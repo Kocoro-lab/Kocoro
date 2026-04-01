@@ -1987,7 +1987,8 @@ func stripImagesFromToolResult(b client.ContentBlock) client.ContentBlock {
 }
 
 // toolResultPattern matches <tool_exec> XML blocks in assistant messages.
-var toolResultPattern = regexp.MustCompile(`(?s)<tool_exec tool="(\w+)" call_id="[0-9a-f]+">\n<input>(.*?)</input>\n<output status="(?:ok|error)">(.*?)</output>\n</tool_exec>`)
+// call_id uses [^"]+ to match both original hex IDs and "comp" from prior compression passes.
+var toolResultPattern = regexp.MustCompile(`(?s)<tool_exec tool="(\w+)" call_id="[^"]+">\n<input>(.*?)</input>\n<output status="(?:ok|error)">(.*?)</output>\n</tool_exec>`)
 
 // legacyToolResultPattern matches old "I called" format for backward-compat compression.
 var legacyToolResultPattern = regexp.MustCompile(`(?s)I called (\w+)\(([^)]*)\)\.\s*\n\n(?:Result|Error):\s*\n(.+?)(?:\n\nI called |\z)`)
@@ -2272,7 +2273,7 @@ func looksLikeUnverifiedClaim(text string) bool {
 // Real tool calls go through the tool_calls API array — they never appear as text.
 // Matches both old "I called" format (backward compat) and new <tool_exec> XML tags.
 // XML branch requires exact attribute shape to avoid false-positives on code examples.
-var fabricatedToolCallPattern = regexp.MustCompile(`(?s)(?:I called \w+\(.*?\)\.\s*\n\n(?:Result|Error):\s|<tool_exec tool="[^"]*" call_id="[0-9a-f]+">\n<input>.*?</input>\n<output status="(?:ok|error)">.*?</output>\n</tool_exec>)`)
+var fabricatedToolCallPattern = regexp.MustCompile(`(?s)(?:I called \w+\(.*?\)\.\s*\n\n(?:Result|Error):\s|<tool_exec tool="[^"]*" call_id="[^"]+">\n<input>.*?</input>\n<output status="(?:ok|error)">.*?</output>\n</tool_exec>)`)
 
 // looksLikeFabricatedToolCalls returns true if the model's text output contains
 // what looks like fabricated tool call results. This is always a hallucination —
