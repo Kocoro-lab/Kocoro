@@ -69,3 +69,5 @@ func buildNotifyScript(title, body string, sound bool) string {
 }
 
 func (t *NotifyTool) RequiresApproval() bool { return true }
+
+func (t *NotifyTool) IsReadOnlyCall(string) bool { return false }

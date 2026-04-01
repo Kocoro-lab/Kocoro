@@ -64,3 +64,13 @@ func (t *ClipboardTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 }
 
 func (t *ClipboardTool) RequiresApproval() bool { return true }
+
+func (t *ClipboardTool) IsReadOnlyCall(argsJSON string) bool {
+	var args struct {
+		Action string `json:"action"`
+	}
+	if json.Unmarshal([]byte(argsJSON), &args) != nil {
+		return false
+	}
+	return args.Action == "read"
+}

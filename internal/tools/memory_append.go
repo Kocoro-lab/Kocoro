@@ -60,3 +60,5 @@ func (t *MemoryAppendTool) Run(ctx context.Context, argsJSON string) (agent.Tool
 }
 
 func (t *MemoryAppendTool) RequiresApproval() bool { return false }
+
+func (t *MemoryAppendTool) IsReadOnlyCall(string) bool { return false }

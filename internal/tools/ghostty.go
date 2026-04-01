@@ -226,6 +226,8 @@ func (t *GhosttyTool) runListTabs() (agent.ToolResult, error) {
 
 func (t *GhosttyTool) RequiresApproval() bool { return true }
 
+func (t *GhosttyTool) IsReadOnlyCall(string) bool { return false }
+
 func resolveTitle(title, command string) string {
 	if title != "" {
 		return title

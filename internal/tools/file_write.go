@@ -74,3 +74,5 @@ func (t *FileWriteTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 }
 
 func (t *FileWriteTool) RequiresApproval() bool { return true }
+
+func (t *FileWriteTool) IsReadOnlyCall(string) bool { return false }

@@ -59,6 +59,8 @@ func (t *GlobTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 
 func (t *GlobTool) RequiresApproval() bool { return true }
 
+func (t *GlobTool) IsReadOnlyCall(string) bool { return true }
+
 func (t *GlobTool) IsSafeArgs(argsJSON string) bool {
 	var args globArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {

@@ -43,3 +43,5 @@ func (t *ThinkTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult,
 }
 
 func (t *ThinkTool) RequiresApproval() bool { return false }
+
+func (t *ThinkTool) IsReadOnlyCall(string) bool { return true }

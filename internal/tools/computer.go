@@ -123,6 +123,8 @@ func (t *ComputerTool) Info() agent.ToolInfo {
 
 func (t *ComputerTool) RequiresApproval() bool { return true }
 
+func (t *ComputerTool) IsReadOnlyCall(string) bool { return false }
+
 func (t *ComputerTool) NativeToolDef() *client.NativeToolDef {
 	return &client.NativeToolDef{
 		Type:            "computer_20251124",

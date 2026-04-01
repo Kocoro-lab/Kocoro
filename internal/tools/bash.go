@@ -111,6 +111,8 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 
 func (t *BashTool) RequiresApproval() bool { return true }
 
+func (t *BashTool) IsReadOnlyCall(string) bool { return false }
+
 func (t *BashTool) IsSafe(command string) bool {
 	return isSafeCommand(command, t.ExtraSafeCommands)
 }

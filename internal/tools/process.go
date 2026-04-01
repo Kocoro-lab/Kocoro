@@ -90,6 +90,8 @@ func (t *ProcessTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 
 func (t *ProcessTool) RequiresApproval() bool { return true }
 
+func (t *ProcessTool) IsReadOnlyCall(string) bool { return false }
+
 func (t *ProcessTool) IsSafeArgs(argsJSON string) bool {
 	var args processArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {

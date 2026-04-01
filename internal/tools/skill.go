@@ -102,3 +102,5 @@ func rewriteRelativePaths(body, dir string) string {
 }
 
 func (t *useSkillTool) RequiresApproval() bool { return false }
+
+func (t *useSkillTool) IsReadOnlyCall(string) bool { return false }

@@ -92,6 +92,8 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 
 func (t *GrepTool) RequiresApproval() bool { return true }
 
+func (t *GrepTool) IsReadOnlyCall(string) bool { return true }
+
 func (t *GrepTool) IsSafeArgs(argsJSON string) bool {
 	var args grepArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {

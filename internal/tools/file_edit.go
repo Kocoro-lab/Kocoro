@@ -93,3 +93,5 @@ func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 }
 
 func (t *FileEditTool) RequiresApproval() bool { return true }
+
+func (t *FileEditTool) IsReadOnlyCall(string) bool { return false }

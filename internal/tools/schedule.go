@@ -151,3 +151,7 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 func (t *ScheduleTool) RequiresApproval() bool {
 	return t.action != "list"
 }
+
+func (t *ScheduleTool) IsReadOnlyCall(string) bool {
+	return t.action == "list"
+}

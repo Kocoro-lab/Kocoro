@@ -41,6 +41,8 @@ func (t *SessionSearchTool) Info() agent.ToolInfo {
 
 func (t *SessionSearchTool) RequiresApproval() bool { return false }
 
+func (t *SessionSearchTool) IsReadOnlyCall(string) bool { return true }
+
 func (t *SessionSearchTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args sessionSearchArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {

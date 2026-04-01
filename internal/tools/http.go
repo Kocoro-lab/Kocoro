@@ -101,6 +101,8 @@ func (t *HTTPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 
 func (t *HTTPTool) RequiresApproval() bool { return true }
 
+func (t *HTTPTool) IsReadOnlyCall(string) bool { return false }
+
 func (t *HTTPTool) IsSafeArgs(argsJSON string) bool {
 	var args httpArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {

@@ -370,6 +370,8 @@ func (t *CloudDelegateTool) Run(ctx context.Context, argsJSON string) (agent.Too
 
 func (t *CloudDelegateTool) RequiresApproval() bool { return true }
 
+func (t *CloudDelegateTool) IsReadOnlyCall(string) bool { return false }
+
 // accumulateUsage extracts usage metadata from LLM_OUTPUT events and adds it to the running total.
 func (t *CloudDelegateTool) accumulateUsage(data string, usage *agent.TurnUsage) {
 	// Shannon Cloud sends usage info in "metadata" field of LLM_OUTPUT events

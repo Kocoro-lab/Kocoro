@@ -65,6 +65,8 @@ func (t *DirectoryListTool) Run(ctx context.Context, argsJSON string) (agent.Too
 
 func (t *DirectoryListTool) RequiresApproval() bool { return true }
 
+func (t *DirectoryListTool) IsReadOnlyCall(string) bool { return true }
+
 func (t *DirectoryListTool) IsSafeArgs(argsJSON string) bool {
 	var args dirListArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {

@@ -99,6 +99,21 @@ func (t *AccessibilityTool) Info() agent.ToolInfo {
 
 func (t *AccessibilityTool) RequiresApproval() bool { return false }
 
+func (t *AccessibilityTool) IsReadOnlyCall(argsJSON string) bool {
+	var args struct {
+		Action string `json:"action"`
+	}
+	if json.Unmarshal([]byte(argsJSON), &args) != nil {
+		return false
+	}
+	switch args.Action {
+	case "read_tree", "annotate", "find", "get_value":
+		return true
+	default:
+		return false
+	}
+}
+
 func (t *AccessibilityTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	if runtime.GOOS != "darwin" || t.client == nil {
 		return agent.ToolResult{Content: "accessibility tool is only available on macOS", IsError: true}, nil

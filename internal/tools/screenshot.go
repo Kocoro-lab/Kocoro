@@ -36,6 +36,8 @@ func (t *ScreenshotTool) Info() agent.ToolInfo {
 
 func (t *ScreenshotTool) RequiresApproval() bool { return false }
 
+func (t *ScreenshotTool) IsReadOnlyCall(string) bool { return true }
+
 func (t *ScreenshotTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args screenshotArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {

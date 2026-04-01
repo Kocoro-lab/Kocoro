@@ -81,6 +81,8 @@ func (t *AppleScriptTool) Run(ctx context.Context, argsJSON string) (agent.ToolR
 
 func (t *AppleScriptTool) RequiresApproval() bool { return true }
 
+func (t *AppleScriptTool) IsReadOnlyCall(string) bool { return false }
+
 // splitScriptLines splits an AppleScript into individual lines for -e args.
 // Preserves empty lines as they can be significant in AppleScript blocks.
 func splitScriptLines(script string) []string {

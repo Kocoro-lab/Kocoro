@@ -71,6 +71,8 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 
 func (t *FileReadTool) RequiresApproval() bool { return true }
 
+func (t *FileReadTool) IsReadOnlyCall(string) bool { return true }
+
 func (t *FileReadTool) IsSafeArgs(argsJSON string) bool {
 	var args fileReadArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {

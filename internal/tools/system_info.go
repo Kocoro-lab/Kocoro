@@ -47,3 +47,5 @@ func (t *SystemInfoTool) Run(ctx context.Context, argsJSON string) (agent.ToolRe
 }
 
 func (t *SystemInfoTool) RequiresApproval() bool { return false }
+
+func (t *SystemInfoTool) IsReadOnlyCall(string) bool { return true }

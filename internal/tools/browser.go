@@ -98,6 +98,8 @@ func (t *BrowserTool) Info() agent.ToolInfo {
 
 func (t *BrowserTool) RequiresApproval() bool { return true }
 
+func (t *BrowserTool) IsReadOnlyCall(string) bool { return false }
+
 func (t *BrowserTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args browserArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
