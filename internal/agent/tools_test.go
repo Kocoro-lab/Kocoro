@@ -400,6 +400,54 @@ func TestToolRegistry_SortedSchemas_MCPAdditionDoesNotShiftLocal(t *testing.T) {
 	}
 }
 
+func TestToolRegistry_SummaryList(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "bash"})
+	reg.Register(&mockTool{name: "file_read"})
+
+	summaries := reg.SummaryList()
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2 summaries, got %d", len(summaries))
+	}
+	for _, s := range summaries {
+		if s.Name == "" {
+			t.Error("summary name is empty")
+		}
+		if s.Description == "" {
+			t.Error("summary description is empty")
+		}
+	}
+}
+
+func TestToolRegistry_FullSchemas(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "bash"})
+	reg.Register(&mockTool{name: "file_read"})
+	reg.Register(&mockTool{name: "grep"})
+
+	schemas := reg.FullSchemas([]string{"bash", "file_read"})
+	if len(schemas) != 2 {
+		t.Fatalf("expected 2 schemas, got %d", len(schemas))
+	}
+	names := map[string]bool{}
+	for _, s := range schemas {
+		names[s.Function.Name] = true
+	}
+	if !names["bash"] || !names["file_read"] {
+		t.Errorf("expected bash and file_read, got %v", names)
+	}
+}
+
+func TestToolRegistry_FullSchemas_Nonexistent(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "bash"})
+
+	schemas := reg.FullSchemas([]string{"nonexistent"})
+	if len(schemas) != 0 {
+		t.Fatalf("expected 0 schemas for nonexistent tool, got %d", len(schemas))
+	}
+}
+
 func TestTurnUsage_CacheTelemetry(t *testing.T) {
 	u := &TurnUsage{}
 

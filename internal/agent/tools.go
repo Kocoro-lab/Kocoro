@@ -121,6 +121,12 @@ type ReadOnlyChecker interface {
 	IsReadOnlyCall(argsJSON string) bool
 }
 
+// ToolSummary is a lightweight name+description pair for deferred tool listings.
+type ToolSummary struct {
+	Name        string
+	Description string
+}
+
 type ToolRegistry struct {
 	tools map[string]Tool
 	order []string
@@ -220,6 +226,28 @@ func (r *ToolRegistry) Schemas() []client.Tool {
 	schemas := make([]client.Tool, 0, len(r.order))
 	for _, name := range r.order {
 		schemas = append(schemas, buildToolSchema(r.tools[name]))
+	}
+	return schemas
+}
+
+// SummaryList returns name+description for all registered tools.
+func (r *ToolRegistry) SummaryList() []ToolSummary {
+	summaries := make([]ToolSummary, 0, len(r.order))
+	for _, name := range r.order {
+		info := r.tools[name].Info()
+		summaries = append(summaries, ToolSummary{Name: info.Name, Description: info.Description})
+	}
+	return summaries
+}
+
+// FullSchemas returns complete client.Tool schemas for the named tools.
+// Unknown names are silently skipped.
+func (r *ToolRegistry) FullSchemas(names []string) []client.Tool {
+	schemas := make([]client.Tool, 0, len(names))
+	for _, name := range names {
+		if t, ok := r.tools[name]; ok {
+			schemas = append(schemas, buildToolSchema(t))
+		}
 	}
 	return schemas
 }
