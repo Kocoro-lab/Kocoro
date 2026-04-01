@@ -688,9 +688,10 @@ func TestAgentLoop_ReactiveCompactionNoDoubleRetry(t *testing.T) {
 		}
 
 		msgCount := len(req.Messages)
+		t.Logf("Main-tier call: msgs=%d, contextErrors=%d", msgCount, contextErrors)
 
-		if msgCount < 12 {
-			// Build up messages with tool calls
+		if msgCount < 6 && contextErrors == 0 {
+			// Build up messages with tool calls until we first trigger overflow.
 			json.NewEncoder(w).Encode(nativeResponse(
 				"", "tool_use",
 				toolCall("think", `{"thought":"building context"}`),
@@ -698,7 +699,8 @@ func TestAgentLoop_ReactiveCompactionNoDoubleRetry(t *testing.T) {
 			return
 		}
 
-		// Always return context-length error for 12+ messages
+		// Always return context-length error once we've started — even after
+		// compaction reduces message count. This forces the double-retry guard.
 		contextErrors++
 		t.Logf("Returning context-length error #%d (msgs=%d)", contextErrors, msgCount)
 		w.WriteHeader(http.StatusBadRequest)

@@ -661,8 +661,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 		lastInputTokens      int    // actual input tokens from last LLM response
 		lastOutputTokens     int    // actual output tokens from last LLM response
 		compactionSummary    string // cached summary from compaction
-		compactionApplied    bool   // true once messages have been shaped
-		summaryFailures      int    // consecutive summary failures; backs off after 3
+		compactionApplied    bool // true once messages have been shaped
+		reactiveCompacted    bool // true once reactive compaction fired (never resets)
+		summaryFailures      int  // consecutive summary failures; backs off after 3
 		toolSearchFired      bool
 		latestUserText       = userMessage // most recent real user request (not tool results or injected nudges)
 		cloudNudgeFired      bool
@@ -863,7 +864,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 			// Reactive compaction: if the error is a context-length overflow,
 			// aggressively compact and retry once. Single retry only —
 			// compactionApplied prevents infinite loops.
-			if isContextLengthError(err) && !compactionApplied {
+			if isContextLengthError(err) && !reactiveCompacted {
 				fmt.Fprintf(os.Stderr, "[agent] context length exceeded, attempting reactive compaction\n")
 
 				// Write-before-compact: persist durable learnings before discarding history.
@@ -883,6 +884,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 				before := len(messages)
 				messages = ctxwin.ShapeHistory(messages, compactionSummary, a.contextWindow)
 				compactionApplied = true
+				reactiveCompacted = true // never reset — prevents infinite reactive loops
 
 				// Rebase run-local indices — same bookkeeping as proactive compaction.
 				if len(messages) < before {
