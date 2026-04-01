@@ -473,7 +473,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 	a.runMsgInjected = nil     // reset for this run
 	a.runMsgTimestamps = nil   // reset for this run
 
-	deferredMode := a.tools.Len() > 30
+	// Deferred mode: only activate if there are actual deferred (non-local) tools.
+	deferred := deferredToolNames(a.tools)
+	deferredMode := a.tools.Len() > 30 && len(deferred) > 0
 
 	cwd, _ := os.Getwd()
 	instrText, _ := instructions.LoadInstructions(a.shannonDir, ".", 4000)
@@ -510,7 +512,6 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 	var toolNames []string
 
 	if deferredMode {
-		deferred := deferredToolNames(a.tools)
 		tsSearch := newToolSearchTool(a.tools, deferred)
 		effTools = a.tools.Clone()
 		effTools.Register(tsSearch)
