@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -96,8 +97,12 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	if maxOut <= 0 {
 		maxOut = 30000
 	}
-	if len(result) > maxOut {
-		result = result[:maxOut] + "\n... (truncated)"
+	if r := []rune(result); len(r) > maxOut {
+		keepHead := maxOut * 3 / 4
+		keepTail := maxOut / 4
+		result = string(r[:keepHead]) + "\n\n[... truncated " +
+			strconv.Itoa(len(r)-maxOut) + " chars ...]\n\n" +
+			string(r[len(r)-keepTail:])
 	}
 
 	if err != nil {

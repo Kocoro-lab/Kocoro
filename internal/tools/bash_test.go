@@ -88,7 +88,7 @@ func TestBash_MaxOutput(t *testing.T) {
 		if len(result.Content) > 31000 {
 			t.Errorf("expected output truncated to ~30000, got %d chars", len(result.Content))
 		}
-		if !strings.Contains(result.Content, "... (truncated)") {
+		if !strings.Contains(result.Content, "truncated") {
 			t.Error("expected truncation marker in output")
 		}
 	})
@@ -102,7 +102,7 @@ func TestBash_MaxOutput(t *testing.T) {
 		if len(result.Content) > 600 {
 			t.Errorf("expected output truncated to ~500, got %d chars", len(result.Content))
 		}
-		if !strings.Contains(result.Content, "... (truncated)") {
+		if !strings.Contains(result.Content, "truncated") {
 			t.Error("expected truncation marker in output")
 		}
 	})
@@ -113,7 +113,7 @@ func TestBash_MaxOutput(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if strings.Contains(result.Content, "... (truncated)") {
+		if strings.Contains(result.Content, "truncated") {
 			t.Error("small output should not be truncated")
 		}
 	})
