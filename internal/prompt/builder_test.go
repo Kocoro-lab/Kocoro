@@ -212,6 +212,38 @@ func TestBuildSystemPrompt_InstructionsTruncation(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_DeferredToolsInStaticSystem(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+		ToolNames:  []string{"bash", "file_read", "tool_search"},
+		DeferredTools: []DeferredToolSummary{
+			{Name: "playwright_click", Description: "Click an element"},
+			{Name: "playwright_type", Description: "Type text"},
+		},
+	})
+
+	if !strings.Contains(parts.System, "## Deferred Tools") {
+		t.Error("System should contain Deferred Tools section")
+	}
+	if !strings.Contains(parts.System, "playwright_click: Click an element") {
+		t.Error("System should list deferred tool summaries")
+	}
+	if !strings.Contains(parts.System, "tool_search") {
+		t.Error("System should mention tool_search in available tools")
+	}
+}
+
+func TestBuildSystemPrompt_NoDeferredSection_WhenEmpty(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+		ToolNames:  []string{"bash", "file_read"},
+	})
+
+	if strings.Contains(parts.System, "Deferred Tools") {
+		t.Error("System should not contain Deferred Tools section when empty")
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	tests := []struct {
 		name     string

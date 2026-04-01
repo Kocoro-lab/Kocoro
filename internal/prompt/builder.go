@@ -15,6 +15,13 @@ const (
 	maxInstructionsChars = 16000
 )
 
+// DeferredToolSummary is a lightweight name+description pair for deferred tool listings.
+// Mirrors agent.ToolSummary but avoids importing the agent package from prompt.
+type DeferredToolSummary struct {
+	Name        string
+	Description string
+}
+
 // PromptOptions configures the system prompt assembly.
 type PromptOptions struct {
 	BasePrompt   string   // persona + core operational rules
@@ -32,6 +39,9 @@ type PromptOptions struct {
 	// that must survive context compaction. Populated by the daemon runner with session
 	// source/channel/task metadata, or by callers needing persistent session facts.
 	StickyContext string
+	// DeferredTools lists tools available via tool_search (deferred mode only).
+	// Rendered in the static system prompt. Empty when not in deferred mode.
+	DeferredTools []DeferredToolSummary
 }
 
 // PromptParts separates the system prompt into cacheable and volatile sections.
@@ -90,6 +100,16 @@ func buildStaticSystem(opts PromptOptions) string {
 		sb.WriteString("|-------|-------------|\n")
 		for _, s := range opts.Skills {
 			sb.WriteString(fmt.Sprintf("| %s | %s |\n", s.Name, s.Description))
+		}
+	}
+
+	// 3b. Deferred Tools (only in deferred mode)
+	if len(opts.DeferredTools) > 0 {
+		sb.WriteString("\n\n## Deferred Tools\n\n")
+		sb.WriteString("The following tools are available via tool_search. Call tool_search with\n")
+		sb.WriteString("\"select:<name>\" to load the full schema before using them.\n\n")
+		for _, dt := range opts.DeferredTools {
+			sb.WriteString(fmt.Sprintf("- %s: %s\n", dt.Name, dt.Description))
 		}
 	}
 
