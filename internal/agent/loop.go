@@ -441,9 +441,10 @@ type toolExecResult struct {
 
 // approvedToolCall tracks a tool call that passed permission checks and pre-hooks.
 type approvedToolCall struct {
-	index int                 // position in original toolCalls slice
-	fc    client.FunctionCall // the tool call
-	tool  Tool                // resolved tool
+	index   int                 // position in original toolCalls slice
+	fc      client.FunctionCall // the tool call
+	tool    Tool                // resolved tool
+	argsStr string              // parsed args, available for IsReadOnlyCall + execution
 }
 
 // assembleUserMessage combines volatile context and user query with cache_break markers.
@@ -1160,7 +1161,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 				}
 			}
 
-			approved = append(approved, approvedToolCall{index: idx, fc: fc, tool: tool})
+			approved = append(approved, approvedToolCall{index: idx, fc: fc, tool: tool, argsStr: callMeta[idx].argsStr})
 		}
 
 		// ---- Phase 2 (parallel): execute approved tool.Run() calls concurrently ----

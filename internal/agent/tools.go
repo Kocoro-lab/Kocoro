@@ -114,6 +114,13 @@ type SafeChecker interface {
 	IsSafeArgs(argsJSON string) bool
 }
 
+// ReadOnlyChecker is an optional interface for tools that can classify
+// individual calls as read-only based on arguments.
+// If args parsing fails, implementations MUST return false (fail-closed).
+type ReadOnlyChecker interface {
+	IsReadOnlyCall(argsJSON string) bool
+}
+
 type ToolRegistry struct {
 	tools map[string]Tool
 	order []string
