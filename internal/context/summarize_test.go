@@ -97,6 +97,27 @@ func TestGenerateSummary(t *testing.T) {
 		}
 	})
 
+	t.Run("extracts summary from two-phase response", func(t *testing.T) {
+		mock := &mockCompleter{
+			response: &client.CompletionResponse{
+				OutputText: "<analysis>\nUser asked about X.\nAssistant did Y.\n</analysis>\n<summary>\nThe actual summary here.\n</summary>",
+			},
+		}
+		messages := []client.Message{
+			{Role: "user", Content: client.NewTextContent("test")},
+		}
+		summary, err := GenerateSummary(context.Background(), mock, messages)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(summary, "<analysis>") {
+			t.Error("summary should not contain <analysis> tags")
+		}
+		if !strings.Contains(summary, "actual summary here") {
+			t.Errorf("summary should contain extracted content, got: %q", summary)
+		}
+	})
+
 	t.Run("includes block content in transcript", func(t *testing.T) {
 		mock := &mockCompleter{
 			response: &client.CompletionResponse{
@@ -134,4 +155,67 @@ func TestGenerateSummary(t *testing.T) {
 			t.Error("transcript should include tool_result content")
 		}
 	})
+}
+
+func TestExtractSummary(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			"both tags present",
+			"<analysis>\nwalkthrough\n</analysis>\n<summary>\nthe summary\n</summary>",
+			"the summary",
+			"walkthrough",
+		},
+		{
+			"summary only, no analysis",
+			"<summary>just the summary</summary>",
+			"just the summary",
+			"",
+		},
+		{
+			"analysis stripped when no summary tags",
+			"<analysis>scratch work</analysis>\nLeftover text here.",
+			"Leftover text here",
+			"scratch work",
+		},
+		{
+			"unclosed analysis stripped",
+			"Some preamble.<analysis>scratch work without closing",
+			"Some preamble",
+			"scratch work",
+		},
+		{
+			"unclosed summary takes remainder",
+			"<summary>everything after tag",
+			"everything after tag",
+			"",
+		},
+		{
+			"no tags at all — returns raw",
+			"plain summary without any tags",
+			"plain summary without any tags",
+			"",
+		},
+		{
+			"empty after stripping analysis — returns raw",
+			"<analysis>only analysis content</analysis>",
+			"only analysis content",
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractSummary(tt.input)
+			if tt.contains != "" && !strings.Contains(got, tt.contains) {
+				t.Errorf("expected to contain %q, got: %q", tt.contains, got)
+			}
+			if tt.excludes != "" && strings.Contains(got, tt.excludes) {
+				t.Errorf("should not contain %q, got: %q", tt.excludes, got)
+			}
+		})
+	}
 }

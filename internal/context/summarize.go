@@ -8,14 +8,27 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
-const summarizePrompt = `Compress the following conversation into a concise summary. Capture:
-- Key decisions made
-- Files read, modified, or created
-- Current state of the task
-- Next steps or unresolved items
-- Important errors or blockers encountered
+const summarizePrompt = `Compress the following conversation into a concise summary using a two-phase approach.
 
-Be factual and brief. Focus on what a continuation of this conversation would need to know.`
+Phase 1 — Write a chronological analysis inside <analysis> tags:
+- Walk through the conversation in order
+- Note every user correction, decision, or preference change
+- Track files read, modified, or created
+- Record errors, blockers, and their resolutions
+
+Phase 2 — Write the final summary inside <summary> tags:
+- Distill the analysis into what a continuation needs to know
+- Preserve user corrections and decisions (these are highest priority)
+- Include current task state and next steps
+- Be factual and brief
+
+Format your response as:
+<analysis>
+[chronological walkthrough]
+</analysis>
+<summary>
+[concise summary for continuation]
+</summary>`
 
 // Completer is the interface for making LLM completion calls.
 // Satisfied by *client.GatewayClient.
@@ -55,7 +68,48 @@ func GenerateSummary(ctx context.Context, c Completer, messages []client.Message
 		return "", fmt.Errorf("summarization failed: %w", err)
 	}
 
-	return resp.OutputText, nil
+	return extractSummary(resp.OutputText), nil
+}
+
+// extractSummary extracts the <summary> content from a two-phase response.
+// If <summary> tags are present, returns their content.
+// If missing, strips any <analysis> block and returns the remainder.
+// Never returns raw <analysis> content — ShapeHistory injects the summary verbatim.
+func extractSummary(raw string) string {
+	raw = strings.TrimSpace(raw)
+
+	// Try to extract <summary>...</summary>
+	if start := strings.Index(raw, "<summary>"); start >= 0 {
+		after := raw[start+len("<summary>"):]
+		if end := strings.Index(after, "</summary>"); end >= 0 {
+			return strings.TrimSpace(after[:end])
+		}
+		// Opening tag but no closing — take everything after the tag
+		return strings.TrimSpace(after)
+	}
+
+	// No <summary> tags — strip <analysis>...</analysis> and return remainder
+	result := raw
+	for {
+		start := strings.Index(result, "<analysis>")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(result, "</analysis>")
+		if end < 0 {
+			// Opening tag but no closing — strip from <analysis> onward
+			result = result[:start]
+			break
+		}
+		result = result[:start] + result[end+len("</analysis>"):]
+	}
+
+	result = strings.TrimSpace(result)
+	if result == "" {
+		// Everything was analysis — return the raw content as last resort
+		return raw
+	}
+	return result
 }
 
 // messageText extracts readable text from a message, handling both plain text
