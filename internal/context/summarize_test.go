@@ -201,10 +201,10 @@ func TestExtractSummary(t *testing.T) {
 			"",
 		},
 		{
-			"empty after stripping analysis — returns raw",
+			"empty after stripping analysis — returns empty",
 			"<analysis>only analysis content</analysis>",
-			"only analysis content",
 			"",
+			"analysis",
 		},
 	}
 	for _, tt := range tests {
@@ -212,6 +212,9 @@ func TestExtractSummary(t *testing.T) {
 			got := extractSummary(tt.input)
 			if tt.contains != "" && !strings.Contains(got, tt.contains) {
 				t.Errorf("expected to contain %q, got: %q", tt.contains, got)
+			}
+			if tt.contains == "" && tt.excludes != "" && got != "" {
+				t.Errorf("expected empty string, got: %q", got)
 			}
 			if tt.excludes != "" && strings.Contains(got, tt.excludes) {
 				t.Errorf("should not contain %q, got: %q", tt.excludes, got)

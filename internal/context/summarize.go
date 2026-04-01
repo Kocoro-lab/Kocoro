@@ -106,8 +106,10 @@ func extractSummary(raw string) string {
 
 	result = strings.TrimSpace(result)
 	if result == "" {
-		// Everything was analysis — return the raw content as last resort
-		return raw
+		// Everything was analysis with no summary — return empty.
+		// ShapeHistory handles empty summaries gracefully (sliding window only).
+		// Returning raw here would leak <analysis> scratch work into context.
+		return ""
 	}
 	return result
 }
