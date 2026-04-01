@@ -61,9 +61,18 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 		if len(batch) == 1 {
 			// Single call: run directly, no goroutine overhead.
 			ac := batch[0]
-			startTime := time.Now()
-			result, runErr := ac.tool.Run(ctx, ac.argsStr)
-			execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						execResults[ac.index] = toolExecResult{
+							result: ToolResult{Content: fmt.Sprintf("tool panicked: %v", r), IsError: true},
+						}
+					}
+				}()
+				startTime := time.Now()
+				result, runErr := ac.tool.Run(ctx, ac.argsStr)
+				execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr}
+			}()
 		} else {
 			// Concurrent batch with semaphore.
 			sem := make(chan struct{}, maxToolConcurrency)

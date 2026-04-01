@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
+
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
@@ -1164,32 +1164,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 			approved = append(approved, approvedToolCall{index: idx, fc: fc, tool: tool, argsStr: callMeta[idx].argsStr})
 		}
 
-		// ---- Phase 2 (parallel): execute approved tool.Run() calls concurrently ----
-		if len(approved) == 1 {
-			// Single tool call: run directly, no goroutine overhead
-			ac := approved[0]
-			startTime := time.Now()
-			result, runErr := ac.tool.Run(ctx, callMeta[ac.index].argsStr)
-			execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr}
-		} else if len(approved) > 1 {
-			var wg sync.WaitGroup
-			wg.Add(len(approved))
-			for _, ac := range approved {
-				go func(ac approvedToolCall) {
-					defer wg.Done()
-					defer func() {
-						if r := recover(); r != nil {
-							execResults[ac.index] = toolExecResult{
-								result: ToolResult{Content: fmt.Sprintf("tool panicked: %v", r), IsError: true},
-							}
-						}
-					}()
-					startTime := time.Now()
-					result, runErr := ac.tool.Run(ctx, callMeta[ac.index].argsStr)
-					execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr}
-				}(ac)
-			}
-			wg.Wait()
+		// ---- Phase 2 (batched): partition by read-only, execute with concurrency limits ----
+		if len(approved) > 0 {
+			batches := partitionToolCalls(approved)
+			executeBatches(ctx, batches, execResults, readTracker)
 		}
 
 		// ---- Phase 3 (serial): post-hooks, audit, events, context recording, loop detection ----

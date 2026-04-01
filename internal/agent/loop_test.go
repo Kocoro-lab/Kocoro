@@ -1278,7 +1278,8 @@ func (m *mockSlowTool) Run(ctx context.Context, args string) (ToolResult, error)
 	return ToolResult{Content: fmt.Sprintf("result from %s", m.name)}, nil
 }
 
-func (m *mockSlowTool) RequiresApproval() bool { return false }
+func (m *mockSlowTool) RequiresApproval() bool  { return false }
+func (m *mockSlowTool) IsReadOnlyCall(string) bool { return true }
 
 // mockPanicTool panics during Run.
 type mockPanicTool struct {
