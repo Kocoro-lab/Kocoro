@@ -15,6 +15,7 @@ type BashTool struct {
 	approvalFn        func(command string) bool
 	ExtraSafeCommands []string
 	CWD               string // working directory for commands (empty = inherit process cwd)
+	MaxOutput         int    // max output chars; 0 = use default 30000
 }
 
 type bashArgs struct {
@@ -91,8 +92,12 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	output, err := cmd.CombinedOutput()
 
 	result := string(output)
-	if len(result) > 30000 {
-		result = result[:30000] + "\n... (truncated)"
+	maxOut := t.MaxOutput
+	if maxOut <= 0 {
+		maxOut = 30000
+	}
+	if len(result) > maxOut {
+		result = result[:maxOut] + "\n... (truncated)"
 	}
 
 	if err != nil {

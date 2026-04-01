@@ -37,6 +37,9 @@ func RegisterLocalTools(cfg *config.Config) (*agent.ToolRegistry, *[]*skills.Ski
 	bashTool := &BashTool{}
 	if cfg != nil {
 		bashTool.ExtraSafeCommands = cfg.Permissions.AllowedCommands
+		if cfg.Tools.BashMaxOutput > 0 {
+			bashTool.MaxOutput = cfg.Tools.BashMaxOutput
+		}
 	}
 	reg.Register(bashTool)
 

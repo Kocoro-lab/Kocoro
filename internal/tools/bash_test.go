@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -70,4 +71,50 @@ func TestBash_IsSafeArgs(t *testing.T) {
 			t.Errorf("IsSafeArgs(%q) = %v, want %v", tt.argsJSON, !tt.safe, tt.safe)
 		}
 	}
+}
+
+func TestBash_MaxOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+
+	t.Run("default limit", func(t *testing.T) {
+		tool := &BashTool{}
+		// Generate output larger than 30000 bytes
+		result, err := tool.Run(context.Background(), `{"command": "python3 -c \"print('x' * 35000)\""}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result.Content) > 31000 {
+			t.Errorf("expected output truncated to ~30000, got %d chars", len(result.Content))
+		}
+		if !strings.Contains(result.Content, "... (truncated)") {
+			t.Error("expected truncation marker in output")
+		}
+	})
+
+	t.Run("custom limit", func(t *testing.T) {
+		tool := &BashTool{MaxOutput: 500}
+		result, err := tool.Run(context.Background(), `{"command": "python3 -c \"print('x' * 1000)\""}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result.Content) > 600 {
+			t.Errorf("expected output truncated to ~500, got %d chars", len(result.Content))
+		}
+		if !strings.Contains(result.Content, "... (truncated)") {
+			t.Error("expected truncation marker in output")
+		}
+	})
+
+	t.Run("small output not truncated", func(t *testing.T) {
+		tool := &BashTool{MaxOutput: 500}
+		result, err := tool.Run(context.Background(), `{"command": "echo hello"}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(result.Content, "... (truncated)") {
+			t.Error("small output should not be truncated")
+		}
+	})
 }
