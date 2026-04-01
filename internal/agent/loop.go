@@ -863,7 +863,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 			}
 			// Reactive compaction: if the error is a context-length overflow,
 			// aggressively compact and retry once. Single retry only —
-			// compactionApplied prevents infinite loops.
+			// reactiveCompacted flag (never resets) prevents infinite loops.
 			if isContextLengthError(err) && !reactiveCompacted {
 				fmt.Fprintf(os.Stderr, "[agent] context length exceeded, attempting reactive compaction\n")
 
@@ -877,7 +877,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 				compressOldToolResults(messages, 1, 100) // aggressive: keep only 1 recent
 				summary, sumErr := ctxwin.GenerateSummary(ctx, a.client, messages)
 				compactionSummary := ""
-				if sumErr == nil {
+				if sumErr != nil {
+					fmt.Fprintf(os.Stderr, "[context] reactive summary failed, shaping without summary: %v\n", sumErr)
+				} else {
 					compactionSummary = summary
 				}
 
