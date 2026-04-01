@@ -45,6 +45,7 @@ const coreOperationalRules = `
 - Keep responses short and direct. Lead with the answer or action, not the reasoning.
 - You can handle multi-step, multi-file tasks. Do not refuse a task as too complex — plan it and execute methodically.
 - Consider reversibility before acting: local reads and edits are safe to proceed; deletions, force operations, and external actions (sending messages, pushing code) warrant user confirmation.
+- Do not give time estimates or predictions for how long tasks will take.
 
 ## Core Rules
 - Always use tools to perform actions. Never claim you did something without a tool call.
@@ -548,6 +549,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 		toolNames = a.tools.SortedNames()
 	}
 
+	// Model identity: prefer specificModel, fall back to modelTier.
+	modelID := a.specificModel
+	if modelID == "" {
+		modelID = a.modelTier
+	}
+
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
 		BasePrompt:    basePrompt,
 		Memory:        mem,
@@ -559,6 +566,8 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 		Skills:        a.agentSkills,
 		MemoryDir:     a.memoryDir,
 		StickyContext: a.stickyContext,
+		ModelID:       modelID,
+		ContextWindow: a.contextWindow,
 	})
 
 	// Append cloud delegation guidance to the static system prompt
@@ -1409,6 +1418,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 				maxChars = 60000
 			}
 			contextResult := truncateStr(cleanResult, maxChars)
+
+			// System reminders: append short contextual hints to high-signal
+			// tool results to reinforce instructions in long sessions.
+			// Skip cloud results — they are copied directly to the user.
+			if !result.CloudResult {
+				if reminder := systemReminder(fc.Name); reminder != "" {
+					contextResult += "\n\n" + reminder
+				}
+			}
+
 			if useNative {
 				if len(result.Images) > 0 {
 					var imageBlocks []client.ContentBlock
@@ -1856,6 +1875,22 @@ func truncateStr(s string, max int) string {
 		return s
 	}
 	return string(runes[:max]) + "..."
+}
+
+// systemReminder returns a short contextual hint for high-signal tools,
+// reinforcing key instructions that decay in influence during long sessions.
+// Returns "" for tools that don't need reminders.
+func systemReminder(toolName string) string {
+	switch toolName {
+	case "file_read":
+		return "<system-reminder>Read before modifying. Use file_edit for changes, not file_write on existing files.</system-reminder>"
+	case "file_write", "file_edit":
+		return "<system-reminder>Verify changes: use file_read to confirm edits. Never claim done without evidence.</system-reminder>"
+	case "bash":
+		return "<system-reminder>Prefer dedicated tools over bash (glob not find, grep not rg, file_read not cat).</system-reminder>"
+	default:
+		return ""
+	}
 }
 
 // generateCallID returns a 6-character random hex string used to tag tool

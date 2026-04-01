@@ -42,6 +42,12 @@ type PromptOptions struct {
 	// DeferredTools lists tools available via tool_search (deferred mode only).
 	// Rendered in the static system prompt. Empty when not in deferred mode.
 	DeferredTools []DeferredToolSummary
+	// ModelID is the model identifier (e.g., "claude-sonnet-4-20250514").
+	// Injected into volatile context so the model knows its own identity.
+	ModelID string
+	// ContextWindow is the model's context window size in tokens.
+	// Injected into volatile context when > 0.
+	ContextWindow int
 }
 
 // PromptParts separates the system prompt into cacheable and volatile sections.
@@ -155,11 +161,17 @@ func buildStableContext(opts PromptOptions) string {
 func buildVolatileContext(opts PromptOptions) string {
 	var sb strings.Builder
 
-	// Date/time + CWD + session info
+	// Date/time + CWD + model identity + session info
 	sb.WriteString("## Context\n")
 	sb.WriteString("Current date: " + time.Now().Format("2006-01-02 15:04 MST"))
 	if opts.CWD != "" {
 		sb.WriteString("\nWorking directory: " + opts.CWD)
+	}
+	if opts.ModelID != "" {
+		sb.WriteString("\nModel: " + opts.ModelID)
+	}
+	if opts.ContextWindow > 0 {
+		sb.WriteString(fmt.Sprintf("\nContext window: %d tokens", opts.ContextWindow))
 	}
 	if opts.SessionInfo != "" {
 		sb.WriteString("\n" + opts.SessionInfo)
