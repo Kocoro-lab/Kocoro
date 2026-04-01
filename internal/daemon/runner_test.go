@@ -105,21 +105,25 @@ func TestOutputFormatForSource(t *testing.T) {
 		source string
 		want   string
 	}{
-		// Local sources → markdown
-		{"shanclaw", "markdown"},
-		{"desktop", "markdown"},
-		{"ShanClaw", "markdown"}, // case-insensitive
-		{"Desktop", "markdown"},
-		// Cloud-distributed sources → plain
+		// Cloud-distributed channel sources → plain
 		{"slack", "plain"},
 		{"line", "plain"},
 		{"webhook", "plain"},
 		{"feishu", "plain"},
+		{"lark", "plain"},
 		{"telegram", "plain"},
-		// Unknown/empty → plain (safe default)
-		{"", "plain"},
-		{"unknown", "plain"},
-		{"custom-bot", "plain"},
+		{"Slack", "plain"},  // case-insensitive
+		{"LINE", "plain"},   // case-insensitive
+		// Everything else → markdown (local, cron, schedule, web, unknown)
+		{"shanclaw", "markdown"},
+		{"desktop", "markdown"},
+		{"web", "markdown"},
+		{"cron", "markdown"},
+		{"schedule", "markdown"},
+		{"heartbeat", "markdown"},
+		{"", "markdown"},
+		{"unknown", "markdown"},
+		{"custom-bot", "markdown"},
 	}
 	for _, tt := range tests {
 		got := outputFormatForSource(tt.source)
