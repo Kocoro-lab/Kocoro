@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadInstructions_BasicHierarchy(t *testing.T) {
@@ -486,5 +487,60 @@ func TestLoadMemoryFrom_RespectsMaxLines(t *testing.T) {
 	}
 	if strings.Contains(result, "line after") {
 		t.Error("should not include lines past maxLines limit")
+	}
+}
+
+func TestAnnotateStaleness(t *testing.T) {
+	// Use a fixed "now" for deterministic tests.
+	now := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+	}{
+		{
+			"double hash with date",
+			"## Auto-persisted (2026-03-30)",
+			"[2 days ago]",
+		},
+		{
+			"single hash with date and time",
+			"# Auto-persisted Learnings (2026-03-30 14:30)",
+			"[2 days ago]",
+		},
+		{
+			"today",
+			"## Note (2026-04-01)",
+			"[today]",
+		},
+		{
+			"yesterday",
+			"## Note (2026-03-31)",
+			"[yesterday]",
+		},
+		{
+			"old entry",
+			"## Decision (2025-01-01)",
+			"[455 days ago]",
+		},
+		{
+			"no date — unchanged",
+			"## Just a heading without date",
+			"## Just a heading without date",
+		},
+		{
+			"non-heading date — unchanged",
+			"Some text with (2026-03-30) in it",
+			"Some text with (2026-03-30) in it",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := annotateStaleness(tt.input, now)
+			if !strings.Contains(got, tt.contains) {
+				t.Errorf("expected to contain %q, got: %q", tt.contains, got)
+			}
+		})
 	}
 }

@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
@@ -183,7 +185,36 @@ func LoadMemoryFrom(dir string, maxLines int) (string, error) {
 		return "", err
 	}
 
-	return strings.Join(lines, "\n"), nil
+	result := strings.Join(lines, "\n")
+	return annotateStaleness(result, time.Now()), nil
+}
+
+// memoryDateRe matches heading lines with dates in parentheses.
+// Handles both # and ## levels: "## Auto-persisted (2025-01-15)" and
+// "# Auto-persisted Learnings (2025-01-15 14:30)".
+var memoryDateRe = regexp.MustCompile(`(?m)^(#{1,2} .+\((\d{4}-\d{2}-\d{2})[^)]*\))`)
+
+// annotateStaleness appends "[N days ago]" to memory headings that contain dates.
+// Helps the model reason about memory freshness without mental date math.
+func annotateStaleness(content string, now time.Time) string {
+	return memoryDateRe.ReplaceAllStringFunc(content, func(match string) string {
+		sub := memoryDateRe.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			return match
+		}
+		t, err := time.Parse("2006-01-02", sub[2])
+		if err != nil {
+			return match
+		}
+		days := int(now.Sub(t).Hours() / 24)
+		if days == 0 {
+			return match + " [today]"
+		}
+		if days == 1 {
+			return match + " [yesterday]"
+		}
+		return match + fmt.Sprintf(" [%d days ago]", days)
+	})
 }
 
 // extractLocalMDLink extracts a local .md filename from a markdown link in a line.
