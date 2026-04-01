@@ -864,17 +864,53 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 			// compactionApplied prevents infinite loops.
 			if isContextLengthError(err) && !compactionApplied {
 				fmt.Fprintf(os.Stderr, "[agent] context length exceeded, attempting reactive compaction\n")
+
+				// Write-before-compact: persist durable learnings before discarding history.
+				if a.memoryDir != "" {
+					if pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir); pErr != nil {
+						fmt.Fprintf(os.Stderr, "[context] reactive persist learnings failed: %v\n", pErr)
+					}
+				}
+
 				compressOldToolResults(messages, 1, 100) // aggressive: keep only 1 recent
 				summary, sumErr := ctxwin.GenerateSummary(ctx, a.client, messages)
+				compactionSummary := ""
 				if sumErr == nil {
-					messages = ctxwin.ShapeHistory(messages, summary, a.contextWindow)
-				} else {
-					// Fallback: shape with empty summary (sliding window only)
-					messages = ctxwin.ShapeHistory(messages, "", a.contextWindow)
+					compactionSummary = summary
 				}
+
+				before := len(messages)
+				messages = ctxwin.ShapeHistory(messages, compactionSummary, a.contextWindow)
 				compactionApplied = true
-				// Rebuild request with compacted messages — reassigning messages
-				// alone doesn't update the existing req struct.
+
+				// Rebase run-local indices — same bookkeeping as proactive compaction.
+				if len(messages) < before {
+					dropped := before - len(messages)
+					fmt.Fprintf(os.Stderr, "[context] reactive compacted: %d → %d messages\n", before, len(messages))
+					newMsgOffset -= dropped
+					if newMsgOffset < 1 {
+						newMsgOffset = 1
+					}
+					rebased := make(map[int]bool, len(injectedIndices))
+					for idx := range injectedIndices {
+						newIdx := idx - dropped
+						if newIdx >= newMsgOffset {
+							rebased[newIdx] = true
+						}
+					}
+					injectedIndices = rebased
+
+					rebasedTS := make(map[int]time.Time, len(msgTimestamps))
+					for idx, ts := range msgTimestamps {
+						newIdx := idx - dropped
+						if newIdx >= newMsgOffset {
+							rebasedTS[newIdx] = ts
+						}
+					}
+					msgTimestamps = rebasedTS
+				}
+
+				// Rebuild request with compacted messages.
 				req = client.CompletionRequest{
 					Messages:        messages,
 					ModelTier:       a.modelTier,
