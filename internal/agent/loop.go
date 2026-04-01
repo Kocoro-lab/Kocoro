@@ -859,6 +859,34 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 				captureRunMessages()
 				return "", usage, fmt.Errorf("LLM call cancelled: %w", ctx.Err())
 			}
+			// Reactive compaction: if the error is a context-length overflow,
+			// aggressively compact and retry once. Single retry only —
+			// compactionApplied prevents infinite loops.
+			if isContextLengthError(err) && !compactionApplied {
+				fmt.Fprintf(os.Stderr, "[agent] context length exceeded, attempting reactive compaction\n")
+				compressOldToolResults(messages, 1, 100) // aggressive: keep only 1 recent
+				summary, sumErr := ctxwin.GenerateSummary(ctx, a.client, messages)
+				if sumErr == nil {
+					messages = ctxwin.ShapeHistory(messages, summary, a.contextWindow)
+				} else {
+					// Fallback: shape with empty summary (sliding window only)
+					messages = ctxwin.ShapeHistory(messages, "", a.contextWindow)
+				}
+				compactionApplied = true
+				// Rebuild request with compacted messages — reassigning messages
+				// alone doesn't update the existing req struct.
+				req = client.CompletionRequest{
+					Messages:        messages,
+					ModelTier:       a.modelTier,
+					SpecificModel:   a.specificModel,
+					Temperature:     a.temperature,
+					MaxTokens:       a.maxTokens,
+					Tools:           toolSchemas,
+					Thinking:        a.thinking,
+					ReasoningEffort: a.reasoningEffort,
+				}
+				continue // retry with compacted request
+			}
 			if !isRetryableLLMError(err) || attempt >= maxLLMRetries-1 {
 				captureRunMessages()
 				return "", usage, fmt.Errorf("LLM call failed: %w", err)
@@ -1561,6 +1589,25 @@ func (a *AgentLoop) completeWithRetry(ctx context.Context, req client.Completion
 			return nil, fmt.Errorf("LLM call cancelled: %w", ctx.Err())
 		}
 	}
+}
+
+// isContextLengthError returns true if the error indicates the prompt exceeded
+// the model's context window. Matches HTTP 400 with specific body patterns.
+// Does NOT match "max_tokens" — that's a normal output length limit.
+func isContextLengthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.StatusCode != 400 {
+		return false
+	}
+	body := strings.ToLower(apiErr.Body)
+	return strings.Contains(body, "prompt is too long") ||
+		strings.Contains(body, "context_length_exceeded")
 }
 
 // isRetryableLLMError returns true for transient errors that may succeed on retry

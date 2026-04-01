@@ -73,3 +73,31 @@ func TestClassifyLLMError(t *testing.T) {
 		})
 	}
 }
+
+func TestIsContextLengthError(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		expect bool
+	}{
+		{"nil", nil, false},
+		{"prompt too long", &client.APIError{StatusCode: 400, Body: `{"error":"prompt is too long"}`}, true},
+		{"context_length_exceeded", &client.APIError{StatusCode: 400, Body: `{"error":"context_length_exceeded"}`}, true},
+		{"case insensitive", &client.APIError{StatusCode: 400, Body: `Prompt Is Too Long`}, true},
+		{"wrapped", fmt.Errorf("call failed: %w", &client.APIError{StatusCode: 400, Body: "prompt is too long"}), true},
+		// Must NOT match
+		{"max_tokens", &client.APIError{StatusCode: 400, Body: `{"error":"max_tokens exceeded"}`}, false},
+		{"unrelated 400", &client.APIError{StatusCode: 400, Body: `{"error":"invalid request"}`}, false},
+		{"server error", &client.APIError{StatusCode: 500, Body: "prompt is too long"}, false},
+		{"non-api error", fmt.Errorf("prompt is too long"), false},
+		{"rate limit", &client.APIError{StatusCode: 429, Body: "rate limited"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isContextLengthError(tt.err)
+			if got != tt.expect {
+				t.Errorf("isContextLengthError(%v) = %v, want %v", tt.err, got, tt.expect)
+			}
+		})
+	}
+}
