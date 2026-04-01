@@ -51,7 +51,6 @@ const coreOperationalRules = `
 - Always use tools to perform actions. Never claim you did something without a tool call.
 - Be concise. Summarize tool results — do not echo raw output. Exception: cloud_delegate results are already user-facing deliverables — present them in full.
 - Never apologize for, comment on, or explain your own tool calls. Just answer the user's question with the information you have.
-- Format text responses using GitHub-flavored markdown (GFM): use headers, fenced code blocks with language tags, lists, bold/italic, and tables where appropriate.
 - Read before modifying: always use file_read before file_edit or file_write on existing files. Never propose changes to code you haven't read.
 - Use absolute paths in tool calls (e.g. /Users/name/Desktop/file.txt). The ~ prefix is expanded automatically, but prefer full absolute paths to avoid ambiguity.
 - Avoid over-engineering. Only do what was asked. Don't create abstractions for one-time operations — three similar lines of code is better than a premature abstraction.
@@ -261,6 +260,7 @@ type AgentLoop struct {
 	contextWindow   int
 	memoryDir        string // directory containing MEMORY.md; re-read each Run(), write-before-compact target
 	stickyContext    string // session-scoped facts injected verbatim into system prompt; never truncated
+	outputFormat     string // "markdown" (default) or "plain" — controls formatting guidance in volatile context
 	sessionID        string        // session ID for audit log correlation
 	injectCh         chan string   // receives user messages injected mid-run
 	injectedMessages []string     // messages injected during the last Run(); cleared on each Run() call
@@ -444,6 +444,13 @@ func (a *AgentLoop) SpillCleanupFunc() func() {
 	}
 }
 
+// SetOutputFormat sets the output format profile ("markdown" or "plain").
+// Default is "markdown" (GFM). Use "plain" for cloud-distributed sessions
+// where Shannon Cloud handles final channel rendering.
+func (a *AgentLoop) SetOutputFormat(format string) {
+	a.outputFormat = format
+}
+
 func (a *AgentLoop) SetEnableStreaming(enable bool) {
 	a.enableStreaming = enable
 }
@@ -565,9 +572,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 		CWD:           cwd,
 		Skills:        a.agentSkills,
 		MemoryDir:     a.memoryDir,
-		StickyContext: a.stickyContext,
-		ModelID:       modelID,
-		ContextWindow: a.contextWindow,
+		StickyContext:  a.stickyContext,
+		ModelID:        modelID,
+		ContextWindow:  a.contextWindow,
+		OutputFormat:   a.outputFormat,
 	})
 
 	// Append cloud delegation guidance to the static system prompt

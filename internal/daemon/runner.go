@@ -105,6 +105,21 @@ func (req *RunAgentRequest) EnsureRouteKey() {
 	}
 }
 
+// outputFormatForSource maps a request source to an output format profile.
+// Cloud-distributed sources use "plain" — Shannon Cloud handles final
+// channel rendering (Slack mrkdwn, LINE Flex, etc.). Local sources and
+// unknown daemon sources default to "plain" as the safer fallback.
+func outputFormatForSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "shanclaw", "desktop":
+		return "markdown"
+	default:
+		// Cloud-distributed (slack, line, webhook, feishu, telegram) and
+		// unknown sources: plain text, let cloud own final rendering.
+		return "plain"
+	}
+}
+
 func routeTitle(source, channel, sender string) string {
 	if source == "" {
 		return ""
@@ -517,6 +532,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		loop.SetStickyContext(strings.Join(parts, "\n"))
 	}
+
+	// Output format: cloud-distributed channels use "plain" (Shannon Cloud
+	// handles final channel rendering). Local sources keep "markdown" (default).
+	loop.SetOutputFormat(outputFormatForSource(req.Source))
 
 	loop.SetHandler(handler)
 

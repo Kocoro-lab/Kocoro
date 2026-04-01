@@ -244,6 +244,34 @@ func TestBuildSystemPrompt_NoDeferredSection_WhenEmpty(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_OutputFormatDefault(t *testing.T) {
+	// Empty OutputFormat defaults to markdown (GFM)
+	parts := BuildSystemPrompt(PromptOptions{BasePrompt: "Base."})
+	if !strings.Contains(parts.VolatileContext, "GitHub-flavored markdown") {
+		t.Error("default OutputFormat should produce GFM guidance in volatile context")
+	}
+	if strings.Contains(parts.System, "GitHub-flavored markdown") {
+		t.Error("formatting guidance should NOT be in static System (moved to volatile)")
+	}
+}
+
+func TestBuildSystemPrompt_OutputFormatMarkdown(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{BasePrompt: "Base.", OutputFormat: "markdown"})
+	if !strings.Contains(parts.VolatileContext, "GitHub-flavored markdown") {
+		t.Error("markdown format should produce GFM guidance")
+	}
+}
+
+func TestBuildSystemPrompt_OutputFormatPlain(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{BasePrompt: "Base.", OutputFormat: "plain"})
+	if !strings.Contains(parts.VolatileContext, "plain text") {
+		t.Error("plain format should produce plain text guidance")
+	}
+	if strings.Contains(parts.VolatileContext, "GitHub-flavored") {
+		t.Error("plain format should NOT contain GFM guidance")
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	tests := []struct {
 		name     string

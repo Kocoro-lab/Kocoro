@@ -100,6 +100,35 @@ func TestRouteTitle(t *testing.T) {
 	}
 }
 
+func TestOutputFormatForSource(t *testing.T) {
+	tests := []struct {
+		source string
+		want   string
+	}{
+		// Local sources → markdown
+		{"shanclaw", "markdown"},
+		{"desktop", "markdown"},
+		{"ShanClaw", "markdown"}, // case-insensitive
+		{"Desktop", "markdown"},
+		// Cloud-distributed sources → plain
+		{"slack", "plain"},
+		{"line", "plain"},
+		{"webhook", "plain"},
+		{"feishu", "plain"},
+		{"telegram", "plain"},
+		// Unknown/empty → plain (safe default)
+		{"", "plain"},
+		{"unknown", "plain"},
+		{"custom-bot", "plain"},
+	}
+	for _, tt := range tests {
+		got := outputFormatForSource(tt.source)
+		if got != tt.want {
+			t.Errorf("outputFormatForSource(%q) = %q, want %q", tt.source, got, tt.want)
+		}
+	}
+}
+
 func TestRunAgentRequestSource(t *testing.T) {
 	req := RunAgentRequest{
 		Text:   "hello",

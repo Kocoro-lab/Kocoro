@@ -48,6 +48,10 @@ type PromptOptions struct {
 	// ContextWindow is the model's context window size in tokens.
 	// Injected into volatile context when > 0.
 	ContextWindow int
+	// OutputFormat controls formatting guidance: "markdown" (default, GFM) or
+	// "plain" (for cloud-distributed sessions where Shannon Cloud handles
+	// final channel rendering). Empty defaults to "markdown".
+	OutputFormat string
 }
 
 // PromptParts separates the system prompt into cacheable and volatile sections.
@@ -177,6 +181,10 @@ func buildVolatileContext(opts PromptOptions) string {
 		sb.WriteString("\n" + opts.SessionInfo)
 	}
 
+	// Output formatting guidance
+	sb.WriteString("\n\n## Output Format\n")
+	sb.WriteString(formatGuidance(opts.OutputFormat))
+
 	// Memory
 	if mem := strings.TrimSpace(opts.Memory); mem != "" {
 		sb.WriteString("\n\n## Memory\n")
@@ -196,6 +204,19 @@ func buildVolatileContext(opts PromptOptions) string {
 	}
 
 	return sb.String()
+}
+
+// formatGuidance returns output formatting instructions based on the profile.
+func formatGuidance(format string) string {
+	switch format {
+	case "plain":
+		return "Format responses as plain text. Use short paragraphs and simple bullet points. " +
+			"Avoid markdown tables, fenced code blocks, headers, bold/italic, and other rich formatting. " +
+			"Use indentation or blank lines for structure. Keep lines short and readable."
+	default: // "markdown" or empty
+		return "Format text responses using GitHub-flavored markdown (GFM): " +
+			"use headers, fenced code blocks with language tags, lists, bold/italic, and tables where appropriate."
+	}
 }
 
 // truncate limits s to maxChars, appending [truncated] if trimmed.
