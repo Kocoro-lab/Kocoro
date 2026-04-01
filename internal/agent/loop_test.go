@@ -963,17 +963,17 @@ func TestCompressOldToolResultsXML(t *testing.T) {
 
 	compressOldToolResults(messages, 3, 100)
 
-	// First 2 assistant messages (indices 2,3) should be compressed
+	// First 2 assistant messages (indices 2,3) should be compressed (tier 2: head+tail truncated)
 	for _, idx := range []int{2, 3} {
 		text := messages[idx].Content.Text()
-		if !strings.Contains(text, "[compressed]") {
-			t.Errorf("message %d should be compressed", idx)
+		if !strings.Contains(text, "[... truncated") {
+			t.Errorf("message %d should be compressed (tier 2 head+tail)", idx)
 		}
 	}
 	// Last 3 (indices 4,5,6) should be uncompressed
 	for _, idx := range []int{4, 5, 6} {
 		text := messages[idx].Content.Text()
-		if strings.Contains(text, "[compressed]") {
+		if strings.Contains(text, "[... truncated") {
 			t.Errorf("message %d should NOT be compressed", idx)
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"time"
@@ -1990,10 +1991,89 @@ var toolResultPattern = regexp.MustCompile(`(?s)<tool_exec tool="(\w+)" call_id=
 var legacyToolResultPattern = regexp.MustCompile(`(?s)I called (\w+)\(([^)]*)\)\.\s*\n\n(?:Result|Error):\s*\n(.+?)(?:\n\nI called |\z)`)
 
 
+// toolCallInfo stores name and args for a tool_use block, used by tier-1 metadata.
+type toolCallInfo struct {
+	Name string
+	Args string // first 100 chars of args JSON
+}
+
+// buildToolCallMap pre-scans messages for tool_use blocks and returns a
+// tool_use_id → name+args map for tier-1 metadata generation.
+func buildToolCallMap(messages []client.Message) map[string]toolCallInfo {
+	m := make(map[string]toolCallInfo)
+	for _, msg := range messages {
+		if msg.Role != "assistant" || !msg.Content.HasBlocks() {
+			continue
+		}
+		for _, b := range msg.Content.Blocks() {
+			if b.Type == "tool_use" && b.ID != "" {
+				argsStr := ""
+				if b.Input != nil {
+					argsStr = string(b.Input)
+					if len(argsStr) > 100 {
+						argsStr = argsStr[:100] + "..."
+					}
+				}
+				m[b.ID] = toolCallInfo{Name: b.Name, Args: argsStr}
+			}
+		}
+	}
+	return m
+}
+
+// stripToMetadata replaces tool_result content with a metadata-only summary.
+func stripToMetadata(mc client.MessageContent, toolCallMap map[string]toolCallInfo) client.MessageContent {
+	blocks := mc.Blocks()
+	var newBlocks []client.ContentBlock
+	for _, b := range blocks {
+		if b.Type != "tool_result" {
+			newBlocks = append(newBlocks, b)
+			continue
+		}
+		info, ok := toolCallMap[b.ToolUseID]
+		name := "unknown"
+		args := ""
+		if ok {
+			name = info.Name
+			args = info.Args
+		}
+		origLen := toolContentLength(b.ToolContent)
+		meta := fmt.Sprintf("[%s called with %s] → [result: %d chars, snipped]", name, args, origLen)
+		b.ToolContent = meta
+		newBlocks = append(newBlocks, b)
+	}
+	return client.NewBlockContent(newBlocks)
+}
+
+// toolContentLength returns the character length of tool_result content.
+func toolContentLength(tc any) int {
+	switch v := tc.(type) {
+	case string:
+		return len([]rune(v))
+	case []client.ContentBlock:
+		total := 0
+		for _, b := range v {
+			if b.Type == "text" {
+				total += len([]rune(b.Text))
+			}
+		}
+		return total
+	default:
+		return 0
+	}
+}
+
 // compressOldToolResults replaces verbose tool results in old messages
-// with short summaries. Handles both XML-text format (assistant role) and
-// native tool_result blocks (user role). Keeps most recent N uncompressed.
+// with short summaries using a 3-tier strategy:
+//   - Tier 3 (most recent keepRecent): keep full results
+//   - Tier 2 (keepRecent to tier1Threshold from end): truncate to maxChars with head+tail
+//   - Tier 1 (older than tier1Threshold from end): strip to metadata only
 func compressOldToolResults(messages []client.Message, keepRecent int, maxChars int) {
+	const tier1Threshold = 10
+
+	// Pre-scan: build tool_use_id → name+args map for tier-1 metadata.
+	toolCallMap := buildToolCallMap(messages)
+
 	// Find messages that contain tool results (XML text or native blocks)
 	var toolResultIndices []int
 	for i, m := range messages {
@@ -2021,21 +2101,55 @@ func compressOldToolResults(messages []client.Message, keepRecent int, maxChars 
 		return
 	}
 
-	// Compress old ones (everything except the most recent keepRecent)
-	for _, idx := range toolResultIndices[:len(toolResultIndices)-keepRecent] {
+	// Apply tiered compression
+	total := len(toolResultIndices)
+	for i, idx := range toolResultIndices {
+		distFromEnd := total - 1 - i
+
+		if distFromEnd < keepRecent {
+			// Tier 3: keep full
+			continue
+		}
+
 		msg := messages[idx]
-		if msg.Role == "user" && msg.Content.HasBlocks() {
-			// Native blocks: truncate tool_result content
-			messages[idx].Content = compressToolResultBlocks(msg.Content, maxChars)
-		} else {
-			// XML text: parse and truncate
-			text := msg.Content.Text()
-			compressed := compressToolResultText(text, maxChars)
-			if compressed != text {
+
+		if distFromEnd >= tier1Threshold {
+			// Tier 1: strip to metadata
+			if msg.Role == "user" && msg.Content.HasBlocks() {
+				messages[idx].Content = stripToMetadata(msg.Content, toolCallMap)
+			} else {
+				// XML text: aggressive truncation to just tool name
+				text := msg.Content.Text()
+				compressed := compressToolResultText(text, 50)
 				messages[idx].Content = client.NewTextContent(compressed)
+			}
+		} else {
+			// Tier 2: truncate to maxChars with head+tail
+			if msg.Role == "user" && msg.Content.HasBlocks() {
+				messages[idx].Content = compressToolResultBlocks(msg.Content, maxChars)
+			} else {
+				text := msg.Content.Text()
+				compressed := compressToolResultText(text, maxChars)
+				if compressed != text {
+					messages[idx].Content = client.NewTextContent(compressed)
+				}
 			}
 		}
 	}
+}
+
+// truncateHeadTail truncates content to maxChars using a 75/25 head/tail split.
+// Rune-safe — never splits mid-rune. Returns content unchanged if within limit.
+func truncateHeadTail(content string, maxChars int) string {
+	r := []rune(content)
+	if len(r) <= maxChars {
+		return content
+	}
+	keepHead := maxChars * 3 / 4
+	keepTail := maxChars / 4
+	return string(r[:keepHead]) + "\n\n[... truncated " +
+		strconv.Itoa(len(r)-maxChars) + " chars ...]\n\n" +
+		string(r[len(r)-keepTail:])
 }
 
 // compressToolResultBlocks truncates the text content inside tool_result blocks.
@@ -2049,15 +2163,15 @@ func compressToolResultBlocks(mc client.MessageContent, maxChars int) client.Mes
 		}
 		switch v := b.ToolContent.(type) {
 		case string:
-			if r := []rune(v); len(r) > maxChars {
-				b.ToolContent = string(r[:maxChars]) + "... [compressed]"
+			if len([]rune(v)) > maxChars {
+				b.ToolContent = truncateHeadTail(v, maxChars)
 			}
 		case []client.ContentBlock:
 			var newNested []client.ContentBlock
 			for _, nb := range v {
 				if nb.Type == "text" {
-					if r := []rune(nb.Text); len(r) > maxChars {
-						nb.Text = string(r[:maxChars]) + "... [compressed]"
+					if len([]rune(nb.Text)) > maxChars {
+						nb.Text = truncateHeadTail(nb.Text, maxChars)
 					}
 				}
 				// Strip images in compressed results
@@ -2114,8 +2228,8 @@ func compressToolResultText(text string, maxChars int) string {
 
 		// Compress the body
 		body = strings.TrimSpace(body)
-		if bodyRunes := []rune(body); len(bodyRunes) > maxChars {
-			body = string(bodyRunes[:maxChars]) + "... [compressed]"
+		if len([]rune(body)) > maxChars {
+			body = truncateHeadTail(body, maxChars)
 		}
 
 		result.WriteString(formatToolExec(toolName, args, "comp", body, isError))
