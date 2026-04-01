@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"time"
@@ -472,8 +473,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 	a.runMsgInjected = nil     // reset for this run
 	a.runMsgTimestamps = nil   // reset for this run
 
-	// Build tool names from sorted ordering for deterministic system prompt
-	toolNames := a.tools.SortedNames()
+	deferredMode := a.tools.Len() > 30
 
 	cwd, _ := os.Getwd()
 	instrText, _ := instructions.LoadInstructions(a.shannonDir, ".", 4000)
@@ -502,11 +502,42 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 		mem, _ = instructions.LoadMemory(a.shannonDir, 200)
 	}
 
+	// effTools is the effective registry for this run. In deferred mode it's
+	// a clone with tool_search added. In normal mode it's a.tools unchanged.
+	// IMPORTANT: never overwrite a.tools — it's shared across Run() calls.
+	var effTools *ToolRegistry
+	var deferredSummaries []prompt.DeferredToolSummary
+	var toolNames []string
+
+	if deferredMode {
+		deferred := deferredToolNames(a.tools)
+		tsSearch := newToolSearchTool(a.tools, deferred)
+		effTools = a.tools.Clone()
+		effTools.Register(tsSearch)
+
+		// ToolNames = local tools + tool_search
+		local, _, _ := effTools.partitionBySource()
+		sort.Strings(local)
+		toolNames = local
+
+		// Deferred summaries for prompt
+		for _, s := range deferredToolSummaries(effTools) {
+			deferredSummaries = append(deferredSummaries, prompt.DeferredToolSummary{
+				Name:        s.Name,
+				Description: s.Description,
+			})
+		}
+	} else {
+		effTools = a.tools
+		toolNames = a.tools.SortedNames()
+	}
+
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
 		BasePrompt:    basePrompt,
 		Memory:        mem,
 		Instructions:  instrText,
 		ToolNames:     toolNames,
+		DeferredTools: deferredSummaries,
 		MCPContext:    a.mcpContext,
 		CWD:           cwd,
 		Skills:        a.agentSkills,
@@ -516,7 +547,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 
 	// Append cloud delegation guidance to the static system prompt
 	systemPrompt := parts.System
-	if _, hasCloud := a.tools.Get("cloud_delegate"); hasCloud {
+	if _, hasCloud := effTools.Get("cloud_delegate"); hasCloud {
 		systemPrompt += cloudDelegationGuidance
 	}
 
@@ -578,7 +609,17 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 	// of the messages slice. Call immediately after appending any message.
 	stampMessage := func() { msgTimestamps[len(messages)-1] = time.Now() }
 
-	toolSchemas := a.tools.SortedSchemas()
+	var toolSchemas []client.Tool
+	var baseSchemas []client.Tool
+	var loadedDeferred map[string]client.Tool
+
+	if deferredMode {
+		baseSchemas = buildLocalOnlySchemas(effTools)
+		loadedDeferred = make(map[string]client.Tool)
+		toolSchemas = baseSchemas
+	} else {
+		toolSchemas = effTools.SortedSchemas()
+	}
 	usage := &TurnUsage{}
 
 	// Read tracker: enforces read-before-edit for file_edit/file_write
@@ -1102,7 +1143,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 				a.handler.OnToolCall(fc.Name, argsStr)
 			}
 
-			tool, ok := a.tools.Get(fc.Name)
+			tool, ok := effTools.Get(fc.Name)
 			if !ok {
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
@@ -1168,6 +1209,27 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 		if len(approved) > 0 {
 			batches := partitionToolCalls(approved)
 			executeBatches(ctx, batches, execResults, readTracker)
+		}
+
+		// Deferred mode: check if tool_search loaded new tools, rebuild schemas.
+		if deferredMode {
+			for _, ac := range approved {
+				if ac.fc.Name == "tool_search" {
+					er := execResults[ac.index]
+					if !er.result.IsError {
+						names := parseLoadedHeader(er.result.Content)
+						for _, name := range names {
+							if _, exists := loadedDeferred[name]; !exists {
+								schemas := effTools.FullSchemas([]string{name})
+								if len(schemas) > 0 {
+									loadedDeferred[name] = schemas[0]
+								}
+							}
+						}
+						toolSchemas = rebuildSchemas(effTools, baseSchemas, loadedDeferred)
+					}
+				}
+			}
 		}
 
 		// ---- Phase 3 (serial): post-hooks, audit, events, context recording, loop detection ----
@@ -1417,7 +1479,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 
 		// One-shot cloud delegation nudge when struggling with web tasks
 		if !cloudNudgeFired && worstAction >= LoopNudge {
-			if _, hasCloud := a.tools.Get("cloud_delegate"); hasCloud && toolsUsed["http"] > 0 {
+			if _, hasCloud := effTools.Get("cloud_delegate"); hasCloud && toolsUsed["http"] > 0 {
 				cloudNudgeFired = true
 				messages = append(messages, client.Message{
 					Role:    "user",
