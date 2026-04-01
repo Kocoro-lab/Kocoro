@@ -56,7 +56,9 @@ func partitionToolCalls(approved []approvedToolCall) [][]approvedToolCall {
 // capped at maxToolConcurrency. Write batches (len == 1) run directly.
 // After each batch, readTracker is updated for successful file_read calls
 // so that subsequent write batches can pass read-before-edit checks.
-func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResults []toolExecResult, readTracker *ReadTracker) {
+// If handler is non-nil, OnToolCall is fired for each call immediately
+// before execution begins (so "running" status reflects actual execution).
+func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResults []toolExecResult, readTracker *ReadTracker, handler EventHandler) {
 	for _, batch := range batches {
 		if len(batch) == 1 {
 			// Single call: run directly, no goroutine overhead.
@@ -69,6 +71,9 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 						}
 					}
 				}()
+				if handler != nil {
+					handler.OnToolCall(ac.fc.Name, ac.argsStr)
+				}
 				startTime := time.Now()
 				result, runErr := ac.tool.Run(ctx, ac.argsStr)
 				execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr}
@@ -79,7 +84,13 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 			var wg sync.WaitGroup
 			wg.Add(len(batch))
 			for _, ac := range batch {
-				sem <- struct{}{} // acquire
+				sem <- struct{}{} // acquire — blocks until a slot is free
+				// Emit "running" after acquiring the slot so the event reflects
+				// actual execution start, not just batch membership. Called from
+				// the main goroutine so handler writes stay serialized.
+				if handler != nil {
+					handler.OnToolCall(ac.fc.Name, ac.argsStr)
+				}
 				go func(ac approvedToolCall) {
 					defer wg.Done()
 					defer func() { <-sem }() // release

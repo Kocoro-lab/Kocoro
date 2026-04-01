@@ -50,7 +50,7 @@ func TestExecuteBatches_ConcurrencyLimit(t *testing.T) {
 
 	execResults := make([]toolExecResult, 15)
 	batches := partitionToolCalls(approved)
-	executeBatches(context.Background(), batches, execResults, nil)
+	executeBatches(context.Background(), batches, execResults, nil, nil)
 
 	if maxSeen.Load() > int32(maxToolConcurrency) {
 		t.Errorf("max concurrent = %d, want <= %d", maxSeen.Load(), maxToolConcurrency)
@@ -84,7 +84,7 @@ func TestExecuteBatches_PanicRecovery(t *testing.T) {
 
 	execResults := make([]toolExecResult, 3)
 	batches := partitionToolCalls(approved)
-	executeBatches(context.Background(), batches, execResults, nil)
+	executeBatches(context.Background(), batches, execResults, nil, nil)
 
 	// Normal tools should succeed.
 	if execResults[0].result.IsError {
@@ -112,7 +112,7 @@ func TestExecuteBatches_ResultOrdering(t *testing.T) {
 
 	execResults := make([]toolExecResult, 4)
 	batches := partitionToolCalls(approved)
-	executeBatches(context.Background(), batches, execResults, nil)
+	executeBatches(context.Background(), batches, execResults, nil, nil)
 
 	// Verify all results are populated (not default zero values).
 	for i, er := range execResults {
@@ -155,7 +155,7 @@ func TestExecuteBatches_ReadTrackerInterBatch(t *testing.T) {
 		t.Fatalf("expected 2 batches, got %d", len(batches))
 	}
 
-	executeBatches(context.Background(), batches, execResults, rt)
+	executeBatches(context.Background(), batches, execResults, rt, nil)
 
 	if !rt.HasRead(filePath) {
 		t.Error("ReadTracker should have marked file as read between batches")

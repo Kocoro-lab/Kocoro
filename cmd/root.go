@@ -272,9 +272,7 @@ type cliEventHandler struct {
 	autoApprove bool
 }
 
-func (h *cliEventHandler) OnToolCall(name string, args string) {
-	// Deferred — prints on OnToolResult
-}
+func (h *cliEventHandler) OnToolCall(name string, args string) {}
 
 func (h *cliEventHandler) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
 	icon := "✓"

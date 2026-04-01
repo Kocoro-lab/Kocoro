@@ -1246,9 +1246,8 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 				cloudDelegateClaimed = true
 			}
 
-			if a.handler != nil {
-				a.handler.OnToolCall(fc.Name, argsStr)
-			}
+			// OnToolCall for approved tools fires in executeBatches, right before
+			// actual execution starts, so "running" status reflects reality.
 
 			tool, ok := effTools.Get(fc.Name)
 			if !ok {
@@ -1257,6 +1256,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 					result: ToolResult{Content: "unknown tool: " + fc.Name, IsError: true},
 				}
 				if a.handler != nil {
+					a.handler.OnToolCall(fc.Name, argsStr)
 					a.handler.OnToolResult(fc.Name, argsStr, execResults[idx].result, 0)
 				}
 				continue
@@ -1273,6 +1273,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 					result: ToolResult{Content: "tool call denied by permission policy", IsError: true},
 				}
 				if a.handler != nil {
+					a.handler.OnToolCall(fc.Name, argsStr)
 					a.handler.OnToolResult(fc.Name, argsStr, ToolResult{Content: "denied by policy", IsError: true}, 0)
 				}
 				continue
@@ -1285,6 +1286,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 				}
 				deniedCalls[dedupKey] = true
 				if a.handler != nil {
+					a.handler.OnToolCall(fc.Name, argsStr)
 					a.handler.OnToolResult(fc.Name, argsStr, ToolResult{Content: "denied by user", IsError: true}, 0)
 				}
 				continue
@@ -1303,6 +1305,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 						result: ToolResult{Content: "tool call denied by hook: " + hookReason, IsError: true},
 					}
 					if a.handler != nil {
+						a.handler.OnToolCall(fc.Name, argsStr)
 						a.handler.OnToolResult(fc.Name, argsStr, execResults[idx].result, 0)
 					}
 					continue
@@ -1315,7 +1318,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 		// ---- Phase 2 (batched): partition by read-only, execute with concurrency limits ----
 		if len(approved) > 0 {
 			batches := partitionToolCalls(approved)
-			executeBatches(ctx, batches, execResults, readTracker)
+			executeBatches(ctx, batches, execResults, readTracker, a.handler)
 		}
 
 		// Deferred mode: check if tool_search loaded new tools, rebuild schemas.

@@ -120,7 +120,7 @@ type mockHandler struct {
 	lastText          string
 }
 
-func (h *mockHandler) OnToolCall(name string, args string)        {}
+func (h *mockHandler) OnToolCall(name string, args string) {}
 func (h *mockHandler) OnToolResult(name string, args string, result ToolResult, elapsed time.Duration) {
 }
 func (h *mockHandler) OnText(text string)         { h.lastText = text }

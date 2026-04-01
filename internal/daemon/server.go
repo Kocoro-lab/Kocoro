@@ -690,9 +690,6 @@ type sseEventHandler struct {
 }
 
 func (h *sseEventHandler) OnToolCall(name string, args string) {
-	// SSE is request-scoped (one tool stream per HTTP request), so session_id
-	// is intentionally omitted here; session correlation is handled at the client
-	// session boundary.
 	data := mustJSON(map[string]interface{}{"tool": name, "status": "running"})
 	fmt.Fprintf(h.w, "event: tool\ndata: %s\n\n", data)
 	h.flusher.Flush()
