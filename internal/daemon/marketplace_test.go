@@ -251,6 +251,12 @@ func TestHandleMarketplaceInstallSuccess(t *testing.T) {
 		t.Errorf("meta.Description = %q, want %q (registry description leaked into response)",
 			meta.Description, onDiskDesc)
 	}
+	if meta.InstallSource != skills.InstallSourceMarketplace {
+		t.Errorf("meta.InstallSource = %q, want %q", meta.InstallSource, skills.InstallSourceMarketplace)
+	}
+	if meta.MarketplaceSlug != "demo" {
+		t.Errorf("meta.MarketplaceSlug = %q, want demo", meta.MarketplaceSlug)
+	}
 }
 
 func TestHandleMarketplaceInstallMaliciousBlocked(t *testing.T) {
@@ -336,6 +342,123 @@ func TestHandleSkillUsage(t *testing.T) {
 	want := []string{"coder", "researcher"}
 	if len(body.Agents) != 2 || body.Agents[0] != want[0] || body.Agents[1] != want[1] {
 		t.Errorf("Agents = %v, want %v", body.Agents, want)
+	}
+}
+
+func TestHandleListSkillsIncludesMarketplaceProvenance(t *testing.T) {
+	repo := t.TempDir()
+	if err := daemonTestRunGit(repo, "init", "-q", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	daemonTestWriteFile(t, filepath.Join(repo, "SKILL.md"), "---\nname: demo\ndescription: Demo\n---\nbody")
+	daemonTestRunGit(repo, "config", "user.email", "t@e.com")
+	daemonTestRunGit(repo, "config", "user.name", "t")
+	daemonTestRunGit(repo, "config", "commit.gpgsign", "false")
+	daemonTestRunGit(repo, "add", ".")
+	daemonTestRunGit(repo, "commit", "-q", "-m", "init")
+
+	registryJSON := fmt.Sprintf(`{
+		"version":1,
+		"skills":[{"slug":"demo","name":"demo","description":"Demo","author":"a","repo":"file://%s","ref":"main"}]
+	}`, repo)
+	s, _ := newTestServerWithMarketplace(t, registryJSON)
+
+	req := httptest.NewRequest("POST", "/skills/marketplace/install/demo", nil)
+	req.SetPathValue("slug", "demo")
+	rr := httptest.NewRecorder()
+	s.handleMarketplaceInstall(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("install status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest("GET", "/skills", nil)
+	rr = httptest.NewRecorder()
+	s.handleListSkills(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	var body struct {
+		Skills []skills.SkillMeta `json:"skills"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if len(body.Skills) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(body.Skills))
+	}
+	if body.Skills[0].InstallSource != skills.InstallSourceMarketplace {
+		t.Errorf("install_source = %q, want %q", body.Skills[0].InstallSource, skills.InstallSourceMarketplace)
+	}
+	if body.Skills[0].MarketplaceSlug != "demo" {
+		t.Errorf("marketplace_slug = %q, want demo", body.Skills[0].MarketplaceSlug)
+	}
+}
+
+func TestHandleLocalSkillCollisionStaysLocal(t *testing.T) {
+	repo := t.TempDir()
+	if err := daemonTestRunGit(repo, "init", "-q", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	daemonTestWriteFile(t, filepath.Join(repo, "SKILL.md"), "---\nname: ontology\ndescription: Marketplace ontology\n---\nbody")
+	daemonTestRunGit(repo, "config", "user.email", "t@e.com")
+	daemonTestRunGit(repo, "config", "user.name", "t")
+	daemonTestRunGit(repo, "config", "commit.gpgsign", "false")
+	daemonTestRunGit(repo, "add", ".")
+	daemonTestRunGit(repo, "commit", "-q", "-m", "init")
+
+	registryJSON := fmt.Sprintf(`{
+		"version":1,
+		"skills":[{"slug":"ontology","name":"ontology","description":"Registry ontology","author":"a","repo":"file://%s","ref":"main"}]
+	}`, repo)
+	s, _ := newTestServerWithMarketplace(t, registryJSON)
+
+	req := httptest.NewRequest("POST", "/skills/marketplace/install/ontology", nil)
+	req.SetPathValue("slug", "ontology")
+	rr := httptest.NewRecorder()
+	s.handleMarketplaceInstall(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("install status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest("DELETE", "/skills/ontology", nil)
+	req.SetPathValue("name", "ontology")
+	rr = httptest.NewRecorder()
+	s.handleDeleteGlobalSkill(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest("PUT", "/skills/ontology", strings.NewReader(`{"description":"Local fake","prompt":"---\nname: ontology\ndescription: Local fake\n---\n# body"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("name", "ontology")
+	rr = httptest.NewRecorder()
+	s.handlePutGlobalSkill(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("put status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest("GET", "/skills", nil)
+	rr = httptest.NewRecorder()
+	s.handleListSkills(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	var body struct {
+		Skills []skills.SkillMeta `json:"skills"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if len(body.Skills) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(body.Skills))
+	}
+	if body.Skills[0].InstallSource != skills.InstallSourceLocal {
+		t.Errorf("install_source = %q, want %q", body.Skills[0].InstallSource, skills.InstallSourceLocal)
+	}
+	if body.Skills[0].MarketplaceSlug != "" {
+		t.Errorf("marketplace_slug = %q, want empty", body.Skills[0].MarketplaceSlug)
 	}
 }
 

@@ -1268,7 +1268,7 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 	hasBuiltin := builtinErr == nil
 	hasUser := userErr == nil
 	api.Builtin = hasBuiltin && !hasUser   // builtin-only, no user override
-	api.Overridden = hasBuiltin && hasUser  // user override of a builtin
+	api.Overridden = hasBuiltin && hasUser // user override of a builtin
 
 	writeJSON(w, http.StatusOK, api)
 }
@@ -2046,13 +2046,15 @@ func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
 	for _, skill := range list {
 		if skill.Name == name {
 			detail := skills.SkillDetail{
-				Name:          skill.Name,
-				Description:   skill.Description,
-				Prompt:        skill.Prompt,
-				Source:        skill.Source,
-				License:       skill.License,
-				Compatibility: skill.Compatibility,
-				Metadata:      skill.Metadata,
+				Name:            skill.Name,
+				Description:     skill.Description,
+				Prompt:          skill.Prompt,
+				Source:          skill.Source,
+				InstallSource:   skill.InstallSource,
+				MarketplaceSlug: skill.MarketplaceSlug,
+				License:         skill.License,
+				Compatibility:   skill.Compatibility,
+				Metadata:        skill.Metadata,
 			}
 			if len(skill.AllowedTools) > 0 {
 				detail.AllowedTools = skill.AllowedTools

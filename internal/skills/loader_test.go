@@ -197,3 +197,86 @@ func TestLoadSkills_Sorted(t *testing.T) {
 		t.Errorf("expected alpha first, got %s", skills[0].Name)
 	}
 }
+
+func TestLoadSkills_InstallProvenance(t *testing.T) {
+	globalDir := t.TempDir()
+	bundledDir := t.TempDir()
+
+	createSkillDir(t, globalDir, "local-skill", "---\nname: local-skill\ndescription: Local\n---\nlocal")
+	createSkillDir(t, globalDir, "market-skill", "---\nname: market-skill\ndescription: Market\n---\nmarket")
+	createSkillDir(t, bundledDir, "bundled-skill", "---\nname: bundled-skill\ndescription: Bundled\n---\nbundled")
+
+	if err := writeMarketplaceProvenance(filepath.Join(globalDir, "market-skill"), "market-skill"); err != nil {
+		t.Fatalf("write provenance: %v", err)
+	}
+
+	loaded, err := LoadSkills(
+		SkillSource{Dir: globalDir, Source: SourceGlobal},
+		SkillSource{Dir: bundledDir, Source: SourceBundled},
+	)
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+
+	got := make(map[string]*Skill, len(loaded))
+	for _, skill := range loaded {
+		got[skill.Name] = skill
+	}
+
+	if got["local-skill"].InstallSource != InstallSourceLocal {
+		t.Errorf("local-skill install source = %q, want %q", got["local-skill"].InstallSource, InstallSourceLocal)
+	}
+	if got["local-skill"].MarketplaceSlug != "" {
+		t.Errorf("local-skill marketplace slug = %q, want empty", got["local-skill"].MarketplaceSlug)
+	}
+
+	if got["market-skill"].InstallSource != InstallSourceMarketplace {
+		t.Errorf("market-skill install source = %q, want %q", got["market-skill"].InstallSource, InstallSourceMarketplace)
+	}
+	if got["market-skill"].MarketplaceSlug != "market-skill" {
+		t.Errorf("market-skill marketplace slug = %q, want market-skill", got["market-skill"].MarketplaceSlug)
+	}
+
+	if got["bundled-skill"].InstallSource != InstallSourceBundled {
+		t.Errorf("bundled-skill install source = %q, want %q", got["bundled-skill"].InstallSource, InstallSourceBundled)
+	}
+}
+
+func TestWriteGlobalSkillClearsMarketplaceProvenance(t *testing.T) {
+	shannonDir := t.TempDir()
+	skillDir := filepath.Join(shannonDir, "skills", "ontology")
+
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := writeMarketplaceProvenance(skillDir, "ontology"); err != nil {
+		t.Fatalf("write provenance: %v", err)
+	}
+
+	err := WriteGlobalSkill(shannonDir, &Skill{
+		Name:        "ontology",
+		Description: "Local replacement",
+		Prompt:      "# local body",
+	})
+	if err != nil {
+		t.Fatalf("WriteGlobalSkill: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(skillDir, marketplaceProvenanceFile)); !os.IsNotExist(err) {
+		t.Fatalf("provenance marker should be removed, stat err = %v", err)
+	}
+
+	loaded, err := LoadSkills(SkillSource{Dir: filepath.Join(shannonDir, "skills"), Source: SourceGlobal})
+	if err != nil {
+		t.Fatalf("LoadSkills: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(loaded))
+	}
+	if loaded[0].InstallSource != InstallSourceLocal {
+		t.Errorf("install source = %q, want %q", loaded[0].InstallSource, InstallSourceLocal)
+	}
+	if loaded[0].MarketplaceSlug != "" {
+		t.Errorf("marketplace slug = %q, want empty", loaded[0].MarketplaceSlug)
+	}
+}

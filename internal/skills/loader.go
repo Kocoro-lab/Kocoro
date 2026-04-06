@@ -77,6 +77,7 @@ func LoadSkills(sources ...SkillSource) ([]*Skill, error) {
 				return nil, fmt.Errorf("loading skill %s: %w", name, err)
 			}
 			s.Dir = skillDir
+			s.InstallSource, s.MarketplaceSlug = installProvenanceForSkill(src.Source, skillDir)
 			seen[name] = true
 			result = append(result, s)
 		}

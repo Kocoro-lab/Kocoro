@@ -181,9 +181,9 @@ func (c *MarketplaceClient) IsStale() bool {
 // Sentinel errors so daemon handlers can map to exact HTTP statuses without
 // parsing message strings.
 var (
-	ErrSkillAlreadyInstalled     = errors.New("skill already installed")
-	ErrMaliciousSkill            = errors.New("skill blocked by security scan")
-	ErrInvalidSkillPayload       = errors.New("invalid skill payload")
+	ErrSkillAlreadyInstalled      = errors.New("skill already installed")
+	ErrMaliciousSkill             = errors.New("skill blocked by security scan")
+	ErrInvalidSkillPayload        = errors.New("invalid skill payload")
 	ErrMarketplaceUpstreamFailure = errors.New("marketplace upstream failure")
 )
 
@@ -268,6 +268,9 @@ func InstallFromMarketplace(ctx context.Context, shannonDir string, entry Market
 	}
 	if parsed.Name != entry.Slug {
 		return fmt.Errorf("%w: frontmatter name %q != slug %q", ErrInvalidSkillPayload, parsed.Name, entry.Slug)
+	}
+	if err := writeMarketplaceProvenance(stageDir, entry.Slug); err != nil {
+		return fmt.Errorf("write marketplace provenance: %w", err)
 	}
 
 	// Atomic rename into place.
