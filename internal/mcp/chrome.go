@@ -41,6 +41,10 @@ var (
 	ensureChromeDebugPortFn = EnsureChromeDebugPort
 )
 
+// CDPChromeProfile overrides automatic profile detection when non-empty.
+// Set from daemon config (daemon.chrome_profile).
+var CDPChromeProfile string
+
 var chromeLoopbackHosts = []string{"127.0.0.1", "::1"}
 
 // IsChromeCDPReachable checks if Chrome's CDP endpoint is responding on the given port.
@@ -157,14 +161,30 @@ func LaunchCDPChrome(port int) error {
 		os.Remove(filepath.Join(cdpDataDir, "SingletonSocket"))
 	}
 
-	// Only seed the CDP profile on first launch — copying into an existing
-	// profile while Chrome is running can corrupt lock files.
+	// Determine which Chrome profile to copy from.
+	srcChromeDir := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
+	profileName := CDPChromeProfile
+	if profileName == "" {
+		profileName = detectActiveProfile(srcChromeDir)
+	}
+
+	// Re-seed when the source profile has changed or on first launch.
+	profileMarker := filepath.Join(cdpDataDir, ".profile_source")
+	needSeed := false
 	cookiesPath := filepath.Join(cdpDataDir, "Default", "Cookies")
 	if _, err := os.Stat(cookiesPath); err != nil {
-		srcProfile := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
-		if err := prepareCDPProfile(srcProfile, cdpDataDir); err != nil {
+		needSeed = true // first launch
+	} else if prev, err := os.ReadFile(profileMarker); err != nil || string(prev) != profileName {
+		needSeed = true // profile changed
+		log.Printf("[chrome-cdp] Profile changed from %q to %q, re-seeding", string(prev), profileName)
+		os.RemoveAll(filepath.Join(cdpDataDir, "Default")) //nolint:errcheck
+	}
+	if needSeed {
+		log.Printf("[chrome-cdp] Seeding CDP profile from %q", profileName)
+		if err := prepareCDPProfile(srcChromeDir, profileName, cdpDataDir); err != nil {
 			return fmt.Errorf("failed to prepare CDP profile: %w", err)
 		}
+		os.WriteFile(profileMarker, []byte(profileName), 0600) //nolint:errcheck
 	}
 
 	log.Printf("[chrome-cdp] Launching CDP Chrome minimized (port %d)", port)
@@ -1084,10 +1104,30 @@ func removeCDPPIDFile(home string) {
 	os.Remove(cdpPIDFilePath(home))
 }
 
+// detectActiveProfile reads Chrome's Local State file and returns the
+// last-used profile directory name (e.g. "Profile 6"). Falls back to "Default".
+func detectActiveProfile(chromeDir string) string {
+	data, err := os.ReadFile(filepath.Join(chromeDir, "Local State"))
+	if err != nil {
+		return "Default"
+	}
+	var state struct {
+		Profile struct {
+			LastUsed string `json:"last_used"`
+		} `json:"profile"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil || state.Profile.LastUsed == "" {
+		return "Default"
+	}
+	return state.Profile.LastUsed
+}
+
 // prepareCDPProfile creates a Chrome user-data-dir for CDP by copying key
 // session files from the user's real Chrome profile.
-func prepareCDPProfile(srcProfile, cdpDir string) error {
-	defaultSrc := filepath.Join(srcProfile, "Default")
+// profileName is the source profile directory (e.g. "Default", "Profile 6").
+// The destination always uses "Default" since the CDP instance only needs one profile.
+func prepareCDPProfile(srcProfile, profileName, cdpDir string) error {
+	profileSrc := filepath.Join(srcProfile, profileName)
 	defaultDst := filepath.Join(cdpDir, "Default")
 
 	if err := os.MkdirAll(defaultDst, 0700); err != nil {
@@ -1097,6 +1137,10 @@ func prepareCDPProfile(srcProfile, cdpDir string) error {
 	if err := copyFile(filepath.Join(srcProfile, "Local State"), filepath.Join(cdpDir, "Local State")); err != nil {
 		log.Printf("[chrome-cdp] failed to copy Local State: %v", err)
 	}
+
+	// Rewrite last_used to "Default" so Chrome opens the profile we seeded,
+	// not the original profile name which would create an empty new directory.
+	patchLocalStateLastUsed(filepath.Join(cdpDir, "Local State"))
 
 	// Critical files are logged on failure; others are best-effort.
 	criticalFiles := map[string]bool{
@@ -1113,7 +1157,7 @@ func prepareCDPProfile(srcProfile, cdpDir string) error {
 		"Network/TransportSecurity",
 	}
 	for _, f := range sessionFiles {
-		src := filepath.Join(defaultSrc, f)
+		src := filepath.Join(profileSrc, f)
 		dst := filepath.Join(defaultDst, f)
 		os.MkdirAll(filepath.Dir(dst), 0700) //nolint:errcheck
 		if err := copyFile(src, dst); err != nil && criticalFiles[f] {
@@ -1122,6 +1166,30 @@ func prepareCDPProfile(srcProfile, cdpDir string) error {
 	}
 
 	return nil
+}
+
+// patchLocalStateLastUsed rewrites profile.last_used to "Default" in the
+// copied Local State file so Chrome uses the Default profile directory where
+// we placed the copied session data.
+func patchLocalStateLastUsed(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		return
+	}
+	profile, ok := state["profile"].(map[string]any)
+	if !ok {
+		return
+	}
+	profile["last_used"] = "Default"
+	patched, err := json.Marshal(state)
+	if err != nil {
+		return
+	}
+	os.WriteFile(path, patched, 0600) //nolint:errcheck
 }
 
 func copyFile(src, dst string) error {

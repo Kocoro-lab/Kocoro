@@ -73,6 +73,9 @@ var daemonStartCmd = &cobra.Command{
 		// so any Chrome CDP we find is truly orphaned (not owned by a peer).
 		mcp.CleanupOrphanedCDPChrome()
 
+		// Apply configured Chrome profile override before any CDP launch.
+		mcp.CDPChromeProfile = cfg.Daemon.ChromeProfile
+
 		gw := client.NewGatewayClient(cfg.Endpoint, cfg.APIKey)
 		baselineReg, reg, skillsPtr, mcpMgr, cleanup, serverErr := tools.RegisterAllWithBaseline(gw, cfg)
 		if serverErr != nil {

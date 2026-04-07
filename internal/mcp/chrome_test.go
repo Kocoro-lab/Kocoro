@@ -608,3 +608,106 @@ func resetBrowserWSMemoryCache(t *testing.T) {
 		cachedBrowserMu.Unlock()
 	})
 }
+
+func TestDetectActiveProfile(t *testing.T) {
+	dir := t.TempDir()
+	state := map[string]any{
+		"profile": map[string]any{
+			"last_used": "Profile 6",
+		},
+	}
+	data, _ := json.Marshal(state)
+	os.WriteFile(filepath.Join(dir, "Local State"), data, 0600)
+
+	got := detectActiveProfile(dir)
+	if got != "Profile 6" {
+		t.Fatalf("expected 'Profile 6', got %q", got)
+	}
+}
+
+func TestDetectActiveProfile_FallbackMissingFile(t *testing.T) {
+	got := detectActiveProfile(t.TempDir())
+	if got != "Default" {
+		t.Fatalf("expected 'Default' fallback, got %q", got)
+	}
+}
+
+func TestDetectActiveProfile_FallbackEmptyField(t *testing.T) {
+	dir := t.TempDir()
+	state := map[string]any{"profile": map[string]any{}}
+	data, _ := json.Marshal(state)
+	os.WriteFile(filepath.Join(dir, "Local State"), data, 0600)
+
+	got := detectActiveProfile(dir)
+	if got != "Default" {
+		t.Fatalf("expected 'Default' fallback, got %q", got)
+	}
+}
+
+func TestPrepareCDPProfile_CustomProfile(t *testing.T) {
+	srcDir := t.TempDir()
+	cdpDir := t.TempDir()
+
+	// Create source profile "Profile 6" with a Cookies file.
+	profileDir := filepath.Join(srcDir, "Profile 6")
+	os.MkdirAll(profileDir, 0700)
+	os.WriteFile(filepath.Join(profileDir, "Cookies"), []byte("cookie-data"), 0600)
+	os.WriteFile(filepath.Join(profileDir, "Login Data"), []byte("login-data"), 0600)
+	os.MkdirAll(filepath.Join(profileDir, "Network"), 0700)
+	os.WriteFile(filepath.Join(profileDir, "Network", "Cookies"), []byte("net-cookie"), 0600)
+
+	// Create a realistic Local State with last_used pointing to the source profile.
+	srcLocalState := map[string]any{
+		"profile": map[string]any{"last_used": "Profile 6"},
+	}
+	srcLocalData, _ := json.Marshal(srcLocalState)
+	os.WriteFile(filepath.Join(srcDir, "Local State"), srcLocalData, 0600)
+
+	err := prepareCDPProfile(srcDir, "Profile 6", cdpDir)
+	if err != nil {
+		t.Fatalf("prepareCDPProfile failed: %v", err)
+	}
+
+	// Verify files ended up in cdpDir/Default (not cdpDir/Profile 6).
+	cookies, err := os.ReadFile(filepath.Join(cdpDir, "Default", "Cookies"))
+	if err != nil {
+		t.Fatalf("Cookies not copied: %v", err)
+	}
+	if string(cookies) != "cookie-data" {
+		t.Fatalf("unexpected Cookies content: %q", cookies)
+	}
+
+	login, err := os.ReadFile(filepath.Join(cdpDir, "Default", "Login Data"))
+	if err != nil {
+		t.Fatalf("Login Data not copied: %v", err)
+	}
+	if string(login) != "login-data" {
+		t.Fatalf("unexpected Login Data content: %q", login)
+	}
+
+	netCookies, err := os.ReadFile(filepath.Join(cdpDir, "Default", "Network", "Cookies"))
+	if err != nil {
+		t.Fatalf("Network/Cookies not copied: %v", err)
+	}
+	if string(netCookies) != "net-cookie" {
+		t.Fatalf("unexpected Network/Cookies content: %q", netCookies)
+	}
+
+	// Verify Local State was patched: last_used must be "Default" so Chrome
+	// opens the profile directory where we placed the copied session data.
+	lsData, err := os.ReadFile(filepath.Join(cdpDir, "Local State"))
+	if err != nil {
+		t.Fatalf("Local State not copied: %v", err)
+	}
+	var patchedState struct {
+		Profile struct {
+			LastUsed string `json:"last_used"`
+		} `json:"profile"`
+	}
+	if err := json.Unmarshal(lsData, &patchedState); err != nil {
+		t.Fatalf("Local State not valid JSON: %v", err)
+	}
+	if patchedState.Profile.LastUsed != "Default" {
+		t.Fatalf("Local State last_used should be 'Default', got %q", patchedState.Profile.LastUsed)
+	}
+}
