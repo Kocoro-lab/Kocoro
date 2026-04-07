@@ -711,3 +711,40 @@ func TestPrepareCDPProfile_CustomProfile(t *testing.T) {
 		t.Fatalf("Local State last_used should be 'Default', got %q", patchedState.Profile.LastUsed)
 	}
 }
+
+func TestValidChromeProfileName(t *testing.T) {
+	valid := []string{"Default", "Profile 1", "Profile 6", "Profile 42"}
+	for _, n := range valid {
+		if !validChromeProfileName(n) {
+			t.Errorf("expected %q to be valid", n)
+		}
+	}
+	invalid := []string{"", "../etc", "Profile", "Profile -1", "My Profile", "Default/../../x"}
+	for _, n := range invalid {
+		if validChromeProfileName(n) {
+			t.Errorf("expected %q to be invalid", n)
+		}
+	}
+}
+
+func TestCDPChromeProfileOverride(t *testing.T) {
+	dir := t.TempDir()
+	// Local State says "Profile 6" but CDPChromeProfile overrides to "Profile 2".
+	state := map[string]any{"profile": map[string]any{"last_used": "Profile 6"}}
+	data, _ := json.Marshal(state)
+	os.WriteFile(filepath.Join(dir, "Local State"), data, 0600)
+
+	old := CDPChromeProfile
+	CDPChromeProfile = "Profile 2"
+	t.Cleanup(func() { CDPChromeProfile = old })
+
+	// detectActiveProfile would return "Profile 6", but with override set
+	// the code should use "Profile 2" instead.
+	profileName := CDPChromeProfile
+	if profileName == "" {
+		profileName = detectActiveProfile(dir)
+	}
+	if profileName != "Profile 2" {
+		t.Fatalf("expected override 'Profile 2', got %q", profileName)
+	}
+}

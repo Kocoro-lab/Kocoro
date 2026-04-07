@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -167,15 +168,20 @@ func LaunchCDPChrome(port int) error {
 	if profileName == "" {
 		profileName = detectActiveProfile(srcChromeDir)
 	}
+	if !validChromeProfileName(profileName) {
+		return fmt.Errorf("invalid chrome profile name %q: must be 'Default' or 'Profile N'", profileName)
+	}
 
 	// Re-seed when the source profile has changed or on first launch.
+	// The .profile_source marker is the sole seed trigger — it handles both
+	// first launch (marker missing) and profile switches (marker mismatch).
 	profileMarker := filepath.Join(cdpDataDir, ".profile_source")
 	needSeed := false
-	cookiesPath := filepath.Join(cdpDataDir, "Default", "Cookies")
-	if _, err := os.Stat(cookiesPath); err != nil {
-		needSeed = true // first launch
-	} else if prev, err := os.ReadFile(profileMarker); err != nil || string(prev) != profileName {
-		needSeed = true // profile changed
+	prev, err := os.ReadFile(profileMarker)
+	if err != nil {
+		needSeed = true // first launch or upgrade from old code
+	} else if string(prev) != profileName {
+		needSeed = true
 		log.Printf("[chrome-cdp] Profile changed from %q to %q, re-seeding", string(prev), profileName)
 		os.RemoveAll(filepath.Join(cdpDataDir, "Default")) //nolint:errcheck
 	}
@@ -1104,6 +1110,14 @@ func removeCDPPIDFile(home string) {
 	os.Remove(cdpPIDFilePath(home))
 }
 
+var chromeProfileRe = regexp.MustCompile(`^(Default|Profile \d+)$`)
+
+// validChromeProfileName checks that a profile directory name matches Chrome's
+// naming convention ("Default" or "Profile N"), preventing path traversal.
+func validChromeProfileName(name string) bool {
+	return chromeProfileRe.MatchString(name)
+}
+
 // detectActiveProfile reads Chrome's Local State file and returns the
 // last-used profile directory name (e.g. "Profile 6"). Falls back to "Default".
 func detectActiveProfile(chromeDir string) string {
@@ -1182,6 +1196,7 @@ func patchLocalStateLastUsed(path string) {
 	}
 	profile, ok := state["profile"].(map[string]any)
 	if !ok {
+		log.Printf("[chrome-cdp] Local State profile key has unexpected type, skipping patch")
 		return
 	}
 	profile["last_used"] = "Default"
