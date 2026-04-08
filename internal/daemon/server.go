@@ -420,11 +420,13 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	}
 	result := make([]agentInfo, 0, len(entries))
 	for _, entry := range entries {
+		// Hide pure builtin sub-agents from the listing.
+		// They become visible only if the user explicitly overrides them.
+		if entry.Builtin {
+			continue
+		}
 		// Resolve effective directory for definition files
 		dir := filepath.Join(s.deps.AgentsDir, entry.Name)
-		if entry.Builtin {
-			dir = filepath.Join(s.deps.AgentsDir, "_builtin", entry.Name)
-		}
 		// Memory is always in top-level runtime dir
 		runtimeDir := filepath.Join(s.deps.AgentsDir, entry.Name)
 		_, memErr := os.Stat(filepath.Join(runtimeDir, "MEMORY.md"))

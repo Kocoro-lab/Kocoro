@@ -16,6 +16,13 @@ import (
 // MaxConcurrentAgents limits how many agent loops can run simultaneously.
 const MaxConcurrentAgents = 5
 
+const dedupTTL = 10 * time.Minute
+
+type processedEntry struct {
+	status    string // "running" | "done"
+	timestamp time.Time
+}
+
 type Client struct {
 	endpoint      string
 	apiKey        string
@@ -27,11 +34,12 @@ type Client struct {
 	pendingClaims sync.Map   // map[string]chan bool
 	activeMsgs    sync.Map   // map[string]context.CancelFunc
 	eventSeqs     sync.Map   // map[string]*atomic.Int64
-	connected     atomic.Bool
-	activeAgent   atomic.Value // stores string
-	startTime     time.Time
-	broker        *ApprovalBroker
-	eventBus      *EventBus
+	connected       atomic.Bool
+	activeAgent     atomic.Value // stores string
+	startTime       time.Time
+	broker          *ApprovalBroker
+	eventBus        *EventBus
+	processedMsgs   sync.Map // map[string]processedEntry — dedup for message_id
 }
 
 // SetEventBus sets the event bus for emitting daemon events.
@@ -295,6 +303,17 @@ func (c *Client) Listen(ctx context.Context) error {
 }
 
 func (c *Client) handleMessage(ctx context.Context, sm ServerMessage) {
+	// --- Dedup check: drop duplicate message_id ---
+	if val, ok := c.processedMsgs.Load(sm.MessageID); ok {
+		entry := val.(processedEntry)
+		if entry.status == "running" || time.Since(entry.timestamp) < dedupTTL {
+			log.Printf("daemon: dropping duplicate message %s (status=%s, age=%v)", sm.MessageID, entry.status, time.Since(entry.timestamp).Round(time.Second))
+			return
+		}
+	}
+	c.processedMsgs.Store(sm.MessageID, processedEntry{status: "running", timestamp: time.Now()})
+	defer c.processedMsgs.Store(sm.MessageID, processedEntry{status: "done", timestamp: time.Now()})
+
 	var payload MessagePayload
 	if err := json.Unmarshal(sm.Payload, &payload); err != nil {
 		log.Printf("daemon: invalid message payload: %v", err)
@@ -400,9 +419,39 @@ func (c *Client) handleMessage(ctx context.Context, sm ServerMessage) {
 	}
 }
 
+// sweepProcessedMsgs removes expired entries from the dedup table.
+// "done" entries are removed after dedupTTL; "running" entries are removed
+// after 1 hour as a safety net against handler panics or leaked goroutines.
+func (c *Client) sweepProcessedMsgs() {
+	const staleRunningTTL = 1 * time.Hour
+	c.processedMsgs.Range(func(key, value any) bool {
+		entry := value.(processedEntry)
+		age := time.Since(entry.timestamp)
+		if (entry.status == "done" && age > dedupTTL) ||
+			(entry.status == "running" && age > staleRunningTTL) {
+			c.processedMsgs.Delete(key)
+		}
+		return true
+	})
+}
+
 // RunWithReconnect connects to the server and reconnects on failure with
 // exponential backoff. It blocks until the context is cancelled.
 func (c *Client) RunWithReconnect(ctx context.Context) {
+	// Start dedup sweeper
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				c.sweepProcessedMsgs()
+			}
+		}
+	}()
+
 	backoff := time.Second
 	maxBackoff := 30 * time.Second
 	for {

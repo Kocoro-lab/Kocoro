@@ -271,7 +271,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		agentName = ""
 	}
 	req.Agent = agentName
-	explicitAgent := agentName != "" // explicitly requested, not parsed from @mention
 
 	// Parse @mention if no explicit agent was provided.
 	if agentName == "" {
@@ -285,10 +284,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if agentName != "" {
 		a, loadErr := agents.LoadAgent(deps.AgentsDir, agentName)
 		if loadErr != nil {
-			if explicitAgent {
-				return nil, fmt.Errorf("agent not found: %s", agentName)
-			}
-			// @mention fallback: use default agent
+			// Agent removed or renamed — fall back to default gracefully.
 			log.Printf("daemon: agent %q not found: %v, using default", agentName, loadErr)
 			agentName = ""
 			prompt = req.Text
@@ -521,6 +517,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetTemperature(runCfg.Agent.Temperature)
 	loop.SetContextWindow(runCfg.Agent.ContextWindow)
 	loop.SetEnableStreaming(false)
+	loop.SetQuiet(true)
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
 	if agentOverride != nil {
 		scopedMCPCtx := tools.ResolveMCPContext(runCfg, agentOverride)
@@ -554,6 +551,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		ac := agentOverride.Config.Agent
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
+		}
+		if ac.ModelTier != nil {
+			loop.SetModelTier(*ac.ModelTier)
 		}
 		if ac.MaxIterations != nil {
 			loop.SetMaxIterations(*ac.MaxIterations)
@@ -613,10 +613,89 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 
+	// Wire SubAgentRunner: inject a fully-wired child AgentLoop builder per-run.
+	// Must use reg (cloned), not baseReg (shared), to avoid race across routes.
+	if st, ok := reg.Get("subagent"); ok {
+		if sat, ok := st.(*tools.SubAgentTool); ok {
+			sat.SetRunner(func(ctx context.Context, ag *agents.Agent, prompt string, childReg *agent.ToolRegistry, handler agent.EventHandler) tools.SubAgentResult {
+				start := time.Now()
+				childLoop := agent.NewAgentLoop(deps.GW, childReg, runCfg.ModelTier, deps.ShannonDir,
+					tools.SubAgentMaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation,
+					&runCfg.Permissions, deps.Auditor, deps.HookRunner)
+				childLoop.SetMaxTokens(tools.SubAgentMaxTokens)
+				childLoop.SetTemperature(runCfg.Agent.Temperature)
+				childLoop.SetContextWindow(runCfg.Agent.ContextWindow)
+				childLoop.SetEnableStreaming(false)
+				childLoop.SetQuiet(true)
+				// Disable thinking for sub-agents to control output token costs.
+				// Thinking tokens often exceed actual output; disabling saves 50%+.
+				childLoop.SetThinking(&client.ThinkingConfig{Type: "disabled"})
+				childLoop.SetSessionCWD(effectiveCWD)
+				childLoop.SetHandler(handler)
+
+				childAgentName := ag.Name
+				childAgentDir := filepath.Join(deps.ShannonDir, "agents", childAgentName)
+				childMCPCtx := tools.ResolveMCPContext(runCfg, ag)
+				childLoop.SwitchAgent(ag.Prompt, childAgentDir, nil, childMCPCtx, ag.Skills)
+
+				// Apply per-agent model config overrides
+				if ag.Config != nil && ag.Config.Agent != nil {
+					ac := ag.Config.Agent
+					if ac.Model != nil {
+						childLoop.SetSpecificModel(*ac.Model)
+					}
+					if ac.ModelTier != nil {
+						childLoop.SetModelTier(*ac.ModelTier)
+						log.Printf("[subagent] %s: model_tier override → %s", childAgentName, *ac.ModelTier)
+					}
+					if ac.MaxIterations != nil {
+						childLoop.SetMaxIterations(*ac.MaxIterations)
+					}
+					if ac.Temperature != nil {
+						childLoop.SetTemperature(*ac.Temperature)
+					}
+					if ac.MaxTokens != nil {
+						childLoop.SetMaxTokens(*ac.MaxTokens)
+					}
+					if ac.ContextWindow != nil {
+						childLoop.SetContextWindow(*ac.ContextWindow)
+					}
+				}
+
+				childTimeout := 30 * time.Minute // safety net only; maxIterations is the primary limiter
+				if ag.Config != nil && ag.Config.Agent != nil && ag.Config.Agent.Timeout != nil {
+					if d, err := time.ParseDuration(*ag.Config.Agent.Timeout); err == nil && d > 0 {
+						childTimeout = d
+					}
+				}
+				childCtx, cancel := context.WithTimeout(ctx, childTimeout)
+				defer cancel()
+
+				output, usage, err := childLoop.Run(childCtx, prompt, nil)
+				result := tools.SubAgentResult{
+					Output:   output,
+					Duration: time.Since(start),
+					Err:      err,
+				}
+				if usage != nil {
+					result.InputTokens = usage.InputTokens
+					result.OutputTokens = usage.OutputTokens
+					result.TotalTokens = usage.TotalTokens
+					result.LLMCalls = usage.LLMCalls
+					result.CostUSD = usage.CostUSD
+				}
+				return result
+			})
+			sat.SetBaseRegistry(reg)
+		}
+	}
+
 	if routeInjectCh != nil {
 		loop.SetInjectCh(routeInjectCh)
 	}
 	loop.SetSessionID(sess.ID)
+	// Scope task store to this session so parallel routes don't mix tasks.
+	tools.OverrideTaskStoreDir(reg, filepath.Join(deps.ShannonDir, "tasks", sess.ID))
 	loop.SetSessionCWD(effectiveCWD)
 	loop.SetWorkingSet(sessMgr.WorkingSet(sess.ID))
 	sessMgr.OnSessionClose(sess.ID, loop.SpillCleanupFunc())

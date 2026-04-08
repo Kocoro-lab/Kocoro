@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -396,5 +397,173 @@ func TestClient_SendReply_CleansUpSeq(t *testing.T) {
 
 	if _, loaded := c.eventSeqs.Load("msg-cleanup"); loaded {
 		t.Error("eventSeqs entry should have been deleted by SendReply")
+	}
+}
+
+func TestClient_Dedup_DropsDuplicateMessage(t *testing.T) {
+	var callCount atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		payload, _ := json.Marshal(MessagePayload{Channel: "slack", Text: "hello", ThreadID: "t1"})
+
+		// Send the same message_id twice.
+		for i := 0; i < 2; i++ {
+			conn.WriteJSON(ServerMessage{Type: MsgTypeMessage, MessageID: "dup-001", Payload: payload})
+
+			// Read the claim (only first message should send one).
+			var dm DaemonMessage
+			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			if err := conn.ReadJSON(&dm); err != nil {
+				// Second iteration: no claim expected (deduped), timeout is fine.
+				continue
+			}
+
+			if dm.Type == MsgTypeClaim {
+				// Grant the claim.
+				ackPayload, _ := json.Marshal(ClaimAckPayload{Granted: true})
+				conn.WriteJSON(ServerMessage{Type: MsgTypeClaimAck, MessageID: "dup-001", Payload: ackPayload})
+
+				// Drain until reply.
+				for {
+					var reply DaemonMessage
+					conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+					if err := conn.ReadJSON(&reply); err != nil {
+						return
+					}
+					if reply.Type == MsgTypeReply {
+						return
+					}
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c := NewClient(wsURL, "", func(msg MessagePayload) string {
+		callCount.Add(1)
+		return fmt.Sprintf("result-%d", callCount.Load())
+	}, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := c.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	go c.Listen(ctx)
+
+	// Wait enough time for both messages to be processed.
+	time.Sleep(1 * time.Second)
+	cancel()
+
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("onMsg called %d times, want 1 (duplicate should be deduped)", got)
+	}
+}
+
+func TestClient_Dedup_AllowsNewMessageID(t *testing.T) {
+	var callCount atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		for i := 1; i <= 2; i++ {
+			msgID := fmt.Sprintf("unique-%03d", i)
+			payload, _ := json.Marshal(MessagePayload{Channel: "slack", Text: fmt.Sprintf("msg%d", i)})
+
+			conn.WriteJSON(ServerMessage{Type: MsgTypeMessage, MessageID: msgID, Payload: payload})
+
+			// Read claim.
+			var dm DaemonMessage
+			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if err := conn.ReadJSON(&dm); err != nil {
+				return
+			}
+
+			if dm.Type != MsgTypeClaim {
+				t.Errorf("expected claim, got %s", dm.Type)
+				return
+			}
+
+			// Grant.
+			ackPayload, _ := json.Marshal(ClaimAckPayload{Granted: true})
+			conn.WriteJSON(ServerMessage{Type: MsgTypeClaimAck, MessageID: msgID, Payload: ackPayload})
+
+			// Drain until reply.
+			for {
+				var reply DaemonMessage
+				conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+				if err := conn.ReadJSON(&reply); err != nil {
+					return
+				}
+				if reply.Type == MsgTypeReply {
+					break
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c := NewClient(wsURL, "", func(msg MessagePayload) string {
+		callCount.Add(1)
+		return "ok"
+	}, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := c.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	go c.Listen(ctx)
+
+	// Wait for both messages to complete.
+	time.Sleep(2 * time.Second)
+
+	if got := callCount.Load(); got != 2 {
+		t.Errorf("onMsg called %d times, want 2 (two distinct message IDs)", got)
+	}
+}
+
+func TestClient_Dedup_SweeperCleansExpired(t *testing.T) {
+	c := NewClient("ws://localhost:1/x", "", nil, nil)
+
+	// Insert an expired "done" entry (timestamp well beyond TTL).
+	c.processedMsgs.Store("expired-msg", processedEntry{
+		status:    "done",
+		timestamp: time.Now().Add(-(dedupTTL + time.Minute)),
+	})
+
+	// Insert a fresh "done" entry (within TTL).
+	c.processedMsgs.Store("fresh-msg", processedEntry{
+		status:    "done",
+		timestamp: time.Now(),
+	})
+
+	c.sweepProcessedMsgs()
+
+	if _, ok := c.processedMsgs.Load("expired-msg"); ok {
+		t.Error("expired entry should have been removed by sweeper")
+	}
+	if _, ok := c.processedMsgs.Load("fresh-msg"); !ok {
+		t.Error("fresh entry should have been retained by sweeper")
 	}
 }
