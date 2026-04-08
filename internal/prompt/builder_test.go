@@ -326,6 +326,36 @@ func TestBuildSystemPrompt_OutputFormatPlain(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_VolatileContainsContextManagement(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{BasePrompt: "Base."})
+	if !strings.Contains(parts.VolatileContext, "tool results may be cleared") {
+		t.Error("VolatileContext should contain context management warning")
+	}
+}
+
+func TestBuildSystemPrompt_SubagentGuidanceContainsOutputSpec(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+		ToolNames:  []string{"subagent", "bash"},
+	})
+	if !strings.Contains(parts.System, "absolute paths") {
+		t.Error("sub-agent guidance should mention absolute paths")
+	}
+	if !strings.Contains(parts.System, "concise report") {
+		t.Error("sub-agent guidance should specify output format")
+	}
+}
+
+func TestBuildSystemPrompt_SubagentGuidanceAbsentWithoutTool(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+		ToolNames:  []string{"bash", "file_read"},
+	})
+	if strings.Contains(parts.System, "Sub-Agents") {
+		t.Error("sub-agent guidance should not appear without subagent tool")
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	tests := []struct {
 		name     string

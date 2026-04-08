@@ -3,6 +3,7 @@ package prompt
 import (
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -112,6 +113,33 @@ func buildStaticSystem(opts PromptOptions) string {
 		sb.WriteString(".")
 	}
 
+	// 2b. Sub-agent guidance (only when subagent is available)
+	if hasSubagent(opts.ToolNames) {
+		sb.WriteString("\n\n## Using Sub-Agents\n")
+		sb.WriteString("Sub-agents run full agent loops in isolation — powerful but not free.\n\n")
+		sb.WriteString("**When to spawn:**\n")
+		sb.WriteString("- Simple, specific tasks (read a file, search a term, run one command) → use direct tools.\n")
+		sb.WriteString("- Broad tasks across multiple items or areas → spawn sub-agents immediately.\n")
+		sb.WriteString("- Launch multiple agents concurrently in a SINGLE response for parallel execution.\n\n")
+		sb.WriteString("**Sub-agent rules:**\n")
+		sb.WriteString("- Once you delegate, commit fully — don't also do the work yourself.\n")
+		sb.WriteString("- Sub-agents cannot see this conversation. Include ALL necessary context in the prompt.\n")
+		sb.WriteString("- Sub-agents cannot spawn further sub-agents. Do not ask them to delegate.\n\n")
+		sb.WriteString("**Writing the prompt:**\n")
+		sb.WriteString("- Use absolute paths (e.g. /Users/name/project/file.txt), never relative.\n")
+		sb.WriteString("- Tell the sub-agent to return a concise report: what was done, key findings, and relevant file paths (absolute).")
+	}
+
+	// 2c. Task tracking guidance (only when task tools are available)
+	if hasTasks(opts.ToolNames) {
+		sb.WriteString("\n\n## Task Tracking\n")
+		sb.WriteString("Break down and manage your work with the task_create tool. These tools help you plan work and show progress to the user. Mark each task completed as soon as you finish it — do not batch.\n\n")
+		sb.WriteString("**When to use:** 3+ step tasks, user provides multiple tasks, complex work needing planning.\n")
+		sb.WriteString("**Skip for:** single actions, trivial changes, quick questions.\n\n")
+		sb.WriteString("Workflow: create tasks → set in_progress before starting each → set completed immediately after finishing. ")
+		sb.WriteString("Keep exactly one task in_progress at a time. Check task_list after completing each task.")
+	}
+
 	// 3. Available Skills (stable once session starts)
 	if len(opts.Skills) > 0 {
 		sb.WriteString("\n\n## Available Skills\n\n")
@@ -159,6 +187,14 @@ func buildStaticSystem(opts PromptOptions) string {
 	}
 
 	return sb.String()
+}
+
+func hasSubagent(toolNames []string) bool {
+	return slices.Contains(toolNames, "subagent")
+}
+
+func hasTasks(toolNames []string) bool {
+	return slices.Contains(toolNames, "task_create")
 }
 
 // buildStableContext assembles the cacheable per-session prefix: shared
@@ -233,6 +269,10 @@ func buildVolatileContext(opts PromptOptions) string {
 		sb.WriteString("\n\n## MCP Server Context\n")
 		sb.WriteString(mcp)
 	}
+
+	// Context management warning
+	sb.WriteString("\n\n## Context Management\n")
+	sb.WriteString("When working with tool results, write down any important information you might need later in your response, as old tool results may be cleared automatically to manage context window size.")
 
 	return sb.String()
 }
