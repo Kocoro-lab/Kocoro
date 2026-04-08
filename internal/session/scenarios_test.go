@@ -130,7 +130,7 @@ func TestScenario_DaemonDefaultAgent_UsesGlobalSessionsDir(t *testing.T) {
 
 func TestScenario_OneShotCreatesNewSession(t *testing.T) {
 	shanDir := t.TempDir()
-	sessDir := filepath.Join(shanDir, "agents", "reviewer", "sessions")
+	sessDir := filepath.Join(shanDir, "agents", "checker", "sessions")
 	os.MkdirAll(sessDir, 0700)
 
 	// Simulate two one-shot invocations

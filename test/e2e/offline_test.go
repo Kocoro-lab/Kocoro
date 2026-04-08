@@ -33,7 +33,7 @@ func TestOffline_BuiltinAgentsPresent(t *testing.T) {
 		found[e.Name] = e
 	}
 
-	for _, name := range []string{"explorer", "reviewer"} {
+	for _, name := range []string{"scout", "checker"} {
 		e, ok := found[name]
 		if !ok {
 			t.Errorf("expected builtin agent %q not found", name)
@@ -54,11 +54,11 @@ func TestOffline_UserOverrideTakesPriority(t *testing.T) {
 		t.Fatalf("EnsureBuiltins: %v", err)
 	}
 
-	overrideDir := filepath.Join(dir, "explorer")
+	overrideDir := filepath.Join(dir, "scout")
 	if err := os.MkdirAll(overrideDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(overrideDir, "AGENT.md"), []byte("Custom explorer"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(overrideDir, "AGENT.md"), []byte("Custom scout"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -68,14 +68,14 @@ func TestOffline_UserOverrideTakesPriority(t *testing.T) {
 	}
 
 	for _, e := range entries {
-		if e.Name == "explorer" {
+		if e.Name == "scout" {
 			if !e.Override {
-				t.Error("explorer should be marked as override")
+				t.Error("scout should be marked as override")
 			}
 			return
 		}
 	}
-	t.Error("explorer not found in agent list")
+	t.Error("scout not found in agent list")
 }
 
 func TestOffline_BuiltinResurfacesAfterOverrideRemoval(t *testing.T) {
@@ -84,7 +84,7 @@ func TestOffline_BuiltinResurfacesAfterOverrideRemoval(t *testing.T) {
 		t.Fatalf("EnsureBuiltins: %v", err)
 	}
 
-	overrideDir := filepath.Join(dir, "explorer")
+	overrideDir := filepath.Join(dir, "scout")
 	os.MkdirAll(overrideDir, 0o755)
 	os.WriteFile(filepath.Join(overrideDir, "AGENT.md"), []byte("Custom"), 0o644)
 	os.RemoveAll(overrideDir)
@@ -95,36 +95,36 @@ func TestOffline_BuiltinResurfacesAfterOverrideRemoval(t *testing.T) {
 	}
 
 	for _, e := range entries {
-		if e.Name == "explorer" {
+		if e.Name == "scout" {
 			if !e.Builtin {
-				t.Error("explorer should be builtin after override removal")
+				t.Error("scout should be builtin after override removal")
 			}
 			if e.Override {
-				t.Error("explorer should not be override after removal")
+				t.Error("scout should not be override after removal")
 			}
 			return
 		}
 	}
-	t.Error("explorer not found")
+	t.Error("scout not found")
 }
 
-func TestOffline_ExplorerHasReadOnlyToolFilter(t *testing.T) {
+func TestOffline_ScoutHasReadOnlyToolFilter(t *testing.T) {
 	dir := t.TempDir()
 	if err := agents.EnsureBuiltins(dir, "test"); err != nil {
 		t.Fatalf("EnsureBuiltins: %v", err)
 	}
 
-	ag, err := agents.LoadAgent(dir, "explorer")
+	ag, err := agents.LoadAgent(dir, "scout")
 	if err != nil {
-		t.Fatalf("LoadAgent explorer: %v", err)
+		t.Fatalf("LoadAgent scout: %v", err)
 	}
 	if ag.Config == nil || len(ag.Config.Tools.Allow) == 0 {
-		t.Fatal("explorer should have a tool allow list")
+		t.Fatal("scout should have a tool allow list")
 	}
 
 	for _, tool := range ag.Config.Tools.Allow {
 		if tool == "file_write" || tool == "file_edit" {
-			t.Errorf("explorer allow list should not contain %q", tool)
+			t.Errorf("scout allow list should not contain %q", tool)
 		}
 	}
 }

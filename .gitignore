@@ -16,3 +16,6 @@ docs/
 internal/tools/axserver/.build/
 build/
 .idea/
+.worktrees/
+CLAUDE.local.md
+

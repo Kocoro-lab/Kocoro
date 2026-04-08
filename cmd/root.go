@@ -197,6 +197,9 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
 		}
+		if ac.ModelTier != nil {
+			loop.SetModelTier(*ac.ModelTier)
+		}
 		if ac.MaxIterations != nil {
 			loop.SetMaxIterations(*ac.MaxIterations)
 		}
@@ -213,6 +216,62 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	loop.SetHandler(&cliEventHandler{autoApprove: autoApprove})
 	loop.SetBypassPermissions(dangerouslySkipPermissions)
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
+
+	// Wire SubAgentRunner in one-shot mode
+	if st, ok := reg.Get("subagent"); ok {
+		if sat, ok := st.(*tools.SubAgentTool); ok {
+			sat.SetRunner(func(ctx context.Context, ag *agents.Agent, prompt string, childReg *agent.ToolRegistry, handler agent.EventHandler) tools.SubAgentResult {
+				start := time.Now()
+				childLoop := agent.NewAgentLoop(gw, childReg, runCfg.ModelTier, shannonDir,
+					tools.SubAgentMaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation,
+					&runCfg.Permissions, auditor, hookRunner)
+				childLoop.SetMaxTokens(tools.SubAgentMaxTokens)
+				childLoop.SetEnableStreaming(false)
+				childLoop.SetThinking(&client.ThinkingConfig{Type: "disabled"})
+				childLoop.SetBypassPermissions(dangerouslySkipPermissions)
+				childLoop.SetHandler(&cliEventHandler{autoApprove: autoApprove})
+
+				agentDir := filepath.Join(shannonDir, "agents", ag.Name)
+				childLoop.SwitchAgent(ag.Prompt, agentDir, nil, tools.ResolveMCPContext(runCfg, ag), ag.Skills)
+				if ag.Config != nil && ag.Config.Agent != nil {
+					ac := ag.Config.Agent
+					if ac.Model != nil {
+						childLoop.SetSpecificModel(*ac.Model)
+					}
+					if ac.ModelTier != nil {
+						childLoop.SetModelTier(*ac.ModelTier)
+					}
+					if ac.MaxIterations != nil {
+						childLoop.SetMaxIterations(*ac.MaxIterations)
+					}
+					if ac.Temperature != nil {
+						childLoop.SetTemperature(*ac.Temperature)
+					}
+					if ac.MaxTokens != nil {
+						childLoop.SetMaxTokens(*ac.MaxTokens)
+					}
+					if ac.ContextWindow != nil {
+						childLoop.SetContextWindow(*ac.ContextWindow)
+					}
+				}
+
+				childCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+				defer cancel()
+
+				output, usage, err := childLoop.Run(childCtx, prompt, nil)
+				result := tools.SubAgentResult{Output: output, Duration: time.Since(start), Err: err}
+				if usage != nil {
+					result.InputTokens = usage.InputTokens
+					result.OutputTokens = usage.OutputTokens
+					result.TotalTokens = usage.TotalTokens
+					result.LLMCalls = usage.LLMCalls
+					result.CostUSD = usage.CostUSD
+				}
+				return result
+			})
+			sat.SetBaseRegistry(reg)
+		}
+	}
 
 	// Load skills (agent-scoped or global) and wire to loop + use_skill tool
 	var loadedSkills []*skills.Skill

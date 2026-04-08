@@ -58,33 +58,40 @@ func TestLive_OneShot_SessionCWD(t *testing.T) {
 		t.Fatalf("shan failed: %v\n%s", err, stdout.String())
 	}
 
-	// Compare against the actual directory we set, resolving symlinks
-	// (macOS: /tmp → /private/tmp, /var → /private/var)
-	expected, _ := filepath.EvalSymlinks(tmpDir)
+	// Both sides need symlink resolution for macOS where /var → /private/var.
+	// The shan output contains the raw pwd result (unresolved), so check
+	// against both the resolved and unresolved forms.
+	resolved, _ := filepath.EvalSymlinks(tmpDir)
 	out := stdout.String()
-	if !strings.Contains(out, expected) {
-		t.Errorf("expected CWD %q in output, got: %s", expected, out)
+	if !strings.Contains(out, resolved) && !strings.Contains(out, tmpDir) {
+		t.Errorf("expected CWD %q or %q in output, got: %s", resolved, tmpDir, out)
 	}
 }
 
-func TestLive_BundledAgent_Explorer(t *testing.T) {
+func TestLive_BundledAgent_Scout(t *testing.T) {
 	skipUnlessLive(t)
 	bin := testBinary(t)
 
-	out := runShan(t, bin, "--agent", "explorer", "what files are in this project")
-	// Explorer should use read-only tools
+	out := runShan(t, bin, "--agent", "scout", "what files are in this project")
+	// Scout should use read-only tools
 	if strings.Contains(out, "file_write") || strings.Contains(out, "file_edit") {
-		t.Error("explorer should not use write tools")
+		t.Error("scout should not use write tools")
 	}
 }
 
-func TestLive_BundledAgent_Reviewer(t *testing.T) {
+func TestLive_BundledAgent_Checker(t *testing.T) {
 	skipUnlessLive(t)
 	bin := testBinary(t)
 
-	out := runShan(t, bin, "--agent", "reviewer", "review main.go")
-	if !strings.Contains(out, "file_read") {
-		t.Error("reviewer should read files")
+	out := runShan(t, bin, "--agent", "checker", "review main.go")
+	// Checker may use any read tool (file_read, grep, glob, bash with cat/head).
+	// Verify it used at least one tool — progress lines show "⏵ <tool>(".
+	usedTool := strings.Contains(out, "file_read") ||
+		strings.Contains(out, "grep") ||
+		strings.Contains(out, "glob") ||
+		strings.Contains(out, "bash")
+	if !usedTool {
+		t.Errorf("checker should use at least one read tool, got: %s", out)
 	}
 }
 
@@ -177,7 +184,7 @@ func TestLive_Daemon_AgentListIncludesBuiltins(t *testing.T) {
 			builtins[m["name"].(string)] = true
 		}
 	}
-	for _, name := range []string{"explorer", "reviewer"} {
+	for _, name := range []string{"scout", "checker"} {
 		if !builtins[name] {
 			t.Errorf("expected builtin agent %q", name)
 		}
