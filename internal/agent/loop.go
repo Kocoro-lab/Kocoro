@@ -67,6 +67,7 @@ const coreOperationalRules = `
 - If a tool call is denied, do not re-attempt the same call. Think about why it was denied and adjust your approach.
 - If you have attempted 3+ different approaches and none worked, STOP and tell the user what you tried and what failed. Ask for guidance.
 - Never claim a task is complete without evidence. Run verification (test output, build success, file_read confirmation) before reporting done.
+- Report outcomes faithfully: if an action failed, say so with the relevant output. If you did not run a verification step, say that rather than implying it succeeded. Equally, when an action did succeed, state it plainly — do not hedge confirmed results with unnecessary disclaimers.
 - If after 3 search attempts you haven't found what you need, reconsider your approach or ask the user for guidance. Do not keep searching with minor variations.
 
 ## Tool Strategy Principles
@@ -142,38 +143,43 @@ const cloudDelegationGuidance = `
 
 ## Cloud Delegation
 
-You have access to cloud_delegate for tasks that exceed local capability.
+You have access to cloud_delegate for tasks that require INTERNET access or cloud-only data APIs.
+cloud_delegate runs REMOTELY and CANNOT access local files, local git repos, or the local environment.
+
+PRIORITY RULE: If a task touches local files or the local environment in ANY way, it is LOCAL — period.
+This overrides all other rules below. "Research my local projects" = LOCAL (use subagent). "Research a topic on the web" = CLOUD.
 
 ALWAYS LOCAL (never delegate):
 - File read/write/edit on user's machine
-- Shell commands, builds, tests, git operations
+- Shell commands, builds, tests, git operations — including analyzing local git repos
 - Running code (Python, Node, etc.) — use local bash tool
 - GUI automation (accessibility, applescript, screenshot, computer)
 - Clipboard, notifications, process management
 - Anything requiring the user's local filesystem or macOS environment
 - Anything the user expects to persist on their machine (downloads, saves, exports)
+- Parallel analysis of local projects/files — use subagent (one per task, all in a single response)
 
 NEVER use cloud_delegate for writing files, running scripts, or any task where the result should exist on the user's machine. Cloud runs in a remote sandbox — files saved there are NOT accessible locally. If the user says "save", "write", "download", or "create a file", that MUST run locally.
 
-ALWAYS CLOUD (delegate):
-- Multi-source research ("compare X", "find all Y across Z")
-- Parallel independent subtasks (3+ that don't share state)
+CLOUD (delegate only when local tools cannot do it):
+- Web search and multi-source internet research — the primary use case
+- Financial data APIs (stock data, SEC filings, news)
+- Ad intelligence and analytics APIs (GA4, ad transparency)
 - Web scraping / data collection at scale
-- Long analysis requiring multiple LLM reasoning steps
-- Tasks needing cloud-only tools (Python sandbox, calculators, data diffing) — these are NOT available locally but the cloud agent has them
+- Tasks needing cloud-only tools (Python sandbox, calculators, data diffing) — these are NOT available locally
 
 PREFER LOCAL (delegate only if struggling):
 - Single web search -> local http tool first
 - Simple Q&A with one source -> local first
 
-WORKFLOW TYPE SELECTION:
-- "research": Deep multi-source research with web search, citation, and synthesis. Use when the user wants thorough investigation of a topic from multiple angles.
-- "swarm": A lead agent dynamically coordinates sub-agents (researcher, coder, analyst) with a shared workspace. Use for open-ended complex tasks that combine research + computation + writing, or when the task scope is unclear and needs adaptive decomposition.
-- "auto": Routes to a fixed DAG plan with parallel subtasks. Good for structured tasks with clear steps.
+WORKFLOW TYPE:
+- "research" (recommended): Deep multi-source web research with citations and synthesis. Use for most delegation tasks.
+- "auto": Fixed DAG plan with parallel subtasks. Good for structured tasks with clear steps.
+- "swarm": Reserved for user-initiated /swarm commands only. Do NOT select swarm automatically.
 
 CRITICAL: Call cloud_delegate ONCE per task. When it returns a result, present the full result to the user — do not summarize or truncate it. The cloud already ran multiple agents and produced a polished deliverable. Never re-call cloud_delegate with the same or similar task.
 
-INDEPENDENT REVIEW: When you need to review code, analysis, or content you just produced in this session, consider delegating to cloud_delegate with workflow_type "review". The cloud agent has no prior context from this session, making it better at catching issues you might overlook due to reasoning inertia. Good candidates: code review of files you just wrote, fact-checking analysis you just produced, second opinion on a design decision.`
+INDEPENDENT REVIEW: When you need to review code, analysis, or content you just produced in this session, consider delegating to cloud_delegate with workflow_type "auto". The cloud agent has no prior context from this session, making it better at catching issues you might overlook due to reasoning inertia. Good candidates: code review of files you just wrote, fact-checking analysis you just produced, second opinion on a design decision.`
 
 // contrastExamplesCore contains behavioral GOOD/BAD pairs that apply to all agents.
 // These target the highest-impact cowork failure modes.
@@ -204,8 +210,12 @@ Correct: When the next step is clear and low-risk, act first with the appropriat
 const contrastExamplesCloud = `
 
 ### Wrong cloud vs local boundary
-Anti-pattern: Delegating a task to cloud_delegate that depends on the user's local machine, local files, logged-in desktop apps, clipboard, or UI state.
-Correct: Keep tasks local when they require the user's environment or should leave artifacts on their machine. Use cloud delegation for broad research, parallel analysis, or large remote synthesis.`
+Anti-pattern: User says "analyze all projects under ~/projects" or "research my local repos in parallel." You call cloud_delegate because the word "research" or "parallel" appears. Cloud cannot access local files — it ends up searching the internet instead, wasting time and money.
+Correct: Any task involving local files or git repos → use subagent (one per project, all in a single response for parallelism) or direct local tools. Only use cloud_delegate when the task genuinely requires internet access or cloud-only APIs.
+
+### Choosing swarm without user request
+Anti-pattern: User asks a research question and you call cloud_delegate with workflow_type "swarm" because the task seems complex.
+Correct: Default to "research" for cloud delegation. "swarm" is reserved for explicit /swarm commands from the user.`
 
 type TurnUsage struct {
 	InputTokens         int
@@ -219,6 +229,7 @@ type TurnUsage struct {
 	// Cache telemetry state (session-scoped, not reset between turns)
 	cacheCapable    bool // true once any response has cache tokens > 0
 	cacheMissStreak int  // consecutive non-first turns with 0 cache reads
+	quiet           bool // suppress stderr debug output
 }
 
 // Add accumulates usage from a single LLM response into the turn totals
@@ -249,7 +260,7 @@ func (u *TurnUsage) Add(r client.Usage) {
 		u.cacheMissStreak = 0
 	} else {
 		u.cacheMissStreak++
-		if u.cacheMissStreak >= 3 {
+		if u.cacheMissStreak >= 3 && !u.quiet {
 			fmt.Fprintf(os.Stderr, "[agent] cache miss streak: %d consecutive turns with 0 cache reads (input_tokens=%d)\n", u.cacheMissStreak, r.InputTokens)
 		}
 	}
@@ -306,6 +317,7 @@ type AgentLoop struct {
 	sessionID         string      // session ID for audit log correlation
 	sessionCWD        string      // session-scoped working directory; set by runner/TUI before Run()
 	deltaProvider     DeltaProvider
+	quiet             bool             // suppress stderr debug output (TUI/daemon sub-agent mode)
 	injectCh          chan InjectedMessage
 	injectedMessages  []string         // messages injected during the last Run(); cleared on each Run() call
 	runMessages       []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
@@ -527,6 +539,12 @@ func (a *AgentLoop) SetEnableStreaming(enable bool) {
 	a.enableStreaming = enable
 }
 
+// SetQuiet suppresses debug fprintf to os.Stderr. Use for child loops in
+// TUI/daemon mode where stderr writes corrupt the Bubbletea display.
+func (a *AgentLoop) SetQuiet(q bool) {
+	a.quiet = q
+}
+
 // toolExecResult holds the output of a single tool.Run() call.
 // Used to collect results from parallel tool execution.
 type toolExecResult struct {
@@ -638,7 +656,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 	// Runs at most once per 7 days, only when ≥12 detail files exist.
 	if a.memoryDir != "" {
 		if gcErr := ctxwin.ConsolidateMemory(ctx, a.client, a.memoryDir); gcErr != nil {
-			fmt.Fprintf(os.Stderr, "[context] memory consolidation failed: %v\n", gcErr)
+			if !a.quiet {
+				fmt.Fprintf(os.Stderr, "[context] memory consolidation failed: %v\n", gcErr)
+			}
 		}
 	}
 
@@ -829,7 +849,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 	// stampMessage records the creation time for the message at the current end
 	// of the messages slice. Call immediately after appending any message.
 	stampMessage := func() { msgTimestamps[len(messages)-1] = time.Now() }
-	usage := &TurnUsage{}
+	usage := &TurnUsage{quiet: a.quiet}
 
 	// Read tracker: enforces read-before-edit for file_edit/file_write
 	readTracker := NewReadTracker()
@@ -877,6 +897,8 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 		cloudNudgeFired      bool
 		cloudDelegateClaimed bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
 		cloudResultContent   string // non-empty when a cloud deliverable should bypass LLM summarization
+		turnsSinceTaskUse    int    // turns since last task_create/task_update call
+		lastTaskReminder     int    // turn number when last task reminder was injected
 
 		// Cross-iteration dedup: cache successful results from previous iteration
 		// to prevent re-execution of identical tool calls across consecutive iterations.
@@ -992,16 +1014,22 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 					// before messages are discarded by compaction.
 					if a.memoryDir != "" {
 						if pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir); pErr != nil {
-							fmt.Fprintf(os.Stderr, "[context] persist learnings failed: %v\n", pErr)
+							if !a.quiet {
+								fmt.Fprintf(os.Stderr, "[context] persist learnings failed: %v\n", pErr)
+							}
 						} else {
-							fmt.Fprintf(os.Stderr, "[context] persisted learnings to MEMORY.md\n")
+							if !a.quiet {
+								fmt.Fprintf(os.Stderr, "[context] persisted learnings to MEMORY.md\n")
+							}
 						}
 					}
 
 					summary, sumErr := ctxwin.GenerateSummary(ctx, a.client, messages)
 					if sumErr != nil {
 						summaryFailures++
-						fmt.Fprintf(os.Stderr, "[context] compaction summary failed (%d/%d): %v\n", summaryFailures, maxSummaryFailures, sumErr)
+						if !a.quiet {
+							fmt.Fprintf(os.Stderr, "[context] compaction summary failed (%d/%d): %v\n", summaryFailures, maxSummaryFailures, sumErr)
+						}
 					} else {
 						summaryFailures = 0 // reset on success
 						compactionSummary = summary
@@ -1012,7 +1040,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 					messages = ctxwin.ShapeHistory(messages, compactionSummary, a.contextWindow)
 					if len(messages) < before {
 						dropped := before - len(messages)
-						fmt.Fprintf(os.Stderr, "[context] compacted: %d → %d messages\n", before, len(messages))
+						if !a.quiet {
+							fmt.Fprintf(os.Stderr, "[context] compacted: %d → %d messages\n", before, len(messages))
+						}
 						// Adjust newMsgOffset: compaction drops middle messages
 						// but keeps the recent tail. Shift by the number dropped.
 						// Clamp to 1 (skip system prompt at index 0) so that
@@ -1068,6 +1098,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 			Thinking:        a.thinking,
 			ReasoningEffort: a.reasoningEffort,
 		}
+		if usage.LLMCalls == 0 {
+			thinkStr := "nil"
+			if a.thinking != nil {
+				thinkStr = a.thinking.Type
+			}
+			if !a.quiet {
+				fmt.Fprintf(os.Stderr, "[agent] config: tier=%s model=%s maxTokens=%d thinking=%s\n",
+					a.modelTier, a.specificModel, a.maxTokens, thinkStr)
+			}
+		}
 
 		const maxLLMRetries = 3
 		for attempt := 0; ; attempt++ {
@@ -1095,12 +1135,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 			// close to proactive compaction. Escalate to the emergency profile
 			// only if the shaped history is still estimated to be over budget.
 			if isContextLengthError(err) && !reactiveCompacted {
-				fmt.Fprintf(os.Stderr, "[agent] context length exceeded, attempting reactive compaction\n")
+				if !a.quiet {
+					fmt.Fprintf(os.Stderr, "[agent] context length exceeded, attempting reactive compaction\n")
+				}
 
 				// Write-before-compact: persist durable learnings before discarding history.
 				if a.memoryDir != "" {
 					if pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir); pErr != nil {
-						fmt.Fprintf(os.Stderr, "[context] reactive persist learnings failed: %v\n", pErr)
+						if !a.quiet {
+							fmt.Fprintf(os.Stderr, "[context] reactive persist learnings failed: %v\n", pErr)
+						}
 					}
 				}
 
@@ -1111,10 +1155,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 				compressOldToolResults(ctx, softMessages, compressAfter, maxResultChars, a.client)
 				summary, sumErr := ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(softMessages, nextSummary))
 				if sumErr != nil {
-					if nextSummary != "" {
-						fmt.Fprintf(os.Stderr, "[context] reactive summary failed, reusing prior summary: %v\n", sumErr)
-					} else {
-						fmt.Fprintf(os.Stderr, "[context] reactive summary failed, shaping without summary: %v\n", sumErr)
+					if !a.quiet {
+						if nextSummary != "" {
+							fmt.Fprintf(os.Stderr, "[context] reactive summary failed, reusing prior summary: %v\n", sumErr)
+						} else {
+							fmt.Fprintf(os.Stderr, "[context] reactive summary failed, shaping without summary: %v\n", sumErr)
+						}
 					}
 				} else if trimmed := strings.TrimSpace(summary); trimmed != "" {
 					nextSummary = trimmed
@@ -1122,16 +1168,20 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 
 				shaped := ctxwin.ShapeHistory(softMessages, nextSummary, a.contextWindow)
 				if a.contextWindow > 0 && ctxwin.EstimateTokens(shaped) >= a.contextWindow {
-					fmt.Fprintf(os.Stderr, "[context] reactive soft path still over budget, using emergency fallback\n")
+					if !a.quiet {
+						fmt.Fprintf(os.Stderr, "[context] reactive soft path still over budget, using emergency fallback\n")
+					}
 					emergencyMessages := cloneMessages(messages)
 					compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
 
 					summary, sumErr = ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(emergencyMessages, nextSummary))
 					if sumErr != nil {
-						if nextSummary != "" {
-							fmt.Fprintf(os.Stderr, "[context] emergency reactive summary failed, keeping prior summary: %v\n", sumErr)
-						} else {
-							fmt.Fprintf(os.Stderr, "[context] emergency reactive summary failed, shaping without summary: %v\n", sumErr)
+						if !a.quiet {
+							if nextSummary != "" {
+								fmt.Fprintf(os.Stderr, "[context] emergency reactive summary failed, keeping prior summary: %v\n", sumErr)
+							} else {
+								fmt.Fprintf(os.Stderr, "[context] emergency reactive summary failed, shaping without summary: %v\n", sumErr)
+							}
 						}
 					} else if trimmed := strings.TrimSpace(summary); trimmed != "" {
 						nextSummary = trimmed
@@ -1148,7 +1198,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 				// Rebase run-local indices — same bookkeeping as proactive compaction.
 				if len(messages) < before {
 					dropped := before - len(messages)
-					fmt.Fprintf(os.Stderr, "[context] reactive compacted: %d → %d messages\n", before, len(messages))
+					if !a.quiet {
+						fmt.Fprintf(os.Stderr, "[context] reactive compacted: %d → %d messages\n", before, len(messages))
+					}
 					newMsgOffset -= dropped
 					if newMsgOffset < 1 {
 						newMsgOffset = 1
@@ -1200,7 +1252,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 			}
 			backoff := time.Duration(1<<attempt) * time.Second // 1s, 2s, 4s
 			reason := classifyLLMError(err)
-			fmt.Fprintf(os.Stderr, "[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxLLMRetries, backoff, err)
+			if !a.quiet {
+				fmt.Fprintf(os.Stderr, "[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxLLMRetries, backoff, err)
+			}
 			if a.handler != nil {
 				a.handler.OnCloudAgent("", "retry", fmt.Sprintf("Retrying request (attempt %d/%d): %s", attempt+1, maxLLMRetries, reason))
 			}
@@ -1223,15 +1277,18 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 			if totalPrompt > 0 {
 				ratio = float64(resp.Usage.CacheReadTokens) / float64(totalPrompt) * 100
 			}
-			fmt.Fprintf(os.Stderr, "[agent] cache: read=%d creation=%d input=%d ratio=%.1f%%\n",
-				resp.Usage.CacheReadTokens, resp.Usage.CacheCreationTokens,
-				resp.Usage.InputTokens, ratio)
+			if !a.quiet {
+				fmt.Fprintf(os.Stderr, "[agent] cache: read=%d creation=%d input=%d ratio=%.1f%%\n",
+					resp.Usage.CacheReadTokens, resp.Usage.CacheCreationTokens,
+					resp.Usage.InputTokens, ratio)
+			}
 		}
 		lastInputTokens = resp.Usage.InputTokens
 		lastOutputTokens = resp.Usage.OutputTokens
 		if resp.Model != "" {
 			usage.Model = resp.Model
 		}
+		turnsSinceTaskUse++
 
 		// Allow re-compaction only if context dropped below threshold
 		// (meaning compaction worked). If still over, stay compacted to
@@ -1541,7 +1598,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 			if a.hookRunner != nil {
 				hookDecision, hookReason, hookErr := a.hookRunner.RunPreToolUse(ctx, fc.Name, argsStr, "")
 				if hookErr != nil {
-					fmt.Fprintf(os.Stderr, "[hooks] pre-tool-use error: %v\n", hookErr)
+					if !a.quiet {
+						fmt.Fprintf(os.Stderr, "[hooks] pre-tool-use error: %v\n", hookErr)
+					}
 				}
 				if hookDecision == "deny" {
 					a.logAudit(fc.Name, argsStr, "tool call denied by hook: "+hookReason, "deny", false, 0)
@@ -1563,6 +1622,19 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 		if len(approved) > 0 {
 			batches := partitionToolCalls(approved)
 			executeBatches(ctx, batches, execResults, readTracker, a.handler)
+		}
+
+		// Accumulate child-loop usage from ToolResult.Usage (e.g., SubAgentTool).
+		// Each result carries its own independent usage, so parallel execution
+		// is safe — no shared mutable state on the tool instance.
+		for _, ac := range approved {
+			if tu := execResults[ac.index].result.Usage; tu != nil {
+				usage.InputTokens += tu.InputTokens
+				usage.OutputTokens += tu.OutputTokens
+				usage.TotalTokens += tu.TotalTokens
+				usage.LLMCalls += tu.LLMCalls
+				usage.CostUSD += tu.CostUSD
+			}
 		}
 
 		// Deferred mode: check if tool_search loaded new tools, rebuild schemas.
@@ -1655,12 +1727,36 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, history []clien
 			}
 			contextResult := truncateStr(cleanResult, maxChars)
 
+			// Track task tool usage for periodic reminder injection.
+			switch fc.Name {
+			case "task_create", "task_update", "task_list", "task_get":
+				turnsSinceTaskUse = 0
+			}
+
 			// System reminders: append short contextual hints to high-signal
 			// tool results to reinforce instructions in long sessions.
 			// Skip cloud results — they are copied directly to the user.
 			if !result.CloudResult {
 				if reminder := systemReminder(fc.Name); reminder != "" {
 					contextResult += "\n\n" + reminder
+				}
+				// Task reminder: nudge after 10 turns without task tool usage,
+				// repeat every 10 turns. Only if task tools are registered.
+				if turnsSinceTaskUse >= 10 && (usage.LLMCalls-lastTaskReminder) >= 10 {
+					if listTool, hasTask := a.tools.Get("task_list"); hasTask {
+						var items []taskReminderItem
+						if listResult, listErr := listTool.Run(ctx, "{}"); listErr == nil && !listResult.IsError && listResult.Content != "No tasks." {
+							for _, line := range strings.Split(listResult.Content, "\n") {
+								line = strings.TrimSpace(line)
+								if line == "" {
+									continue
+								}
+								items = append(items, parseTaskLine(line))
+							}
+						}
+						contextResult += "\n\n" + buildTaskReminder(items)
+						lastTaskReminder = usage.LLMCalls
+					}
 				}
 			}
 
@@ -1905,7 +2001,9 @@ func (a *AgentLoop) completeWithRetry(ctx context.Context, req client.Completion
 			return nil, fmt.Errorf("LLM call failed: %w", err)
 		}
 		backoff := time.Duration(1<<attempt) * time.Second
-		fmt.Fprintf(os.Stderr, "[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxRetries, backoff, err)
+		if !a.quiet {
+			fmt.Fprintf(os.Stderr, "[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxRetries, backoff, err)
+		}
 		if a.handler != nil {
 			a.handler.OnCloudAgent("", "retry", fmt.Sprintf("Retrying request (attempt %d/%d)…", attempt+1, maxRetries))
 		}
@@ -2115,6 +2213,7 @@ func truncateStr(s string, max int) string {
 	}
 	return string(runes[:max]) + "..."
 }
+
 
 // systemReminder returns a short contextual hint for high-signal tools,
 // reinforcing key instructions that decay in influence during long sessions.

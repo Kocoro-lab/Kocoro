@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2068,5 +2070,115 @@ func TestNamedAgentPromptIncludesCoreRules(t *testing.T) {
 		if !strings.Contains(defaultComposed, s) {
 			t.Errorf("default composed prompt missing: %q", s)
 		}
+	}
+}
+
+func TestCoreRules_FaithfulOutcomeReporting(t *testing.T) {
+	if !strings.Contains(coreOperationalRules, "Report outcomes faithfully") {
+		t.Error("coreOperationalRules should contain faithful outcome reporting guidance")
+	}
+}
+
+// usageReportingTool simulates a tool (like subagent) that returns token
+// usage via ToolResult.Usage — one independent usage per call, safe for
+// parallel execution.
+type usageReportingTool struct {
+	childTokens int
+	childCost   float64
+}
+
+func (t *usageReportingTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        "usage_tool",
+		Description: "mock tool with internal token usage",
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+	}
+}
+
+func (t *usageReportingTool) Run(ctx context.Context, args string) (ToolResult, error) {
+	return ToolResult{
+		Content: "done",
+		Usage: &ToolUsage{
+			InputTokens:  t.childTokens / 2,
+			OutputTokens: t.childTokens / 2,
+			TotalTokens:  t.childTokens,
+			LLMCalls:     2,
+			CostUSD:      t.childCost,
+		},
+	}, nil
+}
+
+func (t *usageReportingTool) RequiresApproval() bool { return false }
+
+func TestAgentLoop_UsageReporterAccumulation(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("usage_tool", `{}`), 100, 50))
+		} else {
+			json.NewEncoder(w).Encode(nativeResponse("result", "end_turn", nil, 80, 30))
+		}
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&usageReportingTool{childTokens: 500, childCost: 0.05})
+
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	_, usage, err := loop.Run(context.Background(), "test", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Parent: call 1 (100+50=150) + call 2 (80+30=110) = 260 tokens
+	// Child (via ToolResult.Usage): 500 tokens
+	// Total should be 260 + 500 = 760
+	expectedTotal := 260 + 500
+	if usage.TotalTokens != expectedTotal {
+		t.Errorf("expected %d total tokens (parent 260 + child 500), got %d", expectedTotal, usage.TotalTokens)
+	}
+
+	// LLM calls: parent 2 + child 2 = 4
+	if usage.LLMCalls != 4 {
+		t.Errorf("expected 4 LLM calls (parent 2 + child 2), got %d", usage.LLMCalls)
+	}
+
+	// Cost should include child cost
+	if usage.CostUSD < 0.05 {
+		t.Errorf("expected CostUSD >= 0.05 (child cost), got %f", usage.CostUSD)
+	}
+}
+
+func TestAgentLoop_QuietMode_SuppressesStderr(t *testing.T) {
+	// Capture stderr
+	origStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+	defer func() { os.Stderr = origStderr }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		resp := nativeResponse("hello", "end_turn", nil, 100, 50)
+		resp.Usage.CacheReadTokens = 0
+		resp.Usage.CacheCreationTokens = 10
+		json.NewEncoder(rw).Encode(resp)
+	}))
+	defer srv.Close()
+
+	gw := client.NewGatewayClient(srv.URL, "test-key")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "small", t.TempDir(), 2, 30000, 200, nil, nil, nil)
+	loop.SetQuiet(true)
+
+	_, _, _ = loop.Run(context.Background(), "test", nil)
+
+	w.Close()
+	var buf strings.Builder
+	io.Copy(&buf, r)
+
+	if buf.Len() > 0 {
+		t.Errorf("quiet mode should suppress stderr, got: %q", buf.String())
 	}
 }

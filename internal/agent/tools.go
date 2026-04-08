@@ -10,6 +10,7 @@ import (
 type ToolInfo struct {
 	Name        string
 	Description string
+	Prompt      string // detailed usage guide appended to Description in API schema
 	Parameters  map[string]any
 	Required    []string
 }
@@ -55,7 +56,8 @@ type ToolResult struct {
 	ErrorCategory ErrorCategory // empty when IsError is false
 	IsRetryable   bool          // true only for transient errors
 	Images        []ImageBlock
-	CloudResult   bool // true when result is a cloud deliverable (bypass LLM summarization)
+	CloudResult   bool       // true when result is a cloud deliverable (bypass LLM summarization)
+	Usage         *ToolUsage // non-nil when tool consumed tokens internally (e.g., subagent)
 }
 
 // TransientError returns a ToolResult for timeout/network failures where retry may help.
@@ -125,6 +127,22 @@ type SafeCheckerWithContext interface {
 // If args parsing fails, implementations MUST return false (fail-closed).
 type ReadOnlyChecker interface {
 	IsReadOnlyCall(argsJSON string) bool
+}
+
+// UsageReporter is DEPRECATED — use ToolResult.Usage instead.
+// Kept temporarily for compile-time compatibility; the loop no longer
+// reads this interface. Remove once all callers are migrated.
+type UsageReporter interface {
+	LastUsage() *ToolUsage
+}
+
+// ToolUsage holds token usage reported by a tool's internal operations.
+type ToolUsage struct {
+	InputTokens  int
+	OutputTokens int
+	TotalTokens  int
+	LLMCalls     int
+	CostUSD      float64
 }
 
 // ToolSummary is a lightweight name+description pair for deferred tool listings.
@@ -296,11 +314,15 @@ func buildToolSchema(t Tool) client.Tool {
 	if info.Required != nil {
 		params["required"] = info.Required
 	}
+	desc := info.Description
+	if info.Prompt != "" {
+		desc += "\n\n" + info.Prompt
+	}
 	return client.Tool{
 		Type: "function",
 		Function: client.FunctionDef{
 			Name:        info.Name,
-			Description: info.Description,
+			Description: desc,
 			Parameters:  params,
 		},
 	}
