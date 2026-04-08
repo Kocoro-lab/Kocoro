@@ -111,7 +111,7 @@ func TestListAgents_WithBuiltins(t *testing.T) {
 	os.WriteFile(filepath.Join(userDir, "AGENT.md"), []byte("user"), 0600)
 
 	// Builtin agents
-	for _, name := range []string{"explorer", "reviewer"} {
+	for _, name := range []string{"scout", "checker"} {
 		d := filepath.Join(dir, "_builtin", name)
 		os.MkdirAll(d, 0700)
 		os.WriteFile(filepath.Join(d, "AGENT.md"), []byte("builtin"), 0600)
@@ -129,8 +129,8 @@ func TestListAgents_WithBuiltins(t *testing.T) {
 	for _, e := range entries {
 		byName[e.Name] = e
 	}
-	if e, ok := byName["explorer"]; !ok || !e.Builtin || e.Override {
-		t.Fatalf("explorer: expected builtin=true override=false, got %+v", byName["explorer"])
+	if e, ok := byName["scout"]; !ok || !e.Builtin || e.Override {
+		t.Fatalf("scout: expected builtin=true override=false, got %+v", byName["scout"])
 	}
 	if e, ok := byName["myagent"]; !ok || e.Builtin || e.Override {
 		t.Fatalf("myagent: expected builtin=false override=false, got %+v", byName["myagent"])
@@ -140,11 +140,11 @@ func TestListAgents_WithBuiltins(t *testing.T) {
 func TestListAgents_OverrideDeduplication(t *testing.T) {
 	dir := t.TempDir()
 
-	builtinDir := filepath.Join(dir, "_builtin", "explorer")
+	builtinDir := filepath.Join(dir, "_builtin", "scout")
 	os.MkdirAll(builtinDir, 0700)
 	os.WriteFile(filepath.Join(builtinDir, "AGENT.md"), []byte("builtin"), 0600)
 
-	userDir := filepath.Join(dir, "explorer")
+	userDir := filepath.Join(dir, "scout")
 	os.MkdirAll(userDir, 0700)
 	os.WriteFile(filepath.Join(userDir, "AGENT.md"), []byte("user"), 0600)
 
@@ -275,15 +275,15 @@ func TestAgentConfig_CWD(t *testing.T) {
 func TestLoadAgent_BuiltinFallback(t *testing.T) {
 	dir := t.TempDir()
 	// Create builtin agent only
-	builtinDir := filepath.Join(dir, "_builtin", "explorer")
+	builtinDir := filepath.Join(dir, "_builtin", "scout")
 	os.MkdirAll(builtinDir, 0700)
-	os.WriteFile(filepath.Join(builtinDir, "AGENT.md"), []byte("builtin explorer"), 0600)
+	os.WriteFile(filepath.Join(builtinDir, "AGENT.md"), []byte("builtin scout"), 0600)
 
-	ag, err := LoadAgent(dir, "explorer")
+	ag, err := LoadAgent(dir, "scout")
 	if err != nil {
 		t.Fatalf("LoadAgent: %v", err)
 	}
-	if ag.Prompt != "builtin explorer" {
+	if ag.Prompt != "builtin scout" {
 		t.Fatalf("expected builtin prompt, got %q", ag.Prompt)
 	}
 }
@@ -291,15 +291,15 @@ func TestLoadAgent_BuiltinFallback(t *testing.T) {
 func TestLoadAgent_UserOverrideWins(t *testing.T) {
 	dir := t.TempDir()
 	// Create both builtin and user agent
-	builtinDir := filepath.Join(dir, "_builtin", "explorer")
+	builtinDir := filepath.Join(dir, "_builtin", "scout")
 	os.MkdirAll(builtinDir, 0700)
 	os.WriteFile(filepath.Join(builtinDir, "AGENT.md"), []byte("builtin"), 0600)
 
-	userDir := filepath.Join(dir, "explorer")
+	userDir := filepath.Join(dir, "scout")
 	os.MkdirAll(userDir, 0700)
 	os.WriteFile(filepath.Join(userDir, "AGENT.md"), []byte("user override"), 0600)
 
-	ag, err := LoadAgent(dir, "explorer")
+	ag, err := LoadAgent(dir, "scout")
 	if err != nil {
 		t.Fatalf("LoadAgent: %v", err)
 	}
@@ -311,16 +311,16 @@ func TestLoadAgent_UserOverrideWins(t *testing.T) {
 func TestLoadAgent_MemoryFromRuntimeDir(t *testing.T) {
 	dir := t.TempDir()
 	// Builtin definition
-	builtinDir := filepath.Join(dir, "_builtin", "explorer")
+	builtinDir := filepath.Join(dir, "_builtin", "scout")
 	os.MkdirAll(builtinDir, 0700)
-	os.WriteFile(filepath.Join(builtinDir, "AGENT.md"), []byte("explorer"), 0600)
+	os.WriteFile(filepath.Join(builtinDir, "AGENT.md"), []byte("scout"), 0600)
 
 	// Memory in top-level runtime dir (not in _builtin)
-	runtimeDir := filepath.Join(dir, "explorer")
+	runtimeDir := filepath.Join(dir, "scout")
 	os.MkdirAll(runtimeDir, 0700)
 	os.WriteFile(filepath.Join(runtimeDir, "MEMORY.md"), []byte("runtime memory"), 0600)
 
-	ag, err := LoadAgent(dir, "explorer")
+	ag, err := LoadAgent(dir, "scout")
 	if err != nil {
 		t.Fatalf("LoadAgent: %v", err)
 	}

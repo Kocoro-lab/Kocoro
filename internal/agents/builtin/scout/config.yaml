@@ -1,0 +1,16 @@
+agent:
+  model_tier: small  # read-only reconnaissance — cheap model (haiku-class)
+tools:
+  allow:
+    - file_read
+    - glob
+    - grep
+    - directory_list
+    - bash
+    - system_info
+    - think
+    - session_search
+    - http
+    - browser
+    - screenshot
+    - process

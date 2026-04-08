@@ -8,3 +8,5 @@ tools:
     - system_info
     - think
     - session_search
+    - http
+    - screenshot

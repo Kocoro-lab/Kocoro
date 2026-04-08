@@ -12,7 +12,7 @@ import (
 var builtinFS embed.FS
 
 // BuiltinNames lists the names of all bundled specialist agents.
-var BuiltinNames = []string{"explorer", "reviewer"}
+var BuiltinNames = []string{"scout", "worker", "checker"}
 
 // EnsureBuiltins syncs embedded agent definitions to agentsDir/_builtin/.
 // Skips if the on-disk version matches currentVersion (idempotent).
@@ -28,7 +28,11 @@ func EnsureBuiltins(agentsDir, currentVersion string) error {
 		}
 	}
 
-	// Ensure _builtin dir exists
+	// Wipe stale _builtin dir so renamed/removed agents don't linger,
+	// then recreate it fresh.
+	if err := os.RemoveAll(builtinDir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(builtinDir, 0700); err != nil {
 		return err
 	}

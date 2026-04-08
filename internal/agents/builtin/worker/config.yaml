@@ -1,0 +1,7 @@
+tools:
+  deny:
+    - subagent
+    - cloud_delegate
+    - schedule_create
+    - schedule_update
+    - schedule_remove

@@ -19,7 +19,7 @@ func TestEnsureBuiltins_CreatesOnFirstRun(t *testing.T) {
 	}
 
 	// Verify explorer
-	data, err := os.ReadFile(filepath.Join(agentsDir, "_builtin", "explorer", "AGENT.md"))
+	data, err := os.ReadFile(filepath.Join(agentsDir, "_builtin", "scout", "AGENT.md"))
 	if err != nil {
 		t.Fatalf("explorer AGENT.md missing: %v", err)
 	}
@@ -28,7 +28,7 @@ func TestEnsureBuiltins_CreatesOnFirstRun(t *testing.T) {
 	}
 
 	// Verify reviewer
-	data, err = os.ReadFile(filepath.Join(agentsDir, "_builtin", "reviewer", "AGENT.md"))
+	data, err = os.ReadFile(filepath.Join(agentsDir, "_builtin", "checker", "AGENT.md"))
 	if err != nil {
 		t.Fatalf("reviewer AGENT.md missing: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestEnsureBuiltins_SkipsWhenVersionMatches(t *testing.T) {
 	EnsureBuiltins(agentsDir, "0.0.99")
 
 	// Modify a file to detect if it gets overwritten
-	marker := filepath.Join(agentsDir, "_builtin", "explorer", "AGENT.md")
+	marker := filepath.Join(agentsDir, "_builtin", "scout", "AGENT.md")
 	os.WriteFile(marker, []byte("modified"), 0600)
 
 	// Second run with same version
@@ -74,7 +74,7 @@ func TestEnsureBuiltins_OverwritesOnVersionChange(t *testing.T) {
 
 	EnsureBuiltins(agentsDir, "0.0.98")
 
-	marker := filepath.Join(agentsDir, "_builtin", "explorer", "AGENT.md")
+	marker := filepath.Join(agentsDir, "_builtin", "scout", "AGENT.md")
 	os.WriteFile(marker, []byte("modified"), 0600)
 
 	// Upgrade
@@ -90,17 +90,17 @@ func TestMaterializeBuiltin(t *testing.T) {
 	dir := t.TempDir()
 	agentsDir := filepath.Join(dir, "agents")
 
-	builtinDir := filepath.Join(agentsDir, "_builtin", "explorer")
+	builtinDir := filepath.Join(agentsDir, "_builtin", "scout")
 	os.MkdirAll(builtinDir, 0700)
 	os.WriteFile(filepath.Join(builtinDir, "AGENT.md"), []byte("builtin prompt"), 0600)
 	os.WriteFile(filepath.Join(builtinDir, "config.yaml"), []byte("tools:\n  allow: [bash]"), 0600)
 
-	userDir := filepath.Join(agentsDir, "explorer")
+	userDir := filepath.Join(agentsDir, "scout")
 	if _, err := os.Stat(filepath.Join(userDir, "AGENT.md")); err == nil {
 		t.Fatal("user dir should not exist before materialization")
 	}
 
-	err := MaterializeBuiltin(agentsDir, "explorer")
+	err := MaterializeBuiltin(agentsDir, "scout")
 	if err != nil {
 		t.Fatalf("MaterializeBuiltin: %v", err)
 	}
@@ -146,14 +146,14 @@ func TestBuiltinNames_MatchEmbeddedDirs(t *testing.T) {
 func TestMaterializeBuiltin_SkipsMemory(t *testing.T) {
 	dir := t.TempDir()
 	agentsDir := filepath.Join(dir, "agents")
-	builtinDir := filepath.Join(agentsDir, "_builtin", "explorer")
+	builtinDir := filepath.Join(agentsDir, "_builtin", "scout")
 	os.MkdirAll(builtinDir, 0700)
 	os.WriteFile(filepath.Join(builtinDir, "AGENT.md"), []byte("prompt"), 0600)
 	os.WriteFile(filepath.Join(builtinDir, "MEMORY.md"), []byte("should not copy"), 0600)
 
-	MaterializeBuiltin(agentsDir, "explorer")
+	MaterializeBuiltin(agentsDir, "scout")
 
-	userDir := filepath.Join(agentsDir, "explorer")
+	userDir := filepath.Join(agentsDir, "scout")
 	if _, err := os.Stat(filepath.Join(userDir, "MEMORY.md")); err == nil {
 		t.Fatal("MEMORY.md should not be materialized")
 	}

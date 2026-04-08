@@ -87,10 +87,12 @@ type AgentConfig struct {
 // AgentModelConfig holds per-agent model/iteration overrides.
 type AgentModelConfig struct {
 	Model         *string  `yaml:"model" json:"model,omitempty"`
+	ModelTier     *string  `yaml:"model_tier" json:"model_tier,omitempty"` // "low", "medium", "high" — overrides parent tier
 	MaxIterations *int     `yaml:"max_iterations" json:"max_iterations,omitempty"`
 	Temperature   *float64 `yaml:"temperature" json:"temperature,omitempty"`
 	MaxTokens     *int     `yaml:"max_tokens" json:"max_tokens,omitempty"`
 	ContextWindow *int     `yaml:"context_window" json:"context_window,omitempty"`
+	Timeout       *string  `yaml:"timeout" json:"timeout,omitempty"` // Go duration string, e.g. "10m", "30s"
 }
 
 // Agent represents a loaded agent definition.
