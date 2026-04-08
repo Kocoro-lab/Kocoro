@@ -44,6 +44,7 @@ const (
 	stateProcessing
 	stateApproval
 	stateSessionPicker
+	stateHistorySearch
 )
 
 type agentDoneMsg struct {
@@ -55,6 +56,11 @@ type agentDoneMsg struct {
 type approvalRequestMsg struct {
 	tool string
 	args string
+}
+
+type approvalResponse struct {
+	allowed bool
+	always  bool
 }
 
 type healthCheckMsg struct {
@@ -80,6 +86,9 @@ type outputBlock struct {
 	rendered string                 // width-specific rendered text
 	rerender func(width int) string // optional: re-render at new width (e.g. startup header)
 }
+
+// escTimeoutMsg clears the escape-double-press pending state after 800ms.
+type escTimeoutMsg struct{}
 
 // spinnerTickMsg is a slow fallback that advances spinner phrase text
 type spinnerTickMsg struct{}
@@ -114,6 +123,52 @@ type toolResultEntry struct {
 	elapsed time.Duration
 }
 
+// liveToolEntry tracks a tool call from start to completion for live display.
+type liveToolEntry struct {
+	name    string
+	keyArg  string        // extracted via toolKeyArg()
+	started time.Time
+	elapsed time.Duration // set on completion
+	done    bool
+	isError bool
+}
+
+// tokenUpdateMsg carries cumulative token counts from the agent goroutine.
+type tokenUpdateMsg struct {
+	inputTokens  int
+	outputTokens int
+}
+
+// stallCheckMsg is sent periodically to detect spinner stalls.
+type stallCheckMsg struct{}
+
+// swarmAgentStatusMsg reports sub-agent lifecycle events to the TUI.
+type swarmAgentStatusMsg struct {
+	id          string // unique per sub-agent invocation
+	agentType   string // e.g. "scout", "checker"
+	description string // short task description
+	status      string // "started", "tool_call", "completed", "error"
+	toolName    string // current tool (when status="tool_call")
+	toolArgs    string // tool args JSON (when status="tool_call")
+	elapsed     time.Duration
+	tokens      int
+	taskID      string // links to task store ID for unified view
+}
+
+// swarmDoneCollapseMsg triggers auto-collapse after all subagents complete.
+type swarmDoneCollapseMsg struct{}
+
+// checklistTask represents a single task in the cloud agent workflow checklist.
+type checklistTask struct {
+	subject string
+	status  string // "pending", "in_progress", "completed"
+}
+
+// taskChecklistMsg delivers updated task list from cloud agent events.
+type taskChecklistMsg struct {
+	tasks []checklistTask
+}
+
 type Model struct {
 	baseCfg             *config.Config
 	cfg                 *config.Config
@@ -136,7 +191,10 @@ type Model struct {
 	width               int
 	height              int
 	version             string
-	approvalCh          chan bool
+	approvalCh          chan approvalResponse
+	sessionAllowed      map[string]bool // tool → always allowed this session
+	pendingApprovalTool string          // tool name for current approval
+	pendingApprovalArgs string          // tool args JSON for current approval
 	program             *tea.Program
 	shannonDir          string
 	auditor             *audit.AuditLogger
@@ -155,6 +213,18 @@ type Model struct {
 	pendingToolArgs string
 	lastToolResults []toolResultEntry
 	toolExpandLevel int // 0=summary only, 1=compact lines, 2=expanded details
+	// Live tool progress (replaces pendingToolName/pendingToolArgs during processing)
+	liveTools      []liveToolEntry
+	lastStreamTime time.Time // last time we received any streaming output
+	stallActive    bool      // true when 3s elapsed since lastStreamTime
+	tokenInput     int       // cumulative input tokens this turn
+	tokenOutput    int       // cumulative output tokens this turn
+	// Swarm agent tree
+	swarmAgents []swarmAgentEntry
+	// Task checklist (from cloud agent workflow)
+	checklistTasks []checklistTask
+	// View mode toggle (Tab key)
+	expandedView string // "", "expanded"
 	// Slash command completion menu
 	slashCommands []slashCmd // built once in New(), includes builtins + custom/agent cmds
 	menuVisible   bool
@@ -169,6 +239,23 @@ type Model struct {
 	headerCWD       string                   // cached working directory
 	markdownCacheMu sync.RWMutex
 	markdownCache   map[string]string
+	// Input history (up/down arrow navigation)
+	inputHistory []string // most recent last
+	historyIdx   int      // -1 = not browsing; 0 = most recent entry
+	historyDraft string   // saves current input when browsing starts
+	// Escape double-press to clear input
+	escPending     bool
+	escPendingTime time.Time
+	// Ctrl+R history search
+	searchQuery    string
+	searchMatchIdx int
+	searchDraft    string
+	searchResult   string
+	// Paste content tracking
+	pastedContents map[int]string
+	pasteNextID    int
+	// Task list (file-based task store dir)
+	taskDir string
 }
 
 type slashCmd struct {
@@ -326,6 +413,9 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
 		}
+		if ac.ModelTier != nil {
+			loop.SetModelTier(*ac.ModelTier)
+		}
 		if ac.MaxIterations != nil {
 			loop.SetMaxIterations(*ac.MaxIterations)
 		}
@@ -363,8 +453,14 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		}
 	}
 	loop.SetEnableStreaming(true) // streaming enabled but deltas are suppressed — only final text rendered
+	loop.SetQuiet(true)
 
 	settings := config.LoadSettings()
+
+	taskDir := ""
+	if shannonDir != "" {
+		taskDir = filepath.Join(shannonDir, "tasks", "default")
+	}
 
 	customCmds, instanceCmds := buildRuntimeCommands(shannonDir, initialCWD, agentOverride)
 
@@ -377,7 +473,8 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		textarea:       ta,
 		width:          width,
 		version:        version,
-		approvalCh:     make(chan bool, 1),
+		approvalCh:     make(chan approvalResponse, 1),
+		sessionAllowed: make(map[string]bool),
 		spinnerTexts:   settings.SpinnerTexts,
 		toolRegistry:   reg,
 		toolCleanup:    toolCleanup,
@@ -390,6 +487,9 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		skillsPtr:      skillsPtr,
 		markdownCache:  make(map[string]string),
 		slashCommands:  instanceCmds,
+		historyIdx:     -1,
+		pastedContents: make(map[int]string),
+		taskDir:        taskDir,
 	}
 
 	return m
@@ -464,6 +564,9 @@ func (m *Model) rebuildAgentLoop() {
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
 		}
+		if ac.ModelTier != nil {
+			loop.SetModelTier(*ac.ModelTier)
+		}
 		if ac.MaxIterations != nil {
 			loop.SetMaxIterations(*ac.MaxIterations)
 		}
@@ -479,6 +582,7 @@ func (m *Model) rebuildAgentLoop() {
 	}
 	loop.SetBypassPermissions(m.bypassPermissions)
 	loop.SetEnableStreaming(true)
+	loop.SetQuiet(true)
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
 	if m.agentOverride != nil {
 		scopedMCPCtx := tools.ResolveMCPContext(m.cfg, m.agentOverride)
@@ -639,7 +743,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Unblock approval goroutine if waiting
 				if m.state == stateApproval {
 					select {
-					case m.approvalCh <- false:
+					case m.approvalCh <- approvalResponse{allowed: false}:
 					default:
 					}
 				}
@@ -652,13 +756,51 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cancelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
 				m.appendOutput(cancelStyle.Render("  [Cancelled]"))
 				m.state = stateInput
+				m.textarea.Focus()
 				return m, m.rerenderOutput()
 			}
 			if m.menuVisible {
 				m.menuVisible = false
 				return m, nil
 			}
+			// Escape double-press to clear input
+			if m.state == stateInput {
+				val := strings.TrimSpace(m.textarea.Value())
+				if val == "" {
+					return m, nil
+				}
+				if m.escPending && time.Since(m.escPendingTime) < 800*time.Millisecond {
+					// Second press: clear input, save to history
+					m.inputHistory = append(m.inputHistory, m.textarea.Value())
+					m.textarea.Reset()
+					m.textarea.SetHeight(1)
+					m.historyIdx = -1
+					m.historyDraft = ""
+					m.escPending = false
+					return m, nil
+				}
+				// First press: start pending
+				m.escPending = true
+				m.escPendingTime = time.Now()
+				return m, tea.Tick(800*time.Millisecond, func(time.Time) tea.Msg {
+					return escTimeoutMsg{}
+				})
+			}
 		case tea.KeyTab:
+			if m.state == stateProcessing {
+				if m.expandedView == "" {
+					m.expandedView = "expanded"
+				} else {
+					m.expandedView = ""
+				}
+				return m, nil
+			}
+			// Tab on empty input: open slash command menu
+			if m.state == stateInput && !m.menuVisible && m.textarea.Value() == "" {
+				m.textarea.SetValue("/")
+				m.updateMenu()
+				return m, nil
+			}
 			if m.menuVisible && len(m.menuItems) > 0 {
 				selected := m.menuItems[m.menuIndex]
 				m.textarea.SetValue(selected.cmd + " ")
@@ -691,6 +833,26 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			// History navigation: Up when textarea is single-line
+			if m.state == stateInput && !m.menuVisible && len(m.inputHistory) > 0 {
+				lines := strings.Count(m.textarea.Value(), "\n")
+				if lines == 0 {
+					if m.historyIdx == -1 {
+						// First press: save current input as draft
+						m.historyDraft = m.textarea.Value()
+						m.historyIdx = 0
+					} else if m.historyIdx < len(m.inputHistory)-1 {
+						m.historyIdx++
+					} else {
+						return m, nil // at oldest entry
+					}
+					entry := m.inputHistory[len(m.inputHistory)-1-m.historyIdx]
+					m.textarea.SetValue(entry)
+					m.adjustTextareaHeight()
+					m.updateMenu()
+					return m, nil
+				}
+			}
 		case tea.KeyDown:
 			if m.state == stateInput && m.menuVisible && len(m.menuItems) > 0 {
 				m.menuIndex++
@@ -698,6 +860,25 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.menuIndex = 0
 				}
 				return m, nil
+			}
+			// History navigation: Down to go back toward draft
+			if m.state == stateInput && !m.menuVisible && m.historyIdx >= 0 {
+				lines := strings.Count(m.textarea.Value(), "\n")
+				if lines == 0 {
+					m.historyIdx--
+					if m.historyIdx < 0 {
+						// Back to draft
+						m.historyIdx = -1
+						m.textarea.SetValue(m.historyDraft)
+						m.historyDraft = ""
+					} else {
+						entry := m.inputHistory[len(m.inputHistory)-1-m.historyIdx]
+						m.textarea.SetValue(entry)
+					}
+					m.adjustTextareaHeight()
+					m.updateMenu()
+					return m, nil
+				}
 			}
 		}
 
@@ -708,6 +889,124 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.toolExpandLevel = 1
 			return m, m.flushPrints()
+		}
+
+		// Readline shortcuts (stateInput only)
+		if m.state == stateInput {
+			switch msg.String() {
+			case "ctrl+k": // Kill to end of line
+				li := m.textarea.LineInfo()
+				val := []rune(m.textarea.Value())
+				col := li.ColumnOffset
+				if col < len(val) {
+					m.textarea.SetValue(string(val[:col]))
+					m.textarea.CursorEnd()
+				}
+				return m, nil
+			case "ctrl+u": // Kill to start of line
+				li := m.textarea.LineInfo()
+				val := []rune(m.textarea.Value())
+				col := li.ColumnOffset
+				if col > 0 {
+					m.textarea.SetValue(string(val[col:]))
+					m.textarea.CursorStart()
+				}
+				return m, nil
+			case "ctrl+w": // Kill word backward
+				li := m.textarea.LineInfo()
+				val := []rune(m.textarea.Value())
+				col := li.ColumnOffset
+				if col == 0 {
+					return m, nil
+				}
+				i := col - 1
+				for i > 0 && val[i-1] == ' ' {
+					i--
+				}
+				for i > 0 && val[i-1] != ' ' {
+					i--
+				}
+				newVal := string(val[:i]) + string(val[col:])
+				m.textarea.SetValue(newVal)
+				m.textarea.SetCursor(i)
+				return m, nil
+			case "ctrl+l": // Clear screen + scrollback
+				m.output = nil
+				m.pendingPrints = m.pendingPrints[:0]
+				m.textarea.Focus()
+				return m, func() tea.Msg {
+					os.Stdout.WriteString("\033[3J")
+					return tea.ClearScreen()
+				}
+			case "ctrl+r": // History search
+				if len(m.inputHistory) > 0 {
+					m.searchDraft = m.textarea.Value()
+					m.searchQuery = ""
+					m.searchMatchIdx = 0
+					m.searchResult = ""
+					m.state = stateHistorySearch
+					m.textarea.Blur()
+				}
+				return m, nil
+			}
+		}
+
+		if m.state == stateHistorySearch {
+			switch msg.Type {
+			case tea.KeyEscape:
+				m.textarea.SetValue(m.searchDraft)
+				m.state = stateInput
+				m.textarea.Focus()
+				return m, nil
+			case tea.KeyEnter:
+				if m.searchResult != "" {
+					m.textarea.SetValue(m.searchResult)
+				} else {
+					m.textarea.SetValue(m.searchDraft)
+				}
+				m.state = stateInput
+				m.textarea.Focus()
+				m.adjustTextareaHeight()
+				m.updateMenu()
+				return m, nil
+			case tea.KeyCtrlR:
+				m.searchMatchIdx++
+				result, _, found := m.searchHistory(m.searchQuery, m.searchMatchIdx)
+				if found {
+					m.searchResult = result
+				} else {
+					m.searchMatchIdx--
+				}
+				return m, nil
+			case tea.KeyBackspace:
+				if len(m.searchQuery) == 0 {
+					m.textarea.SetValue(m.searchDraft)
+					m.state = stateInput
+					m.textarea.Focus()
+					return m, nil
+				}
+				runes := []rune(m.searchQuery)
+				m.searchQuery = string(runes[:len(runes)-1])
+				m.searchMatchIdx = 0
+				if m.searchQuery != "" {
+					result, _, found := m.searchHistory(m.searchQuery, 0)
+					if found {
+						m.searchResult = result
+					}
+				} else {
+					m.searchResult = ""
+				}
+				return m, nil
+			case tea.KeyRunes:
+				m.searchQuery += string(msg.Runes)
+				m.searchMatchIdx = 0
+				result, _, found := m.searchHistory(m.searchQuery, 0)
+				if found {
+					m.searchResult = result
+				}
+				return m, nil
+			}
+			return m, nil
 		}
 
 		if m.state == stateSessionPicker {
@@ -749,14 +1048,22 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "y", "Y":
 				select {
-				case m.approvalCh <- true:
+				case m.approvalCh <- approvalResponse{allowed: true}:
 				default:
 				}
 				m.state = stateProcessing
 				return m, nil
 			case "n", "N":
 				select {
-				case m.approvalCh <- false:
+				case m.approvalCh <- approvalResponse{allowed: false}:
+				default:
+				}
+				m.state = stateProcessing
+				return m, nil
+			case "a", "A":
+				m.sessionAllowed[m.pendingApprovalTool] = true
+				select {
+				case m.approvalCh <- approvalResponse{allowed: true, always: true}:
 				default:
 				}
 				m.state = stateProcessing
@@ -776,7 +1083,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case spinnerFrameMsg:
-		if m.state == stateProcessing {
+		if m.state == stateProcessing || m.state == stateApproval {
 			m.glyphIdx++
 			m.colorIdx++
 			return m, spinnerFrameTick()
@@ -784,7 +1091,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case spinnerTickMsg:
-		if m.state == stateProcessing {
+		if m.state == stateProcessing || m.state == stateApproval {
 			m.spinnerIdx = (m.spinnerIdx + 1) % len(m.spinnerTexts)
 			return m, spinnerTick()
 		}
@@ -797,6 +1104,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.state = stateInput
+		m.textarea.Focus()
 		m.cancelRun = nil
 		m.injectCh = nil
 		if msg.err != nil && !errors.Is(msg.err, context.Canceled) {
@@ -808,9 +1116,22 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendMarkdownOutput(msg.result, m.renderMarkdownCached(msg.result, m.width))
 			m.appendOutput("")
 		}
-		// Tool count summary (individual tool lines already shown during execution)
-		if len(m.lastToolResults) > 0 {
+		// Tool summary — individual results were shown in the live panel during
+		// processing. Show a compact count line now.
+		if n := len(m.lastToolResults); n > 0 {
 			m.toolExpandLevel = 0
+			dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+			errCount := 0
+			for _, tr := range m.lastToolResults {
+				if tr.isError {
+					errCount++
+				}
+			}
+			summary := fmt.Sprintf("  %d tool calls", n)
+			if errCount > 0 {
+				summary += fmt.Sprintf(" (%d errors)", errCount)
+			}
+			m.appendOutput(dimStyle.Render(summary))
 		}
 		// Don't show usage/elapsed for cancelled tasks
 		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) {
@@ -835,6 +1156,8 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case approvalRequestMsg:
 		m.state = stateApproval
+		m.pendingApprovalTool = msg.tool
+		m.pendingApprovalArgs = msg.args
 		dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
 		warnIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("?")
 		keyArg := toolKeyArg(msg.tool, msg.args)
@@ -880,6 +1203,8 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case streamOutputMsg:
+		m.lastStreamTime = time.Now()
+		m.stallActive = false
 		if msg.raw != "" {
 			m.appendMarkdownOutput(msg.raw, msg.text)
 		} else {
@@ -890,28 +1215,47 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case toolCallMsg:
 		m.pendingToolName = msg.name
 		m.pendingToolArgs = msg.args
+		m.lastStreamTime = time.Now()
+		m.stallActive = false
+		// Track live tool for progress display
+		m.liveTools = append(m.liveTools, liveToolEntry{
+			name:    msg.name,
+			keyArg:  toolKeyArg(msg.name, msg.args),
+			started: time.Now(),
+		})
 		// Advance spinner phrase on real events
 		m.spinnerIdx = (m.spinnerIdx + 1) % len(m.spinnerTexts)
 		return m, nil
 
 	case toolResultMsg:
-		toolName := m.pendingToolName
-		toolArgs := m.pendingToolArgs
+		m.lastStreamTime = time.Now()
+		m.stallActive = false
+		// Prefer msg fields (authoritative per-result) over pending fields
+		// (shared slot, unreliable for concurrent tool calls like subagent).
+		toolName := msg.name
+		toolArgs := msg.args
 		if toolName == "" {
-			toolName = msg.name
+			toolName = m.pendingToolName
 		}
 		if toolArgs == "" {
-			toolArgs = msg.args
+			toolArgs = m.pendingToolArgs
 		}
-		if toolName == "think" {
-			dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-			m.appendOutput(dimStyle.Render(msg.content))
-		} else {
-			m.appendOutput(formatCompactToolResult(toolName, toolArgs, msg.isError, msg.content, msg.elapsed))
+		// During processing, tool results are shown via the live panel (liveTools),
+		// not as static text. Only record for post-processing summary.
+		if toolName != "think" {
 			entry := toolResultEntry{name: toolName, args: toolArgs, content: msg.content, isError: msg.isError, elapsed: msg.elapsed}
 			m.lastToolResults = append(m.lastToolResults, entry)
 			if len(m.lastToolResults) > 20 {
 				m.lastToolResults = m.lastToolResults[1:]
+			}
+		}
+		// Mark matching live tool as done
+		for i := len(m.liveTools) - 1; i >= 0; i-- {
+			if m.liveTools[i].name == msg.name && !m.liveTools[i].done {
+				m.liveTools[i].done = true
+				m.liveTools[i].isError = msg.isError
+				m.liveTools[i].elapsed = msg.elapsed
+				break
 			}
 		}
 		m.pendingToolName = ""
@@ -926,6 +1270,103 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendOutput(fmt.Sprintf("Copied to clipboard (%d chars)", msg.len))
 		}
 		return m, nil
+
+	case stallCheckMsg:
+		if m.state == stateProcessing || m.state == stateApproval {
+			if !m.lastStreamTime.IsZero() && time.Since(m.lastStreamTime) > 3*time.Second {
+				m.stallActive = true
+			} else {
+				m.stallActive = false
+			}
+			return m, stallCheckTick()
+		}
+
+	case tokenUpdateMsg:
+		m.tokenInput = msg.inputTokens
+		m.tokenOutput = msg.outputTokens
+
+	case swarmAgentStatusMsg:
+		switch msg.status {
+		case "started":
+			m.swarmAgents = append(m.swarmAgents, swarmAgentEntry{
+				id:          msg.id,
+				agentType:   msg.agentType,
+				description: msg.description,
+				status:      "running",
+				started:     time.Now(),
+				taskID:      msg.taskID,
+			})
+		case "completed", "error":
+			for i := range m.swarmAgents {
+				if m.swarmAgents[i].id == msg.id {
+					m.swarmAgents[i].status = msg.status
+					m.swarmAgents[i].elapsed = time.Since(m.swarmAgents[i].started)
+					if msg.tokens > 0 {
+						m.swarmAgents[i].tokenCount = msg.tokens
+					}
+					break
+				}
+			}
+			// Auto-collapse after 2s if all agents are done
+			allDone := true
+			for _, ag := range m.swarmAgents {
+				if ag.status == "running" {
+					allDone = false
+					break
+				}
+			}
+			if allDone && len(m.swarmAgents) > 0 {
+				return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+					return swarmDoneCollapseMsg{}
+				})
+			}
+		case "tool_call":
+			for i := range m.swarmAgents {
+				if m.swarmAgents[i].id == msg.id {
+					m.swarmAgents[i].activity = msg.toolName
+					m.swarmAgents[i].toolUseCount++
+					if msg.tokens > 0 {
+						m.swarmAgents[i].tokenCount = msg.tokens
+					}
+					// Update recent tools sliding window (keep last 10)
+					isRead, isSearch := classifyTool(msg.toolName)
+					entry := recentToolEntry{
+						name:     msg.toolName,
+						keyArg:   toolKeyArg(msg.toolName, msg.toolArgs),
+						isRead:   isRead,
+						isSearch: isSearch,
+					}
+					m.swarmAgents[i].recentTools = append(m.swarmAgents[i].recentTools, entry)
+					if len(m.swarmAgents[i].recentTools) > 10 {
+						m.swarmAgents[i].recentTools = m.swarmAgents[i].recentTools[1:]
+					}
+					break
+				}
+			}
+		}
+
+	case taskChecklistMsg:
+		m.checklistTasks = msg.tasks
+
+	case swarmDoneCollapseMsg:
+		if m.state == stateProcessing {
+			m.expandedView = ""
+			m.swarmAgents = nil
+		}
+
+	case escTimeoutMsg:
+		m.escPending = false
+	}
+
+	// Detect and truncate large pastes
+	if m.state == stateInput {
+		if km, ok := msg.(tea.KeyMsg); ok && km.Paste && len(string(km.Runes)) >= pasteThreshold {
+			pasted := m.truncatePaste(string(km.Runes))
+			m.textarea.InsertString(pasted)
+			m.adjustTextareaHeight()
+			m.updateMenu()
+			return m, nil
+		}
 	}
 
 	if m.state == stateInput {
@@ -956,28 +1397,170 @@ func (m *Model) View() string {
 		// Bottom bar with right-aligned model tier
 		tierDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
 		rightInfo := tierDim.Render(m.cfg.ModelTier)
+		if m.escPending {
+			hintStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Italic(true)
+			rightInfo = hintStyle.Render("Esc again to clear") + "  " + rightInfo
+		}
 		barWidth := m.width - lipgloss.Width(rightInfo)
 		if barWidth < 0 {
 			barWidth = 0
 		}
 		sb.WriteString(barStyle.Render(strings.Repeat("─", barWidth)) + rightInfo)
 	case stateProcessing:
-		if m.pendingToolName != "" {
-			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
-			color := spinColors[m.colorIdx%len(spinColors)]
-			glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+		sb.WriteString(bar)
+		sb.WriteString("\n")
+		glyph := dotFrames[m.glyphIdx%len(dotFrames)]
+		color := spinColors[m.colorIdx%len(spinColors)]
+		glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+		if m.stallActive {
+			glyphStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+		}
+
+		hasSubagents := len(m.swarmAgents) > 0
+
+		var spinnerLine string
+		if hasSubagents {
+			spinnerLine = glyphStyle.Render(glyph) + " " + renderSummaryLine(m.swarmAgents, m.width-4)
+		} else if m.pendingToolName != "" {
 			dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
 			keyArg := toolKeyArg(m.pendingToolName, m.pendingToolArgs)
-			sb.WriteString(glyphStyle.Render(glyph) + dimStyle.Render(fmt.Sprintf(" %s(%s)", m.pendingToolName, keyArg)))
+			spinnerLine = glyphStyle.Render(glyph) + dimStyle.Render(fmt.Sprintf(" %s(%s)", m.pendingToolName, keyArg))
 		} else {
-			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
-			color := spinColors[m.colorIdx%len(spinColors)]
-			glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
 			spinnerText := m.spinnerTexts[m.spinnerIdx%len(m.spinnerTexts)]
-			sb.WriteString(glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx))
+			spinnerLine = glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx)
 		}
+
+		totalTokens := m.tokenInput + m.tokenOutput
+		if hasSubagents {
+			for _, ag := range m.swarmAgents {
+				totalTokens += ag.tokenCount
+			}
+		}
+		if totalTokens > 0 {
+			tokenDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+			tokenStr := tokenDim.Render(formatTokenCount(totalTokens))
+			gap := m.width - lipgloss.Width(spinnerLine) - lipgloss.Width(tokenStr) - 1
+			if gap > 0 {
+				spinnerLine += strings.Repeat(" ", gap) + tokenStr
+			}
+		}
+
+		sb.WriteString(spinnerLine)
 		sb.WriteString("\n")
-		// Bottom status bar with model tier + execution timer (like Claude Code)
+
+		if hasSubagents {
+			// Swarm tree: always show agent activity when subagents are running
+			if m.expandedView == "expanded" {
+				sb.WriteString(renderSwarmTree(m.swarmAgents, m.width))
+				sb.WriteString("\n")
+				if len(m.checklistTasks) > 0 {
+					sb.WriteString(renderChecklist(m.checklistTasks, m.width))
+				}
+			} else {
+				sb.WriteString(renderCompactTree(m.swarmAgents, m.width))
+				sb.WriteString("\n")
+			}
+			// Task list: show alongside swarm tree if tasks exist
+			if tl := renderTaskList(m.taskDir, m.swarmAgents, m.width); tl != "" {
+				sb.WriteString(tl)
+			}
+		} else {
+			// No subagents — show task list or tool progress
+			if tl := renderTaskList(m.taskDir, nil, m.width); tl != "" {
+				sb.WriteString(tl)
+			} else if len(m.checklistTasks) > 0 {
+				sb.WriteString(renderChecklist(m.checklistTasks, m.width))
+			} else if len(m.liveTools) > 0 {
+				sb.WriteString(renderToolProgress(m.liveTools, m.width, m.stallActive))
+				sb.WriteString("\n")
+			}
+		}
+
+		elapsed := formatElapsed(time.Since(m.processingStartTime))
+		tierDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+		var viewHint string
+		if m.expandedView != "" {
+			viewHint = "[expanded] "
+		}
+		rightInfo := tierDim.Render(viewHint + m.cfg.ModelTier + " " + elapsed)
+		statusBarWidth := m.width - lipgloss.Width(rightInfo)
+		if statusBarWidth < 0 {
+			statusBarWidth = 0
+		}
+		sb.WriteString(barStyle.Render(strings.Repeat("─", statusBarWidth)) + rightInfo + "\n")
+	case stateApproval:
+		// Reuse the full processing view (spinner, tool progress, tasks)
+		// so dynamic output stays visible during approval.
+		sb.WriteString(bar)
+		sb.WriteString("\n")
+		glyph := dotFrames[m.glyphIdx%len(dotFrames)]
+		color := spinColors[m.colorIdx%len(spinColors)]
+		glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+
+		hasSubagents := len(m.swarmAgents) > 0
+
+		var spinnerLine string
+		if hasSubagents {
+			spinnerLine = glyphStyle.Render(glyph) + " " + renderSummaryLine(m.swarmAgents, m.width-4)
+		} else {
+			spinnerText := m.spinnerTexts[m.spinnerIdx%len(m.spinnerTexts)]
+			spinnerLine = glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx)
+		}
+
+		totalTokens := m.tokenInput + m.tokenOutput
+		if hasSubagents {
+			for _, ag := range m.swarmAgents {
+				totalTokens += ag.tokenCount
+			}
+		}
+		if totalTokens > 0 {
+			tokenDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+			tokenStr := tokenDim.Render(formatTokenCount(totalTokens))
+			gap := m.width - lipgloss.Width(spinnerLine) - lipgloss.Width(tokenStr) - 1
+			if gap > 0 {
+				spinnerLine += strings.Repeat(" ", gap) + tokenStr
+			}
+		}
+
+		sb.WriteString(spinnerLine)
+		sb.WriteString("\n")
+
+		if hasSubagents {
+			if m.expandedView == "expanded" {
+				sb.WriteString(renderSwarmTree(m.swarmAgents, m.width))
+				sb.WriteString("\n")
+				if len(m.checklistTasks) > 0 {
+					sb.WriteString(renderChecklist(m.checklistTasks, m.width))
+				}
+			} else {
+				sb.WriteString(renderCompactTree(m.swarmAgents, m.width))
+				sb.WriteString("\n")
+			}
+		} else {
+			if len(m.checklistTasks) > 0 {
+				sb.WriteString(renderChecklist(m.checklistTasks, m.width))
+			} else if len(m.liveTools) > 0 {
+				sb.WriteString(renderToolProgress(m.liveTools, m.width, m.stallActive))
+				sb.WriteString("\n")
+			}
+		}
+
+		if len(m.checklistTasks) == 0 {
+			if tl := renderTaskList(m.taskDir, m.swarmAgents, m.width); tl != "" {
+				sb.WriteString(tl)
+			}
+		}
+
+		// Approval prompt line: show which tool needs approval
+		warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+		dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+		keyArg := toolKeyArg(m.pendingApprovalTool, m.pendingApprovalArgs)
+		sb.WriteString(dimStyle.Render(fmt.Sprintf("  ⏵ %s(%s)", m.pendingApprovalTool, keyArg)))
+		sb.WriteString("  " + warnStyle.Render("?") + "  Allow?  ")
+		sb.WriteString(warnStyle.Render("[y/n/a]"))
+		sb.WriteString("\n")
+
+		// Bottom bar with elapsed time and model tier (same as stateProcessing)
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
 		tierDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
 		rightInfo := tierDim.Render(m.cfg.ModelTier + " " + elapsed)
@@ -985,12 +1568,19 @@ func (m *Model) View() string {
 		if statusBarWidth < 0 {
 			statusBarWidth = 0
 		}
-		sb.WriteString(barStyle.Render(strings.Repeat("─", statusBarWidth)) + rightInfo + "\n")
-	case stateApproval:
+		sb.WriteString(barStyle.Render(strings.Repeat("─", statusBarWidth)) + rightInfo)
+	case stateHistorySearch:
 		sb.WriteString(bar)
 		sb.WriteString("\n")
-		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("  [y/n] "))
+		searchStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+		queryStyle := lipgloss.NewStyle().Bold(true)
+		sb.WriteString(searchStyle.Render("bck-i-search: ") + queryStyle.Render(m.searchQuery) + "_")
 		sb.WriteString("\n")
+		if m.searchResult != "" {
+			dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+			sb.WriteString(dimStyle.Render("  " + m.searchResult))
+			sb.WriteString("\n")
+		}
 		sb.WriteString(bar)
 	case stateSessionPicker:
 		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("  Sessions (Up/Down, Enter, Esc)"))
@@ -1020,10 +1610,23 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	input := strings.TrimSpace(m.textarea.Value())
 	m.textarea.Reset()
 	m.textarea.SetHeight(1)
+	m.textarea.Blur()
 
 	if input == "" {
 		return m, nil
 	}
+
+	// Expand any truncated paste placeholders
+	if len(m.pastedContents) > 0 {
+		input = expandPastedContent(input, m.pastedContents)
+		m.pastedContents = make(map[int]string)
+		m.pasteNextID = 0
+	}
+
+	// Save to input history and reset browsing state
+	m.inputHistory = append(m.inputHistory, input)
+	m.historyIdx = -1
+	m.historyDraft = ""
 
 	promptMark := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Render(">")
 	m.appendOutput(fmt.Sprintf("%s %s", promptMark, input))
@@ -1065,6 +1668,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.spinnerIdx = 0
 	m.glyphIdx = 0
 	m.colorIdx = 0
+	m.liveTools = nil
+	m.stallActive = false
+	m.lastStreamTime = time.Now()
+	m.tokenInput = 0
+	m.tokenOutput = 0
+	m.swarmAgents = nil
+	m.checklistTasks = nil
+	clearTaskStore(m.taskDir)
+	m.expandedView = ""
 	// Pass everything except the just-appended user message as history,
 	// stripping any prior loop-injected guardrail nudges so they can't
 	// leak into this run's conversation snapshot.
@@ -1074,7 +1686,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		priorMeta = priorMeta[:len(priorMsgs)]
 	}
 	history := session.FilterInjected(priorMsgs, priorMeta)
-	return m, tea.Batch(m.runAgentLoop(input, history), spinnerTick(), spinnerFrameTick())
+	return m, tea.Batch(m.runAgentLoop(input, history), spinnerTick(), spinnerFrameTick(), stallCheckTick())
 }
 
 func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
@@ -1093,6 +1705,88 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 					cdt.SetHandler(handler)
 				}
 			}
+			// Wire SubAgentRunner so subagent tool can launch child agent loops
+			if st, ok := m.toolRegistry.Get("subagent"); ok {
+				if sat, ok := st.(*tools.SubAgentTool); ok {
+					capturedCWD := effectiveCWD
+					sat.SetOnStatus(func(id, agentType, description, status, toolName, toolArgs string, tokens int, taskID string) {
+						if m.program != nil {
+							m.program.Send(swarmAgentStatusMsg{
+								id:          id,
+								agentType:   agentType,
+								description: description,
+								status:      status,
+								toolName:    toolName,
+								toolArgs:    toolArgs,
+								tokens:      tokens,
+								taskID:      taskID,
+							})
+						}
+					})
+					sat.SetRunner(func(ctx context.Context, ag *agents.Agent, prompt string, childReg *agent.ToolRegistry, handler agent.EventHandler) tools.SubAgentResult {
+						start := time.Now()
+						childLoop := agent.NewAgentLoop(m.gateway, childReg, m.cfg.ModelTier, m.shannonDir,
+							tools.SubAgentMaxIterations, m.cfg.Tools.ResultTruncation, m.cfg.Tools.ArgsTruncation,
+							&m.cfg.Permissions, m.auditor, m.hookRunner)
+						childLoop.SetMaxTokens(tools.SubAgentMaxTokens)
+						childLoop.SetTemperature(m.cfg.Agent.Temperature)
+						childLoop.SetContextWindow(m.cfg.Agent.ContextWindow)
+						childLoop.SetEnableStreaming(false)
+						childLoop.SetQuiet(true)
+						childLoop.SetThinking(&client.ThinkingConfig{Type: "disabled"})
+						childLoop.SetBypassPermissions(m.bypassPermissions)
+						childLoop.SetSessionCWD(capturedCWD)
+						if handler != nil {
+							childLoop.SetHandler(handler)
+						}
+
+						childAgentDir := filepath.Join(m.shannonDir, "agents", ag.Name)
+						childMCPCtx := tools.ResolveMCPContext(m.cfg, ag)
+						childLoop.SwitchAgent(ag.Prompt, childAgentDir, nil, childMCPCtx, ag.Skills)
+
+						if ag.Config != nil && ag.Config.Agent != nil {
+							ac := ag.Config.Agent
+							if ac.Model != nil {
+								childLoop.SetSpecificModel(*ac.Model)
+							}
+							if ac.ModelTier != nil {
+								childLoop.SetModelTier(*ac.ModelTier)
+							}
+							if ac.MaxIterations != nil {
+								childLoop.SetMaxIterations(*ac.MaxIterations)
+							}
+							if ac.Temperature != nil {
+								childLoop.SetTemperature(*ac.Temperature)
+							}
+							if ac.MaxTokens != nil {
+								childLoop.SetMaxTokens(*ac.MaxTokens)
+							}
+							if ac.ContextWindow != nil {
+								childLoop.SetContextWindow(*ac.ContextWindow)
+							}
+						}
+
+						childCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+						defer cancel()
+
+						output, usage, err := childLoop.Run(childCtx, prompt, nil)
+						result := tools.SubAgentResult{
+							Output:   output,
+							Duration: time.Since(start),
+							Err:      err,
+						}
+						if usage != nil {
+							result.InputTokens = usage.InputTokens
+							result.OutputTokens = usage.OutputTokens
+							result.TotalTokens = usage.TotalTokens
+							result.LLMCalls = usage.LLMCalls
+							result.CostUSD = usage.CostUSD
+						}
+						return result
+					})
+					sat.SetBaseRegistry(m.toolRegistry)
+				}
+			}
 			m.agentLoop.SetSessionID(sess.ID)
 			m.agentLoop.SetWorkingSet(m.sessions.WorkingSet(sess.ID))
 			m.agentLoop.SetSessionCWD(effectiveCWD)
@@ -1109,6 +1803,72 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 			if ct, ok := m.toolRegistry.Get("cloud_delegate"); ok {
 				if cdt, ok := ct.(*tools.CloudDelegateTool); ok {
 					cdt.SetHandler(handler)
+				}
+			}
+			// Wire SubAgentRunner so subagent tool can launch child agent loops
+			if st, ok := m.toolRegistry.Get("subagent"); ok {
+				if sat, ok := st.(*tools.SubAgentTool); ok {
+					sat.SetRunner(func(ctx context.Context, ag *agents.Agent, prompt string, childReg *agent.ToolRegistry, handler agent.EventHandler) tools.SubAgentResult {
+						start := time.Now()
+						childLoop := agent.NewAgentLoop(m.gateway, childReg, m.cfg.ModelTier, m.shannonDir,
+							tools.SubAgentMaxIterations, m.cfg.Tools.ResultTruncation, m.cfg.Tools.ArgsTruncation,
+							&m.cfg.Permissions, m.auditor, m.hookRunner)
+						childLoop.SetMaxTokens(tools.SubAgentMaxTokens)
+						childLoop.SetTemperature(m.cfg.Agent.Temperature)
+						childLoop.SetContextWindow(m.cfg.Agent.ContextWindow)
+						childLoop.SetEnableStreaming(false)
+						childLoop.SetQuiet(true)
+						childLoop.SetThinking(&client.ThinkingConfig{Type: "disabled"})
+						childLoop.SetBypassPermissions(m.bypassPermissions)
+						if handler != nil {
+							childLoop.SetHandler(handler)
+						}
+
+						childAgentDir := filepath.Join(m.shannonDir, "agents", ag.Name)
+						childMCPCtx := tools.ResolveMCPContext(m.cfg, ag)
+						childLoop.SwitchAgent(ag.Prompt, childAgentDir, nil, childMCPCtx, ag.Skills)
+
+						if ag.Config != nil && ag.Config.Agent != nil {
+							ac := ag.Config.Agent
+							if ac.Model != nil {
+								childLoop.SetSpecificModel(*ac.Model)
+							}
+							if ac.ModelTier != nil {
+								childLoop.SetModelTier(*ac.ModelTier)
+							}
+							if ac.MaxIterations != nil {
+								childLoop.SetMaxIterations(*ac.MaxIterations)
+							}
+							if ac.Temperature != nil {
+								childLoop.SetTemperature(*ac.Temperature)
+							}
+							if ac.MaxTokens != nil {
+								childLoop.SetMaxTokens(*ac.MaxTokens)
+							}
+							if ac.ContextWindow != nil {
+								childLoop.SetContextWindow(*ac.ContextWindow)
+							}
+						}
+
+						childCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+						defer cancel()
+
+						output, usage, err := childLoop.Run(childCtx, prompt, nil)
+						result := tools.SubAgentResult{
+							Output:   output,
+							Duration: time.Since(start),
+							Err:      err,
+						}
+						if usage != nil {
+							result.InputTokens = usage.InputTokens
+							result.OutputTokens = usage.OutputTokens
+							result.TotalTokens = usage.TotalTokens
+							result.LLMCalls = usage.LLMCalls
+							result.CostUSD = usage.CostUSD
+						}
+						return result
+					})
+					sat.SetBaseRegistry(m.toolRegistry)
 				}
 			}
 			m.agentLoop.SetSessionID("")
@@ -1185,6 +1945,64 @@ func (m *Model) adjustTextareaHeight() {
 	m.textarea.SetHeight(height)
 }
 
+const pasteThreshold = 10000
+
+// truncatePaste stores full content and returns a truncated version with placeholder.
+func (m *Model) truncatePaste(s string) string {
+	if len(s) < pasteThreshold {
+		return s
+	}
+	m.pasteNextID++
+	id := m.pasteNextID
+	m.pastedContents[id] = s
+
+	runes := []rune(s)
+	lines := strings.Count(s, "\n")
+	head := string(runes[:500])
+	tail := string(runes[len(runes)-500:])
+	return head + fmt.Sprintf("[...Pasted text #%d +%d lines...]", id, lines) + tail
+}
+
+// expandPastedContent replaces paste placeholders with full content.
+func expandPastedContent(input string, contents map[int]string) string {
+	if len(contents) == 0 {
+		return input
+	}
+	for id, full := range contents {
+		prefix := fmt.Sprintf("[...Pasted text #%d ", id)
+		start := strings.Index(input, prefix)
+		if start == -1 {
+			continue
+		}
+		end := strings.Index(input[start:], "]")
+		if end == -1 {
+			continue
+		}
+		placeholder := input[start : start+end+1]
+		input = strings.Replace(input, placeholder, full, 1)
+	}
+	return input
+}
+
+// searchHistory finds the Nth match (0-indexed) in inputHistory containing query.
+// Searches newest to oldest. Returns (match, matchIndex, found).
+func (m *Model) searchHistory(query string, startIdx int) (string, int, bool) {
+	if query == "" {
+		return "", 0, false
+	}
+	lowerQuery := strings.ToLower(query)
+	seen := 0
+	for i := len(m.inputHistory) - 1; i >= 0; i-- {
+		if strings.Contains(strings.ToLower(m.inputHistory[i]), lowerQuery) {
+			if seen == startIdx {
+				return m.inputHistory[i], seen, true
+			}
+			seen++
+		}
+	}
+	return "", seen, false
+}
+
 // flushPrints returns a Cmd that prints all pending output above the view.
 func (m *Model) flushPrints() tea.Cmd {
 	if len(m.pendingPrints) == 0 {
@@ -1257,7 +2075,7 @@ var dotFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧",
 var spinColors = []string{"99", "105", "111", "117", "123", "159", "195", "231"}
 
 func spinnerFrameTick() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg {
 		return spinnerFrameMsg{}
 	})
 }
@@ -1265,6 +2083,12 @@ func spinnerFrameTick() tea.Cmd {
 func spinnerTick() tea.Cmd {
 	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
 		return spinnerTickMsg{}
+	})
+}
+
+func stallCheckTick() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return stallCheckMsg{}
 	})
 }
 
@@ -1350,8 +2174,19 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "/help":
 		m.appendOutput(helpText())
-	case "/clear":
+	case "/clear", "/new":
+		// Start fresh: new session + clear screen and scrollback (like CC's /clear)
+		sess := m.sessions.NewSession()
+		m.resumedSession = false
+		m.applyRuntimeContext(sess)
 		m.output = nil
+		m.pendingPrints = m.pendingPrints[:0]
+		m.textarea.Focus()
+		return m, func() tea.Msg {
+			// \033[3J clears terminal scrollback buffer, not just visible area
+			os.Stdout.WriteString("\033[3J")
+			return tea.ClearScreen()
+		}
 	case "/sessions":
 		sessions, err := m.sessions.List()
 		if err != nil {
@@ -1455,6 +2290,12 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+	case "/doctor":
+		toolCount := 0
+		if m.toolRegistry != nil {
+			toolCount = m.toolRegistry.Len()
+		}
+		m.appendOutput(runDoctor(m.cfg, m.version, toolCount))
 	default:
 		// Check custom commands
 		cmdName := strings.TrimPrefix(cmd, "/")
@@ -1481,6 +2322,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.appendOutput(fmt.Sprintf("Unknown command: %s (type /help)", cmd))
 	}
 
+	m.textarea.Focus()
 	return m, nil
 }
 
@@ -1770,7 +2612,10 @@ func (h *tuiEventHandler) OnToolCall(name string, args string) {
 		return
 	}
 	if h.model.program != nil {
-		h.model.program.Send(toolCallMsg{name: name, args: truncate(args, 200)})
+		// Pre-extract the display key from full args before any truncation.
+		// subagent/cloud_delegate args contain long prompt fields that break
+		// JSON parsing when truncated, causing toolKeyArg to fallback to raw JSON.
+		h.model.program.Send(toolCallMsg{name: name, args: toolKeyArg(name, args)})
 	}
 }
 
@@ -1806,7 +2651,14 @@ func (h *tuiEventHandler) SetCloudStreaming(enabled bool) {
 	h.cloudStreaming = enabled
 }
 
-func (h *tuiEventHandler) OnUsage(usage agent.TurnUsage) {}
+func (h *tuiEventHandler) OnUsage(usage agent.TurnUsage) {
+	if h.model.program != nil {
+		h.model.program.Send(tokenUpdateMsg{
+			inputTokens:  usage.InputTokens,
+			outputTokens: usage.OutputTokens,
+		})
+	}
+}
 
 func (h *tuiEventHandler) OnCloudAgent(agentID, status, message string) {
 	prefixes := map[string]string{"started": ">", "completed": "+", "thinking": "~", "tool": "?"}
@@ -1815,6 +2667,25 @@ func (h *tuiEventHandler) OnCloudAgent(agentID, status, message string) {
 		p = "-"
 	}
 	h.OnStreamDelta(fmt.Sprintf("  %s %s\n", p, message))
+
+	// Bridge to swarm tree component
+	if h.model.program != nil && agentID != "" {
+		switch status {
+		case "started":
+			h.model.program.Send(swarmAgentStatusMsg{
+				id: agentID, agentType: "agent",
+				description: message, status: "started",
+			})
+		case "completed":
+			h.model.program.Send(swarmAgentStatusMsg{
+				id: agentID, status: "completed",
+			})
+		case "tool":
+			h.model.program.Send(swarmAgentStatusMsg{
+				id: agentID, status: "tool_call", toolName: message,
+			})
+		}
+	}
 }
 
 func (h *tuiEventHandler) OnCloudProgress(completed, total int) {
@@ -1833,11 +2704,16 @@ func (h *tuiEventHandler) OnCloudPlan(planType, content string, needsReview bool
 }
 
 func (h *tuiEventHandler) OnApprovalNeeded(tool string, args string) bool {
+	// Fast path: tool already always-allowed this session.
+	if h.model.sessionAllowed[tool] {
+		return true
+	}
 	// Send approval prompt to the TUI event loop, then block until user responds.
 	// This runs inside a tea.Cmd goroutine so blocking is safe — it won't freeze the UI.
 	if h.model.program != nil {
 		h.model.program.Send(approvalRequestMsg{tool: tool, args: truncate(args, 200)})
-		return <-h.model.approvalCh
+		resp := <-h.model.approvalCh
+		return resp.allowed
 	}
 	// No program reference — deny by default (should not happen in normal flow)
 	return false
@@ -1877,8 +2753,10 @@ var baseSlashCommands = []slashCmd{
 	{"/sessions", "List saved sessions"},
 	{"/search", "Search session history"},
 	{"/session", "new | resume <n>"},
-	{"/clear", "Clear screen"},
+	{"/clear", "New session + clear screen"},
+	{"/new", "New session + clear screen"},
 	{"/update", "Check for updates"},
+	{"/doctor", "System diagnostics"},
 	{"/quit", "Exit"},
 }
 

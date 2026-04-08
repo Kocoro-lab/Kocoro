@@ -41,6 +41,10 @@ func toolKeyArg(toolName string, argsJSON string) string {
 		key = strVal(m, "script")
 	case "notify":
 		key = strVal(m, "message")
+	case "subagent":
+		key = strVal(m, "description")
+	case "cloud_delegate":
+		key = strVal(m, "task")
 	default:
 		for _, f := range []string{"query", "path", "url", "command", "name"} {
 			if v := strVal(m, f); v != "" {

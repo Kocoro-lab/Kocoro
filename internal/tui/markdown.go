@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/ansi"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Matches 2+ consecutive blank-looking lines (may contain whitespace or ANSI escapes)
@@ -189,7 +190,7 @@ var compactStyle = ansi.StyleConfig{
 	},
 	Code: ansi.StyleBlock{
 		StylePrimitive: ansi.StylePrimitive{
-			Color: stringPtr("203"),
+			Color: stringPtr("223"),
 		},
 	},
 	CodeBlock: ansi.StyleCodeBlock{
@@ -201,7 +202,7 @@ var compactStyle = ansi.StyleConfig{
 		},
 		Chroma: &ansi.Chroma{
 			Text:              ansi.StylePrimitive{Color: stringPtr("#C4C4C4")},
-			Error:             ansi.StylePrimitive{Color: stringPtr("#F1F1F1"), BackgroundColor: stringPtr("#F05B5B")},
+			Error:             ansi.StylePrimitive{Color: stringPtr("#F1F1F1")},
 			Comment:           ansi.StylePrimitive{Color: stringPtr("#676767")},
 			CommentPreproc:    ansi.StylePrimitive{Color: stringPtr("#FF875F")},
 			Keyword:           ansi.StylePrimitive{Color: stringPtr("#00AAFF")},
@@ -255,9 +256,17 @@ func getRenderer(width int) *glamour.TermRenderer {
 	if err != nil {
 		return nil
 	}
+	// Leave a 2-column margin for emoji/CJK width discrepancy.
+	// go-runewidth underestimates some emoji (e.g. 🛠 measured as 1 but
+	// rendered as 2 in most terminals). Without margin, lines overflow
+	// the terminal boundary, causing ANSI color bleed on wrapped lines.
+	wrapWidth := width - 2
+	if wrapWidth < 40 {
+		wrapWidth = 40
+	}
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStylesFromJSONBytes(styleJSON),
-		glamour.WithWordWrap(width),
+		glamour.WithWordWrap(wrapWidth),
 	)
 	if err != nil {
 		return nil
@@ -292,6 +301,11 @@ func renderMarkdown(text string, width int) string {
 	out = blankLineRe.ReplaceAllString(out, "\n\n")
 	out = strings.TrimRight(out, "\n ")
 
+	// Hard-clamp: truncate any line that exceeds terminal width.
+	// Despite the 2-col margin in word wrap, emoji width discrepancy
+	// (go-runewidth vs actual terminal) can still cause occasional overflow.
+	out = clampLines(out, width)
+
 	if sourcesRaw != "" {
 		if entries := parseSources(sourcesRaw); len(entries) > 0 {
 			out += "\n\n" + renderSourcesCompact(entries, width)
@@ -299,6 +313,54 @@ func renderMarkdown(text string, width int) string {
 	}
 
 	return out
+}
+
+// clampLines truncates any line wider than maxWidth using ANSI-aware measurement.
+// Uses lipgloss.Width (which respects ANSI escapes) for measurement and
+// muesli/ansi.Truncate for cutting. Appends reset + ellipsis on truncated lines.
+func clampLines(s string, maxWidth int) string {
+	lines := strings.Split(s, "\n")
+	changed := false
+	for i, line := range lines {
+		if lipgloss.Width(line) > maxWidth {
+			lines[i] = ansiTruncate(line, maxWidth-1) + "…"
+			changed = true
+		}
+	}
+	if !changed {
+		return s
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ansiTruncate truncates s to maxWidth visible characters, preserving ANSI escapes.
+func ansiTruncate(s string, maxWidth int) string {
+	var out strings.Builder
+	visible := 0
+	inEscape := false
+	for _, r := range s {
+		if r == '\x1b' {
+			inEscape = true
+			out.WriteRune(r)
+			continue
+		}
+		if inEscape {
+			out.WriteRune(r)
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				inEscape = false
+			}
+			continue
+		}
+		w := lipgloss.Width(string(r))
+		if visible+w > maxWidth {
+			break
+		}
+		visible += w
+		out.WriteRune(r)
+	}
+	// Reset ANSI state after truncation
+	out.WriteString("\033[0m")
+	return out.String()
 }
 
 func stringPtr(s string) *string { return &s }
