@@ -65,9 +65,11 @@ func (t *CloudDelegateTool) SetAgentContext(name, prompt string) {
 func (t *CloudDelegateTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "cloud_delegate",
-		Description: "Delegate a complex task to Shannon Cloud for multi-agent processing. " +
-			"Use for research, analysis, or tasks that benefit from multiple specialized agents " +
-			"working together. The task runs remotely and streams progress back. " +
+		Description: "Delegate a task to Shannon Cloud for INTERNET research and cloud-only data access. " +
+			"Primary use: web search, multi-source research, financial data APIs, ad intelligence, analytics — " +
+			"capabilities that are NOT available locally. " +
+			"IMPORTANT: This runs REMOTELY — it CANNOT read local files, run local commands, or access the local filesystem. " +
+			"For ANY task involving local files or local git repos, use the subagent tool instead. " +
 			"Returns the final result when complete.",
 		Parameters: map[string]any{
 			"type": "object",
@@ -83,7 +85,7 @@ func (t *CloudDelegateTool) Info() agent.ToolInfo {
 				"workflow_type": map[string]any{
 					"type":        "string",
 					"enum":        []string{"research", "swarm", "auto"},
-					"description": "Workflow type: 'research' for deep multi-source research with web search and synthesis. 'swarm' for complex tasks requiring a lead agent coordinating dynamic sub-agents (researcher, coder, analyst) with a shared workspace — best for open-ended analysis, multi-step problem solving, or tasks combining research + computation + writing. 'auto' (default) routes to a fixed DAG plan — good for structured tasks with clear subtask dependencies.",
+					"description": "Workflow type: 'research' (recommended) for deep multi-source web research with citations and synthesis — use this for most delegation tasks. 'auto' (default) routes to a fixed DAG plan for structured tasks. 'swarm' is reserved for user-initiated /swarm commands only — do NOT select swarm automatically.",
 				},
 				"terminal": map[string]any{
 					"type":        "boolean",
@@ -365,7 +367,17 @@ func (t *CloudDelegateTool) Run(ctx context.Context, argsJSON string) (agent.Too
 		terminal = *args.Terminal
 	}
 
-	return agent.ToolResult{Content: finalResult, CloudResult: fullResultConfirmed && terminal}, nil
+	result := agent.ToolResult{Content: finalResult, CloudResult: fullResultConfirmed && terminal}
+	if cloudUsage.LLMCalls > 0 {
+		result.Usage = &agent.ToolUsage{
+			InputTokens:  cloudUsage.InputTokens,
+			OutputTokens: cloudUsage.OutputTokens,
+			TotalTokens:  cloudUsage.TotalTokens,
+			LLMCalls:     cloudUsage.LLMCalls,
+			CostUSD:      cloudUsage.CostUSD,
+		}
+	}
+	return result, nil
 }
 
 func (t *CloudDelegateTool) RequiresApproval() bool { return true }

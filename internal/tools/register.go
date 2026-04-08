@@ -15,6 +15,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
+	"github.com/Kocoro-lab/ShanClaw/internal/tasks"
 )
 
 // RegisterLocalTools registers only the local tools.
@@ -70,6 +71,23 @@ func RegisterLocalTools(cfg *config.Config) (*agent.ToolRegistry, *[]*skills.Ski
 		}
 	}
 
+	// Task tracking tools — provider resolves store dir at call time.
+	// Default: ~/.shannon/tasks/default (overridden per-session by daemon runner).
+	defaultTaskDir := ""
+	if shanDir := config.ShannonDir(); shanDir != "" {
+		defaultTaskDir = filepath.Join(shanDir, "tasks", "default")
+	}
+	taskProvider := func() *tasks.Store {
+		if defaultTaskDir == "" {
+			return nil
+		}
+		return tasks.NewStore(defaultTaskDir)
+	}
+	reg.Register(&TaskCreateTool{storeProvider: taskProvider})
+	reg.Register(&TaskListTool{storeProvider: taskProvider})
+	reg.Register(&TaskUpdateTool{storeProvider: taskProvider})
+	reg.Register(&TaskGetTool{storeProvider: taskProvider})
+
 	cleanup := func() {
 		browser.Cleanup()
 		axClient.Close()
@@ -112,7 +130,65 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 		}
 	}
 
+	// Deep-copy SubAgentTool so per-run runner/baseReg mutations
+	// don't race across concurrent daemon routes.
+	if st, ok := cloned.Get("subagent"); ok {
+		if existing, ok := st.(*SubAgentTool); ok {
+			saCopy := *existing
+			cloned.Register(&saCopy)
+		}
+	}
+
+	// Deep-copy task tools so per-run storeProvider overrides
+	// don't race across concurrent daemon routes.
+	for _, name := range []string{"task_create", "task_list", "task_update", "task_get"} {
+		if t, ok := cloned.Get(name); ok {
+			switch existing := t.(type) {
+			case *TaskCreateTool:
+				cp := *existing
+				cloned.Register(&cp)
+			case *TaskListTool:
+				cp := *existing
+				cloned.Register(&cp)
+			case *TaskUpdateTool:
+				cp := *existing
+				cloned.Register(&cp)
+			case *TaskGetTool:
+				cp := *existing
+				cloned.Register(&cp)
+			}
+		}
+	}
+
 	return cloned
+}
+
+// OverrideTaskStoreDir updates all task tools in the registry to use a
+// session-scoped store directory, ensuring task isolation across routes.
+func OverrideTaskStoreDir(reg *agent.ToolRegistry, dir string) {
+	provider := func() *tasks.Store {
+		return tasks.NewStore(dir)
+	}
+	if t, ok := reg.Get("task_create"); ok {
+		if tt, ok := t.(*TaskCreateTool); ok {
+			tt.storeProvider = provider
+		}
+	}
+	if t, ok := reg.Get("task_list"); ok {
+		if tt, ok := t.(*TaskListTool); ok {
+			tt.storeProvider = provider
+		}
+	}
+	if t, ok := reg.Get("task_update"); ok {
+		if tt, ok := t.(*TaskUpdateTool); ok {
+			tt.storeProvider = provider
+		}
+	}
+	if t, ok := reg.Get("task_get"); ok {
+		if tt, ok := t.(*TaskGetTool); ok {
+			tt.storeProvider = provider
+		}
+	}
 }
 
 // gatewayAllowedTools is the allowlist of server-side tools worth registering
@@ -262,6 +338,17 @@ func CompleteRegistration(ctx context.Context, gw *client.GatewayClient, cfg *co
 	}
 
 	err := RegisterServerTools(ctx, gw, reg)
+
+	// Sub-agent tool — runner injected per-run by daemon/TUI.
+	agentsDir := ""
+	if shanDir := config.ShannonDir(); shanDir != "" {
+		agentsDir = filepath.Join(shanDir, "agents")
+	}
+	reg.Register(&SubAgentTool{
+		agentsDir: agentsDir,
+		baseReg:   reg.Clone(),
+		// runner: nil — wired per-run by daemon/TUI
+	})
 
 	// Apply tool filter AFTER all sources are registered
 	reg = ApplyToolFilter(reg, agentDef...)

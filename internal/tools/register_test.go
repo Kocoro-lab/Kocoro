@@ -32,7 +32,7 @@ func TestRegisterAll_WithServerTools(t *testing.T) {
 	}
 
 	// Check local tools are registered
-	for _, name := range []string{"use_skill", "file_read", "file_write", "file_edit", "glob", "grep", "bash", "think", "directory_list", "http", "system_info", "clipboard", "notify", "process", "applescript", "accessibility", "ghostty", "browser", "screenshot", "computer", "wait_for", "schedule_create", "schedule_list", "schedule_update", "schedule_remove"} {
+	for _, name := range []string{"use_skill", "file_read", "file_write", "file_edit", "glob", "grep", "bash", "think", "directory_list", "http", "system_info", "clipboard", "notify", "process", "applescript", "accessibility", "ghostty", "browser", "screenshot", "computer", "wait_for", "schedule_create", "schedule_list", "schedule_update", "schedule_remove", "task_create", "task_list", "task_update", "task_get"} {
 		if _, ok := reg.Get(name); !ok {
 			t.Errorf("local tool %q not registered", name)
 		}
@@ -45,10 +45,10 @@ func TestRegisterAll_WithServerTools(t *testing.T) {
 		}
 	}
 
-	// Total: 26 local + 2 server = 28
+	// Total: 30 local + 1 subagent + 2 server = 33
 	schemas := reg.Schemas()
-	if len(schemas) != 28 {
-		t.Errorf("expected 28 tools, got %d", len(schemas))
+	if len(schemas) != 33 {
+		t.Errorf("expected 33 tools, got %d", len(schemas))
 	}
 }
 
@@ -71,9 +71,10 @@ func TestRegisterAll_ServerUnavailable(t *testing.T) {
 		}
 	}
 
+	// 30 local + 1 subagent = 31 (no server tools)
 	schemas := reg.Schemas()
-	if len(schemas) != 26 {
-		t.Errorf("expected 26 local tools, got %d", len(schemas))
+	if len(schemas) != 31 {
+		t.Errorf("expected 31 tools, got %d", len(schemas))
 	}
 }
 
@@ -115,10 +116,10 @@ func TestRegisterAll_LocalPriority(t *testing.T) {
 		t.Error("web_search should be a server tool")
 	}
 
-	// 26 local + 1 server (bash skipped) = 27
+	// 30 local + 1 subagent + 1 server (bash skipped) = 32
 	schemas := reg.Schemas()
-	if len(schemas) != 27 {
-		t.Errorf("expected 27 tools, got %d", len(schemas))
+	if len(schemas) != 32 {
+		t.Errorf("expected 32 tools, got %d", len(schemas))
 	}
 }
 
@@ -157,6 +158,59 @@ func TestRegisterServerTools_AllowlistFiltering(t *testing.T) {
 		if _, ok := reg.Get(name); ok {
 			t.Errorf("non-allowlisted tool %q should NOT be registered", name)
 		}
+	}
+}
+
+func TestRegisterLocalTools_IncludesTaskTools(t *testing.T) {
+	reg, _, cleanup := RegisterLocalTools(nil)
+	defer cleanup()
+
+	for _, name := range []string{"task_create", "task_list", "task_update", "task_get"} {
+		if _, ok := reg.Get(name); !ok {
+			t.Errorf("expected tool %q to be registered", name)
+		}
+	}
+}
+
+func TestCompleteRegistration_IncludesSubagent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]client.ServerToolSchema{})
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	baseReg, _, baseCleanup := RegisterLocalTools(nil)
+	defer baseCleanup()
+
+	reg, _, regCleanup, err := CompleteRegistration(t.Context(), gw, nil, baseReg)
+	if regCleanup != nil {
+		defer regCleanup()
+	}
+	if err != nil {
+		t.Fatalf("CompleteRegistration: %v", err)
+	}
+	if _, ok := reg.Get("subagent"); !ok {
+		t.Error("expected 'subagent' registered")
+	}
+}
+
+func TestCloneWithRuntimeConfig_DeepCopiesSubagent(t *testing.T) {
+	reg := agent.NewToolRegistry()
+	sat := &SubAgentTool{agentsDir: "/original"}
+	reg.Register(sat)
+
+	cloned := CloneWithRuntimeConfig(reg, nil)
+	if st, ok := cloned.Get("subagent"); ok {
+		clonedSat := st.(*SubAgentTool)
+		if clonedSat == sat {
+			t.Error("expected deep copy, got same pointer")
+		}
+		if clonedSat.agentsDir != "/original" {
+			t.Errorf("expected agentsDir '/original', got %q", clonedSat.agentsDir)
+		}
+	} else {
+		t.Error("expected 'subagent' in cloned registry")
 	}
 }
 
