@@ -355,6 +355,7 @@ func (s *Server) handleChromeProfileUpdate(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.setConfiguredChromeProfile(req.Profile)
 	stopChromeFn()
 	if err := resetChromeProfileCloneFn(); err != nil {
 		rollbackPatch := map[string]interface{}{
@@ -371,11 +372,10 @@ func (s *Server) handleChromeProfileUpdate(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to refresh chrome profile clone: %v (rollback failed: %v)", err, rollbackErr))
 			return
 		}
+		s.setConfiguredChromeProfile(prevProfile)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	s.setConfiguredChromeProfile(req.Profile)
 
 	state, err := getChromeProfileStateFn(req.Profile)
 	if err != nil {

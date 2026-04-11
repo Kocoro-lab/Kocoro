@@ -594,6 +594,7 @@ func TestServer_ChromeProfileUpdateDoesNotPersistWhenResetFails(t *testing.T) {
 	resetChromeProfileCloneFn = func() error { return errors.New("directory not empty") }
 
 	shannonDir := t.TempDir()
+	t.Cleanup(func() { _ = os.Chmod(shannonDir, 0o700) })
 	initial := "daemon:\n  auto_approve: true\n"
 	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(initial), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -637,6 +638,78 @@ func TestServer_ChromeProfileUpdateDoesNotPersistWhenResetFails(t *testing.T) {
 	}
 	if !strings.Contains(text, "auto_approve: true") {
 		t.Fatalf("expected rolled-back config to keep sibling settings, got %s", text)
+	}
+}
+
+func TestServer_ChromeProfileUpdateRollbackFailureKeepsMemoryAlignedWithDisk(t *testing.T) {
+	oldGet := getChromeProfileStateFn
+	oldStop := stopChromeFn
+	oldReset := resetChromeProfileCloneFn
+	oldProfile := mcp.GetCDPChromeProfile()
+	defer func() {
+		getChromeProfileStateFn = oldGet
+		stopChromeFn = oldStop
+		resetChromeProfileCloneFn = oldReset
+		mcp.SetCDPChromeProfile(oldProfile)
+	}()
+
+	getChromeProfileStateFn = func(profile string) (mcp.ChromeProfileState, error) {
+		return mcp.ChromeProfileState{
+			Mode:             "auto",
+			DetectedProfile:  "Default",
+			EffectiveProfile: "Default",
+			CloneStatus:      mcp.ChromeProfileCloneCurrent,
+			Profiles: []mcp.ChromeProfileOption{
+				{Name: "Default", DisplayName: "Default", Exists: true, IsLastUsed: true, IsEffective: true},
+				{Name: "Profile 6", DisplayName: "Work", Exists: true},
+			},
+		}, nil
+	}
+	stopChromeFn = func() {}
+
+	shannonDir := t.TempDir()
+	initial := "daemon:\n  auto_approve: true\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(initial), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	resetChromeProfileCloneFn = func() error {
+		if err := os.RemoveAll(shannonDir); err != nil {
+			t.Fatalf("remove shannon dir: %v", err)
+		}
+		return errors.New("directory not empty")
+	}
+
+	deps := &ServerDeps{
+		ShannonDir: shannonDir,
+		Config: &config.Config{
+			Daemon: config.DaemonConfig{AutoApprove: true},
+		},
+	}
+	srv := NewServer(0, nil, deps, "test")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/chrome/profile", strings.NewReader(`{"mode":"explicit","profile":"Profile 6"}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handleChromeProfileUpdate(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status code = %d, want 500, body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if !strings.Contains(body["error"], "rollback failed") {
+		t.Fatalf("expected rollback failure in error body, got %v", body)
+	}
+	if deps.Config.Daemon.ChromeProfile != "Profile 6" {
+		t.Fatalf("expected in-memory chrome_profile to stay aligned with disk, got %q", deps.Config.Daemon.ChromeProfile)
+	}
+	if mcp.GetCDPChromeProfile() != "Profile 6" {
+		t.Fatalf("expected runtime chrome profile override to stay aligned with disk, got %q", mcp.GetCDPChromeProfile())
+	}
+	if _, err := os.Stat(shannonDir); !os.IsNotExist(err) {
+		t.Fatalf("expected rollback failure setup to remove shannon dir, got err=%v", err)
 	}
 }
 
