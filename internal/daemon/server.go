@@ -83,9 +83,12 @@ func resolveRegistryURL(deps *ServerDeps) string {
 }
 
 var (
-	showChromeOnPortFn      = mcp.ShowCDPChromeOnPort
-	hideChromeOnPortFn      = mcp.HideCDPChromeOnPort
-	getChromeStatusOnPortFn = mcp.GetCDPChromeStatusOnPort
+	showChromeOnPortFn        = mcp.ShowCDPChromeOnPort
+	hideChromeOnPortFn        = mcp.HideCDPChromeOnPort
+	getChromeStatusOnPortFn   = mcp.GetCDPChromeStatusOnPort
+	getChromeProfileStateFn   = mcp.GetChromeProfileState
+	stopChromeFn              = mcp.StopCDPChrome
+	resetChromeProfileCloneFn = mcp.ResetCDPProfileClone
 )
 
 func NewServer(port int, client *Client, deps *ServerDeps, version string) *Server {
@@ -115,6 +118,30 @@ func (s *Server) chromeControlPort() int {
 		return mcp.DefaultCDPPort
 	}
 	return mcp.PlaywrightCDPPort(mcp.NormalizePlaywrightCDPConfig(playwright))
+}
+
+func (s *Server) configuredChromeProfile() string {
+	if s == nil || s.deps == nil {
+		return ""
+	}
+	cfg, _, _ := s.deps.Snapshot()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Daemon.ChromeProfile
+}
+
+func (s *Server) setConfiguredChromeProfile(profile string) {
+	if s == nil || s.deps == nil {
+		return
+	}
+	s.deps.WriteLock()
+	if s.deps.Config == nil {
+		s.deps.Config = &config.Config{}
+	}
+	s.deps.Config.Daemon.ChromeProfile = profile
+	s.deps.WriteUnlock()
+	mcp.CDPChromeProfile = profile
 }
 
 // SetApprovalResolvedNotifier sets the function called to notify Cloud when
@@ -200,6 +227,9 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /cancel", s.handleCancel)
 	mux.HandleFunc("GET /events", s.handleEvents)
 	mux.HandleFunc("GET /chrome/status", s.handleChromeStatus)
+	mux.HandleFunc("GET /chrome/profile", s.handleChromeProfile)
+	mux.HandleFunc("POST /chrome/profile", s.handleChromeProfileUpdate)
+	mux.HandleFunc("POST /chrome/profile/refresh", s.handleChromeProfileRefresh)
 	mux.HandleFunc("POST /chrome/show", s.handleChromeShow)
 	mux.HandleFunc("POST /chrome/hide", s.handleChromeHide)
 	mux.HandleFunc("POST /shutdown", s.handleShutdown)
@@ -262,6 +292,96 @@ func (s *Server) handleChromeStatus(w http.ResponseWriter, r *http.Request) {
 		"visible":     status.Visible,
 		"probe_error": status.ProbeError,
 	})
+}
+
+func (s *Server) handleChromeProfile(w http.ResponseWriter, r *http.Request) {
+	state, err := getChromeProfileStateFn(s.configuredChromeProfile())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (s *Server) handleChromeProfileUpdate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mode    string `json:"mode"`
+		Profile string `json:"profile,omitempty"`
+	}
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	switch req.Mode {
+	case "auto":
+		req.Profile = ""
+	case "explicit":
+		if !mcp.ValidChromeProfileName(req.Profile) {
+			writeError(w, http.StatusBadRequest, "invalid chrome profile name")
+			return
+		}
+		state, err := getChromeProfileStateFn("")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		found := false
+		for _, profile := range state.Profiles {
+			if profile.Name == req.Profile {
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeError(w, http.StatusBadRequest, "chrome profile not found")
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, `mode must be "auto" or "explicit"`)
+		return
+	}
+
+	patch := map[string]interface{}{
+		"daemon": map[string]interface{}{
+			"chrome_profile": nil,
+		},
+	}
+	if req.Profile != "" {
+		patch["daemon"] = map[string]interface{}{
+			"chrome_profile": req.Profile,
+		}
+	}
+	stopChromeFn()
+	if err := resetChromeProfileCloneFn(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.patchGlobalConfig(patch); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.setConfiguredChromeProfile(req.Profile)
+
+	state, err := getChromeProfileStateFn(req.Profile)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (s *Server) handleChromeProfileRefresh(w http.ResponseWriter, r *http.Request) {
+	stopChromeFn()
+	if err := resetChromeProfileCloneFn(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	state, err := getChromeProfileStateFn(s.configuredChromeProfile())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
 }
 
 func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
@@ -1367,6 +1487,45 @@ func deepMerge(dst, src map[string]interface{}) {
 		}
 		dst[key] = srcVal
 	}
+}
+
+func pruneEmptyMaps(m map[string]interface{}) bool {
+	for key, val := range m {
+		switch v := val.(type) {
+		case nil:
+			delete(m, key)
+		case map[string]interface{}:
+			if pruneEmptyMaps(v) {
+				delete(m, key)
+			}
+		}
+	}
+	return len(m) == 0
+}
+
+func (s *Server) patchGlobalConfig(patch map[string]interface{}) error {
+	globalPath := filepath.Join(s.deps.ShannonDir, "config.yaml")
+	globalData, _ := os.ReadFile(globalPath)
+	var current map[string]interface{}
+	if len(globalData) > 0 {
+		if err := yaml.Unmarshal(globalData, &current); err != nil {
+			return fmt.Errorf("existing config is corrupt: %v", err)
+		}
+	}
+	if current == nil {
+		current = make(map[string]interface{})
+	}
+
+	normalizePatchKeys(patch)
+	stripRedactedSecrets(patch)
+	deepMerge(current, patch)
+	pruneEmptyMaps(current)
+
+	data, err := yaml.Marshal(current)
+	if err != nil {
+		return err
+	}
+	return agents.AtomicWrite(globalPath, data)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -2618,30 +2777,7 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &patch) {
 		return
 	}
-
-	globalPath := filepath.Join(s.deps.ShannonDir, "config.yaml")
-	globalData, _ := os.ReadFile(globalPath)
-	var current map[string]interface{}
-	if len(globalData) > 0 {
-		if err := yaml.Unmarshal(globalData, &current); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("existing config is corrupt: %v", err))
-			return
-		}
-	}
-	if current == nil {
-		current = make(map[string]interface{})
-	}
-
-	normalizePatchKeys(patch)
-	stripRedactedSecrets(patch)
-	deepMerge(current, patch)
-
-	data, err := yaml.Marshal(current)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := agents.AtomicWrite(globalPath, data); err != nil {
+	if err := s.patchGlobalConfig(patch); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2742,6 +2878,7 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mcpChanged := mcpConfigChanged(oldCfg, newCfg)
+	mcp.CDPChromeProfile = newCfg.Daemon.ChromeProfile
 
 	var regErr error
 	if mcpChanged {

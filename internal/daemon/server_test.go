@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -357,6 +358,281 @@ func TestServer_ChromeHandlersNormalizeLegacyPlaywrightPort(t *testing.T) {
 	}
 	if body["status"] != "visible" {
 		t.Fatalf("show body = %v, want visible status", body)
+	}
+}
+
+func TestServer_ChromeProfileHandlerUsesConfiguredProfile(t *testing.T) {
+	oldGet := getChromeProfileStateFn
+	defer func() { getChromeProfileStateFn = oldGet }()
+
+	var configured string
+	getChromeProfileStateFn = func(profile string) (mcp.ChromeProfileState, error) {
+		configured = profile
+		return mcp.ChromeProfileState{
+			Mode:              "explicit",
+			ConfiguredProfile: profile,
+			EffectiveProfile:  profile,
+			CloneStatus:       mcp.ChromeProfileCloneCurrent,
+			Profiles: []mcp.ChromeProfileOption{
+				{Name: "Profile 6", DisplayName: "Work", Exists: true, IsConfigured: true, IsEffective: true},
+			},
+		}, nil
+	}
+
+	deps := &ServerDeps{
+		Config: &config.Config{
+			Daemon: config.DaemonConfig{ChromeProfile: "Profile 6"},
+		},
+	}
+	srv := NewServer(0, nil, deps, "test")
+
+	rec := httptest.NewRecorder()
+	srv.handleChromeProfile(rec, httptest.NewRequest(http.MethodGet, "/chrome/profile", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200", rec.Code)
+	}
+	if configured != "Profile 6" {
+		t.Fatalf("expected configured profile 'Profile 6', got %q", configured)
+	}
+	var body mcp.ChromeProfileState
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.EffectiveProfile != "Profile 6" {
+		t.Fatalf("expected effective profile 'Profile 6', got %q", body.EffectiveProfile)
+	}
+	if body.CloneStatus != mcp.ChromeProfileCloneCurrent {
+		t.Fatalf("expected clone status %q, got %q", mcp.ChromeProfileCloneCurrent, body.CloneStatus)
+	}
+}
+
+func TestServer_ChromeProfileUpdateExplicitPersistsAndRefreshesClone(t *testing.T) {
+	oldGet := getChromeProfileStateFn
+	oldStop := stopChromeFn
+	oldReset := resetChromeProfileCloneFn
+	oldProfile := mcp.CDPChromeProfile
+	defer func() {
+		getChromeProfileStateFn = oldGet
+		stopChromeFn = oldStop
+		resetChromeProfileCloneFn = oldReset
+		mcp.CDPChromeProfile = oldProfile
+	}()
+
+	getChromeProfileStateFn = func(profile string) (mcp.ChromeProfileState, error) {
+		state := mcp.ChromeProfileState{
+			Mode:              "explicit",
+			ConfiguredProfile: profile,
+			EffectiveProfile:  profile,
+			CloneStatus:       mcp.ChromeProfileCloneMissing,
+			Profiles: []mcp.ChromeProfileOption{
+				{Name: "Default", DisplayName: "Default", Exists: true},
+				{Name: "Profile 6", DisplayName: "Work", Exists: true, IsConfigured: profile == "Profile 6", IsEffective: profile == "Profile 6"},
+			},
+		}
+		if profile == "" {
+			state.Mode = "auto"
+			state.DetectedProfile = "Profile 6"
+			state.EffectiveProfile = "Profile 6"
+		}
+		return state, nil
+	}
+
+	stopCalls := 0
+	stopChromeFn = func() { stopCalls++ }
+	resetCalls := 0
+	resetChromeProfileCloneFn = func() error {
+		resetCalls++
+		return nil
+	}
+
+	shannonDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	deps := &ServerDeps{
+		ShannonDir: shannonDir,
+		Config:     &config.Config{},
+	}
+	srv := NewServer(0, nil, deps, "test")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/chrome/profile", strings.NewReader(`{"mode":"explicit","profile":"Profile 6"}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handleChromeProfileUpdate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if deps.Config.Daemon.ChromeProfile != "Profile 6" {
+		t.Fatalf("expected in-memory config to be updated, got %q", deps.Config.Daemon.ChromeProfile)
+	}
+	if mcp.CDPChromeProfile != "Profile 6" {
+		t.Fatalf("expected runtime chrome profile override, got %q", mcp.CDPChromeProfile)
+	}
+	if stopCalls != 1 || resetCalls != 1 {
+		t.Fatalf("expected stop/reset to be called once each, got stop=%d reset=%d", stopCalls, resetCalls)
+	}
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !strings.Contains(string(data), "chrome_profile: Profile 6") {
+		t.Fatalf("expected config to persist chrome_profile, got %s", string(data))
+	}
+
+	var body mcp.ChromeProfileState
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.ConfiguredProfile != "Profile 6" || body.EffectiveProfile != "Profile 6" {
+		t.Fatalf("unexpected response body: %+v", body)
+	}
+	if body.CloneStatus != mcp.ChromeProfileCloneMissing {
+		t.Fatalf("expected clone status %q, got %q", mcp.ChromeProfileCloneMissing, body.CloneStatus)
+	}
+}
+
+func TestServer_ChromeProfileUpdateAutoClearsConfigKey(t *testing.T) {
+	oldGet := getChromeProfileStateFn
+	oldStop := stopChromeFn
+	oldReset := resetChromeProfileCloneFn
+	oldProfile := mcp.CDPChromeProfile
+	defer func() {
+		getChromeProfileStateFn = oldGet
+		stopChromeFn = oldStop
+		resetChromeProfileCloneFn = oldReset
+		mcp.CDPChromeProfile = oldProfile
+	}()
+
+	getChromeProfileStateFn = func(profile string) (mcp.ChromeProfileState, error) {
+		return mcp.ChromeProfileState{
+			Mode:             "auto",
+			DetectedProfile:  "Profile 6",
+			EffectiveProfile: "Profile 6",
+			CloneStatus:      mcp.ChromeProfileCloneMissing,
+			Profiles: []mcp.ChromeProfileOption{
+				{Name: "Profile 6", DisplayName: "Work", Exists: true, IsLastUsed: true, IsEffective: true},
+			},
+		}, nil
+	}
+	stopChromeFn = func() {}
+	resetChromeProfileCloneFn = func() error { return nil }
+
+	shannonDir := t.TempDir()
+	initial := "daemon:\n  auto_approve: true\n  chrome_profile: Profile 6\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(initial), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	deps := &ServerDeps{
+		ShannonDir: shannonDir,
+		Config: &config.Config{
+			Daemon: config.DaemonConfig{AutoApprove: true, ChromeProfile: "Profile 6"},
+		},
+	}
+	srv := NewServer(0, nil, deps, "test")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/chrome/profile", strings.NewReader(`{"mode":"auto"}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handleChromeProfileUpdate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if deps.Config.Daemon.ChromeProfile != "" {
+		t.Fatalf("expected in-memory chrome_profile to be cleared, got %q", deps.Config.Daemon.ChromeProfile)
+	}
+	if mcp.CDPChromeProfile != "" {
+		t.Fatalf("expected runtime chrome profile override to be cleared, got %q", mcp.CDPChromeProfile)
+	}
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "chrome_profile:") {
+		t.Fatalf("expected chrome_profile key to be removed, got %s", text)
+	}
+	if !strings.Contains(text, "auto_approve: true") {
+		t.Fatalf("expected sibling daemon setting to remain, got %s", text)
+	}
+
+	var body mcp.ChromeProfileState
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Mode != "auto" || body.CloneStatus != mcp.ChromeProfileCloneMissing {
+		t.Fatalf("unexpected response body: %+v", body)
+	}
+}
+
+func TestServer_ChromeProfileUpdateDoesNotPersistWhenResetFails(t *testing.T) {
+	oldGet := getChromeProfileStateFn
+	oldStop := stopChromeFn
+	oldReset := resetChromeProfileCloneFn
+	oldProfile := mcp.CDPChromeProfile
+	defer func() {
+		getChromeProfileStateFn = oldGet
+		stopChromeFn = oldStop
+		resetChromeProfileCloneFn = oldReset
+		mcp.CDPChromeProfile = oldProfile
+	}()
+
+	getChromeProfileStateFn = func(profile string) (mcp.ChromeProfileState, error) {
+		return mcp.ChromeProfileState{
+			Mode:             "auto",
+			DetectedProfile:  "Default",
+			EffectiveProfile: "Default",
+			CloneStatus:      mcp.ChromeProfileCloneCurrent,
+			Profiles: []mcp.ChromeProfileOption{
+				{Name: "Default", DisplayName: "Default", Exists: true, IsLastUsed: true, IsEffective: true},
+				{Name: "Profile 6", DisplayName: "Work", Exists: true},
+			},
+		}, nil
+	}
+	stopChromeFn = func() {}
+	resetChromeProfileCloneFn = func() error { return errors.New("directory not empty") }
+
+	shannonDir := t.TempDir()
+	initial := "daemon:\n  auto_approve: true\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(initial), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	deps := &ServerDeps{
+		ShannonDir: shannonDir,
+		Config: &config.Config{
+			Daemon: config.DaemonConfig{AutoApprove: true},
+		},
+	}
+	srv := NewServer(0, nil, deps, "test")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/chrome/profile", strings.NewReader(`{"mode":"explicit","profile":"Profile 6"}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handleChromeProfileUpdate(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status code = %d, want 500, body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body["error"] != "directory not empty" {
+		t.Fatalf("unexpected error body: %v", body)
+	}
+	if deps.Config.Daemon.ChromeProfile != "" {
+		t.Fatalf("expected in-memory chrome_profile to remain unchanged, got %q", deps.Config.Daemon.ChromeProfile)
+	}
+	if mcp.CDPChromeProfile != oldProfile {
+		t.Fatalf("expected runtime chrome profile override to remain unchanged, got %q", mcp.CDPChromeProfile)
+	}
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if string(data) != initial {
+		t.Fatalf("expected config file to remain unchanged, got %s", string(data))
 	}
 }
 

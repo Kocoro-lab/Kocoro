@@ -31,6 +31,16 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
+var (
+	disconnectPlaywrightAfterIdleFn = func(mgr *mcp.ClientManager, d time.Duration) {
+		mgr.DisconnectAfterIdle("playwright", d)
+	}
+	disconnectPlaywrightNowFn = func(mgr *mcp.ClientManager) {
+		mgr.Disconnect("playwright")
+	}
+	stopPlaywrightChromeFn = mcp.StopCDPChrome
+)
+
 // RequestContentBlock represents a content block in the POST /message request.
 // Supported types: "text" and "image" (passed through to LLM), "file_ref" (resolved by daemon).
 type RequestContentBlock struct {
@@ -44,22 +54,22 @@ type RequestContentBlock struct {
 
 // RunAgentRequest is the input for RunAgent.
 type RunAgentRequest struct {
-	Text           string               `json:"text"`
+	Text           string                `json:"text"`
 	Content        []RequestContentBlock `json:"content,omitempty"` // multimodal content blocks (optional)
-	Agent          string               `json:"agent,omitempty"`
-	SessionID      string               `json:"session_id,omitempty"`
-	NewSession     bool                 `json:"new_session,omitempty"`
-	Source         string               `json:"source,omitempty"`    // "slack", "line", "shanclaw", "webhook"
-	Sender         string               `json:"sender,omitempty"`    // user identifier from channel
-	Channel        string               `json:"channel,omitempty"`   // channel/thread source context
-	ThreadID       string               `json:"thread_id,omitempty"` // thread context for messaging platforms
-	CWD            string               `json:"cwd,omitempty"`       // absolute project path override
-	RouteKey       string               `json:"-"`                   // internal routing key
-	Ephemeral      bool                 `json:"-"`                   // caller owns persistence + events
-	ModelOverride  string               `json:"-"`                   // overrides agent model tier
-	BypassRouting  bool                 `json:"-"`                   // skip route lock (heartbeat runs)
-	SessionHistory []client.Message     `json:"-"`                   // pre-loaded history for LLM context (BypassRouting runs)
-	StickyContext  string               `json:"-"`                   // 额外的 sticky context，注入系统提示（对用户不可见）
+	Agent          string                `json:"agent,omitempty"`
+	SessionID      string                `json:"session_id,omitempty"`
+	NewSession     bool                  `json:"new_session,omitempty"`
+	Source         string                `json:"source,omitempty"`    // "slack", "line", "shanclaw", "webhook"
+	Sender         string                `json:"sender,omitempty"`    // user identifier from channel
+	Channel        string                `json:"channel,omitempty"`   // channel/thread source context
+	ThreadID       string                `json:"thread_id,omitempty"` // thread context for messaging platforms
+	CWD            string                `json:"cwd,omitempty"`       // absolute project path override
+	RouteKey       string                `json:"-"`                   // internal routing key
+	Ephemeral      bool                  `json:"-"`                   // caller owns persistence + events
+	ModelOverride  string                `json:"-"`                   // overrides agent model tier
+	BypassRouting  bool                  `json:"-"`                   // skip route lock (heartbeat runs)
+	SessionHistory []client.Message      `json:"-"`                   // pre-loaded history for LLM context (BypassRouting runs)
+	StickyContext  string                `json:"-"`                   // 额外的 sticky context，注入系统提示（对用户不可见）
 }
 
 // Validate checks that the request has the minimum required fields.
@@ -397,6 +407,24 @@ func (d *ServerDeps) RebuildLayers() (*agent.ToolRegistry, []agent.Tool, []agent
 	bl, gw, po, mgr := d.BaselineReg, d.GatewayOverlay, d.PostOverlays, d.MCPManager
 	d.mu.RUnlock()
 	return bl, gw, po, mgr
+}
+
+func cleanupPlaywrightAfterTurn(mgr *mcp.ClientManager) {
+	if mgr == nil {
+		return
+	}
+	cfg, ok := mgr.ConfigFor("playwright")
+	if !ok || cfg.KeepAlive {
+		return
+	}
+	if mcp.IsPlaywrightCDPMode(cfg) {
+		disconnectPlaywrightNowFn(mgr)
+		stopPlaywrightChromeFn()
+		log.Printf("daemon: Playwright on-demand teardown completed")
+		return
+	}
+	disconnectPlaywrightAfterIdleFn(mgr, 5*time.Minute)
+	log.Printf("daemon: Playwright idle disconnect scheduled (5m)")
 }
 
 // resumeNamedAgentColdStart resumes the latest persisted named-agent session.
@@ -994,17 +1022,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	log.Printf("daemon: reply to %s (%d tokens, $%.4f)", agentName, usage.TotalTokens, usage.CostUSD)
 
-	// Schedule Playwright idle disconnect unless keep_alive or CDP mode.
-	// CDP mode keeps playwright-mcp alive permanently (lightweight WebSocket).
-	if sup != nil {
-		if h := sup.HealthFor("playwright"); h.State == mcp.StateHealthy {
-			if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
-				if cfg, ok := mgr.ConfigFor("playwright"); !ok || (!cfg.KeepAlive && !mcp.IsPlaywrightCDPMode(cfg)) {
-					mgr.DisconnectAfterIdle("playwright", 5*time.Minute)
-					log.Printf("daemon: Playwright idle disconnect scheduled (5m)")
-				}
-			}
-		}
+	// Respect the keep_alive toggle after each completed turn.
+	if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
+		cleanupPlaywrightAfterTurn(mgr)
 	}
 
 	// On save failure, blank SessionID so HTTP/SSE clients can't click through

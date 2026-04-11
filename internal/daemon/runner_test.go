@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
@@ -378,5 +380,114 @@ func TestExtractUserFilePaths_Empty(t *testing.T) {
 	paths = extractUserFilePaths([]RequestContentBlock{{Type: "text", Text: "hello"}})
 	if len(paths) != 0 {
 		t.Errorf("expected empty for text-only, got %v", paths)
+	}
+}
+
+func TestCleanupPlaywrightAfterTurn_CDPOnDemandStopsBrowser(t *testing.T) {
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command:   "dummy",
+		Args:      []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+		KeepAlive: false,
+	})
+
+	oldIdle := disconnectPlaywrightAfterIdleFn
+	oldNow := disconnectPlaywrightNowFn
+	oldStop := stopPlaywrightChromeFn
+	defer func() {
+		disconnectPlaywrightAfterIdleFn = oldIdle
+		disconnectPlaywrightNowFn = oldNow
+		stopPlaywrightChromeFn = oldStop
+	}()
+
+	idleCalls := 0
+	nowCalls := 0
+	stopCalls := 0
+	disconnectPlaywrightAfterIdleFn = func(*mcp.ClientManager, time.Duration) { idleCalls++ }
+	disconnectPlaywrightNowFn = func(*mcp.ClientManager) { nowCalls++ }
+	stopPlaywrightChromeFn = func() { stopCalls++ }
+
+	cleanupPlaywrightAfterTurn(mgr)
+
+	if idleCalls != 0 {
+		t.Fatalf("expected no idle disconnect scheduling, got %d", idleCalls)
+	}
+	if nowCalls != 1 {
+		t.Fatalf("expected immediate disconnect once, got %d", nowCalls)
+	}
+	if stopCalls != 1 {
+		t.Fatalf("expected dedicated Chrome stop once, got %d", stopCalls)
+	}
+}
+
+func TestCleanupPlaywrightAfterTurn_KeepAliveLeavesBrowserRunning(t *testing.T) {
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command:   "dummy",
+		Args:      []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+		KeepAlive: true,
+	})
+
+	oldIdle := disconnectPlaywrightAfterIdleFn
+	oldNow := disconnectPlaywrightNowFn
+	oldStop := stopPlaywrightChromeFn
+	defer func() {
+		disconnectPlaywrightAfterIdleFn = oldIdle
+		disconnectPlaywrightNowFn = oldNow
+		stopPlaywrightChromeFn = oldStop
+	}()
+
+	idleCalls := 0
+	nowCalls := 0
+	stopCalls := 0
+	disconnectPlaywrightAfterIdleFn = func(*mcp.ClientManager, time.Duration) { idleCalls++ }
+	disconnectPlaywrightNowFn = func(*mcp.ClientManager) { nowCalls++ }
+	stopPlaywrightChromeFn = func() { stopCalls++ }
+
+	cleanupPlaywrightAfterTurn(mgr)
+
+	if idleCalls != 0 || nowCalls != 0 || stopCalls != 0 {
+		t.Fatalf("expected no teardown while keepAlive=true, got idle=%d disconnect=%d stop=%d", idleCalls, nowCalls, stopCalls)
+	}
+}
+
+func TestCleanupPlaywrightAfterTurn_NonCDPUsesIdleDisconnect(t *testing.T) {
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command:   "dummy",
+		Args:      []string{"--some-stdio-mode"},
+		KeepAlive: false,
+	})
+
+	oldIdle := disconnectPlaywrightAfterIdleFn
+	oldNow := disconnectPlaywrightNowFn
+	oldStop := stopPlaywrightChromeFn
+	defer func() {
+		disconnectPlaywrightAfterIdleFn = oldIdle
+		disconnectPlaywrightNowFn = oldNow
+		stopPlaywrightChromeFn = oldStop
+	}()
+
+	idleCalls := 0
+	var idleDuration time.Duration
+	nowCalls := 0
+	stopCalls := 0
+	disconnectPlaywrightAfterIdleFn = func(_ *mcp.ClientManager, d time.Duration) {
+		idleCalls++
+		idleDuration = d
+	}
+	disconnectPlaywrightNowFn = func(*mcp.ClientManager) { nowCalls++ }
+	stopPlaywrightChromeFn = func() { stopCalls++ }
+
+	cleanupPlaywrightAfterTurn(mgr)
+
+	if idleCalls != 1 {
+		t.Fatalf("expected idle disconnect scheduling once, got %d", idleCalls)
+	}
+	if idleDuration != 5*time.Minute {
+		t.Fatalf("expected 5m idle disconnect, got %v", idleDuration)
+	}
+	if nowCalls != 0 || stopCalls != 0 {
+		t.Fatalf("expected no immediate teardown in non-CDP mode, got disconnect=%d stop=%d", nowCalls, stopCalls)
 	}
 }
