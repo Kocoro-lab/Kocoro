@@ -734,18 +734,18 @@ func TestValidChromeProfileName(t *testing.T) {
 
 func TestCDPChromeProfileOverride(t *testing.T) {
 	dir := t.TempDir()
-	// Local State says "Profile 6" but CDPChromeProfile overrides to "Profile 2".
+	// Local State says "Profile 6" but the runtime override selects "Profile 2".
 	state := map[string]any{"profile": map[string]any{"last_used": "Profile 6"}}
 	data, _ := json.Marshal(state)
 	os.WriteFile(filepath.Join(dir, "Local State"), data, 0600)
 
-	old := CDPChromeProfile
-	CDPChromeProfile = "Profile 2"
-	t.Cleanup(func() { CDPChromeProfile = old })
+	old := GetCDPChromeProfile()
+	SetCDPChromeProfile("Profile 2")
+	t.Cleanup(func() { SetCDPChromeProfile(old) })
 
 	// detectActiveProfile would return "Profile 6", but with override set
 	// the code should use "Profile 2" instead.
-	profileName := CDPChromeProfile
+	profileName := GetCDPChromeProfile()
 	if profileName == "" {
 		profileName = detectActiveProfile(dir)
 	}

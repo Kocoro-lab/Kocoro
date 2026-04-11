@@ -410,12 +410,12 @@ func TestServer_ChromeProfileUpdateExplicitPersistsAndRefreshesClone(t *testing.
 	oldGet := getChromeProfileStateFn
 	oldStop := stopChromeFn
 	oldReset := resetChromeProfileCloneFn
-	oldProfile := mcp.CDPChromeProfile
+	oldProfile := mcp.GetCDPChromeProfile()
 	defer func() {
 		getChromeProfileStateFn = oldGet
 		stopChromeFn = oldStop
 		resetChromeProfileCloneFn = oldReset
-		mcp.CDPChromeProfile = oldProfile
+		mcp.SetCDPChromeProfile(oldProfile)
 	}()
 
 	getChromeProfileStateFn = func(profile string) (mcp.ChromeProfileState, error) {
@@ -466,8 +466,8 @@ func TestServer_ChromeProfileUpdateExplicitPersistsAndRefreshesClone(t *testing.
 	if deps.Config.Daemon.ChromeProfile != "Profile 6" {
 		t.Fatalf("expected in-memory config to be updated, got %q", deps.Config.Daemon.ChromeProfile)
 	}
-	if mcp.CDPChromeProfile != "Profile 6" {
-		t.Fatalf("expected runtime chrome profile override, got %q", mcp.CDPChromeProfile)
+	if mcp.GetCDPChromeProfile() != "Profile 6" {
+		t.Fatalf("expected runtime chrome profile override, got %q", mcp.GetCDPChromeProfile())
 	}
 	if stopCalls != 1 || resetCalls != 1 {
 		t.Fatalf("expected stop/reset to be called once each, got stop=%d reset=%d", stopCalls, resetCalls)
@@ -496,12 +496,12 @@ func TestServer_ChromeProfileUpdateAutoClearsConfigKey(t *testing.T) {
 	oldGet := getChromeProfileStateFn
 	oldStop := stopChromeFn
 	oldReset := resetChromeProfileCloneFn
-	oldProfile := mcp.CDPChromeProfile
+	oldProfile := mcp.GetCDPChromeProfile()
 	defer func() {
 		getChromeProfileStateFn = oldGet
 		stopChromeFn = oldStop
 		resetChromeProfileCloneFn = oldReset
-		mcp.CDPChromeProfile = oldProfile
+		mcp.SetCDPChromeProfile(oldProfile)
 	}()
 
 	getChromeProfileStateFn = func(profile string) (mcp.ChromeProfileState, error) {
@@ -542,8 +542,8 @@ func TestServer_ChromeProfileUpdateAutoClearsConfigKey(t *testing.T) {
 	if deps.Config.Daemon.ChromeProfile != "" {
 		t.Fatalf("expected in-memory chrome_profile to be cleared, got %q", deps.Config.Daemon.ChromeProfile)
 	}
-	if mcp.CDPChromeProfile != "" {
-		t.Fatalf("expected runtime chrome profile override to be cleared, got %q", mcp.CDPChromeProfile)
+	if mcp.GetCDPChromeProfile() != "" {
+		t.Fatalf("expected runtime chrome profile override to be cleared, got %q", mcp.GetCDPChromeProfile())
 	}
 	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
 	if err != nil {
@@ -570,12 +570,12 @@ func TestServer_ChromeProfileUpdateDoesNotPersistWhenResetFails(t *testing.T) {
 	oldGet := getChromeProfileStateFn
 	oldStop := stopChromeFn
 	oldReset := resetChromeProfileCloneFn
-	oldProfile := mcp.CDPChromeProfile
+	oldProfile := mcp.GetCDPChromeProfile()
 	defer func() {
 		getChromeProfileStateFn = oldGet
 		stopChromeFn = oldStop
 		resetChromeProfileCloneFn = oldReset
-		mcp.CDPChromeProfile = oldProfile
+		mcp.SetCDPChromeProfile(oldProfile)
 	}()
 
 	getChromeProfileStateFn = func(profile string) (mcp.ChromeProfileState, error) {
@@ -624,15 +624,124 @@ func TestServer_ChromeProfileUpdateDoesNotPersistWhenResetFails(t *testing.T) {
 	if deps.Config.Daemon.ChromeProfile != "" {
 		t.Fatalf("expected in-memory chrome_profile to remain unchanged, got %q", deps.Config.Daemon.ChromeProfile)
 	}
-	if mcp.CDPChromeProfile != oldProfile {
-		t.Fatalf("expected runtime chrome profile override to remain unchanged, got %q", mcp.CDPChromeProfile)
+	if mcp.GetCDPChromeProfile() != oldProfile {
+		t.Fatalf("expected runtime chrome profile override to remain unchanged, got %q", mcp.GetCDPChromeProfile())
 	}
 	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
 	if err != nil {
 		t.Fatalf("read config: %v", err)
 	}
-	if string(data) != initial {
-		t.Fatalf("expected config file to remain unchanged, got %s", string(data))
+	text := string(data)
+	if strings.Contains(text, "chrome_profile:") {
+		t.Fatalf("expected rolled-back config to remove chrome_profile, got %s", text)
+	}
+	if !strings.Contains(text, "auto_approve: true") {
+		t.Fatalf("expected rolled-back config to keep sibling settings, got %s", text)
+	}
+}
+
+func TestServer_ChromeProfileUpdateDoesNotStopWhenConfigWriteFails(t *testing.T) {
+	oldGet := getChromeProfileStateFn
+	oldStop := stopChromeFn
+	oldReset := resetChromeProfileCloneFn
+	oldProfile := mcp.GetCDPChromeProfile()
+	defer func() {
+		getChromeProfileStateFn = oldGet
+		stopChromeFn = oldStop
+		resetChromeProfileCloneFn = oldReset
+		mcp.SetCDPChromeProfile(oldProfile)
+	}()
+
+	getChromeProfileStateFn = func(profile string) (mcp.ChromeProfileState, error) {
+		return mcp.ChromeProfileState{
+			Mode:             "auto",
+			DetectedProfile:  "Default",
+			EffectiveProfile: "Default",
+			CloneStatus:      mcp.ChromeProfileCloneCurrent,
+			Profiles: []mcp.ChromeProfileOption{
+				{Name: "Default", DisplayName: "Default", Exists: true, IsLastUsed: true, IsEffective: true},
+				{Name: "Profile 6", DisplayName: "Work", Exists: true},
+			},
+		}, nil
+	}
+
+	stopCalls := 0
+	resetCalls := 0
+	stopChromeFn = func() { stopCalls++ }
+	resetChromeProfileCloneFn = func() error {
+		resetCalls++
+		return nil
+	}
+
+	mcp.SetCDPChromeProfile("Default")
+	deps := &ServerDeps{
+		ShannonDir: filepath.Join(t.TempDir(), "missing-config-dir"),
+		Config: &config.Config{
+			Daemon: config.DaemonConfig{ChromeProfile: "Default"},
+		},
+	}
+	srv := NewServer(0, nil, deps, "test")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/chrome/profile", strings.NewReader(`{"mode":"explicit","profile":"Profile 6"}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handleChromeProfileUpdate(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status code = %d, want 500, body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body["error"] == "" {
+		t.Fatalf("expected non-empty error body, got %v", body)
+	}
+	if stopCalls != 0 || resetCalls != 0 {
+		t.Fatalf("expected no destructive ops when config write fails, got stop=%d reset=%d", stopCalls, resetCalls)
+	}
+	if deps.Config.Daemon.ChromeProfile != "Default" {
+		t.Fatalf("expected in-memory chrome_profile to remain unchanged, got %q", deps.Config.Daemon.ChromeProfile)
+	}
+	if mcp.GetCDPChromeProfile() != "Default" {
+		t.Fatalf("expected runtime chrome profile override to remain unchanged, got %q", mcp.GetCDPChromeProfile())
+	}
+}
+
+func TestServer_PatchConfigNullRemovesChromeProfileKey(t *testing.T) {
+	shannonDir := t.TempDir()
+	initial := "daemon:\n  auto_approve: true\n  chrome_profile: Profile 6\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(initial), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	srv := NewServer(0, nil, &ServerDeps{ShannonDir: shannonDir}, "test")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(`{"daemon":{"chrome_profile":null}}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handlePatchConfig(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["status"] != "updated" {
+		t.Fatalf("unexpected response body: %v", body)
+	}
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "chrome_profile:") {
+		t.Fatalf("expected chrome_profile key to be removed, got %s", text)
+	}
+	if !strings.Contains(text, "auto_approve: true") {
+		t.Fatalf("expected sibling daemon setting to remain, got %s", text)
 	}
 }
 

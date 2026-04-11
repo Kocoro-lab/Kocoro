@@ -140,8 +140,8 @@ func (s *Server) setConfiguredChromeProfile(profile string) {
 		s.deps.Config = &config.Config{}
 	}
 	s.deps.Config.Daemon.ChromeProfile = profile
+	mcp.SetCDPChromeProfile(profile)
 	s.deps.WriteUnlock()
-	mcp.CDPChromeProfile = profile
 }
 
 // SetApprovalResolvedNotifier sets the function called to notify Cloud when
@@ -350,12 +350,27 @@ func (s *Server) handleChromeProfileUpdate(w http.ResponseWriter, r *http.Reques
 			"chrome_profile": req.Profile,
 		}
 	}
-	stopChromeFn()
-	if err := resetChromeProfileCloneFn(); err != nil {
+	prevProfile := s.configuredChromeProfile()
+	if err := s.patchGlobalConfig(patch); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := s.patchGlobalConfig(patch); err != nil {
+	stopChromeFn()
+	if err := resetChromeProfileCloneFn(); err != nil {
+		rollbackPatch := map[string]interface{}{
+			"daemon": map[string]interface{}{
+				"chrome_profile": nil,
+			},
+		}
+		if prevProfile != "" {
+			rollbackPatch["daemon"] = map[string]interface{}{
+				"chrome_profile": prevProfile,
+			}
+		}
+		if rollbackErr := s.patchGlobalConfig(rollbackPatch); rollbackErr != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to refresh chrome profile clone: %v (rollback failed: %v)", err, rollbackErr))
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2878,7 +2893,7 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mcpChanged := mcpConfigChanged(oldCfg, newCfg)
-	mcp.CDPChromeProfile = newCfg.Daemon.ChromeProfile
+	mcp.SetCDPChromeProfile(newCfg.Daemon.ChromeProfile)
 
 	var regErr error
 	if mcpChanged {

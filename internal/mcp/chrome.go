@@ -48,7 +48,22 @@ var (
 
 // CDPChromeProfile overrides automatic profile detection when non-empty.
 // Set from daemon config (daemon.chrome_profile).
-var CDPChromeProfile string
+var cdpChromeProfile atomic.Value
+
+func SetCDPChromeProfile(profile string) {
+	cdpChromeProfile.Store(profile)
+}
+
+func GetCDPChromeProfile() string {
+	v := cdpChromeProfile.Load()
+	if v == nil {
+		return ""
+	}
+	if profile, ok := v.(string); ok {
+		return profile
+	}
+	return ""
+}
 
 type ChromeProfileOption struct {
 	Name         string `json:"name"`
@@ -194,7 +209,7 @@ func LaunchCDPChrome(port int) error {
 
 	// Determine which Chrome profile to copy from.
 	srcChromeDir := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
-	profileName := CDPChromeProfile
+	profileName := GetCDPChromeProfile()
 	if profileName == "" {
 		profileName = detectActiveProfile(srcChromeDir)
 	}
