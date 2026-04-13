@@ -97,6 +97,16 @@ type MessagePayload struct {
 	Timestamp string               `json:"timestamp"`
 	Source    string               `json:"source,omitempty"` // populated by Cloud; "slack", "line", "webhook"
 	CWD       string               `json:"cwd,omitempty"`    // project path override from Cloud/Desktop
+	Files     []RemoteFile         `json:"files,omitempty"` // file attachments from messaging platforms
+}
+
+// RemoteFile describes a file attachment forwarded by Cloud from a messaging platform.
+type RemoteFile struct {
+	Name       string `json:"name"`
+	MimeType   string `json:"mimetype,omitempty"`
+	Size       int64  `json:"size,omitempty"`
+	URL        string `json:"url"`
+	AuthHeader string `json:"auth_header,omitempty"`
 }
 
 // ReplyPayload is sent back after agent completes.

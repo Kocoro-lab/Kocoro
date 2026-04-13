@@ -217,6 +217,7 @@ var daemonStartCmd = &cobra.Command{
 				ThreadID: msg.ThreadID,
 				Sender:   msg.Sender,
 				CWD:      msg.CWD,
+				Files:    msg.Files,
 			}
 			// Fall back to @mention parsing if cloud didn't set agent name.
 			if req.Agent == "" {
@@ -226,6 +227,10 @@ var daemonStartCmd = &cobra.Command{
 			}
 			if req.Text == "" {
 				req.Text = msg.Text
+			}
+			// Allow file-only messages (no text) from messaging platforms.
+			if req.Text == "" && len(req.Files) > 0 {
+				req.Text = "[Attached files]"
 			}
 			if err := req.Validate(); err != nil {
 				return daemon.FriendlyAgentError(err)

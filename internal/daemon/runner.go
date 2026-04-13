@@ -60,6 +60,7 @@ type RunAgentRequest struct {
 	BypassRouting  bool                 `json:"-"`                   // skip route lock (heartbeat runs)
 	SessionHistory []client.Message     `json:"-"`                   // pre-loaded history for LLM context (BypassRouting runs)
 	StickyContext  string               `json:"-"`                   // 额外的 sticky context，注入系统提示（对用户不可见）
+	Files          []RemoteFile         `json:"-"`                   // remote file attachments from Cloud (WS only)
 }
 
 // Validate checks that the request has the minimum required fields.
@@ -445,6 +446,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	agentName := req.Agent
 	prompt := req.Text
+
+	// Download remote file attachments and convert to file_ref blocks.
+	if len(req.Files) > 0 {
+		req.Content = append(req.Content, downloadRemoteFiles(deps.ShannonDir, req.Files)...)
+	}
 
 	// Resolve multimodal content blocks (if present).
 	var resolvedContent []client.ContentBlock
