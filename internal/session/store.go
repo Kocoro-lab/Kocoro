@@ -153,8 +153,8 @@ func (s *Store) Save(sess *Session) error {
 	return nil
 }
 
-// PatchTitle 从磁盘重新读取 session，仅更新标题后写回。
-// 不更新 UpdatedAt，不影响 session 排序。
+// PatchTitle re-reads the session from disk, updates only the title, and writes it back.
+// UpdatedAt is not touched, so session sort order is preserved.
 func (s *Store) PatchTitle(id, title string) error {
 	sess, err := s.Load(id)
 	if err != nil {

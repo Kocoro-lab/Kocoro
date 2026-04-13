@@ -17,5 +17,6 @@ CLAUDE.local.md
 *.log
 docs/
 internal/tools/axserver/.build/
+internal/agent/tmp/
 build/
 .idea/

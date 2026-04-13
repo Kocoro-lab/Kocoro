@@ -30,19 +30,36 @@ func TestReadTracker_MarkAndHasRead(t *testing.T) {
 func TestReadTracker_RelativePath(t *testing.T) {
 	rt := NewReadTracker()
 
-	// Create a file in a temp dir and chdir there
+	// Create a file in a temp dir. The tracker should treat absolute and
+	// relative paths as the same file when SetCWD is called — this mirrors
+	// the explicit-CWD contract the rest of the filesystem tools enforce
+	// after the CWD-hardening work; process cwd is NOT consulted.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rel.txt")
 	os.WriteFile(path, []byte("data"), 0644)
 
-	oldDir, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(oldDir)
+	rt.SetCWD(dir)
 
 	// Mark with absolute, check with relative
 	rt.MarkRead(path)
 	if !rt.HasRead("rel.txt") {
-		t.Error("expected HasRead to match relative path against absolute")
+		t.Error("expected HasRead to match relative path against absolute after SetCWD")
+	}
+}
+
+// TestReadTracker_RelativePathWithoutCWD verifies that a relative path with
+// no SetCWD is treated as a distinct key from its absolute form — the
+// tracker must NOT silently resolve against the process cwd.
+func TestReadTracker_RelativePathWithoutCWD(t *testing.T) {
+	rt := NewReadTracker()
+
+	dir := t.TempDir()
+	abs := filepath.Join(dir, "rel.txt")
+	os.WriteFile(abs, []byte("data"), 0644)
+
+	rt.MarkRead(abs)
+	if rt.HasRead("rel.txt") {
+		t.Error("expected relative path to not match absolute when no CWD is set")
 	}
 }
 

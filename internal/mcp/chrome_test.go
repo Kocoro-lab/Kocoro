@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -98,6 +99,8 @@ func installChromeTestHooks(t *testing.T, home string, execFn func(string, ...st
 	oldReachable := cdpReachableFn
 	oldListening := portListeningFn
 	oldEnsure := ensureChromeDebugPortFn
+	oldRemoveAll := cdpRemoveAll
+	oldStat := cdpStat
 
 	cdpExecCommand = execFn
 	cdpUserHomeDir = func() (string, error) { return home, nil }
@@ -117,6 +120,8 @@ func installChromeTestHooks(t *testing.T, home string, execFn func(string, ...st
 		cdpReachableFn = oldReachable
 		portListeningFn = oldListening
 		ensureChromeDebugPortFn = oldEnsure
+		cdpRemoveAll = oldRemoveAll
+		cdpStat = oldStat
 	})
 }
 
@@ -729,22 +734,224 @@ func TestValidChromeProfileName(t *testing.T) {
 
 func TestCDPChromeProfileOverride(t *testing.T) {
 	dir := t.TempDir()
-	// Local State says "Profile 6" but CDPChromeProfile overrides to "Profile 2".
+	// Local State says "Profile 6" but the runtime override selects "Profile 2".
 	state := map[string]any{"profile": map[string]any{"last_used": "Profile 6"}}
 	data, _ := json.Marshal(state)
 	os.WriteFile(filepath.Join(dir, "Local State"), data, 0600)
 
-	old := CDPChromeProfile
-	CDPChromeProfile = "Profile 2"
-	t.Cleanup(func() { CDPChromeProfile = old })
+	old := GetCDPChromeProfile()
+	SetCDPChromeProfile("Profile 2")
+	t.Cleanup(func() { SetCDPChromeProfile(old) })
 
 	// detectActiveProfile would return "Profile 6", but with override set
 	// the code should use "Profile 2" instead.
-	profileName := CDPChromeProfile
+	profileName := GetCDPChromeProfile()
 	if profileName == "" {
 		profileName = detectActiveProfile(dir)
 	}
 	if profileName != "Profile 2" {
 		t.Fatalf("expected override 'Profile 2', got %q", profileName)
+	}
+}
+
+func TestGetChromeProfileState_AutoDetectsAndListsProfiles(t *testing.T) {
+	home := t.TempDir()
+	chromeDir := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
+	if err := os.MkdirAll(filepath.Join(chromeDir, "Default"), 0o700); err != nil {
+		t.Fatalf("mkdir default profile: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(chromeDir, "Profile 6"), 0o700); err != nil {
+		t.Fatalf("mkdir profile 6: %v", err)
+	}
+	state := map[string]any{
+		"profile": map[string]any{
+			"last_used": "Profile 6",
+			"info_cache": map[string]any{
+				"Default":   map[string]any{"name": "Personal"},
+				"Profile 6": map[string]any{"name": "Work"},
+			},
+		},
+	}
+	data, _ := json.Marshal(state)
+	if err := os.WriteFile(filepath.Join(chromeDir, "Local State"), data, 0o600); err != nil {
+		t.Fatalf("write local state: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".shannon", "chrome-cdp"), 0o700); err != nil {
+		t.Fatalf("mkdir cdp dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp", ".profile_source"), []byte("Default"), 0o600); err != nil {
+		t.Fatalf("write profile marker: %v", err)
+	}
+
+	oldHome := cdpUserHomeDir
+	cdpUserHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { cdpUserHomeDir = oldHome })
+
+	got, err := GetChromeProfileState("")
+	if err != nil {
+		t.Fatalf("GetChromeProfileState returned error: %v", err)
+	}
+	if got.Mode != "auto" {
+		t.Fatalf("expected auto mode, got %q", got.Mode)
+	}
+	if got.DetectedProfile != "Profile 6" {
+		t.Fatalf("expected detected profile 'Profile 6', got %q", got.DetectedProfile)
+	}
+	if got.EffectiveProfile != "Profile 6" {
+		t.Fatalf("expected effective profile 'Profile 6', got %q", got.EffectiveProfile)
+	}
+	if got.LastCloneSource != "Default" {
+		t.Fatalf("expected last clone source 'Default', got %q", got.LastCloneSource)
+	}
+	if got.CloneStatus != ChromeProfileCloneStale {
+		t.Fatalf("expected clone status %q, got %q", ChromeProfileCloneStale, got.CloneStatus)
+	}
+	if !got.RefreshRequired {
+		t.Fatal("expected refreshRequired=true when marker differs from effective profile")
+	}
+	if len(got.Profiles) != 2 {
+		t.Fatalf("expected 2 profiles, got %d", len(got.Profiles))
+	}
+	if got.Profiles[0].Name != "Default" || got.Profiles[0].DisplayName != "Personal" {
+		t.Fatalf("unexpected first profile: %+v", got.Profiles[0])
+	}
+	if got.Profiles[1].Name != "Profile 6" || got.Profiles[1].DisplayName != "Work" {
+		t.Fatalf("unexpected second profile: %+v", got.Profiles[1])
+	}
+	if !got.Profiles[1].IsLastUsed || !got.Profiles[1].IsEffective {
+		t.Fatalf("expected Profile 6 to be marked last-used/effective, got %+v", got.Profiles[1])
+	}
+}
+
+func TestGetChromeProfileState_AddsMissingConfiguredProfile(t *testing.T) {
+	home := t.TempDir()
+	chromeDir := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
+	if err := os.MkdirAll(filepath.Join(chromeDir, "Default"), 0o700); err != nil {
+		t.Fatalf("mkdir default profile: %v", err)
+	}
+
+	oldHome := cdpUserHomeDir
+	cdpUserHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { cdpUserHomeDir = oldHome })
+
+	got, err := GetChromeProfileState("Profile 2")
+	if err != nil {
+		t.Fatalf("GetChromeProfileState returned error: %v", err)
+	}
+	if got.Mode != "explicit" {
+		t.Fatalf("expected explicit mode, got %q", got.Mode)
+	}
+	if got.EffectiveProfile != "Profile 2" {
+		t.Fatalf("expected effective profile 'Profile 2', got %q", got.EffectiveProfile)
+	}
+	found := false
+	for _, profile := range got.Profiles {
+		if profile.Name == "Profile 2" {
+			found = true
+			if profile.Exists {
+				t.Fatalf("expected synthetic configured profile to be marked missing, got %+v", profile)
+			}
+			if !profile.IsConfigured || !profile.IsEffective {
+				t.Fatalf("expected synthetic profile to be configured/effective, got %+v", profile)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected missing configured profile to be included in state")
+	}
+}
+
+func TestGetChromeProfileState_MissingCloneIsNotMarkedStale(t *testing.T) {
+	home := t.TempDir()
+	chromeDir := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
+	if err := os.MkdirAll(filepath.Join(chromeDir, "Default"), 0o700); err != nil {
+		t.Fatalf("mkdir default profile: %v", err)
+	}
+	state := map[string]any{
+		"profile": map[string]any{
+			"last_used": "Default",
+			"info_cache": map[string]any{
+				"Default": map[string]any{"name": "Personal"},
+			},
+		},
+	}
+	data, _ := json.Marshal(state)
+	if err := os.WriteFile(filepath.Join(chromeDir, "Local State"), data, 0o600); err != nil {
+		t.Fatalf("write local state: %v", err)
+	}
+
+	oldHome := cdpUserHomeDir
+	cdpUserHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { cdpUserHomeDir = oldHome })
+
+	got, err := GetChromeProfileState("")
+	if err != nil {
+		t.Fatalf("GetChromeProfileState returned error: %v", err)
+	}
+	if got.CloneStatus != ChromeProfileCloneMissing {
+		t.Fatalf("expected clone status %q, got %q", ChromeProfileCloneMissing, got.CloneStatus)
+	}
+	if got.RefreshRequired {
+		t.Fatal("expected refreshRequired=false when no clone exists yet")
+	}
+	if got.LastCloneSource != "" {
+		t.Fatalf("expected empty last clone source, got %q", got.LastCloneSource)
+	}
+}
+
+func TestResetCDPProfileCloneRemovesDataDir(t *testing.T) {
+	home := t.TempDir()
+	cdpDir := filepath.Join(home, ".shannon", "chrome-cdp", "Default")
+	if err := os.MkdirAll(cdpDir, 0o700); err != nil {
+		t.Fatalf("mkdir cdp dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cdpDir, "Cookies"), []byte("cookie-data"), 0o600); err != nil {
+		t.Fatalf("write cookie file: %v", err)
+	}
+
+	oldHome := cdpUserHomeDir
+	cdpUserHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { cdpUserHomeDir = oldHome })
+
+	if err := ResetCDPProfileClone(); err != nil {
+		t.Fatalf("ResetCDPProfileClone returned error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".shannon", "chrome-cdp")); !os.IsNotExist(err) {
+		t.Fatalf("expected chrome-cdp dir to be removed, got err=%v", err)
+	}
+}
+
+func TestResetCDPProfileCloneRetriesTransientRemoveError(t *testing.T) {
+	home := t.TempDir()
+	cdpRoot := filepath.Join(home, ".shannon", "chrome-cdp")
+	cdpDir := filepath.Join(cdpRoot, "Default")
+	if err := os.MkdirAll(cdpDir, 0o700); err != nil {
+		t.Fatalf("mkdir cdp dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cdpDir, "Cookies"), []byte("cookie-data"), 0o600); err != nil {
+		t.Fatalf("write cookie file: %v", err)
+	}
+
+	runner := &fakeChromeExec{}
+	installChromeTestHooks(t, home, runner.command, func() bool { return false }, func() string { return "" })
+
+	oldRemoveAll := cdpRemoveAll
+	attempts := 0
+	cdpRemoveAll = func(path string) error {
+		attempts++
+		if attempts == 1 {
+			return syscall.ENOTEMPTY
+		}
+		return oldRemoveAll(path)
+	}
+
+	if err := ResetCDPProfileClone(); err != nil {
+		t.Fatalf("ResetCDPProfileClone returned error: %v", err)
+	}
+	if attempts < 2 {
+		t.Fatalf("expected removal retry, got %d attempt(s)", attempts)
+	}
+	if _, err := os.Stat(cdpRoot); !os.IsNotExist(err) {
+		t.Fatalf("expected chrome-cdp dir to be removed, got err=%v", err)
 	}
 }

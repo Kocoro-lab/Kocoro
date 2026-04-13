@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
@@ -40,12 +39,15 @@ func (m *Manager) NewSession() *Session {
 		prevID = m.current.ID
 	}
 	id := generateID()
+	// CWD is intentionally left empty — callers (daemon runner, TUI,
+	// one-shot CLI) are responsible for setting it explicitly based on
+	// their own context. Historically this was populated via os.Getwd()
+	// which leaked the daemon startup directory into every new session.
 	m.current = &Session{
 		SchemaVersion: 1,
 		ID:            id,
 		CreatedAt:     time.Now(),
 		Title:         "New session",
-		CWD:           getCWD(),
 	}
 	m.ensureRuntimeLocked(id)
 	sess := m.current
@@ -97,9 +99,9 @@ func (m *Manager) Save() error {
 	return m.store.Save(m.current)
 }
 
-// PatchTitle 修改指定 session 的标题并持久化。
-// 如果修改的是当前活跃 session，同时更新内存中的 title。
-// 先写磁盘再更新内存，避免写入失败导致不一致。
+// PatchTitle updates the title of the given session and persists it.
+// If the target is the active session, the in-memory title is also updated.
+// Disk is written first so a failed write won't leave memory inconsistent.
 func (m *Manager) PatchTitle(id, title string) error {
 	err := m.store.PatchTitle(id, title)
 	if err != nil {
@@ -310,12 +312,4 @@ func generateID() string {
 		return time.Now().Format("2006-01-02-150405")
 	}
 	return fmt.Sprintf("%s-%s", time.Now().Format("2006-01-02"), hex.EncodeToString(b))
-}
-
-func getCWD() string {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "."
-	}
-	return cwd
 }

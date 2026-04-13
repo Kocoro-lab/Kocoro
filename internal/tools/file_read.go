@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -60,7 +61,16 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
-	args.Path = cwdctx.ResolvePath(ctx, args.Path)
+	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
+	if resolveErr != nil {
+		if errors.Is(resolveErr, cwdctx.ErrNoSessionCWD) {
+			return agent.ValidationError(
+				"file_read: no session working directory is set. Pass an absolute path.",
+			), nil
+		}
+		return agent.ValidationError(fmt.Sprintf("file_read: %v", resolveErr)), nil
+	}
+	args.Path = resolved
 
 	// Image files: return as vision image block instead of text lines.
 	ext := strings.ToLower(filepath.Ext(args.Path))

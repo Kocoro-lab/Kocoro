@@ -108,3 +108,19 @@ func indexOf(s, substr string) int {
 	}
 	return -1
 }
+
+// TestFileRead_RelativePathRefusedWithoutSessionCWD ensures file_read no
+// longer silently falls back to os.Getwd() when no session CWD is set.
+func TestFileRead_RelativePathRefusedWithoutSessionCWD(t *testing.T) {
+	tool := &FileReadTool{}
+	result, err := tool.Run(context.Background(), `{"path":"relative.txt"}`)
+	if err != nil {
+		t.Fatalf("Run should not return a transport error, got %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected error result when session CWD unset and path is relative, got: %s", result.Content)
+	}
+	if !contains(result.Content, "session working directory") && !contains(result.Content, "absolute path") {
+		t.Errorf("expected guard message, got: %s", result.Content)
+	}
+}

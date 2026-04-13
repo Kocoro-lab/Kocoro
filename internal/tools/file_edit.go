@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -40,7 +41,16 @@ func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
-	args.Path = cwdctx.ResolvePath(ctx, args.Path)
+	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
+	if resolveErr != nil {
+		if errors.Is(resolveErr, cwdctx.ErrNoSessionCWD) {
+			return agent.ValidationError(
+				"file_edit: no session working directory is set. Pass an absolute path.",
+			), nil
+		}
+		return agent.ValidationError(fmt.Sprintf("file_edit: %v", resolveErr)), nil
+	}
+	args.Path = resolved
 
 	// Enforce read-before-edit
 	if err := agent.CheckReadBeforeWrite(ctx, args.Path); err != nil {

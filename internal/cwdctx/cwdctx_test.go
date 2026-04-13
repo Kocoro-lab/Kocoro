@@ -2,6 +2,7 @@ package cwdctx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -129,22 +130,13 @@ func TestResolveEffectiveCWD_Priority(t *testing.T) {
 		{"request wins", "/req", "/sess", "/agent", "/req"},
 		{"session wins when no request", "", "/sess", "/agent", "/sess"},
 		{"agent wins when no request or session", "", "", "/agent", "/agent"},
-		{"fallback to home dir", "", "", "", ""},
+		{"empty when nothing provided", "", "", "", ""},
 	}
-	home, _ := os.UserHomeDir()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := ResolveEffectiveCWD(tt.request, tt.session, tt.agent)
-			if tt.want != "" && got != tt.want {
+			if got != tt.want {
 				t.Errorf("expected %q, got %q", tt.want, got)
-			}
-			if tt.want == "" {
-				if got == "" {
-					t.Error("fallback should return non-empty directory")
-				}
-				if got != home {
-					t.Errorf("fallback should return $HOME %q, got %q", home, got)
-				}
 			}
 		})
 	}
@@ -181,5 +173,84 @@ func TestValidateCWD_RejectsFile(t *testing.T) {
 	os.WriteFile(file, []byte("x"), 0644)
 	if err := ValidateCWD(file); err == nil {
 		t.Fatal("expected error for file path")
+	}
+}
+
+// --- ResolveFilesystemPath: refuse relative paths without session CWD ---
+
+func TestResolveFilesystemPath_RelativeErrorsWhenNoSessionCWD(t *testing.T) {
+	ctx := context.Background()
+	_, err := ResolveFilesystemPath(ctx, "relative.txt")
+	if err == nil {
+		t.Fatal("expected error for relative path with no session CWD")
+	}
+	if !errors.Is(err, ErrNoSessionCWD) {
+		t.Errorf("expected ErrNoSessionCWD, got %v", err)
+	}
+}
+
+func TestResolveFilesystemPath_EmptyErrorsWhenNoSessionCWD(t *testing.T) {
+	ctx := context.Background()
+	if _, err := ResolveFilesystemPath(ctx, ""); err == nil {
+		t.Fatal("expected error for empty path with no session CWD")
+	}
+	if _, err := ResolveFilesystemPath(ctx, "."); err == nil {
+		t.Fatal("expected error for dot path with no session CWD")
+	}
+}
+
+func TestResolveFilesystemPath_AbsoluteWorksWithoutSessionCWD(t *testing.T) {
+	ctx := context.Background()
+	got, err := ResolveFilesystemPath(ctx, "/etc/hosts")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "/etc/hosts" {
+		t.Errorf("expected /etc/hosts, got %q", got)
+	}
+}
+
+func TestResolveFilesystemPath_TildeWorksWithoutSessionCWD(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	ctx := context.Background()
+	got, err := ResolveFilesystemPath(ctx, "~/Desktop")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != filepath.Join(home, "Desktop") {
+		t.Errorf("expected %s, got %q", filepath.Join(home, "Desktop"), got)
+	}
+}
+
+func TestResolveFilesystemPath_RelativeJoinsSessionCWD(t *testing.T) {
+	ctx := WithSessionCWD(context.Background(), "/projects/foo")
+	got, err := ResolveFilesystemPath(ctx, "src/main.go")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "/projects/foo/src/main.go" {
+		t.Errorf("expected /projects/foo/src/main.go, got %q", got)
+	}
+}
+
+func TestResolveFilesystemPath_DotReturnsSessionCWD(t *testing.T) {
+	ctx := WithSessionCWD(context.Background(), "/projects/foo")
+	got, err := ResolveFilesystemPath(ctx, ".")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "/projects/foo" {
+		t.Errorf("expected /projects/foo, got %q", got)
+	}
+}
+
+func TestResolveFilesystemPath_CleansTraversal(t *testing.T) {
+	ctx := WithSessionCWD(context.Background(), "/projects/foo")
+	got, err := ResolveFilesystemPath(ctx, "../bar")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "/projects/bar" {
+		t.Errorf("expected /projects/bar, got %q", got)
 	}
 }

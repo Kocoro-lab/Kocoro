@@ -82,13 +82,38 @@ func (cb ContentBlock) MarshalJSON() ([]byte, error) {
 	return json.Marshal(m)
 }
 
-// normalizeToolInput coerces a null/empty/whitespace RawMessage to an empty
-// JSON object so that tool_use.input always serializes as a valid dictionary.
-// Populated inputs are returned unchanged. See issue #45.
+// normalizeToolInput coerces a tool_use input RawMessage into a shape
+// Anthropic's tool_use.input validator ("Input should be a valid
+// dictionary") will accept when we can do so unambiguously.
+//
+// Two normalizations are applied:
+//  1. null / empty / whitespace → "{}" (issue #45).
+//  2. JSON-encoded string wrapping a JSON object → unwrap once. Some
+//     providers (OpenAI-shaped Chat Completions adapters) return tool
+//     arguments as a JSON string whose decoded value is itself a JSON
+//     object, e.g. `"{\"command\":\"ls\"}"`. The tool executes fine via
+//     FunctionCall.ArgumentsString, but the double-encoded bytes used to
+//     be persisted verbatim in the assistant turn, causing the next call
+//     to Anthropic to drop that turn with a 400 — which llm-service then
+//     silently sanitized out, losing tool history from the model.
+//
+// Non-object inputs (numbers, arrays, plain strings, bools) are passed
+// through unchanged on purpose: those are provider bugs, and masking
+// them with "{}" would hide the anomaly. Only the unambiguous
+// null/empty and double-encoded-object cases are rewritten.
 func normalizeToolInput(raw json.RawMessage) json.RawMessage {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return json.RawMessage("{}")
+	}
+	if trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err == nil {
+			inner := bytes.TrimSpace([]byte(s))
+			if len(inner) > 0 && inner[0] == '{' && json.Valid(inner) {
+				return json.RawMessage(inner)
+			}
+		}
 	}
 	return raw
 }

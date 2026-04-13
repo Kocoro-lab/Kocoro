@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,11 +42,54 @@ var (
 	cdpReachableFn          = IsChromeCDPReachable
 	portListeningFn         = isPortListening
 	ensureChromeDebugPortFn = EnsureChromeDebugPort
+	cdpRemoveAll            = os.RemoveAll
+	cdpStat                 = os.Stat
 )
 
 // CDPChromeProfile overrides automatic profile detection when non-empty.
 // Set from daemon config (daemon.chrome_profile).
-var CDPChromeProfile string
+var cdpChromeProfile atomic.Value
+
+func SetCDPChromeProfile(profile string) {
+	cdpChromeProfile.Store(profile)
+}
+
+func GetCDPChromeProfile() string {
+	v := cdpChromeProfile.Load()
+	if v == nil {
+		return ""
+	}
+	if profile, ok := v.(string); ok {
+		return profile
+	}
+	return ""
+}
+
+type ChromeProfileOption struct {
+	Name         string `json:"name"`
+	DisplayName  string `json:"display_name"`
+	Exists       bool   `json:"exists"`
+	IsLastUsed   bool   `json:"is_last_used"`
+	IsConfigured bool   `json:"is_configured"`
+	IsEffective  bool   `json:"is_effective"`
+}
+
+type ChromeProfileState struct {
+	Mode              string                `json:"mode"`
+	ConfiguredProfile string                `json:"configured_profile,omitempty"`
+	DetectedProfile   string                `json:"detected_profile,omitempty"`
+	EffectiveProfile  string                `json:"effective_profile,omitempty"`
+	LastCloneSource   string                `json:"last_clone_source,omitempty"`
+	CloneStatus       string                `json:"clone_status"`
+	RefreshRequired   bool                  `json:"refresh_required"`
+	Profiles          []ChromeProfileOption `json:"profiles"`
+}
+
+const (
+	ChromeProfileCloneMissing = "missing"
+	ChromeProfileCloneCurrent = "current"
+	ChromeProfileCloneStale   = "stale"
+)
 
 var chromeLoopbackHosts = []string{"127.0.0.1", "::1"}
 
@@ -164,7 +209,7 @@ func LaunchCDPChrome(port int) error {
 
 	// Determine which Chrome profile to copy from.
 	srcChromeDir := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
-	profileName := CDPChromeProfile
+	profileName := GetCDPChromeProfile()
 	if profileName == "" {
 		profileName = detectActiveProfile(srcChromeDir)
 	}
@@ -230,6 +275,88 @@ func LaunchCDPChrome(port int) error {
 	}
 
 	return fmt.Errorf("Chrome launched but CDP not reachable on port %d after 15s", port)
+}
+
+// ResetCDPProfileClone removes the dedicated Chrome user-data-dir so the next
+// browser launch re-seeds it from the selected source profile.
+func ResetCDPProfileClone() error {
+	cdpMu.Lock()
+	defer cdpMu.Unlock()
+
+	home, err := cdpUserHomeDir()
+	if err != nil {
+		return fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	clearCachedBrowserWS()
+	cdpDataDir := filepath.Join(home, ".shannon", "chrome-cdp")
+	if cdpChromeAliveFn() {
+		log.Printf("[chrome-cdp] stopping dedicated Chrome before resetting clone")
+		cdpExecCommand("pkill", "-f", fmt.Sprintf("user-data-dir=%s", cdpDataDir)).Run() //nolint:errcheck
+	}
+	if err := waitForCDPChromeExit(home); err != nil {
+		return err
+	}
+	if err := removeCDPProfileCloneDir(cdpDataDir); err != nil {
+		return err
+	}
+	removeCDPPIDFile(home)
+	return nil
+}
+
+func waitForCDPChromeExit(home string) error {
+	if !cdpChromeAliveFn() {
+		removeCDPPIDFile(home)
+		return nil
+	}
+
+	for range 20 {
+		if !cdpChromeAliveFn() {
+			removeCDPPIDFile(home)
+			return nil
+		}
+		cdpSleep(150 * time.Millisecond)
+	}
+
+	if pid := cdpChromePIDFn(); pid != "" {
+		log.Printf("[chrome-cdp] Chrome still alive during clone reset, sending SIGKILL to pid %s", pid)
+		cdpExecCommand("kill", "-9", pid).Run() //nolint:errcheck
+	}
+
+	for range 10 {
+		if !cdpChromeAliveFn() {
+			removeCDPPIDFile(home)
+			return nil
+		}
+		cdpSleep(200 * time.Millisecond)
+	}
+
+	if !cdpChromeAliveFn() {
+		removeCDPPIDFile(home)
+		return nil
+	}
+	return fmt.Errorf("dedicated Chrome did not stop before resetting clone")
+}
+
+func removeCDPProfileCloneDir(cdpDataDir string) error {
+	for attempt := range 12 {
+		err := cdpRemoveAll(cdpDataDir)
+		if err == nil {
+			if _, statErr := cdpStat(cdpDataDir); os.IsNotExist(statErr) {
+				return nil
+			} else if statErr == nil {
+				err = fmt.Errorf("dedicated Chrome clone directory still exists after reset")
+			} else {
+				err = statErr
+			}
+		} else if os.IsNotExist(err) {
+			return nil
+		}
+		if attempt == 11 {
+			return err
+		}
+		cdpSleep(150 * time.Millisecond)
+	}
+	return nil
 }
 
 // minimizeCDPChromeSync minimizes the CDP Chrome windows using its PID.
@@ -1118,22 +1245,190 @@ func validChromeProfileName(name string) bool {
 	return chromeProfileRe.MatchString(name)
 }
 
+// ValidChromeProfileName reports whether name matches the supported Chrome
+// profile directory naming convention.
+func ValidChromeProfileName(name string) bool {
+	return validChromeProfileName(name)
+}
+
+type chromeLocalState struct {
+	Profile struct {
+		LastUsed  string `json:"last_used"`
+		InfoCache map[string]struct {
+			Name string `json:"name"`
+		} `json:"info_cache"`
+	} `json:"profile"`
+}
+
+func loadChromeLocalState(chromeDir string) (chromeLocalState, error) {
+	var state chromeLocalState
+	data, err := os.ReadFile(filepath.Join(chromeDir, "Local State"))
+	if err != nil {
+		return state, err
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
 // detectActiveProfile reads Chrome's Local State file and returns the
 // last-used profile directory name (e.g. "Profile 6"). Falls back to "Default".
 func detectActiveProfile(chromeDir string) string {
-	data, err := os.ReadFile(filepath.Join(chromeDir, "Local State"))
-	if err != nil {
-		return "Default"
-	}
-	var state struct {
-		Profile struct {
-			LastUsed string `json:"last_used"`
-		} `json:"profile"`
-	}
-	if err := json.Unmarshal(data, &state); err != nil || state.Profile.LastUsed == "" {
+	state, err := loadChromeLocalState(chromeDir)
+	if err != nil || state.Profile.LastUsed == "" {
 		return "Default"
 	}
 	return state.Profile.LastUsed
+}
+
+func chromeProfileSortKey(name string) (int, int, string) {
+	if name == "Default" {
+		return 0, 0, ""
+	}
+	if strings.HasPrefix(name, "Profile ") {
+		if n, err := strconv.Atoi(strings.TrimPrefix(name, "Profile ")); err == nil {
+			return 1, n, ""
+		}
+	}
+	return 2, 0, name
+}
+
+func discoverChromeProfiles(chromeDir string) ([]ChromeProfileOption, string) {
+	options := make(map[string]ChromeProfileOption)
+	state, err := loadChromeLocalState(chromeDir)
+	detected := ""
+	if err == nil {
+		if validChromeProfileName(state.Profile.LastUsed) {
+			detected = state.Profile.LastUsed
+		}
+		for dir, info := range state.Profile.InfoCache {
+			if !validChromeProfileName(dir) {
+				continue
+			}
+			opt := options[dir]
+			opt.Name = dir
+			opt.DisplayName = strings.TrimSpace(info.Name)
+			options[dir] = opt
+		}
+	}
+
+	entries, err := os.ReadDir(chromeDir)
+	if err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if !validChromeProfileName(name) {
+				continue
+			}
+			opt := options[name]
+			opt.Name = name
+			opt.Exists = true
+			options[name] = opt
+		}
+	}
+
+	profiles := make([]ChromeProfileOption, 0, len(options))
+	for _, opt := range options {
+		if strings.TrimSpace(opt.DisplayName) == "" {
+			opt.DisplayName = opt.Name
+		}
+		opt.IsLastUsed = opt.Name == detected
+		profiles = append(profiles, opt)
+	}
+	sort.Slice(profiles, func(i, j int) bool {
+		igroup, inum, istr := chromeProfileSortKey(profiles[i].Name)
+		jgroup, jnum, jstr := chromeProfileSortKey(profiles[j].Name)
+		if igroup != jgroup {
+			return igroup < jgroup
+		}
+		if igroup == 1 && inum != jnum {
+			return inum < jnum
+		}
+		return istr < jstr
+	})
+	return profiles, detected
+}
+
+func readProfileSourceMarker(home string) string {
+	data, err := os.ReadFile(filepath.Join(home, ".shannon", "chrome-cdp", ".profile_source"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func chromeCloneStatus(effective, lastClone string) string {
+	if lastClone == "" {
+		return ChromeProfileCloneMissing
+	}
+	if effective != "" && lastClone != effective {
+		return ChromeProfileCloneStale
+	}
+	return ChromeProfileCloneCurrent
+}
+
+// GetChromeProfileState returns discoverable Chrome profiles along with the
+// current configured/detected/effective source profile for the dedicated CDP browser.
+func GetChromeProfileState(configuredProfile string) (ChromeProfileState, error) {
+	home, err := cdpUserHomeDir()
+	if err != nil {
+		return ChromeProfileState{}, fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	chromeDir := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
+	profiles, detected := discoverChromeProfiles(chromeDir)
+	effective := configuredProfile
+	mode := "explicit"
+	if effective == "" {
+		mode = "auto"
+		effective = detected
+	}
+
+	foundConfigured := configuredProfile == ""
+	for i := range profiles {
+		profiles[i].IsConfigured = configuredProfile != "" && profiles[i].Name == configuredProfile
+		profiles[i].IsEffective = effective != "" && profiles[i].Name == effective
+		if profiles[i].IsConfigured {
+			foundConfigured = true
+		}
+	}
+	if configuredProfile != "" && !foundConfigured {
+		profiles = append(profiles, ChromeProfileOption{
+			Name:         configuredProfile,
+			DisplayName:  configuredProfile,
+			Exists:       false,
+			IsConfigured: true,
+			IsEffective:  configuredProfile == effective,
+		})
+		sort.Slice(profiles, func(i, j int) bool {
+			igroup, inum, istr := chromeProfileSortKey(profiles[i].Name)
+			jgroup, jnum, jstr := chromeProfileSortKey(profiles[j].Name)
+			if igroup != jgroup {
+				return igroup < jgroup
+			}
+			if igroup == 1 && inum != jnum {
+				return inum < jnum
+			}
+			return istr < jstr
+		})
+	}
+
+	lastClone := readProfileSourceMarker(home)
+	cloneStatus := chromeCloneStatus(effective, lastClone)
+	refreshRequired := cloneStatus == ChromeProfileCloneStale
+
+	return ChromeProfileState{
+		Mode:              mode,
+		ConfiguredProfile: configuredProfile,
+		DetectedProfile:   detected,
+		EffectiveProfile:  effective,
+		LastCloneSource:   lastClone,
+		CloneStatus:       cloneStatus,
+		RefreshRequired:   refreshRequired,
+		Profiles:          profiles,
+	}, nil
 }
 
 // prepareCDPProfile creates a Chrome user-data-dir for CDP by copying key

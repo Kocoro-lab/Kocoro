@@ -424,6 +424,20 @@ func TestNormalizeToolInput(t *testing.T) {
 		{"empty object preserved", json.RawMessage("{}"), "{}"},
 		{"populated object preserved", json.RawMessage(`{"x":1}`), `{"x":1}`},
 		{"nested object preserved", json.RawMessage(`{"a":{"b":2}}`), `{"a":{"b":2}}`},
+		// Double-encoded string unwrap — OpenAI-shaped adapters sometimes
+		// return tool arguments as a JSON-encoded string wrapping an object.
+		// Anthropic's tool_use.input validator rejects these unless unwrapped.
+		{"double-encoded simple", json.RawMessage(`"{\"command\":\"ls\"}"`), `{"command":"ls"}`},
+		{"double-encoded nested", json.RawMessage(`"{\"a\":{\"b\":2}}"`), `{"a":{"b":2}}`},
+		{"double-encoded empty object", json.RawMessage(`"{}"`), `{}`},
+		{"double-encoded with whitespace inside", json.RawMessage(`"  {\"x\":1}  "`), `{"x":1}`},
+		// Non-object scalars / strings still pass through untouched so
+		// genuine provider bugs remain visible rather than silently masked.
+		// See TestContentBlock_MarshalJSON_PreservesNonObjectToolUseInput.
+		{"plain string passthrough", json.RawMessage(`"hello"`), `"hello"`},
+		{"empty string passthrough", json.RawMessage(`""`), `""`},
+		{"quoted null passthrough", json.RawMessage(`"null"`), `"null"`},
+		{"encoded array passthrough", json.RawMessage(`"[1,2,3]"`), `"[1,2,3]"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -448,6 +462,7 @@ func TestNewToolUseBlock_NormalizesInput(t *testing.T) {
 		{"literal null", json.RawMessage("null"), "{}"},
 		{"empty bytes", json.RawMessage(""), "{}"},
 		{"valid object passthrough", json.RawMessage(`{"url":"x"}`), `{"url":"x"}`},
+		{"double-encoded string unwraps to object", json.RawMessage(`"{\"url\":\"x\"}"`), `{"url":"x"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

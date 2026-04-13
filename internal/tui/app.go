@@ -558,6 +558,12 @@ func (m *Model) applyRuntimeContext(sess *session.Session) string {
 		agentCWD = m.agentOverride.Config.CWD
 	}
 	effectiveCWD := cwdctx.ResolveEffectiveCWD("", sessionCWD, agentCWD)
+	// TUI runs in the user's shell — when nothing is configured explicitly,
+	// default to the terminal's current directory so project-level configs are
+	// picked up. Daemon-routed runs use a different default (empty + guard).
+	if effectiveCWD == "" {
+		effectiveCWD, _ = os.Getwd()
+	}
 	if err := cwdctx.ValidateCWD(effectiveCWD); err != nil {
 		fmt.Fprintf(os.Stderr, "[tui] invalid session CWD %q, falling back to process CWD: %v\n", effectiveCWD, err)
 		effectiveCWD, _ = os.Getwd()
@@ -968,6 +974,13 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.result != "" && (msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached)) {
 			m.appendMarkdownOutput(msg.result, m.renderMarkdownCached(msg.result, m.width))
 			m.appendOutput("")
+			// Soft warning for loop-detector force-stop: the reply is valid
+			// and rendered above, but the run ended early. Show a dim hint,
+			// not a red error.
+			if msg.err == nil && msg.status.Partial && msg.status.FailureCode == runstatus.CodeIterationLimit {
+				dim := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Italic(true)
+				m.appendOutput(dim.Render("  Stopped early after repeated failed attempts."))
+			}
 		}
 		// Tool count summary (individual tool lines already shown during execution)
 		if len(m.lastToolResults) > 0 {

@@ -98,14 +98,14 @@ func (idx *Index) UpsertSession(sess *Session) error {
 	}
 	defer tx.Rollback()
 
-	msgCount := len(sess.Messages)
+	// Upsert session row first (FK parent for messages).
+	// msg_count is set to 0 initially and updated after indexing.
 	_, err = tx.Exec(
 		`INSERT OR REPLACE INTO sessions (id, title, cwd, created_at, updated_at, msg_count)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, 0)`,
 		sess.ID, sess.Title, sess.CWD,
 		sess.CreatedAt.Format(time.RFC3339Nano),
 		sess.UpdatedAt.Format(time.RFC3339Nano),
-		msgCount,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -115,17 +115,29 @@ func (idx *Index) UpsertSession(sess *Session) error {
 		return fmt.Errorf("delete old messages: %w", err)
 	}
 
+	indexedCount := 0
 	for i, msg := range sess.Messages {
+		// Skip system-injected guardrail/nudge messages to keep them out of search results
+		if i < len(sess.MessageMeta) && sess.MessageMeta[i].SystemInjected {
+			continue
+		}
 		text := msg.Content.Text()
 		if text == "" {
 			continue
 		}
+		// msg_index is the original position in sess.Messages (may have gaps
+		// where system-injected or empty entries were skipped).
 		if _, err := tx.Exec(
 			`INSERT INTO messages (session_id, msg_index, role, content) VALUES (?, ?, ?, ?)`,
 			sess.ID, i, msg.Role, text,
 		); err != nil {
 			return fmt.Errorf("insert message %d: %w", i, err)
 		}
+		indexedCount++
+	}
+
+	if _, err := tx.Exec(`UPDATE sessions SET msg_count = ? WHERE id = ?`, indexedCount, sess.ID); err != nil {
+		return fmt.Errorf("update msg_count: %w", err)
 	}
 
 	return tx.Commit()

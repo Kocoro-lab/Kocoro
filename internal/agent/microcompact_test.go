@@ -331,3 +331,136 @@ func TestMicroCompact_SkipsCloudDelegate(t *testing.T) {
 // Ensure the interface is satisfied
 var _ ctxwin.Completer = (*mockCompleter)(nil)
 var _ ctxwin.Completer = (*failingCompleter)(nil)
+
+// TestMicroCompact_SkipsBrowserSnapshot: browser_snapshot returns the DOM
+// tree — the model's "eyes" for web tasks. Summarizing it destroys the
+// structured page content the model needs to extract data. This regression
+// was observed in a real x.com search task where DOM snapshots were replaced
+// with meta-descriptions like "The browser navigated to X", blinding the
+// model mid-extraction.
+func TestMicroCompact_SkipsBrowserSnapshot(t *testing.T) {
+	mc := &mockCompleter{output: "The browser navigated to X and displayed results"}
+
+	var messages []client.Message
+	messages = append(messages, client.Message{Role: "system", Content: client.NewTextContent("system")})
+
+	// Inject tool_use for browser_snapshot with a large DOM payload.
+	messages = append(messages, client.Message{
+		Role: "assistant",
+		Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "tool_use", ID: "tc_snap", Name: "browser_snapshot", Input: json.RawMessage(`{}`)},
+		}),
+	})
+	content := strings.Repeat("<div class=\"tweet\">large DOM payload</div>\n", 200)
+	messages = append(messages, client.Message{
+		Role: "user",
+		Content: client.NewBlockContent([]client.ContentBlock{
+			client.NewToolResultBlock("tc_snap", content, false),
+		}),
+	})
+	messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent("ok")})
+
+	// Pad to push the snapshot into Tier 2.
+	for i := 0; i < 5; i++ {
+		messages = append(messages, client.Message{
+			Role: "user",
+			Content: client.NewBlockContent([]client.ContentBlock{
+				client.NewToolResultBlock("tc"+string(rune('a'+i)), "short", false),
+			}),
+		})
+		messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent("ok")})
+	}
+
+	compressOldToolResults(context.Background(), messages, 3, 300, mc)
+
+	if mc.calls != 0 {
+		t.Errorf("expected 0 LLM calls for browser_snapshot, got %d", mc.calls)
+	}
+}
+
+// TestIsMicroCompactSkipTool_BrowserPrefix locks in the prefix-based
+// matching for browser_* tools. Before the fix, the skip list was an
+// enumerated map that missed browser_drag and browser_take_screenshot —
+// two tools that were already referenced elsewhere in the repo
+// (internal/agent/normalize.go) but absent from this map. Now all browser_*
+// names should match via strings.HasPrefix.
+func TestIsMicroCompactSkipTool_BrowserPrefix(t *testing.T) {
+	// Previously-missed names — regression guard.
+	for _, name := range []string{"browser_drag", "browser_take_screenshot"} {
+		if !isMicroCompactSkipTool(name) {
+			t.Errorf("%s must be skipped (was missing from the old enumerated map)", name)
+		}
+	}
+	// Still covered after the refactor.
+	for _, name := range []string{"browser_navigate", "browser_snapshot", "browser_click"} {
+		if !isMicroCompactSkipTool(name) {
+			t.Errorf("%s must still be skipped after the prefix refactor", name)
+		}
+	}
+	// Non-browser tools keep their original behavior.
+	for _, name := range []string{"think", "file_read", "grep"} {
+		if !isMicroCompactSkipTool(name) {
+			t.Errorf("%s must still be skipped", name)
+		}
+	}
+	// Completely unrelated tools must NOT be skipped.
+	for _, name := range []string{"bash", "http", "memory_append"} {
+		if isMicroCompactSkipTool(name) {
+			t.Errorf("%s must not be skipped", name)
+		}
+	}
+}
+
+func TestIsTier2FloorTool_BrowserPrefix(t *testing.T) {
+	for _, name := range []string{"browser_drag", "browser_take_screenshot", "browser_snapshot"} {
+		if !isTier2FloorTool(name) {
+			t.Errorf("%s must be a tier-2 floor tool", name)
+		}
+	}
+	for _, name := range []string{"file_read", "grep", "glob", "directory_list"} {
+		if !isTier2FloorTool(name) {
+			t.Errorf("%s must remain a tier-2 floor tool", name)
+		}
+	}
+	if isTier2FloorTool("bash") {
+		t.Error("bash must not be a tier-2 floor tool")
+	}
+}
+
+func TestMicroCompact_SkipsBrowserNavigate(t *testing.T) {
+	mc := &mockCompleter{output: "navigated to page"}
+
+	var messages []client.Message
+	messages = append(messages, client.Message{Role: "system", Content: client.NewTextContent("system")})
+
+	messages = append(messages, client.Message{
+		Role: "assistant",
+		Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "tool_use", ID: "tc_nav", Name: "browser_navigate", Input: json.RawMessage(`{"url":"https://x.com"}`)},
+		}),
+	})
+	content := strings.Repeat("<nav>page content</nav>\n", 200)
+	messages = append(messages, client.Message{
+		Role: "user",
+		Content: client.NewBlockContent([]client.ContentBlock{
+			client.NewToolResultBlock("tc_nav", content, false),
+		}),
+	})
+	messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent("ok")})
+
+	for i := 0; i < 5; i++ {
+		messages = append(messages, client.Message{
+			Role: "user",
+			Content: client.NewBlockContent([]client.ContentBlock{
+				client.NewToolResultBlock("tc"+string(rune('a'+i)), "short", false),
+			}),
+		})
+		messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent("ok")})
+	}
+
+	compressOldToolResults(context.Background(), messages, 3, 300, mc)
+
+	if mc.calls != 0 {
+		t.Errorf("expected 0 LLM calls for browser_navigate, got %d", mc.calls)
+	}
+}

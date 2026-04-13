@@ -7,6 +7,20 @@ import (
 	"testing"
 )
 
+// TestSpillToDisk_RejectsEmptyShannonDir is the regression for the bug
+// where filepath.Join("", "tmp") = "tmp" — a relative path — caused spill
+// files to land in the process cwd (e.g. internal/agent/tmp/ during unit
+// tests). The guard now refuses to write when shannonDir is empty.
+func TestSpillToDisk_RejectsEmptyShannonDir(t *testing.T) {
+	_, err := spillToDisk("", "sess1", "call1", "content")
+	if err == nil {
+		t.Fatal("expected spillToDisk to reject empty shannonDir")
+	}
+	if !strings.Contains(err.Error(), "shannonDir") {
+		t.Errorf("expected error to mention shannonDir, got: %v", err)
+	}
+}
+
 func TestSpillToDisk_SmallResult(t *testing.T) {
 	// Results under threshold should not be spilled (caller checks threshold).
 	// This test verifies spillToDisk works even for small content.

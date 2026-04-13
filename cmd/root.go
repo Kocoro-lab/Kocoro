@@ -24,6 +24,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	mcppkg "github.com/Kocoro-lab/ShanClaw/internal/mcp"
+	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
@@ -279,6 +280,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	if err != nil && !errors.Is(err, agent.ErrMaxIterReached) {
 		return err
 	}
+	status := loop.LastRunStatus()
 
 	// Persist session to disk
 	now := time.Now()
@@ -294,6 +296,12 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		fmt.Fprintf(os.Stderr, "Warning: failed to save session: %v\n", saveErr)
 	}
 	fmt.Print(renderMarkdown(result))
+	// Soft warning for loop-detector force-stop: the reply is valid and
+	// already printed above, but the run ended early. Matches the TUI
+	// behavior so one-shot CLI and TUI report force-stops consistently.
+	if err == nil && status.Partial && status.FailureCode == runstatus.CodeIterationLimit {
+		fmt.Fprintln(os.Stderr, "\nStopped early after repeated failed attempts.")
+	}
 	usageLine := fmt.Sprintf("\n[tokens: %d | cost: $%.4f", usage.TotalTokens, usage.CostUSD)
 	if usage.Model != "" {
 		usageLine += " | model: " + usage.Model

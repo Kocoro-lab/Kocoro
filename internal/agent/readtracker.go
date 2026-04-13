@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -114,22 +113,21 @@ func CheckReadBeforeWrite(ctx context.Context, path string) error {
 	return nil
 }
 
-// normalizePathWithCWD resolves a path to an absolute, clean, symlink-resolved form
-// using the given cwd for relative path resolution.
+// normalizePathWithCWD resolves a path to an absolute, clean, symlink-resolved
+// form using the given cwd for relative path resolution. When cwd is empty
+// (scopeless daemon tasks that arrive without a CWD) a relative input is
+// returned cleaned but unresolved; callers must not fall back to the daemon
+// process cwd, which is what the wider CWD-hardening work was meant to
+// eliminate.
 func normalizePathWithCWD(path, cwd string) string {
 	if path == "" {
 		return ""
 	}
 	if !filepath.IsAbs(path) {
-		if cwd != "" {
-			path = filepath.Join(cwd, path)
-		} else {
-			wd, err := os.Getwd()
-			if err != nil {
-				return filepath.Clean(path)
-			}
-			path = filepath.Join(wd, path)
+		if cwd == "" {
+			return filepath.Clean(path)
 		}
+		path = filepath.Join(cwd, path)
 	}
 	path = filepath.Clean(path)
 	// Try to resolve symlinks; if it fails (file doesn't exist yet), use the clean path.
@@ -137,9 +135,4 @@ func normalizePathWithCWD(path, cwd string) string {
 		path = resolved
 	}
 	return path
-}
-
-// normalizePath resolves a path using process CWD (backward compatibility).
-func normalizePath(path string) string {
-	return normalizePathWithCWD(path, "")
 }

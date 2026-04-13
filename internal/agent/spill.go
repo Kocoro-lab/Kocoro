@@ -18,7 +18,15 @@ const (
 // spillToDisk writes content to a temp file under ~/.shannon/tmp/ and returns
 // a short preview string for in-context use. The caller should use the preview
 // as the tool result instead of the full content.
+//
+// shannonDir must be an absolute path. An empty shannonDir is rejected because
+// filepath.Join("", "tmp") yields the relative path "tmp", which would cause
+// spill files to land in whatever cwd the process happens to be in (e.g. the
+// repo root during tests).
 func spillToDisk(shannonDir, sessionID, callID, content string) (preview string, err error) {
+	if shannonDir == "" {
+		return "", fmt.Errorf("spill: shannonDir is empty; refusing to write to process cwd")
+	}
 	dir := filepath.Join(shannonDir, "tmp")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("spill mkdir: %w", err)
@@ -44,6 +52,9 @@ func spillToDisk(shannonDir, sessionID, callID, content string) (preview string,
 
 // cleanupSpills removes all spill files for a given session ID.
 func cleanupSpills(shannonDir, sessionID string) {
+	if shannonDir == "" {
+		return
+	}
 	dir := filepath.Join(shannonDir, "tmp")
 	pattern := filepath.Join(dir, fmt.Sprintf("tool_result_%s_*.txt", sessionID))
 	matches, err := filepath.Glob(pattern)

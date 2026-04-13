@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 // LoopAction tells the agent loop how to respond to a detection signal.
@@ -42,7 +43,8 @@ type ToolCallRecord struct {
 //     Fallback: same-tool count when topic tracking unavailable (5 → nudge, 7 → force stop)
 //   - SearchEscalation: trailing unproductive search-family calls
 //     (5 unproductive → nudge, 8 unproductive → force stop)
-//   - NoProgress: same tool called M+ times regardless of args (skip visual/search tools)
+//   - NoProgress: same tool called M+ times regardless of args (skip visual/search tools,
+//     semi-repeatable tools like bash get a higher threshold)
 //   - Sleep: bash commands containing sleep (2 → nudge, 4 → force stop)
 //
 // Response escalation: threshold = nudge, threshold+1 = force stop (consecutive), 2x threshold = force stop (others).
@@ -55,7 +57,13 @@ type LoopDetector struct {
 	sameToolErrThreshold int
 	noProgressThreshold  int
 
-	repeatableTools map[string]bool
+	repeatableTools          map[string]bool
+	semiRepeatableTools     map[string]bool // higher NoProgress threshold (e.g. bash)
+	semiRepeatableThreshold int             // nudge threshold for semi-repeatable tools
+	// Note: force-stop = threshold*2 = 24 exceeds historySize (20), so the
+	// NoProgress force-stop is intentionally unreachable for semi-repeatable
+	// tools. The nudge budget escalation (maxNudges in loop.go) is the
+	// backstop that converts accumulated nudges into a force-stop.
 
 	// ToolModeSwitch detector state
 	lastNonGUISuccess bool
@@ -69,8 +77,20 @@ type LoopDetector struct {
 
 // GUITools are tools that indicate GUI automation tasks.
 // Used by both LoopDetector (exempt from NoProgress) and effectiveMaxIter (higher limit).
+// Note: the literal "browser" key covers the legacy in-process browser tool.
+// Real MCP playwright tool names (browser_navigate, browser_snapshot, …) are
+// handled via isGUIToolName, which also prefix-matches "browser_".
 var GUITools = map[string]bool{
 	"screenshot": true, "computer": true, "applescript": true, "browser": true, "accessibility": true,
+}
+
+// isGUIToolName reports whether a tool name belongs to the GUI automation
+// family, including playwright MCP tools that share the "browser_" prefix.
+func isGUIToolName(name string) bool {
+	if GUITools[name] {
+		return true
+	}
+	return strings.HasPrefix(name, "browser_")
 }
 
 // visualTools are tools used purely for visual verification (screenshots, mouse/keyboard).
@@ -88,16 +108,39 @@ var repeatableGUITools = map[string]bool{
 	"screenshot": true, "computer": true, "accessibility": true, "browser": true,
 }
 
+// isRepeatableToolName reports whether a tool naturally repeats across a
+// workflow and should be exempt from the generic NoProgress detectors. It
+// checks the configured repeatable set plus a "browser_" prefix so playwright
+// MCP tools (browser_navigate, browser_snapshot, …) match without having to
+// enumerate every one.
+func isRepeatableToolName(set map[string]bool, name string) bool {
+	if set[name] {
+		return true
+	}
+	return strings.HasPrefix(name, "browser_")
+}
+
+// semiRepeatableProdTools lists tools that legitimately appear many times
+// in multi-step scripting workflows (fetch → process → install → build)
+// but should NOT be fully exempt from the NoProgress detector because
+// real loops also live in bash. The exact-dup, same-error, and sleep
+// detectors still catch genuine stuck loops at their existing thresholds.
+var semiRepeatableProdTools = map[string]bool{
+	"bash": true,
+}
+
 // NewLoopDetector creates a detector with production defaults.
 func NewLoopDetector() *LoopDetector {
 	return &LoopDetector{
-		history:              make([]ToolCallRecord, 0, 20),
-		historySize:          20,
-		consecDupThreshold:   2,
-		exactDupThreshold:    3,
-		sameToolErrThreshold: 4,
-		noProgressThreshold:  8,
-		repeatableTools:      repeatableGUITools,
+		history:                 make([]ToolCallRecord, 0, 20),
+		historySize:             20,
+		consecDupThreshold:      2,
+		exactDupThreshold:       3,
+		sameToolErrThreshold:    4,
+		noProgressThreshold:     8,
+		repeatableTools:         repeatableGUITools,
+		semiRepeatableTools:     semiRepeatableProdTools,
+		semiRepeatableThreshold: 12,
 	}
 }
 
@@ -169,7 +212,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// 0. Mode switch: visual tool used right after successful GUI-adjacent tool
 	// (applescript, browser). Only fire for GUI-adjacent tools where visual
 	// verification is likely redundant. Don't fire after file_read, bash, etc.
-	if visualTools[name] && ld.lastNonGUISuccess && !ld.modeSwitchNudged && GUITools[ld.lastNonGUITool] {
+	if visualTools[name] && ld.lastNonGUISuccess && !ld.modeSwitchNudged && isGUIToolName(ld.lastNonGUITool) {
 		ld.modeSwitchNudged = true
 		return LoopNudge, fmt.Sprintf(
 			"Your previous non-GUI tool call (%s) returned a success result. Visual verification is likely unnecessary — consider whether you can summarize the result and stop.", ld.lastNonGUITool)
@@ -306,7 +349,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		// Count same-tool occurrences as a proxy for lack of progress.
 		// Skip repeatable tools and search-family tools (search has its own
 		// dedicated unproductive-streak detector below).
-		if progressCount == 0 && !ld.repeatableTools[name] && family != "search" {
+		if progressCount == 0 && !isRepeatableToolName(ld.repeatableTools, name) && family != "search" {
 			sameToolInFamily := 0
 			for _, rec := range ld.history {
 				if rec.Name == name {
@@ -352,18 +395,26 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// 5. No progress detector: same tool called too many times.
 	// Search-family tools are excluded because productive repository exploration
 	// often uses many grep/glob calls with different arguments.
-	if !ld.repeatableTools[name] && family != "search" {
+	// Semi-repeatable tools (e.g. bash) get a higher threshold because
+	// legitimate multi-step scripting uses many distinct calls, but they
+	// are NOT fully exempt — the exact-dup, same-error, and sleep
+	// detectors still catch real loops at their own thresholds.
+	if !isRepeatableToolName(ld.repeatableTools, name) && family != "search" {
 		count := 0
 		for _, rec := range ld.history {
 			if rec.Name == name {
 				count++
 			}
 		}
-		if count >= ld.noProgressThreshold*2 {
+		threshold := ld.noProgressThreshold
+		if ld.semiRepeatableTools[name] {
+			threshold = ld.semiRepeatableThreshold
+		}
+		if count >= threshold*2 {
 			return LoopForceStop, fmt.Sprintf(
 				"You have called %s %d times without meaningful progress. Provide your answer now.", name, count)
 		}
-		if count >= ld.noProgressThreshold {
+		if count >= threshold {
 			return LoopNudge, fmt.Sprintf(
 				"You've called %s %d times. Summarize what you've learned and try a different approach.", name, count)
 		}

@@ -591,6 +591,15 @@ func TestEffectiveMaxIter(t *testing.T) {
 	if got := a.effectiveMaxIter(map[string]int{}); got != 25 {
 		t.Errorf("empty tools: expected 25, got %d", got)
 	}
+
+	// Playwright MCP browser_* tools: bump to 75 via isGUIToolName prefix match.
+	// The loop detector already covered browser_* via isGUIToolName but
+	// effectiveMaxIter was still reading the literal GUITools map, so real
+	// playwright workflows never got the higher iteration budget.
+	a.maxIter = 25
+	if got := a.effectiveMaxIter(map[string]int{"browser_navigate": 1, "browser_snapshot": 2}); got != 75 {
+		t.Errorf("playwright browser_* tasks: expected 75, got %d", got)
+	}
 }
 
 func TestFilterOldImages(t *testing.T) {
@@ -2644,5 +2653,138 @@ func TestNamedAgentPromptIncludesCoreRules(t *testing.T) {
 		if !strings.Contains(defaultComposed, s) {
 			t.Errorf("default composed prompt missing: %q", s)
 		}
+	}
+}
+
+// TestForceStop_PreservesRequestConfig verifies that the force-stop final LLM
+// turn reuses the agent's live configuration (MaxTokens, SpecificModel,
+// Temperature, Thinking, ReasoningEffort) and explicitly sends no tools.
+// Regression for a bug where the force-stop request was built with only
+// {Messages, ModelTier}, dropping every other field and causing empty
+// responses on the final turn.
+func TestForceStop_PreservesRequestConfig(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []client.CompletionRequest
+	)
+
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		requests = append(requests, req)
+		mu.Unlock()
+
+		callCount++
+		if callCount <= 3 {
+			// 3 back-to-back identical tool calls → force stop on the 3rd.
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("mock_tool", `{"cmd":"same"}`), 10, 5))
+		} else {
+			// Final forced (text-only) response.
+			json.NewEncoder(w).Encode(nativeResponse("Final answer.", "end_turn", nil, 10, 5))
+		}
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetMaxTokens(32000)
+	loop.SetTemperature(0.7)
+	loop.SetSpecificModel("claude-sonnet-4-6")
+	loop.SetThinking(&client.ThinkingConfig{Type: "adaptive"})
+	loop.SetReasoningEffort("medium")
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "Final answer." {
+		t.Errorf("expected force-stop final text, got %q", result)
+	}
+	// Even when the model returns real text, a force-stop exit is abnormal:
+	// the loop detector terminated early, so the run is marked partial.
+	status := loop.LastRunStatus()
+	if status.FailureCode != runstatus.CodeIterationLimit {
+		t.Errorf("force-stop should mark CodeIterationLimit, got %q", status.FailureCode)
+	}
+	if !status.Partial {
+		t.Error("force-stop should set Partial=true even when final text is non-empty")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) < 4 {
+		t.Fatalf("expected at least 4 LLM requests, got %d", len(requests))
+	}
+	final := requests[len(requests)-1]
+	if final.MaxTokens != 32000 {
+		t.Errorf("force-stop dropped MaxTokens: got %d, want 32000", final.MaxTokens)
+	}
+	if final.Temperature != 0.7 {
+		t.Errorf("force-stop dropped Temperature: got %v, want 0.7", final.Temperature)
+	}
+	if final.SpecificModel != "claude-sonnet-4-6" {
+		t.Errorf("force-stop dropped SpecificModel: got %q", final.SpecificModel)
+	}
+	if final.Thinking == nil || final.Thinking.Type != "adaptive" {
+		t.Errorf("force-stop dropped Thinking: got %+v", final.Thinking)
+	}
+	if final.ReasoningEffort != "medium" {
+		t.Errorf("force-stop dropped ReasoningEffort: got %q", final.ReasoningEffort)
+	}
+	if final.ModelTier != "medium" {
+		t.Errorf("force-stop dropped ModelTier: got %q", final.ModelTier)
+	}
+	if len(final.Tools) != 0 {
+		t.Errorf("force-stop should omit tools, got %d", len(final.Tools))
+	}
+}
+
+// TestForceStop_EmptyResponseFallback verifies that when the force-stop final
+// LLM call returns an empty OutputText, the loop substitutes a neutral
+// fallback message and marks the run as abnormal (iteration_limit + partial)
+// instead of persisting a blank assistant bubble.
+func TestForceStop_EmptyResponseFallback(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount <= 3 {
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("mock_tool", `{"cmd":"same"}`), 10, 5))
+		} else {
+			// Force-stop final turn returns empty text — triggers fallback.
+			json.NewEncoder(w).Encode(nativeResponse("", "end_turn", nil, 10, 5))
+		}
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetMaxTokens(32000)
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.TrimSpace(result) == "" {
+		t.Fatal("expected non-empty fallback, got blank result")
+	}
+	if !strings.Contains(result, "loop limit") {
+		t.Errorf("expected fallback mentioning loop limit, got %q", result)
+	}
+	status := loop.LastRunStatus()
+	if status.FailureCode != runstatus.CodeIterationLimit {
+		t.Errorf("expected FailureCode=iteration_limit, got %q", status.FailureCode)
+	}
+	if !status.Partial {
+		t.Error("expected Partial=true for empty-response force-stop")
 	}
 }

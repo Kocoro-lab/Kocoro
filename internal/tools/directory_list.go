@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -37,11 +38,16 @@ func (t *DirectoryListTool) Run(ctx context.Context, argsJSON string) (agent.Too
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
 
-	path := args.Path
-	if path == "" {
-		path = "."
+	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
+	if resolveErr != nil {
+		if errors.Is(resolveErr, cwdctx.ErrNoSessionCWD) {
+			return agent.ValidationError(
+				"directory_list: no session working directory is set. Pass an absolute 'path' argument.",
+			), nil
+		}
+		return agent.ValidationError(fmt.Sprintf("directory_list: %v", resolveErr)), nil
 	}
-	path = cwdctx.ResolvePath(ctx, path)
+	path := resolved
 
 	entries, err := os.ReadDir(path)
 	if err != nil {

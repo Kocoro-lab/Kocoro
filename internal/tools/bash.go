@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -16,7 +17,7 @@ import (
 type BashTool struct {
 	approvalFn        func(command string) bool
 	ExtraSafeCommands []string
-	CWD               string // working directory for commands (empty = inherit process cwd)
+	CWD               string // working directory for commands; if empty and no session CWD is set, bash runs in an isolated temp dir (NOT the process cwd)
 	MaxOutput         int    // max output chars; 0 = use default 30000
 }
 
@@ -92,9 +93,15 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	if dir == "" {
 		dir = cwdctx.FromContext(ctx)
 	}
-	if dir != "" {
-		cmd.Dir = dir
+	// When no CWD is set (neither via tool config nor via session context),
+	// do NOT let Go's exec package inherit the daemon process's cwd — that
+	// would leak the `shan daemon start` directory into every scopeless
+	// request. Run in the OS temp dir instead so the command has no
+	// project-shaped filesystem around it.
+	if dir == "" {
+		dir = os.TempDir()
 	}
+	cmd.Dir = dir
 	output, err := cmd.CombinedOutput()
 
 	result := string(output)

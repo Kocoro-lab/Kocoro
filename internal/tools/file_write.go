@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,7 +39,16 @@ func (t *FileWriteTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
-	args.Path = cwdctx.ResolvePath(ctx, args.Path)
+	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
+	if resolveErr != nil {
+		if errors.Is(resolveErr, cwdctx.ErrNoSessionCWD) {
+			return agent.ValidationError(
+				"file_write: no session working directory is set. Pass an absolute path.",
+			), nil
+		}
+		return agent.ValidationError(fmt.Sprintf("file_write: %v", resolveErr)), nil
+	}
+	args.Path = resolved
 
 	// Block file_write on the agent's MEMORY.md — always use memory_append.
 	// Check unconditionally (not just for existing files) so first-write

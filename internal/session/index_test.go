@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -476,6 +477,120 @@ func TestIndex_SearchFTSSyntaxError(t *testing.T) {
 		if !strings.Contains(err.Error(), "invalid search query") {
 			t.Errorf("query %q: expected clean error, got: %v", q, err)
 		}
+	}
+}
+
+func TestIndex_UpsertSkipsSystemInjected(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := OpenIndex(dir)
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+	defer idx.Close()
+
+	now := time.Now().Truncate(time.Second)
+
+	tests := []struct {
+		name           string
+		messages       []client.Message
+		meta           []MessageMeta
+		wantMsgCount   int
+		searchHit      string
+		searchMiss     string
+	}{
+		{
+			name: "no meta (legacy session) indexes all",
+			messages: []client.Message{
+				{Role: "user", Content: client.NewTextContent("legacy alpha")},
+				{Role: "assistant", Content: client.NewTextContent("legacy bravo")},
+			},
+			meta:         nil,
+			wantMsgCount: 2,
+			searchHit:    "alpha",
+			searchMiss:   "",
+		},
+		{
+			name: "injected messages excluded from index",
+			messages: []client.Message{
+				{Role: "user", Content: client.NewTextContent("visible unicorn")},
+				{Role: "assistant", Content: client.NewTextContent("injected giraffe")},
+				{Role: "assistant", Content: client.NewTextContent("visible elephant")},
+			},
+			meta: []MessageMeta{
+				{},
+				{SystemInjected: true},
+				{},
+			},
+			wantMsgCount: 2,
+			searchHit:    "unicorn",
+			searchMiss:   "giraffe",
+		},
+		{
+			name: "short meta (fewer than messages) indexes unmatched positions",
+			messages: []client.Message{
+				{Role: "user", Content: client.NewTextContent("first penguin")},
+				{Role: "assistant", Content: client.NewTextContent("second dolphin")},
+				{Role: "user", Content: client.NewTextContent("third falcon")},
+			},
+			meta: []MessageMeta{
+				{SystemInjected: true},
+			},
+			wantMsgCount: 2,
+			searchHit:    "dolphin",
+			searchMiss:   "penguin",
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessID := fmt.Sprintf("injected-%d", i)
+			sess := &Session{
+				ID: sessID, Title: tt.name, CreatedAt: now, UpdatedAt: now,
+				Messages:    tt.messages,
+				MessageMeta: tt.meta,
+			}
+			if err := idx.UpsertSession(sess); err != nil {
+				t.Fatalf("UpsertSession: %v", err)
+			}
+
+			summaries, err := idx.ListSessions()
+			if err != nil {
+				t.Fatalf("ListSessions: %v", err)
+			}
+			var found bool
+			for _, s := range summaries {
+				if s.ID == sessID {
+					found = true
+					if s.MsgCount != tt.wantMsgCount {
+						t.Errorf("msg_count = %d, want %d", s.MsgCount, tt.wantMsgCount)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("session %q not found in list", sessID)
+			}
+
+			if tt.searchHit != "" {
+				results, err := idx.Search(tt.searchHit, 20)
+				if err != nil {
+					t.Fatalf("Search(%q): %v", tt.searchHit, err)
+				}
+				if len(results) == 0 {
+					t.Errorf("expected hit for %q", tt.searchHit)
+				}
+			}
+			if tt.searchMiss != "" {
+				results, err := idx.Search(tt.searchMiss, 20)
+				if err != nil {
+					t.Fatalf("Search(%q): %v", tt.searchMiss, err)
+				}
+				for _, r := range results {
+					if r.SessionID == sessID {
+						t.Errorf("expected no hit for %q in session %q, but got one", tt.searchMiss, sessID)
+					}
+				}
+			}
+		})
 	}
 }
 

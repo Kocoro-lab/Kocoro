@@ -78,7 +78,7 @@ var daemonStartCmd = &cobra.Command{
 		mcp.CleanupOrphanedCDPChrome()
 
 		// Apply configured Chrome profile override before any CDP launch.
-		mcp.CDPChromeProfile = cfg.Daemon.ChromeProfile
+		mcp.SetCDPChromeProfile(cfg.Daemon.ChromeProfile)
 
 		gw := client.NewGatewayClient(cfg.Endpoint, cfg.APIKey)
 		baselineReg, reg, skillsPtr, mcpMgr, cleanup, serverErr := tools.RegisterAllWithBaseline(gw, cfg)
