@@ -491,12 +491,12 @@ func TestIndex_UpsertSkipsSystemInjected(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 
 	tests := []struct {
-		name           string
-		messages       []client.Message
-		meta           []MessageMeta
-		wantMsgCount   int
-		searchHit      string
-		searchMiss     string
+		name         string
+		messages     []client.Message
+		meta         []MessageMeta
+		wantMsgCount int
+		searchHit    string
+		searchMiss   string
 	}{
 		{
 			name: "no meta (legacy session) indexes all",
@@ -521,7 +521,7 @@ func TestIndex_UpsertSkipsSystemInjected(t *testing.T) {
 				{SystemInjected: true},
 				{},
 			},
-			wantMsgCount: 2,
+			wantMsgCount: 3,
 			searchHit:    "unicorn",
 			searchMiss:   "giraffe",
 		},
@@ -535,7 +535,7 @@ func TestIndex_UpsertSkipsSystemInjected(t *testing.T) {
 			meta: []MessageMeta{
 				{SystemInjected: true},
 			},
-			wantMsgCount: 2,
+			wantMsgCount: 3,
 			searchHit:    "dolphin",
 			searchMiss:   "penguin",
 		},

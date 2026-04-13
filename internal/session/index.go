@@ -24,12 +24,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     msg_count  INTEGER NOT NULL DEFAULT 0
 );
 
+-- content: tokenized (space-separated) text for FTS matching.
+-- original: user-visible text, used for snippet rendering (never tokenized).
 CREATE TABLE IF NOT EXISTS messages (
     rowid      INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     msg_index  INTEGER NOT NULL,
     role       TEXT NOT NULL,
     content    TEXT NOT NULL,
+    original   TEXT NOT NULL DEFAULT '',
     UNIQUE(session_id, msg_index)
 );
 
@@ -64,7 +67,8 @@ type SearchResult struct {
 }
 
 type Index struct {
-	db *sql.DB
+	db           *sql.DB
+	needsRebuild bool // true when tokenizer version bumped — triggers full reindex
 }
 
 func OpenIndex(dir string) (*Index, error) {
@@ -79,16 +83,56 @@ func OpenIndex(dir string) (*Index, error) {
 	}
 	db.SetMaxOpenConns(1)
 
+	// Tokenizer version gate. A mismatch between the stored user_version and
+	// TokenizerVersion means the on-disk content/messages tables were built
+	// with an older tokenization pipeline (or pre-CJK schema) and cannot be
+	// used by the current code. stored == 0 also counts as a mismatch for
+	// existing databases created before user_version tracking was introduced
+	// (their schema predates the `original` column). For a brand-new empty
+	// database, stored == 0 too — but in that case the drops below are no-ops
+	// and Rebuild simply finds no JSON files to reindex.
+	var stored int
+	_ = db.QueryRow(`PRAGMA user_version`).Scan(&stored)
+
+	needsRebuild := false
+	if stored != TokenizerVersion {
+		// Drop content tables so schema can recreate them with the current
+		// column set. sessions is dropped too so nothing references the old
+		// messages table via FK; it will be repopulated by Rebuild.
+		for _, stmt := range []string{
+			`DROP TABLE IF EXISTS messages_fts`,
+			`DROP TABLE IF EXISTS messages`,
+			`DROP TABLE IF EXISTS sessions`,
+		} {
+			if _, err := db.Exec(stmt); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("migrate drop: %w", err)
+			}
+		}
+		needsRebuild = true
+	}
+
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
 
-	return &Index{db: db}, nil
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, TokenizerVersion)); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set user_version: %w", err)
+	}
+
+	return &Index{db: db, needsRebuild: needsRebuild}, nil
 }
 
 func (idx *Index) Close() error {
 	return idx.db.Close()
+}
+
+// NeedsRebuild reports whether a tokenizer-version mismatch was detected when
+// the index was opened. Store uses this to trigger a one-time reindex.
+func (idx *Index) NeedsRebuild() bool {
+	return idx.needsRebuild
 }
 
 func (idx *Index) UpsertSession(sess *Session) error {
@@ -99,13 +143,17 @@ func (idx *Index) UpsertSession(sess *Session) error {
 	defer tx.Rollback()
 
 	// Upsert session row first (FK parent for messages).
-	// msg_count is set to 0 initially and updated after indexing.
+	// msg_count reflects the total number of messages in the session (including
+	// tool-only assistant turns and system-injected messages). Callers such as
+	// the sidebar use it to decide whether a session has ever been used; it is
+	// NOT a count of FTS-indexed rows.
 	_, err = tx.Exec(
 		`INSERT OR REPLACE INTO sessions (id, title, cwd, created_at, updated_at, msg_count)
-		 VALUES (?, ?, ?, ?, ?, 0)`,
+		 VALUES (?, ?, ?, ?, ?, ?)`,
 		sess.ID, sess.Title, sess.CWD,
 		sess.CreatedAt.Format(time.RFC3339Nano),
 		sess.UpdatedAt.Format(time.RFC3339Nano),
+		len(sess.Messages),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -115,29 +163,26 @@ func (idx *Index) UpsertSession(sess *Session) error {
 		return fmt.Errorf("delete old messages: %w", err)
 	}
 
-	indexedCount := 0
 	for i, msg := range sess.Messages {
 		// Skip system-injected guardrail/nudge messages to keep them out of search results
 		if i < len(sess.MessageMeta) && sess.MessageMeta[i].SystemInjected {
 			continue
 		}
-		text := msg.Content.Text()
-		if text == "" {
+		original := msg.Content.Text()
+		if original == "" {
 			continue
 		}
+		tokenized := Tokenize(original)
 		// msg_index is the original position in sess.Messages (may have gaps
-		// where system-injected or empty entries were skipped).
+		// where system-injected or empty entries were skipped). content holds
+		// the tokenized form (FTS-indexed); original holds the raw text used
+		// for snippet rendering.
 		if _, err := tx.Exec(
-			`INSERT INTO messages (session_id, msg_index, role, content) VALUES (?, ?, ?, ?)`,
-			sess.ID, i, msg.Role, text,
+			`INSERT INTO messages (session_id, msg_index, role, content, original) VALUES (?, ?, ?, ?, ?)`,
+			sess.ID, i, msg.Role, tokenized, original,
 		); err != nil {
 			return fmt.Errorf("insert message %d: %w", i, err)
 		}
-		indexedCount++
-	}
-
-	if _, err := tx.Exec(`UPDATE sessions SET msg_count = ? WHERE id = ?`, indexedCount, sess.ID); err != nil {
-		return fmt.Errorf("update msg_count: %w", err)
 	}
 
 	return tx.Commit()
@@ -170,16 +215,27 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 		limit = 20
 	}
 
+	// Tokenize the query the same way we tokenized the indexed content,
+	// unless the user is using FTS5 operators (quotes, AND/OR/NOT, *).
+	// Otherwise CJK queries like "机器学习" would be one token that never
+	// matches the segmented index.
+	ftsQuery := query
+	if !hasFTSOperator(query) {
+		ftsQuery = Tokenize(query)
+		if strings.TrimSpace(ftsQuery) == "" {
+			return nil, nil
+		}
+	}
+
 	rows, err := idx.db.Query(
-		`SELECT m.session_id, s.title, m.role, m.msg_index, s.created_at,
-		        snippet(messages_fts, 0, '>>>', '<<<', '...', 40)
+		`SELECT m.session_id, s.title, m.role, m.msg_index, s.created_at, m.original
 		 FROM messages_fts
 		 JOIN messages m ON m.rowid = messages_fts.rowid
 		 JOIN sessions s ON s.id = m.session_id
 		 WHERE messages_fts MATCH ?
 		 ORDER BY rank
 		 LIMIT ?`,
-		query, limit,
+		ftsQuery, limit,
 	)
 	if err != nil {
 		if isFTSSyntaxError(err) {
@@ -189,14 +245,19 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 	}
 	defer rows.Close()
 
+	// Build query-term list for snippet highlighting. Strip FTS operators
+	// so the highlight matcher only sees actual content terms.
+	terms := extractTerms(query)
+
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		var createdStr string
-		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.Role, &r.MsgIndex, &createdStr, &r.Snippet); err != nil {
+		var createdStr, original string
+		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.Role, &r.MsgIndex, &createdStr, &original); err != nil {
 			return nil, fmt.Errorf("scan result: %w", err)
 		}
 		r.CreatedAt = parseTime(createdStr)
+		r.Snippet = buildSnippet(original, terms)
 		results = append(results, r)
 	}
 	return results, rows.Err()
@@ -234,6 +295,7 @@ func (idx *Index) Rebuild(store *Store) error {
 			return fmt.Errorf("index session %s: %w", id, err)
 		}
 	}
+	idx.needsRebuild = false
 	return nil
 }
 
@@ -274,4 +336,20 @@ func isFTSSyntaxError(err error) bool {
 		strings.Contains(msg, "fts5 syntax error") ||
 		strings.Contains(msg, "fts5:") ||
 		strings.Contains(msg, "unterminated string")
+}
+
+// hasFTSOperator reports whether the query likely uses FTS5 syntax (quoted
+// phrases, boolean operators, wildcards). Such queries should be passed to
+// FTS5 verbatim without tokenization.
+func hasFTSOperator(q string) bool {
+	if strings.ContainsAny(q, `"*():^`) {
+		return true
+	}
+	// Boolean operators must appear as separate words.
+	for _, op := range []string{" AND ", " OR ", " NOT ", "NEAR("} {
+		if strings.Contains(q, op) {
+			return true
+		}
+	}
+	return false
 }
