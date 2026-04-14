@@ -20,6 +20,14 @@ const (
 	maxFileSize     = 100 * 1024 * 1024 // 100 MB per file
 	maxFiles        = 10                // max attachments per message
 	downloadTimeout = 2 * time.Minute
+
+	// maxInlineImageBase64Bytes caps the pre-decode size of inline image
+	// blocks so a hostile or buggy caller cannot force a multi-hundred-MB
+	// base64 allocation before the downstream 20 MB decoded cap in
+	// resolveFileRef fires. Uses the worst-case 4/3 base64 inflation ratio
+	// plus a few bytes of padding slack.
+	maxInlineImageDecodedBytes   = 20 * 1024 * 1024
+	maxInlineImageBase64Bytes    = maxInlineImageDecodedBytes*4/3 + 4
 )
 
 // urlValidator is the URL validation function used before each download.
@@ -45,6 +53,11 @@ func createAttachmentDir(shannonDir string) (string, func(), error) {
 	return dir, cleanup, nil
 }
 
+// combineCleanup composes two cleanup closures into one, running them in
+// LIFO order: the most-recently-registered (next) runs first. Callers can
+// chain new cleanups onto an accumulator and rely on the later cleanup
+// completing before earlier ones (e.g. remove remote-file dir first, then
+// inline-image dir).
 func combineCleanup(existing, next func()) func() {
 	if existing == nil {
 		return next
@@ -163,6 +176,16 @@ func materializeInlineImageBlocks(shannonDir string, blocks []RequestContentBloc
 			continue
 		}
 
+		// Pre-decode size guard: reject before base64 decoding allocates
+		// memory proportional to the encoded length. The decoded block
+		// still gets the stricter 20 MB cap in resolveFileRef; this guard
+		// just protects the decode step itself.
+		if len(b.Source.Data) > maxInlineImageBase64Bytes {
+			log.Printf("daemon: inline image block %d exceeds size guard (%d base64 bytes > %d)", i, len(b.Source.Data), maxInlineImageBase64Bytes)
+			out = append(out, b)
+			continue
+		}
+
 		data, err := base64.StdEncoding.DecodeString(b.Source.Data)
 		if err != nil {
 			log.Printf("daemon: failed to decode inline image block %d: %v", i, err)
@@ -178,7 +201,14 @@ func materializeInlineImageBlocks(shannonDir string, blocks []RequestContentBloc
 			}
 		}
 
-		displayName := strings.TrimSpace(b.Filename)
+		// Normalize the caller-supplied filename through filepath.Base before
+		// using it anywhere user-visible: the local path goes through
+		// sanitizeFilename, but the Filename field is also echoed back in
+		// the "[User attached image: <name> ...]" hint text the model sees.
+		// Without normalization, a name like "../etc/passwd" would leak into
+		// that hint and look alarming even though the actual disk path is
+		// safe.
+		displayName := filepath.Base(strings.TrimSpace(b.Filename))
 		if displayName == "" || displayName == "." || displayName == ".." {
 			displayName = fmt.Sprintf("attachment_%d%s", nextIndex, ext)
 		} else if filepath.Ext(displayName) == "" {

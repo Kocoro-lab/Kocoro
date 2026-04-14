@@ -579,3 +579,59 @@ func TestRemoteFile_JSONUnmarshal(t *testing.T) {
 		t.Errorf("AuthHeader: got %q", f.AuthHeader)
 	}
 }
+
+// TestMaterializeInlineImageBlocks_PreDecodeSizeGuard ensures an inline
+// image block whose base64 payload exceeds the guard never reaches
+// base64.DecodeString (which would allocate a decoded buffer larger than
+// the downstream resolveFileRef cap). The oversized block passes through
+// untouched so vision access is preserved, but no temp file is written.
+func TestMaterializeInlineImageBlocks_PreDecodeSizeGuard(t *testing.T) {
+	dir := t.TempDir()
+	oversize := strings.Repeat("A", maxInlineImageBase64Bytes+1)
+	blocks, cleanup := materializeInlineImageBlocks(dir, []RequestContentBlock{
+		{Type: "image", Source: &client.ImageSource{
+			Type:      "base64",
+			MediaType: "image/png",
+			Data:      oversize,
+		}},
+	})
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if len(blocks) != 1 || blocks[0].Type != "image" {
+		t.Fatalf("oversize block should pass through unchanged, got %+v", blocks)
+	}
+	if cleanup != nil {
+		t.Error("no attachment dir should be created when every block is rejected by the size guard")
+	}
+}
+
+// TestMaterializeInlineImageBlocks_FilenameSanitized verifies that a
+// caller-supplied filename containing path separators is reduced to its
+// basename before being stored on the file_ref block. The Filename field
+// is echoed into the model-visible attachment hint, so we can't let a
+// value like "../etc/passwd" surface there even though the disk path is
+// safe.
+func TestMaterializeInlineImageBlocks_FilenameSanitized(t *testing.T) {
+	dir := t.TempDir()
+	raw := []byte("fake-png-data")
+	blocks, cleanup := materializeInlineImageBlocks(dir, []RequestContentBlock{
+		{Type: "image", Filename: "../etc/passwd.png", Source: &client.ImageSource{
+			Type:      "base64",
+			MediaType: "image/png",
+			Data:      base64.StdEncoding.EncodeToString(raw),
+		}},
+	})
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if len(blocks) != 1 || blocks[0].Type != "file_ref" {
+		t.Fatalf("expected one file_ref block, got %+v", blocks)
+	}
+	if blocks[0].Filename != "passwd.png" {
+		t.Errorf("Filename should be reduced to basename; got %q", blocks[0].Filename)
+	}
+	if strings.Contains(blocks[0].FilePath, "..") {
+		t.Errorf("FilePath must not contain traversal segments; got %q", blocks[0].FilePath)
+	}
+}
