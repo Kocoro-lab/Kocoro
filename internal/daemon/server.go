@@ -807,9 +807,10 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		MessageIndex int    `json:"message_index"`
-		NewContent   string `json:"new_content"`
-		Agent        string `json:"agent,omitempty"`
+		MessageIndex int                   `json:"message_index"`
+		NewContent   string                `json:"new_content"`
+		Content      []RequestContentBlock `json:"content,omitempty"`
+		Agent        string                `json:"agent,omitempty"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
@@ -843,6 +844,7 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 	// 以新内容重新触发 agent，复用现有消息发送流程
 	runReq := RunAgentRequest{
 		Text:      body.NewContent,
+		Content:   body.Content,
 		Agent:     body.Agent,
 		SessionID: id,
 		Source:    "shanclaw",
