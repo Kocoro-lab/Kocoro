@@ -973,7 +973,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	runForceStopTurn := func(reason string) (string, error) {
 		messages = append(messages, client.Message{
 			Role:    "user",
-			Content: client.NewTextContent(reason),
+			Content: client.NewTextContent("[system] " + reason),
 		})
 		markInjected()
 
@@ -2060,7 +2060,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			}
 			messages = append(messages, client.Message{
 				Role:    "user",
-				Content: client.NewTextContent(worstMsg),
+				Content: client.NewTextContent("[system] " + worstMsg),
 			})
 			markInjected()
 		}

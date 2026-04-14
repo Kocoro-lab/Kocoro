@@ -752,8 +752,44 @@ func TestLoopDetector_BrowserFamilyNoProgress(t *testing.T) {
 	if action != LoopNudge {
 		t.Errorf("3 same-topic browser calls should nudge, got %v", action)
 	}
-	if !strings.Contains(msg, "same topic") {
-		t.Errorf("expected 'same topic' in message, got: %s", msg)
+	if strings.Contains(msg, "searched") || strings.Contains(msg, "query") {
+		t.Errorf("browser-family nudge should not use search vocabulary, got: %s", msg)
+	}
+	if !strings.Contains(msg, "UI action") {
+		t.Errorf("expected browser-family nudge to mention 'UI action', got: %s", msg)
+	}
+}
+
+// TestFamilyNoProgressMessage_VocabularyByFamily asserts the helper emits
+// family-appropriate wording at each stage. Protects against the regression
+// where browser callers received search-vocabulary nudges ("You've searched
+// the same topic…") after FamilyNoProgress was extended to cover browser_*.
+func TestFamilyNoProgressMessage_VocabularyByFamily(t *testing.T) {
+	cases := []struct {
+		family        string
+		stage         int
+		forbidSubstrs []string
+		wantSubstrs   []string
+	}{
+		{"browser", 0, []string{"searched", "query"}, []string{"UI action", "selector"}},
+		{"browser", 1, []string{"searched", "query"}, []string{"UI action"}},
+		{"browser", 2, []string{"searched", "query"}, []string{"UI action", "browser-family"}},
+		{"gui", 0, []string{"searched", "query"}, []string{"UI action"}},
+		{"search", 0, nil, []string{"searched the same topic"}},
+		{"web", 2, nil, []string{"web calls", "same topic"}},
+	}
+	for _, tc := range cases {
+		msg := familyNoProgressMessage(tc.family, 3, 4, tc.stage)
+		for _, forbid := range tc.forbidSubstrs {
+			if strings.Contains(msg, forbid) {
+				t.Errorf("family=%s stage=%d: message must not contain %q, got: %s", tc.family, tc.stage, forbid, msg)
+			}
+		}
+		for _, want := range tc.wantSubstrs {
+			if !strings.Contains(msg, want) {
+				t.Errorf("family=%s stage=%d: message must contain %q, got: %s", tc.family, tc.stage, want, msg)
+			}
+		}
 	}
 }
 

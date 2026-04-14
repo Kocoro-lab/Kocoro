@@ -332,16 +332,13 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		}
 
 		if progressCount >= 7 {
-			return LoopForceStop, fmt.Sprintf(
-				"You have made %d web calls with %d on the same topic. Return your collected results now.", familyCount, progressCount)
+			return LoopForceStop, familyNoProgressMessage(family, progressCount, familyCount, 2)
 		}
 		if progressCount >= 5 {
-			return LoopNudge, fmt.Sprintf(
-				"You've searched the same topic %d times. Summarize what you've found and present it to the user. Do not search again.", progressCount)
+			return LoopNudge, familyNoProgressMessage(family, progressCount, familyCount, 1)
 		}
 		if progressCount >= 3 {
-			return LoopNudge, fmt.Sprintf(
-				"You've searched the same topic %d times with similar results. Use the results you already have or try a fundamentally different query.", progressCount)
+			return LoopNudge, familyNoProgressMessage(family, progressCount, familyCount, 0)
 		}
 
 		// Fallback for families without topic/result tracking (e.g., GUI tools
@@ -466,4 +463,44 @@ func truncateErrSig(s string, maxLen int) string {
 		return s
 	}
 	return string(r[:maxLen])
+}
+
+// familyNoProgressMessage returns a family-appropriate nudge/force-stop
+// message for the FamilyNoProgress detector. The earlier wording was borrowed
+// from the search family ("searched the same topic", "fundamentally different
+// query") and surfaced verbatim for browser/gui callers when the detector
+// was extended to cover "browser_*", producing misleading guidance like
+// "You've searched..." for a series of browser_click calls. stage maps to
+// the threshold tier: 0 = 3-hit initial nudge, 1 = 5-hit stronger nudge,
+// 2 = 7-hit force stop.
+func familyNoProgressMessage(family string, progressCount, familyCount, stage int) string {
+	switch family {
+	case "search", "web":
+		switch stage {
+		case 2:
+			return fmt.Sprintf("You have made %d web calls with %d on the same topic. Return your collected results now.", familyCount, progressCount)
+		case 1:
+			return fmt.Sprintf("You've searched the same topic %d times. Summarize what you've found and present it to the user. Do not search again.", progressCount)
+		default:
+			return fmt.Sprintf("You've searched the same topic %d times with similar results. Use the results you already have or try a fundamentally different query.", progressCount)
+		}
+	case "browser", "gui":
+		switch stage {
+		case 2:
+			return fmt.Sprintf("You have repeated the same UI action %d times across %d browser-family calls without the page state advancing. Report the current state to the user now.", progressCount, familyCount)
+		case 1:
+			return fmt.Sprintf("You've repeated the same UI action %d times without progress. Stop clicking — summarize the current page state for the user and wait for direction.", progressCount)
+		default:
+			return fmt.Sprintf("You've repeated the same UI action %d times with no observable change. Try a different selector, refresh the page, or step back and reassess the plan.", progressCount)
+		}
+	default:
+		switch stage {
+		case 2:
+			return fmt.Sprintf("You have called tools in the same family %d times (%d on the same target) without progress. Provide your answer now.", familyCount, progressCount)
+		case 1:
+			return fmt.Sprintf("You've repeated the same action %d times without progress. Summarize what you have and report back to the user.", progressCount)
+		default:
+			return fmt.Sprintf("You've repeated the same action %d times with similar results. Change approach.", progressCount)
+		}
+	}
 }
