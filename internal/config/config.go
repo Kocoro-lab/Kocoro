@@ -588,6 +588,14 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		}
 	}
 
+	// MCP: merge and deduplicate workspace roots. Project- or local-scoped
+	// config can add extra directories on top of the global set without
+	// replacing it.
+	if overlay.MCP != nil && len(overlay.MCP.WorkspaceRoots) > 0 {
+		cfg.MCP.WorkspaceRoots = dedup(append(cfg.MCP.WorkspaceRoots, overlay.MCP.WorkspaceRoots...))
+		cfg.Sources["mcp.workspace_roots"] = src
+	}
+
 	// Process-global fields (endpoint, api_key, auto_update_check, daemon,
 	// mcp_servers) are intentionally NOT merged here — they stay process-scoped.
 }

@@ -177,3 +177,50 @@ func TestSkillsConfigDefault(t *testing.T) {
 		t.Errorf("Skills.Marketplace.RegistryURL = %q, want %q", cfg.Skills.Marketplace.RegistryURL, want)
 	}
 }
+
+// TestMergeRuntimeOverlayFile_MCPWorkspaceRoots guards the plumbing of
+// mcp.workspace_roots from project/local overlay files into the merged
+// Config. Before the fix the field was declared on overlayConfig but
+// never read in mergeRuntimeOverlayFile, so project-level workspace
+// roots were silently dropped.
+func TestMergeRuntimeOverlayFile_MCPWorkspaceRoots(t *testing.T) {
+	dir := t.TempDir()
+	overlayPath := filepath.Join(dir, ".shannon", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(overlayPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	overlayYAML := `mcp:
+  workspace_roots:
+    - /workspace/project-a
+    - /workspace/shared
+`
+	if err := os.WriteFile(overlayPath, []byte(overlayYAML), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Seed a baseline config with one existing root — overlay should
+	// append rather than replace, and dedupe against what's already there.
+	cfg := &Config{
+		MCP:     MCPConfig{WorkspaceRoots: []string{"/workspace/shared"}},
+		Sources: map[string]ConfigSource{},
+	}
+
+	mergeRuntimeOverlayFile(cfg, overlayPath, "project")
+
+	got := cfg.MCP.WorkspaceRoots
+	if len(got) != 2 {
+		t.Fatalf("expected 2 workspace roots after dedup, got %d: %v", len(got), got)
+	}
+	seen := make(map[string]bool)
+	for _, r := range got {
+		seen[r] = true
+	}
+	for _, want := range []string{"/workspace/shared", "/workspace/project-a"} {
+		if !seen[want] {
+			t.Errorf("missing expected root %q in %v", want, got)
+		}
+	}
+	if src, ok := cfg.Sources["mcp.workspace_roots"]; !ok || src.Level != "project" {
+		t.Errorf("expected source to record project overlay, got %+v ok=%v", src, ok)
+	}
+}
