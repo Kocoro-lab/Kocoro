@@ -15,6 +15,7 @@ import (
 	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -38,14 +39,15 @@ type RemoteTool struct {
 
 // ClientManager manages connections to multiple MCP servers.
 type ClientManager struct {
-	mu          sync.Mutex
-	clients     map[string]mcpclient.MCPClient // server name → client
-	configs     map[string]MCPServerConfig     // server name → config (for reconnect)
-	toolCache   map[string][]RemoteTool        // server name → last-known tools
-	reconnectMu map[string]*sync.Mutex         // per-server reconnect serialization
-	supervised  bool                           // when true, skip inline reconnect in CallTool
-	idleTimers  map[string]*time.Timer         // per-server idle disconnect timers
-	needsSetup  map[string]bool                // servers gated by missing readiness marker
+	mu           sync.Mutex
+	clients      map[string]mcpclient.MCPClient // server name → client
+	configs      map[string]MCPServerConfig     // server name → config (for reconnect)
+	toolCache    map[string][]RemoteTool        // server name → last-known tools
+	reconnectMu  map[string]*sync.Mutex         // per-server reconnect serialization
+	supervised   bool                           // when true, skip inline reconnect in CallTool
+	idleTimers   map[string]*time.Timer         // per-server idle disconnect timers
+	needsSetup   map[string]bool                // servers gated by missing readiness marker
+	rootsHandler *RootsHandler                  // advertised to servers honoring the MCP roots capability; nil disables advertisement
 }
 
 // NewClientManager creates a new MCP client manager.
@@ -57,6 +59,17 @@ func NewClientManager() *ClientManager {
 		reconnectMu: make(map[string]*sync.Mutex),
 		needsSetup:  make(map[string]bool),
 	}
+}
+
+// SetRootsHandler installs a roots handler that will be advertised to every
+// MCP server the manager connects (or reconnects) to. Must be called before
+// ConnectAll / any reconnect path; existing live clients are not retrofitted
+// because mcp-go does not expose runtime capability updates on the client
+// side. Pass nil to disable advertisement.
+func (m *ClientManager) SetRootsHandler(h *RootsHandler) {
+	m.mu.Lock()
+	m.rootsHandler = h
+	m.mu.Unlock()
 }
 
 // ConnectAll connects to all configured MCP servers in parallel and returns discovered tools.
@@ -132,38 +145,47 @@ func (m *ClientManager) ConnectedServers() []string {
 func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerConfig) ([]RemoteTool, error) {
 	m.mu.Lock()
 	m.configs[name] = cfg
+	rootsHandler := m.rootsHandler
 	m.mu.Unlock()
 
-	var c mcpclient.MCPClient
-	var err error
+	// Every connect path needs to: build a transport, attach optional
+	// client-side handlers (currently just roots), then Start. The
+	// convenience constructors in mcp-go (NewStdioMCPClient,
+	// NewStreamableHttpClient) do not accept ClientOption, so we build
+	// the transport and wire the client directly when a handler exists.
+	clientOpts := []mcpclient.ClientOption{}
+	if opt := rootsHandler.clientOption(); opt != nil {
+		clientOpts = append(clientOpts, opt)
+	}
 
+	var c *mcpclient.Client
 	switch cfg.Type {
 	case "http":
 		if cfg.URL == "" {
 			return nil, fmt.Errorf("http MCP server requires url")
 		}
-		c, err = mcpclient.NewStreamableHttpClient(cfg.URL)
+		httpTransport, err := transport.NewStreamableHTTP(cfg.URL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 		}
-		if starter, ok := c.(interface{ Start(context.Context) error }); ok {
-			if err := starter.Start(ctx); err != nil {
-				return nil, fmt.Errorf("failed to start HTTP client: %w", err)
-			}
+		c = mcpclient.NewClient(httpTransport, clientOpts...)
+		if err := c.Start(ctx); err != nil {
+			return nil, fmt.Errorf("failed to start HTTP client: %w", err)
 		}
 	default: // stdio
 		if cfg.Command == "" {
 			return nil, fmt.Errorf("stdio MCP server requires command")
 		}
 		envSlice := buildEnvSlice(cfg.Env)
-		c, err = mcpclient.NewStdioMCPClient(cfg.Command, envSlice, cfg.Args...)
-		if err != nil {
+		stdioTransport := transport.NewStdioWithOptions(cfg.Command, envSlice, cfg.Args)
+		if err := stdioTransport.Start(ctx); err != nil {
 			return nil, fmt.Errorf("failed to start MCP server %q: %w", cfg.Command, err)
 		}
+		c = mcpclient.NewClient(stdioTransport, clientOpts...)
 	}
 
 	// Initialize handshake
-	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+	_, err := c.Initialize(ctx, mcp.InitializeRequest{
 		Params: struct {
 			ProtocolVersion string                 `json:"protocolVersion"`
 			Capabilities    mcp.ClientCapabilities `json:"capabilities"`

@@ -223,6 +223,13 @@ func CompleteRegistration(ctx context.Context, gw *client.GatewayClient, cfg *co
 	var mcpMgr *mcp.ClientManager
 	if len(mcpServers) > 0 {
 		mcpMgr = mcp.NewClientManager()
+		// Advertise workspace roots to servers that honor the MCP `roots`
+		// capability (playwright-mcp restricts browser_file_upload to
+		// declared roots). Must be installed before ConnectAll so the
+		// initialize handshake carries the client capability flag.
+		rootCandidates := mcp.DefaultWorkspaceRootCandidates(config.ShannonDir())
+		rootCandidates = append(rootCandidates, cfg.MCP.WorkspaceRoots...)
+		mcpMgr.SetRootsHandler(mcp.NewRootsHandler(rootCandidates))
 		mcpTools, mcpErr := mcpMgr.ConnectAll(ctx, mcpServers)
 		if mcpErr != nil {
 			log.Printf("MCP connection warning: %v", mcpErr)

@@ -35,7 +35,18 @@ type Config struct {
 	Skills          SkillsConfig                   `mapstructure:"skills"            yaml:"skills"            json:"skills"`
 	Hooks           hooks.HookConfig               `mapstructure:"hooks"             yaml:"hooks"             json:"hooks"`
 	MCPServers      map[string]mcp.MCPServerConfig `mapstructure:"mcp_servers"       yaml:"mcp_servers"       json:"mcp_servers"`
+	MCP             MCPConfig                      `mapstructure:"mcp"               yaml:"mcp"               json:"mcp"`
 	Sources         map[string]ConfigSource        `mapstructure:"-"                 yaml:"-"                 json:"-"`
+}
+
+// MCPConfig holds client-side settings shared across all MCP servers.
+type MCPConfig struct {
+	// WorkspaceRoots are extra directories advertised to MCP servers honoring
+	// the client `roots` capability, on top of the ShanClaw defaults
+	// (attachment staging dir plus common user locations). Intended for
+	// project directories the user wants browser_file_upload or similar
+	// sandboxed tools to reach without manual copying.
+	WorkspaceRoots []string `mapstructure:"workspace_roots" yaml:"workspace_roots,omitempty" json:"workspace_roots,omitempty"`
 }
 
 type AgentConfig struct {
@@ -303,6 +314,11 @@ type overlayConfig struct {
 	Tools           *overlayToolsConfig            `yaml:"tools"`
 	Daemon          *overlayDaemonConfig           `yaml:"daemon"`
 	MCPServers      map[string]mcp.MCPServerConfig `yaml:"mcp_servers"`
+	MCP             *overlayMCPConfig              `yaml:"mcp"`
+}
+
+type overlayMCPConfig struct {
+	WorkspaceRoots []string `yaml:"workspace_roots"`
 }
 
 type overlayOllamaConfig struct {
