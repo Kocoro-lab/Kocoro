@@ -7,9 +7,21 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
+
+// indexSchemaVersion is stamped into PRAGMA user_version. A mismatch drops
+// stale FTS tables and rebuilds from the JSON on disk, so tokenizer changes
+// never leave users with a half-migrated index.
+//
+// Versions:
+//
+//	0 — uninitialised.
+//	1 — porter+unicode61 (shipped default).
+//	2 — trigram tokenizer; native snippet() on original text.
+const indexSchemaVersion = 2
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -37,7 +49,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
     content=messages,
     content_rowid=rowid,
-    tokenize='porter unicode61'
+    tokenize='trigram'
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
@@ -64,7 +76,8 @@ type SearchResult struct {
 }
 
 type Index struct {
-	db *sql.DB
+	db           *sql.DB
+	needsRebuild bool
 }
 
 func OpenIndex(dir string) (*Index, error) {
@@ -79,13 +92,55 @@ func OpenIndex(dir string) (*Index, error) {
 	}
 	db.SetMaxOpenConns(1)
 
+	var stored int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&stored); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("read user_version: %w", err)
+	}
+
+	needsRebuild := false
+	if stored != indexSchemaVersion {
+		// Any version mismatch — including stored==0 from shipped versions
+		// of main that never stamped user_version and still have a porter
+		// FTS table on disk — must drop the stale messages/FTS so the new
+		// schema takes effect. Dropping with IF EXISTS is a no-op for fresh
+		// installs. Sessions table is left alone (metadata-only) so the
+		// session list stays visible while the rebuild runs.
+		stmts := []string{
+			`DROP TABLE IF EXISTS messages_fts`,
+			`DROP TABLE IF EXISTS messages`,
+		}
+		for _, s := range stmts {
+			if _, err := db.Exec(s); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("drop stale table: %w", err)
+			}
+		}
+		// Only flag rebuild when there was actual prior data to migrate.
+		// For a truly fresh DB (stored==0, no sessions rows), NewStore's
+		// IsEmpty check will cover the no-op case.
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&n); err == nil && n > 0 {
+			needsRebuild = true
+		}
+	}
+
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
 
-	return &Index{db: db}, nil
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, indexSchemaVersion)); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("stamp user_version: %w", err)
+	}
+
+	return &Index{db: db, needsRebuild: needsRebuild}, nil
 }
+
+// NeedsRebuild reports whether the tokenizer version changed and the caller
+// should invoke Rebuild against a Store to re-seed messages from JSON.
+func (idx *Index) NeedsRebuild() bool { return idx.needsRebuild }
 
 func (idx *Index) Close() error {
 	return idx.db.Close()
@@ -115,7 +170,6 @@ func (idx *Index) UpsertSession(sess *Session) error {
 		return fmt.Errorf("delete old messages: %w", err)
 	}
 
-	indexedCount := 0
 	for i, msg := range sess.Messages {
 		// Skip system-injected guardrail/nudge messages to keep them out of search results
 		if i < len(sess.MessageMeta) && sess.MessageMeta[i].SystemInjected {
@@ -133,10 +187,12 @@ func (idx *Index) UpsertSession(sess *Session) error {
 		); err != nil {
 			return fmt.Errorf("insert message %d: %w", i, err)
 		}
-		indexedCount++
 	}
 
-	if _, err := tx.Exec(`UPDATE sessions SET msg_count = ? WHERE id = ?`, indexedCount, sess.ID); err != nil {
+	// msg_count is the total message count, not the indexed-row count.
+	// The desktop sidebar's "used session" filter relies on this reflecting
+	// the full message list rather than what happened to land in the index.
+	if _, err := tx.Exec(`UPDATE sessions SET msg_count = ? WHERE id = ?`, len(sess.Messages), sess.ID); err != nil {
 		return fmt.Errorf("update msg_count: %w", err)
 	}
 
@@ -165,9 +221,48 @@ func (idx *Index) ListSessions() ([]SessionSummary, error) {
 	return summaries, rows.Err()
 }
 
+// Search runs the query against the FTS5 trigram index.
+//
+// Routing: queries are split into terms (whitespace-separated, with quoted
+// phrases kept intact). If any term is under 3 runes, trigram cannot index it,
+// so we route through a LIKE-based path that AND-intersects one LIKE clause
+// per term against messages.content. This handles:
+//   - bare short CJK:      登录
+//   - quoted short CJK:    "登录"
+//   - mixed short+long:    登录 failed  (both terms enforced; 登录 cannot be
+//                                       silently dropped by trigram)
+//
+// When every term is long enough for trigram AND the query doesn't contain
+// FTS5 operators that LIKE can't express, the fast MATCH path is used.
 func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 	if limit <= 0 {
 		limit = 20
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+
+	terms := splitQueryTerms(query)
+	hasShort := false
+	for _, t := range terms {
+		if utf8.RuneCountInString(t) < 3 {
+			hasShort = true
+			break
+		}
+	}
+	hasOperator := containsFTSOperator(query)
+
+	if hasShort && !hasOperator {
+		return idx.searchLike(terms, limit)
+	}
+	if hasShort && hasOperator {
+		// Boolean operators (AND/OR/NOT/NEAR) and wildcards cannot be
+		// faithfully translated to LIKE AND-intersection. Rather than
+		// silently return wrong results — FTS5 trigram ignores terms
+		// shorter than 3 characters — reject the query with a clear
+		// message so the caller can reformulate.
+		return nil, fmt.Errorf("invalid search query: terms shorter than 3 characters cannot be combined with AND/OR/NOT/NEAR or wildcard operators; remove operators or use longer terms")
 	}
 
 	rows, err := idx.db.Query(
@@ -202,6 +297,102 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 	return results, rows.Err()
 }
 
+// splitQueryTerms breaks a query into whitespace-separated terms, keeping
+// quoted phrases (single-quoted or double-quoted) as one term with the quotes
+// stripped. Punctuation outside quotes is left attached to the term; we only
+// care about grouping for the short-term detection.
+func splitQueryTerms(q string) []string {
+	var terms []string
+	var cur strings.Builder
+	inQuote := false
+	flush := func() {
+		s := strings.TrimSpace(cur.String())
+		if s != "" {
+			terms = append(terms, s)
+		}
+		cur.Reset()
+	}
+	for _, r := range q {
+		switch {
+		case r == '"':
+			if inQuote {
+				flush()
+				inQuote = false
+			} else {
+				flush()
+				inQuote = true
+			}
+		case !inQuote && (r == ' ' || r == '\t' || r == '\n'):
+			flush()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	flush()
+	return terms
+}
+
+// containsFTSOperator reports whether the query uses FTS5 operators that the
+// LIKE fallback cannot faithfully reproduce. Quoted phrases alone are fine
+// (splitQueryTerms handles them); we only flag AND/OR/NOT/NEAR and wildcards.
+func containsFTSOperator(q string) bool {
+	if strings.ContainsAny(q, `*()^`) {
+		return true
+	}
+	for _, op := range []string{" AND ", " OR ", " NOT ", "NEAR("} {
+		if strings.Contains(q, op) {
+			return true
+		}
+	}
+	return false
+}
+
+// searchLike runs one LIKE '%term%' clause per term, AND-intersecting on
+// message rowid. Every term must match for a row to be returned, so short CJK
+// terms (e.g. 登录) cannot be silently dropped the way FTS5 trigram would.
+func (idx *Index) searchLike(terms []string, limit int) ([]SearchResult, error) {
+	if len(terms) == 0 {
+		return nil, nil
+	}
+	var clauses []string
+	args := make([]any, 0, len(terms)+1)
+	for _, t := range terms {
+		clauses = append(clauses, `m.content LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeLike(t)+"%")
+	}
+	args = append(args, limit)
+	sqlText := `SELECT m.session_id, s.title, m.role, m.msg_index, s.created_at, m.content
+		 FROM messages m
+		 JOIN sessions s ON s.id = m.session_id
+		 WHERE ` + strings.Join(clauses, " AND ") + `
+		 ORDER BY s.updated_at DESC
+		 LIMIT ?`
+	rows, err := idx.db.Query(sqlText, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search (like): %w", err)
+	}
+	defer rows.Close()
+
+	var results []SearchResult
+	for rows.Next() {
+		var r SearchResult
+		var createdStr, content string
+		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.Role, &r.MsgIndex, &createdStr, &content); err != nil {
+			return nil, fmt.Errorf("scan result: %w", err)
+		}
+		r.CreatedAt = parseTime(createdStr)
+		// Snippet around the first term match; fall back to the first term.
+		r.Snippet = likeSnippet(content, terms[0])
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
+}
+
 func (idx *Index) DeleteSession(id string) error {
 	_, err := idx.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
 	if err != nil {
@@ -234,6 +425,7 @@ func (idx *Index) Rebuild(store *Store) error {
 			return fmt.Errorf("index session %s: %w", id, err)
 		}
 	}
+	idx.needsRebuild = false
 	return nil
 }
 
@@ -266,6 +458,52 @@ func parseTime(s string) time.Time {
 		t, _ = time.Parse("2006-01-02 15:04:05.999999999-07:00", s)
 	}
 	return t
+}
+
+// likeSnippet produces a short context window around the first case-insensitive
+// occurrence of query in content, wrapping the match with >>>…<<<. Used by the
+// LIKE fallback path (short CJK queries) where FTS5's native snippet() is not
+// available.
+func likeSnippet(content, query string) string {
+	const window = 40
+	if content == "" || query == "" {
+		return content
+	}
+	lower := strings.ToLower(content)
+	q := strings.ToLower(query)
+	idx := strings.Index(lower, q)
+	if idx < 0 {
+		runes := []rune(content)
+		if len(runes) > window*2 {
+			return string(runes[:window*2]) + "..."
+		}
+		return content
+	}
+	// Expand window in runes for CJK safety.
+	startRune := utf8.RuneCountInString(content[:idx])
+	endRune := startRune + utf8.RuneCountInString(content[idx:idx+len(query)])
+	runes := []rune(content)
+	left := startRune - window
+	if left < 0 {
+		left = 0
+	}
+	right := endRune + window
+	if right > len(runes) {
+		right = len(runes)
+	}
+	var b strings.Builder
+	if left > 0 {
+		b.WriteString("...")
+	}
+	b.WriteString(string(runes[left:startRune]))
+	b.WriteString(">>>")
+	b.WriteString(string(runes[startRune:endRune]))
+	b.WriteString("<<<")
+	b.WriteString(string(runes[endRune:right]))
+	if right < len(runes) {
+		b.WriteString("...")
+	}
+	return b.String()
 }
 
 func isFTSSyntaxError(err error) bool {

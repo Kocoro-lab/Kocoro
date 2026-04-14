@@ -510,6 +510,9 @@ func TestIndex_UpsertSkipsSystemInjected(t *testing.T) {
 			searchMiss:   "",
 		},
 		{
+			// msg_count reflects total messages (len(sess.Messages)), not
+			// indexed rows, so the desktop sidebar's "used session" filter
+			// stays consistent with what the user sees in the conversation.
 			name: "injected messages excluded from index",
 			messages: []client.Message{
 				{Role: "user", Content: client.NewTextContent("visible unicorn")},
@@ -521,7 +524,7 @@ func TestIndex_UpsertSkipsSystemInjected(t *testing.T) {
 				{SystemInjected: true},
 				{},
 			},
-			wantMsgCount: 2,
+			wantMsgCount: 3,
 			searchHit:    "unicorn",
 			searchMiss:   "giraffe",
 		},
@@ -535,7 +538,7 @@ func TestIndex_UpsertSkipsSystemInjected(t *testing.T) {
 			meta: []MessageMeta{
 				{SystemInjected: true},
 			},
-			wantMsgCount: 2,
+			wantMsgCount: 3,
 			searchHit:    "dolphin",
 			searchMiss:   "penguin",
 		},

@@ -120,8 +120,11 @@ func NewStore(dir string) *Store {
 	idx, err := OpenIndex(dir)
 	if err == nil {
 		s.index = idx
-		// First-launch migration: if index is empty but JSON files exist, rebuild
-		if empty, _ := idx.IsEmpty(); empty {
+		// First-launch migration OR tokenizer-version migration: if the index
+		// is empty (fresh install), or OpenIndex detected a version mismatch
+		// and dropped the stale FTS tables, re-seed from the JSON files.
+		empty, _ := idx.IsEmpty()
+		if empty || idx.NeedsRebuild() {
 			idx.Rebuild(s) // best-effort
 		}
 	}
