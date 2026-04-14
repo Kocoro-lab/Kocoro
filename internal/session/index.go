@@ -216,25 +216,32 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 	}
 
 	// Tokenize the query the same way we tokenized the indexed content,
-	// unless the user is using FTS5 operators (quotes, AND/OR/NOT, *).
+	// unless the user is using FTS5 operators (AND/OR/NOT, *, parens).
 	// Otherwise CJK queries like "机器学习" would be one token that never
 	// matches the segmented index.
 	//
-	// For CJK queries, a tokenizer mismatch can occur: the query might be
-	// pure Han (→ gse) while the indexed content was in a Japanese sentence
-	// (→ kagome), producing different tokens for the same kanji compound.
-	// We handle this by searching for both the tokenized form (segmented
-	// terms joined with implicit AND) and the original compound form
-	// (quoted phrase via FTS5 OR), so hits are found regardless of which
-	// segmenter created the indexed tokens.
-	ftsQuery := query
-	if !hasFTSOperator(query) {
-		tokenized := Tokenize(query)
+	// Quoted phrases need special handling: they're FTS5 operators, but the
+	// phrase contents still have to be tokenized when they contain CJK so
+	// that `"登录接口"` matches the segmented `登录 接口` in the index.
+	// For phrases whose tokenization can differ between the query and the
+	// indexed text (for example pure-Han terms inside Japanese text), keep
+	// both the tokenized and original phrase forms.
+	//
+	// For unquoted CJK queries, a tokenizer mismatch can occur: the query
+	// might be pure Han (→ gse) while the indexed content was in a Japanese
+	// sentence (→ kagome), producing different tokens for the same kanji
+	// compound. We search for both the tokenized form and the original
+	// compound as a quoted phrase via FTS5 OR so hits are found regardless
+	// of which segmenter created the indexed tokens.
+	q := rewriteQuotedCJK(query)
+	ftsQuery := q
+	if !hasFTSOperator(q) {
+		tokenized := Tokenize(q)
 		if strings.TrimSpace(tokenized) == "" {
 			return nil, nil
 		}
-		if containsCJK(query) && tokenized != query {
-			ftsQuery = fmt.Sprintf(`(%s) OR "%s"`, tokenized, query)
+		if containsCJK(q) && tokenized != q {
+			ftsQuery = fmt.Sprintf(`(%s) OR "%s"`, tokenized, q)
 		} else {
 			ftsQuery = tokenized
 		}
@@ -365,4 +372,57 @@ func hasFTSOperator(q string) bool {
 		}
 	}
 	return false
+}
+
+// rewriteQuotedCJK walks q and, for each "..."-quoted phrase whose contents
+// contain CJK, preserves phrase semantics while making the segmented index
+// searchable. When tokenization changes the phrase, emit both the tokenized
+// and original phrase forms as `("tok tok" OR "原文")` so Japanese pure-Han
+// terms such as `"実装"` still match kagome-tokenized content.
+// Text outside quotes — including all other operators — is left untouched.
+func rewriteQuotedCJK(q string) string {
+	if !strings.Contains(q, `"`) {
+		return q
+	}
+	var b strings.Builder
+	b.Grow(len(q))
+	i := 0
+	for i < len(q) {
+		if q[i] != '"' {
+			b.WriteByte(q[i])
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(q) && q[j] != '"' {
+			j++
+		}
+		if j >= len(q) {
+			// Unterminated quote — leave verbatim for FTS5 to reject/handle.
+			b.WriteString(q[i:])
+			return b.String()
+		}
+		phrase := q[i+1 : j]
+		if containsCJK(phrase) {
+			tokenized := Tokenize(phrase)
+			switch {
+			case tokenized == "" || tokenized == phrase:
+				b.WriteByte('"')
+				b.WriteString(phrase)
+				b.WriteByte('"')
+			default:
+				b.WriteString(`("`)
+				b.WriteString(tokenized)
+				b.WriteString(`" OR "`)
+				b.WriteString(phrase)
+				b.WriteString(`")`)
+			}
+		} else {
+			b.WriteByte('"')
+			b.WriteString(phrase)
+			b.WriteByte('"')
+		}
+		i = j + 1
+	}
+	return b.String()
 }

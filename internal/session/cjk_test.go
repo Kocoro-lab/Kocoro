@@ -199,6 +199,113 @@ func TestIndex_EnglishStillWorks(t *testing.T) {
 	}
 }
 
+func TestIndex_QuotedCJKPhrase(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := OpenIndex(dir)
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+	defer idx.Close()
+
+	now := time.Now().Truncate(time.Second)
+	if err := idx.UpsertSession(&Session{
+		ID: "qcjk-1", Title: "q", CreatedAt: now, UpdatedAt: now,
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("帮我实现登录接口")},
+			{Role: "assistant", Content: client.NewTextContent("機械学習のログイン機能を実装してください")},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []string{`"登录接口"`, `"機械学習"`, `"実装"`}
+	for _, q := range cases {
+		t.Run(q, func(t *testing.T) {
+			results, err := idx.Search(q, 20)
+			if err != nil {
+				t.Fatalf("Search(%q): %v", q, err)
+			}
+			if len(results) == 0 {
+				t.Errorf("expected match for quoted CJK phrase %q", q)
+			}
+		})
+	}
+}
+
+func TestIndex_SnippetHighlightsQuotedASCIIPhrase(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := OpenIndex(dir)
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+	defer idx.Close()
+
+	now := time.Now().Truncate(time.Second)
+	if err := idx.UpsertSession(&Session{
+		ID: "phrase-snip-1", Title: "phrase", CreatedAt: now, UpdatedAt: now,
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("Set the ping interval to 15 seconds")},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := idx.Search(`"ping interval"`, 20)
+	if err != nil {
+		t.Fatalf("Search(%q): %v", `"ping interval"`, err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected phrase match")
+	}
+	if !strings.Contains(results[0].Snippet, ">>>ping interval<<<") {
+		t.Errorf("expected full phrase highlight, got %q", results[0].Snippet)
+	}
+}
+
+func TestIndex_SnippetHighlightsStemmedMatch(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := OpenIndex(dir)
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+	defer idx.Close()
+
+	now := time.Now().Truncate(time.Second)
+	if err := idx.UpsertSession(&Session{
+		ID: "stem-1", Title: "stem", CreatedAt: now, UpdatedAt: now,
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("program deploy connection running")},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		query string
+		want  string
+	}{
+		{"programs", "program"},
+		{"connections", "connection"},
+		{"run", "running"},
+	}
+	for _, c := range cases {
+		t.Run(c.query, func(t *testing.T) {
+			results, err := idx.Search(c.query, 20)
+			if err != nil {
+				t.Fatalf("Search(%q): %v", c.query, err)
+			}
+			if len(results) == 0 {
+				t.Fatalf("expected stemmed match for %q", c.query)
+			}
+			snip := results[0].Snippet
+			marker := ">>>" + c.want + "<<<"
+			if !strings.Contains(snip, marker) {
+				t.Errorf("snippet missing highlight %q: got %q", marker, snip)
+			}
+		})
+	}
+}
+
 func TestIndex_VersionGateTriggersRebuild(t *testing.T) {
 	dir := t.TempDir()
 
