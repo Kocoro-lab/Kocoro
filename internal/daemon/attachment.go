@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -25,6 +26,38 @@ const (
 // Tests may replace this to allow httptest (loopback) URLs.
 var urlValidator = validateDownloadURL
 
+func createAttachmentDir(shannonDir string) (string, func(), error) {
+	// Generate a random nonce for the attachment directory (session ID is
+	// not yet available at this point in RunAgent).
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", nil, fmt.Errorf("generate attachment nonce: %w", err)
+	}
+	dir := filepath.Join(shannonDir, "tmp", "attachments", hex.EncodeToString(nonce[:]))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", nil, fmt.Errorf("create attachment dir %s: %w", dir, err)
+	}
+	cleanup := func() {
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("daemon: failed to cleanup attachment dir %s: %v", dir, err)
+		}
+	}
+	return dir, cleanup, nil
+}
+
+func combineCleanup(existing, next func()) func() {
+	if existing == nil {
+		return next
+	}
+	if next == nil {
+		return existing
+	}
+	return func() {
+		next()
+		existing()
+	}
+}
+
 // downloadRemoteFiles downloads remote file attachments to a local temp
 // directory and returns file_ref RequestContentBlocks plus a cleanup function
 // that removes the attachment directory. The caller must register the cleanup
@@ -46,22 +79,10 @@ func downloadRemoteFiles(shannonDir string, files []RemoteFile) ([]RequestConten
 		})
 	}
 
-	// Generate a random nonce for the download directory (session ID is
-	// not yet available at this point in RunAgent).
-	var nonce [8]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		log.Printf("daemon: failed to generate attachment nonce: %v", err)
+	dir, cleanup, err := createAttachmentDir(shannonDir)
+	if err != nil {
+		log.Printf("daemon: failed to create attachment dir: %v", err)
 		return nil, func() {}
-	}
-	dir := filepath.Join(shannonDir, "tmp", "attachments", hex.EncodeToString(nonce[:]))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		log.Printf("daemon: failed to create attachment dir %s: %v", dir, err)
-		return nil, func() {}
-	}
-	cleanup := func() {
-		if err := os.RemoveAll(dir); err != nil {
-			log.Printf("daemon: failed to cleanup attachment dir %s: %v", dir, err)
-		}
 	}
 
 	// Custom client that preserves Authorization header across redirects.
@@ -109,6 +130,97 @@ func downloadRemoteFiles(shannonDir string, files []RemoteFile) ([]RequestConten
 	}
 	blocks = append(blocks, capBlocks...)
 	return blocks, cleanup
+}
+
+// materializeInlineImageBlocks rewrites inline base64 image blocks into
+// file_ref blocks backed by temp files so the model can keep both vision
+// access and a stable tool-usable file handle.
+func materializeInlineImageBlocks(shannonDir string, blocks []RequestContentBlock) ([]RequestContentBlock, func()) {
+	if len(blocks) == 0 {
+		return blocks, nil
+	}
+
+	out := make([]RequestContentBlock, 0, len(blocks))
+	var dir string
+	var cleanup func()
+	materializedAny := false
+	nextIndex := 0
+
+	for i, b := range blocks {
+		if b.Type != "image" || b.Source == nil || b.Source.Data == "" {
+			out = append(out, b)
+			continue
+		}
+		if t := strings.TrimSpace(b.Source.Type); t != "" && t != "base64" {
+			out = append(out, b)
+			continue
+		}
+
+		ext := inlineImageExtension(b.Source.MediaType)
+		if ext == "" {
+			log.Printf("daemon: unsupported inline image media type %q for block %d", b.Source.MediaType, i)
+			out = append(out, b)
+			continue
+		}
+
+		data, err := base64.StdEncoding.DecodeString(b.Source.Data)
+		if err != nil {
+			log.Printf("daemon: failed to decode inline image block %d: %v", i, err)
+			out = append(out, b)
+			continue
+		}
+
+		if dir == "" {
+			dir, cleanup, err = createAttachmentDir(shannonDir)
+			if err != nil {
+				log.Printf("daemon: failed to create attachment dir for inline images: %v", err)
+				return blocks, nil
+			}
+		}
+
+		displayName := strings.TrimSpace(b.Filename)
+		if displayName == "" || displayName == "." || displayName == ".." {
+			displayName = fmt.Sprintf("attachment_%d%s", nextIndex, ext)
+		} else if filepath.Ext(displayName) == "" {
+			displayName += ext
+		}
+		localPath := filepath.Join(dir, sanitizeFilename(nextIndex, displayName))
+		if err := os.WriteFile(localPath, data, 0o600); err != nil {
+			log.Printf("daemon: failed to write inline image block %d: %v", i, err)
+			out = append(out, b)
+			continue
+		}
+
+		out = append(out, RequestContentBlock{
+			Type:     "file_ref",
+			FilePath: localPath,
+			Filename: displayName,
+			ByteSize: int64(len(data)),
+		})
+		materializedAny = true
+		nextIndex++
+	}
+
+	if !materializedAny && cleanup != nil {
+		cleanup()
+		cleanup = nil
+	}
+	return out, cleanup
+}
+
+func inlineImageExtension(mediaType string) string {
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	default:
+		return ""
+	}
 }
 
 func downloadOneFile(httpClient *http.Client, f RemoteFile, localPath, displayName string) (RequestContentBlock, error) {

@@ -2,10 +2,12 @@ package daemon
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -281,6 +283,39 @@ func TestResolveContentBlocks_FileRef(t *testing.T) {
 	expected := "[User attached file: test.txt (17 bytes) at path: " + path + " — use the file_read tool to read its contents]"
 	if resolved[0].Text != expected {
 		t.Errorf("file ref text mismatch:\ngot:  %q\nwant: %q", resolved[0].Text, expected)
+	}
+}
+
+func TestResolveContentBlocks_ImageFileRef(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "photo.png")
+	raw := []byte("fake-png-data")
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	blocks := []RequestContentBlock{
+		{Type: "file_ref", FilePath: path, Filename: "photo.png", ByteSize: int64(len(raw))},
+	}
+	resolved := resolveContentBlocks(blocks)
+	if len(resolved) != 2 {
+		t.Fatalf("expected 2 blocks, got %d", len(resolved))
+	}
+	if resolved[0].Type != "text" {
+		t.Fatalf("expected first block to be text, got %s", resolved[0].Type)
+	}
+	expectedText := "[User attached image: photo.png (" + strconv.Itoa(len(raw)) + " bytes) at path: " + path + " — the image is included inline below for vision. Use the path if a tool needs the original file.]"
+	if resolved[0].Text != expectedText {
+		t.Errorf("image file ref text mismatch:\ngot:  %q\nwant: %q", resolved[0].Text, expectedText)
+	}
+	if resolved[1].Type != "image" || resolved[1].Source == nil {
+		t.Fatalf("expected second block to be image, got %+v", resolved[1])
+	}
+	if resolved[1].Source.MediaType != "image/png" {
+		t.Fatalf("expected image/png, got %q", resolved[1].Source.MediaType)
+	}
+	if resolved[1].Source.Data != base64.StdEncoding.EncodeToString(raw) {
+		t.Errorf("image data mismatch: got %q", resolved[1].Source.Data)
 	}
 }
 

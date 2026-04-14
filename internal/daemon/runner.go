@@ -142,7 +142,7 @@ func resolveContentBlocks(blocks []RequestContentBlock) []client.ContentBlock {
 		case "document":
 			out = append(out, client.ContentBlock{Type: "document", Source: b.Source})
 		case "file_ref":
-			out = append(out, resolveFileRef(b))
+			out = append(out, resolveFileRef(b)...)
 		}
 	}
 	return out
@@ -154,10 +154,11 @@ var imageExtensions = map[string]string{
 	".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
 }
 
-// resolveFileRef returns the appropriate content block for a file_ref.
-// Images → base64 image block (vision API requires inline data).
+// resolveFileRef returns the appropriate content blocks for a file_ref.
+// Images → model-visible path hint plus base64 image block so the agent has
+// both a reusable file handle and inline vision access.
 // All other files → text hint with path so the agent reads via file_read tool.
-func resolveFileRef(b RequestContentBlock) client.ContentBlock {
+func resolveFileRef(b RequestContentBlock) []client.ContentBlock {
 	ext := strings.ToLower(filepath.Ext(b.Filename))
 
 	// Images must be inline base64 — Claude vision requires image data in the request body.
@@ -165,49 +166,56 @@ func resolveFileRef(b RequestContentBlock) client.ContentBlock {
 		info, err := os.Stat(b.FilePath)
 		if err != nil {
 			log.Printf("WARNING: failed to read attached image %s: %v", b.FilePath, err)
-			return client.ContentBlock{
+			return []client.ContentBlock{{
 				Type: "text",
 				Text: fmt.Sprintf("[Error: unable to read image %s]", b.Filename),
-			}
+			}}
 		}
 		const maxInlineImage = 20 * 1024 * 1024 // 20 MB
 		if info.Size() > maxInlineImage {
-			return client.ContentBlock{
+			return []client.ContentBlock{{
 				Type: "text",
-				Text: fmt.Sprintf("[User attached image: %s (%d bytes) — too large for inline vision (max %d bytes). Use file_read tool to view it.]",
-					b.Filename, info.Size(), maxInlineImage),
-			}
+				Text: fmt.Sprintf("[User attached image: %s (%d bytes) at path: %s — too large for inline vision (max %d bytes). Use file_read or another file-based tool with this path.]",
+					b.Filename, info.Size(), b.FilePath, maxInlineImage),
+			}}
 		}
 		data, err := os.ReadFile(b.FilePath)
 		if err != nil {
 			log.Printf("WARNING: failed to read attached image %s: %v", b.FilePath, err)
-			return client.ContentBlock{
+			return []client.ContentBlock{{
 				Type: "text",
 				Text: fmt.Sprintf("[Error: unable to read image %s]", b.Filename),
-			}
+			}}
 		}
 		encoded := base64.StdEncoding.EncodeToString(data)
-		return client.ContentBlock{
-			Type:   "image",
-			Source: &client.ImageSource{Type: "base64", MediaType: mimeType, Data: encoded},
+		return []client.ContentBlock{
+			{
+				Type: "text",
+				Text: fmt.Sprintf("[User attached image: %s (%d bytes) at path: %s — the image is included inline below for vision. Use the path if a tool needs the original file.]",
+					b.Filename, info.Size(), b.FilePath),
+			},
+			{
+				Type:   "image",
+				Source: &client.ImageSource{Type: "base64", MediaType: mimeType, Data: encoded},
+			},
 		}
 	}
 
 	// PDF files: file_read natively renders PDF pages as images for vision.
 	if ext == ".pdf" {
-		return client.ContentBlock{
+		return []client.ContentBlock{{
 			Type: "text",
 			Text: fmt.Sprintf("[User attached PDF: %s (%d bytes) at path: %s — use file_read to analyze (it renders PDF pages as images for vision). Use offset for start page, limit for max pages.]",
 				b.Filename, b.ByteSize, b.FilePath),
-		}
+		}}
 	}
 
 	// All other files: let the agent use file_read to access content on demand.
-	return client.ContentBlock{
+	return []client.ContentBlock{{
 		Type: "text",
 		Text: fmt.Sprintf("[User attached file: %s (%d bytes) at path: %s — use the file_read tool to read its contents]",
 			b.Filename, b.ByteSize, b.FilePath),
-	}
+	}}
 }
 
 // extractUserFilePaths collects file paths from file_ref content blocks.
@@ -490,14 +498,21 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// is available; it's cancelled once OnClose takes ownership.
 	var attachmentCleanup func()
 	var attachmentRegistered bool
+	defer func() {
+		if !attachmentRegistered && attachmentCleanup != nil {
+			attachmentCleanup()
+		}
+	}()
+	if len(req.Content) > 0 {
+		var inlineCleanup func()
+		req.Content, inlineCleanup = materializeInlineImageBlocks(deps.ShannonDir, req.Content)
+		attachmentCleanup = combineCleanup(attachmentCleanup, inlineCleanup)
+	}
 	if len(req.Files) > 0 {
 		var fileBlocks []RequestContentBlock
-		fileBlocks, attachmentCleanup = downloadRemoteFiles(deps.ShannonDir, req.Files)
-		defer func() {
-			if !attachmentRegistered && attachmentCleanup != nil {
-				attachmentCleanup()
-			}
-		}()
+		var remoteCleanup func()
+		fileBlocks, remoteCleanup = downloadRemoteFiles(deps.ShannonDir, req.Files)
+		attachmentCleanup = combineCleanup(attachmentCleanup, remoteCleanup)
 		req.Content = append(req.Content, fileBlocks...)
 		// Zero auth headers to prevent lingering tokens in memory.
 		for i := range req.Files {

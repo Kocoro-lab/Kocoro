@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 // skipURLValidation disables SSRF checks for httptest (loopback) URLs.
@@ -73,6 +76,61 @@ func TestDownloadRemoteFiles_WithAuth(t *testing.T) {
 
 	if gotAuth != "Bearer token123" {
 		t.Errorf("expected 'Bearer token123', got %q", gotAuth)
+	}
+}
+
+func TestMaterializeInlineImageBlocks_Success(t *testing.T) {
+	dir := t.TempDir()
+	raw := []byte("fake-png-data")
+	blocks, cleanup := materializeInlineImageBlocks(dir, []RequestContentBlock{
+		{Type: "text", Text: "describe this"},
+		{Type: "image", Source: &client.ImageSource{
+			Type:      "base64",
+			MediaType: "image/png",
+			Data:      base64.StdEncoding.EncodeToString(raw),
+		}},
+	})
+	defer func() {
+		if cleanup != nil {
+			cleanup()
+		}
+	}()
+
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks, got %d", len(blocks))
+	}
+	if blocks[0].Type != "text" || blocks[0].Text != "describe this" {
+		t.Fatalf("block 0 mismatch: %+v", blocks[0])
+	}
+	if blocks[1].Type != "file_ref" {
+		t.Fatalf("block 1: expected file_ref, got %s", blocks[1].Type)
+	}
+	if blocks[1].Filename != "attachment_0.png" {
+		t.Fatalf("expected generated filename attachment_0.png, got %q", blocks[1].Filename)
+	}
+	if blocks[1].ByteSize != int64(len(raw)) {
+		t.Fatalf("expected byte size %d, got %d", len(raw), blocks[1].ByteSize)
+	}
+	if !strings.HasPrefix(blocks[1].FilePath, filepath.Join(dir, "tmp", "attachments")) {
+		t.Fatalf("path %s escapes attachment dir", blocks[1].FilePath)
+	}
+
+	data, err := os.ReadFile(blocks[1].FilePath)
+	if err != nil {
+		t.Fatalf("failed to read materialized image: %v", err)
+	}
+	if string(data) != string(raw) {
+		t.Fatalf("materialized bytes mismatch: got %q want %q", string(data), string(raw))
+	}
+
+	attachmentDir := filepath.Dir(blocks[1].FilePath)
+	if cleanup == nil {
+		t.Fatal("expected cleanup function")
+	}
+	cleanup()
+	cleanup = nil
+	if _, err := os.Stat(attachmentDir); !os.IsNotExist(err) {
+		t.Fatalf("attachment dir should be removed after cleanup, got err: %v", err)
 	}
 }
 
