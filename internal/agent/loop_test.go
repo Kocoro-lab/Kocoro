@@ -2788,3 +2788,219 @@ func TestForceStop_EmptyResponseFallback(t *testing.T) {
 		t.Error("expected Partial=true for empty-response force-stop")
 	}
 }
+
+// TestBuildReanchorText_MergesPromptAndTextBlocks verifies the reanchor
+// builder concatenates the raw user prompt with every text block from the
+// current user turn, skips non-text blocks, and drops empty entries.
+func TestBuildReanchorText_MergesPromptAndTextBlocks(t *testing.T) {
+	cases := []struct {
+		name     string
+		message  string
+		blocks   []client.ContentBlock
+		expected string
+	}{
+		{
+			name:     "prompt only",
+			message:  "describe this",
+			blocks:   nil,
+			expected: "describe this",
+		},
+		{
+			name:    "prompt plus attachment hint and image",
+			message: "describe this",
+			blocks: []client.ContentBlock{
+				{Type: "text", Text: "[User attached image: tiny.png (84 bytes) at path: /tmp/att/0_tiny.png — the image is included inline below for vision.]"},
+				{Type: "image", Source: &client.ImageSource{Type: "base64", MediaType: "image/png", Data: "deadbeef"}},
+			},
+			expected: "describe this\n\n[User attached image: tiny.png (84 bytes) at path: /tmp/att/0_tiny.png — the image is included inline below for vision.]",
+		},
+		{
+			name:    "empty prompt with text block",
+			message: "   ",
+			blocks: []client.ContentBlock{
+				{Type: "text", Text: "fallback question"},
+			},
+			expected: "fallback question",
+		},
+		{
+			name:    "blank text blocks are skipped",
+			message: "hi",
+			blocks: []client.ContentBlock{
+				{Type: "text", Text: ""},
+				{Type: "text", Text: "  \n "},
+				{Type: "text", Text: "actual content"},
+			},
+			expected: "hi\n\nactual content",
+		},
+		{
+			name:    "non-blank whitespace inside content is preserved",
+			message: " prompt with  spaces ",
+			blocks: []client.ContentBlock{
+				{Type: "text", Text: "  indented hint  "},
+			},
+			expected: " prompt with  spaces \n\n  indented hint  ",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildReanchorText(tc.message, tc.blocks)
+			if got != tc.expected {
+				t.Errorf("buildReanchorText mismatch:\n got:  %q\n want: %q", got, tc.expected)
+			}
+		})
+	}
+}
+
+// TestAgentLoop_ReanchorPreservesAttachmentHint drives the tool_search reanchor
+// path with a multimodal user turn (prompt + attachment-hint text block +
+// image) and asserts the injected reanchor message surfaces the path hint so
+// the model can recover it across the boundary. Covers loop.go:1581 (tool
+// search loaded) which shares the boundaryText formatter with the retry and
+// post-compaction boundaries.
+func TestAgentLoop_ReanchorPreservesAttachmentHint(t *testing.T) {
+	var thirdReq client.CompletionRequest
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if callCount == 3 {
+			thirdReq = req
+		}
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("tool_search", `{"query":"select:browser_navigate"}`), 10, 5))
+		case 2:
+			// Model stops with text instead of using the loaded tools → reanchor fires.
+			json.NewEncoder(w).Encode(nativeResponse("Thinking...", "end_turn", nil, 10, 5))
+		case 3:
+			json.NewEncoder(w).Encode(nativeResponse("Done.", "end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	for _, name := range FamilyRegistry["browser"].Core {
+		reg.Register(&bulkyMockMCPTool{name: name})
+	}
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	hintText := "[User attached image: shot.png (84 bytes) at path: /tmp/att/0_shot.png — the image is included inline below for vision.]"
+	userContent := []client.ContentBlock{
+		{Type: "text", Text: hintText},
+		{Type: "image", Source: &client.ImageSource{Type: "base64", MediaType: "image/png", Data: "Zm9v"}},
+	}
+	result, _, err := loop.Run(context.Background(), "upload this image to chatgpt", userContent, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "Done." {
+		t.Fatalf("expected Done., got %q", result)
+	}
+
+	foundReanchor := false
+	for _, msg := range thirdReq.Messages {
+		if msg.Role != "user" || msg.Content.HasBlocks() {
+			continue
+		}
+		text := msg.Content.Text()
+		if !strings.Contains(text, "Deferred tool schemas are now loaded") {
+			continue
+		}
+		if !strings.Contains(text, "upload this image to chatgpt") {
+			t.Errorf("reanchor missing raw prompt, got: %q", text)
+		}
+		if !strings.Contains(text, "/tmp/att/0_shot.png") {
+			t.Errorf("reanchor missing attachment path hint, got: %q", text)
+		}
+		foundReanchor = true
+		break
+	}
+	if !foundReanchor {
+		t.Fatal("expected third request to include a reanchor message")
+	}
+}
+
+// TestAgentLoop_ReanchorAfterLLMRetryIncludesAttachmentHint covers the retry-
+// after-error boundary at internal/agent/loop.go:1413 directly: we force a
+// retryable 500 on the first LLM call, succeed on the retry, and assert the
+// injected reanchor message carries the attachment hint alongside the prompt.
+// This complements the tool_search-path coverage in
+// TestAgentLoop_ReanchorPreservesAttachmentHint, which exercises the same
+// formatter from a different caller.
+func TestAgentLoop_ReanchorAfterLLMRetryIncludesAttachmentHint(t *testing.T) {
+	var secondReq client.CompletionRequest
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// Force a retryable 500 — loop will reanchor and retry after a 1s backoff.
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if callCount == 2 {
+			secondReq = req
+			json.NewEncoder(w).Encode(nativeResponse("Done.", "end_turn", nil, 10, 5))
+			return
+		}
+		t.Errorf("unexpected LLM call %d", callCount)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	loop := NewAgentLoop(gw, NewToolRegistry(), "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	hintText := "[User attached image: shot.png (84 bytes) at path: /tmp/att/0_shot.png — the image is included inline below for vision.]"
+	userContent := []client.ContentBlock{
+		{Type: "text", Text: hintText},
+		{Type: "image", Source: &client.ImageSource{Type: "base64", MediaType: "image/png", Data: "Zm9v"}},
+	}
+	result, _, err := loop.Run(context.Background(), "upload this image to chatgpt", userContent, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "Done." {
+		t.Fatalf("expected Done., got %q", result)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected exactly 2 LLM calls (1 failure + 1 retry), got %d", callCount)
+	}
+
+	foundReanchor := false
+	for _, msg := range secondReq.Messages {
+		if msg.Role != "user" || msg.Content.HasBlocks() {
+			continue
+		}
+		text := msg.Content.Text()
+		if !strings.Contains(text, "retrying after an interruption") {
+			continue
+		}
+		if !strings.Contains(text, "upload this image to chatgpt") {
+			t.Errorf("retry reanchor missing raw prompt, got: %q", text)
+		}
+		if !strings.Contains(text, "/tmp/att/0_shot.png") {
+			t.Errorf("retry reanchor missing attachment path hint, got: %q", text)
+		}
+		foundReanchor = true
+		break
+	}
+	if !foundReanchor {
+		t.Fatal("expected retry request to include a reanchor message")
+	}
+}

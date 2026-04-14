@@ -935,7 +935,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		reactiveCompacted    bool   // true once reactive compaction fired (never resets)
 		summaryFailures      int    // consecutive summary failures; backs off after 3
 		toolSearchFired      bool
-		latestUserText       = userMessage // most recent real user request (not tool results or injected nudges)
+		latestUserText       = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
 		cloudNudgeFired      bool
 		cloudDelegateClaimed bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
 		cloudResultContent   string // non-empty when a cloud deliverable should bypass LLM summarization
@@ -2300,6 +2300,26 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 		return "ask", approved
 	}
 	return "allow", true
+}
+
+// buildReanchorText combines the raw user prompt with every text block from
+// the current user turn (e.g. resolved file_ref path hints). Non-text blocks
+// like images are skipped — the reanchor message is text-only. The result is
+// what boundary nudges ("retrying after an interruption", "context was
+// compacted") quote back to the model so the current request survives across
+// retries and compaction.
+func buildReanchorText(userMessage string, userContent []client.ContentBlock) string {
+	parts := make([]string, 0, 1+len(userContent))
+	if strings.TrimSpace(userMessage) != "" {
+		parts = append(parts, userMessage)
+	}
+	for _, b := range userContent {
+		if b.Type != "text" || strings.TrimSpace(b.Text) == "" {
+			continue
+		}
+		parts = append(parts, b.Text)
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // hasNonTextBlocks returns true if any block is not a text block (e.g., image).
