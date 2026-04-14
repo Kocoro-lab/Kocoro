@@ -290,6 +290,21 @@ func TestLoopDetector_WebFamily_ResultSigDedup(t *testing.T) {
 	}
 }
 
+func TestLoopDetector_WebFamily_AlternatingSearchFetchStillNudges(t *testing.T) {
+	ld := NewLoopDetector()
+
+	// Mixed web workflows should still nudge when alternating tools keep
+	// returning the same source and no new information is being gathered.
+	ld.Record("web_search", `{"query":"go tutorial official"}`, false, "", "go.dev", false)
+	ld.Record("web_fetch", `{"url":"https://go.dev/doc/tutorial"}`, false, "", "go.dev", false)
+	ld.Record("web_search", `{"query":"golang tutorial latest official"}`, false, "", "go.dev", false)
+
+	action, _ := ld.Check("web_search")
+	if action != LoopNudge {
+		t.Errorf("alternating web_search/web_fetch with the same result signature should nudge, got %v", action)
+	}
+}
+
 func TestLoopDetector_WebFamily_ForceStopAt7(t *testing.T) {
 	ld := NewLoopDetector()
 	// 7 web calls with same topic → force stop
@@ -886,5 +901,48 @@ func TestLoopDetector_SemiRepeatable_NonBashUnchanged(t *testing.T) {
 	action, _ := ld.Check("think")
 	if action != LoopNudge {
 		t.Errorf("8 think calls should nudge at generic threshold, got %v", action)
+	}
+}
+
+// TestLoopDetector_BrowserMultiToolFlowNoFalsePositive verifies that a
+// realistic mixed browser workflow does not trigger FamilyNoProgress just
+// because every call on the same page produces the same URL-only result
+// signature. Before the fix, navigate → click → click → upload on
+// chatgpt.com would emit a "same topic/UI action 3 times" nudge because
+// extractResultSignature collapses every browser-family call on that URL
+// to the same hash.
+func TestLoopDetector_BrowserMultiToolFlowNoFalsePositive(t *testing.T) {
+	ld := NewLoopDetector()
+
+	// All four calls return snapshots whose URL set boils down to
+	// https://chatgpt.com/ → identical result signatures.
+	sameResultSig := "https://chatgpt.com"
+	ld.Record("browser_navigate", `{"url":"https://chatgpt.com"}`, false, "", sameResultSig, false)
+	ld.Record("browser_click", `{"ref":"e120","element":"plus"}`, false, "", sameResultSig, false)
+	ld.Record("browser_click", `{"ref":"e513","element":"photos"}`, false, "", sameResultSig, false)
+	ld.Record("browser_file_upload", `{"paths":["/tmp/x.png"]}`, false, "", sameResultSig, false)
+
+	action, msg := ld.Check("browser_file_upload")
+	if action != LoopContinue {
+		t.Errorf("mixed browser workflow with unique tool names must not nudge, got %v (%q)", action, msg)
+	}
+}
+
+// TestLoopDetector_BrowserSameToolStillDetected guards the opposite case:
+// true repetition of the same browser tool on the same page should still
+// trip the detector. Ensures the same-name scoping doesn't break real-loop
+// detection.
+func TestLoopDetector_BrowserSameToolStillDetected(t *testing.T) {
+	ld := NewLoopDetector()
+	sameResultSig := "https://chatgpt.com"
+	// Two back-to-back identical calls hit the consecutive-duplicate
+	// detector at threshold 2 → nudge. A third would force-stop, which is
+	// also correct behavior but not what this test locks in.
+	for i := 0; i < 2; i++ {
+		ld.Record("browser_click", `{"ref":"e120","element":"plus"}`, false, "", sameResultSig, false)
+	}
+	action, _ := ld.Check("browser_click")
+	if action != LoopNudge {
+		t.Errorf("2 consecutive identical browser_click calls should nudge, got %v", action)
 	}
 }

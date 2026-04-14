@@ -310,6 +310,13 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			}
 		}
 
+		// Browser/gui families legitimately mix different tool names in one
+		// workflow (navigate → click → type → upload) while still sharing the
+		// same page URL/result signature. Scoping those families to the SAME
+		// tool name avoids false positives on healthy multi-step interaction.
+		// Web/search families keep the broader family-level counting so
+		// alternating search/fetch loops still nudge early.
+		scopeSameName := family == "browser" || family == "gui"
 		familyCount := 0
 		sameTopicCount := 0
 		sameResultCount := 0
@@ -318,6 +325,9 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 				continue
 			}
 			familyCount++
+			if scopeSameName && rec.Name != name {
+				continue
+			}
 			if latestTopic != "" && rec.TopicHash == latestTopic {
 				sameTopicCount++
 			}
