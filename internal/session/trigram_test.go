@@ -423,6 +423,31 @@ func TestTrigram_OperatorQueryWithShortCJK(t *testing.T) {
 	}
 }
 
+// TestLikeSnippet_TurkishCaseExpansion guards against the latent bug where
+// strings.ToLower("İ") becomes "i\u0307" (2 → 3 bytes), which would make the
+// byte-offset-based snippet machinery slice mid-rune on surrounding text.
+func TestLikeSnippet_TurkishCaseExpansion(t *testing.T) {
+	// "İ" appears before the match; naive byte-offset code could mis-slice.
+	content := "Proje İstanbul 登录 sonuç"
+	snip := likeSnippet(content, []string{"登录"})
+	if !strings.Contains(snip, ">>>登录<<<") {
+		t.Errorf("expected >>>登录<<< highlight, got %q", snip)
+	}
+}
+
+// TestLikeSnippet_EarliestMatch centres the snippet on whichever term matches
+// earliest so multi-term queries surface the relevant context instead of
+// always anchoring on the first term.
+func TestLikeSnippet_EarliestMatch(t *testing.T) {
+	content := "failed at startup before 登录 was ever tried"
+	// Query terms: 登录 (later) and failed (earlier). Snippet should centre
+	// on 'failed' since it appears first in content.
+	snip := likeSnippet(content, []string{"登录", "failed"})
+	if !strings.Contains(snip, ">>>failed<<<") {
+		t.Errorf("expected snippet centred on earliest term 'failed', got %q", snip)
+	}
+}
+
 func keys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

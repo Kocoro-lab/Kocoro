@@ -3,10 +3,12 @@ package session
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
@@ -298,9 +300,9 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 }
 
 // splitQueryTerms breaks a query into whitespace-separated terms, keeping
-// quoted phrases (single-quoted or double-quoted) as one term with the quotes
-// stripped. Punctuation outside quotes is left attached to the term; we only
-// care about grouping for the short-term detection.
+// double-quoted phrases as one term with the surrounding quotes stripped.
+// Punctuation outside quotes is left attached to the term; we only care
+// about grouping for the short-term detection.
 func splitQueryTerms(q string) []string {
 	var terms []string
 	var cur strings.Builder
@@ -382,7 +384,9 @@ func (idx *Index) searchLike(terms []string, limit int) ([]SearchResult, error) 
 		}
 		r.CreatedAt = parseTime(createdStr)
 		// Snippet around the first term match; fall back to the first term.
-		r.Snippet = likeSnippet(content, terms[0])
+		// Centre the snippet on the earliest matching term so the user can
+		// see why the result matched when their query had multiple terms.
+		r.Snippet = likeSnippet(content, terms)
 		results = append(results, r)
 	}
 	return results, rows.Err()
@@ -419,7 +423,11 @@ func (idx *Index) Rebuild(store *Store) error {
 		id := strings.TrimSuffix(e.Name(), ".json")
 		sess, err := store.Load(id)
 		if err != nil {
-			continue // skip corrupt files
+			// Skip unreadable files so one bad session doesn't block the
+			// whole rebuild. Log so the user has breadcrumbs if search
+			// misses a session after migration.
+			log.Printf("session.Rebuild: skip %s: %v", id, err)
+			continue
 		}
 		if err := idx.UpsertSession(sess); err != nil {
 			return fmt.Errorf("index session %s: %w", id, err)
@@ -460,50 +468,113 @@ func parseTime(s string) time.Time {
 	return t
 }
 
-// likeSnippet produces a short context window around the first case-insensitive
-// occurrence of query in content, wrapping the match with >>>…<<<. Used by the
-// LIKE fallback path (short CJK queries) where FTS5's native snippet() is not
-// available.
-func likeSnippet(content, query string) string {
+// likeSnippet produces a short context window around the earliest match of
+// any term in content, wrapping the matched range with >>>…<<<. Used by the
+// LIKE fallback path (short CJK queries) where FTS5's native snippet() is
+// not available.
+//
+// Matching is case-insensitive and operates on rune slices end-to-end so it
+// stays correct for codepoints whose byte length changes under ToLower
+// (e.g. Turkish "İ" → "i\u0307").
+func likeSnippet(content string, terms []string) string {
 	const window = 40
-	if content == "" || query == "" {
-		return content
+	if content == "" || len(terms) == 0 {
+		return truncateRunes(content, window*2)
 	}
-	lower := strings.ToLower(content)
-	q := strings.ToLower(query)
-	idx := strings.Index(lower, q)
-	if idx < 0 {
-		runes := []rune(content)
-		if len(runes) > window*2 {
-			return string(runes[:window*2]) + "..."
+
+	contentRunes := []rune(content)
+	contentLower := make([]rune, len(contentRunes))
+	for i, r := range contentRunes {
+		contentLower[i] = toLowerRune(r)
+	}
+
+	// Find earliest match across all non-empty terms.
+	bestStart, bestLen := -1, 0
+	for _, t := range terms {
+		if t == "" {
+			continue
 		}
-		return content
+		qRunes := []rune(t)
+		qLower := make([]rune, len(qRunes))
+		for i, r := range qRunes {
+			qLower[i] = toLowerRune(r)
+		}
+		start := indexRune(contentLower, qLower)
+		if start < 0 {
+			continue
+		}
+		if bestStart < 0 || start < bestStart {
+			bestStart = start
+			bestLen = len(qLower)
+		}
 	}
-	// Expand window in runes for CJK safety.
-	startRune := utf8.RuneCountInString(content[:idx])
-	endRune := startRune + utf8.RuneCountInString(content[idx:idx+len(query)])
-	runes := []rune(content)
-	left := startRune - window
+
+	if bestStart < 0 {
+		return truncateRunes(content, window*2)
+	}
+
+	end := bestStart + bestLen
+	left := bestStart - window
 	if left < 0 {
 		left = 0
 	}
-	right := endRune + window
-	if right > len(runes) {
-		right = len(runes)
+	right := end + window
+	if right > len(contentRunes) {
+		right = len(contentRunes)
 	}
 	var b strings.Builder
 	if left > 0 {
 		b.WriteString("...")
 	}
-	b.WriteString(string(runes[left:startRune]))
+	b.WriteString(string(contentRunes[left:bestStart]))
 	b.WriteString(">>>")
-	b.WriteString(string(runes[startRune:endRune]))
+	b.WriteString(string(contentRunes[bestStart:end]))
 	b.WriteString("<<<")
-	b.WriteString(string(runes[endRune:right]))
-	if right < len(runes) {
+	b.WriteString(string(contentRunes[end:right]))
+	if right < len(contentRunes) {
 		b.WriteString("...")
 	}
 	return b.String()
+}
+
+// toLowerRune lowercases a single rune via unicode.ToLower, which is a 1:1
+// mapping and therefore safe for the fixed-rune-count snippet window. Unlike
+// strings.ToLower on the full string, it never expands a rune (e.g. Turkish
+// "İ" stays as one rune rather than becoming "i\u0307"), so byte-offset
+// drift between the lowercased and original strings cannot happen.
+func toLowerRune(r rune) rune {
+	return unicode.ToLower(r)
+}
+
+// indexRune returns the index of sub in s, or -1. Both args are rune slices.
+func indexRune(s, sub []rune) int {
+	if len(sub) == 0 {
+		return 0
+	}
+	if len(sub) > len(s) {
+		return -1
+	}
+	for i := 0; i <= len(s)-len(sub); i++ {
+		match := true
+		for j, r := range sub {
+			if s[i+j] != r {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+func truncateRunes(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "..."
 }
 
 func isFTSSyntaxError(err error) bool {
