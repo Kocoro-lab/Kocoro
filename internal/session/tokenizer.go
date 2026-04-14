@@ -4,10 +4,13 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-ego/gse"
 	"github.com/ikawaha/kagome-dict/ipa"
 	kagome "github.com/ikawaha/kagome/v2/tokenizer"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/session/dictdata"
 )
 
 // TokenizerVersion is bumped whenever the tokenization pipeline or the
@@ -17,10 +20,12 @@ import (
 //
 // Version history:
 //
-//	2 — introduced CJK tokenization (gse + kagome) and the `original` column.
-//	3 — forces re-migration for DBs that were incorrectly stamped as v2 by a
-//	    build where the migration branch silently skipped when stored==0,
-//	    leaving the pre-CJK messages schema in place.
+//	2 — intended to introduce CJK tokenization (gse + kagome) and the
+//	    `original` column. Never released to users; an early build
+//	    silently skipped the migration when stored==0, leaving pre-CJK
+//	    schema in place while stamping user_version=2.
+//	3 — current. Forces re-migration for any DB stamped as v2 by that
+//	    earlier build.
 const TokenizerVersion = 3
 
 var (
@@ -35,8 +40,13 @@ var (
 
 func getGse() *gse.Segmenter {
 	gseSegOnce.Do(func() {
-		s, err := gse.NewEmbed("zh")
-		if err != nil {
+		var s gse.Segmenter
+		// Load Chinese dict from our own compressed embed (dictdata package)
+		// instead of gse's built-in NewEmbed, which unconditionally embeds a
+		// 23 MB Japanese dictionary we don't use. Build with -tags ne to
+		// exclude gse's embed; our dictdata provides only the zh data (~3 MB
+		// compressed, ~8 MB decompressed).
+		if err := s.LoadDictStr(dictdata.ZhDict()); err != nil {
 			gseErr = err
 			return
 		}
@@ -57,6 +67,9 @@ func getKagome() *kagome.Tokenizer {
 		}
 		kagomeTnz = t
 	})
+	if kagomeErr != nil {
+		return nil
+	}
 	return kagomeTnz
 }
 
@@ -78,19 +91,30 @@ func Tokenize(text string) string {
 	for i < len(runes) {
 		r := runes[i]
 		switch classify(r) {
-		case runeJapanese:
+		case runeJapanese, runeChinese:
+			// Greedy CJK run: absorb both Han ideographs and kana so
+			// kanji compounds inside Japanese sentences (e.g. 機械学習 in
+			// 機械学習の原理) stay with kagome instead of being handed to
+			// the Chinese segmenter. The presence of any kana in the run
+			// flips routing to Japanese; pure-Han runs go to Chinese.
 			j := i + 1
-			for j < len(runes) && classify(runes[j]) == runeJapanese {
+			hasKana := classify(r) == runeJapanese
+			for j < len(runes) {
+				c := classify(runes[j])
+				if c != runeChinese && c != runeJapanese {
+					break
+				}
+				if c == runeJapanese {
+					hasKana = true
+				}
 				j++
 			}
-			appendTokens(&b, tokenizeJapanese(string(runes[i:j])))
-			i = j
-		case runeChinese:
-			j := i + 1
-			for j < len(runes) && classify(runes[j]) == runeChinese {
-				j++
+			seg := string(runes[i:j])
+			if hasKana {
+				appendTokens(&b, tokenizeJapanese(seg))
+			} else {
+				appendTokens(&b, tokenizeChinese(seg))
 			}
-			appendTokens(&b, tokenizeChinese(string(runes[i:j])))
 			i = j
 		case runeSpace:
 			b.WriteRune(' ')
@@ -109,7 +133,7 @@ func Tokenize(text string) string {
 			i = j
 		}
 	}
-	return b.String()
+	return strings.TrimRight(b.String(), " ")
 }
 
 type runeClass int
@@ -130,14 +154,23 @@ func classify(r rune) runeClass {
 		return runeJapanese
 	}
 	// CJK Unified Ideographs (Han). Shared between Chinese and Japanese;
-	// we route pure-Han runs through gse. Mixed runs with kana already got
-	// pulled into the Japanese segment above because kana neighbors them.
+	// Tokenize() greedily absorbs adjacent kana into the same segment and
+	// routes the whole thing through kagome when any kana is present.
 	if r >= 0x4E00 && r <= 0x9FFF {
 		return runeChinese
 	}
 	// CJK Extension A
 	if r >= 0x3400 && r <= 0x4DBF {
 		return runeChinese
+	}
+	// CJK Compatibility Ideographs — common in real text (e.g. some
+	// proper nouns), so route them through Han segmentation.
+	if r >= 0xF900 && r <= 0xFAFF {
+		return runeChinese
+	}
+	// Halfwidth Katakana (legacy Japanese encodings).
+	if r >= 0xFF65 && r <= 0xFF9F {
+		return runeJapanese
 	}
 	return runeOther
 }
@@ -168,7 +201,7 @@ func tokenizeJapanese(s string) []string {
 }
 
 func runeTokens(s string) []string {
-	out := make([]string, 0, len([]rune(s)))
+	out := make([]string, 0, utf8.RuneCountInString(s))
 	for _, r := range s {
 		out = append(out, string(r))
 	}

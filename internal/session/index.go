@@ -219,11 +219,24 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 	// unless the user is using FTS5 operators (quotes, AND/OR/NOT, *).
 	// Otherwise CJK queries like "机器学习" would be one token that never
 	// matches the segmented index.
+	//
+	// For CJK queries, a tokenizer mismatch can occur: the query might be
+	// pure Han (→ gse) while the indexed content was in a Japanese sentence
+	// (→ kagome), producing different tokens for the same kanji compound.
+	// We handle this by searching for both the tokenized form (segmented
+	// terms joined with implicit AND) and the original compound form
+	// (quoted phrase via FTS5 OR), so hits are found regardless of which
+	// segmenter created the indexed tokens.
 	ftsQuery := query
 	if !hasFTSOperator(query) {
-		ftsQuery = Tokenize(query)
-		if strings.TrimSpace(ftsQuery) == "" {
+		tokenized := Tokenize(query)
+		if strings.TrimSpace(tokenized) == "" {
 			return nil, nil
+		}
+		if containsCJK(query) && tokenized != query {
+			ftsQuery = fmt.Sprintf(`(%s) OR "%s"`, tokenized, query)
+		} else {
+			ftsQuery = tokenized
 		}
 	}
 

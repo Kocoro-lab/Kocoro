@@ -5,6 +5,8 @@ builds:
     binary: shan
     env:
       - CGO_ENABLED=0
+    flags:
+      - -tags=ne
     ldflags:
       - -s -w -X github.com/Kocoro-lab/ShanClaw/cmd.Version={{.Version}}
     goos:

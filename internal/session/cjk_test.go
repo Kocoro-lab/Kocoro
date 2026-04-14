@@ -238,6 +238,30 @@ func TestIndex_VersionGateTriggersRebuild(t *testing.T) {
 	if !empty {
 		t.Error("expected index to be empty after version gate dropped tables")
 	}
+
+	// End-to-end: Rebuild from JSON should restore searchability.
+	store := &Store{dir: dir, index: idx2}
+	if err := store.Save(&Session{
+		ID: "v-1", Title: "v", CreatedAt: now, UpdatedAt: now,
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("alpha content")},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx2.Rebuild(store); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	results, err := idx2.Search("alpha", 20)
+	if err != nil {
+		t.Fatalf("Search after rebuild: %v", err)
+	}
+	if len(results) == 0 || results[0].SessionID != "v-1" {
+		t.Errorf("expected to find session v-1 after rebuild, got %+v", results)
+	}
+	if idx2.NeedsRebuild() {
+		t.Error("expected NeedsRebuild false after Rebuild completes")
+	}
 }
 
 // openRaw opens the sessions.db without the version gate logic (for tests).
