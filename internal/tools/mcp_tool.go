@@ -131,6 +131,7 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 		return agent.ToolResult{Content: fmt.Sprintf("MCP call failed: %v", err), IsError: true}, nil
 	}
 
+	content = normalizeMCPResult(t.serverName, t.tool.Name, content, isError)
 	return agent.ToolResult{Content: content, IsError: isError}, nil
 }
 

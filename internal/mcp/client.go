@@ -169,6 +169,11 @@ func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerC
 			return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 		}
 		c = mcpclient.NewClient(httpTransport, clientOpts...)
+		// Client.Start wires up the bidirectional request handler so
+		// server-initiated calls (e.g. roots/list from playwright-mcp) reach
+		// our RootsHandler. Skipping this step leaves the capability
+		// advertised but functionally dead — the server sends roots/list,
+		// the transport has no handler, and requests silently drop.
 		if err := c.Start(ctx); err != nil {
 			return nil, fmt.Errorf("failed to start HTTP client: %w", err)
 		}
@@ -178,10 +183,21 @@ func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerC
 		}
 		envSlice := buildEnvSlice(cfg.Env)
 		stdioTransport := transport.NewStdioWithOptions(cfg.Command, envSlice, cfg.Args)
-		if err := stdioTransport.Start(ctx); err != nil {
+		// Spawn the subprocess with a never-expiring context so the MCP
+		// server survives after ConnectAll's short timeout returns — the
+		// subprocess is bound to this context via exec.CommandContext.
+		// Matches NewStdioMCPClient upstream which uses context.Background.
+		if err := stdioTransport.Start(context.Background()); err != nil {
 			return nil, fmt.Errorf("failed to start MCP server %q: %w", cfg.Command, err)
 		}
 		c = mcpclient.NewClient(stdioTransport, clientOpts...)
+		// Client.Start is idempotent on the transport (stdio guards on its
+		// `started` flag) but unconditionally wires SetRequestHandler on the
+		// bidirectional transport. Without this call, server-initiated
+		// requests like roots/list never reach our handler.
+		if err := c.Start(ctx); err != nil {
+			return nil, fmt.Errorf("failed to wire MCP client %q: %w", name, err)
+		}
 	}
 
 	// Initialize handshake
