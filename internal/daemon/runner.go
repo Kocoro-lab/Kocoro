@@ -75,8 +75,8 @@ type RunAgentRequest struct {
 
 // Validate checks that the request has the minimum required fields.
 func (r *RunAgentRequest) Validate() error {
-	if strings.TrimSpace(r.Text) == "" {
-		return fmt.Errorf("text is required")
+	if strings.TrimSpace(r.Text) == "" && len(r.Content) == 0 {
+		return fmt.Errorf("text or content is required")
 	}
 	if r.Agent != "" {
 		if err := agents.ValidateAgentName(r.Agent); err != nil {

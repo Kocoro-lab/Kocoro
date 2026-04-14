@@ -1739,3 +1739,80 @@ func TestStripRedactedSecrets(t *testing.T) {
 		})
 	}
 }
+
+func TestServer_EditMessage_Validation(t *testing.T) {
+	shannonDir := t.TempDir()
+	deps := &ServerDeps{
+		ShannonDir:   shannonDir,
+		SessionCache: NewSessionCache(shannonDir),
+	}
+	srv := &Server{deps: deps}
+
+	tests := []struct {
+		name       string
+		sessionID  string
+		body       string
+		wantStatus int
+		wantErr    string
+	}{
+		{
+			name:       "empty new_content and no content blocks",
+			sessionID:  "test-session",
+			body:       `{"message_index":0,"new_content":""}`,
+			wantStatus: http.StatusBadRequest,
+			wantErr:    "new_content or content is required",
+		},
+		{
+			name:       "empty new_content with content blocks passes validation",
+			sessionID:  "nonexistent",
+			body:       `{"message_index":0,"new_content":"","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]}`,
+			wantStatus: http.StatusBadRequest,
+			wantErr:    "no such file or directory",
+		},
+		{
+			name:       "valid new_content only passes validation",
+			sessionID:  "nonexistent",
+			body:       `{"message_index":0,"new_content":"hello"}`,
+			wantStatus: http.StatusBadRequest,
+			wantErr:    "no such file or directory",
+		},
+		{
+			name:       "valid new_content with content blocks passes validation",
+			sessionID:  "nonexistent",
+			body:       `{"message_index":0,"new_content":"analyze this","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]}`,
+			wantStatus: http.StatusBadRequest,
+			wantErr:    "no such file or directory",
+		},
+		{
+			name:       "missing session id",
+			sessionID:  "",
+			body:       `{"message_index":0,"new_content":"hello"}`,
+			wantStatus: http.StatusBadRequest,
+			wantErr:    "session id required",
+		},
+		{
+			name:       "invalid agent name",
+			sessionID:  "test-session",
+			body:       `{"message_index":0,"new_content":"hello","agent":"../evil"}`,
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/sessions/"+tc.sessionID+"/edit", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			req.SetPathValue("id", tc.sessionID)
+
+			srv.handleEditMessage(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d, body = %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantErr != "" && !strings.Contains(rec.Body.String(), tc.wantErr) {
+				t.Errorf("body = %q, want substring %q", rec.Body.String(), tc.wantErr)
+			}
+		})
+	}
+}
