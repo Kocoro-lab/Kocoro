@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -85,12 +86,24 @@ func (p TurnPhase) CountsAsIdle() bool {
 //   - Enter() (top-level) panics if called while a transient is open,
 //     because that would silently orphan the transient's restore. Again,
 //     test-mode panic / production log.
+//   - Any structural violation also sets `invalid`. Observers (e.g. the
+//     watchdog) check Invalid() and silently disable themselves for the
+//     rest of the run, rather than acting on untrustworthy phase data.
 type phaseTracker struct {
 	mu             sync.RWMutex
 	phase          TurnPhase
 	since          time.Time
 	dirty          bool
 	transientDepth int
+	// seq increments on every successful Enter/EnterTransient (and on
+	// restore). Observers use it to dedup soft-status firings by transition
+	// rather than by phase type, so `AwaitingLLM → RetryingLLM → AwaitingLLM`
+	// re-arms cleanly instead of silently suppressing the second soft event.
+	seq int64
+	// invalid is set by any structural violation (forgotten transient,
+	// Enter-inside-transient). Observers must check Invalid() and disable
+	// themselves for the rest of the run when set.
+	invalid atomic.Bool
 }
 
 func newPhaseTracker() *phaseTracker {
@@ -106,15 +119,17 @@ func (t *phaseTracker) Enter(p TurnPhase) {
 		prev := t.phase
 		depth := t.transientDepth
 		t.mu.Unlock()
-		phaseAssertViolation(fmt.Sprintf(
+		t.reportViolation(fmt.Sprintf(
 			"Enter(%s) called while transient is active (depth=%d, current=%s). "+
 				"Use EnterTransient or restore first.", p, depth, prev))
 		// In non-strict mode (logged), fall through and do the transition
-		// anyway so production keeps moving. Re-acquire the lock.
+		// anyway so production keeps moving. The invalid flag is already
+		// set so observers will disable themselves. Re-acquire the lock.
 		t.mu.Lock()
 	}
 	t.phase = p
 	t.since = time.Now()
+	t.seq++
 	t.mu.Unlock()
 }
 
@@ -135,6 +150,7 @@ func (t *phaseTracker) EnterTransient(p TurnPhase) func() {
 	prevSince := t.since
 	t.phase = p
 	t.since = time.Now()
+	t.seq++
 	t.transientDepth++
 	t.mu.Unlock()
 
@@ -144,19 +160,28 @@ func (t *phaseTracker) EnterTransient(p TurnPhase) func() {
 			t.mu.Lock()
 			t.phase = prev
 			t.since = prevSince
+			t.seq++
 			t.transientDepth--
 			t.mu.Unlock()
 		})
 	}
 }
 
-// Current returns the current phase and the duration since it was last
-// entered. Safe from any goroutine (uses the read lock).
-func (t *phaseTracker) Current() (TurnPhase, time.Duration) {
+// Current returns the current phase, the duration since it was last
+// entered, and a monotonically increasing transition sequence number.
+// Observers use (phase, seq) as the identity of an idle phase instance:
+// the same TurnPhase reentered twice produces two different seq values,
+// so a watchdog can re-arm its soft-status fire on re-entry.
+// Safe from any goroutine (uses the read lock).
+func (t *phaseTracker) Current() (TurnPhase, time.Duration, int64) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.phase, time.Since(t.since)
+	return t.phase, time.Since(t.since), t.seq
 }
+
+// Invalid reports whether the tracker has recorded a structural violation
+// during this run. Observers should disable themselves when this is true.
+func (t *phaseTracker) Invalid() bool { return t.invalid.Load() }
 
 // MarkDirty signals that the current phase produced durable state the
 // checkpoint hook should persist. Cleared by TakeDirty().
@@ -183,7 +208,7 @@ func (t *phaseTracker) AssertClean() {
 	phase := t.phase
 	t.mu.RUnlock()
 	if depth != 0 {
-		phaseAssertViolation(fmt.Sprintf(
+		t.reportViolation(fmt.Sprintf(
 			"pending transient at Run() exit: depth=%d, stuck_in=%s", depth, phase))
 	}
 }
@@ -192,13 +217,14 @@ func (t *phaseTracker) AssertClean() {
 // Enable with SHANNON_PHASE_STRICT=1 for diagnostic runs.
 var phaseStrictMode = os.Getenv("SHANNON_PHASE_STRICT") == "1"
 
-// phaseAssertViolation is the single choke point for structural phase
-// violations. Panics under `go test` (via testing.Testing()) or when
-// SHANNON_PHASE_STRICT=1, logs otherwise. This keeps production resilient
-// while ensuring tests and dogfood sessions catch the bug immediately.
-func phaseAssertViolation(msg string) {
+// reportViolation is the single choke point for structural phase
+// violations. It always marks the tracker invalid (so observers disable
+// themselves for the rest of the run). Panics under `go test` (via
+// testing.Testing()) or when SHANNON_PHASE_STRICT=1; logs otherwise.
+func (t *phaseTracker) reportViolation(msg string) {
+	t.invalid.Store(true)
 	if testing.Testing() || phaseStrictMode {
 		panic("phaseTracker: " + msg)
 	}
-	fmt.Fprintf(os.Stderr, "[phase] WARN %s\n", msg)
+	fmt.Fprintf(os.Stderr, "[phase] WARN %s (tracker disabled for rest of run)\n", msg)
 }

@@ -824,6 +824,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetTemperature(runCfg.Agent.Temperature)
 	loop.SetContextWindow(runCfg.Agent.ContextWindow)
 	loop.SetEnableStreaming(false)
+	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
 	if agentOverride != nil {
 		scopedMCPCtx := tools.ResolveMCPContext(runCfg, agentOverride)

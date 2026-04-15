@@ -357,6 +357,9 @@ type AgentLoop struct {
 	// their phase, not by manual suspend bookkeeping.
 	idleSoftTimeout time.Duration
 	idleHardTimeout time.Duration
+	// watchdogTick overrides the default 1s tick for tests. Production
+	// should leave this zero.
+	watchdogTick time.Duration
 
 	// checkpointFn is fired mid-turn at specific phase-exit boundaries
 	// (after a tool batch, after successful reactive compaction, before
@@ -403,6 +406,22 @@ func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, sh
 
 func (a *AgentLoop) SetHandler(h EventHandler) {
 	a.handler = h
+}
+
+// SetIdleTimeouts configures the per-run watchdog. Zero disables that
+// threshold individually. Typical defaults (soft=90s, hard=0) keep the
+// watchdog in visibility-only mode.
+func (a *AgentLoop) SetIdleTimeouts(softSecs, hardSecs int) {
+	if softSecs > 0 {
+		a.idleSoftTimeout = time.Duration(softSecs) * time.Second
+	} else {
+		a.idleSoftTimeout = 0
+	}
+	if hardSecs > 0 {
+		a.idleHardTimeout = time.Duration(hardSecs) * time.Second
+	} else {
+		a.idleHardTimeout = 0
+	}
 }
 
 func (a *AgentLoop) SetModelTier(tier string) {
@@ -690,6 +709,37 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		a.tracker.AssertClean()
 	}()
 	a.tracker.Enter(PhaseSetup)
+
+	// Turn-level watchdog. Hard=0 keeps production in visibility-only mode:
+	// soft status events flow to any RunStatusHandler on the handler, hard
+	// cancellation is off until we flip defaults after dogfood. Using
+	// WithCancelCause so context.Cause(ctx) carries ErrHardIdleTimeout when
+	// the watchdog does fire, letting callers distinguish from user cancel.
+	ctx, cancelCause := context.WithCancelCause(ctx)
+	defer cancelCause(nil)
+	watchdogTick := a.watchdogTick
+	if watchdogTick <= 0 {
+		watchdogTick = defaultWatchdogTick
+	}
+	stopWatchdog := runWatchdogWithTick(ctx, a.tracker,
+		a.idleSoftTimeout, a.idleHardTimeout, watchdogTick,
+		func(phase TurnPhase, idle time.Duration) {
+			if rs, ok := a.handler.(RunStatusHandler); ok {
+				rs.OnRunStatus("idle_soft",
+					fmt.Sprintf("no LLM activity for %s (phase=%s)",
+						idle.Round(time.Second), phase))
+			}
+		},
+		func(phase TurnPhase, idle time.Duration) {
+			if rs, ok := a.handler.(RunStatusHandler); ok {
+				rs.OnRunStatus("idle_hard",
+					fmt.Sprintf("cancelling after %s idle (phase=%s)",
+						idle.Round(time.Second), phase))
+			}
+		},
+		cancelCause,
+	)
+	defer stopWatchdog()
 
 	if a.workingSet == nil {
 		a.workingSet = NewWorkingSet()
@@ -1361,6 +1411,15 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					stampMessage()
 				}
 				captureRunMessages()
+				// Distinguish watchdog hard-timeout from user-initiated cancel.
+				// ErrHardIdleTimeout is attached via context.WithCancelCause at
+				// Run() entry. Treat hard-timeout as a soft failure (partial=true)
+				// so consumers can render a non-error "timed out, here's what we
+				// have" hint, matching the loop-detector ForceStop UX.
+				if errors.Is(context.Cause(ctx), ErrHardIdleTimeout) {
+					setRunStatus(runstatus.CodeDeadlineExceeded, true)
+					return partial, usage, fmt.Errorf("turn aborted: %w", ErrHardIdleTimeout)
+				}
 				setRunStatus(runstatus.CodeFromError(ctx.Err()), false)
 				return partial, usage, fmt.Errorf("LLM call cancelled: %w", ctx.Err())
 			}
