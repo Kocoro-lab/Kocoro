@@ -939,25 +939,20 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		sessMgr.OnClose(attachmentCleanup)
 	}
 
-	// Mid-turn checkpoint: after each tool batch / reactive compaction /
-	// pre-ForceStop boundary inside AgentLoop.Run, rebuild the session
-	// transcript from loop.RunMessages() and Save. Idempotent (rebuilds
-	// from snapshot, never diff-appends) and 2s-debounced to avoid
-	// thrashing sessions.db during tool-heavy turns.
-	baselineMsgCount := len(sess.Messages)
-	baselineMetaCount := len(sess.MessageMeta)
+	// Turn persistence: capture the session state at turn start so both the
+	// mid-turn checkpoint hook and the post-turn final save can rebuild
+	// messages + usage idempotently from (baseline + current loop state).
+	// This is the single source of truth — no append-on-top anywhere in
+	// the turn's persistence path, which would otherwise double-write any
+	// transcript that crossed a checkpoint boundary.
 	checkpointSource := req.Source
 	if checkpointSource == "" {
 		checkpointSource = "unknown"
 	}
-	var lastCheckpointAt time.Time
+	turnBase := captureTurnBaseline(sess, checkpointSource, preLoopUserAppended)
+	loop.SetCheckpointMinInterval(2 * time.Second) // debounce in the loop, not here
 	loop.SetCheckpointFunc(func(ctx context.Context) {
-		if time.Since(lastCheckpointAt) < 2*time.Second {
-			return
-		}
-		lastCheckpointAt = time.Now()
-		applyRunMessagesToSession(sess, loop, checkpointSource,
-			baselineMsgCount, baselineMetaCount, preLoopUserAppended)
+		applyTurnState(sess, loop, handler, turnBase)
 		sess.InProgress = true
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: mid-turn checkpoint save failed: %v", err)
@@ -1038,48 +1033,28 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			}
 		}
 
-		// Append the turn to the session and persist.
-		// Prefer full conversation messages (including tool_use/tool_result turns)
-		// from RunMessages() so resumed sessions give the LLM tool-call evidence.
-		// Falls back to flat text if RunMessages() is empty (early LLM error).
-		source := req.Source
-		if source == "" {
-			source = "unknown"
-		}
-		runMsgs := loop.RunMessages()
-		runInjected := loop.RunMessageInjected()
-		runTimestamps := loop.RunMessageTimestamps()
-		if len(runMsgs) > 0 {
-			// RunMessages includes: [user prompt, assistant+tool_use, tool_result, ..., final assistant].
-			// If the user message was already appended pre-loop, skip the first
-			// message from runMsgs (same user prompt) to avoid duplication.
-			startIdx := 0
-			if preLoopUserAppended && len(runMsgs) > 0 && runMsgs[0].Role == "user" {
-				startIdx = 1
-			}
-			fallbackTime := time.Now()
-			for i, msg := range runMsgs[startIdx:] {
-				idx := i + startIdx
-				ts := fallbackTime
-				if idx < len(runTimestamps) && !runTimestamps[idx].IsZero() {
-					ts = runTimestamps[idx]
-				}
-				sess.Messages = append(sess.Messages, msg)
-				meta := session.MessageMeta{Source: source, Timestamp: session.TimePtr(ts)}
-				if idx < len(runInjected) && runInjected[idx] {
-					meta.SystemInjected = true
-				}
-				sess.MessageMeta = append(sess.MessageMeta, meta)
-			}
+		// Final save uses the same (baseline + current snapshot) rebuild as
+		// mid-turn checkpoints, so a turn that produced checkpoints never
+		// gets its transcript double-written here.
+		if len(loop.RunMessages()) > 0 {
+			applyTurnMessages(sess, loop, turnBase)
 		} else {
-			// Fallback: flat text (early error or no messages accumulated).
+			// Fallback: flat text (early LLM error with nothing accumulated).
+			// Truncate to baseline first so this path is also idempotent
+			// under the (unusual) case where a prior checkpoint ran.
+			if len(sess.Messages) > turnBase.msgCount {
+				sess.Messages = sess.Messages[:turnBase.msgCount]
+			}
+			if len(sess.MessageMeta) > turnBase.metaCount {
+				sess.MessageMeta = sess.MessageMeta[:turnBase.metaCount]
+			}
 			if !preLoopUserAppended {
 				fallbackContent := buildUserMsgContent(prompt, resolvedContent)
 				sess.Messages = append(sess.Messages,
 					client.Message{Role: "user", Content: fallbackContent},
 				)
 				sess.MessageMeta = append(sess.MessageMeta,
-					session.MessageMeta{Source: source, Timestamp: session.TimePtr(userMsgTime)},
+					session.MessageMeta{Source: checkpointSource, Timestamp: session.TimePtr(userMsgTime)},
 				)
 			}
 			replyTime := time.Now()
@@ -1087,25 +1062,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				client.Message{Role: "assistant", Content: client.NewTextContent(result)},
 			)
 			sess.MessageMeta = append(sess.MessageMeta,
-				session.MessageMeta{Source: source, Timestamp: session.TimePtr(replyTime)},
+				session.MessageMeta{Source: checkpointSource, Timestamp: session.TimePtr(replyTime)},
 			)
 		}
-		// Fold handler-accumulated usage (direct LLM + cloud_delegate + tool
-		// billing) into session totals before persisting. LLM and tool costs
-		// are stored in separate fields so the session JSON preserves the
-		// input+output==total_tokens invariant on the LLM side.
-		if up, ok := handler.(agent.UsageProvider); ok {
-			acc := up.Usage()
-			llm := acc.LLM
-			if llm.LLMCalls > 0 || acc.ToolCalls > 0 || llm.InputTokens > 0 {
-				sessMgr.AddUsage(sess.ID, session.UsageFromAccumulated(
-					llm.LLMCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
-					llm.CostUSD, llm.CacheReadTokens, llm.CacheCreationTokens, llm.Model,
-					acc.ToolCalls, acc.ToolCostUSD,
-				))
-			}
-		}
-		sess.InProgress = false // turn completed — clear mid-turn crash marker
+		applyTurnUsage(sess, handler, turnBase) // idempotent: baseline + current
+		sess.InProgress = false                 // turn completed — clear mid-turn crash marker
 		saveErr = sessMgr.Save()
 		if saveErr != nil {
 			log.Printf("daemon: failed to save session: %v", saveErr)
@@ -1225,32 +1186,56 @@ func isSoftRunError(err error) bool {
 		errors.Is(err, context.DeadlineExceeded)
 }
 
-// applyRunMessagesToSession rebuilds the turn's messages on the session by
-// truncating back to the pre-turn baseline and re-applying the current
-// loop.RunMessages() snapshot. Idempotent: calling it multiple times with
-// different snapshots produces the expected final state without drift, so
-// compaction that shrinks the run message list still produces the right
-// session shape.
-func applyRunMessagesToSession(sess *session.Session, loop *agent.AgentLoop,
-	source string, baselineMsgCount, baselineMetaCount int, preLoopUserAppended bool) {
-	// Truncate to pre-turn baseline — drops anything appended by a prior
-	// checkpoint so we always rebuild from the current snapshot.
-	if len(sess.Messages) > baselineMsgCount {
-		sess.Messages = sess.Messages[:baselineMsgCount]
-	}
-	if len(sess.MessageMeta) > baselineMetaCount {
-		sess.MessageMeta = sess.MessageMeta[:baselineMetaCount]
-	}
+// turnBaseline captures pre-turn session state so both mid-turn checkpoints
+// and the post-turn final save can idempotently rebuild the session from
+// (baseline + current loop snapshot) — never append-on-top. This is the
+// single persistence invariant for a turn: after applyTurnState runs, the
+// session reflects exactly one canonical transcript and one usage total
+// for the accumulated turn, no matter how many times the function is
+// called.
+type turnBaseline struct {
+	msgCount    int
+	metaCount   int
+	usage       session.UsageSummary // pre-turn cumulative usage; zero if sess.Usage was nil
+	hadUsage    bool                 // true if sess.Usage was non-nil at baseline
+	source      string
+	preLoopUser bool
+}
 
+// captureTurnBaseline snapshots sess state at turn start so subsequent
+// applyTurnState calls can rebuild idempotently.
+func captureTurnBaseline(sess *session.Session, source string, preLoopUserAppended bool) turnBaseline {
+	b := turnBaseline{
+		msgCount:    len(sess.Messages),
+		metaCount:   len(sess.MessageMeta),
+		source:      source,
+		preLoopUser: preLoopUserAppended,
+	}
+	if sess.Usage != nil {
+		b.usage = *sess.Usage
+		b.hadUsage = true
+	}
+	return b
+}
+
+// applyTurnMessages rebuilds sess.Messages/MessageMeta from baseline +
+// loop.RunMessages(). Idempotent — safe to call any number of times with
+// changing loop state (compaction shrinks etc.).
+func applyTurnMessages(sess *session.Session, loop *agent.AgentLoop, b turnBaseline) {
+	if len(sess.Messages) > b.msgCount {
+		sess.Messages = sess.Messages[:b.msgCount]
+	}
+	if len(sess.MessageMeta) > b.metaCount {
+		sess.MessageMeta = sess.MessageMeta[:b.metaCount]
+	}
 	runMsgs := loop.RunMessages()
 	if len(runMsgs) == 0 {
 		return
 	}
 	runInjected := loop.RunMessageInjected()
 	runTimestamps := loop.RunMessageTimestamps()
-
 	startIdx := 0
-	if preLoopUserAppended && runMsgs[0].Role == "user" {
+	if b.preLoopUser && runMsgs[0].Role == "user" {
 		startIdx = 1
 	}
 	fallbackTime := time.Now()
@@ -1260,12 +1245,49 @@ func applyRunMessagesToSession(sess *session.Session, loop *agent.AgentLoop,
 			ts = runTimestamps[i]
 		}
 		sess.Messages = append(sess.Messages, runMsgs[i])
-		meta := session.MessageMeta{Source: source, Timestamp: session.TimePtr(ts)}
+		meta := session.MessageMeta{Source: b.source, Timestamp: session.TimePtr(ts)}
 		if i < len(runInjected) && runInjected[i] {
 			meta.SystemInjected = true
 		}
 		sess.MessageMeta = append(sess.MessageMeta, meta)
 	}
+}
+
+// applyTurnUsage sets sess.Usage to (baseline + current accumulator).
+// Idempotent — no double-counting across checkpoint + final-save calls.
+func applyTurnUsage(sess *session.Session, handler interface{}, b turnBaseline) {
+	up, ok := handler.(agent.UsageProvider)
+	if !ok {
+		return
+	}
+	acc := up.Usage()
+	llm := acc.LLM
+	hasTurnUsage := llm.LLMCalls > 0 || acc.ToolCalls > 0 || llm.InputTokens > 0 ||
+		llm.CostUSD > 0 || acc.ToolCostUSD > 0
+	if !b.hadUsage && !hasTurnUsage {
+		return
+	}
+	total := b.usage
+	if hasTurnUsage {
+		total.Add(session.UsageFromAccumulated(
+			llm.LLMCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
+			llm.CostUSD, llm.CacheReadTokens, llm.CacheCreationTokens, llm.Model,
+			acc.ToolCalls, acc.ToolCostUSD,
+		))
+	}
+	sess.Usage = &total
+	if sess.SchemaVersion < 2 {
+		sess.SchemaVersion = 2
+	}
+}
+
+// applyTurnState is the combined rebuild — messages + usage — used by
+// both mid-turn checkpoints and the post-turn final save so a turn is
+// never persisted twice via different paths.
+func applyTurnState(sess *session.Session, loop *agent.AgentLoop,
+	handler interface{}, b turnBaseline) {
+	applyTurnMessages(sess, loop, b)
+	applyTurnUsage(sess, handler, b)
 }
 
 // FriendlyAgentError maps raw agent errors to user-facing messages.

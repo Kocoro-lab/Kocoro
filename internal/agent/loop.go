@@ -365,8 +365,14 @@ type AgentLoop struct {
 	// (after a tool batch, after successful reactive compaction, before
 	// ForceStop), gated on the tracker's dirty flag so no-op transitions do
 	// not trigger I/O. It runs synchronously on the loop goroutine and must
-	// return promptly (typically a debounced session.Save()).
+	// return promptly (typically session.Save()).
 	checkpointFn CheckpointFunc
+	// checkpointMinInterval debounces maybeCheckpoint so tool-heavy turns
+	// do not thrash persistence. Zero disables the debounce. The check
+	// runs BEFORE TakeDirty so a skipped tick leaves the dirty flag set
+	// for the next fire point — dirty state is never silently dropped.
+	checkpointMinInterval time.Duration
+	lastCheckpointAt      time.Time
 
 	// tracker is the per-Run phase state machine. Created at Run() entry,
 	// set to PhaseDone + AssertClean via defer on exit. Reads are safe from
@@ -411,15 +417,30 @@ func (a *AgentLoop) SetHandler(h EventHandler) {
 // SetCheckpointFunc installs a mid-turn persistence hook. It is invoked at
 // durable phase-exit boundaries (after tool batches, after successful
 // reactive compaction, before ForceStop) when the tracker's dirty flag is
-// set. Implementations must be idempotent and fast — typically a debounced
+// set. Implementations must be idempotent and fast — typically
 // session.Save() that rebuilds the transcript from loop.RunMessages().
 func (a *AgentLoop) SetCheckpointFunc(fn CheckpointFunc) {
 	a.checkpointFn = fn
 }
 
+// SetCheckpointMinInterval sets a debounce window between checkpoint
+// fires. When a fire point is reached within this window of the previous
+// successful checkpoint, the call is skipped and the dirty flag is left
+// set so the next fire point will pick up the pending durable state.
+// Zero disables the debounce.
+func (a *AgentLoop) SetCheckpointMinInterval(d time.Duration) {
+	a.checkpointMinInterval = d
+}
+
 // maybeCheckpoint fires the checkpoint hook only if the tracker's dirty
-// flag is set. Safe to call at any phase boundary; no-ops when no
-// durable state was produced since the last checkpoint.
+// flag is set AND the debounce window has elapsed. Safe to call at any
+// phase boundary; no-ops when no durable state was produced since the
+// last checkpoint OR when called too soon after the previous fire.
+//
+// IMPORTANT: the debounce check happens BEFORE TakeDirty(). A throttled
+// tick does not clear the dirty flag, so the next fire point still sees
+// the pending durable state. This is the fix for the "debounce silently
+// swallows dirty, work lost if process crashes in the window" bug.
 func (a *AgentLoop) maybeCheckpoint(ctx context.Context) {
 	if a.checkpointFn == nil || a.tracker == nil {
 		return
@@ -427,9 +448,14 @@ func (a *AgentLoop) maybeCheckpoint(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	if a.checkpointMinInterval > 0 && !a.lastCheckpointAt.IsZero() &&
+		time.Since(a.lastCheckpointAt) < a.checkpointMinInterval {
+		return // dirty flag intentionally left set for next fire
+	}
 	if !a.tracker.TakeDirty() {
 		return
 	}
+	a.lastCheckpointAt = time.Now()
 	a.checkpointFn(ctx)
 }
 

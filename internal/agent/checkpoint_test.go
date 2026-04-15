@@ -137,6 +137,38 @@ func TestCheckpoint_IdempotentUnderRepeatedCalls(t *testing.T) {
 	}
 }
 
+// TestMaybeCheckpoint_DebouncePreservesDirty verifies finding #2's fix:
+// when the debounce window skips a checkpoint, the tracker's dirty flag
+// is left set so the next fire point persists the pending durable state.
+// A naive implementation that TakeDirty-before-debounce would lose this
+// work if the process crashed in the window.
+func TestMaybeCheckpoint_DebouncePreservesDirty(t *testing.T) {
+	loop := NewAgentLoop(nil, NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	loop.tracker = newPhaseTracker()
+	loop.SetCheckpointMinInterval(100 * time.Millisecond)
+
+	var fires atomic.Int32
+	loop.SetCheckpointFunc(func(ctx context.Context) { fires.Add(1) })
+
+	// Fire 1: dirty set, no prior checkpoint — should fire.
+	loop.tracker.MarkDirty()
+	loop.maybeCheckpoint(context.Background())
+	if n := fires.Load(); n != 1 {
+		t.Fatalf("fire 1: want 1, got %d", n)
+	}
+
+	// Fire 2: dirty set again, but within debounce window — must skip
+	// AND leave dirty set so the next call persists.
+	loop.tracker.MarkDirty()
+	loop.maybeCheckpoint(context.Background())
+	if n := fires.Load(); n != 1 {
+		t.Fatalf("fire 2 (debounced): want 1 (skipped), got %d", n)
+	}
+	if !loop.tracker.TakeDirty() {
+		t.Fatal("debounced skip consumed dirty flag — crash in window would lose work")
+	}
+}
+
 // TestCheckpoint_SurvivesCancelMidTurn verifies the crash/abort-after-
 // checkpoint recovery: if we cancel mid-turn, the checkpoint callback
 // captured the tool batch before the cancel. This is the core guarantee
