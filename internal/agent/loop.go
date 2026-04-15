@@ -1150,7 +1150,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// Pre-ForceStop: the loop-detector verdict + accumulated tool state
 		// are durable; mark dirty so the checkpoint hook saves before the
 		// final LLM call, then fire it. PhaseForceStop is idle-counted so
-		// the watchdog still observes the final LLM call.
+		// the watchdog still observes the final LLM call — this is
+		// intentional. If the ForceStop itself stalls, a second idle_soft
+		// event fires (seq bumps on every Enter), which is the correct
+		// behavior: the ForceStop is our last-resort stop-the-bleeding
+		// turn and its LLM call deserves the same liveness guarantee as
+		// a normal AwaitingLLM.
 		if a.tracker != nil {
 			a.tracker.MarkDirty()
 		}

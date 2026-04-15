@@ -969,9 +969,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		checkpointSource = "unknown"
 	}
 	turnBase := captureTurnBaseline(sess, checkpointSource, preLoopUserAppended)
+	// The daemon handler implements agent.UsageProvider; extract once so
+	// callsites pass a strongly-typed provider (or nil) to applyTurnState.
+	var turnUsage usageProvider
+	if up, ok := handler.(agent.UsageProvider); ok {
+		turnUsage = up
+	}
 	loop.SetCheckpointMinInterval(2 * time.Second) // debounce in the loop, not here
 	loop.SetCheckpointFunc(func(ctx context.Context) error {
-		applyTurnState(sess, loop, handler, turnBase)
+		applyTurnState(sess, loop, turnUsage, turnBase)
 		sess.InProgress = true
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: mid-turn checkpoint save failed: %v", err)
@@ -1014,7 +1020,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			sess.MessageMeta = append(sess.MessageMeta,
 				session.MessageMeta{Source: req.Source, Timestamp: session.TimePtr(time.Now())},
 			)
-			applyTurnUsage(sess, handler, turnBase)
+			applyTurnUsage(sess, turnUsage, turnBase)
 			sess.InProgress = false // hard-error path: turn is over, clear marker
 			if err := sessMgr.Save(); err != nil {
 				log.Printf("daemon: failed to save error session: %v", err)
@@ -1087,8 +1093,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				session.MessageMeta{Source: checkpointSource, Timestamp: session.TimePtr(replyTime)},
 			)
 		}
-		applyTurnUsage(sess, handler, turnBase) // idempotent: baseline + current
-		sess.InProgress = false                 // turn completed — clear mid-turn crash marker
+		applyTurnUsage(sess, turnUsage, turnBase) // idempotent: baseline + current
+		sess.InProgress = false                   // turn completed — clear mid-turn crash marker
 		saveErr = sessMgr.Save()
 		if saveErr != nil {
 			log.Printf("daemon: failed to save session: %v", saveErr)
@@ -1275,11 +1281,21 @@ func applyTurnMessages(sess *session.Session, loop *agent.AgentLoop, b turnBasel
 	}
 }
 
+// usageProvider is the local interface applyTurnUsage needs. Defined here
+// (rather than accepting agent.UsageProvider directly) so the caller type
+// is restricted at compile time — a future refactor that dropped the
+// interface on the daemon handler would fail to compile instead of
+// silently no-op'ing the usage folding at runtime.
+type usageProvider interface {
+	Usage() agent.AccumulatedUsage
+}
+
 // applyTurnUsage sets sess.Usage to (baseline + current accumulator).
 // Idempotent — no double-counting across checkpoint + final-save calls.
-func applyTurnUsage(sess *session.Session, handler interface{}, b turnBaseline) {
-	up, ok := handler.(agent.UsageProvider)
-	if !ok {
+// A nil provider is a no-op (used by unit tests that exercise only the
+// message path).
+func applyTurnUsage(sess *session.Session, up usageProvider, b turnBaseline) {
+	if up == nil {
 		return
 	}
 	acc := up.Usage()
@@ -1305,11 +1321,11 @@ func applyTurnUsage(sess *session.Session, handler interface{}, b turnBaseline) 
 
 // applyTurnState is the combined rebuild — messages + usage — used by
 // both mid-turn checkpoints and the post-turn final save so a turn is
-// never persisted twice via different paths.
+// never persisted twice via different paths. up may be nil (usage skipped).
 func applyTurnState(sess *session.Session, loop *agent.AgentLoop,
-	handler interface{}, b turnBaseline) {
+	up usageProvider, b turnBaseline) {
 	applyTurnMessages(sess, loop, b)
-	applyTurnUsage(sess, handler, b)
+	applyTurnUsage(sess, up, b)
 }
 
 // FriendlyAgentError maps raw agent errors to user-facing messages.

@@ -709,6 +709,8 @@ agent:
   model: ""                        # specific model override (empty = use model_tier)
   context_window: 128000           # context window in tokens (default: 128000)
   reasoning_effort: ""             # "low", "medium", "high" (empty = model default)
+  idle_soft_timeout_secs: 90       # watchdog: emit "still working" status after this long waiting on the LLM (0 = disabled, default: 90)
+  idle_hard_timeout_secs: 0        # watchdog: cancel the run as a soft/partial failure after this long idle (0 = disabled; recommended: 540 once enabled, stays below the 600s gateway timeout)
 
 # Tool settings
 tools:

@@ -666,6 +666,7 @@ func (h *daemonEventHandler) OnRunStatus(code, detail string) {
 		h.deps.EventBus.Emit(daemon.Event{Type: daemon.EventRunStatus, Payload: payload})
 	}
 }
+
 func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
 		log.Printf("daemon: auto-approving %s (auto_approve=true)", tool)

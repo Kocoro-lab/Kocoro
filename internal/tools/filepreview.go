@@ -205,10 +205,25 @@ func (b *FilePreviewBridge) RewriteFileURL(fileURL string) (string, error) {
 		return b.urlFor(token, real), nil
 	}
 
-	// Lazy server start on first registration.
+	// Lazy server start on first registration. Bind outside the lock —
+	// net.Listen is a blocking syscall we don't want holding b.mu while
+	// AllowRoot/AllowFile callers wait on the mutex.
 	if b.srv == nil {
-		if err := b.startLocked(); err != nil {
+		b.mu.Unlock()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		b.mu.Lock()
+		if err != nil {
 			return "", fmt.Errorf("start preview server: %w", err)
+		}
+		// Another goroutine may have started the server while we had the
+		// lock released. If so, close our spare listener and reuse theirs.
+		if b.srv != nil {
+			_ = ln.Close()
+		} else if b.closed {
+			_ = ln.Close()
+			return "", errors.New("file preview bridge closed")
+		} else {
+			b.assignServerLocked(ln)
 		}
 	}
 
@@ -227,12 +242,10 @@ func (b *FilePreviewBridge) urlFor(token, abs string) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/%s/%s", b.port, token, url.PathEscape(name))
 }
 
-// startLocked boots the loopback HTTP server. Caller must hold b.mu.
-func (b *FilePreviewBridge) startLocked() error {
-	ln, err := net.Listen("tcp", "127.0.0.1:0") // random port, loopback only
-	if err != nil {
-		return err
-	}
+// assignServerLocked wires an already-bound listener into the bridge's
+// state and starts the serve goroutine. Caller must hold b.mu and have
+// confirmed b.srv == nil and !b.closed.
+func (b *FilePreviewBridge) assignServerLocked(ln net.Listener) {
 	b.listener = ln
 	b.port = ln.Addr().(*net.TCPAddr).Port
 
@@ -246,7 +259,6 @@ func (b *FilePreviewBridge) startLocked() error {
 	go func() {
 		_ = b.srv.Serve(ln) // returns http.ErrServerClosed on Close()
 	}()
-	return nil
 }
 
 // serveToken handles /<token>/<name>. Only exact registered tokens are
@@ -347,10 +359,12 @@ func randomToken() (string, error) {
 }
 
 func isLoopbackHost(host string) bool {
-	if host == "127.0.0.1" || host == "::1" || host == "localhost" {
-		return true
-	}
-	// Parse IP for edge cases like "::ffff:127.0.0.1".
+	// IP-based check only — deliberately does NOT special-case the literal
+	// string "localhost". An adversarial /etc/hosts or similar resolver
+	// manipulation could route "localhost" to a non-loopback address; in
+	// practice net.(*TCPListener).RemoteAddr always gives us a numeric
+	// address, so the IP parse path below covers every real case
+	// (including the IPv4-mapped form "::ffff:127.0.0.1").
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		return true
 	}
