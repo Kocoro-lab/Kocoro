@@ -106,6 +106,16 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 				}
 			}
 		}
+		// file:// preview bridge: Playwright's Chromium rejects file://
+		// navigations. If a bridge is attached to ctx, intercept
+		// browser_navigate(url=file://...) and rewrite the URL to a
+		// short-lived http://127.0.0.1/<token>/<name> endpoint scoped to
+		// exactly that one file.
+		if t.tool.Name == "browser_navigate" {
+			if rewritten, ok := maybeRewriteFileURL(ctx, args); ok {
+				args["url"] = rewritten
+			}
+		}
 	}
 
 	content, isError, err := t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
@@ -139,3 +149,29 @@ func (t *MCPTool) RequiresApproval() bool { return false }
 
 // ToolSource implements agent.ToolSourcer for deterministic tool ordering.
 func (t *MCPTool) ToolSource() agent.ToolSource { return agent.SourceMCP }
+
+// maybeRewriteFileURL extracts a file:// URL from a browser_navigate args
+// map and rewrites it to the local preview-bridge URL. Returns the
+// rewritten URL and true on success; (unchanged, false) if there is no
+// file URL, no bridge on ctx, or the rewrite fails for any reason. On
+// failure the original URL is left intact so the upstream MCP error
+// surface (Chromium's "file:// blocked" message) is preserved.
+func maybeRewriteFileURL(ctx context.Context, args map[string]any) (string, bool) {
+	bridge := FilePreviewFrom(ctx)
+	if bridge == nil {
+		return "", false
+	}
+	raw, ok := args["url"].(string)
+	if !ok {
+		return "", false
+	}
+	if !strings.HasPrefix(strings.ToLower(raw), "file://") {
+		return "", false
+	}
+	rewritten, err := bridge.RewriteFileURL(raw)
+	if err != nil {
+		log.Printf("[mcp-tool] file:// preview rewrite failed for %q: %v", raw, err)
+		return "", false
+	}
+	return rewritten, true
+}

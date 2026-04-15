@@ -934,6 +934,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// Always set (even nil) to clear paths from a previous run on a reused loop.
 	loop.SetUserFilePaths(extractUserFilePaths(req.Content))
 	sessMgr.OnSessionClose(sess.ID, loop.SpillCleanupFunc())
+
+	// file:// preview bridge: lazily-started loopback HTTP server that
+	// rewrites browser_navigate(file://...) into http://127.0.0.1/<token>/…
+	// so Playwright's Chromium deny-list doesn't strand the agent. The
+	// server is torn down when the session closes (or right here via
+	// defer if Run never reaches the session-close hook registration).
+	filePreview := tools.NewFilePreviewBridge()
+	sessMgr.OnSessionClose(sess.ID, func() { _ = filePreview.Close() })
+	ctx = tools.WithFilePreview(ctx, filePreview)
 	if attachmentCleanup != nil {
 		attachmentRegistered = true // cancel the defer safety net
 		sessMgr.OnClose(attachmentCleanup)
