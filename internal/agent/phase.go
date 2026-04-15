@@ -113,24 +113,26 @@ func newPhaseTracker() *phaseTracker {
 // Enter sets the current top-level phase. Not safe inside an active
 // transient — a transient must be restored first. Typical use: sequential
 // phase transitions driven from AgentLoop.Run on the loop goroutine.
+//
+// If called while a transient is still active, this is a structural
+// violation: the tracker is marked invalid (observers self-disable),
+// a diagnostic is logged (or panic under test/strict mode), and the
+// transition is applied anyway. The lock is held across the whole
+// sequence so a racing restore closure cannot clobber the write or
+// leave transientDepth negative.
 func (t *phaseTracker) Enter(p TurnPhase) {
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	if t.transientDepth != 0 {
-		prev := t.phase
-		depth := t.transientDepth
-		t.mu.Unlock()
+		// reportViolation writes to stderr / sets an atomic / may panic
+		// under testing.Testing() — all safe to do under the mutex.
 		t.reportViolation(fmt.Sprintf(
 			"Enter(%s) called while transient is active (depth=%d, current=%s). "+
-				"Use EnterTransient or restore first.", p, depth, prev))
-		// In non-strict mode (logged), fall through and do the transition
-		// anyway so production keeps moving. The invalid flag is already
-		// set so observers will disable themselves. Re-acquire the lock.
-		t.mu.Lock()
+				"Use EnterTransient or restore first.", p, t.transientDepth, t.phase))
 	}
 	t.phase = p
 	t.since = time.Now()
 	t.seq++
-	t.mu.Unlock()
 }
 
 // EnterTransient enters phase p and returns a restore closure that restores

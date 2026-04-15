@@ -282,7 +282,26 @@ func (b *FilePreviewBridge) serveToken(w http.ResponseWriter, r *http.Request) {
 	// The name is only in the URL so browsers pick a sensible download
 	// name and so relative-link heuristics inside the page see the right
 	// basename.
-	http.ServeFile(w, r, abs)
+	//
+	// We deliberately use http.ServeContent (not http.ServeFile). ServeFile
+	// issues a built-in redirect for URL paths ending in "/index.html" →
+	// "./"; because our handler ignores the URL name segment for disk
+	// access, that redirect would land on a path we do not serve and
+	// return 404, silently breaking preview of any file named index.html.
+	// ServeContent takes an already-open ReadSeeker and has no such
+	// path-based redirect, so it respects the real file on disk.
+	f, err := os.Open(abs)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeContent(w, r, filepath.Base(abs), info.ModTime(), f)
 }
 
 // Close tears down the HTTP server and clears the token map. Safe to

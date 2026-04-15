@@ -203,6 +203,43 @@ func TestFilePreviewBridge_RejectsMissingFile(t *testing.T) {
 	}
 }
 
+// TestFilePreviewBridge_IndexHTML_ServedNotRedirected is a regression for
+// the http.ServeFile behavior where URLs ending in "/index.html" are
+// rewritten to "./" via an internal redirect. Because the handler ignores
+// the URL name segment for disk access, such a redirect would land on a
+// path we do not serve and return 404 — silently breaking preview of any
+// file named index.html. Switching to http.ServeContent avoids this.
+func TestFilePreviewBridge_IndexHTML_ServedNotRedirected(t *testing.T) {
+	path := writeTempFile(t, "index.html", "<h1>hi</h1>")
+	b := NewFilePreviewBridge()
+	b.AllowFile(path)
+	t.Cleanup(func() { _ = b.Close() })
+
+	rewritten, err := b.RewriteFileURL("file://" + path)
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	// Disable redirect following — we want to see the handler's raw response.
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 2 * time.Second,
+	}
+	resp, err := client.Get(rewritten)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d — index.html redirect regression: %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if string(body) != "<h1>hi</h1>" {
+		t.Fatalf("body: %q", string(body))
+	}
+}
+
 func TestFilePreviewBridge_PercentEncodedPath(t *testing.T) {
 	dir := t.TempDir()
 	// Space + non-ASCII.

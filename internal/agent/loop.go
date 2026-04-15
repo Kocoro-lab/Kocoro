@@ -450,6 +450,13 @@ func (a *AgentLoop) SetCheckpointMinInterval(d time.Duration) {
 //     the callback, and only take-and-clear on success. This keeps the
 //     "dirty means unsaved durable state" invariant intact across
 //     storage errors and callback panics.
+//
+// Context-cancellation caveat: when ctx.Err() is set we skip without
+// firing the callback. Dirty stays set, but since Run is exiting, no
+// further fire point will occur. This is safe because the daemon runner
+// always reaches the final-save path (soft or hard error) after Run
+// returns, and that path uses the SAME idempotent rebuild — so the
+// pending durable state is persisted there, not dropped.
 func (a *AgentLoop) maybeCheckpoint(ctx context.Context) {
 	if a.checkpointFn == nil || a.tracker == nil {
 		return
