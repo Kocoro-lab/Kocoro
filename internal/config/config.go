@@ -62,8 +62,7 @@ type AgentConfig struct {
 	// IdleSoftTimeoutSecs / IdleHardTimeoutSecs: turn-level watchdog measured
 	// against explicit "idle-counted" phases of the agent loop (waiting on an
 	// LLM response). Other phases (tool execution, approval wait, compaction
-	// wrappers) are not counted — they have their own bounded owners. See
-	// docs/plans/2026-04-15-turn-lifecycle-design.md.
+	// wrappers) are not counted — they have their own bounded owners.
 	//
 	// IdleSoftTimeoutSecs: emit OnRunStatus("idle_soft", …) after this long
 	// in an idle-counted phase. 0 = disabled. Default: 90.

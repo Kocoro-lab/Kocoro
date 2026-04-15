@@ -352,8 +352,7 @@ type AgentLoop struct {
 
 	// Watchdog thresholds (0 = disabled). The watchdog observes the loop's
 	// phase tracker and only measures duration in "idle-counted" phases
-	// (PhaseAwaitingLLM, PhaseForceStop) — see phase.go + the design doc at
-	// docs/plans/2026-04-15-turn-lifecycle-design.md. Tool execution,
+	// (PhaseAwaitingLLM, PhaseForceStop) — see phase.go. Tool execution,
 	// approval waits, and compaction wrappers are structurally excluded by
 	// their phase, not by manual suspend bookkeeping.
 	idleSoftTimeout time.Duration
@@ -365,6 +364,11 @@ type AgentLoop struct {
 	// not trigger I/O. It runs synchronously on the loop goroutine and must
 	// return promptly (typically a debounced session.Save()).
 	checkpointFn CheckpointFunc
+
+	// tracker is the per-Run phase state machine. Created at Run() entry,
+	// set to PhaseDone + AssertClean via defer on exit. Reads are safe from
+	// any goroutine (watchdog observer); writes are loop-goroutine only.
+	tracker *phaseTracker
 }
 
 // CheckpointFunc is invoked mid-turn at phase-exit boundaries by AgentLoop.Run
@@ -676,6 +680,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	a.runMsgInjected = nil   // reset for this run
 	a.runMsgTimestamps = nil // reset for this run
 	a.lastRunStatus = RunStatus{}
+
+	// Phase tracker: initialized per Run. AssertClean fires the fail-closed
+	// invariant if any EnterTransient restore was forgotten (panics in
+	// testing.Testing() or SHANNON_PHASE_STRICT=1, logs otherwise).
+	a.tracker = newPhaseTracker()
+	defer func() {
+		a.tracker.Enter(PhaseDone)
+		a.tracker.AssertClean()
+	}()
+	a.tracker.Enter(PhaseSetup)
 
 	if a.workingSet == nil {
 		a.workingSet = NewWorkingSet()
@@ -1011,6 +1025,13 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			Content: client.NewTextContent("[system] " + reason),
 		})
 		markInjected()
+		// Pre-ForceStop: the loop-detector verdict + accumulated tool state
+		// are durable; mark dirty so the checkpoint hook (Slice 4) saves
+		// before the final LLM call. PhaseForceStop is idle-counted.
+		if a.tracker != nil {
+			a.tracker.MarkDirty()
+			a.tracker.Enter(PhaseForceStop)
+		}
 
 		req := client.CompletionRequest{
 			Messages:        messages,
@@ -1139,6 +1160,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				}
 			}
 			if len(injected) > 0 {
+				a.tracker.Enter(PhaseInjectingMessage)
 				combined := strings.Join(injected, "\n\n")
 				latestUserText = combined // track for deferred-tool continuation nudge
 				messages = append(messages, client.Message{
@@ -1206,18 +1228,24 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				shouldCompact = ctxwin.ShouldCompact(est, 0, a.contextWindow)
 			}
 			if shouldCompact {
+				a.tracker.Enter(PhaseCompacting)
 				if compactionSummary == "" {
 					// Write-before-compact: persist durable learnings to MEMORY.md
 					// before messages are discarded by compaction.
 					if a.memoryDir != "" {
-						if pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir); pErr != nil {
+						restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
+						pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir)
+						restoreLLM()
+						if pErr != nil {
 							fmt.Fprintf(os.Stderr, "[context] persist learnings failed: %v\n", pErr)
 						} else {
 							fmt.Fprintf(os.Stderr, "[context] persisted learnings to MEMORY.md\n")
 						}
 					}
 
+					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 					summary, sumErr := ctxwin.GenerateSummary(ctx, a.client, messages)
+					restoreLLM()
 					if sumErr != nil {
 						summaryFailures++
 						fmt.Fprintf(os.Stderr, "[context] compaction summary failed (%d/%d): %v\n", summaryFailures, maxSummaryFailures, sumErr)
@@ -1291,6 +1319,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 		const maxLLMRetries = 3
 		for attempt := 0; ; attempt++ {
+			// Enter (or re-enter) the idle-counted phase for this attempt.
+			// The watchdog (Slice 3) measures duration here. Post-call we
+			// transition out based on outcome (tool exec, error, etc.).
+			a.tracker.Enter(PhaseAwaitingLLM)
+
 			// On retries, skip streaming to avoid duplicate partial deltas.
 			if attempt == 0 && a.enableStreaming && a.handler != nil {
 				streamingText.Reset()
@@ -1337,10 +1370,18 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// only if the shaped history is still estimated to be over budget.
 			if isContextLengthError(err) && !reactiveCompacted {
 				fmt.Fprintf(os.Stderr, "[agent] context length exceeded, attempting reactive compaction\n")
+				// Outer phase for the whole compaction block. Nested LLM
+				// calls below use EnterTransient(PhaseAwaitingLLM) so they
+				// remain idle-watched; everything else (ShapeHistory, local
+				// I/O) is intentionally not idle-counted.
+				a.tracker.Enter(PhaseCompacting)
 
 				// Write-before-compact: persist durable learnings before discarding history.
 				if a.memoryDir != "" {
-					if pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir); pErr != nil {
+					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
+					pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir)
+					restoreLLM()
+					if pErr != nil {
 						fmt.Fprintf(os.Stderr, "[context] reactive persist learnings failed: %v\n", pErr)
 					}
 				}
@@ -1350,7 +1391,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 				softMessages := cloneMessages(messages)
 				compressOldToolResults(ctx, softMessages, compressAfter, maxResultChars, a.client)
+				restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 				summary, sumErr := ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(softMessages, nextSummary))
+				restoreLLM()
 				if sumErr != nil {
 					if nextSummary != "" {
 						fmt.Fprintf(os.Stderr, "[context] reactive summary failed, reusing prior summary: %v\n", sumErr)
@@ -1367,7 +1410,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					emergencyMessages := cloneMessages(messages)
 					compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
 
+					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 					summary, sumErr = ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(emergencyMessages, nextSummary))
+					restoreLLM()
 					if sumErr != nil {
 						if nextSummary != "" {
 							fmt.Fprintf(os.Stderr, "[context] emergency reactive summary failed, keeping prior summary: %v\n", sumErr)
@@ -1451,6 +1496,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if a.handler != nil {
 				a.handler.OnCloudAgent("", "retry", fmt.Sprintf("Retrying request (attempt %d/%d): %s", attempt+1, maxLLMRetries, reason))
 			}
+			a.tracker.Enter(PhaseRetryingLLM)
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
@@ -1849,7 +1895,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// ---- Phase 2 (batched): partition by read-only, execute with concurrency limits ----
 		if len(approved) > 0 {
 			batches := partitionToolCalls(approved)
+			a.tracker.Enter(PhaseExecutingTools)
 			executeBatches(ctx, batches, execResults, readTracker, a.handler)
+			a.tracker.MarkDirty() // tool batch is durable state for checkpoint
 		}
 
 		// Deferred mode: check if tool_search loaded new tools, rebuild schemas.
@@ -2327,7 +2375,15 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 		}
 		approved := false
 		if a.handler != nil {
+			// Approval is not idle-counted — we may be waiting on a human.
+			// Transient so the outer phase (tool resolution) is restored
+			// even if multiple tool calls require approval in sequence.
+			restoreApproval := func() {}
+			if a.tracker != nil {
+				restoreApproval = a.tracker.EnterTransient(PhaseAwaitingApproval)
+			}
 			approved = a.handler.OnApprovalNeeded(toolName, argsStr)
+			restoreApproval()
 		}
 		if approved && cache != nil {
 			cache.RecordApproval(toolName, argsStr)

@@ -1159,14 +1159,14 @@ func TestAgentLoop_ErrorAwareBreaking(t *testing.T) {
 }
 
 func TestAgentLoop_ContextCancellation(t *testing.T) {
-	callCount := 0
+	var callCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
+		n := callCount.Add(1)
 		// Small delay per request so cancellation fires before maxIter
 		time.Sleep(20 * time.Millisecond)
 		// Always return tool calls to keep the loop running
 		json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-			toolCall("mock_tool", fmt.Sprintf(`{"step":%d}`, callCount)), 10, 5))
+			toolCall("mock_tool", fmt.Sprintf(`{"step":%d}`, n)), 10, 5))
 	}))
 	defer server.Close()
 
@@ -1187,8 +1187,8 @@ func TestAgentLoop_ContextCancellation(t *testing.T) {
 		t.Fatalf("expected context.Canceled, got: %v", err)
 	}
 	// Should have stopped well before maxIter=25
-	if callCount >= 25 {
-		t.Errorf("expected loop to exit early due to cancellation, but made %d calls", callCount)
+	if got := callCount.Load(); got >= 25 {
+		t.Errorf("expected loop to exit early due to cancellation, but made %d calls", got)
 	}
 }
 
