@@ -59,6 +59,20 @@ type AgentConfig struct {
 	ReasoningEffort string  `mapstructure:"reasoning_effort" yaml:"reasoning_effort" json:"reasoning_effort"`
 	Model           string  `mapstructure:"model"            yaml:"model"            json:"model"`          // specific model override
 	ContextWindow   int     `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"` // model context window in tokens
+	// IdleSoftTimeoutSecs / IdleHardTimeoutSecs: turn-level watchdog measured
+	// against explicit "idle-counted" phases of the agent loop (waiting on an
+	// LLM response). Other phases (tool execution, approval wait, compaction
+	// wrappers) are not counted — they have their own bounded owners. See
+	// docs/plans/2026-04-15-turn-lifecycle-design.md.
+	//
+	// IdleSoftTimeoutSecs: emit OnRunStatus("idle_soft", …) after this long
+	// in an idle-counted phase. 0 = disabled. Default: 90.
+	// IdleHardTimeoutSecs: cancel the run with ErrHardIdleTimeout after this
+	// long. 0 = disabled (visibility-only mode). Default: 0 while the
+	// watchdog is opt-in; will flip to a value strictly less than the
+	// gateway transport ceiling (600s) after dogfood.
+	IdleSoftTimeoutSecs int `mapstructure:"idle_soft_timeout_secs" yaml:"idle_soft_timeout_secs" json:"idle_soft_timeout_secs"`
+	IdleHardTimeoutSecs int `mapstructure:"idle_hard_timeout_secs" yaml:"idle_hard_timeout_secs" json:"idle_hard_timeout_secs"`
 }
 
 type ToolsConfig struct {
@@ -136,6 +150,8 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.reasoning_effort", "")
 	viper.SetDefault("agent.model", "")
 	viper.SetDefault("agent.context_window", 128000)
+	viper.SetDefault("agent.idle_soft_timeout_secs", 90)
+	viper.SetDefault("agent.idle_hard_timeout_secs", 0) // 0 = disabled; flip to <600 after dogfood
 	viper.SetDefault("tools.bash_timeout", 120)
 	viper.SetDefault("tools.bash_max_output", 30000)
 	viper.SetDefault("tools.result_truncation", 30000)
@@ -340,6 +356,9 @@ type overlayAgentConfig struct {
 	ReasoningEffort *string  `yaml:"reasoning_effort"`
 	Model           *string  `yaml:"model"`
 	ContextWindow   *int     `yaml:"context_window"`
+
+	IdleSoftTimeoutSecs *int `yaml:"idle_soft_timeout_secs"`
+	IdleHardTimeoutSecs *int `yaml:"idle_hard_timeout_secs"`
 }
 
 type overlayToolsConfig struct {
@@ -354,25 +373,27 @@ type overlayToolsConfig struct {
 // buildDefaultSources returns source entries for all config keys set to "default".
 func buildDefaultSources() map[string]ConfigSource {
 	return map[string]ConfigSource{
-		"endpoint":                  {Level: "default"},
-		"api_key":                   {Level: "default"},
-		"model_tier":                {Level: "default"},
-		"auto_update_check":         {Level: "default"},
-		"agent.max_iterations":      {Level: "default"},
-		"agent.temperature":         {Level: "default"},
-		"agent.max_tokens":          {Level: "default"},
-		"agent.thinking":            {Level: "default"},
-		"agent.thinking_mode":       {Level: "default"},
-		"agent.thinking_budget":     {Level: "default"},
-		"agent.reasoning_effort":    {Level: "default"},
-		"agent.model":               {Level: "default"},
-		"agent.context_window":      {Level: "default"},
-		"tools.bash_timeout":        {Level: "default"},
-		"tools.bash_max_output":     {Level: "default"},
-		"tools.result_truncation":   {Level: "default"},
-		"tools.args_truncation":     {Level: "default"},
-		"tools.server_tool_timeout": {Level: "default"},
-		"tools.grep_max_results":    {Level: "default"},
+		"endpoint":                     {Level: "default"},
+		"api_key":                      {Level: "default"},
+		"model_tier":                   {Level: "default"},
+		"auto_update_check":            {Level: "default"},
+		"agent.max_iterations":         {Level: "default"},
+		"agent.temperature":            {Level: "default"},
+		"agent.max_tokens":             {Level: "default"},
+		"agent.thinking":               {Level: "default"},
+		"agent.thinking_mode":          {Level: "default"},
+		"agent.thinking_budget":        {Level: "default"},
+		"agent.reasoning_effort":       {Level: "default"},
+		"agent.model":                  {Level: "default"},
+		"agent.context_window":         {Level: "default"},
+		"agent.idle_soft_timeout_secs": {Level: "default"},
+		"agent.idle_hard_timeout_secs": {Level: "default"},
+		"tools.bash_timeout":           {Level: "default"},
+		"tools.bash_max_output":        {Level: "default"},
+		"tools.result_truncation":      {Level: "default"},
+		"tools.args_truncation":        {Level: "default"},
+		"tools.server_tool_timeout":    {Level: "default"},
+		"tools.grep_max_results":       {Level: "default"},
 	}
 }
 
@@ -418,6 +439,12 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.context_window") {
 		cfg.Sources["agent.context_window"] = src
+	}
+	if viper.IsSet("agent.idle_soft_timeout_secs") {
+		cfg.Sources["agent.idle_soft_timeout_secs"] = src
+	}
+	if viper.IsSet("agent.idle_hard_timeout_secs") {
+		cfg.Sources["agent.idle_hard_timeout_secs"] = src
 	}
 	if viper.IsSet("tools.bash_timeout") {
 		cfg.Sources["tools.bash_timeout"] = src
@@ -534,6 +561,14 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 			cfg.Agent.ContextWindow = *overlay.Agent.ContextWindow
 			cfg.Sources["agent.context_window"] = src
 		}
+		if overlay.Agent.IdleSoftTimeoutSecs != nil {
+			cfg.Agent.IdleSoftTimeoutSecs = *overlay.Agent.IdleSoftTimeoutSecs
+			cfg.Sources["agent.idle_soft_timeout_secs"] = src
+		}
+		if overlay.Agent.IdleHardTimeoutSecs != nil {
+			cfg.Agent.IdleHardTimeoutSecs = *overlay.Agent.IdleHardTimeoutSecs
+			cfg.Sources["agent.idle_hard_timeout_secs"] = src
+		}
 	}
 
 	// Tools field-level merge
@@ -611,6 +646,20 @@ func validateConfig(cfg *Config) error {
 		default:
 			return fmt.Errorf("invalid agent.thinking_mode %q: must be \"adaptive\" or \"enabled\"", cfg.Agent.ThinkingMode)
 		}
+	}
+	if cfg.Agent.IdleSoftTimeoutSecs < 0 {
+		return fmt.Errorf("agent.idle_soft_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Agent.IdleSoftTimeoutSecs)
+	}
+	if cfg.Agent.IdleHardTimeoutSecs < 0 {
+		return fmt.Errorf("agent.idle_hard_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Agent.IdleHardTimeoutSecs)
+	}
+	if cfg.Agent.IdleHardTimeoutSecs > 0 && cfg.Agent.IdleHardTimeoutSecs < 30 {
+		return fmt.Errorf("agent.idle_hard_timeout_secs (%d) too aggressive; must be >= 30 or 0 to disable", cfg.Agent.IdleHardTimeoutSecs)
+	}
+	if cfg.Agent.IdleSoftTimeoutSecs > 0 && cfg.Agent.IdleHardTimeoutSecs > 0 &&
+		cfg.Agent.IdleHardTimeoutSecs < cfg.Agent.IdleSoftTimeoutSecs {
+		return fmt.Errorf("agent.idle_hard_timeout_secs (%d) must be >= agent.idle_soft_timeout_secs (%d)",
+			cfg.Agent.IdleHardTimeoutSecs, cfg.Agent.IdleSoftTimeoutSecs)
 	}
 	return nil
 }

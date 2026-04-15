@@ -91,6 +91,9 @@ type AgentModelConfig struct {
 	Temperature   *float64 `yaml:"temperature" json:"temperature,omitempty"`
 	MaxTokens     *int     `yaml:"max_tokens" json:"max_tokens,omitempty"`
 	ContextWindow *int     `yaml:"context_window" json:"context_window,omitempty"`
+
+	IdleSoftTimeoutSecs *int `yaml:"idle_soft_timeout_secs" json:"idle_soft_timeout_secs,omitempty"`
+	IdleHardTimeoutSecs *int `yaml:"idle_hard_timeout_secs" json:"idle_hard_timeout_secs,omitempty"`
 }
 
 // Agent represents a loaded agent definition.

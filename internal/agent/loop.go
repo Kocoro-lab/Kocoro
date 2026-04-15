@@ -289,6 +289,20 @@ type EventHandler interface {
 	OnCloudPlan(planType string, content string, needsReview bool)
 }
 
+// RunStatusHandler is an optional interface a handler may implement to receive
+// turn-level status updates (watchdog soft/hard idle, retries). The agent loop
+// checks for it via a type assertion, so handlers that do not implement it
+// simply miss these events with no breakage.
+//
+// Known codes:
+//
+//	"idle_soft"  — no activity for IdleSoftTimeout; informational, turn continues
+//	"idle_hard"  — no activity for IdleHardTimeout; turn about to be cancelled
+//	"llm_retry"  — transient LLM error, retrying
+type RunStatusHandler interface {
+	OnRunStatus(code string, detail string)
+}
+
 // InjectedMessage is a mid-run follow-up message delivered by the caller.
 // Text is appended as a new user turn at the next iteration boundary.
 // CWD is optional metadata used by higher layers to enforce immutable
@@ -335,7 +349,28 @@ type AgentLoop struct {
 	runMsgInjected    []bool           // parallel to runMessages: true = system-injected guardrail/nudge
 	runMsgTimestamps  []time.Time      // parallel to runMessages: when each message was created
 	lastRunStatus     RunStatus
+
+	// Watchdog thresholds (0 = disabled). The watchdog observes the loop's
+	// phase tracker and only measures duration in "idle-counted" phases
+	// (PhaseAwaitingLLM, PhaseForceStop) — see phase.go + the design doc at
+	// docs/plans/2026-04-15-turn-lifecycle-design.md. Tool execution,
+	// approval waits, and compaction wrappers are structurally excluded by
+	// their phase, not by manual suspend bookkeeping.
+	idleSoftTimeout time.Duration
+	idleHardTimeout time.Duration
+
+	// checkpointFn is fired mid-turn at specific phase-exit boundaries
+	// (after a tool batch, after successful reactive compaction, before
+	// ForceStop), gated on the tracker's dirty flag so no-op transitions do
+	// not trigger I/O. It runs synchronously on the loop goroutine and must
+	// return promptly (typically a debounced session.Save()).
+	checkpointFn CheckpointFunc
 }
+
+// CheckpointFunc is invoked mid-turn at phase-exit boundaries by AgentLoop.Run
+// so the caller can persist partial session state. Implementations should
+// rebuild the session from loop.RunMessages() idempotently — no diff-append.
+type CheckpointFunc func(ctx context.Context)
 
 func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, shannonDir string, maxIter int, resultTrunc int, argsTrunc int, perms *permissions.PermissionsConfig, auditor *audit.AuditLogger, hookRunner *hooks.HookRunner) *AgentLoop {
 	if maxIter <= 0 {

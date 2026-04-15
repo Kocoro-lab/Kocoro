@@ -870,6 +870,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if ac.ContextWindow != nil {
 			loop.SetContextWindow(*ac.ContextWindow)
 		}
+		if ac.IdleSoftTimeoutSecs != nil {
+			runCfg.Agent.IdleSoftTimeoutSecs = *ac.IdleSoftTimeoutSecs
+		}
+		if ac.IdleHardTimeoutSecs != nil {
+			runCfg.Agent.IdleHardTimeoutSecs = *ac.IdleHardTimeoutSecs
+		}
 	}
 	if req.ModelOverride != "" {
 		loop.SetModelTier(req.ModelOverride)

@@ -9,6 +9,46 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
 )
 
+func TestValidateConfig_IdleTimeouts(t *testing.T) {
+	mk := func(soft, hard int) *Config {
+		c := &Config{}
+		c.Agent.IdleSoftTimeoutSecs = soft
+		c.Agent.IdleHardTimeoutSecs = hard
+		return c
+	}
+	tests := []struct {
+		name    string
+		cfg     *Config
+		wantErr string
+	}{
+		{"both zero ok", mk(0, 0), ""},
+		{"soft only ok", mk(90, 0), ""},
+		{"both positive ordered ok", mk(90, 540), ""},
+		{"negative soft", mk(-1, 0), "idle_soft_timeout_secs"},
+		{"negative hard", mk(0, -1), "idle_hard_timeout_secs"},
+		{"hard too small", mk(0, 10), "too aggressive"},
+		{"hard less than soft", mk(90, 60), "must be >=" /* "must be >= agent.idle_soft_timeout_secs" */},
+		{"hard = soft ok", mk(90, 90), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateConfig(tt.cfg)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("want no error, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("want error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("want error containing %q, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
 func TestAppendAllowedCommand(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
