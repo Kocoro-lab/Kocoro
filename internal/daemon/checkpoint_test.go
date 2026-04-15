@@ -140,6 +140,85 @@ func TestApplyTurnMessages_CheckpointThenFinalSave_NoDuplicate(t *testing.T) {
 	}
 }
 
+// Regression for hard-error-after-checkpoint: a non-soft failure after
+// one or more successful mid-turn checkpoints must NOT duplicate the
+// transcript (checkpoint already persisted it) and must NOT double-count
+// usage (additive AddUsage on top of already-folded usage was the bug).
+// This test mirrors the runner's hard-error path inline.
+func TestApplyTurnState_HardErrorAfterCheckpoint_NoDuplicate(t *testing.T) {
+	sess := &session.Session{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("do thing")},
+		},
+		MessageMeta: []session.MessageMeta{{Source: "web"}},
+		Usage:       &session.UsageSummary{InputTokens: 100, LLMCalls: 1},
+	}
+	base := captureTurnBaseline(sess, "web", true)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	up := &usageStub{usage: agent.AccumulatedUsage{
+		LLM: agent.TurnUsage{InputTokens: 50, LLMCalls: 1},
+	}}
+
+	// Step 1: mid-turn checkpoint after a successful tool batch.
+	agent.SetRunMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("do thing")},
+		{Role: "assistant", Content: client.NewTextContent("[tool_use]")},
+		{Role: "user", Content: client.NewTextContent("[tool_result]")},
+	})
+	applyTurnMessages(sess, loop, base)
+	applyTurnUsage(sess, up, base)
+	// Sanity: 1 baseline + 2 turn msgs = 3. Usage: 100+50=150.
+	if len(sess.Messages) != 3 {
+		t.Fatalf("after checkpoint: want 3 msgs, got %d", len(sess.Messages))
+	}
+	if sess.Usage.InputTokens != 150 {
+		t.Fatalf("after checkpoint: want 150 input tokens, got %d", sess.Usage.InputTokens)
+	}
+
+	// Step 2: hard error fires. The runner's hard-error path rebuilds
+	// from baseline + current RunMessages, appends a friendly error stub,
+	// then applies usage. The accumulator has grown slightly (e.g., one
+	// more failed LLM call).
+	up.usage.LLM.InputTokens = 70 // +20 since checkpoint
+	up.usage.LLM.LLMCalls = 2
+	applyTurnMessages(sess, loop, base)
+	sess.Messages = append(sess.Messages,
+		client.Message{Role: "assistant", Content: client.NewTextContent("Sorry, something failed.")},
+	)
+	sess.MessageMeta = append(sess.MessageMeta,
+		session.MessageMeta{Source: "web", Timestamp: session.TimePtr(time.Now())},
+	)
+	applyTurnUsage(sess, up, base)
+
+	// Expected: 1 baseline + 2 turn + 1 error stub = 4 total. No duplicates.
+	if len(sess.Messages) != 4 {
+		t.Fatalf("after hard error: want 4 msgs (1 baseline + 2 turn + 1 error), got %d", len(sess.Messages))
+	}
+	// Usage: 100 baseline + 70 current = 170. NOT 100+50+70=220 (double-count).
+	if sess.Usage.InputTokens != 170 {
+		t.Fatalf("after hard error: want 170 input tokens (baseline+current), got %d (double-counted)", sess.Usage.InputTokens)
+	}
+	if sess.Usage.LLMCalls != 3 {
+		t.Fatalf("after hard error: want 3 LLMCalls (1 baseline + 2 current), got %d", sess.Usage.LLMCalls)
+	}
+	// Duplicate scan: exactly one tool_use and one tool_result.
+	var toolUse, toolResult, errStub int
+	for _, m := range sess.Messages {
+		switch m.Content.Text() {
+		case "[tool_use]":
+			toolUse++
+		case "[tool_result]":
+			toolResult++
+		case "Sorry, something failed.":
+			errStub++
+		}
+	}
+	if toolUse != 1 || toolResult != 1 || errStub != 1 {
+		t.Fatalf("duplicate in hard-error path: tool_use=%d tool_result=%d err=%d",
+			toolUse, toolResult, errStub)
+	}
+}
+
 // Regression for finding #3: usage survives mid-turn checkpoint + final
 // save without being double-counted. Baseline + current accumulator is
 // the authoritative value at every save.

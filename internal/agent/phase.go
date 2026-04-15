@@ -200,6 +200,16 @@ func (t *phaseTracker) TakeDirty() bool {
 	return d
 }
 
+// IsDirty reads the dirty flag without clearing. Observers use it to
+// peek before deciding to fire a callback; TakeDirty is called only
+// after the callback succeeds so storage errors never silently drop
+// the pending durable-state signal.
+func (t *phaseTracker) IsDirty() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.dirty
+}
+
 // AssertClean reports a violation if any transient restore was forgotten.
 // Call via defer at AgentLoop.Run exit.
 func (t *phaseTracker) AssertClean() {

@@ -383,7 +383,10 @@ type AgentLoop struct {
 // CheckpointFunc is invoked mid-turn at phase-exit boundaries by AgentLoop.Run
 // so the caller can persist partial session state. Implementations should
 // rebuild the session from loop.RunMessages() idempotently — no diff-append.
-type CheckpointFunc func(ctx context.Context)
+// Return a non-nil error to indicate the persistence attempt failed; the
+// loop will leave the tracker's dirty flag set and skip the debounce
+// stamp so the next fire point retries the save immediately.
+type CheckpointFunc func(ctx context.Context) error
 
 func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, shannonDir string, maxIter int, resultTrunc int, argsTrunc int, perms *permissions.PermissionsConfig, auditor *audit.AuditLogger, hookRunner *hooks.HookRunner) *AgentLoop {
 	if maxIter <= 0 {
@@ -437,10 +440,16 @@ func (a *AgentLoop) SetCheckpointMinInterval(d time.Duration) {
 // phase boundary; no-ops when no durable state was produced since the
 // last checkpoint OR when called too soon after the previous fire.
 //
-// IMPORTANT: the debounce check happens BEFORE TakeDirty(). A throttled
-// tick does not clear the dirty flag, so the next fire point still sees
-// the pending durable state. This is the fix for the "debounce silently
-// swallows dirty, work lost if process crashes in the window" bug.
+// Failure-preserving invariants:
+//   - Debounce check happens BEFORE consulting the dirty flag — a
+//     throttled tick leaves the dirty flag set.
+//   - Dirty is only CLEARED on successful save. A checkpoint callback
+//     returning a non-nil error leaves dirty set AND skips the debounce
+//     stamp, so the very next fire point retries.
+//   - Peek-then-take: we read the dirty flag without clearing it, fire
+//     the callback, and only take-and-clear on success. This keeps the
+//     "dirty means unsaved durable state" invariant intact across
+//     storage errors and callback panics.
 func (a *AgentLoop) maybeCheckpoint(ctx context.Context) {
 	if a.checkpointFn == nil || a.tracker == nil {
 		return
@@ -452,11 +461,16 @@ func (a *AgentLoop) maybeCheckpoint(ctx context.Context) {
 		time.Since(a.lastCheckpointAt) < a.checkpointMinInterval {
 		return // dirty flag intentionally left set for next fire
 	}
-	if !a.tracker.TakeDirty() {
+	if !a.tracker.IsDirty() {
 		return
 	}
+	if err := a.checkpointFn(ctx); err != nil {
+		// Leave dirty set and do NOT stamp lastCheckpointAt — the next
+		// fire point retries the save without being throttled.
+		return
+	}
+	a.tracker.TakeDirty() // only clear on successful save
 	a.lastCheckpointAt = time.Now()
-	a.checkpointFn(ctx)
 }
 
 // SetIdleTimeouts configures the per-run watchdog. Zero disables that

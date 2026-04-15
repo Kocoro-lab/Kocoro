@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -39,9 +40,10 @@ func TestCheckpoint_FiresAfterToolBatch(t *testing.T) {
 
 	var checkpointCount atomic.Int32
 	var checkpointMsgCount atomic.Int32
-	loop.SetCheckpointFunc(func(ctx context.Context) {
+	loop.SetCheckpointFunc(func(ctx context.Context) error {
 		checkpointCount.Add(1)
 		checkpointMsgCount.Store(int32(len(loop.RunMessages())))
+		return nil
 	})
 
 	text, _, err := loop.Run(context.Background(), "run tool", nil, nil)
@@ -75,8 +77,9 @@ func TestCheckpoint_NoOpWhenNotDirty(t *testing.T) {
 	loop.SetHandler(&mockHandler{approveResult: true})
 
 	var checkpointCount atomic.Int32
-	loop.SetCheckpointFunc(func(ctx context.Context) {
+	loop.SetCheckpointFunc(func(ctx context.Context) error {
 		checkpointCount.Add(1)
+		return nil
 	})
 
 	_, _, err := loop.Run(context.Background(), "say hi", nil, nil)
@@ -118,8 +121,9 @@ func TestCheckpoint_IdempotentUnderRepeatedCalls(t *testing.T) {
 	// Record msg count seen at each checkpoint — must be monotonically
 	// non-decreasing (compaction can shrink, but in this test there's none).
 	var snapshots []int
-	loop.SetCheckpointFunc(func(ctx context.Context) {
+	loop.SetCheckpointFunc(func(ctx context.Context) error {
 		snapshots = append(snapshots, len(loop.RunMessages()))
+		return nil
 	})
 
 	_, _, err := loop.Run(context.Background(), "loop", nil, nil)
@@ -137,6 +141,45 @@ func TestCheckpoint_IdempotentUnderRepeatedCalls(t *testing.T) {
 	}
 }
 
+// TestMaybeCheckpoint_SaveFailureRetainsDirty verifies that a checkpoint
+// callback returning an error leaves the tracker's dirty flag SET and
+// does not stamp lastCheckpointAt. The next fire point retries the save
+// without being throttled by the debounce window. A naive implementation
+// that takes-dirty-and-stamps-time before the callback would let storage
+// errors silently drop pending work.
+func TestMaybeCheckpoint_SaveFailureRetainsDirty(t *testing.T) {
+	loop := NewAgentLoop(nil, NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	loop.tracker = newPhaseTracker()
+	loop.SetCheckpointMinInterval(100 * time.Millisecond)
+
+	var fireCount atomic.Int32
+	// Simulate a persistent storage error — every call returns error.
+	loop.SetCheckpointFunc(func(ctx context.Context) error {
+		fireCount.Add(1)
+		return errors.New("simulated disk full")
+	})
+
+	loop.tracker.MarkDirty()
+	loop.maybeCheckpoint(context.Background())
+	if fireCount.Load() != 1 {
+		t.Fatalf("fire 1: want 1 call, got %d", fireCount.Load())
+	}
+	// Dirty must still be set (save failed).
+	if !loop.tracker.IsDirty() {
+		t.Fatal("save failure cleared dirty flag — pending work would be silently lost")
+	}
+
+	// Next call (even within debounce window) must retry, not be throttled,
+	// because lastCheckpointAt was NOT stamped on the failed call.
+	loop.maybeCheckpoint(context.Background())
+	if fireCount.Load() != 2 {
+		t.Fatalf("fire 2 (after failure): want 2 calls (retry), got %d — debounce was wrongly stamped on failure", fireCount.Load())
+	}
+	if !loop.tracker.IsDirty() {
+		t.Fatal("second failure also dropped dirty")
+	}
+}
+
 // TestMaybeCheckpoint_DebouncePreservesDirty verifies finding #2's fix:
 // when the debounce window skips a checkpoint, the tracker's dirty flag
 // is left set so the next fire point persists the pending durable state.
@@ -148,7 +191,7 @@ func TestMaybeCheckpoint_DebouncePreservesDirty(t *testing.T) {
 	loop.SetCheckpointMinInterval(100 * time.Millisecond)
 
 	var fires atomic.Int32
-	loop.SetCheckpointFunc(func(ctx context.Context) { fires.Add(1) })
+	loop.SetCheckpointFunc(func(ctx context.Context) error { fires.Add(1); return nil })
 
 	// Fire 1: dirty set, no prior checkpoint — should fire.
 	loop.tracker.MarkDirty()
@@ -202,10 +245,11 @@ func TestCheckpoint_SurvivesCancelMidTurn(t *testing.T) {
 
 	var capturedSnapshots atomic.Int32
 	var lastSnapshotMsgs atomic.Int32
-	loop.SetCheckpointFunc(func(ctx context.Context) {
+	loop.SetCheckpointFunc(func(ctx context.Context) error {
 		capturedSnapshots.Add(1)
 		lastSnapshotMsgs.Store(int32(len(loop.RunMessages())))
 		inToolCount.Add(1)
+		return nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

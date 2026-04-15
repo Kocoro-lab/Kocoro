@@ -951,12 +951,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	turnBase := captureTurnBaseline(sess, checkpointSource, preLoopUserAppended)
 	loop.SetCheckpointMinInterval(2 * time.Second) // debounce in the loop, not here
-	loop.SetCheckpointFunc(func(ctx context.Context) {
+	loop.SetCheckpointFunc(func(ctx context.Context) error {
 		applyTurnState(sess, loop, handler, turnBase)
 		sess.InProgress = true
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: mid-turn checkpoint save failed: %v", err)
+			// Return the error so AgentLoop.maybeCheckpoint keeps the
+			// dirty flag set and the next fire point retries.
+			return err
 		}
+		return nil
 	})
 
 	result, usage, runErr := loop.Run(ctx, prompt, resolvedContent, history)
@@ -972,27 +976,26 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		userErr := FriendlyAgentError(runErr)
 		savedSessionID := ""
 		if !req.Ephemeral && result == "" {
+			// Use the same idempotent rebuild as the mid-turn checkpoint
+			// and the normal final save: reset messages+usage to
+			// (baseline + current snapshot), then append the friendly
+			// error stub on top. This handles three previously-broken cases:
+			//   (a) a prior checkpoint already persisted partial transcript
+			//       — we must not duplicate it by appending the error on
+			//       top of what's already there.
+			//   (b) a dirty checkpoint was debounced just before the error
+			//       — rebuilding from RunMessages picks up the trailing
+			//       batches that never got their own save.
+			//   (c) usage was already folded by a checkpoint — AddUsage
+			//       would double-count, so use baseline+current instead.
+			applyTurnMessages(sess, loop, turnBase)
 			sess.Messages = append(sess.Messages,
 				client.Message{Role: "assistant", Content: client.NewTextContent(userErr)},
 			)
 			sess.MessageMeta = append(sess.MessageMeta,
 				session.MessageMeta{Source: req.Source, Timestamp: session.TimePtr(time.Now())},
 			)
-			// Also fold whatever usage accumulated before the hard error so
-			// the saved session reflects real cost of the failed turn (e.g.
-			// a few successful tool iterations that ran up tokens before a
-			// later LLM call failed).
-			if up, ok := handler.(agent.UsageProvider); ok {
-				acc := up.Usage()
-				llm := acc.LLM
-				if llm.LLMCalls > 0 || acc.ToolCalls > 0 || llm.InputTokens > 0 {
-					sessMgr.AddUsage(sess.ID, session.UsageFromAccumulated(
-						llm.LLMCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
-						llm.CostUSD, llm.CacheReadTokens, llm.CacheCreationTokens, llm.Model,
-						acc.ToolCalls, acc.ToolCostUSD,
-					))
-				}
-			}
+			applyTurnUsage(sess, handler, turnBase)
 			sess.InProgress = false // hard-error path: turn is over, clear marker
 			if err := sessMgr.Save(); err != nil {
 				log.Printf("daemon: failed to save error session: %v", err)
