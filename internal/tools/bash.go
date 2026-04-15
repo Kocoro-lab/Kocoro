@@ -62,7 +62,7 @@ func isSafeCommand(cmd string, extraSafe []string) bool {
 func (t *BashTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:        "bash",
-		Description: "Execute a shell command. Use for running scripts, data processing, file management, automation, and system operations.",
+		Description: "Execute a shell command. Use for running scripts, data processing, file management, automation, and system operations. For multi-line Python with embedded quotes or regex, prefer writing a script via file_write and then running `python3 /path/to/script.py` — heredoc+quote nesting is a frequent source of shell-level syntax errors.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

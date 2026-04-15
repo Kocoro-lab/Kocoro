@@ -2171,7 +2171,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// tool results to reinforce instructions in long sessions.
 			// Skip cloud results — they are copied directly to the user.
 			if !result.CloudResult {
-				if reminder := systemReminder(fc.Name); reminder != "" {
+				if reminder := systemReminder(fc.Name, fc.Arguments); reminder != "" {
 					contextResult += "\n\n" + reminder
 				}
 			}
@@ -2711,18 +2711,62 @@ func truncateStr(s string, max int) string {
 
 // systemReminder returns a short contextual hint for high-signal tools,
 // reinforcing key instructions that decay in influence during long sessions.
-// Returns "" for tools that don't need reminders.
-func systemReminder(toolName string) string {
+// Returns "" for tools that don't need reminders — including bash calls
+// whose command doesn't have a dedicated-tool equivalent (so we don't spam
+// reminders on legitimate `mkdir`, `pip`, `python`, `curl`, etc.).
+func systemReminder(toolName string, rawArgs json.RawMessage) string {
 	switch toolName {
 	case "file_read":
 		return "<system-reminder>Read before modifying. Use file_edit for changes, not file_write on existing files.</system-reminder>"
 	case "file_write", "file_edit":
 		return "<system-reminder>Verify changes: use file_read to confirm edits. Never claim done without evidence.</system-reminder>"
 	case "bash":
+		if !bashCommandHasDedicatedToolReplacement(rawArgs) {
+			return ""
+		}
 		return "<system-reminder>Prefer dedicated tools over bash (glob not find, grep not rg, file_read not cat).</system-reminder>"
 	default:
 		return ""
 	}
+}
+
+// bashCommandHasDedicatedToolReplacement reports whether the bash call is
+// exactly one of the handful of read-only file/dir introspection commands
+// (cat, head, tail, find, grep, rg, ls) with no shell composition. Only those
+// cases have a clean dedicated-tool equivalent (file_read, glob, grep). Any
+// command that pipes, chains, redirects, or substitutes falls through —
+// reminding the model to "use glob not find" on `mkdir -p x && python run.py`
+// is noise, not signal.
+func bashCommandHasDedicatedToolReplacement(rawArgs json.RawMessage) bool {
+	if len(rawArgs) == 0 {
+		return false
+	}
+	var args struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return false
+	}
+	cmd := strings.TrimSpace(args.Command)
+	if cmd == "" {
+		return false
+	}
+	// Any shell composition means the caller is doing something beyond a
+	// simple read; the dedicated-tool substitution wouldn't preserve intent.
+	for _, op := range []string{"|", "&&", "||", ";", ">", "<", "`", "$(", "\n"} {
+		if strings.Contains(cmd, op) {
+			return false
+		}
+	}
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "cat", "head", "tail", "find", "grep", "rg", "ls":
+		return true
+	}
+	return false
 }
 
 // generateCallID returns a 6-character random hex string used to tag tool

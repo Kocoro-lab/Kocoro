@@ -66,22 +66,20 @@ func (t *BrowserTool) Info() agent.ToolInfo {
 		Description: "Control a headless browser with an isolated profile. " +
 			"FIRST CHOICE for any web page interaction: navigating, clicking, reading, scraping, screenshots of web content. " +
 			"Only skip this for pages requiring user login/authentication — use GUI tools for those. " +
-			"Actions: navigate, click, type, scroll, screenshot, read_page, execute_js, wait, snapshot, find, close. " +
-			"Use 'snapshot' to get the accessibility tree with element refs (e1, e2, ...), then use 'ref' parameter with click/type/scroll actions. " +
-			"Use 'find' to search for elements by natural language description.",
+			"Actions: navigate, click, type, scroll, screenshot, read_page, execute_js, wait, close. " +
+			"Use 'read_page' (textMode 'raw' for full DOM) to inspect page structure, or 'execute_js' to query the DOM programmatically and return JSON. " +
+			"Note: snapshot/find (accessibility-tree actions) are not advertised — they only work with the legacy pinchtab backend; use Playwright MCP for equivalent functionality when available.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"action":   map[string]any{"type": "string", "description": "Action: navigate, click, type, scroll, screenshot, read_page, execute_js, wait, snapshot, find, close"},
+				"action":   map[string]any{"type": "string", "description": "Action: navigate, click, type, scroll, screenshot, read_page, execute_js, wait, close"},
 				"url":      map[string]any{"type": "string", "description": "URL to navigate to (for navigate action)"},
 				"selector": map[string]any{"type": "string", "description": "CSS selector (for click, type, read_page, scroll, wait)"},
-				"ref":      map[string]any{"type": "string", "description": "Element ref from snapshot, e.g. 'e5' (for click, type, scroll — alternative to selector)"},
+				"ref":      map[string]any{"type": "string", "description": "Element ref, e.g. 'e5' (for click, type, scroll — alternative to selector). Only meaningful when another tool has produced refs for the current page."},
 				"text":     map[string]any{"type": "string", "description": "Text to type (for type action)"},
 				"key":      map[string]any{"type": "string", "description": "Key to press, e.g. 'Enter' (for press action via click with key)"},
 				"value":    map[string]any{"type": "string", "description": "Value to select (for select action via click with value)"},
-				"script":   map[string]any{"type": "string", "description": "JavaScript to execute (for execute_js action)"},
-				"query":    map[string]any{"type": "string", "description": "Natural language search query (for find action)"},
-				"filter":       map[string]any{"type": "string", "description": "Filter mode: 'interactive' or 'all' (for snapshot action, default: interactive)"},
+				"script":   map[string]any{"type": "string", "description": "JavaScript to execute (for execute_js action). Expression context: a plain expression is evaluated and its value returned. Scripts whose first token is a top-level statement keyword (`return`, `const`, `let`, `var`, `function`, `async`, `if`, `for`, `while`, `try`) are auto-wrapped in an async IIFE on the chromedp backend so they evaluate correctly; plain expressions (including semicolon-terminated or multi-line ones) pass through unchanged."},
 				"waitFor":      map[string]any{"type": "string", "description": "Navigation wait strategy: e.g. 'domcontentloaded', 'networkidle' (for navigate action)"},
 				"waitSelector": map[string]any{"type": "string", "description": "CSS selector to wait for after navigation"},
 				"blockImages":  map[string]any{"type": "boolean", "description": "Disable image loading during navigation"},
@@ -148,6 +146,10 @@ func (t *BrowserTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	case "wait":
 		return t.waitVisible(ctx, args, timeout)
 	case "snapshot":
+		// Pinchtab-only; returns a "requires pinchtab" error on the chromedp
+		// fallback. No longer advertised in Info() so fresh calls should not
+		// arrive here — but the dispatch stays to keep pinchtab environments
+		// working (see ensureBackend's pinchtab-first preference).
 		return t.snapshotAction(ctx, args)
 	case "find":
 		return t.findAction(ctx, args)
@@ -187,7 +189,7 @@ func (t *BrowserTool) validateArgs(args browserArgs) error {
 	case "scroll", "screenshot", "read_page", "snapshot":
 		// no required params
 	default:
-		return fmt.Errorf("unknown action: %q (valid: navigate, click, type, scroll, screenshot, read_page, execute_js, wait, snapshot, find, close)", args.Action)
+		return fmt.Errorf("unknown action: %q (valid: navigate, click, type, scroll, screenshot, read_page, execute_js, wait, close)", args.Action)
 	}
 	return nil
 }
@@ -615,12 +617,17 @@ func (t *BrowserTool) executeJS(_ context.Context, args browserArgs, timeout tim
 		return agent.ToolResult{Content: output}, nil
 	}
 
-	// chromedp
+	// chromedp: Evaluate runs in expression context, so multi-statement
+	// scripts with `return`/`const`/`let` would fail with "Illegal return
+	// statement". Transparently wrap them in an async IIFE so the script
+	// author can write natural multi-statement JS.
+	script := wrapJSForEvaluate(args.Script)
+
 	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
 	defer cancel()
 
 	var result any
-	if err := chromedp.Run(tCtx, chromedp.Evaluate(args.Script, &result)); err != nil {
+	if err := chromedp.Run(tCtx, chromedp.Evaluate(script, &result)); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("execute_js error: %v", err), IsError: true}, nil
 	}
 	output := fmt.Sprintf("%v", result)
@@ -741,6 +748,50 @@ func (t *BrowserTool) findAction(_ context.Context, args browserArgs) (agent.Too
 	}
 
 	return agent.ToolResult{Content: sb.String()}, nil
+}
+
+// wrapJSForEvaluate rewrites a script intended for chromedp.Evaluate so that
+// bare top-level statements (`return x`, `const x = …; return x`) evaluate
+// without a "SyntaxError: Illegal return statement". chromedp.Evaluate runs
+// in expression context, so only statement-like leading keywords trigger the
+// wrap — plain expressions (including semicolon-terminated or multi-line ones
+// like `JSON.stringify(x);` or `a\nb`) must pass through unchanged, because
+// wrapping them in an IIFE without an explicit `return` would silently change
+// the returned value to `undefined`.
+func wrapJSForEvaluate(script string) string {
+	trimmed := strings.TrimSpace(script)
+	if trimmed == "" {
+		return script
+	}
+	// Already wrapped in a user-authored IIFE? Leave it alone — a redundant
+	// wrap is still valid JS, but this keeps behavior predictable in tests.
+	if strings.HasPrefix(trimmed, "(async") || strings.HasPrefix(trimmed, "(()") ||
+		strings.HasPrefix(trimmed, "(function") {
+		return script
+	}
+	if !hasLeadingKeyword(trimmed, "return", "const", "let", "var", "function", "async", "if", "for", "while", "try") {
+		return script
+	}
+	return "(async () => { " + script + " })()"
+}
+
+// hasLeadingKeyword reports whether s starts with any of the keywords followed
+// by whitespace, `(`, or `{` — i.e. a statement boundary rather than an
+// identifier that happens to share a prefix (`returnValue`).
+func hasLeadingKeyword(s string, keywords ...string) bool {
+	for _, kw := range keywords {
+		if !strings.HasPrefix(s, kw) {
+			continue
+		}
+		if len(s) == len(kw) {
+			return true
+		}
+		next := s[len(kw)]
+		if next == ' ' || next == '\t' || next == '(' || next == '{' {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *BrowserTool) closeBrowser() (agent.ToolResult, error) {

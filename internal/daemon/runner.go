@@ -661,10 +661,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 
 	// Resolve effective CWD: request > resumed session > agent config. When all
-	// three are empty we deliberately do NOT invent a working directory — the
-	// request runs with no filesystem scope, and filesystem tools (glob, grep,
-	// file_read, directory_list) will refuse any relative paths at the tool
-	// level. Web-only and pure-reasoning tasks are unaffected.
+	// three are empty we deliberately do NOT invent a working directory for
+	// most sources — the request runs with no filesystem scope, and filesystem
+	// tools (glob, grep, file_read, directory_list) will refuse any relative
+	// paths at the tool level. Web-only and pure-reasoning tasks are unaffected.
+	//
+	// Cloud-routed sources (slack/line/feishu/lark/telegram/webhook) are the
+	// one exception: they arrive with no user shell and no persisted CWD, so a
+	// tool like browser_snapshot(filename="x.md") has nowhere to land and
+	// file_read("x.md") can't resolve it. For those we allocate a per-session
+	// scratch dir under ~/.shannon/tmp/sessions/<id>/ as the lowest-priority
+	// fallback. Any real CWD (request/resumed/agent) still wins.
 	var sessionCWD string
 	if resumed {
 		sessionCWD = sess.CWD
@@ -674,6 +681,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		agentCWD = agentOverride.Config.CWD
 	}
 	effectiveCWD := cwdctx.ResolveEffectiveCWD(req.CWD, sessionCWD, agentCWD)
+	var cloudSessionCWD string
+	if effectiveCWD == "" {
+		if dir, err := ensureCloudSessionTmpDir(deps.ShannonDir, sess.ID, req.Source); err != nil {
+			log.Printf("daemon: failed to allocate cloud session cwd for %s: %v", sess.ID, err)
+		} else if dir != "" {
+			cloudSessionCWD = dir
+			effectiveCWD = dir
+		}
+	}
 	if effectiveCWD != "" {
 		if err := cwdctx.ValidateCWD(effectiveCWD); err != nil {
 			return nil, fmt.Errorf("invalid cwd: %w", err)
@@ -688,8 +704,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	// Only write back when we have a real CWD — avoid poisoning the session
 	// with an empty value and avoid overwriting an existing non-empty session
-	// CWD with an empty fallback.
-	if effectiveCWD != "" {
+	// CWD with an empty fallback. Cloud scratch dirs are deliberately NOT
+	// persisted: they live under ~/.shannon/tmp/sessions/<id>/, get removed
+	// on session close, and must be re-allocated on every resume. Persisting
+	// them would leave sess.CWD pointing at a now-deleted path, and the next
+	// run would fail ValidateCWD before it could recreate the scratch.
+	if effectiveCWD != "" && cloudSessionCWD == "" {
 		sess.CWD = effectiveCWD
 	}
 	ctx = cwdctx.WithSessionCWD(ctx, effectiveCWD)
@@ -952,6 +972,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		filePreview.AllowFile(p)
 	}
 	sessMgr.OnSessionClose(sess.ID, func() { _ = filePreview.Close() })
+	if cloudSessionCWD != "" {
+		// Reclaim the per-session scratch dir when the session is closed
+		// (SessionCache eviction, daemon shutdown). Artifacts live across turns
+		// of the same session but don't accumulate across sessions.
+		sessMgr.OnSessionClose(sess.ID, cloudSessionTmpCleanup(cloudSessionCWD))
+	}
 	ctx = tools.WithFilePreview(ctx, filePreview)
 	if attachmentCleanup != nil {
 		attachmentRegistered = true // cancel the defer safety net

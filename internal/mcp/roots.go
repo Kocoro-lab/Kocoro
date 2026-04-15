@@ -99,7 +99,17 @@ func (h *RootsHandler) clientOption() mcpclient.ClientOption {
 func DefaultWorkspaceRootCandidates(shannonDir string) []string {
 	candidates := []string{}
 	if shannonDir != "" {
-		candidates = append(candidates, filepath.Join(shannonDir, "tmp", "attachments"))
+		candidates = append(candidates,
+			filepath.Join(shannonDir, "tmp", "attachments"),
+			// Per-cloud-session scratch dirs live here. Advertising the parent
+			// root lets MCP servers that gate file I/O on declared roots (e.g.
+			// playwright-mcp for uploads) accept paths the daemon allocated
+			// for browser_snapshot / browser_take_screenshot under
+			// ~/.shannon/tmp/sessions/<id>/. ListRoots filters by existence
+			// so advertising this before any session has allocated under it
+			// is harmless.
+			filepath.Join(shannonDir, "tmp", "sessions"),
+		)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		candidates = append(candidates,

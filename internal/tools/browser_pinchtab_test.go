@@ -360,18 +360,41 @@ func TestBrowser_InfoNewParams(t *testing.T) {
 	info := tool.Info()
 	props := info.Parameters["properties"].(map[string]any)
 
-	newParams := []string{"ref", "query", "filter", "key", "value", "waitFor", "waitSelector", "blockImages", "blockAds", "textMode", "maxChars", "raw"}
+	// snapshot/find are pinchtab-only actions; pinchtab is legacy and the
+	// chromedp fallback can't honor them. They've been removed from the
+	// advertised schema so the model doesn't waste a call discovering the
+	// runtime failure. The corresponding `query` and `filter` params go with
+	// them. See fix C.
+	newParams := []string{"ref", "key", "value", "waitFor", "waitSelector", "blockImages", "blockAds", "textMode", "maxChars", "raw"}
 	for _, p := range newParams {
 		if _, exists := props[p]; !exists {
 			t.Errorf("expected parameter %q in properties", p)
 		}
 	}
-
-	if !strings.Contains(info.Description, "snapshot") {
-		t.Error("expected description to mention snapshot")
+	for _, p := range []string{"query", "filter"} {
+		if _, exists := props[p]; exists {
+			t.Errorf("parameter %q should have been removed from schema", p)
+		}
 	}
-	if !strings.Contains(info.Description, "find") {
-		t.Error("expected description to mention find")
+	// snapshot/find must not appear in the action list (the tool's primary
+	// instructions to the model). They may still appear in an explanatory
+	// note telling the model why those actions are unavailable — that note
+	// is a feature, not drift.
+	const actionListPrefix = "Actions: "
+	start := strings.Index(info.Description, actionListPrefix)
+	if start < 0 {
+		t.Fatalf("expected %q in description, got %q", actionListPrefix, info.Description)
+	}
+	tail := info.Description[start+len(actionListPrefix):]
+	end := strings.Index(tail, ". ")
+	if end < 0 {
+		end = len(tail)
+	}
+	actionList := tail[:end]
+	for _, kw := range []string{"snapshot", "find"} {
+		if strings.Contains(actionList, kw) {
+			t.Errorf("action list should no longer mention %q, got %q", kw, actionList)
+		}
 	}
 }
 
