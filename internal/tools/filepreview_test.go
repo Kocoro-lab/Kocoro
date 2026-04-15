@@ -423,6 +423,93 @@ func TestFilePreviewBridge_AllowFile_ExactOnly(t *testing.T) {
 	}
 }
 
+// TestFilePreviewBridge_Symlink_EscapeFromAllowedRoot is the
+// security-critical regression for the "allowlist is lexical, symlinks
+// still escape" finding. A symlink placed INSIDE an allowed root that
+// points to a target OUTSIDE the root must be rejected — the bridge
+// compares symlink-resolved real paths on both sides, matching the
+// file-access contract of permissions.CheckFilePath.
+func TestFilePreviewBridge_Symlink_EscapeFromAllowedRoot(t *testing.T) {
+	// Forbidden area.
+	outsideDir := t.TempDir()
+	secret := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOP SECRET"), 0644); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+
+	// Allowed area contains a symlink pointing to the secret.
+	allowedDir := t.TempDir()
+	trojan := filepath.Join(allowedDir, "looks-innocent.txt")
+	if err := os.Symlink(secret, trojan); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	b := NewFilePreviewBridge()
+	b.AllowRoot(allowedDir)
+	t.Cleanup(func() { _ = b.Close() })
+
+	_, err := b.RewriteFileURL("file://" + trojan)
+	if err == nil {
+		t.Fatal("symlink escape via allowed root must be rejected")
+	}
+	if !strings.Contains(err.Error(), "allowlist") {
+		t.Fatalf("expected allowlist rejection, got: %v", err)
+	}
+}
+
+// TestFilePreviewBridge_Symlink_InsideAllowedRoot confirms the converse:
+// a symlink whose target stays inside the allowed subtree still works
+// (realpath on both sides keeps intra-subtree symlinks usable).
+func TestFilePreviewBridge_Symlink_InsideAllowedRoot(t *testing.T) {
+	allowedDir := t.TempDir()
+	target := filepath.Join(allowedDir, "real.html")
+	if err := os.WriteFile(target, []byte("<h1>ok</h1>"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	link := filepath.Join(allowedDir, "alias.html")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	b := NewFilePreviewBridge()
+	b.AllowRoot(allowedDir)
+	t.Cleanup(func() { _ = b.Close() })
+
+	if _, err := b.RewriteFileURL("file://" + link); err != nil {
+		t.Fatalf("intra-subtree symlink should be allowed: %v", err)
+	}
+}
+
+// TestFilePreviewBridge_AllowRoot_SymlinkedRoot_ResolvesCorrectly: if the
+// configured root is itself a symlink, we resolve it on registration so
+// the allowlist matches real-paths consistently on both sides.
+func TestFilePreviewBridge_AllowRoot_SymlinkedRoot_ResolvesCorrectly(t *testing.T) {
+	realBase := t.TempDir()
+	realRoot := filepath.Join(realBase, "real")
+	if err := os.MkdirAll(realRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(realRoot, "x.html")
+	if err := os.WriteFile(file, []byte("ok"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	linkRoot := filepath.Join(t.TempDir(), "linked-root")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	b := NewFilePreviewBridge()
+	b.AllowRoot(linkRoot) // configured via symlink
+	t.Cleanup(func() { _ = b.Close() })
+
+	// Requesting the file via its real path must succeed (same realpath
+	// on both sides).
+	if _, err := b.RewriteFileURL("file://" + file); err != nil {
+		t.Fatalf("file reached via real path should be allowed when root is a symlink: %v", err)
+	}
+}
+
 func TestFilePreviewBridge_AllowRoot_IgnoresInvalidPaths(t *testing.T) {
 	b := NewFilePreviewBridge()
 	t.Cleanup(func() { _ = b.Close() })

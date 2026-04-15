@@ -70,38 +70,53 @@ func NewFilePreviewBridge() *FilePreviewBridge {
 	}
 }
 
+// resolveReal returns the absolute, symlink-resolved form of path. If the
+// path or any intermediate component cannot be resolved (missing file,
+// platform edge case), it falls back to the lexical filepath.Clean(abs).
+// Matches the best-effort realpath pattern used in permissions.CheckFilePath.
+func resolveReal(path string) (string, bool) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", false
+	}
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(real), true
+	}
+	return filepath.Clean(abs), true
+}
+
 // AllowRoot whitelists a directory subtree. All regular files at or below
-// this directory become eligible for rewrite. Non-absolute or unresolvable
-// paths are silently ignored (defense-in-depth — never widen the set on
-// bad input).
+// this directory (after symlink resolution on BOTH sides) become eligible
+// for rewrite. Non-absolute or unresolvable paths are silently ignored
+// (defense-in-depth — never widen the set on bad input).
 func (b *FilePreviewBridge) AllowRoot(dir string) {
 	if b == nil || dir == "" {
 		return
 	}
-	abs, err := filepath.Abs(dir)
-	if err != nil {
+	real, ok := resolveReal(dir)
+	if !ok {
 		return
 	}
-	info, err := os.Stat(abs)
+	info, err := os.Stat(real)
 	if err != nil || !info.IsDir() {
 		return
 	}
 	b.mu.Lock()
-	b.allowedRoots = append(b.allowedRoots, filepath.Clean(abs))
+	b.allowedRoots = append(b.allowedRoots, real)
 	b.mu.Unlock()
 }
 
-// AllowFile whitelists an exact file path.
+// AllowFile whitelists an exact file path (after symlink resolution).
 func (b *FilePreviewBridge) AllowFile(path string) {
 	if b == nil || path == "" {
 		return
 	}
-	abs, err := filepath.Abs(path)
-	if err != nil {
+	real, ok := resolveReal(path)
+	if !ok {
 		return
 	}
 	b.mu.Lock()
-	b.allowedFiles[filepath.Clean(abs)] = true
+	b.allowedFiles[real] = true
 	b.mu.Unlock()
 }
 
@@ -151,16 +166,25 @@ func (b *FilePreviewBridge) RewriteFileURL(fileURL string) (string, error) {
 	if err != nil {
 		decoded = u.Path
 	}
+	// Resolve symlinks: a link inside an allowed root that points OUTSIDE
+	// the root must be rejected. We compare real paths on both sides.
+	// EvalSymlinks requires the target to exist, which is also our
+	// regular-file check below.
 	abs, err := filepath.Abs(decoded)
 	if err != nil {
 		return "", fmt.Errorf("resolve file path: %w", err)
 	}
-	info, err := os.Stat(abs)
+	real, err := filepath.EvalSymlinks(abs)
 	if err != nil {
-		return "", fmt.Errorf("stat %s: %w", abs, err)
+		return "", fmt.Errorf("resolve symlinks for %s: %w", abs, err)
+	}
+	real = filepath.Clean(real)
+	info, err := os.Stat(real)
+	if err != nil {
+		return "", fmt.Errorf("stat %s: %w", real, err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("not a regular file: %s", abs)
+		return "", fmt.Errorf("not a regular file: %s", real)
 	}
 
 	b.mu.Lock()
@@ -169,16 +193,16 @@ func (b *FilePreviewBridge) RewriteFileURL(fileURL string) (string, error) {
 		return "", errors.New("file preview bridge closed")
 	}
 
-	// Allowlist enforcement — the model must not gain broader local-file
-	// reach through the browser than the normal filesystem tools. Fail
-	// closed if the path is outside every configured root / file.
-	if !b.isAllowedLocked(abs) {
-		return "", fmt.Errorf("file not in preview allowlist: %s", abs)
+	// Allowlist enforcement against the REAL path, so symlinks cannot
+	// escape the allowed subtree. The model must not gain broader local-
+	// file reach through the browser than the normal filesystem tools.
+	if !b.isAllowedLocked(real) {
+		return "", fmt.Errorf("file not in preview allowlist: %s", real)
 	}
 
-	// Reuse the existing token for this path in the same session.
-	if token, ok := b.byPath[abs]; ok {
-		return b.urlFor(token, abs), nil
+	// Reuse the existing token for this real path in the same session.
+	if token, ok := b.byPath[real]; ok {
+		return b.urlFor(token, real), nil
 	}
 
 	// Lazy server start on first registration.
@@ -192,9 +216,9 @@ func (b *FilePreviewBridge) RewriteFileURL(fileURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("generate token: %w", err)
 	}
-	b.tokens[token] = abs
-	b.byPath[abs] = token
-	return b.urlFor(token, abs), nil
+	b.tokens[token] = real
+	b.byPath[real] = token
+	return b.urlFor(token, real), nil
 }
 
 // urlFor builds the public URL. Caller must hold b.mu.
