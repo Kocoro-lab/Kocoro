@@ -39,6 +39,11 @@ type Session struct {
 	SummaryCache    string           `json:"summary_cache,omitempty"`     // cached summary Markdown
 	SummaryCacheKey string           `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
 	Usage           *UsageSummary    `json:"usage,omitempty"`             // cumulative LLM + tool cost/token totals
+	// InProgress is true between a mid-turn checkpoint save and the final
+	// post-turn save. If a session is loaded with this set, the previous
+	// run crashed or was killed mid-turn — the transcript is partial but
+	// recoverable; tool results already executed are preserved.
+	InProgress bool `json:"in_progress,omitempty"`
 }
 
 // UsageSummary captures cumulative LLM and gateway-tool costs across a session.

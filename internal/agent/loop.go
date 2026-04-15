@@ -408,6 +408,31 @@ func (a *AgentLoop) SetHandler(h EventHandler) {
 	a.handler = h
 }
 
+// SetCheckpointFunc installs a mid-turn persistence hook. It is invoked at
+// durable phase-exit boundaries (after tool batches, after successful
+// reactive compaction, before ForceStop) when the tracker's dirty flag is
+// set. Implementations must be idempotent and fast — typically a debounced
+// session.Save() that rebuilds the transcript from loop.RunMessages().
+func (a *AgentLoop) SetCheckpointFunc(fn CheckpointFunc) {
+	a.checkpointFn = fn
+}
+
+// maybeCheckpoint fires the checkpoint hook only if the tracker's dirty
+// flag is set. Safe to call at any phase boundary; no-ops when no
+// durable state was produced since the last checkpoint.
+func (a *AgentLoop) maybeCheckpoint(ctx context.Context) {
+	if a.checkpointFn == nil || a.tracker == nil {
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if !a.tracker.TakeDirty() {
+		return
+	}
+	a.checkpointFn(ctx)
+}
+
 // SetIdleTimeouts configures the per-run watchdog. Zero disables that
 // threshold individually. Typical defaults (soft=90s, hard=0) keep the
 // watchdog in visibility-only mode.
@@ -1076,10 +1101,15 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		})
 		markInjected()
 		// Pre-ForceStop: the loop-detector verdict + accumulated tool state
-		// are durable; mark dirty so the checkpoint hook (Slice 4) saves
-		// before the final LLM call. PhaseForceStop is idle-counted.
+		// are durable; mark dirty so the checkpoint hook saves before the
+		// final LLM call, then fire it. PhaseForceStop is idle-counted so
+		// the watchdog still observes the final LLM call.
 		if a.tracker != nil {
 			a.tracker.MarkDirty()
+		}
+		captureRunMessages()
+		a.maybeCheckpoint(ctx)
+		if a.tracker != nil {
 			a.tracker.Enter(PhaseForceStop)
 		}
 
@@ -1497,6 +1527,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				compactionSummary = nextSummary
 				compactionApplied = true
 				reactiveCompacted = true // never reset — prevents infinite reactive loops
+				// Durable: the summary was expensive; checkpoint before we
+				// retry the LLM call so a crash in the retry does not force
+				// redoing the summary on next run.
+				a.tracker.MarkDirty()
 
 				// Rebase run-local indices — same bookkeeping as proactive compaction.
 				if len(messages) < before {
@@ -1547,6 +1581,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					Thinking:        a.thinking,
 					ReasoningEffort: a.reasoningEffort,
 				}
+				// Checkpoint the compacted state before retrying. Gated on
+				// the dirty flag we just set — a no-op compaction path
+				// (same message count, no MarkDirty) would not write.
+				captureRunMessages()
+				a.maybeCheckpoint(ctx)
 				continue // retry with compacted request
 			}
 			if !isRetryableLLMError(err) || attempt >= maxLLMRetries-1 {
@@ -1965,6 +2004,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			a.tracker.Enter(PhaseExecutingTools)
 			executeBatches(ctx, batches, execResults, readTracker, a.handler)
 			a.tracker.MarkDirty() // tool batch is durable state for checkpoint
+			// Fire mid-turn checkpoint after captureRunMessages below, so
+			// RunMessages() reflects the just-completed batch. The actual
+			// call happens at the iteration-tail checkpoint below.
 		}
 
 		// Deferred mode: check if tool_search loaded new tools, rebuild schemas.
@@ -2257,6 +2299,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				markInjected()
 			}
 		}
+
+		// End-of-iteration checkpoint: if the tool-exec phase dirtied the
+		// tracker, snapshot the conversation now so a mid-turn crash does
+		// not lose this batch's work. No-op otherwise.
+		captureRunMessages()
+		a.maybeCheckpoint(ctx)
 	}
 
 	// Graceful degradation: return last text with a sentinel error so the

@@ -939,6 +939,31 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		sessMgr.OnClose(attachmentCleanup)
 	}
 
+	// Mid-turn checkpoint: after each tool batch / reactive compaction /
+	// pre-ForceStop boundary inside AgentLoop.Run, rebuild the session
+	// transcript from loop.RunMessages() and Save. Idempotent (rebuilds
+	// from snapshot, never diff-appends) and 2s-debounced to avoid
+	// thrashing sessions.db during tool-heavy turns.
+	baselineMsgCount := len(sess.Messages)
+	baselineMetaCount := len(sess.MessageMeta)
+	checkpointSource := req.Source
+	if checkpointSource == "" {
+		checkpointSource = "unknown"
+	}
+	var lastCheckpointAt time.Time
+	loop.SetCheckpointFunc(func(ctx context.Context) {
+		if time.Since(lastCheckpointAt) < 2*time.Second {
+			return
+		}
+		lastCheckpointAt = time.Now()
+		applyRunMessagesToSession(sess, loop, checkpointSource,
+			baselineMsgCount, baselineMetaCount, preLoopUserAppended)
+		sess.InProgress = true
+		if err := sessMgr.Save(); err != nil {
+			log.Printf("daemon: mid-turn checkpoint save failed: %v", err)
+		}
+	})
+
 	result, usage, runErr := loop.Run(ctx, prompt, resolvedContent, history)
 	status := loop.LastRunStatus()
 	if runErr != nil && !isSoftRunError(runErr) {
@@ -973,6 +998,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					))
 				}
 			}
+			sess.InProgress = false // hard-error path: turn is over, clear marker
 			if err := sessMgr.Save(); err != nil {
 				log.Printf("daemon: failed to save error session: %v", err)
 			} else {
@@ -1079,6 +1105,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				))
 			}
 		}
+		sess.InProgress = false // turn completed — clear mid-turn crash marker
 		saveErr = sessMgr.Save()
 		if saveErr != nil {
 			log.Printf("daemon: failed to save session: %v", saveErr)
@@ -1196,6 +1223,49 @@ func isSoftRunError(err error) bool {
 		errors.Is(err, agent.ErrHardIdleTimeout) ||
 		errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded)
+}
+
+// applyRunMessagesToSession rebuilds the turn's messages on the session by
+// truncating back to the pre-turn baseline and re-applying the current
+// loop.RunMessages() snapshot. Idempotent: calling it multiple times with
+// different snapshots produces the expected final state without drift, so
+// compaction that shrinks the run message list still produces the right
+// session shape.
+func applyRunMessagesToSession(sess *session.Session, loop *agent.AgentLoop,
+	source string, baselineMsgCount, baselineMetaCount int, preLoopUserAppended bool) {
+	// Truncate to pre-turn baseline — drops anything appended by a prior
+	// checkpoint so we always rebuild from the current snapshot.
+	if len(sess.Messages) > baselineMsgCount {
+		sess.Messages = sess.Messages[:baselineMsgCount]
+	}
+	if len(sess.MessageMeta) > baselineMetaCount {
+		sess.MessageMeta = sess.MessageMeta[:baselineMetaCount]
+	}
+
+	runMsgs := loop.RunMessages()
+	if len(runMsgs) == 0 {
+		return
+	}
+	runInjected := loop.RunMessageInjected()
+	runTimestamps := loop.RunMessageTimestamps()
+
+	startIdx := 0
+	if preLoopUserAppended && runMsgs[0].Role == "user" {
+		startIdx = 1
+	}
+	fallbackTime := time.Now()
+	for i := startIdx; i < len(runMsgs); i++ {
+		ts := fallbackTime
+		if i < len(runTimestamps) && !runTimestamps[i].IsZero() {
+			ts = runTimestamps[i]
+		}
+		sess.Messages = append(sess.Messages, runMsgs[i])
+		meta := session.MessageMeta{Source: source, Timestamp: session.TimePtr(ts)}
+		if i < len(runInjected) && runInjected[i] {
+			meta.SystemInjected = true
+		}
+		sess.MessageMeta = append(sess.MessageMeta, meta)
+	}
 }
 
 // FriendlyAgentError maps raw agent errors to user-facing messages.
