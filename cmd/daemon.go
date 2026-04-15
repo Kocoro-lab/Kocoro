@@ -651,6 +651,21 @@ func (h *daemonEventHandler) OnCloudPlan(planType, content string, needsReview b
 		h.deps.EventBus.Emit(daemon.Event{Type: daemon.EventCloudPlan, Payload: payload})
 	}
 }
+
+// OnRunStatus forwards watchdog soft/hard events (and other turn-level
+// status signals) to the daemon event bus so SSE/desktop subscribers can
+// render "still working, upstream slow" hints during silent stalls.
+func (h *daemonEventHandler) OnRunStatus(code, detail string) {
+	if h.deps.EventBus != nil {
+		payload, _ := json.Marshal(map[string]string{
+			"code":       code,
+			"detail":     detail,
+			"session_id": h.sessionID,
+			"agent":      h.agent,
+		})
+		h.deps.EventBus.Emit(daemon.Event{Type: daemon.EventRunStatus, Payload: payload})
+	}
+}
 func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
 		log.Printf("daemon: auto-approving %s (auto_approve=true)", tool)

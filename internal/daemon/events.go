@@ -18,6 +18,7 @@ const (
 	EventCloudProgress    = "cloud_progress"
 	EventCloudPlan        = "cloud_plan"
 	EventNotification     = "notification"
+	EventRunStatus        = "run_status" // watchdog soft/hard events, LLM retries, etc.
 )
 
 // Event is a daemon lifecycle event pushed to SSE subscribers.

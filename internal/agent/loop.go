@@ -1095,7 +1095,15 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		finalResp, err := a.completeWithRetry(ctx, req)
 		if err != nil {
 			captureRunMessages()
-			setRunStatus(runstatus.CodeFromError(err), false)
+			// Hard-idle during ForceStop is still a soft/partial outcome,
+			// not a hard error — the decision to stop was already durable
+			// (MarkDirty fired before the call). Match the main-loop
+			// classification at loop.go's AwaitingLLM cancel path.
+			if errors.Is(err, ErrHardIdleTimeout) {
+				setRunStatus(runstatus.CodeDeadlineExceeded, true)
+			} else {
+				setRunStatus(runstatus.CodeFromError(err), false)
+			}
 			return "", err
 		}
 		usage.Add(finalResp.Usage)
@@ -2280,6 +2288,12 @@ func (a *AgentLoop) completeWithRetry(ctx context.Context, req client.Completion
 			return resp, nil
 		}
 		if ctx.Err() != nil {
+			// Prefer the context cause when available so watchdog hard
+			// timeout surfaces as ErrHardIdleTimeout and not a generic
+			// user-cancel. Callers use errors.Is to branch on it.
+			if cause := context.Cause(ctx); cause != nil && cause != ctx.Err() {
+				return nil, fmt.Errorf("LLM call cancelled: %w", cause)
+			}
 			return nil, fmt.Errorf("LLM call cancelled: %w", ctx.Err())
 		}
 		if !isRetryableLLMError(err) || attempt >= maxRetries-1 {
@@ -2293,6 +2307,9 @@ func (a *AgentLoop) completeWithRetry(ctx context.Context, req client.Completion
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
+			if cause := context.Cause(ctx); cause != nil && cause != ctx.Err() {
+				return nil, fmt.Errorf("LLM call cancelled: %w", cause)
+			}
 			return nil, fmt.Errorf("LLM call cancelled: %w", ctx.Err())
 		}
 	}

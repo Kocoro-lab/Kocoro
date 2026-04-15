@@ -84,6 +84,36 @@ func TestAgentLoop_Watchdog_SoftStatus_HangingClient(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_Watchdog_ForceStop_HardTimeout_SurfacesHardIdleError(t *testing.T) {
+	// Regression for finding #4: during PhaseForceStop, completeWithRetry
+	// must preserve ErrHardIdleTimeout in the error chain (via context.Cause)
+	// rather than collapsing it into ctx.Err() == context.Canceled.
+	gw := &hangingLLMClient{}
+	loop := NewAgentLoop(gw, NewToolRegistry(), "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetEnableStreaming(false)
+	handler := &recordingHandler{mockHandler: mockHandler{approveResult: true}}
+	loop.SetHandler(handler)
+
+	// Simulate ForceStop-style call directly by entering PhaseForceStop and
+	// running completeWithRetry against a ctx cancelled by a cause.
+	loop.tracker = newPhaseTracker()
+	loop.tracker.Enter(PhaseForceStop)
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel(ErrHardIdleTimeout)
+	}()
+
+	_, err := loop.completeWithRetry(ctx, client.CompletionRequest{})
+	if err == nil {
+		t.Fatal("expected cancel error")
+	}
+	if !errors.Is(err, ErrHardIdleTimeout) {
+		t.Fatalf("want ErrHardIdleTimeout via context.Cause, got: %v", err)
+	}
+}
+
 func TestAgentLoop_Watchdog_HardTimeout_CancelsWithCause(t *testing.T) {
 	gw := &hangingLLMClient{}
 	loop := NewAgentLoop(gw, NewToolRegistry(), "medium", "", 25, 2000, 200, nil, nil, nil)

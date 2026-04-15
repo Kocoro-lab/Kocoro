@@ -824,7 +824,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetTemperature(runCfg.Agent.Temperature)
 	loop.SetContextWindow(runCfg.Agent.ContextWindow)
 	loop.SetEnableStreaming(false)
-	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
 	if agentOverride != nil {
 		scopedMCPCtx := tools.ResolveMCPContext(runCfg, agentOverride)
@@ -878,6 +877,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			runCfg.Agent.IdleHardTimeoutSecs = *ac.IdleHardTimeoutSecs
 		}
 	}
+	// Apply idle-timeout config AFTER per-agent overrides have been folded
+	// into runCfg, otherwise agent-level opt-in/override silently does nothing.
+	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)
 	if req.ModelOverride != "" {
 		loop.SetModelTier(req.ModelOverride)
 	}
@@ -1191,6 +1193,7 @@ func closeRouteDone(done chan struct{}) {
 // full conversation from RunMessages(), not just a friendly error stub.
 func isSoftRunError(err error) bool {
 	return errors.Is(err, agent.ErrMaxIterReached) ||
+		errors.Is(err, agent.ErrHardIdleTimeout) ||
 		errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded)
 }

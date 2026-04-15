@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -192,6 +193,8 @@ func TestIsSoftRunError(t *testing.T) {
 		{"context.Canceled", context.Canceled, true},
 		{"context.DeadlineExceeded", context.DeadlineExceeded, true},
 		{"ErrMaxIterReached", agent.ErrMaxIterReached, true},
+		{"ErrHardIdleTimeout", agent.ErrHardIdleTimeout, true},
+		{"wrapped ErrHardIdleTimeout", fmt.Errorf("turn aborted: %w", agent.ErrHardIdleTimeout), true},
 		{"wrapped Canceled", errors.Join(errors.New("loop"), context.Canceled), true},
 		{"random error", errors.New("something broke"), false},
 		{"API error", errors.New("429 rate limited"), false},
