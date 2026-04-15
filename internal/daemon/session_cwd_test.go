@@ -7,6 +7,28 @@ import (
 	"testing"
 )
 
+// TestCloudSourceDefinitionsAgree pins the two places that must agree on
+// "what counts as a cloud source" — the allocator (isCloudSource) and the
+// output-format profile (outputFormatForSource). Adding a new source to one
+// without the other would silently give it a rendered profile but no scratch
+// CWD (or vice versa). This test drives both paths with the same inputs and
+// asserts identical classification.
+func TestCloudSourceDefinitionsAgree(t *testing.T) {
+	inputs := []string{
+		"slack", "line", "feishu", "lark", "telegram", "webhook",
+		"desktop", "cli", "cron", "schedule", "web", "", "unknown",
+		"SLACK", " Slack ",
+	}
+	for _, src := range inputs {
+		cloud := isCloudSource(src)
+		plain := outputFormatForSource(src) == "plain"
+		if cloud != plain {
+			t.Errorf("source %q: isCloudSource=%v but outputFormatForSource=%q — definitions drifted",
+				src, cloud, outputFormatForSource(src))
+		}
+	}
+}
+
 func TestIsCloudSource(t *testing.T) {
 	cases := map[string]bool{
 		"slack":    true,

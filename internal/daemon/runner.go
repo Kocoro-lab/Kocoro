@@ -315,13 +315,15 @@ func (req *RunAgentRequest) EnsureRouteKey() {
 // Only explicit cloud-distributed channel sources use "plain" — Shannon Cloud
 // handles final channel rendering for these (Slack mrkdwn, LINE Flex, etc.).
 // Everything else (local, cron, schedule, web, unknown) defaults to "markdown".
+//
+// Shares its cloud-source definition with ensureCloudSessionTmpDir via
+// isCloudSource; the two paths must agree on what "cloud-routed" means or the
+// allocator and the formatter would drift apart silently.
 func outputFormatForSource(source string) string {
-	switch strings.ToLower(strings.TrimSpace(source)) {
-	case "slack", "line", "feishu", "lark", "telegram", "webhook":
+	if isCloudSource(source) {
 		return "plain"
-	default:
-		return "markdown"
 	}
+	return "markdown"
 }
 
 func routeTitle(source, channel, sender string) string {

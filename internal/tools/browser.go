@@ -769,10 +769,34 @@ func wrapJSForEvaluate(script string) string {
 		strings.HasPrefix(trimmed, "(function") {
 		return script
 	}
-	if !hasLeadingKeyword(trimmed, "return", "const", "let", "var", "function", "async", "if", "for", "while", "try") {
+	// `async` alone is ambiguous: `async () => expr` is a perfectly valid
+	// expression and wrapping it in an IIFE without a `return` would turn
+	// the arrow-function result into `undefined`. Only `async function …`
+	// (a declaration) needs wrapping, so match that two-token form and
+	// leave bare `async` out of the general keyword list.
+	if hasAsyncFunctionPrefix(trimmed) {
+		return "(async () => { " + script + " })()"
+	}
+	if !hasLeadingKeyword(trimmed, "return", "const", "let", "var", "function", "if", "for", "while", "try") {
 		return script
 	}
 	return "(async () => { " + script + " })()"
+}
+
+// hasAsyncFunctionPrefix reports whether s starts with "async function"
+// (with whitespace between the tokens). The arrow-function form
+// `async () => …` and identifier-like forms (`asyncFoo`) return false.
+func hasAsyncFunctionPrefix(s string) bool {
+	const prefix = "async"
+	if !strings.HasPrefix(s, prefix) {
+		return false
+	}
+	rest := s[len(prefix):]
+	if rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
+		return false
+	}
+	rest = strings.TrimLeft(rest, " \t")
+	return hasLeadingKeyword(rest, "function")
 }
 
 // hasLeadingKeyword reports whether s starts with any of the keywords followed

@@ -34,6 +34,7 @@ internal/
     approval.go        # interactive tool approval over WS
     types.go           # daemon request/response types, disconnect, approval messages
     events.go          # EventBus ring buffer for daemon/SSE subscribers
+    session_cwd.go     # cloud-source scratch CWD allocator (ephemeral per-session tmp dir)
   agent/
     loop.go            # AgentLoop.Run() — core agentic loop
     tools.go           # Tool interface, ToolRegistry, filtering, schemas

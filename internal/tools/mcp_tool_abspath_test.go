@@ -2,6 +2,8 @@ package tools
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -56,20 +58,35 @@ func TestMaybeRewriteFileProducingArg_AlreadyAbsoluteNoop(t *testing.T) {
 	}
 }
 
-func TestMaybeRewriteFileProducingArg_TildePathsNoop(t *testing.T) {
-	// Tilde-prefixed paths signal "home-relative absolute" in every other
-	// layer of the agent (bash, file tools, shell). Rewriting them to
-	// <cwd>/~/Desktop/x.md would both misreport the location back to the
-	// model and create a literal "~" directory inside the session scratch.
+func TestMaybeRewriteFileProducingArg_TildeExpands(t *testing.T) {
+	// Tilde-prefixed paths must be expanded to the user's home BEFORE the
+	// MCP call — Node-based MCP servers (playwright-mcp in particular) don't
+	// do shell-style tilde expansion, so a literal `~/Desktop/x.md` would
+	// be written to `./~/Desktop/x.md` relative to the server process CWD.
+	// Expanding here matches the tilde contract in cwdctx and the bash tool.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no home dir available: %v", err)
+	}
 	cwd := t.TempDir()
 	ctx := cwdctx.WithSessionCWD(context.Background(), cwd)
-	for _, v := range []string{"~/Desktop/out.md", "~/notes/x.md", "~"} {
-		args := map[string]any{"filename": v}
-		if got := maybeRewriteFileProducingArg(ctx, "playwright", "browser_snapshot", args); got != "" {
-			t.Errorf("filename=%q: expected no rewrite, got %q", v, got)
+
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"~/Desktop/out.md", filepath.Join(home, "Desktop", "out.md")},
+		{"~/notes/x.md", filepath.Join(home, "notes", "x.md")},
+		{"~", home},
+	}
+	for _, tc := range cases {
+		args := map[string]any{"filename": tc.in}
+		got := maybeRewriteFileProducingArg(ctx, "playwright", "browser_snapshot", args)
+		if got != tc.want {
+			t.Errorf("filename=%q: got %q, want %q", tc.in, got, tc.want)
 		}
-		if args["filename"] != v {
-			t.Errorf("filename=%q: args was mutated to %v", v, args["filename"])
+		if args["filename"] != tc.want {
+			t.Errorf("filename=%q: args[filename] = %v, want %q", tc.in, args["filename"], tc.want)
 		}
 	}
 }

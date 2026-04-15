@@ -35,6 +35,7 @@ internal/
     types.go           # Shared daemon types (disconnect, approval_request/response/resolved)
     events.go          # EventBus ring buffer for daemon/SSE subscribers
     attachment.go      # Download remote file attachments (Slack/Feishu) → file_ref pipeline
+    session_cwd.go     # Cloud-source scratch CWD allocator (ephemeral, per-session tmp dir)
   agent/
     loop.go            # AgentLoop.Run() — core agentic loop, SwitchAgent()
     tools.go           # Tool interface, ToolRegistry, FilterByAllow/Deny, Schemas()

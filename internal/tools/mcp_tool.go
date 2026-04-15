@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -205,13 +206,31 @@ func maybeRewriteFileProducingArg(ctx context.Context, serverName, toolName stri
 		if trimmed == "" {
 			continue
 		}
-		// Treat tilde-prefixed paths as already-resolved: the caller's intent
-		// is clearly a home-relative absolute path, not something scoped to
-		// the session CWD. We leave the value untouched so the MCP server
-		// (or the user's shell, upstream) can expand it; rewriting to
-		// `<cwd>/~/…` would both misreport the saved location and produce a
-		// literal `~` directory component.
-		if filepath.IsAbs(trimmed) || strings.HasPrefix(trimmed, "~/") || trimmed == "~" {
+		// Tilde-prefixed paths: the caller wants a home-relative absolute
+		// path, not a session-scoped one. We must expand `~` ourselves
+		// before handing the filename to the MCP server — playwright-mcp
+		// (and most Node-based MCPs) do not do shell-style tilde expansion,
+		// so a literal `~/Desktop/x.md` would get written to `./~/Desktop/x.md`
+		// relative to the server's process CWD. Rewrite the arg in place to
+		// the expanded absolute path and return it so the result can be
+		// annotated with the real location. This matches the tilde handling
+		// elsewhere in the agent (cwdctx.ResolveFilesystemPath, bash tool).
+		if strings.HasPrefix(trimmed, "~/") || trimmed == "~" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				continue
+			}
+			var expanded string
+			if trimmed == "~" {
+				expanded = home
+			} else {
+				expanded = filepath.Join(home, strings.TrimPrefix(trimmed, "~/"))
+			}
+			expanded = filepath.Clean(expanded)
+			args[name] = expanded
+			return expanded
+		}
+		if filepath.IsAbs(trimmed) {
 			continue
 		}
 		// Reject anything that tries to climb out of the session CWD. Keeping

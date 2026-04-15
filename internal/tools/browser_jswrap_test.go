@@ -26,6 +26,13 @@ func TestWrapJSForEvaluate(t *testing.T) {
 		{"var", "var z = 3", true},
 		{"function declaration", "function f() { return 1 }", true},
 		{"async function", "async function g() { return 1 }", true},
+		{"async function with extra whitespace", "async  function g() { return 1 }", true},
+		// `async` alone must NOT trigger wrap — `async () => expr` is a
+		// valid expression; wrapping it without an explicit `return` in the
+		// outer IIFE would silently yield `undefined`.
+		{"async arrow expression", "async () => fetch('/x').then(r => r.json())", false},
+		{"async arrow without space", "async()=>1", false},
+		{"asyncFoo identifier", "asyncFoo", false},
 		{"multiline const", "const a = 1\na", true},
 		{"leading if", "if (true) { return 1 }", true},
 		{"leading try", "try { return 1 } catch (e) {}", true},
