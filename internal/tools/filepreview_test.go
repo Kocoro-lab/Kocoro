@@ -34,10 +34,11 @@ func fetch(t *testing.T, u string) (*http.Response, string) {
 }
 
 func TestFilePreviewBridge_RewriteAndServe(t *testing.T) {
+	path := writeTempFile(t, "hello.html", "<h1>hi</h1>")
 	b := NewFilePreviewBridge()
+	b.AllowFile(path)
 	t.Cleanup(func() { _ = b.Close() })
 
-	path := writeTempFile(t, "hello.html", "<h1>hi</h1>")
 	rewritten, err := b.RewriteFileURL("file://" + path)
 	if err != nil {
 		t.Fatalf("RewriteFileURL: %v", err)
@@ -60,10 +61,11 @@ func TestFilePreviewBridge_RewriteAndServe(t *testing.T) {
 }
 
 func TestFilePreviewBridge_ReusesTokenForSamePath(t *testing.T) {
+	path := writeTempFile(t, "x.txt", "ok")
 	b := NewFilePreviewBridge()
+	b.AllowFile(path)
 	t.Cleanup(func() { _ = b.Close() })
 
-	path := writeTempFile(t, "x.txt", "ok")
 	u1, err := b.RewriteFileURL("file://" + path)
 	if err != nil {
 		t.Fatalf("rewrite 1: %v", err)
@@ -78,11 +80,12 @@ func TestFilePreviewBridge_ReusesTokenForSamePath(t *testing.T) {
 }
 
 func TestFilePreviewBridge_DistinctTokensPerFile(t *testing.T) {
-	b := NewFilePreviewBridge()
-	t.Cleanup(func() { _ = b.Close() })
-
 	p1 := writeTempFile(t, "a.txt", "A")
 	p2 := writeTempFile(t, "b.txt", "B")
+	b := NewFilePreviewBridge()
+	b.AllowFile(p1)
+	b.AllowFile(p2)
+	t.Cleanup(func() { _ = b.Close() })
 	u1, err := b.RewriteFileURL("file://" + p1)
 	if err != nil {
 		t.Fatalf("rewrite 1: %v", err)
@@ -104,10 +107,11 @@ func TestFilePreviewBridge_DistinctTokensPerFile(t *testing.T) {
 }
 
 func TestFilePreviewBridge_UnknownToken404(t *testing.T) {
+	path := writeTempFile(t, "x.txt", "ok")
 	b := NewFilePreviewBridge()
+	b.AllowFile(path)
 	t.Cleanup(func() { _ = b.Close() })
 
-	path := writeTempFile(t, "x.txt", "ok")
 	u, err := b.RewriteFileURL("file://" + path)
 	if err != nil {
 		t.Fatalf("rewrite: %v", err)
@@ -121,11 +125,11 @@ func TestFilePreviewBridge_UnknownToken404(t *testing.T) {
 }
 
 func TestFilePreviewBridge_NoDirectoryListing(t *testing.T) {
-	b := NewFilePreviewBridge()
-	t.Cleanup(func() { _ = b.Close() })
-
 	// Register a file so the server starts, then probe the root.
 	path := writeTempFile(t, "x.txt", "ok")
+	b := NewFilePreviewBridge()
+	b.AllowFile(path)
+	t.Cleanup(func() { _ = b.Close() })
 	u, err := b.RewriteFileURL("file://" + path)
 	if err != nil {
 		t.Fatalf("rewrite: %v", err)
@@ -138,10 +142,11 @@ func TestFilePreviewBridge_NoDirectoryListing(t *testing.T) {
 }
 
 func TestFilePreviewBridge_TraversalRefused(t *testing.T) {
+	path := writeTempFile(t, "x.txt", "ok")
 	b := NewFilePreviewBridge()
+	b.AllowFile(path)
 	t.Cleanup(func() { _ = b.Close() })
 
-	path := writeTempFile(t, "x.txt", "ok")
 	u, err := b.RewriteFileURL("file://" + path)
 	if err != nil {
 		t.Fatalf("rewrite: %v", err)
@@ -207,6 +212,7 @@ func TestFilePreviewBridge_PercentEncodedPath(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	b := NewFilePreviewBridge()
+	b.AllowFile(path)
 	t.Cleanup(func() { _ = b.Close() })
 
 	encodedPath := strings.ReplaceAll(path, " ", "%20")
@@ -222,8 +228,9 @@ func TestFilePreviewBridge_PercentEncodedPath(t *testing.T) {
 }
 
 func TestFilePreviewBridge_CloseTearsDownServer(t *testing.T) {
-	b := NewFilePreviewBridge()
 	path := writeTempFile(t, "x.txt", "ok")
+	b := NewFilePreviewBridge()
+	b.AllowFile(path)
 	u, err := b.RewriteFileURL("file://" + path)
 	if err != nil {
 		t.Fatalf("rewrite: %v", err)
@@ -280,9 +287,10 @@ func TestFilePreview_CtxPlumbing(t *testing.T) {
 }
 
 func TestMaybeRewriteFileURL_Intercepts(t *testing.T) {
-	b := NewFilePreviewBridge()
-	t.Cleanup(func() { _ = b.Close() })
 	path := writeTempFile(t, "page.html", "<html></html>")
+	b := NewFilePreviewBridge()
+	b.AllowFile(path)
+	t.Cleanup(func() { _ = b.Close() })
 
 	ctx := WithFilePreview(context.Background(), b)
 	args := map[string]any{"url": "file://" + path}
@@ -315,6 +323,119 @@ func TestMaybeRewriteFileURL_NoBridge_Skipped(t *testing.T) {
 		map[string]any{"url": "file:///tmp/x.html"})
 	if ok {
 		t.Fatal("without a bridge on ctx, no rewrite should occur")
+	}
+}
+
+// === Allowlist regressions (security-critical) =========================
+
+func TestFilePreviewBridge_RejectsPathOutsideAllowlist(t *testing.T) {
+	// Bridge with NO allowlist entries → fail-closed on everything.
+	b := NewFilePreviewBridge()
+	t.Cleanup(func() { _ = b.Close() })
+	path := writeTempFile(t, "x.txt", "ok")
+	_, err := b.RewriteFileURL("file://" + path)
+	if err == nil {
+		t.Fatal("empty allowlist must reject all files")
+	}
+	if !strings.Contains(err.Error(), "allowlist") {
+		t.Fatalf("expected allowlist error, got: %v", err)
+	}
+	// Confirm server never started — no listener leak on rejected requests.
+	if b.Active() {
+		t.Fatal("allowlist rejection must not start the HTTP server")
+	}
+}
+
+func TestFilePreviewBridge_AllowRoot_PermitsSubtree(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	deep := filepath.Join(sub, "deep.html")
+	if err := os.WriteFile(deep, []byte("ok"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	b := NewFilePreviewBridge()
+	b.AllowRoot(dir) // only the top dir; subtree is implicit
+	t.Cleanup(func() { _ = b.Close() })
+
+	if _, err := b.RewriteFileURL("file://" + deep); err != nil {
+		t.Fatalf("subtree file must be allowed: %v", err)
+	}
+}
+
+func TestFilePreviewBridge_AllowRoot_RejectsOutsideSubtree(t *testing.T) {
+	allowed := t.TempDir()
+	forbidden := writeTempFile(t, "secret.txt", "never") // different temp dir
+
+	b := NewFilePreviewBridge()
+	b.AllowRoot(allowed)
+	t.Cleanup(func() { _ = b.Close() })
+
+	_, err := b.RewriteFileURL("file://" + forbidden)
+	if err == nil {
+		t.Fatal("file outside allowlist must be rejected")
+	}
+}
+
+func TestFilePreviewBridge_AllowRoot_DoesNotMatchSiblingPrefix(t *testing.T) {
+	// Regression for the classic "/foo" matching "/foobar" bug. Must use
+	// a path separator boundary, not a raw string prefix.
+	base := t.TempDir()
+	allowed := filepath.Join(base, "proj")
+	sibling := filepath.Join(base, "proj-leak")
+	if err := os.MkdirAll(allowed, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sibling, 0755); err != nil {
+		t.Fatal(err)
+	}
+	siblingFile := filepath.Join(sibling, "x.html")
+	if err := os.WriteFile(siblingFile, []byte("leak"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := NewFilePreviewBridge()
+	b.AllowRoot(allowed)
+	t.Cleanup(func() { _ = b.Close() })
+
+	if _, err := b.RewriteFileURL("file://" + siblingFile); err == nil {
+		t.Fatal("sibling dir with shared prefix must NOT match allowlist root")
+	}
+}
+
+func TestFilePreviewBridge_AllowFile_ExactOnly(t *testing.T) {
+	allowed := writeTempFile(t, "ok.html", "yes")
+	// Different file in a different temp dir — parent not whitelisted.
+	neighbor := writeTempFile(t, "other.html", "no")
+
+	b := NewFilePreviewBridge()
+	b.AllowFile(allowed)
+	t.Cleanup(func() { _ = b.Close() })
+
+	if _, err := b.RewriteFileURL("file://" + allowed); err != nil {
+		t.Fatalf("allowed file must pass: %v", err)
+	}
+	if _, err := b.RewriteFileURL("file://" + neighbor); err == nil {
+		t.Fatal("neighbor file must be rejected when only exact file is allowed")
+	}
+}
+
+func TestFilePreviewBridge_AllowRoot_IgnoresInvalidPaths(t *testing.T) {
+	b := NewFilePreviewBridge()
+	t.Cleanup(func() { _ = b.Close() })
+
+	// Non-existent, non-directory, empty — each should be a silent no-op.
+	b.AllowRoot("")
+	b.AllowRoot("/definitely/not/a/real/path/ever")
+	b.AllowRoot(writeTempFile(t, "not-a-dir.txt", "x")) // passed a file, not dir
+
+	// Bridge is still fail-closed.
+	path := writeTempFile(t, "x.txt", "ok")
+	if _, err := b.RewriteFileURL("file://" + path); err == nil {
+		t.Fatal("bad AllowRoot inputs must not widen allowlist")
 	}
 }
 

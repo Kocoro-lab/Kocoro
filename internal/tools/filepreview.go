@@ -22,15 +22,22 @@ import (
 //
 // Design invariants:
 //   - Bound to 127.0.0.1 only. Never publicly reachable.
+//   - ALLOWLISTED paths only. RewriteFileURL rejects paths outside an
+//     explicitly configured set of allowed roots or allowed files. A
+//     bridge with no allowlist rejects everything — fail-closed default.
+//     This matches the file-access boundary of other agent tools: the
+//     model can't escalate its reach by routing through the browser.
 //   - Random 16-byte hex token per file; URL path is /<token>/<name>.
-//   - Each entry scopes exactly one file path — no directory listings, no
-//     glob access, no traversal. Requests for unknown tokens → 404.
+//     Requests for unknown tokens → 404.
 //   - Lazy server start on first registration; idempotent for the same
 //     file path. Server is torn down via Close(), wired to session close.
 //
 // The model never sees the file:// URL after interception; the rewritten
 // http://127.0.0.1:<port>/<token>/<name> URL is opaque to it, preventing
-// the model from constructing unauthorized paths.
+// the model from constructing unauthorized paths. Combined with the
+// allowlist, this means the worst a compromised/misused browser_navigate
+// call can do is re-read a file the agent was already authorized to
+// access via normal tools.
 type FilePreviewBridge struct {
 	mu       sync.Mutex
 	srv      *http.Server
@@ -42,14 +49,80 @@ type FilePreviewBridge struct {
 	// repeated rewrites of the same file:// URL in one session.
 	byPath map[string]string
 	closed bool
+
+	// Allowlist. A path is accepted for rewrite if it is either:
+	//   - an exact match of an entry in allowedFiles (cleaned abs path), OR
+	//   - under (or equal to) an entry in allowedRoots.
+	// Empty allowlist → everything is rejected (fail-closed).
+	allowedRoots []string // cleaned absolute directory paths
+	allowedFiles map[string]bool
 }
 
-// NewFilePreviewBridge creates an unstarted bridge.
+// NewFilePreviewBridge creates an unstarted bridge with an empty
+// allowlist. Callers MUST configure it via AllowRoot / AllowFile before
+// any rewrite will succeed. The daemon runner does this per-session from
+// sessionCWD + user-attached paths.
 func NewFilePreviewBridge() *FilePreviewBridge {
 	return &FilePreviewBridge{
-		tokens: make(map[string]string),
-		byPath: make(map[string]string),
+		tokens:       make(map[string]string),
+		byPath:       make(map[string]string),
+		allowedFiles: make(map[string]bool),
 	}
+}
+
+// AllowRoot whitelists a directory subtree. All regular files at or below
+// this directory become eligible for rewrite. Non-absolute or unresolvable
+// paths are silently ignored (defense-in-depth — never widen the set on
+// bad input).
+func (b *FilePreviewBridge) AllowRoot(dir string) {
+	if b == nil || dir == "" {
+		return
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	b.mu.Lock()
+	b.allowedRoots = append(b.allowedRoots, filepath.Clean(abs))
+	b.mu.Unlock()
+}
+
+// AllowFile whitelists an exact file path.
+func (b *FilePreviewBridge) AllowFile(path string) {
+	if b == nil || path == "" {
+		return
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return
+	}
+	b.mu.Lock()
+	b.allowedFiles[filepath.Clean(abs)] = true
+	b.mu.Unlock()
+}
+
+// isAllowedLocked checks whether abs is within the allowlist. Caller must
+// hold b.mu.
+func (b *FilePreviewBridge) isAllowedLocked(abs string) bool {
+	cleaned := filepath.Clean(abs)
+	if b.allowedFiles[cleaned] {
+		return true
+	}
+	for _, root := range b.allowedRoots {
+		// Proper prefix check: abs must be root itself or under it.
+		if cleaned == root {
+			return true
+		}
+		rootWithSep := root + string(filepath.Separator)
+		if strings.HasPrefix(cleaned, rootWithSep) {
+			return true
+		}
+	}
+	return false
 }
 
 // RewriteFileURL takes a file:// URL, registers its target on the bridge
@@ -94,6 +167,13 @@ func (b *FilePreviewBridge) RewriteFileURL(fileURL string) (string, error) {
 	defer b.mu.Unlock()
 	if b.closed {
 		return "", errors.New("file preview bridge closed")
+	}
+
+	// Allowlist enforcement — the model must not gain broader local-file
+	// reach through the browser than the normal filesystem tools. Fail
+	// closed if the path is outside every configured root / file.
+	if !b.isAllowedLocked(abs) {
+		return "", fmt.Errorf("file not in preview allowlist: %s", abs)
 	}
 
 	// Reuse the existing token for this path in the same session.

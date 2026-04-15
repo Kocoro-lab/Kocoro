@@ -16,8 +16,8 @@ type Manager struct {
 	mu              sync.Mutex
 	store           *Store
 	current         *Session
-	onCloseFns      []func()          // manager-wide cleanup callbacks invoked on Close
-	sessionCloseFns map[string]func() // per-session cleanup invoked on session switch/Close
+	onCloseFns      []func()            // manager-wide cleanup callbacks invoked on Close
+	sessionCloseFns map[string][]func() // per-session cleanup invoked on session switch/Close; append semantics
 	runtime         map[string]*sessionRuntime
 }
 
@@ -173,9 +173,12 @@ func (m *Manager) OnClose(fn func()) {
 	m.onCloseFns = append(m.onCloseFns, fn)
 }
 
-// OnSessionClose registers cleanup for a specific session ID.
-// Registering again for the same session replaces the previous callback.
-// The callback fires when the manager switches away from that session or closes.
+// OnSessionClose registers cleanup for a specific session ID. Multiple
+// callbacks per session are appended and all fire (in registration order)
+// when the manager switches away from that session or closes. Each caller
+// is responsible for one resource — this is a safety-critical lifecycle
+// hook, so composing cleanups by append (not replace) avoids silent leaks
+// when two subsystems register for the same session.
 func (m *Manager) OnSessionClose(sessionID string, fn func()) {
 	if sessionID == "" || fn == nil {
 		return
@@ -183,9 +186,9 @@ func (m *Manager) OnSessionClose(sessionID string, fn func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.sessionCloseFns == nil {
-		m.sessionCloseFns = make(map[string]func())
+		m.sessionCloseFns = make(map[string][]func())
 	}
-	m.sessionCloseFns[sessionID] = fn
+	m.sessionCloseFns[sessionID] = append(m.sessionCloseFns[sessionID], fn)
 }
 
 // WorkingSet returns the in-memory deferred-tool working set for a session.
@@ -213,9 +216,11 @@ func (m *Manager) Close() error {
 	m.mu.Lock()
 	fns := append([]func(){}, m.onCloseFns...)
 	m.onCloseFns = nil
-	for _, fn := range m.sessionCloseFns {
-		if fn != nil {
-			fns = append(fns, fn)
+	for _, sessFns := range m.sessionCloseFns {
+		for _, fn := range sessFns {
+			if fn != nil {
+				fns = append(fns, fn)
+			}
 		}
 	}
 	m.sessionCloseFns = nil
@@ -229,12 +234,12 @@ func (m *Manager) takeSessionCloseLocked(sessionID string) []func() {
 	if sessionID == "" || m.sessionCloseFns == nil {
 		return nil
 	}
-	fn, ok := m.sessionCloseFns[sessionID]
-	if !ok || fn == nil {
+	fns, ok := m.sessionCloseFns[sessionID]
+	if !ok || len(fns) == 0 {
 		return nil
 	}
 	delete(m.sessionCloseFns, sessionID)
-	return []func(){fn}
+	return fns
 }
 
 func runCallbacks(fns []func()) {

@@ -123,20 +123,40 @@ func TestManager_OnSessionClose_FiresOnSessionSwitch(t *testing.T) {
 	}
 }
 
-func TestManager_OnSessionClose_ReplacesCallbackForSameSession(t *testing.T) {
+func TestManager_OnSessionClose_AppendsCallbacks(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(dir)
 
 	sess := m.NewSession()
 	total := 0
+	// Multiple subsystems (spill cleanup, file-preview teardown, etc.)
+	// each register their own close hook. All must fire — replace
+	// semantics would silently leak resources.
 	m.OnSessionClose(sess.ID, func() { total += 1 })
 	m.OnSessionClose(sess.ID, func() { total += 10 })
 
 	if err := m.Close(); err != nil {
 		t.Fatalf("close failed: %v", err)
 	}
-	if total != 10 {
-		t.Fatalf("expected replacement callback to fire once, got total %d", total)
+	if total != 11 {
+		t.Fatalf("expected both callbacks to fire (append semantics), got total %d", total)
+	}
+}
+
+func TestManager_OnSessionClose_AppendFiresOnSessionSwitch(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	sess := m.NewSession()
+	total := 0
+	m.OnSessionClose(sess.ID, func() { total += 1 })
+	m.OnSessionClose(sess.ID, func() { total += 100 })
+
+	// Switching sessions fires the close hooks for the previous session.
+	_ = m.NewSession()
+	if total != 101 {
+		t.Fatalf("append-on-close after switch: want 101, got %d", total)
 	}
 }
 

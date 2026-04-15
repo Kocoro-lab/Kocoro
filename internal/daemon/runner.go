@@ -937,10 +937,20 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	// file:// preview bridge: lazily-started loopback HTTP server that
 	// rewrites browser_navigate(file://...) into http://127.0.0.1/<token>/…
-	// so Playwright's Chromium deny-list doesn't strand the agent. The
-	// server is torn down when the session closes (or right here via
-	// defer if Run never reaches the session-close hook registration).
+	// so Playwright's Chromium deny-list doesn't strand the agent.
+	//
+	// Allowlist: the bridge only serves files already reachable by the
+	// agent's other tools — the effective session CWD subtree plus any
+	// explicit user-attached files. This prevents browser_navigate from
+	// becoming an escape hatch that reads arbitrary local files outside
+	// the normal file-access boundary.
 	filePreview := tools.NewFilePreviewBridge()
+	if effectiveCWD != "" {
+		filePreview.AllowRoot(effectiveCWD)
+	}
+	for _, p := range extractUserFilePaths(req.Content) {
+		filePreview.AllowFile(p)
+	}
 	sessMgr.OnSessionClose(sess.ID, func() { _ = filePreview.Close() })
 	ctx = tools.WithFilePreview(ctx, filePreview)
 	if attachmentCleanup != nil {
