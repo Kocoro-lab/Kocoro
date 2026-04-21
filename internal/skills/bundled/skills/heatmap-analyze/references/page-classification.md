@@ -2,6 +2,9 @@
 
 Classify a webpage into one of 7 types based on URL, content signals, and data patterns.
 
+> **Data source**: all classification signals come from ptengine-cli responses
+> (page_metrics, block_metrics, URL strings). Do not fetch the live page.
+
 ## 7 Page Types
 
 ### 0. Sales Landing Page (Direct Response LP)

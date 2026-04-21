@@ -1,9 +1,10 @@
 ---
 name: heatmap-analyze
 description: >
-  Ptengine Heatmap end-to-end analysis skill. Fetches real heatmap data via ptengine-cli and runs
-  AI-powered CRO behavior analysis using a 4-stage psychology model. Self-contained — includes
-  all analysis methodology, data transformation rules, and output schemas.
+  Ptengine Heatmap end-to-end analysis skill. Fetches real heatmap data exclusively via the
+  built-in ptengine-cli — no browser, Playwright, web scraping, or live page access.
+  Runs AI-powered CRO behavior analysis using a 4-stage psychology model. Self-contained —
+  includes all analysis methodology, data transformation rules, and output schemas.
   Use this skill when the user wants to: analyze a webpage's heatmap data, understand user behavior
   on a page, compare audience segments, validate A/B test results, evaluate ad channel performance,
   analyze audience characteristics, find conversion barriers or opportunities, or optimize a landing page.
@@ -11,6 +12,7 @@ description: >
   "how are users behaving", "compare segments", "A/B test results", "ad performance", "audience analysis",
   "ptengine", "block-level analysis", "conversion optimization", "exit rate", "dwell time", "user drop-off",
   "landing page analysis", or any request involving page analytics combined with behavioral insights.
+allowed-tools: bash file_read think
 ---
 
 # Ptengine Heatmap Analysis
@@ -226,7 +228,10 @@ Before writing analysis, also read:
 4. **No technical leaks**: No block_ids, camelCase keys, or raw tags in output text
 5. **Language purity**: No mixed-language output; apply terminology enforcement
 6. **Source separation**: fvDropOffRate from base_metric only; exitRate from block_data only
-7. **Low sample warning**: If total visits < 100 or a block's impressionRate is very low (< 10%),
+7. **Data source integrity**: all metrics, block content, and page structure come solely
+   from ptengine-cli responses. Never call browser / Playwright / WebFetch / http / screenshot
+   tools on the target URL; attempting to do so is blocked by the skill's tool filter.
+8. **Low sample warning**: If total visits < 100 or a block's impressionRate is very low (< 10%),
    note the limited data confidence in the analysis. Metrics from very few sessions can be misleading.
 
 ---
