@@ -277,7 +277,7 @@ func shellTokens(cmd string) []string {
 var alwaysAskPrefixes = []string{
 	// Arbitrary code execution
 	"python -c", "python3 -c",
-	"node -e", "node -p",
+	"node -e", "node -p", "node --eval", "node --print",
 	"ruby -e", "perl -e",
 	"bash -c", "sh -c", "zsh -c",
 	"python -m", "python3 -m",
@@ -304,6 +304,9 @@ var alwaysAskPrefixes = []string{
 	"git push --mirror",
 	// Strong delete (hard-block already covers root-level rm -rf; this catches
 	// relative or working-dir deletes which are still dangerous).
+	// rm -r (without -f) is intentionally excluded: it still prompts via the
+	// normal "ask" path and is less likely to be used for mass deletion than
+	// rm -rf. Add it here if the project needs stricter treatment.
 	"rm -rf",
 }
 
@@ -335,12 +338,34 @@ func IsAlwaysAskPrefix(cmd string) bool {
 	return false
 }
 
+// normalizeExe replaces the leading executable token in cmd with its basename,
+// so that full-path invocations like /usr/bin/python3 match the same
+// alwaysAskPrefixes entries as the plain name python3.
+func normalizeExe(cmd string) string {
+	tokens := shellTokens(cmd)
+	if len(tokens) == 0 {
+		return cmd
+	}
+	exe := tokens[0]
+	base := filepath.Base(exe)
+	if base == exe {
+		return cmd
+	}
+	if strings.HasPrefix(cmd, exe) {
+		return base + cmd[len(exe):]
+	}
+	return cmd
+}
+
 // isAlwaysAskSingle checks a single (already-split) command segment.
 func isAlwaysAskSingle(cmd string) bool {
 	trimmed := strings.TrimSpace(cmd)
 	if trimmed == "" {
 		return false
 	}
+	// hasTrailingBackground is checked on the raw (un-stripped) string because
+	// stripRedirects consumes trailing & as part of redirect normalization.
+	// Swapping these two lines would let "cmd &>/dev/null" slip through.
 	if hasTrailingBackground(trimmed) {
 		return true
 	}
@@ -348,6 +373,9 @@ func isAlwaysAskSingle(cmd string) bool {
 	if core == "" {
 		return false
 	}
+	// Normalize full-path executables (/usr/bin/python3 → python3) so that
+	// absolute-path invocations match the same alwaysAskPrefixes entries.
+	core = normalizeExe(core)
 	// Exempt list wins (longer prefix beats `python -m`).
 	for _, ex := range minusMExempt {
 		if strings.HasPrefix(core, ex+" ") || core == ex {
@@ -868,6 +896,10 @@ func stripRedirects(cmd string) string {
 // consumeRedirect detects whether a redirect starts at cmd[i] (top-level only).
 // Returns the number of characters to skip (operator + target), or 0 if no
 // redirect starts here.
+//
+// <<EOF heredoc syntax is not handled: the second < causes the target scan to
+// stop immediately (ill-formed → return 0), leaving the << in the string.
+// Heredocs in single-line permission checks are extremely rare in practice.
 func consumeRedirect(cmd string, i int) int {
 	n := len(cmd)
 	if i >= n {

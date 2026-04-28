@@ -849,8 +849,14 @@ func TestIsAlwaysAskPrefix(t *testing.T) {
 		{"python -c", `python -c "print(1)"`, true},
 		{"python3 -c with redirect", `python3 -c "print(1)" 2>/dev/null`, true},
 		{"node -e", `node -e "console.log(1)"`, true},
+		{"node --eval long form", `node --eval "console.log(1)"`, true},
+		{"node --print long form", `node --print "1+1"`, true},
 		{"bash -c", `bash -c "echo hi"`, true},
 		{"agent-browser eval", `agent-browser eval "document.title"`, true},
+		// Full-path executable normalization
+		{"/usr/bin/python3 -c via full path", `/usr/bin/python3 -c "print(1)"`, true},
+		{"/usr/local/bin/node -e via full path", `/usr/local/bin/node -e "console.log(1)"`, true},
+		{"/usr/bin/python3 -m pytest exempt via full path", `/usr/bin/python3 -m pytest -v`, false},
 		// Supply chain
 		{"pip install", `pip install requests`, true},
 		{"pip3 install", `pip3 install pymupdf -q`, true},
@@ -873,8 +879,10 @@ func TestIsAlwaysAskPrefix(t *testing.T) {
 		// Dangerous git
 		{"git push --force", `git push --force origin main`, true},
 		{"git push -f", `git push -f origin main`, true},
-		// Strong delete
+		// Strong delete — rm -r (without -f) is a known boundary: not in the
+		// list by design; it still prompts via the default "ask" path.
 		{"rm -rf relative", `rm -rf ./build`, true},
+		{"rm -r without -f NOT flagged (known boundary)", `rm -r ./build`, false},
 		// Trailing background
 		{"trailing &", `python3 -m http.server 9988 &`, true},
 		// Compound: any matching sub-command flags whole command
@@ -1035,6 +1043,22 @@ func TestCommandPrefixMatch(t *testing.T) {
 			name:  "empty cmd",
 			entry: `git status`,
 			cmd:   ``,
+			want:  false,
+		},
+		{
+			// cmd has only 1 non-flag token; N=2 for git → takeFirstNTokens returns ""
+			// → no match even though executables are identical.
+			name:  "fewer than N non-flag tokens on cmd side",
+			entry: `git status`,
+			cmd:   `git`,
+			want:  false,
+		},
+		{
+			// entry has only 1 non-flag token; N=2 for git → entry prefix is ""
+			// → no match.
+			name:  "fewer than N non-flag tokens on entry side",
+			entry: `git`,
+			cmd:   `git status`,
 			want:  false,
 		},
 	}
