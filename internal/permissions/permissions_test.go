@@ -701,3 +701,398 @@ func TestSplitCompoundCommand(t *testing.T) {
 		})
 	}
 }
+
+// TestSplitCompoundCommand_QuoteAware: operators inside quotes / substitutions
+// must be treated as literal characters, not split points.
+func TestSplitCompoundCommand_QuoteAware(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		{
+			name: "double-quoted &&",
+			cmd:  `agent-browser eval "if (a && b) { return 1; }"`,
+			want: []string{`agent-browser eval "if (a && b) { return 1; }"`},
+		},
+		{
+			name: "double-quoted ; in JS",
+			cmd:  `python3 -c "import os; os.system('x')"`,
+			want: []string{`python3 -c "import os; os.system('x')"`},
+		},
+		{
+			name: "single-quoted operators preserved",
+			cmd:  `echo 'a && b || c' && pwd`,
+			want: []string{`echo 'a && b || c'`, `pwd`},
+		},
+		{
+			name: "split surrounding a quoted heredoc",
+			cmd:  `cmd1 && agent-browser eval "x; y" && cmd2`,
+			want: []string{`cmd1`, `agent-browser eval "x; y"`, `cmd2`},
+		},
+		{
+			name: "double-quote with escape",
+			cmd:  `echo "a\"b && c" && pwd`,
+			want: []string{`echo "a\"b && c"`, `pwd`},
+		},
+		{
+			name: "command substitution $()",
+			cmd:  `echo $(date && hostname)`,
+			want: []string{`echo $(date && hostname)`},
+		},
+		{
+			name: "backtick substitution",
+			cmd:  "echo `date && hostname`",
+			want: []string{"echo `date && hostname`"},
+		},
+		{
+			name: "pipe inside quotes",
+			cmd:  `grep "a|b" file.txt`,
+			want: []string{`grep "a|b" file.txt`},
+		},
+		{
+			name: "real heredoc from user fixture",
+			cmd: `agent-browser eval "
+const buttons = document.querySelectorAll('.x.y');
+let emailBtn = null;
+for (const btn of buttons) {
+  if (btn.textContent.includes('login')) {
+    emailBtn = btn;
+    break;
+  }
+}
+"`,
+			// Single segment — no split inside quoted region.
+			want: nil, // checked by length below
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitCompoundCommand(tt.cmd)
+			if tt.want == nil {
+				if len(got) != 1 {
+					t.Errorf("expected 1 segment, got %d: %v", len(got), got)
+				}
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d segments %v, want %d %v", len(got), got, len(tt.want), tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("segment[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestStripRedirects(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no redirect", `ls -la`, `ls -la`},
+		{"2>/dev/null", `ptengine-cli config get 2>/dev/null`, `ptengine-cli config get`},
+		{"2>&1", `cmd 2>&1`, `cmd`},
+		{">file", `cmd > out.log`, `cmd`},
+		{">>file", `cmd >> out.log`, `cmd`},
+		{"&>file", `cmd &>/tmp/log`, `cmd`},
+		{"&>>file", `cmd &>>/tmp/log`, `cmd`},
+		{"trailing &", `python3 -m http.server 9988 &`, `python3 -m http.server 9988`},
+		{"redirect inside double quotes preserved", `echo "a > b"`, `echo "a > b"`},
+		{"redirect inside single quotes preserved", `echo 'a > b'`, `echo 'a > b'`},
+		{"multi-redirect", `cmd 2>&1 > out.log`, `cmd`},
+		{"redirect with spaces", `cmd 2> /dev/null`, `cmd`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripRedirects(tt.in)
+			if got != tt.want {
+				t.Errorf("stripRedirects(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasTrailingBackground(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{`python3 -m http.server &`, true},
+		{`python3 -m http.server &  `, true}, // trailing whitespace OK
+		{`cmd && cmd2`, false},               // && is not trailing &
+		{`cmd 2>&1`, false},                  // ends in digit
+		{`cmd &>/tmp/log`, false},            // ends in non-& char
+		{`ls`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got := hasTrailingBackground(tt.in)
+			if got != tt.want {
+				t.Errorf("hasTrailingBackground(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsAlwaysAskPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		want bool
+	}{
+		// Code execution gateways
+		{"python -c", `python -c "print(1)"`, true},
+		{"python3 -c with redirect", `python3 -c "print(1)" 2>/dev/null`, true},
+		{"node -e", `node -e "console.log(1)"`, true},
+		{"bash -c", `bash -c "echo hi"`, true},
+		{"agent-browser eval", `agent-browser eval "document.title"`, true},
+		// Supply chain
+		{"pip install", `pip install requests`, true},
+		{"pip3 install", `pip3 install pymupdf -q`, true},
+		{"npm install", `npm install lodash`, true},
+		{"npm i shorthand", `npm i lodash`, true},
+		{"npx pkg", `npx create-react-app myapp`, true},
+		{"pnpm i shorthand", `pnpm i`, true},
+		{"pnpm install", `pnpm install`, true},
+		{"pnpm add", `pnpm add lodash`, true},
+		{"yarn add", `yarn add lodash`, true},
+		{"brew install", `brew install wget`, true},
+		{"cargo install", `cargo install ripgrep`, true},
+		{"gem install", `gem install rails`, true},
+		{"go install", `go install golang.org/x/tools/gopls@latest`, true},
+		// Shorthand collision avoidance
+		{"npm info NOT flagged", `npm info react`, false},
+		{"npm test NOT flagged", `npm test`, false},
+		{"yarn bare NOT flagged", `yarn`, false},
+		{"yarn test NOT flagged", `yarn test`, false},
+		// Dangerous git
+		{"git push --force", `git push --force origin main`, true},
+		{"git push -f", `git push -f origin main`, true},
+		// Strong delete
+		{"rm -rf relative", `rm -rf ./build`, true},
+		// Trailing background
+		{"trailing &", `python3 -m http.server 9988 &`, true},
+		// Compound: any matching sub-command flags whole command
+		{"compound with python -c", `cd /tmp && python3 -c "import x"`, true},
+
+		// minusMExempt overrides
+		{"-m pytest exempt", `python3 -m pytest -v`, false},
+		{"-m http.server exempt", `python3 -m http.server`, false},
+		{"-m json.tool exempt", `python -m json.tool data.json`, false},
+
+		// Non-matching commands
+		{"ls", `ls -la`, false},
+		{"git status", `git status`, false},
+		{"git push (no force)", `git push origin main`, false},
+		{"npm test", `npm test`, false},
+		{"normal compound", `cd /tmp && ls`, false},
+		{"normal ptengine", `ptengine-cli config get`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsAlwaysAskPrefix(tt.cmd)
+			if got != tt.want {
+				t.Errorf("IsAlwaysAskPrefix(%q) = %v, want %v", tt.cmd, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCheckCommand_AlwaysAskOverridesAllow: a high-risk prefix must remain
+// "ask" even when allowed_commands matches the literal command — single
+// approval cannot promote arbitrary code execution to silent autopilot.
+func TestCheckCommand_AlwaysAskOverridesAllow(t *testing.T) {
+	cfg := &PermissionsConfig{
+		AllowedCommands: []string{
+			`python3 -c "import x"`,           // exact literal
+			`python3 -c *`,                    // glob
+			`pip install foo`,                 // supply chain
+			`agent-browser eval "document.title"`,
+		},
+	}
+	risky := []string{
+		`python3 -c "import x"`,
+		`python3 -c "import os; os.system('x')"`,
+		`pip install foo`,
+		`pip install bar`, // glob would catch but high-risk wins
+		`agent-browser eval "x"`,
+	}
+	for _, cmd := range risky {
+		t.Run(cmd, func(t *testing.T) {
+			decision, _ := CheckCommand(cmd, cfg)
+			if decision != "ask" {
+				t.Errorf("CheckCommand(%q) = %q, want ask (high-risk override)", cmd, decision)
+			}
+		})
+	}
+
+	// Sanity: minusM exempts still allowed when in allowed_commands.
+	cfgExempt := &PermissionsConfig{
+		AllowedCommands: []string{`python3 -m pytest *`},
+	}
+	decision, _ := CheckCommand(`python3 -m pytest -v ./tests`, cfgExempt)
+	if decision != "allow" {
+		t.Errorf("python3 -m pytest should be allowed, got %q", decision)
+	}
+}
+
+// TestCommandPrefixMatch: same-family commands match across parameter changes;
+// different sub-commands of the same exec do NOT match.
+func TestCommandPrefixMatch(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry string
+		cmd   string
+		want  bool
+	}{
+		// Same family — should match
+		{
+			name:  "ptengine-cli config family",
+			entry: `ptengine-cli config get 2>/dev/null || echo "X"`,
+			cmd:   `ptengine-cli config show --json`,
+			want:  true,
+		},
+		{
+			name:  "ptengine-cli heatmap family with redirects",
+			entry: `ptengine-cli heatmap query --url x.com 2>&1 | head -50`,
+			cmd:   `ptengine-cli heatmap filter-values --name url --output json`,
+			want:  true,
+		},
+		{
+			name:  "agent-browser open variants",
+			entry: `agent-browser open https://meican.com && agent-browser wait --load networkidle`,
+			cmd:   `agent-browser open https://example.com && agent-browser wait 2000`,
+			want:  true,
+		},
+		{
+			// agent-browser snapshot is the LAST sub-command of entry —
+			// cross-product matching across compound segments must find it.
+			name:  "match against trailing compound segment",
+			entry: `agent-browser click @e23 && agent-browser wait 2000 && agent-browser snapshot -i`,
+			cmd:   `agent-browser snapshot -i`,
+			want:  true,
+		},
+		// Same exec, different sub-command — should NOT match (preserves
+		// TestAlwaysAllowBashPersistence semantics)
+		{
+			name:  "git status vs git push",
+			entry: `git status`,
+			cmd:   `git push`,
+			want:  false,
+		},
+		{
+			name:  "ptengine-cli config vs ptengine-cli heatmap",
+			entry: `ptengine-cli config get`,
+			cmd:   `ptengine-cli heatmap query`,
+			want:  false,
+		},
+		{
+			name:  "kubectl get vs kubectl delete",
+			entry: `kubectl get pods`,
+			cmd:   `kubectl delete pod foo`,
+			want:  false,
+		},
+		// Different exec — never match
+		{
+			name:  "completely different",
+			entry: `ptengine-cli config get`,
+			cmd:   `npm install`,
+			want:  false,
+		},
+		// Default-safe segments are skipped
+		{
+			name:  "cd prefix on entry",
+			entry: `cd /tmp && ptengine-cli config get`,
+			cmd:   `ptengine-cli config show`,
+			want:  true,
+		},
+		{
+			name:  "cd prefix on cmd",
+			entry: `ptengine-cli config get`,
+			cmd:   `cd /tmp && ptengine-cli config show`,
+			want:  true,
+		},
+		// Unknown executable — uses defaultPrefixDepth=3 (stricter)
+		{
+			name:  "unknown CLI N=3 same family",
+			entry: `mycli foo bar --x=1`,
+			cmd:   `mycli foo bar --x=2`,
+			want:  true,
+		},
+		{
+			name:  "unknown CLI N=3 different third token",
+			entry: `mycli foo bar`,
+			cmd:   `mycli foo qux`, // all 3 non-flag tokens present; first 2 match ("mycli foo") but 3rd diverges ("bar" vs "qux") → prefix strings unequal → no match
+			want:  false,
+		},
+		// Empty / edge cases
+		{
+			name:  "empty cmd",
+			entry: `git status`,
+			cmd:   ``,
+			want:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := commandPrefixMatch(tt.cmd, tt.entry)
+			if got != tt.want {
+				t.Errorf("commandPrefixMatch(%q, %q) = %v, want %v", tt.cmd, tt.entry, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCheckCommand_PrefixFallbackOnUserFixture: feeds a slice of real
+// allowed_commands (from user's ~/.shannon/config.yaml) and verifies that
+// (a) entries match themselves and same-family variants, (b) cross-family
+// commands still go to "ask".
+func TestCheckCommand_PrefixFallbackOnUserFixture(t *testing.T) {
+	cfg := &PermissionsConfig{
+		AllowedCommands: []string{
+			`ptengine-cli config get 2>/dev/null || echo "CONFIG_ERROR"`,
+			`ptengine-cli heatmap query --query-type page_metrics --url "https://ptengine.jp" --start-date 2026-04-09 --end-date 2026-04-23 -o json-pretty 2>/dev/null`,
+			`agent-browser open https://meican.com && agent-browser wait --load networkidle && agent-browser screenshot --annotate`,
+			`agent-browser click @e23 && agent-browser wait 2000 && agent-browser get url && agent-browser snapshot -i`,
+		},
+	}
+
+	allowExpect := []string{
+		// Same-family variants — should be allowed without re-prompt
+		`ptengine-cli config show --json 2>/dev/null`,
+		`ptengine-cli config list`,
+		`ptengine-cli heatmap filter-values --name url --output json`,
+		`ptengine-cli heatmap describe`,
+		`agent-browser open https://example.com`,
+		`agent-browser click @e99`,
+		`agent-browser snapshot -i`,
+		`agent-browser wait 5000`,
+	}
+	for _, cmd := range allowExpect {
+		t.Run("allow_"+cmd, func(t *testing.T) {
+			decision, reason := CheckCommand(cmd, cfg)
+			if decision != "allow" {
+				t.Errorf("CheckCommand(%q) = %q (%s), want allow", cmd, decision, reason)
+			}
+		})
+	}
+
+	askExpect := []string{
+		// Different family — must re-prompt
+		`npm install lodash`,
+		`some-totally-unknown-binary --do-stuff`,
+	}
+	for _, cmd := range askExpect {
+		t.Run("ask_"+cmd, func(t *testing.T) {
+			decision, _ := CheckCommand(cmd, cfg)
+			if decision != "ask" {
+				t.Errorf("CheckCommand(%q) = %q, want ask", cmd, decision)
+			}
+		})
+	}
+}

@@ -18,6 +18,350 @@ type PermissionsConfig struct {
 	NetworkAllowlist  []string `yaml:"network_allowlist"   json:"network_allowlist"`
 }
 
+// prefixDepthTable maps known executables to the number of leading non-flag
+// tokens that define a "command family" for token-prefix matching. A smaller
+// number is more permissive (one approval covers more variants); a larger
+// number is stricter. Unknown executables fall back to defaultPrefixDepth.
+//
+// Example:
+//   N=2 for "git" → `git status` and `git push` are different families,
+//                   but `git status -uall` and `git status --short` share `git status`.
+//   N=2 for "ptengine-cli" → `ptengine-cli config` covers config get/show/list/...,
+//                            `ptengine-cli heatmap` covers heatmap query/filter-values/...
+var prefixDepthTable = map[string]int{
+	"git":            2,
+	"kubectl":        2,
+	"docker":         2,
+	"docker-compose": 2,
+	"npm":            2,
+	"yarn":           2,
+	"pnpm":           2,
+	"cargo":          2,
+	"brew":           2,
+	"gh":             2,
+	"aws":            2,
+	"gcloud":         2,
+	"terraform":      2,
+	"ptengine-cli":   2,
+	"agent-browser":  2,
+}
+
+// defaultPrefixDepth is used for executables not in prefixDepthTable. Set to
+// 3 to be conservative for unfamiliar CLIs (one approval covers fewer variants).
+const defaultPrefixDepth = 3
+
+// commandPrefixMatch returns true when any non-safe sub-segment of `cmd`
+// shares the same "command family prefix" as any non-safe sub-segment of
+// `entry`. Both sides are split into compound segments, default-safe segments
+// (e.g. `cd /tmp`, `cat x`) are dropped, redirects are stripped, and the
+// remaining segments are compared by their first N non-flag tokens (N is
+// determined by the leading executable via prefixDepthTable).
+//
+// Symmetric: same normalization applies to both inputs, so `git status` does
+// NOT match `git push` (they diverge at token 2 of N=2).
+//
+// Multi-segment cross-product matching: a user authorization like
+// `agent-browser click X && agent-browser wait 2 && agent-browser snapshot -i`
+// matches future invocations of *any* of those sub-commands individually
+// (mirroring the user's intent — the entry expresses approval for the whole
+// browser-driver family). This is safe because alwaysAskPrefixes still
+// override (e.g. an authorization containing `python -c "..."` does not
+// silently allow future `python -c "..."` calls).
+//
+// This is the fallback for `allowed_commands` matching after literal/glob
+// match fails.
+func commandPrefixMatch(cmd, entry string) bool {
+	cmdSegs := nonSafeSegments(cmd)
+	entrySegs := nonSafeSegments(entry)
+	if len(cmdSegs) == 0 || len(entrySegs) == 0 {
+		return false
+	}
+	for _, c := range cmdSegs {
+		for _, e := range entrySegs {
+			if segmentPrefixMatch(c, e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// segmentPrefixMatch compares two single-command segments (after redirect
+// strip / default-safe filter) by their first N non-flag tokens.
+func segmentPrefixMatch(cmdSeg, entrySeg string) bool {
+	cmdFirst := firstToken(cmdSeg)
+	entryFirst := firstToken(entrySeg)
+	if cmdFirst == "" || entryFirst == "" || cmdFirst != entryFirst {
+		return false
+	}
+	n := prefixDepthFor(cmdFirst)
+	cmdPrefix := takeFirstNTokens(cmdSeg, n)
+	entryPrefix := takeFirstNTokens(entrySeg, n)
+	return cmdPrefix != "" && cmdPrefix == entryPrefix
+}
+
+// nonSafeSegments returns all compound sub-segments of cmd that are NOT
+// built-in default-safe commands. Redirects are stripped from each.
+func nonSafeSegments(cmd string) []string {
+	var out []string
+	for _, seg := range splitCompoundCommand(cmd) {
+		core := stripRedirects(seg)
+		if core == "" {
+			continue
+		}
+		if isDefaultSafe(core) {
+			continue
+		}
+		out = append(out, core)
+	}
+	return out
+}
+
+// firstToken returns the leading whitespace-delimited token of cmd, preserving
+// quoted regions as single tokens.
+func firstToken(cmd string) string {
+	tokens := shellTokens(cmd)
+	if len(tokens) == 0 {
+		return ""
+	}
+	return tokens[0]
+}
+
+// takeFirstNTokens returns the first n non-flag tokens of cmd joined by single
+// spaces. Flag tokens (starting with '-') are skipped without consuming the
+// budget. Returns "" if fewer than n non-flag tokens exist.
+func takeFirstNTokens(cmd string, n int) string {
+	tokens := shellTokens(cmd)
+	var out []string
+	for _, t := range tokens {
+		if len(out) >= n {
+			break
+		}
+		if len(t) > 0 && t[0] == '-' {
+			continue
+		}
+		out = append(out, t)
+	}
+	if len(out) < n {
+		return ""
+	}
+	return strings.Join(out, " ")
+}
+
+// prefixDepthFor returns the configured prefix depth for an executable name,
+// or defaultPrefixDepth if unknown.
+func prefixDepthFor(executable string) int {
+	if d, ok := prefixDepthTable[executable]; ok {
+		return d
+	}
+	return defaultPrefixDepth
+}
+
+// shellTokens splits cmd into whitespace-separated tokens, keeping
+// single/double-quoted strings, $(...) and `...` substitutions intact (the
+// quotes are kept verbatim in the output token).
+func shellTokens(cmd string) []string {
+	var tokens []string
+	var buf strings.Builder
+	var stack []byte
+	push := func(c byte) { stack = append(stack, c) }
+	pop := func() {
+		if n := len(stack); n > 0 {
+			stack = stack[:n-1]
+		}
+	}
+	top := func() byte {
+		if n := len(stack); n > 0 {
+			return stack[n-1]
+		}
+		return 0
+	}
+	flush := func() {
+		if buf.Len() > 0 {
+			tokens = append(tokens, buf.String())
+			buf.Reset()
+		}
+	}
+	n := len(cmd)
+	for i := 0; i < n; i++ {
+		c := cmd[i]
+		switch top() {
+		case 's':
+			buf.WriteByte(c)
+			if c == '\'' {
+				pop()
+			}
+			continue
+		case 'd':
+			if c == '\\' && i+1 < n {
+				buf.WriteByte(c)
+				buf.WriteByte(cmd[i+1])
+				i++
+				continue
+			}
+			buf.WriteByte(c)
+			switch {
+			case c == '"':
+				pop()
+			case c == '$' && i+1 < n && cmd[i+1] == '(':
+				buf.WriteByte(cmd[i+1])
+				i++
+				push('p')
+			case c == '`':
+				push('b')
+			}
+			continue
+		case 'p', 'b':
+			buf.WriteByte(c)
+			switch c {
+			case '\'':
+				push('s')
+			case '"':
+				push('d')
+			case ')':
+				if top() == 'p' {
+					pop()
+				}
+			case '`':
+				if top() == 'b' {
+					pop()
+				} else {
+					push('b')
+				}
+			case '$':
+				if i+1 < n && cmd[i+1] == '(' {
+					buf.WriteByte(cmd[i+1])
+					i++
+					push('p')
+				}
+			}
+			continue
+		}
+		// top-level
+		if c == ' ' || c == '\t' || c == '\n' {
+			flush()
+			continue
+		}
+		switch {
+		case c == '\'':
+			push('s')
+		case c == '"':
+			push('d')
+		case c == '`':
+			push('b')
+		case c == '$' && i+1 < n && cmd[i+1] == '(':
+			buf.WriteByte(c)
+			buf.WriteByte(cmd[i+1])
+			i++
+			push('p')
+			continue
+		}
+		buf.WriteByte(c)
+	}
+	flush()
+	return tokens
+}
+
+// alwaysAskPrefixes are high-risk command prefixes that force the approval
+// dialog on every invocation, regardless of allowed_commands. These cover:
+//   - Arbitrary code execution interpreters (python -c, node -e, bash -c, ...)
+//   - Inline JS injection (agent-browser eval)
+//   - Supply-chain installers (pip/npm/yarn/cargo/brew install, etc.)
+//   - Force-push variants of git
+//   - Trailing & (background launch — checked separately via hasTrailingBackground)
+//   - rm -rf (covers paths the hard-block list doesn't, e.g. relative deletes)
+//
+// Match semantics: the command (with redirects stripped) starts with the
+// prefix followed by space or end. minusMExempt overrides specific safe
+// `-m` invocations (e.g. `python3 -m pytest`).
+var alwaysAskPrefixes = []string{
+	// Arbitrary code execution
+	"python -c", "python3 -c",
+	"node -e", "node -p",
+	"ruby -e", "perl -e",
+	"bash -c", "sh -c", "zsh -c",
+	"python -m", "python3 -m",
+	// Browser JS injection
+	"agent-browser eval",
+	// Generic eval/exec wrappers
+	"eval", "exec",
+	// Supply chain — installers that fetch and run third-party code (incl.
+	// setup hooks, postinstall scripts). Common shorthand variants included:
+	//   npm install ↔ npm i
+	//   pnpm install ↔ pnpm i ↔ pnpm add
+	//   yarn add (yarn bare can also install but is overloaded with `yarn test`
+	//   etc., so we don't catch the bare form to avoid false positives)
+	//   npx <pkg> downloads + runs an arbitrary package binary in one step.
+	"pip install", "pip3 install",
+	"npm install", "npm i",
+	"yarn add",
+	"pnpm install", "pnpm i", "pnpm add",
+	"npx",
+	"cargo install", "gem install",
+	"go install", "brew install",
+	// Dangerous git operations
+	"git push --force", "git push -f",
+	"git push --mirror",
+	// Strong delete (hard-block already covers root-level rm -rf; this catches
+	// relative or working-dir deletes which are still dangerous).
+	"rm -rf",
+}
+
+// minusMExempt are `python -m <module>` (and python3) invocations considered
+// safe. They override an `alwaysAskPrefixes` entry of `python -m`/`python3 -m`
+// because the inner module is a known well-behaved batch tool.
+var minusMExempt = []string{
+	"python -m pytest", "python3 -m pytest",
+	"python -m http.server", "python3 -m http.server",
+	"python -m json.tool", "python3 -m json.tool",
+	"python -m py_compile", "python3 -m py_compile",
+	"python -m venv", "python3 -m venv",
+}
+
+// IsAlwaysAskPrefix reports whether a bash command (possibly compound) contains
+// any sub-command that matches a high-risk prefix or has a trailing `&`
+// background launch. Used by:
+//   - checkSingleCommand: forces "ask" decision even when allowed_commands matches
+//   - daemon-side always_allow handler: skips persistence to config.yaml when true
+//
+// minusMExempt entries override matching alwaysAskPrefixes (so e.g.
+// `python3 -m pytest` is not flagged even though `python3 -m` is in the list).
+func IsAlwaysAskPrefix(cmd string) bool {
+	for _, sub := range splitCompoundCommand(cmd) {
+		if isAlwaysAskSingle(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAlwaysAskSingle checks a single (already-split) command segment.
+func isAlwaysAskSingle(cmd string) bool {
+	trimmed := strings.TrimSpace(cmd)
+	if trimmed == "" {
+		return false
+	}
+	if hasTrailingBackground(trimmed) {
+		return true
+	}
+	core := stripRedirects(trimmed)
+	if core == "" {
+		return false
+	}
+	// Exempt list wins (longer prefix beats `python -m`).
+	for _, ex := range minusMExempt {
+		if strings.HasPrefix(core, ex+" ") || core == ex {
+			return false
+		}
+	}
+	for _, prefix := range alwaysAskPrefixes {
+		if strings.HasPrefix(core, prefix+" ") || core == prefix {
+			return true
+		}
+	}
+	return false
+}
+
 // hardBlockPatterns are always denied and cannot be overridden by config.
 var hardBlockPatterns = []string{
 	"rm -rf /",
@@ -58,6 +402,7 @@ var defaultSafeCommands = []defaultSafeEntry{
 	// --- System info & file inspection ---
 	{prefix: "ls"},
 	{exact: "pwd"},
+	{prefix: "cd"}, // cd in subprocess has no external side effect; cleans up compound prefixes like `cd /tmp && actual-cmd`
 	{prefix: "which"},
 	{prefix: "whereis"},
 	{prefix: "type"},
@@ -404,7 +749,245 @@ func isDefaultSafe(cmd string) bool {
 }
 
 // shellSplitOperators are used to split compound commands.
+// Order matters: longer operators must come first.
 var shellSplitOperators = []string{"&&", "||", ";", "|"}
+
+// stripRedirects removes shell I/O redirection operators (and their targets)
+// from a single command segment, preserving quoted regions intact. Recognized
+// patterns:
+//
+//   - `>file`, `>>file`, `<file`, optionally with leading FD digit (`2>file`)
+//   - `2>&1`, `>&2` etc. (FD duplication)
+//   - `&>file`, `&>>file` (combined stdout+stderr)
+//   - Trailing single `&` (background launch)
+//
+// Operators inside single/double quotes or `$(...)` / backtick subs are kept.
+// Returns the cleaned command with collapsed internal whitespace.
+func stripRedirects(cmd string) string {
+	var out strings.Builder
+	var stack []byte
+	push := func(c byte) { stack = append(stack, c) }
+	pop := func() {
+		if n := len(stack); n > 0 {
+			stack = stack[:n-1]
+		}
+	}
+	top := func() byte {
+		if n := len(stack); n > 0 {
+			return stack[n-1]
+		}
+		return 0
+	}
+	n := len(cmd)
+	for i := 0; i < n; i++ {
+		c := cmd[i]
+		switch top() {
+		case 's':
+			out.WriteByte(c)
+			if c == '\'' {
+				pop()
+			}
+			continue
+		case 'd':
+			if c == '\\' && i+1 < n {
+				out.WriteByte(c)
+				out.WriteByte(cmd[i+1])
+				i++
+				continue
+			}
+			out.WriteByte(c)
+			switch {
+			case c == '"':
+				pop()
+			case c == '$' && i+1 < n && cmd[i+1] == '(':
+				out.WriteByte(cmd[i+1])
+				i++
+				push('p')
+			case c == '`':
+				push('b')
+			}
+			continue
+		case 'p', 'b':
+			out.WriteByte(c)
+			switch c {
+			case '\'':
+				push('s')
+			case '"':
+				push('d')
+			case ')':
+				if top() == 'p' {
+					pop()
+				}
+			case '`':
+				if top() == 'b' {
+					pop()
+				} else {
+					push('b')
+				}
+			case '$':
+				if i+1 < n && cmd[i+1] == '(' {
+					out.WriteByte(cmd[i+1])
+					i++
+					push('p')
+				}
+			}
+			continue
+		}
+		// Top-level: detect redirect.
+		if span := consumeRedirect(cmd, i); span > 0 {
+			i += span - 1
+			// Insert a space so adjacent tokens stay separated after stripping.
+			if out.Len() > 0 {
+				last := out.String()[out.Len()-1]
+				if last != ' ' && last != '\t' {
+					out.WriteByte(' ')
+				}
+			}
+			continue
+		}
+		// Top-level: track openers.
+		switch {
+		case c == '\'':
+			push('s')
+		case c == '"':
+			push('d')
+		case c == '`':
+			push('b')
+		case c == '$' && i+1 < n && cmd[i+1] == '(':
+			out.WriteByte(c)
+			out.WriteByte(cmd[i+1])
+			i++
+			push('p')
+			continue
+		}
+		out.WriteByte(c)
+	}
+	return collapseSpaces(out.String())
+}
+
+// consumeRedirect detects whether a redirect starts at cmd[i] (top-level only).
+// Returns the number of characters to skip (operator + target), or 0 if no
+// redirect starts here.
+func consumeRedirect(cmd string, i int) int {
+	n := len(cmd)
+	if i >= n {
+		return 0
+	}
+	start := i
+	// Optional leading FD digit (e.g., "2>")
+	if cmd[i] >= '0' && cmd[i] <= '9' {
+		// must be followed by < or > to count as redirect
+		if i+1 >= n || (cmd[i+1] != '<' && cmd[i+1] != '>') {
+			return 0
+		}
+		i++
+	}
+	// Operator
+	switch {
+	case i < n && cmd[i] == '&':
+		// Only meaningful as redirect if followed by '>' (i.e., &> or &>>).
+		// FD-dup like "2>&1" is handled by the > branch below.
+		if start != i { // FD digit + & doesn't start a redirect
+			return 0
+		}
+		if i+1 >= n || cmd[i+1] != '>' {
+			// Bare & — might be trailing background. Strip only if rest is
+			// whitespace through end of string.
+			for j := i + 1; j < n; j++ {
+				if cmd[j] != ' ' && cmd[j] != '\t' && cmd[j] != '\n' {
+					return 0
+				}
+			}
+			return n - start
+		}
+		i++ // consume '&'
+		i++ // consume '>'
+		if i < n && cmd[i] == '>' {
+			i++ // &>>
+		}
+	case i < n && (cmd[i] == '<' || cmd[i] == '>'):
+		op := cmd[i]
+		i++
+		if op == '>' && i < n && cmd[i] == '>' {
+			i++ // >>
+		}
+		// FD-dup form like 2>&1 or >&2
+		if op == '>' && i < n && cmd[i] == '&' && i+1 < n && cmd[i+1] >= '0' && cmd[i+1] <= '9' {
+			i++ // &
+			for i < n && cmd[i] >= '0' && cmd[i] <= '9' {
+				i++
+			}
+			return i - start
+		}
+	default:
+		return 0
+	}
+	// Consume optional whitespace and the target token.
+	for i < n && (cmd[i] == ' ' || cmd[i] == '\t') {
+		i++
+	}
+	targetStart := i
+	for i < n {
+		c := cmd[i]
+		if c == ' ' || c == '\t' || c == '\n' {
+			break
+		}
+		if c == '\'' || c == '"' || c == '`' {
+			break
+		}
+		if c == '&' || c == '|' || c == ';' || c == '<' || c == '>' {
+			break
+		}
+		if c == '$' && i+1 < n && cmd[i+1] == '(' {
+			break
+		}
+		i++
+	}
+	if i == targetStart {
+		// No target consumed — ill-formed, don't strip.
+		return 0
+	}
+	return i - start
+}
+
+// hasTrailingBackground returns true if a top-level command segment ends with
+// a single `&` (background launch). Used by alwaysAskPrefixes to force
+// re-prompts on long-running process spawns.
+func hasTrailingBackground(cmd string) bool {
+	trimmed := strings.TrimRightFunc(cmd, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\n'
+	})
+	if !strings.HasSuffix(trimmed, "&") {
+		return false
+	}
+	// Exclude `&&` (would have been split out earlier, but be defensive).
+	if strings.HasSuffix(trimmed, "&&") {
+		return false
+	}
+	// Exclude redirect ops: `&>` or `&>>` end in '>', not '&'.
+	return true
+}
+
+// collapseSpaces replaces runs of whitespace with a single space and trims.
+// Preserves whitespace inside the string semantically (after redirect strip,
+// removed redirects leave a single space behind).
+func collapseSpaces(s string) string {
+	var out strings.Builder
+	prevSpace := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' || c == '\t' || c == '\n' {
+			if !prevSpace {
+				out.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		}
+		out.WriteByte(c)
+		prevSpace = false
+	}
+	return strings.TrimSpace(out.String())
+}
 
 // CheckCommand evaluates a bash command against the permission rules.
 // Returns decision ("allow", "deny", "ask") and a reason string.
@@ -477,10 +1060,19 @@ func checkSingleCommand(cmd string, config *PermissionsConfig) (string, string) 
 		}
 	}
 
-	// AllowedCommands patterns (user config)
+	// High-risk prefixes always require approval (override allowed_commands).
+	if isAlwaysAskSingle(trimmed) {
+		return "ask", "high-risk command pattern requires per-call approval"
+	}
+
+	// AllowedCommands patterns (user config) — first try literal/glob, then
+	// fall back to token-prefix matching for sub-command-family awareness.
 	for _, pattern := range config.AllowedCommands {
 		if MatchesPattern(trimmed, pattern) {
 			return "allow", "matches allowed command pattern: " + pattern
+		}
+		if commandPrefixMatch(trimmed, pattern) {
+			return "allow", "matches allowed command prefix family: " + pattern
 		}
 	}
 
@@ -492,24 +1084,139 @@ func checkSingleCommand(cmd string, config *PermissionsConfig) (string, string) 
 	return "ask", "command not in allowed list; requires approval"
 }
 
-// splitCompoundCommand splits a command string on shell operators (&&, ||, ;, |).
+// splitCompoundCommand splits a command string on top-level shell operators
+// (&&, ||, ;, |), respecting single quotes, double quotes, $(...) and backtick
+// command substitutions. Operators inside any quoted/substituted region are
+// treated as literal characters.
+//
+// Examples:
+//
+//	cmd1 && cmd2                     → ["cmd1", "cmd2"]
+//	echo "a && b"                    → [`echo "a && b"`]
+//	cmd1; agent-browser eval "a; b"  → ["cmd1", `agent-browser eval "a; b"`]
+//
+// Single quotes preserve everything until the matching `'` (POSIX behavior).
+// Double quotes allow `\` escaping and embedded `$(...)` / backtick subs.
+// Operators must match exactly at top level (e.g., `&&` and `||` are checked
+// before single `|`).
 func splitCompoundCommand(cmd string) []string {
-	// Replace operators with a unique separator, then split.
-	// Process longer operators first to avoid partial matches.
-	result := cmd
-	const sep = "\x00SPLIT\x00"
-	for _, op := range shellSplitOperators {
-		result = strings.ReplaceAll(result, op, sep)
-	}
-	parts := strings.Split(result, sep)
-	var trimmed []string
-	for _, p := range parts {
-		s := strings.TrimSpace(p)
+	var parts []string
+	var buf strings.Builder
+	flush := func() {
+		s := strings.TrimSpace(buf.String())
 		if s != "" {
-			trimmed = append(trimmed, s)
+			parts = append(parts, s)
+		}
+		buf.Reset()
+	}
+	// Stack tracks nested contexts:
+	//   's' = single quotes
+	//   'd' = double quotes
+	//   'p' = $(...) substitution
+	//   'b' = `...` backtick substitution
+	var stack []byte
+	push := func(c byte) { stack = append(stack, c) }
+	pop := func() {
+		if n := len(stack); n > 0 {
+			stack = stack[:n-1]
 		}
 	}
-	return trimmed
+	top := func() byte {
+		if n := len(stack); n > 0 {
+			return stack[n-1]
+		}
+		return 0
+	}
+	n := len(cmd)
+	for i := 0; i < n; i++ {
+		c := cmd[i]
+		switch top() {
+		case 's':
+			// Inside '...': only ' closes; no escapes (POSIX).
+			buf.WriteByte(c)
+			if c == '\'' {
+				pop()
+			}
+			continue
+		case 'd':
+			// Inside "...": \ escapes next byte; $(/` open subs; " closes.
+			if c == '\\' && i+1 < n {
+				buf.WriteByte(c)
+				buf.WriteByte(cmd[i+1])
+				i++
+				continue
+			}
+			buf.WriteByte(c)
+			switch {
+			case c == '"':
+				pop()
+			case c == '$' && i+1 < n && cmd[i+1] == '(':
+				buf.WriteByte(cmd[i+1])
+				i++
+				push('p')
+			case c == '`':
+				push('b')
+			}
+			continue
+		case 'p', 'b':
+			// Inside $(...) or `...`: recursive shell context.
+			buf.WriteByte(c)
+			switch c {
+			case '\'':
+				push('s')
+			case '"':
+				push('d')
+			case ')':
+				if top() == 'p' {
+					pop()
+				}
+			case '`':
+				if top() == 'b' {
+					pop()
+				} else {
+					push('b')
+				}
+			case '$':
+				if i+1 < n && cmd[i+1] == '(' {
+					buf.WriteByte(cmd[i+1])
+					i++
+					push('p')
+				}
+			}
+			continue
+		}
+		// Top-level: check operators first (longest-match).
+		matched := 0
+		for _, op := range shellSplitOperators {
+			if i+len(op) <= n && cmd[i:i+len(op)] == op {
+				matched = len(op)
+				break
+			}
+		}
+		if matched > 0 {
+			flush()
+			i += matched - 1
+			continue
+		}
+		// Top-level: track openers.
+		switch {
+		case c == '\'':
+			push('s')
+		case c == '"':
+			push('d')
+		case c == '`':
+			push('b')
+		case c == '$' && i+1 < n && cmd[i+1] == '(':
+			buf.WriteByte(c)
+			buf.WriteByte(cmd[i+1])
+			i++
+			push('p')
+			continue
+		}
+		buf.WriteByte(c)
+	}
+	flush()
+	return parts
 }
 
 // CheckFilePath evaluates a file path for read/write access.

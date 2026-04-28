@@ -650,7 +650,16 @@ func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 		if tool == "bash" {
 			cmd := permissions.ExtractField(args, "command")
 			if cmd != "" {
-				if err := config.AppendAllowedCommand(h.shannonDir, cmd); err != nil {
+				// High-risk prefixes (python -c, pip install, agent-browser
+				// eval, ...) are never persisted: a single approval shouldn't
+				// allow arbitrary future invocations of an arbitrary-code-
+				// execution gateway. The user gets a one-time allow plus a
+				// visible notice explaining why nothing was saved.
+				if permissions.IsAlwaysAskPrefix(cmd) {
+					emitApprovalNotice(h.deps, "warn",
+						"Allowed for this turn. Not saved to config (high-risk command pattern).")
+					log.Printf("daemon: always-allow rejected for high-risk prefix: %s", cmd)
+				} else if err := config.AppendAllowedCommand(h.shannonDir, cmd); err != nil {
 					log.Printf("daemon: failed to persist always-allow: %v", err)
 				} else {
 					// Update in-memory config under write lock.
@@ -671,6 +680,23 @@ func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 		}
 	}
 	return decision == daemon.DecisionAllow || decision == daemon.DecisionAlwaysAllow
+}
+
+// emitApprovalNotice publishes an EventApprovalNotice on the daemon event bus
+// for SSE/Desktop subscribers to render. Best-effort — silently no-ops if the
+// bus is unavailable (e.g. cli/oneshot path).
+func emitApprovalNotice(deps *daemon.ServerDeps, severity, message string) {
+	if deps == nil || deps.EventBus == nil {
+		return
+	}
+	payload, err := json.Marshal(map[string]string{
+		"severity": severity,
+		"message":  message,
+	})
+	if err != nil {
+		return
+	}
+	deps.EventBus.Emit(daemon.Event{Type: daemon.EventApprovalNotice, Payload: payload})
 }
 
 // autoApproveHandler is a minimal EventHandler for internal triggers (watcher, heartbeat).

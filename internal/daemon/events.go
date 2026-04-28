@@ -11,6 +11,7 @@ const (
 	EventAgentReply       = "agent_reply"
 	EventApprovalRequest  = "approval_request"
 	EventApprovalResolved = "approval_resolved"
+	EventApprovalNotice   = "approval_notice" // post-decision feedback (e.g. "high-risk pattern: not saved")
 	EventAgentError       = "agent_error"
 	EventHeartbeatAlert   = "heartbeat_alert"
 	EventToolStatus       = "tool_status"

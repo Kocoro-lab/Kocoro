@@ -1382,7 +1382,19 @@ func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 		if tool == "bash" {
 			cmd := permissions.ExtractField(args, "command")
 			if cmd != "" {
-				if err := config.AppendAllowedCommand(h.deps.ShannonDir, cmd); err != nil {
+				// Same high-risk-prefix gate as the daemon WS path: a single
+				// always-allow click cannot persist arbitrary-code-execution
+				// gateways (python -c, pip install, agent-browser eval, ...).
+				if permissions.IsAlwaysAskPrefix(cmd) {
+					if h.deps != nil && h.deps.EventBus != nil {
+						payload, _ := json.Marshal(map[string]string{
+							"severity": "warn",
+							"message":  "Allowed for this turn. Not saved to config (high-risk command pattern).",
+						})
+						h.deps.EventBus.Emit(Event{Type: EventApprovalNotice, Payload: payload})
+					}
+					log.Printf("sse: always-allow rejected for high-risk prefix: %s", cmd)
+				} else if err := config.AppendAllowedCommand(h.deps.ShannonDir, cmd); err != nil {
 					log.Printf("sse: failed to persist always-allow: %v", err)
 				} else {
 					h.deps.WriteLock()

@@ -22,6 +22,9 @@ Both paths funnel through `multiHandler` on the daemon side: the per-request HTT
 | `agent_reply` | Agent finished a turn (WS / schedule / Ptfrog sources). | Bus |
 | `agent_error` | Agent run failed. | Bus |
 | `notification` | Agent-authored notify tool call. | Bus |
+| `approval_request` | Tool needs user approval; payload `{request_id, tool, args}`. | Bus |
+| `approval_resolved` | User answered an approval; payload `{request_id, decision}` where decision ∈ allow / deny / always_allow. | Bus |
+| `approval_notice` | Post-decision feedback (e.g. high-risk pattern not persisted); payload `{severity, message}` where severity ∈ info / warn. | Bus |
 | `delta` | Streaming text tokens for the agent reply. | Per-request only |
 | `done` | Final reply payload with accumulated `usage`. | Per-request only |
 

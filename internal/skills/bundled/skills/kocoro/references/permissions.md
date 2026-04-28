@@ -7,9 +7,10 @@ Permissions control what commands and tools agents are allowed to run. Before ex
 **Evaluation order:**
 1. **Hard-blocks** — always denied, cannot be overridden (e.g., `rm -rf /`)
 2. **Denied commands** — configured blocklist, never run
-3. **Allowed commands** — configured allowlist, run without asking
-4. **Default safe** — commands Shannon considers low-risk by default
-5. **Ask user** — anything else requires approval before running
+3. **High-risk prefixes (always-ask)** — arbitrary-code-execution gateways like `python -c`, `node -e`, `bash -c`, `agent-browser eval`, supply-chain installers (`pip install` / `pip3 install`, `npm install` / `npm i`, `npx`, `pnpm install` / `pnpm i` / `pnpm add`, `yarn add`, `cargo install`, `gem install`, `go install`, `brew install`), `git push --force` / `-f` / `--mirror`, `rm -rf`, and trailing `&` background launches always re-prompt regardless of allowed_commands. `python -m pytest` / `python -m http.server` / `python -m json.tool` / `python -m py_compile` / `python -m venv` are exempt from the `python -m` rule. Selecting "Always Allow" on these in the UI permits the current invocation but does NOT persist them to config.
+4. **Allowed commands** — configured allowlist. Two match modes: (a) literal/glob pattern match against the full command, (b) token-prefix match — if the command and a stored entry share the same first N non-flag tokens (after stripping redirects and skipping default-safe segments), the command is allowed. N=2 for known CLIs (git, kubectl, docker, npm, ptengine-cli, agent-browser, …), N=3 for unknown executables. So a single `ptengine-cli config get` entry covers `ptengine-cli config show --json`, `ptengine-cli config list`, etc., but not `ptengine-cli heatmap query`.
+5. **Default safe** — commands Shannon considers low-risk by default (read-only `git`, `ls`, `cat`, `cd`, `go test`, …)
+6. **Ask user** — anything else requires approval before running
 
 ## API Endpoints
 
@@ -66,5 +67,7 @@ Permissions control what commands and tools agents are allowed to run. Before ex
 - **NEVER modify `denied_commands`**: The `denied_commands` list is a security boundary. It is intentionally not modifiable through the standard API. If you need a command that's in the denied list, reconsider the approach — these blocks exist for good reason.
 - **Allowed commands widen the attack surface**: Every command you add to `allowed_commands` is one the agent can run without confirmation. Use specific patterns (`git status`) rather than broad ones (`*`) where possible.
 - **Wildcard patterns**: `*` matches any text. `git *` allows all git subcommands. `npm *` allows all npm commands including `npm publish` — be specific.
+- **Token-prefix family matching is implicit**: Even without `*`, an entry like `ptengine-cli config get` automatically covers `ptengine-cli config show`, `ptengine-cli config list`, etc. — same exec, same first N tokens. Different sub-commands of the same exec (e.g. `git status` vs `git push`) do NOT auto-match. Use this to keep `allowed_commands` short.
+- **High-risk always re-prompts**: `python -c`, `pip install`, `agent-browser eval`, `git push --force`, `rm -rf`, and similar gateways always trigger an approval dialog, even if listed in `allowed_commands`. "Always Allow" on these is honored only for the current run and not saved. To genuinely allow them silently, add them to `allowed_commands` AND remove the prefix from the high-risk list (requires a code change — intentional friction).
 - **Reload needed**: After changing permissions via PATCH /config, call POST /config/reload to ensure the daemon picks up the new settings.
 - **macOS permissions are system-level**: Screen recording, accessibility, and microphone permissions are managed by macOS and can only be granted by the user via system dialogs. Shannon cannot grant these programmatically.
