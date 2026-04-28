@@ -372,7 +372,7 @@ Local tools executed on your macOS machine:
 
 ```
 Tool call from LLM
-  → Permission engine (hard-block → denied_commands → split compounds → allowed_commands → default safe)
+  → Permission engine (hard-block → denied_commands → split compounds → always-ask → allowed_commands → default safe)
   → RequiresApproval + SafeChecker
   → Pre-tool hook (can deny)
   → Execute tool
@@ -390,14 +390,15 @@ Tool call from LLM
 
 ## Permission Engine
 
-6-step command resolution:
+Bash command resolution order:
 
 1. **Hard-block** — built-in constants (rm -rf /, mkfs, dd, curl|sh, etc.), cannot be overridden
 2. **Denied commands** — `permissions.denied_commands` in config
-3. **Compound command split** — `&&`, `||`, `;`, `|` are split and checked per sub-command
-4. **Allowed commands** — `permissions.allowed_commands` in config (glob patterns)
-5. **Default safe commands** — built-in safe list (ls, git status, go test, make, etc.)
-6. **User approval** — interactive prompt or `-y` flag
+3. **Compound command split** — `&&`, `||`, `;`, `|`, bare `&` (background separator), and `(...)` subshell groups are split and checked per sub-command. The bare `&` is preserved on the prior segment so background launches still trigger always-ask. Subshell parens are dropped and inner commands are evaluated as plain segments.
+4. **Always-ask high-risk gate** — runs BEFORE the allowlist. Two checks: (a) fixed-prefix list (`python -c`, `bash -c`, `pip install`, `npx`, `rm -rf`, etc.); (b) dangerous-flag token scan, currently for `git push` (any of `--force`, `-f`, `--force-with-lease`, `--force-if-includes`, `--mirror`, `--delete`, `-d`, `--prune`, `--prune-tags` anywhere in args). Trailing `&` background launches are also gated. Selecting "Always Allow" on a high-risk command is honored once for the current run but is NOT persisted to `allowed_commands`.
+5. **Allowed commands** — `permissions.allowed_commands` in config. Two match modes: literal/glob pattern match against the full command, then a token-prefix family fallback (depth N=2 for known CLIs like git/kubectl/docker/npm, N=3 for unknowns). So `ptengine-cli config get` covers `ptengine-cli config show --json`, but not `ptengine-cli heatmap query` (different sub-command family). The always-ask gate above prevents family expansion from silently widening scope to destructive variants.
+6. **Default safe commands** — built-in safe list (ls, git status, go test, make, etc.)
+7. **User approval** — interactive prompt or `-y` flag
 
 For compound commands, every sub-command must be explicitly allowed to auto-allow the whole command. If any sub-command is denied, the whole command is denied.
 

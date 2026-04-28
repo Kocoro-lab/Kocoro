@@ -76,7 +76,7 @@ internal/
     launchd_darwin.go  # plist generation, launchctl (darwin only)
     launchd_stub.go    # no-op stub for non-darwin
   permissions/
-    permissions.go     # 6-step bash resolution: hard-block > denied > split compounds > allowed > default safe > ask
+    permissions.go     # bash resolution: hard-block > denied > split compounds > always-ask (prefix + dangerous-flag tokens) > allowed (literal/glob + token-prefix family) > default safe > ask
   audit/
     audit.go           # JSON-lines logger, RedactSecrets
   hooks/
@@ -187,9 +187,9 @@ Three-layer system for triggering `use_skill`:
 
 ### Permission Model
 ```
-hard-block constants → denied_commands → compound-command splitting → allowed_commands → default safe → RequiresApproval + SafeChecker
+hard-block constants → denied_commands → compound-command splitting (incl. bare & and (...) subshells) → always-ask (alwaysAskPrefixes + git-push dangerous-flag/refspec scan) → allowed_commands (literal/glob + token-prefix family fallback) → default safe → RequiresApproval + SafeChecker
 ```
-Unknown tools → denied by default (fail-safe).
+Unknown tools → denied by default (fail-safe). The always-ask gate runs BEFORE the allowlist, so adding a high-risk command to `allowed_commands` is a no-op; "Always Allow" on these is honored once and not persisted (`IsAlwaysAskPrefix` blocks `cmd/daemon.go` and `internal/daemon/server.go` from writing them to `permissions.allowed_commands`). Token-prefix family matching for the allowlist (depth N=2 for known CLIs like git/docker/npm, N=3 for unknowns) cannot widen scope past the always-ask gate.
 
 ### Daemon Architecture (Production Path)
 - Daemon connects to Shannon Cloud via WebSocket, receives channel messages, runs agent loop locally.

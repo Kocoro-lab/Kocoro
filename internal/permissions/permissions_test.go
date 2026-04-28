@@ -92,8 +92,8 @@ func TestCheckCommand_DeniedCommands(t *testing.T) {
 	}{
 		{"apt-get install vim", "deny"},
 		{"yum install curl", "deny"},
-		{"ls -la", "allow"},       // built-in safe default
-		{"some-unknown", "ask"},   // not denied, not safe → ask
+		{"ls -la", "allow"},     // built-in safe default
+		{"some-unknown", "ask"}, // not denied, not safe → ask
 	}
 
 	for _, tt := range tests {
@@ -142,12 +142,12 @@ func TestCheckCommand_CompoundCommands(t *testing.T) {
 		want string
 	}{
 		{"ls -la && echo hello", "allow"},
-		{"ls -la && rm -rf /", "deny"},         // hard-block in sub-command
-		{"ls | cat", "allow"},                   // both allowed
-		{"ls -la; echo test", "allow"},          // both allowed
-		{"ls || echo fallback", "allow"},        // both allowed
-		{"ls && someunknown", "ask"},            // second not in allowed list
-		{"cat foo.txt | grep bar", "allow"},     // both are built-in safe defaults
+		{"ls -la && rm -rf /", "deny"},      // hard-block in sub-command
+		{"ls | cat", "allow"},               // both allowed
+		{"ls -la; echo test", "allow"},      // both allowed
+		{"ls || echo fallback", "allow"},    // both allowed
+		{"ls && someunknown", "ask"},        // second not in allowed list
+		{"cat foo.txt | grep bar", "allow"}, // both are built-in safe defaults
 	}
 
 	for _, tt := range tests {
@@ -509,7 +509,7 @@ func TestCheckCommand_DefaultSafeCommands(t *testing.T) {
 		// Should NOT be safe
 		{"curl https://example.com", "ask"},
 		{"wget https://example.com", "ask"},
-		{"rm /tmp/test", "ask"},         // rm without -rf is not hard-blocked, just "ask"
+		{"rm /tmp/test", "ask"}, // rm without -rf is not hard-blocked, just "ask"
 		{"kill 1234", "ask"},
 		{"sudo ls", "ask"},
 		{"ssh user@host", "ask"},
@@ -917,9 +917,9 @@ func TestIsAlwaysAskPrefix(t *testing.T) {
 func TestCheckCommand_AlwaysAskOverridesAllow(t *testing.T) {
 	cfg := &PermissionsConfig{
 		AllowedCommands: []string{
-			`python3 -c "import x"`,           // exact literal
-			`python3 -c *`,                    // glob
-			`pip install foo`,                 // supply chain
+			`python3 -c "import x"`, // exact literal
+			`python3 -c *`,          // glob
+			`pip install foo`,       // supply chain
 			`agent-browser eval "document.title"`,
 		},
 	}
@@ -1116,6 +1116,418 @@ func TestCheckCommand_PrefixFallbackOnUserFixture(t *testing.T) {
 			decision, _ := CheckCommand(cmd, cfg)
 			if decision != "ask" {
 				t.Errorf("CheckCommand(%q) = %q, want ask", cmd, decision)
+			}
+		})
+	}
+}
+
+// TestSplitCompoundCommand_BackgroundAndSubshell covers the two splitter
+// bypasses caught in the PR #106 follow-up review:
+//   - bare `&` (background separator) was missing from shellSplitOperators,
+//     so `cmd1 & python3 -c 'evil'` arrived as a single segment and
+//     isDefaultSafe matched on the leading `cmd1` (e.g. echo).
+//   - subshell `(...)` grouping kept the leading `(` glued to the first
+//     token, so `cmd || (python3 -c 'evil')` produced a `(python3` token
+//     that never matched the alwaysAskPrefixes HasPrefix check.
+//
+// The splitter must now: (a) split on bare `&` while preserving the `&` on
+// the prior segment so hasTrailingBackground still fires, (b) drop top-level
+// parens and emit inner commands as separate segments, (c) NOT split when
+// `&` is part of `&>` redirect or FD-dup like `2>&1`.
+func TestSplitCompoundCommand_BackgroundAndSubshell(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		{
+			name: "bare & separator preserves & on prior segment",
+			cmd:  `echo hello & python3 -c 'evil'`,
+			want: []string{`echo hello &`, `python3 -c 'evil'`},
+		},
+		{
+			name: "trailing & alone — single segment with & retained",
+			cmd:  `python3 -m http.server 9988 &`,
+			want: []string{`python3 -m http.server 9988 &`},
+		},
+		{
+			name: "&> redirect must NOT split",
+			cmd:  `cmd1 &>/dev/null`,
+			want: []string{`cmd1 &>/dev/null`},
+		},
+		{
+			name: "FD-dup 2>&1 must NOT split",
+			cmd:  `cmd1 2>&1 & cmd2`,
+			want: []string{`cmd1 2>&1 &`, `cmd2`},
+		},
+		{
+			name: "subshell flat",
+			cmd:  `(python3 -c 'evil')`,
+			want: []string{`python3 -c 'evil'`},
+		},
+		{
+			name: "subshell after ||",
+			cmd:  `cmd1 || (python3 -c 'evil')`,
+			want: []string{`cmd1`, `python3 -c 'evil'`},
+		},
+		{
+			name: "subshell with inner compound",
+			cmd:  `cmd1 && (cmd2 && cmd3)`,
+			want: []string{`cmd1`, `cmd2`, `cmd3`},
+		},
+		{
+			name: "nested subshells",
+			cmd:  `cmd1 || (cmd2 && (cmd3 || cmd4))`,
+			want: []string{`cmd1`, `cmd2`, `cmd3`, `cmd4`},
+		},
+		{
+			name: "parens inside double quotes preserved",
+			cmd:  `agent-browser eval "if (a) { return 1; }"`,
+			want: []string{`agent-browser eval "if (a) { return 1; }"`},
+		},
+		{
+			name: "& inside single quotes preserved",
+			cmd:  `echo 'a & b' && pwd`,
+			want: []string{`echo 'a & b'`, `pwd`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitCompoundCommand(tt.cmd)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d segments %v, want %d %v", len(got), got, len(tt.want), tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("segment[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestIsAlwaysAskPrefix_BypassRegressions covers the three high-risk-gate
+// bypasses found in PR #106 review:
+//   - bare `&` background separator hides a high-risk inner command
+//   - subshell `(...)` grouping defeats the prefix HasPrefix match
+//   - destructive `git push` flag variants (--force-with-lease, --delete, ...)
+//     not caught by the fixed-prefix `git push --force` entry
+func TestIsAlwaysAskPrefix_BypassRegressions(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		want bool
+	}{
+		// Bare & separator: backgrounded benign cmd1 should not hide cmd2.
+		{
+			name: "echo & python3 -c (bare & bypass)",
+			cmd:  `echo hello & python3 -c 'evil'`,
+			want: true,
+		},
+		{
+			name: "ls & rm -rf relative",
+			cmd:  `ls & rm -rf ./build`,
+			want: true,
+		},
+		// Subshell () grouping: parens must not hide high-risk inner commands.
+		{
+			name: "subshell python3 -c",
+			cmd:  `(python3 -c "print(1)")`,
+			want: true,
+		},
+		{
+			name: "subshell after || with python3 -c",
+			cmd:  `echo ok || (python3 -c 'evil')`,
+			want: true,
+		},
+		{
+			name: "nested subshell with bash -c",
+			cmd:  `cmd1 && (cmd2 || (bash -c 'whoami'))`,
+			want: true,
+		},
+		// git push dangerous flags: must always-ask regardless of position.
+		{
+			name: "git push --force-with-lease",
+			cmd:  `git push --force-with-lease origin main`,
+			want: true,
+		},
+		{
+			name: "git push --force-with-lease=ref",
+			cmd:  `git push --force-with-lease=refs/heads/main origin main`,
+			want: true,
+		},
+		{
+			name: "git push --force-if-includes",
+			cmd:  `git push --force-if-includes origin main`,
+			want: true,
+		},
+		{
+			name: "git push --delete",
+			cmd:  `git push --delete origin feature/foo`,
+			want: true,
+		},
+		{
+			name: "git push -d short form",
+			cmd:  `git push -d origin feature/foo`,
+			want: true,
+		},
+		{
+			name: "git push --force at end of args",
+			cmd:  `git push origin main --force`,
+			want: true,
+		},
+		{
+			name: "git push --mirror still flagged",
+			cmd:  `git push --mirror origin`,
+			want: true,
+		},
+		{
+			name: "git push --prune still flagged",
+			cmd:  `git push --prune origin`,
+			want: true,
+		},
+		{
+			name: "git push --prune with refspec still flagged",
+			cmd:  `git push --prune origin refs/heads/*:refs/heads/*`,
+			want: true,
+		},
+		{
+			// --prune-tags is an alias for --prune in more aggressive form
+			// (deletes remote tags missing locally too). The token-equality
+			// match against "--prune" doesn't catch it; explicit entry needed.
+			name: "git push --prune-tags still flagged",
+			cmd:  `git push --prune-tags origin`,
+			want: true,
+		},
+		{
+			name: "git push --prune-tags via -C global option",
+			cmd:  `git -C /tmp push --prune-tags origin`,
+			want: true,
+		},
+		// Negative: a benign push must NOT be flagged so the gate doesn't
+		// over-trigger and force re-prompts on every push.
+		{
+			name: "git push origin main NOT flagged",
+			cmd:  `git push origin main`,
+			want: false,
+		},
+		{
+			name: "git push --tags NOT flagged",
+			cmd:  `git push --tags origin`,
+			want: false,
+		},
+		{
+			name: "git push --no-prune NOT flagged",
+			cmd:  `git push --no-prune origin`,
+			want: false,
+		},
+		// Refspec-based force / delete (PR #106 follow-up review).
+		{
+			name: "git push origin +main (force-push refspec)",
+			cmd:  `git push origin +main`,
+			want: true,
+		},
+		{
+			name: "git push origin +HEAD:main (force-push refspec)",
+			cmd:  `git push origin +HEAD:main`,
+			want: true,
+		},
+		{
+			name: "git push origin :feature/foo (delete-ref refspec)",
+			cmd:  `git push origin :feature/foo`,
+			want: true,
+		},
+		{
+			name: "git push origin :refs/heads/feature (delete-ref refspec)",
+			cmd:  `git push origin :refs/heads/feature`,
+			want: true,
+		},
+		{
+			name: "git push origin '+main' (quoted force-push refspec)",
+			cmd:  `git push origin '+main'`,
+			want: true,
+		},
+		{
+			name: `git push origin "+main" (double-quoted force-push refspec)`,
+			cmd:  `git push origin "+main"`,
+			want: true,
+		},
+		{
+			name: "git push origin main:dev (rename push, NOT destructive)",
+			cmd:  `git push origin main:dev`,
+			want: false,
+		},
+		{
+			name: "git push origin a+b (token does not START with +, NOT destructive)",
+			cmd:  `git push origin a+b`,
+			want: false,
+		},
+		// Global option bypass (PR #106 follow-up review): destructive flags must
+		// still trigger when git is invoked with -C / -c / --git-dir / etc.
+		{
+			name: "git -C . push --force-with-lease",
+			cmd:  `git -C . push --force-with-lease origin main`,
+			want: true,
+		},
+		{
+			name: "git -c key=value push --force",
+			cmd:  `git -c safe.directory=* push --force origin main`,
+			want: true,
+		},
+		{
+			name: "git --git-dir=/p push --force-with-lease",
+			cmd:  `git --git-dir=/some/path push --force-with-lease origin main`,
+			want: true,
+		},
+		{
+			name: "git --no-pager push --force",
+			cmd:  `git --no-pager push --force origin main`,
+			want: true,
+		},
+		{
+			name: "git -C dir push origin +main (refspec via -C)",
+			cmd:  `git -C ../other push origin +main`,
+			want: true,
+		},
+		// Negative: benign git status with -C must NOT trigger.
+		{
+			name: "git -C . status NOT flagged (subcommand is status)",
+			cmd:  `git -C . status`,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsAlwaysAskPrefix(tt.cmd)
+			if got != tt.want {
+				t.Errorf("IsAlwaysAskPrefix(%q) = %v, want %v", tt.cmd, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGitSubcommand verifies the global-option-aware git subcommand resolver
+// handles the bypass paths flagged in PR #106 follow-up review:
+//   - `git -C <dir>` — option with separate-token argument
+//   - `git -c <key=value>` — option with separate-token argument
+//   - `git --git-dir=<path>` — long option with embedded value
+//   - `git --no-pager` — boolean global option (no arg)
+//   - `git --foo --bar=baz push` — multiple stacked global options
+func TestGitSubcommand(t *testing.T) {
+	tests := []struct {
+		name   string
+		tokens []string
+		want   string
+	}{
+		{"plain git push", []string{"git", "push"}, "push"},
+		{"git -C dir push", []string{"git", "-C", ".", "push"}, "push"},
+		{"git -c kv push", []string{"git", "-c", "k=v", "push"}, "push"},
+		{"git --git-dir=p push", []string{"git", "--git-dir=/p", "push"}, "push"},
+		{"git --git-dir p push", []string{"git", "--git-dir", "/p", "push"}, "push"},
+		{"git --no-pager push", []string{"git", "--no-pager", "push"}, "push"},
+		{"git -p push", []string{"git", "-p", "push"}, "push"},
+		{"git -C dir status", []string{"git", "-C", ".", "status"}, "status"},
+		{"stacked options", []string{"git", "--no-pager", "--git-dir=/p", "-c", "k=v", "push"}, "push"},
+		{"not git", []string{"python3", "-c", "x"}, ""},
+		{"empty", []string{}, ""},
+		{"git alone", []string{"git"}, ""},
+		{"git only flags (no subcommand)", []string{"git", "--version"}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := gitSubcommand(tt.tokens)
+			if got != tt.want {
+				t.Errorf("gitSubcommand(%v) = %q, want %q", tt.tokens, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCheckCommand_GitPushFamilyDoesNotWidenToDestructive verifies the
+// regression caught in PR #106 review: with a benign `git push origin main`
+// in allowed_commands, token-prefix family matching (N=2 for git → "git push")
+// previously auto-allowed `git push --force-with-lease origin main` and
+// `git push --delete ...` because takeFirstNTokens skips flag tokens. The
+// always-ask gate now runs BEFORE the allowlist with token-based scanning,
+// so these destructive variants must still resolve to "ask".
+func TestCheckCommand_GitPushFamilyDoesNotWidenToDestructive(t *testing.T) {
+	cfg := &PermissionsConfig{
+		AllowedCommands: []string{
+			`git push origin main`,
+			`git push origin develop`,
+		},
+	}
+
+	mustAsk := []string{
+		`git push --force-with-lease origin main`,
+		`git push --force-if-includes origin main`,
+		`git push --delete origin feature/x`,
+		`git push -d origin feature/x`,
+		`git push --prune origin`,
+		`git push --prune origin refs/heads/*:refs/heads/*`,
+		`git push --prune-tags origin`,
+		`git push origin main --force`,
+		`git push --force-with-lease=refs/heads/main origin main`,
+		// Refspec-based destructive variants (PR #106 follow-up review).
+		`git push origin +main`,
+		`git push origin +HEAD:main`,
+		`git push origin :feature/x`,
+		// Global-option bypass (PR #106 follow-up review): -C / -c / --git-dir /
+		// --no-pager must NOT mask the destructive subcommand.
+		`git -C . push --force-with-lease origin main`,
+		`git -c safe.directory=* push --force origin main`,
+		`git --git-dir=/some/path push --force origin main`,
+		`git --no-pager push --force origin main`,
+		`git -C ../other push origin +main`,
+	}
+	for _, cmd := range mustAsk {
+		t.Run("ask_"+cmd, func(t *testing.T) {
+			decision, reason := CheckCommand(cmd, cfg)
+			if decision != "ask" {
+				t.Errorf("CheckCommand(%q) = %q (%s), want ask (destructive must not widen via family match)", cmd, decision, reason)
+			}
+		})
+	}
+
+	// Benign push variants that share the family must still be allowed via
+	// literal/glob match. (Family expansion can promote them, which is fine
+	// because they're not destructive.)
+	mustAllow := []string{
+		`git push origin main`,
+		`git push origin develop`,
+	}
+	for _, cmd := range mustAllow {
+		t.Run("allow_"+cmd, func(t *testing.T) {
+			decision, reason := CheckCommand(cmd, cfg)
+			if decision != "allow" {
+				t.Errorf("CheckCommand(%q) = %q (%s), want allow", cmd, decision, reason)
+			}
+		})
+	}
+}
+
+// TestCheckCommand_BackgroundSeparatorBypass: agent-style obfuscation where
+// a benign `echo` is backgrounded with `&` and a destructive python -c
+// follows. Pre-fix, this returned "allow" because splitCompoundCommand kept
+// the whole string as one segment and isDefaultSafe matched the leading
+// `echo `.
+func TestCheckCommand_BackgroundSeparatorBypass(t *testing.T) {
+	cfg := &PermissionsConfig{
+		AllowedCommands: []string{"echo *", "ls *"},
+	}
+	mustAsk := []string{
+		`echo hello & python3 -c 'import sys; print(sys.argv)'`,
+		`ls & python3 -c 'evil'`,
+		`echo ok & rm -rf ./build`,
+		// Subshell variant
+		`echo ok || (python3 -c 'evil')`,
+		`(bash -c 'whoami')`,
+	}
+	for _, cmd := range mustAsk {
+		t.Run(cmd, func(t *testing.T) {
+			decision, reason := CheckCommand(cmd, cfg)
+			if decision != "ask" {
+				t.Errorf("CheckCommand(%q) = %q (%s), want ask (high-risk inner command must be flagged)", cmd, decision, reason)
 			}
 		})
 	}

@@ -24,10 +24,11 @@ type PermissionsConfig struct {
 // number is stricter. Unknown executables fall back to defaultPrefixDepth.
 //
 // Example:
-//   N=2 for "git" → `git status` and `git push` are different families,
-//                   but `git status -uall` and `git status --short` share `git status`.
-//   N=2 for "ptengine-cli" → `ptengine-cli config` covers config get/show/list/...,
-//                            `ptengine-cli heatmap` covers heatmap query/filter-values/...
+//
+//	N=2 for "git" → `git status` and `git push` are different families,
+//	                but `git status -uall` and `git status --short` share `git status`.
+//	N=2 for "ptengine-cli" → `ptengine-cli config` covers config get/show/list/...,
+//	                         `ptengine-cli heatmap` covers heatmap query/filter-values/...
 var prefixDepthTable = map[string]int{
 	"git":            2,
 	"kubectl":        2,
@@ -267,13 +268,16 @@ func shellTokens(cmd string) []string {
 //   - Arbitrary code execution interpreters (python -c, node -e, bash -c, ...)
 //   - Inline JS injection (agent-browser eval)
 //   - Supply-chain installers (pip/npm/yarn/cargo/brew install, etc.)
-//   - Force-push variants of git
 //   - Trailing & (background launch — checked separately via hasTrailingBackground)
 //   - rm -rf (covers paths the hard-block list doesn't, e.g. relative deletes)
 //
-// Match semantics: the command (with redirects stripped) starts with the
-// prefix followed by space or end. minusMExempt overrides specific safe
-// `-m` invocations (e.g. `python3 -m pytest`).
+// Match semantics: the command (with redirects stripped and exe basename
+// normalized) starts with the prefix followed by space or end. Flag/refspec
+// dangers in `git push` are handled separately via isAlwaysAskGitPush because
+// they can appear anywhere in the args (`--force-with-lease`, `+main`,
+// `:feature`) and may be hidden behind global options (`git -C dir push ...`)
+// that defeat fixed-prefix matching. minusMExempt overrides specific safe `-m`
+// invocations (e.g. `python3 -m pytest`).
 var alwaysAskPrefixes = []string{
 	// Arbitrary code execution
 	"python -c", "python3 -c",
@@ -299,15 +303,153 @@ var alwaysAskPrefixes = []string{
 	"npx",
 	"cargo install", "gem install",
 	"go install", "brew install",
-	// Dangerous git operations
-	"git push --force", "git push -f",
-	"git push --mirror",
 	// Strong delete (hard-block already covers root-level rm -rf; this catches
 	// relative or working-dir deletes which are still dangerous).
 	// rm -r (without -f) is intentionally excluded: it still prompts via the
 	// normal "ask" path and is less likely to be used for mass deletion than
 	// rm -rf. Add it here if the project needs stricter treatment.
 	"rm -rf",
+}
+
+// gitPushDangerFlags are flag tokens that, if present anywhere in a `git push`
+// invocation, indicate a destructive operation and force ask regardless of
+// allowed_commands. Token-equality match (`t == flag`) or flag-with-value match
+// (`HasPrefix(t, flag+"=")`).
+//
+// This is necessary because `alwaysAskPrefixes` uses HasPrefix(core, prefix+" "),
+// which requires the dangerous flag to be in a fixed position immediately after
+// the executable. That misses:
+//   - `git push --force-with-lease origin main` (next char after `--force` is `-`)
+//   - `git push origin main --force` (flag at end)
+//   - `git push --force=ref` (flag with value via =)
+//   - `git push --delete origin foo` and `git push -d ...`
+//   - `git push --prune origin` (deletes remote refs missing locally)
+//   - `git push --prune-tags origin` (alias for --prune in more aggressive form,
+//     extending pruning to remote tags missing locally — strictly more
+//     destructive than --prune; per git-push(1))
+//
+// Without this gate, prefix-family matching with N=2 (`git push`) would silently
+// auto-allow destructive variants whenever a normal `git push origin main` entry
+// exists in allowed_commands.
+var gitPushDangerFlags = []string{
+	"--force", "-f",
+	"--force-with-lease",
+	"--force-if-includes",
+	"--mirror",
+	"--delete", "-d",
+	"--prune",
+	"--prune-tags",
+}
+
+// gitGlobalOptsWithArg are `git` global options (placed BEFORE the subcommand)
+// that take a separate-token argument. Used by gitSubcommand to skip them when
+// looking for the actual subcommand. Without this, `git -C /tmp push --force`
+// would have its subcommand misidentified as `/tmp` instead of `push`, defeating
+// the always-ask gate.
+//
+// The `--opt=value` long form (single token containing `=`) is handled
+// generically by gitSubcommand without needing an entry here. Boolean global
+// flags like `--no-pager`, `-p`, `--paginate` are also handled generically
+// (any flag-shaped token not in this map is assumed to take no separate arg).
+var gitGlobalOptsWithArg = map[string]bool{
+	"-C":             true,
+	"-c":             true,
+	"--git-dir":      true,
+	"--work-tree":    true,
+	"--namespace":    true,
+	"--super-prefix": true,
+	"--config-env":   true,
+	"--exec-path":    true,
+	"--list-cmds":    true,
+	"--attr-source":  true,
+}
+
+// gitSubcommand returns the actual git subcommand from a tokenized command,
+// skipping global options like `-C <dir>`, `-c <kv>`, `--git-dir=<path>`.
+// Returns "" if the command is not a recognized git invocation or no
+// subcommand could be located.
+//
+// Examples:
+//
+//	["git", "push", ...]                        → "push"
+//	["git", "-C", ".", "push", ...]             → "push"
+//	["git", "-c", "k=v", "push", ...]           → "push"
+//	["git", "--git-dir=/p", "push", ...]        → "push"
+//	["git", "--no-pager", "push", ...]          → "push"
+//	["git"]                                     → ""
+//	["python3", "-c", ...]                      → ""
+func gitSubcommand(tokens []string) string {
+	if len(tokens) == 0 || tokens[0] != "git" {
+		return ""
+	}
+	for i := 1; i < len(tokens); i++ {
+		t := tokens[i]
+		if !strings.HasPrefix(t, "-") {
+			return t
+		}
+		// `--opt=value` long form — single token, skip and continue.
+		if strings.Contains(t, "=") {
+			continue
+		}
+		// Option that takes a separate-token argument — skip the option AND
+		// its argument. Bounds-check so we don't run off the end.
+		if gitGlobalOptsWithArg[t] && i+1 < len(tokens) {
+			i++
+			continue
+		}
+		// Boolean flag — just skip it.
+	}
+	return ""
+}
+
+// unquoteToken returns the contents of a token with one layer of matching outer
+// quotes stripped. Used by isAlwaysAskGitPush so that `'+main'` and `"+main"`
+// are detected as destructive refspecs even when quoted by the agent.
+func unquoteToken(t string) string {
+	if len(t) >= 2 {
+		if (t[0] == '"' && t[len(t)-1] == '"') || (t[0] == '\'' && t[len(t)-1] == '\'') {
+			return t[1 : len(t)-1]
+		}
+	}
+	return t
+}
+
+// isAlwaysAskGitPush returns true if `core` is a git push invocation with any
+// destructive flag, destructive refspec, or both. Handles:
+//   - `git -C dir push ...`, `git -c k=v push ...`, `git --git-dir=p push ...`
+//     (global options before the subcommand) via gitSubcommand.
+//   - Destructive flags from gitPushDangerFlags (anywhere in the args).
+//   - Destructive refspecs:
+//   - `+<refspec>` — force push (overrides non-fast-forward checks). Examples:
+//     `git push origin +main`, `git push origin +HEAD:main`.
+//   - `:<refname>` — delete remote ref. Example: `git push origin :feature/foo`.
+//
+// Quoted refspec tokens like `'+main'` / `"+main"` are unquoted before checking
+// to prevent trivial bypass via shell quoting.
+func isAlwaysAskGitPush(core string) bool {
+	tokens := shellTokens(core)
+	if gitSubcommand(tokens) != "push" {
+		return false
+	}
+	for _, t := range tokens {
+		u := unquoteToken(t)
+		if u == "" {
+			continue
+		}
+		// Destructive flag.
+		for _, f := range gitPushDangerFlags {
+			if u == f || strings.HasPrefix(u, f+"=") {
+				return true
+			}
+		}
+		// Destructive refspec: leading + (force) or : (delete). These only
+		// make sense as refspec args (not flags, not the executable, not the
+		// subcommand), so we can match on the first byte directly.
+		if u[0] == '+' || u[0] == ':' {
+			return true
+		}
+	}
+	return false
 }
 
 // minusMExempt are `python -m <module>` (and python3) invocations considered
@@ -322,10 +464,13 @@ var minusMExempt = []string{
 }
 
 // IsAlwaysAskPrefix reports whether a bash command (possibly compound) contains
-// any sub-command that matches a high-risk prefix or has a trailing `&`
-// background launch. Used by:
-//   - checkSingleCommand: forces "ask" decision even when allowed_commands matches
-//   - daemon-side always_allow handler: skips persistence to config.yaml when true
+// any sub-command that matches a high-risk prefix, dangerous-flag pattern, or
+// has a trailing `&` background launch. The internal engine path
+// (checkSingleCommand) calls the private isAlwaysAskSingle on each split
+// segment; this exported wrapper exists for the daemon-side always_allow
+// persistence guard (cmd/daemon.go, internal/daemon/server.go), which receives
+// pre-split full command strings and must skip persistence to config.yaml when
+// any segment is high-risk.
 //
 // minusMExempt entries override matching alwaysAskPrefixes (so e.g.
 // `python3 -m pytest` is not flagged even though `python3 -m` is in the list).
@@ -387,6 +532,15 @@ func isAlwaysAskSingle(cmd string) bool {
 			return true
 		}
 	}
+	// git push: dangerous-flag/refspec scan handles cases that fixed-prefix
+	// matching cannot:
+	//   - `git -C dir push --force-with-lease ...` (global option bypass)
+	//   - `git push origin +main` / `+HEAD:main` (force-push refspec)
+	//   - `git push origin :feature/foo` (delete-ref refspec)
+	//   - `git push origin main --force` (flag at end of args)
+	if isAlwaysAskGitPush(core) {
+		return true
+	}
 	return false
 }
 
@@ -424,7 +578,7 @@ var defaultSensitivePatterns = []string{
 
 // defaultSafeCommands are commands allowed by default without user config.
 // These are read-only, informational commands with no side effects.
-// Resolution order: hard-block → denied → allowed → defaultSafe → ask.
+// Resolution order: hard-block → denied → always-ask → allowed → defaultSafe → ask.
 // Users can override with denied_commands if needed.
 var defaultSafeCommands = []defaultSafeEntry{
 	// --- System info & file inspection ---
@@ -778,6 +932,12 @@ func isDefaultSafe(cmd string) bool {
 
 // shellSplitOperators are used to split compound commands.
 // Order matters: longer operators must come first.
+//
+// Bare `&` (background separator) is intentionally NOT in this list — it needs
+// context-sensitive handling (must be distinguished from `&&`, `&>` redirect,
+// and FD-dup `2>&1`) and the trailing `&` must be preserved on the prior
+// segment so hasTrailingBackground catches it. See splitCompoundCommand for
+// the inline `&` logic.
 var shellSplitOperators = []string{"&&", "||", ";", "|"}
 
 // stripRedirects removes shell I/O redirection operators (and their targets)
@@ -1117,8 +1277,10 @@ func checkSingleCommand(cmd string, config *PermissionsConfig) (string, string) 
 }
 
 // splitCompoundCommand splits a command string on top-level shell operators
-// (&&, ||, ;, |), respecting single quotes, double quotes, $(...) and backtick
-// command substitutions. Operators inside any quoted/substituted region are
+// (&&, ||, ;, |, and bare `&`), respecting single quotes, double quotes,
+// $(...) and backtick command substitutions. Subshell groups `(...)` are
+// recursively expanded — their inner segments are emitted as separate parts
+// at the top level. Operators inside any quoted/substituted region are
 // treated as literal characters.
 //
 // Examples:
@@ -1126,6 +1288,19 @@ func checkSingleCommand(cmd string, config *PermissionsConfig) (string, string) 
 //	cmd1 && cmd2                     → ["cmd1", "cmd2"]
 //	echo "a && b"                    → [`echo "a && b"`]
 //	cmd1; agent-browser eval "a; b"  → ["cmd1", `agent-browser eval "a; b"`]
+//	cmd1 & cmd2                      → ["cmd1 &", "cmd2"]   (& kept on prior segment)
+//	cmd1 || (python3 -c 'evil')      → ["cmd1", "python3 -c 'evil'"]
+//	cmd1 2>&1 & cmd2                 → ["cmd1 2>&1 &", "cmd2"] (FD-dup not split)
+//	cmd1 &>/dev/null                 → ["cmd1 &>/dev/null"]   (&> redirect not split)
+//
+// Bare `&` semantics: a top-level `&` separates commands (background launch
+// of the prior). The `&` is preserved on the prior segment so isAlwaysAskSingle's
+// hasTrailingBackground check still fires. The splitter does NOT split on `&`
+// when it would mistake a redirect (`&>`) or FD-dup (`2>&1`) for a separator.
+//
+// Subshell `(...)` semantics: the parens themselves are dropped; the inner
+// commands are re-tokenized at top level, so a high-risk inner command can be
+// independently flagged by isAlwaysAskSingle. Nested groups are supported.
 //
 // Single quotes preserve everything until the matching `'` (POSIX behavior).
 // Double quotes allow `\` escaping and embedded `$(...)` / backtick subs.
@@ -1146,6 +1321,7 @@ func splitCompoundCommand(cmd string) []string {
 	//   'd' = double quotes
 	//   'p' = $(...) substitution
 	//   'b' = `...` backtick substitution
+	//   'g' = (...) subshell group at top level — splits like top-level
 	var stack []byte
 	push := func(c byte) { stack = append(stack, c) }
 	pop := func() {
@@ -1191,7 +1367,8 @@ func splitCompoundCommand(cmd string) []string {
 			}
 			continue
 		case 'p', 'b':
-			// Inside $(...) or `...`: recursive shell context.
+			// Inside $(...) or `...`: recursive shell context, kept verbatim
+			// in the buffer (no top-level splitting inside command substitutions).
 			buf.WriteByte(c)
 			switch c {
 			case '\'':
@@ -1217,7 +1394,15 @@ func splitCompoundCommand(cmd string) []string {
 			}
 			continue
 		}
-		// Top-level: check operators first (longest-match).
+		// Top-level OR inside 'g' (subshell group). Both share splitting
+		// semantics: operators split, ( opens nested group, ) closes group.
+		// Closing ) of a subshell group flushes inner content and pops.
+		if top() == 'g' && c == ')' {
+			flush()
+			pop()
+			continue
+		}
+		// Check operators first (longest-match).
 		matched := 0
 		for _, op := range shellSplitOperators {
 			if i+len(op) <= n && cmd[i:i+len(op)] == op {
@@ -1230,7 +1415,21 @@ func splitCompoundCommand(cmd string) []string {
 			i += matched - 1
 			continue
 		}
-		// Top-level: track openers.
+		// Bare `&` (background separator). The prior segment keeps the `&` so
+		// hasTrailingBackground catches background launches in isAlwaysAskSingle.
+		// Excluded:
+		//   - `&>` / `&>>` (combined stdout+stderr redirect — next char is '>')
+		//   - FD-dup like `2>&1` or `>&2` (prior char is '>')
+		// Note: `&&` is already consumed by the operator loop above (longest-match),
+		// so a remaining `&` here is unambiguously a background separator.
+		if c == '&' &&
+			(i+1 >= n || cmd[i+1] != '>') &&
+			(i == 0 || cmd[i-1] != '>') {
+			buf.WriteByte(c)
+			flush()
+			continue
+		}
+		// Top-level openers
 		switch {
 		case c == '\'':
 			push('s')
@@ -1243,6 +1442,12 @@ func splitCompoundCommand(cmd string) []string {
 			buf.WriteByte(cmd[i+1])
 			i++
 			push('p')
+			continue
+		case c == '(':
+			// Subshell group — flush prior content, push 'g'. The `(` is dropped
+			// so the inner commands are tokenized as plain segments.
+			flush()
+			push('g')
 			continue
 		}
 		buf.WriteByte(c)

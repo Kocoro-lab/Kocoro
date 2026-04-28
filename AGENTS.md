@@ -110,7 +110,7 @@ internal/
     launchd_darwin.go  # plist generation, launchctl
     launchd_stub.go    # non-darwin stub
   permissions/
-    permissions.go     # hard-block > denied > split compounds > allowed > default safe > ask
+    permissions.go     # hard-block > denied > split compounds (incl. & and (...)) > always-ask (prefix + dangerous-flag) > allowed (literal/glob + token-prefix family) > default safe > ask
   audit/
     audit.go           # JSON-lines logger, redaction
   hooks/
@@ -165,10 +165,10 @@ Three-layer system for triggering `use_skill`:
 ### Permission Model
 
 ```
-hard-block constants → denied_commands → compound-command splitting → allowed_commands → default safe → RequiresApproval + SafeChecker
+hard-block constants → denied_commands → compound-command splitting (incl. bare & and (...) subshells) → always-ask (alwaysAskPrefixes + git-push dangerous-flag/refspec scan) → allowed_commands (literal/glob + token-prefix family fallback) → default safe → RequiresApproval + SafeChecker
 ```
 
-Unknown tools are denied by default.
+Unknown tools are denied by default. The always-ask gate runs BEFORE the allowlist, so high-risk commands (`python -c`, `bash -c`, `pip install`, destructive `git push` flags such as `--force*`/`--delete`/`--prune`/`--prune-tags`, `rm -rf`, trailing `&`, etc.) cannot be silenced via `allowed_commands` or token-prefix family expansion — the only way to disable the gate for a given prefix or flag is a code change.
 
 ### Daemon Architecture
 

@@ -104,16 +104,25 @@ func (b *EventBus) EmitTo(evt Event) int {
 		}
 	}
 
-	// Write to ring buffer only after delivery attempt. Notification events
-	// that were not delivered (delivered == 0) are excluded: the caller
-	// (runner.go notify handler) falls back to osascript in that case, and
-	// replaying the notification on reconnect would produce a duplicate banner.
-	if evt.Type != EventNotification || delivered > 0 {
-		b.ring[b.ringHead] = evt
-		b.ringHead = (b.ringHead + 1) % ringSize
-		if b.ringLen < ringSize {
-			b.ringLen++
+	// Write to ring buffer only after delivery attempt. Transient
+	// notification-style events that were not delivered (delivered == 0) are
+	// excluded so reconnecting clients don't see stale banners for actions
+	// that already happened:
+	//   - EventNotification: caller (runner.go notify handler) falls back to
+	//     osascript when undelivered; replay would duplicate the banner.
+	//   - EventApprovalNotice: post-decision feedback ("not saved to config —
+	//     high-risk pattern"); the approval decision is one-shot and replaying
+	//     the notice on reconnect produces a phantom warning for a resolved call.
+	switch evt.Type {
+	case EventNotification, EventApprovalNotice:
+		if delivered == 0 {
+			return delivered
 		}
+	}
+	b.ring[b.ringHead] = evt
+	b.ringHead = (b.ringHead + 1) % ringSize
+	if b.ringLen < ringSize {
+		b.ringLen++
 	}
 
 	return delivered
