@@ -1389,6 +1389,46 @@ func TestIsAlwaysAskPrefix_BypassRegressions(t *testing.T) {
 			cmd:  `git -C ../other push origin +main`,
 			want: true,
 		},
+		{
+			name: "env wrapper around git push --force",
+			cmd:  `env git push --force origin main`,
+			want: true,
+		},
+		{
+			name: "env assignment wrapper around git push --force",
+			cmd:  `env FOO=1 git push --force origin main`,
+			want: true,
+		},
+		{
+			name: "full-path env wrapper around full-path git push --force",
+			cmd:  `/usr/bin/env /usr/bin/git push --force origin main`,
+			want: true,
+		},
+		{
+			name: "env split-string wrapper around git push --force",
+			cmd:  `env -S 'git push --force origin main'`,
+			want: true,
+		},
+		{
+			name: "command wrapper around git push --force",
+			cmd:  `command -p git push --force origin main`,
+			want: true,
+		},
+		{
+			name: "sudo wrapper around git push --force",
+			cmd:  `sudo -u root git push --force origin main`,
+			want: true,
+		},
+		{
+			name: "nohup wrapper around git push delete refspec",
+			cmd:  `nohup git push origin :feature/foo`,
+			want: true,
+		},
+		{
+			name: "sudo wrapper option value that looks like refspec is not destructive",
+			cmd:  `sudo -u :root git push origin main`,
+			want: false,
+		},
 		// Negative: benign git status with -C must NOT trigger.
 		{
 			name: "git -C . status NOT flagged (subcommand is status)",
@@ -1432,6 +1472,17 @@ func TestGitSubcommand(t *testing.T) {
 		{"empty", []string{}, ""},
 		{"git alone", []string{"git"}, ""},
 		{"git only flags (no subcommand)", []string{"git", "--version"}, ""},
+		{"env git push", []string{"env", "git", "push"}, "push"},
+		{"env assignment git push", []string{"env", "FOO=1", "git", "push"}, "push"},
+		{"full-path env full-path git push", []string{"/usr/bin/env", "/usr/bin/git", "push"}, "push"},
+		{"env split string git push", []string{"env", "-S", "git push", "--force"}, "push"},
+		{"env split string long option git push", []string{"env", "--split-string='git push'", "--force"}, "push"},
+		{"command -p git push", []string{"command", "-p", "git", "push"}, "push"},
+		{"command -v git does not execute", []string{"command", "-v", "git", "push"}, ""},
+		{"sudo -u root git push", []string{"sudo", "-u", "root", "git", "push"}, "push"},
+		{"nohup git push", []string{"nohup", "git", "push"}, "push"},
+		{"nice -n 10 git push", []string{"nice", "-n", "10", "git", "push"}, "push"},
+		{"time -p git push", []string{"time", "-p", "git", "push"}, "push"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1479,6 +1530,13 @@ func TestCheckCommand_GitPushFamilyDoesNotWidenToDestructive(t *testing.T) {
 		`git --git-dir=/some/path push --force origin main`,
 		`git --no-pager push --force origin main`,
 		`git -C ../other push origin +main`,
+		`env git push --force origin main`,
+		`env FOO=1 git push --force origin main`,
+		`/usr/bin/env /usr/bin/git push --force origin main`,
+		`env -S 'git push --force origin main'`,
+		`command -p git push --force origin main`,
+		`sudo -u root git push --force origin main`,
+		`nohup git push origin :feature/x`,
 	}
 	for _, cmd := range mustAsk {
 		t.Run("ask_"+cmd, func(t *testing.T) {
@@ -1495,6 +1553,48 @@ func TestCheckCommand_GitPushFamilyDoesNotWidenToDestructive(t *testing.T) {
 	mustAllow := []string{
 		`git push origin main`,
 		`git push origin develop`,
+	}
+	for _, cmd := range mustAllow {
+		t.Run("allow_"+cmd, func(t *testing.T) {
+			decision, reason := CheckCommand(cmd, cfg)
+			if decision != "allow" {
+				t.Errorf("CheckCommand(%q) = %q (%s), want allow", cmd, decision, reason)
+			}
+		})
+	}
+}
+
+func TestCheckCommand_GitPushWrapperFamilyDoesNotWidenToDestructive(t *testing.T) {
+	cfg := &PermissionsConfig{
+		AllowedCommands: []string{
+			`env git push origin main`,
+			`env FOO=1 git push origin main`,
+			`command -p git push origin main`,
+			`sudo -u root git push origin main`,
+		},
+	}
+
+	mustAsk := []string{
+		`env git push --force origin main`,
+		`env FOO=1 git push --force origin main`,
+		`env -S 'git push --force origin main'`,
+		`command -p git push --force origin main`,
+		`sudo -u root git push --force origin main`,
+	}
+	for _, cmd := range mustAsk {
+		t.Run("ask_"+cmd, func(t *testing.T) {
+			decision, reason := CheckCommand(cmd, cfg)
+			if decision != "ask" {
+				t.Errorf("CheckCommand(%q) = %q (%s), want ask (wrapped destructive push must not widen via family match)", cmd, decision, reason)
+			}
+		})
+	}
+
+	mustAllow := []string{
+		`env git push origin main`,
+		`env FOO=1 git push origin main`,
+		`command -p git push origin main`,
+		`sudo -u root git push origin main`,
 	}
 	for _, cmd := range mustAllow {
 		t.Run("allow_"+cmd, func(t *testing.T) {

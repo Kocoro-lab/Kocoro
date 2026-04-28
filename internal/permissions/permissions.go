@@ -364,6 +364,192 @@ var gitGlobalOptsWithArg = map[string]bool{
 	"--attr-source":  true,
 }
 
+var envOptsWithArg = map[string]bool{
+	"-u":             true,
+	"--unset":        true,
+	"-C":             true,
+	"--chdir":        true,
+	"-S":             true,
+	"--split-string": true,
+	"-P":             true,
+	"--path":         true,
+}
+
+var sudoOptsWithArg = map[string]bool{
+	"-u":                true,
+	"--user":            true,
+	"-g":                true,
+	"--group":           true,
+	"-h":                true,
+	"--host":            true,
+	"-p":                true,
+	"--prompt":          true,
+	"-C":                true,
+	"--close-from":      true,
+	"-D":                true,
+	"--chdir":           true,
+	"-T":                true,
+	"--command-timeout": true,
+	"-t":                true,
+	"--type":            true,
+	"-r":                true,
+	"--role":            true,
+	"-U":                true,
+	"--other-user":      true,
+}
+
+func tokenCommandName(t string) string {
+	return filepath.Base(unquoteToken(t))
+}
+
+func hasAssignmentToken(t string) bool {
+	return !strings.HasPrefix(t, "-") && strings.Contains(t, "=")
+}
+
+func hasInlineOptionArg(t string, optsWithArg map[string]bool) bool {
+	for opt := range optsWithArg {
+		if strings.HasPrefix(opt, "--") && strings.HasPrefix(t, opt+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func skipOptionTokens(tokens []string, optsWithArg map[string]bool) []string {
+	for i := 0; i < len(tokens); i++ {
+		t := unquoteToken(tokens[i])
+		if t == "--" {
+			return tokens[i+1:]
+		}
+		if hasInlineOptionArg(t, optsWithArg) {
+			continue
+		}
+		if optsWithArg[t] {
+			if i+1 >= len(tokens) {
+				return nil
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(t, "-") {
+			continue
+		}
+		return tokens[i:]
+	}
+	return nil
+}
+
+func skipEnvAssignments(tokens []string) []string {
+	for len(tokens) > 0 && hasAssignmentToken(unquoteToken(tokens[0])) {
+		tokens = tokens[1:]
+	}
+	return tokens
+}
+
+func splitEnvString(arg string, rest []string) []string {
+	split := shellTokens(unquoteToken(arg))
+	return append(split, rest...)
+}
+
+func skipEnvWrapper(tokens []string) []string {
+	for i := 0; i < len(tokens); i++ {
+		t := unquoteToken(tokens[i])
+		switch {
+		case t == "--":
+			return skipEnvAssignments(tokens[i+1:])
+		case t == "-S" || t == "--split-string":
+			if i+1 >= len(tokens) {
+				return nil
+			}
+			return skipEnvAssignments(splitEnvString(tokens[i+1], tokens[i+2:]))
+		case strings.HasPrefix(t, "--split-string="):
+			value := strings.TrimPrefix(t, "--split-string=")
+			return skipEnvAssignments(splitEnvString(value, tokens[i+1:]))
+		case hasInlineOptionArg(t, envOptsWithArg):
+			continue
+		case envOptsWithArg[t]:
+			if i+1 >= len(tokens) {
+				return nil
+			}
+			i++
+			continue
+		case strings.HasPrefix(t, "-"):
+			continue
+		default:
+			return skipEnvAssignments(tokens[i:])
+		}
+	}
+	return nil
+}
+
+func skipCommandWrapper(tokens []string) []string {
+	for i := 0; i < len(tokens); i++ {
+		t := unquoteToken(tokens[i])
+		switch t {
+		case "--":
+			return tokens[i+1:]
+		case "-p":
+			continue
+		case "-v", "-V":
+			return nil
+		}
+		if strings.HasPrefix(t, "-") {
+			return nil
+		}
+		return tokens[i:]
+	}
+	return nil
+}
+
+func gitInvocationTokens(tokens []string) []string {
+	for len(tokens) > 0 {
+		switch tokenCommandName(tokens[0]) {
+		case "git":
+			return tokens
+		case "env":
+			tokens = skipEnvWrapper(tokens[1:])
+		case "command":
+			tokens = skipCommandWrapper(tokens[1:])
+		case "sudo", "doas":
+			tokens = skipOptionTokens(tokens[1:], sudoOptsWithArg)
+		case "nohup":
+			tokens = tokens[1:]
+		case "nice":
+			tokens = skipOptionTokens(tokens[1:], map[string]bool{"-n": true, "--adjustment": true})
+		case "time":
+			tokens = skipOptionTokens(tokens[1:], nil)
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+func gitSubcommandIndex(tokens []string) ([]string, int, string) {
+	tokens = gitInvocationTokens(tokens)
+	if len(tokens) == 0 || tokenCommandName(tokens[0]) != "git" {
+		return nil, -1, ""
+	}
+	for i := 1; i < len(tokens); i++ {
+		t := unquoteToken(tokens[i])
+		if !strings.HasPrefix(t, "-") {
+			return tokens, i, t
+		}
+		// `--opt=value` long form — single token, skip and continue.
+		if strings.Contains(t, "=") {
+			continue
+		}
+		// Option that takes a separate-token argument — skip the option AND
+		// its argument. Bounds-check so we don't run off the end.
+		if gitGlobalOptsWithArg[t] && i+1 < len(tokens) {
+			i++
+			continue
+		}
+		// Boolean flag — just skip it.
+	}
+	return tokens, -1, ""
+}
+
 // gitSubcommand returns the actual git subcommand from a tokenized command,
 // skipping global options like `-C <dir>`, `-c <kv>`, `--git-dir=<path>`.
 // Returns "" if the command is not a recognized git invocation or no
@@ -379,27 +565,8 @@ var gitGlobalOptsWithArg = map[string]bool{
 //	["git"]                                     → ""
 //	["python3", "-c", ...]                      → ""
 func gitSubcommand(tokens []string) string {
-	if len(tokens) == 0 || tokens[0] != "git" {
-		return ""
-	}
-	for i := 1; i < len(tokens); i++ {
-		t := tokens[i]
-		if !strings.HasPrefix(t, "-") {
-			return t
-		}
-		// `--opt=value` long form — single token, skip and continue.
-		if strings.Contains(t, "=") {
-			continue
-		}
-		// Option that takes a separate-token argument — skip the option AND
-		// its argument. Bounds-check so we don't run off the end.
-		if gitGlobalOptsWithArg[t] && i+1 < len(tokens) {
-			i++
-			continue
-		}
-		// Boolean flag — just skip it.
-	}
-	return ""
+	_, _, sub := gitSubcommandIndex(tokens)
+	return sub
 }
 
 // unquoteToken returns the contents of a token with one layer of matching outer
@@ -428,10 +595,11 @@ func unquoteToken(t string) string {
 // to prevent trivial bypass via shell quoting.
 func isAlwaysAskGitPush(core string) bool {
 	tokens := shellTokens(core)
-	if gitSubcommand(tokens) != "push" {
+	gitTokens, subIdx, sub := gitSubcommandIndex(tokens)
+	if sub != "push" {
 		return false
 	}
-	for _, t := range tokens {
+	for _, t := range gitTokens[subIdx+1:] {
 		u := unquoteToken(t)
 		if u == "" {
 			continue
