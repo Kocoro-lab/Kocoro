@@ -51,7 +51,7 @@ type fileReadArgs struct {
 func (t *FileReadTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:        "file_read",
-		Description: "Read a file's contents with line numbers. Use offset and limit for large files. For image files (png/jpg/gif/webp), returns the image for vision analysis. For PDF files, renders pages as images for vision analysis (use offset for start page, limit for max pages).",
+		Description: "Read a file's contents with line numbers. Use offset and limit for large files. Repeat reads of the same (path, offset, limit) within one session return a short \"unchanged since last read\" stub when the file has not been modified — to force a fresh read, modify the file or pass a different offset/limit range. For image files (png/jpg/gif/webp), returns the image for vision analysis. For PDF files, renders pages as images for vision analysis (use offset for start page, limit for max pages).",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -89,6 +89,18 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	// PDF files: render pages as images for vision analysis.
 	if ext == ".pdf" {
 		return t.readPDF(args.Path, args.Offset, args.Limit)
+	}
+
+	// Dedup check: when the same (path, offset, limit) was read earlier in
+	// the session AND the file's mtime+size are unchanged, return a ~120B
+	// stub instead of replaying the full content. Skipped above for
+	// images/PDFs (they return image blocks, not text). No-op when there's
+	// no ReadTracker in context (tool called outside the agent loop).
+	info, statErr := os.Stat(args.Path)
+	if statErr == nil {
+		if hit, stub := agent.CheckFileReadDedup(ctx, args.Path, args.Offset, args.Limit, info.ModTime(), info.Size()); hit {
+			return agent.ToolResult{Content: stub}, nil
+		}
 	}
 
 	data, err := os.ReadFile(args.Path)
@@ -132,6 +144,11 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	var sb strings.Builder
 	for i := start; i < end; i++ {
 		fmt.Fprintf(&sb, "%4d | %s\n", i+1, lines[i])
+	}
+	// Record this read for future dedup. Stat may have failed earlier
+	// (race with file removal); skip recording in that case.
+	if statErr == nil {
+		agent.RecordFileRead(ctx, args.Path, args.Offset, args.Limit, info.ModTime(), info.Size())
 	}
 	return agent.ToolResult{Content: sb.String()}, nil
 }

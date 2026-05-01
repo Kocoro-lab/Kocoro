@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
 
 func TestFileRead_Run(t *testing.T) {
@@ -189,5 +192,147 @@ func TestFileRead_OversizeRespectsLimit(t *testing.T) {
 	// Verify content has the line-number prefix and reasonable length.
 	if !strings.Contains(result.Content, "   1 |") {
 		t.Errorf("expected line number prefix in slice content, got first 200 bytes: %s", result.Content[:min(200, len(result.Content))])
+	}
+}
+
+// TestFileRead_DedupSameFile_SameRange verifies that two reads of the same
+// (path, offset, limit) tuple within one session — with no file modification
+// in between — return a short "unchanged" stub on the second call.
+func TestFileRead_DedupSameFile_SameRange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	os.WriteFile(path, []byte("line1\nline2\nline3\n"), 0o644)
+
+	tracker := agent.NewReadTracker()
+	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
+
+	tool := &FileReadTool{}
+
+	// First read: full content
+	args, _ := json.Marshal(fileReadArgs{Path: path})
+	r1, err := tool.Run(ctx, string(args))
+	if err != nil {
+		t.Fatalf("first read transport error: %v", err)
+	}
+	if r1.IsError {
+		t.Fatalf("first read error: %s", r1.Content)
+	}
+	if !strings.Contains(r1.Content, "line1") {
+		t.Errorf("first read should contain content, got: %s", r1.Content)
+	}
+
+	// Second read with SAME args: should dedup → stub
+	r2, err := tool.Run(ctx, string(args))
+	if err != nil {
+		t.Fatalf("second read transport error: %v", err)
+	}
+	if r2.IsError {
+		t.Fatalf("dedup hit should not be IsError: %s", r2.Content)
+	}
+	if !strings.Contains(r2.Content, "unchanged since last read") {
+		t.Errorf("expected dedup stub, got: %s", r2.Content)
+	}
+	if strings.Contains(r2.Content, "line1") {
+		t.Errorf("dedup stub should NOT contain file content, got: %s", r2.Content)
+	}
+	if len(r2.Content) > 200 {
+		t.Errorf("dedup stub should be short (~120B), got %d bytes", len(r2.Content))
+	}
+}
+
+// TestFileRead_DedupSameFile_DifferentRange: a second read with different
+// offset+limit must NOT dedup — model is asking for a different slice.
+func TestFileRead_DedupSameFile_DifferentRange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	os.WriteFile(path, []byte("line1\nline2\nline3\nline4\nline5\n"), 0o644)
+
+	tracker := agent.NewReadTracker()
+	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
+
+	tool := &FileReadTool{}
+
+	// First read: limit=2 (lines 1-2)
+	args1, _ := json.Marshal(fileReadArgs{Path: path, Limit: 2})
+	r1, _ := tool.Run(ctx, string(args1))
+	if r1.IsError {
+		t.Fatalf("first read error: %s", r1.Content)
+	}
+
+	// Second read with different limit=4 — must return real content, NOT stub
+	args2, _ := json.Marshal(fileReadArgs{Path: path, Limit: 4})
+	r2, err := tool.Run(ctx, string(args2))
+	if err != nil {
+		t.Fatalf("second read transport error: %v", err)
+	}
+	if r2.IsError {
+		t.Fatalf("second read should succeed: %s", r2.Content)
+	}
+	if strings.Contains(r2.Content, "unchanged since last read") {
+		t.Errorf("different range must NOT dedup, got stub: %s", r2.Content)
+	}
+	if !strings.Contains(r2.Content, "line4") {
+		t.Errorf("expected line4 in expanded read, got: %s", r2.Content)
+	}
+}
+
+// TestFileRead_DedupSameFile_FileModified: when the file is modified between
+// reads, dedup must NOT fire (mtime check catches it).
+func TestFileRead_DedupSameFile_FileModified(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	os.WriteFile(path, []byte("v1\n"), 0o644)
+
+	tracker := agent.NewReadTracker()
+	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
+
+	tool := &FileReadTool{}
+	args, _ := json.Marshal(fileReadArgs{Path: path})
+	tool.Run(ctx, string(args)) // first read
+
+	// Modify file (sleep 10ms first to ensure mtime ticks on filesystems
+	// with sub-second mtime resolution; macOS APFS has nanosecond mtime
+	// but kernel timer ticks may coalesce).
+	time.Sleep(15 * time.Millisecond)
+	os.WriteFile(path, []byte("v2 changed\n"), 0o644)
+
+	r2, err := tool.Run(ctx, string(args))
+	if err != nil {
+		t.Fatalf("second read transport error: %v", err)
+	}
+	if r2.IsError {
+		t.Fatalf("second read error: %s", r2.Content)
+	}
+	if strings.Contains(r2.Content, "unchanged since last read") {
+		t.Errorf("modified file must NOT dedup, got stub: %s", r2.Content)
+	}
+	if !strings.Contains(r2.Content, "v2 changed") {
+		t.Errorf("expected new content, got: %s", r2.Content)
+	}
+}
+
+// TestFileRead_DedupSameFile_NoTracker: without a tracker in context, dedup
+// is a no-op (always returns full content).
+func TestFileRead_DedupSameFile_NoTracker(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	os.WriteFile(path, []byte("line1\n"), 0o644)
+
+	tool := &FileReadTool{}
+	args, _ := json.Marshal(fileReadArgs{Path: path})
+
+	// Two reads in plain context — both return full content.
+	r1, _ := tool.Run(context.Background(), string(args))
+	r2, _ := tool.Run(context.Background(), string(args))
+	for i, r := range []agent.ToolResult{r1, r2} {
+		if r.IsError {
+			t.Fatalf("read %d error: %s", i, r.Content)
+		}
+		if !strings.Contains(r.Content, "line1") {
+			t.Errorf("read %d should contain content, got: %s", i, r.Content)
+		}
+		if strings.Contains(r.Content, "unchanged") {
+			t.Errorf("read %d should not dedup without tracker, got: %s", i, r.Content)
+		}
 	}
 }

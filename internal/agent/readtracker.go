@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
@@ -64,17 +66,38 @@ func IsMemoryFile(ctx context.Context, path string) bool {
 // Exported for use in tests that need to inject a tracker into context.
 func ReadTrackerKey() any { return readTrackerKey{} }
 
+// fileReadEntry records the (mtime, size, offset, limit) tuple of a prior
+// file_read so a repeat call with the same tuple can return a short stub
+// instead of replaying the same content. when is the wallclock time of
+// the original read.
+type fileReadEntry struct {
+	mtime  time.Time
+	size   int64
+	offset int
+	limit  int
+	when   time.Time
+}
+
 // ReadTracker tracks which files have been read during the current agent turn.
 // Used to enforce read-before-edit: file_edit and file_write on existing files
-// must be preceded by a file_read of that file.
+// must be preceded by a file_read of that file. Also tracks per-range read
+// history so file_read can dedup repeat calls with the same (path, mtime,
+// size, offset, limit) tuple. mu serializes access because file_read can
+// run inside parallel read-only batches (executeBatches), while MarkRead
+// from the post-loop runs on the main goroutine.
 type ReadTracker struct {
-	read map[string]bool
-	cwd  string
+	mu        sync.Mutex
+	read      map[string]bool
+	lastReads map[string]fileReadEntry
+	cwd       string
 }
 
 // NewReadTracker creates a new ReadTracker.
 func NewReadTracker() *ReadTracker {
-	return &ReadTracker{read: make(map[string]bool)}
+	return &ReadTracker{
+		read:      make(map[string]bool),
+		lastReads: make(map[string]fileReadEntry),
+	}
 }
 
 // SetCWD sets the session CWD used for relative path resolution.
@@ -85,9 +108,12 @@ func (rt *ReadTracker) SetCWD(cwd string) {
 // MarkRead records that a file has been read.
 func (rt *ReadTracker) MarkRead(path string) {
 	norm := normalizePathWithCWD(path, rt.cwd)
-	if norm != "" {
-		rt.read[norm] = true
+	if norm == "" {
+		return
 	}
+	rt.mu.Lock()
+	rt.read[norm] = true
+	rt.mu.Unlock()
 }
 
 // HasRead returns true if the file has been read in this turn.
@@ -96,7 +122,61 @@ func (rt *ReadTracker) HasRead(path string) bool {
 	if norm == "" {
 		return false
 	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	return rt.read[norm]
+}
+
+// CheckFileReadDedup returns (true, stub) when the same path was already read
+// in this session at the same (offset, limit) AND the file's mtime+size are
+// unchanged. Returns (false, "") otherwise — caller should perform the read
+// and call RecordFileRead afterwards. Returns (false, "") when no tracker
+// is in context (e.g. tool called outside the agent loop).
+func CheckFileReadDedup(ctx context.Context, path string, offset, limit int, mtime time.Time, size int64) (bool, string) {
+	rt, ok := ctx.Value(readTrackerKey{}).(*ReadTracker)
+	if !ok || rt == nil {
+		return false, ""
+	}
+	norm := normalizePathWithCWD(path, rt.cwd)
+	if norm == "" {
+		return false, ""
+	}
+	rt.mu.Lock()
+	entry, exists := rt.lastReads[norm]
+	rt.mu.Unlock()
+	if !exists {
+		return false, ""
+	}
+	if entry.mtime.Equal(mtime) && entry.size == size && entry.offset == offset && entry.limit == limit {
+		stub := fmt.Sprintf(
+			"[file unchanged since last read at %s — to force re-read, modify the file or use a different offset/limit range]",
+			entry.when.Format("15:04:05"),
+		)
+		return true, stub
+	}
+	return false, ""
+}
+
+// RecordFileRead stores a per-range read entry for later dedup checks.
+// No-op when no tracker is in context.
+func RecordFileRead(ctx context.Context, path string, offset, limit int, mtime time.Time, size int64) {
+	rt, ok := ctx.Value(readTrackerKey{}).(*ReadTracker)
+	if !ok || rt == nil {
+		return
+	}
+	norm := normalizePathWithCWD(path, rt.cwd)
+	if norm == "" {
+		return
+	}
+	rt.mu.Lock()
+	rt.lastReads[norm] = fileReadEntry{
+		mtime:  mtime,
+		size:   size,
+		offset: offset,
+		limit:  limit,
+		when:   time.Now(),
+	}
+	rt.mu.Unlock()
 }
 
 // CheckReadBeforeWrite extracts the ReadTracker from context and returns an error
