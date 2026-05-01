@@ -15,21 +15,23 @@ import (
 type FileEditTool struct{}
 
 type fileEditArgs struct {
-	Path      string `json:"path"`
-	OldString string `json:"old_string"`
-	NewString string `json:"new_string"`
+	Path       string `json:"path"`
+	OldString  string `json:"old_string"`
+	NewString  string `json:"new_string"`
+	ReplaceAll bool   `json:"replace_all,omitempty"` // when true, replaces every occurrence; default false (must be unique)
 }
 
 func (t *FileEditTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:        "file_edit",
-		Description: "Replace an exact string in a file (old_string must appear exactly once). Prefer this over file_write for targeted edits. If old_string is not unique, use file_read then file_write instead.",
+		Description: "Replace an exact string in a file. By default old_string must appear exactly once (use the smallest snippet that's clearly unique — usually 2-4 adjacent lines is sufficient; don't paste 10+ lines just to disambiguate). Pass replace_all=true to rename / refactor every occurrence in one call.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path":       map[string]any{"type": "string", "description": "File path to edit"},
-				"old_string": map[string]any{"type": "string", "description": "Exact string to find (must be unique)"},
-				"new_string": map[string]any{"type": "string", "description": "Replacement string"},
+				"path":        map[string]any{"type": "string", "description": "File path to edit"},
+				"old_string":  map[string]any{"type": "string", "description": "Exact string to find. Must be unique unless replace_all=true."},
+				"new_string":  map[string]any{"type": "string", "description": "Replacement string"},
+				"replace_all": map[string]any{"type": "boolean", "description": "When true, replace every occurrence of old_string. When false (default), old_string must appear exactly once. Use replace_all only when the target is unambiguous globally (variable rename, refactor)."},
 			},
 		},
 		Required: []string{"path", "old_string", "new_string"},
@@ -83,11 +85,16 @@ func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	if count == 0 {
 		return agent.ValidationError("old_string not found in file"), nil
 	}
-	if count > 1 {
-		return agent.ValidationError(fmt.Sprintf("old_string found %d times (must be unique)", count)), nil
+	if !args.ReplaceAll && count > 1 {
+		return agent.ValidationError(fmt.Sprintf("old_string found %d times (must be unique unless replace_all=true)", count)), nil
 	}
 
-	newContent := strings.Replace(content, args.OldString, args.NewString, 1)
+	var newContent string
+	if args.ReplaceAll {
+		newContent = strings.ReplaceAll(content, args.OldString, args.NewString)
+	} else {
+		newContent = strings.Replace(content, args.OldString, args.NewString, 1)
+	}
 	// Preserve original file permissions
 	perm := os.FileMode(0644)
 	if info, err := os.Stat(args.Path); err == nil {
@@ -100,7 +107,11 @@ func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		return agent.ToolResult{Content: fmt.Sprintf("error writing file: %v", err), IsError: true}, nil
 	}
 
-	return agent.ToolResult{Content: fmt.Sprintf("edited %s: replaced 1 occurrence", args.Path)}, nil
+	noun := "occurrence"
+	if count > 1 {
+		noun = "occurrences"
+	}
+	return agent.ToolResult{Content: fmt.Sprintf("edited %s: replaced %d %s", args.Path, count, noun)}, nil
 }
 
 func (t *FileEditTool) RequiresApproval() bool { return true }
