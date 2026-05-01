@@ -32,6 +32,14 @@ const maxPDFPages = 2
 // pdfPageMaxDim is the max pixel dimension for rendered PDF pages.
 const pdfPageMaxDim = 1024
 
+// fileReadMaxTokens is the hard cap on text file_read output. Files (or
+// offset+limit slices) whose estimated token count exceeds this return an
+// error pointing the agent at offset/limit instead of letting the loop's
+// 50K spill fallback drop a 2K preview into context. ~100B error vs ~2K
+// spill preview ≈ 95% per-call savings on oversized reads. Mirrors CC's
+// DEFAULT_MAX_OUTPUT_TOKENS in src/tools/FileReadTool/limits.ts:18.
+const fileReadMaxTokens = 25000
+
 type FileReadTool struct{}
 
 type fileReadArgs struct {
@@ -102,6 +110,23 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	end := len(lines)
 	if args.Limit > 0 && start+args.Limit < end {
 		end = start + args.Limit
+	}
+
+	// Estimate output tokens on the requested slice (NOT the whole file —
+	// asking for limit=100 of a 10K-line file should succeed). chars/3 is
+	// a coarse but safe estimate for English/code text.
+	var sliceChars int
+	for i := start; i < end; i++ {
+		sliceChars += len(lines[i]) + 1 // +1 for newline
+	}
+	if estTokens := sliceChars / 3; estTokens > fileReadMaxTokens {
+		return agent.ToolResult{
+			IsError: true,
+			Content: fmt.Sprintf(
+				"file_read: requested range too large (~%d tokens, max %d). File has %d lines; use offset+limit to read smaller chunks (e.g. limit=200 reads ~200 lines).",
+				estTokens, fileReadMaxTokens, len(lines),
+			),
+		}, nil
 	}
 
 	var sb strings.Builder

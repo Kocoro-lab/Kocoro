@@ -2,8 +2,10 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -122,5 +124,70 @@ func TestFileRead_RelativePathRefusedWithoutSessionCWD(t *testing.T) {
 	}
 	if !contains(result.Content, "session working directory") && !contains(result.Content, "absolute path") {
 		t.Errorf("expected guard message, got: %s", result.Content)
+	}
+}
+
+// TestFileRead_OversizeThrows: a file whose content exceeds fileReadMaxTokens
+// must return an IsError result with offset+limit guidance, NOT silently
+// truncate or fall through to the loop's spill path.
+func TestFileRead_OversizeThrows(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+	// 10K lines × 30 chars = 300K chars ≈ 100K tokens (well above 25K cap)
+	var sb strings.Builder
+	for i := 0; i < 10000; i++ {
+		sb.WriteString("0123456789012345678901234567890\n")
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := &FileReadTool{}
+	args, _ := json.Marshal(fileReadArgs{Path: path})
+	result, err := tool.Run(context.Background(), string(args))
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected IsError on oversized read, got success with %d bytes", len(result.Content))
+	}
+	if !strings.Contains(result.Content, "too large") {
+		t.Errorf("error must mention 'too large', got: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "offset") || !strings.Contains(result.Content, "limit") {
+		t.Errorf("error must guide to offset+limit, got: %s", result.Content)
+	}
+	// Sanity: error is short (~100B target), not the full file content.
+	if len(result.Content) > 1000 {
+		t.Errorf("error message should be short (~100B), got %d bytes", len(result.Content))
+	}
+}
+
+// TestFileRead_OversizeRespectsLimit: same big file, but with a reasonable
+// limit slice — must succeed (the cap is on the SLICE, not the file).
+func TestFileRead_OversizeRespectsLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.txt")
+	var sb strings.Builder
+	for i := 0; i < 10000; i++ {
+		sb.WriteString("0123456789012345678901234567890\n")
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := &FileReadTool{}
+	args, _ := json.Marshal(fileReadArgs{Path: path, Limit: 100})
+	result, err := tool.Run(context.Background(), string(args))
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("100-line slice of big file should succeed, got error: %s", result.Content)
+	}
+	// 100 lines × ~33 chars = ~3300 chars ~ 1100 tokens — well below 25K cap.
+	// Verify content has the line-number prefix and reasonable length.
+	if !strings.Contains(result.Content, "   1 |") {
+		t.Errorf("expected line number prefix in slice content, got first 200 bytes: %s", result.Content[:min(200, len(result.Content))])
 	}
 }
