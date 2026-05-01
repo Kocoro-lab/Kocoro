@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,49 @@ func TestFileRead_Run(t *testing.T) {
 	}
 	if !contains(result.Content, "1") || !contains(result.Content, "line1") {
 		t.Errorf("expected line-numbered output, got: %s", result.Content)
+	}
+}
+
+func TestFileReadTool_LargeFileRequiresRange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "large.txt")
+	body := strings.Repeat("0123456789abcdef\n", 20000)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tool := &FileReadTool{}
+	result, err := tool.Run(context.Background(), `{"path":"`+path+`"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "file is too large") || !strings.Contains(result.Content, "Use offset+limit") {
+		t.Fatalf("expected range guidance error, got: %#v", result)
+	}
+}
+
+func TestFileReadTool_LargeFileRangeSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "large.txt")
+	var sb strings.Builder
+	for i := 0; i < 10000; i++ {
+		fmt.Fprintf(&sb, "line-%05d\n", i)
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tool := &FileReadTool{}
+	result, err := tool.Run(context.Background(), `{"path":"`+path+`","offset":100,"limit":2}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("range read failed: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, " 101 | line-00100") || !strings.Contains(result.Content, " 102 | line-00101") {
+		t.Fatalf("unexpected range output: %s", result.Content)
+	}
+	if strings.Contains(result.Content, "line-09999") {
+		t.Fatalf("range read leaked far-away content")
 	}
 }
 
