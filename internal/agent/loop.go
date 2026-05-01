@@ -1483,13 +1483,14 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// failure; summaryBackedOff measures the cool-off distance from this iter.
 		// Zero value is fine: the `summaryFailures >= maxSummaryFailures` guard
 		// short-circuits the distance check until a real failure streak writes it.
-		lastSummaryFailureIter int
-		toolSearchFired        bool
-		latestUserText         = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
-		cloudNudgeFired        bool
-		cloudDelegateClaimed   bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
-		cloudResultContent     string // non-empty when a cloud deliverable should bypass LLM summarization
-		lastDiscoveryInput     string // dedup: skip discovery when user text hasn't changed between iterations
+		lastSummaryFailureIter   int
+		toolSearchFired          bool
+		latestUserText           = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
+		cloudNudgeFired          bool
+		cloudDelegateClaimed     bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
+		cloudResultContent       string // non-empty when a cloud deliverable should bypass LLM summarization
+		lastDiscoveryInput       string // dedup: skip discovery when user text hasn't changed between iterations
+		contextBloatReminderSent bool
 
 		// Cross-iteration dedup: cache successful results from previous iteration
 		// to prevent re-execution of identical tool calls across consecutive iterations.
@@ -2043,6 +2044,17 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				markInjected()
 			}
 			stickyInjectPending = false
+		}
+
+		if !contextBloatReminderSent {
+			if reminder := buildContextBloatReminder(messages, ContextBloatOptions{}); reminder != "" {
+				messages = append(messages, client.Message{
+					Role:    "user",
+					Content: client.NewTextContent(reminder),
+				})
+				markInjected()
+				contextBloatReminderSent = true
+			}
 		}
 
 		// Call LLM — streaming or blocking
