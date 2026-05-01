@@ -33,8 +33,9 @@ type grepArgs struct {
 
 func (t *GrepTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
-		Name:        "grep",
-		Description: "Search file CONTENTS using a regex pattern. By default returns matching FILE PATHS only (output_mode=files_with_matches) — keeps results small. Set output_mode=content to get matching lines as file:line:text, or output_mode=count for per-file match counts. Use glob to filter files by name pattern.",
+		Name:               "grep",
+		MaxResultSizeChars: 20000,
+		Description:        "Search file CONTENTS using a regex pattern. By default returns matching FILE PATHS only (output_mode=files_with_matches) — keeps results small. Set output_mode=content to get matching lines as file:line:text, or output_mode=count for per-file match counts. Use glob to filter files by name pattern.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

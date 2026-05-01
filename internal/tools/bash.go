@@ -71,7 +71,8 @@ func isSafeCommand(cmd string, extraSafe []string) bool {
 
 func (t *BashTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
-		Name: "bash",
+		Name:               "bash",
+		MaxResultSizeChars: 30000,
 		Description: `Execute a shell command. Use for running scripts, data processing, file management, automation, and system operations.
 
 Each command runs in a fresh shell. The starting directory is the session CWD, but cd/export/aliases from one bash call do NOT persist to later calls.

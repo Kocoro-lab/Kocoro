@@ -40,6 +40,14 @@ type Session struct {
 	SummaryCache    string           `json:"summary_cache,omitempty"`     // cached summary Markdown
 	SummaryCacheKey string           `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
 	Usage           *UsageSummary    `json:"usage,omitempty"`             // cumulative LLM + tool cost/token totals
+	// ToolResultReplacements stores query-time tool_result replacement text
+	// keyed by tool_use_id. It is not model-visible by itself; agent loops
+	// apply it to a request-local message copy before LLM calls.
+	ToolResultReplacements map[string]string `json:"tool_result_replacements,omitempty"`
+	// ToolResultSeen stores tool_use_ids that have already passed through
+	// query-time budgeting, even if they were not replaced. This freezes their
+	// fate across turns and prevents old history from drifting later.
+	ToolResultSeen map[string]bool `json:"tool_result_seen,omitempty"`
 	// InProgress is true between a mid-turn checkpoint save and the final
 	// post-turn save. If a session is loaded with this set, the previous
 	// run crashed or was killed mid-turn — the transcript is partial but

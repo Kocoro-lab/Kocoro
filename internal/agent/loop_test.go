@@ -115,6 +115,28 @@ func (m *mockSimpleTool) Run(ctx context.Context, args string) (ToolResult, erro
 
 func (m *mockSimpleTool) RequiresApproval() bool { return false }
 
+type budgetCaptureLLMClient struct {
+	responses []*client.CompletionResponse
+	requests  []client.CompletionRequest
+}
+
+func (m *budgetCaptureLLMClient) Complete(ctx context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
+	m.requests = append(m.requests, req)
+	if len(m.responses) == 0 {
+		return &client.CompletionResponse{
+			OutputText:   "done",
+			FinishReason: "end_turn",
+		}, nil
+	}
+	resp := m.responses[0]
+	m.responses = m.responses[1:]
+	return resp, nil
+}
+
+func (m *budgetCaptureLLMClient) CompleteStream(ctx context.Context, req client.CompletionRequest, onDelta func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return m.Complete(ctx, req)
+}
+
 type dedupProbeReadTool struct {
 	path  string
 	mtime time.Time
@@ -199,6 +221,52 @@ func TestAgentLoop_FileReadDedupPersistsAcrossRuns(t *testing.T) {
 	}
 	if !strings.Contains(handler.results[1].Content, "unchanged since last read") {
 		t.Fatalf("second run should dedup same file read, got %q", handler.results[1].Content)
+	}
+}
+
+func TestAgentLoop_ToolResultBudgetAppliedBeforeLLMCall(t *testing.T) {
+	gw := &budgetCaptureLLMClient{
+		responses: []*client.CompletionResponse{
+			{OutputText: "done", FinishReason: "end_turn"},
+		},
+	}
+	loop := NewAgentLoop(gw, NewToolRegistry(), "medium", t.TempDir(), 5, 1000000, 200, nil, nil, nil)
+	loop.SetSessionID("sess")
+	history := budgetToolPair("toolu_budget_hist", "bash", strings.Repeat("x", aggregateCapThreshold+1000))
+
+	if _, _, err := loop.Run(context.Background(), "continue", nil, history); err != nil {
+		t.Fatal(err)
+	}
+	if len(gw.requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(gw.requests))
+	}
+	foundReplacement := false
+	foundRaw := false
+	for _, msg := range gw.requests[0].Messages {
+		if msg.Role != "user" || !msg.Content.HasBlocks() {
+			continue
+		}
+		for _, block := range msg.Content.Blocks() {
+			text := client.ToolResultText(block)
+			if strings.Contains(text, "[Tool result omitted from context:") {
+				foundReplacement = true
+			}
+			if strings.Contains(text, strings.Repeat("x", spillPreviewChars+1)) {
+				foundRaw = true
+			}
+		}
+	}
+	if !foundReplacement {
+		t.Fatal("LLM request did not contain budget replacement")
+	}
+	if foundRaw {
+		t.Fatal("LLM request leaked raw oversized tool result")
+	}
+	if len(loop.ToolResultReplacements()) != 1 {
+		t.Fatalf("replacement state count = %d, want 1", len(loop.ToolResultReplacements()))
+	}
+	if got := toolResultTextAt(t, history, 1); got != strings.Repeat("x", aggregateCapThreshold+1000) {
+		t.Fatal("history transcript was mutated")
 	}
 }
 

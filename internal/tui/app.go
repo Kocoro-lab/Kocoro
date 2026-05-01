@@ -1400,6 +1400,7 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				}
 			}
 			m.agentLoop.SetSessionID(sess.ID)
+			m.agentLoop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)
 			m.agentLoop.SetWorkingSet(m.sessions.WorkingSet(sess.ID))
 			m.agentLoop.SetSessionCWD(effectiveCWD)
 
@@ -1417,6 +1418,7 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				}
 			}
 			m.agentLoop.SetSessionID("")
+			m.agentLoop.SetToolResultBudgetState(nil, nil)
 			m.agentLoop.SetWorkingSet(nil)
 		}
 		result, usage, err := m.agentLoop.Run(ctx, query, nil, history)
@@ -1463,6 +1465,8 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 			// gateway tool billing) into the session's cumulative Usage
 			// summary. LLM and tool costs are stored in separate fields.
 			if sess != nil {
+				sess.ToolResultReplacements = m.agentLoop.ToolResultReplacements()
+				sess.ToolResultSeen = m.agentLoop.ToolResultSeen()
 				acc := handler.Usage()
 				llm := acc.LLM
 				if llm.LLMCalls > 0 || acc.ToolCalls > 0 || llm.InputTokens > 0 {

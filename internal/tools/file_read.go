@@ -50,8 +50,9 @@ type fileReadArgs struct {
 
 func (t *FileReadTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
-		Name:        "file_read",
-		Description: "Read a file's contents with line numbers. Use offset and limit for large files. Repeat reads of the same (path, offset, limit) within one session return a short \"unchanged since last read\" stub when the file has not been modified — to force a fresh read, modify the file or pass a different offset/limit range. For image files (png/jpg/gif/webp), returns the image for vision analysis. For PDF files, renders pages as images for vision analysis (use offset for start page, limit for max pages).",
+		Name:               "file_read",
+		MaxResultSizeChars: agent.UnlimitedToolResultSizeChars,
+		Description:        "Read a file's contents with line numbers. Use offset and limit for large files. Repeat reads of the same (path, offset, limit) within one session return a short \"unchanged since last read\" stub when the file has not been modified — to force a fresh read, modify the file or pass a different offset/limit range. For image files (png/jpg/gif/webp), returns the image for vision analysis. For PDF files, renders pages as images for vision analysis (use offset for start page, limit for max pages).",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

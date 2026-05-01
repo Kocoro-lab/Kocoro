@@ -8,11 +8,17 @@ import (
 )
 
 type ToolInfo struct {
-	Name        string
-	Description string
-	Parameters  map[string]any
-	Required    []string
+	Name               string
+	Description        string
+	Parameters         map[string]any
+	Required           []string
+	MaxResultSizeChars int
 }
+
+const (
+	DefaultMaxToolResultSizeChars = 50000
+	UnlimitedToolResultSizeChars  = -1
+)
 
 type ImageBlock struct {
 	MediaType string // e.g. "image/png"

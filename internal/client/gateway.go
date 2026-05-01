@@ -325,6 +325,7 @@ func rotateRawDumpDir(dir string, max int) {
 //   - "tier2"     — head+tail truncation or micro-compact summary
 //   - "tbcompact" — time-based microcompact (timebasedcompact.go)
 //   - "tbclear"   — time-based result clear (replaces with sentinel)
+//   - "budget"    — query-time tool_result budget replacement
 //
 // Silent when SHANNON_CACHE_DEBUG != "1". Skips no-op rewrites where bytes
 // are unchanged (idempotent re-visit on already-compacted blocks).

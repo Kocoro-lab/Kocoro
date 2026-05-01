@@ -41,6 +41,58 @@ func TestStore_SaveLoad(t *testing.T) {
 	}
 }
 
+func TestStore_RoundTripToolResultReplacements(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+
+	now := time.Now()
+	sess := &Session{
+		ID:        "sess-repl",
+		CreatedAt: now,
+		UpdatedAt: now,
+		Title:     "replacement state",
+		ToolResultReplacements: map[string]string{
+			"toolu_1": "[Tool result omitted from context: /tmp/x]",
+		},
+	}
+	if err := store.Save(sess); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load("sess-repl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ToolResultReplacements["toolu_1"] != "[Tool result omitted from context: /tmp/x]" {
+		t.Fatalf("replacement state not persisted: %#v", got.ToolResultReplacements)
+	}
+}
+
+func TestStore_RoundTripToolResultSeen(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+
+	now := time.Now()
+	sess := &Session{
+		ID:        "sess-seen",
+		CreatedAt: now,
+		UpdatedAt: now,
+		Title:     "seen state",
+		ToolResultSeen: map[string]bool{
+			"toolu_seen": true,
+		},
+	}
+	if err := store.Save(sess); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load("sess-seen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ToolResultSeen["toolu_seen"] {
+		t.Fatalf("seen state not persisted: %#v", got.ToolResultSeen)
+	}
+}
+
 func TestStore_List(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)

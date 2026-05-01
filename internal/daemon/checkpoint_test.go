@@ -249,6 +249,25 @@ func TestApplyTurnUsage_IdempotentAcrossCheckpointAndFinalSave(t *testing.T) {
 	}
 }
 
+func TestApplyTurnState_CopiesToolResultReplacements(t *testing.T) {
+	sess := &session.Session{}
+	base := captureTurnBaseline(sess, "web", false)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	loop.SetToolResultBudgetState(
+		map[string]string{"toolu_saved": "[Tool result omitted from context: saved]"},
+		map[string]bool{"toolu_seen": true},
+	)
+
+	applyTurnState(sess, loop, nil, base)
+
+	if sess.ToolResultReplacements["toolu_saved"] != "[Tool result omitted from context: saved]" {
+		t.Fatalf("replacement state was not copied into session: %#v", sess.ToolResultReplacements)
+	}
+	if !sess.ToolResultSeen["toolu_seen"] || !sess.ToolResultSeen["toolu_saved"] {
+		t.Fatalf("seen state was not copied into session: %#v", sess.ToolResultSeen)
+	}
+}
+
 func TestSessionInProgress_FlagCycles(t *testing.T) {
 	sess := &session.Session{}
 	if sess.InProgress {

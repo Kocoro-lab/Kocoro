@@ -443,6 +443,10 @@ type AgentLoop struct {
 	skillDiscovery    bool            // call small-tier model on first turn to identify relevant skills (default true)
 	sentSkillNames    map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
 	readTracker       *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
+	// toolResultReplacements stores stable query-time replacements for large
+	// historical tool_result blocks. It is session-scoped and persisted by
+	// daemon/TUI callers so resumed sessions replay identical bytes.
+	toolResultReplacements *ToolResultReplacementState
 
 	// Time-based microcompact (see internal/agent/timebasedcompact.go).
 	// Default disabled. When enabled, fires only when (now - lastAssistantAt)
@@ -507,19 +511,20 @@ func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, sh
 		argsTrunc = 200
 	}
 	return &AgentLoop{
-		client:         gw,
-		tools:          tools,
-		modelTier:      modelTier,
-		shannonDir:     shannonDir,
-		maxIter:        maxIter,
-		resultTrunc:    resultTrunc,
-		argsTrunc:      argsTrunc,
-		permissions:    perms,
-		auditor:        auditor,
-		hookRunner:     hookRunner,
-		workingSet:     NewWorkingSet(),
-		skillDiscovery: true,
-		readTracker:    NewReadTracker(),
+		client:                 gw,
+		tools:                  tools,
+		modelTier:              modelTier,
+		shannonDir:             shannonDir,
+		maxIter:                maxIter,
+		resultTrunc:            resultTrunc,
+		argsTrunc:              argsTrunc,
+		permissions:            perms,
+		auditor:                auditor,
+		hookRunner:             hookRunner,
+		workingSet:             NewWorkingSet(),
+		skillDiscovery:         true,
+		readTracker:            NewReadTracker(),
+		toolResultReplacements: NewToolResultReplacementState(nil),
 	}
 }
 
@@ -737,6 +742,77 @@ func (a *AgentLoop) RunMessages() []client.Message {
 	}
 	out := make([]client.Message, len(a.runMessages))
 	copy(out, a.runMessages)
+	return out
+}
+
+// SetToolResultReplacements restores session-scoped query-time tool_result
+// replacements. Callers should invoke this before Run() when resuming a
+// persisted session.
+func (a *AgentLoop) SetToolResultReplacements(replacements map[string]string) {
+	a.SetToolResultBudgetState(replacements, nil)
+}
+
+// SetToolResultBudgetState restores session-scoped query-time tool_result
+// budget state. Replacements imply seen=true; explicit seen IDs freeze
+// unreplaced results so later policy changes do not mutate old history.
+func (a *AgentLoop) SetToolResultBudgetState(replacements map[string]string, seen map[string]bool) {
+	a.toolResultReplacements = NewToolResultReplacementState(replacements)
+	for id, ok := range seen {
+		if ok && strings.TrimSpace(id) != "" {
+			a.toolResultReplacements.Seen[id] = true
+		}
+	}
+}
+
+// ToolResultReplacements returns a JSON-persistable snapshot of query-time
+// replacements created or replayed by this loop.
+func (a *AgentLoop) ToolResultReplacements() map[string]string {
+	if a.toolResultReplacements == nil {
+		return nil
+	}
+	return a.toolResultReplacements.Snapshot()
+}
+
+// ToolResultSeen returns a JSON-persistable snapshot of tool_use IDs already
+// processed by the query-time budget.
+func (a *AgentLoop) ToolResultSeen() map[string]bool {
+	if a.toolResultReplacements == nil || len(a.toolResultReplacements.Seen) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(a.toolResultReplacements.Seen))
+	for id, ok := range a.toolResultReplacements.Seen {
+		if ok {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+func (a *AgentLoop) messagesForLLM(messages []client.Message) []client.Message {
+	if a.toolResultReplacements == nil {
+		a.toolResultReplacements = NewToolResultReplacementState(nil)
+	}
+	opts := defaultToolResultBudgetOptions(a.shannonDir, a.sessionID)
+	opts.ToolMaxResultSizeChars = a.toolResultPolicy()
+	out, changed := applyToolResultBudget(messages, a.toolResultReplacements, opts)
+	if changed && a.tracker != nil {
+		a.tracker.MarkDirty()
+	}
+	return out
+}
+
+func (a *AgentLoop) toolResultPolicy() map[string]int {
+	if a.tools == nil {
+		return nil
+	}
+	out := make(map[string]int)
+	for _, tool := range a.tools.All() {
+		info := tool.Info()
+		if info.Name == "" {
+			continue
+		}
+		out[info.Name] = info.MaxResultSizeChars
+	}
 	return out
 }
 
@@ -1491,7 +1567,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 
 		req := client.CompletionRequest{
-			Messages:        messages,
+			Messages:        a.messagesForLLM(messages),
 			ModelTier:       a.modelTier,
 			SpecificModel:   a.specificModel,
 			Temperature:     a.temperature,
@@ -1973,7 +2049,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		var resp *client.CompletionResponse
 		var err error
 		req := client.CompletionRequest{
-			Messages:        messages,
+			Messages:        a.messagesForLLM(messages),
 			ModelTier:       a.modelTier,
 			SpecificModel:   a.specificModel,
 			Temperature:     a.temperature,
@@ -2158,7 +2234,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 				// Rebuild request with compacted messages.
 				req = client.CompletionRequest{
-					Messages:        messages,
+					Messages:        a.messagesForLLM(messages),
 					ModelTier:       a.modelTier,
 					SpecificModel:   a.specificModel,
 					Temperature:     a.temperature,

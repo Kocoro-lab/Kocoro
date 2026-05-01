@@ -1111,6 +1111,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		loop.SetInjectCh(routeInjectCh)
 	}
 	loop.SetSessionID(sess.ID)
+	loop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)
 	// Inject the per-session ReadTracker so file_read dedup history persists
 	// across the per-message AgentLoop instances created here. nil-safe: an
 	// unset cache returns a fresh tracker, which keeps the pre-fix behavior.
@@ -1745,6 +1746,8 @@ func applyTurnState(sess *session.Session, loop *agent.AgentLoop,
 	up usageProvider, b turnBaseline) {
 	applyTurnMessages(sess, loop, b)
 	applyTurnUsage(sess, up, b)
+	sess.ToolResultReplacements = loop.ToolResultReplacements()
+	sess.ToolResultSeen = loop.ToolResultSeen()
 }
 
 // FriendlyAgentError maps raw agent errors to user-facing messages.
