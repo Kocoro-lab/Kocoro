@@ -41,6 +41,26 @@ func TestBash_DescriptionDoesNotClaimShellStatePersists(t *testing.T) {
 	}
 }
 
+func TestBashTool_MaxOutputChars(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	tool := &BashTool{}
+	result, err := tool.Run(context.Background(), `{"command":"printf '%1000s' x","max_output_chars":100}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("bash failed: %s", result.Content)
+	}
+	if len(result.Content) > 250 {
+		t.Fatalf("output not capped: len=%d content=%q", len(result.Content), result.Content)
+	}
+	if !strings.Contains(result.Content, "truncated") {
+		t.Fatalf("missing truncation marker: %q", result.Content)
+	}
+}
+
 func TestBash_IsSafe(t *testing.T) {
 	tests := []struct {
 		cmd  string

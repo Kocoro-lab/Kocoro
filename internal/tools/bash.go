@@ -32,8 +32,9 @@ type BashTool struct {
 }
 
 type bashArgs struct {
-	Command string `json:"command"`
-	Timeout int    `json:"timeout,omitempty"`
+	Command        string `json:"command"`
+	Timeout        int    `json:"timeout,omitempty"`
+	MaxOutputChars int    `json:"max_output_chars,omitempty"`
 }
 
 var safeCommands = []string{
@@ -108,8 +109,9 @@ Instructions:
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"command": map[string]any{"type": "string", "description": "Shell command to execute"},
-				"timeout": map[string]any{"type": "integer", "description": "Timeout in seconds (default: 120)"},
+				"command":          map[string]any{"type": "string", "description": "Shell command to execute"},
+				"timeout":          map[string]any{"type": "integer", "description": "Timeout in seconds (default: 120)"},
+				"max_output_chars": map[string]any{"type": "integer", "description": "Maximum output characters to return. Use this for noisy commands."},
 			},
 		},
 		Required: []string{"command"},
@@ -157,6 +159,9 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	maxOut := t.MaxOutput
 	if maxOut <= 0 {
 		maxOut = 30000
+	}
+	if args.MaxOutputChars > 0 {
+		maxOut = args.MaxOutputChars
 	}
 	if r := []rune(result); len(r) > maxOut {
 		keepHead := maxOut * 3 / 4
