@@ -328,6 +328,30 @@ func outputFormatForSource(source string) string {
 	return "markdown"
 }
 
+// IsMessagingPlatform returns true for sources where the gateway delivers
+// an explicit AgentName (or empty = use the daemon's default agent) and any
+// "@<botname>" prefix in the message body is user-facing convention, not an
+// agent-routing signal.
+//
+// Callers (e.g. cmd/daemon.go) should skip the @mention parsing fallback for
+// these sources — otherwise a literal "@<botname> hello" arriving from a
+// group chat parses the bot's display name as a local agent, which won't
+// exist in the daemon's registry and surfaces as a confusing error to the
+// end user.
+//
+// NOTE: keep this set aligned with cloudSourceSet in session_cwd.go. The
+// invariants differ (CWD allocation vs. @mention handling), but if a channel
+// is cloud-routed it almost always belongs in both lists.
+func IsMessagingPlatform(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case ChannelSlack, ChannelFeishu, ChannelLark, ChannelWeCom,
+		ChannelLINE, ChannelWeChat, ChannelTeams, ChannelDiscord,
+		ChannelTelegram:
+		return true
+	}
+	return false
+}
+
 // cacheSourceFromDaemonSource maps the daemon-level source (slack/webhook/
 // cron/mcp/tui/...) to the cache_source string Shannon uses for prompt-cache
 // TTL routing. Channel messages + interactive use → long bucket (1h). Fire-and-

@@ -57,10 +57,12 @@ const (
 	ChannelLINE     = "line"
 	ChannelTeams    = "teams"
 	ChannelWeChat   = "wechat"
+	ChannelWeCom    = "wecom"
 	ChannelWeb      = "web"
 	ChannelFeishu   = "feishu"
 	ChannelLark     = "lark"
 	ChannelDiscord  = "discord"
+	ChannelTelegram = "telegram"
 	ChannelSchedule = "schedule"
 	ChannelSystem   = "system"
 )

@@ -225,7 +225,11 @@ var daemonStartCmd = &cobra.Command{
 				Files:    msg.Files,
 			}
 			// Fall back to @mention parsing if cloud didn't set agent name.
-			if req.Agent == "" {
+			// Skip for messaging-platform sources: there the gateway delivers an
+			// explicit AgentName (or empty = use default), and any "@<botname>"
+			// in the message body is user-facing convention, not an agent name
+			// in the local registry. See daemon.IsMessagingPlatform.
+			if req.Agent == "" && !daemon.IsMessagingPlatform(source) {
 				agentName, prompt := agents.ParseAgentMention(msg.Text)
 				req.Agent = agentName
 				req.Text = prompt

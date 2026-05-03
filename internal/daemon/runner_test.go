@@ -50,6 +50,43 @@ func TestCacheSourceFromDaemonSource(t *testing.T) {
 	}
 }
 
+func TestIsMessagingPlatform(t *testing.T) {
+	cases := []struct {
+		source string
+		want   bool
+	}{
+		// Messaging platforms — gateway delivers explicit AgentName.
+		{"slack", true},
+		{"feishu", true},
+		{"lark", true},
+		{"wecom", true},
+		{"line", true},
+		{"wechat", true},
+		{"teams", true},
+		{"discord", true},
+		{"telegram", true},
+		// Case + whitespace normalization.
+		{"WeCom", true},
+		{"  SLACK  ", true},
+		{"Telegram", true},
+		// Non-messaging sources — @mention parsing remains valid here.
+		{"tui", false},
+		{"shanclaw", false},
+		{"webhook", false},
+		{"cron", false},
+		{"schedule", false},
+		{"mcp", false},
+		{"web", false},
+		{"", false},
+		{"never-classified-source", false},
+	}
+	for _, c := range cases {
+		if got := IsMessagingPlatform(c.source); got != c.want {
+			t.Errorf("IsMessagingPlatform(%q) = %v, want %v", c.source, got, c.want)
+		}
+	}
+}
+
 func TestRunAgentRequest_Validate_EmptyText(t *testing.T) {
 	req := RunAgentRequest{Text: ""}
 	if err := req.Validate(); err == nil {
