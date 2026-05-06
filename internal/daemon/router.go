@@ -407,6 +407,40 @@ func (sc *SessionCache) CancelBySessionID(sessionID string) {
 	}
 }
 
+// ClearSessionBindings drops in-memory route-to-session bindings for a session
+// that was reset or deleted. Persisted index rows are cleared by the session
+// store; this prevents the live daemon cache from resurrecting the old link.
+//
+// Two-phase locking: snapshot route entry pointers under sc.mu, then clear
+// each binding under its own entry.mu. The runner writes entry.sessionID
+// directly while holding entry.mu (see runner.go:706 and friends), so reading
+// or writing the field anywhere else must also hold entry.mu — taking sc.mu
+// alone is a data race. Holding sc.mu during the per-entry mu.Lock() would
+// also block the global cache while we wait on a long-running route, so we
+// release sc.mu between phases. Reset/delete therefore blocks until any
+// active run on a matching route finishes, which matches the user
+// expectation that "clear" really clears.
+func (sc *SessionCache) ClearSessionBindings(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	sc.mu.Lock()
+	entries := make([]*routeEntry, 0, len(sc.routes))
+	for _, entry := range sc.routes {
+		if entry != nil {
+			entries = append(entries, entry)
+		}
+	}
+	sc.mu.Unlock()
+	for _, entry := range entries {
+		entry.mu.Lock()
+		if entry.sessionID == sessionID {
+			entry.sessionID = ""
+		}
+		entry.mu.Unlock()
+	}
+}
+
 // Evict closes and removes the manager for this agent and drops matching route
 // state. For active routes (in-flight run), it marks them as evicting and
 // cancels — UnlockRoute finalizes cleanup when the run completes.

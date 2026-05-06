@@ -105,6 +105,87 @@ func TestManager_ResumeLatest_SingleSession(t *testing.T) {
 	}
 }
 
+func TestManager_ResumeLatestByRouteKey_FindsLatestMatchingRoute(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	defer store.Close()
+
+	routeKey := "default:slack:C123-1710000000.000100"
+	store.Save(&Session{
+		ID:       "route-old",
+		Title:    "Old route session",
+		RouteKey: routeKey,
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("first")},
+		},
+	})
+	time.Sleep(10 * time.Millisecond)
+	store.Save(&Session{
+		ID:       "other-route",
+		Title:    "Other route session",
+		RouteKey: "default:slack:C999",
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("other")},
+		},
+	})
+	time.Sleep(10 * time.Millisecond)
+	store.Save(&Session{
+		ID:       "route-new",
+		Title:    "New route session",
+		RouteKey: routeKey,
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("latest")},
+		},
+	})
+
+	m := NewManager(dir)
+	defer m.Close()
+	sess, err := m.ResumeLatestByRouteKey(routeKey)
+	if err != nil {
+		t.Fatalf("ResumeLatestByRouteKey: %v", err)
+	}
+	if sess == nil {
+		t.Fatal("expected a session, got nil")
+	}
+	if sess.ID != "route-new" {
+		t.Fatalf("resumed %q, want route-new", sess.ID)
+	}
+	if current := m.Current(); current == nil || current.ID != "route-new" {
+		t.Fatalf("current session = %#v, want route-new", current)
+	}
+}
+
+func TestManager_ResetClearsRouteKey(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	sess := m.NewSession()
+	sess.RouteKey = "default:slack:C123-1710000000.000100"
+	sess.Messages = []client.Message{{Role: "user", Content: client.NewTextContent("hello")}}
+	if err := m.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	if err := m.Reset(sess.ID); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	loaded, err := m.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.RouteKey != "" {
+		t.Fatalf("RouteKey = %q, want empty", loaded.RouteKey)
+	}
+	resumed, err := m.ResumeLatestByRouteKey("default:slack:C123-1710000000.000100")
+	if err != nil {
+		t.Fatalf("ResumeLatestByRouteKey: %v", err)
+	}
+	if resumed != nil {
+		t.Fatalf("expected no session for cleared route, got %q", resumed.ID)
+	}
+}
+
 func TestManager_OnSessionClose_FiresOnSessionSwitch(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(dir)

@@ -178,6 +178,20 @@ func TestComputeRouteKey_AgentWithoutBypass(t *testing.T) {
 	}
 }
 
+func TestComputeRouteKey_WebhookWithNamedAgentBypassesRoute(t *testing.T) {
+	req := RunAgentRequest{Agent: "ops-bot", Source: "webhook", Channel: "github"}
+	if got := ComputeRouteKey(req); got != "" {
+		t.Errorf("ComputeRouteKey returned %q, want empty route", got)
+	}
+}
+
+func TestComputeRouteKey_ScheduleWithNamedAgentKeepsAgentRoute(t *testing.T) {
+	req := RunAgentRequest{Agent: "ops-bot", Source: ChannelSchedule, Channel: "schedule-daily"}
+	if got := ComputeRouteKey(req); got != "agent:ops-bot" {
+		t.Errorf("ComputeRouteKey returned %q, want %q", got, "agent:ops-bot")
+	}
+}
+
 func TestComputeRouteKey_MessagingPlatformThreadRouting(t *testing.T) {
 	tests := []struct {
 		name string
@@ -221,6 +235,33 @@ func TestComputeRouteKey_MessagingPlatformThreadRouting(t *testing.T) {
 				t.Errorf("ComputeRouteKey(%+v) = %q, want %q", tt.req, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResumeRoutedColdStart_UsesPersistedRouteKey(t *testing.T) {
+	dir := t.TempDir()
+	mgr := session.NewManager(dir)
+	defer mgr.Close()
+
+	sess := mgr.NewSession()
+	sess.RouteKey = "default:slack:C123-1710000000.000100"
+	sess.Messages = []client.Message{{Role: "user", Content: client.NewTextContent("deploy process")}}
+	if err := mgr.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	mgr2 := session.NewManager(dir)
+	defer mgr2.Close()
+	resumed, err := resumeRoutedColdStart(mgr2, "default:slack:C123-1710000000.000100")
+	if err != nil {
+		t.Fatalf("resumeRoutedColdStart: %v", err)
+	}
+	if !resumed {
+		t.Fatal("expected route cold start to resume")
+	}
+	current := mgr2.Current()
+	if current == nil || current.ID != sess.ID {
+		t.Fatalf("current session = %#v, want %q", current, sess.ID)
 	}
 }
 

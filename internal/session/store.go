@@ -36,6 +36,7 @@ type Session struct {
 	MessageMeta     []MessageMeta    `json:"message_meta,omitempty"`
 	Source          string           `json:"source,omitempty"`            // "slack", "line", "shanclaw", "webhook"
 	Channel         string           `json:"channel,omitempty"`           // source channel/group identifier
+	RouteKey        string           `json:"route_key,omitempty"`         // persisted daemon route binding for routed conversations
 	SummaryCache    string           `json:"summary_cache,omitempty"`     // cached summary Markdown
 	SummaryCacheKey string           `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
 	Usage           *UsageSummary    `json:"usage,omitempty"`             // cumulative LLM + tool cost/token totals
@@ -352,6 +353,42 @@ func (s *Store) Delete(id string) error {
 		s.index.DeleteSession(id) // best-effort
 	}
 	return nil
+}
+
+func (s *Store) LatestByRouteKey(routeKey string) (*Session, error) {
+	if strings.TrimSpace(routeKey) == "" {
+		return nil, nil
+	}
+	if s.index != nil {
+		id, err := s.index.LatestUpdatedIDByRouteKey(routeKey)
+		if err == nil && id != "" {
+			if sess, loadErr := s.Load(id); loadErr == nil {
+				return sess, nil
+			}
+			// JSON file missing/corrupt — fall through to brute-force.
+		}
+	}
+
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, err
+	}
+
+	var best *Session
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(e.Name(), ".json")
+		sess, err := s.Load(id)
+		if err != nil || sess.RouteKey != routeKey {
+			continue
+		}
+		if best == nil || sess.UpdatedAt.After(best.UpdatedAt) {
+			best = sess
+		}
+	}
+	return best, nil
 }
 
 func (s *Store) Search(query string, limit int) ([]SearchResult, error) {

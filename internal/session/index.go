@@ -25,7 +25,8 @@ import (
 //	1 — porter+unicode61 (shipped default).
 //	2 — trigram tokenizer; native snippet() on original text.
 //	3 — adds source column to sessions table for sync.exclude_sources.
-const indexSchemaVersion = 3
+//	4 — adds route_key column for daemon route resume after restart.
+const indexSchemaVersion = 4
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -38,7 +39,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
     msg_count  INTEGER NOT NULL DEFAULT 0,
-    source     TEXT NOT NULL DEFAULT ''
+    source     TEXT NOT NULL DEFAULT '',
+    route_key  TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -69,6 +71,7 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
 END;
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_route_key_updated ON sessions(route_key, updated_at DESC);
 `
 
 type SearchResult struct {
@@ -121,11 +124,11 @@ func OpenIndex(dir string) (*Index, error) {
 				return nil, fmt.Errorf("drop stale table: %w", err)
 			}
 		}
-		// v2→v3: when the sessions table already exists from a prior version,
-		// CREATE TABLE IF NOT EXISTS won't add the new `source` column. ALTER
-		// it in. Skip silently when the table doesn't exist yet (fresh DB or
-		// stored==0 with no prior schema), and tolerate "duplicate column"
-		// for idempotency across partial migrations.
+		// Prior versions may already have a sessions table. CREATE TABLE IF
+		// NOT EXISTS won't add new metadata columns, so ALTER them in. Skip
+		// silently when the table doesn't exist yet (fresh DB or stored==0 with
+		// no prior schema), and tolerate "duplicate column" for idempotency
+		// across partial migrations.
 		var sessionsExists int
 		_ = db.QueryRow(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'`).Scan(&sessionsExists)
 		if sessionsExists == 1 {
@@ -133,6 +136,12 @@ func OpenIndex(dir string) (*Index, error) {
 				if !strings.Contains(err.Error(), "duplicate column") {
 					db.Close()
 					return nil, fmt.Errorf("add source column: %w", err)
+				}
+			}
+			if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN route_key TEXT NOT NULL DEFAULT ''`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					db.Close()
+					return nil, fmt.Errorf("add route_key column: %w", err)
 				}
 			}
 			// Only flag rebuild when there was actual prior data to migrate.
@@ -176,12 +185,13 @@ func (idx *Index) UpsertSession(sess *Session) error {
 	// Upsert session row first (FK parent for messages).
 	// msg_count is set to 0 initially and updated after indexing.
 	_, err = tx.Exec(
-		`INSERT OR REPLACE INTO sessions (id, title, cwd, created_at, updated_at, msg_count, source)
-		 VALUES (?, ?, ?, ?, ?, 0, ?)`,
+		`INSERT OR REPLACE INTO sessions (id, title, cwd, created_at, updated_at, msg_count, source, route_key)
+		 VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
 		sess.ID, sess.Title, sess.CWD,
 		sess.CreatedAt.Format(time.RFC3339Nano),
 		sess.UpdatedAt.Format(time.RFC3339Nano),
 		sess.Source,
+		sess.RouteKey,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -251,7 +261,7 @@ func (idx *Index) ListSessions() ([]SessionSummary, error) {
 //   - bare short CJK:      登录
 //   - quoted short CJK:    "登录"
 //   - mixed short+long:    登录 failed  (both terms enforced; 登录 cannot be
-//                                       silently dropped by trigram)
+//     silently dropped by trigram)
 //
 // When every term is long enough for trigram AND the query doesn't contain
 // FTS5 operators that LIKE can't express, the fast MATCH path is used.
@@ -466,6 +476,24 @@ func (idx *Index) LatestUpdatedID() (string, error) {
 	}
 	if err != nil {
 		return "", fmt.Errorf("latest updated: %w", err)
+	}
+	return id, nil
+}
+
+func (idx *Index) LatestUpdatedIDByRouteKey(routeKey string) (string, error) {
+	if strings.TrimSpace(routeKey) == "" {
+		return "", nil
+	}
+	var id string
+	err := idx.db.QueryRow(
+		`SELECT id FROM sessions WHERE route_key = ? ORDER BY updated_at DESC LIMIT 1`,
+		routeKey,
+	).Scan(&id)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("latest updated by route key: %w", err)
 	}
 	return id, nil
 }

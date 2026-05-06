@@ -273,8 +273,9 @@ func (m *Manager) RebuildIndex() error {
 // Reset clears a session's conversation history in place, preserving
 // ID/Title/CreatedAt/CWD/Source/Channel/Usage.
 // Cleared fields: Messages, MessageMeta, RemoteTasks, SummaryCache,
-// SummaryCacheKey, InProgress. If the target is the in-memory current session,
-// the current pointer is updated and its runtime WorkingSet is reset too.
+// SummaryCacheKey, RouteKey, InProgress. If the target is the in-memory
+// current session, the current pointer is updated and its runtime WorkingSet
+// is reset too.
 func (m *Manager) Reset(id string) error {
 	if id == "" {
 		return fmt.Errorf("session id required")
@@ -291,6 +292,7 @@ func (m *Manager) Reset(id string) error {
 	sess.RemoteTasks = nil
 	sess.SummaryCache = ""
 	sess.SummaryCacheKey = ""
+	sess.RouteKey = ""
 	sess.InProgress = false
 	if err := m.store.Save(sess); err != nil {
 		return err
@@ -372,6 +374,30 @@ func (m *Manager) ResumeLatest() (*Session, error) {
 		return nil, nil
 	}
 	return m.Resume(bestID)
+}
+
+// ResumeLatestByRouteKey loads the most recently updated session bound to a
+// daemon route. Returns (nil, nil) if no matching session exists.
+func (m *Manager) ResumeLatestByRouteKey(routeKey string) (*Session, error) {
+	m.mu.Lock()
+	prevID := ""
+	if m.current != nil {
+		prevID = m.current.ID
+	}
+	sess, err := m.store.LatestByRouteKey(routeKey)
+	if err != nil || sess == nil {
+		m.mu.Unlock()
+		return sess, err
+	}
+	m.current = sess
+	m.ensureRuntimeLocked(sess.ID)
+	callbacks := []func(){}
+	if prevID != "" && prevID != sess.ID {
+		callbacks = m.takeSessionCloseLocked(prevID)
+	}
+	m.mu.Unlock()
+	runCallbacks(callbacks)
+	return sess, nil
 }
 
 func generateID() string {

@@ -369,6 +369,25 @@ func TestSessionCache_CancelRoute_Nonexistent(t *testing.T) {
 	sc.CancelRoute("agent:nonexistent")
 }
 
+func TestSessionCache_ClearSessionBindings(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	defer sc.CloseAll()
+
+	sc.mu.Lock()
+	sc.routes["default:slack:T1"] = &routeEntry{sessionID: "sess-a"}
+	sc.routes["default:slack:T2"] = &routeEntry{sessionID: "sess-b"}
+	sc.mu.Unlock()
+
+	sc.ClearSessionBindings("sess-a")
+
+	if got := sc.RouteSessionID("default:slack:T1"); got != "" {
+		t.Fatalf("cleared route session id = %q, want empty", got)
+	}
+	if got := sc.RouteSessionID("default:slack:T2"); got != "sess-b" {
+		t.Fatalf("untouched route session id = %q, want sess-b", got)
+	}
+}
+
 func TestResolveLatestSession_NoRoute(t *testing.T) {
 	sc := NewSessionCache(t.TempDir())
 	_, err := sc.ResolveLatestSession("agent:nonexistent", "")
