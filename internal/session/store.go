@@ -361,7 +361,16 @@ func (s *Store) LatestByRouteKey(routeKey string) (*Session, error) {
 	}
 	if s.index != nil {
 		id, err := s.index.LatestUpdatedIDByRouteKey(routeKey)
-		if err == nil && id != "" {
+		if err == nil {
+			// Index is authoritative for negative results. Skipping the
+			// brute-force scan here matters during v0.1.1 → v0.1.2 upgrade:
+			// every pre-upgrade session has empty route_key, so each first
+			// inbound on a previously-unbound thread would otherwise walk
+			// the whole sessions dir + JSON-decode every file before
+			// returning nil.
+			if id == "" {
+				return nil, nil
+			}
 			if sess, loadErr := s.Load(id); loadErr == nil {
 				return sess, nil
 			}

@@ -776,6 +776,12 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
+	// Cancel any active route bound to this session before clearing in-memory
+	// bindings. ClearSessionBindings now takes per-entry locks, which blocks
+	// behind any long bash/browser run on a route bound to id; without the
+	// cancel, the delete handler can hang past upstream HTTP timeouts.
+	// Mirrors handleResetSession's ordering.
+	s.deps.SessionCache.CancelBySessionID(id)
 	if err := mgr.Delete(id); err != nil {
 		if os.IsNotExist(err) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
