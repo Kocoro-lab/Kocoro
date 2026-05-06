@@ -457,6 +457,43 @@ func TestIndex_LatestUpdated(t *testing.T) {
 	}
 }
 
+func TestIndex_LatestUpdatedByRouteKey(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := OpenIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	t1 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	routeKey := "default:slack:C123-1710000000.000100"
+
+	if err := idx.UpsertSession(&Session{
+		ID: "route-old", Title: "Old", CreatedAt: t1, UpdatedAt: t1, RouteKey: routeKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.UpsertSession(&Session{
+		ID: "other", Title: "Other", CreatedAt: t1, UpdatedAt: t2, RouteKey: "default:slack:C999",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.UpsertSession(&Session{
+		ID: "route-new", Title: "New", CreatedAt: t1, UpdatedAt: t2, RouteKey: routeKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := idx.LatestUpdatedIDByRouteKey(routeKey)
+	if err != nil {
+		t.Fatalf("LatestUpdatedIDByRouteKey: %v", err)
+	}
+	if id != "route-new" {
+		t.Errorf("expected 'route-new', got %q", id)
+	}
+}
+
 func TestIndex_SearchFTSSyntaxError(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := OpenIndex(dir)
@@ -503,12 +540,12 @@ func TestIndex_UpsertSkipsSystemInjected(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 
 	tests := []struct {
-		name           string
-		messages       []client.Message
-		meta           []MessageMeta
-		wantMsgCount   int
-		searchHit      string
-		searchMiss     string
+		name         string
+		messages     []client.Message
+		meta         []MessageMeta
+		wantMsgCount int
+		searchHit    string
+		searchMiss   string
 	}{
 		{
 			name: "no meta (legacy session) indexes all",
@@ -641,12 +678,12 @@ func TestIndex_IsEmpty(t *testing.T) {
 	}
 }
 
-// TestIndex_V2ToV3MigrationRebuildsFromJSON verifies that an existing v2
+// TestIndex_V2MigrationRebuildsFromJSON verifies that an existing v2
 // sessions.db (no `source` column, PRAGMA user_version = 2) can be opened by
-// the v3 schema without error: the rebuild path drops messages tables, the
-// ALTER TABLE backfills the new column, and subsequent UpsertSession calls
-// populate `source` correctly.
-func TestIndex_V2ToV3MigrationRebuildsFromJSON(t *testing.T) {
+// the current schema without error: the rebuild path drops messages tables, the
+// ALTER TABLE steps backfill new columns, and subsequent UpsertSession calls
+// populate the new metadata correctly.
+func TestIndex_V2MigrationRebuildsFromJSON(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "sessions.db")
 	{
@@ -673,11 +710,11 @@ func TestIndex_V2ToV3MigrationRebuildsFromJSON(t *testing.T) {
 		}
 	}
 
-	// Open via the actual API. The version mismatch (2 != 3) MUST trigger
-	// the drop-and-rebuild path AND backfill the `source` column.
+	// Open via the actual API. The version mismatch MUST trigger the
+	// drop-and-rebuild path AND backfill new columns.
 	idx, err := OpenIndex(dir)
 	if err != nil {
-		t.Fatalf("OpenIndex (v2->v3): %v", err)
+		t.Fatalf("OpenIndex migration: %v", err)
 	}
 	defer idx.Close()
 
@@ -690,12 +727,12 @@ func TestIndex_V2ToV3MigrationRebuildsFromJSON(t *testing.T) {
 	}
 	_ = rows
 
-	// Confirm a fresh Upsert populates the source column.
+	// Confirm a fresh Upsert populates the source and route key columns.
 	if err := idx.UpsertSession(&Session{
-		ID: "s2", Source: "slack",
+		ID: "s2", Source: "slack", RouteKey: "default:slack:T1",
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}); err != nil {
-		t.Fatalf("UpsertSession with source: %v", err)
+		t.Fatalf("UpsertSession with metadata: %v", err)
 	}
 	rows2, err := idx.ListUpdatedSince(context.Background(), time.Time{})
 	if err != nil {
@@ -709,6 +746,76 @@ func TestIndex_V2ToV3MigrationRebuildsFromJSON(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected s2 with Source=slack after migration; got %+v", rows2)
+	}
+	id, err := idx.LatestUpdatedIDByRouteKey("default:slack:T1")
+	if err != nil {
+		t.Fatalf("LatestUpdatedIDByRouteKey after migration: %v", err)
+	}
+	if id != "s2" {
+		t.Fatalf("route lookup after migration = %q, want s2", id)
+	}
+}
+
+// TestIndex_V3ToV4MigrationAddsRouteKey covers the production upgrade path
+// from v0.1.1 (schema v3: has `source`, no `route_key`) to v0.1.2+ (schema v4:
+// adds `route_key`). The v2 migration test exercises the same code by way of
+// "duplicate column" tolerance, but daemons running the just-shipped v0.1.1
+// enter migration at v3 specifically — this asserts that entry point.
+func TestIndex_V3ToV4MigrationAddsRouteKey(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "sessions.db")
+	{
+		raw, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatalf("open raw sqlite: %v", err)
+		}
+		// Exact v3 CREATE TABLE — has `source`, no `route_key`.
+		if _, err := raw.Exec(`CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, msg_count INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT '')`); err != nil {
+			t.Fatalf("create v3 sessions table: %v", err)
+		}
+		if _, err := raw.Exec(`PRAGMA user_version = 3`); err != nil {
+			t.Fatalf("stamp v3 user_version: %v", err)
+		}
+		now := time.Now().UTC()
+		if _, err := raw.Exec(
+			`INSERT INTO sessions (id, title, created_at, updated_at, msg_count, source) VALUES (?, ?, ?, ?, ?, ?)`,
+			"s-pre", "v3 session", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), 1, "slack",
+		); err != nil {
+			t.Fatalf("seed v3 row: %v", err)
+		}
+		if err := raw.Close(); err != nil {
+			t.Fatalf("close raw sqlite: %v", err)
+		}
+	}
+
+	idx, err := OpenIndex(dir)
+	if err != nil {
+		t.Fatalf("OpenIndex v3→v4 migration: %v", err)
+	}
+	defer idx.Close()
+
+	// Pre-existing v3 row survives the migration with empty route_key.
+	id, err := idx.LatestUpdatedIDByRouteKey("default:slack:Tnew")
+	if err != nil {
+		t.Fatalf("LatestUpdatedIDByRouteKey on empty: %v", err)
+	}
+	if id != "" {
+		t.Errorf("expected no match for fresh route_key, got %q", id)
+	}
+
+	// Fresh upsert populates route_key, and the new column is queryable.
+	if err := idx.UpsertSession(&Session{
+		ID: "s-post", Source: "slack", RouteKey: "default:slack:Tnew",
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("UpsertSession post-migration: %v", err)
+	}
+	id, err = idx.LatestUpdatedIDByRouteKey("default:slack:Tnew")
+	if err != nil {
+		t.Fatalf("LatestUpdatedIDByRouteKey post-upsert: %v", err)
+	}
+	if id != "s-post" {
+		t.Fatalf("route lookup after migration = %q, want s-post", id)
 	}
 }
 

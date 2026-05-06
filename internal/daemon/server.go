@@ -776,6 +776,12 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
+	// Cancel any active route bound to this session before clearing in-memory
+	// bindings. ClearSessionBindings now takes per-entry locks, which blocks
+	// behind any long bash/browser run on a route bound to id; without the
+	// cancel, the delete handler can hang past upstream HTTP timeouts.
+	// Mirrors handleResetSession's ordering.
+	s.deps.SessionCache.CancelBySessionID(id)
 	if err := mgr.Delete(id); err != nil {
 		if os.IsNotExist(err) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
@@ -784,6 +790,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.deps.SessionCache.ClearSessionBindings(id)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -835,6 +842,7 @@ func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.deps.SessionCache.ClearSessionBindings(id)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reset", "id": id})
 }
 
@@ -2702,10 +2710,10 @@ func (s *Server) handlePutGlobalSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Description        string `json:"description"`
-		Prompt             string `json:"prompt"`
-		License            string `json:"license"`
-		StickyInstructions *bool  `json:"sticky_instructions,omitempty"`
+		Description        string  `json:"description"`
+		Prompt             string  `json:"prompt"`
+		License            string  `json:"license"`
+		StickyInstructions *bool   `json:"sticky_instructions,omitempty"`
 		StickySnippet      *string `json:"sticky_snippet,omitempty"`
 	}
 	if !decodeBody(w, r, &req) {

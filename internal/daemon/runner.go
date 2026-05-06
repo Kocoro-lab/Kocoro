@@ -101,6 +101,9 @@ func ComputeRouteKey(req RunAgentRequest) string {
 	if req.SessionID != "" {
 		return "session:" + sanitizeRouteValue(req.SessionID)
 	}
+	if shouldBypassNamedAgentRoute(req.Source) {
+		return ""
+	}
 	if IsMessagingPlatform(req.Source) && req.ThreadID != "" {
 		if req.Agent != "" {
 			return "agent:" + req.Agent + ":" + sanitizeRouteValue(req.Source) + ":" + sanitizeRouteValue(req.ThreadID)
@@ -119,6 +122,15 @@ func ComputeRouteKey(req RunAgentRequest) string {
 	return ""
 }
 
+func shouldBypassNamedAgentRoute(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case ChannelWeb, "webhook", "cron", ChannelSystem:
+		return true
+	default:
+		return false
+	}
+}
+
 func isPlainAgentRouteKey(routeKey string) bool {
 	if !strings.HasPrefix(routeKey, "agent:") {
 		return false
@@ -133,6 +145,13 @@ func shouldBypassRouteCache(source string) bool {
 	default:
 		return false
 	}
+}
+
+func shouldPersistRouteKey(routeKey string) bool {
+	if routeKey == "" || strings.HasPrefix(routeKey, "session:") {
+		return false
+	}
+	return !isPlainAgentRouteKey(routeKey)
 }
 
 func sanitizeRouteValue(value string) string {
@@ -530,6 +549,20 @@ func resumeNamedAgentColdStart(sessMgr *session.Manager) (bool, error) {
 	return false, nil
 }
 
+func resumeRoutedColdStart(sessMgr *session.Manager, routeKey string) (bool, error) {
+	if !shouldPersistRouteKey(routeKey) {
+		return false, nil
+	}
+	latest, err := sessMgr.ResumeLatestByRouteKey(routeKey)
+	if err != nil {
+		return false, err
+	}
+	if latest != nil {
+		return true, nil
+	}
+	return false, nil
+}
+
 // RunAgent executes a single agent turn using the shared dependencies.
 // The caller provides an EventHandler to control streaming, approval, and
 // event reporting (WS uses daemonEventHandler, HTTP uses httpEventHandler).
@@ -709,6 +742,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		} else {
 			resumed = true
 		}
+	case shouldPersistRouteKey(req.RouteKey):
+		if resumedRoute, err := resumeRoutedColdStart(sessMgr, req.RouteKey); err != nil {
+			log.Printf("daemon: failed to resume persisted routed session for %q: %v", req.RouteKey, err)
+			if sessMgr.Current() == nil {
+				sessMgr.NewSession()
+			}
+		} else if resumedRoute {
+			resumed = true
+		} else {
+			sessMgr.NewSession()
+		}
 	case isPlainAgentRouteKey(req.RouteKey):
 		// Named-agent cold start (first run or after daemon restart).
 		// route.sessionID is empty — resume latest from disk, or start fresh if none.
@@ -724,6 +768,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		sessMgr.NewSession()
 	}
 	sess := sessMgr.Current()
+	if route != nil && sess != nil {
+		route.sessionID = sess.ID
+	}
 
 	// Seed pre-loaded history for bypass-routed runs (e.g., heartbeat).
 	// The throwaway manager has an empty session; this gives the LLM context.
@@ -826,6 +873,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// still needed to capture the assistant's reply.
 	// Ephemeral requests skip persistence — the caller owns session lifecycle.
 	if !req.Ephemeral {
+		if shouldPersistRouteKey(req.RouteKey) {
+			sess.RouteKey = req.RouteKey
+		}
 		if req.Source != "" && req.Channel != "" {
 			sess.Source = req.Source
 			sess.Channel = req.Channel
@@ -1430,6 +1480,15 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 			log.Printf("daemon: failed to resume routed session %q for %q: %v", route.sessionID, req.RouteKey, err)
 			sessMgr.NewSession()
 		}
+	case shouldPersistRouteKey(req.RouteKey):
+		if resumedRoute, err := resumeRoutedColdStart(sessMgr, req.RouteKey); err != nil {
+			log.Printf("daemon: failed to resume persisted routed session for %q: %v", req.RouteKey, err)
+			if sessMgr.Current() == nil {
+				sessMgr.NewSession()
+			}
+		} else if !resumedRoute {
+			sessMgr.NewSession()
+		}
 	case isPlainAgentRouteKey(req.RouteKey):
 		// Named-agent cold start — resume latest from disk, or NewSession if none.
 		if _, err := resumeNamedAgentColdStart(sessMgr); err != nil {
@@ -1442,11 +1501,17 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		sessMgr.NewSession()
 	}
 	sess := sessMgr.Current()
+	if route != nil && sess != nil {
+		route.sessionID = sess.ID
+	}
 
 	// Stamp session metadata before persisting — mirrors runner.go:791-803.
 	// This makes the session searchable/displayable by source+channel and gives
 	// it a stable human-readable title.
 	if !req.Ephemeral {
+		if shouldPersistRouteKey(req.RouteKey) {
+			sess.RouteKey = req.RouteKey
+		}
 		if req.Source != "" && req.Channel != "" {
 			sess.Source = req.Source
 			sess.Channel = req.Channel

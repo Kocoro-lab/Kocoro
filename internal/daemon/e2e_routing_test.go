@@ -67,6 +67,11 @@ func TestE2E_RouteKeyComputation(t *testing.T) {
 			expected: "",
 		},
 		{
+			name:     "named webhook bypasses cache",
+			req:      RunAgentRequest{Text: "hi", Agent: "ops-bot", Source: "webhook", Channel: "hook-1"},
+			expected: "",
+		},
+		{
 			name:     "cron bypasses cache",
 			req:      RunAgentRequest{Text: "hi", Source: "cron", Channel: "job-1"},
 			expected: "",
