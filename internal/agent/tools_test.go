@@ -55,6 +55,17 @@ func (m *mockTool) Run(ctx context.Context, args string) (ToolResult, error) {
 
 func (m *mockTool) RequiresApproval() bool { return false }
 
+func TestDisallowsAutoApproval(t *testing.T) {
+	if !DisallowsAutoApproval("publish_to_web") {
+		t.Fatal("publish_to_web must require per-call approval")
+	}
+	for _, name := range []string{"bash", "file_write", "cloud_delegate", "think"} {
+		if DisallowsAutoApproval(name) {
+			t.Fatalf("%s should not be in the per-call approval denylist", name)
+		}
+	}
+}
+
 type mockNativeTool struct {
 	name string
 }
@@ -325,7 +336,7 @@ func (m *mockSourcedTool) Info() ToolInfo {
 func (m *mockSourcedTool) Run(ctx context.Context, args string) (ToolResult, error) {
 	return ToolResult{Content: "ok"}, nil
 }
-func (m *mockSourcedTool) RequiresApproval() bool  { return false }
+func (m *mockSourcedTool) RequiresApproval() bool { return false }
 func (m *mockSourcedTool) ToolSource() ToolSource { return m.source }
 
 func TestToolRegistry_SortedSchemas(t *testing.T) {

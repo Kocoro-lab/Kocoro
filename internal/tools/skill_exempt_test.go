@@ -2,9 +2,12 @@ package tools
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
+	mcpproto "github.com/mark3labs/mcp-go/mcp"
 )
 
 // TestSkillExemptInventory pins down which production tools opt into framework
@@ -23,8 +26,8 @@ func TestSkillExemptInventory(t *testing.T) {
 	skillsPtr := &[]*skills.Skill{}
 
 	cases := []struct {
-		name      string
-		tool      agent.Tool
+		name       string
+		tool       agent.Tool
 		wantExempt bool
 	}{
 		// Allowlist: pure infrastructure.
@@ -41,7 +44,27 @@ func TestSkillExemptInventory(t *testing.T) {
 		{"bash", &BashTool{}, false},
 		{"http", &HTTPTool{}, false},
 		{"directory_list", &DirectoryListTool{}, false},
+		{"system_info", &SystemInfoTool{}, false},
+		{"clipboard", &ClipboardTool{}, false},
+		{"notify", &NotifyTool{}, false},
+		{"process", &ProcessTool{}, false},
+		{"applescript", &AppleScriptTool{}, false},
+		{"accessibility", &AccessibilityTool{}, false},
+		{"ghostty", &GhosttyTool{}, false},
+		{"browser", &BrowserTool{}, false},
+		{"screenshot", &ScreenshotTool{}, false},
+		{"computer", &ComputerTool{}, false},
+		{"wait_for", &WaitTool{}, false},
 		{"memory_append", &MemoryAppendTool{}, false},
+		{"memory_recall", &MemoryTool{}, false},
+		{"session_search", &SessionSearchTool{}, false},
+		{"schedule_create", &ScheduleTool{action: "create"}, false},
+		{"schedule_list", &ScheduleTool{action: "list"}, false},
+		{"schedule_update", &ScheduleTool{action: "update"}, false},
+		{"schedule_remove", &ScheduleTool{action: "remove"}, false},
+		{"cloud_delegate", NewCloudDelegateTool(nil, "", time.Second, nil, "", ""), false},
+		{"server_tool", NewServerTool(client.ServerToolSchema{Name: "web_search"}, nil), false},
+		{"mcp_tool", NewMCPTool("playwright", mcpproto.Tool{Name: "browser_navigate"}, nil), false},
 		{"publish_to_web", &PublishToWebTool{}, false},
 	}
 

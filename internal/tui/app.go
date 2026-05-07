@@ -981,7 +981,11 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateProcessing
 				return m, nil
 			case "a", "A":
-				m.sessionAllowed[m.pendingApprovalTool] = true
+				if !agent.DisallowsAutoApproval(m.pendingApprovalTool) {
+					m.sessionAllowed[m.pendingApprovalTool] = true
+				} else {
+					m.sendOutput("  ! Allowed once; this tool cannot be saved as always-allow.")
+				}
 				select {
 				case m.approvalCh <- true:
 				default:
@@ -1097,7 +1101,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case approvalRequestMsg:
 		m.pendingApprovalTool = msg.tool
 		// Check session-level auto-approve
-		if m.sessionAllowed[msg.tool] {
+		if m.sessionAllowed[msg.tool] && !agent.DisallowsAutoApproval(msg.tool) {
 			select {
 			case m.approvalCh <- true:
 			default:

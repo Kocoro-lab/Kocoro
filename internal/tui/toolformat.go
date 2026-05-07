@@ -41,6 +41,10 @@ func toolKeyArg(toolName string, argsJSON string) string {
 		key = strVal(m, "script")
 	case "notify":
 		key = strVal(m, "message")
+	case "publish_to_web":
+		if purpose := strVal(m, "purpose"); purpose != "" {
+			key = "purpose: " + purpose
+		}
 	default:
 		for _, f := range []string{"query", "path", "url", "command", "name"} {
 			if v := strVal(m, f); v != "" {

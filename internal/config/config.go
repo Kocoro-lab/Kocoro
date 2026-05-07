@@ -70,8 +70,8 @@ type AgentConfig struct {
 	// long. 0 = disabled (visibility-only mode). Default: 0 while the
 	// watchdog is opt-in; will flip to a value strictly less than the
 	// gateway transport ceiling (600s) after dogfood.
-	IdleSoftTimeoutSecs int `mapstructure:"idle_soft_timeout_secs" yaml:"idle_soft_timeout_secs" json:"idle_soft_timeout_secs"`
-	IdleHardTimeoutSecs int `mapstructure:"idle_hard_timeout_secs" yaml:"idle_hard_timeout_secs" json:"idle_hard_timeout_secs"`
+	IdleSoftTimeoutSecs int   `mapstructure:"idle_soft_timeout_secs" yaml:"idle_soft_timeout_secs" json:"idle_soft_timeout_secs"`
+	IdleHardTimeoutSecs int   `mapstructure:"idle_hard_timeout_secs" yaml:"idle_hard_timeout_secs" json:"idle_hard_timeout_secs"`
 	SkillDiscovery      *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
 
 	// TimeBasedCompact controls time-gated tool_result clearing. Disabled
@@ -405,9 +405,14 @@ type overlayConfig struct {
 	Permissions     *permissions.PermissionsConfig `yaml:"permissions"`
 	Agent           *overlayAgentConfig            `yaml:"agent"`
 	Tools           *overlayToolsConfig            `yaml:"tools"`
+	Cloud           *overlayCloudConfig            `yaml:"cloud"`
 	Daemon          *overlayDaemonConfig           `yaml:"daemon"`
 	MCPServers      map[string]mcp.MCPServerConfig `yaml:"mcp_servers"`
 	MCP             *overlayMCPConfig              `yaml:"mcp"`
+}
+
+type overlayCloudConfig struct {
+	PublishAllowedExtensions []string `yaml:"publish_allowed_extensions"`
 }
 
 type overlayMCPConfig struct {
@@ -703,6 +708,13 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		}
 	}
 
+	// Cloud field-level merge. Only session-safe publish policy is accepted
+	// from project/local overlays; endpoint, API key, and enablement stay global.
+	if overlay.Cloud != nil && len(overlay.Cloud.PublishAllowedExtensions) > 0 {
+		cfg.Cloud.PublishAllowedExtensions = dedup(append(cfg.Cloud.PublishAllowedExtensions, overlay.Cloud.PublishAllowedExtensions...))
+		cfg.Sources["cloud.publish_allowed_extensions"] = src
+	}
+
 	// Permissions: merge and deduplicate lists
 	if overlay.Permissions != nil {
 		if len(overlay.Permissions.AllowedDirs) > 0 {
@@ -736,7 +748,8 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 	}
 
 	// Process-global fields (endpoint, api_key, auto_update_check, daemon,
-	// mcp_servers) are intentionally NOT merged here — they stay process-scoped.
+	// cloud enablement/timeout, mcp_servers) are intentionally NOT merged here —
+	// they stay process-scoped.
 }
 
 func validateConfig(cfg *Config) error {

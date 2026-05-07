@@ -22,7 +22,7 @@ type Scheduler struct {
 	gron      *gronx.Gronx
 	mu        sync.Mutex
 	lastFired map[string]time.Time // scheduleID -> last fired minute (truncated)
-	sem       chan struct{}         // bounded concurrency
+	sem       chan struct{}        // bounded concurrency
 }
 
 // NewScheduler creates a Scheduler that evaluates schedules from mgr.
@@ -195,7 +195,7 @@ func escapeContextText(s string) string {
 }
 
 // scheduleHandler is a silent EventHandler for scheduled agent runs.
-// Auto-approves all tool calls for unattended execution.
+// Auto-approves ordinary tool calls for unattended execution.
 type scheduleHandler struct {
 	usage agent.UsageAccumulator
 }
@@ -203,14 +203,16 @@ type scheduleHandler struct {
 // Usage returns the cumulative usage collected during this schedule run.
 func (h *scheduleHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
 
-func (h *scheduleHandler) OnToolCall(name string, args string)                                      {}
+func (h *scheduleHandler) OnToolCall(name string, args string) {}
 func (h *scheduleHandler) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
 }
-func (h *scheduleHandler) OnText(text string)                                    {}
-func (h *scheduleHandler) OnPreamble(text string)                                {}
-func (h *scheduleHandler) OnStreamDelta(delta string)                            {}
-func (h *scheduleHandler) OnUsage(usage agent.TurnUsage)                         { h.usage.Add(usage) }
-func (h *scheduleHandler) OnCloudAgent(agentID, status, message string)          {}
-func (h *scheduleHandler) OnCloudProgress(completed, total int)                  {}
+func (h *scheduleHandler) OnText(text string)                                     {}
+func (h *scheduleHandler) OnPreamble(text string)                                 {}
+func (h *scheduleHandler) OnStreamDelta(delta string)                             {}
+func (h *scheduleHandler) OnUsage(usage agent.TurnUsage)                          { h.usage.Add(usage) }
+func (h *scheduleHandler) OnCloudAgent(agentID, status, message string)           {}
+func (h *scheduleHandler) OnCloudProgress(completed, total int)                   {}
 func (h *scheduleHandler) OnCloudPlan(planType, content string, needsReview bool) {}
-func (h *scheduleHandler) OnApprovalNeeded(tool string, args string) bool        { return true }
+func (h *scheduleHandler) OnApprovalNeeded(tool string, args string) bool {
+	return !agent.DisallowsAutoApproval(tool)
+}

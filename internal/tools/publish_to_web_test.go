@@ -107,7 +107,7 @@ func TestPublishPurposeTooShort(t *testing.T) {
 func TestPublishPurposeVaguePlaceholder(t *testing.T) {
 	fu := &fakeUploader{}
 	tool := NewPublishToWebTool(fu, nil)
-	for _, vague := range []string{"share", "test", "todo", "asdf", "  Send It  "} {
+	for _, vague := range []string{"share", "test", "todo", "asdf", "  Send It  ", "for testing", "share   with team", "send to user"} {
 		res := runTool(t, tool, map[string]any{
 			"path":    "/tmp/x.html",
 			"purpose": vague,
@@ -159,6 +159,30 @@ func TestPublishPathBlacklistSuffix(t *testing.T) {
 			}, "")
 			if !res.IsError || res.ErrorCategory != agent.ErrCategoryBusiness {
 				t.Fatalf("expected business error, got %+v", res)
+			}
+		})
+	}
+}
+
+func TestPublishSensitiveDisguisedFilenames(t *testing.T) {
+	for _, p := range []string{
+		"/tmp/id_rsa.key.txt",
+		"/tmp/server.key.txt",
+		"/tmp/credentials.json",
+		"/tmp/.env.local.txt",
+	} {
+		t.Run(p, func(t *testing.T) {
+			fu := &fakeUploader{}
+			tool := NewPublishToWebTool(fu, nil)
+			res := runTool(t, tool, map[string]any{
+				"path":    p,
+				"purpose": "send to user via slack reply",
+			}, "")
+			if !res.IsError || res.ErrorCategory != agent.ErrCategoryBusiness {
+				t.Fatalf("expected business error, got %+v", res)
+			}
+			if fu.called {
+				t.Fatalf("uploader must not be called for disguised sensitive path %q", p)
 			}
 		})
 	}

@@ -148,6 +148,9 @@ func TestRuntimeConfigForCWD_AppliesOnlySessionSafeProjectOverrides(t *testing.T
 		"model_tier: low",
 		"tools:",
 		"  bash_max_output: 4096",
+		"cloud:",
+		"  publish_allowed_extensions:",
+		"    - .sql",
 		"permissions:",
 		"  allowed_commands:",
 		"    - make test",
@@ -157,6 +160,9 @@ func TestRuntimeConfigForCWD_AppliesOnlySessionSafeProjectOverrides(t *testing.T
 		t.Fatalf("write project config: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(projectConfigDir, "config.local.yaml"), []byte(strings.Join([]string{
+		"cloud:",
+		"  publish_allowed_extensions:",
+		"    - .log",
 		"permissions:",
 		"  allowed_commands:",
 		"    - go test ./...",
@@ -172,6 +178,11 @@ func TestRuntimeConfigForCWD_AppliesOnlySessionSafeProjectOverrides(t *testing.T
 		},
 		Tools: ToolsConfig{
 			BashMaxOutput: 30000,
+		},
+		Cloud: CloudConfig{
+			Enabled:                  true,
+			Timeout:                  3600,
+			PublishAllowedExtensions: []string{".md"},
 		},
 		Sources: buildDefaultSources(),
 	}
@@ -193,6 +204,9 @@ func TestRuntimeConfigForCWD_AppliesOnlySessionSafeProjectOverrides(t *testing.T
 	if got := cfg.Permissions.AllowedCommands; len(got) != 3 || got[0] != "git status" || got[1] != "make test" || got[2] != "go test ./..." {
 		t.Fatalf("unexpected allowed commands: %#v", got)
 	}
+	if got := cfg.Cloud.PublishAllowedExtensions; len(got) != 3 || got[0] != ".md" || got[1] != ".sql" || got[2] != ".log" {
+		t.Fatalf("unexpected publish extensions: %#v", got)
+	}
 	if cfg.Daemon.AutoApprove {
 		t.Fatal("expected daemon config to remain global")
 	}
@@ -201,6 +215,9 @@ func TestRuntimeConfigForCWD_AppliesOnlySessionSafeProjectOverrides(t *testing.T
 	}
 	if src := cfg.Sources["permissions.allowed_commands"]; src.Level != "local" {
 		t.Fatalf("expected local source for allowed_commands, got %#v", src)
+	}
+	if src := cfg.Sources["cloud.publish_allowed_extensions"]; src.Level != "local" {
+		t.Fatalf("expected local source for publish extensions, got %#v", src)
 	}
 }
 

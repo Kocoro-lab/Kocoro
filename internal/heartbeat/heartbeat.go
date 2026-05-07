@@ -333,4 +333,6 @@ func (tc *TranscriptCollector) OnUsage(usage agent.TurnUsage)                   
 func (tc *TranscriptCollector) OnCloudAgent(agentID, status, message string)           {}
 func (tc *TranscriptCollector) OnCloudProgress(completed, total int)                   {}
 func (tc *TranscriptCollector) OnCloudPlan(planType, content string, needsReview bool) {}
-func (tc *TranscriptCollector) OnApprovalNeeded(tool string, args string) bool         { return true }
+func (tc *TranscriptCollector) OnApprovalNeeded(tool string, args string) bool {
+	return !agent.DisallowsAutoApproval(tool)
+}

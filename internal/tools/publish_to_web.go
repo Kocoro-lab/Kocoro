@@ -12,6 +12,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
+	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
 	"github.com/Kocoro-lab/ShanClaw/internal/uploads"
 )
 
@@ -37,29 +38,30 @@ type uploader interface {
 // Anchored to whole segments so "secrets/" inside a path is denied but
 // "secret-recipes.html" is not.
 var pathDenyComponents = map[string]bool{
-	".env":         true,
-	".envrc":       true,
-	".ssh":         true,
-	".aws":         true,
-	".gcp":         true,
-	".azure":       true,
-	".npmrc":       true,
-	".netrc":       true,
-	".pgpass":      true,
-	".gitconfig":   true,
-	".kube":        true,
-	"credentials":  true,
-	"credential":   true,
-	"secrets":      true,
-	"secret":       true,
-	"id_rsa":       true,
-	"id_ed25519":   true,
-	"id_ecdsa":     true,
-	"id_dsa":       true,
+	".env":        true,
+	".envrc":      true,
+	".ssh":        true,
+	".aws":        true,
+	".gcp":        true,
+	".azure":      true,
+	".npmrc":      true,
+	".netrc":      true,
+	".pgpass":     true,
+	".gitconfig":  true,
+	".kube":       true,
+	"credentials": true,
+	"credential":  true,
+	"secrets":     true,
+	"secret":      true,
+	"id_rsa":      true,
+	"id_ed25519":  true,
+	"id_ecdsa":    true,
+	"id_dsa":      true,
 }
 
-// pathDenySuffixes match the file's basename extension. Catches private-key
-// and signing-material formats that should never be published.
+// pathDenySuffixes match the file's basename extension, including disguised
+// double extensions such as cert.key.txt. Catches private-key and
+// signing-material formats that should never be published.
 var pathDenySuffixes = map[string]bool{
 	".pem":      true,
 	".key":      true,
@@ -89,19 +91,28 @@ var defaultExtAllowlist = map[string]bool{
 // vaguePurposes are placeholder strings LLMs fall back to when forced to fill
 // the field but not actually thinking about why. Reject these explicitly.
 var vaguePurposes = map[string]bool{
-	"share":  true,
-	"send":   true,
+	"share":   true,
+	"send":    true,
 	"send it": true,
-	"upload": true,
-	"test":   true,
-	"todo":   true,
-	"asdf":   true,
-	"foo":    true,
-	"bar":    true,
-	"x":      true,
-	"y":      true,
-	"hi":     true,
-	"hello":  true,
+	"upload":  true,
+	"test":    true,
+	"todo":    true,
+	"asdf":    true,
+	"foo":     true,
+	"bar":     true,
+	"x":       true,
+	"y":       true,
+	"hi":      true,
+	"hello":   true,
+
+	"for testing":     true,
+	"for test":        true,
+	"share with team": true,
+	"share with user": true,
+	"send to user":    true,
+	"show the user":   true,
+	"for the user":    true,
+	"for review":      true,
 }
 
 type PublishToWebTool struct {
@@ -285,24 +296,29 @@ func validatePurpose(purpose string) (agent.ToolResult, bool) {
 				"(e.g. 'send landing page draft to user via Slack reply').",
 		), false
 	}
+	if vaguePurposes[normalizePurpose(trimmed)] {
+		return agent.ValidationError(
+			"purpose is too vague. State the actual reason this file needs to be public " +
+				"(who is the recipient, what channel, what for).",
+		), false
+	}
 	if len(trimmed) < publishMinPurposeLen {
 		return agent.ValidationError(fmt.Sprintf(
 			"purpose too short (%d chars, min %d). Be specific about why this file needs to be public.",
 			len(trimmed), publishMinPurposeLen,
 		)), false
 	}
-	if vaguePurposes[strings.ToLower(trimmed)] {
-		return agent.ValidationError(
-			"purpose is too vague. State the actual reason this file needs to be public " +
-				"(who is the recipient, what channel, what for).",
-		), false
-	}
 	return agent.ToolResult{}, true
 }
 
+func normalizePurpose(purpose string) string {
+	return strings.ToLower(strings.Join(strings.Fields(purpose), " "))
+}
+
 // checkPathBlocked rejects the upload if the resolved path traverses any
-// segment in pathDenyComponents (case-insensitive, exact-segment match) or
-// the basename has a denied suffix.
+// segment in pathDenyComponents (case-insensitive, exact-segment match), the
+// basename matches a sensitive-file pattern, or the basename has a denied
+// suffix.
 func checkPathBlocked(resolved string) (agent.ToolResult, bool) {
 	clean := filepath.Clean(resolved)
 	for _, seg := range strings.Split(clean, string(filepath.Separator)) {
@@ -317,8 +333,14 @@ func checkPathBlocked(resolved string) (agent.ToolResult, bool) {
 		}
 	}
 	base := strings.ToLower(filepath.Base(clean))
+	if permissions.IsSensitiveFile(base) {
+		return agent.BusinessError(fmt.Sprintf(
+			"refusing to publish: filename %q matches the sensitive-file blocklist (path: %s)",
+			filepath.Base(clean), clean,
+		)), false
+	}
 	for suffix := range pathDenySuffixes {
-		if strings.HasSuffix(base, suffix) {
+		if strings.HasSuffix(base, suffix) || strings.Contains(base, suffix+".") {
 			return agent.BusinessError(fmt.Sprintf(
 				"refusing to publish: file extension %q is in the credential/key blocklist (path: %s)",
 				suffix, clean,

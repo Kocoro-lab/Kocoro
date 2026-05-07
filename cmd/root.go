@@ -491,20 +491,49 @@ func (h *cliEventHandler) OnCloudPlan(planType, content string, needsReview bool
 
 func (h *cliEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
+		if agent.DisallowsAutoApproval(tool) {
+			fmt.Printf("  Tool %s requires per-call approval and cannot use --yes auto-approval.\n", tool)
+			return false
+		}
 		return true
 	}
 
 	if !stdinIsTTY() {
+		if agent.DisallowsAutoApproval(tool) {
+			fmt.Printf("  Tool %s requires interactive per-call approval; stdin is not interactive.\n", tool)
+			return false
+		}
 		fmt.Printf("  Tool %s requires approval but stdin is not interactive. Use --yes to auto-approve.\n", tool)
 		return false
 	}
 
-	fmt.Printf("  Allow %s? [y/N] ", tool)
+	if tool == "publish_to_web" {
+		purpose := approvalField(args, "purpose")
+		path := approvalField(args, "path")
+		if purpose != "" || path != "" {
+			fmt.Printf("  Allow %s? path=%s purpose=%s [y/N] ", tool, path, purpose)
+		} else {
+			fmt.Printf("  Allow %s? [y/N] ", tool)
+		}
+	} else {
+		fmt.Printf("  Allow %s? [y/N] ", tool)
+	}
 	var response string
 	if _, err := fmt.Scanln(&response); err != nil {
 		return false
 	}
 	return response == "y" || response == "Y"
+}
+
+func approvalField(argsJSON, key string) string {
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return ""
+	}
+	if v, ok := args[key].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // cliToolKeyArg extracts a short key argument for display in one-shot mode.

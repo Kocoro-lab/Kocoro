@@ -185,6 +185,18 @@ func IsSkillExempt(t Tool) bool {
 	return false
 }
 
+// DisallowsAutoApproval reports tools that require a fresh human decision for
+// every call. These tools may still be approved once, but global auto-approve,
+// unattended runs, and session-level "always allow" must not cover them.
+func DisallowsAutoApproval(toolName string) bool {
+	switch toolName {
+	case "publish_to_web":
+		return true
+	default:
+		return false
+	}
+}
+
 // ToolSummary is a lightweight name+description pair for deferred tool listings.
 type ToolSummary struct {
 	Name        string

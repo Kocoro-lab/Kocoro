@@ -1345,7 +1345,7 @@ func (h *httpEventHandler) OnCloudProgress(completed, total int)                
 func (h *httpEventHandler) OnCloudPlan(planType, content string, needsReview bool) {}
 
 func (h *httpEventHandler) OnApprovalNeeded(tool string, args string) bool {
-	return true
+	return !agent.DisallowsAutoApproval(tool)
 }
 
 // sseEventHandler streams agent events as SSE to an HTTP response.
@@ -1466,6 +1466,10 @@ func (h *sseEventHandler) OnCloudPlan(planType, content string, needsReview bool
 // client responds via POST /approval or the request context is cancelled.
 func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
+		if agent.DisallowsAutoApproval(tool) {
+			log.Printf("sse: refusing auto-approval for %s (per-call approval required)", tool)
+			return false
+		}
 		log.Printf("sse: auto-approving %s (auto_approve=true)", tool)
 		return true
 	}
@@ -1507,6 +1511,15 @@ func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 					log.Printf("sse: always-allow persisted: %s", cmd)
 				}
 			}
+		} else if agent.DisallowsAutoApproval(tool) {
+			if h.deps != nil && h.deps.EventBus != nil {
+				payload, _ := json.Marshal(map[string]string{
+					"severity": "warn",
+					"message":  "Allowed for this call only. This tool cannot be saved as always-allow.",
+				})
+				h.deps.EventBus.Emit(Event{Type: EventApprovalNotice, Payload: payload})
+			}
+			log.Printf("sse: always-allow treated as one-time allow for %s", tool)
 		} else {
 			h.broker.SetToolAutoApprove(tool)
 			log.Printf("sse: always-allow (session): %s", tool)

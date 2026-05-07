@@ -45,6 +45,16 @@ func TestFormatPrompt(t *testing.T) {
 	}
 }
 
+func TestTranscriptCollectorBlocksPerCallApprovalTools(t *testing.T) {
+	tc := &TranscriptCollector{}
+	if tc.OnApprovalNeeded("publish_to_web", `{}`) {
+		t.Fatal("heartbeat must not auto-approve publish_to_web")
+	}
+	if !tc.OnApprovalNeeded("bash", `{}`) {
+		t.Fatal("heartbeat should keep auto-approving ordinary tools")
+	}
+}
+
 func TestReadChecklist(t *testing.T) {
 	dir := t.TempDir()
 
