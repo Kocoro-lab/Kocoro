@@ -2488,6 +2488,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		normalizedToolText := normalizeStructuredToolCallPreamble(resp.OutputText, toolCalls)
 		if normalizedToolText != "" {
 			lastText = normalizedToolText
+			// Forward real preamble to handlers (TUI / daemon LLM_OUTPUT).
+			// The normalize step above already returns "" for serialized
+			// tool-call pseudo-preambles, so we only fire OnText for genuine
+			// user-facing text. Reverses prior suppression behavior; see
+			// docs/superpowers/specs/2026-05-07-agent-preamble-output-design.md
+			// (D6) and the AGENTS.md / CLAUDE.md "Preamble suppressed" notes
+			// (those docs are tracked for sync as a follow-up PR).
+			if a.handler != nil {
+				a.handler.OnText(normalizedToolText)
+			}
 		}
 
 		useNative := hasNativeToolIDs(toolCalls)
