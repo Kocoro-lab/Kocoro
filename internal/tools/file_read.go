@@ -142,11 +142,12 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			}
 			return agent.ToolResult{Content: fmt.Sprintf("error reading file: %v", err), IsError: true}, nil
 		}
-		lines = strings.Split(string(data), "\n")
-		totalLines = len(lines)
-		if start > len(lines) {
-			start = len(lines)
+		all := strings.Split(string(data), "\n")
+		totalLines = len(all)
+		if start > len(all) {
+			start = len(all)
 		}
+		lines = all[start:]
 	}
 
 	// Estimate output tokens on the requested slice (NOT the whole file —

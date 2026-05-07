@@ -1,6 +1,8 @@
 package session
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -201,6 +203,68 @@ func TestManager_OnSessionClose_FiresOnSessionSwitch(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("expected callback to fire once when switching sessions, got %d", calls)
+	}
+}
+
+// TestManager_Delete_FailedDeletePreservesState: when store.Delete fails
+// (e.g. the file is already gone), the manager must NOT clear m.current
+// or fire cleanup callbacks — those would tear down live per-session
+// resources for a session the caller can still see.
+func TestManager_Delete_FailedDeletePreservesState(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	sess := m.NewSession()
+	if err := m.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	calls := 0
+	m.OnSessionClose(sess.ID, func() { calls++ })
+
+	// Pretend the session was already removed from disk by some external
+	// path; store.Delete will return os.ErrNotExist via os.Remove.
+	if err := os.Remove(filepath.Join(dir, sess.ID+".json")); err != nil {
+		t.Fatalf("setup remove: %v", err)
+	}
+
+	if err := m.Delete(sess.ID); err == nil {
+		t.Fatal("expected Delete to return error when disk file missing")
+	}
+	if calls != 0 {
+		t.Errorf("close callbacks fired on failed delete; want 0, got %d", calls)
+	}
+	if cur := m.Current(); cur == nil || cur.ID != sess.ID {
+		t.Error("m.current was cleared despite failed delete")
+	}
+}
+
+// TestManager_OnSessionClose_FiresOnDelete verifies that explicitly
+// deleting a session releases registered cleanup callbacks. Subsystems
+// like ReadTrackerCache.Forget rely on this hook to release per-session
+// memory; pre-fix, Delete only touched the runtime map and store.
+func TestManager_OnSessionClose_FiresOnDelete(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	sess := m.NewSession()
+	if err := m.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	calls := 0
+	m.OnSessionClose(sess.ID, func() { calls++ })
+
+	if err := m.Delete(sess.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected close callback to fire once on Delete, got %d", calls)
+	}
+	// Second Delete is a no-op on callbacks (the entry was already taken).
+	_ = m.Delete(sess.ID)
+	if calls != 1 {
+		t.Fatalf("Delete should be idempotent on callbacks, got %d", calls)
 	}
 }
 

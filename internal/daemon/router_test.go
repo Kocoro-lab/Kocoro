@@ -374,8 +374,12 @@ func TestSessionCache_ClearSessionBindings(t *testing.T) {
 	defer sc.CloseAll()
 
 	sc.mu.Lock()
-	sc.routes["default:slack:T1"] = &routeEntry{sessionID: "sess-a"}
-	sc.routes["default:slack:T2"] = &routeEntry{sessionID: "sess-b"}
+	e1 := &routeEntry{}
+	e1.storeSessionID("sess-a")
+	sc.routes["default:slack:T1"] = e1
+	e2 := &routeEntry{}
+	e2.storeSessionID("sess-b")
+	sc.routes["default:slack:T2"] = e2
 	sc.mu.Unlock()
 
 	sc.ClearSessionBindings("sess-a")
@@ -386,6 +390,46 @@ func TestSessionCache_ClearSessionBindings(t *testing.T) {
 	if got := sc.RouteSessionID("default:slack:T2"); got != "sess-b" {
 		t.Fatalf("untouched route session id = %q, want sess-b", got)
 	}
+}
+
+// TestSessionCache_CancelBySessionID_NoRaceWithRouteSessionWrites runs the
+// cancel-by-session scan concurrently with a runner-style sessionID rotation
+// that holds entry.mu (matching the actual runner flow). With the previous
+// non-atomic field this fails under -race; the atomic.Pointer makes the
+// scan lock-free and race-free.
+func TestSessionCache_CancelBySessionID_NoRaceWithRouteSessionWrites(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	defer sc.CloseAll()
+
+	const targetID = "sess-cancel-target"
+	sc.mu.Lock()
+	entry := &routeEntry{}
+	entry.storeSessionID("sess-initial")
+	sc.routes["agent:rotator"] = entry
+	sc.mu.Unlock()
+
+	done := make(chan struct{})
+	// Writer: rotates sessionID under entry.mu, like the runner does inside
+	// LockRouteWithManager's critical section.
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			entry.mu.Lock()
+			if i%2 == 0 {
+				entry.storeSessionID(targetID)
+			} else {
+				entry.storeSessionID("sess-other")
+			}
+			entry.mu.Unlock()
+		}
+	}()
+
+	// Concurrently scan-and-cancel by sessionID. Pre-fix this raced on
+	// entry.sessionID under sc.mu only.
+	for i := 0; i < 200; i++ {
+		sc.CancelBySessionID(targetID)
+	}
+	<-done
 }
 
 func TestResolveLatestSession_NoRoute(t *testing.T) {

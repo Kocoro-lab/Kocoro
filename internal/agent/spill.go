@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"unicode/utf8"
 )
 
 const (
@@ -79,9 +80,12 @@ func applyAggregateCap(execResults []toolExecResult, shannonDir, sessionID strin
 	if len(execResults) < 2 {
 		return
 	}
+	// Char-count by runes — matches per-result spill (line ~165) and
+	// applyToolResultBudget. len() in bytes overcounts CJK/emoji ~3x and
+	// fires the cap early on multibyte content.
 	total := 0
 	for i := range execResults {
-		total += len(execResults[i].result.Content)
+		total += utf8.RuneCountInString(execResults[i].result.Content)
 	}
 	if total <= aggregateCapThreshold {
 		return
@@ -90,7 +94,7 @@ func applyAggregateCap(execResults []toolExecResult, shannonDir, sessionID strin
 		maxIdx := -1
 		maxLen := 0
 		for i := range execResults {
-			n := len(execResults[i].result.Content)
+			n := utf8.RuneCountInString(execResults[i].result.Content)
 			if n >= minAggregateSpillSize && n > maxLen {
 				maxIdx = i
 				maxLen = n
@@ -105,7 +109,7 @@ func applyAggregateCap(execResults []toolExecResult, shannonDir, sessionID strin
 			return
 		}
 		execResults[maxIdx].result.Content = spilled
-		total = total - len(original) + len(spilled)
+		total = total - utf8.RuneCountInString(original) + utf8.RuneCountInString(spilled)
 	}
 }
 

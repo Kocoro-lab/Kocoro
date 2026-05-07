@@ -156,9 +156,23 @@ func (m *Manager) List() ([]SessionSummary, error) {
 
 func (m *Manager) Delete(id string) error {
 	m.mu.Lock()
+	// Delete under the manager lock so a concurrent Save cannot recreate the
+	// session file between disk removal and clearing m.current/runtime.
+	// If disk delete fails, leave in-memory state and cleanup callbacks intact:
+	// tearing them down would close live per-session resources for a session
+	// the caller can still see and resume.
+	if err := m.store.Delete(id); err != nil {
+		m.mu.Unlock()
+		return err
+	}
 	delete(m.runtime, id)
+	if m.current != nil && m.current.ID == id {
+		m.current = nil
+	}
+	callbacks := m.takeSessionCloseLocked(id)
 	m.mu.Unlock()
-	return m.store.Delete(id)
+	runCallbacks(callbacks)
+	return nil
 }
 
 func (m *Manager) Search(query string, limit int) ([]SearchResult, error) {

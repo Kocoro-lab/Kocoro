@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -23,12 +24,29 @@ type routeEntry struct {
 	cancel        context.CancelFunc
 	cancelPending bool // set under sc.mu when CancelRoute fires before cancel is assigned
 	done          chan struct{}
-	sessionID     string
-	lastAccess    time.Time
-	injectCh      chan agent.InjectedMessage // buffered channel for mid-run follow-up injection
-	activeCWD     string
-	evicting      bool
-	manager       *session.Manager
+	// sessionID is atomic so CancelBySessionID can scan all routes without
+	// blocking on entry.mu held by an active run. Writers in the runner
+	// already hold entry.mu (per the resume invariant); the atomic only
+	// adds memory-order visibility for the lock-free reader.
+	sessionID  atomic.Pointer[string]
+	lastAccess time.Time
+	injectCh   chan agent.InjectedMessage // buffered channel for mid-run follow-up injection
+	activeCWD  string
+	evicting   bool
+	manager    *session.Manager
+}
+
+// loadSessionID returns the route's current session ID, or "" if unset.
+func (e *routeEntry) loadSessionID() string {
+	if p := e.sessionID.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// storeSessionID atomically updates the route's session ID.
+func (e *routeEntry) storeSessionID(id string) {
+	e.sessionID.Store(&id)
 }
 
 func cloneSessionSnapshot(sess *session.Session) *session.Session {
@@ -242,7 +260,7 @@ func (sc *SessionCache) SetRouteSessionID(key, sessionID string) {
 		return
 	}
 	entry.mu.Lock()
-	entry.sessionID = sessionID
+	entry.storeSessionID(sessionID)
 	entry.mu.Unlock()
 }
 
@@ -254,10 +272,7 @@ func (sc *SessionCache) RouteSessionID(key string) string {
 	if entry == nil {
 		return ""
 	}
-	entry.mu.Lock()
-	sessionID := entry.sessionID
-	entry.mu.Unlock()
-	return sessionID
+	return entry.loadSessionID()
 }
 
 // InjectResult describes the outcome of an InjectMessage call.
@@ -393,7 +408,9 @@ func (sc *SessionCache) CancelBySessionID(sessionID string) {
 	sc.mu.Lock()
 	var cancels []context.CancelFunc
 	for _, entry := range sc.routes {
-		if entry != nil && entry.sessionID == sessionID {
+		// loadSessionID is lock-free; entry.cancel/cancelPending are
+		// protected by sc.mu (per SetRouteCancel's documented invariant).
+		if entry != nil && entry.loadSessionID() == sessionID {
 			if entry.cancel != nil {
 				cancels = append(cancels, entry.cancel)
 			} else {
@@ -411,15 +428,12 @@ func (sc *SessionCache) CancelBySessionID(sessionID string) {
 // that was reset or deleted. Persisted index rows are cleared by the session
 // store; this prevents the live daemon cache from resurrecting the old link.
 //
-// Two-phase locking: snapshot route entry pointers under sc.mu, then clear
-// each binding under its own entry.mu. The runner writes entry.sessionID
-// directly while holding entry.mu (see runner.go:706 and friends), so reading
-// or writing the field anywhere else must also hold entry.mu — taking sc.mu
-// alone is a data race. Holding sc.mu during the per-entry mu.Lock() would
-// also block the global cache while we wait on a long-running route, so we
-// release sc.mu between phases. Reset/delete therefore blocks until any
-// active run on a matching route finishes, which matches the user
-// expectation that "clear" really clears.
+// Two-phase locking: snapshot route entry pointers under sc.mu, then take
+// each entry.mu so the clear blocks until any active run on a matching
+// route finishes — matches the user expectation that "clear" really
+// clears, even if the runner's defer would otherwise re-stamp sessionID
+// after we cleared it. The actual sessionID load/store is atomic, but we
+// keep the entry.mu acquire for ordering with the runner's defer.
 func (sc *SessionCache) ClearSessionBindings(sessionID string) {
 	if sessionID == "" {
 		return
@@ -434,8 +448,8 @@ func (sc *SessionCache) ClearSessionBindings(sessionID string) {
 	sc.mu.Unlock()
 	for _, entry := range entries {
 		entry.mu.Lock()
-		if entry.sessionID == sessionID {
-			entry.sessionID = ""
+		if entry.loadSessionID() == sessionID {
+			entry.storeSessionID("")
 		}
 		entry.mu.Unlock()
 	}

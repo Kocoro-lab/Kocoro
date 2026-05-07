@@ -145,6 +145,38 @@ func TestFileRead_NotFound(t *testing.T) {
 	}
 }
 
+// TestFileRead_OffsetWithoutLimit verifies that an offset-only read slices
+// the lines array before printing — previously the unlimited-read branch
+// printed the whole file with line numbers shifted by `offset`, mislabeling
+// file line 1 as "offset+1".
+func TestFileRead_OffsetWithoutLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ranged.txt")
+	var sb strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&sb, "row-%02d\n", i)
+	}
+	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tool := &FileReadTool{}
+	result, err := tool.Run(context.Background(), `{"path":"`+path+`","offset":15}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %s", result.Content)
+	}
+	// Should contain rows 16..20 only, with correct labels.
+	if !strings.Contains(result.Content, "  16 | row-16") {
+		t.Errorf("expected 'row-16' labeled as line 16, got: %s", result.Content)
+	}
+	// Must NOT contain rows before the offset.
+	if strings.Contains(result.Content, "row-01") || strings.Contains(result.Content, "row-15") {
+		t.Errorf("expected lines before offset to be skipped, got: %s", result.Content)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) > 0 && len(substr) > 0 && indexOf(s, substr) >= 0
 }

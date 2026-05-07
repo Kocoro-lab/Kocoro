@@ -705,10 +705,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			deps.SessionCache.ClearRouteRunState(req.RouteKey)
 			closeRouteDone(routeDone)
 			route.cancel = nil
-			// Set sessionID directly — do NOT call SetRouteSessionID which
-			// would try to acquire route.mu again (same deadlock).
+			// Atomic store — SetRouteSessionID would re-acquire entry.mu
+			// (held by the surrounding LockRouteWithManager) and deadlock.
 			if current := sessMgr.Current(); current != nil {
-				route.sessionID = current.ID
+				route.storeSessionID(current.ID)
 			}
 			deps.SessionCache.UnlockRoute(req.RouteKey)
 		}()
@@ -740,9 +740,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		resumed = true
 	case req.NewSession || req.RouteKey == "":
 		sessMgr.NewSession()
-	case route != nil && route.sessionID != "":
-		if _, err := sessMgr.Resume(route.sessionID); err != nil {
-			log.Printf("daemon: failed to resume routed session %q for %q: %v", route.sessionID, req.RouteKey, err)
+	case route != nil && route.loadSessionID() != "":
+		routedSessionID := route.loadSessionID()
+		if _, err := sessMgr.Resume(routedSessionID); err != nil {
+			log.Printf("daemon: failed to resume routed session %q for %q: %v", routedSessionID, req.RouteKey, err)
 			sessMgr.NewSession()
 		} else {
 			resumed = true
@@ -774,7 +775,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	sess := sessMgr.Current()
 	if route != nil && sess != nil {
-		route.sessionID = sess.ID
+		route.storeSessionID(sess.ID)
 	}
 
 	// Seed pre-loaded history for bypass-routed runs (e.g., heartbeat).
@@ -1121,6 +1122,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// Always set (even nil) to clear paths from a previous run on a reused loop.
 	loop.SetUserFilePaths(extractUserFilePaths(req.Content))
 	sessMgr.OnSessionClose(sess.ID, loop.SpillCleanupFunc())
+	sessionID := sess.ID
+	sessMgr.OnSessionClose(sessionID, func() { deps.ReadTrackerCache.Forget(sessionID) })
 
 	// file:// preview bridge: lazily-started loopback HTTP server that
 	// rewrites browser_navigate(file://...) into http://127.0.0.1/<token>/…
@@ -1214,6 +1217,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				session.MessageMeta{Source: req.Source, Timestamp: session.TimePtr(time.Now())},
 			)
 			applyTurnUsage(sess, turnUsage, turnBase)
+			// Persist tool-result budget state so dedup/replacement bookkeeping
+			// from this crashed turn survives resume; mid-turn checkpoints
+			// already update it via applyTurnState, but a turn can fail before
+			// the first checkpoint fires.
+			sess.ToolResultReplacements = loop.ToolResultReplacements()
+			sess.ToolResultSeen = loop.ToolResultSeen()
 			sess.InProgress = false // hard-error path: turn is over, clear marker
 			if err := sessMgr.Save(); err != nil {
 				log.Printf("daemon: failed to save error session: %v", err)
@@ -1287,7 +1296,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			)
 		}
 		applyTurnUsage(sess, turnUsage, turnBase) // idempotent: baseline + current
-		sess.InProgress = false                   // turn completed — clear mid-turn crash marker
+		// Persist tool-result budget state. Mid-turn checkpoints (applyTurnState)
+		// also update these, but a fast turn that finishes before the first
+		// checkpoint fires would otherwise lose new dedup/replacement entries.
+		sess.ToolResultReplacements = loop.ToolResultReplacements()
+		sess.ToolResultSeen = loop.ToolResultSeen()
+		sess.InProgress = false // turn completed — clear mid-turn crash marker
 		saveErr = sessMgr.Save()
 		if saveErr != nil {
 			log.Printf("daemon: failed to save session: %v", saveErr)
@@ -1459,7 +1473,7 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 			deps.SessionCache.ClearRouteRunState(req.RouteKey)
 			closeRouteDone(routeDone)
 			if current := sessMgr.Current(); current != nil {
-				route.sessionID = current.ID
+				route.storeSessionID(current.ID)
 			}
 			deps.SessionCache.UnlockRoute(req.RouteKey)
 		}()
@@ -1481,13 +1495,14 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		}
 	case req.NewSession || req.RouteKey == "":
 		sessMgr.NewSession()
-	case route != nil && route.sessionID != "":
+	case route != nil && route.loadSessionID() != "":
 		// Warm resume: a prior run on this route stored its session ID; reuse it
 		// so subsequent slash calls on the same routed lane (default:source:channel
 		// or agent:foo) append to one continuous local transcript instead of
 		// forking a fresh session each time.
-		if _, err := sessMgr.Resume(route.sessionID); err != nil {
-			log.Printf("daemon: failed to resume routed session %q for %q: %v", route.sessionID, req.RouteKey, err)
+		warmSessionID := route.loadSessionID()
+		if _, err := sessMgr.Resume(warmSessionID); err != nil {
+			log.Printf("daemon: failed to resume routed session %q for %q: %v", warmSessionID, req.RouteKey, err)
 			sessMgr.NewSession()
 		}
 	case shouldPersistRouteKey(req.RouteKey):
@@ -1512,7 +1527,7 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 	}
 	sess := sessMgr.Current()
 	if route != nil && sess != nil {
-		route.sessionID = sess.ID
+		route.storeSessionID(sess.ID)
 	}
 
 	// Stamp session metadata before persisting — mirrors runner.go:791-803.

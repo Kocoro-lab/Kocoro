@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestSpillToDisk_RejectsEmptyShannonDir is the regression for the bug
@@ -247,6 +248,35 @@ func TestApplyAggregateCap_MixedSizes(t *testing.T) {
 	}
 	if total > aggregateCapThreshold {
 		t.Errorf("total after cap (%d) still exceeds threshold (%d)", total, aggregateCapThreshold)
+	}
+}
+
+// TestApplyAggregateCap_MultibyteUsesRunes: pick CJK content sized so the
+// rune total is BELOW the 200K cap but the byte total is ABOVE it. With
+// the byte-counting bug the cap fires and a result gets spilled; with the
+// rune fix it must NOT fire. Asserts no spill happened.
+func TestApplyAggregateCap_MultibyteUsesRunes(t *testing.T) {
+	dir := t.TempDir()
+	// "漢" = 3 bytes in UTF-8. 20K runes per result × 4 = 80K runes (< 200K cap),
+	// but 60K bytes per result × 4 = 240K bytes (> 200K cap). The byte-counting
+	// bug would spill at least one result; the rune fix leaves all four intact.
+	cjk := strings.Repeat("漢", 20_000)
+	results := []toolExecResult{
+		{result: ToolResult{Content: cjk}},
+		{result: ToolResult{Content: cjk}},
+		{result: ToolResult{Content: cjk}},
+		{result: ToolResult{Content: cjk}},
+	}
+	applyAggregateCap(results, dir, "test-sess-cjk-under-cap")
+	for i, er := range results {
+		if strings.HasPrefix(er.result.Content, "[Output saved to disk:") {
+			t.Errorf("result %d was spilled despite rune total (%d) < cap (%d) — byte-counting bug regressed",
+				i, utf8.RuneCountInString(cjk)*len(results), aggregateCapThreshold)
+		}
+		if utf8.RuneCountInString(er.result.Content) != 20_000 {
+			t.Errorf("result %d content was modified; len(runes)=%d, want 20000",
+				i, utf8.RuneCountInString(er.result.Content))
+		}
 	}
 }
 
