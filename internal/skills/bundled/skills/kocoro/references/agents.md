@@ -21,7 +21,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Path: /agents
 - Body: `{"name": "my-agent", "prompt": "You are a helpful assistant that..."}`
 - Response: `{"name":"...","prompt":"...","memory":null,"config":null,"commands":null,"skills":null,"builtin":false,"overridden":false}`
-- Notes: Name must match `^[a-z0-9][a-z0-9_-]{0,63}$` — lowercase letters, numbers, hyphens, underscores only. No spaces.
+- Notes: Name must match `^[a-z0-9][a-z0-9_-]{0,63}$` — lowercase ASCII letters, numbers, hyphens, underscores only. No spaces, no non-ASCII characters. **Pass the user's slug verbatim — never translate or transliterate.** See "Name discipline" below.
 
 ### Update agent prompt / instructions
 - Method: PUT
@@ -87,6 +87,8 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 ## Safety Notes
 
 - **Name format**: Names must be `^[a-z0-9][a-z0-9_-]{0,63}$`. Use hyphens or underscores instead of spaces. Invalid names are rejected.
+- **Name discipline — use the user's slug verbatim**: When the user supplies a name (e.g. `da-pangxie`, `nihon-cha`, `mon-ami`, `kak-dela`), pass it to the API byte-for-byte as typed. **Never translate, transliterate, or "normalize" it into the source language's native script** — do not turn Pinyin into Chinese characters (`da-pangxie` → `大螃蟹`), Romaji into kana/kanji (`nihon-cha` → `日本茶`), Arabic transliteration into Arabic script, Cyrillic transliteration into Cyrillic, etc. The `name` field is an opaque ASCII identifier, not a translatable label. The user's exact bytes are what they expect to see when listing or referring to the agent later.
+- **What to do when the user's input is non-ASCII**: If the user provides a name containing non-ASCII characters (e.g. `大螃蟹`, `日本茶`, `сергей`), uppercase letters, or spaces, the API will reject it. Ask the user to provide a valid slug — do **not** silently slugify, transliterate, or guess. They may want a specific romanization that you would not pick correctly on your own.
 - **Deletion is permanent**: Agent configuration, instructions, and memory are deleted. Sessions in `~/.shannon/sessions/` are not deleted.
 - **`?confirm=true` required**: DELETE without this parameter returns an error, preventing accidental deletion.
 - **Config changes take effect immediately**: No restart needed. The next conversation with the agent uses the new settings.
