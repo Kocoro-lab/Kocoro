@@ -176,10 +176,12 @@ Unknown tools are denied by default. The always-ask gate runs BEFORE the allowli
 ### Daemon Architecture
 
 - Daemon connects to Shannon Cloud via WebSocket, receives channel messages, and runs the agent loop locally.
-- Route keys are computed as:
-  - `agent:<name>` for agent-scoped sessions
+- Route keys are computed as (precedence: top wins):
   - `session:<id>` for explicit session resume
-  - `default:<source>:<channel>` for routed channel sessions
+  - `default:<source>:<thread>` (or `agent:<name>:<source>:<thread>`) for messaging platforms with a thread
+  - `default:<source>:<channel>:<sender>` (or `agent:<name>:<source>:<channel>:<sender>`) for messaging platforms without a thread but with a sender — splits per-user so concurrent senders in a shared channel don't collide on one session
+  - `agent:<name>` for agent-scoped sessions
+  - `default:<source>:<channel>` legacy fallback (no thread, no sender)
 - Routed managers are long-lived. Ephemeral runs (for example bypass/heartbeat paths) use short-lived managers.
 - Output formatting uses profiles, not per-channel syntax:
   - `markdown` is the default

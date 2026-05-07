@@ -110,6 +110,16 @@ func ComputeRouteKey(req RunAgentRequest) string {
 		}
 		return "default:" + sanitizeRouteValue(req.Source) + ":" + sanitizeRouteValue(req.ThreadID)
 	}
+	// Messaging platform without thread but with sender: suffix sender so
+	// concurrent users in a shared channel don't collide on one session.
+	// Group channels that want a single shared session must use a thread,
+	// which the thread-scoped branch above handles.
+	if IsMessagingPlatform(req.Source) && req.Sender != "" {
+		if req.Agent != "" {
+			return "agent:" + req.Agent + ":" + sanitizeRouteValue(req.Source) + ":" + sanitizeRouteValue(req.Channel) + ":" + sanitizeRouteValue(req.Sender)
+		}
+		return "default:" + sanitizeRouteValue(req.Source) + ":" + sanitizeRouteValue(req.Channel) + ":" + sanitizeRouteValue(req.Sender)
+	}
 	if req.Agent != "" {
 		return "agent:" + req.Agent
 	}

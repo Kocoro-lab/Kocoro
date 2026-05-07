@@ -196,7 +196,7 @@ Unknown tools → denied by default (fail-safe). The always-ask gate runs BEFORE
 
 ### Daemon Architecture (Production Path)
 - Daemon connects to Shannon Cloud via WebSocket, receives channel messages, runs agent loop locally.
-- **Session routing**: `SessionCache` with per-route locking. Route key = `agent:<name>`, `session:<id>`, or `default:<source>:<channel>`. Web/webhook/cron/schedule sources bypass routing (always fresh). Routed managers are long-lived; ephemeral managers (heartbeat, bypass) get `defer Close()`.
+- **Session routing**: `SessionCache` with per-route locking. `ComputeRouteKey` precedence (top wins): `session:<id>` → messaging+thread `default:<source>:<thread>` (or `agent:<name>:<source>:<thread>`) → messaging+sender `default:<source>:<channel>:<sender>` (or `agent:<name>:<source>:<channel>:<sender>`, splits per-user when no thread is present so concurrent senders in a shared channel don't collide) → `agent:<name>` → `default:<source>:<channel>`. Web/webhook/cron/schedule sources bypass routing (always fresh). Routed managers are long-lived; ephemeral managers (heartbeat, bypass) get `defer Close()`.
 - **Output format profiles**: `outputFormatForSource()` maps `req.Source` to `"markdown"` (default) or `"plain"` (cloud-distributed channels: slack, line, feishu, lark, telegram, webhook). Cloud owns final channel rendering — ShanClaw outputs neutral text for those paths.
 - **Tool status events**: `OnToolCall("running")` fires at actual execution start (inside `executeBatches`, after semaphore acquire), not during permission checks.
 - **Tool result sizing** (`internal/agent/spill.go` + `toolresult_budget.go` + `context_bloat.go`): three layered caps protect the context window.

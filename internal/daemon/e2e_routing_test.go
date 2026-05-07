@@ -91,6 +91,26 @@ func TestE2E_RouteKeyComputation(t *testing.T) {
 			req:      RunAgentRequest{Text: "hi", Source: "shanclaw", SessionID: "sess-xyz"},
 			expected: "session:sess-xyz",
 		},
+		{
+			name:     "slack channel with sender splits per-user",
+			req:      RunAgentRequest{Text: "hi", Source: "slack", Channel: "C123", Sender: "U-alice"},
+			expected: "default:slack:C123:U-alice",
+		},
+		{
+			name:     "slack named agent channel with sender splits per-user",
+			req:      RunAgentRequest{Text: "hi", Agent: "ops-bot", Source: "slack", Channel: "C123", Sender: "U-alice"},
+			expected: "agent:ops-bot:slack:C123:U-alice",
+		},
+		{
+			name:     "slack thread takes precedence over sender",
+			req:      RunAgentRequest{Text: "hi", Source: "slack", Channel: "C123", ThreadID: "T-9", Sender: "U-alice"},
+			expected: "default:slack:T-9",
+		},
+		{
+			name:     "slack channel without sender keeps legacy key",
+			req:      RunAgentRequest{Text: "hi", Source: "slack", Channel: "C123"},
+			expected: "default:slack:C123",
+		},
 	}
 
 	for _, tt := range tests {
@@ -128,6 +148,16 @@ func TestE2E_MessagingThreadRoutesDoNotInjectAcrossThreads(t *testing.T) {
 			name: "wecom group and dm named agent",
 			a:    RunAgentRequest{Agent: "ops-bot", Source: ChannelWeCom, Channel: ChannelWeCom, ThreadID: "g:group-a"},
 			b:    RunAgentRequest{Agent: "ops-bot", Source: ChannelWeCom, Channel: ChannelWeCom, ThreadID: "u:user-a"},
+		},
+		{
+			name: "slack same channel two senders default agent",
+			a:    RunAgentRequest{Source: ChannelSlack, Channel: "C123", Sender: "U-alice"},
+			b:    RunAgentRequest{Source: ChannelSlack, Channel: "C123", Sender: "U-bob"},
+		},
+		{
+			name: "slack same channel two senders named agent",
+			a:    RunAgentRequest{Agent: "ops-bot", Source: ChannelSlack, Channel: "C123", Sender: "U-alice"},
+			b:    RunAgentRequest{Agent: "ops-bot", Source: ChannelSlack, Channel: "C123", Sender: "U-bob"},
 		},
 	}
 
