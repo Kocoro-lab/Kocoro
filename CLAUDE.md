@@ -108,7 +108,8 @@ internal/
     server.go          # MCP server (JSON-RPC 2.0 over stdio)
     chrome.go          # Playwright Chrome profile/CDP lifecycle management
   runstatus/
-    runstatus.go       # user-facing run state/error classification
+    runstatus.go       # user-facing run state/error classification (Code constants, friendlyMessages, FriendlyMessageFromError)
+    parse.go           # gateway *client.APIError → (Code, Detail) extractor; parse429 disambiguates the four 429 sub-shapes (quota / credits / throttle / upstream)
   skills/
     registry.go        # Skill struct (Anthropic spec), SkillMeta DTO, SecretSpec, RequiredSecrets()
     loader.go          # LoadSkills from SKILL.md dirs (source-order merge; usually global > bundled)

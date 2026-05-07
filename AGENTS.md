@@ -107,7 +107,8 @@ internal/
     server.go          # MCP server
     chrome.go          # Playwright Chrome profile/CDP lifecycle management
   runstatus/
-    runstatus.go       # user-facing run state/error classification
+    runstatus.go       # user-facing run state/error classification (Code constants, friendlyMessages, FriendlyMessageFromError)
+    parse.go           # gateway *client.APIError → (Code, Detail) extractor; disambiguates the four 429 sub-shapes
   schedule/
     schedule.go        # schedule CRUD, atomic writes, validation
     launchd_darwin.go  # plist generation, launchctl

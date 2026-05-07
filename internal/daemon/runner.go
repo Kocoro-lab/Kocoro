@@ -1777,6 +1777,10 @@ func applyTurnState(sess *session.Session, loop *agent.AgentLoop,
 
 // FriendlyAgentError maps raw agent errors to user-facing messages.
 // Full error detail is logged separately; this keeps session/UI clean.
+// Uses FriendlyMessageFromError so 429 sub-codes (quota / credits /
+// throttle / upstream) yield the right user message instead of the
+// generic "try again in a moment" — quota holders get told when the
+// quota resets, credits-exhausted users get told to top up.
 func FriendlyAgentError(err error) string {
-	return runstatus.FriendlyMessage(runstatus.CodeFromError(err))
+	return runstatus.FriendlyMessageFromError(err)
 }
