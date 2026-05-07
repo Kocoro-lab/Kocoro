@@ -2379,17 +2379,15 @@ func (h *tuiEventHandler) OnToolResult(name string, args string, result agent.To
 }
 
 func (h *tuiEventHandler) OnText(text string) {
-	// Mid-turn agent narration (preamble + state-transition updates) — render
-	// inline through the Bubbletea event loop so the user sees the agent's
-	// "what I'm about to do" text between tool calls. Triggered by the
-	// tool-call branch in AgentLoop.Run (loop.go ~line 2491) AND by the
-	// no-tool-call exit branch with the final answer text (loop.go ~line 2469).
-	// For the final-answer call, agentDoneMsg also renders the same text;
-	// callers may observe a duplicate trailing line in scroll history. The
-	// previous no-op stub avoided this by relying on agentDoneMsg as the sole
-	// renderer, but that also dropped every preamble silently — a worse UX.
-	// If the duplicate becomes problematic, dedup by tracking lastText here
-	// and skipping the agentDoneMsg render when it matches.
+	// Final-answer rendering happens in agentDoneMsg (app.go ~line 1037) which
+	// uses the markdown renderer. Rendering here would double the output.
+}
+
+// OnPreamble renders mid-turn agent narration (preamble emitted alongside
+// native tool_use blocks) inline through the Bubbletea event loop, so the
+// user sees the agent's "what I'm about to do" text between tool calls.
+// Triggered by the tool-call branch in AgentLoop.Run (loop.go ~line 2499).
+func (h *tuiEventHandler) OnPreamble(text string) {
 	if text == "" {
 		return
 	}

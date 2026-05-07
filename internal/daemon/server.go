@@ -1332,6 +1332,7 @@ func (h *httpEventHandler) OnToolResult(name string, args string, result agent.T
 	log.Printf("http: tool %s completed (%.1fs)", name, elapsed.Seconds())
 }
 func (h *httpEventHandler) OnText(text string)            {}
+func (h *httpEventHandler) OnPreamble(text string)        {}
 func (h *httpEventHandler) OnStreamDelta(delta string)    {}
 func (h *httpEventHandler) OnUsage(usage agent.TurnUsage) { h.usage.Add(usage) }
 
@@ -1392,10 +1393,17 @@ func (h *sseEventHandler) OnToolResult(name string, args string, result agent.To
 	h.flusher.Flush()
 }
 
-// OnText streams mid-turn agent narration to the per-request SSE client
-// (HTTP POST /messages with stream=true). Mirrors busEventHandler.OnText so
-// HTTP-stream subscribers see the same preamble events as EventBus subscribers.
-func (h *sseEventHandler) OnText(text string) {
+// OnText is a no-op on the per-request SSE path: the final-answer text is
+// delivered to the HTTP /messages stream client via the trailing
+// `event: done` payload (handleMessageSSE / handleSlashSSE), so an extra
+// `assistant_text` event would duplicate it. Mid-turn preamble flows through
+// OnPreamble below.
+func (h *sseEventHandler) OnText(text string) {}
+
+// OnPreamble streams mid-turn agent narration to the per-request SSE client
+// (HTTP POST /messages with stream=true). Mirrors busEventHandler.OnPreamble
+// so HTTP-stream subscribers see the same preamble events as EventBus subscribers.
+func (h *sseEventHandler) OnPreamble(text string) {
 	if text == "" {
 		return
 	}

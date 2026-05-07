@@ -342,6 +342,7 @@ func (h *mockHandler) OnToolCall(name string, args string) {}
 func (h *mockHandler) OnToolResult(name string, args string, result ToolResult, elapsed time.Duration) {
 }
 func (h *mockHandler) OnText(text string)                                     { h.lastText = text }
+func (h *mockHandler) OnPreamble(text string)                                 { h.lastText = text }
 func (h *mockHandler) OnStreamDelta(delta string)                             {}
 func (h *mockHandler) OnUsage(usage TurnUsage)                                {}
 func (h *mockHandler) OnCloudAgent(agentID, status, message string)           {}
@@ -2874,6 +2875,7 @@ func (h *cloudDelegateHandler) OnToolResult(name string, args string, result Too
 	h.results = append(h.results, cloudDelegateResult{name: name, content: result.Content, isError: result.IsError})
 }
 func (h *cloudDelegateHandler) OnText(text string)                                     {}
+func (h *cloudDelegateHandler) OnPreamble(text string)                                 {}
 func (h *cloudDelegateHandler) OnStreamDelta(delta string)                             {}
 func (h *cloudDelegateHandler) OnUsage(usage TurnUsage)                                {}
 func (h *cloudDelegateHandler) OnCloudAgent(agentID, status, message string)           {}
@@ -4453,15 +4455,16 @@ func TestTemporalDelta_CheckIsPureAndIdempotent(t *testing.T) {
 	}
 }
 
-// preambleHandler accumulates every OnText / OnToolCall invocation. Used by
-// TestAgentLoop_ToolCallBranch_TriggersOnText to assert that a real preamble
-// emitted alongside tool calls reaches OnText (and therefore the daemon's
-// LLM_OUTPUT WS event in production). Distinct from mockHandler (only stores
+// preambleHandler accumulates every OnText / OnPreamble / OnToolCall invocation.
+// Tracks the two text channels separately so tests can assert the agent loop
+// routes preamble through OnPreamble and final answer through OnText, rather
+// than collapsing both into one bucket. Distinct from mockHandler (only stores
 // the last text) because we need the full call history. Distinct from the
 // existing recordingHandler (in watchdog_integration_test.go, focused on
 // OnRunStatus) so the two don't collide.
 type preambleHandler struct {
 	textCalls     []string
+	preambleCalls []string
 	toolCallCount int
 }
 
@@ -4470,6 +4473,9 @@ func (h *preambleHandler) OnToolResult(name string, args string, result ToolResu
 }
 func (h *preambleHandler) OnText(text string) {
 	h.textCalls = append(h.textCalls, text)
+}
+func (h *preambleHandler) OnPreamble(text string) {
+	h.preambleCalls = append(h.preambleCalls, text)
 }
 func (h *preambleHandler) OnStreamDelta(delta string)                             {}
 func (h *preambleHandler) OnUsage(usage TurnUsage)                                {}
@@ -4480,17 +4486,15 @@ func (h *preambleHandler) OnApprovalNeeded(tool string, args string) bool       
 
 // TestAgentLoop_ToolCallBranch_TriggersOnText is the load-bearing test for
 // the gap-#2 fix in the spec: when the model emits a real preamble alongside
-// native tool_use blocks, the agent loop must invoke handler.OnText so the
-// daemon forwards LLM_OUTPUT to Cloud.
+// native tool_use blocks, the agent loop must invoke handler.OnPreamble so
+// the daemon forwards LLM_OUTPUT to Cloud and SSE clients label the text as
+// `assistant_text`. The final answer (no-tool-call exit) goes through OnText
+// instead so transports can route the two semantically.
 //
-// Before the fix, OnText is called only on the no-tool-call exit branch
-// (loop.go:2469), so users on Slack/Feishu never see the preamble even
-// though the LLM did emit one. After the fix, OnText fires inside the
-// tool-call branch when normalizedToolText != "".
-//
-// normalizeStructuredToolCallPreamble already strips serialized-tool-call
-// pseudo-preambles (returning ""), so the new OnText call is safe — it
-// only fires for real preamble text.
+// Pre-fix history: OnText was called only on the no-tool-call exit branch,
+// so Slack/Feishu users never saw the preamble. The first iteration of the
+// fix also fired OnText for preamble, which conflated the two semantics.
+// This test pins the final shape: preamble → OnPreamble, final → OnText.
 func TestAgentLoop_ToolCallBranch_TriggersOnText(t *testing.T) {
 	const preamble = "Reading the four files in parallel."
 	callCount := 0
@@ -4524,19 +4528,37 @@ func TestAgentLoop_ToolCallBranch_TriggersOnText(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Assert: preamble reached OnText. We expect at least 2 OnText calls —
-	// one from the tool-call branch (preamble) and one from the no-tool-call
-	// terminating branch ("All four files read."). The tool-call-branch
-	// preamble must be one of them.
+	// Assert: preamble reached OnPreamble (NOT OnText). Final answer ("All
+	// four files read.") reaches OnText. Routing both through the same
+	// callback would let SSE/bus transports double-render the final answer
+	// as both `assistant_text` and `agent_reply`.
 	foundPreamble := false
-	for _, txt := range handler.textCalls {
+	for _, txt := range handler.preambleCalls {
 		if txt == preamble {
 			foundPreamble = true
 			break
 		}
 	}
 	if !foundPreamble {
-		t.Fatalf("expected OnText to be invoked with preamble %q in tool-call branch.\nAll OnText calls: %#v", preamble, handler.textCalls)
+		t.Fatalf("expected OnPreamble to be invoked with preamble %q in tool-call branch.\nOnPreamble calls: %#v\nOnText calls: %#v",
+			preamble, handler.preambleCalls, handler.textCalls)
+	}
+	for _, txt := range handler.textCalls {
+		if txt == preamble {
+			t.Fatalf("preamble %q leaked into OnText — must route through OnPreamble only.\nOnText calls: %#v",
+				preamble, handler.textCalls)
+		}
+	}
+	const finalAnswer = "All four files read."
+	foundFinal := false
+	for _, txt := range handler.textCalls {
+		if txt == finalAnswer {
+			foundFinal = true
+			break
+		}
+	}
+	if !foundFinal {
+		t.Fatalf("expected final answer %q to reach OnText. OnText calls: %#v", finalAnswer, handler.textCalls)
 	}
 
 	// Assert: the tool was invoked exactly once (sanity — confirms we hit

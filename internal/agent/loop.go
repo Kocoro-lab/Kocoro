@@ -369,7 +369,16 @@ func (a *AgentLoop) reportLLMUsage(u client.Usage, model string) {
 type EventHandler interface {
 	OnToolCall(name string, args string)
 	OnToolResult(name string, args string, result ToolResult, elapsed time.Duration)
+	// OnText is fired for the model's final answer text (no-tool-call exit,
+	// force-stop synthesis, cloud_delegate single-tool bypass). Mid-turn
+	// narration emitted alongside tool_use blocks goes to OnPreamble instead
+	// so transports can route the two semantically.
 	OnText(text string)
+	// OnPreamble is fired when the model emits a text block alongside native
+	// tool_use blocks — i.e. mid-turn narration ("I'll read these files now").
+	// Distinct from OnText so SSE/bus transports can label it as
+	// `assistant_text` while keeping the final answer on `agent_reply`.
+	OnPreamble(text string)
 	OnStreamDelta(delta string)
 	OnApprovalNeeded(tool string, args string) bool
 	OnUsage(usage TurnUsage)
@@ -2488,15 +2497,14 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		normalizedToolText := normalizeStructuredToolCallPreamble(resp.OutputText, toolCalls)
 		if normalizedToolText != "" {
 			lastText = normalizedToolText
-			// Forward real preamble to handlers (TUI / daemon LLM_OUTPUT).
-			// The normalize step above already returns "" for serialized
-			// tool-call pseudo-preambles, so we only fire OnText for genuine
-			// user-facing text. Reverses prior suppression behavior; see
-			// docs/superpowers/specs/2026-05-07-agent-preamble-output-design.md
-			// (D6) and the AGENTS.md / CLAUDE.md "Preamble suppressed" notes
-			// (those docs are tracked for sync as a follow-up PR).
+			// Forward real preamble to handlers via OnPreamble (TUI inline
+			// render, daemon LLM_OUTPUT, SSE assistant_text). normalize above
+			// returns "" for serialized tool-call pseudo-preambles, so this
+			// only fires for genuine user-facing text. OnText is reserved for
+			// final-answer paths (1625/2469/3012) so transports can label
+			// "mid-turn narration" vs "final answer" correctly.
 			if a.handler != nil {
-				a.handler.OnText(normalizedToolText)
+				a.handler.OnPreamble(normalizedToolText)
 			}
 		}
 

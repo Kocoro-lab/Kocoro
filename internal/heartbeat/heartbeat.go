@@ -323,6 +323,12 @@ func (tc *TranscriptCollector) OnToolResult(name string, args string, result age
 func (tc *TranscriptCollector) OnText(text string) {
 	tc.Messages = append(tc.Messages, client.Message{Role: "assistant", Content: client.NewTextContent(text)})
 }
+
+// OnPreamble is a no-op: the assistant message containing the preamble + tool_use
+// blocks is already captured into tc.Messages by the agent loop's history
+// recording path. Appending here would duplicate the preamble inside the
+// transcript that heartbeat ships to Cloud.
+func (tc *TranscriptCollector) OnPreamble(text string)                                 {}
 func (tc *TranscriptCollector) OnStreamDelta(delta string)                             {}
 func (tc *TranscriptCollector) OnUsage(usage agent.TurnUsage)                          { tc.usage.Add(usage) }
 func (tc *TranscriptCollector) OnCloudAgent(agentID, status, message string)           {}

@@ -12,6 +12,7 @@ type spyHandler struct {
 	toolCalls      int
 	toolResults    int
 	text           int
+	preamble       int
 	streamDelta    int
 	approvalCalls  int
 	approvalReturn bool // what OnApprovalNeeded returns
@@ -26,6 +27,7 @@ func (s *spyHandler) OnToolResult(name, args string, r agent.ToolResult, e time.
 	s.toolResults++
 }
 func (s *spyHandler) OnText(t string)        { s.text++ }
+func (s *spyHandler) OnPreamble(t string)    { s.preamble++ }
 func (s *spyHandler) OnStreamDelta(d string) { s.streamDelta++ }
 func (s *spyHandler) OnApprovalNeeded(t, a string) bool {
 	s.approvalCalls++

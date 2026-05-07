@@ -44,6 +44,7 @@ type captureHandler struct {
 func (c *captureHandler) OnToolCall(name, args string)                                                   {}
 func (c *captureHandler) OnToolResult(name, args string, result agent.ToolResult, elapsed time.Duration) {}
 func (c *captureHandler) OnText(text string)                                                             {}
+func (c *captureHandler) OnPreamble(text string)                                                         {}
 func (c *captureHandler) OnStreamDelta(d string)                                                         { c.streamDeltas = append(c.streamDeltas, d) }
 func (c *captureHandler) OnApprovalNeeded(tool, args string) bool                                        { return true }
 func (c *captureHandler) OnUsage(u agent.TurnUsage)                                                      { c.finalUsage = u }

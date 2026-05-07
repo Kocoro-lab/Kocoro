@@ -625,6 +625,18 @@ func (h *daemonEventHandler) OnText(text string) {
 		}
 	}
 }
+
+// OnPreamble forwards mid-turn narration to Cloud over the same LLM_OUTPUT WS
+// event used for final-answer text. Cloud distinguishes "preamble vs final" by
+// the surrounding TOOL_RUNNING / TOOL_COMPLETED frames, so reusing the same
+// wire event preserves the existing channel rendering on Slack/Feishu/etc.
+func (h *daemonEventHandler) OnPreamble(text string) {
+	if h.wsClient != nil && h.messageID != "" {
+		if err := h.wsClient.SendEvent(h.messageID, "LLM_OUTPUT", text, nil); err != nil {
+			log.Printf("daemon: event forward failed: %v", err)
+		}
+	}
+}
 func (h *daemonEventHandler) OnStreamDelta(delta string) {
 	if h.wsClient != nil && h.messageID != "" {
 		if err := h.wsClient.SendEvent(h.messageID, "LLM_PARTIAL", delta, nil); err != nil {
@@ -718,6 +730,7 @@ func (h *autoApproveHandler) OnToolResult(name string, args string, result agent
 	log.Printf("daemon: tool %s completed (%.1fs)", name, elapsed.Seconds())
 }
 func (h *autoApproveHandler) OnText(text string)                                     {}
+func (h *autoApproveHandler) OnPreamble(text string)                                 {}
 func (h *autoApproveHandler) OnStreamDelta(delta string)                             {}
 func (h *autoApproveHandler) OnUsage(usage agent.TurnUsage)                          { h.usage.Add(usage) }
 func (h *autoApproveHandler) OnCloudAgent(agentID, status, message string)           {}

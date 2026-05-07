@@ -36,6 +36,12 @@ func (m *multiHandler) OnText(text string) {
 	}
 }
 
+func (m *multiHandler) OnPreamble(text string) {
+	for _, h := range m.handlers {
+		h.OnPreamble(text)
+	}
+}
+
 func (m *multiHandler) OnStreamDelta(delta string) {
 	for _, h := range m.handlers {
 		h.OnStreamDelta(delta)

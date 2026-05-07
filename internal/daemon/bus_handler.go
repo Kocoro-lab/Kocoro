@@ -24,13 +24,17 @@ type busEventHandler struct {
 // event carries it. Matches the optional interface checked by RunAgent.
 func (h *busEventHandler) SetSessionID(id string) { h.sessionID = id }
 
-// OnText emits mid-turn agent narration (preamble + state-transition updates) to the bus
-// so SSE subscribers (Desktop, web UIs) can render the text inline between tool calls.
-// Empty text is dropped — defensive: the agent loop only calls OnText after
-// normalizeStructuredToolCallPreamble filtered serialized-tool-call pseudo-preambles,
-// but a defense-in-depth check costs nothing. Final-answer text reaches Desktop via
-// EventAgentReply; this event is exclusively for the in-progress narration.
-func (h *busEventHandler) OnText(text string) {
+// OnText is a no-op on the bus path: final-answer text reaches Desktop via
+// EventAgentReply (emitted by runner.go), so duplicating it on EventAssistantText
+// would render the same answer twice in the client. Mid-turn preamble flows
+// through OnPreamble below.
+func (h *busEventHandler) OnText(text string) {}
+
+// OnPreamble emits mid-turn agent narration (preamble emitted alongside native
+// tool_use blocks) to the bus so SSE subscribers (Desktop, web UIs) can render
+// the text inline between tool calls. Empty text is dropped defensively even
+// though the agent loop already filters serialized-tool-call pseudo-preambles.
+func (h *busEventHandler) OnPreamble(text string) {
 	if text == "" {
 		return
 	}

@@ -452,7 +452,8 @@ func (h *cliEventHandler) OnToolResult(name string, args string, result agent.To
 	fmt.Printf("  ⏵ %s(%s)  %s%s\n", name, keyArg, icon, brief)
 }
 
-func (h *cliEventHandler) OnText(text string) {}
+func (h *cliEventHandler) OnText(text string)     {}
+func (h *cliEventHandler) OnPreamble(text string) {}
 
 func (h *cliEventHandler) OnStreamDelta(delta string) {
 	fmt.Print(delta)
