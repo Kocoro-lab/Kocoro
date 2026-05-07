@@ -249,12 +249,29 @@ func safeToolResultBudgetID(toolUseID string) string {
 	return safe
 }
 
+// safeSpillSessionID strips any character that could escape the spill
+// directory when concatenated into a filename. Session IDs come from
+// generateID() (`YYYY-MM-DD-<hex>`), but Manager.Resume accepts
+// caller-supplied IDs — defense-in-depth keeps a malicious `id="../../etc"`
+// from traversing out of `~/.shannon/tmp`.
+func safeSpillSessionID(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return "unknown"
+	}
+	safe := unsafeToolResultFilenameChars.ReplaceAllString(sessionID, "_")
+	if len(safe) > 120 {
+		safe = safe[:120]
+	}
+	return safe
+}
+
 func toolResultReplacementPath(opts ToolResultBudgetOptions, toolUseID string) (string, bool) {
 	if opts.ShannonDir == "" || opts.SessionID == "" {
 		return "", false
 	}
 	dir := filepath.Join(opts.ShannonDir, "tmp")
-	return filepath.Join(dir, fmt.Sprintf("tool_result_%s_%s.txt", opts.SessionID, safeToolResultBudgetID(toolUseID))), true
+	return filepath.Join(dir, fmt.Sprintf("tool_result_%s_%s.txt", safeSpillSessionID(opts.SessionID), safeToolResultBudgetID(toolUseID))), true
 }
 
 func rehydrateStoredToolResultReplacement(opts ToolResultBudgetOptions, toolUseID, content string) error {

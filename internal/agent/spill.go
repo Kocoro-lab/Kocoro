@@ -43,7 +43,7 @@ func spillToDisk(shannonDir, sessionID, callID, content string) (preview string,
 		return "", fmt.Errorf("spill mkdir: %w", err)
 	}
 
-	filename := fmt.Sprintf("tool_result_%s_%s.txt", sessionID, callID)
+	filename := fmt.Sprintf("tool_result_%s_%s.txt", safeSpillSessionID(sessionID), callID)
 	path := filepath.Join(dir, filename)
 
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
@@ -155,7 +155,7 @@ func cleanupSpills(shannonDir, sessionID string) {
 		return
 	}
 	dir := filepath.Join(shannonDir, "tmp")
-	pattern := filepath.Join(dir, fmt.Sprintf("tool_result_%s_*.txt", sessionID))
+	pattern := filepath.Join(dir, fmt.Sprintf("tool_result_%s_*.txt", safeSpillSessionID(sessionID)))
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
 		return

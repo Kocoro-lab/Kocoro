@@ -8,12 +8,15 @@ import (
 )
 
 type ContextBloatOptions struct {
-	RecentToolResultBytes int
+	// TotalToolResultBytes is the per-tool sum threshold (in chars, summed
+	// across the entire message history) above which a context-bloat
+	// suggestion is emitted. Default 20000.
+	TotalToolResultBytes int
 }
 
 func buildContextBloatSuggestion(messages []client.Message, opts ContextBloatOptions) string {
-	if opts.RecentToolResultBytes <= 0 {
-		opts.RecentToolResultBytes = 20000
+	if opts.TotalToolResultBytes <= 0 {
+		opts.TotalToolResultBytes = 20000
 	}
 	nameByID := toolUseNameByID(messages)
 	bytesByTool := make(map[string]int)
@@ -38,7 +41,7 @@ func buildContextBloatSuggestion(messages []client.Message, opts ContextBloatOpt
 	}
 	var pairs []pair
 	for name, n := range bytesByTool {
-		if n >= opts.RecentToolResultBytes {
+		if n >= opts.TotalToolResultBytes {
 			pairs = append(pairs, pair{name: name, n: n})
 		}
 	}

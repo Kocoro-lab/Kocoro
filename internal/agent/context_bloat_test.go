@@ -17,7 +17,7 @@ func TestBuildContextBloatSuggestion_FileReadDominates(t *testing.T) {
 		})},
 	}
 	got := buildContextBloatSuggestion(msgs, ContextBloatOptions{
-		RecentToolResultBytes: 5000,
+		TotalToolResultBytes: 5000,
 	})
 	if !strings.Contains(got, "file_read") || !strings.Contains(got, "offset+limit") {
 		t.Fatalf("unexpected reminder: %q", got)
@@ -33,7 +33,7 @@ func TestBuildContextBloatSuggestion_SmallContextNoop(t *testing.T) {
 			client.NewToolResultBlock("toolu_grep", "short", false),
 		})},
 	}
-	if got := buildContextBloatSuggestion(msgs, ContextBloatOptions{RecentToolResultBytes: 5000}); got != "" {
+	if got := buildContextBloatSuggestion(msgs, ContextBloatOptions{TotalToolResultBytes: 5000}); got != "" {
 		t.Fatalf("expected no reminder, got %q", got)
 	}
 }

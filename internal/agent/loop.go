@@ -449,6 +449,12 @@ type AgentLoop struct {
 	// daemon/TUI callers so resumed sessions replay identical bytes.
 	toolResultReplacements *ToolResultReplacementState
 
+	// toolResultPolicyCache memoizes the tool-name → MaxResultSizeChars map.
+	// Tools are registered once before NewAgentLoop returns and never mutate
+	// during Run(), so iterating tools.All() per LLM call is wasted work in
+	// long loops.
+	toolResultPolicyCache map[string]int
+
 	// Time-based microcompact (see internal/agent/timebasedcompact.go).
 	// Default disabled. When enabled, fires only when (now - lastAssistantAt)
 	// exceeds GapThresholdMinutes — i.e. only when the prompt cache has
@@ -806,6 +812,9 @@ func (a *AgentLoop) toolResultPolicy() map[string]int {
 	if a.tools == nil {
 		return nil
 	}
+	if a.toolResultPolicyCache != nil {
+		return a.toolResultPolicyCache
+	}
 	out := make(map[string]int)
 	for _, tool := range a.tools.All() {
 		info := tool.Info()
@@ -814,6 +823,7 @@ func (a *AgentLoop) toolResultPolicy() map[string]int {
 		}
 		out[info.Name] = info.MaxResultSizeChars
 	}
+	a.toolResultPolicyCache = out
 	return out
 }
 
