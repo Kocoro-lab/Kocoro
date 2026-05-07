@@ -35,7 +35,14 @@ var Version = "dev"
 // Add a token in the same PR that lands the feature it advertises;
 // advertising before implementing causes Cloud to activate flows the
 // daemon cannot satisfy.
-var Capabilities = []string{}
+//
+// "delivery_ack" — daemon emits a MsgTypeDeliveryAck envelope after
+// each MsgTypeMessage reaches a terminal state (reply delivered to the
+// user). Cloud uses this to drop the message from its 5-min replay
+// buffer; un-acked messages are replayed on the next reconnect.
+var Capabilities = []string{
+	"delivery_ack",
+}
 
 type Client struct {
 	endpoint      string
@@ -129,6 +136,21 @@ func (c *Client) sendClaim(messageID string) error {
 
 func (c *Client) sendProgress(messageID string) error {
 	return c.sendEnvelope(DaemonMessage{Type: MsgTypeProgress, MessageID: messageID})
+}
+
+// sendDeliveryAck signals to Cloud that the inbound message reached a
+// terminal state (success or error reply already delivered to the
+// user). Cloud drops the entry from its replay buffer so a subsequent
+// disconnect+reconnect doesn't re-deliver the same message. Called
+// only on SendReply success — if the reply itself failed to flush,
+// the user wasn't informed and Cloud must replay on reconnect.
+//
+// Empty messageID is a no-op so callers don't have to guard.
+func (c *Client) sendDeliveryAck(messageID string) error {
+	if messageID == "" {
+		return nil
+	}
+	return c.sendEnvelope(DaemonMessage{Type: MsgTypeDeliveryAck, MessageID: messageID})
 }
 
 // SendProgressWithWorkflow sends a progress heartbeat with a workflow_id payload.
@@ -403,7 +425,10 @@ func (c *Client) handleMessage(ctx context.Context, sm ServerMessage) {
 	heartbeatCancel()
 	c.activeMsgs.Delete(sm.MessageID)
 
-	// Send reply.
+	// Send reply, then ack on success so Cloud can drop the inbound
+	// message from its replay buffer. Reply failure must skip the ack so
+	// the un-delivered message is replayed on the next reconnect — the
+	// user wasn't informed yet.
 	if err := c.SendReply(sm.MessageID, ReplyPayload{
 		Channel:  payload.Channel,
 		ThreadID: payload.ThreadID,
@@ -432,6 +457,10 @@ func (c *Client) handleMessage(ctx context.Context, sm ServerMessage) {
 			})
 			c.eventBus.Emit(Event{Type: EventAgentError, Payload: errPayload})
 		}
+		return
+	}
+	if err := c.sendDeliveryAck(sm.MessageID); err != nil {
+		log.Printf("daemon: delivery_ack failed for message %s: %v", sm.MessageID, err)
 	}
 }
 

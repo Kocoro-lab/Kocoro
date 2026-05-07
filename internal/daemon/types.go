@@ -12,12 +12,13 @@ const (
 
 // Daemon -> Server message types
 const (
-	MsgTypeClaim      = "claim"
-	MsgTypeReply      = "reply"
-	MsgTypeProgress   = "progress"
-	MsgTypeDisconnect = "disconnect"
-	MsgTypeEvent      = "event"
-	MsgTypeProactive  = "proactive"
+	MsgTypeClaim       = "claim"
+	MsgTypeReply       = "reply"
+	MsgTypeProgress    = "progress"
+	MsgTypeDisconnect  = "disconnect"
+	MsgTypeEvent       = "event"
+	MsgTypeProactive   = "proactive"
+	MsgTypeDeliveryAck = "delivery_ack"
 )
 
 // Approval protocol (bidirectional relay via Cloud)

@@ -565,3 +565,108 @@ func TestClient_SendApprovalRequest_PutsMessageIDOnEnvelope(t *testing.T) {
 		t.Fatal("server did not receive approval_request envelope")
 	}
 }
+
+// TestCapabilities_AdvertisesDeliveryAck guards the contract the cloud
+// agent's tracker depends on: the daemon must announce "delivery_ack"
+// in its handshake whenever it ships ack-emission code. Drop this token
+// only by also removing the sendDeliveryAck call site — otherwise Cloud
+// stops tracking but the daemon keeps emitting acks Cloud will warn on.
+func TestCapabilities_AdvertisesDeliveryAck(t *testing.T) {
+	found := false
+	for _, c := range Capabilities {
+		if c == "delivery_ack" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("default Capabilities = %v, want to contain %q", Capabilities, "delivery_ack")
+	}
+}
+
+// TestSendDeliveryAck_EmptyMessageIDIsNoOp confirms a missing inbound
+// MessageID short-circuits before sendEnvelope. The wire protocol
+// requires non-empty MessageID for delivery_ack (Cloud warns and drops
+// otherwise), so silently no-op'ing is the right behavior — the caller
+// path inside handleMessage always has a MessageID, but defensive
+// callers shouldn't have to guard.
+func TestSendDeliveryAck_EmptyMessageIDIsNoOp(t *testing.T) {
+	c := NewClient("ws://localhost:1/x", "", nil, nil)
+	if err := c.sendDeliveryAck(""); err != nil {
+		t.Errorf("sendDeliveryAck(\"\") = %v, want nil (no-op)", err)
+	}
+}
+
+// TestClient_DeliveryAck_SentAfterReplySuccess confirms the daemon emits
+// delivery_ack with the inbound MessageID after a successful SendReply.
+// This is the contract the cloud agent's 5-min replay buffer relies on —
+// without the ack, Cloud replays on reconnect and the user gets a
+// duplicate response.
+func TestClient_DeliveryAck_SentAfterReplySuccess(t *testing.T) {
+	gotAck := make(chan DaemonMessage, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Send a message to the daemon.
+		payload, _ := json.Marshal(MessagePayload{Channel: "slack", Text: "hi"})
+		conn.WriteJSON(ServerMessage{Type: MsgTypeMessage, MessageID: "msg-ack-1", Payload: payload})
+
+		// Read the claim and grant it.
+		var dm DaemonMessage
+		conn.ReadJSON(&dm)
+		ackPayload, _ := json.Marshal(ClaimAckPayload{Granted: true})
+		conn.WriteJSON(ServerMessage{Type: MsgTypeClaimAck, MessageID: "msg-ack-1", Payload: ackPayload})
+
+		// Walk daemon-emitted frames until we see the delivery_ack. Reply
+		// MUST come first (ack-on-success is the contract); progress
+		// frames may interleave from the heartbeat.
+		sawReply := false
+		for {
+			var frame DaemonMessage
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			switch frame.Type {
+			case MsgTypeReply:
+				sawReply = true
+			case MsgTypeDeliveryAck:
+				if !sawReply {
+					t.Errorf("delivery_ack arrived before reply")
+				}
+				gotAck <- frame
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c := NewClient(wsURL, "", func(msg MessagePayload) string {
+		return "agent-result"
+	}, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	go c.Listen(ctx)
+
+	select {
+	case ack := <-gotAck:
+		if ack.MessageID != "msg-ack-1" {
+			t.Errorf("ack.MessageID = %q, want %q", ack.MessageID, "msg-ack-1")
+		}
+		if len(ack.Payload) != 0 {
+			t.Errorf("ack.Payload = %q, want empty (Cloud parses message_id from envelope)", string(ack.Payload))
+		}
+	case <-ctx.Done():
+		t.Fatal("daemon never sent delivery_ack")
+	}
+}
