@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -12,9 +14,9 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
-	"path/filepath"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
+	"github.com/Kocoro-lab/ShanClaw/internal/uploads"
 )
 
 // RegisterLocalTools registers only the local tools.
@@ -460,6 +462,40 @@ func RegisterCloudDelegate(reg *agent.ToolRegistry, gw *client.GatewayClient, cf
 		timeout = 3600 * time.Second
 	}
 	reg.Register(NewCloudDelegateTool(gw, cfg.APIKey, timeout, handler, agentName, agentPrompt))
+}
+
+// RegisterPublishTool registers the publish_to_web tool. It needs the gateway
+// client (for the shared *http.Client) and a configured API key — without a
+// key, /api/v1/uploads will reject every call with 401, so we skip rather
+// than register a tool that can only fail.
+func RegisterPublishTool(reg *agent.ToolRegistry, gw *client.GatewayClient, cfg *config.Config) {
+	if cfg == nil || !cfg.Cloud.Enabled || cfg.APIKey == "" || gw == nil {
+		return
+	}
+	allow := buildPublishAllowlist(cfg.Cloud.PublishAllowedExtensions)
+	uploadsClient := uploads.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
+	reg.Register(NewPublishToWebTool(uploadsClient, allow))
+}
+
+// buildPublishAllowlist merges user-supplied extensions onto the default
+// allowlist. Extensions are normalised to lowercase and given a leading dot
+// if missing. Empty / nil extra returns the default unmodified.
+func buildPublishAllowlist(extra []string) map[string]bool {
+	out := make(map[string]bool, len(defaultExtAllowlist)+len(extra))
+	for k, v := range defaultExtAllowlist {
+		out[k] = v
+	}
+	for _, e := range extra {
+		e = strings.TrimSpace(strings.ToLower(e))
+		if e == "" {
+			continue
+		}
+		if !strings.HasPrefix(e, ".") {
+			e = "." + e
+		}
+		out[e] = true
+	}
+	return out
 }
 
 // ExtractGatewayTools returns all *ServerTool entries from a registry.

@@ -6,10 +6,10 @@ description: |
   Desktop chat. Use when the user asks to "visualize", "chart", "diagram",
   "explain visually", "show me", or when data is denser than a paragraph of
   prose.
-allowed-tools: file_read think
+allowed-tools: file_read file_write publish_to_web think
 hidden: true
 metadata:
-  version: "1.0.1"
+  version: "1.0.2"
   user-invocable: "true"
 ---
 
@@ -193,3 +193,20 @@ file via the `file_read` tool:
 - Tables go in response prose as markdown, not inside widgets.
 - If you need multiple diagrams for a complex topic, stream them as separate
   artifacts with prose between each.
+
+## Sharing externally (optional)
+
+The inline `html-artifact` block is the **primary** output — it renders in
+Kocoro Desktop with no public URL and no upload. Use it whenever the user's
+goal is just "show me".
+
+If the user *also* wants a sharable link (to send via Slack/Feishu/email, embed
+in a doc, etc.), you may additionally:
+
+1. Use `file_write` to save the same HTML body to a temp path
+   (e.g. `/tmp/<short-id>.html`).
+2. Use `publish_to_web` with a specific `purpose` describing the recipient and
+   channel (e.g. `"send revenue chart link to user via Slack"`).
+
+Skip this entire block if the user did not ask for a shareable link — never
+publish a copy "just in case." Public URLs cannot be deleted.

@@ -370,6 +370,7 @@ Local tools executed on your macOS machine:
 | `memory_append` | No | Append entries to agent MEMORY.md (flock-protected) |
 | `use_skill` | No | Activate a skill by name — returns full SKILL.md body. Skill discovery auto-suggests relevant skills each turn via `model_tier: small` prefetch. |
 | `cloud_delegate` | Yes | Delegate tasks to Shannon Cloud for remote research/swarm execution |
+| `publish_to_web` | Yes | ⚠️ Upload a local file to a **public, permanent** S3 URL on Shannon Cloud (50 MiB cap). Requires both `cloud.enabled` and `api_key`. Path blocklist (`.env`, `.ssh`, `credentials`, `*.pem`, …) and extension allowlist (html/md/txt/pdf/png/jpg/svg/csv/json/mp4/…) prevent obvious leaks; mandatory `purpose` field is shown to the user during approval. Extend the allowlist with `cloud.publish_allowed_extensions: [".go", ...]`. Never upload secrets — there is no DELETE. |
 
 ### Tool Approval Flow
 

@@ -42,6 +42,13 @@ func (t *toolSearchTool) Info() ToolInfo {
 func (t *toolSearchTool) RequiresApproval() bool     { return false }
 func (t *toolSearchTool) IsReadOnlyCall(string) bool { return true }
 
+// SkillExempt opts tool_search out of skill allowed-tools restriction. Without
+// this, a skill that omitted tool_search from its allowed list would lock the
+// model out of loading deferred tool schemas — including ones the skill itself
+// might depend on. tool_search has no I/O of its own; everything it loads is
+// still subject to the skill filter and per-tool approval.
+func (t *toolSearchTool) SkillExempt() bool { return true }
+
 func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, error) {
 	var args struct {
 		Query string `json:"query"`

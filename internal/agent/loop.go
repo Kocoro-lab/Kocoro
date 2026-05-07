@@ -2700,6 +2700,15 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if activeSkillFilter != nil {
 				var kept []approvedToolCall
 				for _, ac := range approved {
+					// Framework-level exemption: pure-infrastructure tools
+					// (think, tool_search, use_skill) opt out via the
+					// SkillExempt interface so a skill's allowed-tools never
+					// locks the model out of reasoning or skill switching.
+					// Tools with I/O side effects MUST NOT implement this.
+					if IsSkillExempt(ac.tool) {
+						kept = append(kept, ac)
+						continue
+					}
 					if !activeSkillFilter[ac.fc.Name] {
 						denyMsg := fmt.Sprintf("[skill restriction] tool %q is not allowed by the active skill. Allowed: %s", ac.fc.Name, activeSkillFilterStr)
 						// Drift re-arm: when the active skill is sticky,
@@ -2947,14 +2956,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			er := execResults[ac.index]
 			if ac.fc.Name == "use_skill" && !er.result.IsError {
 				if len(er.result.SkillToolFilter) > 0 {
-					activeSkillFilter = make(map[string]bool, len(er.result.SkillToolFilter)+1)
+					activeSkillFilter = make(map[string]bool, len(er.result.SkillToolFilter))
 					sorted := make([]string, len(er.result.SkillToolFilter))
 					copy(sorted, er.result.SkillToolFilter)
 					sort.Strings(sorted)
 					for _, name := range sorted {
 						activeSkillFilter[name] = true
 					}
-					activeSkillFilter["use_skill"] = true
+					// use_skill / think / tool_search bypass via the
+					// SkillExempt interface (see filter at the top of the
+					// execution block); no explicit allowlist entry needed.
 					activeSkillFilterStr = strings.Join(sorted, ", ")
 				} else {
 					activeSkillFilter = nil

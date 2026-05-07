@@ -519,3 +519,15 @@ func TestBuildLocalActiveSchemas_NoColdReturnsAllLocals(t *testing.T) {
 		t.Errorf("empty cold set: expected 2 schemas, got %d", len(schemas))
 	}
 }
+
+// TestToolSearchSkillExempt asserts that the tool_search meta-tool opts into
+// SkillExempt. Without this, a skill that omits tool_search from its
+// allowed-tools would lock the model out of loading deferred tool schemas.
+func TestToolSearchSkillExempt(t *testing.T) {
+	reg := NewToolRegistry()
+	tool := newToolSearchTool(reg, map[string]bool{})
+	if !IsSkillExempt(tool) {
+		t.Errorf("toolSearchTool must implement SkillExempt() returning true; otherwise " +
+			"any skill that omits tool_search from allowed-tools traps the model")
+	}
+}

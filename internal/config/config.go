@@ -112,6 +112,10 @@ type ToolsConfig struct {
 type CloudConfig struct {
 	Enabled bool `mapstructure:"enabled" yaml:"enabled" json:"enabled"`
 	Timeout int  `mapstructure:"timeout" yaml:"timeout" json:"timeout"` // seconds
+	// PublishAllowedExtensions extends the publish_to_web extension allowlist.
+	// Values are merged onto the built-in default set; there is no allowlist
+	// override and no user-configurable denylist (denylist must not be widenable).
+	PublishAllowedExtensions []string `mapstructure:"publish_allowed_extensions" yaml:"publish_allowed_extensions,omitempty" json:"publish_allowed_extensions,omitempty"`
 }
 
 type OllamaConfig struct {

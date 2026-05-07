@@ -115,6 +115,13 @@ func (m *mockSimpleTool) Run(ctx context.Context, args string) (ToolResult, erro
 
 func (m *mockSimpleTool) RequiresApproval() bool { return false }
 
+// mockSkillExemptTool is a mockSimpleTool that opts out of skill restriction
+// via the SkillExempt interface — used by tests that exercise the framework's
+// skill-bypass path.
+type mockSkillExemptTool struct{ mockSimpleTool }
+
+func (m *mockSkillExemptTool) SkillExempt() bool { return true }
+
 type budgetCaptureLLMClient struct {
 	responses []*client.CompletionResponse
 	requests  []client.CompletionRequest
@@ -3592,6 +3599,107 @@ func TestAgentLoop_SkillToolFilter(t *testing.T) {
 		if len(toolsSentPerCall[callIdx]) != call0Count {
 			t.Errorf("call %d: expected %d tools (same as call 0), got %d", callIdx, call0Count, len(toolsSentPerCall[callIdx]))
 		}
+	}
+}
+
+// TestAgentLoop_SkillExemptBypassesFilter verifies that a tool implementing
+// the SkillExempt interface (think / tool_search / use_skill in production)
+// is NOT blocked by an active skill's allowed-tools list, while a non-exempt
+// tool calling under the same skill IS blocked. We snapshot the captured LLM
+// requests and look at the tool_result content for the SkillExempt call —
+// it must be the success result, not the "[skill restriction]" string.
+func TestAgentLoop_SkillExemptBypassesFilter(t *testing.T) {
+	var mu sync.Mutex
+	var capturedMessages [][]client.Message
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req client.CompletionRequest
+		json.Unmarshal(body, &req)
+		mu.Lock()
+		callNum := len(capturedMessages)
+		// Snapshot a copy of messages so subsequent in-place rewrites by the
+		// loop don't mutate what we asserted on.
+		snap := make([]client.Message, len(req.Messages))
+		copy(snap, req.Messages)
+		capturedMessages = append(capturedMessages, snap)
+		mu.Unlock()
+
+		switch callNum {
+		case 0:
+			// Activate a restrictive skill that only allows "http".
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("use_skill", `{"skill_name": "narrow"}`), 10, 5))
+		case 1:
+			// Call think — should run despite not being in the allow list.
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("think", `{"thought":"plan"}`), 10, 5))
+		case 2:
+			// Call bash — must be denied.
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("bash", `{"command":"echo hi"}`), 10, 5))
+		default:
+			json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 10, 5))
+		}
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+
+	reg.Register(&mockSimpleTool{
+		name: "use_skill",
+		result: ToolResult{
+			Content:         "narrow skill activated",
+			SkillToolFilter: []string{"http"},
+		},
+	})
+	reg.Register(&mockSimpleTool{name: "http", result: ToolResult{Content: "ok"}})
+	reg.Register(&mockSimpleTool{name: "bash", result: ToolResult{Content: "DID NOT EXPECT TO RUN"}})
+	// think implements SkillExempt — must execute despite not being in
+	// the skill's allowed-tools.
+	reg.Register(&mockSkillExemptTool{mockSimpleTool: mockSimpleTool{
+		name:   "think",
+		result: ToolResult{Content: "thought recorded"},
+	}})
+
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	if _, _, err := loop.Run(context.Background(), "test", nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(capturedMessages) < 4 {
+		t.Fatalf("expected ≥4 LLM calls, got %d", len(capturedMessages))
+	}
+	// Last captured request contains the full conversation: locate tool_result
+	// blocks by their tool_use_id and assert content. We don't have direct
+	// IDs here, so scan message text for the expected fragments.
+	last := capturedMessages[len(capturedMessages)-1]
+	hasThinkSuccess := false
+	hasBashDenied := false
+	hasThinkDenied := false
+	for _, m := range last {
+		text := m.Content.Text()
+		if strings.Contains(text, "thought recorded") {
+			hasThinkSuccess = true
+		}
+		if strings.Contains(text, "[skill restriction]") && strings.Contains(text, `"bash"`) {
+			hasBashDenied = true
+		}
+		if strings.Contains(text, "[skill restriction]") && strings.Contains(text, `"think"`) {
+			hasThinkDenied = true
+		}
+	}
+	if !hasThinkSuccess {
+		t.Errorf("expected think to execute and return its result; SkillExempt may not be wired into the filter")
+	}
+	if hasThinkDenied {
+		t.Errorf("think was denied by skill filter despite implementing SkillExempt")
+	}
+	if !hasBashDenied {
+		t.Errorf("expected bash to be denied by skill filter (sanity check) — got conversation that didn't include the denial")
 	}
 }
 

@@ -83,11 +83,14 @@ internal/
   instructions/
     loader.go          # instructions, memory, custom commands
   tools/
-    register.go        # local + MCP + gateway tool registration
+    register.go        # local + MCP + gateway tool registration; RegisterPublishTool for publish_to_web
     schedule.go        # schedule_create/list/update/remove tools
     session_search.go  # session_search tool
     mcp_tool.go        # MCPTool adapter
     server.go          # ServerTool adapter (gateway tools)
+    publish_to_web.go  # publish_to_web tool (path/extension guards + purpose validation; uses internal/uploads)
+  uploads/
+    client.go          # POST /api/v1/uploads multipart streaming client (typed errors, retry/backoff). Reuses GatewayClient.HTTPClient().
   skills/
     registry.go        # skill metadata
     loader.go          # skill loading
@@ -302,4 +305,5 @@ E2E tests in `test/e2e/` split into offline (no API) and live (`SHANNON_E2E_LIVE
 
 - Session: `session_search` when a session manager is present
 - Cloud: `cloud_delegate` when gateway/cloud access is enabled
+- Cloud: `publish_to_web` when `cloud.enabled` AND `api_key` is configured. Always requires user approval; `purpose` arg is mandatory and shown during the approval prompt. Path blocklist and extension allowlist enforced client-side; never used for backup/sync.
 - Meta: `tool_search` in deferred mode only

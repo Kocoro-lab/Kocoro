@@ -161,3 +161,42 @@ Move your workflow from the default agent to a specialized one with tailored beh
 6. **Use the agent**: Pass `--agent my-assistant` to `shan` in the CLI, or select it in the desktop app. In TUI: `shan --agent my-assistant`
 
 The default agent is unchanged — you can switch between agents anytime.
+
+---
+
+## Publish a Generated Artifact to a Public URL
+
+When an agent produces something the user wants to **share externally** (a landing-page draft, a chart PNG, a PDF report, an HTML preview to embed in a Slack/Feishu/LINE reply), use the `publish_to_web` tool.
+
+**Important — when NOT to use:**
+- Backup, sync, or "just in case" uploads. There is no DELETE; the URL is permanent.
+- Source code, configs, `.env`, credentials, private keys, logs. These are blocklisted client-side and will be rejected.
+- Inline previews inside Kocoro Desktop. Use the `kocoro-generative-ui` skill's `html-artifact` blocks instead — they render in the app sandbox without a public URL.
+
+**Flow:**
+
+1. Generate the file locally (typically `file_write` after rendering content).
+2. Call `publish_to_web`:
+   ```json
+   {
+     "path": "/tmp/landing.html",
+     "purpose": "send landing page draft to user via Slack reply"
+   }
+   ```
+   - `purpose` is **mandatory** and shown to the user during approval. Be specific (who is the recipient, why public). Vague answers ("share", "test", "send it") are rejected.
+   - Optional `filename` and `content_type` overrides; defaults inferred from the file path.
+3. The user is prompted for approval (always — there is no auto-approve path).
+4. On approval, the tool POSTs to Shannon Cloud's `/api/v1/uploads` and returns a permanent HTTPS URL.
+5. Embed the URL in the assistant's reply ("Here's the landing page: https://…").
+
+**Constraints:**
+- 50 MiB per file (server-enforced; tool pre-checks locally).
+- Default extension allowlist: html, md, txt, pdf, png, jpg, jpeg, gif, webp, svg, csv, json, mp4, mp3, wav, webm.
+- Path-segment blocklist (`.env`, `.ssh`, `credentials`, `secrets`, `id_rsa`, …) and basename suffix blocklist (`.pem`, `.key`, `.p12`, `.pfx`, …) are enforced before any HTTP call. **Not user-configurable** — denylist intentionally cannot be widened.
+- The allowlist **can** be extended via config:
+  ```yaml
+  cloud:
+    publish_allowed_extensions: [".go", ".sql"]
+  ```
+  This is additive. Even after extending, denylist still applies.
+- Requires `cloud.enabled: true` AND a configured `api_key`. Without either, the tool is not registered.

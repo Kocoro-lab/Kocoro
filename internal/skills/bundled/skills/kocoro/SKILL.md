@@ -77,6 +77,7 @@ For detailed docs on MCP servers, skill API keys, permissions, project init, or 
 **NEVER modify these fields** — the API rejects with 409. Do NOT add `X-Confirm` or any header to bypass:
 `endpoint`, `api_key`, `permissions.denied_commands`. Tell the user to edit `~/.shannon/config.yaml` directly.
 **MCP servers**: shells (`sh`, `bash`, `zsh`), wrapper commands (`env`, `nohup`, `sudo`), and eval flags (`-c`, `-e`, `--eval`) are blocked. Use actual server binaries, not shell wrappers.
+**`publish_to_web` extension allowlist** (`cloud.publish_allowed_extensions`): additive only. Do not coach users to "just add `.pem` / `.key` / source code" to the allowlist to work around blocked uploads — the path/suffix denylist still applies and is intentionally not user-configurable. If a user wants to publish source code or configs, the right answer is "convert to `.txt` / `.md` first, after auditing for secrets".
 **CONFIRM first**: delete any resource, add MCP server, widen permissions, set `daemon.auto_approve` (disables approval prompts for all tool calls).
 
 ## Style

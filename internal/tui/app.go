@@ -688,6 +688,7 @@ func (m *Model) loadServerTools() tea.Cmd {
 				cloudAgentPrompt = m.agentOverride.Prompt
 			}
 			tools.RegisterCloudDelegate(reg, m.gateway, m.cfg, nil, cloudAgentName, cloudAgentPrompt)
+			tools.RegisterPublishTool(reg, m.gateway, m.cfg)
 		}
 
 		return serverToolsLoadedMsg{

@@ -134,3 +134,8 @@ func rewriteRelativePaths(body, dir string) string {
 func (t *useSkillTool) RequiresApproval() bool { return false }
 
 func (t *useSkillTool) IsReadOnlyCall(string) bool { return false }
+
+// SkillExempt keeps use_skill callable regardless of the active skill's
+// allowed-tools list — without this, a skill that omitted "use_skill" would
+// trap the model into the active skill with no way to switch out.
+func (t *useSkillTool) SkillExempt() bool { return true }

@@ -51,3 +51,8 @@ func (t *ThinkTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult,
 func (t *ThinkTool) RequiresApproval() bool { return false }
 
 func (t *ThinkTool) IsReadOnlyCall(string) bool { return true }
+
+// SkillExempt opts think out of skill allowed-tools restriction. Pure
+// reasoning, no I/O — restricting it would only force the model to substitute
+// plan text into its assistant message, which is strictly worse for the loop.
+func (t *ThinkTool) SkillExempt() bool { return true }

@@ -93,6 +93,7 @@ var daemonStartCmd = &cobra.Command{
 		_ = skillsPtr // skills are set per-request in RunAgent
 
 		tools.RegisterCloudDelegate(reg, gw, cfg, nil, "", "") // daemon: agent forwarding per-message not yet supported
+		tools.RegisterPublishTool(reg, gw, cfg)
 
 		gatewayOverlay := tools.ExtractGatewayTools(reg)
 		postOverlays := tools.ExtractPostOverlays(reg, baselineReg)

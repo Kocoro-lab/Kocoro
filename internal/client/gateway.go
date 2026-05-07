@@ -861,6 +861,15 @@ func NewGatewayClient(baseURL, apiKey string) *GatewayClient {
 	}
 }
 
+// HTTPClient exposes the underlying *http.Client so sibling subsystems
+// (e.g. internal/uploads) can reuse the same transport, timeout, and any
+// future tracing wiring without standing up their own client.
+func (c *GatewayClient) HTTPClient() *http.Client { return c.httpClient }
+
+// BaseURL exposes the gateway base URL for sibling subsystems that need to
+// build their own request paths against the same host.
+func (c *GatewayClient) BaseURL() string { return c.baseURL }
+
 // Complete sends a completion request to the gateway's /v1/completions endpoint.
 // This endpoint is a thin proxy to the LLM service that returns raw function_call
 // responses for client-side tool execution.

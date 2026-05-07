@@ -116,16 +116,18 @@ internal/
     activated.go       # ActivatedSet + context helpers for scoping secret injection per-run
     validate.go        # ValidateSkillName (Anthropic spec regex)
   tools/
-    register.go        # RegisterLocalTools, RegisterAll, CompleteRegistration, ApplyToolFilter
+    register.go        # RegisterLocalTools, RegisterAll, CompleteRegistration, ApplyToolFilter, RegisterPublishTool
     # Tool files: file_read, file_write, file_edit, glob, grep, bash,
     # directory_list, think, http, system_info, clipboard, notify, process,
     # applescript, accessibility, ghostty, browser, screenshot, computer,
-    # wait (wait_for), cloud_delegate, imaging (helper), pinchtab (legacy),
-    # safe_path, skill (use_skill), memory_append
+    # wait (wait_for), cloud_delegate, publish_to_web, imaging (helper),
+    # pinchtab (legacy), safe_path, skill (use_skill), memory_append
     schedule.go        # schedule_create/list/update/remove tools
     session_search.go  # session_search tool (FTS5 keyword search)
     mcp_tool.go        # MCPTool adapter
     server.go          # ServerTool adapter (gateway remote tools)
+  uploads/
+    client.go          # POST /api/v1/uploads multipart streaming client (typed errors + retry/backoff). Used by publish_to_web tool. Reuses GatewayClient.HTTPClient() — does not own its own *http.Client.
   tui/
     app.go             # Bubbletea Model — Init/Update/View, slash commands
     doctor.go          # TUI diagnostic checks
@@ -187,6 +189,8 @@ Three-layer system for triggering `use_skill`:
 3. **Fallback catalog** — `use_skill` tool description dynamically includes all loaded skill names.
 
 **Skill allowed-tools enforcement** uses execution-time denial (`loop.go`), NOT schema filtering. The tools array stays full for the entire `Run()` to preserve Anthropic prompt cache stability. Blocked tools receive an error `ToolResult` with `[skill restriction]` message. A `<system-reminder>` hint is also appended to the `use_skill` result for soft guidance.
+
+**Framework-level skill exemption** (`agent.SkillExempt` interface, opt-in): `think`, `tool_search`, `use_skill` always run regardless of the active skill's allowed-tools. Reserved for pure-infrastructure tools with zero I/O — restricting them would only force the model to substitute plan text into assistant messages or lock it out of skill switching. **Do NOT add `SkillExempt()` to tools with side effects** (file/network/publish/bash) — those must remain skill-restrictable so authors of confidential-context skills can lock them out.
 
 ### Permission Model
 ```
@@ -313,4 +317,5 @@ E2E tests in `test/e2e/` are split into offline (no API, runs in CI) and live (n
 **Conditional (registered outside `RegisterLocalTools`):**
 - session_search — added when a session manager is available
 - cloud_delegate — added when `cloud.enabled: true`
+- publish_to_web — added when `cloud.enabled: true` AND `cfg.APIKey != ""`. Lives in `internal/tools/publish_to_web.go`; HTTP plumbing in `internal/uploads/client.go` (multipart streaming via `io.Pipe`, 3-attempt retry on `ErrTransient`, sentinel errors for 401/400/413/500-s3_unconfigured/transient). Always requires approval (`RequiresApproval=true`, `IsSafeArgs=false`). Tool-side guards: required `purpose` arg shown to user during approval; path-segment blocklist (`.env`/`.ssh`/`credentials`/…); basename suffix blocklist (`.pem`/`.key`/…); extension allowlist (default html/md/txt/pdf/png/jpg/svg/csv/json/mp4/…). Allowlist extensible via `cloud.publish_allowed_extensions: [".go", ...]`; **denylist is not user-configurable by design**. Registered alongside `cloud_delegate` at all 5 call sites (`cmd/daemon.go`, `cmd/root.go`, `internal/tui/app.go`, `internal/daemon/server.go` reload paths).
 - tool_search — added in deferred mode when tool count > 30 (lives in `internal/agent/deferred.go`, not `tools/`)

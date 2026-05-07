@@ -177,6 +177,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 			cloudAgentPrompt = agentOverride.Prompt
 		}
 		tools.RegisterCloudDelegate(reg, gw, runCfg, nil, agentName, cloudAgentPrompt)
+		tools.RegisterPublishTool(reg, gw, runCfg)
 	}
 
 	shannonDir := config.ShannonDir()
