@@ -24,8 +24,25 @@ type busEventHandler struct {
 // event carries it. Matches the optional interface checked by RunAgent.
 func (h *busEventHandler) SetSessionID(id string) { h.sessionID = id }
 
-// No-op passthroughs — bus emits only the progress signals, not text/delta.
-func (h *busEventHandler) OnText(text string)                      {}
+// OnText emits mid-turn agent narration (preamble + state-transition updates) to the bus
+// so SSE subscribers (Desktop, web UIs) can render the text inline between tool calls.
+// Empty text is dropped — defensive: the agent loop only calls OnText after
+// normalizeStructuredToolCallPreamble filtered serialized-tool-call pseudo-preambles,
+// but a defense-in-depth check costs nothing. Final-answer text reaches Desktop via
+// EventAgentReply; this event is exclusively for the in-progress narration.
+func (h *busEventHandler) OnText(text string) {
+	if text == "" {
+		return
+	}
+	h.emitJSON(EventAssistantText, map[string]any{
+		"text":       text,
+		"session_id": h.sessionID,
+		"agent":      h.agent,
+		"ts":         nowISO(),
+	})
+}
+
+// No-op passthroughs — bus emits progress signals + agent narration above, not token deltas.
 func (h *busEventHandler) OnStreamDelta(delta string)              {}
 func (h *busEventHandler) OnApprovalNeeded(tool, args string) bool { return false }
 

@@ -1392,7 +1392,17 @@ func (h *sseEventHandler) OnToolResult(name string, args string, result agent.To
 	h.flusher.Flush()
 }
 
-func (h *sseEventHandler) OnText(text string) {}
+// OnText streams mid-turn agent narration to the per-request SSE client
+// (HTTP POST /messages with stream=true). Mirrors busEventHandler.OnText so
+// HTTP-stream subscribers see the same preamble events as EventBus subscribers.
+func (h *sseEventHandler) OnText(text string) {
+	if text == "" {
+		return
+	}
+	data := mustJSON(map[string]string{"text": text})
+	fmt.Fprintf(h.w, "event: %s\ndata: %s\n\n", EventAssistantText, data)
+	h.flusher.Flush()
+}
 
 func (h *sseEventHandler) OnStreamDelta(delta string) {
 	data := mustJSON(map[string]string{"text": delta})

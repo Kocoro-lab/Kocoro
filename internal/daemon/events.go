@@ -15,7 +15,8 @@ const (
 	EventAgentError       = "agent_error"
 	EventHeartbeatAlert   = "heartbeat_alert"
 	EventToolStatus       = "tool_status"
-	EventUsage            = "usage" // per-LLM-call usage snapshot for the run
+	EventAssistantText    = "assistant_text" // mid-turn agent narration (preamble + state-transition updates); distinct from EventAgentReply (final answer)
+	EventUsage            = "usage"           // per-LLM-call usage snapshot for the run
 	EventCloudAgent       = "cloud_agent"
 	EventCloudProgress    = "cloud_progress"
 	EventCloudPlan        = "cloud_plan"
