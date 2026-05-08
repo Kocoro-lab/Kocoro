@@ -673,11 +673,11 @@ func (h *daemonEventHandler) OnCloudPlan(planType, content string, needsReview b
 func (h *daemonEventHandler) OnRunStatus(code, detail string) {}
 
 func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
-	if h.autoApprove && !agent.DisallowsAutoApproval(tool) {
-		log.Printf("daemon: auto-approving %s (auto_approve=true)", tool)
-		return true
-	}
 	if h.autoApprove {
+		if !agent.DisallowsAutoApproval(tool) {
+			log.Printf("daemon: auto-approving %s (auto_approve=true)", tool)
+			return true
+		}
 		log.Printf("daemon: %s requires per-call approval (auto_approve=true); prompting via broker", tool)
 	}
 	if h.broker == nil {

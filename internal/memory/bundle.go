@@ -51,8 +51,10 @@ func NewPuller(cfg Config, sidecar *Sidecar, audit AuditLogger) *Puller {
 	}
 }
 
-// versionInRange enforces [0.4.0, 0.7.0). Hand-rolled (no semver dep) — the
-// constraint is fixed and trivially encodable as integer triplets.
+// versionInRange enforces [0.4.0, 0.7.0). Producers guarantee additive minor
+// bumps in this range; breaking schema changes must move to 0.7.0+ to trip
+// this gate. Hand-rolled (no semver dep) because the constraint is fixed and
+// trivially encodable as integer triplets.
 func versionInRange(v string) bool {
 	parts := strings.SplitN(v, ".", 3)
 	if len(parts) != 3 {

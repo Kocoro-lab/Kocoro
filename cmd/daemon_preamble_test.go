@@ -85,7 +85,7 @@ func TestDaemonEventHandler_AutoApprovePromptsForPerCallTool(t *testing.T) {
 	}
 }
 
-func TestDaemonEventHandler_AutoApproveStillSkipsBrokerForSafeTool(t *testing.T) {
+func TestDaemonEventHandler_AutoApproveSkipsBrokerWhenNotPerCallOnly(t *testing.T) {
 	brokerCalled := false
 	broker := daemon.NewApprovalBroker(func(req daemon.ApprovalRequest) error {
 		brokerCalled = true
@@ -97,11 +97,11 @@ func TestDaemonEventHandler_AutoApproveStillSkipsBrokerForSafeTool(t *testing.T)
 		autoApprove: true,
 	}
 
-	if !handler.OnApprovalNeeded("bash", `{"command":"pwd"}`) {
-		t.Fatal("safe tool should still be auto-approved")
+	if !handler.OnApprovalNeeded("file_read", `{"path":"notes.txt"}`) {
+		t.Fatal("non-per-call tool should still be auto-approved")
 	}
 	if brokerCalled {
-		t.Fatal("safe auto-approved tool should not prompt via broker")
+		t.Fatal("non-per-call auto-approved tool should not prompt via broker")
 	}
 }
 
