@@ -56,8 +56,10 @@ func (m *mockTool) Run(ctx context.Context, args string) (ToolResult, error) {
 func (m *mockTool) RequiresApproval() bool { return false }
 
 func TestDisallowsAutoApproval(t *testing.T) {
-	if !DisallowsAutoApproval("publish_to_web") {
-		t.Fatal("publish_to_web must require per-call approval")
+	for _, name := range []string{"publish_to_web", "generate_image", "edit_image"} {
+		if !DisallowsAutoApproval(name) {
+			t.Fatalf("%s must require per-call approval", name)
+		}
 	}
 	for _, name := range []string{"bash", "file_write", "cloud_delegate", "think"} {
 		if DisallowsAutoApproval(name) {
