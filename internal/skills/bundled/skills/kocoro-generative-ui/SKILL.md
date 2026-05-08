@@ -5,8 +5,9 @@ description: |
   dashboards, illustrations) that render in sandboxed iframes inside Kocoro
   Desktop chat. Use when the user asks to "visualize", "chart", "diagram",
   "explain visually", "show me", or when data is denser than a paragraph of
-  prose.
-allowed-tools: file_read file_write publish_to_web think
+  prose. Can also fetch live data via web_search and web_fetch when the user
+  requests current information alongside visualization.
+allowed-tools: file_read file_write publish_to_web think web_search web_fetch
 hidden: true
 metadata:
   version: "1.0.2"
@@ -164,8 +165,16 @@ file via the `file_read` tool:
 - UI mockups, cards, forms, comparisons → `references/ui-components.md`
 - Geographic maps (choropleths) → `references/maps.md`
 
+## Scope
+
+This skill is visualization-only. It does not search the web, call external
+APIs, or retrieve live data. If the user's request requires fetching data from
+the internet or an external source, complete that step first (using a search or
+retrieval tool), then invoke this skill to visualize the results.
+
 ## Forbidden
 
+- Fetching live data or searching the web — data must already be in context
 - Emoji (use CSS shapes or SVG paths)
 - Gradients, drop shadows, blur, glow, neon
 - `position: fixed`
