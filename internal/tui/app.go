@@ -402,8 +402,10 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	loop := agent.NewAgentLoop(llmClient, reg, runtimeCfg.ModelTier, shannonDir, runtimeCfg.Agent.MaxIterations, runtimeCfg.Tools.ResultTruncation, runtimeCfg.Tools.ArgsTruncation, &runtimeCfg.Permissions, auditor, hookRunner)
 	loop.SetMaxTokens(runtimeCfg.Agent.MaxTokens)
 	loop.SetTemperature(runtimeCfg.Agent.Temperature)
+	// Ollama provider forces auto off — see Finding 1, 2026-05-08 review.
+	effectiveAuto := agent.EffectiveContextWindowAuto(runtimeCfg.Agent.ContextWindowAuto, runtimeCfg.Provider)
 	effectiveWindow := agent.ComputeEffectiveContextWindow(
-		runtimeCfg.Agent.ContextWindowAuto,
+		effectiveAuto,
 		runtimeCfg.Agent.ContextWindow,
 		runtimeCfg.Agent.Model,
 		runtimeCfg.ModelTier,
@@ -437,7 +439,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 			loop.SetSpecificModel(*ac.Model)
 			// Re-resolve effective window against override model
 			// (Finding 1, 2026-05-08).
-			if runtimeCfg.Agent.ContextWindowAuto {
+			if effectiveAuto {
 				loop.RefreshContextWindow(true, runtimeCfg.Agent.ContextWindow)
 			}
 		}
@@ -563,8 +565,10 @@ func (m *Model) rebuildAgentLoop() {
 	loop := agent.NewAgentLoop(m.llmClient, m.toolRegistry, m.cfg.ModelTier, m.shannonDir, m.cfg.Agent.MaxIterations, m.cfg.Tools.ResultTruncation, m.cfg.Tools.ArgsTruncation, &m.cfg.Permissions, m.auditor, m.hookRunner)
 	loop.SetMaxTokens(m.cfg.Agent.MaxTokens)
 	loop.SetTemperature(m.cfg.Agent.Temperature)
+	// Ollama provider forces auto off — see Finding 1, 2026-05-08 review.
+	effectiveAuto := agent.EffectiveContextWindowAuto(m.cfg.Agent.ContextWindowAuto, m.cfg.Provider)
 	effectiveWindow := agent.ComputeEffectiveContextWindow(
-		m.cfg.Agent.ContextWindowAuto,
+		effectiveAuto,
 		m.cfg.Agent.ContextWindow,
 		m.cfg.Agent.Model,
 		m.cfg.ModelTier,
@@ -593,7 +597,7 @@ func (m *Model) rebuildAgentLoop() {
 			loop.SetSpecificModel(*ac.Model)
 			// Re-resolve effective window against override model
 			// (Finding 1, 2026-05-08).
-			if m.cfg.Agent.ContextWindowAuto {
+			if effectiveAuto {
 				loop.RefreshContextWindow(true, m.cfg.Agent.ContextWindow)
 			}
 		}
@@ -1812,6 +1816,12 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 					m.baseCfg.Ollama.Model = newModel
 				}
 				m.agentLoop.SetSpecificModel(newModel)
+				// No RefreshContextWindow here: Ollama provider keeps
+				// auto off (EffectiveContextWindowAuto returns false),
+				// so the loop's window stays pinned to the static
+				// agent.context_window the operator configured for the
+				// local model. The Anthropic prefix table can't map
+				// "qwen3:8b" etc. to a sensible value anyway.
 				saveCfg := m.cfg
 				if m.baseCfg != nil {
 					saveCfg = m.baseCfg
@@ -1856,6 +1866,15 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				}
 				m.cfg.ModelTier = parts[1]
 				m.agentLoop.SetModelTier(parts[1])
+				// Refresh the loop's context window so a tier flip
+				// (e.g. medium → small) actually narrows the preflight
+				// threshold. Without this, /model small kept the loop's
+				// 1M assumption and the preflight guard never fired —
+				// the same bug shape RefreshContextWindow exists to
+				// prevent. (Finding 2, 2026-05-08 review double-check.)
+				if agent.EffectiveContextWindowAuto(m.cfg.Agent.ContextWindowAuto, m.cfg.Provider) {
+					m.agentLoop.RefreshContextWindow(true, m.cfg.Agent.ContextWindow)
+				}
 				if err := config.Save(saveCfg); err != nil {
 					m.appendOutput(fmt.Sprintf("Model tier: %s (failed to save: %v)", parts[1], err))
 				} else {

@@ -204,8 +204,12 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	loop := agent.NewAgentLoop(llmClient, reg, runCfg.ModelTier, shannonDir, runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation, &runCfg.Permissions, auditor, hookRunner)
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
+	// Ollama provider forces auto off — the Anthropic prefix table can't
+	// map local model names, and the tier fallback would substitute Claude
+	// caps for whatever the local model actually holds. (Finding 1.)
+	effectiveAuto := agent.EffectiveContextWindowAuto(runCfg.Agent.ContextWindowAuto, runCfg.Provider)
 	effectiveWindow := agent.ComputeEffectiveContextWindow(
-		runCfg.Agent.ContextWindowAuto,
+		effectiveAuto,
 		runCfg.Agent.ContextWindow,
 		runCfg.Agent.Model,
 		runCfg.ModelTier,
@@ -241,7 +245,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 			// without this, an Opus 4.7 → Haiku 4.5 override would keep
 			// the loop's 1M window assumption and trip the 200K API cap.
 			// (Finding 1 in the 2026-05-08 review.)
-			if runCfg.Agent.ContextWindowAuto {
+			if effectiveAuto {
 				loop.RefreshContextWindow(true, runCfg.Agent.ContextWindow)
 			}
 		}

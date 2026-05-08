@@ -24,12 +24,20 @@ func TestResolveModelCapabilities(t *testing.T) {
 		{"haiku-4-5", "claude-haiku-4-5", "", 200_000},
 		{"haiku-4-5 dated", "claude-haiku-4-5-20251001", "", 200_000},
 
-		// Tier fallback when specific model is empty.
-		{"big tier", "", "big", 1_000_000},
-		{"medium tier", "", "medium", 1_000_000},
+		// Tier-only resolution: every recognized tier returns the conservative
+		// 200K floor. Cloud's priority/failover chains don't guarantee that
+		// tier maps to a 1M-capable model (large priority 1 is gpt-5.1 at
+		// 400K; medium failover lands on sonnet-4-5 at 200K). Operators who
+		// need the 1M benefit must pin agent.model to a 1M-capable name.
+		// "large" is the Shannon Cloud nomenclature; "big" is ShanClaw's —
+		// both accepted to avoid surprises when conventions leak across.
+		{"big tier (conservative 200K)", "", "big", 200_000},
+		{"large tier (Cloud nomenclature)", "", "large", 200_000},
+		{"medium tier (conservative 200K)", "", "medium", 200_000},
 		{"small tier", "", "small", 200_000},
 
-		// Specific takes precedence over tier.
+		// Specific takes precedence over tier (specific path is the only one
+		// that can return 1M, so a 200K model + big tier still resolves to 200K).
 		{"specific wins over tier", "claude-haiku-4-5", "big", 200_000},
 
 		// Unknown / empty → conservative default.

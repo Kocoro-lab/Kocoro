@@ -1008,8 +1008,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		&runCfg.Permissions, deps.Auditor, deps.HookRunner)
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
+	// Ollama provider forces auto off — the Anthropic prefix table can't
+	// map local model names. (Finding 1, 2026-05-08 review double-check.)
+	effectiveAuto := agent.EffectiveContextWindowAuto(runCfg.Agent.ContextWindowAuto, runCfg.Provider)
 	effectiveWindow := agent.ComputeEffectiveContextWindow(
-		runCfg.Agent.ContextWindowAuto,
+		effectiveAuto,
 		runCfg.Agent.ContextWindow,
 		runCfg.Agent.Model,
 		runCfg.ModelTier,
@@ -1059,7 +1062,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			// Re-resolve effective window against override model. Without
 			// this an Opus 4.7 → Sonnet 4.5 override would keep the 1M
 			// assumption and trip the 200K cap. (Finding 1, 2026-05-08.)
-			if runCfg.Agent.ContextWindowAuto {
+			if effectiveAuto {
 				loop.RefreshContextWindow(true, runCfg.Agent.ContextWindow)
 			}
 		}
@@ -1091,7 +1094,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// needs window recompute when auto-resolution is on. Per-agent
 		// ContextWindow override above already won via SetContextWindow,
 		// so this only kicks in when no operator pin is set.
-		if runCfg.Agent.ContextWindowAuto && (agentOverride == nil ||
+		if effectiveAuto && (agentOverride == nil ||
 			agentOverride.Config == nil || agentOverride.Config.Agent == nil ||
 			agentOverride.Config.Agent.ContextWindow == nil) {
 			loop.RefreshContextWindow(true, runCfg.Agent.ContextWindow)

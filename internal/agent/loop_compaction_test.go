@@ -1324,7 +1324,15 @@ func TestEffectiveContextWindow_AutoFromModel(t *testing.T) {
 		{"auto on, sonnet 4.6 → 1M", true, 128000, "claude-sonnet-4-6", "", 1_000_000},
 		{"auto on, haiku 4.5 → 200K", true, 128000, "claude-haiku-4-5", "", 200_000},
 		{"auto on, unknown → config value", true, 128000, "", "", 128000},
-		{"auto on, tier medium → 1M", true, 128000, "", "medium", 1_000_000},
+		// Tier-only resolution returns the conservative 200K floor as of the
+		// 2026-05-08 review's Open Question fix. Cloud-side priority/failover
+		// can land on non-auto-1M models (sonnet-4-5 in medium, gpt-5.1 in
+		// large), so trusting tier=medium → 1M would defeat preflight at
+		// exactly the moment failover happens. Operators who want 1M must
+		// pin agent.model to a known auto-1M model name explicitly.
+		{"auto on, tier medium → 200K (conservative)", true, 128000, "", "medium", 200_000},
+		{"auto on, tier big → 200K (conservative)", true, 128000, "", "big", 200_000},
+		{"auto on, tier small → 200K", true, 128000, "", "small", 200_000},
 		{"auto off → config wins", false, 128000, "claude-opus-4-7", "", 128000},
 		{"auto on, config 0 → resolved", true, 0, "claude-opus-4-7", "", 1_000_000},
 	}
@@ -1698,6 +1706,44 @@ func TestAgentLoop_ReactiveCompaction_RecoversFromOversizedTranscript(t *testing
 		t.Errorf("peak SUMMARY user-content body length = %d, expected the cap to be binding (≥ %d).\n"+
 			"The seeded transcript may not be large enough to actually exercise capTranscriptForSummarize.",
 			peakSummaryChars, summarizeInputCapCharsLocal/2)
+	}
+}
+
+// TestEffectiveContextWindowAuto verifies that the Ollama provider always
+// disables auto-resolution. The Anthropic prefix table cannot map local
+// model names like "qwen3:8b" to a sensible window, and the tier fallback
+// would silently substitute Claude-family caps for whatever the local
+// model actually holds (often 8K–32K). When provider=="ollama" the helper
+// returns false so callers honor the operator-configured static
+// agent.context_window. (See Finding 1, 2026-05-08 review double-check.)
+func TestEffectiveContextWindowAuto(t *testing.T) {
+	cases := []struct {
+		name     string
+		auto     bool
+		provider string
+		want     bool
+	}{
+		// Gateway path: auto flag passes through unchanged.
+		{"gateway auto on", true, "gateway", true},
+		{"gateway auto off", false, "gateway", false},
+		// Empty provider defaults to gateway-like behavior (ShanClaw treats
+		// empty Provider as gateway in cmd/root.go and daemon/runner.go).
+		{"empty provider auto on", true, "", true},
+		{"empty provider auto off", false, "", false},
+		// Ollama path: auto is forced off regardless of the configured flag.
+		// This is the Finding 1 fix — preflight cannot trust Anthropic-family
+		// windows when the actual model is local.
+		{"ollama auto on (forced off)", true, "ollama", false},
+		{"ollama auto off (still off)", false, "ollama", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := EffectiveContextWindowAuto(tc.auto, tc.provider)
+			if got != tc.want {
+				t.Errorf("EffectiveContextWindowAuto(%v, %q) = %v, want %v",
+					tc.auto, tc.provider, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -36,8 +36,12 @@ import (
 //
 // Precedence:
 //  1. auto=false → configValue (operator-pinned)
-//  2. auto=true + non-empty specificModel or modelTier → resolver result
-//     (1M for known auto-1M models, 200K floor for unknown — never speculate up)
+//  2. auto=true + non-empty specificModel or modelTier → resolver result.
+//     specific-model path can return 1M for known auto-1M models;
+//     tier-only path returns the conservative 200K floor (see
+//     client.lookupModelTier docstring for why tier resolution cannot
+//     trust 1M when Cloud-side priority/failover lands on non-auto-1M
+//     models). Unknown specific model also returns 200K.
 //  3. auto=true + both empty + configValue > 0 → configValue
 //  4. auto=true + both empty + configValue == 0 → 200_000 (resolver default)
 func computeEffectiveContextWindow(auto bool, configValue int, specificModel, modelTier string) int {
@@ -58,6 +62,31 @@ func computeEffectiveContextWindow(auto bool, configValue int, specificModel, mo
 // computeEffectiveContextWindow, exposed for daemon wiring.
 func ComputeEffectiveContextWindow(auto bool, configValue int, specificModel, modelTier string) int {
 	return computeEffectiveContextWindow(auto, configValue, specificModel, modelTier)
+}
+
+// EffectiveContextWindowAuto returns whether auto-resolution should be
+// applied for this provider. Auto resolution maps tier/specific model to
+// a Claude-family context window via client.ResolveModelCapabilities —
+// that table is meaningless for the Ollama provider:
+//
+//   - Ollama model names like "qwen3:8b" or "llama3.1:70b" never match
+//     the Anthropic prefix table, so specific-model lookup falls through
+//     to the unknown-model 200K default — already wrong for "qwen3:32b"
+//     (32K) and right by accident for "llama3.1:8b" (128K).
+//   - Tier-only fallback (medium/big → 200K conservatively) still ignores
+//     the actual local-model window, which can be as small as 8K
+//     (llama-guard-4:12b) or 32K (qwen3 family).
+//
+// The right call for Ollama is to honor the operator's static
+// agent.context_window: they know which local model they're running and
+// what window it holds. This helper centralizes that policy so every
+// wiring site (cmd/root.go, daemon/runner.go, tui/app.go) makes the same
+// call. (See 2026-05-08 review Finding 1.)
+func EffectiveContextWindowAuto(auto bool, provider string) bool {
+	if provider == "ollama" {
+		return false
+	}
+	return auto
 }
 
 // preflightCompactThreshold is the fraction of the context window above
