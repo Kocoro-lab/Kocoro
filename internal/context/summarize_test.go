@@ -429,3 +429,43 @@ func TestSummarizeForUser_TagsHelperCacheSource(t *testing.T) {
 		t.Errorf("SummarizeForUser CacheSource = %q, want %q", got, "helper")
 	}
 }
+
+// TestGenerateSummary_CapsOversizedTranscript guards against the 2026-05-07
+// production cascade: reactive recovery hands GenerateSummary a transcript
+// already over the small-tier (Haiku 4.5, 200K) cap, the summarizer 400s
+// with "prompt is too long", and the user sees a hard error. The fix is
+// an internal head+tail truncation that keeps the small-tier input under
+// summarizeInputCapChars regardless of how large the input is.
+func TestGenerateSummary_CapsOversizedTranscript(t *testing.T) {
+	// Build a transcript far over the small-tier 200K cap.
+	// 1.3M chars is ~371K tokens at 3.5 chars/token — well past Haiku 4.5's 200K.
+	huge := strings.Repeat("padding text ", 100_000) // ~1.3M chars
+	messages := []client.Message{
+		{Role: "user", Content: client.NewTextContent(huge)},
+	}
+
+	mock := &mockCompleter{
+		response: &client.CompletionResponse{
+			OutputText: "<summary>ok</summary>",
+		},
+	}
+	_, _, err := GenerateSummary(context.Background(), mock, messages)
+	if err != nil {
+		t.Fatalf("GenerateSummary returned error: %v", err)
+	}
+
+	// The transcript that actually went to the small-tier model must be
+	// at or under the cap, not the raw 1.3M chars.
+	sentBody := mock.lastReq.Messages[1].Content.Text()
+	if len(sentBody) > summarizeInputCapChars {
+		t.Errorf("sent transcript len = %d, want <= %d (cap)",
+			len(sentBody), summarizeInputCapChars)
+	}
+	if !strings.Contains(sentBody, "transcript truncated") {
+		head := sentBody
+		if len(head) > 200 {
+			head = head[:200]
+		}
+		t.Errorf("expected truncation marker in capped transcript, got: %q...", head)
+	}
+}

@@ -10,6 +10,32 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
+// summarizeInputCapChars limits the transcript length sent to the small-tier
+// summarizer. ~540K chars ≈ 180K tokens at the 3 chars/token estimate
+// used by buildTranscript, leaving 20K headroom under Haiku 4.5's 200K context
+// window. This is a defense-in-depth: the reactive path already runs
+// compressOldToolResults before calling GenerateSummary, but that pass is
+// deliberately gentle (keepRecent=8, maxResultChars=300) and can leave a
+// transcript over the small-tier cap when recent tool results are large.
+//
+// Without this guard, a 200K+ transcript fed to the summarizer 400s with
+// "prompt is too long", which is exactly the cascade that caused the
+// 2026-05-07 production incident.
+const summarizeInputCapChars = 540_000
+
+// capTranscriptForSummarize returns s unchanged if it fits, or a head+tail
+// concatenation otherwise. Truncation marker is human-readable so the
+// summarizer can note the gap in its analysis.
+func capTranscriptForSummarize(s string) string {
+	if len(s) <= summarizeInputCapChars {
+		return s
+	}
+	half := summarizeInputCapChars/2 - 60 // 60 = len(marker) margin
+	return s[:half] +
+		"\n\n[... transcript truncated for size — middle elided ...]\n\n" +
+		s[len(s)-half:]
+}
+
 const summarizePrompt = `Compress the following conversation into a concise summary using a two-phase approach.
 
 Phase 1 — Write a chronological analysis inside <analysis> tags:
@@ -78,10 +104,11 @@ func buildTranscript(messages []client.Message) string {
 // It strips the system message from the input to avoid wasting tokens.
 // Serializes both plain text and block content (tool_use, tool_result).
 func GenerateSummary(ctx context.Context, c Completer, messages []client.Message) (string, client.Usage, error) {
+	transcript := capTranscriptForSummarize(buildTranscript(messages))
 	req := client.CompletionRequest{
 		Messages: []client.Message{
 			{Role: "system", Content: client.NewTextContent(summarizePrompt)},
-			{Role: "user", Content: client.NewTextContent(buildTranscript(messages))},
+			{Role: "user", Content: client.NewTextContent(transcript)},
 		},
 		ModelTier:   "small",
 		Temperature: 0.2,
@@ -109,10 +136,11 @@ Requirements:
 
 // SummarizeForUser 调用 LLM 生成面向人类阅读的会话摘要。
 func SummarizeForUser(ctx context.Context, c Completer, messages []client.Message) (string, error) {
+	transcript := capTranscriptForSummarize(buildTranscript(messages))
 	req := client.CompletionRequest{
 		Messages: []client.Message{
 			{Role: "system", Content: client.NewTextContent(userSummarizePrompt)},
-			{Role: "user", Content: client.NewTextContent(buildTranscript(messages))},
+			{Role: "user", Content: client.NewTextContent(transcript)},
 		},
 		ModelTier:   "small",
 		Temperature: 0.2,
