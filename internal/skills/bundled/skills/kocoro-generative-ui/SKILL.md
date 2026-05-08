@@ -5,12 +5,11 @@ description: |
   dashboards, illustrations) that render in sandboxed iframes inside Kocoro
   Desktop chat. Use when the user asks to "visualize", "chart", "diagram",
   "explain visually", "show me", or when data is denser than a paragraph of
-  prose. Can also fetch live data via web_search and web_fetch when the user
-  requests current information alongside visualization.
-allowed-tools: file_read file_write publish_to_web think web_search web_fetch
+  prose.
+allowed-tools: file_read file_write publish_to_web think
 hidden: true
 metadata:
-  version: "1.0.2"
+  version: "1.0.3"
   user-invocable: "true"
 ---
 
