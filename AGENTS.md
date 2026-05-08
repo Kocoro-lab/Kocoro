@@ -83,14 +83,18 @@ internal/
   instructions/
     loader.go          # instructions, memory, custom commands
   tools/
-    register.go        # local + MCP + gateway tool registration; RegisterPublishTool for publish_to_web
+    register.go        # local + MCP + gateway tool registration; RegisterPublishTool, RegisterGenerateImageTool
     schedule.go        # schedule_create/list/update/remove tools
     session_search.go  # session_search tool
     mcp_tool.go        # MCPTool adapter
     server.go          # ServerTool adapter (gateway tools)
     publish_to_web.go  # publish_to_web tool (path/extension guards + purpose validation; uses internal/uploads)
+    generate_image.go  # generate_image tool (text-to-image via Cloud; arg validation + error classification; uses internal/images)
+    edit_image.go      # edit_image tool (CDN URL prefix check on image_urls; 1–4 sources; uses internal/images)
   uploads/
     client.go          # POST /api/v1/uploads multipart streaming client (typed errors, retry/backoff). Reuses GatewayClient.HTTPClient().
+  images/
+    client.go          # POST /api/v1/images/{generations,edits} JSON client. `Generate` (text→image) and `Edit` (CDN URLs + prompt→image) share `doWithRetry` + `attempt` + `classifyError`. Typed sentinels, 3-attempt retry on ErrTransient. Disambiguates 502/500 sub-codes plus edits-only 400 invalid_image_url (ErrInvalidImageURL) and 413 source_too_large (ErrSourceTooLarge) so "fix-the-args" failures short-circuit (re-running same args wastes paid quota). Reuses GatewayClient.HTTPClient() (600s timeout meets API spec).
   skills/
     registry.go        # skill metadata
     loader.go          # skill loading
@@ -308,4 +312,6 @@ E2E tests in `test/e2e/` split into offline (no API) and live (`SHANNON_E2E_LIVE
 - Session: `session_search` when a session manager is present
 - Cloud: `cloud_delegate` when gateway/cloud access is enabled
 - Cloud: `publish_to_web` when `cloud.enabled` AND `api_key` is configured. Always requires user approval; `purpose` arg is mandatory and shown during the approval prompt. Path blocklist and extension allowlist enforced client-side; never used for backup/sync.
+- Cloud: `generate_image` when `cloud.enabled` AND `api_key` is configured. Text-to-image via Shannon Cloud (`POST /api/v1/images/generations`, server-pinned to `gpt-image-2`). Always requires user approval — output is a permanent public CDN URL plus paid quota consumption. Args: `prompt` (1–32000 chars), `size`/`quality`/`n`/`background` (enum-validated). 504 upstream_timeout and 502 no_images_returned short-circuit without retry (caller should drop quality/n or revise the prompt). For charts / data visualization use the `kocoro-generative-ui` skill instead.
+- Cloud: `edit_image` when `cloud.enabled` AND `api_key` is configured. Image-editing via Shannon Cloud (`POST /api/v1/images/edits`, server-pinned to `gpt-image-2`). Always requires user approval — output is a new permanent public CDN URL plus paid quota. Args: `prompt` (1–32000 chars, the modification instruction), `image_urls` (**1–4 sources, every URL must start with `https://static.kocoro.ai/`** — pre-validated client-side), plus the same `size`/`quality`/`n`/`background` enums. No mask field — describe the region in natural language. 400 invalid_image_url and 413 source_too_large short-circuit without retry (caller should pipe through `generate_image`/`publish_to_web` first or shrink the source). Latency 40–70s (single source, low) up to 200–350s (4 sources, high).
 - Meta: `tool_search` in deferred mode only

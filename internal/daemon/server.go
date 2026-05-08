@@ -3426,6 +3426,8 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		}
 		tools.RegisterCloudDelegate(newReg, s.deps.GW, newCfg, nil, "", "")
 		tools.RegisterPublishTool(newReg, s.deps.GW, newCfg)
+		tools.RegisterGenerateImageTool(newReg, s.deps.GW, newCfg)
+		tools.RegisterEditImageTool(newReg, s.deps.GW, newCfg)
 
 		newGatewayOverlay := tools.ExtractGatewayTools(newReg)
 		newPostOverlays := tools.ExtractPostOverlays(newReg, newBaseline)
@@ -3495,6 +3497,8 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		gwCancel()
 		tools.RegisterCloudDelegate(freshReg, s.deps.GW, newCfg, nil, "", "")
 		tools.RegisterPublishTool(freshReg, s.deps.GW, newCfg)
+		tools.RegisterGenerateImageTool(freshReg, s.deps.GW, newCfg)
+		tools.RegisterEditImageTool(freshReg, s.deps.GW, newCfg)
 		var newGatewayOverlay []agent.Tool
 		if gwErr != nil {
 			log.Printf("daemon: reload: gateway refresh failed, keeping existing overlay: %v", gwErr)

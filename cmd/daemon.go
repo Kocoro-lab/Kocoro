@@ -94,6 +94,8 @@ var daemonStartCmd = &cobra.Command{
 
 		tools.RegisterCloudDelegate(reg, gw, cfg, nil, "", "") // daemon: agent forwarding per-message not yet supported
 		tools.RegisterPublishTool(reg, gw, cfg)
+		tools.RegisterGenerateImageTool(reg, gw, cfg)
+		tools.RegisterEditImageTool(reg, gw, cfg)
 
 		gatewayOverlay := tools.ExtractGatewayTools(reg)
 		postOverlays := tools.ExtractPostOverlays(reg, baselineReg)

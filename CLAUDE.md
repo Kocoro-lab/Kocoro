@@ -117,18 +117,20 @@ internal/
     activated.go       # ActivatedSet + context helpers for scoping secret injection per-run
     validate.go        # ValidateSkillName (Anthropic spec regex)
   tools/
-    register.go        # RegisterLocalTools, RegisterAll, CompleteRegistration, ApplyToolFilter, RegisterPublishTool
+    register.go        # RegisterLocalTools, RegisterAll, CompleteRegistration, ApplyToolFilter, RegisterPublishTool, RegisterGenerateImageTool, RegisterEditImageTool
     # Tool files: file_read, file_write, file_edit, glob, grep, bash,
     # directory_list, think, http, system_info, clipboard, notify, process,
     # applescript, accessibility, ghostty, browser, screenshot, computer,
-    # wait (wait_for), cloud_delegate, publish_to_web, imaging (helper),
-    # pinchtab (legacy), safe_path, skill (use_skill), memory_append
+    # wait (wait_for), cloud_delegate, publish_to_web, generate_image, edit_image,
+    # imaging (helper), pinchtab (legacy), safe_path, skill (use_skill), memory_append
     schedule.go        # schedule_create/list/update/remove tools
     session_search.go  # session_search tool (FTS5 keyword search)
     mcp_tool.go        # MCPTool adapter
     server.go          # ServerTool adapter (gateway remote tools)
   uploads/
     client.go          # POST /api/v1/uploads multipart streaming client (typed errors + retry/backoff). Used by publish_to_web tool. Reuses GatewayClient.HTTPClient() — does not own its own *http.Client.
+  images/
+    client.go          # POST /api/v1/images/{generations,edits} JSON client (typed sentinel errors + 3-attempt retry on ErrTransient). `Generate` (text→image) and `Edit` (CDN URLs + prompt→image) share `doWithRetry` + `attempt` + `classifyError`. Disambiguates 502 sub-codes (upstream_error/no_images_returned/decode_failed/source_fetch_failed), 500 sub-codes (image_failed vs server_misconfigured), and edits-only sub-codes (400 invalid_image_url → ErrInvalidImageURL, 413 source_too_large → ErrSourceTooLarge) so retriable failures retry and "fix-the-args" failures (504, no_images_returned, invalid_image_url, source_too_large) short-circuit. Reuses GatewayClient.HTTPClient() (600s timeout meets API spec).
   tui/
     app.go             # Bubbletea Model — Init/Update/View, slash commands
     doctor.go          # TUI diagnostic checks
@@ -320,4 +322,6 @@ E2E tests in `test/e2e/` are split into offline (no API, runs in CI) and live (n
 - session_search — added when a session manager is available
 - cloud_delegate — added when `cloud.enabled: true`
 - publish_to_web — added when `cloud.enabled: true` AND `cfg.APIKey != ""`. Lives in `internal/tools/publish_to_web.go`; HTTP plumbing in `internal/uploads/client.go` (multipart streaming via `io.Pipe`, 3-attempt retry on `ErrTransient`, sentinel errors for 401/400/413/500-s3_unconfigured/transient). Always requires approval (`RequiresApproval=true`, `IsSafeArgs=false`). Tool-side guards: required `purpose` arg shown to user during approval; path-segment blocklist (`.env`/`.ssh`/`credentials`/…); basename suffix blocklist (`.pem`/`.key`/…); extension allowlist (default html/md/txt/pdf/png/jpg/svg/csv/json/mp4/…). Allowlist extensible via `cloud.publish_allowed_extensions: [".go", ...]`; **denylist is not user-configurable by design**. Registered alongside `cloud_delegate` at all 5 call sites (`cmd/daemon.go`, `cmd/root.go`, `internal/tui/app.go`, `internal/daemon/server.go` reload paths).
+- generate_image — added when `cloud.enabled: true` AND `cfg.APIKey != ""`. Lives in `internal/tools/generate_image.go`; HTTP plumbing in `internal/images/client.go` (POST JSON to `/api/v1/images/generations`, 3-attempt retry on `ErrTransient`, sentinel-typed errors). Always requires approval (`RequiresApproval=true`, `IsSafeArgs=false`) — output is a permanent public CDN URL plus paid quota consumption. Reuses `GatewayClient.HTTPClient()` (600s timeout meets the API spec ≥600s requirement). Args: `prompt` (1–32000 chars, required), `size`/`quality`/`n`/`background` (enum-validated client-side). **Never sends a `model` field** — server pins `gpt-image-2`. Error policy: 504 `upstream_timeout` and 502 `no_images_returned` are `BusinessError` (not retried — re-running same args wastes paid quota); 502 `upstream_error`/`decode_failed`, 500 `image_failed`, 503, network → `Transient`. Registered alongside `cloud_delegate` / `publish_to_web` at all 5 call sites.
+- edit_image — added when `cloud.enabled: true` AND `cfg.APIKey != ""`. Lives in `internal/tools/edit_image.go`; shares `internal/images/client.go` with `generate_image` (`Edit` method posts to `/api/v1/images/edits`; success schema reuses `GenerateResponse`). Always requires approval (paid + permanent public URL). Args: `prompt` (1–32000 chars), `image_urls` (**required, 1–4 entries**, every entry must start with `https://static.kocoro.ai/` — pre-validated client-side via `kocoroCDNPrefix` constant in `edit_image.go` to avoid wasted round-trips), plus the same `size`/`quality`/`n`/`background` enums as `generate_image`. **Never sends a `model` field**, **no mask field** (region described in natural language). New sentinels: `ErrInvalidImageURL` (400 invalid_image_url → `BusinessError`, "rebuild the URL pipeline" — server may also reject for non-prefix reasons), `ErrSourceTooLarge` (413 source_too_large → `ValidationError`, source > 25 MiB OpenAI cap). 502 `source_fetch_failed` falls into the existing `ErrTransient` default branch (3-attempt retry covers spec's "可重试 1 次"). Latency reaches 200–350s for 4 sources at `quality=high`. Registered alongside `generate_image` at all 5 call sites.
 - tool_search — added in deferred mode when tool count > 30 (lives in `internal/agent/deferred.go`, not `tools/`)

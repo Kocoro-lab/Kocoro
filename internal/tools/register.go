@@ -12,6 +12,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	"github.com/Kocoro-lab/ShanClaw/internal/images"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
@@ -475,6 +476,31 @@ func RegisterPublishTool(reg *agent.ToolRegistry, gw *client.GatewayClient, cfg 
 	allow := buildPublishAllowlist(cfg.Cloud.PublishAllowedExtensions)
 	uploadsClient := uploads.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
 	reg.Register(NewPublishToWebTool(uploadsClient, allow))
+}
+
+// RegisterGenerateImageTool registers the generate_image tool. Same gating as
+// publish_to_web: needs the gateway client (for the shared *http.Client) and
+// a configured API key — without a key, /api/v1/images/generations will 401.
+func RegisterGenerateImageTool(reg *agent.ToolRegistry, gw *client.GatewayClient, cfg *config.Config) {
+	if cfg == nil || !cfg.Cloud.Enabled || cfg.APIKey == "" || gw == nil {
+		return
+	}
+	imagesClient := images.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
+	reg.Register(NewGenerateImageTool(imagesClient))
+}
+
+// RegisterEditImageTool registers the edit_image tool. Same gating as
+// generate_image: needs the gateway client (for the shared *http.Client) and
+// a configured API key — without a key, /api/v1/images/edits will 401. The
+// edit endpoint requires image_urls under https://static.kocoro.ai/, so
+// register alongside generate_image and publish_to_web (the two ways to
+// produce CDN URLs the LLM can feed in).
+func RegisterEditImageTool(reg *agent.ToolRegistry, gw *client.GatewayClient, cfg *config.Config) {
+	if cfg == nil || !cfg.Cloud.Enabled || cfg.APIKey == "" || gw == nil {
+		return
+	}
+	imagesClient := images.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
+	reg.Register(NewEditImageTool(imagesClient))
 }
 
 // buildPublishAllowlist merges user-supplied extensions onto the default

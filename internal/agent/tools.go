@@ -190,7 +190,7 @@ func IsSkillExempt(t Tool) bool {
 // unattended runs, and session-level "always allow" must not cover them.
 func DisallowsAutoApproval(toolName string) bool {
 	switch toolName {
-	case "publish_to_web":
+	case "publish_to_web", "generate_image", "edit_image":
 		return true
 	default:
 		return false
