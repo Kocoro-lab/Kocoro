@@ -1466,12 +1466,15 @@ func (h *sseEventHandler) OnCloudPlan(planType, content string, needsReview bool
 // client responds via POST /approval or the request context is cancelled.
 func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
-		if agent.DisallowsAutoApproval(tool) {
-			log.Printf("sse: refusing auto-approval for %s (per-call approval required)", tool)
-			return false
+		if !agent.DisallowsAutoApproval(tool) {
+			log.Printf("sse: auto-approving %s (auto_approve=true)", tool)
+			return true
 		}
-		log.Printf("sse: auto-approving %s (auto_approve=true)", tool)
-		return true
+		log.Printf("sse: %s requires per-call approval (auto_approve=true); prompting via broker", tool)
+	}
+	if h.broker == nil {
+		log.Printf("sse: approval broker unavailable for %s; denying", tool)
+		return false
 	}
 	// Local SSE path: no Cloud claim, so messageID is empty. The broker stays
 	// in-process via its own pending map, no WS envelope round-trips Cloud.

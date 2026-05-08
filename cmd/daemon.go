@@ -674,12 +674,15 @@ func (h *daemonEventHandler) OnRunStatus(code, detail string) {}
 
 func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
-		if agent.DisallowsAutoApproval(tool) {
-			log.Printf("daemon: refusing auto-approval for %s (per-call approval required)", tool)
-			return false
+		if !agent.DisallowsAutoApproval(tool) {
+			log.Printf("daemon: auto-approving %s (auto_approve=true)", tool)
+			return true
 		}
-		log.Printf("daemon: auto-approving %s (auto_approve=true)", tool)
-		return true
+		log.Printf("daemon: %s requires per-call approval (auto_approve=true); prompting via broker", tool)
+	}
+	if h.broker == nil {
+		log.Printf("daemon: approval broker unavailable for %s; denying", tool)
+		return false
 	}
 	decision := h.broker.Request(h.ctx, h.messageID, h.channel, h.threadID, h.agent, tool, args)
 	if decision == daemon.DecisionAlwaysAllow {

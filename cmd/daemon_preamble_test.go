@@ -54,6 +54,57 @@ func TestDaemonEventHandler_OnPreamble_DropsEmptyText(t *testing.T) {
 	}
 }
 
+func TestDaemonEventHandler_AutoApprovePromptsForPerCallTool(t *testing.T) {
+	reqCh := make(chan daemon.ApprovalRequest, 1)
+	var broker *daemon.ApprovalBroker
+	broker = daemon.NewApprovalBroker(func(req daemon.ApprovalRequest) error {
+		reqCh <- req
+		go broker.Resolve(req.RequestID, daemon.DecisionAllow)
+		return nil
+	})
+	handler := &daemonEventHandler{
+		broker:      broker,
+		ctx:         context.Background(),
+		messageID:   "msg-123",
+		channel:     "wecom",
+		threadID:    "thread-1",
+		agent:       "Default",
+		autoApprove: true,
+	}
+
+	if !handler.OnApprovalNeeded("publish_to_web", `{"path":"report.html"}`) {
+		t.Fatal("per-call approval tool should prompt via broker and allow when user allows")
+	}
+	select {
+	case req := <-reqCh:
+		if req.Tool != "publish_to_web" || req.MessageID != "msg-123" || req.Agent != "Default" {
+			t.Fatalf("unexpected approval request: %+v", req)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval broker was not called")
+	}
+}
+
+func TestDaemonEventHandler_AutoApproveSkipsBrokerWhenNotPerCallOnly(t *testing.T) {
+	brokerCalled := false
+	broker := daemon.NewApprovalBroker(func(req daemon.ApprovalRequest) error {
+		brokerCalled = true
+		return nil
+	})
+	handler := &daemonEventHandler{
+		broker:      broker,
+		ctx:         context.Background(),
+		autoApprove: true,
+	}
+
+	if !handler.OnApprovalNeeded("file_read", `{"path":"notes.txt"}`) {
+		t.Fatal("non-per-call tool should still be auto-approved")
+	}
+	if brokerCalled {
+		t.Fatal("non-per-call auto-approved tool should not prompt via broker")
+	}
+}
+
 func httptestNewWebSocketServer(t *testing.T, received chan<- daemon.DaemonMessage) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

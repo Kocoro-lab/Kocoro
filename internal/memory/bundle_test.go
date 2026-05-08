@@ -23,7 +23,7 @@ func TestPuller_VersionOutOfRange(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(Manifest{
 			BundleTs:      "2026-04-19T03-14-00Z",
-			BundleVersion: "0.5.0",
+			BundleVersion: "0.7.0",
 			Files:         []ManifestFile{},
 		})
 	}))
@@ -37,12 +37,12 @@ func TestPuller_VersionOutOfRange(t *testing.T) {
 }
 
 func TestPuller_VersionInRange(t *testing.T) {
-	for _, v := range []string{"0.4.0", "0.4.5", "0.4.99"} {
+	for _, v := range []string{"0.4.0", "0.4.5", "0.4.99", "0.5.0", "0.5.99", "0.6.0", "0.6.99"} {
 		if !versionInRange(v) {
 			t.Fatalf("%q should be in range", v)
 		}
 	}
-	for _, v := range []string{"0.3.9", "0.5.0", "1.0.0", "garbage"} {
+	for _, v := range []string{"0.3.9", "0.7.0", "1.0.0", "garbage"} {
 		if versionInRange(v) {
 			t.Fatalf("%q should NOT be in range", v)
 		}
