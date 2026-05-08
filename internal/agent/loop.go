@@ -60,6 +60,28 @@ func ComputeEffectiveContextWindow(auto bool, configValue int, specificModel, mo
 	return computeEffectiveContextWindow(auto, configValue, specificModel, modelTier)
 }
 
+// preflightCompactThreshold is the fraction of the context window above
+// which a pre-flight compaction is forced before the next LLM call.
+// 0.95 leaves a 5% safety margin over EstimateTokens' chars/3.5 heuristic
+// inaccuracy. Below this, ShouldCompact's 0.85 trigger handles it.
+const preflightCompactThreshold = 0.95
+
+// shouldPreflightCompact returns true when the messages-about-to-be-sent
+// estimate exceeds preflightCompactThreshold * contextWindow.
+//
+// This catches the "next-turn-snapshot" timing gap: the proactive path
+// uses lastPromptTokens from the previous LLM response, which lags behind
+// any tool_results accumulated during the current iteration. A single
+// iteration that loads multiple large file_reads can push history above
+// the cap before the proactive trigger evaluates.
+func shouldPreflightCompact(messages []client.Message, contextWindow int) bool {
+	if contextWindow <= 0 {
+		return false
+	}
+	threshold := int(float64(contextWindow) * preflightCompactThreshold)
+	return ctxwin.EstimateTokens(messages) >= threshold
+}
+
 // buildSkillListing formats a <system-reminder> with skill descriptions
 // for injection as a user message. Uses rune-safe truncation with a total
 // character budget.
@@ -1617,6 +1639,30 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			a.tracker.Enter(PhaseForceStop)
 		}
 
+		// Pre-flight guard for the force-stop final turn. Same rationale as the
+		// main loop guard above. We do NOT gate on compactionApplied here:
+		// force-stop is the last-resort turn and especially must not 400.
+		// MinShapeable gate matches the main-loop site — without enough
+		// messages, ShapeHistory is a no-op and the summary call wastes tokens.
+		if shouldPreflightCompact(messages, a.contextWindow) && len(messages) > ctxwin.MinShapeable() {
+			if rs, ok := a.handler.(RunStatusHandler); ok {
+				rs.OnRunStatus("preflight_compaction",
+					fmt.Sprintf("force-stop turn estimate %d tokens >= %.0f%% of %d cap",
+						ctxwin.EstimateTokens(messages), preflightCompactThreshold*100, a.contextWindow))
+			}
+			emergencyMessages := cloneMessages(messages)
+			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
+			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, emergencyMessages)
+			restoreLLM()
+			a.emitInternalUsage(sumUsage)
+			if sumErr == nil {
+				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow)
+			} else {
+				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow)
+			}
+		}
+
 		req := client.CompletionRequest{
 			Messages:        a.messagesForLLM(messages),
 			ModelTier:       a.modelTier,
@@ -2103,6 +2149,79 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				}
 				contextBloatStatusSent = true
 			}
+		}
+
+		// Pre-flight prompt-size guard: if the soon-to-be-sent prompt estimates
+		// over 95% of the context window, force an emergency compaction before
+		// the API call. Last-defense for the next-turn-snapshot timing gap that
+		// caused the 2026-05-07 incident.
+		//
+		// MinShapeable gate mirrors the proactive trigger at line ~1976: when
+		// there are too few messages, ShapeHistory is a no-op, so summarizing
+		// just wastes an LLM call without reducing prompt size. The system
+		// prompt itself can exceed thresholds in artificially-small context
+		// windows (test fixtures or pinned configs); fire-without-shape would
+		// repeatedly burn calls until lastPromptTokens drops back under 85%.
+		if shouldPreflightCompact(messages, a.contextWindow) && !compactionApplied && !reactiveCompacted && len(messages) > ctxwin.MinShapeable() {
+			a.tracker.Enter(PhaseCompacting)
+			if rs, ok := a.handler.(RunStatusHandler); ok {
+				rs.OnRunStatus("preflight_compaction",
+					fmt.Sprintf("estimate %d tokens >= %.0f%% of %d cap",
+						ctxwin.EstimateTokens(messages), preflightCompactThreshold*100, a.contextWindow))
+			}
+
+			// Build summary and shape, mirroring the reactive emergency profile.
+			emergencyMessages := cloneMessages(messages)
+			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
+			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, emergencyMessages)
+			restoreLLM()
+			a.emitInternalUsage(sumUsage)
+			before := len(messages)
+			if sumErr == nil {
+				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow)
+			} else {
+				// Summary failed; ShapeHistory without summary still drops middle messages.
+				// Telemetry handled in Task 5 — for this task, keep stderr to avoid duplicate work.
+				fmt.Fprintf(os.Stderr, "[context] preflight summary failed, shaping without summary: %v\n", sumErr)
+				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow)
+			}
+			if dropped := before - len(messages); dropped > 0 {
+				fmt.Fprintf(os.Stderr, "[context] preflight compacted: %d → %d messages\n", before, len(messages))
+				newMsgOffset -= dropped
+				if newMsgOffset < 1 {
+					newMsgOffset = 1
+				}
+				rebased := make(map[int]bool, len(injectedIndices))
+				for idx := range injectedIndices {
+					newIdx := idx - dropped
+					if newIdx >= newMsgOffset {
+						rebased[newIdx] = true
+					}
+				}
+				injectedIndices = rebased
+
+				rebasedDelta := make(map[int]bool, len(deltaIndices))
+				for idx := range deltaIndices {
+					newIdx := idx - dropped
+					if newIdx >= newMsgOffset {
+						rebasedDelta[newIdx] = true
+					}
+				}
+				deltaIndices = rebasedDelta
+
+				rebasedTS := make(map[int]time.Time, len(msgTimestamps))
+				for idx, ts := range msgTimestamps {
+					newIdx := idx - dropped
+					if newIdx >= newMsgOffset {
+						rebasedTS[newIdx] = ts
+					}
+				}
+				msgTimestamps = rebasedTS
+			}
+			compactionApplied = true
+			reanchorActiveTask(MetaBoundaryPostCompaction)
+			a.tracker.MarkDirty()
 		}
 
 		// Call LLM — streaming or blocking

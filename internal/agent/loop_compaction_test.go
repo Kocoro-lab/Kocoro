@@ -1336,3 +1336,35 @@ func TestEffectiveContextWindow_AutoFromModel(t *testing.T) {
 		})
 	}
 }
+
+func TestPreflightCompaction_TriggersBeforeOversizedCall(t *testing.T) {
+	// Build a message slice that estimates above 0.95 * contextWindow.
+	// Use 1.5M chars ≈ 428K tokens; with contextWindow = 200_000, that's
+	// way over the 95% threshold (190K).
+	bigText := strings.Repeat("x", 1_500_000)
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "user", Content: client.NewTextContent(bigText)},
+	}
+
+	// shouldPreflightCompact is the decision function under test.
+	got := shouldPreflightCompact(messages, 200_000)
+	if !got {
+		t.Errorf("shouldPreflightCompact = false, want true (msg estimate exceeds 95%% of 200K)")
+	}
+
+	// Negative case: well-under-budget should not trigger.
+	smallMsgs := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("hi")},
+	}
+	if shouldPreflightCompact(smallMsgs, 200_000) {
+		t.Errorf("shouldPreflightCompact = true on under-budget messages")
+	}
+
+	// Edge: contextWindow=0 (disabled) → never trigger.
+	if shouldPreflightCompact(messages, 0) {
+		t.Errorf("shouldPreflightCompact = true with contextWindow=0; should be disabled")
+	}
+}
