@@ -326,6 +326,50 @@ func TestGenerateNetworkErrorRetried(t *testing.T) {
 	}
 }
 
+// TestGenerateContextCanceledDuringBackoff covers the path where ctx is
+// canceled while doWithRetry is sleeping between attempts. The select inside
+// doWithRetry must observe ctx.Done() and return ctx.Err() — without this
+// branch a canceled ctx would silently survive the backoff and proceed to
+// another attempt.
+func TestGenerateContextCanceledDuringBackoff(t *testing.T) {
+	var calls int32
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(503) // transient → schedules a retry with non-zero backoff
+	}))
+	defer srv.Close()
+
+	// Override backoff so attempt 2 sleeps long enough to be interrupted.
+	c.backoff = func(attempt int) time.Duration {
+		if attempt == 1 {
+			return 0
+		}
+		return 200 * time.Millisecond
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Wait for the first attempt to land at the server (advancing into
+		// the backoff sleep), then cancel.
+		for atomic.LoadInt32(&calls) < 1 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond) // ensure we're inside the sleep
+		cancel()
+	}()
+
+	_, err := c.Generate(ctx, GenerateRequest{Prompt: "x"})
+	if err == nil {
+		t.Fatal("expected ctx-canceled error from doWithRetry sleep")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("expected exactly 1 server hit (cancel during backoff prevents attempt 2), got %d", got)
+	}
+}
+
 func TestGenerateContextCanceled(t *testing.T) {
 	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {

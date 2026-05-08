@@ -55,6 +55,46 @@ func TestGenerateImagePromptTooLong(t *testing.T) {
 	}
 }
 
+// TestGenerateImagePromptRuneVsByte guards the rune-count enforcement.
+// A CJK prompt of 16000 runes is ~48000 bytes — over the byte limit but
+// well under the rune limit (32000), so it MUST be accepted. Using len()
+// (bytes) would have rejected it client-side before the server got a chance.
+func TestGenerateImagePromptRuneVsByte(t *testing.T) {
+	fake := &fakeImageGen{
+		resp: &images.GenerateResponse{
+			Images: []images.Image{{URL: "https://cdn/x.png", ContentType: "image/png"}},
+			Model:  "gpt-image-2",
+			Size:   "1024x1024",
+		},
+	}
+	tool := NewGenerateImageTool(fake)
+
+	// 16000 CJK runes (each 3 bytes in UTF-8) → 48000 bytes, 16000 runes.
+	cjk := strings.Repeat("漢", 16000)
+	res, _ := tool.Run(context.Background(), `{"prompt":"`+cjk+`"}`)
+	if res.IsError {
+		t.Fatalf("16000-rune CJK prompt must be accepted (well under 32000 max), got %+v", res)
+	}
+
+	// At exactly 32000 runes — boundary, still accepted.
+	at := strings.Repeat("漢", imagePromptMaxLen)
+	res, _ = tool.Run(context.Background(), `{"prompt":"`+at+`"}`)
+	if res.IsError {
+		t.Fatalf("32000-rune CJK prompt at boundary must be accepted, got %+v", res)
+	}
+
+	// 32001 runes — one over, must reject. Rune count, not byte count, in
+	// the error message.
+	over := strings.Repeat("漢", imagePromptMaxLen+1)
+	res, _ = tool.Run(context.Background(), `{"prompt":"`+over+`"}`)
+	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
+		t.Fatalf("32001-rune prompt must be rejected, got %+v", res)
+	}
+	if !strings.Contains(res.Content, "32001") {
+		t.Errorf("error message should report rune count 32001, got %q", res.Content)
+	}
+}
+
 func TestGenerateImageNOutOfRange(t *testing.T) {
 	tool := NewGenerateImageTool(&fakeImageGen{})
 	res, _ := tool.Run(context.Background(), `{"prompt":"x","n":11}`)

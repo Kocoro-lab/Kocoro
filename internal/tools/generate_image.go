@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/images"
@@ -114,10 +115,13 @@ func (t *GenerateImageTool) Run(ctx context.Context, argsJSON string) (agent.Too
 	if prompt == "" {
 		return agent.ValidationError("prompt is required"), nil
 	}
-	if len(prompt) > imagePromptMaxLen {
+	// API spec says "1..32000 chars" — rune-counted to match JSON Schema
+	// maxLength semantics. Using len() (bytes) would reject CJK / emoji
+	// prompts at ~10000 visible characters, well before the server would.
+	if runeCount := utf8.RuneCountInString(prompt); runeCount > imagePromptMaxLen {
 		return agent.ValidationError(fmt.Sprintf(
 			"prompt too long: %d chars (max %d). Trim the prompt to the essentials.",
-			len(prompt), imagePromptMaxLen,
+			runeCount, imagePromptMaxLen,
 		)), nil
 	}
 

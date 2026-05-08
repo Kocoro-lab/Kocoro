@@ -63,6 +63,37 @@ func TestEditImagePromptTooLong(t *testing.T) {
 	}
 }
 
+// TestEditImagePromptRuneVsByte mirrors TestGenerateImagePromptRuneVsByte —
+// rune-counted enforcement so multibyte prompts up to 32000 runes are accepted
+// even though byte length exceeds the same number.
+func TestEditImagePromptRuneVsByte(t *testing.T) {
+	fake := &fakeImageEdit{
+		resp: &images.GenerateResponse{
+			Images: []images.Image{{URL: "https://cdn/x.png", ContentType: "image/png"}},
+			Model:  "gpt-image-2",
+			Size:   "1024x1024",
+		},
+	}
+	tool := NewEditImageTool(fake)
+
+	cjk := strings.Repeat("漢", 16000)
+	res, _ := tool.Run(context.Background(),
+		`{"prompt":"`+cjk+`","image_urls":["`+editTestSrc+`"]}`)
+	if res.IsError {
+		t.Fatalf("16000-rune CJK prompt must be accepted, got %+v", res)
+	}
+
+	over := strings.Repeat("漢", imagePromptMaxLen+1)
+	res, _ = tool.Run(context.Background(),
+		`{"prompt":"`+over+`","image_urls":["`+editTestSrc+`"]}`)
+	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
+		t.Fatalf("32001-rune prompt must be rejected, got %+v", res)
+	}
+	if !strings.Contains(res.Content, "32001") {
+		t.Errorf("error message should report rune count 32001, got %q", res.Content)
+	}
+}
+
 func TestEditImageMissingImageURLs(t *testing.T) {
 	tool := NewEditImageTool(&fakeImageEdit{})
 	for _, a := range []string{

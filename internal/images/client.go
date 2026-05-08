@@ -26,7 +26,7 @@ import (
 //   - Prompt:     1..32000 chars, required.
 //   - Size:       "1024x1024" / "1024x1536" / "1536x1024" / "auto"; empty = server default.
 //   - Quality:    "auto" / "low" / "medium" / "high"; empty = server default.
-//   - N:          1..10; 0 sent as-is so server applies its default.
+//   - N:          1..10; 0 = use server default (omitted from request via `omitempty`).
 //   - Background: "transparent" / "opaque" / "auto"; empty = unset.
 //
 // IMPORTANT: do NOT add a Model field. The server pins gpt-image-2 and
@@ -51,7 +51,7 @@ type GenerateRequest struct {
 //     returns 400 invalid_image_url for non-CDN URLs.
 //   - Size:       "1024x1024" / "1024x1536" / "1536x1024" / "auto"; empty = server default.
 //   - Quality:    "auto" / "low" / "medium" / "high"; empty = server default.
-//   - N:          1..10; 0 sent as-is so server applies its default.
+//   - N:          1..10; 0 = use server default (omitted from request via `omitempty`).
 //   - Background: "transparent" / "opaque" / "auto"; empty = unset.
 //
 // IMPORTANT: do NOT add a Model field — the server pins gpt-image-2 and

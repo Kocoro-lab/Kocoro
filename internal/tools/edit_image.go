@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/images"
@@ -129,10 +130,12 @@ func (t *EditImageTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 	if prompt == "" {
 		return agent.ValidationError("prompt is required"), nil
 	}
-	if len(prompt) > imagePromptMaxLen {
+	// API spec says "1..32000 chars" — rune-counted to match JSON Schema
+	// maxLength semantics. See generate_image.go for the rationale.
+	if runeCount := utf8.RuneCountInString(prompt); runeCount > imagePromptMaxLen {
 		return agent.ValidationError(fmt.Sprintf(
 			"prompt too long: %d chars (max %d). Trim the prompt to the essentials.",
-			len(prompt), imagePromptMaxLen,
+			runeCount, imagePromptMaxLen,
 		)), nil
 	}
 
