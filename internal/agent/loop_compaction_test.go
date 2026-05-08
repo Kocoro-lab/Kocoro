@@ -1440,3 +1440,263 @@ func TestPreflightCompaction_TriggersBeforeOversizedCall(t *testing.T) {
 		t.Errorf("shouldPreflightCompact = true with contextWindow=0; should be disabled")
 	}
 }
+
+// TestAgentLoop_ReactiveCompaction_RecoversFromOversizedTranscript is the E2E
+// regression for the 2026-05-07 production cascade:
+//
+//  1. Session arrives with a multi-megabyte transcript (huge plain-text user
+//     and assistant turns from previous interactions).
+//  2. First main-tier completion call returns HTTP 400 "prompt is too long".
+//  3. Reactive recovery fires: PersistLearnings → compressOldToolResults
+//     → GenerateSummary (small-tier) → ShapeHistory → retry.
+//  4. Pre-fix bug: GenerateSummary received the same ~1M-char transcript and
+//     itself returned 400 with "prompt is too long", surfacing a hard error
+//     to the user.
+//  5. Post-fix (Task 3): capTranscriptForSummarize truncates the transcript
+//     head+tail to summarizeInputCapChars (540K) before the small-tier call,
+//     keeping the summarizer comfortably under Haiku 4.5's 200K context window.
+//
+// We use plain text messages (not tool_result blocks) so compressOldToolResults
+// is a no-op — the only line of defense that should kick in here is Task 3's
+// cap. We also keep the message count below ctxwin.MinShapeable() (9) so the
+// preflight compaction path does not fire and steal the test scenario; the 400
+// response is the only path into reactive recovery.
+func TestAgentLoop_ReactiveCompaction_RecoversFromOversizedTranscript(t *testing.T) {
+	// Mirrors internal/context/summarize.go's summarizeInputCapChars constant;
+	// kept as a local literal because the source-of-truth constant is unexported.
+	// If you bump the cap there, bump this assertion too.
+	const summarizeInputCapCharsLocal = 540_000
+
+	memoryDir := t.TempDir()
+
+	var mu sync.Mutex
+	var calls []string
+	var maxSummaryUserChars int // peak observed body length on small-tier SUMMARY calls
+
+	contextErrorReturned := false
+	retrySucceeded := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := readBody(r.Body)
+		defer r.Body.Close()
+
+		var req struct {
+			ModelTier string `json:"model_tier"`
+			Messages  []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		json.Unmarshal(raw, &req)
+
+		mu.Lock()
+		callNum := len(calls) + 1
+
+		if req.ModelTier == "small" {
+			isPersist := false
+			isSummary := false
+			summaryUserChars := 0
+			for _, m := range req.Messages {
+				var text string
+				json.Unmarshal(m.Content, &text)
+				if strings.Contains(text, "extracting durable knowledge") {
+					isPersist = true
+				}
+				if strings.Contains(text, "Compress the following conversation") {
+					isSummary = true
+				}
+				if m.Role == "user" {
+					// Track length of the user-content portion — this is the
+					// transcript that capTranscriptForSummarize is supposed to
+					// cap. The system message (the summary prompt) is fixed and
+					// not the load-bearing variable.
+					if len(text) > summaryUserChars {
+						summaryUserChars = len(text)
+					}
+				}
+			}
+
+			if isPersist {
+				calls = append(calls, fmt.Sprintf("call %d: PERSIST", callNum))
+				mu.Unlock()
+				t.Logf("Call %d: [small] PersistLearnings (messages: %d)", callNum, len(req.Messages))
+				json.NewEncoder(w).Encode(nativeResponse(
+					"- Reactive recovery exercised cap on oversized transcript",
+					"end_turn", nil, 50, 30))
+				return
+			}
+			if isSummary {
+				if summaryUserChars > maxSummaryUserChars {
+					maxSummaryUserChars = summaryUserChars
+				}
+				calls = append(calls, fmt.Sprintf("call %d: SUMMARY (user_chars=%d)", callNum, summaryUserChars))
+				mu.Unlock()
+				t.Logf("Call %d: [small] GenerateSummary (user_content_chars=%d)", callNum, summaryUserChars)
+				// Return a valid <summary> wrapper so extractSummary yields non-empty content;
+				// otherwise ShapeHistory falls back to sliding-window without a summary, which
+				// is a separate code path from what we want to exercise here.
+				json.NewEncoder(w).Encode(nativeResponse(
+					"<summary>Earlier session covered analysis of multiple components before the context overflowed.</summary>",
+					"end_turn", nil, 50, 30))
+				return
+			}
+
+			calls = append(calls, fmt.Sprintf("call %d: small-other", callNum))
+			mu.Unlock()
+			json.NewEncoder(w).Encode(nativeResponse("ok", "end_turn", nil, 50, 30))
+			return
+		}
+
+		// Main-tier call: first one returns 400, subsequent calls succeed.
+		msgCount := len(req.Messages)
+		if !contextErrorReturned {
+			contextErrorReturned = true
+			calls = append(calls, fmt.Sprintf("call %d: CONTEXT_ERROR (msgs=%d)", callNum, msgCount))
+			mu.Unlock()
+			t.Logf("Call %d: [main] → 400 prompt is too long (msgs=%d)", callNum, msgCount)
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"prompt is too long"}}`))
+			return
+		}
+
+		retrySucceeded = true
+		calls = append(calls, fmt.Sprintf("call %d: RETRY_SUCCESS (msgs=%d)", callNum, msgCount))
+		mu.Unlock()
+		t.Logf("Call %d: [main] end_turn after reactive compaction (msgs=%d)", callNum, msgCount)
+		json.NewEncoder(w).Encode(nativeResponse(
+			"Recovered after reactive compaction with size-capped summary.",
+			"end_turn", nil, 800, 100))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&thinkTool{})
+
+	handler := &mockHandler{approveResult: true}
+
+	// Six pre-existing messages (3 user/assistant turns) of ~200K chars each
+	// → ~1.2M chars total transcript. After buildTranscript prefixes each
+	// message with "[role]: ", that's still well over summarizeInputCapChars
+	// (540K). Without Task 3's cap, the small-tier SUMMARY call would receive
+	// the full ~1.2M-char transcript and 400 with "prompt is too long",
+	// reproducing the production cascade.
+	//
+	// Plain text (not tool_result blocks) is intentional:
+	//   - tool_result is truncated to 450 chars per block by summarizeToolResult,
+	//     which would short-circuit the cap path and make this test prove
+	//     nothing about Task 3.
+	//   - Plain text in user/assistant messages flows through messageText
+	//     untouched, so the only line of defense between buildTranscript and
+	//     the small-tier model is capTranscriptForSummarize.
+	//
+	// Six messages keeps the count below ctxwin.MinShapeable() (9), which gates
+	// the preflight compaction path. We want the 400 response to be the ONLY
+	// trigger of reactive recovery; preflight firing first would shape the
+	// transcript before we ever see the 400 and the test would prove nothing
+	// about the reactive→summary cap interaction.
+	const perMsgChars = 200_000
+	hugeUser := strings.Repeat("u", perMsgChars)
+	hugeAssistant := strings.Repeat("a", perMsgChars)
+	history := []client.Message{
+		{Role: "user", Content: client.NewTextContent(hugeUser)},
+		{Role: "assistant", Content: client.NewTextContent(hugeAssistant)},
+		{Role: "user", Content: client.NewTextContent(hugeUser)},
+		{Role: "assistant", Content: client.NewTextContent(hugeAssistant)},
+		{Role: "user", Content: client.NewTextContent(hugeUser)},
+		{Role: "assistant", Content: client.NewTextContent(hugeAssistant)},
+	}
+	totalHistoryChars := 6 * perMsgChars
+	t.Logf("Seeded history: 6 messages × %d chars = %d chars total (over the %d-char small-tier cap)",
+		perMsgChars, totalHistoryChars, summarizeInputCapCharsLocal)
+
+	loop := NewAgentLoop(gw, reg, "medium", "", 20, 2000, 200, nil, nil, nil)
+	// Big context window so the proactive 0.85 gate doesn't fire on
+	// lastInputTokens (which our mock reports as 800/100, well under any cap).
+	// The 400 response is the only trigger we want for reactive recovery.
+	loop.SetContextWindow(2_000_000)
+	loop.SetMemoryDir(memoryDir)
+	loop.SetHandler(handler)
+
+	result, usage, err := loop.Run(context.Background(),
+		"Continue the analysis after the prior session.",
+		nil, history)
+	if err != nil {
+		t.Fatalf("expected reactive recovery to succeed, got error: %v", err)
+	}
+
+	mu.Lock()
+	t.Logf("\n=== Call sequence (%d total) ===", len(calls))
+	for _, c := range calls {
+		t.Logf("  %s", c)
+	}
+
+	hasPersist := false
+	hasSummary := false
+	hasContextError := false
+	hasRetrySuccess := false
+	for _, c := range calls {
+		if strings.Contains(c, "PERSIST") {
+			hasPersist = true
+		}
+		if strings.Contains(c, "SUMMARY") {
+			hasSummary = true
+		}
+		if strings.Contains(c, "CONTEXT_ERROR") {
+			hasContextError = true
+		}
+		if strings.Contains(c, "RETRY_SUCCESS") {
+			hasRetrySuccess = true
+		}
+	}
+	peakSummaryChars := maxSummaryUserChars
+	mu.Unlock()
+
+	t.Logf("Result: %d chars", len(result))
+	t.Logf("Usage: %d LLM calls", usage.LLMCalls)
+	t.Logf("Peak SUMMARY user-content body length: %d chars (cap=%d, raw transcript would be ~%d)",
+		peakSummaryChars, summarizeInputCapCharsLocal, totalHistoryChars)
+
+	if !hasContextError {
+		t.Error("expected the mock's main-tier 400 to fire (reactive recovery entry point)")
+	}
+	if !hasPersist {
+		t.Error("expected PersistLearnings during reactive compaction")
+	}
+	if !hasSummary {
+		t.Error("expected GenerateSummary during reactive compaction")
+	}
+	if !hasRetrySuccess {
+		t.Error("expected the post-recovery main-tier retry to succeed")
+	}
+	if !retrySucceeded {
+		t.Error("retrySucceeded flag should be true")
+	}
+	if result == "" {
+		t.Error("expected non-empty result after successful retry")
+	}
+
+	// The Task 3 assertion. Without capTranscriptForSummarize, peakSummaryChars
+	// would be ~1.2M (the raw buildTranscript output) and the small-tier call
+	// would 400 just like the main-tier, ending the cascade in a hard error
+	// to the user. With the cap, peakSummaryChars should sit at or just under
+	// summarizeInputCapChars (540K) — never above.
+	if peakSummaryChars == 0 {
+		t.Fatalf("peak SUMMARY body length is 0; the small-tier SUMMARY call was never observed")
+	}
+	if peakSummaryChars > summarizeInputCapCharsLocal {
+		t.Errorf("peak SUMMARY user-content body length = %d, want ≤ %d (summarizeInputCapChars).\n"+
+			"This is the regression for the 2026-05-07 cascade: capTranscriptForSummarize\n"+
+			"failed to apply, so the small-tier summarizer received the full oversized\n"+
+			"transcript and would 400 in production.",
+			peakSummaryChars, summarizeInputCapCharsLocal)
+	}
+	// Also assert the cap was actually exercised (binding) — if peakSummaryChars
+	// is way under 540K, the test scenario didn't actually push hard enough to
+	// prove anything about the cap.
+	if peakSummaryChars < summarizeInputCapCharsLocal/2 {
+		t.Errorf("peak SUMMARY user-content body length = %d, expected the cap to be binding (≥ %d).\n"+
+			"The seeded transcript may not be large enough to actually exercise capTranscriptForSummarize.",
+			peakSummaryChars, summarizeInputCapCharsLocal/2)
+	}
+}
