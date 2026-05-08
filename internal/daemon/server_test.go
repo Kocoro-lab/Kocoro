@@ -129,6 +129,53 @@ func TestServer_GlobalSkillStickyRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSSEEventHandler_AutoApprovePromptsForPerCallTool(t *testing.T) {
+	reqCh := make(chan ApprovalRequest, 1)
+	var broker *ApprovalBroker
+	broker = NewApprovalBroker(func(req ApprovalRequest) error {
+		reqCh <- req
+		go broker.Resolve(req.RequestID, DecisionAllow)
+		return nil
+	})
+	handler := &sseEventHandler{
+		broker:      broker,
+		ctx:         context.Background(),
+		autoApprove: true,
+	}
+
+	if !handler.OnApprovalNeeded("publish_to_web", `{"path":"report.html"}`) {
+		t.Fatal("per-call approval tool should prompt via broker and allow when user allows")
+	}
+	select {
+	case req := <-reqCh:
+		if req.Tool != "publish_to_web" {
+			t.Fatalf("unexpected approval request: %+v", req)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval broker was not called")
+	}
+}
+
+func TestSSEEventHandler_AutoApproveStillSkipsBrokerForSafeTool(t *testing.T) {
+	brokerCalled := false
+	broker := NewApprovalBroker(func(req ApprovalRequest) error {
+		brokerCalled = true
+		return nil
+	})
+	handler := &sseEventHandler{
+		broker:      broker,
+		ctx:         context.Background(),
+		autoApprove: true,
+	}
+
+	if !handler.OnApprovalNeeded("bash", `{"command":"pwd"}`) {
+		t.Fatal("safe tool should still be auto-approved")
+	}
+	if brokerCalled {
+		t.Fatal("safe auto-approved tool should not prompt via broker")
+	}
+}
+
 func TestServer_Health(t *testing.T) {
 	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
 	srv := NewServer(0, c, nil, "test")
