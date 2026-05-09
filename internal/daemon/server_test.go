@@ -130,29 +130,33 @@ func TestServer_GlobalSkillStickyRoundTrip(t *testing.T) {
 }
 
 func TestSSEEventHandler_AutoApprovePromptsForPerCallTool(t *testing.T) {
-	reqCh := make(chan ApprovalRequest, 1)
-	var broker *ApprovalBroker
-	broker = NewApprovalBroker(func(req ApprovalRequest) error {
-		reqCh <- req
-		go broker.Resolve(req.RequestID, DecisionAllow)
-		return nil
-	})
-	handler := &sseEventHandler{
-		broker:      broker,
-		ctx:         context.Background(),
-		autoApprove: true,
-	}
+	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
+		t.Run(tool, func(t *testing.T) {
+			reqCh := make(chan ApprovalRequest, 1)
+			var broker *ApprovalBroker
+			broker = NewApprovalBroker(func(req ApprovalRequest) error {
+				reqCh <- req
+				go broker.Resolve(req.RequestID, DecisionAllow)
+				return nil
+			})
+			handler := &sseEventHandler{
+				broker:      broker,
+				ctx:         context.Background(),
+				autoApprove: true,
+			}
 
-	if !handler.OnApprovalNeeded("publish_to_web", `{"path":"report.html"}`) {
-		t.Fatal("per-call approval tool should prompt via broker and allow when user allows")
-	}
-	select {
-	case req := <-reqCh:
-		if req.Tool != "publish_to_web" {
-			t.Fatalf("unexpected approval request: %+v", req)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("approval broker was not called")
+			if !handler.OnApprovalNeeded(tool, `{"path":"report.html"}`) {
+				t.Fatalf("per-call approval tool %s should prompt via broker and allow when user allows", tool)
+			}
+			select {
+			case req := <-reqCh:
+				if req.Tool != tool {
+					t.Fatalf("unexpected approval request: %+v", req)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("approval broker was not called for %s", tool)
+			}
+		})
 	}
 }
 

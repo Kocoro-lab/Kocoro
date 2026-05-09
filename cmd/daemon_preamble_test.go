@@ -55,33 +55,37 @@ func TestDaemonEventHandler_OnPreamble_DropsEmptyText(t *testing.T) {
 }
 
 func TestDaemonEventHandler_AutoApprovePromptsForPerCallTool(t *testing.T) {
-	reqCh := make(chan daemon.ApprovalRequest, 1)
-	var broker *daemon.ApprovalBroker
-	broker = daemon.NewApprovalBroker(func(req daemon.ApprovalRequest) error {
-		reqCh <- req
-		go broker.Resolve(req.RequestID, daemon.DecisionAllow)
-		return nil
-	})
-	handler := &daemonEventHandler{
-		broker:      broker,
-		ctx:         context.Background(),
-		messageID:   "msg-123",
-		channel:     "wecom",
-		threadID:    "thread-1",
-		agent:       "Default",
-		autoApprove: true,
-	}
+	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
+		t.Run(tool, func(t *testing.T) {
+			reqCh := make(chan daemon.ApprovalRequest, 1)
+			var broker *daemon.ApprovalBroker
+			broker = daemon.NewApprovalBroker(func(req daemon.ApprovalRequest) error {
+				reqCh <- req
+				go broker.Resolve(req.RequestID, daemon.DecisionAllow)
+				return nil
+			})
+			handler := &daemonEventHandler{
+				broker:      broker,
+				ctx:         context.Background(),
+				messageID:   "msg-123",
+				channel:     "wecom",
+				threadID:    "thread-1",
+				agent:       "Default",
+				autoApprove: true,
+			}
 
-	if !handler.OnApprovalNeeded("publish_to_web", `{"path":"report.html"}`) {
-		t.Fatal("per-call approval tool should prompt via broker and allow when user allows")
-	}
-	select {
-	case req := <-reqCh:
-		if req.Tool != "publish_to_web" || req.MessageID != "msg-123" || req.Agent != "Default" {
-			t.Fatalf("unexpected approval request: %+v", req)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("approval broker was not called")
+			if !handler.OnApprovalNeeded(tool, `{"path":"report.html"}`) {
+				t.Fatalf("per-call approval tool %s should prompt via broker and allow when user allows", tool)
+			}
+			select {
+			case req := <-reqCh:
+				if req.Tool != tool || req.MessageID != "msg-123" || req.Agent != "Default" {
+					t.Fatalf("unexpected approval request: %+v", req)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("approval broker was not called for %s", tool)
+			}
+		})
 	}
 }
 

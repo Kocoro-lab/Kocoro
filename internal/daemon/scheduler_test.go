@@ -61,8 +61,10 @@ func TestFormatConversationContext_EmptyInput(t *testing.T) {
 
 func TestScheduleHandlerBlocksPerCallApprovalTools(t *testing.T) {
 	h := &scheduleHandler{}
-	if h.OnApprovalNeeded("publish_to_web", `{}`) {
-		t.Fatal("scheduled runs must not auto-approve publish_to_web")
+	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
+		if h.OnApprovalNeeded(tool, `{}`) {
+			t.Fatalf("scheduled runs must not auto-approve %s", tool)
+		}
 	}
 	if !h.OnApprovalNeeded("bash", `{}`) {
 		t.Fatal("scheduled runs should keep auto-approving ordinary tools")
