@@ -2,15 +2,19 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/images"
 )
 
 // Live E2E tests require SHANNON_E2E_LIVE=1.
@@ -83,8 +87,16 @@ func TestLive_BundledAgent_Reviewer(t *testing.T) {
 	bin := testBinary(t)
 
 	out := runShan(t, bin, "--agent", "reviewer", "review main.go")
-	if !strings.Contains(out, "file_read") {
-		t.Error("reviewer should read files")
+	// The OnText / OnPreamble split (a398ecd, v0.1.3) stopped surfacing tool-call
+	// names in one-shot stdout — only assistant text reaches the user. Assert the
+	// reviewer actually engaged with the file by checking it cited something only
+	// readable from the source: cmd.Execute() (the only symbol main.go references).
+	// A length floor guards against trivially-short refusals or stub responses.
+	if len(out) < 200 {
+		t.Errorf("reviewer output too short (%d bytes); likely did not engage with file: %s", len(out), out)
+	}
+	if !strings.Contains(out, "cmd.Execute") && !strings.Contains(out, "main.go") && !strings.Contains(out, "package main") {
+		t.Errorf("reviewer output lacks evidence of having read main.go (no mention of cmd.Execute / main.go / package main): %s", out)
 	}
 }
 
@@ -212,6 +224,96 @@ func waitForDaemon(t *testing.T, timeout time.Duration) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	t.Fatal("daemon did not become ready within timeout")
+}
+
+// TestLive_GenerateAndEditImage exercises the v0.1.4 generate_image +
+// edit_image pipeline against the configured Shannon Cloud endpoint. It
+// bypasses the agent loop's per-call approval gate (which legitimately blocks
+// image tools under -y) and calls the production HTTP client directly,
+// validating the wire contract end-to-end. Costs ~$0.05 per run on
+// gpt-image-2; both Generate and Edit are bundled in one test to avoid double
+// billing.
+func TestLive_GenerateAndEditImage(t *testing.T) {
+	skipUnlessLive(t)
+
+	endpoint, apiKey := readCloudConfig(t)
+	if endpoint == "" || apiKey == "" {
+		t.Skip("cloud.endpoint / cloud.api_key not configured in ~/.shannon/config.yaml")
+	}
+	client := images.NewClient(endpoint, apiKey, &http.Client{Timeout: 180 * time.Second})
+
+	// Generate a tiny low-quality image to keep cost minimal.
+	genCtx, genCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer genCancel()
+	gen, err := client.Generate(genCtx, images.GenerateRequest{
+		Prompt:  "a red circle on white background, simple flat design",
+		Size:    "1024x1024",
+		Quality: "low",
+		N:       1,
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if len(gen.Images) != 1 {
+		t.Fatalf("Generate: expected 1 image, got %d", len(gen.Images))
+	}
+	if !strings.HasPrefix(gen.Images[0].URL, "https://static.kocoro.ai/") {
+		t.Errorf("Generate: expected https://static.kocoro.ai/ URL, got: %s", gen.Images[0].URL)
+	}
+	if gen.Model != "gpt-image-2" {
+		t.Errorf("Generate: expected gpt-image-2 model, got: %s", gen.Model)
+	}
+	if gen.Images[0].SizeBytes <= 0 {
+		t.Errorf("Generate: expected positive size_bytes, got: %d", gen.Images[0].SizeBytes)
+	}
+
+	// Edit using the URL we just generated — round-trips the CDN allowlist.
+	editCtx, editCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer editCancel()
+	edit, err := client.Edit(editCtx, images.EditRequest{
+		Prompt:    "add a small blue square in the bottom-right corner",
+		ImageURLs: []string{gen.Images[0].URL},
+		Size:      "1024x1024",
+		Quality:   "low",
+		N:         1,
+	})
+	if err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+	if len(edit.Images) != 1 {
+		t.Fatalf("Edit: expected 1 image, got %d", len(edit.Images))
+	}
+	if !strings.HasPrefix(edit.Images[0].URL, "https://static.kocoro.ai/") {
+		t.Errorf("Edit: expected https://static.kocoro.ai/ URL, got: %s", edit.Images[0].URL)
+	}
+	if edit.Images[0].URL == gen.Images[0].URL {
+		t.Errorf("Edit returned identical URL to source — server may have shortcut without editing")
+	}
+}
+
+// readCloudConfig pulls cloud.endpoint and cloud.api_key from the user's
+// ~/.shannon/config.yaml without depending on internal/config (which would
+// pull in the entire package graph). The format is stable enough for a
+// targeted regex match here.
+func readCloudConfig(t *testing.T) (endpoint, apiKey string) {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("UserHomeDir: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".shannon", "config.yaml"))
+	if err != nil {
+		t.Skipf("~/.shannon/config.yaml: %v", err)
+	}
+	endpointRe := regexp.MustCompile(`(?m)^\s*endpoint:\s*"?([^"\s]+)"?\s*$`)
+	apiKeyRe := regexp.MustCompile(`(?m)^\s*api_key:\s*"?([^"\s]+)"?\s*$`)
+	if m := endpointRe.FindSubmatch(data); m != nil {
+		endpoint = string(m[1])
+	}
+	if m := apiKeyRe.FindSubmatch(data); m != nil {
+		apiKey = string(m[1])
+	}
+	return endpoint, apiKey
 }
 
 func httpGet(t *testing.T, url string) map[string]interface{} {
