@@ -14,11 +14,9 @@ import (
 
 // TestSessionsSync_ReadsConfigViaCobra is the regression guard for the class
 // of bug where a cobra subcommand RunE forgets to call config.Load() and
-// silently runs on an uninitialized viper. Before the fix, this test would
-// see "sync is disabled" on stdout regardless of the yaml file because viper
-// returned the SetDefault value of `sync.enabled=false`. After the fix, the
-// yaml `sync.enabled: true` flows through and the dry-run codepath runs to
-// completion, emitting a `sync: outcome=noop ...` summary instead.
+// silently runs on an uninitialized viper. The yaml must flow through so
+// `sync.dry_run: true` selects the dry-run codepath and emits a
+// `sync: outcome=noop ...` summary instead of trying real Cloud upload config.
 func TestSessionsSync_ReadsConfigViaCobra(t *testing.T) {
 	home := t.TempDir()
 	shannonDir := filepath.Join(home, ".shannon")

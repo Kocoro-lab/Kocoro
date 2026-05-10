@@ -21,7 +21,6 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/spf13/viper"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
@@ -388,9 +387,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	// register with a typed-nil MemoryQuerier so the tool falls back to
 	// session_search + MEMORY.md.
 	var memQuerier tools.MemoryQuerier
-	memCfg := memory.LoadConfig(viper.GetViper())
-	memCfg.APIKey = memory.ResolveAPIKey(viper.GetViper())
-	memCfg.Endpoint = memory.ResolveEndpoint(viper.GetViper())
+	memCfg := memory.LoadConfigFromRuntime(runtimeCfg)
 	if memCfg.Provider != "" && memCfg.Provider != "disabled" {
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 1*time.Second)
 		ready, _ := memory.AttachPolicy(probeCtx, memCfg.SocketPath)

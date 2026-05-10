@@ -27,7 +27,7 @@ var sessionsCmd = &cobra.Command{
 
 var sessionsSyncCmd = &cobra.Command{
 	Use:   "sync",
-	Short: "Upload modified sessions to Shannon Cloud (opt-in via sync.enabled)",
+	Short: "Upload modified sessions to Shannon Cloud when sync is enabled",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if _, err := config.Load(); err != nil {
 			return fmt.Errorf("config: %w", err)

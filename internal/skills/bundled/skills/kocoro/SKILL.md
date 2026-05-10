@@ -68,7 +68,7 @@ Currently raw-text upload is supported on **`PUT /instructions`** only. For endp
 For detailed docs on MCP servers, skill API keys, permissions, project init, or multi-step recipes, load the relevant reference:
 `references/agents.md` · `references/skills.md` · `references/config.md` · `references/mcp.md` · `references/instructions.md` · `references/schedules.md` · `references/permissions.md` · `references/project-init.md` · `references/recipes.md` · `references/session-sync.md` · `references/memory.md` · `references/events.md`
 
-- [Session sync](references/session-sync.md) — opt-in daily upload of local sessions to Shannon Cloud
+- [Session sync](references/session-sync.md) — default-on daily upload of local sessions to Shannon Cloud
 - references/memory.md — memory feature config + diagnostics
 - references/events.md — `/events` SSE bus catalog (tool_status / usage / run_status / cloud_* / notification)
 

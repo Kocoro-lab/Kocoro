@@ -1001,13 +1001,14 @@ curl -X POST http://localhost:7533/message \
 ShanClaw includes a `memory_recall` tool that lets the agent look up facts
 learned from prior sessions before asking the user. The structured memory
 runs as a local sidecar over a Unix socket; the daemon manages spawn,
-readiness, restart, and bundle pull. Three modes:
+readiness, restart, and bundle pull. Episodic Memory is enabled by default
+for cloud-connected installs, and can be disabled in settings. Three modes:
 
-- `memory.provider: "disabled"` (default) — no sidecar, `memory_recall` falls
-  back to keyword session search and MEMORY.md.
-- `memory.provider: "cloud"` — daemon pulls fresh memory bundles from Kocoro
+- `memory.provider: "cloud"` (default) — daemon pulls fresh memory bundles from Kocoro
   Cloud every 24h and runs the sidecar against them. Requires `cloud.api_key`
   (or override via `memory.api_key`) and `cloud.endpoint`.
+- `memory.provider: "disabled"` — no sidecar, `memory_recall` falls
+  back to keyword session search and MEMORY.md.
 - `memory.provider: "local"` — daemon runs the sidecar against bundles you
   build locally; no Cloud calls. Useful for self-hosted setups.
 
@@ -1032,30 +1033,32 @@ readiness, restart, and bundle pull. Three modes:
 
 | Key | Default | Notes |
 |---|---|---|
-| `memory.provider` | `disabled` | `disabled` / `cloud` / `local` |
+| `memory.provider` | `cloud` | `disabled` / `cloud` / `local` |
 | `memory.endpoint` | `""` | Falls back to `cloud.endpoint` |
 | `memory.api_key` | `""` | Falls back to `cloud.api_key` |
-| `memory.socket_path` | `$HOME/.shannon/memory.sock` | UDS path |
+| `memory.socket_path` | `$TMPDIR/com.kocoro.tlm.sock` | UDS path |
 | `memory.bundle_root` | `$HOME/.shannon/memory` | Where bundles + symlink live |
 | `memory.tlm_path` | `""` | Empty = `PATH` lookup; missing = silent disable |
 | `memory.bundle_pull_interval` | `24h` | Cloud bundle refresh cadence |
 | `memory.bundle_pull_startup_delay` | `60s` | Wait before first pull on daemon boot |
-| `memory.sidecar_ready_timeout` | `10s` | Spawn → /health probe ceiling |
+| `memory.sidecar_ready_timeout` | `15s` | Spawn → /health probe ceiling |
 | `memory.sidecar_shutdown_grace` | `5s` | SIGTERM → SIGKILL grace |
-| `memory.sidecar_restart_max` | `3` | Crashes before degraded |
+| `memory.sidecar_restart_max` | `5` | Crashes before degraded |
 | `memory.client_request_timeout` | `5s` | Per-request UDS timeout |
 
 ### Privacy
 
-Memory bundles are local files. The daemon never sends queries or
-inferred candidates back to Cloud — only the nightly session sync (Phase
-2.0, opt-in via `sync.enabled`) ships data outward, and that path predates
-this feature. Switching the configured API key triggers a wipe + fresh
-bundle pull so cached recall from a previous tenant does not leak.
+Memory bundles are local files. The daemon never sends recall queries or
+inferred candidates back to Cloud. Session sync is enabled by default for
+cloud-connected installs and uploads local session history so Kocoro Cloud
+can train fresh memory bundles. Turning off Episodic Memory in settings
+disables both bundle-backed recall and session sync. Switching the configured
+API key triggers a wipe + fresh bundle pull so cached recall from a previous
+tenant does not leak.
 
-## Session sync to Cloud (opt-in)
+## Session sync to Cloud
 
-ShanClaw can upload your local session JSON to Shannon Cloud once per day. This is **opt-in and disabled by default**. When enabled, it powers Cloud-side analytics, replay, and per-user memory training.
+ShanClaw uploads local session JSON to Shannon Cloud once per day by default when Cloud credentials are configured. This powers Cloud-side analytics, replay, and per-user memory training. Disable Episodic Memory in settings, or set `sync.enabled: false`, to stop uploads.
 
 **What's uploaded:** the full session JSON files under `~/.shannon/sessions/` and `~/.shannon/agents/*/sessions/`. Sessions are sent as-is — there is no built-in PII or secret redaction in v1. Skill secrets are never included (they live in the macOS Keychain, never in transcripts), but tool output, file contents, and bash command results are uploaded verbatim.
 
@@ -1063,7 +1066,7 @@ ShanClaw can upload your local session JSON to Shannon Cloud once per day. This 
 
 ```yaml
 sync:
-  enabled: true                  # default false
+  enabled: true                  # default true
   dry_run: false                 # if true, write batches to ~/.shannon/sync_outbox/ instead of POSTing
   exclude_agents: []             # ["personal", "scratch", "default"]
   exclude_sources: []            # ["local", "cli", "slack"]; legacy sessions with no source treated as "local"
@@ -1076,7 +1079,7 @@ sync:
 
 **How it runs:**
 
-1. **Daemon ticker** — if the daemon is running, it syncs once 60s after startup, then every 24h. No setup needed beyond `sync.enabled: true`.
+1. **Daemon ticker** — if the daemon is running, it syncs once 60s after startup, then every 24h when Cloud credentials are configured.
 2. **Manual** — run `shan sessions sync` any time. Useful for dry-run verification.
 3. **launchd schedule (recommended for daemon-off coverage on macOS).** `shan schedule create` is for scheduling agent prompts and does not run arbitrary commands, so install a launchd plist by hand:
 

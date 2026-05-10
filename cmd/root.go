@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
@@ -303,9 +302,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	// sidecar is up (or memory is disabled), register with a typed-nil
 	// MemoryQuerier so the tool falls back to session_search + MEMORY.md.
 	var memQuerier tools.MemoryQuerier
-	memCfg := memory.LoadConfig(viper.GetViper())
-	memCfg.APIKey = memory.ResolveAPIKey(viper.GetViper())
-	memCfg.Endpoint = memory.ResolveEndpoint(viper.GetViper())
+	memCfg := memory.LoadConfigFromRuntime(runCfg)
 	if memCfg.Provider != "" && memCfg.Provider != "disabled" {
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 1*time.Second)
 		ready, _ := memory.AttachPolicy(probeCtx, memCfg.SocketPath)

@@ -228,7 +228,7 @@ func Load() (*Config, error) {
 	// sync.* defaults — MUST stay in sync with setSyncDefaults in
 	// internal/sync/config.go. The duplicate exists so internal/sync unit
 	// tests can establish defaults without importing internal/config.
-	viper.SetDefault("sync.enabled", false)
+	viper.SetDefault("sync.enabled", true)
 	viper.SetDefault("sync.dry_run", false)
 	viper.SetDefault("sync.endpoint", "")
 	viper.SetDefault("sync.exclude_agents", []string{})

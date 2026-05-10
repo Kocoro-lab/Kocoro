@@ -2,13 +2,13 @@
 
 ## What it does
 
-Uploads local session JSON from `~/.shannon/sessions/` and `~/.shannon/agents/*/sessions/` to Shannon Cloud once per day. Opt-in (disabled by default). Used for Cloud-side analytics, replay, and per-user memory training.
+Uploads local session JSON from `~/.shannon/sessions/` and `~/.shannon/agents/*/sessions/` to Shannon Cloud once per day. Enabled by default for cloud-connected installs. Used for Cloud-side analytics, replay, and per-user memory training.
 
 ## Config keys (under `sync:`)
 
 | Key | Default | Notes |
 |---|---|---|
-| `enabled` | `false` | Master switch. Must be `true` to upload. |
+| `enabled` | `true` | Master switch. Set `false` to disable uploads. |
 | `dry_run` | `false` | If `true`, writes batches to `~/.shannon/sync_outbox/` instead of POSTing. Useful for local verification. |
 | `endpoint` | `""` | Cloud endpoint. Empty falls back to `{cloud.endpoint}/api/v1/sessions/sync`. |
 | `exclude_agents` | `[]` | List of agent dir names to skip. Use `"default"` for the root sessions dir. |
@@ -23,14 +23,14 @@ Uploads local session JSON from `~/.shannon/sessions/` and `~/.shannon/agents/*/
 
 ## Workflows
 
-### Enable sync (production)
+### Disable sync
 
 ```yaml
 sync:
-  enabled: true
+  enabled: false
 ```
 
-The daemon picks this up on next start. To force an immediate run: `shan sessions sync`.
+The daemon picks this up on next start. The Desktop Episodic Memory toggle writes this together with `memory.provider`.
 
 ### Verify locally before uploading
 
@@ -61,4 +61,4 @@ Each entry shows `reason`, `category` (transient or permanent), `attempts`, and 
 
 ## Privacy posture (v1)
 
-There is **no built-in redaction in v1**. Sessions are uploaded as-is, including tool output, file contents, and bash command results. Skill secrets are never included (they live in the macOS Keychain, not in transcripts). Users who care about tighter privacy should keep `sync.enabled: false` until built-in redaction ships in v1.1.
+There is **no built-in redaction in v1**. Sessions are uploaded as-is, including tool output, file contents, and bash command results. Skill secrets are never included (they live in the macOS Keychain, not in transcripts). Users who care about tighter privacy should set `sync.enabled: false` until built-in redaction ships in v1.1.
