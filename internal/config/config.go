@@ -244,7 +244,7 @@ func Load() (*Config, error) {
 	// Memory feature (Phase 2.3). Single source of truth for memory.* defaults;
 	// internal/memory/config.go reads these via typed accessors but never
 	// registers defaults itself.
-	viper.SetDefault("memory.provider", "disabled")
+	viper.SetDefault("memory.provider", "cloud")
 	viper.SetDefault("memory.endpoint", "")
 	viper.SetDefault("memory.api_key", "")
 	viper.SetDefault("memory.socket_path", "$TMPDIR/com.kocoro.tlm.sock")
