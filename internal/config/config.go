@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
@@ -33,6 +34,7 @@ type Config struct {
 	Cloud           CloudConfig                    `mapstructure:"cloud"             yaml:"cloud"             json:"cloud"`
 	Daemon          DaemonConfig                   `mapstructure:"daemon"            yaml:"daemon"            json:"daemon"`
 	Skills          SkillsConfig                   `mapstructure:"skills"            yaml:"skills"            json:"skills"`
+	Memory          MemoryConfig                   `mapstructure:"memory"            yaml:"memory"            json:"memory"`
 	Hooks           hooks.HookConfig               `mapstructure:"hooks"             yaml:"hooks"             json:"hooks"`
 	MCPServers      map[string]mcp.MCPServerConfig `mapstructure:"mcp_servers"       yaml:"mcp_servers"       json:"mcp_servers"`
 	MCP             MCPConfig                      `mapstructure:"mcp"               yaml:"mcp"               json:"mcp"`
@@ -121,6 +123,21 @@ type CloudConfig struct {
 type OllamaConfig struct {
 	Endpoint string `mapstructure:"endpoint" yaml:"endpoint" json:"endpoint"`
 	Model    string `mapstructure:"model"    yaml:"model"    json:"model"`
+}
+
+type MemoryConfig struct {
+	Provider               string        `mapstructure:"provider"                  yaml:"provider"                  json:"provider"`
+	Endpoint               string        `mapstructure:"endpoint"                  yaml:"endpoint"                  json:"endpoint"`
+	APIKey                 string        `mapstructure:"api_key"                   yaml:"api_key"                   json:"api_key"`
+	SocketPath             string        `mapstructure:"socket_path"               yaml:"socket_path"               json:"socket_path"`
+	BundleRoot             string        `mapstructure:"bundle_root"               yaml:"bundle_root"               json:"bundle_root"`
+	TLMPath                string        `mapstructure:"tlm_path"                  yaml:"tlm_path"                  json:"tlm_path"`
+	BundlePullInterval     time.Duration `mapstructure:"bundle_pull_interval"      yaml:"bundle_pull_interval"      json:"bundle_pull_interval"`
+	BundlePullStartupDelay time.Duration `mapstructure:"bundle_pull_startup_delay" yaml:"bundle_pull_startup_delay" json:"bundle_pull_startup_delay"`
+	SidecarReadyTimeout    time.Duration `mapstructure:"sidecar_ready_timeout"     yaml:"sidecar_ready_timeout"     json:"sidecar_ready_timeout"`
+	SidecarShutdownGrace   time.Duration `mapstructure:"sidecar_shutdown_grace"    yaml:"sidecar_shutdown_grace"    json:"sidecar_shutdown_grace"`
+	SidecarRestartMax      int           `mapstructure:"sidecar_restart_max"       yaml:"sidecar_restart_max"       json:"sidecar_restart_max"`
+	ClientRequestTimeout   time.Duration `mapstructure:"client_request_timeout"    yaml:"client_request_timeout"    json:"client_request_timeout"`
 }
 
 type DaemonConfig struct {
@@ -230,14 +247,14 @@ func Load() (*Config, error) {
 	viper.SetDefault("memory.provider", "disabled")
 	viper.SetDefault("memory.endpoint", "")
 	viper.SetDefault("memory.api_key", "")
-	viper.SetDefault("memory.socket_path", "$HOME/.shannon/memory.sock")
+	viper.SetDefault("memory.socket_path", "$TMPDIR/com.kocoro.tlm.sock")
 	viper.SetDefault("memory.bundle_root", "$HOME/.shannon/memory")
 	viper.SetDefault("memory.tlm_path", "")
 	viper.SetDefault("memory.bundle_pull_interval", "24h")
 	viper.SetDefault("memory.bundle_pull_startup_delay", "60s")
-	viper.SetDefault("memory.sidecar_ready_timeout", "10s")
+	viper.SetDefault("memory.sidecar_ready_timeout", "15s")
 	viper.SetDefault("memory.sidecar_shutdown_grace", "5s")
-	viper.SetDefault("memory.sidecar_restart_max", 3)
+	viper.SetDefault("memory.sidecar_restart_max", 5)
 	viper.SetDefault("memory.client_request_timeout", "5s")
 
 	if err := viper.ReadInConfig(); err != nil {
@@ -409,6 +426,7 @@ type overlayConfig struct {
 	Daemon          *overlayDaemonConfig           `yaml:"daemon"`
 	MCPServers      map[string]mcp.MCPServerConfig `yaml:"mcp_servers"`
 	MCP             *overlayMCPConfig              `yaml:"mcp"`
+	Memory          *overlayMemoryConfig           `yaml:"memory"`
 }
 
 type overlayCloudConfig struct {
@@ -426,6 +444,19 @@ type overlayOllamaConfig struct {
 
 type overlayDaemonConfig struct {
 	AutoApprove *bool `yaml:"auto_approve"`
+}
+
+type overlayMemoryConfig struct {
+	Provider               *string        `yaml:"provider"`
+	SocketPath             *string        `yaml:"socket_path"`
+	BundleRoot             *string        `yaml:"bundle_root"`
+	TLMPath                *string        `yaml:"tlm_path"`
+	BundlePullInterval     *time.Duration `yaml:"bundle_pull_interval"`
+	BundlePullStartupDelay *time.Duration `yaml:"bundle_pull_startup_delay"`
+	SidecarReadyTimeout    *time.Duration `yaml:"sidecar_ready_timeout"`
+	SidecarShutdownGrace   *time.Duration `yaml:"sidecar_shutdown_grace"`
+	SidecarRestartMax      *int           `yaml:"sidecar_restart_max"`
+	ClientRequestTimeout   *time.Duration `yaml:"client_request_timeout"`
 }
 
 type overlayAgentConfig struct {
@@ -745,6 +776,52 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 	if overlay.MCP != nil && len(overlay.MCP.WorkspaceRoots) > 0 {
 		cfg.MCP.WorkspaceRoots = dedup(append(cfg.MCP.WorkspaceRoots, overlay.MCP.WorkspaceRoots...))
 		cfg.Sources["mcp.workspace_roots"] = src
+	}
+
+	// Memory attach settings are session-safe: CLI/TUI use them to decide
+	// whether to attach to an already-running sidecar for this cwd. Cloud
+	// endpoint/API key remain process-scoped and are intentionally not merged.
+	if overlay.Memory != nil {
+		if overlay.Memory.Provider != nil {
+			cfg.Memory.Provider = *overlay.Memory.Provider
+			cfg.Sources["memory.provider"] = src
+		}
+		if overlay.Memory.SocketPath != nil {
+			cfg.Memory.SocketPath = *overlay.Memory.SocketPath
+			cfg.Sources["memory.socket_path"] = src
+		}
+		if overlay.Memory.BundleRoot != nil {
+			cfg.Memory.BundleRoot = *overlay.Memory.BundleRoot
+			cfg.Sources["memory.bundle_root"] = src
+		}
+		if overlay.Memory.TLMPath != nil {
+			cfg.Memory.TLMPath = *overlay.Memory.TLMPath
+			cfg.Sources["memory.tlm_path"] = src
+		}
+		if overlay.Memory.BundlePullInterval != nil {
+			cfg.Memory.BundlePullInterval = *overlay.Memory.BundlePullInterval
+			cfg.Sources["memory.bundle_pull_interval"] = src
+		}
+		if overlay.Memory.BundlePullStartupDelay != nil {
+			cfg.Memory.BundlePullStartupDelay = *overlay.Memory.BundlePullStartupDelay
+			cfg.Sources["memory.bundle_pull_startup_delay"] = src
+		}
+		if overlay.Memory.SidecarReadyTimeout != nil {
+			cfg.Memory.SidecarReadyTimeout = *overlay.Memory.SidecarReadyTimeout
+			cfg.Sources["memory.sidecar_ready_timeout"] = src
+		}
+		if overlay.Memory.SidecarShutdownGrace != nil {
+			cfg.Memory.SidecarShutdownGrace = *overlay.Memory.SidecarShutdownGrace
+			cfg.Sources["memory.sidecar_shutdown_grace"] = src
+		}
+		if overlay.Memory.SidecarRestartMax != nil {
+			cfg.Memory.SidecarRestartMax = *overlay.Memory.SidecarRestartMax
+			cfg.Sources["memory.sidecar_restart_max"] = src
+		}
+		if overlay.Memory.ClientRequestTimeout != nil {
+			cfg.Memory.ClientRequestTimeout = *overlay.Memory.ClientRequestTimeout
+			cfg.Sources["memory.client_request_timeout"] = src
+		}
 	}
 
 	// Process-global fields (endpoint, api_key, auto_update_check, daemon,

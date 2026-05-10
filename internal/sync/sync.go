@@ -26,8 +26,9 @@ type Deps struct {
 	ClientVer string           // for SyncBatchRequest.ClientVersion
 	Uploader  Uploader
 	Loader    SessionLoader
-	Audit     AuditLogger
-	Now       func() time.Time
+	Audit      AuditLogger
+	Now        func() time.Time
+	OnSyncDone func() // optional: called when ≥1 session was accepted; wakes memory bundle puller
 }
 
 // Run executes one sync iteration: read marker, scan candidates, build batches,
@@ -175,6 +176,9 @@ func Run(ctx context.Context, deps Deps) error {
 		"transport_error":    transportErr,
 		"skipped_dirs":       skipped,
 	})
+	if totalAccepted > 0 && deps.OnSyncDone != nil {
+		deps.OnSyncDone()
+	}
 	return nil
 }
 

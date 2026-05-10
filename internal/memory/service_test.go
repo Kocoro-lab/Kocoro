@@ -195,3 +195,76 @@ func TestService_StatusString(t *testing.T) {
 		}
 	}
 }
+
+func TestService_MemoryProviderStatus_Disabled(t *testing.T) {
+	s := NewService(Config{Provider: "disabled"}, nil)
+	_ = s.Start(context.Background())
+	ms := s.MemoryProviderStatus()
+	if ms.Provider != "disabled" {
+		t.Fatalf("provider=%q want disabled", ms.Provider)
+	}
+	if ms.Reason != nil {
+		t.Fatalf("reason=%v want nil", ms.Reason)
+	}
+}
+
+func TestService_MemoryProviderStatus_Unavailable_BinaryMissing(t *testing.T) {
+	cfg := Config{Provider: "local", TLMPath: "/definitely/not/a/real/path"}
+	s := NewService(cfg, nil)
+	_ = s.Start(context.Background())
+	ms := s.MemoryProviderStatus()
+	if ms.Provider != "disabled" {
+		t.Fatalf("provider=%q want disabled", ms.Provider)
+	}
+	if ms.Reason == nil || *ms.Reason != "tlm_binary_missing" {
+		t.Fatalf("reason=%v want tlm_binary_missing", ms.Reason)
+	}
+}
+
+func TestService_MemoryProviderStatus_Degraded(t *testing.T) {
+	s := NewService(Config{}, nil)
+	// Directly inject degraded state as the supervisor goroutine would.
+	r := ReasonRepeatedCrash
+	s.disabledReason.Store(&r)
+	s.restartAttempts.Store(5)
+	s.status.Store(int32(StatusDegraded))
+
+	ms := s.MemoryProviderStatus()
+	if ms.Provider != "disabled" {
+		t.Fatalf("provider=%q want disabled", ms.Provider)
+	}
+	if ms.Reason == nil || *ms.Reason != "repeated_crash" {
+		t.Fatalf("reason=%v want repeated_crash", ms.Reason)
+	}
+	if ms.Detail == nil {
+		t.Fatal("detail must not be nil when degraded")
+	}
+	if ms.Detail["restart_attempts"] != 5 {
+		t.Fatalf("detail.restart_attempts=%v want 5", ms.Detail["restart_attempts"])
+	}
+}
+
+func TestService_MemoryProviderStatus_Initializing(t *testing.T) {
+	s := NewService(Config{}, nil)
+	s.status.Store(int32(StatusInitializing))
+	ms := s.MemoryProviderStatus()
+	if ms.Provider != "enabled" {
+		t.Fatalf("provider=%q want enabled", ms.Provider)
+	}
+	if ms.Reason != nil {
+		t.Fatalf("reason=%v want nil when initializing", ms.Reason)
+	}
+}
+
+func TestService_MemoryProviderStatus_CloudMisconfigured(t *testing.T) {
+	cfg := Config{Provider: "cloud", Endpoint: "https://x", APIKey: "", TLMPath: "/bin/echo"}
+	s := NewService(cfg, nil)
+	_ = s.Start(context.Background())
+	ms := s.MemoryProviderStatus()
+	if ms.Provider != "disabled" {
+		t.Fatalf("provider=%q want disabled", ms.Provider)
+	}
+	if ms.Reason == nil || *ms.Reason != "cloud_misconfigured" {
+		t.Fatalf("reason=%v want cloud_misconfigured", ms.Reason)
+	}
+}

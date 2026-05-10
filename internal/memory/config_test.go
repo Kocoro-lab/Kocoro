@@ -2,7 +2,9 @@ package memory
 
 import (
 	"testing"
+	"time"
 
+	appconfig "github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/spf13/viper"
 )
 
@@ -49,5 +51,41 @@ func TestLoadConfig_HomeExpansion(t *testing.T) {
 	}
 	if cfg.SocketPath != "/tmp/fakehome/.shannon/memory.sock" {
 		t.Fatalf("SocketPath=%q", cfg.SocketPath)
+	}
+}
+
+func TestLoadConfigFromRuntime_UsesRuntimeMemoryOverlay(t *testing.T) {
+	t.Setenv("HOME", "/tmp/fakehome")
+	cfg := &appconfig.Config{
+		Endpoint: "https://cloud.example",
+		APIKey:   "cloud-key",
+		Memory: appconfig.MemoryConfig{
+			Provider:             "local",
+			SocketPath:           "$HOME/tlm.sock",
+			BundleRoot:           "$HOME/tlm-bundles",
+			TLMPath:              "$HOME/bin/tlm",
+			ClientRequestTimeout: 30 * time.Second,
+		},
+	}
+
+	got := LoadConfigFromRuntime(cfg)
+
+	if got.Provider != "local" {
+		t.Fatalf("Provider=%q", got.Provider)
+	}
+	if got.SocketPath != "/tmp/fakehome/tlm.sock" {
+		t.Fatalf("SocketPath=%q", got.SocketPath)
+	}
+	if got.BundleRoot != "/tmp/fakehome/tlm-bundles" {
+		t.Fatalf("BundleRoot=%q", got.BundleRoot)
+	}
+	if got.TLMPath != "/tmp/fakehome/bin/tlm" {
+		t.Fatalf("TLMPath=%q", got.TLMPath)
+	}
+	if got.Endpoint != "https://cloud.example" || got.APIKey != "cloud-key" {
+		t.Fatalf("fallback endpoint/api = %q/%q", got.Endpoint, got.APIKey)
+	}
+	if got.ClientRequestTimeout != 30*time.Second {
+		t.Fatalf("ClientRequestTimeout=%v", got.ClientRequestTimeout)
 	}
 }

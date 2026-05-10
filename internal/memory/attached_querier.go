@@ -31,3 +31,10 @@ func (a *AttachedQuerier) Query(ctx context.Context, intent QueryIntent) (*Respo
 	c := NewClient(a.socket, a.timeout)
 	return c.Query(ctx, intent)
 }
+
+// QueryBatch runs Query for each intent concurrently and returns results
+// in input order. Mirrors Service.QueryBatch so CLI/TUI attach paths
+// can use AttachedQuerier wherever Service is accepted.
+func (a *AttachedQuerier) QueryBatch(ctx context.Context, intents []QueryIntent) []QueryResult {
+	return runQueryBatch(ctx, intents, a.Query)
+}

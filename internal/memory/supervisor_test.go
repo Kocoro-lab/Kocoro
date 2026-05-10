@@ -37,8 +37,14 @@ func (f *fakeSpawner) Wait() error {
 
 func TestSupervisor_BackoffAndDegradedAfterBudget(t *testing.T) {
 	sp := &fakeSpawner{}
-	sp.failsRemaining.Store(10) // always fail
+	sp.failsRemaining.Store(10) // always fail → spawn error
+	var gotReason string
+	var gotAttempts int
 	sup := NewSupervisor(sp, 3, func() { sp.onReadyHit.Add(1) })
+	sup.SetOnDegraded(func(reason string, attempts int) {
+		gotReason = reason
+		gotAttempts = attempts
+	})
 	sup.testBackoff = func(int) time.Duration { return 1 * time.Millisecond }
 	final := sup.Run(context.Background())
 	if final != StateDegraded {
@@ -49,6 +55,69 @@ func TestSupervisor_BackoffAndDegradedAfterBudget(t *testing.T) {
 	}
 	if sp.onReadyHit.Load() != 0 {
 		t.Fatal("onReady should not fire when sidecar never becomes ready")
+	}
+	if gotReason != "tlm_exec_error" {
+		t.Fatalf("reason=%q want tlm_exec_error", gotReason)
+	}
+	if gotAttempts != 3 {
+		t.Fatalf("attempts=%d want 3", gotAttempts)
+	}
+}
+
+func TestSupervisor_OnDegraded_StartupTimeout(t *testing.T) {
+	sp := &fakeSpawner{
+		waitReadyErr: ErrReadyCeilingExceeded,
+		waitErr:      errors.New("unused"),
+	}
+	var gotReason string
+	sup := NewSupervisor(sp, 2, nil)
+	sup.SetOnDegraded(func(reason string, _ int) { gotReason = reason })
+	sup.testBackoff = func(int) time.Duration { return 1 * time.Millisecond }
+	final := sup.Run(context.Background())
+	if final != StateDegraded {
+		t.Fatalf("final=%v want Degraded", final)
+	}
+	if gotReason != "startup_timeout" {
+		t.Fatalf("reason=%q want startup_timeout", gotReason)
+	}
+}
+
+func TestSupervisor_OnDegraded_RepeatedCrash(t *testing.T) {
+	// Sidecar becomes ready then immediately exits — repeated_crash.
+	sp := &fakeSpawner{
+		waitErr: errors.New("simulated exit"),
+	}
+	var gotReason string
+	sup := NewSupervisor(sp, 2, func() { sp.onReadyHit.Add(1) })
+	sup.SetOnDegraded(func(reason string, _ int) { gotReason = reason })
+	sup.testBackoff = func(int) time.Duration { return 1 * time.Millisecond }
+	final := sup.Run(context.Background())
+	if final != StateDegraded {
+		t.Fatalf("final=%v want Degraded", final)
+	}
+	if sp.onReadyHit.Load() == 0 {
+		t.Fatal("onReady should have fired at least once")
+	}
+	if gotReason != "repeated_crash" {
+		t.Fatalf("reason=%q want repeated_crash", gotReason)
+	}
+}
+
+func TestSupervisor_OnDegraded_NotCalledOnCtxCancel(t *testing.T) {
+	sp := &fakeSpawner{}
+	sp.failsRemaining.Store(100)
+	called := false
+	sup := NewSupervisor(sp, 100, nil)
+	sup.SetOnDegraded(func(string, int) { called = true })
+	sup.testBackoff = func(int) time.Duration { return 50 * time.Millisecond }
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
+	final := sup.Run(ctx)
+	if final != StateStopped {
+		t.Fatalf("final=%v want Stopped", final)
+	}
+	if called {
+		t.Fatal("onDegraded must not fire on ctx cancel")
 	}
 }
 

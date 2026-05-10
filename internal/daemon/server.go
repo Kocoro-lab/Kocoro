@@ -299,6 +299,13 @@ func (s *Server) Start(ctx context.Context) error {
 	memCfg := memory.LoadConfig(viper.GetViper())
 	memCfg.APIKey = memory.ResolveAPIKey(viper.GetViper())
 	memCfg.Endpoint = memory.ResolveEndpoint(viper.GetViper())
+	// When shan runs inside the Desktop app bundle, prefer the embedded tlm
+	// binary over PATH unless the operator explicitly set memory.tlm_path.
+	if memCfg.TLMPath == "" {
+		if bundlePath := memory.BundleRelativeTLMPath(); bundlePath != "" {
+			memCfg.TLMPath = bundlePath
+		}
+	}
 	var memAudit memory.AuditLogger
 	if s.deps != nil && s.deps.Auditor != nil {
 		memAudit = memoryAuditAdapter{logger: s.deps.Auditor}
@@ -621,12 +628,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	resp := map[string]interface{}{
 		"is_connected": s.client.IsConnected(),
 		"active_agent": s.client.ActiveAgent(),
 		"uptime":       int(s.client.Uptime().Seconds()),
 		"version":      s.version,
-	})
+	}
+	if s.memSvc != nil {
+		resp["memory"] = s.memSvc.MemoryProviderStatus()
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 // handleAgents lists available agents with optional memory status.
@@ -3768,13 +3779,18 @@ func (s *Server) buildSyncDeps(cfg syncpkg.Config) (syncpkg.Deps, bool) {
 		auditSink = syncAuditAdapter{logger: s.deps.Auditor}
 	}
 
+	var onSyncDone func()
+	if s.memSvc != nil {
+		onSyncDone = s.memSvc.NotifySyncDone
+	}
 	return syncpkg.Deps{
-		Cfg:       cfg,
-		HomeDir:   shannonHome,
-		ClientVer: "shanclaw/daemon",
-		Uploader:  uploader,
-		Loader:    loader,
-		Audit:     auditSink,
-		Now:       time.Now,
+		Cfg:        cfg,
+		HomeDir:    shannonHome,
+		ClientVer:  "shanclaw/daemon",
+		Uploader:   uploader,
+		Loader:     loader,
+		Audit:      auditSink,
+		Now:        time.Now,
+		OnSyncDone: onSyncDone,
 	}, true
 }

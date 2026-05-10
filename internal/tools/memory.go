@@ -51,20 +51,57 @@ type memoryArgs struct {
 
 func (t *MemoryTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
-		Name:        "memory_recall",
-		Description: "Recall facts learned from prior sessions. Use this to look up things like \"what caused X?\", \"what does the user prefer for Y?\", \"what did we decide about Z?\" before asking the user. Returns ranked candidates with evidence labels (observed > derived > text-search). Falls back to keyword search across past sessions when the structured memory is unavailable; results in that mode are flagged as lower-confidence.",
+		Name: "memory_recall",
+		Description: "Read structured long-term memory results from the user's personal knowledge graph.\n" +
+			"Modes:\n" +
+			"- direct_relation: one-hop predicate (e.g. \"what did X create?\"). Read `groups[].via_relations`.\n" +
+			"- path_query: multi-hop / possessive (e.g. \"what did X's collaborator create?\"). relation_constraints is the ordered path; inverse hops use `^-1`. Read `groups[].observed_path`.\n" +
+			"- typed_neighborhood: typed target with exactly one relation. Requires candidate_type. Rank by score.\n\n" +
+			"Evidence rules: ground each factual item in `supporting_event_ids` or `observed_path`, but in user-facing wording say \"past records\" / \"I found\"; do not surface raw event IDs, `memory_block`, `no_data_reason`, or scope labels unless the user asks for debug/provenance. If `no_data_reason` is set, say past records have no direct answer; do not invent from training data.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"mode":                 map[string]any{"type": "string", "enum": []string{"direct_relation", "path_query", "typed_neighborhood"}},
-				"anchor_mentions":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"relation_constraints": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"candidate_type":       map[string]any{"type": "string"},
-				"scope_filter":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"target_slot":          map[string]any{"type": "string", "enum": []string{"head", "tail"}},
-				"time_window":          map[string]any{"type": "string"},
-				"evidence_budget":      map[string]any{"type": "integer"},
-				"result_limit":         map[string]any{"type": "integer"},
+				"mode": map[string]any{
+					"type":        "string",
+					"enum":        []string{"direct_relation", "path_query", "typed_neighborhood"},
+					"description": "Use direct_relation for one-hop facts. Use path_query for multi-hop relationship questions. Use typed_neighborhood only when candidate_type and exactly one relation constraint are clear.",
+				},
+				"anchor_mentions": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Entity names to start from. Use the clearest/fullest name when obvious (for example, use a person's full name rather than a nickname). For path_query, include only the starting entity mention, not relationship words like student/collaborator/project.",
+				},
+				"relation_constraints": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Canonical relation names. For path_query, this is the ordered path; append ^-1 for inverse hops, e.g. collaborated_with^-1 then created for a two-hop possessive question. For typed_neighborhood, provide exactly one relation.",
+				},
+				"candidate_type": map[string]any{
+					"type":        "string",
+					"description": "Optional target entity type filter such as Person, Project, Company, Tool. Required for typed_neighborhood.",
+				},
+				"scope_filter": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Optional scope filters when the user asks about a specific project/topic scope.",
+				},
+				"target_slot": map[string]any{
+					"type":        "string",
+					"enum":        []string{"head", "tail"},
+					"description": "For direct_relation, return relation tails by default; use head for inverse lookup.",
+				},
+				"time_window": map[string]any{
+					"type":        "string",
+					"description": "Optional time window when the user asks about a date/time-bounded memory.",
+				},
+				"evidence_budget": map[string]any{
+					"type":        "integer",
+					"description": "Maximum supporting event ids to include per candidate or path hop.",
+				},
+				"result_limit": map[string]any{
+					"type":        "integer",
+					"description": "Maximum candidate groups to return.",
+				},
 			},
 		},
 		Required: []string{"anchor_mentions"},
@@ -106,6 +143,40 @@ func (t *MemoryTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 	return t.run(ctx, intent)
 }
 
+func validateMemoryArgs(a memoryArgs) string {
+	for _, rel := range a.RelationConstraints {
+		if isBroadMemoryRelation(rel) {
+			return "memory_recall requires concrete relation_constraints. Broad relations like related_to are not valid for structured lookup; use a concrete relation/path, or use session_search for raw private-context lookup."
+		}
+	}
+	switch memory.QueryMode(a.Mode) {
+	case memory.ModeDirectRelation:
+		if len(a.RelationConstraints) == 0 {
+			return "direct_relation requires at least one relation_constraints value. Choose a concrete relation for the user's question, or use session_search for raw private-context lookup."
+		}
+	case memory.ModeTypedNeighborhood:
+		if a.CandidateType == nil || strings.TrimSpace(*a.CandidateType) == "" {
+			return "typed_neighborhood requires candidate_type. Ask the user to narrow the target type, or use direct_relation/path_query when a relation is clear."
+		}
+		if len(a.RelationConstraints) != 1 {
+			return "typed_neighborhood requires exactly one relation_constraints value. Use direct_relation/path_query for relationship questions, or ask the user to narrow the memory lookup."
+		}
+	}
+	return ""
+}
+
+func isBroadMemoryRelation(rel string) bool {
+	rel = strings.TrimSpace(strings.ToLower(rel))
+	rel = strings.TrimPrefix(rel, "^")
+	rel = strings.TrimSuffix(rel, "^-1")
+	switch rel {
+	case "related_to", "relates_to", "associated_with", "about", "mentions":
+		return true
+	default:
+		return false
+	}
+}
+
 // run is the post-validation path. Implements the four class branches
 // from spec §5.3: ClassOK shapes structured candidates (with a degraded
 // warning prefix when env.Reason == "degraded"), ClassRetryable does one
@@ -115,6 +186,13 @@ func (t *MemoryTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 func (t *MemoryTool) run(ctx context.Context, intent memory.QueryIntent) (agent.ToolResult, error) {
 	if t.Service == nil || t.Service.Status() != memory.StatusReady {
 		return t.fallback(ctx, intent, "service_unavailable", "fallback")
+	}
+	if err := validateMemoryArgs(memoryArgs{
+		Mode:                string(intent.Mode),
+		RelationConstraints: intent.RelationConstraints,
+		CandidateType:       intent.CandidateType,
+	}); err != "" {
+		return agent.ToolResult{Content: err, IsError: true}, nil
 	}
 	env, class, err := t.Service.Query(ctx, intent)
 	if err != nil || class == memory.ClassUnavailable {
@@ -184,6 +262,7 @@ func (t *MemoryTool) shapeResult(env *memory.ResponseEnvelope) agent.ToolResult 
 		"source":           "memory_sidecar",
 		"evidence_quality": quality,
 		"bundle_version":   env.BundleVersion,
+		"memory_block":     env.MemoryBlock,
 		"candidates":       cands,
 		"warnings":         warnings,
 		"fallback_reason":  nil,

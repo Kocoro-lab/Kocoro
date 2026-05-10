@@ -38,6 +38,15 @@ type Service struct {
 	cancel   context.CancelFunc
 	attached bool // true for NewServiceAttached path; never spawns
 
+	// Phase 2.5b: reason tracking for MemoryProviderStatus.
+	disabledReason  atomic.Pointer[string]
+	restartAttempts atomic.Int32
+
+	// pullNow is a buffered(1) channel that wakes the puller for an
+	// out-of-schedule bundle check. NotifySyncDone sends to it; nil on
+	// NewServiceAttached (CLI/TUI never runs a puller loop).
+	pullNow chan struct{}
+
 	// Test injection: extra positional args prepended to "serve --socket
 	// --bundle-root" so unit tests can run a fake binary (e.g. python3 with
 	// a script path). Production callers leave this nil.
@@ -46,7 +55,7 @@ type Service struct {
 
 // NewService builds the daemon-mode Service that owns sidecar lifecycle.
 func NewService(cfg Config, audit AuditLogger) *Service {
-	return &Service{cfg: cfg, audit: audit}
+	return &Service{cfg: cfg, audit: audit, pullNow: make(chan struct{}, 1)}
 }
 
 // NewServiceAttached builds a Service for the CLI/TUI attach-only path.
@@ -61,6 +70,51 @@ func (s *Service) Status() ServiceStatus { return ServiceStatus(s.status.Load())
 func (s *Service) logAudit(ev string, fields map[string]any) {
 	if s.audit != nil {
 		s.audit.Log(ev, fields)
+	}
+}
+
+// setDisabledReason stores r as the current failure reason. Pass "" to clear.
+func (s *Service) setDisabledReason(r string) {
+	if r == "" {
+		s.disabledReason.Store(nil)
+	} else {
+		s.disabledReason.Store(&r)
+	}
+}
+
+// MemoryProviderStatus returns the atomic snapshot of the memory feature
+// state for inclusion in the daemon GET /status response.
+func (s *Service) MemoryProviderStatus() MemoryStatus {
+	st := ServiceStatus(s.status.Load())
+	switch st {
+	case StatusReady, StatusInitializing:
+		return MemoryStatus{Provider: "enabled"}
+	case StatusDisabled:
+		return MemoryStatus{Provider: "disabled"}
+	default: // StatusUnavailable, StatusDegraded
+		ms := MemoryStatus{
+			Provider: "disabled",
+			Reason:   s.disabledReason.Load(),
+		}
+		if st == StatusDegraded {
+			ms.Detail = map[string]any{
+				"restart_attempts": int(s.restartAttempts.Load()),
+			}
+		}
+		return ms
+	}
+}
+
+// NotifySyncDone wakes the puller for an out-of-schedule bundle check after
+// a successful session sync. Non-blocking: if a wakeup is already pending
+// the call is a no-op. Safe to call from any goroutine.
+func (s *Service) NotifySyncDone() {
+	if s.pullNow == nil {
+		return
+	}
+	select {
+	case s.pullNow <- struct{}{}:
+	default:
 	}
 }
 
@@ -94,12 +148,14 @@ func (s *Service) Start(ctx context.Context) error {
 		return nil
 	}
 	if !s.tlmAvailable() {
+		s.setDisabledReason(ReasonBinaryMissing)
 		s.status.Store(int32(StatusUnavailable))
 		s.logAudit("memory_tlm_missing", map[string]any{"tlm_path_set": s.cfg.TLMPath != ""})
 		return nil
 	}
 	if s.cfg.Provider == "cloud" {
 		if s.cfg.Endpoint == "" || s.cfg.APIKey == "" {
+			s.setDisabledReason(ReasonCloudMisconfigured)
 			s.status.Store(int32(StatusUnavailable))
 			s.logAudit("memory_cloud_misconfigured", map[string]any{
 				"endpoint_resolved": s.cfg.Endpoint != "",
@@ -147,16 +203,19 @@ func (s *Service) Start(ctx context.Context) error {
 
 	sup := NewSupervisor(s.sidecar, s.cfg.SidecarRestartMax, onReady)
 	sup.SetReadyTimeout(s.cfg.SidecarReadyTimeout)
+	sup.SetOnDegraded(func(reason string, attempts int) {
+		s.restartAttempts.Store(int32(attempts))
+		s.setDisabledReason(reason)
+		s.status.Store(int32(StatusDegraded))
+		s.logAudit("memory_sidecar_degraded", map[string]any{
+			"reason":           reason,
+			"restart_attempts": attempts,
+		})
+	})
 	go func() {
-		final := sup.Run(supCtx)
-		// Map supervisor's terminal state into service status.
-		switch final {
-		case StateDegraded:
-			s.status.Store(int32(StatusDegraded))
-			s.logAudit("memory_sidecar_degraded", map[string]any{})
-		case StateStopped:
-			// ctx cancel — Stop() was called; leave status alone.
-		}
+		sup.Run(supCtx)
+		// Status and reason already set by onDegraded.
+		// StateStopped (ctx cancel via Stop()) needs no action.
 	}()
 	return nil
 }
@@ -186,6 +245,10 @@ func (s *Service) runPullerLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if err := s.puller.tick(ctx); err != nil {
+				s.logAudit("memory_reload_failed", map[string]any{"reason": err.Error()})
+			}
+		case <-s.pullNow:
 			if err := s.puller.tick(ctx); err != nil {
 				s.logAudit("memory_reload_failed", map[string]any{"reason": err.Error()})
 			}

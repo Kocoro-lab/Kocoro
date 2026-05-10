@@ -1,0 +1,291 @@
+{
+    "protocol_version": 1,
+    "bundle_version": "0.6.0",
+    "bundle_created_at": "2025-01-01T00:00:00Z",
+    "bundle_dir": "/tmp/tlm-fixture-synthetic/bundles/20250101T000000",
+    "request_id": "req-000000000002",
+    "candidates": [
+        {
+            "value": "Nexus",
+            "score": 3.3850627513777627,
+            "evidence": "observed",
+            "supporting_event_ids": [
+                "ev_000000000011",
+                "ev_000000000012",
+                "ev_000000000013"
+            ],
+            "support_count": 5,
+            "distinct_session_count": null,
+            "entity_id": "ent_000000000001",
+            "scope": "topic:alice nakamura",
+            "observed_path": [
+                {
+                    "from_entity_id": "ent_000000000020",
+                    "from_label": "Jordan Sato",
+                    "relation": "collaborated_with",
+                    "direction": "inverse",
+                    "to_entity_id": "ent_000000000010",
+                    "to_label": "Alice Nakamura",
+                    "supporting_event_ids": [
+                        "ev_000000000011",
+                        "ev_000000000012",
+                        "ev_000000000013"
+                    ]
+                },
+                {
+                    "from_entity_id": "ent_000000000010",
+                    "from_label": "Alice Nakamura",
+                    "relation": "created",
+                    "direction": "forward",
+                    "to_entity_id": "ent_000000000001",
+                    "to_label": "Nexus",
+                    "supporting_event_ids": [
+                        "ev_000000000001",
+                        "ev_000000000002"
+                    ]
+                }
+            ],
+            "path_collision_count": 1
+        },
+        {
+            "value": "Pulsar",
+            "score": 3.3850627513777627,
+            "evidence": "observed",
+            "supporting_event_ids": [
+                "ev_000000000011",
+                "ev_000000000012",
+                "ev_000000000013"
+            ],
+            "support_count": 5,
+            "distinct_session_count": null,
+            "entity_id": "ent_000000000002",
+            "scope": "topic:alice nakamura",
+            "observed_path": [
+                {
+                    "from_entity_id": "ent_000000000020",
+                    "from_label": "Jordan Sato",
+                    "relation": "collaborated_with",
+                    "direction": "inverse",
+                    "to_entity_id": "ent_000000000010",
+                    "to_label": "Alice Nakamura",
+                    "supporting_event_ids": [
+                        "ev_000000000011",
+                        "ev_000000000012",
+                        "ev_000000000013"
+                    ]
+                },
+                {
+                    "from_entity_id": "ent_000000000010",
+                    "from_label": "Alice Nakamura",
+                    "relation": "created",
+                    "direction": "forward",
+                    "to_entity_id": "ent_000000000002",
+                    "to_label": "Pulsar",
+                    "supporting_event_ids": [
+                        "ev_000000000003",
+                        "ev_000000000004"
+                    ]
+                }
+            ],
+            "path_collision_count": 1
+        },
+        {
+            "value": "Vega",
+            "score": 2.878231366242557,
+            "evidence": "observed",
+            "supporting_event_ids": [
+                "ev_000000000011",
+                "ev_000000000012",
+                "ev_000000000013"
+            ],
+            "support_count": 4,
+            "distinct_session_count": null,
+            "entity_id": "ent_000000000003",
+            "scope": "topic:alice nakamura",
+            "observed_path": [
+                {
+                    "from_entity_id": "ent_000000000020",
+                    "from_label": "Jordan Sato",
+                    "relation": "collaborated_with",
+                    "direction": "inverse",
+                    "to_entity_id": "ent_000000000010",
+                    "to_label": "Alice Nakamura",
+                    "supporting_event_ids": [
+                        "ev_000000000011",
+                        "ev_000000000012",
+                        "ev_000000000013"
+                    ]
+                },
+                {
+                    "from_entity_id": "ent_000000000010",
+                    "from_label": "Alice Nakamura",
+                    "relation": "created",
+                    "direction": "forward",
+                    "to_entity_id": "ent_000000000003",
+                    "to_label": "Vega",
+                    "supporting_event_ids": [
+                        "ev_000000000005"
+                    ]
+                }
+            ],
+            "path_collision_count": 1
+        }
+    ],
+    "memory_block": {
+        "groups": [
+            {
+                "value": "Nexus",
+                "score": 3.3850627513777627,
+                "evidence": "observed",
+                "support_count": 5,
+                "supporting_event_ids": [
+                    "ev_000000000011",
+                    "ev_000000000012",
+                    "ev_000000000013"
+                ],
+                "entity_ids": [
+                    "ent_000000000001"
+                ],
+                "scopes": [
+                    "topic:alice nakamura"
+                ],
+                "via_relations": [],
+                "via_anchor_entity_ids": [],
+                "observed_path": [
+                    {
+                        "from_entity_id": "ent_000000000020",
+                        "from_label": "Jordan Sato",
+                        "relation": "collaborated_with",
+                        "direction": "inverse",
+                        "to_entity_id": "ent_000000000010",
+                        "to_label": "Alice Nakamura",
+                        "supporting_event_ids": [
+                            "ev_000000000011",
+                            "ev_000000000012",
+                            "ev_000000000013"
+                        ]
+                    },
+                    {
+                        "from_entity_id": "ent_000000000010",
+                        "from_label": "Alice Nakamura",
+                        "relation": "created",
+                        "direction": "forward",
+                        "to_entity_id": "ent_000000000001",
+                        "to_label": "Nexus",
+                        "supporting_event_ids": [
+                            "ev_000000000001",
+                            "ev_000000000002"
+                        ]
+                    }
+                ],
+                "path_collision_count": 1
+            },
+            {
+                "value": "Pulsar",
+                "score": 3.3850627513777627,
+                "evidence": "observed",
+                "support_count": 5,
+                "supporting_event_ids": [
+                    "ev_000000000011",
+                    "ev_000000000012",
+                    "ev_000000000013"
+                ],
+                "entity_ids": [
+                    "ent_000000000002"
+                ],
+                "scopes": [
+                    "topic:alice nakamura"
+                ],
+                "via_relations": [],
+                "via_anchor_entity_ids": [],
+                "observed_path": [
+                    {
+                        "from_entity_id": "ent_000000000020",
+                        "from_label": "Jordan Sato",
+                        "relation": "collaborated_with",
+                        "direction": "inverse",
+                        "to_entity_id": "ent_000000000010",
+                        "to_label": "Alice Nakamura",
+                        "supporting_event_ids": [
+                            "ev_000000000011",
+                            "ev_000000000012",
+                            "ev_000000000013"
+                        ]
+                    },
+                    {
+                        "from_entity_id": "ent_000000000010",
+                        "from_label": "Alice Nakamura",
+                        "relation": "created",
+                        "direction": "forward",
+                        "to_entity_id": "ent_000000000002",
+                        "to_label": "Pulsar",
+                        "supporting_event_ids": [
+                            "ev_000000000003",
+                            "ev_000000000004"
+                        ]
+                    }
+                ],
+                "path_collision_count": 1
+            },
+            {
+                "value": "Vega",
+                "score": 2.878231366242557,
+                "evidence": "observed",
+                "support_count": 4,
+                "supporting_event_ids": [
+                    "ev_000000000011",
+                    "ev_000000000012",
+                    "ev_000000000013"
+                ],
+                "entity_ids": [
+                    "ent_000000000003"
+                ],
+                "scopes": [
+                    "topic:alice nakamura"
+                ],
+                "via_relations": [],
+                "via_anchor_entity_ids": [],
+                "observed_path": [
+                    {
+                        "from_entity_id": "ent_000000000020",
+                        "from_label": "Jordan Sato",
+                        "relation": "collaborated_with",
+                        "direction": "inverse",
+                        "to_entity_id": "ent_000000000010",
+                        "to_label": "Alice Nakamura",
+                        "supporting_event_ids": [
+                            "ev_000000000011",
+                            "ev_000000000012",
+                            "ev_000000000013"
+                        ]
+                    },
+                    {
+                        "from_entity_id": "ent_000000000010",
+                        "from_label": "Alice Nakamura",
+                        "relation": "created",
+                        "direction": "forward",
+                        "to_entity_id": "ent_000000000003",
+                        "to_label": "Vega",
+                        "supporting_event_ids": [
+                            "ev_000000000005"
+                        ]
+                    }
+                ],
+                "path_collision_count": 1
+            }
+        ],
+        "no_data_reason": null,
+        "notes": [
+            "Observed path matched 3 candidates; TL fallback skipped."
+        ]
+    },
+    "warnings": [
+        {
+            "code": "query_note",
+            "message": "Observed path matched 3 candidates; TL fallback skipped."
+        }
+    ],
+    "reason": "ok",
+    "error": null,
+    "latency_ms": 1.043834025040269
+}
