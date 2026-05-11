@@ -1,7 +1,9 @@
 package context
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -59,7 +61,7 @@ func TestEstimateTokens(t *testing.T) {
 
 func TestShouldCompact(t *testing.T) {
 	t.Run("below threshold returns false", func(t *testing.T) {
-		// 85% of 128000 = 108800
+		// 90% of 128000 = 115200
 		got := ShouldCompact(50000, 1000, 128000)
 		if got {
 			t.Error("ShouldCompact should be false when well below threshold")
@@ -67,16 +69,16 @@ func TestShouldCompact(t *testing.T) {
 	})
 
 	t.Run("input plus output above threshold returns true", func(t *testing.T) {
-		// 100000 + 10000 = 110000 > 108800
-		got := ShouldCompact(100000, 10000, 128000)
+		// 105000 + 15000 = 120000 > 115200
+		got := ShouldCompact(105000, 15000, 128000)
 		if !got {
-			t.Error("ShouldCompact should be true when input+output exceeds 85% of context window")
+			t.Error("ShouldCompact should be true when input+output exceeds 90% of context window")
 		}
 	})
 
 	t.Run("exactly at threshold returns true", func(t *testing.T) {
-		// 85% of 128000 = 108800
-		got := ShouldCompact(100000, 8800, 128000)
+		// 90% of 128000 = 115200
+		got := ShouldCompact(110000, 5200, 128000)
 		if !got {
 			t.Error("ShouldCompact should be true at exactly the threshold")
 		}
@@ -379,6 +381,164 @@ func TestShapeHistory(t *testing.T) {
 					t.Errorf("orphaned tool_use with id %q at position %d", b.ID, i)
 				}
 			}
+		}
+	})
+}
+
+// TestTruncateOversizedLastUserMessage covers the short-session single-input
+// fallback added to guard P0-#1 from 2026-05-11 stress testing. Without this,
+// a 191K-token single user message escapes every client-side defense because
+// ShapeHistory and the preflight path are both gated by MinShapeable()=9.
+func TestTruncateOversizedLastUserMessage(t *testing.T) {
+	t.Run("plain-text oversized user message is truncated", func(t *testing.T) {
+		// 200K context, 0.90 threshold = 180K tokens. At 3.5 chars/token that's
+		// ~630K chars. Build a user message clearly above this so the function
+		// fires.
+		huge := strings.Repeat("padding ", 100000) // 800K chars
+		msgs := []client.Message{
+			{Role: "system", Content: client.NewTextContent("system prompt")},
+			{Role: "user", Content: client.NewTextContent(huge)},
+		}
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped == 0 {
+			t.Fatalf("expected truncation when input exceeds threshold, dropped=0")
+		}
+		if !strings.Contains(out[1].Content.Text(), "user message truncated") {
+			t.Error("truncation marker absent from user message body")
+		}
+		if !utf8.ValidString(out[1].Content.Text()) {
+			t.Error("output is not valid UTF-8")
+		}
+	})
+
+	// Regression: a huge first user message followed by a small follow-up
+	// (the daemon/TUI resume case) — must still truncate the huge one, not
+	// the small one. Picking "most recent" would silently miss this and
+	// the huge message escapes to the API. (See 2026-05-11 GPT review F1.)
+	t.Run("huge first user message followed by small follow-up", func(t *testing.T) {
+		huge := strings.Repeat("padding ", 100000) // 800K chars
+		msgs := []client.Message{
+			{Role: "system", Content: client.NewTextContent("system")},
+			{Role: "user", Content: client.NewTextContent(huge)},
+			{Role: "assistant", Content: client.NewTextContent("ok")},
+			{Role: "user", Content: client.NewTextContent("继续")},
+		}
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped == 0 {
+			t.Fatalf("expected truncation of huge first user message, dropped=0")
+		}
+		// Truncation must hit messages[1] (the huge one), not messages[3] (the small one).
+		if !strings.Contains(out[1].Content.Text(), "user message truncated") {
+			t.Errorf("huge first user message (msgs[1]) was not truncated — got body of length %d, head %q",
+				len(out[1].Content.Text()), out[1].Content.Text()[:min(120, len(out[1].Content.Text()))])
+		}
+		if out[3].Content.Text() != "继续" {
+			t.Errorf("small follow-up user message (msgs[3]) was mutated; got %q want \"继续\"", out[3].Content.Text())
+		}
+	})
+
+	t.Run("under-threshold message is unchanged", func(t *testing.T) {
+		small := strings.Repeat("hello ", 100) // 600 chars, ~170 tokens
+		msgs := []client.Message{
+			{Role: "user", Content: client.NewTextContent(small)},
+		}
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped != 0 {
+			t.Errorf("expected dropped=0 under threshold, got %d", dropped)
+		}
+		if out[0].Content.Text() != small {
+			t.Errorf("user message body mutated under threshold")
+		}
+	})
+
+	// Regression for PR review #5: TruncateOversizedLastUserMessage used to
+	// pass a rune-count budget into truncateMessageBody which slices by
+	// bytes. For CJK content (~3 bytes/rune) the function silently
+	// over-truncated to ~1/3 the intended size — safe direction but wasteful.
+	// After the fix, the surviving content for CJK should be at least
+	// half of what it would be for ASCII at the same budget (we don't
+	// expect exact parity, but a 1/3 ratio is too aggressive).
+	t.Run("CJK content not over-truncated to byte-budget interpretation", func(t *testing.T) {
+		// 200K repeats of "你好世界 " = 1M runes, ~3.2M bytes. Default
+		// 0.90 * 200K = 180K tokens × 3.5 chars/token = 630K rune budget.
+		// Pre-fix: truncate to 630K *bytes* = ~210K runes (over-trunc 3x).
+		// Post-fix: truncate to ~3.2M/1M × 630K bytes = ~2M bytes = ~660K
+		// runes — much closer to the intended 630K runes.
+		chinese := strings.Repeat("你好世界 ", 200000)
+		msgs := []client.Message{
+			{Role: "user", Content: client.NewTextContent(chinese)},
+		}
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped == 0 {
+			t.Fatalf("expected truncation; this input is well over threshold")
+		}
+		body := out[0].Content.Text()
+		if !utf8.ValidString(body) {
+			t.Errorf("truncation produced invalid UTF-8")
+		}
+		surviveRunes := utf8.RuneCountInString(body)
+		// Floor for "not over-truncated": at least 400K runes survive.
+		// Pre-fix this was ~210K runes (over-trunc). Post-fix expected ~660K.
+		const minExpectedRunes = 400_000
+		if surviveRunes < minExpectedRunes {
+			t.Errorf("CJK content over-truncated: %d runes survived, want >= %d (pre-fix bug)",
+				surviveRunes, minExpectedRunes)
+		}
+	})
+
+	t.Run("CJK content stays rune-aligned", func(t *testing.T) {
+		// EstimateTokens counts runes (not bytes), so the input has to push
+		// rune-count past 0.90 × 200K = 180K tokens × 3.5 chars/token = 630K
+		// runes. 200K repeats × 5 runes ("你好世界 ") = 1M runes, well over.
+		chinese := strings.Repeat("你好世界 ", 200000)
+		if !utf8.ValidString(chinese) {
+			t.Fatalf("test setup invariant: input must be valid UTF-8")
+		}
+		msgs := []client.Message{
+			{Role: "user", Content: client.NewTextContent(chinese)},
+		}
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped == 0 {
+			t.Fatalf("expected truncation on huge CJK input")
+		}
+		body := out[0].Content.Text()
+		if !utf8.ValidString(body) {
+			t.Errorf("truncation split a rune mid-sequence: invalid UTF-8")
+		}
+	})
+
+	t.Run("multi-block user message is left alone", func(t *testing.T) {
+		// Structured content (tool_result / image) needs different handling
+		// — this fallback intentionally skips it.
+		msgs := []client.Message{
+			{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+				{Type: "text", Text: strings.Repeat("padding ", 100000)},
+			})},
+		}
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped != 0 {
+			t.Errorf("multi-block message should not be touched; dropped=%d", dropped)
+		}
+	})
+
+	t.Run("zero context window is a no-op", func(t *testing.T) {
+		msgs := []client.Message{
+			{Role: "user", Content: client.NewTextContent(strings.Repeat("padding ", 100000))},
+		}
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 0)
+		if dropped != 0 {
+			t.Errorf("zero contextWindow should be no-op; dropped=%d", dropped)
+		}
+	})
+
+	t.Run("no user message is a no-op", func(t *testing.T) {
+		msgs := []client.Message{
+			{Role: "system", Content: client.NewTextContent("just system")},
+			{Role: "assistant", Content: client.NewTextContent("just assistant")},
+		}
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped != 0 {
+			t.Errorf("expected no-op when no user msg; dropped=%d", dropped)
 		}
 	})
 }

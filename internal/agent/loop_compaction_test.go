@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -19,12 +21,12 @@ import (
 //
 //  1. Agent loop runs multiple tool-call iterations within a single Run()
 //  2. Mock server reports growing input tokens each iteration
-//  3. When tokens exceed 85% of context_window → compaction triggers
+//  3. When tokens exceed 90% of context_window → compaction triggers
 //  4. PersistLearnings fires (small tier) → writes to MEMORY.md
 //  5. GenerateSummary fires (small tier) → creates summary
 //  6. ShapeHistory reduces messages
 //
-// Uses context_window=2000 so 85% threshold = 1700 tokens.
+// Uses context_window=2000 so 90% threshold = 1800 tokens.
 // Needs ≥5 tool iterations so messages > MinShapeable (9).
 func TestAgentLoop_CompactionAndMemoryPersist(t *testing.T) {
 	memoryDir := t.TempDir()
@@ -125,7 +127,7 @@ func TestAgentLoop_CompactionAndMemoryPersist(t *testing.T) {
 	handler := &mockHandler{approveResult: true}
 
 	loop := NewAgentLoop(gw, reg, "medium", "", 20, 2000, 200, nil, nil, nil)
-	loop.SetContextWindow(2000) // 85% = 1700 triggers compaction
+	loop.SetContextWindow(2000) // 90% = 1800 triggers compaction
 	loop.SetMemoryDir(memoryDir)
 	loop.SetHandler(handler)
 
@@ -613,7 +615,7 @@ func TestAgentLoop_ReactiveCompaction(t *testing.T) {
 
 		if msgCount < 12 {
 			// Keep looping with tool calls, report LOW tokens so proactive
-			// compaction does NOT trigger (under 85% of 128000).
+			// compaction does NOT trigger (under 90% of 128000).
 			calls = append(calls, fmt.Sprintf("call %d: TOOL (msgs=%d)", callNum, msgCount))
 			mu.Unlock()
 			t.Logf("Call %d: [main] tool_use (msgs=%d)", callNum, msgCount)
@@ -883,8 +885,19 @@ func TestAgentLoop_ReactiveCompaction_UsesEmergencyFallbackWhenSoftStillOverBudg
 	loop.SetContextWindow(100000)
 
 	huge := strings.Repeat("x", 450000)
+	// Wrap the huge first user message in a block-content envelope so the
+	// shortSessionTruncate preflight (added 2026-05-11) skips it — this
+	// test specifically exercises the reactive emergency fallback path,
+	// which only fires when client-side defenses cannot recover the
+	// prompt size pre-flight. A plain-text huge message would now get
+	// truncated by TruncateOversizedLastUserMessage before reaching the
+	// API and the soft compaction alone would suffice. Real-world
+	// equivalent: a session whose bulk lives in tool_result / image
+	// blocks, which our preflight intentionally leaves untouched.
 	history := []client.Message{
-		{Role: "user", Content: client.NewTextContent(huge)},
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "text", Text: huge},
+		})},
 		{Role: "assistant", Content: client.NewTextContent("ack")},
 		{Role: "user", Content: client.NewTextContent("second turn")},
 		{Role: "assistant", Content: client.NewTextContent("second reply")},
@@ -1062,10 +1075,10 @@ func TestAgentLoop_CompactionTriggersOnWarmCache(t *testing.T) {
 	}
 
 	if !hasPersist {
-		t.Error("PersistLearnings must fire once warm-cache total prompt exceeds 85% — gate regressed to pre-fix behavior")
+		t.Error("PersistLearnings must fire once warm-cache total prompt exceeds 90% — gate regressed to pre-fix behavior")
 	}
 	if !hasSummary {
-		t.Error("GenerateSummary must fire once warm-cache total prompt exceeds 85% — gate regressed to pre-fix behavior")
+		t.Error("GenerateSummary must fire once warm-cache total prompt exceeds 90% — gate regressed to pre-fix behavior")
 	}
 }
 
@@ -1307,4 +1320,437 @@ func TestAgentLoop_EmptySummaryTriggersBackoff(t *testing.T) {
 	// If there is no 4th SUMMARY at all (len(summaryIndices) == 3), the
 	// breaker held for the entire remaining run — that is also a valid
 	// GREEN state and intentionally passes without additional checks.
+}
+
+// statusRecorder captures OnRunStatus calls for assertions. It also satisfies
+// EventHandler with no-op stubs so it can be assigned to AgentLoop.handler in
+// tests that exercise recordCompactionFailure end-to-end.
+type statusRecorder struct {
+	events []recordedStatus
+}
+
+type recordedStatus struct{ code, detail string }
+
+func (s *statusRecorder) OnRunStatus(code, detail string) {
+	s.events = append(s.events, recordedStatus{code, detail})
+}
+
+// EventHandler stubs — no behavior, just to satisfy the interface.
+func (s *statusRecorder) OnToolCall(name string, args string)                        {}
+func (s *statusRecorder) OnToolResult(string, string, ToolResult, time.Duration)     {}
+func (s *statusRecorder) OnText(string)                                              {}
+func (s *statusRecorder) OnPreamble(string)                                          {}
+func (s *statusRecorder) OnStreamDelta(string)                                       {}
+func (s *statusRecorder) OnApprovalNeeded(string, string) bool                       { return false }
+func (s *statusRecorder) OnUsage(TurnUsage)                                          {}
+func (s *statusRecorder) OnCloudAgent(agentID string, status string, message string) {}
+func (s *statusRecorder) OnCloudProgress(int, int)                                   {}
+func (s *statusRecorder) OnCloudPlan(planType string, content string, needsReview bool) {
+}
+
+func TestEmitCompactionFailureStatus_PostsToHandler(t *testing.T) {
+	rec := &statusRecorder{}
+	emitCompactionFailureStatus(rec, "reactive_summary_with_prior", errors.New("synthetic 500"))
+
+	if len(rec.events) != 1 {
+		t.Fatalf("expected 1 OnRunStatus event, got %d", len(rec.events))
+	}
+	if rec.events[0].code != "compaction_failed" {
+		t.Errorf("code = %q, want compaction_failed", rec.events[0].code)
+	}
+	if !strings.Contains(rec.events[0].detail, "reactive_summary_with_prior") ||
+		!strings.Contains(rec.events[0].detail, "synthetic 500") {
+		t.Errorf("detail missing context: %q", rec.events[0].detail)
+	}
+}
+
+func TestEmitCompactionFailureStatus_HandlesNilHandler(t *testing.T) {
+	// nil handler must not panic.
+	emitCompactionFailureStatus(nil, "any_phase", errors.New("err"))
+}
+
+func TestEmitCompactionFailureStatus_HandlesNonRunStatusHandler(t *testing.T) {
+	// Handler that doesn't implement RunStatusHandler must be silently skipped.
+	bareHandler := struct{}{}
+	emitCompactionFailureStatus(bareHandler, "any_phase", errors.New("err"))
+}
+
+func TestRecordCompactionFailure_EmitsBothChannels(t *testing.T) {
+	rec := &statusRecorder{}
+	a := &AgentLoop{handler: rec, auditor: nil} // auditor=nil exercises the nil guard
+	a.recordCompactionFailure("test_phase", errors.New("boom"))
+
+	if len(rec.events) != 1 {
+		t.Fatalf("expected 1 OnRunStatus event, got %d", len(rec.events))
+	}
+	if rec.events[0].code != "compaction_failed" {
+		t.Errorf("code = %q, want compaction_failed", rec.events[0].code)
+	}
+	if !strings.Contains(rec.events[0].detail, "test_phase") ||
+		!strings.Contains(rec.events[0].detail, "boom") {
+		t.Errorf("detail missing context: %q", rec.events[0].detail)
+	}
+}
+
+func TestPreflightCompaction_TriggersBeforeOversizedCall(t *testing.T) {
+	// Build a message slice that estimates above 0.95 * contextWindow.
+	// Use 1.5M chars ≈ 428K tokens; with contextWindow = 200_000, that's
+	// way over the 95% threshold (190K).
+	bigText := strings.Repeat("x", 1_500_000)
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "user", Content: client.NewTextContent(bigText)},
+	}
+
+	// shouldPreflightCompact is the decision function under test.
+	got := shouldPreflightCompact(messages, 200_000)
+	if !got {
+		t.Errorf("shouldPreflightCompact = false, want true (msg estimate exceeds 95%% of 200K)")
+	}
+
+	// Negative case: well-under-budget should not trigger.
+	smallMsgs := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("hi")},
+	}
+	if shouldPreflightCompact(smallMsgs, 200_000) {
+		t.Errorf("shouldPreflightCompact = true on under-budget messages")
+	}
+
+	// Edge: contextWindow=0 (disabled) → never trigger.
+	if shouldPreflightCompact(messages, 0) {
+		t.Errorf("shouldPreflightCompact = true with contextWindow=0; should be disabled")
+	}
+}
+
+func TestShortSessionTruncate_RepeatsUntilUnderPreflightThreshold(t *testing.T) {
+	loop := &AgentLoop{contextWindow: 200_000}
+	hugeA := strings.Repeat("a", 700_000)
+	hugeB := strings.Repeat("b", 700_000)
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent(hugeA)},
+		{Role: "assistant", Content: client.NewTextContent("ack")},
+		{Role: "user", Content: client.NewTextContent(hugeB)},
+	}
+	if !shouldPreflightCompact(messages, loop.contextWindow) {
+		t.Fatal("test setup invariant: input must exceed preflight threshold")
+	}
+
+	out := loop.shortSessionTruncate(messages, "test")
+	if shouldPreflightCompact(out, loop.contextWindow) {
+		t.Fatalf("shortSessionTruncate left prompt over preflight threshold")
+	}
+	if !strings.Contains(out[1].Content.Text(), "user message truncated") {
+		t.Errorf("first oversized user message was not truncated")
+	}
+	if !strings.Contains(out[3].Content.Text(), "user message truncated") {
+		t.Errorf("second oversized user message was not truncated")
+	}
+}
+
+func TestShortSessionTruncate_CurrentTurnRunMessagesStripScaffold(t *testing.T) {
+	var captured []client.CompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		captured = append(captured, req)
+		json.NewEncoder(w).Encode(nativeResponse("ok", "end_turn", nil, 500, 50))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	loop := NewAgentLoop(gw, NewToolRegistry(), "medium", "", 5, 2000, 200, nil, nil, nil)
+	loop.SetContextWindow(200_000)
+
+	huge := strings.Repeat("x", 800_000)
+	result, _, err := loop.Run(context.Background(), huge, nil, nil)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("result = %q, want ok", result)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("expected one main request, got %d", len(captured))
+	}
+	if !strings.Contains(captured[0].Messages[1].Content.Text(), "user message truncated") {
+		t.Fatalf("test setup invariant: outgoing user prompt was not truncated")
+	}
+
+	runMsgs := loop.RunMessages()
+	if len(runMsgs) == 0 {
+		t.Fatal("RunMessages empty")
+	}
+	first := runMsgs[0].Content.Text()
+	if strings.Contains(first, "<!-- cache_break -->") ||
+		strings.Contains(first, "Active agent context") {
+		t.Fatalf("RunMessages leaked scaffolded user prompt after truncation; head=%q", first[:min(200, len(first))])
+	}
+	if !strings.Contains(first, "user message truncated") {
+		t.Fatalf("RunMessages should persist truncated raw user content, got head=%q", first[:min(200, len(first))])
+	}
+}
+
+// TestAgentLoop_ReactiveCompaction_RecoversFromOversizedTranscript is the E2E
+// regression for the 2026-05-07 production cascade:
+//
+//  1. Session arrives with a multi-megabyte transcript (huge plain-text user
+//     and assistant turns from previous interactions).
+//  2. First main-tier completion call returns HTTP 400 "prompt is too long".
+//  3. Reactive recovery fires: PersistLearnings → compressOldToolResults
+//     → GenerateSummary (small-tier) → ShapeHistory → retry.
+//  4. Pre-fix bug: GenerateSummary received the same ~1M-char transcript and
+//     itself returned 400 with "prompt is too long", surfacing a hard error
+//     to the user.
+//  5. Post-fix (Task 3): capTranscriptForSummarize truncates the transcript
+//     head+tail to summarizeInputCapChars (540K) before the small-tier call,
+//     keeping the summarizer comfortably under Haiku 4.5's 200K context window.
+//
+// We use plain text messages (not tool_result blocks) so compressOldToolResults
+// is a no-op — the only line of defense that should kick in here is Task 3's
+// cap. We also keep the message count below ctxwin.MinShapeable() (9) so the
+// preflight compaction path does not fire and steal the test scenario; the 400
+// response is the only path into reactive recovery.
+func TestAgentLoop_ReactiveCompaction_RecoversFromOversizedTranscript(t *testing.T) {
+	// Mirrors internal/context/summarize.go's summarizeInputCapChars constant;
+	// kept as a local literal because the source-of-truth constant is unexported.
+	// If you bump the cap there, bump this assertion too.
+	const summarizeInputCapCharsLocal = 540_000
+
+	memoryDir := t.TempDir()
+
+	var mu sync.Mutex
+	var calls []string
+	var maxSummaryUserChars int // peak observed body length on small-tier SUMMARY calls
+
+	contextErrorReturned := false
+	retrySucceeded := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := readBody(r.Body)
+		defer r.Body.Close()
+
+		var req struct {
+			ModelTier string `json:"model_tier"`
+			Messages  []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		json.Unmarshal(raw, &req)
+
+		mu.Lock()
+		callNum := len(calls) + 1
+
+		if req.ModelTier == "small" {
+			isPersist := false
+			isSummary := false
+			summaryUserChars := 0
+			for _, m := range req.Messages {
+				var text string
+				json.Unmarshal(m.Content, &text)
+				if strings.Contains(text, "extracting durable knowledge") {
+					isPersist = true
+				}
+				if strings.Contains(text, "Compress the following conversation") {
+					isSummary = true
+				}
+				if m.Role == "user" {
+					// Track length of the user-content portion — this is the
+					// transcript that capTranscriptForSummarize is supposed to
+					// cap. The system message (the summary prompt) is fixed and
+					// not the load-bearing variable.
+					if len(text) > summaryUserChars {
+						summaryUserChars = len(text)
+					}
+				}
+			}
+
+			if isPersist {
+				calls = append(calls, fmt.Sprintf("call %d: PERSIST", callNum))
+				mu.Unlock()
+				t.Logf("Call %d: [small] PersistLearnings (messages: %d)", callNum, len(req.Messages))
+				json.NewEncoder(w).Encode(nativeResponse(
+					"- Reactive recovery exercised cap on oversized transcript",
+					"end_turn", nil, 50, 30))
+				return
+			}
+			if isSummary {
+				if summaryUserChars > maxSummaryUserChars {
+					maxSummaryUserChars = summaryUserChars
+				}
+				calls = append(calls, fmt.Sprintf("call %d: SUMMARY (user_chars=%d)", callNum, summaryUserChars))
+				mu.Unlock()
+				t.Logf("Call %d: [small] GenerateSummary (user_content_chars=%d)", callNum, summaryUserChars)
+				// Return a valid <summary> wrapper so extractSummary yields non-empty content;
+				// otherwise ShapeHistory falls back to sliding-window without a summary, which
+				// is a separate code path from what we want to exercise here.
+				json.NewEncoder(w).Encode(nativeResponse(
+					"<summary>Earlier session covered analysis of multiple components before the context overflowed.</summary>",
+					"end_turn", nil, 50, 30))
+				return
+			}
+
+			calls = append(calls, fmt.Sprintf("call %d: small-other", callNum))
+			mu.Unlock()
+			json.NewEncoder(w).Encode(nativeResponse("ok", "end_turn", nil, 50, 30))
+			return
+		}
+
+		// Main-tier call: first one returns 400, subsequent calls succeed.
+		msgCount := len(req.Messages)
+		if !contextErrorReturned {
+			contextErrorReturned = true
+			calls = append(calls, fmt.Sprintf("call %d: CONTEXT_ERROR (msgs=%d)", callNum, msgCount))
+			mu.Unlock()
+			t.Logf("Call %d: [main] → 400 prompt is too long (msgs=%d)", callNum, msgCount)
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"prompt is too long"}}`))
+			return
+		}
+
+		retrySucceeded = true
+		calls = append(calls, fmt.Sprintf("call %d: RETRY_SUCCESS (msgs=%d)", callNum, msgCount))
+		mu.Unlock()
+		t.Logf("Call %d: [main] end_turn after reactive compaction (msgs=%d)", callNum, msgCount)
+		json.NewEncoder(w).Encode(nativeResponse(
+			"Recovered after reactive compaction with size-capped summary.",
+			"end_turn", nil, 800, 100))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&thinkTool{})
+
+	handler := &mockHandler{approveResult: true}
+
+	// Six pre-existing messages (3 user/assistant turns) of ~200K chars each
+	// → ~1.2M chars total transcript. After buildTranscript prefixes each
+	// message with "[role]: ", that's still well over summarizeInputCapChars
+	// (540K). Without Task 3's cap, the small-tier SUMMARY call would receive
+	// the full ~1.2M-char transcript and 400 with "prompt is too long",
+	// reproducing the production cascade.
+	//
+	// Plain text (not tool_result blocks) is intentional:
+	//   - tool_result is truncated to 450 chars per block by summarizeToolResult,
+	//     which would short-circuit the cap path and make this test prove
+	//     nothing about Task 3.
+	//   - Plain text in user/assistant messages flows through messageText
+	//     untouched, so the only line of defense between buildTranscript and
+	//     the small-tier model is capTranscriptForSummarize.
+	//
+	// Six messages keeps the count below ctxwin.MinShapeable() (9), which gates
+	// the preflight compaction path. We want the 400 response to be the ONLY
+	// trigger of reactive recovery; preflight firing first would shape the
+	// transcript before we ever see the 400 and the test would prove nothing
+	// about the reactive→summary cap interaction.
+	const perMsgChars = 200_000
+	hugeUser := strings.Repeat("u", perMsgChars)
+	hugeAssistant := strings.Repeat("a", perMsgChars)
+	history := []client.Message{
+		{Role: "user", Content: client.NewTextContent(hugeUser)},
+		{Role: "assistant", Content: client.NewTextContent(hugeAssistant)},
+		{Role: "user", Content: client.NewTextContent(hugeUser)},
+		{Role: "assistant", Content: client.NewTextContent(hugeAssistant)},
+		{Role: "user", Content: client.NewTextContent(hugeUser)},
+		{Role: "assistant", Content: client.NewTextContent(hugeAssistant)},
+	}
+	totalHistoryChars := 6 * perMsgChars
+	t.Logf("Seeded history: 6 messages × %d chars = %d chars total (over the %d-char small-tier cap)",
+		perMsgChars, totalHistoryChars, summarizeInputCapCharsLocal)
+
+	loop := NewAgentLoop(gw, reg, "medium", "", 20, 2000, 200, nil, nil, nil)
+	// Big context window so the proactive 0.85 gate doesn't fire on
+	// lastInputTokens (which our mock reports as 800/100, well under any cap).
+	// The 400 response is the only trigger we want for reactive recovery.
+	loop.SetContextWindow(2_000_000)
+	loop.SetMemoryDir(memoryDir)
+	loop.SetHandler(handler)
+
+	result, usage, err := loop.Run(context.Background(),
+		"Continue the analysis after the prior session.",
+		nil, history)
+	if err != nil {
+		t.Fatalf("expected reactive recovery to succeed, got error: %v", err)
+	}
+
+	mu.Lock()
+	t.Logf("\n=== Call sequence (%d total) ===", len(calls))
+	for _, c := range calls {
+		t.Logf("  %s", c)
+	}
+
+	hasPersist := false
+	hasSummary := false
+	hasContextError := false
+	hasRetrySuccess := false
+	for _, c := range calls {
+		if strings.Contains(c, "PERSIST") {
+			hasPersist = true
+		}
+		if strings.Contains(c, "SUMMARY") {
+			hasSummary = true
+		}
+		if strings.Contains(c, "CONTEXT_ERROR") {
+			hasContextError = true
+		}
+		if strings.Contains(c, "RETRY_SUCCESS") {
+			hasRetrySuccess = true
+		}
+	}
+	peakSummaryChars := maxSummaryUserChars
+	mu.Unlock()
+
+	t.Logf("Result: %d chars", len(result))
+	t.Logf("Usage: %d LLM calls", usage.LLMCalls)
+	t.Logf("Peak SUMMARY user-content body length: %d chars (cap=%d, raw transcript would be ~%d)",
+		peakSummaryChars, summarizeInputCapCharsLocal, totalHistoryChars)
+
+	if !hasContextError {
+		t.Error("expected the mock's main-tier 400 to fire (reactive recovery entry point)")
+	}
+	if !hasPersist {
+		t.Error("expected PersistLearnings during reactive compaction")
+	}
+	if !hasSummary {
+		t.Error("expected GenerateSummary during reactive compaction")
+	}
+	if !hasRetrySuccess {
+		t.Error("expected the post-recovery main-tier retry to succeed")
+	}
+	if !retrySucceeded {
+		t.Error("retrySucceeded flag should be true")
+	}
+	if result == "" {
+		t.Error("expected non-empty result after successful retry")
+	}
+
+	// The Task 3 assertion. Without capTranscriptForSummarize, peakSummaryChars
+	// would be ~1.2M (the raw buildTranscript output) and the small-tier call
+	// would 400 just like the main-tier, ending the cascade in a hard error
+	// to the user. With the cap, peakSummaryChars should sit at or just under
+	// summarizeInputCapChars (540K) — never above.
+	if peakSummaryChars == 0 {
+		t.Fatalf("peak SUMMARY body length is 0; the small-tier SUMMARY call was never observed")
+	}
+	if peakSummaryChars > summarizeInputCapCharsLocal {
+		t.Errorf("peak SUMMARY user-content body length = %d, want ≤ %d (summarizeInputCapChars).\n"+
+			"This is the regression for the 2026-05-07 cascade: capTranscriptForSummarize\n"+
+			"failed to apply, so the small-tier summarizer received the full oversized\n"+
+			"transcript and would 400 in production.",
+			peakSummaryChars, summarizeInputCapCharsLocal)
+	}
+	// Also assert the cap was actually exercised (binding) — if peakSummaryChars
+	// is way under 540K, the test scenario didn't actually push hard enough to
+	// prove anything about the cap.
+	if peakSummaryChars < summarizeInputCapCharsLocal/2 {
+		t.Errorf("peak SUMMARY user-content body length = %d, expected the cap to be binding (≥ %d).\n"+
+			"The seeded transcript may not be large enough to actually exercise capTranscriptForSummarize.",
+			peakSummaryChars, summarizeInputCapCharsLocal/2)
+	}
 }

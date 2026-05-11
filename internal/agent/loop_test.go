@@ -2636,7 +2636,7 @@ func (s *simpleTool) Run(ctx context.Context, args string) (ToolResult, error) {
 func (s *simpleTool) RequiresApproval() bool { return false }
 
 func TestAgentLoop_CompactionTriggersOnHighTokenUsage(t *testing.T) {
-	// Simulate a multi-turn session that exceeds 85% of context window.
+	// Simulate a multi-turn session that exceeds 90% of context window.
 	//
 	// Flow:
 	// Call 1: tool call response with high input_tokens (triggers compaction after)
@@ -2657,9 +2657,9 @@ func TestAgentLoop_CompactionTriggersOnHighTokenUsage(t *testing.T) {
 
 		switch n {
 		case 1:
-			// First call: tool call with high token usage
+			// First call: tool call with high token usage (>90% of 128K = 115200)
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("think", `{"thought":"planning"}`), 100000, 10000))
+				toolCall("think", `{"thought":"planning"}`), 110000, 10000))
 		case 2:
 			// Summary call: GenerateSummary uses model_tier=small
 			json.NewEncoder(w).Encode(nativeResponse(
@@ -2685,7 +2685,7 @@ func TestAgentLoop_CompactionTriggersOnHighTokenUsage(t *testing.T) {
 	})
 
 	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
-	loop.SetContextWindow(128000) // 85% = 108800
+	loop.SetContextWindow(128000) // 90% = 115200
 
 	// Provide enough history turns so ShapeHistory has something to drop.
 	// In real usage, 100k input tokens means many prior turns.
@@ -2803,9 +2803,9 @@ func TestAgentLoop_CompactionSummaryTransientFailureRecovers(t *testing.T) {
 
 		switch n {
 		case 1:
-			// Tool call with high tokens
+			// Tool call with high tokens (>90% of 128K = 115200)
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("think", `{"thought":"deep"}`), 100000, 10000))
+				toolCall("think", `{"thought":"deep"}`), 110000, 10000))
 		case 2:
 			// Summary call fails (transient 500)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -2813,7 +2813,7 @@ func TestAgentLoop_CompactionSummaryTransientFailureRecovers(t *testing.T) {
 		case 3:
 			// Retry: another tool call, still high tokens → retries summary
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("think", `{"thought":"more"}`), 105000, 10000))
+				toolCall("think", `{"thought":"more"}`), 115000, 10000))
 		case 4:
 			// Summary retry succeeds this time
 			json.NewEncoder(w).Encode(nativeResponse(

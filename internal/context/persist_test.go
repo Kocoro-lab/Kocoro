@@ -185,6 +185,55 @@ func TestPersistLearningsReturnsUsage(t *testing.T) {
 	}
 }
 
+// TestPersistLearnings_CapsOversizedTranscript verifies that the transcript
+// fed to the small-tier summarizer is bounded by summarizeInputCapChars even
+// when the source history is way over that. Without this, a long session
+// crossing the 0.90 compaction threshold (180K tokens on a 200K cap) would
+// 400 the small model with "prompt is too long" — observed as the
+// "phase=proactive_persist_learnings" compaction_failed audit row during
+// 2026-05-11 stress testing.
+func TestPersistLearnings_CapsOversizedTranscript(t *testing.T) {
+	// Build a transcript far over the small-tier 200K cap, same shape as
+	// TestGenerateSummary_CapsOversizedTranscript so the two cap sites stay
+	// in lockstep.
+	huge := strings.Repeat("padding text ", 100_000) // ~1.3M chars
+	messages := []client.Message{
+		{Role: "user", Content: client.NewTextContent(huge)},
+		{Role: "assistant", Content: client.NewTextContent("ok")},
+	}
+
+	dir := t.TempDir()
+	mock := &mockCompleter{
+		response: &client.CompletionResponse{OutputText: "- fact"},
+	}
+
+	_, err := PersistLearnings(context.Background(), mock, messages, dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The user message body sent to the small-tier model must include
+	// the truncation marker AND its total length must stay under the cap
+	// (plus the existing-memory header overhead).
+	sentBody := mock.lastReq.Messages[1].Content.Text()
+	if !strings.Contains(sentBody, "transcript truncated") {
+		head := sentBody
+		if len(head) > 200 {
+			head = head[:200]
+		}
+		t.Errorf("expected truncation marker in capped transcript, got: %q...", head)
+	}
+	// The capped transcript itself must respect summarizeInputCapChars; the
+	// userMsg wraps it with a static header (~70 chars) — allow a small
+	// headroom for the wrapper without forcing this test to track its exact
+	// byte count.
+	const wrapperHeadroom = 256
+	if len(sentBody) > summarizeInputCapChars+wrapperHeadroom {
+		t.Errorf("sent user-message len = %d, want <= %d (cap %d + wrapper headroom)",
+			len(sentBody), summarizeInputCapChars+wrapperHeadroom, summarizeInputCapChars)
+	}
+}
+
 func TestConsolidateMemoryReturnsUsage(t *testing.T) {
 	dir := t.TempDir()
 	for i := 0; i < consolidateThreshold; i++ {

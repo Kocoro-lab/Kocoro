@@ -23,6 +23,8 @@ const (
 	CodeNetworkInterrupted    Code = "network_interrupted"
 	CodeIterationLimit        Code = "iteration_limit"
 	CodeUnexpected            Code = "unexpected"
+
+	CodeContextCompactionFailed Code = "compaction_failed"
 )
 
 // Static fallback messages used when no Detail is available (parser
@@ -41,6 +43,8 @@ var friendlyMessages = map[Code]string{
 	CodeNetworkInterrupted:    "Sorry, the connection to the AI service was interrupted. Please try again.",
 	CodeIterationLimit:        "The request reached its iteration limit and returned a partial result.",
 	CodeUnexpected:            "Sorry, an unexpected error occurred. Please try again.",
+
+	CodeContextCompactionFailed: "Context compaction encountered an issue but the conversation continued.",
 }
 
 // friendlyPrefixes lists stable opening clauses shared between every

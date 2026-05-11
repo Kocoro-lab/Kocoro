@@ -41,6 +41,8 @@ Global settings control how Shannon behaves across all agents — which AI model
 | `agent.model` | Default model for all agents (e.g., `claude-sonnet-4-5`) | No |
 | `agent.temperature` | Creativity level 0.0–1.0. Lower = more predictable. | No |
 | `agent.max_iterations` | Max tool-use rounds per conversation turn | No |
+| `agent.context_window` | **Seed** value for the context window in tokens (default 200000). On every main-tier LLM response the loop auto-adjusts to the observed model's known cap (1M for `claude-sonnet-4-6`/`opus-4-6`/`opus-4-7`; 200K for `claude-sonnet-4-5`/`haiku-4-5`/`opus-4-5`/`opus-4-1`; per-model values for OpenAI/Gemini/Grok). So you usually do NOT need to set this manually for long-context models — the loop will discover the right value from response 2 onward. | No |
+| `agent.context_window` **per-agent override** | When set in `~/.shannon/agents/<name>/config.yaml`, the value locks against auto-detect — use this for cost caps (e.g. force 50000 tokens even on a 1M model) or for Ollama / custom-cap models where the global auto-detect table doesn't apply. Global `agent.context_window` is a seed; per-agent value is a lock. | No |
 | `agent.skill_discovery` | Enable small-model skill matching on first turn (default: true) | No |
 | `agent.time_based_compact.enabled` | Master switch for time-gated tool_result clearing (default: false) | No |
 | `agent.time_based_compact.gap_threshold_minutes` | Fire when (now − last assistant response) exceeds this; matches the Anthropic 1h cache TTL ceiling so no extra cache miss is forced (default: 60) | No |

@@ -2,6 +2,7 @@ package context
 
 import (
 	"math"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -15,7 +16,11 @@ const (
 	overheadPerMessage = 4
 
 	// compactThreshold is the fraction of context window that triggers compaction.
-	compactThreshold = 0.85
+	// 0.90 leaves the cliff at 180K on a 200K cap, vs 170K at the historical
+	// 0.85 setting; ~5% of sessions in the 170K–180K band skip the cliff entirely.
+	// The preflight emergency gate at 0.95 (internal/agent/loop.go) is the safety
+	// net for the remaining 10K headroom.
+	compactThreshold = 0.90
 
 	// defaultKeepLast is the default number of recent turn pairs to keep.
 	defaultKeepLast = 20
@@ -43,7 +48,7 @@ func EstimateTokens(messages []client.Message) int {
 }
 
 // ShouldCompact returns true if the total tokens (input + output) exceed
-// 85% of the context window.
+// 90% of the context window.
 func ShouldCompact(inputTokens, outputTokens, contextWindow int) bool {
 	if contextWindow <= 0 {
 		return false
@@ -123,6 +128,141 @@ func buildShaped(system, firstUser client.Message, summary string, rest []client
 
 	result = append(result, recent...)
 	return stripOrphanedToolPairs(result)
+}
+
+// TruncateOversizedLastUserMessage applies single-message rune-safe head+tail
+// truncation to the most recent user message when the message count is too
+// small for ShapeHistory to help but the total prompt estimate already
+// exceeds the compaction threshold.
+//
+// This guards against the "single huge user input" failure mode: a user
+// pastes a 195K-token document as one message, len(messages) is far below
+// MinShapeable() (=9), so both ShapeHistory and the preflight emergency
+// path are gated off and the request escapes to the API untouched.
+// Observed during 2026-05-11 stress testing as Stress D (191K input, no
+// client-side defense fired).
+//
+// Returns messages unchanged when:
+//   - contextWindow is non-positive (caller didn't configure)
+//   - total estimate already fits under the compaction threshold
+//   - the last user message has structured content (tool_result / image
+//     blocks): truncating those is unsafe; ShapeHistory's deeper paths
+//     would be the right place to handle them
+//   - the user message's text body already fits its share of the budget
+//
+// On truncation, replaces the user message's text content with a head+tail
+// concatenation joined by a human-readable marker so the model can note
+// the gap. Always UTF-8 rune-aligned — never splits a codepoint mid-sequence.
+// Returns (messages, droppedChars). droppedChars > 0 means truncation
+// actually happened; callers can use it to emit OnRunStatus or audit.
+func TruncateOversizedLastUserMessage(messages []client.Message, contextWindow int) ([]client.Message, int) {
+	if contextWindow <= 0 || len(messages) == 0 {
+		return messages, 0
+	}
+	target := int(float64(contextWindow) * compactThreshold)
+	estimated := EstimateTokens(messages)
+	if estimated <= target {
+		return messages, 0
+	}
+
+	// Find the LARGEST plain-text user message — the one actually pushing
+	// the prompt over the threshold. "Most recent" misses the resume case
+	// (daemon/TUI loaded a huge prior user message from session.json, the
+	// new user message is a small follow-up — truncating the small one
+	// does nothing while the huge one continues to blow up the prompt).
+	// Structured content (tool_result / image blocks) is skipped here;
+	// ShapeHistory's full path handles those when message count allows.
+	idx := -1
+	maxLen := 0
+	for i := 0; i < len(messages); i++ {
+		if messages[i].Role != "user" {
+			continue
+		}
+		if messages[i].Content.HasBlocks() {
+			continue
+		}
+		if l := len(messages[i].Content.Text()); l > maxLen {
+			maxLen = l
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return messages, 0
+	}
+	text := messages[idx].Content.Text()
+	if text == "" {
+		return messages, 0
+	}
+
+	// EstimateTokens measures content in RUNES (chars/3.5 ratio), but
+	// truncateMessageBody slices by BYTES. For pure ASCII bytes == runes so
+	// the two collapse to the same number, but for CJK/emoji (~3 bytes per
+	// rune) a rune-count budget interpreted as byte cap would over-truncate
+	// the content to ~1/3 of the intended size. Convert by sampling this
+	// text's actual bytes-per-rune ratio. (PR review item #5.)
+	runeCount := utf8.RuneCountInString(text)
+	if runeCount == 0 {
+		return messages, 0
+	}
+	userTokenEst := int(math.Ceil(float64(runeCount)/charsPerToken)) + overheadPerMessage
+	otherTokens := estimated - userTokenEst
+	if otherTokens < 0 {
+		otherTokens = 0
+	}
+	userTokenBudget := target - otherTokens
+	const minUserTokenFloor = 1000
+	if userTokenBudget < minUserTokenFloor {
+		userTokenBudget = minUserTokenFloor
+	}
+	userRuneBudget := int(float64(userTokenBudget) * charsPerToken)
+	bytesPerRune := float64(len(text)) / float64(runeCount)
+	userByteBudget := int(float64(userRuneBudget) * bytesPerRune)
+
+	if len(text) <= userByteBudget {
+		return messages, 0
+	}
+
+	truncated := truncateMessageBody(text, userByteBudget)
+	dropped := len(text) - len(truncated)
+	messages[idx] = client.Message{
+		Role:    messages[idx].Role,
+		Content: client.NewTextContent(truncated),
+	}
+	return messages, dropped
+}
+
+// truncateMessageBody returns s capped at `cap` bytes via head+tail
+// rune-aligned slicing. Same UTF-8-safety contract as
+// capTranscriptForSummarize in summarize.go: head/tail boundaries are
+// adjusted to rune starts so multibyte content (CJK/emoji) is never
+// split mid-codepoint.
+func truncateMessageBody(s string, cap int) string {
+	if len(s) <= cap {
+		return s
+	}
+	const marker = "\n\n[... user message truncated for size — middle elided ...]\n\n"
+	if cap <= len(marker) {
+		// Cap is smaller than the marker itself: skip the marker and just
+		// keep the prefix. Rune-align the head end.
+		head := cap
+		for head > 0 && !utf8.RuneStart(s[head]) {
+			head--
+		}
+		return s[:head]
+	}
+	half := (cap - len(marker)) / 2
+
+	headEnd := half
+	for headEnd > 0 && !utf8.RuneStart(s[headEnd]) {
+		headEnd--
+	}
+
+	tailStart := len(s) - half
+	for tailStart < len(s) && !utf8.RuneStart(s[tailStart]) {
+		tailStart++
+	}
+
+	return s[:headEnd] + marker + s[tailStart:]
 }
 
 // imageTokenEstimate is the approximate token cost of an image block.

@@ -602,7 +602,7 @@ agent:
   thinking_mode: adaptive          # "adaptive" or "enabled" (default: adaptive)
   thinking_budget: 10000           # thinking token budget (default: 10000)
   model: ""                        # specific model override (empty = use model_tier)
-  context_window: 128000           # context window in tokens (default: 128000)
+  context_window: 200000           # seed; auto-adjusted from observed model (default: 200000). Per-agent override locks the cap.
   reasoning_effort: ""             # "low", "medium", "high" (empty = model default)
   idle_soft_timeout_secs: 90       # watchdog: emit "still working" status after this long waiting on the LLM (0 = disabled, default: 90)
   idle_hard_timeout_secs: 0        # watchdog: cancel the run as a soft/partial failure after this long idle (0 = disabled; recommended: 540 once enabled, stays below the 600s gateway timeout)
@@ -761,7 +761,7 @@ agent:
   max_iterations: 10
   temperature: 0.2
   max_tokens: 16000
-  context_window: 64000
+  context_window: 64000             # per-agent value is a lock (bypasses model auto-detect — use for cost caps or Ollama / custom-cap models)
 
 # File system watcher — trigger agent on file changes
 watch:

@@ -30,6 +30,150 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
+// preflightCompactThreshold is the fraction of the context window above
+// which a pre-flight compaction is forced before the next LLM call.
+// 0.95 leaves a 5% safety margin over EstimateTokens' chars/3.5 heuristic
+// inaccuracy. Below this, ShouldCompact's 0.90 trigger handles it.
+const preflightCompactThreshold = 0.95
+
+// shouldPreflightCompact returns true when the messages-about-to-be-sent
+// estimate exceeds preflightCompactThreshold * contextWindow.
+//
+// This catches the "next-turn-snapshot" timing gap: the proactive path
+// uses lastPromptTokens from the previous LLM response, which lags behind
+// any tool_results accumulated during the current iteration. A single
+// iteration that loads multiple large file_reads can push history above
+// the cap before the proactive trigger evaluates.
+func shouldPreflightCompact(messages []client.Message, contextWindow int) bool {
+	if contextWindow <= 0 {
+		return false
+	}
+	threshold := int(float64(contextWindow) * preflightCompactThreshold)
+	return ctxwin.EstimateTokens(messages) >= threshold
+}
+
+// emitCompactionFailureStatus surfaces a compaction failure as a non-fatal
+// run-status event so daemon SSE / Desktop subscribers can show degradation
+// to operators. Replaces 9 stderr-only sites scattered through the proactive
+// and reactive compaction paths.
+//
+// Safe to call with nil handler or any handler that doesn't implement
+// RunStatusHandler — both are silently skipped.
+func emitCompactionFailureStatus(handler any, phase string, err error) {
+	if handler == nil {
+		return
+	}
+	rs, ok := handler.(RunStatusHandler)
+	if !ok {
+		return
+	}
+	rs.OnRunStatus(string(runstatus.CodeContextCompactionFailed),
+		fmt.Sprintf("%s: %v", phase, err))
+}
+
+// shortSessionTruncate runs the single-message fallback when the prompt
+// exceeds the preflight threshold but len(messages) is below MinShapeable
+// — i.e. ShapeHistory cannot help because there's nothing to compact, but
+// a single huge user message can still be rune-safely head+tail truncated.
+//
+// Returns the (possibly mutated) messages slice. Emits
+// OnRunStatus("preflight_user_truncate", ...) when truncation actually
+// happens so daemon SSE / Desktop subscribers can show the user that
+// their input was clipped.
+//
+// sourceTag identifies the call-site (force_stop / main_preflight) so the
+// status detail is attributable. Long sessions take the normal ShapeHistory
+// path and return unchanged here.
+//
+// This guards the failure mode discovered during 2026-05-11 stress
+// testing as P0-#1: Stress D sent a single 191K-token user message,
+// every client-side defense was gated by MinShapeable=9, the message
+// escaped to the API untouched.
+func (a *AgentLoop) shortSessionTruncate(messages []client.Message, sourceTag string) []client.Message {
+	if !shouldPreflightCompact(messages, a.contextWindow) {
+		return messages
+	}
+	if len(messages) > ctxwin.MinShapeable() {
+		return messages
+	}
+	totalDropped := 0
+	truncations := 0
+	maxAttempts := len(messages)
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	for shouldPreflightCompact(messages, a.contextWindow) && truncations < maxAttempts {
+		var dropped int
+		messages, dropped = ctxwin.TruncateOversizedLastUserMessage(messages, a.contextWindow)
+		if dropped <= 0 {
+			break
+		}
+		totalDropped += dropped
+		truncations++
+	}
+	if totalDropped > 0 {
+		if rs, ok := a.handler.(RunStatusHandler); ok {
+			rs.OnRunStatus("preflight_user_truncate",
+				fmt.Sprintf("%s: truncated user messages by %d chars across %d message(s) (short session, %d msgs, est %d tokens)",
+					sourceTag, totalDropped, truncations, len(messages), ctxwin.EstimateTokens(messages)))
+		}
+		a.recordCompactionSuccess("short_session_truncate",
+			fmt.Sprintf("source=%s msgs=%d truncations=%d chars_dropped=%d", sourceTag, len(messages), truncations, totalDropped))
+	}
+	return messages
+}
+
+// recordCompactionSuccess emits a compaction_success audit row whenever
+// ShapeHistory (or a single-message truncate fallback) successfully drops
+// or shrinks content from the prompt. Mirrors recordCompactionFailure so
+// every compaction outcome is observable in audit.log — without this,
+// failure paths were the only events with audit rows and ops could not
+// tell whether a compaction-prone session ever recovered.
+//
+// Phase tag identifies the source: proactive / preflight / reactive /
+// force_stop_preflight / short_session_truncate. Detail is a free-form
+// metric string (e.g. "msgs=10→4" for ShapeHistory or "chars=800000→570000"
+// for single-message truncation) so the schema works for both message-count
+// reductions and content-byte reductions.
+//
+// Caller is responsible for emitting the corresponding OnRunStatus (the
+// run-status events already exist at each site).
+//
+// The audit schema convention matches recordCompactionFailure: phase +
+// detail go into OutputSummary, ToolName is empty.
+func (a *AgentLoop) recordCompactionSuccess(phase, detail string) {
+	if a.auditor == nil {
+		return
+	}
+	a.auditor.Log(audit.AuditEntry{
+		Timestamp:     time.Now(),
+		SessionID:     a.sessionID,
+		Event:         "compaction_success",
+		OutputSummary: fmt.Sprintf("phase=%s %s", phase, detail),
+		Approved:      false,
+	})
+}
+
+// recordCompactionFailure emits a compaction-failed run-status event and an
+// audit row in one call. Replaces the emit + if-auditor-then-Log pair that was
+// duplicated across the proactive, preflight, and reactive compaction paths.
+//
+// The phase tag goes into OutputSummary (alongside the error) instead of
+// ToolName, matching the schema convention at audit/audit.go:13 — non-tool
+// entries leave ToolName empty (force_stop is the existing precedent).
+func (a *AgentLoop) recordCompactionFailure(phase string, err error) {
+	emitCompactionFailureStatus(a.handler, phase, err)
+	if a.auditor != nil {
+		a.auditor.Log(audit.AuditEntry{
+			Timestamp:     time.Now(),
+			SessionID:     a.sessionID,
+			Event:         "compaction_failed",
+			OutputSummary: fmt.Sprintf("phase=%s err=%v", phase, err),
+			Approved:      false,
+		})
+	}
+}
+
 // buildSkillListing formats a <system-reminder> with skill descriptions
 // for injection as a user message. Uses rune-safe truncation with a total
 // character budget.
@@ -354,6 +498,7 @@ func (u *TurnUsage) Add(r client.Usage) {
 }
 
 func (a *AgentLoop) reportLLMUsage(u client.Usage, model string) {
+	a.maybeAutoAdjustContextWindow(model)
 	if a.handler == nil {
 		return
 	}
@@ -364,6 +509,36 @@ func (a *AgentLoop) reportLLMUsage(u client.Usage, model string) {
 		return
 	}
 	a.handler.OnUsage(delta)
+}
+
+// maybeAutoAdjustContextWindow updates contextWindow based on the model that
+// served the latest response. No-op when:
+//   - User explicitly configured agent.context_window (locked).
+//   - Model field is empty (provider didn't surface it).
+//   - Model is unknown to LookupModelContextWindow (graceful degradation —
+//     leaves existing value untouched).
+//   - Looked-up value matches current contextWindow (no churn).
+//
+// On a real change, emits OnRunStatus("context_window_autodetect", ...) so
+// SSE/Desktop subscribers and audit can correlate compaction-threshold
+// shifts with the model that triggered them.
+func (a *AgentLoop) maybeAutoAdjustContextWindow(model string) {
+	if a.contextWindowExplicit || model == "" {
+		return
+	}
+	cw, ok := LookupModelContextWindow(model)
+	if !ok || cw == a.contextWindow {
+		return
+	}
+	prev := a.contextWindow
+	a.contextWindow = cw
+	log.Printf("agent: context_window auto-detect model=%s %d -> %d", model, prev, cw)
+	if rs, ok := a.handler.(RunStatusHandler); ok {
+		rs.OnRunStatus(
+			"context_window_autodetect",
+			fmt.Sprintf("model=%s prev_tokens=%d new_tokens=%d", model, prev, cw),
+		)
+	}
 }
 
 type EventHandler interface {
@@ -433,26 +608,29 @@ type AgentLoop struct {
 	specificModel     string
 	agentBasePrompt   string
 	agentSkills       []*skills.Skill
-	contextWindow     int
-	memoryDir         string      // directory containing MEMORY.md; re-read each Run(), write-before-compact target
-	stickyContext     string      // session-scoped facts injected verbatim into system prompt; never truncated
-	outputFormat      string      // "markdown" (default) or "plain" — controls formatting guidance in volatile context
-	userFilePaths     []string    // paths from user-attached file_ref blocks — auto-approved for tool access
-	workingSet        *WorkingSet // session-scoped deferred schema cache injected by the caller
-	sessionID         string      // session ID for audit log correlation
-	sessionCWD        string      // session-scoped working directory; set by runner/TUI before Run()
-	deltaProvider     DeltaProvider
-	injectCh          chan InjectedMessage
-	injectedMessages  []string         // messages injected during the last Run(); cleared on each Run() call
-	runMessages       []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
-	runMsgInjected    []bool           // parallel to runMessages: true = system-injected guardrail/nudge
-	runMsgTimestamps  []time.Time      // parallel to runMessages: when each message was created
-	lastRunStatus     RunStatus
-	toolRefSupported  bool            // true when the configured model supports defer_loading + tool_reference protocol
-	cacheSource       string          // tag sent to gateway on every Complete call for prompt-cache TTL routing
-	skillDiscovery    bool            // call small-tier model on first turn to identify relevant skills (default true)
-	sentSkillNames    map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
-	readTracker       *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
+	// contextWindowExplicit is true when set via user config (e.g. per-agent
+	// override); locks against auto-detect from observed model.
+	contextWindow         int
+	contextWindowExplicit bool
+	memoryDir             string      // directory containing MEMORY.md; re-read each Run(), write-before-compact target
+	stickyContext         string      // session-scoped facts injected verbatim into system prompt; never truncated
+	outputFormat          string      // "markdown" (default) or "plain" — controls formatting guidance in volatile context
+	userFilePaths         []string    // paths from user-attached file_ref blocks — auto-approved for tool access
+	workingSet            *WorkingSet // session-scoped deferred schema cache injected by the caller
+	sessionID             string      // session ID for audit log correlation
+	sessionCWD            string      // session-scoped working directory; set by runner/TUI before Run()
+	deltaProvider         DeltaProvider
+	injectCh              chan InjectedMessage
+	injectedMessages      []string         // messages injected during the last Run(); cleared on each Run() call
+	runMessages           []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
+	runMsgInjected        []bool           // parallel to runMessages: true = system-injected guardrail/nudge
+	runMsgTimestamps      []time.Time      // parallel to runMessages: when each message was created
+	lastRunStatus         RunStatus
+	toolRefSupported      bool            // true when the configured model supports defer_loading + tool_reference protocol
+	cacheSource           string          // tag sent to gateway on every Complete call for prompt-cache TTL routing
+	skillDiscovery        bool            // call small-tier model on first turn to identify relevant skills (default true)
+	sentSkillNames        map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
+	readTracker           *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
 	// toolResultReplacements stores stable query-time replacements for large
 	// historical tool_result blocks. It is session-scoped and persisted by
 	// daemon/TUI callers so resumed sessions replay identical bytes.
@@ -687,8 +865,31 @@ func (a *AgentLoop) SetSpecificModel(model string) {
 	a.specificModel = model
 }
 
+// SetContextWindow seeds the context window from a hint (typically the
+// global agent.context_window config value). The seed is used for the
+// first turn; auto-detect from the model field in cloud responses
+// overrides it from turn 2 onward (see maybeAutoAdjustContextWindow).
+//
+// Always clears the explicit-lock flag — this setter is the "soft" /
+// seed path, complementary to SetContextWindowExplicit. Current callers
+// invoke SetContextWindow before any optional SetContextWindowExplicit,
+// so the lock survives in practice; this clear is defensive against a
+// future refactor that uses SetContextWindow as a reset. (PR review #4.)
 func (a *AgentLoop) SetContextWindow(tokens int) {
 	a.contextWindow = tokens
+	a.contextWindowExplicit = false
+}
+
+// SetContextWindowExplicit sets the context window AND locks it against
+// auto-detection. Reserved for per-agent overrides
+// (~/.shannon/agents/<name>/config.yaml: context_window) where the user
+// has unambiguously expressed intent for this specific agent — auto-detect
+// would override that intent. Global config never reaches this path
+// (would surprise users who set a small cap for cost control by silently
+// raising it on long-context models).
+func (a *AgentLoop) SetContextWindowExplicit(tokens int) {
+	a.contextWindow = tokens
+	a.contextWindowExplicit = true
 }
 
 // SetMaxIterations overrides the maximum number of agent loop iterations.
@@ -1134,6 +1335,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			Event:               "cache_summary",
 			Source:              a.cacheSource,
 			Calls:               s.Calls,
+			InputTokens:         int(s.InputTotal),
 			CacheCreationTokens: int(s.CCTotal),
 			CacheReadTokens:     int(s.CRTotal),
 			CER:                 s.CER,
@@ -1398,7 +1600,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				if first && msg.Role == "user" && !msg.Content.HasBlocks() && msg.Content.Text() == scaffoldedUserText {
 					msg = client.Message{
 						Role:    "user",
-						Content: client.NewTextContent(userMessage),
+						Content: client.NewTextContent(rawUserMessage),
 					}
 				}
 				first = false
@@ -1557,6 +1759,44 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 	}
 
+	truncateRawUserForPersistence := func(raw string) string {
+		if raw == "" {
+			return raw
+		}
+		rawMsgs := []client.Message{
+			{Role: "user", Content: client.NewTextContent(raw)},
+		}
+		rawMsgs, dropped := ctxwin.TruncateOversizedLastUserMessage(rawMsgs, a.contextWindow)
+		if dropped <= 0 || len(rawMsgs) == 0 || rawMsgs[0].Content.HasBlocks() {
+			return raw
+		}
+		return rawMsgs[0].Content.Text()
+	}
+
+	applyShortSessionTruncate := func(sourceTag string) {
+		currentBefore := ""
+		if newMsgOffset >= 0 && newMsgOffset < len(messages) {
+			m := messages[newMsgOffset]
+			if m.Role == "user" && !m.Content.HasBlocks() {
+				currentBefore = m.Content.Text()
+			}
+		}
+		messages = a.shortSessionTruncate(messages, sourceTag)
+		if currentBefore == "" || currentBefore != scaffoldedUserText || newMsgOffset < 0 || newMsgOffset >= len(messages) {
+			return
+		}
+		m := messages[newMsgOffset]
+		if m.Role != "user" || m.Content.HasBlocks() {
+			return
+		}
+		currentAfter := m.Content.Text()
+		if currentAfter == currentBefore {
+			return
+		}
+		scaffoldedUserText = currentAfter
+		rawUserMessage = truncateRawUserForPersistence(rawUserMessage)
+	}
+
 	// runForceStopTurn issues the final non-tool LLM turn after the loop
 	// detector decided to stop. It preserves the live agent config so this
 	// turn behaves like every other turn (MaxTokens, Thinking, SpecificModel,
@@ -1585,6 +1825,80 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		a.maybeCheckpoint(ctx)
 		if a.tracker != nil {
 			a.tracker.Enter(PhaseForceStop)
+		}
+
+		// Short-session fallback: if the prompt is over preflight threshold but
+		// len(messages) <= MinShapeable, ShapeHistory below is gated off but
+		// a single huge user message can still be rune-safely truncated.
+		applyShortSessionTruncate("force_stop")
+
+		// Pre-flight guard for the force-stop final turn. Same rationale as the
+		// main loop guard above. We do NOT gate on compactionApplied here:
+		// force-stop is the last-resort turn and especially must not 400.
+		// MinShapeable gate matches the main-loop site — without enough
+		// messages, ShapeHistory is a no-op and the summary call wastes tokens.
+		if shouldPreflightCompact(messages, a.contextWindow) && len(messages) > ctxwin.MinShapeable() {
+			if rs, ok := a.handler.(RunStatusHandler); ok {
+				rs.OnRunStatus("preflight_compaction",
+					fmt.Sprintf("force-stop turn estimate %d tokens >= %.0f%% of %d cap",
+						ctxwin.EstimateTokens(messages), preflightCompactThreshold*100, a.contextWindow))
+			}
+			fsBefore := len(messages)
+			emergencyMessages := cloneMessages(messages)
+			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
+			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, emergencyMessages)
+			restoreLLM()
+			a.emitInternalUsage(sumUsage)
+			if sumErr == nil {
+				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow)
+			} else {
+				// Summary failed on the force-stop fallback path: emit telemetry
+				// (parity with main-loop preflight at line ~2279) so this last-resort
+				// degradation is visible. ShapeHistory without summary still drops
+				// middle messages. (See 2026-05-11 GPT review F3.)
+				a.recordCompactionFailure("force_stop_summary_failure", sumErr)
+				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow)
+			}
+			if dropped := fsBefore - len(messages); dropped > 0 {
+				a.recordCompactionSuccess("force_stop_preflight",
+					fmt.Sprintf("msgs=%d→%d dropped=%d", fsBefore, len(messages), dropped))
+				// Rebase run-local indices — same bookkeeping as the main-loop
+				// preflight site above. Without this, captureRunMessages picks
+				// up a stale offset and the force-stop synthesis reply either
+				// fails to persist or carries the wrong metadata.
+				// (See 2026-05-11 GPT review F2.)
+				newMsgOffset -= dropped
+				if newMsgOffset < 1 {
+					newMsgOffset = 1
+				}
+				rebased := make(map[int]bool, len(injectedIndices))
+				for idx := range injectedIndices {
+					newIdx := idx - dropped
+					if newIdx >= newMsgOffset {
+						rebased[newIdx] = true
+					}
+				}
+				injectedIndices = rebased
+
+				rebasedDelta := make(map[int]bool, len(deltaIndices))
+				for idx := range deltaIndices {
+					newIdx := idx - dropped
+					if newIdx >= newMsgOffset {
+						rebasedDelta[newIdx] = true
+					}
+				}
+				deltaIndices = rebasedDelta
+
+				rebasedTS := make(map[int]time.Time, len(msgTimestamps))
+				for idx, ts := range msgTimestamps {
+					newIdx := idx - dropped
+					if newIdx >= newMsgOffset {
+						rebasedTS[newIdx] = ts
+					}
+				}
+				msgTimestamps = rebasedTS
+			}
 		}
 
 		req := client.CompletionRequest{
@@ -1893,7 +2207,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			}
 		}
 		// Context window compaction: when actual tokens from previous LLM call
-		// exceed 85% of context window, generate a summary and shape history.
+		// exceed 90% of context window, generate a summary and shape history.
 		// Only attempt when there are enough messages to meaningfully shape
 		// (system + first user + minKeepLast pairs = 9 messages minimum).
 		// On first iteration (daemon resume with large history), uses heuristic
@@ -1924,9 +2238,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 						restoreLLM()
 						a.emitInternalUsage(pUsage)
 						if pErr != nil {
-							fmt.Fprintf(os.Stderr, "[context] persist learnings failed: %v\n", pErr)
-						} else {
-							fmt.Fprintf(os.Stderr, "[context] persisted learnings to MEMORY.md\n")
+							a.recordCompactionFailure("proactive_persist_learnings", pErr)
 						}
 					}
 
@@ -1939,7 +2251,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					case sumErr != nil:
 						summaryFailures++
 						lastSummaryFailureIter = i
-						fmt.Fprintf(os.Stderr, "[context] compaction summary failed (%d/%d): %v\n", summaryFailures, maxSummaryFailures, sumErr)
+						a.recordCompactionFailure("proactive_summary_failure", sumErr)
 					case trimmedSummary == "":
 						// Non-error empty summary: the small-tier model produced output that
 						// extractSummary filtered to "" (e.g. <analysis> only, no <summary>
@@ -1947,7 +2259,8 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 						// fires instead of trying compaction every iteration.
 						summaryFailures++
 						lastSummaryFailureIter = i
-						fmt.Fprintf(os.Stderr, "[context] compaction summary empty (%d/%d) — prompt under-fit; backing off\n", summaryFailures, maxSummaryFailures)
+						a.recordCompactionFailure("proactive_summary_empty",
+							fmt.Errorf("empty summary (%d/%d) — prompt under-fit", summaryFailures, maxSummaryFailures))
 					default:
 						summaryFailures = 0 // reset on real success
 						// lastSummaryFailureIter intentionally NOT reset: the summaryFailures
@@ -1962,7 +2275,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					messages = ctxwin.ShapeHistory(messages, compactionSummary, a.contextWindow)
 					if len(messages) < before {
 						dropped := before - len(messages)
-						fmt.Fprintf(os.Stderr, "[context] compacted: %d → %d messages\n", before, len(messages))
+						a.recordCompactionSuccess("proactive", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
 						// Adjust newMsgOffset: compaction drops middle messages
 						// but keeps the recent tail. Shift by the number dropped.
 						// Clamp to 1 (skip system prompt at index 0) so that
@@ -2075,6 +2388,83 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			}
 		}
 
+		// Short-session fallback: catches single huge user message when
+		// len(messages) is below MinShapeable. See shortSessionTruncate
+		// docstring + 2026-05-11 stress P0-#1.
+		applyShortSessionTruncate("main_preflight")
+
+		// Pre-flight prompt-size guard: if the soon-to-be-sent prompt estimates
+		// over 95% of the context window, force an emergency compaction before
+		// the API call. Last-defense for the next-turn-snapshot timing gap that
+		// caused the 2026-05-07 incident.
+		//
+		// MinShapeable gate mirrors the proactive trigger at line ~1976: when
+		// there are too few messages, ShapeHistory is a no-op, so summarizing
+		// just wastes an LLM call without reducing prompt size. The system
+		// prompt itself can exceed thresholds in artificially-small context
+		// windows (test fixtures or pinned configs); fire-without-shape would
+		// repeatedly burn calls until lastPromptTokens drops back under 90%.
+		if shouldPreflightCompact(messages, a.contextWindow) && !compactionApplied && !reactiveCompacted && len(messages) > ctxwin.MinShapeable() {
+			a.tracker.Enter(PhaseCompacting)
+			if rs, ok := a.handler.(RunStatusHandler); ok {
+				rs.OnRunStatus("preflight_compaction",
+					fmt.Sprintf("estimate %d tokens >= %.0f%% of %d cap",
+						ctxwin.EstimateTokens(messages), preflightCompactThreshold*100, a.contextWindow))
+			}
+
+			// Build summary and shape, mirroring the reactive emergency profile.
+			emergencyMessages := cloneMessages(messages)
+			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
+			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, emergencyMessages)
+			restoreLLM()
+			a.emitInternalUsage(sumUsage)
+			before := len(messages)
+			if sumErr == nil {
+				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow)
+			} else {
+				// Summary failed; ShapeHistory without summary still drops middle messages.
+				a.recordCompactionFailure("preflight_summary_failure", sumErr)
+				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow)
+			}
+			if dropped := before - len(messages); dropped > 0 {
+				a.recordCompactionSuccess("preflight", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
+				newMsgOffset -= dropped
+				if newMsgOffset < 1 {
+					newMsgOffset = 1
+				}
+				rebased := make(map[int]bool, len(injectedIndices))
+				for idx := range injectedIndices {
+					newIdx := idx - dropped
+					if newIdx >= newMsgOffset {
+						rebased[newIdx] = true
+					}
+				}
+				injectedIndices = rebased
+
+				rebasedDelta := make(map[int]bool, len(deltaIndices))
+				for idx := range deltaIndices {
+					newIdx := idx - dropped
+					if newIdx >= newMsgOffset {
+						rebasedDelta[newIdx] = true
+					}
+				}
+				deltaIndices = rebasedDelta
+
+				rebasedTS := make(map[int]time.Time, len(msgTimestamps))
+				for idx, ts := range msgTimestamps {
+					newIdx := idx - dropped
+					if newIdx >= newMsgOffset {
+						rebasedTS[newIdx] = ts
+					}
+				}
+				msgTimestamps = rebasedTS
+			}
+			compactionApplied = true
+			reanchorActiveTask(MetaBoundaryPostCompaction)
+			a.tracker.MarkDirty()
+		}
+
 		// Call LLM — streaming or blocking
 		var resp *client.CompletionResponse
 		var err error
@@ -2169,7 +2559,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					restoreLLM()
 					a.emitInternalUsage(pUsage)
 					if pErr != nil {
-						fmt.Fprintf(os.Stderr, "[context] reactive persist learnings failed: %v\n", pErr)
+						a.recordCompactionFailure("reactive_persist_learnings", pErr)
 					}
 				}
 
@@ -2183,11 +2573,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				restoreLLM()
 				a.emitInternalUsage(sumUsage)
 				if sumErr != nil {
+					phaseTag := "reactive_summary_no_prior"
 					if nextSummary != "" {
-						fmt.Fprintf(os.Stderr, "[context] reactive summary failed, reusing prior summary: %v\n", sumErr)
-					} else {
-						fmt.Fprintf(os.Stderr, "[context] reactive summary failed, shaping without summary: %v\n", sumErr)
+						phaseTag = "reactive_summary_with_prior"
 					}
+					a.recordCompactionFailure(phaseTag, sumErr)
 				} else if trimmed := strings.TrimSpace(summary); trimmed != "" {
 					nextSummary = trimmed
 				}
@@ -2203,11 +2593,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					restoreLLM()
 					a.emitInternalUsage(sumUsage)
 					if sumErr != nil {
+						phaseTag := "emergency_summary_no_prior"
 						if nextSummary != "" {
-							fmt.Fprintf(os.Stderr, "[context] emergency reactive summary failed, keeping prior summary: %v\n", sumErr)
-						} else {
-							fmt.Fprintf(os.Stderr, "[context] emergency reactive summary failed, shaping without summary: %v\n", sumErr)
+							phaseTag = "emergency_summary_with_prior"
 						}
+						a.recordCompactionFailure(phaseTag, sumErr)
 					} else if trimmed := strings.TrimSpace(summary); trimmed != "" {
 						nextSummary = trimmed
 					}
@@ -2227,7 +2617,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				// Rebase run-local indices — same bookkeeping as proactive compaction.
 				if len(messages) < before {
 					dropped := before - len(messages)
-					fmt.Fprintf(os.Stderr, "[context] reactive compacted: %d → %d messages\n", before, len(messages))
+					a.recordCompactionSuccess("reactive", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
 					newMsgOffset -= dropped
 					if newMsgOffset < 1 {
 						newMsgOffset = 1

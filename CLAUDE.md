@@ -273,8 +273,13 @@ See `docs/cache-strategy.md` for the authoritative design (4-breakpoint allocati
 - All in-place `messages[idx].Content` rewrites in the agent loop call `client.LogCacheCompactEvent` so cache-debug.log explains every prefix-byte drift. New mutation paths must wire this — uninstrumented rewrites break drift attribution silently.
 
 ### Context Management
-- **Proactive compaction**: `PersistLearnings` → `GenerateSummary` (two-phase: `<analysis>` scratchpad → `<summary>`) → `ShapeHistory` at 85% context window.
-- **Reactive compaction**: On context-length error, emergency compress + single retry. `reactiveCompacted` flag prevents loops.
+- **Context window**: `agent.context_window` (default 200000) is a **seed** via `loop.SetContextWindow`; after each main-tier response `maybeAutoAdjustContextWindow` resets it from `response.model` via `internal/agent/modelcontext.go` (Anthropic / OpenAI / Google / xAI; 1M and 200K families; longest-prefix-first; unknown IDs untouched). Catches cloud tier-failover (sonnet-4-6 → sonnet-4-5) automatically.
+- **Per-agent override** (`~/.shannon/agents/<name>/config.yaml`) calls `SetContextWindowExplicit` (lock); auto-detect skips locked loops. Plain `SetContextWindow` clears the lock so a soft reseed flows back to auto mode. Use per-agent for cost caps or Ollama / custom-cap models.
+- **No `anthropic-beta` header is sent** (retired 2026-04-30; sonnet-4-6 / opus-4-6 / 4-7 are GA at 1M).
+- **Proactive compaction**: `PersistLearnings` → `GenerateSummary` (two-phase: `<analysis>` scratchpad → `<summary>`) → `ShapeHistory` at 90% context window.
+- **Pre-flight compaction** (`shouldPreflightCompact`): backup gate at 95%, fires before each main LLM call + force-stop turn. Catches the within-iteration overshoot the proactive `lastPromptTokens` snapshot misses. Gated on `len(messages) > MinShapeable()`; emits `OnRunStatus("preflight_compaction", …)`.
+- **Reactive compaction**: On context-length error, emergency compress + single retry. `reactiveCompacted` flag prevents loops. The summarize call inside reactive is itself capped at `summarizeInputCapChars=540_000` (~154K tokens) with UTF-8-rune-safe head+tail truncation (`internal/context/summarize.go`) — without this the cascade re-overflows on the small-tier summarizer and surfaces a hard 400 (2026-05-07 incident).
+- **Compaction failure telemetry** (`recordCompactionFailure`): proactive / preflight / reactive / emergency failures emit `OnRunStatus("compaction_failed", …)` + audit row (`Event: "compaction_failed"`, `ToolName` empty per `audit.go:13-16`). 9 phase tags identify which path degraded.
 - **Tiered result compression**: Tier 1 (>10 msg old) → metadata only. Tier 2 (3–10) → head+tail truncation. Tier 3 (0–2) → full.
 - **Memory staleness**: `annotateStaleness()` appends `[N days ago]` to memory headings.
 - **Deferred tool loading**: When tool count > 30, MCP/gateway tools sent as name+description only. Model calls `tool_search` to load full schemas on demand.

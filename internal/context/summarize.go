@@ -6,9 +6,66 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
+
+// summarizeInputCapChars limits the transcript length sent to the small-tier
+// summarizer. ~540K chars ≈ 180K tokens at the 3 chars/token estimate
+// used by buildTranscript, leaving 20K headroom under Haiku 4.5's 200K context
+// window. This is a defense-in-depth: the reactive path already runs
+// compressOldToolResults before calling GenerateSummary, but that pass is
+// deliberately gentle (keepRecent=8, maxResultChars=300) and can leave a
+// transcript over the small-tier cap when recent tool results are large.
+//
+// Without this guard, a 200K+ transcript fed to the summarizer 400s with
+// "prompt is too long", which is exactly the cascade that caused the
+// 2026-05-07 production incident.
+const summarizeInputCapChars = 540_000
+
+// capTranscriptForSummarize returns s unchanged if it fits, or a head+tail
+// concatenation otherwise. Truncation marker is human-readable so the
+// summarizer can note the gap in its analysis.
+//
+// Boundaries are adjusted to UTF-8 rune starts so multi-byte content
+// (Chinese, Japanese, emoji, …) is never truncated mid-rune. Without this,
+// a byte-aligned slice can leave a partial UTF-8 sequence at either end;
+// json.Marshal would then replace the dangling bytes with U+FFFD before
+// the summarizer ever sees them, polluting the input. Verified with a 1.4M
+// byte all-Chinese transcript producing 2 U+FFFD chars under the previous
+// impl. (See 2026-05-08 review Finding 3.)
+func capTranscriptForSummarize(s string) string {
+	if len(s) <= summarizeInputCapChars {
+		return s
+	}
+	const marker = "\n\n[... transcript truncated for size — middle elided ...]\n\n"
+	// Reserve full marker length, then split the remainder evenly between
+	// head and tail. Worst-case output length = 2*half + len(marker) ≤ cap.
+	// (Boundary adjustments below only shrink head/tail further, so the
+	// inequality stays tight in the byte-aligned case and slack-by-up-to-3
+	// in the multi-byte case — never crosses the cap.)
+	half := (summarizeInputCapChars - len(marker)) / 2
+
+	// Adjust head boundary down to a rune start. utf8.RuneStart returns
+	// true at byte offsets that begin a UTF-8 codepoint; since we truncate
+	// the middle, walking *backwards* a few bytes at most cannot extend
+	// the head past the configured cap.
+	headEnd := half
+	for headEnd > 0 && !utf8.RuneStart(s[headEnd]) {
+		headEnd--
+	}
+
+	// Adjust tail boundary up to a rune start. Walking *forwards* keeps
+	// the result strictly within `half` bytes; combined with the head
+	// adjustment, total result length is ≤ summarizeInputCapChars.
+	tailStart := len(s) - half
+	for tailStart < len(s) && !utf8.RuneStart(s[tailStart]) {
+		tailStart++
+	}
+
+	return s[:headEnd] + marker + s[tailStart:]
+}
 
 const summarizePrompt = `Compress the following conversation into a concise summary using a two-phase approach.
 
@@ -78,10 +135,11 @@ func buildTranscript(messages []client.Message) string {
 // It strips the system message from the input to avoid wasting tokens.
 // Serializes both plain text and block content (tool_use, tool_result).
 func GenerateSummary(ctx context.Context, c Completer, messages []client.Message) (string, client.Usage, error) {
+	transcript := capTranscriptForSummarize(buildTranscript(messages))
 	req := client.CompletionRequest{
 		Messages: []client.Message{
 			{Role: "system", Content: client.NewTextContent(summarizePrompt)},
-			{Role: "user", Content: client.NewTextContent(buildTranscript(messages))},
+			{Role: "user", Content: client.NewTextContent(transcript)},
 		},
 		ModelTier:   "small",
 		Temperature: 0.2,
@@ -109,10 +167,11 @@ Requirements:
 
 // SummarizeForUser 调用 LLM 生成面向人类阅读的会话摘要。
 func SummarizeForUser(ctx context.Context, c Completer, messages []client.Message) (string, error) {
+	transcript := capTranscriptForSummarize(buildTranscript(messages))
 	req := client.CompletionRequest{
 		Messages: []client.Message{
 			{Role: "system", Content: client.NewTextContent(userSummarizePrompt)},
-			{Role: "user", Content: client.NewTextContent(buildTranscript(messages))},
+			{Role: "user", Content: client.NewTextContent(transcript)},
 		},
 		ModelTier:   "small",
 		Temperature: 0.2,

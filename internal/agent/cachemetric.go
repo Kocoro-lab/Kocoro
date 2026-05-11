@@ -16,13 +16,14 @@ import "github.com/Kocoro-lab/ShanClaw/internal/client"
 //
 // See docs/issues/cache-action-plan.md §1.3.
 type CacheTracker struct {
-	calls     int
-	ccTotal   int64
-	crTotal   int64
-	tail      []callPair // last tailCERWindow (cc, cr) pairs
-	firstCC   int
-	firstCR   int
-	firstSeen bool
+	calls      int
+	inputTotal int64 // uncached input tokens (the portion Anthropic charged at base rate)
+	ccTotal    int64
+	crTotal    int64
+	tail       []callPair // last tailCERWindow (cc, cr) pairs
+	firstCC    int
+	firstCR    int
+	firstSeen  bool
 }
 
 type callPair struct {
@@ -42,6 +43,7 @@ func (t *CacheTracker) Record(u client.Usage) {
 		return
 	}
 	t.calls++
+	t.inputTotal += int64(u.InputTokens)
 	t.ccTotal += int64(u.CacheCreationTokens)
 	t.crTotal += int64(u.CacheReadTokens)
 	if !t.firstSeen {
@@ -66,6 +68,7 @@ func (t *CacheTracker) Record(u client.Usage) {
 // creation cost — diagnostic of cross-session cache reuse.
 type CacheSummary struct {
 	Calls        int
+	InputTotal   int64 // uncached input tokens — fills the audit cache_summary's input_tokens field so TOTAL = input + cache_read + cache_creation reflects the real prompt size, including the portion Anthropic decided not to cache (large prompts often fall here)
 	CCTotal      int64
 	CRTotal      int64
 	CER          float64
@@ -94,6 +97,7 @@ func (t *CacheTracker) Summary() CacheSummary {
 	}
 	return CacheSummary{
 		Calls:        t.calls,
+		InputTotal:   t.inputTotal,
 		CCTotal:      t.ccTotal,
 		CRTotal:      t.crTotal,
 		CER:          cer,

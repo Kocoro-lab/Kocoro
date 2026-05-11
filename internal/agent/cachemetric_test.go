@@ -25,13 +25,20 @@ func TestCacheTracker_NilSafeRecord(t *testing.T) {
 
 func TestCacheTracker_AccumulatesAcrossCalls(t *testing.T) {
 	tr := &CacheTracker{}
-	tr.Record(client.Usage{CacheCreationTokens: 1000, CacheReadTokens: 0})
-	tr.Record(client.Usage{CacheCreationTokens: 200, CacheReadTokens: 800})
-	tr.Record(client.Usage{CacheCreationTokens: 50, CacheReadTokens: 1500})
+	// InputTokens populated so the audit cache_summary's input_tokens field
+	// reflects the uncached portion of the prompt (without this, large
+	// prompts that Anthropic chooses not to cache showed TOTAL=0 in audit
+	// — the 2026-05-11 stress test cache_summary reporting bug P2-#6).
+	tr.Record(client.Usage{InputTokens: 100, CacheCreationTokens: 1000, CacheReadTokens: 0})
+	tr.Record(client.Usage{InputTokens: 50, CacheCreationTokens: 200, CacheReadTokens: 800})
+	tr.Record(client.Usage{InputTokens: 30, CacheCreationTokens: 50, CacheReadTokens: 1500})
 
 	s := tr.Summary()
 	if s.Calls != 3 {
 		t.Errorf("Calls = %d, want 3", s.Calls)
+	}
+	if s.InputTotal != 180 {
+		t.Errorf("InputTotal = %d, want 180", s.InputTotal)
 	}
 	if s.CCTotal != 1250 {
 		t.Errorf("CCTotal = %d, want 1250", s.CCTotal)

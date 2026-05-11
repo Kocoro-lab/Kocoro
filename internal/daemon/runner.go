@@ -1061,7 +1061,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			loop.SetMaxTokens(*ac.MaxTokens)
 		}
 		if ac.ContextWindow != nil {
-			loop.SetContextWindow(*ac.ContextWindow)
+			loop.SetContextWindowExplicit(*ac.ContextWindow)
 		}
 		if ac.IdleSoftTimeoutSecs != nil {
 			runCfg.Agent.IdleSoftTimeoutSecs = *ac.IdleSoftTimeoutSecs

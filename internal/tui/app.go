@@ -440,7 +440,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 			loop.SetMaxTokens(*ac.MaxTokens)
 		}
 		if ac.ContextWindow != nil {
-			loop.SetContextWindow(*ac.ContextWindow)
+			loop.SetContextWindowExplicit(*ac.ContextWindow)
 		}
 	}
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
@@ -585,7 +585,7 @@ func (m *Model) rebuildAgentLoop() {
 			loop.SetMaxTokens(*ac.MaxTokens)
 		}
 		if ac.ContextWindow != nil {
-			loop.SetContextWindow(*ac.ContextWindow)
+			loop.SetContextWindowExplicit(*ac.ContextWindow)
 		}
 	}
 	loop.SetBypassPermissions(m.bypassPermissions)
@@ -1920,7 +1920,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		}
 		ctxWindow := m.cfg.Agent.ContextWindow
 		if ctxWindow <= 0 {
-			ctxWindow = 128000
+			ctxWindow = 200000
 		}
 		pct := float64(tokenEst) / float64(ctxWindow) * 100
 		toolCount := 0

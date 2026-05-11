@@ -242,7 +242,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 			loop.SetMaxTokens(*ac.MaxTokens)
 		}
 		if ac.ContextWindow != nil {
-			loop.SetContextWindow(*ac.ContextWindow)
+			loop.SetContextWindowExplicit(*ac.ContextWindow)
 		}
 	}
 	cliHandler := &cliEventHandler{autoApprove: autoApprove}

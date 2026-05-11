@@ -93,12 +93,19 @@ func PersistLearnings(ctx context.Context, c Completer, messages []client.Messag
 		return client.Usage{}, nil
 	}
 
+	// Cap the transcript to fit the small-tier summarizer's context window.
+	// Without this, a >200K-character transcript fed to Haiku 4.5 (200K cap)
+	// can 400 in production. capTranscriptForSummarize is UTF-8 rune-safe so
+	// CJK/emoji content is never sliced mid-codepoint. See the 2026-05-11
+	// stress-test compaction_failed audit row (phase=proactive_persist_learnings).
+	cappedTranscript := capTranscriptForSummarize(transcript.String())
+
 	// Build the user message with existing memory context
 	var userMsg strings.Builder
 	if len(existingMemory) > 0 {
 		fmt.Fprintf(&userMsg, "## Existing Memory (do not duplicate)\n\n%s\n\n---\n\n", string(existingMemory))
 	}
-	fmt.Fprintf(&userMsg, "## Conversation to Extract From\n\n%s", transcript.String())
+	fmt.Fprintf(&userMsg, "## Conversation to Extract From\n\n%s", cappedTranscript)
 
 	req := client.CompletionRequest{
 		Messages: []client.Message{
