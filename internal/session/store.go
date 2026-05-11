@@ -55,6 +55,18 @@ type Session struct {
 	InProgress bool `json:"in_progress,omitempty"`
 }
 
+// LastSeenModel returns the model that served the most recent LLM call on
+// this session, or "" when the session has no prior usage. Used by
+// AgentLoop callers to seed the soft context window when the daemon (or
+// any other caller) builds a fresh loop per request and the auto-detect
+// from a prior turn would otherwise be lost.
+func (s *Session) LastSeenModel() string {
+	if s == nil || s.Usage == nil {
+		return ""
+	}
+	return s.Usage.Model
+}
+
 // UsageSummary captures cumulative LLM and gateway-tool costs across a session.
 // LLM fields come from agent.TurnUsage (input/output tokens, cache tokens, cost).
 // Tool fields come from gateway tools that report usage (e.g. x_search→xAI Grok,

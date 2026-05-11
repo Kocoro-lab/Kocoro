@@ -1008,7 +1008,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		&runCfg.Permissions, deps.Auditor, deps.HookRunner)
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
-	loop.SetContextWindow(runCfg.Agent.ContextWindow)
+	// Seed the soft context window from the configured model or the last
+	// model observed on this session, falling back to the static config.
+	// Without this, every routed daemon turn would re-seed at the static
+	// default and force the first preflight check to assume the wrong cap
+	// until maybeAutoAdjustContextWindow runs after the first response.
+	loop.SetContextWindow(agent.SeedContextWindowFromModels(
+		runCfg.Agent.Model, sess.LastSeenModel(), runCfg.Agent.ContextWindow))
 	loop.SetEnableStreaming(false)
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
 	loop.SetCacheSource(cacheSourceFromDaemonSource(req.Source))

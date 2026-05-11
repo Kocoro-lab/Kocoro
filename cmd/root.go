@@ -204,7 +204,11 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	loop := agent.NewAgentLoop(llmClient, reg, runCfg.ModelTier, shannonDir, runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation, &runCfg.Permissions, auditor, hookRunner)
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
-	loop.SetContextWindow(runCfg.Agent.ContextWindow)
+	// One-shot CLI starts with a fresh session (no last-seen model), but
+	// still seed from the configured model so a known 1M/200K cap guides
+	// the first preflight check before any response arrives.
+	loop.SetContextWindow(agent.SeedContextWindowFromModels(
+		runCfg.Agent.Model, "", runCfg.Agent.ContextWindow))
 	// One-shot CLI invocation — no resume across runs. Short TTL is correct.
 	loop.SetCacheSource("oneshot_cli")
 	loop.SetSkillDiscovery(runCfg.Agent.SkillDiscoveryEnabled())

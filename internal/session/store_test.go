@@ -543,3 +543,39 @@ func TestFilterInjected_NoMetaFastPath(t *testing.T) {
 		t.Errorf("expected capped capacity %d, got %d", len(got), cap(got))
 	}
 }
+
+// TestSession_LastSeenModel guards the accessor used by the daemon
+// runner / TUI to carry an auto-detected context window across new
+// AgentLoop instances. Each routed daemon turn builds a fresh loop;
+// without this method (and a stable Usage.Model in session.json) the
+// seed would always fall back to the static config and over-truncate
+// 1M-context sessions until the first response arrived.
+func TestSession_LastSeenModel(t *testing.T) {
+	t.Run("nil session returns empty", func(t *testing.T) {
+		var s *Session
+		if got := s.LastSeenModel(); got != "" {
+			t.Fatalf("nil session: got %q, want \"\"", got)
+		}
+	})
+
+	t.Run("session without usage returns empty", func(t *testing.T) {
+		s := &Session{ID: "x"}
+		if got := s.LastSeenModel(); got != "" {
+			t.Fatalf("no usage: got %q, want \"\"", got)
+		}
+	})
+
+	t.Run("session with usage but no model returns empty", func(t *testing.T) {
+		s := &Session{ID: "x", Usage: &UsageSummary{InputTokens: 100}}
+		if got := s.LastSeenModel(); got != "" {
+			t.Fatalf("usage without model: got %q, want \"\"", got)
+		}
+	})
+
+	t.Run("session with model returns it", func(t *testing.T) {
+		s := &Session{ID: "x", Usage: &UsageSummary{Model: "claude-sonnet-4-6"}}
+		if got := s.LastSeenModel(); got != "claude-sonnet-4-6" {
+			t.Fatalf("got %q, want claude-sonnet-4-6", got)
+		}
+	})
+}

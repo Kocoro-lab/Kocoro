@@ -1450,6 +1450,169 @@ func TestShortSessionTruncate_RepeatsUntilUnderPreflightThreshold(t *testing.T) 
 	}
 }
 
+// shortSessionTruncate must remain a no-op on long sessions so that the
+// pre-compaction call site never clips a normal-sized user message just
+// because total history is over budget — the ShapeHistory + post-compaction
+// safety net handles long sessions instead.
+func TestShortSessionTruncate_LongSessionIsNoop(t *testing.T) {
+	loop := &AgentLoop{contextWindow: 200_000}
+	huge := strings.Repeat("a", 700_000)
+	// 10 messages = above MinShapeable (=9), so the gate applies.
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent(huge)},
+		{Role: "assistant", Content: client.NewTextContent("a")},
+		{Role: "user", Content: client.NewTextContent("b")},
+		{Role: "assistant", Content: client.NewTextContent("c")},
+		{Role: "user", Content: client.NewTextContent("d")},
+		{Role: "assistant", Content: client.NewTextContent("e")},
+		{Role: "user", Content: client.NewTextContent("f")},
+		{Role: "assistant", Content: client.NewTextContent("g")},
+		{Role: "user", Content: client.NewTextContent("h")},
+	}
+	if !shouldPreflightCompact(messages, loop.contextWindow) {
+		t.Fatal("test setup invariant: input must exceed preflight threshold")
+	}
+	out := loop.shortSessionTruncate(messages, "test")
+	if !strings.HasPrefix(out[1].Content.Text(), "aaaa") || strings.Contains(out[1].Content.Text(), "truncated") {
+		t.Fatalf("shortSessionTruncate clipped a long-session message — should be no-op above MinShapeable")
+	}
+}
+
+// truncateUserMessageOverBudget is the ungated core that the
+// post-compaction safety net calls. It must clip a huge preserved
+// firstUser even in a long session — the gap that the reviewer
+// flagged in PR review of #126.
+func TestTruncateUserMessageOverBudget_LongSessionClipsHugeFirstUser(t *testing.T) {
+	loop := &AgentLoop{contextWindow: 200_000}
+	huge := strings.Repeat("a", 700_000)
+	// Simulate a resumed session where ShapeHistory preserved a huge
+	// firstUser and the recent tail (small messages). 10+ messages so
+	// the short-session gate would skip; the ungated core must still fire.
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent(huge)},
+		{Role: "assistant", Content: client.NewTextContent("a")},
+		{Role: "user", Content: client.NewTextContent("b")},
+		{Role: "assistant", Content: client.NewTextContent("c")},
+		{Role: "user", Content: client.NewTextContent("d")},
+		{Role: "assistant", Content: client.NewTextContent("e")},
+		{Role: "user", Content: client.NewTextContent("f")},
+		{Role: "assistant", Content: client.NewTextContent("g")},
+		{Role: "user", Content: client.NewTextContent("h")},
+	}
+	if !shouldPreflightCompact(messages, loop.contextWindow) {
+		t.Fatal("test setup invariant: input must exceed preflight threshold")
+	}
+	out := loop.truncateUserMessageOverBudget(messages, "post_compaction", "long_session")
+	if shouldPreflightCompact(out, loop.contextWindow) {
+		t.Fatalf("post-compaction safety net left long-session prompt over preflight threshold")
+	}
+	if !strings.Contains(out[1].Content.Text(), "user message truncated") {
+		t.Errorf("huge preserved firstUser was not truncated by long-session safety net")
+	}
+	// Small tail messages must not be touched — only the largest user
+	// message gets clipped.
+	if out[9].Content.Text() != "h" {
+		t.Errorf("small tail user message was mutated: got %q", out[9].Content.Text())
+	}
+}
+
+// TestPostCompactionTruncate_CurrentTurnRunMessagesStripScaffold is the
+// long-session counterpart of the short-session strip-scaffold
+// regression. When the post-compaction safety net clips the CURRENT
+// user turn in a long session, scaffoldedUserText and rawUserMessage
+// must stay in sync with the live messages slice — otherwise
+// captureRunMessages compares against the pre-truncation scaffold,
+// the equality guard fails, and session.json ends up with the
+// scaffolded body (system reminders + prompt framing + potential
+// private-memory context) baked into the persisted user message.
+// Reviewer caught this gap on the first pass of the long-session fix.
+func TestPostCompactionTruncate_CurrentTurnRunMessagesStripScaffold(t *testing.T) {
+	var captured []client.CompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		captured = append(captured, req)
+		if req.ModelTier == "small" {
+			// Stub summary requests with a short canned reply so
+			// GenerateSummary inside the preflight compaction block
+			// can complete and ShapeHistory runs.
+			json.NewEncoder(w).Encode(nativeResponse("<summary>prior</summary>", "end_turn", nil, 100, 20))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("ok", "end_turn", nil, 500, 50))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	loop := NewAgentLoop(gw, NewToolRegistry(), "medium", "", 5, 2000, 200, nil, nil, nil)
+	loop.SetContextWindow(200_000)
+
+	// Long session: 8 small history messages so the assembled prompt
+	// (system + history + huge current user) lands above MinShapeable
+	// (=9). shortSessionTruncate's gate skips here; only the post-
+	// compaction ungated safety net should clip the current turn.
+	history := []client.Message{
+		{Role: "user", Content: client.NewTextContent("turn 1")},
+		{Role: "assistant", Content: client.NewTextContent("reply 1")},
+		{Role: "user", Content: client.NewTextContent("turn 2")},
+		{Role: "assistant", Content: client.NewTextContent("reply 2")},
+		{Role: "user", Content: client.NewTextContent("turn 3")},
+		{Role: "assistant", Content: client.NewTextContent("reply 3")},
+		{Role: "user", Content: client.NewTextContent("turn 4")},
+		{Role: "assistant", Content: client.NewTextContent("reply 4")},
+	}
+	huge := strings.Repeat("x", 800_000) // current turn body well over threshold
+
+	result, _, err := loop.Run(context.Background(), huge, nil, history)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("result = %q, want ok", result)
+	}
+
+	// Sanity: at least one main-tier call landed and its current user
+	// turn arrived truncated (the safety net actually fired).
+	var mainTurn *client.CompletionRequest
+	for i := range captured {
+		if captured[i].ModelTier != "small" {
+			mainTurn = &captured[i]
+			break
+		}
+	}
+	if mainTurn == nil {
+		t.Fatalf("expected a main-tier request, got %d captured (all small)", len(captured))
+	}
+	mainCurrentBody := mainTurn.Messages[len(mainTurn.Messages)-1].Content.Text()
+	if !strings.Contains(mainCurrentBody, "user message truncated") {
+		t.Fatalf("test setup invariant: outgoing current user turn was not truncated; head=%q",
+			mainCurrentBody[:min(200, len(mainCurrentBody))])
+	}
+
+	// The actual regression check: persisted current user turn must not
+	// carry scaffold framing, and must include the truncation marker
+	// (proving the post-compaction truncate ran AND the scaffold
+	// sync wrote the truncated raw body back into rawUserMessage).
+	runMsgs := loop.RunMessages()
+	if len(runMsgs) == 0 {
+		t.Fatal("RunMessages empty")
+	}
+	first := runMsgs[0].Content.Text()
+	if strings.Contains(first, "<!-- cache_break -->") ||
+		strings.Contains(first, "Active agent context") {
+		t.Fatalf("RunMessages leaked scaffolded user prompt after post-compaction truncate; head=%q",
+			first[:min(200, len(first))])
+	}
+	if !strings.Contains(first, "user message truncated") {
+		t.Fatalf("RunMessages should persist truncated raw user content, got head=%q",
+			first[:min(200, len(first))])
+	}
+}
+
 func TestShortSessionTruncate_CurrentTurnRunMessagesStripScaffold(t *testing.T) {
 	var captured []client.CompletionRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

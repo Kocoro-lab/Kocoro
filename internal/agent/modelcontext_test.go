@@ -131,3 +131,83 @@ func TestMaybeAutoAdjustContextWindow(t *testing.T) {
 		}
 	})
 }
+
+// TestSeedContextWindowFromModels guards the precedence used by daemon
+// runner / one-shot CLI / TUI when seeding a fresh AgentLoop. Critical
+// because daemon RunAgent builds a new loop on every routed turn — if
+// the seed is wrong, preflight compaction uses the wrong cap until the
+// first response triggers maybeAutoAdjustContextWindow.
+func TestSeedContextWindowFromModels(t *testing.T) {
+	cases := []struct {
+		name             string
+		configuredModel  string
+		lastSeenModel    string
+		fallback         int
+		want             int
+	}{
+		{
+			name:            "configured 1M wins",
+			configuredModel: "claude-sonnet-4-6",
+			lastSeenModel:   "claude-haiku-4-5",
+			fallback:        128_000,
+			want:            1_000_000,
+		},
+		{
+			name:            "configured 200K wins over fallback default",
+			configuredModel: "claude-opus-4-5",
+			lastSeenModel:   "",
+			fallback:        128_000,
+			want:            200_000,
+		},
+		{
+			name:            "last-seen used when no configured",
+			configuredModel: "",
+			lastSeenModel:   "claude-sonnet-4-6",
+			fallback:        200_000,
+			want:            1_000_000,
+		},
+		{
+			name:            "last-seen dated variant via prefix",
+			configuredModel: "",
+			lastSeenModel:   "claude-sonnet-4-6-20260301",
+			fallback:        200_000,
+			want:            1_000_000,
+		},
+		{
+			name:            "unknown configured falls through to last-seen",
+			configuredModel: "totally-made-up",
+			lastSeenModel:   "claude-sonnet-4-6",
+			fallback:        200_000,
+			want:            1_000_000,
+		},
+		{
+			name:            "unknown configured and unknown last-seen use fallback",
+			configuredModel: "totally-made-up",
+			lastSeenModel:   "another-fake-id",
+			fallback:        128_000,
+			want:            128_000,
+		},
+		{
+			name:            "both empty uses fallback",
+			configuredModel: "",
+			lastSeenModel:   "",
+			fallback:        200_000,
+			want:            200_000,
+		},
+		{
+			name:            "configured beats last-seen even when last-seen is larger",
+			configuredModel: "claude-haiku-4-5",
+			lastSeenModel:   "claude-sonnet-4-6",
+			fallback:        128_000,
+			want:            200_000,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SeedContextWindowFromModels(tc.configuredModel, tc.lastSeenModel, tc.fallback)
+			if got != tc.want {
+				t.Fatalf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

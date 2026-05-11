@@ -130,3 +130,28 @@ func LookupModelContextWindow(modelID string) (int, bool) {
 	}
 	return 0, false
 }
+
+// SeedContextWindowFromModels picks the best soft-seed for a fresh AgentLoop
+// given (a) the model the caller configured and (b) the last model observed
+// on the resumed session. Precedence:
+//
+//  1. configuredModel (e.g. runCfg.Agent.Model) — explicit user intent for
+//     this run, even though the value is unlocked.
+//  2. lastSeenModel (e.g. session.Usage.Model) — the model that actually
+//     served the previous turn. Carries auto-detected caps across new
+//     loop instances when the daemon creates a fresh loop per request.
+//  3. fallback (typically runCfg.Agent.ContextWindow, the static config).
+//
+// Either model string may be empty or unknown; unknown lookups skip to the
+// next tier. The returned value is meant to be passed to SetContextWindow
+// (soft seed) — per-agent explicit overrides should still call
+// SetContextWindowExplicit afterwards to lock the window.
+func SeedContextWindowFromModels(configuredModel, lastSeenModel string, fallback int) int {
+	if cw, ok := LookupModelContextWindow(configuredModel); ok {
+		return cw
+	}
+	if cw, ok := LookupModelContextWindow(lastSeenModel); ok {
+		return cw
+	}
+	return fallback
+}

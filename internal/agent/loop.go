@@ -71,19 +71,13 @@ func emitCompactionFailureStatus(handler any, phase string, err error) {
 		fmt.Sprintf("%s: %v", phase, err))
 }
 
-// shortSessionTruncate runs the single-message fallback when the prompt
-// exceeds the preflight threshold but len(messages) is below MinShapeable
-// — i.e. ShapeHistory cannot help because there's nothing to compact, but
-// a single huge user message can still be rune-safely head+tail truncated.
-//
-// Returns the (possibly mutated) messages slice. Emits
-// OnRunStatus("preflight_user_truncate", ...) when truncation actually
-// happens so daemon SSE / Desktop subscribers can show the user that
-// their input was clipped.
-//
-// sourceTag identifies the call-site (force_stop / main_preflight) so the
-// status detail is attributable. Long sessions take the normal ShapeHistory
-// path and return unchanged here.
+// shortSessionTruncate is the original short-session fallback wrapper:
+// only fires when len(messages) is below MinShapeable so ShapeHistory
+// cannot help. Kept for the early preflight call sites (main_preflight,
+// force_stop) where the short-session restriction preserves the
+// historical intent. Long sessions get a separate ungated safety net
+// after ShapeHistory (truncateUserMessageOverBudget) — see the
+// post-compaction call site.
 //
 // This guards the failure mode discovered during 2026-05-11 stress
 // testing as P0-#1: Stress D sent a single 191K-token user message,
@@ -96,6 +90,32 @@ func (a *AgentLoop) shortSessionTruncate(messages []client.Message, sourceTag st
 	if len(messages) > ctxwin.MinShapeable() {
 		return messages
 	}
+	return a.truncateUserMessageOverBudget(messages, sourceTag, "short_session")
+}
+
+// truncateUserMessageOverBudget is the ungated core: when the prompt
+// estimate is still over the preflight threshold, iteratively clip the
+// largest plain-text user message until the prompt fits or no further
+// progress is possible.
+//
+// Used by:
+//
+//   - shortSessionTruncate (short-session gate) for the early preflight
+//     call sites.
+//   - The post-ShapeHistory safety net (gateless) — ShapeHistory always
+//     preserves firstUser and the recent tail, so a huge resumed
+//     firstUser or oversized recent user message can survive
+//     compaction unchanged and keep the prompt over the model cap.
+//     Without this call, that case escaped to the API and 400'd.
+//
+// Returns the (possibly mutated) messages slice. Emits
+// OnRunStatus("preflight_user_truncate", ...) when truncation actually
+// happens so daemon SSE / Desktop subscribers can surface the clip to
+// the user. sourceTag identifies the call site
+// (main_preflight / force_stop / post_compaction); modeTag distinguishes
+// the gated short-session call from the gateless safety net for audit
+// readability.
+func (a *AgentLoop) truncateUserMessageOverBudget(messages []client.Message, sourceTag, modeTag string) []client.Message {
 	totalDropped := 0
 	truncations := 0
 	maxAttempts := len(messages)
@@ -114,10 +134,10 @@ func (a *AgentLoop) shortSessionTruncate(messages []client.Message, sourceTag st
 	if totalDropped > 0 {
 		if rs, ok := a.handler.(RunStatusHandler); ok {
 			rs.OnRunStatus("preflight_user_truncate",
-				fmt.Sprintf("%s: truncated user messages by %d chars across %d message(s) (short session, %d msgs, est %d tokens)",
-					sourceTag, totalDropped, truncations, len(messages), ctxwin.EstimateTokens(messages)))
+				fmt.Sprintf("%s: truncated user messages by %d chars across %d message(s) (%s, %d msgs, est %d tokens)",
+					sourceTag, totalDropped, truncations, modeTag, len(messages), ctxwin.EstimateTokens(messages)))
 		}
-		a.recordCompactionSuccess("short_session_truncate",
+		a.recordCompactionSuccess(modeTag+"_truncate",
 			fmt.Sprintf("source=%s msgs=%d truncations=%d chars_dropped=%d", sourceTag, len(messages), truncations, totalDropped))
 	}
 	return messages
@@ -1773,7 +1793,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		return rawMsgs[0].Content.Text()
 	}
 
-	applyShortSessionTruncate := func(sourceTag string) {
+	// runTruncateWithScaffoldSync wraps any user-message truncate operation
+	// with the bookkeeping that keeps scaffoldedUserText and rawUserMessage
+	// in sync with the live messages slice. When the truncate clips the
+	// CURRENT turn's user message, both the scaffold-equality guard inside
+	// captureRunMessages and the snapshot closure would otherwise compare
+	// against pre-truncation text, fail, and persist the scaffolded body
+	// (system reminders + prompt framing) into session.json. Used by both
+	// the gated short-session call sites (main_preflight / force_stop) and
+	// the ungated long-session safety net (post_compaction).
+	runTruncateWithScaffoldSync := func(truncate func() []client.Message) {
 		currentBefore := ""
 		if newMsgOffset >= 0 && newMsgOffset < len(messages) {
 			m := messages[newMsgOffset]
@@ -1781,7 +1810,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				currentBefore = m.Content.Text()
 			}
 		}
-		messages = a.shortSessionTruncate(messages, sourceTag)
+		messages = truncate()
 		if currentBefore == "" || currentBefore != scaffoldedUserText || newMsgOffset < 0 || newMsgOffset >= len(messages) {
 			return
 		}
@@ -1795,6 +1824,18 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 		scaffoldedUserText = currentAfter
 		rawUserMessage = truncateRawUserForPersistence(rawUserMessage)
+	}
+
+	applyShortSessionTruncate := func(sourceTag string) {
+		runTruncateWithScaffoldSync(func() []client.Message {
+			return a.shortSessionTruncate(messages, sourceTag)
+		})
+	}
+
+	applyLongSessionTruncate := func(sourceTag string) {
+		runTruncateWithScaffoldSync(func() []client.Message {
+			return a.truncateUserMessageOverBudget(messages, sourceTag, "long_session")
+		})
 	}
 
 	// runForceStopTurn issues the final non-tool LLM turn after the loop
@@ -2463,6 +2504,24 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			compactionApplied = true
 			reanchorActiveTask(MetaBoundaryPostCompaction)
 			a.tracker.MarkDirty()
+		}
+
+		// Post-compaction safety net: ShapeHistory always preserves the
+		// first user message and the recent-tail floor, so a huge resumed
+		// firstUser or an oversized recent user message can survive
+		// compaction unchanged and still exceed the model cap. The early
+		// short-session truncate at line ~2419 was gated on
+		// len(messages) <= MinShapeable() and missed this case, so the
+		// prompt escaped to the API and 400'd. This ungated call clips
+		// the largest plain-text user message after compaction has done
+		// what it can. No-op when the estimate already fits.
+		//
+		// Goes through applyLongSessionTruncate (not the raw method) so
+		// scaffoldedUserText and rawUserMessage stay in sync when the
+		// clip lands on the current turn — otherwise captureRunMessages
+		// would persist the scaffolded body into session.json.
+		if shouldPreflightCompact(messages, a.contextWindow) {
+			applyLongSessionTruncate("post_compaction")
 		}
 
 		// Call LLM — streaming or blocking
