@@ -71,6 +71,43 @@ func emitCompactionFailureStatus(handler any, phase string, err error) {
 		fmt.Sprintf("%s: %v", phase, err))
 }
 
+// shortSessionTruncate runs the single-message fallback when the prompt
+// exceeds the preflight threshold but len(messages) is below MinShapeable
+// — i.e. ShapeHistory cannot help because there's nothing to compact, but
+// a single huge user message can still be rune-safely head+tail truncated.
+//
+// Returns the (possibly mutated) messages slice. Emits
+// OnRunStatus("preflight_user_truncate", ...) when truncation actually
+// happens so daemon SSE / Desktop subscribers can show the user that
+// their input was clipped.
+//
+// sourceTag identifies the call-site (force_stop / main_preflight) so the
+// status detail is attributable. Long sessions take the normal ShapeHistory
+// path and return unchanged here.
+//
+// This guards the failure mode discovered during 2026-05-11 stress
+// testing as P0-#1: Stress D sent a single 191K-token user message,
+// every client-side defense was gated by MinShapeable=9, the message
+// escaped to the API untouched.
+func (a *AgentLoop) shortSessionTruncate(messages []client.Message, sourceTag string) []client.Message {
+	if !shouldPreflightCompact(messages, a.contextWindow) {
+		return messages
+	}
+	if len(messages) > ctxwin.MinShapeable() {
+		return messages
+	}
+	var dropped int
+	messages, dropped = ctxwin.TruncateOversizedLastUserMessage(messages, a.contextWindow)
+	if dropped > 0 {
+		if rs, ok := a.handler.(RunStatusHandler); ok {
+			rs.OnRunStatus("preflight_user_truncate",
+				fmt.Sprintf("%s: truncated user message by %d chars (short session, %d msgs, est %d tokens)",
+					sourceTag, dropped, len(messages), ctxwin.EstimateTokens(messages)))
+		}
+	}
+	return messages
+}
+
 // recordCompactionFailure emits a compaction-failed run-status event and an
 // audit row in one call. Replaces the emit + if-auditor-then-Log pair that was
 // duplicated across the proactive, preflight, and reactive compaction paths.
@@ -1648,6 +1685,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			a.tracker.Enter(PhaseForceStop)
 		}
 
+		// Short-session fallback: if the prompt is over preflight threshold but
+		// len(messages) <= MinShapeable, ShapeHistory below is gated off but
+		// a single huge user message can still be rune-safely truncated.
+		messages = a.shortSessionTruncate(messages, "force_stop")
+
 		// Pre-flight guard for the force-stop final turn. Same rationale as the
 		// main loop guard above. We do NOT gate on compactionApplied here:
 		// force-stop is the last-resort turn and especially must not 400.
@@ -2158,6 +2200,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				contextBloatStatusSent = true
 			}
 		}
+
+		// Short-session fallback: catches single huge user message when
+		// len(messages) is below MinShapeable. See shortSessionTruncate
+		// docstring + 2026-05-11 stress P0-#1.
+		messages = a.shortSessionTruncate(messages, "main_preflight")
 
 		// Pre-flight prompt-size guard: if the soon-to-be-sent prompt estimates
 		// over 95% of the context window, force an emergency compaction before

@@ -1,7 +1,9 @@
 package context
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -379,6 +381,103 @@ func TestShapeHistory(t *testing.T) {
 					t.Errorf("orphaned tool_use with id %q at position %d", b.ID, i)
 				}
 			}
+		}
+	})
+}
+
+// TestTruncateOversizedLastUserMessage covers the short-session single-input
+// fallback added to guard P0-#1 from 2026-05-11 stress testing. Without this,
+// a 191K-token single user message escapes every client-side defense because
+// ShapeHistory and the preflight path are both gated by MinShapeable()=9.
+func TestTruncateOversizedLastUserMessage(t *testing.T) {
+	t.Run("plain-text oversized user message is truncated", func(t *testing.T) {
+		// 200K context, 0.90 threshold = 180K tokens. At 3.5 chars/token that's
+		// ~630K chars. Build a user message clearly above this so the function
+		// fires.
+		huge := strings.Repeat("padding ", 100000) // 800K chars
+		msgs := []client.Message{
+			{Role: "system", Content: client.NewTextContent("system prompt")},
+			{Role: "user", Content: client.NewTextContent(huge)},
+		}
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped == 0 {
+			t.Fatalf("expected truncation when input exceeds threshold, dropped=0")
+		}
+		if !strings.Contains(out[1].Content.Text(), "user message truncated") {
+			t.Error("truncation marker absent from user message body")
+		}
+		if !utf8.ValidString(out[1].Content.Text()) {
+			t.Error("output is not valid UTF-8")
+		}
+	})
+
+	t.Run("under-threshold message is unchanged", func(t *testing.T) {
+		small := strings.Repeat("hello ", 100) // 600 chars, ~170 tokens
+		msgs := []client.Message{
+			{Role: "user", Content: client.NewTextContent(small)},
+		}
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped != 0 {
+			t.Errorf("expected dropped=0 under threshold, got %d", dropped)
+		}
+		if out[0].Content.Text() != small {
+			t.Errorf("user message body mutated under threshold")
+		}
+	})
+
+	t.Run("CJK content stays rune-aligned", func(t *testing.T) {
+		// EstimateTokens counts runes (not bytes), so the input has to push
+		// rune-count past 0.90 × 200K = 180K tokens × 3.5 chars/token = 630K
+		// runes. 200K repeats × 5 runes ("你好世界 ") = 1M runes, well over.
+		chinese := strings.Repeat("你好世界 ", 200000)
+		if !utf8.ValidString(chinese) {
+			t.Fatalf("test setup invariant: input must be valid UTF-8")
+		}
+		msgs := []client.Message{
+			{Role: "user", Content: client.NewTextContent(chinese)},
+		}
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped == 0 {
+			t.Fatalf("expected truncation on huge CJK input")
+		}
+		body := out[0].Content.Text()
+		if !utf8.ValidString(body) {
+			t.Errorf("truncation split a rune mid-sequence: invalid UTF-8")
+		}
+	})
+
+	t.Run("multi-block user message is left alone", func(t *testing.T) {
+		// Structured content (tool_result / image) needs different handling
+		// — this fallback intentionally skips it.
+		msgs := []client.Message{
+			{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+				{Type: "text", Text: strings.Repeat("padding ", 100000)},
+			})},
+		}
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped != 0 {
+			t.Errorf("multi-block message should not be touched; dropped=%d", dropped)
+		}
+	})
+
+	t.Run("zero context window is a no-op", func(t *testing.T) {
+		msgs := []client.Message{
+			{Role: "user", Content: client.NewTextContent(strings.Repeat("padding ", 100000))},
+		}
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 0)
+		if dropped != 0 {
+			t.Errorf("zero contextWindow should be no-op; dropped=%d", dropped)
+		}
+	})
+
+	t.Run("no user message is a no-op", func(t *testing.T) {
+		msgs := []client.Message{
+			{Role: "system", Content: client.NewTextContent("just system")},
+			{Role: "assistant", Content: client.NewTextContent("just assistant")},
+		}
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		if dropped != 0 {
+			t.Errorf("expected no-op when no user msg; dropped=%d", dropped)
 		}
 	})
 }
