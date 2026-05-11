@@ -176,6 +176,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to init settings: %w", err)
 	}
 
+	// One-shot config migrations run before viper.ReadInConfig so the
+	// rewritten yaml is what viper sees on this same launch. Each
+	// migration is gated by ~/.shannon/migrations.json so reruns are no-ops.
+	RunPendingMigrations(dir)
+
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(dir)
