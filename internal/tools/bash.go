@@ -88,11 +88,11 @@ IMPORTANT: Avoid using this tool to run cat, head, tail, sed, awk, grep, find, o
 
 macOS Spotlight (` + "`" + `mdfind` + "`" + `): only fall back to it when glob/grep cannot answer the question — metadata searches, bundle-ID lookups, or files outside the session CWD. Naive mdfind can freeze the system (Spotlight may trigger a reindex). Always follow this template:
 
-    ` + "`" + `{ timeout 15 mdfind "keyword1" 2>/dev/null; timeout 15 mdfind "keyword2" 2>/dev/null; } | sort -u | head -100 || find ~/Documents -iname "*keyword1*" 2>/dev/null | head -100` + "`" + `
+    ` + "`" + `{ timeout 15 mdfind "keyword1" 2>/dev/null; timeout 15 mdfind "keyword2" 2>/dev/null; } | sort -u | head -100` + "`" + `
 
-- Never pass ` + "`" + `-onlyin /` + "`" + `, ` + "`" + `-onlyin /Users` + "`" + `, ` + "`" + `-onlyin $HOME` + "`" + `, or ` + "`" + `-onlyin ~` + "`" + ` — Spotlight filters by path AFTER querying (slow, may trigger reindex). Either omit ` + "`" + `-onlyin` + "`" + ` or scope to a small subdir (e.g., ` + "`" + `-onlyin ~/Documents/project-x` + "`" + `).
+- Never pass ` + "`" + `-onlyin /` + "`" + `, ` + "`" + `-onlyin /Users` + "`" + `, ` + "`" + `-onlyin $HOME` + "`" + `, or ` + "`" + `-onlyin ~` + "`" + ` — wide Spotlight scopes are slow and may trigger a reindex. Either omit ` + "`" + `-onlyin` + "`" + ` or scope to a small subdir (e.g., ` + "`" + `-onlyin ~/Documents/project-x` + "`" + `).
 - Split OR queries into separate mdfind calls then ` + "`" + `sort -u` + "`" + `; never run ` + "`" + `mdfind "A OR B"` + "`" + ` directly.
-- Always pair with ` + "`" + `timeout 15` + "`" + ` and ` + "`" + `| head -100` + "`" + `, and chain a ` + "`" + `find` + "`" + ` fallback with ` + "`" + `||` + "`" + ` so the agent doesn't stall on Spotlight errors.
+- Always pair with ` + "`" + `timeout 15` + "`" + ` and ` + "`" + `| head -100` + "`" + `. If mdfind returns zero results or times out (exit 124), follow up with a focused ` + "`" + `find <subtree> -iname "*keyword*" 2>/dev/null | head -100` + "`" + ` as a separate call — do not chain it via ` + "`" + `||` + "`" + ` in the same pipeline, since ` + "`" + `head` + "`" + ` always exits 0 and the fallback would never fire.
 
 While bash can do similar things, the dedicated tools have better permission handling, output truncation, and result shaping.
 
