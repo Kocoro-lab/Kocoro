@@ -111,4 +111,23 @@ func TestMaybeAutoAdjustContextWindow(t *testing.T) {
 			t.Fatalf("expected shrink to 200K, got %d", a.contextWindow)
 		}
 	})
+
+	// SetContextWindow must clear the explicit-lock flag so it can serve
+	// as a "reset to seed" path in future refactors. (PR review #4.)
+	t.Run("SetContextWindow clears explicit-lock flag", func(t *testing.T) {
+		a := &AgentLoop{}
+		a.SetContextWindowExplicit(50_000) // user pin
+		if !a.contextWindowExplicit {
+			t.Fatalf("test setup invariant: explicit lock should be set")
+		}
+		a.SetContextWindow(200_000) // soft reseed
+		if a.contextWindowExplicit {
+			t.Fatalf("SetContextWindow should clear explicit lock; still locked")
+		}
+		// Auto-detect must now flow through to the loop.
+		a.maybeAutoAdjustContextWindow("claude-sonnet-4-6")
+		if a.contextWindow != 1_000_000 {
+			t.Fatalf("expected auto-detect to flow after SetContextWindow reset, got %d", a.contextWindow)
+		}
+	})
 }

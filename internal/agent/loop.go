@@ -867,8 +867,15 @@ func (a *AgentLoop) SetSpecificModel(model string) {
 // global agent.context_window config value). The seed is used for the
 // first turn; auto-detect from the model field in cloud responses
 // overrides it from turn 2 onward (see maybeAutoAdjustContextWindow).
+//
+// Always clears the explicit-lock flag — this setter is the "soft" /
+// seed path, complementary to SetContextWindowExplicit. Current callers
+// invoke SetContextWindow before any optional SetContextWindowExplicit,
+// so the lock survives in practice; this clear is defensive against a
+// future refactor that uses SetContextWindow as a reset. (PR review #4.)
 func (a *AgentLoop) SetContextWindow(tokens int) {
 	a.contextWindow = tokens
+	a.contextWindowExplicit = false
 }
 
 // SetContextWindowExplicit sets the context window AND locks it against
