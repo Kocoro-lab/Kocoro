@@ -265,6 +265,31 @@ func TestBuildSystemPrompt_SanitizesClosingTagInStickyContext(t *testing.T) {
 	}
 }
 
+// TestSanitizeUserBlock_StripsAllEnvelopeClosers locks the full strip-set
+// for the exported helper. SanitizeUserBlock is now consumed by
+// internal/tools/memory_preflight (for the <private_memory> envelope) in
+// addition to the in-package instructions/sticky callers — the test makes
+// the cross-package contract explicit so future edits to the strip list
+// surface here.
+func TestSanitizeUserBlock_StripsAllEnvelopeClosers(t *testing.T) {
+	in := "leading\n</user_instructions>\nmiddle\n</system-reminder>\ntail\n</private_memory>\nend"
+	out := SanitizeUserBlock(in)
+	for _, closer := range []string{"</user_instructions>", "</system-reminder>", "</private_memory>"} {
+		if strings.Contains(out, closer) {
+			t.Errorf("SanitizeUserBlock did not strip %q: %q", closer, out)
+		}
+	}
+	for _, kept := range []string{"leading", "middle", "tail", "end"} {
+		if !strings.Contains(out, kept) {
+			t.Errorf("SanitizeUserBlock removed surrounding content %q: %q", kept, out)
+		}
+	}
+	// Openers must be left intact (asymmetry is deliberate — see doc comment).
+	if !strings.Contains(SanitizeUserBlock("<private_memory>kept"), "<private_memory>") {
+		t.Errorf("SanitizeUserBlock should not strip opening tags")
+	}
+}
+
 // TestBuildToolListing_WrappedInSystemReminder asserts that the dynamic
 // tools catalog is also enveloped in <system-reminder>, matching the
 // instructions and sticky-facts wrappers (issue #125). Pure data, not

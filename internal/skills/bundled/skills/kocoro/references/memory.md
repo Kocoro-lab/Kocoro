@@ -55,6 +55,42 @@ probe fails, the daemon log will show one of these audit events:
 - `memory_reload_failed` — bundle installed but `/bundle/reload` POST
   failed; sidecar's own poller will pick up the new symlink eventually
 
+## Implicit episodic preflight
+
+Before the first main-model call on a memory-relevant turn, the daemon runs
+a preflight: a small-tier helper compiles `QueryIntent`s via forced
+`tool_use`, the sidecar resolves them, and a `<private_memory>` block is
+injected into the current user message before it reaches the main model.
+Many memory questions are answered on turn 0 without an explicit
+`memory_recall` invocation.
+
+- Fires only when sidecar status is `Ready`. With sidecar unavailable, the
+  agent falls back to the `memory_recall` tool's degraded path described
+  below.
+- The `<private_memory>` block is in-message-only — never persisted to the
+  session transcript, never replayed, and stripped from compaction summaries
+  at every `GenerateSummary` site.
+- Audit event `memory_preflight` records a content-free trace:
+  `attempted` / `helper_used` / `intents_count` / `results_count` /
+  `context_injected` / `outcome` / `error_class` / `http_status`. Query
+  text, anchor mentions, relation labels, and recalled content are never
+  logged.
+- Outcomes worth tracing (the rich set is set inside the preflight; loop.go
+  only fills `Outcome` if still empty):
+  - `context_injected` — happy path, model received the block
+  - `context_returned` — preflight produced a block but injection was
+    skipped upstream (rare)
+  - `no_results` — intents compiled but the sidecar found nothing
+  - `no_context` — results returned but every group was filtered
+  - `no_intents` / `helper_declined` / `gate_declined` — preflight
+    intentionally skipped (greeting / task-text / non-memory prompt)
+  - `query_timeout` — sidecar exceeded its per-intent budget
+  - `helper_error` — small-tier helper call failed; cross-reference
+    `error_class` (`no_tool_call`, `wrong_tool`, `invalid_tool_args`,
+    `nil_response`, `unknown`)
+  - `memory_unavailable` / `helper_unavailable` / `querier_unavailable` —
+    degraded path; agent fell back to the explicit `memory_recall` tool
+
 ## Behavior when memory is unavailable
 
 The `memory_recall` tool degrades gracefully — it returns a JSON

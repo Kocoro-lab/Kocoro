@@ -1029,6 +1029,24 @@ for cloud-connected installs, and can be disabled in settings. Three modes:
    re-pulls every 24h. The agent's `memory_recall` tool delegates to the
    sidecar once it's ready.
 
+### Implicit episodic preflight
+
+Before the first main-model call on a memory-relevant turn, ShanClaw runs an
+implicit preflight: a small-tier helper compiles `QueryIntent`s via forced
+`tool_use`, the sidecar resolves them, and a `<private_memory>` block is
+injected into the current user message before it reaches the main model.
+Effect: many memory questions are answered on turn 0 without an explicit
+`memory_recall` invocation. Behaviour:
+
+- Fires only when the sidecar is `Ready`; otherwise the agent falls back to
+  the explicit `memory_recall` tool (or its session-search degradation path).
+- The `<private_memory>` block is in-message-only — never persisted to the
+  session transcript, never replayed, stripped from compaction summaries.
+- Audit event `memory_preflight` records a content-free trace
+  (`attempted` / `helper_used` / `intents_count` / `results_count` /
+  `context_injected` / `outcome` / `error_class` / `http_status`). Query
+  text, anchors, relation labels, and recalled content are never logged.
+
 ### Configuration
 
 | Key | Default | Notes |
