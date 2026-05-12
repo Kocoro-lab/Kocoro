@@ -137,4 +137,30 @@ func TestBuildForkedRequest_ToolsAllowlist_FiltersTools(t *testing.T) {
 	if len(main.Tools) != 3 {
 		t.Error("main.Tools mutated")
 	}
+	// Filter branch must allocate a fresh slice — backing arrays separate.
+	// Without this, a caller mutating forked.Tools[0] would corrupt main.Tools.
+	forked.Tools[0].Name = "MUTATED_BY_TEST"
+	if main.Tools[0].Name == "MUTATED_BY_TEST" {
+		t.Error("ToolsAllowlist filter aliased main.Tools backing array")
+	}
+}
+
+func TestBuildForkedRequest_ToolsAllowlist_EmptyBlocksAll(t *testing.T) {
+	// Empty-non-nil allowlist means "block all tools" — distinct from nil
+	// (which means "no filter, share main.Tools"). Pin the documented semantics.
+	main := client.CompletionRequest{
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
+		Tools:    []client.Tool{{Name: "file_read"}, {Name: "bash"}},
+	}
+	forked, err := BuildForkedRequest(main, ForkOptions{
+		AppendMessages: []client.Message{{Role: "user", Content: client.NewTextContent("x")}},
+		SkipCacheWrite: true,
+		ToolsAllowlist: []string{}, // empty non-nil
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(forked.Tools) != 0 {
+		t.Errorf("expected empty Tools (allowlist blocks all), got %+v", forked.Tools)
+	}
 }

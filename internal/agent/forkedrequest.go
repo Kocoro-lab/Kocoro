@@ -37,7 +37,13 @@ type ForkOptions struct {
 	// "review" sub-agent restricted to read-only tools). Never use for prompt
 	// suggestion / speculation — they MUST inherit the full tools array.
 	//
-	// Callers that set this MUST emit an audit row tagged
+	// Semantics:
+	//   - nil          → no filter; forked.Tools shares backing array with
+	//                    main.Tools (callers must treat as read-only)
+	//   - []string{}   → block all tools; forked.Tools becomes empty
+	//   - []string{x}  → keep only tools whose Name == x
+	//
+	// Callers that set this to a non-nil value MUST emit an audit row tagged
 	// "fork_tools_filtered" so cache-regression hunting later can correlate
 	// fragmentation with this option.
 	ToolsAllowlist []string
@@ -61,6 +67,12 @@ func BuildForkedRequest(main client.CompletionRequest, opts ForkOptions) (client
 	}
 
 	out := main // shallow copy of value-type struct
+	// NOTE: in the no-allowlist path, out.Tools still shares its backing array
+	// with main.Tools. Callers MUST treat the returned forked.Tools as read-only
+	// — appending or mutating elements can corrupt the main request. The current
+	// suggestion / speculation callers never write to Tools, so this is fine in
+	// practice; a future caller that needs to mutate Tools should pass a non-nil
+	// ToolsAllowlist (which forces a fresh slice via the filter branch below).
 
 	// Defensive deep-copy of Messages — must NOT share backing array with main,
 	// otherwise callers mutating `out.Messages[i]` would corrupt `main.Messages[i]`.
