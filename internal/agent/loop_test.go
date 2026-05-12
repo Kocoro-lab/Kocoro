@@ -572,6 +572,55 @@ func TestCheckPermissionAndApproval_UserFilePaths_DirectoryPrefixMatch(t *testin
 	}
 }
 
+func TestCheckPermissionAndApproval_UserFilePaths_DirectorySymlinkEscape(t *testing.T) {
+	tmp := t.TempDir()
+	attached := filepath.Join(tmp, "attached")
+	outside := filepath.Join(tmp, "outside")
+	if err := os.MkdirAll(attached, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(attached, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	loop := &AgentLoop{
+		userFilePaths: []UserAttachedPath{{Path: attached, IsDir: true}},
+	}
+	tool := &mockApprovalTool{name: "file_read", safeArgs: func(string) bool { return false }}
+	_, approved := loop.checkPermissionAndApproval(
+		context.Background(),
+		"file_read",
+		fmt.Sprintf(`{"path": %q}`, filepath.Join(link, "secret.txt")),
+		tool,
+		nil,
+	)
+	if approved {
+		t.Fatal("expected symlink escape under attached directory to require approval")
+	}
+
+	inside := filepath.Join(attached, "inside.txt")
+	if err := os.WriteFile(inside, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	decision, approved := loop.checkPermissionAndApproval(
+		context.Background(),
+		"file_read",
+		fmt.Sprintf(`{"path": %q}`, inside),
+		tool,
+		nil,
+	)
+	if !approved || decision != "allow" {
+		t.Fatalf("expected normal child path to remain auto-approved, decision=%q approved=%v", decision, approved)
+	}
+}
+
 // mockImageTool returns a tool result with images.
 type mockImageTool struct {
 	name string

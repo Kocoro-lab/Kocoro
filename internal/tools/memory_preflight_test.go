@@ -387,6 +387,63 @@ func TestNewMemoryPreflight_QueriesAndRenders(t *testing.T) {
 	}
 }
 
+func TestNewMemoryPreflight_ReturnsHelperUsageWhenHelperDeclines(t *testing.T) {
+	querier := &fakeMemoryPreflightQuerier{status: memory.StatusReady}
+	llm := &fakeMemoryHelperLLM{responses: []*client.CompletionResponse{
+		helperToolResponse(t, helperMemoryOutput{ShouldRecall: false}, client.Usage{
+			InputTokens:  9,
+			OutputTokens: 3,
+			TotalTokens:  12,
+		}),
+	}}
+	preflight := NewMemoryPreflight(querier, llm)
+
+	result := preflight(context.Background(), "hello", agent.MemoryPreflightOptions{ForceHelper: true})
+	if result == nil {
+		t.Fatal("result=nil; helper usage must be returned even without context")
+	}
+	if result.Context != "" {
+		t.Fatalf("context=%q want empty", result.Context)
+	}
+	if result.Usage.TotalTokens != 12 {
+		t.Fatalf("usage=%+v want helper usage", result.Usage)
+	}
+	if len(querier.intents) != 0 {
+		t.Fatalf("queried despite helper decline: %v", querier.intents)
+	}
+}
+
+func TestNewMemoryPreflight_ReturnsHelperUsageWhenIntentsSanitizeEmpty(t *testing.T) {
+	querier := &fakeMemoryPreflightQuerier{status: memory.StatusReady}
+	llm := &fakeMemoryHelperLLM{responses: []*client.CompletionResponse{
+		helperToolResponse(t, helperMemoryOutput{
+			ShouldRecall: true,
+			Intents: []memory.QueryIntent{{
+				Mode:                memory.ModeDirectRelation,
+				AnchorMentions:      []string{"私"},
+				RelationConstraints: []string{"employed_at"},
+				EvidenceBudget:      5,
+				ResultLimit:         10,
+			}},
+		}, client.Usage{InputTokens: 8, OutputTokens: 2, TotalTokens: 10}),
+	}}
+	preflight := NewMemoryPreflight(querier, llm)
+
+	result := preflight(context.Background(), "私は誰？", agent.MemoryPreflightOptions{ForceHelper: true})
+	if result == nil {
+		t.Fatal("result=nil; sanitized-empty helper usage must still be returned")
+	}
+	if result.Context != "" {
+		t.Fatalf("context=%q want empty", result.Context)
+	}
+	if result.Usage.TotalTokens != 10 {
+		t.Fatalf("usage=%+v want helper usage", result.Usage)
+	}
+	if len(querier.intents) != 0 {
+		t.Fatalf("queried despite empty sanitized intents: %v", querier.intents)
+	}
+}
+
 func TestNewMemoryPreflight_FailSilentWhenUnavailable(t *testing.T) {
 	querier := &fakeMemoryPreflightQuerier{status: memory.StatusUnavailable}
 	preflight := NewMemoryPreflight(querier, nil)

@@ -30,9 +30,9 @@ type MemoryPreflightQuerier interface {
 	QueryBatch(ctx context.Context, intents []memory.QueryIntent) []memory.QueryResult
 }
 
-// helperMemoryOutput is the schema bound to the forced tool_use call. The
-// gateway/provider's schema validator guarantees these fields conform — we
-// no longer need lenient JSON coercion to survive small-model drift.
+// helperMemoryOutput is the schema bound to the forced tool_use call. Providers
+// enforce this at the tool_use boundary, so the lenient JSON fallback ladder is
+// intentionally gone.
 type helperMemoryOutput struct {
 	ShouldRecall bool                 `json:"should_recall"`
 	GateReason   string               `json:"gate_reason,omitempty"`
@@ -158,9 +158,8 @@ func buildMemoryHelperSystemPrompt() string {
 	return sb.String()
 }
 
-// memoryHelperTool is the forced tool the helper must call. The
-// provider/gateway schema validator guarantees clean JSON in
-// FunctionCall.Arguments, so we don't need a lenient parser.
+// memoryHelperTool is the forced tool the helper must call. Providers enforce
+// the schema at the tool_use boundary, so we don't need a lenient parser.
 var memoryHelperTool = buildMemoryHelperTool()
 
 func buildMemoryHelperTool() client.Tool {
@@ -277,11 +276,9 @@ func NewMemoryPreflight(q MemoryPreflightQuerier, llm client.LLMClient) agent.Me
 			if trace != nil && trace.Outcome == "" {
 				trace.Outcome = "no_intents"
 			}
-			return nil
-		}
-		intents = sanitizeMemoryIntents(intents)
-		if len(intents) == 0 {
-			setMemoryPreflightOutcome(trace, "intents_sanitized_empty")
+			if memoryUsageNonZero(usage) {
+				return &agent.MemoryPreflightResult{Usage: usage}
+			}
 			return nil
 		}
 		if trace != nil {
@@ -313,6 +310,17 @@ func NewMemoryPreflight(q MemoryPreflightQuerier, llm client.LLMClient) agent.Me
 		setMemoryPreflightOutcome(trace, "context_returned")
 		return &agent.MemoryPreflightResult{Context: rendered, Usage: usage}
 	}
+}
+
+func memoryUsageNonZero(u client.Usage) bool {
+	return u.InputTokens != 0 ||
+		u.OutputTokens != 0 ||
+		u.TotalTokens != 0 ||
+		u.CostUSD != 0 ||
+		u.CacheReadTokens != 0 ||
+		u.CacheCreationTokens != 0 ||
+		u.CacheCreation5mTokens != 0 ||
+		u.CacheCreation1hTokens != 0
 }
 
 // DetectMemoryIntents compiles a user message into QueryIntent values.

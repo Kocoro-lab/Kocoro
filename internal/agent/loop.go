@@ -658,13 +658,13 @@ type AgentLoop struct {
 	// override); locks against auto-detect from observed model.
 	contextWindow         int
 	contextWindowExplicit bool
-	memoryDir             string      // directory containing MEMORY.md; re-read each Run(), write-before-compact target
-	stickyContext         string      // session-scoped facts injected verbatim into system prompt; never truncated
-	outputFormat          string      // "markdown" (default) or "plain" — controls formatting guidance in volatile context
+	memoryDir             string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
+	stickyContext         string             // session-scoped facts injected verbatim into system prompt; never truncated
+	outputFormat          string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
 	userFilePaths         []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
-	workingSet            *WorkingSet // session-scoped deferred schema cache injected by the caller
-	sessionID             string      // session ID for audit log correlation
-	sessionCWD            string      // session-scoped working directory; set by runner/TUI before Run()
+	workingSet            *WorkingSet        // session-scoped deferred schema cache injected by the caller
+	sessionID             string             // session ID for audit log correlation
+	sessionCWD            string             // session-scoped working directory; set by runner/TUI before Run()
 	deltaProvider         DeltaProvider
 	injectCh              chan InjectedMessage
 	injectedMessages      []string         // messages injected during the last Run(); cleared on each Run() call
@@ -1627,7 +1627,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			a.emitInternalUsage(preflight.Usage)
 			if privateContext := strings.TrimSpace(preflight.Context); privateContext != "" {
 				scaffoldedUserText = injectPrivateMemoryContext(scaffoldedUserText, scaffoldUserPayloadText, privateContext)
+				oldContent := messages[newMsgOffset].Content
 				messages[newMsgOffset] = replaceUserMessageText(messages[newMsgOffset], scaffoldedUserText)
+				client.LogCacheCompactEvent("preflight_inject", newMsgOffset, oldContent, messages[newMsgOffset].Content)
 				trace.ContextInjected = true
 			}
 		}
@@ -3847,9 +3849,9 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 	// are auto-approved (dragging a folder is intuitively "all of this").
 	if len(a.userFilePaths) > 0 {
 		if toolPath := extractToolPath(toolName, argsStr); toolPath != "" {
-			cleaned := filepath.Clean(toolPath)
+			cleaned := resolvePathForAttachmentMatch(toolPath)
 			for _, fp := range a.userFilePaths {
-				cleanedFp := filepath.Clean(fp.Path)
+				cleanedFp := resolvePathForAttachmentMatch(fp.Path)
 				if cleaned == cleanedFp {
 					return "allow", true
 				}
@@ -4099,6 +4101,29 @@ func extractToolPath(toolName, argsJSON string) string {
 		}
 	}
 	return ""
+}
+
+func resolvePathForAttachmentMatch(path string) string {
+	clean := filepath.Clean(path)
+	if real, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.Clean(real)
+	}
+	if !filepath.IsAbs(clean) {
+		return clean
+	}
+	dir := filepath.Dir(clean)
+	tail := filepath.Base(clean)
+	for {
+		if realDir, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Clean(filepath.Join(realDir, tail))
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return clean
+		}
+		tail = filepath.Join(filepath.Base(dir), tail)
+		dir = parent
+	}
 }
 
 // logAudit writes an audit entry if the auditor is configured.

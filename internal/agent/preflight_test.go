@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -46,6 +48,34 @@ func TestAgentLoop_MemoryPreflightInjectedButNotPersisted(t *testing.T) {
 	}
 	if strings.Contains(runMessages[0].Content.Text(), "<private_memory>") {
 		t.Fatalf("private memory leaked into run messages: %q", runMessages[0].Content.Text())
+	}
+}
+
+func TestAgentLoop_MemoryPreflightInjectionLogsCacheEvent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("SHANNON_CACHE_DEBUG", "1")
+
+	llm := &budgetCaptureLLMClient{responses: []*client.CompletionResponse{{
+		OutputText:   "ok",
+		FinishReason: "end_turn",
+		Usage:        client.Usage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12},
+	}}}
+	loop := NewAgentLoop(llm, NewToolRegistry(), "medium", t.TempDir(), 3, 2000, 200, nil, nil, nil)
+	loop.SetSkillDiscovery(false)
+	loop.SetMemoryPreflight(func(ctx context.Context, query string, opts MemoryPreflightOptions) *MemoryPreflightResult {
+		return &MemoryPreflightResult{Context: "<private_memory>\n- Example Contact via collaborated_with\n</private_memory>"}
+	})
+
+	if _, _, err := loop.Run(context.Background(), "who is Example Contact to me?", nil, nil); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(tmp, ".shannon", "logs", "cache-debug.log"))
+	if err != nil {
+		t.Fatalf("read cache log: %v", err)
+	}
+	if !strings.Contains(string(data), `"action":"preflight_inject"`) {
+		t.Fatalf("missing preflight_inject cache event:\n%s", data)
 	}
 }
 
