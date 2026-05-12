@@ -272,7 +272,7 @@ func buildStableContext(opts PromptOptions) string {
 		// ("this block is the user's persistent rules, not an injection")
 		// while staying inside the cacheable user-message prefix. Issue #125.
 		sb.WriteString(UserInstructionsTag + "\n")
-		sb.WriteString(sanitizeUserBlock(truncate(inst, maxInstructionsChars)))
+		sb.WriteString(SanitizeUserBlock(truncate(inst, maxInstructionsChars)))
 		sb.WriteString("\n</user_instructions>")
 	}
 
@@ -286,7 +286,7 @@ func buildStableContext(opts PromptOptions) string {
 		// trust-channel wrapper across every framework-injected block keeps
 		// the user-role surface uniform. Issue #125.
 		sb.WriteString("<system-reminder>\n## Session Facts\n")
-		sb.WriteString(sanitizeUserBlock(sticky))
+		sb.WriteString(SanitizeUserBlock(sticky))
 		sb.WriteString("\n</system-reminder>")
 	}
 
@@ -391,12 +391,13 @@ func truncate(s string, maxChars int) string {
 	return string(r[:maxChars]) + "\n[truncated]"
 }
 
-// sanitizeUserBlock strips wrapper closing tags from user-supplied content
-// so the envelope around it cannot be terminated early. We strip BOTH
-// `</user_instructions>` (used to wrap instructions.md) and
-// `</system-reminder>` (used to wrap sticky facts) — defense in depth, since
-// the same body could in principle be wrapped under either tag depending on
-// the call site and we don't want either to leak out as plain user content.
+// SanitizeUserBlock strips wrapper closing tags from user-supplied content
+// so the framework-wrapped envelope around it cannot be terminated early.
+// Strips `</user_instructions>` (wraps instructions.md), `</system-reminder>`
+// (wraps sticky facts / dynamic-tools listings), and `</private_memory>`
+// (wraps episodic-memory preflight context). Exported so other packages that
+// inject user-derived content into one of these envelopes (e.g.
+// internal/tools/memory_preflight) can apply the same defense.
 //
 // The asymmetry — strip closers but not openers — is deliberate. An opener
 // leaking through produces a nested but still well-formed wrapper (the body
@@ -405,9 +406,10 @@ func truncate(s string, maxChars int) string {
 // is the exact failure mode this PR exists to prevent. Stripping only
 // closers fixes the dangerous case without spending cycles on the safe one.
 // Issue #125.
-func sanitizeUserBlock(s string) string {
+func SanitizeUserBlock(s string) string {
 	s = strings.ReplaceAll(s, "</user_instructions>", "")
 	s = strings.ReplaceAll(s, "</system-reminder>", "")
+	s = strings.ReplaceAll(s, "</private_memory>", "")
 	return s
 }
 

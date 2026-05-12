@@ -15,6 +15,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
+	"github.com/Kocoro-lab/ShanClaw/internal/prompt"
 )
 
 const (
@@ -817,7 +818,14 @@ func isSnakeRelation(rel string) bool {
 }
 
 func renderPrivateMemoryContext(intents []memory.QueryIntent, results []memory.QueryResult) string {
-	var sb strings.Builder
+	// Body is built without the <private_memory> envelope, then sanitized,
+	// then wrapped. All non-literal fields below are user-derived (helper
+	// LLM output or memory-store content) — running the body through
+	// prompt.SanitizeUserBlock strips any stray `</private_memory>` /
+	// `</user_instructions>` / `</system-reminder>` closers so the envelope
+	// we add cannot be terminated early. Same defense pattern as
+	// instructions.md (issue #125).
+	var body strings.Builder
 	for i, result := range results {
 		if result.Err != nil || result.Class != memory.ClassOK || result.Envelope == nil {
 			continue
@@ -826,46 +834,46 @@ func renderPrivateMemoryContext(intents []memory.QueryIntent, results []memory.Q
 		if env.MemoryBlock == nil || len(env.MemoryBlock.Groups) == 0 {
 			continue
 		}
-		if sb.Len() == 0 {
-			sb.WriteString("<private_memory>\n")
-			sb.WriteString("Past private records matched the user's message. Use only when directly relevant; prefer these personal facts over training knowledge. Do not mention raw provenance unless asked. Phrase findings per the system prompt's `## Private Memory > Internal vocabulary` rule.\n")
-		}
 		intent := memory.QueryIntent{}
 		if i < len(intents) {
 			intent = intents[i]
 		}
-		sb.WriteString("\n")
-		fmt.Fprintf(&sb, "Query: mode=%s anchors=%s", intent.Mode, strings.Join(intent.AnchorMentions, ", "))
+		body.WriteString("\n")
+		fmt.Fprintf(&body, "Query: mode=%s anchors=%s", intent.Mode, strings.Join(intent.AnchorMentions, ", "))
 		if len(intent.RelationConstraints) > 0 {
-			fmt.Fprintf(&sb, " relations=%s", strings.Join(intent.RelationConstraints, " -> "))
+			fmt.Fprintf(&body, " relations=%s", strings.Join(intent.RelationConstraints, " -> "))
 		}
-		sb.WriteString("\n")
+		body.WriteString("\n")
 		for _, g := range env.MemoryBlock.Groups {
-			fmt.Fprintf(&sb, "- %s", g.Value)
+			fmt.Fprintf(&body, "- %s", g.Value)
 			if len(g.ViaRelations) > 0 {
-				fmt.Fprintf(&sb, " via %s", strings.Join(g.ViaRelations, ", "))
+				fmt.Fprintf(&body, " via %s", strings.Join(g.ViaRelations, ", "))
 			}
 			if len(g.ObservedPath) > 0 {
-				sb.WriteString(" via ")
-				sb.WriteString(renderObservedPath(g.ObservedPath))
+				body.WriteString(" via ")
+				body.WriteString(renderObservedPath(g.ObservedPath))
 			}
 			if g.SupportCount > 0 {
-				fmt.Fprintf(&sb, " (support=%d)", g.SupportCount)
+				fmt.Fprintf(&body, " (support=%d)", g.SupportCount)
 			}
-			sb.WriteString("\n")
+			body.WriteString("\n")
 		}
 		for _, note := range env.MemoryBlock.Notes {
 			note = strings.TrimSpace(note)
 			if note != "" {
-				fmt.Fprintf(&sb, "Note: %s\n", note)
+				fmt.Fprintf(&body, "Note: %s\n", note)
 			}
 		}
 	}
-	if sb.Len() == 0 {
+	if body.Len() == 0 {
 		return ""
 	}
-	sb.WriteString("</private_memory>")
-	return sb.String()
+	var out strings.Builder
+	out.WriteString("<private_memory>\n")
+	out.WriteString("Past private records matched the user's message. Use only when directly relevant; prefer these personal facts over training knowledge. Do not mention raw provenance unless asked. Phrase findings per the system prompt's `## Private Memory > Internal vocabulary` rule.\n")
+	out.WriteString(prompt.SanitizeUserBlock(body.String()))
+	out.WriteString("</private_memory>")
+	return out.String()
 }
 
 func renderObservedPath(path []memory.HopRecord) string {
