@@ -1054,10 +1054,13 @@ agent:
 
 Or toggle from Desktop: Settings → Suggestions → Enable next-prompt suggestion.
 
-**Cost:** Each suggestion call adds ≈80% of one main-turn cost. With
-`speculation_enabled: true` (pre-runs the next reply), total per-turn cost
-roughly doubles. Disabled by default. Skipped when the prompt cache is cold
-(see `cache_cold_threshold_tokens`).
+**Cost:** Depends on whether `agent.thinking` is enabled. Without thinking,
+each suggestion call is cheap (≈ 5-20% of one main-turn — input mostly
+cache_read, output capped at ~30 tokens by the filter). With thinking
+enabled, the fork inherits the same `thinking.budget_tokens` (cannot be
+trimmed without invalidating Anthropic's cache key), so cost rises to
+≈ 50-90% of one main-turn. Disabled by default. Skipped when the prompt
+cache is cold (see `cache_cold_threshold_tokens`).
 
 ## Memory (Kocoro Cloud feature)
 

@@ -71,12 +71,12 @@ Global settings control how Shannon behaves across all agents — which AI model
 
 After each assistant turn, the daemon can generate a single 2-12 word
 suggestion for the user's next message and render it as ghost text in the
-input field. Optional speculation pre-runs the response so acceptance is instant.
+input field. The user presses Tab / right-arrow to fill the input, then Enter
+to send — no speculative pre-run of the next assistant reply.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `false` | Master switch. When `false`, no suggestion calls fire. |
-| `speculation_enabled` | bool | `false` | Pre-run the response assuming the user accepts. Doubles per-turn cost. Requires `enabled: true`. |
 | `cache_cold_threshold_tokens` | int | `10000` | Skip suggestion when previous turn's uncached input tokens exceed this. Protects against full-price calls. `0` disables the gate. |
 | `min_turns` | int | `2` | Skip suggestion until this many turns have completed. First-turn predictions are usually unhelpful. |
 
@@ -86,14 +86,17 @@ Example:
 agent:
   prompt_suggestion:
     enabled: true
-    speculation_enabled: false
     cache_cold_threshold_tokens: 10000
     min_turns: 2
 ```
 
-**Cost note:** With a warm prompt cache, each suggestion call ≈ 80% of one
-main-turn cost. Speculation adds another ~80%. Disabled by default — opt in
-explicitly per user preference (Desktop has a global toggle wired to this key).
+**Cost note:** Each suggestion call's cost depends on whether `agent.thinking`
+is enabled. With thinking off + a warm prompt cache, suggestion ≈ 5-20% of one
+main-turn cost (input mostly cache_read, output capped at ~30 tokens). With
+thinking on, the fork inherits the same `thinking.budget_tokens` (cannot be
+trimmed without invalidating the cache key), so cost rises to ≈ 50-90% of
+one main-turn. Disabled by default — opt in explicitly via this config or
+the Desktop toggle.
 
 ## memory.* (Phase 2.3 — Kocoro Cloud memory feature)
 

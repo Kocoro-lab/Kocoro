@@ -69,12 +69,12 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 ### `GET /agents/{name}/sessions/{id}/suggestion`
 
 Returns the latest prompt suggestion for the given session, or 404 if none.
+Default-agent equivalent: `GET /sessions/{id}/suggestion`.
 
 Response (200):
 ```json
 {
   "text": "rerun the failing test",
-  "has_speculation": true,
   "suggested_at_unix": 1715500000
 }
 ```
@@ -86,46 +86,35 @@ Errors:
 
 ### `POST /agents/{name}/sessions/{id}/suggestion/accept`
 
-Marks the current suggestion as accepted and returns the speculated response
-(if available). Desktop displays `speculated_response` instantly and skips
-the normal LLM round-trip for the accepted suggestion. The daemon atomically
-persists the (user="suggestion text", assistant="speculated response") message
-pair to the session before returning — so the next turn's context contains
-exactly what Desktop showed the user.
+Marks the current suggestion as accepted and returns the suggestion text
+so Desktop can fill the input. The user still presses Enter to send — the
+normal `POST /agents/{name}/messages` flow handles persistence. There is
+no speculative pre-run of the next assistant reply.
+
+Default-agent equivalent: `POST /sessions/{id}/suggestion/accept`.
 
 Response (200):
 ```json
 {
   "text": "rerun the failing test",
   "suggestion": "rerun the failing test",
-  "speculated_response": "Running the test suite now...",
-  "has_speculation": true,
   "suggested_at_unix": 1715500000
 }
 ```
-
-When speculation is unavailable (feature disabled, speculation in flight, or
-persist failed), `speculated_response` is omitted from the JSON. Desktop
-falls back to a normal `POST /agents/{name}/messages` send in that case.
 
 Errors: same shape as the GET endpoint.
 
 ### SSE event `suggestion_ready`
 
-Emitted on `/events` when a new suggestion (or speculation) is generated.
-Payload:
+Emitted on `/events` when a new suggestion is generated. Payload:
 
 ```json
 {
   "session_id": "sess_abc",
   "agent": "myagent",
-  "text": "rerun the failing test",
-  "has_speculation": false
+  "text": "rerun the failing test"
 }
 ```
-
-A second event with `"has_speculation": true` follows ~1-3 seconds later
-when speculation completes (only if `agent.prompt_suggestion.speculation_enabled: true`).
 
 Wire format follows the HTML5 EventSource spec (two lines per event,
 separated by a blank line):

@@ -1460,7 +1460,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					// predicts the user's NEXT message after seeing the
 					// assistant's response (not a stale follow-up to
 					// the prior user turn).
-					go fireSuggestionAfterRun(context.Background(), deps, agentName, sess.ID, mainReq, ps, result)
+					go fireSuggestionAfterRun(context.Background(), deps, agentName, sess.ID, mainReq, result)
 				}
 			}
 		}
@@ -1559,7 +1559,7 @@ func countAssistantTurns(messages []client.Message) int {
 // can verify the suggestion path is hitting the main turn's prompt cache.
 // Without this telemetry there's no signal that the feature is paying
 // warm-cache pricing as designed.
-func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, sessionID string, main client.CompletionRequest, ps config.PromptSuggestionConfig, assistantReply string) {
+func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, sessionID string, main client.CompletionRequest, assistantReply string) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("daemon: prompt_suggestion panic: %v", rec)
@@ -1636,10 +1636,9 @@ func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, se
 
 	if deps.EventBus != nil {
 		payload, _ := json.Marshal(map[string]any{
-			"session_id":      sessionID,
-			"agent":           agentName,
-			"text":            res.Text,
-			"has_speculation": false,
+			"session_id": sessionID,
+			"agent":      agentName,
+			"text":       res.Text,
 		})
 		deps.EventBus.Emit(Event{Type: EventSuggestionReady, Payload: payload})
 	}
@@ -1656,49 +1655,6 @@ func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, se
 			CacheCreationTokens: res.Usage.CacheCreationTokens,
 			CostUSD:             res.Usage.CostUSD,
 			InputSummary:        fmt.Sprintf("agent=%s text_len=%d", agentName, len(res.Text)),
-		})
-	}
-
-	if !ps.SpeculationEnabled {
-		return
-	}
-
-	specRes, err := agent.RunSpeculationWithUsage(ctx, deps.GW, main, res.Text)
-	if err != nil || specRes.Text == "" {
-		if err != nil && deps.Auditor != nil {
-			deps.Auditor.Log(audit.AuditEntry{
-				Timestamp:    time.Now(),
-				SessionID:    sessionID,
-				Event:        "prompt_speculation_error",
-				InputSummary: fmt.Sprintf("agent=%s err=%v", agentName, err),
-			})
-		}
-		return
-	}
-	deps.Suggestions.SetSpeculation(sessionID, res.Text, specRes.Text)
-
-	if deps.EventBus != nil {
-		payload, _ := json.Marshal(map[string]any{
-			"session_id":      sessionID,
-			"agent":           agentName,
-			"text":            res.Text,
-			"has_speculation": true,
-		})
-		deps.EventBus.Emit(Event{Type: EventSuggestionReady, Payload: payload})
-	}
-
-	if deps.Auditor != nil {
-		deps.Auditor.Log(audit.AuditEntry{
-			Timestamp:           time.Now(),
-			SessionID:           sessionID,
-			Event:               "prompt_speculation_completed",
-			Model:               specRes.Model,
-			InputTokens:         specRes.Usage.InputTokens,
-			OutputTokens:        specRes.Usage.OutputTokens,
-			CacheReadTokens:     specRes.Usage.CacheReadTokens,
-			CacheCreationTokens: specRes.Usage.CacheCreationTokens,
-			CostUSD:             specRes.Usage.CostUSD,
-			InputSummary:        fmt.Sprintf("agent=%s suggestion_len=%d response_len=%d", agentName, len(res.Text), len(specRes.Text)),
 		})
 	}
 }

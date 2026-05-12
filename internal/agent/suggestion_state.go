@@ -11,12 +11,7 @@ type Suggestion struct {
 	Text string
 	// SuggestedAt is the time GenerateSuggestion returned successfully.
 	SuggestedAt time.Time
-	// SpeculationText is the pre-run assistant response if speculation
-	// completed; empty if speculation is disabled, in flight, or failed.
-	SpeculationText string
 	// AcceptedAt is non-nil if the user accepted via POST /suggestion/accept.
-	// The runner uses this to skip the next main-turn LLM call when the
-	// speculated response is served instantly.
 	AcceptedAt *time.Time
 }
 
@@ -130,19 +125,3 @@ func (s *SuggestionState) MarkAccepted(sessionID string) bool {
 	return true
 }
 
-// SetSpeculation stores the pre-run response for the suggestion identified
-// by (sessionID, suggestionText). If the current suggestion has been
-// superseded (different text) or no entry exists, the speculation is silently
-// discarded — stale speculations must not overwrite live state.
-func (s *SuggestionState) SetSpeculation(sessionID, suggestionText, speculation string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v, ok := s.items[sessionID]
-	if !ok {
-		return
-	}
-	if v.Text != suggestionText {
-		return // stale — current suggestion has moved on
-	}
-	v.SpeculationText = speculation
-}

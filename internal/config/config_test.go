@@ -319,9 +319,6 @@ func TestPromptSuggestionConfig_Defaults(t *testing.T) {
 	if cfg.Agent.PromptSuggestion.Enabled {
 		t.Error("PromptSuggestion.Enabled should default to false")
 	}
-	if cfg.Agent.PromptSuggestion.SpeculationEnabled {
-		t.Error("PromptSuggestion.SpeculationEnabled should default to false")
-	}
 	if cfg.Agent.PromptSuggestion.CacheColdThresholdTokens != 10000 {
 		t.Errorf("CacheColdThresholdTokens default = %d, want 10000",
 			cfg.Agent.PromptSuggestion.CacheColdThresholdTokens)
@@ -341,7 +338,6 @@ func TestPromptSuggestionConfig_OverlayMerge(t *testing.T) {
 	yaml := `agent:
   prompt_suggestion:
     enabled: true
-    speculation_enabled: true
     cache_cold_threshold_tokens: 20000
     min_turns: 1
 `
@@ -355,9 +351,6 @@ func TestPromptSuggestionConfig_OverlayMerge(t *testing.T) {
 
 	if !cfg.Agent.PromptSuggestion.Enabled {
 		t.Error("expected enabled=true after overlay")
-	}
-	if !cfg.Agent.PromptSuggestion.SpeculationEnabled {
-		t.Error("expected speculation_enabled=true after overlay")
 	}
 	if cfg.Agent.PromptSuggestion.CacheColdThresholdTokens != 20000 {
 		t.Errorf("got %d, want 20000", cfg.Agent.PromptSuggestion.CacheColdThresholdTokens)

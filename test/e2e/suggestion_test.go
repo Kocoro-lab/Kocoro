@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,18 +21,12 @@ import (
 // fakeGateway mimics the cloud gateway's POST /v1/completions endpoint for
 // offline E2E coverage. It captures every CompletionRequest it sees so the
 // test can assert on the forked-request fields (ForkedKind, SkipCacheWrite)
-// that the suggestion + speculation paths set. Responses are selected by
-// inspecting the last message's text — the suggestion path appends
-// SuggestionPrompt; speculation appends the filtered suggestion text.
+// that the suggestion path sets.
 type fakeGateway struct {
 	mu       sync.Mutex
 	requests []client.CompletionRequest
-	// suggestionText is what the gateway returns for the suggestion call
-	// (the one whose last message contains agent.SuggestionPrompt).
-	suggestionText string
-	// speculationText is what the gateway returns for the speculation call
-	// (the one whose last message contains the filtered suggestion text).
-	speculationText string
+	// reply is what the gateway returns for every call.
+	reply string
 }
 
 func (g *fakeGateway) requestCount() int {
@@ -63,28 +56,13 @@ func (g *fakeGateway) handler() http.Handler {
 		}
 		g.mu.Lock()
 		g.requests = append(g.requests, req)
+		reply := g.reply
 		g.mu.Unlock()
-
-		// Pick a response by sniffing the last message's text content. We
-		// can't use MessageContent.Text() here because UnmarshalJSON already
-		// folded a string-content into mc.text — handy.
-		var last string
-		if n := len(req.Messages); n > 0 {
-			last = req.Messages[n-1].Content.Text()
-		}
-
-		var output string
-		switch {
-		case strings.Contains(last, "Predict the user's most likely next message"):
-			output = g.suggestionText
-		default:
-			output = g.speculationText
-		}
 
 		resp := client.CompletionResponse{
 			Provider:   "anthropic",
 			Model:      "claude-sonnet-4-6",
-			OutputText: output,
+			OutputText: reply,
 			Usage: client.Usage{
 				InputTokens:     1200,
 				OutputTokens:    30,
@@ -100,8 +78,7 @@ func (g *fakeGateway) handler() http.Handler {
 
 // newSuggestionDeps wires the minimum daemon state needed to drive the
 // prompt-suggestion handlers: an AgentsDir with "myagent", a SessionCache
-// rooted in a temp shannon dir, and a pre-seeded session ready for accept
-// to append onto.
+// rooted in a temp shannon dir, and a pre-seeded session.
 func newSuggestionDeps(t *testing.T, gw *client.GatewayClient) (*daemon.ServerDeps, string, string) {
 	t.Helper()
 
@@ -141,54 +118,35 @@ func newSuggestionDeps(t *testing.T, gw *client.GatewayClient) (*daemon.ServerDe
 }
 
 // TestE2E_PromptSuggestion_HappyPath verifies the production happy path:
-// fake gateway → real GatewayClient → agent.GenerateSuggestion / RunSpeculation
-// → SuggestionState → GET /suggestion serves the cached suggestion → POST
-// /accept persists (suggestion, speculated_response) to the session.
+// fake gateway → real GatewayClient → agent.GenerateSuggestionWithUsage →
+// SuggestionState → GET /suggestion serves the cached suggestion → POST
+// /accept consumes it.
 //
 // Scope (option II from the plan): exercises the suggestion package through
 // the real *GatewayClient, then drives the daemon's real HTTP handlers via
 // *Server.Handler(). The post-Run hook in RunAgent (which invokes
 // fireSuggestionAfterRun as a goroutine) is unexported and is not exercised
-// directly here; the test inlines the same call sequence (GenerateSuggestion
-// → state.Set → bus.Emit → RunSpeculation → state.SetSpeculation → bus.Emit)
-// so any drift between the two paths is caught by unit tests in
-// internal/daemon/runner_test.go rather than this E2E.
+// directly here — internal/daemon/runner_test.go covers that path.
 func TestE2E_PromptSuggestion_HappyPath(t *testing.T) {
-	const (
-		expectedSuggestion = "fix the bug"
-		expectedResponse   = "Here is the fix"
-	)
+	const expectedSuggestion = "fix the bug"
 
-	gw := &fakeGateway{
-		suggestionText:  expectedSuggestion,
-		speculationText: expectedResponse,
-	}
+	gw := &fakeGateway{reply: expectedSuggestion}
 	gwServer := httptest.NewServer(gw.handler())
 	defer gwServer.Close()
 
 	gwClient := client.NewGatewayClient(gwServer.URL, "test-api-key")
-
 	deps, agentName, sessionID := newSuggestionDeps(t, gwClient)
+	bus := daemon.NewEventBus()
+	deps.EventBus = bus
+	eventCh := bus.Subscribe()
 
+	// NewServer wires deps.Suggestions automatically (server.go:149).
 	srv := daemon.NewServer(0, nil, deps, "test")
 	httpServer := httptest.NewServer(srv.Handler())
 	defer httpServer.Close()
 
-	bus := deps.EventBus
-	if bus == nil {
-		// NewServer does not auto-wire deps.EventBus; the runner uses
-		// s.eventBus via the closure. We create one here to verify the
-		// payload shape that production code emits.
-		bus = daemon.NewEventBus()
-		deps.EventBus = bus
-	}
-	eventCh := bus.Subscribe()
-	defer bus.Unsubscribe(eventCh)
-
-	// Synthesize the "main" CompletionRequest that production code captures
-	// from the last LLM call and forwards into fireSuggestionAfterRun. We
-	// only need a couple of messages — the SuggestionPrompt is appended by
-	// BuildForkedSuggestionRequest.
+	// Build the main turn's snapshot. Real production gets this from
+	// loop.LastSentRequest(); we synthesize one with the same shape.
 	main := client.CompletionRequest{
 		Messages: []client.Message{
 			{Role: "user", Content: client.NewTextContent("hello there")},
@@ -217,51 +175,26 @@ func TestE2E_PromptSuggestion_HappyPath(t *testing.T) {
 	}
 
 	deps.Suggestions.Set(sessionID, sugRes.Text, time.Now())
-	emitSuggestionEvent(bus, sessionID, agentName, sugRes.Text, false)
+	emitSuggestionEvent(bus, sessionID, agentName, sugRes.Text)
 
-	// Speculation path — same fake gateway, branches on last-message text.
-	specRes, err := agent.RunSpeculationWithUsage(ctx, gwClient, main, sugRes.Text)
-	if err != nil {
-		t.Fatalf("RunSpeculationWithUsage: %v", err)
-	}
-	if specRes.Text != expectedResponse {
-		t.Fatalf("speculation text = %q, want %q", specRes.Text, expectedResponse)
-	}
-	deps.Suggestions.SetSpeculation(sessionID, sugRes.Text, specRes.Text)
-	emitSuggestionEvent(bus, sessionID, agentName, sugRes.Text, true)
-
-	// Assert both gateway calls hit /v1/completions with the on-wire
-	// cache-safety flag the suggestion package promises (SkipCacheWrite=true).
-	// ForkedKind is intentionally stripped before transmission (json:"-")
-	// because it is SHANNON_CACHE_DEBUG-only telemetry — cache-debug.log
-	// correlation lives client-side; nothing on the gateway needs it. Tagging
-	// of ForkedKind is covered by forkedrequest_test.go's byte-equality test.
-	if got := gw.requestCount(); got != 2 {
-		t.Fatalf("gateway request count = %d, want 2", got)
+	// Exactly one gateway call (suggestion only — speculation is gone).
+	if got := gw.requestCount(); got != 1 {
+		t.Fatalf("gateway request count = %d, want 1", got)
 	}
 	sugReq := gw.requestAt(0)
-	specReq := gw.requestAt(1)
-	if !sugReq.SkipCacheWrite || !specReq.SkipCacheWrite {
-		t.Errorf("forked calls should set SkipCacheWrite=true; got sugReq=%v specReq=%v",
-			sugReq.SkipCacheWrite, specReq.SkipCacheWrite)
+	if !sugReq.SkipCacheWrite {
+		t.Errorf("forked suggestion call should set SkipCacheWrite=true")
 	}
-	// Validate the appended messages contain the expected prompts so we
-	// know the fake gateway's last-message switch actually steered each
-	// call to the right scripted response.
-	if n := len(sugReq.Messages); n == 0 || !strings.Contains(sugReq.Messages[n-1].Content.Text(), "Predict the user's most likely next message") {
+	// Validate the appended message is SuggestionPrompt.
+	if n := len(sugReq.Messages); n == 0 ||
+		sugReq.Messages[n-1].Content.Text() == "" ||
+		!stringContains(sugReq.Messages[n-1].Content.Text(), "Predict the user's most likely next message") {
 		t.Errorf("suggestion request last message should be SuggestionPrompt; got %d msgs", n)
 	}
-	if n := len(specReq.Messages); n == 0 || specReq.Messages[n-1].Content.Text() != expectedSuggestion {
-		t.Errorf("speculation request last message should be suggestion text %q; got msgs=%+v", expectedSuggestion, specReq.Messages)
-	}
 
-	// EventBus must have observed both ready events (suggestion-only first,
-	// then has_speculation=true after the speculation call lands).
-	if err := waitForReadyEvent(eventCh, sessionID, false, 1*time.Second); err != nil {
-		t.Fatalf("first ready event: %v", err)
-	}
-	if err := waitForReadyEvent(eventCh, sessionID, true, 1*time.Second); err != nil {
-		t.Fatalf("speculation ready event: %v", err)
+	// EventBus saw the suggestion_ready event.
+	if err := waitForReadyEvent(eventCh, sessionID, 1*time.Second); err != nil {
+		t.Fatalf("ready event: %v", err)
 	}
 
 	// GET /suggestion — Desktop poll path.
@@ -284,88 +217,71 @@ func TestE2E_PromptSuggestion_HappyPath(t *testing.T) {
 	if getBody["text"] != expectedSuggestion {
 		t.Errorf("GET suggestion text = %v, want %q", getBody["text"], expectedSuggestion)
 	}
-	if hs, _ := getBody["has_speculation"].(bool); !hs {
-		t.Errorf("GET suggestion has_speculation = %v, want true", getBody["has_speculation"])
-	}
 
-	// POST /suggestion/accept — Desktop instant-display path; must persist
-	// the (suggestion, speculated_response) pair to the session atomically.
-	postURL := httpServer.URL + "/agents/" + agentName + "/sessions/" + sessionID + "/suggestion/accept"
-	postResp, err := http.Post(postURL, "application/json", nil)
+	// POST /accept — Desktop fills input + user presses Enter.
+	acceptURL := httpServer.URL + "/agents/" + agentName + "/sessions/" + sessionID + "/suggestion/accept"
+	acceptResp, err := http.Post(acceptURL, "application/json", nil)
 	if err != nil {
 		t.Fatalf("POST accept: %v", err)
 	}
-	if postResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(postResp.Body)
-		postResp.Body.Close()
-		t.Fatalf("POST accept status = %d, body = %s", postResp.StatusCode, body)
+	if acceptResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(acceptResp.Body)
+		acceptResp.Body.Close()
+		t.Fatalf("POST accept status = %d, body = %s", acceptResp.StatusCode, body)
 	}
 	var acceptBody map[string]any
-	if err := json.NewDecoder(postResp.Body).Decode(&acceptBody); err != nil {
-		postResp.Body.Close()
+	if err := json.NewDecoder(acceptResp.Body).Decode(&acceptBody); err != nil {
+		acceptResp.Body.Close()
 		t.Fatalf("decode accept body: %v", err)
 	}
-	postResp.Body.Close()
+	acceptResp.Body.Close()
+	if acceptBody["text"] != expectedSuggestion {
+		t.Errorf("accept text = %v, want %q", acceptBody["text"], expectedSuggestion)
+	}
 	if acceptBody["suggestion"] != expectedSuggestion {
-		t.Errorf("accept suggestion = %v, want %q", acceptBody["suggestion"], expectedSuggestion)
+		t.Errorf("accept suggestion = %v, want %q (echoed)", acceptBody["suggestion"], expectedSuggestion)
 	}
-	if acceptBody["speculated_response"] != expectedResponse {
-		t.Errorf("accept speculated_response = %v, want %q", acceptBody["speculated_response"], expectedResponse)
-	}
-
-	// Confirm SuggestionState was cleared by /accept — the suggestion is
-	// consumed once the user has acted on it (prevents stale re-serve on a
-	// duplicate poll).
-	if _, ok := deps.Suggestions.Get(sessionID); ok {
-		t.Error("expected SuggestionState to be cleared after /accept")
+	if _, hasField := acceptBody["speculated_response"]; hasField {
+		t.Errorf("accept body should NOT contain speculated_response: %v", acceptBody)
 	}
 
-	// Session must now have the two appended messages persisted, ready for
-	// the next turn's context.
-	sessMgr := deps.SessionCache.GetOrCreate(agentName)
-	persisted, err := sessMgr.Load(sessionID)
+	// After accept, GET /suggestion 404s (Clear consumed it).
+	resp2, err := http.Get(getURL)
 	if err != nil {
-		t.Fatalf("reload session: %v", err)
+		t.Fatalf("GET suggestion (post-accept): %v", err)
 	}
-	if got, want := len(persisted.Messages), 4; got != want {
-		t.Fatalf("messages after accept = %d, want %d (2 seed + 2 appended)", got, want)
-	}
-	if persisted.Messages[2].Role != "user" || persisted.Messages[2].Content.Text() != expectedSuggestion {
-		t.Errorf("appended user msg = %+v, want role=user content=%q", persisted.Messages[2], expectedSuggestion)
-	}
-	if persisted.Messages[3].Role != "assistant" || persisted.Messages[3].Content.Text() != expectedResponse {
-		t.Errorf("appended assistant msg = %+v, want role=assistant content=%q", persisted.Messages[3], expectedResponse)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotFound {
+		t.Errorf("GET suggestion post-accept status = %d, want 404 (Clear should have consumed it)", resp2.StatusCode)
 	}
 }
 
 // TestE2E_PromptSuggestion_FilteredOutput verifies that a model reply
-// rejected by FilterSuggestion does not produce a stored suggestion or an
-// SSE event — the silent-failure mode that protects users from low-quality
-// model output. Speculation is intentionally not exercised because the
-// runner skips it when the suggestion filter rejects.
+// rejected by FilterSuggestion (e.g., "skip") results in no SSE event,
+// no suggestion stored, and GET /suggestion 404.
 func TestE2E_PromptSuggestion_FilteredOutput(t *testing.T) {
-	gw := &fakeGateway{
-		// "skip" is a meta-marker the filter rejects unconditionally.
-		suggestionText:  "skip",
-		speculationText: "should not be requested",
-	}
+	gw := &fakeGateway{reply: "skip"} // FilterSuggestion rejects "skip"
 	gwServer := httptest.NewServer(gw.handler())
 	defer gwServer.Close()
-	gwClient := client.NewGatewayClient(gwServer.URL, "test-api-key")
 
-	deps, _, sessionID := newSuggestionDeps(t, gwClient)
+	gwClient := client.NewGatewayClient(gwServer.URL, "test-api-key")
+	deps, agentName, sessionID := newSuggestionDeps(t, gwClient)
+	bus := daemon.NewEventBus()
+	deps.EventBus = bus
+
+	// NewServer wires deps.Suggestions automatically (server.go:149).
 	srv := daemon.NewServer(0, nil, deps, "test")
 	httpServer := httptest.NewServer(srv.Handler())
 	defer httpServer.Close()
 
 	main := client.CompletionRequest{
-		Messages: []client.Message{
-			{Role: "user", Content: client.NewTextContent("hello")},
-		},
-		SessionID: sessionID,
+		Messages:    []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
+		ModelTier:   "medium",
+		SessionID:   sessionID,
+		CacheSource: "shanclaw",
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	res, err := agent.GenerateSuggestionWithUsage(ctx, gwClient, main)
@@ -373,73 +289,73 @@ func TestE2E_PromptSuggestion_FilteredOutput(t *testing.T) {
 		t.Fatalf("GenerateSuggestionWithUsage: %v", err)
 	}
 	if res.Text != "" {
-		t.Fatalf("filter should have rejected %q; got non-empty text = %q", gw.suggestionText, res.Text)
+		t.Errorf("filtered suggestion text = %q, want empty", res.Text)
 	}
-	if res.Usage.CacheReadTokens != 1150 {
-		t.Errorf("usage should be populated even on filter rejection; cache_read_tokens = %d", res.Usage.CacheReadTokens)
+	// Gateway was called but no Set fired.
+	if gw.requestCount() != 1 {
+		t.Errorf("gateway should still be called once (filter happens client-side)")
+	}
+	if _, present := deps.Suggestions.Get(sessionID); present {
+		t.Error("filtered suggestion should not land in state")
 	}
 
-	// GET must 404 — no suggestion was stored.
-	getURL := httpServer.URL + "/agents/myagent/sessions/" + sessionID + "/suggestion"
+	getURL := httpServer.URL + "/agents/" + agentName + "/sessions/" + sessionID + "/suggestion"
 	resp, err := http.Get(getURL)
 	if err != nil {
-		t.Fatalf("GET suggestion: %v", err)
+		t.Fatalf("GET: %v", err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("GET status = %d, want 404 after filter rejection", resp.StatusCode)
-	}
-
-	// Only one gateway call was made — speculation must NOT be invoked when
-	// the suggestion filter rejects.
-	if gw.requestCount() != 1 {
-		t.Errorf("gateway request count = %d, want 1 (speculation must be skipped)", gw.requestCount())
+		t.Errorf("GET status = %d, want 404 (no suggestion stored)", resp.StatusCode)
 	}
 }
 
 // emitSuggestionEvent mirrors the daemon's post-Run hook event shape so the
-// EventBus subscriber assertion exercises the same JSON wire format Desktop
-// will parse.
-func emitSuggestionEvent(bus *daemon.EventBus, sessionID, agentName, text string, hasSpec bool) {
+// test exercises the SSE encoding path even though we don't drive RunAgent
+// directly.
+func emitSuggestionEvent(bus *daemon.EventBus, sessionID, agentName, text string) {
 	payload, _ := json.Marshal(map[string]any{
-		"session_id":      sessionID,
-		"agent":           agentName,
-		"text":            text,
-		"has_speculation": hasSpec,
+		"session_id": sessionID,
+		"agent":      agentName,
+		"text":       text,
 	})
 	bus.Emit(daemon.Event{Type: daemon.EventSuggestionReady, Payload: payload})
 }
 
-// waitForReadyEvent drains the bus channel until a suggestion_ready event
-// matching (sessionID, hasSpec) arrives or the deadline expires.
-func waitForReadyEvent(ch <-chan daemon.Event, sessionID string, hasSpec bool, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+// waitForReadyEvent blocks until a matching suggestion_ready event appears.
+func waitForReadyEvent(ch <-chan daemon.Event, sessionID string, timeout time.Duration) error {
+	deadline := time.After(timeout)
+	for {
 		select {
-		case evt := <-ch:
-			if evt.Type != daemon.EventSuggestionReady {
+		case ev := <-ch:
+			if ev.Type != daemon.EventSuggestionReady {
 				continue
 			}
-			var p map[string]any
-			if err := json.Unmarshal(evt.Payload, &p); err != nil {
-				return err
+			var payload map[string]any
+			if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+				continue
 			}
-			gotSession, _ := p["session_id"].(string)
-			gotHas, _ := p["has_speculation"].(bool)
-			if gotSession == sessionID && gotHas == hasSpec {
-				return nil
+			if payload["session_id"] != sessionID {
+				continue
 			}
-		case <-time.After(timeout):
-			return errTimeout
+			return nil
+		case <-deadline:
+			return &timeoutErr{}
 		}
 	}
-	return errTimeout
 }
-
-// errTimeout is a sentinel for waitForReadyEvent so the call sites can
-// distinguish "no event arrived" from a marshal/parse failure.
-var errTimeout = &timeoutErr{}
 
 type timeoutErr struct{}
 
 func (*timeoutErr) Error() string { return "timed out waiting for suggestion_ready event" }
+
+// stringContains is a tiny inline helper to avoid importing strings just for
+// one substring check.
+func stringContains(s, substr string) bool {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

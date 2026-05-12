@@ -50,32 +50,6 @@ func TestSuggestionState_MarkAccepted_AbsentSession(t *testing.T) {
 	}
 }
 
-func TestSuggestionState_SetSpeculation(t *testing.T) {
-	s := NewSuggestionState()
-	s.Set("sess1", "fix the bug", time.Now())
-	s.SetSpeculation("sess1", "fix the bug", "Here's the fix: ...")
-
-	got, _ := s.Get("sess1")
-	if got.SpeculationText != "Here's the fix: ..." {
-		t.Errorf("SpeculationText = %q, want %q", got.SpeculationText, "Here's the fix: ...")
-	}
-}
-
-func TestSuggestionState_SetSpeculation_StaleIgnored(t *testing.T) {
-	// If user already moved on to a new suggestion, late-arriving speculation
-	// for the old suggestion must not overwrite current state.
-	s := NewSuggestionState()
-	s.Set("sess1", "first", time.Now())
-	s.Set("sess1", "second", time.Now())
-	// Late speculation for "first" — must be ignored
-	s.SetSpeculation("sess1", "first", "stale response")
-
-	got, _ := s.Get("sess1")
-	if got.SpeculationText != "" {
-		t.Errorf("expected stale speculation to be ignored, got %q", got.SpeculationText)
-	}
-}
-
 func TestSuggestionState_GetReturnsCopy(t *testing.T) {
 	// Get must return a copy so callers can't mutate internal state via the pointer.
 	s := NewSuggestionState()

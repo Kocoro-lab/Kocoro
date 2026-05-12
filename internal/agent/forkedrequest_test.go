@@ -165,21 +165,16 @@ func TestBuildForkedRequest_ToolsAllowlist_EmptyBlocksAll(t *testing.T) {
 	}
 }
 
-// TestForkedRequest_DebugTagging confirms the suggestion / speculation
-// wrappers stamp the off-wire ForkedKind field so SHANNON_CACHE_DEBUG
-// log lines can be filtered by fork type. The field is json:"-" so it
-// never reaches the gateway, but it surfaces in the local debug log.
+// TestForkedRequest_DebugTagging confirms the suggestion wrapper stamps
+// the off-wire ForkedKind field so SHANNON_CACHE_DEBUG log lines can be
+// filtered by fork type. The field is json:"-" so it never reaches the
+// gateway, but it surfaces in the local debug log.
 func TestForkedRequest_DebugTagging(t *testing.T) {
 	main := client.CompletionRequest{Messages: []client.Message{{Role: "user", Content: client.NewTextContent("hi")}}}
 
 	forked := BuildForkedSuggestionRequest(main)
 	if forked.ForkedKind != "suggestion" {
 		t.Errorf("ForkedKind = %q, want suggestion", forked.ForkedKind)
-	}
-
-	spec := BuildSpeculationRequest(main, "next thing to do")
-	if spec.ForkedKind != "speculation" {
-		t.Errorf("ForkedKind = %q, want speculation", spec.ForkedKind)
 	}
 }
 

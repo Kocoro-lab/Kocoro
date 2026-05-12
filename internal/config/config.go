@@ -87,9 +87,10 @@ type AgentConfig struct {
 	// PromptSuggestion controls the ghost-text "next prompt" suggestion that
 	// appears in the Desktop follow-up input after each assistant turn.
 	// Disabled by default. When enabled, after each turn the daemon runs a
-	// forked completion call to generate a single 2-12 word suggestion. With
-	// SpeculationEnabled, a second forked AgentLoop pre-runs the response to
-	// that suggestion so acceptance is instant.
+	// forked completion call to generate a single 2-12 word suggestion that
+	// Desktop renders as ghost text. Acceptance fills the input but still
+	// requires the user to press Enter — there is no speculative pre-run of
+	// the next assistant reply (intentional design — see plan).
 	PromptSuggestion PromptSuggestionConfig `mapstructure:"prompt_suggestion" yaml:"prompt_suggestion" json:"prompt_suggestion"`
 }
 
@@ -110,11 +111,6 @@ type PromptSuggestionConfig struct {
 	// Enabled is the master switch. When false the entire feature is dormant —
 	// no forked calls, no SSE events, no Desktop ghost text. Default: false.
 	Enabled bool `mapstructure:"enabled" yaml:"enabled" json:"enabled"`
-
-	// SpeculationEnabled triggers a second forked AgentLoop run that pre-computes
-	// the assistant's response assuming the user accepts the suggestion. Doubles
-	// the cost per turn. Only meaningful when Enabled=true. Default: false.
-	SpeculationEnabled bool `mapstructure:"speculation_enabled" yaml:"speculation_enabled" json:"speculation_enabled"`
 
 	// CacheColdThresholdTokens skips suggestion generation when the previous
 	// turn's uncached input token count exceeds this value — guards against
@@ -257,7 +253,6 @@ func Load() (*Config, error) {
 	// turn to generate a single 2-12 word follow-up suggestion. See
 	// internal/config.PromptSuggestionConfig.
 	viper.SetDefault("agent.prompt_suggestion.enabled", false)
-	viper.SetDefault("agent.prompt_suggestion.speculation_enabled", false)
 	viper.SetDefault("agent.prompt_suggestion.cache_cold_threshold_tokens", 10000)
 	viper.SetDefault("agent.prompt_suggestion.min_turns", 2)
 	viper.SetDefault("tools.bash_timeout", 120)
@@ -542,7 +537,6 @@ type overlayTimeBasedCompactConfig struct {
 
 type overlayPromptSuggestionConfig struct {
 	Enabled                  *bool `yaml:"enabled"`
-	SpeculationEnabled       *bool `yaml:"speculation_enabled"`
 	CacheColdThresholdTokens *int  `yaml:"cache_cold_threshold_tokens"`
 	MinTurns                 *int  `yaml:"min_turns"`
 }
@@ -778,10 +772,6 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 			if ps.Enabled != nil {
 				cfg.Agent.PromptSuggestion.Enabled = *ps.Enabled
 				cfg.Sources["agent.prompt_suggestion.enabled"] = src
-			}
-			if ps.SpeculationEnabled != nil {
-				cfg.Agent.PromptSuggestion.SpeculationEnabled = *ps.SpeculationEnabled
-				cfg.Sources["agent.prompt_suggestion.speculation_enabled"] = src
 			}
 			if ps.CacheColdThresholdTokens != nil {
 				cfg.Agent.PromptSuggestion.CacheColdThresholdTokens = *ps.CacheColdThresholdTokens

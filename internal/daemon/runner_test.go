@@ -18,7 +18,6 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
-	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
@@ -792,7 +791,7 @@ func TestFireSuggestionAfterRun_AppendsAssistantReplyToMain(t *testing.T) {
 
 	fireSuggestionAfterRun(context.Background(), deps,
 		"test-agent", "sess1",
-		main, config.PromptSuggestionConfig{}, // SpeculationEnabled: false
+		main, // SpeculationEnabled removed
 		"I'll fix the test in foo.go")
 
 	reqs := gw.requests()
@@ -841,7 +840,7 @@ func TestFireSuggestionAfterRun_EmptyReplySkipsAll(t *testing.T) {
 
 	fireSuggestionAfterRun(context.Background(), deps,
 		"test-agent", "sess1",
-		main, config.PromptSuggestionConfig{},
+		main,
 		"") // empty assistantReply
 
 	if got := len(gw.requests()); got != 0 {
@@ -909,7 +908,7 @@ func TestFireSuggestionAfterRun_StaleGoroutineDoesNotResurrect(t *testing.T) {
 	go func() {
 		fireSuggestionAfterRun(context.Background(), deps,
 			"test-agent", "sess1",
-			main, config.PromptSuggestionConfig{},
+			main,
 			"I just replied to you")
 		close(done)
 	}()

@@ -23,8 +23,8 @@ const (
 	EventNotification     = "notification"
 	EventRunStatus        = "run_status" // watchdog soft/hard events, LLM retries, etc.
 	// EventSuggestionReady is emitted by the daemon's post-Run hook after a
-	// prompt suggestion (and optionally a speculation) has been generated and
-	// stored in SuggestionState. Payload: {session_id, agent, text, has_speculation}.
+	// prompt suggestion has been generated and stored in SuggestionState.
+	// Payload: {session_id, agent, text}.
 	EventSuggestionReady = "suggestion_ready"
 )
 
