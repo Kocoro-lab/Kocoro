@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/adrg/frontmatter"
 	"gopkg.in/yaml.v3"
@@ -198,9 +199,18 @@ var (
 	ErrZipTooLarge = errors.New("zip payload too large")
 )
 
+// conflictPromptPreviewBytes caps the prompt fields surfaced in a 409 conflict
+// response. ZIP payloads can be ~50 MB and the extracted SKILL.md prompt may
+// be most of that; returning the raw bytes inline produces an unmanageable
+// JSON response. 8 KB is enough for a meaningful compare preview while
+// keeping the response body bounded.
+const conflictPromptPreviewBytes = 8 * 1024
+
 // SkillConflictError is returned by InstallFromZipData when a skill with the
 // same slug already exists globally and force=false. The handler encodes all
 // fields in the 409 body so the Desktop can render a side-by-side compare sheet.
+// ExistingPrompt and NewPrompt are truncated to conflictPromptPreviewBytes;
+// callers needing the full body should fetch GET /skills/{slug}.
 type SkillConflictError struct {
 	ExistingName        string
 	ExistingDescription string
@@ -211,6 +221,27 @@ type SkillConflictError struct {
 
 func (e *SkillConflictError) Error() string {
 	return fmt.Sprintf("skill %q already installed", e.ExistingName)
+}
+
+// truncatePromptPreview caps a prompt body at conflictPromptPreviewBytes
+// (total byte length including the marker), appending "[truncated]" so
+// callers know the value is partial and can follow up with GET /skills/{slug}
+// for the full body. Walks back to a rune boundary so multibyte content
+// isn't cut mid-codepoint.
+func truncatePromptPreview(s string) string {
+	if len(s) <= conflictPromptPreviewBytes {
+		return s
+	}
+	const marker = "\n\n[truncated]"
+	budget := conflictPromptPreviewBytes - len(marker)
+	if budget < 0 {
+		budget = 0
+	}
+	truncated := s[:budget]
+	for len(truncated) > 0 && !utf8.ValidString(truncated) {
+		truncated = truncated[:len(truncated)-1]
+	}
+	return truncated + marker
 }
 
 // InstallFromMarketplace runs the full install flow for a marketplace entry.
@@ -365,15 +396,25 @@ func InstallFromZipData(shannonDir string, body io.Reader, force bool, locks *Sl
 		return nil, fmt.Errorf("%w: SKILL.md missing or unreadable", ErrInvalidSkillPayload)
 	}
 
-	// Light parse: extract name only, to derive slug before full validation.
+	// Light parse: extract slug and name, to derive the on-disk identifier
+	// before full validation. frontmatter.name is a free-form display label
+	// (may be CJK / uppercase / contain spaces — see validateFrontmatterName)
+	// while frontmatter.slug is the URL-safe identifier; we prefer the slug
+	// when present, falling back to name for skills that don't declare one.
 	var lightFM struct {
 		Name string `yaml:"name"`
+		Slug string `yaml:"slug"`
 	}
-	frontmatter.Parse(bytes.NewReader(rawMD), &lightFM, frontmatter.NewFormat("---", "---", yaml.Unmarshal))
+	if _, err := frontmatter.Parse(bytes.NewReader(rawMD), &lightFM, frontmatter.NewFormat("---", "---", yaml.Unmarshal)); err != nil {
+		return nil, fmt.Errorf("%w: parse SKILL.md frontmatter: %v", ErrInvalidSkillPayload, err)
+	}
 	if lightFM.Name == "" {
 		return nil, fmt.Errorf("%w: SKILL.md missing name field", ErrInvalidSkillPayload)
 	}
-	slug := lightFM.Name
+	slug := lightFM.Slug
+	if slug == "" {
+		slug = lightFM.Name
+	}
 	if err := ValidateSkillName(slug); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidSkillPayload, err)
 	}
@@ -399,11 +440,11 @@ func InstallFromZipData(shannonDir string, body io.Reader, force bool, locks *Sl
 		conflict := &SkillConflictError{ExistingName: slug}
 		if existing != nil {
 			conflict.ExistingDescription = existing.Description
-			conflict.ExistingPrompt = existing.Prompt
+			conflict.ExistingPrompt = truncatePromptPreview(existing.Prompt)
 		}
 		if uploaded != nil {
 			conflict.NewDescription = uploaded.Description
-			conflict.NewPrompt = uploaded.Prompt
+			conflict.NewPrompt = truncatePromptPreview(uploaded.Prompt)
 		}
 		return nil, conflict
 	}
@@ -415,17 +456,36 @@ func InstallFromZipData(shannonDir string, body io.Reader, force bool, locks *Sl
 	}
 	skill.InstallSource = InstallSourceLocal
 
-	// Atomic rename into place. Remove existing dir first when force=true so
-	// Rename succeeds on non-empty dirs.
+	// Atomic rename into place. For force overwrite, move the existing
+	// directory aside (rename-to-bak) before renaming the new one in, then
+	// remove the backup on success. This narrows the crash window to a
+	// single rename syscall — if the daemon dies between the two renames
+	// the user is briefly left without a skill but the backup is intact
+	// and recoverable, vs. the previous RemoveAll-then-Rename which would
+	// destroy the prior install before the new one was in place.
 	destDir := filepath.Join(shannonDir, "skills", slug)
 	if err := os.MkdirAll(filepath.Dir(destDir), 0700); err != nil {
 		return nil, fmt.Errorf("create skills dir: %w", err)
 	}
+	var backupDir string
 	if force {
-		os.RemoveAll(destDir)
+		if _, err := os.Stat(destDir); err == nil {
+			backupDir = fmt.Sprintf("%s.bak.%d", destDir, time.Now().UnixNano())
+			if err := os.Rename(destDir, backupDir); err != nil {
+				return nil, fmt.Errorf("backup existing skill: %w", err)
+			}
+		}
 	}
 	if err := os.Rename(skillRoot, destDir); err != nil {
+		// Restore the backup so the user isn't left without a skill on
+		// a rename failure (full disk, permissions, cross-device, etc.).
+		if backupDir != "" {
+			_ = os.Rename(backupDir, destDir)
+		}
 		return nil, fmt.Errorf("install rename: %w", err)
+	}
+	if backupDir != "" {
+		os.RemoveAll(backupDir)
 	}
 	return skill, nil
 }

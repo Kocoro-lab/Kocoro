@@ -2574,8 +2574,11 @@ func (s *Server) handleMarketplaceInstall(w http.ResponseWriter, r *http.Request
 const uploadSkillMaxBodyBytes int64 = 52 * 1024 * 1024
 
 // uploadSkillInMemoryBytes is the multipart in-memory threshold; anything over
-// this spills to a tempfile via mime/multipart. Keeps peak RAM bounded under
-// concurrent uploads since the body is streamed directly into InstallFromZipData.
+// this spills the form to a tempfile via mime/multipart. Note this only bounds
+// multipart parser scratch — InstallFromZipData reads the file part fully into
+// memory (io.ReadAll under the 50 MB zip cap) for extraction, so each in-flight
+// upload of a different slug still costs roughly the compressed payload size
+// in RAM. Concurrent uploads of the same slug are serialized by s.slugLocks.
 const uploadSkillInMemoryBytes int64 = 1 << 20 // 1 MB
 
 func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {

@@ -1244,3 +1244,128 @@ func TestInstallFromZipData_MacOSFinderZip(t *testing.T) {
 		t.Errorf("Name = %q, want my-skill", skill.Name)
 	}
 }
+
+// TestInstallFromZipData_PrefersFrontmatterSlug locks in that a skill with a
+// display-only `name` (e.g. CJK) plus an ASCII `slug` installs at the slug
+// path and isn't rejected by ValidateSkillName on the display name.
+func TestInstallFromZipData_PrefersFrontmatterSlug(t *testing.T) {
+	dir := t.TempDir()
+	locks := NewSlugLocks()
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	f, _ := zw.Create("SKILL.md")
+	fmt.Fprintf(f, "---\nname: 小红书\nslug: xiaohongshu\ndescription: cjk display name\n---\n\nPrompt.\n")
+	zw.Close()
+
+	skill, err := InstallFromZipData(dir, bytes.NewReader(buf.Bytes()), false, locks)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if skill.Slug != "xiaohongshu" {
+		t.Errorf("Slug = %q, want xiaohongshu", skill.Slug)
+	}
+	if skill.Name != "小红书" {
+		t.Errorf("Name = %q, want 小红书", skill.Name)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "skills", "xiaohongshu", "SKILL.md")); statErr != nil {
+		t.Errorf("SKILL.md not installed at slug path: %v", statErr)
+	}
+}
+
+// TestInstallFromZipData_ForceOverwriteNoBackupLingers locks in that the
+// crash-safe overwrite pattern (rename old → bak, rename new → dest, cleanup
+// bak) leaves no .bak.* directories behind on the happy path.
+func TestInstallFromZipData_ForceOverwriteNoBackupLingers(t *testing.T) {
+	dir := t.TempDir()
+	locks := NewSlugLocks()
+	zip1 := makeSkillZip(t, "my-skill", "v1 desc", "v1 prompt")
+	zip2 := makeSkillZip(t, "my-skill", "v2 desc", "v2 prompt")
+
+	if _, err := InstallFromZipData(dir, bytes.NewReader(zip1), false, locks); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallFromZipData(dir, bytes.NewReader(zip2), true, locks); err != nil {
+		t.Fatal(err)
+	}
+
+	skillsDir := filepath.Join(dir, "skills")
+	entries, err := os.ReadDir(skillsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".bak.") {
+			t.Errorf("leftover backup directory after force overwrite: %s", e.Name())
+		}
+	}
+
+	// New content must actually be on disk (replaced, not merged).
+	data, err := os.ReadFile(filepath.Join(skillsDir, "my-skill", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "v2 desc") {
+		t.Errorf("SKILL.md still contains v1 content after force overwrite: %q", data)
+	}
+	if strings.Contains(string(data), "v1 prompt") {
+		t.Errorf("SKILL.md still contains v1 prompt after force overwrite")
+	}
+}
+
+// TestInstallFromZipData_MalformedFrontmatter_ReportsParseError surfaces YAML
+// parse failures instead of masking them as "missing name field".
+func TestInstallFromZipData_MalformedFrontmatter_ReportsParseError(t *testing.T) {
+	dir := t.TempDir()
+	locks := NewSlugLocks()
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	f, _ := zw.Create("SKILL.md")
+	// Malformed YAML: unclosed quoted string in name.
+	f.Write([]byte("---\nname: \"unterminated\ndescription: bad\n---\n\nPrompt.\n"))
+	zw.Close()
+
+	_, err := InstallFromZipData(dir, bytes.NewReader(buf.Bytes()), false, locks)
+	if !errors.Is(err, ErrInvalidSkillPayload) {
+		t.Fatalf("want ErrInvalidSkillPayload, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "frontmatter") && !strings.Contains(err.Error(), "yaml") {
+		t.Errorf("error %q should mention frontmatter/yaml parse failure", err.Error())
+	}
+	if strings.Contains(err.Error(), "missing name field") {
+		t.Errorf("error should not be misleading 'missing name field' for YAML parse failure: %q", err.Error())
+	}
+}
+
+// TestInstallFromZipData_ConflictPromptTruncation caps the prompt fields in
+// the 409 conflict response so a near-50 MB skill can't produce a huge JSON
+// response body.
+func TestInstallFromZipData_ConflictPromptTruncation(t *testing.T) {
+	dir := t.TempDir()
+	locks := NewSlugLocks()
+
+	// 100 KB prompt, well above the 8 KB preview cap.
+	bigPrompt := strings.Repeat("a", 100*1024)
+	zip1 := makeSkillZip(t, "my-skill", "v1 desc", bigPrompt)
+	zip2 := makeSkillZip(t, "my-skill", "v2 desc", bigPrompt)
+
+	if _, err := InstallFromZipData(dir, bytes.NewReader(zip1), false, locks); err != nil {
+		t.Fatal(err)
+	}
+	_, err := InstallFromZipData(dir, bytes.NewReader(zip2), false, locks)
+	var conflict *SkillConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("want SkillConflictError, got %v", err)
+	}
+	if len(conflict.ExistingPrompt) > conflictPromptPreviewBytes {
+		t.Errorf("ExistingPrompt len = %d, want <= %d", len(conflict.ExistingPrompt), conflictPromptPreviewBytes)
+	}
+	if len(conflict.NewPrompt) > conflictPromptPreviewBytes {
+		t.Errorf("NewPrompt len = %d, want <= %d", len(conflict.NewPrompt), conflictPromptPreviewBytes)
+	}
+	// Truncated prompts must still convey content (not be empty).
+	if conflict.ExistingPrompt == "" || conflict.NewPrompt == "" {
+		t.Errorf("truncated prompts should not be empty")
+	}
+}
