@@ -179,13 +179,18 @@ func downloadRemoteFiles(shannonDir string, files []RemoteFile) ([]RequestConten
 			if err != nil {
 				log.Printf("daemon: inline document %s failed: %v", f.Name, err)
 				// Fall back to URL download if available — never silently drop.
+				// Re-call ensureDir() so we use the lazily-created dir; the outer
+				// `dir` closure variable is still empty here if materializeInlineDocument
+				// returned before it allocated storage.
 				if f.URL != "" {
-					block, derr := downloadOneFile(httpClient, f, filepath.Join(dir, sanitizeFilename(i, f.Name)), displayName)
-					if derr == nil {
-						blocks = append(blocks, block)
-						continue
+					if localDir, derr := ensureDir(); derr == nil {
+						block, derr := downloadOneFile(httpClient, f, filepath.Join(localDir, sanitizeFilename(i, f.Name)), displayName)
+						if derr == nil {
+							blocks = append(blocks, block)
+							continue
+						}
+						log.Printf("daemon: fallback download %s failed: %v", f.Name, sanitizeError(derr))
 					}
-					log.Printf("daemon: fallback download %s failed: %v", f.Name, sanitizeError(derr))
 				}
 				blocks = append(blocks, RequestContentBlock{
 					Type: "text",
