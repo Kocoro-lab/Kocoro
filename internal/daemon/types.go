@@ -112,12 +112,35 @@ type MessagePayload struct {
 }
 
 // RemoteFile describes a file attachment forwarded by Cloud from a messaging platform.
+//
+// The mirror struct on the Cloud side is FileAttachment
+// (go/orchestrator/internal/daemon/types.go). When Cloud has performed
+// server-side extraction or base64 inlining, it populates ExtractedText or
+// DocumentB64 in addition to (or instead of) URL — see plan §4.3 for the
+// daemon-side priority order. Older daemons that don't decode these fields
+// silently fall back to the URL download path, preserving backward compat.
 type RemoteFile struct {
 	Name       string `json:"name"`
-	MimeType   string `json:"mimetype,omitempty"`
-	Size       int64  `json:"size,omitempty"`
+	MimeType   string `json:"mimetype"`
+	Size       int64  `json:"size"`
 	URL        string `json:"url"`
-	AuthHeader string `json:"auth_header,omitempty"`
+	AuthHeader string `json:"auth_header"`
+
+	// ExtractedText is plain-text content cloud extracted from the source file
+	// (DOCX/XLSX/PPTX/CSV/TXT/JSON/large-PDF fallback path). Non-empty means
+	// daemon skips URL download and emits a `text` content block.
+	ExtractedText string `json:"extracted_text,omitempty"`
+	// DocumentB64 is base64-encoded raw bytes for formats Anthropic accepts
+	// natively (currently application/pdf only). Non-empty means daemon emits
+	// a `document` content block + companion `text` hint. JSON tag is
+	// "document_b64" — matches plan §4.3 byte-for-byte.
+	DocumentB64 string `json:"document_b64,omitempty"`
+	// ExtractionNote carries cloud-side metadata about how the file was
+	// processed (e.g. "extracted via python-docx; tables→markdown",
+	// "truncated: sheet_limit, original_sheets=120, included_sheets=100").
+	// Daemon currently records it in audit but does not surface it to the LLM;
+	// reserved for richer Phase-2 user feedback.
+	ExtractionNote string `json:"extraction_note,omitempty"`
 }
 
 // ReplyPayload is sent back after agent completes.

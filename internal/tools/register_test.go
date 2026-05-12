@@ -32,7 +32,7 @@ func TestRegisterAll_WithServerTools(t *testing.T) {
 	}
 
 	// Check local tools are registered
-	for _, name := range []string{"use_skill", "file_read", "file_write", "file_edit", "glob", "grep", "bash", "think", "directory_list", "http", "system_info", "clipboard", "notify", "process", "applescript", "accessibility", "ghostty", "browser", "screenshot", "computer", "wait_for", "schedule_create", "schedule_list", "schedule_update", "schedule_remove"} {
+	for _, name := range []string{"use_skill", "file_read", "file_write", "file_edit", "glob", "grep", "bash", "think", "directory_list", "http", "system_info", "clipboard", "notify", "process", "applescript", "accessibility", "ghostty", "browser", "screenshot", "computer", "wait_for", "schedule_create", "schedule_list", "schedule_update", "schedule_remove", "archive_inspect", "archive_extract"} {
 		if _, ok := reg.Get(name); !ok {
 			t.Errorf("local tool %q not registered", name)
 		}
@@ -45,10 +45,10 @@ func TestRegisterAll_WithServerTools(t *testing.T) {
 		}
 	}
 
-	// Total: 26 local + 2 server = 28
+	// Total: 28 local + 2 server = 30 (archive_inspect / archive_extract added Phase 1)
 	schemas := reg.Schemas()
-	if len(schemas) != 28 {
-		t.Errorf("expected 28 tools, got %d", len(schemas))
+	if len(schemas) != 30 {
+		t.Errorf("expected 30 tools, got %d", len(schemas))
 	}
 }
 
@@ -72,8 +72,8 @@ func TestRegisterAll_ServerUnavailable(t *testing.T) {
 	}
 
 	schemas := reg.Schemas()
-	if len(schemas) != 26 {
-		t.Errorf("expected 26 local tools, got %d", len(schemas))
+	if len(schemas) != 28 {
+		t.Errorf("expected 28 local tools, got %d", len(schemas))
 	}
 }
 
@@ -115,10 +115,10 @@ func TestRegisterAll_LocalPriority(t *testing.T) {
 		t.Error("web_search should be a server tool")
 	}
 
-	// 26 local + 1 server (bash skipped) = 27
+	// 28 local + 1 server (bash skipped) = 29 (archive tools added Phase 1)
 	schemas := reg.Schemas()
-	if len(schemas) != 27 {
-		t.Errorf("expected 27 tools, got %d", len(schemas))
+	if len(schemas) != 29 {
+		t.Errorf("expected 29 tools, got %d", len(schemas))
 	}
 }
 

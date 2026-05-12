@@ -52,6 +52,8 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	reg.Register(&MemoryAppendTool{})
 	reg.Register(&ThinkTool{})
 	reg.Register(&DirectoryListTool{})
+	reg.Register(&ArchiveInspectTool{})
+	reg.Register(&ArchiveExtractTool{})
 	reg.Register(&HTTPTool{})
 	reg.Register(&SystemInfoTool{})
 	reg.Register(&ClipboardTool{})

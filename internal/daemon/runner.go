@@ -626,6 +626,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		var inlineCleanup func()
 		req.Content, inlineCleanup = materializeInlineImageBlocks(deps.ShannonDir, req.Content)
 		attachmentCleanup = combineCleanup(attachmentCleanup, inlineCleanup)
+
+		// Plan §4.6 extractable hook: Desktop file_ref → cloud /extract (Phase 2).
+		// Currently no-op; reserves the call site so Phase 2 swaps in the cloud
+		// round-trip without touching the runner pipeline.
+		var extractCleanup func()
+		req.Content, extractCleanup = materializeExtractableFiles(deps.ShannonDir, req.Content)
+		attachmentCleanup = combineCleanup(attachmentCleanup, extractCleanup)
 	}
 	if len(req.Files) > 0 {
 		var fileBlocks []RequestContentBlock

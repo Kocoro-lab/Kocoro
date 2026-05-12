@@ -334,6 +334,7 @@ E2E tests in `test/e2e/` split into offline (no API) and live (`SHANNON_E2E_LIVE
 ### Core Local Tools
 
 - File ops: `file_read`, `file_write`, `file_edit`, `glob`, `grep`, `directory_list`
+- Archive: `archive_inspect` (read-only, no approval), `archive_extract` (requires approval) — supports `.zip / .tar / .tar.gz / .tgz`; atomic staging-dir + rename; rejects encrypted, symlink, absolute-path, setuid, device entries; caps 50 MB/entry, 200 MB total, 500 entries
 - Shell/system: `bash`, `system_info`, `process`, `http`, `think`
 - macOS GUI: `accessibility`, `applescript`, `screenshot`, `computer`, `clipboard`, `notify`, `browser`, `wait_for`, `ghostty`
 - Schedule: `schedule_create`, `schedule_list`, `schedule_update`, `schedule_remove`
