@@ -3148,6 +3148,22 @@ func TestNamedAgentPromptIncludesCoreRules(t *testing.T) {
 	}
 }
 
+// TestDefaultPersona_ReferencesUserInstructionsWrapper locks in the semantic
+// coupling between the <persona_note> block (which tells the model that user
+// customization lives inside <user_instructions> wrappers) and the actual
+// wrapper emitted in internal/prompt/builder.go:buildStableContext. The
+// persona-note text literally names the wrapper; if a future rename touches
+// one and not the other, this test fails before the drift reaches production.
+// Round-3 review follow-up on #130.
+func TestDefaultPersona_ReferencesUserInstructionsWrapper(t *testing.T) {
+	if !strings.Contains(defaultPersona, "<user_instructions>") {
+		t.Error("defaultPersona must reference <user_instructions> by name (currently inside the <persona_note> block) — if you renamed the wrapper in internal/prompt/builder.go:buildStableContext, update defaultPersona to match (issue #125)")
+	}
+	if !strings.Contains(defaultPersona, "<persona_note>") || !strings.Contains(defaultPersona, "</persona_note>") {
+		t.Error("defaultPersona must keep the <persona_note> XML envelope — bare prose loses the structural anchor that prevents the model from echoing customization-policy text back to users (issue #125)")
+	}
+}
+
 // TestForceStop_PreservesRequestConfig verifies that the force-stop final LLM
 // turn reuses the agent's live configuration (MaxTokens, SpecificModel,
 // Temperature, Thinking, ReasoningEffort) and explicitly sends no tools.

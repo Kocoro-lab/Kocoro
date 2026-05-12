@@ -280,7 +280,6 @@ const (
 
 // defaultPersona is the identity line for the default (non-overridden) agent.
 // Named agents replace this with their AGENT.md content.
-// Identity framing for the default (non-overridden) agent.
 //
 // A strong unique-named persona ("You are Kocoro") turns every user-supplied
 // identity directive in instructions.md ("you are a cat-girl named Mia")
