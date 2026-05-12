@@ -83,6 +83,14 @@ type AgentConfig struct {
 	// reliably expired so the prefix would be rewritten anyway. See
 	// internal/agent/timebasedcompact.go.
 	TimeBasedCompact TimeBasedCompactConfig `mapstructure:"time_based_compact" yaml:"time_based_compact" json:"time_based_compact"`
+
+	// PromptSuggestion controls the ghost-text "next prompt" suggestion that
+	// appears in Desktop's 继续对话 input after each assistant turn. Disabled
+	// by default. When enabled, after each turn the daemon runs a forked
+	// completion call to generate a single 2-12 word suggestion. With
+	// SpeculationEnabled, a second forked AgentLoop pre-runs the response
+	// to that suggestion so acceptance is instant.
+	PromptSuggestion PromptSuggestionConfig `mapstructure:"prompt_suggestion" yaml:"prompt_suggestion" json:"prompt_suggestion"`
 }
 
 // TimeBasedCompactConfig is the YAML/JSON-bindable view of the agent's
@@ -92,6 +100,29 @@ type TimeBasedCompactConfig struct {
 	Enabled             bool `mapstructure:"enabled"               yaml:"enabled"               json:"enabled"`
 	GapThresholdMinutes int  `mapstructure:"gap_threshold_minutes" yaml:"gap_threshold_minutes" json:"gap_threshold_minutes"`
 	KeepRecent          int  `mapstructure:"keep_recent"           yaml:"keep_recent"           json:"keep_recent"`
+}
+
+// PromptSuggestionConfig controls the post-turn next-prompt suggestion feature.
+// See docs/superpowers/plans/2026-05-12-prompt-suggestion.md for design.
+type PromptSuggestionConfig struct {
+	// Enabled is the master switch. When false the entire feature is dormant —
+	// no forked calls, no SSE events, no Desktop ghost text. Default: false.
+	Enabled bool `mapstructure:"enabled" yaml:"enabled" json:"enabled"`
+
+	// SpeculationEnabled triggers a second forked AgentLoop run that pre-computes
+	// the assistant's response assuming the user accepts the suggestion. Doubles
+	// the cost per turn. Only meaningful when Enabled=true. Default: false.
+	SpeculationEnabled bool `mapstructure:"speculation_enabled" yaml:"speculation_enabled" json:"speculation_enabled"`
+
+	// CacheColdThresholdTokens skips suggestion generation when the previous
+	// turn's uncached input token count exceeds this value — guards against
+	// paying full-price input cost for a 50-token suggestion. Default: 10000.
+	CacheColdThresholdTokens int `mapstructure:"cache_cold_threshold_tokens" yaml:"cache_cold_threshold_tokens" json:"cache_cold_threshold_tokens"`
+
+	// MinTurns is the minimum number of completed assistant turns before
+	// suggestions are emitted. Default: 2 (first reply is usually too sparse
+	// to predict a useful follow-up).
+	MinTurns int `mapstructure:"min_turns" yaml:"min_turns" json:"min_turns"`
 }
 
 // SkillDiscoveryEnabled returns whether skill discovery is enabled (default: true).
@@ -219,6 +250,14 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.time_based_compact.enabled", false)
 	viper.SetDefault("agent.time_based_compact.gap_threshold_minutes", 60)
 	viper.SetDefault("agent.time_based_compact.keep_recent", 5)
+	// Prompt suggestion (post-turn ghost text). Disabled by default —
+	// when enabled, the daemon runs a forked completion call after each
+	// turn to generate a single 2-12 word follow-up suggestion. See
+	// internal/config.PromptSuggestionConfig.
+	viper.SetDefault("agent.prompt_suggestion.enabled", false)
+	viper.SetDefault("agent.prompt_suggestion.speculation_enabled", false)
+	viper.SetDefault("agent.prompt_suggestion.cache_cold_threshold_tokens", 10000)
+	viper.SetDefault("agent.prompt_suggestion.min_turns", 2)
 	viper.SetDefault("tools.bash_timeout", 120)
 	viper.SetDefault("tools.bash_max_output", 30000)
 	viper.SetDefault("tools.result_truncation", 30000)
@@ -489,12 +528,21 @@ type overlayAgentConfig struct {
 	SkillDiscovery      *bool `yaml:"skill_discovery"`
 
 	TimeBasedCompact *overlayTimeBasedCompactConfig `yaml:"time_based_compact"`
+
+	PromptSuggestion *overlayPromptSuggestionConfig `yaml:"prompt_suggestion"`
 }
 
 type overlayTimeBasedCompactConfig struct {
 	Enabled             *bool `yaml:"enabled"`
 	GapThresholdMinutes *int  `yaml:"gap_threshold_minutes"`
 	KeepRecent          *int  `yaml:"keep_recent"`
+}
+
+type overlayPromptSuggestionConfig struct {
+	Enabled                  *bool `yaml:"enabled"`
+	SpeculationEnabled       *bool `yaml:"speculation_enabled"`
+	CacheColdThresholdTokens *int  `yaml:"cache_cold_threshold_tokens"`
+	MinTurns                 *int  `yaml:"min_turns"`
 }
 
 type overlayToolsConfig struct {
@@ -721,6 +769,25 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 			if overlay.Agent.TimeBasedCompact.KeepRecent != nil {
 				cfg.Agent.TimeBasedCompact.KeepRecent = *overlay.Agent.TimeBasedCompact.KeepRecent
 				cfg.Sources["agent.time_based_compact.keep_recent"] = src
+			}
+		}
+		if overlay.Agent.PromptSuggestion != nil {
+			ps := overlay.Agent.PromptSuggestion
+			if ps.Enabled != nil {
+				cfg.Agent.PromptSuggestion.Enabled = *ps.Enabled
+				cfg.Sources["agent.prompt_suggestion.enabled"] = src
+			}
+			if ps.SpeculationEnabled != nil {
+				cfg.Agent.PromptSuggestion.SpeculationEnabled = *ps.SpeculationEnabled
+				cfg.Sources["agent.prompt_suggestion.speculation_enabled"] = src
+			}
+			if ps.CacheColdThresholdTokens != nil {
+				cfg.Agent.PromptSuggestion.CacheColdThresholdTokens = *ps.CacheColdThresholdTokens
+				cfg.Sources["agent.prompt_suggestion.cache_cold_threshold_tokens"] = src
+			}
+			if ps.MinTurns != nil {
+				cfg.Agent.PromptSuggestion.MinTurns = *ps.MinTurns
+				cfg.Sources["agent.prompt_suggestion.min_turns"] = src
 			}
 		}
 	}

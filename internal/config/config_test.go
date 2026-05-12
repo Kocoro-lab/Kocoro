@@ -301,3 +301,68 @@ func TestMemoryDefaults(t *testing.T) {
 		t.Fatalf("bundle_pull_interval=%v want 24h", v)
 	}
 }
+
+// Pattern matches existing TestLoad_* tests: redirect HOME → tmp, write
+// ~/.shannon/config.yaml, call Load() (no args; returns *Config, error).
+func TestPromptSuggestionConfig_Defaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".shannon"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if cfg.Agent.PromptSuggestion.Enabled {
+		t.Error("PromptSuggestion.Enabled should default to false")
+	}
+	if cfg.Agent.PromptSuggestion.SpeculationEnabled {
+		t.Error("PromptSuggestion.SpeculationEnabled should default to false")
+	}
+	if cfg.Agent.PromptSuggestion.CacheColdThresholdTokens != 10000 {
+		t.Errorf("CacheColdThresholdTokens default = %d, want 10000",
+			cfg.Agent.PromptSuggestion.CacheColdThresholdTokens)
+	}
+	if cfg.Agent.PromptSuggestion.MinTurns != 2 {
+		t.Errorf("MinTurns default = %d, want 2", cfg.Agent.PromptSuggestion.MinTurns)
+	}
+}
+
+func TestPromptSuggestionConfig_OverlayMerge(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shannonDir := filepath.Join(home, ".shannon")
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `agent:
+  prompt_suggestion:
+    enabled: true
+    speculation_enabled: true
+    cache_cold_threshold_tokens: 20000
+    min_turns: 1
+`
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if !cfg.Agent.PromptSuggestion.Enabled {
+		t.Error("expected enabled=true after overlay")
+	}
+	if !cfg.Agent.PromptSuggestion.SpeculationEnabled {
+		t.Error("expected speculation_enabled=true after overlay")
+	}
+	if cfg.Agent.PromptSuggestion.CacheColdThresholdTokens != 20000 {
+		t.Errorf("got %d, want 20000", cfg.Agent.PromptSuggestion.CacheColdThresholdTokens)
+	}
+	if cfg.Agent.PromptSuggestion.MinTurns != 1 {
+		t.Errorf("got %d, want 1", cfg.Agent.PromptSuggestion.MinTurns)
+	}
+}
