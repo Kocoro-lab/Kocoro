@@ -66,6 +66,81 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Response: `{"status": "reset", "id": "..."}`
 - Notes: Clears the session's conversation history while keeping the session ID, title, CWD, source, channel, and cumulative usage. Cancels any active run on that session first. Also clears any persisted route binding (the link from a messaging-platform thread/sender to this session) and the live in-memory binding, so the next inbound message on that route starts a fresh session. The `agent` query parameter is REQUIRED — default-agent sessions do not use this endpoint; delete and recreate them via `DELETE /sessions/{id}` instead. Use when the user says "reset", "clear history", or "start over" on a named agent whose routing identity must survive the wipe.
 
+### `GET /agents/{name}/sessions/{id}/suggestion`
+
+Returns the latest prompt suggestion for the given session, or 404 if none.
+
+Response (200):
+```json
+{
+  "text": "rerun the failing test",
+  "has_speculation": true,
+  "suggested_at_unix": 1715500000
+}
+```
+
+Errors:
+- 400 if `id` is empty or contains path-traversal characters.
+- 400 if `name` is not a valid agent name (regex: `^[a-z0-9][a-z0-9_-]{0,63}$`).
+- 404 if the agent does not exist OR no suggestion is currently available for the session.
+
+### `POST /agents/{name}/sessions/{id}/suggestion/accept`
+
+Marks the current suggestion as accepted and returns the speculated response
+(if available). Desktop displays `speculated_response` instantly and skips
+the normal LLM round-trip for the accepted suggestion. The daemon atomically
+persists the (user="suggestion text", assistant="speculated response") message
+pair to the session before returning — so the next turn's context contains
+exactly what Desktop showed the user.
+
+Response (200):
+```json
+{
+  "text": "rerun the failing test",
+  "suggestion": "rerun the failing test",
+  "speculated_response": "Running the test suite now...",
+  "has_speculation": true,
+  "suggested_at_unix": 1715500000
+}
+```
+
+When speculation is unavailable (feature disabled, speculation in flight, or
+persist failed), `speculated_response` is omitted from the JSON. Desktop
+falls back to a normal `POST /agents/{name}/messages` send in that case.
+
+Errors: same shape as the GET endpoint.
+
+### SSE event `suggestion_ready`
+
+Emitted on `/events` when a new suggestion (or speculation) is generated.
+Payload:
+
+```json
+{
+  "session_id": "sess_abc",
+  "agent": "myagent",
+  "text": "rerun the failing test",
+  "has_speculation": false
+}
+```
+
+A second event with `"has_speculation": true` follows ~1-3 seconds later
+when speculation completes (only if `agent.prompt_suggestion.speculation_enabled: true`).
+
+Wire format follows the HTML5 EventSource spec (two lines per event,
+separated by a blank line):
+
+```
+id: 42
+event: suggestion_ready
+data: {"session_id":"sess_abc",...}
+
+```
+
+Desktop's `EventSource.addEventListener("suggestion_ready", ...)` parses
+`event.data` as JSON. There is no outer `{"type":...,"payload":...}`
+wrapper — `event:` is a header line, `data:` is the JSON body.
+
 ## Common Scenarios
 
 ### "Create an email writer agent"

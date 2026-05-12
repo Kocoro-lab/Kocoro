@@ -67,6 +67,34 @@ Global settings control how Shannon behaves across all agents — which AI model
 1. GET /config → look at `effective.agent.model`
 2. `sources.agent.model` shows whether it came from global, project, or local config.
 
+## `agent.prompt_suggestion` — Ghost-text "next prompt" suggestion
+
+After each assistant turn, the daemon can generate a single 2-12 word
+suggestion for the user's next message and render it as ghost text in the
+input field. Optional speculation pre-runs the response so acceptance is instant.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master switch. When `false`, no suggestion calls fire. |
+| `speculation_enabled` | bool | `false` | Pre-run the response assuming the user accepts. Doubles per-turn cost. Requires `enabled: true`. |
+| `cache_cold_threshold_tokens` | int | `10000` | Skip suggestion when previous turn's uncached input tokens exceed this. Protects against full-price calls. `0` disables the gate. |
+| `min_turns` | int | `2` | Skip suggestion until this many turns have completed. First-turn predictions are usually unhelpful. |
+
+Example:
+
+```yaml
+agent:
+  prompt_suggestion:
+    enabled: true
+    speculation_enabled: false
+    cache_cold_threshold_tokens: 10000
+    min_turns: 2
+```
+
+**Cost note:** With a warm prompt cache, each suggestion call ≈ 80% of one
+main-turn cost. Speculation adds another ~80%. Disabled by default — opt in
+explicitly per user preference (Desktop has a global toggle wired to this key).
+
 ## memory.* (Phase 2.3 — Kocoro Cloud memory feature)
 
 | Key | Default | Notes |
