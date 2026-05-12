@@ -168,3 +168,50 @@ func TestSuggestionPromptIsStable(t *testing.T) {
 			len(SuggestionPrompt))
 	}
 }
+
+func TestShouldGenerateSuggestion(t *testing.T) {
+	cases := []struct {
+		name string
+		args ShouldGenerateArgs
+		want bool
+	}{
+		{"happy path",
+			ShouldGenerateArgs{
+				Enabled:                  true,
+				CompletedTurns:           3,
+				MinTurns:                 2,
+				LastTurnUncachedTokens:   500,
+				CacheColdThresholdTokens: 10000,
+				LastTurnHadError:         false,
+				PlanMode:                 false,
+			}, true},
+		{"feature disabled",
+			ShouldGenerateArgs{Enabled: false, CompletedTurns: 3, MinTurns: 2}, false},
+		{"too few turns",
+			ShouldGenerateArgs{Enabled: true, CompletedTurns: 1, MinTurns: 2}, false},
+		{"exact MinTurns",
+			ShouldGenerateArgs{Enabled: true, CompletedTurns: 2, MinTurns: 2,
+				LastTurnUncachedTokens: 100, CacheColdThresholdTokens: 10000}, true},
+		{"cache cold above threshold",
+			ShouldGenerateArgs{Enabled: true, CompletedTurns: 3, MinTurns: 2,
+				LastTurnUncachedTokens: 20000, CacheColdThresholdTokens: 10000}, false},
+		{"cache cold disabled (threshold=0)",
+			ShouldGenerateArgs{Enabled: true, CompletedTurns: 3, MinTurns: 2,
+				LastTurnUncachedTokens: 99999, CacheColdThresholdTokens: 0}, true},
+		{"last turn errored",
+			ShouldGenerateArgs{Enabled: true, CompletedTurns: 3, MinTurns: 2,
+				LastTurnHadError: true}, false},
+		{"plan mode",
+			ShouldGenerateArgs{Enabled: true, CompletedTurns: 3, MinTurns: 2,
+				PlanMode: true}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ShouldGenerateSuggestion(tc.args)
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

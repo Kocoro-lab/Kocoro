@@ -230,3 +230,56 @@ func GenerateSuggestion(ctx context.Context, llm client.LLMClient, main client.C
 	filtered, _ := FilterSuggestion(resp.OutputText)
 	return filtered, nil
 }
+
+// ShouldGenerateArgs is the bundle of state the runner provides to decide
+// whether to fire a suggestion call after a turn completes. Every field
+// represents one independent gate — see ShouldGenerateSuggestion for the
+// exact semantics.
+type ShouldGenerateArgs struct {
+	// Enabled is the master switch (config.Agent.PromptSuggestion.Enabled).
+	Enabled bool
+	// CompletedTurns is the number of assistant messages in the session so
+	// far. Used together with MinTurns to skip very early turns where the
+	// model has too little context to predict useful follow-ups.
+	CompletedTurns int
+	// MinTurns is the minimum value of CompletedTurns at which suggestions
+	// may fire.
+	MinTurns int
+	// LastTurnUncachedTokens is input_tokens − cache_read_tokens from the
+	// most recent main-turn Usage. Used together with CacheColdThresholdTokens
+	// to skip suggestions when the cache is cold (otherwise the suggestion
+	// call would pay full price on a large prefix).
+	LastTurnUncachedTokens int
+	// CacheColdThresholdTokens is the gate threshold; 0 disables the gate
+	// (no cache-cold skipping).
+	CacheColdThresholdTokens int
+	// LastTurnHadError indicates the previous main-turn call did not
+	// complete cleanly. Skip suggestion — the context may be incomplete or
+	// inconsistent with what the user sees.
+	LastTurnHadError bool
+	// PlanMode is true when the session is in plan-mode (user is reviewing
+	// an assistant-proposed plan). A prompt suggestion would be off-topic.
+	PlanMode bool
+}
+
+// ShouldGenerateSuggestion returns true iff every gate passes. Returning
+// false is the fail-cheap default — every gate is opt-in to firing. Gate
+// order is irrelevant; this function is pure (no I/O, no state).
+func ShouldGenerateSuggestion(a ShouldGenerateArgs) bool {
+	if !a.Enabled {
+		return false
+	}
+	if a.LastTurnHadError {
+		return false
+	}
+	if a.PlanMode {
+		return false
+	}
+	if a.CompletedTurns < a.MinTurns {
+		return false
+	}
+	if a.CacheColdThresholdTokens > 0 && a.LastTurnUncachedTokens > a.CacheColdThresholdTokens {
+		return false
+	}
+	return true
+}
