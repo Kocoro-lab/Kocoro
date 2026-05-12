@@ -168,3 +168,16 @@ func TestHandleSuggestion_InvalidAgentName(t *testing.T) {
 		t.Errorf("status = %d, want 400 for invalid agent name", w.Code)
 	}
 }
+
+func TestSuggestionState_ClearedOnNewTurn(t *testing.T) {
+	// Unit-level proof of the contract: Clear() removes the entry, Get()
+	// returns false afterwards. Integration-style proof of "RunAgent clears
+	// before next turn" happens in the E2E test (Task 16).
+	state := agent.NewSuggestionState()
+	state.Set("sess1", "old suggestion", time.Now())
+
+	state.Clear("sess1")
+	if _, ok := state.Get("sess1"); ok {
+		t.Error("expected suggestion to be cleared on new turn")
+	}
+}

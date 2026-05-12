@@ -823,6 +823,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		route.storeSessionID(sess.ID)
 	}
 
+	// Clear any pending suggestion before this turn starts — the user is
+	// sending a new message, so any prior suggestion is stale. If the user
+	// had accepted via /suggestion/accept, that handler also clears (in T11.5);
+	// this guard catches the "user typed something else instead of accepting"
+	// path. Done HERE (not at function top) because sess.ID isn't available
+	// until sessMgr.Current() returns above.
+	if deps.Suggestions != nil && sess != nil {
+		deps.Suggestions.Clear(sess.ID)
+	}
+
 	// Seed pre-loaded history for bypass-routed runs (e.g., heartbeat).
 	// The throwaway manager has an empty session; this gives the LLM context.
 	if len(req.SessionHistory) > 0 {
@@ -1212,6 +1222,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// (SessionCache eviction, daemon shutdown). Artifacts live across turns
 		// of the same session but don't accumulate across sessions.
 		sessMgr.OnSessionClose(sess.ID, cloudSessionTmpCleanup(cloudSessionCWD))
+	}
+	// Tear down per-session suggestion state on explicit session close
+	// (session delete/switch, TUI quit, daemon shutdown). Clear is idempotent
+	// on missing keys, so registering per turn is safe even though
+	// OnSessionClose appends callbacks rather than replacing them.
+	if deps.Suggestions != nil {
+		sessMgr.OnSessionClose(sessionID, func() { deps.Suggestions.Clear(sessionID) })
 	}
 	ctx = tools.WithFilePreview(ctx, filePreview)
 	if attachmentCleanup != nil {
