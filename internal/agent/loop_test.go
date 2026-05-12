@@ -21,6 +21,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
+	"github.com/Kocoro-lab/ShanClaw/internal/prompt"
 	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
@@ -3145,6 +3146,26 @@ func TestNamedAgentPromptIncludesCoreRules(t *testing.T) {
 		if !strings.Contains(defaultComposed, s) {
 			t.Errorf("default composed prompt missing: %q", s)
 		}
+	}
+}
+
+// TestDefaultPersona_ReferencesUserInstructionsWrapper locks in the semantic
+// coupling between the <persona_note> block (which tells the model that user
+// customization lives inside the wrapper named by prompt.UserInstructionsTag)
+// and the actual wrapper emitted in internal/prompt/builder.go:buildStableContext.
+//
+// Since round-4 review, both sides reference the same exported const
+// prompt.UserInstructionsTag — a rename now fails at compile time for any
+// caller that hasn't tracked the change. This test still adds value as a
+// floor: it catches the case where someone removes the const reference from
+// defaultPersona entirely (e.g. rewriting the persona-note in free prose
+// that no longer names the wrapper at all). Round-3/4 follow-up on #130.
+func TestDefaultPersona_ReferencesUserInstructionsWrapper(t *testing.T) {
+	if !strings.Contains(defaultPersona, prompt.UserInstructionsTag) {
+		t.Error("defaultPersona must reference prompt.UserInstructionsTag inside its <persona_note> block — if you removed the customization-policy sentence, the model loses its sanction for user identity directives and the issue-#125 false-positive returns")
+	}
+	if !strings.Contains(defaultPersona, "<persona_note>") || !strings.Contains(defaultPersona, "</persona_note>") {
+		t.Error("defaultPersona must keep the <persona_note> XML envelope — bare prose loses the structural anchor that prevents the model from echoing customization-policy text back to users (issue #125)")
 	}
 }
 

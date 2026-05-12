@@ -341,7 +341,7 @@ E2E tests in `test/e2e/` are split into offline (no API, runs in CI) and live (n
 - npm: `@kocoro/shanclaw` → `npm install -g @kocoro/shanclaw`
 - **Versioning: PATCH-only by default** — do NOT bump minor/major unless explicitly asked
 - Release: `git tag -a vX.Y.Z` → `git push origin vX.Y.Z` → CI builds + publishes
-- `docs/` is gitignored — documentation lives locally only
+- `docs/` is gitignored by default — only `docs/cache-strategy.md` and `docs/cache-debug.md` are tracked (referenced from code + issues). `docs/superpowers/` and `docs/issues/` stay local-only. Add new tracked files via explicit `!docs/<file>.md` exception in `.gitignore`.
 
 ## Local Tools (26 base + conditional)
 

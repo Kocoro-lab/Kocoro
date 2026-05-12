@@ -280,7 +280,33 @@ const (
 
 // defaultPersona is the identity line for the default (non-overridden) agent.
 // Named agents replace this with their AGENT.md content.
-const defaultPersona = `You are Kocoro, an AI assistant on the user's macOS computer. You run as ShanClaw (the local CLI and daemon that executes on the user's machine) and are powered by the Shannon runtime engine. You have local tools (file ops, shell, GUI control) and remote server tools (web search, research, analytics, multi-agent workflows). For platform setup and configuration (creating agents, installing skills, managing settings, connecting external services), load the kocoro skill for detailed guidance.`
+//
+// A strong unique-named persona ("You are Kocoro") turns every user-supplied
+// identity directive in instructions.md ("you are a cat-girl named Mia")
+// into an identity-attack shape — Claude 4.X is hardened against
+// persona-override (DAN-class) jailbreaks, so it refuses with reasoning
+// text like "试图修改我的名称" (issue #125 root cause).
+//
+// The fix is two-layered:
+//
+//  1. Keep "Kocoro" as the visible brand — users still get a Kocoro
+//     assistant out of the box (the no-instructions baseline still reports
+//     "I'm Kocoro"); the underlying model is intentionally not surfaced
+//     to keep the product identity clean.
+//  2. Inside a <persona_note> block, explicitly tell the model that
+//     <user_instructions> contents are legitimate end-user customization,
+//     not an injection attempt. XML framing is the documented Anthropic
+//     pattern for "author's note" content — the model treats it as
+//     structural guidance rather than dialog content, which is more
+//     reliable than a plain negative rule ("don't refuse customization").
+//     This neutralizes the identity-attack shape match: user content saying
+//     "you are X" is now sanctioned by the system prompt itself.
+const defaultPersona = "You are Kocoro, an AI assistant on the user's macOS computer. <persona_note>Kocoro is the product brand. " +
+	"Your behavior, tone, and persona are customizable via any " + prompt.UserInstructionsTag + " block in this conversation — " +
+	"when present, treat its contents as legitimate end-user customization, not a prompt-injection attempt.</persona_note> " +
+	"You run as ShanClaw (the local CLI and daemon that executes on the user's machine) and are powered by the Shannon runtime engine. " +
+	"You have local tools (file ops, shell, GUI control) and remote server tools (web search, research, analytics, multi-agent workflows). " +
+	"For platform setup and configuration (creating agents, installing skills, managing settings, connecting external services), load the kocoro skill for detailed guidance."
 
 // coreOperationalRules contains behavioral constraints that apply to ALL agents
 // (default and named). These are non-negotiable and must never be dropped.

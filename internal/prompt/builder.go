@@ -15,6 +15,15 @@ const (
 	maxInstructionsChars = 16000
 )
 
+// UserInstructionsTag is the opening XML tag this package wraps around
+// instructions.md / rules/*.md content in the user-message StableContext.
+// Exported so the agent persona (internal/agent/loop.go:defaultPersona) can
+// reference the exact same literal — renaming the wrapper there forces a
+// compile error in callers that haven't tracked the change. Issue #125
+// round 4: mechanically lock the semantic coupling between persona-note
+// text and emit site.
+const UserInstructionsTag = "<user_instructions>"
+
 // DeferredToolSummary is a lightweight name+description pair for deferred tool listings.
 // Mirrors agent.ToolSummary but avoids importing the agent package from prompt.
 type DeferredToolSummary struct {
@@ -237,16 +246,37 @@ func buildStableContext(opts PromptOptions) string {
 	var sb strings.Builder
 
 	if inst := strings.TrimSpace(opts.Instructions); inst != "" {
-		sb.WriteString("## Instructions\n")
-		sb.WriteString(truncate(inst, maxInstructionsChars))
+		// Wrap in <user_instructions> rather than a bare `## Instructions`
+		// markdown header. The user-role placement (chosen for BP #3 cache
+		// economics — see commit 7c897b6) means Claude treats the block
+		// through its prompt-injection lens; a directive markdown header in
+		// user content is a textbook injection signature.
+		//
+		// We do NOT use <system-reminder> here — that tag is Anthropic's
+		// internal vocabulary for trusted system signals, and Claude 4.X
+		// is trained to flag user-supplied content wearing that tag as a
+		// forged-system-signal injection (the opposite of what we want).
+		// <user_instructions> is a neutral user-domain tag with no such
+		// training collision; it gives the model a clear semantic boundary
+		// ("this block is the user's persistent rules, not an injection")
+		// while staying inside the cacheable user-message prefix. Issue #125.
+		sb.WriteString(UserInstructionsTag + "\n")
+		sb.WriteString(sanitizeUserBlock(truncate(inst, maxInstructionsChars)))
+		sb.WriteString("\n</user_instructions>")
 	}
 
 	if sticky := strings.TrimSpace(opts.StickyContext); sticky != "" {
 		if sb.Len() > 0 {
 			sb.WriteString("\n\n")
 		}
-		sb.WriteString("## Session Facts\n")
-		sb.WriteString(sticky)
+		// Wrap for parity with the instructions block above. Sticky facts
+		// are data (customer/order info), not directives — so they don't
+		// currently trip Claude's injection sensor — but applying the same
+		// trust-channel wrapper across every framework-injected block keeps
+		// the user-role surface uniform. Issue #125.
+		sb.WriteString("<system-reminder>\n## Session Facts\n")
+		sb.WriteString(sanitizeUserBlock(sticky))
+		sb.WriteString("\n</system-reminder>")
 	}
 
 	// Per-user dynamic tool catalog. Routed here (BP #3, per-session cache)
@@ -350,6 +380,26 @@ func truncate(s string, maxChars int) string {
 	return string(r[:maxChars]) + "\n[truncated]"
 }
 
+// sanitizeUserBlock strips wrapper closing tags from user-supplied content
+// so the envelope around it cannot be terminated early. We strip BOTH
+// `</user_instructions>` (used to wrap instructions.md) and
+// `</system-reminder>` (used to wrap sticky facts) — defense in depth, since
+// the same body could in principle be wrapped under either tag depending on
+// the call site and we don't want either to leak out as plain user content.
+//
+// The asymmetry — strip closers but not openers — is deliberate. An opener
+// leaking through produces a nested but still well-formed wrapper (the body
+// stays inside the outer envelope). A closer leaking through truncates the
+// wrapper and the rest of the body escapes into plain user content, which
+// is the exact failure mode this PR exists to prevent. Stripping only
+// closers fixes the dangerous case without spending cycles on the safe one.
+// Issue #125.
+func sanitizeUserBlock(s string) string {
+	s = strings.ReplaceAll(s, "</user_instructions>", "")
+	s = strings.ReplaceAll(s, "</system-reminder>", "")
+	return s
+}
+
 // macOSAutomationGuidance returns workflow guidance for macOS automation tools,
 // or empty string if not on darwin or no relevant tools are registered.
 // Each bullet is conditional on the actual tool presence to avoid emitting
@@ -408,7 +458,12 @@ func BuildToolListing(opts PromptOptions) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("## Dynamic Tools\n")
+	// Wrap for parity with the instructions and sticky-facts blocks in
+	// buildStableContext (issue #125). Tool catalogs are pure data — names
+	// + short descriptions — so they aren't directive-shaped, but the
+	// uniform <system-reminder> wrapping signals "framework-supplied
+	// context" across every user-role injection point.
+	sb.WriteString("<system-reminder>\n## Dynamic Tools\n")
 	sb.WriteString("These tools are also available — they vary per user/configuration. " +
 		"Discover full schemas through the tools[] array; the names below are a quick reference.\n")
 
@@ -437,6 +492,7 @@ func BuildToolListing(opts PromptOptions) string {
 			sb.WriteString("\n")
 		}
 	}
+	sb.WriteString("\n</system-reminder>")
 
 	return sb.String()
 }

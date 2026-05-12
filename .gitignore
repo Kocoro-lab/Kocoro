@@ -16,7 +16,9 @@ CLAUDE.local.md
 *.key
 *.p12
 *.log
-docs/
+docs/*
+!docs/cache-strategy.md
+!docs/cache-debug.md
 internal/tools/axserver/.build/
 internal/agent/tmp/
 build/

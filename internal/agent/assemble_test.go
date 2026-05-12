@@ -30,8 +30,8 @@ func TestAssembleUserMessage_InstructionsOnlyEmitsCacheBreak(t *testing.T) {
 	prefix := result[:idx]
 	suffix := result[idx:]
 
-	if !strings.Contains(prefix, "## Instructions") {
-		t.Error("Instructions header should be in the cached prefix (before cache_break)")
+	if !strings.Contains(prefix, "<user_instructions>") {
+		t.Error("Instructions wrapper <user_instructions> should be in the cached prefix (before cache_break)")
 	}
 	if !strings.Contains(prefix, "Never push to main without review.") {
 		t.Error("instructions body should be in the cached prefix")
