@@ -125,7 +125,14 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	if deps != nil {
 		deps.SecretsStore = store
 	}
-	return &Server{
+	// suggestions is initialized unconditionally so HTTP handlers work even
+	// when deps == nil (existing test fixtures pass nil). The same pointer is
+	// wired into deps.Suggestions below — when deps is non-nil — so the
+	// runner's post-Run hook reaches the same SuggestionState the handler
+	// reads from. Order matters: construct the Server first, then assign
+	// deps.Suggestions; flipping these would either panic on nil deps or
+	// race the eventBus subscriber test fixtures.
+	s := &Server{
 		port:                   port,
 		client:                 client,
 		deps:                   deps,
@@ -136,12 +143,12 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		marketplace:            skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour),
 		slugLocks:              skills.NewSlugLocks(),
 		secretsStore:           store,
-		// suggestions is initialized unconditionally so handlers work even
-		// when deps == nil (existing test fixtures pass nil). Task 10 will
-		// add `if deps != nil { deps.Suggestions = s.suggestions }` to wire
-		// the same pointer through ServerDeps for the runner to use.
-		suggestions: agent.NewSuggestionState(),
+		suggestions:            agent.NewSuggestionState(),
 	}
+	if deps != nil {
+		deps.Suggestions = s.suggestions
+	}
+	return s
 }
 
 func (s *Server) chromeControlPort() int {

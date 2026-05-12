@@ -97,6 +97,36 @@ func TestGenerateSuggestion_GatewayError(t *testing.T) {
 	}
 }
 
+// TestGenerateSuggestionWithUsage_PopulatesUsage pins the cache-audit contract:
+// the Usage-returning variant must surface cache_read_tokens / input_tokens /
+// model so the daemon's post-Run hook can write audit rows that show whether
+// the forked call actually hit the main turn's prompt cache.
+func TestGenerateSuggestionWithUsage_PopulatesUsage(t *testing.T) {
+	main := client.CompletionRequest{
+		Messages:  []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
+		ModelTier: "medium",
+	}
+	// fakeLLM hardcodes Usage{InputTokens:100, CacheReadTokens:95} on success.
+	llm := &fakeLLM{resp: "rerun the failing test"}
+
+	res, err := GenerateSuggestionWithUsage(context.Background(), llm, main)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if res.Text != "rerun the failing test" {
+		t.Errorf("Text = %q", res.Text)
+	}
+	if res.Usage.InputTokens != 100 {
+		t.Errorf("Usage.InputTokens = %d, want 100", res.Usage.InputTokens)
+	}
+	if res.Usage.CacheReadTokens != 95 {
+		t.Errorf("Usage.CacheReadTokens = %d, want 95", res.Usage.CacheReadTokens)
+	}
+	if res.Model == "" {
+		t.Error("Model should be populated for audit correlation")
+	}
+}
+
 func TestFilterSuggestion(t *testing.T) {
 	cases := []struct {
 		name     string

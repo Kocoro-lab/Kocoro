@@ -205,6 +205,17 @@ func BuildForkedSuggestionRequest(main client.CompletionRequest) client.Completi
 	return out
 }
 
+// GenerateSuggestionResult bundles the filtered suggestion text with the
+// cache/usage data from the forked call so the caller can audit cache health.
+// Text is the post-FilterSuggestion string (may be empty if the filter rejects
+// the model's reply); Usage and Model come from the gateway response and are
+// populated even when Text is empty so audit rows still capture cost data.
+type GenerateSuggestionResult struct {
+	Text  string       // filtered suggestion ("" if filter rejected)
+	Usage client.Usage // raw gateway usage (cache_read_tokens etc.)
+	Model string       // model id used (for audit)
+}
+
 // GenerateSuggestion runs a single forked LLM call to elicit a next-prompt
 // suggestion. Returns the filtered suggestion text (≤12 words) or empty string
 // if the model returned no usable suggestion. Returns a non-nil error only on
@@ -216,19 +227,40 @@ func BuildForkedSuggestionRequest(main client.CompletionRequest) client.Completi
 // Output is capped by the filter to ≤100 chars (~30 tokens). Skipped by the
 // caller (suggestion_handler) when the cache is cold per
 // agent.prompt_suggestion.cache_cold_threshold_tokens.
+//
+// Thin wrapper over GenerateSuggestionWithUsage that discards the Usage/Model
+// fields. Callers that need cache-health auditing (daemon post-Run hook) call
+// the WithUsage variant directly.
 func GenerateSuggestion(ctx context.Context, llm client.LLMClient, main client.CompletionRequest) (string, error) {
+	res, err := GenerateSuggestionWithUsage(ctx, llm, main)
+	return res.Text, err
+}
+
+// GenerateSuggestionWithUsage is the Usage-returning variant of
+// GenerateSuggestion. Used by the daemon's post-Run hook to write audit rows
+// that record the forked call's cache_read_tokens / cache_creation_tokens —
+// the only signal that the suggestion path is actually piggybacking on the
+// main turn's prompt cache as designed.
+func GenerateSuggestionWithUsage(ctx context.Context, llm client.LLMClient, main client.CompletionRequest) (GenerateSuggestionResult, error) {
 	req := BuildForkedSuggestionRequest(main)
 
 	resp, err := llm.Complete(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("suggestion gateway call: %w", err)
+		return GenerateSuggestionResult{}, fmt.Errorf("suggestion gateway call: %w", err)
 	}
-	if resp == nil || resp.OutputText == "" {
-		return "", nil
+	if resp == nil {
+		return GenerateSuggestionResult{}, nil
 	}
-
+	result := GenerateSuggestionResult{
+		Usage: resp.Usage,
+		Model: resp.Model,
+	}
+	if resp.OutputText == "" {
+		return result, nil
+	}
 	filtered, _ := FilterSuggestion(resp.OutputText)
-	return filtered, nil
+	result.Text = filtered
+	return result, nil
 }
 
 // ShouldGenerateArgs is the bundle of state the runner provides to decide

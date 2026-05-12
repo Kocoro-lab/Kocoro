@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"time"
 
@@ -731,6 +732,17 @@ type AgentLoop struct {
 	// set to PhaseDone + AssertClean via defer on exit. Reads are safe from
 	// any goroutine (watchdog observer); writes are loop-goroutine only.
 	tracker *phaseTracker
+
+	// lastSentRequest holds the most recently dispatched CompletionRequest.
+	// Updated by captureSentRequest at every gateway-call site. Callers that
+	// fork from the main request (prompt suggestion / speculation) read this
+	// via LastSentRequest() AFTER Run() returns. Guarded by lastSentMu (a
+	// dedicated mutex separate from any loop-internal locking so cross-thread
+	// readers — e.g. the post-Run goroutine in daemon.RunAgent — never block
+	// on loop state).
+	lastSentMu      sync.Mutex
+	lastSentRequest client.CompletionRequest
+	lastSentValid   bool
 }
 
 // CheckpointFunc is invoked mid-turn at phase-exit boundaries by AgentLoop.Run
@@ -2632,6 +2644,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// transition out based on outcome (tool exec, error, etc.).
 			a.tracker.Enter(PhaseAwaitingLLM)
 
+			// Capture the dispatched request so a post-Run goroutine can fork
+			// suggestion / speculation calls byte-equal to this turn. Same
+			// snapshot covers all three call variants below — req does not
+			// mutate across them.
+			a.captureSentRequest(req)
+
 			// On retries, skip streaming to avoid duplicate partial deltas.
 			if attempt == 0 && a.enableStreaming && a.handler != nil {
 				streamingText.Reset()
@@ -3704,6 +3722,11 @@ func (a *AgentLoop) completeWithRetry(ctx context.Context, req client.Completion
 	var resp *client.CompletionResponse
 	var err error
 	for attempt := 0; ; attempt++ {
+		// Snapshot the dispatched request for post-Run forks (suggestion /
+		// speculation). Captured every iteration since req does not mutate
+		// across retries within this call but may differ from the main-loop
+		// request that preceded us (e.g. force-stop / nudge-escalation tail).
+		a.captureSentRequest(req)
 		resp, err = a.client.Complete(ctx, req)
 		if err == nil {
 			a.lastAssistantAt = time.Now()
@@ -4991,4 +5014,51 @@ func topTools(counts map[string]int, maxN int) string {
 		out += fmt.Sprintf(" (+%d more)", remaining)
 	}
 	return out
+}
+
+// captureSentRequest stores a deep copy of req so a later post-Run snapshot
+// can read it without racing the loop. Messages and Tools slices are
+// deep-copied (header AND backing array); other fields are value-typed or
+// pointer/interface fields where shallow copy is acceptable (the request is
+// post-construction immutable at the gateway-call boundary).
+//
+// Called at every a.client.Complete / a.client.CompleteStream site so the
+// snapshot reflects whichever variant was actually dispatched last.
+func (a *AgentLoop) captureSentRequest(req client.CompletionRequest) {
+	a.lastSentMu.Lock()
+	defer a.lastSentMu.Unlock()
+	snapshot := req
+	snapshot.Messages = append([]client.Message(nil), req.Messages...)
+	if len(req.Tools) > 0 {
+		snapshot.Tools = append([]client.Tool(nil), req.Tools...)
+	}
+	a.lastSentRequest = snapshot
+	a.lastSentValid = true
+}
+
+// LastSentRequest returns a DEEP-COPIED snapshot of the most recently sent
+// gateway request. Returns (zero, false) if no request has been sent during
+// this AgentLoop's lifetime.
+//
+// Deep-copy on read is essential: a struct-value return only copies slice
+// HEADERS, leaving the backing arrays shared. Callers that build forked
+// requests via BuildForkedRequest expect to mutate the snapshot independently
+// of any future capture; sharing backing arrays would create hidden coupling
+// between the snapshot and the loop's next iteration.
+//
+// CACHE SAFETY: the returned request is the canonical "main turn" — forks
+// built via BuildForkedRequest will be byte-equal on the prefix and hit the
+// same prompt cache.
+func (a *AgentLoop) LastSentRequest() (client.CompletionRequest, bool) {
+	a.lastSentMu.Lock()
+	defer a.lastSentMu.Unlock()
+	if !a.lastSentValid {
+		return client.CompletionRequest{}, false
+	}
+	out := a.lastSentRequest
+	out.Messages = append([]client.Message(nil), a.lastSentRequest.Messages...)
+	if len(a.lastSentRequest.Tools) > 0 {
+		out.Tools = append([]client.Tool(nil), a.lastSentRequest.Tools...)
+	}
+	return out, true
 }
