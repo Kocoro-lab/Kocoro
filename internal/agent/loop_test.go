@@ -454,7 +454,7 @@ func TestAgentLoop_UserFilePathBypassesApproval(t *testing.T) {
 	handler := &mockHandler{approveResult: false} // would deny if asked
 	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
 	loop.SetHandler(handler)
-	loop.SetUserFilePaths([]string{"/tmp/user-upload/report.pdf"})
+	loop.SetUserFilePaths([]UserAttachedPath{{Path: "/tmp/user-upload/report.pdf"}})
 
 	result, _, err := loop.Run(context.Background(), "read the file", nil, nil)
 	if err != nil {
@@ -474,7 +474,7 @@ func TestCheckPermissionAndApproval_UserFilePaths_RespectsDeny(t *testing.T) {
 		permissions: &permissions.PermissionsConfig{
 			DeniedCommands: []string{"curl *"},
 		},
-		userFilePaths: []string{"/tmp/user-upload/data.csv"},
+		userFilePaths: []UserAttachedPath{{Path: "/tmp/user-upload/data.csv"}},
 	}
 	tool := &mockApprovalTool{name: "bash", safeArgs: func(string) bool { return false }}
 
@@ -496,7 +496,7 @@ func TestCheckPermissionAndApproval_UserFilePaths_OnlyExactToolPath(t *testing.T
 	// Verify that only tools with extractable path fields are auto-approved,
 	// and only for exact path matches — not substring matches.
 	loop := &AgentLoop{
-		userFilePaths: []string{"/tmp/user-upload/data.csv"},
+		userFilePaths: []UserAttachedPath{{Path: "/tmp/user-upload/data.csv"}},
 	}
 	tool := &mockApprovalTool{name: "file_read", safeArgs: func(string) bool { return false }}
 
@@ -532,6 +532,43 @@ func TestCheckPermissionAndApproval_UserFilePaths_OnlyExactToolPath(t *testing.T
 	)
 	if diffApproved {
 		t.Error("expected file_read with non-matching path to NOT be auto-approved")
+	}
+}
+
+func TestCheckPermissionAndApproval_UserFilePaths_DirectoryPrefixMatch(t *testing.T) {
+	// Folder attachments grant subtree access; file attachments stay exact-match.
+	loop := &AgentLoop{
+		userFilePaths: []UserAttachedPath{
+			{Path: "/tmp/user-upload/proj", IsDir: true},
+			{Path: "/tmp/user-upload/report.pdf", IsDir: false},
+		},
+	}
+	tool := &mockApprovalTool{name: "file_read", safeArgs: func(string) bool { return false }}
+
+	cases := []struct {
+		name    string
+		argPath string
+		want    bool
+	}{
+		{"dir attachment + child file", "/tmp/user-upload/proj/src/main.go", true},
+		{"dir attachment + nested child", "/tmp/user-upload/proj/a/b/c.txt", true},
+		{"dir attachment + the dir itself", "/tmp/user-upload/proj", true},
+		{"dir attachment + sibling outside dir", "/tmp/user-upload/proj-other/x.go", false},
+		{"dir attachment + parent of dir", "/tmp/user-upload", false},
+		{"file attachment + exact path", "/tmp/user-upload/report.pdf", true},
+		{"file attachment + look-alike prefix file", "/tmp/user-upload/report.pdf.bak", false},
+		{"unrelated path", "/etc/passwd", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := fmt.Sprintf(`{"path": %q}`, tc.argPath)
+			_, approved := loop.checkPermissionAndApproval(
+				context.Background(), "file_read", args, tool, nil,
+			)
+			if approved != tc.want {
+				t.Errorf("argPath=%q: got approved=%v, want %v", tc.argPath, approved, tc.want)
+			}
+		})
 	}
 }
 

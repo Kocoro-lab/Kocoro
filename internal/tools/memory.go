@@ -52,12 +52,12 @@ type memoryArgs struct {
 func (t *MemoryTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "memory_recall",
-		Description: "Read structured long-term memory results from the user's personal knowledge graph.\n" +
+		Description: "Read structured episodic memory results from the user's Kocoro hippocampus — past sessions consolidated through nightly memory replay into long-term records.\n" +
 			"Modes:\n" +
 			"- direct_relation: one-hop predicate (e.g. \"what did X create?\"). Read `groups[].via_relations`.\n" +
 			"- path_query: multi-hop / possessive (e.g. \"what did X's collaborator create?\"). relation_constraints is the ordered path; inverse hops use `^-1`. Read `groups[].observed_path`.\n" +
 			"- typed_neighborhood: typed target with exactly one relation. Requires candidate_type. Rank by score.\n\n" +
-			"Evidence rules: ground each factual item in `supporting_event_ids` or `observed_path`, but in user-facing wording say \"past records\" / \"I found\"; do not surface raw event IDs, `memory_block`, `no_data_reason`, or scope labels unless the user asks for debug/provenance. If `no_data_reason` is set, say past records have no direct answer; do not invent from training data.",
+			"Evidence rules: ground each factual item in `supporting_event_ids` or `observed_path`, but in user-facing wording say \"past records\" / \"I found\" / \"过去的记录\" / \"以前提到过\"; do not surface raw event IDs, `memory_block`, `no_data_reason`, or scope labels unless the user asks for debug/provenance. If `no_data_reason` is set, say past records have no direct answer; do not invent from training data. The JSON schema field names and ontology terms used here are internal API vocabulary — see the system prompt's `## Private Memory > Internal vocabulary` rule for how to phrase findings in replies.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -166,7 +166,7 @@ func isBroadMemoryRelation(rel string) bool {
 	rel = strings.TrimPrefix(rel, "^")
 	rel = strings.TrimSuffix(rel, "^-1")
 	switch rel {
-	case "related_to", "relates_to", "associated_with", "about", "mentions":
+	case "related_to", "relates_to", "associated_with", "about", "mentions", "other":
 		return true
 	default:
 		return false

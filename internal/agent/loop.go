@@ -661,7 +661,7 @@ type AgentLoop struct {
 	memoryDir             string      // directory containing MEMORY.md; re-read each Run(), write-before-compact target
 	stickyContext         string      // session-scoped facts injected verbatim into system prompt; never truncated
 	outputFormat          string      // "markdown" (default) or "plain" — controls formatting guidance in volatile context
-	userFilePaths         []string    // paths from user-attached file_ref blocks — auto-approved for tool access
+	userFilePaths         []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
 	workingSet            *WorkingSet // session-scoped deferred schema cache injected by the caller
 	sessionID             string      // session ID for audit log correlation
 	sessionCWD            string      // session-scoped working directory; set by runner/TUI before Run()
@@ -672,9 +672,10 @@ type AgentLoop struct {
 	runMsgInjected        []bool           // parallel to runMessages: true = system-injected guardrail/nudge
 	runMsgTimestamps      []time.Time      // parallel to runMessages: when each message was created
 	lastRunStatus         RunStatus
-	toolRefSupported      bool            // true when the configured model supports defer_loading + tool_reference protocol
-	cacheSource           string          // tag sent to gateway on every Complete call for prompt-cache TTL routing
-	skillDiscovery        bool            // call small-tier model on first turn to identify relevant skills (default true)
+	toolRefSupported      bool   // true when the configured model supports defer_loading + tool_reference protocol
+	cacheSource           string // tag sent to gateway on every Complete call for prompt-cache TTL routing
+	skillDiscovery        bool   // call small-tier model on first turn to identify relevant skills (default true)
+	memoryPreflight       MemoryPreflightFunc
 	sentSkillNames        map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
 	readTracker           *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
 	// toolResultReplacements stores stable query-time replacements for large
@@ -865,6 +866,12 @@ func (a *AgentLoop) SetMCPContext(ctx string) {
 // Empty string is treated as "unknown" (5m fallback) by Shannon.
 func (a *AgentLoop) SetCacheSource(src string) {
 	a.cacheSource = src
+}
+
+// SetMemoryPreflight installs an optional fail-silent private-memory preflight.
+// The result is injected into the current prompt only; it is never persisted.
+func (a *AgentLoop) SetMemoryPreflight(fn MemoryPreflightFunc) {
+	a.memoryPreflight = fn
 }
 
 // SetReadTracker injects an externally-owned ReadTracker so file_read dedup
@@ -1152,9 +1159,20 @@ func (a *AgentLoop) SetSessionCWD(cwd string) {
 	a.sessionCWD = cwd
 }
 
+// UserAttachedPath represents a single path the user attached via a file_ref
+// block. IsDir distinguishes folder attachments from file attachments so the
+// auto-approve matcher can do prefix-match for directories (entries inside an
+// attached folder are auto-approved) while keeping file attachments
+// exact-match (no substring escalation).
+type UserAttachedPath struct {
+	Path  string
+	IsDir bool
+}
+
 // SetUserFilePaths registers file paths from user-attached file_ref blocks.
-// Tool calls whose arguments contain any of these paths are auto-approved.
-func (a *AgentLoop) SetUserFilePaths(paths []string) {
+// Tool calls whose arguments contain any of these paths are auto-approved
+// (exact match for files, subtree match for directories).
+func (a *AgentLoop) SetUserFilePaths(paths []UserAttachedPath) {
 	a.userFilePaths = paths
 }
 
@@ -1223,6 +1241,27 @@ func assembleUserMessage(parts prompt.PromptParts, userMessage string) string {
 	sb.WriteString(userMessage)
 
 	return sb.String()
+}
+
+func injectPrivateMemoryContext(scaffolded, userPayload, privateContext string) string {
+	privateContext = strings.TrimSpace(privateContext)
+	if privateContext == "" {
+		return scaffolded
+	}
+	if userPayload != "" && strings.HasSuffix(scaffolded, userPayload) {
+		return scaffolded[:len(scaffolded)-len(userPayload)] + privateContext + "\n\n" + userPayload
+	}
+	return scaffolded + "\n\n" + privateContext
+}
+
+func isFirstConversationUserMessage(history []client.Message) bool {
+	for _, msg := range history {
+		switch msg.Role {
+		case "user", "assistant", "tool":
+			return false
+		}
+	}
+	return true
 }
 
 func cloneMessages(messages []client.Message) []client.Message {
@@ -1547,8 +1586,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		messages = append(messages, ctxwin.SanitizeHistory(history)...)
 	}
 	var scaffoldedUserText string
+	var scaffoldUserPayloadText string
 	if len(userContent) > 0 && hasNonTextBlocks(userContent) {
 		// Multimodal (images present): must use block array format.
+		scaffoldUserPayloadText = userMessage
 		scaffoldedUserText = assembleUserMessage(parts, userMessage)
 		blocks := make([]client.ContentBlock, 0, 1+len(userContent))
 		blocks = append(blocks, client.ContentBlock{Type: "text", Text: scaffoldedUserText})
@@ -1562,6 +1603,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				merged += "\n\n" + b.Text
 			}
 		}
+		scaffoldUserPayloadText = merged
 		scaffoldedUserText = assembleUserMessage(parts, merged)
 		messages = append(messages, client.Message{Role: "user", Content: client.NewTextContent(scaffoldedUserText)})
 	}
@@ -1577,6 +1619,27 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	deltaIndices := make(map[int]bool)       // message indices that are delta injections (excluded from persistence)
 	msgTimestamps := make(map[int]time.Time) // message index → creation time
 	msgTimestamps[newMsgOffset] = time.Now() // timestamp the user message
+
+	if a.memoryPreflight != nil {
+		trace := MemoryPreflightTrace{Attempted: true, ForceHelper: isFirstConversationUserMessage(history)}
+		opts := MemoryPreflightOptions{ForceHelper: trace.ForceHelper, Trace: &trace}
+		if preflight := a.memoryPreflight(ctx, userMessage, opts); preflight != nil {
+			a.emitInternalUsage(preflight.Usage)
+			if privateContext := strings.TrimSpace(preflight.Context); privateContext != "" {
+				scaffoldedUserText = injectPrivateMemoryContext(scaffoldedUserText, scaffoldUserPayloadText, privateContext)
+				messages[newMsgOffset] = replaceUserMessageText(messages[newMsgOffset], scaffoldedUserText)
+				trace.ContextInjected = true
+			}
+		}
+		if trace.Outcome == "" {
+			if trace.ContextInjected {
+				trace.Outcome = "context_injected"
+			} else {
+				trace.Outcome = "no_results"
+			}
+		}
+		a.logMemoryPreflightTrace(trace)
+	}
 
 	// Install a conversation snapshot provider. Tools can call
 	// ConversationSnapshotFromContext to read the live conversation. The closure
@@ -1600,11 +1663,8 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		clone := cloneMessages(messages)
 		if newMsgOffset >= 0 && newMsgOffset < len(clone) {
 			m := clone[newMsgOffset]
-			if m.Role == "user" && !m.Content.HasBlocks() && m.Content.Text() == scaffoldedUserText {
-				clone[newMsgOffset] = client.Message{
-					Role:    "user",
-					Content: client.NewTextContent(rawUserMessage),
-				}
+			if m.Role == "user" && userMessageTextMatches(m, scaffoldedUserText) {
+				clone[newMsgOffset] = replaceUserMessageText(m, rawUserMessage)
 			}
 		}
 		out := make([]client.Message, 0, len(clone))
@@ -1643,11 +1703,8 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				// and overwriting its content would corrupt the persisted session
 				// with userMessage. Same rationale as the snapshot closure guard
 				// above — see that comment for the full explanation.
-				if first && msg.Role == "user" && !msg.Content.HasBlocks() && msg.Content.Text() == scaffoldedUserText {
-					msg = client.Message{
-						Role:    "user",
-						Content: client.NewTextContent(rawUserMessage),
-					}
+				if first && msg.Role == "user" && userMessageTextMatches(msg, scaffoldedUserText) {
+					msg = replaceUserMessageText(msg, rawUserMessage)
 				}
 				first = false
 				a.runMessages = append(a.runMessages, msg)
@@ -1914,7 +1971,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			emergencyMessages := cloneMessages(messages)
 			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
 			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, emergencyMessages)
+			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
 			restoreLLM()
 			a.emitInternalUsage(sumUsage)
 			if sumErr == nil {
@@ -2310,7 +2367,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					}
 
 					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-					summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, messages)
+					summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(messages))
 					restoreLLM()
 					a.emitInternalUsage(sumUsage)
 					trimmedSummary := strings.TrimSpace(summary)
@@ -2483,7 +2540,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			emergencyMessages := cloneMessages(messages)
 			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
 			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, emergencyMessages)
+			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
 			restoreLLM()
 			a.emitInternalUsage(sumUsage)
 			before := len(messages)
@@ -2654,7 +2711,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				softMessages := cloneMessages(messages)
 				compressOldToolResults(a.ctxWithUsageEmit(ctx), softMessages, compressAfter, maxResultChars, a.client)
 				restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-				summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(softMessages, nextSummary))
+				summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(softMessages), nextSummary))
 				restoreLLM()
 				a.emitInternalUsage(sumUsage)
 				if sumErr != nil {
@@ -2674,7 +2731,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
 
 					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-					summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(emergencyMessages, nextSummary))
+					summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(emergencyMessages), nextSummary))
 					restoreLLM()
 					a.emitInternalUsage(sumUsage)
 					if sumErr != nil {
@@ -3785,12 +3842,18 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 
 	// Auto-approve tool calls that operate on user-uploaded file paths.
 	// Checked AFTER hard-block/deny so destructive commands cannot piggyback.
-	// Only exact path matches are considered — no substring matching.
+	// File attachments: exact path match only — no substring escalation.
+	// Folder attachments: subtree match — files inside the attached folder
+	// are auto-approved (dragging a folder is intuitively "all of this").
 	if len(a.userFilePaths) > 0 {
 		if toolPath := extractToolPath(toolName, argsStr); toolPath != "" {
 			cleaned := filepath.Clean(toolPath)
 			for _, fp := range a.userFilePaths {
-				if cleaned == filepath.Clean(fp) {
+				cleanedFp := filepath.Clean(fp.Path)
+				if cleaned == cleanedFp {
+					return "allow", true
+				}
+				if fp.IsDir && strings.HasPrefix(cleaned, cleanedFp+string(filepath.Separator)) {
 					return "allow", true
 				}
 			}
@@ -3887,6 +3950,125 @@ func replaceUserMessageText(msg client.Message, newText string) client.Message {
 	return client.Message{Role: "user", Content: client.NewBlockContent(out)}
 }
 
+func userMessageTextMatches(msg client.Message, text string) bool {
+	if !msg.Content.HasBlocks() {
+		return msg.Content.Text() == text
+	}
+	for _, b := range msg.Content.Blocks() {
+		if b.Type == "text" {
+			return b.Text == text
+		}
+	}
+	return false
+}
+
+const (
+	privateMemoryOpenMarker  = "<private_memory>"
+	privateMemoryCloseMarker = "</private_memory>"
+)
+
+// stripPrivateMemoryForSummary returns a copy of messages with
+// <private_memory>…</private_memory> blocks removed from every user message's
+// text. The compaction summary should not learn recalled episodic facts —
+// after this strip, GenerateSummary sees only the user's question and
+// assistant context, never the injected private-memory block.
+//
+// Source messages are not mutated. Non-text blocks (images, tool_use,
+// tool_result) are preserved untouched. If no private-memory block is found,
+// the original messages slice is returned (no allocation).
+func stripPrivateMemoryForSummary(messages []client.Message) []client.Message {
+	for _, m := range messages {
+		if messageContainsPrivateMemory(m) {
+			out := make([]client.Message, len(messages))
+			for i, src := range messages {
+				out[i] = stripPrivateMemoryFromMessage(src)
+			}
+			return out
+		}
+	}
+	return messages
+}
+
+func messageContainsPrivateMemory(msg client.Message) bool {
+	if msg.Role != "user" {
+		return false
+	}
+	if !msg.Content.HasBlocks() {
+		return strings.Contains(msg.Content.Text(), privateMemoryOpenMarker)
+	}
+	for _, b := range msg.Content.Blocks() {
+		if b.Type == "text" && strings.Contains(b.Text, privateMemoryOpenMarker) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripPrivateMemoryFromMessage(msg client.Message) client.Message {
+	if msg.Role != "user" {
+		return msg
+	}
+	if !msg.Content.HasBlocks() {
+		cleaned := removePrivateMemoryBlocks(msg.Content.Text())
+		if cleaned == msg.Content.Text() {
+			return msg
+		}
+		out := msg
+		out.Content = client.NewTextContent(cleaned)
+		return out
+	}
+	blocks := msg.Content.Blocks()
+	cleanedBlocks := make([]client.ContentBlock, len(blocks))
+	changed := false
+	for i, b := range blocks {
+		if b.Type != "text" {
+			cleanedBlocks[i] = b
+			continue
+		}
+		cleanedText := removePrivateMemoryBlocks(b.Text)
+		if cleanedText != b.Text {
+			changed = true
+		}
+		nb := b
+		nb.Text = cleanedText
+		cleanedBlocks[i] = nb
+	}
+	if !changed {
+		return msg
+	}
+	out := msg
+	out.Content = client.NewBlockContent(cleanedBlocks)
+	return out
+}
+
+func removePrivateMemoryBlocks(s string) string {
+	for {
+		i := strings.Index(s, privateMemoryOpenMarker)
+		if i < 0 {
+			return s
+		}
+		rel := strings.Index(s[i:], privateMemoryCloseMarker)
+		if rel < 0 {
+			return s // unterminated marker — leave untouched
+		}
+		end := i + rel + len(privateMemoryCloseMarker)
+		for end < len(s) && (s[end] == '\n' || s[end] == '\r' || s[end] == ' ' || s[end] == '\t') {
+			end++
+		}
+		start := i
+		for start > 0 && (s[start-1] == ' ' || s[start-1] == '\t') {
+			start--
+		}
+		if start > 0 && s[start-1] == '\n' {
+			start--
+			if start > 0 && s[start-1] == '\r' {
+				start--
+			}
+		}
+		s = s[:start] + s[end:]
+	}
+}
+
 // extractToolPath extracts the primary file path from a tool's JSON arguments.
 // Returns empty string if the tool doesn't operate on file paths or parsing fails.
 func extractToolPath(toolName, argsJSON string) string {
@@ -3945,6 +4127,48 @@ func (a *AgentLoop) logAudit(toolName, argsStr, outputSummary, decision string, 
 		entry.Model = usage.Model
 	}
 	a.auditor.Log(entry)
+}
+
+func (a *AgentLoop) logMemoryPreflightTrace(trace MemoryPreflightTrace) {
+	if a.auditor == nil || !trace.Attempted {
+		return
+	}
+	summary, err := json.Marshal(struct {
+		Attempted       bool   `json:"attempted"`
+		ForceHelper     bool   `json:"force_helper"`
+		HelperUsed      bool   `json:"helper_used"`
+		IntentSource    string `json:"intent_source,omitempty"`
+		IntentsCount    int    `json:"intents_count"`
+		Queried         bool   `json:"queried"`
+		ResultsCount    int    `json:"results_count"`
+		ContextReturned bool   `json:"context_returned"`
+		ContextInjected bool   `json:"context_injected"`
+		Outcome         string `json:"outcome,omitempty"`
+		ErrorClass      string `json:"error_class,omitempty"`
+		HTTPStatus      int    `json:"http_status,omitempty"`
+	}{
+		Attempted:       trace.Attempted,
+		ForceHelper:     trace.ForceHelper,
+		HelperUsed:      trace.HelperUsed,
+		IntentSource:    trace.IntentSource,
+		IntentsCount:    trace.IntentsCount,
+		Queried:         trace.Queried,
+		ResultsCount:    trace.ResultsCount,
+		ContextReturned: trace.ContextReturned,
+		ContextInjected: trace.ContextInjected,
+		Outcome:         trace.Outcome,
+		ErrorClass:      trace.ErrorClass,
+		HTTPStatus:      trace.HTTPStatus,
+	})
+	if err != nil {
+		return
+	}
+	a.auditor.Log(audit.AuditEntry{
+		Timestamp:    time.Now(),
+		SessionID:    a.sessionID,
+		Event:        "memory_preflight",
+		InputSummary: string(summary),
+	})
 }
 
 // base64ImagePattern matches long base64 strings that start with known image signatures.

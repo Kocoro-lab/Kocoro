@@ -201,9 +201,32 @@ var imageExtensions = map[string]string{
 // resolveFileRef returns the appropriate content blocks for a file_ref.
 // Images → model-visible path hint plus base64 image block so the agent has
 // both a reusable file handle and inline vision access.
+// Directories → hint suggests glob/grep/directory_list/bash to explore.
+// Zip archives → hint suggests `bash unzip -l` for listing, `bash unzip` for extract.
 // All other files → text hint with path so the agent reads via file_read tool.
 func resolveFileRef(b RequestContentBlock) []client.ContentBlock {
 	ext := strings.ToLower(filepath.Ext(b.Filename))
+
+	// Directories: stat to confirm and emit a folder-aware hint. Tool calls
+	// inside the directory are auto-approved by the agent loop's
+	// userFilePaths matcher (prefix-match for IsDir entries).
+	if info, err := os.Stat(b.FilePath); err == nil && info.IsDir() {
+		return []client.ContentBlock{{
+			Type: "text",
+			Text: fmt.Sprintf("[User attached folder: %s at path: %s — use directory_list, glob, grep, file_read, or bash to explore. Tool calls against files inside this folder are auto-approved.]",
+				b.Filename, b.FilePath),
+		}}
+	}
+
+	// Zip archives: opaque file_ref. file_read can't usefully read a zip's
+	// raw bytes, so route the model to bash unzip.
+	if ext == ".zip" {
+		return []client.ContentBlock{{
+			Type: "text",
+			Text: fmt.Sprintf("[User attached zip archive: %s (%d bytes) at path: %s — use `bash unzip -l <path>` to list contents, `bash unzip <path> -d <dir>` to extract.]",
+				b.Filename, b.ByteSize, b.FilePath),
+		}}
+	}
 
 	// Images must be inline base64 — Claude vision requires image data in the request body.
 	if mimeType, ok := imageExtensions[ext]; ok {
@@ -264,13 +287,20 @@ func resolveFileRef(b RequestContentBlock) []client.ContentBlock {
 
 // extractUserFilePaths collects file paths from file_ref content blocks.
 // These paths represent files the user explicitly attached, so tool access
-// to them should be auto-approved without prompting.
-func extractUserFilePaths(blocks []RequestContentBlock) []string {
-	var paths []string
+// to them should be auto-approved without prompting. Each path is stat'd so
+// the agent loop can apply subtree matching for directory attachments and
+// exact matching for file attachments.
+func extractUserFilePaths(blocks []RequestContentBlock) []agent.UserAttachedPath {
+	var paths []agent.UserAttachedPath
 	for _, b := range blocks {
-		if b.Type == "file_ref" && b.FilePath != "" {
-			paths = append(paths, b.FilePath)
+		if b.Type != "file_ref" || b.FilePath == "" {
+			continue
 		}
+		isDir := false
+		if info, err := os.Stat(b.FilePath); err == nil {
+			isDir = info.IsDir()
+		}
+		paths = append(paths, agent.UserAttachedPath{Path: b.FilePath, IsDir: isDir})
 	}
 	return paths
 }
@@ -1019,6 +1049,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
 	loop.SetCacheSource(cacheSourceFromDaemonSource(req.Source))
 	loop.SetSkillDiscovery(runCfg.Agent.SkillDiscoveryEnabled())
+	if deps.MemSvc != nil {
+		var helperLLM client.LLMClient
+		if deps.GW != nil {
+			helperLLM = deps.GW
+		}
+		loop.SetMemoryPreflight(tools.NewMemoryPreflight(deps.MemSvc, helperLLM))
+	}
 	loop.SetTimeBasedCompactConfig(agent.TimeBasedCompactConfig{
 		Enabled:             runCfg.Agent.TimeBasedCompact.Enabled,
 		GapThresholdMinutes: runCfg.Agent.TimeBasedCompact.GapThresholdMinutes,
@@ -1155,7 +1192,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		filePreview.AllowRoot(effectiveCWD)
 	}
 	for _, p := range extractUserFilePaths(req.Content) {
-		filePreview.AllowFile(p)
+		// Both APIs are stat-based and silently ignore wrong-type inputs:
+		// AllowFile no-ops on directories, AllowRoot no-ops on regular files.
+		// Calling both lets folder attachments grant subtree access while
+		// file attachments stay exact-match.
+		filePreview.AllowFile(p.Path)
+		if p.IsDir {
+			filePreview.AllowRoot(p.Path)
+		}
 	}
 	sessMgr.OnSessionClose(sess.ID, func() { _ = filePreview.Close() })
 	if cloudSessionCWD != "" {

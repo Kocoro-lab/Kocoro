@@ -187,9 +187,10 @@ type Model struct {
 	hookRunner          *hooks.HookRunner
 	customCommands      map[string]string // name → prompt content from commands/*.md
 	bypassPermissions   bool
-	agentOverride       *agents.Agent      // per-agent override for re-application after async tool load
-	loadedSkills        []*skills.Skill    // skills for current agent (survives loop re-creation)
-	skillsPtr           *[]*skills.Skill   // pointer into use_skill tool's skills slice
+	agentOverride       *agents.Agent    // per-agent override for re-application after async tool load
+	loadedSkills        []*skills.Skill  // skills for current agent (survives loop re-creation)
+	skillsPtr           *[]*skills.Skill // pointer into use_skill tool's skills slice
+	memPreflight        tools.MemoryPreflightQuerier
 	remoteCleanup       func()             // cleanup for MCP connections from async load
 	cancelRun           context.CancelFunc // cancels the running agent loop
 	injectCh            chan agent.InjectedMessage
@@ -387,13 +388,16 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	// register with a typed-nil MemoryQuerier so the tool falls back to
 	// session_search + MEMORY.md.
 	var memQuerier tools.MemoryQuerier
+	var memPreflightQuerier tools.MemoryPreflightQuerier
 	memCfg := memory.LoadConfigFromRuntime(runtimeCfg)
 	if memCfg.Provider != "" && memCfg.Provider != "disabled" {
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 1*time.Second)
 		ready, _ := memory.AttachPolicy(probeCtx, memCfg.SocketPath)
 		probeCancel()
 		if ready {
-			memQuerier = memory.NewAttachedQuerier(memCfg.SocketPath, memCfg.ClientRequestTimeout)
+			attached := memory.NewAttachedQuerier(memCfg.SocketPath, memCfg.ClientRequestTimeout)
+			memQuerier = attached
+			memPreflightQuerier = attached
 		}
 	}
 	tools.RegisterMemoryTool(reg, memQuerier, &tuiMemoryFallback{sessionMgr: sessMgr})
@@ -402,10 +406,24 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	loop := agent.NewAgentLoop(llmClient, reg, runtimeCfg.ModelTier, shannonDir, runtimeCfg.Agent.MaxIterations, runtimeCfg.Tools.ResultTruncation, runtimeCfg.Tools.ArgsTruncation, &runtimeCfg.Permissions, auditor, hookRunner)
 	loop.SetMaxTokens(runtimeCfg.Agent.MaxTokens)
 	loop.SetTemperature(runtimeCfg.Agent.Temperature)
-	loop.SetContextWindow(runtimeCfg.Agent.ContextWindow)
+	// Seed from the configured model and the session's last-seen model so
+	// the first preflight check after a resume/agent-switch uses the right
+	// cap, instead of falling back to the static config until the next
+	// response arrives. sess at this point is a freshly-created session,
+	// so LastSeenModel returns "" — but the configured-model path still
+	// applies for known IDs.
+	loop.SetContextWindow(agent.SeedContextWindowFromModels(
+		runtimeCfg.Agent.Model, sess.LastSeenModel(), runtimeCfg.Agent.ContextWindow))
 	// Interactive TUI — long-lived session with iteration, 1h cache pays off.
 	loop.SetCacheSource("tui")
 	loop.SetSkillDiscovery(runtimeCfg.Agent.SkillDiscoveryEnabled())
+	if memPreflightQuerier != nil {
+		var helperLLM client.LLMClient
+		if gateway != nil {
+			helperLLM = gateway
+		}
+		loop.SetMemoryPreflight(tools.NewMemoryPreflight(memPreflightQuerier, helperLLM))
+	}
 	loop.SetTimeBasedCompactConfig(agent.TimeBasedCompactConfig{
 		Enabled:             runtimeCfg.Agent.TimeBasedCompact.Enabled,
 		GapThresholdMinutes: runtimeCfg.Agent.TimeBasedCompact.GapThresholdMinutes,
@@ -493,6 +511,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		agentOverride:  agentOverride,
 		loadedSkills:   loadedSkills,
 		skillsPtr:      skillsPtr,
+		memPreflight:   memPreflightQuerier,
 		markdownCache:  make(map[string]string),
 		slashCommands:  instanceCmds,
 		sessionAllowed: make(map[string]bool),
@@ -552,9 +571,27 @@ func (m *Model) rebuildAgentLoop() {
 	loop := agent.NewAgentLoop(m.llmClient, m.toolRegistry, m.cfg.ModelTier, m.shannonDir, m.cfg.Agent.MaxIterations, m.cfg.Tools.ResultTruncation, m.cfg.Tools.ArgsTruncation, &m.cfg.Permissions, m.auditor, m.hookRunner)
 	loop.SetMaxTokens(m.cfg.Agent.MaxTokens)
 	loop.SetTemperature(m.cfg.Agent.Temperature)
-	loop.SetContextWindow(m.cfg.Agent.ContextWindow)
+	// Seed the soft context window from the configured model + the
+	// currently-active session's last-seen model. After an agent switch
+	// the session may already carry usage from prior turns served by a
+	// 1M-context model; without this, preflight would re-seed at the
+	// static config and over-truncate until the next response arrives.
+	var resumedSeenModel string
+	if sess := m.sessions.Current(); sess != nil {
+		resumedSeenModel = sess.LastSeenModel()
+	}
+	loop.SetContextWindow(agent.SeedContextWindowFromModels(
+		m.cfg.Agent.Model, resumedSeenModel, m.cfg.Agent.ContextWindow))
 	// Interactive TUI (switched agent) — same routing as the primary loop.
 	loop.SetCacheSource("tui")
+	loop.SetSkillDiscovery(m.cfg.Agent.SkillDiscoveryEnabled())
+	if m.memPreflight != nil {
+		var helperLLM client.LLMClient
+		if m.gateway != nil {
+			helperLLM = m.gateway
+		}
+		loop.SetMemoryPreflight(tools.NewMemoryPreflight(m.memPreflight, helperLLM))
+	}
 	if m.cfg.Agent.Model != "" {
 		loop.SetSpecificModel(m.cfg.Agent.Model)
 	} else if m.cfg.Provider == "ollama" && m.cfg.Ollama.Model != "" {

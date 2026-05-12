@@ -558,7 +558,7 @@ func TestMemoryTool_CoercesStringEncodedArrays(t *testing.T) {
 
 	// anchor_mentions and relation_constraints as JSON-encoded strings, result_limit as string
 	res, err := tool.Run(context.Background(),
-		`{"mode":"direct_relation","anchor_mentions":"[\"Wayland Zhang\"]","relation_constraints":"[\"created\"]","result_limit":"10"}`)
+		`{"mode":"direct_relation","anchor_mentions":"[\"Example Person\"]","relation_constraints":"[\"created\"]","result_limit":"10"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

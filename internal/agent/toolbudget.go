@@ -21,9 +21,17 @@ const (
 // alwaysDeferTools enumerates local tools whose schemas should start out
 // deferred regardless of the total schema budget. These are categories that
 // most one-shot CLI tasks never use (macOS GUI automation, scheduling,
-// memory-recall, headless process control). Keeping them in the deferred
-// set means cold-start `tools[]` ships ~5K fewer tokens; sessions that DO
-// need them pay one extra `tool_search` round-trip per session.
+// headless process control). Keeping them in the deferred set means cold-start
+// `tools[]` ships ~5K fewer tokens; sessions that DO need them pay one extra
+// `tool_search` round-trip per session.
+//
+// memory_recall is intentionally NOT in this set: it is the explicit fallback
+// path when the implicit memory preflight injects nothing (or the model needs
+// a relation the injected block did not cover). Keeping it always-loaded
+// avoids the "model hallucinates an older schema on first attempt → wasted
+// turn" failure mode observed in production, and the ~1.5K extra schema bytes
+// ride along in the cacheable system prefix so the cost is paid once per
+// session, not per turn.
 //
 // The browser_* prefix is matched separately by shouldDeferByCategory.
 //
@@ -40,7 +48,6 @@ var alwaysDeferTools = map[string]bool{
 	"schedule_list":   true,
 	"schedule_remove": true,
 	"schedule_update": true,
-	"memory_recall":   true,
 }
 
 // shouldDeferByCategory reports whether a tool name belongs to a category

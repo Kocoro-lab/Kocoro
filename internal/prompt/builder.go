@@ -33,9 +33,9 @@ type DeferredToolSummary struct {
 
 // PromptOptions configures the system prompt assembly.
 type PromptOptions struct {
-	BasePrompt   string   // persona + core operational rules
-	Memory       string   // from LoadMemory (~500 tokens budget) — rendered in VolatileContext
-	Instructions string   // from LoadInstructions (~4000 tokens budget) — rendered in StableContext so it joins the cacheable prefix
+	BasePrompt   string // persona + core operational rules
+	Memory       string // from LoadMemory (~500 tokens budget) — rendered in VolatileContext
+	Instructions string // from LoadInstructions (~4000 tokens budget) — rendered in StableContext so it joins the cacheable prefix
 	// LocalToolNames is the deterministic-ordered list of locally-registered
 	// tool names (built-ins like file_read, bash, etc.). Rendered in the
 	// system prompt's "## Available Tools" line. Excludes MCP and gateway
@@ -49,11 +49,11 @@ type PromptOptions struct {
 	// GatewayToolNames is the list of names from gateway-origin tools.
 	// Same routing rationale as MCPToolNames.
 	GatewayToolNames []string
-	MCPContext   string   // context from MCP servers (auth info, usage hints)
-	Skills       []*skills.Skill
-	CWD          string // current working directory
-	SessionInfo  string // optional session context (currently unused by agent loop)
-	MemoryDir    string // directory containing MEMORY.md for agent memory writes
+	MCPContext       string // context from MCP servers (auth info, usage hints)
+	Skills           []*skills.Skill
+	CWD              string // current working directory
+	SessionInfo      string // optional session context (currently unused by agent loop)
+	MemoryDir        string // directory containing MEMORY.md for agent memory writes
 	// StickyContext holds session-scoped facts injected verbatim into StableContext.
 	// Never truncated or compacted. Use for key transactional data (IDs, amounts, names)
 	// that must survive context compaction. Populated by the daemon runner with session
@@ -83,13 +83,13 @@ type PromptOptions struct {
 // Layer semantics:
 //   - System         : persona, core rules, tool names, skills — gateway-cached.
 //   - StableContext  : shared org-wide instructions (instructions.md + rules/*.md +
-//                      project overrides) and sticky session facts. Changes only
-//                      across sessions or on file edits. Sits before the
-//                      cache_break marker in the user message so providers that
-//                      reuse the pre-break prefix can hit on it.
+//     project overrides) and sticky session facts. Changes only
+//     across sessions or on file edits. Sits before the
+//     cache_break marker in the user message so providers that
+//     reuse the pre-break prefix can hit on it.
 //   - VolatileContext: memory (mutated by memory_append mid-session), date/time,
-//                      CWD, MCP server context, output format guidance. Sits
-//                      after the cache_break marker and is re-sent each turn.
+//     CWD, MCP server context, output format guidance. Sits
+//     after the cache_break marker and is re-sent each turn.
 type PromptParts struct {
 	System          string // static: persona + rules + guidance + tool names + skills (cached by gateway)
 	StableContext   string // per-session cacheable prefix: shared instructions + sticky facts (before cache_break)
@@ -173,6 +173,17 @@ func buildStaticSystem(opts PromptOptions) string {
 			"  turn 1: file_read A + file_read B + file_read C\n" +
 			"Only sequence when later calls genuinely depend on earlier results.")
 	}
+
+	sb.WriteString("\n\n## Private Memory\n")
+	sb.WriteString("When a <private_memory> block is present in the user message:\n" +
+		"- Treat it as authoritative personal facts from the user's past records; prefer it over training knowledge.\n" +
+		"- Do not call memory_recall to re-fetch the same anchors with related relations — the injected block already represents the best-available evidence for those anchors.\n" +
+		"- Only call memory_recall when the user's question genuinely requires a specific canonical relation that is not represented in the injected block.\n" +
+		"- Do not surface raw provenance (event IDs, support counts, scope tags) unless the user explicitly asks.\n" +
+		"When <private_memory> is absent, memory_recall remains the normal first step for memory questions.\n\n" +
+		"### Internal vocabulary\n" +
+		"The memory subsystem has its own JSON schema field names, ontology terms, and storage metaphors (for example: entity, anchor, relation, scope, candidate, evidence, hippocampus, graph, node, edge — and the same words in any other language, including 实体, 锚点, 图谱, 节点, etc.). These are internal API vocabulary and never appear in user-facing replies. " +
+		"When you describe what you found, name items by their human description — the person's name, the project, the company, the file — or speak generically as \"past records\" / \"过去的记录\" / \"I found\" / \"提到过\". The same rule applies whether the source was <private_memory>, memory_recall results, or session_search hits.")
 
 	// Text output — stable across sessions/users/format. See
 	// docs/superpowers/specs/2026-05-07-agent-preamble-output-design.md.

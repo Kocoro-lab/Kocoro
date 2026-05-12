@@ -454,7 +454,8 @@ func TestHasCategoricalDeferred(t *testing.T) {
 		{"contains computer", map[string]bool{"mcp_a": true, "computer": true}, true},
 		{"contains browser_*", map[string]bool{"browser_click": true}, true},
 		{"contains schedule_*", map[string]bool{"schedule_remove": true}, true},
-		{"contains memory_recall", map[string]bool{"memory_recall": true}, true},
+		{"contains process", map[string]bool{"process": true}, true},
+		{"memory_recall no longer always-deferred", map[string]bool{"memory_recall": true}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

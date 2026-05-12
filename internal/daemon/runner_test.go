@@ -578,8 +578,33 @@ func TestExtractUserFilePaths(t *testing.T) {
 	if len(paths) != 2 {
 		t.Fatalf("expected 2 paths, got %d: %v", len(paths), paths)
 	}
-	if paths[0] != "/tmp/report.pdf" || paths[1] != "/tmp/data.csv" {
+	if paths[0].Path != "/tmp/report.pdf" || paths[1].Path != "/tmp/data.csv" {
 		t.Errorf("unexpected paths: %v", paths)
+	}
+	if paths[0].IsDir || paths[1].IsDir {
+		t.Errorf("expected IsDir=false for missing/regular paths, got %v", paths)
+	}
+}
+
+func TestExtractUserFilePaths_DetectsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "x.txt")
+	if err := os.WriteFile(file, []byte("hi"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	blocks := []RequestContentBlock{
+		{Type: "file_ref", FilePath: dir, Filename: filepath.Base(dir)},
+		{Type: "file_ref", FilePath: file, Filename: "x.txt"},
+	}
+	paths := extractUserFilePaths(blocks)
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 paths, got %d", len(paths))
+	}
+	if !paths[0].IsDir {
+		t.Errorf("expected directory entry IsDir=true, got %+v", paths[0])
+	}
+	if paths[1].IsDir {
+		t.Errorf("expected file entry IsDir=false, got %+v", paths[1])
 	}
 }
 
