@@ -371,9 +371,17 @@ func truncate(s string, maxChars int) string {
 // Without this, an instructions.md or sticky-facts payload that happens to
 // contain the closing tag (e.g. documentation discussing this mechanism)
 // would silently truncate the trust channel and leak the rest of the body
-// out as plain user-role content. Opening tags inside the body are
-// harmless — Anthropic parses by first close, and our wrapper is the
-// outermost block. Issue #125.
+// out as plain user-role content.
+//
+// The asymmetry — strip closers but not openers — is deliberate. An opener
+// leaking through produces a nested but still well-formed trust channel
+// (`<system-reminder>` inside another `<system-reminder>`); Anthropic's
+// parser handles nesting permissively and the content stays inside the
+// outer trust envelope. A closer leaking through produces the opposite —
+// the rest of the body escapes the channel and gets re-classified as plain
+// user content, which is the failure mode this PR exists to prevent.
+// Stripping only closers fixes the dangerous case without burning cycles
+// on a harmless one. Issue #125.
 func sanitizeForReminder(s string) string {
 	return strings.ReplaceAll(s, "</system-reminder>", "")
 }

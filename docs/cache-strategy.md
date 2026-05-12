@@ -21,9 +21,8 @@ How ShanClaw + Shannon allocate Anthropic's 4 `cache_control` breakpoints and ro
 for any two users running the same agent on the same OS. Per-user values
 (MCP tool names, deferred-tool listings, anything that varies with user
 configuration) are routed to BP #3 (`StableContext` via `BuildToolListing`)
-or to the volatile segment. Test guards: see
-`TestBuildSystemPrompt_BP1ByteStableAcrossMCPConfigs` and
-`TestBuildSystemPrompt_SystemHashIdenticalAcrossMCPVariation` in
+or to the volatile segment. Test guard: see
+`TestBuildSystemPrompt_BP1ByteStableAcrossMCPConfigs` in
 `internal/prompt/builder_test.go`. Production telemetry: `system_stable_hash`
 field on `cache_summary` audit entries (`internal/audit/audit.go`).
 
@@ -119,7 +118,7 @@ bash /tmp/bench_longturn.sh 30
 bash /tmp/bench_parallel.sh 15
 ```
 
-KPI targets (see `docs/cache-bench-results/2026-04-15-baseline.md` for baseline, and `docs/cache-bench-results/2026-04-15-final.md` for post-Phase-1+2+4 numbers):
+KPI targets (per-run bench artifacts under `docs/cache-bench-results/` are local-only — not tracked in this repo):
 
 | # | KPI | Target | Measured (final) |
 |---|---|---|---|
@@ -181,7 +180,7 @@ content is per-user by construction. See `prompt.BuildToolListing`.
 1. Enable `SHANNON_CACHE_DEBUG=1`, reproduce, and inspect `~/.shannon/logs/cache-debug.log` for `BYTE_DRIFT` (same `system_len`, different `system_h` across calls) — see `docs/cache-debug.md` for log schema
 2. If drift: enable `SHANNON_CACHE_DRIFT_DEBUG=1` and compare `payload_h` of drifting requests → find the non-deterministic marshaler
 3. If no drift: check `msgs` growth per turn; if > 20 and prompt doesn't encourage parallel tool use, Phase 2 nudge may be stripped by an agent override
-4. If neither: check whether `cache_source` was accidentally set to a short-bucket where a long bucket was intended — look at `docs/cache-bench-results/` for per-source breakdown
+4. If neither: check whether `cache_source` was accidentally set to a short-bucket where a long bucket was intended — `jq -r '.cache_source' ~/.shannon/logs/audit.log | sort | uniq -c` gives a per-source breakdown
 
 **Bumping Anthropic SDK:**
 SDK changes can silently alter message serialization. After any `anthropic` version bump, run `pytest tests/test_byte_stability.py` and a 30-turn bench to verify CHR hasn't regressed.
