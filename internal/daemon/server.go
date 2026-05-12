@@ -1139,20 +1139,30 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// Attachment-bearing messages cannot be injected because InjectedMessage
 	// is a Text/CWD-only envelope; silently dropping req.Content would mean
 	// the LLM sees an attachment-shaped UI chip on Desktop but receives only
-	// the text in its turn. Make the client retry once the active run ends.
+	// the text in its turn. So reject 409 — but ONLY when an active run
+	// actually exists for this route. Without an active run we fall through
+	// to the normal session-start path below; that path consumes req.Content
+	// correctly. The Desktop client always carries a RouteKey on every send
+	// (including new sessions), so gating on RouteKey alone misroutes fresh
+	// requests through the inject path.
 	if req.RouteKey != "" {
 		if len(req.Content) > 0 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(map[string]string{
-				"status": "rejected",
-				"reason": "active_run_not_ready",
-				"route":  req.RouteKey,
-				"detail": "attachments cannot be injected into an in-flight run; retry after current turn",
-			})
-			return
-		}
-		switch s.deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{Text: req.Text, CWD: req.CWD}) {
+			if s.deps.SessionCache.HasActiveRun(req.RouteKey) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "rejected",
+					"reason": "active_run_not_ready",
+					"route":  req.RouteKey,
+					"detail": "attachments cannot be injected into an in-flight run; retry after current turn",
+				})
+				return
+			}
+			// No active run on this route — skip the inject attempt and let
+			// the normal session-start path below handle it (it will pick up
+			// req.Content via resolveContentBlocks).
+		} else {
+			switch s.deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{Text: req.Text, CWD: req.CWD}) {
 		case InjectOK:
 			if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -1198,7 +1208,8 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		case InjectNoActiveRun:
-			// Fall through to start a new RunAgent
+				// Fall through to start a new RunAgent
+			}
 		}
 	}
 

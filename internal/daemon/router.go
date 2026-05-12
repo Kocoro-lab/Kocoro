@@ -286,6 +286,23 @@ const (
 	InjectCWDConflict                     // active run uses a different immutable cwd
 )
 
+// HasActiveRun reports whether the route currently owns an in-flight
+// agent run. Pure lookup, no side effects — safe to call from request
+// handlers that need to decide between "inject into existing run" vs
+// "start a new run" without actually delivering anything.
+func (sc *SessionCache) HasActiveRun(key string) bool {
+	if key == "" {
+		return false
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	entry, ok := sc.routes[key]
+	if !ok || entry == nil {
+		return false
+	}
+	return entry.done != nil
+}
+
 // InjectMessage sends a message into a running agent loop for this route.
 // Returns:
 //   - InjectOK when the follow-up was delivered to the active run
