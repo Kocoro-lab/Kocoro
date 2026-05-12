@@ -14,11 +14,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 const (
-	maxFileSize     = 100 * 1024 * 1024 // 100 MB per file
-	maxFiles        = 10                // max attachments per message
+	// File caps aligned with claude.ai (500 MB / 20 files) per plan §2 P0.
+	maxFileSize     = 500 * 1024 * 1024 // 500 MB per file
+	maxFiles        = 20                // max attachments per message
 	downloadTimeout = 2 * time.Minute
 
 	// maxInlineImageBase64Bytes caps the pre-decode size of inline image
@@ -26,8 +29,30 @@ const (
 	// base64 allocation before the downstream 20 MB decoded cap in
 	// resolveFileRef fires. Uses the worst-case 4/3 base64 inflation ratio
 	// plus a few bytes of padding slack.
-	maxInlineImageDecodedBytes   = 20 * 1024 * 1024
-	maxInlineImageBase64Bytes    = maxInlineImageDecodedBytes*4/3 + 4
+	//
+	// NOTE: intentionally NOT raised alongside maxFileSize. Inline images
+	// arrive base64-decoded into one contiguous allocation, so they own a
+	// much tighter budget than streamed file downloads. Anthropic's vision
+	// payload sweet spot is well under 20 MB; raising this cap rewards
+	// pathological inputs (multi-hundred-MB screenshots) without unlocking
+	// new use cases.
+	maxInlineImageDecodedBytes = 20 * 1024 * 1024
+	maxInlineImageBase64Bytes  = maxInlineImageDecodedBytes*4/3 + 4
+
+	// MaxExtractedTextChars enforces plan §4.5.1 at the daemon edge: even if
+	// cloud sends an oversized ExtractedText (old build / bug), daemon
+	// truncates before writing to session JSON. Rune-counted to avoid
+	// splitting multi-byte UTF-8 characters mid-symbol.
+	MaxExtractedTextChars = 500_000
+
+	// MaxInlineDocumentB64Bytes caps base64 size of inline `document` blocks
+	// so we reject before allocating decoded bytes. 32 MB raw × 4/3 base64
+	// inflation = ~42.7 MB, but Anthropic's per-request hard cap is 32 MB
+	// (encoded). The 25 MB raw threshold (≈33 MB base64) keeps a small buffer
+	// for the rest of the request body. Cloud's §4.5 size gate is the primary
+	// guard; this is defense in depth.
+	maxInlineDocumentDecodedBytes = 25 * 1024 * 1024
+	maxInlineDocumentB64Bytes  = maxInlineDocumentDecodedBytes*4/3 + 4
 )
 
 // urlValidator is the URL validation function used before each download.
@@ -71,11 +96,20 @@ func combineCleanup(existing, next func()) func() {
 	}
 }
 
-// downloadRemoteFiles downloads remote file attachments to a local temp
-// directory and returns file_ref RequestContentBlocks plus a cleanup function
-// that removes the attachment directory. The caller must register the cleanup
-// (e.g. via OnSessionClose). Download failures produce text error blocks
-// rather than failing the entire message.
+// downloadRemoteFiles materializes remote file attachments into
+// RequestContentBlocks suitable for the LLM. Per plan §4.3 priority order:
+//
+//  1. DocumentB64 non-empty → decode + write to tmp dir, emit a `document`
+//     block (base64 source) + companion `text` hint pointing at the local path.
+//  2. ExtractedText non-empty → single `text` block prefixed with the filename
+//     and mimetype. Daemon-side enforces MaxExtractedTextChars truncation as a
+//     defense-in-depth guard (plan §4.5.1).
+//  3. URL non-empty → legacy HTTP download path (file_ref block).
+//  4. None of the above → text warning block (don't silently drop, §4.8).
+//
+// Cleanup removes the per-message attachment directory. The directory is
+// created lazily so requests carrying only ExtractedText (no files written
+// to disk) don't leave empty directories behind.
 func downloadRemoteFiles(shannonDir string, files []RemoteFile) ([]RequestContentBlock, func()) {
 	if len(files) == 0 {
 		return nil, func() {}
@@ -92,16 +126,29 @@ func downloadRemoteFiles(shannonDir string, files []RemoteFile) ([]RequestConten
 		})
 	}
 
-	dir, cleanup, err := createAttachmentDir(shannonDir)
-	if err != nil {
-		log.Printf("daemon: failed to create attachment dir: %v", err)
-		return nil, func() {}
+	// Lazy attachment directory: only created when the first file actually
+	// needs disk storage (DocumentB64 decode or URL download). Pure
+	// ExtractedText requests never allocate a directory.
+	var (
+		dir     string
+		cleanup func()
+		dirErr  error
+	)
+	ensureDir := func() (string, error) {
+		if dir != "" || dirErr != nil {
+			return dir, dirErr
+		}
+		dir, cleanup, dirErr = createAttachmentDir(shannonDir)
+		if dirErr != nil {
+			log.Printf("daemon: failed to create attachment dir: %v", dirErr)
+		}
+		return dir, dirErr
 	}
 
 	// Custom client that preserves Authorization header across redirects.
 	// Slack may redirect file URLs to CDN; Go's default policy strips
 	// the header on cross-domain redirects.
-	client := &http.Client{
+	httpClient := &http.Client{
 		Timeout: downloadTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
@@ -121,28 +168,207 @@ func downloadRemoteFiles(shannonDir string, files []RemoteFile) ([]RequestConten
 	blocks := make([]RequestContentBlock, 0, len(capped))
 
 	for i, f := range capped {
-		diskName := sanitizeFilename(i, f.Name)
-		localPath := filepath.Join(dir, diskName)
-		// Use the original filename for display (what the LLM sees in hints).
-		// Fall back to the sanitized disk name for empty/degenerate inputs.
 		displayName := f.Name
 		if displayName == "" || displayName == "." || displayName == ".." {
-			displayName = diskName
+			displayName = sanitizeFilename(i, f.Name)
 		}
 
-		block, err := downloadOneFile(client, f, localPath, displayName)
-		if err != nil {
-			log.Printf("daemon: download %s failed: %v", f.Name, sanitizeError(err))
+		switch {
+		case f.DocumentB64 != "":
+			docBlocks, err := materializeInlineDocument(ensureDir, i, f, displayName)
+			if err != nil {
+				log.Printf("daemon: inline document %s failed: %v", f.Name, err)
+				// Fall back to URL download if available — never silently drop.
+				// Re-call ensureDir() so we use the lazily-created dir; the outer
+				// `dir` closure variable is still empty here if materializeInlineDocument
+				// returned before it allocated storage.
+				if f.URL != "" {
+					if localDir, derr := ensureDir(); derr == nil {
+						block, derr := downloadOneFile(httpClient, f, filepath.Join(localDir, sanitizeFilename(i, f.Name)), displayName)
+						if derr == nil {
+							blocks = append(blocks, block)
+							continue
+						}
+						log.Printf("daemon: fallback download %s failed: %v", f.Name, sanitizeError(derr))
+					}
+				}
+				blocks = append(blocks, RequestContentBlock{
+					Type: "text",
+					Text: fmt.Sprintf("[Error: unable to process inline document %s]", displayName),
+				})
+				continue
+			}
+			blocks = append(blocks, docBlocks...)
+
+		case f.ExtractedText != "":
+			blocks = append(blocks, buildExtractedTextBlock(f, displayName))
+
+		case f.URL != "":
+			localDir, err := ensureDir()
+			if err != nil {
+				blocks = append(blocks, RequestContentBlock{
+					Type: "text",
+					Text: fmt.Sprintf("[Error: unable to prepare storage for %s]", displayName),
+				})
+				continue
+			}
+			diskName := sanitizeFilename(i, f.Name)
+			localPath := filepath.Join(localDir, diskName)
+			block, err := downloadOneFile(httpClient, f, localPath, displayName)
+			if err != nil {
+				log.Printf("daemon: download %s failed: %v", f.Name, sanitizeError(err))
+				blocks = append(blocks, RequestContentBlock{
+					Type: "text",
+					Text: fmt.Sprintf("[Error: unable to download file %s]", displayName),
+				})
+				continue
+			}
+			blocks = append(blocks, block)
+
+		default:
+			// No payload of any kind — surface a warning rather than silently
+			// dropping the attachment (plan §4.8 "never silently drop").
 			blocks = append(blocks, RequestContentBlock{
 				Type: "text",
-				Text: fmt.Sprintf("[Error: unable to download file %s]", f.Name),
+				Text: fmt.Sprintf("[Warning: attachment %s arrived with no URL, extracted text, or inline base64]", displayName),
 			})
-			continue
 		}
-		blocks = append(blocks, block)
 	}
 	blocks = append(blocks, capBlocks...)
+	if cleanup == nil {
+		cleanup = func() {}
+	}
 	return blocks, cleanup
+}
+
+// materializeInlineDocument decodes RemoteFile.DocumentB64 and writes it to
+// the per-message attachment directory, returning a `document` block (base64
+// source) followed by a `text` hint pointing at the saved local path so the
+// LLM can fall through to file_read / bash for selective access.
+//
+// Only application/pdf is treated as a native document MIME; any other type is
+// rejected and the caller falls back to URL download. Anthropic's document
+// content block accepts PDF natively; other formats must arrive as
+// extracted_text.
+func materializeInlineDocument(ensureDir func() (string, error), index int, f RemoteFile, displayName string) ([]RequestContentBlock, error) {
+	mime := strings.ToLower(strings.TrimSpace(f.MimeType))
+	// Empty MIME is treated as an error rather than silently defaulting to
+	// PDF: a future cloud build that ships DocumentB64 with non-PDF bytes
+	// and an unset MimeType would otherwise be forwarded to Anthropic as
+	// application/pdf and 400 with a confusing message. The caller falls
+	// back to URL download in this case, so the message still reaches the
+	// model.
+	if mime == "" {
+		return nil, fmt.Errorf("inline document missing MIME type")
+	}
+	if mime != "application/pdf" {
+		return nil, fmt.Errorf("unsupported inline document media type %q", mime)
+	}
+
+	if len(f.DocumentB64) > maxInlineDocumentB64Bytes {
+		return nil, fmt.Errorf("inline document exceeds size guard (%d base64 bytes > %d)", len(f.DocumentB64), maxInlineDocumentB64Bytes)
+	}
+	data, err := base64.StdEncoding.DecodeString(f.DocumentB64)
+	if err != nil {
+		return nil, fmt.Errorf("decode base64: %w", err)
+	}
+	if len(data) > maxInlineDocumentDecodedBytes {
+		return nil, fmt.Errorf("inline document exceeds decoded size guard (%d bytes > %d)", len(data), maxInlineDocumentDecodedBytes)
+	}
+
+	dir, err := ensureDir()
+	if err != nil {
+		return nil, fmt.Errorf("create attachment dir: %w", err)
+	}
+	diskName := sanitizeFilename(index, f.Name)
+	if filepath.Ext(diskName) == "" {
+		diskName += ".pdf"
+	}
+	localPath := filepath.Join(dir, diskName)
+	if err := os.WriteFile(localPath, data, 0o600); err != nil {
+		return nil, fmt.Errorf("write file: %w", err)
+	}
+
+	encoded := f.DocumentB64
+	// Strip any whitespace from the cloud-provided base64 so the marshaled
+	// content block is canonical bytes (Anthropic accepts whitespace, but
+	// stripping keeps the prompt-cache prefix byte-stable for re-sends).
+	if strings.ContainsAny(encoded, "\r\n\t ") {
+		var b strings.Builder
+		b.Grow(len(encoded))
+		for _, r := range encoded {
+			if r != '\r' && r != '\n' && r != '\t' && r != ' ' {
+				b.WriteRune(r)
+			}
+		}
+		encoded = b.String()
+	}
+
+	return []RequestContentBlock{
+		{
+			Type: "document",
+			Source: &client.ImageSource{
+				Type:      "base64",
+				MediaType: mime,
+				Data:      encoded,
+			},
+			Filename: displayName,
+			ByteSize: int64(len(data)),
+		},
+		{
+			Type: "text",
+			Text: fmt.Sprintf("[Attached PDF: %s — also saved locally at %s (use file_read for selective access)]",
+				displayName, localPath),
+		},
+	}, nil
+}
+
+// buildExtractedTextBlock formats Cloud's pre-extracted text into a single
+// `text` content block. Daemon enforces MaxExtractedTextChars truncation here
+// (plan §4.5.1 defense in depth) — even if Cloud sends an oversized payload,
+// daemon trims before the bytes hit session JSON / agent loop.
+func buildExtractedTextBlock(f RemoteFile, displayName string) RequestContentBlock {
+	mime := f.MimeType
+	if mime == "" {
+		mime = "unknown"
+	}
+	text := f.ExtractedText
+	if runeCount := utf8RuneCount(text); runeCount > MaxExtractedTextChars {
+		text = truncateToRunes(text, MaxExtractedTextChars)
+		text += fmt.Sprintf("\n\n[Daemon truncated extracted text: %d → %d chars (cap=%d). See original file via URL if available.]",
+			runeCount, MaxExtractedTextChars, MaxExtractedTextChars)
+	}
+	header := fmt.Sprintf("[Attached: %s (%s)]\n", displayName, mime)
+	return RequestContentBlock{
+		Type: "text",
+		Text: header + text,
+	}
+}
+
+// utf8RuneCount counts UTF-8 runes without importing unicode/utf8 in the call
+// path — slightly cheaper than utf8.RuneCountInString for the short-string
+// case that's the common path here.
+func utf8RuneCount(s string) int {
+	n := 0
+	for range s {
+		n++
+	}
+	return n
+}
+
+// truncateToRunes returns at most n runes of s. Safe for multi-byte UTF-8.
+func truncateToRunes(s string, n int) string {
+	if n <= 0 || s == "" {
+		return ""
+	}
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i]
+		}
+		count++
+	}
+	return s
 }
 
 // materializeInlineImageBlocks rewrites inline base64 image blocks into
@@ -177,12 +403,17 @@ func materializeInlineImageBlocks(shannonDir string, blocks []RequestContentBloc
 		}
 
 		// Pre-decode size guard: reject before base64 decoding allocates
-		// memory proportional to the encoded length. The decoded block
-		// still gets the stricter 20 MB cap in resolveFileRef; this guard
-		// just protects the decode step itself.
+		// memory proportional to the encoded length. Oversized blocks are
+		// replaced with a text error rather than passed through — at this
+		// size the downstream Anthropic API would refuse the request and
+		// the user would see a generic 400 instead of a clear reason.
 		if len(b.Source.Data) > maxInlineImageBase64Bytes {
 			log.Printf("daemon: inline image block %d exceeds size guard (%d base64 bytes > %d)", i, len(b.Source.Data), maxInlineImageBase64Bytes)
-			out = append(out, b)
+			out = append(out, RequestContentBlock{
+				Type: "text",
+				Text: fmt.Sprintf("[Inline image rejected: %d base64 bytes exceeds the %d-byte cap (≈%d MB raw). Re-upload as a smaller image or via file_ref.]",
+					len(b.Source.Data), maxInlineImageBase64Bytes, maxInlineImageDecodedBytes/(1024*1024)),
+			})
 			continue
 		}
 

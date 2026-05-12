@@ -148,6 +148,34 @@ shan "replace all tabs with spaces in config.yaml"
 shan "search for any hardcoded passwords in the codebase"
 ```
 
+**Archives** — `archive_inspect`, `archive_extract` (zip / tar / tar.gz / tgz)
+```bash
+shan "list what's inside ./backup.zip"
+shan "extract backup.zip into ./restore — use overwrite if it already exists"
+shan "inspect data.tar.gz and show me the largest files"
+```
+
+Both tools use only Go standard library (no external dependencies). `archive_inspect` is read-only and never asks for approval. `archive_extract` always asks (writes to disk), refuses encrypted zips, symlinks, absolute-path entries, setuid bits, and device files, and caps payload at 50 MB per entry / 200 MB total / 500 entries. Extraction is atomic: a staging directory is built first and renamed into `dest` only on full success, so a failed run leaves no half-populated output.
+
+**Documents** — `pdf_to_text`, `docx_to_text`, `xlsx_to_text`, `pptx_to_text`
+```bash
+shan "extract the text from quarterly-report.pdf, pages 3 to 8"
+shan "summarize the contents of slides.pptx"
+shan "what's in pricing.xlsx Sheet2?"
+```
+
+Each tool prefers a high-quality external extractor (poppler / pandoc / xlsx2csv) and falls back to a zero-dependency unzip + raw-XML strip when that extractor isn't installed. Read-only; no approval; output capped at 100K characters with a `[Truncated: ...]` marker. The fallback path is intentionally simple — it's "good enough for the LLM to read" without preserving table structure — install the primary extractor for better fidelity.
+
+#### Inbound file format support
+
+| Format | Built-in fallback | Better with |
+|---|---|---|
+| PDF | n/a — suggests uploading the PDF so cloud renders it as a native Anthropic document block | `pdftotext` (`brew install poppler`) |
+| DOCX | unzip + XML strip (raw text) | `pandoc` (`brew install pandoc`) |
+| XLSX | unzip + raw XML | `xlsx2csv` (`pip install xlsx2csv`) |
+| PPTX | unzip + XML strip | `pandoc` (`brew install pandoc`) |
+| HEIC / AVIF | transcoded server-side by cloud | — |
+
 **Shell & System** — `bash`, `system_info`, `process`
 ```bash
 shan "run go test and fix any failures"
@@ -323,6 +351,17 @@ Local tools executed on your macOS machine:
 | `glob` | CWD auto | Find files by pattern (supports `**` recursive) |
 | `grep` | CWD auto | Search file contents (ripgrep, falls back to grep). `output_mode` selects `files_with_matches` (default), `content`, or `count`. Supports `glob` filtering, `head_limit`, `offset`, `type`, `ignore_case`, `multiline`, `before_context`/`after_context`, and `sort_by` (`mtime` newest-first). VCS metadata directories (`.git`, etc.) are skipped automatically; rg output uses `--max-columns 500` to keep minified lines from dominating results. |
 | `directory_list` | CWD auto | List directory contents with sizes |
+| `archive_inspect` | No | List the contents of a `.zip / .tar / .tar.gz / .tgz` archive without extracting. Returns entry list (name, size, is_dir, mode) and totals. |
+| `archive_extract` | Yes | Extract a `.zip / .tar / .tar.gz / .tgz` archive to `dest`. `dest` must not exist unless `overwrite=true`. Atomic via staging dir + rename. Rejects encrypted zips, symlink/absolute-path/setuid/device entries. Caps: 500 entries, 50 MB per entry, 200 MB total. Single-layer only (nested archives stay as files). |
+
+### Documents
+
+| Tool | Approval | Description |
+|------|----------|-------------|
+| `pdf_to_text` | No | Extract plain text from a PDF using poppler's `pdftotext -layout`. Optional `pages` selector: `"all"` (default), `"5"` (single page), or `"1-10"` (range). Requires `pdftotext` on PATH — if missing, returns an install hint (`brew install poppler`) and suggests uploading the PDF so cloud renders it as a native Anthropic document block. Output capped at 100K characters. |
+| `docx_to_text` | No | Extract plain text from a `.docx`. Prefers `pandoc -t plain --wrap=preserve`; falls back to unzipping and stripping XML tags from `word/document.xml`. Install hint on fallback: `brew install pandoc`. Output capped at 100K characters. |
+| `xlsx_to_text` | No | Extract CSV/plain-text from a `.xlsx`. Prefers `xlsx2csv` (`-a` to dump every sheet); falls back to unzipping and reading `sharedStrings.xml` + sheet XML. `sheet` selector: `"all"` (default), a sheet name, or a 1-based index. Install hint on fallback: `pip install xlsx2csv`. Output capped at 100K characters. |
+| `pptx_to_text` | No | Extract plain text from a `.pptx`. Prefers `pandoc -t plain`; falls back to unzipping and stripping XML tags from each `ppt/slides/slide*.xml`. Install hint on fallback: `brew install pandoc`. Output capped at 100K characters. |
 
 ### System & Shell
 
@@ -942,7 +981,7 @@ Slack/LINE ──webhook──▶ Shannon Cloud ──WebSocket──▶ shan da
 - **Schedule mutation tools** (`schedule_create/update/remove`) are denied by default in daemon mode
 - **Interactive approval** — tools requiring approval send requests to the client app (via WS relay through Shannon Cloud); supports "always allow" persistence for bash commands
 - **HITL message injection** — send follow-up messages to a running agent via `POST /message`; messages are injected mid-turn and incorporated into the conversation
-- **File attachments** — Slack/Feishu messages with file attachments are automatically downloaded to `~/.shannon/tmp/attachments/` and converted to `file_ref` content blocks. Supports up to 10 files per message (100 MB each). SSRF-protected with scheme/IP validation. Cleaned up on session close.
+- **File attachments** — Slack / LINE / Feishu / Telegram / webhook messages with files are surfaced to the agent. The daemon picks one of three branches per file: `document_b64` (cloud-supplied PDF base64) → native `document` content block + a `text` hint pointing at a locally-cached copy; `extracted_text` (cloud's server-side DOCX/XLSX/PPTX/CSV/TXT/JSON extraction, plus large-PDF fallback) → a single `text` block headed `[Attached: <name> (<mime>)]`; otherwise the legacy URL is downloaded to `~/.shannon/tmp/attachments/` and exposed as a `file_ref`. Caps: 20 files / message, 500 MB / file. Daemon also enforces a 500K-char rune ceiling on `extracted_text` as a defense-in-depth guard against oversized payloads. SSRF-protected URL validation, scheme/IP allowlist, and Authorization-header redirect preservation are retained on the URL path. Cleaned up on session close. Cloud must advertise the matching `inline_document_b64` / `inline_extracted_text` capabilities; daemons missing them silently fall back to URL-only delivery.
 
 ### Local HTTP API (port 7533)
 

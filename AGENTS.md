@@ -335,6 +335,8 @@ E2E tests in `test/e2e/` split into offline (no API) and live (`SHANNON_E2E_LIVE
 ### Core Local Tools
 
 - File ops: `file_read`, `file_write`, `file_edit`, `glob`, `grep`, `directory_list`
+- Archive: `archive_inspect` (read-only, no approval), `archive_extract` (requires approval) — supports `.zip / .tar / .tar.gz / .tgz`; atomic staging-dir + rename; rejects encrypted, symlink, absolute-path, setuid, device entries; caps 50 MB/entry, 200 MB total, 500 entries
+- Documents: `pdf_to_text`, `docx_to_text`, `xlsx_to_text`, `pptx_to_text` — read-only convenience extractors. Each prefers an external tool (poppler `pdftotext`, `pandoc`, `xlsx2csv`) and falls back to unzip + raw-XML strip when that tool is missing; PDF has no fallback and suggests uploading the file for cloud's native document block. Fixed-argv exec (no shell), 60s timeout per call, output capped at 100K runes with a `[Truncated: ...]` marker. See `internal/tools/doc_extract.go`.
 - Shell/system: `bash`, `system_info`, `process`, `http`, `think`
 - macOS GUI: `accessibility`, `applescript`, `screenshot`, `computer`, `clipboard`, `notify`, `browser`, `wait_for`, `ghostty`
 - Schedule: `schedule_create`, `schedule_list`, `schedule_update`, `schedule_remove`

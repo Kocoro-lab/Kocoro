@@ -583,8 +583,9 @@ func TestRemoteFile_JSONUnmarshal(t *testing.T) {
 // TestMaterializeInlineImageBlocks_PreDecodeSizeGuard ensures an inline
 // image block whose base64 payload exceeds the guard never reaches
 // base64.DecodeString (which would allocate a decoded buffer larger than
-// the downstream resolveFileRef cap). The oversized block passes through
-// untouched so vision access is preserved, but no temp file is written.
+// the downstream resolveFileRef cap). The oversized block is replaced
+// with a user-visible text error so the LLM sees a clear reason instead
+// of the Anthropic API returning an opaque 400 on the downstream call.
 func TestMaterializeInlineImageBlocks_PreDecodeSizeGuard(t *testing.T) {
 	dir := t.TempDir()
 	oversize := strings.Repeat("A", maxInlineImageBase64Bytes+1)
@@ -598,8 +599,11 @@ func TestMaterializeInlineImageBlocks_PreDecodeSizeGuard(t *testing.T) {
 	if cleanup != nil {
 		defer cleanup()
 	}
-	if len(blocks) != 1 || blocks[0].Type != "image" {
-		t.Fatalf("oversize block should pass through unchanged, got %+v", blocks)
+	if len(blocks) != 1 || blocks[0].Type != "text" {
+		t.Fatalf("oversize block should be replaced by a text error, got %+v", blocks)
+	}
+	if !strings.Contains(blocks[0].Text, "rejected") {
+		t.Errorf("text error should mention rejection: %q", blocks[0].Text)
 	}
 	if cleanup != nil {
 		t.Error("no attachment dir should be created when every block is rejected by the size guard")
@@ -635,3 +639,257 @@ func TestMaterializeInlineImageBlocks_FilenameSanitized(t *testing.T) {
 		t.Errorf("FilePath must not contain traversal segments; got %q", blocks[0].FilePath)
 	}
 }
+
+// ---- Phase-1 cloud-extension protocol tests (plan §4.3) ----
+
+// TestDownloadRemoteFiles_DocumentB64 verifies the DocumentB64 priority
+// branch: cloud-supplied PDF bytes are decoded to a temp file and surfaced
+// as a `document` content block (base64 source) followed by a `text` hint
+// pointing at the local path.
+func TestDownloadRemoteFiles_DocumentB64(t *testing.T) {
+	dir := t.TempDir()
+	pdfBytes := []byte("%PDF-1.4 fake pdf payload for testing")
+	encoded := base64.StdEncoding.EncodeToString(pdfBytes)
+	blocks, cleanup := downloadRemoteFiles(dir, []RemoteFile{
+		{
+			Name:           "spec.pdf",
+			MimeType:       "application/pdf",
+			DocumentB64: encoded,
+		},
+	})
+	defer cleanup()
+
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks (document + hint), got %d: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "document" {
+		t.Fatalf("block 0 should be document, got %q", blocks[0].Type)
+	}
+	if blocks[0].Source == nil || blocks[0].Source.MediaType != "application/pdf" {
+		t.Fatalf("document block missing PDF source: %+v", blocks[0])
+	}
+	if blocks[0].Source.Data != encoded {
+		t.Errorf("document base64 should match cloud input exactly; got %d bytes vs %d", len(blocks[0].Source.Data), len(encoded))
+	}
+	if blocks[1].Type != "text" {
+		t.Fatalf("block 1 should be text hint, got %q", blocks[1].Type)
+	}
+	if !strings.Contains(blocks[1].Text, "Attached PDF: spec.pdf") {
+		t.Errorf("hint should mention filename; got %q", blocks[1].Text)
+	}
+	if !strings.Contains(blocks[1].Text, "use file_read") {
+		t.Errorf("hint should mention file_read; got %q", blocks[1].Text)
+	}
+}
+
+// TestDownloadRemoteFiles_DocumentB64Whitespace ensures whitespace in
+// cloud-provided base64 (newlines from chunked encoders) is stripped so the
+// outbound prompt-cache prefix stays byte-stable across re-sends.
+func TestDownloadRemoteFiles_DocumentB64Whitespace(t *testing.T) {
+	dir := t.TempDir()
+	raw := []byte("hello-pdf-bytes")
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	// Splice newlines like older base64 encoders.
+	chunked := ""
+	for i, r := range encoded {
+		chunked += string(r)
+		if i%4 == 0 {
+			chunked += "\n"
+		}
+	}
+	blocks, cleanup := downloadRemoteFiles(dir, []RemoteFile{
+		{Name: "a.pdf", MimeType: "application/pdf", DocumentB64: chunked},
+	})
+	defer cleanup()
+	if len(blocks) < 1 || blocks[0].Type != "document" {
+		t.Fatalf("expected document block, got %+v", blocks)
+	}
+	if strings.ContainsAny(blocks[0].Source.Data, "\r\n\t ") {
+		t.Errorf("document base64 should be whitespace-stripped; got %q", blocks[0].Source.Data)
+	}
+}
+
+// TestDownloadRemoteFiles_DocumentB64SizeGuard ensures oversized base64
+// payloads are rejected before decoding (and fall back to URL if available).
+func TestDownloadRemoteFiles_DocumentB64SizeGuard(t *testing.T) {
+	dir := t.TempDir()
+	oversize := strings.Repeat("A", maxInlineDocumentB64Bytes+1)
+	blocks, cleanup := downloadRemoteFiles(dir, []RemoteFile{
+		{Name: "huge.pdf", MimeType: "application/pdf", DocumentB64: oversize},
+	})
+	defer cleanup()
+	if len(blocks) != 1 || blocks[0].Type != "text" {
+		t.Fatalf("oversize doc should yield single text error block, got %+v", blocks)
+	}
+	if !strings.Contains(blocks[0].Text, "unable to process") {
+		t.Errorf("error block should mention failure; got %q", blocks[0].Text)
+	}
+}
+
+// TestDownloadRemoteFiles_ExtractedText verifies the ExtractedText priority
+// branch: cloud's pre-extracted text becomes a single text content block
+// prefixed with the filename/mimetype.
+func TestDownloadRemoteFiles_ExtractedText(t *testing.T) {
+	dir := t.TempDir()
+	blocks, cleanup := downloadRemoteFiles(dir, []RemoteFile{
+		{
+			Name:          "report.docx",
+			MimeType:      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+			ExtractedText: "# Q4 Report\n\nRevenue is up 12%.",
+		},
+	})
+	defer cleanup()
+	if len(blocks) != 1 || blocks[0].Type != "text" {
+		t.Fatalf("expected one text block, got %+v", blocks)
+	}
+	if !strings.HasPrefix(blocks[0].Text, "[Attached: report.docx (application/vnd.openxmlformats-") {
+		t.Errorf("text should start with attachment header; got %q", blocks[0].Text)
+	}
+	if !strings.Contains(blocks[0].Text, "Q4 Report") {
+		t.Errorf("text should carry the extracted body; got %q", blocks[0].Text)
+	}
+}
+
+// TestDownloadRemoteFiles_ExtractedTextDaemonTruncation ensures the daemon
+// enforces MaxExtractedTextChars as defense-in-depth even when cloud sends an
+// oversized payload (plan §4.5.1).
+func TestDownloadRemoteFiles_ExtractedTextDaemonTruncation(t *testing.T) {
+	dir := t.TempDir()
+	huge := strings.Repeat("a", MaxExtractedTextChars+1000)
+	blocks, cleanup := downloadRemoteFiles(dir, []RemoteFile{
+		{Name: "huge.txt", MimeType: "text/plain", ExtractedText: huge},
+	})
+	defer cleanup()
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block, got %d", len(blocks))
+	}
+	// The text body (after header) must be no larger than MaxExtractedTextChars
+	// plus the truncation footer.
+	if !strings.Contains(blocks[0].Text, "Daemon truncated extracted text") {
+		t.Errorf("daemon should append a truncation note; got tail %q", blocks[0].Text[len(blocks[0].Text)-200:])
+	}
+}
+
+// TestDownloadRemoteFiles_BackwardCompat_URLPath ensures the legacy URL
+// download path still works when neither DocumentB64 nor ExtractedText
+// is set (older cloud sending only URL + auth_header).
+func TestDownloadRemoteFiles_BackwardCompat_URLPath(t *testing.T) {
+	skipURLValidation(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Write([]byte("downloaded-pdf-bytes"))
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	blocks, cleanup := downloadRemoteFiles(dir, []RemoteFile{
+		{Name: "legacy.pdf", URL: ts.URL + "/legacy.pdf"},
+	})
+	defer cleanup()
+	if len(blocks) != 1 || blocks[0].Type != "file_ref" {
+		t.Fatalf("expected file_ref block for URL-only payload, got %+v", blocks)
+	}
+	if blocks[0].Filename != "legacy.pdf" {
+		t.Errorf("filename mismatch; got %q", blocks[0].Filename)
+	}
+}
+
+// TestRemoteFile_UnmarshalProtocol checks that the JSON tags match plan §4.3
+// exactly. The protocol field names (extracted_text, document_b64,
+// extraction_note) are part of the contract with shannon-cloud — drifting
+// from them silently breaks WS interop.
+func TestRemoteFile_UnmarshalProtocol(t *testing.T) {
+	raw := `{
+		"name": "x.docx",
+		"mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		"size": 1234,
+		"url": "https://example.com/x.docx",
+		"auth_header": "Bearer xyz",
+		"extracted_text": "body text",
+		"document_b64": "ZmFrZQ==",
+		"extraction_note": "via python-docx"
+	}`
+	var got RemoteFile
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ExtractedText != "body text" {
+		t.Errorf("ExtractedText tag mismatch; got %q", got.ExtractedText)
+	}
+	if got.DocumentB64 != "ZmFrZQ==" {
+		t.Errorf("DocumentB64 should map to JSON tag document_b64; got %q", got.DocumentB64)
+	}
+	if got.ExtractionNote != "via python-docx" {
+		t.Errorf("ExtractionNote tag mismatch; got %q", got.ExtractionNote)
+	}
+}
+
+// TestRemoteFile_BackwardCompat ensures an older cloud payload that lacks the
+// new fields unmarshals cleanly into a legacy-shaped RemoteFile. This guards
+// the "new daemon, old cloud" interop matrix.
+func TestRemoteFile_BackwardCompat(t *testing.T) {
+	raw := `{"name":"old.bin","mimetype":"application/octet-stream","size":42,"url":"https://example.com/old.bin"}`
+	var got RemoteFile
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ExtractedText != "" || got.DocumentB64 != "" || got.ExtractionNote != "" {
+		t.Errorf("legacy payload should leave new fields zero; got %+v", got)
+	}
+	if got.URL != "https://example.com/old.bin" {
+		t.Errorf("legacy URL should round-trip; got %q", got.URL)
+	}
+}
+
+// TestCapabilities_AdvertisesNewTokens guards that daemon advertises the new
+// inline_document_b64 and inline_extracted_text capability tokens.
+func TestCapabilities_AdvertisesNewTokens(t *testing.T) {
+	want := map[string]bool{
+		CapInlineDocumentB64:   false,
+		CapInlineExtractedText: false,
+	}
+	for _, c := range Capabilities {
+		if _, ok := want[c]; ok {
+			want[c] = true
+		}
+	}
+	for token, found := range want {
+		if !found {
+			t.Errorf("default Capabilities = %v, missing %q", Capabilities, token)
+		}
+	}
+}
+
+// TestDownloadRemoteFiles_DocumentB64_EmptyMIME verifies that DocumentB64
+// payloads without a MimeType are rejected (instead of silently defaulting
+// to application/pdf) and the caller falls back to URL download. Without
+// this guard a future cloud bug shipping non-PDF bytes + empty MIME would
+// be mis-forwarded to Anthropic as a PDF and 400.
+func TestDownloadRemoteFiles_DocumentB64_EmptyMIME(t *testing.T) {
+	skipURLValidation(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Write([]byte("fallback PDF bytes from URL"))
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	blocks, cleanup := downloadRemoteFiles(dir, []RemoteFile{{
+		Name:        "bad.pdf",
+		MimeType:    "", // empty — should NOT default to PDF
+		URL:         ts.URL + "/file.pdf",
+		DocumentB64: "ZmFrZQ==", // non-empty so the document branch is exercised
+	}})
+	defer cleanup()
+
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block (URL fallback), got %d: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "file_ref" {
+		t.Fatalf("expected file_ref from URL fallback (not document block), got %s: %+v", blocks[0].Type, blocks[0])
+	}
+	if blocks[0].ByteSize != int64(len("fallback PDF bytes from URL")) {
+		t.Errorf("URL fallback bytes not downloaded; got byte_size=%d", blocks[0].ByteSize)
+	}
+}
+

@@ -40,8 +40,28 @@ var Version = "dev"
 // each MsgTypeMessage reaches a terminal state (reply delivered to the
 // user). Cloud uses this to drop the message from its 5-min replay
 // buffer; un-acked messages are replayed on the next reconnect.
+//
+// "inline_document_b64" — daemon can consume RemoteFile.DocumentB64.
+// Non-empty values are decoded to disk and emitted as a `document`
+// content block + companion text hint. Cloud uses this token to gate
+// PDF base64 inlining (plan §4.5); older daemons without this token
+// receive the legacy URL-only payload.
+//
+// "inline_extracted_text" — daemon can consume RemoteFile.ExtractedText.
+// Non-empty values are emitted as a single `text` block prefixed with
+// the filename and mimetype. Cloud uses this token to gate server-side
+// extraction (DOCX/XLSX/PPTX/CSV/TXT/JSON/large-PDF fallback). Older
+// daemons fall back to URL download.
+const (
+	CapDeliveryAck         = "delivery_ack"
+	CapInlineDocumentB64   = "inline_document_b64"
+	CapInlineExtractedText = "inline_extracted_text"
+)
+
 var Capabilities = []string{
-	"delivery_ack",
+	CapDeliveryAck,
+	CapInlineDocumentB64,
+	CapInlineExtractedText,
 }
 
 type Client struct {
