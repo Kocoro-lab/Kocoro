@@ -1136,7 +1136,22 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Try injecting into an in-flight run on the same route.
+	// Attachment-bearing messages cannot be injected because InjectedMessage
+	// is a Text/CWD-only envelope; silently dropping req.Content would mean
+	// the LLM sees an attachment-shaped UI chip on Desktop but receives only
+	// the text in its turn. Make the client retry once the active run ends.
 	if req.RouteKey != "" {
+		if len(req.Content) > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "rejected",
+				"reason": "active_run_not_ready",
+				"route":  req.RouteKey,
+				"detail": "attachments cannot be injected into an in-flight run; retry after current turn",
+			})
+			return
+		}
 		switch s.deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{Text: req.Text, CWD: req.CWD}) {
 		case InjectOK:
 			if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {

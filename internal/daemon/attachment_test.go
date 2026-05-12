@@ -583,8 +583,9 @@ func TestRemoteFile_JSONUnmarshal(t *testing.T) {
 // TestMaterializeInlineImageBlocks_PreDecodeSizeGuard ensures an inline
 // image block whose base64 payload exceeds the guard never reaches
 // base64.DecodeString (which would allocate a decoded buffer larger than
-// the downstream resolveFileRef cap). The oversized block passes through
-// untouched so vision access is preserved, but no temp file is written.
+// the downstream resolveFileRef cap). The oversized block is replaced
+// with a user-visible text error so the LLM sees a clear reason instead
+// of the Anthropic API returning an opaque 400 on the downstream call.
 func TestMaterializeInlineImageBlocks_PreDecodeSizeGuard(t *testing.T) {
 	dir := t.TempDir()
 	oversize := strings.Repeat("A", maxInlineImageBase64Bytes+1)
@@ -598,8 +599,11 @@ func TestMaterializeInlineImageBlocks_PreDecodeSizeGuard(t *testing.T) {
 	if cleanup != nil {
 		defer cleanup()
 	}
-	if len(blocks) != 1 || blocks[0].Type != "image" {
-		t.Fatalf("oversize block should pass through unchanged, got %+v", blocks)
+	if len(blocks) != 1 || blocks[0].Type != "text" {
+		t.Fatalf("oversize block should be replaced by a text error, got %+v", blocks)
+	}
+	if !strings.Contains(blocks[0].Text, "rejected") {
+		t.Errorf("text error should mention rejection: %q", blocks[0].Text)
 	}
 	if cleanup != nil {
 		t.Error("no attachment dir should be created when every block is rejected by the size guard")

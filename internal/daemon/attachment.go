@@ -400,12 +400,17 @@ func materializeInlineImageBlocks(shannonDir string, blocks []RequestContentBloc
 		}
 
 		// Pre-decode size guard: reject before base64 decoding allocates
-		// memory proportional to the encoded length. The decoded block
-		// still gets the stricter 20 MB cap in resolveFileRef; this guard
-		// just protects the decode step itself.
+		// memory proportional to the encoded length. Oversized blocks are
+		// replaced with a text error rather than passed through — at this
+		// size the downstream Anthropic API would refuse the request and
+		// the user would see a generic 400 instead of a clear reason.
 		if len(b.Source.Data) > maxInlineImageBase64Bytes {
 			log.Printf("daemon: inline image block %d exceeds size guard (%d base64 bytes > %d)", i, len(b.Source.Data), maxInlineImageBase64Bytes)
-			out = append(out, b)
+			out = append(out, RequestContentBlock{
+				Type: "text",
+				Text: fmt.Sprintf("[Inline image rejected: %d base64 bytes exceeds the %d-byte cap (≈%d MB raw). Re-upload as a smaller image or via file_ref.]",
+					len(b.Source.Data), maxInlineImageBase64Bytes, maxInlineImageDecodedBytes/(1024*1024)),
+			})
 			continue
 		}
 
