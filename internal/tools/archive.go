@@ -703,7 +703,7 @@ func extractTar(staging, src string, format ArchiveFormat) ([]ArchiveEntry, int6
 			}
 			entries = append(entries, ArchiveEntry{Name: hdr.Name, IsDir: true, Mode: fmt.Sprintf("%04o", mode.Perm())})
 			continue
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 		default:
 			// Unknown type — skip it rather than die (most archives have only
 			// regular + dir; sparse / xattr extension types we can ignore).

@@ -344,10 +344,11 @@ E2E tests in `test/e2e/` are split into offline (no API, runs in CI) and live (n
 - Release: `git tag -a vX.Y.Z` → `git push origin vX.Y.Z` → CI builds + publishes
 - `docs/` is gitignored — documentation lives locally only
 
-## Local Tools (28 base + conditional)
+## Local Tools (32 base + conditional)
 
 **File ops:** file_read, file_write, file_edit, glob, grep, directory_list
 **Archive:** archive_inspect (read-only), archive_extract (requires approval) — supports `.zip / .tar / .tar.gz / .tgz` via Go stdlib `archive/zip` + `archive/tar` + `compress/gzip`. Atomic via staging-dir + rename; rejects encrypted zips, absolute-path / symlink / device / setuid entries; zipbomb caps (50 MB / entry, 200 MB total, 500 entries). See `internal/tools/archive.go`.
+**Documents:** pdf_to_text, docx_to_text, xlsx_to_text, pptx_to_text — read-only convenience extractors. Each prefers an external tool (poppler `pdftotext`, `pandoc`, `xlsx2csv`) and falls back to unzip + raw-XML strip when that tool is missing; PDF has no fallback and surfaces an install hint (`brew install poppler`) plus a suggestion to upload the PDF so cloud renders it as a native Anthropic `document` block. Fixed-argv `exec.Command` (no shell injection surface), 60s timeout per call, output capped at 100K runes with a `[Truncated: ...]` tail marker. See `internal/tools/doc_extract.go`.
 **Shell/system:** bash, system_info, process, http, think
 **macOS GUI:** accessibility (primary), applescript, screenshot, computer, clipboard, notify, browser, wait_for, ghostty
 **Schedule:** schedule_create, schedule_list, schedule_update, schedule_remove

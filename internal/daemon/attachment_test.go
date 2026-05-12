@@ -856,25 +856,3 @@ func TestCapabilities_AdvertisesNewTokens(t *testing.T) {
 	}
 }
 
-// TestMaterializeExtractableFiles_NoOp documents the Phase-1 contract: until
-// cloud's /extract endpoint ships, the function must be a transparent
-// pass-through so the runner can wire it in safely now.
-func TestMaterializeExtractableFiles_NoOp(t *testing.T) {
-	dir := t.TempDir()
-	in := []RequestContentBlock{
-		{Type: "text", Text: "hello"},
-		{Type: "file_ref", FilePath: "/tmp/x", Filename: "x"},
-	}
-	out, cleanup := materializeExtractableFiles(dir, in)
-	if cleanup != nil {
-		defer cleanup()
-	}
-	if len(out) != len(in) {
-		t.Fatalf("expected pass-through to preserve %d blocks, got %d", len(in), len(out))
-	}
-	for i := range in {
-		if out[i] != in[i] {
-			t.Errorf("block %d mutated: %+v vs %+v", i, out[i], in[i])
-		}
-	}
-}

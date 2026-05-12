@@ -337,21 +337,6 @@ func buildExtractedTextBlock(f RemoteFile, displayName string) RequestContentBlo
 	}
 }
 
-// materializeExtractableFiles is a placeholder for plan §4.6 — the daemon will
-// call cloud POST /api/v1/attachments/extract for Desktop file_refs that need
-// server-side extraction (DOCX/XLSX/PPTX/...). MVP is no-op: Cloud's /extract
-// endpoint isn't live yet, so this just passes blocks through unchanged.
-//
-// TODO Phase 2: call cloud POST /api/v1/attachments/extract per §4.6.1 privacy
-// opt-in policy. Gate on cfg.Cloud.Enabled + new cfg.Cloud.AttachmentExtract
-// flag; reuse publish_to_web's path denylist; cap single-file uploads at the
-// MaxInlineSingleFile size; on failure preserve the original file_ref so LLM
-// can bash fallback. Audit each call with redacted metadata only (no extracted
-// content in logs).
-func materializeExtractableFiles(_ string, blocks []RequestContentBlock) ([]RequestContentBlock, func()) {
-	return blocks, nil
-}
-
 // utf8RuneCount counts UTF-8 runes without importing unicode/utf8 in the call
 // path — slightly cheaper than utf8.RuneCountInString for the short-string
 // case that's the common path here.
