@@ -13,8 +13,9 @@ SHANNON_CACHE_DEBUG=1 shan -y 'your prompt'
 # Heavy: also dump full request bytes per call (raw bytes diff-able)
 SHANNON_CACHE_DEBUG=1 SHANNON_CACHE_DEBUG_RAW=1 shan -y 'your prompt'
 
-# Analyze the log
-python3 docs/issues/analyze_cache_debug.py
+# Inspect the log directly (see "Reading drift events" below)
+jq -r 'select(.dir == "resp") | "cr=\(.cr) cc=\(.cc) cer=\(if .cc > 0 then .cr / .cc else 0 end)"' \
+  ~/.shannon/logs/cache-debug.log | tail -20
 ```
 
 Both flags are read at every LLM call — toggle without restart. **Daemon
@@ -86,13 +87,14 @@ are skipped silently — only real wire-byte drift hits the log.
 
 The standard analysis pipeline:
 
-1. **Run `analyze_cache_debug.py`** — gets you the per-call CER table and a
-   `EARLIEST DIFF POSITION` section showing the first `msg_hashes[k]` slot
-   that changed between calls N and N+1.
-2. **Cross-reference with `dir: "compact"` lines** — every drift in the
-   `EARLIEST DIFF POSITION` table should have a matching compact event with
-   the same `msg_idx`. If one doesn't, you've found an unexpected mutation
-   path that's not yet instrumented (file an issue).
+1. **Find the `EARLIEST DIFF POSITION`** — for each pair of adjacent `req`
+   lines, compare their `msg_hashes[k].hash` arrays; the first `k` whose hash
+   changed is where the drift starts. Per-call CER is `cr / cc` from the
+   matching `resp` line (joined by `req_id`).
+2. **Cross-reference with `dir: "compact"` lines** — every drift slot should
+   have a matching compact event with the same `msg_idx`. If one doesn't,
+   you've found an unexpected mutation path that's not yet instrumented
+   (file an issue).
 3. **For deep dives, diff raw dumps** — under
    `~/.shannon/logs/cache-debug-raw/<req_id>/messages.json` between two
    adjacent `req_id`s. The byte-level diff localizes the issue inside a
@@ -136,7 +138,6 @@ hashes, lengths, role, type, and TTL/source metadata.
 - `internal/agent/loop.go` — `compressOldToolResults`, `filterOldImages`
   (compact event call sites)
 - `internal/agent/timebasedcompact.go` — `timeBasedCompact` (call site)
-- `docs/issues/analyze_cache_debug.py` — analysis script
 - `scripts/cache_bench.sh` — fixture-based regression bench
 - `docs/cache-strategy.md` — authoritative cache design (4-breakpoint
   allocation, source→TTL routing, byte-stability invariants)

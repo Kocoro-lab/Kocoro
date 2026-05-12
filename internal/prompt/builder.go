@@ -247,7 +247,7 @@ func buildStableContext(opts PromptOptions) string {
 		// Claude to read as framework-internal trusted content — same role
 		// and same cache position, just a trust-channel wrapper. Issue #125.
 		sb.WriteString("<system-reminder>\n")
-		sb.WriteString(truncate(inst, maxInstructionsChars))
+		sb.WriteString(sanitizeForReminder(truncate(inst, maxInstructionsChars)))
 		sb.WriteString("\n</system-reminder>")
 	}
 
@@ -255,8 +255,14 @@ func buildStableContext(opts PromptOptions) string {
 		if sb.Len() > 0 {
 			sb.WriteString("\n\n")
 		}
-		sb.WriteString("## Session Facts\n")
-		sb.WriteString(sticky)
+		// Wrap for parity with the instructions block above. Sticky facts
+		// are data (customer/order info), not directives — so they don't
+		// currently trip Claude's injection sensor — but applying the same
+		// trust-channel wrapper across every framework-injected block keeps
+		// the user-role surface uniform. Issue #125.
+		sb.WriteString("<system-reminder>\n## Session Facts\n")
+		sb.WriteString(sanitizeForReminder(sticky))
+		sb.WriteString("\n</system-reminder>")
 	}
 
 	// Per-user dynamic tool catalog. Routed here (BP #3, per-session cache)
@@ -360,6 +366,18 @@ func truncate(s string, maxChars int) string {
 	return string(r[:maxChars]) + "\n[truncated]"
 }
 
+// sanitizeForReminder strips literal `</system-reminder>` closers from
+// user-supplied content so the wrapper around it cannot be terminated early.
+// Without this, an instructions.md or sticky-facts payload that happens to
+// contain the closing tag (e.g. documentation discussing this mechanism)
+// would silently truncate the trust channel and leak the rest of the body
+// out as plain user-role content. Opening tags inside the body are
+// harmless — Anthropic parses by first close, and our wrapper is the
+// outermost block. Issue #125.
+func sanitizeForReminder(s string) string {
+	return strings.ReplaceAll(s, "</system-reminder>", "")
+}
+
 // macOSAutomationGuidance returns workflow guidance for macOS automation tools,
 // or empty string if not on darwin or no relevant tools are registered.
 // Each bullet is conditional on the actual tool presence to avoid emitting
@@ -418,7 +436,12 @@ func BuildToolListing(opts PromptOptions) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("## Dynamic Tools\n")
+	// Wrap for parity with the instructions and sticky-facts blocks in
+	// buildStableContext (issue #125). Tool catalogs are pure data — names
+	// + short descriptions — so they aren't directive-shaped, but the
+	// uniform <system-reminder> wrapping signals "framework-supplied
+	// context" across every user-role injection point.
+	sb.WriteString("<system-reminder>\n## Dynamic Tools\n")
 	sb.WriteString("These tools are also available — they vary per user/configuration. " +
 		"Discover full schemas through the tools[] array; the names below are a quick reference.\n")
 
@@ -447,6 +470,7 @@ func BuildToolListing(opts PromptOptions) string {
 			sb.WriteString("\n")
 		}
 	}
+	sb.WriteString("\n</system-reminder>")
 
 	return sb.String()
 }

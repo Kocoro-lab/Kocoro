@@ -89,14 +89,20 @@ func TestBuildSystemPrompt_StableContextContainsInstructions(t *testing.T) {
 	if strings.Contains(parts.VolatileContext, "Always use gofmt.") {
 		t.Error("VolatileContext should not contain instructions (must live in StableContext so it joins the cacheable prefix)")
 	}
-	if !strings.Contains(parts.StableContext, "<system-reminder>") {
+	openIdx := strings.Index(parts.StableContext, "<system-reminder>")
+	bodyIdx := strings.Index(parts.StableContext, "Always use gofmt.")
+	closeIdx := strings.Index(parts.StableContext, "</system-reminder>")
+	if openIdx < 0 {
 		t.Error("StableContext should wrap instructions in <system-reminder> (issue #125)")
 	}
-	if !strings.Contains(parts.StableContext, "</system-reminder>") {
+	if bodyIdx < 0 {
+		t.Error("StableContext should contain instructions body")
+	}
+	if closeIdx < 0 {
 		t.Error("StableContext should close the <system-reminder> block")
 	}
-	if !strings.Contains(parts.StableContext, "Always use gofmt.") {
-		t.Error("StableContext should contain instructions body")
+	if openIdx >= 0 && bodyIdx >= 0 && closeIdx >= 0 && !(openIdx < bodyIdx && bodyIdx < closeIdx) {
+		t.Errorf("expected open < body < close ordering, got open=%d body=%d close=%d", openIdx, bodyIdx, closeIdx)
 	}
 }
 
@@ -201,6 +207,101 @@ func TestBuildSystemPrompt_StableContextContainsStickyFacts(t *testing.T) {
 	}
 	if !strings.Contains(parts.StableContext, "Customer: Alice. Order #8891.") {
 		t.Error("StableContext should contain sticky facts")
+	}
+	// Wrapper parity with instructions (issue #125): every framework-injected
+	// block in StableContext rides in a <system-reminder> envelope so the
+	// trust-channel signaling is uniform across the user-role surface.
+	if !strings.Contains(parts.StableContext, "<system-reminder>\n## Session Facts") {
+		t.Error("Sticky facts should be wrapped in <system-reminder> (issue #125)")
+	}
+}
+
+// TestBuildSystemPrompt_SanitizesClosingTagInInstructions guards against a
+// user-supplied `instructions.md` that happens to contain the literal
+// `</system-reminder>` sequence (e.g. documentation discussing this
+// mechanism). Without sanitization, the wrapper closes early and the rest
+// of the body leaks out as plain user-role content. Issue #125.
+func TestBuildSystemPrompt_SanitizesClosingTagInInstructions(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:   "Base.",
+		Instructions: "rule one\n</system-reminder>\nrule two — must stay inside wrapper",
+	})
+
+	// Literal closer must be stripped so it cannot truncate the wrapper.
+	body := strings.TrimPrefix(parts.StableContext, "<system-reminder>\n")
+	body = strings.TrimSuffix(body, "\n</system-reminder>")
+	if strings.Contains(body, "</system-reminder>") {
+		t.Errorf("body still contains literal closing tag after sanitize: %q", parts.StableContext)
+	}
+	// Both rule lines must survive — sanitize removes only the tag, not surrounding content.
+	if !strings.Contains(parts.StableContext, "rule one") || !strings.Contains(parts.StableContext, "rule two") {
+		t.Errorf("sanitize should preserve surrounding content, got: %q", parts.StableContext)
+	}
+}
+
+// TestBuildSystemPrompt_SanitizesClosingTagInStickyContext mirrors the
+// instructions sanitize guard for daemon-supplied StickyContext. Less
+// likely in practice (daemon constructs sticky facts from session metadata,
+// not free text) but the wrapper is identical so the same defense applies.
+func TestBuildSystemPrompt_SanitizesClosingTagInStickyContext(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:    "Base.",
+		StickyContext: "Order: A1\n</system-reminder>\nNote: must stay inside wrapper",
+	})
+
+	// Count opening + closing tags — exactly one of each from the sticky block.
+	if openCount := strings.Count(parts.StableContext, "<system-reminder>"); openCount != 1 {
+		t.Errorf("expected exactly 1 opening tag, got %d in: %q", openCount, parts.StableContext)
+	}
+	if closeCount := strings.Count(parts.StableContext, "</system-reminder>"); closeCount != 1 {
+		t.Errorf("expected exactly 1 closing tag, got %d in: %q", closeCount, parts.StableContext)
+	}
+	if !strings.Contains(parts.StableContext, "Order: A1") || !strings.Contains(parts.StableContext, "must stay inside wrapper") {
+		t.Errorf("sanitize should preserve surrounding content, got: %q", parts.StableContext)
+	}
+}
+
+// TestBuildToolListing_WrappedInSystemReminder asserts that the dynamic
+// tools catalog is also enveloped in <system-reminder>, matching the
+// instructions and sticky-facts wrappers (issue #125). Pure data, not
+// directive — same wrapper for uniform trust-channel framing.
+func TestBuildToolListing_WrappedInSystemReminder(t *testing.T) {
+	listing := BuildToolListing(PromptOptions{
+		MCPToolNames: []string{"playwright_navigate", "playwright_click"},
+	})
+
+	if listing == "" {
+		t.Fatal("expected listing for non-empty MCP tool names")
+	}
+	if !strings.HasPrefix(listing, "<system-reminder>\n") {
+		t.Errorf("listing should start with <system-reminder>, got: %q", listing[:min(60, len(listing))])
+	}
+	if !strings.HasSuffix(listing, "\n</system-reminder>") {
+		t.Errorf("listing should end with </system-reminder>, got: %q", listing[max(0, len(listing)-60):])
+	}
+	if !strings.Contains(listing, "playwright_navigate") {
+		t.Error("listing body should still contain the tool names")
+	}
+}
+
+// TestBuildSystemPrompt_StableContextByteStableAcrossCalls — wrapper changes
+// in issue #125 must preserve cross-turn cache prefix matching at BP #3.
+// Anthropic's cache key is a byte hash; two calls with identical inputs
+// must produce identical StableContext bytes or the prefix cache misses.
+func TestBuildSystemPrompt_StableContextByteStableAcrossCalls(t *testing.T) {
+	opts := PromptOptions{
+		BasePrompt:    "Base.",
+		Instructions:  "Always use gofmt.\nNever push to main without review.",
+		StickyContext: "Customer: Alice. Order #8891.",
+		MCPToolNames:  []string{"playwright_navigate"},
+	}
+
+	first := BuildSystemPrompt(opts).StableContext
+	for i := 0; i < 5; i++ {
+		got := BuildSystemPrompt(opts).StableContext
+		if got != first {
+			t.Fatalf("call %d produced different StableContext bytes (would break BP #3 cache)\n--- first ---\n%s\n--- got ---\n%s", i+1, first, got)
+		}
 	}
 }
 

@@ -170,6 +170,22 @@ content is per-user by construction. See `prompt.BuildToolListing`.
 
 ## Maintenance playbook
 
+**Adding a new call-site that hits the LLM:**
+1. Pick a `cache_source` name that matches the call's lifecycle (long-reuse or one-shot)
+2. Pass `cache_source=<name>` into `providers.generate_completion` (or `manager.complete`)
+3. If long-reuse: add the name to `_LONG_CACHE_SOURCES` in `anthropic_provider.py`
+4. If originating on ShanClaw side: add a case in `cacheSourceFromDaemonSource` in `runner.go`
+5. After traffic hits production, confirm no new `"unknown"` `cache_source` entries in `~/.shannon/logs/audit.log` (`jq -r '.cache_source' audit.log | sort -u`)
+
+**Diagnosing a CHR regression:**
+1. Enable `SHANNON_CACHE_DEBUG=1`, reproduce, and inspect `~/.shannon/logs/cache-debug.log` for `BYTE_DRIFT` (same `system_len`, different `system_h` across calls) — see `docs/cache-debug.md` for log schema
+2. If drift: enable `SHANNON_CACHE_DRIFT_DEBUG=1` and compare `payload_h` of drifting requests → find the non-deterministic marshaler
+3. If no drift: check `msgs` growth per turn; if > 20 and prompt doesn't encourage parallel tool use, Phase 2 nudge may be stripped by an agent override
+4. If neither: check whether `cache_source` was accidentally set to a short-bucket where a long bucket was intended — look at `docs/cache-bench-results/` for per-source breakdown
+
+**Bumping Anthropic SDK:**
+SDK changes can silently alter message serialization. After any `anthropic` version bump, run `pytest tests/test_byte_stability.py` and a 30-turn bench to verify CHR hasn't regressed.
+
 ## Query-Time Tool Result Budget
 
 ShanClaw applies a second tool-result budget immediately before main LLM
@@ -184,19 +200,3 @@ requests. This layer is separate from execution-time spill:
 The default aggregate cap is 200K chars per user tool-result message. Fresh
 replacements use a 2K-char preview and deterministic spill file path under
 `~/.shannon/tmp/`.
-
-**Adding a new call-site that hits the LLM:**
-1. Pick a `cache_source` name that matches the call's lifecycle (long-reuse or one-shot)
-2. Pass `cache_source=<name>` into `providers.generate_completion` (or `manager.complete`)
-3. If long-reuse: add the name to `_LONG_CACHE_SOURCES` in `anthropic_provider.py`
-4. If originating on ShanClaw side: add a case in `cacheSourceFromDaemonSource` in `runner.go`
-5. Run `scripts/cache_bench_analyze.py` after traffic hits production; confirm no new `"unknown"` entries
-
-**Diagnosing a CHR regression:**
-1. `python3 scripts/cache_bench_analyze.py` — look for `BYTE_DRIFT` flag (`system_len` stable, `system_h` varies)
-2. If drift: enable `SHANNON_CACHE_DRIFT_DEBUG=1`, reproduce, compare `payload_h` of drifting requests → find the non-deterministic marshaler
-3. If no drift: check `msgs` growth per turn; if > 20 and prompt doesn't encourage parallel tool use, Phase 2 nudge may be stripped by an agent override
-4. If neither: check whether `cache_source` was accidentally set to a short-bucket where a long bucket was intended — look at `docs/cache-bench-results/` for per-source breakdown
-
-**Bumping Anthropic SDK:**
-SDK changes can silently alter message serialization. After any `anthropic` version bump, run `pytest tests/test_byte_stability.py` and a 30-turn bench to verify CHR hasn't regressed.
