@@ -71,9 +71,10 @@ func isCJKDominant(s string) bool {
 // constraints declared in SuggestionPrompt. Returns the cleaned suggestion
 // and true if acceptable, or empty string and false if rejected.
 //
-// Length thresholds adapt to script:
-//   - Latin / Cyrillic / etc (space-separated): 2-12 words, ≤100 chars
-//   - CJK-dominant: 4-30 runes, ≤100 chars (one CJK char ≈ one "word")
+// Length thresholds adapt to script (a hard upper rune cap of 65 applies
+// to both before the script-specific gates):
+//   - Latin / Cyrillic / etc (space-separated): 2-13 words
+//   - CJK-dominant: 4-30 runes (one CJK char ≈ one "word")
 //
 // Other rejection reasons (apply to both scripts):
 //   - empty or whitespace-only
