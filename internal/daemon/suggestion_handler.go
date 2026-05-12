@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 )
 
 // suggestionResponse is the JSON shape returned to Desktop for both GET and accept.
@@ -78,14 +80,14 @@ func (s *Server) handleGetSuggestion(w http.ResponseWriter, r *http.Request) {
 // still serve the previously-fetched suggestion text to the user — they
 // clicked accept based on what they saw, which is the correct semantic.
 //
-// NOTE: this Task 9 version returns SpeculatedResponse to Desktop without
-// persisting the user/assistant message pair to session. Task 11.5 will
-// extend this handler to atomically write both messages via
-// SessionManager.AppendAcceptedSpeculation, with a downgrade-to-no-spec
-// fallback if persistence fails. Do not pre-implement that here — it
-// requires the AppendAcceptedSpeculation method (added in T11.5).
+// Round 2 R6 — persist-failure downgrade: when speculation is present we
+// MUST persist the (suggestion, speculated_response) pair to the session
+// BEFORE returning it to Desktop. Otherwise Desktop renders text that the
+// next turn's reloaded session does not contain, drifting context. On
+// persist failure we suppress speculated_response in the reply so Desktop
+// falls back to a normal POST /messages (extra LLM call, but consistent).
 func (s *Server) handleAcceptSuggestion(w http.ResponseWriter, r *http.Request) {
-	_, sessionID, ok := s.validateSuggestionRoute(w, r)
+	agentName, sessionID, ok := s.validateSuggestionRoute(w, r)
 	if !ok {
 		return
 	}
@@ -94,13 +96,32 @@ func (s *Server) handleAcceptSuggestion(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotFound, "no suggestion available")
 		return
 	}
+
+	// Round 2 R6: on persist failure, downgrade to "no speculation" so Desktop
+	// re-sends via normal POST /messages instead of showing un-persisted text.
+	// This costs an extra LLM call BUT keeps session state consistent.
+	speculated := ""
+	if cur.SpeculationText != "" && s.deps != nil && s.deps.SessionCache != nil {
+		sessMgr := s.deps.SessionCache.GetOrCreate(agentName)
+		if err := sessMgr.AppendAcceptedSpeculation(sessionID, cur.Text, cur.SpeculationText); err == nil {
+			speculated = cur.SpeculationText
+		} else if s.deps.Auditor != nil {
+			s.deps.Auditor.Log(audit.AuditEntry{
+				SessionID:    sessionID,
+				Event:        "prompt_suggestion_persist_failed",
+				InputSummary: fmt.Sprintf("session=%s err=%v — downgrading to non-speculation response", sessionID, err),
+			})
+		}
+	}
+
 	s.suggestions.MarkAccepted(sessionID)
+	s.suggestions.Clear(sessionID) // accepting consumes the suggestion
 
 	writeJSON(w, http.StatusOK, suggestionResponse{
 		Text:               cur.Text,
-		HasSpeculation:     cur.SpeculationText != "",
+		HasSpeculation:     speculated != "",
 		SuggestedAtUnix:    cur.SuggestedAt.Unix(),
 		Suggestion:         cur.Text,
-		SpeculatedResponse: cur.SpeculationText,
+		SpeculatedResponse: speculated,
 	})
 }

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
 // newSuggestionTestServer returns a *Server wired with the minimum daemon
@@ -28,6 +30,38 @@ func newSuggestionTestServer(t *testing.T) *Server {
 		deps:        &ServerDeps{AgentsDir: agentsDir},
 		suggestions: agent.NewSuggestionState(),
 	}
+}
+
+// newSuggestionTestServerWithSession extends newSuggestionTestServer with a
+// SessionCache rooted in a separate shannon tmpdir, plus a pre-seeded session
+// with the given sessionID under agents/<agentName>/sessions/. Used by Task
+// 11.5's accept-with-speculation test which exercises the
+// AppendAcceptedSpeculation persistence path.
+func newSuggestionTestServerWithSession(t *testing.T, agentName, sessionID string) *Server {
+	t.Helper()
+	s := newSuggestionTestServer(t)
+
+	shannonDir := t.TempDir()
+	sessionsDir := filepath.Join(shannonDir, "agents", agentName, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-save a session with ID=sessionID so ResumeLatest picks it up.
+	seedStore := session.NewStore(sessionsDir)
+	if err := seedStore.Save(&session.Session{
+		ID: sessionID,
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("hello")},
+			{Role: "assistant", Content: client.NewTextContent("hi")},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedStore.Close()
+
+	s.deps.SessionCache = NewSessionCache(shannonDir)
+	return s
 }
 
 func newSuggestionRequest(method, agentName, sessionID string) (*http.Request, *httptest.ResponseRecorder) {
@@ -75,7 +109,11 @@ func TestHandleGetSuggestion_Absent(t *testing.T) {
 }
 
 func TestHandleAcceptSuggestion_WithSpeculation(t *testing.T) {
-	s := newSuggestionTestServer(t)
+	// T11.5: when speculation is present, accept must persist the
+	// (user=suggestion, assistant=speculated_response) pair to session before
+	// returning speculated_response. Use the SessionCache-wired helper so
+	// AppendAcceptedSpeculation has a real session to append to.
+	s := newSuggestionTestServerWithSession(t, "myagent", "sess1")
 	s.suggestions.Set("sess1", "fix the bug", time.Now())
 	s.suggestions.SetSpeculation("sess1", "fix the bug", "Here is the fix")
 
@@ -93,9 +131,26 @@ func TestHandleAcceptSuggestion_WithSpeculation(t *testing.T) {
 	if got["speculated_response"] != "Here is the fix" {
 		t.Errorf("speculated_response = %v", got["speculated_response"])
 	}
-	cur, _ := s.suggestions.Get("sess1")
-	if cur.AcceptedAt == nil {
-		t.Error("AcceptedAt should be set after /accept")
+	// MarkAccepted runs even though the entry is then cleared (Get returns the
+	// pre-clear snapshot for the user's view; MarkAccepted+Clear mutate state).
+	// After Clear, Get returns ok=false — verify the suggestion was consumed.
+	if _, ok := s.suggestions.Get("sess1"); ok {
+		t.Error("expected suggestion to be cleared after /accept")
+	}
+	// And the persist call must have appended both messages to the session.
+	sessMgr := s.deps.SessionCache.GetOrCreate("myagent")
+	got2, err := sessMgr.Load("sess1")
+	if err != nil {
+		t.Fatalf("reload sess1: %v", err)
+	}
+	if len(got2.Messages) != 4 {
+		t.Fatalf("messages len after persist = %d, want 4 (2 seed + 2 appended)", len(got2.Messages))
+	}
+	if got2.Messages[2].Role != "user" || got2.Messages[2].Content.Text() != "fix the bug" {
+		t.Errorf("appended user msg = %+v", got2.Messages[2])
+	}
+	if got2.Messages[3].Role != "assistant" || got2.Messages[3].Content.Text() != "Here is the fix" {
+		t.Errorf("appended assistant msg = %+v", got2.Messages[3])
 	}
 }
 

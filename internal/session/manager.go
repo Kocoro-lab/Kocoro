@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 // Manager provides session lifecycle operations. It is safe for concurrent use
@@ -97,6 +98,59 @@ func (m *Manager) Save() error {
 		return nil
 	}
 	return m.store.Save(m.current)
+}
+
+// AppendAcceptedSpeculation appends two messages to session id atomically:
+//   - user message containing suggestionText
+//   - assistant message containing speculatedResponse
+//
+// Used by the prompt-suggestion accept handler when the user accepts a
+// speculated suggestion: Desktop shows speculatedResponse instantly, and
+// daemon records the same pair so the next turn's context matches what
+// the user saw.
+//
+// Atomicity:
+//   - Takes m.mu.Lock for the duration so no other Save/Load/Reset can race.
+//   - If sessionID matches m.current.ID, mutates m.current in place AND
+//     persists. Otherwise loads from disk, mutates the loaded copy, persists.
+//   - Returns an error if the session can't be loaded (unknown ID).
+//
+// Round 2 R5: in-place mutation is required because m.Save() persists
+// m.current — if we mutated a loaded copy and a concurrent Save runs, it
+// would overwrite our append with stale m.current data.
+//
+// m.store.Save does not take any internal lock (file IO + json only), so
+// holding m.mu across the call is safe — no deadlock.
+func (m *Manager) AppendAcceptedSpeculation(sessionID, suggestionText, speculatedResponse string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var target *Session
+	if m.current != nil && m.current.ID == sessionID {
+		target = m.current
+	} else {
+		loaded, err := m.store.Load(sessionID)
+		if err != nil {
+			return fmt.Errorf("AppendAcceptedSpeculation: load %s: %w", sessionID, err)
+		}
+		target = loaded
+	}
+
+	target.Messages = append(target.Messages,
+		client.Message{Role: "user", Content: client.NewTextContent(suggestionText)},
+		client.Message{Role: "assistant", Content: client.NewTextContent(speculatedResponse)},
+	)
+	// MessageMeta parallel-to-Messages: keep aligned when present. Source
+	// "prompt_suggestion_accept" makes these auditable / filterable later.
+	if target.MessageMeta != nil {
+		target.MessageMeta = append(target.MessageMeta,
+			MessageMeta{Source: "prompt_suggestion_accept"},
+			MessageMeta{Source: "prompt_suggestion_accept"},
+		)
+	}
+	target.UpdatedAt = time.Now()
+
+	return m.store.Save(target)
 }
 
 // PatchTitle updates the title of the given session and persists it.
