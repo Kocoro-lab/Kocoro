@@ -34,6 +34,19 @@ internal/
     approval.go        # interactive tool approval over WS
     types.go           # daemon request/response types, disconnect, approval messages
     events.go          # EventBus ring buffer for daemon/SSE subscribers
+    bus_handler.go     # EventHandler -> EventBus bridge
+    multi_handler.go   # fan-out EventHandler wrapper
+    scheduler.go       # schedule runner and unattended approval handler
+    safeguard.go       # destructive config edit confirmation gates
+    rules.go           # rules API handlers
+    permissions.go     # system permission probes (+ darwin/other impls)
+    pidfile.go         # single-instance PID lock
+    project_init.go    # project scaffold API handler
+    memory_audit.go    # memory audit adapter
+    memory_fallback.go # session/MEMORY fallback when memory sidecar is not ready
+    launchd_darwin.go  # daemon launchd plist generation / launchctl
+    launchd_stub.go    # launchd stubs for non-darwin
+    attachment.go      # remote attachment download -> file_ref pipeline
     session_cwd.go     # cloud-source scratch CWD allocator (ephemeral per-session tmp dir)
     readtracker_cache.go # per-session ReadTracker cache; entries released via SessionManager.OnSessionClose
   agent/
@@ -42,6 +55,8 @@ internal/
     partition.go         # read-only batching, executeBatches
     spill.go             # per-result spill (>50K) and per-turn 200K aggregate cap (rune-counted)
     toolresult_budget.go # persisted query-time tool_result replacement state (Replacements + Seen)
+    toolbudget.go        # schema-token budget and warm-set fingerprints
+    timebasedcompact.go  # time-based tool_result clearing
     context_bloat.go     # buildContextBloatSuggestion: tool_result_bloat run-status nudges
     deferred.go          # deferred tool loading (tool_search)
     statecache.go        # state-aware tool result cache keyed by read/write state
@@ -53,6 +68,13 @@ internal/
     approval_cache.go    # per-turn approval caching
     normalize.go         # response normalization
     skill_discovery.go   # Per-turn small-model skill matching (discoverRelevantSkills)
+    phase.go             # explicit turn phase tracker
+    watchdog.go          # idle soft/hard timeout observer
+    modelcontext.go      # model ID -> context window map
+    preflight.go         # pre-first-call episodic context hook
+    cachemetric.go       # per-run cache stats accumulator
+    usage.go             # per-run usage aggregation
+    warmset.go           # deferred schema warm-set tracking
   agents/
     loader.go          # LoadAgent, ListAgents, ParseAgentMention
     api.go             # daemon-side agent CRUD
@@ -63,6 +85,13 @@ internal/
     gateway.go         # GatewayClient: Complete, CompleteStream, ListTools
     sse.go             # SSE event parsing
     ollama.go          # Ollama provider via OpenAI-compatible chat/tool APIs
+  cloudflow/
+    dispatch.go        # gateway workflow runner / SSE bridge
+    parse.go           # slash command parser for workflow routes
+  heartbeat/
+    heartbeat.go       # periodic per-agent heartbeat checks
+  watcher/
+    watcher.go         # per-agent file-system watcher
   config/
     config.go          # multi-level config loading and merge
     settings.go        # UI settings
@@ -98,6 +127,11 @@ internal/
   skills/
     registry.go        # skill metadata
     loader.go          # skill loading
+    api.go             # builtin install + HTTP DTOs
+    marketplace.go     # marketplace install/uninstall
+    provenance.go      # skill install-source tracking
+    secrets.go         # per-skill secret storage
+    activated.go       # active-skill context for secret injection
     validate.go        # skill name validation
   memory/
     types.go             # Wire schemas mirroring the Kocoro Cloud memory sidecar HTTP contract
@@ -118,8 +152,7 @@ internal/
     parse.go           # gateway *client.APIError → (Code, Detail) extractor; disambiguates the four 429 sub-shapes
   schedule/
     schedule.go        # schedule CRUD, atomic writes, validation
-    launchd_darwin.go  # plist generation, launchctl
-    launchd_stub.go    # non-darwin stub
+                       # launchd support lives with daemon runtime
   permissions/
     permissions.go     # hard-block > denied > split compounds (incl. & and (...)) > always-ask (prefix + dangerous-flag) > allowed (literal/glob + token-prefix family) > default safe > ask
   audit/
@@ -275,9 +308,9 @@ Source-routed TTL: channels/TUI get 1h, one-shot/subagent paths get 5m (fail-che
 ```bash
 go test ./...                    # all tests
 go test ./internal/agent/ -v     # agent loop, batching, compaction, spill, deferred
-go test ./internal/daemon/ -v    # daemon WS client, router, runner
+go test ./internal/daemon/ -v    # daemon WS client, router, runner, launchd
 go test ./internal/agents/ -v    # agent loader
-go test ./internal/schedule/ -v  # schedule CRUD + plist tests
+go test ./internal/schedule/ -v  # schedule CRUD
 go test ./test/ -v               # E2E coverage
 go test ./test/e2e/ -v           # E2E offline: agents, schedule, session, MCP, cache
 SHANNON_E2E_LIVE=1 go test ./test/e2e/ -v  # E2E live: one-shot, bundled agents (daemon skipped until isolated)
@@ -311,7 +344,7 @@ E2E tests in `test/e2e/` split into offline (no API) and live (`SHANNON_E2E_LIVE
 
 - Session: `session_search` when a session manager is present
 - Cloud: `cloud_delegate` when gateway/cloud access is enabled
-- Cloud: `publish_to_web` when `cloud.enabled` AND `api_key` is configured. Always requires user approval; `purpose` arg is mandatory and shown during the approval prompt. Path blocklist and extension allowlist enforced client-side; never used for backup/sync.
-- Cloud: `generate_image` when `cloud.enabled` AND `api_key` is configured. Text-to-image via Shannon Cloud (`POST /api/v1/images/generations`, server-pinned to `gpt-image-2`). Always requires user approval — output is a permanent public CDN URL plus paid quota consumption. Args: `prompt` (1–32000 chars), `size`/`quality`/`n`/`background` (enum-validated). 504 upstream_timeout and 502 no_images_returned short-circuit without retry (caller should drop quality/n or revise the prompt). For charts / data visualization use the `kocoro-generative-ui` skill instead.
-- Cloud: `edit_image` when `cloud.enabled` AND `api_key` is configured. Image-editing via Shannon Cloud (`POST /api/v1/images/edits`, server-pinned to `gpt-image-2`). Always requires user approval — output is a new permanent public CDN URL plus paid quota. Args: `prompt` (1–32000 chars, the modification instruction), `image_urls` (**1–4 sources, every URL must start with `https://static.kocoro.ai/`** — pre-validated client-side), plus the same `size`/`quality`/`n`/`background` enums. No mask field — describe the region in natural language. 400 invalid_image_url and 413 source_too_large short-circuit without retry (caller should pipe through `generate_image`/`publish_to_web` first or shrink the source). Latency 40–70s (single source, low) up to 200–350s (4 sources, high).
+- Cloud: `publish_to_web` when `cloud.enabled` AND `api_key` is configured. Always requires approval; `purpose` is mandatory. Path blocklist + extension allowlist are enforced client-side; details live with the tool and upload client.
+- Cloud: `generate_image` when `cloud.enabled` AND `api_key` is configured. Always requires approval; returns a permanent public CDN URL and consumes paid quota. Server pins `gpt-image-2`; args are validated client-side; retry/error policy lives with the images client.
+- Cloud: `edit_image` when `cloud.enabled` AND `api_key` is configured. Always requires approval; requires 1–4 `https://static.kocoro.ai/` source URLs and has no mask field. Shares the images client with `generate_image`.
 - Meta: `tool_search` in deferred mode only

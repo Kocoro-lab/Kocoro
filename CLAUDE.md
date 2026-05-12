@@ -34,6 +34,18 @@ internal/
     approval.go        # ApprovalBroker: interactive tool approval over WS
     types.go           # Shared daemon types (disconnect, approval_request/response/resolved)
     events.go          # EventBus ring buffer for daemon/SSE subscribers
+    bus_handler.go     # busEventHandler: forwards agent EventHandler callbacks to EventBus (composable with sse/daemon handlers)
+    multi_handler.go   # multiHandler: fans agent EventHandler callbacks to multiple wrapped handlers
+    scheduler.go       # Cron evaluator: tick(), runSchedule, scheduleHandler (auto-approves for unattended runs)
+    safeguard.go       # ?confirm=true gate + protected-fields map for destructive config edits
+    rules.go           # /rules and /agents/{name}/rules HTTP handlers
+    pidfile.go         # flock-guarded PID file for single-instance enforcement
+    permissions.go     # System permission probes (screen recording, accessibility) — see permissions_darwin.go / permissions_other.go for platform impls
+    project_init.go    # /project/init HTTP handler (scaffold .shannon/ in a project dir)
+    memory_audit.go    # memoryAuditAdapter: bridges memory.AuditLogger → daemon audit.AuditLogger (key-name-only)
+    memory_fallback.go # daemonFallback: session search + agent MEMORY.md fallback when sidecar not Ready
+    launchd_darwin.go  # plist generation, launchctl (darwin only) — used by Scheduler for OS-level scheduling
+    launchd_stub.go    # no-op stub for non-darwin
     attachment.go      # Download remote file attachments (Slack/Feishu) → file_ref pipeline
     session_cwd.go     # Cloud-source scratch CWD allocator (ephemeral, per-session tmp dir)
     readtracker_cache.go # Per-session ReadTracker cache; entries released via SessionManager.OnSessionClose
@@ -43,6 +55,8 @@ internal/
     partition.go         # partitionToolCalls (read-only batching), executeBatches
     spill.go             # Per-result spill (>50K → temp file + preview) and per-turn 200K aggregate cap (rune-counted)
     toolresult_budget.go # Persisted query-time tool_result replacement state (Replacements + Seen) shared across turns
+    toolbudget.go        # Schema-token budget + alwaysDeferTools set; toolSchemaFingerprint for warm-set invalidation
+    timebasedcompact.go  # Time-based clearing of old tool_result content (placeholder marker, compactableTools allowlist)
     context_bloat.go     # buildContextBloatSuggestion: surfaces "tool_result_bloat" run-status nudges
     deferred.go          # Deferred tool loading (tool_search schema merging)
     statecache.go        # state-aware tool result cache keyed by read/write state
@@ -54,6 +68,13 @@ internal/
     approval_cache.go    # per-turn approval caching
     normalize.go         # response normalization
     skill_discovery.go   # Per-turn small-model skill matching (discoverRelevantSkills)
+    phase.go             # Turn phase tracker (PhaseAwaitingLLM / PhaseForceStop idle-counted; fail-closed)
+    watchdog.go          # Idle watchdog: OnRunStatus("idle_soft") at soft timeout, ctx.Cancel(ErrHardIdleTimeout) at hard
+    modelcontext.go      # Model-ID → context-window map (Anthropic/OpenAI/Google/xAI, 1M and 200K families; longest-prefix)
+    preflight.go         # MemoryPreflightFunc hook: optional pre-first-call episodic context injection (fail-silent)
+    cachemetric.go       # CacheTracker: per-Run cache stats accumulator, emitted to audit.log on Run exit
+    usage.go             # Per-Run usage aggregation
+    warmset.go           # Warm-set tracking for deferred tool schemas
   agents/
     loader.go          # LoadAgent (config.yaml, commands/, _attached.yaml), ListAgents, ParseAgentMention
     api.go             # Agent CRUD operations for daemon API
@@ -64,6 +85,13 @@ internal/
     gateway.go         # GatewayClient: Complete, CompleteStream, ListTools
     sse.go             # SSE event parsing
     ollama.go          # Ollama provider via OpenAI-compatible chat/tool APIs
+  cloudflow/
+    dispatch.go        # Gateway workflow runner (research/swarm/auto-routing); bridges Gateway SSE → EventHandler
+    parse.go           # ParseSlash: parse /research and /swarm HTTP messages → SlashCommand
+  heartbeat/
+    heartbeat.go       # Per-agent periodic checklist/goal heartbeat (HEARTBEAT.md) + alert event bus emission
+  watcher/
+    watcher.go         # File-system watcher: per-agent debounced events + rate limit + maxWatchDirs FD cap
   config/
     config.go          # Config struct, Load(), multi-level merge (global/project/local)
     settings.go        # UI settings
@@ -76,8 +104,7 @@ internal/
     persist.go         # PersistLearnings: write-before-compact memory extraction
   schedule/
     schedule.go        # Schedule CRUD, atomic writes, file locking, validation
-    launchd_darwin.go  # plist generation, launchctl (darwin only)
-    launchd_stub.go    # no-op stub for non-darwin
+                       # (launchd plist gen + launchctl moved to internal/daemon/launchd_*.go)
   permissions/
     permissions.go     # bash resolution: hard-block > denied > split compounds > always-ask (prefix + dangerous-flag tokens) > allowed (literal/glob + token-prefix family) > default safe > ask
   audit/
@@ -116,6 +143,9 @@ internal/
     secrets.go         # SecretsStore: per-skill API key CRUD (Keychain via zalando/go-keyring) + plaintext index file
     activated.go       # ActivatedSet + context helpers for scoping secret injection per-run
     validate.go        # ValidateSkillName (Anthropic spec regex)
+    api.go             # HTTP-layer API types (SkillDetail incl. body, EnsureBuiltinSkills sha256-walk installer)
+    marketplace.go     # ClawHub marketplace fetch/install/uninstall (zip download, sandboxed stage, atomic install)
+    provenance.go      # InstallSource tracking (marketplace vs. user) for skill origin/upgrade decisions
   tools/
     register.go        # RegisterLocalTools, RegisterAll, CompleteRegistration, ApplyToolFilter, RegisterPublishTool, RegisterGenerateImageTool, RegisterEditImageTool
     # Tool files: file_read, file_write, file_edit, glob, grep, bash,
@@ -163,7 +193,7 @@ Skills listed in `builtinSkills` (`internal/skills/api.go`) are synced from `emb
 - `kocoro-generative-ui` — inline visualization assistant. Teaches the LLM how to emit `html-artifact` fenced blocks that Kocoro Desktop renders in a sandboxed WKWebView. `hidden: true` (excluded from end-user `GET /skills` listings, still loadable via `use_skill`). Reference files cover charts, structural / illustrative diagrams, geographic maps, SVG setup, and UI components.
 
 ### Kocoro Skill Co-Maintenance
-The `kocoro` bundled skill (`internal/skills/bundled/skills/kocoro/`) is a platform configuration assistant that teaches the AI how to manage ShanClaw via the daemon HTTP API. Its SKILL.md and 11 reference files (`references/*.md`) describe available API endpoints, config fields, and workflows. **Kocoro is the AI's only source of truth for ShanClaw's HTTP surface — if it doesn't know an endpoint exists, it will hallucinate a workaround (e.g., telling users to edit `.env` when the API handles secrets).**
+The `kocoro` bundled skill (`internal/skills/bundled/skills/kocoro/`) is a platform configuration assistant that teaches the AI how to manage ShanClaw via the daemon HTTP API. Its SKILL.md and 12 reference files (`references/*.md`) describe available API endpoints, config fields, and workflows. **Kocoro is the AI's only source of truth for ShanClaw's HTTP surface — if it doesn't know an endpoint exists, it will hallucinate a workaround (e.g., telling users to edit `.env` when the API handles secrets).**
 
 **Mechanical check**: every `mux.HandleFunc(...)` line in `internal/daemon/server.go` must have a matching entry in some `references/*.md`. When adding a new endpoint or feature (not just modifying existing ones), update the corresponding kocoro reference file in the same PR:
 - Daemon API endpoints — main resources AND sub-resources (`/skills/{name}/secrets`, `/skills/{name}/scripts`, `/agents/{name}/skills/*`, `/agents/{name}/commands/*`, `/skills/marketplace/*`) → `references/agents.md`, `references/skills.md`, `references/schedules.md`, `references/config.md`
@@ -214,14 +244,14 @@ Unknown tools → denied by default (fail-safe). The always-ask gate runs BEFORE
   - **Persisted budget state** (`ToolResultReplacements` + `ToolResultSeen` on `session.Session`): query-time replacement bookkeeping survives across turns and resumes. Saved by `applyTurnState` at mid-turn checkpoints AND by both terminal save paths (final save + hard-error save) — a fast turn that finishes before the first checkpoint must still persist these maps, otherwise dedup state is lost on resume.
   - **Bloat nudge**: `buildContextBloatSuggestion` emits `OnRunStatus("tool_result_bloat", …)` when a single tool's per-turn output exceeds the bloat threshold; surfaces to SSE/Desktop subscribers without forcing compaction.
 - **file_read dedup**: `internal/agent/readtracker.go` records `(path, offset, limit, mtime, size)` on each successful read. Re-reading the same range returns a short "unchanged since last read" stub. The daemon owns one tracker per session via `internal/daemon/readtracker_cache.go`, registered through `SessionManager.OnSessionClose` so per-session state is released on session switch, manager close, and explicit delete.
-- **Skill secrets**: `SecretsStore` (`internal/skills/secrets.go`) manages per-skill API keys. Values stored in **macOS Keychain** (encrypted; service = `com.shannon.skill.<name>`, account = env var name) via `zalando/go-keyring` (pure Go, no CGo; passes password via stdin not argv so `ps` cannot observe values). A plaintext index file `~/.shannon/secrets-index.json` tracks which key names are configured per skill so `ConfiguredKeys()` can answer without triggering Keychain access prompts. Skills declare required env vars via ClawHub metadata — three interchangeable parent aliases: `metadata.openclaw.requires.env` / `metadata.clawdbot.requires.env` / `metadata.clawdis.requires.env`. Daemon exposes `PUT/DELETE /skills/{name}/secrets` for CRUD (all three write handlers call `auditHTTPOp` with key names only, never values); `GET /skills` returns `required_secrets` + `configured_secrets` (values never exposed). **Runtime injection is env-var-only, scoped to active skills**: secrets never enter the prompt body or session transcript. `AgentLoop.Run` initializes a per-run `skills.ActivatedSet` in context; `use_skill` registers the skill name when invoked; `BashTool.Run` reads the set via context and fetches only those skills' secrets from `SecretsStore` on each invocation, injecting as child-process env vars. A skill loaded but never activated contributes no env vars to bash. Secrets cleaned up on skill deletion.
-- **Turn phase tracker** (`internal/agent/phase.go`): explicit state machine for `AgentLoop.Run`. Every blocking boundary calls `tracker.Enter(phase)` or `tracker.EnterTransient(phase)()`. Only `PhaseAwaitingLLM` and `PhaseForceStop` are idle-counted (watched by the watchdog). Fail-closed: forgotten transient restore and `Enter`-inside-transient mark the tracker `invalid`; observers self-disable. Panics under `testing.Testing()` or `SHANNON_PHASE_STRICT=1`, logs otherwise.
-- **Idle watchdog** (`internal/agent/watchdog.go`): observer goroutine. Fires `OnRunStatus("idle_soft", …)` after `agent.idle_soft_timeout_secs` (default 90) in an idle-counted phase. Cancels ctx with `ErrHardIdleTimeout` via `context.WithCancelCause` after `agent.idle_hard_timeout_secs` (default 0 = disabled; flip to 540 after dogfood). Dedups soft fire by tracker `seq`, re-arms on every phase transition. `completeWithRetry` prefers `context.Cause(ctx)` over `ctx.Err()`. `isSoftRunError` in the runner includes `ErrHardIdleTimeout` so the partial transcript is persisted (not replaced by a friendly error stub). Daemon emits `EventRunStatus` to SSE/Desktop subscribers via `daemonEventHandler.OnRunStatus`.
-- **Mid-turn checkpoint**: `AgentLoop.SetCheckpointFunc(func(ctx) error)` fires at three phase-exit boundaries (after each `executeBatches`, after successful reactive compaction, before `runForceStopTurn`), gated by `tracker.TakeDirty()`. Agent-side `SetCheckpointMinInterval(2s)` debounce; failed save (callback returns error) leaves dirty set and skips the time stamp so the next fire retries. Runner uses `captureTurnBaseline` + `applyTurnMessages` + `applyTurnUsage` — the SAME helpers run from the normal final save AND the hard-error save so a turn is never persisted twice via different paths. The mid-turn checkpoint additionally calls `applyTurnState` (which persists `ToolResultReplacements` + `ToolResultSeen`); the final and hard-error save paths copy those two maps explicitly from `loop` so a fast turn that finishes before any checkpoint fires still ends up with the budget bookkeeping on disk. `session.Session.InProgress` is set mid-turn, cleared on final save; a non-zero flag on reload indicates a crash-recovered session with a partial transcript.
-- **Playwright `file://` preview bridge** (`internal/tools/filepreview.go`): loopback HTTP server rewrites `browser_navigate(file://…)` → `http://127.0.0.1/<token>/<name>`. Fail-closed allowlist via `AllowRoot(dir)` / `AllowFile(path)`, both symlink-resolved via `filepath.EvalSymlinks`. Daemon populates per-run from effective CWD + user-attached paths so browser reach never exceeds `permissions.CheckFilePath`. Uses `http.ServeContent` (not `http.ServeFile`) to avoid the `index.html` internal redirect. Defense-in-depth: `r.RemoteAddr` loopback check in the handler.
+- **Skill secrets** (`internal/skills/secrets.go`): per-skill API keys in macOS Keychain (service `com.shannon.skill.<name>`, account = env var name) via `zalando/go-keyring`. Plaintext index `~/.shannon/secrets-index.json` (key names only, never values). Skills declare required env vars via ClawHub metadata (`openclaw`/`clawdbot`/`clawdis` aliases, all interchangeable). Daemon CRUD: `PUT/DELETE /skills/{name}/secrets`; audit rows include key names only. **Runtime injection is env-var-only, scoped to skills activated by `use_skill` in the current run** — secrets never enter the prompt body, session transcript, or audit values. A skill loaded but never activated contributes no env vars. Secrets deleted on skill removal.
+- **Turn phase tracker** (`internal/agent/phase.go`): state machine for `AgentLoop.Run`; every blocking boundary calls `tracker.Enter` or `EnterTransient`. Only `PhaseAwaitingLLM` and `PhaseForceStop` are idle-counted by the watchdog. Fail-closed on misuse — panics under `testing.Testing()` or `SHANNON_PHASE_STRICT=1`, logs otherwise.
+- **Idle watchdog** (`internal/agent/watchdog.go`): observer goroutine. Fires `OnRunStatus("idle_soft", …)` after `agent.idle_soft_timeout_secs` (default 90) in an idle-counted phase. Cancels ctx with `ErrHardIdleTimeout` via `context.WithCancelCause` after `agent.idle_hard_timeout_secs` (default 0 = disabled; recommended 540 once enabled — see README). Dedups soft fire by tracker `seq`, re-arms on every phase transition. `completeWithRetry` prefers `context.Cause(ctx)` over `ctx.Err()`. `isSoftRunError` in the runner includes `ErrHardIdleTimeout` so the partial transcript is persisted (not replaced by a friendly error stub). Daemon emits `EventRunStatus` to SSE/Desktop subscribers via `daemonEventHandler.OnRunStatus`.
+- **Mid-turn checkpoint**: `AgentLoop.SetCheckpointFunc` fires at three phase-exit boundaries (after `executeBatches`, after reactive compaction, before `runForceStopTurn`); 2s debounce; failed save retries via dirty bit. Runner uses `captureTurnBaseline` + `applyTurnMessages`/`applyTurnUsage`/`applyTurnState` — the **same** helpers run from mid-turn checkpoint, final save, and hard-error save (no path divergence). Terminal save paths copy `ToolResultReplacements` + `ToolResultSeen` explicitly so fast turns that finish before any checkpoint still persist budget state. `session.Session.InProgress` set mid-turn, cleared on final save; non-zero on reload = crash-recovered partial transcript.
+- **Playwright `file://` preview bridge** (`internal/tools/filepreview.go`): loopback HTTP server rewrites `browser_navigate(file://…)` → `http://127.0.0.1/<token>/<name>`. Fail-closed allowlist (`AllowRoot`/`AllowFile`, symlink-resolved via `filepath.EvalSymlinks`); daemon populates per-run from effective CWD + user-attached paths so browser reach never exceeds `permissions.CheckFilePath`. Defense-in-depth: handler enforces `r.RemoteAddr` loopback-only.
 - **Session sync** (`internal/sync/`): uploads local session JSON to Shannon Cloud once per day (opt-in via `sync.enabled`). Single entry point `sync.Run`; called from daemon ticker and `shan sessions sync` CLI; flock + atomic marker write serialize concurrent callers. Per-session ACK with persistent `marker.failed` bookkeeping; permanent reasons (`size_limit_exceeded`, `load_error`) stay forever and self-heal on session edit.
 - **Memory client** (`internal/memory/`, Phase 2.3): daemon owns sidecar lifecycle (spawn / health / restart / shutdown) and the 24h bundle pull loop. Tool `memory_recall` (`internal/tools/memory.go`) delegates to `memory.Service.Query` via UDS; falls back to `session_search` + MEMORY.md whenever `Service.Status() != Ready`. CLI/TUI use `memory.AttachPolicy` (probe-only, never spawn) and connect via `memory.NewServiceAttached`. Privacy invariant: the resolved API key bytes never reach disk or audit logs (only `sha256[:16]` fingerprint in `<bundle_root>/.tenant_fingerprint`).
-- **Loop detector** (`internal/agent/loopdetect.go`): 9 detectors trigger nudge or force-stop. **Threshold policy v2 (2026-04-22)**: defaults raised across the board for Claude 4.X self-recovery — `consecDupThreshold=3`, `exactDupThreshold=5`, `sameToolErrThreshold=6`, `noProgressThreshold=12`, `semiRepeatableThreshold=16`; FamilyNoProgress non-repeatable path 5/8/12 (was 3/5/7); SearchEscalation 7/12 (was 5/8); Sleep 2/4 (unchanged). Key tuning: `dupExemptTools` (currently `use_skill`) skip both ConsecutiveDup and ExactDup entirely (pure idempotent loaders); ConsecutiveDup tail-success skip + all-errors 2x budget lets fail/fail/success retries survive; ExactDup also skips the first success after a recent same-args error streak, even when retries are spread across intervening tool calls; ExactDup all-errors 2x budget mirrors ConsecutiveDup for spread-out retries; FamilyNoProgress fires force-stop-only at progressCount>=15 for repeatable tools when there is no prior same-topic collision beyond the current call itself (no intermediate nudge — prevents stacking with rolling-window escalation); nudge escalation in `loop.go` uses a rolling window (`nudgeWindow`: max 3 nudges within trailing 5 iterations) instead of a flat counter.
+- **Loop detector** (`internal/agent/loopdetect.go`): 9 detectors trigger nudge or force-stop. Thresholds raised broadly 2026-04 for Claude 4.X self-recovery — current values in `loopdetect.go:275-281`. Key invariants: `dupExemptTools` (currently `use_skill`) skip dup detection entirely; all-errors 2× budget lets fail/fail/success retries survive; rolling nudge window (max 3 nudges within trailing 5 iterations) in `loop.go` instead of a flat counter.
 
 ### Daemon Approval Protocol
 - **Interactive mode** (default): Tools requiring approval send `approval_request` over WS → Cloud relays to Ptfrog → user responds → `approval_response` relayed back. Agent loop blocks until response.
@@ -260,7 +290,7 @@ Scalars override, lists merge+dedup, structs field-level merge. MCP server env v
 `schedules.json` and `secrets-index.json` use write-to-temp + `os.Rename` + `syscall.Flock` on a persistent `.lock` file. Never delete the lock file (causes flock race on different inodes).
 
 ### Build Tags
-`internal/schedule/launchd_darwin.go` uses `//go:build darwin`. `launchd_stub.go` provides no-op stubs for non-darwin. Tests that touch launchctl go in `_darwin_test.go`.
+`internal/daemon/launchd_darwin.go` uses `//go:build darwin`. `launchd_stub.go` provides no-op stubs for non-darwin. Tests that touch launchctl go in `_darwin_test.go`.
 
 ### Prompt Cache
 See `docs/cache-strategy.md` for the authoritative design (4-breakpoint allocation, source→TTL routing, byte stability, session_id propagation, env-var overrides). When investigating CER drops, see `docs/cache-debug.md` for the diagnostic instrumentation layer (env flags, log fields, drift patterns). One-line invariants:
@@ -275,7 +305,6 @@ See `docs/cache-strategy.md` for the authoritative design (4-breakpoint allocati
 ### Context Management
 - **Context window**: `agent.context_window` (default 200000) is a **seed** via `loop.SetContextWindow`; after each main-tier response `maybeAutoAdjustContextWindow` resets it from `response.model` via `internal/agent/modelcontext.go` (Anthropic / OpenAI / Google / xAI; 1M and 200K families; longest-prefix-first; unknown IDs untouched). Catches cloud tier-failover (sonnet-4-6 → sonnet-4-5) automatically.
 - **Per-agent override** (`~/.shannon/agents/<name>/config.yaml`) calls `SetContextWindowExplicit` (lock); auto-detect skips locked loops. Plain `SetContextWindow` clears the lock so a soft reseed flows back to auto mode. Use per-agent for cost caps or Ollama / custom-cap models.
-- **No `anthropic-beta` header is sent** (retired 2026-04-30; sonnet-4-6 / opus-4-6 / 4-7 are GA at 1M).
 - **Proactive compaction**: `PersistLearnings` → `GenerateSummary` (two-phase: `<analysis>` scratchpad → `<summary>`) → `ShapeHistory` at 90% context window.
 - **Pre-flight compaction** (`shouldPreflightCompact`): backup gate at 95%, fires before each main LLM call + force-stop turn. Catches the within-iteration overshoot the proactive `lastPromptTokens` snapshot misses. Gated on `len(messages) > MinShapeable()`; emits `OnRunStatus("preflight_compaction", …)`.
 - **Reactive compaction**: On context-length error, emergency compress + single retry. `reactiveCompacted` flag prevents loops. The summarize call inside reactive is itself capped at `summarizeInputCapChars=540_000` (~154K tokens) with UTF-8-rune-safe head+tail truncation (`internal/context/summarize.go`) — without this the cascade re-overflows on the small-tier summarizer and surfaces a hard 400 (2026-05-07 incident).
@@ -292,17 +321,17 @@ XML `<tool_exec>` delimiters in conversation context with random hex call_id. Pr
 
 ```bash
 go test ./...                              # all tests
-go test ./internal/daemon/ -v              # daemon: WS client, router, E2E routing
+go test ./internal/daemon/ -v              # daemon: WS client, router, E2E routing, launchd
 go test ./internal/agent/ -v               # agent loop, partitioning, spill, deferred
 go test ./internal/agents/ -v              # agent loader
-go test ./internal/schedule/ -v            # schedule CRUD + plist tests
+go test ./internal/schedule/ -v            # schedule CRUD
 go test ./test/ -v                         # E2E: vision pipeline, persist learnings
 go test ./test/e2e/ -v                     # E2E offline: agents, schedule, session, MCP, cache
 SHANNON_E2E_LIVE=1 go test ./test/e2e/ -v  # E2E live: one-shot, bundled agents (daemon tests skipped until --port/--home isolation)
 go build ./...                             # build check
 ```
 
-Schedule tests use `t.TempDir()` as `plistDir` — they never write to real `~/Library/LaunchAgents/`.
+Schedule tests use temp directories and never write to real `~/Library/LaunchAgents/`; launchd plist coverage lives with daemon tests.
 
 E2E tests in `test/e2e/` are split into offline (no API, runs in CI) and live (needs `SHANNON_E2E_LIVE=1` + configured endpoint). Run live tests before each release.
 
@@ -326,7 +355,7 @@ E2E tests in `test/e2e/` are split into offline (no API, runs in CI) and live (n
 **Conditional (registered outside `RegisterLocalTools`):**
 - session_search — added when a session manager is available
 - cloud_delegate — added when `cloud.enabled: true`
-- publish_to_web — added when `cloud.enabled: true` AND `cfg.APIKey != ""`. Lives in `internal/tools/publish_to_web.go`; HTTP plumbing in `internal/uploads/client.go` (multipart streaming via `io.Pipe`, 3-attempt retry on `ErrTransient`, sentinel errors for 401/400/413/500-s3_unconfigured/transient). Always requires approval (`RequiresApproval=true`, `IsSafeArgs=false`). Tool-side guards: required `purpose` arg shown to user during approval; path-segment blocklist (`.env`/`.ssh`/`credentials`/…); basename suffix blocklist (`.pem`/`.key`/…); extension allowlist (default html/md/txt/pdf/png/jpg/svg/csv/json/mp4/…). Allowlist extensible via `cloud.publish_allowed_extensions: [".go", ...]`; **denylist is not user-configurable by design**. Registered alongside `cloud_delegate` at all 5 call sites (`cmd/daemon.go`, `cmd/root.go`, `internal/tui/app.go`, `internal/daemon/server.go` reload paths).
-- generate_image — added when `cloud.enabled: true` AND `cfg.APIKey != ""`. Lives in `internal/tools/generate_image.go`; HTTP plumbing in `internal/images/client.go` (POST JSON to `/api/v1/images/generations`, 3-attempt retry on `ErrTransient`, sentinel-typed errors). Always requires approval (`RequiresApproval=true`, `IsSafeArgs=false`) — output is a permanent public CDN URL plus paid quota consumption. Reuses `GatewayClient.HTTPClient()` (600s timeout meets the API spec ≥600s requirement). Args: `prompt` (1–32000 chars, required), `size`/`quality`/`n`/`background` (enum-validated client-side). **Never sends a `model` field** — server pins `gpt-image-2`. Error policy: 504 `upstream_timeout` and 502 `no_images_returned` are `BusinessError` (not retried — re-running same args wastes paid quota); 502 `upstream_error`/`decode_failed`, 500 `image_failed`, 503, network → `Transient`. Registered alongside `cloud_delegate` / `publish_to_web` at all 5 call sites.
-- edit_image — added when `cloud.enabled: true` AND `cfg.APIKey != ""`. Lives in `internal/tools/edit_image.go`; shares `internal/images/client.go` with `generate_image` (`Edit` method posts to `/api/v1/images/edits`; success schema reuses `GenerateResponse`). Always requires approval (paid + permanent public URL). Args: `prompt` (1–32000 chars), `image_urls` (**required, 1–4 entries**, every entry must start with `https://static.kocoro.ai/` — pre-validated client-side via `kocoroCDNPrefix` constant in `edit_image.go` to avoid wasted round-trips), plus the same `size`/`quality`/`n`/`background` enums as `generate_image`. **Never sends a `model` field**, **no mask field** (region described in natural language). New sentinels: `ErrInvalidImageURL` (400 invalid_image_url → `BusinessError`, "rebuild the URL pipeline" — server may also reject for non-prefix reasons), `ErrSourceTooLarge` (413 source_too_large → `ValidationError`, source > 25 MiB OpenAI cap). 502 `source_fetch_failed` falls into the existing `ErrTransient` default branch (3-attempt retry covers spec's "可重试 1 次"). Latency reaches 200–350s for 4 sources at `quality=high`. Registered alongside `generate_image` at all 5 call sites.
+- publish_to_web — gated on `cloud.enabled: true` AND `cfg.APIKey != ""`. Always requires approval (permanent CDN URL). Path-segment + basename blocklist (`.env`/`.pem`/…), extension allowlist (extensible via `cloud.publish_allowed_extensions`; denylist is not user-configurable). Tool: `internal/tools/publish_to_web.go`; HTTP: `internal/uploads/client.go` (multipart streaming, retry on `ErrTransient`).
+- generate_image — gated on `cloud.enabled: true` AND `cfg.APIKey != ""`. Always requires approval (paid quota + permanent public CDN URL). Args: `prompt`/`size`/`quality`/`n`/`background`; server pins `gpt-image-2`. Tool: `internal/tools/generate_image.go`; HTTP + retry/error policy: `internal/images/client.go`.
+- edit_image — gated on `cloud.enabled: true` AND `cfg.APIKey != ""`. Always requires approval. Args: `prompt` + `image_urls` (1–4 entries, must start with `https://static.kocoro.ai/`, pre-validated client-side); no mask field (region in prose). Tool: `internal/tools/edit_image.go`; shares `internal/images/client.go` with `generate_image`.
 - tool_search — added in deferred mode when tool count > 30 (lives in `internal/agent/deferred.go`, not `tools/`)
