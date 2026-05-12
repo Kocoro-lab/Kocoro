@@ -17,21 +17,26 @@ import (
 // do change suggestion behavior in non-obvious ways.
 const SuggestionPrompt = `<system-instruction>Predict the user's most likely next message in this conversation. Respond with ONLY that next message — 2 to 12 words, matching the user's tone and language. No quotes, no preamble, no explanation. If you cannot confidently predict a useful next message, respond with exactly the word "skip".</system-instruction>`
 
-// allowedSingleWords contains short common follow-ups acceptable as 1-word suggestions.
-// Anything outside this set requires ≥2 words. Filler conversational tokens such as
-// "yes"/"ok"/"sure" are intentionally excluded — they read as Claude-voice fillers
-// rather than concrete user follow-ups, and would crowd out more useful predictions.
+// allowedSingleWords contains short imperative action verbs acceptable as
+// 1-word suggestions. Anything outside this set requires ≥2 words. Filler
+// conversational tokens such as "yes"/"yeah"/"ok"/"sure" are intentionally
+// excluded — they read as Claude-voice fillers rather than concrete user
+// follow-ups, and would crowd out more useful predictions. "skip" is omitted
+// because the meta-marker check at the top of FilterSuggestion rejects it
+// before the allowlist runs.
 var allowedSingleWords = map[string]bool{
 	"continue": true, "commit": true, "push": true,
 	"deploy": true, "merge": true, "test": true,
 	"retry": true, "stop": true, "cancel": true,
+	"go": true, "run": true,
 }
 
 // evaluativeWords are common Claude-voice or filler tokens that we drop.
+// Keys are compared after stripping leading/trailing ".,!?" and lowercasing,
+// so e.g. "sure!" → "sure" before lookup — only the trimmed form is meaningful here.
 var evaluativeWords = map[string]bool{
 	"great": true, "perfect": true, "excellent": true, "absolutely": true,
 	"certainly": true, "of": true, "course": true, // "of course"
-	"sure!": true,
 }
 
 // claudeVoicePatterns are substring markers that indicate the model is talking
@@ -106,29 +111,25 @@ func FilterSuggestion(raw string) (string, bool) {
 
 	runeCount := utf8.RuneCountInString(s)
 
-	// Hard upper bound (both scripts)
+	// Defense-in-depth hard upper bound. The per-script caps below (30 runes
+	// for CJK, 65 for Latin) are the primary enforcement; this exists as a
+	// belt-and-suspenders guard against accidental relaxation of those.
 	if runeCount > 100 {
 		return "", false
 	}
 
-	// Multi-sentence — check both ASCII and CJK punctuation
+	// Multi-sentence — any rune after an end-punct rune (regardless of script
+	// or whitespace) means multiple sentences. ASCII uses ". "; CJK has no
+	// space after 。 — the unified "if anything follows, reject" rule handles
+	// both. A trailing end-punct as the final rune is fine (single sentence).
 	for i, r := range s {
 		isEndPunct := r == '.' || r == '!' || r == '?' ||
 			r == '。' || r == '！' || r == '？'
 		if !isEndPunct {
 			continue
 		}
-		// Find next rune
 		if i+utf8.RuneLen(r) < len(s) {
-			next, _ := utf8.DecodeRuneInString(s[i+utf8.RuneLen(r):])
-			// In CJK there's no space after punctuation, so any non-end char after
-			// an end-punct rune means multiple sentences
-			if next != 0 && next != ' ' && next != '\t' {
-				return "", false
-			}
-			if next == ' ' || next == '\t' {
-				return "", false
-			}
+			return "", false
 		}
 	}
 
