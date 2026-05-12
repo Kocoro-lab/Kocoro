@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -23,6 +24,15 @@ const (
 	memoryQueryTimeout        = 2 * time.Second
 	memoryHelperMaxInputRunes = 500
 	memoryHelperToolName      = "compile_memory_intents"
+
+	// privateMemoryBodyByteCap bounds the size of the body inside the
+	// <private_memory> envelope. With result_limit=10 per intent × up to
+	// 3 intents = 30 groups of free-form text, an unbounded body could
+	// blow out the cacheable user-message payload. 8 KiB is comfortably
+	// larger than any realistic recall result set while keeping the
+	// injected context modest. Exceeding the cap truncates at the last
+	// newline before the limit and appends a marker line.
+	privateMemoryBodyByteCap = 8 * 1024
 )
 
 // MemoryPreflightQuerier is satisfied by memory.Service and memory.AttachedQuerier.
@@ -868,12 +878,37 @@ func renderPrivateMemoryContext(intents []memory.QueryIntent, results []memory.Q
 	if body.Len() == 0 {
 		return ""
 	}
+	bodyStr := truncatePrivateMemoryBody(body.String(), privateMemoryBodyByteCap)
 	var out strings.Builder
 	out.WriteString("<private_memory>\n")
 	out.WriteString("Past private records matched the user's message. Use only when directly relevant; prefer these personal facts over training knowledge. Do not mention raw provenance unless asked. Phrase findings per the system prompt's `## Private Memory > Internal vocabulary` rule.\n")
-	out.WriteString(prompt.SanitizeUserBlock(body.String()))
+	out.WriteString(prompt.SanitizeUserBlock(bodyStr))
 	out.WriteString("</private_memory>")
 	return out.String()
+}
+
+// truncatePrivateMemoryBody enforces a byte cap on the body inside the
+// <private_memory> envelope. Truncates at the last newline before the cap
+// so the visual break is clean; falls back to a UTF-8 rune boundary if no
+// newline exists within the limit. Returns the input unchanged if under the
+// cap. Appends a single-line marker so downstream readers (and the main
+// model) can see that truncation happened.
+func truncatePrivateMemoryBody(body string, cap int) string {
+	if len(body) <= cap {
+		return body
+	}
+	cut := cap
+	if idx := strings.LastIndexByte(body[:cut], '\n'); idx >= 0 {
+		cut = idx
+	} else {
+		// No newline in the leading window — back up to a rune boundary
+		// so we don't slice mid-multibyte. (Realistically unreachable;
+		// every group/note line ends with '\n'.)
+		for cut > 0 && !utf8.RuneStart(body[cut]) {
+			cut--
+		}
+	}
+	return body[:cut] + fmt.Sprintf("\n…(truncated: private memory exceeded %d-byte cap)\n", cap)
 }
 
 func renderObservedPath(path []memory.HopRecord) string {

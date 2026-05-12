@@ -3,8 +3,10 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -418,6 +420,112 @@ func TestRenderPrivateMemoryContext_StripsEnvelopeClosersFromBody(t *testing.T) 
 	// Confirm the user-derived content survives apart from the stripped closers.
 	if !strings.Contains(out, "Acme ") || !strings.Contains(out, "stray  tag inside fact") || !strings.Contains(out, "note with  closer") {
 		t.Fatalf("expected non-closer content preserved, got: %q", out)
+	}
+}
+
+func TestRenderPrivateMemoryContext_FitsBodyUnderCapUnchanged(t *testing.T) {
+	intents := []memory.QueryIntent{{
+		Mode:           memory.ModeDirectRelation,
+		AnchorMentions: []string{"Alice"},
+	}}
+	results := []memory.QueryResult{{
+		Class: memory.ClassOK,
+		Envelope: &memory.ResponseEnvelope{MemoryBlock: &memory.MemoryBlock{
+			Groups: []memory.MemoryCandidateGroup{
+				{Value: "Alice works at Acme", ViaRelations: []string{"works_at"}, SupportCount: 2},
+				{Value: "Alice met Bob in 2024", ViaRelations: []string{"met"}, SupportCount: 1},
+			},
+		}},
+	}}
+
+	out := renderPrivateMemoryContext(intents, results)
+	if strings.Contains(out, "truncated") {
+		t.Fatalf("expected no truncation marker for small body, got: %q", out)
+	}
+	if !strings.Contains(out, "Alice works at Acme") || !strings.Contains(out, "Alice met Bob in 2024") {
+		t.Fatalf("expected both groups preserved, got: %q", out)
+	}
+}
+
+func TestRenderPrivateMemoryContext_TruncatesOversizedBody(t *testing.T) {
+	// Build 30 groups (the worst-case observed: 3 intents × result_limit=10)
+	// each carrying ~500 chars of free-form text, well over the 8 KiB cap.
+	bigValue := strings.Repeat("very-long-fact-payload ", 25) // ~575 bytes per group
+	groups := make([]memory.MemoryCandidateGroup, 0, 30)
+	for i := 0; i < 30; i++ {
+		groups = append(groups, memory.MemoryCandidateGroup{
+			Value:        fmt.Sprintf("[group-%d] %s", i, bigValue),
+			ViaRelations: []string{"discussed"},
+			SupportCount: 1,
+		})
+	}
+	intents := []memory.QueryIntent{{Mode: memory.ModeTypedNeighborhood, AnchorMentions: []string{"anchor"}}}
+	results := []memory.QueryResult{{
+		Class:    memory.ClassOK,
+		Envelope: &memory.ResponseEnvelope{MemoryBlock: &memory.MemoryBlock{Groups: groups}},
+	}}
+
+	out := renderPrivateMemoryContext(intents, results)
+
+	// Envelope intact
+	if !strings.HasPrefix(out, "<private_memory>\n") || !strings.HasSuffix(out, "</private_memory>") {
+		t.Fatalf("envelope corrupted: %q", out[:min(120, len(out))])
+	}
+
+	// Marker present
+	if !strings.Contains(out, "truncated: private memory exceeded") {
+		t.Fatalf("expected truncation marker in oversized output; got prefix=%q tail=%q",
+			out[:min(200, len(out))], out[max(0, len(out)-200):])
+	}
+
+	// Total length is reasonable: cap + envelope + lead-in + marker. Allow
+	// some slack but reject runaway growth — must be well under 2× the cap.
+	if len(out) > 2*privateMemoryBodyByteCap {
+		t.Fatalf("output too large after truncation: %d bytes (cap=%d)", len(out), privateMemoryBodyByteCap)
+	}
+
+	// Truncation is at a newline boundary (no half-line right before marker).
+	markerIdx := strings.Index(out, "…(truncated:")
+	if markerIdx <= 0 || out[markerIdx-1] != '\n' {
+		t.Fatalf("truncation marker not preceded by newline (would split a line): byte before marker = %q", out[max(0, markerIdx-1):markerIdx])
+	}
+}
+
+func TestTruncatePrivateMemoryBody_NoTruncationWhenUnderCap(t *testing.T) {
+	in := "line 1\nline 2\nline 3\n"
+	got := truncatePrivateMemoryBody(in, 1024)
+	if got != in {
+		t.Fatalf("under-cap input must pass through unchanged; got %q", got)
+	}
+}
+
+func TestTruncatePrivateMemoryBody_TruncatesAtLastNewlineBeforeCap(t *testing.T) {
+	in := "aaaaa\nbbbbb\nccccc\nddddd\n"
+	// Cap of 12 → fits "aaaaa\nbbbbb\n" (12 bytes) then last newline at index 11
+	got := truncatePrivateMemoryBody(in, 12)
+	if !strings.HasPrefix(got, "aaaaa\nbbbbb") {
+		t.Fatalf("expected truncation to preserve aaaaa\\nbbbbb prefix; got %q", got)
+	}
+	if !strings.Contains(got, "truncated:") {
+		t.Fatalf("expected truncation marker; got %q", got)
+	}
+	if strings.Contains(got, "ccccc") {
+		t.Fatalf("expected ccccc to be dropped; got %q", got)
+	}
+}
+
+func TestTruncatePrivateMemoryBody_FallsBackToRuneBoundary(t *testing.T) {
+	// Single-line body with multibyte runes ('世' is 3 bytes in UTF-8).
+	// Cap chosen so the byte cut would land mid-rune; truncatePrivateMemoryBody
+	// must back up to a rune boundary so the result is valid UTF-8.
+	in := strings.Repeat("世", 100)         // 300 bytes, no newlines
+	got := truncatePrivateMemoryBody(in, 50) // 50 not a multiple of 3
+	body := strings.SplitN(got, "\n…(truncated", 2)[0]
+	if !utf8.ValidString(body) {
+		t.Fatalf("truncated body is not valid UTF-8: bytes=%v", []byte(body))
+	}
+	if !strings.Contains(got, "truncated:") {
+		t.Fatalf("expected truncation marker; got %q", got)
 	}
 }
 
