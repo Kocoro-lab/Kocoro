@@ -216,9 +216,12 @@ func (s *Server) SetOnReload(fn func()) {
 	s.onReload = fn
 }
 
-func (s *Server) Start(ctx context.Context) error {
-	s.ctx = ctx
-	mux := http.NewServeMux()
+// registerRoutes wires every HTTP handler onto mux. Extracted from Start so
+// offline tests (test/e2e/suggestion_test.go) can build a mux without
+// listening on a port or spinning up memSvc / sync ticker. Production Start
+// calls this; nothing else mutates s here, so it is safe to call before
+// listening.
+func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /agents", s.handleAgents)
@@ -294,6 +297,22 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /chrome/show", s.handleChromeShow)
 	mux.HandleFunc("POST /chrome/hide", s.handleChromeHide)
 	mux.HandleFunc("POST /shutdown", s.handleShutdown)
+}
+
+// Handler returns an http.Handler with every route registered. Used by
+// offline E2E tests that need to exercise HTTP handlers without listening
+// on a port or starting the memSvc / sync ticker side effects of Start.
+// Production code paths should use Start instead.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	s.registerRoutes(mux)
+	return mux
+}
+
+func (s *Server) Start(ctx context.Context) error {
+	s.ctx = ctx
+	mux := http.NewServeMux()
+	s.registerRoutes(mux)
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", s.port))
 	if err != nil {
