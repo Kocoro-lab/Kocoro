@@ -860,3 +860,36 @@ func TestCapabilities_AdvertisesNewTokens(t *testing.T) {
 	}
 }
 
+// TestDownloadRemoteFiles_DocumentB64_EmptyMIME verifies that DocumentB64
+// payloads without a MimeType are rejected (instead of silently defaulting
+// to application/pdf) and the caller falls back to URL download. Without
+// this guard a future cloud bug shipping non-PDF bytes + empty MIME would
+// be mis-forwarded to Anthropic as a PDF and 400.
+func TestDownloadRemoteFiles_DocumentB64_EmptyMIME(t *testing.T) {
+	skipURLValidation(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Write([]byte("fallback PDF bytes from URL"))
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	blocks, cleanup := downloadRemoteFiles(dir, []RemoteFile{{
+		Name:        "bad.pdf",
+		MimeType:    "", // empty — should NOT default to PDF
+		URL:         ts.URL + "/file.pdf",
+		DocumentB64: "ZmFrZQ==", // non-empty so the document branch is exercised
+	}})
+	defer cleanup()
+
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block (URL fallback), got %d: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "file_ref" {
+		t.Fatalf("expected file_ref from URL fallback (not document block), got %s: %+v", blocks[0].Type, blocks[0])
+	}
+	if blocks[0].ByteSize != int64(len("fallback PDF bytes from URL")) {
+		t.Errorf("URL fallback bytes not downloaded; got byte_size=%d", blocks[0].ByteSize)
+	}
+}
+
