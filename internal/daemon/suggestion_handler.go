@@ -20,22 +20,30 @@ type suggestionResponse struct {
 	SpeculatedResponse string `json:"speculated_response,omitempty"` // /accept only
 }
 
-// validateSuggestionRoute applies the standard /agents/{name}/sessions/{id}/...
-// validation: agent name shape + existence, session id shape + path-traversal
-// guard. Returns the validated (name, id, ok). On invalid input it writes the
-// appropriate 400 / 404 via writeError / agentExists and returns ok=false.
+// validateSuggestionRoute resolves and validates the route inputs for both
+// route shapes:
+//   - /agents/{name}/sessions/{id}/suggestion[/accept]   — named agent
+//   - /sessions/{id}/suggestion[/accept]                 — default agent ("")
 //
-// Pulled out so Task 11.5's extension of handleAcceptSuggestion (which will
-// resolve the agent's session manager and call AppendAcceptedSpeculation) can
-// trust name+id are filesystem-safe before any disk access.
+// When r.PathValue("name") is empty (the default-agent route), the name
+// validation and existence check are skipped. When non-empty, both are
+// enforced exactly as before. The returned name is "" for default-agent
+// callers, and SessionCache.GetOrCreate("") resolves to the default
+// sessions directory per router.go:sessionsDir.
+//
+// Session id is always validated for shape and path-traversal — required
+// because Task 11.5's AppendAcceptedSpeculation resolves a file path
+// from {id}.
 func (s *Server) validateSuggestionRoute(w http.ResponseWriter, r *http.Request) (name, id string, ok bool) {
 	name = r.PathValue("name")
-	if err := agents.ValidateAgentName(name); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return "", "", false
-	}
-	if !s.agentExists(w, name) {
-		return "", "", false
+	if name != "" {
+		if err := agents.ValidateAgentName(name); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return "", "", false
+		}
+		if !s.agentExists(w, name) {
+			return "", "", false
+		}
 	}
 	id = r.PathValue("id")
 	if id == "" {

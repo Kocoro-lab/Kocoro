@@ -236,3 +236,60 @@ func TestSuggestionState_ClearedOnNewTurn(t *testing.T) {
 		t.Error("expected suggestion to be cleared on new turn")
 	}
 }
+
+// newDefaultSuggestionRequest builds the /sessions/{id}/suggestion route
+// (no agent name segment). Only the "id" path value is set — the handler's
+// validateSuggestionRoute reads r.PathValue("name") which returns "" for
+// this route, taking the default-agent code path.
+func newDefaultSuggestionRequest(method, sessionID string) (*http.Request, *httptest.ResponseRecorder) {
+	url := "/sessions/" + sessionID + "/suggestion"
+	if method == http.MethodPost {
+		url += "/accept"
+	}
+	req := httptest.NewRequest(method, url, nil)
+	req.SetPathValue("id", sessionID)
+	return req, httptest.NewRecorder()
+}
+
+func TestHandleGetSuggestion_DefaultAgent(t *testing.T) {
+	// Default-agent route: no /agents/{name} prefix. validateSuggestionRoute
+	// must skip the agentExists 404 (which would otherwise reject because
+	// agentName=="" has no AGENT.md). Per GPT review P1 finding #3.
+	s := newSuggestionTestServer(t) // AgentsDir has "myagent" but the route
+	                                // doesn't use it; default-agent path
+	                                // should not require any named agent.
+	s.suggestions.Set("sess1", "default-agent suggestion", time.Now())
+
+	req, w := newDefaultSuggestionRequest(http.MethodGet, "sess1")
+	s.handleGetSuggestion(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for default-agent route; body: %s", w.Code, w.Body.String())
+	}
+	var got map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if got["text"] != "default-agent suggestion" {
+		t.Errorf("text = %v, want default-agent suggestion", got["text"])
+	}
+}
+
+func TestHandleGetSuggestion_DefaultAgent_MissingSessionID(t *testing.T) {
+	// Even on the default-agent route, an empty session id is rejected.
+	s := newSuggestionTestServer(t)
+	req, w := newDefaultSuggestionRequest(http.MethodGet, "")
+	s.handleGetSuggestion(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for empty session id", w.Code)
+	}
+}
+
+func TestHandleGetSuggestion_DefaultAgent_PathTraversal(t *testing.T) {
+	// Path-traversal guard still applies — Task 11.5 resolves the agent's
+	// sessions dir from {id} and writes there.
+	s := newSuggestionTestServer(t)
+	req, w := newDefaultSuggestionRequest(http.MethodGet, "../escape")
+	s.handleGetSuggestion(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for path-traversal id", w.Code)
+	}
+}

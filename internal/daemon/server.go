@@ -284,6 +284,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/search", s.handleSessionSearch)
 	mux.HandleFunc("GET /agents/{name}/sessions/{id}/suggestion", s.handleGetSuggestion)
 	mux.HandleFunc("POST /agents/{name}/sessions/{id}/suggestion/accept", s.handleAcceptSuggestion)
+	// Default-agent parallel routes — validateSuggestionRoute returns
+	// agentName="" for these, and SessionCache.GetOrCreate("") maps to
+	// ~/.shannon/sessions. Desktop's default workspace has no named agent
+	// in the URL and would otherwise hit a 404 via agentExists.
+	mux.HandleFunc("GET /sessions/{id}/suggestion", s.handleGetSuggestion)
+	mux.HandleFunc("POST /sessions/{id}/suggestion/accept", s.handleAcceptSuggestion)
 	mux.HandleFunc("GET /permissions", s.handlePermissions)
 	mux.HandleFunc("POST /permissions/request", s.handlePermissionsRequest)
 	mux.HandleFunc("POST /approval", s.handleApproval)
