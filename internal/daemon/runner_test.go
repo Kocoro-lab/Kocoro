@@ -6,14 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
@@ -726,4 +731,136 @@ func TestCleanupPlaywrightAfterTurn_NonCDPUsesIdleDisconnect(t *testing.T) {
 	if nowCalls != 0 || stopCalls != 0 {
 		t.Fatalf("expected no immediate teardown in non-CDP mode, got disconnect=%d stop=%d", nowCalls, stopCalls)
 	}
+}
+
+// fakeGatewayBackend is a minimal httptest server stub for fireSuggestionAfterRun
+// tests. It captures every CompletionRequest the daemon sends and returns a
+// caller-supplied reply text.
+type fakeGatewayBackend struct {
+	mu       sync.Mutex
+	captured []client.CompletionRequest
+	reply    string
+}
+
+func (g *fakeGatewayBackend) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req client.CompletionRequest
+		_ = json.Unmarshal(body, &req)
+		g.mu.Lock()
+		g.captured = append(g.captured, req)
+		reply := g.reply
+		g.mu.Unlock()
+		resp := client.CompletionResponse{
+			Provider:   "anthropic",
+			Model:      "test-model",
+			OutputText: reply,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+func (g *fakeGatewayBackend) requests() []client.CompletionRequest {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]client.CompletionRequest, len(g.captured))
+	copy(out, g.captured)
+	return out
+}
+
+// TestFireSuggestionAfterRun_AppendsAssistantReplyToMain verifies the GPT
+// review P0 fix: forked suggestion request must include the just-completed
+// assistant reply, otherwise the model predicts the user's "next" message
+// without seeing what the assistant actually said.
+func TestFireSuggestionAfterRun_AppendsAssistantReplyToMain(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "run the failing test"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := &ServerDeps{
+		GW:          client.NewGatewayClient(ts.URL, "test-key"),
+		Suggestions: agent.NewSuggestionState(),
+	}
+
+	main := client.CompletionRequest{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("fix the bug")},
+		},
+		ModelTier: "medium",
+	}
+
+	fireSuggestionAfterRun(context.Background(), deps,
+		"test-agent", "sess1",
+		main, config.PromptSuggestionConfig{}, // SpeculationEnabled: false
+		"I'll fix the test in foo.go")
+
+	reqs := gw.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("expected 1 gateway call, got %d", len(reqs))
+	}
+
+	msgs := reqs[0].Messages
+	// Expect 3 messages in this order:
+	//   [0] user="fix the bug"           (the original main turn input)
+	//   [1] assistant="I'll fix the..."  (the just-generated reply — the fix)
+	//   [2] user=SuggestionPrompt        (appended by BuildForkedSuggestionRequest)
+	if len(msgs) != 3 {
+		t.Fatalf("forked request has %d messages, want 3 (user + assistant_reply + SUGGESTION_PROMPT). messages: %+v", len(msgs), msgs)
+	}
+	if msgs[1].Role != "assistant" {
+		t.Errorf("messages[1].Role = %q, want assistant (the just-generated reply)", msgs[1].Role)
+	}
+	if got := messageText(msgs[1]); got != "I'll fix the test in foo.go" {
+		t.Errorf("messages[1] text = %q, want %q (assistant reply)", got, "I'll fix the test in foo.go")
+	}
+
+	sug, ok := deps.Suggestions.Get("sess1")
+	if !ok || sug.Text != "run the failing test" {
+		t.Errorf("SuggestionState entry = %+v, want Text='run the failing test'", sug)
+	}
+}
+
+// TestFireSuggestionAfterRun_EmptyReplySkipsAll guards against the case
+// where loop.Run returned empty text (tool-only turn, partial result).
+// Firing a suggestion with no assistant reply produces a misleading
+// prediction; skip entirely.
+func TestFireSuggestionAfterRun_EmptyReplySkipsAll(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "should never be called"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := &ServerDeps{
+		GW:          client.NewGatewayClient(ts.URL, "test-key"),
+		Suggestions: agent.NewSuggestionState(),
+	}
+	main := client.CompletionRequest{
+		Messages:  []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
+		ModelTier: "medium",
+	}
+
+	fireSuggestionAfterRun(context.Background(), deps,
+		"test-agent", "sess1",
+		main, config.PromptSuggestionConfig{},
+		"") // empty assistantReply
+
+	if got := len(gw.requests()); got != 0 {
+		t.Errorf("gateway called %d times, want 0 (empty reply must skip)", got)
+	}
+	if _, ok := deps.Suggestions.Get("sess1"); ok {
+		t.Error("SuggestionState must remain empty when assistantReply is empty")
+	}
+}
+
+// messageText extracts the text from a Message's MessageContent for
+// assertion purposes. Works across simple-text and multi-block messages
+// by falling back to the JSON form if Text() is unavailable.
+func messageText(m client.Message) string {
+	// MessageContent has Text() helper for text-only payloads.
+	if t := m.Content.Text(); t != "" {
+		return t
+	}
+	// Fallback — JSON-encode and let the test assert by substring.
+	b, _ := json.Marshal(m.Content)
+	return string(b)
 }

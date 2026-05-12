@@ -1454,7 +1454,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					// request ctx (HTTP handler / WS dispatch returns
 					// before the forked call completes). Cancellation
 					// happens via daemon shutdown, not request lifecycle.
-					go fireSuggestionAfterRun(context.Background(), deps, agentName, sess.ID, mainReq, ps)
+					//
+					// result is the assistant reply from loop.Run — the
+					// forked call appends it to main so the model
+					// predicts the user's NEXT message after seeing the
+					// assistant's response (not a stale follow-up to
+					// the prior user turn).
+					go fireSuggestionAfterRun(context.Background(), deps, agentName, sess.ID, mainReq, ps, result)
 				}
 			}
 		}
@@ -1535,17 +1541,49 @@ func countAssistantTurns(messages []client.Message) int {
 // errors to the user; if the suggestion fails, the next /suggestion poll
 // returns 404 and Desktop hides the ghost text.
 //
+// assistantReply is the text the assistant just generated this turn (return
+// value of loop.Run). It must be non-empty — otherwise we skip, since the
+// model has nothing to anchor the next-message prediction on. We append it
+// to main.Messages as an assistant turn so the forked LLM call sees the
+// conversation state Desktop is about to show the user. Without this the
+// snapshot captured by LastSentRequest() reflects "before assistant
+// responded" and the suggestion predicts a stale follow-up.
+//
+// Cache impact: the appended assistant message is uncached (~few hundred
+// input tokens at warm-cache pricing per token). The cached PREFIX —
+// main.Messages and everything before it — is byte-identical to the main
+// turn's request, so prompt-cache lookup still hits.
+//
 // Cache-audit detail (the InputSummary field): the audit row carries the
 // forked-call model + cache_read_tokens / cache_creation_tokens so operators
 // can verify the suggestion path is hitting the main turn's prompt cache.
 // Without this telemetry there's no signal that the feature is paying
 // warm-cache pricing as designed.
-func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, sessionID string, main client.CompletionRequest, ps config.PromptSuggestionConfig) {
+func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, sessionID string, main client.CompletionRequest, ps config.PromptSuggestionConfig, assistantReply string) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("daemon: prompt_suggestion panic: %v", rec)
 		}
 	}()
+
+	if assistantReply == "" {
+		// No assistant text to anchor the prediction. Could be a tool-only
+		// turn or some unusual partial state — skip rather than emit a
+		// low-quality suggestion. Next turn will retry.
+		return
+	}
+
+	// Augment main with the just-completed assistant reply. Allocate a fresh
+	// Messages slice so this never aliases the loop's internal snapshot
+	// (LastSentRequest already deep-copies on read, but rely on local
+	// allocation for clarity).
+	augmented := make([]client.Message, 0, len(main.Messages)+1)
+	augmented = append(augmented, main.Messages...)
+	augmented = append(augmented, client.Message{
+		Role:    "assistant",
+		Content: client.NewTextContent(assistantReply),
+	})
+	main.Messages = augmented
 
 	res, err := agent.GenerateSuggestionWithUsage(ctx, deps.GW, main)
 	if err != nil {
