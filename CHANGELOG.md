@@ -2,6 +2,36 @@
 
 All notable changes to ShanClaw are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.1.6 — 2026-05-12 — Inbound attachments + skill ZIP upload + episodic-memory default revert
+
+Ships inbound attachment support so cloud-fed PDFs and Office documents arrive over the WebSocket path with the right rendering treatment (PDF as a native Anthropic `document` block, DOCX/XLSX/PPTX as pre-extracted text), plus six new local document and archive tools so the daemon can handle the same file types locally. Adds a `POST /skills/upload` endpoint so users can install a skill from a local ZIP without going through ClawHub. Reverts the v0.1.5 "session sync + episodic memory on by default" change after operator feedback — both now default off, opt-in via Kocoro Desktop's Beta toggle.
+
+### Added
+
+- **Inbound attachment protocol** (`internal/daemon/attachment.go`, PR #132) — WS-path `RemoteFile` gained three optional cloud-populated fields: `document_b64` (PDF base64 for a native Anthropic `document` content block, ≤25 MB raw), `extracted_text` (cloud's pre-extracted DOCX/XLSX/PPTX/CSV text), `extraction_note` (audit-only metadata). HTTP-path `RequestContentBlock` accepts a new `document` type that flows straight through `resolveContentBlocks`. Caps: 500 MB / file, 20 files / message; daemon-side rune cap of 500K on inline extracted text as defense-in-depth. New capability tokens `inline_document_b64` and `inline_extracted_text` (alongside the existing `delivery_ack`) tell Cloud the daemon can decode the new fields — older daemons fall back to URL download cleanly.
+- **Local document extractors** (`internal/tools/doc_extract.go`) — `pdf_to_text` (poppler `pdftotext -layout`, install-hint fallback), `docx_to_text` / `pptx_to_text` (pandoc primary, unzip + XML-strip fallback), `xlsx_to_text` (xlsx2csv primary, unzip + sharedStrings/sheet XML fallback). Fixed-argv `exec.Command` (no shell injection), 60s timeout per call, output capped at 100K runes with a `[Truncated: ...]` marker.
+- **Local archive tools** (`internal/tools/archive.go`) — `archive_inspect` (read-only entry listing, no approval needed) and `archive_extract` (approval-gated, atomic stage-then-rename) for `.zip / .tar / .tar.gz / .tgz`. Rejects encrypted zips, absolute-path / symlink / device / setuid entries; caps at 500 entries, 50 MB per entry, 200 MB total. Single-layer only.
+- **`POST /skills/upload` endpoint** (`internal/daemon/server.go`, PR #133) — multipart upload installs a skill from a local ZIP. 50 MB body cap (enforced both at `MaxBytesReader` and inside `extractZipToSkill`). Reuses the existing extractor so zipbomb guards, symlink rejection, path-escape checks, and `__MACOSX` / `.git*` exclusion are inherited. Handles GitHub/Finder single-top-level-dir layout. Per-slug `SlugLocks` serialize concurrent uploads of the same slug.
+- **`SkillConflictError` 409 response with side-by-side compare** (`internal/skills/marketplace.go`) — when a slug already exists and `force=false`, returns existing vs. uploaded name / description / prompt so Kocoro Desktop can render a side-by-side compare sheet. Prompt fields truncated to 8 KB via `truncatePromptPreview`; callers needing the full body fetch `GET /skills/{slug}`.
+- **`IsBuiltinSkill` guard** (`internal/skills/api.go`) — unconditionally rejects uploads targeting `kocoro` / `kocoro-generative-ui` even when `force=true` (`EnsureBuiltinSkills` would silently revert any override on next restart, so the upload would be useless).
+
+### Changed
+
+- **`sync.enabled` defaults back to `false`** (commit `1f5958a`) — reverses the v0.1.5 default-on change. Operator feedback was that the implicit upload-on-by-default behavior was surprising for cloud-connected installs that hadn't yet opted into episodic memory. Enable explicitly via `sync.enabled: true` or the Episodic Memory toggle in Kocoro Desktop's Settings → Advanced → Beta.
+- **`memory.provider` defaults back to disabled** (commit `1f5958a`) — same rationale; pairs with the `sync.enabled` revert so episodic memory is fully off until the Beta toggle is enabled.
+- **`<private_memory>` injection body bounded to 8 KiB** (`internal/agent/preflight.go`, commit `2c6f22c`) — the implicit episodic preflight previously could inject an unbounded body into the in-flight user message when the sidecar returned a verbose recall. Now capped at 8 KiB with a `[truncated]` marker; oversized recalls trim the lowest-scoring entries first.
+
+### Fixed
+
+- **`truncatePromptPreview` rune walk is now O(1) per step, bounded to 3 iterations** (`internal/skills/marketplace.go`) — the initial conflict-truncation helper called `utf8.ValidString` in a loop, rescanning the full prefix each step (O(n²) worst case on invalid UTF-8 input). Replaced with a `utf8.DecodeLastRuneInString` walk-back; UTF-8 runes are ≤4 bytes, so a cut into a partial sequence leaves at most 3 trailing bytes to strip.
+
+### Cross-repo consumers
+
+- **Shannon Cloud**: must populate `RemoteFile.document_b64` (for PDFs ≤18 MB) and `RemoteFile.extracted_text` (for DOCX/XLSX/PPTX/CSV) when serving cloud-fed attachments to daemons advertising the new capability tokens. Older daemons (no `inline_document_b64` / `inline_extracted_text` capability) get the legacy URL-only path. The originally planned `/extract` round-trip is no longer needed — daemons handle the same file types locally via `internal/tools/doc_extract.go`.
+- **ShanClaw Desktop**: helper bundle rebuilt against this tag. The Episodic Memory toggle in Settings → Advanced → Beta now controls `memory.provider` + `sync.enabled` together, both defaulting to off in this release.
+
+---
+
 ## v0.1.5 — 2026-05-11 — Episodic memory (TLM sidecar + session sync default-on)
 
 Ships the full local episodic memory pipeline. The TLM sidecar is now managed by the daemon — it spawns, health-probes, restarts on crash, pulls fresh bundles from Kocoro Cloud every 24h, and hot-reloads the sidecar on install. Session sync is on by default for cloud-connected installs so the training pipeline runs without manual config. CLI and TUI paths now correctly apply cwd-local memory overlays.

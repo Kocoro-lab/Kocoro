@@ -925,6 +925,8 @@ Attached agent skills also appear as `/summarize` slash commands in the TUI.
 
 **Skill secrets.** Skills that need API keys declare required env vars in their ClawHub metadata (`metadata.openclaw.requires.env` / `metadata.clawdbot.requires.env` / `metadata.clawdis.requires.env`). Values are stored in the macOS Keychain — never on disk, never in the prompt or session transcript — and scoped to active skills only: a skill that is installed but never activated via `use_skill` contributes no env vars to `bash`. Manage keys over the daemon API (`PUT/DELETE /skills/{name}/secrets`); `GET /skills` returns `required_secrets` and `configured_secrets` (names only, never values).
 
+**Installing from a local ZIP.** Beyond the ClawHub marketplace, the daemon accepts a direct upload via `POST /skills/upload` (multipart, 50 MB cap). Unwraps a GitHub/Finder single-top-level-dir layout, strips `__MACOSX`, inherits the marketplace extractor's zipbomb / symlink / path-escape guards, and serializes concurrent uploads of the same slug. On slug collision returns a 409 with a side-by-side compare body (existing vs. uploaded name / description / prompt, prompts capped at 8 KB) so Kocoro Desktop can render a compare sheet; re-issue with `?force=true` to overwrite (crash-safe rename-to-backup + atomic rename, backup removed on success). Uploads targeting the `kocoro` / `kocoro-generative-ui` builtins are rejected unconditionally — the daemon re-overlays builtins from the binary on every startup, so an upload there would be reverted.
+
 ### Using Agents
 
 ```bash
