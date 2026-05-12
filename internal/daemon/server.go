@@ -62,6 +62,7 @@ type Server struct {
 	slugLocks    *skills.SlugLocks
 	secretsStore *skills.SecretsStore
 	memSvc       *memory.Service
+	suggestions  *agent.SuggestionState
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500
@@ -135,6 +136,11 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		marketplace:            skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour),
 		slugLocks:              skills.NewSlugLocks(),
 		secretsStore:           store,
+		// suggestions is initialized unconditionally so handlers work even
+		// when deps == nil (existing test fixtures pass nil). Task 10 will
+		// add `if deps != nil { deps.Suggestions = s.suggestions }` to wire
+		// the same pointer through ServerDeps for the runner to use.
+		suggestions: agent.NewSuggestionState(),
 	}
 }
 
@@ -266,6 +272,8 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /sessions/{id}/reset", s.handleResetSession)
 	mux.HandleFunc("GET /sessions/{id}/summary", s.handleSessionSummary)
 	mux.HandleFunc("GET /sessions/search", s.handleSessionSearch)
+	mux.HandleFunc("GET /agents/{name}/sessions/{id}/suggestion", s.handleGetSuggestion)
+	mux.HandleFunc("POST /agents/{name}/sessions/{id}/suggestion/accept", s.handleAcceptSuggestion)
 	mux.HandleFunc("GET /permissions", s.handlePermissions)
 	mux.HandleFunc("POST /permissions/request", s.handlePermissionsRequest)
 	mux.HandleFunc("POST /approval", s.handleApproval)
