@@ -252,11 +252,14 @@ func downloadRemoteFiles(shannonDir string, files []RemoteFile) ([]RequestConten
 // extracted_text.
 func materializeInlineDocument(ensureDir func() (string, error), index int, f RemoteFile, displayName string) ([]RequestContentBlock, error) {
 	mime := strings.ToLower(strings.TrimSpace(f.MimeType))
+	// Empty MIME is treated as an error rather than silently defaulting to
+	// PDF: a future cloud build that ships DocumentB64 with non-PDF bytes
+	// and an unset MimeType would otherwise be forwarded to Anthropic as
+	// application/pdf and 400 with a confusing message. The caller falls
+	// back to URL download in this case, so the message still reaches the
+	// model.
 	if mime == "" {
-		// Best-effort fallback for older cloud builds that omit MIME on
-		// document_b64 payloads — assume PDF, the only currently supported
-		// inline-document media type.
-		mime = "application/pdf"
+		return nil, fmt.Errorf("inline document missing MIME type")
 	}
 	if mime != "application/pdf" {
 		return nil, fmt.Errorf("unsupported inline document media type %q", mime)
