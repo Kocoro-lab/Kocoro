@@ -291,8 +291,8 @@ func TestMemoryDefaults(t *testing.T) {
 	if _, err := Load(); err != nil {
 		t.Fatal(err)
 	}
-	if v := viper.GetString("memory.provider"); v != "cloud" {
-		t.Fatalf("memory.provider=%q want cloud", v)
+	if v := viper.GetString("memory.provider"); v != "disabled" {
+		t.Fatalf("memory.provider=%q want disabled (Episodic Memory is opt-in)", v)
 	}
 	if v := viper.GetInt("memory.sidecar_restart_max"); v != 5 {
 		t.Fatalf("sidecar_restart_max=%d want 5", v)

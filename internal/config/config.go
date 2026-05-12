@@ -233,7 +233,11 @@ func Load() (*Config, error) {
 	// sync.* defaults — MUST stay in sync with setSyncDefaults in
 	// internal/sync/config.go. The duplicate exists so internal/sync unit
 	// tests can establish defaults without importing internal/config.
-	viper.SetDefault("sync.enabled", true)
+	//
+	// sync.enabled defaults to false: session sync is part of the Episodic
+	// Memory pipeline (sessions → cloud training → bundle). The toggle is
+	// opt-in; we don't upload conversation history by default.
+	viper.SetDefault("sync.enabled", false)
 	viper.SetDefault("sync.dry_run", false)
 	viper.SetDefault("sync.endpoint", "")
 	viper.SetDefault("sync.exclude_agents", []string{})
@@ -249,7 +253,12 @@ func Load() (*Config, error) {
 	// Memory feature (Phase 2.3). Single source of truth for memory.* defaults;
 	// internal/memory/config.go reads these via typed accessors but never
 	// registers defaults itself.
-	viper.SetDefault("memory.provider", "cloud")
+	//
+	// memory.provider defaults to "disabled": Episodic Memory is opt-in.
+	// Once enabled by the user, the Desktop installs tlm.app on demand and
+	// writes memory.tlm_path; sync.enabled is also flipped to true in the
+	// same patchConfig call (see ShanClawDesktop SettingsView).
+	viper.SetDefault("memory.provider", "disabled")
 	viper.SetDefault("memory.endpoint", "")
 	viper.SetDefault("memory.api_key", "")
 	viper.SetDefault("memory.socket_path", "$TMPDIR/com.kocoro.tlm.sock")

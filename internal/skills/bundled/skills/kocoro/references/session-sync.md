@@ -2,13 +2,13 @@
 
 ## What it does
 
-Uploads local session JSON from `~/.shannon/sessions/` and `~/.shannon/agents/*/sessions/` to Shannon Cloud once per day. Enabled by default for cloud-connected installs. Used for Cloud-side analytics, replay, and per-user memory training.
+Uploads local session JSON from `~/.shannon/sessions/` and `~/.shannon/agents/*/sessions/` to Shannon Cloud once per day. **Opt-in** — disabled by default; flipped on alongside Episodic Memory by the Kocoro Desktop toggle. Used for Cloud-side analytics, replay, and per-user memory training.
 
 ## Config keys (under `sync:`)
 
 | Key | Default | Notes |
 |---|---|---|
-| `enabled` | `true` | Master switch. Set `false` to disable uploads. |
+| `enabled` | `false` | Master switch. Set `true` to enable uploads (Desktop toggle does this in tandem with `memory.provider`). |
 | `dry_run` | `false` | If `true`, writes batches to `~/.shannon/sync_outbox/` instead of POSTing. Useful for local verification. |
 | `endpoint` | `""` | Cloud endpoint. Empty falls back to `{cloud.endpoint}/api/v1/sessions/sync`. |
 | `exclude_agents` | `[]` | List of agent dir names to skip. Use `"default"` for the root sessions dir. |

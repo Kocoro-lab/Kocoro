@@ -71,7 +71,7 @@ Global settings control how Shannon behaves across all agents — which AI model
 
 | Key | Default | Notes |
 |---|---|---|
-| `memory.provider` | `cloud` | `disabled` / `cloud` / `local` |
+| `memory.provider` | `disabled` | `disabled` / `cloud` / `local` — Episodic Memory is opt-in |
 | `memory.endpoint` | `""` | Falls back to `cloud.endpoint` |
 | `memory.api_key` | `""` | Falls back to `cloud.api_key`; never logged |
 | `memory.socket_path` | `$TMPDIR/com.kocoro.tlm.sock` | UDS for sidecar HTTP |

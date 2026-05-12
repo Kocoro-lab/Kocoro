@@ -1040,14 +1040,15 @@ curl -X POST http://localhost:7533/message \
 ShanClaw includes a `memory_recall` tool that lets the agent look up facts
 learned from prior sessions before asking the user. The structured memory
 runs as a local sidecar over a Unix socket; the daemon manages spawn,
-readiness, restart, and bundle pull. Episodic Memory is enabled by default
-for cloud-connected installs, and can be disabled in settings. Three modes:
+readiness, restart, and bundle pull. Episodic Memory is **opt-in** —
+disabled by default; users enable it from Kocoro Desktop settings (or by
+editing `memory.provider`/`sync.enabled` directly). Three modes:
 
-- `memory.provider: "cloud"` (default) — daemon pulls fresh memory bundles from Kocoro
+- `memory.provider: "disabled"` (default) — no sidecar, `memory_recall` falls
+  back to keyword session search and MEMORY.md.
+- `memory.provider: "cloud"` — daemon pulls fresh memory bundles from Kocoro
   Cloud every 24h and runs the sidecar against them. Requires `cloud.api_key`
   (or override via `memory.api_key`) and `cloud.endpoint`.
-- `memory.provider: "disabled"` — no sidecar, `memory_recall` falls
-  back to keyword session search and MEMORY.md.
 - `memory.provider: "local"` — daemon runs the sidecar against bundles you
   build locally; no Cloud calls. Useful for self-hosted setups.
 
@@ -1090,7 +1091,7 @@ Effect: many memory questions are answered on turn 0 without an explicit
 
 | Key | Default | Notes |
 |---|---|---|
-| `memory.provider` | `cloud` | `disabled` / `cloud` / `local` |
+| `memory.provider` | `disabled` | `disabled` / `cloud` / `local` — Episodic Memory is opt-in |
 | `memory.endpoint` | `""` | Falls back to `cloud.endpoint` |
 | `memory.api_key` | `""` | Falls back to `cloud.api_key` |
 | `memory.socket_path` | `$TMPDIR/com.kocoro.tlm.sock` | UDS path |
@@ -1106,16 +1107,16 @@ Effect: many memory questions are answered on turn 0 without an explicit
 ### Privacy
 
 Memory bundles are local files. The daemon never sends recall queries or
-inferred candidates back to Cloud. Session sync is enabled by default for
-cloud-connected installs and uploads local session history so Kocoro Cloud
-can train fresh memory bundles. Turning off Episodic Memory in settings
-disables both bundle-backed recall and session sync. Switching the configured
-API key triggers a wipe + fresh bundle pull so cached recall from a previous
+inferred candidates back to Cloud. Session sync defaults to disabled and is
+flipped on alongside Episodic Memory by the Desktop toggle (or by setting
+`sync.enabled: true` manually); when on, it uploads local session history so
+Kocoro Cloud can train fresh memory bundles. Switching the configured API
+key triggers a wipe + fresh bundle pull so cached recall from a previous
 tenant does not leak.
 
 ## Session sync to Cloud
 
-ShanClaw uploads local session JSON to Shannon Cloud once per day by default when Cloud credentials are configured. This powers Cloud-side analytics, replay, and per-user memory training. Disable Episodic Memory in settings, or set `sync.enabled: false`, to stop uploads.
+ShanClaw can upload local session JSON to Shannon Cloud once per day to power Cloud-side analytics, replay, and per-user memory training. **Opt-in** — disabled by default; the Kocoro Desktop Episodic Memory toggle flips this on. To enable manually, set `sync.enabled: true` and provide Cloud credentials.
 
 **What's uploaded:** the full session JSON files under `~/.shannon/sessions/` and `~/.shannon/agents/*/sessions/`. Sessions are sent as-is — there is no built-in PII or secret redaction in v1. Skill secrets are never included (they live in the macOS Keychain, never in transcripts), but tool output, file contents, and bash command results are uploaded verbatim.
 
@@ -1123,7 +1124,7 @@ ShanClaw uploads local session JSON to Shannon Cloud once per day by default whe
 
 ```yaml
 sync:
-  enabled: true                  # default true
+  enabled: false                 # default false; flip to true to opt in
   dry_run: false                 # if true, write batches to ~/.shannon/sync_outbox/ instead of POSTing
   exclude_agents: []             # ["personal", "scratch", "default"]
   exclude_sources: []            # ["local", "cli", "slack"]; legacy sessions with no source treated as "local"

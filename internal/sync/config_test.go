@@ -16,8 +16,8 @@ func TestLoadConfig_Defaults(t *testing.T) {
 
 	cfg := LoadConfig(viper.GetViper())
 
-	if cfg.Enabled != true {
-		t.Errorf("Enabled: got %v, want true", cfg.Enabled)
+	if cfg.Enabled != false {
+		t.Errorf("Enabled: got %v, want false (sync is opt-in alongside Episodic Memory)", cfg.Enabled)
 	}
 	if cfg.BatchMaxSessions != 25 {
 		t.Errorf("BatchMaxSessions: got %d, want 25", cfg.BatchMaxSessions)

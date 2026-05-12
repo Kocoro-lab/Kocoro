@@ -28,7 +28,7 @@ type Config struct {
 //
 // MUST stay in sync with the sync.* SetDefault calls in internal/config/config.go.
 func setSyncDefaults(v *viper.Viper) {
-	v.SetDefault("sync.enabled", true)
+	v.SetDefault("sync.enabled", false)
 	v.SetDefault("sync.dry_run", false)
 	v.SetDefault("sync.endpoint", "")
 	v.SetDefault("sync.exclude_agents", []string{})

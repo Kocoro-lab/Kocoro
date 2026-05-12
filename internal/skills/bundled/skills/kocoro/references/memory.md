@@ -3,14 +3,15 @@
 ShanClaw includes a `memory_recall` agent tool backed by a local memory
 sidecar. The daemon manages the sidecar's lifecycle and (in cloud mode)
 periodically pulls fresh memory bundles from Kocoro Cloud. Episodic Memory is
-enabled by default for cloud-connected installs and can be disabled in
-settings. Three modes:
+**opt-in** — disabled by default; users enable it from Kocoro Desktop
+Settings, which also flips on session sync as part of the same toggle. Three
+modes:
 
-- **cloud** (default): paid feature. Daemon polls Kocoro Cloud for bundle manifests
+- **disabled** (default): no sidecar; tool falls back to `session_search`
+  and the agent's MEMORY.md.
+- **cloud**: paid feature. Daemon polls Kocoro Cloud for bundle manifests
   every 24h, downloads + verifies + atomically installs, then triggers a
   sidecar reload.
-- **disabled**: no sidecar; tool falls back to `session_search`
-  and the agent's MEMORY.md.
 - **local**: self-host. User builds + publishes bundles themselves; daemon
   spawns the sidecar but never calls Cloud.
 
@@ -106,5 +107,5 @@ The resolved API key bytes are never written to disk or audit payloads.
 A truncated SHA256 fingerprint (`<bundle_root>/.tenant_fingerprint`)
 serves as the cache-key for tenant-switch detection. When the
 fingerprint changes, the bundle directory is wiped and re-pulled. Session sync
-is enabled by default for cloud-connected installs; turning off Episodic Memory
-also disables session sync.
+defaults to disabled and is flipped on alongside Episodic Memory by the
+Desktop toggle; turning off Episodic Memory also disables session sync.
