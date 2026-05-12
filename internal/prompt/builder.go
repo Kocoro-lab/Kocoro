@@ -237,8 +237,18 @@ func buildStableContext(opts PromptOptions) string {
 	var sb strings.Builder
 
 	if inst := strings.TrimSpace(opts.Instructions); inst != "" {
-		sb.WriteString("## Instructions\n")
+		// Wrap in <system-reminder> rather than emitting a `## Instructions`
+		// markdown header. The user-role placement (chosen for BP #3 cache
+		// economics — see commit 7c897b6) means Claude treats the block
+		// through its prompt-injection lens; a directive markdown header in
+		// user content is a textbook injection signature and triggers
+		// false-positive refusals ("ignored prompt injection block, tried to
+		// modify my name"). `<system-reminder>` is the tag Anthropic trains
+		// Claude to read as framework-internal trusted content — same role
+		// and same cache position, just a trust-channel wrapper. Issue #125.
+		sb.WriteString("<system-reminder>\n")
 		sb.WriteString(truncate(inst, maxInstructionsChars))
+		sb.WriteString("\n</system-reminder>")
 	}
 
 	if sticky := strings.TrimSpace(opts.StickyContext); sticky != "" {

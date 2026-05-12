@@ -89,8 +89,11 @@ func TestBuildSystemPrompt_StableContextContainsInstructions(t *testing.T) {
 	if strings.Contains(parts.VolatileContext, "Always use gofmt.") {
 		t.Error("VolatileContext should not contain instructions (must live in StableContext so it joins the cacheable prefix)")
 	}
-	if !strings.Contains(parts.StableContext, "## Instructions") {
-		t.Error("StableContext should contain the Instructions section header")
+	if !strings.Contains(parts.StableContext, "<system-reminder>") {
+		t.Error("StableContext should wrap instructions in <system-reminder> (issue #125)")
+	}
+	if !strings.Contains(parts.StableContext, "</system-reminder>") {
+		t.Error("StableContext should close the <system-reminder> block")
 	}
 	if !strings.Contains(parts.StableContext, "Always use gofmt.") {
 		t.Error("StableContext should contain instructions body")
@@ -130,10 +133,10 @@ func TestBuildSystemPrompt_InstructionsBeforeStickyFacts(t *testing.T) {
 		StickyContext: "Customer: Alice. Order #8891.",
 	})
 
-	instIdx := strings.Index(parts.StableContext, "## Instructions")
+	instIdx := strings.Index(parts.StableContext, "<system-reminder>")
 	factsIdx := strings.Index(parts.StableContext, "## Session Facts")
 	if instIdx < 0 {
-		t.Fatal("StableContext missing Instructions header")
+		t.Fatal("StableContext missing <system-reminder> instructions wrapper")
 	}
 	if factsIdx < 0 {
 		t.Fatal("StableContext missing Session Facts header")
