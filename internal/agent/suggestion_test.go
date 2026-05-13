@@ -54,8 +54,16 @@ func TestGenerateSuggestion_HappyPath(t *testing.T) {
 	if !llm.gotReq.SkipCacheWrite {
 		t.Error("request sent without SkipCacheWrite=true")
 	}
-	if llm.gotReq.CacheSource != "channel" {
-		t.Errorf("CacheSource = %q, want channel (must match main)", llm.gotReq.CacheSource)
+	// BuildForkedSuggestionRequest deliberately OVERRIDES CacheSource to
+	// "prompt_suggestion" (not inherited from main) so Shannon Cloud can
+	// apply the dedicated billing class — actual cost computed for internal
+	// cost tracking, but not charged to the user's token_usage. TTL is
+	// always 5m on the cloud side by design; see suggestion.go for the
+	// trade-off explanation when the parent main source eventually routes
+	// to a longer bucket.
+	if llm.gotReq.CacheSource != "prompt_suggestion" {
+		t.Errorf("CacheSource = %q, want %q (overridden by BuildForkedSuggestionRequest for billing class)",
+			llm.gotReq.CacheSource, "prompt_suggestion")
 	}
 	if len(llm.gotReq.Messages) != 2 {
 		t.Errorf("messages len = %d, want 2 (main + SUGGESTION)", len(llm.gotReq.Messages))
