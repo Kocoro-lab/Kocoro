@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 func createMinimalPNG() []byte {
@@ -285,5 +287,45 @@ func TestClampCoordinates_ExactBoundary(t *testing.T) {
 	}
 	if y != 799 {
 		t.Errorf("expected y=799, got %d", y)
+	}
+}
+
+func TestEncodeImage_CompressesOversizePNGUnderInlineLimit(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 1800, 1800))
+	var state uint32 = 1
+	for i := 0; i < len(img.Pix); i += 4 {
+		state = state*1664525 + 1013904223
+		img.Pix[i] = byte(state >> 24)
+		state = state*1664525 + 1013904223
+		img.Pix[i+1] = byte(state >> 24)
+		state = state*1664525 + 1013904223
+		img.Pix[i+2] = byte(state >> 24)
+		img.Pix[i+3] = 255
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if base64.StdEncoding.EncodedLen(buf.Len()) <= client.MaxInlineImageBase64Bytes {
+		t.Fatalf("test fixture must exceed inline limit; encoded len=%d",
+			base64.StdEncoding.EncodedLen(buf.Len()))
+	}
+
+	path := filepath.Join(t.TempDir(), "large.png")
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	block, err := EncodeImage(path)
+	if err != nil {
+		t.Fatalf("EncodeImage should compress oversized PNG, got error: %v", err)
+	}
+	if got := len(block.Data); got > client.MaxInlineImageBase64Bytes {
+		t.Fatalf("encoded image exceeds inline limit: got %d, max %d",
+			got, client.MaxInlineImageBase64Bytes)
+	}
+	if block.MediaType != "image/jpeg" {
+		t.Fatalf("oversized PNG should be converted to JPEG, got %q", block.MediaType)
 	}
 }

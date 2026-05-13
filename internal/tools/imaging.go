@@ -32,7 +32,10 @@ const (
 	CompressionFallbackDimension = 1000
 )
 
-// EncodeImage reads a PNG/JPEG file and returns it as a base64-encoded ImageBlock.
+// EncodeImage reads an image file and returns it as a base64-encoded ImageBlock.
+// If the file's raw bytes exceed TargetRawImageBytes, it's recompressed
+// (decode → resize → JPEG quality ladder) so the base64 output fits under
+// client.MaxInlineImageBase64Bytes.
 func EncodeImage(path string) (agent.ImageBlock, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -41,13 +44,38 @@ func EncodeImage(path string) (agent.ImageBlock, error) {
 
 	mediaType := "image/png"
 	lower := strings.ToLower(path)
-	if strings.HasSuffix(lower, ".jpg") || strings.HasSuffix(lower, ".jpeg") {
+	switch {
+	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
 		mediaType = "image/jpeg"
+	case strings.HasSuffix(lower, ".gif"):
+		mediaType = "image/gif"
+	case strings.HasSuffix(lower, ".webp"):
+		mediaType = "image/webp"
+	}
+
+	compressed, outMediaType, err := compressImage(data, mediaType)
+	if err != nil {
+		return agent.ImageBlock{}, fmt.Errorf("compress image %s: %w", path, err)
 	}
 
 	return agent.ImageBlock{
-		MediaType: mediaType,
-		Data:      base64.StdEncoding.EncodeToString(data),
+		MediaType: outMediaType,
+		Data:      base64.StdEncoding.EncodeToString(compressed),
+	}, nil
+}
+
+// EncodeImageBytes is like EncodeImage but takes the bytes directly instead of
+// reading from a file path. Used by attachment paths where the bytes are
+// already in memory. mediaType is the source format hint; the output may be
+// different ("image/jpeg") if compression triggered.
+func EncodeImageBytes(data []byte, mediaType string) (agent.ImageBlock, error) {
+	compressed, outMediaType, err := compressImage(data, mediaType)
+	if err != nil {
+		return agent.ImageBlock{}, fmt.Errorf("compress image: %w", err)
+	}
+	return agent.ImageBlock{
+		MediaType: outMediaType,
+		Data:      base64.StdEncoding.EncodeToString(compressed),
 	}, nil
 }
 
