@@ -1039,7 +1039,7 @@ curl -X POST http://localhost:7533/message \
 
 ### Prompt Suggestion (ghost text in input)
 
-When enabled, ShanClaw's daemon generates a 2-12 word suggestion for your
+When enabled, Kocoro's daemon generates a 2-12 word suggestion for your
 next message after each agent turn. Desktop renders it as gray placeholder
 text in the input — press the right arrow (or Tab) to accept, then edit if needed.
 

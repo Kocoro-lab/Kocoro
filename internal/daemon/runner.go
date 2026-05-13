@@ -61,7 +61,7 @@ type RunAgentRequest struct {
 	Agent          string                `json:"agent,omitempty"`
 	SessionID      string                `json:"session_id,omitempty"`
 	NewSession     bool                  `json:"new_session,omitempty"`
-	Source         string                `json:"source,omitempty"`    // "slack", "line", "shanclaw", "webhook"
+	Source         string                `json:"source,omitempty"`    // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still accepted by router for one release)
 	Sender         string                `json:"sender,omitempty"`    // user identifier from channel
 	Channel        string                `json:"channel,omitempty"`   // channel/thread source context
 	ThreadID       string                `json:"thread_id,omitempty"` // thread context for messaging platforms
@@ -437,8 +437,10 @@ func cacheSourceFromDaemonSource(source string) string {
 	case "slack", "line", "feishu", "lark", "telegram":
 		// Human-conversation channels: idle gaps > 5m are common, 1h pays off.
 		return s
-	case "tui", "shanclaw":
+	case "tui", "kocoro", "shanclaw":
 		// Interactive sessions: TUI and Kocoro Desktop both have idle gaps >> 5m.
+		// "shanclaw" kept one release as belt-and-suspenders during Round-2 protocol rename;
+		// removed in 7.4 after cloud confirms all daemons emit "kocoro".
 		return s
 	case "cache_bench":
 		// Synthetic benchmark traffic — treat as long-bucket so bench measures

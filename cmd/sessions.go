@@ -146,9 +146,9 @@ func formatSyncSummary(fields map[string]any) string {
 
 func readBuildInfo() string {
 	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
-		return "shanclaw/" + info.Main.Version
+		return "kocoro/" + info.Main.Version
 	}
-	return "shanclaw/dev"
+	return "kocoro/dev"
 }
 
 func init() {

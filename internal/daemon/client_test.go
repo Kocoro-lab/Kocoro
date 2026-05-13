@@ -102,19 +102,19 @@ func TestConnect_AdvertisesVersionAndUserAgent(t *testing.T) {
 
 	select {
 	case hdr := <-captured:
-		if got := hdr.Get("X-ShanClaw-Daemon-Version"); got != "0.1.3-test" {
-			t.Errorf("X-ShanClaw-Daemon-Version = %q, want %q", got, "0.1.3-test")
+		if got := hdr.Get("X-Kocoro-Daemon-Version"); got != "0.1.3-test" {
+			t.Errorf("X-Kocoro-Daemon-Version = %q, want %q", got, "0.1.3-test")
 		}
 		ua := hdr.Get("User-Agent")
-		if !strings.Contains(ua, "shanclaw/0.1.3-test") {
-			t.Errorf("User-Agent = %q, want to contain %q", ua, "shanclaw/0.1.3-test")
+		if !strings.Contains(ua, "kocoro/0.1.3-test") {
+			t.Errorf("User-Agent = %q, want to contain %q", ua, "kocoro/0.1.3-test")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not see upgrade request")
 	}
 }
 
-// TestConnect_AdvertisesCapabilities confirms the X-ShanClaw-Capabilities
+// TestConnect_AdvertisesCapabilities confirms the X-Kocoro-Capabilities
 // header carries every token in the package-level Capabilities slice and is
 // omitted entirely when the slice is empty (so Cloud's "no header = legacy"
 // invariant holds for daemons that haven't enabled any opt-in features).
@@ -156,12 +156,12 @@ func TestConnect_AdvertisesCapabilities(t *testing.T) {
 
 			select {
 			case hdr := <-captured:
-				_, present := hdr["X-Shanclaw-Capabilities"]
+				_, present := hdr["X-Kocoro-Capabilities"]
 				if present != tt.wantPresent {
 					t.Errorf("header presence = %v, want %v", present, tt.wantPresent)
 				}
-				if got := hdr.Get("X-ShanClaw-Capabilities"); got != tt.wantHeader {
-					t.Errorf("X-ShanClaw-Capabilities = %q, want %q", got, tt.wantHeader)
+				if got := hdr.Get("X-Kocoro-Capabilities"); got != tt.wantHeader {
+					t.Errorf("X-Kocoro-Capabilities = %q, want %q", got, tt.wantHeader)
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("server did not see upgrade request")

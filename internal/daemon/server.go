@@ -582,14 +582,14 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 	_ = s.notifyApprovalResolved(ApprovalResolvedPayload{
 		RequestID:  req.RequestID,
 		Decision:   req.Decision,
-		ResolvedBy: "shanclaw",
+		ResolvedBy: "kocoro",
 	})
 
 	if s.eventBus != nil {
 		payload, _ := json.Marshal(map[string]string{
 			"request_id":  req.RequestID,
 			"decision":    string(req.Decision),
-			"resolved_by": "shanclaw",
+			"resolved_by": "kocoro",
 		})
 		s.eventBus.Emit(Event{Type: EventApprovalResolved, Payload: payload})
 	}
@@ -1038,7 +1038,7 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 		Content:   body.Content,
 		Agent:     body.Agent,
 		SessionID: id,
-		Source:    "shanclaw",
+		Source:    "kocoro",
 	}
 	runReq.EnsureRouteKey()
 
@@ -1142,7 +1142,7 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Source == "" {
-		req.Source = "shanclaw"
+		req.Source = "kocoro"
 	}
 	// Normalize "default" → "" early so downstream guards are consistent.
 	if req.Agent == "default" {
@@ -3917,7 +3917,7 @@ func (s *Server) buildSyncDeps(cfg syncpkg.Config) (syncpkg.Deps, bool) {
 	return syncpkg.Deps{
 		Cfg:        cfg,
 		HomeDir:    shannonHome,
-		ClientVer:  "shanclaw/daemon",
+		ClientVer:  "kocoro/daemon",
 		Uploader:   uploader,
 		Loader:     loader,
 		Audit:      auditSink,
