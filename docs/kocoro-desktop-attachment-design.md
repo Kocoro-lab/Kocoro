@@ -37,29 +37,38 @@ User intent: "Analyze everything in /Users/me/Desktop"
 
 **Key insight:** Layer A applies only when the user explicitly attaches files. Layer B applies when the agent reads files autonomously. The agent is NOT bound by Layer A's count — it can read 50 files in a turn if the user asks.
 
-## Layer A: Desktop UI limits (recommended)
+## Layer A: Desktop UI limits (shipped + remaining gap)
 
-Aligned with claude.ai web client conventions, lenient where Kocoro's 1M-context Opus 4.7 makes it safe.
+Status as of 2026-05-13:
 
-| Constraint | Value | Toast on violation |
+| Constraint | Value | Status |
 |---|---|---|
-| Images per message | **10** | `"Maximum of 10 images per message"` |
-| Total attachments per message | **20** | `"Maximum of 20 attachments per message"` |
-| Single file size | **20 MB** | `"File exceeds 20 MB limit"` |
-| Image types | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` | `"Unsupported image format"` |
-| Document types | `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.csv`, `.txt`, `.md`, `.json` | `"Unsupported file format"` |
-| Archive types | `.zip`, `.tar`, `.tar.gz`, `.tgz` | `"Unsupported archive format"` |
+| `maxAttachmentsPerMessage` | **20** | ✅ shipped (commit `072841b`) — total file count cap |
+| `maxImagesPerMessage` | **10** | ✅ shipped (this work) — image-specific cap, claude.ai parity |
+| `maxFileSize` per disk file | **500 MB** | ✅ shipped — aligned with daemon Phase 1 |
+| `maxTotalAttachmentSize` | **500 MB** | ✅ shipped |
+| Clipboard inline paste cap | **20 MB** | ✅ shipped — matches daemon's `maxInlineImageDecodedBytes` |
+| `maxImageDimension` | **8192×8192** | ✅ shipped — matches Anthropic single-image upper bound |
+| Image type allowlist | jpg / jpeg / png / gif / webp / heic / heif / avif / tiff / bmp | ✅ shipped |
+| Document type allowlist | pdf / docx / xlsx / pptx / key / txt / md / html / rtf / odt / epub | ✅ shipped |
+| Code extensions (text fallback) | 50+ entries — see `AttachmentLimits.supportedCodeExtensions` | ✅ shipped |
+| Archive types | zip (others fall through to file_ref) | ✅ shipped |
+| Folder drops | treated as directory `file_ref` | ✅ shipped (commit `702cf59`) |
+| Universal accept (unknown ext → file_ref) | ✅ shipped — daemon decides downstream | |
+| **Live counter `N/10 images · M/20 attachments`** | ✅ shipped (this work) — color-shifts at 90% / 100% | |
+| Per-violation `lastError` toast | ✅ shipped | |
 
-**UX rules:**
+**UX rules** (current behavior):
 - Numbered chip per attachment with thumbnail + filename + size + ✕ remove button.
-- Live counter (`8/10 images`, `18/20 files`) so the user sees they're approaching the limit.
-- Soft warning at 90 %, hard block at 100 % with toast.
-- Never silently drop — always toast.
+- Live counter above chip row, only visible when ≥ 1 attachment.
+- Counter is `.secondary` text below 90% capacity, `.orange` at 90%, `.red` at 100%.
+- On hard block, `AttachmentState.lastError` triggers a toast; counter stays red.
+- Universal acceptance: unknown extensions are accepted as file_ref and the daemon decides whether to extract / passthrough / refuse.
 
-**Rationale:**
-- 10 images is more generous than claude.ai's 5/turn cap, justified by Kocoro's 1M-context model and downstream auto-compression.
-- 20 total attachments matches claude.ai's 20-files-per-conversation cap, applied per-message.
-- 20 MB matches Kocoro daemon's current `maxInlineImage` / `maxImageReadSize` constants (`internal/daemon/runner.go` resolveFileRef, `internal/tools/file_read.go`). Promising the user 30 MB in Desktop UI while daemon rejects anything > 20 MB would create a confusing mismatch. (claude.ai's 30 MB cap depends on server-side preprocessing Kocoro doesn't have. If we later raise daemon caps to 30 MB, also add dimension-based OOM protection — a 30 MB PNG can decode to 240+ MB RGBA in memory.)
+**Rationale for Kocoro choosing more permissive numbers than claude.ai**:
+- 500 MB per file (vs claude.ai's 30 MB): Kocoro daemon auto-compresses images at source (`internal/tools/imaging_compress.go`) and treats disk files as `file_ref` paths (not inline base64). The 5 MB Anthropic inline limit is enforced server-side by the daemon, not gated client-side.
+- 20 attachments per message (vs claude.ai's 5/turn for images): Kocoro's 1M-context Sonnet 4.6 can absorb more parallel files than the smaller-context default behind claude.ai.
+- Image cap of 10 (vs claude.ai's 5): more generous given the larger context, but still binds before the total cap so users get image-specific feedback.
 
 ## Layer B: daemon-side compression (already implemented)
 
@@ -78,12 +87,12 @@ Aligned with claude.ai web client conventions, lenient where Kocoro's 1M-context
 
 ## Reference data (Anthropic public limits)
 
-| Constraint | Anthropic API | claude.ai | Kocoro Desktop (proposed) |
+| Constraint | Anthropic API | claude.ai | Kocoro Desktop (shipped) |
 |---|---|---|---|
-| Inline image | 5 MB base64 string | 10 MB (server compresses) | 20 MB raw, daemon compresses |
+| Inline image | 5 MB base64 string | 10 MB (server compresses) | 500 MB raw on disk (daemon compresses); 20 MB inline paste |
 | Images per request | 100 (200K) / 600 (others) | 5 per turn | **10 per message** |
 | Total attachments | — | 20 per conversation | **20 per message** |
-| Total request | 32 MB | — | bounded by per-file caps |
+| Total request | 32 MB | — | 500 MB upload, daemon shrinks |
 | Image dimensions | ≤ 8000×8000 (single), ≤ 2000×2000 (many-image, >20) | — | daemon resizes to ≤ 2000×2000 |
 | PDF pages | 100 (200K) / 600 (others) | — | daemon renders at 1024 px width |
 
@@ -92,8 +101,7 @@ Sources:
 - [Upload files to Claude Help Center](https://support.claude.com/en/articles/8241126-upload-files-to-claude)
 - [Anthropic API Overview — request size limits](https://platform.claude.com/docs/en/api/overview)
 
-## Open questions for the Desktop team
+## Open questions for the Desktop team (remaining after this PR)
 
-1. Should the 20 MB per-file cap be configurable per workspace? (And if raised to 30 MB to match claude.ai, what dimension/decoded-RGBA cap should we add to avoid OOM?)
-2. Should camera photos be auto-rotated based on EXIF in the thumbnail preview?
-3. For PDFs, show a page-count badge so users know how many pages will be processed?
+1. Should camera photos be auto-rotated based on EXIF in the thumbnail preview?
+2. For PDFs, show a page-count badge so users know how many pages will be processed?
