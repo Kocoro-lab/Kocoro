@@ -4788,3 +4788,76 @@ func TestAgentLoop_ToolCallBranch_TriggersOnText(t *testing.T) {
 		t.Errorf("expected 2 LLM calls (preamble+tool, then end_turn), got %d", callCount)
 	}
 }
+
+// TestAgentLoop_LastSentRequest_DeepCopyOnRead pins the deep-copy contract on
+// the getter: mutating the returned snapshot's Messages/Tools slices must NOT
+// leak into a subsequent call to LastSentRequest(). Without per-call backing-
+// array allocation, slice headers share underlying arrays and post-Run forks
+// (suggestion / speculation) would silently corrupt the loop's snapshot.
+func TestAgentLoop_LastSentRequest_DeepCopyOnRead(t *testing.T) {
+	loop := &AgentLoop{}
+	original := client.CompletionRequest{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("hello")},
+		},
+		Tools: []client.Tool{{Name: "file_read"}},
+	}
+	loop.captureSentRequest(original)
+
+	snap1, ok := loop.LastSentRequest()
+	if !ok {
+		t.Fatal("expected valid snapshot")
+	}
+	// Mutate the returned slices — must NOT affect internal state.
+	snap1.Messages[0] = client.Message{Role: "MUTATED", Content: client.NewTextContent("BAD")}
+	snap1.Tools[0] = client.Tool{Name: "MUTATED"}
+
+	snap2, _ := loop.LastSentRequest()
+	if snap2.Messages[0].Role != "user" {
+		t.Errorf("Messages backing array shared between snapshots: got role=%q, want user", snap2.Messages[0].Role)
+	}
+	if snap2.Tools[0].Name != "file_read" {
+		t.Errorf("Tools backing array shared between snapshots: got %+v, want file_read", snap2.Tools)
+	}
+}
+
+// TestAgentLoop_LastSentRequest_EmptyBeforeAnyCall pins the zero-value contract
+// — callers must be able to distinguish "no request sent yet" from "empty
+// request was sent" via the bool return.
+func TestAgentLoop_LastSentRequest_EmptyBeforeAnyCall(t *testing.T) {
+	loop := &AgentLoop{}
+	_, ok := loop.LastSentRequest()
+	if ok {
+		t.Error("expected ok=false before any captureSentRequest call")
+	}
+}
+
+// TestAgentLoop_CaptureSentRequest_AlsoDeepCopiesOnWrite pins the second leg of
+// the deep-copy contract: mutating the ORIGINAL request after capture must NOT
+// affect the stored snapshot. Together with DeepCopyOnRead this means the
+// snapshot is independent on both ends.
+func TestAgentLoop_CaptureSentRequest_AlsoDeepCopiesOnWrite(t *testing.T) {
+	loop := &AgentLoop{}
+	original := client.CompletionRequest{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("hello")},
+		},
+		Tools: []client.Tool{{Name: "file_read"}},
+	}
+	loop.captureSentRequest(original)
+
+	// Mutate the original AFTER capture.
+	original.Messages[0] = client.Message{Role: "MUTATED", Content: client.NewTextContent("BAD")}
+	original.Tools[0] = client.Tool{Name: "MUTATED"}
+
+	snap, ok := loop.LastSentRequest()
+	if !ok {
+		t.Fatal("expected valid snapshot")
+	}
+	if snap.Messages[0].Role != "user" {
+		t.Errorf("snapshot Messages aliased to caller: got role=%q, want user", snap.Messages[0].Role)
+	}
+	if snap.Tools[0].Name != "file_read" {
+		t.Errorf("snapshot Tools aliased to caller: got %+v, want file_read", snap.Tools)
+	}
+}

@@ -49,6 +49,7 @@ internal/
     attachment.go      # Receive remote file attachments — plan §4.3 priority: document_b64 → extracted_text → URL download. Daemon-side MaxExtractedTextChars=500_000 rune cap as a truncation guard. DOCX/XLSX/PPTX/CSV extraction is daemon-local via internal/tools/doc_extract.go (Phase 2 aligned with CC), not via a cloud /extract round-trip.
     session_cwd.go     # Cloud-source scratch CWD allocator (ephemeral, per-session tmp dir)
     readtracker_cache.go # Per-session ReadTracker cache; entries released via SessionManager.OnSessionClose
+    suggestion_handler.go # GET /suggestion + POST /accept, validateSuggestionRoute, atomic persist on accept
   agent/
     loop.go              # AgentLoop.Run() — core agentic loop, SwitchAgent()
     tools.go             # Tool interface, ToolRegistry, FilterByAllow/Deny, Schemas()
@@ -75,6 +76,9 @@ internal/
     cachemetric.go       # CacheTracker: per-Run cache stats accumulator, emitted to audit.log on Run exit
     usage.go             # Per-Run usage aggregation
     warmset.go           # Warm-set tracking for deferred tool schemas
+    suggestion.go        # SUGGESTION_PROMPT, FilterSuggestion, ShouldGenerateSuggestion, GenerateSuggestion(/WithUsage)
+    suggestion_state.go  # SuggestionState — per-session latest suggestion text + accepted timestamp
+    forkedrequest.go     # BuildForkedRequest primitive + ForkOptions (byte-equality cache contract)
   agents/
     loader.go          # LoadAgent (config.yaml, commands/, _attached.yaml), ListAgents, ParseAgentMention
     api.go             # Agent CRUD operations for daemon API
@@ -254,6 +258,7 @@ Unknown tools → denied by default (fail-safe). The always-ask gate runs BEFORE
 - **Memory client** (`internal/memory/`, Phase 2.3): daemon owns sidecar lifecycle (spawn / health / restart / shutdown) and the 24h bundle pull loop. Tool `memory_recall` (`internal/tools/memory.go`) delegates to `memory.Service.Query` via UDS; falls back to `session_search` + MEMORY.md whenever `Service.Status() != Ready`. CLI/TUI use `memory.AttachPolicy` (probe-only, never spawn) and connect via `memory.NewServiceAttached`. Privacy invariant: the resolved API key bytes never reach disk or audit logs (only `sha256[:16]` fingerprint in `<bundle_root>/.tenant_fingerprint`).
 - **Implicit episodic preflight** (`internal/agent/preflight.go` + `internal/tools/memory_preflight.go`): before the first main-model call on a memory-relevant turn, `agent.MemoryPreflightFunc` (wired via `tools.NewMemoryPreflight`) runs a small-tier helper that compiles `memory.QueryIntent`s via forced `tool_use` (`compile_memory_intents`), the sidecar resolves them, and a `<private_memory>` block is injected into the in-flight user message via `injectPrivateMemoryContext`. The block is never persisted to the session transcript, never replayed, and stripped from compaction summary inputs at every `GenerateSummary` call site via `stripPrivateMemoryForSummary`. User-derived body content runs through `prompt.SanitizeUserBlock` before the envelope is wrapped (defense in depth — same pattern as `<user_instructions>`). Audit event `memory_preflight` records a content-free trace (`attempted` / `helper_used` / `intents_count` / `results_count` / `context_injected` / `outcome` / `error_class` / `http_status`); query text, anchors, relation labels, and recalled content are never logged.
 - **Loop detector** (`internal/agent/loopdetect.go`): 9 detectors trigger nudge or force-stop. Thresholds raised broadly 2026-04 for Claude 4.X self-recovery — current values in `loopdetect.go:275-281`. Key invariants: `dupExemptTools` (currently `use_skill`) skip dup detection entirely; all-errors 2× budget lets fail/fail/success retries survive; rolling nudge window (max 3 nudges within trailing 5 iterations) in `loop.go` instead of a flat counter.
+- **Prompt suggestion** (`internal/agent/suggestion.go`): forked LLM call after each main turn produces a 2-12 word ghost-text suggestion. **CACHE SAFETY INVARIANT**: the forked `CompletionRequest` is byte-equal to the main turn except for two appended messages (just-completed assistant reply + SuggestionPrompt) + `SkipCacheWrite: true` + `ForkedKind` (debug-only, `json:"-"`). Any other field divergence (including `thinking.budget_tokens`, `max_tokens`, `tools` order) fragments the Anthropic prompt cache — see `internal/agent/forkedrequest.go` godoc + `ForkOptions.ToolsAllowlist` cautionary inline comment. Per-session state in `internal/agent/suggestion_state.go` (text + accepted-at + generation counter for stale-goroutine guarding); lifecycle hooked from `internal/daemon/runner.go:fireSuggestionAfterRun` (post-`RunAgent` success, fire-and-forget). Gated by `agent.prompt_suggestion.enabled` + `cache_cold_threshold_tokens` + `min_turns` + last-turn error state via `ShouldGenerateSuggestion`. HTTP API: `GET /agents/{name}/sessions/{id}/suggestion` (or `/sessions/{id}/...` for default agent) + `POST` of the same with `/accept`. Accept returns the suggestion text for Desktop to fill the input — user still presses Enter, normal POST /message handles persistence (no atomic speculation persist, no pre-run reply).
 
 ### Daemon Approval Protocol
 - **Interactive mode** (default): Tools requiring approval send `approval_request` over WS → Cloud relays to Ptfrog → user responds → `approval_response` relayed back. Agent loop blocks until response.
@@ -296,8 +301,8 @@ Scalars override, lists merge+dedup, structs field-level merge. MCP server env v
 
 ### Prompt Cache
 See `docs/cache-strategy.md` for the authoritative design (4-breakpoint allocation, source→TTL routing, byte stability, session_id propagation, env-var overrides). When investigating CER drops, see `docs/cache-debug.md` for the diagnostic instrumentation layer (env flags, log fields, drift patterns). One-line invariants:
-- `cache_source` tags every LLM call; `_ttl_block(request)` routes 1h for channel/TUI, 5m for one-shot/subagent (fail cheap).
-- `SHANNON_FORCE_TTL=off|5m|1h` overrides for operator debug / A-B.
+- `cache_source` tags every LLM call. **Current production behavior** (cloud `anthropic_provider.py:188`, since 2026-04-15): `_LONG_CACHE_SOURCES` is the empty set, so `_ttl_block(request)` routes EVERY source to 5m by default — 1.25x write premium vs 2x for 1h (fail cheap when read/write reuse is uncertain). The earlier "1h for channel/TUI" routing was disabled after a bench regression; see `docs/cache-strategy.md`. Cache_source is still meaningful — it drives the analytics taxonomy + future re-enable — so callers must tag accurately even though all routes converge today.
+- `SHANNON_FORCE_TTL=off|5m|1h` overrides for operator debug / A-B (the only way to get 1h currently).
 - `SHANNON_CACHE_DEBUG=1` → JSON-lines log with hash ladders + per-tool / per-message / per-block hashes + compaction events; `SHANNON_CACHE_DEBUG_RAW=1` adds full request bytes per call (LRU 100 dirs, override `SHANNON_CACHE_DEBUG_RAW_MAX`).
 - `normalizeToolInput` in `gateway.go` canonicalizes nested JSON key ordering so cross-turn `system_h` / tool_use-input stays byte-stable.
 - **Skill allowed-tools** uses execution-time denial (not schema filtering) to keep `toolSchemas` byte-stable. Previous `applySkillFilter` shrank the tools array after `use_skill`, causing ~$0.10 cache rebuild per activation; now tools stay full ($0.02).

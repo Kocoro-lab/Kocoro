@@ -22,6 +22,10 @@ const (
 	EventCloudPlan        = "cloud_plan"
 	EventNotification     = "notification"
 	EventRunStatus        = "run_status" // watchdog soft/hard events, LLM retries, etc.
+	// EventSuggestionReady is emitted by the daemon's post-Run hook after a
+	// prompt suggestion has been generated and stored in SuggestionState.
+	// Payload: {session_id, agent, text}.
+	EventSuggestionReady = "suggestion_ready"
 )
 
 // Event is a daemon lifecycle event pushed to SSE subscribers.

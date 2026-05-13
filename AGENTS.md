@@ -49,6 +49,7 @@ internal/
     attachment.go      # remote attachment download -> file_ref pipeline
     session_cwd.go     # cloud-source scratch CWD allocator (ephemeral per-session tmp dir)
     readtracker_cache.go # per-session ReadTracker cache; entries released via SessionManager.OnSessionClose
+    suggestion_handler.go # GET /suggestion + POST /accept, validateSuggestionRoute, atomic persist on accept
   agent/
     loop.go              # AgentLoop.Run() — core agentic loop
     tools.go             # Tool interface, ToolRegistry, filtering, schemas
@@ -75,6 +76,9 @@ internal/
     cachemetric.go       # per-run cache stats accumulator
     usage.go             # per-run usage aggregation
     warmset.go           # deferred schema warm-set tracking
+    suggestion.go        # SUGGESTION_PROMPT, FilterSuggestion, ShouldGenerateSuggestion, GenerateSuggestion(/WithUsage)
+    suggestion_state.go  # SuggestionState — per-session latest suggestion text + accepted timestamp
+    forkedrequest.go     # BuildForkedRequest primitive + ForkOptions (byte-equality cache contract)
   agents/
     loader.go          # LoadAgent, ListAgents, ParseAgentMention
     api.go             # daemon-side agent CRUD
@@ -239,6 +243,7 @@ Unknown tools are denied by default. The always-ask gate runs BEFORE the allowli
 - **Session sync** (`internal/sync/`): uploads local session JSON to Shannon Cloud once per day (opt-in via `sync.enabled`). Single entry point `sync.Run`; called from the daemon ticker and the `shan sessions sync` CLI; flock + atomic marker write serialize concurrent callers. Per-session ACK with persistent `marker.failed` bookkeeping; permanent reasons (`size_limit_exceeded`, `load_error`) stay forever and self-heal on session edit.
 - **Memory client** (`internal/memory/`, Phase 2.3): daemon owns sidecar lifecycle (spawn / health / restart / shutdown) and the 24h bundle pull loop. Tool `memory_recall` (`internal/tools/memory.go`) delegates to `memory.Service.Query` via UDS; falls back to `session_search` + MEMORY.md whenever `Service.Status() != Ready`. CLI/TUI use `memory.AttachPolicy` (probe-only, never spawn) and connect via `memory.NewServiceAttached`. Privacy invariant: the resolved API key bytes never reach disk or audit logs (only `sha256[:16]` fingerprint in `<bundle_root>/.tenant_fingerprint`).
 - **Implicit episodic preflight** (`internal/agent/preflight.go` + `internal/tools/memory_preflight.go`): before the first main-model call on a memory-relevant turn, `agent.MemoryPreflightFunc` (wired via `tools.NewMemoryPreflight`) runs a small-tier helper that compiles `memory.QueryIntent`s via forced `tool_use` (`compile_memory_intents`), the sidecar resolves them, and a `<private_memory>` block is injected into the in-flight user message via `injectPrivateMemoryContext`. The block is never persisted to the session transcript, never replayed, and stripped from compaction summary inputs at every `GenerateSummary` call site via `stripPrivateMemoryForSummary`. User-derived body content runs through `prompt.SanitizeUserBlock` before the envelope is wrapped (defense in depth — same pattern as `<user_instructions>`). Audit event `memory_preflight` records a content-free trace (`attempted` / `helper_used` / `intents_count` / `results_count` / `context_injected` / `outcome` / `error_class` / `http_status`); query text, anchors, relation labels, and recalled content are never logged.
+- **Prompt suggestion** (`internal/agent/suggestion.go`): forked LLM call after each main turn produces a 2-12 word ghost-text suggestion. **CACHE SAFETY INVARIANT**: the forked `CompletionRequest` is byte-equal to the main turn except for two appended messages (just-completed assistant reply + SuggestionPrompt) + `SkipCacheWrite: true` + `ForkedKind` (debug-only, `json:"-"`). Any other field divergence (`thinking.budget_tokens`, `max_tokens`, `tools` order) fragments the Anthropic prompt cache. Per-session state in `internal/agent/suggestion_state.go` (text + accepted-at + generation counter); lifecycle hooked from `internal/daemon/runner.go:fireSuggestionAfterRun` (post-`RunAgent` success, fire-and-forget). Gated by `agent.prompt_suggestion.enabled` + `cache_cold_threshold_tokens` + `min_turns` + last-turn error state via `ShouldGenerateSuggestion`. HTTP API: `GET /agents/{name}/sessions/{id}/suggestion` (or `/sessions/{id}/...` for default agent) + `POST` /accept. Accept returns the suggestion text for Desktop to fill the input — user still presses Enter, normal POST /message handles persistence.
 
 ### Turn Lifecycle
 

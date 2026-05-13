@@ -824,3 +824,49 @@ func TestUsage_JSON_BackwardCompat_MissingSplit(t *testing.T) {
 			u.CacheCreation5mTokens, u.CacheCreation1hTokens)
 	}
 }
+
+func TestCompletionRequest_SkipCacheWrite_Marshaling(t *testing.T) {
+	req := CompletionRequest{
+		Messages:       []Message{{Role: "user", Content: NewTextContent("hi")}},
+		ModelTier:      "medium",
+		SkipCacheWrite: true,
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"skip_cache_write":true`) {
+		t.Errorf("expected skip_cache_write:true in JSON, got: %s", string(b))
+	}
+
+	// Zero value must omit the field (omitempty)
+	req2 := CompletionRequest{Messages: []Message{{Role: "user", Content: NewTextContent("hi")}}}
+	b2, _ := json.Marshal(req2)
+	if strings.Contains(string(b2), "skip_cache_write") {
+		t.Errorf("expected skip_cache_write to be omitted when false, got: %s", string(b2))
+	}
+	// Pin the byte-stable zero-value baseline: neither new field name may
+	// appear in JSON when both are at their zero value. Guards against a
+	// future regression where someone removes omitempty / renames a tag.
+	if strings.Contains(string(b2), "forked_kind") || strings.Contains(string(b2), "ForkedKind") {
+		t.Errorf("zero-value baseline leaked ForkedKind into JSON: %s", string(b2))
+	}
+}
+
+func TestCompletionRequest_ForkedKind_NotInWire(t *testing.T) {
+	req := CompletionRequest{
+		Messages:   []Message{{Role: "user", Content: NewTextContent("hi")}},
+		ForkedKind: "suggestion",
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "forked_kind") || strings.Contains(string(b), "ForkedKind") {
+		t.Errorf("expected ForkedKind to be stripped from JSON (json:\"-\"), got: %s", string(b))
+	}
+	// Ensure the field IS accessible from Go code (not unexported)
+	if req.ForkedKind != "suggestion" {
+		t.Errorf("ForkedKind not readable: got %q", req.ForkedKind)
+	}
+}

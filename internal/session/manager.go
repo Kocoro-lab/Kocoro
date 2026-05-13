@@ -99,6 +99,7 @@ func (m *Manager) Save() error {
 	return m.store.Save(m.current)
 }
 
+
 // PatchTitle updates the title of the given session and persists it.
 // If the target is the active session, the in-memory title is also updated.
 // Disk is written first so a failed write won't leave memory inconsistent.

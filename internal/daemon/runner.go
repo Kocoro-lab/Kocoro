@@ -523,6 +523,20 @@ type ServerDeps struct {
 	// by RunAgent. nil-safe: callers can leave it unset (each turn falls
 	// back to a fresh tracker, equivalent to pre-fix behavior).
 	ReadTrackerCache *ReadTrackerCache
+	// Suggestions is the per-session prompt-suggestion store shared between
+	// the HTTP handler (server.go) and the post-Run hook in RunAgent.
+	// Wired by NewServer after construction. nil-safe: when unset (e.g. CLI
+	// fixtures that construct ServerDeps directly), the post-Run hook is a no-op.
+	Suggestions *agent.SuggestionState
+
+	// suggestionRegisteredMu + suggestionRegistered dedupe the
+	// SessionManager.OnSessionClose registration in RunAgent: without dedupe
+	// each turn appends a fresh closure to the same session's close-handler
+	// list, growing O(N) per N-turn session. The set is keyed by sessionID;
+	// the registered closure deletes its own key when fired so a sessionID
+	// reused after a previous SessionManager lifetime can re-register cleanly.
+	suggestionRegisteredMu sync.Mutex
+	suggestionRegistered   map[string]struct{}
 }
 
 // Snapshot returns current Config, Registry, and Supervisor under read lock.
@@ -816,6 +830,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	sess := sessMgr.Current()
 	if route != nil && sess != nil {
 		route.storeSessionID(sess.ID)
+	}
+
+	// Clear any pending suggestion before this turn starts — the user is
+	// sending a new message, so any prior suggestion is stale. If the user
+	// had accepted via /suggestion/accept, that handler also clears (in T11.5);
+	// this guard catches the "user typed something else instead of accepting"
+	// path. Done HERE (not at function top) because sess.ID isn't available
+	// until sessMgr.Current() returns above.
+	if deps.Suggestions != nil && sess != nil {
+		deps.Suggestions.Clear(sess.ID)
 	}
 
 	// Seed pre-loaded history for bypass-routed runs (e.g., heartbeat).
@@ -1208,6 +1232,35 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// of the same session but don't accumulate across sessions.
 		sessMgr.OnSessionClose(sess.ID, cloudSessionTmpCleanup(cloudSessionCWD))
 	}
+	// Tear down per-session suggestion state on explicit session close
+	// (session delete/switch, TUI quit, daemon shutdown). Forget drops the
+	// gens counter too — the slow leak Clear would otherwise produce across
+	// long-running daemons with churning sessions.
+	//
+	// Dedup the registration: SessionManager.OnSessionClose appends callbacks,
+	// so without this guard each turn of an N-turn session would push N
+	// closures doing the same work. The dedup map is keyed by sessionID; the
+	// registered closure removes its own key when fired so a sessionID reused
+	// after a SessionManager lifetime can re-register cleanly.
+	if deps.Suggestions != nil {
+		deps.suggestionRegisteredMu.Lock()
+		if deps.suggestionRegistered == nil {
+			deps.suggestionRegistered = make(map[string]struct{})
+		}
+		_, already := deps.suggestionRegistered[sessionID]
+		if !already {
+			deps.suggestionRegistered[sessionID] = struct{}{}
+		}
+		deps.suggestionRegisteredMu.Unlock()
+		if !already {
+			sessMgr.OnSessionClose(sessionID, func() {
+				deps.Suggestions.Forget(sessionID)
+				deps.suggestionRegisteredMu.Lock()
+				delete(deps.suggestionRegistered, sessionID)
+				deps.suggestionRegisteredMu.Unlock()
+			})
+		}
+	}
 	ctx = tools.WithFilePreview(ctx, filePreview)
 	if attachmentCleanup != nil {
 		attachmentRegistered = true // cancel the defer safety net
@@ -1398,6 +1451,64 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			payloadBytes, _ := json.Marshal(payload)
 			deps.EventBus.Emit(Event{Type: EventAgentReply, Payload: payloadBytes})
 		}
+
+		// Post-turn prompt suggestion (fire-and-forget). Gated by all of:
+		//   - agent.prompt_suggestion.enabled
+		//   - SuggestionState wired through deps (NewServer wires it; CLI
+		//     fixtures that build ServerDeps directly leave it nil — no-op)
+		//   - session was actually persisted (saveErr == nil) — otherwise the
+		//     HTTP handler that polls /suggestion would 404 on the session
+		//   - ShouldGenerateSuggestion passes (MinTurns, cache-cold gate,
+		//     not partial/errored, not plan-mode)
+		// The captured request snapshot is the last successful main-turn
+		// dispatch (LastSentRequest); forking from it gives byte-equal
+		// prefix and warm-cache pricing on the suggestion call.
+		if saveErr == nil && deps.Suggestions != nil && cfg != nil && cfg.Agent.PromptSuggestion.Enabled {
+			ps := cfg.Agent.PromptSuggestion
+			completedTurns := countAssistantTurns(sess.Messages)
+			// Judge cache warmth on the LAST main-turn LLM call, not the
+			// turn-aggregate `usage` — a multi-tool turn that started cold
+			// but ended warm (last iter ~100% cache_read) should NOT be
+			// gated out by the cumulative count. The suggestion fork pivots
+			// from the last sent request, so the last iter's warmth is the
+			// authoritative signal. Fall back to turn-aggregate when the
+			// loop didn't expose a last-iter snapshot (LastLLMUsage returns
+			// ok=false only before the first call, which can't happen on this
+			// success path, so the fallback is purely defensive).
+			var uncached int
+			if last, ok := loop.LastLLMUsage(); ok {
+				uncached = last.InputTokens - last.CacheReadTokens
+			} else {
+				uncached = usage.InputTokens - usage.CacheReadTokens
+			}
+			if uncached < 0 {
+				uncached = 0
+			}
+			args := agent.ShouldGenerateArgs{
+				Enabled:                  ps.Enabled,
+				CompletedTurns:           completedTurns,
+				MinTurns:                 ps.MinTurns,
+				LastTurnUncachedTokens:   uncached,
+				CacheColdThresholdTokens: ps.CacheColdThresholdTokens,
+				LastTurnHadError:         status.Partial || status.FailureCode != runstatus.CodeNone,
+				PlanMode:                 false, // plan-mode tracking lands in a future task
+			}
+			if agent.ShouldGenerateSuggestion(args) {
+				if mainReq, ok := loop.LastSentRequest(); ok {
+					// context.Background(): the goroutine outlives the
+					// request ctx (HTTP handler / WS dispatch returns
+					// before the forked call completes). Cancellation
+					// happens via daemon shutdown, not request lifecycle.
+					//
+					// result is the assistant reply from loop.Run — the
+					// forked call appends it to main so the model
+					// predicts the user's NEXT message after seeing the
+					// assistant's response (not a stale follow-up to
+					// the prior user turn).
+					go fireSuggestionAfterRun(context.Background(), deps, agentName, sess.ID, mainReq, result)
+				}
+			}
+		}
 	}
 
 	// Prefer handler-accumulated LLM totals (includes cloud_delegate nested
@@ -1449,6 +1560,148 @@ func generateMessageID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return "msg-" + hex.EncodeToString(b)
+}
+
+// countAssistantTurns counts assistant messages in the persisted session.
+// Used by the post-Run hook's MinTurns gate. The system message and any
+// guardrail/preflight user injections are not counted — only the model's
+// own responses are turns.
+func countAssistantTurns(messages []client.Message) int {
+	n := 0
+	for _, m := range messages {
+		if m.Role == "assistant" {
+			n++
+		}
+	}
+	return n
+}
+
+// fireSuggestionAfterRun runs in a detached goroutine after the main turn
+// completes successfully. It generates a forked prompt suggestion, stores it
+// in SuggestionState, emits an SSE event, and writes audit rows that record
+// the forked call's cache stats (T12 baked into T10 per plan).
+//
+// Failure semantics: any error — gateway transport, panic, nil dependency —
+// is swallowed. The suggestion path must never crash the daemon or surface
+// errors to the user; if the suggestion fails, the next /suggestion poll
+// returns 404 and Desktop hides the ghost text.
+//
+// assistantReply is the text the assistant just generated this turn (return
+// value of loop.Run). It must be non-empty — otherwise we skip, since the
+// model has nothing to anchor the next-message prediction on. We append it
+// to main.Messages as an assistant turn so the forked LLM call sees the
+// conversation state Desktop is about to show the user. Without this the
+// snapshot captured by LastSentRequest() reflects "before assistant
+// responded" and the suggestion predicts a stale follow-up.
+//
+// Cache impact: the appended assistant message is uncached (~few hundred
+// input tokens at warm-cache pricing per token). The cached PREFIX —
+// main.Messages and everything before it — is byte-identical to the main
+// turn's request, so prompt-cache lookup still hits.
+//
+// Cache-audit detail (the InputSummary field): the audit row carries the
+// forked-call model + cache_read_tokens / cache_creation_tokens so operators
+// can verify the suggestion path is hitting the main turn's prompt cache.
+// Without this telemetry there's no signal that the feature is paying
+// warm-cache pricing as designed.
+func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, sessionID string, main client.CompletionRequest, assistantReply string) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("daemon: prompt_suggestion panic: %v", rec)
+		}
+	}()
+
+	if assistantReply == "" {
+		// No assistant text to anchor the prediction. Could be a tool-only
+		// turn or some unusual partial state — skip rather than emit a
+		// low-quality suggestion. Next turn will retry.
+		return
+	}
+
+	// Augment main with the just-completed assistant reply. Allocate a fresh
+	// Messages slice so this never aliases the loop's internal snapshot
+	// (LastSentRequest already deep-copies on read, but rely on local
+	// allocation for clarity).
+	augmented := make([]client.Message, 0, len(main.Messages)+1)
+	augmented = append(augmented, main.Messages...)
+	augmented = append(augmented, client.Message{
+		Role:    "assistant",
+		Content: client.NewTextContent(assistantReply),
+	})
+	main.Messages = augmented
+
+	// Capture the generation BEFORE the gateway call. If a Clear fires
+	// while this goroutine is in flight (new turn / session close), the
+	// SetIfFresh below will drop the write rather than resurrect a stale
+	// suggestion the user has already moved past.
+	observedGen := deps.Suggestions.CurrentGen(sessionID)
+
+	res, err := agent.GenerateSuggestionWithUsage(ctx, deps.GW, main)
+	if err != nil {
+		// Transport / gateway failure — silent. Audit a row for diagnosability
+		// only if Auditor is wired; the model is empty here.
+		if deps.Auditor != nil {
+			deps.Auditor.Log(audit.AuditEntry{
+				Timestamp:    time.Now(),
+				SessionID:    sessionID,
+				Event:        "prompt_suggestion_error",
+				InputSummary: fmt.Sprintf("agent=%s err=%v", agentName, err),
+			})
+		}
+		return
+	}
+	if res.Text == "" {
+		// Filter rejection or empty model output — record cost (the gateway
+		// call still cost tokens) but skip the SSE event.
+		if deps.Auditor != nil {
+			deps.Auditor.Log(audit.AuditEntry{
+				Timestamp:           time.Now(),
+				SessionID:           sessionID,
+				Event:               "prompt_suggestion_filtered",
+				Model:               res.Model,
+				InputTokens:         res.Usage.InputTokens,
+				OutputTokens:        res.Usage.OutputTokens,
+				CacheReadTokens:     res.Usage.CacheReadTokens,
+				CacheCreationTokens: res.Usage.CacheCreationTokens,
+				CostUSD:             res.Usage.CostUSD,
+				InputSummary:        fmt.Sprintf("agent=%s", agentName),
+			})
+		}
+		return
+	}
+
+	if !deps.Suggestions.SetIfFresh(sessionID, observedGen, res.Text, time.Now()) {
+		// A Clear fired during the gateway call (new turn started or
+		// session closed). Drop the suggestion silently — the user has
+		// already moved past it, and resurrecting it would confuse the UI.
+		// Audit row would be noise here; the Clear caller already knows
+		// about the lifecycle transition.
+		return
+	}
+
+	if deps.EventBus != nil {
+		payload, _ := json.Marshal(map[string]any{
+			"session_id": sessionID,
+			"agent":      agentName,
+			"text":       res.Text,
+		})
+		deps.EventBus.Emit(Event{Type: EventSuggestionReady, Payload: payload})
+	}
+
+	if deps.Auditor != nil {
+		deps.Auditor.Log(audit.AuditEntry{
+			Timestamp:           time.Now(),
+			SessionID:           sessionID,
+			Event:               "prompt_suggestion_generated",
+			Model:               res.Model,
+			InputTokens:         res.Usage.InputTokens,
+			OutputTokens:        res.Usage.OutputTokens,
+			CacheReadTokens:     res.Usage.CacheReadTokens,
+			CacheCreationTokens: res.Usage.CacheCreationTokens,
+			CostUSD:             res.Usage.CostUSD,
+			InputSummary:        fmt.Sprintf("agent=%s text_len=%d", agentName, len(res.Text)),
+		})
+	}
 }
 
 // ErrSlashRouteBusy is returned when a slash request lands on a route key

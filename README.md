@@ -1037,6 +1037,31 @@ curl -X POST http://localhost:7533/message \
 
 **Bridging a messaging platform (Discord, Matrix, custom webhook, etc.) to the daemon?** See the [Channel Integration Guide](examples/channel-integration-guide.md) for the full `POST /message` + SSE + interactive approval workflow, plus a community reference Discord bot. Official Slack/LINE/Feishu/Lark integrations go through Shannon Cloud for multi-tenant OAuth and audit — the local HTTP path here is for personal/dev deployments.
 
+### Prompt Suggestion (ghost text in input)
+
+When enabled, ShanClaw's daemon generates a 2-12 word suggestion for your
+next message after each agent turn. Desktop renders it as gray placeholder
+text in the input — press the right arrow (or Tab) to accept, then edit if needed.
+
+**To enable:**
+
+```yaml
+# ~/.shannon/config.yaml
+agent:
+  prompt_suggestion:
+    enabled: true
+```
+
+Or toggle from Desktop: Settings → Suggestions → Enable next-prompt suggestion.
+
+**Cost:** Depends on whether `agent.thinking` is enabled. Without thinking,
+each suggestion call is cheap (≈ 5-20% of one main-turn — input mostly
+cache_read, output capped at ~30 tokens by the filter). With thinking
+enabled, the fork inherits the same `thinking.budget_tokens` (cannot be
+trimmed without invalidating Anthropic's cache key), so cost rises to
+≈ 50-90% of one main-turn. Disabled by default. Skipped when the prompt
+cache is cold (see `cache_cold_threshold_tokens`).
+
 ## Memory (Kocoro Cloud feature)
 
 Kocoro includes a `memory_recall` tool that lets the agent look up facts
