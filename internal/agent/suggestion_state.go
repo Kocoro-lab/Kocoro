@@ -45,7 +45,12 @@ func NewSuggestionState() *SuggestionState {
 }
 
 // Set stores a new suggestion for sessionID, overwriting any prior entry.
-// Should be called from GenerateSuggestion's caller after filtering succeeds.
+// Test-only: production paths always use SetIfFresh so the generation token
+// check protects against stale-goroutine resurrect. Kept exported because
+// unit tests in sibling packages (internal/daemon, test/e2e) need to seed
+// state without a paired CurrentGen()/SetIfFresh() dance. New production
+// callers MUST use SetIfFresh — reviewers should treat any new call to Set
+// outside _test.go files as a bug.
 func (s *SuggestionState) Set(sessionID, text string, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -70,14 +75,37 @@ func (s *SuggestionState) Get(sessionID string) (*Suggestion, bool) {
 }
 
 // Clear removes any suggestion for sessionID and bumps the generation token.
-// Called on new turn start and on session close. The generation bump means
-// any in-flight goroutine that captured an earlier gen via CurrentGen will
-// have its SetIfFresh call dropped — preventing stale-suggestion resurrect.
+// Called on new turn start. The generation bump means any in-flight goroutine
+// that captured an earlier gen via CurrentGen will have its SetIfFresh call
+// dropped — preventing stale-suggestion resurrect.
+//
+// Use Clear at turn-start boundaries (mid-session lifecycle). Use Forget when
+// the session itself is gone — Forget removes the gens entry too so the map
+// does not grow unboundedly across millions of long-running sessions.
 func (s *SuggestionState) Clear(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.items, sessionID)
 	s.gens[sessionID]++
+}
+
+// Forget removes all state for sessionID — both the active suggestion and the
+// generation counter. Should be called from SessionManager.OnSessionClose
+// after the manager confirms no in-flight goroutines are still racing on this
+// sessionID. After Forget, a brand-new suggestion goroutine starting on the
+// same sessionID begins at gen=0 (default) — the same starting point a fresh
+// session would use, so the race-protection guarantee still holds even if a
+// sessionID is reused after Forget.
+//
+// Why this exists separately from Clear: Clear bumps gens but never deletes
+// the entry, so gens[] grows by one int per ever-touched session over the
+// daemon's lifetime. With millions of sessions over a year this is a slow
+// memory leak; Forget is the proper drop hook tied to session lifetime.
+func (s *SuggestionState) Forget(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.items, sessionID)
+	delete(s.gens, sessionID)
 }
 
 // CurrentGen returns the current generation token for sessionID. Capture

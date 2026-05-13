@@ -112,59 +112,6 @@ func TestBuildForkedRequest_RejectsEmptyAppend(t *testing.T) {
 	}
 }
 
-func TestBuildForkedRequest_ToolsAllowlist_FiltersTools(t *testing.T) {
-	// ToolsAllowlist is the documented cache-fragmenting option. Verify it
-	// works correctly when used, and that the test makes its risk explicit.
-	main := client.CompletionRequest{
-		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
-		Tools: []client.Tool{
-			{Name: "file_read"},
-			{Name: "file_write"},
-			{Name: "bash"},
-		},
-	}
-	forked, err := BuildForkedRequest(main, ForkOptions{
-		AppendMessages: []client.Message{{Role: "user", Content: client.NewTextContent("x")}},
-		SkipCacheWrite: true,
-		ToolsAllowlist: []string{"file_read"},
-	})
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if len(forked.Tools) != 1 || forked.Tools[0].Name != "file_read" {
-		t.Errorf("Tools = %+v, want only file_read", forked.Tools)
-	}
-	if len(main.Tools) != 3 {
-		t.Error("main.Tools mutated")
-	}
-	// Filter branch must allocate a fresh slice — backing arrays separate.
-	// Without this, a caller mutating forked.Tools[0] would corrupt main.Tools.
-	forked.Tools[0].Name = "MUTATED_BY_TEST"
-	if main.Tools[0].Name == "MUTATED_BY_TEST" {
-		t.Error("ToolsAllowlist filter aliased main.Tools backing array")
-	}
-}
-
-func TestBuildForkedRequest_ToolsAllowlist_EmptyBlocksAll(t *testing.T) {
-	// Empty-non-nil allowlist means "block all tools" — distinct from nil
-	// (which means "no filter, share main.Tools"). Pin the documented semantics.
-	main := client.CompletionRequest{
-		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
-		Tools:    []client.Tool{{Name: "file_read"}, {Name: "bash"}},
-	}
-	forked, err := BuildForkedRequest(main, ForkOptions{
-		AppendMessages: []client.Message{{Role: "user", Content: client.NewTextContent("x")}},
-		SkipCacheWrite: true,
-		ToolsAllowlist: []string{}, // empty non-nil
-	})
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if len(forked.Tools) != 0 {
-		t.Errorf("expected empty Tools (allowlist blocks all), got %+v", forked.Tools)
-	}
-}
-
 // TestForkedRequest_DebugTagging confirms the suggestion wrapper stamps
 // the off-wire ForkedKind field so SHANNON_CACHE_DEBUG log lines can be
 // filtered by fork type. The field is json:"-" so it never reaches the

@@ -743,6 +743,13 @@ type AgentLoop struct {
 	lastSentMu      sync.Mutex
 	lastSentRequest client.CompletionRequest
 	lastSentValid   bool
+	// lastIterUsage holds the most recent single-iteration LLM usage (NOT the
+	// turn-aggregate). The suggestion fork's cache-cold gate reads this so a
+	// multi-tool turn that started cold but ended warm gets correctly judged
+	// against the warm last-call usage rather than the colder turn-average.
+	// Guarded by lastSentMu (same mutex as lastSentRequest — they update
+	// together).
+	lastIterUsage client.Usage
 }
 
 // CheckpointFunc is invoked mid-turn at phase-exit boundaries by AgentLoop.Run
@@ -2872,6 +2879,14 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 
 		normalizedUsage := resp.Usage.Normalized()
+		// Capture this iteration's usage independently of the turn-aggregate.
+		// Cache-cold gates on the suggestion fork need to judge "the LAST main
+		// call's warmth", not the average across all iterations. Updated under
+		// the same mutex as lastSentRequest because they always change together
+		// (we just observed a successful LLM response).
+		a.lastSentMu.Lock()
+		a.lastIterUsage = normalizedUsage
+		a.lastSentMu.Unlock()
 		usage.Add(normalizedUsage)
 		cacheTracker.Record(normalizedUsage)
 		// Emit incremental usage delta to handler for accumulation/persistence.
@@ -5060,5 +5075,30 @@ func (a *AgentLoop) LastSentRequest() (client.CompletionRequest, bool) {
 	if len(a.lastSentRequest.Tools) > 0 {
 		out.Tools = append([]client.Tool(nil), a.lastSentRequest.Tools...)
 	}
+	// Thinking is a pointer — shallow-copy aliases the loop's internal
+	// snapshot. A caller mutating out.Thinking.BudgetTokens would silently
+	// corrupt the next forked-request's cache prefix. BuildForkedRequest
+	// also deep-copies Thinking on the way out (forkedrequest.go), so the
+	// suggestion path is safe today; this guard closes the same footgun
+	// for any other consumer that calls LastSentRequest directly.
+	if a.lastSentRequest.Thinking != nil {
+		thinkingCopy := *a.lastSentRequest.Thinking
+		out.Thinking = &thinkingCopy
+	}
 	return out, true
+}
+
+// LastLLMUsage returns the usage from the most recent single LLM iteration
+// (not the turn-aggregate). Returns (Usage{}, false) before the first LLM
+// call has completed. Used by the suggestion fork's cache-cold gate: judging
+// "did the LAST main call land in a cold cache" gives the fork an accurate
+// inheritance signal, whereas the turn-aggregate gets dragged colder by
+// early tool iterations that started uncached.
+func (a *AgentLoop) LastLLMUsage() (client.Usage, bool) {
+	a.lastSentMu.Lock()
+	defer a.lastSentMu.Unlock()
+	if !a.lastSentValid {
+		return client.Usage{}, false
+	}
+	return a.lastIterUsage, true
 }

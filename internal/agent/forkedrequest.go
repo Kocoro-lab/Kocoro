@@ -29,31 +29,12 @@ type ForkOptions struct {
 	// "speculation", "subagent-explorer". Never sent on the wire — strictly
 	// telemetry. Keep short and stable for log grep ergonomics.
 	DebugKind string
-
-	// ToolsAllowlist, when non-nil, restricts the forked request's Tools array
-	// to only tools whose Name appears in the allowlist. UNSAFE: this changes
-	// the Tools byte representation and fragments the cache prefix. Use ONLY
-	// for sub-agents that genuinely need a different tool surface (e.g. a
-	// "review" sub-agent restricted to read-only tools). Never use for prompt
-	// suggestion / speculation — they MUST inherit the full tools array.
-	//
-	// Semantics:
-	//   - nil          → no filter; forked.Tools shares backing array with
-	//                    main.Tools (callers must treat as read-only)
-	//   - []string{}   → block all tools; forked.Tools becomes empty
-	//   - []string{x}  → keep only tools whose Name == x
-	//
-	// Callers that set this to a non-nil value MUST emit an audit row tagged
-	// "fork_tools_filtered" so cache-regression hunting later can correlate
-	// fragmentation with this option.
-	ToolsAllowlist []string
 }
 
 // BuildForkedRequest returns a CompletionRequest derived from `main` per the
 // given opts. The returned value is byte-equal to main on every field except
 // Messages (extended via opts.AppendMessages), SkipCacheWrite (set to
-// opts.SkipCacheWrite), ForkedKind (set to opts.DebugKind), and — if
-// opts.ToolsAllowlist is set — Tools (filtered).
+// opts.SkipCacheWrite), and ForkedKind (set to opts.DebugKind).
 //
 // # Cache key invariant (read before changing this function)
 //
@@ -101,9 +82,11 @@ func BuildForkedRequest(main client.CompletionRequest, opts ForkOptions) (client
 	// NOTE: in the no-allowlist path, out.Tools still shares its backing array
 	// with main.Tools. Callers MUST treat the returned forked.Tools as read-only
 	// — appending or mutating elements can corrupt the main request. The current
-	// suggestion / speculation callers never write to Tools, so this is fine in
-	// practice; a future caller that needs to mutate Tools should pass a non-nil
-	// ToolsAllowlist (which forces a fresh slice via the filter branch below).
+	// suggestion caller never writes to Tools, so this is fine in practice; a
+	// future caller that needs a different tool surface (e.g. a "review" sub-
+	// agent restricted to read-only tools) must reintroduce an explicit filter
+	// option AND emit a fork_tools_filtered audit row — the cache-fragmentation
+	// hazard is documented in CACHE INVARIANT above.
 
 	// Defensive deep-copy of Messages — must NOT share backing array with main,
 	// otherwise callers mutating `out.Messages[i]` would corrupt `main.Messages[i]`.
@@ -122,21 +105,6 @@ func BuildForkedRequest(main client.CompletionRequest, opts ForkOptions) (client
 
 	out.SkipCacheWrite = opts.SkipCacheWrite
 	out.ForkedKind = opts.DebugKind
-
-	// CACHE-FRAGMENTING: only applied if explicitly opted-in.
-	if opts.ToolsAllowlist != nil {
-		allow := make(map[string]bool, len(opts.ToolsAllowlist))
-		for _, n := range opts.ToolsAllowlist {
-			allow[n] = true
-		}
-		filtered := make([]client.Tool, 0, len(main.Tools))
-		for _, t := range main.Tools {
-			if allow[t.Name] {
-				filtered = append(filtered, t)
-			}
-		}
-		out.Tools = filtered
-	}
 
 	return out, nil
 }

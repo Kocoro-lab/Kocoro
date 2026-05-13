@@ -528,6 +528,15 @@ type ServerDeps struct {
 	// Wired by NewServer after construction. nil-safe: when unset (e.g. CLI
 	// fixtures that construct ServerDeps directly), the post-Run hook is a no-op.
 	Suggestions *agent.SuggestionState
+
+	// suggestionRegisteredMu + suggestionRegistered dedupe the
+	// SessionManager.OnSessionClose registration in RunAgent: without dedupe
+	// each turn appends a fresh closure to the same session's close-handler
+	// list, growing O(N) per N-turn session. The set is keyed by sessionID;
+	// the registered closure deletes its own key when fired so a sessionID
+	// reused after a previous SessionManager lifetime can re-register cleanly.
+	suggestionRegisteredMu sync.Mutex
+	suggestionRegistered   map[string]struct{}
 }
 
 // Snapshot returns current Config, Registry, and Supervisor under read lock.
@@ -1224,11 +1233,33 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		sessMgr.OnSessionClose(sess.ID, cloudSessionTmpCleanup(cloudSessionCWD))
 	}
 	// Tear down per-session suggestion state on explicit session close
-	// (session delete/switch, TUI quit, daemon shutdown). Clear is idempotent
-	// on missing keys, so registering per turn is safe even though
-	// OnSessionClose appends callbacks rather than replacing them.
+	// (session delete/switch, TUI quit, daemon shutdown). Forget drops the
+	// gens counter too — the slow leak Clear would otherwise produce across
+	// long-running daemons with churning sessions.
+	//
+	// Dedup the registration: SessionManager.OnSessionClose appends callbacks,
+	// so without this guard each turn of an N-turn session would push N
+	// closures doing the same work. The dedup map is keyed by sessionID; the
+	// registered closure removes its own key when fired so a sessionID reused
+	// after a SessionManager lifetime can re-register cleanly.
 	if deps.Suggestions != nil {
-		sessMgr.OnSessionClose(sessionID, func() { deps.Suggestions.Clear(sessionID) })
+		deps.suggestionRegisteredMu.Lock()
+		if deps.suggestionRegistered == nil {
+			deps.suggestionRegistered = make(map[string]struct{})
+		}
+		_, already := deps.suggestionRegistered[sessionID]
+		if !already {
+			deps.suggestionRegistered[sessionID] = struct{}{}
+		}
+		deps.suggestionRegisteredMu.Unlock()
+		if !already {
+			sessMgr.OnSessionClose(sessionID, func() {
+				deps.Suggestions.Forget(sessionID)
+				deps.suggestionRegisteredMu.Lock()
+				delete(deps.suggestionRegistered, sessionID)
+				deps.suggestionRegisteredMu.Unlock()
+			})
+		}
 	}
 	ctx = tools.WithFilePreview(ctx, filePreview)
 	if attachmentCleanup != nil {
@@ -1435,7 +1466,21 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if saveErr == nil && deps.Suggestions != nil && cfg != nil && cfg.Agent.PromptSuggestion.Enabled {
 			ps := cfg.Agent.PromptSuggestion
 			completedTurns := countAssistantTurns(sess.Messages)
-			uncached := usage.InputTokens - usage.CacheReadTokens
+			// Judge cache warmth on the LAST main-turn LLM call, not the
+			// turn-aggregate `usage` — a multi-tool turn that started cold
+			// but ended warm (last iter ~100% cache_read) should NOT be
+			// gated out by the cumulative count. The suggestion fork pivots
+			// from the last sent request, so the last iter's warmth is the
+			// authoritative signal. Fall back to turn-aggregate when the
+			// loop didn't expose a last-iter snapshot (LastLLMUsage returns
+			// ok=false only before the first call, which can't happen on this
+			// success path, so the fallback is purely defensive).
+			var uncached int
+			if last, ok := loop.LastLLMUsage(); ok {
+				uncached = last.InputTokens - last.CacheReadTokens
+			} else {
+				uncached = usage.InputTokens - usage.CacheReadTokens
+			}
 			if uncached < 0 {
 				uncached = 0
 			}

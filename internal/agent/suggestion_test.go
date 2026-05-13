@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -197,13 +199,17 @@ func TestSuggestionPromptIsStable(t *testing.T) {
 	// the cache benefit since the suggestion message itself becomes part of
 	// the forked request's tail. (The cache benefit comes from the *prefix*
 	// being identical to main; the appended message is uncached.)
-	// This test exists to make accidental edits visible in code review.
-	if len(SuggestionPrompt) < 50 {
-		t.Errorf("SuggestionPrompt suspiciously short: %d chars", len(SuggestionPrompt))
+	//
+	// Length sanity catches obvious bloat/empty mistakes. The sha256 lock
+	// catches the subtler case: a same-length typo that the length check
+	// would silently allow through.
+	if n := len(SuggestionPrompt); n < 50 || n > 2000 {
+		t.Errorf("SuggestionPrompt length out of range: %d (want 50..2000)", n)
 	}
-	if len(SuggestionPrompt) > 2000 {
-		t.Errorf("SuggestionPrompt suspiciously long (%d chars) — every char is paid input on each turn",
-			len(SuggestionPrompt))
+	const expectedSHA256 = "ee1565894399a6d10a9fdb8aa106c73c9cafe6b0bff632731198aaabbc82837e"
+	got := fmt.Sprintf("%x", sha256.Sum256([]byte(SuggestionPrompt)))
+	if got != expectedSHA256 {
+		t.Errorf("SuggestionPrompt sha256 = %s\n             want = %s\nIf the change is intentional, update expectedSHA256 in this test.", got, expectedSHA256)
 	}
 }
 
