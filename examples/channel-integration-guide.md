@@ -1,11 +1,11 @@
 # Channel Integration Guide
 
-How to connect any messaging platform to ShanClaw via the daemon's local HTTP API.
+How to connect any messaging platform to Kocoro via the daemon's local HTTP API.
 
 > **When to use this guide**
 >
 > This guide covers building a **local bridge bot** that forwards messages from
-> a platform (Discord, Matrix, a custom webhook, etc.) into a ShanClaw daemon
+> a platform (Discord, Matrix, a custom webhook, etc.) into a Kocoro daemon
 > running on your own machine via `POST /message`.
 >
 > **Use this path when:** you're running a personal or dev-team deployment,
@@ -28,7 +28,7 @@ How to connect any messaging platform to ShanClaw via the daemon's local HTTP AP
 
 ```
 ┌─────────────────────┐         ┌──────────────────┐
-│  Messaging Platform  │         │  ShanClaw Daemon  │
+│  Messaging Platform  │         │   Kocoro Daemon   │
 │  (Discord, Telegram, │  HTTP   │  127.0.0.1:7533   │
 │   Slack, custom...)  │◄──────►│                    │
 │                      │         │  AgentLoop runs    │
@@ -247,7 +247,7 @@ The daemon uses a 5-layer permission model. Most read-only tools and common safe
 - **computer**: Mouse/keyboard automation
 - **applescript**: Running macOS automation scripts
 
-Safe commands defined in `internal/permissions/permissions.go` never trigger approval events. See the [ShanClaw permission model](https://github.com/Kocoro-lab/ShanClaw/blob/main/CLAUDE.md#permission-model) for the full list.
+Safe commands defined in `internal/permissions/permissions.go` never trigger approval events. See the [Kocoro permission model](https://github.com/Kocoro-lab/Kocoro/blob/main/CLAUDE.md#permission-model) for the full list.
 
 ### Approval request (SSE event)
 

@@ -538,7 +538,7 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Notify Cloud and emit event BEFORE unblocking the agent.
-	// This ensures ShanClaw dismisses the approval card before seeing the agent reply.
+	// This ensures Kocoro dismisses the approval card before seeing the agent reply.
 	_ = s.notifyApprovalResolved(ApprovalResolvedPayload{
 		RequestID:  req.RequestID,
 		Decision:   req.Decision,

@@ -1,12 +1,12 @@
-# Contributing to ShanClaw
+# Contributing to Kocoro
 
-Thanks for your interest in contributing to ShanClaw!
+Thanks for your interest in contributing to Kocoro!
 
 ## Getting Started
 
 ```bash
-git clone https://github.com/Kocoro-lab/ShanClaw.git
-cd ShanClaw
+git clone https://github.com/Kocoro-lab/Kocoro.git
+cd Kocoro
 go build -o shan .
 go test ./...
 ```

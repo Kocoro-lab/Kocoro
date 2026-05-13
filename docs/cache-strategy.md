@@ -1,12 +1,12 @@
 # Prompt Cache Strategy
 
-How ShanClaw + Shannon allocate Anthropic's 4 `cache_control` breakpoints and route TTL by call-site origin. Canonical reference for anyone touching the LLM request path.
+How Kocoro + Shannon allocate Anthropic's 4 `cache_control` breakpoints and route TTL by call-site origin. Canonical reference for anyone touching the LLM request path.
 
 ## Design goals
 
 1. **Maximize cache_read / cache_creation (CER)** on long-running conversations — Slack/LINE/TUI where the user comes back over minutes or hours.
 2. **Minimize paid cache_creation** on one-shot invocations — cron, webhook, MCP, CLI `shan -y ...`, and every internal subagent (`decompose`, `tool_select`, `lead_decide`, `interpretation`, `stub_cleanup`, `verify`, …) where the cache will never be re-read.
-3. **Stay inside the public Anthropic API** — no `cache_edits` protocol, no `DANGEROUS_uncachedSystemPromptSection` marker, no CC-private `<system-reminder>` cache-key-invisible semantics. ShanClaw *does* emit `<system-reminder>` tags as plain XML text (Claude is trained to read the tag as framework-internal trusted content — used for skill listings, post-tool nudges, and the instructions block in `prompt/builder.go`), but the wrapped content participates in the cache key like any other byte. The ~5-10 pp CHR gap versus Claude Code is accepted as a structural ceiling.
+3. **Stay inside the public Anthropic API** — no `cache_edits` protocol, no `DANGEROUS_uncachedSystemPromptSection` marker, no CC-private `<system-reminder>` cache-key-invisible semantics. Kocoro *does* emit `<system-reminder>` tags as plain XML text (Claude is trained to read the tag as framework-internal trusted content — used for skill listings, post-tool nudges, and the instructions block in `prompt/builder.go`), but the wrapped content participates in the cache key like any other byte. The ~5-10 pp CHR gap versus Claude Code is accepted as a structural ceiling.
 
 ## Breakpoint allocation (Anthropic cap = 4)
 
@@ -56,7 +56,7 @@ TTL is resolved by `_ttl_block(request)` in `anthropic_provider.py`. Precedence:
 
 When adding a new call-site, either:
 
-- Pick a long bucket name → add to `_LONG_CACHE_SOURCES` in `anthropic_provider.py` **and** `cacheSourceFromDaemonSource` in `internal/daemon/runner.go` if the source originates on the ShanClaw side
+- Pick a long bucket name → add to `_LONG_CACHE_SOURCES` in `anthropic_provider.py` **and** `cacheSourceFromDaemonSource` in `internal/daemon/runner.go` if the source originates on the Kocoro side
 - Pick a short bucket name → just set `cache_source=<name>` on the call; no list update needed
 
 ## Env-var escape hatches
@@ -69,7 +69,7 @@ Operator-facing. Set on the `llm-service` container; applies to every request th
 | `SHANNON_FORCE_TTL=5m` | Force every request to 5m | A/B vs 1h in production |
 | `SHANNON_FORCE_TTL=1h` | Force every request to 1h | Legacy-compat / reproducing pre-Phase-1 behavior |
 | *(unset)* | Use source-routed policy above | Normal operation |
-| `SHANNON_CACHE_DEBUG=1` | ShanClaw writes per-request hashes to `~/.shannon/logs/cache-debug.log` | Measurement / bench |
+| `SHANNON_CACHE_DEBUG=1` | Kocoro writes per-request hashes to `~/.shannon/logs/cache-debug.log` | Measurement / bench |
 | `SHANNON_CACHE_DRIFT_DEBUG=1` | Extra `DRIFT[...]` log lines from `_apply_rolling_cache_marker` | Diagnosing byte drift |
 
 ## Byte stability
@@ -100,8 +100,8 @@ If Anthropic ever treats `cache_control` fields as cache-key-insensitive (i.e. s
 
 `CompletionRequest.SessionID` must reach Shannon for prev-marker preservation to work. The chain:
 
-- ShanClaw `internal/agent/loop.go` sets `req.SessionID = a.sessionID` on every `Complete` call
-- ShanClaw `internal/client/gateway.go` marshals `session_id` on the wire (json tag, not `-`)
+- Kocoro `internal/agent/loop.go` sets `req.SessionID = a.sessionID` on every `Complete` call
+- Kocoro `internal/client/gateway.go` marshals `session_id` on the wire (json tag, not `-`)
 - Shannon `llm_provider/anthropic_provider.py::_apply_rolling_cache_marker(claude_messages, request.session_id, ttl_block)` keys the prev-marker memo on it
 
 Without this chain, the memo is keyed on `None` and cross-turn continuity collapses to single-rolling-marker-per-request.
@@ -157,11 +157,11 @@ Together these account for a structural 5-10 pp CHR gap that public-API clients 
 
 ### `<system-reminder>` — same tag, different semantics
 
-ShanClaw *does* emit `<system-reminder>` tags as plain XML text — see `internal/agent/loop.go:buildSkillListing`, `buildStickySkillReminder`, post-tool nudges in `systemReminder`, and the instructions block in `internal/prompt/builder.go` (issue #125). Anthropic's training causes Claude to treat content inside this tag as **framework-internal trusted content**, which suppresses the prompt-injection false-positive that bare `## Instructions` markdown headers triggered in user-role messages. What we **do not** get from this is CC's cache-key-invisibility — the tag is just text in the message body, so wrapped content is part of the byte stream the cache hashes.
+Kocoro *does* emit `<system-reminder>` tags as plain XML text — see `internal/agent/loop.go:buildSkillListing`, `buildStickySkillReminder`, post-tool nudges in `systemReminder`, and the instructions block in `internal/prompt/builder.go` (issue #125). Anthropic's training causes Claude to treat content inside this tag as **framework-internal trusted content**, which suppresses the prompt-injection false-positive that bare `## Instructions` markdown headers triggered in user-role messages. What we **do not** get from this is CC's cache-key-invisibility — the tag is just text in the message body, so wrapped content is part of the byte stream the cache hashes.
 
 **Workaround for `<system-reminder>` cache-invisibility (issue #107):** dynamic per-user tool
 catalogs that CC routes through `<system-reminder>` (cache-key-invisible)
-are routed in ShanClaw through the user message's `StableContext` — they
+are routed in Kocoro through the user message's `StableContext` — they
 land in BP #3 (per-session) rather than BP #1 (cross-user). Cross-user
 share is preserved on BP #1 at the cost of no cross-user share on the
 listing itself, which is the strictly correct trade since the listing
@@ -173,7 +173,7 @@ content is per-user by construction. See `prompt.BuildToolListing`.
 1. Pick a `cache_source` name that matches the call's lifecycle (long-reuse or one-shot)
 2. Pass `cache_source=<name>` into `providers.generate_completion` (or `manager.complete`)
 3. If long-reuse: add the name to `_LONG_CACHE_SOURCES` in `anthropic_provider.py`
-4. If originating on ShanClaw side: add a case in `cacheSourceFromDaemonSource` in `runner.go`
+4. If originating on Kocoro side: add a case in `cacheSourceFromDaemonSource` in `runner.go`
 5. After traffic hits production, confirm no new `"unknown"` `cache_source` entries in `~/.shannon/logs/audit.log` (`jq -r '.cache_source' audit.log | sort -u`)
 
 **Diagnosing a CHR regression:**
@@ -187,7 +187,7 @@ SDK changes can silently alter message serialization. After any `anthropic` vers
 
 ## Query-Time Tool Result Budget
 
-ShanClaw applies a second tool-result budget immediately before main LLM
+Kocoro applies a second tool-result budget immediately before main LLM
 requests. This layer is separate from execution-time spill:
 
 - execution-time spill protects the current tool batch before it enters history;

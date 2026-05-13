@@ -26,7 +26,7 @@ var cloudSourceSet = map[string]struct{}{
 	"webhook":  {},
 }
 
-// isCloudSource reports whether the request source is one ShanClaw Cloud owns
+// isCloudSource reports whether the request source is one Kocoro Cloud owns
 // the final rendering for. Matching is case-insensitive and whitespace-
 // trimmed to mirror outputFormatForSource's normalization.
 func isCloudSource(source string) bool {

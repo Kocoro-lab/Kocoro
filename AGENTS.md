@@ -1,8 +1,8 @@
-# ShanClaw — Project Guide
+# Kocoro — Project Guide
 
 ## What This Is
 
-Go CLI tool (`shan`) — the runtime for Shannon AI agents. The primary production stack is **daemon + ShanClaw Desktop + Shannon Cloud**: the daemon connects to Cloud via WebSocket, receives channel messages, runs the agent loop locally with full tool access, and streams results back. ShanClaw also supports interactive TUI, one-shot CLI, MCP server mode, and local scheduled tasks.
+Go CLI tool (`shan`) — the runtime for Shannon AI agents. The primary production stack is **daemon + Kocoro Desktop + Shannon Cloud**: the daemon connects to Cloud via WebSocket, receives channel messages, runs the agent loop locally with full tool access, and streams results back. Kocoro also supports interactive TUI, one-shot CLI, MCP server mode, and local scheduled tasks.
 
 ## Tech Stack
 
@@ -187,7 +187,7 @@ Skills in `builtinSkills` (`internal/skills/api.go`) are content-addressed-overl
 User edits to either are wiped on next startup — fork under a different skill name to customize.
 
 ### Kocoro Skill Co-Maintenance
-The `kocoro` bundled skill (`internal/skills/bundled/skills/kocoro/`) is a platform configuration assistant. Its SKILL.md and reference files (`references/*.md`) describe daemon API endpoints, config fields, and workflows. Kocoro is the AI's only source of truth for ShanClaw's HTTP surface — missing docs cause it to hallucinate workarounds. **Adding a new endpoint or feature counts as a trigger, not only modifying existing ones**; any `mux.HandleFunc(...)` in `internal/daemon/server.go` must have a matching reference entry. See CLAUDE.md for the full mapping.
+The `kocoro` bundled skill (`internal/skills/bundled/skills/kocoro/`) is a platform configuration assistant. Its SKILL.md and reference files (`references/*.md`) describe daemon API endpoints, config fields, and workflows. Kocoro is the AI's only source of truth for the daemon HTTP surface — missing docs cause it to hallucinate workarounds. **Adding a new endpoint or feature counts as a trigger, not only modifying existing ones**; any `mux.HandleFunc(...)` in `internal/daemon/server.go` must have a matching reference entry. See CLAUDE.md for the full mapping.
 
 ### Agent Names
 
@@ -325,7 +325,7 @@ E2E tests in `test/e2e/` split into offline (no API) and live (`SHANNON_E2E_LIVE
 ## Building & Releasing
 
 - GoReleaser: `.goreleaser.yaml`
-- npm package: `@kocoro/shanclaw`
+- npm package: `@kocoro/kocoro` (previously `@kocoro/shanclaw`, deprecated post-v0.1.7)
 - Versioning is PATCH-only by default unless explicitly directed otherwise
 - Release flow: tag → push tag → CI builds and publishes
 - `docs/` is gitignored — documentation lives locally only

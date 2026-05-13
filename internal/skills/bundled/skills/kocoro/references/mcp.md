@@ -76,7 +76,7 @@ MCP servers are configured through the config API — there is no separate MCP e
 
 ## Tool Naming and the Loop Detector
 
-ShanClaw's loop detector classifies MCP tool names as read-only or write-capable by the verb word at position 0, 1, or 2 of the name (tokens split on `_` and `-`). **Read-only tools** (names whose primary verb is `get`/`list`/`search`/`query`/`fetch`/`read`/`describe`/`find`/`count`/`head`/`show`/`resolve`/`lookup`/`inspect`) get relief from the count-based NoProgress nudge so legitimate batch enumeration with unique arguments (e.g. iterating over 20 distinct database IDs) is not force-stopped.
+Kocoro's loop detector classifies MCP tool names as read-only or write-capable by the verb word at position 0, 1, or 2 of the name (tokens split on `_` and `-`). **Read-only tools** (names whose primary verb is `get`/`list`/`search`/`query`/`fetch`/`read`/`describe`/`find`/`count`/`head`/`show`/`resolve`/`lookup`/`inspect`) get relief from the count-based NoProgress nudge so legitimate batch enumeration with unique arguments (e.g. iterating over 20 distinct database IDs) is not force-stopped.
 
 **Write verbs dominate**: names containing `create`/`delete`/`update`/`remove`/`insert`/`append`/`archive`/`modify`/`rename`/`replace`/`drop`/`prune`/`clear`/`send`/`move`/`upload`/`write`/`push`/`publish`/`submit`/`post`/`add`/`set`/`patch`/`put`/`execute`/`run` in the first three tokens are treated as writes regardless of any read-verb also present. This is deliberate defence-in-depth: the permission engine does not gate MCP calls, so NoProgress is the main guard against unique-arg write loops.
 

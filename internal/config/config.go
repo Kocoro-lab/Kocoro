@@ -44,7 +44,7 @@ type Config struct {
 // MCPConfig holds client-side settings shared across all MCP servers.
 type MCPConfig struct {
 	// WorkspaceRoots are extra directories advertised to MCP servers honoring
-	// the client `roots` capability, on top of the ShanClaw defaults
+	// the client `roots` capability, on top of the Kocoro defaults
 	// (attachment staging dir plus common user locations). Intended for
 	// project directories the user wants browser_file_upload or similar
 	// sandboxed tools to reach without manual copying.
@@ -257,7 +257,7 @@ func Load() (*Config, error) {
 	// memory.provider defaults to "disabled": Episodic Memory is opt-in.
 	// Once enabled by the user, the Desktop installs tlm.app on demand and
 	// writes memory.tlm_path; sync.enabled is also flipped to true in the
-	// same patchConfig call (see ShanClawDesktop SettingsView).
+	// same patchConfig call (see Kocoro Desktop SettingsView).
 	viper.SetDefault("memory.provider", "disabled")
 	viper.SetDefault("memory.endpoint", "")
 	viper.SetDefault("memory.api_key", "")

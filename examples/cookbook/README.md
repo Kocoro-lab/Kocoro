@@ -1,6 +1,6 @@
-# ShanClaw Cookbook
+# Kocoro Cookbook
 
-Short, concrete recipes for multi-step tasks people have actually run through ShanClaw. Each entry records the shape of the task, the tools that carried the load, and the gotchas worth knowing before you try it yourself. These are **patterns**, not full transcripts — they age better that way.
+Short, concrete recipes for multi-step tasks people have actually run through Kocoro. Each entry records the shape of the task, the tools that carried the load, and the gotchas worth knowing before you try it yourself. These are **patterns**, not full transcripts — they age better that way.
 
 The goal is a growing corpus of "this is the kind of thing the agent is good at" so new users can skim a few recipes and get a realistic picture beyond one-shot prompts.
 

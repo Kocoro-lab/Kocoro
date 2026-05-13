@@ -35,10 +35,10 @@ type openAIFunctionCall struct {
 }
 
 // ---------------------------------------------------------------------------
-// Format conversion: ShanClaw (Anthropic) → OpenAI
+// Format conversion: Kocoro (Anthropic) → OpenAI
 // ---------------------------------------------------------------------------
 
-// convertMessagesToOpenAI converts ShanClaw's Anthropic-format messages to
+// convertMessagesToOpenAI converts Kocoro's Anthropic-format messages to
 // OpenAI-compatible format for Ollama.
 func convertMessagesToOpenAI(msgs []Message) []openAIMessage {
 	var result []openAIMessage
@@ -108,10 +108,10 @@ func convertMessagesToOpenAI(msgs []Message) []openAIMessage {
 }
 
 // ---------------------------------------------------------------------------
-// Format conversion: OpenAI → ShanClaw
+// Format conversion: OpenAI → Kocoro
 // ---------------------------------------------------------------------------
 
-// mapFinishReason converts OpenAI finish reasons to ShanClaw's internal values.
+// mapFinishReason converts OpenAI finish reasons to Kocoro's internal values.
 func mapFinishReason(reason string) string {
 	switch reason {
 	case "stop":
@@ -184,7 +184,7 @@ func convertOpenAIResponse(data []byte) (*CompletionResponse, error) {
 	for _, tc := range choice.Message.ToolCalls {
 		args := tc.Function.Arguments
 		// Arguments can be a JSON string (OpenAI compat) or JSON object (Ollama native).
-		// Normalize to raw JSON object for ShanClaw's FunctionCall.Arguments.
+		// Normalize to raw JSON object for Kocoro's FunctionCall.Arguments.
 		var argsStr string
 		if err := json.Unmarshal(args, &argsStr); err == nil {
 			args = json.RawMessage(argsStr)

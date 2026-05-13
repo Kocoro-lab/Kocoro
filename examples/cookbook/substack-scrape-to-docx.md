@@ -4,7 +4,7 @@ One Desktop prompt: pull every post from a Substack, summarize them, and drop a 
 
 ## Entry point
 
-Desktop app (ShanClaw Desktop) → local daemon over the HTTP API.
+Desktop app (Kocoro Desktop) → local daemon over the HTTP API.
 
 Prompt:
 
