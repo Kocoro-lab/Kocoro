@@ -345,7 +345,7 @@ Local tools executed on your macOS machine:
 
 | Tool | Approval | Description |
 |------|----------|-------------|
-| `file_read` | CWD auto | Read files with line numbers (offset/limit). Repeat reads of the same range return a short "unchanged since last read" stub when the file has not been modified. Oversized text reads (~25K tokens estimated) return an error directing the caller to use `offset+limit`. Images (png/jpg/gif/webp) returned as base64 vision blocks. PDFs rendered page-by-page via Swift/PDFKit (offset=start page, limit=page count). |
+| `file_read` | CWD auto | Read files with line numbers (offset/limit). Repeat reads of the same range return a short "unchanged since last read" stub when the file has not been modified. Oversized text reads (~25K tokens estimated) return an error directing the caller to use `offset+limit`. Images (png/jpg/gif/webp) returned as base64 vision blocks; auto-compresses large images so vision works on any screenshot without manual resizing. PDFs rendered page-by-page via Swift/PDFKit (offset=start page, limit=page count). |
 | `file_write` | Yes | Write/create files, creates parent dirs |
 | `file_edit` | Yes | Find-and-replace. `old_string` must be unique by default; pass `replace_all: true` to rewrite every occurrence (useful for renames). |
 | `glob` | CWD auto | Find files by pattern (supports `**` recursive) |
