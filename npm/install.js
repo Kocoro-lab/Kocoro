@@ -4,7 +4,7 @@ const path = require("path");
 const https = require("https");
 const crypto = require("crypto");
 
-const REPO = "Kocoro-lab/ShanClaw";
+const REPO = "Kocoro-lab/Kocoro";
 const BIN_DIR = path.join(__dirname, "bin");
 
 function getPlatform() {
