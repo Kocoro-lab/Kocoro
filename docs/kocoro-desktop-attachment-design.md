@@ -43,8 +43,7 @@ Status as of 2026-05-13:
 
 | Constraint | Value | Status |
 |---|---|---|
-| `maxAttachmentsPerMessage` | **20** | ✅ shipped (commit `072841b`) — total file count cap |
-| `maxImagesPerMessage` | **10** | ✅ shipped (this work) — image-specific cap, claude.ai parity |
+| `maxAttachmentsPerMessage` | **20** | ✅ shipped (commit `072841b`) — total file count cap, matches claude.ai's per-message cap |
 | `maxFileSize` per disk file | **500 MB** | ✅ shipped — aligned with daemon Phase 1 |
 | `maxTotalAttachmentSize` | **500 MB** | ✅ shipped |
 | Clipboard inline paste cap | **20 MB** | ✅ shipped — matches daemon's `maxInlineImageDecodedBytes` |
@@ -55,20 +54,20 @@ Status as of 2026-05-13:
 | Archive types | zip (others fall through to file_ref) | ✅ shipped |
 | Folder drops | treated as directory `file_ref` | ✅ shipped (commit `702cf59`) |
 | Universal accept (unknown ext → file_ref) | ✅ shipped — daemon decides downstream | |
-| **Live counter `N/10 images · M/20 attachments`** | ✅ shipped (this work) — color-shifts at 90% / 100% | |
-| Per-violation `lastError` toast | ✅ shipped | |
+| Per-violation `lastError` toast | ✅ shipped — only feedback when limit hit, matches claude.ai behavior | |
 
 **UX rules** (current behavior):
 - Numbered chip per attachment with thumbnail + filename + size + ✕ remove button.
-- Live counter above chip row, only visible when ≥ 1 attachment.
-- Counter is `.secondary` text below 90% capacity, `.orange` at 90%, `.red` at 100%.
-- On hard block, `AttachmentState.lastError` triggers a toast; counter stays red.
+- No live counter — claude.ai itself doesn't show one. Capacity info is implicit (the chip strip shows what's attached) and the toast on violation tells the user when they've hit the cap.
+- On hard block, `AttachmentState.lastError` triggers a toast.
 - Universal acceptance: unknown extensions are accepted as file_ref and the daemon decides whether to extract / passthrough / refuse.
 
-**Rationale for Kocoro choosing more permissive numbers than claude.ai**:
-- 500 MB per file (vs claude.ai's 30 MB): Kocoro daemon auto-compresses images at source (`internal/tools/imaging_compress.go`) and treats disk files as `file_ref` paths (not inline base64). The 5 MB Anthropic inline limit is enforced server-side by the daemon, not gated client-side.
-- 20 attachments per message (vs claude.ai's 5/turn for images): Kocoro's 1M-context Sonnet 4.6 can absorb more parallel files than the smaller-context default behind claude.ai.
-- Image cap of 10 (vs claude.ai's 5): more generous given the larger context, but still binds before the total cap so users get image-specific feedback.
+**Rationale for Kocoro's 500 MB-per-file cap (vs claude.ai's 30 MB)**:
+Kocoro daemon auto-compresses images at source (`internal/tools/imaging_compress.go`) and treats disk files as `file_ref` paths (not inline base64). The 5 MB Anthropic inline limit is enforced server-side by the daemon, not gated client-side. The 20-attachments-per-message cap matches claude.ai exactly.
+
+**Not implemented (future / explicit non-goals)**:
+- Image-specific cap (`maxImagesPerMessage`): claude.ai does NOT have one — they use a single per-message attachment cap. Adding an image-only cap was investigated and rejected as scope inflation.
+- Per-conversation cumulative cap (claude.ai has "20 files per conversation" across messages): requires cross-message state tracking and is deferred to follow-up.
 
 ## Layer B: daemon-side compression (already implemented)
 
@@ -89,9 +88,9 @@ Status as of 2026-05-13:
 
 | Constraint | Anthropic API | claude.ai | Kocoro Desktop (shipped) |
 |---|---|---|---|
-| Inline image | 5 MB base64 string | 10 MB (server compresses) | 500 MB raw on disk (daemon compresses); 20 MB inline paste |
-| Images per request | 100 (200K) / 600 (others) | 5 per turn | **10 per message** |
-| Total attachments | — | 20 per conversation | **20 per message** |
+| Inline image | 5 MB base64 string | 30 MB (server compresses) | 500 MB raw on disk (daemon compresses); 20 MB inline paste |
+| Images per request | 100 (200K) / 600 (others) | no separate per-image cap | no separate per-image cap |
+| Total attachments | — | 20 per message, 20 per conversation (cumulative) | **20 per message** (per-conversation cumulative cap deferred) |
 | Total request | 32 MB | — | 500 MB upload, daemon shrinks |
 | Image dimensions | ≤ 8000×8000 (single), ≤ 2000×2000 (many-image, >20) | — | daemon resizes to ≤ 2000×2000 |
 | PDF pages | 100 (200K) / 600 (others) | — | daemon renders at 1024 px width |
