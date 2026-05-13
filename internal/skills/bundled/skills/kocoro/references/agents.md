@@ -66,6 +66,70 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Response: `{"status": "reset", "id": "..."}`
 - Notes: Clears the session's conversation history while keeping the session ID, title, CWD, source, channel, and cumulative usage. Cancels any active run on that session first. Also clears any persisted route binding (the link from a messaging-platform thread/sender to this session) and the live in-memory binding, so the next inbound message on that route starts a fresh session. The `agent` query parameter is REQUIRED — default-agent sessions do not use this endpoint; delete and recreate them via `DELETE /sessions/{id}` instead. Use when the user says "reset", "clear history", or "start over" on a named agent whose routing identity must survive the wipe.
 
+### `GET /agents/{name}/sessions/{id}/suggestion`
+
+Returns the latest prompt suggestion for the given session, or 404 if none.
+Default-agent equivalent: `GET /sessions/{id}/suggestion`.
+
+Response (200):
+```json
+{
+  "text": "rerun the failing test",
+  "suggested_at_unix": 1715500000
+}
+```
+
+Errors:
+- 400 if `id` is empty or contains path-traversal characters.
+- 400 if `name` is not a valid agent name (regex: `^[a-z0-9][a-z0-9_-]{0,63}$`).
+- 404 if the agent does not exist OR no suggestion is currently available for the session.
+
+### `POST /agents/{name}/sessions/{id}/suggestion/accept`
+
+Marks the current suggestion as accepted and returns the suggestion text
+so Desktop can fill the input. The user still presses Enter to send — the
+normal `POST /agents/{name}/messages` flow handles persistence. There is
+no speculative pre-run of the next assistant reply.
+
+Default-agent equivalent: `POST /sessions/{id}/suggestion/accept`.
+
+Response (200):
+```json
+{
+  "text": "rerun the failing test",
+  "suggestion": "rerun the failing test",
+  "suggested_at_unix": 1715500000
+}
+```
+
+Errors: same shape as the GET endpoint.
+
+### SSE event `suggestion_ready`
+
+Emitted on `/events` when a new suggestion is generated. Payload:
+
+```json
+{
+  "session_id": "sess_abc",
+  "agent": "myagent",
+  "text": "rerun the failing test"
+}
+```
+
+Wire format follows the HTML5 EventSource spec (two lines per event,
+separated by a blank line):
+
+```
+id: 42
+event: suggestion_ready
+data: {"session_id":"sess_abc",...}
+
+```
+
+Desktop's `EventSource.addEventListener("suggestion_ready", ...)` parses
+`event.data` as JSON. There is no outer `{"type":...,"payload":...}`
+wrapper — `event:` is a header line, `data:` is the JSON body.
+
 ## Common Scenarios
 
 ### "Create an email writer agent"

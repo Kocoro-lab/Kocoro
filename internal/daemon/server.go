@@ -62,6 +62,7 @@ type Server struct {
 	slugLocks    *skills.SlugLocks
 	secretsStore *skills.SecretsStore
 	memSvc       *memory.Service
+	suggestions  *agent.SuggestionState
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500
@@ -124,7 +125,14 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	if deps != nil {
 		deps.SecretsStore = store
 	}
-	return &Server{
+	// suggestions is initialized unconditionally so HTTP handlers work even
+	// when deps == nil (existing test fixtures pass nil). The same pointer is
+	// wired into deps.Suggestions below — when deps is non-nil — so the
+	// runner's post-Run hook reaches the same SuggestionState the handler
+	// reads from. Order matters: construct the Server first, then assign
+	// deps.Suggestions; flipping these would either panic on nil deps or
+	// race the eventBus subscriber test fixtures.
+	s := &Server{
 		port:                   port,
 		client:                 client,
 		deps:                   deps,
@@ -135,7 +143,12 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		marketplace:            skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour),
 		slugLocks:              skills.NewSlugLocks(),
 		secretsStore:           store,
+		suggestions:            agent.NewSuggestionState(),
 	}
+	if deps != nil {
+		deps.Suggestions = s.suggestions
+	}
+	return s
 }
 
 func (s *Server) chromeControlPort() int {
@@ -203,9 +216,12 @@ func (s *Server) SetOnReload(fn func()) {
 	s.onReload = fn
 }
 
-func (s *Server) Start(ctx context.Context) error {
-	s.ctx = ctx
-	mux := http.NewServeMux()
+// registerRoutes wires every HTTP handler onto mux. Extracted from Start so
+// offline tests (test/e2e/suggestion_test.go) can build a mux without
+// listening on a port or spinning up memSvc / sync ticker. Production Start
+// calls this; nothing else mutates s here, so it is safe to call before
+// listening.
+func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /agents", s.handleAgents)
@@ -266,6 +282,14 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /sessions/{id}/reset", s.handleResetSession)
 	mux.HandleFunc("GET /sessions/{id}/summary", s.handleSessionSummary)
 	mux.HandleFunc("GET /sessions/search", s.handleSessionSearch)
+	mux.HandleFunc("GET /agents/{name}/sessions/{id}/suggestion", s.handleGetSuggestion)
+	mux.HandleFunc("POST /agents/{name}/sessions/{id}/suggestion/accept", s.handleAcceptSuggestion)
+	// Default-agent parallel routes — validateSuggestionRoute returns
+	// agentName="" for these, and SessionCache.GetOrCreate("") maps to
+	// ~/.shannon/sessions. Desktop's default workspace has no named agent
+	// in the URL and would otherwise hit a 404 via agentExists.
+	mux.HandleFunc("GET /sessions/{id}/suggestion", s.handleGetSuggestion)
+	mux.HandleFunc("POST /sessions/{id}/suggestion/accept", s.handleAcceptSuggestion)
 	mux.HandleFunc("GET /permissions", s.handlePermissions)
 	mux.HandleFunc("POST /permissions/request", s.handlePermissionsRequest)
 	mux.HandleFunc("POST /approval", s.handleApproval)
@@ -279,6 +303,22 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /chrome/show", s.handleChromeShow)
 	mux.HandleFunc("POST /chrome/hide", s.handleChromeHide)
 	mux.HandleFunc("POST /shutdown", s.handleShutdown)
+}
+
+// Handler returns an http.Handler with every route registered. Used by
+// offline E2E tests that need to exercise HTTP handlers without listening
+// on a port or starting the memSvc / sync ticker side effects of Start.
+// Production code paths should use Start instead.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	s.registerRoutes(mux)
+	return mux
+}
+
+func (s *Server) Start(ctx context.Context) error {
+	s.ctx = ctx
+	mux := http.NewServeMux()
+	s.registerRoutes(mux)
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", s.port))
 	if err != nil {
@@ -538,18 +578,18 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Notify Cloud and emit event BEFORE unblocking the agent.
-	// This ensures ShanClaw dismisses the approval card before seeing the agent reply.
+	// This ensures Kocoro dismisses the approval card before seeing the agent reply.
 	_ = s.notifyApprovalResolved(ApprovalResolvedPayload{
 		RequestID:  req.RequestID,
 		Decision:   req.Decision,
-		ResolvedBy: "shanclaw",
+		ResolvedBy: "kocoro",
 	})
 
 	if s.eventBus != nil {
 		payload, _ := json.Marshal(map[string]string{
 			"request_id":  req.RequestID,
 			"decision":    string(req.Decision),
-			"resolved_by": "shanclaw",
+			"resolved_by": "kocoro",
 		})
 		s.eventBus.Emit(Event{Type: EventApprovalResolved, Payload: payload})
 	}
@@ -998,7 +1038,7 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 		Content:   body.Content,
 		Agent:     body.Agent,
 		SessionID: id,
-		Source:    "shanclaw",
+		Source:    "kocoro",
 	}
 	runReq.EnsureRouteKey()
 
@@ -1102,7 +1142,7 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Source == "" {
-		req.Source = "shanclaw"
+		req.Source = "kocoro"
 	}
 	// Normalize "default" → "" early so downstream guards are consistent.
 	if req.Agent == "default" {
@@ -3877,7 +3917,7 @@ func (s *Server) buildSyncDeps(cfg syncpkg.Config) (syncpkg.Deps, bool) {
 	return syncpkg.Deps{
 		Cfg:        cfg,
 		HomeDir:    shannonHome,
-		ClientVer:  "shanclaw/daemon",
+		ClientVer:  "kocoro/daemon",
 		Uploader:   uploader,
 		Loader:     loader,
 		Audit:      auditSink,

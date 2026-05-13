@@ -155,7 +155,7 @@ func TestIsPolicySkill(t *testing.T) {
 	}{
 		{
 			name:  "platform management",
-			skill: &skills.Skill{Name: "kocoro", Description: "Configure the ShanClaw platform: agents, skills, schedules, permissions, daemon"},
+			skill: &skills.Skill{Name: "kocoro", Description: "Configure the Kocoro platform: agents, skills, schedules, permissions, daemon"},
 			want:  true,
 		},
 		{

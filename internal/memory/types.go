@@ -1,4 +1,4 @@
-// Package memory implements the ShanClaw-side client for the Kocoro Cloud
+// Package memory implements the Kocoro-side client for the Kocoro Cloud
 // memory feature: managed sidecar lifecycle, Cloud bundle pull, agent
 // memory_recall tool with fallback. Wire schemas mirror the Kocoro Cloud
 // memory sidecar HTTP contract.

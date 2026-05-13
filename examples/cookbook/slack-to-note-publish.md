@@ -4,7 +4,7 @@ A single Slack message asks the daemon to research Trump's latest Truth Social p
 
 ## Entry point
 
-Slack DM → Shannon Cloud relay → ShanClaw daemon (cloud-routed session).
+Slack DM → Shannon Cloud relay → Kocoro daemon (cloud-routed session).
 
 Prompt:
 

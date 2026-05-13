@@ -207,6 +207,13 @@ func logCacheDebug(req CompletionRequest, tag string) string {
 	if v := os.Getenv("SHANNON_FORCE_TTL"); v != "" {
 		entry["force_ttl"] = v
 	}
+	// forked_kind tags off-path completions (suggestion / speculation). Main
+	// turn calls leave req.ForkedKind == "" and the field is omitted, so
+	// operators can grep by the same prefix_hash to correlate a main turn
+	// with its forked siblings.
+	if req.ForkedKind != "" {
+		entry["forked_kind"] = req.ForkedKind
+	}
 	appendCacheDebug(entry)
 
 	if os.Getenv("SHANNON_CACHE_DEBUG_RAW") == "1" {
@@ -738,6 +745,22 @@ type CompletionRequest struct {
 	// subagent → 5m). See docs/cache-strategy.md for the authoritative table.
 	// Unset → gateway treats as "unknown" and falls back to 5m (fail cheap).
 	CacheSource string `json:"cache_source,omitempty"`
+
+	// SkipCacheWrite signals the gateway to read existing prompt cache markers
+	// but NOT add new cache_control markers on this request. Used by prompt
+	// suggestion / speculation forked calls so they hit the main turn's cache
+	// prefix without consuming a cache breakpoint slot (Anthropic allows 4 per
+	// request). Without this flag a suggestion call would write a 5th breakpoint
+	// and Anthropic silently drops the lowest-priority marker, degrading the
+	// main turn's CER on subsequent reads.
+	SkipCacheWrite bool `json:"skip_cache_write,omitempty"`
+
+	// ForkedKind is logged by SHANNON_CACHE_DEBUG mode only and stripped
+	// before gateway transmission via the `json:"-"` tag. Set by BuildForkedRequest
+	// (internal/agent/forkedrequest.go, future task) from opts.DebugKind. Values
+	// used today: "suggestion", "speculation". Future: "subagent-<name>". Used to
+	// correlate forked calls with their parent main turn in cache-debug.log.
+	ForkedKind string `json:"-"`
 }
 
 // ThinkingConfig for Anthropic extended thinking.

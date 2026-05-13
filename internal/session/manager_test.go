@@ -475,3 +475,4 @@ func TestManager_Reset_ResetsWorkingSet(t *testing.T) {
 		t.Error("working set should be cleared after reset")
 	}
 }
+

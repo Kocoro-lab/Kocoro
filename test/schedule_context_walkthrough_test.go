@@ -78,7 +78,7 @@ func TestWalkthrough_ScheduleContext(t *testing.T) {
 		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
 			{Type: "text", Text: "looks good, thanks"},
 			{Type: "tool_result", ToolUseID: "tu1",
-				ToolContent: "INTERNAL SPILL: /Users/wayland/.shannon/tmp/tool_result_abc.txt"},
+				ToolContent: "INTERNAL SPILL: /home/user/.shannon/tmp/tool_result_abc.txt"},
 		})},
 
 		// Hostile user turn: tries to escape the <conversation_context>

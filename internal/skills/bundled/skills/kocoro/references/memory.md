@@ -1,6 +1,6 @@
 # Memory feature
 
-ShanClaw includes a `memory_recall` agent tool backed by a local memory
+Kocoro includes a `memory_recall` agent tool backed by a local memory
 sidecar. The daemon manages the sidecar's lifecycle and (in cloud mode)
 periodically pulls fresh memory bundles from Kocoro Cloud. Episodic Memory is
 **opt-in** — disabled by default; users enable it from Kocoro Desktop

@@ -6,9 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,7 +34,7 @@ func TestCacheSourceFromDaemonSource(t *testing.T) {
 		{"telegram", "telegram"},
 		{"tui", "tui"},
 		{"shanclaw", "shanclaw"},
-		// Empty source is defaulted to "shanclaw" in server.go before reaching
+		// Empty source is defaulted to "kocoro" in server.go before reaching
 		// this function; the dedicated empty-string case was removed. Falls
 		// through to "unknown" (5m) defensively in case the default is ever
 		// bypassed — matches the fail-cheap policy documented in
@@ -725,5 +729,203 @@ func TestCleanupPlaywrightAfterTurn_NonCDPUsesIdleDisconnect(t *testing.T) {
 	}
 	if nowCalls != 0 || stopCalls != 0 {
 		t.Fatalf("expected no immediate teardown in non-CDP mode, got disconnect=%d stop=%d", nowCalls, stopCalls)
+	}
+}
+
+// fakeGatewayBackend is a minimal httptest server stub for fireSuggestionAfterRun
+// tests. It captures every CompletionRequest the daemon sends and returns a
+// caller-supplied reply text.
+type fakeGatewayBackend struct {
+	mu       sync.Mutex
+	captured []client.CompletionRequest
+	reply    string
+}
+
+func (g *fakeGatewayBackend) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req client.CompletionRequest
+		_ = json.Unmarshal(body, &req)
+		g.mu.Lock()
+		g.captured = append(g.captured, req)
+		reply := g.reply
+		g.mu.Unlock()
+		resp := client.CompletionResponse{
+			Provider:   "anthropic",
+			Model:      "test-model",
+			OutputText: reply,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+func (g *fakeGatewayBackend) requests() []client.CompletionRequest {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]client.CompletionRequest, len(g.captured))
+	copy(out, g.captured)
+	return out
+}
+
+// TestFireSuggestionAfterRun_AppendsAssistantReplyToMain verifies the GPT
+// review P0 fix: forked suggestion request must include the just-completed
+// assistant reply, otherwise the model predicts the user's "next" message
+// without seeing what the assistant actually said.
+func TestFireSuggestionAfterRun_AppendsAssistantReplyToMain(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "run the failing test"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := &ServerDeps{
+		GW:          client.NewGatewayClient(ts.URL, "test-key"),
+		Suggestions: agent.NewSuggestionState(),
+	}
+
+	main := client.CompletionRequest{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("fix the bug")},
+		},
+		ModelTier: "medium",
+	}
+
+	fireSuggestionAfterRun(context.Background(), deps,
+		"test-agent", "sess1",
+		main, // SpeculationEnabled removed
+		"I'll fix the test in foo.go")
+
+	reqs := gw.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("expected 1 gateway call, got %d", len(reqs))
+	}
+
+	msgs := reqs[0].Messages
+	// Expect 3 messages in this order:
+	//   [0] user="fix the bug"           (the original main turn input)
+	//   [1] assistant="I'll fix the..."  (the just-generated reply — the fix)
+	//   [2] user=SuggestionPrompt        (appended by BuildForkedSuggestionRequest)
+	if len(msgs) != 3 {
+		t.Fatalf("forked request has %d messages, want 3 (user + assistant_reply + SUGGESTION_PROMPT). messages: %+v", len(msgs), msgs)
+	}
+	if msgs[1].Role != "assistant" {
+		t.Errorf("messages[1].Role = %q, want assistant (the just-generated reply)", msgs[1].Role)
+	}
+	if got := messageText(msgs[1]); got != "I'll fix the test in foo.go" {
+		t.Errorf("messages[1] text = %q, want %q (assistant reply)", got, "I'll fix the test in foo.go")
+	}
+
+	sug, ok := deps.Suggestions.Get("sess1")
+	if !ok || sug.Text != "run the failing test" {
+		t.Errorf("SuggestionState entry = %+v, want Text='run the failing test'", sug)
+	}
+}
+
+// TestFireSuggestionAfterRun_EmptyReplySkipsAll guards against the case
+// where loop.Run returned empty text (tool-only turn, partial result).
+// Firing a suggestion with no assistant reply produces a misleading
+// prediction; skip entirely.
+func TestFireSuggestionAfterRun_EmptyReplySkipsAll(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "should never be called"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := &ServerDeps{
+		GW:          client.NewGatewayClient(ts.URL, "test-key"),
+		Suggestions: agent.NewSuggestionState(),
+	}
+	main := client.CompletionRequest{
+		Messages:  []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
+		ModelTier: "medium",
+	}
+
+	fireSuggestionAfterRun(context.Background(), deps,
+		"test-agent", "sess1",
+		main,
+		"") // empty assistantReply
+
+	if got := len(gw.requests()); got != 0 {
+		t.Errorf("gateway called %d times, want 0 (empty reply must skip)", got)
+	}
+	if _, ok := deps.Suggestions.Get("sess1"); ok {
+		t.Error("SuggestionState must remain empty when assistantReply is empty")
+	}
+}
+
+// messageText extracts the text from a Message's MessageContent for
+// assertion purposes. Works across simple-text and multi-block messages
+// by falling back to the JSON form if Text() is unavailable.
+func messageText(m client.Message) string {
+	// MessageContent has Text() helper for text-only payloads.
+	if t := m.Content.Text(); t != "" {
+		return t
+	}
+	// Fallback — JSON-encode and let the test assert by substring.
+	b, _ := json.Marshal(m.Content)
+	return string(b)
+}
+
+// TestFireSuggestionAfterRun_StaleGoroutineDoesNotResurrect simulates the
+// detached-goroutine race the GPT review flagged as P0/P1: a new turn
+// starts (Clear) while the previous turn's suggestion goroutine is still
+// blocked on the gateway. The late Set must be dropped, not resurrected.
+func TestFireSuggestionAfterRun_StaleGoroutineDoesNotResurrect(t *testing.T) {
+	// Gate the fake gateway on a channel so we can interleave Clear()
+	// in the middle of the gateway call.
+	startResp := make(chan struct{})
+	gw := &fakeGatewayBackend{} // reply set just before unblocking
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req client.CompletionRequest
+		_ = json.Unmarshal(body, &req)
+		gw.mu.Lock()
+		gw.captured = append(gw.captured, req)
+		gw.mu.Unlock()
+
+		<-startResp // wait for test to clear state and unblock us
+
+		resp := client.CompletionResponse{
+			Provider:   "anthropic",
+			Model:      "test",
+			OutputText: "stale suggestion text",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	deps := &ServerDeps{
+		GW:          client.NewGatewayClient(ts.URL, "test"),
+		Suggestions: agent.NewSuggestionState(),
+	}
+	main := client.CompletionRequest{
+		Messages:  []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
+		ModelTier: "medium",
+	}
+
+	// Fire the suggestion goroutine. It will block in the fake gateway
+	// handler until we send on startResp.
+	done := make(chan struct{})
+	go func() {
+		fireSuggestionAfterRun(context.Background(), deps,
+			"test-agent", "sess1",
+			main,
+			"I just replied to you")
+		close(done)
+	}()
+
+	// Wait briefly to ensure the goroutine has captured CurrentGen
+	// (it does so before the gateway call returns).
+	time.Sleep(20 * time.Millisecond)
+
+	// Simulate the new-turn lifecycle: Clear bumps the generation.
+	deps.Suggestions.Clear("sess1")
+
+	// Unblock the gateway handler. Goroutine now proceeds with its
+	// stale-gen SetIfFresh call.
+	close(startResp)
+	<-done
+
+	if _, ok := deps.Suggestions.Get("sess1"); ok {
+		t.Error("stale goroutine resurrected SuggestionState after Clear — race not prevented")
 	}
 }

@@ -1,5 +1,5 @@
 {
-  "name": "@kocoro/shanclaw",
+  "name": "@kocoro/kocoro",
   "version": "0.0.0",
   "description": "AI-powered CLI agent with local tools, permissions, and session management",
   "bin": {
@@ -18,9 +18,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/Kocoro-lab/ShanClaw"
+    "url": "https://github.com/Kocoro-lab/Kocoro"
   },
-  "homepage": "https://github.com/Kocoro-lab/ShanClaw",
+  "homepage": "https://github.com/Kocoro-lab/Kocoro",
   "keywords": [
     "cli",
     "ai",

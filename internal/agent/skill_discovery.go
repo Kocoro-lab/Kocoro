@@ -38,7 +38,7 @@ var policySkillMarkers = []string{
 // but hardened with a calendar veto for the most common FP source.
 //
 // Tiers:
-//   anchors       — unique ShanClaw/infra terms, fire on sight, immune to veto
+//   anchors       — unique Kocoro/infra terms, fire on sight, immune to veto
 //   strong nouns  — platform indicators that can also appear elsewhere
 //                   (e.g. "insurance agent"); EN matched by word boundary
 //   verbs         — generic action words; only scored when paired with a

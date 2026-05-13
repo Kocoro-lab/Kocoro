@@ -238,7 +238,15 @@ func truncatePromptPreview(s string) string {
 		budget = 0
 	}
 	truncated := s[:budget]
-	for len(truncated) > 0 && !utf8.ValidString(truncated) {
+	// UTF-8 runes are at most 4 bytes; a cut lands at most 3 bytes into a
+	// partial sequence. Walk back to the last valid rune boundary in O(1)
+	// per step, bounded to 3 iterations. (The prior utf8.ValidString loop
+	// rescanned the whole prefix each step — O(n²) on adversarial input.)
+	for i := 0; i < 3 && len(truncated) > 0; i++ {
+		r, size := utf8.DecodeLastRuneInString(truncated)
+		if r != utf8.RuneError || size > 1 {
+			break
+		}
 		truncated = truncated[:len(truncated)-1]
 	}
 	return truncated + marker

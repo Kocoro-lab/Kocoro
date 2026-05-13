@@ -77,12 +77,12 @@ func RunPendingMigrations(shannonDir string) {
 	lockPath := filepath.Join(shannonDir, migrationsLockName)
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "shanclaw: open migrations lock: %v (skipping migrations)\n", err)
+		fmt.Fprintf(os.Stderr, "kocoro: open migrations lock: %v (skipping migrations)\n", err)
 		return
 	}
 	defer lockFile.Close()
 	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		fmt.Fprintf(os.Stderr, "shanclaw: lock migrations: %v (skipping migrations)\n", err)
+		fmt.Fprintf(os.Stderr, "kocoro: lock migrations: %v (skipping migrations)\n", err)
 		return
 	}
 	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
@@ -96,7 +96,7 @@ func RunPendingMigrations(shannonDir string) {
 			continue
 		}
 		if _, err := m.Apply(shannonDir); err != nil {
-			fmt.Fprintf(os.Stderr, "shanclaw: migration %s failed: %v (will retry on next launch)\n", m.ID(), err)
+			fmt.Fprintf(os.Stderr, "kocoro: migration %s failed: %v (will retry on next launch)\n", m.ID(), err)
 			continue
 		}
 		state.Applied[m.ID()] = migrationRecord{AppliedAt: time.Now().UTC().Format(time.RFC3339)}
@@ -106,7 +106,7 @@ func RunPendingMigrations(shannonDir string) {
 			// re-execute Apply on the next launch — for migrations whose
 			// Apply is idempotent (the only kind we accept) this is a
 			// benign no-op (probe sees the new value, returns early).
-			fmt.Fprintf(os.Stderr, "shanclaw: persist migrations.json: %v (migration %s will re-run on next launch)\n", err, m.ID())
+			fmt.Fprintf(os.Stderr, "kocoro: persist migrations.json: %v (migration %s will re-run on next launch)\n", err, m.ID())
 		}
 	}
 }

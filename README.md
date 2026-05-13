@@ -1,4 +1,4 @@
-# ShanClaw (`shan`)
+# Kocoro (`shan`)
 
 AI agent runtime powered by Shannon. Daemon mode connects to Shannon Cloud via WebSocket for channel messaging (Slack, LINE, Feishu, Telegram, webhook), with local tool execution and streaming results. Also provides interactive TUI, one-shot CLI, and MCP server. Named agents with independent instructions/memory, local tools for macOS computer control, MCP client for third-party integrations (GitHub, databases, etc.), local scheduled tasks via launchd, and remote research/swarm orchestration via the Shannon Gateway API.
 
@@ -12,7 +12,7 @@ Interactive diagram of how the daemon, Shannon Cloud, MCP servers, and local too
 ### Option A: npm (Recommended)
 
 ```bash
-npm install -g @kocoro/shanclaw
+npm install -g @kocoro/kocoro
 ```
 
 Auto-updates on every launch — no manual upgrading needed.
@@ -22,7 +22,7 @@ Auto-updates on every launch — no manual upgrading needed.
 Downloads the latest release binary to `/usr/local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kocoro-lab/ShanClaw/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Kocoro-lab/Kocoro/main/install.sh | sh
 ```
 
 ### Option C: Build from Source
@@ -30,8 +30,8 @@ curl -fsSL https://raw.githubusercontent.com/Kocoro-lab/ShanClaw/main/install.sh
 Requires **Go 1.25+**:
 
 ```bash
-git clone https://github.com/Kocoro-lab/ShanClaw.git
-cd ShanClaw
+git clone https://github.com/Kocoro-lab/Kocoro.git
+cd Kocoro
 go install .
 ```
 
@@ -55,12 +55,12 @@ shan auto-updates when you launch it. You can also update explicitly:
 
 ```bash
 shan update              # manual update
-npm update -g @kocoro/shanclaw  # if installed via npm (re-runs postinstall to fetch latest)
+npm update -g @kocoro/kocoro  # if installed via npm (re-runs postinstall to fetch latest)
 ```
 
 ## Setup
 
-ShanClaw requires a Gateway API for LLM completions and remote tools.
+Kocoro requires a Gateway API for LLM completions and remote tools.
 
 **Option A: Shannon Cloud** — get an API key from [shannon.run](https://shannon.run):
 
@@ -97,7 +97,7 @@ ollama:
   model: "llama3.1"
 ```
 
-When `provider: ollama` is set, ShanClaw connects to Ollama's OpenAI-compatible API. Standard function tools work; native Anthropic tool types (computer use) are not available. Thinking models (e.g. Qwen3) are supported — reasoning output is surfaced with a `[thinking]` prefix.
+When `provider: ollama` is set, Kocoro connects to Ollama's OpenAI-compatible API. Standard function tools work; native Anthropic tool types (computer use) are not available. Thinking models (e.g. Qwen3) are supported — reasoning output is surfaced with a `[thinking]` prefix.
 
 ## Quick Start
 
@@ -435,7 +435,7 @@ Tool call from LLM
 
 ### Tool Result Sizing
 
-ShanClaw protects context window pressure with three layered caps:
+Kocoro protects context window pressure with three layered caps:
 
 - **Per-result spill**: any single tool result over ~50K characters is written to a temp file under `~/.shannon/tmp/` and replaced in-context with a 2K preview plus the file path. Cleaned up per-run (daemon/TUI) or on manager close (one-shot).
 - **Per-turn aggregate cap**: when a turn returns more than 200K characters total across all parallel tool calls, the largest results are spilled until the aggregate drops back under the cap (counted in runes, so multibyte content is measured fairly).
@@ -835,7 +835,7 @@ The filter applies to all tool sources (local, MCP, gateway). If both `allow` an
 
 ### Project Context and `cwd`
 
-ShanClaw uses a session-scoped working directory (`cwd`) to decide which project a run is operating in.
+Kocoro uses a session-scoped working directory (`cwd`) to decide which project a run is operating in.
 
 This affects:
 
@@ -924,6 +924,8 @@ Skills are listed in the system prompt (name + description only). The LLM activa
 Attached agent skills also appear as `/summarize` slash commands in the TUI.
 
 **Skill secrets.** Skills that need API keys declare required env vars in their ClawHub metadata (`metadata.openclaw.requires.env` / `metadata.clawdbot.requires.env` / `metadata.clawdis.requires.env`). Values are stored in the macOS Keychain — never on disk, never in the prompt or session transcript — and scoped to active skills only: a skill that is installed but never activated via `use_skill` contributes no env vars to `bash`. Manage keys over the daemon API (`PUT/DELETE /skills/{name}/secrets`); `GET /skills` returns `required_secrets` and `configured_secrets` (names only, never values).
+
+**Installing from a local ZIP.** Beyond the ClawHub marketplace, the daemon accepts a direct upload via `POST /skills/upload` (multipart, 50 MB cap). Unwraps a GitHub/Finder single-top-level-dir layout, strips `__MACOSX`, inherits the marketplace extractor's zipbomb / symlink / path-escape guards, and serializes concurrent uploads of the same slug. On slug collision returns a 409 with a side-by-side compare body (existing vs. uploaded name / description / prompt, prompts capped at 8 KB) so Kocoro Desktop can render a compare sheet; re-issue with `?force=true` to overwrite (crash-safe rename-to-backup + atomic rename, backup removed on success). Uploads targeting the `kocoro` / `kocoro-generative-ui` builtins are rejected unconditionally — the daemon re-overlays builtins from the binary on every startup, so an upload there would be reverted.
 
 ### Using Agents
 
@@ -1035,9 +1037,34 @@ curl -X POST http://localhost:7533/message \
 
 **Bridging a messaging platform (Discord, Matrix, custom webhook, etc.) to the daemon?** See the [Channel Integration Guide](examples/channel-integration-guide.md) for the full `POST /message` + SSE + interactive approval workflow, plus a community reference Discord bot. Official Slack/LINE/Feishu/Lark integrations go through Shannon Cloud for multi-tenant OAuth and audit — the local HTTP path here is for personal/dev deployments.
 
+### Prompt Suggestion (ghost text in input)
+
+When enabled, Kocoro's daemon generates a 2-12 word suggestion for your
+next message after each agent turn. Desktop renders it as gray placeholder
+text in the input — press the right arrow (or Tab) to accept, then edit if needed.
+
+**To enable:**
+
+```yaml
+# ~/.shannon/config.yaml
+agent:
+  prompt_suggestion:
+    enabled: true
+```
+
+Or toggle from Desktop: Settings → Suggestions → Enable next-prompt suggestion.
+
+**Cost:** Depends on whether `agent.thinking` is enabled. Without thinking,
+each suggestion call is cheap (≈ 5-20% of one main-turn — input mostly
+cache_read, output capped at ~30 tokens by the filter). With thinking
+enabled, the fork inherits the same `thinking.budget_tokens` (cannot be
+trimmed without invalidating Anthropic's cache key), so cost rises to
+≈ 50-90% of one main-turn. Disabled by default. Skipped when the prompt
+cache is cold (see `cache_cold_threshold_tokens`).
+
 ## Memory (Kocoro Cloud feature)
 
-ShanClaw includes a `memory_recall` tool that lets the agent look up facts
+Kocoro includes a `memory_recall` tool that lets the agent look up facts
 learned from prior sessions before asking the user. The structured memory
 runs as a local sidecar over a Unix socket; the daemon manages spawn,
 readiness, restart, and bundle pull. Episodic Memory is **opt-in** —
@@ -1071,7 +1098,7 @@ editing `memory.provider`/`sync.enabled` directly). Three modes:
 
 ### Implicit episodic preflight
 
-Before the first main-model call on a memory-relevant turn, ShanClaw runs an
+Before the first main-model call on a memory-relevant turn, Kocoro runs an
 implicit preflight: a small-tier helper compiles `QueryIntent`s via forced
 `tool_use`, the sidecar resolves them, and a `<private_memory>` block is
 injected into the current user message before it reaches the main model.
@@ -1116,7 +1143,7 @@ tenant does not leak.
 
 ## Session sync to Cloud
 
-ShanClaw can upload local session JSON to Shannon Cloud once per day to power Cloud-side analytics, replay, and per-user memory training. **Opt-in** — disabled by default; the Kocoro Desktop Episodic Memory toggle flips this on. To enable manually, set `sync.enabled: true` and provide Cloud credentials.
+Kocoro can upload local session JSON to Shannon Cloud once per day to power Cloud-side analytics, replay, and per-user memory training. **Opt-in** — disabled by default; the Kocoro Desktop Episodic Memory toggle flips this on. To enable manually, set `sync.enabled: true` and provide Cloud credentials.
 
 **What's uploaded:** the full session JSON files under `~/.shannon/sessions/` and `~/.shannon/agents/*/sessions/`. Sessions are sent as-is — there is no built-in PII or secret redaction in v1. Skill secrets are never included (they live in the macOS Keychain, never in transcripts), but tool output, file contents, and bash command results are uploaded verbatim.
 

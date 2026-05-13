@@ -90,7 +90,7 @@ func (h *RootsHandler) clientOption() mcpclient.ClientOption {
 	return mcpclient.WithRootsHandler(h)
 }
 
-// DefaultWorkspaceRootCandidates returns the baseline roots ShanClaw
+// DefaultWorkspaceRootCandidates returns the baseline roots Kocoro
 // advertises for any MCP server with roots support: the daemon's attachment
 // staging directory (so materialized inline-image attachments are uploadable
 // via browser_file_upload) plus the common user-visible directories people
