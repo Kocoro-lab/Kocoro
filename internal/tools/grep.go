@@ -20,7 +20,10 @@ import (
 )
 
 const (
-	defaultGrepMaxResults = 250
+	// defaultGrepMaxResults: bumped 250 → 500 to align with raised viper default
+	// (see internal/config/config.go). "Find all TODOs in this repo" routinely
+	// returns 400-800 hits; 250 was silently truncating.
+	defaultGrepMaxResults = 500
 	grepPerFileMaxCount   = 50
 	grepTimeout           = 30 * time.Second
 )

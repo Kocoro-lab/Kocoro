@@ -1856,14 +1856,17 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// force-stop. Window of 5 means a productive iteration ages out the
 	// oldest nudge, restoring "self-recovery" headroom.
 	const (
-		maxNudges        = 3
-		nudgeWindowIters = 5
+		maxNudges        = 3  // unchanged — still a meaningful runaway-loop signal
+		nudgeWindowIters = 10 // bumped 5 → 10 — multi-file refactors with 15+ read→edit cycles need a wider window to avoid spurious force-stops
 	)
 
 	// Approval cache: tracks tool+args combos the user already approved this turn
 	approvalCache := NewApprovalCache()
 
-	const maxContinuations = 3 // cap max_tokens continuation attempts
+	// maxContinuations: bumped 3 → 8 — with 32K max_tokens default, a long
+	// structured report can need 4-6 continuations on cold-cache turns. 3 was
+	// silently truncating outputs.
+	const maxContinuations = 8 // cap max_tokens continuation attempts
 
 	// batch-tolerant set: bash + READ-verb MCP tool names only. On these
 	// tools, the NoProgress detector applies a uniqueness gate so
@@ -3024,6 +3027,15 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				})
 				stampMessage()
 				continue
+			}
+			// Silent truncation is the worst UX failure of max_tokens — surface
+			// it to subscribers so the user knows their report was cut short.
+			if isTruncated && continuationCount >= maxContinuations {
+				if rs, ok := a.handler.(RunStatusHandler); ok {
+					rs.OnRunStatus("max_tokens_truncated",
+						fmt.Sprintf("hit continuation cap (%d/%d); output may be truncated",
+							continuationCount, maxContinuations))
+				}
 			}
 
 			if afterCheckpoint {

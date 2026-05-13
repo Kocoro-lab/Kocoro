@@ -7,7 +7,10 @@ import (
 	"time"
 )
 
-const maxToolConcurrency = 10
+// maxToolConcurrency: bumped 10 → 20 — "read 14 files in parallel" was
+// getting split into 2 round-trips (10 + 4) wasting a cache cycle. 20 is
+// still well within Anthropic's per-request parallel-call sanity range.
+const maxToolConcurrency = 20
 
 // isReadOnly checks if a tool call is read-only by testing the ReadOnlyChecker
 // optional interface. Tools without the interface default to false (fail-closed).

@@ -190,6 +190,20 @@ When a feature is added, refactored, or significantly changed, check and update 
 - **CLAUDE.md** — developer-facing: project structure tree, conventions, file paths, architecture notes
 - **AGENTS.md** — external-agent-facing: overlaps with CLAUDE.md (structure tree, conventions, tool inventory). Keep in sync.
 
+### Hardcoded Limit Policy
+
+When introducing a `const max[A-Z]\w+ = <small_int>` (count caps, retention windows, retry counts, concurrency caps), the comment MUST name:
+1. **The user workload that justifies the value** (e.g., "5 screenshots covers typical desktop use").
+2. **The symptom when it binds** (e.g., "model says '未能全部展示' on batch read"), so the next reader can recognize the breakage.
+3. **The path to override** (config key name, env var, or "not user-configurable — file an issue").
+
+This convention exists because of postmortems on `maxRecentImages = 5` (a 200K-context-era default that silently truncated "read all 14 screenshots" tasks on 1M-context families until #135 surfaced it) and `maxPDFPages = 2` (a hidden cap on PDF page count). Lessons:
+- CC-derived constants sized for 200K context often need bumping under 1M-context defaults — re-check whenever the model family upgrades.
+- "Conservative because we couldn't test the upper bound" is a smell — at minimum, run a bench at 3-5× the current value before adopting it as the default.
+- Hidden caps without a config override are the worst — they bite power users who can't even discover the dial. Prefer `viper.SetDefault(...)` over `const` when in doubt.
+
+When reviewing PRs that add small-integer caps, ask: "What user request fails when this binds, and does that user have any way to opt past it?"
+
 ### Auto-installed Builtin Skills
 
 Skills listed in `builtinSkills` (`internal/skills/api.go`) are synced from `embed.FS` to `~/.shannon/skills/<name>/` on every daemon/TUI/CLI startup via `EnsureBuiltinSkills`. The mechanism is content-addressed: a sha256 walk over the embed subtree is compared against the on-disk subtree, and any drift triggers a wipe-and-overlay (per-file `temp+rename`, dest-dir `RemoveAll` first to evict orphans). Concurrent callers serialize on `~/.shannon/skills/.builtin.lock`. User edits to a builtin SKILL.md are wiped on next startup — fork under a different skill name to customize. Current builtins:

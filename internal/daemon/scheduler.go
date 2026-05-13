@@ -13,7 +13,10 @@ import (
 	"github.com/adhocore/gronx"
 )
 
-const maxConcurrentSchedules = 5
+// maxConcurrentSchedules: bumped 5 → 20. User with 20 cron schedules hitting
+// the same minute boundary would have 15 serialize behind the first 5; raising
+// to 20 matches the daemon's attachment-per-message cap.
+const maxConcurrentSchedules = 20
 
 // Scheduler evaluates cron schedules each minute and fires RunAgent for due entries.
 type Scheduler struct {

@@ -25,10 +25,13 @@ var imageReadExtensions = map[string]bool{
 // maxImageReadSize is the maximum file size for image reads (20 MB).
 const maxImageReadSize = 20 * 1024 * 1024
 
-// maxPDFPages is the maximum number of pages rendered per file_read call.
-// Kept low (2) to avoid exceeding gateway body size limits — each page is
-// ~100-300KB as JPEG. Agent can use offset to read more pages.
-const maxPDFPages = 2
+// maxPDFPages is the number of pages rendered per file_read call. Was 2 —
+// too low for "review this 20-page contract" use cases (model would silently
+// see only pages 0-1). Raised to 10. Callers can still pass `limit` to cap
+// further, and `offset` to start mid-document, but the default should be
+// useful for typical small-to-mid PDFs (≤10 pages covers most invoices,
+// proposals, receipts).
+const maxPDFPages = 10
 
 // pdfPageMaxDim is the max pixel dimension for rendered PDF pages.
 const pdfPageMaxDim = 1024

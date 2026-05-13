@@ -230,7 +230,10 @@ func Load() (*Config, error) {
 	viper.SetDefault("api_key", "")
 	viper.SetDefault("model_tier", "medium")
 	viper.SetDefault("auto_update_check", true)
-	viper.SetDefault("agent.max_iterations", 25)
+	// agent.max_iterations: bumped 25 → 40 — typical "refactor 12 files" or
+	// "batch-process 20 attachments" tasks routinely need >25 iterations.
+	// User-configurable per agent; this is just the default.
+	viper.SetDefault("agent.max_iterations", 40)
 	viper.SetDefault("agent.temperature", 0)
 	viper.SetDefault("agent.max_tokens", 32000)
 	viper.SetDefault("agent.thinking", true)
@@ -260,7 +263,11 @@ func Load() (*Config, error) {
 	viper.SetDefault("tools.result_truncation", 30000)
 	viper.SetDefault("tools.args_truncation", 200)
 	viper.SetDefault("tools.server_tool_timeout", 5)
-	viper.SetDefault("tools.grep_max_results", 100)
+	// tools.grep_max_results: bumped 100 → 500 to match code default in
+	// internal/tools/grep.go. Old viper default 100 was BELOW the code
+	// default 250, which is a confusing override-down. Now both sources of
+	// truth agree.
+	viper.SetDefault("tools.grep_max_results", 500)
 	viper.SetDefault("daemon.auto_approve", false)
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	viper.SetDefault("cloud.enabled", true)
