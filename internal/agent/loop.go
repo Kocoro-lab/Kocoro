@@ -1112,8 +1112,14 @@ func (a *AgentLoop) messagesForLLM(messages []client.Message) []client.Message {
 	// Wire-time guard: drop any image whose base64 exceeds Anthropic's 5 MB
 	// inline limit. Covers all CompletionRequest paths (main loop, retry,
 	// force-stop synthesis) with one call. Without this, an oversize image
-	// surviving Layer 1 jams every retry with 400. Operates on `out` (the
-	// budget-adjusted copy) so we don't mutate the caller's slice.
+	// surviving Layer 1 jams every retry with 400.
+	//
+	// `out` may share its backing array with the caller's `messages` slice
+	// when `applyToolResultBudget` returned changed=false (no clone). That is
+	// fine and arguably desirable: the sanitization persists across iterations
+	// instead of having to re-run on the same poisoned message. Every mutation
+	// is logged via `LogCacheCompactEvent("img_oversize_strip", ...)` so the
+	// cache-debug diff path remains complete (see CLAUDE.md "Prompt Cache").
 	filterOversizeImages(out)
 	return out
 }

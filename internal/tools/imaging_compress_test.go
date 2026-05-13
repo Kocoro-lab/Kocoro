@@ -7,6 +7,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -158,5 +159,46 @@ func TestCompressInlineImageSource_SmallPassesThroughUntouched(t *testing.T) {
 	out := CompressInlineImageSource(src)
 	if out != src {
 		t.Fatal("small source should be returned unchanged (same pointer)")
+	}
+}
+
+func TestCompressInlineImageSource_TooLargeInputReturnsUnchangedSrc(t *testing.T) {
+	// Input larger than MaxInlineBase64InputBytes (30 MB) should be returned
+	// unchanged (same pointer) — the function refuses to allocate for it.
+	// Layer 2 (filterOversizeImages) will replace it with a placeholder downstream.
+	huge := strings.Repeat("A", MaxInlineBase64InputBytes+1)
+	src := &client.ImageSource{Type: "base64", MediaType: "image/png", Data: huge}
+	out := CompressInlineImageSource(src)
+	if out != src {
+		t.Fatal("input over MaxInlineBase64InputBytes should return src unchanged (same pointer)")
+	}
+}
+
+func TestCompressInlineImageSource_GarbageBase64ReturnsUnchangedSrc(t *testing.T) {
+	// base64 decode failure → return src unchanged. Caller (Layer 2) gets the
+	// chance to wipe with a placeholder.
+	garbage := strings.Repeat("@", client.MaxInlineImageBase64Bytes+10) // not valid base64
+	src := &client.ImageSource{Type: "base64", MediaType: "image/png", Data: garbage}
+	out := CompressInlineImageSource(src)
+	if out != src {
+		t.Fatal("undecodable base64 should return src unchanged (same pointer)")
+	}
+}
+
+func TestCompressInlineImageSource_UndecodableImageReturnsUnchangedSrc(t *testing.T) {
+	// base64 decodes fine but the bytes are not a recognized image format →
+	// compressImage fails, function returns src unchanged.
+	// Raw size must produce base64 encoding > MaxInlineImageBase64Bytes (5 MB)
+	// to bypass the fast path, but stay under MaxInlineBase64InputBytes (30 MB)
+	// so we reach the actual decode/compress branch.
+	notAnImage := bytes.Repeat([]byte{0xFF}, client.MaxInlineImageBase64Bytes)
+	encoded := base64.StdEncoding.EncodeToString(notAnImage)
+	if len(encoded) <= client.MaxInlineImageBase64Bytes {
+		t.Fatalf("fixture must exceed inline cap to enter the compression branch; len=%d", len(encoded))
+	}
+	src := &client.ImageSource{Type: "base64", MediaType: "image/png", Data: encoded}
+	out := CompressInlineImageSource(src)
+	if out != src {
+		t.Fatal("undecodable image bytes should return src unchanged (same pointer)")
 	}
 }
