@@ -25,13 +25,13 @@ var imageReadExtensions = map[string]bool{
 // maxImageReadSize is the maximum file size for image reads (20 MB).
 const maxImageReadSize = 20 * 1024 * 1024
 
-// maxPDFPages is the number of pages rendered per file_read call. Was 2 —
-// too low for "review this 20-page contract" use cases (model would silently
-// see only pages 0-1). Raised to 10. Callers can still pass `limit` to cap
-// further, and `offset` to start mid-document, but the default should be
-// useful for typical small-to-mid PDFs (≤10 pages covers most invoices,
-// proposals, receipts).
-const maxPDFPages = 10
+// maxPDFPages is the number of pages rendered per file_read call. Matches
+// Claude Code's PDF_MAX_PAGES_PER_READ (src/constants/apiLimits.ts = 20).
+// Was 2 originally — too low for "review this 20-page contract" use cases
+// (model would silently see only pages 0-1). Raised to 10, then to 20 for
+// CC parity. Callers can pass `pages` ("1-20", "3", "10-20") or `limit` to
+// cap further, and `offset`/`pages` to start mid-document.
+const maxPDFPages = 20
 
 // pdfPageMaxDim is the max pixel dimension for rendered PDF pages.
 const pdfPageMaxDim = 1024
@@ -53,21 +53,26 @@ type fileReadArgs struct {
 	Description string `json:"description,omitempty"`
 	Offset      int    `json:"offset,omitempty"`
 	Limit       int    `json:"limit,omitempty"`
+	Pages       string `json:"pages,omitempty"`
 }
 
 func (t *FileReadTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:               "file_read",
 		MaxResultSizeChars: agent.UnlimitedToolResultSizeChars,
-		Description: "Read a file's contents with line numbers. Use offset and limit for large files. Repeat reads of the same (path, offset, limit) within one session return a short \"unchanged since last read\" stub when the file has not been modified — to force a fresh read, modify the file or pass a different offset/limit range. For image files (png/jpg/gif/webp), returns the image for vision analysis. For PDF files, renders pages as images for vision analysis (use offset for start page, limit for max pages)." +
+		Description: "Read a file's contents with line numbers. Use offset and limit for large files. Repeat reads of the same (path, offset, limit) within one session return a short \"unchanged since last read\" stub when the file has not been modified — to force a fresh read, modify the file or pass a different offset/limit range. For image files (png/jpg/gif/webp), returns the image for vision analysis. For PDF files, renders pages as images for vision analysis. Prefer the `pages` parameter (e.g., pages=\"1-10\" or pages=\"7-15\") for PDF page selection; offset/limit also work for sequential reading." +
 			agent.DescriptionGuidance,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path":        map[string]any{"type": "string", "description": "Absolute or relative file path"},
 				"description": agent.DescriptionFieldSpec,
-				"offset":      map[string]any{"type": "integer", "description": "Start line (0-based, default 0). For PDF: start page (0-based)."},
-				"limit":       map[string]any{"type": "integer", "description": "Max lines to read (default: all). For PDF: max pages to render (default: 2)."},
+				"offset":      map[string]any{"type": "integer", "description": "Start line (0-based, default 0). For PDF: start page (0-based). Ignored when 'pages' is set."},
+				"limit":       map[string]any{"type": "integer", "description": "Max lines to read (default: all). For PDF: max pages to render (default: 2). Ignored when 'pages' is set."},
+				"pages": map[string]any{
+					"type":        "string",
+					"description": fmt.Sprintf("Page range for PDF files (e.g., \"1-5\", \"3\", \"10-20\"). Maximum %d pages per range. When set, overrides offset/limit. Pages are 1-indexed (page 1 is the first page).", maxPDFPages),
+				},
 			},
 		},
 		Required: []string{"path", "description"},
@@ -98,6 +103,13 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 
 	// PDF files: render pages as images for vision analysis.
 	if ext == ".pdf" {
+		if args.Pages != "" {
+			start0, count, perr := parsePDFPageRange(args.Pages)
+			if perr != nil {
+				return agent.ToolResult{Content: perr.Error(), IsError: true}, nil
+			}
+			return t.readPDF(args.Path, start0, count)
+		}
 		return t.readPDF(args.Path, args.Offset, args.Limit)
 	}
 
@@ -389,13 +401,59 @@ for i in start..<(start + count) {
 		fmt.Fprintf(&sb, "\n[Warning: %d page(s) failed to encode and were skipped]", skipped)
 	}
 	if startPage+len(images) < totalPages {
-		fmt.Fprintf(&sb, "\n[Use offset=%d to read the next pages]", startPage+len(images))
+		nextStartOneIndexed := startPage + len(images) + 1
+		nextEndOneIndexed := nextStartOneIndexed + maxPDFPages - 1
+		if nextEndOneIndexed > totalPages {
+			nextEndOneIndexed = totalPages
+		}
+		fmt.Fprintf(&sb, "\n[Next pages: use pages=\"%d-%d\" or offset=%d to continue]",
+			nextStartOneIndexed, nextEndOneIndexed, startPage+len(images))
 	}
 
 	return agent.ToolResult{
 		Content: sb.String(),
 		Images:  images,
 	}, nil
+}
+
+// parsePDFPageRange parses CC-style PDF page-range syntax used by the `pages`
+// parameter. Accepts:
+//
+//	"3"     → single page 3 → returns (start=2, count=1)
+//	"1-5"   → pages 1..5    → returns (start=0, count=5)
+//	"10-20" → pages 10..20  → returns (start=9, count=11)
+//
+// Pages are 1-indexed in the parameter (matches CC + claude.ai user expectation).
+// Returns an error if format is invalid OR count exceeds maxPDFPages.
+// Returns (start, count) where start is 0-indexed for the Swift renderer.
+func parsePDFPageRange(pages string) (start0Indexed int, count int, err error) {
+	trimmed := strings.TrimSpace(pages)
+	if trimmed == "" {
+		return 0, 0, fmt.Errorf("pages parameter is empty")
+	}
+	// Single page: "3"
+	if !strings.Contains(trimmed, "-") {
+		p, perr := strconv.Atoi(trimmed)
+		if perr != nil || p < 1 {
+			return 0, 0, fmt.Errorf("invalid page number %q: expected positive integer or range like \"1-5\"", pages)
+		}
+		return p - 1, 1, nil
+	}
+	// Range: "10-20"
+	parts := strings.SplitN(trimmed, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid page range %q: expected format \"START-END\" (e.g., \"1-5\")", pages)
+	}
+	startP, e1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	endP, e2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if e1 != nil || e2 != nil || startP < 1 || endP < startP {
+		return 0, 0, fmt.Errorf("invalid page range %q: expected positive START ≤ END (e.g., \"1-5\")", pages)
+	}
+	rangeSize := endP - startP + 1
+	if rangeSize > maxPDFPages {
+		return 0, 0, fmt.Errorf("page range %q spans %d pages, exceeds maximum of %d per request — split into smaller ranges", pages, rangeSize, maxPDFPages)
+	}
+	return startP - 1, rangeSize, nil
 }
 
 func (t *FileReadTool) RequiresApproval() bool { return true }

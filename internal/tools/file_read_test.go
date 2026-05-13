@@ -387,6 +387,52 @@ func TestFileRead_DedupSameFile_FileModified(t *testing.T) {
 	}
 }
 
+// TestParsePDFPageRange_SinglePage: "3" → start=2, count=1 (1-indexed param,
+// 0-indexed start for the Swift renderer).
+func TestParsePDFPageRange_SinglePage(t *testing.T) {
+	start, count, err := parsePDFPageRange("3")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if start != 2 || count != 1 {
+		t.Fatalf("expected start=2 count=1, got start=%d count=%d", start, count)
+	}
+}
+
+// TestParsePDFPageRange_Range: "10-20" → start=9, count=11 (inclusive range).
+func TestParsePDFPageRange_Range(t *testing.T) {
+	start, count, err := parsePDFPageRange("10-20")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if start != 9 || count != 11 {
+		t.Fatalf("expected start=9 count=11, got start=%d count=%d", start, count)
+	}
+}
+
+// TestParsePDFPageRange_ExceedsMax: range > maxPDFPages must error with a
+// message that nudges toward smaller ranges.
+func TestParsePDFPageRange_ExceedsMax(t *testing.T) {
+	_, _, err := parsePDFPageRange("1-100")
+	if err == nil {
+		t.Fatal("expected error for range > maxPDFPages, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("error should mention 'exceeds maximum', got: %v", err)
+	}
+}
+
+// TestParsePDFPageRange_Invalid: empty / non-numeric / inverted / zero / partial
+// inputs must all error.
+func TestParsePDFPageRange_Invalid(t *testing.T) {
+	cases := []string{"", "abc", "5-3", "0-5", "-5", "1-", "1--5"}
+	for _, in := range cases {
+		if _, _, err := parsePDFPageRange(in); err == nil {
+			t.Errorf("expected error for input %q, got nil", in)
+		}
+	}
+}
+
 // TestFileRead_DedupSameFile_NoTracker: without a tracker in context, dedup
 // is a no-op (always returns full content).
 func TestFileRead_DedupSameFile_NoTracker(t *testing.T) {
