@@ -96,13 +96,19 @@ func TestCompressImage_HugeImage_UnderInlineLimit(t *testing.T) {
 }
 
 func TestCompressImage_DecodesByMagicNotExtension(t *testing.T) {
-	img := image.NewRGBA(image.Rect(0, 0, 50, 50))
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, img, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := compressImage(buf.Bytes(), "application/octet-stream"); err != nil {
+	// Use an oversize PNG with a lying media type. The function must ignore
+	// the media-type hint and route to image.Decode (which sniffs magic
+	// bytes), then re-encode as JPEG under the inline limit.
+	raw := makeNoisePNG(t, 1800, 1800)
+	data, mt, err := compressImage(raw, "application/octet-stream")
+	if err != nil {
 		t.Fatalf("compressImage with unknown media type errored: %v", err)
+	}
+	if mt != "image/jpeg" {
+		t.Fatalf("expected JPEG output (decode-by-magic + re-encode), got %q", mt)
+	}
+	if encoded := base64.StdEncoding.EncodedLen(len(data)); encoded > client.MaxInlineImageBase64Bytes {
+		t.Fatalf("encoded base64 over inline limit: %d", encoded)
 	}
 }
 

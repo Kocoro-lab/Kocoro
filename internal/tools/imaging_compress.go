@@ -67,6 +67,12 @@ func downscaleToFit(img image.Image, max int) image.Image {
 		newH = max
 		newW = w * max / h
 	}
+	if newW < 1 {
+		newW = 1
+	}
+	if newH < 1 {
+		newH = 1
+	}
 	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
 	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
 	return dst
