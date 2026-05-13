@@ -618,6 +618,14 @@ type ImageSource struct {
 	Data      string `json:"data"`
 }
 
+// MaxInlineImageBase64Bytes is Anthropic's per-image inline base64 payload
+// ceiling. Anthropic validates the string length of image source.data, so
+// any image whose base64-encoded payload exceeds this triggers HTTP 400
+// "image exceeds 5 MB maximum: <bytes> > 5242880 bytes". Both image
+// producers (tools) and the history sanitizer use this constant to agree
+// on the wire limit.
+const MaxInlineImageBase64Bytes = 5 * 1024 * 1024
+
 // MessageContent holds message content as either a plain string or content blocks.
 type MessageContent struct {
 	text   string
