@@ -76,3 +76,11 @@ func TestFilterOversizeImages_LeavesSmallImagesAlone(t *testing.T) {
 		t.Fatalf("small image wrongly replaced; got type %q", blocks[0].Type)
 	}
 }
+
+func TestSanitizedRunMessages_EmptyInputReturnsEmpty(t *testing.T) {
+	a := &AgentLoop{}
+	got := a.SanitizedRunMessages()
+	if len(got) != 0 {
+		t.Fatalf("expected empty result, got %d entries", len(got))
+	}
+}

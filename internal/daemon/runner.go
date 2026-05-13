@@ -2047,7 +2047,7 @@ func applyTurnMessages(sess *session.Session, loop *agent.AgentLoop, b turnBasel
 	if len(sess.MessageMeta) > b.metaCount {
 		sess.MessageMeta = sess.MessageMeta[:b.metaCount]
 	}
-	runMsgs := loop.RunMessages()
+	runMsgs := loop.SanitizedRunMessages()
 	if len(runMsgs) == 0 {
 		return
 	}

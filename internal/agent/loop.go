@@ -1041,6 +1041,21 @@ func (a *AgentLoop) RunMessages() []client.Message {
 	return out
 }
 
+// SanitizedRunMessages returns a copy of RunMessages with any oversize image
+// blocks replaced by text placeholders. Use before persisting (mid-turn
+// checkpoint or hard-error save) so a 400-causing image never lands on disk
+// and never replays on resume. The in-memory RunMessages is untouched.
+func (a *AgentLoop) SanitizedRunMessages() []client.Message {
+	raw := a.RunMessages()
+	if len(raw) == 0 {
+		return raw
+	}
+	out := make([]client.Message, len(raw))
+	copy(out, raw)
+	filterOversizeImages(out)
+	return out
+}
+
 // SetToolResultReplacements restores session-scoped query-time tool_result
 // replacements. Callers should invoke this before Run() when resuming a
 // persisted session.
