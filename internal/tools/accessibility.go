@@ -259,7 +259,7 @@ func (t *AccessibilityTool) lookupRef(ref string) (refEntry, error) {
 	if ref == "" {
 		return refEntry{}, fmt.Errorf("missing required parameter: ref")
 	}
-	if t.refs == nil || len(t.refs) == 0 {
+	if len(t.refs) == 0 {
 		return refEntry{}, fmt.Errorf("no refs available — call read_tree first")
 	}
 	entry, ok := t.refs[ref]

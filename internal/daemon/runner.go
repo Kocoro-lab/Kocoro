@@ -355,13 +355,15 @@ func buildUserMsgContent(prompt string, resolvedContent []client.ContentBlock) c
 	}
 
 	// Text-only: merge into single string.
-	merged := prompt
+	var sb strings.Builder
+	sb.WriteString(prompt)
 	for _, b := range resolvedContent {
 		if b.Text != "" {
-			merged += "\n\n" + b.Text
+			sb.WriteString("\n\n")
+			sb.WriteString(b.Text)
 		}
 	}
-	return client.NewTextContent(merged)
+	return client.NewTextContent(sb.String())
 }
 
 // hasPDFAttachment returns true if any file_ref block has a .pdf extension.

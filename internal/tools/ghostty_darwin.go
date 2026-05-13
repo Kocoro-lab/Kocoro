@@ -41,7 +41,12 @@ func execGhosttyScript(script string) (string, error) {
 
 // ghosttyNewTab opens a new tab in the frontmost Ghostty window.
 // Returns the window and tab IDs as strings for later reference.
+//
+// The `color` parameter is reserved for future per-tab color customization
+// (Ghostty exposes color attributes on surface configurations); see ghostty.go's
+// caller which already plumbs the value through.
 func ghosttyNewTab(command, title, color string) (windowIdx, tabIdx int, err error) {
+	_ = color // reserved (see godoc above)
 	cmdPart := "/bin/zsh"
 	if command != "" {
 		escaped := strings.ReplaceAll(command, `"`, `\"`)
@@ -84,7 +89,10 @@ end tell`
 }
 
 // ghosttyNewSplit opens a new split in the given direction (right or down).
+// The `color` parameter is reserved for future per-split color customization
+// (matches ghosttyNewTab's signature; see its godoc).
 func ghosttyNewSplit(direction, command, title, color string) (windowIdx, tabIdx int, err error) {
+	_ = color // reserved (see godoc above)
 	script := fmt.Sprintf(`tell application "Ghostty"
 	activate
 	set win to front window
@@ -108,7 +116,13 @@ end tell`, direction)
 }
 
 // ghosttySendInput sends text to a specific tab by index.
+//
+// `windowIdx` is currently hardcoded to `window 1` in the underlying AppleScript
+// because Ghostty exposes only one window scope per send. The parameter is
+// retained so callers continue to thread a window identifier through, ready
+// for multi-window support without an API break.
 func ghosttySendInput(windowIdx, tabIdx int, text string) error {
+	_ = windowIdx // see godoc — currently scripted as `window 1`
 	escaped := strings.ReplaceAll(text, `\`, `\\`)
 	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
 	script := fmt.Sprintf(`tell application "Ghostty"
@@ -170,7 +184,7 @@ func ghosttyWorkspaceScript(shanBinary string, agentNames []string) string {
 		sb.WriteString("\tset win to new window with configuration cfg\n")
 		sb.WriteString("\tdelay 0.5\n")
 		sb.WriteString("\tset t to focused terminal of selected tab of win\n")
-		sb.WriteString(fmt.Sprintf("\ttell selected tab of win\n"))
+		sb.WriteString("\ttell selected tab of win\n")
 		sb.WriteString(fmt.Sprintf("\t\tset title to \"%s\"\n", name))
 		sb.WriteString("\tend tell\n")
 		sb.WriteString(fmt.Sprintf("\tinput text \"%s --agent %s\" to t\n", escaped, name))

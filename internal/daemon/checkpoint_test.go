@@ -14,20 +14,9 @@ type usageStub struct{ usage agent.AccumulatedUsage }
 
 func (u *usageStub) Usage() agent.AccumulatedUsage { return u.usage }
 
-// checkpointTestLoop exposes a way to inject run messages without a live
-// agent loop, for unit-testing applyRunMessagesToSession's idempotency.
-type checkpointTestLoop struct {
-	*agent.AgentLoop
-	msgs []client.Message
-}
-
-// We directly construct a real AgentLoop, then use its public
-// RunMessages(). Since that getter reads from internal state only set
-// inside Run(), we fall back to constructing a test harness below.
-
-// Here we just exercise applyRunMessagesToSession directly with a hand-
-// built session and fake loop-messages. The function is the idempotency
-// linchpin, so it deserves direct coverage.
+// Here we exercise applyRunMessagesToSession directly with a hand-built
+// session and fake loop-messages via agent.SetRunMessagesForTest. The
+// function is the idempotency linchpin, so it deserves direct coverage.
 func TestApplyTurnMessages_Idempotent(t *testing.T) {
 	// Baseline: session with system + one pre-loop user message already.
 	sess := &session.Session{

@@ -161,10 +161,7 @@ func (c *pinchtabClient) warnOnPinchtabVersion(version string) {
 }
 
 func normalizePinchtabVersion(version string) string {
-	ver := strings.TrimSpace(version)
-	if strings.HasPrefix(ver, "v") {
-		ver = strings.TrimPrefix(ver, "v")
-	}
+	ver := strings.TrimPrefix(strings.TrimSpace(version), "v")
 	if ver == "" {
 		return ""
 	}

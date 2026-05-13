@@ -22,6 +22,7 @@ import "strings"
 // Returns the possibly-rewritten content; isError is returned to the caller
 // unchanged so audit/loop-detection behavior is preserved.
 func normalizeMCPResult(serverName, toolName, content string, isError bool) string {
+	_ = serverName // reserved for future per-server dispatch (today only toolName drives rules)
 	if content == "" {
 		return content
 	}

@@ -198,7 +198,7 @@ var resolutionRe = regexp.MustCompile(`(\d+)\s*x\s*(\d+)`)
 
 func parseScreenDimensions(output string) (int, int, error) {
 	// Prefer "UI Looks like:" (logical resolution on Retina) over raw "Resolution:".
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "UI Looks like:") {
 			m := resolutionRe.FindStringSubmatch(trimmed)
@@ -211,7 +211,7 @@ func parseScreenDimensions(output string) (int, int, error) {
 	}
 
 	// Fall back to "Resolution:" line.
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "Resolution:") {
 			m := resolutionRe.FindStringSubmatch(trimmed)
