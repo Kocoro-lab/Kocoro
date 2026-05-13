@@ -1,7 +1,6 @@
 //go:build dogfood
 
-// Run with:
-//   cd ~/Code_Ptmind/ShanClaw
+// Run with (from the repo root):
 //   go test -tags dogfood -v -timeout 180s -run TestDogfoodLive ./internal/memory/
 //
 // Requires a live Shannon Cloud endpoint configured in ~/.shannon/config.yaml

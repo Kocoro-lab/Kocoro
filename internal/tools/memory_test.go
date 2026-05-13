@@ -315,7 +315,7 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 				SupportCount:       2,
 				SupportingEventIDs: []string{"ev_a", "ev_b"},
 				EntityIDs:          []string{"ent_1"},
-				Scopes:             []string{"project:ShanClaw"},
+				Scopes:             []string{"project:Kocoro"},
 				ViaRelations:       []string{"created"},
 				ViaAnchorEntityIDs: []string{"ent_anchor"},
 			}},

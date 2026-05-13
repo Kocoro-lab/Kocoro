@@ -65,7 +65,7 @@ func decodeStrict(t *testing.T, raw []byte, v any) {
 // Three guarantees, in order of importance:
 //  1. Strict decode of the fixture — Go struct knows every field the
 //     sidecar actually emits (DisallowUnknownFields catches any field a
-//     future TLM release adds without bumping ShanClaw).
+//     future TLM release adds without bumping Kocoro).
 //  2. Strict decode of our re-marshal — our serialization is itself a
 //     valid envelope (no fields invented, none corrupted).
 //  3. Canonical-JSON equality of first and second marshal — no semantic
