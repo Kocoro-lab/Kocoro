@@ -101,10 +101,10 @@ func NewClient(endpoint, apiKey string, onMsg func(MessagePayload) string, onSys
 func (c *Client) Connect(ctx context.Context) error {
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+c.apiKey)
-	header.Set("User-Agent", fmt.Sprintf("shanclaw/%s (%s; %s)", Version, runtime.GOOS, runtime.GOARCH))
-	header.Set("X-ShanClaw-Daemon-Version", Version)
+	header.Set("User-Agent", fmt.Sprintf("kocoro/%s (%s; %s)", Version, runtime.GOOS, runtime.GOARCH))
+	header.Set("X-Kocoro-Daemon-Version", Version)
 	if len(Capabilities) > 0 {
-		header.Set("X-ShanClaw-Capabilities", strings.Join(Capabilities, ","))
+		header.Set("X-Kocoro-Capabilities", strings.Join(Capabilities, ","))
 	}
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
