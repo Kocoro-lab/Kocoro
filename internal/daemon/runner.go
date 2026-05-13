@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -238,7 +237,7 @@ func resolveFileRef(b RequestContentBlock) []client.ContentBlock {
 				Text: fmt.Sprintf("[Error: unable to read image %s]", b.Filename),
 			}}
 		}
-		const maxInlineImage = 20 * 1024 * 1024 // 20 MB
+		const maxInlineImage = 20 * 1024 * 1024 // pre-decode allocation guard
 		if info.Size() > maxInlineImage {
 			return []client.ContentBlock{{
 				Type: "text",
@@ -254,16 +253,33 @@ func resolveFileRef(b RequestContentBlock) []client.ContentBlock {
 				Text: fmt.Sprintf("[Error: unable to read image %s]", b.Filename),
 			}}
 		}
-		encoded := base64.StdEncoding.EncodeToString(data)
+		// Run through the shared compression pipeline so this path enforces the
+		// same 5 MB inline limit as file_read / screenshot / etc. Without this,
+		// Desktop drag-drop of a 6 MB PNG would bypass Layer 1.
+		block, err := tools.EncodeImageBytes(data, mimeType)
+		if err != nil {
+			log.Printf("WARNING: failed to encode attached image %s: %v", b.FilePath, err)
+			return []client.ContentBlock{{
+				Type: "text",
+				Text: fmt.Sprintf("[Error: unable to encode image %s]", b.Filename),
+			}}
+		}
 		return []client.ContentBlock{
 			{
 				Type: "text",
+				// Preserve filename + size + path + path-reuse hint so the model
+				// can still call file_read on the original if it needs vision
+				// after edit / wants pixel-level access bypassing compression.
 				Text: fmt.Sprintf("[User attached image: %s (%d bytes) at path: %s — the image is included inline below for vision. Use the path if a tool needs the original file.]",
 					b.Filename, info.Size(), b.FilePath),
 			},
 			{
-				Type:   "image",
-				Source: &client.ImageSource{Type: "base64", MediaType: mimeType, Data: encoded},
+				Type: "image",
+				Source: &client.ImageSource{
+					Type:      "base64",
+					MediaType: block.MediaType,
+					Data:      block.Data,
+				},
 			},
 		}
 	}
