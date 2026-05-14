@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	skillpkg "github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
 // scanSkills walks ~/.claude/skills and produces a ScannedSkill per skill.
@@ -56,6 +58,10 @@ func scanSkills(claudeHome string) ([]ScannedSkill, []Warning, error) {
 		}
 
 		if entryInfo.IsDir() {
+			if err := skillpkg.ValidateSkillName(name); err != nil {
+				warns = append(warns, Warning{Kind: "invalid_name", Path: "~/.claude/skills/" + name})
+				continue
+			}
 			skillFile := filepath.Join(entryPath, "SKILL.md")
 			if _, err := os.Stat(skillFile); err != nil {
 				// Empty / non-skill directory; skip silently.
@@ -68,6 +74,10 @@ func scanSkills(claudeHome string) ([]ScannedSkill, []Warning, error) {
 			warns = append(warns, ws...)
 		} else if strings.HasSuffix(name, ".md") {
 			slug := strings.TrimSuffix(name, ".md")
+			if err := skillpkg.ValidateSkillName(slug); err != nil {
+				warns = append(warns, Warning{Kind: "invalid_name", Path: "~/.claude/skills/" + name})
+				continue
+			}
 			s, ws := scanFlatSkill(entryPath, slug, claudeHome)
 			if s != nil {
 				out = append(out, *s)

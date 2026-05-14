@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestConvertCommand_SynthesizesFrontmatterFromH1(t *testing.T) {
@@ -48,5 +51,29 @@ func TestConvertCommand_RewritesExistingFrontmatterToSlug(t *testing.T) {
 	// Body lines after the original frontmatter must survive.
 	if !strings.Contains(s, "Body of deploy command") {
 		t.Errorf("body lost: %s", s)
+	}
+}
+
+func TestExtractDescription_TruncatesByRune(t *testing.T) {
+	desc := extractDescription("# " + strings.Repeat("界", 201))
+	if !utf8.ValidString(desc) {
+		t.Fatalf("description is invalid UTF-8")
+	}
+	if got := utf8.RuneCountInString(desc); got != 200 {
+		t.Fatalf("description runes = %d, want 200", got)
+	}
+}
+
+func TestEscapeYAML_ParsesSpecialScalars(t *testing.T) {
+	want := `# [deploy] & check: "prod" > now`
+	var got map[string]string
+	if err := yaml.Unmarshal([]byte("description: "+escapeYAML(want)+"\n"), &got); err != nil {
+		t.Fatalf("description YAML did not parse: %v", err)
+	}
+	if got["description"] != want {
+		t.Fatalf("description = %q, want %q", got["description"], want)
+	}
+	if !strings.HasPrefix(escapeYAML("plain"), `"`) {
+		t.Fatalf("description scalar should be quoted")
 	}
 }

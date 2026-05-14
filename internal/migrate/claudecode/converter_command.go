@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // ConvertCommand wraps a Claude custom command into a Kocoro skill at
@@ -26,7 +28,7 @@ func ConvertCommand(c ScannedCommand, stagingDir, importedAt string) error {
 	if !ok {
 		body = string(data)
 	}
-	slug := "claude-command-" + c.Name
+	slug := commandSkillSlug(c.Name)
 	desc := extractDescription(body)
 	header := fmt.Sprintf("---\nname: %s\ndescription: %s\nlicense: imported\n---\n", slug, escapeYAML(desc))
 	banner := fmt.Sprintf("<!-- imported from ~/.claude/commands/%s.md on %s -->\n", c.Name, importedAt)
@@ -44,19 +46,37 @@ func extractDescription(body string) string {
 			continue
 		}
 		t = strings.TrimPrefix(t, "# ")
-		if len(t) > 200 {
-			t = t[:200]
-		}
-		return t
+		return truncateRunes(t, 200)
 	}
 	return "Imported Claude Code custom command"
 }
 
-// escapeYAML wraps a value in double quotes when it would otherwise break
-// a flow-scalar mapping line. Keeps the synthesized frontmatter parseable.
-func escapeYAML(s string) string {
-	if strings.ContainsAny(s, `:"'`+"\n") {
-		return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	for i := range s {
+		if max == 0 {
+			return s[:i]
+		}
+		max--
 	}
 	return s
+}
+
+// escapeYAML emits a double-quoted scalar so synthesized frontmatter remains
+// parseable for descriptions that start with YAML indicators or contain
+// special flow characters.
+func escapeYAML(s string) string {
+	node := yaml.Node{
+		Kind:  yaml.ScalarNode,
+		Tag:   "!!str",
+		Value: s,
+		Style: yaml.DoubleQuotedStyle,
+	}
+	out, err := yaml.Marshal(&node)
+	if err != nil {
+		return `"` + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), `"`, `\"`) + `"`
+	}
+	return strings.TrimSuffix(string(out), "\n")
 }

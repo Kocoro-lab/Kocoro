@@ -149,17 +149,17 @@ func (s *Server) handleClaudeMigrateApply(w http.ResponseWriter, r *http.Request
 	}
 	result, err := claudecode.NewApplier(s.deps.ShannonDir).Apply(plan)
 	if err != nil {
-		if strings.Contains(err.Error(), "plan_stale") {
+		if errors.Is(err, claudecode.ErrPlanStale) {
 			store.Delete(plan.ID)
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "plan_stale", "message": err.Error()})
 			return
 		}
-		if strings.Contains(err.Error(), "plan_expired") {
+		if errors.Is(err, claudecode.ErrPlanExpired) {
 			store.Delete(plan.ID)
 			writeJSON(w, http.StatusGone, map[string]string{"error": "plan_expired"})
 			return
 		}
-		if strings.Contains(err.Error(), "migration_in_progress") {
+		if errors.Is(err, claudecode.ErrMigrationInProgress) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "migration_in_progress"})
 			return
 		}

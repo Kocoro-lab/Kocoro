@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -159,7 +160,7 @@ func TestApply_MutexBlocksConcurrent(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	_, err := NewApplier(target2).Apply(p2)
-	if err == nil || !strings.Contains(err.Error(), "migration_in_progress") {
+	if !errors.Is(err, ErrMigrationInProgress) {
 		t.Errorf("expected migration_in_progress, got %v", err)
 	}
 	<-done
@@ -190,7 +191,7 @@ func TestApply_RejectsStaleSource(t *testing.T) {
 	}
 
 	_, err := NewApplier(target).Apply(p)
-	if err == nil || !strings.Contains(err.Error(), "plan_stale") {
+	if !errors.Is(err, ErrPlanStale) {
 		t.Errorf("expected plan_stale error after source mutation, got %v", err)
 	}
 	// Target must be untouched.
@@ -261,7 +262,7 @@ func TestApply_RejectsMCPTargetConflictAddedAfterPreview(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := NewApplier(target).Apply(p)
-	if err == nil || !strings.Contains(err.Error(), "plan_stale") {
+	if !errors.Is(err, ErrPlanStale) {
 		t.Errorf("expected plan_stale for MCP target_conflict_added, got %v", err)
 	}
 	if err != nil && !strings.Contains(err.Error(), "mcp_servers/"+mcpName) {

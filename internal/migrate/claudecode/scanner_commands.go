@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	skillpkg "github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
 func scanCommands(claudeHome string) ([]ScannedCommand, []Warning, error) {
@@ -42,6 +44,10 @@ func scanCommands(claudeHome string) ([]ScannedCommand, []Warning, error) {
 			continue
 		}
 		slug := strings.TrimSuffix(name, ".md")
+		if err := skillpkg.ValidateSkillName(commandSkillSlug(slug)); err != nil {
+			warns = append(warns, Warning{Kind: "invalid_name", Path: "~/.claude/commands/" + name})
+			continue
+		}
 		if info.Size() > MaxFileBytes {
 			warns = append(warns, Warning{Kind: "size_limit", Path: "~/.claude/commands/" + name})
 			continue
@@ -58,4 +64,8 @@ func scanCommands(claudeHome string) ([]ScannedCommand, []Warning, error) {
 		})
 	}
 	return out, warns, nil
+}
+
+func commandSkillSlug(name string) string {
+	return "claude-command-" + name
 }

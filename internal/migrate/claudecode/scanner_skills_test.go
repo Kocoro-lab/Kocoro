@@ -41,6 +41,39 @@ func TestScanSkills_MissingDir(t *testing.T) {
 	}
 }
 
+func TestScanSkills_InvalidNameWarnsAndSkips(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "skills", "My-Skill"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "skills", "My-Skill", "SKILL.md"), []byte("---\nname: My-Skill\ndescription: x\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "skills", "my_skill.md"), []byte("---\nname: my_skill\ndescription: x\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "skills", "valid-skill.md"), []byte("---\nname: valid-skill\ndescription: x\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, warns, err := scanSkills(home)
+	if err != nil {
+		t.Fatalf("scanSkills: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "valid-skill" {
+		t.Fatalf("scanned skills = %+v, want only valid-skill", got)
+	}
+	invalid := 0
+	for _, w := range warns {
+		if w.Kind == "invalid_name" {
+			invalid++
+		}
+	}
+	if invalid != 2 {
+		t.Fatalf("invalid_name warnings = %d, want 2: %+v", invalid, warns)
+	}
+}
+
 // TestScanSkills_DirHashIncludesScripts proves that any change to a file
 // under a dir-layout skill (e.g. scripts/helper.sh) flips ContentHash and
 // SizeBytes. Without this, the planner's TOCTOU re-check would miss mid-flight

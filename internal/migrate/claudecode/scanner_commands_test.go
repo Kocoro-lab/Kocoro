@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -51,5 +52,39 @@ func TestScanCommands_SymlinkEntryRejected(t *testing.T) {
 	}
 	if !gotEscape {
 		t.Errorf("expected symlink_escape warning, got %+v", warns)
+	}
+}
+
+func TestScanCommands_InvalidSkillSlugWarnsAndSkips(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "commands"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "commands", "review.md"), []byte("# Review\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "commands", "my_cmd.md"), []byte("# Bad\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	longName := strings.Repeat("a", 50)
+	if err := os.WriteFile(filepath.Join(home, "commands", longName+".md"), []byte("# Too long\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, warns, err := scanCommands(home)
+	if err != nil {
+		t.Fatalf("scanCommands: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "review" {
+		t.Fatalf("scanned commands = %+v, want only review", got)
+	}
+	invalid := 0
+	for _, w := range warns {
+		if w.Kind == "invalid_name" {
+			invalid++
+		}
+	}
+	if invalid != 2 {
+		t.Fatalf("invalid_name warnings = %d, want 2: %+v", invalid, warns)
 	}
 }

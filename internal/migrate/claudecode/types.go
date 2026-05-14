@@ -103,7 +103,7 @@ type ScannedMCPServer struct {
 }
 
 type Warning struct {
-	Kind   string // "missing_env_keys" | "unsupported_fields" | "symlink_escape" | "size_limit" | "source_unavailable" | "parse_failed"
+	Kind   string // "missing_env_keys" | "unsupported_fields" | "symlink_escape" | "size_limit" | "source_unavailable" | "parse_failed" | "invalid_name"
 	Server string // for MCP warnings
 	Keys   []string
 	Fields []string

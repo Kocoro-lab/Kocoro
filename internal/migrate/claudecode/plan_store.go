@@ -7,8 +7,10 @@ import (
 )
 
 var (
-	ErrPlanNotFound = errors.New("plan_not_found")
-	ErrPlanExpired  = errors.New("plan_expired")
+	ErrPlanNotFound        = errors.New("plan_not_found")
+	ErrPlanExpired         = errors.New("plan_expired")
+	ErrPlanStale           = errors.New("plan_stale")
+	ErrMigrationInProgress = errors.New("migration_in_progress")
 )
 
 // PlanStore keeps preview plans in memory until apply or expiry.

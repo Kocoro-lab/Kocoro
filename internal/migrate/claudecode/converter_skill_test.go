@@ -48,6 +48,13 @@ func TestConvertSkill_DirWithScripts(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(staging, "scripts", "helper.sh")); err != nil {
 		t.Errorf("scripts/helper.sh missing in staging: %v", err)
 	}
+	info, err := os.Stat(filepath.Join(staging, "scripts", "helper.sh"))
+	if err != nil {
+		t.Fatalf("stat staged helper: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("script mode = %v, want 0755", info.Mode().Perm())
+	}
 }
 
 func TestConvertSkill_SymlinkInsideDir_NotCopied(t *testing.T) {

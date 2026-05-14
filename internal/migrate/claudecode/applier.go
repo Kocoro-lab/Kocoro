@@ -89,12 +89,12 @@ const importedAtFormat = "2006-01-02T15:04:05Z07:00"
 // "migration_in_progress" so the HTTP handler can map to 409.
 func (a *Applier) Apply(p *Plan) (*ApplyResult, error) {
 	if !migrateMu.TryLock() {
-		return nil, fmt.Errorf("migration_in_progress")
+		return nil, ErrMigrationInProgress
 	}
 	defer migrateMu.Unlock()
 
 	if time.Now().After(p.ExpiresAt) {
-		return nil, fmt.Errorf("plan_expired")
+		return nil, ErrPlanExpired
 	}
 
 	if err := a.validateFreshness(p); err != nil {
@@ -124,10 +124,10 @@ func (a *Applier) validateFreshness(p *Plan) error {
 	for path, want := range p.SourceHashes {
 		ok, err := ValidateSourceFingerprint(path, want)
 		if err != nil {
-			return fmt.Errorf("plan_stale: cannot re-validate %s: %w", path, err)
+			return fmt.Errorf("%w: cannot re-validate %s: %w", ErrPlanStale, path, err)
 		}
 		if !ok {
-			return fmt.Errorf("plan_stale: source_changed: %s", path)
+			return fmt.Errorf("%w: source_changed: %s", ErrPlanStale, path)
 		}
 	}
 	// File/dir target conflict re-check for non-MCP categories.
@@ -140,7 +140,7 @@ func (a *Applier) validateFreshness(p *Plan) error {
 			probe = filepath.Join(act.DstAbs, s)
 		}
 		if _, err := os.Stat(probe); err == nil {
-			return fmt.Errorf("plan_stale: target_conflict_added: %s/%s", act.Category, act.Name)
+			return fmt.Errorf("%w: target_conflict_added: %s/%s", ErrPlanStale, act.Category, act.Name)
 		}
 	}
 	// MCP conflict re-check: if any planned MCP server name now exists in the
@@ -155,11 +155,11 @@ func (a *Applier) validateFreshness(p *Plan) error {
 	if len(plannedMCP) > 0 {
 		existing, err := existingMCPServerNames(a.target)
 		if err != nil {
-			return fmt.Errorf("plan_stale: cannot re-read target config.yaml: %w", err)
+			return fmt.Errorf("%w: cannot re-read target config.yaml: %w", ErrPlanStale, err)
 		}
 		for name := range plannedMCP {
 			if existing[name] {
-				return fmt.Errorf("plan_stale: target_conflict_added: mcp_servers/%s", name)
+				return fmt.Errorf("%w: target_conflict_added: mcp_servers/%s", ErrPlanStale, name)
 			}
 		}
 	}

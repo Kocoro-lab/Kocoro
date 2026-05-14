@@ -79,7 +79,7 @@ func BuildPlan(scan *ScanResult, src SourcePaths, target, homeDir string, now ti
 		if c.Status != "ok" {
 			continue
 		}
-		slug := "claude-command-" + c.Name
+		slug := commandSkillSlug(c.Name)
 		dst := filepath.Join(target, "skills", slug)
 		if _, err := os.Stat(filepath.Join(dst, "SKILL.md")); err == nil {
 			p.Conflicts = append(p.Conflicts, Conflict{Category: "commands", Name: c.Name, Reason: "exists_in_target"})
