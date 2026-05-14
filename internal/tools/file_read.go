@@ -67,7 +67,7 @@ func (t *FileReadTool) Info() agent.ToolInfo {
 				"path":        map[string]any{"type": "string", "description": "Absolute or relative file path"},
 				"description": agent.DescriptionFieldSpec,
 				"offset":      map[string]any{"type": "integer", "description": "Start line (0-based, default 0). For PDF: start page (0-based). Ignored when 'pages' is set."},
-				"limit":       map[string]any{"type": "integer", "description": "Max lines to read (default: all). For PDF: max pages to render (default: 2). Ignored when 'pages' is set."},
+				"limit":       map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (default: all). For PDF: max pages to render (default: %d). Ignored when 'pages' is set.", maxPDFPages)},
 				"pages": map[string]any{
 					"type":        "string",
 					"description": fmt.Sprintf("Page range for PDF files (e.g., \"1-5\", \"3\", \"10-20\"). Maximum %d pages per range. When set, overrides offset/limit. Pages are 1-indexed (page 1 is the first page).", maxPDFPages),
