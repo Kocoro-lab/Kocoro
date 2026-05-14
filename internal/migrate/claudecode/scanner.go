@@ -6,12 +6,24 @@ import "os"
 // or unreadable does not fail the overall scan; categories from the broken
 // source are empty, and a SourceErrors entry is recorded. The handler turns a
 // scan with zero importable items into a 404 claude_not_found per spec §12.1.
+//
+// Privacy: the top-level source roots themselves are os.Lstat'd. If either is
+// a symlink we refuse to traverse it — a malicious ~/.claude or ~/.claude.json
+// symlink could otherwise redirect the scanner to attacker-controlled content
+// in violation of spec §7.4. Per-entry symlink rejection in the sub-scanners
+// only kicks in after the root is opened, so root protection has to live here.
 func Scan(src SourcePaths) (*ScanResult, error) {
 	r := &ScanResult{SourceErrors: map[string]string{}}
 
-	if _, err := os.Stat(src.ClaudeHome); err != nil {
+	homeInfo, err := os.Lstat(src.ClaudeHome)
+	switch {
+	case err != nil:
 		r.SourceErrors["claude_home"] = err.Error()
-	} else {
+	case homeInfo.Mode()&os.ModeSymlink != 0:
+		// Symlinked ~/.claude — refuse, surface warning, do not traverse.
+		r.SourceErrors["claude_home"] = "symlinked_source_root"
+		r.Warnings = append(r.Warnings, Warning{Kind: "symlink_escape", Path: "~/.claude"})
+	default:
 		skills, warns, err := scanSkills(src.ClaudeHome)
 		if err != nil {
 			r.SourceErrors["claude_home"] = err.Error()

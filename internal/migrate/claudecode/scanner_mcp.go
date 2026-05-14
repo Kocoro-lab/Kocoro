@@ -110,15 +110,24 @@ func scanMCP(claudeUserConfig string) ([]ScannedMCPServer, []Warning, error) {
 		}
 		sort.Strings(s.UnsupportedFields)
 
-		// http transport with no url → error
-		if s.Transport == "http" && s.URL == "" {
+		// Reject any transport we don't model. Per spec §10.4, only stdio,
+		// http, and sse (normalized to http above) are supported in v1.
+		// An unknown transport stays in the response with status=error so
+		// the planner skips it; the result page lists it under skipped.
+		switch s.Transport {
+		case "stdio":
+			if s.Command == "" {
+				s.Status = "error"
+				s.ErrorReason = "missing_command"
+			}
+		case "http":
+			if s.URL == "" {
+				s.Status = "error"
+				s.ErrorReason = "missing_url"
+			}
+		default:
 			s.Status = "error"
-			s.ErrorReason = "missing_url"
-		}
-		// stdio with no command → error
-		if s.Transport == "stdio" && s.Command == "" {
-			s.Status = "error"
-			s.ErrorReason = "missing_command"
+			s.ErrorReason = "unsupported_transport"
 		}
 
 		out = append(out, s)

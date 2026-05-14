@@ -86,3 +86,47 @@ func TestScanMCP_SymlinkConfigRejected(t *testing.T) {
 		t.Errorf("expected symlink_escape warning, got %+v", warns)
 	}
 }
+
+// TestScanMCP_UnsupportedTransport ensures servers with an unknown `type`
+// (anything outside stdio / http / sse) are marked status=error with reason
+// unsupported_transport so the planner skips them. Spec §10.4 — anything
+// else is "listed as unsupported_transport, server skipped".
+func TestScanMCP_UnsupportedTransport(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "claude.json")
+	body := `{
+	  "mcpServers": {
+	    "websocket-thing": { "type": "websocket", "url": "wss://x" },
+	    "tcp-thing":       { "type": "tcp", "command": "irrelevant" },
+	    "ok-stdio":        { "command": "node" },
+	    "ok-http":         { "type": "http", "url": "https://h" }
+	  }
+	}`
+	if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := scanMCP(cfg)
+	if err != nil {
+		t.Fatalf("scanMCP: %v", err)
+	}
+	byName := map[string]ScannedMCPServer{}
+	for _, s := range got {
+		byName[s.Name] = s
+	}
+
+	ws := byName["websocket-thing"]
+	if ws.Status != "error" || ws.ErrorReason != "unsupported_transport" {
+		t.Errorf("websocket-thing: status=%q reason=%q, want error/unsupported_transport", ws.Status, ws.ErrorReason)
+	}
+	tcp := byName["tcp-thing"]
+	if tcp.Status != "error" || tcp.ErrorReason != "unsupported_transport" {
+		t.Errorf("tcp-thing: status=%q reason=%q, want error/unsupported_transport", tcp.Status, tcp.ErrorReason)
+	}
+	stdio := byName["ok-stdio"]
+	if stdio.Status != "ok" {
+		t.Errorf("ok-stdio: status=%q, want ok", stdio.Status)
+	}
+	http := byName["ok-http"]
+	if http.Status != "ok" {
+		t.Errorf("ok-http: status=%q, want ok", http.Status)
+	}
+}

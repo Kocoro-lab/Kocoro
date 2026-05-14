@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -77,5 +78,55 @@ func TestScan_BothSourcesPresent_TotalImportableCovers(t *testing.T) {
 	}
 	if got.TotalImportable() != want {
 		t.Errorf("TotalImportable() = %d, want %d", got.TotalImportable(), want)
+	}
+}
+
+// TestScan_ClaudeHomeIsSymlink_Rejected proves the privacy invariant: if the
+// top-level ~/.claude root is itself a symlink (which could redirect to an
+// attacker-controlled directory), Scan() refuses to traverse it and records
+// a symlink_escape warning. Per-entry symlink rejection inside sub-scanners
+// only triggers AFTER the root is opened — root protection has to live in
+// Scan() itself.
+func TestScan_ClaudeHomeIsSymlink_Rejected(t *testing.T) {
+	realDir := t.TempDir()
+	// Populate the real dir with a normal-looking Claude tree to prove that
+	// even an "innocent" symlink target is refused.
+	if err := os.MkdirAll(filepath.Join(realDir, "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "skills", "innocent.md"),
+		[]byte("---\nname: innocent\ndescription: x\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := t.TempDir()
+	symlinkRoot := filepath.Join(parent, ".claude")
+	if err := os.Symlink(realDir, symlinkRoot); err != nil {
+		t.Skipf("symlink unsupported here: %v", err)
+	}
+
+	src := SourcePaths{
+		ClaudeHome:       symlinkRoot,
+		ClaudeUserConfig: filepath.Join("testdata", "claude_user_config_basic.json"),
+	}
+	got, _ := Scan(src)
+	if len(got.Skills) != 0 {
+		t.Errorf("symlinked ClaudeHome must not yield skills, got %+v", got.Skills)
+	}
+	if _, ok := got.SourceErrors["claude_home"]; !ok {
+		t.Error("expected SourceErrors entry for symlinked claude_home")
+	}
+	sawWarning := false
+	for _, w := range got.Warnings {
+		if w.Kind == "symlink_escape" && w.Path == "~/.claude" {
+			sawWarning = true
+		}
+	}
+	if !sawWarning {
+		t.Errorf("expected symlink_escape warning at ~/.claude, got %+v", got.Warnings)
+	}
+	// Sanity: the OTHER source (MCP) should still scan fine.
+	if len(got.MCPServers) == 0 {
+		t.Error("symlinked claude_home should not affect MCP scan from claude_user_config")
 	}
 }
