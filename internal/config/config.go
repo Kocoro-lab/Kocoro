@@ -140,6 +140,7 @@ func (c *AgentConfig) SkillDiscoveryEnabled() bool {
 
 type ToolsConfig struct {
 	BashTimeout       int `mapstructure:"bash_timeout"        yaml:"bash_timeout"        json:"bash_timeout"`
+	BashMaxTimeout    int `mapstructure:"bash_max_timeout"    yaml:"bash_max_timeout"    json:"bash_max_timeout"`
 	BashMaxOutput     int `mapstructure:"bash_max_output"     yaml:"bash_max_output"     json:"bash_max_output"`
 	ResultTruncation  int `mapstructure:"result_truncation"   yaml:"result_truncation"   json:"result_truncation"`
 	ArgsTruncation    int `mapstructure:"args_truncation"     yaml:"args_truncation"     json:"args_truncation"`
@@ -266,6 +267,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.prompt_suggestion.cache_cold_threshold_tokens", 10000)
 	viper.SetDefault("agent.prompt_suggestion.min_turns", 2)
 	viper.SetDefault("tools.bash_timeout", 120)
+	viper.SetDefault("tools.bash_max_timeout", 600)
 	viper.SetDefault("tools.bash_max_output", 30000)
 	viper.SetDefault("tools.result_truncation", 30000)
 	viper.SetDefault("tools.args_truncation", 200)
@@ -553,6 +555,7 @@ type overlayPromptSuggestionConfig struct {
 
 type overlayToolsConfig struct {
 	BashTimeout       *int `yaml:"bash_timeout"`
+	BashMaxTimeout    *int `yaml:"bash_max_timeout"`
 	BashMaxOutput     *int `yaml:"bash_max_output"`
 	ResultTruncation  *int `yaml:"result_truncation"`
 	ArgsTruncation    *int `yaml:"args_truncation"`
@@ -579,6 +582,7 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.idle_soft_timeout_secs": {Level: "default"},
 		"agent.idle_hard_timeout_secs": {Level: "default"},
 		"tools.bash_timeout":           {Level: "default"},
+		"tools.bash_max_timeout":       {Level: "default"},
 		"tools.bash_max_output":        {Level: "default"},
 		"tools.result_truncation":      {Level: "default"},
 		"tools.args_truncation":        {Level: "default"},
@@ -640,6 +644,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("tools.bash_timeout") {
 		cfg.Sources["tools.bash_timeout"] = src
+	}
+	if viper.IsSet("tools.bash_max_timeout") {
+		cfg.Sources["tools.bash_max_timeout"] = src
 	}
 	if viper.IsSet("tools.bash_max_output") {
 		cfg.Sources["tools.bash_max_output"] = src
@@ -802,6 +809,10 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Tools.BashTimeout != nil {
 			cfg.Tools.BashTimeout = *overlay.Tools.BashTimeout
 			cfg.Sources["tools.bash_timeout"] = src
+		}
+		if overlay.Tools.BashMaxTimeout != nil {
+			cfg.Tools.BashMaxTimeout = *overlay.Tools.BashMaxTimeout
+			cfg.Sources["tools.bash_max_timeout"] = src
 		}
 		if overlay.Tools.BashMaxOutput != nil {
 			cfg.Tools.BashMaxOutput = *overlay.Tools.BashMaxOutput

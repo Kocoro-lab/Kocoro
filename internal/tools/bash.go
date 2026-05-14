@@ -33,6 +33,11 @@ type BashTool struct {
 	// per-call `timeout` arg is absent or zero. 0 = use built-in default 120.
 	// Wired from config.Tools.BashTimeout by register.go.
 	DefaultTimeoutSecs int
+	// MaxTimeoutSecs is the hard ceiling for per-call timeout. 0 = use
+	// built-in default 600. Wired from config.Tools.BashMaxTimeout by
+	// register.go. Clamping is logged so operators can discover when their
+	// configured timeout was capped.
+	MaxTimeoutSecs int
 	// SecretsStore, when set, supplies per-skill API keys as env vars
 	// for skills activated via use_skill in the current run. Values are
 	// fetched lazily at execution time and scoped to bash child processes
@@ -159,10 +164,26 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	}
 
 	// Timeout precedence: per-call args > tool default (from config) > 120s fallback,
-	// then hard-capped at maxBashTimeout. The cap protects against models passing an
-	// unreasonably large timeout (e.g. 3600s for a hung server) that would leave UI
-	// cards looking frozen for many minutes before SIGKILL fires.
-	const maxBashTimeout = 600 * time.Second
+	// then hard-capped at MaxTimeoutSecs.
+	//
+	// Hardcoded-limit policy compliance (CLAUDE.md):
+	//   - User workload: 10-min default ceiling covers macOS test suites,
+	//     longest legit `brew install`/`xcodebuild clean build`, multi-step
+	//     bash scripts. Anything longer is almost always a hung server or
+	//     polling loop the model misclassified as foreground work.
+	//   - Symptom when it binds: a user's bash command is SIGKILL'd at the
+	//     cap and the result carries "[note: process killed after Xs by
+	//     context-cancel]". The clamping itself emits a one-shot log line
+	//     to stderr ("[bash] requested timeout Xs > cap Ys; clamping").
+	//   - Override path: `tools.bash_max_timeout` (seconds) in
+	//     ~/.shannon/config.yaml or per-project .shannon/config.yaml. Set
+	//     to a higher value for slow integration suites; never 0/unset to
+	//     disable (the cap protects UI cards from looking frozen for
+	//     unbounded minutes before SIGKILL fires).
+	maxBashTimeout := 600 * time.Second
+	if t.MaxTimeoutSecs > 0 {
+		maxBashTimeout = time.Duration(t.MaxTimeoutSecs) * time.Second
+	}
 	timeout := 120 * time.Second
 	if t.DefaultTimeoutSecs > 0 {
 		timeout = time.Duration(t.DefaultTimeoutSecs) * time.Second
@@ -171,6 +192,7 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 		timeout = time.Duration(args.Timeout) * time.Second
 	}
 	if timeout > maxBashTimeout {
+		fmt.Fprintf(os.Stderr, "[bash] requested timeout %v > cap %v; clamping (override via tools.bash_max_timeout)\n", timeout, maxBashTimeout)
 		timeout = maxBashTimeout
 	}
 

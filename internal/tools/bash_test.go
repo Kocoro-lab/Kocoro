@@ -606,3 +606,97 @@ func TestBash_SessionCWDStillHonored(t *testing.T) {
 		t.Fatalf("expected bash to run in session CWD %s, got %s", sessionCWD, out)
 	}
 }
+
+// TestBash_ElapsedPrefix_AppearsAtOrAbove1s pins the threshold for the
+// "[command ran for Ns]" prefix added by commit 2db2ec4. Without this test
+// a future refactor can silently regress the threshold and break the
+// model's ability to verify timing claims against tool output.
+func TestBash_ElapsedPrefix_AppearsAtOrAbove1s(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	tool := &BashTool{}
+	result, err := tool.Run(context.Background(), `{"command":"sleep 1 && echo done"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "[command ran for") {
+		t.Errorf("expected elapsed prefix on >=1s command, got %q", result.Content)
+	}
+}
+
+// TestBash_ElapsedPrefix_AbsentBelowThreshold confirms the prefix is NOT
+// emitted for fast commands — keeps the noise floor low for the model.
+func TestBash_ElapsedPrefix_AbsentBelowThreshold(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	tool := &BashTool{}
+	result, err := tool.Run(context.Background(), `{"command":"echo fast"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %s", result.Content)
+	}
+	if strings.Contains(result.Content, "[command ran for") {
+		t.Errorf("did not expect elapsed prefix on sub-1s command, got %q", result.Content)
+	}
+}
+
+// TestBash_ClampsExcessiveTimeout verifies that per-call timeout requests
+// above the cap are silently lowered to the cap and the command does not
+// hang forever. Default cap is 600s; we set a lower cap on the tool so the
+// test runs in milliseconds.
+func TestBash_ClampsExcessiveTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	// Cap at 1s so the test asserts the clamp by observing the SIGKILL.
+	tool := &BashTool{MaxTimeoutSecs: 1}
+	result, _ := tool.Run(context.Background(), `{"command":"sleep 10 && echo nope","timeout":30}`)
+	// We expect the command to get SIGKILL'd at the 1s cap, not run for the
+	// requested 30s or the model-implied 10s.
+	if !result.IsError && strings.Contains(result.Content, "nope") {
+		t.Errorf("clamping failed: command produced output past the cap; got %q", result.Content)
+	}
+}
+
+// TestBash_MaxTimeoutOverride_AcceptsConfiguredCap confirms the cap is
+// configurable. With MaxTimeoutSecs=5 a 3s command runs to completion.
+func TestBash_MaxTimeoutOverride_AcceptsConfiguredCap(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	tool := &BashTool{MaxTimeoutSecs: 5}
+	result, err := tool.Run(context.Background(), `{"command":"sleep 3 && echo within_cap"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Errorf("3s command under 5s cap should succeed, got error: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "within_cap") {
+		t.Errorf("expected command output; got %q", result.Content)
+	}
+}
+
+// TestBash_ParallelProcessGroupKill is a smoke test for commit ee6a2e8's
+// Setpgid + SIGKILL-of-pgid fix: when the parent times out, child processes
+// (like `python -m http.server`) should be killed too, not orphaned. Hard
+// to assert directly without process inspection — we just verify the
+// timeout path doesn't crash and returns a sensible error.
+func TestBash_ParallelProcessGroupKill_TimeoutHonored(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	tool := &BashTool{MaxTimeoutSecs: 1}
+	// Sub-shell with background child — the trap is the child outliving sh.
+	result, _ := tool.Run(context.Background(), `{"command":"(sleep 30 & sleep 5)","timeout":1}`)
+	if !result.IsError {
+		t.Errorf("expected error result on timeout, got: %s", result.Content)
+	}
+}

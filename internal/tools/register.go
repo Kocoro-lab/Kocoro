@@ -75,6 +75,9 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 		if cfg.Tools.BashTimeout > 0 {
 			bashTool.DefaultTimeoutSecs = cfg.Tools.BashTimeout
 		}
+		if cfg.Tools.BashMaxTimeout > 0 {
+			bashTool.MaxTimeoutSecs = cfg.Tools.BashMaxTimeout
+		}
 	}
 	reg.Register(bashTool)
 
@@ -147,6 +150,11 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 					bashCopy.DefaultTimeoutSecs = cfg.Tools.BashTimeout
 				} else {
 					bashCopy.DefaultTimeoutSecs = 0
+				}
+				if cfg.Tools.BashMaxTimeout > 0 {
+					bashCopy.MaxTimeoutSecs = cfg.Tools.BashMaxTimeout
+				} else {
+					bashCopy.MaxTimeoutSecs = 0
 				}
 			}
 			cloned.Register(&bashCopy)

@@ -45,7 +45,7 @@ func (t *ThinkTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult,
 		// surfaced 4 consecutive empty calls). The loop detector has a
 		// separate rule that force-stops on two such consecutive calls.
 		return agent.ToolResult{
-			Content: "(empty thought — extended thinking likely already captured your reasoning; proceed with action)",
+			Content: "Empty thought received. Your reasoning likely landed in the native thinking block — proceed with the next action or final answer; do not retry the empty think call.",
 			IsError: false,
 		}, nil
 	}

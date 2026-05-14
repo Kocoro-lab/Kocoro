@@ -980,8 +980,12 @@ func buildAssistantMessage(resp *client.CompletionResponse, normalizedToolText s
 		}
 	}
 	if len(resp.ContentBlocks) > 0 {
-		// Shallow copy: future mutations to resp.ContentBlocks must not
-		// reach back into the persisted message.
+		// Slice-resize-safe copy: a fresh slice header so appends to
+		// `blocks` later can't bleed back into `resp.ContentBlocks`.
+		// Per-block fields (`Input json.RawMessage`, etc.) still share
+		// their backing arrays with `resp` — fine because no current
+		// caller mutates them after this assembly, but treat the message
+		// as read-only post-construction (the loop's existing invariant).
 		blocks := make([]client.ContentBlock, len(resp.ContentBlocks))
 		copy(blocks, resp.ContentBlocks)
 		return client.Message{

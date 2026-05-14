@@ -26,6 +26,16 @@ import (
 // On parse failure, returns the original body unchanged plus the parse error.
 // The caller may opt to log + continue (preferred, to avoid blocking sync on
 // a corrupt local file) or treat as load_error (strict).
+//
+// Note: on the mutation path the output is re-marshaled through map[string]any,
+// which `encoding/json` emits with alphabetically-sorted keys. The returned
+// bytes therefore are NOT byte-identical to the on-disk JSON even ignoring
+// the stripped blocks (key order shifts). This is intentional and acceptable
+// for the current upload path (the cloud ingest does structural parsing, not
+// byte-hash dedup). If a future caller needs byte-equality with the on-disk
+// file (e.g. for content-addressed dedup), swap the implementation to a
+// surgical edit that preserves key order — e.g. walk + splice the JSON token
+// stream rather than round-tripping through map[string]any.
 func stripThinkingFromSessionJSON(body []byte) ([]byte, error) {
 	if len(body) == 0 {
 		return body, nil
@@ -43,7 +53,7 @@ func stripThinkingFromSessionJSON(body []byte) ([]byte, error) {
 	}
 
 	mutated := false
-	for i, rawMsg := range rawMessages {
+	for _, rawMsg := range rawMessages {
 		msg, ok := rawMsg.(map[string]any)
 		if !ok {
 			continue
@@ -76,8 +86,11 @@ func stripThinkingFromSessionJSON(body []byte) ([]byte, error) {
 			filtered = append(filtered, rawBlock)
 		}
 		if dropped {
+			// `msg` is the map[string]any reference already held inside
+			// rawMessages[i] — mutating msg["content"] in place is enough;
+			// no need to re-assign the slice element. Same for the outer
+			// `top["messages"]` (already pointing at rawMessages).
 			msg["content"] = filtered
-			rawMessages[i] = msg
 			mutated = true
 		}
 	}
@@ -85,6 +98,5 @@ func stripThinkingFromSessionJSON(body []byte) ([]byte, error) {
 	if !mutated {
 		return body, nil
 	}
-	top["messages"] = rawMessages
 	return json.Marshal(top)
 }

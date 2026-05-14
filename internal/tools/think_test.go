@@ -65,8 +65,12 @@ func TestThinkTool_EmptyThoughtSoftHint(t *testing.T) {
 			if result.IsError {
 				t.Errorf("IsError = true, want false (soft hint instead of hard error); content=%q", result.Content)
 			}
-			if !strings.Contains(strings.ToLower(result.Content), "empty") {
-				t.Errorf("expected content to mention 'empty' as a hint, got %q", result.Content)
+			lc := strings.ToLower(result.Content)
+			if !strings.Contains(lc, "empty thought") {
+				t.Errorf("expected content to mention 'empty thought' explicitly, got %q", result.Content)
+			}
+			if !strings.Contains(lc, "proceed") && !strings.Contains(lc, "do not retry") {
+				t.Errorf("expected imperative steering (proceed / do not retry), got %q", result.Content)
 			}
 		})
 	}

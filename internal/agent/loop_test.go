@@ -5117,3 +5117,122 @@ func TestTimeBasedCompact_DoesNotTouchThinkingBlocks(t *testing.T) {
 		}
 	}
 }
+
+// capturingLLMClient is a fake client.LLMClient that records every
+// CompletionRequest it receives, then returns a programmable response
+// per call. Lets integration tests inspect what the loop sent upstream.
+type capturingLLMClient struct {
+	requests  []client.CompletionRequest
+	responses []*client.CompletionResponse
+	idx       int
+}
+
+func (c *capturingLLMClient) Complete(_ context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
+	c.requests = append(c.requests, req)
+	if c.idx >= len(c.responses) {
+		// Default: empty text, stop reason — terminates the loop cleanly.
+		return &client.CompletionResponse{FinishReason: "stop"}, nil
+	}
+	resp := c.responses[c.idx]
+	c.idx++
+	return resp, nil
+}
+
+func (c *capturingLLMClient) CompleteStream(ctx context.Context, req client.CompletionRequest, _ func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return c.Complete(ctx, req)
+}
+
+// stubBashLikeTool is a no-approval, always-success Tool used by integration
+// tests where we don't care about the tool's behavior, only that it exists
+// and returns a result.
+type stubBashLikeTool struct{ name string }
+
+func (s *stubBashLikeTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        s.name,
+		Description: "stub for tests",
+		Parameters: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"command": map[string]any{"type": "string"}},
+		},
+	}
+}
+func (s *stubBashLikeTool) Run(_ context.Context, _ string) (ToolResult, error) {
+	return ToolResult{Content: "ok"}, nil
+}
+func (s *stubBashLikeTool) RequiresApproval() bool { return false }
+
+// TestAgentLoop_NativeToolUsePath_PreservesThinkingInTrajectory pins the
+// call-site wire contract for `buildAssistantMessage` at loop.go:3265.
+// When the LLM response carries ContentBlocks (Cloud ≥ 2026-05 wire),
+// the assistant message added to history must be the verbatim ordered
+// list — so the SECOND turn's request to the LLM includes the thinking
+// block in the trajectory. Without this guard a refactor could silently
+// revert the call site to direct text+tool_use reconstruction, breaking
+// Anthropic's preserved-thinking-blocks contract.
+func TestAgentLoop_NativeToolUsePath_PreservesThinkingInTrajectory(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&stubBashLikeTool{name: "stub_tool"})
+
+	cap := &capturingLLMClient{
+		responses: []*client.CompletionResponse{
+			// Turn 1: native tool_use with interleaved thinking blocks.
+			{
+				OutputText:   "",
+				FinishReason: "tool_use",
+				ToolCalls:    []client.FunctionCall{{ID: "toolu_T1", Name: "stub_tool", Arguments: json.RawMessage(`{"command":"echo hi"}`)}},
+				ContentBlocks: []client.ContentBlock{
+					{Type: "thinking", Thinking: "let me call stub_tool first", Signature: "sigA"},
+					{Type: "tool_use", ID: "toolu_T1", Name: "stub_tool", Input: json.RawMessage(`{"command":"echo hi"}`)},
+				},
+			},
+			// Turn 2: final text answer, terminates the loop.
+			{OutputText: "done", FinishReason: "stop"},
+		},
+	}
+
+	loop := NewAgentLoop(cap, reg, "medium", "", 5, 2000, 200, nil, nil, nil)
+	loop.SetEnableStreaming(false)
+	handler := &mockHandler{approveResult: true}
+	loop.SetHandler(handler)
+
+	_, _, err := loop.Run(context.Background(), "go", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(cap.requests) < 2 {
+		t.Fatalf("expected at least 2 LLM calls, got %d", len(cap.requests))
+	}
+
+	// Inspect the SECOND request: must include the turn-1 assistant message
+	// with the thinking block in the trajectory.
+	turn2Msgs := cap.requests[1].Messages
+	var sawThinkingWithSig bool
+	for _, m := range turn2Msgs {
+		if m.Role != "assistant" {
+			continue
+		}
+		for _, b := range m.Content.Blocks() {
+			if b.Type == "thinking" && b.Signature == "sigA" {
+				sawThinkingWithSig = true
+			}
+		}
+	}
+	if !sawThinkingWithSig {
+		// Dump for debugging.
+		for i, m := range turn2Msgs {
+			role := m.Role
+			if m.Content.HasBlocks() {
+				types := []string{}
+				for _, b := range m.Content.Blocks() {
+					types = append(types, b.Type)
+				}
+				t.Logf("turn2 msg[%d] %s blocks=%v", i, role, types)
+			} else {
+				t.Logf("turn2 msg[%d] %s text=%q", i, role, m.Content.Text())
+			}
+		}
+		t.Fatal("thinking block with signature 'sigA' was not present in turn-2 trajectory — buildAssistantMessage call site regressed")
+	}
+}
