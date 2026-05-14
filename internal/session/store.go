@@ -215,6 +215,24 @@ type SessionSummary struct {
 	Title     string    `json:"title"`
 	CreatedAt time.Time `json:"created_at"`
 	MsgCount  int       `json:"msg_count"`
+	// Source identifies the originating IM / surface for this session.
+	// Canonical values are the `Channel*` constants in
+	// `internal/daemon/types.go` (slack/line/teams/wechat/wecom/web/feishu/
+	// lark/discord/telegram/schedule/system/webhook) plus "kocoro" (set by
+	// POST /messages when the inbound request omits a source — i.e. the
+	// Desktop / TUI path). Empty for legacy sessions written before the
+	// column existed. Frontends use this to pick a channel icon / filter
+	// the sidebar.
+	Source string `json:"source,omitempty"`
+	// InProgress reports whether the daemon currently owns an in-flight
+	// agent run for this session (mirrors SessionCache.ActiveSessionIDs).
+	// Populated at HTTP-list time by the daemon — Store.List itself leaves
+	// this false because store has no view into runtime state.
+	InProgress bool `json:"in_progress,omitempty"`
+	// AwaitingApproval reports whether the agent loop is currently blocked
+	// waiting for the user to approve a tool call. Populated at HTTP-list
+	// time from ApprovalTracker; Store.List leaves it false.
+	AwaitingApproval bool `json:"awaiting_approval,omitempty"`
 }
 
 type Store struct {
@@ -354,6 +372,7 @@ func (s *Store) List() ([]SessionSummary, error) {
 			Title:     sess.Title,
 			CreatedAt: sess.CreatedAt,
 			MsgCount:  len(sess.Messages),
+			Source:    sess.Source,
 		})
 	}
 

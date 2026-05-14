@@ -286,6 +286,34 @@ const (
 	InjectCWDConflict                     // active run uses a different immutable cwd
 )
 
+// ActiveSessionIDs returns the set of session IDs whose route currently
+// owns an in-flight agent run (entry.done != nil). Used by the HTTP layer
+// to flag sessions as "in_progress" in the listing without scanning JSON
+// from disk. Returns nil when nothing is running so JSON encoders emit
+// null and not an empty object.
+func (sc *SessionCache) ActiveSessionIDs() map[string]struct{} {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if len(sc.routes) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(sc.routes))
+	for _, entry := range sc.routes {
+		if entry == nil || entry.done == nil {
+			continue
+		}
+		id := entry.loadSessionID()
+		if id == "" {
+			continue
+		}
+		out[id] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // HasActiveRun reports whether the route currently owns an in-flight
 // agent run. Pure lookup, no side effects — safe to call from request
 // handlers that need to decide between "inject into existing run" vs

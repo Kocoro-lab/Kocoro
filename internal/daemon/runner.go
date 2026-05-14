@@ -557,6 +557,12 @@ type ServerDeps struct {
 	// fixtures that construct ServerDeps directly), the post-Run hook is a no-op.
 	Suggestions *agent.SuggestionState
 
+	// ApprovalTracker records which sessions are currently blocked on a
+	// user approval prompt. Approval handlers (SSE + WS) Mark/Clear here so
+	// the daemon HTTP layer can surface "awaiting_approval" without scanning
+	// per-request brokers. nil-safe.
+	ApprovalTracker *ApprovalTracker
+
 	// suggestionRegisteredMu + suggestionRegistered dedupe the
 	// SessionManager.OnSessionClose registration in RunAgent: without dedupe
 	// each turn appends a fresh closure to the same session's close-handler
@@ -1884,6 +1890,19 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 	sess := sessMgr.Current()
 	if route != nil && sess != nil {
 		route.storeSessionID(sess.ID)
+	}
+
+	// Notify the handler of the resolved session ID. Mirrors the RunAgent
+	// path at runner.go:946-948 — without this, any approval prompt that
+	// surfaces inside the cloud workflow would Mark the ApprovalTracker
+	// with an empty sessionID and be invisible to GET /approvals on
+	// reconnect. Today /research and /swarm rarely trigger user-facing
+	// approvals (most tools auto-route via Gateway), but the asymmetry is
+	// cheap to remove and keeps the contract consistent.
+	if sess != nil {
+		if setter, ok := handler.(interface{ SetSessionID(string) }); ok {
+			setter.SetSessionID(sess.ID)
+		}
 	}
 
 	// Stamp session metadata before persisting — mirrors runner.go:791-803.

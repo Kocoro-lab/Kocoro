@@ -685,6 +685,16 @@ func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 		log.Printf("daemon: approval broker unavailable for %s; denying", tool)
 		return false
 	}
+	// defer guards against a panic inside broker.Request leaking a phantom
+	// session into the tracker. Temp var kept because some test fixtures
+	// construct daemonEventHandler with deps == nil; production always wires
+	// it via daemon.NewServer.
+	var tracker *daemon.ApprovalTracker
+	if h.deps != nil {
+		tracker = h.deps.ApprovalTracker
+	}
+	tracker.Mark(h.sessionID)
+	defer tracker.Clear(h.sessionID)
 	decision := h.broker.Request(h.ctx, h.messageID, h.channel, h.threadID, h.agent, tool, args)
 	if decision == daemon.DecisionAlwaysAllow {
 		// PR 5: single entry point shared with the SSE path so SSE/WS

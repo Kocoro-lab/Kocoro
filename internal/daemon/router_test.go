@@ -504,3 +504,36 @@ func TestAppendToSession_SessionChanged(t *testing.T) {
 		t.Errorf("expected ErrSessionChanged, got %v", err)
 	}
 }
+
+func TestSessionCache_ActiveSessionIDs(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	defer sc.CloseAll()
+
+	// Empty cache → nil (matches JSON encoder expectation in handleSessions).
+	if got := sc.ActiveSessionIDs(); got != nil {
+		t.Fatalf("empty cache should return nil, got %v", got)
+	}
+
+	active := &routeEntry{done: make(chan struct{})}
+	active.storeSessionID("sess-active")
+	finished := &routeEntry{} // done == nil → not running
+	finished.storeSessionID("sess-finished")
+	pending := &routeEntry{done: make(chan struct{})}
+	// pending.sessionID intentionally not set — route locked before session
+	// resolves; must be filtered out so the listing never claims a placeholder
+	// session is in-progress.
+
+	sc.mu.Lock()
+	sc.routes["agent:active"] = active
+	sc.routes["agent:finished"] = finished
+	sc.routes["agent:pending"] = pending
+	sc.mu.Unlock()
+
+	got := sc.ActiveSessionIDs()
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one active session, got %v", got)
+	}
+	if _, ok := got["sess-active"]; !ok {
+		t.Fatalf("expected sess-active to be flagged in-progress, got %v", got)
+	}
+}

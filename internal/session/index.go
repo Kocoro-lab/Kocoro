@@ -232,7 +232,7 @@ func (idx *Index) UpsertSession(sess *Session) error {
 
 func (idx *Index) ListSessions() ([]SessionSummary, error) {
 	rows, err := idx.db.Query(
-		`SELECT id, title, created_at, msg_count FROM sessions ORDER BY created_at DESC`,
+		`SELECT id, title, created_at, msg_count, source FROM sessions ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
@@ -243,7 +243,7 @@ func (idx *Index) ListSessions() ([]SessionSummary, error) {
 	for rows.Next() {
 		var s SessionSummary
 		var createdStr string
-		if err := rows.Scan(&s.ID, &s.Title, &createdStr, &s.MsgCount); err != nil {
+		if err := rows.Scan(&s.ID, &s.Title, &createdStr, &s.MsgCount, &s.Source); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		s.CreatedAt = parseTime(createdStr)
