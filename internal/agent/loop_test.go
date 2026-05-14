@@ -4861,3 +4861,71 @@ func TestAgentLoop_CaptureSentRequest_AlsoDeepCopiesOnWrite(t *testing.T) {
 		t.Errorf("snapshot Tools aliased to caller: got %+v, want file_read", snap.Tools)
 	}
 }
+
+// TestOperationalRules_FullByteEqualWhenThinkRegistered verifies that when
+// the think tool IS in the registry, operationalRules() returns the exact
+// coreOperationalRules constant — no byte drift in the system prompt vs
+// older builds that ran with think always registered. Critical for the
+// Anthropic prompt-cache prefix-hash stability invariant.
+func TestOperationalRules_FullByteEqualWhenThinkRegistered(t *testing.T) {
+	loop := &AgentLoop{tools: NewToolRegistry()}
+	loop.tools.Register(&fakeThinkTool{})
+	got := loop.operationalRules()
+	if got != coreOperationalRules {
+		t.Errorf("operationalRules() must equal coreOperationalRules byte-for-byte when think registered; len got=%d want=%d", len(got), len(coreOperationalRules))
+	}
+}
+
+// TestOperationalRules_StripsBulletWhenThinkUnregistered verifies that the
+// `### Planning` section is removed when the think tool is not registered,
+// while other sections remain intact and spacing stays clean.
+func TestOperationalRules_StripsBulletWhenThinkUnregistered(t *testing.T) {
+	loop := &AgentLoop{tools: NewToolRegistry()}
+	// Intentionally do NOT register think.
+	got := loop.operationalRules()
+
+	if strings.Contains(got, "- think: Append a structured thought") {
+		t.Error("planning bullet text must not appear when think unregistered")
+	}
+	if strings.Contains(got, "### Planning") {
+		t.Error("'### Planning' header must not appear when think unregistered")
+	}
+	// Surrounding sections must remain.
+	if !strings.Contains(got, "## Approach") {
+		t.Error("pre-planning '## Approach' section missing")
+	}
+	if !strings.Contains(got, "### System") {
+		t.Error("post-planning '### System' section missing")
+	}
+	// Spacing: '### System' must be preceded by a blank line (i.e. `\n\n### System`),
+	// not by triple-newline (would happen if removal substring was wrong).
+	if strings.Contains(got, "\n\n\n### System") {
+		t.Error("triple newline before ### System — planning removal left extra blank line")
+	}
+}
+
+// TestOperationalRules_NilRegistryStripsBullet covers the safety case where
+// the registry hasn't been populated yet (Has() returns false). Should behave
+// the same as "think not registered".
+func TestOperationalRules_NilRegistryStripsBullet(t *testing.T) {
+	loop := &AgentLoop{tools: nil}
+	got := loop.operationalRules()
+	if strings.Contains(got, "- think: Append a structured thought") {
+		t.Error("planning bullet must not appear when registry is nil")
+	}
+}
+
+// fakeThinkTool is a minimal Tool used in tests that need a registry where
+// `think` is present without depending on the real ThinkTool implementation
+// (which lives in internal/tools, downstream of internal/agent).
+type fakeThinkTool struct{}
+
+func (f *fakeThinkTool) Info() ToolInfo {
+	return ToolInfo{Name: "think", Description: "stub for tests"}
+}
+
+func (f *fakeThinkTool) Run(_ context.Context, _ string) (ToolResult, error) {
+	return ToolResult{Content: "stub"}, nil
+}
+
+func (f *fakeThinkTool) RequiresApproval() bool { return false }

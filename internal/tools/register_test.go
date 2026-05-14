@@ -8,6 +8,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	mcpproto "github.com/mark3labs/mcp-go/mcp"
 )
@@ -263,5 +264,91 @@ func TestRebuildRegistryForHealth_GatewayAndPostOverlays(t *testing.T) {
 	}
 	if _, ok := reg.Get("notify"); !ok {
 		t.Error("post overlay 'notify' should be present")
+	}
+}
+
+// TestShouldRegisterThinkTool covers the gating predicate that decides whether
+// the local `think` tool is registered. See plan
+// 2026-05-14-thinking-blocks-cc-alignment.md Phase E.
+func TestShouldRegisterThinkTool(t *testing.T) {
+	cases := []struct {
+		name string
+		mod  func(*config.Config)
+		want bool
+	}{
+		{"nil cfg → register (fail-open)", nil, true},
+		{"gateway + thinking=true → skip", func(c *config.Config) {
+			c.Agent.Thinking = true
+		}, false},
+		{"gateway + thinking=false → register (no native)", func(c *config.Config) {
+			c.Agent.Thinking = false
+		}, true},
+		{"ollama + thinking=true → register (no native on ollama)", func(c *config.Config) {
+			c.Provider = "ollama"
+			c.Agent.Thinking = true
+		}, true},
+		{"force_think_tool overrides gateway+thinking", func(c *config.Config) {
+			c.Agent.Thinking = true
+			c.Agent.ForceThinkTool = true
+		}, true},
+		{"force_think_tool=false honors default skip", func(c *config.Config) {
+			c.Agent.Thinking = true
+			c.Agent.ForceThinkTool = false
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg *config.Config
+			if tc.mod != nil {
+				cfg = &config.Config{}
+				tc.mod(cfg)
+			}
+			got := shouldRegisterThinkTool(cfg)
+			if got != tc.want {
+				t.Errorf("shouldRegisterThinkTool = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRegisterLocalTools_HidesThinkUnderDefaultGateway(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Agent.Thinking = true
+	reg, _, cleanup := RegisterLocalTools(cfg, nil)
+	defer cleanup()
+	if _, ok := reg.Get("think"); ok {
+		t.Errorf("think tool must not be registered under gateway+thinking=true; got names %v", reg.Names())
+	}
+}
+
+func TestRegisterLocalTools_KeepsThinkWhenThinkingDisabled(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Agent.Thinking = false
+	reg, _, cleanup := RegisterLocalTools(cfg, nil)
+	defer cleanup()
+	if _, ok := reg.Get("think"); !ok {
+		t.Errorf("think tool must be registered when thinking=false; got names %v", reg.Names())
+	}
+}
+
+func TestRegisterLocalTools_KeepsThinkUnderOllama(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Provider = "ollama"
+	cfg.Agent.Thinking = true
+	reg, _, cleanup := RegisterLocalTools(cfg, nil)
+	defer cleanup()
+	if _, ok := reg.Get("think"); !ok {
+		t.Errorf("think tool must be registered on Ollama; got names %v", reg.Names())
+	}
+}
+
+func TestRegisterLocalTools_ForceThinkToolOverride(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Agent.Thinking = true
+	cfg.Agent.ForceThinkTool = true
+	reg, _, cleanup := RegisterLocalTools(cfg, nil)
+	defer cleanup()
+	if _, ok := reg.Get("think"); !ok {
+		t.Errorf("ForceThinkTool=true must re-register think; got names %v", reg.Names())
 	}
 }

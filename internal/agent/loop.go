@@ -309,6 +309,16 @@ const defaultPersona = "You are Kocoro, an AI assistant on the user's macOS comp
 	"You have local tools (file ops, shell, GUI control) and remote server tools (web search, research, analytics, multi-agent workflows). " +
 	"For platform setup and configuration (creating agents, installing skills, managing settings, connecting external services), load the kocoro skill for detailed guidance."
 
+// planningBulletSection is the exact substring inside coreOperationalRules
+// that documents the `think` tool. When the think tool is not registered
+// (gateway+thinking enabled by default — see internal/tools/register.go
+// shouldRegisterThinkTool), this section is removed at prompt-build time so
+// the system prompt never advertises a tool the model can't call. Removal
+// also drops the trailing blank line so the following ### System header is
+// separated from the prior ### context by exactly one blank line —
+// byte-equal to a hand-edited prompt without planning.
+const planningBulletSection = "### Planning\n- think: Append a structured thought to the log when complex reasoning or sequential decisions are needed (long tool chains, policy-heavy tasks). Does not obtain new information or change state. For simpler reasoning extended thinking handles it natively — don't reach for this tool by default.\n\n"
+
 // coreOperationalRules contains behavioral constraints that apply to ALL agents
 // (default and named). These are non-negotiable and must never be dropped.
 const coreOperationalRules = `
@@ -932,6 +942,19 @@ func (a *AgentLoop) SetThinking(cfg *client.ThinkingConfig) {
 	a.thinking = cfg
 }
 
+// operationalRules returns coreOperationalRules with the `think` planning
+// bullet stripped when the think tool is not in the live registry. Keeps
+// the system prompt from advertising a tool the model can't actually call.
+// Byte-stable: returns exactly coreOperationalRules when think IS registered,
+// guaranteeing no prompt-cache divergence between this build and any prior
+// build that ran with think registered.
+func (a *AgentLoop) operationalRules() string {
+	if a.tools.Has("think") {
+		return coreOperationalRules
+	}
+	return strings.Replace(coreOperationalRules, planningBulletSection, "", 1)
+}
+
 func (a *AgentLoop) SetReasoningEffort(effort string) {
 	a.reasoningEffort = effort
 }
@@ -1478,7 +1501,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	if a.agentBasePrompt != "" {
 		persona = a.agentBasePrompt
 	}
-	basePrompt := persona + coreOperationalRules + contrastExamplesCore
+	basePrompt := persona + a.operationalRules() + contrastExamplesCore
 	usage := &TurnUsage{}
 
 	// Per-Run cache tracker. Records main-tier LLM responses only (helper

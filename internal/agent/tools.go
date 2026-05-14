@@ -252,6 +252,18 @@ func (r *ToolRegistry) Get(name string) (Tool, bool) {
 	return t, ok
 }
 
+// Has reports whether a tool with the given name is registered. Used by
+// prompt builders (e.g. agent/loop.go operationalRules) that want to
+// conditionally surface a tool's documentation only when the tool itself
+// is live in this run. Nil-safe — a nil registry contains no tools.
+func (r *ToolRegistry) Has(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.tools[name]
+	return ok
+}
+
 func (r *ToolRegistry) All() []Tool {
 	tools := make([]Tool, 0, len(r.order))
 	for _, name := range r.order {
