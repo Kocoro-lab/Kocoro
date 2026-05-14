@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "anthropic": {
+      "command": "node",
+      "args": ["server.js"],
+      "env": { "ANTHROPIC_API_KEY": "sk-ant-DO-NOT-LEAK" }
+    },
+    "internal-api": {
+      "type": "http",
+      "url": "https://example.internal/mcp",
+      "headers": { "X-Auth": "DO-NOT-LEAK" }
+    },
+    "command-only": {
+      "command": "/usr/local/bin/mcp-server"
+    }
+  },
+  "projects": {}
+}
