@@ -6,7 +6,7 @@ Kocoro runs AI agents locally with full computer access — files, apps, browser
 
 ### Get Kocoro
 
-- **[Download Kocoro Desktop (macOS)](https://kocoro.ai/download/mac)** — DMG, the recommended way to use Kocoro
+- **[Download Kocoro Desktop (macOS)](https://desktop.kocoro.ai/download/mac)** — DMG, the recommended way to use Kocoro
 - **CLI only** — `npm install -g @kocoro/kocoro` (build-from-source and other options under [Installation](#installation))
 
 > **Coming from Claude Code?** Kocoro Desktop can import your existing agents, skills, and instructions from `~/.claude/` in one click — preview-then-apply via the daemon's `/migrate/claude-code/*` endpoints.
