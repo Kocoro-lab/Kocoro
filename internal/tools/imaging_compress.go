@@ -13,14 +13,41 @@ import (
 	_ "golang.org/x/image/webp" // register WebP decoder
 )
 
+// MaxImagePixelBudget is the upper bound on Width*Height accepted by
+// compressImage before any pixel buffer is allocated. 64 MP matches
+// Anthropic's documented single-image dimension cap (8000×8000) — anything
+// larger would be rejected upstream anyway. Without this guard, a 30 MB PNG
+// header claiming 100000×100000 px would allocate ~40 GB of RGBA inside
+// image.Decode before downscaleToFit ever runs. The DoS surface is real
+// because CompressInlineImageSource accepts cloud-pushed inline base64.
+const MaxImagePixelBudget = 64_000_000
+
 // compressImage takes raw image bytes and a media-type hint and returns either
 // the same bytes (when ≤ TargetRawImageBytes) or a JPEG-compressed version
 // that base64-encodes under client.MaxInlineImageBase64Bytes.
 //
 // Output mediaType is "image/jpeg" when conversion happened; otherwise input
-// mediaType is returned unchanged. Errors only when decode fails or every
-// fallback overshoots.
+// mediaType is returned unchanged. Errors when decode fails, dimensions
+// exceed MaxImagePixelBudget, or every fallback overshoots.
 func compressImage(data []byte, mediaType string) ([]byte, string, error) {
+	// Header-only dimension guard runs BEFORE the byte-size fast path. A
+	// uniform-color PNG of 100000×100000 px compresses to a few hundred KB
+	// (zlib RLE-style) — it would slide through the byte threshold and only
+	// blow up at image.Decode allocating ~40 GB of RGBA. DecodeConfig parses
+	// IHDR / VP8 / GIF header only, no pixel buffer commit. When DecodeConfig
+	// fails (corrupt header or unrecognized format) we fall through; the
+	// fast path preserves the legacy "passthrough invalid bytes" behavior
+	// downstream callers may rely on, and the slow path's image.Decode
+	// produces a clean decode error.
+	if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(data)); cfgErr == nil {
+		if int64(cfg.Width)*int64(cfg.Height) > MaxImagePixelBudget {
+			return nil, "", fmt.Errorf(
+				"image dimensions exceed pixel budget: %d×%d (limit %d px)",
+				cfg.Width, cfg.Height, MaxImagePixelBudget,
+			)
+		}
+	}
+
 	if len(data) <= TargetRawImageBytes {
 		return data, mediaType, nil
 	}

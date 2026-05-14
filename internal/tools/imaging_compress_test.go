@@ -202,3 +202,30 @@ func TestCompressInlineImageSource_UndecodableImageReturnsUnchangedSrc(t *testin
 		t.Fatal("undecodable image bytes should return src unchanged (same pointer)")
 	}
 }
+
+// TestCompressImage_RejectsPixelBomb verifies the DecodeConfig pre-check
+// blocks payloads whose declared dimensions would allocate too much RGBA
+// memory. Without the guard, a header claiming W×H > MaxImagePixelBudget
+// would let image.Decode commit ~W*H*4 bytes before downscaleToFit even
+// runs. Uses a uniform Gray bitmap so PNG zlib compresses tightly and the
+// fixture stays small on disk (under a few MB) while still claiming 9000×9000
+// (81 MP > 64 MP budget) in its IHDR header.
+func TestCompressImage_RejectsPixelBomb(t *testing.T) {
+	const dim = 9000 // 9000×9000 = 81 MP > MaxImagePixelBudget (64 MP)
+	img := image.NewGray(image.Rect(0, 0, dim, dim))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode pixel-bomb fixture: %v", err)
+	}
+	// Note: a uniform Gray bitmap zlib-compresses to ~100 KB even at 9000×9000,
+	// well under TargetRawImageBytes. This is exactly why the dimension guard
+	// must run BEFORE the byte-size fast path — a pixel bomb does not have to
+	// be a large byte payload.
+	_, _, err := compressImage(buf.Bytes(), "image/png")
+	if err == nil {
+		t.Fatal("expected dimension-budget rejection for 9000×9000 PNG, got nil")
+	}
+	if !strings.Contains(err.Error(), "pixel budget") {
+		t.Errorf("error should mention 'pixel budget', got: %v", err)
+	}
+}
