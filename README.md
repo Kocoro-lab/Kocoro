@@ -654,7 +654,8 @@ agent:
 
 # Tool settings
 tools:
-  bash_timeout: 120                # seconds (default: 120)
+  bash_timeout: 120                # default per-call timeout (seconds, default: 120)
+  bash_max_timeout: 600            # hard cap on per-call timeout (seconds, default: 600). Per-call `timeout` arg above this is clamped and a one-shot log line is emitted to stderr. Raise for slow integration suites; the cap protects UI cards from looking frozen for unbounded minutes before SIGKILL.
   bash_max_output: 30000           # max chars in bash output (default: 30000)
   result_truncation: 30000         # max chars in tool result (default: 30000)
   args_truncation: 200             # max chars in displayed args (default: 200)
