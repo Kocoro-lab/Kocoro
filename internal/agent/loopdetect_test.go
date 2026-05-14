@@ -1209,6 +1209,65 @@ func TestLoopDetector_NoProgress_BashMixedArgsRatio_GateIsolated(t *testing.T) {
 	})
 }
 
+// TestLoopDetector_NoProgress_FileReadUniqueArgs_NoNudge covers the
+// "user asked me to read N screenshots" fan-out pattern. In production this
+// triggered the NoProgress nudge "You've called file_read 13 times.
+// Summarize what you've learned and try a different approach" — the model
+// then fabricated an "exceeded context window" excuse to drop the task even
+// though the actual prompt was 22% of the 1M-token window (see PR #140
+// session 2026-05-14-9f885aef91c0). The fix: file_read must be batch-tolerant
+// the same way bash and read-verb MCP tools are, so the uniqueness gate
+// recognizes 13 distinct paths as legitimate fan-out instead of a stuck loop.
+func TestLoopDetector_NoProgress_FileReadUniqueArgs_NoNudge(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.batchTolerant = map[string]bool{"file_read": true}
+
+	for i := range 13 {
+		ld.Record("file_read", fmt.Sprintf(`{"path":"/Users/me/Desktop/shot_%02d.png"}`, i), false, "", "", false)
+		action, msg := ld.Check("file_read")
+		if action != LoopContinue {
+			t.Fatalf("call %d: unique-path file_read on batch-tolerant tool must stay Continue, got %v (%s)", i+1, action, msg)
+		}
+	}
+}
+
+// TestLoopDetector_NoProgress_GlobGrepUniqueArgs_NoNudge guards the same
+// fan-out invariant for glob and grep. Repository exploration legitimately
+// runs many distinct patterns; NoProgress nudges here forced premature
+// surrender in audit-log incidents.
+func TestLoopDetector_NoProgress_GlobGrepUniqueArgs_NoNudge(t *testing.T) {
+	for _, name := range []string{"glob", "grep"} {
+		t.Run(name, func(t *testing.T) {
+			ld := NewLoopDetector()
+			ld.batchTolerant = map[string]bool{name: true}
+			for i := range 13 {
+				ld.Record(name, fmt.Sprintf(`{"pattern":"q%02d*.go"}`, i), false, "", "", false)
+				action, msg := ld.Check(name)
+				if action != LoopContinue {
+					t.Fatalf("%s call %d: unique-args on batch-tolerant tool must stay Continue, got %v (%s)", name, i+1, action, msg)
+				}
+			}
+		})
+	}
+}
+
+// TestLoopDetector_NoProgress_FileReadIdenticalArgs_StillStops locks the
+// invariant that batch-tolerance must NOT relax identical-args spin
+// detection. 13 file_read calls on the SAME path indicates the model is
+// stuck, not enumerating — some detector must still catch it.
+func TestLoopDetector_NoProgress_FileReadIdenticalArgs_StillStops(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.batchTolerant = map[string]bool{"file_read": true}
+
+	for range 13 {
+		ld.Record("file_read", `{"path":"/same/file.png"}`, false, "", "", false)
+	}
+	action, msg := ld.Check("file_read")
+	if action == LoopContinue {
+		t.Fatalf("identical-path file_read ×13 must still be stopped by some detector, got Continue (%s)", msg)
+	}
+}
+
 // TestLoopDetector_UseSkill_RepeatedNeverFiresAnyDup documents production
 // issue: 9 force-stops in audit log on use_skill same-args ×3, iter=3,
 // killing queries before they were processed. use_skill is an idempotent

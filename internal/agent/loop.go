@@ -1868,15 +1868,29 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// silently truncating outputs.
 	const maxContinuations = 8 // cap max_tokens continuation attempts
 
-	// batch-tolerant set: bash + READ-verb MCP tool names only. On these
+	// batch-tolerant set: bash + READ-verb MCP tool names + read-only local
+	// fan-out tools (file_read / glob / grep / directory_list). On these
 	// tools, the NoProgress detector applies a uniqueness gate so
-	// legitimate batch enumerations (Task 5 / Task 6 benchmarks) are not
-	// force-stopped by name-count alone. Write-capable MCP tools
-	// (create_*, update_*, delete_*, send_*, …) deliberately STAY under
-	// the count-based guard — MCPTool.RequiresApproval() is always false
-	// and the permission engine does not gate MCP calls, so NoProgress
-	// is the only defense against write loops with unique arguments.
-	batchTolerant := map[string]bool{"bash": true}
+	// legitimate batch enumerations (Task 5 / Task 6 benchmarks, "read all N
+	// screenshots") are not force-stopped by name-count alone. The local
+	// read-only tools were added after #135 audit-log review showed the
+	// "read 13 desktop screenshots" workflow tripping the count-12 NoProgress
+	// nudge "Summarize what you've learned and try a different approach" —
+	// the model then fabricated an "exceeded context window" excuse and
+	// dropped the task even though the real prompt was 22% of the 1M-token
+	// window. Write-capable MCP tools (create_*, update_*, delete_*, send_*,
+	// …) deliberately STAY under the count-based guard — MCPTool.
+	// RequiresApproval() is always false and the permission engine does not
+	// gate MCP calls, so NoProgress is the only defense against write loops
+	// with unique arguments. Identical-args spin is still caught for the
+	// batch-tolerant tools (see TestLoopDetector_NoProgress_*_IdenticalArgs_StillStops).
+	batchTolerant := map[string]bool{
+		"bash":           true,
+		"file_read":      true,
+		"glob":           true,
+		"grep":           true,
+		"directory_list": true,
+	}
 	if a.tools != nil {
 		for _, n := range a.tools.MCPNames() {
 			if isReadMCPName(n) {
