@@ -2,6 +2,12 @@
 
 All notable changes to ShanClaw are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Changed
+
+- **`PUT /skills/{name}` returns 409 on existing slug instead of silent upsert** (`internal/daemon/server.go`, PR #139) — manual skill create / edit through the daemon HTTP API previously did a silent upsert (200 on update). Now mirrors `POST /skills/upload`'s conflict gate: returns `409` with `{error: "skill_already_exists", existing_name, existing_description, existing_prompt, new_description, new_prompt}` (prompts truncated to 8 KB via the shared `TruncatePromptPreview`) unless `?force=true` is appended to opt into overwrite. External callers using PUT as upsert (custom scripts, CI, third-party MCP clients) must update to either add `?force=true` or surface the side-by-side compare to the user. Builtin slugs (`kocoro`, `kocoro-generative-ui`) return `403 skill_is_builtin` regardless of `force` — `EnsureBuiltinSkills` would wipe overrides on next restart anyway. A malformed existing SKILL.md now returns `422` even with `force=true` to prevent silently clobbering security-critical fields like `AllowedTools` / `Metadata` on a transient FS error.
+
 ## v0.1.6 — 2026-05-12 — Inbound attachments + skill ZIP upload + episodic-memory default revert
 
 Ships inbound attachment support so cloud-fed PDFs and Office documents arrive over the WebSocket path with the right rendering treatment (PDF as a native Anthropic `document` block, DOCX/XLSX/PPTX as pre-extracted text), plus six new local document and archive tools so the daemon can handle the same file types locally. Adds a `POST /skills/upload` endpoint so users can install a skill from a local ZIP without going through ClawHub. Reverts the v0.1.5 "session sync + episodic memory on by default" change after operator feedback — both now default off, opt-in via Kocoro Desktop's Beta toggle.

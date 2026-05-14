@@ -2988,6 +2988,15 @@ func (s *Server) handlePutGlobalSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Builtin guard: refuse to write over kocoro / kocoro-generative-ui.
+	// Matches /skills/upload's ErrSkillIsBuiltin behavior — EnsureBuiltinSkills
+	// would wipe any override on the next daemon restart anyway, and during the
+	// running session a defaced kocoro misleads the AI about the daemon's HTTP
+	// surface. `force=true` does NOT override this; the guard is unconditional.
+	if skills.IsBuiltinSkill(name) {
+		writeError(w, http.StatusForbidden, "skill_is_builtin")
+		return
+	}
 	var req struct {
 		Description        string  `json:"description"`
 		Prompt             string  `json:"prompt"`
@@ -3010,6 +3019,16 @@ func (s *Server) handlePutGlobalSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "daemon deps not configured")
 		return
 	}
+	// Serialize concurrent writes to the same slug. Mirrors the lock
+	// InstallFromZipData takes for /skills/upload — without it, two PUTs
+	// racing on the same slug can both observe "no file on disk", both
+	// skip the conflict gate, and one of them clobbers AllowedTools /
+	// Metadata with the empty zero-value that the PUT body doesn't carry.
+	// Also gives PUT vs POST /skills/upload vs DELETE /skills/{name}
+	// mutual exclusion via the same SlugLocks instance — see
+	// handleDeleteGlobalSkill for the DELETE-side acquisition.
+	unlock := s.slugLocks.Lock(name)
+	defer unlock()
 	// Load the existing skill so we can preserve fields the PUT body doesn't
 	// carry (AllowedTools, Metadata, Compatibility). If the skill directory
 	// already exists but load fails, refuse the write rather than silently
@@ -3023,6 +3042,7 @@ func (s *Server) handlePutGlobalSkill(w http.ResponseWriter, r *http.Request) {
 			skillExistsOnDisk = true
 		}
 	}
+	loadedExisting := false
 	sources, err := s.skillSources()
 	if err != nil {
 		if skillExistsOnDisk {
@@ -3044,9 +3064,38 @@ func (s *Server) handlePutGlobalSkill(w http.ResponseWriter, r *http.Request) {
 		for _, existing := range list {
 			if existing.Slug == name {
 				skillToWrite = *existing
+				loadedExisting = true
 				break
 			}
 		}
+	}
+	// LoadSkills silently skips per-skill parse errors (loader.go fail-open).
+	// If the directory has a SKILL.md but the loader didn't return a match,
+	// the on-disk frontmatter is malformed. Refuse the write — letting force=true
+	// proceed here would clobber AllowedTools/Metadata with zero values, which
+	// is exactly what the comment above protects against on transient errors.
+	if skillExistsOnDisk && !loadedExisting {
+		writeError(w, http.StatusUnprocessableEntity,
+			fmt.Sprintf("existing skill %q has malformed SKILL.md frontmatter; fix or delete it before updating via PUT", name))
+		return
+	}
+	// Conflict gate: when a skill with this slug already exists and the
+	// caller did not opt into overwrite, return 409 with both sides'
+	// description+prompt so the Desktop client can present a compare sheet.
+	// Same JSON shape as /skills/upload's SkillConflictError, with prompts
+	// run through skills.TruncatePromptPreview so the response size is
+	// bounded the same way (≤ 8 KB per prompt) regardless of write path.
+	force := r.URL.Query().Get("force") == "true"
+	if skillExistsOnDisk && !force {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":                "skill_already_exists",
+			"existing_name":        name,
+			"existing_description": skillToWrite.Description,
+			"existing_prompt":      skills.TruncatePromptPreview(skillToWrite.Prompt),
+			"new_description":      req.Description,
+			"new_prompt":           skills.TruncatePromptPreview(req.Prompt),
+		})
+		return
 	}
 	skillToWrite.Slug = name
 	// Preserve the existing Name when updating; only overwrite if the
@@ -3089,6 +3138,13 @@ func (s *Server) handleDeleteGlobalSkill(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "daemon deps not configured")
 		return
 	}
+	// Serialize against concurrent PUT /skills/{name} and POST /skills/upload
+	// on the same slug. Without this lock, a PUT can read the existing skill,
+	// DELETE can race in and remove the directory, then PUT proceeds and
+	// recreates it with state copied from the deleted version. Same lock
+	// instance as handlePutGlobalSkill / InstallFromZipData / InstallFromMarketplace.
+	unlock := s.slugLocks.Lock(name)
+	defer unlock()
 	globalDir := filepath.Join(s.deps.ShannonDir, "skills", name)
 	skillFile := filepath.Join(globalDir, "SKILL.md")
 	if _, err := os.Stat(skillFile); err != nil {

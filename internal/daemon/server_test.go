@@ -88,6 +88,10 @@ func TestServer_GlobalSkillStickyRoundTrip(t *testing.T) {
 	}
 
 	reqBody := `{"description":"updated description","prompt":"# policy\n\nUpdated.","license":"Apache-2.0"}`
+	// First PUT without force: must hit the conflict gate since the seed
+	// already wrote a `policy` skill to disk. The Desktop client (Swift
+	// SkillsViewModel.save) surfaces the 409 as a compare sheet and the user
+	// must explicitly confirm overwrite before we retry with force=true.
 	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://127.0.0.1:%d/skills/policy", srv.Port()), strings.NewReader(reqBody))
 	if err != nil {
 		t.Fatal(err)
@@ -97,10 +101,30 @@ func TestServer_GlobalSkillStickyRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
+	if resp2.StatusCode != http.StatusConflict {
 		body, _ := io.ReadAll(resp2.Body)
-		t.Fatalf("PUT /skills/policy status = %d body=%s", resp2.StatusCode, string(body))
+		resp2.Body.Close()
+		t.Fatalf("first PUT /skills/policy status = %d body=%s, want 409", resp2.StatusCode, string(body))
+	}
+	resp2.Body.Close()
+
+	// Retry with ?force=true — equivalent to the user clicking "Overwrite"
+	// in the compare sheet, or to the edit-existing-skill flow where the
+	// frontend passes force=true unconditionally because edit implies overwrite.
+	forceURL := fmt.Sprintf("http://127.0.0.1:%d/skills/policy?force=true", srv.Port())
+	req, err = http.NewRequest(http.MethodPut, forceURL, strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp3, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp3.Body)
+		t.Fatalf("force PUT /skills/policy status = %d body=%s", resp3.StatusCode, string(body))
 	}
 
 	loaded, err := skills.LoadSkills(skills.SkillSource{
@@ -2187,6 +2211,252 @@ func TestServer_UploadSkill_ForceOverwrite(t *testing.T) {
 	if resp2.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp2.Body)
 		t.Fatalf("want 201, got %d: %s", resp2.StatusCode, body)
+	}
+}
+
+// TestServer_PutGlobalSkill_Conflict verifies the same conflict gate that
+// /skills/upload uses also applies to manual create via PUT /skills/{name}.
+// Response body shape must match /skills/upload so the Desktop client can
+// reuse SkillUploadConflict + SkillUploadCompareSheet.
+func TestServer_PutGlobalSkill_Conflict(t *testing.T) {
+	shannonDir := t.TempDir()
+	deps := &ServerDeps{ShannonDir: shannonDir}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/skills/manual-create", srv.Port())
+	body1 := `{"description":"v1 desc","prompt":"v1 prompt"}`
+	req, _ := http.NewRequest("PUT", url, strings.NewReader(body1))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first PUT want 200, got %d", resp.StatusCode)
+	}
+
+	body2 := `{"description":"v2 desc","prompt":"v2 prompt"}`
+	req2, _ := http.NewRequest("PUT", url, strings.NewReader(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("second PUT want 409, got %d", resp2.StatusCode)
+	}
+
+	var respBody map[string]string
+	json.NewDecoder(resp2.Body).Decode(&respBody)
+	if respBody["error"] != "skill_already_exists" {
+		t.Errorf("error = %q, want skill_already_exists", respBody["error"])
+	}
+	if respBody["existing_name"] != "manual-create" {
+		t.Errorf("existing_name = %q, want manual-create", respBody["existing_name"])
+	}
+	if respBody["existing_description"] != "v1 desc" {
+		t.Errorf("existing_description = %q, want v1 desc", respBody["existing_description"])
+	}
+	if respBody["existing_prompt"] != "v1 prompt" {
+		t.Errorf("existing_prompt = %q, want v1 prompt", respBody["existing_prompt"])
+	}
+	if respBody["new_description"] != "v2 desc" {
+		t.Errorf("new_description = %q, want v2 desc", respBody["new_description"])
+	}
+	if respBody["new_prompt"] != "v2 prompt" {
+		t.Errorf("new_prompt = %q, want v2 prompt", respBody["new_prompt"])
+	}
+}
+
+func TestServer_PutGlobalSkill_ForceOverwrite(t *testing.T) {
+	shannonDir := t.TempDir()
+	deps := &ServerDeps{ShannonDir: shannonDir}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/skills/manual-create", srv.Port())
+	body1 := `{"description":"v1 desc","prompt":"v1 prompt"}`
+	req, _ := http.NewRequest("PUT", url, strings.NewReader(body1))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("seed PUT want 200, got %d: %s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+
+	forceURL := url + "?force=true"
+	body2 := `{"description":"v2 desc","prompt":"v2 prompt"}`
+	req2, _ := http.NewRequest("PUT", forceURL, strings.NewReader(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("force PUT want 200, got %d: %s", resp2.StatusCode, b)
+	}
+}
+
+// TestServer_PutGlobalSkill_Builtin verifies that PUT cannot replace a builtin
+// (kocoro / kocoro-generative-ui) even with force=true — EnsureBuiltinSkills
+// would wipe any override on the next daemon restart, and during the running
+// session a defaced kocoro misleads the AI about the daemon's HTTP surface.
+// Mirrors TestServer_UploadSkill_Builtin which enforces the same guard on
+// /skills/upload.
+func TestServer_PutGlobalSkill_Builtin(t *testing.T) {
+	shannonDir := t.TempDir()
+	deps := &ServerDeps{ShannonDir: shannonDir}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	for _, slug := range []string{"kocoro", "kocoro-generative-ui"} {
+		for _, qs := range []string{"", "?force=true"} {
+			url := fmt.Sprintf("http://127.0.0.1:%d/skills/%s%s", srv.Port(), slug, qs)
+			body := `{"description":"hijack","prompt":"# hijack"}`
+			req, _ := http.NewRequest("PUT", url, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("%s %s: %v", slug, qs, err)
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("PUT %s%s: got %d %s, want 403", slug, qs, resp.StatusCode, b)
+			}
+			if !strings.Contains(string(b), "skill_is_builtin") {
+				t.Errorf("PUT %s%s: body = %s, want skill_is_builtin", slug, qs, b)
+			}
+		}
+	}
+}
+
+// TestServer_PutGlobalSkill_MalformedExisting verifies the boundary where a
+// SKILL.md exists on disk but its frontmatter fails to parse — LoadSkills
+// silently skips it (fail-open), so without an explicit guard force=true would
+// proceed and clobber the malformed file's AllowedTools/Metadata with zero
+// values. The handler must instead refuse with 422 so the user can fix or
+// delete the file first.
+func TestServer_PutGlobalSkill_MalformedExisting(t *testing.T) {
+	shannonDir := t.TempDir()
+	// Seed a malformed SKILL.md — no frontmatter at all, so loadSkillMD errors
+	// and LoadSkills logs+skips it.
+	globalDir := filepath.Join(shannonDir, "skills", "broken")
+	if err := os.MkdirAll(globalDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(globalDir, "SKILL.md"), []byte("no frontmatter here"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := &ServerDeps{ShannonDir: shannonDir}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	for _, qs := range []string{"", "?force=true"} {
+		url := fmt.Sprintf("http://127.0.0.1:%d/skills/broken%s", srv.Port(), qs)
+		body := `{"description":"fix","prompt":"# fix"}`
+		req, _ := http.NewRequest("PUT", url, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", qs, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			t.Errorf("PUT broken%s: got %d %s, want 422", qs, resp.StatusCode, b)
+		}
+		if !strings.Contains(string(b), "malformed") {
+			t.Errorf("PUT broken%s: body = %s, want 'malformed' hint", qs, b)
+		}
+	}
+}
+
+// TestServer_PutGlobalSkill_ConflictPromptTruncated verifies the 409 body caps
+// existing_prompt and new_prompt at skills.ConflictPromptPreviewBytes — without
+// the cap, an oversized existing prompt + oversized new prompt could produce a
+// ~100 MB JSON response (request body limit is 50 MB). Shares the cap with the
+// /skills/upload path via skills.TruncatePromptPreview.
+func TestServer_PutGlobalSkill_ConflictPromptTruncated(t *testing.T) {
+	shannonDir := t.TempDir()
+	bigPrompt := "# header\n\n" + strings.Repeat("A", skills.ConflictPromptPreviewBytes*2)
+	if err := skills.WriteGlobalSkill(shannonDir, &skills.Skill{
+		Name:        "policy",
+		Description: "policy description",
+		Prompt:      bigPrompt,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	deps := &ServerDeps{ShannonDir: shannonDir}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/skills/policy", srv.Port())
+	newPrompt := "# new\n\n" + strings.Repeat("B", skills.ConflictPromptPreviewBytes*2)
+	payload, _ := json.Marshal(map[string]string{"description": "new desc", "prompt": newPrompt})
+	req, _ := http.NewRequest("PUT", url, bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := len(body["existing_prompt"]); got > skills.ConflictPromptPreviewBytes {
+		t.Errorf("existing_prompt len = %d, want <= %d", got, skills.ConflictPromptPreviewBytes)
+	}
+	if got := len(body["new_prompt"]); got > skills.ConflictPromptPreviewBytes {
+		t.Errorf("new_prompt len = %d, want <= %d", got, skills.ConflictPromptPreviewBytes)
+	}
+	// Sanity: truncated previews must not be empty, otherwise the compare
+	// sheet has nothing to render.
+	if body["existing_prompt"] == "" || body["new_prompt"] == "" {
+		t.Errorf("truncated prompts should not be empty: existing=%q new=%q",
+			body["existing_prompt"], body["new_prompt"])
+	}
+	if !strings.Contains(body["existing_prompt"], "[truncated]") {
+		t.Errorf("existing_prompt missing [truncated] marker: %q", body["existing_prompt"])
+	}
+	if !strings.Contains(body["new_prompt"], "[truncated]") {
+		t.Errorf("new_prompt missing [truncated] marker: %q", body["new_prompt"])
 	}
 }
 

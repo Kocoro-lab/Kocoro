@@ -199,17 +199,18 @@ var (
 	ErrZipTooLarge = errors.New("zip payload too large")
 )
 
-// conflictPromptPreviewBytes caps the prompt fields surfaced in a 409 conflict
+// ConflictPromptPreviewBytes caps the prompt fields surfaced in a 409 conflict
 // response. ZIP payloads can be ~50 MB and the extracted SKILL.md prompt may
 // be most of that; returning the raw bytes inline produces an unmanageable
 // JSON response. 8 KB is enough for a meaningful compare preview while
-// keeping the response body bounded.
-const conflictPromptPreviewBytes = 8 * 1024
+// keeping the response body bounded. Exported so the daemon's PUT /skills/{name}
+// path can apply the same cap when surfacing the same 409 shape.
+const ConflictPromptPreviewBytes = 8 * 1024
 
 // SkillConflictError is returned by InstallFromZipData when a skill with the
 // same slug already exists globally and force=false. The handler encodes all
 // fields in the 409 body so the Desktop can render a side-by-side compare sheet.
-// ExistingPrompt and NewPrompt are truncated to conflictPromptPreviewBytes;
+// ExistingPrompt and NewPrompt are truncated to ConflictPromptPreviewBytes;
 // callers needing the full body should fetch GET /skills/{slug}.
 type SkillConflictError struct {
 	ExistingName        string
@@ -223,17 +224,19 @@ func (e *SkillConflictError) Error() string {
 	return fmt.Sprintf("skill %q already installed", e.ExistingName)
 }
 
-// truncatePromptPreview caps a prompt body at conflictPromptPreviewBytes
+// TruncatePromptPreview caps a prompt body at ConflictPromptPreviewBytes
 // (total byte length including the marker), appending "[truncated]" so
 // callers know the value is partial and can follow up with GET /skills/{slug}
 // for the full body. Walks back to a rune boundary so multibyte content
-// isn't cut mid-codepoint.
-func truncatePromptPreview(s string) string {
-	if len(s) <= conflictPromptPreviewBytes {
+// isn't cut mid-codepoint. Used by both /skills/upload (zip path) and
+// PUT /skills/{name} (manual create/update path) so the 409 body shape and
+// caps stay aligned across write endpoints.
+func TruncatePromptPreview(s string) string {
+	if len(s) <= ConflictPromptPreviewBytes {
 		return s
 	}
 	const marker = "\n\n[truncated]"
-	budget := conflictPromptPreviewBytes - len(marker)
+	budget := ConflictPromptPreviewBytes - len(marker)
 	if budget < 0 {
 		budget = 0
 	}
@@ -448,11 +451,11 @@ func InstallFromZipData(shannonDir string, body io.Reader, force bool, locks *Sl
 		conflict := &SkillConflictError{ExistingName: slug}
 		if existing != nil {
 			conflict.ExistingDescription = existing.Description
-			conflict.ExistingPrompt = truncatePromptPreview(existing.Prompt)
+			conflict.ExistingPrompt = TruncatePromptPreview(existing.Prompt)
 		}
 		if uploaded != nil {
 			conflict.NewDescription = uploaded.Description
-			conflict.NewPrompt = truncatePromptPreview(uploaded.Prompt)
+			conflict.NewPrompt = TruncatePromptPreview(uploaded.Prompt)
 		}
 		return nil, conflict
 	}

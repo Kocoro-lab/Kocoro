@@ -1358,11 +1358,11 @@ func TestInstallFromZipData_ConflictPromptTruncation(t *testing.T) {
 	if !errors.As(err, &conflict) {
 		t.Fatalf("want SkillConflictError, got %v", err)
 	}
-	if len(conflict.ExistingPrompt) > conflictPromptPreviewBytes {
-		t.Errorf("ExistingPrompt len = %d, want <= %d", len(conflict.ExistingPrompt), conflictPromptPreviewBytes)
+	if len(conflict.ExistingPrompt) > ConflictPromptPreviewBytes {
+		t.Errorf("ExistingPrompt len = %d, want <= %d", len(conflict.ExistingPrompt), ConflictPromptPreviewBytes)
 	}
-	if len(conflict.NewPrompt) > conflictPromptPreviewBytes {
-		t.Errorf("NewPrompt len = %d, want <= %d", len(conflict.NewPrompt), conflictPromptPreviewBytes)
+	if len(conflict.NewPrompt) > ConflictPromptPreviewBytes {
+		t.Errorf("NewPrompt len = %d, want <= %d", len(conflict.NewPrompt), ConflictPromptPreviewBytes)
 	}
 	// Truncated prompts must still convey content (not be empty).
 	if conflict.ExistingPrompt == "" || conflict.NewPrompt == "" {

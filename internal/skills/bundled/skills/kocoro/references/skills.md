@@ -50,12 +50,17 @@ Skills are knowledge packages that teach agents specific abilities — like read
 - Response 422: invalid skill payload (missing SKILL.md, malformed frontmatter, invalid name)
 - Notes: GitHub/Finder-style ZIPs (single top-level directory) are auto-unwrapped, and `__MACOSX` metadata directories are ignored. The slug is derived from the SKILL.md frontmatter `name` field. Use `force=true` to overwrite an existing user-installed skill (does not apply to builtins). The 409 body includes both existing and new descriptions/prompts so the frontend can render a side-by-side compare sheet. `install_source` is set to `local` to distinguish uploads from `bundled` / `marketplace` installs.
 
-### Update a custom skill
+### Create or update a custom skill
 - Method: PUT
-- Path: /skills/{slug}
+- Path: /skills/{slug}?force=true
 - Body: `{"description": "...", "prompt": "# My Skill\n\n..."}`
-- Response: `{"status": "updated"}`
-- Notes: For skills you have created or customized. The `{slug}` path segment is the directory identifier (from GET /skills). Bundled skills should be reinstalled rather than edited. The existing frontmatter `name` (display label) is preserved; supply a fresh name via the payload only when renaming intentionally.
+- Response 200: `{"status": "updated"}`
+- Response 409: `{"error": "skill_already_exists", "existing_name": "...", "existing_description": "...", "existing_prompt": "...", "new_description": "...", "new_prompt": "..."}` — same shape as POST /skills/upload so frontends can reuse one compare sheet.
+- Response 403: `{"error": "skill_is_builtin"}` — `{slug}` is an auto-installed builtin (`kocoro`, `kocoro-generative-ui`). `force=true` does NOT override this; the guard is unconditional because `EnsureBuiltinSkills` would wipe any override on the next daemon restart.
+- Response 422: existing on-disk SKILL.md has malformed frontmatter; fix or delete the directory before retrying.
+- Response 400: missing `description` or `prompt` in the body.
+- Response 503: cannot resolve skill sources or LoadSkills failed while an existing skill is on disk — refused to clobber AllowedTools/Metadata. Transient; retry.
+- Notes: PUT is the single endpoint for both **create new** and **update existing**. Without `force=true`, the daemon refuses to overwrite an existing slug and returns 409 with both sides' description+prompt (each capped at ~8 KB with a `[truncated]` marker — fetch GET /skills/{slug} for the full body). Two-step flow for new skills: send PUT first; on 409, prompt the user with a compare sheet; on confirm, retry with `?force=true`. One-step flow for the edit-existing-skill UI: pass `force=true` unconditionally because edit implies overwrite. The `{slug}` path segment is the directory identifier (from GET /skills). Bundled skills should be reinstalled rather than edited. The existing frontmatter `name` (display label) is preserved on update; supply a fresh name via the payload only when renaming intentionally. AllowedTools/Metadata/Compatibility from the existing SKILL.md are preserved across the write — the PUT body cannot drop them.
 
 ### Delete a skill
 - Method: DELETE
