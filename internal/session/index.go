@@ -26,7 +26,8 @@ import (
 //	2 — trigram tokenizer; native snippet() on original text.
 //	3 — adds source column to sessions table for sync.exclude_sources.
 //	4 — adds route_key column for daemon route resume after restart.
-const indexSchemaVersion = 4
+//	5 — adds pinned + favorite columns for session pin/star UI.
+const indexSchemaVersion = 5
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -40,7 +41,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at DATETIME NOT NULL,
     msg_count  INTEGER NOT NULL DEFAULT 0,
     source     TEXT NOT NULL DEFAULT '',
-    route_key  TEXT NOT NULL DEFAULT ''
+    route_key  TEXT NOT NULL DEFAULT '',
+    pinned     INTEGER NOT NULL DEFAULT 0,
+    favorite   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -144,6 +147,18 @@ func OpenIndex(dir string) (*Index, error) {
 					return nil, fmt.Errorf("add route_key column: %w", err)
 				}
 			}
+			if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					db.Close()
+					return nil, fmt.Errorf("add pinned column: %w", err)
+				}
+			}
+			if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					db.Close()
+					return nil, fmt.Errorf("add favorite column: %w", err)
+				}
+			}
 			// Only flag rebuild when there was actual prior data to migrate.
 			// For a truly fresh DB (stored==0, no sessions rows), NewStore's
 			// IsEmpty check will cover the no-op case.
@@ -184,14 +199,24 @@ func (idx *Index) UpsertSession(sess *Session) error {
 
 	// Upsert session row first (FK parent for messages).
 	// msg_count is set to 0 initially and updated after indexing.
+	pinned := 0
+	if sess.Pinned {
+		pinned = 1
+	}
+	favorite := 0
+	if sess.Favorite {
+		favorite = 1
+	}
 	_, err = tx.Exec(
-		`INSERT OR REPLACE INTO sessions (id, title, cwd, created_at, updated_at, msg_count, source, route_key)
-		 VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
+		`INSERT OR REPLACE INTO sessions (id, title, cwd, created_at, updated_at, msg_count, source, route_key, pinned, favorite)
+		 VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
 		sess.ID, sess.Title, sess.CWD,
 		sess.CreatedAt.Format(time.RFC3339Nano),
 		sess.UpdatedAt.Format(time.RFC3339Nano),
 		sess.Source,
 		sess.RouteKey,
+		pinned,
+		favorite,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -230,9 +255,56 @@ func (idx *Index) UpsertSession(sess *Session) error {
 	return tx.Commit()
 }
 
+// UpdateSessionFlags applies a narrow UPDATE to just the pinned/favorite
+// columns. Unlike UpsertSession, it does not touch the messages table or
+// FTS index, so a pin/star toggle on a long session is cheap. Either
+// pointer may be nil to leave that column unchanged. Returns os.ErrNotExist
+// when no row matches id.
+func (idx *Index) UpdateSessionFlags(id string, pinned, favorite *bool) error {
+	if pinned == nil && favorite == nil {
+		return nil
+	}
+	// COALESCE keeps the existing column value when the corresponding
+	// parameter is nil. SQLite has no native bool, so map *bool → *int.
+	var pinnedArg, favoriteArg interface{}
+	if pinned != nil {
+		v := 0
+		if *pinned {
+			v = 1
+		}
+		pinnedArg = v
+	}
+	if favorite != nil {
+		v := 0
+		if *favorite {
+			v = 1
+		}
+		favoriteArg = v
+	}
+	res, err := idx.db.Exec(
+		`UPDATE sessions
+		    SET pinned   = COALESCE(?, pinned),
+		        favorite = COALESCE(?, favorite)
+		  WHERE id = ?`,
+		pinnedArg, favoriteArg, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update session flags: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if n == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
 func (idx *Index) ListSessions() ([]SessionSummary, error) {
 	rows, err := idx.db.Query(
-		`SELECT id, title, created_at, msg_count, source FROM sessions ORDER BY created_at DESC`,
+		`SELECT id, title, created_at, msg_count, source, pinned, favorite
+		 FROM sessions ORDER BY pinned DESC, created_at DESC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
@@ -243,10 +315,13 @@ func (idx *Index) ListSessions() ([]SessionSummary, error) {
 	for rows.Next() {
 		var s SessionSummary
 		var createdStr string
-		if err := rows.Scan(&s.ID, &s.Title, &createdStr, &s.MsgCount, &s.Source); err != nil {
+		var pinned, favorite int
+		if err := rows.Scan(&s.ID, &s.Title, &createdStr, &s.MsgCount, &s.Source, &pinned, &favorite); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		s.CreatedAt = parseTime(createdStr)
+		s.Pinned = pinned != 0
+		s.Favorite = favorite != 0
 		summaries = append(summaries, s)
 	}
 	return summaries, rows.Err()

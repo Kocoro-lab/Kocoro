@@ -579,3 +579,148 @@ func TestSession_LastSeenModel(t *testing.T) {
 		}
 	})
 }
+
+func TestStore_PatchFlags(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+
+	original := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	store.Save(&Session{ID: "sess1", Title: "Hello", UpdatedAt: original})
+
+	tru, fls := true, false
+
+	t.Run("pinned only", func(t *testing.T) {
+		if err := store.PatchFlags("sess1", &tru, nil); err != nil {
+			t.Fatalf("PatchFlags: %v", err)
+		}
+		s, _ := store.Load("sess1")
+		if !s.Pinned {
+			t.Error("expected Pinned=true")
+		}
+		if s.Favorite {
+			t.Error("expected Favorite=false (untouched)")
+		}
+	})
+
+	t.Run("favorite only leaves pinned intact", func(t *testing.T) {
+		if err := store.PatchFlags("sess1", nil, &tru); err != nil {
+			t.Fatalf("PatchFlags: %v", err)
+		}
+		s, _ := store.Load("sess1")
+		if !s.Pinned {
+			t.Error("expected Pinned still true")
+		}
+		if !s.Favorite {
+			t.Error("expected Favorite=true")
+		}
+	})
+
+	t.Run("both clear", func(t *testing.T) {
+		if err := store.PatchFlags("sess1", &fls, &fls); err != nil {
+			t.Fatalf("PatchFlags: %v", err)
+		}
+		s, _ := store.Load("sess1")
+		if s.Pinned || s.Favorite {
+			t.Errorf("expected both false, got pinned=%v favorite=%v", s.Pinned, s.Favorite)
+		}
+	})
+
+	t.Run("both nil is no-op", func(t *testing.T) {
+		before, _ := store.Load("sess1")
+		if err := store.PatchFlags("sess1", nil, nil); err != nil {
+			t.Fatalf("PatchFlags: %v", err)
+		}
+		after, _ := store.Load("sess1")
+		if !after.UpdatedAt.Equal(before.UpdatedAt) {
+			t.Error("no-op patch must not touch UpdatedAt")
+		}
+	})
+
+	t.Run("PatchFlags does not bump UpdatedAt", func(t *testing.T) {
+		before, _ := store.Load("sess1")
+		if err := store.PatchFlags("sess1", &tru, nil); err != nil {
+			t.Fatalf("PatchFlags: %v", err)
+		}
+		after, _ := store.Load("sess1")
+		if !after.UpdatedAt.Equal(before.UpdatedAt) {
+			t.Errorf("UpdatedAt changed: before=%v after=%v", before.UpdatedAt, after.UpdatedAt)
+		}
+	})
+
+	t.Run("unknown id returns error", func(t *testing.T) {
+		if err := store.PatchFlags("does-not-exist", &tru, nil); err == nil {
+			t.Error("expected error for missing session")
+		}
+	})
+
+	t.Run("pinned floats to top of List", func(t *testing.T) {
+		// sess1 already exists (CreatedAt earlier). Save a newer non-pinned
+		// session, then pin sess1 — pinned must outrank recency.
+		store.Save(&Session{ID: "sess2", Title: "Newer", CreatedAt: time.Now()})
+		store.PatchFlags("sess1", &tru, nil)
+		store.PatchFlags("sess2", &fls, nil)
+
+		sums, err := store.List()
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if len(sums) < 2 {
+			t.Fatalf("expected >=2, got %d", len(sums))
+		}
+		if sums[0].ID != "sess1" {
+			t.Errorf("expected pinned sess1 first, got %q (full: %+v)", sums[0].ID, sums)
+		}
+		if !sums[0].Pinned {
+			t.Error("expected summary Pinned=true")
+		}
+	})
+
+	t.Run("self-heals when index row is missing", func(t *testing.T) {
+		// Simulate the broken state: JSON on disk, no row in the SQLite
+		// sessions table. Reachable via manual session import, prior
+		// best-effort UpsertSession failure during Save, or partial
+		// index corruption.
+		orphan := &Session{ID: "orphan", Title: "lost", CreatedAt: time.Now()}
+		if err := store.Save(orphan); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+		// Drop the index row directly; JSON file remains.
+		if _, err := store.index.db.Exec(`DELETE FROM sessions WHERE id = ?`, "orphan"); err != nil {
+			t.Fatalf("seed drop row: %v", err)
+		}
+		// Sanity: List no longer shows the orphan.
+		for _, s := range mustList(t, store) {
+			if s.ID == "orphan" {
+				t.Fatal("orphan should be absent from List after row drop")
+			}
+		}
+
+		// Pin the orphan. PatchFlags must detect the missing row and
+		// fall back to UpsertSession so the session re-enters the index.
+		if err := store.PatchFlags("orphan", &tru, nil); err != nil {
+			t.Fatalf("PatchFlags: %v", err)
+		}
+
+		found := false
+		for _, s := range mustList(t, store) {
+			if s.ID == "orphan" {
+				found = true
+				if !s.Pinned {
+					t.Errorf("re-inserted row should be Pinned=true, got %+v", s)
+				}
+			}
+		}
+		if !found {
+			t.Error("orphan not re-inserted into index — PatchFlags silently failed")
+		}
+	})
+}
+
+func mustList(t *testing.T, store *Store) []SessionSummary {
+	t.Helper()
+	sums, err := store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	return sums
+}
