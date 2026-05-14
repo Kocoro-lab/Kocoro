@@ -4861,3 +4861,378 @@ func TestAgentLoop_CaptureSentRequest_AlsoDeepCopiesOnWrite(t *testing.T) {
 		t.Errorf("snapshot Tools aliased to caller: got %+v, want file_read", snap.Tools)
 	}
 }
+
+// TestOperationalRules_FullByteEqualWhenThinkRegistered verifies that when
+// the think tool IS in the registry, operationalRules() returns the exact
+// coreOperationalRules constant — no byte drift in the system prompt vs
+// older builds that ran with think always registered. Critical for the
+// Anthropic prompt-cache prefix-hash stability invariant.
+func TestOperationalRules_FullByteEqualWhenThinkRegistered(t *testing.T) {
+	loop := &AgentLoop{tools: NewToolRegistry()}
+	loop.tools.Register(&fakeThinkTool{})
+	got := loop.operationalRules()
+	if got != coreOperationalRules {
+		t.Errorf("operationalRules() must equal coreOperationalRules byte-for-byte when think registered; len got=%d want=%d", len(got), len(coreOperationalRules))
+	}
+}
+
+// TestOperationalRules_StripsBulletWhenThinkUnregistered verifies that the
+// `### Planning` section is removed when the think tool is not registered,
+// while other sections remain intact and spacing stays clean.
+func TestOperationalRules_StripsBulletWhenThinkUnregistered(t *testing.T) {
+	loop := &AgentLoop{tools: NewToolRegistry()}
+	// Intentionally do NOT register think.
+	got := loop.operationalRules()
+
+	if strings.Contains(got, "- think: Append a structured thought") {
+		t.Error("planning bullet text must not appear when think unregistered")
+	}
+	if strings.Contains(got, "### Planning") {
+		t.Error("'### Planning' header must not appear when think unregistered")
+	}
+	// Surrounding sections must remain.
+	if !strings.Contains(got, "## Approach") {
+		t.Error("pre-planning '## Approach' section missing")
+	}
+	if !strings.Contains(got, "### System") {
+		t.Error("post-planning '### System' section missing")
+	}
+	// Spacing: '### System' must be preceded by a blank line (i.e. `\n\n### System`),
+	// not by triple-newline (would happen if removal substring was wrong).
+	if strings.Contains(got, "\n\n\n### System") {
+		t.Error("triple newline before ### System — planning removal left extra blank line")
+	}
+}
+
+// TestOperationalRules_NilRegistryStripsBullet covers the safety case where
+// the registry hasn't been populated yet (Has() returns false). Should behave
+// the same as "think not registered".
+func TestOperationalRules_NilRegistryStripsBullet(t *testing.T) {
+	loop := &AgentLoop{tools: nil}
+	got := loop.operationalRules()
+	if strings.Contains(got, "- think: Append a structured thought") {
+		t.Error("planning bullet must not appear when registry is nil")
+	}
+}
+
+// fakeThinkTool is a minimal Tool used in tests that need a registry where
+// `think` is present without depending on the real ThinkTool implementation
+// (which lives in internal/tools, downstream of internal/agent).
+type fakeThinkTool struct{}
+
+func (f *fakeThinkTool) Info() ToolInfo {
+	return ToolInfo{Name: "think", Description: "stub for tests"}
+}
+
+func (f *fakeThinkTool) Run(_ context.Context, _ string) (ToolResult, error) {
+	return ToolResult{Content: "stub"}, nil
+}
+
+func (f *fakeThinkTool) RequiresApproval() bool { return false }
+
+// TestBuildAssistantMessage_PrefersContentBlocksWhenPresent verifies that
+// when Cloud emits the new content_blocks wire field, we pass the verbatim
+// ordered list through (including interleaved thinking + signatures).
+func TestBuildAssistantMessage_PrefersContentBlocksWhenPresent(t *testing.T) {
+	resp := &client.CompletionResponse{
+		OutputText:   "visible",
+		FinishReason: "tool_use",
+		ToolCalls:    []client.FunctionCall{{ID: "t1", Name: "f", Arguments: json.RawMessage(`{}`)}},
+		ContentBlocks: []client.ContentBlock{
+			{Type: "thinking", Thinking: "first reasoning", Signature: "sigA"},
+			{Type: "text", Text: "visible"},
+			{Type: "tool_use", ID: "t1", Name: "f", Input: json.RawMessage(`{}`)},
+			{Type: "thinking", Thinking: "interleaved reasoning", Signature: "sigB"},
+		},
+	}
+	msg := buildAssistantMessage(resp, "ignored normalized preamble")
+	if msg.Role != "assistant" {
+		t.Fatalf("Role = %q, want assistant", msg.Role)
+	}
+	blocks := msg.Content.Blocks()
+	if len(blocks) != 4 {
+		t.Fatalf("expected 4 blocks (verbatim from ContentBlocks), got %d: %+v", len(blocks), blocks)
+	}
+	want := []string{"thinking", "text", "tool_use", "thinking"}
+	for i, w := range want {
+		if blocks[i].Type != w {
+			t.Errorf("blocks[%d].Type = %q, want %q (order must be preserved)", i, blocks[i].Type, w)
+		}
+	}
+	if blocks[0].Signature != "sigA" || blocks[3].Signature != "sigB" {
+		t.Errorf("signatures lost: %+v", blocks)
+	}
+	// The normalizedToolText argument MUST be ignored when ContentBlocks is present.
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text == "ignored normalized preamble" {
+			t.Error("normalizedToolText leaked into output when ContentBlocks already had a text block")
+		}
+	}
+}
+
+// TestBuildAssistantMessage_LegacyFallbackUsesAllToolCalls verifies the
+// legacy code path (Cloud without content_blocks) rebuilds text+tool_use
+// using AllToolCalls — handles both FunctionCall (single, legacy) and
+// ToolCalls (array, modern) shapes.
+func TestBuildAssistantMessage_LegacyFallbackUsesAllToolCalls(t *testing.T) {
+	resp := &client.CompletionResponse{
+		OutputText:   "hello world",
+		FinishReason: "tool_use",
+		// Use the single FunctionCall shape (legacy / non-array providers).
+		FunctionCall: &client.FunctionCall{ID: "fc1", Name: "file_read", Arguments: json.RawMessage(`{"path":"/x"}`)},
+		// ContentBlocks intentionally nil — exercise legacy fallback.
+	}
+	msg := buildAssistantMessage(resp, "hello world")
+	blocks := msg.Content.Blocks()
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks (text+tool_use), got %d: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "text" || blocks[0].Text != "hello world" {
+		t.Errorf("first block must be text from normalizedToolText, got %+v", blocks[0])
+	}
+	if blocks[1].Type != "tool_use" || blocks[1].Name != "file_read" {
+		t.Errorf("second block must be tool_use from FunctionCall, got %+v", blocks[1])
+	}
+}
+
+// TestBuildAssistantMessage_EmptyPreambleSkipsTextBlock matches the prior
+// inline behavior at loop.go:3207 — when the model produced ONLY tool_use
+// (no preamble text), the assistant message must contain only tool_use
+// blocks. Emitting an empty text block here would change wire bytes.
+func TestBuildAssistantMessage_EmptyPreambleSkipsTextBlock(t *testing.T) {
+	resp := &client.CompletionResponse{
+		FinishReason: "tool_use",
+		ToolCalls:    []client.FunctionCall{{ID: "t1", Name: "bash", Arguments: json.RawMessage(`{"cmd":"ls"}`)}},
+	}
+	msg := buildAssistantMessage(resp, "") // empty preamble
+	blocks := msg.Content.Blocks()
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block (tool_use only), got %d: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "tool_use" {
+		t.Errorf("expected tool_use only, got %q", blocks[0].Type)
+	}
+}
+
+// TestBuildAssistantMessage_NilResponseReturnsEmpty defends against a
+// caller accidentally passing nil — should produce an empty assistant
+// message rather than panic.
+func TestBuildAssistantMessage_NilResponseReturnsEmpty(t *testing.T) {
+	msg := buildAssistantMessage(nil, "")
+	if msg.Role != "assistant" {
+		t.Errorf("Role = %q, want assistant", msg.Role)
+	}
+	if len(msg.Content.Blocks()) != 0 {
+		t.Errorf("expected zero blocks for nil response, got %+v", msg.Content.Blocks())
+	}
+}
+
+// TestMessagesForLLM_PreservesThinkingBlocks locks the invariant that the
+// pre-flight sanitizer pipeline (oversize image filter, etc.) does NOT
+// strip thinking content blocks from assistant messages. CC rule 3
+// requires those blocks survive the trajectory.
+func TestMessagesForLLM_PreservesThinkingBlocks(t *testing.T) {
+	loop := &AgentLoop{}
+	in := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "thinking", Thinking: "plan", Signature: "sigA"},
+			{Type: "text", Text: "ok"},
+			{Type: "tool_use", ID: "t1", Name: "file_read", Input: json.RawMessage(`{"path":"/x"}`)},
+			{Type: "thinking", Thinking: "interleaved", Signature: "sigB"},
+		})},
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "tool_result", ToolUseID: "t1", ToolContent: "data"},
+		})},
+	}
+	out := loop.messagesForLLM(in)
+
+	var asst *client.Message
+	for i := range out {
+		if out[i].Role == "assistant" {
+			asst = &out[i]
+			break
+		}
+	}
+	if asst == nil {
+		t.Fatal("assistant message dropped by messagesForLLM")
+	}
+	gotSigs := map[string]bool{}
+	for _, b := range asst.Content.Blocks() {
+		if b.Type == "thinking" {
+			gotSigs[b.Signature] = true
+		}
+	}
+	if !gotSigs["sigA"] || !gotSigs["sigB"] {
+		t.Errorf("thinking blocks (or signatures) lost in messagesForLLM; gotSigs=%v", gotSigs)
+	}
+}
+
+// TestTimeBasedCompact_DoesNotTouchThinkingBlocks: the time-based clearing
+// pass only mutates user-role tool_result blocks (whitelist in
+// timebasedcompact.go `compactableTools`). Assistant-side thinking blocks
+// must survive untouched even when compaction clears the oldest results.
+func TestTimeBasedCompact_DoesNotTouchThinkingBlocks(t *testing.T) {
+	// Build a 4-turn history: 2 old (compactable) + 2 recent (preserved).
+	mkAsst := func(thoughtSig string, toolID string) client.Message {
+		return client.Message{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "thinking", Thinking: "reasoning-" + thoughtSig, Signature: thoughtSig},
+			{Type: "tool_use", ID: toolID, Name: "file_read", Input: json.RawMessage(`{}`)},
+		})}
+	}
+	mkResult := func(toolID, body string) client.Message {
+		return client.Message{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "tool_result", ToolUseID: toolID, ToolContent: body},
+		})}
+	}
+	messages := []client.Message{
+		mkAsst("sigOldA", "t1"), mkResult("t1", "old body 1"),
+		mkAsst("sigOldB", "t2"), mkResult("t2", "old body 2"),
+		mkAsst("sigRecent", "t3"), mkResult("t3", "recent body"),
+	}
+
+	cfg := TimeBasedCompactConfig{Enabled: true, GapThresholdMinutes: 1, KeepRecent: 1}
+	// Set lastAssistantAt deep in the past so trigger fires.
+	cleared := timeBasedCompact(messages, time.Now().Add(-2*time.Hour), cfg)
+	if cleared == 0 {
+		t.Fatalf("expected at least one tool_result cleared")
+	}
+
+	// Verify thinking blocks across ALL assistant messages survived intact.
+	wantSigs := []string{"sigOldA", "sigOldB", "sigRecent"}
+	gotSigs := map[string]string{}
+	for _, m := range messages {
+		if m.Role != "assistant" {
+			continue
+		}
+		for _, b := range m.Content.Blocks() {
+			if b.Type == "thinking" {
+				gotSigs[b.Signature] = b.Thinking
+			}
+		}
+	}
+	for _, want := range wantSigs {
+		if _, ok := gotSigs[want]; !ok {
+			t.Errorf("thinking signature %q stripped by time-based compaction; got %v", want, gotSigs)
+		}
+	}
+}
+
+// capturingLLMClient is a fake client.LLMClient that records every
+// CompletionRequest it receives, then returns a programmable response
+// per call. Lets integration tests inspect what the loop sent upstream.
+type capturingLLMClient struct {
+	requests  []client.CompletionRequest
+	responses []*client.CompletionResponse
+	idx       int
+}
+
+func (c *capturingLLMClient) Complete(_ context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
+	c.requests = append(c.requests, req)
+	if c.idx >= len(c.responses) {
+		// Default: empty text, stop reason — terminates the loop cleanly.
+		return &client.CompletionResponse{FinishReason: "stop"}, nil
+	}
+	resp := c.responses[c.idx]
+	c.idx++
+	return resp, nil
+}
+
+func (c *capturingLLMClient) CompleteStream(ctx context.Context, req client.CompletionRequest, _ func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return c.Complete(ctx, req)
+}
+
+// stubBashLikeTool is a no-approval, always-success Tool used by integration
+// tests where we don't care about the tool's behavior, only that it exists
+// and returns a result.
+type stubBashLikeTool struct{ name string }
+
+func (s *stubBashLikeTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        s.name,
+		Description: "stub for tests",
+		Parameters: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"command": map[string]any{"type": "string"}},
+		},
+	}
+}
+func (s *stubBashLikeTool) Run(_ context.Context, _ string) (ToolResult, error) {
+	return ToolResult{Content: "ok"}, nil
+}
+func (s *stubBashLikeTool) RequiresApproval() bool { return false }
+
+// TestAgentLoop_NativeToolUsePath_PreservesThinkingInTrajectory pins the
+// call-site wire contract for `buildAssistantMessage` at loop.go:3265.
+// When the LLM response carries ContentBlocks (Cloud ≥ 2026-05 wire),
+// the assistant message added to history must be the verbatim ordered
+// list — so the SECOND turn's request to the LLM includes the thinking
+// block in the trajectory. Without this guard a refactor could silently
+// revert the call site to direct text+tool_use reconstruction, breaking
+// Anthropic's preserved-thinking-blocks contract.
+func TestAgentLoop_NativeToolUsePath_PreservesThinkingInTrajectory(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&stubBashLikeTool{name: "stub_tool"})
+
+	cap := &capturingLLMClient{
+		responses: []*client.CompletionResponse{
+			// Turn 1: native tool_use with interleaved thinking blocks.
+			{
+				OutputText:   "",
+				FinishReason: "tool_use",
+				ToolCalls:    []client.FunctionCall{{ID: "toolu_T1", Name: "stub_tool", Arguments: json.RawMessage(`{"command":"echo hi"}`)}},
+				ContentBlocks: []client.ContentBlock{
+					{Type: "thinking", Thinking: "let me call stub_tool first", Signature: "sigA"},
+					{Type: "tool_use", ID: "toolu_T1", Name: "stub_tool", Input: json.RawMessage(`{"command":"echo hi"}`)},
+				},
+			},
+			// Turn 2: final text answer, terminates the loop.
+			{OutputText: "done", FinishReason: "stop"},
+		},
+	}
+
+	loop := NewAgentLoop(cap, reg, "medium", "", 5, 2000, 200, nil, nil, nil)
+	loop.SetEnableStreaming(false)
+	handler := &mockHandler{approveResult: true}
+	loop.SetHandler(handler)
+
+	_, _, err := loop.Run(context.Background(), "go", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(cap.requests) < 2 {
+		t.Fatalf("expected at least 2 LLM calls, got %d", len(cap.requests))
+	}
+
+	// Inspect the SECOND request: must include the turn-1 assistant message
+	// with the thinking block in the trajectory.
+	turn2Msgs := cap.requests[1].Messages
+	var sawThinkingWithSig bool
+	for _, m := range turn2Msgs {
+		if m.Role != "assistant" {
+			continue
+		}
+		for _, b := range m.Content.Blocks() {
+			if b.Type == "thinking" && b.Signature == "sigA" {
+				sawThinkingWithSig = true
+			}
+		}
+	}
+	if !sawThinkingWithSig {
+		// Dump for debugging.
+		for i, m := range turn2Msgs {
+			role := m.Role
+			if m.Content.HasBlocks() {
+				types := []string{}
+				for _, b := range m.Content.Blocks() {
+					types = append(types, b.Type)
+				}
+				t.Logf("turn2 msg[%d] %s blocks=%v", i, role, types)
+			} else {
+				t.Logf("turn2 msg[%d] %s text=%q", i, role, m.Content.Text())
+			}
+		}
+		t.Fatal("thinking block with signature 'sigA' was not present in turn-2 trajectory — buildAssistantMessage call site regressed")
+	}
+}

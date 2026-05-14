@@ -309,6 +309,16 @@ const defaultPersona = "You are Kocoro, an AI assistant on the user's macOS comp
 	"You have local tools (file ops, shell, GUI control) and remote server tools (web search, research, analytics, multi-agent workflows). " +
 	"For platform setup and configuration (creating agents, installing skills, managing settings, connecting external services), load the kocoro skill for detailed guidance."
 
+// planningBulletSection is the exact substring inside coreOperationalRules
+// that documents the `think` tool. When the think tool is not registered
+// (gateway+thinking enabled by default — see internal/tools/register.go
+// shouldRegisterThinkTool), this section is removed at prompt-build time so
+// the system prompt never advertises a tool the model can't call. Removal
+// also drops the trailing blank line so the following ### System header is
+// separated from the prior ### context by exactly one blank line —
+// byte-equal to a hand-edited prompt without planning.
+const planningBulletSection = "### Planning\n- think: Append a structured thought to the log when complex reasoning or sequential decisions are needed (long tool chains, policy-heavy tasks). Does not obtain new information or change state. For simpler reasoning extended thinking handles it natively — don't reach for this tool by default.\n\n"
+
 // coreOperationalRules contains behavioral constraints that apply to ALL agents
 // (default and named). These are non-negotiable and must never be dropped.
 const coreOperationalRules = `
@@ -335,6 +345,7 @@ const coreOperationalRules = `
 
 ## Verification & Stopping
 - NEVER claim you see, read, or completed something without a tool call in the SAME response proving it. If you describe screen content, you must have called screenshot or accessibility read_tree in this turn. If you claim a file was edited, file_read must confirm it. Unverified claims are hallucinations.
+- NEVER invent tool restrictions, rate limits, or blocking rules from training memory. The tool result you are looking at IS the source of truth — if a tool returned successfully (no IsError, no error prefix in the content), the operation succeeded, regardless of what you "remember" about how similar tools behave in other systems. Do NOT tell the user the call was "rate-limited", "blocked", "intercepted", "restricted", or that the "system prevented X" when no such message appears in the actual result. Fabricated restrictions are worse than fabricated content because they teach the user wrong assumptions about your capabilities.
 - After GUI actions (applescript, computer), only take a screenshot if the result is ambiguous or the action may have failed. If the tool returned a clear success message, trust it and move on.
 - If an action fails or produces no visible change after 2 attempts, STOP. Try a fundamentally different method, or ask the user. Do not keep trying variations of the same broken approach.
 - Do not brute-force a blocked approach. Consider alternatives or ask the user.
@@ -404,6 +415,7 @@ IMPORTANT: Do NOT use bash to run find, grep, cat, head, tail, sed, awk, or ls c
 - Server-side tools (web_search, web_fetch) are preferred for search and page reading — faster.
 - browser_* tools (browser_navigate, browser_type, browser_click, browser_snapshot, browser_take_screenshot, etc.): ALWAYS use these as the FIRST choice for ANY web page interaction — opening URLs, clicking, reading, screenshotting. These run in a dedicated Chrome instance with your cookies/sessions, so they work for both public AND authenticated sites (x.com, gmail, github, banking). Workflow: browser_navigate → browser_snapshot (get refs e1, e2...) → browser_click/browser_type by ref → browser_take_screenshot.
 - NEVER use bash to open URLs (no "open -a Chrome", no "open https://..."). NEVER use computer/accessibility/applescript for web browsing when browser_* tools are available. The browser_* tools are faster, more reliable, and maintain session state.
+- Local HTML files (file://): pass ` + "`" + `file:///abs/path.html` + "`" + ` directly to browser_navigate — the daemon rewrites file:// to a short-lived http://127.0.0.1/<token>/<name> loopback endpoint scoped to that file, so Chromium can load it. Do NOT start a local HTTP server (` + "`" + `python -m http.server` + "`" + `, ` + "`" + `python3 -m http.server` + "`" + `, ` + "`" + `npx serve` + "`" + `, etc.) via bash to host the file — bash will hang on the long-running server until timeout.
 - NEVER kill Chrome via bash (no "pkill Chrome", no "killall Chrome"). If browser_* tools fail, report the error to the user — do NOT try to force-restart Chrome yourself.
 - computer/accessibility/applescript: ONLY use for native macOS app interaction (Finder, System Settings, etc.) — NEVER for web pages.
 - Decision rule: ANY web task → browser_* tools. No exceptions.
@@ -670,22 +682,22 @@ type AgentLoop struct {
 	// checkPermissionAndApproval honors it as an approval bypass — except for
 	// tools listed in DisallowsAutoApproval, which must always prompt.
 	alwaysAllowTools map[string]bool
-	workingSet            *WorkingSet        // session-scoped deferred schema cache injected by the caller
-	sessionID             string             // session ID for audit log correlation
-	sessionCWD            string             // session-scoped working directory; set by runner/TUI before Run()
-	deltaProvider         DeltaProvider
-	injectCh              chan InjectedMessage
-	injectedMessages      []string         // messages injected during the last Run(); cleared on each Run() call
-	runMessages           []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
-	runMsgInjected        []bool           // parallel to runMessages: true = system-injected guardrail/nudge
-	runMsgTimestamps      []time.Time      // parallel to runMessages: when each message was created
-	lastRunStatus         RunStatus
-	toolRefSupported      bool   // true when the configured model supports defer_loading + tool_reference protocol
-	cacheSource           string // tag sent to gateway on every Complete call for prompt-cache TTL routing
-	skillDiscovery        bool   // call small-tier model on first turn to identify relevant skills (default true)
-	memoryPreflight       MemoryPreflightFunc
-	sentSkillNames        map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
-	readTracker           *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
+	workingSet       *WorkingSet // session-scoped deferred schema cache injected by the caller
+	sessionID        string      // session ID for audit log correlation
+	sessionCWD       string      // session-scoped working directory; set by runner/TUI before Run()
+	deltaProvider    DeltaProvider
+	injectCh         chan InjectedMessage
+	injectedMessages []string         // messages injected during the last Run(); cleared on each Run() call
+	runMessages      []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
+	runMsgInjected   []bool           // parallel to runMessages: true = system-injected guardrail/nudge
+	runMsgTimestamps []time.Time      // parallel to runMessages: when each message was created
+	lastRunStatus    RunStatus
+	toolRefSupported bool   // true when the configured model supports defer_loading + tool_reference protocol
+	cacheSource      string // tag sent to gateway on every Complete call for prompt-cache TTL routing
+	skillDiscovery   bool   // call small-tier model on first turn to identify relevant skills (default true)
+	memoryPreflight  MemoryPreflightFunc
+	sentSkillNames   map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
+	readTracker      *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
 	// toolResultReplacements stores stable query-time replacements for large
 	// historical tool_result blocks. It is session-scoped and persisted by
 	// daemon/TUI callers so resumed sessions replay identical bytes.
@@ -930,6 +942,68 @@ func (a *AgentLoop) LastRunStatus() RunStatus {
 
 func (a *AgentLoop) SetThinking(cfg *client.ThinkingConfig) {
 	a.thinking = cfg
+}
+
+// operationalRules returns coreOperationalRules with the `think` planning
+// bullet stripped when the think tool is not in the live registry. Keeps
+// the system prompt from advertising a tool the model can't actually call.
+// Byte-stable: returns exactly coreOperationalRules when think IS registered,
+// guaranteeing no prompt-cache divergence between this build and any prior
+// build that ran with think registered.
+func (a *AgentLoop) operationalRules() string {
+	if a.tools.Has("think") {
+		return coreOperationalRules
+	}
+	return strings.Replace(coreOperationalRules, planningBulletSection, "", 1)
+}
+
+// buildAssistantMessage constructs an assistant client.Message from a
+// CompletionResponse + the preamble already normalized by the caller.
+//
+// When resp.ContentBlocks is non-empty (Cloud ≥ 2026-05), it is the source
+// of truth: the verbatim ordered list of blocks Anthropic returned. This
+// preserves thinking content + signatures + their interleaved positions,
+// satisfying CC rule 3 (thinking blocks survive the assistant trajectory).
+//
+// When resp.ContentBlocks is empty (legacy Cloud or non-Anthropic provider
+// that never populates it), fall back to assembling text+tool_use blocks
+// from normalizedToolText + resp.AllToolCalls(). `AllToolCalls()` handles
+// both `FunctionCall` (legacy single-call shape) and `ToolCalls` (array
+// shape) — using it ensures we don't drop the tool call when Cloud emits
+// only the function_call form. An empty normalizedToolText suppresses the
+// text block entirely (matches the prior inline behavior).
+func buildAssistantMessage(resp *client.CompletionResponse, normalizedToolText string) client.Message {
+	if resp == nil {
+		return client.Message{
+			Role:    "assistant",
+			Content: client.NewBlockContent(nil),
+		}
+	}
+	if len(resp.ContentBlocks) > 0 {
+		// Slice-resize-safe copy: a fresh slice header so appends to
+		// `blocks` later can't bleed back into `resp.ContentBlocks`.
+		// Per-block fields (`Input json.RawMessage`, etc.) still share
+		// their backing arrays with `resp` — fine because no current
+		// caller mutates them after this assembly, but treat the message
+		// as read-only post-construction (the loop's existing invariant).
+		blocks := make([]client.ContentBlock, len(resp.ContentBlocks))
+		copy(blocks, resp.ContentBlocks)
+		return client.Message{
+			Role:    "assistant",
+			Content: client.NewBlockContent(blocks),
+		}
+	}
+	var blocks []client.ContentBlock
+	if normalizedToolText != "" {
+		blocks = append(blocks, client.ContentBlock{Type: "text", Text: normalizedToolText})
+	}
+	for _, fc := range resp.AllToolCalls() {
+		blocks = append(blocks, client.NewToolUseBlock(fc.ID, fc.Name, fc.Arguments))
+	}
+	return client.Message{
+		Role:    "assistant",
+		Content: client.NewBlockContent(blocks),
+	}
 }
 
 func (a *AgentLoop) SetReasoningEffort(effort string) {
@@ -1478,7 +1552,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	if a.agentBasePrompt != "" {
 		persona = a.agentBasePrompt
 	}
-	basePrompt := persona + coreOperationalRules + contrastExamplesCore
+	basePrompt := persona + a.operationalRules() + contrastExamplesCore
 	usage := &TurnUsage{}
 
 	// Per-Run cache tracker. Records main-tier LLM responses only (helper
@@ -2040,9 +2114,23 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// the model returns empty text, so callers never see a blank bubble.
 	// Tools are intentionally omitted to force a text-only response.
 	runForceStopTurn := func(reason string, fallback string) (string, error) {
+		// Frame the force-stop reason so the model doesn't hallucinate
+		// about WHETHER its tools ran. The detector fires AFTER tool
+		// execution — every tool_use the model emitted before this point
+		// has already executed and its result is in the conversation
+		// above. Without this framing, models occasionally tell the user
+		// "the system intercepted the calls before they ran" when in fact
+		// the calls ran and only the next round-trip was blocked
+		// (observed: parallel-sleep test, 2026-05-14 — see plan
+		// 2026-05-14-thinking-blocks-cc-alignment.md post-mortem).
 		messages = append(messages, client.Message{
-			Role:    "user",
-			Content: client.NewTextContent("[system] " + reason),
+			Role: "user",
+			Content: client.NewTextContent(
+				"[system] " + reason + "\n\n" +
+					"The tools you already called have executed and their results are in this conversation above. " +
+					"Summarize what they returned and provide your final answer to the user. " +
+					"Do not claim the tools were intercepted or did not run.",
+			),
 		})
 		markInjected()
 		// Pre-ForceStop: the loop-detector verdict + accumulated tool state
@@ -3030,10 +3118,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if isTruncated && resp.OutputText != "" && continuationCount < maxContinuations {
 				continuationCount++
 				truncatedText.WriteString(resp.OutputText)
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				// buildAssistantMessage preserves thinking blocks across the
+				// continuation boundary; falls back to a text-only message
+				// when ContentBlocks is empty (legacy Cloud path). The empty
+				// preamble case is impossible here (guarded by OutputText != "").
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				messages = append(messages, client.Message{
 					Role:    "user",
@@ -3054,10 +3143,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 			if afterCheckpoint {
 				afterCheckpoint = false
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				// Preserve thinking content from the post-checkpoint
+				// continuation response (CC rule 3).
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				continue
 			}
@@ -3071,10 +3159,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// Check 2 (softer): model claims to see/complete something without any tool call.
 			if hallucinationNudges < 2 && looksLikeFabricatedToolCalls(resp.OutputText) {
 				hallucinationNudges++
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				// Record the model's (fabricated-looking) response with its
+				// thinking blocks intact — the next-turn nudge needs to see
+				// the same trajectory the model emitted.
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				messages = append(messages, client.Message{
 					Role:    "user",
@@ -3085,10 +3173,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			}
 			if totalToolCalls > 0 && hallucinationNudges < 2 && looksLikeUnverifiedClaim(resp.OutputText) {
 				hallucinationNudges++
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				messages = append(messages, client.Message{
 					Role:    "user",
@@ -3100,10 +3185,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 			if len(deniedCalls) > 0 && hallucinationNudges < 2 && claimsSuccessAfterDenial(resp.OutputText) {
 				hallucinationNudges++
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				messages = append(messages, client.Message{
 					Role:    "user",
@@ -3118,10 +3200,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if toolSearchFired {
 				toolSearchFired = false
 				reanchorActiveTask(MetaBoundaryToolSearchLoaded)
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				// tool_search nudge path — preserve the model's pre-load
+				// reasoning so the next iteration sees the same trajectory.
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				continue
 			}
@@ -3177,20 +3258,15 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 		useNative := hasNativeToolIDs(toolCalls)
 
-		// Native path: build assistant message with tool_use blocks before execution
+		// Native path: build assistant message with tool_use blocks before execution.
+		// Uses buildAssistantMessage so Anthropic thinking content blocks (when
+		// Cloud emits them via resp.ContentBlocks) are preserved verbatim with
+		// signatures intact — CC rule 3. Legacy fallback inside the helper
+		// reconstructs from normalizedToolText + AllToolCalls() when the wire
+		// shape predates 2026-05.
 		var resultBlocks []client.ContentBlock
 		if useNative {
-			var assistantBlocks []client.ContentBlock
-			if normalizedToolText != "" {
-				assistantBlocks = append(assistantBlocks, client.ContentBlock{Type: "text", Text: normalizedToolText})
-			}
-			for _, fc := range toolCalls {
-				assistantBlocks = append(assistantBlocks, client.NewToolUseBlock(fc.ID, fc.Name, fc.Arguments))
-			}
-			messages = append(messages, client.Message{
-				Role:    "assistant",
-				Content: client.NewBlockContent(assistantBlocks),
-			})
+			messages = append(messages, buildAssistantMessage(resp, normalizedToolText))
 			stampMessage()
 		}
 

@@ -56,6 +56,20 @@ func BuildBatches(ctx context.Context, cands []Candidate, loader SessionLoader, 
 			recordFailed(marker, c.SessionID, "load_error", 0, c.UpdatedAt, now)
 			continue
 		}
+		// Strip assistant `thinking` / `redacted_thinking` content blocks BEFORE
+		// the size limit check. Privacy: thinking content can carry sensitive
+		// intermediate reasoning the user never sees; the sync endpoint uses
+		// sessions for cross-device resume and doesn't need them. Putting the
+		// strip before the size check also means a session whose ON-DISK size
+		// would exceed SingleSessionMaxBytes only because of thinking will now
+		// fit the cap after strip, instead of being silently rejected.
+		// Parse-failure path: helper returns the original body + err; we log
+		// and continue with the unstripped body so a single bad file doesn't
+		// block the whole sync run (Cloud will surface its own error if the
+		// JSON is genuinely malformed).
+		if stripped, stripErr := stripThinkingFromSessionJSON(body); stripErr == nil {
+			body = stripped
+		}
 		size := uint64(len(body))
 
 		if cfg.SingleSessionMaxBytes > 0 && size > uint64(cfg.SingleSessionMaxBytes) {

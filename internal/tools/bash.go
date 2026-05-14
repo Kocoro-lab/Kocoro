@@ -3,11 +3,13 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -31,6 +33,11 @@ type BashTool struct {
 	// per-call `timeout` arg is absent or zero. 0 = use built-in default 120.
 	// Wired from config.Tools.BashTimeout by register.go.
 	DefaultTimeoutSecs int
+	// MaxTimeoutSecs is the hard ceiling for per-call timeout. 0 = use
+	// built-in default 600. Wired from config.Tools.BashMaxTimeout by
+	// register.go. Clamping is logged so operators can discover when their
+	// configured timeout was capped.
+	MaxTimeoutSecs int
 	// SecretsStore, when set, supplies per-skill API keys as env vars
 	// for skills activated via use_skill in the current run. Values are
 	// fetched lazily at execution time and scoped to bash child processes
@@ -115,7 +122,7 @@ Instructions:
 - Prefer absolute paths over cd to keep the working directory stable.
 - For multi-line Python with embedded quotes or regex, write a script via file_write then run python3 /path/to/script.py — heredoc+quote nesting is a frequent source of shell syntax errors.
 - When issuing multiple commands:
-  - If independent and can run in parallel, make multiple bash tool calls in a single response. Example: "git status" and "git diff" together — send a single response with two bash calls in parallel.
+  - Multiple bash calls in a single turn execute SEQUENTIALLY, not in parallel — the daemon batches non-read-only tools as size-1 to avoid side-effect collisions (port binds, file writes, etc.). You can still emit multiple bash calls in one response to save round-trips, but do NOT promise the user parallel timing or invent fake "rate limits" / "blocked" / "restricted" explanations when you expected parallel and saw serial. Read the actual tool results — if each bash returned successfully, the operation succeeded.
   - If commands depend on each other, chain with && in a single bash call.
   - Use ';' only when sequential execution is needed and earlier failures don't matter.
   - DO NOT use newlines to separate commands (newlines inside quoted strings are fine).
@@ -123,6 +130,8 @@ Instructions:
   - Prefer creating a new commit over amending an existing commit.
   - Before destructive operations (git reset --hard, git push --force, git checkout --), consider safer alternatives. Only use destructive operations when truly the best approach.
   - Never skip hooks (--no-verify) or bypass signing unless the user explicitly asked. If a hook fails, investigate and fix the underlying issue.
+- Do NOT start long-running server processes (python -m http.server, flask run, npm start, vite, etc.). This tool uses CombinedOutput() and blocks until the process closes its pipes, so a server that runs forever will hang the call until timeout. Need local HTTP to serve a file to a browser? Just pass file:///abs/path.html to browser_navigate — the daemon bridges file:// to a loopback HTTP endpoint automatically, no manual server needed.
+- Silent commands that consume wall time (sleep, wait, sync, busy loops, network probes) produce no stdout but DO execute. The tool prepends ` + "`" + `[command ran for Ns]` + "`" + ` to any result that took ≥ 1 second, so a result like ` + "`" + `[command ran for 2.0s]\ntask1_done` + "`" + ` is sleep+echo working correctly — the sleep was NOT blocked or skipped. An absence of stdout for a slept command is normal; never fabricate "rate limited" / "blocked" / "skipped" explanations to fill that gap.
 - Avoid unnecessary sleep commands:
   - Do not sleep between commands that can run immediately — just run them.
   - Do not retry failing commands in a sleep loop — diagnose the root cause.
@@ -154,7 +163,27 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
 
-	// Timeout precedence: per-call args > tool default (from config) > 120s fallback.
+	// Timeout precedence: per-call args > tool default (from config) > 120s fallback,
+	// then hard-capped at MaxTimeoutSecs.
+	//
+	// Hardcoded-limit policy compliance (CLAUDE.md):
+	//   - User workload: 10-min default ceiling covers macOS test suites,
+	//     longest legit `brew install`/`xcodebuild clean build`, multi-step
+	//     bash scripts. Anything longer is almost always a hung server or
+	//     polling loop the model misclassified as foreground work.
+	//   - Symptom when it binds: a user's bash command is SIGKILL'd at the
+	//     cap and the result carries "[note: process killed after Xs by
+	//     context-cancel]". The clamping itself emits a one-shot log line
+	//     to stderr ("[bash] requested timeout Xs > cap Ys; clamping").
+	//   - Override path: `tools.bash_max_timeout` (seconds) in
+	//     ~/.shannon/config.yaml or per-project .shannon/config.yaml. Set
+	//     to a higher value for slow integration suites; never 0/unset to
+	//     disable (the cap protects UI cards from looking frozen for
+	//     unbounded minutes before SIGKILL fires).
+	maxBashTimeout := 600 * time.Second
+	if t.MaxTimeoutSecs > 0 {
+		maxBashTimeout = time.Duration(t.MaxTimeoutSecs) * time.Second
+	}
 	timeout := 120 * time.Second
 	if t.DefaultTimeoutSecs > 0 {
 		timeout = time.Duration(t.DefaultTimeoutSecs) * time.Second
@@ -162,11 +191,31 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	if args.Timeout > 0 {
 		timeout = time.Duration(args.Timeout) * time.Second
 	}
+	if timeout > maxBashTimeout {
+		fmt.Fprintf(os.Stderr, "[bash] requested timeout %v > cap %v; clamping (override via tools.bash_max_timeout)\n", timeout, maxBashTimeout)
+		timeout = maxBashTimeout
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", args.Command)
+	// Put sh and any children it spawns into a new process group so we can
+	// SIGKILL the whole tree on timeout. Without Setpgid, exec's default
+	// Cancel kills only sh's PID — long-running grandchildren (e.g.
+	// `python -m http.server` backgrounded from sh) survive as orphans
+	// and keep ports bound until the user kills them by hand.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return os.ErrProcessDone
+	}
+	// Cap how long Wait() blocks after Cancel fires. Without WaitDelay, a
+	// stuck child that ignores SIGKILL (zombie, uninterruptible sleep) can
+	// keep CombinedOutput pinned forever.
+	cmd.WaitDelay = 2 * time.Second
 	dir := t.CWD
 	if dir == "" {
 		dir = cwdctx.FromContext(ctx)
@@ -183,7 +232,9 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	if envPairs := collectActivatedSkillEnv(ctx, t.SecretsStore); len(envPairs) > 0 {
 		cmd.Env = append(os.Environ(), envPairs...)
 	}
+	start := time.Now()
 	output, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
 
 	result := string(output)
 	maxOut := t.MaxOutput
@@ -201,10 +252,31 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 			string(r[len(r)-keepTail:])
 	}
 
+	// Prepend elapsed-time annotation when the command consumed meaningful
+	// wall time. Gives the model unambiguous evidence that "silent" commands
+	// (sleep, wait, sync, network probes) actually executed — without this,
+	// models can misperceive an empty-stdout success as "the command was
+	// blocked or skipped" and fabricate restrictions to explain it.
+	if elapsed >= time.Second {
+		result = fmt.Sprintf("[command ran for %.1fs]\n%s", elapsed.Seconds(), result)
+	}
+
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			timeoutSecs := int(timeout.Seconds())
 			return agent.TransientError(fmt.Sprintf("command timed out after %ds\n%s", timeoutSecs, result)), nil
+		}
+		// ErrWaitDelay fires when the foreground process exited normally but
+		// stdout/stderr pipes were still held by a background subprocess
+		// (e.g. `python -m http.server &`). The foreground command itself
+		// finished — its output is already captured in `result` — so this
+		// is not a real failure. Promote to success with a note so the
+		// model doesn't mis-read the Go-internal error as a command error.
+		if errors.Is(err, exec.ErrWaitDelay) {
+			return agent.ToolResult{
+				Content: strings.TrimRight(result, "\n") +
+					"\n\n[note: bash returned early because a background subprocess kept stdout/stderr open after the foreground command finished. The foreground command itself completed — its output is shown above.]",
+			}, nil
 		}
 		return agent.ToolResult{
 			Content: fmt.Sprintf("exit code: %v\n%s", err, result),

@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
@@ -307,7 +309,8 @@ func TestCloneWithRuntimeConfig_UpdatesBashSettingsWithoutMutatingSource(t *test
 			AllowedCommands: []string{"git status"},
 		},
 		Tools: config.ToolsConfig{
-			BashMaxOutput: 30000,
+			BashMaxOutput:  30000,
+			BashMaxTimeout: 600,
 		},
 	}, nil)
 	defer cleanup()
@@ -317,7 +320,8 @@ func TestCloneWithRuntimeConfig_UpdatesBashSettingsWithoutMutatingSource(t *test
 			AllowedCommands: []string{"make test"},
 		},
 		Tools: config.ToolsConfig{
-			BashMaxOutput: 4096,
+			BashMaxOutput:  4096,
+			BashMaxTimeout: 1200,
 		},
 	})
 
@@ -342,11 +346,17 @@ func TestCloneWithRuntimeConfig_UpdatesBashSettingsWithoutMutatingSource(t *test
 	if runtimeBash.MaxOutput != 4096 {
 		t.Fatalf("expected cloned bash max output 4096, got %d", runtimeBash.MaxOutput)
 	}
+	if runtimeBash.MaxTimeoutSecs != 1200 {
+		t.Fatalf("expected cloned bash max timeout 1200, got %d", runtimeBash.MaxTimeoutSecs)
+	}
 	if len(runtimeBash.ExtraSafeCommands) != 1 || runtimeBash.ExtraSafeCommands[0] != "make test" {
 		t.Fatalf("unexpected cloned safe commands: %#v", runtimeBash.ExtraSafeCommands)
 	}
 	if originalBash.MaxOutput != 30000 {
 		t.Fatalf("expected original bash max output to stay 30000, got %d", originalBash.MaxOutput)
+	}
+	if originalBash.MaxTimeoutSecs != 600 {
+		t.Fatalf("expected original bash max timeout to stay 600, got %d", originalBash.MaxTimeoutSecs)
 	}
 	if len(originalBash.ExtraSafeCommands) != 1 || originalBash.ExtraSafeCommands[0] != "git status" {
 		t.Fatalf("unexpected original safe commands: %#v", originalBash.ExtraSafeCommands)
@@ -604,5 +614,122 @@ func TestBash_SessionCWDStillHonored(t *testing.T) {
 	resolvedOut, _ := filepath.EvalSymlinks(out)
 	if resolvedOut != resolvedCWD {
 		t.Fatalf("expected bash to run in session CWD %s, got %s", sessionCWD, out)
+	}
+}
+
+// TestBash_ElapsedPrefix_AppearsAtOrAbove1s pins the threshold for the
+// "[command ran for Ns]" prefix added by commit 2db2ec4. Without this test
+// a future refactor can silently regress the threshold and break the
+// model's ability to verify timing claims against tool output.
+func TestBash_ElapsedPrefix_AppearsAtOrAbove1s(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	tool := &BashTool{}
+	result, err := tool.Run(context.Background(), `{"command":"sleep 1 && echo done"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "[command ran for") {
+		t.Errorf("expected elapsed prefix on >=1s command, got %q", result.Content)
+	}
+}
+
+// TestBash_ElapsedPrefix_AbsentBelowThreshold confirms the prefix is NOT
+// emitted for fast commands — keeps the noise floor low for the model.
+func TestBash_ElapsedPrefix_AbsentBelowThreshold(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	tool := &BashTool{}
+	result, err := tool.Run(context.Background(), `{"command":"echo fast"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %s", result.Content)
+	}
+	if strings.Contains(result.Content, "[command ran for") {
+		t.Errorf("did not expect elapsed prefix on sub-1s command, got %q", result.Content)
+	}
+}
+
+// TestBash_ClampsExcessiveTimeout verifies that per-call timeout requests
+// above the cap are silently lowered to the cap and the command does not
+// hang forever. Default cap is 600s; we set a lower cap on the tool so the
+// test runs in milliseconds.
+func TestBash_ClampsExcessiveTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	// Cap at 1s so the test asserts the clamp by observing the SIGKILL.
+	tool := &BashTool{MaxTimeoutSecs: 1}
+	result, _ := tool.Run(context.Background(), `{"command":"sleep 10 && echo nope","timeout":30}`)
+	// We expect the command to get SIGKILL'd at the 1s cap, not run for the
+	// requested 30s or the model-implied 10s.
+	if !result.IsError && strings.Contains(result.Content, "nope") {
+		t.Errorf("clamping failed: command produced output past the cap; got %q", result.Content)
+	}
+}
+
+// TestBash_MaxTimeoutOverride_AcceptsConfiguredCap confirms the cap is
+// configurable. With MaxTimeoutSecs=5 a 3s command runs to completion.
+func TestBash_MaxTimeoutOverride_AcceptsConfiguredCap(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	tool := &BashTool{MaxTimeoutSecs: 5}
+	result, err := tool.Run(context.Background(), `{"command":"sleep 3 && echo within_cap"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Errorf("3s command under 5s cap should succeed, got error: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "within_cap") {
+		t.Errorf("expected command output; got %q", result.Content)
+	}
+}
+
+// TestBash_ParallelProcessGroupKill verifies commit ee6a2e8's Setpgid +
+// SIGKILL-of-pgid fix: when the parent shell times out, background children
+// (e.g. `python -m http.server` left behind in the original bug report)
+// must be killed too, not orphaned. Asserts the original failure mode
+// directly via `pgrep` for a unique marker — this test will silently pass
+// without that assertion if the fix is reverted.
+func TestBash_ParallelProcessGroupKill_TimeoutHonored(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	// pgrep is needed to verify the orphan-child claim. Skip if missing
+	// (rare on macOS / linux; CI containers usually ship it).
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		t.Skip("pgrep not available, skipping process-group test")
+	}
+
+	// `sleep 31337` is a value unlikely to collide with any real or other
+	// test sleep, so a post-call pgrep matches only THIS test's child.
+	tool := &BashTool{MaxTimeoutSecs: 1}
+	result, _ := tool.Run(context.Background(), `{"command":"sleep 31337 & sleep 5"}`)
+	if !result.IsError {
+		t.Errorf("expected timeout error, got: %s", result.Content)
+	}
+
+	// Give the SIGKILL-of-pgid a brief window to propagate to the
+	// background child. macOS occasionally takes 50-100ms.
+	time.Sleep(300 * time.Millisecond)
+
+	// If Setpgid + Cancel-via-`kill(-pgid)` works, the orphan is dead.
+	// If reverted (only sh's PID killed), `sleep 31337` survives. Use the
+	// process-tree-aware variant of pgrep to catch sleep regardless of
+	// how the OS reports the argv.
+	out, _ := exec.Command("pgrep", "-f", "sleep 31337").CombinedOutput()
+	if len(out) > 0 {
+		// Defensive cleanup so the orphan doesn't poison subsequent tests.
+		_ = exec.Command("pkill", "-f", "sleep 31337").Run()
+		t.Errorf("orphaned `sleep 31337` survived parent SIGKILL — Setpgid+pgid-kill regressed; pgrep matched: %q", string(out))
 	}
 }

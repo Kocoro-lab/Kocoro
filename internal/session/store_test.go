@@ -579,3 +579,57 @@ func TestSession_LastSeenModel(t *testing.T) {
 		}
 	})
 }
+
+// TestStore_RoundTripInterleavedThinkingBlocks confirms that assistant
+// messages with interleaved thinking blocks survive a Save → Load cycle
+// with text + signatures intact. The Session struct already serializes
+// client.Message via ContentBlock JSON tags; this test pins that contract.
+func TestStore_RoundTripInterleavedThinkingBlocks(t *testing.T) {
+	store := NewStore(t.TempDir())
+	sess := &Session{
+		ID: "test-thinking",
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("hi")},
+			{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+				{Type: "thinking", Thinking: "first reasoning", Signature: "sigA"},
+				{Type: "text", Text: "visible reply"},
+				{Type: "tool_use", ID: "t1", Name: "file_read", Input: json.RawMessage(`{"path":"/x"}`)},
+				{Type: "thinking", Thinking: "interleaved reasoning", Signature: "sigB"},
+				{Type: "redacted_thinking", Data: "opaque-blob"},
+			})},
+		},
+	}
+	if err := store.Save(sess); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := store.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded.Messages) != 2 {
+		t.Fatalf("Messages count = %d, want 2", len(loaded.Messages))
+	}
+	asst := loaded.Messages[1]
+	if asst.Role != "assistant" {
+		t.Fatalf("Role = %q, want assistant", asst.Role)
+	}
+	blocks := asst.Content.Blocks()
+	wantTypes := []string{"thinking", "text", "tool_use", "thinking", "redacted_thinking"}
+	if len(blocks) != len(wantTypes) {
+		t.Fatalf("blocks count = %d, want %d", len(blocks), len(wantTypes))
+	}
+	for i, want := range wantTypes {
+		if blocks[i].Type != want {
+			t.Errorf("blocks[%d].Type = %q, want %q (order must be preserved)", i, blocks[i].Type, want)
+		}
+	}
+	if blocks[0].Signature != "sigA" || blocks[3].Signature != "sigB" {
+		t.Errorf("thinking signatures lost on reload: [0].sig=%q [3].sig=%q", blocks[0].Signature, blocks[3].Signature)
+	}
+	if blocks[4].Data != "opaque-blob" {
+		t.Errorf("redacted_thinking data lost on reload: %q", blocks[4].Data)
+	}
+	if blocks[0].Thinking != "first reasoning" {
+		t.Errorf("thinking text lost: %q", blocks[0].Thinking)
+	}
+}

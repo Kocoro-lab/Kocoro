@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"testing"
@@ -236,5 +237,53 @@ func TestBuildForkedRequest_CallerMutationBreaksByteEquality(t *testing.T) {
 	// must NOT touch main. (Thinking-aliasing regression check.)
 	if snap(main) != mainSnap {
 		t.Error("caller mutation to forked changed main — pointer aliasing not contained")
+	}
+}
+
+// TestBuildForkedRequest_ByteStableWithInterleavedThinking confirms the
+// byte-equality cache contract holds when assistant messages carry
+// interleaved thinking blocks. Without this, a forked suggestion call
+// after a thinking-rich main turn would miss the parent's prompt cache.
+func TestBuildForkedRequest_ByteStableWithInterleavedThinking(t *testing.T) {
+	main := client.CompletionRequest{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("hi")},
+			{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+				{Type: "thinking", Thinking: "reason 1", Signature: "sigA"},
+				{Type: "text", Text: "ok"},
+				{Type: "tool_use", ID: "t1", Name: "f", Input: json.RawMessage(`{}`)},
+				{Type: "thinking", Thinking: "reason 2 (interleaved)", Signature: "sigB"},
+			})},
+		},
+		Thinking: &client.ThinkingConfig{Type: "adaptive"},
+	}
+	opts := ForkOptions{
+		AppendMessages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("suggest a continuation")},
+		},
+		SkipCacheWrite: true,
+		DebugKind:      "suggestion-test",
+	}
+	fork, err := BuildForkedRequest(main, opts)
+	if err != nil {
+		t.Fatalf("BuildForkedRequest: %v", err)
+	}
+
+	// Truncate appended messages + clear fork-only divergences for byte compare.
+	forkTrunc := fork
+	forkTrunc.Messages = forkTrunc.Messages[:len(main.Messages)]
+	forkTrunc.SkipCacheWrite = false
+	forkTrunc.ForkedKind = ""
+
+	mainBytes, err := json.Marshal(main)
+	if err != nil {
+		t.Fatalf("marshal main: %v", err)
+	}
+	forkBytes, err := json.Marshal(forkTrunc)
+	if err != nil {
+		t.Fatalf("marshal fork: %v", err)
+	}
+	if !bytes.Equal(mainBytes, forkBytes) {
+		t.Errorf("byte drift with interleaved thinking blocks:\n  main=%s\n  fork=%s", mainBytes, forkBytes)
 	}
 }

@@ -259,6 +259,12 @@ The agent loop declares an explicit phase state machine (`internal/agent/phase.g
 - **Mid-turn checkpoint**: after each tool batch, after successful reactive compaction, and before a force-stop, the daemon rebuilds the on-disk session from a baseline + current loop snapshot. The same rebuild runs at final save so a turn is never persisted twice. `session.Session.InProgress=true` on reload indicates a crash-recovered session with a partial transcript.
 - **Event types**: `EventRunStatus` (watchdog soft/hard, LLM retries) joins the existing `EventAgentReply`, `EventToolStatus`, `EventApprovalRequest` stream.
 
+### Thinking Blocks (2026-05+)
+
+Anthropic models with extended thinking (`agent.thinking: true`, default) emit `thinking` and occasionally `redacted_thinking` content blocks. Cloud's `anthropic_provider` relays the assistant message's full ordered `content_blocks: [...]` list (text + tool_use + thinking + interleaved thinking) verbatim to ShanClaw; `client.CompletionResponse.ContentBlocks []ContentBlock` receives them and `agent.buildAssistantMessage` uses them as the source of truth for the assistant message. Preserved by every sanitizer (`messagesForLLM`, time-based/micro compaction, fork builder) and by session JSON; stripped only by `internal/sync/strip_thinking.go` BEFORE the upload size-limit check (privacy + size-cap fairness). Satisfies Anthropic's "thinking blocks must be preserved unmodified across the assistant trajectory" — including interleaved thinking emitted between consecutive `tool_use` blocks.
+
+The local `think` tool is registered conditionally (`internal/tools/register.go:shouldRegisterThinkTool`): skipped on the default gateway+thinking path (native thinking covers it, mirroring Anthropic's Claude Code which ships zero think-equivalent tools); kept when thinking is disabled, on Ollama, or when `agent.force_think_tool=true`. Defensive bottom guards (independent of the wire change): `tools/think.go` soft-handles empty `thought` (returns hint, `IsError: false`); `agent/loopdetect.go` rule "0a" force-stops on two consecutive empty-input `think` calls.
+
 ### Browser Preview Bridge
 
 For daemon runs with Playwright, `browser_navigate(file://…)` is transparently rewritten to a short-lived `http://127.0.0.1/<token>/<name>` URL served by a loopback HTTP server bound per-session:

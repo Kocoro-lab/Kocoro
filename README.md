@@ -371,7 +371,7 @@ Local tools executed on your macOS machine:
 | `system_info` | No | OS, arch, hostname, CPU, memory, disk |
 | `process` | Auto for list/ports | Process management: list, ports, kill |
 | `http` | Network allowlist | HTTP client, localhost auto-approved |
-| `think` | No | Scratchpad for reasoning — the thought is captured in the tool call and the result is an `ack` so it does not echo back into context. |
+| `think` | No | Scratchpad for reasoning — the thought is captured in the tool call and the result is an `ack` so it does not echo back into context. **Conditionally registered (2026-05+)**: skipped on the default gateway + native-thinking path (Sonnet 4.6 / Opus 4.7 with `agent.thinking: true` cover the same role via interleaved thinking blocks). Still registered when `agent.thinking: false`, `provider: ollama`, or escape-hatch `agent.force_think_tool: true`. |
 
 ### macOS Control
 
@@ -640,6 +640,7 @@ agent:
   thinking: true                   # enable extended thinking (default: true)
   thinking_mode: adaptive          # "adaptive" or "enabled" (default: adaptive)
   thinking_budget: 10000           # thinking token budget (default: 10000)
+  force_think_tool: false          # re-enable local `think` tool even when native thinking is active (default: false). Skip on gateway + thinking=true by default; explicit override for workflows that depend on the explicit planning tool surface.
   model: ""                        # specific model override (empty = use model_tier)
   context_window: 200000           # seed; auto-adjusted from observed model (default: 200000). Per-agent override locks the cap.
   reasoning_effort: ""             # "low", "medium", "high" (empty = model default)
@@ -653,7 +654,8 @@ agent:
 
 # Tool settings
 tools:
-  bash_timeout: 120                # seconds (default: 120)
+  bash_timeout: 120                # default per-call timeout (seconds, default: 120)
+  bash_max_timeout: 600            # hard cap on per-call timeout (seconds, default: 600). Per-call `timeout` arg above this is clamped and a one-shot log line is emitted to stderr. Raise for slow integration suites; the cap protects UI cards from looking frozen for unbounded minutes before SIGKILL.
   bash_max_output: 30000           # max chars in bash output (default: 30000)
   result_truncation: 30000         # max chars in tool result (default: 30000)
   args_truncation: 200             # max chars in displayed args (default: 200)

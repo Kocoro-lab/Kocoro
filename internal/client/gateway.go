@@ -404,7 +404,7 @@ func (e *APIError) Error() string {
 // --- Public types (used by agent loop) ---
 
 // ContentBlock represents a polymorphic content block.
-// Supported types: "text", "image", "tool_use", "tool_result".
+// Supported types: "text", "image", "tool_use", "tool_result", "thinking", "redacted_thinking".
 type ContentBlock struct {
 	Type   string       `json:"type"`
 	Text   string       `json:"text,omitempty"`
@@ -417,6 +417,17 @@ type ContentBlock struct {
 	ToolUseID   string `json:"tool_use_id,omitempty"`
 	IsError     bool   `json:"is_error,omitempty"`
 	ToolContent any    `json:"-"` // string or []ContentBlock; serialized as "content" for tool_result
+	// thinking fields (Anthropic extended thinking content block).
+	// Type "thinking": Thinking carries the chain-of-thought text, Signature
+	// is the opaque base64 token Anthropic requires us to echo back on the
+	// next request — without it the model drops the block as forged. Type
+	// "redacted_thinking": Data holds the encrypted blob (text unavailable
+	// to us). Both forms pass through unmodified to satisfy CC rule 3:
+	// "Thinking blocks must be preserved for the duration of an assistant
+	// trajectory" (assistant → tool_result → next assistant).
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	Data      string `json:"data,omitempty"`
 	// CompressedTier records that an agent-loop compaction pass has visited
 	// this tool_result block. Once non-zero, further passes leave ToolContent
 	// alone so the wire bytes stay byte-stable across iterations — Anthropic's
@@ -829,10 +840,18 @@ type CompletionResponse struct {
 	FinishReason string         `json:"finish_reason"`
 	FunctionCall *FunctionCall  `json:"function_call,omitempty"`
 	ToolCalls    []FunctionCall `json:"tool_calls,omitempty"`
-	Usage        Usage          `json:"usage"`
-	RequestID    string         `json:"request_id,omitempty"`
-	LatencyMs    int            `json:"latency_ms,omitempty"`
-	Cached       bool           `json:"cached"`
+	// ContentBlocks is the verbatim ordered copy of the assistant's content
+	// blocks from upstream (Anthropic), including thinking / redacted_thinking
+	// preserved at their original positions. When non-empty, this is the
+	// source of truth for assembling the next assistant message — OutputText
+	// and ToolCalls are legacy fallbacks for older Cloud versions. The Go
+	// json package silently ignores this field when older Cloud doesn't emit
+	// it (omitempty + missing-key tolerance), so this is a no-op upgrade.
+	ContentBlocks []ContentBlock `json:"content_blocks,omitempty"`
+	Usage         Usage          `json:"usage"`
+	RequestID     string         `json:"request_id,omitempty"`
+	LatencyMs     int            `json:"latency_ms,omitempty"`
+	Cached        bool           `json:"cached"`
 }
 
 // AllToolCalls returns all tool calls from the response, preferring ToolCalls

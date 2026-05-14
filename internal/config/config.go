@@ -58,6 +58,13 @@ type AgentConfig struct {
 	Thinking          bool    `mapstructure:"thinking"         yaml:"thinking"         json:"thinking"`
 	ThinkingMode      string  `mapstructure:"thinking_mode"    yaml:"thinking_mode"    json:"thinking_mode"` // "adaptive" (default) or "enabled" (fixed budget)
 	ThinkingBudget    int     `mapstructure:"thinking_budget"  yaml:"thinking_budget"  json:"thinking_budget"`
+	// ForceThinkTool re-enables the local `think` tool even on paths where
+	// native extended thinking is active (the default-skip case). The two
+	// signals are redundant on Sonnet 4.6 / Opus 4.7 with adaptive thinking
+	// — leaving both registered led to ritual `think({})` emissions that
+	// could spin the agent loop. Set to true only if you have a workflow
+	// that specifically depends on the explicit planning tool surface.
+	ForceThinkTool    bool    `mapstructure:"force_think_tool" yaml:"force_think_tool" json:"force_think_tool"`
 	ReasoningEffort   string  `mapstructure:"reasoning_effort" yaml:"reasoning_effort" json:"reasoning_effort"`
 	Model             string  `mapstructure:"model"            yaml:"model"            json:"model"`                     // specific model override
 	ContextWindow     int     `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"`            // model context window in tokens
@@ -133,6 +140,7 @@ func (c *AgentConfig) SkillDiscoveryEnabled() bool {
 
 type ToolsConfig struct {
 	BashTimeout       int `mapstructure:"bash_timeout"        yaml:"bash_timeout"        json:"bash_timeout"`
+	BashMaxTimeout    int `mapstructure:"bash_max_timeout"    yaml:"bash_max_timeout"    json:"bash_max_timeout"`
 	BashMaxOutput     int `mapstructure:"bash_max_output"     yaml:"bash_max_output"     json:"bash_max_output"`
 	ResultTruncation  int `mapstructure:"result_truncation"   yaml:"result_truncation"   json:"result_truncation"`
 	ArgsTruncation    int `mapstructure:"args_truncation"     yaml:"args_truncation"     json:"args_truncation"`
@@ -238,6 +246,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.thinking", true)
 	viper.SetDefault("agent.thinking_mode", "adaptive")
 	viper.SetDefault("agent.thinking_budget", 10000)
+	viper.SetDefault("agent.force_think_tool", false)
 	viper.SetDefault("agent.reasoning_effort", "")
 	viper.SetDefault("agent.model", "")
 	viper.SetDefault("agent.context_window", 200000)
@@ -258,6 +267,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.prompt_suggestion.cache_cold_threshold_tokens", 10000)
 	viper.SetDefault("agent.prompt_suggestion.min_turns", 2)
 	viper.SetDefault("tools.bash_timeout", 120)
+	viper.SetDefault("tools.bash_max_timeout", 600)
 	viper.SetDefault("tools.bash_max_output", 30000)
 	viper.SetDefault("tools.result_truncation", 30000)
 	viper.SetDefault("tools.args_truncation", 200)
@@ -517,6 +527,7 @@ type overlayAgentConfig struct {
 	Thinking          *bool    `yaml:"thinking"`
 	ThinkingMode      *string  `yaml:"thinking_mode"`
 	ThinkingBudget    *int     `yaml:"thinking_budget"`
+	ForceThinkTool    *bool    `yaml:"force_think_tool"`
 	ReasoningEffort   *string  `yaml:"reasoning_effort"`
 	Model             *string  `yaml:"model"`
 	ContextWindow     *int     `yaml:"context_window"`
@@ -544,6 +555,7 @@ type overlayPromptSuggestionConfig struct {
 
 type overlayToolsConfig struct {
 	BashTimeout       *int `yaml:"bash_timeout"`
+	BashMaxTimeout    *int `yaml:"bash_max_timeout"`
 	BashMaxOutput     *int `yaml:"bash_max_output"`
 	ResultTruncation  *int `yaml:"result_truncation"`
 	ArgsTruncation    *int `yaml:"args_truncation"`
@@ -563,12 +575,14 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.thinking":               {Level: "default"},
 		"agent.thinking_mode":          {Level: "default"},
 		"agent.thinking_budget":        {Level: "default"},
+		"agent.force_think_tool":       {Level: "default"},
 		"agent.reasoning_effort":       {Level: "default"},
 		"agent.model":                  {Level: "default"},
 		"agent.context_window":         {Level: "default"},
 		"agent.idle_soft_timeout_secs": {Level: "default"},
 		"agent.idle_hard_timeout_secs": {Level: "default"},
 		"tools.bash_timeout":           {Level: "default"},
+		"tools.bash_max_timeout":       {Level: "default"},
 		"tools.bash_max_output":        {Level: "default"},
 		"tools.result_truncation":      {Level: "default"},
 		"tools.args_truncation":        {Level: "default"},
@@ -610,6 +624,9 @@ func markGlobalSources(cfg *Config, file string) {
 	if viper.IsSet("agent.thinking_budget") {
 		cfg.Sources["agent.thinking_budget"] = src
 	}
+	if viper.IsSet("agent.force_think_tool") {
+		cfg.Sources["agent.force_think_tool"] = src
+	}
 	if viper.IsSet("agent.reasoning_effort") {
 		cfg.Sources["agent.reasoning_effort"] = src
 	}
@@ -627,6 +644,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("tools.bash_timeout") {
 		cfg.Sources["tools.bash_timeout"] = src
+	}
+	if viper.IsSet("tools.bash_max_timeout") {
+		cfg.Sources["tools.bash_max_timeout"] = src
 	}
 	if viper.IsSet("tools.bash_max_output") {
 		cfg.Sources["tools.bash_max_output"] = src
@@ -725,6 +745,10 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 			cfg.Agent.ThinkingBudget = *overlay.Agent.ThinkingBudget
 			cfg.Sources["agent.thinking_budget"] = src
 		}
+		if overlay.Agent.ForceThinkTool != nil {
+			cfg.Agent.ForceThinkTool = *overlay.Agent.ForceThinkTool
+			cfg.Sources["agent.force_think_tool"] = src
+		}
 		if overlay.Agent.ReasoningEffort != nil {
 			cfg.Agent.ReasoningEffort = *overlay.Agent.ReasoningEffort
 			cfg.Sources["agent.reasoning_effort"] = src
@@ -785,6 +809,10 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Tools.BashTimeout != nil {
 			cfg.Tools.BashTimeout = *overlay.Tools.BashTimeout
 			cfg.Sources["tools.bash_timeout"] = src
+		}
+		if overlay.Tools.BashMaxTimeout != nil {
+			cfg.Tools.BashMaxTimeout = *overlay.Tools.BashMaxTimeout
+			cfg.Sources["tools.bash_max_timeout"] = src
 		}
 		if overlay.Tools.BashMaxOutput != nil {
 			cfg.Tools.BashMaxOutput = *overlay.Tools.BashMaxOutput

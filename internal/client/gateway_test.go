@@ -870,3 +870,120 @@ func TestCompletionRequest_ForkedKind_NotInWire(t *testing.T) {
 		t.Errorf("ForkedKind not readable: got %q", req.ForkedKind)
 	}
 }
+
+// TestContentBlock_ThinkingRoundtrip verifies a Type=="thinking" block
+// preserves Thinking + Signature across JSON marshal/unmarshal. The signature
+// is opaque-but-required by Anthropic on the next request.
+func TestContentBlock_ThinkingRoundtrip(t *testing.T) {
+	in := ContentBlock{
+		Type:      "thinking",
+		Thinking:  "let me reason about this step by step",
+		Signature: "eyJ0eXAiOiJ0aGlua2luZyJ9.abc",
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out ContentBlock
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Type != "thinking" || out.Thinking != in.Thinking || out.Signature != in.Signature {
+		t.Errorf("roundtrip mismatch: in=%+v out=%+v", in, out)
+	}
+}
+
+func TestContentBlock_RedactedThinkingRoundtrip(t *testing.T) {
+	in := ContentBlock{Type: "redacted_thinking", Data: "opaque-encrypted-blob"}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out ContentBlock
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Type != "redacted_thinking" || out.Data != in.Data {
+		t.Errorf("redacted roundtrip mismatch: in=%+v out=%+v", in, out)
+	}
+}
+
+// TestContentBlock_NonThinkingOmitsThinkingFields confirms a text/image/etc.
+// block does NOT emit `thinking`/`signature`/`data` keys on the wire — the
+// fields are omitempty so they only appear when the block is actually a
+// thinking type. Important for Anthropic which rejects malformed shapes.
+func TestContentBlock_NonThinkingOmitsThinkingFields(t *testing.T) {
+	in := ContentBlock{Type: "text", Text: "hello"}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(raw)
+	for _, k := range []string{`"thinking"`, `"signature"`, `"data"`} {
+		if strings.Contains(s, k) {
+			t.Errorf("unexpected thinking-shape key %s on text block: %s", k, s)
+		}
+	}
+}
+
+// TestCompletionResponse_ParseContentBlocks asserts the wire shape Shannon
+// Cloud emits (an ordered `content_blocks` array including interleaved
+// thinking) is decoded correctly into CompletionResponse.ContentBlocks.
+func TestCompletionResponse_ParseContentBlocks(t *testing.T) {
+	wire := []byte(`{
+		"provider": "anthropic",
+		"model": "claude-sonnet-4-6",
+		"output_text": "visible reply",
+		"finish_reason": "tool_use",
+		"content_blocks": [
+			{"type": "thinking", "thinking": "first", "signature": "sigA"},
+			{"type": "text", "text": "visible reply"},
+			{"type": "tool_use", "id": "t1", "name": "file_read", "input": {"path": "/x"}},
+			{"type": "thinking", "thinking": "interleaved", "signature": "sigB"},
+			{"type": "redacted_thinking", "data": "opaque"}
+		],
+		"usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+	}`)
+	var resp CompletionResponse
+	if err := json.Unmarshal(wire, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.ContentBlocks) != 5 {
+		t.Fatalf("ContentBlocks len = %d, want 5", len(resp.ContentBlocks))
+	}
+	wantTypes := []string{"thinking", "text", "tool_use", "thinking", "redacted_thinking"}
+	for i, want := range wantTypes {
+		if resp.ContentBlocks[i].Type != want {
+			t.Errorf("ContentBlocks[%d].Type = %q, want %q (order must be preserved)", i, resp.ContentBlocks[i].Type, want)
+		}
+	}
+	if resp.ContentBlocks[0].Signature != "sigA" || resp.ContentBlocks[3].Signature != "sigB" {
+		t.Errorf("signatures lost: %+v", resp.ContentBlocks)
+	}
+	if resp.ContentBlocks[4].Data != "opaque" {
+		t.Errorf("redacted_thinking data lost: %+v", resp.ContentBlocks[4])
+	}
+}
+
+// TestCompletionResponse_LegacyShapeStillDecodes confirms a pre-2026-05
+// Cloud response (no content_blocks field) still decodes cleanly with
+// ContentBlocks left as nil. Backward compat invariant.
+func TestCompletionResponse_LegacyShapeStillDecodes(t *testing.T) {
+	wire := []byte(`{
+		"provider": "anthropic",
+		"model": "claude-sonnet-4-6",
+		"output_text": "hi",
+		"finish_reason": "stop",
+		"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+	}`)
+	var resp CompletionResponse
+	if err := json.Unmarshal(wire, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.ContentBlocks != nil {
+		t.Errorf("expected nil ContentBlocks for legacy response, got %+v", resp.ContentBlocks)
+	}
+	if resp.OutputText != "hi" {
+		t.Errorf("OutputText not parsed: %q", resp.OutputText)
+	}
+}

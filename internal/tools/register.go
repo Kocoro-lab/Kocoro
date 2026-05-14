@@ -20,6 +20,35 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/uploads"
 )
 
+// shouldRegisterThinkTool reports whether the local `think` tool should be
+// added to the registry. Skipped by default on the gateway path with native
+// thinking enabled — the two signals are redundant on Sonnet 4.6 / Opus 4.7
+// adaptive mode, and Anthropic's own Claude Code product ships zero
+// think-equivalent tools (relies on native interleaved thinking only).
+// Kept on:
+//   - Ollama (`cfg.Provider == "ollama"`) — OpenAI-shape API has no native thinking.
+//   - Thinking disabled by user (`cfg.Agent.Thinking == false`) — no native fallback.
+//   - Explicit escape hatch (`cfg.Agent.ForceThinkTool == true`).
+//
+// See plan 2026-05-14-thinking-blocks-cc-alignment.md Phase E for the wider
+// rationale (the ritual `think({})` empty-input emissions surfaced as a
+// 14-minute production hang before Phase 0's bottom guards landed).
+func shouldRegisterThinkTool(cfg *config.Config) bool {
+	if cfg == nil {
+		return true
+	}
+	if cfg.Agent.ForceThinkTool {
+		return true
+	}
+	if cfg.Provider == "ollama" {
+		return true
+	}
+	if !cfg.Agent.Thinking {
+		return true
+	}
+	return false
+}
+
 // RegisterLocalTools registers only the local tools.
 // If cfg is non-nil, extra safe commands from permissions.allowed_commands
 // are passed to the BashTool so they skip approval.
@@ -46,11 +75,16 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 		if cfg.Tools.BashTimeout > 0 {
 			bashTool.DefaultTimeoutSecs = cfg.Tools.BashTimeout
 		}
+		if cfg.Tools.BashMaxTimeout > 0 {
+			bashTool.MaxTimeoutSecs = cfg.Tools.BashMaxTimeout
+		}
 	}
 	reg.Register(bashTool)
 
 	reg.Register(&MemoryAppendTool{})
-	reg.Register(&ThinkTool{})
+	if shouldRegisterThinkTool(cfg) {
+		reg.Register(&ThinkTool{})
+	}
 	reg.Register(&DirectoryListTool{})
 	reg.Register(&ArchiveInspectTool{})
 	reg.Register(&ArchiveExtractTool{})
@@ -116,6 +150,11 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 					bashCopy.DefaultTimeoutSecs = cfg.Tools.BashTimeout
 				} else {
 					bashCopy.DefaultTimeoutSecs = 0
+				}
+				if cfg.Tools.BashMaxTimeout > 0 {
+					bashCopy.MaxTimeoutSecs = cfg.Tools.BashMaxTimeout
+				} else {
+					bashCopy.MaxTimeoutSecs = 0
 				}
 			}
 			cloned.Register(&bashCopy)

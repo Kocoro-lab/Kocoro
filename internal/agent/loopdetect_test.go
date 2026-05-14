@@ -624,67 +624,64 @@ func TestLoopDetector_SuccessAfterError_ResetsOnNewWork(t *testing.T) {
 	}
 }
 
-func TestLoopDetector_SleepDetection_Nudge(t *testing.T) {
+// TestLoopDetector_ParallelSleepBashTask_NoFalsePositive is the
+// regression guard for the removed sleep detector. The user case that
+// motivated the removal: "run 3 sleep commands in parallel (same turn)"
+// produced 3 bash records with `sleep N` and tripped the old 4-count
+// threshold once the model retried once. Now: a legitimate parallel
+// sleep task must not force-stop or nudge through any detector. Real
+// polling is covered by ExactDup (same command repeated) and NoProgress
+// (many bash calls without progress) elsewhere.
+func TestLoopDetector_ParallelSleepBashTask_NoFalsePositive(t *testing.T) {
 	ld := NewLoopDetector()
-
-	// 1 sleep call: no trigger
-	ld.Record("bash", `{"command":"sleep 5"}`, false, "", "", false)
-	action, _ := ld.Check("bash")
-	if action != LoopContinue {
-		t.Errorf("1 sleep call should not trigger, got %v", action)
-	}
-
-	// 2nd sleep call: nudge
-	ld.Record("bash", `{"command":"sleep 5 && curl http://localhost:8080"}`, false, "", "", false)
+	// 3 distinct parallel-sleep commands (one assistant turn, 3 tool_use).
+	ld.Record("bash", `{"command":"sleep 2 && echo task1_done"}`, false, "", "", false)
+	ld.Record("bash", `{"command":"sleep 2 && echo task2_done"}`, false, "", "", false)
+	ld.Record("bash", `{"command":"sleep 2 && echo task3_done"}`, false, "", "", false)
 	action, msg := ld.Check("bash")
-	if action != LoopNudge {
-		t.Errorf("2 sleep calls should nudge, got %v", action)
-	}
-	if msg == "" {
-		t.Error("nudge should have a message")
-	}
-}
-
-func TestLoopDetector_SleepDetection_ForceStop(t *testing.T) {
-	ld := NewLoopDetector()
-
-	// 4 sleep calls: force stop
-	ld.Record("bash", `{"command":"sleep 5"}`, false, "", "", false)
-	ld.Record("bash", `{"command":"sleep 1 && echo done"}`, false, "", "", false)
-	ld.Record("bash", `{"command":"while true; do sleep 1; done"}`, false, "", "", false)
-	ld.Record("bash", `{"command":"sleep 10"}`, false, "", "", false)
-	action, _ := ld.Check("bash")
-	if action != LoopForceStop {
-		t.Errorf("4 sleep calls should force stop, got %v", action)
-	}
-}
-
-func TestLoopDetector_SleepDetection_NoFalsePositive(t *testing.T) {
-	ld := NewLoopDetector()
-
-	// bash commands without sleep: no trigger
-	ld.Record("bash", `{"command":"echo hello"}`, false, "", "", false)
-	ld.Record("bash", `{"command":"cat sleep.log"}`, false, "", "", false)
-	ld.Record("bash", `{"command":"grep sleeper main.go"}`, false, "", "", false)
-	ld.Record("bash", `{"command":"ls -la"}`, false, "", "", false)
-	action, _ := ld.Check("bash")
 	if action != LoopContinue {
-		t.Errorf("non-sleep bash commands should not trigger, got %v", action)
+		t.Errorf("3 parallel distinct sleep commands must not fire any detector, got %v (msg=%q)", action, msg)
+	}
+	// Plus a fourth distinct sleep (e.g. cleanup verify). Still fine.
+	ld.Record("bash", `{"command":"sleep 1 && ls /tmp/output"}`, false, "", "", false)
+	action, msg = ld.Check("bash")
+	if action != LoopContinue {
+		t.Errorf("4th distinct sleep command must still continue (no naked sleep counter), got %v (msg=%q)", action, msg)
 	}
 }
 
-func TestLoopDetector_SleepDetection_IgnoreNonBash(t *testing.T) {
-	ld := NewLoopDetector()
+// TestLoopDetector_TrueSleepPolling_StillCaughtByExistingDetectors
+// confirms that removing the dedicated sleep detector does not blind us
+// to genuine polling: same `sleep N && check_status` repeated trips the
+// existing ConsecutiveDup / ExactDup detectors via the args hash. After
+// 3 identical calls the ConsecutiveDup detector nudges (threshold = 3),
+// after 4 it force-stops (consecDupThreshold + 1). For bash specifically
+// this is the right behavior — the model is asking the same question of
+// the system repeatedly and getting the same answer.
+func TestLoopDetector_TrueSleepPolling_StillCaughtByExistingDetectors(t *testing.T) {
+	cmd := `{"command":"sleep 5 && curl -s http://localhost:8080/status"}`
 
-	// sleep in non-bash tool args: no trigger (different args to avoid dup detection)
-	ld.Record("file_read", `{"command":"sleep 5"}`, false, "", "", false)
-	ld.Record("grep", `{"command":"sleep 10"}`, false, "", "", false)
-	ld.Record("file_read", `{"command":"sleep 15"}`, false, "", "", false)
-	ld.Record("grep", `{"command":"sleep 20"}`, false, "", "", false)
-	action, _ := ld.Check("grep")
-	if action != LoopContinue {
-		t.Errorf("sleep in non-bash tool args should not trigger, got %v", action)
-	}
+	t.Run("3 identical → nudge", func(t *testing.T) {
+		ld := NewLoopDetector()
+		for i := 0; i < 3; i++ {
+			ld.Record("bash", cmd, false, "", "", false)
+		}
+		action, msg := ld.Check("bash")
+		if action != LoopNudge {
+			t.Errorf("3 identical polling calls should nudge, got action=%v msg=%q", action, msg)
+		}
+	})
+
+	t.Run("4 identical → force-stop", func(t *testing.T) {
+		ld := NewLoopDetector()
+		for i := 0; i < 4; i++ {
+			ld.Record("bash", cmd, false, "", "", false)
+		}
+		action, msg := ld.Check("bash")
+		if action != LoopForceStop {
+			t.Errorf("4 identical polling calls should force-stop, got action=%v msg=%q", action, msg)
+		}
+	})
 }
 
 func TestLoopDetector_SearchEscalation_Nudge(t *testing.T) {
@@ -1591,5 +1588,102 @@ func TestFamilyNoProgress_NonRepeatableOriginalThresholds(t *testing.T) {
 	action, _ := ld.Check("web_search")
 	if action != LoopForceStop {
 		t.Fatalf("12 same-topic web_search must still force-stop (v2 threshold), got %v", action)
+	}
+}
+
+// TestLoopDetector_Record_FlagsEmptyThinkInput verifies Record() sets
+// IsEmptyThinkInput on the ToolCallRecord for `think` calls whose args parse
+// to an empty / whitespace-only thought. The flag drives the Check() rule
+// that force-stops after two consecutive empty think calls. See plan
+// 2026-05-14-thinking-blocks-cc-alignment.md Phase 0.2.
+func TestLoopDetector_Record_FlagsEmptyThinkInput(t *testing.T) {
+	cases := []struct {
+		name      string
+		toolName  string
+		argsJSON  string
+		wantEmpty bool
+	}{
+		{"think empty object", "think", `{}`, true},
+		{"think empty thought", "think", `{"thought":""}`, true},
+		{"think whitespace thought", "think", `{"thought":"   "}`, true},
+		{"think tab/newline thought", "think", `{"thought":"\t\n"}`, true},
+		{"think real thought", "think", `{"thought":"plan A then B"}`, false},
+		{"think malformed JSON not flagged", "think", `not json`, false},
+		{"non-think empty args not flagged", "file_read", `{}`, false},
+		{"non-think tool with thought-like arg not flagged", "bash", `{"thought":""}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ld := NewLoopDetector()
+			ld.Record(tc.toolName, tc.argsJSON, false, "", "", false)
+			if len(ld.history) != 1 {
+				t.Fatalf("history len = %d, want 1", len(ld.history))
+			}
+			got := ld.history[0].IsEmptyThinkInput
+			if got != tc.wantEmpty {
+				t.Errorf("IsEmptyThinkInput = %v, want %v (tool=%q args=%q)", got, tc.wantEmpty, tc.toolName, tc.argsJSON)
+			}
+		})
+	}
+}
+
+// TestLoopDetector_EmptyThinkForceStop verifies the Phase 0 rule: two
+// consecutive `think` calls with empty input force-stop immediately. The
+// rule defends against Sonnet 4.6 / Opus 4.7 emitting ritual `think({})`
+// calls after native thinking blocks (saw 4 consecutive in one production
+// hang before the fix). See plan 2026-05-14-thinking-blocks-cc-alignment.md.
+func TestLoopDetector_EmptyThinkForceStop_OneNotEnough(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.Record("think", `{}`, false, "", "", false)
+	action, _ := ld.Check("think")
+	if action == LoopForceStop {
+		t.Errorf("single empty think must not force-stop, got %v", action)
+	}
+}
+
+func TestLoopDetector_EmptyThinkForceStop_TwoConsecutiveFires(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.Record("think", `{}`, false, "", "", false)
+	ld.Record("think", `{"thought":"   "}`, false, "", "", false)
+	action, msg := ld.Check("think")
+	if action != LoopForceStop {
+		t.Fatalf("two consecutive empty think calls must force-stop, got %v (msg=%q)", action, msg)
+	}
+	if msg == "" {
+		t.Error("force-stop should include an explanatory message")
+	}
+}
+
+func TestLoopDetector_EmptyThinkForceStop_InterleavedToolBreaksStreak(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.Record("think", `{}`, false, "", "", false)
+	ld.Record("file_read", `{"path":"/x"}`, false, "", "", false)
+	ld.Record("think", `{}`, false, "", "", false)
+	action, _ := ld.Check("think")
+	if action == LoopForceStop {
+		t.Errorf("non-consecutive empty think must not force-stop (file_read broke streak), got %v", action)
+	}
+}
+
+func TestLoopDetector_EmptyThinkForceStop_NonEmptyBreaksStreak(t *testing.T) {
+	ld := NewLoopDetector()
+	ld.Record("think", `{}`, false, "", "", false)
+	ld.Record("think", `{"thought":"actual reasoning"}`, false, "", "", false)
+	ld.Record("think", `{}`, false, "", "", false)
+	action, _ := ld.Check("think")
+	if action == LoopForceStop {
+		t.Errorf("non-empty think between two empties must reset the streak, got %v", action)
+	}
+}
+
+func TestLoopDetector_EmptyThinkForceStop_NonThinkUnaffected(t *testing.T) {
+	// Two consecutive empty-args calls to a non-think tool must NOT trip
+	// the empty-think rule — only the dup-detector budget applies.
+	ld := NewLoopDetector()
+	ld.Record("file_read", `{}`, false, "", "", false)
+	ld.Record("file_read", `{}`, false, "", "", false)
+	action, _ := ld.Check("file_read")
+	if action == LoopForceStop {
+		t.Errorf("empty-args calls on non-think tools must not trip the empty-think rule, got %v", action)
 	}
 }

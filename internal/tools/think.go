@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
@@ -36,8 +37,17 @@ func (t *ThinkTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult,
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
-	if args.Thought == "" {
-		return agent.ToolResult{Content: "thought is required", IsError: true}, nil
+	if strings.TrimSpace(args.Thought) == "" {
+		// Soft hint instead of hard error. Sonnet 4.6 / Opus 4.7 with native
+		// interleaved thinking occasionally emit ritual `think({})` calls
+		// because the reasoning lives in the native thinking content block;
+		// hard-erroring used to spin the loop for 14 minutes (one prod hang
+		// surfaced 4 consecutive empty calls). The loop detector has a
+		// separate rule that force-stops on two such consecutive calls.
+		return agent.ToolResult{
+			Content: "Empty thought received. Your reasoning likely landed in the native thinking block — proceed with the next action or final answer; do not retry the empty think call.",
+			IsError: false,
+		}, nil
 	}
 	// Short ack instead of echoing the thought back. The thought already
 	// lives in the assistant message's tool_use.input.thought field — the
