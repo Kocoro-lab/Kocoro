@@ -146,6 +146,9 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	}
 	if deps != nil {
 		deps.Suggestions = s.suggestions
+		if deps.ApprovalTracker == nil {
+			deps.ApprovalTracker = NewApprovalTracker()
+		}
 	}
 	return s
 }
@@ -296,6 +299,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /permissions", s.handlePermissions)
 	mux.HandleFunc("POST /permissions/request", s.handlePermissionsRequest)
 	mux.HandleFunc("POST /approval", s.handleApproval)
+	mux.HandleFunc("GET /approvals", s.handleApprovals)
 	mux.HandleFunc("POST /message", s.handleMessage)
 	mux.HandleFunc("POST /cancel", s.handleCancel)
 	mux.HandleFunc("GET /events", s.handleEvents)
@@ -761,14 +765,48 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
+	// Enrich each summary with runtime state so the frontend can flag
+	// "running" / "awaiting approval" sessions without a second round-trip.
+	// Both sources are nil-safe: cache is always non-nil here, tracker may
+	// be nil when deps was constructed outside NewServer.
+	activeIDs := s.deps.SessionCache.ActiveSessionIDs()
+	var awaitingIDs map[string]struct{}
+	if s.deps.ApprovalTracker != nil {
+		awaitingIDs = s.deps.ApprovalTracker.AwaitingSet()
+	}
+
 	// Filter out empty sessions (created but never used).
 	filtered := make([]session.SessionSummary, 0, len(summaries))
-	for _, s := range summaries {
-		if s.MsgCount > 0 {
-			filtered = append(filtered, s)
+	for _, sum := range summaries {
+		if sum.MsgCount == 0 {
+			continue
 		}
+		if _, ok := activeIDs[sum.ID]; ok {
+			sum.InProgress = true
+		}
+		if _, ok := awaitingIDs[sum.ID]; ok {
+			sum.AwaitingApproval = true
+		}
+		filtered = append(filtered, sum)
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": filtered})
+}
+
+// handleApprovals returns the set of session IDs currently blocked on a
+// user-approval prompt. Lets the frontend re-sync on page refresh / first
+// connect — the SSE EventApprovalRequest stream covers live updates but is
+// lossy across reconnect.
+func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.deps == nil || s.deps.ApprovalTracker == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"sessions": []string{}})
+		return
+	}
+	ids := s.deps.ApprovalTracker.SessionIDs()
+	if ids == nil {
+		ids = []string{}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": ids})
 }
 
 // handleGetSession 返回指定 session 的完整内容（包含消息列表）。
@@ -1441,8 +1479,16 @@ type sseEventHandler struct {
 	// Empty for default-agent / non-routed paths (e.g. /research, /swarm) — in
 	// that case persistAgentAlwaysAllow falls back to session-only.
 	agent string
-	usage agent.UsageAccumulator
+	// sessionID is set by RunAgent via SetSessionID after the session is
+	// resolved. Approval Mark/Clear keys on this so a paused session can be
+	// surfaced via deps.ApprovalTracker.
+	sessionID string
+	usage     agent.UsageAccumulator
 }
+
+// SetSessionID captures the resolved session ID. Called by RunAgent's
+// multiHandler interface-assertion path (see runner.go SetSessionID injection).
+func (h *sseEventHandler) SetSessionID(id string) { h.sessionID = id }
 
 // Usage returns the cumulative usage collected during this handler's lifetime.
 func (h *sseEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
@@ -1563,7 +1609,13 @@ func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	}
 	// Local SSE path: no Cloud claim, so messageID is empty. The broker stays
 	// in-process via its own pending map, no WS envelope round-trips Cloud.
+	var tracker *ApprovalTracker
+	if h.deps != nil {
+		tracker = h.deps.ApprovalTracker
+	}
+	tracker.Mark(h.sessionID)
 	decision := h.broker.Request(h.ctx, "", "", "", "", tool, args)
+	tracker.Clear(h.sessionID)
 	if decision == DecisionAlwaysAllow {
 		HandleAlwaysAllowDecision(h.deps, h.broker, h.agent, tool, args)
 	}

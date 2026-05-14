@@ -685,7 +685,13 @@ func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 		log.Printf("daemon: approval broker unavailable for %s; denying", tool)
 		return false
 	}
+	var tracker *daemon.ApprovalTracker
+	if h.deps != nil {
+		tracker = h.deps.ApprovalTracker
+	}
+	tracker.Mark(h.sessionID)
 	decision := h.broker.Request(h.ctx, h.messageID, h.channel, h.threadID, h.agent, tool, args)
+	tracker.Clear(h.sessionID)
 	if decision == daemon.DecisionAlwaysAllow {
 		// PR 5: single entry point shared with the SSE path so SSE/WS
 		// behavior cannot drift. Handles bash (tool-level for named agents,

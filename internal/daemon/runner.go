@@ -557,6 +557,12 @@ type ServerDeps struct {
 	// fixtures that construct ServerDeps directly), the post-Run hook is a no-op.
 	Suggestions *agent.SuggestionState
 
+	// ApprovalTracker records which sessions are currently blocked on a
+	// user approval prompt. Approval handlers (SSE + WS) Mark/Clear here so
+	// the daemon HTTP layer can surface "awaiting_approval" without scanning
+	// per-request brokers. nil-safe.
+	ApprovalTracker *ApprovalTracker
+
 	// suggestionRegisteredMu + suggestionRegistered dedupe the
 	// SessionManager.OnSessionClose registration in RunAgent: without dedupe
 	// each turn appends a fresh closure to the same session's close-handler

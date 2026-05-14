@@ -215,6 +215,21 @@ type SessionSummary struct {
 	Title     string    `json:"title"`
 	CreatedAt time.Time `json:"created_at"`
 	MsgCount  int       `json:"msg_count"`
+	// Source identifies the originating IM / surface for this session:
+	// "slack", "feishu", "lark", "wecom", "line", "telegram", "webhook",
+	// "kocoro", "tui", "local", "cron", "scheduler", "web". Empty for legacy
+	// sessions written before the field was populated. Frontends use this
+	// to pick a channel icon / filter the sidebar.
+	Source string `json:"source,omitempty"`
+	// InProgress reports whether the daemon currently owns an in-flight
+	// agent run for this session (mirrors SessionCache.ActiveSessionIDs).
+	// Populated at HTTP-list time by the daemon — Store.List itself leaves
+	// this false because store has no view into runtime state.
+	InProgress bool `json:"in_progress,omitempty"`
+	// AwaitingApproval reports whether the agent loop is currently blocked
+	// waiting for the user to approve a tool call. Populated at HTTP-list
+	// time from ApprovalTracker; Store.List leaves it false.
+	AwaitingApproval bool `json:"awaiting_approval,omitempty"`
 }
 
 type Store struct {
@@ -354,6 +369,7 @@ func (s *Store) List() ([]SessionSummary, error) {
 			Title:     sess.Title,
 			CreatedAt: sess.CreatedAt,
 			MsgCount:  len(sess.Messages),
+			Source:    sess.Source,
 		})
 	}
 

@@ -87,6 +87,18 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Response: `{"status": "updated"}`
 - Notes: Command name becomes a slash command the agent recognizes (e.g., `/report`).
 
+### List sessions
+- Method: GET
+- Path: /sessions[?agent={name}]
+- Response: `{"sessions": [{"id", "title", "created_at", "msg_count", "source"?, "in_progress"?, "awaiting_approval"?}]}`
+- Notes: Empty sessions (msg_count == 0) are filtered out. `source` identifies the originating IM / surface — one of `slack`, `feishu`, `lark`, `wecom`, `line`, `telegram`, `webhook`, `kocoro` (Desktop), `tui`, `local`, `cron`, `scheduler`, `web`. Empty/omitted on legacy sessions written before the field was populated; frontends should treat empty as "unknown" and fall back to a generic icon. `in_progress` is true when the daemon currently owns an in-flight agent run for the session; `awaiting_approval` is true when the agent loop is blocked waiting for the user to approve a tool call. The two runtime flags are omitted (not emitted as false) when not set, and reset to false on daemon restart.
+
+### List sessions awaiting approval
+- Method: GET
+- Path: /approvals
+- Response: `{"sessions": ["sess_abc", "sess_def"]}` (empty array when nothing pending)
+- Notes: Returns the set of session IDs whose agent loop is currently blocked on an approval prompt. Use this on first connect / page refresh to re-sync — the `approval` SSE event covers live updates but is lossy across reconnect. Pairs with `POST /approval` (resolve a pending request_id) for the full approval flow.
+
 ### Reset agent session history (in place)
 - Method: POST
 - Path: /sessions/{id}/reset?agent={name}
