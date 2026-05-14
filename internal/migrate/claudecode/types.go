@@ -124,16 +124,32 @@ type PlannedAction struct {
 	DstAbs   string
 }
 
+// SourceFingerprint pairs a content hash with the algorithm used to compute it.
+// The applier's Phase A freshness check (§6.2 / §8.1) dispatches on Kind to
+// re-compute the right hash and detect mid-flight source mutations — including
+// edits to scripts under a dir-layout skill that the SKILL.md hash alone would
+// miss.
+type SourceFingerprint struct {
+	// Kind selects the algorithm:
+	//   "file"       — sha256 of a single regular file
+	//   "skill_tree" — sha256 over sorted (relpath, sha256) of every non-symlink
+	//                  file under a skill directory (see hashSkillTree)
+	Kind string
+	Hash string // hex-encoded sha256
+}
+
 // Plan is the immutable preview snapshot kept in PlanStore until apply or expiry.
 type Plan struct {
-	ID              string
-	Hash            string
-	CreatedAt       time.Time
-	ExpiresAt       time.Time
-	SourcePaths     SourcePaths
-	Symbolic        SymbolicPaths
-	TargetPath      string            // absolute, e.g. /Users/wayland/.shannon
-	SourceHashes    map[string]string // src_abs_path → sha256, for TOCTOU re-check
+	ID           string
+	Hash         string
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
+	SourcePaths  SourcePaths
+	Symbolic     SymbolicPaths
+	TargetPath   string // absolute, e.g. /Users/wayland/.shannon
+	SourceHashes map[string]SourceFingerprint // src_abs_path → fingerprint, for TOCTOU re-check.
+	// Key is the path that will be re-fingerprinted at apply time. For dir-layout
+	// skills the path is the skill directory; for everything else it's the file.
 	PlannedActions  []PlannedAction
 	PlannedWarnings []Warning
 	Conflicts       []Conflict
