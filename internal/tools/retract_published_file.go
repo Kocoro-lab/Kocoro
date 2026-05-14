@@ -210,6 +210,17 @@ func (t *RetractPublishedFileTool) Run(ctx context.Context, argsJSON string) (ag
 	if err != nil {
 		return classifyRetractErr(err), nil
 	}
+	// Today's cloud contract makes `deleted=false` on a 2xx unreachable, but
+	// guard so a future partial-failure mode (or a contract drift) does not
+	// silently render "Retracted." to the user when nothing was actually
+	// deleted. One line of insurance — caught by a code reviewer.
+	if !res.Deleted {
+		return agent.BusinessError(fmt.Sprintf(
+			"retract_published_file: cloud responded 2xx but deleted=false (id=%s). "+
+				"This is unexpected — the file may NOT have been removed. Re-run "+
+				"`list_my_published_files` to confirm and tell the user the result is uncertain.",
+			res.ID)), nil
+	}
 
 	return agent.ToolResult{
 		Content: fmt.Sprintf(

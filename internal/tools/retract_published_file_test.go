@@ -232,6 +232,58 @@ func TestRetractPublishedFileTool_Run_HappyPath(t *testing.T) {
 	}
 }
 
+func TestRetractPublishedFileTool_Run_EmptyDescriptionStillExecutes(t *testing.T) {
+	// Approval-description spec invariant (CLAUDE.md): the daemon does NOT
+	// block execution when `description` is missing or empty. The schema
+	// declares it required so the model is nudged to populate it, but tools
+	// must NOT enforce — `args` JSON is the source of truth for audit logs
+	// and rewriting it would record fiction. UI clients fall back to raw
+	// args when description is empty.
+	//
+	// Symmetric to TestRetractPublishedFileTool_Run_MissingIDIsValidationError
+	// (which DOES enforce, because no id means there's nothing to delete).
+	fake := &fakeRetractUploader{
+		resp: &uploads.DeleteResponse{Deleted: true, ID: "abc", CDNEvictionSeconds: 300},
+	}
+	tool := NewRetractPublishedFileTool(fake)
+	// Missing description entirely.
+	out, _ := tool.Run(context.Background(), `{"id":"abc"}`)
+	if out.IsError {
+		t.Errorf("missing description must not block execution; got error: %s", out.Content)
+	}
+	// Empty-string description.
+	out, _ = tool.Run(context.Background(), `{"id":"abc","description":""}`)
+	if out.IsError {
+		t.Errorf("empty description must not block execution; got error: %s", out.Content)
+	}
+	// Whitespace-only description.
+	out, _ = tool.Run(context.Background(), `{"id":"abc","description":"   "}`)
+	if out.IsError {
+		t.Errorf("whitespace-only description must not block execution; got error: %s", out.Content)
+	}
+}
+
+func TestRetractPublishedFileTool_Run_DeletedFalseOn2xxIsBusinessError(t *testing.T) {
+	// Cloud's current contract says deleted=true on every 2xx; the only path
+	// to "deleted=false" is a 4xx/5xx with a typed error. But if cloud ever
+	// adds a partial-failure mode, we must not silently render "Retracted."
+	// to the user. This test pins the defensive guard.
+	fake := &fakeRetractUploader{
+		resp: &uploads.DeleteResponse{Deleted: false, ID: "abc", CDNEvictionSeconds: 300},
+	}
+	tool := NewRetractPublishedFileTool(fake)
+	out, _ := tool.Run(context.Background(), `{"id":"abc","description":"x"}`)
+	if !out.IsError {
+		t.Fatal("expected IsError=true when deleted=false on 2xx")
+	}
+	if out.ErrorCategory != agent.ErrCategoryBusiness {
+		t.Errorf("ErrorCategory = %s, want business", out.ErrorCategory)
+	}
+	if !strings.Contains(out.Content, "uncertain") {
+		t.Errorf("user-facing message should signal uncertainty; got: %s", out.Content)
+	}
+}
+
 func TestRetractPublishedFileTool_Run_MissingIDIsValidationError(t *testing.T) {
 	tool := NewRetractPublishedFileTool(&fakeRetractUploader{})
 	out, _ := tool.Run(context.Background(), `{"description":"x"}`)

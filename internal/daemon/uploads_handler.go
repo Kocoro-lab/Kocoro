@@ -36,14 +36,14 @@ func (s *Server) handleListUploads(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
+	// parseIntParam returns def for n < 1, so `limit=0` (or negative / missing)
+	// falls through to 20 — aligned with cloud's "0 → default 20" contract.
+	// Same clause clamps any negative offset to 0; no extra guard needed.
 	limit := parseIntParam(q.Get("limit"), 20)
 	if limit > uploadsListLimitMax {
 		limit = uploadsListLimitMax
 	}
 	offset := parseIntParam(q.Get("offset"), 0)
-	if offset < 0 {
-		offset = 0
-	}
 
 	client := uploads.NewClient(cfg.Endpoint, cfg.APIKey, s.deps.GW.HTTPClient())
 	resp, err := client.List(r.Context(), limit, offset)
