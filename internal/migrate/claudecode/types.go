@@ -1,8 +1,13 @@
 // Package claudecode implements one-way migration of Claude Code user-scope
-// configuration into Kocoro's ~/.shannon/ tree. The package never reads,
-// retains, or copies secrets — see the spec at
+// configuration into Kocoro's ~/.shannon/ tree.
+//
+// Privacy contract: secret values may transit through JSON parsing as the
+// scanner walks ~/.claude.json, but they are never retained in any package
+// data structure, copied to any target file, returned in API responses,
+// logged, hashed, or written. The scanner extracts MCP `env` key names only
+// and discards the value subtree before returning. See the spec at
 // docs/superpowers/specs/2026-05-14-claude-migrate-design.md §7 for the
-// privacy invariants this code is required to uphold.
+// full privacy invariants this code is required to uphold.
 package claudecode
 
 import "time"
@@ -34,12 +39,23 @@ type ScanResult struct {
 }
 
 type ScannedSkill struct {
-	Name        string
-	SrcRelPath  string // relative to ClaudeHome
-	SrcAbsPath  string
-	Layout      string // "flat" (single .md) | "dir" (<name>/SKILL.md + scripts)
-	SizeBytes   int64
-	ContentHash string // sha256 of SKILL.md (or flat .md)
+	Name       string
+	SrcRelPath string // relative to ClaudeHome; for dir layout this is the skill directory
+	SrcAbsPath string // for flat: the .md path; for dir: the skill directory path
+	Layout     string // "flat" (single .md) | "dir" (<name>/SKILL.md + scripts)
+
+	// SizeBytes is the total bytes of all non-symlink regular files contributing
+	// to this skill (flat: the .md size; dir: SKILL.md + every file under the
+	// skill directory, excluding symlinks).
+	SizeBytes int64
+
+	// ContentHash is a deterministic hash that changes whenever ANY contributing
+	// file changes. For flat layout: sha256 of the .md file. For dir layout:
+	// sha256 over the sorted (relpath, sha256) pairs of every contributing file
+	// in the skill directory tree. validateFreshness re-computes the same hash
+	// at apply time to detect mid-flight source changes (including scripts).
+	ContentHash string
+
 	Status      string // "ok" | "error"
 	ErrorReason string
 }
