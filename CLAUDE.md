@@ -190,6 +190,20 @@ When a feature is added, refactored, or significantly changed, check and update 
 - **CLAUDE.md** — developer-facing: project structure tree, conventions, file paths, architecture notes
 - **AGENTS.md** — external-agent-facing: overlaps with CLAUDE.md (structure tree, conventions, tool inventory). Keep in sync.
 
+### Hardcoded Limit Policy
+
+When introducing a `const max[A-Z]\w+ = <small_int>` (count caps, retention windows, retry counts, concurrency caps), the comment MUST name:
+1. **The user workload that justifies the value** (e.g., "5 screenshots covers typical desktop use").
+2. **The symptom when it binds** (e.g., "model says '未能全部展示' on batch read"), so the next reader can recognize the breakage.
+3. **The path to override** (config key name, env var, or "not user-configurable — file an issue").
+
+This convention exists because of postmortems on `maxRecentImages = 5` (a 200K-context-era default that silently truncated "read all 14 screenshots" tasks on 1M-context families until #135 surfaced it) and `maxPDFPages = 2` (a hidden cap on PDF page count). Lessons:
+- Constants sized for 200K-context-era defaults often need bumping under 1M-context families — re-check whenever the model family upgrades.
+- "Conservative because we couldn't test the upper bound" is a smell — at minimum, run a bench at 3-5× the current value before adopting it as the default.
+- Hidden caps without a config override are the worst — they bite power users who can't even discover the dial. Prefer `viper.SetDefault(...)` over `const` when in doubt.
+
+When reviewing PRs that add small-integer caps, ask: "What user request fails when this binds, and does that user have any way to opt past it?"
+
 ### Auto-installed Builtin Skills
 
 Skills listed in `builtinSkills` (`internal/skills/api.go`) are synced from `embed.FS` to `~/.shannon/skills/<name>/` on every daemon/TUI/CLI startup via `EnsureBuiltinSkills`. The mechanism is content-addressed: a sha256 walk over the embed subtree is compared against the on-disk subtree, and any drift triggers a wipe-and-overlay (per-file `temp+rename`, dest-dir `RemoveAll` first to evict orphans). Concurrent callers serialize on `~/.shannon/skills/.builtin.lock`. User edits to a builtin SKILL.md are wiped on next startup — fork under a different skill name to customize. Current builtins:
@@ -250,6 +264,10 @@ Unknown tools → denied by default (fail-safe). The always-ask gate runs BEFORE
   - **Persisted budget state** (`ToolResultReplacements` + `ToolResultSeen` on `session.Session`): query-time replacement bookkeeping survives across turns and resumes. Saved by `applyTurnState` at mid-turn checkpoints AND by both terminal save paths (final save + hard-error save) — a fast turn that finishes before the first checkpoint must still persist these maps, otherwise dedup state is lost on resume.
   - **Bloat nudge**: `buildContextBloatSuggestion` emits `OnRunStatus("tool_result_bloat", …)` when a single tool's per-turn output exceeds the bloat threshold; surfaces to SSE/Desktop subscribers without forcing compaction.
 - **file_read dedup**: `internal/agent/readtracker.go` records `(path, offset, limit, mtime, size)` on each successful read. Re-reading the same range returns a short "unchanged since last read" stub. The daemon owns one tracker per session via `internal/daemon/readtracker_cache.go`, registered through `SessionManager.OnSessionClose` so per-session state is released on session switch, manager close, and explicit delete.
+- **Image size guard** (`internal/tools/imaging_compress.go` + `internal/agent/oversize_image.go`): three layered defenses for Anthropic's per-image 5 MB inline limit.
+  - **Source-time compression**: `EncodeImage` / `EncodeImageBytes` decode any image whose raw bytes exceed `TargetRawImageBytes` (3.75 MB → 5 MB base64), resize to ≤ 2000×2000, JPEG quality ladder `[80,60,40,20]`, hard fallback 1000×1000 q=20. Covers `file_read`, `screenshot`, PDF page render, `computer`, `browser`, `accessibility`, `applescript`, AND `resolveFileRef` (Desktop drag-drop attachments via `internal/daemon/runner.go`).
+  - **Wire-time sanitizer** (`filterOversizeImages` in `internal/agent/oversize_image.go`): runs inside `(*AgentLoop).messagesForLLM` so every `CompletionRequest` builder (main loop, retry, force-stop synthesis) gets sanitized output. Replaces any image whose `Source.Data` length exceeds `client.MaxInlineImageBase64Bytes` with a text placeholder.
+  - **Persist-time guard** (`(*AgentLoop).SanitizedRunMessages`): used by `applyTurnMessages` in `internal/daemon/runner.go` so a 400-causing image never lands in `~/.shannon/sessions/*.json`.
 - **Skill secrets** (`internal/skills/secrets.go`): per-skill API keys in macOS Keychain (service `com.shannon.skill.<name>`, account = env var name) via `zalando/go-keyring`. Plaintext index `~/.shannon/secrets-index.json` (key names only, never values). Skills declare required env vars via ClawHub metadata (`openclaw`/`clawdbot`/`clawdis` aliases, all interchangeable). Daemon CRUD: `PUT/DELETE /skills/{name}/secrets`; audit rows include key names only. **Runtime injection is env-var-only, scoped to skills activated by `use_skill` in the current run** — secrets never enter the prompt body, session transcript, or audit values. A skill loaded but never activated contributes no env vars. Secrets deleted on skill removal.
 - **Turn phase tracker** (`internal/agent/phase.go`): state machine for `AgentLoop.Run`; every blocking boundary calls `tracker.Enter` or `EnterTransient`. Only `PhaseAwaitingLLM` and `PhaseForceStop` are idle-counted by the watchdog. Fail-closed on misuse — panics under `testing.Testing()` or `SHANNON_PHASE_STRICT=1`, logs otherwise.
 - **Idle watchdog** (`internal/agent/watchdog.go`): observer goroutine. Fires `OnRunStatus("idle_soft", …)` after `agent.idle_soft_timeout_secs` (default 90) in an idle-counted phase. Cancels ctx with `ErrHardIdleTimeout` via `context.WithCancelCause` after `agent.idle_hard_timeout_secs` (default 0 = disabled; recommended 540 once enabled — see README). Dedups soft fire by tracker `seq`, re-arms on every phase transition. `completeWithRetry` prefers `context.Cause(ctx)` over `ctx.Err()`. `isSoftRunError` in the runner includes `ErrHardIdleTimeout` so the partial transcript is persisted (not replaced by a friendly error stub). Daemon emits `EventRunStatus` to SSE/Desktop subscribers via `daemonEventHandler.OnRunStatus`.
@@ -362,7 +380,7 @@ E2E tests in `test/e2e/` are split into offline (no API, runs in CI) and live (n
 
 ## Local Tools (32 base + conditional)
 
-**File ops:** file_read, file_write, file_edit, glob, grep, directory_list
+**File ops:** file_read (auto-compresses image files > 3.75 MB raw via decode → resize ≤ 2000×2000 → JPEG quality ladder; output stays under Anthropic's 5 MB inline limit. See internal/tools/imaging_compress.go), file_write, file_edit, glob, grep, directory_list
 **Archive:** archive_inspect (read-only), archive_extract (requires approval) — supports `.zip / .tar / .tar.gz / .tgz` via Go stdlib `archive/zip` + `archive/tar` + `compress/gzip`. Atomic via staging-dir + rename; rejects encrypted zips, absolute-path / symlink / device / setuid entries; zipbomb caps (50 MB / entry, 200 MB total, 500 entries). See `internal/tools/archive.go`.
 **Documents:** pdf_to_text, docx_to_text, xlsx_to_text, pptx_to_text — read-only convenience extractors. Each prefers an external tool (poppler `pdftotext`, `pandoc`, `xlsx2csv`) and falls back to unzip + raw-XML strip when that tool is missing; PDF has no fallback and surfaces an install hint (`brew install poppler`) plus a suggestion to upload the PDF so cloud renders it as a native Anthropic `document` block. Fixed-argv `exec.Command` (no shell injection surface), 60s timeout per call, output capped at 100K runes with a `[Truncated: ...]` tail marker. See `internal/tools/doc_extract.go`.
 **Shell/system:** bash, system_info, process, http, think

@@ -3279,7 +3279,7 @@ func (s *Server) handleListSkillSubresource(w http.ResponseWriter, r *http.Reque
 	entries, err := os.ReadDir(target)
 	if err != nil {
 		if os.IsNotExist(err) {
-			writeJSON(w, http.StatusOK, map[string][]string{"files": []string{}})
+			writeJSON(w, http.StatusOK, map[string][]string{"files": {}})
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())

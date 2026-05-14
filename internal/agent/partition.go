@@ -7,7 +7,21 @@ import (
 	"time"
 )
 
-const maxToolConcurrency = 10
+// maxToolConcurrency caps the number of read-only tool calls the loop runs
+// in parallel within a single read-only batch (write-batches always run with
+// concurrency 1 to preserve ordering).
+//
+// Workload: parallel file_read / grep / glob over a small/medium repo (e.g.
+// "read these 14 screenshots" or "grep these 18 paths for an identifier") —
+// the iteration's read-only fan-out arrives in one batch from the model.
+// Symptom when binds: a read-only batch with more than this many calls is
+// split into multiple sub-batches that execute back-to-back; user sees the
+// turn take noticeably longer and an extra prompt-cache cycle is paid before
+// the next assistant message. Bumped 10 → 20 because "read 14 files in
+// parallel" was being split into 10 + 4 (wasted a cache cycle).
+// Override: not user-configurable yet — file an issue if your workload
+// routinely fans out beyond 20 read-only calls per turn.
+const maxToolConcurrency = 20
 
 // isReadOnly checks if a tool call is read-only by testing the ReadOnlyChecker
 // optional interface. Tools without the interface default to false (fail-closed).

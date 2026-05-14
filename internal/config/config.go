@@ -137,7 +137,6 @@ type ToolsConfig struct {
 	ResultTruncation  int `mapstructure:"result_truncation"   yaml:"result_truncation"   json:"result_truncation"`
 	ArgsTruncation    int `mapstructure:"args_truncation"     yaml:"args_truncation"     json:"args_truncation"`
 	ServerToolTimeout int `mapstructure:"server_tool_timeout" yaml:"server_tool_timeout" json:"server_tool_timeout"`
-	GrepMaxResults    int `mapstructure:"grep_max_results"    yaml:"grep_max_results"    json:"grep_max_results"`
 }
 
 type CloudConfig struct {
@@ -230,7 +229,10 @@ func Load() (*Config, error) {
 	viper.SetDefault("api_key", "")
 	viper.SetDefault("model_tier", "medium")
 	viper.SetDefault("auto_update_check", true)
-	viper.SetDefault("agent.max_iterations", 25)
+	// agent.max_iterations: bumped 25 → 40 — typical "refactor 12 files" or
+	// "batch-process 20 attachments" tasks routinely need >25 iterations.
+	// User-configurable per agent; this is just the default.
+	viper.SetDefault("agent.max_iterations", 40)
 	viper.SetDefault("agent.temperature", 0)
 	viper.SetDefault("agent.max_tokens", 32000)
 	viper.SetDefault("agent.thinking", true)
@@ -260,7 +262,6 @@ func Load() (*Config, error) {
 	viper.SetDefault("tools.result_truncation", 30000)
 	viper.SetDefault("tools.args_truncation", 200)
 	viper.SetDefault("tools.server_tool_timeout", 5)
-	viper.SetDefault("tools.grep_max_results", 100)
 	viper.SetDefault("daemon.auto_approve", false)
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	viper.SetDefault("cloud.enabled", true)
@@ -547,7 +548,6 @@ type overlayToolsConfig struct {
 	ResultTruncation  *int `yaml:"result_truncation"`
 	ArgsTruncation    *int `yaml:"args_truncation"`
 	ServerToolTimeout *int `yaml:"server_tool_timeout"`
-	GrepMaxResults    *int `yaml:"grep_max_results"`
 }
 
 // buildDefaultSources returns source entries for all config keys set to "default".
@@ -573,7 +573,6 @@ func buildDefaultSources() map[string]ConfigSource {
 		"tools.result_truncation":      {Level: "default"},
 		"tools.args_truncation":        {Level: "default"},
 		"tools.server_tool_timeout":    {Level: "default"},
-		"tools.grep_max_results":       {Level: "default"},
 	}
 }
 
@@ -640,9 +639,6 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("tools.server_tool_timeout") {
 		cfg.Sources["tools.server_tool_timeout"] = src
-	}
-	if viper.IsSet("tools.grep_max_results") {
-		cfg.Sources["tools.grep_max_results"] = src
 	}
 	// List fields from global
 	if len(cfg.Permissions.AllowedDirs) > 0 {
@@ -805,10 +801,6 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Tools.ServerToolTimeout != nil {
 			cfg.Tools.ServerToolTimeout = *overlay.Tools.ServerToolTimeout
 			cfg.Sources["tools.server_tool_timeout"] = src
-		}
-		if overlay.Tools.GrepMaxResults != nil {
-			cfg.Tools.GrepMaxResults = *overlay.Tools.GrepMaxResults
-			cfg.Sources["tools.grep_max_results"] = src
 		}
 	}
 

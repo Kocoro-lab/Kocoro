@@ -13,7 +13,19 @@ import (
 	"github.com/adhocore/gronx"
 )
 
-const maxConcurrentSchedules = 5
+// maxConcurrentSchedules caps how many cron schedules can run concurrently
+// when several fire on the same tick (e.g. multiple "* * * * *" entries
+// hitting the same minute boundary).
+//
+// Workload: a user with many cron schedules clustered on the same minute
+// (e.g. 20 "0 9 * * *" morning briefings or every-minute polling jobs).
+// Symptom when binds: schedules over this cap log
+// "scheduler: skipping schedule <id> (all N slots busy)" on that tick and
+// wait for the NEXT scheduled fire — they do not queue, they drop for that
+// tick. Bumped 5 → 20 to match the daemon's attachment-per-message cap.
+// Override: not user-configurable — file an issue if you legitimately need
+// more than 20 schedules co-firing on the same minute boundary.
+const maxConcurrentSchedules = 20
 
 // Scheduler evaluates cron schedules each minute and fires RunAgent for due entries.
 type Scheduler struct {

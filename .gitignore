@@ -19,6 +19,7 @@ CLAUDE.local.md
 docs/*
 !docs/cache-strategy.md
 !docs/cache-debug.md
+!docs/kocoro-desktop-attachment-design.md
 internal/tools/axserver/.build/
 internal/agent/tmp/
 build/

@@ -25,10 +25,13 @@ var imageReadExtensions = map[string]bool{
 // maxImageReadSize is the maximum file size for image reads (20 MB).
 const maxImageReadSize = 20 * 1024 * 1024
 
-// maxPDFPages is the maximum number of pages rendered per file_read call.
-// Kept low (2) to avoid exceeding gateway body size limits — each page is
-// ~100-300KB as JPEG. Agent can use offset to read more pages.
-const maxPDFPages = 2
+// maxPDFPages is the number of pages rendered per file_read call. Was 2
+// originally — too low for "review this 20-page contract" use cases (model
+// would silently see only pages 0-1). Raised to 20, matching the industry-
+// standard cap used by other vision-capable agent tools. Callers can pass
+// `pages` ("1-20", "3", "10-20") or `limit` to cap further, and `offset` or
+// `pages` to start mid-document.
+const maxPDFPages = 20
 
 // pdfPageMaxDim is the max pixel dimension for rendered PDF pages.
 const pdfPageMaxDim = 1024
@@ -37,8 +40,7 @@ const pdfPageMaxDim = 1024
 // offset+limit slices) whose estimated token count exceeds this return an
 // error pointing the agent at offset/limit instead of letting the loop's
 // 50K spill fallback drop a 2K preview into context. ~100B error vs ~2K
-// spill preview ≈ 95% per-call savings on oversized reads. Mirrors CC's
-// DEFAULT_MAX_OUTPUT_TOKENS in src/tools/FileReadTool/limits.ts:18.
+// spill preview ≈ 95% per-call savings on oversized reads.
 const fileReadMaxTokens = 25000
 
 const fileReadNoLimitMaxBytes = 256 * 1024
@@ -50,21 +52,26 @@ type fileReadArgs struct {
 	Description string `json:"description,omitempty"`
 	Offset      int    `json:"offset,omitempty"`
 	Limit       int    `json:"limit,omitempty"`
+	Pages       string `json:"pages,omitempty"`
 }
 
 func (t *FileReadTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:               "file_read",
 		MaxResultSizeChars: agent.UnlimitedToolResultSizeChars,
-		Description: "Read a file's contents with line numbers. Use offset and limit for large files. Repeat reads of the same (path, offset, limit) within one session return a short \"unchanged since last read\" stub when the file has not been modified — to force a fresh read, modify the file or pass a different offset/limit range. For image files (png/jpg/gif/webp), returns the image for vision analysis. For PDF files, renders pages as images for vision analysis (use offset for start page, limit for max pages)." +
+		Description: "Read a file's contents with line numbers. Use offset and limit for large files. Repeat reads of the same (path, offset, limit) within one session return a short \"unchanged since last read\" stub when the file has not been modified — to force a fresh read, modify the file or pass a different offset/limit range. For image files (png/jpg/gif/webp), returns the image for vision analysis. For PDF files, renders pages as images for vision analysis. Prefer the `pages` parameter (e.g., pages=\"1-10\" or pages=\"7-15\") for PDF page selection; offset/limit also work for sequential reading." +
 			agent.DescriptionGuidance,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path":        map[string]any{"type": "string", "description": "Absolute or relative file path"},
 				"description": agent.DescriptionFieldSpec,
-				"offset":      map[string]any{"type": "integer", "description": "Start line (0-based, default 0). For PDF: start page (0-based)."},
-				"limit":       map[string]any{"type": "integer", "description": "Max lines to read (default: all). For PDF: max pages to render (default: 2)."},
+				"offset":      map[string]any{"type": "integer", "description": "Start line (0-based, default 0). For PDF: start page (0-based). Ignored when 'pages' is set."},
+				"limit":       map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (default: all). For PDF: max pages to render (default: %d). Ignored when 'pages' is set.", maxPDFPages)},
+				"pages": map[string]any{
+					"type":        "string",
+					"description": fmt.Sprintf("Page range for PDF files (e.g., \"1-5\", \"3\", \"10-20\"). Maximum %d pages per range. When set, overrides offset/limit. Pages are 1-indexed (page 1 is the first page).", maxPDFPages),
+				},
 			},
 		},
 		Required: []string{"path", "description"},
@@ -90,12 +97,19 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	// Image files: return as vision image block instead of text lines.
 	ext := strings.ToLower(filepath.Ext(args.Path))
 	if imageReadExtensions[ext] {
-		return t.readImage(args.Path)
+		return t.readImage(ctx, args.Path)
 	}
 
 	// PDF files: render pages as images for vision analysis.
 	if ext == ".pdf" {
-		return t.readPDF(args.Path, args.Offset, args.Limit)
+		if args.Pages != "" {
+			start0, count, perr := parsePDFPageRange(args.Pages)
+			if perr != nil {
+				return agent.ToolResult{Content: perr.Error(), IsError: true}, nil
+			}
+			return t.readPDF(ctx, args.Path, start0, count)
+		}
+		return t.readPDF(ctx, args.Path, args.Offset, args.Limit)
 	}
 
 	// Dedup check: when the same (path, offset, limit) was read earlier in
@@ -215,7 +229,13 @@ func readTextLineRange(path string, offset, limit int) (lines []string, totalLin
 }
 
 // readImage reads an image file and returns it as a vision-compatible image block.
-func (t *FileReadTool) readImage(path string) (agent.ToolResult, error) {
+// Repeat reads of the same path (mtime + size unchanged) return the standard
+// "[file unchanged since last read…]" stub from CheckFileReadDedup — same
+// contract text files have. Without this, "read all N screenshots" workflows
+// where the model loops and re-reads the same paths cost N× the image-token
+// budget on every retry. Dedup key uses offset=0/limit=0 because image reads
+// have no slicing dimension.
+func (t *FileReadTool) readImage(ctx context.Context, path string) (agent.ToolResult, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsPermission(err) {
@@ -230,10 +250,15 @@ func (t *FileReadTool) readImage(path string) (agent.ToolResult, error) {
 		}, nil
 	}
 
+	if hit, stub := agent.CheckFileReadDedup(ctx, path, 0, 0, info.ModTime(), info.Size()); hit {
+		return agent.ToolResult{Content: stub}, nil
+	}
+
 	block, err := EncodeImage(path)
 	if err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("error encoding image: %v", err), IsError: true}, nil
 	}
+	agent.RecordFileRead(ctx, path, 0, 0, info.ModTime(), info.Size())
 	return agent.ToolResult{
 		Content: fmt.Sprintf("[Image: %s (%d bytes)]", filepath.Base(path), info.Size()),
 		Images:  []agent.ImageBlock{block},
@@ -243,8 +268,13 @@ func (t *FileReadTool) readImage(path string) (agent.ToolResult, error) {
 // readPDF renders PDF pages to images using macOS PDFKit (via swift) and returns
 // them as vision-compatible image blocks. startPage is 0-based, maxPages defaults
 // to maxPDFPages. This uses the macOS-native Swift PDFKit which is always available.
-func (t *FileReadTool) readPDF(path string, startPage, maxPages int) (agent.ToolResult, error) {
-	if _, err := os.Stat(path); err != nil {
+// Dedup key uses the POST-normalization (startPage, maxPages) so a repeat call
+// with `pages="1-20"` matches a prior call with `offset=0 limit=0` (both render
+// the same physical pages). Without this, an agent that double-reads "the
+// contract" pays the swift-render cost twice.
+func (t *FileReadTool) readPDF(ctx context.Context, path string, startPage, maxPages int) (agent.ToolResult, error) {
+	info, err := os.Stat(path)
+	if err != nil {
 		if os.IsPermission(err) {
 			return agent.PermissionError(fmt.Sprintf("cannot read %s: permission denied", path)), nil
 		}
@@ -256,6 +286,10 @@ func (t *FileReadTool) readPDF(path string, startPage, maxPages int) (agent.Tool
 	}
 	if maxPages <= 0 || maxPages > maxPDFPages {
 		maxPages = maxPDFPages
+	}
+
+	if hit, stub := agent.CheckFileReadDedup(ctx, path, startPage, maxPages, info.ModTime(), info.Size()); hit {
+		return agent.ToolResult{Content: stub}, nil
 	}
 
 	tmpDir, err := os.MkdirTemp("", "shannon-pdf-*")
@@ -378,6 +412,11 @@ for i in start..<(start + count) {
 		}, nil
 	}
 
+	// Record the successful render for future dedup. Mirrors the post-success
+	// RecordFileRead in Run() for text files. Failures above intentionally
+	// skip recording so the agent can retry without dedup blocking it.
+	agent.RecordFileRead(ctx, path, startPage, maxPages, info.ModTime(), info.Size())
+
 	// Build summary text.
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "[PDF: %s — %d total pages, showing pages %d–%d]",
@@ -386,13 +425,59 @@ for i in start..<(start + count) {
 		fmt.Fprintf(&sb, "\n[Warning: %d page(s) failed to encode and were skipped]", skipped)
 	}
 	if startPage+len(images) < totalPages {
-		fmt.Fprintf(&sb, "\n[Use offset=%d to read the next pages]", startPage+len(images))
+		nextStartOneIndexed := startPage + len(images) + 1
+		nextEndOneIndexed := nextStartOneIndexed + maxPDFPages - 1
+		if nextEndOneIndexed > totalPages {
+			nextEndOneIndexed = totalPages
+		}
+		fmt.Fprintf(&sb, "\n[Next pages: use pages=\"%d-%d\" or offset=%d to continue]",
+			nextStartOneIndexed, nextEndOneIndexed, startPage+len(images))
 	}
 
 	return agent.ToolResult{
 		Content: sb.String(),
 		Images:  images,
 	}, nil
+}
+
+// parsePDFPageRange parses PDF page-range syntax used by the `pages`
+// parameter. Accepts:
+//
+//	"3"     → single page 3 → returns (start=2, count=1)
+//	"1-5"   → pages 1..5    → returns (start=0, count=5)
+//	"10-20" → pages 10..20  → returns (start=9, count=11)
+//
+// Pages are 1-indexed in the parameter (natural user expectation).
+// Returns an error if format is invalid OR count exceeds maxPDFPages.
+// Returns (start, count) where start is 0-indexed for the Swift renderer.
+func parsePDFPageRange(pages string) (start0Indexed int, count int, err error) {
+	trimmed := strings.TrimSpace(pages)
+	if trimmed == "" {
+		return 0, 0, fmt.Errorf("pages parameter is empty")
+	}
+	// Single page: "3"
+	if !strings.Contains(trimmed, "-") {
+		p, perr := strconv.Atoi(trimmed)
+		if perr != nil || p < 1 {
+			return 0, 0, fmt.Errorf("invalid page number %q: expected positive integer or range like \"1-5\"", pages)
+		}
+		return p - 1, 1, nil
+	}
+	// Range: "10-20"
+	parts := strings.SplitN(trimmed, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid page range %q: expected format \"START-END\" (e.g., \"1-5\")", pages)
+	}
+	startP, e1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	endP, e2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if e1 != nil || e2 != nil || startP < 1 || endP < startP {
+		return 0, 0, fmt.Errorf("invalid page range %q: expected positive START ≤ END (e.g., \"1-5\")", pages)
+	}
+	rangeSize := endP - startP + 1
+	if rangeSize > maxPDFPages {
+		return 0, 0, fmt.Errorf("page range %q spans %d pages, exceeds maximum of %d per request — split into smaller ranges", pages, rangeSize, maxPDFPages)
+	}
+	return startP - 1, rangeSize, nil
 }
 
 func (t *FileReadTool) RequiresApproval() bool { return true }

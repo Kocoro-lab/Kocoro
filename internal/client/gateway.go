@@ -327,12 +327,14 @@ func rotateRawDumpDir(dir string, max int) {
 // `dir:"req"` line on the same session is the standard correlation.
 //
 // Action vocabulary (free-form, but use these for analyzability):
-//   - "tier1"     — stripToMetadata (Anthropic native blocks)
-//   - "tier1_xml" — XML-format truncation
-//   - "tier2"     — head+tail truncation or micro-compact summary
-//   - "tbcompact" — time-based microcompact (timebasedcompact.go)
-//   - "tbclear"   — time-based result clear (replaces with sentinel)
-//   - "budget"    — query-time tool_result budget replacement
+//   - "tier1"               — stripToMetadata (Anthropic native blocks)
+//   - "tier1_xml"           — XML-format truncation
+//   - "tier2"               — head+tail truncation or micro-compact summary
+//   - "tbcompact"           — time-based microcompact (timebasedcompact.go)
+//   - "tbclear"             — time-based result clear (replaces with sentinel)
+//   - "budget"              — query-time tool_result budget replacement
+//   - "img_oversize_strip"  — per-image size cap (filterOversizeImages pass 1)
+//   - "img_aggregate_strip" — aggregate body cap (enforceAggregateImageCap)
 //
 // Silent when SHANNON_CACHE_DEBUG != "1". Skips no-op rewrites where bytes
 // are unchanged (idempotent re-visit on already-compacted blocks).
@@ -617,6 +619,14 @@ type ImageSource struct {
 	MediaType string `json:"media_type"` // "image/png"
 	Data      string `json:"data"`
 }
+
+// MaxInlineImageBase64Bytes is Anthropic's per-image inline base64 payload
+// ceiling. Anthropic validates the string length of image source.data, so
+// any image whose base64-encoded payload exceeds this triggers HTTP 400
+// "image exceeds 5 MB maximum: <bytes> > 5242880 bytes". Both image
+// producers (tools) and the history sanitizer use this constant to agree
+// on the wire limit.
+const MaxInlineImageBase64Bytes = 5 * 1024 * 1024
 
 // MessageContent holds message content as either a plain string or content blocks.
 type MessageContent struct {

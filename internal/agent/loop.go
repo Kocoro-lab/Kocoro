@@ -1041,6 +1041,21 @@ func (a *AgentLoop) RunMessages() []client.Message {
 	return out
 }
 
+// SanitizedRunMessages returns a copy of RunMessages with any oversize image
+// blocks replaced by text placeholders. Use before persisting (mid-turn
+// checkpoint or hard-error save) so a 400-causing image never lands on disk
+// and never replays on resume. The in-memory RunMessages is untouched.
+func (a *AgentLoop) SanitizedRunMessages() []client.Message {
+	raw := a.RunMessages()
+	if len(raw) == 0 {
+		return raw
+	}
+	out := make([]client.Message, len(raw))
+	copy(out, raw)
+	filterOversizeImages(out)
+	return out
+}
+
 // SetToolResultReplacements restores session-scoped query-time tool_result
 // replacements. Callers should invoke this before Run() when resuming a
 // persisted session.
@@ -1094,6 +1109,18 @@ func (a *AgentLoop) messagesForLLM(messages []client.Message) []client.Message {
 	if changed && a.tracker != nil {
 		a.tracker.MarkDirty()
 	}
+	// Wire-time guard: drop any image whose base64 exceeds Anthropic's 5 MB
+	// inline limit. Covers all CompletionRequest paths (main loop, retry,
+	// force-stop synthesis) with one call. Without this, an oversize image
+	// surviving Layer 1 jams every retry with 400.
+	//
+	// `out` may share its backing array with the caller's `messages` slice
+	// when `applyToolResultBudget` returned changed=false (no clone). That is
+	// fine and arguably desirable: the sanitization persists across iterations
+	// instead of having to re-run on the same poisoned message. Every mutation
+	// is logged via `LogCacheCompactEvent("img_oversize_strip", ...)` so the
+	// cache-debug diff path remains complete (see CLAUDE.md "Prompt Cache").
+	filterOversizeImages(out)
 	return out
 }
 
@@ -1808,7 +1835,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	ctx = context.WithValue(ctx, readTrackerKey{}, readTracker)
 
 	// Loop behavior constants
-	const maxRecentImages = 5  // keep only last N screenshot messages in context
+	//
+	// maxRecentImages: runaway defense — caps screenshot bytes in context if an
+	// agent gets stuck in a screenshot loop. Reference agent implementations
+	// generally rely on token-based context management rather than count-based
+	// image pruning; we keep this as a safety net but at a value that won't
+	// bind on legit "describe N screenshots" tasks. With Layer 1 compression
+	// each image is ≤ 5 MB base64 (~6-12 K tokens), so 50 images ≈ 300-600 K
+	// tokens — comfortably under our 1 M-token default context window. Was 5
+	// (pre-#135, too conservative for batch-vision use cases).
+	const maxRecentImages = 50 // keep only last N screenshot messages in context
 	const compressAfter = 8    // compress tool results older than N from the end
 	const maxResultChars = 300 // compressed tool result max chars
 
@@ -1817,27 +1853,44 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// iterations triggers force-stop. Replaces the previous flat counter that
 	// never reset, which turned 3 widely-spaced harmless nudges in a long
 	// workflow (e.g. real Teams session at iter 9/15/16) into a premature
-	// force-stop. Window of 5 means a productive iteration ages out the
+	// force-stop. Window of 10 means a productive iteration ages out the
 	// oldest nudge, restoring "self-recovery" headroom.
 	const (
-		maxNudges        = 3
-		nudgeWindowIters = 5
+		maxNudges        = 3  // unchanged — still a meaningful runaway-loop signal
+		nudgeWindowIters = 10 // bumped 5 → 10 — multi-file refactors with 15+ read→edit cycles need a wider window to avoid spurious force-stops
 	)
 
 	// Approval cache: tracks tool+args combos the user already approved this turn
 	approvalCache := NewApprovalCache()
 
-	const maxContinuations = 3 // cap max_tokens continuation attempts
+	// maxContinuations: bumped 3 → 8 — with 32K max_tokens default, a long
+	// structured report can need 4-6 continuations on cold-cache turns. 3 was
+	// silently truncating outputs.
+	const maxContinuations = 8 // cap max_tokens continuation attempts
 
-	// batch-tolerant set: bash + READ-verb MCP tool names only. On these
+	// batch-tolerant set: bash + READ-verb MCP tool names + read-only local
+	// fan-out tools (file_read / glob / grep / directory_list). On these
 	// tools, the NoProgress detector applies a uniqueness gate so
-	// legitimate batch enumerations (Task 5 / Task 6 benchmarks) are not
-	// force-stopped by name-count alone. Write-capable MCP tools
-	// (create_*, update_*, delete_*, send_*, …) deliberately STAY under
-	// the count-based guard — MCPTool.RequiresApproval() is always false
-	// and the permission engine does not gate MCP calls, so NoProgress
-	// is the only defense against write loops with unique arguments.
-	batchTolerant := map[string]bool{"bash": true}
+	// legitimate batch enumerations (Task 5 / Task 6 benchmarks, "read all N
+	// screenshots") are not force-stopped by name-count alone. The local
+	// read-only tools were added after #135 audit-log review showed the
+	// "read 13 desktop screenshots" workflow tripping the count-12 NoProgress
+	// nudge "Summarize what you've learned and try a different approach" —
+	// the model then fabricated an "exceeded context window" excuse and
+	// dropped the task even though the real prompt was 22% of the 1M-token
+	// window. Write-capable MCP tools (create_*, update_*, delete_*, send_*,
+	// …) deliberately STAY under the count-based guard — MCPTool.
+	// RequiresApproval() is always false and the permission engine does not
+	// gate MCP calls, so NoProgress is the only defense against write loops
+	// with unique arguments. Identical-args spin is still caught for the
+	// batch-tolerant tools (see TestLoopDetector_NoProgress_*_IdenticalArgs_StillStops).
+	batchTolerant := map[string]bool{
+		"bash":           true,
+		"file_read":      true,
+		"glob":           true,
+		"grep":           true,
+		"directory_list": true,
+	}
 	if a.tools != nil {
 		for _, n := range a.tools.MCPNames() {
 			if isReadMCPName(n) {
@@ -2988,6 +3041,15 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				})
 				stampMessage()
 				continue
+			}
+			// Silent truncation is the worst UX failure of max_tokens — surface
+			// it to subscribers so the user knows their report was cut short.
+			if isTruncated && continuationCount >= maxContinuations {
+				if rs, ok := a.handler.(RunStatusHandler); ok {
+					rs.OnRunStatus("max_tokens_truncated",
+						fmt.Sprintf("hit continuation cap (%d/%d); output may be truncated",
+							continuationCount, maxContinuations))
+				}
 			}
 
 			if afterCheckpoint {

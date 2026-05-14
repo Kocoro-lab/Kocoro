@@ -37,9 +37,9 @@ func TestExecuteBatches_ConcurrencyLimit(t *testing.T) {
 	maxSeen := &atomic.Int32{}
 	tool := &slowReadTool{inflight: inflight, maxSeen: maxSeen}
 
-	// 15 read-only calls — should never exceed maxToolConcurrency (10).
+	// 25 read-only calls — should never exceed maxToolConcurrency (20).
 	var approved []approvedToolCall
-	for i := 0; i < 15; i++ {
+	for i := 0; i < 25; i++ {
 		approved = append(approved, approvedToolCall{
 			index:   i,
 			fc:      client.FunctionCall{Name: "slow_read"},
@@ -48,7 +48,7 @@ func TestExecuteBatches_ConcurrencyLimit(t *testing.T) {
 		})
 	}
 
-	execResults := make([]toolExecResult, 15)
+	execResults := make([]toolExecResult, 25)
 	batches := partitionToolCalls(approved)
 	executeBatches(context.Background(), batches, execResults, nil, nil)
 
