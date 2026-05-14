@@ -620,6 +620,9 @@ func markGlobalSources(cfg *Config, file string) {
 	if viper.IsSet("agent.thinking_budget") {
 		cfg.Sources["agent.thinking_budget"] = src
 	}
+	if viper.IsSet("agent.force_think_tool") {
+		cfg.Sources["agent.force_think_tool"] = src
+	}
 	if viper.IsSet("agent.reasoning_effort") {
 		cfg.Sources["agent.reasoning_effort"] = src
 	}

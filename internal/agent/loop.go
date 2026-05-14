@@ -3098,10 +3098,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if isTruncated && resp.OutputText != "" && continuationCount < maxContinuations {
 				continuationCount++
 				truncatedText.WriteString(resp.OutputText)
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				// buildAssistantMessage preserves thinking blocks across the
+				// continuation boundary; falls back to a text-only message
+				// when ContentBlocks is empty (legacy Cloud path). The empty
+				// preamble case is impossible here (guarded by OutputText != "").
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				messages = append(messages, client.Message{
 					Role:    "user",
@@ -3122,10 +3123,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 			if afterCheckpoint {
 				afterCheckpoint = false
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				// Preserve thinking content from the post-checkpoint
+				// continuation response (CC rule 3).
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				continue
 			}
@@ -3139,10 +3139,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// Check 2 (softer): model claims to see/complete something without any tool call.
 			if hallucinationNudges < 2 && looksLikeFabricatedToolCalls(resp.OutputText) {
 				hallucinationNudges++
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				// Record the model's (fabricated-looking) response with its
+				// thinking blocks intact — the next-turn nudge needs to see
+				// the same trajectory the model emitted.
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				messages = append(messages, client.Message{
 					Role:    "user",
@@ -3153,10 +3153,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			}
 			if totalToolCalls > 0 && hallucinationNudges < 2 && looksLikeUnverifiedClaim(resp.OutputText) {
 				hallucinationNudges++
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				messages = append(messages, client.Message{
 					Role:    "user",
@@ -3168,10 +3165,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 			if len(deniedCalls) > 0 && hallucinationNudges < 2 && claimsSuccessAfterDenial(resp.OutputText) {
 				hallucinationNudges++
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				messages = append(messages, client.Message{
 					Role:    "user",
@@ -3186,10 +3180,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if toolSearchFired {
 				toolSearchFired = false
 				reanchorActiveTask(MetaBoundaryToolSearchLoaded)
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(resp.OutputText),
-				})
+				// tool_search nudge path — preserve the model's pre-load
+				// reasoning so the next iteration sees the same trajectory.
+				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				continue
 			}
