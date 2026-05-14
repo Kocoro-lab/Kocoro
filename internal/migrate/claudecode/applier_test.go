@@ -199,6 +199,99 @@ func TestApply_RejectsStaleSource(t *testing.T) {
 	}
 }
 
+// --- Partial apply must not leave staging behind ---
+
+func TestApply_PhaseB_PartialCleansLeftoverStaging(t *testing.T) {
+	p, target := buildHappyPlan(t)
+	a := NewApplier(target)
+	// Fail on the second skill so #1 commits, #2 fails, and all subsequent
+	// staged actions (agents/commands/rules/mcp) are abandoned.
+	a.testFailOnItem = func(act PlannedAction, idx int) error {
+		if act.Category == "skills" && idx == 1 {
+			return fmt.Errorf("simulated_fail")
+		}
+		return nil
+	}
+	res, err := a.Apply(p)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if res.Result != "partial_applied" {
+		t.Fatalf("Result = %q, want partial_applied", res.Result)
+	}
+
+	// Scan target for any *.staging-* or *.migrate.tmp leftovers.
+	leftover := []string{}
+	err = filepath.Walk(target, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		name := filepath.Base(path)
+		if strings.Contains(name, ".staging-") || strings.HasSuffix(name, ".migrate.tmp") {
+			leftover = append(leftover, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(leftover) > 0 {
+		t.Errorf("partial apply left staging behind:\n  %s", strings.Join(leftover, "\n  "))
+	}
+}
+
+// --- MCP target conflict added after preview → plan_stale ---
+
+func TestApply_RejectsMCPTargetConflictAddedAfterPreview(t *testing.T) {
+	p, target := buildHappyPlan(t)
+	// Pick any planned MCP server name.
+	var mcpName string
+	for _, a := range p.PlannedActions {
+		if a.Category == "mcp_servers" {
+			mcpName = a.Name
+			break
+		}
+	}
+	if mcpName == "" {
+		t.Skip("fixture has no planned MCP servers")
+	}
+	// Simulate the user editing config.yaml between preview and apply.
+	if err := writeFile(t, filepath.Join(target, "config.yaml"),
+		fmt.Sprintf("mcp_servers:\n  %s:\n    command: user-added\n", mcpName)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewApplier(target).Apply(p)
+	if err == nil || !strings.Contains(err.Error(), "plan_stale") {
+		t.Errorf("expected plan_stale for MCP target_conflict_added, got %v", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "mcp_servers/"+mcpName) {
+		t.Errorf("error should name the conflicting server %q: %v", mcpName, err)
+	}
+}
+
+// --- Applied manifest write failure must surface in response ---
+
+func TestApply_ManifestWriteFailure_Surfaced(t *testing.T) {
+	p, target := buildHappyPlan(t)
+	a := NewApplier(target)
+	a.testAppliedManifestError = fmt.Errorf("disk full")
+
+	res, err := a.Apply(p)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	// Items DID land — Result should still be applied.
+	if res.Result != "applied" {
+		t.Errorf("Result = %q, want applied (items renamed)", res.Result)
+	}
+	if res.ManifestID != "" {
+		t.Errorf("ManifestID should be cleared when audit record missing, got %q", res.ManifestID)
+	}
+	if res.Failure == nil || res.Failure.Reason != "manifest_write_failed" {
+		t.Errorf("expected Failure.Reason=manifest_write_failed, got %+v", res.Failure)
+	}
+}
+
 // --- helpers ---
 
 func categoryPlanCounts(p *Plan) map[string]int {

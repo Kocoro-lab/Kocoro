@@ -67,6 +67,11 @@ type Applier struct {
 	// testFailOnItem fires before each Phase B atomic rename. Returning a non-
 	// nil error simulates a rename failure mid-flight. The index is per-category.
 	testFailOnItem func(act PlannedAction, indexWithinCategory int) error
+
+	// testAppliedManifestError, when non-nil, is returned in place of the real
+	// WriteAppliedManifest call so tests can drive the manifest_write_failed
+	// branch without touching the filesystem.
+	testAppliedManifestError error
 }
 
 type stagedAction struct {
@@ -112,8 +117,9 @@ func (a *Applier) Apply(p *Plan) (*ApplyResult, error) {
 }
 
 // validateFreshness re-fingerprints every source path recorded in the plan
-// and re-checks every planned destination. A mismatched fingerprint or a
-// newly-existing target item aborts with plan_stale before any write.
+// and re-checks every planned destination. A mismatched fingerprint, a
+// newly-existing target item (file/dir or MCP server name in config.yaml),
+// or an unreadable config aborts with plan_stale before any write.
 func (a *Applier) validateFreshness(p *Plan) error {
 	for path, want := range p.SourceHashes {
 		ok, err := ValidateSourceFingerprint(path, want)
@@ -124,6 +130,7 @@ func (a *Applier) validateFreshness(p *Plan) error {
 			return fmt.Errorf("plan_stale: source_changed: %s", path)
 		}
 	}
+	// File/dir target conflict re-check for non-MCP categories.
 	for _, act := range p.PlannedActions {
 		if act.Category == "mcp_servers" || act.DstAbs == "" {
 			continue
@@ -134,6 +141,26 @@ func (a *Applier) validateFreshness(p *Plan) error {
 		}
 		if _, err := os.Stat(probe); err == nil {
 			return fmt.Errorf("plan_stale: target_conflict_added: %s/%s", act.Category, act.Name)
+		}
+	}
+	// MCP conflict re-check: if any planned MCP server name now exists in the
+	// target's config.yaml (added after preview), abort. Otherwise the merge
+	// step's silent skip would let the result count it as imported.
+	plannedMCP := map[string]bool{}
+	for _, act := range p.PlannedActions {
+		if act.Category == "mcp_servers" {
+			plannedMCP[act.Name] = true
+		}
+	}
+	if len(plannedMCP) > 0 {
+		existing, err := existingMCPServerNames(a.target)
+		if err != nil {
+			return fmt.Errorf("plan_stale: cannot re-read target config.yaml: %w", err)
+		}
+		for name := range plannedMCP {
+			if existing[name] {
+				return fmt.Errorf("plan_stale: target_conflict_added: mcp_servers/%s", name)
+			}
 		}
 	}
 	return nil
@@ -310,6 +337,14 @@ func (a *Applier) commit(p *Plan) (*ApplyResult, error) {
 		}
 	}
 
+	// Clean any staging that didn't get atomic-renamed. For successful items
+	// the staging path no longer exists (it WAS renamed), so RemoveAll is a
+	// no-op. For items after a Phase B failure, this removes their abandoned
+	// staging dirs/files. Also catches MCP's .migrate.tmp if MergeMCPIntoConfig
+	// failed midway.
+	a.cleanupStaging()
+	_ = os.Remove(filepath.Join(a.target, "config.yaml.migrate.tmp"))
+
 	res := &ApplyResult{
 		AppliedAt:  time.Now().UTC(),
 		ManifestID: p.ID,
@@ -338,8 +373,34 @@ func (a *Applier) commit(p *Plan) (*ApplyResult, error) {
 			res.MCPUnsupportedFields = append(res.MCPUnsupportedFields, ServerFields{Server: w.Server, Fields: w.Fields})
 		}
 	}
-	_ = WriteAppliedManifest(a.target, p, applied)
+	// If the applied manifest write fails, the items did land but the audit
+	// record is missing. Don't lie in the response: clear ManifestID and
+	// surface a Failure if one isn't already set (so partial-applied failures
+	// take precedence). Result stays applied / partial_applied because target
+	// state did change — the failure flag tells the client what's wrong.
+	manifestWriter := a.appliedWriter()
+	if err := manifestWriter(a.target, p, applied); err != nil {
+		res.ManifestID = ""
+		if res.Failure == nil {
+			res.Failure = &FailureInfo{
+				Category: "manifest",
+				Item:     p.ID,
+				Reason:   "manifest_write_failed",
+				Detail:   err.Error(),
+			}
+		}
+	}
 	return res, nil
+}
+
+// appliedWriter returns the WriteAppliedManifest function unless a test hook
+// is installed. Keeps the production path untouched while letting tests
+// inject failures.
+func (a *Applier) appliedWriter() func(string, *Plan, []AppliedItem) error {
+	if a.testAppliedManifestError != nil {
+		return func(string, *Plan, []AppliedItem) error { return a.testAppliedManifestError }
+	}
+	return WriteAppliedManifest
 }
 
 type plannedCounts struct {
