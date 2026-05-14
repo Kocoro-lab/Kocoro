@@ -681,22 +681,22 @@ type AgentLoop struct {
 	// checkPermissionAndApproval honors it as an approval bypass — except for
 	// tools listed in DisallowsAutoApproval, which must always prompt.
 	alwaysAllowTools map[string]bool
-	workingSet            *WorkingSet        // session-scoped deferred schema cache injected by the caller
-	sessionID             string             // session ID for audit log correlation
-	sessionCWD            string             // session-scoped working directory; set by runner/TUI before Run()
-	deltaProvider         DeltaProvider
-	injectCh              chan InjectedMessage
-	injectedMessages      []string         // messages injected during the last Run(); cleared on each Run() call
-	runMessages           []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
-	runMsgInjected        []bool           // parallel to runMessages: true = system-injected guardrail/nudge
-	runMsgTimestamps      []time.Time      // parallel to runMessages: when each message was created
-	lastRunStatus         RunStatus
-	toolRefSupported      bool   // true when the configured model supports defer_loading + tool_reference protocol
-	cacheSource           string // tag sent to gateway on every Complete call for prompt-cache TTL routing
-	skillDiscovery        bool   // call small-tier model on first turn to identify relevant skills (default true)
-	memoryPreflight       MemoryPreflightFunc
-	sentSkillNames        map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
-	readTracker           *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
+	workingSet       *WorkingSet // session-scoped deferred schema cache injected by the caller
+	sessionID        string      // session ID for audit log correlation
+	sessionCWD       string      // session-scoped working directory; set by runner/TUI before Run()
+	deltaProvider    DeltaProvider
+	injectCh         chan InjectedMessage
+	injectedMessages []string         // messages injected during the last Run(); cleared on each Run() call
+	runMessages      []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
+	runMsgInjected   []bool           // parallel to runMessages: true = system-injected guardrail/nudge
+	runMsgTimestamps []time.Time      // parallel to runMessages: when each message was created
+	lastRunStatus    RunStatus
+	toolRefSupported bool   // true when the configured model supports defer_loading + tool_reference protocol
+	cacheSource      string // tag sent to gateway on every Complete call for prompt-cache TTL routing
+	skillDiscovery   bool   // call small-tier model on first turn to identify relevant skills (default true)
+	memoryPreflight  MemoryPreflightFunc
+	sentSkillNames   map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
+	readTracker      *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
 	// toolResultReplacements stores stable query-time replacements for large
 	// historical tool_result blocks. It is session-scoped and persisted by
 	// daemon/TUI callers so resumed sessions replay identical bytes.
