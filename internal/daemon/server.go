@@ -30,6 +30,7 @@ import (
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
+	"github.com/Kocoro-lab/ShanClaw/internal/migrate/claudecode"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
@@ -62,6 +63,7 @@ type Server struct {
 	secretsStore *skills.SecretsStore
 	memSvc       *memory.Service
 	suggestions  *agent.SuggestionState
+	migratePlans *claudecode.PlanStore
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500
@@ -143,6 +145,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		slugLocks:              skills.NewSlugLocks(),
 		secretsStore:           store,
 		suggestions:            agent.NewSuggestionState(),
+		migratePlans:           claudecode.NewPlanStore(),
 	}
 	if deps != nil {
 		deps.Suggestions = s.suggestions
@@ -305,6 +308,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /chrome/profile/refresh", s.handleChromeProfileRefresh)
 	mux.HandleFunc("POST /chrome/show", s.handleChromeShow)
 	mux.HandleFunc("POST /chrome/hide", s.handleChromeHide)
+	mux.HandleFunc("POST /migrate/claude-code/preview", s.handleClaudeMigratePreview)
+	mux.HandleFunc("POST /migrate/claude-code/apply", s.handleClaudeMigrateApply)
 	mux.HandleFunc("POST /shutdown", s.handleShutdown)
 }
 
@@ -320,6 +325,7 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) Start(ctx context.Context) error {
 	s.ctx = ctx
+	s.recoverMigrationOrphans()
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 

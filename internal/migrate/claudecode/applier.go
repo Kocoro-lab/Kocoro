@@ -15,14 +15,14 @@ import (
 // scanner items — so conflicts (which are excluded from PlannedActions) can
 // never be miscounted as imported.
 type ApplyResult struct {
-	Result               string         // "applied" | "partial_applied" | "staged_only"
-	AppliedAt            time.Time
-	Imported             map[string]CategoryCount
-	Skipped              []Conflict
-	MCPMissingEnvKeys    []ServerKeys
-	MCPUnsupportedFields []ServerFields
-	Failure              *FailureInfo
-	ManifestID           string
+	Result               string                   `json:"result"` // "applied" | "partial_applied" | "staged_only"
+	AppliedAt            time.Time                `json:"applied_at"`
+	Imported             map[string]CategoryCount `json:"imported"`
+	Skipped              []Conflict               `json:"skipped"`
+	MCPMissingEnvKeys    []ServerKeys             `json:"mcp_missing_env_keys"`
+	MCPUnsupportedFields []ServerFields           `json:"mcp_unsupported_fields"`
+	Failure              *FailureInfo             `json:"failure,omitempty"`
+	ManifestID           string                   `json:"manifest_id,omitempty"`
 }
 
 // CategoryCount carries planned/completed as `any` so a JSON encoder can

@@ -111,9 +111,9 @@ type Warning struct {
 }
 
 type Conflict struct {
-	Category string
-	Name     string
-	Reason   string // "exists_in_target"
+	Category string `json:"category"`
+	Name     string `json:"name"`
+	Reason   string `json:"reason"` // "exists_in_target"
 }
 
 // PlannedAction is one item the applier will commit during Phase B.
@@ -146,7 +146,7 @@ type Plan struct {
 	ExpiresAt    time.Time
 	SourcePaths  SourcePaths
 	Symbolic     SymbolicPaths
-	TargetPath   string // absolute, e.g. /Users/wayland/.shannon
+	TargetPath   string                       // absolute, e.g. /Users/wayland/.shannon
 	SourceHashes map[string]SourceFingerprint // src_abs_path → fingerprint, for TOCTOU re-check.
 	// Key is the path that will be re-fingerprinted at apply time. For dir-layout
 	// skills the path is the skill directory; for everything else it's the file.
