@@ -126,6 +126,7 @@ Instructions:
   - Before destructive operations (git reset --hard, git push --force, git checkout --), consider safer alternatives. Only use destructive operations when truly the best approach.
   - Never skip hooks (--no-verify) or bypass signing unless the user explicitly asked. If a hook fails, investigate and fix the underlying issue.
 - Do NOT start long-running server processes (python -m http.server, flask run, npm start, vite, etc.). This tool uses CombinedOutput() and blocks until the process closes its pipes, so a server that runs forever will hang the call until timeout. Need local HTTP to serve a file to a browser? Just pass file:///abs/path.html to browser_navigate — the daemon bridges file:// to a loopback HTTP endpoint automatically, no manual server needed.
+- Silent commands that consume wall time (sleep, wait, sync, busy loops, network probes) produce no stdout but DO execute. The tool prepends ` + "`" + `[command ran for Ns]` + "`" + ` to any result that took ≥ 1 second, so a result like ` + "`" + `[command ran for 2.0s]\ntask1_done` + "`" + ` is sleep+echo working correctly — the sleep was NOT blocked or skipped. An absence of stdout for a slept command is normal; never fabricate "rate limited" / "blocked" / "skipped" explanations to fill that gap.
 - Avoid unnecessary sleep commands:
   - Do not sleep between commands that can run immediately — just run them.
   - Do not retry failing commands in a sleep loop — diagnose the root cause.
@@ -209,7 +210,9 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	if envPairs := collectActivatedSkillEnv(ctx, t.SecretsStore); len(envPairs) > 0 {
 		cmd.Env = append(os.Environ(), envPairs...)
 	}
+	start := time.Now()
 	output, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
 
 	result := string(output)
 	maxOut := t.MaxOutput
@@ -225,6 +228,15 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 		result = string(r[:keepHead]) + "\n\n[... truncated " +
 			strconv.Itoa(len(r)-maxOut) + " chars ...]\n\n" +
 			string(r[len(r)-keepTail:])
+	}
+
+	// Prepend elapsed-time annotation when the command consumed meaningful
+	// wall time. Gives the model unambiguous evidence that "silent" commands
+	// (sleep, wait, sync, network probes) actually executed — without this,
+	// models can misperceive an empty-stdout success as "the command was
+	// blocked or skipped" and fabricate restrictions to explain it.
+	if elapsed >= time.Second {
+		result = fmt.Sprintf("[command ran for %.1fs]\n%s", elapsed.Seconds(), result)
 	}
 
 	if err != nil {
