@@ -107,6 +107,41 @@ func TestPlan_DetectsSkillConflict(t *testing.T) {
 	}
 }
 
+func TestPlan_DetectsMCPConflict(t *testing.T) {
+	src := SourcePaths{
+		ClaudeHome:       filepath.Join("testdata", "claude_home_basic"),
+		ClaudeUserConfig: filepath.Join("testdata", "claude_user_config_basic.json"),
+	}
+	scan, _ := Scan(src)
+	target := t.TempDir()
+	if err := writeFile(t, filepath.Join(target, "config.yaml"), `mcp_servers:
+  anthropic:
+    command: existing
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := BuildPlan(scan, src, target, "/Users/wayland", time.Now())
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+
+	gotConflict := false
+	for _, c := range p.Conflicts {
+		if c.Category == "mcp_servers" && c.Name == "anthropic" {
+			gotConflict = true
+		}
+	}
+	if !gotConflict {
+		t.Errorf("expected MCP conflict for anthropic, got %+v", p.Conflicts)
+	}
+	for _, a := range p.PlannedActions {
+		if a.Category == "mcp_servers" && a.Name == "anthropic" {
+			t.Errorf("conflicting MCP server should not appear in PlannedActions: %+v", a)
+		}
+	}
+}
+
 func TestPlan_HashStable(t *testing.T) {
 	src := SourcePaths{
 		ClaudeHome:       filepath.Join("testdata", "claude_home_basic"),

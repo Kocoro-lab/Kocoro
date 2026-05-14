@@ -18,7 +18,7 @@ import (
 // transport) are skipped entirely.
 //
 // Atomicity: build the merged document in memory, marshal, validate parse-back,
-// write to a tmp file, then rename(2) into place. Existing config is backed up.
+// write to a tmp file, then rename(2) into place.
 func MergeMCPIntoConfig(target string, servers []ScannedMCPServer, disabled map[string]bool, importedAt string) error {
 	cfgPath := filepath.Join(target, "config.yaml")
 	var root map[string]any
@@ -37,6 +37,9 @@ func MergeMCPIntoConfig(target string, servers []ScannedMCPServer, disabled map[
 
 	for _, s := range servers {
 		if s.Status != "ok" {
+			continue
+		}
+		if _, exists := mcp[s.Name]; exists {
 			continue
 		}
 		entry := map[string]any{}
@@ -82,9 +85,6 @@ func MergeMCPIntoConfig(target string, servers []ScannedMCPServer, disabled map[
 	tmp := cfgPath + ".migrate.tmp"
 	if err := os.WriteFile(tmp, merged, 0o644); err != nil {
 		return err
-	}
-	if _, err := os.Stat(cfgPath); err == nil {
-		_ = copyFile(cfgPath, cfgPath+".pre-migrate-bak")
 	}
 	return os.Rename(tmp, cfgPath)
 }

@@ -22,6 +22,7 @@ permissions:
 	}
 
 	servers := []ScannedMCPServer{
+		{Name: "preexisting", Transport: "stdio", Command: "SHOULD-NOT-WRITE", Status: "ok"},
 		{Name: "anthropic", Transport: "stdio", Command: "node", Args: []string{"server.js"}, EnvKeys: []string{"ANTHROPIC_API_KEY"}, Status: "ok"},
 		{Name: "internal-api", Transport: "http", URL: "https://x", UnsupportedFields: []string{"headers"}, Status: "ok"},
 		{Name: "command-only", Transport: "stdio", Command: "/usr/local/bin/mcp", Status: "ok"},
@@ -59,6 +60,12 @@ permissions:
 	// Disabled servers have `disabled: true` somewhere in their entry.
 	if !strings.Contains(s, "disabled: true") {
 		t.Errorf("expected at least one disabled:true entry: %s", s)
+	}
+	if strings.Contains(s, "SHOULD-NOT-WRITE") {
+		t.Errorf("existing MCP server was overwritten: %s", s)
+	}
+	if _, err := os.Stat(filepath.Join(target, "config.yaml.pre-migrate-bak")); !os.IsNotExist(err) {
+		t.Errorf("config backup should not be written; stat err=%v", err)
 	}
 }
 

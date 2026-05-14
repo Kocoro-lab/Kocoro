@@ -99,6 +99,36 @@ func TestValidateSourceFingerprint_File_MatchesAndMismatches(t *testing.T) {
 	}
 }
 
+func TestValidateSourceFingerprint_FileRejectsSymlinkSwap(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "a.md")
+	other := filepath.Join(dir, "other.md")
+	if err := os.WriteFile(p, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp, err := ComputeFileFingerprint(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, p); err != nil {
+		t.Skipf("symlink unsupported here: %v", err)
+	}
+
+	ok, err := ValidateSourceFingerprint(p, fp)
+	if err == nil || ok {
+		t.Fatalf("expected symlink swap rejection, ok=%v err=%v", ok, err)
+	}
+	if _, err := ComputeFileFingerprint(p); err == nil {
+		t.Fatal("ComputeFileFingerprint should reject symlink paths")
+	}
+}
+
 func TestValidateSourceFingerprint_SkillTree_RoundTrip(t *testing.T) {
 	home := t.TempDir()
 	skill := filepath.Join(home, "skills", "tree")

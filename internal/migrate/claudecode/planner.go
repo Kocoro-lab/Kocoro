@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // BuildPlan converts a ScanResult into an immutable Plan ready for apply.
@@ -110,6 +112,11 @@ func BuildPlan(scan *ScanResult, src SourcePaths, target, homeDir string, now ti
 		}
 	}
 
+	existingMCP, err := existingMCPServerNames(target)
+	if err != nil {
+		return nil, err
+	}
+
 	// MCP servers — disable when missing env keys OR unsupported fields non-empty.
 	// All MCP servers derive from a single source file (src.ClaudeUserConfig);
 	// record one fingerprint covering it so a mid-flight edit to ~/.claude.json
@@ -121,6 +128,10 @@ func BuildPlan(scan *ScanResult, src SourcePaths, target, homeDir string, now ti
 	}
 	for _, m := range scan.MCPServers {
 		if m.Status != "ok" {
+			continue
+		}
+		if existingMCP[m.Name] {
+			p.Conflicts = append(p.Conflicts, Conflict{Category: "mcp_servers", Name: m.Name, Reason: "exists_in_target"})
 			continue
 		}
 		if len(m.EnvKeys) > 0 || len(m.UnsupportedFields) > 0 {
@@ -139,6 +150,28 @@ func BuildPlan(scan *ScanResult, src SourcePaths, target, homeDir string, now ti
 
 	p.Hash = computePlanHash(p)
 	return p, nil
+}
+
+func existingMCPServerNames(target string) (map[string]bool, error) {
+	cfgPath := filepath.Join(target, "config.yaml")
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var raw struct {
+		MCPServers map[string]struct{} `yaml:"mcp_servers"`
+	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse existing config.yaml mcp_servers: %w", err)
+	}
+	out := make(map[string]bool, len(raw.MCPServers))
+	for name := range raw.MCPServers {
+		out[name] = true
+	}
+	return out, nil
 }
 
 func newPlanID(now time.Time) string {

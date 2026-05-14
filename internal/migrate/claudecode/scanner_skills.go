@@ -182,6 +182,16 @@ func hashSkillTree(root, slug string) (hash string, total int64, ok bool, warns 
 }
 
 func fileSHA256(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("refusing to hash symlink: %s", path)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("refusing to hash non-regular file: %s", path)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
