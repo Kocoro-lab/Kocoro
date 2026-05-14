@@ -1482,6 +1482,13 @@ type sseEventHandler struct {
 	// sessionID is set by RunAgent via SetSessionID after the session is
 	// resolved. Approval Mark/Clear keys on this so a paused session can be
 	// surfaced via deps.ApprovalTracker.
+	//
+	// Plain string (no atomic) is intentional: SetSessionID is called exactly
+	// once from RunAgent before the first tool call, and OnApprovalNeeded
+	// reads it on the same agent loop goroutine — single-writer, then
+	// happens-before-ordered single-reader via RunAgent's sequencing.
+	// Contrast routeEntry.sessionID (atomic.Pointer) which is read from
+	// arbitrary HTTP handler goroutines (CancelBySessionID scans all routes).
 	sessionID string
 	usage     agent.UsageAccumulator
 }
@@ -1609,13 +1616,20 @@ func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	}
 	// Local SSE path: no Cloud claim, so messageID is empty. The broker stays
 	// in-process via its own pending map, no WS envelope round-trips Cloud.
+	//
+	// Mark/Clear use defer so a panic inside broker.Request (e.g. SSE writer
+	// failure) can't leak a phantom session in the tracker — net/http's
+	// per-request panic recovery would otherwise leave IsAwaiting stuck at
+	// true forever. The temp var stays because test fixtures construct
+	// sseEventHandler with deps == nil (see server_test.go); production
+	// always wires deps via NewServer.
 	var tracker *ApprovalTracker
 	if h.deps != nil {
 		tracker = h.deps.ApprovalTracker
 	}
 	tracker.Mark(h.sessionID)
+	defer tracker.Clear(h.sessionID)
 	decision := h.broker.Request(h.ctx, "", "", "", "", tool, args)
-	tracker.Clear(h.sessionID)
 	if decision == DecisionAlwaysAllow {
 		HandleAlwaysAllowDecision(h.deps, h.broker, h.agent, tool, args)
 	}

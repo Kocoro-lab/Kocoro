@@ -60,8 +60,9 @@ func (t *ApprovalTracker) IsAwaiting(sessionID string) bool {
 }
 
 // SessionIDs returns the set of session IDs currently awaiting approval.
-// Returns nil (not a zero-length slice) when nothing is pending so JSON
-// callers see `null` and not `[]` — matches existing daemon list conventions.
+// Returns nil (not a zero-length slice) when nothing is pending; HTTP
+// callers must normalize nil → []string{} before encoding to keep the
+// daemon's `{"sessions": []}` empty-list convention (see handleApprovals).
 func (t *ApprovalTracker) SessionIDs() []string {
 	if t == nil {
 		return nil

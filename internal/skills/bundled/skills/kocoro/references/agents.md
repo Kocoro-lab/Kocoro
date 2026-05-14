@@ -97,7 +97,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Method: GET
 - Path: /approvals
 - Response: `{"sessions": ["sess_abc", "sess_def"]}` (empty array when nothing pending)
-- Notes: Returns the set of session IDs whose agent loop is currently blocked on an approval prompt. Use this on first connect / page refresh to re-sync — the `approval` SSE event covers live updates but is lossy across reconnect. Pairs with `POST /approval` (resolve a pending request_id) for the full approval flow.
+- Notes: Returns the set of session IDs whose agent loop is currently blocked on an approval prompt. Use this on first connect / page refresh to re-sync — the `approval_request` SSE event covers live updates but is lossy across reconnect. Pairs with `POST /approval` (resolve a pending request_id) for the full approval flow.
 
 ### Reset agent session history (in place)
 - Method: POST
