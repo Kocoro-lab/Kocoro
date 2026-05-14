@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -123,6 +124,7 @@ Instructions:
   - Prefer creating a new commit over amending an existing commit.
   - Before destructive operations (git reset --hard, git push --force, git checkout --), consider safer alternatives. Only use destructive operations when truly the best approach.
   - Never skip hooks (--no-verify) or bypass signing unless the user explicitly asked. If a hook fails, investigate and fix the underlying issue.
+- Do NOT start long-running server processes (python -m http.server, flask run, npm start, vite, etc.). This tool uses CombinedOutput() and blocks until the process closes its pipes, so a server that runs forever will hang the call until timeout. Need local HTTP to serve a file to a browser? Just pass file:///abs/path.html to browser_navigate — the daemon bridges file:// to a loopback HTTP endpoint automatically, no manual server needed.
 - Avoid unnecessary sleep commands:
   - Do not sleep between commands that can run immediately — just run them.
   - Do not retry failing commands in a sleep loop — diagnose the root cause.
@@ -154,7 +156,11 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
 
-	// Timeout precedence: per-call args > tool default (from config) > 120s fallback.
+	// Timeout precedence: per-call args > tool default (from config) > 120s fallback,
+	// then hard-capped at maxBashTimeout. The cap protects against models passing an
+	// unreasonably large timeout (e.g. 3600s for a hung server) that would leave UI
+	// cards looking frozen for many minutes before SIGKILL fires.
+	const maxBashTimeout = 600 * time.Second
 	timeout := 120 * time.Second
 	if t.DefaultTimeoutSecs > 0 {
 		timeout = time.Duration(t.DefaultTimeoutSecs) * time.Second
@@ -162,11 +168,30 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	if args.Timeout > 0 {
 		timeout = time.Duration(args.Timeout) * time.Second
 	}
+	if timeout > maxBashTimeout {
+		timeout = maxBashTimeout
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", args.Command)
+	// Put sh and any children it spawns into a new process group so we can
+	// SIGKILL the whole tree on timeout. Without Setpgid, exec's default
+	// Cancel kills only sh's PID — long-running grandchildren (e.g.
+	// `python -m http.server` backgrounded from sh) survive as orphans
+	// and keep ports bound until the user kills them by hand.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return os.ErrProcessDone
+	}
+	// Cap how long Wait() blocks after Cancel fires. Without WaitDelay, a
+	// stuck child that ignores SIGKILL (zombie, uninterruptible sleep) can
+	// keep CombinedOutput pinned forever.
+	cmd.WaitDelay = 2 * time.Second
 	dir := t.CWD
 	if dir == "" {
 		dir = cwdctx.FromContext(ctx)
