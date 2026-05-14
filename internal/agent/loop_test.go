@@ -5026,3 +5026,94 @@ func TestBuildAssistantMessage_NilResponseReturnsEmpty(t *testing.T) {
 		t.Errorf("expected zero blocks for nil response, got %+v", msg.Content.Blocks())
 	}
 }
+
+// TestMessagesForLLM_PreservesThinkingBlocks locks the invariant that the
+// pre-flight sanitizer pipeline (oversize image filter, etc.) does NOT
+// strip thinking content blocks from assistant messages. CC rule 3
+// requires those blocks survive the trajectory.
+func TestMessagesForLLM_PreservesThinkingBlocks(t *testing.T) {
+	loop := &AgentLoop{}
+	in := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "thinking", Thinking: "plan", Signature: "sigA"},
+			{Type: "text", Text: "ok"},
+			{Type: "tool_use", ID: "t1", Name: "file_read", Input: json.RawMessage(`{"path":"/x"}`)},
+			{Type: "thinking", Thinking: "interleaved", Signature: "sigB"},
+		})},
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "tool_result", ToolUseID: "t1", ToolContent: "data"},
+		})},
+	}
+	out := loop.messagesForLLM(in)
+
+	var asst *client.Message
+	for i := range out {
+		if out[i].Role == "assistant" {
+			asst = &out[i]
+			break
+		}
+	}
+	if asst == nil {
+		t.Fatal("assistant message dropped by messagesForLLM")
+	}
+	gotSigs := map[string]bool{}
+	for _, b := range asst.Content.Blocks() {
+		if b.Type == "thinking" {
+			gotSigs[b.Signature] = true
+		}
+	}
+	if !gotSigs["sigA"] || !gotSigs["sigB"] {
+		t.Errorf("thinking blocks (or signatures) lost in messagesForLLM; gotSigs=%v", gotSigs)
+	}
+}
+
+// TestTimeBasedCompact_DoesNotTouchThinkingBlocks: the time-based clearing
+// pass only mutates user-role tool_result blocks (whitelist in
+// timebasedcompact.go `compactableTools`). Assistant-side thinking blocks
+// must survive untouched even when compaction clears the oldest results.
+func TestTimeBasedCompact_DoesNotTouchThinkingBlocks(t *testing.T) {
+	// Build a 4-turn history: 2 old (compactable) + 2 recent (preserved).
+	mkAsst := func(thoughtSig string, toolID string) client.Message {
+		return client.Message{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "thinking", Thinking: "reasoning-" + thoughtSig, Signature: thoughtSig},
+			{Type: "tool_use", ID: toolID, Name: "file_read", Input: json.RawMessage(`{}`)},
+		})}
+	}
+	mkResult := func(toolID, body string) client.Message {
+		return client.Message{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "tool_result", ToolUseID: toolID, ToolContent: body},
+		})}
+	}
+	messages := []client.Message{
+		mkAsst("sigOldA", "t1"), mkResult("t1", "old body 1"),
+		mkAsst("sigOldB", "t2"), mkResult("t2", "old body 2"),
+		mkAsst("sigRecent", "t3"), mkResult("t3", "recent body"),
+	}
+
+	cfg := TimeBasedCompactConfig{Enabled: true, GapThresholdMinutes: 1, KeepRecent: 1}
+	// Set lastAssistantAt deep in the past so trigger fires.
+	cleared := timeBasedCompact(messages, time.Now().Add(-2*time.Hour), cfg)
+	if cleared == 0 {
+		t.Fatalf("expected at least one tool_result cleared")
+	}
+
+	// Verify thinking blocks across ALL assistant messages survived intact.
+	wantSigs := []string{"sigOldA", "sigOldB", "sigRecent"}
+	gotSigs := map[string]string{}
+	for _, m := range messages {
+		if m.Role != "assistant" {
+			continue
+		}
+		for _, b := range m.Content.Blocks() {
+			if b.Type == "thinking" {
+				gotSigs[b.Signature] = b.Thinking
+			}
+		}
+	}
+	for _, want := range wantSigs {
+		if _, ok := gotSigs[want]; !ok {
+			t.Errorf("thinking signature %q stripped by time-based compaction; got %v", want, gotSigs)
+		}
+	}
+}
