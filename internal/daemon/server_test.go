@@ -22,6 +22,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
+	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
@@ -1986,6 +1987,134 @@ func TestServer_EditMessage_Validation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServer_PatchSession(t *testing.T) {
+	shannonDir := t.TempDir()
+	deps := &ServerDeps{
+		ShannonDir:   shannonDir,
+		SessionCache: NewSessionCache(shannonDir),
+	}
+	srv := &Server{deps: deps}
+
+	// Seed a default-agent session via the live manager so handler reads
+	// hit the same on-disk + SQLite index state.
+	mgr := deps.SessionCache.GetOrCreate("")
+	sess := mgr.NewSession()
+	sess.Title = "original"
+	if err := mgr.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	sessID := sess.ID
+
+	patch := func(t *testing.T, id, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPatch, "/sessions/"+id, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.SetPathValue("id", id)
+		srv.handlePatchSession(rec, req)
+		return rec
+	}
+
+	reload := func(t *testing.T) *session.Session {
+		t.Helper()
+		s, err := mgr.Resume(sessID)
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+		return s
+	}
+
+	t.Run("title only (back-compat)", func(t *testing.T) {
+		rec := patch(t, sessID, `{"title":"renamed"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		json.Unmarshal(rec.Body.Bytes(), &resp)
+		if resp["title"] != "renamed" {
+			t.Errorf("expected echoed title, got %v", resp)
+		}
+		if _, ok := resp["pinned"]; ok {
+			t.Errorf("pinned should be absent when not patched, got %v", resp)
+		}
+		if reload(t).Title != "renamed" {
+			t.Error("title not persisted")
+		}
+	})
+
+	t.Run("pinned only", func(t *testing.T) {
+		rec := patch(t, sessID, `{"pinned":true}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		json.Unmarshal(rec.Body.Bytes(), &resp)
+		if resp["pinned"] != true {
+			t.Errorf("expected pinned=true in response, got %v", resp)
+		}
+		s := reload(t)
+		if !s.Pinned {
+			t.Error("Pinned not persisted")
+		}
+		if s.Title != "renamed" {
+			t.Errorf("title should be unchanged, got %q", s.Title)
+		}
+	})
+
+	t.Run("favorite only", func(t *testing.T) {
+		rec := patch(t, sessID, `{"favorite":true}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		s := reload(t)
+		if !s.Favorite || !s.Pinned {
+			t.Errorf("expected both flags true, got pinned=%v favorite=%v", s.Pinned, s.Favorite)
+		}
+	})
+
+	t.Run("all fields at once", func(t *testing.T) {
+		rec := patch(t, sessID, `{"title":"final","pinned":false,"favorite":false}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		s := reload(t)
+		if s.Title != "final" || s.Pinned || s.Favorite {
+			t.Errorf("got title=%q pinned=%v favorite=%v", s.Title, s.Pinned, s.Favorite)
+		}
+	})
+
+	t.Run("empty body rejected", func(t *testing.T) {
+		rec := patch(t, sessID, `{}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "at least one of") {
+			t.Errorf("expected explanatory error, got %s", rec.Body.String())
+		}
+	})
+
+	t.Run("empty title rejected", func(t *testing.T) {
+		rec := patch(t, sessID, `{"title":"   "}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rec.Code)
+		}
+	})
+
+	t.Run("unknown session returns 404", func(t *testing.T) {
+		rec := patch(t, "no-such-session", `{"pinned":true}`)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("expected 404, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("path traversal rejected", func(t *testing.T) {
+		rec := patch(t, "../evil", `{"pinned":true}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("expected 400, got %d", rec.Code)
+		}
+	})
 }
 
 func TestRunSyncLoop_StaysAliveWhenInitiallyDisabled(t *testing.T) {

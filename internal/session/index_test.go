@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -854,5 +855,129 @@ func TestIndex_ListUpdatedSince(t *testing.T) {
 	}
 	if len(rows) != 2 {
 		t.Errorf("expected 2 rows, got %d: %+v", len(rows), rows)
+	}
+}
+
+func TestIndex_UpdateSessionFlags(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := OpenIndex(dir)
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+	defer idx.Close()
+
+	now := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	mustUpsert(t, idx, &Session{ID: "s1", Title: "one", CreatedAt: now, UpdatedAt: now})
+	tru, fls := true, false
+
+	t.Run("set pinned only leaves favorite", func(t *testing.T) {
+		if err := idx.UpdateSessionFlags("s1", &tru, nil); err != nil {
+			t.Fatalf("UpdateSessionFlags: %v", err)
+		}
+		sums, _ := idx.ListSessions()
+		if len(sums) != 1 || !sums[0].Pinned || sums[0].Favorite {
+			t.Errorf("expected Pinned=true Favorite=false, got %+v", sums)
+		}
+	})
+
+	t.Run("set favorite preserves pinned", func(t *testing.T) {
+		if err := idx.UpdateSessionFlags("s1", nil, &tru); err != nil {
+			t.Fatalf("UpdateSessionFlags: %v", err)
+		}
+		sums, _ := idx.ListSessions()
+		if !sums[0].Pinned || !sums[0].Favorite {
+			t.Errorf("expected both true, got %+v", sums[0])
+		}
+	})
+
+	t.Run("clear both", func(t *testing.T) {
+		if err := idx.UpdateSessionFlags("s1", &fls, &fls); err != nil {
+			t.Fatalf("UpdateSessionFlags: %v", err)
+		}
+		sums, _ := idx.ListSessions()
+		if sums[0].Pinned || sums[0].Favorite {
+			t.Errorf("expected both false, got %+v", sums[0])
+		}
+	})
+
+	t.Run("missing id returns os.ErrNotExist", func(t *testing.T) {
+		err := idx.UpdateSessionFlags("does-not-exist", &tru, nil)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !os.IsNotExist(err) {
+			t.Errorf("expected os.ErrNotExist, got %v", err)
+		}
+	})
+
+	t.Run("both nil is no-op", func(t *testing.T) {
+		if err := idx.UpdateSessionFlags("s1", nil, nil); err != nil {
+			t.Errorf("nil/nil should be no-op, got %v", err)
+		}
+	})
+
+	t.Run("does not touch messages table", func(t *testing.T) {
+		// Seed messages, toggle flags, confirm rowid + count are unchanged.
+		seed := &Session{
+			ID:        "s2",
+			Title:     "two",
+			CreatedAt: now,
+			UpdatedAt: now,
+			Messages: []client.Message{
+				{Role: "user", Content: client.NewTextContent("hello world")},
+			},
+		}
+		mustUpsert(t, idx, seed)
+
+		var rowidBefore int64
+		idx.db.QueryRow(`SELECT rowid FROM messages WHERE session_id='s2'`).Scan(&rowidBefore)
+		if rowidBefore == 0 {
+			t.Fatal("seed message not indexed")
+		}
+
+		if err := idx.UpdateSessionFlags("s2", &tru, &tru); err != nil {
+			t.Fatalf("UpdateSessionFlags: %v", err)
+		}
+
+		var rowidAfter int64
+		idx.db.QueryRow(`SELECT rowid FROM messages WHERE session_id='s2'`).Scan(&rowidAfter)
+		if rowidAfter != rowidBefore {
+			t.Errorf("messages rowid changed: before=%d after=%d (narrow UPDATE must not rebuild messages)", rowidBefore, rowidAfter)
+		}
+	})
+}
+
+func TestIndex_ListSessions_PinnedFirst(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := OpenIndex(dir)
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+	defer idx.Close()
+
+	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	mid := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+
+	// "old" gets pinned; "newer" stays unpinned and would otherwise sort first.
+	mustUpsert(t, idx, &Session{ID: "old", Title: "Old", CreatedAt: old, UpdatedAt: old, Pinned: true})
+	mustUpsert(t, idx, &Session{ID: "mid", Title: "Mid", CreatedAt: mid, UpdatedAt: mid})
+	mustUpsert(t, idx, &Session{ID: "newer", Title: "Newer", CreatedAt: newer, UpdatedAt: newer})
+
+	sums, err := idx.ListSessions()
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sums) != 3 {
+		t.Fatalf("expected 3, got %d", len(sums))
+	}
+	if sums[0].ID != "old" || !sums[0].Pinned {
+		t.Errorf("expected pinned 'old' first, got %q (pinned=%v)", sums[0].ID, sums[0].Pinned)
+	}
+	if sums[1].ID != "newer" {
+		t.Errorf("expected 'newer' second among unpinned, got %q", sums[1].ID)
+	}
+	if sums[2].ID != "mid" {
+		t.Errorf("expected 'mid' last, got %q", sums[2].ID)
 	}
 }

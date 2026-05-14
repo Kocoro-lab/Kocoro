@@ -955,15 +955,24 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Title string `json:"title"`
+		Title    *string `json:"title,omitempty"`
+		Pinned   *bool   `json:"pinned,omitempty"`
+		Favorite *bool   `json:"favorite,omitempty"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
 	}
-	title := strings.TrimSpace(body.Title)
-	if title == "" {
-		writeError(w, http.StatusBadRequest, "title cannot be empty")
+	if body.Title == nil && body.Pinned == nil && body.Favorite == nil {
+		writeError(w, http.StatusBadRequest, "request body must include at least one of: title, pinned, favorite")
 		return
+	}
+	var title string
+	if body.Title != nil {
+		title = strings.TrimSpace(*body.Title)
+		if title == "" {
+			writeError(w, http.StatusBadRequest, "title cannot be empty")
+			return
+		}
 	}
 	agentName := r.URL.Query().Get("agent")
 	if agentName != "" {
@@ -973,15 +982,36 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
-	if err := mgr.PatchTitle(id, title); err != nil {
-		if os.IsNotExist(err) {
-			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
+	resp := map[string]interface{}{"status": "updated"}
+	if body.Title != nil {
+		if err := mgr.PatchTitle(id, title); err != nil {
+			// errors.Is traverses fmt.Errorf("%w") chains; os.IsNotExist does not.
+			if errors.Is(err, os.ErrNotExist) {
+				writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		resp["title"] = title
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "updated", "title": title})
+	if body.Pinned != nil || body.Favorite != nil {
+		if err := mgr.PatchFlags(id, body.Pinned, body.Favorite); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if body.Pinned != nil {
+			resp["pinned"] = *body.Pinned
+		}
+		if body.Favorite != nil {
+			resp["favorite"] = *body.Favorite
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleSessionSearch(w http.ResponseWriter, r *http.Request) {

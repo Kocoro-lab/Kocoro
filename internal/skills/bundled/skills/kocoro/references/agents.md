@@ -90,8 +90,15 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 ### List sessions
 - Method: GET
 - Path: /sessions[?agent={name}]
-- Response: `{"sessions": [{"id", "title", "created_at", "msg_count", "source"?, "in_progress"?, "awaiting_approval"?}]}`
-- Notes: Empty sessions (msg_count == 0) are filtered out. `source` identifies the originating IM / surface. Canonical values are the `Channel*` constants in `internal/daemon/types.go`, currently `slack`, `line`, `teams`, `wechat`, `wecom`, `web`, `feishu`, `lark`, `discord`, `telegram`, `schedule`, `system`, `webhook` — plus `kocoro` (set by `POST /messages` when the inbound request omits a source, i.e. the Desktop / TUI path). Empty / omitted on legacy sessions written before the column existed; frontends should treat empty as "unknown" and fall back to a generic icon. `in_progress` is true when the daemon currently owns an in-flight agent run for the session; `awaiting_approval` is true when the agent loop is blocked waiting for the user to approve a tool call. The two runtime flags are omitted (not emitted as false) when not set, and reset to false on daemon restart.
+- Response: `{"sessions": [{"id", "title", "created_at", "msg_count", "source"?, "in_progress"?, "awaiting_approval"?, "pinned"?, "favorite"?}]}`
+- Notes: Empty sessions (msg_count == 0) are filtered out. Pinned sessions sort to the top of the list ahead of recency. `source` identifies the originating IM / surface. Canonical values are the `Channel*` constants in `internal/daemon/types.go`, currently `slack`, `line`, `teams`, `wechat`, `wecom`, `web`, `feishu`, `lark`, `discord`, `telegram`, `schedule`, `system`, `webhook` — plus `kocoro` (set by `POST /messages` when the inbound request omits a source, i.e. the Desktop / TUI path). Empty / omitted on legacy sessions written before the column existed; frontends should treat empty as "unknown" and fall back to a generic icon. `in_progress` is true when the daemon currently owns an in-flight agent run for the session; `awaiting_approval` is true when the agent loop is blocked waiting for the user to approve a tool call. The two runtime flags are omitted (not emitted as false) when not set, and reset to false on daemon restart. `pinned` / `favorite` are user-set persistence flags managed via `PATCH /sessions/{id}` — both default to false and are omitted when false.
+
+### Rename / pin / favorite a session
+- Method: PATCH
+- Path: /sessions/{id}[?agent={name}]
+- Body: `{"title": "...", "pinned": true, "favorite": true}` — every field is OPTIONAL; supply only the ones you want to change. At least one of `title` / `pinned` / `favorite` must be present.
+- Response: `{"status": "updated", "title"?, "pinned"?, "favorite"?}` — echoes only the fields that were changed.
+- Notes: `title` must be a non-empty string after trimming. `pinned` / `favorite` are independent booleans (a session can be one, both, or neither). Updates do NOT bump `updated_at`, so list order is preserved when only flags change; pinned sessions float to the top of `GET /sessions` regardless. Use `agent={name}` query parameter to target a named-agent session; omit for default-agent sessions.
 
 ### List sessions awaiting approval
 - Method: GET

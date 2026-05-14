@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -53,6 +54,12 @@ type Session struct {
 	// run crashed or was killed mid-turn — the transcript is partial but
 	// recoverable; tool results already executed are preserved.
 	InProgress bool `json:"in_progress,omitempty"`
+	// Pinned sticks the session to the top of the list regardless of
+	// recency. Set/cleared via PATCH /sessions/{id} {"pinned": bool}.
+	Pinned bool `json:"pinned,omitempty"`
+	// Favorite marks the session as starred for filter views. Independent
+	// of Pinned. Set/cleared via PATCH /sessions/{id} {"favorite": bool}.
+	Favorite bool `json:"favorite,omitempty"`
 }
 
 // LastSeenModel returns the model that served the most recent LLM call on
@@ -233,6 +240,10 @@ type SessionSummary struct {
 	// waiting for the user to approve a tool call. Populated at HTTP-list
 	// time from ApprovalTracker; Store.List leaves it false.
 	AwaitingApproval bool `json:"awaiting_approval,omitempty"`
+	// Pinned mirrors Session.Pinned: sticky-to-top regardless of recency.
+	Pinned bool `json:"pinned,omitempty"`
+	// Favorite mirrors Session.Favorite: starred for filter views.
+	Favorite bool `json:"favorite,omitempty"`
 }
 
 type Store struct {
@@ -307,6 +318,50 @@ func (s *Store) PatchTitle(id, title string) error {
 	return nil
 }
 
+// PatchFlags re-reads the session from disk, applies any non-nil flag, and
+// writes it back. UpdatedAt is not touched so list ordering is preserved
+// (pinned/favorite is metadata, not activity). Either flag may be nil to
+// leave that field unchanged; passing both nil is a no-op.
+func (s *Store) PatchFlags(id string, pinned, favorite *bool) error {
+	if pinned == nil && favorite == nil {
+		return nil
+	}
+	sess, err := s.Load(id)
+	if err != nil {
+		return err
+	}
+	if pinned != nil {
+		sess.Pinned = *pinned
+	}
+	if favorite != nil {
+		sess.Favorite = *favorite
+	}
+
+	data, err := json.MarshalIndent(sess, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal session: %w", err)
+	}
+
+	path := filepath.Join(s.dir, sess.ID+".json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+
+	if s.index != nil {
+		// Narrow UPDATE on pinned/favorite columns only — does not rebuild
+		// the messages/FTS index, so toggle cost stays O(1) regardless of
+		// session length. When the index row is missing (manual session
+		// import, prior best-effort UpsertSession failure during Save,
+		// partial index corruption), fall back to a full UpsertSession so
+		// the session reappears in GET /sessions with current flags. Best-
+		// effort: any other index error is dropped, matching PatchTitle.
+		if err := s.index.UpdateSessionFlags(sess.ID, pinned, favorite); errors.Is(err, os.ErrNotExist) {
+			s.index.UpsertSession(sess)
+		}
+	}
+	return nil
+}
+
 // PatchSummaryCache 从磁盘重新读取 session 的最新版本，仅更新摘要缓存字段后写回。
 // 避免覆盖在初次 Load 和写入之间被 agent loop 追加的新消息。
 // 不更新 UpdatedAt，不影响 session 排序。
@@ -373,10 +428,15 @@ func (s *Store) List() ([]SessionSummary, error) {
 			CreatedAt: sess.CreatedAt,
 			MsgCount:  len(sess.Messages),
 			Source:    sess.Source,
+			Pinned:    sess.Pinned,
+			Favorite:  sess.Favorite,
 		})
 	}
 
 	sort.Slice(summaries, func(i, j int) bool {
+		if summaries[i].Pinned != summaries[j].Pinned {
+			return summaries[i].Pinned
+		}
 		return summaries[i].CreatedAt.After(summaries[j].CreatedAt)
 	})
 	return summaries, nil
