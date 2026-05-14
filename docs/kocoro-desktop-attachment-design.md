@@ -37,19 +37,20 @@ User intent: "Analyze everything in /Users/me/Desktop"
 
 **Key insight:** Layer A applies only when the user explicitly attaches files. Layer B applies when the agent reads files autonomously. The agent is NOT bound by Layer A's count — it can read 50 files in a turn if the user asks.
 
-## Layer A: Desktop UI limits (shipped + remaining gap)
+## Layer A: Desktop UI limits (shipped status)
 
-Status as of 2026-05-13:
+Status as of 2026-05-14. All rows are shipped; the only gap relative to claude.ai is the per-conversation cumulative cap (deferred — see "Not implemented" below).
 
 | Constraint | Value | Status |
 |---|---|---|
-| `maxAttachmentsPerMessage` | **20** | ✅ shipped (commit `072841b`) — total file count cap, matches claude.ai's per-message cap |
+| `maxAttachmentsPerMessage` | **20** | ✅ shipped — total file count cap, matches claude.ai's per-message cap |
 | `maxFileSize` per disk file | **500 MB** | ✅ shipped — aligned with daemon Phase 1 |
 | `maxTotalAttachmentSize` | **500 MB** | ✅ shipped |
 | Clipboard inline paste cap | **20 MB** | ✅ shipped — matches daemon's `maxInlineImageDecodedBytes` |
 | `maxImageDimension` | **8192×8192** | ✅ shipped — matches Anthropic single-image upper bound |
 | Image type allowlist | jpg / jpeg / png / gif / webp / heic / heif / avif / tiff / bmp | ✅ shipped |
-| Document type allowlist | pdf / docx / xlsx / pptx / key / txt / md / html / rtf / odt / epub | ✅ shipped |
+| Document type allowlist | pdf / docx / pptx / key / txt / md / html / rtf / odt / epub | ✅ shipped |
+| Data type allowlist | csv / json / xlsx | ✅ shipped (rendered as "Data" chip but caps shared with documents) |
 | Code extensions (text fallback) | 50+ entries — see `AttachmentLimits.supportedCodeExtensions` | ✅ shipped |
 | Archive types | zip (others fall through to file_ref) | ✅ shipped |
 | Folder drops | treated as directory `file_ref` | ✅ shipped (commit `702cf59`) |
@@ -82,7 +83,7 @@ Kocoro daemon auto-compresses images at source (`internal/tools/imaging_compress
 - Do NOT enforce Layer A limits on Layer B (agent-read files are independent).
 - Do NOT pre-compress on Desktop side; daemon handles it.
 - Do NOT silently drop attachments; always toast.
-- Do NOT use a "Maximum of 5 images" copy if your real limit is 10 — keep UI text honest.
+- Do NOT promise a count in UI copy that doesn't match the actual cap — toast wording must match `AttachmentLimits` constants verbatim (currently 20 per message).
 
 ## Reference data (Anthropic public limits)
 
