@@ -55,6 +55,16 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 		args = map[string]any{}
 	}
 
+	// Defense against LLM over-generalization: the model frequently
+	// hallucinates fields it learned from other tools' schemas (e.g. the
+	// `description` field that every approval-card-bearing local tool
+	// declares gets injected into server-tool calls too, where the cloud
+	// schema doesn't declare it). Strip anything the gateway's schema
+	// doesn't list so the wire payload stays minimal, audit logs don't
+	// show phantom args, and cloud-side reject paths aren't tripped on
+	// older cloud versions without the reserved-daemon-fields whitelist.
+	stripFieldsNotInSchema(args, t.schema.Parameters)
+
 	resp, err := t.gateway.ExecuteTool(ctx, t.schema.Name, args, "")
 	if err != nil {
 		msg := err.Error()
@@ -260,4 +270,28 @@ func truncateLadderDetail(s string) string {
 		return s
 	}
 	return string(r[:ladderDetailMaxLen]) + "..."
+}
+
+// stripFieldsNotInSchema removes any args keys that the server tool's schema
+// does not declare under properties. Conservative: when the schema is nil,
+// empty, or doesn't expose properties as a map, args is left untouched (better
+// to send a possibly-extra field than to silently drop a legitimate one whose
+// schema we couldn't parse).
+func stripFieldsNotInSchema(args map[string]any, schemaParams map[string]any) {
+	if len(args) == 0 || len(schemaParams) == 0 {
+		return
+	}
+	propsAny, ok := schemaParams["properties"]
+	if !ok {
+		return
+	}
+	props, ok := propsAny.(map[string]any)
+	if !ok {
+		return
+	}
+	for k := range args {
+		if _, declared := props[k]; !declared {
+			delete(args, k)
+		}
+	}
 }

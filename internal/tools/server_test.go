@@ -462,3 +462,117 @@ func TestServerTool_Run_LadderWhenErrorEmptyAndSuccessFalse(t *testing.T) {
 		t.Errorf("expected firecrawl detail, got %q", result.Content)
 	}
 }
+
+// --- stripFieldsNotInSchema: defend against LLM-hallucinated args ---
+
+func TestStripFieldsNotInSchema_RemovesUnknown(t *testing.T) {
+	args := map[string]any{
+		"url":         "https://example.com",
+		"description": "should-be-stripped",
+		"foo":         "also-stripped",
+	}
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"url":        map[string]any{"type": "string"},
+			"max_length": map[string]any{"type": "integer"},
+		},
+	}
+	stripFieldsNotInSchema(args, schema)
+	if _, ok := args["description"]; ok {
+		t.Errorf("description should have been stripped, got %v", args)
+	}
+	if _, ok := args["foo"]; ok {
+		t.Errorf("foo should have been stripped, got %v", args)
+	}
+	if args["url"] != "https://example.com" {
+		t.Errorf("url must be preserved, got %v", args["url"])
+	}
+}
+
+func TestStripFieldsNotInSchema_PreservesDeclared(t *testing.T) {
+	args := map[string]any{
+		"url":        "https://example.com",
+		"max_length": 5000,
+	}
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"url":        map[string]any{"type": "string"},
+			"max_length": map[string]any{"type": "integer"},
+		},
+	}
+	stripFieldsNotInSchema(args, schema)
+	if len(args) != 2 {
+		t.Errorf("declared fields must survive, got %v", args)
+	}
+}
+
+func TestStripFieldsNotInSchema_NilSchema_NoOp(t *testing.T) {
+	args := map[string]any{"description": "kept-because-no-schema"}
+	stripFieldsNotInSchema(args, nil)
+	if _, ok := args["description"]; !ok {
+		t.Errorf("nil schema must be no-op, got %v", args)
+	}
+}
+
+func TestStripFieldsNotInSchema_MissingProperties_NoOp(t *testing.T) {
+	args := map[string]any{"description": "kept-because-no-properties"}
+	schema := map[string]any{"type": "object"} // no "properties" key
+	stripFieldsNotInSchema(args, schema)
+	if _, ok := args["description"]; !ok {
+		t.Errorf("schema without properties must be no-op, got %v", args)
+	}
+}
+
+func TestStripFieldsNotInSchema_PropertiesWrongType_NoOp(t *testing.T) {
+	args := map[string]any{"description": "kept-because-malformed-schema"}
+	// properties as a list of strings, not a map → unparseable, leave args alone
+	schema := map[string]any{"properties": []string{"url"}}
+	stripFieldsNotInSchema(args, schema)
+	if _, ok := args["description"]; !ok {
+		t.Errorf("malformed properties must be no-op, got %v", args)
+	}
+}
+
+func TestServerTool_Run_StripsLLMHallucinatedDescription(t *testing.T) {
+	// Mock gateway server captures the args body it actually receives.
+	var received map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if a, ok := req["arguments"].(map[string]any); ok {
+			received = a
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(toolExecResp(true, map[string]any{"content": "ok"}, nil))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	schema := client.ServerToolSchema{
+		Name: "web_fetch",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"url": map[string]any{"type": "string"},
+			},
+			"required": []string{"url"},
+		},
+	}
+	tool := NewServerTool(schema, gw)
+	_, err := tool.Run(context.Background(),
+		`{"url":"https://example.com","description":"LLM-hallucinated description"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if received == nil {
+		t.Fatal("mock server did not receive a request")
+	}
+	if _, leaked := received["description"]; leaked {
+		t.Errorf("description leaked to wire: %v", received)
+	}
+	if received["url"] != "https://example.com" {
+		t.Errorf("url not preserved on wire: %v", received)
+	}
+}
