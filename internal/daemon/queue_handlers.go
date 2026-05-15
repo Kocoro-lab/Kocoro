@@ -41,8 +41,21 @@ func (s *Server) handleDeleteQueueItem(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	routeKey := r.URL.Query().Get("route_key")
+	if routeKey == "" {
+		if sessionID := r.URL.Query().Get("session_id"); sessionID != "" {
+			routeKey = s.routeKeyForSession(sessionID)
+			if routeKey == "" {
+				// Desktop's default-agent path: the ad-hoc route was
+				// registered under "session:<id>" (see runner.go ad-hoc
+				// branch). Use the same synthetic key so a Desktop
+				// retract finds the entry without needing to know the
+				// daemon's internal route bookkeeping.
+				routeKey = "session:" + sessionID
+			}
+		}
+	}
 	if id == "" || routeKey == "" {
-		writeError(w, http.StatusBadRequest, "route_key required")
+		writeError(w, http.StatusBadRequest, "route_key or session_id required")
 		return
 	}
 	snap := s.deps.SessionCache.MailboxSnapshot(routeKey)
