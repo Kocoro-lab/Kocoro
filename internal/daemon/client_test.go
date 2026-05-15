@@ -584,6 +584,25 @@ func TestCapabilities_AdvertisesDeliveryAck(t *testing.T) {
 	}
 }
 
+// TestCapabilities_AdvertisesToolUseIDEvents guards the contract that the
+// daemon advertises "tool_use_id_events" whenever it actually emits the
+// tool_use_id field on tool_status running/completed events. Drop this token
+// only after removing the field from both bus_handler.go and the SSE/WS
+// handlers, otherwise Cloud may rely on a capability the daemon no longer
+// satisfies.
+func TestCapabilities_AdvertisesToolUseIDEvents(t *testing.T) {
+	found := false
+	for _, c := range Capabilities {
+		if c == CapToolUseIDEvents {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("default Capabilities = %v, want to contain %q", Capabilities, CapToolUseIDEvents)
+	}
+}
+
 // TestSendDeliveryAck_EmptyMessageIDIsNoOp confirms a missing inbound
 // MessageID short-circuits before sendEnvelope. The wire protocol
 // requires non-empty MessageID for delivery_ack (Cloud warns and drops

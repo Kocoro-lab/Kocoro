@@ -625,8 +625,10 @@ func (h *daemonEventHandler) OnToolCall(name string, args string, toolUseID stri
 	// never receives WORKFLOW_COMPLETED from the Temporal workflow).
 	if h.wsClient != nil && h.messageID != "" && name != "cloud_delegate" {
 		// Send empty message so StreamConsumer uses toolDisplayName mapping
-		// (e.g., "web_search" → "Searching the web")
-		if err := h.wsClient.SendEvent(h.messageID, "TOOL_INVOKED", "", map[string]interface{}{"tool": name}); err != nil {
+		// (e.g., "web_search" → "Searching the web"). tool_use_id pairs this
+		// TOOL_INVOKED frame with its later TOOL_COMPLETED frame; advertised to
+		// Cloud via the tool_use_id_events capability token.
+		if err := h.wsClient.SendEvent(h.messageID, "TOOL_INVOKED", "", map[string]interface{}{"tool": name, "tool_use_id": toolUseID}); err != nil {
 			log.Printf("daemon: event forward failed: %v", err)
 		}
 	}
@@ -634,7 +636,7 @@ func (h *daemonEventHandler) OnToolCall(name string, args string, toolUseID stri
 func (h *daemonEventHandler) OnToolResult(name string, args string, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	log.Printf("daemon: tool %s completed (%.1fs)", name, elapsed.Seconds())
 	if h.wsClient != nil && h.messageID != "" && name != "cloud_delegate" {
-		if err := h.wsClient.SendEvent(h.messageID, "TOOL_COMPLETED", "", map[string]interface{}{"tool": name, "elapsed": elapsed.Seconds()}); err != nil {
+		if err := h.wsClient.SendEvent(h.messageID, "TOOL_COMPLETED", "", map[string]interface{}{"tool": name, "tool_use_id": toolUseID, "elapsed": elapsed.Seconds()}); err != nil {
 			log.Printf("daemon: event forward failed: %v", err)
 		}
 	}

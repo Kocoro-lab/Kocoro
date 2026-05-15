@@ -52,16 +52,25 @@ var Version = "dev"
 // the filename and mimetype. Cloud uses this token to gate server-side
 // extraction (DOCX/XLSX/PPTX/CSV/TXT/JSON/large-PDF fallback). Older
 // daemons fall back to URL download.
+//
+// "tool_use_id_events" — daemon emits a tool_use_id field on both the
+// running (TOOL_INVOKED / tool_status status=running) and completed
+// (TOOL_COMPLETED / tool_status status=completed) tool events on SSE
+// and WS, so UIs running multiple bash invocations in parallel can pair
+// them up. Optional for consumers; events remain backward-readable
+// because older readers ignore unknown keys.
 const (
 	CapDeliveryAck         = "delivery_ack"
 	CapInlineDocumentB64   = "inline_document_b64"
 	CapInlineExtractedText = "inline_extracted_text"
+	CapToolUseIDEvents     = "tool_use_id_events"
 )
 
 var Capabilities = []string{
 	CapDeliveryAck,
 	CapInlineDocumentB64,
 	CapInlineExtractedText,
+	CapToolUseIDEvents,
 }
 
 type Client struct {

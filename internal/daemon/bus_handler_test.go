@@ -420,6 +420,53 @@ func TestBusEventHandlerOnCloudPlanShortContentNotTruncated(t *testing.T) {
 	}
 }
 
+// TestBusEventHandlerOnToolCallIncludesToolUseID asserts the running event
+// carries the tool_use_id so multi-bash-in-flight UIs can pair running events
+// with their later completed events. Without this field the UI cannot tell
+// which of N concurrent bash invocations a given completion belongs to.
+func TestBusEventHandlerOnToolCallIncludesToolUseID(t *testing.T) {
+	h, bus := newTestHandler(t)
+	ch := bus.Subscribe()
+	defer bus.Unsubscribe(ch)
+
+	h.OnToolCall("bash", "git status", "toolu_abc123")
+
+	got := drain(t, ch, 1)
+	if len(got) != 1 {
+		t.Fatalf("want 1 event, got %d", len(got))
+	}
+	var p map[string]any
+	if err := json.Unmarshal(got[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if p["tool_use_id"] != "toolu_abc123" {
+		t.Fatalf("tool_use_id = %v, want %q", p["tool_use_id"], "toolu_abc123")
+	}
+}
+
+// TestBusEventHandlerOnToolResultIncludesToolUseID is the pair to the running
+// test — the completed event must carry the same tool_use_id so pairing works
+// end-to-end.
+func TestBusEventHandlerOnToolResultIncludesToolUseID(t *testing.T) {
+	h, bus := newTestHandler(t)
+	ch := bus.Subscribe()
+	defer bus.Unsubscribe(ch)
+
+	h.OnToolResult("bash", "git status", "toolu_abc123", agent.ToolResult{Content: "M file.go"}, 10*time.Millisecond)
+
+	got := drain(t, ch, 1)
+	if len(got) != 1 {
+		t.Fatalf("want 1 event, got %d", len(got))
+	}
+	var p map[string]any
+	if err := json.Unmarshal(got[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if p["tool_use_id"] != "toolu_abc123" {
+		t.Fatalf("tool_use_id = %v, want %q", p["tool_use_id"], "toolu_abc123")
+	}
+}
+
 func TestBusEventHandlerOnRunStatus(t *testing.T) {
 	h, bus := newTestHandler(t)
 	ch := bus.Subscribe()

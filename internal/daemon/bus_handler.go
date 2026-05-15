@@ -51,28 +51,34 @@ func (h *busEventHandler) OnStreamDelta(delta string)              {}
 func (h *busEventHandler) OnApprovalNeeded(tool, args string) bool { return false }
 
 // OnToolCall emits a "running" event when a tool is invoked. Args are redacted
-// (secrets) and truncated (size budget) before emission.
+// (secrets) and truncated (size budget) before emission. The tool_use_id pairs
+// this running event with its later "completed" partner so multi-bash-in-flight
+// UIs can match them up; gated to Cloud via the tool_use_id_events capability
+// token in client.go.
 func (h *busEventHandler) OnToolCall(name, args, toolUseID string) {
 	h.emitJSON(EventToolStatus, map[string]any{
-		"tool":       name,
-		"status":     "running",
-		"args":       redactAndTruncate(args, 200),
-		"session_id": h.sessionID,
-		"ts":         nowISO(),
+		"tool":        name,
+		"tool_use_id": toolUseID,
+		"status":      "running",
+		"args":        redactAndTruncate(args, 200),
+		"session_id":  h.sessionID,
+		"ts":          nowISO(),
 	})
 }
 
 // OnToolResult emits a "completed" event when a tool finishes. The result
 // preview is extracted from Content or ContentBlocks, redacted, and truncated.
+// See OnToolCall for tool_use_id semantics.
 func (h *busEventHandler) OnToolResult(name, args, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	h.emitJSON(EventToolStatus, map[string]any{
-		"tool":       name,
-		"status":     "completed",
-		"elapsed":    elapsed.Seconds(),
-		"is_error":   result.IsError,
-		"preview":    redactAndTruncate(toolResultPreview(result), 200),
-		"session_id": h.sessionID,
-		"ts":         nowISO(),
+		"tool":        name,
+		"tool_use_id": toolUseID,
+		"status":      "completed",
+		"elapsed":     elapsed.Seconds(),
+		"is_error":    result.IsError,
+		"preview":     redactAndTruncate(toolResultPreview(result), 200),
+		"session_id":  h.sessionID,
+		"ts":          nowISO(),
 	})
 }
 func (h *busEventHandler) OnUsage(u agent.TurnUsage) {
