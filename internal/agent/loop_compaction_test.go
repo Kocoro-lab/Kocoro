@@ -1336,15 +1336,15 @@ func (s *statusRecorder) OnRunStatus(code, detail string) {
 }
 
 // EventHandler stubs — no behavior, just to satisfy the interface.
-func (s *statusRecorder) OnToolCall(name string, args string)                        {}
-func (s *statusRecorder) OnToolResult(string, string, ToolResult, time.Duration)     {}
-func (s *statusRecorder) OnText(string)                                              {}
-func (s *statusRecorder) OnPreamble(string)                                          {}
-func (s *statusRecorder) OnStreamDelta(string)                                       {}
-func (s *statusRecorder) OnApprovalNeeded(string, string) bool                       { return false }
-func (s *statusRecorder) OnUsage(TurnUsage)                                          {}
-func (s *statusRecorder) OnCloudAgent(agentID string, status string, message string) {}
-func (s *statusRecorder) OnCloudProgress(int, int)                                   {}
+func (s *statusRecorder) OnToolCall(name string, args string, toolUseID string)          {}
+func (s *statusRecorder) OnToolResult(string, string, string, ToolResult, time.Duration) {}
+func (s *statusRecorder) OnText(string)                                                  {}
+func (s *statusRecorder) OnPreamble(string)                                              {}
+func (s *statusRecorder) OnStreamDelta(string)                                           {}
+func (s *statusRecorder) OnApprovalNeeded(string, string) bool                           { return false }
+func (s *statusRecorder) OnUsage(TurnUsage)                                              {}
+func (s *statusRecorder) OnCloudAgent(agentID string, status string, message string)     {}
+func (s *statusRecorder) OnCloudProgress(int, int)                                       {}
 func (s *statusRecorder) OnCloudPlan(planType string, content string, needsReview bool) {
 }
 

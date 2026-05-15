@@ -51,6 +51,20 @@ Tool priority is local tools, then MCP tools, then gateway tools. Deduplicate by
 
 Skill-exempt tools must be pure infrastructure with no external side effects. Do not exempt side-effecting tools from skill restrictions.
 
+### Tool Concurrency
+
+The dispatcher batches tool calls by `IsConcurrencySafeCall`, not `IsReadOnlyCall`. Tools without an explicit `ConcurrencySafeChecker` implementation fall back to their `IsReadOnlyCall` value — so file_read / grep / glob etc. keep batching concurrently as before, and writers stay serial. Adding the new interface to one tool has no effect on any other tool's grouping.
+
+`BashTool` implements `IsConcurrencySafeCall` via `internal/tools/bash_concurrency.go`. It is gated by `agent.bash_concurrency_enabled` (default `true` in Phase C — Desktop consumes the `tool_use_id_events` capability so id-keyed cards stay correct under concurrent batches). When the flag is on, commands whose first token is in a strict read-only whitelist AND contain no shell metacharacters (including `\n` / `\r`) are eligible for the concurrent batch. Everything else — `&&` / pipes / redirects / command substitution, plus any non-whitelisted leading token (`git push`, `npm install`, `curl`, `rm`, `git remote add`, `go env -w`, ...) — stays in a size-1 serial batch.
+
+Tool events on the SSE/WS wire (`tool_status` running + completed) include a `tool_use_id` field so multi-tool-in-flight UIs (e.g. parallel bash) can pair them correctly. The daemon advertises this on the WS handshake via the `tool_use_id_events` capability token.
+
+### Tool Required-Field Validation
+
+Every tool's `Run()` MUST explicitly check that each field listed in `ToolInfo.Required` is non-zero immediately after `json.Unmarshal`, and return `agent.ValidationError(...)` (NOT a bare `ToolResult{Content: ..., IsError: true}`) on failure. Go's json decoder cannot distinguish "field missing" from "field present with zero value" on a strongly-typed struct, so a missing required string arrives as `""` and downstream syscalls happily accept it. The 2026-05-13 production stuck loop was a `file_write` with no `content` that wrote 0 bytes, returned `IsError=false`, truncated the user's file, and trapped the model into a 16-call retry spin.
+
+The `[validation error]` prefix that `ValidationError` injects is load-bearing: `LoopDetector.isValidationErrorSig` short-circuits a same-tool + same-args + 3-consecutive `[validation error]` run to `LoopForceStop`, well below the all-errors 2x ConsecutiveDup budget at call #7.
+
 ### Providers
 
 The default provider is the Cloud gateway client. Ollama uses an OpenAI-compatible local client. Both implement complete and streaming completion paths; keep provider-specific behavior behind those interfaces.

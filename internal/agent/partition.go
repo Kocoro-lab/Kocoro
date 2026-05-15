@@ -33,30 +33,42 @@ func isReadOnly(ac approvedToolCall) bool {
 	return checker.IsReadOnlyCall(ac.argsStr)
 }
 
+// isConcurrencySafe returns whether a tool call can share a concurrent batch
+// with other calls. If the tool implements ConcurrencySafeChecker, its answer
+// wins; otherwise fall back to isReadOnly so existing tools keep current
+// behavior. This means adding the new interface to one tool (e.g. BashTool)
+// has no effect on any other tool's grouping.
+func isConcurrencySafe(ac approvedToolCall) bool {
+	if checker, ok := ac.tool.(ConcurrencySafeChecker); ok {
+		return checker.IsConcurrencySafeCall(ac.argsStr)
+	}
+	return isReadOnly(ac)
+}
+
 // partitionToolCalls groups approved tool calls into execution batches.
-// Consecutive read-only calls are grouped into a single concurrent batch.
-// Non-read-only calls each get their own sequential batch of size 1.
+// Consecutive concurrency-safe calls share a batch; non-safe calls each get
+// their own sequential batch of size 1.
 func partitionToolCalls(approved []approvedToolCall) [][]approvedToolCall {
 	if len(approved) == 0 {
 		return nil
 	}
 	var batches [][]approvedToolCall
 	var currentBatch []approvedToolCall
-	currentIsReadOnly := false
+	currentIsSafe := false
 
 	for i, ac := range approved {
-		ro := isReadOnly(ac)
+		safe := isConcurrencySafe(ac)
 		if i == 0 {
 			currentBatch = []approvedToolCall{ac}
-			currentIsReadOnly = ro
+			currentIsSafe = safe
 			continue
 		}
-		if ro && currentIsReadOnly {
+		if safe && currentIsSafe {
 			currentBatch = append(currentBatch, ac)
 		} else {
 			batches = append(batches, currentBatch)
 			currentBatch = []approvedToolCall{ac}
-			currentIsReadOnly = ro
+			currentIsSafe = safe
 		}
 	}
 	if len(currentBatch) > 0 {
@@ -92,7 +104,7 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 					}
 				}()
 				if handler != nil {
-					handler.OnToolCall(ac.fc.Name, ac.argsStr)
+					handler.OnToolCall(ac.fc.Name, ac.argsStr, ac.fc.ID)
 				}
 				startTime := time.Now()
 				result, runErr := ac.tool.Run(ctx, ac.argsStr)
@@ -109,7 +121,7 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 				// actual execution start, not just batch membership. Called from
 				// the main goroutine so handler writes stay serialized.
 				if handler != nil {
-					handler.OnToolCall(ac.fc.Name, ac.argsStr)
+					handler.OnToolCall(ac.fc.Name, ac.argsStr, ac.fc.ID)
 				}
 				go func(ac approvedToolCall) {
 					defer wg.Done()

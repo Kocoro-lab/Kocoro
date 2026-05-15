@@ -177,7 +177,7 @@ type collectingHandler struct {
 	results []ToolResult
 }
 
-func (h *collectingHandler) OnToolResult(name string, args string, result ToolResult, elapsed time.Duration) {
+func (h *collectingHandler) OnToolResult(name string, args string, toolUseID string, result ToolResult, elapsed time.Duration) {
 	h.results = append(h.results, result)
 }
 
@@ -346,8 +346,8 @@ type mockHandler struct {
 	lastText          string
 }
 
-func (h *mockHandler) OnToolCall(name string, args string) {}
-func (h *mockHandler) OnToolResult(name string, args string, result ToolResult, elapsed time.Duration) {
+func (h *mockHandler) OnToolCall(name string, args string, toolUseID string) {}
+func (h *mockHandler) OnToolResult(name string, args string, toolUseID string, result ToolResult, elapsed time.Duration) {
 }
 func (h *mockHandler) OnText(text string)                                     { h.lastText = text }
 func (h *mockHandler) OnPreamble(text string)                                 { h.lastText = text }
@@ -2624,7 +2624,7 @@ type trackingHandler struct {
 	toolCallNames []string // names passed to OnToolCall
 }
 
-func (h *trackingHandler) OnToolCall(name string, args string) {
+func (h *trackingHandler) OnToolCall(name string, args string, toolUseID string) {
 	h.toolCallNames = append(h.toolCallNames, name)
 }
 
@@ -2962,8 +2962,8 @@ type cloudDelegateResult struct {
 	isError bool
 }
 
-func (h *cloudDelegateHandler) OnToolCall(name string, args string) {}
-func (h *cloudDelegateHandler) OnToolResult(name string, args string, result ToolResult, elapsed time.Duration) {
+func (h *cloudDelegateHandler) OnToolCall(name string, args string, toolUseID string) {}
+func (h *cloudDelegateHandler) OnToolResult(name string, args string, toolUseID string, result ToolResult, elapsed time.Duration) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.results = append(h.results, cloudDelegateResult{name: name, content: result.Content, isError: result.IsError})
@@ -4683,8 +4683,8 @@ type preambleHandler struct {
 	toolCallCount int
 }
 
-func (h *preambleHandler) OnToolCall(name string, args string) { h.toolCallCount++ }
-func (h *preambleHandler) OnToolResult(name string, args string, result ToolResult, elapsed time.Duration) {
+func (h *preambleHandler) OnToolCall(name string, args string, toolUseID string) { h.toolCallCount++ }
+func (h *preambleHandler) OnToolResult(name string, args string, toolUseID string, result ToolResult, elapsed time.Duration) {
 }
 func (h *preambleHandler) OnText(text string) {
 	h.textCalls = append(h.textCalls, text)

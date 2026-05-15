@@ -619,22 +619,24 @@ func (h *daemonEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Sna
 // the same long-lived handler so per-message cost reporting is accurate.
 func (h *daemonEventHandler) ResetUsage() { h.usage.Reset() }
 
-func (h *daemonEventHandler) OnToolCall(name string, args string) {
+func (h *daemonEventHandler) OnToolCall(name string, args string, toolUseID string) {
 	// Skip cloud_delegate — it has its own streaming path via SendProgressWithWorkflow.
 	// Forwarding it as a daemon event would conflict (creates a daemon: stream that
 	// never receives WORKFLOW_COMPLETED from the Temporal workflow).
 	if h.wsClient != nil && h.messageID != "" && name != "cloud_delegate" {
 		// Send empty message so StreamConsumer uses toolDisplayName mapping
-		// (e.g., "web_search" → "Searching the web")
-		if err := h.wsClient.SendEvent(h.messageID, "TOOL_INVOKED", "", map[string]interface{}{"tool": name}); err != nil {
+		// (e.g., "web_search" → "Searching the web"). tool_use_id pairs this
+		// TOOL_INVOKED frame with its later TOOL_COMPLETED frame; advertised to
+		// Cloud via the tool_use_id_events capability token.
+		if err := h.wsClient.SendEvent(h.messageID, "TOOL_INVOKED", "", map[string]interface{}{"tool": name, "tool_use_id": toolUseID}); err != nil {
 			log.Printf("daemon: event forward failed: %v", err)
 		}
 	}
 }
-func (h *daemonEventHandler) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
+func (h *daemonEventHandler) OnToolResult(name string, args string, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	log.Printf("daemon: tool %s completed (%.1fs)", name, elapsed.Seconds())
 	if h.wsClient != nil && h.messageID != "" && name != "cloud_delegate" {
-		if err := h.wsClient.SendEvent(h.messageID, "TOOL_COMPLETED", "", map[string]interface{}{"tool": name, "elapsed": elapsed.Seconds()}); err != nil {
+		if err := h.wsClient.SendEvent(h.messageID, "TOOL_COMPLETED", "", map[string]interface{}{"tool": name, "tool_use_id": toolUseID, "elapsed": elapsed.Seconds()}); err != nil {
 			log.Printf("daemon: event forward failed: %v", err)
 		}
 	}
@@ -723,8 +725,8 @@ type autoApproveHandler struct {
 // Usage returns the cumulative usage collected during this handler's lifetime.
 func (h *autoApproveHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
 
-func (h *autoApproveHandler) OnToolCall(name string, args string) {}
-func (h *autoApproveHandler) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
+func (h *autoApproveHandler) OnToolCall(name string, args string, toolUseID string) {}
+func (h *autoApproveHandler) OnToolResult(name string, args string, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	log.Printf("daemon: tool %s completed (%.1fs)", name, elapsed.Seconds())
 }
 func (h *autoApproveHandler) OnText(text string)                                     {}

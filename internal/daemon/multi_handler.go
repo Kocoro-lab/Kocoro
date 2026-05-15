@@ -18,15 +18,15 @@ type multiHandler struct {
 	handlers []agent.EventHandler
 }
 
-func (m *multiHandler) OnToolCall(name, args string) {
+func (m *multiHandler) OnToolCall(name, args, toolUseID string) {
 	for _, h := range m.handlers {
-		h.OnToolCall(name, args)
+		h.OnToolCall(name, args, toolUseID)
 	}
 }
 
-func (m *multiHandler) OnToolResult(name, args string, result agent.ToolResult, elapsed time.Duration) {
+func (m *multiHandler) OnToolResult(name, args, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	for _, h := range m.handlers {
-		h.OnToolResult(name, args, result, elapsed)
+		h.OnToolResult(name, args, toolUseID, result, elapsed)
 	}
 }
 

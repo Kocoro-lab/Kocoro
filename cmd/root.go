@@ -453,9 +453,9 @@ type cliEventHandler struct {
 // corrupt the LLM token accounting.
 func (h *cliEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
 
-func (h *cliEventHandler) OnToolCall(name string, args string) {}
+func (h *cliEventHandler) OnToolCall(name string, args string, toolUseID string) {}
 
-func (h *cliEventHandler) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
+func (h *cliEventHandler) OnToolResult(name string, args string, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	icon := "✓"
 	if result.IsError {
 		icon = "✗"

@@ -213,3 +213,366 @@ func TestServerTool_Run_InvalidJSON(t *testing.T) {
 		t.Error("expected IsError=true for invalid JSON")
 	}
 }
+
+// --- buildFallbackLadder / metadata.attempts → tool_result content ---
+
+func TestBuildFallbackLadder_Empty(t *testing.T) {
+	cases := []struct {
+		name string
+		meta map[string]any
+	}{
+		{"nil metadata", nil},
+		{"empty metadata", map[string]any{}},
+		{"no attempts key", map[string]any{"other": "x"}},
+		{"attempts wrong type", map[string]any{"attempts": "not-an-array"}},
+		{"empty attempts array", map[string]any{"attempts": []any{}}},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildFallbackLadder(tt.meta); got != "" {
+				t.Errorf("expected empty ladder, got %q", got)
+			}
+		})
+	}
+}
+
+func TestBuildFallbackLadder_FiltersNonFailures(t *testing.T) {
+	meta := map[string]any{
+		"attempts": []any{
+			map[string]any{"provider": "firecrawl", "status": "success"},
+			map[string]any{"provider": "exa", "status": "attempted"},
+			map[string]any{"provider": "python", "status": "sparse_fallback"},
+			map[string]any{"provider": "exa", "status": "skipped", "reason": "not configured"},
+		},
+	}
+	if got := buildFallbackLadder(meta); got != "" {
+		t.Errorf("expected empty (only non-failures present), got %q", got)
+	}
+}
+
+func TestBuildFallbackLadder_TwoLayerLadder(t *testing.T) {
+	meta := map[string]any{
+		"attempts": []any{
+			map[string]any{"provider": "firecrawl", "status": "failed", "error": "Firecrawl error: 403: do not support this site"},
+			map[string]any{"provider": "exa", "status": "failed", "error": "Exa API returned no content"},
+		},
+	}
+	got := buildFallbackLadder(meta)
+	if !strings.HasPrefix(got, "Provider attempts:\n") {
+		t.Errorf("expected ladder header, got %q", got)
+	}
+	if !strings.Contains(got, "- firecrawl failed: Firecrawl error: 403: do not support this site") {
+		t.Errorf("missing firecrawl line, got %q", got)
+	}
+	if !strings.Contains(got, "- exa failed: Exa API returned no content") {
+		t.Errorf("missing exa line, got %q", got)
+	}
+}
+
+func TestBuildFallbackLadder_FailedWithoutErrorFallsToReason(t *testing.T) {
+	meta := map[string]any{
+		"attempts": []any{
+			map[string]any{"provider": "firecrawl", "status": "failed", "reason": "rate-limited"},
+		},
+	}
+	got := buildFallbackLadder(meta)
+	if !strings.Contains(got, "- firecrawl failed: rate-limited") {
+		t.Errorf("expected reason fallback, got %q", got)
+	}
+}
+
+func TestBuildFallbackLadder_SkippedWithInformativeReason(t *testing.T) {
+	meta := map[string]any{
+		"attempts": []any{
+			map[string]any{"provider": "exa", "status": "skipped", "reason": "domain blocklisted"},
+		},
+	}
+	got := buildFallbackLadder(meta)
+	if !strings.Contains(got, "- exa skipped: domain blocklisted") {
+		t.Errorf("expected informative skipped line, got %q", got)
+	}
+}
+
+func TestBuildFallbackLadder_RedactsSecrets(t *testing.T) {
+	meta := map[string]any{
+		"attempts": []any{
+			map[string]any{"provider": "p", "status": "failed", "error": "auth failed: Bearer abc123xyz-token-DEF"},
+			map[string]any{"provider": "q", "status": "failed", "error": "key sk-abcdefghijklmnopqrstuvwxyz0123"},
+		},
+	}
+	got := buildFallbackLadder(meta)
+	if strings.Contains(got, "abc123xyz-token-DEF") {
+		t.Errorf("Bearer token leaked: %q", got)
+	}
+	if strings.Contains(got, "sk-abcdefghijklmnopqrstuvwxyz0123") {
+		t.Errorf("sk- key leaked: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Errorf("expected [REDACTED] marker, got %q", got)
+	}
+}
+
+func TestBuildFallbackLadder_TruncatesLongDetail(t *testing.T) {
+	longErr := strings.Repeat("x", 500)
+	meta := map[string]any{
+		"attempts": []any{
+			map[string]any{"provider": "p", "status": "failed", "error": longErr},
+		},
+	}
+	got := buildFallbackLadder(meta)
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("expected truncation suffix, got %q", got)
+	}
+	xCount := strings.Count(got, "x")
+	if xCount > 210 {
+		t.Errorf("not truncated to ~200 chars, x-count=%d, got %q", xCount, got)
+	}
+}
+
+func TestServerTool_Run_AppendsLadderOnError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := client.ToolExecuteResponse{
+			Success: false,
+			Error:   strPtr("Exa API returned no content"),
+			Metadata: map[string]any{
+				"attempts": []any{
+					map[string]any{"provider": "firecrawl", "status": "failed", "error": "Firecrawl error: 403: do not support this site"},
+					map[string]any{"provider": "exa", "status": "failed", "error": "Exa API returned no content"},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	tool := NewServerTool(client.ServerToolSchema{Name: "web_fetch"}, gw)
+	result, err := tool.Run(context.Background(), `{"url":"https://www.reddit.com/r/x"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Error("expected IsError=true")
+	}
+	if !strings.Contains(result.Content, "Exa API returned no content") {
+		t.Errorf("expected base error preserved, got %q", result.Content)
+	}
+	if !strings.Contains(result.Content, "Provider attempts:") {
+		t.Errorf("expected ladder header, got %q", result.Content)
+	}
+	if !strings.Contains(result.Content, "firecrawl failed: Firecrawl error: 403: do not support this site") {
+		t.Errorf("expected firecrawl root-cause detail, got %q", result.Content)
+	}
+}
+
+func TestServerTool_Run_NoLadderOnSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := client.ToolExecuteResponse{
+			Success: true,
+			Output:  json.RawMessage(`"ok"`),
+			Metadata: map[string]any{
+				"attempts": []any{
+					map[string]any{"provider": "firecrawl", "status": "failed", "error": "transient"},
+					map[string]any{"provider": "exa", "status": "success"},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	tool := NewServerTool(client.ServerToolSchema{Name: "web_fetch"}, gw)
+	result, err := tool.Run(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Errorf("unexpected error: %s", result.Content)
+	}
+	if strings.Contains(result.Content, "Provider attempts:") {
+		t.Errorf("ladder must not appear on success, got %q", result.Content)
+	}
+}
+
+func TestServerTool_Run_LadderNotDoubledWhenAlreadyPresent(t *testing.T) {
+	preExisting := "base failure\n\nProvider attempts:\n- some line"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := client.ToolExecuteResponse{
+			Success: false,
+			Error:   &preExisting,
+			Metadata: map[string]any{
+				"attempts": []any{
+					map[string]any{"provider": "firecrawl", "status": "failed", "error": "should-not-be-appended"},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	tool := NewServerTool(client.ServerToolSchema{Name: "web_fetch"}, gw)
+	result, err := tool.Run(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(result.Content, "should-not-be-appended") {
+		t.Errorf("ladder was doubled, got %q", result.Content)
+	}
+	if got := strings.Count(result.Content, "Provider attempts:"); got != 1 {
+		t.Errorf("expected exactly one 'Provider attempts:' marker, got %d in %q", got, result.Content)
+	}
+}
+
+func TestServerTool_Run_LadderWhenErrorEmptyAndSuccessFalse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := client.ToolExecuteResponse{
+			Success: false,
+			Metadata: map[string]any{
+				"attempts": []any{
+					map[string]any{"provider": "firecrawl", "status": "failed", "error": "Firecrawl error: 403"},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	tool := NewServerTool(client.ServerToolSchema{Name: "web_fetch"}, gw)
+	result, err := tool.Run(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Error("expected IsError=true")
+	}
+	if !strings.Contains(result.Content, "tool execution failed") {
+		t.Errorf("expected generic base, got %q", result.Content)
+	}
+	if !strings.Contains(result.Content, "Provider attempts:") {
+		t.Errorf("expected ladder, got %q", result.Content)
+	}
+	if !strings.Contains(result.Content, "firecrawl failed: Firecrawl error: 403") {
+		t.Errorf("expected firecrawl detail, got %q", result.Content)
+	}
+}
+
+// --- stripFieldsNotInSchema: defend against LLM-hallucinated args ---
+
+func TestStripFieldsNotInSchema_RemovesUnknown(t *testing.T) {
+	args := map[string]any{
+		"url":         "https://example.com",
+		"description": "should-be-stripped",
+		"foo":         "also-stripped",
+	}
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"url":        map[string]any{"type": "string"},
+			"max_length": map[string]any{"type": "integer"},
+		},
+	}
+	stripFieldsNotInSchema(args, schema)
+	if _, ok := args["description"]; ok {
+		t.Errorf("description should have been stripped, got %v", args)
+	}
+	if _, ok := args["foo"]; ok {
+		t.Errorf("foo should have been stripped, got %v", args)
+	}
+	if args["url"] != "https://example.com" {
+		t.Errorf("url must be preserved, got %v", args["url"])
+	}
+}
+
+func TestStripFieldsNotInSchema_PreservesDeclared(t *testing.T) {
+	args := map[string]any{
+		"url":        "https://example.com",
+		"max_length": 5000,
+	}
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"url":        map[string]any{"type": "string"},
+			"max_length": map[string]any{"type": "integer"},
+		},
+	}
+	stripFieldsNotInSchema(args, schema)
+	if len(args) != 2 {
+		t.Errorf("declared fields must survive, got %v", args)
+	}
+}
+
+func TestStripFieldsNotInSchema_NilSchema_NoOp(t *testing.T) {
+	args := map[string]any{"description": "kept-because-no-schema"}
+	stripFieldsNotInSchema(args, nil)
+	if _, ok := args["description"]; !ok {
+		t.Errorf("nil schema must be no-op, got %v", args)
+	}
+}
+
+func TestStripFieldsNotInSchema_MissingProperties_NoOp(t *testing.T) {
+	args := map[string]any{"description": "kept-because-no-properties"}
+	schema := map[string]any{"type": "object"} // no "properties" key
+	stripFieldsNotInSchema(args, schema)
+	if _, ok := args["description"]; !ok {
+		t.Errorf("schema without properties must be no-op, got %v", args)
+	}
+}
+
+func TestStripFieldsNotInSchema_PropertiesWrongType_NoOp(t *testing.T) {
+	args := map[string]any{"description": "kept-because-malformed-schema"}
+	// properties as a list of strings, not a map → unparseable, leave args alone
+	schema := map[string]any{"properties": []string{"url"}}
+	stripFieldsNotInSchema(args, schema)
+	if _, ok := args["description"]; !ok {
+		t.Errorf("malformed properties must be no-op, got %v", args)
+	}
+}
+
+func TestServerTool_Run_StripsLLMHallucinatedDescription(t *testing.T) {
+	// Mock gateway server captures the args body it actually receives.
+	var received map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if a, ok := req["arguments"].(map[string]any); ok {
+			received = a
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(toolExecResp(true, map[string]any{"content": "ok"}, nil))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	schema := client.ServerToolSchema{
+		Name: "web_fetch",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"url": map[string]any{"type": "string"},
+			},
+			"required": []string{"url"},
+		},
+	}
+	tool := NewServerTool(schema, gw)
+	_, err := tool.Run(context.Background(),
+		`{"url":"https://example.com","description":"LLM-hallucinated description"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if received == nil {
+		t.Fatal("mock server did not receive a request")
+	}
+	if _, leaked := received["description"]; leaked {
+		t.Errorf("description leaked to wire: %v", received)
+	}
+	if received["url"] != "https://example.com" {
+		t.Errorf("url not preserved on wire: %v", received)
+	}
+}

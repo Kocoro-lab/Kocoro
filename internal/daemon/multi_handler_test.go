@@ -22,8 +22,8 @@ type spyHandler struct {
 	cloudPlan      int
 }
 
-func (s *spyHandler) OnToolCall(name, args string) { s.toolCalls++ }
-func (s *spyHandler) OnToolResult(name, args string, r agent.ToolResult, e time.Duration) {
+func (s *spyHandler) OnToolCall(name, args, toolUseID string) { s.toolCalls++ }
+func (s *spyHandler) OnToolResult(name, args, toolUseID string, r agent.ToolResult, e time.Duration) {
 	s.toolResults++
 }
 func (s *spyHandler) OnText(t string)        { s.text++ }
@@ -49,8 +49,8 @@ func TestMultiHandlerFansOutBaseMethods(t *testing.T) {
 	a, b := &usageSpy{}, &usageSpy{}
 	m := &multiHandler{handlers: []agent.EventHandler{a, b}}
 
-	m.OnToolCall("bash", "ls")
-	m.OnToolResult("bash", "ls", agent.ToolResult{}, 0)
+	m.OnToolCall("bash", "ls", "")
+	m.OnToolResult("bash", "ls", "", agent.ToolResult{}, 0)
 	m.OnText("hi")
 	m.OnPreamble("about to run ls")
 	m.OnStreamDelta("d")

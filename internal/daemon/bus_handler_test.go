@@ -58,7 +58,7 @@ func TestBusEventHandlerOnToolCallEmitsRunning(t *testing.T) {
 	ch := bus.Subscribe()
 	defer bus.Unsubscribe(ch)
 
-	h.OnToolCall("bash", "ls -la /tmp")
+	h.OnToolCall("bash", "ls -la /tmp", "")
 
 	got := drain(t, ch, 1)
 	if len(got) != 1 {
@@ -99,7 +99,7 @@ func TestBusEventHandlerOnToolCallRedactsAndTruncatesArgs(t *testing.T) {
 	defer bus.Unsubscribe(ch)
 
 	long := "curl -H 'Authorization: Bearer sk-secretvalue1234567890' https://api.example.com/" + strings.Repeat("x", 500)
-	h.OnToolCall("bash", long)
+	h.OnToolCall("bash", long, "")
 
 	got := drain(t, ch, 1)
 	if len(got) != 1 {
@@ -130,7 +130,7 @@ func TestBusEventHandlerOnToolResultEmitsCompleted(t *testing.T) {
 		Content: "total 12\ndrwxr-x...",
 		IsError: false,
 	}
-	h.OnToolResult("bash", "ls", result, 1234*time.Millisecond)
+	h.OnToolResult("bash", "ls", "", result, 1234*time.Millisecond)
 
 	got := drain(t, ch, 1)
 	if len(got) != 1 {
@@ -167,7 +167,7 @@ func TestBusEventHandlerOnToolResultTruncatesPreview(t *testing.T) {
 
 	longText := strings.Repeat("x", 500)
 	result := agent.ToolResult{Content: longText}
-	h.OnToolResult("bash", "", result, 0)
+	h.OnToolResult("bash", "", "", result, 0)
 
 	got := drain(t, ch, 1)
 	var p struct {
@@ -184,7 +184,7 @@ func TestBusEventHandlerOnToolResultPropagatesIsError(t *testing.T) {
 	ch := bus.Subscribe()
 	defer bus.Unsubscribe(ch)
 
-	h.OnToolResult("bash", "", agent.ToolResult{
+	h.OnToolResult("bash", "", "", agent.ToolResult{
 		Content: "command not found",
 		IsError: true,
 	}, 5*time.Millisecond)
@@ -216,7 +216,7 @@ func TestBusEventHandlerOnToolCallRedactsSecretSpanningTruncation(t *testing.T) 
 	// requirement, and leak the prefix. redact-then-truncate matches the full
 	// pattern before truncation, substitutes [REDACTED], and truncates cleanly.
 	input := strings.Repeat("a", 185) + "AKIAABCDEFGHIJKLMNOP" + strings.Repeat("z", 100)
-	h.OnToolCall("bash", input)
+	h.OnToolCall("bash", input, "")
 
 	got := drain(t, ch, 1)
 	if len(got) != 1 {
@@ -417,6 +417,53 @@ func TestBusEventHandlerOnCloudPlanShortContentNotTruncated(t *testing.T) {
 	}
 	if p.NeedsReview {
 		t.Fatalf("needs_review = true, want false")
+	}
+}
+
+// TestBusEventHandlerOnToolCallIncludesToolUseID asserts the running event
+// carries the tool_use_id so multi-bash-in-flight UIs can pair running events
+// with their later completed events. Without this field the UI cannot tell
+// which of N concurrent bash invocations a given completion belongs to.
+func TestBusEventHandlerOnToolCallIncludesToolUseID(t *testing.T) {
+	h, bus := newTestHandler(t)
+	ch := bus.Subscribe()
+	defer bus.Unsubscribe(ch)
+
+	h.OnToolCall("bash", "git status", "toolu_abc123")
+
+	got := drain(t, ch, 1)
+	if len(got) != 1 {
+		t.Fatalf("want 1 event, got %d", len(got))
+	}
+	var p map[string]any
+	if err := json.Unmarshal(got[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if p["tool_use_id"] != "toolu_abc123" {
+		t.Fatalf("tool_use_id = %v, want %q", p["tool_use_id"], "toolu_abc123")
+	}
+}
+
+// TestBusEventHandlerOnToolResultIncludesToolUseID is the pair to the running
+// test — the completed event must carry the same tool_use_id so pairing works
+// end-to-end.
+func TestBusEventHandlerOnToolResultIncludesToolUseID(t *testing.T) {
+	h, bus := newTestHandler(t)
+	ch := bus.Subscribe()
+	defer bus.Unsubscribe(ch)
+
+	h.OnToolResult("bash", "git status", "toolu_abc123", agent.ToolResult{Content: "M file.go"}, 10*time.Millisecond)
+
+	got := drain(t, ch, 1)
+	if len(got) != 1 {
+		t.Fatalf("want 1 event, got %d", len(got))
+	}
+	var p map[string]any
+	if err := json.Unmarshal(got[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if p["tool_use_id"] != "toolu_abc123" {
+		t.Fatalf("tool_use_id = %v, want %q", p["tool_use_id"], "toolu_abc123")
 	}
 }
 

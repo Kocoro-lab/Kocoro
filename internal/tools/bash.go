@@ -43,6 +43,14 @@ type BashTool struct {
 	// fetched lazily at execution time and scoped to bash child processes
 	// only — they never enter prompt context or session transcripts.
 	SecretsStore *skills.SecretsStore
+	// ConcurrencyEnabled gates IsConcurrencySafeCall — when true (the
+	// Phase C default since 2026-05-15) bash invocations that pass the
+	// static read-only analyzer can share a concurrent batch with other
+	// tools. When false, the method always returns false so the agent
+	// loop's partition dispatcher keeps bash on its historical size-1
+	// serial path. Wired from config.AgentConfig.BashConcurrencyEnabled
+	// by register.go (RegisterLocalTools + CloneWithRuntimeConfig).
+	ConcurrencyEnabled bool
 }
 
 type bashArgs struct {
@@ -122,7 +130,7 @@ Instructions:
 - Prefer absolute paths over cd to keep the working directory stable.
 - For multi-line Python with embedded quotes or regex, write a script via file_write then run python3 /path/to/script.py — heredoc+quote nesting is a frequent source of shell syntax errors.
 - When issuing multiple commands:
-  - Multiple bash calls in a single turn execute SEQUENTIALLY, not in parallel — the daemon batches non-read-only tools as size-1 to avoid side-effect collisions (port binds, file writes, etc.). You can still emit multiple bash calls in one response to save round-trips, but do NOT promise the user parallel timing or invent fake "rate limits" / "blocked" / "restricted" explanations when you expected parallel and saw serial. Read the actual tool results — if each bash returned successfully, the operation succeeded.
+  - Bash invocations are dispatched in concurrent batches when they are statically provable to be read-only (no shell metacharacters including newlines, first token in a whitelist of read-only commands like git status / git diff / git log / ls / cat / pwd / wc / stat / which). Any command containing &&, ||, ;, |, >, <, $(), newlines, or shell-substitution markers, plus any write/network command (git push, npm install, curl, rm, git remote add, go env -w, ...), runs sequentially as its own batch. If a batch you expected to be parallel ran serially, that's because at least one call's command did not pass the static check — not because of a "rate limit" or "block". Read the actual tool results to confirm what happened.
   - If commands depend on each other, chain with && in a single bash call.
   - Use ';' only when sequential execution is needed and earlier failures don't matter.
   - DO NOT use newlines to separate commands (newlines inside quoted strings are fine).
@@ -290,6 +298,24 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 func (t *BashTool) RequiresApproval() bool { return true }
 
 func (t *BashTool) IsReadOnlyCall(string) bool { return false }
+
+// IsConcurrencySafeCall reports whether this specific bash invocation is safe
+// to run concurrently with other tool calls. Gated by ConcurrencyEnabled —
+// when on (the Phase C default since 2026-05-15), delegates to the pure
+// analyzer IsCommandConcurrencySafe. When off, returns false unconditionally
+// so the dispatcher matches pre-Phase-A serial behavior.
+//
+// Parse failures and unknown JSON shapes default to false (fail-closed).
+func (t *BashTool) IsConcurrencySafeCall(argsStr string) bool {
+	if !t.ConcurrencyEnabled {
+		return false
+	}
+	var args bashArgs
+	if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
+		return false
+	}
+	return IsCommandConcurrencySafe(args.Command)
+}
 
 func (t *BashTool) IsSafe(command string) bool {
 	return isSafeCommand(command, t.ExtraSafeCommands)

@@ -1559,8 +1559,8 @@ type httpEventHandler struct {
 // Usage returns the cumulative usage collected during this handler's lifetime.
 func (h *httpEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
 
-func (h *httpEventHandler) OnToolCall(name string, args string) {}
-func (h *httpEventHandler) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
+func (h *httpEventHandler) OnToolCall(name string, args string, toolUseID string) {}
+func (h *httpEventHandler) OnToolResult(name string, args string, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	log.Printf("http: tool %s completed (%.1fs)", name, elapsed.Seconds())
 }
 func (h *httpEventHandler) OnText(text string)            {}
@@ -1613,32 +1613,36 @@ func (h *sseEventHandler) SetSessionID(id string) { h.sessionID = id }
 // Usage returns the cumulative usage collected during this handler's lifetime.
 func (h *sseEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
 
-func (h *sseEventHandler) OnToolCall(name string, args string) {
+func (h *sseEventHandler) OnToolCall(name string, args string, toolUseID string) {
 	// Match bus payload: redact-first, then truncate. `audit.RedactSecrets ∘
 	// truncate` is wrong — a secret that straddles the byte-200 boundary
 	// gets chopped into a fragment before the redaction regex sees it, and
 	// then leaks through SSE. See redactAndTruncate + the boundary
-	// regression test in bus_handler_test.go.
+	// regression test in bus_handler_test.go. tool_use_id pairs this running
+	// frame with its later completed frame (see bus_handler.go).
 	data := mustJSON(map[string]interface{}{
-		"tool":   name,
-		"status": "running",
-		"args":   redactAndTruncate(args, 200),
+		"tool":        name,
+		"tool_use_id": toolUseID,
+		"status":      "running",
+		"args":        redactAndTruncate(args, 200),
 	})
 	fmt.Fprintf(h.w, "event: tool\ndata: %s\n\n", data)
 	h.flusher.Flush()
 }
 
-func (h *sseEventHandler) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
+func (h *sseEventHandler) OnToolResult(name string, args string, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	// SSE is request-scoped (one tool stream per HTTP request), so session_id
 	// is intentionally omitted here; session correlation is handled at the client
 	// session boundary. `is_error` and `preview` mirror the bus payload so the
 	// Desktop foreground pill can render errors / a short result preview.
+	// tool_use_id pairs this completed frame with its earlier running frame.
 	data := mustJSON(map[string]interface{}{
-		"tool":     name,
-		"status":   "completed",
-		"elapsed":  elapsed.Seconds(),
-		"is_error": result.IsError,
-		"preview":  redactAndTruncate(toolResultPreview(result), 200),
+		"tool":        name,
+		"tool_use_id": toolUseID,
+		"status":      "completed",
+		"elapsed":     elapsed.Seconds(),
+		"is_error":    result.IsError,
+		"preview":     redactAndTruncate(toolResultPreview(result), 200),
 	})
 	fmt.Fprintf(h.w, "event: tool\ndata: %s\n\n", data)
 	h.flusher.Flush()

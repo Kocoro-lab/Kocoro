@@ -601,8 +601,8 @@ func (a *AgentLoop) maybeAutoAdjustContextWindow(model string) {
 }
 
 type EventHandler interface {
-	OnToolCall(name string, args string)
-	OnToolResult(name string, args string, result ToolResult, elapsed time.Duration)
+	OnToolCall(name string, args string, toolUseID string)
+	OnToolResult(name string, args string, toolUseID string, result ToolResult, elapsed time.Duration)
 	// OnText is fired for the model's final answer text (no-tool-call exit,
 	// force-stop synthesis, cloud_delegate single-tool bypass). Mid-turn
 	// narration emitted alongside tool_use blocks goes to OnPreamble instead
@@ -3309,7 +3309,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					result: ToolResult{Content: "duplicate tool call skipped (identical to earlier call in this response)", IsError: true},
 				}
 				if a.handler != nil {
-					a.handler.OnToolResult(fc.Name, argsStr, execResults[idx].result, 0)
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
 				}
 				continue
 			}
@@ -3322,7 +3322,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					result: ToolResult{Content: "tool call blocked: previously denied this turn. Use a different approach.", IsError: true},
 				}
 				if a.handler != nil {
-					a.handler.OnToolResult(fc.Name, argsStr, execResults[idx].result, 0)
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
 				}
 				continue
 			}
@@ -3337,7 +3337,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 						result: ToolResult{Content: "cloud_delegate already called this turn. Use the previous result — do not re-delegate.", IsError: true},
 					}
 					if a.handler != nil {
-						a.handler.OnToolResult(fc.Name, argsStr, execResults[idx].result, 0)
+						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
 					}
 					continue
 				}
@@ -3354,7 +3354,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					result: ToolResult{Content: "unknown tool: " + fc.Name, IsError: true},
 				}
 				if a.handler != nil {
-					a.handler.OnToolResult(fc.Name, argsStr, execResults[idx].result, 0)
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
 				}
 				continue
 			}
@@ -3379,7 +3379,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 						},
 					}
 					if a.handler != nil {
-						a.handler.OnToolResult(fc.Name, argsStr, execResults[idx].result, 0)
+						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
 					}
 					continue
 				}
@@ -3396,7 +3396,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					result: ToolResult{Content: "tool call denied by permission policy", IsError: true},
 				}
 				if a.handler != nil {
-					a.handler.OnToolResult(fc.Name, argsStr, ToolResult{Content: "denied by policy", IsError: true}, 0)
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, ToolResult{Content: "denied by policy", IsError: true}, 0)
 				}
 				continue
 			}
@@ -3408,7 +3408,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				}
 				deniedCalls[dedupKey] = true
 				if a.handler != nil {
-					a.handler.OnToolResult(fc.Name, argsStr, ToolResult{Content: "denied by user", IsError: true}, 0)
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, ToolResult{Content: "denied by user", IsError: true}, 0)
 				}
 				continue
 			}
@@ -3426,7 +3426,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 						result: ToolResult{Content: "tool call denied by hook: " + hookReason, IsError: true},
 					}
 					if a.handler != nil {
-						a.handler.OnToolResult(fc.Name, argsStr, execResults[idx].result, 0)
+						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
 					}
 					continue
 				}
@@ -3469,7 +3469,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 							},
 						}
 						if a.handler != nil {
-							a.handler.OnToolResult(ac.fc.Name, ac.argsStr, execResults[ac.index].result, 0)
+							a.handler.OnToolResult(ac.fc.Name, ac.argsStr, ac.fc.ID, execResults[ac.index].result, 0)
 						}
 						a.logAudit(ac.fc.Name, ac.argsStr, "denied by skill tool filter", "deny", false, 0, nil)
 					} else {
@@ -3559,7 +3559,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				a.logAudit(fc.Name, argsStr, result.Content, decision, wasApproved, elapsed.Milliseconds(), result.Usage)
 
 				if a.handler != nil {
-					a.handler.OnToolResult(fc.Name, argsStr, result, elapsed)
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, result, elapsed)
 				}
 			}
 

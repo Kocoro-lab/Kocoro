@@ -47,6 +47,98 @@ func TestLoopDetector_ConsecutiveDup_ForceStop(t *testing.T) {
 	}
 }
 
+// TestLoopDetector_ValidationError_ForceStopAt3 covers the deterministic
+// validation-error short-circuit: same tool + same args + result content
+// prefixed with "[validation error]" three times in a row force-stops
+// immediately, instead of waiting for the all-errors 2x ConsecutiveDup
+// budget at call #7. The premise: validation errors are deterministic —
+// retrying with identical args cannot succeed, so the all-errors budget
+// (calibrated for flaky retries like Playwright selectors) is the wrong
+// signal here.
+func TestLoopDetector_ValidationError_ForceStopAt3(t *testing.T) {
+	ld := NewLoopDetector()
+	args := `{"path":"/tmp/x"}`
+	errMsg := "[validation error] file_write: missing required `content` parameter."
+
+	// Calls 1, 2: no trigger
+	for i := range 2 {
+		ld.Record("file_write", args, true, errMsg, "", false)
+		action, _ := ld.Check("file_write")
+		if action != LoopContinue {
+			t.Errorf("call %d: expected LoopContinue, got %v", i+1, action)
+		}
+	}
+
+	// Call 3: validation-error force-stop
+	ld.Record("file_write", args, true, errMsg, "", false)
+	action, msg := ld.Check("file_write")
+	if action != LoopForceStop {
+		t.Errorf("call 3: expected LoopForceStop, got %v (msg: %s)", action, msg)
+	}
+	if !strings.Contains(msg, "validation error") {
+		t.Errorf("force-stop message should mention validation error, got: %s", msg)
+	}
+}
+
+// TestLoopDetector_ValidationError_DifferentArgs_NoForceStop ensures the
+// short-circuit only fires when the args are identical. If the model is
+// genuinely trying different parameter shapes (each round produces a fresh
+// validation error on a slightly different arg set), it should fall back
+// to the standard SameToolError detector at call #6.
+func TestLoopDetector_ValidationError_DifferentArgs_NoForceStop(t *testing.T) {
+	ld := NewLoopDetector()
+	errMsg := "[validation error] missing required `content`"
+
+	// 3 different argsHash + same validation error: should NOT force-stop early.
+	for i := range 3 {
+		ld.Record("file_write", fmt.Sprintf(`{"path":"/tmp/file%d"}`, i), true, errMsg, "", false)
+	}
+	action, _ := ld.Check("file_write")
+	if action == LoopForceStop {
+		t.Errorf("different args should not trigger validation-error force-stop at 3, got %v", action)
+	}
+}
+
+// TestLoopDetector_NonValidationError_StaysOnNormalPath ensures non-validation
+// error messages (permission, business rule, generic IsError) do not inherit
+// the aggressive 3-call force-stop. Only the explicit "[validation error]"
+// prefix from agent.ValidationError() qualifies.
+func TestLoopDetector_NonValidationError_StaysOnNormalPath(t *testing.T) {
+	ld := NewLoopDetector()
+	args := `{"path":"/tmp/x"}`
+	// Note: no "[validation error]" prefix — this looks like a bare permission /
+	// business / staleness error.
+	errMsg := "permission denied"
+
+	for range 3 {
+		ld.Record("file_write", args, true, errMsg, "", false)
+	}
+	action, _ := ld.Check("file_write")
+	if action == LoopForceStop {
+		t.Errorf("non-validation error at 3 calls must not force-stop early (would interfere with normal all-errors 2x path), got %v", action)
+	}
+}
+
+// TestLoopDetector_ValidationError_BrokenStreak verifies that a single
+// non-validation entry between identical validation errors breaks the
+// short-circuit streak (because it breaks consecutive same-args anyway).
+func TestLoopDetector_ValidationError_BrokenStreak(t *testing.T) {
+	ld := NewLoopDetector()
+	args := `{"path":"/tmp/x"}`
+	verr := "[validation error] missing required `content`"
+
+	ld.Record("file_write", args, true, verr, "", false)
+	ld.Record("file_write", args, true, verr, "", false)
+	// Different tool breaks the consecutive run.
+	ld.Record("bash", `{"command":"ls"}`, false, "", "", false)
+	ld.Record("file_write", args, true, verr, "", false)
+
+	action, _ := ld.Check("file_write")
+	if action == LoopForceStop {
+		t.Errorf("broken consecutive streak must not trigger validation force-stop, got %v", action)
+	}
+}
+
 func TestLoopDetector_NonConsecutiveDup_NoFalsePositive(t *testing.T) {
 	ld := NewLoopDetector()
 

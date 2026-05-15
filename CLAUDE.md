@@ -138,6 +138,20 @@ Must match `^[a-z0-9][a-z0-9_-]{0,63}$`. Validated before any path concatenation
 
 Local tools > MCP tools > Gateway tools. Deduplicated by name.
 
+### Tool Concurrency
+
+The dispatcher batches tool calls by `IsConcurrencySafeCall`, not `IsReadOnlyCall`. Tools without an explicit `ConcurrencySafeChecker` implementation fall back to their `IsReadOnlyCall` value — so file_read / grep / glob etc. keep batching concurrently as before, and writers stay serial. Adding the new interface to one tool has no effect on any other tool's grouping.
+
+`BashTool` implements `IsConcurrencySafeCall` via `internal/tools/bash_concurrency.go`. It is gated by `agent.bash_concurrency_enabled` (default `true` in Phase C — Desktop consumes the `tool_use_id_events` capability so id-keyed cards stay correct under concurrent batches). When the flag is on, commands whose first token is in a strict read-only whitelist AND contain no shell metacharacters (including `\n` / `\r`) are eligible for the concurrent batch. Everything else — `&&` / pipes / redirects / command substitution, plus any non-whitelisted leading token (`git push`, `npm install`, `curl`, `rm`, `git remote add`, `go env -w`, ...) — stays in a size-1 serial batch.
+
+Tool events on the SSE/WS wire (`tool_status` running + completed) include a `tool_use_id` field so multi-tool-in-flight UIs (e.g. parallel bash) can pair them correctly. The daemon advertises this on the WS handshake via the `tool_use_id_events` capability token.
+
+### Tool Required-Field Validation
+
+Every tool's `Run()` MUST explicitly check that each field listed in `ToolInfo.Required` is non-zero immediately after `json.Unmarshal`, and return `agent.ValidationError(...)` (NOT a bare `ToolResult{Content: ..., IsError: true}`) on failure. Go's `json.Unmarshal` cannot distinguish "field missing" from "field present with zero value" on a strongly-typed struct, so a missing string `required` field arrives as `""` — which `os.WriteFile`, `exec.Command`, etc. happily accept. The 2026-05-13 production stuck loop was a `file_write` call with no `content` field that wrote 0 bytes, returned `IsError=false`, truncated the user's existing file, and trapped the model into a 16-call retry spin.
+
+The `[validation error]` prefix that `ValidationError` injects is load-bearing: `LoopDetector.isValidationErrorSig` short-circuits a same-tool + same-args + 3-consecutive `[validation error]` run to `LoopForceStop`, well below the all-errors 2x ConsecutiveDup budget at call #7. Returning a hand-rolled `IsError=true` result without the prefix loses this early-stop and falls back to the slower flaky-retry path. Examples: `internal/tools/file_write.go` (content), `internal/tools/file_edit.go` (old_string), `internal/tools/archive.go` (path/dest), `internal/tools/cloud_delegate.go` (task), `internal/tools/edit_image.go` (prompt).
+
 ### Skill Discovery
 
 Three layers triggering `use_skill`:
