@@ -52,7 +52,7 @@ func (h *busEventHandler) OnApprovalNeeded(tool, args string) bool { return fals
 
 // OnToolCall emits a "running" event when a tool is invoked. Args are redacted
 // (secrets) and truncated (size budget) before emission.
-func (h *busEventHandler) OnToolCall(name, args string) {
+func (h *busEventHandler) OnToolCall(name, args, toolUseID string) {
 	h.emitJSON(EventToolStatus, map[string]any{
 		"tool":       name,
 		"status":     "running",
@@ -64,7 +64,7 @@ func (h *busEventHandler) OnToolCall(name, args string) {
 
 // OnToolResult emits a "completed" event when a tool finishes. The result
 // preview is extracted from Content or ContentBlocks, redacted, and truncated.
-func (h *busEventHandler) OnToolResult(name, args string, result agent.ToolResult, elapsed time.Duration) {
+func (h *busEventHandler) OnToolResult(name, args, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	h.emitJSON(EventToolStatus, map[string]any{
 		"tool":       name,
 		"status":     "completed",

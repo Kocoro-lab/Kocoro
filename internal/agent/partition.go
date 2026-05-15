@@ -104,7 +104,7 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 					}
 				}()
 				if handler != nil {
-					handler.OnToolCall(ac.fc.Name, ac.argsStr)
+					handler.OnToolCall(ac.fc.Name, ac.argsStr, ac.fc.ID)
 				}
 				startTime := time.Now()
 				result, runErr := ac.tool.Run(ctx, ac.argsStr)
@@ -121,7 +121,7 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 				// actual execution start, not just batch membership. Called from
 				// the main goroutine so handler writes stay serialized.
 				if handler != nil {
-					handler.OnToolCall(ac.fc.Name, ac.argsStr)
+					handler.OnToolCall(ac.fc.Name, ac.argsStr, ac.fc.ID)
 				}
 				go func(ac approvedToolCall) {
 					defer wg.Done()

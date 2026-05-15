@@ -317,8 +317,8 @@ type TranscriptCollector struct {
 // Usage returns the cumulative usage collected during the heartbeat run.
 func (tc *TranscriptCollector) Usage() agent.AccumulatedUsage { return tc.usage.Snapshot() }
 
-func (tc *TranscriptCollector) OnToolCall(name string, args string) {}
-func (tc *TranscriptCollector) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
+func (tc *TranscriptCollector) OnToolCall(name string, args string, toolUseID string) {}
+func (tc *TranscriptCollector) OnToolResult(name string, args string, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 }
 func (tc *TranscriptCollector) OnText(text string) {
 	tc.Messages = append(tc.Messages, client.Message{Role: "assistant", Content: client.NewTextContent(text)})

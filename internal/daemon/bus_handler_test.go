@@ -58,7 +58,7 @@ func TestBusEventHandlerOnToolCallEmitsRunning(t *testing.T) {
 	ch := bus.Subscribe()
 	defer bus.Unsubscribe(ch)
 
-	h.OnToolCall("bash", "ls -la /tmp")
+	h.OnToolCall("bash", "ls -la /tmp", "")
 
 	got := drain(t, ch, 1)
 	if len(got) != 1 {
@@ -99,7 +99,7 @@ func TestBusEventHandlerOnToolCallRedactsAndTruncatesArgs(t *testing.T) {
 	defer bus.Unsubscribe(ch)
 
 	long := "curl -H 'Authorization: Bearer sk-secretvalue1234567890' https://api.example.com/" + strings.Repeat("x", 500)
-	h.OnToolCall("bash", long)
+	h.OnToolCall("bash", long, "")
 
 	got := drain(t, ch, 1)
 	if len(got) != 1 {
@@ -130,7 +130,7 @@ func TestBusEventHandlerOnToolResultEmitsCompleted(t *testing.T) {
 		Content: "total 12\ndrwxr-x...",
 		IsError: false,
 	}
-	h.OnToolResult("bash", "ls", result, 1234*time.Millisecond)
+	h.OnToolResult("bash", "ls", "", result, 1234*time.Millisecond)
 
 	got := drain(t, ch, 1)
 	if len(got) != 1 {
@@ -167,7 +167,7 @@ func TestBusEventHandlerOnToolResultTruncatesPreview(t *testing.T) {
 
 	longText := strings.Repeat("x", 500)
 	result := agent.ToolResult{Content: longText}
-	h.OnToolResult("bash", "", result, 0)
+	h.OnToolResult("bash", "", "", result, 0)
 
 	got := drain(t, ch, 1)
 	var p struct {
@@ -184,7 +184,7 @@ func TestBusEventHandlerOnToolResultPropagatesIsError(t *testing.T) {
 	ch := bus.Subscribe()
 	defer bus.Unsubscribe(ch)
 
-	h.OnToolResult("bash", "", agent.ToolResult{
+	h.OnToolResult("bash", "", "", agent.ToolResult{
 		Content: "command not found",
 		IsError: true,
 	}, 5*time.Millisecond)
@@ -216,7 +216,7 @@ func TestBusEventHandlerOnToolCallRedactsSecretSpanningTruncation(t *testing.T) 
 	// requirement, and leak the prefix. redact-then-truncate matches the full
 	// pattern before truncation, substitutes [REDACTED], and truncates cleanly.
 	input := strings.Repeat("a", 185) + "AKIAABCDEFGHIJKLMNOP" + strings.Repeat("z", 100)
-	h.OnToolCall("bash", input)
+	h.OnToolCall("bash", input, "")
 
 	got := drain(t, ch, 1)
 	if len(got) != 1 {

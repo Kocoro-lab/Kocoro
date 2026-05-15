@@ -1559,8 +1559,8 @@ type httpEventHandler struct {
 // Usage returns the cumulative usage collected during this handler's lifetime.
 func (h *httpEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
 
-func (h *httpEventHandler) OnToolCall(name string, args string) {}
-func (h *httpEventHandler) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
+func (h *httpEventHandler) OnToolCall(name string, args string, toolUseID string) {}
+func (h *httpEventHandler) OnToolResult(name string, args string, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	log.Printf("http: tool %s completed (%.1fs)", name, elapsed.Seconds())
 }
 func (h *httpEventHandler) OnText(text string)            {}
@@ -1613,7 +1613,7 @@ func (h *sseEventHandler) SetSessionID(id string) { h.sessionID = id }
 // Usage returns the cumulative usage collected during this handler's lifetime.
 func (h *sseEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
 
-func (h *sseEventHandler) OnToolCall(name string, args string) {
+func (h *sseEventHandler) OnToolCall(name string, args string, toolUseID string) {
 	// Match bus payload: redact-first, then truncate. `audit.RedactSecrets ∘
 	// truncate` is wrong — a secret that straddles the byte-200 boundary
 	// gets chopped into a fragment before the redaction regex sees it, and
@@ -1628,7 +1628,7 @@ func (h *sseEventHandler) OnToolCall(name string, args string) {
 	h.flusher.Flush()
 }
 
-func (h *sseEventHandler) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
+func (h *sseEventHandler) OnToolResult(name string, args string, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	// SSE is request-scoped (one tool stream per HTTP request), so session_id
 	// is intentionally omitted here; session correlation is handled at the client
 	// session boundary. `is_error` and `preview` mirror the bus payload so the

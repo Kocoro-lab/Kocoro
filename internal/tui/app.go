@@ -2414,7 +2414,7 @@ func (h *tuiEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapsh
 // usage reporting to a single run.
 func (h *tuiEventHandler) ResetUsage() { h.usage.Reset() }
 
-func (h *tuiEventHandler) OnToolCall(name string, args string) {
+func (h *tuiEventHandler) OnToolCall(name string, args string, toolUseID string) {
 	// Skip spinner/indicator for think tool — its content is shown dimmed on result.
 	if name == "think" {
 		return
@@ -2424,7 +2424,7 @@ func (h *tuiEventHandler) OnToolCall(name string, args string) {
 	}
 }
 
-func (h *tuiEventHandler) OnToolResult(name string, args string, result agent.ToolResult, elapsed time.Duration) {
+func (h *tuiEventHandler) OnToolResult(name string, args string, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
 	if h.model.program != nil {
 		h.model.program.Send(toolResultMsg{
 			name:    name,

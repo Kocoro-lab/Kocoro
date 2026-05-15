@@ -1336,8 +1336,8 @@ func (s *statusRecorder) OnRunStatus(code, detail string) {
 }
 
 // EventHandler stubs — no behavior, just to satisfy the interface.
-func (s *statusRecorder) OnToolCall(name string, args string)                        {}
-func (s *statusRecorder) OnToolResult(string, string, ToolResult, time.Duration)     {}
+func (s *statusRecorder) OnToolCall(name string, args string, toolUseID string)                  {}
+func (s *statusRecorder) OnToolResult(string, string, string, ToolResult, time.Duration)          {}
 func (s *statusRecorder) OnText(string)                                              {}
 func (s *statusRecorder) OnPreamble(string)                                          {}
 func (s *statusRecorder) OnStreamDelta(string)                                       {}
