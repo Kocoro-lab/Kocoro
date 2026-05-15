@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -166,11 +167,22 @@ func (sc *SessionCache) EnqueueMessage(key string, msg agenttypes.QueuedMessage)
 	if ch != nil {
 		select {
 		case ch <- agent.InjectedMessage{Text: msg.Text, CWD: msg.CWD}:
+			log.Printf("daemon: mailbox→injectCh wrote %q (route=%s id=%s)", truncForLog(msg.Text, 60), key, msg.ID)
 		default:
 			// injectCh saturated — fine, mailbox still owns durability.
+			log.Printf("daemon: mailbox→injectCh full, leaving on disk (route=%s id=%s)", key, msg.ID)
 		}
+	} else {
+		log.Printf("daemon: mailbox→injectCh nil (no active run) (route=%s id=%s)", key, msg.ID)
 	}
 	return MailboxQueued, nil
+}
+
+func truncForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // DrainMailbox dequeues up to limit messages for the route. Returns nil for
