@@ -955,15 +955,6 @@ func (c *GatewayClient) StreamIdleTimeout() time.Duration { return c.streamIdleT
 // This endpoint is a thin proxy to the LLM service that returns raw function_call
 // responses for client-side tool execution.
 func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error) {
-	// Cloud-side workaround (see strip_stale_thinking.go): drop thinking
-	// blocks from all but the most-recent assistant message so the rolling
-	// cache_control marker Cloud places on claude_messages[-2] cannot land
-	// on a thinking block (Anthropic rejects that with
-	// "messages.N.content.0.thinking.cache_control: Extra inputs are not
-	// permitted"). Lazy: only allocates a new slice when a strip actually
-	// happens, so single-turn / no-thinking requests pay zero overhead.
-	req.Messages = stripStaleThinkingBlocks(req.Messages)
-
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -1009,10 +1000,6 @@ type StreamDelta struct {
 // that returns ErrStreamIdleTimeout if no chunk arrives within that interval.
 func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionRequest, onDelta func(StreamDelta)) (*CompletionResponse, error) {
 	req.Stream = true
-	// Same Cloud-side workaround as Complete (see strip_stale_thinking.go):
-	// strip thinking blocks from older assistant turns so Cloud's rolling
-	// cache_control marker can't land on a thinking block.
-	req.Messages = stripStaleThinkingBlocks(req.Messages)
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
