@@ -59,11 +59,19 @@ var Version = "dev"
 // and WS, so UIs running multiple bash invocations in parallel can pair
 // them up. Optional for consumers; events remain backward-readable
 // because older readers ignore unknown keys.
+//
+// "client_message_queue" — daemon owns a persistent per-route mailbox
+// (SQLite-backed at ~/.shannon/sessions/mailbox.db). Durability boundary
+// shifts from "ack after SendReply" to "ack after mailbox.Append".
+// Cloud may use this token to coordinate replay-buffer behavior or
+// surface a future channel-side "typing/queued" indicator; current
+// behavior is no-change-on-Cloud-side, the token is advisory only.
 const (
 	CapDeliveryAck         = "delivery_ack"
 	CapInlineDocumentB64   = "inline_document_b64"
 	CapInlineExtractedText = "inline_extracted_text"
 	CapToolUseIDEvents     = "tool_use_id_events"
+	CapClientMessageQueue  = "client_message_queue"
 )
 
 var Capabilities = []string{
@@ -71,6 +79,7 @@ var Capabilities = []string{
 	CapInlineDocumentB64,
 	CapInlineExtractedText,
 	CapToolUseIDEvents,
+	CapClientMessageQueue,
 }
 
 type Client struct {
