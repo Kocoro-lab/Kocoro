@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -776,5 +777,51 @@ func TestStore_RoundTripInterleavedThinkingBlocks(t *testing.T) {
 	}
 	if blocks[0].Thinking != "first reasoning" {
 		t.Errorf("thinking text lost: %q", blocks[0].Thinking)
+	}
+}
+
+// TestStore_SaveAssignsStrictlyMonotonicUpdatedAt pins the invariant that
+// successive Save calls on the same Store produce strictly increasing
+// UpdatedAt timestamps even when the underlying clock has not advanced. The
+// index relies on this for stable ORDER BY updated_at DESC; the CI-only
+// flake of TestSmoke_EndToEnd surfaced when two Saves on a low-resolution
+// Linux clock landed on the same instant.
+//
+// The test is deterministic regardless of host clock resolution: we preload
+// store.lastUpdated to a time in the future, which forces nextUpdatedAt to
+// take the bump branch every iteration.
+func TestStore_SaveAssignsStrictlyMonotonicUpdatedAt(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	defer store.Close()
+
+	// Pin the internal clock ahead of time.Now() so every Save is forced
+	// through the +1ns bump branch — this is the path that protects the
+	// index against same-instant collisions on low-resolution clocks.
+	store.clockMu.Lock()
+	store.lastUpdated = time.Now().Add(time.Hour)
+	pinned := store.lastUpdated
+	store.clockMu.Unlock()
+
+	const n = 50
+	sessions := make([]*Session, n)
+	for i := range sessions {
+		sessions[i] = &Session{ID: "monotonic-" + strconv.Itoa(i)}
+		if err := store.Save(sessions[i]); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+	}
+	if !sessions[0].UpdatedAt.After(pinned) {
+		t.Fatalf("first save did not bump past pinned future timestamp: pinned=%s got=%s",
+			pinned.Format(time.RFC3339Nano),
+			sessions[0].UpdatedAt.Format(time.RFC3339Nano))
+	}
+	for i := 1; i < n; i++ {
+		if !sessions[i].UpdatedAt.After(sessions[i-1].UpdatedAt) {
+			t.Fatalf("UpdatedAt not strictly monotonic at index %d: prev=%s curr=%s",
+				i,
+				sessions[i-1].UpdatedAt.Format(time.RFC3339Nano),
+				sessions[i].UpdatedAt.Format(time.RFC3339Nano))
+		}
 	}
 }

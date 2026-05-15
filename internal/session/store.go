@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -249,6 +250,15 @@ type SessionSummary struct {
 type Store struct {
 	dir   string
 	index *Index // nil = index unavailable (graceful degradation)
+
+	// clockMu guards lastUpdated so concurrent Save calls produce strictly
+	// monotonic UpdatedAt values. Without this, two Saves that observe the
+	// same time.Now() reading would land on identical timestamps and the
+	// index ORDER BY updated_at DESC would return them in non-deterministic
+	// order — caught by TestSmoke_EndToEnd on low-resolution clocks
+	// (GitHub Actions Linux runners).
+	clockMu     sync.Mutex
+	lastUpdated time.Time
 }
 
 func NewStore(dir string) *Store {
@@ -268,8 +278,23 @@ func NewStore(dir string) *Store {
 	return s
 }
 
+// nextUpdatedAt returns time.Now(), bumped by 1ns if the underlying clock has
+// not advanced past the previous Save. This makes the per-Store sequence of
+// UpdatedAt values strictly monotonic, which the SQLite index relies on for
+// stable ORDER BY updated_at DESC (the SQL has no tie-breaker).
+func (s *Store) nextUpdatedAt() time.Time {
+	s.clockMu.Lock()
+	defer s.clockMu.Unlock()
+	now := time.Now()
+	if !now.After(s.lastUpdated) {
+		now = s.lastUpdated.Add(time.Nanosecond)
+	}
+	s.lastUpdated = now
+	return now
+}
+
 func (s *Store) Save(sess *Session) error {
-	sess.UpdatedAt = time.Now()
+	sess.UpdatedAt = s.nextUpdatedAt()
 	if sess.CreatedAt.IsZero() {
 		sess.CreatedAt = sess.UpdatedAt
 	}
