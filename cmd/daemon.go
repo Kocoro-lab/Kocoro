@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -29,6 +30,8 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 	"github.com/Kocoro-lab/ShanClaw/internal/watcher"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	_ "modernc.org/sqlite"
 )
 
 var daemonCmd = &cobra.Command{
@@ -126,7 +129,70 @@ var daemonStartCmd = &cobra.Command{
 		}
 		hookRunner := hooks.NewHookRunner(cfg.Hooks)
 
-		sessionCache := daemon.NewSessionCache(shanDir)
+		// Open the mailbox SQLite database for per-route message queue
+		// persistence. Failure to open or migrate the schema is non-fatal —
+		// the daemon continues with mailbox persistence disabled so existing
+		// flows keep working; only the crash-recovery and ack-on-persist
+		// guarantees are lost in that degraded mode.
+		mailboxCap := viper.GetInt("daemon.mailbox_max_per_route")
+		if mailboxCap <= 0 {
+			mailboxCap = 100
+		}
+		mailboxDir := filepath.Join(shanDir, "sessions")
+		if err := os.MkdirAll(mailboxDir, 0o700); err != nil {
+			log.Printf("daemon: mkdir for mailbox: %v", err)
+		}
+		var sessionCache *daemon.SessionCache
+		var mailboxDB *sql.DB
+		mailboxDBPath := filepath.Join(mailboxDir, "mailbox.db")
+		if db, err := sql.Open("sqlite", mailboxDBPath); err != nil {
+			log.Printf("daemon: open mailbox db failed (%v); mailbox persistence DISABLED", err)
+			sessionCache = daemon.NewSessionCache(shanDir)
+		} else {
+			db.SetMaxOpenConns(1)
+			store, schemaErr := daemon.NewMailboxStore(db)
+			if schemaErr != nil {
+				log.Printf("daemon: mailbox schema failed (%v); mailbox persistence DISABLED", schemaErr)
+				db.Close()
+				sessionCache = daemon.NewSessionCache(shanDir)
+			} else {
+				mailboxDB = db
+				sessionCache = daemon.NewSessionCacheWithMailbox(shanDir, store, mailboxCap)
+				if pending, perr := store.LoadAllPending(); perr != nil {
+					log.Printf("daemon: mailbox recovery load failed: %v", perr)
+				} else {
+					recovered := 0
+					for routeKey, msgs := range pending {
+						loaded, dropped := sessionCache.SeedMailbox(routeKey, msgs)
+						recovered += loaded
+						if dropped > 0 {
+							log.Printf("daemon: mailbox recovery dropped %d msgs over cap on route %s", dropped, routeKey)
+						}
+					}
+					if recovered > 0 {
+						log.Printf("daemon: mailbox recovery seeded %d msg(s) across %d route(s); they drain on the next message for each route", recovered, len(pending))
+					}
+				}
+				// Daily purge of consumed rows older than 7 days.
+				go func(s *daemon.MailboxStore) {
+					tick := time.NewTicker(24 * time.Hour)
+					defer tick.Stop()
+					for range tick.C {
+						n, err := s.PurgeConsumedBefore(time.Now().Add(-7 * 24 * time.Hour))
+						if err != nil {
+							log.Printf("daemon: mailbox purge: %v", err)
+							continue
+						}
+						if n > 0 {
+							log.Printf("daemon: mailbox purge: %d row(s)", n)
+						}
+					}
+				}(store)
+			}
+		}
+		if mailboxDB != nil {
+			defer mailboxDB.Close()
+		}
 
 		wsEndpoint := strings.Replace(cfg.Endpoint, "https://", "wss://", 1)
 		wsEndpoint = strings.Replace(wsEndpoint, "http://", "ws://", 1)

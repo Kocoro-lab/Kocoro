@@ -1056,6 +1056,43 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			}
 			deps.SessionCache.UnlockRoute(req.RouteKey)
 		}()
+
+		// Drain any pending mailbox messages and prepend their text to the
+		// current prompt so the LLM sees the user's full intent in one user
+		// turn. This consumes both crash-recovery rows (seeded at daemon
+		// startup) and any HTTP/Desktop messages that piled up via the
+		// /queue endpoint while the route was idle.
+		//
+		// Known limitation (P0-4 relaxed): mailbox messages are MarkConsumed
+		// as soon as their text lands in the prompt string — they are NOT
+		// guaranteed to survive a daemon crash that happens between this
+		// point and session.Save. The trade-off bounds blast radius to
+		// "messages enqueued via /queue or recovery, then daemon crashes
+		// in the next ~10ms"; for Cloud-sourced messages the Cloud replay
+		// buffer is the primary durability layer regardless.
+		if pendingBatch := deps.SessionCache.DrainMailbox(req.RouteKey, 20); len(pendingBatch) > 0 {
+			pendingIDs := make([]string, 0, len(pendingBatch))
+			var b strings.Builder
+			for _, m := range pendingBatch {
+				if b.Len() > 0 {
+					b.WriteByte('\n')
+				}
+				b.WriteString(m.Text)
+				pendingIDs = append(pendingIDs, m.ID)
+			}
+			if b.Len() > 0 {
+				if prompt == "" {
+					prompt = b.String()
+				} else {
+					prompt = b.String() + "\n" + prompt
+				}
+				req.Text = prompt
+			}
+			log.Printf("daemon: drained %d mailbox msg(s) into prompt for route %q", len(pendingBatch), req.RouteKey)
+			if err := deps.SessionCache.MarkMailboxConsumed(pendingIDs); err != nil {
+				log.Printf("daemon: mailbox mark consumed (%v): %v", pendingIDs, err)
+			}
+		}
 	} else {
 		managerDir := sessionsDir
 		if req.BypassRouting {
