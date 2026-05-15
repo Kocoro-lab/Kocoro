@@ -37,9 +37,29 @@ type Event struct {
 
 const ringSize = 512
 
+// notifRingSize caps the dedicated notification history buffer. 500 covers
+// roughly a week of normal use (notify tool + approvals + alerts) at the
+// rates we see today; raise via Server-level override if it binds.
+const notifRingSize = 500
+
+// isNotificationType reports whether an event type should be retained in the
+// notification history buffer. These are the events that surface as macOS
+// banner notifications in Kocoro Desktop.
+func isNotificationType(t string) bool {
+	switch t {
+	case EventNotification, EventApprovalRequest, EventHeartbeatAlert, EventAgentError:
+		return true
+	}
+	return false
+}
+
 // EventBus is a simple pub/sub bus for daemon events.
 // It maintains a ring buffer of the last ringSize events so that
 // reconnecting clients can replay missed events via EventsSince.
+//
+// A second, smaller ring (notifRing) retains every notification-class event
+// regardless of delivery status, so /notifications can answer "what banners
+// did the user receive" even when no SSE subscriber was attached at emit time.
 type EventBus struct {
 	mu          sync.RWMutex
 	subscribers map[<-chan Event]chan Event
@@ -47,6 +67,47 @@ type EventBus struct {
 	ringLen     int    // number of valid events in ring (≤ ringSize)
 	ringHead    int    // next write position
 	nextID      uint64 // monotonically increasing event ID, starts at 1
+
+	notifRing    [notifRingSize]Event
+	notifLen     int
+	notifHead    int
+	notifPersist func(Event) // optional disk-append hook; nil = in-memory only
+}
+
+// SetNotifPersister installs a callback invoked under the bus lock for every
+// notification-class event. Used by the daemon to append the event to the
+// on-disk JSONL log so /notifications survives a restart. nil clears it.
+func (b *EventBus) SetNotifPersister(fn func(Event)) {
+	b.mu.Lock()
+	b.notifPersist = fn
+	b.mu.Unlock()
+}
+
+// RestoreNotifications seeds the notification ring with previously-persisted
+// events (typically loaded from disk at daemon startup) and advances nextID
+// past the highest restored ID so newly-emitted events keep monotonic IDs
+// across restarts — preserving the /notifications?since=<cursor> contract for
+// Desktop clients holding a cursor from before the restart.
+func (b *EventBus) RestoreNotifications(events []Event) {
+	if len(events) == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var maxID uint64
+	for _, e := range events {
+		if e.ID > maxID {
+			maxID = e.ID
+		}
+		b.notifRing[b.notifHead] = e
+		b.notifHead = (b.notifHead + 1) % notifRingSize
+		if b.notifLen < notifRingSize {
+			b.notifLen++
+		}
+	}
+	if maxID > b.nextID {
+		b.nextID = maxID
+	}
 }
 
 // NewEventBus creates a new EventBus.
@@ -109,7 +170,36 @@ func (b *EventBus) EmitTo(evt Event) int {
 		}
 	}
 
-	// Write to ring buffer only after delivery attempt. Transient
+	// Notification history ring: retain banner-class events so /notifications
+	// can serve them after the fact.
+	//
+	// EventNotification is special-cased to mirror the SSE replay rule below:
+	// when no subscriber received the event, the notify tool's caller
+	// (runner.go notify handler → tools/notify.go) falls back to osascript and
+	// the banner has ALREADY been shown by macOS at this point. Persisting it
+	// would let Desktop re-banner the same notification on its next launch.
+	// Other notification-class events (approval_request, heartbeat_alert,
+	// agent_error) have no osascript fallback path, so we always retain them.
+	if isNotificationType(evt.Type) {
+		retain := true
+		if evt.Type == EventNotification && delivered == 0 {
+			retain = false
+		}
+		if retain {
+			b.notifRing[b.notifHead] = evt
+			b.notifHead = (b.notifHead + 1) % notifRingSize
+			if b.notifLen < notifRingSize {
+				b.notifLen++
+			}
+			if b.notifPersist != nil {
+				// Called under b.mu; persister must be fast (file append).
+				// Single-instance daemon means no cross-process contention.
+				b.notifPersist(evt)
+			}
+		}
+	}
+
+	// Write to SSE replay ring only after delivery attempt. Transient
 	// notification-style events that were not delivered (delivered == 0) are
 	// excluded so reconnecting clients don't see stale banners for actions
 	// that already happened:
@@ -131,6 +221,37 @@ func (b *EventBus) EmitTo(evt Event) int {
 	}
 
 	return delivered
+}
+
+// Notifications returns notification-class events with ID > sinceID, oldest
+// first. If types is non-empty, only events whose Type is in the set are
+// returned. limit caps the result; 0 means no cap.
+func (b *EventBus) Notifications(sinceID uint64, types map[string]struct{}, limit int) []Event {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.notifLen == 0 {
+		return nil
+	}
+	out := make([]Event, 0, b.notifLen)
+	start := (b.notifHead - b.notifLen + notifRingSize) % notifRingSize
+	for i := 0; i < b.notifLen; i++ {
+		idx := (start + i) % notifRingSize
+		evt := b.notifRing[idx]
+		if evt.ID <= sinceID {
+			continue
+		}
+		if len(types) > 0 {
+			if _, ok := types[evt.Type]; !ok {
+				continue
+			}
+		}
+		out = append(out, evt)
+	}
+	if limit > 0 && len(out) > limit {
+		// Keep most recent when truncating.
+		out = out[len(out)-limit:]
+	}
+	return out
 }
 
 // SubscribeWithReplay atomically registers a subscriber and returns all
