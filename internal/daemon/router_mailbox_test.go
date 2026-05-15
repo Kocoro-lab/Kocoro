@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 	_ "modernc.org/sqlite"
 )
@@ -214,5 +215,65 @@ func TestMailboxRetractMissingReturnsFalse(t *testing.T) {
 	defer cleanup()
 	if sc.MailboxRetract("r1", "nope") {
 		t.Error("retract on missing id should return false")
+	}
+}
+
+func TestEnqueueMessage_AlsoNotifiesActiveRunInjectCh(t *testing.T) {
+	sc, _, cleanup := newCacheWithMailbox(t, 100)
+	defer cleanup()
+
+	// Simulate an active run by registering an injectCh on the route entry.
+	// This mirrors what runner.go does after LockRouteWithManager.
+	sc.mu.Lock()
+	entry := &routeEntry{injectCh: make(chan agent.InjectedMessage, 10)}
+	sc.routes["r1"] = entry
+	sc.mu.Unlock()
+
+	if outcome, _ := sc.EnqueueMessage("r1", newQMsg("a")); outcome != MailboxQueued {
+		t.Fatalf("enqueue: %s", outcome)
+	}
+
+	// The agent loop's mid-turn drain (loop.go ~line 2463) reads from
+	// injectCh non-blocking; we should see exactly one message ready.
+	select {
+	case got := <-entry.injectCh:
+		if got.Text != "msg a" {
+			t.Errorf("injectCh payload mismatch: %q", got.Text)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("EnqueueMessage did NOT write to injectCh — active run will not see the queued message")
+	}
+}
+
+func TestEnqueueMessage_NoActiveRunInjectChSilentlyOK(t *testing.T) {
+	sc, _, cleanup := newCacheWithMailbox(t, 100)
+	defer cleanup()
+
+	// No injectCh set up; EnqueueMessage must still succeed (mailbox is
+	// the durability backbone). The drain happens on the next RunAgent
+	// start via SeedMailbox + the existing runner.go drain block.
+	out, err := sc.EnqueueMessage("r1", newQMsg("a"))
+	if err != nil || out != MailboxQueued {
+		t.Fatalf("enqueue without active run: outcome=%s err=%v", out, err)
+	}
+}
+
+func TestEnqueueMessage_InjectChFullStillSucceeds(t *testing.T) {
+	sc, _, cleanup := newCacheWithMailbox(t, 100)
+	defer cleanup()
+
+	// Saturate injectCh (capacity 1) before EnqueueMessage runs.
+	saturated := make(chan agent.InjectedMessage, 1)
+	saturated <- agent.InjectedMessage{Text: "existing"}
+	sc.mu.Lock()
+	sc.routes["r1"] = &routeEntry{injectCh: saturated}
+	sc.mu.Unlock()
+
+	// Enqueue should still succeed (mailbox owns durability); the
+	// active run will pick this up from the mailbox on its next
+	// drain-from-store path.
+	out, err := sc.EnqueueMessage("r1", newQMsg("b"))
+	if err != nil || out != MailboxQueued {
+		t.Fatalf("saturated injectCh should not block enqueue: outcome=%s err=%v", out, err)
 	}
 }

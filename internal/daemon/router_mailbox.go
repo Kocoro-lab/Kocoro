@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 )
 
@@ -147,6 +148,27 @@ func (sc *SessionCache) EnqueueMessage(key string, msg agenttypes.QueuedMessage)
 			return MailboxQueueFull, nil
 		}
 		return MailboxPersistFailed, err
+	}
+
+	// (5) Also notify the active run (if any) via its injectCh so the
+	// running agent loop's existing mid-turn drain (loop.go drain block)
+	// consumes this message in the next iteration boundary — without
+	// having to wait for the next RunAgent invocation to drain mailbox
+	// from scratch. The mailbox row is the durability backbone; injectCh
+	// is the "live notify" so users see their queued message merged into
+	// the current turn rather than the next.
+	//
+	// Non-blocking: if injectCh is full or absent, the message stays in
+	// the mailbox and will be drained by the next RunAgent start.
+	sc.mu.Lock()
+	ch := entry.injectCh
+	sc.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- agent.InjectedMessage{Text: msg.Text, CWD: msg.CWD}:
+		default:
+			// injectCh saturated — fine, mailbox still owns durability.
+		}
 	}
 	return MailboxQueued, nil
 }
