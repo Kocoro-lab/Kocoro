@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/base64"
 	"fmt"
+	"image"
 	"log"
 	"os"
 	"os/exec"
@@ -101,14 +102,19 @@ func CompressInlineImageSource(src *client.ImageSource) *client.ImageSource {
 	if src == nil {
 		return src
 	}
-	// Fast path: under the inline cap, nothing to do.
-	if len(src.Data) <= client.MaxInlineImageBase64Bytes {
-		return src
-	}
 	// Pre-decode size guard: refuse to allocate ~37 MB for an obvious garbage
 	// payload. Log once so the abuse / bug is visible in audit-time triage.
 	if len(src.Data) > MaxInlineBase64InputBytes {
 		log.Printf("WARNING: CompressInlineImageSource: input base64 too large (%d bytes), skipping compression", len(src.Data))
+		return src
+	}
+	// Fast path: skip decode only when under the inline byte cap AND under
+	// the dimension cap. Wide PNG screenshots (e.g. 2588×690 Retina chrome)
+	// compress to a few hundred KB but still exceed Anthropic's many-image
+	// 2000px per-side limit, so a pure byte check lets them slip through to
+	// the wire. Streaming-decode the base64 reader through DecodeConfig
+	// (header-only) so we only pay decode cost for the few header bytes.
+	if len(src.Data) <= client.MaxInlineImageBase64Bytes && !inlineSourceOversizeDim(src.Data) {
 		return src
 	}
 	raw, err := base64.StdEncoding.DecodeString(src.Data)
@@ -126,6 +132,23 @@ func CompressInlineImageSource(src *client.ImageSource) *client.ImageSource {
 		MediaType: mt,
 		Data:      base64.StdEncoding.EncodeToString(compressed),
 	}
+}
+
+// inlineSourceOversizeDim returns true when the base64 payload's image header
+// reports either edge above CompressionMaxDimension. Streams the base64 bytes
+// through image.DecodeConfig, which reads only the header (PNG IHDR / WebP
+// VP8 / JPEG SOFn / GIF LSD) — typically tens of bytes — so the decode cost
+// stays bounded even for the 5 MB-base64 fast-path case. Returns false on
+// any decode error: a malformed payload is the byte-cap path's problem and
+// will surface at compressImage's image.Decode call. Image registrations
+// (png/gif/jpeg/webp) are inherited from imaging_compress.go.
+func inlineSourceOversizeDim(b64 string) bool {
+	reader := base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64))
+	cfg, _, err := image.DecodeConfig(reader)
+	if err != nil {
+		return false
+	}
+	return cfg.Width > CompressionMaxDimension || cfg.Height > CompressionMaxDimension
 }
 
 // ResizeImage resizes an image so its longest edge is at most maxDim pixels.
