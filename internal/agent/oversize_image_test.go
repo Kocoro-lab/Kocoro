@@ -330,3 +330,44 @@ func TestFilterOversizeImages_DimPass_NormalDimSurvives(t *testing.T) {
 		t.Fatalf("legitimate-dim image touched: type=%q", out[0].Type)
 	}
 }
+
+// TestFilterOversizeImages_DimPass_CrossMessage exercises the realistic
+// many-turn shape: oversize-dim images spread across several user
+// messages so totalImageCount has to walk all messages, not just one.
+// Without the cross-message walk, a session that accumulated 5
+// screenshots over 5 turns (25 total) would never trip Pass 0 because
+// no single message has > 20 images.
+func TestFilterOversizeImages_DimPass_CrossMessage(t *testing.T) {
+	var messages []client.Message
+	const turns, perTurn = 5, 5
+	for turn := 0; turn < turns; turn++ {
+		blocks := make([]client.ContentBlock, 0, perTurn)
+		// First image per turn is oversize-dim; others are small.
+		blocks = append(blocks, makeOversizeDimImageBlock(t, 2588, 690))
+		for i := 1; i < perTurn; i++ {
+			blocks = append(blocks, makeSmallImageBlock())
+		}
+		messages = append(messages, client.Message{
+			Role:    "user",
+			Content: client.NewBlockContent(blocks),
+		})
+	}
+	// Sanity: 5 turns × 5 images = 25 (> manyImageThreshold).
+	if got := totalImageCount(messages); got != turns*perTurn {
+		t.Fatalf("setup count mismatch: got %d, want %d", got, turns*perTurn)
+	}
+
+	filterOversizeImages(messages)
+
+	stripped := 0
+	for _, m := range messages {
+		for _, b := range m.Content.Blocks() {
+			if b.Type == "text" && strings.Contains(b.Text, "dimension exceeds") {
+				stripped++
+			}
+		}
+	}
+	if stripped != turns {
+		t.Fatalf("cross-message Pass 0 expected %d strips (one per turn), got %d", turns, stripped)
+	}
+}
