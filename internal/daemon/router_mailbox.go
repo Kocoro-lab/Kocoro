@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -301,4 +302,72 @@ func (sc *SessionCache) RouteKeyForSession(sessionID string) string {
 		}
 	}
 	return ""
+}
+
+// RegisterAdHocSessionRoute attaches a transient routeEntry under the key
+// "session:<sessionID>" so POST /queue and POST /cancel can locate the
+// running default-agent loop (ComputeRouteKey returns "" for the desktop
+// default-agent path, so the routed branch in runner.go never registers
+// these runs the normal way).
+//
+// The entry holds the run's cancel function, done channel, injectCh, and
+// activeCWD — exactly the fields handleEnqueueQueue and handleCancel need
+// — but does NOT participate in entry.mu locking or sessMgr ownership.
+// Those stay with the ephemeral sessMgr the runner created. Caller MUST
+// invoke UnregisterAdHocSessionRoute on the returned key in a defer to
+// avoid leaking dangling entries.
+//
+// Returns ("" , false) if a route already exists for this key — the
+// caller's run can't safely overwrite an in-flight one.
+func (sc *SessionCache) RegisterAdHocSessionRoute(
+	sessionID string,
+	cancel context.CancelFunc,
+	done chan struct{},
+	injectCh chan agent.InjectedMessage,
+	activeCWD string,
+) (string, bool) {
+	if sessionID == "" {
+		return "", false
+	}
+	key := "session:" + sanitizeRouteValue(sessionID)
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if existing, exists := sc.routes[key]; exists && existing != nil && existing.done != nil {
+		// Another run already claimed this session — refuse rather than
+		// stomping on the live entry's cancel handle.
+		return "", false
+	}
+	entry, exists := sc.routes[key]
+	if !exists || entry == nil {
+		entry = &routeEntry{lastAccess: time.Now()}
+		sc.routes[key] = entry
+	}
+	entry.cancel = cancel
+	entry.done = done
+	entry.injectCh = injectCh
+	entry.activeCWD = activeCWD
+	entry.lastAccess = time.Now()
+	entry.storeSessionID(sessionID)
+	return key, true
+}
+
+// UnregisterAdHocSessionRoute clears the run-state fields of the entry
+// matching key. The entry itself is left in the map as a reusable shell
+// (mailbox preservation, lastAccess for eviction policy). If the entry
+// has a non-empty mailbox, we leave injectCh nil so the next RunAgent
+// that picks it up via the routed branch can attach its own channels.
+func (sc *SessionCache) UnregisterAdHocSessionRoute(key string) {
+	if key == "" {
+		return
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	entry, ok := sc.routes[key]
+	if !ok || entry == nil {
+		return
+	}
+	entry.cancel = nil
+	entry.done = nil
+	entry.injectCh = nil
+	entry.activeCWD = ""
 }

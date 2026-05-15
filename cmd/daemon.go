@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -119,6 +120,20 @@ var daemonStartCmd = &cobra.Command{
 
 		gatewayOverlay := tools.ExtractGatewayTools(reg)
 		postOverlays := tools.ExtractPostOverlays(reg, baselineReg)
+
+		// Tee log output to ~/.shannon/logs/daemon.log so helper-spawned
+		// daemons (whose stdout is owned by the parent Desktop process)
+		// still leave a debuggable trail. The launchd plist already
+		// redirects stdout there, but Desktop's ShanClawBridge spawns the
+		// helper directly and consumes stdout itself — without this tee
+		// the entire run is invisible to anyone but Desktop.
+		if shanDir != "" {
+			logsDir := filepath.Join(shanDir, "logs")
+			_ = os.MkdirAll(logsDir, 0o700)
+			if lf, err := os.OpenFile(filepath.Join(logsDir, "daemon.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+				log.SetOutput(io.MultiWriter(os.Stderr, lf))
+			}
+		}
 
 		var auditor *audit.AuditLogger
 		if shanDir != "" {

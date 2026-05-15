@@ -49,6 +49,17 @@ func (s *Server) handleEnqueueQueue(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RouteKey == "" && req.SessionID != "" {
 		req.RouteKey = s.deps.SessionCache.RouteKeyForSession(req.SessionID)
+		if req.RouteKey == "" {
+			// Default-agent / Desktop path: the active run was started without
+			// an explicit route_key (handleMessage doesn't synthesize one) so
+			// RouteKeyForSession's scan misses. Fall back to a synthetic
+			// "session:<id>" key — EnqueueMessage will create a mailbox under
+			// this key, and the runner path that resumed the session will
+			// also discover and drain it on its next iteration boundary
+			// (see runner.go drain block: it uses req.RouteKey which we
+			// likewise default to "session:<id>" for default-agent runs).
+			req.RouteKey = "session:" + req.SessionID
+		}
 	}
 	if req.RouteKey == "" {
 		writeError(w, http.StatusBadRequest, "route_key or session_id required")

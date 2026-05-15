@@ -1194,6 +1194,50 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		route.storeSessionID(sess.ID)
 	}
 
+	// Ad-hoc route registration for default-agent / route-less runs.
+	//
+	// ComputeRouteKey returns "" for Desktop's default-agent path (source=
+	// "desktop" with no channel/agent), which sends those runs through the
+	// `route == nil` branch above without any SessionCache entry. That means
+	// a subsequent POST /queue with `session_id` cannot reach the running
+	// loop — `RouteKeyForSession` finds no match and EnqueueMessage can't
+	// write into an injectCh that was never registered.
+	//
+	// To make mid-turn injection work for the default-agent path we now
+	// register a transient entry under "session:<sess.ID>" once sessions
+	// have resolved. The entry carries this run's cancel func + done chan
+	// + injectCh + activeCWD so POST /queue, POST /cancel, and the existing
+	// mid-turn drain in agent loop all locate the active run via session_id.
+	//
+	// Note: only fires when `route == nil` AND sess.ID is non-empty — the
+	// routed branch above already set up its own injectCh/cancel for runs
+	// with a meaningful route_key (named agents, Slack threads, etc.).
+	var adHocRouteKey string
+	if route == nil && sess != nil && sess.ID != "" {
+		reqCtx, cancel := context.WithCancel(ctx)
+		ctx = reqCtx
+		routeDone = make(chan struct{})
+		routeInjectCh = make(chan agent.InjectedMessage, 10)
+		// activeCWD is unresolved at this point (effectiveCWD is computed
+		// further below). Register with "" — EnqueueMessage's CWD check
+		// is gated on activeCWD != "" so a missing value is permissive.
+		if key, ok := deps.SessionCache.RegisterAdHocSessionRoute(sess.ID, cancel, routeDone, routeInjectCh, ""); ok {
+			adHocRouteKey = key
+			log.Printf("daemon: ad-hoc route registered key=%s (default-agent run, session=%s)", adHocRouteKey, sess.ID)
+			defer func() {
+				deps.SessionCache.UnregisterAdHocSessionRoute(adHocRouteKey)
+				closeRouteDone(routeDone)
+			}()
+		} else {
+			cancel()
+			// Falling back to running without ad-hoc registration is safe —
+			// the loop still works, only mid-turn injection is unavailable.
+			routeDone = nil
+			routeInjectCh = nil
+			log.Printf("daemon: ad-hoc route NOT registered (session=%s already has an active run); mid-turn injection disabled", sess.ID)
+		}
+	}
+
 	// Clear any pending suggestion before this turn starts — the user is
 	// sending a new message, so any prior suggestion is stale. If the user
 	// had accepted via /suggestion/accept, that handler also clears (in T11.5);
