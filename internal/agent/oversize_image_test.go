@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/base64"
+	"image"
+	"image/png"
 	"strings"
 	"testing"
 
@@ -202,5 +205,128 @@ func TestFilterOversizeImages_AggregateCap_PartialToolResultDrop(t *testing.T) {
 		if nestedOut[i].Type != "image" {
 			t.Errorf("nested[%d] should be image (newer kept), got %s", i, nestedOut[i].Type)
 		}
+	}
+}
+
+// --- Pass 0 (dimension cap) tests ---
+
+// makeOversizeDimImageBlock returns an image block whose base64 payload
+// decodes to a >2000px image but stays well under the byte cap.
+// Uniform-gray PNG, ~few hundred bytes raw.
+func makeOversizeDimImageBlock(t *testing.T, w, h int) client.ContentBlock {
+	t.Helper()
+	return client.ContentBlock{
+		Type: "image",
+		Source: &client.ImageSource{
+			Type:      "base64",
+			MediaType: "image/png",
+			Data:      base64.StdEncoding.EncodeToString(makePixelBytes(t, w, h)),
+		},
+	}
+}
+
+// makePixelBytes is a thin shim over image/png so the test stays
+// portable. Uses uniform Gray so PNG zlib RLE keeps bytes small.
+func makePixelBytes(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewGray(image.Rect(0, 0, w, h))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestFilterOversizeImages_DimPass_ManyImages verifies that with > 20
+// images present, an oversize-dim block is replaced with the dimension
+// placeholder.
+func TestFilterOversizeImages_DimPass_ManyImages(t *testing.T) {
+	var blocks []client.ContentBlock
+	blocks = append(blocks, makeOversizeDimImageBlock(t, 2588, 690))
+	// Pad with 20 small images so total count is 21.
+	for i := 0; i < 20; i++ {
+		blocks = append(blocks, makeSmallImageBlock())
+	}
+	messages := []client.Message{
+		{Role: "user", Content: client.NewBlockContent(blocks)},
+	}
+	filterOversizeImages(messages)
+	out := messages[0].Content.Blocks()
+	if out[0].Type != "text" {
+		t.Fatalf("oversize-dim block not replaced; type=%q", out[0].Type)
+	}
+	if !strings.Contains(out[0].Text, "dimension exceeds") {
+		t.Fatalf("placeholder text mismatch: %q", out[0].Text)
+	}
+}
+
+// TestFilterOversizeImages_DimPass_FewImages verifies that with <= 20
+// images present, an oversize-dim block is left alone — Anthropic's
+// 2000-px rule does not apply to few-image requests.
+func TestFilterOversizeImages_DimPass_FewImages(t *testing.T) {
+	blocks := []client.ContentBlock{
+		makeOversizeDimImageBlock(t, 2588, 690),
+	}
+	// Pad up to exactly 20 — boundary case.
+	for i := 0; i < 19; i++ {
+		blocks = append(blocks, makeSmallImageBlock())
+	}
+	messages := []client.Message{
+		{Role: "user", Content: client.NewBlockContent(blocks)},
+	}
+	filterOversizeImages(messages)
+	out := messages[0].Content.Blocks()
+	if out[0].Type != "image" {
+		t.Fatalf("oversize-dim block touched at boundary count=20: type=%q", out[0].Type)
+	}
+}
+
+// TestFilterOversizeImages_DimPass_NestedToolResult covers the case
+// where the oversize-dim image is inside a tool_result block (typical
+// for file_read / screenshot output).
+func TestFilterOversizeImages_DimPass_NestedToolResult(t *testing.T) {
+	var blocks []client.ContentBlock
+	toolResult := client.ContentBlock{
+		Type: "tool_result",
+		ToolContent: []client.ContentBlock{
+			makeOversizeDimImageBlock(t, 2588, 690),
+		},
+	}
+	blocks = append(blocks, toolResult)
+	// Add 21 sibling images so total count > 20.
+	for i := 0; i < 21; i++ {
+		blocks = append(blocks, makeSmallImageBlock())
+	}
+	messages := []client.Message{
+		{Role: "user", Content: client.NewBlockContent(blocks)},
+	}
+	filterOversizeImages(messages)
+	out := messages[0].Content.Blocks()
+	nested, ok := out[0].ToolContent.([]client.ContentBlock)
+	if !ok {
+		t.Fatalf("tool_result shape lost")
+	}
+	if nested[0].Type != "text" {
+		t.Fatalf("nested oversize-dim image not replaced; type=%q", nested[0].Type)
+	}
+}
+
+// TestFilterOversizeImages_DimPass_NormalDimSurvives ensures a normal-
+// dimension image stays untouched even when image count > 20 (we don't
+// over-correct).
+func TestFilterOversizeImages_DimPass_NormalDimSurvives(t *testing.T) {
+	var blocks []client.ContentBlock
+	// 1500x1000 — well under 2000 cap.
+	blocks = append(blocks, makeOversizeDimImageBlock(t, 1500, 1000))
+	for i := 0; i < 25; i++ {
+		blocks = append(blocks, makeSmallImageBlock())
+	}
+	messages := []client.Message{
+		{Role: "user", Content: client.NewBlockContent(blocks)},
+	}
+	filterOversizeImages(messages)
+	out := messages[0].Content.Blocks()
+	if out[0].Type != "image" {
+		t.Fatalf("legitimate-dim image touched: type=%q", out[0].Type)
 	}
 }

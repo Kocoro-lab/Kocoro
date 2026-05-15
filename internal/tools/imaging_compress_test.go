@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"image"
 	"image/color"
+	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"strings"
@@ -254,16 +255,12 @@ func TestCompressImage_OversizeDimSmallBytes_GetsResized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compressImage: %v", err)
 	}
-	// Output must respect 2000px cap.
-	var out image.Image
-	switch mt {
-	case "image/jpeg":
-		out, err = jpeg.Decode(bytes.NewReader(data))
-	case "image/png":
-		out, err = png.Decode(bytes.NewReader(data))
-	default:
-		t.Fatalf("unexpected output media type %q", mt)
+	// Production path: compressImage always re-encodes as JPEG when it
+	// touches the slow path (downscaleToFit → encodeJPEG). Pin it.
+	if mt != "image/jpeg" {
+		t.Fatalf("oversize-dim path must return image/jpeg, got %q", mt)
 	}
+	out, err := jpeg.Decode(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("decode output: %v", err)
 	}
@@ -380,20 +377,127 @@ func TestCompressInlineImageSource_OversizeDimSmallBytes_GetsResized(t *testing.
 	if err != nil {
 		t.Fatalf("decode b64 output: %v", err)
 	}
-	var decoded image.Image
-	switch out.MediaType {
-	case "image/jpeg":
-		decoded, err = jpeg.Decode(bytes.NewReader(raw))
-	case "image/png":
-		decoded, err = png.Decode(bytes.NewReader(raw))
-	default:
-		t.Fatalf("unexpected output media type %q", out.MediaType)
+	if out.MediaType != "image/jpeg" {
+		t.Fatalf("oversize-dim inline path must produce image/jpeg, got %q", out.MediaType)
 	}
+	decoded, err := jpeg.Decode(bytes.NewReader(raw))
 	if err != nil {
-		t.Fatalf("decode output: %v", err)
+		t.Fatalf("decode JPEG: %v", err)
 	}
 	if decoded.Bounds().Dx() > CompressionMaxDimension || decoded.Bounds().Dy() > CompressionMaxDimension {
 		t.Fatalf("inline source not resized under %dpx: got %dx%d",
 			CompressionMaxDimension, decoded.Bounds().Dx(), decoded.Bounds().Dy())
 	}
 }
+
+// makeOversizeGIF builds a wide single-frame GIF that exceeds
+// CompressionMaxDimension on one edge but stays small in bytes — the LZW
+// encoder packs uniform-palette pixels very tightly. Used to lock in the
+// contract that GIF headers (Logical Screen Descriptor) parse correctly
+// through inlineSourceOversizeDim and that compressImage forces re-encode
+// on the oversize-dim path for GIF input.
+func makeOversizeGIF(t *testing.T) []byte {
+	t.Helper()
+	pal := []color.Color{color.RGBA{0, 0, 0, 255}, color.RGBA{255, 255, 255, 255}}
+	img := image.NewPaletted(image.Rect(0, 0, 2100, 50), pal)
+	var buf bytes.Buffer
+	if err := gif.Encode(&buf, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestInlineSourceOversizeDim_FormatMatrix locks in the multi-format
+// contract documented on inlineSourceOversizeDim: PNG / GIF / WebP all
+// route through image.DecodeConfig via the package-level decoder
+// registrations (image/png, image/gif, golang.org/x/image/webp). A
+// future Go upgrade or vendored-dep refresh that drops one of those
+// registrations would otherwise silently regress to "always returns
+// false" → oversize-dim images leak through to the wire.
+//
+// WebP fixtures are pre-computed because Go's standard library + the
+// x/image WebP package are decode-only. Both were produced by `cwebp
+// -lossless` against a uniform-gray PNG of the stated dimensions, so
+// the entire payload is under 60 bytes — safe to inline.
+func TestInlineSourceOversizeDim_FormatMatrix(t *testing.T) {
+	cases := []struct {
+		name      string
+		makeRaw   func(t *testing.T) []byte
+		wantTrip  bool
+		mediaHint string
+	}{
+		{
+			name:      "png_2588x690_trip",
+			makeRaw:   func(t *testing.T) []byte { return makeOversizeGrayPNG(t, 2588, 690) },
+			wantTrip:  true,
+			mediaHint: "image/png",
+		},
+		{
+			name:      "png_1500x1000_quiet",
+			makeRaw:   func(t *testing.T) []byte { return makeOversizeGrayPNG(t, 1500, 1000) },
+			wantTrip:  false,
+			mediaHint: "image/png",
+		},
+		{
+			name:      "gif_2100x50_trip",
+			makeRaw:   makeOversizeGIF,
+			wantTrip:  true,
+			mediaHint: "image/gif",
+		},
+		{
+			name: "webp_2001x100_trip",
+			makeRaw: func(t *testing.T) []byte {
+				raw, err := base64.StdEncoding.DecodeString(webpFixture2001x100)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return raw
+			},
+			wantTrip:  true,
+			mediaHint: "image/webp",
+		},
+		{
+			name: "webp_200x100_quiet",
+			makeRaw: func(t *testing.T) []byte {
+				raw, err := base64.StdEncoding.DecodeString(webpFixture200x100)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return raw
+			},
+			wantTrip:  false,
+			mediaHint: "image/webp",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw := c.makeRaw(t)
+			b64 := base64.StdEncoding.EncodeToString(raw)
+			got := inlineSourceOversizeDim(b64)
+			if got != c.wantTrip {
+				t.Fatalf("%s: inlineSourceOversizeDim returned %v, want %v", c.name, got, c.wantTrip)
+			}
+		})
+	}
+}
+
+// makeOversizeGrayPNG returns a uniform-gray PNG of given dimensions —
+// small bytes thanks to PNG zlib RLE.
+func makeOversizeGrayPNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewGray(image.Rect(0, 0, w, h))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// webpFixture* are minimal lossless WebP files generated by
+// `cwebp -lossless` against a uniform-gray PNG of the named dimensions.
+// Encoded fully here so the tests have no external dependency. Verified
+// by image.DecodeConfig returning the documented dimensions.
+const (
+	webpFixture2001x100 = "UklGRiwAAABXRUJQVlA4TCAAAAAv0McYAAcQEf0PKGjbhil/+N1xRP8z/Oc///nPf/4XAg=="
+	webpFixture200x100  = "UklGRiAAAABXRUJQVlA4TBQAAAAvx8AYAAcQEf0PACjS//8S0f9UOA=="
+)
