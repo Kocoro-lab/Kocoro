@@ -110,6 +110,48 @@ func TestIsCommandConcurrencySafe(t *testing.T) {
 
 		// Unsafe — `env VAR=val cmd` runs a child command.
 		{"env with assignment", "env FOO=bar ls", false},
+
+		// B1 — git diff/log/show/blame must reject --output (writes a file)
+		// and --ext-diff (invokes external command).
+		{"git diff --output equals", "git diff --output=/tmp/x HEAD~1", false},
+		{"git diff --output space", "git diff --output /tmp/x HEAD~1", false},
+		{"git log --output", "git log --output=/tmp/x", false},
+		{"git show --output", "git show --output=/tmp/x HEAD", false},
+		{"git blame --output", "git blame --output=/tmp/x file.go", false},
+		{"git diff --ext-diff", "git diff --ext-diff", false},
+
+		// B2 — `tail -f` / --follow / -F blocks indefinitely (slot DoS).
+		{"tail -f", "tail -f /var/log/syslog", false},
+		{"tail --follow", "tail --follow file.log", false},
+		{"tail -F", "tail -F file.log", false},
+		{"tail -n", "tail -n 50 file.log", true},
+		{"tail bare", "tail file.log", true},
+
+		// B3 — reads from /dev/random, /dev/urandom, /dev/zero, /dev/tty*
+		// block or stream forever.
+		{"cat /dev/random", "cat /dev/random", false},
+		{"cat /dev/urandom", "cat /dev/urandom", false},
+		{"cat /dev/zero", "cat /dev/zero", false},
+		{"cat /dev/tty", "cat /dev/tty", false},
+		{"head /dev/urandom", "head /dev/urandom", false},
+		{"cat /tmp/file", "cat /tmp/file", true},
+
+		// B4 — `git config --get-urlmatch` and `--get-color` are read-only.
+		{"git config --get-urlmatch", "git config --get-urlmatch http.https://example.com user", true},
+		{"git config --get-color", "git config --get-color color.diff.new", true},
+
+		// B5 — git accepts global options before the subcommand. Recall safe
+		// subcommands when prefixed with -C/-c/-P/--no-pager/--git-dir/etc.
+		{"git -C path status", "git -C /tmp status", true},
+		{"git -C path log", "git -C /tmp log --oneline -5", true},
+		{"git --no-pager log", "git --no-pager log", true},
+		{"git -P log", "git -P log", true},
+		{"git -c user.name=x log", "git -c user.name=x log", true},
+		{"git --git-dir path status", "git --git-dir /tmp/.git status", true},
+		{"git --git-dir=path status", "git --git-dir=/tmp/.git status", true},
+		// Global options must NOT widen scope to unsafe subcommands.
+		{"git -C path commit", "git -C /tmp commit -m msg", false},
+		{"git -C path push", "git -C /tmp push", false},
 	}
 
 	for _, tc := range cases {

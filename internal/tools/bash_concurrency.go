@@ -29,12 +29,12 @@ var shellMetacharacters = []string{
 var readOnlyCommandWhitelist = map[string]func(args []string) bool{
 	"ls":       nil,
 	"pwd":      nil,
-	"cat":      nil,
-	"head":     nil,
-	"tail":     nil,
-	"wc":       nil,
-	"stat":     nil,
-	"file":     nil,
+	"cat":      noBlockingDevicePath,    // reading /dev/random etc. blocks/streams forever.
+	"head":     noBlockingDevicePath,    // same.
+	"tail":     tailArgsSafe,            // rejects -f/-F/--follow plus blocking device paths.
+	"wc":       noBlockingDevicePath,    // same — wc would never return on /dev/urandom.
+	"stat":     noBlockingDevicePath,    // stat on /dev/tty would block on input.
+	"file":     noBlockingDevicePath,    // same.
 	"which":    nil,
 	"type":     nil,
 	"echo":     nil,
@@ -98,17 +98,91 @@ var gitUnconditionallyReadOnlySubcommands = map[string]bool{
 	"ls-tree":   true,
 }
 
+// gitWriteCapableArgs lists subcommands whose argv can specify a file write or
+// external command invocation via --output / --ext-diff. We disqualify any
+// argv containing these flags before letting the subcommand fall through to
+// the read-only whitelist.
+var gitWriteCapableArgs = map[string]bool{
+	"log":   true,
+	"diff":  true,
+	"show":  true,
+	"blame": true,
+}
+
+// argsContainOutputOrExtDiff scans for `--output[=value]` (writes a file) or
+// `--ext-diff` (invokes external command), both of which break read-only
+// concurrency-safety even on otherwise-safe git subcommands.
+func argsContainOutputOrExtDiff(args []string) bool {
+	for _, a := range args {
+		if a == "--output" || strings.HasPrefix(a, "--output=") {
+			return true
+		}
+		if a == "--ext-diff" {
+			return true
+		}
+	}
+	return false
+}
+
+// skipGitGlobalOptions consumes leading global git options (`-C path`,
+// `-c key=value`, `-P`, `--no-pager`, `--git-dir`, `--work-tree`,
+// `--exec-path`, etc.) and returns the remaining args starting at the
+// subcommand. Returns nil if the args are malformed (option consumes a
+// value but none follows). Recall is conservative: we only consume options
+// known to be safe — anything unrecognized stays in place so the existing
+// switch falls through to `false`.
+func skipGitGlobalOptions(args []string) []string {
+	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		a := args[0]
+		switch {
+		case a == "-P", a == "--no-pager", a == "--literal-pathspecs",
+			a == "--no-replace-objects", a == "--bare":
+			args = args[1:]
+		case a == "-C", a == "--git-dir", a == "--work-tree", a == "--exec-path":
+			// Two-token form: option + value. Bail if value missing.
+			if len(args) < 2 {
+				return nil
+			}
+			args = args[2:]
+		case a == "-c":
+			// `-c key=value` — value is the next token.
+			if len(args) < 2 {
+				return nil
+			}
+			args = args[2:]
+		case strings.HasPrefix(a, "--git-dir="),
+			strings.HasPrefix(a, "--work-tree="),
+			strings.HasPrefix(a, "--exec-path="):
+			args = args[1:]
+		default:
+			// Unknown global option — stop consuming. Caller's switch will
+			// fall through to the read-only whitelist (which returns false).
+			return args
+		}
+	}
+	return args
+}
+
 func gitSubcommandSafe(args []string) bool {
+	args = skipGitGlobalOptions(args)
 	if len(args) == 0 {
 		return false
 	}
 	sub := args[0]
 	rest := args[1:]
+	// Block --output / --ext-diff on the write-capable read subcommands BEFORE
+	// any other recognition — these flags turn an otherwise-read-only invocation
+	// into a write or external-command call.
+	if gitWriteCapableArgs[sub] && argsContainOutputOrExtDiff(rest) {
+		return false
+	}
 	switch sub {
 	case "config":
-		// Only --get / --get-all / --get-regexp / --list / -l are read-only.
+		// Only --get / --get-all / --get-regexp / --get-urlmatch / --get-color /
+		// --list / -l are read-only.
 		for _, a := range rest {
-			if a == "--get" || a == "--list" || a == "--get-all" || a == "--get-regexp" || a == "-l" {
+			if a == "--get" || a == "--list" || a == "--get-all" || a == "--get-regexp" ||
+				a == "--get-urlmatch" || a == "--get-color" || a == "-l" {
 				return true
 			}
 		}
@@ -214,4 +288,45 @@ func hostnameArgsSafe(args []string) bool {
 		}
 	}
 	return true
+}
+
+// containsBlockingDevicePath reports whether any positional arg names a
+// system pseudo-device that either blocks forever (/dev/random when entropy
+// is depleted, /dev/tty waiting on a terminal) or streams forever
+// (/dev/urandom, /dev/zero). Reading those would hold a concurrent slot for
+// the entire turn timeout. We intentionally do not try to detect FIFOs in
+// /tmp because that is a runtime filesystem property, not a static one.
+func containsBlockingDevicePath(args []string) bool {
+	for _, a := range args {
+		// Skip flag-shaped args; only positionals are file paths here.
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		switch a {
+		case "/dev/random", "/dev/urandom", "/dev/zero":
+			return true
+		}
+		if strings.HasPrefix(a, "/dev/tty") {
+			return true
+		}
+	}
+	return false
+}
+
+// noBlockingDevicePath wraps containsBlockingDevicePath as a whitelist
+// predicate: safe iff no positional arg is a blocking pseudo-device.
+func noBlockingDevicePath(args []string) bool {
+	return !containsBlockingDevicePath(args)
+}
+
+// tailArgsSafe rejects follow-mode (`-f`, `-F`, `--follow[=...]`) which would
+// pin a concurrency slot indefinitely, then also rejects reads from blocking
+// pseudo-devices via noBlockingDevicePath.
+func tailArgsSafe(args []string) bool {
+	for _, a := range args {
+		if a == "-f" || a == "-F" || a == "--follow" || strings.HasPrefix(a, "--follow=") {
+			return false
+		}
+	}
+	return noBlockingDevicePath(args)
 }
