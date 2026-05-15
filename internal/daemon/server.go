@@ -346,6 +346,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /sessions/{id}", s.handlePatchSession)
 	mux.HandleFunc("POST /sessions/{id}/edit", s.handleEditMessage)
 	mux.HandleFunc("POST /sessions/{id}/reset", s.handleResetSession)
+	mux.HandleFunc("POST /sessions/{id}/rewind", s.handleRewind)
 	mux.HandleFunc("GET /sessions/{id}/summary", s.handleSessionSummary)
 	mux.HandleFunc("POST /sessions/{id}/share", s.handleSessionShare)
 	mux.HandleFunc("DELETE /sessions/{id}/share", s.handleSessionShareRetract)
