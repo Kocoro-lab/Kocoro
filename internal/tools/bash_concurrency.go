@@ -29,18 +29,18 @@ var shellMetacharacters = []string{
 var readOnlyCommandWhitelist = map[string]func(args []string) bool{
 	"ls":       nil,
 	"pwd":      nil,
-	"cat":      noBlockingDevicePath,    // reading /dev/random etc. blocks/streams forever.
-	"head":     noBlockingDevicePath,    // same.
-	"tail":     tailArgsSafe,            // rejects -f/-F/--follow plus blocking device paths.
-	"wc":       noBlockingDevicePath,    // same — wc would never return on /dev/urandom.
-	"stat":     noBlockingDevicePath,    // stat on /dev/tty would block on input.
-	"file":     noBlockingDevicePath,    // same.
+	"cat":      noBlockingDevicePath, // reading /dev/random etc. blocks/streams forever.
+	"head":     noBlockingDevicePath, // same.
+	"tail":     tailArgsSafe,         // rejects -f/-F/--follow plus blocking device paths.
+	"wc":       noBlockingDevicePath, // same — wc would never return on /dev/urandom.
+	"stat":     noBlockingDevicePath, // stat on /dev/tty would block on input.
+	"file":     noBlockingDevicePath, // same.
 	"which":    nil,
 	"type":     nil,
 	"echo":     nil,
 	"printenv": nil,
-	"env":      envArgsSafe,      // bare `env` is read-only, `env X=1 cmd` isn't.
-	"date":     dateArgsSafe,     // formatting only, never a clock-set form.
+	"env":      envArgsSafe,  // bare `env` is read-only, `env X=1 cmd` isn't.
+	"date":     dateArgsSafe, // formatting only, never a clock-set form.
 	"whoami":   nil,
 	"id":       nil,
 	"hostname": hostnameArgsSafe, // bare or read flags only.

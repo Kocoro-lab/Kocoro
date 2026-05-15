@@ -344,17 +344,17 @@ func TestFileWrite_MixedValidAndInvalid(t *testing.T) {
 // extends with mutation-based exploration.
 func FuzzFileWrite_RawJSON(f *testing.F) {
 	seeds := []string{
-		`{"path":"a.txt"}`,                            // missing content (incident shape)
-		`{"path":"a.txt","content":""}`,               // explicit empty
-		`{"path":"a.txt","content":null}`,             // null
-		`{"path":"a.txt","content":" "}`,              // single space (allowed)
-		`{"path":"a.txt","content":"hello"}`,          // happy path
-		`{"path":"","content":"x"}`,                   // empty path
-		``,                                            // empty input
-		`{}`,                                          // empty object
-		`[]`,                                          // wrong root type
-		`{"path":"a.txt","content":123}`,              // wrong type for content
-		`{"path":"a.txt","content":["a","b"]}`,        // array content
+		`{"path":"a.txt"}`,                     // missing content (incident shape)
+		`{"path":"a.txt","content":""}`,        // explicit empty
+		`{"path":"a.txt","content":null}`,      // null
+		`{"path":"a.txt","content":" "}`,       // single space (allowed)
+		`{"path":"a.txt","content":"hello"}`,   // happy path
+		`{"path":"","content":"x"}`,            // empty path
+		``,                                     // empty input
+		`{}`,                                   // empty object
+		`[]`,                                   // wrong root type
+		`{"path":"a.txt","content":123}`,       // wrong type for content
+		`{"path":"a.txt","content":["a","b"]}`, // array content
 		`{"path":"a.txt","content":{"nested":"yes"}}`, // object content
 		`{"path":null,"content":"x"}`,                 // null path
 		`not json at all`,                             // total garbage
