@@ -83,11 +83,12 @@ type AgentConfig struct {
 	IdleHardTimeoutSecs int   `mapstructure:"idle_hard_timeout_secs" yaml:"idle_hard_timeout_secs" json:"idle_hard_timeout_secs"`
 	SkillDiscovery      *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
 
-	// BashConcurrencyEnabled gates BashTool.IsConcurrencySafeCall. When false
-	// (the default), bash always runs as a size-1 sequential batch — matching
-	// behavior before the concurrency-alignment work. Flip to true only after
-	// Desktop clients ship the tool_use_id-aware UI; otherwise concurrent bash
-	// running/completed events may render on the wrong tool cards.
+	// BashConcurrencyEnabled gates BashTool.IsConcurrencySafeCall. When true
+	// (the Phase C default since 2026-05-15), bash invocations that pass the
+	// static read-only analyzer (internal/tools/bash_concurrency.go) can share
+	// a concurrent batch with other tools. Set to false to force the pre-Phase-A
+	// serial-only behavior (e.g. for a project that surfaces UI client without
+	// tool_use_id-aware pairing).
 	BashConcurrencyEnabled bool `mapstructure:"bash_concurrency_enabled" yaml:"bash_concurrency_enabled" json:"bash_concurrency_enabled"`
 
 	// TimeBasedCompact controls time-gated tool_result clearing. Disabled

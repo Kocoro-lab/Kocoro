@@ -43,8 +43,10 @@ type BashTool struct {
 	// fetched lazily at execution time and scoped to bash child processes
 	// only — they never enter prompt context or session transcripts.
 	SecretsStore *skills.SecretsStore
-	// ConcurrencyEnabled gates IsConcurrencySafeCall — when false (the
-	// default in Phase A) the method always returns false so the agent
+	// ConcurrencyEnabled gates IsConcurrencySafeCall — when true (the
+	// Phase C default since 2026-05-15) bash invocations that pass the
+	// static read-only analyzer can share a concurrent batch with other
+	// tools. When false, the method always returns false so the agent
 	// loop's partition dispatcher keeps bash on its historical size-1
 	// serial path. Wired from config.AgentConfig.BashConcurrencyEnabled
 	// by register.go (RegisterLocalTools + CloneWithRuntimeConfig).
@@ -299,9 +301,9 @@ func (t *BashTool) IsReadOnlyCall(string) bool { return false }
 
 // IsConcurrencySafeCall reports whether this specific bash invocation is safe
 // to run concurrently with other tool calls. Gated by ConcurrencyEnabled —
-// when off (the Phase A default), returns false unconditionally so the
-// dispatcher matches pre-feature serial behavior. When on, delegates to the
-// pure analyzer IsCommandConcurrencySafe.
+// when on (the Phase C default since 2026-05-15), delegates to the pure
+// analyzer IsCommandConcurrencySafe. When off, returns false unconditionally
+// so the dispatcher matches pre-Phase-A serial behavior.
 //
 // Parse failures and unknown JSON shapes default to false (fail-closed).
 func (t *BashTool) IsConcurrencySafeCall(argsStr string) bool {
