@@ -156,6 +156,10 @@ Response shape:
 
 If no events match, `notifications` is `[]` and `next_cursor` echoes the `since` value (or `0`).
 
+**Cursor caveat:** the `next_cursor` advances past all events seen during the call, regardless of the `types` filter. If a client paginates with `types=notification` and later widens to `types=notification,approval_request`, any `approval_request` events with ID ≤ the prior cursor are skipped. Clients that change the `types` filter mid-session should rewind the cursor to `0`.
+
+**Malformed query params** (e.g. `since=abc`, `limit=-1`) silently fall back to defaults — the endpoint never returns 400. This is intentional: a stale Desktop client should degrade to "show latest 500" rather than fail closed and hide all history.
+
 ## Backward compatibility
 
 - `args` / `is_error` / `preview` on `tool_status` are **additive** — older subscribers that ignore unknown fields keep working.

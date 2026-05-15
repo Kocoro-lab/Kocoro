@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -122,7 +123,7 @@ func TestNotifStoreCompactionOnLoad(t *testing.T) {
 		// json.Marshal preserves field order from struct definition; build by
 		// hand to keep the test independent of encoding/json output shape.
 		sb.WriteString(`{"id":`)
-		sb.WriteString(itoa(i))
+		sb.WriteString(strconv.Itoa(i))
 		sb.WriteString(`,"type":"notification","payload":{}}`)
 		sb.WriteByte('\n')
 	}
@@ -186,6 +187,37 @@ func TestNotifStoreOversizeLineSkipped(t *testing.T) {
 	}
 }
 
+// Counter-based assertion: the persister hook itself must not fire for an
+// undelivered EventNotification. Earlier tests check the on-disk file
+// content, but a future refactor could conceivably break the in-memory
+// branch while accidentally keeping the disk side passing via some other
+// path — this test pins the contract at the hook boundary.
+func TestEventBusUndeliveredNotificationDoesNotCallPersister(t *testing.T) {
+	bus := NewEventBus()
+	var persistCalls int
+	var persistedTypes []string
+	bus.SetNotifPersister(func(evt Event) {
+		persistCalls++
+		persistedTypes = append(persistedTypes, evt.Type)
+	})
+	// No subscribers attached.
+
+	bus.EmitTo(Event{Type: EventNotification, Payload: json.RawMessage(`{}`)})
+	bus.EmitTo(Event{Type: EventApprovalRequest, Payload: json.RawMessage(`{}`)})
+	bus.EmitTo(Event{Type: EventHeartbeatAlert, Payload: json.RawMessage(`{}`)})
+	bus.EmitTo(Event{Type: EventAgentError, Payload: json.RawMessage(`{}`)})
+
+	if persistCalls != 3 {
+		t.Fatalf("expected 3 persister calls (EventNotification skipped), got %d (types=%v)",
+			persistCalls, persistedTypes)
+	}
+	for _, tt := range persistedTypes {
+		if tt == EventNotification {
+			t.Fatalf("undelivered EventNotification reached persister hook: types=%v", persistedTypes)
+		}
+	}
+}
+
 // EventNotification with zero subscribers fires the osascript fallback in
 // the notify tool, so persisting it would let Desktop re-banner the same
 // notification on next launch. The notifRing must stay empty in this case
@@ -227,6 +259,37 @@ func TestEventBusUndeliveredNotificationNotPersisted(t *testing.T) {
 	}
 }
 
+// After notifCompactEvery successful appends, the on-disk log must be
+// compacted in place so a long-lived daemon can't accrue unbounded growth.
+func TestNotifStoreOpportunisticCompaction(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, notifFileName)
+
+	store, _, err := newNotifStore(dir)
+	if err != nil {
+		t.Fatalf("newNotifStore: %v", err)
+	}
+
+	// Drive exactly notifCompactEvery appends; the final Append should fire
+	// compaction, trimming the file back to notifRingSize lines.
+	for i := 1; i <= notifCompactEvery; i++ {
+		store.Append(Event{
+			ID:      uint64(i),
+			Type:    EventNotification,
+			Payload: json.RawMessage(`{}`),
+		})
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	lines := strings.Count(strings.TrimRight(string(data), "\n"), "\n") + 1
+	if lines != notifRingSize {
+		t.Fatalf("expected file compacted to %d lines, got %d", notifRingSize, lines)
+	}
+}
+
 // Even when load returns an error (e.g. compaction rewrite failed because the
 // directory became read-only mid-trim), NewServer must still restore the
 // events that were successfully parsed AND keep writing new ones. The
@@ -240,7 +303,7 @@ func TestNotifStoreReturnsPartialEventsOnRewriteFailure(t *testing.T) {
 	var sb strings.Builder
 	total := notifRingSize + 10
 	for i := 1; i <= total; i++ {
-		sb.WriteString(`{"id":` + itoa(i) + `,"type":"notification","payload":{}}` + "\n")
+		sb.WriteString(`{"id":` + strconv.Itoa(i) + `,"type":"notification","payload":{}}` + "\n")
 	}
 	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -267,18 +330,3 @@ func TestNotifStoreReturnsPartialEventsOnRewriteFailure(t *testing.T) {
 	}
 }
 
-// Minimal int → ASCII helper to avoid pulling strconv into the test seed
-// generator. Local to the test file.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
-}

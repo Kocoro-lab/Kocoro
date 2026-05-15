@@ -19,10 +19,17 @@ const notifFileName = "notifications.jsonl"
 // notifStore is the single-writer file appender for notification-class events.
 // The daemon is single-instance (pidfile flock in cmd/daemon.go), so we only
 // need an in-process mutex to serialize writes against compaction.
+// notifCompactEvery triggers an opportunistic compaction every N appends. Set
+// to 4× the ring capacity so the on-disk log oscillates between roughly N and
+// 2N lines — a comfortable margin over the in-memory cap without compacting
+// on every emit. Tunable if compaction cost ever shows up in profiles.
+const notifCompactEvery = 4 * notifRingSize
+
 type notifStore struct {
-	path    string
-	mu      sync.Mutex
-	errOnce sync.Once // fires the first I/O failure to logs, then stays silent
+	path        string
+	mu          sync.Mutex
+	errOnce     sync.Once // fires the first I/O failure to logs, then stays silent
+	appendCount int       // since-startup append counter; drives opportunistic compaction
 }
 
 // newNotifStore opens (or initialises) the on-disk history file and returns
@@ -100,9 +107,13 @@ func loadAndCompactNotifications(path string, keep int) ([]Event, error) {
 // trailing data was read.
 //
 // maxLineSize bounds the per-line memory footprint we'll commit to a single
-// payload. 4 MB matches publish_to_web's practical args ceiling; raising it
-// is cheap if some future tool needs more.
-const maxLineSize = 4 * 1024 * 1024
+// payload. 256 KB is comfortably above realistic notification payloads:
+// approval-card args are redacted + truncated upstream (bus_handler /
+// cmd/daemon.go), notify-tool messages are short, heartbeat alerts and
+// agent_error messages are kilobytes. Capping here also bounds the
+// worst-case on-disk file size between compactions
+// (notifRingSize × maxLineSize ≈ 125 MB).
+const maxLineSize = 256 * 1024
 
 func readJSONLLine(br *bufio.Reader) ([]byte, error) {
 	var buf bytes.Buffer
@@ -163,8 +174,11 @@ func rewriteNotifications(path string, events []Event) error {
 		if err != nil {
 			continue
 		}
-		w.Write(b)
-		w.WriteByte('\n')
+		// Per-call Write errors are surfaced by Flush below; ignored here
+		// to keep the loop simple. The atomic rename target stays untouched
+		// if any later step fails.
+		_, _ = w.Write(b)
+		_ = w.WriteByte('\n')
 	}
 	if err := w.Flush(); err != nil {
 		f.Close()
@@ -175,6 +189,11 @@ func rewriteNotifications(path string, events []Event) error {
 		os.Remove(tmp)
 		return err
 	}
+	// No fsync before rename: notification history is best-effort. On power
+	// loss the file may appear with pre-rename content; clients re-establish
+	// state from the live event stream on reconnect. Stronger durability
+	// would mean adding f.Sync() + directory fsync on the parent dir, which
+	// is overkill for banner replay.
 	return os.Rename(tmp, path)
 }
 
@@ -183,6 +202,10 @@ func rewriteNotifications(path string, events []Event) error {
 // daemon lifetime is logged so a systemic problem (read-only mount, ENOSPC,
 // chmod gone wrong) doesn't go entirely silent. Subsequent failures stay
 // quiet to avoid log spam.
+//
+// Every notifCompactEvery successful appends, the log is compacted in place:
+// load → trim to notifRingSize → atomic rewrite. Bounds disk growth between
+// daemon restarts so a long-lived process can't accrue an unbounded log.
 func (s *notifStore) Append(evt Event) {
 	if s == nil || s.path == "" {
 		return
@@ -194,18 +217,34 @@ func (s *notifStore) Append(evt Event) {
 		s.reportErr("open", err)
 		return
 	}
-	defer f.Close()
 	b, err := json.Marshal(evt)
 	if err != nil {
+		f.Close()
 		s.reportErr("marshal", err)
 		return
 	}
-	if _, err := f.Write(b); err != nil {
+	// Single Write so a crash mid-call can't torn-write the JSON and newline
+	// independently — readJSONLLine's corrupt-line skip already handles a
+	// torn JSON object, but a record with no trailing '\n' followed by the
+	// next record's JSON would form an unparseable concatenation.
+	line := append(b, '\n')
+	if _, err := f.Write(line); err != nil {
+		f.Close()
 		s.reportErr("write", err)
 		return
 	}
-	if _, err := f.Write([]byte("\n")); err != nil {
-		s.reportErr("write", err)
+	if err := f.Close(); err != nil {
+		s.reportErr("close", err)
+		return
+	}
+	s.appendCount++
+	if s.appendCount >= notifCompactEvery {
+		s.appendCount = 0
+		// Best-effort: a compaction error doesn't disable persistence (next
+		// Append still tries), and load surfaces partial events anyway.
+		if _, err := loadAndCompactNotifications(s.path, notifRingSize); err != nil {
+			s.reportErr("compact", err)
+		}
 	}
 }
 

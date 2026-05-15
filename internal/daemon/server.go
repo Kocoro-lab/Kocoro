@@ -835,16 +835,23 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": ids})
 }
 
-// handleNotifications returns the in-memory notification history captured by
-// the EventBus (notification / approval_request / heartbeat_alert /
-// agent_error). Volatile: cleared on daemon restart, capped at notifRingSize.
+// handleNotifications returns the notification history captured by the
+// EventBus (notification / approval_request / heartbeat_alert / agent_error).
+// Backed by ~/.shannon/notifications.jsonl so it survives a daemon restart;
+// capped at notifRingSize entries (oldest evicted, log rewritten on load).
 //
-// Query params:
+// Query params (strict parsing intentionally NOT enforced — invalid values
+// silently fall back to defaults so a malformed Desktop cursor never blocks
+// the UI):
 //   - since: only return events with ID strictly greater than this (cursor).
 //   - limit: cap result count (most-recent kept on truncate); 0 = no cap.
 //   - types: comma-separated subset of event types to include.
 //
 // Response: {"notifications":[...], "next_cursor": <last event ID or sinceID>}.
+//
+// Cursor caveat: if a client changes the `types` filter between paginated
+// calls, events of newly-included types with ID ≤ cursor are NOT replayed.
+// Clients that switch filters mid-session should rewind the cursor to 0.
 func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	q := r.URL.Query()
