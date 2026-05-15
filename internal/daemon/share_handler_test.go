@@ -220,10 +220,22 @@ func TestBuildShareFilename(t *testing.T) {
 			want:      "session-Refactor-the-loader-20260515-081214.html",
 		},
 		{
-			name:      "chinese title preserved",
+			name:      "pure CJK title falls back to session id (S3 key safety)",
 			title:     "现在支持哪些模型",
 			sessionID: "sess_abc",
-			want:      "session-现在支持哪些模型-20260515-081214.html",
+			want:      "session-sess_abc-20260515-081214.html",
+		},
+		{
+			name:      "mixed CJK + ASCII keeps only the ASCII portion",
+			title:     "前端 refactor 重构",
+			sessionID: "sess_abc",
+			want:      "session-refactor-20260515-081214.html",
+		},
+		{
+			name:      "cyrillic / arabic / japanese all strip cleanly",
+			title:     "Привет мир こんにちは مرحبا",
+			sessionID: "sess_x",
+			want:      "session-sess_x-20260515-081214.html",
 		},
 		{
 			name:      "filesystem-unsafe chars stripped",
@@ -244,10 +256,10 @@ func TestBuildShareFilename(t *testing.T) {
 			want:      "session-sess_xyz-20260515-081214.html",
 		},
 		{
-			name:      "title trimmed to 40 runes",
-			title:     strings.Repeat("长", 60),
+			name:      "long ASCII title trimmed to 40 runes",
+			title:     strings.Repeat("a", 60),
 			sessionID: "sess_x",
-			want:      "session-" + strings.Repeat("长", 40) + "-20260515-081214.html",
+			want:      "session-" + strings.Repeat("a", 40) + "-20260515-081214.html",
 		},
 	}
 	for _, tc := range cases {

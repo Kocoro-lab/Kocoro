@@ -244,10 +244,23 @@ func buildShareFilename(title, sessionID string, now time.Time) string {
 }
 
 // slugifyTitleForFilename trims a session title down to a single token safe
-// for use in a URL path / S3 key. Allows letters (including CJK), digits,
-// hyphens, underscores, and dots; replaces whitespace with "-"; drops every
-// other punctuation/control character. Caps at 40 runes so a paragraph-long
-// title doesn't produce a 200-character filename.
+// for use in a URL path / S3 key. Allows ASCII letters, digits, hyphens,
+// underscores, and dots; replaces whitespace with "-"; drops every other
+// character including non-ASCII letters (CJK / Cyrillic / Arabic / etc.),
+// punctuation, emojis, and control chars.
+//
+// Why ASCII-only: a CJK title makes a CJK S3 key, which round-trips through
+// percent-encoding fine on most paths but breaks on a few:
+//   - macOS filesystems normalize to NFD whereas HTTP carries NFC bytes
+//   - some HTTP libraries / proxies double-encode or re-canonicalize the path
+//   - CloudFront/S3 key lookup is byte-exact after percent-decode, so any
+//     normalization mismatch becomes a 404
+// ASCII-only filenames sidestep the entire class. Titles with no ASCII
+// content (e.g. "现在支持哪些模型") slug to empty, which buildShareFilename
+// falls back to a session-ID-based filename for.
+//
+// Caps at 40 runes so a paragraph-long title doesn't produce a 200-character
+// filename.
 func slugifyTitleForFilename(title string) string {
 	const maxRunes = 40
 
@@ -263,18 +276,19 @@ func slugifyTitleForFilename(title string) string {
 		case r == '-' || r == '_' || r == '.':
 			b.WriteRune(r)
 			prevDash = (r == '-')
-		case unicode.IsLetter(r) || unicode.IsDigit(r):
+		case r < 0x80 && (unicode.IsLetter(r) || unicode.IsDigit(r)):
 			b.WriteRune(r)
 			prevDash = false
 		default:
-			// Strip filesystem-unsafe punctuation (`/ \ : * ? " < > |`),
-			// emojis, control chars — all collapse silently.
+			// Strip non-ASCII letters, filesystem-unsafe punctuation, emojis,
+			// control chars — all collapse silently.
 		}
 	}
 	s := strings.Trim(b.String(), "-_.")
 
 	// Truncate to maxRunes runes, then strip any trailing dash/underscore/dot
-	// the cut may have orphaned.
+	// the cut may have orphaned. (After ASCII-only filtering len(rune)==len(byte),
+	// but the rune slice is still correct.)
 	r := []rune(s)
 	if len(r) > maxRunes {
 		s = string(r[:maxRunes])
