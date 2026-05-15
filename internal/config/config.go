@@ -259,7 +259,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.context_window", 200000)
 	viper.SetDefault("agent.idle_soft_timeout_secs", 90)
 	viper.SetDefault("agent.idle_hard_timeout_secs", 0) // 0 = disabled; flip to <600 after dogfood
-	viper.SetDefault("agent.bash_concurrency_enabled", false) // Phase A: gate ships dark; flip after Desktop adopts tool_use_id-aware UI.
+	viper.SetDefault("agent.bash_concurrency_enabled", true) // Phase C: Desktop now consumes tool_use_id on tool_status events, safe to enable concurrent bash batches by default.
 	// Time-based microcompact. Disabled by default — short sessions never
 	// compact, and only sessions that idle past the gap threshold will
 	// clear old tool_results. 60min matches Anthropic's 1h prompt-cache
