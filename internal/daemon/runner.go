@@ -1092,6 +1092,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			if err := deps.SessionCache.MarkMailboxConsumed(pendingIDs); err != nil {
 				log.Printf("daemon: mailbox mark consumed (%v): %v", pendingIDs, err)
 			}
+			if deps.EventBus != nil {
+				payload, _ := json.Marshal(map[string]any{
+					"route_key":    req.RouteKey,
+					"consumed_ids": pendingIDs,
+					"snapshot":     ToDTOs(deps.SessionCache.MailboxSnapshot(req.RouteKey)),
+				})
+				deps.EventBus.Emit(Event{Type: EventQueueFlushed, Payload: payload})
+			}
 		}
 	} else {
 		managerDir := sessionsDir

@@ -248,3 +248,23 @@ func (sc *SessionCache) MailboxLen(key string) int {
 func (sc *SessionCache) MailboxStoreHandle() *MailboxStore {
 	return sc.mailboxStore
 }
+
+// RouteKeyForSession returns the route key currently bound to the given
+// session ID, or "" when no route is mapped (or sessionID is empty).
+// Used by GET /queue's ?session_id= shortcut lookup.
+func (sc *SessionCache) RouteKeyForSession(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	for key, entry := range sc.routes {
+		if entry == nil {
+			continue
+		}
+		if entry.loadSessionID() == sessionID {
+			return key
+		}
+	}
+	return ""
+}

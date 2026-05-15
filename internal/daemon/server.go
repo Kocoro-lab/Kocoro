@@ -365,6 +365,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
 	mux.HandleFunc("POST /message", s.handleMessage)
 	mux.HandleFunc("POST /cancel", s.handleCancel)
+	// Per-route mailbox (see references/queue.md and references/cancel.md).
+	mux.HandleFunc("GET /queue", s.handleGetQueue)
+	mux.HandleFunc("DELETE /queue/{id}", s.handleDeleteQueueItem)
 	mux.HandleFunc("GET /events", s.handleEvents)
 	mux.HandleFunc("GET /notifications", s.handleNotifications)
 	mux.HandleFunc("GET /chrome/status", s.handleChromeStatus)
