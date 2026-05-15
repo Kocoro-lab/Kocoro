@@ -185,6 +185,97 @@ func IsSkillExempt(t Tool) bool {
 	return false
 }
 
+// CancelableMidTurn is an optional interface a tool can implement to opt
+// into mid-turn cancellation. When the user submits a new message while a
+// tool is running (CancelReason=Interrupt path), the daemon honors this
+// signal:
+//
+//   - tools that DO implement CancelableMidTurn() returning true are
+//     aborted via ctx cancellation; their goroutine is expected to return
+//     promptly via ctx-aware HTTP / subprocess / file IO.
+//   - tools that do NOT implement this interface (or return false) keep
+//     running until natural completion; the queued user message becomes
+//     the next turn's prompt after this tool finishes.
+//
+// Default is "block" (safer): the queued submit only fires after the
+// in-flight tool resolves. Only proven-safe pure-read or trivially
+// cancellable tools should opt in.
+//
+// Explicit opt-in list (see internal/tools/cancelable_optin.go):
+// file_read, glob, grep, directory_list, think, system_info,
+// memory_recall, session_search, list_my_published_files, tool_search,
+// use_skill, schedule_list, plus pdf/docx/xlsx/pptx text extractors
+// (subprocess-based, respond cleanly to ctx cancel).
+//
+// retract_published_file and http are deliberately NOT cancelable: HTTP
+// methods may be non-idempotent (POST/DELETE) and aborting mid-flight
+// can leave the remote system in an inconsistent state.
+type CancelableMidTurn interface {
+	CancelableMidTurn() bool
+}
+
+// IsCancelableMidTurn reports whether a tool opts into mid-turn cancel.
+// Returns false (block) by default — the safer choice.
+//
+// Two layers: (1) explicit CancelableMidTurn interface implementation,
+// (2) a centralized name-based allowlist for builtin tools that we
+// deliberately decline to modify file-by-file. The allowlist is the
+// pragmatic path for shipping mid-turn cancel without touching ~30 tool
+// source files; the interface remains the durable mechanism (third-party / MCP
+// tools can opt in directly).
+func IsCancelableMidTurn(t Tool) bool {
+	if c, ok := t.(CancelableMidTurn); ok {
+		return c.CancelableMidTurn()
+	}
+	if t == nil {
+		return false
+	}
+	return isBuiltinCancelable(t.Info().Name)
+}
+
+// builtinCancelableMidTurn lists builtin tools that may be aborted via
+// ctx cancellation when the user submits a new message mid-tool. Anything
+// not in this list (and not implementing CancelableMidTurn) is treated as
+// blocking — the queued message waits for natural tool completion.
+//
+// Hard-blocked tools (deliberately omitted):
+//   - bash, file_write, file_edit, archive_extract, process (state-mutating)
+//   - publish_to_web, generate_image, edit_image, retract_published_file
+//     (paid quota / non-idempotent network)
+//   - cloud_delegate, memory_append (remote / file-lock-protected state)
+//   - http (verb-polymorphic; aborting POST/DELETE risks inconsistent
+//     remote state)
+//   - schedule_create, schedule_update, schedule_remove (modifies plist)
+//   - accessibility, applescript, screenshot, computer, clipboard,
+//     notify, browser, wait_for, ghostty (GUI side effects)
+var builtinCancelableMidTurn = map[string]struct{}{
+	"file_read":                {},
+	"glob":                     {},
+	"grep":                     {},
+	"directory_list":           {},
+	"think":                    {},
+	"system_info":              {},
+	"memory_recall":            {},
+	"session_search":           {},
+	"list_my_published_files":  {},
+	"tool_search":              {},
+	"use_skill":                {},
+	"schedule_list":            {},
+	"archive_inspect":          {},
+	"pdf_to_text":              {},
+	"docx_to_text":             {},
+	"xlsx_to_text":             {},
+	"pptx_to_text":             {},
+}
+
+func isBuiltinCancelable(name string) bool {
+	if name == "" {
+		return false
+	}
+	_, ok := builtinCancelableMidTurn[name]
+	return ok
+}
+
 // autoApprovalDenyList is the canonical set of tools that REFUSE to be
 // persisted into a user-facing "always allow" list (per-agent or global).
 // AutoApprovalDenyList returns a copy for cross-package consistency tests;
