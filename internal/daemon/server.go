@@ -23,6 +23,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
@@ -613,9 +614,11 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		RouteKey  string `json:"route_key,omitempty"`
-		SessionID string `json:"session_id,omitempty"`
-		Agent     string `json:"agent,omitempty"`
+		RouteKey    string `json:"route_key,omitempty"`
+		SessionID   string `json:"session_id,omitempty"`
+		Agent       string `json:"agent,omitempty"`
+		Reason      string `json:"reason,omitempty"`
+		RestoreLast bool   `json:"restore_last,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -634,9 +637,72 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.deps.SessionCache.CancelRoute(key)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "cancelled", "route": key})
+	reason, ok := agenttypes.ParseCancelReason(req.Reason)
+	if !ok {
+		http.Error(w, `{"error":"unknown reason; expected user_cancel|interrupt|background|idle_timeout"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Fast path: legacy callers that don't request a restore get the old
+	// fire-and-forget semantics. Slow path waits for the run to exit so we
+	// can safely slice the session.
+	if !req.RestoreLast {
+		s.deps.SessionCache.CancelRouteWithReason(key, reason)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"status":   "cancelled",
+			"route":    key,
+			"reason":   reason.String(),
+			"restored": false,
+		})
+		return
+	}
+
+	restored, err := s.deps.SessionCache.CancelRouteForRestore(key, reason, true, 5*time.Second)
+	if errors.Is(err, ErrCancelRestoreTimeout) {
+		writeError(w, http.StatusGatewayTimeout, "agent run did not exit within 5s; restore aborted")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if restored != nil {
+		s.publishCancelRestored(key, restored)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"status":   "cancelled",
+			"route":    key,
+			"reason":   reason.String(),
+			"restored": true,
+			"text":     restored.Text,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"status":   "cancelled",
+		"route":    key,
+		"reason":   reason.String(),
+		"restored": false,
+	})
+}
+
+// publishCancelRestored emits the cancel.restored SSE event so subscribed UI
+// clients can fill the user's last message back into their input box.
+func (s *Server) publishCancelRestored(routeKey string, restored *session.RestoredMessage) {
+	if s.deps == nil || s.deps.EventBus == nil || restored == nil {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"route_key":   routeKey,
+		"text":        restored.Text,
+		"attachments": restored.Attachments,
+	})
+	if err != nil {
+		return
+	}
+	s.deps.EventBus.Emit(Event{Type: EventCancelRestored, Payload: payload})
 }
 
 func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {

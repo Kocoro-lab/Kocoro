@@ -74,6 +74,12 @@ const (
 	// items into a user turn. Payload:
 	// {route_key, consumed_ids:[string], snapshot:[DTO]}.
 	EventQueueFlushed = "queue.flushed"
+
+	// EventCancelRestored fires when POST /cancel with restore_last=true
+	// successfully sliced the most recent user message off the session.
+	// Payload: {route_key, text, attachments:[…]}. UI clients fill `text`
+	// back into their input box.
+	EventCancelRestored = "cancel.restored"
 )
 
 // Event is a daemon lifecycle event pushed to SSE subscribers.

@@ -465,20 +465,135 @@ func (sc *SessionCache) ClearRouteRunState(key string) {
 //     API layer still returns "cancelled" for idempotency, but no pending
 //     intent is stored — the key must appear in sc.routes for pending to work).
 func (sc *SessionCache) CancelRoute(key string) {
+	sc.CancelRouteWithReason(key, agenttypes.ReasonUserCancel)
+}
+
+// CancelRouteWithReason is the reason-tagged variant of CancelRoute. The
+// reason is recorded on the route entry (for pending cancels) and, when a
+// CancelCauseFunc is available, threaded through context.WithCancelCause
+// so the agent loop's finalizer can recover it via
+// agenttypes.ExtractReason(context.Cause(ctx)).
+//
+// When only the legacy context.CancelFunc is registered (older code paths
+// that never called SetRouteCancelCause), the reason is still stamped on
+// entry.pendingReason but the cancellation itself is unparameterized.
+// agenttypes.ReasonUserCancel is the safe default for those paths.
+func (sc *SessionCache) CancelRouteWithReason(key string, reason agenttypes.CancelReason) {
 	sc.mu.Lock()
 	entry, ok := sc.routes[key]
-	var cancel context.CancelFunc
+	var (
+		cancel      context.CancelFunc
+		cancelCause context.CancelCauseFunc
+	)
 	if ok && entry != nil {
 		cancel = entry.cancel
-		if cancel == nil {
+		cancelCause = entry.cancelCause
+		if cancel == nil && cancelCause == nil {
 			entry.cancelPending = true
+			entry.pendingReason = reason
 		}
 	}
 	sc.mu.Unlock()
+	if cancelCause != nil {
+		cancelCause(agenttypes.NewCancelError(reason))
+		return
+	}
 	if cancel != nil {
 		cancel()
 	}
 }
+
+// CancelRouteForRestore cancels the route's in-flight run, waits up to the
+// supplied timeout for the run to finish, and (when restoreLast is true and
+// the session permits) slices the most recent user message off the session,
+// returning it for restoration into a UI input box.
+//
+// Returns:
+//   - restored != nil: the user message that was sliced.
+//   - restored == nil, err == nil: cancelled successfully but conditions for
+//     restore weren't met (no run, no user message, content followed it).
+//   - err == ErrCancelRestoreTimeout: the run didn't exit within timeout;
+//     the session was NOT mutated (we don't slice optimistically while the
+//     finalizer may still write).
+//   - other err: session load/save failed.
+func (sc *SessionCache) CancelRouteForRestore(key string, reason agenttypes.CancelReason, restoreLast bool, timeout time.Duration) (*session.RestoredMessage, error) {
+	if key == "" {
+		return nil, errors.New("route key required")
+	}
+
+	sc.mu.Lock()
+	entry := sc.routes[key]
+	sc.mu.Unlock()
+
+	if entry == nil {
+		return nil, nil
+	}
+
+	// Capture cancel handle + done channel under sc.mu so a concurrent
+	// ClearRouteRunState can't yank them out from under us.
+	sc.mu.Lock()
+	cancelCause := entry.cancelCause
+	cancel := entry.cancel
+	doneCh := entry.done
+	mgr := entry.manager
+	sessID := entry.loadSessionID()
+	sc.mu.Unlock()
+
+	switch {
+	case cancelCause != nil:
+		cancelCause(agenttypes.NewCancelError(reason))
+	case cancel != nil:
+		cancel()
+	default:
+		// No active cancel handle yet — mark pending and return.
+		sc.mu.Lock()
+		entry.cancelPending = true
+		entry.pendingReason = reason
+		sc.mu.Unlock()
+		return nil, nil
+	}
+
+	if !restoreLast {
+		return nil, nil
+	}
+
+	// Wait for the run to actually exit before mutating the session.
+	if doneCh != nil {
+		select {
+		case <-doneCh:
+		case <-time.After(timeout):
+			return nil, ErrCancelRestoreTimeout
+		}
+	}
+
+	if mgr == nil || sessID == "" {
+		return nil, nil
+	}
+
+	// At this point the run has exited, so it's safe to acquire entry.mu
+	// briefly to mutate the session under the same lock the runner uses.
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	sess, err := mgr.Resume(sessID)
+	if err != nil {
+		return nil, fmt.Errorf("resume session for restore: %w", err)
+	}
+	restored, ok := sess.SliceBeforeLastUser()
+	if !ok {
+		return nil, nil
+	}
+	if err := mgr.Save(); err != nil {
+		return nil, fmt.Errorf("save sliced session: %w", err)
+	}
+	return restored, nil
+}
+
+// ErrCancelRestoreTimeout signals that the in-flight run did not exit
+// within the deadline supplied to CancelRouteForRestore. Callers should
+// translate this to HTTP 504 — the session was not mutated, so it's safe
+// to retry.
+var ErrCancelRestoreTimeout = errors.New("agent run did not exit within restore timeout")
 
 // CancelBySessionID cancels any active route whose sessionID matches,
 // regardless of route key type (agent:<name>, session:<id>, default:<s>:<c>).
