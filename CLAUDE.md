@@ -146,6 +146,12 @@ The dispatcher batches tool calls by `IsConcurrencySafeCall`, not `IsReadOnlyCal
 
 Tool events on the SSE/WS wire (`tool_status` running + completed) include a `tool_use_id` field so multi-tool-in-flight UIs (e.g. parallel bash) can pair them correctly. The daemon advertises this on the WS handshake via the `tool_use_id_events` capability token.
 
+### Tool Required-Field Validation
+
+Every tool's `Run()` MUST explicitly check that each field listed in `ToolInfo.Required` is non-zero immediately after `json.Unmarshal`, and return `agent.ValidationError(...)` (NOT a bare `ToolResult{Content: ..., IsError: true}`) on failure. Go's `json.Unmarshal` cannot distinguish "field missing" from "field present with zero value" on a strongly-typed struct, so a missing string `required` field arrives as `""` — which `os.WriteFile`, `exec.Command`, etc. happily accept. The 2026-05-13 production stuck loop was a `file_write` call with no `content` field that wrote 0 bytes, returned `IsError=false`, truncated the user's existing file, and trapped the model into a 16-call retry spin.
+
+The `[validation error]` prefix that `ValidationError` injects is load-bearing: `LoopDetector.isValidationErrorSig` short-circuits a same-tool + same-args + 3-consecutive `[validation error]` run to `LoopForceStop`, well below the all-errors 2x ConsecutiveDup budget at call #7. Returning a hand-rolled `IsError=true` result without the prefix loses this early-stop and falls back to the slower flaky-retry path. Examples: `internal/tools/file_write.go` (content), `internal/tools/file_edit.go` (old_string), `internal/tools/archive.go` (path/dest), `internal/tools/cloud_delegate.go` (task), `internal/tools/edit_image.go` (prompt).
+
 ### Skill Discovery
 
 Three layers triggering `use_skill`:

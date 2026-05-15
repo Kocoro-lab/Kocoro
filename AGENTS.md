@@ -59,6 +59,12 @@ The dispatcher batches tool calls by `IsConcurrencySafeCall`, not `IsReadOnlyCal
 
 Tool events on the SSE/WS wire (`tool_status` running + completed) include a `tool_use_id` field so multi-tool-in-flight UIs (e.g. parallel bash) can pair them correctly. The daemon advertises this on the WS handshake via the `tool_use_id_events` capability token.
 
+### Tool Required-Field Validation
+
+Every tool's `Run()` MUST explicitly check that each field listed in `ToolInfo.Required` is non-zero immediately after `json.Unmarshal`, and return `agent.ValidationError(...)` (NOT a bare `ToolResult{Content: ..., IsError: true}`) on failure. Go's json decoder cannot distinguish "field missing" from "field present with zero value" on a strongly-typed struct, so a missing required string arrives as `""` and downstream syscalls happily accept it. The 2026-05-13 production stuck loop was a `file_write` with no `content` that wrote 0 bytes, returned `IsError=false`, truncated the user's file, and trapped the model into a 16-call retry spin.
+
+The `[validation error]` prefix that `ValidationError` injects is load-bearing: `LoopDetector.isValidationErrorSig` short-circuits a same-tool + same-args + 3-consecutive `[validation error]` run to `LoopForceStop`, well below the all-errors 2x ConsecutiveDup budget at call #7.
+
 ### Providers
 
 The default provider is the Cloud gateway client. Ollama uses an OpenAI-compatible local client. Both implement complete and streaming completion paths; keep provider-specific behavior behind those interfaces.

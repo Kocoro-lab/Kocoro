@@ -42,6 +42,16 @@ func (t *FileWriteTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
+	// Reject calls that omit content (or pass an empty string). Without this
+	// guard, os.WriteFile happily writes 0 bytes and returns "wrote 0 bytes"
+	// with IsError=false — the model reads that as a successful write and
+	// keeps looping. See the 2026-05-13 stuck-loop incident.
+	if args.Content == "" {
+		return agent.ValidationError(
+			"file_write: missing required `content` parameter. " +
+				"To truncate the file pass a single space, or use `bash` with `: > path`.",
+		), nil
+	}
 	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
 	if resolveErr != nil {
 		if errors.Is(resolveErr, cwdctx.ErrNoSessionCWD) {

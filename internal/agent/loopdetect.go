@@ -417,6 +417,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	//   threshold (2 nudge, 3 force-stop).
 	consecCount := 0
 	consecErrCount := 0
+	consecValidationErrCount := 0
 	for i := len(ld.history) - 1; i >= 0; i-- {
 		if ld.history[i].Name != name || ld.history[i].ArgsHash != latestHash {
 			break
@@ -424,6 +425,9 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		consecCount++
 		if ld.history[i].IsError {
 			consecErrCount++
+			if isValidationErrorSig(ld.history[i].ErrorSig) {
+				consecValidationErrCount++
+			}
 		}
 	}
 	// dupExemptTools (use_skill) are pure idempotent loaders — skip both
@@ -434,6 +438,19 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		!ld.history[len(ld.history)-1].IsError &&
 		consecErrCount > 0
 	exactRecovered := latestRecoveredAfterSameArgsErrors(ld.history, name, latestHash)
+
+	// 1a-pre. Deterministic validation-error short-circuit. Same tool +
+	// same args + every result tagged as `[validation error]` × 3 means
+	// the model is asking for the same impossible thing — retrying with
+	// identical args cannot succeed. Skip the all-errors 2x budget below
+	// (which is calibrated for flaky retries, not parameter-shape
+	// mistakes) and force-stop immediately.
+	if !dupExemptTools[name] && consecValidationErrCount >= 3 && consecValidationErrCount == consecCount {
+		return LoopForceStop, fmt.Sprintf(
+			"Tool %s rejected your arguments %d times in a row with the same validation error: %q. "+
+				"Retrying with identical arguments will not succeed — fix the arguments or ask the user for guidance.",
+			name, consecCount, ld.history[len(ld.history)-1].ErrorSig)
+	}
 
 	if !dupExemptTools[name] && consecCount > 0 && !recovered {
 		threshold := ld.consecDupThreshold
@@ -732,6 +749,22 @@ func latestRecoveredAfterSameArgsErrors(history []ToolCallRecord, name, latestHa
 		return sawError
 	}
 	return sawError
+}
+
+// isValidationErrorSig reports whether a result's error signature was produced
+// by `agent.ValidationError(...)`, which prefixes its content with the literal
+// "[validation error] " marker. Matching the prefix lets the loop detector
+// distinguish deterministic "your arguments are wrong" failures from
+// transient/flaky failures (network, permission denied, file moved by editor)
+// that legitimately benefit from the all-errors 2x retry budget.
+//
+// Why prefix-only and not keyword matching: keyword heuristics ("missing",
+// "required", "invalid") risk false positives on staleness messages
+// ("File has been modified... read it again") and on tool-specific business
+// errors. The prefix is set in exactly one place (tools.go ValidationError)
+// and is byte-stable across releases.
+func isValidationErrorSig(sig string) bool {
+	return strings.HasPrefix(sig, "[validation error]")
 }
 
 func hashArgs(args string) string {
