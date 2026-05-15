@@ -223,6 +223,7 @@ Scalars override, lists merge+dedup, structs field-level merge. MCP server env-v
 - Spill: `~/.shannon/tmp/tool_result_<session>_<call_id>.txt`
 - Attachments: `~/.shannon/tmp/attachments/<nonce>/`
 - Schedules: `~/.shannon/schedules.json` + `~/Library/LaunchAgents/com.shannon.schedule.<id>.plist`
+- Notification history: `~/.shannon/notifications.jsonl` (JSONL append-only, capped at 500 entries; trimmed + atomically rewritten on daemon startup, survives restarts)
 - Skill secrets index: `~/.shannon/secrets-index.json` (chmod 600, flock-protected, names only); values in macOS Keychain (service `com.shannon.skill.<name>`)
 - Sync: marker `~/.shannon/sync_marker.json`, lock `~/.shannon/sync.lock` (never delete), dry-run outbox `~/.shannon/sync_outbox/`
 - Logs: `~/.shannon/logs/audit.log`, `~/.shannon/logs/schedule-<id>.log`

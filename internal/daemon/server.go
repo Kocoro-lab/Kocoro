@@ -153,6 +153,23 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 			deps.ApprovalTracker = NewApprovalTracker()
 		}
 	}
+	// Rehydrate notification history from disk so /notifications survives a
+	// daemon restart. Best-effort: errors are logged but never fatal — a
+	// corrupt log should never block daemon startup. newNotifStore returns
+	// whatever events it could parse before an error too, so we restore those
+	// even on partial-failure paths (e.g. compaction rewrite failed but the
+	// read succeeded). Order matters: install the persister after restore so
+	// rehydrated events don't get appended back to disk.
+	if shannonDir != "" {
+		store, restored, err := newNotifStore(shannonDir)
+		if err != nil {
+			log.Printf("daemon: notification history load partial: %v", err)
+		}
+		s.eventBus.RestoreNotifications(restored)
+		if store != nil {
+			s.eventBus.SetNotifPersister(store.Append)
+		}
+	}
 	return s
 }
 
@@ -308,6 +325,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /message", s.handleMessage)
 	mux.HandleFunc("POST /cancel", s.handleCancel)
 	mux.HandleFunc("GET /events", s.handleEvents)
+	mux.HandleFunc("GET /notifications", s.handleNotifications)
 	mux.HandleFunc("GET /chrome/status", s.handleChromeStatus)
 	mux.HandleFunc("GET /chrome/profile", s.handleChromeProfile)
 	mux.HandleFunc("POST /chrome/profile", s.handleChromeProfileUpdate)
@@ -815,6 +833,63 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request) {
 		ids = []string{}
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": ids})
+}
+
+// handleNotifications returns the notification history captured by the
+// EventBus (notification / approval_request / heartbeat_alert / agent_error).
+// Backed by ~/.shannon/notifications.jsonl so it survives a daemon restart;
+// capped at notifRingSize entries (oldest evicted, log rewritten on load).
+//
+// Query params (strict parsing intentionally NOT enforced — invalid values
+// silently fall back to defaults so a malformed Desktop cursor never blocks
+// the UI):
+//   - since: only return events with ID strictly greater than this (cursor).
+//   - limit: cap result count (most-recent kept on truncate); 0 = no cap.
+//   - types: comma-separated subset of event types to include.
+//
+// Response: {"notifications":[...], "next_cursor": <last event ID or sinceID>}.
+//
+// Cursor caveat: if a client changes the `types` filter between paginated
+// calls, events of newly-included types with ID ≤ cursor are NOT replayed.
+// Clients that switch filters mid-session should rewind the cursor to 0.
+func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	q := r.URL.Query()
+
+	var since uint64
+	if v := q.Get("since"); v != "" {
+		if parsed, err := strconv.ParseUint(v, 10, 64); err == nil {
+			since = parsed
+		}
+	}
+	limit := 0
+	if v := q.Get("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	var typeFilter map[string]struct{}
+	if v := q.Get("types"); v != "" {
+		typeFilter = make(map[string]struct{})
+		for _, t := range strings.Split(v, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				typeFilter[t] = struct{}{}
+			}
+		}
+	}
+
+	events := s.eventBus.Notifications(since, typeFilter, limit)
+	if events == nil {
+		events = []Event{}
+	}
+	cursor := since
+	if n := len(events); n > 0 {
+		cursor = events[n-1].ID
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"notifications": events,
+		"next_cursor":   cursor,
+	})
 }
 
 // handleGetSession 返回指定 session 的完整内容（包含消息列表）。

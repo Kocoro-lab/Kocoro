@@ -407,10 +407,17 @@ var daemonStartCmd = &cobra.Command{
 
 		broker.SetOnRequest(func(requestID, tool, args string) {
 			if localServer.EventBus() != nil {
+				// Redact before emit so subscribers (Desktop UI, curl debug
+				// sessions) and the on-disk /notifications history all see
+				// the sanitized form. Matches the redact-then-emit policy
+				// already in place for tool_status (bus_handler.go:redactAndTruncate).
+				// Without this, raw bearer tokens / AWS keys / passwords in
+				// approval args would land in ~/.shannon/notifications.jsonl
+				// and survive across restarts.
 				payload, _ := json.Marshal(map[string]string{
 					"request_id": requestID,
 					"tool":       tool,
-					"args":       args,
+					"args":       audit.RedactSecrets(args),
 				})
 				localServer.EventBus().Emit(daemon.Event{Type: daemon.EventApprovalRequest, Payload: payload})
 			}

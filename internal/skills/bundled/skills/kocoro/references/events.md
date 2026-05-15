@@ -109,6 +109,57 @@ curl -N http://localhost:7533/events
 curl -N "http://localhost:7533/events?since=42"
 ```
 
+## Notification history
+
+`GET /notifications` returns the history of banner-class events captured by the EventBus. Distinct from `/events?since=` replay: this buffer retains notification-class events **regardless of whether a subscriber was attached at emit time**, so Desktop can show "what notifications did the user receive while offline".
+
+Captured types: `notification`, `approval_request`, `heartbeat_alert`, `agent_error`.
+
+**Persistent across daemon restarts.** Backed by `~/.shannon/notifications.jsonl` (JSON-lines, append-only). On daemon startup the file is loaded and trimmed to the most recent 500 entries (oldest evicted, log atomically rewritten). Event IDs remain monotonic across restarts — clients holding a `next_cursor` from before the restart can keep using it.
+
+### Asymmetry with `/events?since=` replay
+
+The two rings have intentionally different retention rules:
+
+| Event type | `/events?since=` SSE ring | `/notifications` ring + disk |
+|---|---|---|
+| `notification` (no subscriber at emit) | **dropped** | **dropped** (osascript fallback already fired the banner natively — re-banner on Desktop launch would duplicate) |
+| `notification` (subscriber present at emit) | kept | kept |
+| `approval_request` / `heartbeat_alert` / `agent_error` | kept | kept (no osascript fallback path, so always safe to retain) |
+| `approval_notice` | dropped if undelivered | **never tracked** (post-decision feedback, not a banner) |
+| All other event types | kept | not tracked |
+
+The two rings have parallel retention rules for `notification`: both drop it when no subscriber is attached, because in that case the notify tool falls back to `osascript` and macOS already showed the banner. The history endpoint exists to recover notifications the user missed **between SSE sessions while the daemon was running** (e.g. Desktop crashed and relaunched), not to replay banners that the OS already delivered through the fallback path.
+
+Query params:
+
+- `since` — only return events with ID strictly greater than this. Use `next_cursor` from a prior response as the cursor.
+- `limit` — cap result count; on truncation the **most recent** are kept. `0` (default) = no cap.
+- `types` — comma-separated subset of event types to include (e.g. `types=notification,approval_request`). Default = all four captured types.
+
+```bash
+curl http://localhost:7533/notifications?limit=50
+curl "http://localhost:7533/notifications?since=120&types=notification,agent_error"
+```
+
+Response shape:
+
+```json
+{
+  "notifications": [
+    { "id": 121, "type": "notification", "payload": { /* original event payload */ } },
+    { "id": 134, "type": "approval_request", "payload": { /* ... */ } }
+  ],
+  "next_cursor": 134
+}
+```
+
+If no events match, `notifications` is `[]` and `next_cursor` echoes the `since` value (or `0`).
+
+**Cursor caveat:** the `next_cursor` advances past all events seen during the call, regardless of the `types` filter. If a client paginates with `types=notification` and later widens to `types=notification,approval_request`, any `approval_request` events with ID ≤ the prior cursor are skipped. Clients that change the `types` filter mid-session should rewind the cursor to `0`.
+
+**Malformed query params** (e.g. `since=abc`, `limit=-1`) silently fall back to defaults — the endpoint never returns 400. This is intentional: a stale Desktop client should degrade to "show latest 500" rather than fail closed and hide all history.
+
 ## Backward compatibility
 
 - `args` / `is_error` / `preview` on `tool_status` are **additive** — older subscribers that ignore unknown fields keep working.
