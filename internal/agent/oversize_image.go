@@ -1,10 +1,34 @@
 package agent
 
 import (
+	"encoding/base64"
 	"fmt"
+	"image"
+	"strings"
+
+	_ "image/gif"  // header parse for filterOversizeImages dim guard
+	_ "image/jpeg" // header parse for filterOversizeImages dim guard
+	_ "image/png"  // header parse for filterOversizeImages dim guard
+
+	_ "golang.org/x/image/webp" // header parse for filterOversizeImages dim guard
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
+
+// wireImageDimensionCap is the per-side pixel limit applied at the wire
+// sanitizer when a request carries more than manyImageThreshold images.
+// Mirrors tools.CompressionMaxDimension; kept as a separate constant
+// because internal/agent must not import internal/tools (tools depends
+// on agent for ToolRegistry). Adjust both in lockstep — TestWireImage*
+// pins the contract.
+const wireImageDimensionCap = 2000
+
+// manyImageThreshold is the inclusive lower bound that triggers Pass 0's
+// dimension check. Anthropic's documented many-image rule kicks in when
+// the request carries >20 images: per-side limit drops from 8000 to 2000.
+// We engage Pass 0 strictly above 20 so single high-resolution images
+// stay untouched.
+const manyImageThreshold = 20
 
 // MaxAggregateImageBase64Bytes caps the SUM of all image base64 payloads in a
 // single request. Anthropic's hard request-body limit is 32 MB; this leaves
@@ -19,7 +43,16 @@ import (
 // exceeds 25 MB of compressed inline images per request.
 const MaxAggregateImageBase64Bytes = 25 * 1024 * 1024
 
-// filterOversizeImages enforces two caps:
+// filterOversizeImages enforces three caps:
+//  0. Per-image dimension (many-image only): when total image count >
+//     manyImageThreshold (20), any image with either edge >
+//     wireImageDimensionCap (2000 px) is replaced with a placeholder.
+//     Backstop for the source-time tools.compressImage /
+//     tools.CompressInlineImageSource dimension check: catches images
+//     that bypass Layer 1 entirely — pre-fix persisted sessions, MCP
+//     server-produced image blocks, anything that never went through
+//     EncodeImage/CompressInlineImageSource. Without this pass, those
+//     paths can hit Anthropic's "many-image requests: 2000 pixels" 400.
 //  1. Per-image: any image > client.MaxInlineImageBase64Bytes (5 MB) is replaced
 //     with a placeholder. This prevents Anthropic's per-image 400.
 //  2. Aggregate: if the SUM of all remaining image source bytes across all
@@ -35,6 +68,9 @@ const MaxAggregateImageBase64Bytes = 25 * 1024 * 1024
 //
 // Pairs with filterOldImages (count-based) — this one is size-based.
 func filterOversizeImages(messages []client.Message) {
+	// Pass 0: per-image dimension cap (many-image scenarios only).
+	enforcePerImageDimensionCap(messages)
+
 	// Pass 1: per-image cap.
 	for i := range messages {
 		if !messages[i].Content.HasBlocks() {
@@ -204,6 +240,139 @@ func sanitizeToolResultImages(b client.ContentBlock) (client.ContentBlock, bool)
 	for k, nb := range nested {
 		if nb.Type == "image" && oversizeImageSource(nb.Source) {
 			newNested[k] = oversizeImagePlaceholder()
+			changed = true
+			continue
+		}
+		newNested[k] = nb
+	}
+	if !changed {
+		return b, false
+	}
+	out := b
+	out.ToolContent = newNested
+	return out, true
+}
+
+// enforcePerImageDimensionCap is Pass 0 of filterOversizeImages. When the
+// total image count exceeds manyImageThreshold (20), every image block
+// whose header reports either side > wireImageDimensionCap (2000 px) is
+// replaced with a text placeholder. Decoded once per image via header-
+// only image.DecodeConfig (PNG IHDR / JPEG SOFn / GIF LSD / WebP VP8),
+// which scans tens of bytes — bounded cost even on the 5 MB-base64
+// fast-path payload.
+//
+// Returns silently for image counts ≤ 20 so single-image and few-image
+// requests carrying a legitimate >2000px image still pass through (those
+// use Anthropic's 8000-px-per-side single-image limit). DecodeConfig
+// errors are treated as "not oversize" — a malformed payload is the
+// byte-cap path's problem and the per-image / aggregate passes that
+// follow will deal with it if it's actually too large in bytes.
+func enforcePerImageDimensionCap(messages []client.Message) {
+	if totalImageCount(messages) <= manyImageThreshold {
+		return
+	}
+	for i := range messages {
+		if !messages[i].Content.HasBlocks() {
+			continue
+		}
+		oldBlocks := messages[i].Content.Blocks()
+		newBlocks := make([]client.ContentBlock, len(oldBlocks))
+		changed := false
+		for j, b := range oldBlocks {
+			switch b.Type {
+			case "image":
+				if dimensionOversize(b.Source) {
+					newBlocks[j] = dimensionPlaceholder()
+					changed = true
+					continue
+				}
+				newBlocks[j] = b
+			case "tool_result":
+				nb, nestedChanged := sanitizeToolResultDimensions(b)
+				if nestedChanged {
+					changed = true
+				}
+				newBlocks[j] = nb
+			default:
+				newBlocks[j] = b
+			}
+		}
+		if changed {
+			oldContent := messages[i].Content
+			messages[i].Content = client.NewBlockContent(newBlocks)
+			client.LogCacheCompactEvent("img_dim_strip", i, oldContent, messages[i].Content)
+		}
+	}
+}
+
+// totalImageCount counts top-level image blocks AND images nested inside
+// tool_result blocks. Both shapes contribute to Anthropic's per-request
+// image tally and so both shapes contribute to the many-image threshold
+// decision.
+func totalImageCount(messages []client.Message) int {
+	n := 0
+	for _, m := range messages {
+		if !m.Content.HasBlocks() {
+			continue
+		}
+		for _, b := range m.Content.Blocks() {
+			switch b.Type {
+			case "image":
+				n++
+			case "tool_result":
+				if nested, ok := b.ToolContent.([]client.ContentBlock); ok {
+					for _, nb := range nested {
+						if nb.Type == "image" {
+							n++
+						}
+					}
+				}
+			}
+		}
+	}
+	return n
+}
+
+// dimensionOversize returns true when the image source's header reports
+// either edge above wireImageDimensionCap. Streams the base64 reader
+// through image.DecodeConfig so only the header bytes are decoded.
+// Returns false on nil source, empty data, or any decode error.
+func dimensionOversize(s *client.ImageSource) bool {
+	if s == nil || s.Data == "" {
+		return false
+	}
+	reader := base64.NewDecoder(base64.StdEncoding, strings.NewReader(s.Data))
+	cfg, _, err := image.DecodeConfig(reader)
+	if err != nil {
+		return false
+	}
+	return cfg.Width > wireImageDimensionCap || cfg.Height > wireImageDimensionCap
+}
+
+// dimensionPlaceholder is the text block injected when an image is
+// dropped by the dimension cap. Distinct text from byte-cap placeholders
+// so audit/cache-debug logs disambiguate the drop reason.
+func dimensionPlaceholder() client.ContentBlock {
+	return client.ContentBlock{
+		Type: "text",
+		Text: fmt.Sprintf("[image removed: dimension exceeds %dpx for many-image request]", wireImageDimensionCap),
+	}
+}
+
+// sanitizeToolResultDimensions mirrors sanitizeToolResultImages but for
+// the dimension cap: replaces oversize-dimension images nested inside a
+// tool_result with placeholders, leaving the surrounding tool_result
+// shape intact.
+func sanitizeToolResultDimensions(b client.ContentBlock) (client.ContentBlock, bool) {
+	nested, ok := b.ToolContent.([]client.ContentBlock)
+	if !ok {
+		return b, false
+	}
+	newNested := make([]client.ContentBlock, len(nested))
+	changed := false
+	for k, nb := range nested {
+		if nb.Type == "image" && dimensionOversize(nb.Source) {
+			newNested[k] = dimensionPlaceholder()
 			changed = true
 			continue
 		}
