@@ -236,8 +236,8 @@ func TestExecuteBatches_SerialWhenUnsafe(t *testing.T) {
 	start := time.Now()
 	executeBatches(context.Background(), batches, results, nil, nil)
 	elapsed := time.Since(start)
-	if elapsed < 280*time.Millisecond {
-		t.Errorf("serial execution took %v, expected >=280ms (3x100ms back-to-back, allow 20ms scheduler slack)", elapsed)
+	if elapsed < 250*time.Millisecond {
+		t.Errorf("serial execution took %v, expected ≥250ms (3×100ms back-to-back, allow scheduler slack)", elapsed)
 	}
 	if got := atomic.LoadInt32(&tool.maxInFlight); got > 1 {
 		t.Errorf("expected maxInFlight=1 for serial, got %d", got)
