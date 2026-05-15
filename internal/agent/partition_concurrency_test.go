@@ -161,3 +161,85 @@ func TestExecuteBatches_ReadTrackerInterBatch(t *testing.T) {
 		t.Error("ReadTracker should have marked file as read between batches")
 	}
 }
+
+// timingSlowTool sleeps for the configured duration and tracks the maximum
+// concurrent invocations observed. Used to prove executeBatches actually runs
+// concurrency-safe calls in parallel (and that non-safe calls stay serial).
+// Distinct from slowReadTool above: that fake exercises the maxToolConcurrency
+// cap, while this one toggles ConcurrencySafeChecker directly so the
+// dispatcher's batch-grouping decision drives wall-clock behavior.
+type timingSlowTool struct {
+	sleep         time.Duration
+	concurrencyOk bool
+	inFlight      int32
+	maxInFlight   int32
+}
+
+func (s *timingSlowTool) Info() ToolInfo                    { return ToolInfo{Name: "timing_slow"} }
+func (s *timingSlowTool) RequiresApproval() bool            { return false }
+func (s *timingSlowTool) IsReadOnlyCall(string) bool        { return false }
+func (s *timingSlowTool) IsConcurrencySafeCall(string) bool { return s.concurrencyOk }
+func (s *timingSlowTool) Run(ctx context.Context, args string) (ToolResult, error) {
+	now := atomic.AddInt32(&s.inFlight, 1)
+	for {
+		m := atomic.LoadInt32(&s.maxInFlight)
+		if now <= m {
+			break
+		}
+		if atomic.CompareAndSwapInt32(&s.maxInFlight, m, now) {
+			break
+		}
+	}
+	time.Sleep(s.sleep)
+	atomic.AddInt32(&s.inFlight, -1)
+	return ToolResult{Content: "ok"}, nil
+}
+
+func TestExecuteBatches_ConcurrentWhenSafe(t *testing.T) {
+	tool := &timingSlowTool{sleep: 200 * time.Millisecond, concurrencyOk: true}
+	approved := []approvedToolCall{
+		{tool: tool, index: 0, fc: client.FunctionCall{Name: "timing_slow", ID: "tu1"}, argsStr: "{}"},
+		{tool: tool, index: 1, fc: client.FunctionCall{Name: "timing_slow", ID: "tu2"}, argsStr: "{}"},
+		{tool: tool, index: 2, fc: client.FunctionCall{Name: "timing_slow", ID: "tu3"}, argsStr: "{}"},
+	}
+	results := make([]toolExecResult, 3)
+	batches := partitionToolCalls(approved)
+	if len(batches) != 1 {
+		t.Fatalf("expected 1 batch, got %d", len(batches))
+	}
+	if len(batches[0]) != 3 {
+		t.Fatalf("expected 3 calls in the single batch, got %d", len(batches[0]))
+	}
+	start := time.Now()
+	executeBatches(context.Background(), batches, results, nil, nil)
+	elapsed := time.Since(start)
+	if elapsed > 400*time.Millisecond {
+		t.Errorf("parallel execution took %v, expected <400ms (3x200ms serial would be >=600ms)", elapsed)
+	}
+	if got := atomic.LoadInt32(&tool.maxInFlight); got < 2 {
+		t.Errorf("expected at least 2 concurrent invocations, observed max %d", got)
+	}
+}
+
+func TestExecuteBatches_SerialWhenUnsafe(t *testing.T) {
+	tool := &timingSlowTool{sleep: 100 * time.Millisecond, concurrencyOk: false}
+	approved := []approvedToolCall{
+		{tool: tool, index: 0, fc: client.FunctionCall{Name: "timing_slow", ID: "tu1"}, argsStr: "{}"},
+		{tool: tool, index: 1, fc: client.FunctionCall{Name: "timing_slow", ID: "tu2"}, argsStr: "{}"},
+		{tool: tool, index: 2, fc: client.FunctionCall{Name: "timing_slow", ID: "tu3"}, argsStr: "{}"},
+	}
+	results := make([]toolExecResult, 3)
+	batches := partitionToolCalls(approved)
+	if len(batches) != 3 {
+		t.Fatalf("expected 3 sequential batches, got %d", len(batches))
+	}
+	start := time.Now()
+	executeBatches(context.Background(), batches, results, nil, nil)
+	elapsed := time.Since(start)
+	if elapsed < 280*time.Millisecond {
+		t.Errorf("serial execution took %v, expected >=280ms (3x100ms back-to-back, allow 20ms scheduler slack)", elapsed)
+	}
+	if got := atomic.LoadInt32(&tool.maxInFlight); got > 1 {
+		t.Errorf("expected maxInFlight=1 for serial, got %d", got)
+	}
+}
