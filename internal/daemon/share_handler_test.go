@@ -209,62 +209,78 @@ func TestBuildShareFilename(t *testing.T) {
 	now := time.Date(2026, 5, 15, 8, 12, 14, 0, time.UTC)
 	cases := []struct {
 		name      string
+		haikuSlug string
 		title     string
 		sessionID string
 		want      string
 	}{
 		{
-			name:      "english title slugged",
+			name:      "haiku slug preferred over title",
+			haikuSlug: "debug-payment-bug",
+			title:     "Help me fix the payment flow",
+			sessionID: "sess_abc",
+			want:      "session-debug-payment-bug-20260515-081214.html",
+		},
+		{
+			name:      "haiku slug from non-English session — saves UX for CJK",
+			haikuSlug: "supported-models-query",
+			title:     "现在支持哪些模型",
+			sessionID: "sess_abc",
+			want:      "session-supported-models-query-20260515-081214.html",
+		},
+		{
+			name:      "haiku failed → fall back to title-ASCII slug",
+			haikuSlug: "",
 			title:     "Refactor the loader",
 			sessionID: "sess_abc",
 			want:      "session-Refactor-the-loader-20260515-081214.html",
 		},
 		{
-			name:      "pure CJK title falls back to session id (S3 key safety)",
+			name:      "haiku failed + pure CJK title → session id (final fallback)",
+			haikuSlug: "",
 			title:     "现在支持哪些模型",
 			sessionID: "sess_abc",
 			want:      "session-sess_abc-20260515-081214.html",
 		},
 		{
-			name:      "mixed CJK + ASCII keeps only the ASCII portion",
+			name:      "haiku failed + mixed CJK title → keep ASCII portion",
+			haikuSlug: "",
 			title:     "前端 refactor 重构",
 			sessionID: "sess_abc",
 			want:      "session-refactor-20260515-081214.html",
 		},
 		{
-			name:      "cyrillic / arabic / japanese all strip cleanly",
+			name:      "haiku failed + cyrillic/arabic title → session id",
+			haikuSlug: "",
 			title:     "Привет мир こんにちは مرحبا",
 			sessionID: "sess_x",
 			want:      "session-sess_x-20260515-081214.html",
 		},
 		{
-			name:      "filesystem-unsafe chars stripped",
+			name:      "haiku failed + filesystem-unsafe chars stripped",
+			haikuSlug: "",
 			title:     "report/2025: q3/q4 ★",
 			sessionID: "sess_abc",
 			want:      "session-report2025-q3q4-20260515-081214.html",
 		},
 		{
-			name:      "empty title falls back to short session id",
+			name:      "everything empty falls back to session id",
+			haikuSlug: "",
 			title:     "",
 			sessionID: "2026-05-15-ec4484bab957",
 			want:      "session-2026-05-15-ec4484bab957-20260515-081214.html",
 		},
 		{
-			name:      "title that sanitizes to empty falls back",
+			name:      "title sanitizes to empty + haiku empty → session id",
+			haikuSlug: "",
 			title:     "????///***",
 			sessionID: "sess_xyz",
 			want:      "session-sess_xyz-20260515-081214.html",
 		},
-		{
-			name:      "long ASCII title trimmed to 40 runes",
-			title:     strings.Repeat("a", 60),
-			sessionID: "sess_x",
-			want:      "session-" + strings.Repeat("a", 40) + "-20260515-081214.html",
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildShareFilename(tc.title, tc.sessionID, now)
+			got := buildShareFilename(tc.haikuSlug, tc.title, tc.sessionID, now)
 			if got != tc.want {
 				t.Errorf("got\n  %q\nwant\n  %q", got, tc.want)
 			}

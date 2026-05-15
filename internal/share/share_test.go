@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -12,28 +13,48 @@ import (
 
 // fakeCompleter satisfies ctxwin.Completer (and client.LLMClient.Complete)
 // without touching the network. Returns canned text or a canned error.
+//
+// share.Render fires TWO parallel Haiku calls (summary + slug) through
+// the same gateway, so the fake routes by system prompt: requests whose
+// system prompt mentions "slug generator" get slugOut, others get out.
+// This lets tests verify both calls independently without bespoke mocks.
 type fakeCompleter struct {
-	out string
-	err error
-	// seenSystemPrompt captures the system message from the most recent call
-	// so tests can assert that share called SummarizeForUser (not GenerateSummary).
+	out     string // default response (summary path)
+	slugOut string // response for the slug-prompt path (optional)
+	err     error
+	// seenSystemPrompt captures the most recent NON-slug system prompt
+	// (i.e. the summary path) so existing tests can keep asserting on it.
 	seenSystemPrompt string
 	// seenCacheSource captures the CacheSource tag from the most recent call.
 	// Tests use it to confirm the share endpoint pins "session_share" so
 	// Cloud-side billing can route it into the user-quota exempt bucket.
 	seenCacheSource string
+
+	mu sync.Mutex
 }
 
 func (f *fakeCompleter) Complete(ctx context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
+	var sys string
 	for _, m := range req.Messages {
 		if m.Role == "system" {
-			f.seenSystemPrompt = m.Content.Text()
+			sys = m.Content.Text()
 			break
 		}
 	}
+	isSlug := strings.Contains(sys, "URL slug generator")
+
+	f.mu.Lock()
 	f.seenCacheSource = req.CacheSource
+	if !isSlug {
+		f.seenSystemPrompt = sys
+	}
+	f.mu.Unlock()
+
 	if f.err != nil {
 		return nil, f.err
+	}
+	if isSlug {
+		return &client.CompletionResponse{OutputText: f.slugOut}, nil
 	}
 	return &client.CompletionResponse{OutputText: f.out}, nil
 }
@@ -176,6 +197,97 @@ func TestRender_NilSessionErrors(t *testing.T) {
 	_, err := Render(context.Background(), nil, nil, Options{})
 	if err == nil {
 		t.Fatalf("expected error for nil session")
+	}
+}
+
+func TestRender_PropagatesHaikuSlug(t *testing.T) {
+	// share.Render fires summary + slug in parallel. Assert the slug call
+	// happens, its output is captured into RenderResult.Slug, and the
+	// summary path still works concurrently.
+	sess := &session.Session{
+		ID:    "s1",
+		Title: "现在支持哪些模型",
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("现在 Kocoro 支持哪些模型？")},
+		},
+	}
+	gw := &fakeCompleter{
+		out:     "# 对话总结\n用户询问支持的模型。",
+		slugOut: "supported-models-query",
+	}
+	res, err := Render(context.Background(), gw, sess, Options{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if res.Slug != "supported-models-query" {
+		t.Errorf("Slug = %q, want %q", res.Slug, "supported-models-query")
+	}
+	if res.SummaryFallback {
+		t.Errorf("summary should have succeeded alongside slug")
+	}
+}
+
+func TestRender_EmptySlugOnHaikuError(t *testing.T) {
+	// When Haiku errors, BOTH parallel calls fail (same gateway). slug
+	// returns empty so the handler can fall back to title-ASCII slug.
+	sess := &session.Session{
+		ID:    "s1",
+		Title: "fallback",
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("hi")},
+		},
+	}
+	gw := &fakeCompleter{err: errors.New("upstream 500")}
+	res, err := Render(context.Background(), gw, sess, Options{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if res.Slug != "" {
+		t.Errorf("Slug = %q on error, want empty", res.Slug)
+	}
+	if !res.SummaryFallback {
+		t.Errorf("summary should fall back on same error")
+	}
+}
+
+func TestCleanSlug(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"already clean", "debug-payment-flow", "debug-payment-flow"},
+		{"mixed case lowercased", "Debug-Payment-Flow", "debug-payment-flow"},
+		{"strips leading 'slug:' preamble", "slug: refactor-loader", "refactor-loader"},
+		{"strips 'Output:' preamble", "Output: machine-learning-basics", "machine-learning-basics"},
+		{"strips surrounding quotes", `"loader-refactor"`, "loader-refactor"},
+		{"strips backticks", "`payment-bug-fix`", "payment-bug-fix"},
+		{"strips trailing period", "list-desktop-files.", "list-desktop-files"},
+		{"underscore and space collapse to hyphen", "list desktop files", "list-desktop-files"},
+		{"slash separator", "refactor/loader", "refactor-loader"},
+		{"collapses consecutive hyphens", "debug--payment---bug", "debug-payment-bug"},
+		{"strips leading/trailing hyphens", "-refactor-loader-", "refactor-loader"},
+		{"rejects too short (1 char)", "a", ""},
+		{"rejects pure punctuation", "...", ""},
+		{"rejects unicode-only", "你好世界", ""},
+		{"caps at 40 runes", strings.Repeat("a", 60), strings.Repeat("a", 40)},
+		{"empty input", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cleanSlug(tc.in)
+			if got != tc.want {
+				t.Errorf("cleanSlug(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGenerateEnglishSlug_NilGateway(t *testing.T) {
+	sess := &session.Session{ID: "s1", Title: "test"}
+	got := generateEnglishSlug(context.Background(), nil, sess, nil)
+	if got != "" {
+		t.Errorf("nil gw should return empty, got %q", got)
 	}
 }
 

@@ -131,7 +131,7 @@ func (s *Server) handleSessionShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filename := buildShareFilename(sess.Title, sess.ID, time.Now().UTC())
+	filename := buildShareFilename(result.Slug, sess.Title, sess.ID, time.Now().UTC())
 
 	uploadsClient := uploads.NewClient(cfg.Endpoint, cfg.APIKey, s.deps.GW.HTTPClient())
 
@@ -220,19 +220,21 @@ func (s *Server) handleSessionShareRetract(w http.ResponseWriter, r *http.Reques
 //
 // Shape:  session-<slug>-<YYYYMMDD-HHMMSS>.html
 //
-// - session- prefix     — disambiguates from publish_to_web / generate_image
-//                         uploads in a mixed listing.
-// - slug                — sanitized session.Title; non-ASCII (CJK etc.)
-//                         characters preserved verbatim, filesystem-unsafe
-//                         chars stripped, whitespace runs collapsed to "-",
-//                         length capped at 40 runes. Empty/all-stripped
-//                         titles fall back to the session-ID short prefix.
-// - timestamp           — keeps repeat shares of the same session unique
-//                         and provides a chronological hint.
+// Slug source priority (each falls back when the previous yields empty):
+//  1. haikuSlug — Haiku-generated English slug ("debug-payment-bug"),
+//     ASCII-only by construction. Best UX for non-English sessions.
+//  2. slugifyTitleForFilename(title) — ASCII portion of the session title
+//     ("Refactor the loader" → "Refactor-the-loader"). Used when Haiku is
+//     unavailable but the title has usable ASCII content.
+//  3. sessionID short prefix — last-resort identifier; loses topic info
+//     but stays unique and S3-safe.
 //
 // Total length stays well under typical filesystem / S3 key limits (256B).
-func buildShareFilename(title, sessionID string, now time.Time) string {
-	slug := slugifyTitleForFilename(title)
+func buildShareFilename(haikuSlug, title, sessionID string, now time.Time) string {
+	slug := strings.TrimSpace(haikuSlug)
+	if slug == "" {
+		slug = slugifyTitleForFilename(title)
+	}
 	if slug == "" {
 		short := sessionID
 		if len(short) > 24 {

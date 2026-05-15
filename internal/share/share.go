@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -39,6 +40,12 @@ type RenderResult struct {
 	// SummaryFallback is true when Haiku was unreachable / errored / produced
 	// empty output and the page used Title / first-user-message instead.
 	SummaryFallback bool
+	// Slug is the Haiku-generated English URL slug ("debug-payment-bug"
+	// style), empty when generation failed or returned malformed output.
+	// Callers use this as the preferred filename source — it gives non-
+	// English sessions readable filenames without risking the CJK-key
+	// encoding issues that drove the ASCII-only fallback path.
+	Slug string
 }
 
 // Render is the orchestrator the daemon endpoint calls. It sanitizes the
@@ -61,7 +68,26 @@ func Render(ctx context.Context, gw ctxwin.Completer, sess *session.Session, opt
 
 	sanitizedMsgs, sanitizedMeta := Sanitize(sess.Messages, sess.MessageMeta, opts)
 
-	summary, fallback := generateSummary(ctx, gw, sanitizedMsgs, sess)
+	// Summary and slug are two independent Haiku calls — run in parallel
+	// so the slug doesn't add wall-clock time (summary is the longer of
+	// the two and dominates). Both inherit ctx, so user cancellation
+	// (e.g. Desktop dialog dismissed mid-render) reaches both.
+	var (
+		summary  string
+		fallback bool
+		slug     string
+		wg       sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		summary, fallback = generateSummary(ctx, gw, sanitizedMsgs, sess)
+	}()
+	go func() {
+		defer wg.Done()
+		slug = generateEnglishSlug(ctx, gw, sess, sanitizedMsgs)
+	}()
+	wg.Wait()
 
 	html, err := RenderHTML(RenderInput{
 		Session:     sess,
@@ -78,6 +104,7 @@ func Render(ctx context.Context, gw ctxwin.Completer, sess *session.Session, opt
 		HTML:            html,
 		Summary:         summary,
 		SummaryFallback: fallback,
+		Slug:            slug,
 	}, nil
 }
 
