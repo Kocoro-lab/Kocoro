@@ -39,6 +39,15 @@ func compressImage(data []byte, mediaType string) ([]byte, string, error) {
 	// fast path preserves the legacy "passthrough invalid bytes" behavior
 	// downstream callers may rely on, and the slow path's image.Decode
 	// produces a clean decode error.
+	//
+	// oversizeDim trips when max(W,H) > CompressionMaxDimension. Anthropic
+	// applies a 2000px per-side limit when a single request carries >20
+	// images ("many-image requests"), separate from the 8000px single-image
+	// limit. Wide PNG screenshots compress small (a 2588×690 screenshot of
+	// UI chrome zlibs to ~600 KB) so the byte fast path alone lets them
+	// reach the wire and earn a 400. The dimension flag forces them through
+	// downscaleToFit even when bytes are tiny.
+	oversizeDim := false
 	if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(data)); cfgErr == nil {
 		if int64(cfg.Width)*int64(cfg.Height) > MaxImagePixelBudget {
 			return nil, "", fmt.Errorf(
@@ -46,9 +55,10 @@ func compressImage(data []byte, mediaType string) ([]byte, string, error) {
 				cfg.Width, cfg.Height, MaxImagePixelBudget,
 			)
 		}
+		oversizeDim = cfg.Width > CompressionMaxDimension || cfg.Height > CompressionMaxDimension
 	}
 
-	if len(data) <= TargetRawImageBytes {
+	if !oversizeDim && len(data) <= TargetRawImageBytes {
 		return data, mediaType, nil
 	}
 

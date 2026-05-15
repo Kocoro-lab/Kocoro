@@ -229,3 +229,171 @@ func TestCompressImage_RejectsPixelBomb(t *testing.T) {
 		t.Errorf("error should mention 'pixel budget', got: %v", err)
 	}
 }
+
+// TestCompressImage_OversizeDimSmallBytes_GetsResized covers Anthropic's
+// many-image 2000px constraint: when a single request contains >20 images,
+// per-side limit drops from 8000 to 2000 px. A wide Retina screenshot (e.g.
+// 2588×690 PNG of UI chrome) zlib-compresses well below TargetRawImageBytes
+// (3.75 MB), so the legacy byte-only fast path passes it through unchanged
+// and Anthropic returns 400. The dimension fast-path guard must trigger
+// re-encode whenever max(W,H) > CompressionMaxDimension regardless of size.
+func TestCompressImage_OversizeDimSmallBytes_GetsResized(t *testing.T) {
+	// Uniform Gray PNG at 2588×690 — same dimensions as the production
+	// screenshot that triggered the original 400. PNG compresses uniform
+	// gray to a few KB, well under TargetRawImageBytes.
+	img := image.NewGray(image.Rect(0, 0, 2588, 690))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode fixture: %v", err)
+	}
+	if len(buf.Bytes()) > TargetRawImageBytes {
+		t.Fatalf("fixture too big (%d > %d) — defeats test premise",
+			len(buf.Bytes()), TargetRawImageBytes)
+	}
+	data, mt, err := compressImage(buf.Bytes(), "image/png")
+	if err != nil {
+		t.Fatalf("compressImage: %v", err)
+	}
+	// Output must respect 2000px cap.
+	var out image.Image
+	switch mt {
+	case "image/jpeg":
+		out, err = jpeg.Decode(bytes.NewReader(data))
+	case "image/png":
+		out, err = png.Decode(bytes.NewReader(data))
+	default:
+		t.Fatalf("unexpected output media type %q", mt)
+	}
+	if err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	if out.Bounds().Dx() > CompressionMaxDimension || out.Bounds().Dy() > CompressionMaxDimension {
+		t.Fatalf("output not resized under %dpx: got %dx%d",
+			CompressionMaxDimension, out.Bounds().Dx(), out.Bounds().Dy())
+	}
+}
+
+// TestCompressImage_BoundaryDim2000_Passthrough verifies the dimension check
+// uses strict `>` not `>=`. Anthropic's error message says "exceed max
+// allowed size: 2000 pixels", and `downscaleToFit` is a no-op at exactly the
+// limit. So a 2000×2000 image must NOT be re-encoded — passthrough preserves
+// the original PNG bytes, keeping prompt cache byte-stable and avoiding a
+// pointless JPEG re-encode at the boundary.
+func TestCompressImage_BoundaryDim2000_Passthrough(t *testing.T) {
+	img := image.NewGray(image.Rect(0, 0, CompressionMaxDimension, CompressionMaxDimension))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(buf.Bytes()) > TargetRawImageBytes {
+		t.Fatalf("fixture too big (%d > %d); test premise broken",
+			len(buf.Bytes()), TargetRawImageBytes)
+	}
+	data, mt, err := compressImage(buf.Bytes(), "image/png")
+	if err != nil {
+		t.Fatalf("compressImage: %v", err)
+	}
+	if !bytes.Equal(data, buf.Bytes()) || mt != "image/png" {
+		t.Fatalf("exactly 2000x2000 must passthrough unchanged; got %d bytes, mt=%q (input %d bytes)",
+			len(data), mt, len(buf.Bytes()))
+	}
+}
+
+// TestCompressImage_BoundaryDim2001_TriggersResize verifies one pixel above
+// the cap forces re-encode, regardless of byte size.
+func TestCompressImage_BoundaryDim2001_TriggersResize(t *testing.T) {
+	img := image.NewGray(image.Rect(0, 0, CompressionMaxDimension+1, 100))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(buf.Bytes()) > TargetRawImageBytes {
+		t.Fatalf("fixture too big; test premise broken")
+	}
+	data, mt, err := compressImage(buf.Bytes(), "image/png")
+	if err != nil {
+		t.Fatalf("compressImage: %v", err)
+	}
+	if mt != "image/jpeg" {
+		t.Fatalf("2001x100 must trigger JPEG re-encode, got %q", mt)
+	}
+	out, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("decode JPEG: %v", err)
+	}
+	if out.Bounds().Dx() > CompressionMaxDimension {
+		t.Fatalf("output not resized: %d > %d", out.Bounds().Dx(), CompressionMaxDimension)
+	}
+}
+
+// TestCompressImage_OversizeDimAndOversizeBytes covers the dual-violation
+// case: 3024×1964 / 6.3 MB raw bytes — original 17:47-binary code already
+// downscaled this via the byte path. The fix must preserve that behavior,
+// not get into a redundant re-encode loop.
+func TestCompressImage_OversizeDimAndOversizeBytes(t *testing.T) {
+	raw := makeNoisePNG(t, 3024, 1964)
+	if len(raw) <= TargetRawImageBytes {
+		t.Fatalf("fixture must exceed byte cap; got %d", len(raw))
+	}
+	data, mt, err := compressImage(raw, "image/png")
+	if err != nil {
+		t.Fatalf("compressImage: %v", err)
+	}
+	if mt != "image/jpeg" {
+		t.Fatalf("expected JPEG, got %q", mt)
+	}
+	out, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("decode JPEG: %v", err)
+	}
+	if out.Bounds().Dx() > CompressionMaxDimension || out.Bounds().Dy() > CompressionMaxDimension {
+		t.Fatalf("output not within %dpx: %dx%d", CompressionMaxDimension, out.Bounds().Dx(), out.Bounds().Dy())
+	}
+	if encoded := base64.StdEncoding.EncodedLen(len(data)); encoded > client.MaxInlineImageBase64Bytes {
+		t.Fatalf("encoded base64 over inline limit: %d", encoded)
+	}
+}
+
+// TestCompressInlineImageSource_OversizeDimSmallBytes_GetsResized covers the
+// same Anthropic many-image 2000px rule, but on the inline-image path
+// (daemon.resolveContentBlocks → CompressInlineImageSource). Without a
+// dimension check, a small-byte but wide screenshot pushed inline by
+// cloud/Desktop bypasses compressImage entirely because the function
+// short-circuits when base64 length is under MaxInlineImageBase64Bytes.
+func TestCompressInlineImageSource_OversizeDimSmallBytes_GetsResized(t *testing.T) {
+	img := image.NewGray(image.Rect(0, 0, 2588, 690))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode fixture: %v", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(buf.Bytes())
+	if len(encoded) > client.MaxInlineImageBase64Bytes {
+		t.Fatalf("fixture too big for test premise: %d > %d",
+			len(encoded), client.MaxInlineImageBase64Bytes)
+	}
+	src := &client.ImageSource{Type: "base64", MediaType: "image/png", Data: encoded}
+	out := CompressInlineImageSource(src)
+	if out == src {
+		t.Fatal("expected re-encoded source (different pointer) for 2588×690 input")
+	}
+	raw, err := base64.StdEncoding.DecodeString(out.Data)
+	if err != nil {
+		t.Fatalf("decode b64 output: %v", err)
+	}
+	var decoded image.Image
+	switch out.MediaType {
+	case "image/jpeg":
+		decoded, err = jpeg.Decode(bytes.NewReader(raw))
+	case "image/png":
+		decoded, err = png.Decode(bytes.NewReader(raw))
+	default:
+		t.Fatalf("unexpected output media type %q", out.MediaType)
+	}
+	if err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	if decoded.Bounds().Dx() > CompressionMaxDimension || decoded.Bounds().Dy() > CompressionMaxDimension {
+		t.Fatalf("inline source not resized under %dpx: got %dx%d",
+			CompressionMaxDimension, decoded.Bounds().Dx(), decoded.Bounds().Dy())
+	}
+}
