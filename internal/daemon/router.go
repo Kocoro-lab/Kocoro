@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
@@ -22,8 +23,15 @@ var ErrRouteActive = errors.New("route has an active run")
 type routeEntry struct {
 	mu            sync.Mutex
 	cancel        context.CancelFunc
-	cancelPending bool // set under sc.mu when CancelRoute fires before cancel is assigned
-	done          chan struct{}
+	cancelPending bool                    // set under sc.mu when CancelRoute fires before cancel is assigned
+	pendingReason agenttypes.CancelReason // reason for the pending cancel (set with cancelPending)
+	// cancelCause is the optional reason-tagged variant of cancel. Runner.go
+	// registers both (cancel + cancelCause) when it owns the ctx — the legacy
+	// CancelFunc value lives in cancel; the typed one in cancelCause. CancelRoute
+	// prefers cancelCause when present so the loop can extract the reason via
+	// agenttypes.ExtractReason(context.Cause(ctx)).
+	cancelCause context.CancelCauseFunc
+	done        chan struct{}
 	// sessionID is atomic so CancelBySessionID can scan all routes without
 	// blocking on entry.mu held by an active run. Writers in the runner
 	// already hold entry.mu (per the resume invariant); the atomic only
@@ -34,6 +42,12 @@ type routeEntry struct {
 	activeCWD  string
 	evicting   bool
 	manager    *session.Manager
+	// mailbox is the persisted per-route message queue (Phase 1+).
+	// Lazily created on first EnsureMailbox; nil for routes that have
+	// never queued. Coexists with injectCh — injectCh is the legacy
+	// in-memory mid-run path, mailbox is the durability-first path for
+	// new ack-on-persist semantics.
+	mailbox *agenttypes.Mailbox
 }
 
 // loadSessionID returns the route's current session ID, or "" if unset.
@@ -61,22 +75,41 @@ func cloneSessionSnapshot(sess *session.Session) *session.Session {
 }
 
 // SessionCache separates route-level locking from session storage.
-// - routes: one lock/cancel/inflight channel per routing key
-// - managers: one shared session.Manager per sessions directory for non-routed usage
-// - route manager: lazily created session.Manager per route for routed runs
+//   - routes: one lock/cancel/inflight channel per routing key
+//   - managers: one shared session.Manager per sessions directory for non-routed usage
+//   - route manager: lazily created session.Manager per route for routed runs
+//   - mailboxStore: optional SQLite-backed durability for per-route mailboxes
+//     (nil disables persistence; tests typically pass nil)
+//   - mailboxCap: per-route mailbox capacity cap (defaults to 100)
 type SessionCache struct {
-	mu         sync.Mutex
-	routes     map[string]*routeEntry
-	managers   map[string]*session.Manager
-	shannonDir string
+	mu           sync.Mutex
+	routes       map[string]*routeEntry
+	managers     map[string]*session.Manager
+	shannonDir   string
+	mailboxStore *MailboxStore
+	mailboxCap   int
 }
 
 // NewSessionCache creates a cache rooted at the given shannon directory.
+// Mailbox persistence is disabled (callers that want crash recovery should use
+// NewSessionCacheWithMailbox).
 func NewSessionCache(shannonDir string) *SessionCache {
+	return NewSessionCacheWithMailbox(shannonDir, nil, 0)
+}
+
+// NewSessionCacheWithMailbox creates a cache with the given mailbox store and
+// per-route capacity cap. A non-nil store enables persistence + recovery; a
+// zero capacity falls back to the agenttypes default (100).
+func NewSessionCacheWithMailbox(shannonDir string, store *MailboxStore, capacity int) *SessionCache {
+	if capacity <= 0 {
+		capacity = 100
+	}
 	return &SessionCache{
-		routes:     make(map[string]*routeEntry),
-		managers:   make(map[string]*session.Manager),
-		shannonDir: shannonDir,
+		routes:       make(map[string]*routeEntry),
+		managers:     make(map[string]*session.Manager),
+		shannonDir:   shannonDir,
+		mailboxStore: store,
+		mailboxCap:   capacity,
 	}
 }
 
