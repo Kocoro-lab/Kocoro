@@ -1206,6 +1206,11 @@ type ToolExecuteResponse struct {
 	// xAI Grok tokens for x_search, SerpAPI query count for web_search).
 	// Server-populated when available; nil when the tool does not bill per call.
 	Usage *ToolUsage `json:"usage,omitempty"`
+	// Metadata carries structured diagnostics from the cloud-side tool
+	// (e.g. web_fetch's per-provider `attempts` ladder). Used by
+	// tools.ServerTool.Run to surface root causes in the LLM-facing tool_result
+	// content when the top-level Error reflects only the last fallback's error.
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // ToolUsage captures cost information reported by a gateway tool execution.
