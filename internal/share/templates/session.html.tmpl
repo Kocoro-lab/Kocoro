@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="{{.Lang}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{{.Title}} · Kocoro</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    /* Warm cream palette inspired by Claude.ai — feels approachable, not clinical.
+       Avoid sterile pure-white backgrounds; cream reads better for long-form text. */
+    --bg: #F8F5EE;
+    --surface: #FFFCF5;
+    --surface-2: #F2EDE2;
+    --fg: #1B1A17;
+    --fg-soft: #4A463F;
+    --muted: #8A857C;
+    --border: #E5DFD0;
+    --border-soft: #EFEADE;
+    --accent: #C96442;
+    --accent-soft: #E89274;
+    --code-bg: #F0EBE0;
+    --code-fg: #1B1A17;
+    --shadow-soft: 0 1px 2px rgba(40, 30, 20, 0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1B1A17;
+      --surface: #232220;
+      --surface-2: #1F1E1B;
+      --fg: #E8E2D5;
+      --fg-soft: #BFB8A9;
+      --muted: #7A746B;
+      --border: #2F2D29;
+      --border-soft: #29272300;
+      --accent: #D67855;
+      --accent-soft: #F09375;
+      --code-bg: #14130F;
+      --code-fg: #E8E2D5;
+      --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.4);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI",
+      "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+    font-size: 16px;
+    line-height: 1.65;
+  }
+  main {
+    max-width: 740px;
+    margin: 0 auto;
+    padding: 56px 24px 96px;
+  }
+  @media (max-width: 600px) {
+    main { padding: 32px 16px 64px; }
+    body { font-size: 15px; }
+  }
+
+  /* ===== Header ===== */
+  header.share-header {
+    margin-bottom: 40px;
+  }
+  header.share-header h1 {
+    margin: 0 0 10px;
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.012em;
+    line-height: 1.25;
+    color: var(--fg);
+  }
+  header.share-header .meta {
+    color: var(--muted);
+    font-size: 13.5px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+  }
+  header.share-header .meta .dot { color: var(--border); }
+  header.share-header .meta code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    color: var(--fg-soft);
+  }
+
+  /* ===== Summary card ===== */
+  .summary {
+    margin-top: 28px;
+    padding: 24px 26px;
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-radius: 12px;
+    box-shadow: var(--shadow-soft);
+  }
+  .summary .label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 14px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+  }
+  .summary .label::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  .summary .body { color: var(--fg-soft); }
+  .summary .body > *:first-child { margin-top: 0; }
+  .summary .body > *:last-child { margin-bottom: 0; }
+
+  /* ===== Conversation ===== */
+  .conversation { margin-top: 16px; }
+
+  /* Centered uppercase label flanked by thin lines — separates the summary
+     card from the actual transcript so the reader knows the synopsis ends
+     here and live conversation starts. Style matches the summary label
+     family (uppercase, letter-spaced, muted) without competing with it. */
+  .section-divider {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin: 40px 0 20px;
+  }
+  .section-divider::before,
+  .section-divider::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+  .section-divider span {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  article.msg {
+    margin: 28px 0;
+    word-wrap: break-word;
+  }
+  article.msg:first-child { margin-top: 8px; }
+
+  /* User: subtle right-leaning bubble — keeps the visual asymmetry of a
+     conversation while staying flat (no shadows). */
+  article.msg.user {
+    display: flex;
+    justify-content: flex-end;
+  }
+  article.msg.user .bubble {
+    max-width: 88%;
+    padding: 14px 18px;
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-radius: 18px 18px 4px 18px;
+    color: var(--fg);
+  }
+  article.msg.user .role { display: none; } /* implicit from bubble alignment */
+
+  /* Assistant + tool: full-width, no bubble — the page itself is the surface.
+     A subtle accent dot on the left provides the only visual marker. Tool
+     messages (Anthropic-API user role carrying only tool_result blocks) use
+     a muted color to mark them as agent-loop flow rather than typed input. */
+  article.msg.assistant,
+  article.msg.tool {
+    position: relative;
+    padding-left: 18px;
+  }
+  article.msg.assistant::before,
+  article.msg.tool::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 12px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+  }
+  article.msg.assistant::before { background: var(--accent); }
+  article.msg.tool::before      { background: var(--muted); }
+
+  .role {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    margin-bottom: 6px;
+    letter-spacing: 0.02em;
+  }
+  .role time {
+    font-weight: 400;
+    margin-left: 8px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ===== Rendered markdown content ===== */
+  .content {
+    /* overflow-wrap: anywhere — break long unwordable tokens (URLs, hashes)
+       only when needed; natural word/CJK boundaries still wrap normally. */
+    overflow-wrap: anywhere;
+    word-wrap: break-word;
+  }
+  .content > *:first-child { margin-top: 0; }
+  .content > *:last-child { margin-bottom: 0; }
+  .content p { margin: 0 0 14px; }
+  .content h1, .content h2, .content h3, .content h4 {
+    margin: 22px 0 10px;
+    line-height: 1.3;
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .content h1 { font-size: 20px; }
+  .content h2 { font-size: 17px; }
+  .content h3 { font-size: 15.5px; }
+  .content h4 { font-size: 14.5px; color: var(--fg-soft); }
+  .content ul, .content ol { margin: 0 0 14px; padding-left: 24px; }
+  .content li { margin: 4px 0; }
+  .content li > p { margin: 0 0 6px; }
+  .content a {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .content a:hover { border-bottom-color: var(--accent); }
+  .content blockquote {
+    margin: 14px 0;
+    padding: 2px 14px;
+    border-left: 3px solid var(--border);
+    color: var(--fg-soft);
+  }
+  .content hr {
+    border: 0;
+    border-top: 1px solid var(--border);
+    margin: 28px 0;
+  }
+  .content code {
+    background: var(--code-bg);
+    padding: 1.5px 5px;
+    border-radius: 4px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.88em;
+    color: var(--code-fg);
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .content pre {
+    background: var(--code-bg);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin: 14px 0;
+    overflow-x: auto;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--code-fg);
+  }
+  .content pre code {
+    background: transparent;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+  }
+  .content table {
+    border-collapse: collapse;
+    margin: 14px 0;
+    font-size: 14px;
+    width: 100%;
+  }
+  .content table th,
+  .content table td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .content table th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .content img {
+    max-width: 100%;
+    height: auto;
+    margin: 10px 0;
+    border-radius: 8px;
+    border: 1px solid var(--border-soft);
+  }
+
+  /* Standalone images (image content blocks attached to messages) */
+  .msg-image {
+    margin: 10px 0;
+    max-width: 100%;
+    height: auto;
+    border-radius: 8px;
+    border: 1px solid var(--border-soft);
+    display: block;
+  }
+
+  /* ===== Tool calls — folded by default, muted styling ===== */
+  details.tool {
+    margin: 10px 0;
+    background: var(--surface-2);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  details.tool > summary {
+    padding: 9px 14px;
+    cursor: pointer;
+    font-size: 12.5px;
+    color: var(--muted);
+    list-style: none;
+    user-select: none;
+    transition: background 0.12s ease;
+  }
+  details.tool > summary::-webkit-details-marker { display: none; }
+  details.tool > summary::before {
+    content: "▸";
+    display: inline-block;
+    margin-right: 8px;
+    color: var(--muted);
+    font-size: 9px;
+    transform: translateY(-1px);
+    transition: transform 0.15s ease;
+  }
+  details.tool[open] > summary::before { transform: rotate(90deg) translateX(-1px); }
+  details.tool > summary:hover { background: var(--surface); }
+  details.tool > summary .name {
+    color: var(--fg);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+  }
+  details.tool > summary .badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    background: var(--code-bg);
+    color: var(--muted);
+    border-radius: 4px;
+    font-size: 11px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  details.tool .tool-body {
+    padding: 0 14px 12px;
+  }
+  details.tool pre {
+    margin: 8px 0 0;
+    padding: 12px 14px;
+    background: var(--code-bg);
+    border-radius: 6px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--code-fg);
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: 480px;
+  }
+  details.tool img {
+    max-width: 100%;
+    height: auto;
+    margin: 8px 0 0;
+    border-radius: 6px;
+    border: 1px solid var(--border-soft);
+  }
+  details.tool.error > summary .name { color: #B84A2A; }
+  details.tool.error > summary .badge { background: #FBE5DC; color: #B84A2A; }
+  @media (prefers-color-scheme: dark) {
+    details.tool.error > summary .name { color: #E37553; }
+    details.tool.error > summary .badge { background: #3D1F14; color: #E37553; }
+  }
+
+  /* ===== Footer ===== */
+  footer.share-footer {
+    margin-top: 64px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 12.5px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  footer.share-footer a {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 500;
+  }
+  footer.share-footer a:hover { text-decoration: underline; }
+  footer.share-footer code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11.5px;
+    color: var(--fg-soft);
+  }
+</style>
+</head>
+<body>
+<main>
+<header class="share-header">
+  <h1>{{.Title}}</h1>
+  <div class="meta">
+    {{if .AgentName}}<span><code>{{.AgentName}}</code></span><span class="dot">·</span>{{end}}
+    <span>{{.MessageCount}} message{{if ne .MessageCount 1}}s{{end}}</span>
+    {{if .CreatedAt}}<span class="dot">·</span><time datetime="{{.CreatedAtISO}}">{{.CreatedAt}}</time>{{end}}
+  </div>
+  {{if .SummaryHTML}}
+  <section class="summary">
+    <div class="label">Summary</div>
+    <div class="body content">{{.SummaryHTML}}</div>
+  </section>
+  {{end}}
+</header>
+
+<section class="conversation">
+  {{if .SummaryHTML}}
+  <div class="section-divider"><span>Conversation</span></div>
+  {{end}}
+{{range .Messages}}
+<article class="msg {{.Role}}">
+  {{if and (eq .Role "user") .BubbleBlocks}}
+    <div class="bubble">
+      {{range .BubbleBlocks}}
+        {{if eq .Kind "text"}}<div class="content">{{.HTML}}</div>{{end}}
+        {{if eq .Kind "image"}}<img class="msg-image" src="{{.ImageDataURI}}" alt="attached image" loading="lazy">{{end}}
+      {{end}}
+    </div>
+  {{else if .BubbleBlocks}}
+    <div class="role">
+      {{.RoleLabel}}{{if .Timestamp}}<time datetime="{{.TimestampISO}}">{{.Timestamp}}</time>{{end}}
+    </div>
+    {{range .BubbleBlocks}}
+      {{if eq .Kind "text"}}<div class="content">{{.HTML}}</div>{{end}}
+      {{if eq .Kind "image"}}<img class="msg-image" src="{{.ImageDataURI}}" alt="attached image" loading="lazy">{{end}}
+    {{end}}
+  {{end}}
+  {{if .AsideBlocks}}
+    {{if not .BubbleBlocks}}
+      <div class="role">
+        {{.RoleLabel}}{{if .Timestamp}}<time datetime="{{.TimestampISO}}">{{.Timestamp}}</time>{{end}}
+      </div>
+    {{end}}
+    {{range .AsideBlocks}}
+      {{if eq .Kind "tool_use"}}
+        <details class="tool">
+          <summary><span class="name">{{.ToolName}}</span><span class="badge">tool call</span></summary>
+          <div class="tool-body">
+            {{if .ToolInput}}<pre>{{.ToolInput}}</pre>{{end}}
+          </div>
+        </details>
+      {{end}}
+      {{if eq .Kind "tool_result"}}
+        <details class="tool{{if .ToolResultIsError}} error{{end}}">
+          <summary><span class="name">tool result</span><span class="badge">{{if .ToolResultIsError}}error{{else}}output{{end}}</span></summary>
+          <div class="tool-body">
+            {{if .ToolResultText}}<pre>{{.ToolResultText}}</pre>{{end}}
+            {{range .NestedImages}}<img src="{{.}}" alt="tool image" loading="lazy">{{end}}
+          </div>
+        </details>
+      {{end}}
+    {{end}}
+  {{end}}
+</article>
+{{end}}
+</section>
+
+<footer class="share-footer">
+  <span>Shared from <a href="https://kocoro.ai">Kocoro</a></span>
+  {{if .GeneratedAt}}<span>{{.GeneratedAt}}</span>{{end}}
+</footer>
+</main>
+</body>
+</html>

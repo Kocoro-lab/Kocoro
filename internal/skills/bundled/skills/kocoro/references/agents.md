@@ -112,6 +112,18 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Response: `{"status": "reset", "id": "..."}`
 - Notes: Clears the session's conversation history while keeping the session ID, title, CWD, source, channel, and cumulative usage. Cancels any active run on that session first. Also clears any persisted route binding (the link from a messaging-platform thread/sender to this session) and the live in-memory binding, so the next inbound message on that route starts a fresh session. The `agent` query parameter is REQUIRED — default-agent sessions do not use this endpoint; delete and recreate them via `DELETE /sessions/{id}` instead. Use when the user says "reset", "clear history", or "start over" on a named agent whose routing identity must survive the wipe.
 
+### Share session as HTML
+- Method: POST
+- Path: /sessions/{id}/share[?agent={name}]
+- Response: `{"url": "https://...", "key": "...", "size": 12345, "upload_id": "uuid-or-empty", "summary_fallback": false}`
+- Notes: Renders the session as a self-contained HTML page and uploads it to the cloud uploads endpoint, returning a public CDN URL. The HTML embeds a Haiku-generated summary at the top, inlines image attachments as `data:` URIs, drops file/PDF attachments and `thinking` blocks, folds every tool call into a collapsible `<details>` element, and strips home-dir paths, attachment paths, env-var assignments, and recognizable API-key shapes. `upload_id` is resolved via a follow-up `GET /uploads` lookup matched by URL — usually populated, occasionally empty under concurrent uploads (in which case retract via `GET /uploads` + `DELETE /uploads/{id}`). `summary_fallback` is true when the Haiku call timed out or errored and the page used the session title (or first user message) as the summary instead. Requires `cloud.enabled` and a valid `api_key`; returns 503 otherwise. Returns 413 when rendered HTML exceeds 45 MiB (lower than the 50 MiB upload cap to leave headroom — usually means the session has too many large inline images). The same session may be shared repeatedly; each call uploads a new file (timestamp suffix in the name) and produces an independent `upload_id`.
+
+### Retract a shared session
+- Method: DELETE
+- Path: /sessions/{id}/share?upload_id={id}[&agent={name}]
+- Response: `{"deleted": true, "id": "uuid", "cdn_eviction_seconds": 300}`
+- Notes: Thin session-context wrapper around `DELETE /uploads/{id}`. Records a session-aware audit row instead of a generic upload-retraction log line; otherwise identical semantics. `cdn_eviction_seconds` is the worst-case window during which CloudFront edge nodes may still serve the cached page — surface it to the user so the URL "still working" for a few minutes does not look like a failed retract. Idempotent at the cloud layer: a second retract of the same `upload_id` returns 404 (cloud deliberately conflates not-found / already-retracted / cross-user to avoid existence leaks). Use `agent={name}` to match the same path namespace that the share POST used.
+
 ### `GET /agents/{name}/sessions/{id}/suggestion`
 
 Returns the latest prompt suggestion for the given session, or 404 if none.
