@@ -694,6 +694,58 @@ func TestBash_MaxTimeoutOverride_AcceptsConfiguredCap(t *testing.T) {
 	}
 }
 
+// TestBashTool_IsConcurrencySafeCall guards the config-gated wiring between
+// BashTool and the IsCommandConcurrencySafe analyzer. Phase A ships the gate
+// dark: when ConcurrencyEnabled is false (default), the method must return
+// false for every input so the dispatcher keeps the historical serial
+// behavior. When the flag is on, the method must delegate to the pure
+// analyzer — so the failing cases below double as regression guards for the
+// analyzer's review-hit fixes (newline split, `command` builtin bypass,
+// `git remote add`, `go env -w`, BSD `date` clock-set form).
+func TestBashTool_IsConcurrencySafeCall(t *testing.T) {
+	// Flag-off path: every input must return false.
+	off := &BashTool{ConcurrencyEnabled: false}
+	for _, arg := range []string{
+		`{"command":"git status"}`,
+		`{"command":"ls -la"}`,
+		`{"command":"echo hi"}`,
+	} {
+		if off.IsConcurrencySafeCall(arg) {
+			t.Errorf("expected false when ConcurrencyEnabled=false on %q", arg)
+		}
+	}
+
+	// Flag-on path: delegate to analyzer.
+	on := &BashTool{ConcurrencyEnabled: true}
+	cases := []struct {
+		args string
+		want bool
+	}{
+		{`{"command":"git status"}`, true},
+		{`{"command":"ls -la"}`, true},
+		{`{"command":"git push"}`, false},
+		{`{"command":"ls && rm x"}`, false},
+		{`{"command":""}`, false},
+		{`not json`, false},
+		{`{}`, false},
+		{`{"command":"git status","description":"check repo state"}`, true},
+		// Regression guards for analyzer fixes (these were the review hits).
+		{`{"command":"ls\nrm x"}`, false},
+		{`{"command":"command rm x"}`, false},
+		{`{"command":"git remote add foo https://x"}`, false},
+		{`{"command":"go env -w GOPROXY=x"}`, false},
+		{`{"command":"date 010100002026"}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.args, func(t *testing.T) {
+			got := on.IsConcurrencySafeCall(tc.args)
+			if got != tc.want {
+				t.Errorf("IsConcurrencySafeCall(%q) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestBash_ParallelProcessGroupKill verifies commit ee6a2e8's Setpgid +
 // SIGKILL-of-pgid fix: when the parent shell times out, background children
 // (e.g. `python -m http.server` left behind in the original bug report)

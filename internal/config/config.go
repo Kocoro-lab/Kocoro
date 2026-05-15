@@ -83,6 +83,13 @@ type AgentConfig struct {
 	IdleHardTimeoutSecs int   `mapstructure:"idle_hard_timeout_secs" yaml:"idle_hard_timeout_secs" json:"idle_hard_timeout_secs"`
 	SkillDiscovery      *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
 
+	// BashConcurrencyEnabled gates BashTool.IsConcurrencySafeCall. When false
+	// (the default), bash always runs as a size-1 sequential batch — matching
+	// behavior before the concurrency-alignment work. Flip to true only after
+	// Desktop clients ship the tool_use_id-aware UI; otherwise concurrent bash
+	// running/completed events may render on the wrong tool cards.
+	BashConcurrencyEnabled bool `mapstructure:"bash_concurrency_enabled" yaml:"bash_concurrency_enabled" json:"bash_concurrency_enabled"`
+
 	// TimeBasedCompact controls time-gated tool_result clearing. Disabled
 	// by default. When enabled, an old tool_result is cleared to a short
 	// marker only after the gap since the last assistant response exceeds
@@ -252,6 +259,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.context_window", 200000)
 	viper.SetDefault("agent.idle_soft_timeout_secs", 90)
 	viper.SetDefault("agent.idle_hard_timeout_secs", 0) // 0 = disabled; flip to <600 after dogfood
+	viper.SetDefault("agent.bash_concurrency_enabled", false) // Phase A: gate ships dark; flip after Desktop adopts tool_use_id-aware UI.
 	// Time-based microcompact. Disabled by default — short sessions never
 	// compact, and only sessions that idle past the gap threshold will
 	// clear old tool_results. 60min matches Anthropic's 1h prompt-cache

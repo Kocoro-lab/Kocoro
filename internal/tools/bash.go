@@ -43,6 +43,12 @@ type BashTool struct {
 	// fetched lazily at execution time and scoped to bash child processes
 	// only — they never enter prompt context or session transcripts.
 	SecretsStore *skills.SecretsStore
+	// ConcurrencyEnabled gates IsConcurrencySafeCall — when false (the
+	// default in Phase A) the method always returns false so the agent
+	// loop's partition dispatcher keeps bash on its historical size-1
+	// serial path. Wired from config.AgentConfig.BashConcurrencyEnabled
+	// by register.go (RegisterLocalTools + CloneWithRuntimeConfig).
+	ConcurrencyEnabled bool
 }
 
 type bashArgs struct {
@@ -290,6 +296,24 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 func (t *BashTool) RequiresApproval() bool { return true }
 
 func (t *BashTool) IsReadOnlyCall(string) bool { return false }
+
+// IsConcurrencySafeCall reports whether this specific bash invocation is safe
+// to run concurrently with other tool calls. Gated by ConcurrencyEnabled —
+// when off (the Phase A default), returns false unconditionally so the
+// dispatcher matches pre-feature serial behavior. When on, delegates to the
+// pure analyzer IsCommandConcurrencySafe.
+//
+// Parse failures and unknown JSON shapes default to false (fail-closed).
+func (t *BashTool) IsConcurrencySafeCall(argsStr string) bool {
+	if !t.ConcurrencyEnabled {
+		return false
+	}
+	var args bashArgs
+	if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
+		return false
+	}
+	return IsCommandConcurrencySafe(args.Command)
+}
 
 func (t *BashTool) IsSafe(command string) bool {
 	return isSafeCommand(command, t.ExtraSafeCommands)

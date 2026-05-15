@@ -78,6 +78,7 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 		if cfg.Tools.BashMaxTimeout > 0 {
 			bashTool.MaxTimeoutSecs = cfg.Tools.BashMaxTimeout
 		}
+		bashTool.ConcurrencyEnabled = cfg.Agent.BashConcurrencyEnabled
 	}
 	reg.Register(bashTool)
 
@@ -156,6 +157,7 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 				} else {
 					bashCopy.MaxTimeoutSecs = 0
 				}
+				bashCopy.ConcurrencyEnabled = cfg.Agent.BashConcurrencyEnabled
 			}
 			cloned.Register(&bashCopy)
 		}
