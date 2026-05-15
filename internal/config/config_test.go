@@ -376,6 +376,36 @@ func TestMergeRuntimeOverlayFile_MCPWorkspaceRoots(t *testing.T) {
 	}
 }
 
+// TestMergeRuntimeOverlayFile_BashConcurrencyEnabled guards the overlay path
+// for agent.bash_concurrency_enabled. Before the fix the field existed on
+// AgentConfig and viper.SetDefault marked it true (Phase C), but project /
+// local overlays could not override it back to false because
+// overlayAgentConfig was missing the field.
+func TestMergeRuntimeOverlayFile_BashConcurrencyEnabled(t *testing.T) {
+	dir := t.TempDir()
+	overlayPath := filepath.Join(dir, ".shannon", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(overlayPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	overlayYAML := "agent:\n  bash_concurrency_enabled: false\n"
+	if err := os.WriteFile(overlayPath, []byte(overlayYAML), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Seed config with the Phase C default (true).
+	cfg := &Config{Sources: map[string]ConfigSource{}}
+	cfg.Agent.BashConcurrencyEnabled = true
+
+	mergeRuntimeOverlayFile(cfg, overlayPath, "project")
+
+	if cfg.Agent.BashConcurrencyEnabled {
+		t.Errorf("expected overlay to flip BashConcurrencyEnabled to false, still true")
+	}
+	if src, ok := cfg.Sources["agent.bash_concurrency_enabled"]; !ok || src.Level != "project" {
+		t.Errorf("expected source to record project overlay, got %+v ok=%v", src, ok)
+	}
+}
+
 func TestMemoryDefaults(t *testing.T) {
 	// Use a scratch HOME so we don't touch the real ~/.shannon/config.yaml.
 	tmp := t.TempDir()

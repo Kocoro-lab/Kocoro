@@ -545,6 +545,10 @@ type overlayAgentConfig struct {
 	IdleHardTimeoutSecs *int  `yaml:"idle_hard_timeout_secs"`
 	SkillDiscovery      *bool `yaml:"skill_discovery"`
 
+	// BashConcurrencyEnabled is a pointer so unset overlays leave the value
+	// alone — distinguishing "not specified" from "explicitly false".
+	BashConcurrencyEnabled *bool `yaml:"bash_concurrency_enabled"`
+
 	TimeBasedCompact *overlayTimeBasedCompactConfig `yaml:"time_based_compact"`
 
 	PromptSuggestion *overlayPromptSuggestionConfig `yaml:"prompt_suggestion"`
@@ -588,9 +592,10 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.reasoning_effort":       {Level: "default"},
 		"agent.model":                  {Level: "default"},
 		"agent.context_window":         {Level: "default"},
-		"agent.idle_soft_timeout_secs": {Level: "default"},
-		"agent.idle_hard_timeout_secs": {Level: "default"},
-		"tools.bash_timeout":           {Level: "default"},
+		"agent.idle_soft_timeout_secs":   {Level: "default"},
+		"agent.idle_hard_timeout_secs":   {Level: "default"},
+		"agent.bash_concurrency_enabled": {Level: "default"},
+		"tools.bash_timeout":             {Level: "default"},
 		"tools.bash_max_timeout":       {Level: "default"},
 		"tools.bash_max_output":        {Level: "default"},
 		"tools.result_truncation":      {Level: "default"},
@@ -650,6 +655,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.idle_hard_timeout_secs") {
 		cfg.Sources["agent.idle_hard_timeout_secs"] = src
+	}
+	if viper.IsSet("agent.bash_concurrency_enabled") {
+		cfg.Sources["agent.bash_concurrency_enabled"] = src
 	}
 	if viper.IsSet("tools.bash_timeout") {
 		cfg.Sources["tools.bash_timeout"] = src
@@ -781,6 +789,10 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Agent.SkillDiscovery != nil {
 			cfg.Agent.SkillDiscovery = overlay.Agent.SkillDiscovery
 			cfg.Sources["agent.skill_discovery"] = src
+		}
+		if overlay.Agent.BashConcurrencyEnabled != nil {
+			cfg.Agent.BashConcurrencyEnabled = *overlay.Agent.BashConcurrencyEnabled
+			cfg.Sources["agent.bash_concurrency_enabled"] = src
 		}
 		if overlay.Agent.TimeBasedCompact != nil {
 			if overlay.Agent.TimeBasedCompact.Enabled != nil {

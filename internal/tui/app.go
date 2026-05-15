@@ -1222,13 +1222,18 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case toolResultMsg:
-		toolName := m.pendingToolName
-		toolArgs := m.pendingToolArgs
+		// Prefer the result event's own (name, args) — they are paired with the
+		// specific tool_use_id that produced this result. The pendingTool*
+		// scalars are a singleton-style spinner hint and would mis-pair when
+		// multiple concurrency-safe tools are in flight (e.g. parallel bash);
+		// fall back to them only if the event omits both (legacy callers).
+		toolName := msg.name
+		toolArgs := msg.args
 		if toolName == "" {
-			toolName = msg.name
+			toolName = m.pendingToolName
 		}
 		if toolArgs == "" {
-			toolArgs = msg.args
+			toolArgs = m.pendingToolArgs
 		}
 		if toolName == "think" {
 			dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
