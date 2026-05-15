@@ -31,10 +31,15 @@ func TestApprovalBroker_RequestResolve(t *testing.T) {
 		mu.Lock()
 		reqID := sent[0].RequestID
 		mu.Unlock()
-		broker.Resolve(reqID, DecisionAllow)
+		broker.Resolve(reqID, DecisionAllow, nil)
 	}()
 
-	decision := broker.Request(context.Background(), "msg-1", "ch1", "th1", "bot", "bash", `{"command":"ls"}`)
+	decision := broker.Request(context.Background(), ApprovalRequestMeta{
+		MessageID: "msg-1",
+		Channel:   "ch1",
+		ThreadID:  "th1",
+		Agent:     "bot",
+	}, "bash", `{"command":"ls"}`)
 	if decision != DecisionAllow {
 		t.Errorf("expected allow, got %s", decision)
 	}
@@ -58,7 +63,12 @@ func TestApprovalBroker_ContextCancel(t *testing.T) {
 		cancel()
 	}()
 
-	decision := broker.Request(ctx, "msg-1", "ch1", "th1", "bot", "bash", `{}`)
+	decision := broker.Request(ctx, ApprovalRequestMeta{
+		MessageID: "msg-1",
+		Channel:   "ch1",
+		ThreadID:  "th1",
+		Agent:     "bot",
+	}, "bash", `{}`)
 	if decision != DecisionDeny {
 		t.Errorf("expected deny on ctx cancel, got %s", decision)
 	}
@@ -70,7 +80,12 @@ func TestApprovalBroker_CancelAll(t *testing.T) {
 	results := make(chan ApprovalDecision, 3)
 	for i := 0; i < 3; i++ {
 		go func() {
-			results <- broker.Request(context.Background(), "msg-1", "ch1", "th1", "bot", "bash", `{}`)
+			results <- broker.Request(context.Background(), ApprovalRequestMeta{
+				MessageID: "msg-1",
+				Channel:   "ch1",
+				ThreadID:  "th1",
+				Agent:     "bot",
+			}, "bash", `{}`)
 		}()
 	}
 
@@ -96,7 +111,12 @@ func TestApprovalBroker_SendFails(t *testing.T) {
 		return fmt.Errorf("not connected")
 	})
 
-	decision := broker.Request(context.Background(), "msg-1", "ch1", "th1", "bot", "bash", `{}`)
+	decision := broker.Request(context.Background(), ApprovalRequestMeta{
+		MessageID: "msg-1",
+		Channel:   "ch1",
+		ThreadID:  "th1",
+		Agent:     "bot",
+	}, "bash", `{}`)
 	if decision != DecisionDeny {
 		t.Errorf("expected deny on send failure, got %s", decision)
 	}
@@ -105,7 +125,7 @@ func TestApprovalBroker_SendFails(t *testing.T) {
 func TestApprovalBroker_ResolveUnknown(t *testing.T) {
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
 	// Should not panic
-	broker.Resolve("nonexistent", DecisionAllow)
+	broker.Resolve("nonexistent", DecisionAllow, nil)
 }
 
 func TestApprovalBroker_ConcurrentRequests(t *testing.T) {
@@ -123,7 +143,12 @@ func TestApprovalBroker_ConcurrentRequests(t *testing.T) {
 
 	for i := 0; i < n; i++ {
 		go func() {
-			results <- broker.Request(context.Background(), "msg-1", "ch1", "th1", "bot", "bash", `{}`)
+			results <- broker.Request(context.Background(), ApprovalRequestMeta{
+				MessageID: "msg-1",
+				Channel:   "ch1",
+				ThreadID:  "th1",
+				Agent:     "bot",
+			}, "bash", `{}`)
 		}()
 	}
 
@@ -132,7 +157,7 @@ func TestApprovalBroker_ConcurrentRequests(t *testing.T) {
 
 	mu.Lock()
 	for _, req := range sent {
-		broker.Resolve(req.RequestID, DecisionAllow)
+		broker.Resolve(req.RequestID, DecisionAllow, nil)
 	}
 	mu.Unlock()
 
@@ -239,9 +264,9 @@ func TestApprovalBroker_FlagsHighRiskTools(t *testing.T) {
 	// High-risk tool: flag MUST be present so UI hides "Always Allow".
 	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
 		captured = ApprovalRequest{}
-		go broker.Resolve(captured.RequestID, DecisionDeny) // no-op (req not in-flight yet)
+		go broker.Resolve(captured.RequestID, DecisionDeny, nil) // no-op (req not in-flight yet)
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		_ = broker.Request(ctx, "", "", "", "", tool, "{}")
+		_ = broker.Request(ctx, ApprovalRequestMeta{}, tool, "{}")
 		cancel()
 		found := false
 		for _, f := range captured.Flags {
@@ -258,7 +283,7 @@ func TestApprovalBroker_FlagsHighRiskTools(t *testing.T) {
 	for _, tool := range []string{"bash", "file_write", "http", "browser"} {
 		captured = ApprovalRequest{}
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		_ = broker.Request(ctx, "", "", "", "", tool, "{}")
+		_ = broker.Request(ctx, ApprovalRequestMeta{}, tool, "{}")
 		cancel()
 		for _, f := range captured.Flags {
 			if f == ApprovalFlagAlwaysAllowDisabled {

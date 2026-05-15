@@ -294,6 +294,7 @@ var daemonStartCmd = &cobra.Command{
 				channel:     msg.Channel,
 				threadID:    msg.ThreadID,
 				agent:       req.Agent,
+				source:      req.Source,
 				autoApprove: autoApprove,
 				shannonDir:  shanDir,
 				deps:        deps,
@@ -405,23 +406,9 @@ var daemonStartCmd = &cobra.Command{
 			}
 		})
 
-		broker.SetOnRequest(func(requestID, tool, args string) {
-			if localServer.EventBus() != nil {
-				// Redact before emit so subscribers (Desktop UI, curl debug
-				// sessions) and the on-disk /notifications history all see
-				// the sanitized form. Matches the redact-then-emit policy
-				// already in place for tool_status (bus_handler.go:redactAndTruncate).
-				// Without this, raw bearer tokens / AWS keys / passwords in
-				// approval args would land in ~/.shannon/notifications.jsonl
-				// and survive across restarts.
-				payload, _ := json.Marshal(map[string]string{
-					"request_id": requestID,
-					"tool":       tool,
-					"args":       audit.RedactSecrets(args),
-				})
-				localServer.EventBus().Emit(daemon.Event{Type: daemon.EventApprovalRequest, Payload: payload})
-			}
-		})
+		// Wire the WS broker's bus hooks the same way NewServer wires
+		// s.approvalBroker — both paths publish identical event payloads.
+		daemon.WireApprovalBusHooks(broker, localServer.EventBus())
 		serverErrCh := make(chan error, 1)
 		go func() {
 			serverErrCh <- localServer.Start(ctx)
@@ -599,6 +586,7 @@ type daemonEventHandler struct {
 	channel     string
 	threadID    string
 	agent       string
+	source      string // RunAgentRequest.Source — threaded into ApprovalRequestMeta for the bus payload
 	autoApprove bool
 	shannonDir  string
 	deps        *daemon.ServerDeps
@@ -706,7 +694,14 @@ func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	}
 	tracker.Mark(h.sessionID)
 	defer tracker.Clear(h.sessionID)
-	decision := h.broker.Request(h.ctx, h.messageID, h.channel, h.threadID, h.agent, tool, args)
+	decision := h.broker.Request(h.ctx, daemon.ApprovalRequestMeta{
+		MessageID: h.messageID,
+		SessionID: h.sessionID,
+		Source:    h.source,
+		Channel:   h.channel,
+		ThreadID:  h.threadID,
+		Agent:     h.agent,
+	}, tool, args)
 	if decision == daemon.DecisionAlwaysAllow {
 		// PR 5: single entry point shared with the SSE path so SSE/WS
 		// behavior cannot drift. Handles bash (tool-level for named agents,

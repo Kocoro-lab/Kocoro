@@ -351,21 +351,26 @@ func (c *Client) Listen(ctx context.Context) error {
 				log.Printf("daemon: invalid approval_response: %v", err)
 				continue
 			}
-			// Emit before Resolve so Ptfrog dismisses the card before seeing the reply.
 			resolvedBy := resp.ResolvedBy
 			if resolvedBy == "" {
 				resolvedBy = "external"
 			}
-			if c.eventBus != nil {
-				payload, _ := json.Marshal(map[string]string{
-					"request_id":  resp.RequestID,
-					"decision":    string(resp.Decision),
-					"resolved_by": resolvedBy,
-				})
-				c.eventBus.Emit(Event{Type: EventApprovalResolved, Payload: payload})
-			}
+			// Claim under the broker's lock first; bus emit runs as Resolve's
+			// beforeDeliver so it fires only when we won the claim AND lands
+			// on the bus with an ID earlier than any agent event the
+			// resuming Request goroutine could trigger. A concurrent
+			// daemon-cleanup path (timeout / ctx-cancel / CancelAll on
+			// disconnect) that already claimed makes Resolve a no-op here,
+			// preserving the at-most-one terminal-event contract.
 			if c.broker != nil {
-				c.broker.Resolve(resp.RequestID, resp.Decision)
+				c.broker.Resolve(resp.RequestID, resp.Decision, func() {
+					emitBusJSON(c.eventBus, EventApprovalResolved, map[string]any{
+						"request_id":  resp.RequestID,
+						"decision":    string(resp.Decision),
+						"resolved_by": resolvedBy,
+						"ts":          nowISO(),
+					})
+				})
 			}
 		case MsgTypeSystem:
 			if c.onSystem != nil {

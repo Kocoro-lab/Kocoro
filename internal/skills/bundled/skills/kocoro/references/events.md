@@ -22,8 +22,9 @@ Both paths funnel through `multiHandler` on the daemon side: the per-request HTT
 | `agent_reply` | Agent finished a turn (WS / schedule / Ptfrog sources). | Bus |
 | `agent_error` | Agent run failed. | Bus |
 | `notification` | Agent-authored notify tool call. | Bus |
-| `approval_request` | Tool needs user approval; payload `{request_id, tool, args, agent, flags?}`. Optional `flags` array carries policy hints (currently `"always_allow_disabled"` for paid / permanent-public tools so UI clients disable the "Always Allow" button). | Bus |
-| `approval_resolved` | User answered an approval; payload `{request_id, decision}` where decision ∈ allow / deny / always_allow. | Bus |
+| `approval_request` | Tool needs user approval; payload `{request_id, session_id, agent, tool, title, source, channel, args, flags?, ts}`. `title` is parsed from `args.description` (falls back to `tool`). `args` is redacted+truncated (event-bus copy only; the wire copy sent to Cloud stays unredacted so Slack/etc. can render the real command). `flags` carries policy hints (currently `"always_allow_disabled"` for paid / permanent-public tools so UI clients disable the "Always Allow" button). Emitted only after the outgoing request reached the transport successfully — failed sends never publish a card. | Bus |
+| `approval_resolved` | User answered an approval; payload `{request_id, decision, resolved_by, ts}` where decision ∈ allow / deny / always_allow and `resolved_by` ∈ kocoro / external / `daemon` / Cloud-provided actor. `daemon` resolution with `decision: "deny"` is a synthetic cleanup emitted when the daemon abandons a request (timeout, ctx cancel, WS disconnect via `CancelAll`) — Desktop dismisses the inbox card on it. The broker guarantees **at most one `approval_resolved` per `request_id`**: ingress paths (`POST /approval`, WS `approval_response`) and the daemon-cleanup path race for the same `pending` entry under the broker mutex, and only the winner emits, so subscribers will never see conflicting terminal states like `allow/kocoro` followed by `deny/daemon` for the same id. | Bus |
+| `schedule_run` | Scheduled agent run lifecycle; payload `{schedule_id, session_id, agent, phase, error?, ts}` where `phase` ∈ started / succeeded / failed. `session_id` is empty for `started` (no session yet) and for failures that hit before session resolution. `error` is present only on `failed` (redacted + truncated). Two events fire per scheduled run: `started` before `RunAgent`, then exactly one of `succeeded` / `failed` after it returns (or after a panic recovery). | Bus |
 | `approval_notice` | Post-decision feedback (e.g. high-risk pattern not persisted). Structured i18n-friendly payload: `{severity, code, tool, message}`. `severity` ∈ info / warn. `code` is the stable i18n key (`high_risk_not_persistable` / `bash_always_ask_not_persisted` / `persist_failed`); `tool` is the offending tool name (for interpolation into localized templates); `message` is the English fallback for clients that don't recognize `code` yet. Older clients reading only `severity` + `message` continue to work — `code` and `tool` are additive. | Bus |
 | `delta` | Streaming text tokens for the agent reply. | Per-request only |
 | `done` | Final reply payload with accumulated `usage`. | Per-request only |
@@ -160,8 +161,35 @@ If no events match, `notifications` is `[]` and `next_cursor` echoes the `since`
 
 **Malformed query params** (e.g. `since=abc`, `limit=-1`) silently fall back to defaults — the endpoint never returns 400. This is intentional: a stale Desktop client should degrade to "show latest 500" rather than fail closed and hide all history.
 
+### `approval_request`
+
+```json
+{
+  "request_id": "apr_1f2a",
+  "session_id": "sess_abc",
+  "agent": "bot",
+  "tool": "bash",
+  "title": "check repo state",
+  "source": "slack",
+  "channel": "C123",
+  "args": "{\"command\":\"git status\",\"description\":\"check repo state\"}",
+  "flags": ["always_allow_disabled"],
+  "ts": "2026-05-15T01:23:45Z"
+}
+```
+
+### `schedule_run`
+
+```json
+{ "schedule_id": "sch_1", "session_id": "", "agent": "bot", "phase": "started", "ts": "2026-05-15T09:00:00Z" }
+{ "schedule_id": "sch_1", "session_id": "sess_99", "agent": "bot", "phase": "succeeded", "ts": "2026-05-15T09:00:42Z" }
+{ "schedule_id": "sch_2", "session_id": "", "agent": "bot", "phase": "failed", "error": "agent boom", "ts": "2026-05-15T09:00:42Z" }
+```
+
 ## Backward compatibility
 
 - `args` / `is_error` / `preview` on `tool_status` are **additive** — older subscribers that ignore unknown fields keep working.
 - `ts` is additive on `tool_status` and `usage`.
+- `session_id`, `agent`, `title`, `source`, `channel`, `args`, `flags`, `ts` on `approval_request` and `resolved_by` / `ts` on `approval_resolved` are additive; older Desktop clients that only read `request_id` / `tool` / `decision` keep working.
+- `schedule_run` is a new event type; old clients that don't decode it ignore it.
 - Older builds that don't emit the `usage` event type simply don't fire it; new Desktop code degrades gracefully (usage row stays hidden).

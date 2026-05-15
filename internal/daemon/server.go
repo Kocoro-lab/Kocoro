@@ -147,6 +147,10 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		suggestions:            agent.NewSuggestionState(),
 		migratePlans:           claudecode.NewPlanStore(),
 	}
+	// Wire approval bus hooks so SSE per-request brokers (which inherit from
+	// s.approvalBroker in handleMessageSSE) publish EventApprovalRequest /
+	// EventApprovalResolved alongside the WS path's broker.
+	WireApprovalBusHooks(s.approvalBroker, s.eventBus)
 	if deps != nil {
 		deps.Suggestions = s.suggestions
 		if deps.ApprovalTracker == nil {
@@ -610,28 +614,42 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"decision must be allow, deny, or always_allow"}`, http.StatusBadRequest)
 		return
 	}
-	// Notify Cloud and emit event BEFORE unblocking the agent.
-	// This ensures Kocoro dismisses the approval card before seeing the agent reply.
-	_ = s.notifyApprovalResolved(ApprovalResolvedPayload{
-		RequestID:  req.RequestID,
-		Decision:   req.Decision,
-		ResolvedBy: "kocoro",
-	})
-
-	if s.eventBus != nil {
-		payload, _ := json.Marshal(map[string]string{
+	// Claim the request under the broker's lock first; gate Cloud notify +
+	// bus emit on whether we actually won the claim. Without this, a
+	// concurrent daemon-cleanup path (timeout / ctx-cancel / CancelAll on
+	// disconnect) could emit a deny/daemon terminal event for the same
+	// request_id that we're about to mark allow/kocoro — Desktop would
+	// have no way to tell which is authoritative. See the at-most-one
+	// terminal-event contract documented on EventApprovalResolved.
+	//
+	// Bus emit runs as Resolve's beforeDeliver so the approval_resolved
+	// event gets an ID assigned BEFORE pa.ch is written — the Request
+	// goroutine, and the agent loop reading its decision, cannot resume on
+	// another P and emit a tool_status with a lower bus ID. See the doc
+	// comment on ApprovalBroker.Resolve. Cloud notify lives outside the
+	// broker mutex: Cloud has its own event fan-out so local bus ordering
+	// is the only invariant that matters here.
+	emitResolved := func() {
+		emitBusJSON(s.eventBus, EventApprovalResolved, map[string]any{
 			"request_id":  req.RequestID,
 			"decision":    string(req.Decision),
 			"resolved_by": "kocoro",
+			"ts":          nowISO(),
 		})
-		s.eventBus.Emit(Event{Type: EventApprovalResolved, Payload: payload})
 	}
-
 	// Look up the per-request broker (SSE path) or fall back to server broker (WS path).
+	var claimed bool
 	if b, ok := s.pendingBrokers.Load(req.RequestID); ok {
-		b.(*ApprovalBroker).Resolve(req.RequestID, req.Decision)
+		claimed = b.(*ApprovalBroker).Resolve(req.RequestID, req.Decision, emitResolved)
 	} else {
-		s.approvalBroker.Resolve(req.RequestID, req.Decision)
+		claimed = s.approvalBroker.Resolve(req.RequestID, req.Decision, emitResolved)
+	}
+	if claimed {
+		_ = s.notifyApprovalResolved(ApprovalResolvedPayload{
+			RequestID:  req.RequestID,
+			Decision:   req.Decision,
+			ResolvedBy: "kocoro",
+		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1444,8 +1462,10 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 		flusher.Flush()
 		return err
 	})
-	// Inherit onRequest callback from the server broker for EventBus emission.
+	// Inherit bus hooks from the server broker so EventBus emission stays
+	// consistent with the WS path (request payload + daemon-cleanup deny).
 	reqBroker.onRequest = s.approvalBroker.onRequest
+	reqBroker.onCleanup = s.approvalBroker.onCleanup
 	// Register pending requestIDs so POST /approval can find this broker.
 	reqBroker.onRegister = func(requestID string) { s.pendingBrokers.Store(requestID, reqBroker) }
 	reqBroker.onDeregister = func(requestID string) { s.pendingBrokers.Delete(requestID) }
@@ -1462,7 +1482,7 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 		}
 	}
 
-	handler := &sseEventHandler{w: w, flusher: flusher, broker: reqBroker, ctx: r.Context(), autoApprove: autoApprove, deps: s.deps, agent: req.Agent}
+	handler := &sseEventHandler{w: w, flusher: flusher, broker: reqBroker, ctx: r.Context(), autoApprove: autoApprove, deps: s.deps, agent: req.Agent, source: req.Source}
 	result, err := RunAgent(r.Context(), s.deps, req, handler)
 	if err != nil {
 		fmt.Fprintf(w, "event: error\ndata: %s\n\n", mustJSON(map[string]string{"error": err.Error()}))
@@ -1592,6 +1612,11 @@ type sseEventHandler struct {
 	// Empty for default-agent / non-routed paths (e.g. /research, /swarm) — in
 	// that case persistAgentAlwaysAllow falls back to session-only.
 	agent string
+	// source mirrors RunAgentRequest.Source ("kocoro" for local Desktop,
+	// "slack"/"wecom"/"schedule"/... for cloud-distributed channels). Threaded
+	// into ApprovalRequestMeta so the approval_request bus payload carries the
+	// channel-bucket distinct from the more specific Channel field.
+	source string
 	// sessionID is set by RunAgent via SetSessionID after the session is
 	// resolved. Approval Mark/Clear keys on this so a paused session can be
 	// surfaced via deps.ApprovalTracker.
@@ -1746,7 +1771,11 @@ func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	}
 	tracker.Mark(h.sessionID)
 	defer tracker.Clear(h.sessionID)
-	decision := h.broker.Request(h.ctx, "", "", "", "", tool, args)
+	decision := h.broker.Request(h.ctx, ApprovalRequestMeta{
+		SessionID: h.sessionID,
+		Source:    h.source,
+		Agent:     h.agent,
+	}, tool, args)
 	if decision == DecisionAlwaysAllow {
 		HandleAlwaysAllowDecision(h.deps, h.broker, h.agent, tool, args)
 	}

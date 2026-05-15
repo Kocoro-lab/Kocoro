@@ -169,10 +169,58 @@ func (s *Scheduler) runSchedule(ctx context.Context, sched schedule.Schedule) {
 		req.StickyContext = formatConversationContext(ctxMsgs)
 	}
 
-	_, err := RunAgent(ctx, s.deps, req, &scheduleHandler{})
-	if err != nil {
-		log.Printf("scheduler: agent run failed for schedule %s: %v", sched.ID, err)
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return RunAgent(ctx, s.deps, req, &scheduleHandler{})
+	})
+}
+
+// runWithLifecycle emits started/succeeded/failed schedule_run events around
+// fn. Extracted so tests can verify lifecycle emission without spinning up
+// the full RunAgent stack.
+func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAgentResult, error)) {
+	s.emitScheduleRun("started", sched, "", nil)
+
+	var result *RunAgentResult
+	var runErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				runErr = fmt.Errorf("scheduler panic: %v", r)
+				log.Printf("scheduler: panic in schedule %s: %v", sched.ID, r)
+			}
+		}()
+		result, runErr = fn()
+	}()
+
+	sessionID := ""
+	if result != nil {
+		sessionID = result.SessionID
 	}
+	if runErr != nil {
+		log.Printf("scheduler: agent run failed for schedule %s: %v", sched.ID, runErr)
+		s.emitScheduleRun("failed", sched, sessionID, runErr)
+		return
+	}
+	s.emitScheduleRun("succeeded", sched, sessionID, nil)
+}
+
+// emitScheduleRun publishes a schedule_run lifecycle event. Best-effort; nil
+// deps or nil bus drops silently so unit tests that pass nil deps still run.
+func (s *Scheduler) emitScheduleRun(phase string, sched schedule.Schedule, sessionID string, runErr error) {
+	if s == nil || s.deps == nil {
+		return
+	}
+	payload := map[string]any{
+		"schedule_id": sched.ID,
+		"session_id":  sessionID,
+		"agent":       sched.Agent,
+		"phase":       phase,
+		"ts":          nowISO(),
+	}
+	if phase == "failed" && runErr != nil {
+		payload["error"] = redactAndTruncate(runErr.Error(), 500)
+	}
+	emitBusJSON(s.deps.EventBus, EventScheduleRun, payload)
 }
 
 // formatConversationContext formats the captured conversation context as

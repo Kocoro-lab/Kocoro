@@ -38,12 +38,23 @@ const (
 // fail-closed (see shannon-cloud `handleApprovalRequest`).
 type ApprovalRequest struct {
 	MessageID string `json:"-"`
+	// SessionID lets Desktop click-through from an inbox card into the
+	// originating agent session. Populated from the resolved RunAgent
+	// session ID; empty for paths that approve before session resolution.
+	SessionID string `json:"session_id,omitempty"`
+	// Source is the canonical RunAgentRequest.Source bucket (slack, wecom,
+	// schedule, kocoro, ...). Distinct from Channel below.
+	Source    string `json:"source,omitempty"`
 	Channel   string `json:"channel"`
 	ThreadID  string `json:"thread_id"`
 	RequestID string `json:"request_id"`
 	Tool      string `json:"tool"`
-	Args      string `json:"args"`
-	Agent     string `json:"agent"`
+	// Title is a short human label parsed from args.description (the
+	// approval-card description required by internal/agent/approval_description.go);
+	// falls back to Tool when args has no description.
+	Title string `json:"title,omitempty"`
+	Args  string `json:"args"`
+	Agent string `json:"agent"`
 	// Flags is an optional, additive list of policy hints for the UI. Older
 	// clients can safely ignore it. Currently emitted:
 	//   - "always_allow_disabled": tool is in agent.DisallowsAutoApproval (paid

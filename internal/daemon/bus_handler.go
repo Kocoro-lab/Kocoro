@@ -170,11 +170,21 @@ func (h *busEventHandler) emitJSON(eventType string, payload any) {
 	if h.deps == nil || h.deps.EventBus == nil {
 		return
 	}
+	emitBusJSON(h.deps.EventBus, eventType, payload)
+}
+
+// emitBusJSON marshals payload and emits to bus. Package-level helper for
+// non-handler emitters (approval broker hooks, scheduler lifecycle); tolerates
+// nil bus and marshal errors silently.
+func emitBusJSON(bus *EventBus, eventType string, payload any) {
+	if bus == nil {
+		return
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
-	h.deps.EventBus.Emit(Event{Type: eventType, Payload: data})
+	bus.Emit(Event{Type: eventType, Payload: data})
 }
 
 // nowISO returns the current wall time in RFC3339 for the `ts` field.
