@@ -1746,7 +1746,23 @@ type sseEventHandler struct {
 
 // SetSessionID captures the resolved session ID. Called by RunAgent's
 // multiHandler interface-assertion path (see runner.go SetSessionID injection).
-func (h *sseEventHandler) SetSessionID(id string) { h.sessionID = id }
+//
+// Also emits an SSE `session_started` event so SSE consumers (Desktop) can
+// capture session_id BEFORE the first delta/tool/done event. Without this,
+// Desktop only learns the session_id on the `done` event, which means a
+// follow-up message sent mid-turn (or before `done` arrives) goes out with
+// no session_id and the daemon opens a fresh session instead of continuing
+// the same conversation.
+func (h *sseEventHandler) SetSessionID(id string) {
+	h.sessionID = id
+	if id == "" || h.w == nil {
+		return
+	}
+	fmt.Fprintf(h.w, "event: session_started\ndata: %s\n\n", mustJSON(map[string]string{"session_id": id}))
+	if h.flusher != nil {
+		h.flusher.Flush()
+	}
+}
 
 // Usage returns the cumulative usage collected during this handler's lifetime.
 func (h *sseEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
