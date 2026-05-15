@@ -1078,6 +1078,33 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					b.WriteByte('\n')
 				}
 				b.WriteString(m.Text)
+				// Phase 4: surface any attachments as a bracketed hint so the
+				// LLM is aware the user shipped files alongside this text.
+				// Full RequestContentBlock integration (image compression /
+				// file_ref / auto-approval) is the follow-up — for now the
+				// text representation keeps the queue lossless on the prompt
+				// path even if downstream tools won't process them yet.
+				if len(m.Attachments) > 0 {
+					b.WriteByte('\n')
+					b.WriteString("[Attached: ")
+					for i, att := range m.Attachments {
+						if i > 0 {
+							b.WriteString(", ")
+						}
+						if att.Kind != "" {
+							b.WriteString(att.Kind)
+							b.WriteString(":")
+						}
+						if att.OriginalURL != "" {
+							b.WriteString(att.OriginalURL)
+						} else if att.Nonce != "" {
+							b.WriteString(att.Nonce)
+						} else {
+							b.WriteString("file")
+						}
+					}
+					b.WriteByte(']')
+				}
 				pendingIDs = append(pendingIDs, m.ID)
 			}
 			if b.Len() > 0 {
