@@ -155,18 +155,62 @@ func GenerateSummary(ctx context.Context, c Completer, messages []client.Message
 	return extractSummary(resp.OutputText), resp.Usage, nil
 }
 
+// userSummarizePrompt is the system prompt for both GET /sessions/{id}/summary
+// (Kocoro daemon) and POST /sessions/{id}/share's auto-generated summary.
+//
+// Two intentional design choices that may look unusual but are load-bearing:
+//
+//  1. The language examples below each include an instruction PHRASED IN THE
+//     TARGET LANGUAGE ("日本語で書いてください", "한국어로 작성하세요"). This
+//     primes the model into the target language and is significantly more
+//     reliable than "write the summary in Japanese". Do not normalize these
+//     back to English when refactoring.
+//
+//  2. The 11-language list is a TEACHING DEVICE for the model, not a
+//     supported-languages whitelist. Adding more examples is cheap (~5 tokens
+//     each, prompt is cached) and improves reliability on low-resource
+//     languages; removing examples Haiku may not have seen reduces its
+//     confidence to use that language unprompted. Expand the list when a new
+//     user-base language emerges; the trailing "every other language" clause
+//     covers the unbounded case.
 const userSummarizePrompt = `You are a conversation summarizer. Read the following conversation and produce a clear, well-structured Markdown summary for a human reader.
 
 Requirements:
-- Write in the SAME LANGUAGE as the conversation (if the conversation is in Chinese, write in Chinese; if in English, write in English, etc.)
-- Use Markdown formatting with headers and bullet points
-- Focus on: what was discussed, key decisions made, work completed, and remaining action items
-- Be concise but comprehensive — a reader should understand the conversation's outcome without reading the full transcript
-- Do NOT include internal LLM terminology (tool_call, context window, tokens, etc.)
-- Do NOT wrap the output in code fences — output raw Markdown directly`
+- Match the USER's primary language exactly. Determine this from the user's
+  own messages (NOT from code, file paths, or English-only tool output that
+  appears in tool_result blocks — those are incidental noise).
+  - If the user writes in 中文 → write the summary in 中文.
+  - If the user writes in 日本語 → 日本語で書いてください.
+  - If the user writes in 한국어 → 한국어로 작성하세요.
+  - If the user writes in English → write in English.
+  - Same rule for Español / Français / Deutsch / Português / Tiếng Việt /
+    العربية / Русский / and every other language.
+  - NEVER translate the user's language into a different one, even if some
+    tool outputs or referenced code happen to be in English.
+- Use Markdown formatting with headers and bullet points.
+- Focus on: what was discussed, key decisions made, work completed, and
+  remaining action items.
+- Be concise but comprehensive — a reader should understand the
+  conversation's outcome without reading the full transcript.
+- Do NOT include internal LLM terminology (tool_call, context window,
+  tokens, etc.).
+- Do NOT wrap the output in code fences — output raw Markdown directly.`
 
-// SummarizeForUser 调用 LLM 生成面向人类阅读的会话摘要。
+// SummarizeForUser 调用 LLM 生成面向人类阅读的会话摘要。Default cache_source
+// "helper" routes the call through standard user-quota billing — appropriate
+// for the on-demand GET /sessions/{id}/summary endpoint where the user is
+// the direct consumer.
 func SummarizeForUser(ctx context.Context, c Completer, messages []client.Message) (string, error) {
+	return SummarizeForUserWithSource(ctx, c, messages, "helper")
+}
+
+// SummarizeForUserWithSource is the variant of SummarizeForUser that lets the
+// caller pin a custom cache_source tag — used by the share endpoint to opt
+// the auto-generated summary into the "internal feature, not user-billed"
+// tier (cache_source="session_share"), matching how prompt_suggestion is
+// already routed Cloud-side. The transcript / prompt / model tier remain
+// identical so the response shape is unchanged.
+func SummarizeForUserWithSource(ctx context.Context, c Completer, messages []client.Message, cacheSource string) (string, error) {
 	transcript := capTranscriptForSummarize(buildTranscript(messages))
 	req := client.CompletionRequest{
 		Messages: []client.Message{
@@ -176,7 +220,7 @@ func SummarizeForUser(ctx context.Context, c Completer, messages []client.Messag
 		ModelTier:   "small",
 		Temperature: 0.2,
 		MaxTokens:   2000,
-		CacheSource: "helper",
+		CacheSource: cacheSource,
 	}
 
 	resp, err := c.Complete(ctx, req)
