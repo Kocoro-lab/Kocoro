@@ -26,6 +26,10 @@ const (
 	// prompt suggestion has been generated and stored in SuggestionState.
 	// Payload: {session_id, agent, text}.
 	EventSuggestionReady = "suggestion_ready"
+	// EventScheduleRun marks the lifecycle of a scheduled agent run. The
+	// payload carries `phase` (started/succeeded/failed) so Desktop can
+	// distinguish scheduler-started work from ordinary agent progress events.
+	EventScheduleRun = "schedule_run"
 )
 
 // Event is a daemon lifecycle event pushed to SSE subscribers.

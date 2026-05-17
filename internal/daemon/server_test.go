@@ -163,7 +163,7 @@ func TestSSEEventHandler_AutoApprovePromptsForPerCallTool(t *testing.T) {
 			var broker *ApprovalBroker
 			broker = NewApprovalBroker(func(req ApprovalRequest) error {
 				reqCh <- req
-				go broker.Resolve(req.RequestID, DecisionAllow)
+				go broker.Resolve(req.RequestID, DecisionAllow, nil)
 				return nil
 			})
 			handler := &sseEventHandler{

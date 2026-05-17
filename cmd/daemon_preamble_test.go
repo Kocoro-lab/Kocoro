@@ -61,7 +61,7 @@ func TestDaemonEventHandler_AutoApprovePromptsForPerCallTool(t *testing.T) {
 			var broker *daemon.ApprovalBroker
 			broker = daemon.NewApprovalBroker(func(req daemon.ApprovalRequest) error {
 				reqCh <- req
-				go broker.Resolve(req.RequestID, daemon.DecisionAllow)
+				go broker.Resolve(req.RequestID, daemon.DecisionAllow, nil)
 				return nil
 			})
 			handler := &daemonEventHandler{
