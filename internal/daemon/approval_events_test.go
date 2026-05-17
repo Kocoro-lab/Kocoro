@@ -223,8 +223,6 @@ func TestApprovalCleanup_OnContextCancel(t *testing.T) {
 	}
 
 	// Expect: approval_request (post-send), then cleanup approval_resolved.
-	events := readApprovalEvents(t, bus, 0, 0)
-	_ = events
 	all := bus.EventsSince(0)
 	if got := eventTypes(all); !sliceEqual(got, []string{EventApprovalRequest, EventApprovalResolved}) {
 		t.Fatalf("expected events [request, resolved], got %v", got)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -186,7 +187,7 @@ func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAge
 		defer func() {
 			if r := recover(); r != nil {
 				runErr = fmt.Errorf("scheduler panic: %v", r)
-				log.Printf("scheduler: panic in schedule %s: %v", sched.ID, r)
+				log.Printf("scheduler: panic in schedule %s: %v\n%s", sched.ID, r, debug.Stack())
 			}
 		}()
 		result, runErr = fn()
