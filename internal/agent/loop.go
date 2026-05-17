@@ -3359,6 +3359,35 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				continue
 			}
 
+			// Truncated trailing tool_use: when stop_reason=max_tokens the LLM was
+			// cut off mid-emission. Only the LAST tool_use in the response can be
+			// the one that got clipped — earlier tool_use blocks were fully
+			// serialized before the cap hit. If the trailing call's args fail to
+			// parse or are missing a required field, the JSON arrived truncated;
+			// dispatching would burn another ~16K output tokens on a doomed retry
+			// and trap the model in a validation-error loop (cf. 2026-05-13
+			// file_write 0-byte incident — the validation guard fires but the
+			// model can't see *why* its own output was cut off). Synthetic result
+			// preserves tool_use/tool_result pairing for the Anthropic API.
+			if idx == len(toolCalls)-1 && isMaxTokensTruncation(resp.FinishReason) &&
+				argsLookTruncated(argsStr, tool.Info()) {
+				callMeta[idx].resolved = true
+				execResults[idx] = toolExecResult{
+					result: ToolResult{
+						Content: "[output_truncated] Your response was cut off at the max output-token cap mid-tool-call, so this call's arguments arrived incomplete and it was NOT executed. Do NOT retry the same call — the truncation will repeat at the same boundary. Pivot: split the work into smaller pieces, have a script read large content from disk at runtime instead of inlining it, or use bash heredoc.",
+						IsError: true,
+					},
+				}
+				if a.handler != nil {
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
+				}
+				if rs, ok := a.handler.(RunStatusHandler); ok {
+					rs.OnRunStatus("max_tokens_truncated_tool_call",
+						fmt.Sprintf("trailing %s call truncated; synthetic error injected", fc.Name))
+				}
+				continue
+			}
+
 			stateTraits := resolveCallStateTraits(fc.Name, argsStr)
 			if !stateTraits.Cacheable && len(stateTraits.Reads) == 0 && len(stateTraits.Writes) == 0 && !stateTraits.UnknownWrite {
 				stateTraits = resolveFallbackReadStateTraits(tool, argsStr)
@@ -5168,6 +5197,33 @@ func isMaxTokensTruncation(reason string) bool {
 	switch reason {
 	case "max_tokens", "length", "end_turn_max_tokens":
 		return true
+	}
+	return false
+}
+
+// argsLookTruncated returns true when a tool-call's JSON arguments appear cut
+// off mid-emission. Detection is conservative — only unambiguously-incomplete
+// shapes count:
+//   - empty string, "{}", "null"
+//   - JSON that fails to parse
+//   - a name listed in info.Required is absent
+//
+// Pair with isMaxTokensTruncation(resp.FinishReason) to short-circuit dispatch
+// when the trailing tool_use was clipped by the output-token cap.
+func argsLookTruncated(argsJSON string, info ToolInfo) bool {
+	s := strings.TrimSpace(argsJSON)
+	if s == "" || s == "{}" || s == "null" {
+		return true
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return true
+	}
+	for _, req := range info.Required {
+		_, present := m[req]
+		if !present {
+			return true
+		}
 	}
 	return false
 }
