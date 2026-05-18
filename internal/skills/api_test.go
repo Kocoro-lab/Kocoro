@@ -1,9 +1,11 @@
 package skills
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -159,5 +161,137 @@ func TestEnsureBuiltinSkills_RemovesLegacyVersionSidecar(t *testing.T) {
 
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Fatalf("legacy _builtin.version survived: err=%v", err)
+	}
+}
+
+// fakeGitSucceed populates dir with a minimal Anthropic-repo-style layout
+// for the requested skill name. Returns a function suitable for assigning
+// to the package-level runGit variable. The caller chooses which subcommand
+// (clone / sparse-checkout) triggers the layout write.
+func fakeGitSucceed(name string) func(dir string, args ...string) error {
+	return func(dir string, args ...string) error {
+		if len(args) > 0 && args[0] == "clone" {
+			skillDir := filepath.Join(dir, "skills", name)
+			if err := os.MkdirAll(skillDir, 0700); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"),
+				[]byte("---\nname: "+name+"\ndescription: fixture\n---\nbody"), 0644); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// TestInstallFromRepo_RetriesOnTransientFailure pins the retry contract:
+// a single transient `git clone` failure must NOT surface to the caller;
+// the next attempt's success should produce a clean install. This is the
+// core robustness change — if it ever regresses, ouikyou's class of
+// "intermittent github.com reachability" failures comes back as user-
+// visible install errors. Backoff makes this test ~1s in the happy path.
+func TestInstallFromRepo_RetriesOnTransientFailure(t *testing.T) {
+	origRunGit := runGit
+	t.Cleanup(func() { runGit = origRunGit })
+
+	shannonDir := t.TempDir()
+	var attempts atomic.Int32
+	succeed := fakeGitSucceed("retry-fixture")
+	runGit = func(dir string, args ...string) error {
+		n := attempts.Add(1)
+		if len(args) > 0 && args[0] == "clone" && n == 1 {
+			return fmt.Errorf("simulated network flake")
+		}
+		return succeed(dir, args...)
+	}
+
+	destDir := filepath.Join(shannonDir, "skills", "retry-fixture")
+	if err := installFromRepo(shannonDir, "retry-fixture", destDir); err != nil {
+		t.Fatalf("install should succeed after retry, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destDir, "SKILL.md")); err != nil {
+		t.Fatalf("installed SKILL.md missing: %v", err)
+	}
+	// Attempt 1: clone fail. Attempt 2: clone ok + sparse-checkout. Total 3 git calls.
+	if got := attempts.Load(); got < 2 {
+		t.Errorf("expected ≥2 git calls (proves retry happened), got %d", got)
+	}
+}
+
+// TestInstallFromRepo_NoRetryOnNotFoundSentinel pins the boundary case:
+// when `git clone` succeeds but the requested skill isn't actually in the
+// Anthropic repo's tree, the wrapper must return immediately rather than
+// re-running the (slow, network-bound) clone twice more on what is a
+// deterministic 404. Mock clone always succeeds; we never lay down the
+// requested skill subdir; expect exactly one clone call.
+func TestInstallFromRepo_NoRetryOnNotFoundSentinel(t *testing.T) {
+	origRunGit := runGit
+	t.Cleanup(func() { runGit = origRunGit })
+
+	shannonDir := t.TempDir()
+	var cloneCalls atomic.Int32
+	runGit = func(dir string, args ...string) error {
+		if len(args) > 0 && args[0] == "clone" {
+			cloneCalls.Add(1)
+		}
+		// Intentionally do not create skills/<name>/SKILL.md — that's what
+		// triggers the "not found in Anthropic repo" sentinel.
+		return nil
+	}
+
+	destDir := filepath.Join(shannonDir, "skills", "does-not-exist")
+	err := installFromRepo(shannonDir, "does-not-exist", destDir)
+	if err == nil {
+		t.Fatalf("expected sentinel error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found in Anthropic repo") {
+		t.Errorf("expected \"not found in Anthropic repo\" sentinel, got %v", err)
+	}
+	if got := cloneCalls.Load(); got != 1 {
+		t.Errorf("clone called %d times, want exactly 1 (no retry on deterministic 404)", got)
+	}
+}
+
+// TestInstallFromRepo_ExhaustsRetriesAndReturnsLastError pins the failure
+// shape after all retries are exhausted: the last git error is returned
+// unchanged so the audit log captures the actual stderr the user needs to
+// diagnose (proxy, DNS, missing git binary, etc.).
+func TestInstallFromRepo_ExhaustsRetriesAndReturnsLastError(t *testing.T) {
+	origRunGit := runGit
+	t.Cleanup(func() { runGit = origRunGit })
+
+	shannonDir := t.TempDir()
+	var attempts atomic.Int32
+	runGit = func(dir string, args ...string) error {
+		attempts.Add(1)
+		return fmt.Errorf("persistent failure: exit status 128")
+	}
+
+	destDir := filepath.Join(shannonDir, "skills", "always-fails")
+	err := installFromRepo(shannonDir, "always-fails", destDir)
+	if err == nil {
+		t.Fatalf("expected error after exhausting retries, got nil")
+	}
+	if !strings.Contains(err.Error(), "persistent failure") {
+		t.Errorf("final error did not preserve underlying message: %v", err)
+	}
+	// Each attempt makes one clone call before the failure short-circuits
+	// the rest of the attempt's git operations. installFromRepoMaxAttempts
+	// is the contract here; if it changes, this assertion documents the
+	// expected attempt count.
+	if got := attempts.Load(); int(got) != installFromRepoMaxAttempts {
+		t.Errorf("clone called %d times, want %d (one per attempt)", got, installFromRepoMaxAttempts)
+	}
+}
+
+// Sanity that the backoff actually adds up to the documented worst-case
+// total. Cheap arithmetic test, no I/O.
+func TestInstallFromRepo_BackoffBudget(t *testing.T) {
+	var total time.Duration
+	for attempt := 1; attempt < installFromRepoMaxAttempts; attempt++ {
+		total += time.Duration(attempt) * time.Second
+	}
+	if want := 3 * time.Second; total != want {
+		t.Errorf("backoff budget = %v, want %v (0s + 1s + 2s)", total, want)
 	}
 }
