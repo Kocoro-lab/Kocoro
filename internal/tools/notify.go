@@ -75,26 +75,29 @@ func (t *NotifyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 		body = args.Message
 	}
 
-	// Prefer the Desktop route when a handler is attached. The handler returns
-	// true when a Desktop client is actually subscribed; if it returns false,
-	// the daemon is headless and we fall through to the osascript path so the
-	// banner still shows (attributed to Script Editor, which is expected in
-	// headless mode since there's no app bundle to attribute it to).
+	if err := SendBanner(ctx, args.Title, body, args.Sound); err != nil {
+		return agent.ToolResult{Content: fmt.Sprintf("notification error: %v", err), IsError: true}, nil
+	}
+	return agent.ToolResult{Content: "notification sent"}, nil
+}
+
+// SendBanner delivers a macOS notification banner using the Desktop route when
+// a NotifyHandler is attached to ctx; otherwise falls back to osascript so the
+// banner still fires in headless mode. Shared by the notify tool and the
+// daemon's reply-complete banner so both honor the same delivery contract.
+func SendBanner(ctx context.Context, title, body string, sound bool) error {
 	if h := NotifyHandlerFrom(ctx); h != nil {
-		if h(args.Title, body, args.Sound) {
-			return agent.ToolResult{Content: "notification sent"}, nil
+		if h(title, body, sound) {
+			return nil
 		}
 	}
-
-	script := buildNotifyScript(args.Title, body, args.Sound)
-
+	script := buildNotifyScript(title, body, sound)
 	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("notification error: %v\n%s", err, string(output)), IsError: true}, nil
+		return fmt.Errorf("%w: %s", err, string(output))
 	}
-
-	return agent.ToolResult{Content: "notification sent"}, nil
+	return nil
 }
 
 func buildNotifyScript(title, body string, sound bool) string {

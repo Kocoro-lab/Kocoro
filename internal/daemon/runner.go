@@ -1509,6 +1509,24 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			}
 			payloadBytes, _ := json.Marshal(payload)
 			deps.EventBus.Emit(Event{Type: EventAgentReply, Payload: payloadBytes})
+
+			// Reply-complete banner: routes through tools.SendBanner so it honors
+			// the same Desktop-handler-or-osascript-fallback contract as the
+			// notify tool. The handler wired at the top of this function emits
+			// EventNotification via EmitTo; when no subscriber is attached
+			// SendBanner falls back to osascript so the banner still fires in
+			// headless mode. Skip cloud-distributed sources (Slack/LINE/etc.) —
+			// the reply is already delivered through the channel — and skip when
+			// there is no text to show (force-stop with empty result).
+			if !isCloudSource(req.Source) && result != "" {
+				title := agentName
+				if title == "" {
+					title = "Kocoro"
+				}
+				if err := tools.SendBanner(ctx, title, redactAndTruncate(result, 140), false); err != nil {
+					log.Printf("daemon: reply-complete banner failed (session=%s): %v", sess.ID, err)
+				}
+			}
 		}
 
 		// Post-turn prompt suggestion (fire-and-forget). Gated by all of:
