@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
@@ -39,7 +40,9 @@ func TestToolRegistry_Schemas(t *testing.T) {
 }
 
 type mockTool struct {
-	name string
+	name     string
+	required []string     // optional: names of required fields advertised via Info()
+	runs     atomic.Int32 // tests can read to assert Run() was/was not invoked
 }
 
 func (m *mockTool) Info() ToolInfo {
@@ -47,10 +50,12 @@ func (m *mockTool) Info() ToolInfo {
 		Name:        m.name,
 		Description: "mock tool",
 		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+		Required:    m.required,
 	}
 }
 
 func (m *mockTool) Run(ctx context.Context, args string) (ToolResult, error) {
+	m.runs.Add(1)
 	return ToolResult{Content: "mock result"}, nil
 }
 

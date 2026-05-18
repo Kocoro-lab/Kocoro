@@ -1103,7 +1103,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// until maybeAutoAdjustContextWindow runs after the first response.
 	loop.SetContextWindow(agent.SeedContextWindowFromModels(
 		runCfg.Agent.Model, sess.LastSeenModel(), runCfg.Agent.ContextWindow))
-	loop.SetEnableStreaming(false)
+	// Streaming on: bypasses Shannon Cloud's MAX_NON_STREAMING=16384 cap in
+	// llm-service/llm_provider/anthropic_provider.py, raising effective max
+	// output to the model's full limit (e.g. Sonnet 4.6 = 64K). Without this,
+	// the trailing tool_use truncation handled above triggers on routine large
+	// file_write calls; with streaming, it becomes a rare edge case (still
+	// possible past 64K, but the model has 4x the budget before clipping).
+	// Streaming fallback to Complete() is built into the agent loop, so a
+	// gateway that rejects streaming degrades gracefully. WS/SSE/bus handlers
+	// all implement OnStreamDelta — the WS+bus paths are no-ops (clients see
+	// the final message either way), SSE forwards deltas for real-time UI.
+	loop.SetEnableStreaming(true)
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
 	loop.SetCacheSource(cacheSourceFromDaemonSource(req.Source))
 	loop.SetSkillDiscovery(runCfg.Agent.SkillDiscoveryEnabled())
