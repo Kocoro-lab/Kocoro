@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1030,5 +1031,39 @@ func TestChromeUseLease_RaceAcquireRelease(t *testing.T) {
 	wg.Wait()
 	if got := tr.activeCount(); got != 0 {
 		t.Fatalf("counter leaked under MarkUsed/Release race: got %d", got)
+	}
+}
+
+func TestMarkChromeUsed_ViaContextLease(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	ctx := context.WithValue(context.Background(), chromeLeaseKey{}, lease)
+
+	MarkChromeUsed(ctx)
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count 1 after MarkChromeUsed via ctx, got %d", got)
+	}
+
+	// Calling MarkChromeUsed on a ctx without a lease is a safe no-op.
+	MarkChromeUsed(context.Background())
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count still 1, got %d", got)
+	}
+}
+
+func TestChromeUseLeaseFrom_MissingReturnsNil(t *testing.T) {
+	if got := ChromeUseLeaseFrom(context.Background()); got != nil {
+		t.Fatalf("expected nil for ctx without lease, got %v", got)
+	}
+}
+
+func TestWithChromeUseLease_InstallsFreshLease(t *testing.T) {
+	ctx := WithChromeUseLease(context.Background())
+	lease := ChromeUseLeaseFrom(ctx)
+	if lease == nil {
+		t.Fatal("expected lease installed on ctx, got nil")
+	}
+	if lease.tracker != globalChromeTracker {
+		t.Fatal("expected lease bound to globalChromeTracker")
 	}
 }

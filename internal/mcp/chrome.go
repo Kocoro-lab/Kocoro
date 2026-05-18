@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -112,6 +113,31 @@ func (l *ChromeUseLease) ReleaseOnly() {
 	if l.acquired {
 		l.tracker.count--
 	}
+}
+
+type chromeLeaseKey struct{}
+
+// WithChromeUseLease installs a fresh ChromeUseLease on the context. Call once
+// at Run start (in RunAgent) before any tool dispatch can happen.
+func WithChromeUseLease(ctx context.Context) context.Context {
+	return context.WithValue(ctx, chromeLeaseKey{}, NewChromeUseLease())
+}
+
+// ChromeUseLeaseFrom returns the lease installed by WithChromeUseLease, or nil
+// if none is present. Cleanup code uses nil as a defensive signal that no
+// browser use was tracked this Run.
+func ChromeUseLeaseFrom(ctx context.Context) *ChromeUseLease {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(chromeLeaseKey{}).(*ChromeUseLease)
+	return v
+}
+
+// MarkChromeUsed marks the lease on ctx as having used the browser this Run.
+// No-op when ctx carries no lease. Idempotent via the lease state machine.
+func MarkChromeUsed(ctx context.Context) {
+	ChromeUseLeaseFrom(ctx).MarkUsed()
 }
 
 // cdpMu serializes all EnsureChromeDebugPort calls to prevent concurrent
