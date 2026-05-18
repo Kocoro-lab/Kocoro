@@ -633,11 +633,11 @@ func TestCleanupPlaywrightAfterTurn_CDPOnDemandStopsBrowser(t *testing.T) {
 
 	oldIdle := disconnectPlaywrightAfterIdleFn
 	oldNow := disconnectPlaywrightNowFn
-	oldStop := stopPlaywrightChromeFn
+	oldStopWait := stopPlaywrightChromeAndWaitFn
 	defer func() {
 		disconnectPlaywrightAfterIdleFn = oldIdle
 		disconnectPlaywrightNowFn = oldNow
-		stopPlaywrightChromeFn = oldStop
+		stopPlaywrightChromeAndWaitFn = oldStopWait
 	}()
 
 	idleCalls := 0
@@ -645,9 +645,12 @@ func TestCleanupPlaywrightAfterTurn_CDPOnDemandStopsBrowser(t *testing.T) {
 	stopCalls := 0
 	disconnectPlaywrightAfterIdleFn = func(*mcp.ClientManager, time.Duration) { idleCalls++ }
 	disconnectPlaywrightNowFn = func(*mcp.ClientManager) { nowCalls++ }
-	stopPlaywrightChromeFn = func() { stopCalls++ }
+	stopPlaywrightChromeAndWaitFn = func(context.Context) error { stopCalls++; return nil }
 
-	cleanupPlaywrightAfterTurn(mgr)
+	ctx := mcp.WithChromeUseLease(context.Background())
+	mcp.MarkChromeUsed(ctx) // simulate a browser tool ran this Run
+
+	cleanupPlaywrightAfterTurn(ctx, mgr)
 
 	if idleCalls != 0 {
 		t.Fatalf("expected no idle disconnect scheduling, got %d", idleCalls)
@@ -670,11 +673,11 @@ func TestCleanupPlaywrightAfterTurn_KeepAliveLeavesBrowserRunning(t *testing.T) 
 
 	oldIdle := disconnectPlaywrightAfterIdleFn
 	oldNow := disconnectPlaywrightNowFn
-	oldStop := stopPlaywrightChromeFn
+	oldStopWait := stopPlaywrightChromeAndWaitFn
 	defer func() {
 		disconnectPlaywrightAfterIdleFn = oldIdle
 		disconnectPlaywrightNowFn = oldNow
-		stopPlaywrightChromeFn = oldStop
+		stopPlaywrightChromeAndWaitFn = oldStopWait
 	}()
 
 	idleCalls := 0
@@ -682,12 +685,19 @@ func TestCleanupPlaywrightAfterTurn_KeepAliveLeavesBrowserRunning(t *testing.T) 
 	stopCalls := 0
 	disconnectPlaywrightAfterIdleFn = func(*mcp.ClientManager, time.Duration) { idleCalls++ }
 	disconnectPlaywrightNowFn = func(*mcp.ClientManager) { nowCalls++ }
-	stopPlaywrightChromeFn = func() { stopCalls++ }
+	stopPlaywrightChromeAndWaitFn = func(context.Context) error { stopCalls++; return nil }
 
-	cleanupPlaywrightAfterTurn(mgr)
+	ctx := mcp.WithChromeUseLease(context.Background())
+	mcp.MarkChromeUsed(ctx)
+
+	cleanupPlaywrightAfterTurn(ctx, mgr)
 
 	if idleCalls != 0 || nowCalls != 0 || stopCalls != 0 {
 		t.Fatalf("expected no teardown while keepAlive=true, got idle=%d disconnect=%d stop=%d", idleCalls, nowCalls, stopCalls)
+	}
+	// But the lease counter must return to 0 (no leak).
+	if got := mcp.GlobalChromeTrackerActiveCountForTest(); got != 0 {
+		t.Fatalf("expected counter back to 0 after keep_alive release, got %d", got)
 	}
 }
 
@@ -701,11 +711,11 @@ func TestCleanupPlaywrightAfterTurn_NonCDPUsesIdleDisconnect(t *testing.T) {
 
 	oldIdle := disconnectPlaywrightAfterIdleFn
 	oldNow := disconnectPlaywrightNowFn
-	oldStop := stopPlaywrightChromeFn
+	oldStopWait := stopPlaywrightChromeAndWaitFn
 	defer func() {
 		disconnectPlaywrightAfterIdleFn = oldIdle
 		disconnectPlaywrightNowFn = oldNow
-		stopPlaywrightChromeFn = oldStop
+		stopPlaywrightChromeAndWaitFn = oldStopWait
 	}()
 
 	idleCalls := 0
@@ -717,9 +727,12 @@ func TestCleanupPlaywrightAfterTurn_NonCDPUsesIdleDisconnect(t *testing.T) {
 		idleDuration = d
 	}
 	disconnectPlaywrightNowFn = func(*mcp.ClientManager) { nowCalls++ }
-	stopPlaywrightChromeFn = func() { stopCalls++ }
+	stopPlaywrightChromeAndWaitFn = func(context.Context) error { stopCalls++; return nil }
 
-	cleanupPlaywrightAfterTurn(mgr)
+	// No MarkChromeUsed — non-CDP idle-disconnect runs regardless.
+	ctx := mcp.WithChromeUseLease(context.Background())
+
+	cleanupPlaywrightAfterTurn(ctx, mgr)
 
 	if idleCalls != 1 {
 		t.Fatalf("expected idle disconnect scheduling once, got %d", idleCalls)
@@ -729,6 +742,122 @@ func TestCleanupPlaywrightAfterTurn_NonCDPUsesIdleDisconnect(t *testing.T) {
 	}
 	if nowCalls != 0 || stopCalls != 0 {
 		t.Fatalf("expected no immediate teardown in non-CDP mode, got disconnect=%d stop=%d", nowCalls, stopCalls)
+	}
+}
+
+func TestCleanupPlaywrightAfterTurn_CDPSkipsWhenBrowserNotUsed(t *testing.T) {
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command:   "dummy",
+		Args:      []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+		KeepAlive: false,
+	})
+
+	oldNow := disconnectPlaywrightNowFn
+	oldStopWait := stopPlaywrightChromeAndWaitFn
+	defer func() {
+		disconnectPlaywrightNowFn = oldNow
+		stopPlaywrightChromeAndWaitFn = oldStopWait
+	}()
+
+	nowCalls := 0
+	stopCalls := 0
+	disconnectPlaywrightNowFn = func(*mcp.ClientManager) { nowCalls++ }
+	stopPlaywrightChromeAndWaitFn = func(context.Context) error { stopCalls++; return nil }
+
+	ctx := mcp.WithChromeUseLease(context.Background())
+	// NO MarkChromeUsed call — Run never touched browser.
+	cleanupPlaywrightAfterTurn(ctx, mgr)
+
+	if nowCalls != 0 || stopCalls != 0 {
+		t.Fatalf("expected no teardown when browser not used, got disconnect=%d stop=%d", nowCalls, stopCalls)
+	}
+}
+
+func TestCleanupPlaywrightAfterTurn_ConcurrentRunsDeferTeardown(t *testing.T) {
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command:   "dummy",
+		Args:      []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+		KeepAlive: false,
+	})
+
+	oldNow := disconnectPlaywrightNowFn
+	oldStopWait := stopPlaywrightChromeAndWaitFn
+	defer func() {
+		disconnectPlaywrightNowFn = oldNow
+		stopPlaywrightChromeAndWaitFn = oldStopWait
+	}()
+
+	stopCalls := 0
+	disconnectPlaywrightNowFn = func(*mcp.ClientManager) {}
+	stopPlaywrightChromeAndWaitFn = func(context.Context) error { stopCalls++; return nil }
+
+	ctxA := mcp.WithChromeUseLease(context.Background())
+	mcp.MarkChromeUsed(ctxA)
+	ctxB := mcp.WithChromeUseLease(context.Background())
+	mcp.MarkChromeUsed(ctxB)
+
+	cleanupPlaywrightAfterTurn(ctxA, mgr)
+	if stopCalls != 0 {
+		t.Fatalf("expected no stop after first cleanup (another Run still active), got %d", stopCalls)
+	}
+
+	cleanupPlaywrightAfterTurn(ctxB, mgr)
+	if stopCalls != 1 {
+		t.Fatalf("expected stop after last cleanup, got %d", stopCalls)
+	}
+}
+
+func TestCleanupPlaywrightAfterTurn_UsesIndependentContext(t *testing.T) {
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command:   "dummy",
+		Args:      []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+		KeepAlive: false,
+	})
+
+	oldNow := disconnectPlaywrightNowFn
+	oldStopWait := stopPlaywrightChromeAndWaitFn
+	defer func() {
+		disconnectPlaywrightNowFn = oldNow
+		stopPlaywrightChromeAndWaitFn = oldStopWait
+	}()
+
+	disconnectPlaywrightNowFn = func(*mcp.ClientManager) {}
+
+	// Capture ctx state synchronously inside the stop callback, while ctx is
+	// still valid. After cleanupPlaywrightAfterTurn returns, its defer cancel()
+	// fires and ctx.Err() would flip to context.Canceled — the captured facts
+	// below are the only reliable observation point.
+	var observedErr error
+	var observedHasDeadline bool
+	var observedRemaining time.Duration
+	stopPlaywrightChromeAndWaitFn = func(ctx context.Context) error {
+		observedErr = ctx.Err()
+		deadline, hasDeadline := ctx.Deadline()
+		observedHasDeadline = hasDeadline
+		if hasDeadline {
+			observedRemaining = time.Until(deadline)
+		}
+		return nil
+	}
+
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	ctx := mcp.WithChromeUseLease(parentCtx)
+	mcp.MarkChromeUsed(ctx)
+	parentCancel() // cancel BEFORE cleanup runs
+
+	cleanupPlaywrightAfterTurn(ctx, mgr)
+
+	if observedErr != nil {
+		t.Fatalf("expected cleanup ctx to NOT inherit parent cancellation, got err=%v", observedErr)
+	}
+	if !observedHasDeadline {
+		t.Fatal("expected cleanup ctx to carry a deadline")
+	}
+	if observedRemaining <= 0 {
+		t.Fatalf("expected cleanup ctx deadline to be in the future, got remaining=%v", observedRemaining)
 	}
 }
 
