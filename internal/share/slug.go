@@ -12,10 +12,20 @@ import (
 )
 
 const (
-	// slugTimeout caps the Haiku slug call. Output is tiny (2-5 words) so
-	// most responses land in 300-800 ms; the budget is generous to absorb
-	// occasional cold paths without forcing fallback.
-	slugTimeout = 5 * time.Second
+	// slugTimeout caps the Haiku slug call. Output is tiny (2-5 words, ~30
+	// tokens) and the input is a small ~600-char snippet, so warm responses
+	// land in 300-800 ms — but cold-path / queue stalls can spike well past
+	// the original 5s ceiling, which made falling back to title-ASCII slug
+	// (or sess-id, for pure-CJK sessions) common enough to hurt the
+	// "Published files" listing UX.
+	//
+	// 30s is chosen to:
+	//   - Sit comfortably under summaryTimeout (45s) so the parallel slug
+	//     call never blocks the wg.Wait() longer than the summary does.
+	//   - Stay well inside shareTaskTimeout (180s) on the async path.
+	//   - Be wide enough to absorb a cold Haiku route (rare but real) plus
+	//     a few hundred ms of network jitter.
+	slugTimeout = 30 * time.Second
 
 	// slugMaxRunes caps the post-clean slug length. Total filename is
 	// "session-<slug>-<YYYYMMDD-HHMMSS>.html"; with timestamp adding 22

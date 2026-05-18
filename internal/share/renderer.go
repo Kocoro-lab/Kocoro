@@ -63,16 +63,25 @@ func RenderHTML(input RenderInput) ([]byte, error) {
 }
 
 // viewData is the top-level template payload.
+//
+// Timestamp strategy: every visible date is rendered as a <time datetime=ISO>
+// element with a UTC fallback text. Client-side JavaScript in the template
+// rewrites each <time> element to the viewer's browser timezone + locale on
+// load, so a Tokyo viewer sees JST and a London viewer sees BST off the same
+// HTML. UTC is the fallback (rather than the daemon operator's local CST/MST)
+// so a JS-disabled viewer at least sees a consistent, unambiguous timezone
+// instead of "what wall-clock did the daemon happen to be in".
 type viewData struct {
-	Lang         string
-	Title        string
-	AgentName    string
-	SummaryHTML  template.HTML // markdown-rendered, pre-escaped; empty template.HTML is falsy in {{if}}
-	CreatedAt    string        // human-readable
-	CreatedAtISO string        // RFC3339, for <time datetime>
-	GeneratedAt  string
-	MessageCount int
-	Messages     []viewMessage
+	Lang           string
+	Title          string
+	AgentName      string
+	SummaryHTML    template.HTML // markdown-rendered, pre-escaped; empty template.HTML is falsy in {{if}}
+	CreatedAt      string        // UTC fallback text ("2026-05-15 17:34 UTC")
+	CreatedAtISO   string        // RFC3339 for <time datetime>, used by the client-side localizer
+	GeneratedAt    string        // UTC fallback text ("2026-05-18 08:11 UTC")
+	GeneratedAtISO string        // RFC3339, parallel to CreatedAtISO
+	MessageCount   int
+	Messages       []viewMessage
 }
 
 // viewMessage represents a single rendered message card. Role drives the
@@ -123,16 +132,24 @@ func buildViewData(in RenderInput) viewData {
 		pageTitle = "Untitled session"
 	}
 
-	created := ""
-	createdISO := ""
+	// Render both timestamps in UTC for the static text. Client-side JS in
+	// the template rewrites these to the viewer's local timezone + locale
+	// (see <script id="localize-timestamps"> at the bottom of the template);
+	// the UTC text is the fallback when JS is disabled or fails. Critically,
+	// the SERVER's local zone (CST, MST, ...) is NOT used here — that would
+	// leak the daemon operator's wall-clock to every share viewer and
+	// produce the "header CST + footer UTC" mismatch this comment was
+	// written to prevent.
+	created, createdISO := "", ""
 	if !sess.CreatedAt.IsZero() {
-		created = sess.CreatedAt.Format("2006-01-02 15:04 MST")
+		created = sess.CreatedAt.UTC().Format("2006-01-02 15:04 UTC")
 		createdISO = sess.CreatedAt.UTC().Format(time.RFC3339)
 	}
 
-	generated := ""
+	generated, generatedISO := "", ""
 	if !in.GeneratedAt.IsZero() {
 		generated = in.GeneratedAt.UTC().Format("2006-01-02 15:04 UTC")
+		generatedISO = in.GeneratedAt.UTC().Format(time.RFC3339)
 	}
 
 	// Compute renderedMessages first so the header count reflects what the
@@ -141,15 +158,16 @@ func buildViewData(in RenderInput) viewData {
 	// would be confusing).
 	rendered := buildViewMessages(in.Messages, in.Meta)
 	return viewData{
-		Lang:         "en",
-		Title:        pageTitle,
-		AgentName:    agentNameFromSession(sess),
-		SummaryHTML:  renderMarkdown(summaryBody),
-		CreatedAt:    created,
-		CreatedAtISO: createdISO,
-		GeneratedAt:  generated,
-		MessageCount: len(rendered),
-		Messages:     rendered,
+		Lang:           "en",
+		Title:          pageTitle,
+		AgentName:      agentNameFromSession(sess),
+		SummaryHTML:    renderMarkdown(summaryBody),
+		CreatedAt:      created,
+		CreatedAtISO:   createdISO,
+		GeneratedAt:    generated,
+		GeneratedAtISO: generatedISO,
+		MessageCount:   len(rendered),
+		Messages:       rendered,
 	}
 }
 
@@ -246,7 +264,14 @@ func buildViewMessages(msgs []client.Message, meta []session.MessageMeta) []view
 			AsideBlocks:  aside,
 		}
 		if mm.Timestamp != nil && !mm.Timestamp.IsZero() {
-			vm.Timestamp = mm.Timestamp.Format("15:04")
+			// Same UTC-only fallback policy as the header/footer timestamps —
+			// the JS localizer rewrites this to viewer-local on load, but if
+			// JS is disabled a viewer must not see the daemon operator's
+			// wall-clock hour/minute and mistake it for their own timezone.
+			// "UTC" suffix is dropped to keep message-row chrome compact;
+			// the data-fmt="time" attribute the template sets disambiguates
+			// for the localizer.
+			vm.Timestamp = mm.Timestamp.UTC().Format("15:04 UTC")
 			vm.TimestampISO = mm.Timestamp.UTC().Format(time.RFC3339)
 		}
 		out = append(out, vm)

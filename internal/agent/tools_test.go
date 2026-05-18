@@ -61,15 +61,54 @@ func (m *mockTool) Run(ctx context.Context, args string) (ToolResult, error) {
 
 func (m *mockTool) RequiresApproval() bool { return false }
 
+// TestDisallowsAutoApproval pins the current policy: the deny-list mechanism
+// EXISTS (so a future genuinely-irreversible tool can be added) but is empty
+// for now. publish_to_web / generate_image / edit_image were previously on
+// this list; the 2026-05-18 product call moved them off so users who opt
+// into "always allow" no longer have to re-confirm every call. See the
+// trade-off block on autoApprovalDenyList for the data-exfiltration risk we
+// accepted.
 func TestDisallowsAutoApproval(t *testing.T) {
-	for _, name := range []string{"publish_to_web", "generate_image", "edit_image"} {
-		if !DisallowsAutoApproval(name) {
-			t.Fatalf("%s must require per-call approval", name)
-		}
+	// The list is currently empty — every tool can be persisted as always-allow.
+	if got := AutoApprovalDenyList(); len(got) != 0 {
+		t.Fatalf("autoApprovalDenyList expected empty, got %v", got)
 	}
-	for _, name := range []string{"bash", "file_write", "cloud_delegate", "think"} {
+	// And no representative tool should be considered non-persistable, including
+	// the three that USED to be on the list. If a future change adds a new entry
+	// the test author should explicitly add it here so the policy shift is visible.
+	for _, name := range []string{
+		"publish_to_web", "generate_image", "edit_image",
+		"bash", "file_write", "cloud_delegate", "think",
+	} {
 		if DisallowsAutoApproval(name) {
 			t.Fatalf("%s should not be in the per-call approval denylist", name)
+		}
+	}
+}
+
+// TestDisallowsUnattendedAutoApproval pins the unattended gate. As of
+// 2026-05-18 this list is empty — see unattendedAutoApprovalDenyList for
+// the product-decision context. The plumbing (function + call sites in
+// scheduler / heartbeat / watcher / auto_approve handlers) is preserved
+// so a future tool can be added without rewiring callers.
+//
+// If you add an entry, also enumerate the tools you expect to remain off
+// the list so accidental over-broad deny-listing (which would break
+// scheduled runs of ordinary agents) gets caught.
+func TestDisallowsUnattendedAutoApproval(t *testing.T) {
+	if got := UnattendedAutoApprovalDenyList(); len(got) != 0 {
+		t.Fatalf("unattendedAutoApprovalDenyList expected empty, got %v", got)
+	}
+	// Ordinary tools and the three formerly-deny-listed tools should ALL
+	// return false. The formerly-deny-listed trio is enumerated explicitly
+	// so a regression that re-adds them to the unattended list — without
+	// also moving them off this assertion — fails loudly in review.
+	for _, name := range []string{
+		"publish_to_web", "generate_image", "edit_image",
+		"bash", "file_write", "file_read", "think", "cloud_delegate", "browser",
+	} {
+		if DisallowsUnattendedAutoApproval(name) {
+			t.Errorf("%s should NOT be on the unattended deny-list", name)
 		}
 	}
 }

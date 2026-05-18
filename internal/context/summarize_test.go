@@ -431,6 +431,114 @@ func TestSummarizeForUser_TagsHelperCacheSource(t *testing.T) {
 	}
 }
 
+// TestShareSummaryPrompt_HasConstraints guards the share-page prompt's three
+// load-bearing constraints: short length (2-3 sentences / ≤120 chars),
+// plain-text-only output (no Markdown), and the multi-language priming list.
+// Regressions here would re-introduce the long-Markdown summary that prompted
+// this whole prompt split in the first place.
+func TestShareSummaryPrompt_HasConstraints(t *testing.T) {
+	required := []string{
+		"2-3 sentence",
+		"≤120 characters",
+		"PLAIN TEXT ONLY",
+		// Multilingual priming — same teaching device as userSummarizePrompt.
+		"中文",
+		"日本語",
+		"한국어",
+	}
+	for _, phrase := range required {
+		if !strings.Contains(shareSummaryPrompt, phrase) {
+			t.Errorf("shareSummaryPrompt missing required phrase %q; current prompt:\n%s",
+				phrase, shareSummaryPrompt)
+		}
+	}
+
+	// Cross-check: this prompt MUST be distinct from userSummarizePrompt,
+	// otherwise the share path silently inherited the long-Markdown behavior.
+	if shareSummaryPrompt == userSummarizePrompt {
+		t.Fatal("shareSummaryPrompt is identical to userSummarizePrompt — share path will produce long Markdown again")
+	}
+}
+
+// TestSummarizeForShareWithSource_RequestShape pins the four invariants the
+// share endpoint relies on: small tier, MaxTokens hard cap, low temperature,
+// and the caller-provided cache_source (so Cloud billing exemption works).
+func TestSummarizeForShareWithSource_RequestShape(t *testing.T) {
+	mock := &mockCompleter{
+		response: &client.CompletionResponse{OutputText: "短摘要。"},
+	}
+	got, err := SummarizeForShareWithSource(context.Background(), mock,
+		[]client.Message{{Role: "user", Content: client.NewTextContent("hello")}},
+		"session_share")
+	if err != nil {
+		t.Fatalf("SummarizeForShareWithSource: %v", err)
+	}
+	if got != "短摘要。" {
+		t.Errorf("output not trimmed/propagated, got %q", got)
+	}
+	if mock.lastReq == nil {
+		t.Fatal("mockCompleter never received a request")
+	}
+	if mock.lastReq.ModelTier != "small" {
+		t.Errorf("ModelTier = %q, want %q", mock.lastReq.ModelTier, "small")
+	}
+	if mock.lastReq.MaxTokens != 200 {
+		t.Errorf("MaxTokens = %d, want 200 (hard cap against chatty Haiku)", mock.lastReq.MaxTokens)
+	}
+	if mock.lastReq.Temperature != 0.2 {
+		t.Errorf("Temperature = %f, want 0.2", mock.lastReq.Temperature)
+	}
+	if mock.lastReq.CacheSource != "session_share" {
+		t.Errorf("CacheSource = %q, want %q (caller-provided tag must reach the LLM)",
+			mock.lastReq.CacheSource, "session_share")
+	}
+	// System message must be shareSummaryPrompt, NOT userSummarizePrompt.
+	if len(mock.lastReq.Messages) < 1 || mock.lastReq.Messages[0].Role != "system" {
+		t.Fatal("first message must be the system prompt")
+	}
+	sys := mock.lastReq.Messages[0].Content.Text()
+	if !strings.Contains(sys, "2-3 sentence overview") {
+		t.Errorf("share path did not use shareSummaryPrompt; got system prompt:\n%s", sys)
+	}
+}
+
+// TestSummarizeForShareWithSource_CapsOversizedTranscript verifies the share
+// path inherits the 540K transcript cap from buildTranscript+capTranscriptForSummarize.
+// Without this, a user pasting a megabyte of text into their first message
+// would push Haiku past its 200K context.
+func TestSummarizeForShareWithSource_CapsOversizedTranscript(t *testing.T) {
+	huge := strings.Repeat("padding text ", 100_000) // ~1.3M chars
+	mock := &mockCompleter{
+		response: &client.CompletionResponse{OutputText: "ok"},
+	}
+	_, err := SummarizeForShareWithSource(context.Background(), mock,
+		[]client.Message{{Role: "user", Content: client.NewTextContent(huge)}},
+		"session_share")
+	if err != nil {
+		t.Fatalf("SummarizeForShareWithSource: %v", err)
+	}
+	body := mock.lastReq.Messages[1].Content.Text()
+	if len(body) > summarizeInputCapChars {
+		t.Errorf("share transcript len = %d, want <= %d (cap)", len(body), summarizeInputCapChars)
+	}
+	if !strings.Contains(body, "transcript truncated") {
+		t.Errorf("expected truncation marker in capped share transcript")
+	}
+}
+
+// TestSummarizeForShareWithSource_ErrorPropagates ensures LLM-side failures
+// reach the caller (share.go's fallbackSummary depends on err being non-nil
+// to switch over to session.Title / first user message).
+func TestSummarizeForShareWithSource_ErrorPropagates(t *testing.T) {
+	mock := &mockCompleter{err: context.DeadlineExceeded}
+	_, err := SummarizeForShareWithSource(context.Background(), mock,
+		[]client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
+		"session_share")
+	if err == nil {
+		t.Error("expected error to propagate from completer")
+	}
+}
+
 // TestGenerateSummary_CapsOversizedTranscript guards against the 2026-05-07
 // production cascade: reactive recovery hands GenerateSummary a transcript
 // already over the small-tier (Haiku 4.5, 200K) cap, the summarizer 400s

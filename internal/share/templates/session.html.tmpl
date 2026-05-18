@@ -445,7 +445,7 @@
     </div>
   {{else if .BubbleBlocks}}
     <div class="role">
-      {{.RoleLabel}}{{if .Timestamp}}<time datetime="{{.TimestampISO}}">{{.Timestamp}}</time>{{end}}
+      {{.RoleLabel}}{{if .Timestamp}}<time datetime="{{.TimestampISO}}" data-fmt="time">{{.Timestamp}}</time>{{end}}
     </div>
     {{range .BubbleBlocks}}
       {{if eq .Kind "text"}}<div class="content">{{.HTML}}</div>{{end}}
@@ -455,7 +455,7 @@
   {{if .AsideBlocks}}
     {{if not .BubbleBlocks}}
       <div class="role">
-        {{.RoleLabel}}{{if .Timestamp}}<time datetime="{{.TimestampISO}}">{{.Timestamp}}</time>{{end}}
+        {{.RoleLabel}}{{if .Timestamp}}<time datetime="{{.TimestampISO}}" data-fmt="time">{{.Timestamp}}</time>{{end}}
       </div>
     {{end}}
     {{range .AsideBlocks}}
@@ -484,8 +484,53 @@
 
 <footer class="share-footer">
   <span>Shared from <a href="https://kocoro.ai">Kocoro</a></span>
-  {{if .GeneratedAt}}<span>{{.GeneratedAt}}</span>{{end}}
+  {{if .GeneratedAt}}<time datetime="{{.GeneratedAtISO}}">{{.GeneratedAt}}</time>{{end}}
 </footer>
 </main>
+
+{{/*
+  localize-timestamps: rewrite every <time datetime="..."> element in the
+  document to the viewer's local timezone + locale. Server-side rendering
+  emits UTC as a static fallback (works for no-JS / no-Intl viewers); this
+  script upgrades it in-place so a Tokyo viewer reads JST and a London
+  viewer reads BST off the same uploaded HTML.
+
+  Why two formats (date+time vs message-bubble timestamp): the header and
+  footer carry full date+time stamps; message-bubble timestamps (rendered
+  by viewMessage.TimestampISO) are time-of-day only. We discriminate by
+  presence of the "data-fmt='time'" attribute that buildViewMessages tags
+  message timestamps with.
+
+  Fail-quiet: any error (invalid ISO, missing Intl API on a very old
+  browser) leaves the server-rendered UTC text alone — never throws.
+*/}}
+<script id="localize-timestamps">
+(function() {
+  if (typeof Intl === 'undefined' || !Intl.DateTimeFormat) return;
+  var locale = (navigator.language || 'en-US');
+  var dateTimeFmt = new Intl.DateTimeFormat(locale, {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+    timeZoneName: 'short'
+  });
+  var timeOnlyFmt = new Intl.DateTimeFormat(locale, {
+    hour: '2-digit', minute: '2-digit'
+  });
+  var nodes = document.querySelectorAll('time[datetime]');
+  for (var i = 0; i < nodes.length; i++) {
+    var el = nodes[i];
+    var iso = el.getAttribute('datetime');
+    if (!iso) continue;
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) continue;
+    try {
+      var formatter = (el.getAttribute('data-fmt') === 'time') ? timeOnlyFmt : dateTimeFmt;
+      el.textContent = formatter.format(d);
+    } catch (err) {
+      // Leave the server-rendered UTC text in place.
+    }
+  }
+})();
+</script>
 </body>
 </html>

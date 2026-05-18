@@ -50,22 +50,26 @@ func TestCheckPermissionAndApproval_AlwaysAllowNotInListStillPrompts(t *testing.
 	}
 }
 
-func TestCheckPermissionAndApproval_HighRiskIgnoresAlwaysAllow(t *testing.T) {
+// TestCheckPermissionAndApproval_FormerlyHighRiskHonorsAlwaysAllow pins the
+// 2026-05-18 policy change. publish_to_web USED to be on
+// autoApprovalDenyList — the runtime would force a prompt every time even if
+// the user had added it to always-allow. The deny-list is now empty, so an
+// always-allow entry IS honored and skips the prompt. If a future tool
+// genuinely needs the old behavior, re-add it to autoApprovalDenyList AND
+// add a fresh test on the same shape as this one for that tool.
+func TestCheckPermissionAndApproval_FormerlyHighRiskHonorsAlwaysAllow(t *testing.T) {
 	loop, handler := newApprovalProbeLoop(t, nil)
-	// Even if a hand-edited config.yaml smuggles publish_to_web into the list,
-	// the runtime gate must still prompt — DisallowsAutoApproval is the last
-	// line of defense.
 	loop.SetAlwaysAllowTools([]string{"publish_to_web"})
 
 	tool := &mockApprovalTool{name: "publish_to_web"}
 	cache := NewApprovalCache()
 	_, approved := loop.checkPermissionAndApproval(context.Background(), "publish_to_web", `{}`, tool, cache)
 
-	if approved {
-		t.Error("expected approval to be requested for high-risk tool, got auto-approve")
+	if !approved {
+		t.Error("expected always-allow to bypass approval for publish_to_web (deny-list is now empty)")
 	}
-	if !handler.approvalRequested {
-		t.Error("OnApprovalNeeded was not called for high-risk tool despite always-allow entry")
+	if handler.approvalRequested {
+		t.Error("OnApprovalNeeded should NOT be called when always-allow is set and tool is not deny-listed")
 	}
 }
 

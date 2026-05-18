@@ -54,14 +54,21 @@ func TestDaemonEventHandler_OnPreamble_DropsEmptyText(t *testing.T) {
 	}
 }
 
-func TestDaemonEventHandler_AutoApprovePromptsForPerCallTool(t *testing.T) {
-	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
+// TestDaemonEventHandler_AutoApproveAllowsAllTools pins the 2026-05-18
+// policy: with daemon.auto_approve=true, every tool is auto-approved with
+// no broker round-trip (unattended deny-list is empty). Previously
+// publish_to_web / generate_image / edit_image still prompted via the
+// broker; the product call moved them off the gate. The plumbing remains
+// so a future tool can re-occupy the slot.
+func TestDaemonEventHandler_AutoApproveAllowsAllTools(t *testing.T) {
+	for _, tool := range []string{
+		"publish_to_web", "generate_image", "edit_image",
+		"bash", "file_write",
+	} {
 		t.Run(tool, func(t *testing.T) {
-			reqCh := make(chan daemon.ApprovalRequest, 1)
-			var broker *daemon.ApprovalBroker
-			broker = daemon.NewApprovalBroker(func(req daemon.ApprovalRequest) error {
-				reqCh <- req
-				go broker.Resolve(req.RequestID, daemon.DecisionAllow, nil)
+			brokerCalled := false
+			broker := daemon.NewApprovalBroker(func(req daemon.ApprovalRequest) error {
+				brokerCalled = true
 				return nil
 			})
 			handler := &daemonEventHandler{
@@ -75,15 +82,10 @@ func TestDaemonEventHandler_AutoApprovePromptsForPerCallTool(t *testing.T) {
 			}
 
 			if !handler.OnApprovalNeeded(tool, `{"path":"report.html"}`) {
-				t.Fatalf("per-call approval tool %s should prompt via broker and allow when user allows", tool)
+				t.Fatalf("auto_approve=true should auto-approve %s without prompting", tool)
 			}
-			select {
-			case req := <-reqCh:
-				if req.Tool != tool || req.MessageID != "msg-123" || req.Agent != "Default" {
-					t.Fatalf("unexpected approval request: %+v", req)
-				}
-			case <-time.After(time.Second):
-				t.Fatalf("approval broker was not called for %s", tool)
+			if brokerCalled {
+				t.Fatalf("%s was auto-approved but broker was still invoked", tool)
 			}
 		})
 	}

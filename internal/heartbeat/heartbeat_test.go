@@ -45,13 +45,19 @@ func TestFormatPrompt(t *testing.T) {
 	}
 }
 
-func TestTranscriptCollectorBlocksPerCallApprovalTools(t *testing.T) {
+// TestTranscriptCollectorAutoApproves pins the 2026-05-18 policy: heartbeat
+// runs auto-approve every tool because the unattended deny-list is empty.
+// The plumbing (DisallowsUnattendedAutoApproval call site) is preserved so
+// a future entry can be added without rewriting this handler.
+func TestTranscriptCollectorAutoApproves(t *testing.T) {
 	tc := &TranscriptCollector{}
-	if tc.OnApprovalNeeded("publish_to_web", `{}`) {
-		t.Fatal("heartbeat must not auto-approve publish_to_web")
-	}
-	if !tc.OnApprovalNeeded("bash", `{}`) {
-		t.Fatal("heartbeat should keep auto-approving ordinary tools")
+	for _, tool := range []string{
+		"publish_to_web", "generate_image", "edit_image",
+		"bash", "file_write",
+	} {
+		if !tc.OnApprovalNeeded(tool, `{}`) {
+			t.Errorf("heartbeat should auto-approve %s (unattended list is empty)", tool)
+		}
 	}
 }
 

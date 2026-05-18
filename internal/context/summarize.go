@@ -205,11 +205,14 @@ func SummarizeForUser(ctx context.Context, c Completer, messages []client.Messag
 }
 
 // SummarizeForUserWithSource is the variant of SummarizeForUser that lets the
-// caller pin a custom cache_source tag — used by the share endpoint to opt
-// the auto-generated summary into the "internal feature, not user-billed"
-// tier (cache_source="session_share"), matching how prompt_suggestion is
-// already routed Cloud-side. The transcript / prompt / model tier remain
-// identical so the response shape is unchanged.
+// caller pin a custom cache_source tag. The transcript / prompt / model tier
+// remain identical to SummarizeForUser so the response shape is unchanged.
+//
+// Note: the share-page summary used to call this with cache_source="session_share".
+// That path now lives in SummarizeForShareWithSource (short overview, ≤120
+// chars). This function continues to back the interactive GET
+// /sessions/{id}/summary endpoint where users want the full structured
+// Markdown.
 func SummarizeForUserWithSource(ctx context.Context, c Completer, messages []client.Message, cacheSource string) (string, error) {
 	transcript := capTranscriptForSummarize(buildTranscript(messages))
 	req := client.CompletionRequest{
@@ -226,6 +229,71 @@ func SummarizeForUserWithSource(ctx context.Context, c Completer, messages []cli
 	resp, err := c.Complete(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("user summarization failed: %w", err)
+	}
+
+	return strings.TrimSpace(resp.OutputText), nil
+}
+
+// shareSummaryPrompt is a stricter variant of userSummarizePrompt for the
+// share-page header. A share reader wants to know the topic at a glance, not
+// read a structured Markdown report — so we explicitly cap to 2-3 sentences,
+// ≤120 chars, plain text. MaxTokens=200 (in SummarizeForShareWithSource) is
+// the hard ceiling that defends against a chatty model.
+//
+// The 11-language list mirrors userSummarizePrompt: it's a TEACHING DEVICE
+// (priming Haiku to write in the user's language), not a whitelist. Keep both
+// in sync if you add a language.
+const shareSummaryPrompt = `You are a conversation summarizer producing a SHORT overview for a public share-page header. Read the following conversation and write a 2-3 sentence overview of what the user discussed and the conversation's outcome.
+
+Requirements:
+- Match the USER's primary language exactly. Determine this from the user's
+  own messages (NOT from code, file paths, or English-only tool output that
+  appears in tool_result blocks — those are incidental noise).
+  - If the user writes in 中文 → write the summary in 中文.
+  - If the user writes in 日本語 → 日本語で書いてください.
+  - If the user writes in 한국어 → 한국어로 작성하세요.
+  - If the user writes in English → write in English.
+  - Same rule for Español / Français / Deutsch / Português / Tiếng Việt /
+    العربية / Русский / and every other language.
+  - NEVER translate the user's language into a different one, even if some
+    tool outputs or referenced code happen to be in English.
+- Output 2-3 sentences total, ≤120 characters. Skim-readable at a glance.
+- Output PLAIN TEXT ONLY. Do NOT use Markdown headers (#), bullet points
+  (- / *), numbered lists, code fences (~~~ or ` + "`" + ` ` + "`" + ` ` + "`" + `), bold (**), or italic (_).
+- Focus on the topic and outcome. Do NOT include internal LLM terminology
+  (tool_call, context window, tokens, etc.).
+- Do NOT wrap the output in quotes or any other delimiter — output the
+  sentences directly.`
+
+// SummarizeForShareWithSource produces a short 2-3 sentence overview suitable
+// for the share-page header (POST /sessions/{id}/share). Differences from
+// SummarizeForUserWithSource:
+//
+//   - Uses shareSummaryPrompt — explicit 2-3 sentence / ≤120 char / plain-text
+//     constraints instead of "concise but comprehensive" Markdown.
+//   - MaxTokens=200 — hard ceiling so a chatty Haiku response can't dominate
+//     the share page header even if it ignores the soft sentence budget.
+//
+// Same transcript construction + cap as SummarizeForUserWithSource (buildTranscript
+// skips image content blocks, capTranscriptForSummarize bounds total input
+// to 540K chars), so large sessions and base64-image-pasted text won't push
+// Haiku past its 200K context window.
+func SummarizeForShareWithSource(ctx context.Context, c Completer, messages []client.Message, cacheSource string) (string, error) {
+	transcript := capTranscriptForSummarize(buildTranscript(messages))
+	req := client.CompletionRequest{
+		Messages: []client.Message{
+			{Role: "system", Content: client.NewTextContent(shareSummaryPrompt)},
+			{Role: "user", Content: client.NewTextContent(transcript)},
+		},
+		ModelTier:   "small",
+		Temperature: 0.2,
+		MaxTokens:   200,
+		CacheSource: cacheSource,
+	}
+
+	resp, err := c.Complete(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("share summarization failed: %w", err)
 	}
 
 	return strings.TrimSpace(resp.OutputText), nil

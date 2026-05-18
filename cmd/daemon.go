@@ -674,7 +674,12 @@ func (h *daemonEventHandler) OnRunStatus(code, detail string) {}
 
 func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
-		if !agent.DisallowsAutoApproval(tool) {
+		// Treat auto-approve like the scheduled-run gate for paid +
+		// permanent-CDN tools — the user opted into "skip prompts" but
+		// almost certainly did not mean "drain image quota / publish .env
+		// without a human in the loop". DisallowsUnattendedAutoApproval
+		// matches the policy used by SSE auto-approve and scheduler.
+		if !agent.DisallowsUnattendedAutoApproval(tool) {
 			log.Printf("daemon: auto-approving %s (auto_approve=true)", tool)
 			return true
 		}
@@ -731,8 +736,12 @@ func (h *autoApproveHandler) OnUsage(usage agent.TurnUsage)                     
 func (h *autoApproveHandler) OnCloudAgent(agentID, status, message string)           {}
 func (h *autoApproveHandler) OnCloudProgress(completed, total int)                   {}
 func (h *autoApproveHandler) OnCloudPlan(planType, content string, needsReview bool) {}
+// OnApprovalNeeded auto-approves tools for internal triggers (file-system
+// watcher, heartbeat). These are fully unattended — there is no human at
+// the keyboard to backstop a misuse — so paid + permanent-CDN tools are
+// blocked at the same gate scheduled runs use.
 func (h *autoApproveHandler) OnApprovalNeeded(tool string, args string) bool {
-	return !agent.DisallowsAutoApproval(tool)
+	return !agent.DisallowsUnattendedAutoApproval(tool)
 }
 
 func stopExistingDaemon(pidPath string) {

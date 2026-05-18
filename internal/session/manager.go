@@ -145,6 +145,38 @@ func (m *Manager) PatchSummaryCache(id, summary, cacheKey string) error {
 	return m.store.PatchSummaryCache(id, summary, cacheKey)
 }
 
+// PatchPublishedShares re-reads the session from disk and applies mutate to
+// its PublishedShares slice. See Store.PatchPublishedShares for semantics.
+//
+// The entire read-modify-write is held under m.mu so it serializes against
+// the manager's Save / Reset / TruncateMessages — all of which write the
+// same JSON file. Without this lock a concurrent agent-loop Save could
+// either (a) overwrite the PublishedShares we just wrote, OR (b) be
+// overwritten by us, losing whichever side completed its Marshal first.
+// Share is rare and foreground, but the agent loop's Save runs every turn,
+// so the race is real and easy to hit on a busy session.
+//
+// mutate MUST be a pure function — it runs inside the manager mutex, so any
+// callback into Manager methods would deadlock. Append/filter on the slice
+// is fine; anything fancier needs to compute its result up front and close
+// over it.
+func (m *Manager) PatchPublishedShares(id string, mutate func([]PublishedShareEntry) []PublishedShareEntry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.store.PatchPublishedShares(id, mutate); err != nil {
+		return err
+	}
+	if m.current != nil && m.current.ID == id {
+		// Reload from disk so the in-memory copy reflects the just-written
+		// list. Cheap (one JSON read) and avoids a divergence window where
+		// the daemon's next Save would clobber the share with stale data.
+		if fresh, err := m.store.Load(id); err == nil {
+			m.current = fresh
+		}
+	}
+	return nil
+}
+
 // AddUsage merges a usage delta into the session's cumulative UsageSummary.
 // If the target session is currently loaded it updates the in-memory copy too.
 // Caller is expected to follow up with Save() — this keeps persistence batching

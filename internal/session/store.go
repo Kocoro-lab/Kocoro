@@ -61,6 +61,29 @@ type Session struct {
 	// Favorite marks the session as starred for filter views. Independent
 	// of Pinned. Set/cleared via PATCH /sessions/{id} {"favorite": bool}.
 	Favorite bool `json:"favorite,omitempty"`
+	// PublishedShares is the daemon-side source-of-truth for upload_ids
+	// returned by POST /sessions/{id}/share. The UI is the primary keeper of
+	// these IDs (it sends them back on DELETE /sessions/{id}/share), but UI
+	// state can drift — most visibly when a named agent's session ends up
+	// retract-broken because the UI dropped its upload_id. Storing the list
+	// here gives the UI a fallback to read via GET /sessions/{id}/shares,
+	// and gives us an audit trail that survives UI restarts.
+	//
+	// Append-only on share; on successful retract the matching UploadID is
+	// filtered out. Writes go through Store.PatchPublishedShares so they do
+	// NOT bump UpdatedAt (share/retract is metadata, not activity, and a
+	// bump would re-sort the session to the top of the recency list).
+	PublishedShares []PublishedShareEntry `json:"published_shares,omitempty"`
+}
+
+// PublishedShareEntry is one entry in Session.PublishedShares — a successful
+// share-page upload that has not yet been retracted. URL is the public CDN
+// link; UploadID is the UUID needed to retract via DELETE /api/v1/uploads/{id}.
+type PublishedShareEntry struct {
+	UploadID  string    `json:"upload_id"`
+	URL       string    `json:"url"`
+	Filename  string    `json:"filename,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // LastSeenModel returns the model that served the most recent LLM call on
@@ -385,6 +408,34 @@ func (s *Store) PatchFlags(id string, pinned, favorite *bool) error {
 		}
 	}
 	return nil
+}
+
+// PatchPublishedShares re-reads the session from disk, applies mutate to the
+// current PublishedShares slice, and writes it back. UpdatedAt is NOT touched
+// — share/retract is metadata, not user activity, so a bump would re-sort the
+// session to the top of the recency list unnecessarily. The mutator pattern
+// (vs. an Append + Remove pair) lets a future caller batch share+retract or
+// dedup in-place without round-tripping through two reads.
+//
+// Concurrency note: this method is NOT safe to call concurrently with
+// Store.Save on the same session — both do a full Marshal+WriteFile and the
+// last writer wins. Callers MUST serialise via Manager.PatchPublishedShares
+// (which holds Manager.mu around the whole RMW). Direct Store callers are
+// only acceptable in tests where no concurrent Save is in flight.
+func (s *Store) PatchPublishedShares(id string, mutate func([]PublishedShareEntry) []PublishedShareEntry) error {
+	sess, err := s.Load(id)
+	if err != nil {
+		return err
+	}
+	sess.PublishedShares = mutate(sess.PublishedShares)
+
+	data, err := json.MarshalIndent(sess, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal session: %w", err)
+	}
+
+	path := filepath.Join(s.dir, sess.ID+".json")
+	return os.WriteFile(path, data, 0600)
 }
 
 // PatchSummaryCache 从磁盘重新读取 session 的最新版本，仅更新摘要缓存字段后写回。

@@ -64,6 +64,16 @@ type Server struct {
 	memSvc       *memory.Service
 	suggestions  *agent.SuggestionState
 	migratePlans *claudecode.PlanStore
+
+	// shareTasks tracks in-flight and recently-completed async share
+	// goroutines. Lifecycle:
+	//   1. POST /sessions/{id}/share spawns a goroutine, registers state here, returns 202+task_id
+	//   2. The goroutine emits EventShareProgress and mutates state via updateShareTask
+	//   3. shareTaskRetainAfterDone after terminal phase, an AfterFunc drops the entry
+	// Lookups by GET /sessions/{id}/share/tasks/{task_id} race with the GC; a
+	// 404 is the legitimate "task expired" response in that case.
+	shareTasksMu sync.RWMutex
+	shareTasks   map[string]*shareTaskState
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500
@@ -315,6 +325,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}/summary", s.handleSessionSummary)
 	mux.HandleFunc("POST /sessions/{id}/share", s.handleSessionShare)
 	mux.HandleFunc("DELETE /sessions/{id}/share", s.handleSessionShareRetract)
+	mux.HandleFunc("GET /sessions/{id}/shares", s.handleSessionShares)
+	mux.HandleFunc("GET /sessions/{id}/share/tasks/{task_id}", s.handleSessionShareTask)
 	mux.HandleFunc("GET /sessions/search", s.handleSessionSearch)
 	mux.HandleFunc("GET /agents/{name}/sessions/{id}/suggestion", s.handleGetSuggestion)
 	mux.HandleFunc("POST /agents/{name}/sessions/{id}/suggestion/accept", s.handleAcceptSuggestion)
@@ -1598,8 +1610,13 @@ func (h *httpEventHandler) OnCloudAgent(agentID, status, message string)        
 func (h *httpEventHandler) OnCloudProgress(completed, total int)                   {}
 func (h *httpEventHandler) OnCloudPlan(planType, content string, needsReview bool) {}
 
+// OnApprovalNeeded auto-approves for local HTTP API calls except for tools
+// on the unattended deny-list — HTTP API callers are typically scripts /
+// automation, which is the same threat model as scheduled runs (no human
+// click stream to backstop a misuse). Keep paid + permanent-CDN tools
+// gated so a runaway script can't drain quota / leak files.
 func (h *httpEventHandler) OnApprovalNeeded(tool string, args string) bool {
-	return !agent.DisallowsAutoApproval(tool)
+	return !agent.DisallowsUnattendedAutoApproval(tool)
 }
 
 // sseEventHandler streams agent events as SSE to an HTTP response.
@@ -1748,7 +1765,11 @@ func (h *sseEventHandler) OnCloudPlan(planType, content string, needsReview bool
 // client responds via POST /approval or the request context is cancelled.
 func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
-		if !agent.DisallowsAutoApproval(tool) {
+		// daemon.auto_approve=true is a "skip prompts" global, but paid +
+		// permanent-CDN tools still demand attended consent — the user who
+		// flipped auto_approve probably did NOT mean "spend my image quota
+		// without asking". Treat them like the scheduled-run gate.
+		if !agent.DisallowsUnattendedAutoApproval(tool) {
 			log.Printf("sse: auto-approving %s (auto_approve=true)", tool)
 			return true
 		}

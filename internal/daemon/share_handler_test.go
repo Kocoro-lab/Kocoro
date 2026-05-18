@@ -382,3 +382,505 @@ func TestHandleSessionShareRetract_CloudDisabled(t *testing.T) {
 	}
 }
 
+// shareCloudHandler returns a cloud upstream that POST-uploads (returning
+// the canned url) and LIST-matches that URL to a fixed upload_id. Reused by
+// the PublishedShares persistence tests below.
+func shareCloudHandler(uploadID, url string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/api/v1/uploads"):
+			_ = r.ParseMultipartForm(32 << 20)
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"url":"` + url + `","key":"k","size":100,"content_type":"text/html"}`))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/api/v1/uploads"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"uploads":[{"id":"` + uploadID + `","url":"` + url + `","filename":"f.html","content_type":"text/html","size":100,"created_at":"2026-05-18T00:00:00Z"}],"total_count":1}`))
+		case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/api/v1/uploads/"):
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"deleted":true,"id":"` + uploadID + `","cdn_eviction_seconds":300}`))
+		default:
+			w.WriteHeader(503)
+		}
+	}
+}
+
+// TestHandleSessionShare_PersistsPublishedShare guards the daemon-side
+// source-of-truth: after a successful share, the session file MUST contain
+// a PublishedShares entry with the upload_id cloud returned via LIST. This
+// is what the UI falls back to via GET /sessions/{id}/shares when its own
+// upload_id storage gets out of sync — the suspected root cause of
+// named-agent retract failures.
+func TestHandleSessionShare_PersistsPublishedShare(t *testing.T) {
+	const wantUploadID = "upload-uuid-aaa"
+	const wantURL = "https://cdn.example/shared/aaa.html"
+
+	s, sessID := newTestShareServer(t, shareCloudHandler(wantUploadID, wantURL))
+
+	req := httptest.NewRequest("POST", "/sessions/"+sessID+"/share", nil)
+	req.SetPathValue("id", sessID)
+	rr := httptest.NewRecorder()
+	s.handleSessionShare(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("share status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	// Re-load from disk (not the in-memory cache) to prove the write hit.
+	store := session.NewStore(s.deps.SessionCache.SessionsDir(""))
+	defer store.Close()
+	sess, err := store.Load(sessID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(sess.PublishedShares) != 1 {
+		t.Fatalf("PublishedShares len = %d, want 1; got %+v", len(sess.PublishedShares), sess.PublishedShares)
+	}
+	got := sess.PublishedShares[0]
+	if got.UploadID != wantUploadID {
+		t.Errorf("UploadID = %q, want %q", got.UploadID, wantUploadID)
+	}
+	if got.URL != wantURL {
+		t.Errorf("URL = %q, want %q", got.URL, wantURL)
+	}
+	if got.Filename == "" {
+		t.Error("Filename empty — handler did not propagate the buildShareFilename result")
+	}
+	if got.CreatedAt.IsZero() {
+		t.Error("CreatedAt zero — handler did not stamp the entry")
+	}
+}
+
+// TestHandleSessionShareRetract_RemovesPublishedShare verifies the retract
+// path filters the matching upload_id out of PublishedShares so the daemon
+// SoT stays in sync with the cloud state.
+func TestHandleSessionShareRetract_RemovesPublishedShare(t *testing.T) {
+	const uploadID = "upload-uuid-bbb"
+	const url = "https://cdn.example/shared/bbb.html"
+
+	s, sessID := newTestShareServer(t, shareCloudHandler(uploadID, url))
+
+	// First share so there's an entry to retract.
+	req := httptest.NewRequest("POST", "/sessions/"+sessID+"/share", nil)
+	req.SetPathValue("id", sessID)
+	rr := httptest.NewRecorder()
+	s.handleSessionShare(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("seed share failed: %d %s", rr.Code, rr.Body.String())
+	}
+
+	// Now retract.
+	req2 := httptest.NewRequest("DELETE", "/sessions/"+sessID+"/share?upload_id="+uploadID, nil)
+	req2.SetPathValue("id", sessID)
+	rr2 := httptest.NewRecorder()
+	s.handleSessionShareRetract(rr2, req2)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("retract failed: %d %s", rr2.Code, rr2.Body.String())
+	}
+
+	store := session.NewStore(s.deps.SessionCache.SessionsDir(""))
+	defer store.Close()
+	sess, err := store.Load(sessID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(sess.PublishedShares) != 0 {
+		t.Fatalf("PublishedShares len = %d after retract, want 0; got %+v", len(sess.PublishedShares), sess.PublishedShares)
+	}
+}
+
+// TestHandleSessionShares_ReturnsEntries pins the new GET /sessions/{id}/shares
+// endpoint: empty array (NOT null) on a fresh session; populated after a share.
+// UI clients depend on the response always being a JSON array to avoid having
+// to handle null.
+func TestHandleSessionShares_ReturnsEntries(t *testing.T) {
+	const uploadID = "upload-uuid-ccc"
+	const url = "https://cdn.example/shared/ccc.html"
+
+	s, sessID := newTestShareServer(t, shareCloudHandler(uploadID, url))
+
+	// Fresh session → empty array.
+	req := httptest.NewRequest("GET", "/sessions/"+sessID+"/shares", nil)
+	req.SetPathValue("id", sessID)
+	rr := httptest.NewRecorder()
+	s.handleSessionShares(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("empty case status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+	var empty struct {
+		Shares []session.PublishedShareEntry `json:"shares"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &empty); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if empty.Shares == nil {
+		t.Error("shares is null — handler must return [] not null")
+	}
+	if len(empty.Shares) != 0 {
+		t.Errorf("fresh session has %d entries, want 0", len(empty.Shares))
+	}
+
+	// After a share → one entry.
+	shareReq := httptest.NewRequest("POST", "/sessions/"+sessID+"/share", nil)
+	shareReq.SetPathValue("id", sessID)
+	shareRr := httptest.NewRecorder()
+	s.handleSessionShare(shareRr, shareReq)
+	if shareRr.Code != http.StatusOK {
+		t.Fatalf("share failed: %d %s", shareRr.Code, shareRr.Body.String())
+	}
+
+	req2 := httptest.NewRequest("GET", "/sessions/"+sessID+"/shares", nil)
+	req2.SetPathValue("id", sessID)
+	rr2 := httptest.NewRecorder()
+	s.handleSessionShares(rr2, req2)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("populated case status = %d", rr2.Code)
+	}
+	var populated struct {
+		Shares []session.PublishedShareEntry `json:"shares"`
+	}
+	if err := json.Unmarshal(rr2.Body.Bytes(), &populated); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(populated.Shares) != 1 || populated.Shares[0].UploadID != uploadID {
+		t.Errorf("populated shares = %+v, want one entry with UploadID=%s", populated.Shares, uploadID)
+	}
+}
+
+// TestHandleSessionShares_NonexistentSession returns 404 — symmetric with
+// the share/retract paths so UI clients can use the same not-found branch.
+func TestHandleSessionShares_NonexistentSession(t *testing.T) {
+	s, _ := newTestShareServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("upstream should not be touched")
+	})
+	req := httptest.NewRequest("GET", "/sessions/missing/shares", nil)
+	req.SetPathValue("id", "missing")
+	rr := httptest.NewRecorder()
+	s.handleSessionShares(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// waitForShareTaskTerminal polls s.shareTasks until the task reaches a
+// terminal phase (completed / failed / cancelled) or a 5s deadline elapses.
+// Terminal-phase polling beats a fixed sleep — fast tests stay fast, slow CI
+// gets the headroom it needs without flaking. Returns the final snapshot.
+func waitForShareTaskTerminal(t *testing.T, s *Server, taskID string) *shareTaskState {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		task := s.getShareTask(taskID)
+		if task == nil {
+			t.Fatalf("task %s disappeared before reaching terminal phase", taskID)
+		}
+		switch task.Phase {
+		case ShareTaskPhaseCompleted, ShareTaskPhaseFailed, ShareTaskPhaseCancelled:
+			return task
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("task %s did not reach terminal phase within 5s", taskID)
+	return nil
+}
+
+// TestHandleSessionShare_AsyncReturns202 covers the new default contract:
+// POST returns 202 + task_id immediately, and the goroutine completes the
+// share in the background. The task snapshot eventually carries the URL +
+// upload_id that the legacy sync body would have returned directly.
+func TestHandleSessionShare_AsyncReturns202(t *testing.T) {
+	const uploadID = "upload-uuid-async-aaa"
+	const url = "https://cdn.example/shared/async-aaa.html"
+
+	s, sessID := newTestShareServer(t, shareCloudHandler(uploadID, url))
+	s.deps.Config.Daemon.ShareAsyncDefault = true
+
+	req := httptest.NewRequest("POST", "/sessions/"+sessID+"/share", nil)
+	req.SetPathValue("id", sessID)
+	rr := httptest.NewRecorder()
+	s.handleSessionShare(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		TaskID    string `json:"task_id"`
+		SessionID string `json:"session_id"`
+		Phase     string `json:"phase"`
+		Status    string `json:"status"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !strings.HasPrefix(body.TaskID, "share-") {
+		t.Errorf("task_id = %q, want share-* prefix", body.TaskID)
+	}
+	if body.SessionID != sessID {
+		t.Errorf("session_id = %q, want %q", body.SessionID, sessID)
+	}
+	if body.Phase != ShareTaskPhaseAccepted {
+		t.Errorf("phase = %q, want %q", body.Phase, ShareTaskPhaseAccepted)
+	}
+	if body.Status != "accepted" {
+		t.Errorf("status = %q, want %q", body.Status, "accepted")
+	}
+
+	final := waitForShareTaskTerminal(t, s, body.TaskID)
+	if final.Phase != ShareTaskPhaseCompleted {
+		t.Fatalf("final phase = %q, want %q (error=%q)",
+			final.Phase, ShareTaskPhaseCompleted, final.Error)
+	}
+	if final.URL != url {
+		t.Errorf("URL = %q, want %q", final.URL, url)
+	}
+	if final.UploadID != uploadID {
+		t.Errorf("UploadID = %q, want %q", final.UploadID, uploadID)
+	}
+
+	// Daemon SoT must mirror the cloud-side write (same contract as sync path).
+	store := session.NewStore(s.deps.SessionCache.SessionsDir(""))
+	defer store.Close()
+	sess, err := store.Load(sessID)
+	if err != nil {
+		t.Fatalf("reload session: %v", err)
+	}
+	if len(sess.PublishedShares) != 1 || sess.PublishedShares[0].UploadID != uploadID {
+		t.Errorf("PublishedShares after async = %+v, want one entry with UploadID=%s",
+			sess.PublishedShares, uploadID)
+	}
+}
+
+// TestHandleSessionShare_AsyncEmitsProgressEvents covers the SSE contract:
+// the share_progress phase sequence MUST include accepted → uploading →
+// completed in order (we don't insist on every intermediate phase landing
+// in the test, since rendering can complete before the subscriber sees it,
+// but the sequence must be monotonic and include both endpoints).
+func TestHandleSessionShare_AsyncEmitsProgressEvents(t *testing.T) {
+	const uploadID = "upload-uuid-async-bbb"
+	const url = "https://cdn.example/shared/async-bbb.html"
+
+	s, sessID := newTestShareServer(t, shareCloudHandler(uploadID, url))
+	s.deps.Config.Daemon.ShareAsyncDefault = true
+	s.eventBus = NewEventBus()
+
+	ch := s.eventBus.Subscribe()
+	defer s.eventBus.Unsubscribe(ch)
+
+	req := httptest.NewRequest("POST", "/sessions/"+sessID+"/share", nil)
+	req.SetPathValue("id", sessID)
+	rr := httptest.NewRecorder()
+	s.handleSessionShare(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", rr.Code)
+	}
+
+	// Collect events until completed or timeout.
+	phases := []string{}
+	deadline := time.After(5 * time.Second)
+collect:
+	for {
+		select {
+		case evt := <-ch:
+			if evt.Type != EventShareProgress {
+				continue
+			}
+			var payload struct {
+				Phase string `json:"phase"`
+			}
+			if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+				t.Fatalf("payload unmarshal: %v", err)
+			}
+			phases = append(phases, payload.Phase)
+			if payload.Phase == ShareTaskPhaseCompleted || payload.Phase == ShareTaskPhaseFailed {
+				break collect
+			}
+		case <-deadline:
+			t.Fatalf("did not receive terminal share_progress within 5s; got %v", phases)
+		}
+	}
+
+	if len(phases) < 2 {
+		t.Fatalf("expected at least accepted + completed events; got %v", phases)
+	}
+	if phases[0] != ShareTaskPhaseAccepted {
+		t.Errorf("first phase = %q, want %q", phases[0], ShareTaskPhaseAccepted)
+	}
+	if phases[len(phases)-1] != ShareTaskPhaseCompleted {
+		t.Errorf("last phase = %q, want %q; full sequence %v",
+			phases[len(phases)-1], ShareTaskPhaseCompleted, phases)
+	}
+}
+
+// TestHandleSessionShare_AsyncUploadFailureSetsFailedPhase covers the error
+// path: cloud upload returns 500 → task transitions to failed with the
+// upstream error message preserved in task.Error.
+func TestHandleSessionShare_AsyncUploadFailureSetsFailedPhase(t *testing.T) {
+	failingCloud := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/api/v1/uploads") {
+			// 500 with code "upload_failed" routes to ErrTransient — the
+			// uploads client retries 3 times then surfaces as a wrapped
+			// transient error. Either way the share task ends in failed.
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":"upload_failed","message":"simulated S3 error"}`))
+			return
+		}
+		w.WriteHeader(503)
+	}
+	s, sessID := newTestShareServer(t, failingCloud)
+	s.deps.Config.Daemon.ShareAsyncDefault = true
+
+	req := httptest.NewRequest("POST", "/sessions/"+sessID+"/share", nil)
+	req.SetPathValue("id", sessID)
+	rr := httptest.NewRecorder()
+	s.handleSessionShare(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	var body struct {
+		TaskID string `json:"task_id"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+
+	// Wait long enough for 3 retries × backoff (1+2+4=7s); the 180s task
+	// timeout is well above that so the test won't race the ceiling.
+	deadline := time.Now().Add(15 * time.Second)
+	var final *shareTaskState
+	for time.Now().Before(deadline) {
+		task := s.getShareTask(body.TaskID)
+		if task == nil {
+			t.Fatalf("task disappeared")
+		}
+		if task.Phase == ShareTaskPhaseFailed || task.Phase == ShareTaskPhaseCompleted {
+			final = task
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if final == nil {
+		t.Fatal("task did not reach terminal phase")
+	}
+	if final.Phase != ShareTaskPhaseFailed {
+		t.Errorf("phase = %q, want %q", final.Phase, ShareTaskPhaseFailed)
+	}
+	if final.Error == "" {
+		t.Error("Error empty — failure context lost")
+	}
+	if final.URL != "" {
+		t.Errorf("URL = %q on failed task, want empty", final.URL)
+	}
+}
+
+// TestHandleSessionShareTask_ReturnsSnapshot covers the polling-fallback
+// endpoint: after the goroutine completes, GET returns the same snapshot
+// the final SSE event carried.
+func TestHandleSessionShareTask_ReturnsSnapshot(t *testing.T) {
+	const uploadID = "upload-uuid-async-ccc"
+	const url = "https://cdn.example/shared/async-ccc.html"
+	s, sessID := newTestShareServer(t, shareCloudHandler(uploadID, url))
+	s.deps.Config.Daemon.ShareAsyncDefault = true
+
+	req := httptest.NewRequest("POST", "/sessions/"+sessID+"/share", nil)
+	req.SetPathValue("id", sessID)
+	rr := httptest.NewRecorder()
+	s.handleSessionShare(rr, req)
+	var body struct {
+		TaskID string `json:"task_id"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+
+	final := waitForShareTaskTerminal(t, s, body.TaskID)
+	if final.Phase != ShareTaskPhaseCompleted {
+		t.Fatalf("setup failed — task did not complete: %+v", final)
+	}
+
+	// Now GET the task — should mirror the snapshot.
+	getReq := httptest.NewRequest("GET", "/sessions/"+sessID+"/share/tasks/"+body.TaskID, nil)
+	getReq.SetPathValue("id", sessID)
+	getReq.SetPathValue("task_id", body.TaskID)
+	getRr := httptest.NewRecorder()
+	s.handleSessionShareTask(getRr, getReq)
+
+	if getRr.Code != http.StatusOK {
+		t.Fatalf("GET task status = %d, body=%s", getRr.Code, getRr.Body.String())
+	}
+	var got shareTaskState
+	if err := json.Unmarshal(getRr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal task: %v", err)
+	}
+	if got.TaskID != body.TaskID || got.Phase != ShareTaskPhaseCompleted ||
+		got.URL != url || got.UploadID != uploadID {
+		t.Errorf("snapshot mismatch: %+v", got)
+	}
+}
+
+// TestHandleSessionShareTask_404OnMissing covers a fresh / expired task_id.
+func TestHandleSessionShareTask_404OnMissing(t *testing.T) {
+	s, sessID := newTestShareServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("upstream should not be touched")
+	})
+	req := httptest.NewRequest("GET", "/sessions/"+sessID+"/share/tasks/share-deadbeef", nil)
+	req.SetPathValue("id", sessID)
+	req.SetPathValue("task_id", "share-deadbeef")
+	rr := httptest.NewRecorder()
+	s.handleSessionShareTask(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+}
+
+// TestHandleSessionShareTask_404OnSessionMismatch defends against a UI bug
+// where one session's GET probes another session's task ID.
+func TestHandleSessionShareTask_404OnSessionMismatch(t *testing.T) {
+	const uploadID = "upload-uuid-async-ddd"
+	s, sessID := newTestShareServer(t, shareCloudHandler(uploadID, "https://x/y.html"))
+	s.deps.Config.Daemon.ShareAsyncDefault = true
+
+	req := httptest.NewRequest("POST", "/sessions/"+sessID+"/share", nil)
+	req.SetPathValue("id", sessID)
+	rr := httptest.NewRecorder()
+	s.handleSessionShare(rr, req)
+	var body struct {
+		TaskID string `json:"task_id"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	_ = waitForShareTaskTerminal(t, s, body.TaskID)
+
+	// GET with a different session id should 404 even though the task exists.
+	getReq := httptest.NewRequest("GET", "/sessions/other_session/share/tasks/"+body.TaskID, nil)
+	getReq.SetPathValue("id", "other_session")
+	getReq.SetPathValue("task_id", body.TaskID)
+	getRr := httptest.NewRecorder()
+	s.handleSessionShareTask(getRr, getReq)
+	if getRr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 on session id mismatch", getRr.Code)
+	}
+}
+
+// TestHandleSessionShare_ExplicitAsyncFalseOverridesDefault confirms the
+// per-request override beats daemon.share_async_default — operators who set
+// the default to true can still get the legacy sync body from a script that
+// passes `?async=false`.
+func TestHandleSessionShare_ExplicitAsyncFalseOverridesDefault(t *testing.T) {
+	const uploadID = "upload-uuid-sync-override"
+	const url = "https://cdn.example/sync-override.html"
+	s, sessID := newTestShareServer(t, shareCloudHandler(uploadID, url))
+	s.deps.Config.Daemon.ShareAsyncDefault = true // override target
+
+	req := httptest.NewRequest("POST", "/sessions/"+sessID+"/share?async=false", nil)
+	req.SetPathValue("id", sessID)
+	rr := httptest.NewRecorder()
+	s.handleSessionShare(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		URL      string `json:"url"`
+		UploadID string `json:"upload_id"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.URL != url || body.UploadID != uploadID {
+		t.Errorf("sync body lost: %+v", body)
+	}
+}
+

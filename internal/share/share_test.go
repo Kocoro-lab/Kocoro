@@ -79,10 +79,11 @@ func TestRender_HappyPath(t *testing.T) {
 	if !strings.Contains(string(res.HTML), "We refactored the session loader") {
 		t.Fatalf("Haiku summary missing from output")
 	}
-	// Confirm we hit SummarizeForUser (markdown, in-language) rather than
-	// the structured GenerateSummary path.
-	if !strings.Contains(gw.seenSystemPrompt, "Markdown summary for a human reader") {
-		t.Fatalf("expected SummarizeForUser system prompt, got: %s", gw.seenSystemPrompt)
+	// Confirm we hit SummarizeForShare (2-3 sentence plain-text overview)
+	// rather than the longer SummarizeForUser Markdown variant or the
+	// structured GenerateSummary path.
+	if !strings.Contains(gw.seenSystemPrompt, "2-3 sentence overview") {
+		t.Fatalf("expected SummarizeForShare system prompt (looking for '2-3 sentence overview'), got: %s", gw.seenSystemPrompt)
 	}
 }
 

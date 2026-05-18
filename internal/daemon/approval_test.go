@@ -211,75 +211,53 @@ func TestApprovalBroker_ToolAutoApprove(t *testing.T) {
 	}
 }
 
-// TestApprovalBroker_HighRiskNeverAutoApproved guards the fail-safe added in
-// PR 3: callers may unconditionally invoke SetToolAutoApprove after a
-// DecisionAlwaysAllow click, but the broker itself must refuse to honor
-// high-risk tools so a single click cannot self-elevate the rest of the session.
-// This is the regression check pointed out in PR 3 review.
-func TestApprovalBroker_HighRiskNeverAutoApproved(t *testing.T) {
+// TestApprovalBroker_FormerlyHighRiskNowAutoApprovable pins the 2026-05-18
+// policy change: SetToolAutoApprove on the previously-blocked trio now
+// succeeds. The guard plumbing (DisallowsAutoApproval check in
+// SetToolAutoApprove + IsToolAutoApproved) stays in place so a future tool
+// can re-enter the deny-list without callers being rewritten.
+func TestApprovalBroker_FormerlyHighRiskNowAutoApprovable(t *testing.T) {
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
 
 	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
-		// Caller path: unconditional set after Always-Allow click.
 		broker.SetToolAutoApprove(tool)
-		if broker.IsToolAutoApproved(tool) {
-			t.Errorf("%s must NOT be auto-approved even after SetToolAutoApprove", tool)
+		if !broker.IsToolAutoApproved(tool) {
+			t.Errorf("%s should now be auto-approvable (deny-list is empty)", tool)
 		}
 	}
 
-	// Sanity: safe tools still work after the high-risk attempts above —
-	// the set-side guard must not corrupt the underlying map.
+	// Sanity: the safe-tool path still works.
 	broker.SetToolAutoApprove("file_write")
 	if !broker.IsToolAutoApproved("file_write") {
-		t.Error("file_write should still be auto-approved after high-risk set attempts")
+		t.Error("file_write auto-approve regressed")
 	}
 }
 
-// TestApprovalBroker_HighRiskCheckSideOnly verifies the get-side fail-safe
-// in isolation: even if a future regression bypassed SetToolAutoApprove and
-// wrote directly to the map, IsToolAutoApproved must still refuse high-risk.
-func TestApprovalBroker_HighRiskCheckSideOnly(t *testing.T) {
-	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-
-	// Bypass the set-side guard by writing the map directly.
-	broker.mu.Lock()
-	broker.toolAutoApprove["publish_to_web"] = true
-	broker.mu.Unlock()
-
-	if broker.IsToolAutoApproved("publish_to_web") {
-		t.Error("IsToolAutoApproved must refuse high-risk tools even if the map contains them")
-	}
-}
-
-// TestApprovalBroker_FlagsHighRiskTools verifies the policy hint sent to UI
-// clients on the approval payload. Non-technical UIs use this flag to disable
-// the "Always Allow" affordance for tools whose nature (paid quota /
-// permanent public output) requires fresh consent every call.
-func TestApprovalBroker_FlagsHighRiskTools(t *testing.T) {
+// TestApprovalBroker_FlagsNoLongerSetForFormerlyHighRisk pins the UI-facing
+// side of the 2026-05-18 change. The ApprovalFlagAlwaysAllowDisabled mechanism
+// is preserved (so a future deny-listed tool can opt back in) but no tool
+// currently triggers it. Desktop's "Always Allow" button stays enabled for
+// all three formerly-high-risk tools.
+func TestApprovalBroker_FlagsNoLongerSetForFormerlyHighRisk(t *testing.T) {
 	var captured ApprovalRequest
 	broker := NewApprovalBroker(func(req ApprovalRequest) error {
 		captured = req
 		return nil
 	})
-	// High-risk tool: flag MUST be present so UI hides "Always Allow".
+	// Previously-high-risk tool: flag MUST be absent now.
 	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
 		captured = ApprovalRequest{}
-		go broker.Resolve(captured.RequestID, DecisionDeny, nil) // no-op (req not in-flight yet)
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		_ = broker.Request(ctx, ApprovalRequestMeta{}, tool, "{}")
 		cancel()
-		found := false
 		for _, f := range captured.Flags {
 			if f == ApprovalFlagAlwaysAllowDisabled {
-				found = true
-				break
+				t.Errorf("%s: %q flag should NOT be set (deny-list is empty), got %v",
+					tool, ApprovalFlagAlwaysAllowDisabled, captured.Flags)
 			}
 		}
-		if !found {
-			t.Errorf("%s: expected flags to contain %q, got %v", tool, ApprovalFlagAlwaysAllowDisabled, captured.Flags)
-		}
 	}
-	// Safe tool: flag MUST be absent so UI shows the "Always Allow" button.
+	// Safe tool: flag MUST still be absent.
 	for _, tool := range []string{"bash", "file_write", "http", "browser"} {
 		captured = ApprovalRequest{}
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -287,7 +265,8 @@ func TestApprovalBroker_FlagsHighRiskTools(t *testing.T) {
 		cancel()
 		for _, f := range captured.Flags {
 			if f == ApprovalFlagAlwaysAllowDisabled {
-				t.Errorf("%s: flag %q should NOT be set for safe tools, got %v", tool, ApprovalFlagAlwaysAllowDisabled, captured.Flags)
+				t.Errorf("%s: flag %q should NOT be set for safe tools, got %v",
+					tool, ApprovalFlagAlwaysAllowDisabled, captured.Flags)
 			}
 		}
 	}

@@ -30,6 +30,35 @@ const (
 	// payload carries `phase` (started/succeeded/failed) so Desktop can
 	// distinguish scheduler-started work from ordinary agent progress events.
 	EventScheduleRun = "schedule_run"
+	// EventShareProgress reports the lifecycle of a POST /sessions/{id}/share
+	// task in async mode. UI clients (Desktop) subscribe to /events and use
+	// these to drive the share-button spinner / phase text without polling
+	// the task endpoint.
+	//
+	// Payload shape: {
+	//   "task_id":    string,            // UUID from the POST 202 response
+	//   "session_id": string,
+	//   "agent":      string,            // empty for default agent
+	//   "phase":      string,            // see phases below
+	//   "message":    string,            // optional human-readable status line
+	//   "url":        string (optional), // populated on phase="completed"
+	//   "upload_id":  string (optional), // populated on phase="completed"
+	//   "error":      string (optional)  // populated on phase="failed"
+	// }
+	//
+	// Phases (linear; never repeats; "completed"/"failed"/"cancelled" are terminal):
+	//   accepted     — task accepted, goroutine started
+	//   rendering    — sanitizing + RenderHTML (Haiku summary + slug in parallel)
+	//   uploading    — POST /api/v1/uploads in flight
+	//   listing      — POST returned; resolving upload_id via GET /api/v1/uploads
+	//   completed    — done; url + upload_id populated; PublishedShares written
+	//   failed       — upload error, render error, or 180s share-task timeout
+	//   cancelled    — daemon stopping; goroutine drained
+	//
+	// Not retained in the notification ring (not a banner-class event) but
+	// IS retained in the standard SSE replay ring, so a reconnecting client
+	// can still pick up an in-flight share's recent phase events.
+	EventShareProgress = "share_progress"
 )
 
 // Event is a daemon lifecycle event pushed to SSE subscribers.
