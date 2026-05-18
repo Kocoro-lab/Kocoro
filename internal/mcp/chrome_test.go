@@ -1067,3 +1067,148 @@ func TestWithChromeUseLease_InstallsFreshLease(t *testing.T) {
 		t.Fatal("expected lease bound to globalChromeTracker")
 	}
 }
+
+func TestReleaseAndMaybeTeardown_LastReleaseTriggersCallbacks(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.MarkUsed()
+
+	disconnectCalls := 0
+	stopCalls := 0
+	disconnect := func() { disconnectCalls++ }
+	stop := func(ctx context.Context) error { stopCalls++; return nil }
+
+	torndown, err := lease.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !torndown {
+		t.Fatal("expected torndown=true")
+	}
+	if disconnectCalls != 1 || stopCalls != 1 {
+		t.Fatalf("expected one call each, got disconnect=%d stop=%d", disconnectCalls, stopCalls)
+	}
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("expected count 0 after teardown, got %d", got)
+	}
+}
+
+func TestReleaseAndMaybeTeardown_NotLastReleaseSkipsCallbacks(t *testing.T) {
+	tr := &chromeUseTracker{}
+	leaseA := newChromeUseLeaseWithTracker(tr)
+	leaseB := newChromeUseLeaseWithTracker(tr)
+	leaseA.MarkUsed()
+	leaseB.MarkUsed()
+
+	disconnectCalls := 0
+	stopCalls := 0
+	disconnect := func() { disconnectCalls++ }
+	stop := func(ctx context.Context) error { stopCalls++; return nil }
+
+	torndown, err := leaseA.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if torndown {
+		t.Fatal("expected torndown=false when another lease still holds")
+	}
+	if disconnectCalls != 0 || stopCalls != 0 {
+		t.Fatalf("expected no callbacks, got disconnect=%d stop=%d", disconnectCalls, stopCalls)
+	}
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count 1, got %d", got)
+	}
+
+	// Second lease's release triggers teardown.
+	torndown, _ = leaseB.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+	if !torndown {
+		t.Fatal("expected torndown=true on final release")
+	}
+	if disconnectCalls != 1 || stopCalls != 1 {
+		t.Fatalf("expected one call each after final release, got disconnect=%d stop=%d", disconnectCalls, stopCalls)
+	}
+}
+
+func TestReleaseAndMaybeTeardown_HoldsLockAcrossStop(t *testing.T) {
+	tr := &chromeUseTracker{}
+	leaseA := newChromeUseLeaseWithTracker(tr)
+	leaseA.MarkUsed()
+
+	stopStarted := make(chan struct{})
+	stopRelease := make(chan struct{})
+	stop := func(ctx context.Context) error {
+		close(stopStarted)
+		<-stopRelease
+		return nil
+	}
+	disconnect := func() {}
+
+	// Release on a goroutine — it will block inside stop().
+	releaseDone := make(chan struct{})
+	go func() {
+		_, _ = leaseA.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+		close(releaseDone)
+	}()
+
+	<-stopStarted
+
+	// While stop() is blocked, a concurrent MarkUsed on a new lease must wait —
+	// it competes for tracker.mu, which ReleaseAndMaybeTeardown holds.
+	acquireDone := make(chan struct{})
+	leaseB := newChromeUseLeaseWithTracker(tr)
+	go func() {
+		leaseB.MarkUsed()
+		close(acquireDone)
+	}()
+
+	select {
+	case <-acquireDone:
+		t.Fatal("MarkUsed returned while stop was still running — lock not held")
+	case <-time.After(150 * time.Millisecond):
+		// Expected: acquire is blocked behind the held mutex.
+	}
+
+	close(stopRelease)
+	<-releaseDone
+	<-acquireDone
+
+	// After stop completed and lock dropped, leaseB's MarkUsed incremented.
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count 1 after relaunch acquire, got %d", got)
+	}
+}
+
+func TestReleaseAndMaybeTeardown_IdempotentDoubleRelease(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.MarkUsed()
+
+	calls := 0
+	disconnect := func() { calls++ }
+	stop := func(ctx context.Context) error { calls++; return nil }
+
+	_, _ = lease.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+	_, _ = lease.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+
+	if calls != 2 {
+		t.Fatalf("expected exactly 2 total callback invocations (1 disconnect + 1 stop), got %d", calls)
+	}
+}
+
+func TestReleaseAndMaybeTeardown_PropagatesStopError(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.MarkUsed()
+
+	wantErr := errors.New("boom")
+	disconnect := func() {}
+	stop := func(ctx context.Context) error { return wantErr }
+
+	torndown, err := lease.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+	if !torndown {
+		t.Fatal("expected torndown=true even on stop error")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped wantErr, got %v", err)
+	}
+}

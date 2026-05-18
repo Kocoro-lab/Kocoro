@@ -115,6 +115,49 @@ func (l *ChromeUseLease) ReleaseOnly() {
 	}
 }
 
+// ReleaseAndMaybeTeardown decrements the tracker (if MarkUsed was called); if
+// the resulting count is zero, runs disconnect() then stop(ctx) WHILE STILL
+// HOLDING tracker.mu. Concurrent MarkUsed() calls take the same mutex and so
+// block until teardown completes — this is the contract that prevents a new
+// browser-using Run from having its Chrome killed mid-launch.
+//
+// Idempotent: subsequent calls return (false, nil) without invoking callbacks.
+// Returns (true, err) when teardown ran; (false, nil) when another lease still
+// holds the tracker (count > 0 after decrement) or when the lease was never
+// acquired (MarkUsed never called).
+func (l *ChromeUseLease) ReleaseAndMaybeTeardown(
+	disconnect func(),
+	stop func(context.Context) error,
+	ctx context.Context,
+) (torndown bool, err error) {
+	if l == nil {
+		return false, nil
+	}
+	l.tracker.mu.Lock()
+	defer l.tracker.mu.Unlock()
+	if l.released {
+		return false, nil
+	}
+	l.released = true
+	if !l.acquired {
+		// Late release before any MarkUsed — set released=true so any
+		// future MarkUsed no-ops. No counter change.
+		return false, nil
+	}
+	l.tracker.count--
+	if l.tracker.count > 0 {
+		return false, nil
+	}
+	torndown = true
+	if disconnect != nil {
+		disconnect()
+	}
+	if stop != nil {
+		err = stop(ctx)
+	}
+	return torndown, err
+}
+
 type chromeLeaseKey struct{}
 
 // WithChromeUseLease installs a fresh ChromeUseLease on the context. Call once
