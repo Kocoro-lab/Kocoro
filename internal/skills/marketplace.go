@@ -508,28 +508,17 @@ func InstallFromZipData(shannonDir string, body io.Reader, force bool, locks *Sl
 // are wrapped as ErrInvalidSkillPayload so the handler maps them to
 // 422, matching the design doc's error matrix.
 func installFromGit(ctx context.Context, entry MarketplaceEntry, stageDir, tmpRoot string) error {
-	cloneDir, err := os.MkdirTemp(tmpRoot, "skill-clone-"+entry.Slug+"-*")
+	// Retry the git clone portion on transient failures. Matches the
+	// downloadable-skills path (see installFromRepo): same flakes hit both
+	// transports (Tokyo/CN networks intermittently lose reachability to
+	// github.com / other hosts during clone). Staging/validation is local
+	// and is NOT retried — only the network operations are. cloneDir is
+	// recreated each attempt because `git clone` rejects a non-empty target.
+	cloneDir, err := gitCloneWithRetry(ctx, entry, tmpRoot)
 	if err != nil {
-		return fmt.Errorf("create clone dir: %w", err)
+		return err
 	}
 	defer os.RemoveAll(cloneDir)
-
-	ref := entry.Ref
-	if ref == "" {
-		ref = "main"
-	}
-	if entry.RepoPath == "" {
-		if err := runGitCtx(ctx, cloneDir, "clone", "--depth=1", "--branch", ref, entry.Repo, "."); err != nil {
-			return fmt.Errorf("%w: git clone: %v", ErrMarketplaceUpstreamFailure, err)
-		}
-	} else {
-		if err := runGitCtx(ctx, cloneDir, "clone", "--depth=1", "--filter=blob:none", "--sparse", "--branch", ref, entry.Repo, "."); err != nil {
-			return fmt.Errorf("%w: git clone: %v", ErrMarketplaceUpstreamFailure, err)
-		}
-		if err := runGitCtx(ctx, cloneDir, "sparse-checkout", "set", entry.RepoPath); err != nil {
-			return fmt.Errorf("%w: git sparse-checkout: %v", ErrMarketplaceUpstreamFailure, err)
-		}
-	}
 
 	srcDir := cloneDir
 	if entry.RepoPath != "" {
@@ -545,6 +534,56 @@ func installFromGit(ctx context.Context, entry MarketplaceEntry, stageDir, tmpRo
 		return fmt.Errorf("%w: %v", ErrInvalidSkillPayload, err)
 	}
 	return nil
+}
+
+// gitCloneWithRetry performs the marketplace git clone (+ optional sparse
+// checkout) with retry/backoff identical to installFromRepo. Returns the
+// populated cloneDir on success; cleans up the temp dir on every failed
+// attempt so the next attempt starts from a fresh empty directory.
+// Respects ctx cancellation during the inter-attempt sleep.
+func gitCloneWithRetry(ctx context.Context, entry MarketplaceEntry, tmpRoot string) (string, error) {
+	ref := entry.Ref
+	if ref == "" {
+		ref = "main"
+	}
+	var lastErr error
+	for attempt := 0; attempt < installFromRepoMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		cloneDir, err := os.MkdirTemp(tmpRoot, "skill-clone-"+entry.Slug+"-*")
+		if err != nil {
+			// Local MkdirTemp failure is not a network flake — fail fast.
+			return "", fmt.Errorf("create clone dir: %w", err)
+		}
+		if entry.RepoPath == "" {
+			err = runGitCtx(ctx, cloneDir, "clone", "--depth=1", "--branch", ref, entry.Repo, ".")
+			if err != nil {
+				os.RemoveAll(cloneDir)
+				lastErr = fmt.Errorf("%w: git clone: %v", ErrMarketplaceUpstreamFailure, err)
+				continue
+			}
+		} else {
+			err = runGitCtx(ctx, cloneDir, "clone", "--depth=1", "--filter=blob:none", "--sparse", "--branch", ref, entry.Repo, ".")
+			if err != nil {
+				os.RemoveAll(cloneDir)
+				lastErr = fmt.Errorf("%w: git clone: %v", ErrMarketplaceUpstreamFailure, err)
+				continue
+			}
+			err = runGitCtx(ctx, cloneDir, "sparse-checkout", "set", entry.RepoPath)
+			if err != nil {
+				os.RemoveAll(cloneDir)
+				lastErr = fmt.Errorf("%w: git sparse-checkout: %v", ErrMarketplaceUpstreamFailure, err)
+				continue
+			}
+		}
+		return cloneDir, nil
+	}
+	return "", lastErr
 }
 
 // installFromZip fetches entry.DownloadURL and extracts it into stageDir

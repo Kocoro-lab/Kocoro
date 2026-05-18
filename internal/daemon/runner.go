@@ -3,14 +3,19 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -39,7 +44,7 @@ var (
 	disconnectPlaywrightNowFn = func(mgr *mcp.ClientManager) {
 		mgr.Disconnect("playwright")
 	}
-	stopPlaywrightChromeFn = mcp.StopCDPChrome
+	stopPlaywrightChromeAndWaitFn = mcp.StopCDPChromeAndWait
 )
 
 // RequestContentBlock represents a content block in the POST /message request.
@@ -197,6 +202,153 @@ func resolveContentBlocks(blocks []RequestContentBlock) []client.ContentBlock {
 		}
 	}
 	return out
+}
+
+// ConvertFilesToInjected lowers daemon-layer RemoteFile (cloud wire format)
+// to agent.InjectedFile (cycle-free agent-layer carrier). The inject-path
+// priority order is:
+//
+//	ExtractedText > DocumentB64 > URL-download (image case).
+//
+// Note this is the REVERSE of downloadRemoteFiles' priority (which is
+// DocumentB64 > ExtractedText > URL, per attachment.go's header comment).
+// The main path prefers DocumentB64 to preserve PDF fidelity for native
+// vision; the inject path prefers ExtractedText because mid-turn injects
+// share context with the active turn and a cheaper-token text block
+// usually wins over a fresh ~25 MB document. Real-world cloud mid-turn
+// followups are typically "look at this image" or "here is the extract"
+// — when ExtractedText is populated, the cloud already did the extraction
+// work and we honor it.
+//
+// Returns nil for empty input; skips entries that can't be expressed and
+// logs them rather than silently dropping. Non-image URL-only files are
+// skipped intentionally — the inject path has no disk-cleanup hook for the
+// file_ref/disk-download flow that downloadRemoteFiles uses, and the only
+// real-world mid-turn attachment from cloud channels is an image followup
+// ("here's the screenshot you asked about"). A future enhancement can wire
+// document downloads through ensureDir() + the existing cleanup chain.
+//
+// Exported so the cmd/daemon.go WS handler can call it before queueing the
+// InjectedMessage onto the route's inject channel.
+func ConvertFilesToInjected(ctx context.Context, files []RemoteFile) []agent.InjectedFile {
+	if len(files) == 0 {
+		return nil
+	}
+	out := make([]agent.InjectedFile, 0, len(files))
+	for _, f := range files {
+		switch {
+		case f.ExtractedText != "":
+			out = append(out, agent.InjectedFile{
+				Type: "text",
+				Data: f.ExtractedText,
+			})
+		case f.DocumentB64 != "":
+			out = append(out, agent.InjectedFile{
+				Type:      "document",
+				MediaType: f.MimeType,
+				Data:      f.DocumentB64,
+			})
+		case f.URL != "" && strings.HasPrefix(f.MimeType, "image/"):
+			b64, err := downloadInjectedImageBase64(ctx, f.URL, f.AuthHeader)
+			if err != nil {
+				log.Printf("daemon: convertFilesToInjected: image download failed for %q: %v", f.Name, sanitizeError(err))
+				continue
+			}
+			out = append(out, agent.InjectedFile{
+				Type:      "image",
+				MediaType: f.MimeType,
+				Data:      b64,
+			})
+		default:
+			log.Printf("daemon: convertFilesToInjected: skip unrepresentable file %q (mimetype=%s, has_url=%v)", f.Name, f.MimeType, f.URL != "")
+		}
+	}
+	return out
+}
+
+// downloadInjectedImageBase64 fetches a remote image URL in memory and
+// returns its base64-encoded body. Used by the mid-turn inject path which
+// can't reuse downloadOneFile's disk-+-cleanup flow (no cleanup hook).
+// Applies the same SSRF/Slack-rewrite/auth-header guards as downloadOneFile
+// and caps decoded bytes at maxInlineImageDecodedBytes to match Anthropic's
+// 5 MB inline-image ceiling (with a 4 MB safety margin via the 20 MB cap
+// used by the rest of the inline-image path).
+func downloadInjectedImageBase64(ctx context.Context, rawURL, authHeader string) (string, error) {
+	dlURL := slackDownloadURL(rawURL)
+	if err := urlValidator(dlURL); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dlURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("bad URL: %w", err)
+	}
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	httpClient := &http.Client{
+		Timeout: downloadTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			if err := urlValidator(req.URL.String()); err != nil {
+				return fmt.Errorf("redirect blocked: %w", err)
+			}
+			// Cross-host redirect handling. Cloud-supplied URLs aren't
+			// directly user-controlled, but a malicious 302 from a compromised
+			// upstream would otherwise leak the bot token to attacker.com.
+			//
+			// Two layers of leakage to defend against:
+			//
+			// 1. Stdlib's `Client.do` auto-copies the original request's
+			//    Authorization header onto the redirected request before
+			//    invoking CheckRedirect. The strip path is gated by two
+			//    checks: `reqs[0].URL.Host != req.URL.Host` (port-aware)
+			//    AND `!shouldCopyHeaderOnRedirect(...)` — the latter
+			//    compares via idnaASCIIFromURL (hostname-only, port-blind)
+			//    and returns true on hostname/subdomain match. So two
+			//    httptest servers on 127.0.0.1:A vs 127.0.0.1:B trip the
+			//    first check but pass the second, and stdlib silently
+			//    propagates Authorization. We must DELETE that header on
+			//    cross-host redirects, not merely refrain from re-setting.
+			// 2. The pre-existing custom block below explicitly re-applied the
+			//    original Authorization on every redirect, defeating stdlib's
+			//    same-hostname filter for genuine cross-domain redirects too.
+			//
+			// We compare URL.Host (with port) so the httptest case behaves as
+			// "cross-host". Same-host (including port) keeps the original
+			// Authorization; cross-host strips it.
+			if req.URL.Host == via[0].URL.Host {
+				if auth := via[0].Header.Get("Authorization"); auth != "" {
+					req.Header.Set("Authorization", auth)
+				}
+			} else {
+				req.Header.Del("Authorization")
+			}
+			return nil
+		},
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/html") {
+		return "", fmt.Errorf("got text/html response (auth may have failed)")
+	}
+	// Read with a hard limit slightly above the decoded cap so we can detect
+	// oversize via the (read > cap) check without buffering arbitrary bytes.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxInlineImageDecodedBytes)+1))
+	if err != nil {
+		return "", fmt.Errorf("read body: %w", err)
+	}
+	if len(data) > maxInlineImageDecodedBytes {
+		return "", fmt.Errorf("image exceeds %d-byte inline cap", maxInlineImageDecodedBytes)
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
 }
 
 // imageExtensions are sent as base64 image content blocks to the LLM.
@@ -426,6 +578,49 @@ func outputFormatForSource(source string) string {
 	return "markdown"
 }
 
+// silentBannerSources lists request sources whose `agent_reply` should NOT
+// trigger the daemon's reply-complete macOS banner. Cloud-distributed channels
+// (slack/line/feishu/lark/telegram/webhook) are filtered separately via
+// isCloudSource — those deliver the reply elsewhere. The entries here are the
+// autonomous local sources that fire frequently without a foregrounded user:
+//   - heartbeat: per-agent self-pings on a timer (internal/heartbeat)
+//   - watcher:   filesystem-change triggered runs (cmd/daemon.go watcher)
+//   - mcp:       another MCP client owns the response; banner is noise
+//
+// schedule/cron stay opted-in — those are exactly the background completions
+// the user wants surfaced.
+var silentBannerSources = map[string]struct{}{
+	"heartbeat": {},
+	"watcher":   {},
+	"mcp":       {},
+}
+
+// shouldEmitReplyBanner reports whether a reply-complete banner should fire
+// for the given request source. Returns false for cloud-distributed channels
+// (reply delivered elsewhere) and for autonomous local sources that would
+// spam the notification center.
+func shouldEmitReplyBanner(source string) bool {
+	if isCloudSource(source) {
+		return false
+	}
+	_, silent := silentBannerSources[strings.ToLower(strings.TrimSpace(source))]
+	return !silent
+}
+
+// markdownStripRE matches the small set of markdown markers that read poorly
+// in a macOS notification: backticks (inline code + fences), bold/italic
+// asterisks and underscores, leading hashes for headers, and the `[text](url)`
+// link wrapper (the captured `text` is restored by the replacement). Heavier
+// constructs (tables, html, fenced code bodies) are out of scope — banners are
+// 140 chars and the goal is readability, not faithful rendering.
+var markdownStripRE = regexp.MustCompile(`\x60+|\*+|_+|^#{1,6}\s+|\[([^\]]+)\]\([^)]*\)`)
+
+// stripMarkdownLite removes the markdown markers most likely to read as
+// visible cruft in a banner. Idempotent and safe on plain text.
+func stripMarkdownLite(s string) string {
+	return markdownStripRE.ReplaceAllString(s, "$1")
+}
+
 // IsMessagingPlatform returns true for sources where the gateway delivers
 // an explicit AgentName (or empty = use the daemon's default agent) and any
 // "@<botname>" prefix in the message body is user-facing convention, not an
@@ -607,18 +802,71 @@ func (d *ServerDeps) RebuildLayers() (*agent.ToolRegistry, []agent.Tool, []agent
 	return bl, gw, po, mgr
 }
 
-func cleanupPlaywrightAfterTurn(mgr *mcp.ClientManager) {
+// cleanupPlaywrightAfterTurn runs at the end of every RunAgent invocation
+// (via defer). Behavior depends on three orthogonal factors: the playwright
+// MCP config (CDP vs stdio), the keep_alive flag, and whether this Run
+// actually used the browser (tracked via mcp.ChromeUseLease on ctx).
+//
+// CDP path: gated on browser-was-used. Counter ALWAYS releases (no leak on
+// keep_alive). When the last browser-using Run releases its lease, disconnect
+// Playwright + blocking-stop Chrome atomically under the tracker mutex so
+// concurrent acquires from new Runs wait until teardown finishes.
+//
+// Non-CDP path: idle-disconnect schedules every Run regardless of browser-use
+// (preserves existing behavior). keep_alive=true short-circuits as before.
+func cleanupPlaywrightAfterTurn(ctx context.Context, mgr *mcp.ClientManager) {
+	lease := mcp.ChromeUseLeaseFrom(ctx)
 	if mgr == nil {
+		if lease != nil {
+			lease.ReleaseOnly()
+		}
 		return
 	}
 	cfg, ok := mgr.ConfigFor("playwright")
-	if !ok || cfg.KeepAlive {
+	if !ok {
+		if lease != nil {
+			lease.ReleaseOnly()
+		}
 		return
 	}
+
 	if mcp.IsPlaywrightCDPMode(cfg) {
-		disconnectPlaywrightNowFn(mgr)
-		stopPlaywrightChromeFn()
-		log.Printf("daemon: Playwright on-demand teardown completed")
+		if cfg.KeepAlive {
+			// Release the lease even on keep_alive so the counter cannot leak;
+			// no teardown by config.
+			if lease != nil {
+				lease.ReleaseOnly()
+			}
+			return
+		}
+		if lease == nil {
+			// Defensive: no lease => no browser use this Run, nothing to release.
+			return
+		}
+		// Fresh background context — the request ctx may already be cancelled
+		// on error/timeout paths, but cleanup must still complete.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		torndown, err := lease.ReleaseAndMaybeTeardown(
+			func() { disconnectPlaywrightNowFn(mgr) },
+			stopPlaywrightChromeAndWaitFn,
+			cleanupCtx,
+		)
+		if torndown {
+			log.Printf("daemon: Playwright on-demand teardown completed")
+		}
+		if err != nil {
+			log.Printf("daemon: Playwright teardown error: %v", err)
+		}
+		return
+	}
+
+	// Non-CDP path: unchanged behavior for keep_alive=true; idle-disconnect
+	// schedules for keep_alive=false on every turn regardless of browser-use.
+	if lease != nil {
+		lease.ReleaseOnly()
+	}
+	if cfg.KeepAlive {
 		return
 	}
 	disconnectPlaywrightAfterIdleFn(mgr, 5*time.Minute)
@@ -665,6 +913,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if cfg == nil || deps.GW == nil || deps.SessionCache == nil {
 		return nil, fmt.Errorf("daemon not fully configured")
 	}
+	// Install ChromeUseLease on ctx before any tool dispatch happens. Defer the
+	// same end-of-turn manager lookup the success-path cleanup used, so reloads
+	// during a turn keep the existing cleanup semantics.
+	ctx = mcp.WithChromeUseLease(ctx)
+	defer func() {
+		_, _, _, mgr := deps.RebuildLayers()
+		cleanupPlaywrightAfterTurn(ctx, mgr)
+	}()
 	if sup != nil {
 		// Cancel any pending idle disconnect — a new turn is starting.
 		if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
@@ -1509,6 +1765,25 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			}
 			payloadBytes, _ := json.Marshal(payload)
 			deps.EventBus.Emit(Event{Type: EventAgentReply, Payload: payloadBytes})
+
+			// Reply-complete banner: routes through tools.SendBanner so it honors
+			// the same Desktop-handler-or-osascript-fallback contract as the
+			// notify tool. Skip when there is nothing to show or the source
+			// already delivers the reply elsewhere (cloud channels) or fires
+			// autonomously and would spam (heartbeat/watcher/mcp). The osascript
+			// fallback is macOS-only — skip the call on other platforms to keep
+			// headless Linux daemons silent instead of log-spamming a missing
+			// binary on every turn.
+			if runtime.GOOS == "darwin" && result != "" && shouldEmitReplyBanner(req.Source) {
+				title := "Kocoro"
+				if agentName != "" {
+					title = "Kocoro · " + agentName
+				}
+				body := truncate(stripMarkdownLite(audit.RedactSecrets(result)), 140)
+				if err := tools.SendBanner(ctx, title, body, false); err != nil {
+					log.Printf("daemon: reply-complete banner failed (session=%s): %v", sess.ID, err)
+				}
+			}
 		}
 
 		// Post-turn prompt suggestion (fire-and-forget). Gated by all of:
@@ -1593,11 +1868,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 	log.Printf("daemon: reply to %s (%d tokens, $%.4f)", agentName, reportedUsage.TotalTokens, reportedUsage.CostUSD)
-
-	// Respect the keep_alive toggle after each completed turn.
-	if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
-		cleanupPlaywrightAfterTurn(mgr)
-	}
 
 	// On save failure, blank SessionID so HTTP/SSE clients can't click through
 	// to a session that isn't on disk (matches the agent_reply gate above).

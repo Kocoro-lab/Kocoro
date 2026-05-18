@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -822,6 +823,41 @@ func TestStore_SaveAssignsStrictlyMonotonicUpdatedAt(t *testing.T) {
 				i,
 				sessions[i-1].UpdatedAt.Format(time.RFC3339Nano),
 				sessions[i].UpdatedAt.Format(time.RFC3339Nano))
+		}
+	}
+}
+
+// inputs that safeSessionPath must reject with a recognizable error
+// ("invalid session id" or "session id is empty"), never an ENOENT-style
+// filesystem error from a downstream os call.
+var storeTraversalInputs = []string{"../foo", "a/b", "/abs", ".", "..", ""}
+
+func TestStore_Load_RejectsTraversal(t *testing.T) {
+	s := NewStore(t.TempDir())
+	defer s.Close()
+	for _, id := range storeTraversalInputs {
+		_, err := s.Load(id)
+		if err == nil {
+			t.Errorf("Load(%q) returned nil error, expected rejection", id)
+			continue
+		}
+		if !strings.Contains(err.Error(), "invalid session id") && !strings.Contains(err.Error(), "session id is empty") {
+			t.Errorf("Load(%q) returned %q; expected an 'invalid session id' / 'empty' error from safeSessionPath, not a filesystem error", id, err)
+		}
+	}
+}
+
+func TestStore_Delete_RejectsTraversal(t *testing.T) {
+	s := NewStore(t.TempDir())
+	defer s.Close()
+	for _, id := range storeTraversalInputs {
+		err := s.Delete(id)
+		if err == nil {
+			t.Errorf("Delete(%q) returned nil error, expected rejection", id)
+			continue
+		}
+		if !strings.Contains(err.Error(), "invalid session id") && !strings.Contains(err.Error(), "session id is empty") {
+			t.Errorf("Delete(%q) returned %q; expected an 'invalid session id' / 'empty' error from safeSessionPath, not a filesystem error", id, err)
 		}
 	}
 }

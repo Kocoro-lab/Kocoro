@@ -252,8 +252,19 @@ var daemonStartCmd = &cobra.Command{
 			req.EnsureRouteKey()
 
 			// Try injecting into an active run on the same route.
-			if req.RouteKey != "" {
-				switch deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{Text: req.Text, CWD: req.CWD}) {
+			// Probe HasActiveRun first so cold-start routes skip the inject
+			// path entirely — otherwise ConvertFilesToInjected would download
+			// + base64 every attachment, then RunAgent below would re-download
+			// the same files via downloadRemoteFiles. Pattern matches the HTTP
+			// guard in internal/daemon/server.go:1367. Tiny race window where
+			// the run ends between probe and InjectMessage is acceptable:
+			// worst case we paid one download for an InjectNoActiveRun.
+			if req.RouteKey != "" && deps.SessionCache.HasActiveRun(req.RouteKey) {
+				switch deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{
+					Text:  req.Text,
+					CWD:   req.CWD,
+					Files: daemon.ConvertFilesToInjected(msgCtx, req.Files),
+				}) {
 				case daemon.InjectOK:
 					// Message injected — running loop will incorporate it.
 					// Suppress the explicit ack on messaging platforms: the user's

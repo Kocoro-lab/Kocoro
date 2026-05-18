@@ -2734,3 +2734,37 @@ func TestHandleRemoveGlobalAlwaysAllow(t *testing.T) {
 		t.Error("file_write should still be in in-memory mirror")
 	}
 }
+
+func TestHandleMessage_RejectsPathTraversal(t *testing.T) {
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		Config:       &config.Config{},
+		AgentsDir:    t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	body := `{"text":"x","session_id":"../../../../etc/passwd","source":"kocoro"}`
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/message", srv.Port()),
+		"application/json",
+		strings.NewReader(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(b), "/etc/passwd") {
+		t.Errorf("response body echoes attacker id (info leak): %s", b)
+	}
+}

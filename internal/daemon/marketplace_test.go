@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
@@ -780,5 +782,202 @@ func TestHandleMarketplaceListFiltersMalicious(t *testing.T) {
 
 	if !strings.Contains(rr.Body.String(), `"good"`) || strings.Contains(rr.Body.String(), `"evil"`) {
 		t.Errorf("malicious entry should be excluded: %s", rr.Body.String())
+	}
+}
+
+// attachTestAuditor wires a fresh on-disk AuditLogger into s.deps and returns
+// the log path so the caller can read entries back. Close the logger before
+// reading to ensure all writes have been flushed.
+func attachTestAuditor(t *testing.T, s *Server) (logPath string, closer func()) {
+	t.Helper()
+	logDir := t.TempDir()
+	logger, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("new audit logger: %v", err)
+	}
+	s.deps.Auditor = logger
+	return filepath.Join(logDir, "audit.log"), func() {
+		_ = logger.Close()
+	}
+}
+
+// readAuditEntries returns every line from the audit log decoded as a map.
+// Each line is one JSON object; assertions check the relevant fields.
+func readAuditEntries(t *testing.T, logPath string) []map[string]any {
+	t.Helper()
+	f, err := os.Open(logPath)
+	if err != nil {
+		t.Fatalf("open audit log: %v", err)
+	}
+	defer f.Close()
+	var entries []map[string]any
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var entry map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			t.Fatalf("decode audit entry %q: %v", scanner.Text(), err)
+		}
+		entries = append(entries, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan audit log: %v", err)
+	}
+	return entries
+}
+
+// TestHandleInstallSkill_AuditsNotDownloadable locks in that auditHTTPOpError
+// fires on the early "not in downloadable registry" branch. This is the
+// simplest deterministic path that exercises the new helper without depending
+// on git or network. Reviewer concern: install attempts must be visible in
+// audit.log even when the daemon rejects them.
+func TestHandleInstallSkill_AuditsNotDownloadable(t *testing.T) {
+	s, _ := newTestServerWithMarketplace(t, `{"version":1,"skills":[]}`)
+	logPath, closer := attachTestAuditor(t, s)
+
+	req := httptest.NewRequest("POST", "/skills/install/not-a-real-skill", nil)
+	req.SetPathValue("name", "not-a-real-skill")
+	rr := httptest.NewRecorder()
+	s.handleInstallSkill(rr, req)
+	closer()
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	entries := readAuditEntries(t, logPath)
+	if len(entries) != 1 {
+		t.Fatalf("got %d audit entries, want 1: %+v", len(entries), entries)
+	}
+	e := entries[0]
+	if e["decision"] != "error" {
+		t.Errorf("decision = %v, want \"error\"", e["decision"])
+	}
+	if e["approved"] != false {
+		t.Errorf("approved = %v, want false", e["approved"])
+	}
+	if got, want := e["input_summary"], "POST /skills/install/not-a-real-skill"; got != want {
+		t.Errorf("input_summary = %q, want %q", got, want)
+	}
+	if out, _ := e["output_summary"].(string); !strings.Contains(out, "not in downloadable registry") {
+		t.Errorf("output_summary = %q, want it to contain reason", out)
+	}
+}
+
+// TestHandleMarketplaceInstallSuccess_AuditsBeforeEarlyReturn locks in that
+// the success audit fires even though the success path early-returns through
+// the LoadSkills/writeJSON branch. Reviewer concern: success audits placed at
+// the end of a function don't get reached by early returns; ours is placed
+// right after err == nil to survive.
+func TestHandleMarketplaceInstallSuccess_AuditsBeforeEarlyReturn(t *testing.T) {
+	// Same fixture as TestHandleMarketplaceInstallSuccess — minimal local
+	// repo cloned via file://.
+	repo := t.TempDir()
+	if err := daemonTestRunGit(repo, "init", "-q", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	daemonTestWriteFile(t, filepath.Join(repo, "SKILL.md"),
+		"---\nname: demo\ndescription: d\n---\nbody")
+	daemonTestRunGit(repo, "config", "user.email", "t@e.com")
+	daemonTestRunGit(repo, "config", "user.name", "t")
+	daemonTestRunGit(repo, "config", "commit.gpgsign", "false")
+	daemonTestRunGit(repo, "add", ".")
+	daemonTestRunGit(repo, "commit", "-q", "-m", "init")
+
+	registryJSON := fmt.Sprintf(`{
+		"version":1,
+		"skills":[{"slug":"demo","name":"demo","description":"d","author":"a","repo":"file://%s","ref":"main"}]
+	}`, repo)
+	s, _ := newTestServerWithMarketplace(t, registryJSON)
+	logPath, closer := attachTestAuditor(t, s)
+
+	req := httptest.NewRequest("POST", "/skills/marketplace/install/demo", nil)
+	req.SetPathValue("slug", "demo")
+	rr := httptest.NewRecorder()
+	s.handleMarketplaceInstall(rr, req)
+	closer()
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	entries := readAuditEntries(t, logPath)
+	if len(entries) != 1 {
+		t.Fatalf("got %d audit entries, want 1: %+v", len(entries), entries)
+	}
+	e := entries[0]
+	if e["decision"] != "approved" {
+		t.Errorf("decision = %v, want \"approved\"", e["decision"])
+	}
+	if e["approved"] != true {
+		t.Errorf("approved = %v, want true", e["approved"])
+	}
+	if in, _ := e["input_summary"].(string); !strings.Contains(in, "/skills/marketplace/install/demo") || !strings.Contains(in, "installed skill: demo") {
+		t.Errorf("input_summary = %q, want endpoint + slug", in)
+	}
+}
+
+// TestHandleUploadSkill_AuditsMissingFile covers the parse-error audit
+// branches: previously a multipart form without a "file" field returned 400
+// and wrote nothing to audit.log. Now it should write a decision="error"
+// entry so failed uploads are diagnosable.
+func TestHandleUploadSkill_AuditsMissingFile(t *testing.T) {
+	s, _ := newTestServerWithMarketplace(t, `{"version":1,"skills":[]}`)
+	logPath, closer := attachTestAuditor(t, s)
+
+	// Build a minimal multipart body with NO "file" field.
+	body := "--BOUND\r\nContent-Disposition: form-data; name=\"other\"\r\n\r\nvalue\r\n--BOUND--\r\n"
+	req := httptest.NewRequest("POST", "/skills/upload", strings.NewReader(body))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=BOUND")
+	rr := httptest.NewRecorder()
+	s.handleUploadSkill(rr, req)
+	closer()
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	entries := readAuditEntries(t, logPath)
+	if len(entries) != 1 {
+		t.Fatalf("got %d audit entries, want 1: %+v", len(entries), entries)
+	}
+	e := entries[0]
+	if e["decision"] != "error" {
+		t.Errorf("decision = %v, want \"error\"", e["decision"])
+	}
+	if out, _ := e["output_summary"].(string); !strings.Contains(out, "missing 'file' field") {
+		t.Errorf("output_summary = %q, want \"missing 'file' field\"", out)
+	}
+}
+
+// TestHandleMarketplaceInstall_AuditsUpstreamFailure locks in that the
+// upstream-failure branch (502 path) records the underlying git error in
+// output_summary. This is the case ouikyou hit on 2026-05-18 with docx/pdf
+// against github.com from a Tokyo office network — previously invisible in
+// audit.log.
+func TestHandleMarketplaceInstall_AuditsUpstreamFailure(t *testing.T) {
+	registryJSON := `{
+		"version":1,
+		"skills":[{"slug":"demo","name":"demo","description":"d","author":"a","repo":"file:///nonexistent/path/to/repo","ref":"main"}]
+	}`
+	s, _ := newTestServerWithMarketplace(t, registryJSON)
+	logPath, closer := attachTestAuditor(t, s)
+
+	req := httptest.NewRequest("POST", "/skills/marketplace/install/demo", nil)
+	req.SetPathValue("slug", "demo")
+	rr := httptest.NewRecorder()
+	s.handleMarketplaceInstall(rr, req)
+	closer()
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rr.Code)
+	}
+	entries := readAuditEntries(t, logPath)
+	if len(entries) != 1 {
+		t.Fatalf("got %d audit entries, want 1: %+v", len(entries), entries)
+	}
+	e := entries[0]
+	if e["decision"] != "error" {
+		t.Errorf("decision = %v, want \"error\"", e["decision"])
+	}
+	out, _ := e["output_summary"].(string)
+	if !strings.Contains(out, "upstream failure") {
+		t.Errorf("output_summary = %q, want \"upstream failure\" prefix", out)
 	}
 }

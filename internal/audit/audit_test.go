@@ -266,6 +266,70 @@ func TestRedactSecrets_PEMMarker(t *testing.T) {
 	}
 }
 
+// TestRedactSecrets_URLEmbeddedCredentials covers the case where git's
+// auth-failure stderr echoes back a remote URL configured with embedded
+// credentials (e.g. `git config url."https://user:token@github.com/".insteadOf`).
+// That stderr lands in audit.log via auditHTTPOpError's output_summary on
+// install failure, so we must scrub credentials before persisting.
+func TestRedactSecrets_URLEmbeddedCredentials(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		mustHave  string // substring that must remain (proves scheme+host kept)
+		mustHide  string // substring that must NOT appear (proves creds gone)
+	}{
+		{
+			name:     "https with token",
+			input:    "fatal: unable to access 'https://wayland:ghp_secrettoken123@github.com/foo/bar.git/': Forbidden",
+			mustHave: "https://[REDACTED]@github.com/foo/bar.git",
+			mustHide: "ghp_secrettoken123",
+		},
+		{
+			name:     "http with password",
+			input:    "remote: http://admin:hunter2@internal.corp/repo.git",
+			mustHave: "http://[REDACTED]@internal.corp/repo.git",
+			mustHide: "hunter2",
+		},
+		{
+			name:     "username also hidden",
+			input:    "url is https://secret_user:tok@example.com/path",
+			mustHave: "[REDACTED]",
+			mustHide: "secret_user",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RedactSecrets(tt.input)
+			if !strings.Contains(got, tt.mustHave) {
+				t.Errorf("RedactSecrets(%q) = %q; expected substring %q", tt.input, got, tt.mustHave)
+			}
+			if strings.Contains(got, tt.mustHide) {
+				t.Errorf("RedactSecrets(%q) = %q; must not contain %q", tt.input, got, tt.mustHide)
+			}
+		})
+	}
+}
+
+// TestRedactSecrets_URLWithoutCredentials verifies bare URLs (no `user:pass@`
+// portion) pass through untouched. Same regex shape happens to live in our
+// installFromRepo source comment, so we must not silently rewrite plain URLs
+// in log output.
+func TestRedactSecrets_URLWithoutCredentials(t *testing.T) {
+	cases := []string{
+		"https://github.com/anthropics/skills.git",
+		"http://localhost:7533/skills/install/docx",
+		"https://example.com/path?query=value",
+	}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			got := RedactSecrets(in)
+			if got != in {
+				t.Errorf("RedactSecrets(%q) = %q; want unchanged", in, got)
+			}
+		})
+	}
+}
+
 func TestRedactSecrets_EnvVarAssignments(t *testing.T) {
 	tests := []struct {
 		input    string

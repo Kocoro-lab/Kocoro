@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -72,11 +73,17 @@ func spillToDisk(shannonDir, sessionID, callID, content string) (preview string,
 // independent: a single 60K result is already spilled by the per-result
 // path, but 10×30K results — each below 50K — are only caught here.
 //
+// `policy` carries per-tool MaxResultSizeChars; tools declaring
+// UnlimitedToolResultSizeChars are skipped when choosing the next spill
+// target, mirroring perToolResultSpillThreshold. Without this, fixing the
+// per-result path alone still leaks file_read output into spill via the
+// aggregate path (file_read → spill → file_read rehydration loop, #161).
+//
 // Mutates execResults in place. Safe for any execResults length; no-op for
 // empty/single-element batches. spillToDisk failures are silently ignored
 // so a transient disk error doesn't stall the agent loop — worst case is
 // the message goes through uncapped.
-func applyAggregateCap(execResults []toolExecResult, shannonDir, sessionID string) {
+func applyAggregateCap(execResults []toolExecResult, shannonDir, sessionID string, policy map[string]int) {
 	if len(execResults) < 2 {
 		return
 	}
@@ -94,6 +101,13 @@ func applyAggregateCap(execResults []toolExecResult, shannonDir, sessionID strin
 		maxIdx := -1
 		maxLen := 0
 		for i := range execResults {
+			// Skip tools that self-bound — spilling their output would create
+			// a rehydration loop (the LLM can read the spill file back via a
+			// tool that's also Unlimited). See perToolResultSpillThreshold.
+			if resolveToolResultMax(execResults[i].name,
+				ToolResultBudgetOptions{ToolMaxResultSizeChars: policy}) == UnlimitedToolResultSizeChars {
+				continue
+			}
 			n := utf8.RuneCountInString(execResults[i].result.Content)
 			if n >= minAggregateSpillSize && n > maxLen {
 				maxIdx = i
@@ -101,6 +115,16 @@ func applyAggregateCap(execResults []toolExecResult, shannonDir, sessionID strin
 			}
 		}
 		if maxIdx == -1 {
+			// Dirty exit: all spill-eligible candidates already shrunk, but the
+			// aggregate cap is still breached. This happens when the remaining
+			// content lives entirely in Unlimited tools (e.g. multiple file_read
+			// results). The per-tool 500K hard cap bounds each one, but their
+			// SUM can still inflate; surface a breadcrumb so cache-pressure
+			// spikes have a paper trail.
+			if total > aggregateCapThreshold {
+				log.Printf("agent: applyAggregateCap dirty exit: total=%d > cap=%d (no spillable candidates left — only Unlimited tools remain)",
+					total, aggregateCapThreshold)
+			}
 			return // nothing left worth spilling
 		}
 		original := execResults[maxIdx].result.Content
@@ -127,8 +151,15 @@ func applyPerResultSpill(content, toolName, shannonDir, sessionID string, policy
 
 func perToolResultSpillThreshold(toolName string, policy map[string]int) int {
 	maxChars := resolveToolResultMax(toolName, ToolResultBudgetOptions{ToolMaxResultSizeChars: policy})
+	// Tools declaring UnlimitedToolResultSizeChars self-bound their output
+	// (today: file_read, which has a 500K-rune hard cap in the tool itself;
+	// any future tool returning user-visible deliverables can opt in via the
+	// same sentinel). Spilling them would write the result to a tmp file and
+	// replace the in-context content with a path the model can then re-read,
+	// creating a file_read → spill → file_read rehydration loop. Returning 0
+	// short-circuits applyPerResultSpill via its `threshold <= 0` early return.
 	if maxChars == UnlimitedToolResultSizeChars {
-		return spillThreshold
+		return 0
 	}
 	if maxChars > 0 && maxChars < spillThreshold {
 		return maxChars

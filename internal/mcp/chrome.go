@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +29,165 @@ const (
 	// LegacyCDPPort was the original hardcoded Playwright CDP endpoint.
 	LegacyCDPPort = 9222
 )
+
+// chromeUseTracker counts in-flight Runs that are using the daemon-owned
+// dedicated CDP Chrome. tracker.mu serializes ALL state transitions: counter
+// increments, decrements, and per-lease acquired/released flag flips. Task 3
+// extends final release to perform disconnect + stop while still holding this
+// lock, so concurrent acquires from new Runs block until teardown completes and
+// the next first tool call relaunches Chrome cleanly via EnsureChromeDebugPort.
+type chromeUseTracker struct {
+	mu    sync.Mutex
+	count int
+}
+
+var globalChromeTracker = &chromeUseTracker{}
+
+func (t *chromeUseTracker) activeCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.count
+}
+
+// ChromeUseLease is the per-Run handle to globalChromeTracker.
+//
+// State machine (all transitions under tracker.mu):
+//   - initial: acquired=false, released=false
+//   - MarkUsed when !acquired && !released: counter++, acquired=true
+//   - MarkUsed when acquired || released:   no-op (idempotent or post-release)
+//   - Release  when !released && acquired:  counter--, released=true
+//   - Release  when !released && !acquired: released=true (no counter change)
+//   - Release  when released:               no-op (idempotent)
+//
+// The "MarkUsed when released" no-op rule is what prevents the
+// release-before-acquire counter leak: after Release commits, late MarkUsed
+// calls silently drop. In production this can't happen because MarkUsed runs
+// during the Run (under tool dispatch) and Release runs only in the defer
+// after RunAgent returns — but the safety net is present.
+type ChromeUseLease struct {
+	tracker  *chromeUseTracker
+	acquired bool // protected by tracker.mu
+	released bool // protected by tracker.mu
+}
+
+// NewChromeUseLease returns a lease bound to the global tracker.
+func NewChromeUseLease() *ChromeUseLease {
+	return newChromeUseLeaseWithTracker(globalChromeTracker)
+}
+
+// newChromeUseLeaseWithTracker is the test seam — wires a lease to a specific
+// tracker. Production code uses the global tracker via NewChromeUseLease.
+func newChromeUseLeaseWithTracker(tr *chromeUseTracker) *ChromeUseLease {
+	return &ChromeUseLease{tracker: tr}
+}
+
+// MarkUsed acquires the lease on first call; subsequent calls (and calls
+// after Release) are no-ops. Safe to call from every playwright tool dispatch
+// in a Run.
+func (l *ChromeUseLease) MarkUsed() {
+	if l == nil {
+		return
+	}
+	l.tracker.mu.Lock()
+	defer l.tracker.mu.Unlock()
+	if l.acquired || l.released {
+		return
+	}
+	l.tracker.count++
+	l.acquired = true
+}
+
+// ReleaseOnly decrements the tracker (if MarkUsed was called) without running
+// any teardown callbacks. Used by cleanup paths that should release the lease
+// but skip teardown by config (e.g. keep_alive=true). Idempotent.
+func (l *ChromeUseLease) ReleaseOnly() {
+	if l == nil {
+		return
+	}
+	l.tracker.mu.Lock()
+	defer l.tracker.mu.Unlock()
+	if l.released {
+		return
+	}
+	l.released = true
+	if l.acquired {
+		l.tracker.count--
+	}
+}
+
+// ReleaseAndMaybeTeardown decrements the tracker (if MarkUsed was called); if
+// the resulting count is zero, runs disconnect() then stop(ctx) WHILE STILL
+// HOLDING tracker.mu. Concurrent MarkUsed() calls take the same mutex and so
+// block until teardown completes — this is the contract that prevents a new
+// browser-using Run from having its Chrome killed mid-launch.
+//
+// Idempotent: subsequent calls return (false, nil) without invoking callbacks.
+// Returns (true, err) when teardown ran; (false, nil) when another lease still
+// holds the tracker (count > 0 after decrement) or when the lease was never
+// acquired (MarkUsed never called).
+func (l *ChromeUseLease) ReleaseAndMaybeTeardown(
+	disconnect func(),
+	stop func(context.Context) error,
+	ctx context.Context,
+) (torndown bool, err error) {
+	if l == nil {
+		return false, nil
+	}
+	l.tracker.mu.Lock()
+	defer l.tracker.mu.Unlock()
+	if l.released {
+		return false, nil
+	}
+	l.released = true
+	if !l.acquired {
+		// Late release before any MarkUsed — set released=true so any
+		// future MarkUsed no-ops. No counter change.
+		return false, nil
+	}
+	l.tracker.count--
+	if l.tracker.count > 0 {
+		return false, nil
+	}
+	torndown = true
+	if disconnect != nil {
+		disconnect()
+	}
+	if stop != nil {
+		err = stop(ctx)
+	}
+	return torndown, err
+}
+
+type chromeLeaseKey struct{}
+
+// WithChromeUseLease installs a fresh ChromeUseLease on the context. Call once
+// at Run start (in RunAgent) before any tool dispatch can happen.
+func WithChromeUseLease(ctx context.Context) context.Context {
+	return context.WithValue(ctx, chromeLeaseKey{}, NewChromeUseLease())
+}
+
+// ChromeUseLeaseFrom returns the lease installed by WithChromeUseLease, or nil
+// if none is present. Cleanup code uses nil as a defensive signal that no
+// browser use was tracked this Run.
+func ChromeUseLeaseFrom(ctx context.Context) *ChromeUseLease {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(chromeLeaseKey{}).(*ChromeUseLease)
+	return v
+}
+
+// MarkChromeUsed marks the lease on ctx as having used the browser this Run.
+// No-op when ctx carries no lease. Idempotent via the lease state machine.
+func MarkChromeUsed(ctx context.Context) {
+	ChromeUseLeaseFrom(ctx).MarkUsed()
+}
+
+// GlobalChromeTrackerActiveCountForTest exposes the global tracker count for
+// cross-package tests. Test-only — not part of the public API.
+func GlobalChromeTrackerActiveCountForTest() int {
+	return globalChromeTracker.activeCount()
+}
 
 // cdpMu serializes all EnsureChromeDebugPort calls to prevent concurrent
 // callers (boot, tool call, supervisor) from racing to launch/kill Chrome.
@@ -398,6 +558,95 @@ func StopCDPChrome() {
 	}
 	cdpExecCommand("pkill", "-f", fmt.Sprintf("user-data-dir=%s", cdpDataDir)).Run() //nolint:errcheck
 	log.Printf("[chrome-cdp] SIGTERM sent to CDP Chrome")
+}
+
+const (
+	// chromeTermGrace is how long StopCDPChromeAndWait waits after SIGTERM
+	// before escalating to SIGKILL. Matches existing waitForCDPChromeExit.
+	chromeTermGrace = 3 * time.Second
+	// chromeKillGrace is how long StopCDPChromeAndWait waits after SIGKILL
+	// before declaring Chrome unkillable.
+	chromeKillGrace = 2 * time.Second
+	// chromePollInterval is the polling cadence inside the grace windows.
+	chromePollInterval = 150 * time.Millisecond
+)
+
+// StopCDPChromeAndWait stops the daemon-owned dedicated CDP Chrome and cleans
+// up its state files. Unlike StopCDPChrome (non-blocking, for daemon shutdown),
+// this function verifies Chrome actually exits and escalates to SIGKILL when
+// SIGTERM is ignored.
+//
+// Behavior:
+//   - No daemon-owned Chrome alive (clean state or stale PID file from a prior
+//     manual close): remove PID file + WS cache, return nil.
+//   - SIGTERM, then poll up to chromeTermGrace. If dead: clean state, return nil.
+//   - SIGKILL the main pid, poll up to chromeKillGrace. If dead: clean state, return nil.
+//   - Still alive after SIGKILL: leave PID file intact (matches
+//     CleanupOrphanedCDPChrome contract), return error.
+//
+// ctx provides cancellation; on cancellation returns whatever state was reached.
+func StopCDPChromeAndWait(ctx context.Context) error {
+	clearCachedBrowserWS()
+	home, err := cdpUserHomeDir()
+	if err != nil {
+		return fmt.Errorf("home dir: %w", err)
+	}
+	if !cdpChromeAliveFn() {
+		// Clean state or stale PID file — same cleanup as CleanupOrphanedCDPChrome.
+		removeCDPPIDFile(home)
+		return nil
+	}
+
+	// SIGTERM all chrome-cdp processes.
+	cdpDataDir := filepath.Join(home, ".shannon", "chrome-cdp")
+	_ = cdpExecCommand("pkill", "-f", fmt.Sprintf("user-data-dir=%s", cdpDataDir)).Run()
+
+	if waitForChromeDead(ctx, chromeTermGrace) {
+		removeCDPPIDFile(home)
+		return nil
+	}
+
+	// Escalate: SIGKILL the main browser process.
+	pid := cdpChromePIDFn()
+	if pid == "" {
+		// Chrome reported alive but pid lookup failed; trust the alive probe
+		// and try a last poll before declaring stuck.
+		if waitForChromeDead(ctx, chromeKillGrace) {
+			removeCDPPIDFile(home)
+			return nil
+		}
+		return fmt.Errorf("chrome alive but pid lookup failed; not cleaning PID file")
+	}
+	log.Printf("[chrome-cdp] SIGTERM ignored, sending SIGKILL to pid %s", pid)
+	_ = cdpExecCommand("kill", "-9", pid).Run()
+
+	if waitForChromeDead(ctx, chromeKillGrace) {
+		removeCDPPIDFile(home)
+		return nil
+	}
+	return fmt.Errorf("chrome pid %s still alive after SIGKILL; PID file preserved", pid)
+}
+
+// waitForChromeDead polls cdpChromeAliveFn until it returns false, ctx is
+// cancelled, or the grace window's poll budget is exhausted. Returns true if
+// Chrome is dead. The grace window is divided into chromePollInterval-sized
+// slices, so when tests stub cdpSleep to a no-op the loop completes instantly
+// (matching the file's existing count-based wait pattern).
+func waitForChromeDead(ctx context.Context, grace time.Duration) bool {
+	polls := int(grace / chromePollInterval)
+	if polls < 1 {
+		polls = 1
+	}
+	for range polls {
+		if ctx.Err() != nil {
+			return !cdpChromeAliveFn()
+		}
+		if !cdpChromeAliveFn() {
+			return true
+		}
+		cdpSleep(chromePollInterval)
+	}
+	return !cdpChromeAliveFn()
 }
 
 // CleanupOrphanedCDPChrome kills any Chrome CDP processes left behind by a
