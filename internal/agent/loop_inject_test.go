@@ -102,10 +102,48 @@ func TestBuildInjectedUserMessage_WithFiles(t *testing.T) {
 	if blocks[1].Source == nil || blocks[1].Source.Type != "base64" {
 		t.Errorf("image block must have base64 source; got %+v", blocks[1].Source)
 	}
+	if blocks[1].Source.MediaType != "image/png" {
+		t.Errorf("MediaType not forwarded; got %q want image/png", blocks[1].Source.MediaType)
+	}
+	if blocks[1].Source.Data != "iVBORw0KGgo=" {
+		t.Errorf("Data not forwarded; got %q want %q", blocks[1].Source.Data, "iVBORw0KGgo=")
+	}
 }
 
 func TestBuildInjectedUserMessage_Empty(t *testing.T) {
 	if _, ok := buildInjectedUserMessage(nil); ok {
 		t.Error("empty input should return ok=false")
+	}
+}
+
+func TestInjectedFileToBlock_AllTypes(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       InjectedFile
+		wantType string
+		wantText string // for text/default cases; empty means don't check
+		wantSrc  bool   // expect Source != nil
+	}{
+		{"image", InjectedFile{Type: "image", MediaType: "image/png", Data: "abc"}, "image", "", true},
+		{"document", InjectedFile{Type: "document", MediaType: "application/pdf", Data: "xyz"}, "document", "", true},
+		{"text", InjectedFile{Type: "text", Data: "hello extracted"}, "text", "hello extracted", false},
+		{"unknown", InjectedFile{Type: "weird"}, "text", "[unsupported attachment: weird]", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := injectedFileToBlock(tc.in)
+			if b.Type != tc.wantType {
+				t.Errorf("Type: got %q want %q", b.Type, tc.wantType)
+			}
+			if tc.wantText != "" && b.Text != tc.wantText {
+				t.Errorf("Text: got %q want %q", b.Text, tc.wantText)
+			}
+			if tc.wantSrc && b.Source == nil {
+				t.Errorf("expected Source != nil")
+			}
+			if !tc.wantSrc && b.Source != nil {
+				t.Errorf("expected Source == nil")
+			}
+		})
 	}
 }
