@@ -47,10 +47,21 @@ const fileReadNoLimitMaxBytes = 256 * 1024
 
 // fileReadHardCapRunes bounds raw file_read output as defense-in-depth.
 // Required after file_read was exempted from spill (see
-// internal/agent/spill.go) — without this, a future relaxation of the
-// pre-flight checks above could let a single read of a multi-MB log shove
-// the entire payload into the LLM's next turn. The cap is generous enough
-// that real source files (~100K runes typical) pass through unchanged.
+// internal/agent/spill.go:perToolResultSpillThreshold) — without this, a
+// future relaxation of the pre-flight checks above could let a single read
+// of a multi-MB log shove the entire payload into the LLM's next turn,
+// blowing the prompt cache.
+//
+// Workload: typical source files (~100K runes), edited files (~50K), config
+// (<10K). The 500K cap leaves ~5x headroom for legitimate large reads such
+// as CSV exports, generated SQL dumps, or full git diffs without clipping
+// them.
+// Symptom when it binds: legitimate large reads (e.g. 1MB+ CSV) get clipped
+// to 500K with a marker pointing the caller at offset/limit for the rest.
+// Override path: none today — hardcoded const. If a workload routinely
+// needs >500K, bump this const rather than introducing a viper default;
+// sessions hitting the cap are rare enough that runtime tuning isn't
+// justified yet.
 const fileReadHardCapRunes = 500_000
 
 // applyFileReadHardCap truncates content to fileReadHardCapRunes, appending

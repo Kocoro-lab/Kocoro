@@ -563,6 +563,12 @@ func TestFileRead_HardCap500K(t *testing.T) {
 	if !strings.Contains(got, "truncated") {
 		t.Errorf("expected truncation marker in capped output")
 	}
+	if !strings.Contains(got, "500000") {
+		t.Errorf("expected marker to mention cap (500000 runes); got: %q", got[len(got)-200:])
+	}
+	if !strings.Contains(got, "600000") {
+		t.Errorf("expected marker to mention original length (600000 runes); got: %q", got[len(got)-200:])
+	}
 }
 
 // TestFileRead_DedupSameFile_NoTracker: without a tracker in context, dedup

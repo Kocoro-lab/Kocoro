@@ -141,12 +141,12 @@ func applyPerResultSpill(content, toolName, shannonDir, sessionID string, policy
 func perToolResultSpillThreshold(toolName string, policy map[string]int) int {
 	maxChars := resolveToolResultMax(toolName, ToolResultBudgetOptions{ToolMaxResultSizeChars: policy})
 	// Tools declaring UnlimitedToolResultSizeChars self-bound their output
-	// (e.g. file_read has a 500K-rune hard cap in the tool itself; cloud_delegate
-	// returns user-visible deliverables). Spilling them would write the result
-	// to a tmp file and replace the in-context content with a path the model
-	// can then re-read, creating a file_read → spill → file_read rehydration
-	// loop. Returning 0 short-circuits applyPerResultSpill via its
-	// `threshold <= 0` early return.
+	// (today: file_read, which has a 500K-rune hard cap in the tool itself;
+	// any future tool returning user-visible deliverables can opt in via the
+	// same sentinel). Spilling them would write the result to a tmp file and
+	// replace the in-context content with a path the model can then re-read,
+	// creating a file_read → spill → file_read rehydration loop. Returning 0
+	// short-circuits applyPerResultSpill via its `threshold <= 0` early return.
 	if maxChars == UnlimitedToolResultSizeChars {
 		return 0
 	}
