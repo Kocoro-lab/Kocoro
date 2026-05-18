@@ -45,6 +45,28 @@ const fileReadMaxTokens = 25000
 
 const fileReadNoLimitMaxBytes = 256 * 1024
 
+// fileReadHardCapRunes bounds raw file_read output as defense-in-depth.
+// Required after file_read was exempted from spill (see
+// internal/agent/spill.go) — without this, a future relaxation of the
+// pre-flight checks above could let a single read of a multi-MB log shove
+// the entire payload into the LLM's next turn. The cap is generous enough
+// that real source files (~100K runes typical) pass through unchanged.
+const fileReadHardCapRunes = 500_000
+
+// applyFileReadHardCap truncates content to fileReadHardCapRunes, appending
+// a marker so the model knows the slice was clipped. Applied only on the
+// text-return path; image and PDF return ImageBlocks instead of strings.
+func applyFileReadHardCap(content string) string {
+	runes := []rune(content)
+	if len(runes) <= fileReadHardCapRunes {
+		return content
+	}
+	head := string(runes[:fileReadHardCapRunes])
+	return head + fmt.Sprintf(
+		"\n\n[file_read: output truncated at %d runes (original %d); use offset/limit to read more]",
+		fileReadHardCapRunes, len(runes))
+}
+
 type FileReadTool struct{}
 
 type fileReadArgs struct {
@@ -193,7 +215,7 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	if statErr == nil {
 		agent.RecordFileRead(ctx, args.Path, args.Offset, args.Limit, info.ModTime(), info.Size())
 	}
-	return agent.ToolResult{Content: sb.String()}, nil
+	return agent.ToolResult{Content: applyFileReadHardCap(sb.String())}, nil
 }
 
 func readTextLineRange(path string, offset, limit int) (lines []string, totalLines int, reachedEOF bool, err error) {

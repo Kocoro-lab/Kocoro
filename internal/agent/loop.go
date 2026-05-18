@@ -1365,6 +1365,7 @@ type toolExecResult struct {
 	result  ToolResult
 	elapsed time.Duration
 	err     error
+	name    string // tool name; used by applyAggregateCap to skip Unlimited tools
 }
 
 // approvedToolCall tracks a tool call that passed permission checks and pre-hooks.
@@ -3318,6 +3319,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "duplicate tool call skipped (identical to earlier call in this response)", IsError: true},
+					name:   fc.Name,
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3331,6 +3333,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "tool call blocked: previously denied this turn. Use a different approach.", IsError: true},
+					name:   fc.Name,
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3346,6 +3349,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					callMeta[idx].resolved = true
 					execResults[idx] = toolExecResult{
 						result: ToolResult{Content: "cloud_delegate already called this turn. Use the previous result — do not re-delegate.", IsError: true},
+						name:   fc.Name,
 					}
 					if a.handler != nil {
 						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3363,6 +3367,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "unknown tool: " + fc.Name, IsError: true},
+					name:   fc.Name,
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3407,6 +3412,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: content, IsError: true},
+					name:   fc.Name,
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3453,6 +3459,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 							IsError: cached.IsError,
 							Images:  cached.Images,
 						},
+						name: fc.Name,
 					}
 					if a.handler != nil {
 						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3470,6 +3477,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "tool call denied by permission policy", IsError: true},
+					name:   fc.Name,
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, ToolResult{Content: "denied by policy", IsError: true}, 0)
@@ -3481,6 +3489,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "Tool execution was DENIED by the user. The command did NOT run. Do not claim it completed or report any output from it.", IsError: true},
+					name:   fc.Name,
 				}
 				deniedCalls[dedupKey] = true
 				if a.handler != nil {
@@ -3500,6 +3509,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					callMeta[idx].resolved = true
 					execResults[idx] = toolExecResult{
 						result: ToolResult{Content: "tool call denied by hook: " + hookReason, IsError: true},
+						name:   fc.Name,
 					}
 					if a.handler != nil {
 						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3543,6 +3553,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 								Content: denyMsg,
 								IsError: true,
 							},
+							name: ac.fc.Name,
 						}
 						if a.handler != nil {
 							a.handler.OnToolResult(ac.fc.Name, ac.argsStr, ac.fc.ID, execResults[ac.index].result, 0)
@@ -3563,7 +3574,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// 30K each can put hundreds of KB into one user message. Spill
 			// the largest result(s) to bring the sum under 200K. No-op for
 			// turns with small or few results.
-			applyAggregateCap(execResults, a.shannonDir, a.sessionID)
+			applyAggregateCap(execResults, a.shannonDir, a.sessionID, a.toolResultPolicy())
 			a.tracker.MarkDirty() // tool batch is durable state for checkpoint
 			// Fire mid-turn checkpoint after captureRunMessages below, so
 			// RunMessages() reflects the just-completed batch. The actual
