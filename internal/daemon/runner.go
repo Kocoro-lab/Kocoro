@@ -39,7 +39,6 @@ var (
 	disconnectPlaywrightNowFn = func(mgr *mcp.ClientManager) {
 		mgr.Disconnect("playwright")
 	}
-	stopPlaywrightChromeFn        = mcp.StopCDPChrome
 	stopPlaywrightChromeAndWaitFn = mcp.StopCDPChromeAndWait
 )
 
