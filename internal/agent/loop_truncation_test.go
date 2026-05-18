@@ -61,6 +61,15 @@ func TestArgsLookTruncated(t *testing.T) {
 	}
 }
 
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal JSON: %v", err)
+	}
+	return string(b)
+}
+
 // Trailing tool_use with stop_reason=max_tokens AND truncated args (missing
 // declared required field) must NOT be dispatched. The loop emits a synthetic
 // tool_result paired with the truncated tool_use so the next request keeps
@@ -166,6 +175,61 @@ func TestAgentLoop_MaxTokens_TruncatedNativeCallPreservesToolUseID(t *testing.T)
 	}
 	if !sawResult {
 		t.Fatal("second request missing paired native tool_result block")
+	}
+}
+
+func TestAgentLoop_MaxTokens_TextContinuationPromptIsInjected(t *testing.T) {
+	callCount := 0
+	var secondReq client.CompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("part one ", "max_tokens", nil, 10, 2000))
+		case 2:
+			if err := json.NewDecoder(r.Body).Decode(&secondReq); err != nil {
+				t.Fatalf("decode second request: %v", err)
+			}
+			json.NewEncoder(w).Encode(nativeResponse("part two", "end_turn", nil, 20, 10))
+		default:
+			t.Fatalf("unexpected LLM call %d", callCount)
+		}
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	loop := NewAgentLoop(gw, NewToolRegistry(), "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "write a long answer", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "part one part two" {
+		t.Fatalf("result = %q, want stitched continuation", result)
+	}
+	if callCount != 2 {
+		t.Fatalf("LLM calls = %d, want 2", callCount)
+	}
+	if !strings.Contains(mustJSON(t, secondReq.Messages), "Your response was cut off. Continue from where you stopped.") {
+		t.Fatalf("same-turn continuation prompt missing from second request")
+	}
+
+	runMsgs := loop.RunMessages()
+	runInjected := loop.RunMessageInjected()
+	if len(runMsgs) != len(runInjected) {
+		t.Fatalf("RunMessages and RunMessageInjected length drift: %d vs %d", len(runMsgs), len(runInjected))
+	}
+	var foundInjected bool
+	for i, msg := range runMsgs {
+		if strings.Contains(msg.Content.Text(), "Your response was cut off. Continue from where you stopped.") {
+			if !runInjected[i] {
+				t.Fatalf("continuation prompt at run message %d was not marked injected", i)
+			}
+			foundInjected = true
+		}
+	}
+	if !foundInjected {
+		t.Fatalf("RunMessages missing continuation prompt; test no longer exercises persistence boundary")
 	}
 }
 

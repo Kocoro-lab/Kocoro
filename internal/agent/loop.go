@@ -3139,7 +3139,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					Role:    "user",
 					Content: client.NewTextContent("Your response was cut off. Continue from where you stopped."),
 				})
-				stampMessage()
+				markInjected()
 				continue
 			}
 			// Silent truncation is the worst UX failure of max_tokens — surface
