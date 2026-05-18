@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/skills/bundled"
 	"gopkg.in/yaml.v3"
@@ -423,8 +424,48 @@ func installFromBundled(shannonDir, name, destDir string) error {
 	return copyDir(srcDir, destDir)
 }
 
+// installFromRepoMaxAttempts is the number of times installFromRepo retries
+// the git operations on transient failures. Tokyo/CN corporate networks see
+// intermittent github.com reachability flakes; observed user workaround was
+// to click Install again from the Desktop UI. Backoff: 0s, 1s, 2s → ≤3s of
+// added wait worst-case, on top of actual clone time.
+// Override: not currently exposed; recompile if 3 attempts proves wrong.
+const installFromRepoMaxAttempts = 3
+
+// ErrSkillNotInRepo is returned by tryInstallFromRepo when `git clone` and
+// `sparse-checkout` succeed but the requested skill's directory is absent
+// from the upstream tree — a deterministic 404 against
+// github.com/anthropics/skills, not a transient flake. installFromRepo
+// uses errors.Is to short-circuit retry on this sentinel.
+var ErrSkillNotInRepo = errors.New("skill not found in Anthropic repo")
+
 // installFromRepo downloads a skill from Anthropic's skills repo via git sparse checkout.
+// Retries the git operations on transient failures (network flake, github.com
+// reachability). Does NOT retry ErrSkillNotInRepo — that's a real 404 against
+// the upstream tree, not a flake.
 func installFromRepo(shannonDir, name, destDir string) error {
+	var lastErr error
+	for attempt := 0; attempt < installFromRepoMaxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+		err := tryInstallFromRepo(shannonDir, name, destDir)
+		if err == nil {
+			return nil
+		}
+		// Don't retry a genuine "skill not in upstream" — that's deterministic.
+		if errors.Is(err, ErrSkillNotInRepo) {
+			return err
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+// tryInstallFromRepo is a single attempt of installFromRepo. Each attempt
+// uses a fresh tmpDir so a partially-written clone from a previous failure
+// does not contaminate the next try.
+func tryInstallFromRepo(shannonDir, name, destDir string) error {
 	tmpDir, err := os.MkdirTemp(shannonDir, "skill-install-*")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
@@ -441,7 +482,7 @@ func installFromRepo(shannonDir, name, destDir string) error {
 
 	srcDir := filepath.Join(tmpDir, "skills", name)
 	if _, err := os.Stat(filepath.Join(srcDir, "SKILL.md")); err != nil {
-		return fmt.Errorf("skill %q not found in Anthropic repo", name)
+		return fmt.Errorf("%w: %q", ErrSkillNotInRepo, name)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(destDir), 0700); err != nil {
@@ -478,7 +519,13 @@ func InstallSkillFromRepo(shannonDir, name string) error {
 	return InstallSkill(shannonDir, name)
 }
 
-func runGit(dir string, args ...string) error {
+// runGit is a package-level indirection so retry tests in api_test.go can
+// inject failures without spawning a real `git` binary. Production callers
+// see no behavioral difference from a regular function — restore by writing
+// runGit = runGitReal in a t.Cleanup.
+var runGit = runGitReal
+
+func runGitReal(dir string, args ...string) error {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()

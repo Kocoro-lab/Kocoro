@@ -94,6 +94,29 @@ func (s *Server) auditHTTPOp(method, path, summary string) {
 	})
 }
 
+// auditHTTPOpError logs an HTTP API write operation that failed. Unlike
+// auditHTTPOp the schema splits endpoint into input_summary and the failure
+// detail into output_summary. Keeps input_summary short for grep/dashboards
+// while preserving the full upstream error (git stderr, etc.) in
+// output_summary up to the 500-char truncation cap.
+func (s *Server) auditHTTPOpError(method, path, summary string, err error) {
+	if s.deps == nil || s.deps.Auditor == nil {
+		return
+	}
+	output := summary
+	if err != nil {
+		output += ": " + err.Error()
+	}
+	s.deps.Auditor.Log(audit.AuditEntry{
+		Timestamp:     time.Now(),
+		ToolName:      "http_api",
+		InputSummary:  method + " " + path,
+		OutputSummary: output,
+		Decision:      "error",
+		Approved:      false,
+	})
+}
+
 // resolveRegistryURL returns the configured marketplace registry URL, falling
 // back to the public default. Tolerates nil deps / nil Config so tests that
 // construct NewServer with nil deps continue to work.
@@ -2854,13 +2877,16 @@ func (s *Server) handleMarketplaceInstall(w http.ResponseWriter, r *http.Request
 		return
 	}
 	slug := r.PathValue("slug")
+	endpoint := "/skills/marketplace/install/" + slug
 	if err := skills.ValidateSkillName(slug); err != nil {
+		s.auditHTTPOpError("POST", endpoint, "invalid slug", err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	idx, err := s.marketplace.Load(r.Context())
 	if err != nil {
+		s.auditHTTPOpError("POST", endpoint, "marketplace unavailable", err)
 		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
 		return
 	}
@@ -2872,6 +2898,7 @@ func (s *Server) handleMarketplaceInstall(w http.ResponseWriter, r *http.Request
 		}
 	}
 	if entry == nil {
+		s.auditHTTPOpError("POST", endpoint, "not in marketplace index", nil)
 		writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
 		return
 	}
@@ -2879,6 +2906,10 @@ func (s *Server) handleMarketplaceInstall(w http.ResponseWriter, r *http.Request
 	err = skills.InstallFromMarketplace(r.Context(), s.deps.ShannonDir, *entry, s.slugLocks)
 	switch {
 	case err == nil:
+		// Audit success here, before the metadata-load early returns below,
+		// so the log entry survives even if LoadSkills can't find the
+		// freshly-installed skill (fallback writeJSON path still runs).
+		s.auditHTTPOp("POST", endpoint, "installed skill: "+entry.Slug)
 		// Load the freshly installed skill so the response body reflects
 		// on-disk truth (frontmatter name, description, source) rather
 		// than synthesized data from the registry. Mirrors the pattern
@@ -2908,15 +2939,20 @@ func (s *Server) handleMarketplaceInstall(w http.ResponseWriter, r *http.Request
 			Source:      "global",
 		})
 	case errors.Is(err, skills.ErrMaliciousSkill):
+		s.auditHTTPOpError("POST", endpoint, "malicious skill", err)
 		writeError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, skills.ErrSkillAlreadyInstalled):
+		s.auditHTTPOpError("POST", endpoint, "already installed", err)
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, skills.ErrInvalidSkillPayload):
+		s.auditHTTPOpError("POST", endpoint, "invalid payload", err)
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 	case errors.Is(err, skills.ErrMarketplaceUpstreamFailure):
+		s.auditHTTPOpError("POST", endpoint, "upstream failure", err)
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("install failed: %v", err))
 	default:
 		// Local disk/staging failures → 500, per spec error matrix.
+		s.auditHTTPOpError("POST", endpoint, "install failed", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("install failed: %v", err))
 	}
 }
@@ -2944,14 +2980,17 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(uploadSkillInMemoryBytes); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
+			s.auditHTTPOpError("POST", "/skills/upload", "request body too large", err)
 			writeError(w, http.StatusRequestEntityTooLarge, "zip too large (maximum 50 MB)")
 			return
 		}
+		s.auditHTTPOpError("POST", "/skills/upload", "invalid multipart form", err)
 		writeError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
 		return
 	}
 	file, _, err := r.FormFile("file")
 	if err != nil {
+		s.auditHTTPOpError("POST", "/skills/upload", "missing 'file' field in multipart form", err)
 		writeError(w, http.StatusBadRequest, "missing 'file' field in multipart form")
 		return
 	}
@@ -2966,6 +3005,7 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 		s.auditHTTPOp("POST", "/skills/upload", "installed skill via zip: "+skill.Slug)
 		writeJSON(w, http.StatusCreated, skill.ToMeta())
 	case errors.As(err, &conflict):
+		s.auditHTTPOpError("POST", "/skills/upload", "conflict: "+conflict.ExistingName, err)
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error":                "skill_already_exists",
 			"existing_name":        conflict.ExistingName,
@@ -2975,12 +3015,16 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 			"new_prompt":           conflict.NewPrompt,
 		})
 	case errors.Is(err, skills.ErrSkillIsBuiltin):
+		s.auditHTTPOpError("POST", "/skills/upload", "builtin skill rejected", err)
 		writeError(w, http.StatusForbidden, "skill_is_builtin")
 	case errors.Is(err, skills.ErrZipTooLarge):
+		s.auditHTTPOpError("POST", "/skills/upload", "zip too large", err)
 		writeError(w, http.StatusRequestEntityTooLarge, "zip too large (maximum 50 MB)")
 	case errors.Is(err, skills.ErrInvalidSkillPayload):
+		s.auditHTTPOpError("POST", "/skills/upload", "invalid payload", err)
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 	default:
+		s.auditHTTPOpError("POST", "/skills/upload", "upload failed", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("upload failed: %v", err))
 	}
 }
@@ -3119,20 +3163,32 @@ func (s *Server) handleListDownloadableSkills(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
 	name := r.PathValue("name")
+	endpoint := "/skills/install/" + name
 	if !skills.IsDownloadable(name) {
+		s.auditHTTPOpError("POST", endpoint, "not in downloadable registry", nil)
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("skill %q is not available for download", name))
 		return
 	}
 
 	if err := skills.InstallSkillFromRepo(s.deps.ShannonDir, name); err != nil {
 		if strings.Contains(err.Error(), "already installed") {
+			s.auditHTTPOpError("POST", endpoint, "already installed", err)
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
+		s.auditHTTPOpError("POST", endpoint, "install failed", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// Audit success here, before the metadata-load early returns below, so the
+	// log entry survives even if LoadSkills can't find the freshly-installed
+	// skill (rare, but the fallback writeJSON path still runs).
+	s.auditHTTPOp("POST", endpoint, "installed skill")
 
 	// Load the installed skill to return its metadata
 	sources, _ := s.skillSources()

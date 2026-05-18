@@ -141,6 +141,14 @@ func (a *AuditLogger) Close() error {
 // redaction patterns compiled once at package init
 var redactPatterns []*regexp.Regexp
 
+// urlCredRE matches URL-embedded credentials of the form
+// https://user:token@host/... and is handled separately from redactPatterns
+// because the replacement preserves the scheme and host (only the
+// credentials are scrubbed). Defends against git stderr echoing back a
+// remote URL configured with embedded creds — that stderr lands in
+// audit.log via auditHTTPOpError's output_summary on install failure.
+var urlCredRE = regexp.MustCompile(`(https?://)[^/\s:@]+:[^/\s@]+@`)
+
 func init() {
 	patterns := []string{
 		// AWS access key IDs
@@ -164,12 +172,15 @@ func init() {
 	}
 }
 
-// RedactSecrets replaces known secret patterns with [REDACTED].
+// RedactSecrets replaces known secret patterns with [REDACTED]. URL-embedded
+// credentials are redacted in-place ("https://[REDACTED]@host/...") so the
+// scheme and host stay visible for debugging.
 func RedactSecrets(text string) string {
 	result := text
 	for _, re := range redactPatterns {
 		result = re.ReplaceAllString(result, "[REDACTED]")
 	}
+	result = urlCredRE.ReplaceAllString(result, "${1}[REDACTED]@")
 	return result
 }
 
