@@ -269,6 +269,12 @@ func (s *Store) safeSessionPath(id string) (string, error) {
 	if id == "" {
 		return "", fmt.Errorf("session id is empty")
 	}
+	// "." and ".." survive filepath.Base unchanged and contain no slash, so they
+	// would otherwise slip past the next check and resolve to ".json" / "..json"
+	// inside s.dir — bypassing the helper's contract even if not directly exploitable.
+	if id == "." || id == ".." {
+		return "", fmt.Errorf("invalid session id: %s", id)
+	}
 	if id != filepath.Base(id) || strings.ContainsAny(id, `/\`) {
 		return "", fmt.Errorf("invalid session id: %s", id)
 	}

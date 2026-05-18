@@ -827,12 +827,10 @@ func TestStore_SaveAssignsStrictlyMonotonicUpdatedAt(t *testing.T) {
 	}
 }
 
-// inputs that safeSessionPath should reject with a recognizable error.
-// "." and ".." are intentionally omitted: filepath.Base(".") == "." and they
-// contain no slash, so they slip past safeSessionPath today and surface as
-// ENOENT from os.ReadFile / os.Remove. That gap is upstream of these tests;
-// the handler-edge ValidateSessionID covers it in production. See report.
-var storeTraversalInputs = []string{"../foo", "a/b", "/abs", ""}
+// inputs that safeSessionPath must reject with a recognizable error
+// ("invalid session id" or "session id is empty"), never an ENOENT-style
+// filesystem error from a downstream os call.
+var storeTraversalInputs = []string{"../foo", "a/b", "/abs", ".", "..", ""}
 
 func TestStore_Load_RejectsTraversal(t *testing.T) {
 	s := NewStore(t.TempDir())
