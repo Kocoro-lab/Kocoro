@@ -333,10 +333,10 @@ func (tc *TranscriptCollector) OnUsage(usage agent.TurnUsage)                   
 func (tc *TranscriptCollector) OnCloudAgent(agentID, status, message string)           {}
 func (tc *TranscriptCollector) OnCloudProgress(completed, total int)                   {}
 func (tc *TranscriptCollector) OnCloudPlan(planType, content string, needsReview bool) {}
-// OnApprovalNeeded gates auto-approval for heartbeat-triggered runs. Heartbeat
-// runs unattended (periodic / on-demand from a watcher), so paid +
-// permanent-CDN tools must stay blocked even though the user's general
-// "always allow" choices would otherwise permit them.
+
+// OnApprovalNeeded gates auto-approval for heartbeat-triggered runs through
+// the unattended deny-list. The list is empty as of 2026-05-18, but this keeps
+// heartbeat aligned with scheduler / watcher / daemon auto-approve paths.
 func (tc *TranscriptCollector) OnApprovalNeeded(tool string, args string) bool {
 	return !agent.DisallowsUnattendedAutoApproval(tool)
 }

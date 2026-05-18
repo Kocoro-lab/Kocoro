@@ -544,10 +544,10 @@ Tools requiring approval send requests to the client app (via WS relay through S
 
 Clicking it writes the tool name to the appropriate scope (named agent → per-agent; default agent → global); future calls of that tool skip approval.
 
-**Two safety gates remain regardless of what either list contains** — checked by separate code paths, hand-edited config cannot bypass:
+**Safety gates remain regardless of what either list contains** — checked by separate code paths, hand-edited config cannot bypass:
 
 - **High-risk bash commands** (`pip install`, `rm -rf`, `python -c`, `git push --force`, etc.) still prompt every call. Enforced by the runtime gate in `internal/agent/loop.go` against `permissions.alwaysAskPrefixes`.
-- **Paid / permanent-public tools** (`publish_to_web`, `generate_image`, `edit_image`) cannot be persisted at all. Enforced at write-time AND at runtime via `agent.DisallowsAutoApproval`.
+- **Attended vs unattended auto-approval** — two parallel deny-lists (`agent.DisallowsAutoApproval` / `agent.DisallowsUnattendedAutoApproval`), **both empty as of 2026-05-18**, provide hooks for blocking persistence or unattended execution of specific tools. `publish_to_web`, `generate_image`, and `edit_image` used to be on the attended list; the product call moved them off — they are now ordinary approval-required tools (fresh prompt the first time, "always allow" persists for the rest). The plumbing stays in place for a future tool that genuinely cannot be auto-approved (account deletion, payment authorization, etc.).
 
 #### Approval-card descriptions
 

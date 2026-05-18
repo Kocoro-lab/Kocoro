@@ -274,12 +274,11 @@ func (h *scheduleHandler) OnUsage(usage agent.TurnUsage)                        
 func (h *scheduleHandler) OnCloudAgent(agentID, status, message string)           {}
 func (h *scheduleHandler) OnCloudProgress(completed, total int)                   {}
 func (h *scheduleHandler) OnCloudPlan(planType, content string, needsReview bool) {}
-// OnApprovalNeeded gates auto-approval for scheduled (unattended) runs. The
-// unattended deny-list (publish_to_web / generate_image / edit_image) is
-// independent from the user-facing always-allow deny-list — a scheduled
-// 3am job that decides to publish .env to a public CDN is exactly the
-// scenario these tools' permanence + paid-quota cost was meant to prevent.
-// See agent.DisallowsUnattendedAutoApproval for rationale.
+
+// OnApprovalNeeded gates auto-approval for scheduled (unattended) runs through
+// the unattended deny-list. The list is empty as of 2026-05-18, but the call
+// site stays explicit so a future non-unattended-safe tool can be blocked here
+// without rewriting scheduler approval flow.
 func (h *scheduleHandler) OnApprovalNeeded(tool string, args string) bool {
 	return !agent.DisallowsUnattendedAutoApproval(tool)
 }

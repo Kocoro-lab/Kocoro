@@ -132,10 +132,9 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 		Args:      args,
 		Agent:     meta.Agent,
 	}
-	// Policy hint for UI: paid / permanent-public tools cannot be persisted
-	// as always-allow at any layer (see HandleAlwaysAllowDecision + 4-layer
-	// defense). Telling the UI here lets it disable the "Always Allow"
-	// affordance so non-technical users don't click and see no effect.
+	// Policy hint for UI: tools in DisallowsAutoApproval cannot be persisted
+	// as always-allow. The list is empty as of 2026-05-18, but the hint stays
+	// available so clients can disable "Always Allow" for a future entry.
 	if agentpkg.DisallowsAutoApproval(tool) {
 		req.Flags = append(req.Flags, ApprovalFlagAlwaysAllowDisabled)
 	}
@@ -300,11 +299,9 @@ func (b *ApprovalBroker) CancelAll() {
 }
 
 // SetToolAutoApprove marks a non-bash tool as auto-approved (in-memory only).
-// High-risk tools (agentpkg.DisallowsAutoApproval) are silently refused — those
-// must prompt fresh for every call regardless of prior user clicks, so a single
-// "Always Allow" cannot self-elevate the rest of the session. Callers may
-// unconditionally invoke this after DecisionAlwaysAllow; the broker is the
-// authoritative gate.
+// Tools in agentpkg.DisallowsAutoApproval are silently refused. The list is
+// empty today, but callers may still unconditionally invoke this after
+// DecisionAlwaysAllow; the broker remains the authoritative gate.
 func (b *ApprovalBroker) SetToolAutoApprove(tool string) {
 	if agentpkg.DisallowsAutoApproval(tool) {
 		return
@@ -315,10 +312,9 @@ func (b *ApprovalBroker) SetToolAutoApprove(tool string) {
 }
 
 // IsToolAutoApproved checks if a tool has been auto-approved via "Always Allow".
-// Defense-in-depth: even if the map somehow contains a high-risk tool (e.g.
-// from a future regression or a callsite bypassing SetToolAutoApprove), this
-// gate refuses to honor it. The two checks together ensure no path leaks
-// auto-approval for tools that must prompt every call.
+// Defense-in-depth: even if the map somehow contains a non-persistable tool
+// (e.g. from a future regression or a callsite bypassing SetToolAutoApprove),
+// this gate refuses to honor it.
 func (b *ApprovalBroker) IsToolAutoApproved(tool string) bool {
 	if agentpkg.DisallowsAutoApproval(tool) {
 		return false

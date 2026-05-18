@@ -185,7 +185,7 @@ When an agent produces something the user wants to **share externally** (a landi
    ```
    - `purpose` is **mandatory** and shown to the user during approval. Be specific (who is the recipient, why public). Vague answers ("share", "test", "send it") are rejected.
    - Optional `filename` and `content_type` overrides; defaults inferred from the file path.
-3. The user is prompted for approval (always — there is no auto-approve path).
+3. The user is prompted for approval unless the user has opted into always-allow for `publish_to_web`.
 4. On approval, the tool POSTs to Shannon Cloud's `/api/v1/uploads` and returns a permanent HTTPS URL.
 5. Embed the URL in the assistant's reply ("Here's the landing page: https://…").
 
@@ -208,7 +208,7 @@ When an agent produces something the user wants to **share externally** (a landi
 Once a user has published a file via `publish_to_web`, two companion tools let the agent (and the user, via Kocoro Desktop's "Published Files" panel) review and retract those uploads:
 
 - **`list_my_published_files`** — read-only, no approval. Paginated (default 20, max 100), newest first. Optional `kind` filter narrows by business purpose (`session_share` = HTML pages from the session-share button, `other` = files uploaded via `publish_to_web`, plus `report`/`landing_page`/`image` reserved for future producers). Omit `kind` to list every category. Use when the user asks "what have I shared?" / "find that landing page I sent yesterday" / "show me my shared conversations" (→ `kind="session_share"`) / before calling `retract_published_file` (the LLM needs an `id` from this list — the public URL alone is not enough).
-- **`retract_published_file`** — destructive. Soft-deletes the DB row and hard-deletes the S3 object. Approval required (each call by default; the user can opt in to `always_allow_tools` to skip after the first prompt — retract is destructive but not paid, so unlike `publish_to_web` / `generate_image` / `edit_image` it is NOT on the high-risk denylist).
+- **`retract_published_file`** — destructive. Soft-deletes the DB row and hard-deletes the S3 object. Approval required by default; the user can opt in to `always_allow_tools` to skip after the first prompt. The current auto-approval deny-list is empty, so this behaves like other approval-required tools.
 
 **Important caveats:**
 - Retraction is **not** undoable.

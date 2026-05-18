@@ -46,8 +46,8 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Method: POST
 - Path: /agents/{name}/permissions/always-allow
 - Body: `{"tool": "file_write"}`
-- Response: `{"status": "added"}` on success; `400` if the tool is high-risk and cannot be persisted (`publish_to_web`, `generate_image`, `edit_image`).
-- Notes: Appends the tool name to `permissions.always_allow_tools` in the agent's `config.yaml`. Next time this agent calls the named tool, the approval prompt is skipped. Idempotent (duplicate add is a no-op). Distinct from `tools.allow` — that's a schema filter (controls what the LLM can see); this is an approval bypass (controls whether the user is prompted at run time). Also written automatically when the user clicks "Always Allow" on an approval prompt (both bash and non-bash tools, as long as the message routed to a named agent) — Desktop/Cloud do not need to call this endpoint directly in that flow. **Safety gates that remain even with `bash` in this list**: (a) high-risk bash commands (`pip install`, `rm -rf`, `python -c`, `git push --force`, etc.) still prompt every call — see the always-ask gate in `permissions.md`; (b) paid / permanent-public tools (`publish_to_web`, `generate_image`, `edit_image`) cannot be persisted at all.
+- Response: `{"status": "added"}` on success; `400` if the tool is in `agent.DisallowsAutoApproval` (currently empty as of 2026-05-18).
+- Notes: Appends the tool name to `permissions.always_allow_tools` in the agent's `config.yaml`. Next time this agent calls the named tool, the approval prompt is skipped. Idempotent (duplicate add is a no-op). Distinct from `tools.allow` — that's a schema filter (controls what the LLM can see); this is an approval bypass (controls whether the user is prompted at run time). Also written automatically when the user clicks "Always Allow" on an approval prompt (both bash and non-bash tools, as long as the message routed to a named agent) — Desktop/Cloud do not need to call this endpoint directly in that flow. **Safety gate that remains even with `bash` in this list**: high-risk bash commands (`pip install`, `rm -rf`, `python -c`, `git push --force`, etc.) still prompt every call — see the always-ask gate in `permissions.md`. `publish_to_web`, `generate_image`, and `edit_image` used to be non-persistable but are now ordinary approval-required tools.
 
 ### Remove tool from agent's always-allow list
 - Method: DELETE
@@ -60,7 +60,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Method: POST
 - Path: /permissions/always-allow
 - Body: `{"tool": "bash"}`
-- Response: `{"status": "added"}` on success; `400` if the tool is high-risk and cannot be persisted (`publish_to_web`, `generate_image`, `edit_image`).
+- Response: `{"status": "added"}` on success; `400` if the tool is in `agent.DisallowsAutoApproval` (currently empty as of 2026-05-18).
 - Notes: Appends to `permissions.always_allow_tools` in `~/.shannon/config.yaml` (global scope). Applies to EVERY agent including the default agent that has no per-agent config. Use this for tools the user trusts broadly (e.g. `bash`, `file_write`) so non-technical users on the default agent don't get re-prompted on every command-string variant. Use the per-agent endpoint when trust should be limited to a single agent. Same safety gates apply: high-risk bash commands (`pip install`, `rm -rf`, etc.) still prompt every call regardless.
 
 ### Remove tool from GLOBAL always-allow list

@@ -1610,11 +1610,9 @@ func (h *httpEventHandler) OnCloudAgent(agentID, status, message string)        
 func (h *httpEventHandler) OnCloudProgress(completed, total int)                   {}
 func (h *httpEventHandler) OnCloudPlan(planType, content string, needsReview bool) {}
 
-// OnApprovalNeeded auto-approves for local HTTP API calls except for tools
-// on the unattended deny-list — HTTP API callers are typically scripts /
-// automation, which is the same threat model as scheduled runs (no human
-// click stream to backstop a misuse). Keep paid + permanent-CDN tools
-// gated so a runaway script can't drain quota / leak files.
+// OnApprovalNeeded auto-approves for local HTTP API calls except for tools on
+// the unattended deny-list. HTTP callers are often scripts / automation, so the
+// path stays aligned with scheduled runs. The list is empty as of 2026-05-18.
 func (h *httpEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	return !agent.DisallowsUnattendedAutoApproval(tool)
 }
@@ -1765,10 +1763,9 @@ func (h *sseEventHandler) OnCloudPlan(planType, content string, needsReview bool
 // client responds via POST /approval or the request context is cancelled.
 func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
-		// daemon.auto_approve=true is a "skip prompts" global, but paid +
-		// permanent-CDN tools still demand attended consent — the user who
-		// flipped auto_approve probably did NOT mean "spend my image quota
-		// without asking". Treat them like the scheduled-run gate.
+		// daemon.auto_approve=true is a "skip prompts" global, but keep this
+		// routed through the unattended deny-list so a future non-unattended-safe
+		// tool can still force a broker round-trip. Empty as of 2026-05-18.
 		if !agent.DisallowsUnattendedAutoApproval(tool) {
 			log.Printf("sse: auto-approving %s (auto_approve=true)", tool)
 			return true
@@ -2542,8 +2539,10 @@ type alwaysAllowToolRequest struct {
 }
 
 // handleAddAgentAlwaysAllow appends a tool to permissions.always_allow_tools
-// for an agent. High-risk tools (publish_to_web, generate_image, edit_image)
-// return 400 — those must always prompt the user fresh.
+// for an agent. Tools in agent.DisallowsAutoApproval return 400 — the list
+// is currently empty as of 2026-05-18 (publish_to_web / generate_image /
+// edit_image used to be on it and were moved off), so no production tool
+// is refused today, but the gate stays in place for future use.
 func (s *Server) handleAddAgentAlwaysAllow(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := agents.ValidateAgentName(name); err != nil {
@@ -4321,4 +4320,3 @@ func (s *Server) buildSyncDeps(cfg syncpkg.Config) (syncpkg.Deps, bool) {
 		OnSyncDone: onSyncDone,
 	}, true
 }
-
