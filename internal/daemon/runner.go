@@ -302,12 +302,15 @@ func downloadInjectedImageBase64(ctx context.Context, rawURL, authHeader string)
 			//
 			// 1. Stdlib's `Client.do` auto-copies the original request's
 			//    Authorization header onto the redirected request before
-			//    invoking CheckRedirect, gated by shouldCopyHeaderOnRedirect
-			//    which uses url.Hostname() (port-blind). Two httptest servers
-			//    on 127.0.0.1:A and 127.0.0.1:B share a hostname, so stdlib
-			//    silently propagates Authorization across them. We must DELETE
-			//    that header on cross-host redirects, not merely refrain from
-			//    re-setting it.
+			//    invoking CheckRedirect. The strip path is gated by two
+			//    checks: `reqs[0].URL.Host != req.URL.Host` (port-aware)
+			//    AND `!shouldCopyHeaderOnRedirect(...)` — the latter
+			//    compares via idnaASCIIFromURL (hostname-only, port-blind)
+			//    and returns true on hostname/subdomain match. So two
+			//    httptest servers on 127.0.0.1:A vs 127.0.0.1:B trip the
+			//    first check but pass the second, and stdlib silently
+			//    propagates Authorization. We must DELETE that header on
+			//    cross-host redirects, not merely refrain from re-setting.
 			// 2. The pre-existing custom block below explicitly re-applied the
 			//    original Authorization on every redirect, defeating stdlib's
 			//    same-hostname filter for genuine cross-domain redirects too.
