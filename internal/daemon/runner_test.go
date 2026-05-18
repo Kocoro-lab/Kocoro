@@ -746,6 +746,54 @@ func TestCleanupPlaywrightAfterTurn_NonCDPUsesIdleDisconnect(t *testing.T) {
 	}
 }
 
+func TestCleanupPlaywrightAfterTurn_NonCDPReleasesLease(t *testing.T) {
+	assertGlobalChromeTrackerClean(t)
+
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command:   "dummy",
+		Args:      []string{"--some-stdio-mode"},
+		KeepAlive: false,
+	})
+
+	oldIdle := disconnectPlaywrightAfterIdleFn
+	defer func() { disconnectPlaywrightAfterIdleFn = oldIdle }()
+	disconnectPlaywrightAfterIdleFn = func(*mcp.ClientManager, time.Duration) {}
+
+	ctx := mcp.WithChromeUseLease(context.Background())
+	lease := mcp.ChromeUseLeaseFrom(ctx)
+	if lease == nil {
+		t.Fatal("expected lease installed")
+	}
+	defer lease.ReleaseOnly()
+	mcp.MarkChromeUsed(ctx)
+
+	cleanupPlaywrightAfterTurn(ctx, mgr)
+
+	if got := mcp.GlobalChromeTrackerActiveCountForTest(); got != 0 {
+		t.Fatalf("expected non-CDP cleanup to release stale lease, got count=%d", got)
+	}
+}
+
+func TestCleanupPlaywrightAfterTurn_ReleasesLeaseWhenConfigMissing(t *testing.T) {
+	assertGlobalChromeTrackerClean(t)
+
+	mgr := mcp.NewClientManager()
+	ctx := mcp.WithChromeUseLease(context.Background())
+	lease := mcp.ChromeUseLeaseFrom(ctx)
+	if lease == nil {
+		t.Fatal("expected lease installed")
+	}
+	defer lease.ReleaseOnly()
+	mcp.MarkChromeUsed(ctx)
+
+	cleanupPlaywrightAfterTurn(ctx, mgr)
+
+	if got := mcp.GlobalChromeTrackerActiveCountForTest(); got != 0 {
+		t.Fatalf("expected missing-config cleanup to release lease, got count=%d", got)
+	}
+}
+
 func TestCleanupPlaywrightAfterTurn_CDPSkipsWhenBrowserNotUsed(t *testing.T) {
 	mgr := mcp.NewClientManager()
 	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
@@ -859,6 +907,13 @@ func TestCleanupPlaywrightAfterTurn_UsesIndependentContext(t *testing.T) {
 	}
 	if observedRemaining <= 0 {
 		t.Fatalf("expected cleanup ctx deadline to be in the future, got remaining=%v", observedRemaining)
+	}
+}
+
+func assertGlobalChromeTrackerClean(t *testing.T) {
+	t.Helper()
+	if got := mcp.GlobalChromeTrackerActiveCountForTest(); got != 0 {
+		t.Fatalf("global chrome tracker leaked count=%d from a prior test", got)
 	}
 }
 

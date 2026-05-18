@@ -621,14 +621,20 @@ func (d *ServerDeps) RebuildLayers() (*agent.ToolRegistry, []agent.Tool, []agent
 // Non-CDP path: idle-disconnect schedules every Run regardless of browser-use
 // (preserves existing behavior). keep_alive=true short-circuits as before.
 func cleanupPlaywrightAfterTurn(ctx context.Context, mgr *mcp.ClientManager) {
+	lease := mcp.ChromeUseLeaseFrom(ctx)
 	if mgr == nil {
+		if lease != nil {
+			lease.ReleaseOnly()
+		}
 		return
 	}
 	cfg, ok := mgr.ConfigFor("playwright")
 	if !ok {
+		if lease != nil {
+			lease.ReleaseOnly()
+		}
 		return
 	}
-	lease := mcp.ChromeUseLeaseFrom(ctx)
 
 	if mcp.IsPlaywrightCDPMode(cfg) {
 		if cfg.KeepAlive {
@@ -663,6 +669,9 @@ func cleanupPlaywrightAfterTurn(ctx context.Context, mgr *mcp.ClientManager) {
 
 	// Non-CDP path: unchanged behavior for keep_alive=true; idle-disconnect
 	// schedules for keep_alive=false on every turn regardless of browser-use.
+	if lease != nil {
+		lease.ReleaseOnly()
+	}
 	if cfg.KeepAlive {
 		return
 	}
@@ -715,9 +724,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// during a turn keep the existing cleanup semantics.
 	ctx = mcp.WithChromeUseLease(ctx)
 	defer func() {
-		if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
-			cleanupPlaywrightAfterTurn(ctx, mgr)
-		}
+		_, _, _, mgr := deps.RebuildLayers()
+		cleanupPlaywrightAfterTurn(ctx, mgr)
 	}()
 	if sup != nil {
 		// Cancel any pending idle disconnect — a new turn is starting.

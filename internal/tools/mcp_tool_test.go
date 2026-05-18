@@ -284,7 +284,7 @@ func TestMCPTool_PlaywrightDispatchMarksChromeUsed(t *testing.T) {
 
 	// Stub ensureChromeDebugPort so the dispatch path runs without needing
 	// real Chrome / network. CallTool will fail (no real MCP server) — we
-	// don't care; we only care that MarkChromeUsed ran on dispatch entry,
+	// don't care; we only care that MarkChromeUsed ran on the CDP path,
 	// BEFORE the failure path.
 	oldEnsure := ensureChromeDebugPort
 	ensureChromeDebugPort = func(int) error { return nil }
@@ -294,6 +294,26 @@ func TestMCPTool_PlaywrightDispatchMarksChromeUsed(t *testing.T) {
 
 	if got := mcp.GlobalChromeTrackerActiveCountForTest(); got < 1 {
 		t.Fatalf("expected playwright dispatch to mark chrome used, count=%d", got)
+	}
+}
+
+func TestMCPTool_NonCDPPlaywrightDoesNotMarkChromeUsed(t *testing.T) {
+	assertGlobalChromeTrackerClean(t)
+
+	ctx := mcp.WithChromeUseLease(context.Background())
+
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command: "dummy",
+		Args:    []string{"--some-stdio-mode"},
+	})
+	mgr.SeedClient("playwright", &successCallToolClient{})
+
+	tool := NewMCPTool("playwright", mcpgo.Tool{Name: "browser_navigate"}, mgr)
+	_, _ = tool.Run(ctx, `{"url":"about:blank"}`)
+
+	if got := mcp.GlobalChromeTrackerActiveCountForTest(); got != 0 {
+		t.Fatalf("expected non-CDP playwright dispatch to NOT mark chrome used, count=%d", got)
 	}
 }
 
