@@ -19,6 +19,10 @@ const uploadsListLimitMax = 100
 // Query parameters (passed through, with local clamping):
 //   - limit  (default 20, max 100)
 //   - offset (default 0)
+//   - kind   (optional business-purpose filter: session_share / report /
+//     landing_page / image / other). Validated against the upload-kind
+//     whitelist before forwarding — unknown values return 400 locally
+//     rather than burning a round trip on Cloud's CHECK rejection.
 //
 // Response is the raw cloud JSON: {"uploads": [...], "total_count": N}.
 // Error mapping: 401 (api_key missing/invalid), 503 (cloud unreachable), 500
@@ -44,9 +48,15 @@ func (s *Server) handleListUploads(w http.ResponseWriter, r *http.Request) {
 		limit = uploadsListLimitMax
 	}
 	offset := parseIntParam(q.Get("offset"), 0)
+	kind := strings.TrimSpace(q.Get("kind"))
+	if kind != "" && !uploads.IsValidKind(kind) {
+		writeError(w, http.StatusBadRequest,
+			"invalid kind: allowed values are session_share, report, landing_page, image, other")
+		return
+	}
 
 	client := uploads.NewClient(cfg.Endpoint, cfg.APIKey, s.deps.GW.HTTPClient())
-	resp, err := client.List(r.Context(), limit, offset)
+	resp, err := client.List(r.Context(), uploads.ListOptions{Limit: limit, Offset: offset, Kind: kind})
 	if err != nil {
 		writeUploadsError(w, err)
 		return
@@ -102,6 +112,8 @@ func writeUploadsError(w http.ResponseWriter, err error) {
 		// 503 so Desktop shows "service unavailable" rather than a misleading
 		// 404 (which the UI may interpret as "the file was already retracted").
 		writeError(w, http.StatusServiceUnavailable, err.Error())
+	case errors.Is(err, uploads.ErrInvalidKind):
+		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, uploads.ErrBadRequest):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, uploads.ErrTransient):

@@ -262,7 +262,12 @@ func (s *Server) runShareTask(
 		return io.NopCloser(bytes.NewReader(htmlBytes)), nil
 	}
 
-	upload, err := uploadsClient.Upload(ctx, filename, "text/html", openBody)
+	upload, err := uploadsClient.Upload(ctx, openBody, uploads.UploadOptions{
+		Filename:    filename,
+		ContentType: "text/html",
+		Kind:        uploads.KindSessionShare,
+		Metadata:    buildShareUploadMetadata(sess.ID, agentName),
+	})
 	if err != nil {
 		s.failShareTask(task, fmt.Errorf("upload: %w", err))
 		return
@@ -270,13 +275,15 @@ func (s *Server) runShareTask(
 
 	// Phase: listing — resolve upload_id by URL match against the most recent
 	// LIST page. Non-fatal: a missing upload_id still leaves a working URL.
+	// Same kind-filtered lookup as the sync path so concurrent landing-page /
+	// image uploads don't shove the row we just POSTed off the first page.
 	s.updateShareTask(task, func(t *shareTaskState) {
 		t.Phase = ShareTaskPhaseListing
 		t.Message = "resolving upload id"
 	})
 
 	uploadID := ""
-	if listResp, lerr := uploadsClient.List(ctx, shareLookupListLimit, 0); lerr == nil {
+	if listResp, lerr := uploadsClient.List(ctx, uploads.ListOptions{Limit: shareLookupListLimit, Kind: uploads.KindSessionShare}); lerr == nil {
 		for _, entry := range listResp.Uploads {
 			if entry.URL == upload.URL {
 				uploadID = entry.ID

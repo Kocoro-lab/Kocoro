@@ -29,8 +29,8 @@ const publishMinPurposeLen = 10
 // uploader is the seam the tool talks to. *uploads.Client implements it; tests
 // inject a fake to assert error classification without standing up an HTTP server.
 type uploader interface {
-	Upload(ctx context.Context, filename, contentType string,
-		openBody func() (io.ReadCloser, error)) (*uploads.UploadResponse, error)
+	Upload(ctx context.Context, openBody func() (io.ReadCloser, error),
+		opts uploads.UploadOptions) (*uploads.UploadResponse, error)
 }
 
 // pathDenyComponents are case-insensitive path-segment matches. Any one of
@@ -273,7 +273,18 @@ func (t *PublishToWebTool) Run(ctx context.Context, argsJSON string) (agent.Tool
 
 	openBody := func() (io.ReadCloser, error) { return os.Open(resolved) }
 
-	res, err := t.client.Upload(ctx, filename, args.ContentType, openBody)
+	// publish_to_web tags every upload with kind=other deliberately. The LLM is
+	// not exposed to the kind enum — the alternatives (session_share / report /
+	// landing_page / image) require business judgement the model is not
+	// well-placed to make for ad-hoc shares, and the Desktop UI's MIME-based
+	// filter ("HTML / Image / PDF / Other") already covers the format axis.
+	// Session-share uploads come from the daemon share handler with kind set
+	// explicitly there.
+	res, err := t.client.Upload(ctx, openBody, uploads.UploadOptions{
+		Filename:    filename,
+		ContentType: args.ContentType,
+		Kind:        uploads.KindOther,
+	})
 	if err != nil {
 		return classifyUploadErr(err), nil
 	}

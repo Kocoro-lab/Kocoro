@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -195,7 +196,12 @@ func (s *Server) handleSessionShare(w http.ResponseWriter, r *http.Request) {
 		return io.NopCloser(bytes.NewReader(htmlBytes)), nil
 	}
 
-	upload, err := uploadsClient.Upload(r.Context(), filename, "text/html", openBody)
+	upload, err := uploadsClient.Upload(r.Context(), openBody, uploads.UploadOptions{
+		Filename:    filename,
+		ContentType: "text/html",
+		Kind:        uploads.KindSessionShare,
+		Metadata:    buildShareUploadMetadata(sess.ID, agentName),
+	})
 	if err != nil {
 		writeUploadsError(w, err)
 		return
@@ -205,8 +211,10 @@ func (s *Server) handleSessionShare(w http.ResponseWriter, r *http.Request) {
 	// the id, but the row is at or near the top of LIST sorted newest-first.
 	// Failure here is non-fatal: we still return the URL/key, and Desktop UI
 	// can fall back to a separate GET /uploads lookup to discover the id.
+	// Filter by Kind=session_share so a burst of concurrent landing_page /
+	// image / other uploads can't shove our row out of the lookup window.
 	uploadID := ""
-	if listResp, lerr := uploadsClient.List(r.Context(), shareLookupListLimit, 0); lerr == nil {
+	if listResp, lerr := uploadsClient.List(r.Context(), uploads.ListOptions{Limit: shareLookupListLimit, Kind: uploads.KindSessionShare}); lerr == nil {
 		for _, entry := range listResp.Uploads {
 			if entry.URL == upload.URL {
 				uploadID = entry.ID
@@ -441,6 +449,28 @@ func buildShareFilename(haikuSlug, title, sessionID string, now time.Time) strin
 		slug = short
 	}
 	return fmt.Sprintf("session-%s-%s.html", slug, now.Format("20060102-150405"))
+}
+
+// buildShareUploadMetadata returns the JSON payload attached to every session-
+// share upload. Cloud stores it on the row so the Desktop UI can cross-reference
+// uploads back to their originating session/agent without round-tripping the
+// daemon. agentName empty (default agent) omits the key so the JSON stays
+// minimal — Cloud's 8 KiB metadata cap is generous but we keep this lean.
+//
+// json.Marshal failure on a string→string map is unreachable; on the off chance
+// the encoder ever fails we fall back to nil, which Upload treats as "omit the
+// metadata field entirely" — the share still goes through, just without the
+// cross-reference. Better than aborting the share.
+func buildShareUploadMetadata(sessionID, agentName string) json.RawMessage {
+	md := map[string]string{"session_id": sessionID}
+	if agentName != "" {
+		md["agent"] = agentName
+	}
+	raw, err := json.Marshal(md)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 // slugifyTitleForFilename trims a session title down to a single token safe

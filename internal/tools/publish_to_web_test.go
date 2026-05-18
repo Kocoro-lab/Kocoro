@@ -21,16 +21,20 @@ type fakeUploader struct {
 	called    bool
 	filename  string
 	mimeType  string
+	kind      string
+	metadata  string
 	bodyBytes []byte
 	resp      *uploads.UploadResponse
 	err       error
 }
 
-func (f *fakeUploader) Upload(ctx context.Context, filename, contentType string,
-	openBody func() (io.ReadCloser, error)) (*uploads.UploadResponse, error) {
+func (f *fakeUploader) Upload(ctx context.Context, openBody func() (io.ReadCloser, error),
+	opts uploads.UploadOptions) (*uploads.UploadResponse, error) {
 	f.called = true
-	f.filename = filename
-	f.mimeType = contentType
+	f.filename = opts.Filename
+	f.mimeType = opts.ContentType
+	f.kind = opts.Kind
+	f.metadata = string(opts.Metadata)
 	if openBody != nil {
 		rc, err := openBody()
 		if err == nil {
@@ -330,6 +334,9 @@ func TestPublishHappyPath(t *testing.T) {
 	}
 	if fu.mimeType != "text/html" {
 		t.Errorf("content-type = %q, want text/html", fu.mimeType)
+	}
+	if fu.kind != uploads.KindOther {
+		t.Errorf("publish_to_web should tag kind=other, got %q", fu.kind)
 	}
 	if string(fu.bodyBytes) != "<h1>hi</h1>" {
 		t.Errorf("body = %q", fu.bodyBytes)

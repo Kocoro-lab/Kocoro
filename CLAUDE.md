@@ -179,6 +179,7 @@ Unknown tools → denied (fail-safe). Always-ask gate runs BEFORE the allowlist,
 | `delivery_ack` capability | `client.go:sendDeliveryAck` | After `SendReply` succeeds for `MsgTypeMessage`, emit ack so Cloud drops the replay-buffer entry. Reply-failure paths skip the ack so replay is correct. |
 | Attachments | `attachment.go` | Priority `document_b64` → `extracted_text` → URL download. Caps: 500 MB/file, 20/msg, inline doc ≤ 25 MB raw. Capability tokens `inline_document_b64` / `inline_extracted_text` gate the new fields. DOCX/XLSX/PPTX/CSV extraction is daemon-local via `internal/tools/doc_extract.go` (Phase 2 aligned with CC). Cloud fills PDF `DocumentB64` + transcodes HEIC/AVIF. |
 | Session routing | `router.go` | `ComputeRouteKey` precedence: explicit `session:<id>` → thread → sender → agent → channel. Web/webhook/cron/schedule bypass (always fresh). |
+| Session share uploads | `daemon/share_handler.go` + `share_async.go` | Render HTML → POST `/api/v1/uploads` with `kind=session_share` + `metadata={session_id, agent?}`; the post-upload LIST lookup also filters by `kind=session_share` so concurrent landing-page/image uploads can't shove our row off the first page. publish_to_web sends `kind=other`; daemon list proxy validates kind against the whitelist before forwarding. |
 | Output format | `runner.go outputFormatForSource` | `plain` for cloud-distributed channels (slack/line/feishu/lark/telegram/webhook); `markdown` default. |
 | Tool result sizing | `spill.go` + `toolresult_budget.go` + `context_bloat.go` | Per-result spill at policy threshold (default 50K, grep 20K, file_read unlimited→50K) → tmp file + 2K preview. Per-turn 200K-rune aggregate cap. `ToolResultReplacements` + `ToolResultSeen` persisted across checkpoints AND terminal saves. |
 | file_read dedup | `agent/readtracker.go` + `daemon/readtracker_cache.go` | Records `(path, offset, limit, mtime, size)`; re-reads return a stub. Per-session, released via `SessionManager.OnSessionClose`. |
@@ -321,8 +322,8 @@ Conditional:
 
 - `session_search` — when session manager available
 - `cloud_delegate` — `cloud.enabled: true`
-- `publish_to_web` — `cloud.enabled` + `cfg.APIKey`. Always approval. Path-segment + basename blocklist (`.env`/`.pem`/…); extension allowlist (`cloud.publish_allowed_extensions`).
-- `list_my_published_files` — same gating. Read-only, no approval. `limit` (≤100), `offset`. Returns paged `UploadEntry` rows keyed by id.
+- `publish_to_web` — `cloud.enabled` + `cfg.APIKey`. Always approval. Path-segment + basename blocklist (`.env`/`.pem`/…); extension allowlist (`cloud.publish_allowed_extensions`). All uploads tagged `kind=other` server-side; the kind enum (`session_share`/`report`/`landing_page`/`image`/`other` — see `internal/uploads/client.go`) is NOT exposed to the model (avoids landing_page misclassification for ad-hoc shares).
+- `list_my_published_files` — same gating. Read-only, no approval. `limit` (≤100), `offset`, optional `kind` filter (same enum). Returns paged `UploadEntry` rows keyed by id; rendering surfaces a `kind=…` badge per row so the LLM can answer "which of these are session shares".
 - `retract_published_file` — same gating. Destructive, requires approval. `agent.DisallowsAutoApproval` is empty as of 2026-05-18, so retract behaves like other approval-required tools (can be persisted to always-allow if the user chooses). Args: `id` (UUID from list) + `description`. 404 conflates not-found/already-retracted/not-yours to avoid existence leak.
 - `generate_image` / `edit_image` — same gating. Always approval (paid quota + permanent CDN). Edit requires `image_urls` 1-4 entries starting with `https://static.kocoro.ai/`.
 - `tool_search` — deferred mode when tool count > 30 (lives in `agent/deferred.go`)

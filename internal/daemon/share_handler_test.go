@@ -121,6 +121,8 @@ func TestHandleSessionShare_HappyPath(t *testing.T) {
 	//   2. POST /api/v1/uploads — accept the multipart, return url+key
 	//   3. GET  /api/v1/uploads — return one row matching the upload's URL
 	var gotUploadHTML string
+	var gotUploadKind, gotUploadMetadata string
+	var gotListQuery string
 	cloudHandler := func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/api/v1/uploads"):
@@ -128,6 +130,8 @@ func TestHandleSessionShare_HappyPath(t *testing.T) {
 			if err := r.ParseMultipartForm(32 << 20); err != nil {
 				t.Errorf("ParseMultipartForm: %v", err)
 			}
+			gotUploadKind = r.FormValue("kind")
+			gotUploadMetadata = r.FormValue("metadata")
 			for _, fileHeaders := range r.MultipartForm.File {
 				for _, fh := range fileHeaders {
 					f, _ := fh.Open()
@@ -146,6 +150,7 @@ func TestHandleSessionShare_HappyPath(t *testing.T) {
 			}`))
 		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/api/v1/uploads"):
 			// The post-upload list lookup: include our row with matching URL.
+			gotListQuery = r.URL.RawQuery
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{
 				"uploads":[{
@@ -203,6 +208,31 @@ func TestHandleSessionShare_HappyPath(t *testing.T) {
 	if !strings.Contains(gotUploadHTML, "<!DOCTYPE html>") || !strings.Contains(gotUploadHTML, "explain the loader") {
 		t.Errorf("uploaded HTML missing expected content. First 400 bytes:\n%s", firstN(gotUploadHTML, 400))
 	}
+	if gotUploadKind != "session_share" {
+		t.Errorf("session share upload kind = %q, want session_share", gotUploadKind)
+	}
+	if !strings.Contains(gotUploadMetadata, `"session_id":"`+sessID+`"`) {
+		t.Errorf("session share upload metadata missing session_id %q: %s", sessID, gotUploadMetadata)
+	}
+	if !strings.Contains(gotListQuery, "kind=session_share") {
+		t.Errorf("upload_id lookup must filter by kind=session_share; query = %q", gotListQuery)
+	}
+}
+
+func TestBuildShareUploadMetadata(t *testing.T) {
+	t.Run("default agent omits agent key", func(t *testing.T) {
+		got := string(buildShareUploadMetadata("sess_abc", ""))
+		if got != `{"session_id":"sess_abc"}` {
+			t.Errorf("metadata = %q, want exactly {\"session_id\":\"sess_abc\"}", got)
+		}
+	})
+	t.Run("named agent included", func(t *testing.T) {
+		got := string(buildShareUploadMetadata("sess_abc", "researcher"))
+		// json.Marshal sorts map keys alphabetically — agent comes before session_id.
+		if got != `{"agent":"researcher","session_id":"sess_abc"}` {
+			t.Errorf("metadata = %q", got)
+		}
+	})
 }
 
 func TestBuildShareFilename(t *testing.T) {
@@ -645,6 +675,66 @@ func TestHandleSessionShare_AsyncReturns202(t *testing.T) {
 	if len(sess.PublishedShares) != 1 || sess.PublishedShares[0].UploadID != uploadID {
 		t.Errorf("PublishedShares after async = %+v, want one entry with UploadID=%s",
 			sess.PublishedShares, uploadID)
+	}
+}
+
+// TestHandleSessionShare_AsyncTagsSessionShareKind guards the async path's
+// kind/metadata wiring. Sync path is already covered by
+// TestHandleSessionShare_HappyPath; this is the analogous regression for
+// share_async.runShareTask. Without this, a future refactor could quietly
+// drop the kind tag on the async path and the only signal would be Desktop
+// UI users complaining that their shared conversations show up under
+// "Other" instead of "Session" in the published-files panel.
+func TestHandleSessionShare_AsyncTagsSessionShareKind(t *testing.T) {
+	const uploadID = "upload-uuid-async-kind"
+	const url = "https://cdn.example/shared/async-kind.html"
+
+	var gotKind, gotMetadata, gotListQuery string
+	cloud := func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/api/v1/uploads"):
+			_ = r.ParseMultipartForm(32 << 20)
+			gotKind = r.FormValue("kind")
+			gotMetadata = r.FormValue("metadata")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"url":"` + url + `","key":"k","size":100,"content_type":"text/html"}`))
+		case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/api/v1/uploads"):
+			gotListQuery = r.URL.RawQuery
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"uploads":[{"id":"` + uploadID + `","url":"` + url + `","filename":"f.html","content_type":"text/html","size":100,"created_at":"2026-05-18T00:00:00Z"}],"total_count":1}`))
+		default:
+			w.WriteHeader(503)
+		}
+	}
+
+	s, sessID := newTestShareServer(t, cloud)
+	s.deps.Config.Daemon.ShareAsyncDefault = true
+
+	req := httptest.NewRequest("POST", "/sessions/"+sessID+"/share", nil)
+	req.SetPathValue("id", sessID)
+	rr := httptest.NewRecorder()
+	s.handleSessionShare(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		TaskID string `json:"task_id"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+
+	final := waitForShareTaskTerminal(t, s, body.TaskID)
+	if final.Phase != ShareTaskPhaseCompleted {
+		t.Fatalf("task did not complete: %+v", final)
+	}
+
+	if gotKind != "session_share" {
+		t.Errorf("async upload kind = %q, want session_share", gotKind)
+	}
+	if !strings.Contains(gotMetadata, `"session_id":"`+sessID+`"`) {
+		t.Errorf("async upload metadata missing session_id %q: %s", sessID, gotMetadata)
+	}
+	if !strings.Contains(gotListQuery, "kind=session_share") {
+		t.Errorf("async upload_id lookup must filter by kind=session_share; query = %q", gotListQuery)
 	}
 }
 

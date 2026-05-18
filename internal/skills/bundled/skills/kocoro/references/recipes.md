@@ -207,7 +207,7 @@ When an agent produces something the user wants to **share externally** (a landi
 
 Once a user has published a file via `publish_to_web`, two companion tools let the agent (and the user, via Kocoro Desktop's "Published Files" panel) review and retract those uploads:
 
-- **`list_my_published_files`** — read-only, no approval. Paginated (default 20, max 100), newest first. Use when the user asks "what have I shared?" / "find that landing page I sent yesterday" / before calling `retract_published_file` (the LLM needs an `id` from this list — the public URL alone is not enough).
+- **`list_my_published_files`** — read-only, no approval. Paginated (default 20, max 100), newest first. Optional `kind` filter narrows by business purpose (`session_share` = HTML pages from the session-share button, `other` = files uploaded via `publish_to_web`, plus `report`/`landing_page`/`image` reserved for future producers). Omit `kind` to list every category. Use when the user asks "what have I shared?" / "find that landing page I sent yesterday" / "show me my shared conversations" (→ `kind="session_share"`) / before calling `retract_published_file` (the LLM needs an `id` from this list — the public URL alone is not enough).
 - **`retract_published_file`** — destructive. Soft-deletes the DB row and hard-deletes the S3 object. Approval required (each call by default; the user can opt in to `always_allow_tools` to skip after the first prompt — retract is destructive but not paid, so unlike `publish_to_web` / `generate_image` / `edit_image` it is NOT on the high-risk denylist).
 
 **Important caveats:**
@@ -225,10 +225,10 @@ Once a user has published a file via `publish_to_web`, two companion tools let t
 
 **Daemon HTTP equivalents** (for Kocoro Desktop, not the agent):
 
-- `GET /uploads?limit=&offset=` — same response shape as the cloud's `/api/v1/uploads`.
+- `GET /uploads?limit=&offset=&kind=` — same response shape as the cloud's `/api/v1/uploads`. `kind` whitelist (`session_share` / `report` / `landing_page` / `image` / `other`) is enforced locally; invalid values return 400 without a round trip. Use `kind=session_share` to back the Desktop "Session" filter; omit `kind` for "All".
 - `DELETE /uploads/{id}` — same response shape and 404 semantics. Owner-only.
 
-Both endpoints transparently proxy the request through Shannon Cloud using the daemon's configured `api_key`. Desktop builds its UI on these — the LLM tools and the management panel share the same backing data.
+Both endpoints transparently proxy the request through Shannon Cloud using the daemon's configured `api_key`. Desktop builds its UI on these — the LLM tools and the management panel share the same backing data. Session-share uploads (POST `/sessions/{id}/share`, sync or async) automatically tag `kind=session_share` and stash `{session_id, agent}` in `metadata`; `publish_to_web` tags everything `kind=other`.
 
 **Requirements:** `cloud.enabled: true` AND `api_key`. Same as `publish_to_web`.
 
