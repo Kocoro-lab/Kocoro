@@ -9,8 +9,10 @@ import (
 )
 
 func TestConvertFilesToInjected_PrioritizesExtractedText(t *testing.T) {
-	// When ExtractedText and DocumentB64 are both set, the priority order
-	// (matching downloadRemoteFiles) is ExtractedText > DocumentB64 > URL.
+	// When ExtractedText and DocumentB64 are both set on the inject path,
+	// ExtractedText wins. Note this is intentionally the REVERSE of
+	// downloadRemoteFiles (which prefers DocumentB64 for PDF vision fidelity);
+	// see ConvertFilesToInjected doc-comment for the rationale.
 	files := []RemoteFile{{
 		Name:          "report.pdf",
 		MimeType:      "application/pdf",

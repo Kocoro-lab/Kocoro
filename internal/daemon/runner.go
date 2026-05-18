@@ -205,10 +205,20 @@ func resolveContentBlocks(blocks []RequestContentBlock) []client.ContentBlock {
 }
 
 // ConvertFilesToInjected lowers daemon-layer RemoteFile (cloud wire format)
-// to agent.InjectedFile (cycle-free agent-layer carrier). Priority order
-// mirrors downloadRemoteFiles:
+// to agent.InjectedFile (cycle-free agent-layer carrier). The inject-path
+// priority order is:
 //
 //	ExtractedText > DocumentB64 > URL-download (image case).
+//
+// Note this is the REVERSE of downloadRemoteFiles' priority (which is
+// DocumentB64 > ExtractedText > URL, per attachment.go's header comment).
+// The main path prefers DocumentB64 to preserve PDF fidelity for native
+// vision; the inject path prefers ExtractedText because mid-turn injects
+// share context with the active turn and a cheaper-token text block
+// usually wins over a fresh ~25 MB document. Real-world cloud mid-turn
+// followups are typically "look at this image" or "here is the extract"
+// — when ExtractedText is populated, the cloud already did the extraction
+// work and we honor it.
 //
 // Returns nil for empty input; skips entries that can't be expressed and
 // logs them rather than silently dropping. Non-image URL-only files are
