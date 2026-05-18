@@ -34,12 +34,12 @@ const summaryTimeout = 45 * time.Second
 // user message doesn't dominate the page when Haiku fails.
 const summaryFallbackChars = 200
 
-// summaryCacheSource tags the Haiku call as a share-feature internal helper
-// so Cloud-side billing skips user-quota accounting — parallel to how
-// "prompt_suggestion" is already exempted (see CLAUDE.md "Prompt Cache"
-// section). Cloud must include "session_share" in its billing exempt list
-// for the exemption to take effect; until then the call still bills the
-// user but the tag remains stable so the rollout is daemon-no-op.
+// summaryCacheSource tags the share-page Haiku calls (both summary and slug)
+// as a share-feature internal helper so Cloud-side billing skips user-quota
+// accounting — parallel to how "prompt_suggestion" is exempted. Cloud added
+// the "session_share" entry to its billing exempt list on 2026-05-15, so
+// every share now runs free of user quota; the tag has been in place since
+// share shipped, so the change was a pure Cloud-side flip.
 const summaryCacheSource = "session_share"
 
 // RenderResult bundles the rendered HTML with light telemetry callers may

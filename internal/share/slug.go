@@ -67,8 +67,8 @@ var slugValidator = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 // The caller (share_handler.buildShareFilename) falls back to the
 // title-based ASCII slug, then to a session-ID prefix.
 //
-// Runs with cache_source="session_share" so once Cloud adds the exemption
-// rule, both the summary and the slug Haiku calls are user-quota-exempt.
+// Runs with cache_source="session_share" so it shares the user-quota
+// exemption Cloud applied to the share-page Haiku calls on 2026-05-15.
 func generateEnglishSlug(ctx context.Context, gw ctxwin.Completer, sess *session.Session, msgs []client.Message) string {
 	if gw == nil || sess == nil {
 		return ""
