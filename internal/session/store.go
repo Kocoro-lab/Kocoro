@@ -261,6 +261,20 @@ type Store struct {
 	lastUpdated time.Time
 }
 
+// safeSessionPath joins id onto s.dir while refusing inputs that could escape
+// the sessions directory. Defense in depth — handler-edge validation is the
+// primary block, but Store.Load/Delete are also reachable from internal code
+// paths where the id may have been derived rather than validated.
+func (s *Store) safeSessionPath(id string) (string, error) {
+	if id == "" {
+		return "", fmt.Errorf("session id is empty")
+	}
+	if id != filepath.Base(id) || strings.ContainsAny(id, `/\`) {
+		return "", fmt.Errorf("invalid session id: %s", id)
+	}
+	return filepath.Join(s.dir, id+".json"), nil
+}
+
 func NewStore(dir string) *Store {
 	os.MkdirAll(dir, 0700)
 	s := &Store{dir: dir}
@@ -408,7 +422,10 @@ func (s *Store) PatchSummaryCache(id, summary, cacheKey string) error {
 }
 
 func (s *Store) Load(id string) (*Session, error) {
-	path := filepath.Join(s.dir, id+".json")
+	path, err := s.safeSessionPath(id)
+	if err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read session: %w", err)
@@ -468,7 +485,10 @@ func (s *Store) List() ([]SessionSummary, error) {
 }
 
 func (s *Store) Delete(id string) error {
-	path := filepath.Join(s.dir, id+".json")
+	path, err := s.safeSessionPath(id)
+	if err != nil {
+		return err
+	}
 	if err := os.Remove(path); err != nil {
 		return err
 	}

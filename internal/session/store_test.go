@@ -825,3 +825,23 @@ func TestStore_SaveAssignsStrictlyMonotonicUpdatedAt(t *testing.T) {
 		}
 	}
 }
+
+func TestStore_Load_RejectsTraversal(t *testing.T) {
+	s := NewStore(t.TempDir())
+	defer s.Close()
+	for _, id := range []string{"../foo", "a/b", "/abs", ".", ""} {
+		if _, err := s.Load(id); err == nil {
+			t.Errorf("Load(%q) returned nil error, expected rejection", id)
+		}
+	}
+}
+
+func TestStore_Delete_RejectsTraversal(t *testing.T) {
+	s := NewStore(t.TempDir())
+	defer s.Close()
+	for _, id := range []string{"../foo", "a/b", "/abs", ".", ""} {
+		if err := s.Delete(id); err == nil {
+			t.Errorf("Delete(%q) returned nil error, expected rejection", id)
+		}
+	}
+}
