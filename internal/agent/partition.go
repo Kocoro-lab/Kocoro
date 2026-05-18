@@ -100,6 +100,7 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 					if r := recover(); r != nil {
 						execResults[ac.index] = toolExecResult{
 							result: ToolResult{Content: fmt.Sprintf("tool panicked: %v", r), IsError: true},
+							name:   ac.fc.Name,
 						}
 					}
 				}()
@@ -108,7 +109,7 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 				}
 				startTime := time.Now()
 				result, runErr := ac.tool.Run(ctx, ac.argsStr)
-				execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr}
+				execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr, name: ac.fc.Name}
 			}()
 		} else {
 			// Concurrent batch with semaphore.
@@ -130,12 +131,13 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 						if r := recover(); r != nil {
 							execResults[ac.index] = toolExecResult{
 								result: ToolResult{Content: fmt.Sprintf("tool panicked: %v", r), IsError: true},
+								name:   ac.fc.Name,
 							}
 						}
 					}()
 					startTime := time.Now()
 					result, runErr := ac.tool.Run(ctx, ac.argsStr)
-					execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr}
+					execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr, name: ac.fc.Name}
 				}(ac)
 			}
 			wg.Wait()

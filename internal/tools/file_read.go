@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
@@ -44,6 +45,43 @@ const pdfPageMaxDim = 1024
 const fileReadMaxTokens = 25000
 
 const fileReadNoLimitMaxBytes = 256 * 1024
+
+// fileReadHardCapRunes bounds raw file_read output as defense-in-depth.
+// Required after file_read was exempted from spill (see
+// internal/agent/spill.go:perToolResultSpillThreshold) — without this, a
+// future relaxation of the pre-flight checks above could let a single read
+// of a multi-MB log shove the entire payload into the LLM's next turn,
+// blowing the prompt cache.
+//
+// Workload: typical source files (~100K runes), edited files (~50K), config
+// (<10K). The 500K cap leaves ~5x headroom for legitimate large reads such
+// as CSV exports, generated SQL dumps, or full git diffs without clipping
+// them.
+// Symptom when it binds: legitimate large reads (e.g. 1MB+ CSV) get clipped
+// to 500K with a marker pointing the caller at offset/limit for the rest.
+// Override path: none today — hardcoded const. If a workload routinely
+// needs >500K, bump this const rather than introducing a viper default;
+// sessions hitting the cap are rare enough that runtime tuning isn't
+// justified yet.
+const fileReadHardCapRunes = 500_000
+
+// applyFileReadHardCap truncates content to fileReadHardCapRunes, appending
+// a marker so the model knows the slice was clipped. Applied only on the
+// text-return path; image and PDF return ImageBlocks instead of strings.
+func applyFileReadHardCap(content string) string {
+	// Gate via RuneCountInString to avoid materializing the []rune slice on
+	// every read. In steady state fileReadMaxTokens (~75K runes) caps output
+	// well below fileReadHardCapRunes (500K), so the cap never trips and the
+	// rune allocation was pure waste — ~4 bytes/rune × every read.
+	if utf8.RuneCountInString(content) <= fileReadHardCapRunes {
+		return content
+	}
+	runes := []rune(content)
+	head := string(runes[:fileReadHardCapRunes])
+	return head + fmt.Sprintf(
+		"\n\n[file_read: output truncated at %d runes (original %d); use offset/limit to read more]",
+		fileReadHardCapRunes, len(runes))
+}
 
 type FileReadTool struct{}
 
@@ -193,7 +231,7 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	if statErr == nil {
 		agent.RecordFileRead(ctx, args.Path, args.Offset, args.Limit, info.ModTime(), info.Size())
 	}
-	return agent.ToolResult{Content: sb.String()}, nil
+	return agent.ToolResult{Content: applyFileReadHardCap(sb.String())}, nil
 }
 
 func readTextLineRange(path string, offset, limit int) (lines []string, totalLines int, reachedEOF bool, err error) {

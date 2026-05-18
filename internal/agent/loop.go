@@ -641,8 +641,9 @@ type RunStatusHandler interface {
 // CWD is optional metadata used by higher layers to enforce immutable
 // project-context policies; the loop currently ignores it.
 type InjectedMessage struct {
-	Text string
-	CWD  string
+	Text  string
+	CWD   string
+	Files []InjectedFile // optional; empty for text-only injects (TUI keyboard, legacy callers)
 }
 
 type AgentLoop struct {
@@ -687,7 +688,6 @@ type AgentLoop struct {
 	sessionCWD       string      // session-scoped working directory; set by runner/TUI before Run()
 	deltaProvider    DeltaProvider
 	injectCh         chan InjectedMessage
-	injectedMessages []string         // messages injected during the last Run(); cleared on each Run() call
 	runMessages      []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
 	runMsgInjected   []bool           // parallel to runMessages: true = system-injected guardrail/nudge
 	runMsgTimestamps []time.Time      // parallel to runMessages: when each message was created
@@ -1094,12 +1094,6 @@ func (a *AgentLoop) SetDeltaProvider(dp DeltaProvider) {
 	a.deltaProvider = dp
 }
 
-// InjectedMessages returns the user messages that were injected during the
-// last Run() call. Callers should persist these to session history.
-func (a *AgentLoop) InjectedMessages() []string {
-	return a.injectedMessages
-}
-
 // RunMessages returns the conversation messages accumulated during the last
 // Run() call, excluding the system prompt and pre-existing history. This
 // includes the user prompt, all assistant responses (with tool_use blocks),
@@ -1365,6 +1359,7 @@ type toolExecResult struct {
 	result  ToolResult
 	elapsed time.Duration
 	err     error
+	name    string // tool name; used by applyAggregateCap to skip Unlimited tools
 }
 
 // approvedToolCall tracks a tool call that passed permission checks and pre-hooks.
@@ -1460,7 +1455,6 @@ func reactiveSummaryInput(messages []client.Message, priorSummary string) []clie
 }
 
 func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []client.ContentBlock, history []client.Message) (string, *TurnUsage, error) {
-	a.injectedMessages = nil // reset for this run
 	a.runMessages = nil      // reset for this run
 	a.runMsgInjected = nil   // reset for this run
 	a.runMsgTimestamps = nil // reset for this run
@@ -2474,28 +2468,24 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// Drain injected user messages (non-blocking).
 		// Multiple pending messages are batched into one user turn.
 		if a.injectCh != nil {
-			var injected []string
-		drain:
-			for {
-				select {
-				case msg := <-a.injectCh:
-					injected = append(injected, msg.Text)
-				default:
-					break drain
-				}
-			}
-			if len(injected) > 0 {
-				a.tracker.Enter(PhaseInjectingMessage)
-				combined := strings.Join(injected, "\n\n")
-				latestUserText = combined // track for deferred-tool continuation nudge
-				messages = append(messages, client.Message{
-					Role:    "user",
-					Content: client.NewTextContent("[New message from user]\n" + combined),
-				})
-				stampMessage()
-				a.injectedMessages = append(a.injectedMessages, injected...)
-				if a.handler != nil {
-					a.handler.OnText("")
+			if drained := drainInjected(a.injectCh); len(drained) > 0 {
+				if newMsg, ok := buildInjectedUserMessage(drained); ok {
+					a.tracker.Enter(PhaseInjectingMessage)
+					// latestUserText tracks the user-typed text for the deferred-tool
+					// continuation nudge — Files don't have a text equivalent, so
+					// only count text from each drained message.
+					var texts []string
+					for _, m := range drained {
+						if m.Text != "" {
+							texts = append(texts, m.Text)
+						}
+					}
+					latestUserText = strings.Join(texts, "\n\n")
+					messages = append(messages, newMsg)
+					stampMessage()
+					if a.handler != nil {
+						a.handler.OnText("")
+					}
 				}
 			}
 		}
@@ -3318,6 +3308,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "duplicate tool call skipped (identical to earlier call in this response)", IsError: true},
+					name:   fc.Name,
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3331,6 +3322,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "tool call blocked: previously denied this turn. Use a different approach.", IsError: true},
+					name:   fc.Name,
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3346,6 +3338,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					callMeta[idx].resolved = true
 					execResults[idx] = toolExecResult{
 						result: ToolResult{Content: "cloud_delegate already called this turn. Use the previous result — do not re-delegate.", IsError: true},
+						name:   fc.Name,
 					}
 					if a.handler != nil {
 						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3363,6 +3356,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "unknown tool: " + fc.Name, IsError: true},
+					name:   fc.Name,
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3407,6 +3401,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: content, IsError: true},
+					name:   fc.Name,
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3453,6 +3448,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 							IsError: cached.IsError,
 							Images:  cached.Images,
 						},
+						name: fc.Name,
 					}
 					if a.handler != nil {
 						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3470,6 +3466,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "tool call denied by permission policy", IsError: true},
+					name:   fc.Name,
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, ToolResult{Content: "denied by policy", IsError: true}, 0)
@@ -3481,6 +3478,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "Tool execution was DENIED by the user. The command did NOT run. Do not claim it completed or report any output from it.", IsError: true},
+					name:   fc.Name,
 				}
 				deniedCalls[dedupKey] = true
 				if a.handler != nil {
@@ -3500,6 +3498,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					callMeta[idx].resolved = true
 					execResults[idx] = toolExecResult{
 						result: ToolResult{Content: "tool call denied by hook: " + hookReason, IsError: true},
+						name:   fc.Name,
 					}
 					if a.handler != nil {
 						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
@@ -3543,6 +3542,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 								Content: denyMsg,
 								IsError: true,
 							},
+							name: ac.fc.Name,
 						}
 						if a.handler != nil {
 							a.handler.OnToolResult(ac.fc.Name, ac.argsStr, ac.fc.ID, execResults[ac.index].result, 0)
@@ -3563,7 +3563,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// 30K each can put hundreds of KB into one user message. Spill
 			// the largest result(s) to bring the sum under 200K. No-op for
 			// turns with small or few results.
-			applyAggregateCap(execResults, a.shannonDir, a.sessionID)
+			applyAggregateCap(execResults, a.shannonDir, a.sessionID, a.toolResultPolicy())
 			a.tracker.MarkDirty() // tool batch is durable state for checkpoint
 			// Fire mid-turn checkpoint after captureRunMessages below, so
 			// RunMessages() reflects the just-completed batch. The actual

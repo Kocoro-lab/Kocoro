@@ -540,6 +540,37 @@ func TestParsePDFPageRange_Invalid(t *testing.T) {
 	}
 }
 
+// TestFileRead_HardCap500K verifies the 500K-rune safety-net cap applied on
+// the text-return path. The cap is defense-in-depth: the existing pre-flight
+// checks (fileReadNoLimitMaxBytes, fileReadMaxTokens) already error on
+// oversized reads, but since file_read is now exempt from spill (#161), this
+// extra cap ensures a future pre-flight change can't let a single read dump
+// megabytes into context. Unit-tested via the helper so we can exercise the
+// cap path directly without fighting the pre-flight gate.
+func TestFileRead_HardCap500K(t *testing.T) {
+	// Under the cap: pass-through.
+	small := strings.Repeat("a", 100_000)
+	if got := applyFileReadHardCap(small); got != small {
+		t.Errorf("content under cap should be unchanged; len=%d", len([]rune(got)))
+	}
+
+	// Over the cap: truncated with marker.
+	huge := strings.Repeat("a", 600_000)
+	got := applyFileReadHardCap(huge)
+	if len([]rune(got)) > 510_000 {
+		t.Errorf("expected file_read output capped at ~500K runes, got %d", len([]rune(got)))
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Errorf("expected truncation marker in capped output")
+	}
+	if !strings.Contains(got, "500000") {
+		t.Errorf("expected marker to mention cap (500000 runes); got: %q", got[len(got)-200:])
+	}
+	if !strings.Contains(got, "600000") {
+		t.Errorf("expected marker to mention original length (600000 runes); got: %q", got[len(got)-200:])
+	}
+}
+
 // TestFileRead_DedupSameFile_NoTracker: without a tracker in context, dedup
 // is a no-op (always returns full content).
 func TestFileRead_DedupSameFile_NoTracker(t *testing.T) {

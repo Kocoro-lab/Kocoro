@@ -3,11 +3,14 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -199,6 +202,153 @@ func resolveContentBlocks(blocks []RequestContentBlock) []client.ContentBlock {
 		}
 	}
 	return out
+}
+
+// ConvertFilesToInjected lowers daemon-layer RemoteFile (cloud wire format)
+// to agent.InjectedFile (cycle-free agent-layer carrier). The inject-path
+// priority order is:
+//
+//	ExtractedText > DocumentB64 > URL-download (image case).
+//
+// Note this is the REVERSE of downloadRemoteFiles' priority (which is
+// DocumentB64 > ExtractedText > URL, per attachment.go's header comment).
+// The main path prefers DocumentB64 to preserve PDF fidelity for native
+// vision; the inject path prefers ExtractedText because mid-turn injects
+// share context with the active turn and a cheaper-token text block
+// usually wins over a fresh ~25 MB document. Real-world cloud mid-turn
+// followups are typically "look at this image" or "here is the extract"
+// — when ExtractedText is populated, the cloud already did the extraction
+// work and we honor it.
+//
+// Returns nil for empty input; skips entries that can't be expressed and
+// logs them rather than silently dropping. Non-image URL-only files are
+// skipped intentionally — the inject path has no disk-cleanup hook for the
+// file_ref/disk-download flow that downloadRemoteFiles uses, and the only
+// real-world mid-turn attachment from cloud channels is an image followup
+// ("here's the screenshot you asked about"). A future enhancement can wire
+// document downloads through ensureDir() + the existing cleanup chain.
+//
+// Exported so the cmd/daemon.go WS handler can call it before queueing the
+// InjectedMessage onto the route's inject channel.
+func ConvertFilesToInjected(ctx context.Context, files []RemoteFile) []agent.InjectedFile {
+	if len(files) == 0 {
+		return nil
+	}
+	out := make([]agent.InjectedFile, 0, len(files))
+	for _, f := range files {
+		switch {
+		case f.ExtractedText != "":
+			out = append(out, agent.InjectedFile{
+				Type: "text",
+				Data: f.ExtractedText,
+			})
+		case f.DocumentB64 != "":
+			out = append(out, agent.InjectedFile{
+				Type:      "document",
+				MediaType: f.MimeType,
+				Data:      f.DocumentB64,
+			})
+		case f.URL != "" && strings.HasPrefix(f.MimeType, "image/"):
+			b64, err := downloadInjectedImageBase64(ctx, f.URL, f.AuthHeader)
+			if err != nil {
+				log.Printf("daemon: convertFilesToInjected: image download failed for %q: %v", f.Name, sanitizeError(err))
+				continue
+			}
+			out = append(out, agent.InjectedFile{
+				Type:      "image",
+				MediaType: f.MimeType,
+				Data:      b64,
+			})
+		default:
+			log.Printf("daemon: convertFilesToInjected: skip unrepresentable file %q (mimetype=%s, has_url=%v)", f.Name, f.MimeType, f.URL != "")
+		}
+	}
+	return out
+}
+
+// downloadInjectedImageBase64 fetches a remote image URL in memory and
+// returns its base64-encoded body. Used by the mid-turn inject path which
+// can't reuse downloadOneFile's disk-+-cleanup flow (no cleanup hook).
+// Applies the same SSRF/Slack-rewrite/auth-header guards as downloadOneFile
+// and caps decoded bytes at maxInlineImageDecodedBytes to match Anthropic's
+// 5 MB inline-image ceiling (with a 4 MB safety margin via the 20 MB cap
+// used by the rest of the inline-image path).
+func downloadInjectedImageBase64(ctx context.Context, rawURL, authHeader string) (string, error) {
+	dlURL := slackDownloadURL(rawURL)
+	if err := urlValidator(dlURL); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dlURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("bad URL: %w", err)
+	}
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	httpClient := &http.Client{
+		Timeout: downloadTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			if err := urlValidator(req.URL.String()); err != nil {
+				return fmt.Errorf("redirect blocked: %w", err)
+			}
+			// Cross-host redirect handling. Cloud-supplied URLs aren't
+			// directly user-controlled, but a malicious 302 from a compromised
+			// upstream would otherwise leak the bot token to attacker.com.
+			//
+			// Two layers of leakage to defend against:
+			//
+			// 1. Stdlib's `Client.do` auto-copies the original request's
+			//    Authorization header onto the redirected request before
+			//    invoking CheckRedirect. The strip path is gated by two
+			//    checks: `reqs[0].URL.Host != req.URL.Host` (port-aware)
+			//    AND `!shouldCopyHeaderOnRedirect(...)` — the latter
+			//    compares via idnaASCIIFromURL (hostname-only, port-blind)
+			//    and returns true on hostname/subdomain match. So two
+			//    httptest servers on 127.0.0.1:A vs 127.0.0.1:B trip the
+			//    first check but pass the second, and stdlib silently
+			//    propagates Authorization. We must DELETE that header on
+			//    cross-host redirects, not merely refrain from re-setting.
+			// 2. The pre-existing custom block below explicitly re-applied the
+			//    original Authorization on every redirect, defeating stdlib's
+			//    same-hostname filter for genuine cross-domain redirects too.
+			//
+			// We compare URL.Host (with port) so the httptest case behaves as
+			// "cross-host". Same-host (including port) keeps the original
+			// Authorization; cross-host strips it.
+			if req.URL.Host == via[0].URL.Host {
+				if auth := via[0].Header.Get("Authorization"); auth != "" {
+					req.Header.Set("Authorization", auth)
+				}
+			} else {
+				req.Header.Del("Authorization")
+			}
+			return nil
+		},
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/html") {
+		return "", fmt.Errorf("got text/html response (auth may have failed)")
+	}
+	// Read with a hard limit slightly above the decoded cap so we can detect
+	// oversize via the (read > cap) check without buffering arbitrary bytes.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxInlineImageDecodedBytes)+1))
+	if err != nil {
+		return "", fmt.Errorf("read body: %w", err)
+	}
+	if len(data) > maxInlineImageDecodedBytes {
+		return "", fmt.Errorf("image exceeds %d-byte inline cap", maxInlineImageDecodedBytes)
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
 }
 
 // imageExtensions are sent as base64 image content blocks to the LLM.

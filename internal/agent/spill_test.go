@@ -176,7 +176,7 @@ func TestApplyAggregateCap_NoOpUnderCap(t *testing.T) {
 		{result: ToolResult{Content: strings.Repeat("c", 30_000)}},
 	}
 	// total = 90K < 200K cap
-	applyAggregateCap(results, dir, "test-sess")
+	applyAggregateCap(results, dir, "test-sess", nil)
 	for i, er := range results {
 		if len(er.result.Content) != 30_000 {
 			t.Errorf("result[%d] should be untouched (30K), got %d bytes", i, len(er.result.Content))
@@ -191,7 +191,7 @@ func TestApplyAggregateCap_NoOpForSmallBatch(t *testing.T) {
 	results := []toolExecResult{
 		{result: ToolResult{Content: strings.Repeat("a", 300_000)}},
 	}
-	applyAggregateCap(results, dir, "test-sess")
+	applyAggregateCap(results, dir, "test-sess", nil)
 	if len(results[0].result.Content) != 300_000 {
 		t.Errorf("single-element batch should be no-op, got %d bytes", len(results[0].result.Content))
 	}
@@ -206,7 +206,7 @@ func TestApplyAggregateCap_TenBy30K(t *testing.T) {
 	for i := range results {
 		results[i] = toolExecResult{result: ToolResult{Content: strings.Repeat("x", 30_000)}}
 	}
-	applyAggregateCap(results, dir, "test-sess-tenby30k")
+	applyAggregateCap(results, dir, "test-sess-tenby30k", nil)
 	total := 0
 	spilled := 0
 	for _, er := range results {
@@ -236,7 +236,7 @@ func TestApplyAggregateCap_MixedSizes(t *testing.T) {
 		{result: ToolResult{Content: strings.Repeat("d", 1_000)}}, // small, must not spill
 	}
 	// total = 241K > 200K
-	applyAggregateCap(results, dir, "test-sess-mixed")
+	applyAggregateCap(results, dir, "test-sess-mixed", nil)
 	// First three are eligible (>= minAggregateSpillSize), should be spilled in
 	// some order until total < 200K. The 1K one must remain literal.
 	if len(results[3].result.Content) != 1_000 {
@@ -267,7 +267,7 @@ func TestApplyAggregateCap_MultibyteUsesRunes(t *testing.T) {
 		{result: ToolResult{Content: cjk}},
 		{result: ToolResult{Content: cjk}},
 	}
-	applyAggregateCap(results, dir, "test-sess-cjk-under-cap")
+	applyAggregateCap(results, dir, "test-sess-cjk-under-cap", nil)
 	for i, er := range results {
 		if strings.HasPrefix(er.result.Content, "[Output saved to disk:") {
 			t.Errorf("result %d was spilled despite rune total (%d) < cap (%d) — byte-counting bug regressed",
@@ -293,7 +293,7 @@ func TestApplyAggregateCap_CooperatesWithPerResultSpill(t *testing.T) {
 	}
 	// total = 220K > 200K. Aggregate cap kicks in (per-result spill happens
 	// elsewhere in loop.go; this test only exercises the aggregate path).
-	applyAggregateCap(results, dir, "test-sess-coop")
+	applyAggregateCap(results, dir, "test-sess-coop", nil)
 	total := 0
 	for _, er := range results {
 		total += len(er.result.Content)
@@ -337,5 +337,43 @@ func TestContextResultMaxChars_UsesPerToolPolicy(t *testing.T) {
 	}
 	if got := contextResultMaxChars("grep", true, 30_000, policy); got != 60_000 {
 		t.Fatalf("cloud result should preserve cloud context limit, got %d", got)
+	}
+}
+
+// TestApplyPerResultSpill_SkipsUnlimitedTool: tools declaring
+// UnlimitedToolResultSizeChars (e.g. file_read) self-bound their output and
+// must NEVER be spilled — spilling would put a tmp file path in context, the
+// model would call file_read on it, and we'd loop. Regression for #161.
+func TestApplyPerResultSpill_SkipsUnlimitedTool(t *testing.T) {
+	big := strings.Repeat("x", 80_000) // > spillThreshold (50K)
+	policy := map[string]int{
+		"file_read": UnlimitedToolResultSizeChars,
+	}
+	got := applyPerResultSpill(big, "file_read", t.TempDir(), "sess1", policy)
+	if got != big {
+		t.Errorf("file_read with Unlimited policy must NOT spill; got len=%d (raw was %d)", len(got), len(big))
+	}
+	if strings.Contains(got, "Output saved to disk") {
+		t.Errorf("file_read result contains spill preview marker; should be passed through unchanged")
+	}
+}
+
+// TestApplyAggregateCap_SkipsUnlimitedTool: even when the per-result spill
+// path is fixed, the aggregate cap (200K) selects the largest result as the
+// next spill target. Without name-aware skipping, two file_read results
+// totalling 240K would get re-spilled in aggregate — same rehydration loop.
+// Regression for #161.
+func TestApplyAggregateCap_SkipsUnlimitedTool(t *testing.T) {
+	big := strings.Repeat("y", 120_000)
+	results := []toolExecResult{
+		{result: ToolResult{Content: big}, name: "file_read"},
+		{result: ToolResult{Content: big}, name: "file_read"},
+	}
+	policy := map[string]int{"file_read": UnlimitedToolResultSizeChars}
+	applyAggregateCap(results, t.TempDir(), "sess1", policy)
+	for i, r := range results {
+		if strings.Contains(r.result.Content, "Output saved to disk") {
+			t.Errorf("result[%d] was spilled despite being from an Unlimited tool", i)
+		}
 	}
 }

@@ -947,9 +947,8 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "session id required")
 		return
 	}
-	// 防止路径穿越
-	if id != filepath.Base(id) || strings.ContainsAny(id, `/\`) {
-		writeError(w, http.StatusBadRequest, "invalid session id")
+	if err := ValidateSessionID(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	agentName := r.URL.Query().Get("agent")
@@ -982,9 +981,8 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "session id required")
 		return
 	}
-	// Prevent path traversal — session IDs must be safe filenames.
-	if id != filepath.Base(id) || strings.ContainsAny(id, `/\`) {
-		writeError(w, http.StatusBadRequest, "invalid session id")
+	if err := ValidateSessionID(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	agentName := r.URL.Query().Get("agent")
@@ -1036,8 +1034,8 @@ func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "session id required")
 		return
 	}
-	if id != filepath.Base(id) || strings.ContainsAny(id, `/\`) {
-		writeError(w, http.StatusBadRequest, "invalid session id")
+	if err := ValidateSessionID(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	agentName := r.URL.Query().Get("agent")
@@ -1075,9 +1073,8 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "session id required")
 		return
 	}
-	// Prevent path traversal — session ID must be a safe filename.
-	if id != filepath.Base(id) || strings.ContainsAny(id, `/\`) {
-		writeError(w, http.StatusBadRequest, "invalid session id")
+	if err := ValidateSessionID(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var body struct {
@@ -1186,9 +1183,8 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "session id required")
 		return
 	}
-	// 防止路径穿越
-	if id != filepath.Base(id) || strings.ContainsAny(id, `/\`) {
-		writeError(w, http.StatusBadRequest, "invalid session id")
+	if err := ValidateSessionID(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1267,8 +1263,8 @@ func (s *Server) handleSessionSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "session id required")
 		return
 	}
-	if id != filepath.Base(id) {
-		writeError(w, http.StatusBadRequest, "invalid session id")
+	if err := ValidateSessionID(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	agentName := r.URL.Query().Get("agent")
@@ -1337,6 +1333,12 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	var req RunAgentRequest
 	if !decodeBody(w, r, &req) {
 		return
+	}
+	if req.SessionID != "" {
+		if err := ValidateSessionID(req.SessionID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if req.Source == "" {
 		req.Source = "kocoro"
