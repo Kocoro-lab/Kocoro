@@ -253,7 +253,11 @@ var daemonStartCmd = &cobra.Command{
 
 			// Try injecting into an active run on the same route.
 			if req.RouteKey != "" {
-				switch deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{Text: req.Text, CWD: req.CWD}) {
+				switch deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{
+					Text:  req.Text,
+					CWD:   req.CWD,
+					Files: daemon.ConvertFilesToInjected(msgCtx, req.Files),
+				}) {
 				case daemon.InjectOK:
 					// Message injected — running loop will incorporate it.
 					// Suppress the explicit ack on messaging platforms: the user's

@@ -641,8 +641,9 @@ type RunStatusHandler interface {
 // CWD is optional metadata used by higher layers to enforce immutable
 // project-context policies; the loop currently ignores it.
 type InjectedMessage struct {
-	Text string
-	CWD  string
+	Text  string
+	CWD   string
+	Files []InjectedFile // optional; empty for text-only injects (TUI keyboard, legacy callers)
 }
 
 type AgentLoop struct {
@@ -2475,28 +2476,29 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// Drain injected user messages (non-blocking).
 		// Multiple pending messages are batched into one user turn.
 		if a.injectCh != nil {
-			var injected []string
-		drain:
-			for {
-				select {
-				case msg := <-a.injectCh:
-					injected = append(injected, msg.Text)
-				default:
-					break drain
-				}
-			}
-			if len(injected) > 0 {
-				a.tracker.Enter(PhaseInjectingMessage)
-				combined := strings.Join(injected, "\n\n")
-				latestUserText = combined // track for deferred-tool continuation nudge
-				messages = append(messages, client.Message{
-					Role:    "user",
-					Content: client.NewTextContent("[New message from user]\n" + combined),
-				})
-				stampMessage()
-				a.injectedMessages = append(a.injectedMessages, injected...)
-				if a.handler != nil {
-					a.handler.OnText("")
+			if drained := drainInjected(a.injectCh); len(drained) > 0 {
+				if newMsg, ok := buildInjectedUserMessage(drained); ok {
+					a.tracker.Enter(PhaseInjectingMessage)
+					// latestUserText tracks the user-typed text for the deferred-tool
+					// continuation nudge — Files don't have a text equivalent, so
+					// only count text from each drained message.
+					var texts []string
+					for _, m := range drained {
+						if m.Text != "" {
+							texts = append(texts, m.Text)
+						}
+					}
+					latestUserText = strings.Join(texts, "\n\n")
+					messages = append(messages, newMsg)
+					stampMessage()
+					for _, m := range drained {
+						if m.Text != "" {
+							a.injectedMessages = append(a.injectedMessages, m.Text)
+						}
+					}
+					if a.handler != nil {
+						a.handler.OnText("")
+					}
 				}
 			}
 		}
