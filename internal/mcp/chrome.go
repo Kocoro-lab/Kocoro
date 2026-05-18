@@ -183,6 +183,12 @@ func MarkChromeUsed(ctx context.Context) {
 	ChromeUseLeaseFrom(ctx).MarkUsed()
 }
 
+// GlobalChromeTrackerActiveCountForTest exposes the global tracker count for
+// cross-package tests. Test-only — not part of the public API.
+func GlobalChromeTrackerActiveCountForTest() int {
+	return globalChromeTracker.activeCount()
+}
+
 // cdpMu serializes all EnsureChromeDebugPort calls to prevent concurrent
 // callers (boot, tool call, supervisor) from racing to launch/kill Chrome.
 var cdpMu sync.Mutex

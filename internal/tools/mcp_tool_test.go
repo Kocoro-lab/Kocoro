@@ -263,3 +263,62 @@ func (c *successCallToolClient) Close() error      { return nil }
 func (c *controllableCallToolClient) OnNotification(func(mcpgo.JSONRPCNotification)) {
 }
 func (c *successCallToolClient) OnNotification(func(mcpgo.JSONRPCNotification)) {}
+
+func TestMCPTool_PlaywrightDispatchMarksChromeUsed(t *testing.T) {
+	assertGlobalChromeTrackerClean(t)
+
+	ctx := mcp.WithChromeUseLease(context.Background())
+	lease := mcp.ChromeUseLeaseFrom(ctx)
+	if lease == nil {
+		t.Fatal("expected lease installed")
+	}
+	defer lease.ReleaseOnly() // panic-safe cleanup to keep global tracker clean
+
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command: "dummy",
+		Args:    []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+	})
+
+	tool := NewMCPTool("playwright", mcpgo.Tool{Name: "browser_navigate"}, mgr)
+
+	// Stub ensureChromeDebugPort so the dispatch path runs without needing
+	// real Chrome / network. CallTool will fail (no real MCP server) — we
+	// don't care; we only care that MarkChromeUsed ran on dispatch entry,
+	// BEFORE the failure path.
+	oldEnsure := ensureChromeDebugPort
+	ensureChromeDebugPort = func(int) error { return nil }
+	defer func() { ensureChromeDebugPort = oldEnsure }()
+
+	_, _ = tool.Run(ctx, `{"url":"about:blank"}`)
+
+	if got := mcp.GlobalChromeTrackerActiveCountForTest(); got < 1 {
+		t.Fatalf("expected playwright dispatch to mark chrome used, count=%d", got)
+	}
+}
+
+func TestMCPTool_NonPlaywrightDispatchDoesNotMarkChromeUsed(t *testing.T) {
+	assertGlobalChromeTrackerClean(t)
+
+	ctx := mcp.WithChromeUseLease(context.Background())
+
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("filesystem", mcp.MCPServerConfig{Command: "dummy"})
+
+	tool := NewMCPTool("filesystem", mcpgo.Tool{Name: "read_file"}, mgr)
+
+	_, _ = tool.Run(ctx, `{"path":"/tmp/x"}`)
+
+	if got := mcp.GlobalChromeTrackerActiveCountForTest(); got != 0 {
+		t.Fatalf("expected non-playwright dispatch to NOT mark chrome used, count=%d", got)
+	}
+}
+
+// assertGlobalChromeTrackerClean fails fast if a prior test leaked global
+// tracker state. Tests that exercise the global tracker must call this first.
+func assertGlobalChromeTrackerClean(t *testing.T) {
+	t.Helper()
+	if got := mcp.GlobalChromeTrackerActiveCountForTest(); got != 0 {
+		t.Fatalf("global chrome tracker leaked count=%d from a prior test", got)
+	}
+}
