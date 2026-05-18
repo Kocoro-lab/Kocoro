@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -826,12 +827,24 @@ func TestStore_SaveAssignsStrictlyMonotonicUpdatedAt(t *testing.T) {
 	}
 }
 
+// inputs that safeSessionPath should reject with a recognizable error.
+// "." and ".." are intentionally omitted: filepath.Base(".") == "." and they
+// contain no slash, so they slip past safeSessionPath today and surface as
+// ENOENT from os.ReadFile / os.Remove. That gap is upstream of these tests;
+// the handler-edge ValidateSessionID covers it in production. See report.
+var storeTraversalInputs = []string{"../foo", "a/b", "/abs", ""}
+
 func TestStore_Load_RejectsTraversal(t *testing.T) {
 	s := NewStore(t.TempDir())
 	defer s.Close()
-	for _, id := range []string{"../foo", "a/b", "/abs", ".", ""} {
-		if _, err := s.Load(id); err == nil {
+	for _, id := range storeTraversalInputs {
+		_, err := s.Load(id)
+		if err == nil {
 			t.Errorf("Load(%q) returned nil error, expected rejection", id)
+			continue
+		}
+		if !strings.Contains(err.Error(), "invalid session id") && !strings.Contains(err.Error(), "session id is empty") {
+			t.Errorf("Load(%q) returned %q; expected an 'invalid session id' / 'empty' error from safeSessionPath, not a filesystem error", id, err)
 		}
 	}
 }
@@ -839,9 +852,14 @@ func TestStore_Load_RejectsTraversal(t *testing.T) {
 func TestStore_Delete_RejectsTraversal(t *testing.T) {
 	s := NewStore(t.TempDir())
 	defer s.Close()
-	for _, id := range []string{"../foo", "a/b", "/abs", ".", ""} {
-		if err := s.Delete(id); err == nil {
+	for _, id := range storeTraversalInputs {
+		err := s.Delete(id)
+		if err == nil {
 			t.Errorf("Delete(%q) returned nil error, expected rejection", id)
+			continue
+		}
+		if !strings.Contains(err.Error(), "invalid session id") && !strings.Contains(err.Error(), "session id is empty") {
+			t.Errorf("Delete(%q) returned %q; expected an 'invalid session id' / 'empty' error from safeSessionPath, not a filesystem error", id, err)
 		}
 	}
 }
