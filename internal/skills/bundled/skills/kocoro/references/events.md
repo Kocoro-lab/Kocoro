@@ -17,7 +17,7 @@ Both paths funnel through `multiHandler` on the daemon side: the per-request HTT
 | `cloud_agent` | Shannon Cloud sub-agent status changes (started/thinking/completed). | Bus + per-request |
 | `cloud_progress` | Task-list progress (completed/total) for cloud-delegated turns. | Bus + per-request |
 | `cloud_plan` | Cloud research plan / updated plan / approved plan. | Bus + per-request |
-| `run_status` | Watchdog state: `idle_soft`, `idle_hard`, `llm_retry`. | Bus |
+| `run_status` | Run-level state changes: watchdog timeouts, output-cap truncation, compaction, etc. (see `run_status` section for full code list, non-exhaustive). | Bus |
 | `usage` | Per-LLM-call token and cost snapshot (on `OnUsage` boundary). | Bus |
 | `agent_reply` | Agent finished a turn (WS / schedule / Ptfrog sources). | Bus |
 | `agent_error` | Agent run failed. | Bus |
@@ -87,7 +87,20 @@ Emits once per `OnUsage` boundary (typically once per LLM call, not per token). 
 }
 ```
 
-`code` ∈ {`idle_soft`, `idle_hard`, `llm_retry`}. `detail` is human-readable and may encode the elapsed seconds or retry attempt count; consumers should extract with a tolerant regex rather than parse field-by-field.
+`code` is one of the values below. The list is **non-exhaustive**; consumers should treat an unknown `code` as informational rather than erroring out, and extract any numeric data from `detail` with a tolerant regex rather than parsing field-by-field.
+
+| `code` | Meaning |
+|---|---|
+| `idle_soft` | No LLM activity for the soft-idle threshold (default 90s). Detail typically encodes elapsed seconds and current phase. |
+| `idle_hard` | Hard-idle threshold reached; context was cancelled. Detail encodes elapsed seconds. |
+| `max_tokens_truncated` | Text-only response hit the output-token cap; continuation budget exhausted. |
+| `max_tokens_truncated_tool_call` | Trailing `tool_use` was cut off mid-emission; a synthetic `tool_result` was injected so the model can retry with smaller pieces. Detail encodes the recovery attempt count (e.g. `recovery 2/3`). |
+| `max_tokens_recovery_exhausted` | The model kept emitting truncated tool calls past the per-run recovery budget; the run is being force-stopped. |
+| `preflight_compaction` | Context was at 95%+ of the model's window; history was compacted before the LLM call. |
+| `preflight_user_truncate` | A single user message exceeded the preflight cap and was head+tail truncated before send. |
+| `context_bloat` | Tool-result content has dominated context; an inline nudge was added asking the model to summarize or stop. |
+| `context_window_autodetect` | The configured context window was overridden after the provider's `response.model` revealed a different family (e.g. 200K → 1M). |
+| `compaction_failed` | A compaction attempt failed; detail encodes the phase tag. |
 
 ### `cloud_agent` / `cloud_progress` / `cloud_plan`
 

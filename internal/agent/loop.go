@@ -1990,7 +1990,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		streamingText           strings.Builder // accumulates streaming deltas for cancel recovery
 		truncatedText           strings.Builder // accumulates text from max_tokens continuations
 		continuationCount       int
-		truncationRecoveryCount int // per-turn counter; see maxTruncationRecoveries
+		truncationRecoveryCount int // per-Run() (one user message); see maxTruncationRecoveries
 		afterCheckpoint         bool
 		checkpointDone          bool
 		nudges                  = newNudgeWindow(maxNudges, nudgeWindowIters)
@@ -3424,6 +3424,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				}
 				if exhausted {
 					worstAction = LoopForceStop
+					// Distinct from the synthetic tool_result content above: that
+					// is the *model*'s next-turn input; this is the force-stop
+					// synthesis turn's "reason" string. Two audiences, similar
+					// phrasing — keep both, don't dedupe.
 					worstMsg = fmt.Sprintf(
 						"Output token cap hit %d times in this turn — the model kept emitting tool calls larger than the single-response budget. Recovery exhausted.",
 						truncationRecoveryCount)
@@ -5236,6 +5240,9 @@ func looksLikeFabricatedToolCalls(text string) bool {
 
 // isMaxTokensTruncation returns true if the finish reason indicates the response
 // was cut short due to the output token limit. Different providers use different values.
+// Match is case-sensitive: Anthropic/OpenAI both ship lowercase today, and the Cloud
+// provider normalizes upstream. Swap to strings.EqualFold if a future backend ever
+// mixes case.
 func isMaxTokensTruncation(reason string) bool {
 	switch reason {
 	case "max_tokens", "length", "end_turn_max_tokens":
@@ -5253,6 +5260,11 @@ func isMaxTokensTruncation(reason string) bool {
 //
 // Pair with isMaxTokensTruncation(resp.FinishReason) to short-circuit dispatch
 // when the trailing tool_use was clipped by the output-token cap.
+//
+// Carve-out: "{}" is flagged even for tools with Required == nil. Today's
+// no-arg tools (e.g. think) are SkillExempt and never reach this branch. If
+// a future no-arg tool legitimately accepts "{}" + has no required fields,
+// add it to a small exempt set or pass info.Name through and check here.
 func argsLookTruncated(argsJSON string, info ToolInfo) bool {
 	s := strings.TrimSpace(argsJSON)
 	if s == "" || s == "{}" || s == "null" {
