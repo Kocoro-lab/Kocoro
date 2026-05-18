@@ -1942,6 +1942,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// silently truncating outputs.
 	const maxContinuations = 8 // cap max_tokens continuation attempts
 
+	// maxTruncationRecoveries caps per-turn recovery attempts for a trailing
+	// tool_use truncated by the output-token cap. We inject a synthetic
+	// tool_result and continue the loop so the model can split the work. If
+	// the model keeps emitting truncated calls past this many attempts in a
+	// single turn, the synthetic result still fires (preserves Anthropic's
+	// tool_use/tool_result pairing) but we set LoopForceStop so the existing
+	// force-stop turn ends the run gracefully. Further retries just burn the
+	// output budget at the same boundary.
+	const maxTruncationRecoveries = 3
+
 	// batch-tolerant set: bash + READ-verb MCP tool names + read-only local
 	// fan-out tools (file_read / glob / grep / directory_list). On these
 	// tools, the NoProgress detector applies a uniqueness gate so
@@ -1973,23 +1983,24 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 	}
 	var (
-		detector            = NewLoopDetector()
-		toolsUsed           = make(map[string]int)
-		totalToolCalls      int
-		lastText            string
-		streamingText       strings.Builder // accumulates streaming deltas for cancel recovery
-		truncatedText       strings.Builder // accumulates text from max_tokens continuations
-		continuationCount   int
-		afterCheckpoint     bool
-		checkpointDone      bool
-		nudges              = newNudgeWindow(maxNudges, nudgeWindowIters)
-		hallucinationNudges int
-		lastPromptTokens    int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
-		lastOutputTokens    int    // actual output tokens from last LLM response
-		compactionSummary   string // cached summary from compaction
-		compactionApplied   bool   // true once messages have been shaped
-		reactiveCompacted   bool   // true once reactive compaction fired (never resets)
-		summaryFailures     int    // consecutive summary failures; backs off after 3
+		detector                = NewLoopDetector()
+		toolsUsed               = make(map[string]int)
+		totalToolCalls          int
+		lastText                string
+		streamingText           strings.Builder // accumulates streaming deltas for cancel recovery
+		truncatedText           strings.Builder // accumulates text from max_tokens continuations
+		continuationCount       int
+		truncationRecoveryCount int // per-turn counter; see maxTruncationRecoveries
+		afterCheckpoint         bool
+		checkpointDone          bool
+		nudges                  = newNudgeWindow(maxNudges, nudgeWindowIters)
+		hallucinationNudges     int
+		lastPromptTokens        int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
+		lastOutputTokens        int    // actual output tokens from last LLM response
+		compactionSummary       string // cached summary from compaction
+		compactionApplied       bool   // true once messages have been shaped
+		reactiveCompacted       bool   // true once reactive compaction fired (never resets)
+		summaryFailures         int    // consecutive summary failures; backs off after 3
 		// lastSummaryFailureIter records the iteration of the most recent summary
 		// failure; summaryBackedOff measures the cool-off distance from this iter.
 		// Zero value is fine: the `summaryFailures >= maxSummaryFailures` guard
@@ -3369,21 +3380,53 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// file_write 0-byte incident — the validation guard fires but the
 			// model can't see *why* its own output was cut off). Synthetic result
 			// preserves tool_use/tool_result pairing for the Anthropic API.
+			//
+			// Recovery is capped at maxTruncationRecoveries per turn. The model
+			// gets that many "you were cut off — break it smaller" signals
+			// before we set LoopForceStop so the existing force-stop path
+			// takes over. We still emit the synthetic result on the exhausting
+			// attempt to preserve tool_use/tool_result pairing in the
+			// persisted transcript. Wording avoids apology/recap so the model
+			// doesn't burn the next turn on preamble.
 			if idx == len(toolCalls)-1 && isMaxTokensTruncation(resp.FinishReason) &&
 				argsLookTruncated(argsStr, tool.Info()) {
+				truncationRecoveryCount++
+				exhausted := truncationRecoveryCount > maxTruncationRecoveries
+
+				var content string
+				if exhausted {
+					content = fmt.Sprintf(
+						"[output_truncated] Output token cap hit again — this is truncation #%d in this turn, past the recovery budget of %d. Stopping the loop. Tell the user the requested output was too large to emit in one response and ask whether to retry with explicit chunking instructions.",
+						truncationRecoveryCount, maxTruncationRecoveries)
+				} else {
+					content = fmt.Sprintf(
+						"[output_truncated] Output token limit hit mid-tool-call (recovery %d/%d). The trailing call's arguments were truncated and it was NOT executed. Resume directly — no apology, no recap. Pick up where the cut happened by breaking the remaining work into smaller pieces (multiple smaller calls, or compose from files already on disk).",
+						truncationRecoveryCount, maxTruncationRecoveries)
+				}
+
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
-					result: ToolResult{
-						Content: "[output_truncated] Your response was cut off at the max output-token cap mid-tool-call, so this call's arguments arrived incomplete and it was NOT executed. Do NOT retry the same call — the truncation will repeat at the same boundary. Pivot: split the work into smaller pieces, have a script read large content from disk at runtime instead of inlining it, or use bash heredoc.",
-						IsError: true,
-					},
+					result: ToolResult{Content: content, IsError: true},
 				}
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
 				}
 				if rs, ok := a.handler.(RunStatusHandler); ok {
-					rs.OnRunStatus("max_tokens_truncated_tool_call",
-						fmt.Sprintf("trailing %s call truncated; synthetic error injected", fc.Name))
+					if exhausted {
+						rs.OnRunStatus("max_tokens_recovery_exhausted",
+							fmt.Sprintf("%s call truncated again after %d/%d recoveries; forcing stop",
+								fc.Name, truncationRecoveryCount, maxTruncationRecoveries))
+					} else {
+						rs.OnRunStatus("max_tokens_truncated_tool_call",
+							fmt.Sprintf("trailing %s call truncated (recovery %d/%d); synthetic error injected",
+								fc.Name, truncationRecoveryCount, maxTruncationRecoveries))
+					}
+				}
+				if exhausted {
+					worstAction = LoopForceStop
+					worstMsg = fmt.Sprintf(
+						"Output token cap hit %d times in this turn — the model kept emitting tool calls larger than the single-response budget. Recovery exhausted.",
+						truncationRecoveryCount)
 				}
 				continue
 			}

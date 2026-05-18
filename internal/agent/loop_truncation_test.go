@@ -169,6 +169,60 @@ func TestAgentLoop_MaxTokens_TruncatedNativeCallPreservesToolUseID(t *testing.T)
 	}
 }
 
+// When the model keeps emitting truncated trailing tool_use blocks past
+// maxTruncationRecoveries (=3), the loop must stop instead of burning
+// output budget at the same boundary indefinitely. The synthetic
+// tool_result still fires on the exhausting attempt so the persisted
+// transcript keeps the Anthropic tool_use/tool_result pairing intact.
+func TestAgentLoop_MaxTokens_RecoveryCounterExhausts(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		// First 4 calls each return a truncated trailing tool_use. After the
+		// 4th the recovery budget (3) is exhausted and the loop must trigger
+		// runForceStopTurn, which omits tools and asks for a final text reply.
+		// Call #5 (the force-stop turn) returns a clean end_turn so the loop
+		// can produce a non-empty final answer.
+		if callCount >= 5 {
+			json.NewEncoder(w).Encode(nativeResponse(
+				"output too large to emit in one response; please retry with chunked instructions",
+				"end_turn", nil, 20, 10))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("", "max_tokens",
+			toolCall("mock_tool", `{"path":"/tmp/x"}`), 10, 5))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	mt := &mockTool{name: "mock_tool", required: []string{"path", "content"}}
+	reg.Register(mt)
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "write a big file", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := mt.runs.Load(); got != 0 {
+		t.Errorf("mock_tool.Run was invoked %d times; expected 0 (every truncated call must be suppressed)", got)
+	}
+	// Upper bound: 4 truncated + 1 force-stop final + small slack for any
+	// unrelated synthesis call. Anything past ~7 means we did NOT actually
+	// force-stop and the model is in an infinite loop — the very bug we are
+	// guarding against.
+	if callCount > 7 {
+		t.Errorf("expected loop to force-stop after %d recoveries; got %d LLM calls (infinite loop?)",
+			3, callCount)
+	}
+	if callCount < 5 {
+		t.Errorf("expected at least 5 LLM calls (4 truncated + 1 force-stop final); got %d", callCount)
+	}
+	if result == "" {
+		t.Error("expected non-empty final response after force-stop, got empty")
+	}
+}
+
 // Same finish_reason but args are well-formed. Dispatch must proceed normally;
 // the suppression rule must not over-fire on calls that happened to land at
 // the cap with intact JSON. Guards against a regression that would silently
