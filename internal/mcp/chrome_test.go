@@ -955,3 +955,80 @@ func TestResetCDPProfileCloneRetriesTransientRemoveError(t *testing.T) {
 		t.Fatalf("expected chrome-cdp dir to be removed, got err=%v", err)
 	}
 }
+
+func TestChromeUseLease_MarkUsedIncrementsTracker(t *testing.T) {
+	tr := &chromeUseTracker{}
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("expected initial count 0, got %d", got)
+	}
+
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.MarkUsed()
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count 1 after MarkUsed, got %d", got)
+	}
+
+	// Idempotent: second MarkUsed must not increment again.
+	lease.MarkUsed()
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count still 1 after second MarkUsed, got %d", got)
+	}
+}
+
+func TestChromeUseLease_ReleaseOnlyDecrementsWithoutCallbacks(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.MarkUsed()
+	lease.ReleaseOnly()
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("expected count 0 after ReleaseOnly, got %d", got)
+	}
+
+	// Idempotent: second ReleaseOnly must not decrement below 0.
+	lease.ReleaseOnly()
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("expected count still 0 after second ReleaseOnly, got %d", got)
+	}
+}
+
+func TestChromeUseLease_ReleaseWithoutAcquireNoOp(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.ReleaseOnly()
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("expected count 0 when releasing without acquire, got %d", got)
+	}
+}
+
+func TestChromeUseLease_ReleaseBeforeAcquireDoesNotLeak(t *testing.T) {
+	// Regression test: in a naive sync.Once design, Release-then-MarkUsed
+	// could leave the counter at 1 forever. The state-machine design must
+	// either prevent the increment (MarkUsed sees released=true and no-ops)
+	// or pair it with a decrement.
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+
+	lease.ReleaseOnly()
+	lease.MarkUsed() // late acquire — must not leak the counter
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("counter leaked after Release-then-MarkUsed: got %d", got)
+	}
+}
+
+func TestChromeUseLease_RaceAcquireRelease(t *testing.T) {
+	// Stress: launch many goroutines that race MarkUsed vs ReleaseOnly across
+	// many fresh leases. Each lease's final counter contribution must be 0.
+	const leases = 200
+	tr := &chromeUseTracker{}
+	var wg sync.WaitGroup
+	for range leases {
+		lease := newChromeUseLeaseWithTracker(tr)
+		wg.Add(2)
+		go func() { defer wg.Done(); lease.MarkUsed() }()
+		go func() { defer wg.Done(); lease.ReleaseOnly() }()
+	}
+	wg.Wait()
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("counter leaked under MarkUsed/Release race: got %d", got)
+	}
+}

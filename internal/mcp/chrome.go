@@ -29,6 +29,91 @@ const (
 	LegacyCDPPort = 9222
 )
 
+// chromeUseTracker counts in-flight Runs that are using the daemon-owned
+// dedicated CDP Chrome. tracker.mu serializes ALL state transitions: counter
+// increments, decrements, and per-lease acquired/released flag flips. Task 3
+// extends final release to perform disconnect + stop while still holding this
+// lock, so concurrent acquires from new Runs block until teardown completes and
+// the next first tool call relaunches Chrome cleanly via EnsureChromeDebugPort.
+type chromeUseTracker struct {
+	mu    sync.Mutex
+	count int
+}
+
+var globalChromeTracker = &chromeUseTracker{}
+
+func (t *chromeUseTracker) activeCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.count
+}
+
+// ChromeUseLease is the per-Run handle to globalChromeTracker.
+//
+// State machine (all transitions under tracker.mu):
+//   - initial: acquired=false, released=false
+//   - MarkUsed when !acquired && !released: counter++, acquired=true
+//   - MarkUsed when acquired || released:   no-op (idempotent or post-release)
+//   - Release  when !released && acquired:  counter--, released=true
+//   - Release  when !released && !acquired: released=true (no counter change)
+//   - Release  when released:               no-op (idempotent)
+//
+// The "MarkUsed when released" no-op rule is what prevents the
+// release-before-acquire counter leak: after Release commits, late MarkUsed
+// calls silently drop. In production this can't happen because MarkUsed runs
+// during the Run (under tool dispatch) and Release runs only in the defer
+// after RunAgent returns — but the safety net is present.
+type ChromeUseLease struct {
+	tracker  *chromeUseTracker
+	acquired bool // protected by tracker.mu
+	released bool // protected by tracker.mu
+}
+
+// NewChromeUseLease returns a lease bound to the global tracker.
+func NewChromeUseLease() *ChromeUseLease {
+	return newChromeUseLeaseWithTracker(globalChromeTracker)
+}
+
+// newChromeUseLeaseWithTracker is the test seam — wires a lease to a specific
+// tracker. Production code uses the global tracker via NewChromeUseLease.
+func newChromeUseLeaseWithTracker(tr *chromeUseTracker) *ChromeUseLease {
+	return &ChromeUseLease{tracker: tr}
+}
+
+// MarkUsed acquires the lease on first call; subsequent calls (and calls
+// after Release) are no-ops. Safe to call from every playwright tool dispatch
+// in a Run.
+func (l *ChromeUseLease) MarkUsed() {
+	if l == nil {
+		return
+	}
+	l.tracker.mu.Lock()
+	defer l.tracker.mu.Unlock()
+	if l.acquired || l.released {
+		return
+	}
+	l.tracker.count++
+	l.acquired = true
+}
+
+// ReleaseOnly decrements the tracker (if MarkUsed was called) without running
+// any teardown callbacks. Used by cleanup paths that should release the lease
+// but skip teardown by config (e.g. keep_alive=true). Idempotent.
+func (l *ChromeUseLease) ReleaseOnly() {
+	if l == nil {
+		return
+	}
+	l.tracker.mu.Lock()
+	defer l.tracker.mu.Unlock()
+	if l.released {
+		return
+	}
+	l.released = true
+	if l.acquired {
+		l.tracker.count--
+	}
+}
+
 // cdpMu serializes all EnsureChromeDebugPort calls to prevent concurrent
 // callers (boot, tool call, supervisor) from racing to launch/kill Chrome.
 var cdpMu sync.Mutex
