@@ -141,6 +141,70 @@ func TestDownloadInjectedImageBase64_RedirectCapped(t *testing.T) {
 	}
 }
 
+func TestDownloadInjectedImageBase64_StripsAuthOnCrossHostRedirect(t *testing.T) {
+	skipURLValidation(t)
+	// Second server records whether the Authorization header arrives on the
+	// redirected request. Two distinct httptest.Servers share 127.0.0.1 but
+	// listen on different ports — using URL.Host (with port) for the same-
+	// host check makes this register as a cross-host redirect.
+	var gotAuthOnSecond string
+	var secondHit bool
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHit = true
+		gotAuthOnSecond = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte("img"))
+	}))
+	defer second.Close()
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, second.URL, http.StatusFound)
+	}))
+	defer first.Close()
+	_, err := downloadInjectedImageBase64(context.Background(), first.URL, "Bearer secret-token")
+	if err != nil {
+		t.Fatalf("download failed: %v", err)
+	}
+	if !secondHit {
+		t.Fatal("expected second server to be hit after redirect")
+	}
+	if gotAuthOnSecond != "" {
+		t.Errorf("Authorization header leaked across hosts: got %q, want \"\"", gotAuthOnSecond)
+	}
+}
+
+func TestDownloadInjectedImageBase64_KeepsAuthOnSameHostRedirect(t *testing.T) {
+	skipURLValidation(t)
+	// Single httptest server with two paths so the redirect stays on the
+	// same host:port — exercises the auth-preserved branch of the same-host
+	// check.
+	var gotAuthOnRedirect string
+	var redirected bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/start":
+			http.Redirect(w, r, "/final", http.StatusFound)
+		case "/final":
+			redirected = true
+			gotAuthOnRedirect = r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "image/png")
+			w.Write([]byte("img"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	_, err := downloadInjectedImageBase64(context.Background(), srv.URL+"/start", "Bearer secret-token")
+	if err != nil {
+		t.Fatalf("download failed: %v", err)
+	}
+	if !redirected {
+		t.Fatal("expected /final to be hit after same-host redirect")
+	}
+	if gotAuthOnRedirect != "Bearer secret-token" {
+		t.Errorf("Authorization should pass through on same-host redirect; got %q", gotAuthOnRedirect)
+	}
+}
+
 func TestDownloadInjectedImageBase64_HTMLBodyRejected(t *testing.T) {
 	skipURLValidation(t)
 	// Slack/Feishu auth-failure pattern: 200 OK with text/html login page.

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -114,6 +115,16 @@ func applyAggregateCap(execResults []toolExecResult, shannonDir, sessionID strin
 			}
 		}
 		if maxIdx == -1 {
+			// Dirty exit: all spill-eligible candidates already shrunk, but the
+			// aggregate cap is still breached. This happens when the remaining
+			// content lives entirely in Unlimited tools (e.g. multiple file_read
+			// results). The per-tool 500K hard cap bounds each one, but their
+			// SUM can still inflate; surface a breadcrumb so cache-pressure
+			// spikes have a paper trail.
+			if total > aggregateCapThreshold {
+				log.Printf("agent: applyAggregateCap dirty exit: total=%d > cap=%d (no spillable candidates left — only Unlimited tools remain)",
+					total, aggregateCapThreshold)
+			}
 			return // nothing left worth spilling
 		}
 		original := execResults[maxIdx].result.Content

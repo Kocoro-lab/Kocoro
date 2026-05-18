@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
@@ -68,10 +69,14 @@ const fileReadHardCapRunes = 500_000
 // a marker so the model knows the slice was clipped. Applied only on the
 // text-return path; image and PDF return ImageBlocks instead of strings.
 func applyFileReadHardCap(content string) string {
-	runes := []rune(content)
-	if len(runes) <= fileReadHardCapRunes {
+	// Gate via RuneCountInString to avoid materializing the []rune slice on
+	// every read. In steady state fileReadMaxTokens (~75K runes) caps output
+	// well below fileReadHardCapRunes (500K), so the cap never trips and the
+	// rune allocation was pure waste — ~4 bytes/rune × every read.
+	if utf8.RuneCountInString(content) <= fileReadHardCapRunes {
 		return content
 	}
+	runes := []rune(content)
 	head := string(runes[:fileReadHardCapRunes])
 	return head + fmt.Sprintf(
 		"\n\n[file_read: output truncated at %d runes (original %d); use offset/limit to read more]",

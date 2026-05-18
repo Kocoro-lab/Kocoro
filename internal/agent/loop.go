@@ -688,7 +688,6 @@ type AgentLoop struct {
 	sessionCWD       string      // session-scoped working directory; set by runner/TUI before Run()
 	deltaProvider    DeltaProvider
 	injectCh         chan InjectedMessage
-	injectedMessages []string         // messages injected during the last Run(); cleared on each Run() call
 	runMessages      []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
 	runMsgInjected   []bool           // parallel to runMessages: true = system-injected guardrail/nudge
 	runMsgTimestamps []time.Time      // parallel to runMessages: when each message was created
@@ -1095,12 +1094,6 @@ func (a *AgentLoop) SetDeltaProvider(dp DeltaProvider) {
 	a.deltaProvider = dp
 }
 
-// InjectedMessages returns the user messages that were injected during the
-// last Run() call. Callers should persist these to session history.
-func (a *AgentLoop) InjectedMessages() []string {
-	return a.injectedMessages
-}
-
 // RunMessages returns the conversation messages accumulated during the last
 // Run() call, excluding the system prompt and pre-existing history. This
 // includes the user prompt, all assistant responses (with tool_use blocks),
@@ -1462,7 +1455,6 @@ func reactiveSummaryInput(messages []client.Message, priorSummary string) []clie
 }
 
 func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []client.ContentBlock, history []client.Message) (string, *TurnUsage, error) {
-	a.injectedMessages = nil // reset for this run
 	a.runMessages = nil      // reset for this run
 	a.runMsgInjected = nil   // reset for this run
 	a.runMsgTimestamps = nil // reset for this run
@@ -2491,11 +2483,6 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					latestUserText = strings.Join(texts, "\n\n")
 					messages = append(messages, newMsg)
 					stampMessage()
-					for _, m := range drained {
-						if m.Text != "" {
-							a.injectedMessages = append(a.injectedMessages, m.Text)
-						}
-					}
 					if a.handler != nil {
 						a.handler.OnText("")
 					}

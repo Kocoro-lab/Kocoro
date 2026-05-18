@@ -294,8 +294,33 @@ func downloadInjectedImageBase64(ctx context.Context, rawURL, authHeader string)
 			if err := urlValidator(req.URL.String()); err != nil {
 				return fmt.Errorf("redirect blocked: %w", err)
 			}
-			if auth := via[0].Header.Get("Authorization"); auth != "" {
-				req.Header.Set("Authorization", auth)
+			// Cross-host redirect handling. Cloud-supplied URLs aren't
+			// directly user-controlled, but a malicious 302 from a compromised
+			// upstream would otherwise leak the bot token to attacker.com.
+			//
+			// Two layers of leakage to defend against:
+			//
+			// 1. Stdlib's `Client.do` auto-copies the original request's
+			//    Authorization header onto the redirected request before
+			//    invoking CheckRedirect, gated by shouldCopyHeaderOnRedirect
+			//    which uses url.Hostname() (port-blind). Two httptest servers
+			//    on 127.0.0.1:A and 127.0.0.1:B share a hostname, so stdlib
+			//    silently propagates Authorization across them. We must DELETE
+			//    that header on cross-host redirects, not merely refrain from
+			//    re-setting it.
+			// 2. The pre-existing custom block below explicitly re-applied the
+			//    original Authorization on every redirect, defeating stdlib's
+			//    same-hostname filter for genuine cross-domain redirects too.
+			//
+			// We compare URL.Host (with port) so the httptest case behaves as
+			// "cross-host". Same-host (including port) keeps the original
+			// Authorization; cross-host strips it.
+			if req.URL.Host == via[0].URL.Host {
+				if auth := via[0].Header.Get("Authorization"); auth != "" {
+					req.Header.Set("Authorization", auth)
+				}
+			} else {
+				req.Header.Del("Authorization")
 			}
 			return nil
 		},
