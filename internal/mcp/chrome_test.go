@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -953,5 +954,391 @@ func TestResetCDPProfileCloneRetriesTransientRemoveError(t *testing.T) {
 	}
 	if _, err := os.Stat(cdpRoot); !os.IsNotExist(err) {
 		t.Fatalf("expected chrome-cdp dir to be removed, got err=%v", err)
+	}
+}
+
+func TestChromeUseLease_MarkUsedIncrementsTracker(t *testing.T) {
+	tr := &chromeUseTracker{}
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("expected initial count 0, got %d", got)
+	}
+
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.MarkUsed()
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count 1 after MarkUsed, got %d", got)
+	}
+
+	// Idempotent: second MarkUsed must not increment again.
+	lease.MarkUsed()
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count still 1 after second MarkUsed, got %d", got)
+	}
+}
+
+func TestChromeUseLease_ReleaseOnlyDecrementsWithoutCallbacks(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.MarkUsed()
+	lease.ReleaseOnly()
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("expected count 0 after ReleaseOnly, got %d", got)
+	}
+
+	// Idempotent: second ReleaseOnly must not decrement below 0.
+	lease.ReleaseOnly()
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("expected count still 0 after second ReleaseOnly, got %d", got)
+	}
+}
+
+func TestChromeUseLease_ReleaseWithoutAcquireNoOp(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.ReleaseOnly()
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("expected count 0 when releasing without acquire, got %d", got)
+	}
+}
+
+func TestChromeUseLease_ReleaseBeforeAcquireDoesNotLeak(t *testing.T) {
+	// Regression test: in a naive sync.Once design, Release-then-MarkUsed
+	// could leave the counter at 1 forever. The state-machine design must
+	// either prevent the increment (MarkUsed sees released=true and no-ops)
+	// or pair it with a decrement.
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+
+	lease.ReleaseOnly()
+	lease.MarkUsed() // late acquire — must not leak the counter
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("counter leaked after Release-then-MarkUsed: got %d", got)
+	}
+}
+
+func TestChromeUseLease_RaceAcquireRelease(t *testing.T) {
+	// Stress: launch many goroutines that race MarkUsed vs ReleaseOnly across
+	// many fresh leases. Each lease's final counter contribution must be 0.
+	const leases = 200
+	tr := &chromeUseTracker{}
+	var wg sync.WaitGroup
+	for range leases {
+		lease := newChromeUseLeaseWithTracker(tr)
+		wg.Add(2)
+		go func() { defer wg.Done(); lease.MarkUsed() }()
+		go func() { defer wg.Done(); lease.ReleaseOnly() }()
+	}
+	wg.Wait()
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("counter leaked under MarkUsed/Release race: got %d", got)
+	}
+}
+
+func TestMarkChromeUsed_ViaContextLease(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	ctx := context.WithValue(context.Background(), chromeLeaseKey{}, lease)
+
+	MarkChromeUsed(ctx)
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count 1 after MarkChromeUsed via ctx, got %d", got)
+	}
+
+	// Calling MarkChromeUsed on a ctx without a lease is a safe no-op.
+	MarkChromeUsed(context.Background())
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count still 1, got %d", got)
+	}
+}
+
+func TestChromeUseLeaseFrom_MissingReturnsNil(t *testing.T) {
+	if got := ChromeUseLeaseFrom(context.Background()); got != nil {
+		t.Fatalf("expected nil for ctx without lease, got %v", got)
+	}
+}
+
+func TestWithChromeUseLease_InstallsFreshLease(t *testing.T) {
+	ctx := WithChromeUseLease(context.Background())
+	lease := ChromeUseLeaseFrom(ctx)
+	if lease == nil {
+		t.Fatal("expected lease installed on ctx, got nil")
+	}
+	if lease.tracker != globalChromeTracker {
+		t.Fatal("expected lease bound to globalChromeTracker")
+	}
+}
+
+func TestReleaseAndMaybeTeardown_LastReleaseTriggersCallbacks(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.MarkUsed()
+
+	disconnectCalls := 0
+	stopCalls := 0
+	disconnect := func() { disconnectCalls++ }
+	stop := func(ctx context.Context) error { stopCalls++; return nil }
+
+	torndown, err := lease.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !torndown {
+		t.Fatal("expected torndown=true")
+	}
+	if disconnectCalls != 1 || stopCalls != 1 {
+		t.Fatalf("expected one call each, got disconnect=%d stop=%d", disconnectCalls, stopCalls)
+	}
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("expected count 0 after teardown, got %d", got)
+	}
+}
+
+func TestReleaseAndMaybeTeardown_NotLastReleaseSkipsCallbacks(t *testing.T) {
+	tr := &chromeUseTracker{}
+	leaseA := newChromeUseLeaseWithTracker(tr)
+	leaseB := newChromeUseLeaseWithTracker(tr)
+	leaseA.MarkUsed()
+	leaseB.MarkUsed()
+
+	disconnectCalls := 0
+	stopCalls := 0
+	disconnect := func() { disconnectCalls++ }
+	stop := func(ctx context.Context) error { stopCalls++; return nil }
+
+	torndown, err := leaseA.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if torndown {
+		t.Fatal("expected torndown=false when another lease still holds")
+	}
+	if disconnectCalls != 0 || stopCalls != 0 {
+		t.Fatalf("expected no callbacks, got disconnect=%d stop=%d", disconnectCalls, stopCalls)
+	}
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count 1, got %d", got)
+	}
+
+	// Second lease's release triggers teardown.
+	torndown, _ = leaseB.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+	if !torndown {
+		t.Fatal("expected torndown=true on final release")
+	}
+	if disconnectCalls != 1 || stopCalls != 1 {
+		t.Fatalf("expected one call each after final release, got disconnect=%d stop=%d", disconnectCalls, stopCalls)
+	}
+}
+
+func TestReleaseAndMaybeTeardown_HoldsLockAcrossStop(t *testing.T) {
+	tr := &chromeUseTracker{}
+	leaseA := newChromeUseLeaseWithTracker(tr)
+	leaseA.MarkUsed()
+
+	stopStarted := make(chan struct{})
+	stopRelease := make(chan struct{})
+	stop := func(ctx context.Context) error {
+		close(stopStarted)
+		<-stopRelease
+		return nil
+	}
+	disconnect := func() {}
+
+	// Release on a goroutine — it will block inside stop().
+	releaseDone := make(chan struct{})
+	go func() {
+		_, _ = leaseA.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+		close(releaseDone)
+	}()
+
+	<-stopStarted
+
+	// While stop() is blocked, a concurrent MarkUsed on a new lease must wait —
+	// it competes for tracker.mu, which ReleaseAndMaybeTeardown holds.
+	acquireDone := make(chan struct{})
+	leaseB := newChromeUseLeaseWithTracker(tr)
+	go func() {
+		leaseB.MarkUsed()
+		close(acquireDone)
+	}()
+
+	select {
+	case <-acquireDone:
+		t.Fatal("MarkUsed returned while stop was still running — lock not held")
+	case <-time.After(150 * time.Millisecond):
+		// Expected: acquire is blocked behind the held mutex.
+	}
+
+	close(stopRelease)
+	<-releaseDone
+	<-acquireDone
+
+	// After stop completed and lock dropped, leaseB's MarkUsed incremented.
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("expected count 1 after relaunch acquire, got %d", got)
+	}
+}
+
+func TestReleaseAndMaybeTeardown_IdempotentDoubleRelease(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.MarkUsed()
+
+	calls := 0
+	disconnect := func() { calls++ }
+	stop := func(ctx context.Context) error { calls++; return nil }
+
+	_, _ = lease.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+	_, _ = lease.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+
+	if calls != 2 {
+		t.Fatalf("expected exactly 2 total callback invocations (1 disconnect + 1 stop), got %d", calls)
+	}
+}
+
+func TestReleaseAndMaybeTeardown_PropagatesStopError(t *testing.T) {
+	tr := &chromeUseTracker{}
+	lease := newChromeUseLeaseWithTracker(tr)
+	lease.MarkUsed()
+
+	wantErr := errors.New("boom")
+	disconnect := func() {}
+	stop := func(ctx context.Context) error { return wantErr }
+
+	torndown, err := lease.ReleaseAndMaybeTeardown(disconnect, stop, context.Background())
+	if !torndown {
+		t.Fatal("expected torndown=true even on stop error")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped wantErr, got %v", err)
+	}
+}
+
+func TestStopCDPChromeAndWait_NoOpWhenChromeNotRunning(t *testing.T) {
+	home := t.TempDir()
+	// Pre-write a stale PID file to verify it gets cleaned up.
+	_ = os.MkdirAll(filepath.Join(home, ".shannon"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp.pid"), []byte("99999\n"), 0o600)
+
+	fe := &fakeChromeExec{}
+	installChromeTestHooks(t, home, fe.command, func() bool { return false }, func() string { return "" })
+
+	if err := StopCDPChromeAndWait(context.Background()); err != nil {
+		t.Fatalf("expected nil for not-running Chrome, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".shannon", "chrome-cdp.pid")); !os.IsNotExist(err) {
+		t.Fatalf("expected stale PID file removed, stat err=%v", err)
+	}
+	for _, call := range fe.snapshotCalls() {
+		if strings.HasPrefix(call, "pkill ") || strings.HasPrefix(call, "kill ") {
+			t.Fatalf("expected no signal sent, got %q", call)
+		}
+	}
+}
+
+func TestStopCDPChromeAndWait_DiesOnTerm(t *testing.T) {
+	home := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(home, ".shannon"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp.pid"), []byte("12345\n"), 0o600)
+
+	// Alive=true on first poll, false thereafter.
+	aliveCalls := 0
+	aliveFn := func() bool {
+		aliveCalls++
+		return aliveCalls <= 1
+	}
+
+	fe := &fakeChromeExec{}
+	installChromeTestHooks(t, home, fe.command, aliveFn, func() string { return "12345" })
+
+	if err := StopCDPChromeAndWait(context.Background()); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".shannon", "chrome-cdp.pid")); !os.IsNotExist(err) {
+		t.Fatalf("expected PID file removed, stat err=%v", err)
+	}
+	for _, call := range fe.snapshotCalls() {
+		if strings.Contains(call, "kill -9") {
+			t.Fatalf("expected no SIGKILL, got %q", call)
+		}
+	}
+}
+
+func TestStopCDPChromeAndWait_EscalatesToKill(t *testing.T) {
+	home := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(home, ".shannon"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp.pid"), []byte("12345\n"), 0o600)
+
+	// Alive until the SIGKILL fake-fires: poll counter > N flips it dead.
+	killSeen := false
+	aliveFn := func() bool { return !killSeen }
+
+	fe := &fakeChromeExec{kill9OK: true}
+	// Wrap command to flip killSeen when we see kill -9.
+	origCmd := fe.command
+	wrappedCmd := func(name string, args ...string) *exec.Cmd {
+		if name == "kill" && len(args) >= 1 && args[0] == "-9" {
+			killSeen = true
+		}
+		return origCmd(name, args...)
+	}
+	installChromeTestHooks(t, home, wrappedCmd, aliveFn, func() string { return "12345" })
+
+	if err := StopCDPChromeAndWait(context.Background()); err != nil {
+		t.Fatalf("expected nil after SIGKILL escalation, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".shannon", "chrome-cdp.pid")); !os.IsNotExist(err) {
+		t.Fatalf("expected PID file removed after kill, stat err=%v", err)
+	}
+	sawKill := false
+	for _, call := range fe.snapshotCalls() {
+		if strings.Contains(call, "kill -9 12345") {
+			sawKill = true
+			break
+		}
+	}
+	if !sawKill {
+		t.Fatalf("expected SIGKILL on pid 12345 in calls: %v", fe.snapshotCalls())
+	}
+}
+
+func TestStopCDPChromeAndWait_PreservesPIDFileWhenChromeSurvivesKill(t *testing.T) {
+	home := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(home, ".shannon"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp.pid"), []byte("12345\n"), 0o600)
+
+	// Alive returns true forever — Chrome is unkillable.
+	fe := &fakeChromeExec{}
+	installChromeTestHooks(t, home, fe.command, func() bool { return true }, func() string { return "12345" })
+
+	err := StopCDPChromeAndWait(context.Background())
+	if err == nil {
+		t.Fatal("expected error when Chrome survives SIGKILL")
+	}
+	// PID file must NOT be removed — matches CleanupOrphanedCDPChrome contract.
+	if _, statErr := os.Stat(filepath.Join(home, ".shannon", "chrome-cdp.pid")); statErr != nil {
+		t.Fatalf("expected PID file preserved, stat err=%v", statErr)
+	}
+}
+
+func TestStopCDPChromeAndWait_ContextCancellationStopsPolling(t *testing.T) {
+	home := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(home, ".shannon"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp.pid"), []byte("12345\n"), 0o600)
+
+	fe := &fakeChromeExec{}
+	installChromeTestHooks(t, home, fe.command, func() bool { return true }, func() string { return "12345" })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled
+
+	start := time.Now()
+	err := StopCDPChromeAndWait(ctx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error on cancelled ctx with surviving Chrome")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("expected fast return on pre-cancelled ctx, took %v", elapsed)
 	}
 }

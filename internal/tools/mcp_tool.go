@@ -118,6 +118,7 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	// server improvise its own temporary browser.
 	if t.serverName == "playwright" {
 		if cfg, ok := t.manager.ConfigFor(t.serverName); ok && isPlaywrightCDPMode(cfg) {
+			mcp.MarkChromeUsed(ctx)
 			port := playwrightCDPPort(cfg)
 			if !t.manager.IsConnected(t.serverName) || shouldPreflightChromeForTool(port) {
 				if err := ensureChromeDebugPort(port); err != nil {

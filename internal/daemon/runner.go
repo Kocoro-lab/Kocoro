@@ -39,7 +39,7 @@ var (
 	disconnectPlaywrightNowFn = func(mgr *mcp.ClientManager) {
 		mgr.Disconnect("playwright")
 	}
-	stopPlaywrightChromeFn = mcp.StopCDPChrome
+	stopPlaywrightChromeAndWaitFn = mcp.StopCDPChromeAndWait
 )
 
 // RequestContentBlock represents a content block in the POST /message request.
@@ -607,18 +607,71 @@ func (d *ServerDeps) RebuildLayers() (*agent.ToolRegistry, []agent.Tool, []agent
 	return bl, gw, po, mgr
 }
 
-func cleanupPlaywrightAfterTurn(mgr *mcp.ClientManager) {
+// cleanupPlaywrightAfterTurn runs at the end of every RunAgent invocation
+// (via defer). Behavior depends on three orthogonal factors: the playwright
+// MCP config (CDP vs stdio), the keep_alive flag, and whether this Run
+// actually used the browser (tracked via mcp.ChromeUseLease on ctx).
+//
+// CDP path: gated on browser-was-used. Counter ALWAYS releases (no leak on
+// keep_alive). When the last browser-using Run releases its lease, disconnect
+// Playwright + blocking-stop Chrome atomically under the tracker mutex so
+// concurrent acquires from new Runs wait until teardown finishes.
+//
+// Non-CDP path: idle-disconnect schedules every Run regardless of browser-use
+// (preserves existing behavior). keep_alive=true short-circuits as before.
+func cleanupPlaywrightAfterTurn(ctx context.Context, mgr *mcp.ClientManager) {
+	lease := mcp.ChromeUseLeaseFrom(ctx)
 	if mgr == nil {
+		if lease != nil {
+			lease.ReleaseOnly()
+		}
 		return
 	}
 	cfg, ok := mgr.ConfigFor("playwright")
-	if !ok || cfg.KeepAlive {
+	if !ok {
+		if lease != nil {
+			lease.ReleaseOnly()
+		}
 		return
 	}
+
 	if mcp.IsPlaywrightCDPMode(cfg) {
-		disconnectPlaywrightNowFn(mgr)
-		stopPlaywrightChromeFn()
-		log.Printf("daemon: Playwright on-demand teardown completed")
+		if cfg.KeepAlive {
+			// Release the lease even on keep_alive so the counter cannot leak;
+			// no teardown by config.
+			if lease != nil {
+				lease.ReleaseOnly()
+			}
+			return
+		}
+		if lease == nil {
+			// Defensive: no lease => no browser use this Run, nothing to release.
+			return
+		}
+		// Fresh background context — the request ctx may already be cancelled
+		// on error/timeout paths, but cleanup must still complete.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		torndown, err := lease.ReleaseAndMaybeTeardown(
+			func() { disconnectPlaywrightNowFn(mgr) },
+			stopPlaywrightChromeAndWaitFn,
+			cleanupCtx,
+		)
+		if torndown {
+			log.Printf("daemon: Playwright on-demand teardown completed")
+		}
+		if err != nil {
+			log.Printf("daemon: Playwright teardown error: %v", err)
+		}
+		return
+	}
+
+	// Non-CDP path: unchanged behavior for keep_alive=true; idle-disconnect
+	// schedules for keep_alive=false on every turn regardless of browser-use.
+	if lease != nil {
+		lease.ReleaseOnly()
+	}
+	if cfg.KeepAlive {
 		return
 	}
 	disconnectPlaywrightAfterIdleFn(mgr, 5*time.Minute)
@@ -665,6 +718,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if cfg == nil || deps.GW == nil || deps.SessionCache == nil {
 		return nil, fmt.Errorf("daemon not fully configured")
 	}
+	// Install ChromeUseLease on ctx before any tool dispatch happens. Defer the
+	// same end-of-turn manager lookup the success-path cleanup used, so reloads
+	// during a turn keep the existing cleanup semantics.
+	ctx = mcp.WithChromeUseLease(ctx)
+	defer func() {
+		_, _, _, mgr := deps.RebuildLayers()
+		cleanupPlaywrightAfterTurn(ctx, mgr)
+	}()
 	if sup != nil {
 		// Cancel any pending idle disconnect — a new turn is starting.
 		if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
@@ -1593,11 +1654,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 	log.Printf("daemon: reply to %s (%d tokens, $%.4f)", agentName, reportedUsage.TotalTokens, reportedUsage.CostUSD)
-
-	// Respect the keep_alive toggle after each completed turn.
-	if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
-		cleanupPlaywrightAfterTurn(mgr)
-	}
 
 	// On save failure, blank SessionID so HTTP/SSE clients can't click through
 	// to a session that isn't on disk (matches the agent_reply gate above).
