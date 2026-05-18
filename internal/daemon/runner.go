@@ -710,6 +710,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if cfg == nil || deps.GW == nil || deps.SessionCache == nil {
 		return nil, fmt.Errorf("daemon not fully configured")
 	}
+	// Install ChromeUseLease on ctx before any tool dispatch happens. Defer the
+	// same end-of-turn manager lookup the success-path cleanup used, so reloads
+	// during a turn keep the existing cleanup semantics.
+	ctx = mcp.WithChromeUseLease(ctx)
+	defer func() {
+		if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
+			cleanupPlaywrightAfterTurn(ctx, mgr)
+		}
+	}()
 	if sup != nil {
 		// Cancel any pending idle disconnect — a new turn is starting.
 		if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
@@ -1628,12 +1637,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 	log.Printf("daemon: reply to %s (%d tokens, $%.4f)", agentName, reportedUsage.TotalTokens, reportedUsage.CostUSD)
-
-	// Respect the keep_alive toggle after each completed turn.
-	// (Task 7 moves this to a defer block earlier in RunAgent.)
-	if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
-		cleanupPlaywrightAfterTurn(ctx, mgr)
-	}
 
 	// On save failure, blank SessionID so HTTP/SSE clients can't click through
 	// to a session that isn't on disk (matches the agent_reply gate above).

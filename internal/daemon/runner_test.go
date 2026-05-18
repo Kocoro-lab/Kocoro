@@ -18,6 +18,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
@@ -1056,5 +1057,69 @@ func TestFireSuggestionAfterRun_StaleGoroutineDoesNotResurrect(t *testing.T) {
 
 	if _, ok := deps.Suggestions.Get("sess1"); ok {
 		t.Error("stale goroutine resurrected SuggestionState after Clear — race not prevented")
+	}
+}
+
+func TestRunAgent_NoCleanupBeforeDeferInstalled(t *testing.T) {
+	// Misconfigured deps (deps.GW nil) triggers the EARLIEST error return —
+	// before RebuildLayers, before the defer is installed. Cleanup MUST NOT
+	// fire here, otherwise the defer is placed too early in RunAgent.
+	deps := &ServerDeps{}
+
+	oldStopWait := stopPlaywrightChromeAndWaitFn
+	oldIdle := disconnectPlaywrightAfterIdleFn
+	defer func() {
+		stopPlaywrightChromeAndWaitFn = oldStopWait
+		disconnectPlaywrightAfterIdleFn = oldIdle
+	}()
+	stopCalls := 0
+	idleCalls := 0
+	stopPlaywrightChromeAndWaitFn = func(context.Context) error { stopCalls++; return nil }
+	disconnectPlaywrightAfterIdleFn = func(*mcp.ClientManager, time.Duration) { idleCalls++ }
+
+	req := RunAgentRequest{Text: "hi"}
+	_, err := RunAgent(context.Background(), deps, req, nil)
+	if err == nil {
+		t.Fatal("expected error from misconfigured daemon")
+	}
+	if stopCalls != 0 || idleCalls != 0 {
+		t.Fatalf("expected no cleanup on pre-validation error, got stop=%d idle=%d", stopCalls, idleCalls)
+	}
+}
+
+func TestRunAgent_CleanupFiresOnPostDeferError(t *testing.T) {
+	// Construct deps that passes the line-665 validation (Config/GW/SessionCache
+	// non-nil) but fails the second-snapshot validation (Registry nil). This
+	// proves the defer fires on a real internal error return after agent-loop
+	// initialization paths.
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command:   "dummy",
+		Args:      []string{"--some-stdio-mode"}, // non-CDP — idle disconnect is observable without MarkUsed
+		KeepAlive: false,
+	})
+
+	deps := &ServerDeps{
+		Config:       &config.Config{},
+		GW:           &client.GatewayClient{},
+		SessionCache: &SessionCache{},
+		MCPManager:   mgr,
+		// Registry / BaselineReg intentionally nil — triggers the second-validation error return.
+	}
+
+	oldIdle := disconnectPlaywrightAfterIdleFn
+	defer func() { disconnectPlaywrightAfterIdleFn = oldIdle }()
+	idleCalls := 0
+	disconnectPlaywrightAfterIdleFn = func(*mcp.ClientManager, time.Duration) { idleCalls++ }
+
+	_, err := RunAgent(context.Background(), deps, RunAgentRequest{Text: "hi"}, nil)
+	if err == nil {
+		t.Fatal("expected error from missing Registry")
+	}
+	// The defer installed BEFORE the second snapshot fires on this error
+	// return. Non-CDP + keep_alive=false → idle-disconnect scheduled
+	// unconditionally. This proves the defer placement.
+	if idleCalls != 1 {
+		t.Fatalf("expected deferred cleanup to schedule idle disconnect, got %d", idleCalls)
 	}
 }
