@@ -333,6 +333,10 @@ func (tc *TranscriptCollector) OnUsage(usage agent.TurnUsage)                   
 func (tc *TranscriptCollector) OnCloudAgent(agentID, status, message string)           {}
 func (tc *TranscriptCollector) OnCloudProgress(completed, total int)                   {}
 func (tc *TranscriptCollector) OnCloudPlan(planType, content string, needsReview bool) {}
+
+// OnApprovalNeeded gates auto-approval for heartbeat-triggered runs through
+// the unattended deny-list. The list is empty as of 2026-05-18, but this keeps
+// heartbeat aligned with scheduler / watcher / daemon auto-approve paths.
 func (tc *TranscriptCollector) OnApprovalNeeded(tool string, args string) bool {
-	return !agent.DisallowsAutoApproval(tool)
+	return !agent.DisallowsUnattendedAutoApproval(tool)
 }

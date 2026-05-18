@@ -59,15 +59,21 @@ func TestFormatConversationContext_EmptyInput(t *testing.T) {
 	}
 }
 
-func TestScheduleHandlerBlocksPerCallApprovalTools(t *testing.T) {
+// TestScheduleHandlerAutoApproves pins the 2026-05-18 policy: scheduled runs
+// auto-approve every tool because the unattended deny-list is empty. The
+// scheduleHandler.OnApprovalNeeded plumbing still consults
+// DisallowsUnattendedAutoApproval, so this test reads through that gate to
+// catch a future regression that re-populates the list without updating the
+// test.
+func TestScheduleHandlerAutoApproves(t *testing.T) {
 	h := &scheduleHandler{}
-	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
-		if h.OnApprovalNeeded(tool, `{}`) {
-			t.Fatalf("scheduled runs must not auto-approve %s", tool)
+	for _, tool := range []string{
+		"publish_to_web", "generate_image", "edit_image",
+		"bash", "file_write", "browser",
+	} {
+		if !h.OnApprovalNeeded(tool, `{}`) {
+			t.Errorf("scheduled runs should auto-approve %s (unattended list is empty)", tool)
 		}
-	}
-	if !h.OnApprovalNeeded("bash", `{}`) {
-		t.Fatal("scheduled runs should keep auto-approving ordinary tools")
 	}
 }
 

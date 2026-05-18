@@ -185,24 +185,62 @@ func IsSkillExempt(t Tool) bool {
 	return false
 }
 
-// autoApprovalDenyList is the canonical set of tools that require a fresh
-// human decision for every call. AutoApprovalDenyList returns a copy for
-// cross-package consistency tests; DisallowsAutoApproval is the runtime check.
-var autoApprovalDenyList = []string{"publish_to_web", "generate_image", "edit_image"}
+// autoApprovalDenyList is the canonical set of tools that REFUSE to be
+// persisted into a user-facing "always allow" list (per-agent or global).
+// AutoApprovalDenyList returns a copy for cross-package consistency tests;
+// DisallowsAutoApproval is the runtime check.
+//
+// As of 2026-05-18 this list is intentionally empty: publish_to_web /
+// generate_image / edit_image used to be on it because of paid + permanent
+// CDN concerns. The product decision was to treat them as ordinary
+// approval-required tools — fresh prompt the first time, "always allow"
+// persists for future calls. The path-allowlist and basename-blocklist
+// guards in `internal/tools/publish_to_web.go` are still in place as
+// independent protection.
+//
+// The plumbing (DisallowsAutoApproval + all call sites) is preserved as a
+// hook for a future tool that genuinely cannot be persisted (account
+// deletion, payment authorization, etc.). See unattendedAutoApprovalDenyList
+// below for the parallel unattended-only gate — also currently empty.
+var autoApprovalDenyList = []string{}
 
-// AutoApprovalDenyList returns a copy of the tools that disallow any form of
-// auto-approval (session always-allow, agent always-allow, global auto-approve,
-// unattended/scheduled runs). Exposed for consistency tests that verify the
-// agents package's persistence gate stays aligned with the runtime gate.
+// unattendedAutoApprovalDenyList is the set of tools that scheduled
+// (unattended) agent runs MUST NOT auto-approve. As of 2026-05-18 this list
+// is empty: the product call (same one that emptied autoApprovalDenyList)
+// chose to treat publish_to_web / generate_image / edit_image as ordinary
+// approval-required tools across all paths — if a user adds them to
+// always-allow, that consent extends to scheduled / watcher / heartbeat
+// invocations too, no separate gate.
+//
+// The plumbing (DisallowsUnattendedAutoApproval + every handler that calls
+// it) is preserved so a future tool that genuinely cannot run unattended
+// (e.g. payment authorization, account deletion) can be added here without
+// rewriting callers. Empty for now.
+var unattendedAutoApprovalDenyList = []string{}
+
+// AutoApprovalDenyList returns a copy of the tools that disallow being
+// persisted into a user-facing always-allow list. Exposed for consistency
+// tests that verify the agents package's persistence gate stays aligned
+// with the runtime gate.
+//
+// This is the "attended" gate (user is at the keyboard and explicitly opted
+// into skipping prompts). For the unattended scheduled-run gate, see
+// DisallowsUnattendedAutoApproval / unattendedAutoApprovalDenyList.
 func AutoApprovalDenyList() []string {
 	out := make([]string, len(autoApprovalDenyList))
 	copy(out, autoApprovalDenyList)
 	return out
 }
 
-// DisallowsAutoApproval reports tools that require a fresh human decision for
-// every call. These tools may still be approved once, but global auto-approve,
-// unattended runs, and session-level "always allow" must not cover them.
+// DisallowsAutoApproval reports tools that refuse "always allow" persistence.
+// These tools may still be approved once, but the persistence pathway (the
+// "Always Allow" button in Desktop, hand-edited config.yaml entries) is
+// refused at multiple layers.
+//
+// Currently empty — see autoApprovalDenyList for the policy decision.
+// Scheduled-run gating is INTENTIONALLY separate, since attended consent
+// ("I'm clicking always-allow right now") is a different surface than
+// unattended consent ("this cron fires at 3am unsupervised").
 func DisallowsAutoApproval(toolName string) bool {
 	for _, denied := range autoApprovalDenyList {
 		if toolName == denied {
@@ -210,6 +248,32 @@ func DisallowsAutoApproval(toolName string) bool {
 		}
 	}
 	return false
+}
+
+// DisallowsUnattendedAutoApproval reports tools that MUST NOT be
+// auto-approved by scheduled or otherwise-unattended agent runs, even if
+// the user has them in an always-allow list. Compare with
+// DisallowsAutoApproval, which gates attended ("I'm watching") consent.
+//
+// Caller: scheduleHandler.OnApprovalNeeded. Other unattended paths added in
+// the future (RemoteTrigger auto-run, system-level retries, etc.) should
+// route through this check before auto-approving.
+func DisallowsUnattendedAutoApproval(toolName string) bool {
+	for _, denied := range unattendedAutoApprovalDenyList {
+		if toolName == denied {
+			return true
+		}
+	}
+	return false
+}
+
+// UnattendedAutoApprovalDenyList returns a copy of the unattended deny list.
+// Exposed for tests and any future debugging UI that wants to surface the
+// guard policy to operators.
+func UnattendedAutoApprovalDenyList() []string {
+	out := make([]string, len(unattendedAutoApprovalDenyList))
+	copy(out, unattendedAutoApprovalDenyList)
+	return out
 }
 
 // ToolSummary is a lightweight name+description pair for deferred tool listings.

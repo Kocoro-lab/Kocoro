@@ -685,7 +685,10 @@ func (h *daemonEventHandler) OnRunStatus(code, detail string) {}
 
 func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
-		if !agent.DisallowsAutoApproval(tool) {
+		// Treat auto-approve like the scheduled-run gate: ordinary tools skip the
+		// broker, while any future entry in the unattended deny-list still
+		// requires a human decision. The list is empty as of 2026-05-18.
+		if !agent.DisallowsUnattendedAutoApproval(tool) {
 			log.Printf("daemon: auto-approving %s (auto_approve=true)", tool)
 			return true
 		}
@@ -742,8 +745,12 @@ func (h *autoApproveHandler) OnUsage(usage agent.TurnUsage)                     
 func (h *autoApproveHandler) OnCloudAgent(agentID, status, message string)           {}
 func (h *autoApproveHandler) OnCloudProgress(completed, total int)                   {}
 func (h *autoApproveHandler) OnCloudPlan(planType, content string, needsReview bool) {}
+
+// OnApprovalNeeded auto-approves tools for internal triggers (file-system
+// watcher, heartbeat). These are fully unattended, so they route through the
+// same unattended deny-list as scheduled runs. The list is empty today.
 func (h *autoApproveHandler) OnApprovalNeeded(tool string, args string) bool {
-	return !agent.DisallowsAutoApproval(tool)
+	return !agent.DisallowsUnattendedAutoApproval(tool)
 }
 
 func stopExistingDaemon(pidPath string) {

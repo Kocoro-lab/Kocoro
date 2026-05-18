@@ -283,8 +283,8 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 | Tool | Approval | Description |
 |------|----------|-------------|
 | `cloud_delegate` | Yes | Delegate to Shannon Cloud for remote research/swarm execution. |
-| `publish_to_web` | Yes ⚠️ | Upload to a **public** S3 URL on Shannon Cloud (50 MiB cap). Path blocklist (`.env`, `.ssh`, `credentials`, `*.pem`, …) and extension allowlist (html/md/txt/pdf/png/jpg/svg/csv/json/mp4/…). Extend allowlist via `cloud.publish_allowed_extensions`. Files retractable via `retract_published_file`, but **anyone with the URL can read content until then** plus up to 5 minutes after via CDN edge cache. |
-| `list_my_published_files` | No | List the user's still-active published files. Paginated (`limit` default 20, max 100). |
+| `publish_to_web` | Yes ⚠️ | Upload to a **public** S3 URL on Shannon Cloud (50 MiB cap). Path blocklist (`.env`, `.ssh`, `credentials`, `*.pem`, …) and extension allowlist (html/md/txt/pdf/png/jpg/svg/csv/json/mp4/…). Extend allowlist via `cloud.publish_allowed_extensions`. Uploads are tagged `kind=other` server-side (Desktop UI's "All / Image / HTML / PDF / Other" filter sits alongside a separate "Session" bucket for daemon-side session shares). Files retractable via `retract_published_file`, but **anyone with the URL can read content until then** plus up to 5 minutes after via CDN edge cache. |
+| `list_my_published_files` | No | List the user's still-active published files. Paginated (`limit` default 20, max 100). Optional `kind` filter (`session_share` / `report` / `landing_page` / `image` / `other`) — omit to list every category. |
 | `retract_published_file` | Yes ⚠️ | Retract a published file by `id` (UUID from list, **not** the URL). Owner-only; cross-user calls return a friendly 404 (cloud conflates not-found/already-retracted/not-yours to prevent existence leaks). NOT on the high-risk auto-approval denylist — user can opt in to `always_allow_tools`. CDN edges may serve content for up to 5 min after success. |
 | `generate_image` | Yes ⚠️ | Generate via `POST /api/v1/images/generations` (`gpt-image-2`); returns a **public permanent** CDN URL. Args: `prompt`, `size`, `quality` (latency 30s→180s), `n` (1–10), `background`. Each call consumes paid quota. For charts use `kocoro-generative-ui` instead. |
 | `edit_image` | Yes ⚠️ | Edit via `POST /api/v1/images/edits`. Args: `prompt` + `image_urls` (1–4, must start with `https://static.kocoro.ai/` — external URLs rejected; pipe through `generate_image` / `publish_to_web` first). No mask field — describe the region in prose. Latency 40s–350s. |
@@ -544,10 +544,10 @@ Tools requiring approval send requests to the client app (via WS relay through S
 
 Clicking it writes the tool name to the appropriate scope (named agent → per-agent; default agent → global); future calls of that tool skip approval.
 
-**Two safety gates remain regardless of what either list contains** — checked by separate code paths, hand-edited config cannot bypass:
+**Safety gates remain regardless of what either list contains** — checked by separate code paths, hand-edited config cannot bypass:
 
 - **High-risk bash commands** (`pip install`, `rm -rf`, `python -c`, `git push --force`, etc.) still prompt every call. Enforced by the runtime gate in `internal/agent/loop.go` against `permissions.alwaysAskPrefixes`.
-- **Paid / permanent-public tools** (`publish_to_web`, `generate_image`, `edit_image`) cannot be persisted at all. Enforced at write-time AND at runtime via `agent.DisallowsAutoApproval`.
+- **Attended vs unattended auto-approval** — two parallel deny-lists (`agent.DisallowsAutoApproval` / `agent.DisallowsUnattendedAutoApproval`), **both empty as of 2026-05-18**, provide hooks for blocking persistence or unattended execution of specific tools. `publish_to_web`, `generate_image`, and `edit_image` used to be on the attended list; the product call moved them off — they are now ordinary approval-required tools (fresh prompt the first time, "always allow" persists for the rest). The plumbing stays in place for a future tool that genuinely cannot be auto-approved (account deletion, payment authorization, etc.).
 
 #### Approval-card descriptions
 

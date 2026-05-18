@@ -187,6 +187,13 @@ type MemoryConfig struct {
 type DaemonConfig struct {
 	AutoApprove   bool   `mapstructure:"auto_approve" yaml:"auto_approve" json:"auto_approve"`
 	ChromeProfile string `mapstructure:"chrome_profile" yaml:"chrome_profile,omitempty" json:"chrome_profile,omitempty"`
+	// ShareAsyncDefault controls whether POST /sessions/{id}/share returns
+	// 202+task_id (true, default) or blocks until upload completes (false).
+	// Operators on stacks where the UI has not yet learned to subscribe to
+	// share_progress events can flip this to false to keep the legacy
+	// synchronous contract until the UI ships. Per-request `?async=true|false`
+	// always wins over this default.
+	ShareAsyncDefault bool `mapstructure:"share_async_default" yaml:"share_async_default" json:"share_async_default"`
 }
 
 type SkillsConfig struct {
@@ -282,6 +289,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("tools.args_truncation", 200)
 	viper.SetDefault("tools.server_tool_timeout", 5)
 	viper.SetDefault("daemon.auto_approve", false)
+	viper.SetDefault("daemon.share_async_default", true)
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	viper.SetDefault("cloud.enabled", true)
 	viper.SetDefault("cloud.timeout", 3600)

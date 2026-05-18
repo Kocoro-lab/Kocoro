@@ -13,17 +13,23 @@ import (
 )
 
 // ErrToolNotPersistable is returned when a tool cannot be persisted to a
-// per-agent always-allow list. Currently this only fires for high-risk tools
-// (see isHighRiskTool); the runtime check enforces the same gate even if a
-// hand-edited config.yaml manages to bypass this function.
+// per-agent always-allow list. The list of non-persistable tools is currently
+// empty (see highRiskTools below); this error and the surrounding plumbing
+// are preserved so a future genuinely-irreversible tool (account deletion,
+// payment authorization) can be added without rewiring callers.
 var ErrToolNotPersistable = errors.New("tool cannot be persisted as always-allow")
 
 // highRiskTools mirrors internal/agent/tools.go autoApprovalDenyList to avoid
 // a cross-package dependency from agents into agent (would form a cycle via
-// instructions). The list is small and stable; drift is guarded by
-// TestHighRiskListConsistency in internal/agent/tools_test.go, which compares
-// HighRiskTools() against agent.AutoApprovalDenyList() as a set.
-var highRiskTools = []string{"publish_to_web", "generate_image", "edit_image"}
+// instructions). Drift between the two is guarded by TestHighRiskListConsistency
+// in internal/agent/tools_test.go.
+//
+// As of 2026-05-18 this list is empty — see autoApprovalDenyList for the
+// product-decision context. publish_to_web, generate_image, and edit_image
+// now can be persisted as "always allow" once the user opts in; runtime
+// approval still prompts the first time because their RequiresApproval()
+// returns true.
+var highRiskTools = []string{}
 
 // HighRiskTools returns a copy of the tools that cannot be persisted to a
 // per-agent always-allow list. Exposed for cross-package consistency tests.
@@ -43,11 +49,10 @@ func isHighRiskTool(toolName string) bool {
 }
 
 // IsToolAlwaysAllowable reports whether a tool may be persisted to an agent's
-// permissions.always_allow_tools list. High-risk tools that require fresh
-// human re-approval each call (publish_to_web, generate_image, edit_image)
-// are not persistable. The runtime enforces the same gate independently —
-// see internal/agent/loop.go checkPermissionAndApproval — so a hand-edited
-// config.yaml cannot bypass the prompt.
+// permissions.always_allow_tools list. The current policy permits every tool
+// (highRiskTools is empty); the function and the call sites remain so a
+// future tool that truly demands per-call approval can be denied persistence
+// without rewriting callers.
 func IsToolAlwaysAllowable(toolName string) bool {
 	return !isHighRiskTool(toolName)
 }

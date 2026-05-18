@@ -40,6 +40,97 @@ func TestRenderHTML_BasicShape(t *testing.T) {
 	mustContain(t, out, "2 messages")
 }
 
+// TestRenderHTML_MessageTimestampsUseUTCFallback pins the per-message
+// timestamp fix that paired with the header/footer fix. mm.Timestamp comes
+// from MessageMeta and is typically stamped with the daemon's local zone;
+// before the fix it rendered as "15:04" without zone info — JS-disabled
+// viewers saw the daemon operator's wall-clock hour/minute and assumed it
+// was their own timezone. The fallback text now carries a UTC suffix +
+// the <time datetime> attribute lets the client-side localizer rewrite to
+// viewer-local on load.
+func TestRenderHTML_MessageTimestampsUseUTCFallback(t *testing.T) {
+	created := time.Date(2026, 5, 15, 9, 30, 0, 0, time.UTC)
+	// Message stamped at 03:45 UTC. If we ever regress to server-local
+	// formatting, a CI runner in UTC would still show "03:45" and the test
+	// would pass — so anchor on the UTC suffix instead.
+	msgTime := time.Date(2026, 5, 15, 3, 45, 0, 0, time.UTC)
+
+	sess := &session.Session{ID: "s1", Title: "ts test", CreatedAt: created}
+	// Assistant role renders the role+time header line; user-with-bubble
+	// suppresses the timestamp by design (the bubble layout is timestamp-less
+	// for visual compactness). Use assistant so the <time> element actually
+	// appears in the output.
+	input := RenderInput{
+		Session: sess,
+		Messages: []client.Message{
+			{Role: "assistant", Content: client.NewTextContent("greetings")},
+		},
+		Meta: []session.MessageMeta{
+			{Timestamp: session.TimePtr(msgTime)},
+		},
+		GeneratedAt: created,
+	}
+	html, err := RenderHTML(input)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	out := string(html)
+
+	// Fallback text: "03:45 UTC", carried inside a <time> with ISO datetime
+	// and data-fmt="time" so the localizer knows to use time-only formatting.
+	mustContain(t, out, `<time datetime="2026-05-15T03:45:00Z" data-fmt="time">03:45 UTC</time>`)
+
+	// Defense-in-depth: a bare "03:45" without a zone suffix would mean the
+	// regression came back. The "UTC" suffix is the load-bearing tell.
+	if strings.Contains(out, `>03:45<`) {
+		t.Errorf("message timestamp regressed to no-zone format:\n%s", snippet(out))
+	}
+}
+
+// TestRenderHTML_TimestampsUnifiedToUTCWithISO pins the fix for the
+// "header CST + footer UTC" bug. Both visible timestamps must:
+//  1. Render UTC text as the no-JS fallback (NOT the daemon operator's
+//     local timezone — that was the bug).
+//  2. Carry a <time datetime="ISO8601"> attribute so the client-side
+//     localize-timestamps script can rewrite them to the viewer's browser
+//     timezone + locale.
+//  3. Use UTC consistently in both places so a JS-disabled viewer never
+//     sees mismatched zones.
+func TestRenderHTML_TimestampsUnifiedToUTCWithISO(t *testing.T) {
+	// Construct fixed UTC times so the assertions can match byte-for-byte
+	// regardless of where this test runs (CI in UTC, dev laptop in CST/PST).
+	created := time.Date(2026, 5, 15, 9, 30, 0, 0, time.UTC)
+	generated := time.Date(2026, 5, 18, 8, 11, 0, 0, time.UTC)
+	sess := &session.Session{ID: "s1", Title: "ts test", CreatedAt: created}
+	input := RenderInput{
+		Session:     sess,
+		Messages:    []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
+		GeneratedAt: generated,
+	}
+	html, err := RenderHTML(input)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	out := string(html)
+
+	// Header time element: UTC fallback text + RFC3339 datetime attribute.
+	mustContain(t, out, `<time datetime="2026-05-15T09:30:00Z">2026-05-15 09:30 UTC</time>`)
+
+	// Footer time element: same shape, no special "UTC" suffix divergence.
+	mustContain(t, out, `<time datetime="2026-05-18T08:11:00Z">2026-05-18 08:11 UTC</time>`)
+
+	// Both UTC fallback strings carry the same "UTC" suffix — guards against
+	// a future refactor that re-introduces "MST" / "CST" on one side.
+	if strings.Contains(out, "MST</time>") || strings.Contains(out, "CST</time>") ||
+		strings.Contains(out, "PST</time>") || strings.Contains(out, "EST</time>") {
+		t.Errorf("server-local timezone leaked into UTC fallback text:\n%s", snippet(out))
+	}
+
+	// The localizer script must be embedded so viewer-side rewrite works.
+	mustContain(t, out, `id="localize-timestamps"`)
+	mustContain(t, out, "Intl.DateTimeFormat")
+}
+
 func TestRenderHTML_OmitsSummaryWhenEmpty(t *testing.T) {
 	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
 	input := RenderInput{

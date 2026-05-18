@@ -61,7 +61,7 @@ func TestUploadHappyPath(t *testing.T) {
 	defer srv.Close()
 
 	open, _ := fileFactory([]byte("<h1>hi</h1>\n"))
-	res, err := c.Upload(context.Background(), "landing.html", "text/html", open)
+	res, err := c.Upload(context.Background(), open, UploadOptions{Filename: "landing.html", ContentType: "text/html"})
 	if err != nil {
 		t.Fatalf("Upload: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestUploadUnauthorizedNoRetry(t *testing.T) {
 	defer srv.Close()
 
 	open, _ := fileFactory([]byte("hi"))
-	_, err := c.Upload(context.Background(), "x.txt", "text/plain", open)
+	_, err := c.Upload(context.Background(), open, UploadOptions{Filename: "x.txt", ContentType: "text/plain"})
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
 	}
@@ -108,7 +108,7 @@ func TestUploadFileTooLargeNoRetry(t *testing.T) {
 	defer srv.Close()
 
 	open, _ := fileFactory([]byte("hi"))
-	_, err := c.Upload(context.Background(), "x.txt", "text/plain", open)
+	_, err := c.Upload(context.Background(), open, UploadOptions{Filename: "x.txt", ContentType: "text/plain"})
 	if !errors.Is(err, ErrFileTooLarge) {
 		t.Fatalf("expected ErrFileTooLarge, got %v", err)
 	}
@@ -127,7 +127,7 @@ func TestUploadEndpointNotFoundNoRetry(t *testing.T) {
 	defer srv.Close()
 
 	open, _ := fileFactory([]byte("hi"))
-	_, err := c.Upload(context.Background(), "x.txt", "text/plain", open)
+	_, err := c.Upload(context.Background(), open, UploadOptions{Filename: "x.txt", ContentType: "text/plain"})
 	if !errors.Is(err, ErrEndpointNotFound) {
 		t.Fatalf("expected ErrEndpointNotFound, got %v", err)
 	}
@@ -146,7 +146,7 @@ func TestUploadServerConfigNoRetry(t *testing.T) {
 	defer srv.Close()
 
 	open, _ := fileFactory([]byte("hi"))
-	_, err := c.Upload(context.Background(), "x.txt", "text/plain", open)
+	_, err := c.Upload(context.Background(), open, UploadOptions{Filename: "x.txt", ContentType: "text/plain"})
 	if !errors.Is(err, ErrServerConfig) {
 		t.Fatalf("expected ErrServerConfig, got %v", err)
 	}
@@ -170,7 +170,7 @@ func TestUploadTransientThenSuccess(t *testing.T) {
 	defer srv.Close()
 
 	open, factCalls := fileFactory([]byte("hi"))
-	res, err := c.Upload(context.Background(), "x.txt", "text/plain", open)
+	res, err := c.Upload(context.Background(), open, UploadOptions{Filename: "x.txt", ContentType: "text/plain"})
 	if err != nil {
 		t.Fatalf("Upload: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestUploadTransientExhausted(t *testing.T) {
 	defer srv.Close()
 
 	open, factCalls := fileFactory([]byte("hi"))
-	_, err := c.Upload(context.Background(), "x.txt", "text/plain", open)
+	_, err := c.Upload(context.Background(), open, UploadOptions{Filename: "x.txt", ContentType: "text/plain"})
 	if !errors.Is(err, ErrTransient) {
 		t.Fatalf("expected ErrTransient, got %v", err)
 	}
@@ -219,7 +219,7 @@ func TestUploadNetworkErrorRetried(t *testing.T) {
 	c.backoff = func(int) time.Duration { return 0 }
 
 	open, factCalls := fileFactory([]byte("hi"))
-	_, err = c.Upload(context.Background(), "x.txt", "text/plain", open)
+	_, err = c.Upload(context.Background(), open, UploadOptions{Filename: "x.txt", ContentType: "text/plain"})
 	if !errors.Is(err, ErrTransient) {
 		t.Fatalf("expected ErrTransient, got %v", err)
 	}
@@ -242,7 +242,7 @@ func TestUploadFilenameDefault(t *testing.T) {
 	defer srv.Close()
 
 	open, _ := fileFactory([]byte("hi"))
-	if _, err := c.Upload(context.Background(), "", "text/plain", open); err != nil {
+	if _, err := c.Upload(context.Background(), open, UploadOptions{ContentType: "text/plain"}); err != nil {
 		t.Fatalf("Upload: %v", err)
 	}
 	if got != "upload" {
@@ -268,7 +268,7 @@ func TestUploadContextCanceled(t *testing.T) {
 	}()
 
 	open, _ := fileFactory([]byte("hi"))
-	_, err := c.Upload(ctx, "x.txt", "text/plain", open)
+	_, err := c.Upload(ctx, open, UploadOptions{Filename: "x.txt", ContentType: "text/plain"})
 	if err == nil {
 		t.Fatal("expected error from canceled ctx")
 	}
@@ -285,7 +285,7 @@ func TestUploadResponseMissingURL(t *testing.T) {
 	defer srv.Close()
 
 	open, _ := fileFactory([]byte("hi"))
-	_, err := c.Upload(context.Background(), "x.txt", "text/plain", open)
+	_, err := c.Upload(context.Background(), open, UploadOptions{Filename: "x.txt", ContentType: "text/plain"})
 	if err == nil || !strings.Contains(err.Error(), "missing url") {
 		t.Fatalf("expected missing url error, got %v", err)
 	}
@@ -320,7 +320,7 @@ func TestListHappyPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	res, err := c.List(context.Background(), 50, 10)
+	res, err := c.List(context.Background(), ListOptions{Limit: 50, Offset: 10})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestListOmitsZeroPagingParams(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := c.List(context.Background(), 0, 0); err != nil {
+	if _, err := c.List(context.Background(), ListOptions{}); err != nil {
 		t.Fatalf("List: %v", err)
 	}
 	if gotQuery != "" {
@@ -379,7 +379,7 @@ func TestListEmptyUploadsArrayNotNil(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	res, err := c.List(context.Background(), 0, 0)
+	res, err := c.List(context.Background(), ListOptions{})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestListUnauthorizedNoRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := c.List(context.Background(), 20, 0)
+	_, err := c.List(context.Background(), ListOptions{Limit: 20})
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
 	}
@@ -414,7 +414,7 @@ func TestListTransientExhausted(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := c.List(context.Background(), 20, 0)
+	_, err := c.List(context.Background(), ListOptions{Limit: 20})
 	if !errors.Is(err, ErrTransient) {
 		t.Fatalf("expected ErrTransient, got %v", err)
 	}
@@ -605,6 +605,171 @@ func TestClassifyError404ListOpReturnsEndpointNotFound(t *testing.T) {
 	err := classifyError(404, []byte(""), "list")
 	if !errors.Is(err, ErrEndpointNotFound) {
 		t.Errorf("list op 404 → %v, want ErrEndpointNotFound", err)
+	}
+}
+
+// --- kind / metadata wiring ---
+
+func TestUploadKindAndMetadataInForm(t *testing.T) {
+	var got struct {
+		kind     string
+		metadata string
+	}
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("ParseMultipartForm: %v", err)
+		}
+		got.kind = r.FormValue("kind")
+		got.metadata = r.FormValue("metadata")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"url":"https://x/y","key":"k","size":2,"content_type":"text/html","kind":"session_share","metadata":{"session_id":"abc"}}`))
+	}))
+	defer srv.Close()
+
+	open, _ := fileFactory([]byte("hi"))
+	res, err := c.Upload(context.Background(), open, UploadOptions{
+		Filename:    "share.html",
+		ContentType: "text/html",
+		Kind:        KindSessionShare,
+		Metadata:    []byte(`{"session_id":"abc"}`),
+	})
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if got.kind != "session_share" {
+		t.Errorf("kind field = %q, want session_share", got.kind)
+	}
+	if got.metadata != `{"session_id":"abc"}` {
+		t.Errorf("metadata field = %q", got.metadata)
+	}
+	if res.Kind != "session_share" {
+		t.Errorf("response Kind = %q", res.Kind)
+	}
+	if string(res.Metadata) != `{"session_id":"abc"}` {
+		t.Errorf("response Metadata = %q", string(res.Metadata))
+	}
+}
+
+func TestUploadOmitsKindAndMetadataWhenZero(t *testing.T) {
+	var got struct {
+		hasKind     bool
+		hasMetadata bool
+	}
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("ParseMultipartForm: %v", err)
+		}
+		_, got.hasKind = r.MultipartForm.Value["kind"]
+		_, got.hasMetadata = r.MultipartForm.Value["metadata"]
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"url":"https://x/y","key":"k","size":2,"content_type":"text/plain"}`))
+	}))
+	defer srv.Close()
+
+	open, _ := fileFactory([]byte("hi"))
+	if _, err := c.Upload(context.Background(), open, UploadOptions{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if got.hasKind {
+		t.Error("kind field should NOT be present when Kind == \"\"")
+	}
+	if got.hasMetadata {
+		t.Error("metadata field should NOT be present when Metadata == nil")
+	}
+}
+
+func TestUploadInvalidKindRejectedLocally(t *testing.T) {
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("server should not be hit when kind is invalid")
+	}))
+	defer srv.Close()
+
+	open, _ := fileFactory([]byte("hi"))
+	_, err := c.Upload(context.Background(), open, UploadOptions{Kind: "bogus"})
+	if !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("expected ErrBadRequest for invalid kind, got %v", err)
+	}
+}
+
+func TestUploadInvalidKindFromServer(t *testing.T) {
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(400)
+		_, _ = w.Write([]byte(`{"error":"invalid_kind","message":"kind 'foo' not allowed"}`))
+	}))
+	defer srv.Close()
+
+	open, _ := fileFactory([]byte("hi"))
+	// Send a valid-looking kind so the client doesn't short-circuit; rely on
+	// the server response to drive the classification path.
+	_, err := c.Upload(context.Background(), open, UploadOptions{Kind: KindOther})
+	if !errors.Is(err, ErrInvalidKind) {
+		t.Fatalf("expected ErrInvalidKind from server 400, got %v", err)
+	}
+}
+
+func TestListWithKindFilter(t *testing.T) {
+	var gotQuery string
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"uploads":[],"total_count":0}`))
+	}))
+	defer srv.Close()
+
+	if _, err := c.List(context.Background(), ListOptions{Limit: 20, Kind: KindSessionShare}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if !strings.Contains(gotQuery, "kind=session_share") {
+		t.Errorf("query = %q, expected kind=session_share", gotQuery)
+	}
+}
+
+func TestListInvalidKindRejectedLocally(t *testing.T) {
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("server should not be hit when list kind is invalid")
+	}))
+	defer srv.Close()
+
+	_, err := c.List(context.Background(), ListOptions{Kind: "bogus"})
+	if !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("expected ErrBadRequest, got %v", err)
+	}
+}
+
+func TestListResponseCarriesKindAndMetadata(t *testing.T) {
+	c, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{
+			"uploads": [
+				{"id":"a","url":"https://x/y/a.html","filename":"a.html","content_type":"text/html","size":1,"kind":"session_share","metadata":{"session_id":"s1"},"created_at":"2026-05-18T00:00:00Z"}
+			],
+			"total_count": 1
+		}`))
+	}))
+	defer srv.Close()
+
+	res, err := c.List(context.Background(), ListOptions{})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if res.Uploads[0].Kind != "session_share" {
+		t.Errorf("Kind = %q", res.Uploads[0].Kind)
+	}
+	if string(res.Uploads[0].Metadata) != `{"session_id":"s1"}` {
+		t.Errorf("Metadata = %q", string(res.Uploads[0].Metadata))
+	}
+}
+
+func TestIsValidKind(t *testing.T) {
+	for _, k := range []string{KindSessionShare, KindReport, KindLandingPage, KindImage, KindOther} {
+		if !IsValidKind(k) {
+			t.Errorf("IsValidKind(%q) = false, want true", k)
+		}
+	}
+	for _, k := range []string{"", "bogus", "Session_Share", "SESSION_SHARE"} {
+		if IsValidKind(k) {
+			t.Errorf("IsValidKind(%q) = true, want false", k)
+		}
 	}
 }
 

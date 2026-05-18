@@ -64,6 +64,16 @@ type Server struct {
 	memSvc       *memory.Service
 	suggestions  *agent.SuggestionState
 	migratePlans *claudecode.PlanStore
+
+	// shareTasks tracks in-flight and recently-completed async share
+	// goroutines. Lifecycle:
+	//   1. POST /sessions/{id}/share spawns a goroutine, registers state here, returns 202+task_id
+	//   2. The goroutine emits EventShareProgress and mutates state via updateShareTask
+	//   3. shareTaskRetainAfterDone after terminal phase, an AfterFunc drops the entry
+	// Lookups by GET /sessions/{id}/share/tasks/{task_id} race with the GC; a
+	// 404 is the legitimate "task expired" response in that case.
+	shareTasksMu sync.RWMutex
+	shareTasks   map[string]*shareTaskState
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500
@@ -338,6 +348,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}/summary", s.handleSessionSummary)
 	mux.HandleFunc("POST /sessions/{id}/share", s.handleSessionShare)
 	mux.HandleFunc("DELETE /sessions/{id}/share", s.handleSessionShareRetract)
+	mux.HandleFunc("GET /sessions/{id}/shares", s.handleSessionShares)
+	mux.HandleFunc("GET /sessions/{id}/share/tasks/{task_id}", s.handleSessionShareTask)
 	mux.HandleFunc("GET /sessions/search", s.handleSessionSearch)
 	mux.HandleFunc("GET /agents/{name}/sessions/{id}/suggestion", s.handleGetSuggestion)
 	mux.HandleFunc("POST /agents/{name}/sessions/{id}/suggestion/accept", s.handleAcceptSuggestion)
@@ -1623,8 +1635,11 @@ func (h *httpEventHandler) OnCloudAgent(agentID, status, message string)        
 func (h *httpEventHandler) OnCloudProgress(completed, total int)                   {}
 func (h *httpEventHandler) OnCloudPlan(planType, content string, needsReview bool) {}
 
+// OnApprovalNeeded auto-approves for local HTTP API calls except for tools on
+// the unattended deny-list. HTTP callers are often scripts / automation, so the
+// path stays aligned with scheduled runs. The list is empty as of 2026-05-18.
 func (h *httpEventHandler) OnApprovalNeeded(tool string, args string) bool {
-	return !agent.DisallowsAutoApproval(tool)
+	return !agent.DisallowsUnattendedAutoApproval(tool)
 }
 
 // sseEventHandler streams agent events as SSE to an HTTP response.
@@ -1773,7 +1788,10 @@ func (h *sseEventHandler) OnCloudPlan(planType, content string, needsReview bool
 // client responds via POST /approval or the request context is cancelled.
 func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
-		if !agent.DisallowsAutoApproval(tool) {
+		// daemon.auto_approve=true is a "skip prompts" global, but keep this
+		// routed through the unattended deny-list so a future non-unattended-safe
+		// tool can still force a broker round-trip. Empty as of 2026-05-18.
+		if !agent.DisallowsUnattendedAutoApproval(tool) {
 			log.Printf("sse: auto-approving %s (auto_approve=true)", tool)
 			return true
 		}
@@ -2546,8 +2564,10 @@ type alwaysAllowToolRequest struct {
 }
 
 // handleAddAgentAlwaysAllow appends a tool to permissions.always_allow_tools
-// for an agent. High-risk tools (publish_to_web, generate_image, edit_image)
-// return 400 — those must always prompt the user fresh.
+// for an agent. Tools in agent.DisallowsAutoApproval return 400 — the list
+// is currently empty as of 2026-05-18 (publish_to_web / generate_image /
+// edit_image used to be on it and were moved off), so no production tool
+// is refused today, but the gate stays in place for future use.
 func (s *Server) handleAddAgentAlwaysAllow(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := agents.ValidateAgentName(name); err != nil {
@@ -4358,4 +4378,3 @@ func (s *Server) buildSyncDeps(cfg syncpkg.Config) (syncpkg.Deps, bool) {
 		OnSyncDone: onSyncDone,
 	}, true
 }
-

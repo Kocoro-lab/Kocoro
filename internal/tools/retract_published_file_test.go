@@ -13,13 +13,15 @@ import (
 
 type fakeListUploader struct {
 	gotLimit, gotOffset int
+	gotKind             string
 	resp                *uploads.ListResponse
 	err                 error
 }
 
-func (f *fakeListUploader) List(_ context.Context, limit, offset int) (*uploads.ListResponse, error) {
-	f.gotLimit = limit
-	f.gotOffset = offset
+func (f *fakeListUploader) List(_ context.Context, opts uploads.ListOptions) (*uploads.ListResponse, error) {
+	f.gotLimit = opts.Limit
+	f.gotOffset = opts.Offset
+	f.gotKind = opts.Kind
 	return f.resp, f.err
 }
 
@@ -164,6 +166,56 @@ func TestListPublishedFilesTool_Run_PaginatedHint(t *testing.T) {
 	out, _ := tool.Run(context.Background(), `{"limit": 1, "offset": 0}`)
 	if !strings.Contains(out.Content, "offset=1") {
 		t.Errorf("expected next-page hint with offset=1; got:\n%s", out.Content)
+	}
+}
+
+func TestListPublishedFilesTool_Run_PassesKindToClient(t *testing.T) {
+	fake := &fakeListUploader{resp: &uploads.ListResponse{Uploads: []uploads.UploadEntry{}, TotalCount: 0}}
+	tool := NewListPublishedFilesTool(fake)
+	out, err := tool.Run(context.Background(), `{"kind":"session_share"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.IsError {
+		t.Fatalf("IsError = true: %s", out.Content)
+	}
+	if fake.gotKind != uploads.KindSessionShare {
+		t.Errorf("client gotKind = %q, want session_share", fake.gotKind)
+	}
+}
+
+func TestListPublishedFilesTool_Run_InvalidKindReturnsValidationError(t *testing.T) {
+	fake := &fakeListUploader{resp: &uploads.ListResponse{Uploads: []uploads.UploadEntry{}, TotalCount: 0}}
+	tool := NewListPublishedFilesTool(fake)
+	out, _ := tool.Run(context.Background(), `{"kind":"bogus"}`)
+	if !out.IsError {
+		t.Fatalf("expected IsError = true for invalid kind")
+	}
+	if out.ErrorCategory != agent.ErrCategoryValidation {
+		t.Errorf("ErrorCategory = %s, want validation", out.ErrorCategory)
+	}
+	if fake.gotKind != "" {
+		t.Errorf("client should NOT have been called when kind is invalid; gotKind = %q", fake.gotKind)
+	}
+}
+
+func TestListPublishedFilesTool_Run_KindBadgeInRendering(t *testing.T) {
+	fake := &fakeListUploader{
+		resp: &uploads.ListResponse{
+			Uploads: []uploads.UploadEntry{
+				{ID: "a", URL: "x", Filename: "share.html", ContentType: "text/html", Size: 100, Kind: uploads.KindSessionShare, CreatedAt: "now"},
+				{ID: "b", URL: "x", Filename: "report.pdf", ContentType: "application/pdf", Size: 200, Kind: uploads.KindOther, CreatedAt: "now"},
+			},
+			TotalCount: 2,
+		},
+	}
+	tool := NewListPublishedFilesTool(fake)
+	out, _ := tool.Run(context.Background(), `{}`)
+	if !strings.Contains(out.Content, "kind=session_share") {
+		t.Errorf("output missing kind=session_share badge; got:\n%s", out.Content)
+	}
+	if !strings.Contains(out.Content, "kind=other") {
+		t.Errorf("output missing kind=other badge; got:\n%s", out.Content)
 	}
 }
 

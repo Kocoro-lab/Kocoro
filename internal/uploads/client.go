@@ -21,24 +21,90 @@ import (
 	"time"
 )
 
+// Kind enumerates the business-purpose buckets Cloud accepts on POST /uploads.
+// Cloud enforces these via a CHECK constraint (migration 130) — adding a new
+// value here without a corresponding cloud migration causes 400 invalid_kind.
+// Leaving Kind empty in UploadOptions lets Cloud default to "other" server-side.
+const (
+	KindSessionShare = "session_share"
+	KindReport       = "report"
+	KindLandingPage  = "landing_page"
+	KindImage        = "image"
+	KindOther        = "other"
+)
+
+// validUploadKinds is the client-side mirror of Cloud's CHECK constraint.
+// Used both as upload-time pre-validation (skip a round trip on obvious typos)
+// and as a list-filter whitelist. Kept in sync with the constants above.
+var validUploadKinds = map[string]bool{
+	KindSessionShare: true,
+	KindReport:       true,
+	KindLandingPage:  true,
+	KindImage:        true,
+	KindOther:        true,
+}
+
+// IsValidKind reports whether s is in the upload-kind whitelist. Empty string
+// is NOT valid — callers that want "no preference" should pass "" to Upload
+// and let Cloud default to "other", but list filters require an explicit value.
+func IsValidKind(s string) bool { return validUploadKinds[s] }
+
+// UploadOptions bundles the optional knobs for POST /api/v1/uploads. All
+// fields are optional individually; the empty struct uploads as application/
+// octet-stream with no business classification (Cloud defaults Kind to "other").
+type UploadOptions struct {
+	// Filename overrides the multipart Part filename. Empty falls back to
+	// "upload" (server then sniffs by extension on the bytes).
+	Filename string
+	// ContentType overrides the stored MIME. Empty falls back to the server's
+	// extension-based sniff, ending in application/octet-stream.
+	ContentType string
+	// Kind is the business-purpose bucket — see KindXxx constants. Empty is
+	// allowed and means "let Cloud default to other". A non-empty value not in
+	// validUploadKinds short-circuits with ErrBadRequest before any HTTP call.
+	Kind string
+	// Metadata is a pre-marshaled JSON object (≤ 8 KiB). Empty/nil = no
+	// metadata field on the multipart envelope; Cloud stores {} in that case.
+	// Must be a JSON object — arrays / scalars are rejected by Cloud with
+	// invalid_metadata, but the client doesn't pre-validate shape (callers are
+	// expected to marshal from a struct/map).
+	Metadata json.RawMessage
+}
+
+// ListOptions bundles the query parameters for GET /api/v1/uploads. Zero values
+// for Limit and Offset map to Cloud defaults (limit=20, offset=0); empty Kind
+// disables the filter.
+type ListOptions struct {
+	Limit  int
+	Offset int
+	// Kind filters the response to a single business-purpose bucket. Empty
+	// returns all kinds. A non-empty value not in validUploadKinds returns
+	// ErrBadRequest before any HTTP call.
+	Kind string
+}
+
 // UploadResponse mirrors the JSON returned by POST /api/v1/uploads on success.
 // Use URL directly — its path segments are already percent-encoded server-side.
 type UploadResponse struct {
-	URL         string `json:"url"`
-	Key         string `json:"key"`
-	Size        int64  `json:"size"`
-	ContentType string `json:"content_type"`
+	URL         string          `json:"url"`
+	Key         string          `json:"key"`
+	Size        int64           `json:"size"`
+	ContentType string          `json:"content_type"`
+	Kind        string          `json:"kind,omitempty"`
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
 }
 
 // UploadEntry is a single record in GET /api/v1/uploads. Cloud omits
 // s3_key / tenant_id / user_id by design — do not assume they exist.
 type UploadEntry struct {
-	ID          string `json:"id"`
-	URL         string `json:"url"`
-	Filename    string `json:"filename"`
-	ContentType string `json:"content_type"`
-	Size        int64  `json:"size"`
-	CreatedAt   string `json:"created_at"` // RFC3339 UTC
+	ID          string          `json:"id"`
+	URL         string          `json:"url"`
+	Filename    string          `json:"filename"`
+	ContentType string          `json:"content_type"`
+	Size        int64           `json:"size"`
+	Kind        string          `json:"kind,omitempty"`
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
+	CreatedAt   string          `json:"created_at"` // RFC3339 UTC
 }
 
 // ListResponse mirrors the JSON returned by GET /api/v1/uploads on success.
@@ -77,6 +143,11 @@ var (
 	// not have /api/v1/uploads mounted. Usually means the deployment doesn't
 	// include the uploads handler yet, or cloud.endpoint points at a wrong host.
 	ErrEndpointNotFound = errors.New("upload: endpoint not deployed")
+	// ErrInvalidKind is a 400 with code "invalid_kind" — the kind value is not
+	// in Cloud's CHECK-constrained whitelist. Permanent client bug; same shape
+	// as ErrBadRequest but split out so daemon handler and tool layer can map
+	// it to a more actionable error message instead of generic "bad request".
+	ErrInvalidKind = errors.New("upload: invalid kind")
 	// ErrFileTooLarge is a 413. Permanent — file exceeds the 50 MiB server limit.
 	ErrFileTooLarge = errors.New("upload: file too large")
 	// ErrServerConfig is a 500 with code "s3_unconfigured". Permanent — server-side fix needed.
@@ -137,30 +208,38 @@ func defaultBackoff(attempt int) time.Duration {
 // MUST return a fresh, fully-rewound reader each time, because each retry
 // reissues the request and consumes the body afresh.
 //
-// filename and contentType may be empty. When filename is empty it falls back
-// to "upload" (server further falls back to extension sniff on the bytes).
-// When contentType is empty the server sniffs by extension or returns
-// application/octet-stream.
+// All UploadOptions fields are optional. Filename empty falls back to "upload";
+// ContentType empty defers to the server's extension sniff; Kind empty lets
+// Cloud default to "other"; Metadata nil/empty omits the field entirely. A
+// non-empty Kind not in validUploadKinds short-circuits with ErrBadRequest
+// before any HTTP call (defends against typos before they cost a round trip).
 func (c *Client) Upload(
 	ctx context.Context,
-	filename, contentType string,
 	openBody func() (io.ReadCloser, error),
+	opts UploadOptions,
 ) (*UploadResponse, error) {
 	if openBody == nil {
 		return nil, fmt.Errorf("upload: openBody is required")
 	}
+	if opts.Kind != "" && !validUploadKinds[opts.Kind] {
+		return nil, fmt.Errorf("%w: invalid kind %q (allowed: session_share, report, landing_page, image, other)", ErrBadRequest, opts.Kind)
+	}
 	return doWithRetry(ctx, c.maxAttempts, c.backoff, func(ctx context.Context) (*UploadResponse, error) {
-		return c.uploadOnce(ctx, filename, contentType, openBody)
+		return c.uploadOnce(ctx, openBody, opts)
 	})
 }
 
-// List calls GET /api/v1/uploads?limit=&offset= and returns the parsed
-// response. limit/offset are passed through as-is; cloud clamps limit to
-// [1, 100] internally (and 0 → default 20), but callers are encouraged to
-// validate before calling so error messages stay close to the user.
-func (c *Client) List(ctx context.Context, limit, offset int) (*ListResponse, error) {
+// List calls GET /api/v1/uploads with the supplied options and returns the
+// parsed response. Limit/Offset are passed through as-is; cloud clamps limit
+// to [1, 100] internally (and 0 → default 20), but callers are encouraged to
+// validate before calling so error messages stay close to the user. A
+// non-empty Kind not in validUploadKinds short-circuits with ErrBadRequest.
+func (c *Client) List(ctx context.Context, opts ListOptions) (*ListResponse, error) {
+	if opts.Kind != "" && !validUploadKinds[opts.Kind] {
+		return nil, fmt.Errorf("%w: invalid kind %q (allowed: session_share, report, landing_page, image, other)", ErrBadRequest, opts.Kind)
+	}
 	return doWithRetry(ctx, c.maxAttempts, c.backoff, func(ctx context.Context) (*ListResponse, error) {
-		return c.listOnce(ctx, limit, offset)
+		return c.listOnce(ctx, opts)
 	})
 }
 
@@ -224,8 +303,8 @@ func isRetriable(err error) bool {
 // reader so net/http drains it incrementally without buffering the file.
 func (c *Client) uploadOnce(
 	ctx context.Context,
-	filename, contentType string,
 	openBody func() (io.ReadCloser, error),
+	opts UploadOptions,
 ) (*UploadResponse, error) {
 	body, err := openBody()
 	if err != nil {
@@ -242,14 +321,26 @@ func (c *Client) uploadOnce(
 		defer pw.Close()
 		defer mw.Close()
 
-		if contentType != "" {
-			if werr := mw.WriteField("content_type", contentType); werr != nil {
+		if opts.ContentType != "" {
+			if werr := mw.WriteField("content_type", opts.ContentType); werr != nil {
+				pw.CloseWithError(werr)
+				return
+			}
+		}
+		if opts.Kind != "" {
+			if werr := mw.WriteField("kind", opts.Kind); werr != nil {
+				pw.CloseWithError(werr)
+				return
+			}
+		}
+		if len(opts.Metadata) > 0 {
+			if werr := mw.WriteField("metadata", string(opts.Metadata)); werr != nil {
 				pw.CloseWithError(werr)
 				return
 			}
 		}
 
-		fname := filename
+		fname := opts.Filename
 		if fname == "" {
 			fname = "upload"
 		}
@@ -258,8 +349,8 @@ func (c *Client) uploadOnce(
 		hdr := make(textproto.MIMEHeader)
 		hdr.Set("Content-Disposition",
 			fmt.Sprintf(`form-data; name="file"; filename=%q`, fname))
-		if contentType != "" {
-			hdr.Set("Content-Type", contentType)
+		if opts.ContentType != "" {
+			hdr.Set("Content-Type", opts.ContentType)
 		} else {
 			hdr.Set("Content-Type", "application/octet-stream")
 		}
@@ -315,17 +406,20 @@ func (c *Client) uploadOnce(
 }
 
 // listOnce performs a single GET /api/v1/uploads with the given paging.
-func (c *Client) listOnce(ctx context.Context, limit, offset int) (*ListResponse, error) {
+func (c *Client) listOnce(ctx context.Context, opts ListOptions) (*ListResponse, error) {
 	endpoint, err := url.Parse(c.baseURL + "/api/v1/uploads")
 	if err != nil {
 		return nil, fmt.Errorf("upload: build request: %w", err)
 	}
 	q := endpoint.Query()
-	if limit > 0 {
-		q.Set("limit", strconv.Itoa(limit))
+	if opts.Limit > 0 {
+		q.Set("limit", strconv.Itoa(opts.Limit))
 	}
-	if offset > 0 {
-		q.Set("offset", strconv.Itoa(offset))
+	if opts.Offset > 0 {
+		q.Set("offset", strconv.Itoa(opts.Offset))
+	}
+	if opts.Kind != "" {
+		q.Set("kind", opts.Kind)
 	}
 	endpoint.RawQuery = q.Encode()
 
@@ -426,6 +520,13 @@ func classifyError(status int, body []byte, op string) error {
 	case http.StatusUnauthorized: // 401
 		return fmt.Errorf("%w (status %d, code %q)%s", ErrUnauthorized, status, code, suffix())
 	case http.StatusBadRequest: // 400
+		// invalid_kind is the only 400 sub-code daemon/tool layers need to
+		// distinguish (so they can rewrite "kind=foo not in whitelist" into a
+		// user-friendly message). invalid_metadata / metadata_too_large stay
+		// under ErrBadRequest since they only fire on client bugs.
+		if code == "invalid_kind" {
+			return fmt.Errorf("%w (status %d, code %q)%s", ErrInvalidKind, status, code, suffix())
+		}
 		return fmt.Errorf("%w (status %d, code %q)%s", ErrBadRequest, status, code, suffix())
 	case http.StatusNotFound: // 404
 		if op == "delete" {

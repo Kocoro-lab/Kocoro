@@ -179,6 +179,7 @@ Unknown tools → denied (fail-safe). Always-ask gate runs BEFORE the allowlist,
 | `delivery_ack` capability | `client.go:sendDeliveryAck` | After `SendReply` succeeds for `MsgTypeMessage`, emit ack so Cloud drops the replay-buffer entry. Reply-failure paths skip the ack so replay is correct. |
 | Attachments | `attachment.go` | Priority `document_b64` → `extracted_text` → URL download. Caps: 500 MB/file, 20/msg, inline doc ≤ 25 MB raw. Capability tokens `inline_document_b64` / `inline_extracted_text` gate the new fields. DOCX/XLSX/PPTX/CSV extraction is daemon-local via `internal/tools/doc_extract.go` (Phase 2 aligned with CC). Cloud fills PDF `DocumentB64` + transcodes HEIC/AVIF. |
 | Session routing | `router.go` | `ComputeRouteKey` precedence: explicit `session:<id>` → thread → sender → agent → channel. Web/webhook/cron/schedule bypass (always fresh). |
+| Session share uploads | `daemon/share_handler.go` + `share_async.go` | Render HTML → POST `/api/v1/uploads` with `kind=session_share` + `metadata={session_id, agent?}`; the post-upload LIST lookup also filters by `kind=session_share` so concurrent landing-page/image uploads can't shove our row off the first page. publish_to_web sends `kind=other`; daemon list proxy validates kind against the whitelist before forwarding. |
 | Output format | `runner.go outputFormatForSource` | `plain` for cloud-distributed channels (slack/line/feishu/lark/telegram/webhook); `markdown` default. |
 | Tool result sizing | `spill.go` + `toolresult_budget.go` + `context_bloat.go` | Per-result spill at policy threshold (default 50K, grep 20K) → tmp file + 2K preview. `file_read` is `UnlimitedToolResultSizeChars` (no spill); it self-bounds via `fileReadHardCapRunes = 500_000` in the tool itself, with truncation marker. Per-turn 200K-rune aggregate cap skips Unlimited tools. `ToolResultReplacements` + `ToolResultSeen` persisted across checkpoints AND terminal saves. |
 | file_read dedup | `agent/readtracker.go` + `daemon/readtracker_cache.go` | Records `(path, offset, limit, mtime, size)`; re-reads return a stub. Per-session, released via `SessionManager.OnSessionClose`. |
@@ -210,12 +211,18 @@ Unknown tools → denied (fail-safe). Always-ask gate runs BEFORE the allowlist,
 | bash, always-ask command | any | none | One-time allow + `EventApprovalNotice` warning. Runtime gate in `loop.go` enforces denylist even if hand-written into config. |
 | bash, safe command | named | per-agent `permissions.always_allow_tools` | Future bash from this agent skips approval. |
 | bash, safe command | default (`req.Agent==""`) | GLOBAL `permissions.always_allow_tools` | Affects all agents. PR 6 fix for non-technical users on default agent. |
-| non-bash | named | per-agent tool-level | High-risk tools (`agent.DisallowsAutoApproval`: publish_to_web/generate_image/edit_image) refuse persistence + emit warn notice. |
-| non-bash | default | global tool-level | Same path bash takes. SSE handler creates fresh broker per request, so broker-only persistence evaporates. High-risk still refused at all layers. |
+| non-bash | named | per-agent tool-level | `agent.DisallowsAutoApproval` (currently empty) refuses persistence + emits warn notice. publish_to_web / generate_image / edit_image used to be on this list — moved off 2026-05-18, see `internal/agent/tools.go` for trade-off rationale. |
+| non-bash | default | global tool-level | Same path bash takes. SSE handler creates fresh broker per request, so broker-only persistence evaporates. |
 
 Global and per-agent always-allow lists are **unioned at injection** in `SetAlwaysAllowTools` (called from runner.go / tui/app.go / cmd/root.go after `SwitchAgent`). `SwitchAgent` resets the field so reuse can't leak.
 
-**`approval_request.flags`** (additive `[]string`): currently only `always_allow_disabled` for tools in `agent.DisallowsAutoApproval`. UI clients hide/disable the affordance; daemon still rejects persistence as defense-in-depth.
+**Attended vs unattended auto-approval (two parallel deny-lists, both currently empty as of 2026-05-18)**:
+- `agent.DisallowsAutoApproval` / `autoApprovalDenyList` — refuses "always allow" persistence. Currently **empty**.
+- `agent.DisallowsUnattendedAutoApproval` / `unattendedAutoApprovalDenyList` — refuses auto-approval on scheduled / heartbeat / watcher / `auto_approve=true` paths. Currently **empty**. Consulted by `scheduleHandler.OnApprovalNeeded`, `daemonEventHandler` / `sseEventHandler` / `httpEventHandler` (auto_approve=true path), `cmd/daemon.go autoApproveHandler`, and `heartbeat.TranscriptCollector.OnApprovalNeeded`.
+
+Both lists used to contain `{publish_to_web, generate_image, edit_image}` — the 2026-05-18 product decision was to treat those as ordinary approval-required tools across all paths (fresh prompt the first time, "always allow" persists for the rest). The plumbing for both gates is preserved as a hook for a future tool that needs one (account deletion, payment authorization, etc.).
+
+**`approval_request.flags`** (additive `[]string`): `always_allow_disabled` is emitted for tools in `agent.DisallowsAutoApproval`. With the deny-list now empty no production tool ships this flag — it stays in the schema for a future tool that needs it.
 
 **`EventApprovalNotice`** payload is `{severity, code, tool, message}`. `code` is a stable i18n key (`high_risk_not_persistable` / `bash_always_ask_not_persisted` / `persist_failed`); daemon NEVER ships translated text. `message` is English fallback.
 
@@ -315,8 +322,8 @@ Conditional:
 
 - `session_search` — when session manager available
 - `cloud_delegate` — `cloud.enabled: true`
-- `publish_to_web` — `cloud.enabled` + `cfg.APIKey`. Always approval. Path-segment + basename blocklist (`.env`/`.pem`/…); extension allowlist (`cloud.publish_allowed_extensions`).
-- `list_my_published_files` — same gating. Read-only, no approval. `limit` (≤100), `offset`. Returns paged `UploadEntry` rows keyed by id.
-- `retract_published_file` — same gating. Destructive, requires approval; intentionally NOT in `agent.DisallowsAutoApproval`. Args: `id` (UUID from list) + `description`. 404 conflates not-found/already-retracted/not-yours to avoid existence leak.
+- `publish_to_web` — `cloud.enabled` + `cfg.APIKey`. Always approval. Path-segment + basename blocklist (`.env`/`.pem`/…); extension allowlist (`cloud.publish_allowed_extensions`). All uploads tagged `kind=other` server-side; the kind enum (`session_share`/`report`/`landing_page`/`image`/`other` — see `internal/uploads/client.go`) is NOT exposed to the model (avoids landing_page misclassification for ad-hoc shares).
+- `list_my_published_files` — same gating. Read-only, no approval. `limit` (≤100), `offset`, optional `kind` filter (same enum). Returns paged `UploadEntry` rows keyed by id; rendering surfaces a `kind=…` badge per row so the LLM can answer "which of these are session shares".
+- `retract_published_file` — same gating. Destructive, requires approval. `agent.DisallowsAutoApproval` is empty as of 2026-05-18, so retract behaves like other approval-required tools (can be persisted to always-allow if the user chooses). Args: `id` (UUID from list) + `description`. 404 conflates not-found/already-retracted/not-yours to avoid existence leak.
 - `generate_image` / `edit_image` — same gating. Always approval (paid quota + permanent CDN). Edit requires `image_urls` 1-4 entries starting with `https://static.kocoro.ai/`.
 - `tool_search` — deferred mode when tool count > 30 (lives in `agent/deferred.go`)

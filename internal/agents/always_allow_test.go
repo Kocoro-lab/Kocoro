@@ -2,7 +2,6 @@ package agents
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -157,16 +156,38 @@ func TestAppendAlwaysAllowTool_SortedOrder(t *testing.T) {
 	}
 }
 
-func TestAppendAlwaysAllowTool_RejectsHighRisk(t *testing.T) {
-	dir, name := setupAgent(t, "highrisk")
+// TestAppendAlwaysAllowTool_PersistsFormerlyHighRisk pins the 2026-05-18
+// policy change: publish_to_web / generate_image / edit_image USED to be
+// rejected by AppendAlwaysAllowTool, forcing users to re-approve every call.
+// The product call moved them off the deny-list — they should now persist
+// like any other tool. ErrToolNotPersistable still exists as plumbing for a
+// future tool that genuinely cannot be persisted; this test catches a
+// regression where the rejection rule comes back without explicit intent.
+func TestAppendAlwaysAllowTool_PersistsFormerlyHighRisk(t *testing.T) {
+	dir, name := setupAgent(t, "formerhighrisk")
 	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
-		err := AppendAlwaysAllowTool(dir, name, tool)
-		if !errors.Is(err, ErrToolNotPersistable) {
-			t.Errorf("%s: expected ErrToolNotPersistable, got %v", tool, err)
+		if err := AppendAlwaysAllowTool(dir, name, tool); err != nil {
+			t.Errorf("%s: expected persistence to succeed, got %v", tool, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, name, "config.yaml")); !os.IsNotExist(err) {
-		t.Error("config.yaml should not have been created for rejected tools")
+	// All three should be present in config.yaml after the appends.
+	cfgPath := filepath.Join(dir, name, "config.yaml")
+	if _, err := os.Stat(cfgPath); err != nil {
+		t.Fatalf("config.yaml should exist after persisting tools: %v", err)
+	}
+	raw, err := readAgentConfigRaw(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	got := readAlwaysAllowTools(raw, name)
+	want := map[string]bool{"publish_to_web": true, "generate_image": true, "edit_image": true}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want all three tools persisted", got)
+	}
+	for _, tool := range got {
+		if !want[tool] {
+			t.Errorf("unexpected tool persisted: %q", tool)
+		}
 	}
 }
 

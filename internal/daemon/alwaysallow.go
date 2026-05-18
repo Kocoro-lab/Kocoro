@@ -36,21 +36,21 @@ import (
 //     non-technical users get "click once, never asked again" semantics.
 //
 //  4. Non-bash + named agent: tool-level per-agent persistence.
+//
 //  5. Non-bash + default agent: tool-level GLOBAL persistence (same global
 //     list bash uses). Required because the SSE handler recreates the
 //     broker per request, so broker.SetToolAutoApprove alone evaporates.
-//     High-risk tools (DisallowsAutoApproval: publish_to_web,
-//     generate_image, edit_image) are refused at this entry plus at
-//     PersistAgentAlwaysAllow, broker, and the runtime gate in
-//     loop.go — four independent gates.
+//     Tools in DisallowsAutoApproval are refused at this entry plus at
+//     PersistAgentAlwaysAllow, broker, and the runtime gate in loop.go. The
+//     list is empty as of 2026-05-18.
 func HandleAlwaysAllowDecision(deps *ServerDeps, broker *ApprovalBroker, agentName, tool, args string) {
 	if tool == "bash" {
 		handleBashAlwaysAllow(deps, broker, agentName, args)
 		return
 	}
-	// Non-bash. PersistAgentAlwaysAllow does its own high-risk gate
-	// (DisallowsAutoApproval → notice + false return) for both the per-agent
-	// and the "no agent context" sub-paths.
+	// Non-bash. PersistAgentAlwaysAllow does its own DisallowsAutoApproval gate
+	// (notice + false return) for both the per-agent and the "no agent context"
+	// sub-paths.
 	if agentName != "" {
 		PersistAgentAlwaysAllow(deps, agentName, tool)
 		broker.SetToolAutoApprove(tool)
@@ -60,12 +60,12 @@ func HandleAlwaysAllowDecision(deps *ServerDeps, broker *ApprovalBroker, agentNa
 	// (server.go), so broker.SetToolAutoApprove alone evaporates after the
 	// current message. Persist to GLOBAL permissions.always_allow_tools so
 	// the runtime gate honors the click on every subsequent request — same
-	// mechanism PR 6 wired for bash. High-risk tools (DisallowsAutoApproval)
-	// remain rejected at every gate (write-time + broker + runtime).
+	// mechanism PR 6 wired for bash. Tools in DisallowsAutoApproval remain
+	// rejected at every gate (write-time + broker + runtime).
 	if agent.DisallowsAutoApproval(tool) {
 		emitAlwaysAllowNotice(deps, "warn", NoticeCodeHighRiskNotPersistable, tool,
-			"This tool always requires fresh approval (paid or permanent public output) and cannot be saved as always-allow. Allowed for this call only.")
-		log.Printf("daemon: always-allow rejected for high-risk tool (default agent): %s", tool)
+			"This tool always requires fresh approval and cannot be saved as always-allow. Allowed for this call only.")
+		log.Printf("daemon: always-allow rejected for non-persistable tool (default agent): %s", tool)
 		return
 	}
 	persistGlobalToolAlwaysAllow(deps, broker, tool)
@@ -141,8 +141,8 @@ func PersistAgentAlwaysAllow(deps *ServerDeps, agentName, tool string) bool {
 	}
 	if agent.DisallowsAutoApproval(tool) {
 		emitAlwaysAllowNotice(deps, "warn", NoticeCodeHighRiskNotPersistable, tool,
-			"This tool always requires fresh approval (paid or permanent public output) and cannot be saved as always-allow. Allowed for this call only.")
-		log.Printf("daemon: always-allow rejected for high-risk tool: %s", tool)
+			"This tool always requires fresh approval and cannot be saved as always-allow. Allowed for this call only.")
+		log.Printf("daemon: always-allow rejected for non-persistable tool: %s", tool)
 		return false
 	}
 	if agentName == "" {
@@ -177,9 +177,9 @@ func PersistAgentAlwaysAllow(deps *ServerDeps, agentName, tool string) bool {
 // recognize the code.
 const (
 	// NoticeCodeHighRiskNotPersistable is sent when the user clicks "Always
-	// Allow" on a tool in agent.DisallowsAutoApproval (publish_to_web /
-	// generate_image / edit_image / ...). The click is honored once but
-	// cannot be saved at any persistence layer.
+	// Allow" on a tool in agent.DisallowsAutoApproval. The click is honored
+	// once but cannot be saved at any persistence layer. The list is empty as
+	// of 2026-05-18, but the notice code stays for future entries.
 	NoticeCodeHighRiskNotPersistable = "high_risk_not_persistable"
 	// NoticeCodeBashAlwaysAskNotPersisted is sent when the user clicks
 	// "Always Allow" on a bash command matching permissions.alwaysAskPrefixes

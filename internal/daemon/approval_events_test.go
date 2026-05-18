@@ -796,7 +796,13 @@ func TestApprovalRequest_FlagsOmittedWhenEmpty(t *testing.T) {
 		t.Errorf("flags must be omitted when empty (not emitted as null); got payload: %s", string(rawPayload))
 	}
 
-	// Symmetric: high-risk tools must STILL ship flags as a non-empty array.
+	// 2026-05-18 update: this symmetric case used to assert publish_to_web
+	// emitted a non-empty flags array (with ApprovalFlagAlwaysAllowDisabled).
+	// The deny-list is now empty so publish_to_web behaves like any other
+	// tool — flags stay omitted. We keep the second probe in place so the
+	// "flags omitted everywhere" invariant is exercised end-to-end with a
+	// formerly-high-risk tool name, to catch a future regression that
+	// emits an unintended flag for it.
 	bus2 := NewEventBus()
 	broker2 := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
 	WireApprovalBusHooks(broker2, bus2)
@@ -813,16 +819,18 @@ func TestApprovalRequest_FlagsOmittedWhenEmpty(t *testing.T) {
 	}()
 	_ = broker2.Request(context.Background(), ApprovalRequestMeta{}, "publish_to_web", `{}`)
 
-	var highRiskPayload map[string]any
+	var rawPayload2 []byte
 	for _, evt := range bus2.EventsSince(0) {
 		if evt.Type == EventApprovalRequest {
-			_ = json.Unmarshal(evt.Payload, &highRiskPayload)
+			rawPayload2 = evt.Payload
 			break
 		}
 	}
-	flags, ok := highRiskPayload["flags"].([]any)
-	if !ok || len(flags) == 0 {
-		t.Errorf("high-risk tool: flags must be a non-empty array, got %v (full payload: %v)", highRiskPayload["flags"], highRiskPayload)
+	if rawPayload2 == nil {
+		t.Fatal("approval_request for publish_to_web never reached bus")
+	}
+	if bytes.Contains(rawPayload2, []byte(`"flags"`)) {
+		t.Errorf("publish_to_web is no longer deny-listed; flags must be omitted, got payload: %s", string(rawPayload2))
 	}
 }
 

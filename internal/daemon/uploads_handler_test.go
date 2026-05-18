@@ -134,6 +134,46 @@ func TestHandleListUploads_NoAPIKeyReturns503(t *testing.T) {
 	}
 }
 
+func TestHandleListUploads_ForwardsKindToCloud(t *testing.T) {
+	var gotQuery string
+	s, _ := newTestServerWithCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"uploads":[],"total_count":0}`))
+	})
+
+	req := httptest.NewRequest("GET", "/uploads?kind=session_share&limit=5", nil)
+	rr := httptest.NewRecorder()
+	s.handleListUploads(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(gotQuery, "kind=session_share") {
+		t.Errorf("kind not forwarded; query = %q", gotQuery)
+	}
+}
+
+func TestHandleListUploads_RejectsInvalidKindLocally(t *testing.T) {
+	cloudHit := false
+	s, _ := newTestServerWithCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		cloudHit = true
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"uploads":[],"total_count":0}`))
+	})
+
+	req := httptest.NewRequest("GET", "/uploads?kind=bogus", nil)
+	rr := httptest.NewRecorder()
+	s.handleListUploads(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+	if cloudHit {
+		t.Error("cloud should NOT have been hit for invalid kind")
+	}
+}
+
 func TestHandleListUploads_CloudUnauthorizedMapsTo401(t *testing.T) {
 	s, _ := newTestServerWithCloud(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(401)

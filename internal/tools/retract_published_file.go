@@ -15,7 +15,7 @@ import (
 // implements it; tests inject a fake to assert table-rendering without
 // standing up an HTTP server.
 type listUploader interface {
-	List(ctx context.Context, limit, offset int) (*uploads.ListResponse, error)
+	List(ctx context.Context, opts uploads.ListOptions) (*uploads.ListResponse, error)
 }
 
 // retractUploader is the seam RetractPublishedFileTool talks to.
@@ -42,19 +42,25 @@ func NewListPublishedFilesTool(client listUploader) *ListPublishedFilesTool {
 }
 
 type listPublishedArgs struct {
-	Limit  int `json:"limit,omitempty"`
-	Offset int `json:"offset,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
+	Offset int    `json:"offset,omitempty"`
+	Kind   string `json:"kind,omitempty"`
 }
 
 func (t *ListPublishedFilesTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "list_my_published_files",
 		Description: "List the current user's still-active files previously published via " +
-			"`publish_to_web`. Returns up to 100 entries per page, newest first. " +
-			"Read-only — no approval needed.\n\n" +
+			"`publish_to_web` or shared via the session-share endpoint. Returns up to " +
+			"100 entries per page, newest first. Read-only — no approval needed.\n\n" +
 			"USE when the user asks 'what have I shared?', 'find that landing page I " +
 			"sent yesterday', or before calling `retract_published_file` (the LLM " +
 			"needs an `id` from this list — the public URL alone is not enough).\n\n" +
+			"Filter by business purpose with `kind`:\n" +
+			"  - `session_share` — HTML pages produced by the session share button\n" +
+			"  - `other` — everything uploaded via `publish_to_web` (default for this tool)\n" +
+			"  - `report` / `landing_page` / `image` — reserved for future producers\n" +
+			"  - omit `kind` to see all categories at once\n\n" +
 			"DO NOT USE for:\n" +
 			"  - Counting all-time uploads. `total_count` is the active (non-retracted) " +
 			"count under the current filter; retracted files are not listed.\n" +
@@ -75,6 +81,11 @@ func (t *ListPublishedFilesTool) Info() agent.ToolInfo {
 					"type":        "integer",
 					"description": "Skip the first N entries (default 0). Combine with `limit` to paginate when `total_count` exceeds the page.",
 					"minimum":     0,
+				},
+				"kind": map[string]any{
+					"type":        "string",
+					"description": "Optional business-purpose filter. Omit to list all uploads regardless of category.",
+					"enum":        []string{uploads.KindSessionShare, uploads.KindReport, uploads.KindLandingPage, uploads.KindImage, uploads.KindOther},
 				},
 			},
 		},
@@ -99,8 +110,15 @@ func (t *ListPublishedFilesTool) Run(ctx context.Context, argsJSON string) (agen
 	if offset < 0 {
 		offset = 0
 	}
+	kind := strings.TrimSpace(args.Kind)
+	if kind != "" && !uploads.IsValidKind(kind) {
+		return agent.ValidationError(fmt.Sprintf(
+			"invalid kind %q. Allowed: session_share, report, landing_page, image, other (or omit to list all).",
+			kind,
+		)), nil
+	}
 
-	res, err := t.client.List(ctx, limit, offset)
+	res, err := t.client.List(ctx, uploads.ListOptions{Limit: limit, Offset: offset, Kind: kind})
 	if err != nil {
 		return classifyListErr(err), nil
 	}
@@ -117,12 +135,22 @@ func (t *ListPublishedFilesTool) Run(ctx context.Context, argsJSON string) (agen
 	var sb strings.Builder
 	for i, u := range res.Uploads {
 		fmt.Fprintf(&sb, "[%d] %s\n", offset+i+1, u.ID)
-		fmt.Fprintf(&sb, "    %s  (%s, %s)  created %s\n",
-			u.Filename, humanizeBytes(u.Size), u.ContentType, u.CreatedAt)
+		// Surface kind so the LLM can answer "which of these are session shares
+		// vs. regular uploads" without re-querying.
+		kindBadge := u.Kind
+		if kindBadge == "" {
+			kindBadge = "other"
+		}
+		fmt.Fprintf(&sb, "    %s  (%s, %s, kind=%s)  created %s\n",
+			u.Filename, humanizeBytes(u.Size), u.ContentType, kindBadge, u.CreatedAt)
 		fmt.Fprintf(&sb, "    %s\n\n", u.URL)
 	}
 	end := offset + len(res.Uploads)
-	fmt.Fprintf(&sb, "Showing %d-%d of %d active file(s).", offset+1, end, res.TotalCount)
+	header := fmt.Sprintf("Showing %d-%d of %d active file(s)", offset+1, end, res.TotalCount)
+	if kind != "" {
+		header += fmt.Sprintf(" (kind=%s)", kind)
+	}
+	sb.WriteString(header + ".")
 	if end < res.TotalCount {
 		fmt.Fprintf(&sb, " Call again with offset=%d to see the next page.", end)
 	}

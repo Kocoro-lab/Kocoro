@@ -12,22 +12,34 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
-// summaryTimeout caps Haiku waits. Beyond this the fallback summary kicks in
-// so a slow LLM never blocks a user's share. Larger than the agent-loop
-// skill-discovery timeout (5s) because share is a user-initiated, foreground
-// action where waiting a few extra seconds is acceptable.
-const summaryTimeout = 15 * time.Second
+// summaryTimeout caps the Haiku summary call. Sized to absorb P99 small-tier
+// latency on a near-cap (540K rune) transcript without falling back to the
+// session-title / first-user-message fallback — landing on the fallback
+// means a public share page shows a truncated first user message instead of
+// a real overview, which is a worse UX than waiting a few extra seconds.
+//
+// Latency profile we're sizing for (small-tier, MaxTokens=200):
+//   P50 ≈ 3–5s   typical 5K rune transcript
+//   P95 ≈ 15s    cap-sized transcript, warm route
+//   P99 ≈ 25–30s cap-sized + cold path / queue
+//
+// 45s leaves ~33% safety margin over P99. Async share has shareTaskTimeout
+// (180s) above it, so summary+slug+upload+list still has 135s of headroom
+// after a summary worst case. Sync path consumers (CLI, ?async=false) wait
+// the full 45s on cold paths — acceptable because the alternative is a
+// disappointing fallback summary on the rendered share page.
+const summaryTimeout = 45 * time.Second
 
 // summaryFallbackChars caps the fallback summary's length so a long first
 // user message doesn't dominate the page when Haiku fails.
 const summaryFallbackChars = 200
 
-// summaryCacheSource tags the Haiku call as a share-feature internal helper
-// so Cloud-side billing skips user-quota accounting — parallel to how
-// "prompt_suggestion" is already exempted (see CLAUDE.md "Prompt Cache"
-// section). Cloud must include "session_share" in its billing exempt list
-// for the exemption to take effect; until then the call still bills the
-// user but the tag remains stable so the rollout is daemon-no-op.
+// summaryCacheSource tags the share-page Haiku calls (both summary and slug)
+// as a share-feature internal helper so Cloud-side billing skips user-quota
+// accounting — parallel to how "prompt_suggestion" is exempted. Cloud added
+// the "session_share" entry to its billing exempt list on 2026-05-15, so
+// every share now runs free of user quota; the tag has been in place since
+// share shipped, so the change was a pure Cloud-side flip.
 const summaryCacheSource = "session_share"
 
 // RenderResult bundles the rendered HTML with light telemetry callers may
@@ -115,7 +127,7 @@ func generateSummary(ctx context.Context, gw ctxwin.Completer, msgs []client.Mes
 	cctx, cancel := context.WithTimeout(ctx, summaryTimeout)
 	defer cancel()
 
-	summary, err := ctxwin.SummarizeForUserWithSource(cctx, gw, msgs, summaryCacheSource)
+	summary, err := ctxwin.SummarizeForShareWithSource(cctx, gw, msgs, summaryCacheSource)
 	if err != nil || strings.TrimSpace(summary) == "" {
 		return fallbackSummary(sess, msgs), true
 	}

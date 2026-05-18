@@ -89,35 +89,50 @@ func TestPersistAgentAlwaysAllow_HappyPath(t *testing.T) {
 	}
 }
 
-func TestPersistAgentAlwaysAllow_HighRiskRejected(t *testing.T) {
+// TestPersistAgentAlwaysAllow_FormerlyHighRiskNowPersists pins the 2026-05-18
+// policy change. publish_to_web / generate_image / edit_image USED to be
+// rejected with a warn notice; they now persist like any other tool. The
+// rejection plumbing (EventApprovalNotice + ErrToolNotPersistable) is
+// preserved so a future tool that genuinely cannot be persisted can use it
+// — but no tool occupies that slot today.
+func TestPersistAgentAlwaysAllow_FormerlyHighRiskNowPersists(t *testing.T) {
 	deps := setupDepsWithAgent(t, "risky")
 	ch := deps.EventBus.Subscribe()
 	defer deps.EventBus.Unsubscribe(ch)
 
 	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
-		if ok := PersistAgentAlwaysAllow(deps, "risky", tool); ok {
-			t.Errorf("%s should not have been persisted", tool)
+		if ok := PersistAgentAlwaysAllow(deps, "risky", tool); !ok {
+			t.Errorf("%s should now persist (deny-list is empty)", tool)
 		}
-		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "risky"); len(got) != 0 {
-			t.Errorf("%s leaked to disk: %v", tool, got)
+		got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "risky")
+		found := false
+		for _, t := range got {
+			if t == tool {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s should be persisted to disk; got %v", tool, got)
 		}
 
-		// Expect a warn notice on the bus.
+		// No warn notice should fire on the success path. Drain anything else
+		// that might have accumulated (e.g. cumulative add events from a prior
+		// iteration in this loop) by giving a brief window with strict assertion.
 		select {
 		case evt := <-ch:
-			if evt.Type != EventApprovalNotice {
-				t.Errorf("%s: expected %s, got %s", tool, EventApprovalNotice, evt.Type)
+			if evt.Type == EventApprovalNotice {
+				var payload struct {
+					Severity string `json:"severity"`
+					Message  string `json:"message"`
+				}
+				_ = json.Unmarshal(evt.Payload, &payload)
+				if payload.Severity == "warn" {
+					t.Errorf("%s: unexpected warn notice on success path: %+v", tool, payload)
+				}
 			}
-			var payload struct {
-				Severity string `json:"severity"`
-				Message  string `json:"message"`
-			}
-			_ = json.Unmarshal(evt.Payload, &payload)
-			if payload.Severity != "warn" {
-				t.Errorf("%s: expected severity warn, got %s", tool, payload.Severity)
-			}
-		case <-time.After(100 * time.Millisecond):
-			t.Errorf("%s: expected approval_notice event on high-risk rejection", tool)
+		case <-time.After(50 * time.Millisecond):
+			// Expected: no notice on success.
 		}
 	}
 }
@@ -313,9 +328,11 @@ func TestHandleAlwaysAllowDecision_NonBashDefaultAgent_GlobalToolLevel(t *testin
 	}
 }
 
-// TestHandleAlwaysAllowDecision_NonBashDefaultAgent_HighRiskRejected confirms
-// the global-default path still refuses high-risk tools.
-func TestHandleAlwaysAllowDecision_NonBashDefaultAgent_HighRiskRejected(t *testing.T) {
+// TestHandleAlwaysAllowDecision_NonBashDefaultAgent_FormerlyHighRiskPersists
+// pins the 2026-05-18 policy change for the global-default path. publish_to_web
+// used to be globally non-persistable with a warn notice; it now persists
+// like any other tool. (See autoApprovalDenyList trade-off notes.)
+func TestHandleAlwaysAllowDecision_NonBashDefaultAgent_FormerlyHighRiskPersists(t *testing.T) {
 	deps := newDepsWithConfig(t, "ignored")
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
 	ch := deps.EventBus.Subscribe()
@@ -324,21 +341,34 @@ func TestHandleAlwaysAllowDecision_NonBashDefaultAgent_HighRiskRejected(t *testi
 	HandleAlwaysAllowDecision(deps, broker, "", "publish_to_web",
 		`{"path":"/tmp/x.html","purpose":"share with user"}`)
 
-	if len(deps.Config.Permissions.AlwaysAllowTools) != 0 {
-		t.Errorf("publish_to_web must never be persisted globally, got: %v",
+	found := false
+	for _, t := range deps.Config.Permissions.AlwaysAllowTools {
+		if t == "publish_to_web" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("publish_to_web should now persist globally, got: %v",
 			deps.Config.Permissions.AlwaysAllowTools)
 	}
-	if broker.IsToolAutoApproved("publish_to_web") {
-		t.Error("publish_to_web must not be in broker auto-approve set")
+	if !broker.IsToolAutoApproved("publish_to_web") {
+		t.Error("publish_to_web should be in broker auto-approve set after persistence")
 	}
-	// Notice must fire.
+	// No warn notice expected on success.
 	select {
 	case evt := <-ch:
-		if evt.Type != EventApprovalNotice {
-			t.Errorf("expected %s, got %s", EventApprovalNotice, evt.Type)
+		if evt.Type == EventApprovalNotice {
+			var payload struct {
+				Severity string `json:"severity"`
+			}
+			_ = json.Unmarshal(evt.Payload, &payload)
+			if payload.Severity == "warn" {
+				t.Errorf("unexpected warn notice on success path: %+v", payload)
+			}
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Error("expected approval_notice on high-risk rejection (default agent path)")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: no notice.
 	}
 }
 
@@ -394,25 +424,13 @@ func TestAlwaysAllowNotice_I18nStructuredPayload(t *testing.T) {
 		wantCode string
 		wantTool string
 	}
+	// 2026-05-18 update: publish_to_web / generate_image / edit_image used to
+	// be on autoApprovalDenyList and produced NoticeCodeHighRiskNotPersistable
+	// here. The deny-list is now empty so they persist silently like any
+	// other tool; only the bash always-ask path still emits a structured notice.
+	// The NoticeCodeHighRiskNotPersistable constant + payload shape stay in
+	// place for the next time a tool needs that behavior.
 	cases := []caseT{
-		{
-			name: "high-risk tool on named agent",
-			invoke: func() {
-				HandleAlwaysAllowDecision(deps, broker, "writer", "publish_to_web",
-					`{"path":"/tmp/x.html","purpose":"share with user","description":"..."}`)
-			},
-			wantCode: NoticeCodeHighRiskNotPersistable,
-			wantTool: "publish_to_web",
-		},
-		{
-			name: "high-risk tool on default agent",
-			invoke: func() {
-				HandleAlwaysAllowDecision(deps, broker, "", "generate_image",
-					`{"prompt":"a cat","description":"draw a cat"}`)
-			},
-			wantCode: NoticeCodeHighRiskNotPersistable,
-			wantTool: "generate_image",
-		},
 		{
 			name: "bash always-ask command",
 			invoke: func() {
