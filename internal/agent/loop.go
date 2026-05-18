@@ -3258,6 +3258,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if a.handler != nil {
 				a.handler.OnText(fullText)
 			}
+			// Drain race guard: a user message can land in injectCh while the
+			// LLM is composing this "I'm done" reply. If we return now, the
+			// queued message strands in the mailbox until the next manual
+			// /run — leaving the UI's queue card visibly stuck even though
+			// the run completed. Continuing into another iteration lets the
+			// top-of-loop drain pick it up and respond to it in the same
+			// turn from the user's perspective.
+			if len(a.injectCh) > 0 {
+				continue
+			}
 			return fullText, usage, nil
 		}
 
