@@ -279,7 +279,7 @@ func (sc *SessionCache) SetRouteCancel(key string, cancel context.CancelFunc) {
 		entry.cancelPending = false
 	}
 	sc.mu.Unlock()
-	if pending {
+	if pending && cancel != nil {
 		cancel()
 	}
 }
@@ -361,6 +361,14 @@ func (sc *SessionCache) HasActiveRun(key string) bool {
 	if !ok || entry == nil {
 		return false
 	}
+	// Mid-cancellation routes report as inactive so callers (e.g.
+	// /message to InjectMessage gate) let a fresh RunAgent start instead
+	// of bouncing the request with 409 while the runner.go cleanup is
+	// still flushing the old run. Same race that InjectMessage handles;
+	// kept in sync here.
+	if entry.cancelPending {
+		return false
+	}
 	return entry.done != nil
 }
 
@@ -384,7 +392,18 @@ func (sc *SessionCache) InjectMessage(key string, msg agent.InjectedMessage) Inj
 	ch := entry.injectCh
 	done := entry.done
 	activeCWD := entry.activeCWD
+	cancelPending := entry.cancelPending
 	sc.mu.Unlock()
+	// Treat a route mid-cancellation as "no active run" so the caller can
+	// fall through to starting a fresh RunAgent. Without this, Desktop's
+	// interrupt-send (cancel to SSE close to immediate POST /message) races
+	// the runner.go cleanup that clears `done`, and the new prompt lands
+	// here while `done` is still non-nil but `cancelPending` is set,
+	// returning InjectBusy 409 to the client and surfacing as "SSE request
+	// failed" on the Desktop toolbar.
+	if cancelPending {
+		return InjectNoActiveRun
+	}
 	if done == nil {
 		return InjectNoActiveRun
 	}
@@ -488,10 +507,13 @@ func (sc *SessionCache) CancelRouteWithReason(key string, reason agenttypes.Canc
 	if ok && entry != nil {
 		cancel = entry.cancel
 		cancelCause = entry.cancelCause
-		if cancel == nil && cancelCause == nil {
-			entry.cancelPending = true
-			entry.pendingReason = reason
-		}
+		// Mark cancellation synchronously even when an active cancel function
+		// exists. Desktop interrupt-send closes/cancels the current run and
+		// immediately POSTs the replacement message; the inject gate must see
+		// that this route is winding down and start a fresh RunAgent instead
+		// of writing the replacement into the dying loop's injectCh.
+		entry.cancelPending = true
+		entry.pendingReason = reason
 	}
 	sc.mu.Unlock()
 	if cancelCause != nil {

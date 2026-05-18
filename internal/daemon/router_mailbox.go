@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -13,8 +12,9 @@ import (
 
 // MailboxOutcome describes the result of EnqueueMessage. It is wire-distinct
 // from the legacy InjectResult: EnqueueMessage is the ack-on-persist path
-// (Phase 1) used by cmd/daemon.go and the HTTP /message endpoint; InjectMessage
-// remains the in-memory mid-run drain channel path.
+// used by cmd/daemon.go and the HTTP /queue endpoint. InjectMessage remains
+// the separate in-memory "modify active run" path for explicit /message
+// injection.
 type MailboxOutcome int
 
 const (
@@ -152,38 +152,7 @@ func (sc *SessionCache) EnqueueMessage(key string, msg agenttypes.QueuedMessage)
 		return MailboxPersistFailed, err
 	}
 
-	// (5) Also notify the active run (if any) via its injectCh so the
-	// running agent loop's existing mid-turn drain (loop.go drain block)
-	// consumes this message in the next iteration boundary — without
-	// having to wait for the next RunAgent invocation to drain mailbox
-	// from scratch. The mailbox row is the durability backbone; injectCh
-	// is the "live notify" so users see their queued message merged into
-	// the current turn rather than the next.
-	//
-	// Non-blocking: if injectCh is full or absent, the message stays in
-	// the mailbox and will be drained by the next RunAgent start.
-	sc.mu.Lock()
-	ch := entry.injectCh
-	sc.mu.Unlock()
-	if ch != nil {
-		select {
-		case ch <- agent.InjectedMessage{Text: msg.Text, CWD: msg.CWD}:
-			log.Printf("daemon: mailbox→injectCh wrote %q (route=%s id=%s)", truncForLog(msg.Text, 60), key, msg.ID)
-		default:
-			// injectCh saturated — fine, mailbox still owns durability.
-			log.Printf("daemon: mailbox→injectCh full, leaving on disk (route=%s id=%s)", key, msg.ID)
-		}
-	} else {
-		log.Printf("daemon: mailbox→injectCh nil (no active run) (route=%s id=%s)", key, msg.ID)
-	}
 	return MailboxQueued, nil
-}
-
-func truncForLog(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
 }
 
 // DrainMailbox dequeues up to limit messages for the route. Returns nil for

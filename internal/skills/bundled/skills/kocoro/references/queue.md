@@ -1,6 +1,6 @@
 # Daemon API: `/queue`
 
-The daemon maintains a per-route **mailbox** of queued user messages. The mailbox is consumed at agent-loop turn boundaries — a user message sent while a loop is running is not rejected and does not open a new turn; it queues, is acknowledged to its source (Cloud `delivery_ack` or HTTP 200), and is merged into the next user turn the loop reaches.
+The daemon maintains a per-route **mailbox** of queued user messages. `POST /queue` is queue-only: it persists the message and updates the in-memory mailbox, but it does not inject the message into the currently running agent loop. Desktop-style clients either wait for the current turn to finish and then retract+send the queued text as a fresh turn, or cancel the current turn and force-send the queued text immediately.
 
 Persistence lives in `~/.shannon/sessions/mailbox.db`. Daemon crash recovery reloads pending rows on startup; durability boundary is **append-to-SQLite**, not network ack. See `internal/daemon/mailbox_store.go`.
 
@@ -57,7 +57,7 @@ The events bus (`GET /events`) publishes three queue-lifecycle events. Each even
 
 | Event `type` | Fires when | Payload |
 |---|---|---|
-| `queue.added` | `InjectMessage` succeeded (SQLite append + in-memory enqueue both committed) | `{ message_id, snapshot: [DTO] }` |
+| `queue.added` | `POST /queue` succeeded (SQLite append + in-memory enqueue both committed) | `{ message_id, snapshot: [DTO] }` |
 | `queue.removed` | `DELETE /queue/{id}` succeeded, or the drain skipped this item due to `SourceMailboxID` idempotency check | `{ message_id, snapshot: [DTO] }` |
 | `queue.flushed` | Drain consumed one or more items; `consumed_ids` lists them | `{ consumed_ids: [string], snapshot: [DTO] }` |
 
@@ -65,8 +65,8 @@ The events bus (`GET /events`) publishes three queue-lifecycle events. Each even
 
 ## Capacity & dedup
 
-- **Per-route cap** — `daemon.mailbox_max_per_route` (viper default `100`). `InjectMessage` returns `InjectQueueFull` when exceeded; daemon does NOT ack the source. Cloud will replay; Desktop should surface the failure.
-- **Per-message cap** — text + metadata ≤ 1 MB. Exceeding returns `InjectFailed`.
+- **Per-route cap** — `daemon.mailbox_max_per_route` (viper default `100`). `POST /queue` returns 503 when exceeded; daemon does NOT ack the source. Cloud will replay; Desktop should surface the failure.
+- **Per-message cap** — text + metadata <= 1 MB. Exceeding returns 413.
 - **Cloud `msg_id` dedup** — `mailbox` table uses `INSERT OR IGNORE` keyed on `(cloud_msg_id, route_key)`. Cloud-replay of an already-ack'd message becomes a no-op.
 
 ## Ordering guarantees
@@ -80,4 +80,4 @@ At-least-once delivery: after daemon crash, recovery reloads `consumed_at IS NUL
 - `internal/agenttypes/queued_message.go` — `QueuedMessage` type (full fidelity, daemon-internal).
 - `internal/daemon/queue_dto.go` — redacted DTO used by HTTP/SSE.
 - `internal/daemon/mailbox_store.go` — SQLite schema, append, mark-consumed, recovery.
-- `internal/daemon/router.go` — `InjectMessage` outcome dispatch.
+- `internal/daemon/router_mailbox.go` — mailbox enqueue, drain, retract, and session route helpers.

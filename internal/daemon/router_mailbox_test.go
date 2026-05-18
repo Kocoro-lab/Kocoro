@@ -218,12 +218,12 @@ func TestMailboxRetractMissingReturnsFalse(t *testing.T) {
 	}
 }
 
-func TestEnqueueMessage_AlsoNotifiesActiveRunInjectCh(t *testing.T) {
+func TestEnqueueMessage_DoesNotNotifyActiveRunInjectCh(t *testing.T) {
 	sc, _, cleanup := newCacheWithMailbox(t, 100)
 	defer cleanup()
 
 	// Simulate an active run by registering an injectCh on the route entry.
-	// This mirrors what runner.go does after LockRouteWithManager.
+	// Queue semantics are "next turn", not "mutate the current turn".
 	sc.mu.Lock()
 	entry := &routeEntry{injectCh: make(chan agent.InjectedMessage, 10)}
 	sc.routes["r1"] = entry
@@ -233,15 +233,13 @@ func TestEnqueueMessage_AlsoNotifiesActiveRunInjectCh(t *testing.T) {
 		t.Fatalf("enqueue: %s", outcome)
 	}
 
-	// The agent loop's mid-turn drain (loop.go ~line 2463) reads from
-	// injectCh non-blocking; we should see exactly one message ready.
 	select {
 	case got := <-entry.injectCh:
-		if got.Text != "msg a" {
-			t.Errorf("injectCh payload mismatch: %q", got.Text)
-		}
+		t.Fatalf("queued message leaked into active run injectCh: %q", got.Text)
 	case <-time.After(50 * time.Millisecond):
-		t.Fatal("EnqueueMessage did NOT write to injectCh — active run will not see the queued message")
+	}
+	if got := sc.MailboxLen("r1"); got != 1 {
+		t.Fatalf("queued message should remain pending for next turn, got mailbox len %d", got)
 	}
 }
 
@@ -269,9 +267,8 @@ func TestEnqueueMessage_InjectChFullStillSucceeds(t *testing.T) {
 	sc.routes["r1"] = &routeEntry{injectCh: saturated}
 	sc.mu.Unlock()
 
-	// Enqueue should still succeed (mailbox owns durability); the
-	// active run will pick this up from the mailbox on its next
-	// drain-from-store path.
+	// Enqueue should still succeed because queue semantics do not depend on
+	// the active run's injectCh.
 	out, err := sc.EnqueueMessage("r1", newQMsg("b"))
 	if err != nil || out != MailboxQueued {
 		t.Fatalf("saturated injectCh should not block enqueue: outcome=%s err=%v", out, err)

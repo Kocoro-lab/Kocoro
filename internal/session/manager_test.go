@@ -3,6 +3,7 @@ package session
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -476,3 +477,117 @@ func TestManager_Reset_ResetsWorkingSet(t *testing.T) {
 	}
 }
 
+
+func TestIsValidSessionID(t *testing.T) {
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		{"2026-05-18-d2c0db1e93bb", true}, // daemon-minted shape
+		{"abcdef12345678", true},          // generic lowercase hex
+		{"B5F8A3D2-9C4E-4D8A", true},      // truncated UUID-ish
+		{"a.b_c-d_e.f", true},             // mixed safe punctuation
+		{"short", false},                  // below 8-char floor
+		{"too..many/slashes", false},      // path traversal characters
+		{"contains space", false},
+		{"contains/slash", false},
+		{"contains\\backslash", false},
+		{"a@b", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := IsValidSessionID(c.id); got != c.want {
+			t.Errorf("IsValidSessionID(%q) = %v, want %v", c.id, got, c.want)
+		}
+	}
+	// Boundary lengths exercised via string-builder to keep the literal
+	// count honest:
+	if !IsValidSessionID(strings.Repeat("a", 8)) {
+		t.Error("8-char id should be valid (lower bound)")
+	}
+	if !IsValidSessionID(strings.Repeat("a", 80)) {
+		t.Error("80-char id should be valid (upper bound)")
+	}
+	if IsValidSessionID(strings.Repeat("a", 81)) {
+		t.Error("81-char id should be rejected (above cap)")
+	}
+	if IsValidSessionID(strings.Repeat("a", 7)) {
+		t.Error("7-char id should be rejected (below floor)")
+	}
+}
+
+func TestManager_NewSessionWithID_AssignsRequestedID(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	const requested = "client-minted-uuid-1234567"
+	sess := m.NewSessionWithID(requested)
+	if sess.ID != requested {
+		t.Fatalf("session.ID = %q, want %q", sess.ID, requested)
+	}
+	// Daemon-side persistence must accept the client id so a later
+	// resume can find the row by that exact key.
+	if err := m.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, requested+".json")); err != nil {
+		t.Fatalf("session file with client id not on disk: %v", err)
+	}
+	resumed, err := m.Resume(requested)
+	if err != nil {
+		t.Fatalf("Resume(%q): %v", requested, err)
+	}
+	if resumed.ID != requested {
+		t.Fatalf("resumed.ID = %q, want %q", resumed.ID, requested)
+	}
+}
+
+func TestManager_NewSessionWithID_EmptyFallsBackToGenerated(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	sess := m.NewSessionWithID("")
+	if !IsValidSessionID(sess.ID) {
+		t.Errorf("fallback id %q does not pass IsValidSessionID", sess.ID)
+	}
+}
+
+// TestManager_NewSessionWithID_OverwritesInMemoryButCallerCanResume captures
+// the contract the daemon's runner.go relies on: NewSessionWithID always
+// produces a blank in-memory Session under the requested id, even if a
+// session with that id already exists on disk. The runner is responsible
+// for trying Resume() FIRST and falling back to NewSessionWithID only when
+// Resume fails — this test exists so future changes don't add "skip if
+// already exists" logic here that would mask the runner's Resume-first
+// flow.
+func TestManager_NewSessionWithID_OverwritesInMemoryButCallerCanResume(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	const id = "shared-id-12345678"
+	first := m.NewSessionWithID(id)
+	first.Title = "first-was-here"
+	if err := m.Save(); err != nil {
+		t.Fatalf("Save first: %v", err)
+	}
+
+	// Resume must find the on-disk row.
+	resumed, err := m.Resume(id)
+	if err != nil {
+		t.Fatalf("Resume(%q): %v", id, err)
+	}
+	if resumed.Title != "first-was-here" {
+		t.Errorf("resumed.Title = %q, want %q", resumed.Title, "first-was-here")
+	}
+
+	// Calling NewSessionWithID with the same id again still produces a
+	// blank session in memory — caller must guard with Resume first if
+	// they want history preserved.
+	blank := m.NewSessionWithID(id)
+	if blank.Title == "first-was-here" {
+		t.Error("NewSessionWithID should not carry forward disk state by itself")
+	}
+}

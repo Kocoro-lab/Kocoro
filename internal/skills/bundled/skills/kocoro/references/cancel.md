@@ -19,7 +19,7 @@ Cancels an in-flight agent run on a specific route. Extends the original simpler
 | `reason` | Use case | Cleanup |
 |---|---|---|
 | `user_cancel` | Typical Esc-from-prompt. UI user pressed Esc with empty input + empty queue. | Loop's `context.Cause` returns `ReasonUserCancel`. Partial assistant text is preserved as an `assistant` message with `metadata.incomplete=true`. Tools tagged `InterruptBlock` finish; tools tagged `InterruptCancel` abort. |
-| `interrupt` | User submitted a new message while a tool was running. The daemon publishes `cancel.restored=false` and immediately drains the mailbox into the next user turn. | Same as `user_cancel` for tool dispatch, but the "Request interrupted by user" sentinel is suppressed in the transcript (the queued message provides the context). |
+| `interrupt` | User force-sent a queued/replacement message while a run was active. The daemon marks the route as cancelling immediately so the next `POST /message` starts a fresh run instead of injecting into the dying loop. | Same as `user_cancel` for tool dispatch, but the "Request interrupted by user" sentinel is suppressed in the transcript (the replacement message provides the context). |
 | `background` | Programmatic detach (Desktop's "minimize agent" action). | NO partial-text preservation, NO restore, NO sentinel — silent. |
 
 The daemon never silently maps unknown `reason` values. Unknown reason → 400.

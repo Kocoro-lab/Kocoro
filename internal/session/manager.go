@@ -4,11 +4,28 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
+
+// validSessionIDPattern restricts client-supplied session IDs to a safe shape.
+// Allowed: 8–80 chars of [A-Za-z0-9._-]. The cap matches generateID's
+// "YYYY-MM-DD-<hex>" upper bound; the character class permits both daemon-minted
+// IDs and Desktop's lowercase UUIDs while refusing path separators (`/`, `..`)
+// and whitespace so the ID can be embedded in a filesystem path without
+// further sanitization.
+var validSessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{8,80}$`)
+
+// IsValidSessionID reports whether the given ID is shaped like one the
+// session store will accept. Used by daemon handlers that take a client-
+// supplied ID (e.g. interrupt-send carrying a Desktop-minted UUID) to
+// reject malformed input at the wire boundary.
+func IsValidSessionID(id string) bool {
+	return validSessionIDPattern.MatchString(id)
+}
 
 // Manager provides session lifecycle operations. It is safe for concurrent use
 // across multiple route entries that share the same sessions directory.
@@ -33,12 +50,33 @@ func NewManager(sessionsDir string) *Manager {
 }
 
 func (m *Manager) NewSession() *Session {
+	return m.newSessionWithID("")
+}
+
+// NewSessionWithID creates a fresh session whose ID is supplied by the
+// caller instead of minted by the daemon. Used by the HTTP /message
+// path when the client opts into client-minted UUIDs — fixes the
+// "interrupt-send creates duplicate session" race where the client's
+// follow-up POST arrives before the server has emitted the
+// `session_started` SSE event carrying the daemon-minted ID, so the
+// client cannot reference the still-in-flight session by id.
+//
+// id must already satisfy IsValidSessionID; the caller is responsible
+// for validating before calling. Empty id falls back to generateID().
+func (m *Manager) NewSessionWithID(id string) *Session {
+	return m.newSessionWithID(id)
+}
+
+func (m *Manager) newSessionWithID(requestedID string) *Session {
 	m.mu.Lock()
 	prevID := ""
 	if m.current != nil {
 		prevID = m.current.ID
 	}
-	id := generateID()
+	id := requestedID
+	if id == "" {
+		id = generateID()
+	}
 	// CWD is intentionally left empty — callers (daemon runner, TUI,
 	// one-shot CLI) are responsible for setting it explicitly based on
 	// their own context. Historically this was populated via os.Getwd()

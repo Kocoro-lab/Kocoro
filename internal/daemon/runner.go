@@ -683,6 +683,10 @@ func routeTitle(source, channel, sender string) string {
 	if s == "" {
 		return ""
 	}
+	switch s {
+	case "desktop", "shanclaw", "kocoro":
+		return ""
+	}
 	label := strings.ToUpper(s[:1]) + s[1:]
 
 	// Use sender name when available (e.g. "Slack · Wayland")
@@ -1148,6 +1152,28 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	resumed := false
 	switch {
+	case req.NewSession && req.SessionID != "":
+		// Client-minted ID path: the caller (Desktop) generated the UUID
+		// before the first POST so subsequent follow-ups can carry the
+		// same id without waiting for the daemon's `session_started`
+		// event. Without this branch, NewSession=true would route to the
+		// generic NewSession() below and the daemon would mint its own
+		// id — defeating the whole point.
+		//
+		// Idempotency: a follow-up POST may STILL carry new_session=true
+		// when the client's pending-marker hadn't been cleared by the
+		// `session_started` SSE event yet (the race we're fixing).
+		// Resume first so a second-POST-while-first-not-acked re-binds
+		// to the existing session instead of wiping the in-progress
+		// history with a fresh blank Session.
+		if !session.IsValidSessionID(req.SessionID) {
+			return nil, fmt.Errorf("invalid session_id format: %q", req.SessionID)
+		}
+		if _, err := sessMgr.Resume(req.SessionID); err == nil {
+			resumed = true
+		} else {
+			sessMgr.NewSessionWithID(req.SessionID)
+		}
 	case req.SessionID != "":
 		// Resume a specific session by ID (reuses cached manager to avoid DB handle leak).
 		if _, err := sessMgr.Resume(req.SessionID); err != nil {
@@ -1199,15 +1225,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// ComputeRouteKey returns "" for Desktop's default-agent path (source=
 	// "desktop" with no channel/agent), which sends those runs through the
 	// `route == nil` branch above without any SessionCache entry. That means
-	// a subsequent POST /queue with `session_id` cannot reach the running
-	// loop — `RouteKeyForSession` finds no match and EnqueueMessage can't
-	// write into an injectCh that was never registered.
+	// a subsequent POST /cancel or explicit POST /message injection with
+	// `session_id` cannot reach the running loop; `RouteKeyForSession`
+	// finds no match.
 	//
-	// To make mid-turn injection work for the default-agent path we now
-	// register a transient entry under "session:<sess.ID>" once sessions
-	// have resolved. The entry carries this run's cancel func + done chan
-	// + injectCh + activeCWD so POST /queue, POST /cancel, and the existing
-	// mid-turn drain in agent loop all locate the active run via session_id.
+	// To make cancellation and explicit mid-turn injection work for the
+	// default-agent path we register a transient entry under
+	// "session:<sess.ID>" once sessions have resolved. The entry carries
+	// this run's cancel func + done chan + injectCh + activeCWD so
+	// POST /cancel and POST /message can locate the active run via
+	// session_id. POST /queue is queue-only and does not write injectCh.
 	//
 	// Note: only fires when `route == nil` AND sess.ID is non-empty — the
 	// routed branch above already set up its own injectCh/cancel for runs
@@ -1618,6 +1645,28 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	if routeInjectCh != nil {
 		loop.SetInjectCh(routeInjectCh)
+	}
+	// Wire mailbox row consumption for legacy injected mailbox IDs. The
+	// modern POST /queue path is queue-only, but this keeps older injected
+	// ID paths idempotent if they appear in a live loop.
+	if req.RouteKey != "" {
+		routeKey := req.RouteKey
+		loop.SetMailboxConsumeFn(func(ids []string) {
+			if len(ids) == 0 {
+				return
+			}
+			if err := deps.SessionCache.MarkMailboxConsumed(ids); err != nil {
+				log.Printf("daemon: MarkMailboxConsumed(%v): %v", ids, err)
+			}
+			if deps.EventBus != nil {
+				payload, _ := json.Marshal(map[string]any{
+					"route_key":    routeKey,
+					"consumed_ids": ids,
+					"snapshot":     ToDTOs(deps.SessionCache.MailboxSnapshot(routeKey)),
+				})
+				deps.EventBus.Emit(Event{Type: EventQueueFlushed, Payload: payload})
+			}
+		})
 	}
 	loop.SetSessionID(sess.ID)
 	loop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)

@@ -638,7 +638,14 @@ type RunStatusHandler interface {
 // Text is appended as a new user turn at the next iteration boundary.
 // CWD is optional metadata used by higher layers to enforce immutable
 // project-context policies; the loop currently ignores it.
+// ID is the durable mailbox row identifier (set by the daemon when the
+// message originated from a SQLite mailbox row). When set, the loop hands
+// it to the mailbox-consume callback after appending the message so the
+// row is marked done — otherwise the next RunAgent's startup drain would
+// re-inject the same text and prepend it to the next user prompt, which
+// surfaces as a merged user bubble in Desktop.
 type InjectedMessage struct {
+	ID    string
 	Text  string
 	CWD   string
 	Files []InjectedFile // optional; empty for text-only injects (TUI keyboard, legacy callers)
@@ -686,6 +693,14 @@ type AgentLoop struct {
 	sessionCWD       string      // session-scoped working directory; set by runner/TUI before Run()
 	deltaProvider    DeltaProvider
 	injectCh         chan InjectedMessage
+	injectedMessages []string         // messages injected during the last Run(); cleared on each Run() call
+	// mailboxConsumeFn, when set, is invoked with the mailbox row IDs of any
+	// InjectedMessage entries the loop drained mid-turn. The daemon installs
+	// this hook to mark those rows consumed in SQLite + emit queue.flushed
+	// for SSE subscribers. Without it, the durable mailbox row would survive
+	// the run and be re-prepended to the next user prompt by runner.go's
+	// startup drain, producing visible "merged user bubble" regressions.
+	mailboxConsumeFn func(ids []string)
 	runMessages      []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
 	runMsgInjected   []bool           // parallel to runMessages: true = system-injected guardrail/nudge
 	runMsgTimestamps []time.Time      // parallel to runMessages: when each message was created
@@ -1085,6 +1100,17 @@ func (a *AgentLoop) InvalidateWorkingSet() {
 // so multiple messages are batched.
 func (a *AgentLoop) SetInjectCh(ch chan InjectedMessage) {
 	a.injectCh = ch
+}
+
+// SetMailboxConsumeFn registers a callback fired with mailbox row IDs
+// after the loop appends them as a user turn. Daemon callers wire this to
+// MarkMailboxConsumed + EventQueueFlushed so the durable row is retired
+// and Desktop's queue card clears in step with the actual drain.
+//
+// Pass nil to clear. Callback is invoked synchronously inside the loop's
+// drain block — keep it fast (or run heavy work in a goroutine).
+func (a *AgentLoop) SetMailboxConsumeFn(fn func(ids []string)) {
+	a.mailboxConsumeFn = fn
 }
 
 // SetDeltaProvider configures a provider for mid-run state change deltas.
@@ -2469,20 +2495,33 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if drained := drainInjected(a.injectCh); len(drained) > 0 {
 				if newMsg, ok := buildInjectedUserMessage(drained); ok {
 					a.tracker.Enter(PhaseInjectingMessage)
-					// latestUserText tracks the user-typed text for the deferred-tool
-					// continuation nudge — Files don't have a text equivalent, so
-					// only count text from each drained message.
+					// Collect text for latestUserText (deferred-tool continuation
+					// nudge), the legacy a.injectedMessages tracker, and mailbox
+					// row IDs for the consume hook — all in one pass.
 					var texts []string
+					var injectedIDs []string
 					for _, m := range drained {
 						if m.Text != "" {
 							texts = append(texts, m.Text)
+						}
+						if m.ID != "" {
+							injectedIDs = append(injectedIDs, m.ID)
 						}
 					}
 					latestUserText = strings.Join(texts, "\n\n")
 					messages = append(messages, newMsg)
 					stampMessage()
+					a.injectedMessages = append(a.injectedMessages, texts...)
 					if a.handler != nil {
 						a.handler.OnText("")
+					}
+					// Retire the underlying SQLite mailbox rows so runner.go's
+					// next-RunAgent drain does not re-prepend the same text to
+					// the next user prompt. Missing this hook produced the
+					// "original query bubble shows the queued follow-up text on
+					// top of itself" regression.
+					if a.mailboxConsumeFn != nil && len(injectedIDs) > 0 {
+						a.mailboxConsumeFn(injectedIDs)
 					}
 				}
 			}
