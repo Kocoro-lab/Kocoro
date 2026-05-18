@@ -1,12 +1,55 @@
 # Changelog
 
-All notable changes to ShanClaw are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
+All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## Unreleased
+## v0.1.11 — 2026-05-18 — Async share, mid-turn attachments, streaming bypass, max-tokens handling
 
-### Changed
+Ships an async session-share path so the publish round-trip no longer blocks the caller (daemon owns the share state machine end-to-end), adds mid-turn attachment threading so a user can drop a file into an already-running turn, switches the daemon to streaming end-to-end so completions are no longer capped by the Anthropic non-streaming 16K ceiling, and tightens behavior around `stop_reason=max_tokens` so truncated tool calls don't get retried into a stuck loop. Three security/correctness fixes ship alongside: session_id path traversal (#158), Authorization-header leak on cross-host redirect, and `file_read` runaway via the spill exemption + 500K rune hard cap (#161).
 
-- **`PUT /skills/{name}` returns 409 on existing slug instead of silent upsert** (`internal/daemon/server.go`, PR #139) — manual skill create / edit through the daemon HTTP API previously did a silent upsert (200 on update). Now mirrors `POST /skills/upload`'s conflict gate: returns `409` with `{error: "skill_already_exists", existing_name, existing_description, existing_prompt, new_description, new_prompt}` (prompts truncated to 8 KB via the shared `TruncatePromptPreview`) unless `?force=true` is appended to opt into overwrite. External callers using PUT as upsert (custom scripts, CI, third-party MCP clients) must update to either add `?force=true` or surface the side-by-side compare to the user. Builtin slugs (`kocoro`, `kocoro-generative-ui`) return `403 skill_is_builtin` regardless of `force` — `EnsureBuiltinSkills` would wipe overrides on next restart anyway. A malformed existing SKILL.md now returns `422` even with `force=true` to prevent silently clobbering security-critical fields like `AllowedTools` / `Metadata` on a transient FS error.
+### Added
+
+- **Async session share + approval/share unification** (PR #170, `internal/daemon/share_async.go`, `internal/daemon/share_handler.go`) — `POST /sessions/{id}/share` returns immediately with a job state; the daemon renders, uploads, and finalizes in the background. Daemon is the single source of truth for share state (summary, status, retry, finalize); the post-upload `LIST` lookup filters by `kind=session_share` so concurrent landing-page / image uploads can't shove the row off the first page. Also: timestamp consistency across summary / approval / share events, and approval denylist cleanup (`publish_to_web`, `generate_image`, `edit_image` no longer special-cased — they go through ordinary approval-required-tool flow, with always-allow persistence available).
+- **Mid-turn attachments** (PR #162, `internal/agent/inject_types.go`, `internal/daemon/runner.go`) — `InjectedMessage` carries a `Files []InjectedFile` slice; `ConvertFilesToInjected` materializes them as content blocks into the in-flight user turn (subject to the same `oversize_image.go` guards as initial-turn attachments). A `HasActiveRun` probe runs before the download so cancelled runs don't pull bytes (`f3bad5b`).
+- **Streaming bypasses 16K non-streaming cap** (commit `c0f0c87`) — daemon → cloud is now streaming by default so completions can exceed Anthropic's non-streaming completion ceiling. Truncated trailing `tool_use` blocks under `stop_reason=max_tokens` are now suppressed (`343fae4`, PR #155) and the continuation-prompt is flagged as injected (`556e9dc`, PR #172) so the next turn's input is correctly attributed.
+- **Reply-complete banner notification** (commits `2c87de3`, `bac68ad`, `5e9e0c5`) — emits a system notification when a reply finishes. Darwin-only guard, channel-source filtering (TUI/CLI/web suppressed; only daemon-distributed sources notify), markdown stripped from the body.
+- **审批事件 + 定时任务生命周期通知** (PR #156) — richer approval lifecycle events on the wire, scheduled-task pre-run / completion / failure events surfaced through the bus. `internal/daemon/approval_events_test.go` (+855 LOC) covers the new event matrix.
+
+### Fixed
+
+- **Path traversal via `session_id`** (PR #158, `internal/daemon/validate.go`) — `safeSessionPath` now rejects `.`, `..`, and embedded traversal sequences before any join. `validate_test.go` asserts the rejection message.
+- **`file_read` spill exemption + 500K rune hard cap** (PR #161, `internal/tools/file_read.go`) — `file_read` no longer routes through the per-result spill path (which had been silently shortening large reads into 2K previews). It now self-bounds at `fileReadHardCapRunes = 500_000` with a clear truncation marker. Rationale (workload / symptom / override) documented inline per the new hardcoded-limit policy (`fb1836f`).
+- **Chrome teardown after browser-using runs** (PR #166, `internal/mcp/chrome.go`) — Playwright MCP child + Chrome instance are reliably torn down at end of run; previously could leak processes across multiple browser-using runs. New `chrome_test.go` covers the lifecycle (+387 LOC).
+- **Skill installs retry on transient git failure** (PR #171, `internal/skills/marketplace.go`) — `MarketplaceInstall` now retries on transient `git fetch` failures with bounded backoff, and emits an audit row for every install operation (success or failure). Eliminates a class of false-failure user reports.
+- **Authorization stripped on cross-host redirect** (commit `86e09f3`, `internal/daemon/client.go`) — daemon HTTP client now mirrors Go stdlib's `CheckRedirect` policy: when redirected to a different host, the `Authorization` header is dropped before the redirected request. Defense-in-depth against accidental token leak to an external host.
+- **Per-turn truncation recoveries capped at 3** (commit `f7c51e9`, `internal/agent/loop.go`) — prevents a pathological model output from causing unbounded "truncation → continue → truncation" recoveries within a single turn.
+
+### Docs
+
+- `run_status` codes documented in `internal/skills/bundled/skills/kocoro/references/events.md`; truncation comments tightened (commit `7e54db5`).
+- `file_read` hard-cap rationale inlined per the new hardcoded-limit policy (commit `fb1836f`).
+- Inject-priority comment and dev-guide spill row corrected (commit `8485fc9`).
+- Stdlib redirect-strip gating clarified in `CheckRedirect` comment (commit `ca6322d`).
+
+### Cross-repo consumers
+
+- **Kocoro Desktop**: the async-share state machine now lives daemon-side. The Desktop client should poll the share endpoint for terminal state rather than awaiting the original POST. Approval denylist removal means `publish_to_web` / `generate_image` / `edit_image` will surface "Always Allow" buttons on first approval; UI copy should reflect that these are now persistable like other approval-required tools.
+- **Shannon Cloud**: streaming-by-default daemons can now receive responses beyond the legacy 16K non-streaming cap. Cloud should not introduce a regression cap on the streaming path.
+
+---
+
+## v0.1.7 — v0.1.10
+
+These releases were tagged without CHANGELOG entries; see annotated tag messages
+(`git tag -l v0.1.10 -n50`) and the
+[GitHub Releases page](https://github.com/Kocoro-lab/Kocoro/releases) for the
+per-release "Highlights" notes. Major themes across this window:
+
+- **v0.1.10** (2026-05-15) — Session share to web (#152), persistent notification history JSONL, bash command concurrency Phase C default-on (#151), image dimension cap (#153).
+- **v0.1.9** (2026-05-14) — `PUT /skills/{name}` returns 409 on conflict instead of silent upsert (#139, with `?force=true` opt-in and `403 skill_is_builtin` for builtin slugs).
+- **v0.1.8** (2026-05-13) — Kocoro rebrand Round 1 follow-ups.
+- **v0.1.7** (2026-05-13) — ShanClaw → Kocoro rebrand Round 1.
+
+---
 
 ## v0.1.6 — 2026-05-12 — Inbound attachments + skill ZIP upload + episodic-memory default revert
 
