@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
@@ -85,6 +86,11 @@ func (t *NotifyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 // a NotifyHandler is attached to ctx; otherwise falls back to osascript so the
 // banner still fires in headless mode. Shared by the notify tool and the
 // daemon's reply-complete banner so both honor the same delivery contract.
+//
+// The osascript fallback is macOS-only: on Linux/Windows it returns an
+// `executable file not found` error. Callers that fire SendBanner implicitly
+// (rather than via an agent-invoked tool) should gate on `runtime.GOOS ==
+// "darwin"` to keep headless deployments quiet.
 func SendBanner(ctx context.Context, title, body string, sound bool) error {
 	if h := NotifyHandlerFrom(ctx); h != nil {
 		if h(title, body, sound) {
@@ -95,7 +101,10 @@ func SendBanner(ctx context.Context, title, body string, sound bool) error {
 	cmd := exec.CommandContext(ctx, "osascript", "-e", script)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%w: %s", err, string(output))
+		if out := strings.TrimSpace(string(output)); out != "" {
+			return fmt.Errorf("%w: %s", err, out)
+		}
+		return err
 	}
 	return nil
 }

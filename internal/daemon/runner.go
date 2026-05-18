@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -424,6 +426,49 @@ func outputFormatForSource(source string) string {
 		return "plain"
 	}
 	return "markdown"
+}
+
+// silentBannerSources lists request sources whose `agent_reply` should NOT
+// trigger the daemon's reply-complete macOS banner. Cloud-distributed channels
+// (slack/line/feishu/lark/telegram/webhook) are filtered separately via
+// isCloudSource — those deliver the reply elsewhere. The entries here are the
+// autonomous local sources that fire frequently without a foregrounded user:
+//   - heartbeat: per-agent self-pings on a timer (internal/heartbeat)
+//   - watcher:   filesystem-change triggered runs (cmd/daemon.go watcher)
+//   - mcp:       another MCP client owns the response; banner is noise
+//
+// schedule/cron stay opted-in — those are exactly the background completions
+// the user wants surfaced.
+var silentBannerSources = map[string]struct{}{
+	"heartbeat": {},
+	"watcher":   {},
+	"mcp":       {},
+}
+
+// shouldEmitReplyBanner reports whether a reply-complete banner should fire
+// for the given request source. Returns false for cloud-distributed channels
+// (reply delivered elsewhere) and for autonomous local sources that would
+// spam the notification center.
+func shouldEmitReplyBanner(source string) bool {
+	if isCloudSource(source) {
+		return false
+	}
+	_, silent := silentBannerSources[strings.ToLower(strings.TrimSpace(source))]
+	return !silent
+}
+
+// markdownStripRE matches the small set of markdown markers that read poorly
+// in a macOS notification: backticks (inline code + fences), bold/italic
+// asterisks and underscores, leading hashes for headers, and the `[text](url)`
+// link wrapper (the captured `text` is restored by the replacement). Heavier
+// constructs (tables, html, fenced code bodies) are out of scope — banners are
+// 140 chars and the goal is readability, not faithful rendering.
+var markdownStripRE = regexp.MustCompile(`\x60+|\*+|_+|^#{1,6}\s+|\[([^\]]+)\]\([^)]*\)`)
+
+// stripMarkdownLite removes the markdown markers most likely to read as
+// visible cruft in a banner. Idempotent and safe on plain text.
+func stripMarkdownLite(s string) string {
+	return markdownStripRE.ReplaceAllString(s, "$1")
 }
 
 // IsMessagingPlatform returns true for sources where the gateway delivers
@@ -1512,18 +1557,19 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 			// Reply-complete banner: routes through tools.SendBanner so it honors
 			// the same Desktop-handler-or-osascript-fallback contract as the
-			// notify tool. The handler wired at the top of this function emits
-			// EventNotification via EmitTo; when no subscriber is attached
-			// SendBanner falls back to osascript so the banner still fires in
-			// headless mode. Skip cloud-distributed sources (Slack/LINE/etc.) —
-			// the reply is already delivered through the channel — and skip when
-			// there is no text to show (force-stop with empty result).
-			if !isCloudSource(req.Source) && result != "" {
-				title := agentName
-				if title == "" {
-					title = "Kocoro"
+			// notify tool. Skip when there is nothing to show or the source
+			// already delivers the reply elsewhere (cloud channels) or fires
+			// autonomously and would spam (heartbeat/watcher/mcp). The osascript
+			// fallback is macOS-only — skip the call on other platforms to keep
+			// headless Linux daemons silent instead of log-spamming a missing
+			// binary on every turn.
+			if runtime.GOOS == "darwin" && result != "" && shouldEmitReplyBanner(req.Source) {
+				title := "Kocoro"
+				if agentName != "" {
+					title = "Kocoro · " + agentName
 				}
-				if err := tools.SendBanner(ctx, title, redactAndTruncate(result, 140), false); err != nil {
+				body := truncate(stripMarkdownLite(audit.RedactSecrets(result)), 140)
+				if err := tools.SendBanner(ctx, title, body, false); err != nil {
 					log.Printf("daemon: reply-complete banner failed (session=%s): %v", sess.ID, err)
 				}
 			}
