@@ -401,7 +401,9 @@
     gap: 8px;
   }
   footer.share-footer a {
-    color: var(--accent);
+    /* Kocoro brand color — hardcoded so it stays consistent across light/dark
+       themes and doesn't drift if --accent is re-tuned for other UI accents. */
+    color: #FE2F5C;
     text-decoration: none;
     font-weight: 500;
   }
