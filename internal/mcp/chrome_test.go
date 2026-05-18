@@ -1212,3 +1212,133 @@ func TestReleaseAndMaybeTeardown_PropagatesStopError(t *testing.T) {
 		t.Fatalf("expected wrapped wantErr, got %v", err)
 	}
 }
+
+func TestStopCDPChromeAndWait_NoOpWhenChromeNotRunning(t *testing.T) {
+	home := t.TempDir()
+	// Pre-write a stale PID file to verify it gets cleaned up.
+	_ = os.MkdirAll(filepath.Join(home, ".shannon"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp.pid"), []byte("99999\n"), 0o600)
+
+	fe := &fakeChromeExec{}
+	installChromeTestHooks(t, home, fe.command, func() bool { return false }, func() string { return "" })
+
+	if err := StopCDPChromeAndWait(context.Background()); err != nil {
+		t.Fatalf("expected nil for not-running Chrome, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".shannon", "chrome-cdp.pid")); !os.IsNotExist(err) {
+		t.Fatalf("expected stale PID file removed, stat err=%v", err)
+	}
+	for _, call := range fe.snapshotCalls() {
+		if strings.HasPrefix(call, "pkill ") || strings.HasPrefix(call, "kill ") {
+			t.Fatalf("expected no signal sent, got %q", call)
+		}
+	}
+}
+
+func TestStopCDPChromeAndWait_DiesOnTerm(t *testing.T) {
+	home := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(home, ".shannon"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp.pid"), []byte("12345\n"), 0o600)
+
+	// Alive=true on first poll, false thereafter.
+	aliveCalls := 0
+	aliveFn := func() bool {
+		aliveCalls++
+		return aliveCalls <= 1
+	}
+
+	fe := &fakeChromeExec{}
+	installChromeTestHooks(t, home, fe.command, aliveFn, func() string { return "12345" })
+
+	if err := StopCDPChromeAndWait(context.Background()); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".shannon", "chrome-cdp.pid")); !os.IsNotExist(err) {
+		t.Fatalf("expected PID file removed, stat err=%v", err)
+	}
+	for _, call := range fe.snapshotCalls() {
+		if strings.Contains(call, "kill -9") {
+			t.Fatalf("expected no SIGKILL, got %q", call)
+		}
+	}
+}
+
+func TestStopCDPChromeAndWait_EscalatesToKill(t *testing.T) {
+	home := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(home, ".shannon"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp.pid"), []byte("12345\n"), 0o600)
+
+	// Alive until the SIGKILL fake-fires: poll counter > N flips it dead.
+	killSeen := false
+	aliveFn := func() bool { return !killSeen }
+
+	fe := &fakeChromeExec{kill9OK: true}
+	// Wrap command to flip killSeen when we see kill -9.
+	origCmd := fe.command
+	wrappedCmd := func(name string, args ...string) *exec.Cmd {
+		if name == "kill" && len(args) >= 1 && args[0] == "-9" {
+			killSeen = true
+		}
+		return origCmd(name, args...)
+	}
+	installChromeTestHooks(t, home, wrappedCmd, aliveFn, func() string { return "12345" })
+
+	if err := StopCDPChromeAndWait(context.Background()); err != nil {
+		t.Fatalf("expected nil after SIGKILL escalation, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".shannon", "chrome-cdp.pid")); !os.IsNotExist(err) {
+		t.Fatalf("expected PID file removed after kill, stat err=%v", err)
+	}
+	sawKill := false
+	for _, call := range fe.snapshotCalls() {
+		if strings.Contains(call, "kill -9 12345") {
+			sawKill = true
+			break
+		}
+	}
+	if !sawKill {
+		t.Fatalf("expected SIGKILL on pid 12345 in calls: %v", fe.snapshotCalls())
+	}
+}
+
+func TestStopCDPChromeAndWait_PreservesPIDFileWhenChromeSurvivesKill(t *testing.T) {
+	home := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(home, ".shannon"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp.pid"), []byte("12345\n"), 0o600)
+
+	// Alive returns true forever — Chrome is unkillable.
+	fe := &fakeChromeExec{}
+	installChromeTestHooks(t, home, fe.command, func() bool { return true }, func() string { return "12345" })
+
+	err := StopCDPChromeAndWait(context.Background())
+	if err == nil {
+		t.Fatal("expected error when Chrome survives SIGKILL")
+	}
+	// PID file must NOT be removed — matches CleanupOrphanedCDPChrome contract.
+	if _, statErr := os.Stat(filepath.Join(home, ".shannon", "chrome-cdp.pid")); statErr != nil {
+		t.Fatalf("expected PID file preserved, stat err=%v", statErr)
+	}
+}
+
+func TestStopCDPChromeAndWait_ContextCancellationStopsPolling(t *testing.T) {
+	home := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(home, ".shannon"), 0o700)
+	_ = os.WriteFile(filepath.Join(home, ".shannon", "chrome-cdp.pid"), []byte("12345\n"), 0o600)
+
+	fe := &fakeChromeExec{}
+	installChromeTestHooks(t, home, fe.command, func() bool { return true }, func() string { return "12345" })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled
+
+	start := time.Now()
+	err := StopCDPChromeAndWait(ctx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error on cancelled ctx with surviving Chrome")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("expected fast return on pre-cancelled ctx, took %v", elapsed)
+	}
+}

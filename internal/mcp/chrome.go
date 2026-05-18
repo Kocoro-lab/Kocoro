@@ -554,6 +554,95 @@ func StopCDPChrome() {
 	log.Printf("[chrome-cdp] SIGTERM sent to CDP Chrome")
 }
 
+const (
+	// chromeTermGrace is how long StopCDPChromeAndWait waits after SIGTERM
+	// before escalating to SIGKILL. Matches existing waitForCDPChromeExit.
+	chromeTermGrace = 3 * time.Second
+	// chromeKillGrace is how long StopCDPChromeAndWait waits after SIGKILL
+	// before declaring Chrome unkillable.
+	chromeKillGrace = 2 * time.Second
+	// chromePollInterval is the polling cadence inside the grace windows.
+	chromePollInterval = 150 * time.Millisecond
+)
+
+// StopCDPChromeAndWait stops the daemon-owned dedicated CDP Chrome and cleans
+// up its state files. Unlike StopCDPChrome (non-blocking, for daemon shutdown),
+// this function verifies Chrome actually exits and escalates to SIGKILL when
+// SIGTERM is ignored.
+//
+// Behavior:
+//   - No daemon-owned Chrome alive (clean state or stale PID file from a prior
+//     manual close): remove PID file + WS cache, return nil.
+//   - SIGTERM, then poll up to chromeTermGrace. If dead: clean state, return nil.
+//   - SIGKILL the main pid, poll up to chromeKillGrace. If dead: clean state, return nil.
+//   - Still alive after SIGKILL: leave PID file intact (matches
+//     CleanupOrphanedCDPChrome contract), return error.
+//
+// ctx provides cancellation; on cancellation returns whatever state was reached.
+func StopCDPChromeAndWait(ctx context.Context) error {
+	clearCachedBrowserWS()
+	home, err := cdpUserHomeDir()
+	if err != nil {
+		return fmt.Errorf("home dir: %w", err)
+	}
+	if !cdpChromeAliveFn() {
+		// Clean state or stale PID file — same cleanup as CleanupOrphanedCDPChrome.
+		removeCDPPIDFile(home)
+		return nil
+	}
+
+	// SIGTERM all chrome-cdp processes.
+	cdpDataDir := filepath.Join(home, ".shannon", "chrome-cdp")
+	_ = cdpExecCommand("pkill", "-f", fmt.Sprintf("user-data-dir=%s", cdpDataDir)).Run()
+
+	if waitForChromeDead(ctx, chromeTermGrace) {
+		removeCDPPIDFile(home)
+		return nil
+	}
+
+	// Escalate: SIGKILL the main browser process.
+	pid := cdpChromePIDFn()
+	if pid == "" {
+		// Chrome reported alive but pid lookup failed; trust the alive probe
+		// and try a last poll before declaring stuck.
+		if waitForChromeDead(ctx, chromeKillGrace) {
+			removeCDPPIDFile(home)
+			return nil
+		}
+		return fmt.Errorf("chrome alive but pid lookup failed; not cleaning PID file")
+	}
+	log.Printf("[chrome-cdp] SIGTERM ignored, sending SIGKILL to pid %s", pid)
+	_ = cdpExecCommand("kill", "-9", pid).Run()
+
+	if waitForChromeDead(ctx, chromeKillGrace) {
+		removeCDPPIDFile(home)
+		return nil
+	}
+	return fmt.Errorf("chrome pid %s still alive after SIGKILL; PID file preserved", pid)
+}
+
+// waitForChromeDead polls cdpChromeAliveFn until it returns false, ctx is
+// cancelled, or the grace window's poll budget is exhausted. Returns true if
+// Chrome is dead. The grace window is divided into chromePollInterval-sized
+// slices, so when tests stub cdpSleep to a no-op the loop completes instantly
+// (matching the file's existing count-based wait pattern).
+func waitForChromeDead(ctx context.Context, grace time.Duration) bool {
+	polls := int(grace / chromePollInterval)
+	if polls < 1 {
+		polls = 1
+	}
+	for range polls {
+		if ctx.Err() != nil {
+			return !cdpChromeAliveFn()
+		}
+		if !cdpChromeAliveFn() {
+			return true
+		}
+		cdpSleep(chromePollInterval)
+	}
+	return !cdpChromeAliveFn()
+}
+
 // CleanupOrphanedCDPChrome kills any Chrome CDP processes left behind by a
 // previous daemon that was hard-killed (SIGKILL). Must be called AFTER the
 // daemon PID file lock is acquired — this guarantees no other daemon is alive,
