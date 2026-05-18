@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -244,8 +245,10 @@ func TestInstallFromRepo_NoRetryOnNotFoundSentinel(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected sentinel error, got nil")
 	}
-	if !strings.Contains(err.Error(), "not found in Anthropic repo") {
-		t.Errorf("expected \"not found in Anthropic repo\" sentinel, got %v", err)
+	// Typed-sentinel assertion: pins the wrapper contract so a future
+	// rename of the error string can't silently regress the no-retry path.
+	if !errors.Is(err, ErrSkillNotInRepo) {
+		t.Errorf("expected errors.Is(err, ErrSkillNotInRepo) == true, got %v", err)
 	}
 	if got := cloneCalls.Load(); got != 1 {
 		t.Errorf("clone called %d times, want exactly 1 (no retry on deterministic 404)", got)

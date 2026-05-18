@@ -429,12 +429,20 @@ func installFromBundled(shannonDir, name, destDir string) error {
 // intermittent github.com reachability flakes; observed user workaround was
 // to click Install again from the Desktop UI. Backoff: 0s, 1s, 2s → ≤3s of
 // added wait worst-case, on top of actual clone time.
+// Override: not currently exposed; recompile if 3 attempts proves wrong.
 const installFromRepoMaxAttempts = 3
+
+// ErrSkillNotInRepo is returned by tryInstallFromRepo when `git clone` and
+// `sparse-checkout` succeed but the requested skill's directory is absent
+// from the upstream tree — a deterministic 404 against
+// github.com/anthropics/skills, not a transient flake. installFromRepo
+// uses errors.Is to short-circuit retry on this sentinel.
+var ErrSkillNotInRepo = errors.New("skill not found in Anthropic repo")
 
 // installFromRepo downloads a skill from Anthropic's skills repo via git sparse checkout.
 // Retries the git operations on transient failures (network flake, github.com
-// reachability). Does NOT retry the explicit "not found in Anthropic repo"
-// branch — that's a real 404 against the upstream tree, not a flake.
+// reachability). Does NOT retry ErrSkillNotInRepo — that's a real 404 against
+// the upstream tree, not a flake.
 func installFromRepo(shannonDir, name, destDir string) error {
 	var lastErr error
 	for attempt := 0; attempt < installFromRepoMaxAttempts; attempt++ {
@@ -446,8 +454,7 @@ func installFromRepo(shannonDir, name, destDir string) error {
 			return nil
 		}
 		// Don't retry a genuine "skill not in upstream" — that's deterministic.
-		// Match on the sentinel substring produced by tryInstallFromRepo below.
-		if strings.Contains(err.Error(), "not found in Anthropic repo") {
+		if errors.Is(err, ErrSkillNotInRepo) {
 			return err
 		}
 		lastErr = err
@@ -475,7 +482,7 @@ func tryInstallFromRepo(shannonDir, name, destDir string) error {
 
 	srcDir := filepath.Join(tmpDir, "skills", name)
 	if _, err := os.Stat(filepath.Join(srcDir, "SKILL.md")); err != nil {
-		return fmt.Errorf("skill %q not found in Anthropic repo", name)
+		return fmt.Errorf("%w: %q", ErrSkillNotInRepo, name)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(destDir), 0700); err != nil {
