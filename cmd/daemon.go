@@ -368,6 +368,11 @@ var daemonStartCmd = &cobra.Command{
 					if shouldForwardQueuedFollowUpStatus(source) {
 						sendQueuedFollowUpStatusEvent(wsClient, activeCloudMessages.MessageID(req.RouteKey), req.Text)
 					}
+					// Tell Cloud the IM follow-up was accepted into the running loop so
+					// the platform reaction can flip from "received" → "processing"
+					// later when the agent loop drains it. No-op on non-IM sources
+					// (empty IMStatusContext); see emitLifecycleReceived guards.
+					emitLifecycleReceived(wsClient, msg.MessageID, msg.IMStatusContext)
 					// Message injected — running loop will incorporate it.
 					// Suppress the explicit ack on messaging platforms: the user's
 					// own message is already visible in the thread and the active
@@ -417,6 +422,13 @@ var daemonStartCmd = &cobra.Command{
 
 			clearActiveCloudMessage := activeCloudMessages.Track(req.RouteKey, msg.MessageID)
 			defer clearActiveCloudMessage()
+
+			// Tell Cloud the inbound IM message reached the daemon for a fresh
+			// run (first user turn). No-op on non-IM sources or when this is
+			// not a cold-start path (e.g. queue-full / busy / cwd-conflict
+			// returns above don't fall through here). Cloud uses this to flip
+			// the platform reaction to "received" before the first LLM call.
+			emitLifecycleReceived(wsClient, msg.MessageID, msg.IMStatusContext)
 
 			result, err := daemon.RunAgent(msgCtx, deps, req, handler)
 			if err != nil {

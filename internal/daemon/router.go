@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +17,16 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
+
+// DrainedInflightEntry tracks a user IM message that has been pulled from
+// injectCh into an LLM turn. The agent loop appends one entry per drained
+// follow-up so the daemon can emit MESSAGE_LIFECYCLE "done" / "cleared"
+// events to Cloud at run completion (Cloud needs the original IMStatusContext
+// to map each entry back to a platform reaction).
+type DrainedInflightEntry struct {
+	MessageID       string
+	IMStatusContext json.RawMessage
+}
 
 var ErrSessionChanged = errors.New("session changed since pre-check")
 var ErrRouteActive = errors.New("route has an active run")
@@ -48,6 +59,12 @@ type routeEntry struct {
 	// in-memory mid-run path, mailbox is the durability-first path for
 	// new ack-on-persist semantics.
 	mailbox *agenttypes.Mailbox
+	// drainedInflight is the per-route ordered list of follow-up messages
+	// this run has pulled out of injectCh into an LLM turn. Consumed by the
+	// run-completion emit path to fire MESSAGE_LIFECYCLE "done" / "cleared"
+	// for each entry. Reads/writes must hold entry.mu (the same lock the
+	// active run already owns for the duration of execution).
+	drainedInflight []DrainedInflightEntry
 }
 
 // loadSessionID returns the route's current session ID, or "" if unset.
