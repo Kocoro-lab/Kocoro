@@ -13,8 +13,8 @@ import (
 // Attachments is reserved for Phase 4 (queued attachments); in Phase 1 it is
 // always empty.
 type RestoredMessage struct {
-	Text        string             `json:"text"`
-	Attachments []RestoredFileRef  `json:"attachments,omitempty"`
+	Text        string            `json:"text"`
+	Attachments []RestoredFileRef `json:"attachments,omitempty"`
 }
 
 // RestoredFileRef is a minimal pointer to a previously-attached file. The
@@ -57,14 +57,10 @@ func (s *Session) TruncateAt(idx int) (*RestoredMessage, error) {
 	restored := &RestoredMessage{Text: messageText(s.Messages[idx])}
 
 	s.Messages = s.Messages[:idx]
-	if idx <= len(s.MessageMeta) {
-		s.MessageMeta = s.MessageMeta[:idx]
-	} else {
-		// MessageMeta may have grown out of step in pathological cases.
-		// Truncate by len-1 differently — keep parallel alignment by clipping
-		// to the shorter of the two.
-		s.MessageMeta = s.MessageMeta[:len(s.Messages)]
-	}
+	// MessageMeta may be shorter than Messages for sessions created before
+	// metadata existed or after partial recovery. Do not extend the slice into
+	// stale capacity; clip to the shorter side.
+	s.MessageMeta = s.MessageMeta[:min(idx, len(s.MessageMeta))]
 
 	// Summary cache is no longer valid because the conversation tail is gone.
 	s.SummaryCache = ""

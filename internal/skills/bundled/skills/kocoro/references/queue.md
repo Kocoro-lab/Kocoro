@@ -66,7 +66,8 @@ The events bus (`GET /events`) publishes three queue-lifecycle events. Each even
 ## Capacity & dedup
 
 - **Per-route cap** — `daemon.mailbox_max_per_route` (viper default `100`). `POST /queue` returns 503 when exceeded; daemon does NOT ack the source. Cloud will replay; Desktop should surface the failure.
-- **Per-message cap** — text + metadata <= 1 MB. Exceeding returns 413.
+- **Per-message cap** — full JSON request body <= 1 MB; `text` also has its
+  own 1 MB storage cap. Exceeding either returns 413.
 - **Cloud `msg_id` dedup** — `mailbox` table uses `INSERT OR IGNORE` keyed on `(cloud_msg_id, route_key)`. Cloud-replay of an already-ack'd message becomes a no-op.
 
 ## Ordering guarantees

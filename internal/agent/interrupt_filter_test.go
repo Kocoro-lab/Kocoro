@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -85,4 +86,34 @@ func TestInterruptFilteredContext_ChildCancelStopsWatcher(t *testing.T) {
 
 	<-child.Done()
 	// Should not deadlock — the watcher exits when child.Done() fires.
+}
+
+func TestInterruptFilteredContext_CancelFuncIsConcurrentSafe(t *testing.T) {
+	for attempt := 0; attempt < 200; attempt++ {
+		_, cancel := InterruptFilteredContext(context.Background())
+		start := make(chan struct{})
+		panicCh := make(chan any, 32)
+		var wg sync.WaitGroup
+
+		for i := 0; i < 32; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						panicCh <- r
+					}
+				}()
+				<-start
+				cancel()
+			}()
+		}
+
+		close(start)
+		wg.Wait()
+		close(panicCh)
+		for p := range panicCh {
+			t.Fatalf("cancel func panicked under concurrent calls on attempt %d: %v", attempt, p)
+		}
+	}
 }

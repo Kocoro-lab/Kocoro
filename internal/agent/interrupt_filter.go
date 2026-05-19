@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"sync"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 )
@@ -38,6 +39,7 @@ func InterruptFilteredContext(parent context.Context) (context.Context, context.
 	child, cancel := context.WithCancelCause(base)
 
 	stop := make(chan struct{})
+	var stopOnce sync.Once
 	go func() {
 		select {
 		case <-parent.Done():
@@ -54,14 +56,8 @@ func InterruptFilteredContext(parent context.Context) (context.Context, context.
 
 	wrappedCancel := func() {
 		cancel(context.Canceled)
-		// Signal the watcher to exit if parent hasn't fired yet. Multiple
-		// close() calls would panic, so guard with a select+default for
-		// idempotency.
-		select {
-		case <-stop:
-		default:
-			close(stop)
-		}
+		// Signal the watcher to exit if parent hasn't fired yet.
+		stopOnce.Do(func() { close(stop) })
 	}
 	return child, wrappedCancel
 }

@@ -11,6 +11,8 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 )
 
+const maxQueueRequestBodyBytes = 1 << 20
+
 // handleEnqueueQueue serves POST /queue. Lets HTTP clients (Desktop, CLI
 // tooling, tests) push a message into a route's mailbox directly, bypassing
 // the legacy /message + InjectMessage channel.
@@ -43,7 +45,12 @@ func (s *Server) handleEnqueueQueue(w http.ResponseWriter, r *http.Request) {
 		Priority    *int                          `json:"priority,omitempty"`
 		Attachments []agenttypes.QueuedAttachment `json:"attachments,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxQueueRequestBodyBytes)).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "queue payload exceeds 1 MB cap")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -70,9 +77,8 @@ func (s *Server) handleEnqueueQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Per-message size cap (P2): 1 MB total payload, counting text + each
-	// attachment's serialized form. Cheap heuristic — we don't want a 100 MB
-	// JSON body to slip through and bloat mailbox.db.
+	// Per-message text cap in addition to the wire body cap above, so a
+	// compressed/compact request still cannot store an oversized prompt.
 	if approxSize := len(req.Text); approxSize > 1<<20 {
 		writeError(w, http.StatusRequestEntityTooLarge, "message text exceeds 1 MB cap")
 		return

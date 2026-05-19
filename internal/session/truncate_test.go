@@ -60,6 +60,25 @@ func TestTruncateAt_TruncatesBothMessagesAndMeta(t *testing.T) {
 	}
 }
 
+func TestTruncateAt_ClipsShortMessageMetaWithoutPanic(t *testing.T) {
+	s := mkSession()
+	s.MessageMeta = s.MessageMeta[:1]
+
+	restored, err := s.TruncateAt(2)
+	if err != nil {
+		t.Fatalf("TruncateAt: %v", err)
+	}
+	if restored.Text != "second prompt" {
+		t.Errorf("restored.Text = %q, want %q", restored.Text, "second prompt")
+	}
+	if len(s.Messages) != 2 {
+		t.Errorf("Messages length: want 2, got %d", len(s.Messages))
+	}
+	if len(s.MessageMeta) != 1 {
+		t.Errorf("MessageMeta length: want existing shorter length 1, got %d", len(s.MessageMeta))
+	}
+}
+
 func TestTruncateAt_RejectsNonUserMessage(t *testing.T) {
 	s := mkSession()
 	if _, err := s.TruncateAt(1); err == nil {

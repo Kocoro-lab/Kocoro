@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -88,6 +89,28 @@ func TestHandleEnqueueQueue_AcceptsAttachments(t *testing.T) {
 	}
 	if snap[0].Attachments[0].Kind != "image" || snap[0].Attachments[1].OriginalURL != "https://example.com/x.pdf" {
 		t.Errorf("attachment fields mangled: %+v", snap[0].Attachments)
+	}
+}
+
+func TestHandleEnqueueQueue_RejectsOversizedWireBody(t *testing.T) {
+	srv, _, cleanup := newQueueHandlerServer(t)
+	defer cleanup()
+
+	body := mustMarshal(t, map[string]any{
+		"route_key": "r1",
+		"attachments": []map[string]any{
+			{
+				"kind":         "document",
+				"original_url": strings.Repeat("x", 1<<20),
+			},
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/queue", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.handleEnqueueQueue(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body: want 413, got %d body: %s", rec.Code, rec.Body.String())
 	}
 }
 
