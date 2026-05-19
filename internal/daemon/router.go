@@ -63,11 +63,11 @@ type routeEntry struct {
 	// in-memory mid-run path, mailbox is the durability-first path for
 	// new ack-on-persist semantics.
 	mailbox *agenttypes.Mailbox
-	// drainedInflight is the per-route ordered list of follow-up messages
-	// this run has pulled out of injectCh into an LLM turn. Consumed by the
-	// run-completion emit path to fire MESSAGE_LIFECYCLE "done" / "cleared"
-	// for each entry. Reads/writes must hold entry.mu (the same lock the
-	// active run already owns for the duration of execution).
+	// drainedInflight is the per-route ordered list of IM messages that this
+	// run has fed into an LLM turn. Each entry pairs a Cloud envelope id with
+	// the message's IMStatusContext. Populated by RunLifecycleEmitter.OnUserMessage-
+	// Processing (which calls SessionCache.AppendDrainedInflight). Consumed by
+	// run-completion lifecycle emission. Locking: sc.mu (see AppendDrainedInflight).
 	drainedInflight []DrainedInflightEntry
 }
 
@@ -476,6 +476,26 @@ func (sc *SessionCache) AppendDrainedInflight(key string, entry DrainedInflightE
 	if e, ok := sc.routes[key]; ok && e != nil {
 		e.drainedInflight = append(e.drainedInflight, entry)
 	}
+}
+
+// TakeDrainedInflight returns the drained-inflight slice for routeKey and
+// clears it from the route entry. Atomic under sc.mu — readers see either the
+// full slice OR an empty one, never a partial. Used by the run-completion
+// lifecycle emit to drain + clear in one critical section so a second call
+// after completion is a silent no-op (idempotent).
+func (sc *SessionCache) TakeDrainedInflight(routeKey string) []DrainedInflightEntry {
+	if routeKey == "" {
+		return nil
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	e, ok := sc.routes[routeKey]
+	if !ok || e == nil {
+		return nil
+	}
+	out := e.drainedInflight
+	e.drainedInflight = nil
+	return out
 }
 
 // SetRouteRunState updates the externally visible run state for a route.

@@ -39,6 +39,14 @@ type drainedInflightAppender interface {
 	AppendDrainedInflight(routeKey string, entry DrainedInflightEntry)
 }
 
+// drainedInflightTaker is the SessionCache surface the run-completion emit
+// needs. Kept separate from drainedInflightAppender so completion paths
+// cannot accidentally append, and so the RunLifecycleEmitter does not have
+// to widen its dependency to the take side.
+type drainedInflightTaker interface {
+	TakeDrainedInflight(routeKey string) []DrainedInflightEntry
+}
+
 // RunLifecycleEmitter implements agent.LifecycleEmitter for a single agent
 // run. Each instance is bound to one (route, ws client) pair and forwards
 // every OnUserMessageProcessing call as a WS MESSAGE_LIFECYCLE "processing"
@@ -82,5 +90,45 @@ func (e *RunLifecycleEmitter) OnUserMessageProcessing(cloudMessageID string, imS
 			CloudMessageID:  cloudMessageID,
 			IMStatusContext: imStatusContext,
 		})
+	}
+}
+
+// EmitLifecycleOnRunCompletion drains the per-route in-flight list, emits
+// MESSAGE_LIFECYCLE "done" for the tail entry and "cleared" for all earlier
+// entries, then clears the slice from the route. Idempotent — calling again
+// after the slice is taken is a silent no-op.
+//
+// Argument discipline:
+//   - cache or routeKey unset: silent no-op (nothing to drain).
+//   - wsClient nil: still calls TakeDrainedInflight so the route's slice is
+//     drained even when no emitter is attached. In practice this only happens
+//     in test fixtures (no WS client wired) or non-IM runs (slice is already
+//     empty because the per-message emit short-circuited).
+//
+// Called from the runner's per-route completion defer — kept daemon-internal
+// rather than threaded through agent.LifecycleEmitter because the runner has
+// direct access to WSClient + SessionCache + routeKey and the lifecycle "done"
+// emit is a daemon concern (Cloud-facing wire event), not an agent-loop
+// turn-boundary concern like the "processing" emit.
+func EmitLifecycleOnRunCompletion(wsClient LifecycleEventSender, cache drainedInflightTaker, routeKey string) {
+	if cache == nil || routeKey == "" {
+		return
+	}
+	entries := cache.TakeDrainedInflight(routeKey)
+	if len(entries) == 0 || wsClient == nil {
+		return
+	}
+	last := len(entries) - 1
+	for i, e := range entries {
+		state := LifecycleCleared
+		if i == last {
+			state = LifecycleDone
+		}
+		if err := wsClient.SendEvent(e.CloudMessageID, EventTypeMessageLifecycle, "", map[string]interface{}{
+			"state":             state,
+			"im_status_context": e.IMStatusContext,
+		}); err != nil {
+			log.Printf("daemon: lifecycle %s emit failed for %s: %v", state, e.CloudMessageID, err)
+		}
 	}
 }

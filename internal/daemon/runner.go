@@ -1058,6 +1058,18 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// Also fires cancel right away if CancelRoute already set cancelPending.
 		deps.SessionCache.SetRouteCancel(req.RouteKey, cancel)
 		defer func() {
+			// Emit MESSAGE_LIFECYCLE "done" for the tail of this run's
+			// drained-inflight IM messages and "cleared" for earlier entries,
+			// then clear the slice. Runs before ClearRouteRunState so the
+			// route is still externally "active" while lifecycle events go
+			// out, mirroring the Task 8 "processing" emit ordering. nil-safe
+			// — TakeDrainedInflight short-circuits when the slice is empty
+			// (non-IM runs / no follow-ups drained).
+			var ws LifecycleEventSender
+			if deps.WSClient != nil {
+				ws = deps.WSClient
+			}
+			EmitLifecycleOnRunCompletion(ws, deps.SessionCache, req.RouteKey)
 			deps.SessionCache.ClearRouteRunState(req.RouteKey)
 			closeRouteDone(routeDone)
 			route.cancel = nil
@@ -2304,6 +2316,16 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		deps.SessionCache.SetRouteRunState(req.RouteKey, routeDone, nil, "")
 		deps.SessionCache.SetRouteCancel(req.RouteKey, slashCancel)
 		defer func() {
+			// Drain lifecycle done/cleared for any IM messages this slash run
+			// consumed. In practice slash workflows are HTTP-initiated and the
+			// slice is empty, but emitting unconditionally keeps the contract
+			// uniform with RunAgent and stays a no-op when there is nothing
+			// to emit.
+			var ws LifecycleEventSender
+			if deps.WSClient != nil {
+				ws = deps.WSClient
+			}
+			EmitLifecycleOnRunCompletion(ws, deps.SessionCache, req.RouteKey)
 			// Clear cancel registration before unlock so the next caller registers fresh.
 			deps.SessionCache.SetRouteCancel(req.RouteKey, nil)
 			deps.SessionCache.ClearRouteRunState(req.RouteKey)
