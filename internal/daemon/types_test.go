@@ -130,3 +130,36 @@ func TestIsSystemChannel(t *testing.T) {
 		t.Error("slack should not be system channel")
 	}
 }
+
+func TestMessagePayloadIMStatusContextRoundTrip(t *testing.T) {
+	rawCtx := json.RawMessage(`{"platform":"slack","channel_id":"Cxxx","message_ts":"123.456"}`)
+	in := MessagePayload{
+		Channel:         "slack",
+		Text:            "hi",
+		IMStatusContext: rawCtx,
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out MessagePayload
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(out.IMStatusContext) != string(rawCtx) {
+		t.Fatalf("IMStatusContext mismatch: want %s got %s", rawCtx, out.IMStatusContext)
+	}
+}
+
+func TestCapabilitiesIncludesIMMessageLifecycleV1(t *testing.T) {
+	found := false
+	for _, c := range Capabilities {
+		if c == CapIMMessageLifecycleV1 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected im_message_lifecycle_v1 in Capabilities")
+	}
+}

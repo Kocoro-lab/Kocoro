@@ -134,6 +134,13 @@ type MessagePayload struct {
 	Source    string               `json:"source,omitempty"` // populated by Cloud; "slack", "line", "webhook"
 	CWD       string               `json:"cwd,omitempty"`    // project path override from Cloud/Desktop
 	Files     []RemoteFile         `json:"files,omitempty"` // file attachments from messaging platforms
+
+	// IMStatusContext is an opaque blob produced by Cloud that identifies the
+	// inbound message on its IM platform. Daemon NEVER decodes this — it is
+	// stored on route state and echoed verbatim inside MESSAGE_LIFECYCLE events
+	// so Cloud can call platform reaction/status APIs. Empty for non-IM sources
+	// (TUI, CLI, scheduled, webhook, etc.).
+	IMStatusContext json.RawMessage `json:"im_status_context,omitempty"`
 }
 
 // RemoteFile describes a file attachment forwarded by Cloud from a messaging platform.

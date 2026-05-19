@@ -80,6 +80,7 @@ var Capabilities = []string{
 	CapInlineExtractedText,
 	CapToolUseIDEvents,
 	CapClientMessageQueue,
+	CapIMMessageLifecycleV1,
 }
 
 type Client struct {
