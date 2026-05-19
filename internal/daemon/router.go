@@ -23,8 +23,12 @@ import (
 // follow-up so the daemon can emit MESSAGE_LIFECYCLE "done" / "cleared"
 // events to Cloud at run completion (Cloud needs the original IMStatusContext
 // to map each entry back to a platform reaction).
+//
+// CloudMessageID is the Cloud-side envelope id (set on MessagePayload.MessageID
+// in the WS frame); MessageID alone is ambiguous in a daemon that also tracks
+// session messages and mailbox rows.
 type DrainedInflightEntry struct {
-	MessageID       string
+	CloudMessageID  string
 	IMStatusContext json.RawMessage
 }
 
@@ -450,6 +454,28 @@ func normalizeCWDForCompare(cwd string) string {
 		return resolved
 	}
 	return cwd
+}
+
+// AppendDrainedInflight records that an IM-sourced user message has moved
+// from injectCh (or first-turn primary) into an LLM turn. Consumed at run
+// completion by Task 9 to emit MESSAGE_LIFECYCLE "done" / "cleared" for each
+// entry — Cloud needs the original IMStatusContext to map the entry back to
+// a platform reaction. No-op when key or CloudMessageID is empty (defensive:
+// non-IM drains short-circuit at the call site already).
+//
+// Locking: sc.mu only. The agent loop runs under entry.mu (acquired by the
+// runner via LockRouteWithManager), but we never touch entry.mu here. The
+// slice field is guarded by sc.mu — Task 9's run-completion reader MUST
+// take sc.mu the same way.
+func (sc *SessionCache) AppendDrainedInflight(key string, entry DrainedInflightEntry) {
+	if key == "" || entry.CloudMessageID == "" {
+		return
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if e, ok := sc.routes[key]; ok && e != nil {
+		e.drainedInflight = append(e.drainedInflight, entry)
+	}
 }
 
 // SetRouteRunState updates the externally visible run state for a route.

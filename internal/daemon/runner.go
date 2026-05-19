@@ -77,6 +77,14 @@ type RunAgentRequest struct {
 	SessionHistory []client.Message      `json:"-"`                   // pre-loaded history for LLM context (BypassRouting runs)
 	StickyContext  string                `json:"-"`                   // 额外的 sticky context，注入系统提示（对用户不可见）
 	Files          []RemoteFile          `json:"-"`                   // remote file attachments from Cloud (WS only)
+
+	// IM message lifecycle plumbing for the run's PRIMARY user message (first
+	// turn). Mid-run follow-ups carry their own copies on InjectedMessage.
+	// CloudMessageID is the Cloud envelope id; IMStatusContext is the opaque
+	// platform reaction context (echoed verbatim in MESSAGE_LIFECYCLE events).
+	// Both empty for non-IM sources (TUI/CLI/webhook/cron).
+	CloudMessageID  string          `json:"-"`
+	IMStatusContext json.RawMessage `json:"-"`
 }
 
 // Validate checks that the request has the minimum required fields.
@@ -1646,6 +1654,27 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if routeInjectCh != nil {
 		loop.SetInjectCh(routeInjectCh)
 	}
+	// IM message lifecycle: wire the per-run emitter so the agent loop can
+	// fire "processing" + record drained-inflight entries for IM-sourced user
+	// messages (Cloud needs the original IMStatusContext to map the entry
+	// back to a platform reaction). Non-IM runs construct the emitter too —
+	// it short-circuits internally on empty IMStatusContext, so the
+	// architectural plumbing stays uniform and we avoid per-source branching.
+	// nil deps.WSClient is tolerated (tests / fixtures construct ServerDeps
+	// without a WS client); the emitter still records bookkeeping for the
+	// drained-inflight slice Task 9 consumes at run completion.
+	if req.RouteKey != "" {
+		var ws LifecycleEventSender
+		if deps.WSClient != nil {
+			ws = deps.WSClient
+		}
+		loop.SetLifecycleEmitter(NewRunLifecycleEmitter(ws, deps.SessionCache, req.RouteKey))
+	}
+	// First-turn lifecycle: the run's primary user message moves into the
+	// LLM turn on iter 0; expose its IM plumbing to the loop so it can emit
+	// "processing" exactly once at first-turn entry. Empty fields short-
+	// circuit inside the loop's first-turn check.
+	loop.SetFirstTurnLifecycle(req.CloudMessageID, req.IMStatusContext)
 	// Wire mailbox row consumption for legacy injected mailbox IDs. The
 	// modern POST /queue path is queue-only, but this keeps older injected
 	// ID paths idempotent if they appear in a live loop.

@@ -317,15 +317,17 @@ var daemonStartCmd = &cobra.Command{
 				source = msg.Channel
 			}
 			req := daemon.RunAgentRequest{
-				Text:     msg.Text,
-				Content:  msg.Content,
-				Agent:    msg.AgentName,
-				Source:   source,
-				Channel:  msg.Channel,
-				ThreadID: msg.ThreadID,
-				Sender:   msg.Sender,
-				CWD:      msg.CWD,
-				Files:    msg.Files,
+				Text:            msg.Text,
+				Content:         msg.Content,
+				Agent:           msg.AgentName,
+				Source:          source,
+				Channel:         msg.Channel,
+				ThreadID:        msg.ThreadID,
+				Sender:          msg.Sender,
+				CWD:             msg.CWD,
+				Files:           msg.Files,
+				CloudMessageID:  msg.MessageID,
+				IMStatusContext: msg.IMStatusContext,
 			}
 			// Fall back to @mention parsing if cloud didn't set agent name.
 			// Skip for messaging-platform sources: there the gateway delivers an
@@ -359,9 +361,11 @@ var daemonStartCmd = &cobra.Command{
 			// worst case we paid one download for an InjectNoActiveRun.
 			if req.RouteKey != "" && deps.SessionCache.HasActiveRun(req.RouteKey) {
 				switch deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{
-					Text:  req.Text,
-					CWD:   req.CWD,
-					Files: daemon.ConvertFilesToInjected(msgCtx, req.Files),
+					Text:            req.Text,
+					CWD:             req.CWD,
+					Files:           daemon.ConvertFilesToInjected(msgCtx, req.Files),
+					CloudMessageID:  msg.MessageID,
+					IMStatusContext: msg.IMStatusContext,
 				}) {
 				case daemon.InjectOK:
 					emitInjectedMessageReceivedEvent(deps.EventBus, deps.SessionCache, req, msg.MessageID)

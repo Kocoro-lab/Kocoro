@@ -619,6 +619,18 @@ type EventHandler interface {
 	OnCloudPlan(planType string, content string, needsReview bool)
 }
 
+// LifecycleEmitter is the daemon's plug-point for MESSAGE_LIFECYCLE
+// notifications fired by the agent loop. It is invoked exactly once per IM
+// user message moving into an LLM turn — either when a queued follow-up is
+// drained from injectCh, or for the first user turn of a fresh run. The
+// agent package owns "when" (turn boundaries); the daemon owns "how"
+// (WS send + per-route drained-inflight bookkeeping). Implementations MUST
+// be fast (the call is synchronous on the loop goroutine) and self-guarding
+// against nil routes / empty messageIDs.
+type LifecycleEmitter interface {
+	OnUserMessageProcessing(cloudMessageID string, imStatusContext json.RawMessage)
+}
+
 // RunStatusHandler is an optional interface a handler may implement to receive
 // turn-level status updates (watchdog soft/hard idle, retries). The agent loop
 // checks for it via a type assertion, so handlers that do not implement it
@@ -644,11 +656,20 @@ type RunStatusHandler interface {
 // row is marked done — otherwise the next RunAgent's startup drain would
 // re-inject the same text and prepend it to the next user prompt, which
 // surfaces as a merged user bubble in Desktop.
+//
+// IMStatusContext + CloudMessageID carry the per-message lifecycle plumbing
+// for IM-sourced injects (Slack/Feishu/WeCom). When both are set, the loop
+// invokes its LifecycleEmitter after appending the message so the daemon can
+// fire MESSAGE_LIFECYCLE "processing" and record the entry in its
+// drained-inflight slice for "done" / "cleared" emission at run completion.
+// Empty for non-IM sources (TUI, CLI, scheduled, webhook).
 type InjectedMessage struct {
-	ID    string
-	Text  string
-	CWD   string
-	Files []InjectedFile // optional; empty for text-only injects (TUI keyboard, legacy callers)
+	ID              string
+	Text            string
+	CWD             string
+	Files           []InjectedFile  // optional; empty for text-only injects (TUI keyboard, legacy callers)
+	IMStatusContext json.RawMessage // platform reaction context, echoed verbatim in lifecycle events
+	CloudMessageID  string          // Cloud envelope id; the messageID daemon emits lifecycle for
 }
 
 type AgentLoop struct {
@@ -701,6 +722,18 @@ type AgentLoop struct {
 	// the run and be re-prepended to the next user prompt by runner.go's
 	// startup drain, producing visible "merged user bubble" regressions.
 	mailboxConsumeFn func(ids []string)
+	// lifecycleEmitter, when set, receives one OnUserMessageProcessing call
+	// per IM-sourced user message moving into an LLM turn (drained follow-up
+	// or first-turn primary). Daemon callers wire this to WS SendEvent +
+	// drained-inflight bookkeeping; nil-safe (no-op for TUI / CLI tests).
+	lifecycleEmitter LifecycleEmitter
+	// firstTurnIMContext / firstTurnCloudMessageID carry the lifecycle plumbing
+	// for the run's primary user message. Set once before Run() by the daemon
+	// runner from the inbound RunAgentRequest; the loop fires
+	// OnUserMessageProcessing exactly once at first-turn entry and clears
+	// firstTurnIMContext so re-entry (compaction retry, etc.) cannot re-emit.
+	firstTurnIMContext      json.RawMessage
+	firstTurnCloudMessageID string
 	runMessages      []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
 	runMsgInjected   []bool           // parallel to runMessages: true = system-injected guardrail/nudge
 	runMsgTimestamps []time.Time      // parallel to runMessages: when each message was created
@@ -1111,6 +1144,55 @@ func (a *AgentLoop) SetInjectCh(ch chan InjectedMessage) {
 // drain block — keep it fast (or run heavy work in a goroutine).
 func (a *AgentLoop) SetMailboxConsumeFn(fn func(ids []string)) {
 	a.mailboxConsumeFn = fn
+}
+
+// SetLifecycleEmitter installs the daemon hook for MESSAGE_LIFECYCLE
+// "processing" notifications. The loop calls OnUserMessageProcessing once
+// per IM-sourced user message moving into an LLM turn (drain site +
+// first-turn site). Pass nil to clear.
+func (a *AgentLoop) SetLifecycleEmitter(em LifecycleEmitter) {
+	a.lifecycleEmitter = em
+}
+
+// SetFirstTurnLifecycle records the IM lifecycle plumbing for the run's
+// primary (first-turn) user message. The loop consumes it once at the first
+// iteration of Run() and clears the stored context so reset paths do not
+// double-emit. Empty messageID or empty IMStatusContext is a no-op.
+func (a *AgentLoop) SetFirstTurnLifecycle(cloudMessageID string, imStatusContext json.RawMessage) {
+	a.firstTurnCloudMessageID = cloudMessageID
+	a.firstTurnIMContext = imStatusContext
+}
+
+// emitDrainedLifecycle fires OnUserMessageProcessing for each drained
+// follow-up that carries an IMStatusContext. Non-IM drains (TUI keyboard,
+// etc.) arrive with empty CloudMessageID + IMStatusContext and skip.
+// No-op when lifecycleEmitter is unset.
+func (a *AgentLoop) emitDrainedLifecycle(drained []InjectedMessage) {
+	if a.lifecycleEmitter == nil {
+		return
+	}
+	for _, m := range drained {
+		if m.CloudMessageID == "" || len(m.IMStatusContext) == 0 {
+			continue
+		}
+		a.lifecycleEmitter.OnUserMessageProcessing(m.CloudMessageID, m.IMStatusContext)
+	}
+}
+
+// emitFirstTurnLifecycle fires OnUserMessageProcessing exactly once for the
+// run's primary user message at first-turn entry. Clears the stored fields
+// so re-entry (e.g. reactive recompaction inside Run()) cannot re-fire.
+// No-op when lifecycleEmitter is unset or first-turn fields are empty.
+func (a *AgentLoop) emitFirstTurnLifecycle() {
+	if a.lifecycleEmitter == nil {
+		return
+	}
+	if a.firstTurnCloudMessageID == "" || len(a.firstTurnIMContext) == 0 {
+		return
+	}
+	a.lifecycleEmitter.OnUserMessageProcessing(a.firstTurnCloudMessageID, a.firstTurnIMContext)
+	a.firstTurnCloudMessageID = ""
+	a.firstTurnIMContext = nil
 }
 
 // SetDeltaProvider configures a provider for mid-run state change deltas.
@@ -2523,8 +2605,18 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					if a.mailboxConsumeFn != nil && len(injectedIDs) > 0 {
 						a.mailboxConsumeFn(injectedIDs)
 					}
+					// IM message lifecycle: fire one "processing" per drained
+					// follow-up that carries an IMStatusContext. See
+					// emitDrainedLifecycle.
+					a.emitDrainedLifecycle(drained)
 				}
 			}
+		}
+
+		// First-turn IM lifecycle: emit "processing" once for the run's
+		// primary user message. See emitFirstTurnLifecycle.
+		if i == 0 {
+			a.emitFirstTurnLifecycle()
 		}
 
 		// Poll for mid-run state change deltas (e.g., date rollover).
