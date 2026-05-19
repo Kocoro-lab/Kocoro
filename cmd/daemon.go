@@ -297,6 +297,7 @@ var daemonStartCmd = &cobra.Command{
 		// Create WS client first, then broker (broker needs client's send method).
 		var wsClient *daemon.Client
 		var broker *daemon.ApprovalBroker
+		activeCloudMessages := newActiveCloudMessageTracker()
 
 		wsClient = daemon.NewClient(wsEndpoint, cfg.APIKey, func(msg daemon.MessagePayload) string {
 			msgCtx := ctx
@@ -364,6 +365,9 @@ var daemonStartCmd = &cobra.Command{
 				}) {
 				case daemon.InjectOK:
 					emitInjectedMessageReceivedEvent(deps.EventBus, deps.SessionCache, req, msg.MessageID)
+					if shouldForwardQueuedFollowUpStatus(source) {
+						sendQueuedFollowUpStatusEvent(wsClient, activeCloudMessages.MessageID(req.RouteKey), req.Text)
+					}
 					// Message injected — running loop will incorporate it.
 					// Suppress the explicit ack on messaging platforms: the user's
 					// own message is already visible in the thread and the active
@@ -410,6 +414,9 @@ var daemonStartCmd = &cobra.Command{
 				wsClient:    wsClient,
 				messageID:   msg.MessageID,
 			}
+
+			clearActiveCloudMessage := activeCloudMessages.Track(req.RouteKey, msg.MessageID)
+			defer clearActiveCloudMessage()
 
 			result, err := daemon.RunAgent(msgCtx, deps, req, handler)
 			if err != nil {
@@ -705,6 +712,40 @@ type daemonEventHandler struct {
 	usage       agent.UsageAccumulator
 }
 
+type activeCloudMessageTracker struct {
+	mu      sync.Mutex
+	byRoute map[string]string
+}
+
+func newActiveCloudMessageTracker() *activeCloudMessageTracker {
+	return &activeCloudMessageTracker{byRoute: make(map[string]string)}
+}
+
+func (t *activeCloudMessageTracker) Track(routeKey, messageID string) func() {
+	if t == nil || routeKey == "" || messageID == "" {
+		return func() {}
+	}
+	t.mu.Lock()
+	t.byRoute[routeKey] = messageID
+	t.mu.Unlock()
+	return func() {
+		t.mu.Lock()
+		if t.byRoute[routeKey] == messageID {
+			delete(t.byRoute, routeKey)
+		}
+		t.mu.Unlock()
+	}
+}
+
+func (t *activeCloudMessageTracker) MessageID(routeKey string) string {
+	if t == nil || routeKey == "" {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.byRoute[routeKey]
+}
+
 func emitInjectedMessageReceivedEvent(eventBus *daemon.EventBus, sessionCache *daemon.SessionCache, req daemon.RunAgentRequest, messageID string) {
 	if eventBus == nil || sessionCache == nil || req.RouteKey == "" {
 		return
@@ -723,6 +764,49 @@ func emitInjectedMessageReceivedEvent(eventBus *daemon.EventBus, sessionCache *d
 		"queued":     true,
 	})
 	eventBus.Emit(daemon.Event{Type: daemon.EventMessageReceived, Payload: payload})
+}
+
+func shouldForwardQueuedFollowUpStatus(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case daemon.ChannelSlack, daemon.ChannelWeCom, daemon.ChannelFeishu, daemon.ChannelLark:
+		return true
+	default:
+		return false
+	}
+}
+
+func sendQueuedFollowUpStatusEvent(wsClient *daemon.Client, activeMessageID, text string) {
+	if wsClient == nil || activeMessageID == "" {
+		return
+	}
+	message := queuedFollowUpStatusText(text)
+	if message == "" {
+		return
+	}
+	if err := wsClient.SendEvent(activeMessageID, "LLM_OUTPUT", message, map[string]interface{}{"queued": true}); err != nil {
+		log.Printf("daemon: queued follow-up status forward failed: %v", err)
+	}
+}
+
+func queuedFollowUpStatusText(text string) string {
+	preview := queuedFollowUpPreview(text)
+	if preview == "" {
+		preview = "[Attached files]"
+	}
+	return "Queued next:\n> " + preview
+}
+
+func queuedFollowUpPreview(text string) string {
+	const maxRunes = 160
+	preview := strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if preview == "" {
+		return ""
+	}
+	runes := []rune(preview)
+	if len(runes) <= maxRunes {
+		return preview
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 func (h *daemonEventHandler) SetSessionID(id string) { h.sessionID = id }

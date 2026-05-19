@@ -103,6 +103,82 @@ func TestDaemonEventHandler_OnPreamble_DropsEmptyText(t *testing.T) {
 	}
 }
 
+func TestActiveCloudMessageTracker_ClearDoesNotDeleteReplacement(t *testing.T) {
+	tracker := newActiveCloudMessageTracker()
+
+	clearFirst := tracker.Track("default:slack:T1", "msg-active-1")
+	clearSecond := tracker.Track("default:slack:T1", "msg-active-2")
+
+	clearFirst()
+	if got := tracker.MessageID("default:slack:T1"); got != "msg-active-2" {
+		t.Fatalf("stale clear removed replacement: got %q", got)
+	}
+
+	clearSecond()
+	if got := tracker.MessageID("default:slack:T1"); got != "" {
+		t.Fatalf("clearSecond left stale message id %q", got)
+	}
+}
+
+func TestSendQueuedFollowUpStatusEventTargetsActiveMessage(t *testing.T) {
+	received := make(chan daemon.DaemonMessage, 2)
+	srv := httptestNewWebSocketServer(t, received)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	client := daemon.NewClient(wsURL, "", nil, nil)
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	sendQueuedFollowUpStatusEvent(client, "msg-active", "总结到我的notion")
+
+	select {
+	case dm := <-received:
+		if dm.Type != daemon.MsgTypeEvent || dm.MessageID != "msg-active" {
+			t.Fatalf("unexpected daemon message: %+v", dm)
+		}
+		var payload daemon.DaemonEventPayload
+		if err := json.Unmarshal(dm.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		if payload.EventType != "LLM_OUTPUT" {
+			t.Fatalf("event type = %q, want LLM_OUTPUT", payload.EventType)
+		}
+		if !strings.Contains(payload.Message, "Queued next:") || !strings.Contains(payload.Message, "总结到我的notion") {
+			t.Fatalf("queued status text missing preview: %q", payload.Message)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not receive queued follow-up status event")
+	}
+}
+
+func TestShouldForwardQueuedFollowUpStatusOnlyForSupportedIMs(t *testing.T) {
+	cases := []struct {
+		source string
+		want   bool
+	}{
+		{"slack", true},
+		{"wecom", true},
+		{"feishu", true},
+		{"lark", true},
+		{" Slack ", true},
+		{"line", false},
+		{"telegram", false},
+		{"wechat", false},
+		{"teams", false},
+		{"discord", false},
+		{"desktop", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := shouldForwardQueuedFollowUpStatus(c.source); got != c.want {
+			t.Errorf("shouldForwardQueuedFollowUpStatus(%q) = %v, want %v", c.source, got, c.want)
+		}
+	}
+}
+
 // TestDaemonEventHandler_AutoApproveAllowsAllTools pins the 2026-05-18
 // policy: with daemon.auto_approve=true, every tool is auto-approved with
 // no broker round-trip (unattended deny-list is empty). Previously
