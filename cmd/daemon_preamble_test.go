@@ -179,6 +179,18 @@ func TestShouldForwardQueuedFollowUpStatusOnlyForSupportedIMs(t *testing.T) {
 	}
 }
 
+func TestShouldForwardQueuedFollowUpStatusForMessageSuppressesLifecycleContext(t *testing.T) {
+	if shouldForwardQueuedFollowUpStatusForMessage("slack", json.RawMessage(`{"platform":"slack"}`)) {
+		t.Fatal("expected queued footer to be suppressed when IM lifecycle context is present")
+	}
+	if !shouldForwardQueuedFollowUpStatusForMessage("slack", nil) {
+		t.Fatal("expected queued footer fallback when IM lifecycle context is absent")
+	}
+	if shouldForwardQueuedFollowUpStatusForMessage("desktop", nil) {
+		t.Fatal("desktop must not forward cloud queued footer")
+	}
+}
+
 // TestDaemonEventHandler_AutoApproveAllowsAllTools pins the 2026-05-18
 // policy: with daemon.auto_approve=true, every tool is auto-approved with
 // no broker round-trip (unattended deny-list is empty). Previously

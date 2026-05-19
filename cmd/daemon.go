@@ -369,7 +369,7 @@ var daemonStartCmd = &cobra.Command{
 				}) {
 				case daemon.InjectOK:
 					emitInjectedMessageReceivedEvent(deps.EventBus, deps.SessionCache, req, msg.MessageID)
-					if shouldForwardQueuedFollowUpStatus(source) {
+					if shouldForwardQueuedFollowUpStatusForMessage(source, msg.IMStatusContext) {
 						sendQueuedFollowUpStatusEvent(wsClient, activeCloudMessages.MessageID(req.RouteKey), req.Text)
 					}
 					// Tell Cloud the IM follow-up was accepted into the running loop so
@@ -789,6 +789,13 @@ func shouldForwardQueuedFollowUpStatus(source string) bool {
 	default:
 		return false
 	}
+}
+
+func shouldForwardQueuedFollowUpStatusForMessage(source string, imStatusContext json.RawMessage) bool {
+	if len(imStatusContext) > 0 {
+		return false
+	}
+	return shouldForwardQueuedFollowUpStatus(source)
 }
 
 func sendQueuedFollowUpStatusEvent(wsClient *daemon.Client, activeMessageID, text string) {
