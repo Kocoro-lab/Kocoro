@@ -52,22 +52,22 @@ type MCPConfig struct {
 }
 
 type AgentConfig struct {
-	MaxIterations     int     `mapstructure:"max_iterations"   yaml:"max_iterations"   json:"max_iterations"`
-	Temperature       float64 `mapstructure:"temperature"      yaml:"temperature"      json:"temperature"`
-	MaxTokens         int     `mapstructure:"max_tokens"       yaml:"max_tokens"       json:"max_tokens"`
-	Thinking          bool    `mapstructure:"thinking"         yaml:"thinking"         json:"thinking"`
-	ThinkingMode      string  `mapstructure:"thinking_mode"    yaml:"thinking_mode"    json:"thinking_mode"` // "adaptive" (default) or "enabled" (fixed budget)
-	ThinkingBudget    int     `mapstructure:"thinking_budget"  yaml:"thinking_budget"  json:"thinking_budget"`
+	MaxIterations  int     `mapstructure:"max_iterations"   yaml:"max_iterations"   json:"max_iterations"`
+	Temperature    float64 `mapstructure:"temperature"      yaml:"temperature"      json:"temperature"`
+	MaxTokens      int     `mapstructure:"max_tokens"       yaml:"max_tokens"       json:"max_tokens"`
+	Thinking       bool    `mapstructure:"thinking"         yaml:"thinking"         json:"thinking"`
+	ThinkingMode   string  `mapstructure:"thinking_mode"    yaml:"thinking_mode"    json:"thinking_mode"` // "adaptive" (default) or "enabled" (fixed budget)
+	ThinkingBudget int     `mapstructure:"thinking_budget"  yaml:"thinking_budget"  json:"thinking_budget"`
 	// ForceThinkTool re-enables the local `think` tool even on paths where
 	// native extended thinking is active (the default-skip case). The two
 	// signals are redundant on Sonnet 4.6 / Opus 4.7 with adaptive thinking
 	// — leaving both registered led to ritual `think({})` emissions that
 	// could spin the agent loop. Set to true only if you have a workflow
 	// that specifically depends on the explicit planning tool surface.
-	ForceThinkTool    bool    `mapstructure:"force_think_tool" yaml:"force_think_tool" json:"force_think_tool"`
-	ReasoningEffort   string  `mapstructure:"reasoning_effort" yaml:"reasoning_effort" json:"reasoning_effort"`
-	Model             string  `mapstructure:"model"            yaml:"model"            json:"model"`                     // specific model override
-	ContextWindow     int     `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"`            // model context window in tokens
+	ForceThinkTool  bool   `mapstructure:"force_think_tool" yaml:"force_think_tool" json:"force_think_tool"`
+	ReasoningEffort string `mapstructure:"reasoning_effort" yaml:"reasoning_effort" json:"reasoning_effort"`
+	Model           string `mapstructure:"model"            yaml:"model"            json:"model"`          // specific model override
+	ContextWindow   int    `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"` // model context window in tokens
 	// IdleSoftTimeoutSecs / IdleHardTimeoutSecs: turn-level watchdog measured
 	// against explicit "idle-counted" phases of the agent loop (waiting on an
 	// LLM response). Other phases (tool execution, approval wait, compaction
@@ -76,12 +76,18 @@ type AgentConfig struct {
 	// IdleSoftTimeoutSecs: emit OnRunStatus("idle_soft", …) after this long
 	// in an idle-counted phase. 0 = disabled. Default: 90.
 	// IdleHardTimeoutSecs: cancel the run with ErrHardIdleTimeout after this
-	// long. 0 = disabled (visibility-only mode). Default: 0 while the
-	// watchdog is opt-in; will flip to a value strictly less than the
-	// gateway transport ceiling (600s) after dogfood.
-	IdleSoftTimeoutSecs int   `mapstructure:"idle_soft_timeout_secs" yaml:"idle_soft_timeout_secs" json:"idle_soft_timeout_secs"`
-	IdleHardTimeoutSecs int   `mapstructure:"idle_hard_timeout_secs" yaml:"idle_hard_timeout_secs" json:"idle_hard_timeout_secs"`
-	SkillDiscovery      *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
+	// long. 0 = disabled (visibility-only mode; daemon logs a startup WARN).
+	// Default: 540 — 60s headroom under the gateway transport ceiling (600s)
+	// so cancellation can propagate + cleanup runs before the transport bails.
+	IdleSoftTimeoutSecs int `mapstructure:"idle_soft_timeout_secs" yaml:"idle_soft_timeout_secs" json:"idle_soft_timeout_secs"`
+	IdleHardTimeoutSecs int `mapstructure:"idle_hard_timeout_secs" yaml:"idle_hard_timeout_secs" json:"idle_hard_timeout_secs"`
+	// StreamIdleTimeoutSecs: abort the SSE streaming body when no chunk has
+	// arrived for this long. Closes the failure mode IdleHardTimeoutSecs
+	// cannot catch: silent TCP-level connection drop mid-response, where the
+	// kernel never returns from read() so the turn-elapsed watchdog can't
+	// observe progress. 0 = disabled (legacy scanner path). Default: 90.
+	StreamIdleTimeoutSecs int   `mapstructure:"stream_idle_timeout_secs" yaml:"stream_idle_timeout_secs" json:"stream_idle_timeout_secs"`
+	SkillDiscovery        *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
 
 	// BashConcurrencyEnabled gates BashTool.IsConcurrencySafeCall. When true
 	// (the Phase C default since 2026-05-15), bash invocations that pass the
@@ -265,8 +271,12 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.reasoning_effort", "")
 	viper.SetDefault("agent.model", "")
 	viper.SetDefault("agent.context_window", 200000)
+	// NOTE: if you change these idle/stream defaults, also update
+	// docs/config-reference.md AND internal/skills/bundled/skills/kocoro/references/config.md
+	// to match — the bundled skill reference is the AI-facing source of truth.
 	viper.SetDefault("agent.idle_soft_timeout_secs", 90)
-	viper.SetDefault("agent.idle_hard_timeout_secs", 0) // 0 = disabled; flip to <600 after dogfood
+	viper.SetDefault("agent.idle_hard_timeout_secs", 540)    // 60s headroom under the 600s HTTP transport ceiling so cancel can propagate + cleanup runs before transport bails. Set to 0 in yaml to opt out (startup WARN logs).
+	viper.SetDefault("agent.stream_idle_timeout_secs", 90)   // per-chunk gap watchdog inside CompleteStream. 0 disables (legacy scanner path).
 	viper.SetDefault("agent.bash_concurrency_enabled", true) // Phase C: Desktop now consumes tool_use_id on tool_status events, safe to enable concurrent bash batches by default.
 	// Time-based microcompact. Disabled by default — short sessions never
 	// compact, and only sessions that idle past the gap threshold will
@@ -538,20 +548,21 @@ type overlayMemoryConfig struct {
 }
 
 type overlayAgentConfig struct {
-	MaxIterations     *int     `yaml:"max_iterations"`
-	Temperature       *float64 `yaml:"temperature"`
-	MaxTokens         *int     `yaml:"max_tokens"`
-	Thinking          *bool    `yaml:"thinking"`
-	ThinkingMode      *string  `yaml:"thinking_mode"`
-	ThinkingBudget    *int     `yaml:"thinking_budget"`
-	ForceThinkTool    *bool    `yaml:"force_think_tool"`
-	ReasoningEffort   *string  `yaml:"reasoning_effort"`
-	Model             *string  `yaml:"model"`
-	ContextWindow     *int     `yaml:"context_window"`
+	MaxIterations   *int     `yaml:"max_iterations"`
+	Temperature     *float64 `yaml:"temperature"`
+	MaxTokens       *int     `yaml:"max_tokens"`
+	Thinking        *bool    `yaml:"thinking"`
+	ThinkingMode    *string  `yaml:"thinking_mode"`
+	ThinkingBudget  *int     `yaml:"thinking_budget"`
+	ForceThinkTool  *bool    `yaml:"force_think_tool"`
+	ReasoningEffort *string  `yaml:"reasoning_effort"`
+	Model           *string  `yaml:"model"`
+	ContextWindow   *int     `yaml:"context_window"`
 
-	IdleSoftTimeoutSecs *int  `yaml:"idle_soft_timeout_secs"`
-	IdleHardTimeoutSecs *int  `yaml:"idle_hard_timeout_secs"`
-	SkillDiscovery      *bool `yaml:"skill_discovery"`
+	IdleSoftTimeoutSecs   *int  `yaml:"idle_soft_timeout_secs"`
+	IdleHardTimeoutSecs   *int  `yaml:"idle_hard_timeout_secs"`
+	StreamIdleTimeoutSecs *int  `yaml:"stream_idle_timeout_secs"`
+	SkillDiscovery        *bool `yaml:"skill_discovery"`
 
 	// BashConcurrencyEnabled is a pointer so unset overlays leave the value
 	// alone — distinguishing "not specified" from "explicitly false".
@@ -586,29 +597,30 @@ type overlayToolsConfig struct {
 // buildDefaultSources returns source entries for all config keys set to "default".
 func buildDefaultSources() map[string]ConfigSource {
 	return map[string]ConfigSource{
-		"endpoint":                     {Level: "default"},
-		"api_key":                      {Level: "default"},
-		"model_tier":                   {Level: "default"},
-		"auto_update_check":            {Level: "default"},
-		"agent.max_iterations":         {Level: "default"},
-		"agent.temperature":            {Level: "default"},
-		"agent.max_tokens":             {Level: "default"},
-		"agent.thinking":               {Level: "default"},
-		"agent.thinking_mode":          {Level: "default"},
-		"agent.thinking_budget":        {Level: "default"},
-		"agent.force_think_tool":       {Level: "default"},
-		"agent.reasoning_effort":       {Level: "default"},
-		"agent.model":                  {Level: "default"},
-		"agent.context_window":         {Level: "default"},
+		"endpoint":                       {Level: "default"},
+		"api_key":                        {Level: "default"},
+		"model_tier":                     {Level: "default"},
+		"auto_update_check":              {Level: "default"},
+		"agent.max_iterations":           {Level: "default"},
+		"agent.temperature":              {Level: "default"},
+		"agent.max_tokens":               {Level: "default"},
+		"agent.thinking":                 {Level: "default"},
+		"agent.thinking_mode":            {Level: "default"},
+		"agent.thinking_budget":          {Level: "default"},
+		"agent.force_think_tool":         {Level: "default"},
+		"agent.reasoning_effort":         {Level: "default"},
+		"agent.model":                    {Level: "default"},
+		"agent.context_window":           {Level: "default"},
 		"agent.idle_soft_timeout_secs":   {Level: "default"},
 		"agent.idle_hard_timeout_secs":   {Level: "default"},
+		"agent.stream_idle_timeout_secs": {Level: "default"},
 		"agent.bash_concurrency_enabled": {Level: "default"},
 		"tools.bash_timeout":             {Level: "default"},
-		"tools.bash_max_timeout":       {Level: "default"},
-		"tools.bash_max_output":        {Level: "default"},
-		"tools.result_truncation":      {Level: "default"},
-		"tools.args_truncation":        {Level: "default"},
-		"tools.server_tool_timeout":    {Level: "default"},
+		"tools.bash_max_timeout":         {Level: "default"},
+		"tools.bash_max_output":          {Level: "default"},
+		"tools.result_truncation":        {Level: "default"},
+		"tools.args_truncation":          {Level: "default"},
+		"tools.server_tool_timeout":      {Level: "default"},
 	}
 }
 
@@ -663,6 +675,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.idle_hard_timeout_secs") {
 		cfg.Sources["agent.idle_hard_timeout_secs"] = src
+	}
+	if viper.IsSet("agent.stream_idle_timeout_secs") {
+		cfg.Sources["agent.stream_idle_timeout_secs"] = src
 	}
 	if viper.IsSet("agent.bash_concurrency_enabled") {
 		cfg.Sources["agent.bash_concurrency_enabled"] = src
@@ -793,6 +808,10 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Agent.IdleHardTimeoutSecs != nil {
 			cfg.Agent.IdleHardTimeoutSecs = *overlay.Agent.IdleHardTimeoutSecs
 			cfg.Sources["agent.idle_hard_timeout_secs"] = src
+		}
+		if overlay.Agent.StreamIdleTimeoutSecs != nil {
+			cfg.Agent.StreamIdleTimeoutSecs = *overlay.Agent.StreamIdleTimeoutSecs
+			cfg.Sources["agent.stream_idle_timeout_secs"] = src
 		}
 		if overlay.Agent.SkillDiscovery != nil {
 			cfg.Agent.SkillDiscovery = overlay.Agent.SkillDiscovery
@@ -976,6 +995,9 @@ func validateConfig(cfg *Config) error {
 		cfg.Agent.IdleHardTimeoutSecs < cfg.Agent.IdleSoftTimeoutSecs {
 		return fmt.Errorf("agent.idle_hard_timeout_secs (%d) must be >= agent.idle_soft_timeout_secs (%d)",
 			cfg.Agent.IdleHardTimeoutSecs, cfg.Agent.IdleSoftTimeoutSecs)
+	}
+	if cfg.Agent.StreamIdleTimeoutSecs < 0 {
+		return fmt.Errorf("agent.stream_idle_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Agent.StreamIdleTimeoutSecs)
 	}
 	return nil
 }

@@ -160,6 +160,9 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		llmClient = client.NewOllamaClient(runCfg.Ollama.Endpoint, model)
 	} else {
 		gw = client.NewGatewayClient(runCfg.Endpoint, runCfg.APIKey)
+		if runCfg.Agent.StreamIdleTimeoutSecs > 0 {
+			gw.SetStreamIdleTimeout(time.Duration(runCfg.Agent.StreamIdleTimeoutSecs) * time.Second)
+		}
 		llmClient = gw
 	}
 
@@ -206,6 +209,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	loop := agent.NewAgentLoop(llmClient, reg, runCfg.ModelTier, shannonDir, runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation, &runCfg.Permissions, auditor, hookRunner)
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
+	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)
 	// One-shot CLI starts with a fresh session (no last-seen model), but
 	// still seed from the configured model so a known 1M/200K cap guides
 	// the first preflight check before any response arrives.

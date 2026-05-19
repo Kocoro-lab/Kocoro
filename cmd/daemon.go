@@ -50,6 +50,19 @@ var daemonStartCmd = &cobra.Command{
 			return fmt.Errorf("config: %w", err)
 		}
 
+		if cfg.Agent.IdleHardTimeoutSecs == 0 {
+			log.Printf("daemon: WARN — agent.idle_hard_timeout_secs=0 (watchdog disabled). "+
+				"A hung LLM call will block the route up to %s (HTTP transport ceiling). "+
+				"Remove the override or set a value <600 to enable watchdog cancellation.",
+				600*time.Second)
+		} else if cfg.Agent.IdleHardTimeoutSecs >= 600 {
+			log.Printf("daemon: WARN — agent.idle_hard_timeout_secs=%d (>= 600s HTTP transport ceiling). "+
+				"The 600s transport timeout will fire first, so the watchdog cancellation never "+
+				"propagates and you lose the partial-success exit path. Set a value < 600 "+
+				"(recommended: 540) to enable watchdog cancellation.",
+				cfg.Agent.IdleHardTimeoutSecs)
+		}
+
 		shanDir := config.ShannonDir()
 		agentsDir := filepath.Join(shanDir, "agents")
 		pidPath := filepath.Join(shanDir, "daemon.pid")
@@ -85,6 +98,9 @@ var daemonStartCmd = &cobra.Command{
 		mcp.SetCDPChromeProfile(cfg.Daemon.ChromeProfile)
 
 		gw := client.NewGatewayClient(cfg.Endpoint, cfg.APIKey)
+		if cfg.Agent.StreamIdleTimeoutSecs > 0 {
+			gw.SetStreamIdleTimeout(time.Duration(cfg.Agent.StreamIdleTimeoutSecs) * time.Second)
+		}
 		baselineReg, reg, skillsPtr, mcpMgr, cleanup, serverErr := tools.RegisterAllWithBaseline(gw, cfg)
 		if serverErr != nil {
 			log.Printf("Warning: %v", serverErr)

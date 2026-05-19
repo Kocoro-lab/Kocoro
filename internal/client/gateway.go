@@ -8,8 +8,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -400,6 +402,12 @@ func (e *APIError) Error() string {
 	}
 	return fmt.Sprintf("API returned %d", e.StatusCode)
 }
+
+// ErrStreamIdleTimeout is returned by CompleteStream when no SSE chunk has
+// arrived for the configured per-chunk idle timeout. Distinguishable from a
+// generic transport error so callers can avoid retry — the upstream is
+// silently dropping the stream, so retrying produces the same hang.
+var ErrStreamIdleTimeout = errors.New("streaming idle timeout: no chunks received")
 
 // --- Public types (used by agent loop) ---
 
@@ -901,6 +909,17 @@ type GatewayClient struct {
 	baseURL    string
 	apiKey     string
 	httpClient *http.Client
+
+	// streamIdleTimeout abort the CompleteStream SSE body when no chunk has
+	// arrived for this long. 0 = disabled (legacy scanner path).
+	//
+	// CONCURRENCY: configured via SetStreamIdleTimeout BEFORE the first
+	// CompleteStream call (typically right after NewGatewayClient at
+	// daemon/one-shot/TUI startup). The field is read without synchronization
+	// inside CompleteStream; concurrent runtime mutation (e.g. config reload
+	// while requests are in flight) is NOT safe and NOT currently supported.
+	// If a future caller needs hot-reload semantics, switch this to atomic.Int64.
+	streamIdleTimeout time.Duration
 }
 
 func NewGatewayClient(baseURL, apiKey string) *GatewayClient {
@@ -921,6 +940,16 @@ func (c *GatewayClient) HTTPClient() *http.Client { return c.httpClient }
 // BaseURL exposes the gateway base URL for sibling subsystems that need to
 // build their own request paths against the same host.
 func (c *GatewayClient) BaseURL() string { return c.baseURL }
+
+// SetStreamIdleTimeout configures the per-chunk idle watchdog for
+// CompleteStream. 0 disables the watchdog (legacy scanner path stays in use).
+// MUST be called before any CompleteStream invocation; not safe for concurrent
+// updates with in-flight calls. See the streamIdleTimeout field doc.
+func (c *GatewayClient) SetStreamIdleTimeout(d time.Duration) { c.streamIdleTimeout = d }
+
+// StreamIdleTimeout returns the configured per-chunk idle timeout, or 0 if
+// disabled. Used by callers (e.g. agent loop) to format diagnostic messages.
+func (c *GatewayClient) StreamIdleTimeout() time.Duration { return c.streamIdleTimeout }
 
 // Complete sends a completion request to the gateway's /v1/completions endpoint.
 // This endpoint is a thin proxy to the LLM service that returns raw function_call
@@ -966,7 +995,9 @@ type StreamDelta struct {
 }
 
 // CompleteStream sends a streaming completion request. It calls onDelta for each
-// text chunk and returns the final CompletionResponse when done.
+// text chunk and returns the final CompletionResponse when done. When
+// streamIdleTimeout > 0, the SSE body is read under a per-chunk idle watchdog
+// that returns ErrStreamIdleTimeout if no chunk arrives within that interval.
 func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionRequest, onDelta func(StreamDelta)) (*CompletionResponse, error) {
 	req.Stream = true
 	body, err := json.Marshal(req)
@@ -995,51 +1026,27 @@ func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionReques
 		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
 	}
 
-	// Parse SSE stream
+	if c.streamIdleTimeout <= 0 {
+		return c.completeStreamLegacy(resp, onDelta, reqID, req.SessionID)
+	}
+	return c.completeStreamWatchdog(ctx, resp, onDelta, reqID, req.SessionID)
+}
+
+// completeStreamLegacy reads the SSE body in a single blocking scanner loop.
+// Used when streamIdleTimeout is disabled (0). Behavior MUST stay byte-for-byte
+// identical to the pre-watchdog implementation so opt-out users see no change.
+func (c *GatewayClient) completeStreamLegacy(resp *http.Response, onDelta func(StreamDelta), reqID, sessionID string) (*CompletionResponse, error) {
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	var result *CompletionResponse
 	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" || strings.HasPrefix(line, ":") {
-			continue
+		stop, parsed := processSSEData(scanner.Text(), onDelta)
+		if parsed != nil {
+			result = parsed
 		}
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := line[6:]
-		if payload == "[DONE]" {
+		if stop {
 			break
-		}
-
-		var event map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(payload), &event); err != nil {
-			continue
-		}
-
-		typeBytes, ok := event["type"]
-		if !ok {
-			continue
-		}
-		var eventType string
-		json.Unmarshal(typeBytes, &eventType)
-
-		switch eventType {
-		case "content_delta":
-			var text string
-			if textBytes, ok := event["text"]; ok {
-				json.Unmarshal(textBytes, &text)
-			}
-			if text != "" && onDelta != nil {
-				onDelta(StreamDelta{Text: text})
-			}
-		case "done":
-			// The done event has the full response shape
-			var final CompletionResponse
-			if err := json.Unmarshal([]byte(payload), &final); err == nil {
-				result = &final
-			}
 		}
 	}
 
@@ -1051,8 +1058,177 @@ func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionReques
 		return nil, fmt.Errorf("stream ended without done event")
 	}
 
-	logCacheResponse(reqID, req.SessionID, result)
+	logCacheResponse(reqID, sessionID, result)
 	return result, nil
+}
+
+// completeStreamWatchdog reads the SSE body under a per-chunk idle watchdog.
+// The scanner runs in a goroutine; the main goroutine multiplexes chunk
+// receipt against an idle timer (full timeout) and a warn timer (timeout/2).
+// Each successful chunk resets both timers. On idle timeout, the body is
+// closed to unblock the scanner's read() and ErrStreamIdleTimeout is returned.
+func (c *GatewayClient) completeStreamWatchdog(ctx context.Context, resp *http.Response, onDelta func(StreamDelta), reqID, sessionID string) (*CompletionResponse, error) {
+	type scannerMsg struct {
+		line string
+		eof  bool
+		err  error
+	}
+	// Buffer 64: lets the scanner goroutine pre-buffer chunks while the main
+	// goroutine processes the previous one (processSSEData + onDelta callback).
+	// The idle timer is reset on DEQUEUE — line 1127 below — not on wire arrival.
+	// Under a sustained burst with a temporarily slow main goroutine (e.g.
+	// expensive onDelta render), the timer still drains as main catches up.
+	// Sized for "burst absorption", not "deep queue"; today's onDelta is a
+	// fast in-memory push (a.handler.OnStreamDelta), so 64 is comfortably more
+	// than the worst observed burst. If onDelta ever blocks on I/O, revisit:
+	// a long main-goroutine stall could let chunks accumulate without the
+	// timer firing despite legitimate upstream silence between them.
+	chunkCh := make(chan scannerMsg, 64)
+	scanCtx, scanCancel := context.WithCancel(ctx)
+	defer scanCancel()
+
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for scanner.Scan() {
+			select {
+			case chunkCh <- scannerMsg{line: scanner.Text()}:
+			case <-scanCtx.Done():
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			select {
+			case chunkCh <- scannerMsg{err: err}:
+			case <-scanCtx.Done():
+			}
+			return
+		}
+		select {
+		case chunkCh <- scannerMsg{eof: true}:
+		case <-scanCtx.Done():
+		}
+	}()
+
+	idleTimer := time.NewTimer(c.streamIdleTimeout)
+	defer idleTimer.Stop()
+	warnTimer := time.NewTimer(c.streamIdleTimeout / 2)
+	defer warnTimer.Stop()
+	warningEmitted := false
+
+	var result *CompletionResponse
+	for {
+		select {
+		case msg := <-chunkCh:
+			if msg.err != nil {
+				return nil, fmt.Errorf("stream read error: %w", msg.err)
+			}
+			if msg.eof {
+				if result == nil {
+					return nil, fmt.Errorf("stream ended without done event")
+				}
+				logCacheResponse(reqID, sessionID, result)
+				return result, nil
+			}
+			stop, parsed := processSSEData(msg.line, onDelta)
+			if parsed != nil {
+				result = parsed
+			}
+			if stop {
+				if result == nil {
+					return nil, fmt.Errorf("stream ended without done event")
+				}
+				logCacheResponse(reqID, sessionID, result)
+				return result, nil
+			}
+			resetTimer(idleTimer, c.streamIdleTimeout)
+			resetTimer(warnTimer, c.streamIdleTimeout/2)
+			warningEmitted = false
+
+		case <-warnTimer.C:
+			if !warningEmitted {
+				log.Printf("client: stream idle warning: no chunks for %s (timeout %s)",
+					c.streamIdleTimeout/2, c.streamIdleTimeout)
+				warningEmitted = true
+			}
+
+		case <-idleTimer.C:
+			scanCancel()
+			resp.Body.Close()
+			// If the gateway already delivered a complete "done" event (result
+			// is parsed) but stalled before the "[DONE]" sentinel, return the
+			// result rather than throwing away a successful response. Matches
+			// the legacy scanner-loop semantics where a clean EOF after "done"
+			// returns success even without an explicit "[DONE]".
+			if result != nil {
+				logCacheResponse(reqID, sessionID, result)
+				return result, nil
+			}
+			return nil, ErrStreamIdleTimeout
+
+		case <-ctx.Done():
+			scanCancel()
+			resp.Body.Close()
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// processSSEData parses one SSE data line from the gateway's streaming output.
+// Returns stop=true when the line is a "[DONE]" sentinel (caller should exit
+// the read loop). Returns a non-nil *CompletionResponse when the line carries
+// a parsed "done" event payload. Unrecognized lines are silently skipped to
+// match the pre-watchdog behavior.
+func processSSEData(line string, onDelta func(StreamDelta)) (stop bool, result *CompletionResponse) {
+	if line == "" || strings.HasPrefix(line, ":") {
+		return false, nil
+	}
+	if !strings.HasPrefix(line, "data: ") {
+		return false, nil
+	}
+	payload := line[6:]
+	if payload == "[DONE]" {
+		return true, nil
+	}
+	var event map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		return false, nil
+	}
+	typeBytes, ok := event["type"]
+	if !ok {
+		return false, nil
+	}
+	var eventType string
+	_ = json.Unmarshal(typeBytes, &eventType)
+	switch eventType {
+	case "content_delta":
+		var text string
+		if textBytes, ok := event["text"]; ok {
+			_ = json.Unmarshal(textBytes, &text)
+		}
+		if text != "" && onDelta != nil {
+			onDelta(StreamDelta{Text: text})
+		}
+	case "done":
+		var final CompletionResponse
+		if err := json.Unmarshal([]byte(payload), &final); err == nil {
+			return false, &final
+		}
+	}
+	return false, nil
+}
+
+// resetTimer stops, drains, and resets a timer. The drain is unnecessary on
+// Go 1.23+ (which the module requires via go 1.25.7) but kept explicit so the
+// intent is unambiguous to a reviewer who isn't sure which version applies.
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
 }
 
 func (c *GatewayClient) SubmitTaskStream(ctx context.Context, req TaskRequest) (*TaskStreamResponse, error) {
