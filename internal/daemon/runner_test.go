@@ -1178,3 +1178,32 @@ func TestRunAgent_CleanupFiresOnPostDeferError(t *testing.T) {
 		t.Fatalf("expected deferred cleanup to schedule idle disconnect, got %d", idleCalls)
 	}
 }
+
+// TestIsSoftRunError_StreamIdleTimeout pins the soft-classification for the
+// new sentinel. If this regresses, RunAgent will treat a silent stream drop
+// as a hard error: the agent loop's partial reply (captured via streaming
+// deltas + emitted as OnRunStatus("stream_idle_timeout") with Partial=true)
+// would be overwritten by the FriendlyAgentError stub at runner.go:1617.
+// Symptom: agent_reply event missing, user sees "agent error" instead of the
+// half-sentence we actually received.
+func TestIsSoftRunError_StreamIdleTimeout(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		soft bool
+	}{
+		{"raw stream idle", client.ErrStreamIdleTimeout, true},
+		{"wrapped stream idle", fmt.Errorf("stream aborted: %w", client.ErrStreamIdleTimeout), true},
+		{"hard idle (existing)", agent.ErrHardIdleTimeout, true},
+		{"context canceled (existing)", context.Canceled, true},
+		{"random error", fmt.Errorf("upstream 500"), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSoftRunError(tc.err); got != tc.soft {
+				t.Fatalf("isSoftRunError(%v) = %v, want %v", tc.err, got, tc.soft)
+			}
+		})
+	}
+}

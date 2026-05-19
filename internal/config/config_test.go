@@ -482,3 +482,79 @@ func TestPromptSuggestionConfig_OverlayMerge(t *testing.T) {
 		t.Errorf("got %d, want 1", cfg.Agent.PromptSuggestion.MinTurns)
 	}
 }
+
+// TestConfig_IdleHardTimeoutDefault540 pins the flipped default. The flip is
+// the user-visible half of the watchdog feature — regressions here would
+// silently re-enable the 600s-HTTP-transport-only fallback.
+func TestConfig_IdleHardTimeoutDefault540(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".shannon"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Agent.IdleHardTimeoutSecs != 540 {
+		t.Errorf("IdleHardTimeoutSecs default = %d, want 540", cfg.Agent.IdleHardTimeoutSecs)
+	}
+}
+
+// TestConfig_StreamIdleTimeoutDefault90 pins the new chunk-gap watchdog
+// default (mirrors CC's CLAUDE_STREAM_IDLE_TIMEOUT_MS).
+func TestConfig_StreamIdleTimeoutDefault90(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".shannon"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Agent.StreamIdleTimeoutSecs != 90 {
+		t.Errorf("StreamIdleTimeoutSecs default = %d, want 90", cfg.Agent.StreamIdleTimeoutSecs)
+	}
+}
+
+// TestConfig_IdleHardTimeoutYamlOverridesDefault verifies a yaml-supplied
+// value beats the flipped default — including the opt-out value 0, which the
+// daemon converts into a startup WARN at boot.
+func TestConfig_IdleHardTimeoutYamlOverridesDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shannonDir := filepath.Join(home, ".shannon")
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	yaml := "agent:\n  idle_hard_timeout_secs: 180\n  stream_idle_timeout_secs: 30\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Agent.IdleHardTimeoutSecs != 180 {
+		t.Errorf("IdleHardTimeoutSecs = %d, want 180 (yaml override)", cfg.Agent.IdleHardTimeoutSecs)
+	}
+	if cfg.Agent.StreamIdleTimeoutSecs != 30 {
+		t.Errorf("StreamIdleTimeoutSecs = %d, want 30 (yaml override)", cfg.Agent.StreamIdleTimeoutSecs)
+	}
+}
+
+// TestConfig_StreamIdleTimeoutNegativeRejected ensures the validator catches
+// nonsensical values so a typo can't silently disable the watchdog or wrap
+// into a positive duration via int conversion.
+func TestConfig_StreamIdleTimeoutNegativeRejected(t *testing.T) {
+	cfg := &Config{}
+	cfg.Agent.StreamIdleTimeoutSecs = -1
+	err := validateConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error for negative stream_idle_timeout_secs, got nil")
+	}
+	if !strings.Contains(err.Error(), "stream_idle_timeout_secs") {
+		t.Errorf("expected error to mention stream_idle_timeout_secs, got %v", err)
+	}
+}

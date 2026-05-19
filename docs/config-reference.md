@@ -84,9 +84,10 @@ agent:
   thinking_budget: 10000           # thinking token budget (default: 10000)
   force_think_tool: false          # re-enable local `think` tool even when native thinking is active. Use only if a workflow depends on the explicit planning tool surface.
 
-  # Idle watchdog
+  # Idle watchdog (two independent layers)
   idle_soft_timeout_secs: 90       # emit "still working" status after this long waiting on the LLM (0 = disabled)
-  idle_hard_timeout_secs: 0        # cancel run as soft/partial failure after this long idle. 0 = disabled. Recommended: 540 (stays below the 600s gateway timeout).
+  idle_hard_timeout_secs: 540      # cancel run as soft/partial failure after this long idle. Default 540 leaves 60s headroom under the 600s gateway transport ceiling so cancellation can propagate before transport bails. Set to 0 to opt out (daemon logs a startup WARN).
+  stream_idle_timeout_secs: 90     # abort the SSE streaming body if no chunk arrives for this long. Closes the failure mode idle_hard_timeout_secs cannot catch: silent TCP-level stream drop where the kernel never returns from read(). 0 = disabled (legacy scanner path).
 
   # Skill matching
   skill_discovery: true            # per-turn small-model skill matching prefetch (default: true)

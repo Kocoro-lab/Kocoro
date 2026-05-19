@@ -367,6 +367,9 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		llmClient = client.NewOllamaClient(runtimeCfg.Ollama.Endpoint, model)
 	} else {
 		gateway = client.NewGatewayClient(runtimeCfg.Endpoint, runtimeCfg.APIKey)
+		if runtimeCfg.Agent.StreamIdleTimeoutSecs > 0 {
+			gateway.SetStreamIdleTimeout(time.Duration(runtimeCfg.Agent.StreamIdleTimeoutSecs) * time.Second)
+		}
 		llmClient = gateway
 	}
 
@@ -494,6 +497,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		loop.SetAlwaysAllowTools(runtimeCfg.Permissions.AlwaysAllowTools)
 	}
 	loop.SetEnableStreaming(true) // streaming enabled but deltas are suppressed — only final text rendered
+	loop.SetIdleTimeouts(runtimeCfg.Agent.IdleSoftTimeoutSecs, runtimeCfg.Agent.IdleHardTimeoutSecs)
 
 	settings := config.LoadSettings()
 

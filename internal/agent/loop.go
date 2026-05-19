@@ -2844,6 +2844,38 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					a.handler.OnStreamDelta(delta.Text)
 					streamingText.WriteString(delta.Text)
 				})
+				// Silent stream drop: the per-chunk watchdog inside CompleteStream
+				// fired because no chunk arrived for stream_idle_timeout_secs.
+				// Falling back to non-streaming would re-hit the same hung
+				// upstream and burn another 600s on the HTTP transport ceiling,
+				// so treat as a partial-success exit (matches ErrHardIdleTimeout).
+				if errors.Is(err, client.ErrStreamIdleTimeout) {
+					partial := streamingText.String()
+					if partial != "" {
+						messages = append(messages, client.Message{
+							Role:    "assistant",
+							Content: client.NewTextContent(partial),
+						})
+					} else {
+						messages = append(messages, client.Message{
+							Role:    "assistant",
+							Content: client.NewTextContent("[stream idle timeout]"),
+						})
+					}
+					stampMessage()
+					captureRunMessages()
+					if rs, ok := a.handler.(RunStatusHandler); ok {
+						var detail string
+						if gw, ok := a.client.(*client.GatewayClient); ok {
+							detail = fmt.Sprintf("streaming aborted: no chunk for %s", gw.StreamIdleTimeout())
+						} else {
+							detail = "streaming aborted: no chunks received within configured idle timeout"
+						}
+						rs.OnRunStatus("stream_idle_timeout", detail)
+					}
+					setRunStatus(runstatus.CodeDeadlineExceeded, true)
+					return partial, usage, fmt.Errorf("stream aborted: %w", err)
+				}
 				// Fall back to non-streaming if gateway doesn't support it
 				if err != nil {
 					resp, err = a.client.Complete(ctx, req)
@@ -4048,9 +4080,18 @@ func isContextLengthError(err error) bool {
 
 // isRetryableLLMError returns true for transient errors that may succeed on retry
 // (rate limits, server errors, timeouts). Non-retryable: 400 bad request,
-// 401 auth, 403 forbidden, context cancelled, marshalling errors.
+// 401 auth, 403 forbidden, context cancelled, marshalling errors,
+// ErrStreamIdleTimeout (upstream silently dropping — retrying re-hangs).
 func isRetryableLLMError(err error) bool {
 	if err == nil {
+		return false
+	}
+	// Stream-idle timeout means the upstream connection is silently dropping
+	// chunks. The agent loop's stream-fallback short-circuit already exits
+	// before this is reached, but the check is defensive — any other call
+	// site that surfaces ErrStreamIdleTimeout (e.g. completeWithRetry-wrapped
+	// path) MUST also avoid retrying for the same reason.
+	if errors.Is(err, client.ErrStreamIdleTimeout) {
 		return false
 	}
 	// Typed API error — check status code directly.

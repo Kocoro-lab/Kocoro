@@ -188,3 +188,64 @@ func (f *fakeLLMClient) Complete(ctx context.Context, _ client.CompletionRequest
 func (f *fakeLLMClient) CompleteStream(ctx context.Context, req client.CompletionRequest, _ func(client.StreamDelta)) (*client.CompletionResponse, error) {
 	return f.Complete(ctx, req)
 }
+
+// streamIdleLLMClient surfaces ErrStreamIdleTimeout from CompleteStream and
+// counts both Complete and CompleteStream calls. The agent loop's silent-drop
+// short-circuit must prevent any retry — completeCalls MUST stay 0.
+type streamIdleLLMClient struct {
+	streamCalls   atomic.Int32
+	completeCalls atomic.Int32
+	deltaText     string // optional partial text to deliver before the timeout
+}
+
+func (s *streamIdleLLMClient) Complete(ctx context.Context, _ client.CompletionRequest) (*client.CompletionResponse, error) {
+	s.completeCalls.Add(1)
+	return nil, client.ErrStreamIdleTimeout
+}
+
+func (s *streamIdleLLMClient) CompleteStream(ctx context.Context, _ client.CompletionRequest, onDelta func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	s.streamCalls.Add(1)
+	if s.deltaText != "" && onDelta != nil {
+		onDelta(client.StreamDelta{Text: s.deltaText})
+	}
+	return nil, client.ErrStreamIdleTimeout
+}
+
+// TestAgentLoop_StreamIdleTimeout_NoRetry exercises the full agent-side
+// handling of a silent stream drop:
+//   - CompleteStream returns ErrStreamIdleTimeout
+//   - loop short-circuits the streaming→Complete fallback (no retry)
+//   - isRetryableLLMError refuses to retry the inline attempt loop
+//   - OnRunStatus("stream_idle_timeout", …) fires for downstream consumers
+//   - LastRunStatus().Partial == true so UIs render the "timed out, here's
+//     what we have" hint instead of a hard error
+func TestAgentLoop_StreamIdleTimeout_NoRetry(t *testing.T) {
+	gw := &streamIdleLLMClient{deltaText: "half a sentence"}
+	loop := NewAgentLoop(gw, NewToolRegistry(), "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetEnableStreaming(true)
+	handler := &recordingHandler{mockHandler: mockHandler{approveResult: true}}
+	loop.SetHandler(handler)
+
+	partial, _, err := loop.Run(context.Background(), "hello", nil, nil)
+	if err == nil {
+		t.Fatal("expected stream-idle error, got nil")
+	}
+	if !errors.Is(err, client.ErrStreamIdleTimeout) {
+		t.Fatalf("want ErrStreamIdleTimeout in error chain, got: %v", err)
+	}
+	if partial != "half a sentence" {
+		t.Errorf("expected partial text to be preserved, got %q", partial)
+	}
+	if got := gw.streamCalls.Load(); got != 1 {
+		t.Errorf("CompleteStream calls = %d, want 1 (no retry)", got)
+	}
+	if got := gw.completeCalls.Load(); got != 0 {
+		t.Errorf("Complete fallback calls = %d, want 0 (must short-circuit on stream_idle_timeout)", got)
+	}
+	if !handler.HasCode("stream_idle_timeout") {
+		t.Errorf("expected stream_idle_timeout status event, got: %v", handler.Statuses())
+	}
+	if status := loop.LastRunStatus(); !status.Partial {
+		t.Errorf("expected Partial=true on stream-idle-timeout, got: %+v", status)
+	}
+}

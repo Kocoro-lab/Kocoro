@@ -2297,9 +2297,17 @@ func closeRouteDone(done chan struct{}) {
 // isSoftRunError reports whether err is a normal termination (cancel, timeout,
 // max iterations) rather than a hard failure. Soft errors should persist the
 // full conversation from RunMessages(), not just a friendly error stub.
+//
+// ErrStreamIdleTimeout is soft: the agent loop already captures partial
+// streaming text and emits OnRunStatus("stream_idle_timeout") with
+// CodeDeadlineExceeded + Partial=true before returning. Treating it as hard
+// here would overwrite the partial reply with the friendly-error stub and
+// drop the agent_reply event entirely (issue: silent stream drops would lose
+// any text received before the drop).
 func isSoftRunError(err error) bool {
 	return errors.Is(err, agent.ErrMaxIterReached) ||
 		errors.Is(err, agent.ErrHardIdleTimeout) ||
+		errors.Is(err, client.ErrStreamIdleTimeout) ||
 		errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded)
 }
