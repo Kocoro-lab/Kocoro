@@ -22,6 +22,7 @@ var cloudSourceSet = map[string]struct{}{
 	"line":     {},
 	"feishu":   {},
 	"lark":     {},
+	"wecom":    {},
 	"telegram": {},
 	"webhook":  {},
 }

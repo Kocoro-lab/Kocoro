@@ -11,8 +11,57 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/daemon"
 )
+
+func TestEmitInjectedMessageReceivedEventIncludesActiveSessionAndMessageID(t *testing.T) {
+	bus := daemon.NewEventBus()
+	ch := bus.Subscribe()
+	defer bus.Unsubscribe(ch)
+
+	cache := daemon.NewSessionCache(t.TempDir())
+	defer cache.CloseAll()
+
+	routeKey, ok := cache.RegisterAdHocSessionRoute("sess-123", nil, make(chan struct{}), make(chan agent.InjectedMessage, 1), "")
+	if !ok {
+		t.Fatal("failed to register active session route")
+	}
+	defer cache.UnregisterAdHocSessionRoute(routeKey)
+
+	emitInjectedMessageReceivedEvent(bus, cache, daemon.RunAgentRequest{
+		Agent:    "default",
+		Source:   "slack",
+		Sender:   "U123",
+		Text:     "follow up",
+		RouteKey: routeKey,
+	}, "msg-456")
+
+	select {
+	case evt := <-ch:
+		if evt.Type != daemon.EventMessageReceived {
+			t.Fatalf("event type = %q, want %q", evt.Type, daemon.EventMessageReceived)
+		}
+		var payload struct {
+			Agent     string `json:"agent"`
+			Source    string `json:"source"`
+			Sender    string `json:"sender"`
+			SessionID string `json:"session_id"`
+			MessageID string `json:"message_id"`
+			Text      string `json:"text"`
+			Queued    bool   `json:"queued"`
+		}
+		if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		if payload.Agent != "default" || payload.Source != "slack" || payload.Sender != "U123" ||
+			payload.SessionID != "sess-123" || payload.MessageID != "msg-456" || payload.Text != "follow up" || !payload.Queued {
+			t.Fatalf("unexpected payload: %+v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for injected message_received event")
+	}
+}
 
 func TestDaemonEventHandler_OnPreamble_DropsEmptyText(t *testing.T) {
 	received := make(chan daemon.DaemonMessage, 2)

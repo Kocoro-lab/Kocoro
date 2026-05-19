@@ -655,7 +655,7 @@ func IsMessagingPlatform(source string) bool {
 func cacheSourceFromDaemonSource(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
 	switch s {
-	case "slack", "line", "feishu", "lark", "telegram":
+	case "slack", "line", "feishu", "lark", "wecom", "telegram":
 		// Human-conversation channels: idle gaps > 5m are common, 1h pays off.
 		return s
 	case "tui", "kocoro", "shanclaw":

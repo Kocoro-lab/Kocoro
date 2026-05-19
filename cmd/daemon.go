@@ -363,6 +363,7 @@ var daemonStartCmd = &cobra.Command{
 					Files: daemon.ConvertFilesToInjected(msgCtx, req.Files),
 				}) {
 				case daemon.InjectOK:
+					emitInjectedMessageReceivedEvent(deps.EventBus, deps.SessionCache, req, msg.MessageID)
 					// Message injected — running loop will incorporate it.
 					// Suppress the explicit ack on messaging platforms: the user's
 					// own message is already visible in the thread and the active
@@ -378,7 +379,7 @@ var daemonStartCmd = &cobra.Command{
 				case daemon.InjectQueueFull:
 					// Active run exists but queue saturated — don't start a new run.
 					log.Printf("daemon: inject queue full for route %q, message dropped", req.RouteKey)
-					return ""
+					return "[message rejected: the active run already has a queued follow-up; retry after it reaches the next turn]"
 				case daemon.InjectBusy:
 					return "[message rejected: the active run is still initializing; retry when it reaches the next turn]"
 				case daemon.InjectCWDConflict:
@@ -702,6 +703,26 @@ type daemonEventHandler struct {
 	wsClient    *daemon.Client // for event forwarding to Cloud
 	messageID   string         // scoped to current message
 	usage       agent.UsageAccumulator
+}
+
+func emitInjectedMessageReceivedEvent(eventBus *daemon.EventBus, sessionCache *daemon.SessionCache, req daemon.RunAgentRequest, messageID string) {
+	if eventBus == nil || sessionCache == nil || req.RouteKey == "" {
+		return
+	}
+	sessionID := sessionCache.RouteSessionID(req.RouteKey)
+	if sessionID == "" {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"agent":      req.Agent,
+		"source":     req.Source,
+		"sender":     req.Sender,
+		"session_id": sessionID,
+		"message_id": messageID,
+		"text":       req.Text,
+		"queued":     true,
+	})
+	eventBus.Emit(daemon.Event{Type: daemon.EventMessageReceived, Payload: payload})
 }
 
 func (h *daemonEventHandler) SetSessionID(id string) { h.sessionID = id }

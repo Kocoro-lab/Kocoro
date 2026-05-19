@@ -32,6 +32,7 @@ func TestCacheSourceFromDaemonSource(t *testing.T) {
 		{"Slack", "slack"},
 		{"  line  ", "line"},
 		{"feishu", "feishu"},
+		{"wecom", "wecom"},
 		{"telegram", "telegram"},
 		{"tui", "tui"},
 		{"shanclaw", "shanclaw"},
@@ -325,6 +326,7 @@ func TestOutputFormatForSource(t *testing.T) {
 		{"webhook", "plain"},
 		{"feishu", "plain"},
 		{"lark", "plain"},
+		{"wecom", "plain"},
 		{"telegram", "plain"},
 		{"Slack", "plain"}, // case-insensitive
 		{"LINE", "plain"},  // case-insensitive
