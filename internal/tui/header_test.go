@@ -19,8 +19,17 @@ func TestRenderStartupHeader_FirstFrame(t *testing.T) {
 }
 
 func TestRenderStartupHeader_FinalFrame(t *testing.T) {
+	// CreatedAt is far in the past, UpdatedAt is recent — header should
+	// render the recency (UpdatedAt) under "Recent activity", not the
+	// creation date. Guards the same sort-key/display contract as PR #176.
 	sessions := []session.SessionSummary{
-		{ID: "abc", Title: "test session", CreatedAt: time.Now().Add(-2 * time.Hour), MsgCount: 5},
+		{
+			ID:        "abc",
+			Title:     "test session",
+			CreatedAt: time.Now().Add(-90 * 24 * time.Hour),
+			UpdatedAt: time.Now().Add(-2 * time.Hour),
+			MsgCount:  5,
+		},
 	}
 	result := renderStartupHeader(headerTotalFrames-1, 80, "v0.1.0", "large", "https://api.test.com", "/home/user/project", sessions, 0)
 
