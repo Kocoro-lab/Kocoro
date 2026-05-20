@@ -100,7 +100,7 @@ func renderStartupHeader(frame int, width int, version string, modelTier string,
 		titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 		agoStyle := lipgloss.NewStyle().Foreground(dimColor)
 		rightLines = append(rightLines, " "+titleStyle.Render(title))
-		rightLines = append(rightLines, " "+agoStyle.Render(fmt.Sprintf("%s, %d msgs", timeAgo(s.CreatedAt), s.MsgCount)))
+		rightLines = append(rightLines, " "+agoStyle.Render(fmt.Sprintf("%s, %d msgs", timeAgo(s.UpdatedAt), s.MsgCount)))
 	}
 
 	// Equalize line counts between columns.
