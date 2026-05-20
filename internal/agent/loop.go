@@ -260,6 +260,36 @@ func buildStickySkillReminder(skillName, snippet string) string {
 // to distinguish truncated results from hard failures.
 var ErrMaxIterReached = errors.New("agent loop reached iteration limit")
 
+// ErrEmptyFinalResponse is returned when the LLM completes a turn with
+// err == nil, no tool calls, and no visible text (OutputText == "" and no
+// non-empty text blocks in ContentBlocks). The previous behavior was to
+// persist an assistant message with empty content, which Cloud rewrites to
+// `[{"type":"text","text":""}]` and Cloud's rolling cache_control marker
+// then lands on, producing Anthropic 400
+// `cache_control cannot be set for empty text blocks` on the next request.
+// See docs/empty-assistant-content-400.md. Callers (runner.go) treat this
+// like other hard run failures and append the standard friendly error.
+var ErrEmptyFinalResponse = errors.New("agent: LLM returned empty final response")
+
+// recoverVisibleTextFromBlocks scans resp.ContentBlocks for non-empty text
+// blocks and returns their concatenation. Used as a last-resort fallback in
+// the final response path when OutputText is empty but Cloud emitted real
+// text blocks (e.g. stream-done aggregator edge case). Returns "" for nil
+// resp, no blocks, or only thinking/redacted_thinking — the caller treats
+// "" as an empty final response.
+func recoverVisibleTextFromBlocks(resp *client.CompletionResponse) string {
+	if resp == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, b := range resp.ContentBlocks {
+		if b.Type == "text" && b.Text != "" {
+			sb.WriteString(b.Text)
+		}
+	}
+	return sb.String()
+}
+
 type RunStatus struct {
 	// Partial reports that the run returned a usable partial result instead of a
 	// clean success. In that case FailureCode describes why the result is partial
@@ -1295,6 +1325,13 @@ func (a *AgentLoop) messagesForLLM(messages []client.Message) []client.Message {
 	// is logged via `LogCacheCompactEvent("img_oversize_strip", ...)` so the
 	// cache-debug diff path remains complete (see CLAUDE.md "Prompt Cache").
 	filterOversizeImages(out)
+	// Wire-time guard for empty assistant content. Catches in-memory
+	// `assistant content: ""` that could be introduced this turn (e.g. via
+	// queued injected messages, mid-turn snapshot paths, or external history
+	// from disk that predates Solution A in loop.go). The repair returns the
+	// same slice when nothing is wrong, so the no-op case is cheap.
+	// See docs/empty-assistant-content-400.md.
+	out = ctxwin.RepairEmptyAssistantContent(out)
 	return out
 }
 
@@ -3376,6 +3413,21 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if truncatedText.Len() > 0 {
 				truncatedText.WriteString(resp.OutputText)
 				fullText = truncatedText.String()
+			}
+			// Empty-final-response guard: if OutputText (plus any accumulated
+			// truncation text) is empty, try to recover visible text from
+			// resp.ContentBlocks (Cloud / stream-done aggregator edge case
+			// where the typed blocks have text but OutputText collapsed to "").
+			// If still empty, refuse to persist `assistant content: ""` — that
+			// shape causes Anthropic 400 "cache_control cannot be set for empty
+			// text blocks" on the next request. See
+			// docs/empty-assistant-content-400.md.
+			if fullText == "" {
+				fullText = recoverVisibleTextFromBlocks(resp)
+			}
+			if fullText == "" {
+				captureRunMessages()
+				return "", usage, ErrEmptyFinalResponse
 			}
 			// Record the final assistant text in messages before capturing.
 			messages = append(messages, client.Message{

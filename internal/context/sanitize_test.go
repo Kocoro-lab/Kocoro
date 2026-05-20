@@ -2,6 +2,7 @@ package context
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -566,5 +567,219 @@ func TestSanitizeHistory_DoesNotMutateInput(t *testing.T) {
 	}
 	if string(origInput) != "null" {
 		t.Errorf("SanitizeHistory mutated caller's RawMessage: got %q, want %q", string(origInput), "null")
+	}
+}
+
+// --- Empty assistant repair (docs/empty-assistant-content-400.md) ---
+//
+// Bug: ShanClaw's final response path used to persist
+// `assistant content: ""` when the LLM returned err==nil with no tool
+// calls AND no visible text. Replaying that history triggers Anthropic's
+// "cache_control cannot be set for empty text blocks" 400.
+// SanitizeHistory must repair such poisoned sessions on the way to the
+// wire AND on resume.
+
+// Plain string content with empty text on assistant must be dropped.
+// Surrounding user content must survive — content-preserving merge for
+// the newly-adjacent users that result from the drop.
+func TestSanitizeHistory_DropsPlainEmptyAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "assistant", Content: client.NewTextContent("")},
+		{Role: "user", Content: client.NewTextContent("我的图呢")},
+	}
+	result := SanitizeHistory(msgs)
+
+	for i, m := range result {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
+			t.Errorf("empty assistant survived at %d: %+v", i, m)
+		}
+	}
+
+	var userTexts []string
+	for _, m := range result {
+		if m.Role == "user" {
+			userTexts = append(userTexts, m.Content.Text())
+		}
+	}
+	combined := strings.Join(userTexts, " | ")
+	if !strings.Contains(combined, "first") {
+		t.Errorf("first user content dropped after empty-assistant repair; got %q", combined)
+	}
+	if !strings.Contains(combined, "我的图呢") {
+		t.Errorf("second user content dropped after empty-assistant repair; got %q", combined)
+	}
+}
+
+// Block content with NO blocks AND empty text on assistant — same as bare empty.
+// `MessageContent{blocks: nil, text: ""}` and `MessageContent{blocks: []}` both
+// serialize to "" via MessageContent.MarshalJSON.
+func TestSanitizeHistory_DropsEmptyBlockListAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewBlockContent(nil)},
+		{Role: "user", Content: client.NewTextContent("there")},
+	}
+	result := SanitizeHistory(msgs)
+	for i, m := range result {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
+			t.Errorf("empty-block-list assistant survived at %d", i)
+		}
+	}
+}
+
+// Mixed blocks: thinking + empty text. The empty text block is the one that
+// triggers the 400; strip it but keep the thinking block (which preserves
+// the assistant turn's reasoning trail across resume).
+func TestSanitizeHistory_StripsEmptyTextBlockFromAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "thinking", Thinking: "plan", Signature: "sig"},
+			{Type: "text", Text: ""},
+		})},
+		{Role: "user", Content: client.NewTextContent("ok")},
+	}
+	result := SanitizeHistory(msgs)
+
+	var asst *client.Message
+	for i := range result {
+		if result[i].Role == "assistant" {
+			asst = &result[i]
+		}
+	}
+	if asst == nil {
+		t.Fatal("assistant message dropped — thinking block should have survived")
+	}
+	blocks := asst.Content.Blocks()
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text == "" {
+			t.Errorf("empty text block survived in assistant blocks")
+		}
+	}
+	hasThinking := false
+	for _, b := range blocks {
+		if b.Type == "thinking" && b.Thinking == "plan" {
+			hasThinking = true
+		}
+	}
+	if !hasThinking {
+		t.Error("thinking block must be preserved when stripping empty text blocks")
+	}
+}
+
+// All-empty-text blocks → effectively empty assistant → drop entirely.
+func TestSanitizeHistory_DropsAllEmptyTextBlockAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "text", Text: ""},
+			{Type: "text", Text: ""},
+		})},
+		{Role: "user", Content: client.NewTextContent("there")},
+	}
+	result := SanitizeHistory(msgs)
+	for i, m := range result {
+		if m.Role == "assistant" {
+			t.Errorf("all-empty-text-block assistant survived at %d: %+v", i, m)
+		}
+	}
+}
+
+// Replicates the exact 2026-05-19 session shape:
+// user → asst(tool_use) → user(tool_result) → asst("") → user("我的图呢").
+// Dropping the empty assistant produces user(tool_result) + user(text)
+// adjacency. A keep-later merge would discard the tool_result and orphan
+// the prior assistant's tool_use, replacing one 400 with another. The
+// repair must content-merge instead so the tool_use/tool_result pair
+// stays intact.
+func TestSanitizeHistory_EmptyAssistantDropPreservesToolResultPair(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("read this")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "tool_use", ID: "tu_1", Name: "file_read", Input: json.RawMessage(`{"path":"/x"}`)},
+		})},
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			client.NewToolResultBlock("tu_1", "file contents", false),
+		})},
+		{Role: "assistant", Content: client.NewTextContent("")},
+		{Role: "user", Content: client.NewTextContent("我的图呢")},
+	}
+	result := SanitizeHistory(msgs)
+
+	for i, m := range result {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
+			t.Errorf("empty assistant survived at %d", i)
+		}
+	}
+
+	var foundToolUse, foundToolResult bool
+	for _, m := range result {
+		if !m.Content.HasBlocks() {
+			continue
+		}
+		for _, b := range m.Content.Blocks() {
+			if b.Type == "tool_use" && b.ID == "tu_1" {
+				foundToolUse = true
+			}
+			if b.Type == "tool_result" && b.ToolUseID == "tu_1" {
+				foundToolResult = true
+			}
+		}
+	}
+	if !foundToolUse {
+		t.Error("tool_use dropped — would orphan and 400")
+	}
+	if !foundToolResult {
+		t.Error("tool_result dropped — would orphan and 400")
+	}
+
+	var allText strings.Builder
+	for _, m := range result {
+		allText.WriteString(m.Content.Text())
+	}
+	if !strings.Contains(allText.String(), "我的图呢") {
+		t.Errorf("user text 我的图呢 lost during empty-assistant repair; got %q", allText.String())
+	}
+}
+
+// RepairEmptyAssistantContent is also called directly from agent.messagesForLLM
+// as a wire-time guard. Verify the exported helper handles the same shapes.
+func TestRepairEmptyAssistantContent_DropsBareEmptyAndMergesUsers(t *testing.T) {
+	in := []client.Message{
+		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "assistant", Content: client.NewTextContent("")},
+		{Role: "user", Content: client.NewTextContent("我的图呢")},
+	}
+	out := RepairEmptyAssistantContent(in)
+	for i, m := range out {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
+			t.Errorf("empty assistant survived at %d", i)
+		}
+	}
+	var combined strings.Builder
+	for _, m := range out {
+		combined.WriteString(m.Content.Text())
+	}
+	if !strings.Contains(combined.String(), "first") || !strings.Contains(combined.String(), "我的图呢") {
+		t.Errorf("user content lost in RepairEmptyAssistantContent; got %q", combined.String())
+	}
+}
+
+// Idempotence: running the repair on already-clean history must be a no-op.
+func TestRepairEmptyAssistantContent_Idempotent(t *testing.T) {
+	in := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewTextContent("hello")},
+	}
+	out1 := RepairEmptyAssistantContent(in)
+	out2 := RepairEmptyAssistantContent(out1)
+	if len(out1) != len(out2) {
+		t.Fatalf("non-idempotent: %d vs %d", len(out1), len(out2))
+	}
+	for i := range out1 {
+		if out1[i].Content.Text() != out2[i].Content.Text() {
+			t.Errorf("idempotence broken at %d: %q vs %q", i, out1[i].Content.Text(), out2[i].Content.Text())
+		}
 	}
 }

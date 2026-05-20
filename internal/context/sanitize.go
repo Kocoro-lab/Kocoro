@@ -13,6 +13,10 @@ import (
 // Specifically handles:
 //   - tool role messages with plain text (no tool_result blocks) → dropped
 //   - assistant messages that are just "[tool_call: ...]" placeholders → dropped
+//   - assistant messages with empty content (no blocks AND empty text, or
+//     blocks where every text block is empty) → dropped, with any newly-
+//     adjacent users content-merged so tool_use/tool_result pairing
+//     survives (see docs/empty-assistant-content-400.md)
 //   - consecutive assistant messages without intervening user → merged into one
 //   - assistant error messages (friendly run-failure output) → dropped
 //   - orphaned tool_use blocks (no matching tool_result follows) → stripped
@@ -34,17 +38,24 @@ func SanitizeHistory(messages []client.Message) []client.Message {
 		cleaned = append(cleaned, msg)
 	}
 
-	// Second pass: fix consecutive same-role messages.
-	// Claude API requires strict user/assistant alternation.
-	merged := mergeConsecutiveRoles(cleaned)
+	// Second pass: repair empty assistant content. Runs BEFORE
+	// mergeConsecutiveRoles because the content-preserving merge done
+	// here for users adjacent-after-drop preserves tool_result blocks
+	// that mergeConsecutiveRoles' keep-later semantics would discard,
+	// orphaning the prior assistant's tool_use into a 400.
+	repaired := RepairEmptyAssistantContent(cleaned)
 
-	// Third pass: strip orphaned tool_use and tool_result blocks.
+	// Third pass: fix consecutive same-role messages.
+	// Claude API requires strict user/assistant alternation.
+	merged := mergeConsecutiveRoles(repaired)
+
+	// Fourth pass: strip orphaned tool_use and tool_result blocks.
 	// Runs after role merging so adjacency checks are reliable.
 	// Both Anthropic and OpenAI reject conversations where tool_use/tool_result
 	// blocks lack their matching counterpart.
 	stripped := stripOrphanedToolPairs(merged)
 
-	// Fourth pass: normalize stale tool_use Input fields. Protects users
+	// Fifth pass: normalize stale tool_use Input fields. Protects users
 	// resuming sessions persisted before the issue #45 fix from replaying a
 	// poisoned "input":null into the next Anthropic request.
 	normalized := normalizeStaleToolUseInputs(stripped)
@@ -54,6 +65,171 @@ func SanitizeHistory(messages []client.Message) []client.Message {
 	result := mergeConsecutiveRoles(normalized)
 
 	return result
+}
+
+// RepairEmptyAssistantContent removes assistant messages whose content would
+// serialize to an empty JSON value via MessageContent.MarshalJSON — i.e.
+//
+//   - bare empty text content (`MessageContent{text: "", blocks: nil}`)
+//   - empty block list (`MessageContent{blocks: []}` or `nil`)
+//   - block list whose only members are `{type:"text", text:""}`
+//
+// Empty assistant content reaches Cloud's `_convert_messages_to_claude_format`
+// as `""` and is rewritten to `[{"type":"text","text":""}]`. Cloud's rolling
+// `cache_control` marker on `claude_messages[-2]` then lands on that empty
+// text block, triggering Anthropic's 400
+// `cache_control cannot be set for empty text blocks`.
+// See docs/empty-assistant-content-400.md for the full data flow.
+//
+// Mixed blocks (e.g. `thinking + empty text`) keep the non-text blocks and
+// strip just the empty text — the thinking block carries useful trajectory
+// state across resume and the cache_control failure mode is text-block
+// specific.
+//
+// When dropping an empty assistant leaves two adjacent user messages, they
+// are content-merged here (NOT in mergeConsecutiveRoles, whose keep-later
+// semantics would discard the prior tool_result block and orphan the
+// preceding assistant's tool_use). User adjacency that existed in the
+// INPUT (e.g. three rapid user messages with no assistant between them)
+// is left for mergeConsecutiveRoles to handle in its established way.
+//
+// Returns a new slice; the original is not modified. Idempotent.
+func RepairEmptyAssistantContent(messages []client.Message) []client.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+	out := make([]client.Message, 0, len(messages))
+	justDroppedAssistant := false
+	for _, msg := range messages {
+		if msg.Role == "assistant" {
+			repaired, drop := repairAssistantBlocks(msg)
+			if drop {
+				justDroppedAssistant = true
+				continue
+			}
+			justDroppedAssistant = false
+			out = append(out, repaired)
+			continue
+		}
+		// Non-assistant message after a dropped assistant: if it's a user
+		// and the previous accumulated message is also a user, content-merge.
+		if justDroppedAssistant && msg.Role == "user" && len(out) > 0 && out[len(out)-1].Role == "user" {
+			out[len(out)-1] = mergeTwoUsersPreservingContent(out[len(out)-1], msg)
+			justDroppedAssistant = false
+			continue
+		}
+		justDroppedAssistant = false
+		out = append(out, msg)
+	}
+	return out
+}
+
+// repairAssistantBlocks examines a single assistant message and returns
+// either (msg, true) to drop, or (possibly-repaired msg, false) to keep.
+//
+// Rules:
+//   - !HasBlocks() && Text() == "" → drop (bare empty)
+//   - HasBlocks() with at least one empty text block:
+//     strip the empty text blocks; if NO blocks remain → drop, else keep
+//     the rebuilt message with the stripped blocks (thinking, tool_use,
+//     non-empty text, etc. are preserved verbatim).
+//   - All other shapes (non-empty text, tool_use, thinking-only, etc.) →
+//     keep unchanged.
+func repairAssistantBlocks(msg client.Message) (client.Message, bool) {
+	if !msg.Content.HasBlocks() {
+		if msg.Content.Text() == "" {
+			return msg, true
+		}
+		return msg, false
+	}
+
+	src := msg.Content.Blocks()
+	hasEmptyText := false
+	for _, b := range src {
+		if b.Type == "text" && b.Text == "" {
+			hasEmptyText = true
+			break
+		}
+	}
+	if !hasEmptyText {
+		return msg, false
+	}
+
+	kept := make([]client.ContentBlock, 0, len(src))
+	for _, b := range src {
+		if b.Type == "text" && b.Text == "" {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	if len(kept) == 0 {
+		return msg, true
+	}
+	return client.Message{
+		Role:       msg.Role,
+		Content:    client.NewBlockContent(kept),
+		Name:       msg.Name,
+		ToolCallID: msg.ToolCallID,
+	}, false
+}
+
+// mergeTwoUsersPreservingContent joins two adjacent user messages such that
+// content from both is preserved. This is the content-preserving counterpart
+// to mergeConsecutiveRoles (which uses keep-later). Used only inside
+// RepairEmptyAssistantContent, where dropping an empty assistant can leave a
+// user{tool_result} immediately followed by a user{text} — losing the
+// tool_result via keep-later would orphan the prior assistant's tool_use.
+//
+// Block merging:
+//   - text + text   → joined with "\n\n"
+//   - blocks + text → blocks copied, then a {type:"text",text:bText} appended
+//   - text + blocks → {type:"text",text:aText} prepended to b's blocks
+//   - blocks + blocks → concatenated
+//
+// Empty text on one side is skipped so we never introduce empty text blocks
+// or stray separators.
+func mergeTwoUsersPreservingContent(a, b client.Message) client.Message {
+	aHas := a.Content.HasBlocks()
+	bHas := b.Content.HasBlocks()
+	aText := a.Content.Text()
+	bText := b.Content.Text()
+
+	switch {
+	case !aHas && !bHas:
+		joined := aText
+		if aText != "" && bText != "" {
+			joined = aText + "\n\n" + bText
+		} else if aText == "" {
+			joined = bText
+		}
+		return client.Message{Role: "user", Content: client.NewTextContent(joined)}
+
+	case aHas && !bHas:
+		aBlocks := a.Content.Blocks()
+		merged := make([]client.ContentBlock, 0, len(aBlocks)+1)
+		merged = append(merged, aBlocks...)
+		if bText != "" {
+			merged = append(merged, client.ContentBlock{Type: "text", Text: bText})
+		}
+		return client.Message{Role: "user", Content: client.NewBlockContent(merged)}
+
+	case !aHas && bHas:
+		bBlocks := b.Content.Blocks()
+		merged := make([]client.ContentBlock, 0, 1+len(bBlocks))
+		if aText != "" {
+			merged = append(merged, client.ContentBlock{Type: "text", Text: aText})
+		}
+		merged = append(merged, bBlocks...)
+		return client.Message{Role: "user", Content: client.NewBlockContent(merged)}
+
+	default:
+		aBlocks := a.Content.Blocks()
+		bBlocks := b.Content.Blocks()
+		merged := make([]client.ContentBlock, 0, len(aBlocks)+len(bBlocks))
+		merged = append(merged, aBlocks...)
+		merged = append(merged, bBlocks...)
+		return client.Message{Role: "user", Content: client.NewBlockContent(merged)}
+	}
 }
 
 // normalizeStaleToolUseInputs rebuilds messages whose tool_use blocks carry
