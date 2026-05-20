@@ -201,8 +201,9 @@ func LoadMemoryFrom(dir string, maxLines int) (string, error) {
 	}
 
 	result := strings.Join(lines, "\n")
-	result = annotateStaleness(result, time.Now())
-	result = prependFileStaleness(result, mtime, time.Now())
+	now := time.Now()
+	result = annotateStaleness(result, now)
+	result = prependFileStaleness(result, mtime, now)
 	return result, nil
 }
 

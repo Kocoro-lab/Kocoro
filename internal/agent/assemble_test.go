@@ -101,3 +101,60 @@ func TestAssembleUserMessage_SessionPlaceholderEmitsCacheBreak(t *testing.T) {
 		t.Fatalf("session placeholder not preserved: %q", msg)
 	}
 }
+
+// TestAppendDynamicUserBlocks_LanguageAfterSkillListing is the load-bearing
+// regression guard for issue #157. Skill listings carry multilingual trigger
+// keywords (e.g. "日:一覧/表示/...") which previously sat at the absolute end
+// of the user message and pulled response language toward Japanese under
+// recency bias. The Language directive MUST be appended after the skill
+// listing so it remains the last system block before the model generates.
+//
+// Without this test, a refactor that reorders the two appends inside
+// AgentLoop.Run silently reintroduces the bug — all other tests still pass.
+func TestAppendDynamicUserBlocks_LanguageAfterSkillListing(t *testing.T) {
+	// Realistic skill listing — wrapped in <system-reminder> by the real
+	// buildSkillListing, with a kocoro entry carrying the same multilingual
+	// trigger keywords that originally caused the drift.
+	skillListing := "<system-reminder>\n## Available Skills\n" +
+		"- kocoro: Inspect Kocoro platform state. " +
+		"中:列出/查看/查询/创建/修改 agent/skill/MCP/计划. " +
+		"日:一覧/表示/確認/検索/作成 agent/skill/MCP/スケジュール.\n" +
+		"</system-reminder>"
+	langDirective := prompt.LanguageDirective()
+
+	out := appendDynamicUserBlocks("user-query", skillListing, langDirective)
+
+	skillIdx := strings.Index(out, "## Available Skills")
+	langIdx := strings.Index(out, "## Language")
+	jpIdx := strings.Index(out, "日:一覧")
+
+	if skillIdx < 0 || langIdx < 0 || jpIdx < 0 {
+		t.Fatalf("expected all markers present; got skill=%d lang=%d jp=%d in:\n%s",
+			skillIdx, langIdx, jpIdx, out)
+	}
+	if langIdx <= skillIdx {
+		t.Errorf("issue #157: ## Language at idx=%d must come AFTER ## Available Skills at idx=%d. "+
+			"Otherwise multilingual skill trigger keywords (e.g. 日:一覧) become the recency anchor "+
+			"and short English prompts get answered in Japanese.",
+			langIdx, skillIdx)
+	}
+	if langIdx <= jpIdx {
+		t.Errorf("issue #157: ## Language at idx=%d must come AFTER the Japanese skill trigger "+
+			"keywords at idx=%d for the same reason", langIdx, jpIdx)
+	}
+}
+
+// TestAppendDynamicUserBlocks_OmittedBlocksAreNoOp asserts the helper is a
+// no-op for empty inputs — AgentLoop.Run relies on this so it can pass `""`
+// for skill listing when no new skills are present without branching.
+func TestAppendDynamicUserBlocks_OmittedBlocksAreNoOp(t *testing.T) {
+	if got := appendDynamicUserBlocks("user-query", "", ""); got != "user-query" {
+		t.Errorf("expected unchanged input when both blocks empty, got: %q", got)
+	}
+	if got := appendDynamicUserBlocks("user-query", "", "## Language\nfoo"); !strings.HasSuffix(got, "## Language\nfoo") {
+		t.Errorf("expected Language appended when no skill listing, got: %q", got)
+	}
+	if got := appendDynamicUserBlocks("user-query", "skills", ""); !strings.HasSuffix(got, "skills") {
+		t.Errorf("expected skill listing appended when no language directive, got: %q", got)
+	}
+}

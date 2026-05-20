@@ -1502,6 +1502,30 @@ func assembleUserMessage(parts prompt.PromptParts, userMessage string) string {
 	return sb.String()
 }
 
+// appendDynamicUserBlocks adds turn-time blocks to the end of the
+// scaffolded user message: the skill listing (when there are new skills to
+// announce) and the Language directive.
+//
+// Ordering invariant (issue #157): the Language directive MUST be the LAST
+// appended block. Skill listings carry multilingual trigger keywords
+// (e.g. "日:一覧/表示/確認" for Japanese-speaking users to find the right
+// skill) which, under recency bias, would otherwise pull short English
+// prompts toward whichever language a skill author embedded. Pinning
+// Language to the absolute end of the user message reverses that pull
+// regardless of how many non-English blocks appear earlier in the scaffold.
+//
+// Pure function — the dedup state for skill listings (which skills to
+// surface this turn) lives in the caller.
+func appendDynamicUserBlocks(scaffoldedUserText, skillListing, languageDirective string) string {
+	if skillListing != "" {
+		scaffoldedUserText += "\n\n" + skillListing
+	}
+	if languageDirective != "" {
+		scaffoldedUserText += "\n\n" + languageDirective
+	}
+	return scaffoldedUserText
+}
+
 func injectPrivateMemoryContext(scaffolded, userPayload, privateContext string) string {
 	privateContext = strings.TrimSpace(privateContext)
 	if privateContext == "" {
@@ -2496,7 +2520,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// the cached prefix which would break byte stability on skill set changes.
 	// Delta tracking: only announce skills not yet sent in prior Run() calls
 	// (relevant for TUI multi-turn sessions where sentSkillNames persists).
-	scaffoldDirty := false
+	var skillListing string
 	if len(a.agentSkills) > 0 {
 		if a.sentSkillNames == nil {
 			a.sentSkillNames = make(map[string]bool)
@@ -2508,31 +2532,15 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			}
 		}
 		if len(newSkills) > 0 {
-			if listing := buildSkillListing(newSkills); listing != "" {
-				scaffoldedUserText += "\n\n" + listing
-				scaffoldDirty = true
-			}
+			skillListing = buildSkillListing(newSkills)
 			for _, s := range a.agentSkills {
 				a.sentSkillNames[s.Name] = true
 			}
 		}
 	}
 
-	// Append the Language directive as the FINAL block of the user message —
-	// after VolatileContext, the user input, AND the skill listing above.
-	// Skill descriptions intentionally carry multilingual trigger keywords
-	// (e.g. "日:一覧/表示/確認" for Japanese-speaking users to find the right
-	// skill), which under recency bias previously caused short English
-	// prompts to be answered in Japanese (issue #157). Pinning the directive
-	// to the absolute end of the user message reverses that pull regardless
-	// of how many non-English blocks appear earlier in the scaffold.
-	if langBlock := prompt.LanguageDirective(); langBlock != "" {
-		scaffoldedUserText += "\n\n" + langBlock
-		scaffoldDirty = true
-	}
-	if scaffoldDirty {
-		messages[len(messages)-1] = replaceUserMessageText(messages[len(messages)-1], scaffoldedUserText)
-	}
+	scaffoldedUserText = appendDynamicUserBlocks(scaffoldedUserText, skillListing, prompt.LanguageDirective())
+	messages[len(messages)-1] = replaceUserMessageText(messages[len(messages)-1], scaffoldedUserText)
 
 	const discoveryThreshold = 10
 	type discoveryResult struct {

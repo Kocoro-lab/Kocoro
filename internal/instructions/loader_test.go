@@ -321,9 +321,13 @@ func TestPrependFileStaleness_ZeroMtime(t *testing.T) {
 func TestLoadMemory_StalenessHeaderIntegration(t *testing.T) {
 	shannonDir := t.TempDir()
 	memDir := filepath.Join(shannonDir, "memory")
-	os.MkdirAll(memDir, 0755)
+	if err := os.MkdirAll(memDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
 	path := filepath.Join(memDir, "MEMORY.md")
-	os.WriteFile(path, []byte("- fact about X"), 0644)
+	if err := os.WriteFile(path, []byte("- fact about X"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
 	oldTime := time.Now().AddDate(0, 0, -30)
 	if err := os.Chtimes(path, oldTime, oldTime); err != nil {
