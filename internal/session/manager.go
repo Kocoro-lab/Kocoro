@@ -464,9 +464,11 @@ func (m *Manager) ResumeLatest() (*Session, error) {
 		return nil, nil
 	}
 
-	// Find the session with the most recent UpdatedAt.
-	// List() only has CreatedAt, so we load each to check UpdatedAt.
-	// For typical daemon use (1 session per agent), this is just 1 load.
+	// Find the session with the most recent UpdatedAt by reloading each
+	// summary. SessionSummary now carries UpdatedAt directly, but Resume
+	// at the end of this function needs the full *Session anyway — so
+	// for the typical 1-session-per-agent daemon case skipping the
+	// per-iteration Load wouldn't save any work.
 	var bestID string
 	var bestTime time.Time
 	for _, s := range summaries {
