@@ -249,8 +249,8 @@ type SessionSummary struct {
 	// (mirrors Session.UpdatedAt). Drives list ordering in GET /sessions so
 	// the most recently used session surfaces first, regardless of creation
 	// date. Title / pinned / favorite edits intentionally do NOT bump this
-	// (see Store.Rename / SetPinned / SetFavorite) so metadata changes
-	// preserve order.
+	// (see Store.PatchTitle / Store.PatchFlags, which write JSON directly
+	// and bypass Save / nextUpdatedAt) so metadata changes preserve order.
 	UpdatedAt time.Time `json:"updated_at"`
 	MsgCount  int       `json:"msg_count"`
 	// Source identifies the originating IM / surface for this session.
