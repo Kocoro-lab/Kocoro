@@ -3,9 +3,11 @@ package daemon
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
@@ -205,6 +207,114 @@ func TestSessionCache_InjectMessage_ActiveRoute(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected message in channel")
+	}
+}
+
+// TestSessionCache_InjectMessage_CancelPendingFallsThrough guards the
+// Desktop interrupt-send race: when the client closes SSE (issuing cancel)
+// then immediately POSTs /message for the same route, the cleanup goroutine
+// may not have cleared `done` yet. cancelPending is set synchronously by
+// CancelRouteWithReason. If we honored the still-set `done`, the new
+// POST would hit InjectBusy 409 and surface as "SSE request failed". The
+// fix: any route mid-cancellation is reported as "no active run" so the
+// caller falls through to start a fresh RunAgent.
+func TestSessionCache_InjectMessage_CancelPendingFallsThrough(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	defer sc.CloseAll()
+
+	injectCh := make(chan agent.InjectedMessage, 5)
+	sc.mu.Lock()
+	sc.routes["agent:test"] = &routeEntry{
+		injectCh:      injectCh,
+		done:          make(chan struct{}),
+		cancelPending: true,
+	}
+	sc.mu.Unlock()
+
+	if got := sc.InjectMessage("agent:test", agent.InjectedMessage{Text: "interrupt-send payload"}); got != InjectNoActiveRun {
+		t.Fatalf("expected InjectNoActiveRun while cancelPending, got %d", got)
+	}
+	if got := sc.HasActiveRun("agent:test"); got {
+		t.Fatalf("HasActiveRun should report false while cancelPending, got true")
+	}
+
+	// Drain check: the message must NOT have been pushed into the channel;
+	// otherwise it would deliver to the dying run instead of the fresh one.
+	select {
+	case msg := <-injectCh:
+		t.Fatalf("message leaked into cancelPending route's injectCh: %q", msg.Text)
+	default:
+	}
+}
+
+func TestSessionCache_CancelRouteWithReason_ActiveRouteStopsFurtherInjection(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	defer sc.CloseAll()
+
+	injectCh := make(chan agent.InjectedMessage, 5)
+	done := make(chan struct{})
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+	sc.mu.Lock()
+	sc.routes["agent:test"] = &routeEntry{
+		injectCh: injectCh,
+		done:     done,
+		cancel: func() {
+			cancelOnce.Do(func() {
+				close(cancelled)
+				close(done)
+			})
+		},
+	}
+	sc.mu.Unlock()
+
+	sc.CancelRouteWithReason("agent:test", agenttypes.ReasonInterrupt)
+
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("expected active route cancel func to be called")
+	}
+	if got := sc.InjectMessage("agent:test", agent.InjectedMessage{Text: "must start a fresh run"}); got != InjectNoActiveRun {
+		t.Fatalf("expected InjectNoActiveRun after active cancel, got %d", got)
+	}
+	if got := sc.HasActiveRun("agent:test"); got {
+		t.Fatalf("HasActiveRun should report false after active cancel, got true")
+	}
+	select {
+	case msg := <-injectCh:
+		t.Fatalf("message leaked into cancelled route's injectCh: %q", msg.Text)
+	default:
+	}
+}
+
+// TestSessionCache_SetRouteCancel_NilWhilePendingNoPanic guards the
+// follow-on race the CancelPending fix uncovered: defer cleanup paths
+// (slash workflow, RunAgent) call SetRouteCancel(key, nil) to clear the
+// registration after the run ends. If cancelPending was set during the
+// run, the older code unconditionally invoked the just-cleared cancel
+// (nil) and crashed the HTTP goroutine. With the nil guard the cleanup
+// still clears pending state but skips the redundant invocation.
+func TestSessionCache_SetRouteCancel_NilWhilePendingNoPanic(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	defer sc.CloseAll()
+
+	sc.mu.Lock()
+	sc.routes["agent:test"] = &routeEntry{
+		cancelPending: true,
+		pendingReason: agenttypes.ReasonInterrupt,
+	}
+	sc.mu.Unlock()
+
+	// Must not panic on nil cancel.
+	sc.SetRouteCancel("agent:test", nil)
+
+	sc.mu.Lock()
+	entry := sc.routes["agent:test"]
+	pendingAfter := entry.cancelPending
+	sc.mu.Unlock()
+	if pendingAfter {
+		t.Fatal("SetRouteCancel(nil) should still consume cancelPending flag")
 	}
 }
 

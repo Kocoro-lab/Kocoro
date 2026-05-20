@@ -66,11 +66,14 @@ http PUT http://localhost:7533/instructions
 Currently raw-text upload is supported on **`PUT /instructions`** only. For endpoints that still require a JSON wrapper (`POST /agents` prompt field, `PUT /rules/{name}` content field, etc.), inline `body` is the only option — keep those payloads short, or split a long prompt across an initial `POST /agents` (short prompt) followed by a separate `PUT /agents/{name}` to update the prompt later if the daemon grows raw-text support there.
 
 For detailed docs on MCP servers, skill API keys, permissions, project init, or multi-step recipes, load the relevant reference:
-`references/agents.md` · `references/skills.md` · `references/config.md` · `references/mcp.md` · `references/instructions.md` · `references/schedules.md` · `references/permissions.md` · `references/project-init.md` · `references/recipes.md` · `references/session-sync.md` · `references/memory.md` · `references/events.md`
+`references/agents.md` · `references/skills.md` · `references/config.md` · `references/mcp.md` · `references/instructions.md` · `references/schedules.md` · `references/permissions.md` · `references/project-init.md` · `references/recipes.md` · `references/session-sync.md` · `references/memory.md` · `references/events.md` · `references/queue.md` · `references/cancel.md` · `references/rewind.md`
 
 - [Session sync](references/session-sync.md) — default-on daily upload of local sessions to Shannon Cloud
 - references/memory.md — memory feature config + diagnostics
 - references/events.md — `/events` SSE bus catalog (tool_status / usage / run_status / cloud_* / notification)
+- references/queue.md — per-route mailbox: `GET /queue`, `DELETE /queue/{id}`, queue.* SSE events
+- references/cancel.md — extended `POST /cancel` with reason classification + optional last-user restore
+- references/rewind.md — `POST /sessions/{id}/rewind` slices history at a chosen user message
 
 ## Security
 

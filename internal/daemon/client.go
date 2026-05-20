@@ -59,11 +59,19 @@ var Version = "dev"
 // and WS, so UIs running multiple bash invocations in parallel can pair
 // them up. Optional for consumers; events remain backward-readable
 // because older readers ignore unknown keys.
+//
+// "client_message_queue" — daemon owns a persistent per-route mailbox
+// (SQLite-backed at ~/.shannon/sessions/mailbox.db). Durability boundary
+// shifts from "ack after SendReply" to "ack after mailbox.Append".
+// For active-run IM follow-ups, the daemon also forwards an in-place
+// "Queued next" status event to the active channel-stream message when
+// Cloud sends the source as slack/wecom/feishu/lark.
 const (
 	CapDeliveryAck         = "delivery_ack"
 	CapInlineDocumentB64   = "inline_document_b64"
 	CapInlineExtractedText = "inline_extracted_text"
 	CapToolUseIDEvents     = "tool_use_id_events"
+	CapClientMessageQueue  = "client_message_queue"
 )
 
 var Capabilities = []string{
@@ -71,6 +79,8 @@ var Capabilities = []string{
 	CapInlineDocumentB64,
 	CapInlineExtractedText,
 	CapToolUseIDEvents,
+	CapClientMessageQueue,
+	CapIMMessageLifecycleV1,
 }
 
 type Client struct {
@@ -81,9 +91,9 @@ type Client struct {
 	onMsg         func(MessagePayload) string // returns reply text
 	onSystem      func(string)                // system notifications
 	sem           chan struct{}
-	pendingClaims sync.Map   // map[string]chan bool
-	activeMsgs    sync.Map   // map[string]context.CancelFunc
-	eventSeqs     sync.Map   // map[string]*atomic.Int64
+	pendingClaims sync.Map // map[string]chan bool
+	activeMsgs    sync.Map // map[string]context.CancelFunc
+	eventSeqs     sync.Map // map[string]*atomic.Int64
 	connected     atomic.Bool
 	activeAgent   atomic.Value // stores string
 	startTime     time.Time

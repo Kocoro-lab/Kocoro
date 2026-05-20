@@ -23,6 +23,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
@@ -345,6 +346,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /sessions/{id}", s.handlePatchSession)
 	mux.HandleFunc("POST /sessions/{id}/edit", s.handleEditMessage)
 	mux.HandleFunc("POST /sessions/{id}/reset", s.handleResetSession)
+	mux.HandleFunc("POST /sessions/{id}/rewind", s.handleRewind)
 	mux.HandleFunc("GET /sessions/{id}/summary", s.handleSessionSummary)
 	mux.HandleFunc("POST /sessions/{id}/share", s.handleSessionShare)
 	mux.HandleFunc("DELETE /sessions/{id}/share", s.handleSessionShareRetract)
@@ -365,6 +367,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
 	mux.HandleFunc("POST /message", s.handleMessage)
 	mux.HandleFunc("POST /cancel", s.handleCancel)
+	// Per-route mailbox (see references/queue.md and references/cancel.md).
+	mux.HandleFunc("POST /queue", s.handleEnqueueQueue)
+	mux.HandleFunc("GET /queue", s.handleGetQueue)
+	mux.HandleFunc("DELETE /queue/{id}", s.handleDeleteQueueItem)
 	mux.HandleFunc("GET /events", s.handleEvents)
 	mux.HandleFunc("GET /notifications", s.handleNotifications)
 	mux.HandleFunc("GET /chrome/status", s.handleChromeStatus)
@@ -610,9 +616,11 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		RouteKey  string `json:"route_key,omitempty"`
-		SessionID string `json:"session_id,omitempty"`
-		Agent     string `json:"agent,omitempty"`
+		RouteKey    string `json:"route_key,omitempty"`
+		SessionID   string `json:"session_id,omitempty"`
+		Agent       string `json:"agent,omitempty"`
+		Reason      string `json:"reason,omitempty"`
+		RestoreLast bool   `json:"restore_last,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -631,9 +639,72 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.deps.SessionCache.CancelRoute(key)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "cancelled", "route": key})
+	reason, ok := agenttypes.ParseCancelReason(req.Reason)
+	if !ok {
+		http.Error(w, `{"error":"unknown reason; expected user_cancel|interrupt|background|idle_timeout"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Fast path: legacy callers that don't request a restore get the old
+	// fire-and-forget semantics. Slow path waits for the run to exit so we
+	// can safely slice the session.
+	if !req.RestoreLast {
+		s.deps.SessionCache.CancelRouteWithReason(key, reason)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"status":   "cancelled",
+			"route":    key,
+			"reason":   reason.String(),
+			"restored": false,
+		})
+		return
+	}
+
+	restored, err := s.deps.SessionCache.CancelRouteForRestore(key, reason, true, 5*time.Second)
+	if errors.Is(err, ErrCancelRestoreTimeout) {
+		writeError(w, http.StatusGatewayTimeout, "agent run did not exit within 5s; restore aborted")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if restored != nil {
+		s.publishCancelRestored(key, restored)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"status":   "cancelled",
+			"route":    key,
+			"reason":   reason.String(),
+			"restored": true,
+			"text":     restored.Text,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"status":   "cancelled",
+		"route":    key,
+		"reason":   reason.String(),
+		"restored": false,
+	})
+}
+
+// publishCancelRestored emits the cancel.restored SSE event so subscribed UI
+// clients can fill the user's last message back into their input box.
+func (s *Server) publishCancelRestored(routeKey string, restored *session.RestoredMessage) {
+	if s.deps == nil || s.deps.EventBus == nil || restored == nil {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"route_key":   routeKey,
+		"text":        restored.Text,
+		"attachments": restored.Attachments,
+	})
+	if err != nil {
+		return
+	}
+	s.deps.EventBus.Emit(Event{Type: EventCancelRestored, Payload: payload})
 }
 
 func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
@@ -1675,7 +1746,23 @@ type sseEventHandler struct {
 
 // SetSessionID captures the resolved session ID. Called by RunAgent's
 // multiHandler interface-assertion path (see runner.go SetSessionID injection).
-func (h *sseEventHandler) SetSessionID(id string) { h.sessionID = id }
+//
+// Also emits an SSE `session_started` event so SSE consumers (Desktop) can
+// capture session_id BEFORE the first delta/tool/done event. Without this,
+// Desktop only learns the session_id on the `done` event, which means a
+// follow-up message sent mid-turn (or before `done` arrives) goes out with
+// no session_id and the daemon opens a fresh session instead of continuing
+// the same conversation.
+func (h *sseEventHandler) SetSessionID(id string) {
+	h.sessionID = id
+	if id == "" || h.w == nil {
+		return
+	}
+	fmt.Fprintf(h.w, "event: session_started\ndata: %s\n\n", mustJSON(map[string]string{"session_id": id}))
+	if h.flusher != nil {
+		h.flusher.Flush()
+	}
+}
 
 // Usage returns the cumulative usage collected during this handler's lifetime.
 func (h *sseEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }

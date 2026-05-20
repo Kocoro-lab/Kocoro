@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -12,9 +13,24 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
+
+// DrainedInflightEntry tracks a user IM message that has been pulled from
+// injectCh into an LLM turn. The agent loop appends one entry per drained
+// follow-up so the daemon can emit MESSAGE_LIFECYCLE "done" / "cleared"
+// events to Cloud at run completion (Cloud needs the original IMStatusContext
+// to map each entry back to a platform reaction).
+//
+// CloudMessageID is the Cloud-side envelope id (set on MessagePayload.MessageID
+// in the WS frame); MessageID alone is ambiguous in a daemon that also tracks
+// session messages and mailbox rows.
+type DrainedInflightEntry struct {
+	CloudMessageID  string
+	IMStatusContext json.RawMessage
+}
 
 var ErrSessionChanged = errors.New("session changed since pre-check")
 var ErrRouteActive = errors.New("route has an active run")
@@ -22,8 +38,15 @@ var ErrRouteActive = errors.New("route has an active run")
 type routeEntry struct {
 	mu            sync.Mutex
 	cancel        context.CancelFunc
-	cancelPending bool // set under sc.mu when CancelRoute fires before cancel is assigned
-	done          chan struct{}
+	cancelPending bool                    // set under sc.mu when CancelRoute fires before cancel is assigned
+	pendingReason agenttypes.CancelReason // reason for the pending cancel (set with cancelPending)
+	// cancelCause is the optional reason-tagged variant of cancel. Runner.go
+	// registers both (cancel + cancelCause) when it owns the ctx — the legacy
+	// CancelFunc value lives in cancel; the typed one in cancelCause. CancelRoute
+	// prefers cancelCause when present so the loop can extract the reason via
+	// agenttypes.ExtractReason(context.Cause(ctx)).
+	cancelCause context.CancelCauseFunc
+	done        chan struct{}
 	// sessionID is atomic so CancelBySessionID can scan all routes without
 	// blocking on entry.mu held by an active run. Writers in the runner
 	// already hold entry.mu (per the resume invariant); the atomic only
@@ -34,6 +57,18 @@ type routeEntry struct {
 	activeCWD  string
 	evicting   bool
 	manager    *session.Manager
+	// mailbox is the persisted per-route message queue (Phase 1+).
+	// Lazily created on first EnsureMailbox; nil for routes that have
+	// never queued. Coexists with injectCh — injectCh is the legacy
+	// in-memory mid-run path, mailbox is the durability-first path for
+	// new ack-on-persist semantics.
+	mailbox *agenttypes.Mailbox
+	// drainedInflight is the per-route ordered list of IM messages that this
+	// run has fed into an LLM turn. Each entry pairs a Cloud envelope id with
+	// the message's IMStatusContext. Populated by RunLifecycleEmitter.OnUserMessage-
+	// Processing (which calls SessionCache.AppendDrainedInflight). Consumed by
+	// run-completion lifecycle emission. Locking: sc.mu (see AppendDrainedInflight).
+	drainedInflight []DrainedInflightEntry
 }
 
 // loadSessionID returns the route's current session ID, or "" if unset.
@@ -61,22 +96,41 @@ func cloneSessionSnapshot(sess *session.Session) *session.Session {
 }
 
 // SessionCache separates route-level locking from session storage.
-// - routes: one lock/cancel/inflight channel per routing key
-// - managers: one shared session.Manager per sessions directory for non-routed usage
-// - route manager: lazily created session.Manager per route for routed runs
+//   - routes: one lock/cancel/inflight channel per routing key
+//   - managers: one shared session.Manager per sessions directory for non-routed usage
+//   - route manager: lazily created session.Manager per route for routed runs
+//   - mailboxStore: optional SQLite-backed durability for per-route mailboxes
+//     (nil disables persistence; tests typically pass nil)
+//   - mailboxCap: per-route mailbox capacity cap (defaults to 100)
 type SessionCache struct {
-	mu         sync.Mutex
-	routes     map[string]*routeEntry
-	managers   map[string]*session.Manager
-	shannonDir string
+	mu           sync.Mutex
+	routes       map[string]*routeEntry
+	managers     map[string]*session.Manager
+	shannonDir   string
+	mailboxStore *MailboxStore
+	mailboxCap   int
 }
 
 // NewSessionCache creates a cache rooted at the given shannon directory.
+// Mailbox persistence is disabled (callers that want crash recovery should use
+// NewSessionCacheWithMailbox).
 func NewSessionCache(shannonDir string) *SessionCache {
+	return NewSessionCacheWithMailbox(shannonDir, nil, 0)
+}
+
+// NewSessionCacheWithMailbox creates a cache with the given mailbox store and
+// per-route capacity cap. A non-nil store enables persistence + recovery; a
+// zero capacity falls back to the agenttypes default (100).
+func NewSessionCacheWithMailbox(shannonDir string, store *MailboxStore, capacity int) *SessionCache {
+	if capacity <= 0 {
+		capacity = 100
+	}
 	return &SessionCache{
-		routes:     make(map[string]*routeEntry),
-		managers:   make(map[string]*session.Manager),
-		shannonDir: shannonDir,
+		routes:       make(map[string]*routeEntry),
+		managers:     make(map[string]*session.Manager),
+		shannonDir:   shannonDir,
+		mailboxStore: store,
+		mailboxCap:   capacity,
 	}
 }
 
@@ -246,7 +300,7 @@ func (sc *SessionCache) SetRouteCancel(key string, cancel context.CancelFunc) {
 		entry.cancelPending = false
 	}
 	sc.mu.Unlock()
-	if pending {
+	if pending && cancel != nil {
 		cancel()
 	}
 }
@@ -328,6 +382,14 @@ func (sc *SessionCache) HasActiveRun(key string) bool {
 	if !ok || entry == nil {
 		return false
 	}
+	// Mid-cancellation routes report as inactive so callers (e.g.
+	// /message to InjectMessage gate) let a fresh RunAgent start instead
+	// of bouncing the request with 409 while the runner.go cleanup is
+	// still flushing the old run. Same race that InjectMessage handles;
+	// kept in sync here.
+	if entry.cancelPending {
+		return false
+	}
 	return entry.done != nil
 }
 
@@ -351,7 +413,18 @@ func (sc *SessionCache) InjectMessage(key string, msg agent.InjectedMessage) Inj
 	ch := entry.injectCh
 	done := entry.done
 	activeCWD := entry.activeCWD
+	cancelPending := entry.cancelPending
 	sc.mu.Unlock()
+	// Treat a route mid-cancellation as "no active run" so the caller can
+	// fall through to starting a fresh RunAgent. Without this, Desktop's
+	// interrupt-send (cancel to SSE close to immediate POST /message) races
+	// the runner.go cleanup that clears `done`, and the new prompt lands
+	// here while `done` is still non-nil but `cancelPending` is set,
+	// returning InjectBusy 409 to the client and surfacing as "SSE request
+	// failed" on the Desktop toolbar.
+	if cancelPending {
+		return InjectNoActiveRun
+	}
 	if done == nil {
 		return InjectNoActiveRun
 	}
@@ -381,6 +454,48 @@ func normalizeCWDForCompare(cwd string) string {
 		return resolved
 	}
 	return cwd
+}
+
+// AppendDrainedInflight records that an IM-sourced user message has moved
+// from injectCh (or first-turn primary) into an LLM turn. Consumed at run
+// completion by Task 9 to emit MESSAGE_LIFECYCLE "done" / "cleared" for each
+// entry — Cloud needs the original IMStatusContext to map the entry back to
+// a platform reaction. No-op when key or CloudMessageID is empty (defensive:
+// non-IM drains short-circuit at the call site already).
+//
+// Locking: sc.mu only. The agent loop runs under entry.mu (acquired by the
+// runner via LockRouteWithManager), but we never touch entry.mu here. The
+// slice field is guarded by sc.mu — Task 9's run-completion reader MUST
+// take sc.mu the same way.
+func (sc *SessionCache) AppendDrainedInflight(key string, entry DrainedInflightEntry) {
+	if key == "" || entry.CloudMessageID == "" {
+		return
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if e, ok := sc.routes[key]; ok && e != nil {
+		e.drainedInflight = append(e.drainedInflight, entry)
+	}
+}
+
+// TakeDrainedInflight returns the drained-inflight slice for routeKey and
+// clears it from the route entry. Atomic under sc.mu — readers see either the
+// full slice OR an empty one, never a partial. Used by the run-completion
+// lifecycle emit to drain + clear in one critical section so a second call
+// after completion is a silent no-op (idempotent).
+func (sc *SessionCache) TakeDrainedInflight(routeKey string) []DrainedInflightEntry {
+	if routeKey == "" {
+		return nil
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	e, ok := sc.routes[routeKey]
+	if !ok || e == nil {
+		return nil
+	}
+	out := e.drainedInflight
+	e.drainedInflight = nil
+	return out
 }
 
 // SetRouteRunState updates the externally visible run state for a route.
@@ -432,20 +547,138 @@ func (sc *SessionCache) ClearRouteRunState(key string) {
 //     API layer still returns "cancelled" for idempotency, but no pending
 //     intent is stored — the key must appear in sc.routes for pending to work).
 func (sc *SessionCache) CancelRoute(key string) {
+	sc.CancelRouteWithReason(key, agenttypes.ReasonUserCancel)
+}
+
+// CancelRouteWithReason is the reason-tagged variant of CancelRoute. The
+// reason is recorded on the route entry (for pending cancels) and, when a
+// CancelCauseFunc is available, threaded through context.WithCancelCause
+// so the agent loop's finalizer can recover it via
+// agenttypes.ExtractReason(context.Cause(ctx)).
+//
+// When only the legacy context.CancelFunc is registered (older code paths
+// that never called SetRouteCancelCause), the reason is still stamped on
+// entry.pendingReason but the cancellation itself is unparameterized.
+// agenttypes.ReasonUserCancel is the safe default for those paths.
+func (sc *SessionCache) CancelRouteWithReason(key string, reason agenttypes.CancelReason) {
 	sc.mu.Lock()
 	entry, ok := sc.routes[key]
-	var cancel context.CancelFunc
+	var (
+		cancel      context.CancelFunc
+		cancelCause context.CancelCauseFunc
+	)
 	if ok && entry != nil {
 		cancel = entry.cancel
-		if cancel == nil {
-			entry.cancelPending = true
-		}
+		cancelCause = entry.cancelCause
+		// Mark cancellation synchronously even when an active cancel function
+		// exists. Desktop interrupt-send closes/cancels the current run and
+		// immediately POSTs the replacement message; the inject gate must see
+		// that this route is winding down and start a fresh RunAgent instead
+		// of writing the replacement into the dying loop's injectCh.
+		entry.cancelPending = true
+		entry.pendingReason = reason
 	}
 	sc.mu.Unlock()
+	if cancelCause != nil {
+		cancelCause(agenttypes.NewCancelError(reason))
+		return
+	}
 	if cancel != nil {
 		cancel()
 	}
 }
+
+// CancelRouteForRestore cancels the route's in-flight run, waits up to the
+// supplied timeout for the run to finish, and (when restoreLast is true and
+// the session permits) slices the most recent user message off the session,
+// returning it for restoration into a UI input box.
+//
+// Returns:
+//   - restored != nil: the user message that was sliced.
+//   - restored == nil, err == nil: cancelled successfully but conditions for
+//     restore weren't met (no run, no user message, content followed it).
+//   - err == ErrCancelRestoreTimeout: the run didn't exit within timeout;
+//     the session was NOT mutated (we don't slice optimistically while the
+//     finalizer may still write).
+//   - other err: session load/save failed.
+func (sc *SessionCache) CancelRouteForRestore(key string, reason agenttypes.CancelReason, restoreLast bool, timeout time.Duration) (*session.RestoredMessage, error) {
+	if key == "" {
+		return nil, errors.New("route key required")
+	}
+
+	sc.mu.Lock()
+	entry := sc.routes[key]
+	sc.mu.Unlock()
+
+	if entry == nil {
+		return nil, nil
+	}
+
+	// Capture cancel handle + done channel under sc.mu so a concurrent
+	// ClearRouteRunState can't yank them out from under us.
+	sc.mu.Lock()
+	cancelCause := entry.cancelCause
+	cancel := entry.cancel
+	doneCh := entry.done
+	mgr := entry.manager
+	sessID := entry.loadSessionID()
+	sc.mu.Unlock()
+
+	switch {
+	case cancelCause != nil:
+		cancelCause(agenttypes.NewCancelError(reason))
+	case cancel != nil:
+		cancel()
+	default:
+		// No active cancel handle yet — mark pending and return.
+		sc.mu.Lock()
+		entry.cancelPending = true
+		entry.pendingReason = reason
+		sc.mu.Unlock()
+		return nil, nil
+	}
+
+	if !restoreLast {
+		return nil, nil
+	}
+
+	// Wait for the run to actually exit before mutating the session.
+	if doneCh != nil {
+		select {
+		case <-doneCh:
+		case <-time.After(timeout):
+			return nil, ErrCancelRestoreTimeout
+		}
+	}
+
+	if mgr == nil || sessID == "" {
+		return nil, nil
+	}
+
+	// At this point the run has exited, so it's safe to acquire entry.mu
+	// briefly to mutate the session under the same lock the runner uses.
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	sess, err := mgr.Resume(sessID)
+	if err != nil {
+		return nil, fmt.Errorf("resume session for restore: %w", err)
+	}
+	restored, ok := sess.SliceBeforeLastUser()
+	if !ok {
+		return nil, nil
+	}
+	if err := mgr.Save(); err != nil {
+		return nil, fmt.Errorf("save sliced session: %w", err)
+	}
+	return restored, nil
+}
+
+// ErrCancelRestoreTimeout signals that the in-flight run did not exit
+// within the deadline supplied to CancelRouteForRestore. Callers should
+// translate this to HTTP 504 — the session was not mutated, so it's safe
+// to retry.
+var ErrCancelRestoreTimeout = errors.New("agent run did not exit within restore timeout")
 
 // CancelBySessionID cancels any active route whose sessionID matches,
 // regardless of route key type (agent:<name>, session:<id>, default:<s>:<c>).

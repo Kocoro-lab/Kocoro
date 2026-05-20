@@ -26,6 +26,7 @@ const (
 	// prompt suggestion has been generated and stored in SuggestionState.
 	// Payload: {session_id, agent, text}.
 	EventSuggestionReady = "suggestion_ready"
+
 	// EventScheduleRun marks the lifecycle of a scheduled agent run. The
 	// payload carries `phase` (started/succeeded/failed) so Desktop can
 	// distinguish scheduler-started work from ordinary agent progress events.
@@ -59,6 +60,26 @@ const (
 	// IS retained in the standard SSE replay ring, so a reconnecting client
 	// can still pick up an in-flight share's recent phase events.
 	EventShareProgress = "share_progress"
+
+	// EventQueueAdded fires when EnqueueMessage succeeds (SQLite + in-memory
+	// both committed). Payload: {route_key, message_id, snapshot:[DTO]}.
+	EventQueueAdded = "queue.added"
+
+	// EventQueueRemoved fires when a queued message was retracted by the
+	// caller (DELETE /queue/{id}) or skipped by the drain idempotency check.
+	// Payload: {route_key, message_id, snapshot:[DTO]}.
+	EventQueueRemoved = "queue.removed"
+
+	// EventQueueFlushed fires when the runner drained one or more mailbox
+	// items into a user turn. Payload:
+	// {route_key, consumed_ids:[string], snapshot:[DTO]}.
+	EventQueueFlushed = "queue.flushed"
+
+	// EventCancelRestored fires when POST /cancel with restore_last=true
+	// successfully sliced the most recent user message off the session.
+	// Payload: {route_key, text, attachments:[…]}. UI clients fill `text`
+	// back into their input box.
+	EventCancelRestored = "cancel.restored"
 )
 
 // Event is a daemon lifecycle event pushed to SSE subscribers.

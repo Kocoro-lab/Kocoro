@@ -603,6 +603,22 @@ func TestCapabilities_AdvertisesToolUseIDEvents(t *testing.T) {
 	}
 }
 
+// TestCapabilities_AdvertisesClientMessageQueue confirms the queue token is
+// shipped so Cloud / inspectors can identify daemons that own a persistent
+// per-route mailbox (durability boundary at mailbox.Append, not after reply).
+func TestCapabilities_AdvertisesClientMessageQueue(t *testing.T) {
+	found := false
+	for _, c := range Capabilities {
+		if c == CapClientMessageQueue {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("default Capabilities = %v, want to contain %q", Capabilities, CapClientMessageQueue)
+	}
+}
+
 // TestSendDeliveryAck_EmptyMessageIDIsNoOp confirms a missing inbound
 // MessageID short-circuits before sendEnvelope. The wire protocol
 // requires non-empty MessageID for delivery_ack (Cloud warns and drops

@@ -77,6 +77,14 @@ type RunAgentRequest struct {
 	SessionHistory []client.Message      `json:"-"`                   // pre-loaded history for LLM context (BypassRouting runs)
 	StickyContext  string                `json:"-"`                   // 额外的 sticky context，注入系统提示（对用户不可见）
 	Files          []RemoteFile          `json:"-"`                   // remote file attachments from Cloud (WS only)
+
+	// IM message lifecycle plumbing for the run's PRIMARY user message (first
+	// turn). Mid-run follow-ups carry their own copies on InjectedMessage.
+	// CloudMessageID is the Cloud envelope id; IMStatusContext is the opaque
+	// platform reaction context (echoed verbatim in MESSAGE_LIFECYCLE events).
+	// Both empty for non-IM sources (TUI/CLI/webhook/cron).
+	CloudMessageID  string          `json:"-"`
+	IMStatusContext json.RawMessage `json:"-"`
 }
 
 // Validate checks that the request has the minimum required fields.
@@ -655,7 +663,7 @@ func IsMessagingPlatform(source string) bool {
 func cacheSourceFromDaemonSource(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
 	switch s {
-	case "slack", "line", "feishu", "lark", "telegram":
+	case "slack", "line", "feishu", "lark", "wecom", "telegram":
 		// Human-conversation channels: idle gaps > 5m are common, 1h pays off.
 		return s
 	case "tui", "kocoro", "shanclaw":
@@ -681,6 +689,10 @@ func routeTitle(source, channel, sender string) string {
 	}
 	s := strings.ToLower(strings.TrimSpace(source))
 	if s == "" {
+		return ""
+	}
+	switch s {
+	case "desktop", "shanclaw", "kocoro":
 		return ""
 	}
 	label := strings.ToUpper(s[:1]) + s[1:]
@@ -1046,6 +1058,18 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// Also fires cancel right away if CancelRoute already set cancelPending.
 		deps.SessionCache.SetRouteCancel(req.RouteKey, cancel)
 		defer func() {
+			// Emit MESSAGE_LIFECYCLE "done" for the tail of this run's
+			// drained-inflight IM messages and "cleared" for earlier entries,
+			// then clear the slice. Runs before ClearRouteRunState so the
+			// route is still externally "active" while lifecycle events go
+			// out, mirroring the Task 8 "processing" emit ordering. nil-safe
+			// — TakeDrainedInflight short-circuits when the slice is empty
+			// (non-IM runs / no follow-ups drained).
+			var ws LifecycleEventSender
+			if deps.WSClient != nil {
+				ws = deps.WSClient
+			}
+			EmitLifecycleOnRunCompletion(ws, deps.SessionCache, req.RouteKey)
 			deps.SessionCache.ClearRouteRunState(req.RouteKey)
 			closeRouteDone(routeDone)
 			route.cancel = nil
@@ -1056,6 +1080,78 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			}
 			deps.SessionCache.UnlockRoute(req.RouteKey)
 		}()
+
+		// Drain any pending mailbox messages and prepend their text to the
+		// current prompt so the LLM sees the user's full intent in one user
+		// turn. This consumes both crash-recovery rows (seeded at daemon
+		// startup) and any HTTP/Desktop messages that piled up via the
+		// /queue endpoint while the route was idle.
+		//
+		// Known limitation (P0-4 relaxed): mailbox messages are MarkConsumed
+		// as soon as their text lands in the prompt string — they are NOT
+		// guaranteed to survive a daemon crash that happens between this
+		// point and session.Save. The trade-off bounds blast radius to
+		// "messages enqueued via /queue or recovery, then daemon crashes
+		// in the next ~10ms"; for Cloud-sourced messages the Cloud replay
+		// buffer is the primary durability layer regardless.
+		if pendingBatch := deps.SessionCache.DrainMailbox(req.RouteKey, 20); len(pendingBatch) > 0 {
+			pendingIDs := make([]string, 0, len(pendingBatch))
+			var b strings.Builder
+			for _, m := range pendingBatch {
+				if b.Len() > 0 {
+					b.WriteByte('\n')
+				}
+				b.WriteString(m.Text)
+				// Phase 4: surface any attachments as a bracketed hint so the
+				// LLM is aware the user shipped files alongside this text.
+				// Full RequestContentBlock integration (image compression /
+				// file_ref / auto-approval) is the follow-up — for now the
+				// text representation keeps the queue lossless on the prompt
+				// path even if downstream tools won't process them yet.
+				if len(m.Attachments) > 0 {
+					b.WriteByte('\n')
+					b.WriteString("[Attached: ")
+					for i, att := range m.Attachments {
+						if i > 0 {
+							b.WriteString(", ")
+						}
+						if att.Kind != "" {
+							b.WriteString(att.Kind)
+							b.WriteString(":")
+						}
+						if att.OriginalURL != "" {
+							b.WriteString(att.OriginalURL)
+						} else if att.Nonce != "" {
+							b.WriteString(att.Nonce)
+						} else {
+							b.WriteString("file")
+						}
+					}
+					b.WriteByte(']')
+				}
+				pendingIDs = append(pendingIDs, m.ID)
+			}
+			if b.Len() > 0 {
+				if prompt == "" {
+					prompt = b.String()
+				} else {
+					prompt = b.String() + "\n" + prompt
+				}
+				req.Text = prompt
+			}
+			log.Printf("daemon: drained %d mailbox msg(s) into prompt for route %q", len(pendingBatch), req.RouteKey)
+			if err := deps.SessionCache.MarkMailboxConsumed(pendingIDs); err != nil {
+				log.Printf("daemon: mailbox mark consumed (%v): %v", pendingIDs, err)
+			}
+			if deps.EventBus != nil {
+				payload, _ := json.Marshal(map[string]any{
+					"route_key":    req.RouteKey,
+					"consumed_ids": pendingIDs,
+					"snapshot":     ToDTOs(deps.SessionCache.MailboxSnapshot(req.RouteKey)),
+				})
+				deps.EventBus.Emit(Event{Type: EventQueueFlushed, Payload: payload})
+			}
+		}
 	} else {
 		managerDir := sessionsDir
 		if req.BypassRouting {
@@ -1076,6 +1172,28 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	resumed := false
 	switch {
+	case req.NewSession && req.SessionID != "":
+		// Client-minted ID path: the caller (Desktop) generated the UUID
+		// before the first POST so subsequent follow-ups can carry the
+		// same id without waiting for the daemon's `session_started`
+		// event. Without this branch, NewSession=true would route to the
+		// generic NewSession() below and the daemon would mint its own
+		// id — defeating the whole point.
+		//
+		// Idempotency: a follow-up POST may STILL carry new_session=true
+		// when the client's pending-marker hadn't been cleared by the
+		// `session_started` SSE event yet (the race we're fixing).
+		// Resume first so a second-POST-while-first-not-acked re-binds
+		// to the existing session instead of wiping the in-progress
+		// history with a fresh blank Session.
+		if !session.IsValidSessionID(req.SessionID) {
+			return nil, fmt.Errorf("invalid session_id format: %q", req.SessionID)
+		}
+		if _, err := sessMgr.Resume(req.SessionID); err == nil {
+			resumed = true
+		} else {
+			sessMgr.NewSessionWithID(req.SessionID)
+		}
 	case req.SessionID != "":
 		// Resume a specific session by ID (reuses cached manager to avoid DB handle leak).
 		if _, err := sessMgr.Resume(req.SessionID); err != nil {
@@ -1120,6 +1238,51 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	sess := sessMgr.Current()
 	if route != nil && sess != nil {
 		route.storeSessionID(sess.ID)
+	}
+
+	// Ad-hoc route registration for default-agent / route-less runs.
+	//
+	// ComputeRouteKey returns "" for Desktop's default-agent path (source=
+	// "desktop" with no channel/agent), which sends those runs through the
+	// `route == nil` branch above without any SessionCache entry. That means
+	// a subsequent POST /cancel or explicit POST /message injection with
+	// `session_id` cannot reach the running loop; `RouteKeyForSession`
+	// finds no match.
+	//
+	// To make cancellation and explicit mid-turn injection work for the
+	// default-agent path we register a transient entry under
+	// "session:<sess.ID>" once sessions have resolved. The entry carries
+	// this run's cancel func + done chan + injectCh + activeCWD so
+	// POST /cancel and POST /message can locate the active run via
+	// session_id. POST /queue is queue-only and does not write injectCh.
+	//
+	// Note: only fires when `route == nil` AND sess.ID is non-empty — the
+	// routed branch above already set up its own injectCh/cancel for runs
+	// with a meaningful route_key (named agents, Slack threads, etc.).
+	var adHocRouteKey string
+	if route == nil && sess != nil && sess.ID != "" {
+		reqCtx, cancel := context.WithCancel(ctx)
+		ctx = reqCtx
+		routeDone = make(chan struct{})
+		routeInjectCh = make(chan agent.InjectedMessage, 10)
+		// activeCWD is unresolved at this point (effectiveCWD is computed
+		// further below). Register with "" — EnqueueMessage's CWD check
+		// is gated on activeCWD != "" so a missing value is permissive.
+		if key, ok := deps.SessionCache.RegisterAdHocSessionRoute(sess.ID, cancel, routeDone, routeInjectCh, ""); ok {
+			adHocRouteKey = key
+			log.Printf("daemon: ad-hoc route registered key=%s (default-agent run, session=%s)", adHocRouteKey, sess.ID)
+			defer func() {
+				deps.SessionCache.UnregisterAdHocSessionRoute(adHocRouteKey)
+				closeRouteDone(routeDone)
+			}()
+		} else {
+			cancel()
+			// Falling back to running without ad-hoc registration is safe —
+			// the loop still works, only mid-turn injection is unavailable.
+			routeDone = nil
+			routeInjectCh = nil
+			log.Printf("daemon: ad-hoc route NOT registered (session=%s already has an active run); mid-turn injection disabled", sess.ID)
+		}
 	}
 
 	// Clear any pending suggestion before this turn starts — the user is
@@ -1502,6 +1665,49 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	if routeInjectCh != nil {
 		loop.SetInjectCh(routeInjectCh)
+	}
+	// IM message lifecycle: wire the per-run emitter so the agent loop can
+	// fire "processing" + record drained-inflight entries for IM-sourced user
+	// messages (Cloud needs the original IMStatusContext to map the entry
+	// back to a platform reaction). Non-IM runs construct the emitter too —
+	// it short-circuits internally on empty IMStatusContext, so the
+	// architectural plumbing stays uniform and we avoid per-source branching.
+	// nil deps.WSClient is tolerated (tests / fixtures construct ServerDeps
+	// without a WS client); the emitter still records bookkeeping for the
+	// drained-inflight slice Task 9 consumes at run completion.
+	if req.RouteKey != "" {
+		var ws LifecycleEventSender
+		if deps.WSClient != nil {
+			ws = deps.WSClient
+		}
+		loop.SetLifecycleEmitter(NewRunLifecycleEmitter(ws, deps.SessionCache, req.RouteKey))
+	}
+	// First-turn lifecycle: the run's primary user message moves into the
+	// LLM turn on iter 0; expose its IM plumbing to the loop so it can emit
+	// "processing" exactly once at first-turn entry. Empty fields short-
+	// circuit inside the loop's first-turn check.
+	loop.SetFirstTurnLifecycle(req.CloudMessageID, req.IMStatusContext)
+	// Wire mailbox row consumption for legacy injected mailbox IDs. The
+	// modern POST /queue path is queue-only, but this keeps older injected
+	// ID paths idempotent if they appear in a live loop.
+	if req.RouteKey != "" {
+		routeKey := req.RouteKey
+		loop.SetMailboxConsumeFn(func(ids []string) {
+			if len(ids) == 0 {
+				return
+			}
+			if err := deps.SessionCache.MarkMailboxConsumed(ids); err != nil {
+				log.Printf("daemon: MarkMailboxConsumed(%v): %v", ids, err)
+			}
+			if deps.EventBus != nil {
+				payload, _ := json.Marshal(map[string]any{
+					"route_key":    routeKey,
+					"consumed_ids": ids,
+					"snapshot":     ToDTOs(deps.SessionCache.MailboxSnapshot(routeKey)),
+				})
+				deps.EventBus.Emit(Event{Type: EventQueueFlushed, Payload: payload})
+			}
+		})
 	}
 	loop.SetSessionID(sess.ID)
 	loop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)
@@ -2110,6 +2316,16 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		deps.SessionCache.SetRouteRunState(req.RouteKey, routeDone, nil, "")
 		deps.SessionCache.SetRouteCancel(req.RouteKey, slashCancel)
 		defer func() {
+			// Drain lifecycle done/cleared for any IM messages this slash run
+			// consumed. In practice slash workflows are HTTP-initiated and the
+			// slice is empty, but emitting unconditionally keeps the contract
+			// uniform with RunAgent and stays a no-op when there is nothing
+			// to emit.
+			var ws LifecycleEventSender
+			if deps.WSClient != nil {
+				ws = deps.WSClient
+			}
+			EmitLifecycleOnRunCompletion(ws, deps.SessionCache, req.RouteKey)
 			// Clear cancel registration before unlock so the next caller registers fresh.
 			deps.SessionCache.SetRouteCancel(req.RouteKey, nil)
 			deps.SessionCache.ClearRouteRunState(req.RouteKey)

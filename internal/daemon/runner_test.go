@@ -32,6 +32,7 @@ func TestCacheSourceFromDaemonSource(t *testing.T) {
 		{"Slack", "slack"},
 		{"  line  ", "line"},
 		{"feishu", "feishu"},
+		{"wecom", "wecom"},
 		{"telegram", "telegram"},
 		{"tui", "tui"},
 		{"shanclaw", "shanclaw"},
@@ -298,6 +299,9 @@ func TestRouteTitle(t *testing.T) {
 		{"slack", "#general", "", "Slack · #general"},
 		{"slack", "#general", "Alice", "Slack · Alice"},
 		{"webhook", "hook-1", "", "Webhook · hook-1"},
+		{"desktop", "shanclaw", "", ""},
+		{"shanclaw", "shanclaw", "", ""},
+		{"kocoro", "shanclaw", "", ""},
 		{"", "slack", "Wayland", ""},
 		{"slack", "", "Wayland", "Slack · Wayland"},
 		{"", "", "", ""},
@@ -322,6 +326,7 @@ func TestOutputFormatForSource(t *testing.T) {
 		{"webhook", "plain"},
 		{"feishu", "plain"},
 		{"lark", "plain"},
+		{"wecom", "plain"},
 		{"telegram", "plain"},
 		{"Slack", "plain"}, // case-insensitive
 		{"LINE", "plain"},  // case-insensitive

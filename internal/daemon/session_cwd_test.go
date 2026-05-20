@@ -15,7 +15,7 @@ import (
 // asserts identical classification.
 func TestCloudSourceDefinitionsAgree(t *testing.T) {
 	inputs := []string{
-		"slack", "line", "feishu", "lark", "telegram", "webhook",
+		"slack", "line", "feishu", "lark", "wecom", "telegram", "webhook",
 		"desktop", "cli", "cron", "schedule", "web", "", "unknown",
 		"SLACK", " Slack ",
 	}
@@ -33,10 +33,11 @@ func TestIsCloudSource(t *testing.T) {
 	cases := map[string]bool{
 		"slack":    true,
 		"SLACK":    true,
-		" slack ": true,
+		" slack ":  true,
 		"line":     true,
 		"feishu":   true,
 		"lark":     true,
+		"wecom":    true,
 		"telegram": true,
 		"webhook":  true,
 		"desktop":  false,

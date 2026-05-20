@@ -11,8 +11,57 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/daemon"
 )
+
+func TestEmitInjectedMessageReceivedEventIncludesActiveSessionAndMessageID(t *testing.T) {
+	bus := daemon.NewEventBus()
+	ch := bus.Subscribe()
+	defer bus.Unsubscribe(ch)
+
+	cache := daemon.NewSessionCache(t.TempDir())
+	defer cache.CloseAll()
+
+	routeKey, ok := cache.RegisterAdHocSessionRoute("sess-123", nil, make(chan struct{}), make(chan agent.InjectedMessage, 1), "")
+	if !ok {
+		t.Fatal("failed to register active session route")
+	}
+	defer cache.UnregisterAdHocSessionRoute(routeKey)
+
+	emitInjectedMessageReceivedEvent(bus, cache, daemon.RunAgentRequest{
+		Agent:    "default",
+		Source:   "slack",
+		Sender:   "U123",
+		Text:     "follow up",
+		RouteKey: routeKey,
+	}, "msg-456")
+
+	select {
+	case evt := <-ch:
+		if evt.Type != daemon.EventMessageReceived {
+			t.Fatalf("event type = %q, want %q", evt.Type, daemon.EventMessageReceived)
+		}
+		var payload struct {
+			Agent     string `json:"agent"`
+			Source    string `json:"source"`
+			Sender    string `json:"sender"`
+			SessionID string `json:"session_id"`
+			MessageID string `json:"message_id"`
+			Text      string `json:"text"`
+			Queued    bool   `json:"queued"`
+		}
+		if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		if payload.Agent != "default" || payload.Source != "slack" || payload.Sender != "U123" ||
+			payload.SessionID != "sess-123" || payload.MessageID != "msg-456" || payload.Text != "follow up" || !payload.Queued {
+			t.Fatalf("unexpected payload: %+v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for injected message_received event")
+	}
+}
 
 func TestDaemonEventHandler_OnPreamble_DropsEmptyText(t *testing.T) {
 	received := make(chan daemon.DaemonMessage, 2)
@@ -51,6 +100,94 @@ func TestDaemonEventHandler_OnPreamble_DropsEmptyText(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not receive non-empty preamble")
+	}
+}
+
+func TestActiveCloudMessageTracker_ClearDoesNotDeleteReplacement(t *testing.T) {
+	tracker := newActiveCloudMessageTracker()
+
+	clearFirst := tracker.Track("default:slack:T1", "msg-active-1")
+	clearSecond := tracker.Track("default:slack:T1", "msg-active-2")
+
+	clearFirst()
+	if got := tracker.MessageID("default:slack:T1"); got != "msg-active-2" {
+		t.Fatalf("stale clear removed replacement: got %q", got)
+	}
+
+	clearSecond()
+	if got := tracker.MessageID("default:slack:T1"); got != "" {
+		t.Fatalf("clearSecond left stale message id %q", got)
+	}
+}
+
+func TestSendQueuedFollowUpStatusEventTargetsActiveMessage(t *testing.T) {
+	received := make(chan daemon.DaemonMessage, 2)
+	srv := httptestNewWebSocketServer(t, received)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	client := daemon.NewClient(wsURL, "", nil, nil)
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	sendQueuedFollowUpStatusEvent(client, "msg-active", "总结到我的notion")
+
+	select {
+	case dm := <-received:
+		if dm.Type != daemon.MsgTypeEvent || dm.MessageID != "msg-active" {
+			t.Fatalf("unexpected daemon message: %+v", dm)
+		}
+		var payload daemon.DaemonEventPayload
+		if err := json.Unmarshal(dm.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		if payload.EventType != "LLM_OUTPUT" {
+			t.Fatalf("event type = %q, want LLM_OUTPUT", payload.EventType)
+		}
+		if !strings.Contains(payload.Message, "Queued next:") || !strings.Contains(payload.Message, "总结到我的notion") {
+			t.Fatalf("queued status text missing preview: %q", payload.Message)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not receive queued follow-up status event")
+	}
+}
+
+func TestShouldForwardQueuedFollowUpStatusOnlyForSupportedIMs(t *testing.T) {
+	cases := []struct {
+		source string
+		want   bool
+	}{
+		{"slack", true},
+		{"wecom", true},
+		{"feishu", true},
+		{"lark", true},
+		{" Slack ", true},
+		{"line", false},
+		{"telegram", false},
+		{"wechat", false},
+		{"teams", false},
+		{"discord", false},
+		{"desktop", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := shouldForwardQueuedFollowUpStatus(c.source); got != c.want {
+			t.Errorf("shouldForwardQueuedFollowUpStatus(%q) = %v, want %v", c.source, got, c.want)
+		}
+	}
+}
+
+func TestShouldForwardQueuedFollowUpStatusForMessageSuppressesLifecycleContext(t *testing.T) {
+	if shouldForwardQueuedFollowUpStatusForMessage("slack", json.RawMessage(`{"platform":"slack"}`)) {
+		t.Fatal("expected queued footer to be suppressed when IM lifecycle context is present")
+	}
+	if !shouldForwardQueuedFollowUpStatusForMessage("slack", nil) {
+		t.Fatal("expected queued footer fallback when IM lifecycle context is absent")
+	}
+	if shouldForwardQueuedFollowUpStatusForMessage("desktop", nil) {
+		t.Fatal("desktop must not forward cloud queued footer")
 	}
 }
 

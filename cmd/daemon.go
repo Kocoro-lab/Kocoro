@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -29,6 +31,8 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 	"github.com/Kocoro-lab/ShanClaw/internal/watcher"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	_ "modernc.org/sqlite"
 )
 
 var daemonCmd = &cobra.Command{
@@ -117,6 +121,20 @@ var daemonStartCmd = &cobra.Command{
 		gatewayOverlay := tools.ExtractGatewayTools(reg)
 		postOverlays := tools.ExtractPostOverlays(reg, baselineReg)
 
+		// Tee log output to ~/.shannon/logs/daemon.log so helper-spawned
+		// daemons (whose stdout is owned by the parent Desktop process)
+		// still leave a debuggable trail. The launchd plist already
+		// redirects stdout there, but Desktop's ShanClawBridge spawns the
+		// helper directly and consumes stdout itself — without this tee
+		// the entire run is invisible to anyone but Desktop.
+		if shanDir != "" {
+			logsDir := filepath.Join(shanDir, "logs")
+			_ = os.MkdirAll(logsDir, 0o700)
+			if lf, err := os.OpenFile(filepath.Join(logsDir, "daemon.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+				log.SetOutput(io.MultiWriter(os.Stderr, lf))
+			}
+		}
+
 		var auditor *audit.AuditLogger
 		if shanDir != "" {
 			auditor, _ = audit.NewAuditLogger(filepath.Join(shanDir, "logs"))
@@ -126,7 +144,70 @@ var daemonStartCmd = &cobra.Command{
 		}
 		hookRunner := hooks.NewHookRunner(cfg.Hooks)
 
-		sessionCache := daemon.NewSessionCache(shanDir)
+		// Open the mailbox SQLite database for per-route message queue
+		// persistence. Failure to open or migrate the schema is non-fatal —
+		// the daemon continues with mailbox persistence disabled so existing
+		// flows keep working; only the crash-recovery and ack-on-persist
+		// guarantees are lost in that degraded mode.
+		mailboxCap := viper.GetInt("daemon.mailbox_max_per_route")
+		if mailboxCap <= 0 {
+			mailboxCap = 100
+		}
+		mailboxDir := filepath.Join(shanDir, "sessions")
+		if err := os.MkdirAll(mailboxDir, 0o700); err != nil {
+			log.Printf("daemon: mkdir for mailbox: %v", err)
+		}
+		var sessionCache *daemon.SessionCache
+		var mailboxDB *sql.DB
+		mailboxDBPath := filepath.Join(mailboxDir, "mailbox.db")
+		if db, err := sql.Open("sqlite", mailboxDBPath); err != nil {
+			log.Printf("daemon: open mailbox db failed (%v); mailbox persistence DISABLED", err)
+			sessionCache = daemon.NewSessionCache(shanDir)
+		} else {
+			db.SetMaxOpenConns(1)
+			store, schemaErr := daemon.NewMailboxStore(db)
+			if schemaErr != nil {
+				log.Printf("daemon: mailbox schema failed (%v); mailbox persistence DISABLED", schemaErr)
+				db.Close()
+				sessionCache = daemon.NewSessionCache(shanDir)
+			} else {
+				mailboxDB = db
+				sessionCache = daemon.NewSessionCacheWithMailbox(shanDir, store, mailboxCap)
+				if pending, perr := store.LoadAllPending(); perr != nil {
+					log.Printf("daemon: mailbox recovery load failed: %v", perr)
+				} else {
+					recovered := 0
+					for routeKey, msgs := range pending {
+						loaded, dropped := sessionCache.SeedMailbox(routeKey, msgs)
+						recovered += loaded
+						if dropped > 0 {
+							log.Printf("daemon: mailbox recovery dropped %d msgs over cap on route %s", dropped, routeKey)
+						}
+					}
+					if recovered > 0 {
+						log.Printf("daemon: mailbox recovery seeded %d msg(s) across %d route(s); they drain on the next message for each route", recovered, len(pending))
+					}
+				}
+				// Daily purge of consumed rows older than 7 days.
+				go func(s *daemon.MailboxStore) {
+					tick := time.NewTicker(24 * time.Hour)
+					defer tick.Stop()
+					for range tick.C {
+						n, err := s.PurgeConsumedBefore(time.Now().Add(-7 * 24 * time.Hour))
+						if err != nil {
+							log.Printf("daemon: mailbox purge: %v", err)
+							continue
+						}
+						if n > 0 {
+							log.Printf("daemon: mailbox purge: %d row(s)", n)
+						}
+					}
+				}(store)
+			}
+		}
+		if mailboxDB != nil {
+			defer mailboxDB.Close()
+		}
 
 		wsEndpoint := strings.Replace(cfg.Endpoint, "https://", "wss://", 1)
 		wsEndpoint = strings.Replace(wsEndpoint, "http://", "ws://", 1)
@@ -216,6 +297,7 @@ var daemonStartCmd = &cobra.Command{
 		// Create WS client first, then broker (broker needs client's send method).
 		var wsClient *daemon.Client
 		var broker *daemon.ApprovalBroker
+		activeCloudMessages := newActiveCloudMessageTracker()
 
 		wsClient = daemon.NewClient(wsEndpoint, cfg.APIKey, func(msg daemon.MessagePayload) string {
 			msgCtx := ctx
@@ -235,15 +317,17 @@ var daemonStartCmd = &cobra.Command{
 				source = msg.Channel
 			}
 			req := daemon.RunAgentRequest{
-				Text:     msg.Text,
-				Content:  msg.Content,
-				Agent:    msg.AgentName,
-				Source:   source,
-				Channel:  msg.Channel,
-				ThreadID: msg.ThreadID,
-				Sender:   msg.Sender,
-				CWD:      msg.CWD,
-				Files:    msg.Files,
+				Text:            msg.Text,
+				Content:         msg.Content,
+				Agent:           msg.AgentName,
+				Source:          source,
+				Channel:         msg.Channel,
+				ThreadID:        msg.ThreadID,
+				Sender:          msg.Sender,
+				CWD:             msg.CWD,
+				Files:           msg.Files,
+				CloudMessageID:  msg.MessageID,
+				IMStatusContext: msg.IMStatusContext,
 			}
 			// Fall back to @mention parsing if cloud didn't set agent name.
 			// Skip for messaging-platform sources: there the gateway delivers an
@@ -277,11 +361,22 @@ var daemonStartCmd = &cobra.Command{
 			// worst case we paid one download for an InjectNoActiveRun.
 			if req.RouteKey != "" && deps.SessionCache.HasActiveRun(req.RouteKey) {
 				switch deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{
-					Text:  req.Text,
-					CWD:   req.CWD,
-					Files: daemon.ConvertFilesToInjected(msgCtx, req.Files),
+					Text:            req.Text,
+					CWD:             req.CWD,
+					Files:           daemon.ConvertFilesToInjected(msgCtx, req.Files),
+					CloudMessageID:  msg.MessageID,
+					IMStatusContext: msg.IMStatusContext,
 				}) {
 				case daemon.InjectOK:
+					emitInjectedMessageReceivedEvent(deps.EventBus, deps.SessionCache, req, msg.MessageID)
+					if shouldForwardQueuedFollowUpStatusForMessage(source, msg.IMStatusContext) {
+						sendQueuedFollowUpStatusEvent(wsClient, activeCloudMessages.MessageID(req.RouteKey), req.Text)
+					}
+					// Tell Cloud the IM follow-up was accepted into the running loop so
+					// the platform reaction can flip from "received" → "processing"
+					// later when the agent loop drains it. No-op on non-IM sources
+					// (empty IMStatusContext); see emitLifecycleReceived guards.
+					emitLifecycleReceived(wsClient, msg.MessageID, msg.IMStatusContext)
 					// Message injected — running loop will incorporate it.
 					// Suppress the explicit ack on messaging platforms: the user's
 					// own message is already visible in the thread and the active
@@ -297,7 +392,7 @@ var daemonStartCmd = &cobra.Command{
 				case daemon.InjectQueueFull:
 					// Active run exists but queue saturated — don't start a new run.
 					log.Printf("daemon: inject queue full for route %q, message dropped", req.RouteKey)
-					return ""
+					return "[message rejected: the active run already has a queued follow-up; retry after it reaches the next turn]"
 				case daemon.InjectBusy:
 					return "[message rejected: the active run is still initializing; retry when it reaches the next turn]"
 				case daemon.InjectCWDConflict:
@@ -328,6 +423,16 @@ var daemonStartCmd = &cobra.Command{
 				wsClient:    wsClient,
 				messageID:   msg.MessageID,
 			}
+
+			clearActiveCloudMessage := activeCloudMessages.Track(req.RouteKey, msg.MessageID)
+			defer clearActiveCloudMessage()
+
+			// Tell Cloud the inbound IM message reached the daemon for a fresh
+			// run (first user turn). No-op on non-IM sources or when this is
+			// not a cold-start path (e.g. queue-full / busy / cwd-conflict
+			// returns above don't fall through here). Cloud uses this to flip
+			// the platform reaction to "received" before the first LLM call.
+			emitLifecycleReceived(wsClient, msg.MessageID, msg.IMStatusContext)
 
 			result, err := daemon.RunAgent(msgCtx, deps, req, handler)
 			if err != nil {
@@ -621,6 +726,110 @@ type daemonEventHandler struct {
 	wsClient    *daemon.Client // for event forwarding to Cloud
 	messageID   string         // scoped to current message
 	usage       agent.UsageAccumulator
+}
+
+type activeCloudMessageTracker struct {
+	mu      sync.Mutex
+	byRoute map[string]string
+}
+
+func newActiveCloudMessageTracker() *activeCloudMessageTracker {
+	return &activeCloudMessageTracker{byRoute: make(map[string]string)}
+}
+
+func (t *activeCloudMessageTracker) Track(routeKey, messageID string) func() {
+	if t == nil || routeKey == "" || messageID == "" {
+		return func() {}
+	}
+	t.mu.Lock()
+	t.byRoute[routeKey] = messageID
+	t.mu.Unlock()
+	return func() {
+		t.mu.Lock()
+		if t.byRoute[routeKey] == messageID {
+			delete(t.byRoute, routeKey)
+		}
+		t.mu.Unlock()
+	}
+}
+
+func (t *activeCloudMessageTracker) MessageID(routeKey string) string {
+	if t == nil || routeKey == "" {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.byRoute[routeKey]
+}
+
+func emitInjectedMessageReceivedEvent(eventBus *daemon.EventBus, sessionCache *daemon.SessionCache, req daemon.RunAgentRequest, messageID string) {
+	if eventBus == nil || sessionCache == nil || req.RouteKey == "" {
+		return
+	}
+	sessionID := sessionCache.RouteSessionID(req.RouteKey)
+	if sessionID == "" {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"agent":      req.Agent,
+		"source":     req.Source,
+		"sender":     req.Sender,
+		"session_id": sessionID,
+		"message_id": messageID,
+		"text":       req.Text,
+		"queued":     true,
+	})
+	eventBus.Emit(daemon.Event{Type: daemon.EventMessageReceived, Payload: payload})
+}
+
+func shouldForwardQueuedFollowUpStatus(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case daemon.ChannelSlack, daemon.ChannelWeCom, daemon.ChannelFeishu, daemon.ChannelLark:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldForwardQueuedFollowUpStatusForMessage(source string, imStatusContext json.RawMessage) bool {
+	if len(imStatusContext) > 0 {
+		return false
+	}
+	return shouldForwardQueuedFollowUpStatus(source)
+}
+
+func sendQueuedFollowUpStatusEvent(wsClient *daemon.Client, activeMessageID, text string) {
+	if wsClient == nil || activeMessageID == "" {
+		return
+	}
+	message := queuedFollowUpStatusText(text)
+	if message == "" {
+		return
+	}
+	if err := wsClient.SendEvent(activeMessageID, "LLM_OUTPUT", message, map[string]interface{}{"queued": true}); err != nil {
+		log.Printf("daemon: queued follow-up status forward failed: %v", err)
+	}
+}
+
+func queuedFollowUpStatusText(text string) string {
+	preview := queuedFollowUpPreview(text)
+	if preview == "" {
+		preview = "[Attached files]"
+	}
+	return "Queued next:\n> " + preview
+}
+
+func queuedFollowUpPreview(text string) string {
+	const maxRunes = 160
+	preview := strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if preview == "" {
+		return ""
+	}
+	runes := []rune(preview)
+	if len(runes) <= maxRunes {
+		return preview
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 func (h *daemonEventHandler) SetSessionID(id string) { h.sessionID = id }
