@@ -275,6 +275,73 @@ func TestLoadMemory_ShortFile(t *testing.T) {
 	}
 }
 
+// TestPrependFileStaleness_FreshFile asserts no header is prepended when
+// mtime is within the staleness threshold. Threshold-gated so daily memory
+// edits don't accumulate header noise (mirrors CC's memoryFreshnessText
+// returning "" for d<=1, scaled to our weekly cadence).
+func TestPrependFileStaleness_FreshFile(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	mtime := now.AddDate(0, 0, -3) // 3 days old
+	out := prependFileStaleness("body", mtime, now)
+	if out != "body" {
+		t.Errorf("expected unchanged body for fresh file, got: %q", out)
+	}
+}
+
+// TestPrependFileStaleness_StaleFile asserts the header is prepended once
+// mtime crosses the threshold.
+func TestPrependFileStaleness_StaleFile(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	mtime := now.AddDate(0, 0, -45) // 45 days old
+	out := prependFileStaleness("body", mtime, now)
+	if !strings.Contains(out, "MEMORY.md last updated 45 days ago") {
+		t.Errorf("expected staleness header naming 45 days, got: %q", out)
+	}
+	if !strings.HasSuffix(out, "body") {
+		t.Errorf("expected original body preserved at end, got: %q", out)
+	}
+	if !strings.Contains(out, "verify file paths") {
+		t.Errorf("expected guidance about verifying before asserting, got: %q", out)
+	}
+}
+
+// TestPrependFileStaleness_ZeroMtime asserts a missing mtime (stat failure)
+// is a no-op, never injecting a misleading "0 days ago" header.
+func TestPrependFileStaleness_ZeroMtime(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	out := prependFileStaleness("body", time.Time{}, now)
+	if out != "body" {
+		t.Errorf("expected unchanged body when mtime is zero, got: %q", out)
+	}
+}
+
+// TestLoadMemory_StalenessHeaderIntegration verifies LoadMemoryFrom wires
+// the file mtime through to prependFileStaleness. Uses os.Chtimes to set
+// an old mtime; verifies the header appears in the loaded output.
+func TestLoadMemory_StalenessHeaderIntegration(t *testing.T) {
+	shannonDir := t.TempDir()
+	memDir := filepath.Join(shannonDir, "memory")
+	os.MkdirAll(memDir, 0755)
+	path := filepath.Join(memDir, "MEMORY.md")
+	os.WriteFile(path, []byte("- fact about X"), 0644)
+
+	oldTime := time.Now().AddDate(0, 0, -30)
+	if err := os.Chtimes(path, oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	result, err := LoadMemory(shannonDir, 200)
+	if err != nil {
+		t.Fatalf("LoadMemory: %v", err)
+	}
+	if !strings.Contains(result, "MEMORY.md last updated") {
+		t.Errorf("expected staleness header in loaded output, got:\n%s", result)
+	}
+	if !strings.Contains(result, "- fact about X") {
+		t.Errorf("expected original content preserved, got:\n%s", result)
+	}
+}
+
 func TestLoadCustomCommands_Basic(t *testing.T) {
 	shannonDir := t.TempDir()
 	projectDir := t.TempDir()

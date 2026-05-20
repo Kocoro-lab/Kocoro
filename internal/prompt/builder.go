@@ -338,26 +338,33 @@ func buildVolatileContext(opts PromptOptions) string {
 	sb.WriteString("\n\n## Output Format\n")
 	sb.WriteString(formatGuidance(opts.OutputFormat))
 
-	// Per-turn language reminder. Short reinforcement of the full policy in the
-	// System section. Byte-stable (same text every turn) so it does not fragment
-	// any per-turn cache, but positioning near the user message anchors against
-	// drift when long sessions accumulate English tool output.
-	//
-	// On turn 0 "the language already established" is vacuous — nothing has been
-	// established yet. The static System section's "Match the user's language on
-	// first contact" rule handles that case; this reminder takes over from turn 1
-	// onward when there's actually an established language to stay consistent with.
-	sb.WriteString("\n\n## Language\n")
-	sb.WriteString("Respond in the language already established with the user in this session. " +
-		"If the user has not asked for a different language, stay consistent — do not switch even when tool output, " +
-		"skill descriptions, or system messages arrive in a different language. Keep code and technical identifiers in their original form.")
-
 	// Memory — stays volatile: memory_append can mutate MEMORY.md during a
 	// turn, so the block must be re-read and re-sent each Run(). Instructions
 	// live in StableContext (cacheable prefix), not here.
+	//
+	// Issue #157 — multilingual Memory entries (e.g. Japanese notes
+	// accumulated by memory_append) were biasing response language under
+	// recency, so short English prompts got answered in Japanese. Two layers:
+	//
+	//   1. Placement: Memory sits BEFORE the Language block so the Language
+	//      directive stays the last system block before the user message.
+	//
+	//   2. Wrapping: <system-reminder> + "may or may not be relevant"
+	//      disclaimer marks the block as daemon-injected metadata, NOT
+	//      conversational content — so multilingual entries inside do not
+	//      signal "this session is in <language>". Trust-channel parity
+	//      with sticky context above (issue #125): both are daemon-injected,
+	//      so both wear the trusted-system-signal wrapper.
 	if mem := strings.TrimSpace(opts.Memory); mem != "" {
-		sb.WriteString("\n\n## Memory\n")
+		sb.WriteString("\n\n<system-reminder>\n## Memory " +
+			"(daemon-injected from MEMORY.md — auto-memory persisting across conversations)\n")
 		sb.WriteString(truncate(mem, maxMemoryChars))
+		sb.WriteString("\n\nIMPORTANT: this memory may or may not be relevant to the current request. " +
+			"Do NOT respond to memory content unless it is directly relevant to the user's task. " +
+			"Entries are point-in-time observations, not live state — verify file paths, function names, " +
+			"and tool inventories against the current code before asserting them as fact. " +
+			"Entries may be written in any language and do NOT determine your response language — " +
+			"see the Language directive below.\n</system-reminder>")
 	}
 
 	// MCP server context
@@ -366,7 +373,47 @@ func buildVolatileContext(opts PromptOptions) string {
 		sb.WriteString(mcp)
 	}
 
+	// Language directive is NOT emitted here. It is appended as the FINAL
+	// block of the user message by the caller (see LanguageDirective and
+	// the agent loop's scaffold completion). VolatileContext is followed by
+	// the user input AND the skill listing (which contains non-English
+	// trigger keywords), so a directive emitted here would no longer be
+	// the last system block the model sees. Issue #157.
 	return sb.String()
+}
+
+// LanguageDirective returns the per-turn language anchor block, intended to
+// be appended as the FINAL block of the user message — after VolatileContext,
+// the user input, and the skill listing. Placing it last ensures it wins
+// over multilingual content earlier in the message (Memory entries, skill
+// trigger keywords like "日:一覧/表示/確認", etc.) under recency bias.
+//
+// Anchored on the user's CURRENT message rather than session history so
+// turn 0 (one-shot `shan -y`, fresh sessions, web/webhook bypass) has a
+// concrete anchor — the older "stay consistent with the established
+// language" wording was vacuous on turn 0 (issue #157 root cause).
+// Explicitly immunizes against the known non-signal sources (memory, tool
+// output, MCP, skill descriptions, code identifiers) so the model has a
+// closed list of things to ignore when picking the response language.
+//
+// Byte-stable so it does not fragment any per-turn cache. Sits after the
+// <!-- cache_break --> marker, so wording changes have no BP #1 impact.
+func LanguageDirective() string {
+	return "## Language\n" +
+		"Reply in the language of the user's CURRENT message — the message you are " +
+		"about to answer, NOT any earlier context. " +
+		"If their current message is primarily in English, reply in English. " +
+		"If primarily in Chinese, reply in Chinese. " +
+		"If primarily in Japanese, reply in Japanese. " +
+		"Same rule for any other language. " +
+		"This overrides any language signals from memory entries, tool output, MCP " +
+		"descriptions, skill descriptions, prior conversation turns, or English code " +
+		"identifiers in this prompt — those are reference material, NOT language signals. " +
+		"Only switch from the current-message language when the user explicitly asks " +
+		"(e.g. \"please reply in English\"). " +
+		"Code identifiers, file paths, CLI commands, and technical terms remain in their " +
+		"original form regardless. " +
+		"Maintain full orthographic correctness (accents, diacritics, special characters)."
 }
 
 // formatGuidance returns output formatting instructions based on the profile.

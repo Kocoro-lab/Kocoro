@@ -425,6 +425,122 @@ func TestBuildSystemPrompt_MemoryTruncation(t *testing.T) {
 	}
 }
 
+// TestBuildVolatileContext_OmitsLanguageBlock asserts the Language directive
+// is NOT emitted inside VolatileContext. It is the caller's responsibility
+// (agent loop) to append LanguageDirective() as the absolute final block of
+// the user message — after VolatileContext, user input, and the skill
+// listing. Emitting it here would put it ahead of the skill listing, which
+// carries multilingual trigger keywords that triggered the issue #157 drift.
+func TestBuildVolatileContext_OmitsLanguageBlock(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+		Memory:     "- some fact",
+		MCPContext: "Server X usage notes.",
+	})
+	if strings.Contains(parts.VolatileContext, "## Language") {
+		t.Errorf("VolatileContext must NOT contain ## Language — it is appended "+
+			"by the caller as the final user-message block (issue #157). Got:\n%s",
+			parts.VolatileContext)
+	}
+}
+
+// TestLanguageDirective_HasImmunizationPhrases asserts LanguageDirective()
+// returns a block that anchors on the user's CURRENT message and explicitly
+// names the known non-signal sources so the model has a closed list of
+// things to ignore when picking the response language.
+func TestLanguageDirective_HasImmunizationPhrases(t *testing.T) {
+	block := LanguageDirective()
+
+	if !strings.HasPrefix(block, "## Language\n") {
+		t.Errorf("LanguageDirective() must start with `## Language\\n`, got: %q", block[:min(40, len(block))])
+	}
+
+	required := []string{
+		"CURRENT message",
+		"memory entries",
+		"tool output",
+		"MCP descriptions",
+		"skill descriptions",
+		"code identifiers",
+	}
+	for _, phrase := range required {
+		if !strings.Contains(block, phrase) {
+			t.Errorf("LanguageDirective() missing immunization phrase %q (issue #157)", phrase)
+		}
+	}
+}
+
+// TestBuildSystemPrompt_MemoryIsSystemReminderWrapped asserts the Memory
+// block is wrapped in <system-reminder> with a "may or may not be relevant"
+// disclaimer and an explicit "do NOT determine your response language"
+// note. The wrapper marks the block as daemon-injected metadata, not
+// conversational content, so multilingual entries inside do not bias
+// response language. Trust-channel parity with sticky context above
+// (issue #125): both daemon-injected, both wear the same wrapper.
+func TestBuildSystemPrompt_MemoryIsSystemReminderWrapped(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+		Memory:     "- some fact",
+	})
+
+	memOpenIdx := strings.Index(parts.VolatileContext, "<system-reminder>\n## Memory")
+	memCloseIdx := strings.Index(parts.VolatileContext, "</system-reminder>")
+	if memOpenIdx < 0 {
+		t.Error("Memory section must be wrapped in <system-reminder>")
+	}
+	if memCloseIdx < 0 {
+		t.Error("Memory <system-reminder> wrapper must be closed")
+	}
+	if memOpenIdx >= 0 && memCloseIdx >= 0 && memOpenIdx >= memCloseIdx {
+		t.Error("Memory <system-reminder> open must precede close")
+	}
+
+	required := []string{
+		"daemon-injected from MEMORY.md",   // origin tag — model knows source
+		"persisting across conversations",  // semantic role — long-term, not in-session
+		"may or may not be relevant",       // marks block as reference, not conversation
+		"Do NOT respond to memory content", // explicit instruction
+		"verify file paths",                // staleness reminder — entries are point-in-time
+		"do NOT determine your response language",
+	}
+	for _, phrase := range required {
+		if !strings.Contains(parts.VolatileContext, phrase) {
+			t.Errorf("Memory wrapper missing disclaimer phrase %q (issue #157)", phrase)
+		}
+	}
+}
+
+// TestBuildSystemPrompt_VolatileContextMemoryWithJapaneseStillEmits is the
+// structural regression test for issue #157 on the prompt side. The
+// multilingual content must still appear inside the <system-reminder>
+// Memory wrapper so the language-neutrality disclaimer sits with it.
+// (Cross-block ordering — Language after skill listing — is covered in
+// internal/agent/assemble_test.go which exercises the loop's final
+// scaffold composition.)
+func TestBuildSystemPrompt_VolatileContextMemoryWithJapaneseStillEmits(t *testing.T) {
+	japaneseMemory := "- ユーザーは Kocoro が好き\n" +
+		"- `gh` CLI がインストール済み\n" +
+		"- some english notes too"
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+		Memory:     japaneseMemory,
+	})
+
+	jpIdx := strings.Index(parts.VolatileContext, "ユーザー")
+	openIdx := strings.Index(parts.VolatileContext, "<system-reminder>\n## Memory")
+	closeIdx := strings.Index(parts.VolatileContext, "</system-reminder>")
+	if jpIdx < 0 || openIdx < 0 || closeIdx < 0 {
+		t.Fatalf("expected Japanese memory inside system-reminder wrapper; "+
+			"got jp=%d open=%d close=%d", jpIdx, openIdx, closeIdx)
+	}
+	if !(openIdx < jpIdx && jpIdx < closeIdx) {
+		t.Errorf("issue #157: Japanese memory text at idx=%d must sit INSIDE "+
+			"the <system-reminder> wrapper (open=%d, close=%d) so the "+
+			"language-neutrality disclaimer applies",
+			jpIdx, openIdx, closeIdx)
+	}
+}
+
 func TestBuildSystemPrompt_InstructionsTruncation(t *testing.T) {
 	bigInstructions := strings.Repeat("i", maxInstructionsChars+1000)
 	parts := BuildSystemPrompt(PromptOptions{

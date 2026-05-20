@@ -2496,6 +2496,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// the cached prefix which would break byte stability on skill set changes.
 	// Delta tracking: only announce skills not yet sent in prior Run() calls
 	// (relevant for TUI multi-turn sessions where sentSkillNames persists).
+	scaffoldDirty := false
 	if len(a.agentSkills) > 0 {
 		if a.sentSkillNames == nil {
 			a.sentSkillNames = make(map[string]bool)
@@ -2509,12 +2510,28 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		if len(newSkills) > 0 {
 			if listing := buildSkillListing(newSkills); listing != "" {
 				scaffoldedUserText += "\n\n" + listing
-				messages[len(messages)-1] = replaceUserMessageText(messages[len(messages)-1], scaffoldedUserText)
+				scaffoldDirty = true
 			}
 			for _, s := range a.agentSkills {
 				a.sentSkillNames[s.Name] = true
 			}
 		}
+	}
+
+	// Append the Language directive as the FINAL block of the user message —
+	// after VolatileContext, the user input, AND the skill listing above.
+	// Skill descriptions intentionally carry multilingual trigger keywords
+	// (e.g. "日:一覧/表示/確認" for Japanese-speaking users to find the right
+	// skill), which under recency bias previously caused short English
+	// prompts to be answered in Japanese (issue #157). Pinning the directive
+	// to the absolute end of the user message reverses that pull regardless
+	// of how many non-English blocks appear earlier in the scaffold.
+	if langBlock := prompt.LanguageDirective(); langBlock != "" {
+		scaffoldedUserText += "\n\n" + langBlock
+		scaffoldDirty = true
+	}
+	if scaffoldDirty {
+		messages[len(messages)-1] = replaceUserMessageText(messages[len(messages)-1], scaffoldedUserText)
 	}
 
 	const discoveryThreshold = 10
