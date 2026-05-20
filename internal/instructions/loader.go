@@ -147,6 +147,9 @@ func LoadMemory(shannonDir string, maxLines int) (string, error) {
 // If the file doesn't exist, returns an empty string (not an error).
 // Markdown links to .md files in the same directory are auto-expanded inline
 // so the LLM sees the full content without needing extra file_read calls.
+// When the file is older than memoryStalenessThresholdDays, a file-level
+// staleness header is prepended so the model is reminded to verify rather
+// than assert stale facts.
 func LoadMemoryFrom(dir string, maxLines int) (string, error) {
 	if dir == "" {
 		return "", nil
@@ -160,6 +163,11 @@ func LoadMemoryFrom(dir string, maxLines int) (string, error) {
 		return "", err
 	}
 	defer f.Close()
+
+	var mtime time.Time
+	if info, statErr := f.Stat(); statErr == nil {
+		mtime = info.ModTime()
+	}
 
 	var lines []string
 	scanner := bufio.NewScanner(f)
@@ -193,7 +201,43 @@ func LoadMemoryFrom(dir string, maxLines int) (string, error) {
 	}
 
 	result := strings.Join(lines, "\n")
-	return annotateStaleness(result, time.Now()), nil
+	now := time.Now()
+	result = annotateStaleness(result, now)
+	result = prependFileStaleness(result, mtime, now)
+	return result, nil
+}
+
+// memoryStalenessThresholdDays gates the file-level staleness header.
+// Threshold rationale: MEMORY.md is typically appended to within hours of
+// active work, so days <= 7 is "normal recent use" and adding a header
+// would be persistent noise. Once a week passes with no edits, the model
+// benefits from being reminded that file:line citations and tool inventories
+// may have moved on.
+//
+// Override path: none currently. If user reports always-on noise from a
+// very-frequently-edited memory file, expose this via viper
+// ("agent.memory_staleness_days") rather than tuning the const.
+const memoryStalenessThresholdDays = 7
+
+// prependFileStaleness adds a one-line "[MEMORY.md last updated N days ago — …]"
+// header when mtime is older than memoryStalenessThresholdDays. Returns content
+// unchanged when mtime is zero (stat failed) or the file is recent enough.
+// Threshold-gated so daily memory edits don't accumulate header noise.
+func prependFileStaleness(content string, mtime, now time.Time) string {
+	if mtime.IsZero() {
+		return content
+	}
+	days := int(now.Sub(mtime).Hours() / 24)
+	if days <= memoryStalenessThresholdDays {
+		return content
+	}
+	header := fmt.Sprintf(
+		"[MEMORY.md last updated %d days ago — entries may be stale; "+
+			"verify file paths, function names, and tool inventories against "+
+			"the current code before asserting them as fact.]\n\n",
+		days,
+	)
+	return header + content
 }
 
 // memoryDateRe matches heading lines with dates in parentheses.

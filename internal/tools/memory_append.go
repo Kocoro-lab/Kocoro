@@ -22,14 +22,22 @@ type memoryAppendArgs struct {
 
 func (t *MemoryAppendTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
-		Name:        "memory_append",
-		Description: "Append new entries to MEMORY.md. Use this instead of file_write or file_edit for memory updates. Writes are atomic, flock-protected, and auto-overflow to detail files when MEMORY.md exceeds the line limit.",
+		Name: "memory_append",
+		Description: "Append new entries to MEMORY.md. Use this instead of file_write or file_edit for memory updates. " +
+			"Writes are atomic, flock-protected, and auto-overflow to detail files when MEMORY.md exceeds the line limit. " +
+			"\n\n" +
+			"LANGUAGE: write entries in English by default, even when the current conversation is in another language. " +
+			"You may quote the user's words verbatim when the exact wording matters (proper nouns, decisions stated in their own voice), " +
+			"but the structural scaffolding (subject, fact statement, why-it-matters) stays in English. " +
+			"Rationale: memory accumulates across many sessions across many languages; uniform English keeps MEMORY.md searchable, " +
+			"avoids biasing future replies toward the language a single past session happened to use, and prevents the " +
+			"self-reinforcing loop where multilingual memory entries push later responses into that same language.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"content": map[string]any{
 					"type":        "string",
-					"description": "New entries to append (markdown bullet points)",
+					"description": "New entries to append (markdown bullet points). Write in English by default; quote the user verbatim only when exact wording matters.",
 				},
 			},
 		},
