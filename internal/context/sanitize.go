@@ -226,6 +226,16 @@ func sameContent(a, b client.MessageContent) bool {
 //     non-empty text, etc. are preserved verbatim).
 //   - All other shapes (non-empty text, tool_use, thinking-only, etc.) →
 //     keep unchanged.
+//
+// Write/repair asymmetry on thinking-only: this differs from the write-
+// site guard in loop.go (recoverVisibleTextFromBlocks +
+// ErrEmptyFinalResponse), which refuses to persist a thinking-only final
+// response because the user would receive no visible answer. Here, on
+// the repair / resume path, a thinking-only assistant that survived a
+// strip is kept — preserving the assistant's reasoning trail across
+// resume is worth the small risk of an unusual mid-history block shape
+// on the wire. The cache_control 400 mode is text-block-specific, so a
+// thinking-only assistant in mid-history does not reintroduce that 400.
 func repairAssistantBlocks(msg client.Message) (client.Message, bool) {
 	if !msg.Content.HasBlocks() {
 		if msg.Content.Text() == "" {

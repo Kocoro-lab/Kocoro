@@ -75,13 +75,24 @@ just changed.
 
 | Field | What |
 |---|---|
-| `action` | `tier1` (strip-to-metadata, native blocks) / `tier1_xml` / `tier2` (head+tail or micro-compact summary) / `tbclear` (time-based result clear) / `img_strip` (image-content removal) |
+| `action` | `tier1` (strip-to-metadata, native blocks) / `tier1_xml` / `tier2` (head+tail or micro-compact summary) / `tbclear` (time-based result clear) / `img_strip` (image-content removal) / `empty_assistant_drop` (empty assistant removed from history) / `empty_text_block_strip` (empty text block stripped from assistant blocks) / `repair_user_merge` (two user messages content-merged after the assistant between them was dropped) |
 | `msg_idx` | Position in the message array that was rewritten |
 | `old_hash` / `new_hash` | sha256[:6] of the message content before / after — should match the previous `msg_hashes[msg_idx].hash` and the next req's same slot |
 | `old_len` / `new_len` | Bytes before / after — the size delta of the rewrite |
 
 No-op rewrites (bytes unchanged, e.g. revisiting an already-compacted block)
 are skipped silently — only real wire-byte drift hits the log.
+
+`empty_assistant_drop` is the one structural (non-rewrite) action: the
+message at `msg_idx` is REMOVED, not edited. Its `new_hash` corresponds
+to an internal sentinel block (`_kocoro_repair_drop_marker`) used only
+to defeat the dedup that would otherwise swallow the row — that sentinel
+never appears on the wire. Cache-debug tooling that re-hashes messages
+from raw dumps will not find this hash; treat the row as "msg_idx was
+dropped, downstream indices shifted by one". `repair_user_merge` rows
+typically pair with this — they appear at the input index of the
+trailing user, with `new_hash` matching the merged user at the previous
+position.
 
 ## Reading drift events
 
