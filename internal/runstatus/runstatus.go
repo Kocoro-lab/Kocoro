@@ -54,7 +54,7 @@ var friendlyMessages = map[Code]string{
 
 	CodeContextCompactionFailed: "Context compaction encountered an issue but the conversation continued.",
 
-	CodeEmptyResponse: "The model finished this turn without producing a visible answer (it spent its budget on internal reasoning). Please retry, or try simplifying / shortening your question.",
+	CodeEmptyResponse: "The model finished this turn without producing a visible answer. Please retry, or try simplifying / shortening your question.",
 }
 
 // friendlyPrefixes lists stable opening clauses shared between every

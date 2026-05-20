@@ -910,3 +910,54 @@ func TestRepairEmptyAssistantContent_EmitsCacheCompactEvents(t *testing.T) {
 		}
 	}
 }
+
+// Whitespace-only assistant content must be treated identically to bare
+// empty content — both Cloud's _mark_last_block rstrip+stamp pipeline AND
+// the wire-time gate in agent/loop.go strip whitespace before deciding
+// what to do with the message. If sanitize keeps "   " but loop trims it
+// to "", the two layers disagree and the bug class re-opens.
+func TestSanitizeHistory_DropsWhitespaceOnlyAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "assistant", Content: client.NewTextContent("   \n\t  ")},
+		{Role: "user", Content: client.NewTextContent("second")},
+	}
+	result := SanitizeHistory(msgs)
+	for i, m := range result {
+		if m.Role != "assistant" {
+			continue
+		}
+		if !m.Content.HasBlocks() && strings.TrimSpace(m.Content.Text()) == "" {
+			t.Errorf("whitespace-only assistant survived at %d: %q", i, m.Content.Text())
+		}
+	}
+}
+
+// Block-form whitespace-only text block (mixed with thinking) must be
+// stripped — thinking survives, the unhelpful whitespace block is gone.
+func TestSanitizeHistory_StripsWhitespaceOnlyTextBlockFromAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "thinking", Thinking: "plan", Signature: "sig"},
+			{Type: "text", Text: "  \n  "},
+		})},
+		{Role: "user", Content: client.NewTextContent("ok")},
+	}
+	result := SanitizeHistory(msgs)
+
+	var asst *client.Message
+	for i := range result {
+		if result[i].Role == "assistant" {
+			asst = &result[i]
+		}
+	}
+	if asst == nil {
+		t.Fatal("assistant message dropped — thinking block should have survived")
+	}
+	for _, b := range asst.Content.Blocks() {
+		if b.Type == "text" && strings.TrimSpace(b.Text) == "" {
+			t.Errorf("whitespace-only text block survived stripping")
+		}
+	}
+}

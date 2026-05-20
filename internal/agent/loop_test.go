@@ -5492,3 +5492,55 @@ func TestAgentLoop_EmptyFinalResponse_BareEmpty_AuditBlocksNone(t *testing.T) {
 	}
 	t.Fatal("no empty_final_response audit row emitted")
 }
+
+// Whitespace-only fullText must trigger the empty-response guard. The
+// Cloud-side _mark_last_block in shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py
+// calls .strip() on string content before wrapping it as a cache_control'd
+// text block — feeding whitespace upstream re-creates the 400 trap. Both
+// sides must agree on "whitespace == empty" or the bug class re-opens.
+func TestAgentLoop_WhitespaceOnlyFinalResponse_TriggersEmptyGuard(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(nativeResponse("   \n\t  ", "end_turn", nil, 10, 5))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "test", nil, nil)
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Fatalf("expected ErrEmptyFinalResponse for whitespace-only output, got %v", err)
+	}
+	if result != "" {
+		t.Errorf("expected empty result, got %q", result)
+	}
+	for _, m := range loop.RunMessages() {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && strings.TrimSpace(m.Content.Text()) == "" {
+			t.Errorf("whitespace-only assistant persisted — Cloud would still 400 on next request")
+		}
+	}
+}
+
+// Whitespace-only block-form OutputText: recoverVisibleTextFromBlocks must
+// also TrimSpace, so a stream-aggregator edge case that left whitespace in
+// ContentBlocks doesn't escape the guard.
+func TestAgentLoop_WhitespaceOnlyTextBlock_RecoveryReturnsEmpty(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := nativeResponse("", "end_turn", nil, 10, 5)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "text", Text: "   \n  "},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	_, _, err := loop.Run(context.Background(), "test", nil, nil)
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Errorf("whitespace-only text block must NOT be treated as recovered visible text; got err=%v", err)
+	}
+}

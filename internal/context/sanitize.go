@@ -185,13 +185,18 @@ func needsEmptyAssistantRepair(messages []client.Message) bool {
 			continue
 		}
 		if !msg.Content.HasBlocks() {
-			if msg.Content.Text() == "" {
+			// TrimSpace match — whitespace-only assistant content is also
+			// a 400 risk because Cloud's _mark_last_block runs rstrip()
+			// on string content before wrapping it as a cache_control
+			// text block (see shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py).
+			// Matches the wire-time gate in agent/loop.go.
+			if strings.TrimSpace(msg.Content.Text()) == "" {
 				return true
 			}
 			continue
 		}
 		for _, b := range msg.Content.Blocks() {
-			if b.Type == "text" && b.Text == "" {
+			if b.Type == "text" && strings.TrimSpace(b.Text) == "" {
 				return true
 			}
 		}
@@ -238,7 +243,11 @@ func sameContent(a, b client.MessageContent) bool {
 // thinking-only assistant in mid-history does not reintroduce that 400.
 func repairAssistantBlocks(msg client.Message) (client.Message, bool) {
 	if !msg.Content.HasBlocks() {
-		if msg.Content.Text() == "" {
+		// TrimSpace match: whitespace-only counts as empty for the same
+		// reason as needsEmptyAssistantRepair — Cloud's rstrip+stamp
+		// pipeline can downgrade whitespace to "" before applying the
+		// cache_control marker, reconstructing the 400-trigger shape.
+		if strings.TrimSpace(msg.Content.Text()) == "" {
 			return msg, true
 		}
 		return msg, false
@@ -247,7 +256,7 @@ func repairAssistantBlocks(msg client.Message) (client.Message, bool) {
 	src := msg.Content.Blocks()
 	hasEmptyText := false
 	for _, b := range src {
-		if b.Type == "text" && b.Text == "" {
+		if b.Type == "text" && strings.TrimSpace(b.Text) == "" {
 			hasEmptyText = true
 			break
 		}
@@ -258,7 +267,7 @@ func repairAssistantBlocks(msg client.Message) (client.Message, bool) {
 
 	kept := make([]client.ContentBlock, 0, len(src))
 	for _, b := range src {
-		if b.Type == "text" && b.Text == "" {
+		if b.Type == "text" && strings.TrimSpace(b.Text) == "" {
 			continue
 		}
 		kept = append(kept, b)

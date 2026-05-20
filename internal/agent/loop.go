@@ -283,7 +283,12 @@ func recoverVisibleTextFromBlocks(resp *client.CompletionResponse) string {
 	}
 	var sb strings.Builder
 	for _, b := range resp.ContentBlocks {
-		if b.Type == "text" && b.Text != "" {
+		// TrimSpace check: a whitespace-only text block is wire-form
+		// "visible" but semantically empty, and Cloud's _mark_last_block
+		// rstrip+stamp pipeline can still convert it into the 400-trigger
+		// shape `{"type":"text","text":"","cache_control":...}`. Treat it
+		// as empty here so the empty-response guard in the caller fires.
+		if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
 			sb.WriteString(b.Text)
 		}
 	}
@@ -3459,10 +3464,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// shape causes Anthropic 400 "cache_control cannot be set for empty
 			// text blocks" on the next request. See
 			// docs/empty-assistant-content-400.md.
-			if fullText == "" {
+			// TrimSpace check throughout: whitespace-only fullText is wire-
+			// form "non-empty" but Cloud's _mark_last_block rstrip+stamp
+			// can still produce the empty-text+cache_control 400 trigger.
+			// Treat it as empty here so we never persist whitespace-only
+			// assistants. Matches the Cloud-side _has_visible_text gate
+			// in shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py.
+			if strings.TrimSpace(fullText) == "" {
 				fullText = recoverVisibleTextFromBlocks(resp)
 			}
-			if fullText == "" {
+			if strings.TrimSpace(fullText) == "" {
 				captureRunMessages()
 				setRunStatus(runstatus.CodeEmptyResponse, false)
 				// Audit row so post-incident triage can attribute "user saw
