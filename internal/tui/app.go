@@ -1370,7 +1370,7 @@ func (m *Model) View() string {
 			if r := []rune(title); len(r) > 40 {
 				title = string(r[:37]) + "..."
 			}
-			desc := fmt.Sprintf("[%s] %d msgs", s.CreatedAt.Format("Jan 02 15:04"), s.MsgCount)
+			desc := fmt.Sprintf("[%s] %d msgs", s.UpdatedAt.Format("Jan 02 15:04"), s.MsgCount)
 			return title, desc
 		}))
 	}
@@ -2369,7 +2369,7 @@ func (m *Model) showSessions() {
 	m.lastSessions = sessions
 	for i, s := range sessions {
 		m.appendOutput(fmt.Sprintf("  %d. [%s] %s (%d messages)",
-			i+1, s.CreatedAt.Format("Jan 02"), s.Title, s.MsgCount))
+			i+1, s.UpdatedAt.Format("Jan 02"), s.Title, s.MsgCount))
 	}
 	m.appendOutput("  Use /session resume <number> to resume")
 }
