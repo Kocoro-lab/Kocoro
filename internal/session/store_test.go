@@ -112,6 +112,51 @@ func TestStore_List(t *testing.T) {
 	}
 }
 
+// TestStore_List_OrdersByUpdatedAt covers the JSON fallback path in
+// Store.List (taken when the SQLite index is unavailable). The path must
+// sort by UpdatedAt DESC, matching Index.ListSessions — otherwise an
+// index-rebuild window would silently reshuffle the sidebar.
+func TestStore_List_OrdersByUpdatedAt(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	defer store.Close()
+
+	// Save A then B; UpdatedAt is monotonic so A < B at this point.
+	if err := store.Save(&Session{ID: "a", Title: "First"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(&Session{ID: "b", Title: "Second"}); err != nil {
+		t.Fatal(err)
+	}
+	// Re-save A to bump only its UpdatedAt (CreatedAt is preserved by
+	// Store.Save when non-zero). After this: a.CreatedAt < b.CreatedAt
+	// but a.UpdatedAt > b.UpdatedAt.
+	aSess, err := store.Load("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(aSess); err != nil {
+		t.Fatal(err)
+	}
+
+	// Disable the index so List takes the JSON fallback branch.
+	store.index = nil
+
+	sessions, err := store.List()
+	if err != nil {
+		t.Fatalf("list failed: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(sessions))
+	}
+	if sessions[0].ID != "a" {
+		t.Errorf("expected recently-updated session first, got %q (would happen if fallback reverted to CreatedAt sort)", sessions[0].ID)
+	}
+	if !sessions[0].UpdatedAt.After(sessions[1].UpdatedAt) {
+		t.Errorf("expected sessions[0].UpdatedAt > sessions[1].UpdatedAt, got %v vs %v", sessions[0].UpdatedAt, sessions[1].UpdatedAt)
+	}
+}
+
 func TestStore_Delete(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)

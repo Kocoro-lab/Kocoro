@@ -245,6 +245,13 @@ type SessionSummary struct {
 	ID        string    `json:"id"`
 	Title     string    `json:"title"`
 	CreatedAt time.Time `json:"created_at"`
+	// UpdatedAt is the timestamp of the most recent activity in the session
+	// (mirrors Session.UpdatedAt). Drives list ordering in GET /sessions so
+	// the most recently used session surfaces first, regardless of creation
+	// date. Title / pinned / favorite edits intentionally do NOT bump this
+	// (see Store.Rename / SetPinned / SetFavorite) so metadata changes
+	// preserve order.
+	UpdatedAt time.Time `json:"updated_at"`
 	MsgCount  int       `json:"msg_count"`
 	// Source identifies the originating IM / surface for this session.
 	// Canonical values are the `Channel*` constants in
@@ -525,6 +532,7 @@ func (s *Store) List() ([]SessionSummary, error) {
 			ID:        sess.ID,
 			Title:     sess.Title,
 			CreatedAt: sess.CreatedAt,
+			UpdatedAt: sess.UpdatedAt,
 			MsgCount:  len(sess.Messages),
 			Source:    sess.Source,
 			Pinned:    sess.Pinned,
@@ -536,7 +544,7 @@ func (s *Store) List() ([]SessionSummary, error) {
 		if summaries[i].Pinned != summaries[j].Pinned {
 			return summaries[i].Pinned
 		}
-		return summaries[i].CreatedAt.After(summaries[j].CreatedAt)
+		return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
 	})
 	return summaries, nil
 }

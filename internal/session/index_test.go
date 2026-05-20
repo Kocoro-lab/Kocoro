@@ -113,6 +113,55 @@ func TestIndex_ListOrder(t *testing.T) {
 	}
 }
 
+// TestIndex_ListOrder_PrefersUpdatedOverCreated guards the GET /sessions
+// ordering contract: the list is sorted by updated_at DESC, not created_at,
+// so a session created earlier but used more recently surfaces above a
+// session created later but untouched since. Regressing this back to
+// created_at would re-introduce the "last conversation buried at rank 8"
+// bug reported on 2026-05-20.
+func TestIndex_ListOrder_PrefersUpdatedOverCreated(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := OpenIndex(dir)
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+	defer idx.Close()
+
+	earlyCreate := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	lateCreate := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	earlyUpdate := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	lateUpdate := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+
+	// "stale-new": created late, never touched since.
+	if err := idx.UpsertSession(&Session{
+		ID: "stale-new", Title: "Created later but untouched",
+		CreatedAt: lateCreate, UpdatedAt: earlyUpdate,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// "active-old": created early, used recently.
+	if err := idx.UpsertSession(&Session{
+		ID: "active-old", Title: "Created earlier but recently active",
+		CreatedAt: earlyCreate, UpdatedAt: lateUpdate,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	summaries, err := idx.ListSessions()
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2, got %d", len(summaries))
+	}
+	if summaries[0].ID != "active-old" {
+		t.Errorf("expected recently-active session first, got %q (would happen if SQL reverted to ORDER BY created_at DESC)", summaries[0].ID)
+	}
+	if !summaries[0].UpdatedAt.Equal(lateUpdate) {
+		t.Errorf("expected UpdatedAt %v in summary, got %v", lateUpdate, summaries[0].UpdatedAt)
+	}
+}
+
 func TestIndex_Search(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := OpenIndex(dir)

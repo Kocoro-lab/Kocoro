@@ -303,8 +303,8 @@ func (idx *Index) UpdateSessionFlags(id string, pinned, favorite *bool) error {
 
 func (idx *Index) ListSessions() ([]SessionSummary, error) {
 	rows, err := idx.db.Query(
-		`SELECT id, title, created_at, msg_count, source, pinned, favorite
-		 FROM sessions ORDER BY pinned DESC, created_at DESC`,
+		`SELECT id, title, created_at, updated_at, msg_count, source, pinned, favorite
+		 FROM sessions ORDER BY pinned DESC, updated_at DESC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
@@ -314,12 +314,13 @@ func (idx *Index) ListSessions() ([]SessionSummary, error) {
 	var summaries []SessionSummary
 	for rows.Next() {
 		var s SessionSummary
-		var createdStr string
+		var createdStr, updatedStr string
 		var pinned, favorite int
-		if err := rows.Scan(&s.ID, &s.Title, &createdStr, &s.MsgCount, &s.Source, &pinned, &favorite); err != nil {
+		if err := rows.Scan(&s.ID, &s.Title, &createdStr, &updatedStr, &s.MsgCount, &s.Source, &pinned, &favorite); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		s.CreatedAt = parseTime(createdStr)
+		s.UpdatedAt = parseTime(updatedStr)
 		s.Pinned = pinned != 0
 		s.Favorite = favorite != 0
 		summaries = append(summaries, s)
