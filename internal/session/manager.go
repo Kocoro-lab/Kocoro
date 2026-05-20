@@ -464,12 +464,11 @@ func (m *Manager) ResumeLatest() (*Session, error) {
 		return nil, nil
 	}
 
-	// Find the session with the most recent UpdatedAt.
-	// SessionSummary carries UpdatedAt, but the JSON fallback path here
-	// re-loads each file to stay byte-for-byte consistent with the prior
-	// behavior (and to tolerate any drift between summary and on-disk
-	// state). For typical daemon use (1 session per agent), this is just
-	// 1 load.
+	// Find the session with the most recent UpdatedAt by reloading each
+	// summary. SessionSummary now carries UpdatedAt directly, but Resume
+	// at the end of this function needs the full *Session anyway — so
+	// for the typical 1-session-per-agent daemon case skipping the
+	// per-iteration Load wouldn't save any work.
 	var bestID string
 	var bestTime time.Time
 	for _, s := range summaries {
