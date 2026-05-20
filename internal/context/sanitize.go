@@ -93,28 +93,68 @@ func SanitizeHistory(messages []client.Message) []client.Message {
 // INPUT (e.g. three rapid user messages with no assistant between them)
 // is left for mergeConsecutiveRoles to handle in its established way.
 //
-// Returns a new slice; the original is not modified. Idempotent.
+// Scope note (asymmetry vs empty USER messages): the same cache_control
+// 400 also triggers if Cloud's marker lands on an empty USER text block,
+// but the only production source of empty content observed to date is
+// the assistant final-response path. Empty user messages are out of
+// scope; if a future incident surfaces them we can either expand this
+// repair pass or add a complementary user-side guard.
+//
+// Cache-debug instrumentation: when SHANNON_CACHE_DEBUG=1, drops, strips
+// and merges each emit a client.LogCacheCompactEvent row so the analyst
+// can attribute cache_hashes drift on the next request to this repair
+// pass. Per CLAUDE.md "Prompt Cache" — all wire-shape mutators MUST log.
+//
+// Fast-path: when no assistant message qualifies for repair, the input
+// slice is returned unchanged (no allocation). The pre-scan is O(N+B).
+//
+// Returns a new slice when any repair was applied, or the input slice
+// untouched when no repair was needed. Idempotent.
 func RepairEmptyAssistantContent(messages []client.Message) []client.Message {
 	if len(messages) == 0 {
 		return messages
 	}
+	if !needsEmptyAssistantRepair(messages) {
+		return messages
+	}
 	out := make([]client.Message, 0, len(messages))
 	justDroppedAssistant := false
-	for _, msg := range messages {
+	for i, msg := range messages {
 		if msg.Role == "assistant" {
 			repaired, drop := repairAssistantBlocks(msg)
 			if drop {
+				// Drop the empty assistant. Cache-debug attribution: both
+				// the actual old content and any natural "newContent we
+				// could choose here marshal to `""`, so the dedup inside
+				// LogCacheCompactEvent would silently swallow this row.
+				// Pass emptyAssistantDropMarker (a unique JSON shape that
+				// never enters the wire — the message is gone) so the row
+				// actually lands in cache-debug.log.
+				client.LogCacheCompactEvent("empty_assistant_drop", i, msg.Content, emptyAssistantDropMarker)
 				justDroppedAssistant = true
 				continue
 			}
 			justDroppedAssistant = false
+			if !sameContent(msg.Content, repaired.Content) {
+				// Empty text block(s) stripped; non-empty blocks survived.
+				client.LogCacheCompactEvent("empty_text_block_strip", i, msg.Content, repaired.Content)
+			}
 			out = append(out, repaired)
 			continue
 		}
 		// Non-assistant message after a dropped assistant: if it's a user
 		// and the previous accumulated message is also a user, content-merge.
 		if justDroppedAssistant && msg.Role == "user" && len(out) > 0 && out[len(out)-1].Role == "user" {
-			out[len(out)-1] = mergeTwoUsersPreservingContent(out[len(out)-1], msg)
+			oldContent := out[len(out)-1].Content
+			merged := mergeTwoUsersPreservingContent(out[len(out)-1], msg)
+			out[len(out)-1] = merged
+			// Log against the input index `i` of the message that triggered
+			// the merge (the "second" user). new = the merged content that
+			// now sits at the prior user's index in `out`. Together with the
+			// empty_assistant_drop row at the dropped position, the analyst
+			// has a complete pair: "msg[X] dropped, msg[X+1] merged into
+			// msg[X-1]".
+			client.LogCacheCompactEvent("repair_user_merge", i, oldContent, merged.Content)
 			justDroppedAssistant = false
 			continue
 		}
@@ -122,6 +162,57 @@ func RepairEmptyAssistantContent(messages []client.Message) []client.Message {
 		out = append(out, msg)
 	}
 	return out
+}
+
+// emptyAssistantDropMarker is the placeholder newContent passed to
+// LogCacheCompactEvent when an empty assistant is dropped. It exists ONLY
+// so the dedup inside LogCacheCompactEvent (skip when old/new marshal to
+// equal bytes) doesn't swallow the log row. It never enters the wire —
+// the message at that index is gone. The unique sentinel type lets a
+// cache-debug-log parser ignore these blocks if needed.
+var emptyAssistantDropMarker = client.NewBlockContent([]client.ContentBlock{
+	{Type: "_kocoro_repair_drop_marker"},
+})
+
+// needsEmptyAssistantRepair returns true iff at least one assistant message
+// has content that would be touched by repairAssistantBlocks (bare empty
+// text/blocks, or any block list containing an empty text block). When this
+// returns false, RepairEmptyAssistantContent can return its input unchanged
+// without allocating a new slice — the common case for clean histories.
+func needsEmptyAssistantRepair(messages []client.Message) bool {
+	for _, msg := range messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		if !msg.Content.HasBlocks() {
+			if msg.Content.Text() == "" {
+				return true
+			}
+			continue
+		}
+		for _, b := range msg.Content.Blocks() {
+			if b.Type == "text" && b.Text == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sameContent reports whether two MessageContent values serialize to byte-
+// identical JSON. Used to decide whether a repair pass actually changed the
+// content (and therefore whether to emit a cache-compact log row). Encoding
+// equivalence beats reflective field comparison because MessageContent's
+// MarshalJSON folds nil/empty block slices into the same `""` shape as bare
+// empty text content — and that wire-form equivalence is what the cache
+// debugger cares about.
+func sameContent(a, b client.MessageContent) bool {
+	ab, errA := json.Marshal(a)
+	bb, errB := json.Marshal(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return bytes.Equal(ab, bb)
 }
 
 // repairAssistantBlocks examines a single assistant message and returns

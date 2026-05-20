@@ -2,6 +2,8 @@ package context
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -780,6 +782,131 @@ func TestRepairEmptyAssistantContent_Idempotent(t *testing.T) {
 	for i := range out1 {
 		if out1[i].Content.Text() != out2[i].Content.Text() {
 			t.Errorf("idempotence broken at %d: %q vs %q", i, out1[i].Content.Text(), out2[i].Content.Text())
+		}
+	}
+}
+
+// Bot review #4: inverse-shape regression. RepairEmptyAssistantContent must
+// NOT touch user adjacency that was already present in the input (no empty-
+// assistant drop between them). That case stays mergeConsecutiveRoles' job
+// with its established keep-later semantics — tested by
+// TestSanitizeHistory_MergesConsecutiveUser. This explicit, separately-
+// scoped test pins the contract so a future refactor of the merge logic
+// can't silently move the responsibility.
+func TestRepairEmptyAssistantContent_DoesNotMergePreExistingAdjacentUsers(t *testing.T) {
+	in := []client.Message{
+		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "user", Content: client.NewTextContent("second")},
+		{Role: "user", Content: client.NewTextContent("third")},
+		{Role: "assistant", Content: client.NewTextContent("ack")},
+	}
+	out := RepairEmptyAssistantContent(in)
+	if len(out) != len(in) {
+		t.Fatalf("repair must not merge already-adjacent users (no drop happened); got %d, want %d", len(out), len(in))
+	}
+	for i := range in {
+		if out[i].Role != in[i].Role || out[i].Content.Text() != in[i].Content.Text() {
+			t.Errorf("msg %d mutated: got {%s,%q}, want {%s,%q}",
+				i, out[i].Role, out[i].Content.Text(),
+				in[i].Role, in[i].Content.Text())
+		}
+	}
+}
+
+// Fast-path: clean history must return the input slice unchanged (same
+// header) — no allocation, no copy. This both proves the optimization
+// works and guards against an accidental re-introduction of unconditional
+// `make([]client.Message, 0, ...)` that would defeat it.
+func TestRepairEmptyAssistantContent_FastPathReturnsInputUnchanged(t *testing.T) {
+	in := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewTextContent("hello")},
+		{Role: "user", Content: client.NewTextContent("bye")},
+		{Role: "assistant", Content: client.NewTextContent("see you")},
+	}
+	out := RepairEmptyAssistantContent(in)
+	if &out[0] != &in[0] {
+		t.Error("clean history should return the input slice header unchanged (fast path)")
+	}
+}
+
+// Cache-debug instrumentation: with SHANNON_CACHE_DEBUG=1, each drop / strip /
+// merge emits a row in ~/.shannon/logs/cache-debug.log so the analyst can
+// attribute next-request msg_hashes drift to this repair pass. Per CLAUDE.md
+// "Prompt Cache": all wire-shape mutators MUST log.
+//
+// We trigger all three actions in one fixture:
+//   user("first") → assistant("") → assistant([thinking,""]) → user("我的图呢")
+// After repair: drop the bare-empty assistant, strip the empty text block from
+// the next assistant, then merge the two users (the second drop creates
+// user/user adjacency between user("first") and user("我的图呢")). Wait — that
+// fixture doesn't actually produce a merge because the second assistant is
+// kept. We use a focused shape instead.
+func TestRepairEmptyAssistantContent_EmitsCacheCompactEvents(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("SHANNON_CACHE_DEBUG", "1")
+
+	in := []client.Message{
+		// Will be kept; empty text block is the only repair here → strip event.
+		{Role: "user", Content: client.NewTextContent("u0")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "thinking", Thinking: "plan", Signature: "sig"},
+			{Type: "text", Text: ""},
+		})},
+		// Drop + merge: bare-empty assistant between two users.
+		{Role: "user", Content: client.NewTextContent("u2")},
+		{Role: "assistant", Content: client.NewTextContent("")},
+		{Role: "user", Content: client.NewTextContent("u4")},
+	}
+	out := RepairEmptyAssistantContent(in)
+
+	// Verify the wire-side effect first (independent of the log):
+	// - assistant at idx 1 in input survives with thinking-only blocks
+	// - assistant at idx 3 is gone
+	// - users at idx 2 and 4 are merged
+	if len(out) != 3 {
+		t.Fatalf("expected 3 messages (u0, asst-thinking, u2+u4), got %d", len(out))
+	}
+
+	logPath := filepath.Join(tmp, ".shannon", "logs", "cache-debug.log")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read cache-debug.log: %v", err)
+	}
+
+	type event struct {
+		Dir    string `json:"dir"`
+		Action string `json:"action"`
+		MsgIdx int    `json:"msg_idx"`
+	}
+	var events []event
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		var ev event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Dir == "compact" {
+			events = append(events, ev)
+		}
+	}
+
+	wantActions := map[string]bool{
+		"empty_text_block_strip": false,
+		"empty_assistant_drop":   false,
+		"repair_user_merge":      false,
+	}
+	for _, ev := range events {
+		if _, ok := wantActions[ev.Action]; ok {
+			wantActions[ev.Action] = true
+		}
+	}
+	for action, seen := range wantActions {
+		if !seen {
+			t.Errorf("expected cache-compact action %q to be emitted; events=%+v", action, events)
 		}
 	}
 }

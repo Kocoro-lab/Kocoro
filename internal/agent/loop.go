@@ -1328,9 +1328,11 @@ func (a *AgentLoop) messagesForLLM(messages []client.Message) []client.Message {
 	// Wire-time guard for empty assistant content. Catches in-memory
 	// `assistant content: ""` that could be introduced this turn (e.g. via
 	// queued injected messages, mid-turn snapshot paths, or external history
-	// from disk that predates Solution A in loop.go). The repair returns the
-	// same slice when nothing is wrong, so the no-op case is cheap.
-	// See docs/empty-assistant-content-400.md.
+	// from disk that predates Solution A in loop.go). Returns the input slice
+	// unchanged on the clean-history fast path (O(N+B) pre-scan, no allocation),
+	// and emits client.LogCacheCompactEvent rows per drop / strip / merge so
+	// SHANNON_CACHE_DEBUG=1 keeps a complete attribution trail (CLAUDE.md
+	// "Prompt Cache" invariant). See docs/empty-assistant-content-400.md.
 	out = ctxwin.RepairEmptyAssistantContent(out)
 	return out
 }
