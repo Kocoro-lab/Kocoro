@@ -260,6 +260,76 @@ func buildStickySkillReminder(skillName, snippet string) string {
 // to distinguish truncated results from hard failures.
 var ErrMaxIterReached = errors.New("agent loop reached iteration limit")
 
+// ErrEmptyFinalResponse is returned when the LLM completes a turn with
+// err == nil, no tool calls, and no visible text (OutputText == "" and no
+// non-empty text blocks in ContentBlocks). The previous behavior was to
+// persist an assistant message with empty content, which Cloud rewrites to
+// `[{"type":"text","text":""}]` and Cloud's rolling cache_control marker
+// then lands on, producing Anthropic 400
+// `cache_control cannot be set for empty text blocks` on the next request.
+// See docs/empty-assistant-content-400.md. Callers (runner.go) treat this
+// like other hard run failures and append the standard friendly error.
+var ErrEmptyFinalResponse = errors.New("agent: LLM returned empty final response")
+
+// recoverVisibleTextFromBlocks scans resp.ContentBlocks for non-empty text
+// blocks and returns their concatenation. Used as a last-resort fallback in
+// the final response path when OutputText is empty but Cloud emitted real
+// text blocks (e.g. stream-done aggregator edge case). Returns "" for nil
+// resp, no blocks, or only thinking/redacted_thinking — the caller treats
+// "" as an empty final response.
+func recoverVisibleTextFromBlocks(resp *client.CompletionResponse) string {
+	if resp == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, b := range resp.ContentBlocks {
+		// TrimSpace check: a whitespace-only text block is wire-form
+		// "visible" but semantically empty, and Cloud's _mark_last_block
+		// rstrip+stamp pipeline can still convert it into the 400-trigger
+		// shape `{"type":"text","text":"","cache_control":...}`. Treat it
+		// as empty here so the empty-response guard in the caller fires.
+		if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+			sb.WriteString(b.Text)
+		}
+	}
+	return sb.String()
+}
+
+// describeContentBlocks emits a compact one-line summary of an assistant
+// response's content blocks for audit-row attribution. Format examples:
+//
+//	"none"                      no blocks at all
+//	"[thinking]"                single thinking block
+//	"[thinking,text:empty]"     thinking + empty text
+//	"[thinking,text:42c]"       thinking + 42-rune text
+//	"[tool_use:bash]"           lone tool_use
+//
+// Used by the empty_final_response audit row in loop.go and intentionally
+// log-friendly (no JSON nesting, one quote-free line).
+func describeContentBlocks(blocks []client.ContentBlock) string {
+	if len(blocks) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			if b.Text == "" {
+				parts = append(parts, "text:empty")
+			} else {
+				parts = append(parts, fmt.Sprintf("text:%dc", len([]rune(b.Text))))
+			}
+		case "tool_use":
+			parts = append(parts, "tool_use:"+b.Name)
+		case "thinking", "redacted_thinking":
+			parts = append(parts, b.Type)
+		default:
+			parts = append(parts, b.Type)
+		}
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
 type RunStatus struct {
 	// Partial reports that the run returned a usable partial result instead of a
 	// clean success. In that case FailureCode describes why the result is partial
@@ -1295,6 +1365,15 @@ func (a *AgentLoop) messagesForLLM(messages []client.Message) []client.Message {
 	// is logged via `LogCacheCompactEvent("img_oversize_strip", ...)` so the
 	// cache-debug diff path remains complete (see CLAUDE.md "Prompt Cache").
 	filterOversizeImages(out)
+	// Wire-time guard for empty assistant content. Catches in-memory
+	// `assistant content: ""` that could be introduced this turn (e.g. via
+	// queued injected messages, mid-turn snapshot paths, or external history
+	// from disk that predates Solution A in loop.go). Returns the input slice
+	// unchanged on the clean-history fast path (O(N+B) pre-scan, no allocation),
+	// and emits client.LogCacheCompactEvent rows per drop / strip / merge so
+	// SHANNON_CACHE_DEBUG=1 keeps a complete attribution trail (CLAUDE.md
+	// "Prompt Cache" invariant). See docs/empty-assistant-content-400.md.
+	out = ctxwin.RepairEmptyAssistantContent(out)
 	return out
 }
 
@@ -3401,6 +3480,47 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if truncatedText.Len() > 0 {
 				truncatedText.WriteString(resp.OutputText)
 				fullText = truncatedText.String()
+			}
+			// Empty-final-response guard: if OutputText (plus any accumulated
+			// truncation text) is empty, try to recover visible text from
+			// resp.ContentBlocks (Cloud / stream-done aggregator edge case
+			// where the typed blocks have text but OutputText collapsed to "").
+			// If still empty, refuse to persist `assistant content: ""` — that
+			// shape causes Anthropic 400 "cache_control cannot be set for empty
+			// text blocks" on the next request. See
+			// docs/empty-assistant-content-400.md.
+			// TrimSpace check throughout: whitespace-only fullText is wire-
+			// form "non-empty" but Cloud's _mark_last_block rstrip+stamp
+			// can still produce the empty-text+cache_control 400 trigger.
+			// Treat it as empty here so we never persist whitespace-only
+			// assistants. Matches the Cloud-side _has_visible_text gate
+			// in shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py.
+			if strings.TrimSpace(fullText) == "" {
+				fullText = recoverVisibleTextFromBlocks(resp)
+			}
+			if strings.TrimSpace(fullText) == "" {
+				captureRunMessages()
+				setRunStatus(runstatus.CodeEmptyResponse, false)
+				// Audit row so post-incident triage can attribute "user saw
+				// CodeEmptyResponse" to a concrete upstream form: finish_reason
+				// (max_tokens vs end_turn drives different follow-up fixes),
+				// output_tokens (was the budget hit?), and the content_blocks
+				// shape (thinking-only vs all-empty-text vs no blocks at all).
+				// One row per occurrence — frequency tells us whether a Cloud-
+				// side auto-retry needs to land sooner rather than later.
+				if a.auditor != nil {
+					a.auditor.Log(audit.AuditEntry{
+						Timestamp: time.Now(),
+						SessionID: a.sessionID,
+						Event:     "empty_final_response",
+						InputSummary: fmt.Sprintf("iter=%d model=%s finish_reason=%s",
+							i, resp.Model, resp.FinishReason),
+						OutputSummary: fmt.Sprintf("input_tokens=%d output_tokens=%d blocks=%s",
+							resp.Usage.InputTokens, resp.Usage.OutputTokens,
+							describeContentBlocks(resp.ContentBlocks)),
+					})
+				}
+				return "", usage, ErrEmptyFinalResponse
 			}
 			// Record the final assistant text in messages before capturing.
 			messages = append(messages, client.Message{

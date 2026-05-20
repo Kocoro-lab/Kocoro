@@ -272,3 +272,43 @@ func TestCodeFromError_WrappedAPIError(t *testing.T) {
 		t.Errorf("%%w-wrapped APIError = %q, want %q", got, CodeCreditsExhausted)
 	}
 }
+
+// TestCodeFromError_EmptyFinalResponse verifies the string-match path that
+// classifies agent.ErrEmptyFinalResponse without importing internal/agent
+// (would create a cycle). The error message text is the contract — if the
+// agent package's ErrEmptyFinalResponse.Error() string ever changes, this
+// test forces an update on both sides simultaneously.
+func TestCodeFromError_EmptyFinalResponse(t *testing.T) {
+	err := errors.New("agent: LLM returned empty final response")
+	if got := CodeFromError(err); got != CodeEmptyResponse {
+		t.Fatalf("expected %q, got %q", CodeEmptyResponse, got)
+	}
+
+	// Daemon goes through FriendlyMessageFromError to compose the user-
+	// facing stub. Verify it picks up the specific friendly text rather
+	// than falling back to the generic CodeUnexpected message.
+	got := FriendlyMessageFromError(err)
+	want := friendlyMessages[CodeEmptyResponse]
+	if got != want {
+		t.Fatalf("expected friendly message %q, got %q", want, got)
+	}
+	if got == friendlyMessages[CodeUnexpected] {
+		t.Fatalf("empty-response error fell back to CodeUnexpected friendly message — string match broken")
+	}
+}
+
+// TestFriendlyMessage_EmptyResponseExists guards the friendly-message map
+// against accidental removal — the deferred CodeEmptyResponse entry is the
+// only differentiator vs CodeUnexpected from the user's POV.
+func TestFriendlyMessage_EmptyResponseExists(t *testing.T) {
+	msg := FriendlyMessage(CodeEmptyResponse)
+	if msg == "" {
+		t.Fatal("CodeEmptyResponse has no friendly message")
+	}
+	if msg == friendlyMessages[CodeUnexpected] {
+		t.Fatal("CodeEmptyResponse friendly message equals CodeUnexpected — coaching value lost")
+	}
+	if !IsFriendlyMessage(msg) {
+		t.Fatal("CodeEmptyResponse friendly message is not recognized as friendly — would survive sanitize and pollute LLM context")
+	}
+}

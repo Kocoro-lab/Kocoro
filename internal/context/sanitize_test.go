@@ -2,6 +2,9 @@ package context
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -566,5 +569,395 @@ func TestSanitizeHistory_DoesNotMutateInput(t *testing.T) {
 	}
 	if string(origInput) != "null" {
 		t.Errorf("SanitizeHistory mutated caller's RawMessage: got %q, want %q", string(origInput), "null")
+	}
+}
+
+// --- Empty assistant repair (docs/empty-assistant-content-400.md) ---
+//
+// Bug: ShanClaw's final response path used to persist
+// `assistant content: ""` when the LLM returned err==nil with no tool
+// calls AND no visible text. Replaying that history triggers Anthropic's
+// "cache_control cannot be set for empty text blocks" 400.
+// SanitizeHistory must repair such poisoned sessions on the way to the
+// wire AND on resume.
+
+// Plain string content with empty text on assistant must be dropped.
+// Surrounding user content must survive — content-preserving merge for
+// the newly-adjacent users that result from the drop.
+func TestSanitizeHistory_DropsPlainEmptyAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "assistant", Content: client.NewTextContent("")},
+		{Role: "user", Content: client.NewTextContent("我的图呢")},
+	}
+	result := SanitizeHistory(msgs)
+
+	for i, m := range result {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
+			t.Errorf("empty assistant survived at %d: %+v", i, m)
+		}
+	}
+
+	var userTexts []string
+	for _, m := range result {
+		if m.Role == "user" {
+			userTexts = append(userTexts, m.Content.Text())
+		}
+	}
+	combined := strings.Join(userTexts, " | ")
+	if !strings.Contains(combined, "first") {
+		t.Errorf("first user content dropped after empty-assistant repair; got %q", combined)
+	}
+	if !strings.Contains(combined, "我的图呢") {
+		t.Errorf("second user content dropped after empty-assistant repair; got %q", combined)
+	}
+}
+
+// Block content with NO blocks AND empty text on assistant — same as bare empty.
+// `MessageContent{blocks: nil, text: ""}` and `MessageContent{blocks: []}` both
+// serialize to "" via MessageContent.MarshalJSON.
+func TestSanitizeHistory_DropsEmptyBlockListAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewBlockContent(nil)},
+		{Role: "user", Content: client.NewTextContent("there")},
+	}
+	result := SanitizeHistory(msgs)
+	for i, m := range result {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
+			t.Errorf("empty-block-list assistant survived at %d", i)
+		}
+	}
+}
+
+// Mixed blocks: thinking + empty text. The empty text block is the one that
+// triggers the 400; strip it but keep the thinking block (which preserves
+// the assistant turn's reasoning trail across resume).
+func TestSanitizeHistory_StripsEmptyTextBlockFromAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "thinking", Thinking: "plan", Signature: "sig"},
+			{Type: "text", Text: ""},
+		})},
+		{Role: "user", Content: client.NewTextContent("ok")},
+	}
+	result := SanitizeHistory(msgs)
+
+	var asst *client.Message
+	for i := range result {
+		if result[i].Role == "assistant" {
+			asst = &result[i]
+		}
+	}
+	if asst == nil {
+		t.Fatal("assistant message dropped — thinking block should have survived")
+	}
+	blocks := asst.Content.Blocks()
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text == "" {
+			t.Errorf("empty text block survived in assistant blocks")
+		}
+	}
+	hasThinking := false
+	for _, b := range blocks {
+		if b.Type == "thinking" && b.Thinking == "plan" {
+			hasThinking = true
+		}
+	}
+	if !hasThinking {
+		t.Error("thinking block must be preserved when stripping empty text blocks")
+	}
+}
+
+// All-empty-text blocks → effectively empty assistant → drop entirely.
+func TestSanitizeHistory_DropsAllEmptyTextBlockAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "text", Text: ""},
+			{Type: "text", Text: ""},
+		})},
+		{Role: "user", Content: client.NewTextContent("there")},
+	}
+	result := SanitizeHistory(msgs)
+	for i, m := range result {
+		if m.Role == "assistant" {
+			t.Errorf("all-empty-text-block assistant survived at %d: %+v", i, m)
+		}
+	}
+}
+
+// Replicates the exact 2026-05-19 session shape:
+// user → asst(tool_use) → user(tool_result) → asst("") → user("我的图呢").
+// Dropping the empty assistant produces user(tool_result) + user(text)
+// adjacency. A keep-later merge would discard the tool_result and orphan
+// the prior assistant's tool_use, replacing one 400 with another. The
+// repair must content-merge instead so the tool_use/tool_result pair
+// stays intact.
+func TestSanitizeHistory_EmptyAssistantDropPreservesToolResultPair(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("read this")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "tool_use", ID: "tu_1", Name: "file_read", Input: json.RawMessage(`{"path":"/x"}`)},
+		})},
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			client.NewToolResultBlock("tu_1", "file contents", false),
+		})},
+		{Role: "assistant", Content: client.NewTextContent("")},
+		{Role: "user", Content: client.NewTextContent("我的图呢")},
+	}
+	result := SanitizeHistory(msgs)
+
+	for i, m := range result {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
+			t.Errorf("empty assistant survived at %d", i)
+		}
+	}
+
+	var foundToolUse, foundToolResult bool
+	for _, m := range result {
+		if !m.Content.HasBlocks() {
+			continue
+		}
+		for _, b := range m.Content.Blocks() {
+			if b.Type == "tool_use" && b.ID == "tu_1" {
+				foundToolUse = true
+			}
+			if b.Type == "tool_result" && b.ToolUseID == "tu_1" {
+				foundToolResult = true
+			}
+		}
+	}
+	if !foundToolUse {
+		t.Error("tool_use dropped — would orphan and 400")
+	}
+	if !foundToolResult {
+		t.Error("tool_result dropped — would orphan and 400")
+	}
+
+	var allText strings.Builder
+	for _, m := range result {
+		allText.WriteString(m.Content.Text())
+	}
+	if !strings.Contains(allText.String(), "我的图呢") {
+		t.Errorf("user text 我的图呢 lost during empty-assistant repair; got %q", allText.String())
+	}
+}
+
+// RepairEmptyAssistantContent is also called directly from agent.messagesForLLM
+// as a wire-time guard. Verify the exported helper handles the same shapes.
+func TestRepairEmptyAssistantContent_DropsBareEmptyAndMergesUsers(t *testing.T) {
+	in := []client.Message{
+		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "assistant", Content: client.NewTextContent("")},
+		{Role: "user", Content: client.NewTextContent("我的图呢")},
+	}
+	out := RepairEmptyAssistantContent(in)
+	for i, m := range out {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
+			t.Errorf("empty assistant survived at %d", i)
+		}
+	}
+	var combined strings.Builder
+	for _, m := range out {
+		combined.WriteString(m.Content.Text())
+	}
+	if !strings.Contains(combined.String(), "first") || !strings.Contains(combined.String(), "我的图呢") {
+		t.Errorf("user content lost in RepairEmptyAssistantContent; got %q", combined.String())
+	}
+}
+
+// Idempotence: running the repair on already-clean history must be a no-op.
+func TestRepairEmptyAssistantContent_Idempotent(t *testing.T) {
+	in := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewTextContent("hello")},
+	}
+	out1 := RepairEmptyAssistantContent(in)
+	out2 := RepairEmptyAssistantContent(out1)
+	if len(out1) != len(out2) {
+		t.Fatalf("non-idempotent: %d vs %d", len(out1), len(out2))
+	}
+	for i := range out1 {
+		if out1[i].Content.Text() != out2[i].Content.Text() {
+			t.Errorf("idempotence broken at %d: %q vs %q", i, out1[i].Content.Text(), out2[i].Content.Text())
+		}
+	}
+}
+
+// Bot review #4: inverse-shape regression. RepairEmptyAssistantContent must
+// NOT touch user adjacency that was already present in the input (no empty-
+// assistant drop between them). That case stays mergeConsecutiveRoles' job
+// with its established keep-later semantics — tested by
+// TestSanitizeHistory_MergesConsecutiveUser. This explicit, separately-
+// scoped test pins the contract so a future refactor of the merge logic
+// can't silently move the responsibility.
+func TestRepairEmptyAssistantContent_DoesNotMergePreExistingAdjacentUsers(t *testing.T) {
+	in := []client.Message{
+		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "user", Content: client.NewTextContent("second")},
+		{Role: "user", Content: client.NewTextContent("third")},
+		{Role: "assistant", Content: client.NewTextContent("ack")},
+	}
+	out := RepairEmptyAssistantContent(in)
+	if len(out) != len(in) {
+		t.Fatalf("repair must not merge already-adjacent users (no drop happened); got %d, want %d", len(out), len(in))
+	}
+	for i := range in {
+		if out[i].Role != in[i].Role || out[i].Content.Text() != in[i].Content.Text() {
+			t.Errorf("msg %d mutated: got {%s,%q}, want {%s,%q}",
+				i, out[i].Role, out[i].Content.Text(),
+				in[i].Role, in[i].Content.Text())
+		}
+	}
+}
+
+// Fast-path: clean history must return the input slice unchanged (same
+// header) — no allocation, no copy. This both proves the optimization
+// works and guards against an accidental re-introduction of unconditional
+// `make([]client.Message, 0, ...)` that would defeat it.
+func TestRepairEmptyAssistantContent_FastPathReturnsInputUnchanged(t *testing.T) {
+	in := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewTextContent("hello")},
+		{Role: "user", Content: client.NewTextContent("bye")},
+		{Role: "assistant", Content: client.NewTextContent("see you")},
+	}
+	out := RepairEmptyAssistantContent(in)
+	if &out[0] != &in[0] {
+		t.Error("clean history should return the input slice header unchanged (fast path)")
+	}
+}
+
+// Cache-debug instrumentation: with SHANNON_CACHE_DEBUG=1, each drop / strip /
+// merge emits a row in ~/.shannon/logs/cache-debug.log so the analyst can
+// attribute next-request msg_hashes drift to this repair pass. Per CLAUDE.md
+// "Prompt Cache": all wire-shape mutators MUST log.
+//
+// We trigger all three actions in one fixture:
+//   user("first") → assistant("") → assistant([thinking,""]) → user("我的图呢")
+// After repair: drop the bare-empty assistant, strip the empty text block from
+// the next assistant, then merge the two users (the second drop creates
+// user/user adjacency between user("first") and user("我的图呢")). Wait — that
+// fixture doesn't actually produce a merge because the second assistant is
+// kept. We use a focused shape instead.
+func TestRepairEmptyAssistantContent_EmitsCacheCompactEvents(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("SHANNON_CACHE_DEBUG", "1")
+
+	in := []client.Message{
+		// Will be kept; empty text block is the only repair here → strip event.
+		{Role: "user", Content: client.NewTextContent("u0")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "thinking", Thinking: "plan", Signature: "sig"},
+			{Type: "text", Text: ""},
+		})},
+		// Drop + merge: bare-empty assistant between two users.
+		{Role: "user", Content: client.NewTextContent("u2")},
+		{Role: "assistant", Content: client.NewTextContent("")},
+		{Role: "user", Content: client.NewTextContent("u4")},
+	}
+	out := RepairEmptyAssistantContent(in)
+
+	// Verify the wire-side effect first (independent of the log):
+	// - assistant at idx 1 in input survives with thinking-only blocks
+	// - assistant at idx 3 is gone
+	// - users at idx 2 and 4 are merged
+	if len(out) != 3 {
+		t.Fatalf("expected 3 messages (u0, asst-thinking, u2+u4), got %d", len(out))
+	}
+
+	logPath := filepath.Join(tmp, ".shannon", "logs", "cache-debug.log")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read cache-debug.log: %v", err)
+	}
+
+	type event struct {
+		Dir    string `json:"dir"`
+		Action string `json:"action"`
+		MsgIdx int    `json:"msg_idx"`
+	}
+	var events []event
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		var ev event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if ev.Dir == "compact" {
+			events = append(events, ev)
+		}
+	}
+
+	wantActions := map[string]bool{
+		"empty_text_block_strip": false,
+		"empty_assistant_drop":   false,
+		"repair_user_merge":      false,
+	}
+	for _, ev := range events {
+		if _, ok := wantActions[ev.Action]; ok {
+			wantActions[ev.Action] = true
+		}
+	}
+	for action, seen := range wantActions {
+		if !seen {
+			t.Errorf("expected cache-compact action %q to be emitted; events=%+v", action, events)
+		}
+	}
+}
+
+// Whitespace-only assistant content must be treated identically to bare
+// empty content — both Cloud's _mark_last_block rstrip+stamp pipeline AND
+// the wire-time gate in agent/loop.go strip whitespace before deciding
+// what to do with the message. If sanitize keeps "   " but loop trims it
+// to "", the two layers disagree and the bug class re-opens.
+func TestSanitizeHistory_DropsWhitespaceOnlyAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "assistant", Content: client.NewTextContent("   \n\t  ")},
+		{Role: "user", Content: client.NewTextContent("second")},
+	}
+	result := SanitizeHistory(msgs)
+	for i, m := range result {
+		if m.Role != "assistant" {
+			continue
+		}
+		if !m.Content.HasBlocks() && strings.TrimSpace(m.Content.Text()) == "" {
+			t.Errorf("whitespace-only assistant survived at %d: %q", i, m.Content.Text())
+		}
+	}
+}
+
+// Block-form whitespace-only text block (mixed with thinking) must be
+// stripped — thinking survives, the unhelpful whitespace block is gone.
+func TestSanitizeHistory_StripsWhitespaceOnlyTextBlockFromAssistant(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "thinking", Thinking: "plan", Signature: "sig"},
+			{Type: "text", Text: "  \n  "},
+		})},
+		{Role: "user", Content: client.NewTextContent("ok")},
+	}
+	result := SanitizeHistory(msgs)
+
+	var asst *client.Message
+	for i := range result {
+		if result[i].Role == "assistant" {
+			asst = &result[i]
+		}
+	}
+	if asst == nil {
+		t.Fatal("assistant message dropped — thinking block should have survived")
+	}
+	for _, b := range asst.Content.Blocks() {
+		if b.Type == "text" && strings.TrimSpace(b.Text) == "" {
+			t.Errorf("whitespace-only text block survived stripping")
+		}
 	}
 }

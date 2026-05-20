@@ -5236,3 +5236,311 @@ func TestAgentLoop_NativeToolUsePath_PreservesThinkingInTrajectory(t *testing.T)
 		t.Fatal("thinking block with signature 'sigA' was not present in turn-2 trajectory — buildAssistantMessage call site regressed")
 	}
 }
+
+// --- Empty final response guard (docs/empty-assistant-content-400.md) ---
+//
+// Bug: when the LLM returned err==nil, no tool calls, OutputText=="", the
+// loop unconditionally appended `assistant content: ""` and persisted it.
+// Replaying that session triggered Anthropic 400 "cache_control cannot be
+// set for empty text blocks". The fix returns ErrEmptyFinalResponse from
+// the final response path and refuses to write the empty assistant.
+
+// Plain empty response (no text, no blocks, no tool calls) → sentinel error,
+// no empty-assistant persisted in RunMessages.
+func TestAgentLoop_EmptyFinalResponse_ReturnsErrorAndDoesNotPersistEmpty(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(nativeResponse("", "end_turn", nil, 10, 0))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "test", nil, nil)
+	if err == nil {
+		t.Fatal("expected ErrEmptyFinalResponse, got nil")
+	}
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Errorf("expected ErrEmptyFinalResponse, got %v", err)
+	}
+	if result != "" {
+		t.Errorf("expected empty result, got %q", result)
+	}
+
+	for i, m := range loop.RunMessages() {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
+			t.Errorf("empty assistant was persisted at idx %d — would trigger cache_control 400 on resume", i)
+		}
+	}
+}
+
+// OutputText is empty but ContentBlocks carries a real text block (Cloud /
+// stream aggregator edge case). The visible text must be recovered so the
+// turn succeeds normally, not converted to ErrEmptyFinalResponse.
+func TestAgentLoop_EmptyOutputText_RecoversFromContentBlocks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := nativeResponse("", "end_turn", nil, 10, 5)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "text", Text: "recovered text"},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "test", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "recovered text" {
+		t.Errorf("expected recovered text from ContentBlocks, got %q", result)
+	}
+}
+
+// Thinking-only final response (no visible text block). Treated as empty
+// final response — the user got no answer, so the turn fails with the
+// sentinel rather than persisting a thinking-only assistant whose
+// downstream cache_control marker fate is uncertain.
+func TestAgentLoop_ThinkingOnlyFinalResponse_ReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := nativeResponse("", "end_turn", nil, 10, 5)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "thinking", Thinking: "I'm thinking but said nothing visible", Signature: "sig"},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "test", nil, nil)
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Errorf("expected ErrEmptyFinalResponse, got %v", err)
+	}
+	if result != "" {
+		t.Errorf("expected empty result, got %q", result)
+	}
+
+	for i, m := range loop.RunMessages() {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
+			t.Errorf("bare empty assistant persisted at idx %d", i)
+		}
+	}
+}
+
+// Mixed content blocks (text + thinking). Visible text wins, normal success path.
+func TestAgentLoop_EmptyOutputText_MixedBlocksRecoversText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := nativeResponse("", "end_turn", nil, 10, 5)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "thinking", Thinking: "plan", Signature: "sig"},
+			{Type: "text", Text: "the answer"},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "test", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "the answer" {
+		t.Errorf("expected 'the answer', got %q", result)
+	}
+}
+
+// describeContentBlocks shape test — used by the empty_final_response audit
+// row to label the upstream form (no blocks / thinking-only / mixed with
+// empty text / etc.). Triage queries grep this string so the format is
+// effectively a contract.
+func TestDescribeContentBlocks(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []client.ContentBlock
+		want string
+	}{
+		{"nil", nil, "none"},
+		{"empty slice", []client.ContentBlock{}, "none"},
+		{"thinking only", []client.ContentBlock{
+			{Type: "thinking", Thinking: "...", Signature: "sig"},
+		}, "[thinking]"},
+		{"text empty", []client.ContentBlock{
+			{Type: "text", Text: ""},
+		}, "[text:empty]"},
+		{"text nonempty", []client.ContentBlock{
+			{Type: "text", Text: "hello"},
+		}, "[text:5c]"},
+		{"thinking + empty text", []client.ContentBlock{
+			{Type: "thinking", Thinking: "...", Signature: "sig"},
+			{Type: "text", Text: ""},
+		}, "[thinking,text:empty]"},
+		{"tool_use", []client.ContentBlock{
+			{Type: "tool_use", Name: "bash"},
+		}, "[tool_use:bash]"},
+		{"unicode runes", []client.ContentBlock{
+			{Type: "text", Text: "你好世界"},
+		}, "[text:4c]"},
+	}
+	for _, tc := range cases {
+		if got := describeContentBlocks(tc.in); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Empty final response: verify (a) LastRunStatus.FailureCode is set to
+// CodeEmptyResponse so the daemon's friendly-stub path picks up the
+// specific message, and (b) a one-row audit entry lands so triage can
+// attribute frequency / upstream finish_reason / token spend.
+func TestAgentLoop_EmptyFinalResponse_EmitsRunStatusAndAudit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := nativeResponse("", "end_turn", nil, 25908, 0)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "thinking", Thinking: "long reasoning trail", Signature: "sig"},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+
+	_, _, runErr := loop.Run(context.Background(), "make a mind map", nil, nil)
+	if !errors.Is(runErr, ErrEmptyFinalResponse) {
+		t.Fatalf("expected ErrEmptyFinalResponse, got %v", runErr)
+	}
+
+	status := loop.LastRunStatus()
+	if status.FailureCode != runstatus.CodeEmptyResponse {
+		t.Errorf("expected FailureCode=%q, got %q", runstatus.CodeEmptyResponse, status.FailureCode)
+	}
+
+	entries := readAuditLines(t, logDir)
+	var found map[string]any
+	for _, e := range entries {
+		if e["event"] == "empty_final_response" {
+			found = e
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected empty_final_response audit entry; got %d entries: %+v", len(entries), entries)
+	}
+	// Triage attribution: the row must carry the upstream finish_reason
+	// (max_tokens vs end_turn drives different follow-up fixes) AND a
+	// content_blocks shape descriptor (thinking vs empty-text vs none).
+	in, _ := found["input_summary"].(string)
+	out, _ := found["output_summary"].(string)
+	if !strings.Contains(in, "finish_reason=end_turn") {
+		t.Errorf("audit input_summary missing finish_reason: %q", in)
+	}
+	if !strings.Contains(out, "blocks=[thinking]") {
+		t.Errorf("audit output_summary missing thinking blocks descriptor: %q", out)
+	}
+	if !strings.Contains(out, "input_tokens=25908") {
+		t.Errorf("audit output_summary missing input_tokens — without it we can't correlate to session cost: %q", out)
+	}
+}
+
+// Bare empty (no ContentBlocks) — still must set CodeEmptyResponse + emit
+// an audit row with blocks=none so the analyst can distinguish "model
+// returned thinking-only" from "model returned literally nothing".
+func TestAgentLoop_EmptyFinalResponse_BareEmpty_AuditBlocksNone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(nativeResponse("", "end_turn", nil, 100, 0))
+	}))
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+
+	_, _, _ = loop.Run(context.Background(), "test", nil, nil)
+
+	entries := readAuditLines(t, logDir)
+	for _, e := range entries {
+		if e["event"] != "empty_final_response" {
+			continue
+		}
+		out, _ := e["output_summary"].(string)
+		if !strings.Contains(out, "blocks=none") {
+			t.Errorf("bare-empty audit row should say blocks=none; got %q", out)
+		}
+		return
+	}
+	t.Fatal("no empty_final_response audit row emitted")
+}
+
+// Whitespace-only fullText must trigger the empty-response guard. The
+// Cloud-side _mark_last_block in shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py
+// calls .strip() on string content before wrapping it as a cache_control'd
+// text block — feeding whitespace upstream re-creates the 400 trap. Both
+// sides must agree on "whitespace == empty" or the bug class re-opens.
+func TestAgentLoop_WhitespaceOnlyFinalResponse_TriggersEmptyGuard(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(nativeResponse("   \n\t  ", "end_turn", nil, 10, 5))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "test", nil, nil)
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Fatalf("expected ErrEmptyFinalResponse for whitespace-only output, got %v", err)
+	}
+	if result != "" {
+		t.Errorf("expected empty result, got %q", result)
+	}
+	for _, m := range loop.RunMessages() {
+		if m.Role == "assistant" && !m.Content.HasBlocks() && strings.TrimSpace(m.Content.Text()) == "" {
+			t.Errorf("whitespace-only assistant persisted — Cloud would still 400 on next request")
+		}
+	}
+}
+
+// Whitespace-only block-form OutputText: recoverVisibleTextFromBlocks must
+// also TrimSpace, so a stream-aggregator edge case that left whitespace in
+// ContentBlocks doesn't escape the guard.
+func TestAgentLoop_WhitespaceOnlyTextBlock_RecoveryReturnsEmpty(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := nativeResponse("", "end_turn", nil, 10, 5)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "text", Text: "   \n  "},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	_, _, err := loop.Run(context.Background(), "test", nil, nil)
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Errorf("whitespace-only text block must NOT be treated as recovered visible text; got err=%v", err)
+	}
+}
