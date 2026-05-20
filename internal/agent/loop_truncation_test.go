@@ -114,6 +114,48 @@ func TestAgentLoop_MaxTokens_TruncatedTrailingCallSuppressed(t *testing.T) {
 	}
 }
 
+// The [output_truncated] synthetic tool_result is addressed to the model
+// (self-recovery prompt) and must NOT be pushed to UI clients. It still has
+// to land in the transcript so the next LLM request preserves tool_use /
+// tool_result pairing — that invariant is covered by the test above. This
+// test pins the other half: EventHandler.OnToolResult never sees it.
+func TestAgentLoop_MaxTokens_TruncatedSyntheticResultNotPushedToHandler(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			json.NewEncoder(w).Encode(nativeResponse("", "max_tokens",
+				toolCall("mock_tool", `{"path":"/tmp/x"}`), 10, 5))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 20, 10))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	mt := &mockTool{name: "mock_tool", required: []string{"path", "content"}}
+	reg.Register(mt)
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	h := &collectingHandler{}
+	loop.SetHandler(h)
+
+	if _, _, err := loop.Run(context.Background(), "write a big file", nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for i, r := range h.results {
+		if strings.Contains(r.Content, "output_truncated") {
+			t.Errorf("handler.OnToolResult #%d leaked synthetic [output_truncated] to UI: %q",
+				i, r.Content)
+		}
+		if r.InternalOnly {
+			t.Errorf("handler.OnToolResult #%d received an InternalOnly result; should have been suppressed", i)
+		}
+	}
+}
+
 func TestAgentLoop_MaxTokens_TruncatedNativeCallPreservesToolUseID(t *testing.T) {
 	callCount := 0
 	var secondReq client.CompletionRequest

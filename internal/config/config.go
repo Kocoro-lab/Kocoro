@@ -263,7 +263,13 @@ func Load() (*Config, error) {
 	// User-configurable per agent; this is just the default.
 	viper.SetDefault("agent.max_iterations", 40)
 	viper.SetDefault("agent.temperature", 0)
-	viper.SetDefault("agent.max_tokens", 32000)
+	// agent.max_tokens: 0 = auto, resolved per request via
+	// agent.MaxTokensForModel(specificModel). Explicit non-zero value here
+	// (or in yaml / per-agent config) wins and applies to every request.
+	// The legacy 32000 constant capped Sonnet 4.6 / Opus 4.6 / Haiku 4.5
+	// at half their physical 64K output limit; the model-aware default
+	// lifts that cap without forcing users to learn this knob.
+	viper.SetDefault("agent.max_tokens", 0)
 	viper.SetDefault("agent.thinking", true)
 	viper.SetDefault("agent.thinking_mode", "adaptive")
 	viper.SetDefault("agent.thinking_budget", 10000)

@@ -1049,6 +1049,23 @@ func (a *AgentLoop) SetMaxTokens(maxTokens int) {
 	a.maxTokens = maxTokens
 }
 
+// effectiveMaxTokens returns the per-request output token cap. When the
+// user did not configure agent.max_tokens explicitly (a.maxTokens == 0),
+// fall back to the model's physical upper limit via MaxTokensForModel.
+// This stops the daemon from artificially capping output at the legacy
+// 32K default when the model and cloud both allow more (e.g. Sonnet 4.6
+// / Opus 4.6 / Haiku 4.5 all permit 64K).
+//
+// Resolution happens per-request rather than at SetMaxTokens / SetSpecificModel
+// time so the lookup always sees the final (model, override) pair regardless
+// of caller setup order.
+func (a *AgentLoop) effectiveMaxTokens() int {
+	if a.maxTokens > 0 {
+		return a.maxTokens
+	}
+	return MaxTokensForModel(a.specificModel)
+}
+
 // LastRunStatus returns the status from the most recent Run call.
 // Callers should read it in the same goroutine immediately after Run returns
 // and snapshot the value if they need to retain it.
@@ -2444,7 +2461,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			ModelTier:       a.modelTier,
 			SpecificModel:   a.specificModel,
 			Temperature:     a.temperature,
-			MaxTokens:       a.maxTokens,
+			MaxTokens:       a.effectiveMaxTokens(),
 			Thinking:        a.thinking,
 			ReasoningEffort: a.reasoningEffort,
 			SessionID:       a.sessionID,
@@ -3049,7 +3066,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			ModelTier:       a.modelTier,
 			SpecificModel:   a.specificModel,
 			Temperature:     a.temperature,
-			MaxTokens:       a.maxTokens,
+			MaxTokens:       a.effectiveMaxTokens(),
 			Tools:           toolSchemas,
 			Thinking:        a.thinking,
 			ReasoningEffort: a.reasoningEffort,
@@ -3272,7 +3289,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					ModelTier:       a.modelTier,
 					SpecificModel:   a.specificModel,
 					Temperature:     a.temperature,
-					MaxTokens:       a.maxTokens,
+					MaxTokens:       a.effectiveMaxTokens(),
 					Tools:           toolSchemas,
 					Thinking:        a.thinking,
 					ReasoningEffort: a.reasoningEffort,
@@ -3378,9 +3395,13 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// If response was truncated by max_tokens, accumulate the partial text
 			// and continue the loop so the LLM can finish its output.
 			// Detection: explicit finish_reason from gateway, or output token count
-			// matches the max_tokens limit (gateway may omit finish_reason in streaming).
+			// matches the cap we actually sent (gateway may omit finish_reason in
+			// streaming). Use effectiveMaxTokens to match the value passed to the
+			// request — a.maxTokens alone is 0 when relying on the model-aware
+			// default, which would silently disable this fallback detection.
+			effMax := a.effectiveMaxTokens()
 			isTruncated := isMaxTokensTruncation(resp.FinishReason) ||
-				(a.maxTokens > 0 && resp.Usage.OutputTokens >= a.maxTokens)
+				(effMax > 0 && resp.Usage.OutputTokens >= effMax)
 			if isTruncated && resp.OutputText != "" && continuationCount < maxContinuations {
 				continuationCount++
 				truncatedText.WriteString(resp.OutputText)
@@ -3703,6 +3724,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				truncationRecoveryCount++
 				exhausted := truncationRecoveryCount > maxTruncationRecoveries
 
+				// Synthetic tool_result content is addressed to the model
+				// (self-recovery prompt), not the user. The "[output_truncated]"
+				// prefix is load-bearing for downstream loop-detector logic and
+				// audit-log search, so keep it even though the user never sees
+				// the body (InternalOnly suppresses UI fanout below).
 				var content string
 				if exhausted {
 					content = fmt.Sprintf(
@@ -3716,32 +3742,37 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
-					result: ToolResult{Content: content, IsError: true},
+					// InternalOnly: write to transcript (LLM next-turn input
+					// + tool_use/tool_result API pairing) but suppress from
+					// SSE/WS fanout. The English prompt above is for the
+					// model only; the user gets the OnRunStatus message
+					// (run_status event) which is i18n-friendly.
+					result: ToolResult{Content: content, IsError: true, InternalOnly: true},
 					name:   fc.Name,
 				}
-				if a.handler != nil {
-					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
-				}
+				// Skip handler.OnToolResult entirely for this synthetic result
+				// — it was never meant for the user. UI gets the OnRunStatus
+				// below instead. The transcript still records it via the
+				// execResults[idx].result assignment above.
 				if rs, ok := a.handler.(RunStatusHandler); ok {
 					if exhausted {
+						// Detail copy intentionally avoids internal terms
+						// (recovery count, max_tokens, output budget). The
+						// stable `code` field carries that semantics for
+						// i18n / audit; the detail is the human-facing line.
 						rs.OnRunStatus("max_tokens_recovery_exhausted",
-							fmt.Sprintf("%s call truncated again after %d/%d recoveries; forcing stop",
-								fc.Name, truncationRecoveryCount, maxTruncationRecoveries))
+							"输出过长,无法一次完成。可以让它分步生成,比如先写出主要结构,再分段补充内容。")
 					} else {
 						rs.OnRunStatus("max_tokens_truncated_tool_call",
-							fmt.Sprintf("trailing %s call truncated (recovery %d/%d); synthetic error injected",
-								fc.Name, truncationRecoveryCount, maxTruncationRecoveries))
+							"内容较长,正在拆分继续…")
 					}
 				}
 				if exhausted {
 					worstAction = LoopForceStop
-					// Distinct from the synthetic tool_result content above: that
-					// is the *model*'s next-turn input; this is the force-stop
-					// synthesis turn's "reason" string. Two audiences, similar
-					// phrasing — keep both, don't dedupe.
-					worstMsg = fmt.Sprintf(
-						"Output token cap hit %d times in this turn — the model kept emitting tool calls larger than the single-response budget. Recovery exhausted.",
-						truncationRecoveryCount)
+					// Force-stop "reason" is also user-facing in some surfaces
+					// (session terminal_reason field). Keep it consistent with
+					// the OnRunStatus copy above — same audience, same tone.
+					worstMsg = "输出过长,无法一次完成。"
 				}
 				continue
 			}
