@@ -290,6 +290,41 @@ func recoverVisibleTextFromBlocks(resp *client.CompletionResponse) string {
 	return sb.String()
 }
 
+// describeContentBlocks emits a compact one-line summary of an assistant
+// response's content blocks for audit-row attribution. Format examples:
+//
+//	"none"                      no blocks at all
+//	"[thinking]"                single thinking block
+//	"[thinking,text:empty]"     thinking + empty text
+//	"[thinking,text:42c]"       thinking + 42-rune text
+//	"[tool_use:bash]"           lone tool_use
+//
+// Used by the empty_final_response audit row in loop.go and intentionally
+// log-friendly (no JSON nesting, one quote-free line).
+func describeContentBlocks(blocks []client.ContentBlock) string {
+	if len(blocks) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			if b.Text == "" {
+				parts = append(parts, "text:empty")
+			} else {
+				parts = append(parts, fmt.Sprintf("text:%dc", len([]rune(b.Text))))
+			}
+		case "tool_use":
+			parts = append(parts, "tool_use:"+b.Name)
+		case "thinking", "redacted_thinking":
+			parts = append(parts, b.Type)
+		default:
+			parts = append(parts, b.Type)
+		}
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
 type RunStatus struct {
 	// Partial reports that the run returned a usable partial result instead of a
 	// clean success. In that case FailureCode describes why the result is partial
@@ -3429,6 +3464,26 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			}
 			if fullText == "" {
 				captureRunMessages()
+				setRunStatus(runstatus.CodeEmptyResponse, false)
+				// Audit row so post-incident triage can attribute "user saw
+				// CodeEmptyResponse" to a concrete upstream form: finish_reason
+				// (max_tokens vs end_turn drives different follow-up fixes),
+				// output_tokens (was the budget hit?), and the content_blocks
+				// shape (thinking-only vs all-empty-text vs no blocks at all).
+				// One row per occurrence — frequency tells us whether a Cloud-
+				// side auto-retry needs to land sooner rather than later.
+				if a.auditor != nil {
+					a.auditor.Log(audit.AuditEntry{
+						Timestamp: time.Now(),
+						SessionID: a.sessionID,
+						Event:     "empty_final_response",
+						InputSummary: fmt.Sprintf("iter=%d model=%s finish_reason=%s",
+							i, resp.Model, resp.FinishReason),
+						OutputSummary: fmt.Sprintf("input_tokens=%d output_tokens=%d blocks=%s",
+							resp.Usage.InputTokens, resp.Usage.OutputTokens,
+							describeContentBlocks(resp.ContentBlocks)),
+					})
+				}
 				return "", usage, ErrEmptyFinalResponse
 			}
 			// Record the final assistant text in messages before capturing.

@@ -25,6 +25,14 @@ const (
 	CodeUnexpected            Code = "unexpected"
 
 	CodeContextCompactionFailed Code = "compaction_failed"
+
+	// CodeEmptyResponse is returned when the LLM completed a turn
+	// (err == nil, no tool calls) but produced no visible text — typically
+	// a thinking-only end_turn under heavy reasoning. See
+	// docs/empty-assistant-content-400.md. The friendly message coaches
+	// the user toward an effective retry rather than treating it as a
+	// generic system failure.
+	CodeEmptyResponse Code = "empty_response"
 )
 
 // Static fallback messages used when no Detail is available (parser
@@ -45,6 +53,8 @@ var friendlyMessages = map[Code]string{
 	CodeUnexpected:            "Sorry, an unexpected error occurred. Please try again.",
 
 	CodeContextCompactionFailed: "Context compaction encountered an issue but the conversation continued.",
+
+	CodeEmptyResponse: "The model finished this turn without producing a visible answer (it spent its budget on internal reasoning). Please retry, or try simplifying / shortening your question.",
 }
 
 // friendlyPrefixes lists stable opening clauses shared between every
@@ -155,6 +165,12 @@ func codeAndDetailFromError(err error) (Code, *Detail) {
 		return CodeServiceTemporaryError, nil
 	case strings.Contains(msg, "request failed:") || strings.Contains(msg, "stream read error"):
 		return CodeNetworkInterrupted, nil
+	case strings.Contains(msg, "empty final response"):
+		// String-match on agent.ErrEmptyFinalResponse.Error() — runstatus
+		// cannot import internal/agent (would be a cycle). The string is
+		// stable: it appears in the var declaration in agent/loop.go and
+		// is the only error message containing that exact substring.
+		return CodeEmptyResponse, nil
 	default:
 		return CodeUnexpected, nil
 	}

@@ -5358,3 +5358,137 @@ func TestAgentLoop_EmptyOutputText_MixedBlocksRecoversText(t *testing.T) {
 		t.Errorf("expected 'the answer', got %q", result)
 	}
 }
+
+// describeContentBlocks shape test — used by the empty_final_response audit
+// row to label the upstream form (no blocks / thinking-only / mixed with
+// empty text / etc.). Triage queries grep this string so the format is
+// effectively a contract.
+func TestDescribeContentBlocks(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []client.ContentBlock
+		want string
+	}{
+		{"nil", nil, "none"},
+		{"empty slice", []client.ContentBlock{}, "none"},
+		{"thinking only", []client.ContentBlock{
+			{Type: "thinking", Thinking: "...", Signature: "sig"},
+		}, "[thinking]"},
+		{"text empty", []client.ContentBlock{
+			{Type: "text", Text: ""},
+		}, "[text:empty]"},
+		{"text nonempty", []client.ContentBlock{
+			{Type: "text", Text: "hello"},
+		}, "[text:5c]"},
+		{"thinking + empty text", []client.ContentBlock{
+			{Type: "thinking", Thinking: "...", Signature: "sig"},
+			{Type: "text", Text: ""},
+		}, "[thinking,text:empty]"},
+		{"tool_use", []client.ContentBlock{
+			{Type: "tool_use", Name: "bash"},
+		}, "[tool_use:bash]"},
+		{"unicode runes", []client.ContentBlock{
+			{Type: "text", Text: "你好世界"},
+		}, "[text:4c]"},
+	}
+	for _, tc := range cases {
+		if got := describeContentBlocks(tc.in); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Empty final response: verify (a) LastRunStatus.FailureCode is set to
+// CodeEmptyResponse so the daemon's friendly-stub path picks up the
+// specific message, and (b) a one-row audit entry lands so triage can
+// attribute frequency / upstream finish_reason / token spend.
+func TestAgentLoop_EmptyFinalResponse_EmitsRunStatusAndAudit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := nativeResponse("", "end_turn", nil, 25908, 0)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "thinking", Thinking: "long reasoning trail", Signature: "sig"},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+
+	_, _, runErr := loop.Run(context.Background(), "make a mind map", nil, nil)
+	if !errors.Is(runErr, ErrEmptyFinalResponse) {
+		t.Fatalf("expected ErrEmptyFinalResponse, got %v", runErr)
+	}
+
+	status := loop.LastRunStatus()
+	if status.FailureCode != runstatus.CodeEmptyResponse {
+		t.Errorf("expected FailureCode=%q, got %q", runstatus.CodeEmptyResponse, status.FailureCode)
+	}
+
+	entries := readAuditLines(t, logDir)
+	var found map[string]any
+	for _, e := range entries {
+		if e["event"] == "empty_final_response" {
+			found = e
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected empty_final_response audit entry; got %d entries: %+v", len(entries), entries)
+	}
+	// Triage attribution: the row must carry the upstream finish_reason
+	// (max_tokens vs end_turn drives different follow-up fixes) AND a
+	// content_blocks shape descriptor (thinking vs empty-text vs none).
+	in, _ := found["input_summary"].(string)
+	out, _ := found["output_summary"].(string)
+	if !strings.Contains(in, "finish_reason=end_turn") {
+		t.Errorf("audit input_summary missing finish_reason: %q", in)
+	}
+	if !strings.Contains(out, "blocks=[thinking]") {
+		t.Errorf("audit output_summary missing thinking blocks descriptor: %q", out)
+	}
+	if !strings.Contains(out, "input_tokens=25908") {
+		t.Errorf("audit output_summary missing input_tokens — without it we can't correlate to session cost: %q", out)
+	}
+}
+
+// Bare empty (no ContentBlocks) — still must set CodeEmptyResponse + emit
+// an audit row with blocks=none so the analyst can distinguish "model
+// returned thinking-only" from "model returned literally nothing".
+func TestAgentLoop_EmptyFinalResponse_BareEmpty_AuditBlocksNone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(nativeResponse("", "end_turn", nil, 100, 0))
+	}))
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+
+	_, _, _ = loop.Run(context.Background(), "test", nil, nil)
+
+	entries := readAuditLines(t, logDir)
+	for _, e := range entries {
+		if e["event"] != "empty_final_response" {
+			continue
+		}
+		out, _ := e["output_summary"].(string)
+		if !strings.Contains(out, "blocks=none") {
+			t.Errorf("bare-empty audit row should say blocks=none; got %q", out)
+		}
+		return
+	}
+	t.Fatal("no empty_final_response audit row emitted")
+}
