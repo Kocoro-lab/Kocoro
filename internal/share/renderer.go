@@ -43,6 +43,7 @@ type RenderInput struct {
 	Meta        []session.MessageMeta // already sanitized, aligned with Messages
 	Summary     string                // Haiku-generated; empty when generation failed
 	GeneratedAt time.Time
+	Metadata    ShareMetadata // drives the <head> social-share tags; zero value uses built-in fallbacks
 }
 
 // RenderHTML produces the full HTML page bytes for sharing. The returned bytes
@@ -82,6 +83,19 @@ type viewData struct {
 	GeneratedAtISO string        // RFC3339, parallel to CreatedAtISO
 	MessageCount   int
 	Messages       []viewMessage
+
+	// Social-share <head> fields. The template gates each tag on the
+	// non-empty value so a Description = "" silently omits both
+	// <meta name="description"> and og:description / twitter:description,
+	// rather than emitting empty content="" attributes that crawlers warn on.
+	Description  string      // ≤150 runes, plain text, no markdown
+	OGTitle      string      // ≤60 runes, ellipsis-truncated
+	OGImage      string      // absolute URL for og:image; empty → no og:image
+	TwitterImage string      // absolute URL for twitter:image; empty → no twitter:image
+	SiteName     string      // "Kocoro" by default
+	SiteURL      string      // "https://www.kocoro.ai/" by default, trailing slash preserved for favicon concat
+	LogoURL      string      // JSON-LD publisher.logo; empty → publisher.logo omitted
+	JSONLD       template.JS // pre-marshaled application/ld+json body; template emits as-is
 }
 
 // viewMessage represents a single rendered message card. Role drives the
@@ -157,7 +171,40 @@ func buildViewData(in RenderInput) viewData {
 	// skipped downstream — promising "N messages" and then showing fewer
 	// would be confusing).
 	rendered := buildViewMessages(in.Messages, in.Meta)
-	return viewData{
+
+	// Social-share metadata. The two-level fallback (Metadata field → built-in
+	// default) keeps the renderer robust to a caller that constructs
+	// RenderInput by hand and forgets to fill Metadata (every test in this
+	// package does that). Daemon callers go through Viper defaults so they
+	// always supply non-empty SiteName/SiteURL.
+	siteName := in.Metadata.SiteName
+	if siteName == "" {
+		siteName = "Kocoro"
+	}
+	siteURL := strings.TrimSpace(in.Metadata.SiteURL)
+	if siteURL == "" {
+		siteURL = "https://www.kocoro.ai/"
+	}
+	// The template concatenates "{{.SiteURL}}favicon.ico" — without a
+	// trailing slash an operator-configured "https://example.com" produces
+	// "https://example.comfavicon.ico", which 404s silently and is a pain
+	// to diagnose from the share page. Append a trailing slash here so the
+	// concat always produces a valid path.
+	if !strings.HasSuffix(siteURL, "/") {
+		siteURL += "/"
+	}
+	description := truncateOGDescription(buildShareDescription(summaryBody, sess.Title, in.Messages))
+
+	ogImage := strings.TrimSpace(in.Metadata.DefaultOGImage)
+	// twitter:image falls back to og:image when not overridden, so a
+	// caller that only configures DefaultOGImage still gets Twitter
+	// previews from the same asset.
+	twitterImage := strings.TrimSpace(in.Metadata.TwitterImage)
+	if twitterImage == "" {
+		twitterImage = ogImage
+	}
+
+	d := viewData{
 		Lang:           "en",
 		Title:          pageTitle,
 		AgentName:      agentNameFromSession(sess),
@@ -168,7 +215,16 @@ func buildViewData(in RenderInput) viewData {
 		GeneratedAtISO: generatedISO,
 		MessageCount:   len(rendered),
 		Messages:       rendered,
+		Description:    description,
+		OGTitle:        truncateOGTitle(pageTitle),
+		OGImage:        ogImage,
+		TwitterImage:   twitterImage,
+		SiteName:       siteName,
+		SiteURL:        siteURL,
+		LogoURL:        strings.TrimSpace(in.Metadata.LogoURL),
 	}
+	d.JSONLD = buildJSONLD(d, in)
+	return d
 }
 
 // pageTitleMaxRunes caps the rune length of the page <title> and the

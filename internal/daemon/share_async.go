@@ -231,7 +231,10 @@ func (s *Server) runShareTask(
 	})
 
 	home, _ := os.UserHomeDir()
-	result, err := share.Render(ctx, s.deps.GW, sess, share.Options{HomeDir: home})
+	result, err := share.Render(ctx, s.deps.GW, sess, share.Options{
+		HomeDir:  home,
+		Metadata: shareMetadataFromConfig(cfg),
+	})
 	if err != nil {
 		s.failShareTask(task, fmt.Errorf("render share: %w", err))
 		return
@@ -327,6 +330,25 @@ func (s *Server) runShareTask(
 		t.UploadID = uploadID
 		t.Message = ""
 	})
+}
+
+// shareMetadataFromConfig copies the social-meta fields out of the daemon
+// config into the share-package-local ShareMetadata shape. Pulled into a
+// helper so the sync (share_handler.go) and async (runShareTask) call sites
+// can't drift out of sync as new fields get added. cfg is non-nil by the
+// time we get here — every caller goes through deps.Snapshot().
+func shareMetadataFromConfig(cfg *config.Config) share.ShareMetadata {
+	if cfg == nil {
+		return share.ShareMetadata{}
+	}
+	m := cfg.Daemon.ShareMetadata
+	return share.ShareMetadata{
+		SiteName:       m.SiteName,
+		SiteURL:        m.SiteURL,
+		DefaultOGImage: m.DefaultOGImage,
+		TwitterImage:   m.TwitterImage,
+		LogoURL:        m.LogoURL,
+	}
 }
 
 // newShareTaskID returns a "share-" + 16-hex-char identifier. 64 bits of

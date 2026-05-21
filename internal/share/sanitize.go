@@ -76,6 +76,29 @@ type Options struct {
 	// "/Users/alice" → "~"). Pass os.UserHomeDir() at call site; tests
 	// inject a fixed value to keep golden files stable.
 	HomeDir string
+
+	// Metadata drives the social-share <head> tags (OG / Twitter Card /
+	// JSON-LD). Zero value is safe: missing SiteName / SiteURL fall back to
+	// "Kocoro" / "https://www.kocoro.ai/" inside buildViewData; an empty
+	// DefaultOGImage / LogoURL just skips emitting the corresponding tag.
+	Metadata ShareMetadata
+}
+
+// ShareMetadata is the share-package-local view of daemon.share_metadata
+// config — declared here (not in internal/config) so the share package
+// stays free of an upward dependency on the larger config struct. The
+// daemon layer copies cfg.Daemon.ShareMetadata into this shape at the
+// call site (see internal/daemon/share_handler.go).
+type ShareMetadata struct {
+	SiteName       string
+	SiteURL        string
+	DefaultOGImage string
+	// TwitterImage, when non-empty, takes precedence over DefaultOGImage for
+	// the twitter:image tag. Lets operators ship a 1200×630 wide hero for
+	// Twitter while keeping a square brand mark for og:image (which Slack /
+	// Teams / Facebook render fine).
+	TwitterImage string
+	LogoURL      string
 }
 
 // Sanitize returns a filtered copy of messages + meta safe to publish:

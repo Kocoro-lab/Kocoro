@@ -107,6 +107,7 @@ func Render(ctx context.Context, gw ctxwin.Completer, sess *session.Session, opt
 		Meta:        sanitizedMeta,
 		Summary:     summary,
 		GeneratedAt: time.Now(),
+		Metadata:    opts.Metadata,
 	})
 	if err != nil {
 		return RenderResult{}, err
