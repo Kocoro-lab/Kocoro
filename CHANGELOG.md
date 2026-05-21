@@ -2,6 +2,22 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.1.12 — 2026-05-21 — Empty-response 400 fix, language-drift mitigation, session sort
+
+Three internal-only fixes (no wire-protocol changes, no cross-repo coordination required). The largest is an Anthropic-side 400 root-cause fix: when the model emitted an assistant turn containing only `thinking` blocks (no text / tool_use), the next request carried a `cache_control` on empty `content[]` and the API rejected it. The daemon now refuses to persist empty assistant content, surfaces a neutral friendly fallback, and the context sanitizer repairs the same shape on historical messages so existing sessions keep loading.
+
+### Fixed
+
+- **Empty-assistant `cache_control` 400** (PR #175, `internal/context/sanitize.go`, `internal/agent/loop.go`) — `RepairEmptyAssistantContent` detects empty- and whitespace-only assistant blocks and rewrites them with a neutral marker; rewrites are instrumented via `LogCacheCompactEvent` so cache-debug attributes the change. Loop refuses to persist empty turns and emits a friendly fallback message plus the new `runstatus.EmptyFinalResponse` audit code.
+- **Language drift from multilingual MEMORY.md** (PR #177, #157, `internal/prompt/builder.go`, `internal/instructions/loader.go`, `internal/agent/loop.go`) — system-prompt assembly reorders memory injection and tags memory blocks so a mixed-language MEMORY.md no longer pulls the model into the wrong reply language. `appendDynamicUserBlocks` extracted with explicit ordering test.
+- **`GET /sessions` sort by `updated_at`** (`internal/session/{index,manager,store}.go`, `internal/tui/{app,header}.go`) — recently-active sessions surface first. TUI session list and startup-header "Recent activity" updated to display `updated_at` so the visible timestamp matches the new sort order. `kocoro` skill reference (`references/agents.md`) updated.
+
+### Note
+
+Tag `v0.1.12` was cut before this CHANGELOG entry landed; the entry is on `main` post-tag (the tag's commit message carries the same summary).
+
+---
+
 ## v0.1.11 — 2026-05-18 — Async share, mid-turn attachments, streaming bypass, max-tokens handling
 
 Ships an async session-share path so the publish round-trip no longer blocks the caller (daemon owns the share state machine end-to-end), adds mid-turn attachment threading so a user can drop a file into an already-running turn, switches the daemon to streaming end-to-end so completions are no longer capped by the Anthropic non-streaming 16K ceiling, and tightens behavior around `stop_reason=max_tokens` so truncated tool calls don't get retried into a stuck loop. Three security/correctness fixes ship alongside: session_id path traversal (#158), Authorization-header leak on cross-host redirect, and `file_read` runaway via the spill exemption + 500K rune hard cap (#161).
