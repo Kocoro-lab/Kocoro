@@ -24,9 +24,12 @@ import "strings"
 // enough to cover Opus 4.1 era and any third-party / Ollama model.
 var modelMaxOutputTokens = map[string]int{
 	// --- 1M-context families (output cap is independent of context) ---
-	"claude-sonnet-4-6": 64_000,
-	"claude-opus-4-6":   64_000,
-	"claude-opus-4-7":   64_000,
+	"claude-sonnet-4-6":     64_000,
+	"claude-opus-4-6":       64_000,
+	"claude-opus-4-7":       64_000,
+	// Mythos preview: stays on the 32K fallback until output-cap docs are
+	// published; flip to 64K when shannon-cloud config/models.yaml confirms.
+	"claude-mythos-preview": defaultMaxOutputTokens,
 
 	// --- 200K, dated forms ---
 	"claude-sonnet-4-5-20250929": 64_000,
@@ -53,6 +56,12 @@ var modelMaxOutputTokens = map[string]int{
 
 // modelMaxOutputTokensPrefix matches forward-compat dated variants of
 // dateless family IDs. Same pattern as modelContextWindowPrefix.
+//
+// GPT-5 / GPT-4.1 prefixes are intentionally omitted: OpenAI ships dated
+// model IDs as the canonical surface (e.g. gpt-5-mini-2025-08-07) without
+// a separate dateless floating tag, so prefix fallback would only catch
+// hypothetical future shapes that don't currently exist. Exact-match
+// covers what's released; unknown IDs land on defaultMaxOutputTokens.
 var modelMaxOutputTokensPrefix = map[string]int{
 	"claude-sonnet-4-6-": 64_000,
 	"claude-opus-4-6-":   64_000,

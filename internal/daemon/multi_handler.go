@@ -25,6 +25,17 @@ func (m *multiHandler) OnToolCall(name, args, toolUseID string) {
 }
 
 func (m *multiHandler) OnToolResult(name, args, toolUseID string, result agent.ToolResult, elapsed time.Duration) {
+	// Defense in depth: agent.ToolResult.InternalOnly results are addressed
+	// to the LLM (transcript / tool_use-result pairing) and must never reach
+	// SSE / WS clients. The agent loop already skips OnToolResult for these,
+	// so under normal flow this branch is never taken — but pinning the
+	// invariant here keeps the contract local rather than ambient, so any
+	// future force-stop site or checkpoint-replay path that forgets to
+	// suppress the dispatch cannot leak a synthetic [output_truncated] card
+	// to the user.
+	if result.InternalOnly {
+		return
+	}
 	for _, h := range m.handlers {
 		h.OnToolResult(name, args, toolUseID, result, elapsed)
 	}

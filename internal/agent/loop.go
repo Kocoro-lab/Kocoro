@@ -3746,7 +3746,8 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					// + tool_use/tool_result API pairing) but suppress from
 					// SSE/WS fanout. The English prompt above is for the
 					// model only; the user gets the OnRunStatus message
-					// (run_status event) which is i18n-friendly.
+					// (run_status event) below which the client i18n's via
+					// the stable `code`.
 					result: ToolResult{Content: content, IsError: true, InternalOnly: true},
 					name:   fc.Name,
 				}
@@ -3755,24 +3756,33 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				// below instead. The transcript still records it via the
 				// execResults[idx].result assignment above.
 				if rs, ok := a.handler.(RunStatusHandler); ok {
+					// `code` is a stable i18n key; `detail` is the English
+					// fallback the client can map to a localized string. We
+					// keep the recovery counts in detail so audit / logs /
+					// untranslated locales still have actionable context.
+					// Matches the approval-notice i18n contract documented
+					// in the daemon architecture guide.
 					if exhausted {
-						// Detail copy intentionally avoids internal terms
-						// (recovery count, max_tokens, output budget). The
-						// stable `code` field carries that semantics for
-						// i18n / audit; the detail is the human-facing line.
 						rs.OnRunStatus("max_tokens_recovery_exhausted",
-							"输出过长,无法一次完成。可以让它分步生成,比如先写出主要结构,再分段补充内容。")
+							fmt.Sprintf("%s call truncated again after %d/%d recoveries; forcing stop",
+								fc.Name, truncationRecoveryCount, maxTruncationRecoveries))
 					} else {
 						rs.OnRunStatus("max_tokens_truncated_tool_call",
-							"内容较长,正在拆分继续…")
+							fmt.Sprintf("trailing %s call truncated (recovery %d/%d); synthetic error injected",
+								fc.Name, truncationRecoveryCount, maxTruncationRecoveries))
 					}
 				}
 				if exhausted {
 					worstAction = LoopForceStop
-					// Force-stop "reason" is also user-facing in some surfaces
-					// (session terminal_reason field). Keep it consistent with
-					// the OnRunStatus copy above — same audience, same tone.
-					worstMsg = "输出过长,无法一次完成。"
+					// Distinct from the synthetic tool_result content above:
+					// that is the *model*'s next-turn input via the truncated
+					// tool_use leg; this is the force-stop synthesis turn's
+					// "reason" string (see buildForceStopReason above), also
+					// surfaced to the user in some terminal_reason fields.
+					// Two audiences, similar phrasing — keep both, don't dedupe.
+					worstMsg = fmt.Sprintf(
+						"Output token cap hit %d times in this turn — the model kept emitting tool calls larger than the single-response budget. Recovery exhausted.",
+						truncationRecoveryCount)
 				}
 				continue
 			}
