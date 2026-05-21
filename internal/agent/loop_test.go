@@ -4904,6 +4904,17 @@ func TestOperationalRules_StripsBulletWhenThinkUnregistered(t *testing.T) {
 	}
 }
 
+// TestOperationalRules_HasActingWithCareSection guards the blast-radius
+// guidance from silent removal in future prompt trimming. The byte-equality
+// test catches *unintended* changes; this test catches intentional removal
+// of the load-bearing section the model uses to decide ask-vs-act on
+// destructive, hard-to-reverse, or shared-state actions.
+func TestOperationalRules_HasActingWithCareSection(t *testing.T) {
+	if !strings.Contains(coreOperationalRules, "## Acting with Care") {
+		t.Error("## Acting with Care section missing from coreOperationalRules — removed without replacement?")
+	}
+}
+
 // TestOperationalRules_NilRegistryStripsBullet covers the safety case where
 // the registry hasn't been populated yet (Has() returns false). Should behave
 // the same as "think not registered".
