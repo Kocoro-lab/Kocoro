@@ -2719,7 +2719,14 @@ func formatConfigDisplay(cfg *config.Config) string {
 	sb.WriteString("\nAgent:\n")
 	sb.WriteString(fmt.Sprintf("  max_iterations: %d %s\n", cfg.Agent.MaxIterations, srcLabel("agent.max_iterations")))
 	sb.WriteString(fmt.Sprintf("  temperature: %g %s\n", cfg.Agent.Temperature, srcLabel("agent.temperature")))
-	sb.WriteString(fmt.Sprintf("  max_tokens: %d %s\n", cfg.Agent.MaxTokens, srcLabel("agent.max_tokens")))
+	// max_tokens: 0 = auto, resolved per request by agent.MaxTokensForModel.
+	// Display "auto" instead of a literal 0 so it doesn't read like a broken
+	// or forgotten config to a user inspecting /doctor.
+	if cfg.Agent.MaxTokens == 0 {
+		sb.WriteString(fmt.Sprintf("  max_tokens: auto %s\n", srcLabel("agent.max_tokens")))
+	} else {
+		sb.WriteString(fmt.Sprintf("  max_tokens: %d %s\n", cfg.Agent.MaxTokens, srcLabel("agent.max_tokens")))
+	}
 	sb.WriteString(fmt.Sprintf("  thinking: %v %s\n", cfg.Agent.Thinking, srcLabel("agent.thinking")))
 	if cfg.Agent.Thinking {
 		sb.WriteString(fmt.Sprintf("  thinking_mode: %s %s\n", cfg.Agent.ThinkingMode, srcLabel("agent.thinking_mode")))

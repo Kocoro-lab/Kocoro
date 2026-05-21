@@ -82,6 +82,16 @@ type ToolResult struct {
 	// to the allowed tools. Works alongside SkillToolFilter (which provides
 	// execution-time denial).
 	SkillToolHint string
+	// InternalOnly marks a daemon-synthesized tool_result that must be
+	// written to the LLM transcript (so the tool_use/tool_result pairing
+	// the API requires stays intact) but MUST NOT be pushed to SSE/WS
+	// clients. Used for the [output_truncated] recovery prompt — that text
+	// is addressed to the LLM ("you got cut off, break the work smaller"),
+	// not to the human user. Without this flag, clients render it as a red
+	// error card and users think the run failed.
+	//
+	// Field is intentionally untagged for JSON — it never crosses the wire.
+	InternalOnly bool `json:"-"`
 }
 
 // ToolUsage is ToolResult's per-call cost breakdown. Mirrors client.ToolUsage

@@ -114,6 +114,113 @@ func TestAgentLoop_MaxTokens_TruncatedTrailingCallSuppressed(t *testing.T) {
 	}
 }
 
+// The [output_truncated] synthetic tool_result is addressed to the model
+// (self-recovery prompt) and must NOT be pushed to UI clients. It still has
+// to land in the transcript so the next LLM request preserves tool_use /
+// tool_result pairing — that invariant is covered by the test above. This
+// test pins the other half: EventHandler.OnToolResult never sees it.
+func TestAgentLoop_MaxTokens_TruncatedSyntheticResultNotPushedToHandler(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			json.NewEncoder(w).Encode(nativeResponse("", "max_tokens",
+				toolCall("mock_tool", `{"path":"/tmp/x"}`), 10, 5))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 20, 10))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	mt := &mockTool{name: "mock_tool", required: []string{"path", "content"}}
+	reg.Register(mt)
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	h := &collectingHandler{}
+	loop.SetHandler(h)
+
+	if _, _, err := loop.Run(context.Background(), "write a big file", nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Pinned explicitly so the assertion isn't vacuously true if the loop
+	// stops emitting tool calls altogether: the only tool_use in this flow
+	// is the truncated mock_tool, and InternalOnly suppression means zero
+	// OnToolResult fires on the user-facing handler. If a future regression
+	// passes the synthetic result through, len(h.results) goes to 1 and
+	// this triggers immediately, even before the content-content guards
+	// below could match.
+	if len(h.results) != 0 {
+		t.Fatalf("expected zero OnToolResult calls (synthetic result must stay InternalOnly), got %d: %+v",
+			len(h.results), h.results)
+	}
+	for i, r := range h.results {
+		if strings.Contains(r.Content, "output_truncated") {
+			t.Errorf("handler.OnToolResult #%d leaked synthetic [output_truncated] to UI: %q",
+				i, r.Content)
+		}
+		if r.InternalOnly {
+			t.Errorf("handler.OnToolResult #%d received an InternalOnly result; should have been suppressed", i)
+		}
+	}
+}
+
+// Companion to TruncatedSyntheticResultNotPushedToHandler: pin that a
+// *non-truncated* tool call running alongside the truncated trailing one
+// still reaches the UI handler. Guards against an overly broad suppression
+// that would also swallow legitimate tool results.
+func TestAgentLoop_MaxTokens_NonTruncatedSiblingStillReachesHandler(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// Two tool calls in one assistant turn, stop_reason=max_tokens.
+			// The first (well-formed) must dispatch normally; the second
+			// (truncated args, only `path` not `content`) gets a synthetic
+			// InternalOnly result. Bypass nativeResponse helper because it
+			// only supports a single tool_use per response.
+			json.NewEncoder(w).Encode(client.CompletionResponse{
+				FinishReason: "max_tokens",
+				Usage:        client.Usage{InputTokens: 10, OutputTokens: 5},
+				ToolCalls: []client.FunctionCall{
+					{ID: "call_ok", Name: "mock_tool", Arguments: json.RawMessage(`{"path":"/tmp/a","content":"hi"}`)},
+					{ID: "call_bad", Name: "mock_tool", Arguments: json.RawMessage(`{"path":"/tmp/x"}`)},
+				},
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 20, 10))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	mt := &mockTool{name: "mock_tool", required: []string{"path", "content"}}
+	reg.Register(mt)
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	h := &collectingHandler{}
+	loop.SetHandler(h)
+
+	if _, _, err := loop.Run(context.Background(), "write two files", nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(h.results) != 1 {
+		t.Fatalf("expected exactly 1 OnToolResult call (the well-formed one); got %d: %+v",
+			len(h.results), h.results)
+	}
+	r := h.results[0]
+	if r.InternalOnly {
+		t.Errorf("well-formed tool result was incorrectly marked InternalOnly: %+v", r)
+	}
+	if strings.Contains(r.Content, "output_truncated") {
+		t.Errorf("well-formed tool result content unexpectedly contains synthetic prefix: %q", r.Content)
+	}
+}
+
 func TestAgentLoop_MaxTokens_TruncatedNativeCallPreservesToolUseID(t *testing.T) {
 	callCount := 0
 	var secondReq client.CompletionRequest
