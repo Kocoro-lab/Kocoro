@@ -5,6 +5,49 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>{{.Title}} · Kocoro</title>
+{{/* ========== SEO ========== */}}
+{{- if .Description}}
+<meta name="description" content="{{.Description}}">
+{{- end}}
+<meta name="author" content="{{.SiteName}}">
+
+{{/* ========== Open Graph (Slack / Teams / WeChat / Facebook / LinkedIn) ========== */}}
+<meta property="og:type" content="article">
+<meta property="og:title" content="{{.OGTitle}}">
+{{- if .Description}}
+<meta property="og:description" content="{{.Description}}">
+{{- end}}
+{{- if .OGImage}}
+<meta property="og:image" content="{{.OGImage}}">
+<meta property="og:image:alt" content="{{.OGTitle}}">
+{{- end}}
+<meta property="og:site_name" content="{{.SiteName}}">
+<meta property="og:locale" content="en_US">
+{{- if .CreatedAtISO}}
+<meta property="article:published_time" content="{{.CreatedAtISO}}">
+{{- end}}
+{{- if .GeneratedAtISO}}
+<meta property="article:modified_time" content="{{.GeneratedAtISO}}">
+{{- end}}
+
+{{/* ========== Twitter / X Card ========== */}}
+<meta name="twitter:card" content="{{if .OGImage}}summary_large_image{{else}}summary{{end}}">
+<meta name="twitter:title" content="{{.OGTitle}}">
+{{- if .Description}}
+<meta name="twitter:description" content="{{.Description}}">
+{{- end}}
+{{- if .OGImage}}
+<meta name="twitter:image" content="{{.OGImage}}">
+<meta name="twitter:image:alt" content="{{.OGTitle}}">
+{{- end}}
+
+{{/* ========== Favicon (sourced from kocoro.ai so the share file stays self-contained) ========== */}}
+{{- if .SiteURL}}
+<link rel="icon" type="image/x-icon" href="{{.SiteURL}}favicon.ico">
+{{- end}}
+
+{{/* ========== Structured data — schema.org Article, publisher = Kocoro ========== */}}
+<script type="application/ld+json">{{.JSONLD}}</script>
 <style>
   :root {
     color-scheme: light dark;

@@ -199,7 +199,20 @@ type DaemonConfig struct {
 	// share_progress events can flip this to false to keep the legacy
 	// synchronous contract until the UI ships. Per-request `?async=true|false`
 	// always wins over this default.
-	ShareAsyncDefault bool `mapstructure:"share_async_default" yaml:"share_async_default" json:"share_async_default"`
+	ShareAsyncDefault bool                `mapstructure:"share_async_default" yaml:"share_async_default" json:"share_async_default"`
+	ShareMetadata     ShareMetadataConfig `mapstructure:"share_metadata"      yaml:"share_metadata"      json:"share_metadata"`
+}
+
+// ShareMetadataConfig holds the social-meta defaults injected into the
+// session share HTML <head>. Empty fields fall back to either built-in
+// defaults (SiteName / SiteURL) or "skip emitting that tag" (DefaultOGImage
+// / LogoURL) — see internal/share.buildViewData and the share template for
+// the conditional rendering.
+type ShareMetadataConfig struct {
+	SiteName       string `mapstructure:"site_name"        yaml:"site_name"        json:"site_name"`
+	SiteURL        string `mapstructure:"site_url"         yaml:"site_url"         json:"site_url"`
+	DefaultOGImage string `mapstructure:"default_og_image" yaml:"default_og_image" json:"default_og_image"`
+	LogoURL        string `mapstructure:"logo_url"         yaml:"logo_url"         json:"logo_url"`
 }
 
 type SkillsConfig struct {
@@ -306,6 +319,17 @@ func Load() (*Config, error) {
 	viper.SetDefault("tools.server_tool_timeout", 5)
 	viper.SetDefault("daemon.auto_approve", false)
 	viper.SetDefault("daemon.share_async_default", true)
+	// Share HTML social-meta defaults. The default OG image is the same
+	// Kocoro logo asset used in the JSON-LD publisher.logo field — not
+	// the textbook 1200×630 OG ratio, but it lets share cards render
+	// with a brand mark today; swap for a purpose-built 1200×630 hero
+	// here when one ships. The share template intentionally omits the
+	// og:image:width/height hints so each platform measures the image
+	// itself rather than trusting a possibly-wrong static size.
+	viper.SetDefault("daemon.share_metadata.site_name", "Kocoro")
+	viper.SetDefault("daemon.share_metadata.site_url", "https://www.kocoro.ai/")
+	viper.SetDefault("daemon.share_metadata.default_og_image", "https://static.kocoro.ai/public/quTeFSunx6sZp_MXBBx50h_r9fhY39_tXyiKQJLHFF8/logo-1x.png")
+	viper.SetDefault("daemon.share_metadata.logo_url", "https://static.kocoro.ai/public/quTeFSunx6sZp_MXBBx50h_r9fhY39_tXyiKQJLHFF8/logo-1x.png")
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	viper.SetDefault("cloud.enabled", true)
 	viper.SetDefault("cloud.timeout", 3600)

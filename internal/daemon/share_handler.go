@@ -168,7 +168,10 @@ func (s *Server) handleSessionShare(w http.ResponseWriter, r *http.Request) {
 	// catches /Users/*/.shannon/... and /home/*/.shannon/... paths.
 	home, _ := os.UserHomeDir()
 
-	result, err := share.Render(r.Context(), s.deps.GW, sess, share.Options{HomeDir: home})
+	result, err := share.Render(r.Context(), s.deps.GW, sess, share.Options{
+		HomeDir:  home,
+		Metadata: shareMetadataFromConfig(cfg),
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("render share: %v", err))
 		return
