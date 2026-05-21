@@ -66,6 +66,12 @@ type Server struct {
 	suggestions  *agent.SuggestionState
 	migratePlans *claudecode.PlanStore
 
+	// auth manages the /local/auth/* email/password flow. May be nil on
+	// non-darwin platforms where Keychain is unavailable — handlers
+	// short-circuit to 503 in that case so the path stays observable in
+	// Desktop logs rather than silently 404-ing.
+	auth *AuthManager
+
 	// shareTasks tracks in-flight and recently-completed async share
 	// goroutines. Lifecycle:
 	//   1. POST /sessions/{id}/share spawns a goroutine, registers state here, returns 202+task_id
@@ -276,6 +282,64 @@ func (s *Server) SetOnReload(fn func()) {
 	s.onReload = fn
 }
 
+// SetAuth installs the AuthManager so /local/auth/* handlers can serve.
+// Nil is permitted (non-darwin platforms) — handlers respond 503.
+func (s *Server) SetAuth(a *AuthManager) {
+	s.auth = a
+}
+
+// RegisterAuthRoutes wires only the /local/auth/* endpoints onto mux.
+// Used by E2E tests that need a focused handler tree without the full
+// route surface (which would 500 on nil deps).
+func (s *Server) RegisterAuthRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /local/auth/state", s.handleAuthState)
+	mux.HandleFunc("POST /local/auth/register", s.handleAuthRegister)
+	mux.HandleFunc("POST /local/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("POST /local/auth/resend-verification", s.handleAuthResendVerification)
+	mux.HandleFunc("POST /local/auth/forgot-password", s.handleAuthForgotPassword)
+	mux.HandleFunc("POST /local/auth/sign-out", s.handleAuthSignOut)
+	mux.HandleFunc("POST /local/auth/sign-out-full", s.handleAuthSignOutFull)
+}
+
+// RebuildAuthSensitiveTools re-registers the gateway tools whose
+// construction captures cfg.APIKey by value (cloud_delegate,
+// publish_to_web, list_my_published_files, retract_published_file,
+// generate_image, edit_image). The AuthManager calls this after a key
+// change so sign-out invalidates these tools (cfg.APIKey == "" causes
+// the Register* helpers to skip) and login re-arms them with the new
+// key.
+//
+// This is intentionally a narrow rebuild — it does NOT reload yaml or
+// touch MCP / local tools, which keeps the path safe to call repeatedly
+// without disturbing in-flight agent runs that hold concurrent reads on
+// the local-tool subset.
+func (s *Server) RebuildAuthSensitiveTools(_ context.Context) {
+	if s == nil || s.deps == nil || s.deps.Registry == nil || s.deps.GW == nil {
+		return
+	}
+	cfg := s.deps.Config
+	if cfg == nil {
+		return
+	}
+	reg := s.deps.Registry
+	for _, name := range []string{
+		"cloud_delegate",
+		"publish_to_web",
+		"list_my_published_files",
+		"retract_published_file",
+		"generate_image",
+		"edit_image",
+	} {
+		reg.Remove(name)
+	}
+	tools.RegisterCloudDelegate(reg, s.deps.GW, cfg, nil, "", "")
+	tools.RegisterPublishTool(reg, s.deps.GW, cfg)
+	tools.RegisterListPublishedFilesTool(reg, s.deps.GW, cfg)
+	tools.RegisterRetractPublishedFileTool(reg, s.deps.GW, cfg)
+	tools.RegisterGenerateImageTool(reg, s.deps.GW, cfg)
+	tools.RegisterEditImageTool(reg, s.deps.GW, cfg)
+}
+
 // registerRoutes wires every HTTP handler onto mux. Extracted from Start so
 // offline tests (test/e2e/suggestion_test.go) can build a mux without
 // listening on a port or spinning up memSvc / sync ticker. Production Start
@@ -381,6 +445,18 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /chrome/hide", s.handleChromeHide)
 	mux.HandleFunc("POST /migrate/claude-code/preview", s.handleClaudeMigratePreview)
 	mux.HandleFunc("POST /migrate/claude-code/apply", s.handleClaudeMigrateApply)
+
+	// /local/auth/* — email/password authentication endpoints for the
+	// Kocoro Desktop UI. macOS-only; on other platforms s.auth is nil
+	// and the handlers return 503 platform_unsupported.
+	mux.HandleFunc("GET /local/auth/state", s.handleAuthState)
+	mux.HandleFunc("POST /local/auth/register", s.handleAuthRegister)
+	mux.HandleFunc("POST /local/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("POST /local/auth/resend-verification", s.handleAuthResendVerification)
+	mux.HandleFunc("POST /local/auth/forgot-password", s.handleAuthForgotPassword)
+	mux.HandleFunc("POST /local/auth/sign-out", s.handleAuthSignOut)
+	mux.HandleFunc("POST /local/auth/sign-out-full", s.handleAuthSignOutFull)
+
 	mux.HandleFunc("POST /shutdown", s.handleShutdown)
 }
 
@@ -4207,9 +4283,34 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]interface{}{"status": "reloaded"}
-	if oldCfg != nil && (oldCfg.Endpoint != newCfg.Endpoint || oldCfg.APIKey != newCfg.APIKey) {
+	// Endpoint change ALWAYS needs a restart — AuthClient.baseURL and the
+	// WS dialer URL are captured at construction and cannot be swapped
+	// in place today.
+	//
+	// api_key change needs a restart ONLY when there is no AuthManager
+	// running the live key rotation:
+	//   - On macOS with AuthManager installed: sign-in/sign-out/Bootstrap
+	//     call applyAPIKey which propagates the new key to GatewayClient
+	//     and WS Client at runtime. yaml api_key field is also irrelevant
+	//     because v1 migration has moved it into Keychain. Mutating yaml's
+	//     api_key on this path is a no-op for in-process state, and
+	//     surfacing restart_required to Desktop made it chain a /shutdown
+	//     after every sign-out (the "Bug 2" reported 2026-05-20).
+	//   - On non-darwin / AuthManager-absent path: reload does NOT push
+	//     newCfg.APIKey into GatewayClient (captured value), so a yaml
+	//     api_key edit really does need a restart to take effect.
+	needsRestart := false
+	var reason string
+	if oldCfg != nil && oldCfg.Endpoint != newCfg.Endpoint {
+		needsRestart = true
+		reason = "endpoint changed — restart daemon to apply"
+	} else if oldCfg != nil && oldCfg.APIKey != newCfg.APIKey && s.auth == nil {
+		needsRestart = true
+		reason = "api_key changed in yaml (legacy path) — restart daemon to apply"
+	}
+	if needsRestart {
 		resp["restart_required"] = true
-		resp["restart_reason"] = "endpoint or api_key changed — restart daemon to apply"
+		resp["restart_reason"] = reason
 	}
 
 	// MCP server status for UI indicators

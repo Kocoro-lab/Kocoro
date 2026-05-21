@@ -9,10 +9,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
 	"golang.org/x/term"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
 )
 
 const DefaultEndpoint = "https://api-dev.shannon.run"
@@ -22,15 +25,38 @@ const (
 	hintLocal = "Running locally? See https://github.com/Kocoro-lab/Shannon for self-hosting docs."
 )
 
+// keychainStoreOpener returns the Keychain store used by setup-time
+// codepaths (NeedsSetup probe, setupGateway api_key persist). Production
+// uses keychain.NewOSStore which talks to macOS Keychain; tests replace
+// this with an in-memory backend to avoid polluting the developer's
+// real Keychain.
+//
+// Returns nil-Store + non-nil-err on non-darwin (ErrUnsupportedPlatform)
+// so callers can short-circuit cleanly.
+var keychainStoreOpener = func() (*keychain.Store, error) {
+	return keychain.NewOSStore(nil)
+}
+
 // NeedsSetup returns true if the config has no API key and the endpoint
 // is not a local address (localhost/127.0.0.1 bypass auth).
 // Ollama provider never needs gateway setup.
+//
+// On macOS we ALSO consider a Keychain api_key as "configured" so users
+// who logged in via Kocoro Desktop (/local/auth/login) are not re-prompted
+// to paste a key in `shan --setup` on the next CLI invocation.
 func NeedsSetup(cfg *Config) bool {
 	if cfg.Provider == "ollama" {
 		return cfg.Ollama.Model == "" // model required for ollama to be usable
 	}
 	if cfg.APIKey != "" {
 		return false
+	}
+	if runtime.GOOS == "darwin" {
+		if store, err := keychainStoreOpener(); err == nil {
+			if k, _ := store.GetAPIKey(); k != "" {
+				return false
+			}
+		}
 	}
 	return !isLocalEndpoint(cfg.Endpoint)
 }
@@ -135,6 +161,22 @@ func setupGateway(cfg *Config, in io.Reader, reader *bufio.Reader, out io.Writer
 
 		fmt.Fprintln(out, "OK")
 		break
+	}
+
+	// On macOS, route the pasted api_key into the Keychain "legacy" account
+	// so AuthManager.Bootstrap can adopt it (resolve user_id via /auth/me,
+	// rename the entry). Clear cfg.APIKey so it does not end up in yaml.
+	// Other platforms continue to persist cfg.APIKey to yaml (legacy path).
+	if runtime.GOOS == "darwin" && cfg.APIKey != "" {
+		if store, err := keychainStoreOpener(); err == nil {
+			if err := store.Write(keychain.ServiceDaemonAPIKey, keychain.AccountLegacy, cfg.APIKey); err == nil {
+				_ = store.Write(keychain.ServiceDaemonState, keychain.AccountCurrentUser, keychain.AccountLegacy)
+				cfg.APIKey = ""
+				fmt.Fprintln(out, "API key stored in macOS Keychain (ai.kocoro.daemon.api_key).")
+			} else {
+				fmt.Fprintf(out, "Warning: could not write keychain (%v); falling back to yaml plaintext.\n", err)
+			}
+		}
 	}
 
 	return nil

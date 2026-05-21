@@ -907,7 +907,6 @@ type TaskStatusResponse struct {
 
 type GatewayClient struct {
 	baseURL    string
-	apiKey     string
 	httpClient *http.Client
 
 	// streamIdleTimeout abort the CompleteStream SSE body when no chunk has
@@ -920,6 +919,13 @@ type GatewayClient struct {
 	// while requests are in flight) is NOT safe and NOT currently supported.
 	// If a future caller needs hot-reload semantics, switch this to atomic.Int64.
 	streamIdleTimeout time.Duration
+
+	// keyMu / apiKey support hot-swapping the X-API-Key header on
+	// sign-in / sign-out / WS-401 paths. AuthManager (internal/daemon/auth)
+	// owns the writes via SetAPIKey; all header sites read through
+	// getAPIKey() under an RLock.
+	keyMu  sync.RWMutex
+	apiKey string
 }
 
 func NewGatewayClient(baseURL, apiKey string) *GatewayClient {
@@ -951,6 +957,26 @@ func (c *GatewayClient) SetStreamIdleTimeout(d time.Duration) { c.streamIdleTime
 // disabled. Used by callers (e.g. agent loop) to format diagnostic messages.
 func (c *GatewayClient) StreamIdleTimeout() time.Duration { return c.streamIdleTimeout }
 
+// SetAPIKey swaps the api_key used for the X-API-Key header on subsequent
+// requests. Called by AuthManager on login (key bootstrap), sign-out
+// (key cleared), and WS 401 recovery. Concurrent in-flight Complete /
+// upload / image calls already captured the previous value via getAPIKey
+// at request-construction time and finish on the previous key.
+func (c *GatewayClient) SetAPIKey(key string) {
+	c.keyMu.Lock()
+	c.apiKey = key
+	c.keyMu.Unlock()
+}
+
+// getAPIKey returns the current api_key under read lock. All header-setting
+// sites use this so SetAPIKey can swap atomically without producing a torn
+// read mid-request.
+func (c *GatewayClient) getAPIKey() string {
+	c.keyMu.RLock()
+	defer c.keyMu.RUnlock()
+	return c.apiKey
+}
+
 // Complete sends a completion request to the gateway's /v1/completions endpoint.
 // This endpoint is a thin proxy to the LLM service that returns raw function_call
 // responses for client-side tool execution.
@@ -966,8 +992,8 @@ func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*C
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("X-API-Key", c.apiKey)
+	if key := c.getAPIKey(); key != "" {
+		httpReq.Header.Set("X-API-Key", key)
 	}
 
 	resp, err := c.httpClient.Do(httpReq)
@@ -1012,8 +1038,8 @@ func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionReques
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
-	if c.apiKey != "" {
-		httpReq.Header.Set("X-API-Key", c.apiKey)
+	if key := c.getAPIKey(); key != "" {
+		httpReq.Header.Set("X-API-Key", key)
 	}
 
 	resp, err := c.httpClient.Do(httpReq)
@@ -1242,8 +1268,8 @@ func (c *GatewayClient) SubmitTaskStream(ctx context.Context, req TaskRequest) (
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("X-API-Key", c.apiKey)
+	if key := c.getAPIKey(); key != "" {
+		httpReq.Header.Set("X-API-Key", key)
 	}
 
 	resp, err := c.httpClient.Do(httpReq)
@@ -1276,8 +1302,8 @@ func (c *GatewayClient) GetTask(ctx context.Context, taskID string) (*TaskStatus
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -1310,8 +1336,8 @@ func (c *GatewayClient) ApproveReviewPlan(ctx context.Context, workflowID string
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -1341,8 +1367,8 @@ func (c *GatewayClient) Health(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -1419,8 +1445,8 @@ func (c *GatewayClient) ListTools(ctx context.Context) ([]ServerToolSchema, erro
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -1457,8 +1483,8 @@ func (c *GatewayClient) ExecuteTool(ctx context.Context, name string, arguments 
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -1527,8 +1553,8 @@ func (c *GatewayClient) SyncSessions(ctx context.Context, batch SyncBatchRequest
 		return SyncBatchResponse{}, fmt.Errorf("build sync request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("X-API-Key", c.apiKey)
+	if key := c.getAPIKey(); key != "" {
+		httpReq.Header.Set("X-API-Key", key)
 	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {

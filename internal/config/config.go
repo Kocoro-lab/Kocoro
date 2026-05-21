@@ -371,6 +371,15 @@ func Load() (*Config, error) {
 	}
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 
+	// KOCORO_ENDPOINT env var overrides the yaml endpoint. Useful when an
+	// external process (e.g. the macOS Desktop app's launch logic) keeps
+	// resetting `endpoint` in config.yaml on every boot — exporting this
+	// env var locks the daemon to a chosen Cloud URL regardless of yaml
+	// state. Empty / unset env = no override (yaml wins as before).
+	if override := strings.TrimSpace(os.Getenv("KOCORO_ENDPOINT")); override != "" {
+		cfg.Endpoint = override
+	}
+
 	// Re-read MCP servers directly from YAML to preserve env var key casing.
 	// Viper lowercases all map keys which breaks env vars like API_KEY → api_key.
 	globalFile := filepath.Join(dir, "config.yaml")
