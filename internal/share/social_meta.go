@@ -157,13 +157,17 @@ func buildJSONLD(d viewData, in RenderInput) template.JS {
 	if d.OGImage != "" {
 		doc["image"] = d.OGImage
 	}
-	if in.Session != nil {
-		if !in.Session.CreatedAt.IsZero() {
-			doc["dateCreated"] = d.CreatedAtISO
-			doc["datePublished"] = d.CreatedAtISO
-		}
+	if in.Session != nil && !in.Session.CreatedAt.IsZero() {
+		// dateCreated tracks when the underlying conversation began
+		// (schema.org: "the date on which the CreativeWork was created").
+		doc["dateCreated"] = d.CreatedAtISO
 	}
 	if !in.GeneratedAt.IsZero() {
+		// datePublished is when the resource first became public — for a
+		// session share that's when the HTML was rendered, NOT the session
+		// creation time (which is dateCreated above). Pairs with
+		// dateModified since each share is a single immutable snapshot.
+		doc["datePublished"] = d.GeneratedAtISO
 		doc["dateModified"] = d.GeneratedAtISO
 	}
 
