@@ -31,13 +31,13 @@
 {{- end}}
 
 {{/* ========== Twitter / X Card ========== */}}
-<meta name="twitter:card" content="{{if .OGImage}}summary_large_image{{else}}summary{{end}}">
+<meta name="twitter:card" content="{{if .TwitterImage}}summary_large_image{{else}}summary{{end}}">
 <meta name="twitter:title" content="{{.OGTitle}}">
 {{- if .Description}}
 <meta name="twitter:description" content="{{.Description}}">
 {{- end}}
-{{- if .OGImage}}
-<meta name="twitter:image" content="{{.OGImage}}">
+{{- if .TwitterImage}}
+<meta name="twitter:image" content="{{.TwitterImage}}">
 <meta name="twitter:image:alt" content="{{.OGTitle}}">
 {{- end}}
 

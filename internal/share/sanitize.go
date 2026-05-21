@@ -93,7 +93,12 @@ type ShareMetadata struct {
 	SiteName       string
 	SiteURL        string
 	DefaultOGImage string
-	LogoURL        string
+	// TwitterImage, when non-empty, takes precedence over DefaultOGImage for
+	// the twitter:image tag. Lets operators ship a 1200×630 wide hero for
+	// Twitter while keeping a square brand mark for og:image (which Slack /
+	// Teams / Facebook render fine).
+	TwitterImage string
+	LogoURL      string
 }
 
 // Sanitize returns a filtered copy of messages + meta safe to publish:

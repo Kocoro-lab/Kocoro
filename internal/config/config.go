@@ -212,7 +212,13 @@ type ShareMetadataConfig struct {
 	SiteName       string `mapstructure:"site_name"        yaml:"site_name"        json:"site_name"`
 	SiteURL        string `mapstructure:"site_url"         yaml:"site_url"         json:"site_url"`
 	DefaultOGImage string `mapstructure:"default_og_image" yaml:"default_og_image" json:"default_og_image"`
-	LogoURL        string `mapstructure:"logo_url"         yaml:"logo_url"         json:"logo_url"`
+	// TwitterImage overrides DefaultOGImage specifically for the
+	// twitter:image meta tag. Twitter's summary_large_image card wants a
+	// 1.91:1 wide image; Facebook / LinkedIn / Slack / Teams render
+	// reasonable thumbnails from a square logo, so the two are kept
+	// independently configurable. Empty → falls back to DefaultOGImage.
+	TwitterImage string `mapstructure:"twitter_image"    yaml:"twitter_image"    json:"twitter_image"`
+	LogoURL      string `mapstructure:"logo_url"         yaml:"logo_url"         json:"logo_url"`
 }
 
 type SkillsConfig struct {
@@ -329,6 +335,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("daemon.share_metadata.site_name", "Kocoro")
 	viper.SetDefault("daemon.share_metadata.site_url", "https://www.kocoro.ai/")
 	viper.SetDefault("daemon.share_metadata.default_og_image", "https://static.kocoro.ai/public/Po09_46rjwAQoLhAvp-m52HNUCcViv6dx_uMiuUAzr4/logo-3x.png")
+	viper.SetDefault("daemon.share_metadata.twitter_image", "https://static.kocoro.ai/public/cmrsQzsDWCJ3pGC989VtOQutwUeE1IQyTsGMJfSBjIk/kocoro-og-1200x630.png")
 	viper.SetDefault("daemon.share_metadata.logo_url", "https://static.kocoro.ai/public/quTeFSunx6sZp_MXBBx50h_r9fhY39_tXyiKQJLHFF8/logo-1x.png")
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	viper.SetDefault("cloud.enabled", true)

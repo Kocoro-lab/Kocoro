@@ -346,6 +346,7 @@ func shareMetadataFromConfig(cfg *config.Config) share.ShareMetadata {
 		SiteName:       m.SiteName,
 		SiteURL:        m.SiteURL,
 		DefaultOGImage: m.DefaultOGImage,
+		TwitterImage:   m.TwitterImage,
 		LogoURL:        m.LogoURL,
 	}
 }

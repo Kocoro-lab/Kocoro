@@ -561,6 +561,69 @@ func TestRenderHTML_OGImageOptional(t *testing.T) {
 	})
 }
 
+// TestRenderHTML_TwitterImageOverridesOGImage covers the dual-image setup:
+// a square brand mark for og:image (which Slack / Teams / Facebook /
+// LinkedIn unfurl well as a thumbnail) plus a 1200×630 wide hero for
+// twitter:image (what summary_large_image cards actually want). The two
+// meta tags must point at different URLs without affecting each other.
+func TestRenderHTML_TwitterImageOverridesOGImage(t *testing.T) {
+	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
+	input := RenderInput{
+		Session:  sess,
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
+		Summary:  "Quick recap.",
+		Metadata: ShareMetadata{
+			SiteName:       "Kocoro",
+			SiteURL:        "https://www.kocoro.ai/",
+			DefaultOGImage: "https://static.kocoro.ai/square.png",
+			TwitterImage:   "https://static.kocoro.ai/wide-1200x630.png",
+		},
+	}
+	html, err := RenderHTML(input)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	out := string(html)
+	mustContain(t, out, `<meta property="og:image" content="https://static.kocoro.ai/square.png">`)
+	mustContain(t, out, `<meta name="twitter:image" content="https://static.kocoro.ai/wide-1200x630.png">`)
+	mustContain(t, out, `<meta name="twitter:card" content="summary_large_image">`)
+	// And the cross-contamination guard: og:image must NOT carry the wide
+	// Twitter URL, and twitter:image must NOT carry the square URL.
+	if strings.Contains(out, `property="og:image" content="https://static.kocoro.ai/wide-1200x630.png"`) {
+		t.Fatalf("og:image incorrectly received the TwitterImage URL")
+	}
+	if strings.Contains(out, `name="twitter:image" content="https://static.kocoro.ai/square.png"`) {
+		t.Fatalf("twitter:image incorrectly received the DefaultOGImage URL")
+	}
+}
+
+// TestRenderHTML_TwitterImageFallsBackToOGImage pins the back-compat
+// fallback: a caller that only sets DefaultOGImage (the pre-split-image
+// API) still gets a working twitter:image. Without this fallback the
+// split would silently break every existing yaml config that only knows
+// about the older single-image knob.
+func TestRenderHTML_TwitterImageFallsBackToOGImage(t *testing.T) {
+	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
+	input := RenderInput{
+		Session:  sess,
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("hi")}},
+		Summary:  "Quick recap.",
+		Metadata: ShareMetadata{
+			SiteName:       "Kocoro",
+			SiteURL:        "https://www.kocoro.ai/",
+			DefaultOGImage: "https://static.kocoro.ai/only-one.png",
+			// TwitterImage intentionally omitted
+		},
+	}
+	html, err := RenderHTML(input)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	out := string(html)
+	mustContain(t, out, `<meta property="og:image" content="https://static.kocoro.ai/only-one.png">`)
+	mustContain(t, out, `<meta name="twitter:image" content="https://static.kocoro.ai/only-one.png">`)
+}
+
 // TestRenderHTML_OGTitleEscaping defends against a Haiku-generated or user-
 // authored title that contains `"`, `<`, `>`, `&`, or even a literal
 // `</script>` from breaking out of the meta content="…" attribute or the

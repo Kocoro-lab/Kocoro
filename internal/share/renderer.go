@@ -88,13 +88,14 @@ type viewData struct {
 	// non-empty value so a Description = "" silently omits both
 	// <meta name="description"> and og:description / twitter:description,
 	// rather than emitting empty content="" attributes that crawlers warn on.
-	Description string      // ≤150 runes, plain text, no markdown
-	OGTitle     string      // ≤60 runes, ellipsis-truncated
-	OGImage     string      // absolute URL; empty → no og:image / twitter:image
-	SiteName    string      // "Kocoro" by default
-	SiteURL     string      // "https://www.kocoro.ai/" by default, trailing slash preserved for favicon concat
-	LogoURL     string      // JSON-LD publisher.logo; empty → publisher.logo omitted
-	JSONLD      template.JS // pre-marshaled application/ld+json body; template emits as-is
+	Description  string      // ≤150 runes, plain text, no markdown
+	OGTitle      string      // ≤60 runes, ellipsis-truncated
+	OGImage      string      // absolute URL for og:image; empty → no og:image
+	TwitterImage string      // absolute URL for twitter:image; empty → no twitter:image
+	SiteName     string      // "Kocoro" by default
+	SiteURL      string      // "https://www.kocoro.ai/" by default, trailing slash preserved for favicon concat
+	LogoURL      string      // JSON-LD publisher.logo; empty → publisher.logo omitted
+	JSONLD       template.JS // pre-marshaled application/ld+json body; template emits as-is
 }
 
 // viewMessage represents a single rendered message card. Role drives the
@@ -194,6 +195,15 @@ func buildViewData(in RenderInput) viewData {
 	}
 	description := truncateOGDescription(buildShareDescription(summaryBody, sess.Title, in.Messages))
 
+	ogImage := strings.TrimSpace(in.Metadata.DefaultOGImage)
+	// twitter:image falls back to og:image when not overridden, so a
+	// caller that only configures DefaultOGImage still gets Twitter
+	// previews from the same asset.
+	twitterImage := strings.TrimSpace(in.Metadata.TwitterImage)
+	if twitterImage == "" {
+		twitterImage = ogImage
+	}
+
 	d := viewData{
 		Lang:           "en",
 		Title:          pageTitle,
@@ -207,7 +217,8 @@ func buildViewData(in RenderInput) viewData {
 		Messages:       rendered,
 		Description:    description,
 		OGTitle:        truncateOGTitle(pageTitle),
-		OGImage:        strings.TrimSpace(in.Metadata.DefaultOGImage),
+		OGImage:        ogImage,
+		TwitterImage:   twitterImage,
 		SiteName:       siteName,
 		SiteURL:        siteURL,
 		LogoURL:        strings.TrimSpace(in.Metadata.LogoURL),
