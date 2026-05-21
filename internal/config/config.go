@@ -328,7 +328,7 @@ func Load() (*Config, error) {
 	// itself rather than trusting a possibly-wrong static size.
 	viper.SetDefault("daemon.share_metadata.site_name", "Kocoro")
 	viper.SetDefault("daemon.share_metadata.site_url", "https://www.kocoro.ai/")
-	viper.SetDefault("daemon.share_metadata.default_og_image", "https://static.kocoro.ai/public/quTeFSunx6sZp_MXBBx50h_r9fhY39_tXyiKQJLHFF8/logo-1x.png")
+	viper.SetDefault("daemon.share_metadata.default_og_image", "https://static.kocoro.ai/public/Po09_46rjwAQoLhAvp-m52HNUCcViv6dx_uMiuUAzr4/logo-3x.png")
 	viper.SetDefault("daemon.share_metadata.logo_url", "https://static.kocoro.ai/public/quTeFSunx6sZp_MXBBx50h_r9fhY39_tXyiKQJLHFF8/logo-1x.png")
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	viper.SetDefault("cloud.enabled", true)
