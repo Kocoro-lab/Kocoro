@@ -3,6 +3,8 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
+	"io"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -69,6 +71,9 @@ func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAuth(w) {
 		return
 	}
+	if !requireAuthJSON(w, r) {
+		return
+	}
 	var req authRegisterReq
 	if !decodeAuthBody(w, r, &req) {
 		return
@@ -92,6 +97,9 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAuth(w) {
 		return
 	}
+	if !requireAuthJSON(w, r) {
+		return
+	}
 	var req authLoginReq
 	if !decodeAuthBody(w, r, &req) {
 		return
@@ -109,8 +117,13 @@ func (s *Server) handleAuthResendVerification(w http.ResponseWriter, r *http.Req
 	if !s.requireAuth(w) {
 		return
 	}
+	if !requireAuthJSON(w, r) {
+		return
+	}
 	var req authResendReq
-	_ = json.NewDecoder(r.Body).Decode(&req) // empty body is permitted
+	if !decodeOptionalAuthBody(w, r, &req) {
+		return
+	}
 	if err := s.auth.ResendVerification(r.Context(), strings.TrimSpace(req.Email), strings.TrimSpace(req.Language)); err != nil {
 		writeAuthError(w, err)
 		return
@@ -119,9 +132,12 @@ func (s *Server) handleAuthResendVerification(w http.ResponseWriter, r *http.Req
 }
 
 // handleAuthForgotPassword — POST /local/auth/forgot-password.
-// Anti-enumeration: always 200, regardless of email existence.
+// Cloud owns anti-enumeration semantics; daemon forwards Cloud's response.
 func (s *Server) handleAuthForgotPassword(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAuth(w) {
+		return
+	}
+	if !requireAuthJSON(w, r) {
 		return
 	}
 	var req authForgotReq
@@ -135,10 +151,13 @@ func (s *Server) handleAuthForgotPassword(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]bool{"sent": true})
 }
 
-// handleAuthSignOut — POST /local/auth/sign-out. Preserves Keychain
-// api_key so the user can re-login without re-typing credentials.
+// handleAuthSignOut — POST /local/auth/sign-out. Preserves the per-user
+// Keychain api_key but clears the active user pointer.
 func (s *Server) handleAuthSignOut(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAuth(w) {
+		return
+	}
+	if !requireAuthJSON(w, r) {
 		return
 	}
 	s.auth.SignOut(r.Context(), false /* clearKeychain */)
@@ -149,6 +168,9 @@ func (s *Server) handleAuthSignOut(w http.ResponseWriter, r *http.Request) {
 // Keychain api_key too. Use for "switch account" flows.
 func (s *Server) handleAuthSignOutFull(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAuth(w) {
+		return
+	}
+	if !requireAuthJSON(w, r) {
 		return
 	}
 	s.auth.SignOut(r.Context(), true /* clearKeychain */)
@@ -175,6 +197,35 @@ func decodeAuthBody(w http.ResponseWriter, r *http.Request, out any) bool {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_request",
 			"message": err.Error(),
+		})
+		return false
+	}
+	return true
+}
+
+func decodeOptionalAuthBody(w http.ResponseWriter, r *http.Request, out any) bool {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_request",
+			"message": err.Error(),
+		})
+		return false
+	}
+	return true
+}
+
+func requireAuthJSON(w http.ResponseWriter, r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if ct == "" || err != nil || mediaType != "application/json" {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{
+			"error":   "unsupported_media_type",
+			"message": "Auth POST requests must use Content-Type: application/json.",
 		})
 		return false
 	}

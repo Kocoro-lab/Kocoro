@@ -184,9 +184,10 @@ func (s *Store) RenameLegacy(realUserID string) error {
 	return nil
 }
 
-// DeleteAPIKey removes the api_key for the current user but preserves
-// current_user_id (used by sign-out so users can sign back in without
-// re-typing email). Idempotent.
+// DeleteAPIKey removes the api_key for the current active user but preserves
+// current_user_id. Callers that want a full sign-out should call
+// ClearActiveUser after this, because clearing first loses the account name
+// needed to delete the key entry. Idempotent.
 func (s *Store) DeleteAPIKey() error {
 	userID, err := s.CurrentUserID()
 	if err != nil {

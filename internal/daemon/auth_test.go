@@ -287,8 +287,30 @@ func TestAuthManager_SignOut_PreservesKeychain(t *testing.T) {
 	if f.gw.APIKey() != "" {
 		t.Fatalf("gateway api key should be cleared, got %q", f.gw.APIKey())
 	}
-	if k, _ := f.keychain.GetAPIKey(); k != "sk_test" {
+	if u, _ := f.keychain.CurrentUserID(); u != "" {
+		t.Fatalf("current_user_id should be cleared, got %q", u)
+	}
+	if k, _ := f.keychain.GetAPIKey(); k != "" {
+		t.Fatalf("active key should be unavailable after sign-out, got %q", k)
+	}
+	if k, _ := f.keychain.Read(keychain.ServiceDaemonAPIKey, "user-1"); k != "sk_test" {
 		t.Fatalf("keychain key should be preserved, got %q", k)
+	}
+}
+
+func TestAuthManager_SignOut_DoesNotBootstrapOnRestart(t *testing.T) {
+	f := newAuthFixture(t)
+	_ = f.keychain.SetAPIKey("user-1", "sk_test")
+	f.manager.setState(AuthStateSignedIn, &client.AuthUser{ID: "user-1", Email: "a@b.c"}, "")
+
+	f.manager.SignOut(context.Background(), false /* clearKeychain */)
+	f.manager.Bootstrap(context.Background())
+
+	if s := f.manager.State(); s != AuthStateSignedOut {
+		t.Fatalf("state=%q want signed_out", s)
+	}
+	if k, _ := f.keychain.Read(keychain.ServiceDaemonAPIKey, "user-1"); k != "sk_test" {
+		t.Fatalf("preserved key=%q", k)
 	}
 }
 

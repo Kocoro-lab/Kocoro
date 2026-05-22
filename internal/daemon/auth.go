@@ -440,9 +440,11 @@ func (a *AuthManager) ForgotPassword(ctx context.Context, email, language string
 }
 
 // SignOut tears down the in-memory session. When clearKeychain is false
-// the api_key is preserved so the user can sign back in without re-typing
-// credentials (Login will re-affirm). When clearKeychain is true (the
-// /sign-out-full endpoint) the Keychain entry is removed too.
+// the per-user api_key entry is preserved, but current_user_id is cleared
+// so the next daemon startup does not silently bootstrap back into signed_in.
+// A later Login can still reuse the preserved key after Cloud returns the
+// user_id. When clearKeychain is true (/sign-out-full), the active api_key
+// entry is removed before current_user_id is cleared.
 func (a *AuthManager) SignOut(ctx context.Context, clearKeychain bool) {
 	if a.kc == nil {
 		return
@@ -455,8 +457,8 @@ func (a *AuthManager) SignOut(ctx context.Context, clearKeychain bool) {
 	a.applyAPIKey(ctx, "")
 	if clearKeychain {
 		_ = a.kc.DeleteAPIKey()
-		_ = a.kc.ClearActiveUser()
 	}
+	_ = a.kc.ClearActiveUser()
 	a.setState(AuthStateSignedOut, nil, "")
 }
 

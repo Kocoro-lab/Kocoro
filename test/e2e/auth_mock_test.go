@@ -129,6 +129,9 @@ func (am *authMux) do(t *testing.T, method, path string, body any) *httptest.Res
 		rdr = bytes.NewReader(b)
 	}
 	req := httptest.NewRequest(method, path, rdr)
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	w := httptest.NewRecorder()
 	am.mux.ServeHTTP(w, req)
 	return w
@@ -202,13 +205,19 @@ func TestAuthMock_RegisterToLogin_FullFlow(t *testing.T) {
 		t.Fatalf("state body=%s", w.Body.String())
 	}
 
-	// 6) Sign-out preserves Keychain
+	// 6) Sign-out clears the active session but preserves the per-user key
 	w = am.do(t, "POST", "/local/auth/sign-out", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("sign-out status=%d", w.Code)
 	}
-	if k, _ := am.keychain.GetAPIKey(); k != "sk_minted" {
-		t.Fatalf("sign-out should preserve keychain, got %q", k)
+	if u, _ := am.keychain.CurrentUserID(); u != "" {
+		t.Fatalf("sign-out should clear active user, got %q", u)
+	}
+	if k, _ := am.keychain.GetAPIKey(); k != "" {
+		t.Fatalf("sign-out should clear active key, got %q", k)
+	}
+	if k, _ := am.keychain.Read(keychain.ServiceDaemonAPIKey, "user-1"); k != "sk_minted" {
+		t.Fatalf("sign-out should preserve per-user key, got %q", k)
 	}
 	if am.gw.APIKey() != "" {
 		t.Fatalf("sign-out should clear gateway api key, got %q", am.gw.APIKey())

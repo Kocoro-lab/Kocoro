@@ -87,6 +87,9 @@ func (hf *handlerFixture) do(t *testing.T, method, path string, body any) *httpt
 	} else {
 		req = httptest.NewRequest(method, path, nil)
 	}
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	w := httptest.NewRecorder()
 	// Dispatch by path — we only register the auth handlers in the test.
 	mux := http.NewServeMux()
@@ -227,6 +230,24 @@ func TestHandleAuthResendVerification_UsesPending(t *testing.T) {
 	}
 }
 
+func TestHandleAuthResendVerification_InvalidJSON(t *testing.T) {
+	hf := newHandlerFixture(t)
+	req := httptest.NewRequest("POST", "/local/auth/resend-verification", strings.NewReader("not json"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	hf.srv.handleAuthResendVerification(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d", w.Code)
+	}
+	var body map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if body["error"] != "invalid_request" {
+		t.Fatalf("error=%q body=%s", body["error"], w.Body.String())
+	}
+}
+
 func TestHandleAuthForgotPassword_AlwaysOK(t *testing.T) {
 	hf := newHandlerFixture(t)
 	hf.cloudOn("POST", "/api/v1/auth/forgot-password", http.StatusOK, nil)
@@ -245,8 +266,36 @@ func TestHandleAuthSignOut_PreservesKeychain(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d", w.Code)
 	}
-	if k, _ := hf.keychain.GetAPIKey(); k != "sk_test" {
+	if u, _ := hf.keychain.CurrentUserID(); u != "" {
+		t.Fatalf("sign-out should clear active user, got %q", u)
+	}
+	if k, _ := hf.keychain.GetAPIKey(); k != "" {
+		t.Fatalf("sign-out should clear active key, got %q", k)
+	}
+	if k, _ := hf.keychain.Read(keychain.ServiceDaemonAPIKey, "user-1"); k != "sk_test" {
 		t.Fatalf("sign-out should preserve keychain key, got %q", k)
+	}
+}
+
+func TestHandleAuthSignOut_RejectsSimplePost(t *testing.T) {
+	hf := newHandlerFixture(t)
+	_ = hf.keychain.SetAPIKey("user-1", "sk_test")
+	hf.manager.setState(AuthStateSignedIn, &client.AuthUser{ID: "user-1"}, "")
+	req := httptest.NewRequest("POST", "/local/auth/sign-out", nil)
+	w := httptest.NewRecorder()
+
+	hf.srv.handleAuthSignOut(w, req)
+
+	if w.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status=%d", w.Code)
+	}
+	var body map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if body["error"] != "unsupported_media_type" {
+		t.Fatalf("error=%q body=%s", body["error"], w.Body.String())
+	}
+	if k, _ := hf.keychain.GetAPIKey(); k != "sk_test" {
+		t.Fatalf("key should remain active after rejected request, got %q", k)
 	}
 }
 
@@ -282,10 +331,16 @@ func TestHandleAuthState_PlatformUnsupported(t *testing.T) {
 func TestHandleAuthRegister_InvalidJSON(t *testing.T) {
 	hf := newHandlerFixture(t)
 	req := httptest.NewRequest("POST", "/local/auth/register", strings.NewReader("not json"))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	hf.srv.handleAuthRegister(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d", w.Code)
+	}
+	var body map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if body["error"] != "invalid_request" {
+		t.Fatalf("error=%q body=%s", body["error"], w.Body.String())
 	}
 }
 
