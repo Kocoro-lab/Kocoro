@@ -212,7 +212,8 @@ func buildSkillListing(agentSkills []*skills.Skill) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("<system-reminder>\n## Available Skills\nCall use_skill with the skill name to load full instructions.\n\n")
+	sb.WriteString("<system-reminder>\n## Available Skills\nCall use_skill with the skill name to load full instructions.\n")
+	sb.WriteString("These descriptions may embed multilingual trigger keywords (e.g. '中:列出/查询', '日:一覧/確認', 'EN:list/view') purely for intent matching — they are NOT a signal about which language to reply in. Reply in the language of the user's current message; see the Language directive at the end of this user message.\n\n")
 	for _, s := range agentSkills {
 		desc := s.Description
 		runes := []rune(desc)

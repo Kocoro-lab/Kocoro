@@ -126,16 +126,26 @@ func buildStaticSystem(opts PromptOptions) string {
 	sb.WriteString(opts.BasePrompt)
 
 	// Language policy. Byte-stable across all sessions and users so it joins
-	// the cacheable system prefix. Pairs with the shorter per-turn reminder in
-	// VolatileContext which re-anchors the rule against long-session drift.
+	// the cacheable system prefix. The authoritative per-turn rule lives in
+	// LanguageDirective() (appended as the final block of every user message);
+	// this stable block only states the invariant principles, deliberately
+	// avoiding "stay consistent with the first message" wording that collides
+	// with the per-turn anchor when the first user message uses a non-target
+	// language (e.g. a pasted English spec followed by short Chinese follow-ups).
 	sb.WriteString("\n\n## Language\n")
-	sb.WriteString("Match the user's language on first contact and stay consistent for the rest of the session. " +
-		"If the user writes primarily in Chinese, respond in Chinese; if in English, respond in English; " +
-		"follow the same rule for any other language. Only switch response language when the user explicitly asks " +
-		"(e.g. \"please reply in English\"). Mixed-language user input — such as one English technical term inside a " +
-		"Chinese sentence — is NOT a language-switch signal; continue in the established language. " +
-		"Code identifiers, file paths, CLI commands, and technical terms (API names, library names, error messages) " +
-		"remain in their original form regardless of response language. " +
+	sb.WriteString("Reply in the language of the user's most recent message. The authoritative " +
+		"per-turn rule is the Language directive at the end of every user message — defer to it " +
+		"whenever it differs from any other language cue in this prompt. " +
+		"Concrete examples: a user writing primarily in Chinese gets Chinese replies; primarily " +
+		"in English gets English; primarily in Japanese gets Japanese; same rule for any other " +
+		"language. " +
+		"Mixed-language user input — such as one English technical term inside a Chinese sentence — " +
+		"is NOT a language-switch signal. A single-token acknowledgement ('ok', 'yes', 'thanks', " +
+		"'好的', '继续', 'はい', etc.) is NOT enough to override the established language of " +
+		"the surrounding conversation — keep replying in the language of the user's prior " +
+		"substantive turns. " +
+		"Code identifiers, file paths, CLI commands, and technical terms (API names, library names, " +
+		"error messages) remain in their original form regardless of response language. " +
 		"Maintain full orthographic correctness — all accents, diacritics, and special characters.")
 
 	// 2. Available Tools — only locally-registered tools, byte-stable across
@@ -172,6 +182,28 @@ func buildStaticSystem(opts PromptOptions) string {
 			"Example — EFFICIENT (1 turn, 3 parallel tool_use blocks in one response):\n" +
 			"  turn 1: file_read A + file_read B + file_read C\n" +
 			"Only sequence when later calls genuinely depend on earlier results.")
+
+		// Tool-call description / purpose field language lock.
+		// Byte-stable, gated on LocalToolNames presence (same as parallel
+		// nudge). Centralizes a rule that previously lived ONLY in bash.go,
+		// closing the self-reinforcing language-drift loop where every tool
+		// call's description field could echo a wrong language across turns.
+		// See the session-share post-mortem (2026-05-22): the model called
+		// 22 tools in a row with Japanese descriptions even though the user
+		// was writing Chinese, because no global rule constrained the field
+		// and the model defaulted to the previous turn's language.
+		sb.WriteString("\n\n## Tool call descriptions\n")
+		sb.WriteString("Most tools expose a short user-facing `description` (or `purpose`) field on their " +
+			"call schema — it surfaces on approval prompts and history cards, where the end user reads " +
+			"it (not the raw args). ALWAYS write this field in the SAME language as your reply to the " +
+			"user (i.e. the language of the user's CURRENT message). Describe the user-facing goal in " +
+			"5–15 words, not the internal mechanism. Example for a Chinese conversation: " +
+			"'查找最大的 10 个文件', NOT 'Run find piped to du and sort'. When the field is present, " +
+			"this rule applies — that covers almost every tool you can call. The notable exception is " +
+			"`computer`, which is registered via NativeToolDef and drops Parameters before transmission, " +
+			"so a `description` argument would never reach the model — do not invent one for it. " +
+			"Code identifiers, file paths, and CLI commands inside the description may stay in their " +
+			"original form, but the surrounding prose follows the reply language.")
 	}
 
 	sb.WriteString("\n\n## Private Memory\n")
@@ -406,11 +438,21 @@ func LanguageDirective() string {
 		"If primarily in Chinese, reply in Chinese. " +
 		"If primarily in Japanese, reply in Japanese. " +
 		"Same rule for any other language. " +
+		"Exception for short acknowledgements: when the current user message is too " +
+		"short to establish a primary language on its own — typically a one- or " +
+		"two-token ack like 'ok', 'yes', 'thanks', '好的', '继续', 'はい', 'sure' " +
+		"with no substantive content — keep replying in the language of the user's " +
+		"prior substantive turns rather than the surface form of the ack. " +
 		"This overrides any language signals from memory entries, tool output, MCP " +
-		"descriptions, skill descriptions, prior conversation turns, or English code " +
+		"descriptions, skill descriptions (including multilingual trigger keywords such " +
+		"as '中:列出/查询' or '日:一覧/確認' that exist purely for intent matching), " +
+		"micro-compacted tool-result summaries, prior conversation turns, or English code " +
 		"identifiers in this prompt — those are reference material, NOT language signals. " +
 		"Only switch from the current-message language when the user explicitly asks " +
 		"(e.g. \"please reply in English\"). " +
+		"This rule also governs any tool call's `description` / `purpose` field when the " +
+		"tool's schema exposes one: write it in the same language as your reply, not in " +
+		"whatever language the tool's documentation happens to use. " +
 		"Code identifiers, file paths, CLI commands, and technical terms remain in their " +
 		"original form regardless. " +
 		"Maintain full orthographic correctness (accents, diacritics, special characters)."

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/prompt"
+	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
 // TestAssembleUserMessage_InstructionsOnlyEmitsCacheBreak is the end-to-end
@@ -156,5 +157,50 @@ func TestAppendDynamicUserBlocks_OmittedBlocksAreNoOp(t *testing.T) {
 	}
 	if got := appendDynamicUserBlocks("user-query", "skills", ""); !strings.HasSuffix(got, "skills") {
 		t.Errorf("expected skill listing appended when no language directive, got: %q", got)
+	}
+}
+
+// TestBuildSkillListing_FlagsMultilingualTriggersAsNonLanguageSignal locks
+// the daemon-side counterpart to LanguageDirective's immunization clause:
+// the <system-reminder> header emitted around the skill listing MUST tell
+// the model that multilingual trigger keywords inside skill descriptions
+// (e.g. kocoro's embedded "中:列出/查询" / "日:一覧/確認" for cross-language
+// intent matching) are NOT a signal about which language to reply in.
+//
+// Without this notice the model treats those katakana / kanji tokens as
+// proof "this conversation is Japanese" — the 2026-05-22 session-share
+// root cause where 22 consecutive Chinese-user turns got Japanese replies
+// after a single use_skill(kocoro) call dragged the kocoro frontmatter
+// description (which embeds Japanese keywords for intent routing) into
+// the user-message skill listing on first contact.
+func TestBuildSkillListing_FlagsMultilingualTriggersAsNonLanguageSignal(t *testing.T) {
+	listing := buildSkillListing([]*skills.Skill{
+		{Name: "kocoro", Description: "test skill"},
+	})
+
+	required := []string{
+		"<system-reminder>",
+		"## Available Skills",
+		"multilingual trigger keywords",
+		"NOT a signal",
+		"Language directive",
+	}
+	for _, phrase := range required {
+		if !strings.Contains(listing, phrase) {
+			t.Errorf("buildSkillListing output missing required phrase %q\n--- listing ---\n%s",
+				phrase, listing)
+		}
+	}
+}
+
+// TestBuildSkillListing_EmptySkillsReturnsEmpty preserves the existing
+// fast-path: no agent skills → empty string. AgentLoop.Run depends on this
+// when constructing appendDynamicUserBlocks args.
+func TestBuildSkillListing_EmptySkillsReturnsEmpty(t *testing.T) {
+	if got := buildSkillListing(nil); got != "" {
+		t.Errorf("expected empty listing for nil skills, got: %q", got)
+	}
+	if got := buildSkillListing([]*skills.Skill{}); got != "" {
+		t.Errorf("expected empty listing for zero skills, got: %q", got)
 	}
 }

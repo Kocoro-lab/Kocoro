@@ -470,6 +470,146 @@ func TestLanguageDirective_HasImmunizationPhrases(t *testing.T) {
 	}
 }
 
+// TestLanguageDirective_CoversToolDescAndMicroCompact asserts the per-turn
+// directive immunizes against two sources that the 2026-05-22 session-share
+// post-mortem identified as drift vectors: (a) multilingual trigger keywords
+// embedded in skill descriptions for cross-language intent matching, and
+// (b) micro-compacted tool-result summaries the small-tier model produces.
+// Also asserts the directive explicitly governs the tool-call description /
+// purpose field — the 22-turn self-reinforcing-Japanese loop in that share
+// was driven by description fields drifting away from the user's language.
+func TestLanguageDirective_CoversToolDescAndMicroCompact(t *testing.T) {
+	block := LanguageDirective()
+
+	required := []string{
+		"multilingual trigger keywords",
+		"micro-compacted tool-result summaries",
+		"tool call's `description`",
+	}
+	for _, phrase := range required {
+		if !strings.Contains(block, phrase) {
+			t.Errorf("LanguageDirective() missing 2026-05-22 immunization phrase %q", phrase)
+		}
+	}
+}
+
+// TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present verifies the
+// static system prompt contains a top-level "## Tool call descriptions"
+// section that binds every tool's `description` / `purpose` field to the
+// user's current-message language. Companion to the per-turn directive
+// asserted by TestLanguageDirective_CoversToolDescAndMicroCompact — the
+// system-prompt section is the byte-stable cached statement of the rule,
+// the per-turn directive is the live re-anchor. Both must remain present.
+// Regression guard for the 2026-05-22 session-share post-mortem.
+//
+// Two of the required phrases (`When the field is present` and the
+// `computer` exemption) are specifically there because the first iteration
+// of this section claimed "Every tool call carries a description" and
+// listed `computer` alongside bash / http — but agent.buildToolSchema
+// drops Parameters for Anthropic native tools (computer included), so
+// the model would never see a `description` slot on computer's call
+// schema. Lock both the conditional wording and the `computer` carve-out
+// so a future cleanup can't quietly reintroduce the schema/prompt
+// contradiction.
+func TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:     "Base.",
+		LocalToolNames: []string{"file_read", "bash"},
+	})
+
+	required := []string{
+		"## Tool call descriptions",
+		"`description`",
+		"SAME language as your reply",
+		"language of the user's CURRENT message",
+		// Conditional wording — must NOT regress to "Every tool call carries".
+		"When the field is present",
+		// Computer exemption — must NOT regress to listing `computer`
+		// alongside bash / http as if it accepted a description field.
+		"`computer`",
+		"do not invent one for it",
+	}
+	for _, phrase := range required {
+		if !strings.Contains(parts.System, phrase) {
+			t.Errorf("system prompt missing tool-description language-lock phrase %q", phrase)
+		}
+	}
+}
+
+// TestBuildSystemPrompt_LanguageSection_CoversShortAckFallback locks the
+// short-acknowledgement carve-out added in response to the PR #184 review:
+// a long-running Chinese (or any-language) conversation must not flip
+// response language when the user types a single English token like "ok"
+// or "yes". Without this guard the previous refactor — which traded the
+// old "stay consistent with first contact" line for "current message
+// wins" — left the model free to interpret a one-word English ack as
+// "primarily English" and switch reply language for that turn.
+//
+// Asserts BOTH the static `## Language` section (where the rule needs to
+// live for cache stability) AND the per-turn LanguageDirective (where it
+// re-anchors against drift). Either alone is not enough — the static
+// section without the per-turn restate would be lost in a long context;
+// the per-turn directive alone could be overridden by recency bias on a
+// long tool-result tail.
+func TestBuildSystemPrompt_LanguageSection_CoversShortAckFallback(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+	})
+	directive := LanguageDirective()
+
+	staticRequired := []string{
+		"single-token acknowledgement",
+		"prior substantive turns",
+	}
+	for _, phrase := range staticRequired {
+		if !strings.Contains(parts.System, phrase) {
+			t.Errorf("static `## Language` section missing short-ack phrase %q", phrase)
+		}
+	}
+
+	directiveRequired := []string{
+		"Exception for short acknowledgements",
+		"prior substantive turns",
+	}
+	for _, phrase := range directiveRequired {
+		if !strings.Contains(directive, phrase) {
+			t.Errorf("LanguageDirective missing short-ack phrase %q", phrase)
+		}
+	}
+}
+
+// TestBuildSystemPrompt_ToolDescriptionLanguageLock_GatedOnLocalTools
+// verifies the new section is gated on LocalToolNames presence (same gate
+// as the adjacent parallel-tool-use nudge). An agent without local tools
+// has no tool-call description field to constrain, so the section adds
+// cached prefix bytes for no benefit.
+func TestBuildSystemPrompt_ToolDescriptionLanguageLock_GatedOnLocalTools(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:     "Base.",
+		LocalToolNames: nil,
+	})
+
+	if strings.Contains(parts.System, "## Tool call descriptions") {
+		t.Error("Tool call descriptions section must not appear when LocalToolNames is empty")
+	}
+}
+
+// TestLanguageDirective_NamesIntentMatchingRationale keeps the rationale
+// for the multilingual-trigger immunization self-documenting in the
+// directive body — without it, a future cleanup may strip "intent matching"
+// thinking it's redundant, then the rule reads as a flat prohibition
+// without explaining WHY skill-description Japanese is non-signal. The
+// live skill-listing test in internal/agent (which exercises the actual
+// buildSkillListing output) stays the primary regression guard; this
+// asserts the prompt-package directive carries the matching phrasing so
+// they evolve together.
+func TestLanguageDirective_NamesIntentMatchingRationale(t *testing.T) {
+	block := LanguageDirective()
+	if !strings.Contains(block, "intent matching") {
+		t.Error("LanguageDirective must mention `intent matching` so the rationale for the multilingual-trigger immunization is self-documenting alongside the rule")
+	}
+}
+
 // TestBuildSystemPrompt_MemoryIsSystemReminderWrapped asserts the Memory
 // block is wrapped in <system-reminder> with a "may or may not be relevant"
 // disclaimer and an explicit "do NOT determine your response language"
