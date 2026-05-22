@@ -448,6 +448,12 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	// Per-agent model config overrides
 	if agentOverride != nil && agentOverride.Config != nil && agentOverride.Config.Agent != nil {
 		ac := agentOverride.Config.Agent
+		// SetModelTier runs BEFORE SetSpecificModel so an explicit `model:` pin
+		// beats a `model_tier:` family hint when both are set (matches the
+		// daemon helper applyAgentModelOverlayToLoop in internal/daemon/runner.go).
+		if ac.ModelTier != nil && *ac.ModelTier != "" {
+			loop.SetModelTier(*ac.ModelTier)
+		}
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
 		}
@@ -622,6 +628,12 @@ func (m *Model) rebuildAgentLoop() {
 	}
 	if m.agentOverride != nil && m.agentOverride.Config != nil && m.agentOverride.Config.Agent != nil {
 		ac := m.agentOverride.Config.Agent
+		// SetModelTier runs BEFORE SetSpecificModel so an explicit `model:` pin
+		// beats a `model_tier:` family hint when both are set (matches the
+		// daemon helper applyAgentModelOverlayToLoop in internal/daemon/runner.go).
+		if ac.ModelTier != nil && *ac.ModelTier != "" {
+			loop.SetModelTier(*ac.ModelTier)
+		}
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
 		}
