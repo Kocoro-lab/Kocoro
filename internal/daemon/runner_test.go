@@ -1248,6 +1248,12 @@ func TestApplyAgentModelOverlayToLoop_SpecificModelBeatsTier(t *testing.T) {
 	if got := loop.ModelTier(); got != "large" {
 		t.Errorf("ModelTier = %q, want %q (overlay should still apply tier)", got, "large")
 	}
+	// Specific model must actually be set on the loop — without this assertion
+	// a regression that drops the SetSpecificModel call would still leave
+	// ModelTier == "large" and the test would silently pass.
+	if got := loop.SpecificModel(); got != pinned {
+		t.Errorf("SpecificModel = %q, want %q (overlay should pin specific model)", got, pinned)
+	}
 }
 
 // TestApplyAgentModelOverlayToLoop_EmptyTierIgnored guards against a config

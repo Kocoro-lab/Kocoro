@@ -998,6 +998,16 @@ func (a *AgentLoop) ModelTier() string {
 	return a.modelTier
 }
 
+// SpecificModel returns the currently-configured specific model id. Test-only
+// accessor used to prove that SetSpecificModel won the precedence race against
+// SetModelTier; production callers read specificModel directly via
+// messagesForLLM / Run. Without this accessor a regression that drops the
+// SetSpecificModel call in applyAgentModelOverlayToLoop would silently slip
+// past the precedence-chain regression test.
+func (a *AgentLoop) SpecificModel() string {
+	return a.specificModel
+}
+
 func (a *AgentLoop) SetMCPContext(ctx string) {
 	a.mcpContext = ctx
 }

@@ -152,6 +152,48 @@ func TestBuildSystemPrompt_InstructionsBeforeStickyFacts(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_VolatileTierAnchorsEnum(t *testing.T) {
+	// Known tier names trigger the "Kocoro offers two tiers" anchor so the
+	// model cannot hallucinate a low/medium/high enum from training-data
+	// priors. The "Context window:" line was removed because the model does
+	// not need it (daemon owns compaction) and surfacing the transient
+	// turn-1 default leaked confusing capacity numbers to users.
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:    "Base.",
+		ModelID:       "medium",
+		ContextWindow: 200000,
+	})
+	if !strings.Contains(parts.VolatileContext, "Model tier: medium") {
+		t.Error("VolatileContext should render 'Model tier: medium' for known tier name")
+	}
+	if !strings.Contains(parts.VolatileContext, "Kocoro offers two tiers: medium, large.") {
+		t.Error("VolatileContext should anchor the tier enum to prevent low/high hallucination")
+	}
+	if strings.Contains(parts.VolatileContext, "Context window:") {
+		t.Error("VolatileContext must not surface context-window number to the model")
+	}
+}
+
+func TestBuildSystemPrompt_VolatileSpecificModelKeepsPlainForm(t *testing.T) {
+	// When the operator pins a specific model id (not a tier), the prompt
+	// must render it as plain identity, not as "Model tier: <id>" — otherwise
+	// the model is told its own model id is a tier, which then contradicts
+	// the "Kocoro offers two tiers" enum line.
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+		ModelID:    "vendor-pinned-model-id",
+	})
+	if !strings.Contains(parts.VolatileContext, "Model: vendor-pinned-model-id") {
+		t.Error("VolatileContext should render 'Model: <id>' for pinned model")
+	}
+	if strings.Contains(parts.VolatileContext, "Model tier: vendor-pinned-model-id") {
+		t.Error("VolatileContext must not call a pinned model id a 'tier'")
+	}
+	if strings.Contains(parts.VolatileContext, "Kocoro offers two tiers") {
+		t.Error("VolatileContext should not append tier enum when pinning a specific model id")
+	}
+}
+
 func TestBuildSystemPrompt_VolatileContainsCWD(t *testing.T) {
 	parts := BuildSystemPrompt(PromptOptions{
 		BasePrompt: "Base.",

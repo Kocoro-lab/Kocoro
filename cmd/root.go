@@ -214,7 +214,8 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	// still seed from the configured model so a known 1M/200K cap guides
 	// the first preflight check before any response arrives.
 	loop.SetContextWindow(agent.SeedContextWindowFromModels(
-		runCfg.Agent.Model, "", runCfg.Agent.ContextWindow))
+		runCfg.Agent.Model, "",
+		agent.ContextWindowFloorForProvider(runCfg.Provider, runCfg.Agent.ContextWindow)))
 	// One-shot CLI invocation — no resume across runs. Short TTL is correct.
 	loop.SetCacheSource("oneshot_cli")
 	loop.SetSkillDiscovery(runCfg.Agent.SkillDiscoveryEnabled())

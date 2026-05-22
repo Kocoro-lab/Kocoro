@@ -1552,7 +1552,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// default and force the first preflight check to assume the wrong cap
 	// until maybeAutoAdjustContextWindow runs after the first response.
 	loop.SetContextWindow(agent.SeedContextWindowFromModels(
-		runCfg.Agent.Model, sess.LastSeenModel(), runCfg.Agent.ContextWindow))
+		runCfg.Agent.Model, sess.LastSeenModel(),
+		agent.ContextWindowFloorForProvider(runCfg.Provider, runCfg.Agent.ContextWindow)))
 	// Streaming on: bypasses Shannon Cloud's MAX_NON_STREAMING=16384 cap in
 	// llm-service/llm_provider/anthropic_provider.py, raising effective max
 	// output to the model's full limit (e.g. Sonnet 4.6 = 64K). Without this,

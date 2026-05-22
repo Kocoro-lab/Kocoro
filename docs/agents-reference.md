@@ -49,7 +49,7 @@ mcp_servers:
 # Model and behavior overrides (subset of global agent.* keys)
 agent:
   model: "claude-sonnet-4-6"
-  model_tier: "large"               # optional; small | medium | large. Omit to inherit global model_tier. `agent.model` (specific id) wins over `agent.model_tier` when both are set.
+  model_tier: "large"               # optional; medium | large. Omit to inherit global model_tier. `agent.model` (specific id) wins over `agent.model_tier` when both are set. ("small" is a daemon-internal sub-tier for skill discovery / micro-compaction; do not pin it via per-agent override.)
   max_iterations: 10
   temperature: 0.2
   max_tokens: 16000

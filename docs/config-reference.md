@@ -9,7 +9,7 @@ For multi-level merge behavior (global / project / local), see the README's `## 
 ```yaml
 endpoint: http://localhost:8080    # Shannon Gateway URL
 api_key: ""                        # Gateway API key
-model_tier: medium                 # small, medium, large (default: medium)
+model_tier: medium                 # medium | large (default: medium). "small" exists but is reserved for daemon-internal sub-tier calls (skill discovery, micro-compaction); UI surfaces and per-agent overrides should stick to medium / large.
 provider: ""                       # empty = gateway; "ollama" for local Ollama
 ```
 
@@ -75,9 +75,9 @@ agent:
   temperature: 0                   # LLM temperature (default: 0)
   max_tokens: 32000                # max output tokens (default: 32000)
   model: ""                        # specific model override (empty = use model_tier)
-  model_tier: ""                   # tier override (small | medium | large); empty = inherit global model_tier
+  model_tier: ""                   # tier override (medium | large); empty = inherit global model_tier. "small" reserved for daemon-internal calls — do not pin via UI.
   reasoning_effort: ""             # "low" / "medium" / "high" (empty = model default)
-  context_window: 200000           # seed; auto-adjusted from observed model. Per-agent override locks the cap.
+  context_window: 1_000_000        # seed; auto-adjusted from observed model. Per-agent override locks the cap. (Ollama callers clamp to 200K — see ContextWindowFloorForProvider.)
 
   # Extended thinking (Anthropic native)
   thinking: true                   # enable extended thinking (default: true)

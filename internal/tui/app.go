@@ -416,7 +416,8 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	// so LastSeenModel returns "" — but the configured-model path still
 	// applies for known IDs.
 	loop.SetContextWindow(agent.SeedContextWindowFromModels(
-		runtimeCfg.Agent.Model, sess.LastSeenModel(), runtimeCfg.Agent.ContextWindow))
+		runtimeCfg.Agent.Model, sess.LastSeenModel(),
+		agent.ContextWindowFloorForProvider(runtimeCfg.Provider, runtimeCfg.Agent.ContextWindow)))
 	// Interactive TUI — long-lived session with iteration, 1h cache pays off.
 	loop.SetCacheSource("tui")
 	loop.SetSkillDiscovery(runtimeCfg.Agent.SkillDiscoveryEnabled())
@@ -600,7 +601,8 @@ func (m *Model) rebuildAgentLoop() {
 		resumedSeenModel = sess.LastSeenModel()
 	}
 	loop.SetContextWindow(agent.SeedContextWindowFromModels(
-		m.cfg.Agent.Model, resumedSeenModel, m.cfg.Agent.ContextWindow))
+		m.cfg.Agent.Model, resumedSeenModel,
+		agent.ContextWindowFloorForProvider(m.cfg.Provider, m.cfg.Agent.ContextWindow)))
 	// Interactive TUI (switched agent) — same routing as the primary loop.
 	loop.SetCacheSource("tui")
 	loop.SetSkillDiscovery(m.cfg.Agent.SkillDiscoveryEnabled())

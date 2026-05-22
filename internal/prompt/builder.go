@@ -324,8 +324,16 @@ func buildVolatileContext(opts PromptOptions) string {
 		sb.WriteString("\nWorking directory: " + opts.CWD)
 	}
 	if opts.ModelID != "" {
-		sb.WriteString("\nModel tier: " + opts.ModelID)
-		sb.WriteString("\nKocoro offers two tiers: medium, large.")
+		// loop.go fills ModelID from specificModel first, then falls back to
+		// modelTier. Render tier narrative only when the value matches a known
+		// tier name; for pinned model ids keep the plain "Model: <id>" form so
+		// the model is not told its model id is a tier.
+		if isKnownTierName(opts.ModelID) {
+			sb.WriteString("\nModel tier: " + opts.ModelID)
+			sb.WriteString("\nKocoro offers two tiers: medium, large.")
+		} else {
+			sb.WriteString("\nModel: " + opts.ModelID)
+		}
 	}
 	if opts.SessionInfo != "" {
 		sb.WriteString("\n" + opts.SessionInfo)
@@ -433,6 +441,18 @@ func truncate(s string, maxChars int) string {
 		return s
 	}
 	return string(r[:maxChars]) + "\n[truncated]"
+}
+
+// isKnownTierName returns true when s matches an internal tier identifier.
+// "small" stays in the set so that the rare cases of pinning small via
+// agent.model_tier still render as tier narrative rather than fall through
+// to "Model: small" (which would read as if small were a model id).
+func isKnownTierName(s string) bool {
+	switch s {
+	case "small", "medium", "large":
+		return true
+	}
+	return false
 }
 
 // SanitizeUserBlock strips wrapper closing tags from user-supplied content
