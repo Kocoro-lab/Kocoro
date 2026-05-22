@@ -49,8 +49,7 @@ func TestSystemPromptAudit(t *testing.T) {
 		BasePrompt:     basePrompt,
 		LocalToolNames: tools,
 		MemoryDir:      "/Users/test/.shannon/agents/sample",
-		ContextWindow:  200000,
-		ModelID:        "claude-sonnet-4-6",
+		ModelID:        "medium",
 		OutputFormat:   "markdown",
 	})
 

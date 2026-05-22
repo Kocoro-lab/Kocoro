@@ -214,7 +214,8 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	// still seed from the configured model so a known 1M/200K cap guides
 	// the first preflight check before any response arrives.
 	loop.SetContextWindow(agent.SeedContextWindowFromModels(
-		runCfg.Agent.Model, "", runCfg.Agent.ContextWindow))
+		runCfg.Agent.Model, "",
+		agent.ContextWindowFloorForProvider(runCfg.Provider, runCfg.Agent.ContextWindow)))
 	// One-shot CLI invocation — no resume across runs. Short TTL is correct.
 	loop.SetCacheSource("oneshot_cli")
 	loop.SetSkillDiscovery(runCfg.Agent.SkillDiscoveryEnabled())
@@ -239,6 +240,11 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	// Per-agent model config overrides
 	if agentOverride != nil && agentOverride.Config != nil && agentOverride.Config.Agent != nil {
 		ac := agentOverride.Config.Agent
+		// SetModelTier runs before SetSpecificModel so an explicit `model:`
+		// pin still beats a `model_tier:` family hint when both are set.
+		if ac.ModelTier != nil && *ac.ModelTier != "" {
+			loop.SetModelTier(*ac.ModelTier)
+		}
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
 		}

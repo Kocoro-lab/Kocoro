@@ -126,6 +126,7 @@ func (p *AgentPermissionsConfig) Clone() *AgentPermissionsConfig {
 // AgentModelConfig holds per-agent model/iteration overrides.
 type AgentModelConfig struct {
 	Model         *string  `yaml:"model" json:"model,omitempty"`
+	ModelTier     *string  `yaml:"model_tier" json:"model_tier,omitempty"`
 	MaxIterations *int     `yaml:"max_iterations" json:"max_iterations,omitempty"`
 	Temperature   *float64 `yaml:"temperature" json:"temperature,omitempty"`
 	MaxTokens     *int     `yaml:"max_tokens" json:"max_tokens,omitempty"`

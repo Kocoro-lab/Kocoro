@@ -1,7 +1,6 @@
 package prompt
 
 import (
-	"fmt"
 	"runtime"
 	"strings"
 	"time"
@@ -64,12 +63,10 @@ type PromptOptions struct {
 	// message, BP #3). Excluded from the system prompt for BP #1 byte
 	// stability. See issue #107. Empty when not in deferred mode.
 	DeferredTools []DeferredToolSummary
-	// ModelID is the model identifier (e.g., "claude-sonnet-4-20250514").
-	// Injected into volatile context so the model knows its own identity.
+	// ModelID is either the active tier name (small/medium/large) or a
+	// pinned specific model id. Injected into volatile context so the
+	// model knows its own identity. See isKnownTierName for the dispatch.
 	ModelID string
-	// ContextWindow is the model's context window size in tokens.
-	// Injected into volatile context when > 0.
-	ContextWindow int
 	// OutputFormat controls formatting guidance: "markdown" (default, GFM) or
 	// "plain" (for cloud-distributed sessions where Shannon Cloud handles
 	// final channel rendering). Empty defaults to "markdown".
@@ -357,10 +354,16 @@ func buildVolatileContext(opts PromptOptions) string {
 		sb.WriteString("\nWorking directory: " + opts.CWD)
 	}
 	if opts.ModelID != "" {
-		sb.WriteString("\nModel: " + opts.ModelID)
-	}
-	if opts.ContextWindow > 0 {
-		sb.WriteString(fmt.Sprintf("\nContext window: %d tokens", opts.ContextWindow))
+		// loop.go fills ModelID from specificModel first, then falls back to
+		// modelTier. Render tier narrative only when the value matches a known
+		// tier name; for pinned model ids keep the plain "Model: <id>" form so
+		// the model is not told its model id is a tier.
+		if isKnownTierName(opts.ModelID) {
+			sb.WriteString("\nModel tier: " + opts.ModelID)
+			sb.WriteString("\nKocoro offers two tiers: medium, large.")
+		} else {
+			sb.WriteString("\nModel: " + opts.ModelID)
+		}
 	}
 	if opts.SessionInfo != "" {
 		sb.WriteString("\n" + opts.SessionInfo)
@@ -478,6 +481,18 @@ func truncate(s string, maxChars int) string {
 		return s
 	}
 	return string(r[:maxChars]) + "\n[truncated]"
+}
+
+// isKnownTierName returns true when s matches an internal tier identifier.
+// "small" stays in the set so that the rare cases of pinning small via
+// agent.model_tier still render as tier narrative rather than fall through
+// to "Model: small" (which would read as if small were a model id).
+func isKnownTierName(s string) bool {
+	switch s {
+	case "small", "medium", "large":
+		return true
+	}
+	return false
 }
 
 // SanitizeUserBlock strips wrapper closing tags from user-supplied content

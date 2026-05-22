@@ -274,7 +274,7 @@ See `docs/cache-strategy.md` (4-breakpoint allocation, source→TTL routing, byt
 
 ### Context Management
 
-- **Context window**: `agent.context_window` (default 200000) is a seed; `maybeAutoAdjustContextWindow` resets from `response.model` via `modelcontext.go` (Anthropic/OpenAI/Google/xAI; 1M and 200K families). Catches Cloud tier-failover. Per-agent override calls `SetContextWindowExplicit` (lock); auto-detect skips locked loops.
+- **Context window**: `agent.context_window` (default 1_000_000 — matches the Opus 4.7 / Sonnet 4.6 / Gemini-3-Pro 1M-context families that medium/large tiers route to) is a seed; `maybeAutoAdjustContextWindow` resets from `response.model` via `modelcontext.go` (Anthropic/OpenAI/Google/xAI; 1M and 200K families). Catches Cloud tier-failover (e.g. Haiku 200K) in either direction. Per-agent override calls `SetContextWindowExplicit` (lock); auto-detect skips locked loops. For Ollama (model names absent from `LookupModelContextWindow`), callers wrap the fallback with `agent.ContextWindowFloorForProvider` which clamps to 200K so a local 128K model is not seeded at 1M.
 - **Proactive compaction** at 90%: `PersistLearnings` → `GenerateSummary` (two-phase analysis→summary) → `ShapeHistory`.
 - **Pre-flight compaction** at 95% (`shouldPreflightCompact`): backup gate before each main LLM call + force-stop turn. Emits `OnRunStatus("preflight_compaction")`.
 - **Reactive compaction** on context-length error: emergency compress + single retry; `reactiveCompacted` prevents loops. Summarize input itself capped at `summarizeInputCapChars=540_000` rune-safe head+tail (else cascade re-overflows on small tier).

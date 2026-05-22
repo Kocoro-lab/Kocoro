@@ -343,3 +343,62 @@ func TestAgentConfig_CWD_RejectsRelativePath(t *testing.T) {
 		t.Fatal("expected error for relative cwd path")
 	}
 }
+
+func TestLoadAgent_ParsesModelTier(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "test_opus")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte("test agent"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `agent:
+  model_tier: large
+`
+	if err := os.WriteFile(filepath.Join(agentDir, "config.yaml"), []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := LoadAgent(dir, "test_opus")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Config == nil || a.Config.Agent == nil {
+		t.Fatal("expected agent config to be loaded")
+	}
+	if a.Config.Agent.ModelTier == nil {
+		t.Fatal("ModelTier expected non-nil")
+	}
+	if got := *a.Config.Agent.ModelTier; got != "large" {
+		t.Errorf("ModelTier = %q, want %q", got, "large")
+	}
+}
+
+func TestLoadAgent_ModelTierNilWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "test_default")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte("test agent"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `agent:
+  max_iterations: 10
+`
+	if err := os.WriteFile(filepath.Join(agentDir, "config.yaml"), []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := LoadAgent(dir, "test_default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Config == nil || a.Config.Agent == nil {
+		t.Fatal("expected agent config to be loaded")
+	}
+	if a.Config.Agent.ModelTier != nil {
+		t.Errorf("ModelTier expected nil when omitted, got %q", *a.Config.Agent.ModelTier)
+	}
+}

@@ -155,3 +155,19 @@ func SeedContextWindowFromModels(configuredModel, lastSeenModel string, fallback
 	}
 	return fallback
 }
+
+// ContextWindowFloorForProvider clamps a fallback context window when the
+// provider's model ids cannot be resolved by LookupModelContextWindow. The
+// only such provider today is "ollama" — local model names (llama3, qwen,
+// mistral, …) are not in the static table, so an over-large config default
+// (e.g. 1M for the cloud path) would seed past most real local-model windows
+// and let proactive compaction sit idle until the upstream returns a context-
+// length error. Callers should wrap their fallback in this helper before
+// passing it to SeedContextWindowFromModels.
+func ContextWindowFloorForProvider(provider string, fallback int) int {
+	const ollamaSafeMax = 200_000
+	if provider == "ollama" && fallback > ollamaSafeMax {
+		return ollamaSafeMax
+	}
+	return fallback
+}

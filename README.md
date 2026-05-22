@@ -427,6 +427,8 @@ permissions:
 
 See [docs/config-reference.md](docs/config-reference.md) for the full key list including `agent.*`, `tools.*`, `mcp_servers`, `cloud`, `memory`, `sync`, `daemon`, `hooks`, UI settings, etc. Run `/config` in the TUI to see the merged config with sources.
 
+Per-agent overrides live in `~/.shannon/agents/<name>/_attached.yaml` — including `agent.model_tier` so individual agents can opt into the Large (Opus) tier without changing the global default. See [docs/agents-reference.md](docs/agents-reference.md) for the precedence chain.
+
 ## Instructions & Memory
 
 AI behavior customization from markdown files (token-budgeted, deduplicated; `.md` links auto-expanded inline):

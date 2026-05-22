@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
@@ -1210,5 +1211,60 @@ func TestIsSoftRunError_StreamIdleTimeout(t *testing.T) {
 				t.Fatalf("isSoftRunError(%v) = %v, want %v", tc.err, got, tc.soft)
 			}
 		})
+	}
+}
+
+// TestApplyAgentModelOverlayToLoop_ModelTier verifies that the per-agent
+// `agent.model_tier` overlay actually retargets the loop's tier on each turn.
+// Regression guard: dropping the SetModelTier call here would silently leave
+// the loop on the baseline tier even when the agent's config.yaml asks for
+// large/medium/small.
+func TestApplyAgentModelOverlayToLoop_ModelTier(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	if got := loop.ModelTier(); got != "medium" {
+		t.Fatalf("precondition: baseline ModelTier = %q, want %q", got, "medium")
+	}
+	tier := "large"
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{ModelTier: &tier})
+	if got := loop.ModelTier(); got != "large" {
+		t.Errorf("after overlay: ModelTier = %q, want %q", got, "large")
+	}
+}
+
+// TestApplyAgentModelOverlayToLoop_SpecificModelBeatsTier locks in the
+// priority chain documented on applyAgentModelOverlayToLoop: SetModelTier
+// must run BEFORE SetSpecificModel so an explicit `model:` pin wins. If the
+// call order is ever flipped the loop would silently fall back to tier
+// routing even when a specific model was requested.
+func TestApplyAgentModelOverlayToLoop_SpecificModelBeatsTier(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	tier := "large"
+	pinned := "vendor-model-2026"
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{
+		ModelTier: &tier,
+		Model:     &pinned,
+	})
+	// modelTier should still be set, but SpecificModel wins at request time.
+	if got := loop.ModelTier(); got != "large" {
+		t.Errorf("ModelTier = %q, want %q (overlay should still apply tier)", got, "large")
+	}
+	// Specific model must actually be set on the loop — without this assertion
+	// a regression that drops the SetSpecificModel call would still leave
+	// ModelTier == "large" and the test would silently pass.
+	if got := loop.SpecificModel(); got != pinned {
+		t.Errorf("SpecificModel = %q, want %q (overlay should pin specific model)", got, pinned)
+	}
+}
+
+// TestApplyAgentModelOverlayToLoop_EmptyTierIgnored guards against a config
+// that serializes `model_tier: ""` (empty string pointer) clobbering the
+// baseline tier with "" — which would later route to the default fallback
+// and look like a silent tier downgrade.
+func TestApplyAgentModelOverlayToLoop_EmptyTierIgnored(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	empty := ""
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{ModelTier: &empty})
+	if got := loop.ModelTier(); got != "medium" {
+		t.Errorf("ModelTier after empty-string overlay = %q, want %q (unchanged)", got, "medium")
 	}
 }

@@ -38,9 +38,9 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 ### Update agent config
 - Method: PUT
 - Path: /agents/{name}/config
-- Body: `{"cwd": "/path/to/project", "agent": {"model": "claude-opus-4-5"}, "tools": {"allow": ["bash:git *"], "deny": ["bash:rm *"]}}`
+- Body: `{"cwd": "/path/to/project", "agent": {"model": "claude-opus-4-5", "model_tier": "large"}, "tools": {"allow": ["bash:git *"], "deny": ["bash:rm *"]}}`
 - Response: `{"status": "updated"}`
-- Notes: Supports `cwd`, `agent.model`, `agent.temperature`, `tools.allow`, `tools.deny`, `mcp_servers`, `permissions.always_allow_tools`.
+- Notes: Supports `cwd`, `agent.model`, `agent.model_tier`, `agent.temperature`, `tools.allow`, `tools.deny`, `mcp_servers`, `permissions.always_allow_tools`. `agent.model_tier` (one of `small` | `medium` | `large`) overrides the global `model_tier` for this agent only; omit to inherit. When both are set, `agent.model` (specific model id) wins over `agent.model_tier`. Full precedence (highest first): `agent.model` (specific model id always wins) → `RunAgentRequest.ModelOverride` (heartbeat tier override) → `agent.model_tier` → local / project / global `model_tier` → viper default `"medium"`.
 
 ### Add tool to agent's always-allow list
 - Method: POST

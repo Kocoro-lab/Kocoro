@@ -916,6 +916,40 @@ func resumeRoutedColdStart(sessMgr *session.Manager, routeKey string) (bool, err
 	return false, nil
 }
 
+// applyAgentModelOverlayToLoop applies the loop-facing fields of the per-agent
+// model overlay onto the AgentLoop. Called per-turn so reload picks up edits.
+//
+// SetModelTier and SetSpecificModel write to independent fields on the loop
+// (modelTier vs specificModel). Call order does NOT decide precedence; the
+// request-time resolver in loop.go:messagesForLLM picks specificModel when
+// non-empty and falls back to modelTier otherwise. Both setters are applied
+// so an operator can later switch between specific-pin and tier without
+// unsetting the other. Idle timeout fields live in runCfg, not on the loop,
+// and are handled inline at the call site.
+func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelConfig) {
+	if loop == nil || ac == nil {
+		return
+	}
+	if ac.ModelTier != nil && *ac.ModelTier != "" {
+		loop.SetModelTier(*ac.ModelTier)
+	}
+	if ac.Model != nil {
+		loop.SetSpecificModel(*ac.Model)
+	}
+	if ac.MaxIterations != nil {
+		loop.SetMaxIterations(*ac.MaxIterations)
+	}
+	if ac.Temperature != nil {
+		loop.SetTemperature(*ac.Temperature)
+	}
+	if ac.MaxTokens != nil {
+		loop.SetMaxTokens(*ac.MaxTokens)
+	}
+	if ac.ContextWindow != nil {
+		loop.SetContextWindowExplicit(*ac.ContextWindow)
+	}
+}
+
 // RunAgent executes a single agent turn using the shared dependencies.
 // The caller provides an EventHandler to control streaming, approval, and
 // event reporting (WS uses daemonEventHandler, HTTP uses httpEventHandler).
@@ -1521,7 +1555,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// default and force the first preflight check to assume the wrong cap
 	// until maybeAutoAdjustContextWindow runs after the first response.
 	loop.SetContextWindow(agent.SeedContextWindowFromModels(
-		runCfg.Agent.Model, sess.LastSeenModel(), runCfg.Agent.ContextWindow))
+		runCfg.Agent.Model, sess.LastSeenModel(),
+		agent.ContextWindowFloorForProvider(runCfg.Provider, runCfg.Agent.ContextWindow)))
 	// Streaming on: bypasses Shannon Cloud's MAX_NON_STREAMING=16384 cap in
 	// llm-service/llm_provider/anthropic_provider.py, raising effective max
 	// output to the model's full limit (e.g. Sonnet 4.6 = 64K). Without this,
@@ -1593,21 +1628,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// Per-agent model config overrides
 	if agentOverride != nil && agentOverride.Config != nil && agentOverride.Config.Agent != nil {
 		ac := agentOverride.Config.Agent
-		if ac.Model != nil {
-			loop.SetSpecificModel(*ac.Model)
-		}
-		if ac.MaxIterations != nil {
-			loop.SetMaxIterations(*ac.MaxIterations)
-		}
-		if ac.Temperature != nil {
-			loop.SetTemperature(*ac.Temperature)
-		}
-		if ac.MaxTokens != nil {
-			loop.SetMaxTokens(*ac.MaxTokens)
-		}
-		if ac.ContextWindow != nil {
-			loop.SetContextWindowExplicit(*ac.ContextWindow)
-		}
+		applyAgentModelOverlayToLoop(loop, ac)
 		if ac.IdleSoftTimeoutSecs != nil {
 			runCfg.Agent.IdleSoftTimeoutSecs = *ac.IdleSoftTimeoutSecs
 		}
