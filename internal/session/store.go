@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 )
 
 // TimePtr returns a pointer to t, for use in MessageMeta literals.
@@ -502,6 +503,11 @@ func (s *Store) Load(id string) (*Session, error) {
 	if sess.SchemaVersion == 0 {
 		sess.SchemaVersion = 1
 	}
+	// Load-time self-heal for malformed thinking blocks persisted by earlier
+	// daemon versions. See internal/context/thinking_sanitize.go for the
+	// wire-shape that motivates this. The next Save() persists the cleaned
+	// shape, so disk copies repair themselves on first read after upgrade.
+	sess.Messages = ctxwin.DropMalformedThinking(sess.Messages)
 	return &sess, nil
 }
 

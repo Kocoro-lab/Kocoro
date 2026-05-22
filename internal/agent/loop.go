@@ -1380,6 +1380,14 @@ func (a *AgentLoop) messagesForLLM(messages []client.Message) []client.Message {
 	// is logged via `LogCacheCompactEvent("img_oversize_strip", ...)` so the
 	// cache-debug diff path remains complete (see CLAUDE.md "Prompt Cache").
 	filterOversizeImages(out)
+	// Wire-time guard for malformed thinking / redacted_thinking blocks.
+	// Drops blocks whose required payload field is empty so encoding/json
+	// cannot omit the `thinking` / `data` key under its `,omitempty` tag.
+	// Runs BEFORE RepairEmptyAssistantContent so that, if removing the
+	// malformed block empties an assistant message, the existing
+	// empty-content policy in RepairEmptyAssistantContent decides whether
+	// to drop or merge — keeping the empty-content rule centralized.
+	out = ctxwin.DropMalformedThinking(out)
 	// Wire-time guard for empty assistant content. Catches in-memory
 	// `assistant content: ""` that could be introduced this turn (e.g. via
 	// queued injected messages, mid-turn snapshot paths, or external history
