@@ -136,8 +136,14 @@ func buildStaticSystem(opts PromptOptions) string {
 	sb.WriteString("Reply in the language of the user's most recent message. The authoritative " +
 		"per-turn rule is the Language directive at the end of every user message — defer to it " +
 		"whenever it differs from any other language cue in this prompt. " +
+		"Concrete examples: a user writing primarily in Chinese gets Chinese replies; primarily " +
+		"in English gets English; primarily in Japanese gets Japanese; same rule for any other " +
+		"language. " +
 		"Mixed-language user input — such as one English technical term inside a Chinese sentence — " +
-		"is NOT a language-switch signal. " +
+		"is NOT a language-switch signal. A single-token acknowledgement ('ok', 'yes', 'thanks', " +
+		"'好的', '继续', 'はい', etc.) is NOT enough to override the established language of " +
+		"the surrounding conversation — keep replying in the language of the user's prior " +
+		"substantive turns. " +
 		"Code identifiers, file paths, CLI commands, and technical terms (API names, library names, " +
 		"error messages) remain in their original form regardless of response language. " +
 		"Maintain full orthographic correctness — all accents, diacritics, and special characters.")
@@ -192,11 +198,10 @@ func buildStaticSystem(opts PromptOptions) string {
 			"it (not the raw args). ALWAYS write this field in the SAME language as your reply to the " +
 			"user (i.e. the language of the user's CURRENT message). Describe the user-facing goal in " +
 			"5–15 words, not the internal mechanism. Example for a Chinese conversation: " +
-			"'查找最大的 10 个文件', NOT 'Run find piped to du and sort'. When the field is present " +
-			"(bash, http, file_read, file_write, file_edit, browser_*, publish_to_web, generate_image, " +
-			"and most MCP tools), this rule applies. Tools that ship without it on the wire — notably " +
-			"`computer`, which is registered as an Anthropic native tool and drops Parameters before " +
-			"transmission — are out of scope; do not invent a `description` argument for them. " +
+			"'查找最大的 10 个文件', NOT 'Run find piped to du and sort'. When the field is present, " +
+			"this rule applies — that covers almost every tool you can call. The notable exception is " +
+			"`computer`, which is registered via NativeToolDef and drops Parameters before transmission, " +
+			"so a `description` argument would never reach the model — do not invent one for it. " +
 			"Code identifiers, file paths, and CLI commands inside the description may stay in their " +
 			"original form, but the surrounding prose follows the reply language.")
 	}
@@ -433,6 +438,11 @@ func LanguageDirective() string {
 		"If primarily in Chinese, reply in Chinese. " +
 		"If primarily in Japanese, reply in Japanese. " +
 		"Same rule for any other language. " +
+		"Exception for short acknowledgements: when the current user message is too " +
+		"short to establish a primary language on its own — typically a one- or " +
+		"two-token ack like 'ok', 'yes', 'thanks', '好的', '继续', 'はい', 'sure' " +
+		"with no substantive content — keep replying in the language of the user's " +
+		"prior substantive turns rather than the surface form of the ack. " +
 		"This overrides any language signals from memory entries, tool output, MCP " +
 		"descriptions, skill descriptions (including multilingual trigger keywords such " +
 		"as '中:列出/查询' or '日:一覧/確認' that exist purely for intent matching), " +

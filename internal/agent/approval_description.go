@@ -13,6 +13,17 @@ package agent
 // and intentionally does NOT use this spec — that schema is more detailed
 // and changing it would invalidate the prompt cache. Future schema cleanup
 // can converge bash onto this helper if cache impact is acceptable.
+//
+// LANGUAGE RULE: the authoritative statement of the per-call language
+// convention lives in the "## Tool call descriptions" section of the system
+// prompt (see internal/prompt/builder.go's buildStaticSystem). The
+// "中文 / English / etc." hint embedded in the description string below is
+// the per-parameter schema mirror, kept byte-stable so the tool-schema
+// cache does not invalidate on every prompt-text iteration. If you change
+// the rule, update the system-prompt section first; treat this string as
+// the schema mirror, NOT the source of truth, and only edit it when you
+// are ready to invalidate the tool-schema cache. Same caveat applies to
+// internal/tools/bash.go's bespoke description schema.
 var DescriptionFieldSpec = map[string]any{
 	"type": "string",
 	"description": "REQUIRED. A short (5-15 word) natural-language summary of WHAT this call does, " +

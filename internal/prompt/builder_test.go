@@ -527,11 +527,53 @@ func TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present(t *testing.T) {
 		// Computer exemption — must NOT regress to listing `computer`
 		// alongside bash / http as if it accepted a description field.
 		"`computer`",
-		"do not invent a `description` argument",
+		"do not invent one for it",
 	}
 	for _, phrase := range required {
 		if !strings.Contains(parts.System, phrase) {
 			t.Errorf("system prompt missing tool-description language-lock phrase %q", phrase)
+		}
+	}
+}
+
+// TestBuildSystemPrompt_LanguageSection_CoversShortAckFallback locks the
+// short-acknowledgement carve-out added in response to the PR #184 review:
+// a long-running Chinese (or any-language) conversation must not flip
+// response language when the user types a single English token like "ok"
+// or "yes". Without this guard the previous refactor — which traded the
+// old "stay consistent with first contact" line for "current message
+// wins" — left the model free to interpret a one-word English ack as
+// "primarily English" and switch reply language for that turn.
+//
+// Asserts BOTH the static `## Language` section (where the rule needs to
+// live for cache stability) AND the per-turn LanguageDirective (where it
+// re-anchors against drift). Either alone is not enough — the static
+// section without the per-turn restate would be lost in a long context;
+// the per-turn directive alone could be overridden by recency bias on a
+// long tool-result tail.
+func TestBuildSystemPrompt_LanguageSection_CoversShortAckFallback(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+	})
+	directive := LanguageDirective()
+
+	staticRequired := []string{
+		"single-token acknowledgement",
+		"prior substantive turns",
+	}
+	for _, phrase := range staticRequired {
+		if !strings.Contains(parts.System, phrase) {
+			t.Errorf("static `## Language` section missing short-ack phrase %q", phrase)
+		}
+	}
+
+	directiveRequired := []string{
+		"Exception for short acknowledgements",
+		"prior substantive turns",
+	}
+	for _, phrase := range directiveRequired {
+		if !strings.Contains(directive, phrase) {
+			t.Errorf("LanguageDirective missing short-ack phrase %q", phrase)
 		}
 	}
 }
