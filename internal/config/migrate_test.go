@@ -364,3 +364,41 @@ custom:
 		t.Fatalf("multi-occurrence mismatch\nwant:\n%s\ngot:\n%s", want, string(out))
 	}
 }
+
+// Test removeTopLevelLine helper used by apiKeyToKeychainMigration. The
+// full migration requires real Keychain access — integration coverage
+// lives in test/e2e/auth_*.
+func TestRemoveTopLevelLine_StripsKey(t *testing.T) {
+	in := []byte("provider: gateway\napi_key: sk_abc123\nendpoint: https://x\n")
+	out, ok := removeTopLevelLine(in, "api_key")
+	if !ok {
+		t.Fatal("expected match")
+	}
+	want := "provider: gateway\nendpoint: https://x\n"
+	if string(out) != want {
+		t.Fatalf("got %q want %q", string(out), want)
+	}
+}
+
+func TestRemoveTopLevelLine_NoMatch(t *testing.T) {
+	in := []byte("provider: gateway\nendpoint: https://x\n")
+	out, ok := removeTopLevelLine(in, "api_key")
+	if ok {
+		t.Fatal("expected no match")
+	}
+	if string(out) != string(in) {
+		t.Fatal("input must be unchanged when no match")
+	}
+}
+
+func TestRemoveTopLevelLine_DoesNotTouchNested(t *testing.T) {
+	// Only top-level should match — nested api_key under cloud: must survive.
+	in := []byte("cloud:\n  api_key: sk_nested\nprovider: gateway\n")
+	out, ok := removeTopLevelLine(in, "api_key")
+	if ok {
+		t.Fatalf("nested api_key should not match top-level pattern\ngot %q", string(out))
+	}
+	if string(out) != string(in) {
+		t.Fatal("input must be unchanged")
+	}
+}

@@ -25,6 +25,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/daemon"
 	"github.com/Kocoro-lab/ShanClaw/internal/heartbeat"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
+	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
@@ -100,6 +101,13 @@ var daemonStartCmd = &cobra.Command{
 
 		// Apply configured Chrome profile override before any CDP launch.
 		mcp.SetCDPChromeProfile(cfg.Daemon.ChromeProfile)
+
+		// Log the effective endpoint so anyone debugging "why does daemon
+		// talk to <wrong server>" can see what cfg actually resolved to
+		// (covers the KOCORO_ENDPOINT env override path + yaml default
+		// fallback). Mirrored to ~/.shannon/logs/audit.log on startup so
+		// it survives Desktop's stdout capture.
+		log.Printf("daemon: cfg.endpoint=%q (set KOCORO_ENDPOINT env to override)", cfg.Endpoint)
 
 		gw := client.NewGatewayClient(cfg.Endpoint, cfg.APIKey)
 		if cfg.Agent.StreamIdleTimeoutSecs > 0 {
@@ -456,6 +464,36 @@ var daemonStartCmd = &cobra.Command{
 		deps.EventBus = localServer.EventBus()
 		deps.WSClient = wsClient
 
+		// AuthManager wiring. Keychain is macOS-only — on Linux/Windows
+		// authMgr stays nil and /local/auth/* responds 503. Legacy path
+		// (cfg.APIKey set via setup wizard or yaml) continues to work
+		// because wsClient was already constructed with that key above
+		// and WSController.Start below dials directly.
+		var authMgr *daemon.AuthManager
+		var wsCtl *daemon.WSController
+		kcStore, kcErr := keychain.NewOSStore(log.Default())
+		if kcErr == nil {
+			authClient := client.NewAuthClient(cfg.Endpoint, gw.HTTPClient())
+			authMgr = daemon.NewAuthManager(daemon.AuthManagerConfig{
+				Keychain: kcStore,
+				Cloud:    authClient,
+				Gateway:  gw,
+				WSClient: wsClient,
+				Cfg:      cfg,
+				OnAPIKeyChanged: func(ctx context.Context) {
+					localServer.RebuildAuthSensitiveTools(ctx)
+				},
+				Logger: log.Default(),
+			})
+			authMgr.SetEventBus(localServer.EventBus())
+			wsCtl = daemon.NewWSController(ctx, wsClient)
+			authMgr.SetWSController(wsCtl)
+			wsClient.SetOnAuthFailure(authMgr.HandleWSAuthFailure)
+			localServer.SetAuth(authMgr)
+		} else {
+			log.Printf("daemon: keychain unavailable (%v) — falling back to legacy cfg.APIKey path", kcErr)
+		}
+
 		// Start file watcher and heartbeat manager.
 		var triggerMu sync.Mutex
 		var fileWatcher *watcher.Watcher
@@ -554,8 +592,26 @@ var daemonStartCmd = &cobra.Command{
 			log.Printf("daemon: local server listening on http://127.0.0.1:7533")
 		}
 
-		log.Printf("daemon: connecting to %s", wsEndpoint)
-		wsClient.RunWithReconnect(ctx)
+		log.Printf("daemon: WS endpoint %s", wsEndpoint)
+		if authMgr != nil {
+			// AuthManager owns WS lifecycle. Bootstrap reads any existing
+			// Keychain key + validates via /auth/me; if valid it starts
+			// the WS, otherwise daemon stays idle until /local/auth/login.
+			// We run Bootstrap async so HTTP /local/auth/state responds
+			// immediately during startup (default signed_out state is
+			// already populated).
+			go authMgr.Bootstrap(ctx)
+		} else if wsClient != nil {
+			// Legacy path (non-darwin or Keychain disabled): start WS
+			// directly with whatever key the user pasted via setup
+			// wizard. No AuthManager, no /local/auth/*.
+			wsCtl = daemon.NewWSController(ctx, wsClient)
+			wsCtl.Start(ctx)
+		}
+		<-ctx.Done()
+		if wsCtl != nil {
+			wsCtl.Stop()
+		}
 
 		triggerMu.Lock()
 		if fileWatcher != nil {

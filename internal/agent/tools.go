@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"sort"
+	"sync"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -259,23 +260,23 @@ func IsCancelableMidTurn(t Tool) bool {
 //   - accessibility, applescript, screenshot, computer, clipboard,
 //     notify, browser, wait_for, ghostty (GUI side effects)
 var builtinCancelableMidTurn = map[string]struct{}{
-	"file_read":                {},
-	"glob":                     {},
-	"grep":                     {},
-	"directory_list":           {},
-	"think":                    {},
-	"system_info":              {},
-	"memory_recall":            {},
-	"session_search":           {},
-	"list_my_published_files":  {},
-	"tool_search":              {},
-	"use_skill":                {},
-	"schedule_list":            {},
-	"archive_inspect":          {},
-	"pdf_to_text":              {},
-	"docx_to_text":             {},
-	"xlsx_to_text":             {},
-	"pptx_to_text":             {},
+	"file_read":               {},
+	"glob":                    {},
+	"grep":                    {},
+	"directory_list":          {},
+	"think":                   {},
+	"system_info":             {},
+	"memory_recall":           {},
+	"session_search":          {},
+	"list_my_published_files": {},
+	"tool_search":             {},
+	"use_skill":               {},
+	"schedule_list":           {},
+	"archive_inspect":         {},
+	"pdf_to_text":             {},
+	"docx_to_text":            {},
+	"xlsx_to_text":            {},
+	"pptx_to_text":            {},
 }
 
 func isBuiltinCancelable(name string) bool {
@@ -384,6 +385,7 @@ type ToolSummary struct {
 }
 
 type ToolRegistry struct {
+	mu    sync.RWMutex
 	tools map[string]Tool
 	order []string
 }
@@ -395,6 +397,8 @@ func NewToolRegistry() *ToolRegistry {
 }
 
 func (r *ToolRegistry) Register(t Tool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	name := t.Info().Name
 	if _, exists := r.tools[name]; !exists {
 		r.order = append(r.order, name)
@@ -403,6 +407,8 @@ func (r *ToolRegistry) Register(t Tool) {
 }
 
 func (r *ToolRegistry) Clone() *ToolRegistry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	clone := NewToolRegistry()
 	for _, name := range r.order {
 		tool := r.tools[name]
@@ -413,6 +419,8 @@ func (r *ToolRegistry) Clone() *ToolRegistry {
 }
 
 func (r *ToolRegistry) Get(name string) (Tool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	t, ok := r.tools[name]
 	return t, ok
 }
@@ -425,11 +433,15 @@ func (r *ToolRegistry) Has(name string) bool {
 	if r == nil {
 		return false
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	_, ok := r.tools[name]
 	return ok
 }
 
 func (r *ToolRegistry) All() []Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	tools := make([]Tool, 0, len(r.order))
 	for _, name := range r.order {
 		tools = append(tools, r.tools[name])
@@ -439,6 +451,8 @@ func (r *ToolRegistry) All() []Tool {
 
 // Remove removes a tool from the registry by name.
 func (r *ToolRegistry) Remove(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if _, ok := r.tools[name]; !ok {
 		return
 	}
@@ -453,6 +467,8 @@ func (r *ToolRegistry) Remove(name string) {
 
 // Names returns the ordered list of tool names.
 func (r *ToolRegistry) Names() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := make([]string, len(r.order))
 	copy(out, r.order)
 	return out
@@ -460,12 +476,16 @@ func (r *ToolRegistry) Names() []string {
 
 // Len returns the number of registered tools.
 func (r *ToolRegistry) Len() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return len(r.tools)
 }
 
 // FilterByAllow returns a new registry containing only the named tools.
 // Tools not found are silently skipped.
 func (r *ToolRegistry) FilterByAllow(allow []string) *ToolRegistry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	filtered := NewToolRegistry()
 	for _, name := range allow {
 		if t, ok := r.tools[name]; ok {
@@ -477,6 +497,8 @@ func (r *ToolRegistry) FilterByAllow(allow []string) *ToolRegistry {
 
 // FilterByDeny returns a new registry with the named tools removed.
 func (r *ToolRegistry) FilterByDeny(deny []string) *ToolRegistry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	denySet := make(map[string]struct{}, len(deny))
 	for _, name := range deny {
 		denySet[name] = struct{}{}
@@ -491,6 +513,8 @@ func (r *ToolRegistry) FilterByDeny(deny []string) *ToolRegistry {
 }
 
 func (r *ToolRegistry) Schemas() []client.Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	schemas := make([]client.Tool, 0, len(r.order))
 	for _, name := range r.order {
 		schemas = append(schemas, buildToolSchema(r.tools[name]))
@@ -500,6 +524,8 @@ func (r *ToolRegistry) Schemas() []client.Tool {
 
 // SummaryList returns name+description for all registered tools.
 func (r *ToolRegistry) SummaryList() []ToolSummary {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	summaries := make([]ToolSummary, 0, len(r.order))
 	for _, name := range r.order {
 		info := r.tools[name].Info()
@@ -511,6 +537,8 @@ func (r *ToolRegistry) SummaryList() []ToolSummary {
 // FullSchemas returns complete client.Tool schemas for the named tools.
 // Unknown names are silently skipped.
 func (r *ToolRegistry) FullSchemas(names []string) []client.Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	schemas := make([]client.Tool, 0, len(names))
 	for _, name := range names {
 		if t, ok := r.tools[name]; ok {
@@ -523,7 +551,9 @@ func (r *ToolRegistry) FullSchemas(names []string) []client.Tool {
 // SortedSchemas returns tool schemas in deterministic order:
 // local tools (alpha) → MCP tools (alpha) → gateway tools (alpha).
 func (r *ToolRegistry) SortedSchemas() []client.Tool {
-	local, mcp, gw := r.partitionBySource()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	local, mcp, gw := r.partitionBySourceLocked()
 	sort.Strings(local)
 	sort.Strings(mcp)
 	sort.Strings(gw)
@@ -570,7 +600,9 @@ func buildToolSchema(t Tool) client.Tool {
 
 // SortedNames returns tool names in the same deterministic order as SortedSchemas.
 func (r *ToolRegistry) SortedNames() []string {
-	local, mcp, gw := r.partitionBySource()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	local, mcp, gw := r.partitionBySourceLocked()
 	sort.Strings(local)
 	sort.Strings(mcp)
 	sort.Strings(gw)
@@ -587,12 +619,20 @@ func (r *ToolRegistry) SortedNames() []string {
 // enumerations (e.g. iterating over distinct database UUIDs) do not trip the
 // NoProgress nudge on count alone.
 func (r *ToolRegistry) MCPNames() []string {
-	_, mcp, _ := r.partitionBySource()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, mcp, _ := r.partitionBySourceLocked()
 	return mcp
 }
 
 // partitionBySource groups tool names by their source category.
 func (r *ToolRegistry) partitionBySource() (local, mcp, gw []string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.partitionBySourceLocked()
+}
+
+func (r *ToolRegistry) partitionBySourceLocked() (local, mcp, gw []string) {
 	for _, name := range r.order {
 		t := r.tools[name]
 		if sourcer, ok := t.(ToolSourcer); ok {

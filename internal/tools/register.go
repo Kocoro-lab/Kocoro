@@ -502,7 +502,7 @@ func RegisterMemoryTool(reg *agent.ToolRegistry, svc MemoryQuerier, fallback Fal
 
 // RegisterCloudDelegate registers the cloud_delegate tool if cloud is enabled.
 func RegisterCloudDelegate(reg *agent.ToolRegistry, gw *client.GatewayClient, cfg *config.Config, handler agent.EventHandler, agentName, agentPrompt string) {
-	if cfg == nil || !cfg.Cloud.Enabled {
+	if cfg == nil || !cfg.Cloud.Enabled || cfg.APIKey == "" {
 		return
 	}
 	timeout := time.Duration(cfg.Cloud.Timeout) * time.Second

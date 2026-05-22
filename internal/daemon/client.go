@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,6 +15,14 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// ErrWSAuthRejected is the sentinel returned by Connect / RunWithReconnect
+// when Cloud answered the WS upgrade with HTTP 401. AuthManager observes
+// this through onAuthFailure (set by SetOnAuthFailure) and transitions
+// the daemon back to signed_out — RunWithReconnect must also abort its
+// retry loop rather than burning attempts on a key that Cloud has
+// already invalidated.
+var ErrWSAuthRejected = errors.New("websocket auth rejected")
 
 // MaxConcurrentAgents limits how many agent loops can run simultaneously.
 const MaxConcurrentAgents = 5
@@ -85,7 +94,6 @@ var Capabilities = []string{
 
 type Client struct {
 	endpoint      string
-	apiKey        string
 	conn          *websocket.Conn
 	writeMu       sync.Mutex
 	onMsg         func(MessagePayload) string // returns reply text
@@ -99,11 +107,54 @@ type Client struct {
 	startTime     time.Time
 	broker        *ApprovalBroker
 	eventBus      *EventBus
+
+	keyMu  sync.RWMutex
+	apiKey string
+
+	// onAuthFailure fires when Cloud rejects a WS upgrade with 401 —
+	// installed by AuthManager via SetOnAuthFailure. The callback runs
+	// asynchronously (go cb()) so it cannot deadlock against Client locks
+	// taken inside Connect / RunWithReconnect. Nil-tolerant: a daemon
+	// built without an AuthManager (non-darwin legacy path) simply skips
+	// the notification and lets RunWithReconnect exit on ErrWSAuthRejected.
+	onAuthFailure func()
 }
 
 // SetEventBus sets the event bus for emitting daemon events.
 func (c *Client) SetEventBus(bus *EventBus) {
 	c.eventBus = bus
+}
+
+// SetAPIKey swaps the api_key used in the WS upgrade Authorization
+// header. AuthManager calls this on login (bootstrap), sign-out (clear),
+// and Bootstrap (Keychain restore). Concurrent in-flight WS upgrades
+// captured the prior key at Connect-time via getAPIKey; subsequent
+// reconnect attempts use the new value.
+func (c *Client) SetAPIKey(key string) {
+	c.keyMu.Lock()
+	c.apiKey = key
+	c.keyMu.Unlock()
+}
+
+// SetOnAuthFailure registers the callback invoked when Connect observes
+// an HTTP 401 from the WS upgrade. Setting it to nil disables the
+// notification (RunWithReconnect still aborts on ErrWSAuthRejected).
+func (c *Client) SetOnAuthFailure(cb func()) {
+	c.keyMu.Lock()
+	c.onAuthFailure = cb
+	c.keyMu.Unlock()
+}
+
+func (c *Client) getAPIKey() string {
+	c.keyMu.RLock()
+	defer c.keyMu.RUnlock()
+	return c.apiKey
+}
+
+func (c *Client) getOnAuthFailure() func() {
+	c.keyMu.RLock()
+	defer c.keyMu.RUnlock()
+	return c.onAuthFailure
 }
 
 func NewClient(endpoint, apiKey string, onMsg func(MessagePayload) string, onSystem func(string)) *Client {
@@ -119,7 +170,7 @@ func NewClient(endpoint, apiKey string, onMsg func(MessagePayload) string, onSys
 
 func (c *Client) Connect(ctx context.Context) error {
 	header := http.Header{}
-	header.Set("Authorization", "Bearer "+c.apiKey)
+	header.Set("Authorization", "Bearer "+c.getAPIKey())
 	header.Set("User-Agent", fmt.Sprintf("kocoro/%s (%s; %s)", Version, runtime.GOOS, runtime.GOARCH))
 	header.Set("X-Kocoro-Daemon-Version", Version)
 	if len(Capabilities) > 0 {
@@ -128,8 +179,22 @@ func (c *Client) Connect(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
-	conn, _, err := dialer.DialContext(ctx, c.endpoint, header)
+	conn, resp, err := dialer.DialContext(ctx, c.endpoint, header)
 	if err != nil {
+		// Cloud rejected the upgrade with a real HTTP response (vs a
+		// pure transport error). 401 means the api_key is invalid —
+		// surface ErrWSAuthRejected and notify AuthManager so it can
+		// clear Keychain and transition to signed_out. RunWithReconnect
+		// detects the sentinel and stops retrying.
+		if resp != nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusUnauthorized {
+				if cb := c.getOnAuthFailure(); cb != nil {
+					go cb()
+				}
+				return fmt.Errorf("%w: %v", ErrWSAuthRejected, err)
+			}
+		}
 		return fmt.Errorf("websocket connect: %w", err)
 	}
 	c.conn = conn
@@ -509,7 +574,11 @@ func (c *Client) handleMessage(ctx context.Context, sm ServerMessage) {
 }
 
 // RunWithReconnect connects to the server and reconnects on failure with
-// exponential backoff. It blocks until the context is cancelled.
+// exponential backoff. It blocks until the context is cancelled OR Cloud
+// rejects the WS upgrade with HTTP 401 — in the latter case retrying is
+// counterproductive (key is invalid; backoff would only burn attempts)
+// so the loop exits and AuthManager.HandleWSAuthFailure (registered via
+// SetOnAuthFailure) cleans up.
 func (c *Client) RunWithReconnect(ctx context.Context) {
 	backoff := time.Second
 	maxBackoff := 30 * time.Second
@@ -521,6 +590,10 @@ func (c *Client) RunWithReconnect(ctx context.Context) {
 		}
 		if err := c.Connect(ctx); err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			if errors.Is(err, ErrWSAuthRejected) {
+				log.Printf("daemon: ws auth rejected by Cloud; stopping reconnect loop")
 				return
 			}
 			log.Printf("daemon: connect failed: %v (retry in %v)", err, backoff)

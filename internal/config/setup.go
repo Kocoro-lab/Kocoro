@@ -9,10 +9,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
+	"testing"
 	"time"
 
 	"golang.org/x/term"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
 )
 
 const DefaultEndpoint = "https://api-dev.shannon.run"
@@ -22,9 +26,22 @@ const (
 	hintLocal = "Running locally? See https://github.com/Kocoro-lab/Shannon for self-hosting docs."
 )
 
+// keychainStoreOpener returns the Keychain store used by setup-time
+// codepaths (Load hydration, setupGateway api_key persist). Production
+// uses keychain.NewOSStore which talks to macOS Keychain; tests replace
+// this with an in-memory backend to avoid polluting the developer's
+// real Keychain.
+//
+// Returns nil-Store + non-nil-err on non-darwin (ErrUnsupportedPlatform)
+// so callers can short-circuit cleanly.
+var keychainStoreOpener = func() (*keychain.Store, error) {
+	return keychain.NewOSStore(nil)
+}
+
 // NeedsSetup returns true if the config has no API key and the endpoint
 // is not a local address (localhost/127.0.0.1 bypass auth).
-// Ollama provider never needs gateway setup.
+// Ollama provider never needs gateway setup. Load hydrates cfg.APIKey from
+// Keychain on macOS before callers reach this check.
 func NeedsSetup(cfg *Config) bool {
 	if cfg.Provider == "ollama" {
 		return cfg.Ollama.Model == "" // model required for ollama to be usable
@@ -33,6 +50,25 @@ func NeedsSetup(cfg *Config) bool {
 		return false
 	}
 	return !isLocalEndpoint(cfg.Endpoint)
+}
+
+func hydrateAPIKeyFromKeychain(cfg *Config) {
+	if cfg == nil || cfg.APIKey != "" || runtime.GOOS != "darwin" {
+		return
+	}
+	if testing.Testing() && os.Getenv("KOCORO_FORCE_KEYCHAIN_HYDRATE") != "1" {
+		return
+	}
+	store, err := keychainStoreOpener()
+	if err != nil {
+		return
+	}
+	apiKey, err := store.GetAPIKey()
+	if err != nil {
+		return
+	}
+	cfg.APIKey = strings.TrimSpace(apiKey)
+	cfg.apiKeyFromKeychain = cfg.APIKey != ""
 }
 
 // RunSetup runs the interactive setup flow, prompting the user for
@@ -135,6 +171,22 @@ func setupGateway(cfg *Config, in io.Reader, reader *bufio.Reader, out io.Writer
 
 		fmt.Fprintln(out, "OK")
 		break
+	}
+
+	// On macOS, route the pasted api_key into the Keychain "legacy" account
+	// so AuthManager.Bootstrap can adopt it (resolve user_id via /auth/me,
+	// rename the entry). Clear cfg.APIKey so it does not end up in yaml.
+	// Other platforms continue to persist cfg.APIKey to yaml (legacy path).
+	if runtime.GOOS == "darwin" && cfg.APIKey != "" {
+		if store, err := keychainStoreOpener(); err == nil {
+			if err := store.Write(keychain.ServiceDaemonAPIKey, keychain.AccountLegacy, cfg.APIKey); err == nil {
+				_ = store.Write(keychain.ServiceDaemonState, keychain.AccountCurrentUser, keychain.AccountLegacy)
+				cfg.APIKey = ""
+				fmt.Fprintln(out, "API key stored in macOS Keychain (ai.kocoro.daemon.api_key).")
+			} else {
+				fmt.Fprintf(out, "Warning: could not write keychain (%v); falling back to yaml plaintext.\n", err)
+			}
+		}
 	}
 
 	return nil

@@ -2455,9 +2455,13 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		}
 	}
 
+	apiKey := cfg.APIKey
+	if deps.GW != nil {
+		apiKey = deps.GW.APIKey()
+	}
 	cf := cloudflow.Request{
 		Gateway:      deps.GW,
-		APIKey:       cfg.APIKey,
+		APIKey:       apiKey,
 		Query:        cmd.Query,
 		WorkflowType: cmd.Type,
 		Strategy:     cmd.Strategy,

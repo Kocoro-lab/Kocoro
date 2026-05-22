@@ -51,6 +51,9 @@ internal/
     readtracker_cache.go # Per-session ReadTracker cache
     suggestion_handler.go # GET /suggestion + POST /accept
     uploads_handler.go # /uploads GET (list) + DELETE (retract) proxies
+    auth.go            # AuthManager state machine (email/password, macOS-only)
+    auth_handlers.go   # /local/auth/* handlers (state, register, login, sign-out, …)
+    ws_controller.go   # WS goroutine start/stop driven by AuthManager
   agent/
     loop.go              # AgentLoop.Run(), SwitchAgent()
     tools.go             # Tool interface, ToolRegistry
@@ -81,7 +84,8 @@ internal/
     suggestion_state.go  # Per-session suggestion text/state
     forkedrequest.go     # BuildForkedRequest (byte-equality contract)
   agents/                # AGENT.md loader, CRUD, validate, embed.FS builtins
-  client/                # GatewayClient (Anthropic via Cloud), OllamaClient, SSE
+  keychain/              # macOS Keychain wrapper (Backend interface + osBackend/memBackend); api_key source of truth
+  client/                # GatewayClient (Anthropic via Cloud), OllamaClient, SSE, AuthClient (/auth/*)
   cloudflow/             # /research, /swarm Gateway workflow runner
   heartbeat/             # Per-agent HEARTBEAT.md + alerts
   watcher/               # Per-agent debounced FS watcher
@@ -116,6 +120,7 @@ Feature changes update README.md (user-facing), CLAUDE.md (this file, developer-
 **Kocoro skill is the AI's source of truth for the daemon HTTP API** — every `mux.HandleFunc(...)` in `internal/daemon/server.go` must have a matching entry in `internal/skills/bundled/skills/kocoro/references/*.md`. When adding endpoints, update the matching reference file in the same PR. Maps:
 - agents/skills/schedules/config endpoints → `references/{agents,skills,schedules,config}.md`
 - MCP / permissions / project-init / instructions / recipes / session-sync / memory → matching `references/*.md`
+- `/local/auth/*` endpoints → `references/auth.md`
 - Protected config fields, tool filter → `SKILL.md` security section
 
 ### Hardcoded Limit Policy
@@ -197,6 +202,7 @@ Unknown tools → denied (fail-safe). Always-ask gate runs BEFORE the allowlist,
 | Thinking blocks | `client.ContentBlock` + `agent.buildAssistantMessage` | Cloud relays full ordered `content_blocks` incl. `thinking`/`redacted_thinking`. Persisted verbatim; `internal/sync/strip_thinking.go` removes from upload-side copy before size check. Sanitizers in `messagesForLLM` / time-based / micro-compact / `BuildForkedRequest` preserve them. |
 | Conditional `think` tool | `tools/register.go shouldRegisterThinkTool` | Not registered on default gateway+thinking path. Still registered when thinking disabled, Ollama provider, or `ForceThinkTool=true`. `operationalRules()` strips `### Planning` bullet only when think absent, keeping prompt byte-equal otherwise. |
 | Prompt suggestion | `agent/suggestion.go` | Forked LLM call after each main turn. **CACHE SAFETY**: byte-equal to main request except 2 appended messages + `SkipCacheWrite: true`. Any other divergence fragments the cache. |
+| Email/password auth (macOS only) | `internal/daemon/auth.go` + `auth_handlers.go` + `ws_controller.go` + `internal/keychain/` + `internal/client/auth.go` | `/local/auth/{state,register,login,resend-verification,forgot-password,sign-out,sign-out-full}` proxy to Cloud `/api/v1/auth/*`. AuthManager state machine drives WS lifecycle via WSController — WS only runs in `signed_in` state. `auth_state_changed` event broadcasts transitions over SSE. api_key persisted in Keychain (`ai.kocoro.daemon.api_key/<user_id>`); yaml `api_key` field is migrated away on first launch (v1 migration in `internal/config/migrate.go`). Non-darwin: AuthManager is nil, endpoints return 503, legacy cfg.APIKey path used. |
 
 ### Daemon Approval Protocol
 
@@ -246,6 +252,7 @@ Scalars override, lists merge+dedup, structs field-level merge. MCP server env-v
 - Schedules: `~/.shannon/schedules.json` + `~/Library/LaunchAgents/com.shannon.schedule.<id>.plist`
 - Notification history: `~/.shannon/notifications.jsonl` (JSONL append-only, capped at 500 entries; trimmed + atomically rewritten on daemon startup, survives restarts)
 - Skill secrets index: `~/.shannon/secrets-index.json` (chmod 600, flock-protected, names only); values in macOS Keychain (service `com.shannon.skill.<name>`)
+- Daemon api_key (macOS only): macOS Keychain service `ai.kocoro.daemon.api_key`, account = Cloud user_id (UUID). Active user pointer at service `ai.kocoro.daemon.state`, account `current_user_id`. `cfg.APIKey` (yaml) is now empty after the v1 migration; Bootstrap reads Keychain instead
 - Sync: marker `~/.shannon/sync_marker.json`, lock `~/.shannon/sync.lock` (never delete), dry-run outbox `~/.shannon/sync_outbox/`
 - Logs: `~/.shannon/logs/audit.log`, `~/.shannon/logs/schedule-<id>.log`
 - Memory: socket `~/.shannon/memory.sock`, bundle root `~/.shannon/memory/`

@@ -7,10 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strings"
 	"syscall"
+	"testing"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
 )
 
 // One-shot config migrations applied at binary startup. Each Migration:
@@ -32,6 +37,7 @@ const (
 	migrationsFileName               = "migrations.json"
 	migrationsLockName               = "migrations.lock"
 	migrationIDContextWindow128To200 = "context_window_128_to_200"
+	migrationIDAPIKeyToKeychain      = "api_key_to_keychain_v1"
 )
 
 // Migration is the contract every one-shot upgrade transform implements.
@@ -57,6 +63,7 @@ type migrationRecord struct {
 // shannon dir (typically irrelevant since each migration is independent).
 var registeredMigrations = []Migration{
 	&contextWindow128To200Migration{},
+	&apiKeyToKeychainMigration{},
 }
 
 // RunPendingMigrations executes any migrations not yet recorded in
@@ -262,4 +269,129 @@ func replaceIndentedIntLine(raw []byte, key string, oldVal, newVal int) ([]byte,
 	}
 	replacement := fmt.Sprintf("${1}%d${2}", newVal)
 	return []byte(re.ReplaceAllString(string(raw), replacement)), true
+}
+
+// apiKeyToKeychainMigration moves a plaintext top-level `api_key` from
+// ~/.shannon/config.yaml into the macOS Keychain (service
+// ai.kocoro.daemon.api_key, account "legacy"). AuthManager.Bootstrap then
+// resolves the account to the real user_id on the next /auth/me call.
+//
+// Behavior matrix:
+//   - Non-darwin → no-op success (Keychain unavailable; daemon keeps using
+//     cfg.APIKey from yaml on legacy code paths).
+//   - yaml absent or no api_key field → no-op success.
+//   - Keychain already has an entry for the same key bytes → still delete
+//     the yaml field (cleanup).
+//   - Keychain write fails → return error, marker not recorded, retry
+//     next launch (don't strand the key — keep yaml intact).
+//
+// Backup file uses the same suffix convention as context_window
+// migration so users have one place to look for forensics.
+type apiKeyToKeychainMigration struct{}
+
+func (m *apiKeyToKeychainMigration) ID() string { return migrationIDAPIKeyToKeychain }
+
+func (m *apiKeyToKeychainMigration) Apply(shannonDir string) (bool, error) {
+	if runtime.GOOS != "darwin" {
+		return false, nil
+	}
+	// Skip the actual Keychain write under `go test` runs. zalando/go-keyring
+	// shells out to the macOS `security` binary which prompts the user
+	// (e.g. "kocoro wants to use the Keychain") through the GUI; in a
+	// headless CI runner there is no UI to dismiss it and the call hangs
+	// indefinitely, killing the test with a timeout. testing.Testing() is
+	// the Go-1.21+ standard guard for this kind of side-effect skip.
+	//
+	// Setting KOCORO_FORCE_KEYCHAIN_MIGRATION=1 re-enables it for the rare
+	// case where an integration test actually wants to exercise the path
+	// (running with `security` already authorized, or via mocked keychain).
+	if testing.Testing() && os.Getenv("KOCORO_FORCE_KEYCHAIN_MIGRATION") != "1" {
+		return false, nil
+	}
+	cfgPath := filepath.Join(shannonDir, "config.yaml")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	var probe struct {
+		APIKey string `yaml:"api_key"`
+	}
+	if err := yaml.Unmarshal(raw, &probe); err != nil {
+		// Malformed yaml — leave alone; viper will surface the error.
+		return false, nil
+	}
+	apiKey := strings.TrimSpace(probe.APIKey)
+	if apiKey == "" {
+		return false, nil
+	}
+
+	store, err := keychain.NewOSStore(nil)
+	if err != nil {
+		// macOS but keyring access denied (CI sandbox, Headless SSH).
+		// Don't strand the key — leave yaml intact and retry next launch.
+		return false, fmt.Errorf("open keychain: %w", err)
+	}
+	// Write under "legacy" account; AuthManager.Bootstrap renames it
+	// after /auth/me resolves the real user_id. If an entry already
+	// exists (re-run after partial failure) overwrite — same key bytes
+	// either way.
+	if err := store.Write(keychain.ServiceDaemonAPIKey, keychain.AccountLegacy, apiKey); err != nil {
+		return false, fmt.Errorf("keychain write: %w", err)
+	}
+	if err := store.Write(keychain.ServiceDaemonState, keychain.AccountCurrentUser, keychain.AccountLegacy); err != nil {
+		return false, fmt.Errorf("keychain write current_user_id: %w", err)
+	}
+
+	// Strip api_key from yaml. Preserve original mode + formatting via a
+	// regex line removal — yaml.Marshal would reformat the file.
+	info, err := os.Stat(cfgPath)
+	if err != nil {
+		return true, fmt.Errorf("stat config (key already in keychain): %w", err)
+	}
+	origMode := info.Mode().Perm()
+
+	newRaw, removed := removeTopLevelLine(raw, "api_key")
+	if !removed {
+		// yaml said api_key existed but we couldn't surgical-remove it
+		// (flow-style mapping, multi-line). Leave yaml alone — Keychain
+		// already has the key so daemon still works; the yaml field
+		// continues to exist as a (now-redundant) plaintext entry. User
+		// can clear it manually.
+		return true, nil
+	}
+
+	backupPath := cfgPath + ".pre-migrate-" + time.Now().UTC().Format("20060102T150405Z") + ".bak"
+	if err := os.WriteFile(backupPath, raw, origMode); err != nil {
+		return true, fmt.Errorf("write backup: %w", err)
+	}
+
+	tmpPath := cfgPath + ".migrate.tmp"
+	if err := os.WriteFile(tmpPath, newRaw, origMode); err != nil {
+		return true, fmt.Errorf("write tmp yaml: %w", err)
+	}
+	if err := os.Rename(tmpPath, cfgPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return true, fmt.Errorf("rename yaml: %w", err)
+	}
+	return true, nil
+}
+
+// removeTopLevelLine deletes the first occurrence of a top-level
+// `<key>: <anything>` line from raw yaml. Returns (raw, false) when the
+// key cannot be matched at the top level.
+//
+// Block-scalar values (key: |  / key: >) and flow-style mappings would
+// require a real yaml parser to handle safely; here we deliberately bail
+// in those cases (returning false) rather than risk corruption.
+func removeTopLevelLine(raw []byte, key string) ([]byte, bool) {
+	pattern := fmt.Sprintf(`(?m)^%s:[^\n]*\n?`, regexp.QuoteMeta(key))
+	re := regexp.MustCompile(pattern)
+	if !re.Match(raw) {
+		return raw, false
+	}
+	return re.ReplaceAll(raw, nil), true
 }

@@ -17,10 +17,11 @@ Kocoro is the Go CLI/runtime for Shannon AI agents. The main production path is 
 ## Module Map
 
 - cmd: CLI entry points for one-shot, daemon, scheduling, update, and MCP serve.
-- internal/daemon: primary production path; HTTP API server, WebSocket client, routing, approvals, events, launchd, attachments, session CWD, memory fallback, suggestions.
+- internal/daemon: primary production path; HTTP API server, WebSocket client, routing, approvals, events, launchd, attachments, session CWD, memory fallback, suggestions, email/password auth (`auth.go` / `auth_handlers.go` / `ws_controller.go`).
 - internal/agent: core loop; tool batching, compaction, spill/budget state, deferred loading, state cache, read tracking, approvals, phase/watchdog, thinking handling, prompt suggestions, forked requests.
 - internal/tools: local, gateway, cloud, schedule, publish/upload, image, memory, MCP, and document tools.
-- internal/client: gateway/SSE/Ollama clients.
+- internal/keychain: macOS Keychain wrapper for daemon api_key (Backend interface + osBackend/memBackend; non-darwin returns ErrUnsupportedPlatform).
+- internal/client: gateway/SSE/Ollama clients plus AuthClient (`/api/v1/auth/*` REST wrapper).
 - internal/session: session persistence, lifecycle, titles, and SQLite FTS index.
 - internal/config: config loading, merging, settings, and setup.
 - internal/skills: skill registry, bundled skills, marketplace install, provenance, secrets, validation.
@@ -130,6 +131,10 @@ Persistent JSON indexes use write-temp, rename, and flock on a stable lock file.
 ### Memory
 
 Memory sidecar lifecycle belongs to the daemon. CLI/TUI attach or probe; they do not spawn unless explicitly designed to. API key bytes must never hit disk or audit logs; only content-free state and fingerprints are logged.
+
+### Auth (macOS only)
+
+`/local/auth/*` endpoints proxy to Shannon Cloud `/api/v1/auth/*`. `AuthManager` (`internal/daemon/auth.go`) owns the state machine (`signed_out` / `pending_verification` / `logging_in` / `bootstrapping_key` / `signed_in`); transitions emit `auth_state_changed` on the event bus. WS connection runs only in `signed_in` — `WSController.Start` / `Stop` are the only allowed call sites for spinning the reconnect loop. api_key is the source-of-truth credential and lives in macOS Keychain (service `ai.kocoro.daemon.api_key`); access_token / refresh_token are RAM only. On non-darwin platforms `AuthManager` is nil, the endpoints respond 503, and the legacy `cfg.APIKey` path continues to drive WS. See `internal/skills/bundled/skills/kocoro/references/auth.md` for the full endpoint matrix and recovery scenarios.
 
 Implicit episodic preflight is in-message-only: it may inject private memory into the current request, but it must never persist to transcripts, replay, or summaries. Audit only content-free counts/status/error class.
 
