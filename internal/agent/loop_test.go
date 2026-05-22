@@ -5555,3 +5555,149 @@ func TestAgentLoop_WhitespaceOnlyTextBlock_RecoveryReturnsEmpty(t *testing.T) {
 		t.Errorf("whitespace-only text block must NOT be treated as recovered visible text; got err=%v", err)
 	}
 }
+
+// Inconsistent-finish detection: when Cloud yields finish_reason=tool_use
+// but no tool_calls AND no visible text (only thinking blocks), the daemon
+// must NOT immediately return ErrEmptyFinalResponse. Instead it retries the
+// current iteration once with the same request; if the retry recovers (text
+// or tool_calls), the run continues normally.
+//
+// This is the daemon-side defense for the shape that shannon-cloud's retry
+// guard is supposed to catch. Both repos defend it (defense-in-depth).
+//
+// The thinking block matters: the real 2026-05-22 audit row had
+// blocks=[thinking] + output_tokens=10233 (10K tokens of reasoning that
+// went into thinking, with no tool_use block landing). A test that emits
+// "no blocks at all" would still trip the detection, but would not
+// reproduce the actual production shape — assertions on the
+// empty_with_inconsistent_finish audit row's blocks field pin that.
+func TestAgentLoop_InconsistentFinish_ToolUseWithoutBlock_RetriesAndRecovers(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// First call: inconsistent shape — finish_reason=tool_use, no
+			// tool_use block, only a thinking block. Exact pattern from the
+			// 2026-05-22 audit row (input=146, output=10233, blocks=[thinking]).
+			resp := nativeResponse("", "tool_use", nil, 146, 10233)
+			resp.ContentBlocks = []client.ContentBlock{
+				{Type: "thinking", Thinking: "long internal reasoning", Signature: "sig"},
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+		// Retry: real text answer.
+		json.NewEncoder(w).Encode(nativeResponse("recovered", "end_turn", nil, 100, 5))
+	}))
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+
+	out, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if err != nil {
+		t.Fatalf("expected nil error on recovery, got %v", err)
+	}
+	if out != "recovered" {
+		t.Errorf("expected recovered text, got %q", out)
+	}
+	if callCount != 2 {
+		t.Errorf("expected exactly 2 calls (initial + 1 retry), got %d", callCount)
+	}
+
+	// Audit row attribution: post-incident triage needs to distinguish
+	// recoveries via this branch from the legitimate end_turn empty case.
+	entries := readAuditLines(t, logDir)
+	var found map[string]any
+	for _, e := range entries {
+		if e["event"] == "empty_with_inconsistent_finish" {
+			found = e
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected empty_with_inconsistent_finish audit row, got none in %d entries", len(entries))
+	}
+	in, _ := found["input_summary"].(string)
+	outSum, _ := found["output_summary"].(string)
+	if !strings.Contains(in, "finish_reason=tool_use") {
+		t.Errorf("audit row should record finish_reason=tool_use, got %q", in)
+	}
+	if !strings.Contains(outSum, "blocks=[thinking]") {
+		t.Errorf("audit row should record blocks=[thinking], got %q", outSum)
+	}
+}
+
+// Bound: after maxInconsistentFinishRetries, the daemon stops retrying and
+// returns ErrEmptyFinalResponse so the user gets the friendly fallback.
+func TestAgentLoop_InconsistentFinish_RetryBudgetExhausted_ReturnsEmptyFinalResponse(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		// Every call returns the same inconsistent shape — sampling never recovers.
+		resp := nativeResponse("", "tool_use", nil, 146, 10233)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "thinking", Thinking: "long internal reasoning", Signature: "sig"},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	_, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if err == nil {
+		t.Fatal("expected ErrEmptyFinalResponse after retry exhausted, got nil")
+	}
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Errorf("expected ErrEmptyFinalResponse, got %v", err)
+	}
+	// 1 initial + maxInconsistentFinishRetries (1) = 2 calls before giving up.
+	if callCount != 2 {
+		t.Errorf("expected 2 calls (initial + 1 retry), got %d", callCount)
+	}
+}
+
+// Negative: a legitimate finish_reason=tool_use WITH a tool_use block must
+// dispatch the tool normally — the new retry branch must not interfere.
+func TestAgentLoop_InconsistentFinish_LegitimateToolUseDispatchesNormally(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// Real tool_use with a real block — must NOT trigger retry.
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("mock_tool", `{"path":"/tmp/x","content":"y"}`), 100, 50))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 50, 5))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	mt := &mockTool{name: "mock_tool", required: []string{"path", "content"}}
+	reg.Register(mt)
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	out, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "done" {
+		t.Errorf("expected done, got %q", out)
+	}
+	// 1 = LLM tool_use call, 2 = LLM final response. No retry inserted.
+	if callCount != 2 {
+		t.Errorf("expected 2 calls (tool_use + final), got %d", callCount)
+	}
+}
