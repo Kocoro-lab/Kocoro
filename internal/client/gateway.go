@@ -977,6 +977,15 @@ func (c *GatewayClient) getAPIKey() string {
 	return c.apiKey
 }
 
+// APIKey returns the current api_key used for gateway-adjacent callers that
+// need to build their own Cloud clients while sharing AuthManager's live key.
+func (c *GatewayClient) APIKey() string {
+	if c == nil {
+		return ""
+	}
+	return c.getAPIKey()
+}
+
 // Complete sends a completion request to the gateway's /v1/completions endpoint.
 // This endpoint is a thin proxy to the LLM service that returns raw function_call
 // responses for client-side tool execution.

@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"testing"
 	"time"
 
 	"golang.org/x/term"
@@ -26,7 +27,7 @@ const (
 )
 
 // keychainStoreOpener returns the Keychain store used by setup-time
-// codepaths (NeedsSetup probe, setupGateway api_key persist). Production
+// codepaths (Load hydration, setupGateway api_key persist). Production
 // uses keychain.NewOSStore which talks to macOS Keychain; tests replace
 // this with an in-memory backend to avoid polluting the developer's
 // real Keychain.
@@ -39,11 +40,8 @@ var keychainStoreOpener = func() (*keychain.Store, error) {
 
 // NeedsSetup returns true if the config has no API key and the endpoint
 // is not a local address (localhost/127.0.0.1 bypass auth).
-// Ollama provider never needs gateway setup.
-//
-// On macOS we ALSO consider a Keychain api_key as "configured" so users
-// who logged in via Kocoro Desktop (/local/auth/login) are not re-prompted
-// to paste a key in `shan --setup` on the next CLI invocation.
+// Ollama provider never needs gateway setup. Load hydrates cfg.APIKey from
+// Keychain on macOS before callers reach this check.
 func NeedsSetup(cfg *Config) bool {
 	if cfg.Provider == "ollama" {
 		return cfg.Ollama.Model == "" // model required for ollama to be usable
@@ -51,14 +49,26 @@ func NeedsSetup(cfg *Config) bool {
 	if cfg.APIKey != "" {
 		return false
 	}
-	if runtime.GOOS == "darwin" {
-		if store, err := keychainStoreOpener(); err == nil {
-			if k, _ := store.GetAPIKey(); k != "" {
-				return false
-			}
-		}
-	}
 	return !isLocalEndpoint(cfg.Endpoint)
+}
+
+func hydrateAPIKeyFromKeychain(cfg *Config) {
+	if cfg == nil || cfg.APIKey != "" || runtime.GOOS != "darwin" {
+		return
+	}
+	if testing.Testing() && os.Getenv("KOCORO_FORCE_KEYCHAIN_HYDRATE") != "1" {
+		return
+	}
+	store, err := keychainStoreOpener()
+	if err != nil {
+		return
+	}
+	apiKey, err := store.GetAPIKey()
+	if err != nil {
+		return
+	}
+	cfg.APIKey = strings.TrimSpace(apiKey)
+	cfg.apiKeyFromKeychain = cfg.APIKey != ""
 }
 
 // RunSetup runs the interactive setup flow, prompting the user for

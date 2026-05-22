@@ -182,8 +182,8 @@ func TestAuthMock_RegisterToLogin_FullFlow(t *testing.T) {
 	if am.mgr.State() != daemon.AuthStateSignedIn {
 		t.Fatalf("state=%q want signed_in", am.mgr.State())
 	}
-	if am.cfg.APIKey != "sk_minted" {
-		t.Fatalf("cfg.APIKey=%q", am.cfg.APIKey)
+	if am.gw.APIKey() != "sk_minted" {
+		t.Fatalf("gateway api key=%q", am.gw.APIKey())
 	}
 	if u, k, _ := am.keychain.GetActiveUserAndKey(); u != "user-1" || k != "sk_minted" {
 		t.Fatalf("keychain user=%q key=%q", u, k)
@@ -210,8 +210,8 @@ func TestAuthMock_RegisterToLogin_FullFlow(t *testing.T) {
 	if k, _ := am.keychain.GetAPIKey(); k != "sk_minted" {
 		t.Fatalf("sign-out should preserve keychain, got %q", k)
 	}
-	if am.cfg.APIKey != "" {
-		t.Fatalf("sign-out should clear cfg.APIKey, got %q", am.cfg.APIKey)
+	if am.gw.APIKey() != "" {
+		t.Fatalf("sign-out should clear gateway api key, got %q", am.gw.APIKey())
 	}
 
 	// 7) Sign back in reuses existing Keychain key (no api-keys call)

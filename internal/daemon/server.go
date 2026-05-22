@@ -288,6 +288,27 @@ func (s *Server) SetAuth(a *AuthManager) {
 	s.auth = a
 }
 
+func (s *Server) liveAPIKey(cfg *config.Config) string {
+	if s != nil && s.auth != nil && s.deps != nil && s.deps.GW != nil {
+		return s.deps.GW.APIKey()
+	}
+	if cfg == nil {
+		return ""
+	}
+	return cfg.APIKey
+}
+
+func (s *Server) configWithLiveAPIKey(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return nil
+	}
+	out := config.Clone(cfg)
+	if s != nil && s.auth != nil && s.deps != nil && s.deps.GW != nil {
+		out.APIKey = s.deps.GW.APIKey()
+	}
+	return out
+}
+
 // RegisterAuthRoutes wires only the /local/auth/* endpoints onto mux.
 // Used by E2E tests that need a focused handler tree without the full
 // route surface (which would 500 on nil deps).
@@ -317,7 +338,7 @@ func (s *Server) RebuildAuthSensitiveTools(_ context.Context) {
 	if s == nil || s.deps == nil || s.deps.Registry == nil || s.deps.GW == nil {
 		return
 	}
-	cfg := s.deps.Config
+	cfg := s.configWithLiveAPIKey(s.deps.Config)
 	if cfg == nil {
 		return
 	}
@@ -1562,51 +1583,51 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 			// req.Content via resolveContentBlocks).
 		} else {
 			switch s.deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{Text: req.Text, CWD: req.CWD}) {
-		case InjectOK:
-			if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.Header().Set("Cache-Control", "no-cache")
-				w.Header().Set("Connection", "keep-alive")
-				fmt.Fprintf(w, "event: injected\ndata: %s\n\n", req.RouteKey)
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
+			case InjectOK:
+				if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.Header().Set("Cache-Control", "no-cache")
+					w.Header().Set("Connection", "keep-alive")
+					fmt.Fprintf(w, "event: injected\ndata: %s\n\n", req.RouteKey)
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					return
 				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "injected",
+					"route":  req.RouteKey,
+				})
 				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{
-				"status": "injected",
-				"route":  req.RouteKey,
-			})
-			return
-		case InjectQueueFull:
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusTooManyRequests)
-			json.NewEncoder(w).Encode(map[string]string{
-				"status": "rejected",
-				"reason": "queue_full",
-				"route":  req.RouteKey,
-			})
-			return
-		case InjectBusy:
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(map[string]string{
-				"status": "rejected",
-				"reason": "active_run_not_ready",
-				"route":  req.RouteKey,
-			})
-			return
-		case InjectCWDConflict:
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(map[string]string{
-				"status": "rejected",
-				"reason": "cwd_conflict",
-				"route":  req.RouteKey,
-			})
-			return
-		case InjectNoActiveRun:
+			case InjectQueueFull:
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "rejected",
+					"reason": "queue_full",
+					"route":  req.RouteKey,
+				})
+				return
+			case InjectBusy:
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "rejected",
+					"reason": "active_run_not_ready",
+					"route":  req.RouteKey,
+				})
+				return
+			case InjectCWDConflict:
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "rejected",
+					"reason": "cwd_conflict",
+					"route":  req.RouteKey,
+				})
+				return
+			case InjectNoActiveRun:
 				// Fall through to start a new RunAgent
 			}
 		}
@@ -4178,12 +4199,13 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		if regErr != nil {
 			log.Printf("daemon: reload warning: %v", regErr)
 		}
-		tools.RegisterCloudDelegate(newReg, s.deps.GW, newCfg, nil, "", "")
-		tools.RegisterPublishTool(newReg, s.deps.GW, newCfg)
-		tools.RegisterListPublishedFilesTool(newReg, s.deps.GW, newCfg)
-		tools.RegisterRetractPublishedFileTool(newReg, s.deps.GW, newCfg)
-		tools.RegisterGenerateImageTool(newReg, s.deps.GW, newCfg)
-		tools.RegisterEditImageTool(newReg, s.deps.GW, newCfg)
+		toolCfg := s.configWithLiveAPIKey(newCfg)
+		tools.RegisterCloudDelegate(newReg, s.deps.GW, toolCfg, nil, "", "")
+		tools.RegisterPublishTool(newReg, s.deps.GW, toolCfg)
+		tools.RegisterListPublishedFilesTool(newReg, s.deps.GW, toolCfg)
+		tools.RegisterRetractPublishedFileTool(newReg, s.deps.GW, toolCfg)
+		tools.RegisterGenerateImageTool(newReg, s.deps.GW, toolCfg)
+		tools.RegisterEditImageTool(newReg, s.deps.GW, toolCfg)
 
 		newGatewayOverlay := tools.ExtractGatewayTools(newReg)
 		newPostOverlays := tools.ExtractPostOverlays(newReg, newBaseline)
@@ -4251,12 +4273,13 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		gwCtx, gwCancel := context.WithTimeout(r.Context(), 5*time.Second)
 		gwErr := tools.RegisterServerTools(gwCtx, s.deps.GW, freshReg)
 		gwCancel()
-		tools.RegisterCloudDelegate(freshReg, s.deps.GW, newCfg, nil, "", "")
-		tools.RegisterPublishTool(freshReg, s.deps.GW, newCfg)
-		tools.RegisterListPublishedFilesTool(freshReg, s.deps.GW, newCfg)
-		tools.RegisterRetractPublishedFileTool(freshReg, s.deps.GW, newCfg)
-		tools.RegisterGenerateImageTool(freshReg, s.deps.GW, newCfg)
-		tools.RegisterEditImageTool(freshReg, s.deps.GW, newCfg)
+		toolCfg := s.configWithLiveAPIKey(newCfg)
+		tools.RegisterCloudDelegate(freshReg, s.deps.GW, toolCfg, nil, "", "")
+		tools.RegisterPublishTool(freshReg, s.deps.GW, toolCfg)
+		tools.RegisterListPublishedFilesTool(freshReg, s.deps.GW, toolCfg)
+		tools.RegisterRetractPublishedFileTool(freshReg, s.deps.GW, toolCfg)
+		tools.RegisterGenerateImageTool(freshReg, s.deps.GW, toolCfg)
+		tools.RegisterEditImageTool(freshReg, s.deps.GW, toolCfg)
 		var newGatewayOverlay []agent.Tool
 		if gwErr != nil {
 			log.Printf("daemon: reload: gateway refresh failed, keeping existing overlay: %v", gwErr)

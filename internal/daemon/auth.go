@@ -49,8 +49,9 @@ type authSnapshot struct {
 }
 
 // AuthManagerConfig collects the daemon dependencies AuthManager needs to
-// operate. All fields are required EXCEPT OnAPIKeyChanged (nil → skip
-// tool rebuild) and WSController (nil → skip WS lifecycle).
+// operate. All fields are required EXCEPT Cfg (legacy callers/tests may still
+// pass it), OnAPIKeyChanged (nil → skip tool rebuild), and WSController
+// (nil → skip WS lifecycle).
 type AuthManagerConfig struct {
 	Keychain        *keychain.Store
 	Cloud           *client.AuthClient
@@ -80,7 +81,6 @@ type AuthManager struct {
 	wsClient        *Client
 	wsCtl           *WSController
 	bus             *EventBus
-	cfg             *config.Config
 	onAPIKeyChanged func(context.Context)
 	logger          *log.Logger
 	sf              singleflight.Group
@@ -102,7 +102,6 @@ func NewAuthManager(cfg AuthManagerConfig) *AuthManager {
 		cloud:           cfg.Cloud,
 		gw:              cfg.Gateway,
 		wsClient:        cfg.WSClient,
-		cfg:             cfg.Cfg,
 		onAPIKeyChanged: cfg.OnAPIKeyChanged,
 		logger:          logger,
 	}
@@ -205,12 +204,12 @@ func (a *AuthManager) setState(s AuthState, user *client.AuthUser, errCode strin
 
 // Bootstrap recovers a prior sign-in from Keychain on daemon startup. The
 // algorithm:
-//   1) Keychain empty → stay signed_out (default state, no event needed).
-//   2) Active user == AccountLegacy → call /auth/me with the legacy key,
-//      resolve real user_id, rename the entry, then enter signed_in.
-//   3) Otherwise → call /auth/me; 401 means stale key, clear Keychain and
-//      stay signed_out. Network error → optimistic signed_in (WS will
-//      retry; if it 401s, HandleWSAuthFailure tears down).
+//  1. Keychain empty → stay signed_out (default state, no event needed).
+//  2. Active user == AccountLegacy → call /auth/me with the legacy key,
+//     resolve real user_id, rename the entry, then enter signed_in.
+//  3. Otherwise → call /auth/me; 401 means stale key, clear Keychain and
+//     stay signed_out. Network error → optimistic signed_in (WS will
+//     retry; if it 401s, HandleWSAuthFailure tears down).
 //
 // Bootstrap is non-blocking by design — cmd/daemon.go launches it in a
 // goroutine so the HTTP server is up immediately.
@@ -291,11 +290,11 @@ func (a *AuthManager) Register(ctx context.Context, req client.AuthRegisterReque
 
 // deriveUsername builds a Cloud-compatible username from an email
 // address. Cloud requires 3-50 chars, must be globally unique. Strategy:
-//   1) Take everything before '@' (or whole string if no '@').
-//   2) Lowercase + replace non-[a-z0-9_] with '_'.
-//   3) Truncate to 30 chars to leave room for the random suffix.
-//   4) Pad with 'x' to 3 chars if the email prefix was unusually short.
-//   5) Append '_' + 8 random hex chars (4 bytes of crypto/rand = 2³² space).
+//  1. Take everything before '@' (or whole string if no '@').
+//  2. Lowercase + replace non-[a-z0-9_] with '_'.
+//  3. Truncate to 30 chars to leave room for the random suffix.
+//  4. Pad with 'x' to 3 chars if the email prefix was unusually short.
+//  5. Append '_' + 8 random hex chars (4 bytes of crypto/rand = 2³² space).
 //
 // Collision math: per-signup probability that the derived username clashes
 // with an existing user sharing the same email prefix ≈ N / 2³².
@@ -496,22 +495,18 @@ func IsErrPlatformUnsupported(err error) bool {
 // the dependencies that consume it:
 //   - GatewayClient.SetAPIKey   (X-API-Key on all Cloud HTTP requests)
 //   - WS client.SetAPIKey       (Authorization: Bearer on WS upgrade)
-//   - cfg.APIKey                (for tool registrations that capture it
-//                                at construction; see register.go)
-//   - OnAPIKeyChanged callback  (rebuilds auth-sensitive tools)
+//   - OnAPIKeyChanged callback  (rebuilds auth-sensitive tools from the
+//     GatewayClient's synchronized live key)
 //
-// Pass "" to clear all four uniformly.
+// Pass "" to clear all live consumers uniformly.
 func (a *AuthManager) applyAPIKey(ctx context.Context, key string) {
 	a.gw.SetAPIKey(key)
 	if a.wsClient != nil {
 		a.wsClient.SetAPIKey(key)
 	}
-	a.mu.Lock()
-	if a.cfg != nil {
-		a.cfg.APIKey = key
-	}
+	a.mu.RLock()
 	cb := a.onAPIKeyChanged
-	a.mu.Unlock()
+	a.mu.RUnlock()
 	if cb != nil {
 		cb(ctx)
 	}

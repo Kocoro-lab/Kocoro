@@ -64,7 +64,8 @@ func (s *Server) validateShareRequest(w http.ResponseWriter, r *http.Request) (i
 	}
 
 	cfg, _, _ := s.deps.Snapshot()
-	if cfg == nil || !cfg.Cloud.Enabled || cfg.APIKey == "" || s.deps.GW == nil {
+	apiKey := s.liveAPIKey(cfg)
+	if cfg == nil || !cfg.Cloud.Enabled || apiKey == "" || s.deps.GW == nil {
 		writeError(w, http.StatusServiceUnavailable,
 			"session share requires cloud uploads (need cloud.enabled and api_key)")
 		return "", "", false
@@ -103,6 +104,7 @@ func (s *Server) handleSessionShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg, _, _ := s.deps.Snapshot()
+	cfg = s.configWithLiveAPIKey(cfg)
 
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
 	sess, err := mgr.Load(id)
@@ -290,8 +292,9 @@ func (s *Server) handleSessionShareRetract(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	cfg, _, _ := s.deps.Snapshot()
+	apiKey := s.liveAPIKey(cfg)
 
-	uploadsClient := uploads.NewClient(cfg.Endpoint, cfg.APIKey, s.deps.GW.HTTPClient())
+	uploadsClient := uploads.NewClient(cfg.Endpoint, apiKey, s.deps.GW.HTTPClient())
 	resp, err := uploadsClient.Delete(r.Context(), uploadID)
 	if err != nil {
 		writeUploadsError(w, err)
@@ -485,6 +488,7 @@ func buildShareUploadMetadata(sessionID, agentName string) json.RawMessage {
 //   - some HTTP libraries / proxies double-encode or re-canonicalize the path
 //   - CloudFront/S3 key lookup is byte-exact after percent-decode, so any
 //     normalization mismatch becomes a 404
+//
 // ASCII-only filenames sidestep the entire class. Titles with no ASCII
 // content (e.g. "现在支持哪些模型") slug to empty, which buildShareFilename
 // falls back to a session-ID-based filename for.

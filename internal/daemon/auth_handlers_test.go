@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,6 +25,7 @@ type handlerFixture struct {
 	manager     *AuthManager
 	keychain    *keychain.Store
 	cfg         *config.Config
+	gw          *client.GatewayClient
 }
 
 func newHandlerFixture(t *testing.T) *handlerFixture {
@@ -41,6 +43,7 @@ func newHandlerFixture(t *testing.T) *handlerFixture {
 	hf.cfg = &config.Config{}
 	hf.keychain = keychain.NewStore(keychain.NewMemBackend(), nil)
 	gw := client.NewGatewayClient(hf.cloud.URL, "")
+	hf.gw = gw
 	authClient := client.NewAuthClient(hf.cloud.URL, hf.cloud.Client())
 	hf.manager = NewAuthManager(AuthManagerConfig{
 		Keychain: hf.keychain,
@@ -166,8 +169,8 @@ func TestHandleAuthLogin_200(t *testing.T) {
 	if snap.State != AuthStateSignedIn {
 		t.Fatalf("state=%q", snap.State)
 	}
-	if hf.cfg.APIKey != "sk_new" {
-		t.Fatalf("cfg.APIKey=%q", hf.cfg.APIKey)
+	if hf.gw.APIKey() != "sk_new" {
+		t.Fatalf("gateway api key=%q", hf.gw.APIKey())
 	}
 }
 
@@ -283,6 +286,23 @@ func TestHandleAuthRegister_InvalidJSON(t *testing.T) {
 	hf.srv.handleAuthRegister(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d", w.Code)
+	}
+}
+
+func TestWriteAuthError_InternalDoesNotLeakRawError(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeAuthError(w, errors.New("keychain write: errSecInteractionNotAllowed"))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d", w.Code)
+	}
+	var body map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if body["error"] != "internal_error" {
+		t.Fatalf("error=%q", body["error"])
+	}
+	if strings.Contains(body["message"], "errSec") || strings.Contains(body["message"], "keychain write") {
+		t.Fatalf("message leaked raw error: %q", body["message"])
 	}
 }
 

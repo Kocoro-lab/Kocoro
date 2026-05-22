@@ -207,6 +207,6 @@ func writeAuthError(w http.ResponseWriter, err error) {
 	}
 	writeJSON(w, http.StatusInternalServerError, map[string]string{
 		"error":   "internal_error",
-		"message": err.Error(),
+		"message": "Local authentication operation failed.",
 	})
 }

@@ -106,3 +106,21 @@ func TestRunSetup_GatewayProvider(t *testing.T) {
 		}
 	}
 }
+
+func TestHydrateAPIKeyFromKeychain(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Keychain hydration is macOS-only")
+	}
+	t.Setenv("KOCORO_FORCE_KEYCHAIN_HYDRATE", "1")
+	be := withTestKeychain(t)
+	store := keychain.NewStore(be, nil)
+	if err := store.SetAPIKey("user-1", "sk_from_keychain"); err != nil {
+		t.Fatalf("SetAPIKey: %v", err)
+	}
+
+	cfg := &Config{}
+	hydrateAPIKeyFromKeychain(cfg)
+	if cfg.APIKey != "sk_from_keychain" {
+		t.Fatalf("APIKey=%q", cfg.APIKey)
+	}
+}

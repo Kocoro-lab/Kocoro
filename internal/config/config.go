@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -22,23 +23,24 @@ type ConfigSource struct {
 }
 
 type Config struct {
-	Provider        string                         `mapstructure:"provider"          yaml:"provider"          json:"provider"` // "gateway" (default) or "ollama"
-	Endpoint        string                         `mapstructure:"endpoint"          yaml:"endpoint"          json:"endpoint"`
-	APIKey          string                         `mapstructure:"api_key"           yaml:"api_key"           json:"api_key"`
-	ModelTier       string                         `mapstructure:"model_tier"        yaml:"model_tier"        json:"model_tier"`
-	Ollama          OllamaConfig                   `mapstructure:"ollama"            yaml:"ollama"            json:"ollama"`
-	AutoUpdateCheck bool                           `mapstructure:"auto_update_check" yaml:"auto_update_check" json:"auto_update_check"`
-	Permissions     permissions.PermissionsConfig  `mapstructure:"permissions"       yaml:"permissions"       json:"permissions"`
-	Agent           AgentConfig                    `mapstructure:"agent"             yaml:"agent"             json:"agent"`
-	Tools           ToolsConfig                    `mapstructure:"tools"             yaml:"tools"             json:"tools"`
-	Cloud           CloudConfig                    `mapstructure:"cloud"             yaml:"cloud"             json:"cloud"`
-	Daemon          DaemonConfig                   `mapstructure:"daemon"            yaml:"daemon"            json:"daemon"`
-	Skills          SkillsConfig                   `mapstructure:"skills"            yaml:"skills"            json:"skills"`
-	Memory          MemoryConfig                   `mapstructure:"memory"            yaml:"memory"            json:"memory"`
-	Hooks           hooks.HookConfig               `mapstructure:"hooks"             yaml:"hooks"             json:"hooks"`
-	MCPServers      map[string]mcp.MCPServerConfig `mapstructure:"mcp_servers"       yaml:"mcp_servers"       json:"mcp_servers"`
-	MCP             MCPConfig                      `mapstructure:"mcp"               yaml:"mcp"               json:"mcp"`
-	Sources         map[string]ConfigSource        `mapstructure:"-"                 yaml:"-"                 json:"-"`
+	Provider           string `mapstructure:"provider"          yaml:"provider"          json:"provider"` // "gateway" (default) or "ollama"
+	Endpoint           string `mapstructure:"endpoint"          yaml:"endpoint"          json:"endpoint"`
+	APIKey             string `mapstructure:"api_key"           yaml:"api_key"           json:"api_key"`
+	apiKeyFromKeychain bool
+	ModelTier          string                         `mapstructure:"model_tier"        yaml:"model_tier"        json:"model_tier"`
+	Ollama             OllamaConfig                   `mapstructure:"ollama"            yaml:"ollama"            json:"ollama"`
+	AutoUpdateCheck    bool                           `mapstructure:"auto_update_check" yaml:"auto_update_check" json:"auto_update_check"`
+	Permissions        permissions.PermissionsConfig  `mapstructure:"permissions"       yaml:"permissions"       json:"permissions"`
+	Agent              AgentConfig                    `mapstructure:"agent"             yaml:"agent"             json:"agent"`
+	Tools              ToolsConfig                    `mapstructure:"tools"             yaml:"tools"             json:"tools"`
+	Cloud              CloudConfig                    `mapstructure:"cloud"             yaml:"cloud"             json:"cloud"`
+	Daemon             DaemonConfig                   `mapstructure:"daemon"            yaml:"daemon"            json:"daemon"`
+	Skills             SkillsConfig                   `mapstructure:"skills"            yaml:"skills"            json:"skills"`
+	Memory             MemoryConfig                   `mapstructure:"memory"            yaml:"memory"            json:"memory"`
+	Hooks              hooks.HookConfig               `mapstructure:"hooks"             yaml:"hooks"             json:"hooks"`
+	MCPServers         map[string]mcp.MCPServerConfig `mapstructure:"mcp_servers"       yaml:"mcp_servers"       json:"mcp_servers"`
+	MCP                MCPConfig                      `mapstructure:"mcp"               yaml:"mcp"               json:"mcp"`
+	Sources            map[string]ConfigSource        `mapstructure:"-"                 yaml:"-"                 json:"-"`
 }
 
 // MCPConfig holds client-side settings shared across all MCP servers.
@@ -370,6 +372,7 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
+	hydrateAPIKeyFromKeychain(&cfg)
 
 	// KOCORO_ENDPOINT env var overrides the yaml endpoint. Useful when an
 	// external process (e.g. the macOS Desktop app's launch logic) keeps
@@ -501,7 +504,11 @@ func migrateOldConfig() {
 func Save(cfg *Config) error {
 	viper.Set("provider", cfg.Provider)
 	viper.Set("endpoint", cfg.Endpoint)
-	viper.Set("api_key", strings.TrimSpace(cfg.APIKey))
+	apiKey := strings.TrimSpace(cfg.APIKey)
+	if runtime.GOOS == "darwin" && cfg.apiKeyFromKeychain {
+		apiKey = ""
+	}
+	viper.Set("api_key", apiKey)
 	viper.Set("model_tier", cfg.ModelTier)
 	viper.Set("auto_update_check", cfg.AutoUpdateCheck)
 	if cfg.Ollama.Endpoint != "" {

@@ -16,21 +16,20 @@ import (
 )
 
 // authFixture builds an AuthManager wired to a fake Cloud (httptest), an
-// in-memory keychain, a real (but never-Connected) WS Client, an EventBus
-// for assertions, and a *config.Config that auth_test mutates to verify
-// cfg.APIKey propagation.
+// in-memory keychain, a real (but never-Connected) WS Client, and an EventBus
+// for assertions.
 type authFixture struct {
-	t            *testing.T
-	manager      *AuthManager
-	keychain     *keychain.Store
-	cfg          *config.Config
-	gw           *client.GatewayClient
-	bus          *EventBus
-	cloudServer  *httptest.Server
-	handlers     map[string]http.HandlerFunc
-	apiKeyCalls  int
-	cb           func()
-	cbMu         sync.Mutex
+	t           *testing.T
+	manager     *AuthManager
+	keychain    *keychain.Store
+	cfg         *config.Config
+	gw          *client.GatewayClient
+	bus         *EventBus
+	cloudServer *httptest.Server
+	handlers    map[string]http.HandlerFunc
+	apiKeyCalls int
+	cb          func()
+	cbMu        sync.Mutex
 }
 
 func newAuthFixture(t *testing.T) *authFixture {
@@ -89,11 +88,12 @@ func (f *authFixture) onError(method, path string, status int, code, message str
 	f.on(method, path, status, map[string]string{"error": code, "message": message})
 }
 
-// waitEvent blocks until an event of type t is emitted or the channel
-// runs dry. Calling this without an active subscription will hang —
-// always subscribe before triggering the action.
+// waitEvent blocks until an event of type t is emitted, the channel closes,
+// or a short deadline expires. Always subscribe before triggering the action.
 func (f *authFixture) waitEvent(ch <-chan Event, want string) Event {
 	f.t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
 	for {
 		select {
 		case evt, ok := <-ch:
@@ -103,6 +103,8 @@ func (f *authFixture) waitEvent(ch <-chan Event, want string) Event {
 			if evt.Type == want {
 				return evt
 			}
+		case <-timer.C:
+			f.t.Fatalf("timed out waiting for event %q", want)
 		}
 	}
 }
@@ -182,8 +184,8 @@ func TestAuthManager_Login_Success_PreexistingKeychainKey(t *testing.T) {
 	if s := f.manager.State(); s != AuthStateSignedIn {
 		t.Fatalf("state=%q want signed_in", s)
 	}
-	if f.cfg.APIKey != "sk_old" {
-		t.Fatalf("cfg.APIKey=%q want sk_old (preexisting reused)", f.cfg.APIKey)
+	if f.gw.APIKey() != "sk_old" {
+		t.Fatalf("gateway api key=%q want sk_old (preexisting reused)", f.gw.APIKey())
 	}
 	if f.apiKeyCalls == 0 {
 		t.Fatal("OnAPIKeyChanged not invoked")
@@ -203,8 +205,8 @@ func TestAuthManager_Login_Success_BootstrapsNewKey(t *testing.T) {
 	if err := f.manager.Login(context.Background(), "a@b.c", "pw1"); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
-	if f.cfg.APIKey != "sk_freshly_minted" {
-		t.Fatalf("cfg.APIKey=%q", f.cfg.APIKey)
+	if f.gw.APIKey() != "sk_freshly_minted" {
+		t.Fatalf("gateway api key=%q", f.gw.APIKey())
 	}
 	u, k, _ := f.keychain.GetActiveUserAndKey()
 	if u != "user-1" || k != "sk_freshly_minted" {
@@ -274,7 +276,7 @@ func TestAuthManager_Login_APIKeyBootstrapFails(t *testing.T) {
 func TestAuthManager_SignOut_PreservesKeychain(t *testing.T) {
 	f := newAuthFixture(t)
 	_ = f.keychain.SetAPIKey("user-1", "sk_test")
-	f.cfg.APIKey = "sk_test"
+	f.gw.SetAPIKey("sk_test")
 	f.manager.setState(AuthStateSignedIn, &client.AuthUser{ID: "user-1", Email: "a@b.c"}, "")
 
 	f.manager.SignOut(context.Background(), false /* clearKeychain */)
@@ -282,8 +284,8 @@ func TestAuthManager_SignOut_PreservesKeychain(t *testing.T) {
 	if s := f.manager.State(); s != AuthStateSignedOut {
 		t.Fatalf("state=%q", s)
 	}
-	if f.cfg.APIKey != "" {
-		t.Fatalf("cfg.APIKey should be cleared, got %q", f.cfg.APIKey)
+	if f.gw.APIKey() != "" {
+		t.Fatalf("gateway api key should be cleared, got %q", f.gw.APIKey())
 	}
 	if k, _ := f.keychain.GetAPIKey(); k != "sk_test" {
 		t.Fatalf("keychain key should be preserved, got %q", k)
@@ -327,8 +329,8 @@ func TestAuthManager_Bootstrap_ValidKey_SignsIn(t *testing.T) {
 	if s := f.manager.State(); s != AuthStateSignedIn {
 		t.Fatalf("state=%q want signed_in", s)
 	}
-	if f.cfg.APIKey != "sk_valid" {
-		t.Fatalf("cfg.APIKey=%q", f.cfg.APIKey)
+	if f.gw.APIKey() != "sk_valid" {
+		t.Fatalf("gateway api key=%q", f.gw.APIKey())
 	}
 }
 
@@ -390,7 +392,7 @@ func TestAuthManager_Bootstrap_LegacyAccount_Renames(t *testing.T) {
 func TestAuthManager_HandleWSAuthFailure_ClearsAll(t *testing.T) {
 	f := newAuthFixture(t)
 	_ = f.keychain.SetAPIKey("user-1", "sk_revoked")
-	f.cfg.APIKey = "sk_revoked"
+	f.gw.SetAPIKey("sk_revoked")
 	f.manager.setState(AuthStateSignedIn, &client.AuthUser{ID: "user-1"}, "")
 
 	f.manager.HandleWSAuthFailure()
@@ -398,8 +400,8 @@ func TestAuthManager_HandleWSAuthFailure_ClearsAll(t *testing.T) {
 	if s := f.manager.State(); s != AuthStateSignedOut {
 		t.Fatalf("state=%q", s)
 	}
-	if f.cfg.APIKey != "" {
-		t.Fatalf("cfg.APIKey=%q", f.cfg.APIKey)
+	if f.gw.APIKey() != "" {
+		t.Fatalf("gateway api key=%q", f.gw.APIKey())
 	}
 	if k, _ := f.keychain.GetAPIKey(); k != "" {
 		t.Fatalf("keychain key should be cleared, got %q", k)
@@ -592,11 +594,10 @@ func TestAuthManager_BootstrapOffline_NoLastErr(t *testing.T) {
 	}
 }
 
-// OnAPIKeyChanged must observe cfg.APIKey already set to the new value
-// when the callback fires (tool re-registration depends on this). This
-// pins the contract that applyAPIKey writes cfg.APIKey BEFORE invoking
-// the callback.
-func TestAuthManager_OnAPIKeyChanged_SeesUpdatedCfg(t *testing.T) {
+// OnAPIKeyChanged must observe GatewayClient's live key already set to the
+// new value when the callback fires. Tool re-registration depends on this
+// synchronized key source rather than mutating shared config state.
+func TestAuthManager_OnAPIKeyChanged_SeesUpdatedGatewayKey(t *testing.T) {
 	fc := newFakeCloudForCfgTest(t)
 	cfg := &config.Config{}
 	be := keychain.NewMemBackend()
@@ -610,7 +611,7 @@ func TestAuthManager_OnAPIKeyChanged_SeesUpdatedCfg(t *testing.T) {
 		Keychain: kc, Cloud: authClient, Gateway: gw, Cfg: cfg,
 		OnAPIKeyChanged: func(ctx context.Context) {
 			calls++
-			observedKey = cfg.APIKey
+			observedKey = gw.APIKey()
 		},
 	})
 	mgr.SetEventBus(NewEventBus())
@@ -622,17 +623,17 @@ func TestAuthManager_OnAPIKeyChanged_SeesUpdatedCfg(t *testing.T) {
 		t.Fatal("OnAPIKeyChanged was not invoked")
 	}
 	if observedKey != "sk_new" {
-		t.Fatalf("OnAPIKeyChanged observed cfg.APIKey=%q at callback time; expected the new key", observedKey)
+		t.Fatalf("OnAPIKeyChanged observed gateway api key=%q at callback time; expected the new key", observedKey)
 	}
 
-	// Sign-out: callback fires again with cfg.APIKey already cleared.
+	// Sign-out: callback fires again with GatewayClient already cleared.
 	mgr.SignOut(context.Background(), false)
 	if observedKey != "" {
-		t.Fatalf("after sign-out, OnAPIKeyChanged should observe empty cfg.APIKey, got %q", observedKey)
+		t.Fatalf("after sign-out, OnAPIKeyChanged should observe empty gateway api key, got %q", observedKey)
 	}
 }
 
-// Helper for the cfg-observation test: a minimal fake Cloud that
+// Helper for the gateway-key observation test: a minimal fake Cloud that
 // returns canned responses for login + api-keys without the per-test
 // route table that authFixture maintains.
 func newFakeCloudForCfgTest(t *testing.T) *httptest.Server {

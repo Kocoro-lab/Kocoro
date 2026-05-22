@@ -33,7 +33,8 @@ func (s *Server) handleListUploads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg, _, _ := s.deps.Snapshot()
-	if cfg == nil || !cfg.Cloud.Enabled || cfg.APIKey == "" || s.deps.GW == nil {
+	apiKey := s.liveAPIKey(cfg)
+	if cfg == nil || !cfg.Cloud.Enabled || apiKey == "" || s.deps.GW == nil {
 		writeError(w, http.StatusServiceUnavailable,
 			"cloud uploads not configured (need cloud.enabled and api_key)")
 		return
@@ -55,7 +56,7 @@ func (s *Server) handleListUploads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := uploads.NewClient(cfg.Endpoint, cfg.APIKey, s.deps.GW.HTTPClient())
+	client := uploads.NewClient(cfg.Endpoint, apiKey, s.deps.GW.HTTPClient())
 	resp, err := client.List(r.Context(), uploads.ListOptions{Limit: limit, Offset: offset, Kind: kind})
 	if err != nil {
 		writeUploadsError(w, err)
@@ -82,13 +83,14 @@ func (s *Server) handleDeleteUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg, _, _ := s.deps.Snapshot()
-	if cfg == nil || !cfg.Cloud.Enabled || cfg.APIKey == "" || s.deps.GW == nil {
+	apiKey := s.liveAPIKey(cfg)
+	if cfg == nil || !cfg.Cloud.Enabled || apiKey == "" || s.deps.GW == nil {
 		writeError(w, http.StatusServiceUnavailable,
 			"cloud uploads not configured (need cloud.enabled and api_key)")
 		return
 	}
 
-	client := uploads.NewClient(cfg.Endpoint, cfg.APIKey, s.deps.GW.HTTPClient())
+	client := uploads.NewClient(cfg.Endpoint, apiKey, s.deps.GW.HTTPClient())
 	resp, err := client.Delete(r.Context(), id)
 	if err != nil {
 		writeUploadsError(w, err)
