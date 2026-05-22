@@ -159,9 +159,8 @@ func TestBuildSystemPrompt_VolatileTierAnchorsEnum(t *testing.T) {
 	// not need it (daemon owns compaction) and surfacing the transient
 	// turn-1 default leaked confusing capacity numbers to users.
 	parts := BuildSystemPrompt(PromptOptions{
-		BasePrompt:    "Base.",
-		ModelID:       "medium",
-		ContextWindow: 200000,
+		BasePrompt: "Base.",
+		ModelID:    "medium",
 	})
 	if !strings.Contains(parts.VolatileContext, "Model tier: medium") {
 		t.Error("VolatileContext should render 'Model tier: medium' for known tier name")

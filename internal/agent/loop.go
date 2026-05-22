@@ -1935,7 +1935,6 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		MemoryDir:        a.memoryDir,
 		StickyContext:    a.stickyContext,
 		ModelID:          modelID,
-		ContextWindow:    a.contextWindow,
 		OutputFormat:     a.outputFormat,
 	})
 

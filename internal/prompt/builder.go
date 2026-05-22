@@ -63,12 +63,10 @@ type PromptOptions struct {
 	// message, BP #3). Excluded from the system prompt for BP #1 byte
 	// stability. See issue #107. Empty when not in deferred mode.
 	DeferredTools []DeferredToolSummary
-	// ModelID is the model identifier (e.g., "claude-sonnet-4-20250514").
-	// Injected into volatile context so the model knows its own identity.
+	// ModelID is either the active tier name (small/medium/large) or a
+	// pinned specific model id. Injected into volatile context so the
+	// model knows its own identity. See isKnownTierName for the dispatch.
 	ModelID string
-	// ContextWindow is the model's context window size in tokens.
-	// Injected into volatile context when > 0.
-	ContextWindow int
 	// OutputFormat controls formatting guidance: "markdown" (default, GFM) or
 	// "plain" (for cloud-distributed sessions where Shannon Cloud handles
 	// final channel rendering). Empty defaults to "markdown".
