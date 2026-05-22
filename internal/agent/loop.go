@@ -767,7 +767,7 @@ type AgentLoop struct {
 	sessionCWD       string      // session-scoped working directory; set by runner/TUI before Run()
 	deltaProvider    DeltaProvider
 	injectCh         chan InjectedMessage
-	injectedMessages []string         // messages injected during the last Run(); cleared on each Run() call
+	injectedMessages []string // messages injected during the last Run(); cleared on each Run() call
 	// mailboxConsumeFn, when set, is invoked with the mailbox row IDs of any
 	// InjectedMessage entries the loop drained mid-turn. The daemon installs
 	// this hook to mark those rows consumed in SQLite + emit queue.flushed
@@ -787,16 +787,16 @@ type AgentLoop struct {
 	// firstTurnIMContext so re-entry (compaction retry, etc.) cannot re-emit.
 	firstTurnIMContext      json.RawMessage
 	firstTurnCloudMessageID string
-	runMessages      []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
-	runMsgInjected   []bool           // parallel to runMessages: true = system-injected guardrail/nudge
-	runMsgTimestamps []time.Time      // parallel to runMessages: when each message was created
-	lastRunStatus    RunStatus
-	toolRefSupported bool   // true when the configured model supports defer_loading + tool_reference protocol
-	cacheSource      string // tag sent to gateway on every Complete call for prompt-cache TTL routing
-	skillDiscovery   bool   // call small-tier model on first turn to identify relevant skills (default true)
-	memoryPreflight  MemoryPreflightFunc
-	sentSkillNames   map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
-	readTracker      *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
+	runMessages             []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
+	runMsgInjected          []bool           // parallel to runMessages: true = system-injected guardrail/nudge
+	runMsgTimestamps        []time.Time      // parallel to runMessages: when each message was created
+	lastRunStatus           RunStatus
+	toolRefSupported        bool   // true when the configured model supports defer_loading + tool_reference protocol
+	cacheSource             string // tag sent to gateway on every Complete call for prompt-cache TTL routing
+	skillDiscovery          bool   // call small-tier model on first turn to identify relevant skills (default true)
+	memoryPreflight         MemoryPreflightFunc
+	sentSkillNames          map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
+	readTracker             *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
 	// toolResultReplacements stores stable query-time replacements for large
 	// historical tool_result blocks. It is session-scoped and persisted by
 	// daemon/TUI callers so resumed sessions replay identical bytes.
@@ -2226,24 +2226,25 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 	}
 	var (
-		detector                = NewLoopDetector()
-		toolsUsed               = make(map[string]int)
-		totalToolCalls          int
-		lastText                string
-		streamingText           strings.Builder // accumulates streaming deltas for cancel recovery
-		truncatedText           strings.Builder // accumulates text from max_tokens continuations
-		continuationCount       int
-		truncationRecoveryCount int // per-Run() (one user message); see maxTruncationRecoveries
-		afterCheckpoint         bool
-		checkpointDone          bool
-		nudges                  = newNudgeWindow(maxNudges, nudgeWindowIters)
-		hallucinationNudges     int
-		lastPromptTokens        int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
-		lastOutputTokens        int    // actual output tokens from last LLM response
-		compactionSummary       string // cached summary from compaction
-		compactionApplied       bool   // true once messages have been shaped
-		reactiveCompacted       bool   // true once reactive compaction fired (never resets)
-		summaryFailures         int    // consecutive summary failures; backs off after 3
+		detector                  = NewLoopDetector()
+		toolsUsed                 = make(map[string]int)
+		totalToolCalls            int
+		lastText                  string
+		streamingText             strings.Builder // accumulates streaming deltas for cancel recovery
+		truncatedText             strings.Builder // accumulates text from max_tokens continuations
+		continuationCount         int
+		truncationRecoveryCount   int // per-Run() (one user message); see maxTruncationRecoveries
+		inconsistentFinishRetries int // per-Run(); see maxInconsistentFinishRetries (Task 7)
+		afterCheckpoint           bool
+		checkpointDone            bool
+		nudges                    = newNudgeWindow(maxNudges, nudgeWindowIters)
+		hallucinationNudges       int
+		lastPromptTokens          int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
+		lastOutputTokens          int    // actual output tokens from last LLM response
+		compactionSummary         string // cached summary from compaction
+		compactionApplied         bool   // true once messages have been shaped
+		reactiveCompacted         bool   // true once reactive compaction fired (never resets)
+		summaryFailures           int    // consecutive summary failures; backs off after 3
 		// lastSummaryFailureIter records the iteration of the most recent summary
 		// failure; summaryBackedOff measures the cool-off distance from this iter.
 		// Zero value is fine: the `summaryFailures >= maxSummaryFailures` guard
@@ -3541,6 +3542,55 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// in shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py.
 			if strings.TrimSpace(fullText) == "" {
 				fullText = recoverVisibleTextFromBlocks(resp)
+			}
+			// Inconsistent-finish retry: finish_reason claims the model emitted a
+			// tool_use, but neither a tool_use block nor any visible text landed in
+			// the response. Cloud's retry guard is supposed to catch this shape but
+			// historically only covered end_turn (see anthropic_provider.py); this
+			// branch is the daemon-side defense.
+			//
+			// Bounded by maxInconsistentFinishRetries. Re-uses the existing main-loop
+			// continue path so the next iteration re-issues the same request with the
+			// same context; Anthropic sampling non-determinism makes resampling likely
+			// to recover the missing block.
+			//
+			// Scope: only stop_reason="tool_use" is widened here. max_tokens /
+			// length have their own continuation path elsewhere in this loop and the
+			// same-prompt resample strategy would just re-burn thinking tokens.
+			//
+			// We're already inside `if !resp.HasToolCalls()`, so the "no tool calls"
+			// predicate is implicit — no need to re-check via toolCalls (which
+			// is not in scope here).
+			if strings.TrimSpace(fullText) == "" &&
+				resp.FinishReason == "tool_use" &&
+				inconsistentFinishRetries < maxInconsistentFinishRetries {
+				inconsistentFinishRetries++
+				// Audit row — distinct event so post-incident triage can attribute
+				// recoveries (and exhausted-retry exhaustions) to this path vs the
+				// legitimate end_turn empty case.
+				if a.auditor != nil {
+					a.auditor.Log(audit.AuditEntry{
+						Timestamp: time.Now(),
+						SessionID: a.sessionID,
+						Event:     "empty_with_inconsistent_finish",
+						InputSummary: fmt.Sprintf("iter=%d model=%s finish_reason=%s retry=%d/%d",
+							i, resp.Model, resp.FinishReason,
+							inconsistentFinishRetries, maxInconsistentFinishRetries),
+						OutputSummary: fmt.Sprintf("input_tokens=%d output_tokens=%d blocks=%s",
+							resp.Usage.InputTokens, resp.Usage.OutputTokens,
+							describeContentBlocks(resp.ContentBlocks)),
+					})
+				}
+				if rs, ok := a.handler.(RunStatusHandler); ok {
+					rs.OnRunStatus("upstream_inconsistent_finish",
+						"上游响应不完整,正在重试…")
+				}
+				// Do NOT append the assistant message — the response is malformed
+				// (claims tool_use without a tool_use block). Persisting it would
+				// poison the next request's cache_control rolling marker (same class
+				// of bug docs/empty-assistant-content-400.md fixed for end_turn).
+				// Just re-issue with the same `messages`.
+				continue
 			}
 			if strings.TrimSpace(fullText) == "" {
 				captureRunMessages()
