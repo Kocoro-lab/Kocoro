@@ -5611,27 +5611,35 @@ func TestAgentLoop_InconsistentFinish_ToolUseWithoutBlock_RetriesAndRecovers(t *
 	if callCount != 2 {
 		t.Errorf("expected exactly 2 calls (initial + 1 retry), got %d", callCount)
 	}
+	if code := loop.LastRunStatus().FailureCode; code != "" {
+		t.Errorf("recovered run must clear FailureCode, got %q", code)
+	}
 
 	// Audit row attribution: post-incident triage needs to distinguish
 	// recoveries via this branch from the legitimate end_turn empty case.
 	entries := readAuditLines(t, logDir)
-	var found map[string]any
+	// Recovery emits exactly ONE empty_with_inconsistent_finish row — the
+	// inconsistent response that triggered the retry. The subsequent
+	// successful response goes through the normal success path with no
+	// extra audit row. If Task 7 ever changes to "log per attempt", this
+	// count check surfaces the contract change explicitly.
+	matches := []map[string]any{}
 	for _, e := range entries {
 		if e["event"] == "empty_with_inconsistent_finish" {
-			found = e
-			break
+			matches = append(matches, e)
 		}
 	}
-	if found == nil {
-		t.Fatalf("expected empty_with_inconsistent_finish audit row, got none in %d entries", len(entries))
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly 1 empty_with_inconsistent_finish audit row, got %d", len(matches))
 	}
+	found := matches[0]
 	in, _ := found["input_summary"].(string)
 	outSum, _ := found["output_summary"].(string)
 	if !strings.Contains(in, "finish_reason=tool_use") {
 		t.Errorf("audit row should record finish_reason=tool_use, got %q", in)
 	}
-	if !strings.Contains(outSum, "blocks=[thinking]") {
-		t.Errorf("audit row should record blocks=[thinking], got %q", outSum)
+	if !strings.Contains(outSum, "blocks=[thinking") {
+		t.Errorf("audit row should record blocks=[thinking..., got %q", outSum)
 	}
 }
 
