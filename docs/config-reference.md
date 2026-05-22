@@ -75,6 +75,7 @@ agent:
   temperature: 0                   # LLM temperature (default: 0)
   max_tokens: 32000                # max output tokens (default: 32000)
   model: ""                        # specific model override (empty = use model_tier)
+  model_tier: ""                   # tier override (small | medium | large); empty = inherit global model_tier
   reasoning_effort: ""             # "low" / "medium" / "high" (empty = model default)
   context_window: 200000           # seed; auto-adjusted from observed model. Per-agent override locks the cap.
 

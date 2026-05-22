@@ -38,7 +38,9 @@ Global settings control how Shannon behaves across all agents — which AI model
 | `provider` | LLM backend: `""` (Shannon Cloud/Gateway) or `"ollama"` | No |
 | `endpoint` | Shannon Cloud or custom gateway URL | YES |
 | `api_key` | API key for the configured provider | YES |
+| `model_tier` | Global LLM tier (default `medium`). One of `small` / `medium` / `large`. Per-agent override is available via `agent.model_tier` in `~/.shannon/agents/<name>/config.yaml`. Precedence (highest first): `RunAgentRequest.ModelOverride` → `agent.model` → `agent.model_tier` → local `config.yaml model_tier` → project `config.yaml model_tier` → global `config.yaml model_tier` → viper default `"medium"`. | No |
 | `agent.model` | Default model for all agents (e.g., `claude-sonnet-4-5`) | No |
+| `agent.model_tier` | **Per-agent tier override.** When set in `~/.shannon/agents/<name>/config.yaml`, overrides the global `model_tier` for this agent only. One of `small` / `medium` / `large`. Omit to inherit. `agent.model` (specific model id) wins over `agent.model_tier` when both are set. | No |
 | `agent.temperature` | Creativity level 0.0–1.0. Lower = more predictable. | No |
 | `agent.max_iterations` | Max tool-use rounds per conversation turn | No |
 | `agent.context_window` | **Seed** value for the context window in tokens (default 200000). On every main-tier LLM response the loop auto-adjusts to the observed model's known cap (1M for `claude-sonnet-4-6`/`opus-4-6`/`opus-4-7`; 200K for `claude-sonnet-4-5`/`haiku-4-5`/`opus-4-5`/`opus-4-1`; per-model values for OpenAI/Gemini/Grok). So you usually do NOT need to set this manually for long-context models — the loop will discover the right value from response 2 onward. | No |
