@@ -297,7 +297,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.force_think_tool", false)
 	viper.SetDefault("agent.reasoning_effort", "")
 	viper.SetDefault("agent.model", "")
-	viper.SetDefault("agent.context_window", 200000)
+	viper.SetDefault("agent.context_window", 1_000_000)
 	// NOTE: if you change these idle/stream defaults, also update
 	// docs/config-reference.md AND internal/skills/bundled/skills/kocoro/references/config.md
 	// to match — the bundled skill reference is the AI-facing source of truth.
