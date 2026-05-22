@@ -1,15 +1,19 @@
 ---
 name: kocoro-generative-ui
 description: |
-  Generate interactive, inline HTML/SVG widgets (charts, diagrams, forms,
-  dashboards, illustrations) that render in sandboxed iframes inside Kocoro
-  Desktop chat. Use when the user asks to "visualize", "chart", "diagram",
-  "explain visually", "show me", or when data is denser than a paragraph of
-  prose.
+  Generate interactive, inline HTML/SVG widgets that render in sandboxed
+  iframes inside Kocoro Desktop chat: charts (bar/line/pie/scatter),
+  flowcharts and illustrative diagrams (hand-rolled SVG), auto-laid-out
+  diagrams via mermaid (ER / sequence / state / class / gantt / git graph /
+  user journey), geographic maps, UI mockups, forms, and dashboards. Use
+  when the user asks to "visualize", "chart", "diagram", "explain
+  visually", "show me a chart/diagram", names a specific diagram type
+  (ERD, sequence diagram, state machine, gantt chart, class diagram, UML,
+  user journey), or when data is denser than a paragraph of prose.
 allowed-tools: file_read file_write publish_to_web think
 hidden: true
 metadata:
-  version: "1.0.3"
+  version: "1.0.4"
   user-invocable: "true"
 ---
 
@@ -161,6 +165,8 @@ file via the `file_read` tool:
 - Flowcharts / structural diagrams → `references/diagrams.md` +
   `references/svg-setup.md`
 - Illustrative diagrams ("how does X work") → `references/diagrams.md`
+- ERDs, sequence, state, class, gantt, git graph, journey diagrams →
+  `references/mermaid.md` — mermaid.js init recipe + per-family fix-ups
 - UI mockups, cards, forms, comparisons → `references/ui-components.md`
 - Geographic maps (choropleths) → `references/maps.md`
 
@@ -176,6 +182,9 @@ retrieval tool), then invoke this skill to visualize the results.
 - Fetching live data or searching the web — data must already be in context
 - Emoji (use CSS shapes or SVG paths)
 - Gradients, drop shadows, blur, glow, neon
+- Mermaid default theme — must override with `theme: 'base'` (the default
+  theme ships gradients/shadows that silently violate the flat rule; see
+  `references/mermaid.md` for the calibrated init block)
 - `position: fixed`
 - `<!-- HTML comments -->` / `/* CSS comments */`
 - Font sizes below 11px
