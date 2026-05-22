@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
+	"github.com/spf13/viper"
 )
 
 // withTestKeychain swaps keychainStoreOpener for an in-memory backend so
@@ -122,5 +123,31 @@ func TestHydrateAPIKeyFromKeychain(t *testing.T) {
 	hydrateAPIKeyFromKeychain(cfg)
 	if cfg.APIKey != "sk_from_keychain" {
 		t.Fatalf("APIKey=%q", cfg.APIKey)
+	}
+}
+
+func TestLoad_HydratedAPIKeySeedsViper(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Keychain hydration is macOS-only")
+	}
+	t.Setenv("KOCORO_FORCE_KEYCHAIN_HYDRATE", "1")
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(func() { viper.Set("api_key", "") })
+
+	be := withTestKeychain(t)
+	store := keychain.NewStore(be, nil)
+	if err := store.SetAPIKey("user-1", "sk_from_keychain"); err != nil {
+		t.Fatalf("SetAPIKey: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.APIKey != "sk_from_keychain" {
+		t.Fatalf("APIKey=%q", cfg.APIKey)
+	}
+	if got := viper.GetString("cloud.api_key"); got != "sk_from_keychain" {
+		t.Fatalf("cloud.api_key=%q", got)
 	}
 }

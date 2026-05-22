@@ -70,7 +70,7 @@ func TestIntegration_OnDegraded_ReasonFlowsToService(t *testing.T) {
 
 	sup := NewSupervisor(sp, 2, nil)
 	sup.testBackoff = func(int) time.Duration { return 1 * time.Millisecond }
-	sup.SetOnDegraded(func(reason string, attempts int) {
+	sup.SetOnDegraded(func(reason string, attempts int, _ map[string]any) {
 		svc.restartAttempts.Store(int32(attempts))
 		svc.setDisabledReason(reason)
 		svc.status.Store(int32(StatusDegraded))

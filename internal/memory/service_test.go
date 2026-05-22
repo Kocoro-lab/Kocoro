@@ -268,3 +268,115 @@ func TestService_MemoryProviderStatus_CloudMisconfigured(t *testing.T) {
 		t.Fatalf("reason=%v want cloud_misconfigured", ms.Reason)
 	}
 }
+
+// TestService_MemoryProviderStatus_BundleSchemaMismatchEmitsRepairNeeded
+// asserts that when the supervisor's onDegraded fires with the schema-mismatch
+// reason + detail map, MemoryProviderStatus surfaces it as detail.repair_needed.
+// Desktop reads this block to drive the on-demand tlm reinstall flow.
+func TestService_MemoryProviderStatus_BundleSchemaMismatchEmitsRepairNeeded(t *testing.T) {
+	s := &Service{}
+	s.status.Store(int32(StatusDegraded))
+	s.setDisabledReason(ReasonBundleSchemaMismatch)
+	s.restartAttempts.Store(2)
+	s.setDisabledDetail(map[string]any{
+		"compatibility":  "incompatible",
+		"sub_code":       "no_manifest",
+		"bundle_version": "",
+	})
+
+	ms := s.MemoryProviderStatus()
+	if ms.Provider != "disabled" {
+		t.Fatalf("provider=%q want disabled", ms.Provider)
+	}
+	if ms.Reason == nil || *ms.Reason != ReasonBundleSchemaMismatch {
+		t.Fatalf("reason=%v want %q", ms.Reason, ReasonBundleSchemaMismatch)
+	}
+	repair, ok := ms.Detail["repair_needed"].(map[string]any)
+	if !ok {
+		t.Fatalf("detail.repair_needed missing or wrong type: %+v", ms.Detail)
+	}
+	if repair["compatibility"] != "incompatible" || repair["sub_code"] != "no_manifest" {
+		t.Fatalf("repair=%+v missing expected fields", repair)
+	}
+	if ms.Detail["restart_attempts"] != 2 {
+		t.Fatalf("restart_attempts=%v want 2 (back-compat field preserved)", ms.Detail["restart_attempts"])
+	}
+}
+
+// TestService_MemoryProviderStatus_NonSchemaReasonHasNoRepairBlock asserts that
+// repair_needed is ONLY attached for ReasonBundleSchemaMismatch — generic
+// startup_timeout or repeated_crash should NOT carry a stale detail block
+// even if disabledDetail is populated (it gets cleared on each fresh
+// onDegraded — but defense in depth).
+func TestService_MemoryProviderStatus_NonSchemaReasonHasNoRepairBlock(t *testing.T) {
+	s := &Service{}
+	s.status.Store(int32(StatusDegraded))
+	s.setDisabledReason(ReasonStartupTimeout)
+	s.setDisabledDetail(map[string]any{
+		"compatibility": "unknown",
+		"sub_code":      "",
+	})
+
+	ms := s.MemoryProviderStatus()
+	if _, present := ms.Detail["repair_needed"]; present {
+		t.Fatalf("repair_needed should not appear for reason=%v: %+v", *ms.Reason, ms.Detail)
+	}
+}
+
+// TestCurrentBundleReadable_TableDriven covers the four cases the helper
+// must distinguish: no current, missing manifest, corrupt manifest, valid
+// manifest.
+func TestCurrentBundleReadable_TableDriven(t *testing.T) {
+	t.Run("no_current_symlink", func(t *testing.T) {
+		root := t.TempDir()
+		if currentBundleReadable(root) {
+			t.Fatal("want false for empty bundle root")
+		}
+	})
+	t.Run("missing_manifest", func(t *testing.T) {
+		root := t.TempDir()
+		bundleDir := filepath.Join(root, "bundles", "2026-01-01T00-00-00Z")
+		if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(bundleDir, filepath.Join(root, "current")); err != nil {
+			t.Fatal(err)
+		}
+		if currentBundleReadable(root) {
+			t.Fatal("want false when manifest.json missing")
+		}
+	})
+	t.Run("corrupt_manifest", func(t *testing.T) {
+		root := t.TempDir()
+		bundleDir := filepath.Join(root, "bundles", "2026-01-01T00-00-00Z")
+		if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bundleDir, "manifest.json"), []byte("{not-json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(bundleDir, filepath.Join(root, "current")); err != nil {
+			t.Fatal(err)
+		}
+		if currentBundleReadable(root) {
+			t.Fatal("want false when manifest.json is unparseable")
+		}
+	})
+	t.Run("valid_manifest", func(t *testing.T) {
+		root := t.TempDir()
+		bundleDir := filepath.Join(root, "bundles", "2026-01-01T00-00-00Z")
+		if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bundleDir, "manifest.json"),
+			[]byte(`{"bundle_version":"0.6.0"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(bundleDir, filepath.Join(root, "current")); err != nil {
+			t.Fatal(err)
+		}
+		if !currentBundleReadable(root) {
+			t.Fatal("want true when manifest is valid JSON")
+		}
+	})
+}

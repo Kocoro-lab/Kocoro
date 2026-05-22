@@ -404,6 +404,12 @@ func Load() (*Config, error) {
 	}
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 	hydrateAPIKeyFromKeychain(&cfg)
+	if cfg.apiKeyFromKeychain {
+		// Keep the hydrated key in-process for older call sites that read
+		// viper directly. Save still strips it back out, so Keychain remains
+		// the only persistent credential store on macOS.
+		viper.Set("api_key", cfg.APIKey)
+	}
 
 	// KOCORO_ENDPOINT env var overrides the yaml endpoint. Useful when an
 	// external process (e.g. the macOS Desktop app's launch logic) keeps

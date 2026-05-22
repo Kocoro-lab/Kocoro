@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,12 @@ type Service struct {
 	// Phase 2.5b: reason tracking for MemoryProviderStatus.
 	disabledReason  atomic.Pointer[string]
 	restartAttempts atomic.Int32
+
+	// 2026-05-22: typed detail for the GET /status memory.detail block —
+	// carries {compatibility, sub_code, bundle_version} from the supervisor's
+	// last WaitReady observation. Surfaced as repair_needed when reason is
+	// ReasonBundleSchemaMismatch so Kocoro Desktop can prompt for tlm reinstall.
+	disabledDetail atomic.Pointer[map[string]any]
 
 	// pullNow is a buffered(1) channel that wakes the puller for an
 	// out-of-schedule bundle check. NotifySyncDone sends to it; nil on
@@ -82,6 +89,20 @@ func (s *Service) setDisabledReason(r string) {
 	}
 }
 
+// setDisabledDetail stores the supervisor's last WaitReady observation as
+// the repair_needed payload. Pass nil to clear.
+func (s *Service) setDisabledDetail(d map[string]any) {
+	if d == nil {
+		s.disabledDetail.Store(nil)
+		return
+	}
+	cp := make(map[string]any, len(d))
+	for k, v := range d {
+		cp[k] = v
+	}
+	s.disabledDetail.Store(&cp)
+}
+
 // MemoryProviderStatus returns the atomic snapshot of the memory feature
 // state for inclusion in the daemon GET /status response.
 func (s *Service) MemoryProviderStatus() MemoryStatus {
@@ -99,6 +120,14 @@ func (s *Service) MemoryProviderStatus() MemoryStatus {
 		if st == StatusDegraded {
 			ms.Detail = map[string]any{
 				"restart_attempts": int(s.restartAttempts.Load()),
+			}
+			// Attach the supervisor's last WaitReady observation as a
+			// repair_needed block when the failure is a schema-mismatch
+			// lockout. Desktop reads this to drive its on-demand tlm install.
+			if reason := s.disabledReason.Load(); reason != nil && *reason == ReasonBundleSchemaMismatch {
+				if d := s.disabledDetail.Load(); d != nil && len(*d) > 0 {
+					ms.Detail["repair_needed"] = *d
+				}
 			}
 		}
 		return ms
@@ -168,10 +197,14 @@ func (s *Service) Start(ctx context.Context) error {
 
 	// Cold-start bootstrap (cloud-mode only): sidecar reports ready=false
 	// until a bundle exists, but the puller only starts from onReady. Break
-	// the cycle by pulling synchronously here when `current` is missing or
-	// dangling. os.Stat (not Readlink) so a dangling link triggers bootstrap.
+	// the cycle by pulling synchronously here when `current` is missing,
+	// dangling, or points at a bundle whose manifest.json is unreadable as
+	// JSON. This catches the "missing/corrupt" case only — manifests that
+	// parse as JSON but contain newer fields the local tlm binary's dataclass
+	// can't unmarshal look readable here and must be handled by the
+	// supervisor's onIncompatible self-heal path (real schema-mismatch fix).
 	if s.cfg.Provider == "cloud" {
-		if _, err := os.Stat(filepath.Join(s.cfg.BundleRoot, "current")); err != nil {
+		if !currentBundleReadable(s.cfg.BundleRoot) {
 			boot := NewPuller(s.cfg, nil, s.audit)
 			if tickErr := boot.tick(ctx); tickErr != nil {
 				s.logAudit("memory_bootstrap_pull_failed", map[string]any{"reason": tickErr.Error()})
@@ -203,21 +236,72 @@ func (s *Service) Start(ctx context.Context) error {
 
 	sup := NewSupervisor(s.sidecar, s.cfg.SidecarRestartMax, onReady)
 	sup.SetReadyTimeout(s.cfg.SidecarReadyTimeout)
-	sup.SetOnDegraded(func(reason string, attempts int) {
+	sup.SetOnDegraded(func(reason string, attempts int, detail map[string]any) {
 		s.restartAttempts.Store(int32(attempts))
 		s.setDisabledReason(reason)
+		s.setDisabledDetail(detail)
 		s.status.Store(int32(StatusDegraded))
-		s.logAudit("memory_sidecar_degraded", map[string]any{
+		fields := map[string]any{
 			"reason":           reason,
 			"restart_attempts": attempts,
-		})
+		}
+		for k, v := range detail {
+			fields[k] = v
+		}
+		s.logAudit("memory_sidecar_degraded", fields)
 	})
+	// One-shot self-heal hook: cloud-mode only. When the supervisor sees a
+	// sustained incompatible_bundle/(no_manifest|version_out_of_range) it
+	// invokes this callback once, then on continued mismatch short-circuits
+	// to StateDegraded with ReasonBundleSchemaMismatch — so we burn one
+	// puller round-trip, not the full restart budget. Local-mode users have
+	// no upstream to pull from so we skip the hook (supervisor will
+	// short-circuit on first detection instead of retrying pointlessly).
+	if s.cfg.Provider == "cloud" {
+		sup.SetOnIncompatible(func() {
+			s.logAudit("memory_self_heal_attempt", map[string]any{
+				"trigger": "incompatible_bundle",
+			})
+			boot := NewPuller(s.cfg, nil, s.audit)
+			if err := boot.tick(supCtx); err != nil {
+				s.logAudit("memory_self_heal_failed", map[string]any{"reason": err.Error()})
+			} else {
+				s.logAudit("memory_self_heal_ok", map[string]any{})
+			}
+		})
+	}
 	go func() {
 		sup.Run(supCtx)
 		// Status and reason already set by onDegraded.
 		// StateStopped (ctx cancel via Stop()) needs no action.
 	}()
 	return nil
+}
+
+// currentBundleReadable reports whether <bundleRoot>/current resolves to a
+// directory that contains a manifest.json the Go side can JSON-decode. It
+// returns false when:
+//   - the `current` path is missing or a dangling symlink
+//   - the target is not a directory
+//   - manifest.json is missing
+//   - manifest.json contents are not valid JSON
+//
+// It does NOT validate that the manifest is loadable by the local tlm
+// binary's dataclass. The production 2026-05-22 lockout had a JSON-valid
+// manifest carrying newer fields the Apr 21 binary couldn't accept; that
+// case looks readable here and is the supervisor's onIncompatible path.
+func currentBundleReadable(bundleRoot string) bool {
+	currentPath := filepath.Join(bundleRoot, "current")
+	st, err := os.Stat(currentPath) // follows the symlink
+	if err != nil || !st.IsDir() {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(currentPath, "manifest.json"))
+	if err != nil {
+		return false
+	}
+	var probe map[string]any
+	return json.Unmarshal(data, &probe) == nil
 }
 
 // runPullerLoop runs the 24h bundle pull ticker. Honors

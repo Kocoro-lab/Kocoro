@@ -138,6 +138,112 @@ func TestSidecar_SpawnAndShutdown(t *testing.T) {
 	}
 }
 
+// TestSidecar_ShutdownIdempotent_AfterWait asserts that calling Shutdown
+// after the supervisor has already reaped the child via Wait() is safe —
+// no double exec.Cmd.Wait call (which is undefined per stdlib), no panic.
+func TestSidecar_ShutdownIdempotent_AfterWait(t *testing.T) {
+	sock := shortSocketPath(t, "idem")
+	root, err := os.MkdirTemp("", "tlmroot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+
+	script := writeFakeTLMScript(t)
+	cfg := Config{
+		TLMPath:              "python3",
+		SocketPath:           sock,
+		BundleRoot:           root,
+		SidecarReadyTimeout:  5 * time.Second,
+		SidecarShutdownGrace: 2 * time.Second,
+	}
+	sc := NewSidecar(cfg, []string{script})
+	ctx := context.Background()
+	if err := sc.Spawn(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.WaitReady(ctx, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	// Kill the child out-of-band so Wait() returns quickly (we don't have
+	// a clean exit path from the fake script). SIGTERM the process group so
+	// the python http server actually stops listening.
+	_ = sc.cmd.Process.Signal(os.Interrupt)
+	_ = sc.Wait() // reaps the child
+
+	// Now Shutdown must not double-Wait or panic. Two calls in a row should
+	// both succeed.
+	if err := sc.Shutdown(1 * time.Second); err != nil {
+		t.Fatalf("Shutdown after Wait returned err=%v", err)
+	}
+	if err := sc.Shutdown(1 * time.Second); err != nil {
+		t.Fatalf("second Shutdown returned err=%v", err)
+	}
+}
+
+// TestSidecar_ConcurrentWaitAndShutdown asserts that Wait and Shutdown can
+// be invoked from different goroutines on the same Sidecar without racing
+// the cmd field, double-Waiting the same exec.Cmd, or deadlocking. Run with
+// -race to catch field-access races.
+//
+// This models the production failure mode: Desktop repair flow stops the
+// daemon (Service.Stop → Shutdown) while the supervisor goroutine is
+// blocked in Sidecar.Wait().
+func TestSidecar_ConcurrentWaitAndShutdown(t *testing.T) {
+	sock := shortSocketPath(t, "race")
+	root, err := os.MkdirTemp("", "tlmroot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+
+	script := writeFakeTLMScript(t)
+	cfg := Config{
+		TLMPath:              "python3",
+		SocketPath:           sock,
+		BundleRoot:           root,
+		SidecarReadyTimeout:  5 * time.Second,
+		SidecarShutdownGrace: 2 * time.Second,
+	}
+	sc := NewSidecar(cfg, []string{script})
+	ctx := context.Background()
+	if err := sc.Spawn(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.WaitReady(ctx, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fire Wait and Shutdown concurrently. Repeat the Wait+Shutdown pair
+	// a few times — each subsequent pair runs against the reaped-state
+	// (idempotent) paths.
+	const goroutines = 8
+	done := make(chan struct{}, goroutines)
+	for i := 0; i < goroutines; i++ {
+		i := i
+		go func() {
+			defer func() { done <- struct{}{} }()
+			if i%2 == 0 {
+				_ = sc.Wait()
+			} else {
+				_ = sc.Shutdown(1 * time.Second)
+			}
+		}()
+	}
+	// Bounded wait so a deadlock fails loudly under -race instead of
+	// hanging the test runner. 10s is far above the Shutdown grace +
+	// SIGKILL fallback (1s+1s).
+	deadline := time.After(10 * time.Second)
+	for i := 0; i < goroutines; i++ {
+		select {
+		case <-done:
+		case <-deadline:
+			t.Fatal("Wait/Shutdown goroutines did not all complete within 10s — likely deadlock")
+		}
+	}
+}
+
 func TestSidecar_TLMNotFound(t *testing.T) {
 	cfg := Config{TLMPath: "/definitely/no/such/binary"}
 	sc := NewSidecar(cfg, nil)

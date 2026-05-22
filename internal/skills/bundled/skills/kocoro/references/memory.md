@@ -48,13 +48,77 @@ probe fails, the daemon log will show one of these audit events:
   add to `$PATH`)
 - `memory_cloud_misconfigured` — `cloud` mode with empty endpoint or key
   (boolean fields `endpoint_resolved`, `api_key_present` indicate which)
-- `memory_sidecar_degraded` — restart budget exhausted (3 crashes); the
-  tool falls back until daemon restart
+- `memory_sidecar_degraded` — restart budget exhausted OR confirmed
+  schema-mismatch short-circuit; the tool falls back until daemon restart.
+  Carries `reason` field (see enum below) and optional
+  `compatibility`/`sub_code`/`bundle_version` when reason is
+  `tlm_binary_too_old`.
+- `memory_self_heal_attempt` / `memory_self_heal_ok` /
+  `memory_self_heal_failed` — emitted when the supervisor's one-shot
+  `onIncompatible` hook fires after detecting `incompatible_bundle`.
+  Cloud-mode pulls a fresh bundle once before declaring the lockout
+  unrecoverable from the daemon side.
 - `memory_tenant_switch` — fingerprint mismatch detected, bundles wiped
 - `memory_bundle_unsafe_path` — manifest contained a path that escaped
   the sandbox; install aborted
 - `memory_reload_failed` — bundle installed but `/bundle/reload` POST
   failed; sidecar's own poller will pick up the new symlink eventually
+
+## `memory_sidecar_degraded` reason enum
+
+The `reason` field surfaced on both the audit event and `GET /status`
+`memory.reason`:
+
+- `tlm_binary_missing` — `tlm` binary not resolvable at all.
+- `tlm_exec_error` — Spawn returned an OS-level error (e.g. permission).
+- `tlm_health_failed` — `/health` probe failed in a way that wasn't a
+  ready-window timeout.
+- `startup_timeout` — sidecar never became Ready within the configured
+  window for a non-schema reason (slow disk, hung process).
+- `repeated_crash` — sidecar became Ready, then exited, repeatedly.
+- `cloud_misconfigured` — `cloud` mode with empty endpoint or API key.
+- `tlm_binary_too_old` — sustained `compatibility="incompatible"` with
+  `sub_code in {"no_manifest","version_out_of_range"}` from the
+  sidecar's `/health`. The most common cause is a local `tlm` binary
+  older than the bundle manifest's schema (newer dataclass fields the
+  binary can't unmarshal). Kocoro Desktop consumes this via
+  `GET /status memory.reason` and prompts the user to re-run its
+  on-demand `tlm` install. The supervisor fires its self-heal hook
+  once (cloud-mode bundle pull) before short-circuiting to degraded
+  — five restart attempts won't make a stale binary compatible.
+
+## `GET /status memory.detail.repair_needed` shape
+
+When `memory.reason == "tlm_binary_too_old"`, the `detail` map also
+carries a `repair_needed` block with the last `/health` observation
+from before the supervisor short-circuited:
+
+```json
+{
+  "memory": {
+    "provider": "disabled",
+    "reason": "tlm_binary_too_old",
+    "detail": {
+      "restart_attempts": 2,
+      "repair_needed": {
+        "compatibility": "incompatible",
+        "sub_code": "no_manifest",
+        "bundle_version": ""
+      }
+    }
+  }
+}
+```
+
+Desktop polls this endpoint and routes the user into the on-demand
+`tlm` reinstall flow when the block is present. The CLI prints the
+same data via `shan daemon status`:
+
+```
+Memory:    disabled (tlm_binary_too_old)
+           restart_attempts=2
+Repair:    bundle_version= compatibility=incompatible sub_code=no_manifest
+```
 
 ## Implicit episodic preflight
 

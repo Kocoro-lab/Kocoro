@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -473,6 +474,24 @@ var daemonStartCmd = &cobra.Command{
 		var wsCtl *daemon.WSController
 		kcStore, kcErr := keychain.NewOSStore(log.Default())
 		if kcErr == nil {
+			// Pre-seed viper's cloud.api_key from Keychain so the memory
+			// subsystem's cold-start gate (memory.ResolveAPIKey at
+			// server.go:518) doesn't fire cloud_misconfigured for users
+			// whose yaml api_key has been moved to Keychain by the v1
+			// migration. Without this, AuthManager.Bootstrap correctly
+			// signs the user in, but memSvc has already been constructed
+			// with an empty api_key and stays Unavailable forever.
+			//
+			// Viper override is in-process only — yaml on disk stays as
+			// the migration left it (Keychain is the source of truth).
+			// Skip when yaml already has a value: the operator may have
+			// manually set memory.api_key / cloud.api_key and we should
+			// not stomp it.
+			if k, kerr := kcStore.GetAPIKey(); kerr == nil && k != "" {
+				if viper.GetString("memory.api_key") == "" && viper.GetString("cloud.api_key") == "" {
+					viper.Set("cloud.api_key", k)
+				}
+			}
 			authClient := client.NewAuthClient(cfg.Endpoint, gw.HTTPClient())
 			authMgr = daemon.NewAuthManager(daemon.AuthManagerConfig{
 				Keychain: kcStore,
@@ -716,6 +735,77 @@ var daemonStopCmd = &cobra.Command{
 	},
 }
 
+// daemonMemoryStatus mirrors internal/memory.MemoryStatus on the wire. Kept
+// in cmd/ to avoid pulling internal/memory into the CLI package.
+type daemonMemoryStatus struct {
+	Provider string         `json:"provider"`
+	Reason   *string        `json:"reason"`
+	Detail   map[string]any `json:"detail,omitempty"`
+}
+
+// daemonStatusResponse mirrors the JSON shape returned by GET /status.
+type daemonStatusResponse struct {
+	IsConnected bool                `json:"is_connected"`
+	ActiveAgent string              `json:"active_agent"`
+	Uptime      int                 `json:"uptime"`
+	Version     string              `json:"version"`
+	Memory      *daemonMemoryStatus `json:"memory,omitempty"`
+}
+
+// printMemoryStatus writes a human-readable summary of the memory section
+// to w. Older daemons without the memory field produce no output (ms == nil).
+//
+// Renders up to three lines:
+//
+//	Memory:    enabled                       (happy path)
+//	Memory:    disabled (tlm_binary_too_old) (degraded; reason in parens)
+//	           restart_attempts=5            (other top-level detail keys)
+//	Repair:    compatibility=incompatible sub_code=no_manifest bundle_version=
+//	                                         (only when reason ==
+//	                                          tlm_binary_too_old, so users +
+//	                                          Desktop see the actionable bits
+//	                                          without parsing the JSON detail)
+func printMemoryStatus(w io.Writer, ms *daemonMemoryStatus) {
+	if ms == nil {
+		return
+	}
+	line := "Memory:    " + ms.Provider
+	if ms.Reason != nil && *ms.Reason != "" {
+		line += " (" + *ms.Reason + ")"
+	}
+	fmt.Fprintln(w, line)
+
+	if len(ms.Detail) > 0 {
+		topKeys := make([]string, 0, len(ms.Detail))
+		for k := range ms.Detail {
+			if k == "repair_needed" {
+				continue
+			}
+			topKeys = append(topKeys, k)
+		}
+		sort.Strings(topKeys)
+		if len(topKeys) > 0 {
+			parts := make([]string, 0, len(topKeys))
+			for _, k := range topKeys {
+				parts = append(parts, fmt.Sprintf("%s=%v", k, ms.Detail[k]))
+			}
+			fmt.Fprintln(w, "           "+strings.Join(parts, " "))
+		}
+		if repair, ok := ms.Detail["repair_needed"].(map[string]any); ok && len(repair) > 0 {
+			rKeys := make([]string, 0, len(repair))
+			for k := range repair {
+				rKeys = append(rKeys, k)
+			}
+			sort.Strings(rKeys)
+			parts := make([]string, 0, len(rKeys))
+			for _, k := range rKeys {
+				parts = append(parts, fmt.Sprintf("%s=%v", k, repair[k]))
+			}
+			fmt.Fprintln(w, "Repair:    "+strings.Join(parts, " "))
+		}
+	}
+}
+
 var daemonStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show daemon status",
@@ -735,12 +825,7 @@ var daemonStatusCmd = &cobra.Command{
 		}
 		defer resp.Body.Close()
 
-		var status struct {
-			IsConnected bool   `json:"is_connected"`
-			ActiveAgent string `json:"active_agent"`
-			Uptime      int    `json:"uptime"`
-			Version     string `json:"version"`
-		}
+		var status daemonStatusResponse
 		if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 			return fmt.Errorf("failed to parse status: %w", err)
 		}
@@ -759,6 +844,7 @@ var daemonStatusCmd = &cobra.Command{
 		}
 		uptime := time.Duration(status.Uptime) * time.Second
 		fmt.Printf("Uptime:    %s\n", uptime)
+		printMemoryStatus(os.Stdout, status.Memory)
 		if daemon.IsDaemonServiceLoaded() {
 			fmt.Printf("Launchd:   managed\n")
 		} else {
