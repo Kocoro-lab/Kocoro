@@ -992,6 +992,12 @@ func (a *AgentLoop) SetModelTier(tier string) {
 	a.modelTier = tier
 }
 
+// ModelTier returns the currently-configured model tier. Test-only accessor;
+// production callers read modelTier directly through messagesForLLM / Run.
+func (a *AgentLoop) ModelTier() string {
+	return a.modelTier
+}
+
 func (a *AgentLoop) SetMCPContext(ctx string) {
 	a.mcpContext = ctx
 }
