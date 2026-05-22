@@ -641,37 +641,6 @@ func stripMarkdownLite(s string) string {
 // end user.
 //
 // NOTE: keep this set aligned with cloudSourceSet in session_cwd.go. The
-// applyAgentModelOverlayToLoop applies the loop-facing fields of the per-agent
-// model overlay onto the AgentLoop. Called per-turn so reload picks up edits.
-//
-// Priority chain (last writer wins): SetModelTier runs BEFORE SetSpecificModel
-// so an explicit `model:` pin beats a `model_tier:` family hint when both are
-// set. Idle timeout fields live in runCfg, not on the loop, and are handled
-// inline at the call site.
-func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelConfig) {
-	if loop == nil || ac == nil {
-		return
-	}
-	if ac.ModelTier != nil && *ac.ModelTier != "" {
-		loop.SetModelTier(*ac.ModelTier)
-	}
-	if ac.Model != nil {
-		loop.SetSpecificModel(*ac.Model)
-	}
-	if ac.MaxIterations != nil {
-		loop.SetMaxIterations(*ac.MaxIterations)
-	}
-	if ac.Temperature != nil {
-		loop.SetTemperature(*ac.Temperature)
-	}
-	if ac.MaxTokens != nil {
-		loop.SetMaxTokens(*ac.MaxTokens)
-	}
-	if ac.ContextWindow != nil {
-		loop.SetContextWindowExplicit(*ac.ContextWindow)
-	}
-}
-
 // invariants differ (CWD allocation vs. @mention handling), but if a channel
 // is cloud-routed it almost always belongs in both lists.
 func IsMessagingPlatform(source string) bool {
@@ -945,6 +914,37 @@ func resumeRoutedColdStart(sessMgr *session.Manager, routeKey string) (bool, err
 		return true, nil
 	}
 	return false, nil
+}
+
+// applyAgentModelOverlayToLoop applies the loop-facing fields of the per-agent
+// model overlay onto the AgentLoop. Called per-turn so reload picks up edits.
+//
+// Priority chain (last writer wins): SetModelTier runs BEFORE SetSpecificModel
+// so an explicit `model:` pin beats a `model_tier:` family hint when both are
+// set. Idle timeout fields live in runCfg, not on the loop, and are handled
+// inline at the call site.
+func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelConfig) {
+	if loop == nil || ac == nil {
+		return
+	}
+	if ac.ModelTier != nil && *ac.ModelTier != "" {
+		loop.SetModelTier(*ac.ModelTier)
+	}
+	if ac.Model != nil {
+		loop.SetSpecificModel(*ac.Model)
+	}
+	if ac.MaxIterations != nil {
+		loop.SetMaxIterations(*ac.MaxIterations)
+	}
+	if ac.Temperature != nil {
+		loop.SetTemperature(*ac.Temperature)
+	}
+	if ac.MaxTokens != nil {
+		loop.SetMaxTokens(*ac.MaxTokens)
+	}
+	if ac.ContextWindow != nil {
+		loop.SetContextWindowExplicit(*ac.ContextWindow)
+	}
 }
 
 // RunAgent executes a single agent turn using the shared dependencies.
