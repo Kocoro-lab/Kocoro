@@ -4894,13 +4894,24 @@ func TestOperationalRules_StripsBulletWhenThinkUnregistered(t *testing.T) {
 	if !strings.Contains(got, "## Approach") {
 		t.Error("pre-planning '## Approach' section missing")
 	}
-	if !strings.Contains(got, "### System") {
-		t.Error("post-planning '### System' section missing")
+	if !strings.Contains(got, "## Skills") {
+		t.Error("post-planning '## Skills' section missing")
 	}
-	// Spacing: '### System' must be preceded by a blank line (i.e. `\n\n### System`),
+	// Spacing: '## Skills' must be preceded by a blank line (i.e. `\n\n## Skills`),
 	// not by triple-newline (would happen if removal substring was wrong).
-	if strings.Contains(got, "\n\n\n### System") {
-		t.Error("triple newline before ### System — planning removal left extra blank line")
+	if strings.Contains(got, "\n\n\n## Skills") {
+		t.Error("triple newline before ## Skills — planning removal left extra blank line")
+	}
+}
+
+// TestOperationalRules_HasActingWithCareSection guards the blast-radius
+// guidance from silent removal in future prompt trimming. The byte-equality
+// test catches *unintended* changes; this test catches intentional removal
+// of the load-bearing section the model uses to decide ask-vs-act on
+// destructive, hard-to-reverse, or shared-state actions.
+func TestOperationalRules_HasActingWithCareSection(t *testing.T) {
+	if !strings.Contains(coreOperationalRules, "## Acting with Care") {
+		t.Error("## Acting with Care section missing from coreOperationalRules — removed without replacement?")
 	}
 }
 

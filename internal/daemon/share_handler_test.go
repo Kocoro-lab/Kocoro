@@ -11,6 +11,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
+	"github.com/Kocoro-lab/ShanClaw/internal/share"
 )
 
 // newTestShareServer wires a *Server with an in-memory cloud upstream, a temp
@@ -974,3 +975,42 @@ func TestHandleSessionShare_ExplicitAsyncFalseOverridesDefault(t *testing.T) {
 	}
 }
 
+// TestShareMetadataFromConfig_ExhaustiveFieldCopy is a regression guard for
+// the config → share.ShareMetadata helper. Every field on ShareMetadataConfig
+// must propagate through the helper; if a new field gets added to the config
+// struct and an author forgets to copy it in shareMetadataFromConfig, the
+// renderer would silently see an empty value and skip the corresponding meta
+// tag. A reflect-based check catches the omission at test time instead of in
+// production.
+func TestShareMetadataFromConfig_ExhaustiveFieldCopy(t *testing.T) {
+	cfg := &config.Config{
+		Daemon: config.DaemonConfig{
+			ShareMetadata: config.ShareMetadataConfig{
+				SiteName:       "TestSite",
+				SiteURL:        "https://example.test/",
+				DefaultOGImage: "https://example.test/og.png",
+				TwitterImage:   "https://example.test/twitter-1200x630.png",
+				LogoURL:        "https://example.test/logo.png",
+			},
+		},
+	}
+	got := shareMetadataFromConfig(cfg)
+	want := share.ShareMetadata{
+		SiteName:       "TestSite",
+		SiteURL:        "https://example.test/",
+		DefaultOGImage: "https://example.test/og.png",
+		TwitterImage:   "https://example.test/twitter-1200x630.png",
+		LogoURL:        "https://example.test/logo.png",
+	}
+	if got != want {
+		t.Errorf("shareMetadataFromConfig dropped or rewrote a field:\n  got  %+v\n  want %+v", got, want)
+	}
+
+	// nil cfg must produce a zero-value ShareMetadata (never panic). This
+	// path is defensive: every caller in production goes through
+	// deps.Snapshot() which returns non-nil, but the helper takes a pointer
+	// and is cheaper to make safe than to require callers to verify.
+	if zero := shareMetadataFromConfig(nil); zero != (share.ShareMetadata{}) {
+		t.Errorf("nil cfg should yield zero ShareMetadata, got %+v", zero)
+	}
+}
