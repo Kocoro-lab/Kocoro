@@ -3583,7 +3583,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				}
 				if rs, ok := a.handler.(RunStatusHandler); ok {
 					rs.OnRunStatus("upstream_inconsistent_finish",
-						"上游响应不完整,正在重试…")
+						"上游响应不完整，正在重试…")
 				}
 				// Do NOT append the assistant message — the response is malformed
 				// (claims tool_use without a tool_use block). Persisting it would
