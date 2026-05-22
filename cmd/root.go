@@ -239,6 +239,11 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	// Per-agent model config overrides
 	if agentOverride != nil && agentOverride.Config != nil && agentOverride.Config.Agent != nil {
 		ac := agentOverride.Config.Agent
+		// SetModelTier runs before SetSpecificModel so an explicit `model:`
+		// pin still beats a `model_tier:` family hint when both are set.
+		if ac.ModelTier != nil && *ac.ModelTier != "" {
+			loop.SetModelTier(*ac.ModelTier)
+		}
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
 		}
