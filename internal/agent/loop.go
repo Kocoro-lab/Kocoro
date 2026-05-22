@@ -2178,6 +2178,23 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// output budget at the same boundary.
 	const maxTruncationRecoveries = 3
 
+	// maxInconsistentFinishRetries bounds the daemon-side retry budget for the
+	// "stop_reason=tool_use but no tool_use block AND no visible text" upstream
+	// anomaly. Matches shannon-cloud's `_retry_attempt` ceiling of 1 — if
+	// cloud's retry already ran and still produced the inconsistent shape, one
+	// more daemon attempt is the most we should try before surfacing
+	// ErrEmptyFinalResponse. Worst-case token spend bounded at 2x for this
+	// branch (and the cloud retry runs INSIDE one daemon call, so the
+	// daemon+cloud product is bounded at 2x×2x = 4x — see plan for details).
+	//
+	// Scope note: this branch covers stop_reason="tool_use" ONLY. max_tokens /
+	// length have their own continuation path (isMaxTokensTruncation +
+	// truncatedText accumulation) that requires resp.OutputText != ""; if a
+	// future audit shows max_tokens hitting the empty-text shape, it needs a
+	// different recovery strategy (shorter prompt, not same-prompt resample)
+	// and should be designed separately.
+	const maxInconsistentFinishRetries = 1
+
 	// batch-tolerant set: bash + READ-verb MCP tool names + read-only local
 	// fan-out tools (file_read / glob / grep / directory_list). On these
 	// tools, the NoProgress detector applies a uniqueness gate so
