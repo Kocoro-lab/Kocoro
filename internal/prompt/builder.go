@@ -1,7 +1,6 @@
 package prompt
 
 import (
-	"fmt"
 	"runtime"
 	"strings"
 	"time"
@@ -325,10 +324,8 @@ func buildVolatileContext(opts PromptOptions) string {
 		sb.WriteString("\nWorking directory: " + opts.CWD)
 	}
 	if opts.ModelID != "" {
-		sb.WriteString("\nModel: " + opts.ModelID)
-	}
-	if opts.ContextWindow > 0 {
-		sb.WriteString(fmt.Sprintf("\nContext window: %d tokens", opts.ContextWindow))
+		sb.WriteString("\nModel tier: " + opts.ModelID)
+		sb.WriteString("\nKocoro offers two tiers: medium, large.")
 	}
 	if opts.SessionInfo != "" {
 		sb.WriteString("\n" + opts.SessionInfo)
