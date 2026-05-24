@@ -361,6 +361,46 @@ func (h *mockHandler) OnApprovalNeeded(tool string, args string) bool {
 	return h.approveResult
 }
 
+type usageRecordingHandler struct {
+	mockHandler
+	mu           sync.Mutex
+	deltas       []TurnUsage
+	statusEvents []recordedStatus
+}
+
+func (h *usageRecordingHandler) OnUsage(usage TurnUsage) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.deltas = append(h.deltas, usage)
+}
+
+// OnRunStatus makes usageRecordingHandler satisfy RunStatusHandler so the
+// `a.handler.(RunStatusHandler)` type assertion in loop.go succeeds in
+// tests. Without this, the upstream_inconsistent_finish emit is a silent
+// no-op in tests and events.md's public promise of an observable event
+// has no test backing it.
+func (h *usageRecordingHandler) OnRunStatus(code, detail string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.statusEvents = append(h.statusEvents, recordedStatus{code: code, detail: detail})
+}
+
+func (h *usageRecordingHandler) UsageDeltas() []TurnUsage {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]TurnUsage, len(h.deltas))
+	copy(out, h.deltas)
+	return out
+}
+
+func (h *usageRecordingHandler) StatusEvents() []recordedStatus {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]recordedStatus, len(h.statusEvents))
+	copy(out, h.statusEvents)
+	return out
+}
+
 func TestAgentLoop_SafeCheckerSkipsApproval(t *testing.T) {
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -5553,5 +5593,370 @@ func TestAgentLoop_WhitespaceOnlyTextBlock_RecoveryReturnsEmpty(t *testing.T) {
 	_, _, err := loop.Run(context.Background(), "test", nil, nil)
 	if !errors.Is(err, ErrEmptyFinalResponse) {
 		t.Errorf("whitespace-only text block must NOT be treated as recovered visible text; got err=%v", err)
+	}
+}
+
+// Inconsistent-finish detection: when Cloud yields finish_reason=tool_use
+// but no tool_calls AND no visible text (only thinking blocks), the daemon
+// must NOT immediately return ErrEmptyFinalResponse. Instead it retries the
+// current iteration once with the same request; if the retry recovers (text
+// or tool_calls), the run continues normally.
+//
+// This is the daemon-side defense for the shape that shannon-cloud's retry
+// guard is supposed to catch. Both repos defend it (defense-in-depth).
+//
+// The thinking block matters: the real 2026-05-22 audit row had
+// blocks=[thinking] + output_tokens=10233 (10K tokens of reasoning that
+// went into thinking, with no tool_use block landing). A test that emits
+// "no blocks at all" would still trip the detection, but would not
+// reproduce the actual production shape — assertions on the
+// empty_with_inconsistent_finish audit row's blocks field pin that.
+func TestAgentLoop_InconsistentFinish_ToolUseWithoutBlock_RetriesAndRecovers(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// First call: inconsistent shape — finish_reason=tool_use, no
+			// tool_use block, only a thinking block. Exact pattern from the
+			// 2026-05-22 audit row (input=146, output=10233, blocks=[thinking]).
+			resp := nativeResponse("", "tool_use", nil, 146, 10233)
+			resp.ContentBlocks = []client.ContentBlock{
+				{Type: "thinking", Thinking: "long internal reasoning", Signature: "sig"},
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+		// Retry: real text answer.
+		json.NewEncoder(w).Encode(nativeResponse("recovered", "end_turn", nil, 100, 5))
+	}))
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+	handler := &usageRecordingHandler{}
+	loop.SetHandler(handler)
+
+	out, turnUsage, err := loop.Run(context.Background(), "do work", nil, nil)
+	if err != nil {
+		t.Fatalf("expected nil error on recovery, got %v", err)
+	}
+	if out != "recovered" {
+		t.Errorf("expected recovered text, got %q", out)
+	}
+	if callCount != 2 {
+		t.Errorf("expected exactly 2 calls (initial + 1 retry), got %d", callCount)
+	}
+	if code := loop.LastRunStatus().FailureCode; code != "" {
+		t.Errorf("recovered run must clear FailureCode, got %q", code)
+	}
+	if turnUsage.LLMCalls != 2 {
+		t.Errorf("turn usage should count malformed response + recovery, LLMCalls=%d", turnUsage.LLMCalls)
+	}
+	if turnUsage.InputTokens != 246 || turnUsage.OutputTokens != 10238 {
+		t.Errorf("turn usage should include both LLM responses, got input=%d output=%d",
+			turnUsage.InputTokens, turnUsage.OutputTokens)
+	}
+	deltas := handler.UsageDeltas()
+	if len(deltas) != 2 {
+		t.Fatalf("handler should receive usage for malformed response + recovery, got %d deltas: %+v", len(deltas), deltas)
+	}
+	if deltas[0].InputTokens != 146 || deltas[0].OutputTokens != 10233 || deltas[0].LLMCalls != 1 {
+		t.Errorf("first usage delta should be malformed response usage, got %+v", deltas[0])
+	}
+	if deltas[1].InputTokens != 100 || deltas[1].OutputTokens != 5 || deltas[1].LLMCalls != 1 {
+		t.Errorf("second usage delta should be recovery response usage, got %+v", deltas[1])
+	}
+
+	// events.md:102 promises that `upstream_inconsistent_finish` is observable
+	// on the run-status stream. Pin that the OnRunStatus emit actually fires —
+	// without this, a future refactor that drops the emit (e.g. moving it
+	// behind a feature flag, removing the type assertion) leaves the public
+	// contract silently broken while tests stay green.
+	statusEvents := handler.StatusEvents()
+	if len(statusEvents) != 1 {
+		t.Fatalf("recovery must emit exactly 1 upstream_inconsistent_finish event, got %d: %+v",
+			len(statusEvents), statusEvents)
+	}
+	if statusEvents[0].code != "upstream_inconsistent_finish" {
+		t.Errorf("status event code should be upstream_inconsistent_finish, got %q", statusEvents[0].code)
+	}
+	if strings.TrimSpace(statusEvents[0].detail) == "" {
+		t.Errorf("status event detail should be a non-empty English fallback, got %q", statusEvents[0].detail)
+	}
+
+	// Audit row attribution: post-incident triage needs to distinguish
+	// recoveries via this branch from the legitimate end_turn empty case.
+	entries := readAuditLines(t, logDir)
+	// Recovery emits exactly ONE empty_with_inconsistent_finish row — the
+	// inconsistent response that triggered the retry. The subsequent
+	// successful response goes through the normal success path with no
+	// extra audit row. If Task 7 ever changes to "log per attempt", this
+	// count check surfaces the contract change explicitly.
+	matches := []map[string]any{}
+	for _, e := range entries {
+		if e["event"] == "empty_with_inconsistent_finish" {
+			matches = append(matches, e)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly 1 empty_with_inconsistent_finish audit row, got %d", len(matches))
+	}
+	found := matches[0]
+	in, _ := found["input_summary"].(string)
+	outSum, _ := found["output_summary"].(string)
+	if !strings.Contains(in, "finish_reason=tool_use") {
+		t.Errorf("audit row should record finish_reason=tool_use, got %q", in)
+	}
+	if !strings.Contains(outSum, "blocks=[thinking") {
+		t.Errorf("audit row should record blocks=[thinking..., got %q", outSum)
+	}
+
+	// Load-bearing cache_control safety claim: the malformed assistant
+	// message must NOT be appended to messages. If it were, the next
+	// request would ship `assistant content:""` with a cache_control
+	// marker → Anthropic 400 "cache_control cannot be set for empty
+	// text blocks". docs/empty-assistant-content-400.md exists exactly
+	// to prevent this regression. If a future refactor adds a stray
+	// `messages = append(...)` to the inconsistent-finish branch, this
+	// assertion is the only thing that will catch it.
+	for idx, msg := range loop.RunMessages() {
+		if msg.Role != "assistant" {
+			continue
+		}
+		txt := strings.TrimSpace(msg.Content.Text())
+		if txt == "" {
+			t.Errorf("run message %d is an empty-text assistant — malformed retry response leaked into messages: %+v",
+				idx, msg)
+		}
+	}
+}
+
+// Regression for blocker #1 (truncatedText masking the retry). If a prior
+// iteration was max_tokens truncated AND the next iteration returns the
+// inconsistent shape (empty OutputText + finish_reason=tool_use), the
+// retry MUST still fire — the predicate inspects the raw response, not
+// the post-concat fullText. Before the fix, fullText was non-empty (it
+// carried the prior truncated text) and silently shipped as the final
+// answer with no retry and no audit row.
+func TestAgentLoop_InconsistentFinish_TruncatedTextDoesNotMaskRetry(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			// max_tokens truncation: text-only with non-empty OutputText.
+			// AgentLoop accumulates this in truncatedText and continues.
+			// Use a small max_tokens (200) so OutputTokens >= effMax fires
+			// the max_tokens-truncation detector at loop.go:3429.
+			json.NewEncoder(w).Encode(nativeResponse("partial-truncated", "max_tokens", nil, 100, 200))
+		case 2:
+			// Continuation iteration returns the inconsistent shape:
+			// finish_reason=tool_use, no tool_use block, no visible text.
+			// truncatedText already contains "partial-truncated"; the retry
+			// must still fire by checking resp.OutputText/recoverVisibleText
+			// rather than the assembled fullText.
+			resp := nativeResponse("", "tool_use", nil, 50, 5000)
+			resp.ContentBlocks = []client.ContentBlock{
+				{Type: "thinking", Thinking: "long internal reasoning", Signature: "sig"},
+			}
+			json.NewEncoder(w).Encode(resp)
+		default:
+			// Recovery on retry: real text answer.
+			json.NewEncoder(w).Encode(nativeResponse("recovered-after-truncation", "end_turn", nil, 80, 5))
+		}
+	}))
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	// MaxTokens=200 so OutputTokens=200 on call 1 trips the truncation detector.
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 200, 200, nil, auditor, nil)
+
+	out, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if err != nil {
+		t.Fatalf("expected nil error on recovery, got %v", err)
+	}
+	// Expected wire: call 1 (truncated) + call 2 (inconsistent) + call 3 (recovered).
+	if callCount != 3 {
+		t.Fatalf("expected 3 calls (truncated → inconsistent → recovered), got %d", callCount)
+	}
+	// Final answer must be the concatenation of truncated + recovered,
+	// NOT just the stale truncated text.
+	if !strings.Contains(out, "recovered-after-truncation") {
+		t.Errorf("final answer missing recovered text — retry was masked by truncatedText: %q", out)
+	}
+	// And the inconsistent-finish branch must have logged its audit row.
+	matches := 0
+	for _, e := range readAuditLines(t, logDir) {
+		if e["event"] == "empty_with_inconsistent_finish" {
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Errorf("expected 1 empty_with_inconsistent_finish row from the inconsistent iteration, got %d", matches)
+	}
+}
+
+// Regression for blocker #4 (HasToolCalls ignoring ContentBlocks). A response
+// whose tool_use lives ONLY in ContentBlocks (legacy ToolCalls/FunctionCall
+// empty) must be dispatched normally — not treated as the inconsistent
+// shape and retried. Forward-compatibility with a Cloud build that ships
+// tool_use only via content_blocks.
+func TestAgentLoop_InconsistentFinish_ContentBlockToolUseDispatchesNormally(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// Legitimate tool_use shape, but the tool_use lives ONLY in
+			// ContentBlocks — ToolCalls/FunctionCall are empty. Production
+			// gateway today populates both; this test pins forward-compat.
+			resp := nativeResponse("", "tool_use", nil, 100, 50)
+			resp.ContentBlocks = []client.ContentBlock{
+				{
+					Type:  "tool_use",
+					ID:    "toolu_test_1",
+					Name:  "mock_tool",
+					Input: json.RawMessage(`{"path":"/tmp/x","content":"y"}`),
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 50, 5))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	mt := &mockTool{name: "mock_tool", required: []string{"path", "content"}}
+	reg.Register(mt)
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	out, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "done" {
+		t.Errorf("expected done, got %q", out)
+	}
+	// 1 = LLM tool_use (content-block-only), 2 = LLM final. No retry.
+	if callCount != 2 {
+		t.Errorf("expected 2 calls (tool_use via ContentBlocks + final), got %d", callCount)
+	}
+}
+
+// Negative-predicate test: !HasToolCalls() + empty text + finish_reason
+// OTHER than "tool_use" (end_turn here) must NOT trigger the new retry.
+// The PR's scope comment is explicit: only tool_use is widened; end_turn
+// thinking-only goes straight to ErrEmptyFinalResponse. Without this test
+// a future refactor that widens the predicate would not be caught.
+func TestAgentLoop_InconsistentFinish_EndTurnEmptyDoesNotRetry(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		// finish_reason=end_turn (NOT tool_use), no visible text, thinking-only.
+		// Sibling test TestAgentLoop_ThinkingOnlyFinalResponse_ReturnsError
+		// covers the ErrEmptyFinalResponse contract; this test pins that the
+		// new retry budget is NOT consumed for non-tool_use finish reasons.
+		resp := nativeResponse("", "end_turn", nil, 100, 5000)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "thinking", Thinking: "long internal reasoning", Signature: "sig"},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	_, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Errorf("expected ErrEmptyFinalResponse (no retry for end_turn), got %v", err)
+	}
+	// Exactly 1 call — no retry. A regression that widens the predicate
+	// would produce 2 calls.
+	if callCount != 1 {
+		t.Errorf("expected exactly 1 call (no retry for end_turn), got %d", callCount)
+	}
+}
+
+// Bound: after maxInconsistentFinishRetries, the daemon stops retrying and
+// returns ErrEmptyFinalResponse so the user gets the friendly fallback.
+func TestAgentLoop_InconsistentFinish_RetryBudgetExhausted_ReturnsEmptyFinalResponse(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		// Every call returns the same inconsistent shape — sampling never recovers.
+		resp := nativeResponse("", "tool_use", nil, 146, 10233)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "thinking", Thinking: "long internal reasoning", Signature: "sig"},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	_, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if err == nil {
+		t.Fatal("expected ErrEmptyFinalResponse after retry exhausted, got nil")
+	}
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Errorf("expected ErrEmptyFinalResponse, got %v", err)
+	}
+	// 1 initial + maxInconsistentFinishRetries (1) = 2 calls before giving up.
+	if callCount != 2 {
+		t.Errorf("expected 2 calls (initial + 1 retry), got %d", callCount)
+	}
+}
+
+// Negative: a legitimate finish_reason=tool_use WITH a tool_use block must
+// dispatch the tool normally — the new retry branch must not interfere.
+func TestAgentLoop_InconsistentFinish_LegitimateToolUseDispatchesNormally(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// Real tool_use with a real block — must NOT trigger retry.
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("mock_tool", `{"path":"/tmp/x","content":"y"}`), 100, 50))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 50, 5))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	mt := &mockTool{name: "mock_tool", required: []string{"path", "content"}}
+	reg.Register(mt)
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	out, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "done" {
+		t.Errorf("expected done, got %q", out)
+	}
+	// 1 = LLM tool_use call, 2 = LLM final response. No retry inserted.
+	if callCount != 2 {
+		t.Errorf("expected 2 calls (tool_use + final), got %d", callCount)
 	}
 }

@@ -862,8 +862,11 @@ type CompletionResponse struct {
 	Cached        bool           `json:"cached"`
 }
 
-// AllToolCalls returns all tool calls from the response, preferring ToolCalls
-// array if present, falling back to single FunctionCall for backward compat.
+// AllToolCalls returns all tool calls from the response. Preference order:
+// ToolCalls array, single FunctionCall, then ContentBlocks (Type=tool_use).
+// ContentBlocks is the documented source of truth (see CompletionResponse.ContentBlocks
+// comment); a future Cloud build that ships tool_use only via content_blocks
+// would otherwise be treated as "no tool calls" by every caller.
 func (r *CompletionResponse) AllToolCalls() []FunctionCall {
 	if len(r.ToolCalls) > 0 {
 		return r.ToolCalls
@@ -871,12 +874,33 @@ func (r *CompletionResponse) AllToolCalls() []FunctionCall {
 	if r.FunctionCall != nil {
 		return []FunctionCall{*r.FunctionCall}
 	}
-	return nil
+	var derived []FunctionCall
+	for _, cb := range r.ContentBlocks {
+		if cb.Type != "tool_use" {
+			continue
+		}
+		derived = append(derived, FunctionCall{
+			ID:        cb.ID,
+			Name:      cb.Name,
+			Arguments: cb.Input,
+		})
+	}
+	return derived
 }
 
-// HasToolCalls returns true if the response contains any tool calls.
+// HasToolCalls returns true if the response contains any tool calls — checks
+// the legacy ToolCalls/FunctionCall fields AND ContentBlocks (the documented
+// source of truth). See AllToolCalls.
 func (r *CompletionResponse) HasToolCalls() bool {
-	return len(r.ToolCalls) > 0 || r.FunctionCall != nil
+	if len(r.ToolCalls) > 0 || r.FunctionCall != nil {
+		return true
+	}
+	for _, cb := range r.ContentBlocks {
+		if cb.Type == "tool_use" {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Task/workflow types (used by /research, /swarm) ---
