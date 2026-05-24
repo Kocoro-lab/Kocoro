@@ -203,6 +203,13 @@ type DaemonConfig struct {
 	// always wins over this default.
 	ShareAsyncDefault bool                `mapstructure:"share_async_default" yaml:"share_async_default" json:"share_async_default"`
 	ShareMetadata     ShareMetadataConfig `mapstructure:"share_metadata"      yaml:"share_metadata"      json:"share_metadata"`
+	// BrowserReloadBackstopSecs bounds how long a deprecated BrowserTool can
+	// linger after config reload before the reload handler logs a structured
+	// warning. Default 120s; not normally tuned. Raise for workloads with
+	// legitimate hour-long browser sessions that span the watchdog window.
+	// The watchdog only LOGS — it never calls Cleanup while leases remain
+	// (would kill in-flight work), so this is purely a diagnostic threshold.
+	BrowserReloadBackstopSecs int `mapstructure:"browser_reload_backstop_secs" yaml:"browser_reload_backstop_secs,omitempty" json:"browser_reload_backstop_secs,omitempty"`
 }
 
 // ShareMetadataConfig holds the social-meta defaults injected into the
@@ -326,6 +333,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("tools.args_truncation", 200)
 	viper.SetDefault("tools.server_tool_timeout", 5)
 	viper.SetDefault("daemon.auto_approve", false)
+	viper.SetDefault("daemon.browser_reload_backstop_secs", 120)
 	viper.SetDefault("daemon.share_async_default", true)
 	// Share HTML social-meta defaults. The default OG image is the same
 	// Kocoro logo asset used in the JSON-LD publisher.logo field — not
