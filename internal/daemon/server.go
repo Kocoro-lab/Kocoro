@@ -4242,7 +4242,15 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 			log.Printf("MCP registry rebuilt (reload): %d tools", len(rebuilt.All()))
 		})
 
+		var oldBrowser *tools.BrowserTool
 		s.deps.mu.Lock()
+		// Snapshot OLD browser under the deps lock so it is consistent with the
+		// oldCleanup / oldSupervisor values captured below.
+		if s.deps.BaselineReg != nil {
+			if bt, ok := s.deps.BaselineReg.Get("browser"); ok {
+				oldBrowser, _ = bt.(*tools.BrowserTool)
+			}
+		}
 		oldCleanup := s.deps.Cleanup
 		oldSupervisor := s.deps.Supervisor
 		s.deps.Config = newCfg
@@ -4257,6 +4265,14 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 
 		if oldSupervisor != nil {
 			oldSupervisor.Stop()
+		}
+
+		// Mark OLD browser deprecated BEFORE oldCleanup() runs so the cleanup
+		// closure (register.go) skips browser.Cleanup() and lease teardown
+		// handles it instead. HandBrowserOff also handles the fast-path /
+		// watchdog branches.
+		if oldBrowser != nil {
+			tools.HandBrowserOff(oldBrowser, oldBrowserCleanupBackstop)
 		}
 		if oldCleanup != nil {
 			oldCleanup()
@@ -4303,7 +4319,15 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		}
 		newPostOverlays := tools.ExtractPostOverlays(freshReg, newBaseline)
 
+		var oldBrowser *tools.BrowserTool
 		s.deps.mu.Lock()
+		// Snapshot OLD browser under the deps lock so it is consistent with the
+		// oldCleanup value captured below.
+		if s.deps.BaselineReg != nil {
+			if bt, ok := s.deps.BaselineReg.Get("browser"); ok {
+				oldBrowser, _ = bt.(*tools.BrowserTool)
+			}
+		}
 		oldCleanup := s.deps.Cleanup
 		s.deps.Config = newCfg
 		s.deps.BaselineReg = newBaseline
@@ -4311,6 +4335,10 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		s.deps.PostOverlays = newPostOverlays
 		s.deps.Cleanup = func() { newBaseCleanup(); oldCleanup() }
 		s.deps.mu.Unlock()
+
+		if oldBrowser != nil {
+			tools.HandBrowserOff(oldBrowser, oldBrowserCleanupBackstop)
+		}
 	}
 
 	if s.onReload != nil {
