@@ -44,7 +44,6 @@ type BrowserTool struct {
 	deprecated atomic.Bool // set by reload handoff; consulted by register.go cleanup gate
 
 	// Test-only observability counters; production code never reads them.
-	// Pattern mirrors cleanupOrphanedChromedpCalledForTest in Task 8.
 	cleanupCalledForTest         atomic.Int32 // incremented at top of Cleanup
 	cleanupChromedpCalledForTest atomic.Int32 // incremented at top of CleanupChromedp
 }
