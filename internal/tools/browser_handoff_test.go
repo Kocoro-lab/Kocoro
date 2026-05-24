@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -114,5 +115,48 @@ func TestReloadBrowserHandoff_MixedOldNewConcurrent(t *testing.T) {
 	leaseOld.ReleaseAndMaybeTeardown(func() error { oldCleanupFired++; return nil })
 	if oldCleanupFired != 1 {
 		t.Fatalf("OLD teardown must fire on release; fired=%d", oldCleanupFired)
+	}
+}
+
+func TestHandBrowserOff_RaceCleanupVsMarkUsed(t *testing.T) {
+	// Regression for the TOCTOU race between HandBrowserOff's zero-count
+	// fast-path and a concurrent MarkBrowserUsed from an in-flight Run that
+	// captured OLD via a pre-reload registry clone. Under -race, an
+	// interleaving where MarkUsedWith landed between the count read and
+	// the Cleanup write would either trigger a race report (if the same
+	// memory was touched) or, more importantly, leave the lease counter
+	// inconsistent (zombie owner entry after cleanup). With the atomic
+	// check+cleanup the race is impossible: either the lease wins (and
+	// Cleanup is deferred to the watchdog/teardown path) or HandBrowserOff
+	// wins (and MarkUsedWith observes a clean post-cleanup tracker state).
+	//
+	// We can't make this test deterministic because the race window is
+	// small, but -count=N catches it probabilistically.
+	for i := 0; i < 50; i++ {
+		bt := &BrowserTool{}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			HandBrowserOff(bt, 50*time.Millisecond)
+		}()
+		go func() {
+			defer wg.Done()
+			ctx := WithBrowserUseLease(context.Background())
+			MarkBrowserUsed(ctx, bt)
+			// Simulate Run completing; release the lease so we don't leak owners[bt].
+			lease := BrowserUseLeaseFrom(ctx)
+			lease.ReleaseAndMaybeTeardown(nil)
+		}()
+		wg.Wait()
+		// Final state: owners[bt] must be 0 regardless of which goroutine
+		// raced first. Any non-zero count means the lease release didn't
+		// see its prior MarkUsedWith — i.e. inconsistency.
+		if got := BrowserOwnerActiveCount(bt); got != 0 {
+			t.Fatalf("iter %d: owners[bt] = %d after race, want 0", i, got)
+		}
+		if !bt.IsDeprecated() {
+			t.Fatalf("iter %d: bt must be deprecated", i)
+		}
 	}
 }
