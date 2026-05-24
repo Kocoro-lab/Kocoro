@@ -2467,9 +2467,30 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		}()
 	}
 
-	// Resume / new-session — mirrors RunAgent's switch at runner.go:659-687
-	// (SessionID > NewSession > warm-resume > agent cold-start > default new).
+	// Resume / new-session — mirrors RunAgent's switch at runner.go:1310-1373
+	// (client-minted ID > pure SessionID resume > NewSession/no-route >
+	// warm-resume > agent cold-start > default new).
 	switch {
+	case req.NewSession && req.SessionID != "":
+		// Client-minted ID path: Desktop generates the UUID before the first
+		// POST so subsequent follow-ups can carry the same id without waiting
+		// for the daemon's `session_started` SSE event. Without this branch
+		// the request falls through to `case req.SessionID != ""` below and
+		// fails with "session not found" because the session file does not
+		// exist yet — the bug that surfaced as `/research quick` and `/swarm`
+		// erroring on the very first message of a fresh chat.
+		//
+		// Idempotency mirrors RunAgent: a follow-up POST may STILL carry
+		// new_session=true when the client's pending-marker hadn't been
+		// cleared by `session_started` yet. Resume first so a second POST
+		// re-binds to the existing session instead of wiping the in-progress
+		// history with a fresh blank Session.
+		if !session.IsValidSessionID(req.SessionID) {
+			return nil, fmt.Errorf("invalid session_id format: %q", req.SessionID)
+		}
+		if _, err := sessMgr.Resume(req.SessionID); err != nil {
+			sessMgr.NewSessionWithID(req.SessionID)
+		}
 	case req.SessionID != "":
 		if _, err := sessMgr.Resume(req.SessionID); err != nil {
 			return nil, fmt.Errorf("session not found: %s", req.SessionID)

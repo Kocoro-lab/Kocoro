@@ -225,6 +225,86 @@ func TestHandleMessage_SlashResearch_RoutesToCloudflow(t *testing.T) {
 	}
 }
 
+// TestHandleMessage_SlashWithClientMintedSessionID_NewSessionTrue verifies the
+// fresh-chat / client-minted-UUID path Desktop uses for the very first POST of
+// a new session. Desktop generates a UUID up front and sends both
+// new_session=true AND session_id=<uuid> so subsequent follow-up POSTs can
+// carry the same id without waiting for the `session_started` SSE event.
+//
+// Regression: before 2026-05-24 the switch in RunSlashWorkflow lacked the
+// `req.NewSession && req.SessionID != ""` case, so this request fell into the
+// `req.SessionID != ""` branch, tried to Resume() a UUID with no on-disk
+// session file, and returned "session not found: <uuid>" — surfacing in
+// Desktop as an error toast on the first message of a fresh chat for /research
+// quick and /swarm (working /schedule and /computer go through RunAgent, which
+// has always had this branch).
+func TestHandleMessage_SlashWithClientMintedSessionID_NewSessionTrue(t *testing.T) {
+	fg, gwSrv := newFakeGateway(t, researchSSEEvents, "ok")
+	srv := newSlashTestServer(t, gwSrv.URL)
+
+	const mintedID = "11111111-2222-3333-4444-555555555555"
+	body := fmt.Sprintf(
+		`{"text":"/research quick what is X","source":"shanclaw","new_session":true,"session_id":%q}`,
+		mintedID,
+	)
+	req, _ := http.NewRequest(http.MethodPost,
+		fmt.Sprintf("http://127.0.0.1:%d/message", srv.Port()),
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	events := readSSE(t, resp)
+	t.Logf("events: %+v", events)
+
+	if fg.submitCalls.Load() == 0 {
+		t.Error("expected gateway submit to be called at least once")
+	}
+
+	var gotSessionStarted, gotDone bool
+	var doneResult RunAgentResult
+	for _, ev := range events {
+		switch ev.event {
+		case "error":
+			t.Fatalf("expected no error event, got: %s", ev.data)
+		case "session_started":
+			gotSessionStarted = true
+			var p struct {
+				SessionID string `json:"session_id"`
+			}
+			if err := json.Unmarshal([]byte(ev.data), &p); err != nil {
+				t.Fatalf("decode session_started event: %v (data=%q)", err, ev.data)
+			}
+			if p.SessionID != mintedID {
+				t.Errorf("session_started carried %q, want client-minted %q", p.SessionID, mintedID)
+			}
+		case "done":
+			gotDone = true
+			if err := json.Unmarshal([]byte(ev.data), &doneResult); err != nil {
+				t.Fatalf("decode done event: %v (data=%q)", err, ev.data)
+			}
+		}
+	}
+	if !gotSessionStarted {
+		t.Error("expected a session_started event (Desktop relies on this to confirm minted-UUID adoption)")
+	}
+	if !gotDone {
+		t.Fatal("expected a done event")
+	}
+	if doneResult.SessionID != mintedID {
+		t.Errorf("expected SessionID %q (the client-minted UUID), got %q", mintedID, doneResult.SessionID)
+	}
+}
+
 // TestHandleMessage_SlashSwarm_RoutesToCloudflow verifies /swarm produces
 // cloud_progress events from TASKLIST_UPDATED.
 func TestHandleMessage_SlashSwarm_RoutesToCloudflow(t *testing.T) {
