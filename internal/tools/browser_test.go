@@ -402,3 +402,27 @@ func TestBrowserTool_IsPinchtab_NoRaceWithCleanup(t *testing.T) {
 	}
 	<-done
 }
+
+func TestSnapshotChromedpCtx_BackendNone(t *testing.T) {
+	bt := &BrowserTool{backend: backendNone}
+	if _, ok := bt.snapshotChromedpCtx(); ok {
+		t.Fatalf("expected ok=false for backendNone")
+	}
+}
+
+func TestSnapshotChromedpCtx_BackendChromedpWithCtx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bt := &BrowserTool{backend: backendChromedp, ctx: ctx}
+	got, ok := bt.snapshotChromedpCtx()
+	if !ok || got != ctx {
+		t.Fatalf("expected ok=true, ctx==ctx; got ok=%v ctx==same=%v", ok, got == ctx)
+	}
+}
+
+func TestSnapshotChromedpCtx_BackendChromedpNilCtx(t *testing.T) {
+	bt := &BrowserTool{backend: backendChromedp, ctx: nil}
+	if _, ok := bt.snapshotChromedpCtx(); ok {
+		t.Fatalf("expected ok=false when ctx==nil even with chromedp backend")
+	}
+}

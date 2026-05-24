@@ -311,6 +311,22 @@ func (t *BrowserTool) isPinchtab() bool {
 	return t.backend == backendPinchtab
 }
 
+// snapshotChromedpCtx returns the chromedp browser context iff the backend is
+// currently chromedp. When ok=false, no chromedp session is active and callers
+// must surface a tool error rather than dereferencing browserCtx.
+//
+// Defense-in-depth: callers can already rely on the per-owner lease pattern,
+// but this helper closes the window between ensureBackend's t.mu release and
+// the action's t.ctx read.
+func (t *BrowserTool) snapshotChromedpCtx() (browserCtx context.Context, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.backend != backendChromedp || t.ctx == nil {
+		return nil, false
+	}
+	return t.ctx, true
+}
+
 // CleanupChromedp tears down only the chromedp backend, leaving pinchtab (a
 // long-lived external process) untouched. Safe to call when chromedp is not
 // active. Returns an error if the tracked Chrome refused to die after SIGTERM
@@ -400,7 +416,11 @@ func (t *BrowserTool) navigate(_ context.Context, args browserArgs, timeout time
 	}
 
 	// chromedp
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 
 	var title, textContent string
@@ -449,7 +469,11 @@ func (t *BrowserTool) click(_ context.Context, args browserArgs, timeout time.Du
 	if args.Selector == "" {
 		return agent.ToolResult{Content: "chromedp fallback requires 'selector' (refs not supported without pinchtab)", IsError: true}, nil
 	}
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 	if err := chromedp.Run(tCtx, chromedp.Click(args.Selector)); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("click error: %v", err), IsError: true}, nil
@@ -477,7 +501,11 @@ func (t *BrowserTool) typeText(_ context.Context, args browserArgs, timeout time
 	if args.Selector == "" {
 		return agent.ToolResult{Content: "chromedp fallback requires 'selector'", IsError: true}, nil
 	}
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 	if err := chromedp.Run(tCtx, chromedp.SendKeys(args.Selector, args.Text)); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("type error: %v", err), IsError: true}, nil
@@ -508,7 +536,11 @@ func (t *BrowserTool) scroll(_ context.Context, args browserArgs, timeout time.D
 	}
 
 	// chromedp
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 
 	if args.Selector != "" {
@@ -560,7 +592,11 @@ func (t *BrowserTool) screenshot(_ context.Context, _ browserArgs, timeout time.
 	}
 
 	// chromedp
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 
 	var buf []byte
@@ -643,7 +679,11 @@ func (t *BrowserTool) readPage(_ context.Context, args browserArgs, timeout time
 	}
 
 	// chromedp
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 
 	selector := "html"
@@ -698,7 +738,11 @@ func (t *BrowserTool) executeJS(_ context.Context, args browserArgs, timeout tim
 	// author can write natural multi-statement JS.
 	script := wrapJSForEvaluate(args.Script)
 
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 
 	var result any
@@ -737,7 +781,11 @@ func (t *BrowserTool) waitVisible(_ context.Context, args browserArgs, timeout t
 	}
 
 	// chromedp
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 	if err := chromedp.Run(tCtx, chromedp.WaitVisible(args.Selector)); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("wait error: %v", err), IsError: true}, nil
