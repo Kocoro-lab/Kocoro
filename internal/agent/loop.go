@@ -3098,32 +3098,294 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			CacheSource:     a.cacheSource,
 		}
 
+		recordMainLLMUsage := func(resp *client.CompletionResponse, updateLastIter bool) client.Usage {
+			if resp == nil {
+				return client.Usage{}
+			}
+			normalized := resp.Usage.Normalized()
+			if updateLastIter {
+				// Capture this iteration's usage independently of the turn-aggregate.
+				// Cache-cold gates on the suggestion fork need to judge "the LAST main
+				// call's warmth", not the average across all iterations. Updated under
+				// the same mutex as lastSentRequest because they always change together
+				// (we just observed a successful LLM response that will drive control flow).
+				a.lastSentMu.Lock()
+				a.lastIterUsage = normalized
+				a.lastSentMu.Unlock()
+			}
+			usage.Add(normalized)
+			cacheTracker.Record(normalized)
+			// Emit incremental usage delta to handler for accumulation/persistence.
+			// Handler sums these into session totals. Model is carried so the last-seen
+			// model wins at the session level (handler decides its own precedence).
+			a.reportLLMUsage(normalized, resp.Model)
+			return normalized
+		}
+
 		const maxLLMRetries = 3
-		for attempt := 0; ; attempt++ {
-			// Enter (or re-enter) the idle-counted phase for this attempt.
-			// The watchdog (Slice 3) measures duration here. Post-call we
-			// transition out based on outcome (tool exec, error, etc.).
-			a.tracker.Enter(PhaseAwaitingLLM)
+		// Inconsistent-finish retry wrapper: a successful HTTP response can
+		// still carry the upstream anomaly where finish_reason="tool_use" but
+		// neither a tool_use block (now detected via ContentBlocks in
+		// HasToolCalls — see gateway.go) nor any visible text landed. Re-
+		// issuing the SAME `req` inline preserves cache identity and lets
+		// Anthropic sampling non-determinism recover the missing block.
+		// Doing this here (rather than via outer-loop `continue`) avoids:
+		//   1. burning an `i` slot of effectiveMaxIter at the cap boundary,
+		//   2. running top-of-loop mutators (compaction, injectCh drain,
+		//      timeBasedCompact, applyShortSessionTruncate) between attempts,
+		//   3. truncatedText concatenation masking the empty signal.
+		// Scope: only stop_reason="tool_use" is widened. max_tokens / length
+		// have their own continuation path; same-prompt resample would just
+		// re-burn thinking tokens for those shapes. Bounded by
+		// maxInconsistentFinishRetries (per-Run). Re-issues run the inner
+		// attempt loop fresh (attempt=0), so streamingText resets naturally.
+		for {
+			for attempt := 0; ; attempt++ {
+				// Enter (or re-enter) the idle-counted phase for this attempt.
+				// The watchdog (Slice 3) measures duration here. Post-call we
+				// transition out based on outcome (tool exec, error, etc.).
+				a.tracker.Enter(PhaseAwaitingLLM)
 
-			// Capture the dispatched request so a post-Run goroutine can fork
-			// suggestion / speculation calls byte-equal to this turn. Same
-			// snapshot covers all three call variants below — req does not
-			// mutate across them.
-			a.captureSentRequest(req)
+				// Capture the dispatched request so a post-Run goroutine can fork
+				// suggestion / speculation calls byte-equal to this turn. Same
+				// snapshot covers all three call variants below — req does not
+				// mutate across them.
+				a.captureSentRequest(req)
 
-			// On retries, skip streaming to avoid duplicate partial deltas.
-			if attempt == 0 && a.enableStreaming && a.handler != nil {
-				streamingText.Reset()
-				resp, err = a.client.CompleteStream(ctx, req, func(delta client.StreamDelta) {
-					a.handler.OnStreamDelta(delta.Text)
-					streamingText.WriteString(delta.Text)
-				})
-				// Silent stream drop: the per-chunk watchdog inside CompleteStream
-				// fired because no chunk arrived for stream_idle_timeout_secs.
-				// Falling back to non-streaming would re-hit the same hung
-				// upstream and burn another 600s on the HTTP transport ceiling,
-				// so treat as a partial-success exit (matches ErrHardIdleTimeout).
-				if errors.Is(err, client.ErrStreamIdleTimeout) {
+				// On retries, skip streaming to avoid duplicate partial deltas.
+				if attempt == 0 && a.enableStreaming && a.handler != nil {
+					streamingText.Reset()
+					resp, err = a.client.CompleteStream(ctx, req, func(delta client.StreamDelta) {
+						a.handler.OnStreamDelta(delta.Text)
+						streamingText.WriteString(delta.Text)
+					})
+					// Silent stream drop: the per-chunk watchdog inside CompleteStream
+					// fired because no chunk arrived for stream_idle_timeout_secs.
+					// Falling back to non-streaming would re-hit the same hung
+					// upstream and burn another 600s on the HTTP transport ceiling,
+					// so treat as a partial-success exit (matches ErrHardIdleTimeout).
+					if errors.Is(err, client.ErrStreamIdleTimeout) {
+						partial := streamingText.String()
+						if partial != "" {
+							messages = append(messages, client.Message{
+								Role:    "assistant",
+								Content: client.NewTextContent(partial),
+							})
+						} else {
+							messages = append(messages, client.Message{
+								Role:    "assistant",
+								Content: client.NewTextContent("[stream idle timeout]"),
+							})
+						}
+						stampMessage()
+						captureRunMessages()
+						if rs, ok := a.handler.(RunStatusHandler); ok {
+							var detail string
+							if gw, ok := a.client.(*client.GatewayClient); ok {
+								detail = fmt.Sprintf("streaming aborted: no chunk for %s", gw.StreamIdleTimeout())
+							} else {
+								detail = "streaming aborted: no chunks received within configured idle timeout"
+							}
+							rs.OnRunStatus("stream_idle_timeout", detail)
+						}
+						setRunStatus(runstatus.CodeDeadlineExceeded, true)
+						return partial, usage, fmt.Errorf("stream aborted: %w", err)
+					}
+					// Fall back to non-streaming if gateway doesn't support it
+					if err != nil {
+						resp, err = a.client.Complete(ctx, req)
+					}
+				} else {
+					resp, err = a.client.Complete(ctx, req)
+				}
+				if err == nil {
+					// Mark "last assistant response received" for the time-based
+					// microcompact gap calculation (timebasedcompact.go).
+					a.lastAssistantAt = time.Now()
+					break
+				}
+				if ctx.Err() != nil {
+					// Preserve any partial streaming text so the next resume sees
+					// what the assistant was saying before cancel interrupted it.
+					partial := streamingText.String()
+					if partial != "" {
+						messages = append(messages, client.Message{
+							Role:    "assistant",
+							Content: client.NewTextContent(partial),
+						})
+						stampMessage()
+					} else {
+						// No streaming text captured. Insert a placeholder so the
+						// session has an assistant turn between user messages.
+						messages = append(messages, client.Message{
+							Role:    "assistant",
+							Content: client.NewTextContent("[cancelled before response]"),
+						})
+						stampMessage()
+					}
+					captureRunMessages()
+					// Distinguish watchdog hard-timeout from user-initiated cancel.
+					// ErrHardIdleTimeout is attached via context.WithCancelCause at
+					// Run() entry. Treat hard-timeout as a soft failure (partial=true)
+					// so consumers can render a non-error "timed out, here's what we
+					// have" hint, matching the loop-detector ForceStop UX.
+					if errors.Is(context.Cause(ctx), ErrHardIdleTimeout) {
+						setRunStatus(runstatus.CodeDeadlineExceeded, true)
+						return partial, usage, fmt.Errorf("turn aborted: %w", ErrHardIdleTimeout)
+					}
+					setRunStatus(runstatus.CodeFromError(ctx.Err()), false)
+					return partial, usage, fmt.Errorf("LLM call cancelled: %w", ctx.Err())
+				}
+				// Reactive compaction: if the error is a context-length overflow,
+				// try the normal compaction profile first so summary quality stays
+				// close to proactive compaction. Escalate to the emergency profile
+				// only if the shaped history is still estimated to be over budget.
+				if isContextLengthError(err) && !reactiveCompacted {
+					fmt.Fprintf(os.Stderr, "[agent] context length exceeded, attempting reactive compaction\n")
+					// Outer phase for the whole compaction block. Nested LLM
+					// calls below use EnterTransient(PhaseAwaitingLLM) so they
+					// remain idle-watched; everything else (ShapeHistory, local
+					// I/O) is intentionally not idle-counted.
+					a.tracker.Enter(PhaseCompacting)
+
+					// Write-before-compact: persist durable learnings before discarding history.
+					if a.memoryDir != "" {
+						restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
+						pUsage, pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir)
+						restoreLLM()
+						a.emitInternalUsage(pUsage)
+						if pErr != nil {
+							a.recordCompactionFailure("reactive_persist_learnings", pErr)
+						}
+					}
+
+					before := len(messages)
+					nextSummary := strings.TrimSpace(compactionSummary)
+
+					softMessages := cloneMessages(messages)
+					compressOldToolResults(a.ctxWithUsageEmit(ctx), softMessages, compressAfter, maxResultChars, a.client)
+					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
+					summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(softMessages), nextSummary))
+					restoreLLM()
+					a.emitInternalUsage(sumUsage)
+					if sumErr != nil {
+						phaseTag := "reactive_summary_no_prior"
+						if nextSummary != "" {
+							phaseTag = "reactive_summary_with_prior"
+						}
+						a.recordCompactionFailure(phaseTag, sumErr)
+					} else if trimmed := strings.TrimSpace(summary); trimmed != "" {
+						nextSummary = trimmed
+					}
+
+					shaped := ctxwin.ShapeHistory(softMessages, nextSummary, a.contextWindow)
+					if a.contextWindow > 0 && ctxwin.EstimateTokens(shaped) >= a.contextWindow {
+						fmt.Fprintf(os.Stderr, "[context] reactive soft path still over budget, using emergency fallback\n")
+						emergencyMessages := cloneMessages(messages)
+						compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+
+						restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
+						summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(emergencyMessages), nextSummary))
+						restoreLLM()
+						a.emitInternalUsage(sumUsage)
+						if sumErr != nil {
+							phaseTag := "emergency_summary_no_prior"
+							if nextSummary != "" {
+								phaseTag = "emergency_summary_with_prior"
+							}
+							a.recordCompactionFailure(phaseTag, sumErr)
+						} else if trimmed := strings.TrimSpace(summary); trimmed != "" {
+							nextSummary = trimmed
+						}
+
+						shaped = ctxwin.ShapeHistory(emergencyMessages, nextSummary, a.contextWindow)
+					}
+
+					messages = shaped
+					compactionSummary = nextSummary
+					compactionApplied = true
+					reactiveCompacted = true // never reset — prevents infinite reactive loops
+					// Durable: the summary was expensive; checkpoint before we
+					// retry the LLM call so a crash in the retry does not force
+					// redoing the summary on next run.
+					a.tracker.MarkDirty()
+
+					// Rebase run-local indices — same bookkeeping as proactive compaction.
+					if len(messages) < before {
+						dropped := before - len(messages)
+						a.recordCompactionSuccess("reactive", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
+						newMsgOffset -= dropped
+						if newMsgOffset < 1 {
+							newMsgOffset = 1
+						}
+						rebased := make(map[int]bool, len(injectedIndices))
+						for idx := range injectedIndices {
+							newIdx := idx - dropped
+							if newIdx >= newMsgOffset {
+								rebased[newIdx] = true
+							}
+						}
+						injectedIndices = rebased
+
+						rebasedDelta := make(map[int]bool, len(deltaIndices))
+						for idx := range deltaIndices {
+							newIdx := idx - dropped
+							if newIdx >= newMsgOffset {
+								rebasedDelta[newIdx] = true
+							}
+						}
+						deltaIndices = rebasedDelta
+
+						rebasedTS := make(map[int]time.Time, len(msgTimestamps))
+						for idx, ts := range msgTimestamps {
+							newIdx := idx - dropped
+							if newIdx >= newMsgOffset {
+								rebasedTS[newIdx] = ts
+							}
+						}
+						msgTimestamps = rebasedTS
+					}
+
+					reanchorActiveTask(MetaBoundaryPostCompaction)
+
+					// Rebuild request with compacted messages.
+					req = client.CompletionRequest{
+						Messages:        a.messagesForLLM(messages),
+						ModelTier:       a.modelTier,
+						SpecificModel:   a.specificModel,
+						Temperature:     a.temperature,
+						MaxTokens:       a.effectiveMaxTokens(),
+						Tools:           toolSchemas,
+						Thinking:        a.thinking,
+						ReasoningEffort: a.reasoningEffort,
+						SessionID:       a.sessionID,
+						CacheSource:     a.cacheSource,
+					}
+					// Checkpoint the compacted state before retrying. Gated on
+					// the dirty flag we just set — a no-op compaction path
+					// (same message count, no MarkDirty) would not write.
+					captureRunMessages()
+					a.maybeCheckpoint(ctx)
+					continue // retry with compacted request
+				}
+				if !isRetryableLLMError(err) || attempt >= maxLLMRetries-1 {
+					captureRunMessages()
+					setRunStatus(runstatus.CodeFromError(err), false)
+					return "", usage, fmt.Errorf("LLM call failed: %w", err)
+				}
+				backoff := time.Duration(1<<attempt) * time.Second // 1s, 2s, 4s
+				reason := classifyLLMError(err)
+				retryCount++
+				reanchorActiveTask(MetaBoundaryRetryAfterError)
+				req.Messages = messages
+				fmt.Fprintf(os.Stderr, "[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxLLMRetries, backoff, err)
+				if a.handler != nil {
+					a.handler.OnCloudAgent("", "retry", fmt.Sprintf("Retrying request (attempt %d/%d): %s", attempt+1, maxLLMRetries, reason))
+				}
+				a.tracker.Enter(PhaseRetryingLLM)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
 					partial := streamingText.String()
 					if partial != "" {
 						messages = append(messages, client.Message{
@@ -3133,252 +3395,64 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					} else {
 						messages = append(messages, client.Message{
 							Role:    "assistant",
-							Content: client.NewTextContent("[stream idle timeout]"),
+							Content: client.NewTextContent("[cancelled before response]"),
 						})
 					}
 					stampMessage()
 					captureRunMessages()
-					if rs, ok := a.handler.(RunStatusHandler); ok {
-						var detail string
-						if gw, ok := a.client.(*client.GatewayClient); ok {
-							detail = fmt.Sprintf("streaming aborted: no chunk for %s", gw.StreamIdleTimeout())
-						} else {
-							detail = "streaming aborted: no chunks received within configured idle timeout"
-						}
-						rs.OnRunStatus("stream_idle_timeout", detail)
-					}
-					setRunStatus(runstatus.CodeDeadlineExceeded, true)
-					return partial, usage, fmt.Errorf("stream aborted: %w", err)
+					setRunStatus(runstatus.CodeFromError(ctx.Err()), false)
+					return partial, usage, fmt.Errorf("LLM call cancelled: %w", ctx.Err())
 				}
-				// Fall back to non-streaming if gateway doesn't support it
-				if err != nil {
-					resp, err = a.client.Complete(ctx, req)
-				}
-			} else {
-				resp, err = a.client.Complete(ctx, req)
 			}
-			if err == nil {
-				// Mark "last assistant response received" for the time-based
-				// microcompact gap calculation (timebasedcompact.go).
-				a.lastAssistantAt = time.Now()
-				break
-			}
-			if ctx.Err() != nil {
-				// Preserve any partial streaming text so the next resume sees
-				// what the assistant was saying before cancel interrupted it.
-				partial := streamingText.String()
-				if partial != "" {
-					messages = append(messages, client.Message{
-						Role:    "assistant",
-						Content: client.NewTextContent(partial),
-					})
-					stampMessage()
-				} else {
-					// No streaming text captured. Insert a placeholder so the
-					// session has an assistant turn between user messages.
-					messages = append(messages, client.Message{
-						Role:    "assistant",
-						Content: client.NewTextContent("[cancelled before response]"),
-					})
-					stampMessage()
-				}
-				captureRunMessages()
-				// Distinguish watchdog hard-timeout from user-initiated cancel.
-				// ErrHardIdleTimeout is attached via context.WithCancelCause at
-				// Run() entry. Treat hard-timeout as a soft failure (partial=true)
-				// so consumers can render a non-error "timed out, here's what we
-				// have" hint, matching the loop-detector ForceStop UX.
-				if errors.Is(context.Cause(ctx), ErrHardIdleTimeout) {
-					setRunStatus(runstatus.CodeDeadlineExceeded, true)
-					return partial, usage, fmt.Errorf("turn aborted: %w", ErrHardIdleTimeout)
-				}
-				setRunStatus(runstatus.CodeFromError(ctx.Err()), false)
-				return partial, usage, fmt.Errorf("LLM call cancelled: %w", ctx.Err())
-			}
-			// Reactive compaction: if the error is a context-length overflow,
-			// try the normal compaction profile first so summary quality stays
-			// close to proactive compaction. Escalate to the emergency profile
-			// only if the shaped history is still estimated to be over budget.
-			if isContextLengthError(err) && !reactiveCompacted {
-				fmt.Fprintf(os.Stderr, "[agent] context length exceeded, attempting reactive compaction\n")
-				// Outer phase for the whole compaction block. Nested LLM
-				// calls below use EnterTransient(PhaseAwaitingLLM) so they
-				// remain idle-watched; everything else (ShapeHistory, local
-				// I/O) is intentionally not idle-counted.
-				a.tracker.Enter(PhaseCompacting)
 
-				// Write-before-compact: persist durable learnings before discarding history.
-				if a.memoryDir != "" {
-					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-					pUsage, pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir)
-					restoreLLM()
-					a.emitInternalUsage(pUsage)
-					if pErr != nil {
-						a.recordCompactionFailure("reactive_persist_learnings", pErr)
-					}
-				}
-
-				before := len(messages)
-				nextSummary := strings.TrimSpace(compactionSummary)
-
-				softMessages := cloneMessages(messages)
-				compressOldToolResults(a.ctxWithUsageEmit(ctx), softMessages, compressAfter, maxResultChars, a.client)
-				restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-				summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(softMessages), nextSummary))
-				restoreLLM()
-				a.emitInternalUsage(sumUsage)
-				if sumErr != nil {
-					phaseTag := "reactive_summary_no_prior"
-					if nextSummary != "" {
-						phaseTag = "reactive_summary_with_prior"
-					}
-					a.recordCompactionFailure(phaseTag, sumErr)
-				} else if trimmed := strings.TrimSpace(summary); trimmed != "" {
-					nextSummary = trimmed
-				}
-
-				shaped := ctxwin.ShapeHistory(softMessages, nextSummary, a.contextWindow)
-				if a.contextWindow > 0 && ctxwin.EstimateTokens(shaped) >= a.contextWindow {
-					fmt.Fprintf(os.Stderr, "[context] reactive soft path still over budget, using emergency fallback\n")
-					emergencyMessages := cloneMessages(messages)
-					compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
-
-					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-					summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(emergencyMessages), nextSummary))
-					restoreLLM()
-					a.emitInternalUsage(sumUsage)
-					if sumErr != nil {
-						phaseTag := "emergency_summary_no_prior"
-						if nextSummary != "" {
-							phaseTag = "emergency_summary_with_prior"
-						}
-						a.recordCompactionFailure(phaseTag, sumErr)
-					} else if trimmed := strings.TrimSpace(summary); trimmed != "" {
-						nextSummary = trimmed
-					}
-
-					shaped = ctxwin.ShapeHistory(emergencyMessages, nextSummary, a.contextWindow)
-				}
-
-				messages = shaped
-				compactionSummary = nextSummary
-				compactionApplied = true
-				reactiveCompacted = true // never reset — prevents infinite reactive loops
-				// Durable: the summary was expensive; checkpoint before we
-				// retry the LLM call so a crash in the retry does not force
-				// redoing the summary on next run.
-				a.tracker.MarkDirty()
-
-				// Rebase run-local indices — same bookkeeping as proactive compaction.
-				if len(messages) < before {
-					dropped := before - len(messages)
-					a.recordCompactionSuccess("reactive", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
-					newMsgOffset -= dropped
-					if newMsgOffset < 1 {
-						newMsgOffset = 1
-					}
-					rebased := make(map[int]bool, len(injectedIndices))
-					for idx := range injectedIndices {
-						newIdx := idx - dropped
-						if newIdx >= newMsgOffset {
-							rebased[newIdx] = true
-						}
-					}
-					injectedIndices = rebased
-
-					rebasedDelta := make(map[int]bool, len(deltaIndices))
-					for idx := range deltaIndices {
-						newIdx := idx - dropped
-						if newIdx >= newMsgOffset {
-							rebasedDelta[newIdx] = true
-						}
-					}
-					deltaIndices = rebasedDelta
-
-					rebasedTS := make(map[int]time.Time, len(msgTimestamps))
-					for idx, ts := range msgTimestamps {
-						newIdx := idx - dropped
-						if newIdx >= newMsgOffset {
-							rebasedTS[newIdx] = ts
-						}
-					}
-					msgTimestamps = rebasedTS
-				}
-
-				reanchorActiveTask(MetaBoundaryPostCompaction)
-
-				// Rebuild request with compacted messages.
-				req = client.CompletionRequest{
-					Messages:        a.messagesForLLM(messages),
-					ModelTier:       a.modelTier,
-					SpecificModel:   a.specificModel,
-					Temperature:     a.temperature,
-					MaxTokens:       a.effectiveMaxTokens(),
-					Tools:           toolSchemas,
-					Thinking:        a.thinking,
-					ReasoningEffort: a.reasoningEffort,
-					SessionID:       a.sessionID,
-					CacheSource:     a.cacheSource,
-				}
-				// Checkpoint the compacted state before retrying. Gated on
-				// the dirty flag we just set — a no-op compaction path
-				// (same message count, no MarkDirty) would not write.
-				captureRunMessages()
-				a.maybeCheckpoint(ctx)
-				continue // retry with compacted request
-			}
-			if !isRetryableLLMError(err) || attempt >= maxLLMRetries-1 {
-				captureRunMessages()
-				setRunStatus(runstatus.CodeFromError(err), false)
-				return "", usage, fmt.Errorf("LLM call failed: %w", err)
-			}
-			backoff := time.Duration(1<<attempt) * time.Second // 1s, 2s, 4s
-			reason := classifyLLMError(err)
-			retryCount++
-			reanchorActiveTask(MetaBoundaryRetryAfterError)
-			req.Messages = messages
-			fmt.Fprintf(os.Stderr, "[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxLLMRetries, backoff, err)
-			if a.handler != nil {
-				a.handler.OnCloudAgent("", "retry", fmt.Sprintf("Retrying request (attempt %d/%d): %s", attempt+1, maxLLMRetries, reason))
-			}
-			a.tracker.Enter(PhaseRetryingLLM)
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				partial := streamingText.String()
-				if partial != "" {
-					messages = append(messages, client.Message{
-						Role:    "assistant",
-						Content: client.NewTextContent(partial),
-					})
-				} else {
-					messages = append(messages, client.Message{
-						Role:    "assistant",
-						Content: client.NewTextContent("[cancelled before response]"),
+			// Inconsistent-finish detection. Check the raw response BEFORE
+			// any fullText/truncatedText assembly: a prior max_tokens
+			// continuation could leave truncatedText non-empty, which would
+			// otherwise mask the empty signal from the current iteration.
+			//
+			// Predicate: no tool calls (now ContentBlocks-aware), finish
+			// reason claims tool_use, no visible text in OutputText or any
+			// content block, and the per-Run retry budget has room.
+			if !resp.HasToolCalls() &&
+				resp.FinishReason == "tool_use" &&
+				strings.TrimSpace(resp.OutputText) == "" &&
+				strings.TrimSpace(recoverVisibleTextFromBlocks(resp)) == "" &&
+				inconsistentFinishRetries < maxInconsistentFinishRetries {
+				recordMainLLMUsage(resp, false)
+				inconsistentFinishRetries++
+				// Distinct audit event so post-incident triage can attribute
+				// recoveries to this path vs the legitimate end_turn empty case.
+				if a.auditor != nil {
+					a.auditor.Log(audit.AuditEntry{
+						Timestamp: time.Now(),
+						SessionID: a.sessionID,
+						Event:     "empty_with_inconsistent_finish",
+						InputSummary: fmt.Sprintf("iter=%d model=%s finish_reason=%s retry=%d/%d",
+							i, resp.Model, resp.FinishReason,
+							inconsistentFinishRetries, maxInconsistentFinishRetries),
+						OutputSummary: fmt.Sprintf("input_tokens=%d output_tokens=%d blocks=%s",
+							resp.Usage.InputTokens, resp.Usage.OutputTokens,
+							describeContentBlocks(resp.ContentBlocks)),
 					})
 				}
-				stampMessage()
-				captureRunMessages()
-				setRunStatus(runstatus.CodeFromError(ctx.Err()), false)
-				return partial, usage, fmt.Errorf("LLM call cancelled: %w", ctx.Err())
+				if rs, ok := a.handler.(RunStatusHandler); ok {
+					// English fallback per the daemon i18n convention used by
+					// every other OnRunStatus call in this file (idle_soft,
+					// stream_idle_timeout, preflight_compaction, etc.).
+					// Clients localize off the stable code.
+					rs.OnRunStatus("upstream_inconsistent_finish",
+						"upstream returned an incomplete response; retrying")
+				}
+				// Do NOT append the malformed assistant message — persisting
+				// it would poison the next request's cache_control rolling
+				// marker (same class as the docs/empty-assistant-content-400
+				// bug fixed for end_turn). The retry re-issues the SAME `req`.
+				continue
 			}
+			break
 		}
 
-		normalizedUsage := resp.Usage.Normalized()
-		// Capture this iteration's usage independently of the turn-aggregate.
-		// Cache-cold gates on the suggestion fork need to judge "the LAST main
-		// call's warmth", not the average across all iterations. Updated under
-		// the same mutex as lastSentRequest because they always change together
-		// (we just observed a successful LLM response).
-		a.lastSentMu.Lock()
-		a.lastIterUsage = normalizedUsage
-		a.lastSentMu.Unlock()
-		usage.Add(normalizedUsage)
-		cacheTracker.Record(normalizedUsage)
-		// Emit incremental usage delta to handler for accumulation/persistence.
-		// Handler sums these into session totals. Model is carried so the last-seen
-		// model wins at the session level (handler decides its own precedence).
-		a.reportLLMUsage(normalizedUsage, resp.Model)
+		normalizedUsage := recordMainLLMUsage(resp, true)
 		// Log cache metrics for debugging prompt cache effectiveness
 		if normalizedUsage.CacheReadTokens > 0 || normalizedUsage.CacheCreationTokens > 0 {
 			// Cache hit ratio: cache_read / total_prompt_tokens.
@@ -3542,55 +3616,6 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// in shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py.
 			if strings.TrimSpace(fullText) == "" {
 				fullText = recoverVisibleTextFromBlocks(resp)
-			}
-			// Inconsistent-finish retry: finish_reason claims the model emitted a
-			// tool_use, but neither a tool_use block nor any visible text landed in
-			// the response. Cloud's retry guard is supposed to catch this shape but
-			// historically only covered end_turn (see anthropic_provider.py); this
-			// branch is the daemon-side defense.
-			//
-			// Bounded by maxInconsistentFinishRetries. Re-uses the existing main-loop
-			// continue path so the next iteration re-issues the same request with the
-			// same context; Anthropic sampling non-determinism makes resampling likely
-			// to recover the missing block.
-			//
-			// Scope: only stop_reason="tool_use" is widened here. max_tokens /
-			// length have their own continuation path elsewhere in this loop and the
-			// same-prompt resample strategy would just re-burn thinking tokens.
-			//
-			// We're already inside `if !resp.HasToolCalls()`, so the "no tool calls"
-			// predicate is implicit — no need to re-check via toolCalls (which
-			// is not in scope here).
-			if strings.TrimSpace(fullText) == "" &&
-				resp.FinishReason == "tool_use" &&
-				inconsistentFinishRetries < maxInconsistentFinishRetries {
-				inconsistentFinishRetries++
-				// Audit row — distinct event so post-incident triage can attribute
-				// recoveries (and exhausted-retry exhaustions) to this path vs the
-				// legitimate end_turn empty case.
-				if a.auditor != nil {
-					a.auditor.Log(audit.AuditEntry{
-						Timestamp: time.Now(),
-						SessionID: a.sessionID,
-						Event:     "empty_with_inconsistent_finish",
-						InputSummary: fmt.Sprintf("iter=%d model=%s finish_reason=%s retry=%d/%d",
-							i, resp.Model, resp.FinishReason,
-							inconsistentFinishRetries, maxInconsistentFinishRetries),
-						OutputSummary: fmt.Sprintf("input_tokens=%d output_tokens=%d blocks=%s",
-							resp.Usage.InputTokens, resp.Usage.OutputTokens,
-							describeContentBlocks(resp.ContentBlocks)),
-					})
-				}
-				if rs, ok := a.handler.(RunStatusHandler); ok {
-					rs.OnRunStatus("upstream_inconsistent_finish",
-						"上游响应不完整，正在重试…")
-				}
-				// Do NOT append the assistant message — the response is malformed
-				// (claims tool_use without a tool_use block). Persisting it would
-				// poison the next request's cache_control rolling marker (same class
-				// of bug docs/empty-assistant-content-400.md fixed for end_turn).
-				// Just re-issue with the same `messages`.
-				continue
 			}
 			if strings.TrimSpace(fullText) == "" {
 				captureRunMessages()

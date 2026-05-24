@@ -361,6 +361,26 @@ func (h *mockHandler) OnApprovalNeeded(tool string, args string) bool {
 	return h.approveResult
 }
 
+type usageRecordingHandler struct {
+	mockHandler
+	mu     sync.Mutex
+	deltas []TurnUsage
+}
+
+func (h *usageRecordingHandler) OnUsage(usage TurnUsage) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.deltas = append(h.deltas, usage)
+}
+
+func (h *usageRecordingHandler) UsageDeltas() []TurnUsage {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]TurnUsage, len(h.deltas))
+	copy(out, h.deltas)
+	return out
+}
+
 func TestAgentLoop_SafeCheckerSkipsApproval(t *testing.T) {
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -5600,8 +5620,10 @@ func TestAgentLoop_InconsistentFinish_ToolUseWithoutBlock_RetriesAndRecovers(t *
 	gw := client.NewGatewayClient(server.URL, "")
 	reg := NewToolRegistry()
 	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+	handler := &usageRecordingHandler{}
+	loop.SetHandler(handler)
 
-	out, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	out, turnUsage, err := loop.Run(context.Background(), "do work", nil, nil)
 	if err != nil {
 		t.Fatalf("expected nil error on recovery, got %v", err)
 	}
@@ -5613,6 +5635,23 @@ func TestAgentLoop_InconsistentFinish_ToolUseWithoutBlock_RetriesAndRecovers(t *
 	}
 	if code := loop.LastRunStatus().FailureCode; code != "" {
 		t.Errorf("recovered run must clear FailureCode, got %q", code)
+	}
+	if turnUsage.LLMCalls != 2 {
+		t.Errorf("turn usage should count malformed response + recovery, LLMCalls=%d", turnUsage.LLMCalls)
+	}
+	if turnUsage.InputTokens != 246 || turnUsage.OutputTokens != 10238 {
+		t.Errorf("turn usage should include both LLM responses, got input=%d output=%d",
+			turnUsage.InputTokens, turnUsage.OutputTokens)
+	}
+	deltas := handler.UsageDeltas()
+	if len(deltas) != 2 {
+		t.Fatalf("handler should receive usage for malformed response + recovery, got %d deltas: %+v", len(deltas), deltas)
+	}
+	if deltas[0].InputTokens != 146 || deltas[0].OutputTokens != 10233 || deltas[0].LLMCalls != 1 {
+		t.Errorf("first usage delta should be malformed response usage, got %+v", deltas[0])
+	}
+	if deltas[1].InputTokens != 100 || deltas[1].OutputTokens != 5 || deltas[1].LLMCalls != 1 {
+		t.Errorf("second usage delta should be recovery response usage, got %+v", deltas[1])
 	}
 
 	// Audit row attribution: post-incident triage needs to distinguish
@@ -5640,6 +5679,181 @@ func TestAgentLoop_InconsistentFinish_ToolUseWithoutBlock_RetriesAndRecovers(t *
 	}
 	if !strings.Contains(outSum, "blocks=[thinking") {
 		t.Errorf("audit row should record blocks=[thinking..., got %q", outSum)
+	}
+
+	// Load-bearing cache_control safety claim: the malformed assistant
+	// message must NOT be appended to messages. If it were, the next
+	// request would ship `assistant content:""` with a cache_control
+	// marker → Anthropic 400 "cache_control cannot be set for empty
+	// text blocks". docs/empty-assistant-content-400.md exists exactly
+	// to prevent this regression. If a future refactor adds a stray
+	// `messages = append(...)` to the inconsistent-finish branch, this
+	// assertion is the only thing that will catch it.
+	for idx, msg := range loop.RunMessages() {
+		if msg.Role != "assistant" {
+			continue
+		}
+		txt := strings.TrimSpace(msg.Content.Text())
+		if txt == "" {
+			t.Errorf("run message %d is an empty-text assistant — malformed retry response leaked into messages: %+v",
+				idx, msg)
+		}
+	}
+}
+
+// Regression for blocker #1 (truncatedText masking the retry). If a prior
+// iteration was max_tokens truncated AND the next iteration returns the
+// inconsistent shape (empty OutputText + finish_reason=tool_use), the
+// retry MUST still fire — the predicate inspects the raw response, not
+// the post-concat fullText. Before the fix, fullText was non-empty (it
+// carried the prior truncated text) and silently shipped as the final
+// answer with no retry and no audit row.
+func TestAgentLoop_InconsistentFinish_TruncatedTextDoesNotMaskRetry(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			// max_tokens truncation: text-only with non-empty OutputText.
+			// AgentLoop accumulates this in truncatedText and continues.
+			// Use a small max_tokens (200) so OutputTokens >= effMax fires
+			// the max_tokens-truncation detector at loop.go:3429.
+			json.NewEncoder(w).Encode(nativeResponse("partial-truncated", "max_tokens", nil, 100, 200))
+		case 2:
+			// Continuation iteration returns the inconsistent shape:
+			// finish_reason=tool_use, no tool_use block, no visible text.
+			// truncatedText already contains "partial-truncated"; the retry
+			// must still fire by checking resp.OutputText/recoverVisibleText
+			// rather than the assembled fullText.
+			resp := nativeResponse("", "tool_use", nil, 50, 5000)
+			resp.ContentBlocks = []client.ContentBlock{
+				{Type: "thinking", Thinking: "long internal reasoning", Signature: "sig"},
+			}
+			json.NewEncoder(w).Encode(resp)
+		default:
+			// Recovery on retry: real text answer.
+			json.NewEncoder(w).Encode(nativeResponse("recovered-after-truncation", "end_turn", nil, 80, 5))
+		}
+	}))
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	// MaxTokens=200 so OutputTokens=200 on call 1 trips the truncation detector.
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 200, 200, nil, auditor, nil)
+
+	out, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if err != nil {
+		t.Fatalf("expected nil error on recovery, got %v", err)
+	}
+	// Expected wire: call 1 (truncated) + call 2 (inconsistent) + call 3 (recovered).
+	if callCount != 3 {
+		t.Fatalf("expected 3 calls (truncated → inconsistent → recovered), got %d", callCount)
+	}
+	// Final answer must be the concatenation of truncated + recovered,
+	// NOT just the stale truncated text.
+	if !strings.Contains(out, "recovered-after-truncation") {
+		t.Errorf("final answer missing recovered text — retry was masked by truncatedText: %q", out)
+	}
+	// And the inconsistent-finish branch must have logged its audit row.
+	matches := 0
+	for _, e := range readAuditLines(t, logDir) {
+		if e["event"] == "empty_with_inconsistent_finish" {
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Errorf("expected 1 empty_with_inconsistent_finish row from the inconsistent iteration, got %d", matches)
+	}
+}
+
+// Regression for blocker #4 (HasToolCalls ignoring ContentBlocks). A response
+// whose tool_use lives ONLY in ContentBlocks (legacy ToolCalls/FunctionCall
+// empty) must be dispatched normally — not treated as the inconsistent
+// shape and retried. Forward-compatibility with a Cloud build that ships
+// tool_use only via content_blocks.
+func TestAgentLoop_InconsistentFinish_ContentBlockToolUseDispatchesNormally(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// Legitimate tool_use shape, but the tool_use lives ONLY in
+			// ContentBlocks — ToolCalls/FunctionCall are empty. Production
+			// gateway today populates both; this test pins forward-compat.
+			resp := nativeResponse("", "tool_use", nil, 100, 50)
+			resp.ContentBlocks = []client.ContentBlock{
+				{
+					Type:  "tool_use",
+					ID:    "toolu_test_1",
+					Name:  "mock_tool",
+					Input: json.RawMessage(`{"path":"/tmp/x","content":"y"}`),
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 50, 5))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	mt := &mockTool{name: "mock_tool", required: []string{"path", "content"}}
+	reg.Register(mt)
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	out, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "done" {
+		t.Errorf("expected done, got %q", out)
+	}
+	// 1 = LLM tool_use (content-block-only), 2 = LLM final. No retry.
+	if callCount != 2 {
+		t.Errorf("expected 2 calls (tool_use via ContentBlocks + final), got %d", callCount)
+	}
+}
+
+// Negative-predicate test: !HasToolCalls() + empty text + finish_reason
+// OTHER than "tool_use" (end_turn here) must NOT trigger the new retry.
+// The PR's scope comment is explicit: only tool_use is widened; end_turn
+// thinking-only goes straight to ErrEmptyFinalResponse. Without this test
+// a future refactor that widens the predicate would not be caught.
+func TestAgentLoop_InconsistentFinish_EndTurnEmptyDoesNotRetry(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		// finish_reason=end_turn (NOT tool_use), no visible text, thinking-only.
+		// Sibling test TestAgentLoop_ThinkingOnlyFinalResponse_ReturnsError
+		// covers the ErrEmptyFinalResponse contract; this test pins that the
+		// new retry budget is NOT consumed for non-tool_use finish reasons.
+		resp := nativeResponse("", "end_turn", nil, 100, 5000)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "thinking", Thinking: "long internal reasoning", Signature: "sig"},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	_, _, err := loop.Run(context.Background(), "do work", nil, nil)
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Errorf("expected ErrEmptyFinalResponse (no retry for end_turn), got %v", err)
+	}
+	// Exactly 1 call — no retry. A regression that widens the predicate
+	// would produce 2 calls.
+	if callCount != 1 {
+		t.Errorf("expected exactly 1 call (no retry for end_turn), got %d", callCount)
 	}
 }
 
