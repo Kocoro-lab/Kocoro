@@ -352,3 +352,26 @@ func TestRegisterLocalTools_ForceThinkToolOverride(t *testing.T) {
 		t.Errorf("ForceThinkTool=true must re-register think; got names %v", reg.Names())
 	}
 }
+
+func TestRegisterLocalTools_CleanupSkipsDeprecatedBrowser(t *testing.T) {
+	// Indirect assertion: the cleanup closure returned by RegisterLocalTools
+	// closes over the *BrowserTool it registered. Marking that browser
+	// deprecated must make cleanup a no-op on the browser side.
+	reg, _, cleanup := RegisterLocalTools(nil, nil)
+	bt, ok := reg.Get("browser")
+	if !ok {
+		t.Fatalf("browser tool not registered")
+	}
+	browser, ok := bt.(*BrowserTool)
+	if !ok {
+		t.Fatalf("registered browser is not *BrowserTool")
+	}
+	browser.MarkDeprecated()
+	cleanup()
+	if got := browser.CleanupCalledForTest(); got != 0 {
+		t.Fatalf("deprecated browser must not be cleaned up by registration cleanup; got Cleanup calls=%d", got)
+	}
+	if !browser.IsDeprecated() {
+		t.Fatalf("deprecated flag must persist after cleanup")
+	}
+}

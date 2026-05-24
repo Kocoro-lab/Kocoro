@@ -120,7 +120,9 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	}
 
 	cleanup := func() {
-		browser.Cleanup()
+		if !browser.IsDeprecated() {
+			browser.Cleanup()
+		}
 		axClient.Close()
 	}
 	return reg, skillsPtr, cleanup
