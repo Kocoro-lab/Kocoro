@@ -114,6 +114,9 @@ var daemonStartCmd = &cobra.Command{
 		if cfg.Agent.StreamIdleTimeoutSecs > 0 {
 			gw.SetStreamIdleTimeout(time.Duration(cfg.Agent.StreamIdleTimeoutSecs) * time.Second)
 		}
+		// Orphan sweep is startup-only — reload paths must not sweep because they
+		// would kill live Chrome owned by in-flight runs.
+		tools.CleanupOrphanedChromedp()
 		baselineReg, reg, skillsPtr, mcpMgr, cleanup, serverErr := tools.RegisterAllWithBaseline(gw, cfg)
 		if serverErr != nil {
 			log.Printf("Warning: %v", serverErr)

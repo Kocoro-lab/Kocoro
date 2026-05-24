@@ -375,3 +375,15 @@ func TestRegisterLocalTools_CleanupSkipsDeprecatedBrowser(t *testing.T) {
 		t.Fatalf("deprecated flag must persist after cleanup")
 	}
 }
+
+func TestRegisterAllWithBaseline_DoesNotSweepOrphans(t *testing.T) {
+	// The presence of CleanupOrphanedChromedp() inside RegisterAllWithBaseline
+	// makes reload kill live Chrome. We verify the call is gone by using a
+	// test-only counter: assert it == 0 after RegisterAllWithBaseline.
+	cleanupOrphanedChromedpCalledForTest = 0
+	cfg := &config.Config{}
+	_, _, _, _, _, _ = RegisterAllWithBaseline(nil, cfg)
+	if cleanupOrphanedChromedpCalledForTest != 0 {
+		t.Fatalf("RegisterAllWithBaseline must not invoke CleanupOrphanedChromedp; got %d calls", cleanupOrphanedChromedpCalledForTest)
+	}
+}
