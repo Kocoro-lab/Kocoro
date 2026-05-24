@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -74,4 +75,44 @@ func TestHandBrowserOff_NilBrowser_NoOp(t *testing.T) {
 	// Helper must tolerate nil OLD (when reg.Get fails to find a browser).
 	HandBrowserOff(nil, 50*time.Millisecond)
 	// No panic = pass.
+}
+
+func TestReloadBrowserHandoff_MixedOldNewConcurrent(t *testing.T) {
+	// Pre-reload: lease A on OLD. Post-reload: lease B on NEW.
+	// OLD and NEW each cleaned up when their own lease releases.
+	// Locks in the v3 three-way-gate bug as a regression test.
+	oldBT := &BrowserTool{}
+	newBT := &BrowserTool{}
+
+	ctxOld := WithBrowserUseLease(context.Background())
+	MarkBrowserUsed(ctxOld, oldBT)
+
+	// Simulate reload: mark OLD deprecated; NEW takes its place.
+	oldBT.MarkDeprecated()
+
+	ctxNew := WithBrowserUseLease(context.Background())
+	MarkBrowserUsed(ctxNew, newBT)
+
+	if BrowserOwnerActiveCount(oldBT) != 1 {
+		t.Fatalf("owners[oldBT] = %d, want 1", BrowserOwnerActiveCount(oldBT))
+	}
+	if BrowserOwnerActiveCount(newBT) != 1 {
+		t.Fatalf("owners[newBT] = %d, want 1", BrowserOwnerActiveCount(newBT))
+	}
+
+	// Release NEW first: per-owner gate fires NEW's teardown even though
+	// OLD's lease is still active (the v3 bug would have left NEW leaked).
+	var newCleanupFired, oldCleanupFired int
+	leaseNew := BrowserUseLeaseFrom(ctxNew)
+	leaseNew.ReleaseAndMaybeTeardown(func() error { newCleanupFired++; return nil })
+	if newCleanupFired != 1 {
+		t.Fatalf("NEW teardown must fire on release with per-owner gate; fired=%d", newCleanupFired)
+	}
+
+	// Release OLD: deprecated path, per-owner gate fires.
+	leaseOld := BrowserUseLeaseFrom(ctxOld)
+	leaseOld.ReleaseAndMaybeTeardown(func() error { oldCleanupFired++; return nil })
+	if oldCleanupFired != 1 {
+		t.Fatalf("OLD teardown must fire on release; fired=%d", oldCleanupFired)
+	}
 }
