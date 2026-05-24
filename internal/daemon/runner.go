@@ -885,6 +885,77 @@ func cleanupPlaywrightAfterTurn(ctx context.Context, mgr *mcp.ClientManager) {
 	log.Printf("daemon: Playwright idle disconnect scheduled (5m)")
 }
 
+// cleanupBrowserToolAfterTurn runs at the end of every RunAgent invocation
+// (via defer) to tear down the chromedp BrowserTool's Chrome when the last
+// in-flight Run releases its lease. Mirrors cleanupPlaywrightAfterTurn but for
+// the local chromedp fallback used when Playwright MCP isn't healthy. Has no
+// effect when the Run didn't touch the chromedp backend or when the tool isn't
+// in the registry (Playwright connected at startup and removed it).
+func cleanupBrowserToolAfterTurn(ctx context.Context, reg *agent.ToolRegistry) {
+	lease := tools.BrowserUseLeaseFrom(ctx)
+	if lease == nil {
+		return
+	}
+	if reg == nil {
+		lease.ReleaseOnly()
+		return
+	}
+	bt, ok := reg.Get("browser")
+	if !ok {
+		lease.ReleaseOnly()
+		return
+	}
+	browserTool, ok := bt.(*tools.BrowserTool)
+	if !ok {
+		lease.ReleaseOnly()
+		return
+	}
+	torndown, err := lease.ReleaseAndMaybeTeardown(browserTool.CleanupChromedp)
+	if torndown {
+		if err != nil {
+			log.Printf("daemon: chromedp browser teardown error: %v", err)
+		} else {
+			log.Printf("daemon: chromedp browser on-demand teardown completed")
+		}
+	}
+}
+
+// isUnattendedRunStartProbe reports whether this RunAgent invocation is
+// triggered automatically (heartbeat, scheduled job, cron, file watcher, MCP
+// inbound call, external webhook) rather than by a live user interaction. The
+// Playwright degraded-self-heal path skips ProbeNow's Chrome relaunch for
+// unattended runs so a user idle at their desk never sees a Chrome window pop
+// open from a background tick — UX invariant: no visible Chrome while idle.
+//
+// Webhooks are included because they're fired by external services (CI,
+// GitHub, Slack events, etc.) without a live user watching — same UX class as
+// heartbeat/schedule.
+func isUnattendedRunStartProbe(req RunAgentRequest) bool {
+	if req.BypassRouting {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(req.Source)) {
+	case "heartbeat", "schedule", "cron", "watcher", "mcp", "webhook":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldSkipPlaywrightProbeChromeRelaunch(before mcp.ServerHealth, cfg mcp.MCPServerConfig, req RunAgentRequest) bool {
+	return before.State == mcp.StateDegraded &&
+		mcp.IsPlaywrightCDPMode(cfg) &&
+		!cfg.KeepAlive &&
+		isUnattendedRunStartProbe(req)
+}
+
+func shouldTrackPlaywrightProbeChromeBefore(before mcp.ServerHealth, cfg mcp.MCPServerConfig, req RunAgentRequest) bool {
+	return before.State == mcp.StateDegraded &&
+		mcp.IsPlaywrightCDPMode(cfg) &&
+		!cfg.KeepAlive &&
+		!isUnattendedRunStartProbe(req)
+}
+
 // resumeNamedAgentColdStart resumes the latest persisted named-agent session.
 // Returns true only when a session was actually loaded from disk; a fresh
 // in-memory session pre-created by the route manager does not count as resumed.
@@ -959,13 +1030,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if cfg == nil || deps.GW == nil || deps.SessionCache == nil {
 		return nil, fmt.Errorf("daemon not fully configured")
 	}
-	// Install ChromeUseLease on ctx before any tool dispatch happens. Defer the
-	// same end-of-turn manager lookup the success-path cleanup used, so reloads
-	// during a turn keep the existing cleanup semantics.
+	// Install ChromeUseLease + BrowserUseLease on ctx before any tool dispatch
+	// happens. Defer the same end-of-turn manager lookup the success-path
+	// cleanup used, so reloads during a turn keep the existing cleanup
+	// semantics. The browser lease covers the chromedp BrowserTool fallback used
+	// when Playwright MCP is unavailable.
 	ctx = mcp.WithChromeUseLease(ctx)
+	ctx = tools.WithBrowserUseLease(ctx)
 	defer func() {
-		_, _, _, mgr := deps.RebuildLayers()
+		reg, _, _, mgr := deps.RebuildLayers()
 		cleanupPlaywrightAfterTurn(ctx, mgr)
+		cleanupBrowserToolAfterTurn(ctx, reg)
 	}()
 	if sup != nil {
 		// Cancel any pending idle disconnect — a new turn is starting.
@@ -976,8 +1051,23 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// When the user closes Chrome, the periodic probe marks it Disconnected.
 		// Calling ProbeNow on a Disconnected server triggers attemptReconnect,
 		// which relaunches Chrome — disruptive if the task doesn't need browser tools.
-		if h := sup.HealthFor("playwright"); h.State != mcp.StateDisconnected {
-			sup.ProbeNow("playwright")
+		if before := sup.HealthFor("playwright"); before.State != mcp.StateDisconnected {
+			var pwCfg mcp.MCPServerConfig
+			hasPlaywrightCfg := false
+			if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
+				pwCfg, hasPlaywrightCfg = mgr.ConfigFor("playwright")
+			}
+			if hasPlaywrightCfg && shouldSkipPlaywrightProbeChromeRelaunch(before, pwCfg, req) {
+				log.Printf("daemon: skipping unattended Playwright degraded probe relaunch")
+			} else {
+				if hasPlaywrightCfg && shouldTrackPlaywrightProbeChromeBefore(before, pwCfg, req) {
+					// ProbeNow may launch Chrome and still return Degraded/timeout
+					// while the extension finishes initializing. Mark before the
+					// probe so keep_alive=false always gets an end-of-turn teardown.
+					mcp.MarkChromeUsed(ctx)
+				}
+				sup.ProbeNow("playwright")
+			}
 		}
 	}
 	// Phase 2: re-snapshot to get post-swap registry

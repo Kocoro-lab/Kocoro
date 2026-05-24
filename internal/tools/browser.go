@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -34,10 +35,18 @@ type BrowserTool struct {
 	tabID string // active tab in pinchtab
 
 	// chromedp fallback
-	ctx    context.Context
-	cancel context.CancelFunc
-	active bool
+	ctx             context.Context
+	cancel          context.CancelFunc
+	chromedpDataDir string
+	active          bool
 }
+
+// ensureBackendFn is the indirection that BrowserTool.Run uses to set up the
+// browser backend. Tests override this to verify ordering invariants (e.g.
+// MarkBrowserUsed must run BEFORE backend setup) without launching real
+// Chrome. Production uses (*BrowserTool).ensureBackend. Mirrors the pattern
+// in internal/tools/mcp_tool.go ensureChromeDebugPort.
+var ensureBackendFn = (*BrowserTool).ensureBackend
 
 type browserArgs struct {
 	Action       string `json:"action"`
@@ -74,15 +83,15 @@ func (t *BrowserTool) Info() agent.ToolInfo {
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"action":      map[string]any{"type": "string", "description": "Action: navigate, click, type, scroll, screenshot, read_page, execute_js, wait, close"},
-				"description": agent.DescriptionFieldSpec,
-				"url":         map[string]any{"type": "string", "description": "URL to navigate to (for navigate action)"},
-				"selector": map[string]any{"type": "string", "description": "CSS selector (for click, type, read_page, scroll, wait)"},
-				"ref":      map[string]any{"type": "string", "description": "Element ref, e.g. 'e5' (for click, type, scroll — alternative to selector). Only meaningful when another tool has produced refs for the current page."},
-				"text":     map[string]any{"type": "string", "description": "Text to type (for type action)"},
-				"key":      map[string]any{"type": "string", "description": "Key to press, e.g. 'Enter' (for press action via click with key)"},
-				"value":    map[string]any{"type": "string", "description": "Value to select (for select action via click with value)"},
-				"script":   map[string]any{"type": "string", "description": "JavaScript to execute (for execute_js action). Expression context: a plain expression is evaluated and its value returned. Scripts whose first token is a top-level statement keyword (`return`, `const`, `let`, `var`, `function`, `async`, `if`, `for`, `while`, `try`) are auto-wrapped in an async IIFE on the chromedp backend so they evaluate correctly; plain expressions (including semicolon-terminated or multi-line ones) pass through unchanged."},
+				"action":       map[string]any{"type": "string", "description": "Action: navigate, click, type, scroll, screenshot, read_page, execute_js, wait, close"},
+				"description":  agent.DescriptionFieldSpec,
+				"url":          map[string]any{"type": "string", "description": "URL to navigate to (for navigate action)"},
+				"selector":     map[string]any{"type": "string", "description": "CSS selector (for click, type, read_page, scroll, wait)"},
+				"ref":          map[string]any{"type": "string", "description": "Element ref, e.g. 'e5' (for click, type, scroll — alternative to selector). Only meaningful when another tool has produced refs for the current page."},
+				"text":         map[string]any{"type": "string", "description": "Text to type (for type action)"},
+				"key":          map[string]any{"type": "string", "description": "Key to press, e.g. 'Enter' (for press action via click with key)"},
+				"value":        map[string]any{"type": "string", "description": "Value to select (for select action via click with value)"},
+				"script":       map[string]any{"type": "string", "description": "JavaScript to execute (for execute_js action). Expression context: a plain expression is evaluated and its value returned. Scripts whose first token is a top-level statement keyword (`return`, `const`, `let`, `var`, `function`, `async`, `if`, `for`, `while`, `try`) are auto-wrapped in an async IIFE on the chromedp backend so they evaluate correctly; plain expressions (including semicolon-terminated or multi-line ones) pass through unchanged."},
 				"waitFor":      map[string]any{"type": "string", "description": "Navigation wait strategy: e.g. 'domcontentloaded', 'networkidle' (for navigate action)"},
 				"waitSelector": map[string]any{"type": "string", "description": "CSS selector to wait for after navigation"},
 				"blockImages":  map[string]any{"type": "boolean", "description": "Disable image loading during navigation"},
@@ -104,11 +113,14 @@ func (t *BrowserTool) IsReadOnlyCall(string) bool { return false }
 func (t *BrowserTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args browserArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 
 	if args.Action == "" {
-		return agent.ToolResult{Content: "missing required parameter: action", IsError: true}, nil
+		return agent.ValidationError("missing required parameter: action"), nil
+	}
+	if args.Description == "" {
+		return agent.ValidationError("missing required parameter: description"), nil
 	}
 
 	timeout := 30 * time.Second
@@ -116,18 +128,32 @@ func (t *BrowserTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 		timeout = time.Duration(args.Timeout) * time.Second
 	}
 
-	// close doesn't need a running backend
-	if args.Action == "close" {
-		return t.closeBrowser()
-	}
-
 	// Validate required params before starting a browser
 	if err := t.validateArgs(args); err != nil {
-		return agent.ToolResult{Content: err.Error(), IsError: true}, nil
+		return agent.ValidationError(err.Error()), nil
+	}
+
+	// Mark the per-Run browser lease BEFORE ensureBackend so a concurrent
+	// teardown observes our contribution to the counter before deciding
+	// whether to skip teardown. Marking after ensureBackend leaves a race
+	// window where another Run's defer can kill Chrome between ensureBackend
+	// returning and our MarkUsed, dropping us into the action with backendNone
+	// / nil t.ctx. Mirrors mcp_tool.go's mcp.MarkChromeUsed-before-ensure
+	// order.
+	//
+	// We always mark (even when pinchtab will be chosen) — the teardown
+	// callback is CleanupChromedp, which is a no-op on non-chromedp backends.
+	// Cost is one extra tracker.mu round-trip per pinchtab Run.
+	MarkBrowserUsed(ctx)
+
+	// close doesn't need to start a backend, but it must still participate in
+	// the lease so it cannot tear down Chrome while another Run is using it.
+	if args.Action == "close" {
+		return t.closeBrowser(ctx)
 	}
 
 	// Ensure a backend is available (pinchtab preferred, chromedp fallback)
-	if err := t.ensureBackend(ctx); err != nil {
+	if err := ensureBackendFn(t, ctx); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("failed to start browser: %v", err), IsError: true}, nil
 	}
 
@@ -189,7 +215,7 @@ func (t *BrowserTool) validateArgs(args browserArgs) error {
 		if args.Query == "" {
 			return fmt.Errorf("find action requires 'query' parameter")
 		}
-	case "scroll", "screenshot", "read_page", "snapshot":
+	case "scroll", "screenshot", "read_page", "snapshot", "close":
 		// no required params
 	default:
 		return fmt.Errorf("unknown action: %q (valid: navigate, click, type, scroll, screenshot, read_page, execute_js, wait, close)", args.Action)
@@ -239,11 +265,16 @@ func (t *BrowserTool) ensureBackend(ctx context.Context) error {
 }
 
 func (t *BrowserTool) startChromedp() error {
+	dataDir, err := os.MkdirTemp("", "kocoro-chromedp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create browser profile: %w", err)
+	}
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", false),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-first-run", true),
 		chromedp.Flag("no-default-browser-check", true),
+		chromedp.UserDataDir(dataDir),
 	)
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -252,6 +283,7 @@ func (t *BrowserTool) startChromedp() error {
 	if err := chromedp.Run(browserCtx); err != nil {
 		browserCancel()
 		allocCancel()
+		_ = os.RemoveAll(dataDir)
 		return fmt.Errorf("failed to start browser: %w", err)
 	}
 
@@ -260,6 +292,7 @@ func (t *BrowserTool) startChromedp() error {
 		browserCancel()
 		allocCancel()
 	}
+	t.chromedpDataDir = dataDir
 	t.active = true
 	t.backend = backendChromedp
 	return nil
@@ -267,6 +300,35 @@ func (t *BrowserTool) startChromedp() error {
 
 func (t *BrowserTool) isPinchtab() bool {
 	return t.backend == backendPinchtab
+}
+
+// CleanupChromedp tears down only the chromedp backend, leaving pinchtab (a
+// long-lived external process) untouched. Safe to call when chromedp is not
+// active. Returns an error if the tracked Chrome refused to die after SIGTERM
+// and SIGKILL.
+//
+// The kill runs OUTSIDE t.mu so concurrent ensureBackend calls don't block on
+// the up-to-3s poll loop. The lease's tracker.mu is what serializes a fresh
+// MarkUsed against an in-flight teardown.
+func (t *BrowserTool) CleanupChromedp() error {
+	var dataDir string
+	t.mu.Lock()
+	if t.backend == backendChromedp {
+		if t.cancel != nil {
+			t.cancel()
+		}
+		dataDir = t.chromedpDataDir
+		t.ctx = nil
+		t.cancel = nil
+		t.chromedpDataDir = ""
+		t.active = false
+		t.backend = backendNone
+	}
+	t.mu.Unlock()
+	if dataDir == "" {
+		return nil
+	}
+	return killChromedpChromeForDirFn(dataDir)
 }
 
 // --- Actions ---
@@ -821,27 +883,36 @@ func hasLeadingKeyword(s string, keywords ...string) bool {
 	return false
 }
 
-func (t *BrowserTool) closeBrowser() (agent.ToolResult, error) {
+func (t *BrowserTool) closeBrowser(ctx context.Context) (agent.ToolResult, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if t.backend == backendNone {
+		t.mu.Unlock()
 		return agent.ToolResult{Content: "Browser is not running"}, nil
 	}
+	t.mu.Unlock()
 
-	t.cleanup()
+	_, skipped, err := BrowserUseLeaseFrom(ctx).TeardownIfOnlyUser(t.cleanupAll)
+	if skipped {
+		// Informational, not a tool failure: another concurrent Run is still
+		// using the browser. Returning IsError=true here would burn the LLM's
+		// all-errors retry budget (loopdetect) and could trigger a force-stop
+		// on a benign "wait your turn" signal.
+		return agent.ToolResult{Content: "Browser close skipped: another run is still using the browser"}, nil
+	}
+	if err != nil {
+		return agent.ToolResult{Content: fmt.Sprintf("browser close error: %v", err), IsError: true}, nil
+	}
 	return agent.ToolResult{Content: "Browser closed"}, nil
 }
 
 // Cleanup shuts down the browser. Safe to call multiple times.
 func (t *BrowserTool) Cleanup() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.cleanup()
+	_ = t.cleanupAll()
 }
 
-// cleanup must be called with mu held.
-func (t *BrowserTool) cleanup() {
+func (t *BrowserTool) cleanupAll() error {
+	var dataDir string
+	t.mu.Lock()
 	switch t.backend {
 	case backendPinchtab:
 		if t.pt != nil {
@@ -852,20 +923,112 @@ func (t *BrowserTool) cleanup() {
 		if t.cancel != nil {
 			t.cancel()
 		}
+		dataDir = t.chromedpDataDir
 		t.ctx = nil
 		t.cancel = nil
+		t.chromedpDataDir = ""
 		t.active = false
 	}
 	t.backend = backendNone
+	t.mu.Unlock()
+	if dataDir == "" {
+		return nil
+	}
+	return killChromedpChromeForDirFn(dataDir)
+}
+
+const (
+	// chromedpTermGrace is how long killChromedpChromeForDir waits after
+	// SIGTERM before escalating to SIGKILL. Matches StopCDPChromeAndWait's
+	// pattern.
+	chromedpTermGrace = 2 * time.Second
+	// chromedpKillGrace is how long to wait after SIGKILL before declaring
+	// Chrome unkillable.
+	chromedpKillGrace = 1 * time.Second
+	// chromedpPollInterval matches StopCDPChromeAndWait's cadence.
+	chromedpPollInterval = 200 * time.Millisecond
+	// chromedpOrphanPattern matches startChromedp's MkdirTemp prefix
+	// ("kocoro-chromedp-*") and the legacy chromedp.DefaultExecAllocatorOptions
+	// prefix ("chromedp-runner-*"). Used ONLY by CleanupOrphanedChromedp; the
+	// per-turn teardown path matches the exact data-dir of the BrowserTool
+	// instance that started it.
+	chromedpOrphanPattern = "user-data-dir.*(kocoro-chromedp|chromedp-runner)"
+)
+
+var killChromedpChromeForDirFn = killChromedpChromeForDir
+
+// killChromedpChromeForDir SIGTERMs the Chrome process whose --user-data-dir
+// is exactly dataDir, polls for exit, and escalates to SIGKILL when SIGTERM is
+// ignored. Returns nil when Chrome is dead (or never alive); returns an error
+// only when Chrome survives SIGKILL.
+//
+// Used by Cleanup paths because cancelling chromedp's allocCtx alone doesn't
+// reliably reap the Chrome process tree — production case showed orphan
+// chromedp Chrome alive 3h+ after a nominal Cleanup.
+//
+// The dataDir is removed from disk on every successful path (dead, TERM-dead,
+// KILL-dead). When Chrome survives SIGKILL the dir is preserved so a follow-up
+// orphan sweep can still find it.
+func killChromedpChromeForDir(dataDir string) error {
+	if dataDir == "" {
+		return nil
+	}
+	pattern := fmt.Sprintf("user-data-dir=%s", regexp.QuoteMeta(dataDir))
+	return killChromedpChromeForPattern(pattern, dataDir)
+}
+
+func killChromedpChromeForPattern(pattern string, dataDir string) error {
+	if !chromedpChromeAlivePattern(pattern) {
+		if dataDir != "" {
+			_ = os.RemoveAll(dataDir)
+		}
+		return nil
+	}
+	_ = exec.Command("pkill", "-f", pattern).Run()
+	if waitChromedpDeadPattern(pattern, chromedpTermGrace) {
+		if dataDir != "" {
+			_ = os.RemoveAll(dataDir)
+		}
+		return nil
+	}
+	// SIGTERM ignored — escalate to SIGKILL.
+	_ = exec.Command("pkill", "-9", "-f", pattern).Run()
+	if waitChromedpDeadPattern(pattern, chromedpKillGrace) {
+		if dataDir != "" {
+			_ = os.RemoveAll(dataDir)
+		}
+		return nil
+	}
+	return fmt.Errorf("chromedp Chrome still alive after SIGKILL")
+}
+
+func chromedpChromeAlivePattern(pattern string) bool {
+	out, err := exec.Command("pgrep", "-f", pattern).Output()
+	return err == nil && len(strings.TrimSpace(string(out))) > 0
+}
+
+func waitChromedpDeadPattern(pattern string, grace time.Duration) bool {
+	polls := int(grace / chromedpPollInterval)
+	if polls < 1 {
+		polls = 1
+	}
+	for range polls {
+		if !chromedpChromeAlivePattern(pattern) {
+			return true
+		}
+		time.Sleep(chromedpPollInterval)
+	}
+	return !chromedpChromeAlivePattern(pattern)
 }
 
 // CleanupOrphanedChromedp kills any Chrome processes started by chromedp from
 // previous daemon runs that weren't properly cleaned up (e.g. force-kill, crash).
 // Safe to call at daemon startup before registering tools.
+//
+// Matches both the current kocoro-chromedp-* MkdirTemp prefix from startChromedp
+// and the legacy chromedp-runner-* default prefix used by older daemons.
 func CleanupOrphanedChromedp() {
-	// chromedp Chrome instances use --user-data-dir pointing to a temp dir
-	// matching "chromedp-runner*". Find and kill them.
-	out, err := exec.Command("pgrep", "-f", "user-data-dir.*chromedp-runner").Output()
+	out, err := exec.Command("pgrep", "-f", chromedpOrphanPattern).Output()
 	if err != nil || strings.TrimSpace(string(out)) == "" {
 		return
 	}

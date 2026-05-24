@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -67,7 +68,7 @@ func TestBrowser_MissingAction(t *testing.T) {
 
 func TestBrowser_UnknownAction(t *testing.T) {
 	tool := &BrowserTool{}
-	result, err := tool.Run(context.Background(), `{"action": "fly"}`)
+	result, err := tool.Run(context.Background(), `{"action": "fly", "description": "test"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -79,9 +80,23 @@ func TestBrowser_UnknownAction(t *testing.T) {
 	}
 }
 
+func TestBrowser_MissingDescription(t *testing.T) {
+	tool := &BrowserTool{}
+	result, err := tool.Run(context.Background(), `{"action": "read_page"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Error("expected error result for missing description")
+	}
+	if !contains(result.Content, "[validation error]") || !contains(result.Content, "description") {
+		t.Errorf("expected validation error for missing description, got: %s", result.Content)
+	}
+}
+
 func TestBrowser_NavigateMissingURL(t *testing.T) {
 	tool := &BrowserTool{}
-	result, err := tool.Run(context.Background(), `{"action": "navigate"}`)
+	result, err := tool.Run(context.Background(), `{"action": "navigate", "description": "test"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -95,7 +110,7 @@ func TestBrowser_NavigateMissingURL(t *testing.T) {
 
 func TestBrowser_ClickMissingSelector(t *testing.T) {
 	tool := &BrowserTool{}
-	result, err := tool.Run(context.Background(), `{"action": "click"}`)
+	result, err := tool.Run(context.Background(), `{"action": "click", "description": "test"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -109,7 +124,7 @@ func TestBrowser_ClickMissingSelector(t *testing.T) {
 
 func TestBrowser_TypeMissingSelector(t *testing.T) {
 	tool := &BrowserTool{}
-	result, err := tool.Run(context.Background(), `{"action": "type"}`)
+	result, err := tool.Run(context.Background(), `{"action": "type", "description": "test"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -123,7 +138,7 @@ func TestBrowser_TypeMissingSelector(t *testing.T) {
 
 func TestBrowser_WaitMissingSelector(t *testing.T) {
 	tool := &BrowserTool{}
-	result, err := tool.Run(context.Background(), `{"action": "wait"}`)
+	result, err := tool.Run(context.Background(), `{"action": "wait", "description": "test"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -137,7 +152,7 @@ func TestBrowser_WaitMissingSelector(t *testing.T) {
 
 func TestBrowser_ExecuteJSMissingScript(t *testing.T) {
 	tool := &BrowserTool{}
-	result, err := tool.Run(context.Background(), `{"action": "execute_js"}`)
+	result, err := tool.Run(context.Background(), `{"action": "execute_js", "description": "test"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -151,7 +166,7 @@ func TestBrowser_ExecuteJSMissingScript(t *testing.T) {
 
 func TestBrowser_CloseWhenNotRunning(t *testing.T) {
 	tool := &BrowserTool{}
-	result, err := tool.Run(context.Background(), `{"action": "close"}`)
+	result, err := tool.Run(context.Background(), `{"action": "close", "description": "test"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -294,5 +309,32 @@ func TestDetectAntiBotPage(t *testing.T) {
 				t.Errorf("detectAntiBotPage(%q) = %v, want %v", tt.title, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestChromedpOrphanPattern_MatchesBothPrefixes locks in the alternation that
+// CleanupOrphanedChromedp relies on: the broad-sweep regex must catch both
+// the current kocoro-chromedp-* MkdirTemp prefix used by startChromedp AND
+// the legacy chromedp.DefaultExecAllocatorOptions chromedp-runner-* prefix
+// used by older daemons (so a binary upgrade still cleans up old orphans).
+// pgrep uses POSIX extended regex; Go's regexp is RE2 — both honor `(a|b)`
+// alternation the same way for the literal anchors we care about here.
+func TestChromedpOrphanPattern_MatchesBothPrefixes(t *testing.T) {
+	re := regexp.MustCompile(chromedpOrphanPattern)
+	cases := []struct {
+		argv string
+		want bool
+	}{
+		{"--user-data-dir=/var/folders/abc/T/kocoro-chromedp-12345", true},
+		{"--user-data-dir=/tmp/chromedp-runner-99999", true},
+		{"--user-data-dir=/Users/wayland/Library/Application Support/Google/Chrome", false},
+		{"--user-data-dir=/tmp/some-other-thing", false},
+		{"chrome --foo --user-data-dir=/tmp/kocoro-chromedp-x --bar", true},
+	}
+	for _, tc := range cases {
+		got := re.MatchString(tc.argv)
+		if got != tc.want {
+			t.Fatalf("orphan pattern match %q = %v, want %v", tc.argv, got, tc.want)
+		}
 	}
 }

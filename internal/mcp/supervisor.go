@@ -331,6 +331,11 @@ func (s *Supervisor) serverLoop(ctx context.Context, name string, entry *serverE
 			return
 
 		case <-entry.probeNowCh:
+			// Explicit/user-triggered path: if Playwright is degraded because
+			// the dedicated CDP Chrome was torn down after a prior turn, relaunch
+			// Chrome before probing. Periodic probes deliberately do not do this
+			// so an idle machine does not pop Chrome open unexpectedly.
+			s.maybeRelaunchDegradedCDPChrome(name, entry)
 			s.runTransportProbe(ctx, name, entry)
 			// On-demand path: if still disconnected, attempt reconnect.
 			// This is the ONLY path that reconnects — periodic probes never do.
@@ -420,7 +425,7 @@ func (s *Supervisor) attemptReconnect(ctx context.Context, name string, entry *s
 
 // runTransportProbe probes transport health and updates state on failure.
 // Does NOT auto-relaunch Chrome or reconnect — that happens on-demand when a
-// tool is actually invoked (via attemptReconnect / EnsureChromeDebugPort).
+// tool or explicit ProbeNow is actually invoked.
 // When transport recovers and the server has a capability probe, runs it
 // immediately before declaring healthy.
 func (s *Supervisor) runTransportProbe(ctx context.Context, name string, entry *serverEntry) {
@@ -533,6 +538,48 @@ func (s *Supervisor) runCapabilityProbe(ctx context.Context, name string, entry 
 			log.Printf("[mcp-supervisor] Playwright extension unreachable after %d probes — cleared readiness marker", capFailures)
 		}
 	}
+}
+
+// maybeRelaunchDegradedCDPChrome ensures the dedicated CDP Chrome is running
+// before a capability re-probe when:
+//   - name == "playwright"
+//   - the server's MCP config is in CDP mode (--cdp-endpoint)
+//   - current state is StateDegraded (NOT Healthy, NOT Disconnected)
+//   - the CDP port is not currently reachable
+//
+// Otherwise it's a no-op. This is the self-heal path for the case where a
+// previous turn's on-demand teardown killed Chrome and the subsequent probe
+// went degraded. Callers intentionally invoke this only from explicit
+// user/tool-triggered probes, so background periodic probes can observe health
+// without popping Chrome open while the user is idle.
+//
+// Intentionally narrow: gating on StateDegraded plus explicit call-site opt-in
+// preserves the keep_alive=false "Chrome on demand from user activity" lifecycle.
+func (s *Supervisor) maybeRelaunchDegradedCDPChrome(name string, entry *serverEntry) {
+	if name != "playwright" {
+		return
+	}
+	s.mu.Lock()
+	state := entry.health.State
+	cfg := entry.config
+	s.mu.Unlock()
+	if state != StateDegraded {
+		return
+	}
+	if !IsPlaywrightCDPMode(cfg) {
+		return
+	}
+	port := PlaywrightCDPPort(cfg)
+	if cdpReachableFn(port) {
+		// Chrome came back via another path (e.g. concurrent tool dispatch).
+		// Let the probe run against the live Chrome.
+		return
+	}
+	if err := ensureChromeDebugPortFn(port); err != nil {
+		log.Printf("[mcp-supervisor] playwright: degraded re-probe Chrome launch failed: %v", err)
+		return
+	}
+	log.Printf("[mcp-supervisor] playwright: degraded re-probe relaunched Chrome on port %d", port)
 }
 
 // fireOnChange logs the transition and calls the onChange callback outside the lock.

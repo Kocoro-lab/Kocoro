@@ -1214,6 +1214,120 @@ func TestIsSoftRunError_StreamIdleTimeout(t *testing.T) {
 	}
 }
 
+func TestShouldTrackPlaywrightProbeChromeBefore(t *testing.T) {
+	cdpCfg := mcp.MCPServerConfig{
+		Command: "playwright-mcp",
+		Args:    []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+	}
+	keepAliveCfg := cdpCfg
+	keepAliveCfg.KeepAlive = true
+	stdioCfg := mcp.MCPServerConfig{Command: "playwright-mcp", Args: []string{"--headless"}}
+
+	cases := []struct {
+		name   string
+		before mcp.ServerHealth
+		cfg    mcp.MCPServerConfig
+		req    RunAgentRequest
+		want   bool
+	}{
+		{
+			name:   "attended degraded cdp keepalive false tracks before probe",
+			before: mcp.ServerHealth{State: mcp.StateDegraded},
+			cfg:    cdpCfg,
+			req:    RunAgentRequest{Source: "kocoro"},
+			want:   true,
+		},
+		{
+			name:   "schedule does not track because probe relaunch is skipped",
+			before: mcp.ServerHealth{State: mcp.StateDegraded},
+			cfg:    cdpCfg,
+			req:    RunAgentRequest{Source: "schedule"},
+		},
+		{
+			name:   "heartbeat bypass does not track because probe relaunch is skipped",
+			before: mcp.ServerHealth{State: mcp.StateDegraded},
+			cfg:    cdpCfg,
+			req:    RunAgentRequest{Source: "heartbeat", BypassRouting: true},
+		},
+		{
+			name:   "webhook does not track because probe relaunch is skipped",
+			before: mcp.ServerHealth{State: mcp.StateDegraded},
+			cfg:    cdpCfg,
+			req:    RunAgentRequest{Source: "webhook"},
+		},
+		{
+			name:   "cron does not track because probe relaunch is skipped",
+			before: mcp.ServerHealth{State: mcp.StateDegraded},
+			cfg:    cdpCfg,
+			req:    RunAgentRequest{Source: "cron"},
+		},
+		{
+			name:   "watcher does not track because probe relaunch is skipped",
+			before: mcp.ServerHealth{State: mcp.StateDegraded},
+			cfg:    cdpCfg,
+			req:    RunAgentRequest{Source: "watcher"},
+		},
+		{
+			name:   "mcp does not track because probe relaunch is skipped",
+			before: mcp.ServerHealth{State: mcp.StateDegraded},
+			cfg:    cdpCfg,
+			req:    RunAgentRequest{Source: "mcp"},
+		},
+		{
+			name:   "healthy does not pretrack",
+			before: mcp.ServerHealth{State: mcp.StateHealthy},
+			cfg:    cdpCfg,
+			req:    RunAgentRequest{Source: "kocoro"},
+		},
+		{
+			name:   "keepalive true does not pretrack",
+			before: mcp.ServerHealth{State: mcp.StateDegraded},
+			cfg:    keepAliveCfg,
+			req:    RunAgentRequest{Source: "kocoro"},
+		},
+		{
+			name:   "non cdp does not pretrack",
+			before: mcp.ServerHealth{State: mcp.StateDegraded},
+			cfg:    stdioCfg,
+			req:    RunAgentRequest{Source: "kocoro"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldTrackPlaywrightProbeChromeBefore(tc.before, tc.cfg, tc.req); got != tc.want {
+				t.Fatalf("shouldTrackPlaywrightProbeChromeBefore() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestShouldSkipPlaywrightProbeChromeRelaunch(t *testing.T) {
+	cdpCfg := mcp.MCPServerConfig{
+		Command: "playwright-mcp",
+		Args:    []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+	}
+
+	skipSources := []string{"schedule", "heartbeat", "cron", "watcher", "mcp", "webhook"}
+	for _, src := range skipSources {
+		if !shouldSkipPlaywrightProbeChromeRelaunch(
+			mcp.ServerHealth{State: mcp.StateDegraded},
+			cdpCfg,
+			RunAgentRequest{Source: src},
+		) {
+			t.Fatalf("expected %q degraded CDP probe relaunch to be skipped", src)
+		}
+	}
+
+	if shouldSkipPlaywrightProbeChromeRelaunch(
+		mcp.ServerHealth{State: mcp.StateDegraded},
+		cdpCfg,
+		RunAgentRequest{Source: "kocoro"},
+	) {
+		t.Fatal("interactive degraded CDP probe relaunch must not be skipped")
+	}
+}
+
 // TestApplyAgentModelOverlayToLoop_ModelTier verifies that the per-agent
 // `agent.model_tier` overlay actually retargets the loop's tier on each turn.
 // Regression guard: dropping the SetModelTier call here would silently leave
