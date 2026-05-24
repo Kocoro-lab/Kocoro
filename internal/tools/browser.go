@@ -1113,7 +1113,7 @@ func waitChromedpDeadPattern(pattern string, grace time.Duration) bool {
 
 // cleanupOrphanedChromedpCalledForTest is incremented every time
 // CleanupOrphanedChromedp runs. Test-only; production code never reads it.
-var cleanupOrphanedChromedpCalledForTest int
+var cleanupOrphanedChromedpCalledForTest atomic.Int32
 
 // CleanupOrphanedChromedp kills any Chrome processes started by chromedp from
 // previous daemon runs that weren't properly cleaned up (e.g. force-kill, crash).
@@ -1122,7 +1122,7 @@ var cleanupOrphanedChromedpCalledForTest int
 // Matches both the current kocoro-chromedp-* MkdirTemp prefix from startChromedp
 // and the legacy chromedp-runner-* default prefix used by older daemons.
 func CleanupOrphanedChromedp() {
-	cleanupOrphanedChromedpCalledForTest++
+	cleanupOrphanedChromedpCalledForTest.Add(1)
 	out, err := exec.Command("pgrep", "-f", chromedpOrphanPattern).Output()
 	if err != nil || strings.TrimSpace(string(out)) == "" {
 		return
