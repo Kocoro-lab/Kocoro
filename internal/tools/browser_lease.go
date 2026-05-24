@@ -111,8 +111,15 @@ func (l *BrowserUseLease) ReleaseOnly() {
 		return
 	}
 	l.released = true
-	if l.acquired {
-		l.tracker.count--
+	if !l.acquired {
+		return
+	}
+	l.tracker.count--
+	if l.owner != nil {
+		l.tracker.owners[l.owner]--
+		if l.tracker.owners[l.owner] == 0 {
+			delete(l.tracker.owners, l.owner)
+		}
 	}
 }
 
@@ -140,8 +147,21 @@ func (l *BrowserUseLease) ReleaseAndMaybeTeardown(teardown func() error) (torndo
 		return false, nil
 	}
 	l.tracker.count--
-	if l.tracker.count > 0 {
-		return false, nil
+	owner := l.owner
+	if owner != nil {
+		l.tracker.owners[owner]--
+		if l.tracker.owners[owner] == 0 {
+			delete(l.tracker.owners, owner)
+		}
+		// Per-owner gate: teardown when no other lease references this owner.
+		if l.tracker.owners[owner] > 0 {
+			return false, nil
+		}
+	} else {
+		// Legacy/test gate: global count (no owner captured).
+		if l.tracker.count > 0 {
+			return false, nil
+		}
 	}
 	torndown = true
 	if teardown != nil {
@@ -162,8 +182,15 @@ func (l *BrowserUseLease) TeardownIfOnlyUser(teardown func() error) (torndown bo
 	}
 	l.tracker.mu.Lock()
 	defer l.tracker.mu.Unlock()
-	if l.tracker.count > 1 {
-		return false, true, nil
+	owner := l.owner
+	if owner != nil {
+		if l.tracker.owners[owner] > 1 {
+			return false, true, nil
+		}
+	} else {
+		if l.tracker.count > 1 {
+			return false, true, nil
+		}
 	}
 	torndown = true
 	if teardown != nil {
