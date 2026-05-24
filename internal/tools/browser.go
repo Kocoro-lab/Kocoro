@@ -884,13 +884,12 @@ func hasLeadingKeyword(s string, keywords ...string) bool {
 }
 
 func (t *BrowserTool) closeBrowser(ctx context.Context) (agent.ToolResult, error) {
-	t.mu.Lock()
-	if t.backend == backendNone {
-		t.mu.Unlock()
-		return agent.ToolResult{Content: "Browser is not running"}, nil
-	}
-	t.mu.Unlock()
-
+	// No pre-check on backend state — dropping the lock between the check and
+	// TeardownIfOnlyUser opened a TOCTOU window where a concurrent Cleanup
+	// could swap state in the gap, and we'd report a misleading message for
+	// work another goroutine did. cleanupAll handles backendNone as a no-op
+	// switch fallthrough, so an already-closed browser just produces the
+	// same "Browser closed" result the LLM was after.
 	_, skipped, err := BrowserUseLeaseFrom(ctx).TeardownIfOnlyUser(t.cleanupAll)
 	if skipped {
 		// Informational, not a tool failure: another concurrent Run is still
@@ -949,10 +948,16 @@ const (
 	chromedpPollInterval = 200 * time.Millisecond
 	// chromedpOrphanPattern matches startChromedp's MkdirTemp prefix
 	// ("kocoro-chromedp-*") and the legacy chromedp.DefaultExecAllocatorOptions
-	// prefix ("chromedp-runner-*"). Used ONLY by CleanupOrphanedChromedp; the
+	// prefix ("chromedp-runner*"). Used ONLY by CleanupOrphanedChromedp; the
 	// per-turn teardown path matches the exact data-dir of the BrowserTool
 	// instance that started it.
-	chromedpOrphanPattern = "user-data-dir.*(kocoro-chromedp|chromedp-runner)"
+	//
+	// Anchored to the literal --user-data-dir= flag form so a cmdline that
+	// only happens to contain the substring "user-data-dir" (e.g. a script
+	// referenced from a chromedp-runner-style sibling path) can't trigger a
+	// false-positive match. [^ ] prevents the path glob from greedily
+	// spanning across argv elements when pgrep -f sees the joined cmdline.
+	chromedpOrphanPattern = "--user-data-dir=[^ ]*(kocoro-chromedp|chromedp-runner)"
 )
 
 var killChromedpChromeForDirFn = killChromedpChromeForDir

@@ -348,8 +348,11 @@ func TestPinchtab_CloseWhenPinchtabNeverStarted(t *testing.T) {
 	if result.IsError {
 		t.Errorf("expected clean close, got error: %s", result.Content)
 	}
-	if !contains(result.Content, "not running") {
-		t.Errorf("expected 'not running', got: %s", result.Content)
+	// closeBrowser uniformly reports "Browser closed" — see
+	// TestBrowser_CloseWhenNotRunning for the rationale behind dropping the
+	// "not running" pre-check.
+	if !contains(result.Content, "Browser closed") {
+		t.Errorf("expected 'Browser closed', got: %s", result.Content)
 	}
 }
 
