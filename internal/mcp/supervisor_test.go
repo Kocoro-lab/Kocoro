@@ -607,7 +607,7 @@ func (f *fakeListToolsClient) SetLevel(context.Context, mcp.SetLevelRequest) err
 func (f *fakeListToolsClient) Complete(context.Context, mcp.CompleteRequest) (*mcp.CompleteResult, error) {
 	return &mcp.CompleteResult{}, nil
 }
-func (f *fakeListToolsClient) Close() error                                         { return nil }
+func (f *fakeListToolsClient) Close() error                                 { return nil }
 func (f *fakeListToolsClient) OnNotification(func(mcp.JSONRPCNotification)) {}
 
 // --- OnReconnect callback tests ---
@@ -822,5 +822,224 @@ func TestSupervisor_OnReconnect_FiltersByServerName(t *testing.T) {
 	close(reconnected)
 	for name := range reconnected {
 		t.Errorf("unexpected reconnect callback for %q (should not fire on failed reconnect)", name)
+	}
+}
+
+// --- maybeRelaunchDegradedCDPChrome tests ---
+// Self-heal path for Playwright stuck in degraded after a CDP Chrome teardown.
+
+// newDegradedTestSup builds a Supervisor + serverEntry pair plus a recording
+// stub for ensureChromeDebugPortFn. Returns the entry, a pointer to a counter
+// of ensure calls, a pointer to the last port the stub saw, and a cleanup
+// func that restores the package-level seams.
+func newDegradedTestSup(t *testing.T, name string, cfg MCPServerConfig, state HealthState, reachable bool) (sup *Supervisor, entry *serverEntry, ensureCalls *int, lastPort *int, cleanup func()) {
+	t.Helper()
+	mgr := NewClientManager()
+	sup = NewSupervisor(mgr)
+	entry = &serverEntry{
+		config:            cfg,
+		health:            ServerHealth{State: state, Since: time.Now()},
+		transportBackoff:  newBackoffState(10*time.Second, 5*time.Minute, 30*time.Minute),
+		capabilityBackoff: newBackoffState(10*time.Second, 5*time.Minute, 30*time.Minute),
+	}
+	sup.mu.Lock()
+	sup.servers[name] = entry
+	sup.mu.Unlock()
+
+	oldReachable := cdpReachableFn
+	oldEnsure := ensureChromeDebugPortFn
+	calls := 0
+	port := -1
+	cdpReachableFn = func(int) bool { return reachable }
+	ensureChromeDebugPortFn = func(p int) error {
+		calls++
+		port = p
+		return nil
+	}
+	cleanup = func() {
+		cdpReachableFn = oldReachable
+		ensureChromeDebugPortFn = oldEnsure
+	}
+	return sup, entry, &calls, &port, cleanup
+}
+
+func playwrightCDPConfig() MCPServerConfig {
+	return MCPServerConfig{
+		Command: "playwright-mcp",
+		Args:    []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+	}
+}
+
+func TestMaybeRelaunchDegradedCDPChrome_DegradedAndUnreachable_TriggersEnsure(t *testing.T) {
+	sup, entry, calls, port, cleanup := newDegradedTestSup(t, "playwright", playwrightCDPConfig(), StateDegraded, false)
+	defer cleanup()
+
+	sup.maybeRelaunchDegradedCDPChrome("playwright", entry)
+
+	if *calls != 1 {
+		t.Fatalf("expected ensureChromeDebugPort called once, got %d", *calls)
+	}
+	if *port != 9223 {
+		t.Fatalf("expected port 9223, got %d", *port)
+	}
+}
+
+func TestMaybeRelaunchDegradedCDPChrome_Healthy_SkipsEnsure(t *testing.T) {
+	sup, entry, calls, _, cleanup := newDegradedTestSup(t, "playwright", playwrightCDPConfig(), StateHealthy, false)
+	defer cleanup()
+
+	sup.maybeRelaunchDegradedCDPChrome("playwright", entry)
+
+	if *calls != 0 {
+		t.Fatalf("Healthy state must never trigger Chrome launch from the periodic probe, got %d calls", *calls)
+	}
+}
+
+func TestMaybeRelaunchDegradedCDPChrome_Disconnected_SkipsEnsure(t *testing.T) {
+	sup, entry, calls, _, cleanup := newDegradedTestSup(t, "playwright", playwrightCDPConfig(), StateDisconnected, false)
+	defer cleanup()
+
+	sup.maybeRelaunchDegradedCDPChrome("playwright", entry)
+
+	if *calls != 0 {
+		t.Fatalf("Disconnected is handled by attemptReconnect, not this hook — got %d calls", *calls)
+	}
+}
+
+func TestMaybeRelaunchDegradedCDPChrome_DegradedButReachable_SkipsEnsure(t *testing.T) {
+	sup, entry, calls, _, cleanup := newDegradedTestSup(t, "playwright", playwrightCDPConfig(), StateDegraded, true)
+	defer cleanup()
+
+	sup.maybeRelaunchDegradedCDPChrome("playwright", entry)
+
+	if *calls != 0 {
+		t.Fatalf("Chrome already reachable — must not launch again. Got %d calls", *calls)
+	}
+}
+
+func TestMaybeRelaunchDegradedCDPChrome_NonPlaywrightServer_SkipsEnsure(t *testing.T) {
+	// A non-playwright server in Degraded state must NOT trigger CDP Chrome
+	// launch. The hook is scoped to Playwright only.
+	sup, entry, calls, _, cleanup := newDegradedTestSup(t, "other-server", MCPServerConfig{Command: "dummy"}, StateDegraded, false)
+	defer cleanup()
+
+	sup.maybeRelaunchDegradedCDPChrome("other-server", entry)
+
+	if *calls != 0 {
+		t.Fatalf("non-playwright server must not trigger Chrome launch, got %d calls", *calls)
+	}
+}
+
+func TestMaybeRelaunchDegradedCDPChrome_NonCDPConfig_SkipsEnsure(t *testing.T) {
+	// Playwright in stdio mode (no --cdp-endpoint) must NOT trigger Chrome
+	// launch — there is no CDP Chrome to relaunch.
+	stdioCfg := MCPServerConfig{Command: "playwright-mcp", Args: []string{"--headless"}}
+	sup, entry, calls, _, cleanup := newDegradedTestSup(t, "playwright", stdioCfg, StateDegraded, false)
+	defer cleanup()
+
+	sup.maybeRelaunchDegradedCDPChrome("playwright", entry)
+
+	if *calls != 0 {
+		t.Fatalf("non-CDP Playwright must not trigger Chrome launch, got %d calls", *calls)
+	}
+}
+
+func TestMaybeRelaunchDegradedCDPChrome_EnsureFails_StaysDegraded(t *testing.T) {
+	// On ensureChromeDebugPort error, state must stay Degraded — we don't
+	// fake healthy. The probe that runs immediately after will see Chrome
+	// still missing and the state will remain Degraded.
+	mgr := NewClientManager()
+	sup := NewSupervisor(mgr)
+	entry := &serverEntry{
+		config:            playwrightCDPConfig(),
+		health:            ServerHealth{State: StateDegraded, Since: time.Now()},
+		transportBackoff:  newBackoffState(10*time.Second, 5*time.Minute, 30*time.Minute),
+		capabilityBackoff: newBackoffState(10*time.Second, 5*time.Minute, 30*time.Minute),
+	}
+	sup.mu.Lock()
+	sup.servers["playwright"] = entry
+	sup.mu.Unlock()
+
+	oldReachable := cdpReachableFn
+	oldEnsure := ensureChromeDebugPortFn
+	defer func() {
+		cdpReachableFn = oldReachable
+		ensureChromeDebugPortFn = oldEnsure
+	}()
+	cdpReachableFn = func(int) bool { return false }
+	ensureChromeDebugPortFn = func(int) error { return fmt.Errorf("chrome launch failed") }
+
+	sup.maybeRelaunchDegradedCDPChrome("playwright", entry)
+
+	sup.mu.Lock()
+	state := entry.health.State
+	sup.mu.Unlock()
+	if state != StateDegraded {
+		t.Fatalf("expected state to remain Degraded on ensure failure, got %v", state)
+	}
+}
+
+func TestRunCapabilityProbe_PeriodicDegradedProbeDoesNotLaunchChrome(t *testing.T) {
+	sup, entry, calls, _, cleanup := newDegradedTestSup(t, "playwright", playwrightCDPConfig(), StateDegraded, false)
+	defer cleanup()
+
+	probe := &mockCapabilityProbe{result: ProbeResult{Degraded: true, Detail: "chrome missing"}}
+	sup.runCapabilityProbe(context.Background(), "playwright", entry, probe)
+
+	if *calls != 0 {
+		t.Fatalf("periodic degraded probe must not launch Chrome without user activity, got %d calls", *calls)
+	}
+}
+
+func TestSupervisorProbeNow_DegradedPlaywrightRelaunchesChrome(t *testing.T) {
+	mgr := NewClientManager()
+	mgr.mu.Lock()
+	mgr.configs["playwright"] = playwrightCDPConfig()
+	mgr.mu.Unlock()
+
+	sup := NewSupervisor(mgr)
+	sup.transportInterval = time.Hour
+	sup.capabilityInterval = time.Hour
+	sup.RegisterCapabilityProbe("playwright", &mockCapabilityProbe{})
+
+	oldReachable := cdpReachableFn
+	oldEnsure := ensureChromeDebugPortFn
+	defer func() {
+		cdpReachableFn = oldReachable
+		ensureChromeDebugPortFn = oldEnsure
+	}()
+	calls := 0
+	port := -1
+	cdpReachableFn = func(int) bool { return false }
+	ensureChromeDebugPortFn = func(p int) error {
+		calls++
+		port = p
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sup.Start(ctx)
+	defer sup.Stop()
+
+	mgr.mu.Lock()
+	mgr.clients["playwright"] = &fakeListToolsClient{}
+	mgr.mu.Unlock()
+
+	sup.mu.Lock()
+	entry := sup.servers["playwright"]
+	entry.health.State = StateDegraded
+	entry.health.Since = time.Now()
+	sup.mu.Unlock()
+
+	health := sup.ProbeNow("playwright")
+	if health.State != StateHealthy {
+		t.Fatalf("expected explicit ProbeNow to recover to healthy, got %v", health.State)
+	}
+	if calls != 1 {
+		t.Fatalf("expected explicit ProbeNow to launch Chrome once, got %d calls", calls)
+	}
+	if port != 9223 {
+		t.Fatalf("expected port 9223, got %d", port)
 	}
 }

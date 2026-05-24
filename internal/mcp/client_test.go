@@ -46,6 +46,10 @@ func TestIsPlaywrightCDPMode(t *testing.T) {
 	if !IsPlaywrightCDPMode(cfg) {
 		t.Fatal("expected CDP mode to be detected")
 	}
+	cfg.Args = []string{"--cdp-endpoint=http://localhost:9222"}
+	if !IsPlaywrightCDPMode(cfg) {
+		t.Fatal("expected combined CDP endpoint flag to be detected")
+	}
 
 	cfg.Args = []string{"--browser", "chrome"}
 	if IsPlaywrightCDPMode(cfg) {
@@ -59,6 +63,15 @@ func TestNormalizePlaywrightCDPConfig_MigratesLegacyLocalhostPort(t *testing.T) 
 	want := "http://127.0.0.1:9223"
 	if normalized.Args[1] != want {
 		t.Fatalf("expected %s, got %s", want, normalized.Args[1])
+	}
+}
+
+func TestNormalizePlaywrightCDPConfig_MigratesCombinedLegacyLocalhostPort(t *testing.T) {
+	cfg := MCPServerConfig{Args: []string{"--cdp-endpoint=http://localhost:9222", "--caps", "vision,pdf"}}
+	normalized := NormalizePlaywrightCDPConfig(cfg)
+	want := "--cdp-endpoint=http://127.0.0.1:9223"
+	if normalized.Args[0] != want {
+		t.Fatalf("expected %s, got %s", want, normalized.Args[0])
 	}
 }
 
@@ -80,6 +93,11 @@ func TestPlaywrightCDPPort(t *testing.T) {
 	cfg = NormalizePlaywrightCDPConfig(cfg)
 	if got := PlaywrightCDPPort(cfg); got != DefaultCDPPort {
 		t.Fatalf("expected default dedicated port %d, got %d", DefaultCDPPort, got)
+	}
+
+	cfg = MCPServerConfig{Args: []string{"--cdp-endpoint=http://127.0.0.1:9444"}}
+	if got := PlaywrightCDPPort(cfg); got != 9444 {
+		t.Fatalf("expected combined flag port 9444, got %d", got)
 	}
 }
 

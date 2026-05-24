@@ -117,7 +117,7 @@ func TestPinchtab_Snapshot(t *testing.T) {
 	defer tool.Cleanup()
 
 	// Navigate first to get a tabID
-	result, err := tool.Run(context.Background(), `{"action":"navigate","url":"https://example.com"}`)
+	result, err := tool.Run(context.Background(), `{"action":"navigate","url":"https://example.com","description":"test"}`)
 	if err != nil {
 		t.Fatalf("navigate error: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestPinchtab_Snapshot(t *testing.T) {
 	}
 
 	// Snapshot
-	result, err = tool.Run(context.Background(), `{"action":"snapshot","filter":"interactive"}`)
+	result, err = tool.Run(context.Background(), `{"action":"snapshot","filter":"interactive","description":"test"}`)
 	if err != nil {
 		t.Fatalf("snapshot error: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestPinchtab_Find(t *testing.T) {
 	tool := newToolWithFakePinchtab(t, srv)
 	defer tool.Cleanup()
 
-	result, err := tool.Run(context.Background(), `{"action":"find","query":"submit button"}`)
+	result, err := tool.Run(context.Background(), `{"action":"find","query":"submit button","description":"test"}`)
 	if err != nil {
 		t.Fatalf("find error: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestPinchtab_ClickByRef(t *testing.T) {
 	tool := newToolWithFakePinchtab(t, srv)
 	defer tool.Cleanup()
 
-	result, err := tool.Run(context.Background(), `{"action":"click","ref":"e1"}`)
+	result, err := tool.Run(context.Background(), `{"action":"click","ref":"e1","description":"test"}`)
 	if err != nil {
 		t.Fatalf("click error: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestPinchtab_ClickWithKey(t *testing.T) {
 	defer tool.Cleanup()
 
 	// click with key should dispatch as "press" kind
-	result, err := tool.Run(context.Background(), `{"action":"click","ref":"e2","key":"Enter"}`)
+	result, err := tool.Run(context.Background(), `{"action":"click","ref":"e2","key":"Enter","description":"test"}`)
 	if err != nil {
 		t.Fatalf("click+key error: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestPinchtab_ClickWithValue(t *testing.T) {
 	defer tool.Cleanup()
 
 	// click with value should dispatch as "select" kind
-	result, err := tool.Run(context.Background(), `{"action":"click","ref":"e2","value":"option1"}`)
+	result, err := tool.Run(context.Background(), `{"action":"click","ref":"e2","value":"option1","description":"test"}`)
 	if err != nil {
 		t.Fatalf("click+value error: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestPinchtab_ScreenshotFeedsVision(t *testing.T) {
 	tool := newToolWithFakePinchtab(t, srv)
 	defer tool.Cleanup()
 
-	result, err := tool.Run(context.Background(), `{"action":"screenshot"}`)
+	result, err := tool.Run(context.Background(), `{"action":"screenshot","description":"test"}`)
 	if err != nil {
 		t.Fatalf("screenshot error: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestPinchtab_CloseAfterServerDies(t *testing.T) {
 	srv.Close()
 
 	// close should not panic, should report success
-	result, err := tool.Run(context.Background(), `{"action":"close"}`)
+	result, err := tool.Run(context.Background(), `{"action":"close","description":"test"}`)
 	if err != nil {
 		t.Fatalf("close error: %v", err)
 	}
@@ -341,15 +341,18 @@ func TestPinchtab_CloseWhenPinchtabNeverStarted(t *testing.T) {
 		pt: newPinchtabClient(),
 	}
 
-	result, err := tool.Run(context.Background(), `{"action":"close"}`)
+	result, err := tool.Run(context.Background(), `{"action":"close","description":"test"}`)
 	if err != nil {
 		t.Fatalf("close error: %v", err)
 	}
 	if result.IsError {
 		t.Errorf("expected clean close, got error: %s", result.Content)
 	}
-	if !contains(result.Content, "not running") {
-		t.Errorf("expected 'not running', got: %s", result.Content)
+	// closeBrowser uniformly reports "Browser closed" — see
+	// TestBrowser_CloseWhenNotRunning for the rationale behind dropping the
+	// "not running" pre-check.
+	if !contains(result.Content, "Browser closed") {
+		t.Errorf("expected 'Browser closed', got: %s", result.Content)
 	}
 }
 
@@ -434,7 +437,7 @@ func TestPinchtab_NavigateParamsForwarded(t *testing.T) {
 	tool := newToolWithFakePinchtab(t, srv)
 	defer tool.Cleanup()
 
-	result, err := tool.Run(context.Background(), `{"action":"navigate","url":"https://example.com","blockImages":true,"blockAds":true,"waitFor":"networkidle","waitSelector":"#content"}`)
+	result, err := tool.Run(context.Background(), `{"action":"navigate","url":"https://example.com","blockImages":true,"blockAds":true,"waitFor":"networkidle","waitSelector":"#content","description":"test"}`)
 	if err != nil {
 		t.Fatalf("navigate error: %v", err)
 	}
@@ -490,11 +493,11 @@ func TestPinchtab_ReadPageParamsForwarded(t *testing.T) {
 	tool := newToolWithFakePinchtab(t, srv)
 	defer tool.Cleanup()
 
-	if _, err := tool.Run(context.Background(), `{"action":"navigate","url":"https://example.com"}`); err != nil {
+	if _, err := tool.Run(context.Background(), `{"action":"navigate","url":"https://example.com","description":"test"}`); err != nil {
 		t.Fatalf("navigate error: %v", err)
 	}
 
-	result, err := tool.Run(context.Background(), `{"action":"read_page","textMode":"raw","maxChars":123}`)
+	result, err := tool.Run(context.Background(), `{"action":"read_page","textMode":"raw","maxChars":123,"description":"test"}`)
 	if err != nil {
 		t.Fatalf("read_page error: %v", err)
 	}

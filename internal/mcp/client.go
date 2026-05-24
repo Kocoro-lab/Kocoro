@@ -579,12 +579,8 @@ func BuildContext(servers map[string]MCPServerConfig) string {
 
 // IsPlaywrightCDPMode reports whether the args include --cdp-endpoint.
 func IsPlaywrightCDPMode(cfg MCPServerConfig) bool {
-	for _, arg := range cfg.Args {
-		if arg == "--cdp-endpoint" {
-			return true
-		}
-	}
-	return false
+	_, ok := playwrightCDPEndpointArg(cfg)
+	return ok
 }
 
 // NormalizePlaywrightCDPConfig migrates legacy localhost:9222 configs to the
@@ -594,39 +590,53 @@ func NormalizePlaywrightCDPConfig(cfg MCPServerConfig) MCPServerConfig {
 		return cfg
 	}
 	args := append([]string(nil), cfg.Args...)
-	for i := 0; i < len(args)-1; i++ {
-		if args[i] != "--cdp-endpoint" {
-			continue
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--cdp-endpoint" && i+1 < len(args):
+			args[i+1] = normalizePlaywrightCDPEndpoint(args[i+1])
+			cfg.Args = args
+			return cfg
+		case strings.HasPrefix(args[i], "--cdp-endpoint="):
+			raw := strings.TrimPrefix(args[i], "--cdp-endpoint=")
+			args[i] = "--cdp-endpoint=" + normalizePlaywrightCDPEndpoint(raw)
+			cfg.Args = args
+			return cfg
 		}
-		args[i+1] = normalizePlaywrightCDPEndpoint(args[i+1])
-		break
 	}
 	cfg.Args = args
 	return cfg
 }
 
+func playwrightCDPEndpointArg(cfg MCPServerConfig) (string, bool) {
+	for i, arg := range cfg.Args {
+		if arg == "--cdp-endpoint" {
+			if i+1 < len(cfg.Args) {
+				return cfg.Args[i+1], true
+			}
+			return "", true
+		}
+		if strings.HasPrefix(arg, "--cdp-endpoint=") {
+			return strings.TrimPrefix(arg, "--cdp-endpoint="), true
+		}
+	}
+	return "", false
+}
+
 // PlaywrightCDPPort extracts the configured CDP port, defaulting to the
 // daemon-owned dedicated port when absent or invalid.
 func PlaywrightCDPPort(cfg MCPServerConfig) int {
-	if !IsPlaywrightCDPMode(cfg) {
+	endpoint, ok := playwrightCDPEndpointArg(cfg)
+	if !ok {
 		return DefaultCDPPort
 	}
-	// Stop at len-1 so a malformed trailing "--cdp-endpoint" without a value
-	// safely falls back to the dedicated default instead of misparsing args.
-	for i := 0; i < len(cfg.Args)-1; i++ {
-		if cfg.Args[i] != "--cdp-endpoint" {
-			continue
-		}
-		u, err := url.Parse(cfg.Args[i+1])
-		if err != nil {
-			return DefaultCDPPort
-		}
-		if port := u.Port(); port != "" {
-			if n, err := strconv.Atoi(port); err == nil && n > 0 {
-				return n
-			}
-		}
+	u, err := url.Parse(endpoint)
+	if err != nil {
 		return DefaultCDPPort
+	}
+	if port := u.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err == nil && n > 0 {
+			return n
+		}
 	}
 	return DefaultCDPPort
 }
