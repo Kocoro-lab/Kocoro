@@ -472,3 +472,42 @@ func TestBrowserToolRun_InvalidArgsSkipsLease(t *testing.T) {
 		t.Fatalf("invalid args must not mark the lease, got count %d", got)
 	}
 }
+
+func TestBrowserUseLease_MarkUsedWith_CapturesOwner(t *testing.T) {
+	tr := &browserUseTracker{}
+	bt := &BrowserTool{}
+	lease := newBrowserUseLeaseWithTracker(tr)
+	lease.MarkUsedWith(bt)
+	if got := lease.Owner(); got != bt {
+		t.Fatalf("Owner() = %v, want %v", got, bt)
+	}
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("global count = %d, want 1", got)
+	}
+	if got := tr.ownerActiveCount(bt); got != 1 {
+		t.Fatalf("owner count = %d, want 1", got)
+	}
+}
+
+func TestBrowserUseLease_MarkUsedWith_IdempotentOnSameLease(t *testing.T) {
+	tr := &browserUseTracker{}
+	bt := &BrowserTool{}
+	lease := newBrowserUseLeaseWithTracker(tr)
+	lease.MarkUsedWith(bt)
+	lease.MarkUsedWith(bt)
+	if got := tr.ownerActiveCount(bt); got != 1 {
+		t.Fatalf("owner count = %d, want 1 after second MarkUsedWith on same lease", got)
+	}
+}
+
+func TestBrowserOwnerActiveCount_AcrossLeases(t *testing.T) {
+	tr := &browserUseTracker{}
+	bt := &BrowserTool{}
+	leaseA := newBrowserUseLeaseWithTracker(tr)
+	leaseB := newBrowserUseLeaseWithTracker(tr)
+	leaseA.MarkUsedWith(bt)
+	leaseB.MarkUsedWith(bt)
+	if got := tr.ownerActiveCount(bt); got != 2 {
+		t.Fatalf("owner count = %d, want 2", got)
+	}
+}
