@@ -363,8 +363,9 @@ func (h *mockHandler) OnApprovalNeeded(tool string, args string) bool {
 
 type usageRecordingHandler struct {
 	mockHandler
-	mu     sync.Mutex
-	deltas []TurnUsage
+	mu           sync.Mutex
+	deltas       []TurnUsage
+	statusEvents []recordedStatus
 }
 
 func (h *usageRecordingHandler) OnUsage(usage TurnUsage) {
@@ -373,11 +374,30 @@ func (h *usageRecordingHandler) OnUsage(usage TurnUsage) {
 	h.deltas = append(h.deltas, usage)
 }
 
+// OnRunStatus makes usageRecordingHandler satisfy RunStatusHandler so the
+// `a.handler.(RunStatusHandler)` type assertion in loop.go succeeds in
+// tests. Without this, the upstream_inconsistent_finish emit is a silent
+// no-op in tests and events.md's public promise of an observable event
+// has no test backing it.
+func (h *usageRecordingHandler) OnRunStatus(code, detail string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.statusEvents = append(h.statusEvents, recordedStatus{code: code, detail: detail})
+}
+
 func (h *usageRecordingHandler) UsageDeltas() []TurnUsage {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	out := make([]TurnUsage, len(h.deltas))
 	copy(out, h.deltas)
+	return out
+}
+
+func (h *usageRecordingHandler) StatusEvents() []recordedStatus {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]recordedStatus, len(h.statusEvents))
+	copy(out, h.statusEvents)
 	return out
 }
 
@@ -5652,6 +5672,23 @@ func TestAgentLoop_InconsistentFinish_ToolUseWithoutBlock_RetriesAndRecovers(t *
 	}
 	if deltas[1].InputTokens != 100 || deltas[1].OutputTokens != 5 || deltas[1].LLMCalls != 1 {
 		t.Errorf("second usage delta should be recovery response usage, got %+v", deltas[1])
+	}
+
+	// events.md:102 promises that `upstream_inconsistent_finish` is observable
+	// on the run-status stream. Pin that the OnRunStatus emit actually fires —
+	// without this, a future refactor that drops the emit (e.g. moving it
+	// behind a feature flag, removing the type assertion) leaves the public
+	// contract silently broken while tests stay green.
+	statusEvents := handler.StatusEvents()
+	if len(statusEvents) != 1 {
+		t.Fatalf("recovery must emit exactly 1 upstream_inconsistent_finish event, got %d: %+v",
+			len(statusEvents), statusEvents)
+	}
+	if statusEvents[0].code != "upstream_inconsistent_finish" {
+		t.Errorf("status event code should be upstream_inconsistent_finish, got %q", statusEvents[0].code)
+	}
+	if strings.TrimSpace(statusEvents[0].detail) == "" {
+		t.Errorf("status event detail should be a non-empty English fallback, got %q", statusEvents[0].detail)
 	}
 
 	// Audit row attribution: post-incident triage needs to distinguish
