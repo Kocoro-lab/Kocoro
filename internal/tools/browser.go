@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chromedp/chromedp"
@@ -39,6 +40,13 @@ type BrowserTool struct {
 	cancel          context.CancelFunc
 	chromedpDataDir string
 	active          bool
+
+	deprecated atomic.Bool // set by reload handoff; consulted by register.go cleanup gate
+
+	// Test-only observability counters; production code never reads them.
+	// Pattern mirrors cleanupOrphanedChromedpCalledForTest in Task 8.
+	cleanupCalledForTest         atomic.Int32 // incremented at top of Cleanup
+	cleanupChromedpCalledForTest atomic.Int32 // incremented at top of CleanupChromedp
 }
 
 // ensureBackendFn is the indirection that BrowserTool.Run uses to set up the
@@ -311,6 +319,7 @@ func (t *BrowserTool) isPinchtab() bool {
 // the up-to-3s poll loop. The lease's tracker.mu is what serializes a fresh
 // MarkUsed against an in-flight teardown.
 func (t *BrowserTool) CleanupChromedp() error {
+	t.cleanupChromedpCalledForTest.Add(1)
 	var dataDir string
 	t.mu.Lock()
 	if t.backend == backendChromedp {
@@ -906,6 +915,7 @@ func (t *BrowserTool) closeBrowser(ctx context.Context) (agent.ToolResult, error
 
 // Cleanup shuts down the browser. Safe to call multiple times.
 func (t *BrowserTool) Cleanup() {
+	t.cleanupCalledForTest.Add(1)
 	_ = t.cleanupAll()
 }
 
@@ -934,6 +944,32 @@ func (t *BrowserTool) cleanupAll() error {
 		return nil
 	}
 	return killChromedpChromeForDirFn(dataDir)
+}
+
+// MarkDeprecated flags this BrowserTool as superseded by reload. The
+// registration-time cleanup func skips browser.Cleanup() for deprecated
+// instances; the per-owner lease teardown path is the cleanup driver instead.
+// Idempotent.
+func (t *BrowserTool) MarkDeprecated() {
+	t.deprecated.Store(true)
+}
+
+// IsDeprecated reports whether this BrowserTool has been superseded by a
+// reload-time handoff.
+func (t *BrowserTool) IsDeprecated() bool {
+	return t.deprecated.Load()
+}
+
+// CleanupCalledForTest returns the number of times Cleanup has been called.
+// Test-only accessor.
+func (t *BrowserTool) CleanupCalledForTest() int32 {
+	return t.cleanupCalledForTest.Load()
+}
+
+// CleanupChromedpCalledForTest returns the number of times CleanupChromedp
+// has been called. Test-only accessor.
+func (t *BrowserTool) CleanupChromedpCalledForTest() int32 {
+	return t.cleanupChromedpCalledForTest.Load()
 }
 
 const (

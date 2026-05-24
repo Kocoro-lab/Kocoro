@@ -365,3 +365,18 @@ func TestChromedpOrphanPattern_MatchesBothPrefixes(t *testing.T) {
 		}
 	}
 }
+
+func TestBrowserTool_Deprecated_Idempotent(t *testing.T) {
+	bt := &BrowserTool{}
+	if bt.IsDeprecated() {
+		t.Fatalf("fresh BrowserTool must not be deprecated")
+	}
+	bt.MarkDeprecated()
+	if !bt.IsDeprecated() {
+		t.Fatalf("MarkDeprecated did not set the flag")
+	}
+	bt.MarkDeprecated() // idempotent
+	if !bt.IsDeprecated() {
+		t.Fatalf("second MarkDeprecated must remain true")
+	}
+}
