@@ -85,13 +85,13 @@ func TestMarkBrowserUsed_ViaContextLease(t *testing.T) {
 	lease := newBrowserUseLeaseWithTracker(tr)
 	ctx := context.WithValue(context.Background(), browserLeaseKey{}, lease)
 
-	MarkBrowserUsed(ctx)
+	MarkBrowserUsed(ctx, &BrowserTool{})
 	if got := tr.activeCount(); got != 1 {
 		t.Fatalf("expected count 1 after MarkBrowserUsed, got %d", got)
 	}
 
 	// MarkBrowserUsed on a ctx without a lease is a safe no-op.
-	MarkBrowserUsed(context.Background())
+	MarkBrowserUsed(context.Background(), nil)
 	if got := tr.activeCount(); got != 1 {
 		t.Fatalf("expected count still 1, got %d", got)
 	}
@@ -373,12 +373,14 @@ func TestBrowserToolRun_CloseSkipsWhenAnotherRunActive(t *testing.T) {
 	}
 
 	tr := &browserUseTracker{}
+	bt := &BrowserTool{backend: backendChromedp, chromedpDataDir: "/tmp/kocoro-owned-profile"}
 	leaseA := newBrowserUseLeaseWithTracker(tr)
 	leaseB := newBrowserUseLeaseWithTracker(tr)
-	leaseB.MarkUsed()
+	// leaseB simulates a concurrent Run on the same *BrowserTool instance — it
+	// must use the same owner so the per-owner gate in TeardownIfOnlyUser fires.
+	leaseB.MarkUsedWith(bt)
 	ctx := context.WithValue(context.Background(), browserLeaseKey{}, leaseA)
 
-	bt := &BrowserTool{backend: backendChromedp, chromedpDataDir: "/tmp/kocoro-owned-profile"}
 	result, err := bt.Run(ctx, `{"action":"close","description":"test"}`)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)

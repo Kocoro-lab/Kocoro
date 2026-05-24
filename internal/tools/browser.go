@@ -144,7 +144,7 @@ func (t *BrowserTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	// We always mark (even when pinchtab will be chosen) — the teardown
 	// callback is CleanupChromedp, which is a no-op on non-chromedp backends.
 	// Cost is one extra tracker.mu round-trip per pinchtab Run.
-	MarkBrowserUsed(ctx)
+	MarkBrowserUsed(ctx, t)
 
 	// close doesn't need to start a backend, but it must still participate in
 	// the lease so it cannot tear down Chrome while another Run is using it.

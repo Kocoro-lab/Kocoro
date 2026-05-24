@@ -68,8 +68,9 @@ func (l *BrowserUseLease) MarkUsed() {
 }
 
 // MarkUsedWith acquires the lease and captures the BrowserTool that this Run
-// uses. Idempotent on the same lease. owner is required — pass the *BrowserTool
-// whose CleanupChromedp will be used for teardown.
+// uses. Idempotent on the same lease. owner may be nil for test/no-op callers —
+// a nil owner still bumps the global count but does not touch tracker.owners
+// (avoids panic on nil-map write and avoids polluting the map with a nil key).
 func (l *BrowserUseLease) MarkUsedWith(owner *BrowserTool) {
 	if l == nil {
 		return
@@ -80,10 +81,12 @@ func (l *BrowserUseLease) MarkUsedWith(owner *BrowserTool) {
 		return
 	}
 	l.tracker.count++
-	if l.tracker.owners == nil {
-		l.tracker.owners = make(map[*BrowserTool]int)
+	if owner != nil {
+		if l.tracker.owners == nil {
+			l.tracker.owners = make(map[*BrowserTool]int)
+		}
+		l.tracker.owners[owner]++
 	}
-	l.tracker.owners[owner]++
 	l.acquired = true
 	l.owner = owner
 }
@@ -218,10 +221,10 @@ func BrowserUseLeaseFrom(ctx context.Context) *BrowserUseLease {
 }
 
 // MarkBrowserUsed marks the lease on ctx as having used the chromedp Chrome
-// this Run. No-op when ctx carries no lease. Idempotent via the lease state
-// machine.
-func MarkBrowserUsed(ctx context.Context) {
-	BrowserUseLeaseFrom(ctx).MarkUsed()
+// this Run AND captures the *BrowserTool owner for per-owner-aware teardown.
+// No-op when ctx carries no lease. Idempotent via the lease state machine.
+func MarkBrowserUsed(ctx context.Context, owner *BrowserTool) {
+	BrowserUseLeaseFrom(ctx).MarkUsedWith(owner)
 }
 
 // GlobalBrowserTrackerActiveCountForTest exposes the global tracker count for
