@@ -22,7 +22,7 @@ func TestCleanupBrowserToolAfterTurn_UsesLeaseOwnerNotRegistry(t *testing.T) {
 	ctx := tools.WithBrowserUseLease(context.Background())
 	tools.MarkBrowserUsed(ctx, oldBT)
 
-	cleanupBrowserToolAfterTurn(ctx, reg)
+	cleanupBrowserToolAfterTurn(ctx)
 
 	// OBSERVABLE assertion: OLD's CleanupChromedp was called; NEW's was not.
 	// Counters added on BrowserTool in Task 5 make this directly checkable.
@@ -49,7 +49,7 @@ func TestCleanupBrowserToolAfterTurn_DeprecatedOwnerCallsFullCleanup(t *testing.
 	ctx := tools.WithBrowserUseLease(context.Background())
 	tools.MarkBrowserUsed(ctx, oldBT)
 
-	cleanupBrowserToolAfterTurn(ctx, nil)
+	cleanupBrowserToolAfterTurn(ctx)
 
 	if got := oldBT.CleanupCalledForTest(); got != 1 {
 		t.Fatalf("deprecated OLD must hit full Cleanup() once; got %d", got)
@@ -64,6 +64,6 @@ func TestCleanupBrowserToolAfterTurn_NilOwnerReleasesOnly(t *testing.T) {
 	// no browser activity this turn. Cleanup is no-op; ReleaseOnly keeps
 	// the counter sane.
 	ctx := tools.WithBrowserUseLease(context.Background())
-	cleanupBrowserToolAfterTurn(ctx, nil)
+	cleanupBrowserToolAfterTurn(ctx)
 	// No panic, no allocations beyond release.
 }

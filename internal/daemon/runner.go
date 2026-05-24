@@ -891,8 +891,7 @@ func cleanupPlaywrightAfterTurn(ctx context.Context, mgr *mcp.ClientManager) {
 // the local chromedp fallback used when Playwright MCP isn't healthy. Has no
 // effect when the Run didn't touch the chromedp backend or when the tool isn't
 // in the registry (Playwright connected at startup and removed it).
-func cleanupBrowserToolAfterTurn(ctx context.Context, reg *agent.ToolRegistry) {
-	_ = reg // retained for signature compat; cleanup now uses lease.Owner()
+func cleanupBrowserToolAfterTurn(ctx context.Context) {
 	lease := tools.BrowserUseLeaseFrom(ctx)
 	if lease == nil {
 		return
@@ -1051,9 +1050,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	ctx = mcp.WithChromeUseLease(ctx)
 	ctx = tools.WithBrowserUseLease(ctx)
 	defer func() {
-		reg, _, _, mgr := deps.RebuildLayers()
+		_, _, _, mgr := deps.RebuildLayers()
 		cleanupPlaywrightAfterTurn(ctx, mgr)
-		cleanupBrowserToolAfterTurn(ctx, reg)
+		cleanupBrowserToolAfterTurn(ctx)
 	}()
 	if sup != nil {
 		// Cancel any pending idle disconnect — a new turn is starting.
