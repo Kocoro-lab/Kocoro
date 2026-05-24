@@ -306,6 +306,8 @@ func (t *BrowserTool) startChromedp() error {
 }
 
 func (t *BrowserTool) isPinchtab() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return t.backend == backendPinchtab
 }
 

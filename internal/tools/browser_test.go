@@ -380,3 +380,25 @@ func TestBrowserTool_Deprecated_Idempotent(t *testing.T) {
 		t.Fatalf("second MarkDeprecated must remain true")
 	}
 }
+
+func TestBrowserTool_IsPinchtab_NoRaceWithCleanup(t *testing.T) {
+	// Run repeatedly under -race to verify isPinchtab no longer reads
+	// t.backend without holding t.mu.
+	bt := &BrowserTool{backend: backendChromedp}
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 1000; i++ {
+			_ = bt.isPinchtab()
+		}
+		done <- struct{}{}
+	}()
+	for i := 0; i < 1000; i++ {
+		bt.mu.Lock()
+		bt.backend = backendNone
+		bt.mu.Unlock()
+		bt.mu.Lock()
+		bt.backend = backendChromedp
+		bt.mu.Unlock()
+	}
+	<-done
+}
