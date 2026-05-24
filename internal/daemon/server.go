@@ -4169,7 +4169,8 @@ func mcpConfigChanged(oldCfg, newCfg *config.Config) bool {
 		}
 		if oldSrv.Command != newSrv.Command || oldSrv.Type != newSrv.Type ||
 			oldSrv.URL != newSrv.URL || oldSrv.Disabled != newSrv.Disabled ||
-			oldSrv.Context != newSrv.Context || !slices.Equal(oldSrv.Args, newSrv.Args) ||
+			oldSrv.Context != newSrv.Context || oldSrv.KeepAlive != newSrv.KeepAlive ||
+			!slices.Equal(oldSrv.Args, newSrv.Args) ||
 			!maps.Equal(oldSrv.Env, newSrv.Env) {
 			return true
 		}
