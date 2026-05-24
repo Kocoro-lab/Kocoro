@@ -4178,6 +4178,17 @@ func mcpConfigChanged(oldCfg, newCfg *config.Config) bool {
 	return false
 }
 
+// oldBrowserCleanupBackstop bounds how long a deprecated BrowserTool can
+// linger before the reload handler logs a structured warning.
+//
+// Workload: reload during in-flight browser run where the lease is still
+// legitimately active after this duration.
+// Symptom when binds: structured warn log via log.Printf; no behavior change
+// (does NOT call Cleanup, which would kill in-flight work).
+// Override path: viper.SetDefault("daemon.browser_reload_backstop_secs", 120)
+// reserved for operator override; not exposed today.
+const oldBrowserCleanupBackstop = 120 * time.Second
+
 func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	oldCfg, _, _ := s.deps.Snapshot()
 
