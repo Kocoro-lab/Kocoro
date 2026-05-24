@@ -120,7 +120,9 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	}
 
 	cleanup := func() {
-		browser.Cleanup()
+		if !browser.IsDeprecated() {
+			browser.Cleanup()
+		}
 		axClient.Close()
 	}
 	return reg, skillsPtr, cleanup
@@ -356,7 +358,6 @@ func RegisterAllWithBaseline(gw *client.GatewayClient, cfg *config.Config, agent
 	cleanup func(),
 	err error,
 ) {
-	CleanupOrphanedChromedp()
 	localReg, sp, baseCleanup := RegisterLocalTools(cfg, nil)
 	baseline = localReg
 
@@ -379,9 +380,6 @@ func RegisterAllWithBaseline(gw *client.GatewayClient, cfg *config.Config, agent
 // If agentDef is non-nil, tool filtering and MCP scoping are applied per-agent.
 // The returned cleanup function must be called on shutdown.
 func RegisterAll(gw *client.GatewayClient, cfg *config.Config, agentDef ...*agents.Agent) (*agent.ToolRegistry, *[]*skills.Skill, *mcp.ClientManager, func(), error) {
-	// Kill any orphaned chromedp Chrome processes from previous daemon runs
-	CleanupOrphanedChromedp()
-
 	reg, skillsPtr, baseCleanup := RegisterLocalTools(cfg, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

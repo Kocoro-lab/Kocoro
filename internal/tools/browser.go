@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chromedp/chromedp"
@@ -39,6 +40,12 @@ type BrowserTool struct {
 	cancel          context.CancelFunc
 	chromedpDataDir string
 	active          bool
+
+	deprecated atomic.Bool // set by reload handoff; consulted by register.go cleanup gate
+
+	// Test-only observability counters; production code never reads them.
+	cleanupCalledForTest         atomic.Int32 // incremented at top of Cleanup
+	cleanupChromedpCalledForTest atomic.Int32 // incremented at top of CleanupChromedp
 }
 
 // ensureBackendFn is the indirection that BrowserTool.Run uses to set up the
@@ -144,7 +151,7 @@ func (t *BrowserTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	// We always mark (even when pinchtab will be chosen) — the teardown
 	// callback is CleanupChromedp, which is a no-op on non-chromedp backends.
 	// Cost is one extra tracker.mu round-trip per pinchtab Run.
-	MarkBrowserUsed(ctx)
+	MarkBrowserUsed(ctx, t)
 
 	// close doesn't need to start a backend, but it must still participate in
 	// the lease so it cannot tear down Chrome while another Run is using it.
@@ -299,7 +306,25 @@ func (t *BrowserTool) startChromedp() error {
 }
 
 func (t *BrowserTool) isPinchtab() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return t.backend == backendPinchtab
+}
+
+// snapshotChromedpCtx returns the chromedp browser context iff the backend is
+// currently chromedp. When ok=false, no chromedp session is active and callers
+// must surface a tool error rather than dereferencing browserCtx.
+//
+// Defense-in-depth: callers can already rely on the per-owner lease pattern,
+// but this helper closes the window between ensureBackend's t.mu release and
+// the action's t.ctx read.
+func (t *BrowserTool) snapshotChromedpCtx() (browserCtx context.Context, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.backend != backendChromedp || t.ctx == nil {
+		return nil, false
+	}
+	return t.ctx, true
 }
 
 // CleanupChromedp tears down only the chromedp backend, leaving pinchtab (a
@@ -311,6 +336,7 @@ func (t *BrowserTool) isPinchtab() bool {
 // the up-to-3s poll loop. The lease's tracker.mu is what serializes a fresh
 // MarkUsed against an in-flight teardown.
 func (t *BrowserTool) CleanupChromedp() error {
+	t.cleanupChromedpCalledForTest.Add(1)
 	var dataDir string
 	t.mu.Lock()
 	if t.backend == backendChromedp {
@@ -390,7 +416,11 @@ func (t *BrowserTool) navigate(_ context.Context, args browserArgs, timeout time
 	}
 
 	// chromedp
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 
 	var title, textContent string
@@ -439,7 +469,11 @@ func (t *BrowserTool) click(_ context.Context, args browserArgs, timeout time.Du
 	if args.Selector == "" {
 		return agent.ToolResult{Content: "chromedp fallback requires 'selector' (refs not supported without pinchtab)", IsError: true}, nil
 	}
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 	if err := chromedp.Run(tCtx, chromedp.Click(args.Selector)); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("click error: %v", err), IsError: true}, nil
@@ -467,7 +501,11 @@ func (t *BrowserTool) typeText(_ context.Context, args browserArgs, timeout time
 	if args.Selector == "" {
 		return agent.ToolResult{Content: "chromedp fallback requires 'selector'", IsError: true}, nil
 	}
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 	if err := chromedp.Run(tCtx, chromedp.SendKeys(args.Selector, args.Text)); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("type error: %v", err), IsError: true}, nil
@@ -498,7 +536,11 @@ func (t *BrowserTool) scroll(_ context.Context, args browserArgs, timeout time.D
 	}
 
 	// chromedp
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 
 	if args.Selector != "" {
@@ -550,7 +592,11 @@ func (t *BrowserTool) screenshot(_ context.Context, _ browserArgs, timeout time.
 	}
 
 	// chromedp
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 
 	var buf []byte
@@ -633,7 +679,11 @@ func (t *BrowserTool) readPage(_ context.Context, args browserArgs, timeout time
 	}
 
 	// chromedp
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 
 	selector := "html"
@@ -688,7 +738,11 @@ func (t *BrowserTool) executeJS(_ context.Context, args browserArgs, timeout tim
 	// author can write natural multi-statement JS.
 	script := wrapJSForEvaluate(args.Script)
 
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 
 	var result any
@@ -727,7 +781,11 @@ func (t *BrowserTool) waitVisible(_ context.Context, args browserArgs, timeout t
 	}
 
 	// chromedp
-	tCtx, cancel := context.WithTimeout(t.ctx, timeout)
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return agent.ToolResult{Content: "browser context unavailable", IsError: true}, nil
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
 	defer cancel()
 	if err := chromedp.Run(tCtx, chromedp.WaitVisible(args.Selector)); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("wait error: %v", err), IsError: true}, nil
@@ -906,6 +964,7 @@ func (t *BrowserTool) closeBrowser(ctx context.Context) (agent.ToolResult, error
 
 // Cleanup shuts down the browser. Safe to call multiple times.
 func (t *BrowserTool) Cleanup() {
+	t.cleanupCalledForTest.Add(1)
 	_ = t.cleanupAll()
 }
 
@@ -934,6 +993,32 @@ func (t *BrowserTool) cleanupAll() error {
 		return nil
 	}
 	return killChromedpChromeForDirFn(dataDir)
+}
+
+// MarkDeprecated flags this BrowserTool as superseded by reload. The
+// registration-time cleanup func skips browser.Cleanup() for deprecated
+// instances; the per-owner lease teardown path is the cleanup driver instead.
+// Idempotent.
+func (t *BrowserTool) MarkDeprecated() {
+	t.deprecated.Store(true)
+}
+
+// IsDeprecated reports whether this BrowserTool has been superseded by a
+// reload-time handoff.
+func (t *BrowserTool) IsDeprecated() bool {
+	return t.deprecated.Load()
+}
+
+// CleanupCalledForTest returns the number of times Cleanup has been called.
+// Test-only accessor.
+func (t *BrowserTool) CleanupCalledForTest() int32 {
+	return t.cleanupCalledForTest.Load()
+}
+
+// CleanupChromedpCalledForTest returns the number of times CleanupChromedp
+// has been called. Test-only accessor.
+func (t *BrowserTool) CleanupChromedpCalledForTest() int32 {
+	return t.cleanupChromedpCalledForTest.Load()
 }
 
 const (
@@ -1026,6 +1111,10 @@ func waitChromedpDeadPattern(pattern string, grace time.Duration) bool {
 	return !chromedpChromeAlivePattern(pattern)
 }
 
+// cleanupOrphanedChromedpCalledForTest is incremented every time
+// CleanupOrphanedChromedp runs. Test-only; production code never reads it.
+var cleanupOrphanedChromedpCalledForTest atomic.Int32
+
 // CleanupOrphanedChromedp kills any Chrome processes started by chromedp from
 // previous daemon runs that weren't properly cleaned up (e.g. force-kill, crash).
 // Safe to call at daemon startup before registering tools.
@@ -1033,6 +1122,7 @@ func waitChromedpDeadPattern(pattern string, grace time.Duration) bool {
 // Matches both the current kocoro-chromedp-* MkdirTemp prefix from startChromedp
 // and the legacy chromedp-runner-* default prefix used by older daemons.
 func CleanupOrphanedChromedp() {
+	cleanupOrphanedChromedpCalledForTest.Add(1)
 	out, err := exec.Command("pgrep", "-f", chromedpOrphanPattern).Output()
 	if err != nil || strings.TrimSpace(string(out)) == "" {
 		return

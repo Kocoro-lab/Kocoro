@@ -166,6 +166,8 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		llmClient = gw
 	}
 
+	// Orphan sweep is startup-only — see daemon comment.
+	tools.CleanupOrphanedChromedp()
 	reg, skillsPtr, _, cleanup, serverErr := tools.RegisterAll(gw, runCfg, agentOverride)
 	defer cleanup()
 	if serverErr != nil {

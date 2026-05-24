@@ -365,3 +365,64 @@ func TestChromedpOrphanPattern_MatchesBothPrefixes(t *testing.T) {
 		}
 	}
 }
+
+func TestBrowserTool_Deprecated_Idempotent(t *testing.T) {
+	bt := &BrowserTool{}
+	if bt.IsDeprecated() {
+		t.Fatalf("fresh BrowserTool must not be deprecated")
+	}
+	bt.MarkDeprecated()
+	if !bt.IsDeprecated() {
+		t.Fatalf("MarkDeprecated did not set the flag")
+	}
+	bt.MarkDeprecated() // idempotent
+	if !bt.IsDeprecated() {
+		t.Fatalf("second MarkDeprecated must remain true")
+	}
+}
+
+func TestBrowserTool_IsPinchtab_NoRaceWithCleanup(t *testing.T) {
+	// Run repeatedly under -race to verify isPinchtab no longer reads
+	// t.backend without holding t.mu.
+	bt := &BrowserTool{backend: backendChromedp}
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 1000; i++ {
+			_ = bt.isPinchtab()
+		}
+		done <- struct{}{}
+	}()
+	for i := 0; i < 1000; i++ {
+		bt.mu.Lock()
+		bt.backend = backendNone
+		bt.mu.Unlock()
+		bt.mu.Lock()
+		bt.backend = backendChromedp
+		bt.mu.Unlock()
+	}
+	<-done
+}
+
+func TestSnapshotChromedpCtx_BackendNone(t *testing.T) {
+	bt := &BrowserTool{backend: backendNone}
+	if _, ok := bt.snapshotChromedpCtx(); ok {
+		t.Fatalf("expected ok=false for backendNone")
+	}
+}
+
+func TestSnapshotChromedpCtx_BackendChromedpWithCtx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bt := &BrowserTool{backend: backendChromedp, ctx: ctx}
+	got, ok := bt.snapshotChromedpCtx()
+	if !ok || got != ctx {
+		t.Fatalf("expected ok=true, ctx==ctx; got ok=%v ctx==same=%v", ok, got == ctx)
+	}
+}
+
+func TestSnapshotChromedpCtx_BackendChromedpNilCtx(t *testing.T) {
+	bt := &BrowserTool{backend: backendChromedp, ctx: nil}
+	if _, ok := bt.snapshotChromedpCtx(); ok {
+		t.Fatalf("expected ok=false when ctx==nil even with chromedp backend")
+	}
+}

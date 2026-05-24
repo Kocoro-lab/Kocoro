@@ -2768,3 +2768,30 @@ func TestHandleMessage_RejectsPathTraversal(t *testing.T) {
 		t.Errorf("response body echoes attacker id (info leak): %s", b)
 	}
 }
+
+func TestMCPConfigChanged_KeepAliveDetected(t *testing.T) {
+	makeCfg := func(keepAlive bool) *config.Config {
+		return &config.Config{
+			MCPServers: map[string]mcp.MCPServerConfig{
+				"playwright": {Command: "npx", Args: []string{"@playwright/mcp"}, KeepAlive: keepAlive},
+			},
+		}
+	}
+	tests := []struct {
+		name     string
+		old, new *config.Config
+		want     bool
+	}{
+		{"keep_alive false→true", makeCfg(false), makeCfg(true), true},
+		{"keep_alive true→false", makeCfg(true), makeCfg(false), true},
+		{"keep_alive unchanged", makeCfg(true), makeCfg(true), false},
+		{"both false unchanged", makeCfg(false), makeCfg(false), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mcpConfigChanged(tc.old, tc.new); got != tc.want {
+				t.Fatalf("mcpConfigChanged(...) = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

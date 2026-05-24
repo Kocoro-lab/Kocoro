@@ -891,26 +891,38 @@ func cleanupPlaywrightAfterTurn(ctx context.Context, mgr *mcp.ClientManager) {
 // the local chromedp fallback used when Playwright MCP isn't healthy. Has no
 // effect when the Run didn't touch the chromedp backend or when the tool isn't
 // in the registry (Playwright connected at startup and removed it).
-func cleanupBrowserToolAfterTurn(ctx context.Context, reg *agent.ToolRegistry) {
+func cleanupBrowserToolAfterTurn(ctx context.Context) {
 	lease := tools.BrowserUseLeaseFrom(ctx)
 	if lease == nil {
 		return
 	}
-	if reg == nil {
+	owner := lease.Owner()
+	if owner == nil {
+		// Lease was created but MarkUsedWith never called (no browser activity this turn).
 		lease.ReleaseOnly()
 		return
 	}
-	bt, ok := reg.Get("browser")
-	if !ok {
-		lease.ReleaseOnly()
-		return
+	// Owner-aware release: per-owner gate in ReleaseAndMaybeTeardown ensures
+	// teardown fires against this lease's owner, not whatever the registry
+	// currently holds (which post-reload would be NEW).
+	//
+	// Callback selection:
+	//   - owner.IsDeprecated() → full Cleanup() (kills chromedp AND pinchtab).
+	//     register.go's cleanup gate skips this owner, so the lease path is
+	//     the only one that will tear down a deprecated owner's pinchtab
+	//     state. Using CleanupChromedp here would leak pinchtab forever.
+	//   - else → CleanupChromedp (preserves long-lived pinchtab across turns;
+	//     this is the unchanged per-turn semantics from before this PR).
+	var teardown func() error
+	if owner.IsDeprecated() {
+		teardown = func() error {
+			owner.Cleanup()
+			return nil
+		}
+	} else {
+		teardown = owner.CleanupChromedp
 	}
-	browserTool, ok := bt.(*tools.BrowserTool)
-	if !ok {
-		lease.ReleaseOnly()
-		return
-	}
-	torndown, err := lease.ReleaseAndMaybeTeardown(browserTool.CleanupChromedp)
+	torndown, err := lease.ReleaseAndMaybeTeardown(teardown)
 	if torndown {
 		if err != nil {
 			log.Printf("daemon: chromedp browser teardown error: %v", err)
@@ -1038,9 +1050,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	ctx = mcp.WithChromeUseLease(ctx)
 	ctx = tools.WithBrowserUseLease(ctx)
 	defer func() {
-		reg, _, _, mgr := deps.RebuildLayers()
+		_, _, _, mgr := deps.RebuildLayers()
 		cleanupPlaywrightAfterTurn(ctx, mgr)
-		cleanupBrowserToolAfterTurn(ctx, reg)
+		cleanupBrowserToolAfterTurn(ctx)
 	}()
 	if sup != nil {
 		// Cancel any pending idle disconnect — a new turn is starting.

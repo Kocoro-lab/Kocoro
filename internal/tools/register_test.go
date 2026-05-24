@@ -352,3 +352,38 @@ func TestRegisterLocalTools_ForceThinkToolOverride(t *testing.T) {
 		t.Errorf("ForceThinkTool=true must re-register think; got names %v", reg.Names())
 	}
 }
+
+func TestRegisterLocalTools_CleanupSkipsDeprecatedBrowser(t *testing.T) {
+	// Indirect assertion: the cleanup closure returned by RegisterLocalTools
+	// closes over the *BrowserTool it registered. Marking that browser
+	// deprecated must make cleanup a no-op on the browser side.
+	reg, _, cleanup := RegisterLocalTools(nil, nil)
+	bt, ok := reg.Get("browser")
+	if !ok {
+		t.Fatalf("browser tool not registered")
+	}
+	browser, ok := bt.(*BrowserTool)
+	if !ok {
+		t.Fatalf("registered browser is not *BrowserTool")
+	}
+	browser.MarkDeprecated()
+	cleanup()
+	if got := browser.CleanupCalledForTest(); got != 0 {
+		t.Fatalf("deprecated browser must not be cleaned up by registration cleanup; got Cleanup calls=%d", got)
+	}
+	if !browser.IsDeprecated() {
+		t.Fatalf("deprecated flag must persist after cleanup")
+	}
+}
+
+func TestRegisterAllWithBaseline_DoesNotSweepOrphans(t *testing.T) {
+	// The presence of CleanupOrphanedChromedp() inside RegisterAllWithBaseline
+	// makes reload kill live Chrome. We verify the call is gone by using a
+	// test-only counter: assert it == 0 after RegisterAllWithBaseline.
+	cleanupOrphanedChromedpCalledForTest.Store(0)
+	cfg := &config.Config{}
+	_, _, _, _, _, _ = RegisterAllWithBaseline(nil, cfg)
+	if cleanupOrphanedChromedpCalledForTest.Load() != 0 {
+		t.Fatalf("RegisterAllWithBaseline must not invoke CleanupOrphanedChromedp; got %d calls", cleanupOrphanedChromedpCalledForTest.Load())
+	}
+}

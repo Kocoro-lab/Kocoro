@@ -85,13 +85,13 @@ func TestMarkBrowserUsed_ViaContextLease(t *testing.T) {
 	lease := newBrowserUseLeaseWithTracker(tr)
 	ctx := context.WithValue(context.Background(), browserLeaseKey{}, lease)
 
-	MarkBrowserUsed(ctx)
+	MarkBrowserUsed(ctx, &BrowserTool{})
 	if got := tr.activeCount(); got != 1 {
 		t.Fatalf("expected count 1 after MarkBrowserUsed, got %d", got)
 	}
 
 	// MarkBrowserUsed on a ctx without a lease is a safe no-op.
-	MarkBrowserUsed(context.Background())
+	MarkBrowserUsed(context.Background(), nil)
 	if got := tr.activeCount(); got != 1 {
 		t.Fatalf("expected count still 1, got %d", got)
 	}
@@ -373,12 +373,14 @@ func TestBrowserToolRun_CloseSkipsWhenAnotherRunActive(t *testing.T) {
 	}
 
 	tr := &browserUseTracker{}
+	bt := &BrowserTool{backend: backendChromedp, chromedpDataDir: "/tmp/kocoro-owned-profile"}
 	leaseA := newBrowserUseLeaseWithTracker(tr)
 	leaseB := newBrowserUseLeaseWithTracker(tr)
-	leaseB.MarkUsed()
+	// leaseB simulates a concurrent Run on the same *BrowserTool instance — it
+	// must use the same owner so the per-owner gate in TeardownIfOnlyUser fires.
+	leaseB.MarkUsedWith(bt)
 	ctx := context.WithValue(context.Background(), browserLeaseKey{}, leaseA)
 
-	bt := &BrowserTool{backend: backendChromedp, chromedpDataDir: "/tmp/kocoro-owned-profile"}
 	result, err := bt.Run(ctx, `{"action":"close","description":"test"}`)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -470,5 +472,160 @@ func TestBrowserToolRun_InvalidArgsSkipsLease(t *testing.T) {
 
 	if got := tr.activeCount(); got != 0 {
 		t.Fatalf("invalid args must not mark the lease, got count %d", got)
+	}
+}
+
+func TestBrowserUseLease_MarkUsedWith_CapturesOwner(t *testing.T) {
+	tr := &browserUseTracker{}
+	bt := &BrowserTool{}
+	lease := newBrowserUseLeaseWithTracker(tr)
+	lease.MarkUsedWith(bt)
+	if got := lease.Owner(); got != bt {
+		t.Fatalf("Owner() = %v, want %v", got, bt)
+	}
+	if got := tr.activeCount(); got != 1 {
+		t.Fatalf("global count = %d, want 1", got)
+	}
+	if got := tr.ownerActiveCount(bt); got != 1 {
+		t.Fatalf("owner count = %d, want 1", got)
+	}
+}
+
+func TestBrowserUseLease_MarkUsedWith_IdempotentOnSameLease(t *testing.T) {
+	tr := &browserUseTracker{}
+	bt := &BrowserTool{}
+	lease := newBrowserUseLeaseWithTracker(tr)
+	lease.MarkUsedWith(bt)
+	lease.MarkUsedWith(bt)
+	if got := tr.ownerActiveCount(bt); got != 1 {
+		t.Fatalf("owner count = %d, want 1 after second MarkUsedWith on same lease", got)
+	}
+}
+
+func TestBrowserOwnerActiveCount_AcrossLeases(t *testing.T) {
+	tr := &browserUseTracker{}
+	bt := &BrowserTool{}
+	leaseA := newBrowserUseLeaseWithTracker(tr)
+	leaseB := newBrowserUseLeaseWithTracker(tr)
+	leaseA.MarkUsedWith(bt)
+	leaseB.MarkUsedWith(bt)
+	if got := tr.ownerActiveCount(bt); got != 2 {
+		t.Fatalf("owner count = %d, want 2", got)
+	}
+}
+
+func TestReleaseAndMaybeTeardown_OwnerAware_MixedOldNew(t *testing.T) {
+	// Mixed OLD+NEW: NEW releases first; per-owner gate must fire NEW's teardown
+	// even though OLD's lease is still active. v3 three-way gate would have leaked.
+	tr := &browserUseTracker{}
+	oldBT := &BrowserTool{}
+	newBT := &BrowserTool{}
+	leaseOld := newBrowserUseLeaseWithTracker(tr)
+	leaseNew := newBrowserUseLeaseWithTracker(tr)
+	leaseOld.MarkUsedWith(oldBT)
+	leaseNew.MarkUsedWith(newBT)
+
+	var newTeardownFired bool
+	torndown, _ := leaseNew.ReleaseAndMaybeTeardown(func() error {
+		newTeardownFired = true
+		return nil
+	})
+	if !torndown || !newTeardownFired {
+		t.Fatalf("NEW teardown must fire when owners[newBT]==0 (got torndown=%v fired=%v)", torndown, newTeardownFired)
+	}
+	if tr.ownerActiveCount(newBT) != 0 {
+		t.Fatalf("owners[newBT] = %d, want 0", tr.ownerActiveCount(newBT))
+	}
+	if tr.ownerActiveCount(oldBT) != 1 {
+		t.Fatalf("owners[oldBT] = %d, want 1 (lease still active)", tr.ownerActiveCount(oldBT))
+	}
+}
+
+func TestReleaseAndMaybeTeardown_OwnerAware_TwoLeasesSameOwner(t *testing.T) {
+	tr := &browserUseTracker{}
+	bt := &BrowserTool{}
+	leaseA := newBrowserUseLeaseWithTracker(tr)
+	leaseB := newBrowserUseLeaseWithTracker(tr)
+	leaseA.MarkUsedWith(bt)
+	leaseB.MarkUsedWith(bt)
+
+	var firedCount int
+	teardown := func() error { firedCount++; return nil }
+
+	torndownA, _ := leaseA.ReleaseAndMaybeTeardown(teardown)
+	if torndownA || firedCount != 0 {
+		t.Fatalf("first release with two same-owner leases must NOT fire teardown (torndown=%v fired=%d)", torndownA, firedCount)
+	}
+	torndownB, _ := leaseB.ReleaseAndMaybeTeardown(teardown)
+	if !torndownB || firedCount != 1 {
+		t.Fatalf("second release must fire teardown exactly once (torndown=%v fired=%d)", torndownB, firedCount)
+	}
+}
+
+func TestTeardownIfOnlyUser_OwnerAware_NotBlockedByDifferentOwner(t *testing.T) {
+	tr := &browserUseTracker{}
+	oldBT := &BrowserTool{}
+	newBT := &BrowserTool{}
+	leaseOld := newBrowserUseLeaseWithTracker(tr)
+	leaseNew := newBrowserUseLeaseWithTracker(tr)
+	leaseOld.MarkUsedWith(oldBT)
+	leaseNew.MarkUsedWith(newBT)
+
+	// Close called on OLD via leaseOld. tracker.count == 2, but owners[oldBT] == 1.
+	// Must proceed (not be blocked by NEW activity).
+	var fired bool
+	torndown, skipped, _ := leaseOld.TeardownIfOnlyUser(func() error { fired = true; return nil })
+	if !torndown || skipped || !fired {
+		t.Fatalf("close on OLD must proceed when owners[OLD]==1, got torndown=%v skipped=%v fired=%v", torndown, skipped, fired)
+	}
+}
+
+func TestTeardownIfOnlyUser_OwnerAware_BlockedBySameOwner(t *testing.T) {
+	tr := &browserUseTracker{}
+	bt := &BrowserTool{}
+	leaseA := newBrowserUseLeaseWithTracker(tr)
+	leaseB := newBrowserUseLeaseWithTracker(tr)
+	leaseA.MarkUsedWith(bt)
+	leaseB.MarkUsedWith(bt)
+
+	var fired bool
+	_, skipped, _ := leaseA.TeardownIfOnlyUser(func() error { fired = true; return nil })
+	if !skipped || fired {
+		t.Fatalf("close on shared owner must be skipped, got skipped=%v fired=%v", skipped, fired)
+	}
+}
+
+func TestReleaseAndMaybeTeardown_NilOwner_FallsBackToGlobalGate(t *testing.T) {
+	// Legacy path: MarkUsed (no owner) uses global gate.
+	tr := &browserUseTracker{}
+	leaseA := newBrowserUseLeaseWithTracker(tr)
+	leaseB := newBrowserUseLeaseWithTracker(tr)
+	leaseA.MarkUsed()
+	leaseB.MarkUsed()
+	var fired bool
+	torndownA, _ := leaseA.ReleaseAndMaybeTeardown(func() error { fired = true; return nil })
+	if torndownA || fired {
+		t.Fatalf("legacy global gate: first release with count>1 must skip teardown")
+	}
+}
+
+func TestReleaseOnly_OwnerAware_DecrementsPerOwnerCount(t *testing.T) {
+	// ReleaseOnly is used by paths that release without teardown (e.g. when
+	// a Run held a lease but never touched the chromedp backend). It must
+	// keep per-owner count consistent — otherwise owners[t] leaks and the
+	// reload watchdog sees a phantom in-flight lease forever.
+	tr := &browserUseTracker{}
+	bt := &BrowserTool{}
+	lease := newBrowserUseLeaseWithTracker(tr)
+	lease.MarkUsedWith(bt)
+	if got := tr.ownerActiveCount(bt); got != 1 {
+		t.Fatalf("owners[bt] = %d, want 1 after MarkUsedWith", got)
+	}
+	lease.ReleaseOnly()
+	if got := tr.ownerActiveCount(bt); got != 0 {
+		t.Fatalf("owners[bt] = %d, want 0 after ReleaseOnly", got)
+	}
+	if got := tr.activeCount(); got != 0 {
+		t.Fatalf("global count = %d, want 0", got)
 	}
 }
