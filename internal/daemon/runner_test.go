@@ -1382,3 +1382,29 @@ func TestApplyAgentModelOverlayToLoop_EmptyTierIgnored(t *testing.T) {
 		t.Errorf("ModelTier after empty-string overlay = %q, want %q (unchanged)", got, "medium")
 	}
 }
+
+// --- Task 4: history snapshot honours OmitHistory --------------------------
+
+func TestHistorySnapshot_OmitHistoryReturnsEmpty(t *testing.T) {
+	sess := &session.Session{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("old turn 1")},
+			{Role: "assistant", Content: client.NewTextContent("old reply 1")},
+		},
+	}
+
+	got := historySnapshotForRequest(sess, RunAgentRequest{OmitHistory: false})
+	if len(got) != 2 {
+		t.Errorf("OmitHistory=false: want 2 messages, got %d", len(got))
+	}
+
+	got = historySnapshotForRequest(sess, RunAgentRequest{OmitHistory: true})
+	if len(got) != 0 {
+		t.Errorf("OmitHistory=true: want empty history, got %d messages", len(got))
+	}
+
+	// Crucial invariant: session.Messages must NOT be mutated.
+	if len(sess.Messages) != 2 {
+		t.Errorf("historySnapshotForRequest mutated session: messages now %d", len(sess.Messages))
+	}
+}

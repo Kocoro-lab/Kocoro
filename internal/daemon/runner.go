@@ -1045,6 +1045,18 @@ func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelCo
 	}
 }
 
+// historySnapshotForRequest returns the conversation history that the agent
+// loop should see. When req.OmitHistory is true (set by the scheduler for
+// stateless schedules), the LLM gets an empty history even though the session
+// file still records every turn. Otherwise, defers to session.HistoryForLoop()
+// which strips loop-injected guardrail nudges.
+func historySnapshotForRequest(sess *session.Session, req RunAgentRequest) []client.Message {
+	if req.OmitHistory {
+		return nil
+	}
+	return sess.HistoryForLoop()
+}
+
 // RunAgent executes a single agent turn using the shared dependencies.
 // The caller provides an EventHandler to control streaming, approval, and
 // event reporting (WS uses daemonEventHandler, HTTP uses httpEventHandler).
@@ -1586,7 +1598,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// HistoryForLoop strips prior loop-injected guardrail nudges (MessageMeta
 	// .SystemInjected) so they cannot leak into the current run's conversation
 	// snapshot — see session.Session.HistoryForLoop for the full rationale.
-	history := sess.HistoryForLoop()
+	history := historySnapshotForRequest(sess, req)
 
 	// For externally-sourced messages (Slack, LINE, etc.), persist the user message
 	// before the agent loop so the UI can display it immediately on notification.
