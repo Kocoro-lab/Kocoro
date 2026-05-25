@@ -177,6 +177,44 @@ func (s *Server) handleAuthSignOutFull(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, authStateResp{s.auth.Snapshot()})
 }
 
+// authAdoptKeyReq carries an externally-obtained api_key (Desktop Google /
+// OAuth flow) for the daemon to adopt into live auth state.
+type authAdoptKeyReq struct {
+	APIKey string `json:"api_key"`
+}
+
+// handleAuthAdoptKey — POST /local/auth/adopt-key. Installs an
+// externally-obtained api_key into the live auth path so Google/OAuth login
+// converges on the same daemon state as email login (Keychain + live gateway
+// key + signed_in + WS). AuthManager.AdoptKey validates with Cloud first; an
+// invalid key passes Cloud's status through (e.g. 401) and stores nothing.
+// A missing route (old daemon) surfaces as the router's 404 — Desktop uses
+// that as its ONLY signal to fall back to the legacy config path.
+func (s *Server) handleAuthAdoptKey(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAuth(w) {
+		return
+	}
+	if !requireAuthJSON(w, r) {
+		return
+	}
+	var req authAdoptKeyReq
+	if !decodeAuthBody(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.APIKey) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_request",
+			"message": "api_key is required",
+		})
+		return
+	}
+	if err := s.auth.AdoptKey(r.Context(), req.APIKey); err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, authStateResp{s.auth.Snapshot()})
+}
+
 // --- Helpers ---
 
 func (s *Server) requireAuth(w http.ResponseWriter) bool {

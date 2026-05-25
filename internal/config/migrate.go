@@ -380,6 +380,65 @@ func (m *apiKeyToKeychainMigration) Apply(shannonDir string) (bool, error) {
 	return true, nil
 }
 
+// PeekYAMLAPIKey returns the top-level api_key persisted in
+// <shannonDir>/config.yaml, trimmed, or "" if the file/field is absent or
+// blank. Unlike Load it neither hydrates from Keychain nor applies defaults —
+// it reports exactly what yaml holds. The daemon's Keychain self-heal uses
+// this to decide whether a legacy / fallback-written yaml key should be
+// promoted into the Keychain.
+func PeekYAMLAPIKey(shannonDir string) string {
+	raw, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		return ""
+	}
+	var probe struct {
+		APIKey string `yaml:"api_key"`
+	}
+	if err := yaml.Unmarshal(raw, &probe); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(probe.APIKey)
+}
+
+// StripYAMLAPIKey removes the top-level api_key line from config.yaml,
+// preserving the file's mode and surrounding formatting. It is a no-op (nil)
+// when the file or key is absent, or when the value is a block scalar / flow
+// mapping that cannot be surgically removed (same conservative bail as the
+// migration). Callers strip only AFTER the key is safely in the Keychain.
+//
+// Unlike apiKeyToKeychainMigration (which writes a timestamped `.pre-migrate-*`
+// backup before stripping), this writes no backup: the self-heal caller only
+// reaches the strip after the key has been validated against Cloud AND
+// confirmed written to the Keychain, so the stripped value is never the last
+// copy of anything recoverable.
+func StripYAMLAPIKey(shannonDir string) error {
+	cfgPath := filepath.Join(shannonDir, "config.yaml")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	newRaw, removed := removeTopLevelLine(raw, "api_key")
+	if !removed {
+		return nil
+	}
+	info, err := os.Stat(cfgPath)
+	if err != nil {
+		return err
+	}
+	tmpPath := cfgPath + ".selfheal.tmp"
+	if err := os.WriteFile(tmpPath, newRaw, info.Mode().Perm()); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, cfgPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
 // removeTopLevelLine deletes the first occurrence of a top-level
 // `<key>: <anything>` line from raw yaml. Returns (raw, false) when the
 // key cannot be matched at the top level.

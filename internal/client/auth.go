@@ -288,26 +288,44 @@ func (c *AuthClient) CreateAPIKey(ctx context.Context, accessToken, name string)
 	return &resp, nil
 }
 
-// meResponse handles Cloud's /me schema which wraps the user object under
-// {"user": {...}}. Callers receive a clean *AuthUser.
+// meResponse decodes Cloud's /me schema. The authoritative shape
+// (shannon-cloud MeResponse) is FLAT with the canonical id under the
+// top-level `user_id` key (NOT `id`, and NOT nested under `user`) and the
+// plan under top-level `tier`:
+//
+//	{"user_id":"…","tenant_id":"…","email":"…","tier":"max", …}
+//
+// The legacy `user`-nested and flat-`id` forms are kept as tolerant
+// fallbacks. The earlier decoder mapped only `user.id` / `id`, so against
+// the real wire it produced an empty ID with a populated tier ("signed-in,
+// max tier, empty user_id") — which left the daemon Keychain stuck on the
+// `legacy` account and would panic kc.SetAPIKey(user.ID="" , …).
 type meResponse struct {
-	User AuthUser `json:"user"`
-	// Also accept flat-shape responses where Cloud returns user fields at
-	// the top level (used by login/register paths).
-	ID            string `json:"id,omitempty"`
-	Email         string `json:"email,omitempty"`
-	EmailVerified bool   `json:"email_verified,omitempty"`
-	Name          string `json:"name,omitempty"`
-	Tier          string `json:"tier,omitempty"`
+	User          AuthUser `json:"user"`
+	UserID        string   `json:"user_id,omitempty"`
+	ID            string   `json:"id,omitempty"`
+	Email         string   `json:"email,omitempty"`
+	EmailVerified bool     `json:"email_verified,omitempty"`
+	Name          string   `json:"name,omitempty"`
+	Tier          string   `json:"tier,omitempty"`
 }
 
 func userFromMe(r *meResponse) *AuthUser {
 	if r.User.ID != "" {
 		u := r.User
+		// Cloud emits tier at the top level; carry it onto the nested user
+		// when the nested object didn't include it.
+		if u.Tier == "" {
+			u.Tier = r.Tier
+		}
 		return &u
 	}
+	id := r.UserID
+	if id == "" {
+		id = r.ID
+	}
 	return &AuthUser{
-		ID:            r.ID,
+		ID:            id,
 		Email:         r.Email,
 		EmailVerified: r.EmailVerified,
 		Name:          r.Name,
