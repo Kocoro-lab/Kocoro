@@ -193,3 +193,46 @@ func TestSchedulerSkipsMalformedCron(t *testing.T) {
 		t.Fatalf("got %d due, want 0 (malformed cron)", len(due))
 	}
 }
+
+// --- Task 5: buildScheduleRequest plumbs Stateful → OmitHistory -----------
+
+func TestBuildScheduleRequest_StatelessNamedAgent(t *testing.T) {
+	f := false
+	sched := schedule.Schedule{ID: "s1", Agent: "pr-reviewer", Prompt: "p", Stateful: &f}
+	req := buildScheduleRequest(sched, "")
+	if !req.OmitHistory {
+		t.Error("stateless schedule must set OmitHistory=true")
+	}
+	if req.NewSession {
+		t.Error("named-agent schedule must not set NewSession (uses one session file)")
+	}
+	if req.Source != ChannelSchedule {
+		t.Errorf("Source = %q, want %q", req.Source, ChannelSchedule)
+	}
+}
+
+func TestBuildScheduleRequest_LegacyNamedAgent(t *testing.T) {
+	sched := schedule.Schedule{ID: "s1", Agent: "ai-news-reporter", Prompt: "p"} // Stateful nil
+	req := buildScheduleRequest(sched, "")
+	if req.OmitHistory {
+		t.Error("legacy (nil Stateful) schedule must NOT set OmitHistory — preserve current behaviour")
+	}
+}
+
+func TestBuildScheduleRequest_ExplicitStatefulNamedAgent(t *testing.T) {
+	tr := true
+	sched := schedule.Schedule{ID: "s1", Agent: "x", Prompt: "p", Stateful: &tr}
+	req := buildScheduleRequest(sched, "")
+	if req.OmitHistory {
+		t.Error("explicit stateful schedule must NOT set OmitHistory")
+	}
+}
+
+func TestBuildScheduleRequest_DefaultAgentAlwaysNewSession(t *testing.T) {
+	f := false
+	sched := schedule.Schedule{ID: "s1", Agent: "", Prompt: "p", Stateful: &f}
+	req := buildScheduleRequest(sched, "")
+	if !req.NewSession {
+		t.Error("default-agent schedule must keep NewSession=true regardless of Stateful")
+	}
+}

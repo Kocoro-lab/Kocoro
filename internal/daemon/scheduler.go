@@ -152,27 +152,39 @@ func (s *Scheduler) EvaluateDue(now time.Time) []schedule.Schedule {
 
 // runSchedule fires a single scheduled agent run.
 func (s *Scheduler) runSchedule(ctx context.Context, sched schedule.Schedule) {
-	req := RunAgentRequest{
+	stickyContext := ""
+	// Load the associated conversation context and inject it into sticky
+	// context (prepended to the user turn as StableContext). Not visible to
+	// the end user.
+	if ctxMsgs, err := s.manager.LoadContext(sched.ID); err == nil && len(ctxMsgs) > 0 {
+		stickyContext = formatConversationContext(ctxMsgs)
+	}
+	req := buildScheduleRequest(sched, stickyContext)
+
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return RunAgent(ctx, s.deps, req, &scheduleHandler{})
+	})
+}
+
+// buildScheduleRequest constructs the RunAgentRequest for a scheduled run.
+// Extracted as a seam so tests can verify field plumbing — especially the
+// Stateful → OmitHistory mapping — without spinning up the full RunAgent
+// machinery. Legacy schedules (Stateful == nil) preserve their pre-feature
+// stateful behaviour (OmitHistory stays false).
+func buildScheduleRequest(sched schedule.Schedule, stickyContext string) RunAgentRequest {
+	return RunAgentRequest{
 		Text:    sched.Prompt,
 		Agent:   sched.Agent,
 		Source:  ChannelSchedule,
 		Channel: ChannelSchedule + "-" + sched.ID,
 		Sender:  "scheduler",
-		// Named agents resume their single long-lived session.
-		// Default agent (no name) gets a fresh session per run.
-		NewSession: sched.Agent == "",
+		// Default agent (no name) gets a fresh session per run; named agents
+		// resume their single long-lived session — but if Stateful is *false,
+		// OmitHistory below makes the LLM see an empty history regardless.
+		NewSession:    sched.Agent == "",
+		OmitHistory:   sched.IsStateless(),
+		StickyContext: stickyContext,
 	}
-
-	// Load the associated conversation context and inject it into sticky
-	// context (prepended to the user turn as StableContext). Not visible to
-	// the end user.
-	if ctxMsgs, err := s.manager.LoadContext(sched.ID); err == nil && len(ctxMsgs) > 0 {
-		req.StickyContext = formatConversationContext(ctxMsgs)
-	}
-
-	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
-		return RunAgent(ctx, s.deps, req, &scheduleHandler{})
-	})
 }
 
 // runWithLifecycle emits started/succeeded/failed schedule_run events around
