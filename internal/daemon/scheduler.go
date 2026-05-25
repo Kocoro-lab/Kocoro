@@ -187,6 +187,36 @@ func buildScheduleRequest(sched schedule.Schedule, stickyContext string) RunAgen
 	}
 }
 
+// ScheduleRunUsage is the per-run token-usage block emitted on succeeded
+// schedule_run events. Fields mirror RunAgentUsage (runner.go) — if
+// cache-creation/cache-read counts become available there, extend both
+// structs together.
+type ScheduleRunUsage struct {
+	InputTokens  int     `json:"input_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	TotalTokens  int     `json:"total_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+}
+
+func (u ScheduleRunUsage) isZero() bool {
+	return u.InputTokens == 0 && u.OutputTokens == 0 &&
+		u.TotalTokens == 0 && u.CostUSD == 0
+}
+
+// scheduleRunUsageFromResult lifts the per-run totals out of RunAgentResult
+// into the wire shape. Defensive: nil-safe, returns zero on nil.
+func scheduleRunUsageFromResult(r *RunAgentResult) ScheduleRunUsage {
+	if r == nil {
+		return ScheduleRunUsage{}
+	}
+	return ScheduleRunUsage{
+		InputTokens:  r.Usage.InputTokens,
+		OutputTokens: r.Usage.OutputTokens,
+		TotalTokens:  r.Usage.TotalTokens,
+		CostUSD:      r.Usage.CostUSD,
+	}
+}
+
 // runWithLifecycle emits started/succeeded/failed schedule_run events around
 // fn. Extracted so tests can verify lifecycle emission without spinning up
 // the full RunAgent stack.
@@ -206,20 +236,30 @@ func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAge
 	}()
 
 	sessionID := ""
+	usage := ScheduleRunUsage{}
 	if result != nil {
 		sessionID = result.SessionID
+		usage = scheduleRunUsageFromResult(result)
 	}
 	if runErr != nil {
 		log.Printf("scheduler: agent run failed for schedule %s: %v", sched.ID, runErr)
-		s.emitScheduleRun("failed", sched, sessionID, runErr)
+		s.emitScheduleRunWithUsage("failed", sched, sessionID, runErr, usage)
 		return
 	}
-	s.emitScheduleRun("succeeded", sched, sessionID, nil)
+	s.emitScheduleRunWithUsage("succeeded", sched, sessionID, nil, usage)
 }
 
-// emitScheduleRun publishes a schedule_run lifecycle event. Best-effort; nil
-// deps or nil bus drops silently so unit tests that pass nil deps still run.
+// emitScheduleRun publishes a schedule_run lifecycle event without a usage
+// block. Kept for callers (started phase, panics with no result) that have
+// no per-run usage to report.
 func (s *Scheduler) emitScheduleRun(phase string, sched schedule.Schedule, sessionID string, runErr error) {
+	s.emitScheduleRunWithUsage(phase, sched, sessionID, runErr, ScheduleRunUsage{})
+}
+
+// emitScheduleRunWithUsage is the full form. Usage is omitted from the wire
+// payload when zero so failed runs that never reached an LLM call don't
+// emit misleading zero-value usage counters.
+func (s *Scheduler) emitScheduleRunWithUsage(phase string, sched schedule.Schedule, sessionID string, runErr error, usage ScheduleRunUsage) {
 	if s == nil || s.deps == nil {
 		return
 	}
@@ -232,6 +272,9 @@ func (s *Scheduler) emitScheduleRun(phase string, sched schedule.Schedule, sessi
 	}
 	if phase == "failed" && runErr != nil {
 		payload["error"] = redactAndTruncate(runErr.Error(), 500)
+	}
+	if !usage.isZero() {
+		payload["usage"] = usage
 	}
 	emitBusJSON(s.deps.EventBus, EventScheduleRun, payload)
 }
