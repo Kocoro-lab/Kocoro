@@ -66,7 +66,8 @@ var scheduleCreateCmd = &cobra.Command{
 			return fmt.Errorf("--cron and --prompt are required")
 		}
 		mgr := newScheduleManager()
-		id, err := mgr.Create(schedCreateAgent, schedCreateCron, schedCreatePrompt)
+		// stateful=false is the eventual default. Task 7 wires this to the --stateful flag.
+		id, err := mgr.Create(schedCreateAgent, schedCreateCron, schedCreatePrompt, false)
 		if err != nil {
 			return err
 		}

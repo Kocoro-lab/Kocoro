@@ -81,7 +81,7 @@ func TestSchedulerDedupSameMinute(t *testing.T) {
 	dir := t.TempDir()
 	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
 
-	id, err := mgr.Create("bot", "* * * * *", "hello")
+	id, err := mgr.Create("bot", "* * * * *", "hello", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestSchedulerSkipsDisabled(t *testing.T) {
 	dir := t.TempDir()
 	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
 
-	id, err := mgr.Create("bot", "* * * * *", "hello")
+	id, err := mgr.Create("bot", "* * * * *", "hello", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestSchedulerPrunesDeletedEntries(t *testing.T) {
 	dir := t.TempDir()
 	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
 
-	id, err := mgr.Create("bot", "* * * * *", "hello")
+	id, err := mgr.Create("bot", "* * * * *", "hello", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

@@ -12,7 +12,7 @@ import (
 func TestCreateAndList(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, err := mgr.Create("ops-bot", "0 9 * * *", "check prod health")
+	id, err := mgr.Create("ops-bot", "0 9 * * *", "check prod health", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestCreateAndList(t *testing.T) {
 func TestCreateRejectsInvalidCron(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	_, err := mgr.Create("bot", "not-a-cron", "task")
+	_, err := mgr.Create("bot", "not-a-cron", "task", false)
 	if err == nil {
 		t.Fatal("expected error for invalid cron")
 	}
@@ -46,7 +46,7 @@ func TestCreateRejectsInvalidCron(t *testing.T) {
 func TestCreateRejectsInvalidAgentName(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	_, err := mgr.Create("../evil", "0 9 * * *", "task")
+	_, err := mgr.Create("../evil", "0 9 * * *", "task", false)
 	if err == nil {
 		t.Fatal("expected error for invalid agent name")
 	}
@@ -55,7 +55,7 @@ func TestCreateRejectsInvalidAgentName(t *testing.T) {
 func TestCreateAcceptsEmptyAgent(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, err := mgr.Create("", "0 9 * * *", "task")
+	id, err := mgr.Create("", "0 9 * * *", "task", false)
 	if err != nil {
 		t.Fatalf("Create with empty agent: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestCreateSupportsCronSyntax(t *testing.T) {
 		"30 */2 * * *",
 	}
 	for _, c := range crons {
-		_, err := mgr.Create("", c, "task")
+		_, err := mgr.Create("", c, "task", false)
 		if err != nil {
 			t.Errorf("expected valid cron %q, got error: %v", c, err)
 		}
@@ -86,7 +86,7 @@ func TestCreateSupportsCronSyntax(t *testing.T) {
 func TestRemove(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, _ := mgr.Create("bot", "0 9 * * *", "task")
+	id, _ := mgr.Create("bot", "0 9 * * *", "task", false)
 	err := mgr.Remove(id)
 	if err != nil {
 		t.Fatalf("Remove: %v", err)
@@ -109,7 +109,7 @@ func TestRemoveNotFound(t *testing.T) {
 func TestUpdate(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, _ := mgr.Create("bot", "0 9 * * *", "old prompt")
+	id, _ := mgr.Create("bot", "0 9 * * *", "old prompt", false)
 	err := mgr.Update(id, &UpdateOpts{Prompt: strPtr("new prompt")})
 	if err != nil {
 		t.Fatalf("Update: %v", err)
@@ -123,7 +123,7 @@ func TestUpdate(t *testing.T) {
 func TestUpdateRejectsInvalidCron(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, _ := mgr.Create("bot", "0 9 * * *", "task")
+	id, _ := mgr.Create("bot", "0 9 * * *", "task", false)
 	bad := "not-valid"
 	err := mgr.Update(id, &UpdateOpts{Cron: &bad})
 	if err == nil {
@@ -134,7 +134,7 @@ func TestUpdateRejectsInvalidCron(t *testing.T) {
 func TestEnableDisable(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, _ := mgr.Create("bot", "0 9 * * *", "task")
+	id, _ := mgr.Create("bot", "0 9 * * *", "task", false)
 	if err := mgr.Update(id, &UpdateOpts{Enabled: boolPtr(false)}); err != nil {
 		t.Fatalf("Disable: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestConcurrentCreates(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			mgr.Create("bot", "0 9 * * *", "task")
+			mgr.Create("bot", "0 9 * * *", "task", false)
 		}()
 	}
 	wg.Wait()
@@ -168,7 +168,7 @@ func boolPtr(b bool) *bool    { return &b }
 func TestSaveLoadContextRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, err := mgr.Create("bot", "0 9 * * *", "task")
+	id, err := mgr.Create("bot", "0 9 * * *", "task", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestSaveContextIsAtomic(t *testing.T) {
 	// the final file permissions are 0600.
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, err := mgr.Create("bot", "0 9 * * *", "task")
+	id, err := mgr.Create("bot", "0 9 * * *", "task", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestSaveContextIsAtomic(t *testing.T) {
 func TestSaveContextEmptyIsNoOp(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, err := mgr.Create("bot", "0 9 * * *", "task")
+	id, err := mgr.Create("bot", "0 9 * * *", "task", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestSaveContextEmptyIsNoOp(t *testing.T) {
 func TestUpdateClearsContextOnPromptChange(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, err := mgr.Create("bot", "0 9 * * *", "check prod")
+	id, err := mgr.Create("bot", "0 9 * * *", "check prod", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestUpdateClearsContextOnPromptChange(t *testing.T) {
 func TestUpdatePreservesContextWhenPromptUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, err := mgr.Create("bot", "0 9 * * *", "check prod")
+	id, err := mgr.Create("bot", "0 9 * * *", "check prod", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestUpdatePreservesContextWhenPromptSame(t *testing.T) {
 	// Update called with the same prompt is a no-op for intent — don't clear.
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
-	id, err := mgr.Create("bot", "0 9 * * *", "check prod")
+	id, err := mgr.Create("bot", "0 9 * * *", "check prod", false)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -368,5 +368,111 @@ func TestSchedule_JSONRoundTrip_ExplicitFalse(t *testing.T) {
 	}
 	if back.Stateful == nil || *back.Stateful {
 		t.Errorf("round-trip lost explicit false: %+v", back.Stateful)
+	}
+}
+
+// --- Task 2: Create / Update + Stateful plumbing ---------------------------
+
+func TestManager_Create_DefaultsToStateless(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(filepath.Join(dir, "schedules.json"))
+	id, err := m.Create("pr-reviewer", "*/30 * * * *", "check", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Stateful == nil {
+		t.Fatal("Create should set Stateful explicitly, got nil")
+	}
+	if *got.Stateful {
+		t.Errorf("Create default should be *false (stateless), got *true")
+	}
+}
+
+func TestManager_Create_OptInStateful(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(filepath.Join(dir, "schedules.json"))
+	id, err := m.Create("pr-reviewer", "*/30 * * * *", "check", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.Get(id)
+	if got.Stateful == nil || !*got.Stateful {
+		t.Errorf("Create(stateful=true) should set *true, got %v", got.Stateful)
+	}
+}
+
+func TestManager_Update_FlipStateful(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(filepath.Join(dir, "schedules.json"))
+	id, _ := m.Create("pr-reviewer", "*/30 * * * *", "check", false)
+	tru := true
+	if err := m.Update(id, &UpdateOpts{Stateful: &tru}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.Get(id)
+	if got.Stateful == nil || !*got.Stateful {
+		t.Errorf("Update should flip to *true, got %v", got.Stateful)
+	}
+}
+
+// Flipping back to false matters more than it looks — false is the zero value
+// and a naive PATCH handler that drops zero values would silently no-op this.
+// This test guards against that regression at the manager level; the HTTP-
+// level analog lives in Task 6.
+func TestManager_Update_FlipStatefulFromTrueToFalse(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(filepath.Join(dir, "schedules.json"))
+	id, _ := m.Create("pr-reviewer", "*/30 * * * *", "check", true)
+	fals := false
+	if err := m.Update(id, &UpdateOpts{Stateful: &fals}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.Get(id)
+	if got.Stateful == nil || *got.Stateful {
+		t.Errorf("Update should flip to *false, got %v", got.Stateful)
+	}
+}
+
+// Legacy schedule (Stateful nil on disk) survives an unrelated Update
+// (e.g. cron change) without being silently promoted to *true or *false.
+// The admin must explicitly send stateful in the PATCH to migrate it.
+func TestManager_Update_NilStatefulNotImplicitlyMigrated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "schedules.json")
+	raw := `[{"id":"legacy","agent":"x","cron":"0 9 * * *","prompt":"p","enabled":true,"sync_status":"ok","created_at":"2025-01-01T00:00:00Z"}]`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(path)
+	newCron := "0 10 * * *"
+	if err := m.Update("legacy", &UpdateOpts{Cron: &newCron}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.Get("legacy")
+	if got.Stateful != nil {
+		t.Errorf("unrelated update must leave Stateful nil, got *%v", *got.Stateful)
+	}
+}
+
+// Operator path: migrate a legacy schedule to stateless via PATCH.
+func TestManager_Update_MigrateLegacyToStateless(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "schedules.json")
+	raw := `[{"id":"legacy","agent":"x","cron":"0 9 * * *","prompt":"p","enabled":true,"sync_status":"ok","created_at":"2025-01-01T00:00:00Z"}]`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(path)
+	fals := false
+	if err := m.Update("legacy", &UpdateOpts{Stateful: &fals}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.Get("legacy")
+	if got.Stateful == nil || *got.Stateful {
+		t.Errorf("legacy migrate to stateless: got %v", got.Stateful)
 	}
 }

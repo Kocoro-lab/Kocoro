@@ -100,7 +100,9 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		if cron == "" || prompt == "" {
 			return agent.ToolResult{Content: "cron and prompt are required", IsError: true}, nil
 		}
-		id, err := t.manager.Create(agentName, cron, prompt)
+		// LLM-created schedules default to stateless (same as HTTP/CLI default).
+		// If callers need stateful schedules, surface a "stateful" arg here.
+		id, err := t.manager.Create(agentName, cron, prompt, false)
 		if err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
 		}

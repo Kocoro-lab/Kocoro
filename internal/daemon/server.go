@@ -3949,7 +3949,8 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	id, err := s.deps.ScheduleManager.Create(req.Agent, req.Cron, req.Prompt)
+	// stateful=false is the eventual default. Task 6 wires this to an optional body field.
+	id, err := s.deps.ScheduleManager.Create(req.Agent, req.Cron, req.Prompt, false)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, err.Error())

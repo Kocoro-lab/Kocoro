@@ -42,9 +42,10 @@ func (s *Schedule) IsStateless() bool {
 }
 
 type UpdateOpts struct {
-	Cron    *string
-	Prompt  *string
-	Enabled *bool
+	Cron     *string
+	Prompt   *string
+	Enabled  *bool
+	Stateful *bool // nil = no change; non-nil = overwrite (including flip to/from legacy nil)
 }
 
 type Manager struct {
@@ -165,7 +166,7 @@ func (m *Manager) lockedModify(fn func([]Schedule) ([]Schedule, error)) error {
 	return m.save(schedules)
 }
 
-func (m *Manager) Create(agentName, cron, prompt string) (string, error) {
+func (m *Manager) Create(agentName, cron, prompt string, stateful bool) (string, error) {
 	if err := validateAgent(agentName); err != nil {
 		return "", err
 	}
@@ -176,9 +177,11 @@ func (m *Manager) Create(agentName, cron, prompt string) (string, error) {
 		return "", err
 	}
 	id := generateScheduleID()
+	statefulCopy := stateful
 	s := Schedule{
 		ID: id, Agent: agentName, Cron: cron, Prompt: prompt,
 		Enabled: true, SyncStatus: "ok", CreatedAt: time.Now(),
+		Stateful: &statefulCopy, // always explicit on Create — never leave nil for new rows
 	}
 	err := m.lockedModify(func(schedules []Schedule) ([]Schedule, error) {
 		return append(schedules, s), nil
@@ -207,7 +210,7 @@ func (m *Manager) Get(id string) (*Schedule, error) {
 }
 
 func (m *Manager) Update(id string, opts *UpdateOpts) error {
-	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil {
+	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil {
 		return fmt.Errorf("no fields to update")
 	}
 	if opts.Cron != nil {
@@ -244,6 +247,10 @@ func (m *Manager) Update(id string, opts *UpdateOpts) error {
 				}
 				if opts.Enabled != nil {
 					schedules[i].Enabled = *opts.Enabled
+				}
+				if opts.Stateful != nil {
+					v := *opts.Stateful
+					schedules[i].Stateful = &v
 				}
 				return schedules, nil
 			}
