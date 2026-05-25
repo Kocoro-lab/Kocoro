@@ -320,6 +320,7 @@ func (s *Server) RegisterAuthRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /local/auth/forgot-password", s.handleAuthForgotPassword)
 	mux.HandleFunc("POST /local/auth/sign-out", s.handleAuthSignOut)
 	mux.HandleFunc("POST /local/auth/sign-out-full", s.handleAuthSignOutFull)
+	mux.HandleFunc("POST /local/auth/adopt-key", s.handleAuthAdoptKey)
 }
 
 // RebuildAuthSensitiveTools re-registers the gateway tools whose
@@ -477,6 +478,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /local/auth/forgot-password", s.handleAuthForgotPassword)
 	mux.HandleFunc("POST /local/auth/sign-out", s.handleAuthSignOut)
 	mux.HandleFunc("POST /local/auth/sign-out-full", s.handleAuthSignOutFull)
+	mux.HandleFunc("POST /local/auth/adopt-key", s.handleAuthAdoptKey)
 
 	mux.HandleFunc("POST /shutdown", s.handleShutdown)
 }

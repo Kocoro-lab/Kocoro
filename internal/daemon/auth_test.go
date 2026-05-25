@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -777,5 +778,127 @@ func TestAuthManager_NilKeychain_ReturnsErrPlatformUnsupported(t *testing.T) {
 	err := mgr.Login(context.Background(), "a@b.c", "pw")
 	if !IsErrPlatformUnsupported(err) {
 		t.Fatalf("expected platform unsupported, got %v", err)
+	}
+}
+
+// --- AdoptKey (Google / external OAuth convergence) ---
+
+func TestAuthManager_AdoptKey_Success(t *testing.T) {
+	f := newAuthFixture(t)
+	// Authoritative Cloud /me shape: id under top-level user_id, tier flat.
+	f.on(http.MethodGet, "/api/v1/auth/me", http.StatusOK, map[string]any{
+		"user_id": "real-user-uuid", "email": "max@example.com", "tier": "max",
+	})
+
+	if err := f.manager.AdoptKey(context.Background(), "sk_new"); err != nil {
+		t.Fatalf("AdoptKey: %v", err)
+	}
+
+	if got := f.gw.APIKey(); got != "sk_new" {
+		t.Fatalf("gateway key not applied: %q", got)
+	}
+	uid, key, _ := f.keychain.GetActiveUserAndKey()
+	if uid != "real-user-uuid" || key != "sk_new" {
+		t.Fatalf("keychain not written under resolved user_id: uid=%q key=%q", uid, key)
+	}
+	if s := f.manager.State(); s != AuthStateSignedIn {
+		t.Fatalf("state=%q want signed_in", s)
+	}
+}
+
+func TestAuthManager_AdoptKey_InvalidKey_NoMutation(t *testing.T) {
+	f := newAuthFixture(t)
+	f.onError(http.MethodGet, "/api/v1/auth/me", http.StatusUnauthorized, "invalid_api_key", "revoked")
+
+	err := f.manager.AdoptKey(context.Background(), "sk_bad")
+	if err == nil {
+		t.Fatal("expected error for invalid key")
+	}
+	if ae, ok := client.IsAuthError(err); !ok || ae.HTTPCode != http.StatusUnauthorized {
+		t.Fatalf("want 401 AuthError passthrough, got %v", err)
+	}
+	// Nothing stored, gateway untouched, state untouched — a bad key must not
+	// knock out a current/pending session or leave a half-written credential.
+	if got := f.gw.APIKey(); got != "" {
+		t.Fatalf("gateway key mutated on invalid adopt: %q", got)
+	}
+	if _, key, _ := f.keychain.GetActiveUserAndKey(); key != "" {
+		t.Fatalf("keychain written on invalid adopt: %q", key)
+	}
+	if s := f.manager.State(); s != AuthStateSignedOut {
+		t.Fatalf("state mutated on invalid adopt: %q", s)
+	}
+}
+
+func TestAuthManager_AdoptKey_EmptyUserID_Rejected(t *testing.T) {
+	f := newAuthFixture(t)
+	// Malformed /me: valid 200 but no resolvable user id.
+	f.on(http.MethodGet, "/api/v1/auth/me", http.StatusOK, map[string]any{
+		"email": "x@example.com", "tier": "max",
+	})
+
+	if err := f.manager.AdoptKey(context.Background(), "sk_x"); err == nil {
+		t.Fatal("expected error when /me returns empty user_id")
+	}
+	if got := f.gw.APIKey(); got != "" {
+		t.Fatalf("gateway key applied despite empty user_id: %q", got)
+	}
+	if _, key, _ := f.keychain.GetActiveUserAndKey(); key != "" {
+		t.Fatalf("keychain written despite empty user_id: %q", key)
+	}
+}
+
+// --- Bootstrap self-heal from yaml ---
+
+func TestAuthManager_SelfHeal_PromotesYamlKeyAndStrips(t *testing.T) {
+	f := newAuthFixture(t)
+	dir := t.TempDir()
+	f.manager.shanDir = dir
+	cfgPath := dir + "/config.yaml"
+	if err := os.WriteFile(cfgPath, []byte("endpoint: https://c\napi_key: sk_yaml\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.on(http.MethodGet, "/api/v1/auth/me", http.StatusOK, map[string]any{
+		"user_id": "uid-1", "tier": "max",
+	})
+
+	// Keychain is empty → Bootstrap takes the self-heal branch.
+	f.manager.Bootstrap(context.Background())
+
+	if got := f.gw.APIKey(); got != "sk_yaml" {
+		t.Fatalf("self-heal did not apply yaml key: %q", got)
+	}
+	uid, key, _ := f.keychain.GetActiveUserAndKey()
+	if uid != "uid-1" || key != "sk_yaml" {
+		t.Fatalf("self-heal did not write keychain: uid=%q key=%q", uid, key)
+	}
+	if s := f.manager.State(); s != AuthStateSignedIn {
+		t.Fatalf("state=%q want signed_in", s)
+	}
+	if got := config.PeekYAMLAPIKey(dir); got != "" {
+		t.Fatalf("yaml api_key not stripped after self-heal: %q", got)
+	}
+}
+
+func TestAuthManager_SelfHeal_IgnoresPlaceholderAndAbsent(t *testing.T) {
+	f := newAuthFixture(t)
+	dir := t.TempDir()
+	f.manager.shanDir = dir
+	// Redacted placeholder must not trigger a Cloud call or any mutation.
+	// (No /me handler registered → fixture fails the test if one is made.)
+	if err := os.WriteFile(dir+"/config.yaml", []byte("endpoint: https://c\napi_key: \"***\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	f.manager.Bootstrap(context.Background())
+
+	if got := f.gw.APIKey(); got != "" {
+		t.Fatalf("placeholder yaml key was adopted: %q", got)
+	}
+	if _, key, _ := f.keychain.GetActiveUserAndKey(); key != "" {
+		t.Fatalf("keychain written from placeholder: %q", key)
+	}
+	if s := f.manager.State(); s != AuthStateSignedOut {
+		t.Fatalf("state mutated on placeholder self-heal: %q", s)
 	}
 }

@@ -153,6 +153,53 @@ func TestWSController_Stop_ReleasesGoroutine(t *testing.T) {
 	}
 }
 
+// TestWSController_Restart_ReplacesRunningConnection guards the account-switch
+// path AdoptKey relies on. A naive Stop()+Start() short-circuits — Stop leaves
+// `running` true until the cancelled goroutine's deferred cleanup, so the
+// immediate Start sees true and no-ops, leaving the WS down. Restart must join
+// the old run, then start a fresh one — observable as a SECOND upgrade.
+func TestWSController_Restart_ReplacesRunningConnection(t *testing.T) {
+	mock := newWSMockServer(true)
+	defer mock.close()
+
+	client := NewClient(mock.url(), "sk_test",
+		func(MessagePayload) string { return "" },
+		func(string) {},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctl := NewWSController(ctx, client)
+
+	ctl.Start(ctx)
+	defer ctl.Stop()
+
+	waitForUpgrades := func(n int32) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if mock.upgrades.Load() >= n {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("expected >= %d upgrades, got %d", n, mock.upgrades.Load())
+	}
+
+	waitForUpgrades(1)
+	ctl.Restart(ctx)
+	waitForUpgrades(2) // fresh connection after the old run drained
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctl.IsRunning() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !ctl.IsRunning() {
+		t.Fatal("expected IsRunning=true after Restart")
+	}
+}
+
 func TestWSController_AuthRejected_StopsRetrying(t *testing.T) {
 	mock := newWSMockServer(false) // 401
 	defer mock.close()

@@ -499,9 +499,10 @@ var daemonStartCmd = &cobra.Command{
 			authMgr = daemon.NewAuthManager(daemon.AuthManagerConfig{
 				Keychain: kcStore,
 				Cloud:    authClient,
-				Gateway:  gw,
-				WSClient: wsClient,
-				Cfg:      cfg,
+				Gateway:    gw,
+				WSClient:   wsClient,
+				Cfg:        cfg,
+				ShannonDir: shanDir,
 				OnAPIKeyChanged: func(ctx context.Context) {
 					localServer.RebuildAuthSensitiveTools(ctx)
 				},

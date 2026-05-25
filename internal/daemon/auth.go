@@ -58,6 +58,7 @@ type AuthManagerConfig struct {
 	Gateway         *client.GatewayClient
 	WSClient        *Client
 	Cfg             *config.Config
+	ShannonDir      string
 	OnAPIKeyChanged func(context.Context)
 	Logger          *log.Logger
 }
@@ -83,6 +84,7 @@ type AuthManager struct {
 	bus             *EventBus
 	onAPIKeyChanged func(context.Context)
 	logger          *log.Logger
+	shanDir         string
 	sf              singleflight.Group
 }
 
@@ -104,6 +106,7 @@ func NewAuthManager(cfg AuthManagerConfig) *AuthManager {
 		wsClient:        cfg.WSClient,
 		onAPIKeyChanged: cfg.OnAPIKeyChanged,
 		logger:          logger,
+		shanDir:         cfg.ShannonDir,
 	}
 }
 
@@ -224,6 +227,14 @@ func (a *AuthManager) Bootstrap(ctx context.Context) {
 		return
 	}
 	if apiKey == "" {
+		// Keychain empty. A real api_key may still be sitting in config.yaml
+		// — e.g. a Desktop login wrote it via the legacy fallback path (or
+		// against an old daemon without adopt-key). Promote it into the
+		// Keychain so the daemon converges on full signed_in state (live key
+		// + WS + Keychain canonical) instead of a yaml-only half-state where
+		// only HTTP is authenticated. Validate via Cloud first; strip yaml
+		// only after a successful adopt.
+		a.selfHealFromYAML(ctx)
 		return
 	}
 
@@ -261,6 +272,31 @@ func (a *AuthManager) Bootstrap(ctx context.Context) {
 	}
 	a.setState(AuthStateSignedIn, user, "")
 	a.startWS(ctx)
+}
+
+// selfHealFromYAML promotes a real top-level api_key still living in
+// config.yaml into the Keychain when the Keychain has no active key. It runs
+// the same validated adopt path as the Desktop adopt-key endpoint, then —
+// only on success — strips the now-redundant yaml key so the Keychain stays
+// the single source of truth (yaml `api_key` otherwise wins at the next Load
+// and could drift from the Keychain copy). A Cloud-validation failure leaves
+// everything untouched; the gateway was already seeded from the same yaml key
+// at construction, so HTTP stays usable regardless.
+func (a *AuthManager) selfHealFromYAML(ctx context.Context) {
+	if a.shanDir == "" {
+		return
+	}
+	candidate := config.PeekYAMLAPIKey(a.shanDir)
+	if candidate == "" || candidate == "***" {
+		return
+	}
+	if err := a.doAdoptKey(ctx, candidate); err != nil {
+		a.logger.Printf("auth: keychain self-heal from yaml api_key failed: %v", err)
+		return
+	}
+	if err := config.StripYAMLAPIKey(a.shanDir); err != nil {
+		a.logger.Printf("auth: keychain self-heal: strip yaml api_key: %v", err)
+	}
 }
 
 // Register proxies POST /api/v1/auth/register to Cloud and transitions to
@@ -409,6 +445,76 @@ func (a *AuthManager) doLogin(ctx context.Context, email, password string) error
 	return nil
 }
 
+// AdoptKey installs an externally-obtained api_key into the live auth state.
+// The Desktop Google/OAuth flow exchanges the OAuth code with Cloud directly
+// and never transits the daemon's /local/auth/login path, so applyAPIKey
+// (the only runtime fan-out to GatewayClient + WS on macOS) would otherwise
+// never fire — leaving a post-logout re-login authenticating with an empty
+// key (401 + anonymous/free tier). AdoptKey converges that flow onto the same
+// post-login daemon state as email login: Keychain write, live gateway key,
+// signed_in snapshot, WS connected.
+//
+// Hardening contract (callers rely on this):
+//   - Validate with Cloud FIRST and require a non-empty resolved user_id.
+//     On an invalid key (401) or malformed /auth/me, store NOTHING and leave
+//     the current/pending auth state untouched — Desktop must NOT fall back
+//     to writing the key into config.yaml on this failure.
+//   - Persist to Keychain BEFORE going live, so a Keychain failure can't tear
+//     down an existing session.
+//   - Clear any stale email JWTs (adopt-key carries only an api_key) and
+//     restart WS so HTTP + WS agree on the new key even when called while
+//     already signed_in (account switch).
+//
+// Email register (pending_verification) and email login are unaffected — they
+// keep their own paths; AdoptKey is exclusively for externally-obtained keys.
+func (a *AuthManager) AdoptKey(ctx context.Context, apiKey string) error {
+	if a.kc == nil {
+		return errPlatformUnsupported
+	}
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return fmt.Errorf("adopt key: empty api_key")
+	}
+	_, err, _ := a.sf.Do("adopt:"+apiKey, func() (any, error) {
+		return nil, a.doAdoptKey(ctx, apiKey)
+	})
+	return err
+}
+
+func (a *AuthManager) doAdoptKey(ctx context.Context, apiKey string) error {
+	// 1. Validate first. No state mutation on failure — a bad key must not
+	//    knock the user out of a current/pending session.
+	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	user, err := a.cloud.MeWithAPIKey(probeCtx, apiKey)
+	if err != nil {
+		return err
+	}
+	if user.ID == "" {
+		return fmt.Errorf("adopt key: cloud /auth/me returned empty user_id")
+	}
+
+	// 2. Persist before going live so a Keychain write failure leaves the
+	//    existing session intact (WS still up, state unchanged).
+	if err := a.kc.SetAPIKey(user.ID, apiKey); err != nil {
+		return fmt.Errorf("adopt key: keychain write: %w", err)
+	}
+
+	// 3. Commit live. Drop stale email JWTs from any prior account, restart
+	//    WS around the key swap so the socket re-authenticates with the new
+	//    key, and fan the key out to GatewayClient + tools via applyAPIKey.
+	a.mu.Lock()
+	a.accessToken = ""
+	a.refreshToken = ""
+	a.mu.Unlock()
+	a.applyAPIKey(ctx, apiKey)
+	a.setState(AuthStateSignedIn, user, "")
+	// Restart (not stop+start): on an account switch a WS for the previous
+	// account may still be live, and stop+start would no-op the start.
+	a.restartWS(ctx)
+	return nil
+}
+
 // ResendVerification proxies POST /api/v1/auth/resend-verification. If
 // email is empty, uses the pendingEmail captured during register/login.
 // `language` is the per-call locale override (Cloud contract uses the
@@ -529,5 +635,19 @@ func (a *AuthManager) stopWS() {
 	a.mu.RUnlock()
 	if ctl != nil {
 		ctl.Stop()
+	}
+}
+
+// restartWS tears down any live WS and brings up a fresh one bound to the
+// current api_key. Used by AdoptKey: a plain stopWS()+startWS() would
+// short-circuit when a WS is already running (running flag still set during
+// the cancelled goroutine's drain), so an account switch would leave the WS
+// down. WSController.Restart joins the old run before starting the new one.
+func (a *AuthManager) restartWS(ctx context.Context) {
+	a.mu.RLock()
+	ctl := a.wsCtl
+	a.mu.RUnlock()
+	if ctl != nil {
+		ctl.Restart(ctx)
 	}
 }

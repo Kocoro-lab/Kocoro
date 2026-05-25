@@ -277,6 +277,34 @@ func TestAuthClient_MeWithAPIKey_XAPIKey(t *testing.T) {
 	}
 }
 
+// TestAuthClient_MeWithAPIKey_RealCloudShape pins the authoritative Cloud
+// wire shape (shannon-cloud MeResponse): the canonical id is the top-level
+// `user_id` (NOT `id`) and the plan is the top-level `tier`, with no nested
+// `user` object. The prior decoder only read `user.id` / `id`, so against
+// this real body it returned an empty ID with a populated tier — the
+// production "signed-in, max tier, empty user_id" bug. This test decodes a
+// producer-accurate body so the regression cannot reappear silently.
+func TestAuthClient_MeWithAPIKey_RealCloudShape(t *testing.T) {
+	fc := newFakeCloud(t)
+	fc.on(http.MethodGet, "/api/v1/auth/me", http.StatusOK, map[string]any{
+		"user_id":   "real-user-uuid",
+		"tenant_id": "tenant-1",
+		"email":     "max@example.com",
+		"username":  "max",
+		"tier":      "max",
+	})
+	user, err := fc.client().MeWithAPIKey(context.Background(), "sk_abc")
+	if err != nil {
+		t.Fatalf("MeWithAPIKey: %v", err)
+	}
+	if user.ID != "real-user-uuid" {
+		t.Fatalf("user_id not mapped to ID: %+v", user)
+	}
+	if user.Tier != "max" {
+		t.Fatalf("top-level tier not mapped: %+v", user)
+	}
+}
+
 func TestAuthClient_MeWithAPIKey_401(t *testing.T) {
 	fc := newFakeCloud(t)
 	fc.on(http.MethodGet, "/api/v1/auth/me", http.StatusUnauthorized, map[string]string{

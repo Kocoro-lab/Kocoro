@@ -82,6 +82,20 @@ All endpoints listen on `127.0.0.1:7533` (daemon HTTP). Localhost-only, no auth 
 - Response: 200 + state snapshot (state="signed_out")
 - Same as sign-out plus: Keychain api_key + current_user_id are deleted. Use for "switch account" flows.
 
+### Adopt key (Google / external OAuth)
+- Method: POST
+- Path: `/local/auth/adopt-key`
+- Body: `{"api_key": "sk_..."}`
+- Response: 200 + state snapshot (state="signed_in")
+- Purpose: install an externally-obtained api_key into the daemon's live auth. A login flow that exchanges credentials with Cloud directly (Google/OAuth) and never transits `/local/auth/login` has the key in hand but no way to reach `applyAPIKey` — on macOS the daemon owns the live key via Keychain + AuthManager, and `PATCH /config` cannot update it (`api_key` is a protected field and config reload is a no-op for the in-process key). Without this endpoint a post-logout re-login leaves the GatewayClient authenticating with an empty key (Cloud returns 401; the user appears as the free/anonymous tier). adopt-key converges that flow onto the SAME post-login state as email login.
+- Side effects on success: validates the key against Cloud (`/auth/me`), writes it to the Keychain under the resolved `user_id`, applies it to GatewayClient + WS Client, transitions to `signed_in`, starts the WS connection. Safe while already signed_in (account switch): WS is restarted around the key swap and stale email JWTs are cleared.
+- Hardening: the key is validated with Cloud BEFORE any mutation. On an invalid key or a `/auth/me` response with no resolvable `user_id`, the daemon stores nothing and leaves the current/pending auth state untouched.
+- Errors:
+  - 400 `invalid_request` (missing / empty `api_key`)
+  - 401 `invalid_api_key` (Cloud rejected the key — passthrough)
+  - 503 `platform_unsupported` (non-macOS: no Keychain; legacy `cfg.APIKey` yaml path applies)
+- Client note: a **404** here means the daemon predates this endpoint — that (or an unreachable daemon) is the ONLY signal a client should use to fall back to the legacy config.yaml path. A 401 / 500 is a hard failure and must NOT fall back.
+
 ## Events on /events SSE stream
 
 `auth_state_changed` — emitted on every state transition. Payload:

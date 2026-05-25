@@ -23,6 +23,7 @@ type WSController struct {
 	mu      sync.Mutex
 	client  *Client
 	cancel  context.CancelFunc
+	done    chan struct{} // closed when the current run goroutine exits; nil when not running
 	running bool
 	parent  context.Context
 }
@@ -44,7 +45,9 @@ func (w *WSController) Start(_ context.Context) {
 		return
 	}
 	runCtx, cancel := context.WithCancel(w.parent)
+	done := make(chan struct{})
 	w.cancel = cancel
+	w.done = done
 	w.running = true
 	w.mu.Unlock()
 
@@ -53,9 +56,39 @@ func (w *WSController) Start(_ context.Context) {
 			w.mu.Lock()
 			w.running = false
 			w.cancel = nil
+			w.done = nil
 			w.mu.Unlock()
+			close(done) // unblock any Restart waiting to join this run
 		}()
 		w.client.RunWithReconnect(runCtx)
+	}()
+}
+
+// Restart stops the current run (if any) and starts a fresh one once the old
+// goroutine has fully drained. Stop()+Start() cannot be used for an in-place
+// key swap: Stop only cancels the run context, leaving `running` true until
+// the goroutine's deferred cleanup, so an immediately-following Start
+// short-circuits and the WS never reconnects with the new key (the
+// account-switch hazard). Restart joins the old goroutine via its done
+// channel before starting — in the background, so HTTP callers (AdoptKey)
+// don't block on the WS handshake. No-op-safe when not running.
+func (w *WSController) Restart(_ context.Context) {
+	w.mu.Lock()
+	cancel := w.cancel
+	done := w.done
+	w.cancel = nil
+	w.mu.Unlock()
+
+	if cancel == nil {
+		w.Start(w.parent) // nothing running — just start
+		return
+	}
+	cancel()
+	go func() {
+		if done != nil {
+			<-done // wait for the old run's defer to flip running → false
+		}
+		w.Start(w.parent)
 	}()
 }
 
