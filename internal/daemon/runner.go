@@ -75,6 +75,7 @@ type RunAgentRequest struct {
 	ModelOverride  string                `json:"-"`                   // overrides agent model tier
 	BypassRouting  bool                  `json:"-"`                   // skip route lock (heartbeat runs)
 	SessionHistory []client.Message      `json:"-"`                   // pre-loaded history for LLM context (BypassRouting runs)
+	OmitHistory    bool                  `json:"-"`                   // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
 	StickyContext  string                `json:"-"`                   // 额外的 sticky context，注入系统提示（对用户不可见）
 	Files          []RemoteFile          `json:"-"`                   // remote file attachments from Cloud (WS only)
 
