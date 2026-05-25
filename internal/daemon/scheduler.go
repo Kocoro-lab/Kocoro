@@ -362,3 +362,24 @@ func (h *scheduleHandler) OnCloudPlan(planType, content string, needsReview bool
 func (h *scheduleHandler) OnApprovalNeeded(tool string, args string) bool {
 	return !agent.DisallowsUnattendedAutoApproval(tool)
 }
+
+// ProactiveSender is the narrow Cloud-broadcast surface scheduler needs from
+// *daemon.Client. Defined here so tests can substitute a recording fake
+// without standing up a real WebSocket server. Mirrors LifecycleEventSender
+// in lifecycle.go.
+type ProactiveSender interface {
+	SendProactive(agentName, text, sessionID string) error
+}
+
+// broadcastReply forwards a successful schedule reply to every Cloud channel
+// mapped to the named agent (Slack / Lark / Telegram / …). No-op if any
+// precondition fails. Errors are logged, never propagated — the local
+// schedule lifecycle is intentionally decoupled from Cloud delivery.
+func broadcastReply(ws ProactiveSender, scheduleID, agent, reply, sessionID string) {
+	if ws == nil || agent == "" || reply == "" {
+		return
+	}
+	if err := ws.SendProactive(agent, reply, sessionID); err != nil {
+		log.Printf("scheduler: proactive send failed for schedule %s: %v", scheduleID, err)
+	}
+}
