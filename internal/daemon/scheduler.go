@@ -36,6 +36,12 @@ type Scheduler struct {
 	mu        sync.Mutex
 	lastFired map[string]time.Time // scheduleID -> last fired minute (truncated)
 	sem       chan struct{}        // bounded concurrency
+
+	// proactiveSender is the Cloud-broadcast sender for successful runs.
+	// nil at construction; resolved lazily from deps.WSClient at fire time
+	// so a daemon that signs in mid-process picks up the WS client without
+	// re-creating the Scheduler. Tests inject a fake directly.
+	proactiveSender ProactiveSender
 }
 
 // NewScheduler creates a Scheduler that evaluates schedules from mgr.
@@ -272,6 +278,14 @@ func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAge
 		return
 	}
 	s.emitScheduleRunWithUsage("succeeded", sched, sessionID, nil, usage)
+
+	ws := s.proactiveSender
+	if ws == nil && s.deps != nil && s.deps.WSClient != nil {
+		ws = s.deps.WSClient
+	}
+	if result != nil {
+		broadcastReply(ws, sched.ID, sched.Agent, result.Reply, result.SessionID)
+	}
 }
 
 // emitScheduleRun publishes a schedule_run lifecycle event without a usage

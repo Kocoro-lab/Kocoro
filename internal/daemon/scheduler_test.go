@@ -423,3 +423,77 @@ func TestBroadcastReply_SendErrorIsSwallowed(t *testing.T) {
 		t.Fatalf("send was not attempted: got %d calls", len(ws.calls))
 	}
 }
+
+func TestRunWithLifecycle_BroadcastsOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
+
+	s := NewScheduler(mgr, &ServerDeps{})
+	fake := &fakeProactiveSender{}
+	s.proactiveSender = fake // testing seam injected on the Scheduler value
+
+	sched := schedule.Schedule{
+		ID:      "abc123",
+		Agent:   "researcher",
+		Prompt:  "anything",
+		Cron:    "* * * * *",
+		Enabled: true,
+	}
+
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return &RunAgentResult{
+			Reply:     "today's AI news: ...",
+			SessionID: "sess-1",
+			Agent:     "researcher",
+		}, nil
+	})
+
+	if len(fake.calls) != 1 {
+		t.Fatalf("want 1 SendProactive call, got %d", len(fake.calls))
+	}
+	got := fake.calls[0]
+	if got.agent != "researcher" || got.text != "today's AI news: ..." || got.sessionID != "sess-1" {
+		t.Errorf("payload mismatch: %+v", got)
+	}
+}
+
+func TestRunWithLifecycle_NoBroadcastOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
+
+	s := NewScheduler(mgr, &ServerDeps{})
+	fake := &fakeProactiveSender{}
+	s.proactiveSender = fake
+
+	sched := schedule.Schedule{ID: "abc123", Agent: "researcher"}
+
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return nil, errors.New("agent run failed")
+	})
+
+	if len(fake.calls) != 0 {
+		t.Fatalf("want 0 SendProactive calls on failure, got %d", len(fake.calls))
+	}
+}
+
+func TestRunWithLifecycle_NoBroadcastOnNilResult(t *testing.T) {
+	// Defensive: RunAgent in current code always returns either (*result, nil)
+	// or (nil, err). If it ever returns (nil, nil) — pathological success —
+	// the broadcast path must not panic on result.Reply / result.SessionID.
+	dir := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
+
+	s := NewScheduler(mgr, &ServerDeps{})
+	fake := &fakeProactiveSender{}
+	s.proactiveSender = fake
+
+	sched := schedule.Schedule{ID: "abc123", Agent: "researcher"}
+
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return nil, nil
+	})
+
+	if len(fake.calls) != 0 {
+		t.Fatalf("want 0 SendProactive calls on nil result, got %d", len(fake.calls))
+	}
+}
