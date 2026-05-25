@@ -19,16 +19,16 @@ Schedules are automated tasks that run on a cron schedule without any human inte
 ### Create a schedule
 - Method: POST
 - Path: /schedules
-- Body: `{"prompt": "Check the sales dashboard and summarize any anomalies", "cron": "0 9 * * 1-5", "agent": "analyst"}`
-- Response: `{"id": "...", "prompt": "...", "cron": "...", "agent": "...", "enabled": true}`
-- Notes: `agent` is optional — omit to use the default agent. `cron` uses standard 5-field cron format.
+- Body: `{"prompt": "Check the sales dashboard and summarize any anomalies", "cron": "0 9 * * 1-5", "agent": "analyst", "stateful": false}`
+- Response: `{"id": "...", "prompt": "...", "cron": "...", "agent": "...", "enabled": true, "stateful": false}`
+- Notes: `agent` is optional — omit to use the default agent. `cron` uses standard 5-field cron format. `stateful` defaults to `false` (each run starts with empty LLM history; recommended for digest/polling/PR-review style tasks). Set `stateful: true` for agents that need cross-run memory (continuous tracking, follow-up analysis).
 
 ### Update a schedule
 - Method: PATCH
 - Path: /schedules/{id}
-- Body: `{"prompt": "Updated task...", "enabled": false}`
-- Response: `{"id": "...", "prompt": "...", "cron": "...", "agent": "...", "enabled": false}`
-- Notes: Only include fields you want to change.
+- Body: `{"prompt": "Updated task...", "enabled": false, "stateful": true}`
+- Response: `{"id": "...", "prompt": "...", "cron": "...", "agent": "...", "enabled": false, "stateful": true}`
+- Notes: Only include fields you want to change. `stateful` accepts `true` or `false`; omit to leave existing setting untouched. Legacy schedules created before this field existed have no `stateful` value on disk and behave as if stateful — explicitly send `{"stateful": false}` to migrate them to the new stateless default.
 
 ### Delete a schedule
 - Method: DELETE
