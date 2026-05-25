@@ -3942,15 +3942,19 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Agent  string `json:"agent"`
-		Cron   string `json:"cron"`
-		Prompt string `json:"prompt"`
+		Agent    string `json:"agent"`
+		Cron     string `json:"cron"`
+		Prompt   string `json:"prompt"`
+		Stateful *bool  `json:"stateful"` // nil → default (false / stateless); explicit overrides
 	}
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	// stateful=false is the eventual default. Task 6 wires this to an optional body field.
-	id, err := s.deps.ScheduleManager.Create(req.Agent, req.Cron, req.Prompt, false)
+	stateful := false
+	if req.Stateful != nil {
+		stateful = *req.Stateful
+	}
+	id, err := s.deps.ScheduleManager.Create(req.Agent, req.Cron, req.Prompt, stateful)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, err.Error())
@@ -3976,21 +3980,23 @@ func (s *Server) handlePatchSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	var patch struct {
-		Cron    *string `json:"cron"`
-		Prompt  *string `json:"prompt"`
-		Enabled *bool   `json:"enabled"`
+		Cron     *string `json:"cron"`
+		Prompt   *string `json:"prompt"`
+		Enabled  *bool   `json:"enabled"`
+		Stateful *bool   `json:"stateful"`
 	}
 	if !decodeBody(w, r, &patch) {
 		return
 	}
-	if patch.Cron == nil && patch.Prompt == nil && patch.Enabled == nil {
+	if patch.Cron == nil && patch.Prompt == nil && patch.Enabled == nil && patch.Stateful == nil {
 		writeError(w, http.StatusBadRequest, "no fields to update")
 		return
 	}
 	update := &schedule.UpdateOpts{
-		Cron:    patch.Cron,
-		Prompt:  patch.Prompt,
-		Enabled: patch.Enabled,
+		Cron:     patch.Cron,
+		Prompt:   patch.Prompt,
+		Enabled:  patch.Enabled,
+		Stateful: patch.Stateful,
 	}
 	if err := s.deps.ScheduleManager.Update(id, update); err != nil {
 		if strings.Contains(err.Error(), "not found") {
