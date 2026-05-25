@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -325,5 +326,100 @@ func TestRunWithLifecycle_SkipsLastRunWhenNoSession(t *testing.T) {
 	}
 	if got.LastRunMessageStartIndex != 0 || got.LastRunMessageEndIndex != 0 {
 		t.Errorf("indices must remain zero when no session: start=%d end=%d", got.LastRunMessageStartIndex, got.LastRunMessageEndIndex)
+	}
+}
+
+// fakeProactiveSender records SendProactive invocations for assertions.
+type fakeProactiveSender struct {
+	calls []proactiveCall
+	err   error
+}
+
+type proactiveCall struct {
+	agent     string
+	text      string
+	sessionID string
+}
+
+func (f *fakeProactiveSender) SendProactive(agentName, text, sessionID string) error {
+	f.calls = append(f.calls, proactiveCall{agentName, text, sessionID})
+	return f.err
+}
+
+func TestBroadcastReply_Guards(t *testing.T) {
+	const (
+		scheduleID = "abc123"
+		sessionID  = "sess-1"
+	)
+
+	tests := []struct {
+		name     string
+		ws       ProactiveSender // nil means literally nil (the typed-nil pitfall is handled at the call site, not here)
+		agent    string
+		reply    string
+		wantCall bool
+	}{
+		{
+			name:     "happy path broadcasts",
+			ws:       &fakeProactiveSender{},
+			agent:    "researcher",
+			reply:    "today's AI news: ...",
+			wantCall: true,
+		},
+		{
+			name:     "nil sender is a no-op",
+			ws:       nil,
+			agent:    "researcher",
+			reply:    "today's AI news: ...",
+			wantCall: false,
+		},
+		{
+			name:     "empty agent skips broadcast",
+			ws:       &fakeProactiveSender{},
+			agent:    "",
+			reply:    "today's AI news: ...",
+			wantCall: false,
+		},
+		{
+			name:     "empty reply skips broadcast",
+			ws:       &fakeProactiveSender{},
+			agent:    "researcher",
+			reply:    "",
+			wantCall: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			broadcastReply(tc.ws, scheduleID, tc.agent, tc.reply, sessionID)
+
+			if tc.ws == nil {
+				return // nothing to inspect
+			}
+			fake := tc.ws.(*fakeProactiveSender)
+			if tc.wantCall {
+				if len(fake.calls) != 1 {
+					t.Fatalf("want 1 call, got %d", len(fake.calls))
+				}
+				got := fake.calls[0]
+				if got.agent != tc.agent || got.text != tc.reply || got.sessionID != sessionID {
+					t.Errorf("call payload mismatch: got %+v", got)
+				}
+			} else {
+				if len(fake.calls) != 0 {
+					t.Fatalf("want 0 calls, got %d (%+v)", len(fake.calls), fake.calls)
+				}
+			}
+		})
+	}
+}
+
+func TestBroadcastReply_SendErrorIsSwallowed(t *testing.T) {
+	ws := &fakeProactiveSender{err: errors.New("ws closed")}
+	// Must not panic, must not return; we're asserting that no panic / no
+	// exit-status change escapes the helper.
+	broadcastReply(ws, "abc", "researcher", "hello", "sess-1")
+	if len(ws.calls) != 1 {
+		t.Fatalf("send was not attempted: got %d calls", len(ws.calls))
 	}
 }
