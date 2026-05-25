@@ -375,11 +375,11 @@ type ProactiveSender interface {
 // mapped to the named agent (Slack / Lark / Telegram / …). No-op if any
 // precondition fails. Errors are logged, never propagated — the local
 // schedule lifecycle is intentionally decoupled from Cloud delivery.
-func broadcastReply(ws ProactiveSender, scheduleID, agent, reply, sessionID string) {
-	if ws == nil || agent == "" || reply == "" {
+func broadcastReply(ws ProactiveSender, scheduleID, agentName, reply, sessionID string) {
+	if ws == nil || agentName == "" || reply == "" {
 		return
 	}
-	if err := ws.SendProactive(agent, reply, sessionID); err != nil {
+	if err := ws.SendProactive(agentName, reply, sessionID); err != nil {
 		log.Printf("scheduler: proactive send failed for schedule %s: %v", scheduleID, err)
 	}
 }
