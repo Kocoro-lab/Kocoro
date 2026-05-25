@@ -24,6 +24,21 @@ type Schedule struct {
 	Enabled    bool      `json:"enabled"`
 	SyncStatus string    `json:"sync_status"`
 	CreatedAt  time.Time `json:"created_at"`
+
+	// Stateful controls whether scheduled runs preserve LLM context across
+	// triggers. nil = legacy schedule (treated as stateful for backward
+	// compatibility); *false = each run gets an empty history snapshot
+	// (default for new schedules); *true = explicit opt-in to share history
+	// across runs. The session file is appended to on every run regardless —
+	// only the LLM's view (runner.historySnapshotForRequest) is affected.
+	Stateful *bool `json:"stateful,omitempty"`
+}
+
+// IsStateless reports whether this schedule should run with an empty LLM
+// history snapshot. Legacy schedules (Stateful == nil) preserve their
+// pre-feature stateful behaviour.
+func (s *Schedule) IsStateless() bool {
+	return s.Stateful != nil && !*s.Stateful
 }
 
 type UpdateOpts struct {

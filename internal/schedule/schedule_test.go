@@ -1,8 +1,10 @@
 package schedule
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -314,5 +316,57 @@ func TestUpdatePreservesContextWhenPromptSame(t *testing.T) {
 	}
 	if !mgr.HasContext(id) {
 		t.Error("context sidecar should survive an update that sets the same prompt")
+	}
+}
+
+// --- Task 1: Stateful *bool / IsStateless semantics -------------------------
+
+func TestSchedule_IsStateless_LegacyJSONTreatedAsStateful(t *testing.T) {
+	raw := `{"id":"abc","agent":"pr-reviewer","cron":"*/30 * * * *","prompt":"check PRs","enabled":true}`
+	var s Schedule
+	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+		t.Fatalf("unmarshal legacy: %v", err)
+	}
+	if s.Stateful != nil {
+		t.Errorf("legacy schedule should leave Stateful nil, got *%v", *s.Stateful)
+	}
+	if s.IsStateless() {
+		t.Error("legacy schedule must be treated as stateful (current behaviour), got stateless")
+	}
+}
+
+func TestSchedule_IsStateless_ExplicitTrue(t *testing.T) {
+	b := true
+	s := Schedule{Stateful: &b}
+	if s.IsStateless() {
+		t.Error("Stateful=*true should not be stateless")
+	}
+}
+
+func TestSchedule_IsStateless_ExplicitFalse(t *testing.T) {
+	b := false
+	s := Schedule{Stateful: &b}
+	if !s.IsStateless() {
+		t.Error("Stateful=*false should be stateless")
+	}
+}
+
+func TestSchedule_JSONRoundTrip_ExplicitFalse(t *testing.T) {
+	b := false
+	s := Schedule{ID: "x", Stateful: &b}
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"stateful":false`) {
+		t.Errorf("expected explicit false in JSON, got %s", data)
+	}
+
+	var back Schedule
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Stateful == nil || *back.Stateful {
+		t.Errorf("round-trip lost explicit false: %+v", back.Stateful)
 	}
 }
