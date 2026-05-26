@@ -721,6 +721,15 @@ type RunAgentResult struct {
 	// an error.
 	Partial     bool           `json:"partial,omitempty"`
 	FailureCode runstatus.Code `json:"failure_code,omitempty"`
+
+	// MessageStartIndex / MessageEndIndex pin the slice of sess.Messages this
+	// invocation wrote (== len(sess.Messages) snapshot before/after the run).
+	// Scheduler stores these into Schedule.LastRunMessage{Start,End}Index so
+	// schedule_show can return the precise turns from this run instead of the
+	// session's tail (which, on named-agent shared sessions, may be later
+	// interactive chat). Populated on both success and hard-error paths.
+	MessageStartIndex int `json:"message_start_index,omitempty"`
+	MessageEndIndex   int `json:"message_end_index,omitempty"`
 }
 
 // RunAgentUsage tracks token and cost information for a single agent run.
@@ -2052,7 +2061,18 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			})
 			deps.EventBus.Emit(Event{Type: EventAgentError, Payload: payload})
 		}
-		return nil, fmt.Errorf("agent error for %s: %w", agentName, runErr)
+		// Return a partial result alongside the error so schedulers (and any
+		// other lifecycle observer) can stamp "last run pointed at session X"
+		// even when the LLM call hard-errored. Production callers (cmd/daemon.go
+		// and heartbeat.go) gate on err first and never deref result on error,
+		// so this is a wire-safe upgrade.
+		return &RunAgentResult{
+			SessionID:         savedSessionID,
+			Agent:             agentName,
+			FailureCode:       status.FailureCode,
+			MessageStartIndex: turnBase.msgCount,
+			MessageEndIndex:   len(sess.Messages),
+		}, fmt.Errorf("agent error for %s: %w", agentName, runErr)
 	}
 	if errors.Is(runErr, agent.ErrMaxIterReached) {
 		log.Printf("daemon: agent %s hit iteration limit, saving partial result", agentName)
@@ -2259,12 +2279,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		returnedSessionID = ""
 	}
 	return &RunAgentResult{
-		Reply:       result,
-		SessionID:   returnedSessionID,
-		Agent:       agentName,
-		Usage:       reportedUsage,
-		Partial:     status.Partial,
-		FailureCode: status.FailureCode,
+		Reply:             result,
+		SessionID:         returnedSessionID,
+		Agent:             agentName,
+		Usage:             reportedUsage,
+		Partial:           status.Partial,
+		FailureCode:       status.FailureCode,
+		MessageStartIndex: turnBase.msgCount,
+		MessageEndIndex:   len(sess.Messages),
 	}, nil
 }
 

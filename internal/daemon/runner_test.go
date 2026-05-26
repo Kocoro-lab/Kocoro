@@ -1408,3 +1408,124 @@ func TestHistorySnapshot_OmitHistoryReturnsEmpty(t *testing.T) {
 		t.Errorf("historySnapshotForRequest mutated session: messages now %d", len(sess.Messages))
 	}
 }
+
+// --- Task 3: RunAgent contract for message indices + partial result --------
+
+// nullEventHandler is a no-op agent.EventHandler used by the RunAgent
+// contract tests below. None of the assertions care about per-call
+// notifications; the tests only inspect the returned *RunAgentResult.
+type nullEventHandler struct{}
+
+func (nullEventHandler) OnToolCall(string, string, string)                          {}
+func (nullEventHandler) OnToolResult(string, string, string, agent.ToolResult, time.Duration) {}
+func (nullEventHandler) OnText(string)                                              {}
+func (nullEventHandler) OnPreamble(string)                                          {}
+func (nullEventHandler) OnStreamDelta(string)                                       {}
+func (nullEventHandler) OnApprovalNeeded(string, string) bool                       { return true }
+func (nullEventHandler) OnUsage(agent.TurnUsage)                                    {}
+func (nullEventHandler) OnCloudAgent(string, string, string)                        {}
+func (nullEventHandler) OnCloudProgress(int, int)                                   {}
+func (nullEventHandler) OnCloudPlan(string, string, bool)                           {}
+
+// runAgentContractTestDeps builds a minimal ServerDeps that passes RunAgent's
+// validation gates and points the gateway at the supplied httptest URL. The
+// returned deps drive a fully default-agent run with no MCP/skills/auditor
+// overhead — enough to reach loop.Run() with a working LLM transport.
+func runAgentContractTestDeps(t *testing.T, gatewayURL string) *ServerDeps {
+	t.Helper()
+	shanDir := t.TempDir()
+	cfg := &config.Config{
+		Provider:  "gateway",
+		ModelTier: "medium",
+		Agent: config.AgentConfig{
+			MaxIterations: 2, // small bound — we only need one turn to exit
+		},
+	}
+	return &ServerDeps{
+		Config:       cfg,
+		GW:           client.NewGatewayClient(gatewayURL, "test-key"),
+		Registry:     agent.NewToolRegistry(),
+		BaselineReg:  agent.NewToolRegistry(),
+		SessionCache: NewSessionCache(shanDir),
+		ShannonDir:   shanDir,
+		AgentsDir:    filepath.Join(shanDir, "agents"),
+	}
+}
+
+// Success path: RunAgent must populate MessageStartIndex (== len(sess.Messages)
+// before the run wrote anything) and MessageEndIndex (== len(sess.Messages)
+// after the run finished). Scheduler uses the range to slice "this run's
+// turns" out of a shared session.
+func TestRunAgent_Success_PopulatesMessageIndices(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "hello from fake llm"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+
+	req := RunAgentRequest{
+		Text:          "hi",
+		Source:        "heartbeat", // arbitrary non-empty so user message is appended
+		BypassRouting: true,        // avoid route lock + adhoc registration overhead
+	}
+	res, err := RunAgent(context.Background(), deps, req, nullEventHandler{})
+	if err != nil {
+		t.Fatalf("RunAgent error: %v", err)
+	}
+	if res == nil {
+		t.Fatal("RunAgent returned nil result on success")
+	}
+	// MessageStartIndex == turnBase.msgCount, which is captured AFTER the
+	// pre-loop user-message append for sources with non-empty Source. So on
+	// a fresh session with Source="heartbeat" we expect StartIndex=1 (one
+	// user message already on disk when captureTurnBaseline runs), and
+	// EndIndex >= 2 (StartIndex + at least the assistant reply this run wrote).
+	// The downstream resolver (SummarizeLastRun) emits only assistant turns
+	// from the slice, so this tighter-by-one start is by design.
+	if res.MessageStartIndex != 1 {
+		t.Errorf("MessageStartIndex = %d, want 1 (turnBase.msgCount captured after pre-loop user append)", res.MessageStartIndex)
+	}
+	if res.MessageEndIndex <= res.MessageStartIndex {
+		t.Errorf("MessageEndIndex = %d must be > MessageStartIndex = %d", res.MessageEndIndex, res.MessageStartIndex)
+	}
+	if res.Reply != "hello from fake llm" {
+		t.Errorf("Reply = %q, want %q", res.Reply, "hello from fake llm")
+	}
+}
+
+// Hard-error path: RunAgent today returns (nil, err); after this task it
+// must return (&RunAgentResult{SessionID, MessageStartIndex, MessageEndIndex,
+// FailureCode}, err) so the scheduler can stamp LastRun on partial transcripts.
+// The three production callers (cmd/daemon.go x2, heartbeat.go) gate on err
+// first and never deref result on error, so this is wire-safe.
+func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
+	// httptest handler that always 500s — every LLM call hits a hard error.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "synthetic upstream failure", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+
+	req := RunAgentRequest{
+		Text:   "fail please",
+		Source: "heartbeat",
+		// Ephemeral=false (default): RunAgent's hard-error block calls
+		// sessMgr.Save() and sets savedSessionID, which we assert below.
+	}
+	res, err := RunAgent(context.Background(), deps, req, nullEventHandler{})
+	if err == nil {
+		t.Fatal("expected hard error from always-500 gateway")
+	}
+	if res == nil {
+		t.Fatal("partial result must be non-nil on hard error (scheduler needs sessionID to stamp LastRun)")
+	}
+	if res.SessionID == "" {
+		t.Errorf("partial result should carry saved sessionID, got empty (hard-error block ran sessMgr.Save successfully?)")
+	}
+	if res.MessageEndIndex < res.MessageStartIndex {
+		t.Errorf("indices invariant violated: end %d < start %d", res.MessageEndIndex, res.MessageStartIndex)
+	}
+}
