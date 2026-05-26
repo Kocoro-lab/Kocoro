@@ -42,6 +42,8 @@ The bundled `kocoro` skill is the AI-facing source of truth for daemon HTTP APIs
 
 Bundled skills are overlaid into the user skill directory on startup and user edits are overwritten. Fork under a new skill name to customize. The hidden generative UI skill emits `html-artifact` blocks for Desktop's sandboxed WKWebView.
 
+`internal/daemon/skill_filter.go` maintains a `desktopOnlySkills` registry. Daemon filters these out of the per-request skill list when `req.Source` is a cloud-distributed channel (Feishu / Lark / WeCom / Slack / LINE / Telegram / webhook), keeping the use_skill tool registry, scaffolded listing, and semantic discovery consistent. Filter is applied once on the producer side immediately after `LoadGlobalSkills` so all consumers see the same view. Drift test (`skill_filter_test.go`) walks the `desktopOnlySkills × cloudSourceSet` cross product.
+
 ### Agent Names
 
 Agent names must match `^[a-z0-9][a-z0-9_-]{0,63}$`. Validate before path construction.

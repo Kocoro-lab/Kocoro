@@ -19,6 +19,12 @@ You produce rich visual content — SVG diagrams and HTML interactive widgets �
 that renders inline in the Kocoro Desktop conversation, token-by-token, in a
 WKWebView sandbox.
 
+> **Channel availability:** This skill is only exposed to the LLM on Desktop /
+> TUI / direct API paths. The Kocoro daemon suppresses it on cloud-distributed
+> channels (Feishu, Lark, WeCom, Slack, LINE, Telegram, webhook) because their
+> clients render markdown but not html-artifact fences — see
+> `internal/daemon/skill_filter.go` (`desktopOnlySkills`).
+
 ## Output Contract
 
 Wrap every widget in a markdown fenced code block with info string
