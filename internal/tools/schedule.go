@@ -38,9 +38,21 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"agent":       map[string]any{"type": "string", "description": "Agent name (from ~/.shannon/agents/). Empty for default agent."},
-					"cron":        map[string]any{"type": "string", "description": "5-field cron expression (minute hour day month weekday). Supports */5, 1-5, 1,3,5."},
-					"prompt":      map[string]any{"type": "string", "description": "The prompt to send to the agent on each run."},
+					"agent": map[string]any{
+						"type": "string",
+						"description": "Agent name (from ~/.shannon/agents/). " +
+							"When the user is creating a schedule from inside a conversation with a named agent (e.g. they are talking to 'analyst' and ask to schedule a daily report), pass that agent's name so future runs use the same persona AND so the user can find the results via session_search inside that same agent. " +
+							"Pass an empty string only when the user explicitly wants the default agent (rare); each run will land in the global ~/.shannon/sessions/ pool and won't be visible to your session_search.",
+					},
+					"cron":   map[string]any{"type": "string", "description": "5-field cron expression (minute hour day month weekday). Supports */5, 1-5, 1,3,5."},
+					"prompt": map[string]any{"type": "string", "description": "The prompt to send to the agent on each run."},
+					"stateful": map[string]any{
+						"type":    "boolean",
+						"default": false,
+						"description": "Only meaningful for named agents (ignored for the default agent). " +
+							"false (default, recommended): each run starts with no prior conversation history — best for digests, polling, daily reports, monitoring, and any task where runs are independent. " +
+							"true: each run sees the conversation from prior runs — only choose this when the user explicitly wants the agent to remember and build on previous runs (e.g. continuous research, ongoing project tracking with follow-up questions).",
+					},
 					"description": agent.DescriptionFieldSpec,
 				},
 			},
@@ -60,10 +72,14 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"id":          map[string]any{"type": "string", "description": "Schedule ID"},
-					"cron":        map[string]any{"type": "string", "description": "New cron expression"},
-					"prompt":      map[string]any{"type": "string", "description": "New prompt"},
-					"enabled":     map[string]any{"type": "boolean", "description": "Enable or disable"},
+					"id":      map[string]any{"type": "string", "description": "Schedule ID"},
+					"cron":    map[string]any{"type": "string", "description": "New cron expression"},
+					"prompt":  map[string]any{"type": "string", "description": "New prompt"},
+					"enabled": map[string]any{"type": "boolean", "description": "Enable or disable"},
+					"stateful": map[string]any{
+						"type":        "boolean",
+						"description": "Change history-preservation behaviour for named-agent schedules. Omit to leave unchanged. false = each run starts fresh; true = each run sees prior history. Has no effect on default-agent schedules.",
+					},
 					"description": agent.DescriptionFieldSpec,
 				},
 			},
@@ -100,9 +116,8 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		if cron == "" || prompt == "" {
 			return agent.ToolResult{Content: "cron and prompt are required", IsError: true}, nil
 		}
-		// LLM-created schedules default to stateless (same as HTTP/CLI default).
-		// If callers need stateful schedules, surface a "stateful" arg here.
-		id, err := t.manager.Create(agentName, cron, prompt, false)
+		stateful, _ := args["stateful"].(bool) // missing → false (Go zero value, matches HTTP/CLI default)
+		id, err := t.manager.Create(agentName, cron, prompt, stateful)
 		if err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
 		}
@@ -155,7 +170,10 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		if v, ok := args["enabled"].(bool); ok {
 			opts.Enabled = &v
 		}
-		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil {
+		if v, ok := args["stateful"].(bool); ok {
+			opts.Stateful = &v
+		}
+		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil {
 			return agent.ToolResult{Content: "at least one of cron, prompt, or enabled is required", IsError: true}, nil
 		}
 		if err := t.manager.Update(id, opts); err != nil {

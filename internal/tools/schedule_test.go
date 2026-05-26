@@ -221,7 +221,7 @@ func TestScheduleTool_UpdateAppendsHeartbeatWarning(t *testing.T) {
 	shan := setupShannonHomeWithAgent(t, "hb", "30m")
 	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
 
-	id, err := mgr.Create("hb", "*/5 * * * *", "initial")
+	id, err := mgr.Create("hb", "*/5 * * * *", "initial", false)
 	if err != nil {
 		t.Fatalf("seed schedule: %v", err)
 	}
