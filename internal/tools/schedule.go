@@ -110,7 +110,15 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	}
 	switch t.action {
 	case "create":
-		agentName, _ := args["agent"].(string)
+		agentName, agentExplicit := args["agent"].(string)
+		// When the LLM omits the agent arg entirely, default to the caller's
+		// own agent so results stay reachable via session_search inside the
+		// same agent. "agent": "" (explicit empty) still means default agent.
+		if !agentExplicit {
+			if ctxAgent, ok := agent.AgentNameFromContext(ctx); ok {
+				agentName = ctxAgent
+			}
+		}
 		cron, _ := args["cron"].(string)
 		prompt, _ := args["prompt"].(string)
 		if cron == "" || prompt == "" {

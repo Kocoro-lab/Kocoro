@@ -1882,6 +1882,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		})
 	}
 	loop.SetSessionID(sess.ID)
+	// Make the caller's agent name available to tools via ctx. schedule_create
+	// reads this so a schedule built from an agent conversation defaults to
+	// that agent (keeping results reachable via session_search inside the
+	// same agent) instead of silently routing to the default agent's pool.
+	loop.SetAgentName(agentName)
 	loop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)
 	// Inject the per-session ReadTracker so file_read dedup history persists
 	// across the per-message AgentLoop instances created here. nil-safe: an

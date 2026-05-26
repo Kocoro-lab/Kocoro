@@ -49,6 +49,26 @@ func MemoryDirFromContext(ctx context.Context) string {
 	return ""
 }
 
+// agentNameKey is the context key for the current agent's name.
+// Empty string is meaningful — it represents the default agent.
+type agentNameKey struct{}
+
+// WithAgentName returns a new context with the agent name set. Tools that
+// need "who is calling me" (e.g. schedule_create wanting to default to the
+// caller's agent) read it via AgentNameFromContext.
+func WithAgentName(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, agentNameKey{}, name)
+}
+
+// AgentNameFromContext returns the current agent's name from context plus
+// an "ok" boolean. ok=false means no agent identity was injected (tool
+// called outside the agent loop); ok=true with empty string means the
+// caller is explicitly the default agent.
+func AgentNameFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(agentNameKey{}).(string)
+	return v, ok
+}
+
 // IsMemoryFile returns true if path resolves to the MEMORY.md inside the
 // agent's configured memory directory. Returns false when no memory dir
 // is set in context (e.g. tool called outside agent loop).
