@@ -1510,8 +1510,9 @@ func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
 	defer deps.SessionCache.CloseAll()
 
 	req := RunAgentRequest{
-		Text:   "fail please",
-		Source: "heartbeat",
+		Text:          "fail please",
+		Source:        "heartbeat",
+		BypassRouting: true, // symmetry with the success test (skip route lock + unattended-probe gating)
 		// Ephemeral=false (default): RunAgent's hard-error block calls
 		// sessMgr.Save() and sets savedSessionID, which we assert below.
 	}
@@ -1524,6 +1525,14 @@ func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
 	}
 	if res.SessionID == "" {
 		t.Errorf("partial result should carry saved sessionID, got empty (hard-error block ran sessMgr.Save successfully?)")
+	}
+	// Assert exact values rather than the trivially-true ordering invariant
+	// (0 >= 0). On a fresh session with Source="heartbeat" the pre-loop user
+	// append lands at index 0, so turnBase.msgCount == 1 when captured —
+	// matching the success test. A future refactor that returned zero indices
+	// on hard error would slip through an ordering-only check; this catches it.
+	if res.MessageStartIndex != 1 {
+		t.Errorf("MessageStartIndex = %d, want 1 (turnBase.msgCount captured after pre-loop user append)", res.MessageStartIndex)
 	}
 	if res.MessageEndIndex < res.MessageStartIndex {
 		t.Errorf("indices invariant violated: end %d < start %d", res.MessageEndIndex, res.MessageStartIndex)

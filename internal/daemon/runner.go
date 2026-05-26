@@ -723,7 +723,15 @@ type RunAgentResult struct {
 	FailureCode runstatus.Code `json:"failure_code,omitempty"`
 
 	// MessageStartIndex / MessageEndIndex pin the slice of sess.Messages this
-	// invocation wrote (== len(sess.Messages) snapshot before/after the run).
+	// invocation wrote. MessageStartIndex is len(sess.Messages) AFTER the
+	// pre-loop user message was appended (when Source != "" && !Ephemeral) —
+	// i.e. it points at the first ASSISTANT message this run will write, not
+	// at the user message that triggered it. MessageEndIndex is
+	// len(sess.Messages) after the run terminated. The downstream resolver
+	// (SummarizeLastRun) emits only assistant turns, so user-message
+	// inclusion is invisible to consumers, but document the actual semantics
+	// for future callers.
+	//
 	// Scheduler stores these into Schedule.LastRunMessage{Start,End}Index so
 	// schedule_show can return the precise turns from this run instead of the
 	// session's tail (which, on named-agent shared sessions, may be later
