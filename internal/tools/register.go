@@ -375,6 +375,110 @@ func RegisterAllWithBaseline(gw *client.GatewayClient, cfg *config.Config, agent
 	return baseline, reg, sp, mcpMgr, cleanup, err
 }
 
+// StartMCPFunc kicks off the deferred MCP connection goroutines for an
+// async registration. It blocks only long enough to register every server's
+// config under one lock; each individual connect runs in its own goroutine
+// with a per-server timeout (MCPServerConfig.ConnectTimeoutSeconds or
+// cfg.MCP.DefaultConnectTimeoutSecs). onResult fires once per non-disabled
+// server with its outcome.
+type StartMCPFunc func(parentCtx context.Context, onResult func(serverName string, err error))
+
+// CompleteRegistrationAsync builds the registry like CompleteRegistration but
+// does NOT block on MCP server connects. Instead it returns a StartMCPFunc
+// closure the caller invokes after wiring the supervisor; the initial
+// registry contains only local + gateway tools, and MCP tools fill in as
+// each server's background connect succeeds (via supervisor OnChange →
+// RebuildRegistryForHealth). Callers that need the full sync flow (TUI,
+// one-shot CLI) keep using CompleteRegistration.
+func CompleteRegistrationAsync(ctx context.Context, gw *client.GatewayClient, cfg *config.Config, baseReg *agent.ToolRegistry, agentDef ...*agents.Agent) (*agent.ToolRegistry, *mcp.ClientManager, StartMCPFunc, func(), error) {
+	reg := baseReg.Clone()
+
+	mcpServers := resolveMCPServers(cfg, agentDef...)
+
+	// CDP mode: same eager-launch gate as the sync path. Chrome must be
+	// reachable before the playwright connect attempt fires; if not we drop
+	// the server from the set so the supervisor doesn't keep retrying.
+	if pwCfg, hasPW := mcpServers["playwright"]; hasPW && !pwCfg.Disabled && mcp.IsPlaywrightCDPMode(pwCfg) {
+		if pwCfg.KeepAlive {
+			if err := mcp.EnsureChromeDebugPort(mcp.PlaywrightCDPPort(pwCfg)); err != nil {
+				log.Printf("Playwright CDP: Chrome debug port unavailable: %v — skipping", err)
+				delete(mcpServers, "playwright")
+			}
+		}
+	}
+
+	var mcpMgr *mcp.ClientManager
+	if len(mcpServers) > 0 {
+		mcpMgr = mcp.NewClientManager()
+		rootCandidates := mcp.DefaultWorkspaceRootCandidates(config.ShannonDir())
+		rootCandidates = append(rootCandidates, cfg.MCP.WorkspaceRoots...)
+		mcpMgr.SetRootsHandler(mcp.NewRootsHandler(rootCandidates))
+		// Pre-register all configs so supervisor.Start (called by daemon
+		// between this return and StartMCPFunc invocation) sees the full
+		// server set and creates per-server probe entries.
+		mcpMgr.RegisterConfigs(mcpServers)
+	}
+
+	var err error
+	if gw != nil {
+		err = RegisterServerTools(ctx, gw, reg)
+	}
+
+	reg = ApplyToolFilter(reg, agentDef...)
+
+	cleanup := func() {
+		if mcpMgr != nil {
+			mcpMgr.Close()
+		}
+	}
+
+	startMCP := StartMCPFunc(func(parentCtx context.Context, onResult func(serverName string, err error)) {
+		if mcpMgr == nil || len(mcpServers) == 0 {
+			return
+		}
+		defaultTimeout := time.Duration(cfg.MCP.DefaultConnectTimeoutSecs) * time.Second
+		if defaultTimeout <= 0 {
+			defaultTimeout = 60 * time.Second
+		}
+		mcpMgr.StartConnectAll(parentCtx, mcpServers, defaultTimeout, onResult)
+	})
+
+	return reg, mcpMgr, startMCP, cleanup, err
+}
+
+// RegisterAllWithBaselineAsync mirrors RegisterAllWithBaseline but defers
+// MCP connects: the returned startMCP closure runs them in the background
+// once the caller has stood up the supervisor and atomically swapped the
+// new deps into place. HTTP /config/reload and daemon startup are no
+// longer blocked by slow MCP handshakes (Intercom OAuth can be 30-180s).
+func RegisterAllWithBaselineAsync(gw *client.GatewayClient, cfg *config.Config, agentDef ...*agents.Agent) (
+	baseline *agent.ToolRegistry,
+	reg *agent.ToolRegistry,
+	skillsPtr *[]*skills.Skill,
+	mcpMgr *mcp.ClientManager,
+	cleanup func(),
+	startMCP StartMCPFunc,
+	err error,
+) {
+	localReg, sp, baseCleanup := RegisterLocalTools(cfg, nil)
+	baseline = localReg
+
+	// Shorter ctx than the sync variant — no MCP connect inside, so we just
+	// need to cover the gateway tools/list round-trip.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var remoteCleanup func()
+	reg, mcpMgr, startMCP, remoteCleanup, err = CompleteRegistrationAsync(ctx, gw, cfg, localReg, agentDef...)
+
+	cleanup = func() {
+		baseCleanup()
+		remoteCleanup()
+	}
+
+	return baseline, reg, sp, mcpMgr, cleanup, startMCP, err
+}
+
 // RegisterAll registers local tools, connects MCP servers, and then fetches
 // server-side tools from the gateway. Local tools take priority, then MCP, then gateway.
 // If agentDef is non-nil, tool filtering and MCP scoping are applied per-agent.
@@ -451,6 +555,68 @@ func resolveMCPServers(cfg *config.Config, agentDef ...*agents.Agent) map[string
 	}
 
 	return result
+}
+
+// ShouldSkipReloadRetry mirrors the PostConnectDisconnectIfDiscoveryOnly
+// predicate so /config/reload's "retry disconnected enabled servers" pass
+// (daemon/server.go retryDisconnectedEnabledMCPServers) doesn't undo the
+// discover-then-disconnect optimization on every reload.
+//
+// Without this check the loop is:
+//   1. daemon startup → async connect playwright → tools cached
+//   2. PostConnectDisconnectIfDiscoveryOnly intentionally Disconnects
+//   3. user POSTs /config/reload (e.g. Desktop's startup sync ping)
+//   4. retry sees playwright "not connected" → StartConnectAll again
+//   5. successful connect → ProbeNow → serverLoop probeNowCh handler →
+//      maybeRelaunchDegradedCDPChrome relaunches Chrome because the
+//      capability probe ran without Chrome on the previous cycle and
+//      left state=Degraded
+//
+// Net effect: a blank Chrome window pops every time the Desktop client
+// reconnects. mgr.CachedTools() being non-empty is the "we already
+// discovered, this Disconnect is intentional" signal — empty cache means
+// the first connect attempt failed (genuine retry case).
+func ShouldSkipReloadRetry(mcpMgr *mcp.ClientManager, serverName string, cfg mcp.MCPServerConfig) bool {
+	if cfg.KeepAlive {
+		return false
+	}
+	if serverName != "playwright" {
+		return false
+	}
+	if mcpMgr == nil {
+		return false
+	}
+	return len(mcpMgr.CachedTools(serverName)) > 0
+}
+
+// PostConnectDisconnectIfDiscoveryOnly preserves the legacy "discover-then-
+// disconnect" optimization for playwright when its config has KeepAlive=
+// false. The synchronous registration path used to disconnect playwright
+// right after the initial ConnectAll so Chrome wouldn't stay open idle;
+// the async path doesn't have a natural place to do that, so this helper
+// runs from the daemon's onResult success callback. Tools remain in the
+// mgr's tool cache, so CallTool's existing on-demand reconnect path
+// handles tool invocation by re-spawning playwright-mcp + Chrome.
+//
+// Generic for all server names — currently only playwright opts into this
+// behavior via KeepAlive=false, but the function is name-agnostic so a
+// future built-in can opt in the same way.
+func PostConnectDisconnectIfDiscoveryOnly(mcpMgr *mcp.ClientManager, serverName string) {
+	if mcpMgr == nil {
+		return
+	}
+	cfg, ok := mcpMgr.ConfigFor(serverName)
+	if !ok || cfg.KeepAlive {
+		return
+	}
+	// Restrict to playwright for now: it's the only server where idle
+	// resource pressure (Chrome) justifies the extra reconnect roundtrip
+	// on first tool call. Generalize when a second server needs it.
+	if serverName != "playwright" {
+		return
+	}
+	mcpMgr.Disconnect(serverName)
+	log.Printf("[mcp] %s: disconnected after tool discovery (KeepAlive=false); will reconnect on demand", serverName)
 }
 
 // CleanupPlaywrightReconnect runs after a supervisor-driven reconnect.

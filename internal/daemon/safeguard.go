@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"strings"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 )
 
 // requireConfirm returns true if the ?confirm=true query parameter is missing.
@@ -140,6 +143,38 @@ func validateMCPCommands(servers map[string]interface{}, confirmed bool) error {
 		}
 	}
 	return nil
+}
+
+// validateBuiltinMCPPatch refuses PATCH /config attempts that try to mutate
+// daemon-owned fields on a built-in MCP server. Users may still toggle
+// disabled, set env, or flip keep_alive — those are persisted to yaml and
+// round-tripped on each Load. Returns (field, message, true) when blocked.
+func validateBuiltinMCPPatch(servers map[string]interface{}) (string, string, bool) {
+	if len(servers) == 0 {
+		return "", "", false
+	}
+	immutable := make(map[string]struct{}, len(mcp.BuiltinImmutableFields))
+	for _, f := range mcp.BuiltinImmutableFields {
+		immutable[f] = struct{}{}
+	}
+	for name, srvRaw := range servers {
+		if !mcp.IsBuiltin(name) {
+			continue
+		}
+		srvMap, ok := srvRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for key := range srvMap {
+			if _, hit := immutable[strings.ToLower(key)]; hit {
+				return key, fmt.Sprintf(
+					"mcp_servers.%s.%s is owned by the built-in catalog and cannot be edited — toggle disabled / env / keep_alive instead",
+					name, key,
+				), true
+			}
+		}
+	}
+	return "", "", false
 }
 
 // extractArgs reads the "args" field from an MCP server config map.

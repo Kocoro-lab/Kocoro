@@ -29,6 +29,19 @@ type MCPServerConfig struct {
 	Disabled  bool              `yaml:"disabled,omitempty"   mapstructure:"disabled"  json:"disabled,omitempty"`    // skip this server
 	Context   string            `yaml:"context,omitempty"    mapstructure:"context"   json:"context,omitempty"`     // LLM context injected into system prompt
 	KeepAlive bool              `yaml:"keep_alive,omitempty" mapstructure:"keep_alive" json:"keep_alive,omitempty"` // stay connected between turns (skip on-demand teardown)
+	// ConnectTimeoutSeconds overrides the per-server connect timeout used by
+	// StartConnectAll. Zero falls back to MCPConfig.DefaultConnectTimeoutSecs
+	// (configured under `mcp.default_connect_timeout_secs`, default 60s).
+	// OAuth-bridged servers like Intercom set this to ~300s in the built-in
+	// catalog so the user has time to complete the browser flow before the
+	// daemon kills the npx subprocess.
+	ConnectTimeoutSeconds int `yaml:"connect_timeout_secs,omitempty" mapstructure:"connect_timeout_secs" json:"connect_timeout_secs,omitempty"`
+	// Builtin marks an entry that originated from BuiltinMCPServers. Set by
+	// config.Load after merging the in-binary catalog onto user yaml; never
+	// persisted (yaml:"-" + mapstructure:"-"). The daemon API surfaces it
+	// via GET /config/status so Desktop can distinguish pre-bundled servers
+	// from user-added ones.
+	Builtin bool `yaml:"-" mapstructure:"-" json:"builtin,omitempty"`
 }
 
 // RemoteTool represents a tool discovered from an MCP server.
@@ -43,6 +56,8 @@ type ClientManager struct {
 	clients      map[string]mcpclient.MCPClient // server name → client
 	configs      map[string]MCPServerConfig     // server name → config (for reconnect)
 	toolCache    map[string][]RemoteTool        // server name → last-known tools
+	cancellers   map[string]context.CancelFunc  // server name → ctx.Cancel for the spawned subprocess (stdio only); cancelling it SIGTERMs the whole process group
+	inFlight     map[string]struct{}            // server name → connect goroutine in progress; StartConnectAll/Reconnect skip duplicates
 	reconnectMu  map[string]*sync.Mutex         // per-server reconnect serialization
 	supervised   bool                           // when true, skip inline reconnect in CallTool
 	idleTimers   map[string]*time.Timer         // per-server idle disconnect timers
@@ -56,9 +71,35 @@ func NewClientManager() *ClientManager {
 		clients:     make(map[string]mcpclient.MCPClient),
 		configs:     make(map[string]MCPServerConfig),
 		toolCache:   make(map[string][]RemoteTool),
+		cancellers:  make(map[string]context.CancelFunc),
+		inFlight:    make(map[string]struct{}),
 		reconnectMu: make(map[string]*sync.Mutex),
 		needsSetup:  make(map[string]bool),
 	}
+}
+
+// tryReserveInFlight marks serverName as having an in-flight connect attempt.
+// Returns (release, true) on success; (nil, false) if another connect goroutine
+// is already mid-flight for this server — caller should skip and let the
+// existing attempt finish. The release func must be called when the attempt
+// terminates (success OR failure) to clear the slot.
+//
+// Without this guard, a /config/reload that fires while the daemon-startup
+// async connect is still inside Initialize/ListTools would spawn a second
+// subprocess for the same server; both race to bind the OAuth callback
+// loopback port and the loser crashes with EADDRINUSE.
+func (m *ClientManager) tryReserveInFlight(serverName string) (func(), bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, busy := m.inFlight[serverName]; busy {
+		return nil, false
+	}
+	m.inFlight[serverName] = struct{}{}
+	return func() {
+		m.mu.Lock()
+		delete(m.inFlight, serverName)
+		m.mu.Unlock()
+	}, true
 }
 
 // SetRootsHandler installs a roots handler that will be advertised to every
@@ -123,6 +164,93 @@ func (m *ClientManager) ConnectAll(ctx context.Context, servers map[string]MCPSe
 	return allTools, nil
 }
 
+// RegisterConfigs stores server configs without attempting to connect. Use
+// before calling Supervisor.Start so the supervisor discovers every entry,
+// then call StartConnectAll to kick off the actual connection goroutines.
+// Existing entries with the same key are overwritten.
+func (m *ClientManager) RegisterConfigs(servers map[string]MCPServerConfig) {
+	if len(servers) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for name, cfg := range servers {
+		m.configs[name] = cfg
+	}
+}
+
+// StartConnectAll launches per-server connection goroutines and returns
+// immediately — the daemon HTTP path is no longer blocked by slow MCP
+// handshakes (e.g. Intercom's npx + OAuth chain commonly runs 30–180s).
+//
+// Per-server timeout resolves in this order:
+//  1. cfg.ConnectTimeoutSeconds (if > 0)
+//  2. defaultTimeout (from cfg.MCP.DefaultConnectTimeoutSecs)
+//  3. 60 second hardcoded floor
+//
+// onResult fires once per non-disabled server with (name, err). On success
+// (err == nil) the daemon typically calls Supervisor.ProbeNow(name) to flip
+// health state and trigger a registry rebuild; on failure it should write
+// an audit entry — the supervisor's periodic probes deliberately do NOT
+// reconnect, so a failed first attempt stays Disconnected until the user
+// re-toggles.
+//
+// parentCtx cancellation cancels in-flight Initialize/ListTools calls. The
+// per-server timeout deadline does too — and when it fires we force-close
+// the client (in a side goroutine because mcp-go's Close blocks until the
+// inner reads unwind) which SIGTERMs the stdio subprocess and unblocks the
+// Initialize read. Net effect: a hung server (e.g. mcp-remote waiting for
+// OAuth the user abandoned) is reaped at timeout rather than leaking until
+// daemon shutdown.
+func (m *ClientManager) StartConnectAll(parentCtx context.Context, servers map[string]MCPServerConfig, defaultTimeout time.Duration, onResult func(serverName string, err error)) {
+	// Pre-register every config under one lock acquisition so the supervisor
+	// (if already started) sees a consistent picture before any goroutine
+	// races ahead.
+	m.mu.Lock()
+	for name, cfg := range servers {
+		m.configs[name] = cfg
+	}
+	m.mu.Unlock()
+
+	for name, cfg := range servers {
+		if cfg.Disabled {
+			continue
+		}
+		timeout := defaultTimeout
+		if cfg.ConnectTimeoutSeconds > 0 {
+			timeout = time.Duration(cfg.ConnectTimeoutSeconds) * time.Second
+		}
+		if timeout <= 0 {
+			timeout = 60 * time.Second
+		}
+		go func(name string, cfg MCPServerConfig, timeout time.Duration) {
+			// Skip if a connect goroutine is already in flight for this
+			// server. The pending attempt will eventually call onResult on
+			// its own; firing a duplicate would either lose the EADDRINUSE
+			// race or overwrite m.clients/m.cancellers and leak a process
+			// group.
+			release, ok := m.tryReserveInFlight(name)
+			if !ok {
+				log.Printf("[mcp] %s: connect already in flight, skipping duplicate StartConnectAll attempt", name)
+				return
+			}
+			defer release()
+
+			ctx, cancel := context.WithTimeout(parentCtx, timeout)
+			defer cancel()
+			// connectWithForceClose actively closes the client when ctx
+			// expires. The bare connect() path can leak on mcp-go's stdio
+			// transport (Initialize blocks on a stdin read that ignores
+			// ctx) — important for OAuth bridges like mcp-remote where the
+			// user may walk away without finishing the browser flow.
+			_, err := m.connectWithForceClose(ctx, name, cfg)
+			if onResult != nil {
+				onResult(name, err)
+			}
+		}(name, cfg, timeout)
+	}
+}
+
 // ConnectedServers returns the names of all servers that have an active client connection.
 // IsConnected returns true if the named server has an active client connection.
 func (m *ClientManager) IsConnected(serverName string) bool {
@@ -142,6 +270,146 @@ func (m *ClientManager) ConnectedServers() []string {
 	return names
 }
 
+// connectWithForceClose is like connect() but reliably kills the subprocess
+// when ctx expires. Two issues with the naive path:
+//   - mcp-go's stdio transport does NOT honor ctx during Initialize/ListTools
+//     (raw pipe read).
+//   - mcp-go's Stdio.Close() calls cmd.Wait() — it blocks until the subprocess
+//     exits on its own. A well-behaved server exits on stdin EOF; abandoned
+//     mcp-remote OAuth flows do not.
+//
+// Fix: spawn the subprocess under a cancellable cmdCtx (exec.CommandContext
+// SIGKILLs on ctx cancel inside mcp-go's spawnCommand), run Initialize in
+// an inner goroutine, and on ctx expiry cancel cmdCtx so the subprocess
+// dies promptly. Close still runs in a side goroutine because cmd.Wait
+// can race the SIGKILL by a few ms on busy systems.
+func (m *ClientManager) connectWithForceClose(ctx context.Context, name string, cfg MCPServerConfig) ([]RemoteTool, error) {
+	m.mu.Lock()
+	m.configs[name] = cfg
+	rootsHandler := m.rootsHandler
+	m.mu.Unlock()
+
+	clientOpts := []mcpclient.ClientOption{}
+	if opt := rootsHandler.clientOption(); opt != nil {
+		clientOpts = append(clientOpts, opt)
+	}
+
+	var c *mcpclient.Client
+	var cmdCancel context.CancelFunc // nil for http; set for stdio so timeout can SIGKILL
+	switch cfg.Type {
+	case "http":
+		if cfg.URL == "" {
+			return nil, fmt.Errorf("http MCP server requires url")
+		}
+		httpTransport, err := transport.NewStreamableHTTP(cfg.URL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create HTTP client: %w", err)
+		}
+		c = mcpclient.NewClient(httpTransport, clientOpts...)
+		if err := c.Start(ctx); err != nil {
+			return nil, fmt.Errorf("failed to start HTTP client: %w", err)
+		}
+	default:
+		if cfg.Command == "" {
+			return nil, fmt.Errorf("stdio MCP server requires command")
+		}
+		envSlice := buildEnvSlice(cfg.Env)
+		// withProcessGroup puts the subprocess in its own process group so
+		// cancelling cmdCtx SIGTERMs the entire chain (npx → npm exec →
+		// node mcp-remote), not just the direct child. Without this an
+		// abandoned-OAuth mcp-remote keeps holding its loopback callback
+		// port, and subsequent toggle-on attempts crash with EADDRINUSE.
+		stdioTransport := transport.NewStdioWithOptions(cfg.Command, envSlice, cfg.Args, withProcessGroup())
+		// Subprocess is bound to cmdCtx via exec.CommandContext; cancel it
+		// on timeout to force a SIGKILL. On success path we stash cancel
+		// in m.cancellers so Disconnect / Close can reap the group later.
+		cmdCtx, cancel := context.WithCancel(context.Background())
+		cmdCancel = cancel
+		if err := stdioTransport.Start(cmdCtx); err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to start MCP server %q: %w", cfg.Command, err)
+		}
+		c = mcpclient.NewClient(stdioTransport, clientOpts...)
+		if err := c.Start(ctx); err != nil {
+			cancel()
+			_ = c.Close()
+			return nil, fmt.Errorf("failed to wire MCP client %q: %w", name, err)
+		}
+	}
+
+	type initResult struct {
+		tools []RemoteTool
+		err   error
+	}
+	resultCh := make(chan initResult, 1)
+	go func() {
+		_, err := c.Initialize(ctx, mcp.InitializeRequest{
+			Params: struct {
+				ProtocolVersion string                 `json:"protocolVersion"`
+				Capabilities    mcp.ClientCapabilities `json:"capabilities"`
+				ClientInfo      mcp.Implementation     `json:"clientInfo"`
+			}{
+				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+				ClientInfo:      mcp.Implementation{Name: "shannon-cli", Version: "1.0.0"},
+			},
+		})
+		if err != nil {
+			resultCh <- initResult{nil, fmt.Errorf("initialize failed: %w", err)}
+			return
+		}
+		toolsResult, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+		if err != nil {
+			resultCh <- initResult{nil, fmt.Errorf("tools/list failed: %w", err)}
+			return
+		}
+		var tools []RemoteTool
+		for _, t := range toolsResult.Tools {
+			tools = append(tools, RemoteTool{
+				ServerName: name,
+				Tool:       t,
+			})
+		}
+		resultCh <- initResult{tools, nil}
+	}()
+
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			if cmdCancel != nil {
+				cmdCancel()
+			}
+			_ = c.Close()
+			return nil, res.err
+		}
+		// Success: stash cmdCancel in m.cancellers so Disconnect / Close
+		// can SIGTERM the whole process group later. mcp-go's Stdio.Close
+		// calls cmd.Wait() which blocks until the subprocess exits — for
+		// OAuth bridges (mcp-remote listening on a loopback callback port)
+		// stdin EOF is not enough to make them exit, so we MUST cancel
+		// cmdCtx before c.Close() can return.
+		m.mu.Lock()
+		m.clients[name] = c
+		m.toolCache[name] = res.tools
+		if cmdCancel != nil {
+			m.cancellers[name] = cmdCancel
+		}
+		m.mu.Unlock()
+		return res.tools, nil
+	case <-ctx.Done():
+		log.Printf("[mcp] %s: ctx expired, force-killing subprocess + closing client", name)
+		// SIGKILL via cmdCancel → subprocess dies → stdout EOF → readResponses
+		// closes done → in-flight Initialize/ListTools return → goroutine exits
+		// and writes to the buffered resultCh (cap=1, no receiver needed). Close
+		// runs in a side goroutine so we never block the outer return on
+		// cmd.Wait, even if SIGKILL takes a moment to propagate.
+		if cmdCancel != nil {
+			cmdCancel()
+		}
+		go func() { _ = c.Close() }()
+		return nil, fmt.Errorf("connect timed out for %q: %w", name, ctx.Err())
+	}
+}
+
 func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerConfig) ([]RemoteTool, error) {
 	m.mu.Lock()
 	m.configs[name] = cfg
@@ -159,6 +427,7 @@ func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerC
 	}
 
 	var c *mcpclient.Client
+	var cmdCancel context.CancelFunc // nil for http; set for stdio so Disconnect can SIGTERM the group
 	switch cfg.Type {
 	case "http":
 		if cfg.URL == "" {
@@ -182,12 +451,20 @@ func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerC
 			return nil, fmt.Errorf("stdio MCP server requires command")
 		}
 		envSlice := buildEnvSlice(cfg.Env)
-		stdioTransport := transport.NewStdioWithOptions(cfg.Command, envSlice, cfg.Args)
-		// Spawn the subprocess with a never-expiring context so the MCP
-		// server survives after ConnectAll's short timeout returns — the
-		// subprocess is bound to this context via exec.CommandContext.
-		// Matches NewStdioMCPClient upstream which uses context.Background.
-		if err := stdioTransport.Start(context.Background()); err != nil {
+		// withProcessGroup ensures cancelling cmdCtx kills the entire
+		// process chain (npx → npm exec → node mcp-remote), not just the
+		// direct child. Without it, abandoned-OAuth subprocesses keep
+		// holding their loopback callback port and the next reconnect
+		// crashes with EADDRINUSE.
+		stdioTransport := transport.NewStdioWithOptions(cfg.Command, envSlice, cfg.Args, withProcessGroup())
+		// Spawn under a cancellable context derived from Background so the
+		// MCP server survives the ctx given to connect() (which may carry
+		// a short timeout) — Disconnect / Close are the deliberate ways to
+		// reap the process group via the stashed cancel fn.
+		cmdCtx, cancel := context.WithCancel(context.Background())
+		cmdCancel = cancel
+		if err := stdioTransport.Start(cmdCtx); err != nil {
+			cancel()
 			return nil, fmt.Errorf("failed to start MCP server %q: %w", cfg.Command, err)
 		}
 		c = mcpclient.NewClient(stdioTransport, clientOpts...)
@@ -196,6 +473,8 @@ func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerC
 		// bidirectional transport. Without this call, server-initiated
 		// requests like roots/list never reach our handler.
 		if err := c.Start(ctx); err != nil {
+			cancel()
+			_ = c.Close()
 			return nil, fmt.Errorf("failed to wire MCP client %q: %w", name, err)
 		}
 	}
@@ -212,6 +491,9 @@ func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerC
 		},
 	})
 	if err != nil {
+		if cmdCancel != nil {
+			cmdCancel()
+		}
 		_ = c.Close()
 		return nil, fmt.Errorf("initialize failed: %w", err)
 	}
@@ -219,12 +501,18 @@ func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerC
 	// List available tools
 	toolsResult, err := c.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
+		if cmdCancel != nil {
+			cmdCancel()
+		}
 		_ = c.Close()
 		return nil, fmt.Errorf("tools/list failed: %w", err)
 	}
 
 	m.mu.Lock()
 	m.clients[name] = c
+	if cmdCancel != nil {
+		m.cancellers[name] = cmdCancel
+	}
 	m.mu.Unlock()
 
 	var tools []RemoteTool
@@ -304,10 +592,18 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 		m.mu.Lock()
 		cfg, hasCfg := m.configs[serverName]
 		stale := m.clients[serverName]
+		staleCancel := m.cancellers[serverName]
+		delete(m.cancellers, serverName)
 		m.mu.Unlock()
 
 		if hasCfg {
-			// Close the stale client to release its resources before reconnecting.
+			// Reap the old process group + close the stale client. Skipping
+			// staleCancel here would leave an orphan when the client died
+			// from something other than transport EOF (e.g. user toggled
+			// reload concurrently).
+			if staleCancel != nil {
+				staleCancel()
+			}
 			if stale != nil {
 				_ = stale.Close()
 			}
@@ -357,15 +653,35 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 }
 
 // Close shuts down all connected MCP servers in parallel.
+//
+// For stdio servers we cancel the per-server cmdCtx FIRST, which sends
+// SIGTERM to the entire process group (npx → npm → node mcp-remote) via
+// processGroupCmdFunc's custom cmd.Cancel hook. Only then do we call
+// c.Close() — mcp-go's Stdio.Close runs cmd.Wait() and would block
+// indefinitely if the subprocess is one that ignores stdin EOF (every
+// OAuth-bridged server, mcp-remote being the canonical example).
 func (m *ClientManager) Close() {
 	m.mu.Lock()
 	clients := make(map[string]mcpclient.MCPClient, len(m.clients))
+	cancellers := make(map[string]context.CancelFunc, len(m.cancellers))
 	for name, c := range m.clients {
 		clients[name] = c
 		delete(m.clients, name)
 	}
+	for name, cancel := range m.cancellers {
+		cancellers[name] = cancel
+		delete(m.cancellers, name)
+	}
 	m.mu.Unlock()
 
+	// Phase 1: SIGTERM every stdio process group. Doing this before c.Close()
+	// lets cmd.Wait() return quickly once the group dies.
+	for _, cancel := range cancellers {
+		cancel()
+	}
+
+	// Phase 2: close each client. c.Close still calls cmd.Wait, which now
+	// returns within the cmd.WaitDelay backstop instead of blocking forever.
 	var wg sync.WaitGroup
 	for _, c := range clients {
 		wg.Add(1)
@@ -387,6 +703,12 @@ func (m *ClientManager) ConfigFor(serverName string) (MCPServerConfig, bool) {
 
 // Disconnect closes a single server's client, removing it from the active map.
 // The config and tool cache are preserved so the server can reconnect later.
+//
+// Cancels the per-server cmdCtx before c.Close so the process group dies
+// promptly even when the subprocess ignores stdin EOF (see Close for full
+// rationale). Without this an mcp-remote stuck on an abandoned OAuth flow
+// would keep holding its loopback callback port and crash any subsequent
+// reconnect with EADDRINUSE.
 func (m *ClientManager) Disconnect(serverName string) {
 	m.mu.Lock()
 	// Cancel any pending idle timer for this server.
@@ -398,7 +720,12 @@ func (m *ClientManager) Disconnect(serverName string) {
 	if ok {
 		delete(m.clients, serverName)
 	}
+	cmdCancel := m.cancellers[serverName]
+	delete(m.cancellers, serverName)
 	m.mu.Unlock()
+	if cmdCancel != nil {
+		cmdCancel()
+	}
 	if ok && c != nil {
 		_ = c.Close()
 	}
@@ -513,16 +840,33 @@ func (m *ClientManager) Reconnect(ctx context.Context, serverName string) ([]Rem
 		m.reconnectMu[serverName] = rmu
 	}
 	stale := m.clients[serverName]
+	staleCancel := m.cancellers[serverName]
 	m.mu.Unlock()
 
 	rmu.Lock()
 	defer rmu.Unlock()
 
+	// Refuse to reconnect while a different connect goroutine is mid-flight
+	// for this server (e.g. StartConnectAll fired from daemon startup or a
+	// /config/reload retry). Without this check, the two attempts race to
+	// bind the OAuth callback port and the loser crashes with EADDRINUSE.
+	release, ok := m.tryReserveInFlight(serverName)
+	if !ok {
+		return nil, fmt.Errorf("reconnect for %q skipped: connect already in flight", serverName)
+	}
+	defer release()
+
+	// Reap the old process group first so c.Close (cmd.Wait inside) returns
+	// promptly even when the old subprocess ignores stdin EOF.
+	if staleCancel != nil {
+		staleCancel()
+	}
 	if stale != nil {
 		_ = stale.Close()
 	}
 	m.mu.Lock()
 	delete(m.clients, serverName)
+	delete(m.cancellers, serverName)
 	m.mu.Unlock()
 
 	return m.connect(ctx, serverName, cfg)
