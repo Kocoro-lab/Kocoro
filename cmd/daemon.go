@@ -117,7 +117,7 @@ var daemonStartCmd = &cobra.Command{
 		// Orphan sweep is startup-only — reload paths must not sweep because they
 		// would kill live Chrome owned by in-flight runs.
 		tools.CleanupOrphanedChromedp()
-		baselineReg, reg, skillsPtr, mcpMgr, cleanup, serverErr := tools.RegisterAllWithBaseline(gw, cfg)
+		baselineReg, reg, skillsPtr, mcpMgr, cleanup, startMCP, serverErr := tools.RegisterAllWithBaselineAsync(gw, cfg)
 		if serverErr != nil {
 			log.Printf("Warning: %v", serverErr)
 		}
@@ -300,6 +300,40 @@ var daemonStartCmd = &cobra.Command{
 			deps.Registry = initReg
 			deps.WriteUnlock()
 			log.Printf("MCP registry initialized with supervisor: %d tools", len(initReg.All()))
+		}
+
+		// Kick off MCP connections in the background. The HTTP listener (set
+		// up below) is ready immediately; tools become available as each
+		// server's handshake completes (Intercom OAuth: up to 300s). On
+		// success we trigger a supervisor probe so OnChange rebuilds the
+		// registry with newly-discovered tools.
+		if startMCP != nil {
+			capturedSupervisor := supervisor
+			capturedAuditor := auditor
+			capturedMgr := mcpMgr
+			go startMCP(ctx, func(name string, connErr error) {
+				_, _, depsSup := deps.Snapshot()
+				if depsSup != capturedSupervisor {
+					return // deps swapped by a config reload — drop stale result.
+				}
+				if connErr != nil {
+					log.Printf("[mcp] %s: async connect failed: %v", name, connErr)
+					if capturedAuditor != nil {
+						capturedAuditor.Log(audit.AuditEntry{
+							Timestamp:     time.Now(),
+							ToolName:      "mcp_connect",
+							InputSummary:  "mcp_servers." + name,
+							OutputSummary: connErr.Error(),
+							Decision:      "error",
+							Approved:      false,
+						})
+					}
+					return
+				}
+				log.Printf("[mcp] %s: async connect succeeded; probing supervisor", name)
+				capturedSupervisor.ProbeNow(name)
+				tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
+			})
 		}
 
 		if !cfg.Daemon.AutoApprove {

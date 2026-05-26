@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -316,3 +317,74 @@ func TestCheckProtectedFields_MCPServersAliasNormalized(t *testing.T) {
 		t.Fatal("expected mcpServers alias to be removed after normalization")
 	}
 }
+
+// --- validateBuiltinMCPPatch ---
+
+func TestValidateBuiltinMCPPatch_AllowsTogglingDisabled(t *testing.T) {
+	servers := map[string]interface{}{
+		"intercom": map[string]interface{}{
+			"disabled": false,
+		},
+	}
+	if field, _, blocked := validateBuiltinMCPPatch(servers); blocked {
+		t.Errorf("toggling disabled should be allowed; blocked on field %q", field)
+	}
+}
+
+func TestValidateBuiltinMCPPatch_AllowsEnvAndKeepAlive(t *testing.T) {
+	servers := map[string]interface{}{
+		"intercom": map[string]interface{}{
+			"env":        map[string]interface{}{"DEBUG": "1"},
+			"keep_alive": true,
+		},
+	}
+	if field, _, blocked := validateBuiltinMCPPatch(servers); blocked {
+		t.Errorf("env / keep_alive should be allowed; blocked on field %q", field)
+	}
+}
+
+func TestValidateBuiltinMCPPatch_BlocksCommandOnBuiltin(t *testing.T) {
+	servers := map[string]interface{}{
+		"intercom": map[string]interface{}{
+			"command": "rm",
+		},
+	}
+	field, msg, blocked := validateBuiltinMCPPatch(servers)
+	if !blocked {
+		t.Fatal("expected block when patching command on built-in")
+	}
+	if field != "command" {
+		t.Errorf("expected field=command, got %q", field)
+	}
+	if msg == "" || !strings.Contains(msg, "intercom") || !strings.Contains(msg, "command") {
+		t.Errorf("expected message naming server+field, got %q", msg)
+	}
+}
+
+func TestValidateBuiltinMCPPatch_BlocksCaseInsensitiveImmutableField(t *testing.T) {
+	servers := map[string]interface{}{
+		"intercom": map[string]interface{}{
+			"Args": []interface{}{"foo"},
+		},
+	}
+	field, _, blocked := validateBuiltinMCPPatch(servers)
+	if !blocked {
+		t.Fatal("expected block on Args (case-insensitive match)")
+	}
+	if field != "Args" {
+		t.Errorf("expected field=Args (echo back original casing), got %q", field)
+	}
+}
+
+func TestValidateBuiltinMCPPatch_IgnoresNonBuiltinServer(t *testing.T) {
+	servers := map[string]interface{}{
+		"my-custom": map[string]interface{}{
+			"command": "node",
+			"args":    []interface{}{"server.js"},
+		},
+	}
+	if field, _, blocked := validateBuiltinMCPPatch(servers); blocked {
+		t.Errorf("non-builtin server should pass through; blocked on %q", field)
+	}
+}
+

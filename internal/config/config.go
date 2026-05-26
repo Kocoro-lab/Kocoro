@@ -51,6 +51,10 @@ type MCPConfig struct {
 	// project directories the user wants browser_file_upload or similar
 	// sandboxed tools to reach without manual copying.
 	WorkspaceRoots []string `mapstructure:"workspace_roots" yaml:"workspace_roots,omitempty" json:"workspace_roots,omitempty"`
+	// DefaultConnectTimeoutSecs caps per-server startup time when StartConnectAll
+	// fans out connection goroutines. Per-server MCPServerConfig.ConnectTimeoutSeconds
+	// overrides this. 0 keeps the hardcoded 60s fallback.
+	DefaultConnectTimeoutSecs int `mapstructure:"default_connect_timeout_secs" yaml:"default_connect_timeout_secs,omitempty" json:"default_connect_timeout_secs,omitempty"`
 }
 
 type AgentConfig struct {
@@ -347,6 +351,11 @@ func Load() (*Config, error) {
 	viper.SetDefault("daemon.share_metadata.default_og_image", "https://static.kocoro.ai/public/Po09_46rjwAQoLhAvp-m52HNUCcViv6dx_uMiuUAzr4/logo-3x.png")
 	viper.SetDefault("daemon.share_metadata.twitter_image", "https://static.kocoro.ai/public/cmrsQzsDWCJ3pGC989VtOQutwUeE1IQyTsGMJfSBjIk/kocoro-og-1200x630.png")
 	viper.SetDefault("daemon.share_metadata.logo_url", "https://static.kocoro.ai/public/quTeFSunx6sZp_MXBBx50h_r9fhY39_tXyiKQJLHFF8/logo-1x.png")
+	// mcp.default_connect_timeout_secs: fallback per-server connect timeout
+	// used by StartConnectAll when MCPServerConfig.ConnectTimeoutSeconds is 0.
+	// 60s matches the pre-async legacy hardcoded value; OAuth-bridged servers
+	// (Intercom) override to ~300s in the built-in catalog.
+	viper.SetDefault("mcp.default_connect_timeout_secs", 60)
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	viper.SetDefault("cloud.enabled", true)
 	viper.SetDefault("cloud.timeout", 3600)
@@ -432,6 +441,7 @@ func Load() (*Config, error) {
 	// Viper lowercases all map keys which breaks env vars like API_KEY → api_key.
 	globalFile := filepath.Join(dir, "config.yaml")
 	fixMCPEnvKeyCasing(&cfg, globalFile)
+	mergeBuiltinMCPServers(&cfg)
 	cfg.Sources = buildDefaultSources()
 	markGlobalSources(&cfg, globalFile)
 
@@ -1067,6 +1077,52 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("agent.stream_idle_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Agent.StreamIdleTimeoutSecs)
 	}
 	return nil
+}
+
+// mergeBuiltinMCPServers folds the in-binary BuiltinMCPServers catalog onto
+// cfg.MCPServers using a field-level merge: command / args / type / url /
+// context always come from the Go source (daemon owns them, upgrades pick
+// up changes automatically), while disabled / env / keep_alive are taken
+// from the user's yaml so their preferences persist. When the user has no
+// entry for a built-in name yet, a fresh row is injected with disabled=true
+// so first-launch shows the server as available-but-off.
+//
+// Must run AFTER fixMCPEnvKeyCasing so the env map written here is the
+// case-preserved version, not viper's lowercased copy.
+func mergeBuiltinMCPServers(cfg *Config) {
+	if len(mcp.BuiltinMCPServers) == 0 {
+		return
+	}
+	if cfg.MCPServers == nil {
+		cfg.MCPServers = make(map[string]mcp.MCPServerConfig, len(mcp.BuiltinMCPServers))
+	}
+	for name, builtin := range mcp.BuiltinMCPServers {
+		// Deep-copy Args so a downstream mutation through cfg.MCPServers
+		// can't reach into BuiltinMCPServers' backing array. Type/URL/
+		// Command/Context are value types and copy via struct assignment.
+		merged := builtin.Config
+		if len(builtin.Config.Args) > 0 {
+			merged.Args = append([]string(nil), builtin.Config.Args...)
+		}
+		if existing, ok := cfg.MCPServers[name]; ok {
+			// Preserve user-controlled fields. Default for Disabled when the
+			// user has an entry is whatever they wrote (zero-value = false,
+			// matching yaml semantics). ConnectTimeoutSeconds is also user-
+			// tunable — keep the user override when non-zero, fall through
+			// to the catalog default otherwise.
+			merged.Disabled = existing.Disabled
+			merged.Env = existing.Env
+			merged.KeepAlive = existing.KeepAlive
+			if existing.ConnectTimeoutSeconds > 0 {
+				merged.ConnectTimeoutSeconds = existing.ConnectTimeoutSeconds
+			}
+		} else {
+			// First-launch default: shipped off until the user opts in.
+			merged.Disabled = true
+		}
+		merged.Builtin = true
+		cfg.MCPServers[name] = merged
+	}
 }
 
 // fixMCPEnvKeyCasing re-reads MCP servers from YAML to restore env var key casing.

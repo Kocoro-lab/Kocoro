@@ -111,6 +111,29 @@ func (s *Server) auditHTTPOp(method, path, summary string) {
 	})
 }
 
+// auditMCPConnectFailure records a background MCP connect failure (async
+// startup path). The supervisor's periodic probes deliberately do NOT
+// reconnect — so a failed first attempt stays Disconnected until the user
+// re-toggles. Logging here gives operators a forensic trail for "I clicked
+// the toggle but tools never appeared" reports.
+func (s *Server) auditMCPConnectFailure(serverName string, err error) {
+	if s.deps == nil || s.deps.Auditor == nil {
+		return
+	}
+	output := ""
+	if err != nil {
+		output = err.Error()
+	}
+	s.deps.Auditor.Log(audit.AuditEntry{
+		Timestamp:     time.Now(),
+		ToolName:      "mcp_connect",
+		InputSummary:  "mcp_servers." + serverName,
+		OutputSummary: output,
+		Decision:      "error",
+		Approved:      false,
+	})
+}
+
 // auditHTTPOpError logs an HTTP API write operation that failed. Unlike
 // auditHTTPOp the schema splits endpoint into input_summary and the failure
 // detail into output_summary. Keeps input_summary short for grep/dashboards
@@ -4083,6 +4106,15 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		// Built-ins own command/args/type/url/context — refuse mutations to
+		// those keys. disabled / env / keep_alive remain writable.
+		if _, msg, blocked := validateBuiltinMCPPatch(servers); blocked {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":   "builtin_mcp_immutable",
+				"message": msg,
+			})
+			return
+		}
 	}
 
 	if err := s.patchGlobalConfig(patch); err != nil {
@@ -4111,6 +4143,7 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 		}
 
 		mcpStatus := make(map[string]string, len(cfg.MCPServers))
+		mcpServerInfo := make(map[string]map[string]interface{})
 		for name, srv := range cfg.MCPServers {
 			if srv.Disabled {
 				mcpStatus[name] = "disabled"
@@ -4119,8 +4152,29 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 			} else {
 				mcpStatus[name] = "enabled"
 			}
+			if srv.Builtin {
+				info := map[string]interface{}{"builtin": true}
+				if entry, ok := mcp.BuiltinMCPServers[name]; ok {
+					if entry.DisplayName != "" {
+						info["display_name"] = entry.DisplayName
+					}
+					if entry.Description != "" {
+						info["description"] = entry.Description
+					}
+					if entry.AuthHint != "" {
+						info["auth_hint"] = entry.AuthHint
+					}
+					if entry.RequiresAuth {
+						info["requires_auth"] = true
+					}
+				}
+				mcpServerInfo[name] = info
+			}
 		}
 		resp["mcp_servers"] = mcpStatus
+		if len(mcpServerInfo) > 0 {
+			resp["mcp_server_info"] = mcpServerInfo
+		}
 	}
 
 	_, _, sup := s.deps.Snapshot()
@@ -4152,6 +4206,84 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// retryDisconnectedEnabledMCPServers fires a fresh async connect attempt
+// for every server that is enabled in cfg but not currently in the mgr's
+// connected set. Used by /config/reload as the user's explicit retry
+// signal — without it, the supervisor's no-auto-reconnect policy leaves a
+// server stuck in "enabled" status forever after a single connect failure
+// (the Bug 2 from the 2026-05-25 Intercom OAuth report).
+//
+// Safe to call when no MCP config change happened — if every enabled
+// server is already connected, this is a no-op.
+func (s *Server) retryDisconnectedEnabledMCPServers(cfg *config.Config) {
+	if cfg == nil || len(cfg.MCPServers) == 0 {
+		return
+	}
+	s.deps.mu.RLock()
+	mgr := s.deps.MCPManager
+	sup := s.deps.Supervisor
+	s.deps.mu.RUnlock()
+	if mgr == nil || sup == nil {
+		return
+	}
+	connected := make(map[string]bool)
+	for _, name := range mgr.ConnectedServers() {
+		connected[name] = true
+	}
+	var retry map[string]mcp.MCPServerConfig
+	for name, srv := range cfg.MCPServers {
+		if srv.Disabled || connected[name] {
+			continue
+		}
+		// Don't retry servers that are disconnected by design (the
+		// discover-then-disconnect optimization, e.g. playwright with
+		// KeepAlive=false). Retrying them would relaunch Chrome on every
+		// reload and defeat the optimization. mgr.CachedTools()
+		// non-empty is the signal that the previous disconnect was
+		// intentional, not a failed connect.
+		if tools.ShouldSkipReloadRetry(mgr, name, srv) {
+			continue
+		}
+		if retry == nil {
+			retry = make(map[string]mcp.MCPServerConfig)
+		}
+		retry[name] = srv
+	}
+	if len(retry) == 0 {
+		return
+	}
+	defaultTimeout := time.Duration(cfg.MCP.DefaultConnectTimeoutSecs) * time.Second
+	if defaultTimeout <= 0 {
+		defaultTimeout = 60 * time.Second
+	}
+	capturedSup := sup
+	capturedMgr := mgr
+	go func() {
+		// Final stale-check before spawning subprocesses: a fast follow-up
+		// reload may have swapped deps between scheduling this goroutine
+		// and the runtime picking it up. If so, abort here so we don't
+		// strand subprocesses inside an mgr that has no reachable owner.
+		_, _, depsSup := s.deps.Snapshot()
+		if depsSup != capturedSup {
+			return
+		}
+		capturedMgr.StartConnectAll(s.ctx, retry, defaultTimeout, func(name string, connErr error) {
+			_, _, depsSup := s.deps.Snapshot()
+			if depsSup != capturedSup {
+				return // deps swapped by a newer reload — drop stale result.
+			}
+			if connErr != nil {
+				log.Printf("[mcp] %s: reload retry failed: %v", name, connErr)
+				s.auditMCPConnectFailure(name, connErr)
+				return
+			}
+			log.Printf("[mcp] %s: reload retry succeeded; probing supervisor", name)
+			capturedSup.ProbeNow(name)
+			tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
+		})
+	}()
 }
 
 // mcpConfigChanged returns true if MCP server configuration differs between old and new config.
@@ -4196,7 +4328,8 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		var newMCPMgr *mcp.ClientManager
 		var newCleanup func()
 		var newBaseline *agent.ToolRegistry
-		newBaseline, newReg, _, newMCPMgr, newCleanup, regErr = tools.RegisterAllWithBaseline(s.deps.GW, newCfg)
+		var startMCP tools.StartMCPFunc
+		newBaseline, newReg, _, newMCPMgr, newCleanup, startMCP, regErr = tools.RegisterAllWithBaselineAsync(s.deps.GW, newCfg)
 		if regErr != nil {
 			log.Printf("daemon: reload warning: %v", regErr)
 		}
@@ -4284,6 +4417,32 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 			s.deps.WriteUnlock()
 			log.Printf("MCP registry initialized with supervisor (reload): %d tools", len(initReg.All()))
 		}
+
+		// Kick off per-server connect goroutines in the background. HTTP
+		// returns immediately after this function exits; each connect
+		// respects its own ConnectTimeoutSeconds (Intercom: 300s for OAuth)
+		// so a stalled OAuth flow can't pin the daemon. On success we
+		// trigger a supervisor probe which transitions state to Healthy and
+		// fires OnChange → RebuildRegistryForHealth → MCP tools appear in
+		// the live registry.
+		if startMCP != nil {
+			capturedSupervisor := newSupervisor
+			capturedMgr := newMCPMgr
+			go startMCP(s.ctx, func(name string, connErr error) {
+				_, _, depsSup := s.deps.Snapshot()
+				if depsSup != capturedSupervisor {
+					return // deps swapped by a newer reload — drop result.
+				}
+				if connErr != nil {
+					log.Printf("[mcp] %s: async connect failed: %v", name, connErr)
+					s.auditMCPConnectFailure(name, connErr)
+					return
+				}
+				log.Printf("[mcp] %s: async connect succeeded; probing supervisor", name)
+				capturedSupervisor.ProbeNow(name)
+				tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
+			})
+		}
 	} else {
 		// Config changed but MCP servers didn't — update config and refresh
 		// cached rebuild layers so health-driven rebuilds use current settings.
@@ -4336,6 +4495,15 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 			}
 			tools.HandBrowserOff(oldBrowser, backstop)
 		}
+
+		// MCP config unchanged → existing mgr / supervisor still in place.
+		// But "POST /config/reload" is the user's explicit retry signal,
+		// so any server that's `disabled: false` but not currently
+		// connected (e.g. a previous async-connect attempt failed) gets
+		// another shot here. Without this, a Desktop "Retry" button has
+		// no effect once a server falls into the disconnected-disabled-
+		// supervisor-no-auto-reconnect hole.
+		s.retryDisconnectedEnabledMCPServers(newCfg)
 	}
 
 	if s.onReload != nil {
