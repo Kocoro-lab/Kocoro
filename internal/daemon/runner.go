@@ -1630,6 +1630,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		loadedSkills = injectBundledSkill(loadedSkills, deps.ShannonDir, "pdf-reader")
 	}
 
+	// Per-request skill suppression for desktop-only skills on cloud channels.
+	// Must run BEFORE every loadedSkills consumer (SetRegistrySkills below for
+	// the use_skill tool's runtime lookup, plus SwitchAgent / SetSkills further
+	// down for AgentLoop.agentSkills which feeds buildSkillListing + semantic
+	// discovery). Filtering at this single producer-side point keeps the three
+	// LLM-facing exposure paths consistent — see internal/daemon/skill_filter.go.
+	loadedSkills = filterSkillsForSource(loadedSkills, req.Source)
+
 	tools.SetRegistrySkills(reg, loadedSkills)
 
 	// Always expose local session search for daemon-served agents.

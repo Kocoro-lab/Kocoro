@@ -1,0 +1,43 @@
+package daemon
+
+import "github.com/Kocoro-lab/ShanClaw/internal/skills"
+
+// desktopOnlySkills enumerates builtin skills whose output only renders in
+// Kocoro Desktop (e.g. kocoro-generative-ui emits html-artifact fences that
+// only the WKWebView host can interpret). They are suppressed on cloud-
+// distributed channels — without suppression the LLM would happily activate
+// the skill and ship raw HTML/CSS/JS that surfaces as a fenced code block in
+// Feishu / Lark / WeCom / Slack / LINE / Telegram / webhook clients.
+//
+// Keep aligned with cloudSourceSet in session_cwd.go: the drift test in
+// skill_filter_test.go enforces that every entry here is suppressed across
+// every cloudSourceSet entry. Adding a new desktop-only skill requires no
+// channel-side work — adding a new cloud source likewise requires no skill-
+// side work — the matrix product is checked automatically.
+var desktopOnlySkills = map[string]struct{}{
+	"kocoro-generative-ui": {},
+}
+
+// filterSkillsForSource returns a new slice with desktop-only skills removed
+// when the request source is a cloud-distributed channel. Non-cloud sources
+// (empty / kocoro / web / cron / schedule / ws — i.e. TUI, Desktop, one-shot
+// CLI, scheduler) receive the full list unchanged.
+//
+// The input slice is intentionally not mutated. runner.go reuses the same
+// loadedSkills value across the agent-override and default-agent branches
+// within a single Run() invocation, and the slice itself may be shared across
+// concurrent sessions for the same agent. An in-place filter would leak the
+// filtered view to subsequent calls with a different (or empty) source value.
+func filterSkillsForSource(loaded []*skills.Skill, source string) []*skills.Skill {
+	if !isCloudSource(source) {
+		return loaded
+	}
+	out := make([]*skills.Skill, 0, len(loaded))
+	for _, s := range loaded {
+		if _, blocked := desktopOnlySkills[s.Name]; blocked {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
