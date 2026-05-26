@@ -193,6 +193,18 @@ func TestSummarizeLastRun_LegacyNoRangeFallsBackToTail(t *testing.T) {
 	}
 }
 
+func TestSummarizeLastRun_NeverRun_TurnsIsEmptyArrayNotNull(t *testing.T) {
+	sched := Schedule{ID: "x"} // never run
+	out, _ := SummarizeLastRun(sched, t.TempDir(), 5)
+	data, _ := json.Marshal(out)
+	if !strings.Contains(string(data), `"turns":[]`) {
+		t.Errorf("turns must serialize as [] not null, got: %s", data)
+	}
+	if strings.Contains(string(data), `"turns":null`) {
+		t.Errorf("turns must not serialize as null, got: %s", data)
+	}
+}
+
 func TestSummarizeLastRun_MissingFileGracefulError(t *testing.T) {
 	shan := t.TempDir()
 	sched := Schedule{

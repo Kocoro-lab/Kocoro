@@ -51,6 +51,10 @@ func SummarizeLastRun(sched Schedule, shannonDir string, maxTurns int) (LastRunS
 		SessionID: sched.LastRunSessionID,
 		AgentName: sched.Agent,
 		LastRunAt: sched.LastRunAt,
+		// Always non-nil so JSON marshals as [] not null. Swift Codable on
+		// the Desktop bridge declares the field as [ScheduleLastRunTurn]
+		// (non-optional), which would fail to decode on null.
+		Turns: []TurnSummary{},
 	}
 	if sched.LastRunSessionID == "" {
 		return out, nil
@@ -120,7 +124,11 @@ func SummarizeLastRun(sched Schedule, shannonDir string, maxTurns int) (LastRunS
 	if len(allAssistant) > maxTurns {
 		allAssistant = allAssistant[len(allAssistant)-maxTurns:]
 	}
-	out.Turns = allAssistant
+	if allAssistant != nil {
+		// Preserve the pre-initialized empty slice when no assistant turns
+		// were extracted, so JSON stays "turns":[] (see init above).
+		out.Turns = allAssistant
+	}
 	return out, nil
 }
 
