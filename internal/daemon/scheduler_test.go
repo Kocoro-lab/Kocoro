@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -234,5 +235,95 @@ func TestBuildScheduleRequest_DefaultAgentAlwaysNewSession(t *testing.T) {
 	req := buildScheduleRequest(sched, "")
 	if !req.NewSession {
 		t.Error("default-agent schedule must keep NewSession=true regardless of Stateful")
+	}
+}
+
+// --- Task 4: scheduler persists LastRun ------------------------------------
+
+// runWithLifecycle should call MarkLastRun on succeeded with the produced
+// sessionID + message indices, so a later schedule_show resolves to the
+// run's transcript slice (not the session's tail).
+func TestRunWithLifecycle_PersistsLastRunOnSucceeded(t *testing.T) {
+	dir := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
+	id, _ := mgr.Create("bot", "0 9 * * *", "p", false)
+
+	deps := &ServerDeps{EventBus: NewEventBus(), ScheduleManager: mgr}
+	s := &Scheduler{deps: deps}
+	sched, _ := mgr.Get(id)
+
+	before := time.Now()
+	s.runWithLifecycle(*sched, func() (*RunAgentResult, error) {
+		return &RunAgentResult{
+			SessionID:         "sess-success",
+			MessageStartIndex: 7,
+			MessageEndIndex:   11,
+		}, nil
+	})
+	after := time.Now()
+
+	got, _ := mgr.Get(id)
+	if got.LastRunSessionID != "sess-success" {
+		t.Errorf("LastRunSessionID = %q, want sess-success", got.LastRunSessionID)
+	}
+	if got.LastRunAt == nil || got.LastRunAt.Before(before) || got.LastRunAt.After(after) {
+		t.Errorf("LastRunAt %v outside [%v, %v]", got.LastRunAt, before, after)
+	}
+	if got.LastRunMessageStartIndex != 7 || got.LastRunMessageEndIndex != 11 {
+		t.Errorf("indices: start=%d end=%d, want 7/11", got.LastRunMessageStartIndex, got.LastRunMessageEndIndex)
+	}
+}
+
+// Failed runs that still reached session resolution must also stamp —
+// the partial transcript is more useful than nothing for the user
+// reviewing the failure. Task 3's runner-contract change makes this
+// achievable (hard error now returns &RunAgentResult{SessionID,...}, err).
+func TestRunWithLifecycle_PersistsLastRunOnFailedWithSession(t *testing.T) {
+	dir := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
+	id, _ := mgr.Create("bot", "0 9 * * *", "p", false)
+
+	deps := &ServerDeps{EventBus: NewEventBus(), ScheduleManager: mgr}
+	s := &Scheduler{deps: deps}
+	sched, _ := mgr.Get(id)
+
+	s.runWithLifecycle(*sched, func() (*RunAgentResult, error) {
+		return &RunAgentResult{
+			SessionID:         "sess-failed",
+			MessageStartIndex: 3,
+			MessageEndIndex:   4, // failed early — only the user message + error stub
+		}, fmt.Errorf("boom")
+	})
+
+	got, _ := mgr.Get(id)
+	if got.LastRunSessionID != "sess-failed" {
+		t.Errorf("LastRunSessionID = %q, want sess-failed (partial transcript)", got.LastRunSessionID)
+	}
+	if got.LastRunMessageStartIndex != 3 || got.LastRunMessageEndIndex != 4 {
+		t.Errorf("failed-run indices: start=%d end=%d, want 3/4", got.LastRunMessageStartIndex, got.LastRunMessageEndIndex)
+	}
+}
+
+// If the run failed before producing a sessionID (e.g. agent loader
+// errored), there's nothing to point at — must NOT stamp LastRun.
+func TestRunWithLifecycle_SkipsLastRunWhenNoSession(t *testing.T) {
+	dir := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
+	id, _ := mgr.Create("bot", "0 9 * * *", "p", false)
+
+	deps := &ServerDeps{EventBus: NewEventBus(), ScheduleManager: mgr}
+	s := &Scheduler{deps: deps}
+	sched, _ := mgr.Get(id)
+
+	s.runWithLifecycle(*sched, func() (*RunAgentResult, error) {
+		return nil, fmt.Errorf("agent loader failed")
+	})
+
+	got, _ := mgr.Get(id)
+	if got.LastRunAt != nil {
+		t.Errorf("must not stamp LastRunAt when no session: %v", got.LastRunAt)
+	}
+	if got.LastRunMessageStartIndex != 0 || got.LastRunMessageEndIndex != 0 {
+		t.Errorf("indices must remain zero when no session: start=%d end=%d", got.LastRunMessageStartIndex, got.LastRunMessageEndIndex)
 	}
 }

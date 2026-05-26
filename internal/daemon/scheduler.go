@@ -236,11 +236,29 @@ func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAge
 	}()
 
 	sessionID := ""
+	startIdx, endIdx := 0, 0
 	usage := ScheduleRunUsage{}
 	if result != nil {
 		sessionID = result.SessionID
+		startIdx = result.MessageStartIndex
+		endIdx = result.MessageEndIndex
 		usage = scheduleRunUsageFromResult(result)
 	}
+
+	// Persist last-run BEFORE emitting the terminal event so any
+	// subscriber that immediately calls schedule_show sees the stamped
+	// pointer. MarkLastRun is a silent no-op on empty sessionID (covered
+	// by Manager.MarkLastRun contract), so hard errors that crashed
+	// before session resolution leave LastRun untouched. The index range
+	// pins down the precise slice of sess.Messages this run wrote, which
+	// matters because named-agent sessions are shared across multiple
+	// schedules + interactive chat.
+	if s.deps != nil && s.deps.ScheduleManager != nil {
+		if err := s.deps.ScheduleManager.MarkLastRun(sched.ID, sessionID, time.Now(), startIdx, endIdx); err != nil {
+			log.Printf("scheduler: MarkLastRun failed for %s: %v", sched.ID, err)
+		}
+	}
+
 	if runErr != nil {
 		log.Printf("scheduler: agent run failed for schedule %s: %v", sched.ID, runErr)
 		s.emitScheduleRunWithUsage("failed", sched, sessionID, runErr, usage)
