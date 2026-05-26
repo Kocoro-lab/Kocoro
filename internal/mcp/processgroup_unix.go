@@ -40,11 +40,23 @@ func processGroupCmdFunc(ctx context.Context, command string, env []string, args
 		}
 		// Negative PID targets the process group whose leader is this PID.
 		// Setpgid above guarantees the child IS its own group leader.
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM); err != nil {
-			// Fallback: direct kill of the leader, matching exec.Cmd's default.
-			return cmd.Process.Kill()
+		//
+		// Escalation ladder: SIGTERM-group → SIGKILL-group → SIGKILL-leader.
+		// The mid-step is important: if SIGTERM-group fails for a reason
+		// other than "no such group" (e.g. permission, partial setpgid),
+		// falling straight back to cmd.Process.Kill() defeats the purpose
+		// of using Setpgid in the first place — the grandchild would
+		// survive and keep holding the OAuth callback port. Trying
+		// SIGKILL-group next preserves the "wipe the whole chain" intent.
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM); err == nil {
+			return nil
 		}
-		return nil
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err == nil {
+			return nil
+		}
+		// Last resort: kill the leader directly. Stragglers in the group
+		// will get reaped on Wait() via WaitDelay's SIGKILL backstop.
+		return cmd.Process.Kill()
 	}
 	cmd.WaitDelay = 3 * time.Second
 	return cmd, nil

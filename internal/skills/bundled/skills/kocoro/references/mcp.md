@@ -49,15 +49,21 @@ MCP servers are configured through the config API — there is no separate MCP e
 The daemon ships with a small catalog of pre-bundled MCP servers (currently: `intercom`). These appear in `GET /config/status` even when the user has never edited their config:
 
 - `mcp_servers` shows the runtime state (`disabled` / `enabled` / `connected`). Built-ins ship as `disabled` on first launch.
-- `mcp_server_info` adds metadata for built-in entries only: `{"<name>": {"builtin": true, "display_name": "Intercom", "description": "...", "auth_hint": "...", "requires_auth": true}}`. Older clients that don't know about this field ignore it.
+- `mcp_server_info` adds metadata for built-in entries only: `{"<name>": {"builtin": true, "display_name": "Intercom", "description": "...", "auth_hint": "...", "requires_auth": true, "authorized": true|false}}`. Older clients that don't know about this field ignore it.
 
 `requires_auth: true` means activation kicks off an out-of-process OAuth flow that the user needs to be primed for. **Desktop UIs SHOULD show a confirm dialog BEFORE flipping the toggle from off to on**, using `auth_hint` verbatim as the modal body and `display_name` to compose the title (e.g. "Enable Intercom?"). Only after the user confirms should Desktop send `PATCH /config` + `POST /config/reload`. Without this confirm step the browser appears to pop up on its own a few seconds after the toggle moves, which is jarring on cold-cache `npx` installs (5–20s gap).
 
+`authorized` (only emitted when `requires_auth: true`) is the dynamic counterpart: it reports whether the daemon detected an existing OAuth credential cache for this server (for mcp-remote-based servers like Intercom, this means a valid token file exists in `~/.mcp-auth/`). **When `authorized: true`, Desktop SHOULD skip the confirm modal** — re-enabling will silently reuse the cached token, no browser will open, and showing the modal makes the toggle look broken when the user clicks "Authorize" and nothing visible happens. Pseudocode for the Desktop guard:
+
+```ts
+const needsConfirm = info.requires_auth && info.authorized !== true && currentlyDisabled;
+```
+
 Activating a built-in:
-1. (Desktop) If `mcp_server_info.<name>.requires_auth === true`, show a confirm modal with `auth_hint` as the body. Bail out on cancel.
+1. (Desktop) If `mcp_server_info.<name>.requires_auth === true` AND `authorized !== true`, show a confirm modal with `auth_hint` as the body. Bail out on cancel.
 2. `PATCH /config` body `{"mcp_servers": {"intercom": {"disabled": false}}}`
-3. `POST /config/reload` — daemon spawns the configured subprocess. For Intercom this runs `npx mcp-remote https://mcp.intercom.com/mcp`, which opens the user's default browser for OAuth on first run.
-4. After OAuth completes, `GET /config/status` reports `"connected"`. Tools become available to agents.
+3. `POST /config/reload` — daemon spawns the configured subprocess. For Intercom this runs `npx mcp-remote https://mcp.intercom.com/mcp`, which opens the user's default browser for OAuth on first run. On re-enable after a previous successful authorization the cached token is used silently.
+4. After OAuth completes (or right away when re-enabling), `GET /config/status` reports `"connected"`. Tools become available to agents.
 
 The `command` / `args` / `type` / `url` / `context` fields of a built-in are owned by the daemon binary: PATCH /config rejects edits to those keys with `409 {"error": "builtin_mcp_immutable"}`. Users can still patch `disabled`, `env`, and `keep_alive`, and the yaml file only persists those user-set fields — daemon upgrades pick up any catalog changes (command tweaks, new URL, etc.) automatically without yaml surgery.
 

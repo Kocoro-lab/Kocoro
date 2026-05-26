@@ -4166,6 +4166,20 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 					}
 					if entry.RequiresAuth {
 						info["requires_auth"] = true
+						// `authorized` is the dynamic counterpart to
+						// `requires_auth`: requires_auth says "this
+						// server class needs OAuth"; authorized says
+						// "the current user already has a usable token".
+						// Desktop skips the confirm modal on enable
+						// when authorized=true (mcp-remote will reuse
+						// the cached token, no browser pop happens).
+						// Field is always set (true/false) for clarity;
+						// older clients ignore the key.
+						authorized := false
+						if entry.IsAuthorized != nil {
+							authorized = entry.IsAuthorized()
+						}
+						info["authorized"] = authorized
 					}
 				}
 				mcpServerInfo[name] = info

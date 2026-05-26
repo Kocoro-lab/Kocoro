@@ -107,6 +107,56 @@ func TestStartConnectAll_SkipsDisabledServers(t *testing.T) {
 	}
 }
 
+func TestStartConnectAll_DedupesInFlightConnect(t *testing.T) {
+	// Reload while a daemon-startup async connect is still mid-Initialize
+	// must NOT spawn a second connect goroutine for the same server —
+	// that's exactly the EADDRINUSE scenario the original Bug 1 fix was
+	// supposed to close, and the code review caught us missing the
+	// dedup. Use `sleep 30` so the inner Initialize stays blocked long
+	// enough to observe the dedup decision.
+	mgr := NewClientManager()
+	servers := map[string]MCPServerConfig{
+		"hang": {
+			Command:               "sleep",
+			Args:                  []string{"30"},
+			ConnectTimeoutSeconds: 10,
+		},
+	}
+
+	// First call: reserves the in-flight slot, kicks off the goroutine.
+	firstCh := make(chan struct{}, 1)
+	mgr.StartConnectAll(context.Background(), servers, 30*time.Second, func(name string, err error) {
+		firstCh <- struct{}{}
+	})
+
+	// Give the first goroutine a hair of CPU so it can claim the slot
+	// before the second StartConnectAll fires.
+	time.Sleep(50 * time.Millisecond)
+
+	// Second call against same mgr + same server: must be a no-op (the
+	// onResult would normally fire fast for "sleep 30" because Initialize
+	// errors out as soon as ctx times out, but the dedup skip path returns
+	// without calling onResult).
+	secondFired := make(chan struct{}, 1)
+	mgr.StartConnectAll(context.Background(), servers, 30*time.Second, func(name string, err error) {
+		secondFired <- struct{}{}
+	})
+
+	select {
+	case <-secondFired:
+		t.Fatal("second StartConnectAll for in-flight server fired onResult — dedup failed, would have spawned a duplicate subprocess")
+	case <-time.After(500 * time.Millisecond):
+		// good: skipped silently.
+	}
+
+	// Drain first call's eventual onResult so the test goroutine cleans up.
+	select {
+	case <-firstCh:
+	case <-time.After(15 * time.Second):
+		t.Fatal("first connect goroutine never finished")
+	}
+}
+
 func TestStartConnectAll_PerServerTimeoutHonored(t *testing.T) {
 	// `sleep 30` ignores stdin and writes nothing to stdout, so the MCP
 	// Initialize handshake stalls forever waiting for a response. The only

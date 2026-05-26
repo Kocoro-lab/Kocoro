@@ -57,6 +57,7 @@ type ClientManager struct {
 	configs      map[string]MCPServerConfig     // server name → config (for reconnect)
 	toolCache    map[string][]RemoteTool        // server name → last-known tools
 	cancellers   map[string]context.CancelFunc  // server name → ctx.Cancel for the spawned subprocess (stdio only); cancelling it SIGTERMs the whole process group
+	inFlight     map[string]struct{}            // server name → connect goroutine in progress; StartConnectAll/Reconnect skip duplicates
 	reconnectMu  map[string]*sync.Mutex         // per-server reconnect serialization
 	supervised   bool                           // when true, skip inline reconnect in CallTool
 	idleTimers   map[string]*time.Timer         // per-server idle disconnect timers
@@ -71,9 +72,34 @@ func NewClientManager() *ClientManager {
 		configs:     make(map[string]MCPServerConfig),
 		toolCache:   make(map[string][]RemoteTool),
 		cancellers:  make(map[string]context.CancelFunc),
+		inFlight:    make(map[string]struct{}),
 		reconnectMu: make(map[string]*sync.Mutex),
 		needsSetup:  make(map[string]bool),
 	}
+}
+
+// tryReserveInFlight marks serverName as having an in-flight connect attempt.
+// Returns (release, true) on success; (nil, false) if another connect goroutine
+// is already mid-flight for this server — caller should skip and let the
+// existing attempt finish. The release func must be called when the attempt
+// terminates (success OR failure) to clear the slot.
+//
+// Without this guard, a /config/reload that fires while the daemon-startup
+// async connect is still inside Initialize/ListTools would spawn a second
+// subprocess for the same server; both race to bind the OAuth callback
+// loopback port and the loser crashes with EADDRINUSE.
+func (m *ClientManager) tryReserveInFlight(serverName string) (func(), bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, busy := m.inFlight[serverName]; busy {
+		return nil, false
+	}
+	m.inFlight[serverName] = struct{}{}
+	return func() {
+		m.mu.Lock()
+		delete(m.inFlight, serverName)
+		m.mu.Unlock()
+	}, true
 }
 
 // SetRootsHandler installs a roots handler that will be advertised to every
@@ -198,6 +224,18 @@ func (m *ClientManager) StartConnectAll(parentCtx context.Context, servers map[s
 			timeout = 60 * time.Second
 		}
 		go func(name string, cfg MCPServerConfig, timeout time.Duration) {
+			// Skip if a connect goroutine is already in flight for this
+			// server. The pending attempt will eventually call onResult on
+			// its own; firing a duplicate would either lose the EADDRINUSE
+			// race or overwrite m.clients/m.cancellers and leak a process
+			// group.
+			release, ok := m.tryReserveInFlight(name)
+			if !ok {
+				log.Printf("[mcp] %s: connect already in flight, skipping duplicate StartConnectAll attempt", name)
+				return
+			}
+			defer release()
+
 			ctx, cancel := context.WithTimeout(parentCtx, timeout)
 			defer cancel()
 			// connectWithForceClose actively closes the client when ctx
@@ -807,6 +845,16 @@ func (m *ClientManager) Reconnect(ctx context.Context, serverName string) ([]Rem
 
 	rmu.Lock()
 	defer rmu.Unlock()
+
+	// Refuse to reconnect while a different connect goroutine is mid-flight
+	// for this server (e.g. StartConnectAll fired from daemon startup or a
+	// /config/reload retry). Without this check, the two attempts race to
+	// bind the OAuth callback port and the loser crashes with EADDRINUSE.
+	release, ok := m.tryReserveInFlight(serverName)
+	if !ok {
+		return nil, fmt.Errorf("reconnect for %q skipped: connect already in flight", serverName)
+	}
+	defer release()
 
 	// Reap the old process group first so c.Close (cmd.Wait inside) returns
 	// promptly even when the old subprocess ignores stdin EOF.

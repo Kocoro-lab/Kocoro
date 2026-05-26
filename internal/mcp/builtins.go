@@ -1,5 +1,7 @@
 package mcp
 
+import "os"
+
 // Built-in MCP server catalog.
 //
 // Entries here ship inside the daemon binary and surface to Desktop as
@@ -30,6 +32,13 @@ type BuiltinEntry struct {
 	AuthHint     string          // full text to drop into a confirm modal / tooltip; empty if no auth
 	RequiresAuth bool            // true → Desktop should show a confirm dialog (with AuthHint as body) BEFORE flipping the toggle, because activation triggers an out-of-process browser OAuth flow that the user needs to expect
 	Config       MCPServerConfig // command/args/type/url/context — overrides user yaml
+	// IsAuthorized returns true when the user already holds valid auth
+	// credentials for this server, so re-enabling will NOT pop a browser
+	// (e.g. mcp-remote will silently use its cached OAuth token). Surfaced
+	// at GET /config/status as `mcp_server_info.<name>.authorized` so
+	// Desktop can skip the confirm modal on repeat enables. Nil = treat as
+	// always unauthorized (safe default — Desktop will keep prompting).
+	IsAuthorized func() bool
 }
 
 // BuiltinMCPServers is the catalog. Keys MUST be valid MCP server names
@@ -49,7 +58,7 @@ var BuiltinMCPServers = map[string]BuiltinEntry{
 		RequiresAuth: true,
 		Config: MCPServerConfig{
 			Command: "npx",
-			Args:    []string{"mcp-remote", "https://mcp.intercom.com/mcp"},
+			Args:    []string{"mcp-remote", IntercomMCPRemoteURL},
 			Context: "Intercom MCP server. Use it to read Intercom conversations, contacts, companies, and help center articles, or to send replies on behalf of the workspace owner.",
 			// 300s gives the user a 5-minute window to complete the OAuth
 			// flow in the browser before the daemon kills the npx subprocess.
@@ -57,7 +66,19 @@ var BuiltinMCPServers = map[string]BuiltinEntry{
 			// followed by manual OAuth approval (commonly 30–180s).
 			ConnectTimeoutSeconds: 300,
 		},
+		IsAuthorized: intercomIsAuthorized,
 	},
+}
+
+// intercomIsAuthorized is a package-level var (not inline closure) so the
+// test suite can swap it out to fake an authorized / unauthorized state
+// without touching the real ~/.mcp-auth/ directory.
+var intercomIsAuthorized = func() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	return MCPRemoteHasToken(home, IntercomMCPRemoteURL)
 }
 
 // BuiltinImmutableFields names the MCPServerConfig fields that the daemon

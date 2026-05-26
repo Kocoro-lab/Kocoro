@@ -1097,12 +1097,19 @@ func mergeBuiltinMCPServers(cfg *Config) {
 		cfg.MCPServers = make(map[string]mcp.MCPServerConfig, len(mcp.BuiltinMCPServers))
 	}
 	for name, builtin := range mcp.BuiltinMCPServers {
-		// Deep-copy Args so a downstream mutation through cfg.MCPServers
-		// can't reach into BuiltinMCPServers' backing array. Type/URL/
+		// Deep-copy Args + Env so a downstream mutation through cfg.MCPServers
+		// can't reach into BuiltinMCPServers' backing storage. Type/URL/
 		// Command/Context are value types and copy via struct assignment.
 		merged := builtin.Config
 		if len(builtin.Config.Args) > 0 {
 			merged.Args = append([]string(nil), builtin.Config.Args...)
+		}
+		merged.Env = nil
+		if len(builtin.Config.Env) > 0 {
+			merged.Env = make(map[string]string, len(builtin.Config.Env))
+			for k, v := range builtin.Config.Env {
+				merged.Env[k] = v
+			}
 		}
 		if existing, ok := cfg.MCPServers[name]; ok {
 			// Preserve user-controlled fields. Default for Disabled when the
@@ -1110,11 +1117,21 @@ func mergeBuiltinMCPServers(cfg *Config) {
 			// matching yaml semantics). ConnectTimeoutSeconds is also user-
 			// tunable — keep the user override when non-zero, fall through
 			// to the catalog default otherwise.
+			//
+			// Env merges key-by-key with user winning on conflicts: this
+			// preserves any default env vars the catalog ships (currently
+			// none, but a future builtin might) while still letting the
+			// user override specific keys via yaml.
 			merged.Disabled = existing.Disabled
-			merged.Env = existing.Env
 			merged.KeepAlive = existing.KeepAlive
 			if existing.ConnectTimeoutSeconds > 0 {
 				merged.ConnectTimeoutSeconds = existing.ConnectTimeoutSeconds
+			}
+			for k, v := range existing.Env {
+				if merged.Env == nil {
+					merged.Env = make(map[string]string, len(existing.Env))
+				}
+				merged.Env[k] = v
 			}
 		} else {
 			// First-launch default: shipped off until the user opts in.

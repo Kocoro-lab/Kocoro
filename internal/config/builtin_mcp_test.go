@@ -97,6 +97,55 @@ func TestMergeBuiltinMCPServers_ArgsAreDeepCopied(t *testing.T) {
 	}
 }
 
+func TestMergeBuiltinMCPServers_EnvIsDeepCopiedAndMerged(t *testing.T) {
+	// Mirror of TestMergeBuiltinMCPServers_ArgsAreDeepCopied for the Env
+	// map: mutating merged Env on a downstream cfg.MCPServers entry must
+	// not poison the BuiltinMCPServers global. Also: when user yaml has
+	// Env, key-by-key merge should win (user override) while still
+	// retaining any catalog-default keys not present in the user map.
+	//
+	// Intercom ships no default Env today, so we add a synthetic builtin
+	// for the deep-copy assertion. Restore on test exit so other tests
+	// see the catalog unchanged.
+	const fixtureName = "test-env-fixture"
+	orig := mcp.BuiltinMCPServers[fixtureName]
+	mcp.BuiltinMCPServers[fixtureName] = mcp.BuiltinEntry{
+		DisplayName: "Env fixture",
+		Config: mcp.MCPServerConfig{
+			Command: "/bin/true",
+			Env:     map[string]string{"CATALOG_KEY": "from-builtin"},
+		},
+	}
+	t.Cleanup(func() {
+		if orig.DisplayName == "" {
+			delete(mcp.BuiltinMCPServers, fixtureName)
+		} else {
+			mcp.BuiltinMCPServers[fixtureName] = orig
+		}
+	})
+
+	cfg := &Config{
+		MCPServers: map[string]mcp.MCPServerConfig{
+			fixtureName: {Env: map[string]string{"USER_KEY": "from-user"}},
+		},
+	}
+	mergeBuiltinMCPServers(cfg)
+
+	srv := cfg.MCPServers[fixtureName]
+	if srv.Env["CATALOG_KEY"] != "from-builtin" {
+		t.Errorf("expected catalog default CATALOG_KEY to survive merge, got %q", srv.Env["CATALOG_KEY"])
+	}
+	if srv.Env["USER_KEY"] != "from-user" {
+		t.Errorf("expected user override USER_KEY to be preserved, got %q", srv.Env["USER_KEY"])
+	}
+
+	// Poison the merged Env — must not reach back into the catalog.
+	srv.Env["CATALOG_KEY"] = "poisoned"
+	if mcp.BuiltinMCPServers[fixtureName].Config.Env["CATALOG_KEY"] != "from-builtin" {
+		t.Error("downstream mutation leaked into BuiltinMCPServers — Env map was shallow-copied")
+	}
+}
+
 func TestMergeBuiltinMCPServers_PreservesUserEnvAndKeepAlive(t *testing.T) {
 	cfg := &Config{
 		MCPServers: map[string]mcp.MCPServerConfig{
