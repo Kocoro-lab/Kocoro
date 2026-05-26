@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -387,5 +388,142 @@ func TestScheduleTool_Create_StatefulArgHonored(t *testing.T) {
 	list, _ := mgr.List()
 	if list[0].Stateful == nil || !*list[0].Stateful {
 		t.Errorf("stateful=%v, want *true", list[0].Stateful)
+	}
+}
+
+// --- Task 6: schedule_show tool --------------------------------------------
+
+// Read-only contract: schedule_show is a query, never asks for approval,
+// matches the schedule_list precedent. Concurrent-safety follows by
+// inheritance from IsReadOnlyCall.
+func TestScheduleTool_Show_NoApproval_ReadOnly(t *testing.T) {
+	tool := &ScheduleTool{action: "show"}
+	if tool.RequiresApproval() {
+		t.Errorf("schedule_show must not require approval (read-only query)")
+	}
+	if !tool.IsReadOnlyCall("") {
+		t.Errorf("schedule_show must be IsReadOnlyCall == true")
+	}
+}
+
+func TestScheduleTool_Show_NeverRun(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "tracker", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	id, _ := mgr.Create("tracker", "0 9 * * *", "p", false)
+	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
+
+	res, err := tool.Run(context.Background(), `{"id":"`+id+`"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("show: err=%v res=%+v", err, res)
+	}
+	if !strings.Contains(res.Content, "has not run yet") {
+		t.Errorf("never-run output should say 'has not run yet', got %q", res.Content)
+	}
+}
+
+func TestScheduleTool_Show_RendersTurns(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "tracker", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	id, _ := mgr.Create("tracker", "0 9 * * *", "p", false)
+
+	sessDir := filepath.Join(shan, "agents", "tracker", "sessions")
+	os.MkdirAll(sessDir, 0700)
+	os.WriteFile(filepath.Join(sessDir, "sess-1.json"), []byte(
+		`{"id":"sess-1","schema_version":1,"messages":[{"role":"user","content":"q"},{"role":"assistant","content":"hello from run"}]}`,
+	), 0600)
+	mgr.MarkLastRun(id, "sess-1", time.Now(), 0, 2)
+
+	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
+	res, err := tool.Run(context.Background(), `{"id":"`+id+`"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("show: err=%v res=%+v", err, res)
+	}
+	if !strings.Contains(res.Content, "hello from run") {
+		t.Errorf("expected assistant text, got %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "sess-1") {
+		t.Errorf("expected session id, got %q", res.Content)
+	}
+}
+
+func TestScheduleTool_Show_UnknownID(t *testing.T) {
+	shan := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
+
+	res, _ := tool.Run(context.Background(), `{"id":"nope"}`)
+	if !res.IsError {
+		t.Errorf("unknown id should set IsError, got %+v", res)
+	}
+}
+
+func TestScheduleTool_Show_MissingSessionFile(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "tracker", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	id, _ := mgr.Create("tracker", "0 9 * * *", "p", false)
+	mgr.MarkLastRun(id, "sess-vanished", time.Now(), 0, 4)
+
+	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
+	res, _ := tool.Run(context.Background(), `{"id":"`+id+`"}`)
+	if !res.IsError {
+		t.Errorf("missing session should set IsError, got %+v", res)
+	}
+	if !strings.Contains(res.Content, "session") {
+		t.Errorf("error should mention session, got %q", res.Content)
+	}
+}
+
+func TestScheduleTool_Show_MaxTurnsArg(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "tracker", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	id, _ := mgr.Create("tracker", "0 9 * * *", "p", false)
+
+	sessDir := filepath.Join(shan, "agents", "tracker", "sessions")
+	os.MkdirAll(sessDir, 0700)
+	msgs := `{"id":"sess","schema_version":1,"messages":[` +
+		`{"role":"assistant","content":"turn 1"},` +
+		`{"role":"assistant","content":"turn 2"},` +
+		`{"role":"assistant","content":"turn 3"},` +
+		`{"role":"assistant","content":"turn 4"},` +
+		`{"role":"assistant","content":"turn 5"},` +
+		`{"role":"assistant","content":"turn 6"}]}`
+	os.WriteFile(filepath.Join(sessDir, "sess.json"), []byte(msgs), 0600)
+	mgr.MarkLastRun(id, "sess", time.Now(), 0, 6)
+
+	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
+	res, _ := tool.Run(context.Background(), `{"id":"`+id+`","max_turns":2}`)
+	if strings.Contains(res.Content, "turn 4") {
+		t.Errorf("max_turns=2 must NOT include turn 4: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "turn 5") || !strings.Contains(res.Content, "turn 6") {
+		t.Errorf("max_turns=2 must include turns 5 and 6: %q", res.Content)
+	}
+}
+
+// The behavior that motivated the entire spec: a named-agent session is
+// shared between interactive chat AND scheduled runs. schedule_show MUST
+// return only the run's slice, not the session's tail.
+func TestScheduleTool_Show_RespectsMessageRange(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "tracker", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	id, _ := mgr.Create("tracker", "0 9 * * *", "p", false)
+
+	sessDir := filepath.Join(shan, "agents", "tracker", "sessions")
+	os.MkdirAll(sessDir, 0700)
+	msgs := `{"id":"sess-shared","schema_version":1,"messages":[` +
+		`{"role":"user","content":"interactive q"},` +
+		`{"role":"assistant","content":"INTERACTIVE_REPLY"},` +
+		`{"role":"user","content":"scheduled prompt"},` +
+		`{"role":"assistant","content":"SCHEDULED_REPLY"}]}`
+	os.WriteFile(filepath.Join(sessDir, "sess-shared.json"), []byte(msgs), 0600)
+	mgr.MarkLastRun(id, "sess-shared", time.Now(), 2, 4)
+
+	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
+	res, _ := tool.Run(context.Background(), `{"id":"`+id+`"}`)
+	if strings.Contains(res.Content, "INTERACTIVE_REPLY") {
+		t.Errorf("interactive chat reply must NOT appear in show output: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "SCHEDULED_REPLY") {
+		t.Errorf("scheduled reply must appear in show output: %q", res.Content)
 	}
 }

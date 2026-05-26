@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -15,16 +16,18 @@ import (
 )
 
 type ScheduleTool struct {
-	manager *schedule.Manager
-	action  string
+	manager    *schedule.Manager
+	action     string
+	shannonDir string // root for resolving session files in schedule_show
 }
 
-func NewScheduleTools(mgr *schedule.Manager) []agent.Tool {
+func NewScheduleTools(mgr *schedule.Manager, shannonDir string) []agent.Tool {
 	return []agent.Tool{
-		&ScheduleTool{manager: mgr, action: "create"},
-		&ScheduleTool{manager: mgr, action: "list"},
-		&ScheduleTool{manager: mgr, action: "update"},
-		&ScheduleTool{manager: mgr, action: "remove"},
+		&ScheduleTool{manager: mgr, action: "create", shannonDir: shannonDir},
+		&ScheduleTool{manager: mgr, action: "list", shannonDir: shannonDir},
+		&ScheduleTool{manager: mgr, action: "update", shannonDir: shannonDir},
+		&ScheduleTool{manager: mgr, action: "remove", shannonDir: shannonDir},
+		&ScheduleTool{manager: mgr, action: "show", shannonDir: shannonDir},
 	}
 }
 
@@ -97,6 +100,21 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 				"type": "object",
 				"properties": map[string]any{
 					"id":          map[string]any{"type": "string", "description": "Schedule ID to remove"},
+					"description": agent.DescriptionFieldSpec,
+				},
+			},
+			Required: []string{"id", "description"},
+		}
+	case "show":
+		return agent.ToolInfo{
+			Name: "schedule_show",
+			Description: "Show the most recent run of a scheduled task. Returns when it last fired plus a summary of the last assistant turns from that run. Use this when the user asks what a schedule produced (e.g. 'what did my daily report say' or 'show me the last run'); do not push the user to call session_search themselves." +
+				agent.DescriptionGuidance,
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id":          map[string]any{"type": "string", "description": "Schedule ID (from schedule_list)."},
+					"max_turns":   map[string]any{"type": "integer", "default": 5, "minimum": 1, "maximum": 20, "description": "How many most-recent assistant turns to include. Defaults to 5; clamped to 1-20."},
 					"description": agent.DescriptionFieldSpec,
 				},
 			},
@@ -209,16 +227,58 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
 		}
 		return agent.ToolResult{Content: fmt.Sprintf("Schedule %s removed.", id)}, nil
+	case "show":
+		id, _ := args["id"].(string)
+		if id == "" {
+			return agent.ToolResult{Content: "id is required", IsError: true}, nil
+		}
+		sched, err := t.manager.Get(id)
+		if err != nil {
+			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
+		}
+		maxTurns := 5
+		if v, ok := args["max_turns"].(float64); ok && v > 0 {
+			maxTurns = int(v)
+		}
+		summary, err := schedule.SummarizeLastRun(*sched, t.shannonDir, maxTurns)
+		if err != nil {
+			return agent.ToolResult{Content: fmt.Sprintf("schedule_show: %v", err), IsError: true}, nil
+		}
+		if summary.SessionID == "" {
+			return agent.ToolResult{Content: fmt.Sprintf("Schedule %s has not run yet.", id)}, nil
+		}
+		var sb strings.Builder
+		if summary.LastRunAt != nil {
+			fmt.Fprintf(&sb, "Schedule %s last ran at %s (session %s).\n", id, summary.LastRunAt.Format(time.RFC3339), summary.SessionID)
+		} else {
+			fmt.Fprintf(&sb, "Schedule %s (session %s):\n", id, summary.SessionID)
+		}
+		if len(summary.Turns) == 0 {
+			sb.WriteString("(session has no assistant turns yet)")
+		} else {
+			for i, turn := range summary.Turns {
+				fmt.Fprintf(&sb, "\n--- assistant turn %d ---\n%s\n", i+1, turn.Text)
+			}
+		}
+		return agent.ToolResult{Content: sb.String()}, nil
 	}
 	return agent.ToolResult{Content: "unknown action", IsError: true}, nil
 }
 
 func (t *ScheduleTool) RequiresApproval() bool {
-	return t.action != "list"
+	switch t.action {
+	case "list", "show":
+		return false
+	}
+	return true
 }
 
 func (t *ScheduleTool) IsReadOnlyCall(string) bool {
-	return t.action == "list"
+	switch t.action {
+	case "list", "show":
+		return true
+	}
+	return false
 }
 
 // triggerConflictWarning returns a user-facing warning line (with the leading

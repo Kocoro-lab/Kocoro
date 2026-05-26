@@ -114,7 +114,7 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	// for audit logging and confirm gates; these tools serve as fallback.
 	if shanDir := config.ShannonDir(); shanDir != "" {
 		schMgr := schedule.NewManager(filepath.Join(shanDir, "schedules.json"))
-		for _, tool := range NewScheduleTools(schMgr) {
+		for _, tool := range NewScheduleTools(schMgr, shanDir) {
 			reg.Register(tool)
 		}
 	}

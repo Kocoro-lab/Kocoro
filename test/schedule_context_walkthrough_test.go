@@ -119,7 +119,7 @@ func TestWalkthrough_ScheduleContext(t *testing.T) {
 
 	// Create a real schedule via the ScheduleTool. The tool will call
 	// extractConversationContext(ctx) and SaveContext internally.
-	scheduleTools := tools.NewScheduleTools(mgr)
+	scheduleTools := tools.NewScheduleTools(mgr, tmpHome)
 	var createTool agent.Tool
 	for _, tl := range scheduleTools {
 		if tl.Info().Name == "schedule_create" {
