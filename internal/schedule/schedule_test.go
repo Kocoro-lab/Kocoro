@@ -492,6 +492,12 @@ func TestSchedule_LegacyJSON_LastRunFieldsAreNil(t *testing.T) {
 	if s.LastRunSessionID != "" {
 		t.Errorf("legacy LastRunSessionID should be empty, got %q", s.LastRunSessionID)
 	}
+	if s.LastRunMessageStartIndex != 0 {
+		t.Errorf("legacy LastRunMessageStartIndex should be 0, got %d", s.LastRunMessageStartIndex)
+	}
+	if s.LastRunMessageEndIndex != 0 {
+		t.Errorf("legacy LastRunMessageEndIndex should be 0, got %d", s.LastRunMessageEndIndex)
+	}
 }
 
 func TestSchedule_JSONRoundTrip_LastRunFieldsPreserved(t *testing.T) {
@@ -532,5 +538,84 @@ func TestSchedule_JSONRoundTrip_LastRunFieldsPreserved(t *testing.T) {
 	}
 	if back.LastRunMessageStartIndex != 12 || back.LastRunMessageEndIndex != 18 {
 		t.Errorf("round-trip lost message range: start=%d end=%d", back.LastRunMessageStartIndex, back.LastRunMessageEndIndex)
+	}
+}
+
+// --- Task 2: MarkLastRun ----------------------------------------------------
+
+func TestManager_MarkLastRun_NormalUpdate(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(filepath.Join(dir, "schedules.json"))
+	id, err := m.Create("bot", "0 9 * * *", "p", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	when := time.Date(2026, 5, 26, 12, 30, 0, 0, time.UTC)
+	if err := m.MarkLastRun(id, "2026-05-26-deadbeef", when, 5, 9); err != nil {
+		t.Fatalf("MarkLastRun: %v", err)
+	}
+	got, _ := m.Get(id)
+	if got.LastRunSessionID != "2026-05-26-deadbeef" {
+		t.Errorf("LastRunSessionID = %q, want 2026-05-26-deadbeef", got.LastRunSessionID)
+	}
+	if got.LastRunAt == nil || !got.LastRunAt.Equal(when) {
+		t.Errorf("LastRunAt = %v, want %v", got.LastRunAt, when)
+	}
+	if got.LastRunMessageStartIndex != 5 || got.LastRunMessageEndIndex != 9 {
+		t.Errorf("indices: start=%d end=%d, want 5/9", got.LastRunMessageStartIndex, got.LastRunMessageEndIndex)
+	}
+}
+
+// Overwrites are the common path — schedule fires repeatedly. Second mark
+// must replace, not append.
+func TestManager_MarkLastRun_Overwrites(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(filepath.Join(dir, "schedules.json"))
+	id, _ := m.Create("bot", "0 9 * * *", "p", false)
+
+	t1 := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	_ = m.MarkLastRun(id, "sess-1", t1, 0, 4)
+	t2 := time.Date(2026, 5, 26, 13, 0, 0, 0, time.UTC)
+	_ = m.MarkLastRun(id, "sess-2", t2, 4, 7)
+
+	got, _ := m.Get(id)
+	if got.LastRunSessionID != "sess-2" {
+		t.Errorf("overwrite lost: %q", got.LastRunSessionID)
+	}
+	if !got.LastRunAt.Equal(t2) {
+		t.Errorf("LastRunAt overwrite lost: %v", got.LastRunAt)
+	}
+	if got.LastRunMessageStartIndex != 4 || got.LastRunMessageEndIndex != 7 {
+		t.Errorf("indices overwrite lost: start=%d end=%d", got.LastRunMessageStartIndex, got.LastRunMessageEndIndex)
+	}
+}
+
+// MarkLastRun against an unknown id (e.g. schedule deleted between
+// runWithLifecycle dispatch and completion) MUST silently no-op so we
+// don't crash the scheduler tick.
+func TestManager_MarkLastRun_UnknownIDIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(filepath.Join(dir, "schedules.json"))
+	if err := m.MarkLastRun("nonexistent", "sess-x", time.Now(), 0, 0); err != nil {
+		t.Errorf("unknown id should not error: %v", err)
+	}
+}
+
+// Empty sessionID would only happen if the run never reached session
+// resolution — we must NOT stamp LastRunAt in that case, because there's
+// nothing for the show endpoint to resolve.
+func TestManager_MarkLastRun_EmptySessionIDIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(filepath.Join(dir, "schedules.json"))
+	id, _ := m.Create("bot", "0 9 * * *", "p", false)
+	if err := m.MarkLastRun(id, "", time.Now(), 0, 0); err != nil {
+		t.Errorf("empty sessionID should be silent no-op: %v", err)
+	}
+	got, _ := m.Get(id)
+	if got.LastRunAt != nil {
+		t.Errorf("empty sessionID must not stamp LastRunAt, got %v", got.LastRunAt)
+	}
+	if got.LastRunMessageStartIndex != 0 || got.LastRunMessageEndIndex != 0 {
+		t.Errorf("empty sessionID must not stamp indices, got %d/%d", got.LastRunMessageStartIndex, got.LastRunMessageEndIndex)
 	}
 }

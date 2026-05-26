@@ -45,12 +45,13 @@ type Schedule struct {
 
 	// LastRunMessageStartIndex / LastRunMessageEndIndex pin down the precise
 	// slice of sess.Messages this run wrote. Required because the named-agent
-	// route key is `agent:<name>` (router.go:949) — every schedule + every
-	// interactive chat with the same agent shares one session, so without an
-	// index range, schedule_show would return the session's tail (which could
-	// be the user's last chat reply, not the schedule's output). When the
-	// schedule has never run, both default to 0; combined with the empty
-	// LastRunSessionID this unambiguously signals never-run.
+	// route key is `agent:<name>` (SessionCache.agentRouteKey in router.go) —
+	// every schedule + every interactive chat with the same agent shares one
+	// session, so without an index range, schedule_show would return the
+	// session's tail (which could be the user's last chat reply, not the
+	// schedule's output). When the schedule has never run, both default to 0;
+	// combined with the empty LastRunSessionID this unambiguously signals
+	// never-run.
 	LastRunMessageStartIndex int `json:"last_run_message_start_index,omitempty"`
 	LastRunMessageEndIndex   int `json:"last_run_message_end_index,omitempty"`
 }
@@ -277,6 +278,43 @@ func (m *Manager) Update(id string, opts *UpdateOpts) error {
 			}
 		}
 		return nil, fmt.Errorf("schedule %q not found", id)
+	})
+}
+
+// MarkLastRun records that the schedule fired and which session captured
+// the transcript, plus the message index range this run wrote. Called by
+// the scheduler at end-of-lifecycle. Idempotent overwrite — only the most
+// recent run is tracked, by design: list endpoints stay light (just
+// pointers), and a separate show endpoint resolves the pointer to the
+// actual transcript slice on demand.
+//
+// The index range pins down precisely which slice of sess.Messages came
+// from this run, so SummarizeLastRun can return the correct turns even
+// when the session is shared across multiple schedules + interactive chat
+// (the named-agent route key is `agent:<name>`, which makes sharing the
+// common case).
+//
+// No-op cases:
+//   - id not found: schedule may have been deleted between dispatch and
+//     completion; we should not crash the scheduler.
+//   - sessionID empty: the run failed before session resolution; there's
+//     nothing for SummarizeLastRun to fetch.
+func (m *Manager) MarkLastRun(id, sessionID string, when time.Time, startIdx, endIdx int) error {
+	if sessionID == "" {
+		return nil
+	}
+	return m.lockedModify(func(schedules []Schedule) ([]Schedule, error) {
+		for i := range schedules {
+			if schedules[i].ID == id {
+				w := when
+				schedules[i].LastRunAt = &w
+				schedules[i].LastRunSessionID = sessionID
+				schedules[i].LastRunMessageStartIndex = startIdx
+				schedules[i].LastRunMessageEndIndex = endIdx
+				return schedules, nil
+			}
+		}
+		return schedules, nil // unknown id — silent
 	})
 }
 
