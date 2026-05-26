@@ -99,6 +99,28 @@ func TestFilterSkillsForSource_NoDesktopOnlySkills_PassThrough(t *testing.T) {
 	}
 }
 
+// TestFilterSkillsForSource_NormalizesSourceCasing asserts the filter honors
+// the same lower+trim normalization isCloudSource applies, so a channel
+// handler that ships "Slack" or " feishu " still triggers suppression. Locks
+// in the contract — without this test someone "optimizing" isCloudSource into
+// a direct map lookup would silently regress mixed-case / padded inputs.
+func TestFilterSkillsForSource_NormalizesSourceCasing(t *testing.T) {
+	for _, src := range []string{"Slack", "FEISHU", " feishu ", "\tlark\n", "WeCom"} {
+		t.Run(src, func(t *testing.T) {
+			in := makeTestSkills()
+			out := filterSkillsForSource(in, src)
+			if len(out) != 2 {
+				t.Fatalf("source %q: got %d skills, want 2 (suppression should ignore case/whitespace)", src, len(out))
+			}
+			for _, s := range out {
+				if s.Name == "kocoro-generative-ui" {
+					t.Fatalf("source %q: kocoro-generative-ui leaked — normalization regressed", src)
+				}
+			}
+		})
+	}
+}
+
 // TestDesktopOnlySkillsCoverage_Drift asserts that for every desktop-only
 // skill, every cloudSourceSet entry suppresses it. Mirrors the drift test in
 // session_cwd_test.go: cheap insurance against someone adding a new cloud

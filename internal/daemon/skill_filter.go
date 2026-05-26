@@ -14,6 +14,15 @@ import "github.com/Kocoro-lab/ShanClaw/internal/skills"
 // every cloudSourceSet entry. Adding a new desktop-only skill requires no
 // channel-side work — adding a new cloud source likewise requires no skill-
 // side work — the matrix product is checked automatically.
+//
+// Map keys are Skill.Name (the identifier the LLM sees in the listing and
+// passes to use_skill). use_skill's runtime lookup (internal/tools/skill.go)
+// resolves Name first then falls back to Slug, but because filterSkillsForSource
+// drops the *whole* entry both identifiers vanish from every downstream
+// consumer — the asymmetry is moot as long as we stay in "drop the entry"
+// mode. If anyone later replaces this with a set-based identifier-contains
+// check (e.g. retaining the skill but filtering its name from the listing
+// only), they must match both Name and Slug to preserve the same guarantee.
 var desktopOnlySkills = map[string]struct{}{
 	"kocoro-generative-ui": {},
 }
