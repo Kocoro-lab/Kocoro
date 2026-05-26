@@ -1055,20 +1055,38 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		cleanupBrowserToolAfterTurn(ctx)
 	}()
 	if sup != nil {
-		// Cancel any pending idle disconnect — a new turn is starting.
-		if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
+		var mgr *mcp.ClientManager
+		if _, _, _, m := deps.RebuildLayers(); m != nil {
+			mgr = m
+			// Cancel any pending idle disconnect — a new turn is starting.
 			mgr.CancelIdleDisconnect("playwright")
 		}
-		// Only probe+reconnect Playwright when it's not already disconnected.
-		// When the user closes Chrome, the periodic probe marks it Disconnected.
-		// Calling ProbeNow on a Disconnected server triggers attemptReconnect,
-		// which relaunches Chrome — disruptive if the task doesn't need browser tools.
-		if before := sup.HealthFor("playwright"); before.State != mcp.StateDisconnected {
+		// Only probe+reconnect Playwright when there is actually a live
+		// client to probe. Two cases trigger the skip:
+		//
+		//   (1) periodic probe marked it Disconnected (e.g. user closed
+		//       Chrome) — ProbeNow on Disconnected would fire
+		//       attemptReconnect → relaunch Chrome.
+		//   (2) post-discovery Disconnect for keep_alive=false — the
+		//       async startup flow leaves supervisor state at Degraded
+		//       (the capability probe ran before Chrome was up) even
+		//       though we deliberately removed the client. ProbeNow on
+		//       Degraded + CDP mode fires maybeRelaunchDegradedCDPChrome
+		//       and pops Chrome for a turn that may never touch browser
+		//       tools.
+		//
+		// Tool invocation paths in mcp_tool.go handle their own
+		// ensureChromeDebugPort lazily, so we never lose recovery
+		// capability when the agent actually needs the browser.
+		state := sup.HealthFor("playwright").State
+		playwrightLive := mgr != nil && mgr.IsConnected("playwright")
+		if state != mcp.StateDisconnected && playwrightLive {
 			var pwCfg mcp.MCPServerConfig
 			hasPlaywrightCfg := false
-			if _, _, _, mgr := deps.RebuildLayers(); mgr != nil {
+			if mgr != nil {
 				pwCfg, hasPlaywrightCfg = mgr.ConfigFor("playwright")
 			}
+			before := sup.HealthFor("playwright")
 			if hasPlaywrightCfg && shouldSkipPlaywrightProbeChromeRelaunch(before, pwCfg, req) {
 				log.Printf("daemon: skipping unattended Playwright degraded probe relaunch")
 			} else {
