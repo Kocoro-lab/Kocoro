@@ -136,7 +136,7 @@ func TestOffline_ScheduleCRUD(t *testing.T) {
 	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
 
 	// Create
-	id, err := mgr.Create("", "0 0 31 2 *", "never runs")
+	id, err := mgr.Create("", "0 0 31 2 *", "never runs", false)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
