@@ -954,6 +954,17 @@ func isUnattendedRunStartProbe(req RunAgentRequest) bool {
 	}
 }
 
+// shouldSkipPlaywrightProbeChromeRelaunch is defense-in-depth for the
+// unattended-degraded-keep_alive=false branch of the preflight probe.
+// The async-startup flow added an outer guard in RunAgent (skip when
+// mgr.IsConnected("playwright") is false) that already covers the
+// common post-discovery-Disconnect case — by the time we reach this
+// predicate, playwrightLive must be true. So in practice the only
+// surviving live cfg.KeepAlive=false path through here would be a
+// transient window between connect-success and PostConnectDisconnect-
+// IfDiscoveryOnly running. Kept as a safety net: if some future
+// refactor breaks the "discover then disconnect" handshake, an
+// unattended turn still won't pop a Chrome window.
 func shouldSkipPlaywrightProbeChromeRelaunch(before mcp.ServerHealth, cfg mcp.MCPServerConfig, req RunAgentRequest) bool {
 	return before.State == mcp.StateDegraded &&
 		mcp.IsPlaywrightCDPMode(cfg) &&
@@ -1078,15 +1089,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// Tool invocation paths in mcp_tool.go handle their own
 		// ensureChromeDebugPort lazily, so we never lose recovery
 		// capability when the agent actually needs the browser.
-		state := sup.HealthFor("playwright").State
+		before := sup.HealthFor("playwright")
 		playwrightLive := mgr != nil && mgr.IsConnected("playwright")
-		if state != mcp.StateDisconnected && playwrightLive {
+		if before.State != mcp.StateDisconnected && playwrightLive {
 			var pwCfg mcp.MCPServerConfig
 			hasPlaywrightCfg := false
 			if mgr != nil {
 				pwCfg, hasPlaywrightCfg = mgr.ConfigFor("playwright")
 			}
-			before := sup.HealthFor("playwright")
 			if hasPlaywrightCfg && shouldSkipPlaywrightProbeChromeRelaunch(before, pwCfg, req) {
 				log.Printf("daemon: skipping unattended Playwright degraded probe relaunch")
 			} else {
