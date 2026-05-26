@@ -488,6 +488,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	if agentOverride != nil {
 		agentDir := filepath.Join(shannonDir, "agents", agentOverride.Name)
 		loop.SwitchAgent(agentOverride.Prompt, agentDir, nil, "", loadedSkills)
+		loop.SetAgentName(agentOverride.Name)
 		// TUI honors the same persisted always-allow set Desktop writes to.
 		// Read-only — TUI has no "Always Allow" write path yet.
 		merged := append([]string(nil), runtimeCfg.Permissions.AlwaysAllowTools...)
@@ -496,6 +497,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		}
 		loop.SetAlwaysAllowTools(merged)
 	} else {
+		loop.SetAgentName("")
 		loop.SetMemoryDir(filepath.Join(shannonDir, "memory"))
 		if loadedSkills != nil {
 			loop.SetSkills(loadedSkills)
@@ -659,12 +661,14 @@ func (m *Model) rebuildAgentLoop() {
 		scopedMCPCtx := tools.ResolveMCPContext(m.cfg, m.agentOverride)
 		agentDir := filepath.Join(m.shannonDir, "agents", m.agentOverride.Name)
 		loop.SwitchAgent(m.agentOverride.Prompt, agentDir, nil, scopedMCPCtx, m.loadedSkills)
+		loop.SetAgentName(m.agentOverride.Name)
 		merged := append([]string(nil), m.cfg.Permissions.AlwaysAllowTools...)
 		if m.agentOverride.Config != nil && m.agentOverride.Config.Permissions != nil {
 			merged = append(merged, m.agentOverride.Config.Permissions.AlwaysAllowTools...)
 		}
 		loop.SetAlwaysAllowTools(merged)
 	} else {
+		loop.SetAgentName("")
 		loop.SetMemoryDir(filepath.Join(m.shannonDir, "memory"))
 		if m.loadedSkills != nil {
 			loop.SetSkills(m.loadedSkills)

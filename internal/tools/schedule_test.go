@@ -262,3 +262,130 @@ func TestExtractConversationContext_ConcatenatesMultipleTextBlocks(t *testing.T)
 		t.Errorf("msg content = %q, want %q", got[0].Content, "first part\nsecond part")
 	}
 }
+
+// --- ctx agent-name fallback (stress tests) -------------------------------
+
+// Case 1: LLM omits "agent" entirely → ctx-injected caller agent wins.
+func TestScheduleTool_Create_InheritsAgentFromCtxWhenArgMissing(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "academic-writer", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	ctx := agent.WithAgentName(context.Background(), "academic-writer")
+	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+
+	list, _ := mgr.List()
+	if len(list) != 1 {
+		t.Fatalf("want 1 schedule, got %d", len(list))
+	}
+	if list[0].Agent != "academic-writer" {
+		t.Errorf("agent = %q, want %q (ctx fallback)", list[0].Agent, "academic-writer")
+	}
+}
+
+// Case 2: LLM explicit "agent": "" → respects intent, routes to default.
+// This is the key "explicit empty vs missing" distinction.
+func TestScheduleTool_Create_ExplicitEmptyAgentRoutesDefault(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "academic-writer", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	ctx := agent.WithAgentName(context.Background(), "academic-writer")
+	res, err := tool.Run(ctx, `{"agent":"","cron":"*/5 * * * *","prompt":"check"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+
+	list, _ := mgr.List()
+	if list[0].Agent != "" {
+		t.Errorf("agent = %q, want empty (explicit empty = default)", list[0].Agent)
+	}
+}
+
+// Case 3: LLM explicit different name → that name wins, ctx ignored.
+func TestScheduleTool_Create_ExplicitAgentOverridesCtx(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "academic-writer", "")
+	// also create the "explorer" agent dir so validation passes
+	if err := os.MkdirAll(filepath.Join(shan, "agents", "explorer"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shan, "agents", "explorer", "AGENT.md"), []byte("explorer"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	ctx := agent.WithAgentName(context.Background(), "academic-writer")
+	res, err := tool.Run(ctx, `{"agent":"explorer","cron":"*/5 * * * *","prompt":"check"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+
+	list, _ := mgr.List()
+	if list[0].Agent != "explorer" {
+		t.Errorf("agent = %q, want %q (explicit overrides ctx)", list[0].Agent, "explorer")
+	}
+}
+
+// Case 4: Default-agent caller (ctx says ""). LLM omits arg → stays default.
+// Don't accidentally promote default to anything else.
+func TestScheduleTool_Create_DefaultCallerOmittedArgStaysDefault(t *testing.T) {
+	shan := t.TempDir()
+	t.Setenv("HOME", shan)
+	mgr := schedule.NewManager(filepath.Join(shan, ".shannon", "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	// ctx says "default agent" (empty string, explicit injection)
+	ctx := agent.WithAgentName(context.Background(), "")
+	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+
+	list, _ := mgr.List()
+	if list[0].Agent != "" {
+		t.Errorf("agent = %q, want empty (default caller stays default)", list[0].Agent)
+	}
+}
+
+// Case 5: ctx has no injected agent name (e.g. tool invoked outside agent
+// loop, like in tests or direct unit calls). Must not panic; falls back
+// to default routing. Backward-compat with pre-fix call paths.
+func TestScheduleTool_Create_NoCtxAgentSafelyDefaults(t *testing.T) {
+	shan := t.TempDir()
+	t.Setenv("HOME", shan)
+	mgr := schedule.NewManager(filepath.Join(shan, ".shannon", "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	res, err := tool.Run(context.Background(), `{"cron":"*/5 * * * *","prompt":"check"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+
+	list, _ := mgr.List()
+	if list[0].Agent != "" {
+		t.Errorf("agent = %q, want empty (no ctx → default)", list[0].Agent)
+	}
+}
+
+// Case 6: stateful=true via tool args is honored (regression for the new
+// schema arg we added).
+func TestScheduleTool_Create_StatefulArgHonored(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "tracker", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	ctx := agent.WithAgentName(context.Background(), "tracker")
+	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check","stateful":true}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+
+	list, _ := mgr.List()
+	if list[0].Stateful == nil || !*list[0].Stateful {
+		t.Errorf("stateful=%v, want *true", list[0].Stateful)
+	}
+}
