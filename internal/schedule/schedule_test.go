@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestCreateAndList(t *testing.T) {
@@ -474,5 +475,62 @@ func TestManager_Update_MigrateLegacyToStateless(t *testing.T) {
 	got, _ := m.Get("legacy")
 	if got.Stateful == nil || *got.Stateful {
 		t.Errorf("legacy migrate to stateless: got %v", got.Stateful)
+	}
+}
+
+// --- Task 1: LastRun fields ------------------------------------------------
+
+func TestSchedule_LegacyJSON_LastRunFieldsAreNil(t *testing.T) {
+	raw := `{"id":"abc","agent":"x","cron":"0 9 * * *","prompt":"p","enabled":true,"sync_status":"ok","created_at":"2025-01-01T00:00:00Z"}`
+	var s Schedule
+	if err := json.Unmarshal([]byte(raw), &s); err != nil {
+		t.Fatalf("unmarshal legacy: %v", err)
+	}
+	if s.LastRunAt != nil {
+		t.Errorf("legacy LastRunAt should be nil, got %v", *s.LastRunAt)
+	}
+	if s.LastRunSessionID != "" {
+		t.Errorf("legacy LastRunSessionID should be empty, got %q", s.LastRunSessionID)
+	}
+}
+
+func TestSchedule_JSONRoundTrip_LastRunFieldsPreserved(t *testing.T) {
+	now := time.Date(2026, 5, 26, 12, 30, 0, 0, time.UTC)
+	s := Schedule{
+		ID:                       "x",
+		LastRunAt:                &now,
+		LastRunSessionID:         "2026-05-26-deadbeef",
+		LastRunMessageStartIndex: 12,
+		LastRunMessageEndIndex:   18,
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"last_run_at"`) {
+		t.Errorf("expected last_run_at key in JSON, got %s", data)
+	}
+	if !strings.Contains(string(data), `"last_run_session_id":"2026-05-26-deadbeef"`) {
+		t.Errorf("expected last_run_session_id in JSON, got %s", data)
+	}
+	if !strings.Contains(string(data), `"last_run_message_start_index":12`) {
+		t.Errorf("expected last_run_message_start_index in JSON, got %s", data)
+	}
+	if !strings.Contains(string(data), `"last_run_message_end_index":18`) {
+		t.Errorf("expected last_run_message_end_index in JSON, got %s", data)
+	}
+
+	var back Schedule
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.LastRunAt == nil || !back.LastRunAt.Equal(now) {
+		t.Errorf("round-trip lost LastRunAt: %v", back.LastRunAt)
+	}
+	if back.LastRunSessionID != "2026-05-26-deadbeef" {
+		t.Errorf("round-trip lost LastRunSessionID: %q", back.LastRunSessionID)
+	}
+	if back.LastRunMessageStartIndex != 12 || back.LastRunMessageEndIndex != 18 {
+		t.Errorf("round-trip lost message range: start=%d end=%d", back.LastRunMessageStartIndex, back.LastRunMessageEndIndex)
 	}
 }

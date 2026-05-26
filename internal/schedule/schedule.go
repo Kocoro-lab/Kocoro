@@ -32,6 +32,27 @@ type Schedule struct {
 	// across runs. The session file is appended to on every run regardless —
 	// only the LLM's view (runner.historySnapshotForRequest) is affected.
 	Stateful *bool `json:"stateful,omitempty"`
+
+	// LastRunAt is the wall-clock time of the most recent scheduler-triggered
+	// run (succeeded or failed). nil = never run. Stamped by
+	// Manager.MarkLastRun from the scheduler's runWithLifecycle.
+	LastRunAt *time.Time `json:"last_run_at,omitempty"`
+
+	// LastRunSessionID is the session that received the most recent run's
+	// transcript. Resolves through the standard session store (agent-scoped
+	// or global default) — see schedule.SummarizeLastRun. Empty = never run.
+	LastRunSessionID string `json:"last_run_session_id,omitempty"`
+
+	// LastRunMessageStartIndex / LastRunMessageEndIndex pin down the precise
+	// slice of sess.Messages this run wrote. Required because the named-agent
+	// route key is `agent:<name>` (router.go:949) — every schedule + every
+	// interactive chat with the same agent shares one session, so without an
+	// index range, schedule_show would return the session's tail (which could
+	// be the user's last chat reply, not the schedule's output). When the
+	// schedule has never run, both default to 0; combined with the empty
+	// LastRunSessionID this unambiguously signals never-run.
+	LastRunMessageStartIndex int `json:"last_run_message_start_index,omitempty"`
+	LastRunMessageEndIndex   int `json:"last_run_message_end_index,omitempty"`
 }
 
 // IsStateless reports whether this schedule should run with an empty LLM
