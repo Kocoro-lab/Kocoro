@@ -766,6 +766,7 @@ type AgentLoop struct {
 	sessionID        string      // session ID for audit log correlation
 	sessionCWD       string      // session-scoped working directory; set by runner/TUI before Run()
 	agentName        string      // current agent name; empty = default agent. Injected into tool ctx for "who is calling me" lookups.
+	source           string      // per-call originating source (e.g. "slack", "webview", "tui"). Read by tools that need to capture it (schedule_create). Empty = unknown.
 	deltaProvider    DeltaProvider
 	injectCh         chan InjectedMessage
 	injectedMessages []string // messages injected during the last Run(); cleared on each Run() call
@@ -1500,6 +1501,18 @@ func (a *AgentLoop) SetSessionID(id string) {
 // it represents the default agent.
 func (a *AgentLoop) SetAgentName(name string) {
 	a.agentName = name
+}
+
+// SetSource records the per-call originating source (e.g. "slack", "webview",
+// "tui"). Tools that need to capture this — currently schedule_create — can
+// read it via Source(). Empty string means unknown.
+func (a *AgentLoop) SetSource(source string) {
+	a.source = source
+}
+
+// Source returns the per-call source recorded via SetSource. Empty if unset.
+func (a *AgentLoop) Source() string {
+	return a.source
 }
 
 // SetSessionCWD sets the session-scoped working directory for this loop.

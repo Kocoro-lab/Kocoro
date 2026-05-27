@@ -5960,3 +5960,18 @@ func TestAgentLoop_InconsistentFinish_LegitimateToolUseDispatchesNormally(t *tes
 		t.Errorf("expected 2 calls (tool_use + final), got %d", callCount)
 	}
 }
+
+func TestAgentLoop_SourceAccessor(t *testing.T) {
+	loop := &AgentLoop{}
+	if got := loop.Source(); got != "" {
+		t.Errorf("default Source() should be empty, got %q", got)
+	}
+	loop.SetSource("slack")
+	if got := loop.Source(); got != "slack" {
+		t.Errorf("after SetSource(\"slack\") want %q got %q", "slack", got)
+	}
+	loop.SetSource("")
+	if got := loop.Source(); got != "" {
+		t.Errorf("after SetSource(\"\") want empty, got %q", got)
+	}
+}
