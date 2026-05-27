@@ -765,6 +765,7 @@ type AgentLoop struct {
 	workingSet       *WorkingSet // session-scoped deferred schema cache injected by the caller
 	sessionID        string      // session ID for audit log correlation
 	sessionCWD       string      // session-scoped working directory; set by runner/TUI before Run()
+	agentName        string      // current agent name; empty = default agent. Injected into tool ctx for "who is calling me" lookups.
 	deltaProvider    DeltaProvider
 	injectCh         chan InjectedMessage
 	injectedMessages []string // messages injected during the last Run(); cleared on each Run() call
@@ -1493,6 +1494,14 @@ func (a *AgentLoop) SetSessionID(id string) {
 	a.sessionID = id
 }
 
+// SetAgentName sets the current agent's name. The runner calls this before
+// loop.Run() so tools (notably schedule_create) can read the caller's agent
+// identity from ctx via AgentNameFromContext. Empty string is meaningful —
+// it represents the default agent.
+func (a *AgentLoop) SetAgentName(name string) {
+	a.agentName = name
+}
+
 // SetSessionCWD sets the session-scoped working directory for this loop.
 func (a *AgentLoop) SetSessionCWD(cwd string) {
 	a.sessionCWD = cwd
@@ -2132,6 +2141,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		readTracker.MarkRead(filepath.Join(a.memoryDir, "MEMORY.md"))
 		ctx = WithMemoryDir(ctx, a.memoryDir)
 	}
+	// Inject agent name into ctx so tools like schedule_create can default to
+	// the caller's agent instead of routing into the default agent's pool when
+	// the LLM forgets to pass an explicit "agent" arg. Unconditional because
+	// empty string is meaningful (= default agent) and we want tools to be
+	// able to distinguish "no ctx value" from "ctx says default agent".
+	ctx = WithAgentName(ctx, a.agentName)
 	ctx = context.WithValue(ctx, readTrackerKey{}, readTracker)
 
 	// Loop behavior constants

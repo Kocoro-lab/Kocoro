@@ -119,7 +119,7 @@ func TestWalkthrough_ScheduleContext(t *testing.T) {
 
 	// Create a real schedule via the ScheduleTool. The tool will call
 	// extractConversationContext(ctx) and SaveContext internally.
-	scheduleTools := tools.NewScheduleTools(mgr)
+	scheduleTools := tools.NewScheduleTools(mgr, tmpHome)
 	var createTool agent.Tool
 	for _, tl := range scheduleTools {
 		if tl.Info().Name == "schedule_create" {
@@ -132,8 +132,9 @@ func TestWalkthrough_ScheduleContext(t *testing.T) {
 	}
 
 	args, _ := json.Marshal(map[string]any{
-		"cron":   "0 9 * * 1-5",
-		"prompt": "Check staging deploy health and alert on anomalies.",
+		"cron":        "0 9 * * 1-5",
+		"prompt":      "Check staging deploy health and alert on anomalies.",
+		"description": "create weekday staging-deploy health schedule",
 	})
 	result, err := createTool.Run(ctx, string(args))
 	if err != nil {

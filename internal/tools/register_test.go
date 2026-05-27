@@ -46,10 +46,12 @@ func TestRegisterAll_WithServerTools(t *testing.T) {
 		}
 	}
 
-	// Total: 32 local + 2 server = 34 (4 doc-extract tools added Phase 2)
+	// Total: 33 local + 2 server = 35. doc-extract pdf/docx/xlsx/pptx are
+	// pre-existing local extractors; the +1 in this assertion is
+	// schedule_show (added for last-run inspection).
 	schemas := reg.Schemas()
-	if len(schemas) != 34 {
-		t.Errorf("expected 34 tools, got %d", len(schemas))
+	if len(schemas) != 35 {
+		t.Errorf("expected 35 tools, got %d", len(schemas))
 	}
 }
 
@@ -73,8 +75,8 @@ func TestRegisterAll_ServerUnavailable(t *testing.T) {
 	}
 
 	schemas := reg.Schemas()
-	if len(schemas) != 32 {
-		t.Errorf("expected 32 local tools, got %d", len(schemas))
+	if len(schemas) != 33 {
+		t.Errorf("expected 33 local tools, got %d", len(schemas))
 	}
 }
 
@@ -116,10 +118,12 @@ func TestRegisterAll_LocalPriority(t *testing.T) {
 		t.Error("web_search should be a server tool")
 	}
 
-	// 32 local + 1 server (bash skipped) = 33 (4 doc-extract tools added Phase 2)
+	// 33 local + 1 server (bash skipped) = 34. doc-extract pdf/docx/xlsx/pptx
+	// are pre-existing local extractors; the +1 in this assertion is
+	// schedule_show (added for last-run inspection).
 	schemas := reg.Schemas()
-	if len(schemas) != 33 {
-		t.Errorf("expected 33 tools, got %d", len(schemas))
+	if len(schemas) != 34 {
+		t.Errorf("expected 34 tools, got %d", len(schemas))
 	}
 }
 

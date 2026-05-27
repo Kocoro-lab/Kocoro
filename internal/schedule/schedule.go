@@ -24,12 +24,50 @@ type Schedule struct {
 	Enabled    bool      `json:"enabled"`
 	SyncStatus string    `json:"sync_status"`
 	CreatedAt  time.Time `json:"created_at"`
+
+	// Stateful controls whether scheduled runs preserve LLM context across
+	// triggers. nil = legacy schedule (treated as stateful for backward
+	// compatibility); *false = each run gets an empty history snapshot
+	// (default for new schedules); *true = explicit opt-in to share history
+	// across runs. The session file is appended to on every run regardless —
+	// only the LLM's view (runner.historySnapshotForRequest) is affected.
+	Stateful *bool `json:"stateful,omitempty"`
+
+	// LastRunAt is the wall-clock time of the most recent scheduler-triggered
+	// run (succeeded or failed). nil = never run. Stamped by
+	// Manager.MarkLastRun from the scheduler's runWithLifecycle.
+	LastRunAt *time.Time `json:"last_run_at,omitempty"`
+
+	// LastRunSessionID is the session that received the most recent run's
+	// transcript. Resolves through the standard session store (agent-scoped
+	// or global default) — see schedule.SummarizeLastRun. Empty = never run.
+	LastRunSessionID string `json:"last_run_session_id,omitempty"`
+
+	// LastRunMessageStartIndex / LastRunMessageEndIndex pin down the precise
+	// slice of sess.Messages this run wrote. Required because the named-agent
+	// route key is `agent:<name>` (SessionCache.agentRouteKey in router.go) —
+	// every schedule + every interactive chat with the same agent shares one
+	// session, so without an index range, schedule_show would return the
+	// session's tail (which could be the user's last chat reply, not the
+	// schedule's output). When the schedule has never run, both default to 0;
+	// combined with the empty LastRunSessionID this unambiguously signals
+	// never-run.
+	LastRunMessageStartIndex int `json:"last_run_message_start_index,omitempty"`
+	LastRunMessageEndIndex   int `json:"last_run_message_end_index,omitempty"`
+}
+
+// IsStateless reports whether this schedule should run with an empty LLM
+// history snapshot. Legacy schedules (Stateful == nil) preserve their
+// pre-feature stateful behaviour.
+func (s *Schedule) IsStateless() bool {
+	return s.Stateful != nil && !*s.Stateful
 }
 
 type UpdateOpts struct {
-	Cron    *string
-	Prompt  *string
-	Enabled *bool
+	Cron     *string
+	Prompt   *string
+	Enabled  *bool
+	Stateful *bool // nil = no change; non-nil = overwrite (including flip to/from legacy nil)
 }
 
 type Manager struct {
@@ -150,7 +188,7 @@ func (m *Manager) lockedModify(fn func([]Schedule) ([]Schedule, error)) error {
 	return m.save(schedules)
 }
 
-func (m *Manager) Create(agentName, cron, prompt string) (string, error) {
+func (m *Manager) Create(agentName, cron, prompt string, stateful bool) (string, error) {
 	if err := validateAgent(agentName); err != nil {
 		return "", err
 	}
@@ -161,9 +199,11 @@ func (m *Manager) Create(agentName, cron, prompt string) (string, error) {
 		return "", err
 	}
 	id := generateScheduleID()
+	statefulCopy := stateful
 	s := Schedule{
 		ID: id, Agent: agentName, Cron: cron, Prompt: prompt,
 		Enabled: true, SyncStatus: "ok", CreatedAt: time.Now(),
+		Stateful: &statefulCopy, // always explicit on Create — never leave nil for new rows
 	}
 	err := m.lockedModify(func(schedules []Schedule) ([]Schedule, error) {
 		return append(schedules, s), nil
@@ -192,8 +232,8 @@ func (m *Manager) Get(id string) (*Schedule, error) {
 }
 
 func (m *Manager) Update(id string, opts *UpdateOpts) error {
-	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil {
-		return fmt.Errorf("no fields to update")
+	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil {
+		return fmt.Errorf("no fields to update: provide at least one of cron, prompt, enabled, or stateful")
 	}
 	if opts.Cron != nil {
 		if err := validateCron(*opts.Cron); err != nil {
@@ -230,10 +270,51 @@ func (m *Manager) Update(id string, opts *UpdateOpts) error {
 				if opts.Enabled != nil {
 					schedules[i].Enabled = *opts.Enabled
 				}
+				if opts.Stateful != nil {
+					v := *opts.Stateful
+					schedules[i].Stateful = &v
+				}
 				return schedules, nil
 			}
 		}
 		return nil, fmt.Errorf("schedule %q not found", id)
+	})
+}
+
+// MarkLastRun records that the schedule fired and which session captured
+// the transcript, plus the message index range this run wrote. Called by
+// the scheduler at end-of-lifecycle. Idempotent overwrite — only the most
+// recent run is tracked, by design: list endpoints stay light (just
+// pointers), and a separate show endpoint resolves the pointer to the
+// actual transcript slice on demand.
+//
+// The index range pins down precisely which slice of sess.Messages came
+// from this run, so SummarizeLastRun can return the correct turns even
+// when the session is shared across multiple schedules + interactive chat
+// (the named-agent route key is `agent:<name>`, which makes sharing the
+// common case).
+//
+// No-op cases:
+//   - id not found: schedule may have been deleted between dispatch and
+//     completion; we should not crash the scheduler.
+//   - sessionID empty: the run failed before session resolution; there's
+//     nothing for SummarizeLastRun to fetch.
+func (m *Manager) MarkLastRun(id, sessionID string, when time.Time, startIdx, endIdx int) error {
+	if sessionID == "" {
+		return nil
+	}
+	return m.lockedModify(func(schedules []Schedule) ([]Schedule, error) {
+		for i := range schedules {
+			if schedules[i].ID == id {
+				w := when
+				schedules[i].LastRunAt = &w
+				schedules[i].LastRunSessionID = sessionID
+				schedules[i].LastRunMessageStartIndex = startIdx
+				schedules[i].LastRunMessageEndIndex = endIdx
+				return schedules, nil
+			}
+		}
+		return schedules, nil // unknown id — silent
 	})
 }
 

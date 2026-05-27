@@ -4,12 +4,29 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"text/tabwriter"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/spf13/cobra"
 )
+
+// parseStatefulFlag converts the --stateful CLI string into the *bool shape
+// schedule.UpdateOpts expects. Empty input means "no change"; any non-empty
+// value MUST parse as a bool or we error out — silently coercing "maybe" /
+// "yes" / "" to false would let a typo flip a schedule's behaviour without
+// the user realising.
+func parseStatefulFlag(raw string) (*bool, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	b, err := strconv.ParseBool(raw)
+	if err != nil {
+		return nil, fmt.Errorf("--stateful must be true or false, got %q", raw)
+	}
+	return &b, nil
+}
 
 func newScheduleManager() *schedule.Manager {
 	dir := config.ShannonDir()
@@ -53,9 +70,10 @@ var scheduleListCmd = &cobra.Command{
 }
 
 var (
-	schedCreateAgent  string
-	schedCreateCron   string
-	schedCreatePrompt string
+	schedCreateAgent    string
+	schedCreateCron     string
+	schedCreatePrompt   string
+	schedCreateStateful bool
 )
 
 var scheduleCreateCmd = &cobra.Command{
@@ -66,7 +84,7 @@ var scheduleCreateCmd = &cobra.Command{
 			return fmt.Errorf("--cron and --prompt are required")
 		}
 		mgr := newScheduleManager()
-		id, err := mgr.Create(schedCreateAgent, schedCreateCron, schedCreatePrompt)
+		id, err := mgr.Create(schedCreateAgent, schedCreateCron, schedCreatePrompt, schedCreateStateful)
 		if err != nil {
 			return err
 		}
@@ -76,8 +94,9 @@ var scheduleCreateCmd = &cobra.Command{
 }
 
 var (
-	schedUpdateCron   string
-	schedUpdatePrompt string
+	schedUpdateCron     string
+	schedUpdatePrompt   string
+	schedUpdateStateful string // "" | parseable bool
 )
 
 var scheduleUpdateCmd = &cobra.Command{
@@ -85,11 +104,15 @@ var scheduleUpdateCmd = &cobra.Command{
 	Short: "Update a scheduled task",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if schedUpdateCron == "" && schedUpdatePrompt == "" {
-			return fmt.Errorf("at least one of --cron or --prompt is required")
+		statefulPtr, err := parseStatefulFlag(schedUpdateStateful)
+		if err != nil {
+			return err
+		}
+		if schedUpdateCron == "" && schedUpdatePrompt == "" && statefulPtr == nil {
+			return fmt.Errorf("at least one of --cron, --prompt, --stateful is required")
 		}
 		mgr := newScheduleManager()
-		opts := &schedule.UpdateOpts{}
+		opts := &schedule.UpdateOpts{Stateful: statefulPtr}
 		if schedUpdateCron != "" {
 			opts.Cron = &schedUpdateCron
 		}
@@ -152,9 +175,14 @@ func init() {
 	scheduleCreateCmd.Flags().StringVar(&schedCreateAgent, "agent", "", "Agent to run (empty for default)")
 	scheduleCreateCmd.Flags().StringVar(&schedCreateCron, "cron", "", "Cron expression (5-field, supports ranges/steps/lists)")
 	scheduleCreateCmd.Flags().StringVar(&schedCreatePrompt, "prompt", "", "Prompt to send")
+	scheduleCreateCmd.Flags().BoolVar(&schedCreateStateful, "stateful", false,
+		"Preserve LLM conversation history across runs (default false: each run starts with empty context). "+
+			"Set --stateful for tasks that genuinely need cross-run memory.")
 
 	scheduleUpdateCmd.Flags().StringVar(&schedUpdateCron, "cron", "", "New cron expression")
 	scheduleUpdateCmd.Flags().StringVar(&schedUpdatePrompt, "prompt", "", "New prompt")
+	scheduleUpdateCmd.Flags().StringVar(&schedUpdateStateful, "stateful", "",
+		"Change history-preservation behaviour: 'true', 'false', or omit to leave unchanged.")
 
 	scheduleCmd.AddCommand(scheduleListCmd)
 	scheduleCmd.AddCommand(scheduleCreateCmd)

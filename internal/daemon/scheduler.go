@@ -152,27 +152,76 @@ func (s *Scheduler) EvaluateDue(now time.Time) []schedule.Schedule {
 
 // runSchedule fires a single scheduled agent run.
 func (s *Scheduler) runSchedule(ctx context.Context, sched schedule.Schedule) {
-	req := RunAgentRequest{
+	stickyContext := ""
+	// Load the associated conversation context and inject it into sticky
+	// context (prepended to the user turn as StableContext). Not visible to
+	// the end user.
+	if ctxMsgs, err := s.manager.LoadContext(sched.ID); err == nil && len(ctxMsgs) > 0 {
+		stickyContext = formatConversationContext(ctxMsgs)
+	}
+	req := buildScheduleRequest(sched, stickyContext)
+
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return RunAgent(ctx, s.deps, req, &scheduleHandler{})
+	})
+}
+
+// buildScheduleRequest constructs the RunAgentRequest for a scheduled run.
+// Extracted as a seam so tests can verify field plumbing — especially the
+// Stateful → OmitHistory mapping — without spinning up the full RunAgent
+// machinery. Legacy schedules (Stateful == nil) preserve their pre-feature
+// stateful behaviour (OmitHistory stays false).
+func buildScheduleRequest(sched schedule.Schedule, stickyContext string) RunAgentRequest {
+	return RunAgentRequest{
 		Text:    sched.Prompt,
 		Agent:   sched.Agent,
 		Source:  ChannelSchedule,
 		Channel: ChannelSchedule + "-" + sched.ID,
 		Sender:  "scheduler",
-		// Named agents resume their single long-lived session.
-		// Default agent (no name) gets a fresh session per run.
-		NewSession: sched.Agent == "",
+		// Default agent (no name) gets a fresh session per run; named agents
+		// resume their single long-lived session — but if Stateful is *false,
+		// OmitHistory below makes the LLM see an empty history regardless.
+		//
+		// Stateful: true with a default agent is a silent no-op: NewSession=true
+		// forces a fresh session per run so there's never prior history to
+		// preserve. The schedule_create tool description warns the LLM
+		// ("ignored for the default agent") rather than the manager rejecting
+		// the combo — keeps the wire shape simple and lets the user toggle
+		// the flag without an agent rename.
+		NewSession:    sched.Agent == "",
+		OmitHistory:   sched.IsStateless(),
+		StickyContext: stickyContext,
 	}
+}
 
-	// Load the associated conversation context and inject it into sticky
-	// context (prepended to the user turn as StableContext). Not visible to
-	// the end user.
-	if ctxMsgs, err := s.manager.LoadContext(sched.ID); err == nil && len(ctxMsgs) > 0 {
-		req.StickyContext = formatConversationContext(ctxMsgs)
+// ScheduleRunUsage is the per-run token-usage block emitted on succeeded
+// schedule_run events. Fields mirror RunAgentUsage (runner.go) — if
+// cache-creation/cache-read counts become available there, extend both
+// structs together.
+type ScheduleRunUsage struct {
+	InputTokens  int     `json:"input_tokens"`
+	OutputTokens int     `json:"output_tokens"`
+	TotalTokens  int     `json:"total_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+}
+
+func (u ScheduleRunUsage) isZero() bool {
+	return u.InputTokens == 0 && u.OutputTokens == 0 &&
+		u.TotalTokens == 0 && u.CostUSD == 0
+}
+
+// scheduleRunUsageFromResult lifts the per-run totals out of RunAgentResult
+// into the wire shape. Defensive: nil-safe, returns zero on nil.
+func scheduleRunUsageFromResult(r *RunAgentResult) ScheduleRunUsage {
+	if r == nil {
+		return ScheduleRunUsage{}
 	}
-
-	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
-		return RunAgent(ctx, s.deps, req, &scheduleHandler{})
-	})
+	return ScheduleRunUsage{
+		InputTokens:  r.Usage.InputTokens,
+		OutputTokens: r.Usage.OutputTokens,
+		TotalTokens:  r.Usage.TotalTokens,
+		CostUSD:      r.Usage.CostUSD,
+	}
 }
 
 // runWithLifecycle emits started/succeeded/failed schedule_run events around
@@ -194,20 +243,48 @@ func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAge
 	}()
 
 	sessionID := ""
+	startIdx, endIdx := 0, 0
+	usage := ScheduleRunUsage{}
 	if result != nil {
 		sessionID = result.SessionID
+		startIdx = result.MessageStartIndex
+		endIdx = result.MessageEndIndex
+		usage = scheduleRunUsageFromResult(result)
 	}
+
+	// Persist last-run BEFORE emitting the terminal event so any
+	// subscriber that immediately calls schedule_show sees the stamped
+	// pointer. MarkLastRun is a silent no-op on empty sessionID (covered
+	// by Manager.MarkLastRun contract), so hard errors that crashed
+	// before session resolution leave LastRun untouched. The index range
+	// pins down the precise slice of sess.Messages this run wrote, which
+	// matters because named-agent sessions are shared across multiple
+	// schedules + interactive chat.
+	if s.deps != nil && s.deps.ScheduleManager != nil {
+		if err := s.deps.ScheduleManager.MarkLastRun(sched.ID, sessionID, time.Now(), startIdx, endIdx); err != nil {
+			log.Printf("scheduler: MarkLastRun failed for %s: %v", sched.ID, err)
+		}
+	}
+
 	if runErr != nil {
 		log.Printf("scheduler: agent run failed for schedule %s: %v", sched.ID, runErr)
-		s.emitScheduleRun("failed", sched, sessionID, runErr)
+		s.emitScheduleRunWithUsage("failed", sched, sessionID, runErr, usage)
 		return
 	}
-	s.emitScheduleRun("succeeded", sched, sessionID, nil)
+	s.emitScheduleRunWithUsage("succeeded", sched, sessionID, nil, usage)
 }
 
-// emitScheduleRun publishes a schedule_run lifecycle event. Best-effort; nil
-// deps or nil bus drops silently so unit tests that pass nil deps still run.
+// emitScheduleRun publishes a schedule_run lifecycle event without a usage
+// block. Kept for callers (started phase, panics with no result) that have
+// no per-run usage to report.
 func (s *Scheduler) emitScheduleRun(phase string, sched schedule.Schedule, sessionID string, runErr error) {
+	s.emitScheduleRunWithUsage(phase, sched, sessionID, runErr, ScheduleRunUsage{})
+}
+
+// emitScheduleRunWithUsage is the full form. Usage is omitted from the wire
+// payload when zero so failed runs that never reached an LLM call don't
+// emit misleading zero-value usage counters.
+func (s *Scheduler) emitScheduleRunWithUsage(phase string, sched schedule.Schedule, sessionID string, runErr error, usage ScheduleRunUsage) {
 	if s == nil || s.deps == nil {
 		return
 	}
@@ -220,6 +297,9 @@ func (s *Scheduler) emitScheduleRun(phase string, sched schedule.Schedule, sessi
 	}
 	if phase == "failed" && runErr != nil {
 		payload["error"] = redactAndTruncate(runErr.Error(), 500)
+	}
+	if !usage.isZero() {
+		payload["usage"] = usage
 	}
 	emitBusJSON(s.deps.EventBus, EventScheduleRun, payload)
 }

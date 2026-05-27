@@ -1382,3 +1382,265 @@ func TestApplyAgentModelOverlayToLoop_EmptyTierIgnored(t *testing.T) {
 		t.Errorf("ModelTier after empty-string overlay = %q, want %q (unchanged)", got, "medium")
 	}
 }
+
+// --- Task 4: history snapshot honours OmitHistory --------------------------
+
+func TestHistorySnapshot_OmitHistoryReturnsEmpty(t *testing.T) {
+	sess := &session.Session{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("old turn 1")},
+			{Role: "assistant", Content: client.NewTextContent("old reply 1")},
+		},
+	}
+
+	got := historySnapshotForRequest(sess, RunAgentRequest{OmitHistory: false})
+	if len(got) != 2 {
+		t.Errorf("OmitHistory=false: want 2 messages, got %d", len(got))
+	}
+
+	got = historySnapshotForRequest(sess, RunAgentRequest{OmitHistory: true})
+	if len(got) != 0 {
+		t.Errorf("OmitHistory=true: want empty history, got %d messages", len(got))
+	}
+
+	// Crucial invariant: session.Messages must NOT be mutated.
+	if len(sess.Messages) != 2 {
+		t.Errorf("historySnapshotForRequest mutated session: messages now %d", len(sess.Messages))
+	}
+}
+
+// --- Task 3: RunAgent contract for message indices + partial result --------
+
+// nullEventHandler is a no-op agent.EventHandler used by the RunAgent
+// contract tests below. None of the assertions care about per-call
+// notifications; the tests only inspect the returned *RunAgentResult.
+type nullEventHandler struct{}
+
+func (nullEventHandler) OnToolCall(string, string, string)                          {}
+func (nullEventHandler) OnToolResult(string, string, string, agent.ToolResult, time.Duration) {}
+func (nullEventHandler) OnText(string)                                              {}
+func (nullEventHandler) OnPreamble(string)                                          {}
+func (nullEventHandler) OnStreamDelta(string)                                       {}
+func (nullEventHandler) OnApprovalNeeded(string, string) bool                       { return true }
+func (nullEventHandler) OnUsage(agent.TurnUsage)                                    {}
+func (nullEventHandler) OnCloudAgent(string, string, string)                        {}
+func (nullEventHandler) OnCloudProgress(int, int)                                   {}
+func (nullEventHandler) OnCloudPlan(string, string, bool)                           {}
+
+// runAgentContractTestDeps builds a minimal ServerDeps that passes RunAgent's
+// validation gates and points the gateway at the supplied httptest URL. The
+// returned deps drive a fully default-agent run with no MCP/skills/auditor
+// overhead — enough to reach loop.Run() with a working LLM transport.
+func runAgentContractTestDeps(t *testing.T, gatewayURL string) *ServerDeps {
+	t.Helper()
+	shanDir := t.TempDir()
+	cfg := &config.Config{
+		Provider:  "gateway",
+		ModelTier: "medium",
+		Agent: config.AgentConfig{
+			MaxIterations: 2, // small bound — we only need one turn to exit
+		},
+	}
+	return &ServerDeps{
+		Config:       cfg,
+		GW:           client.NewGatewayClient(gatewayURL, "test-key"),
+		Registry:     agent.NewToolRegistry(),
+		BaselineReg:  agent.NewToolRegistry(),
+		SessionCache: NewSessionCache(shanDir),
+		ShannonDir:   shanDir,
+		AgentsDir:    filepath.Join(shanDir, "agents"),
+	}
+}
+
+// Success path: RunAgent must populate MessageStartIndex (== len(sess.Messages)
+// before the run wrote anything) and MessageEndIndex (== len(sess.Messages)
+// after the run finished). Scheduler uses the range to slice "this run's
+// turns" out of a shared session.
+func TestRunAgent_Success_PopulatesMessageIndices(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "hello from fake llm"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+
+	req := RunAgentRequest{
+		Text:          "hi",
+		Source:        "heartbeat", // arbitrary non-empty so user message is appended
+		BypassRouting: true,        // avoid route lock + adhoc registration overhead
+	}
+	res, err := RunAgent(context.Background(), deps, req, nullEventHandler{})
+	if err != nil {
+		t.Fatalf("RunAgent error: %v", err)
+	}
+	if res == nil {
+		t.Fatal("RunAgent returned nil result on success")
+	}
+	// MessageStartIndex == turnBase.msgCount, which is captured AFTER the
+	// pre-loop user-message append for sources with non-empty Source. So on
+	// a fresh session with Source="heartbeat" we expect StartIndex=1 (one
+	// user message already on disk when captureTurnBaseline runs), and
+	// EndIndex >= 2 (StartIndex + at least the assistant reply this run wrote).
+	// The downstream resolver (SummarizeLastRun) emits only assistant turns
+	// from the slice, so this tighter-by-one start is by design.
+	if res.MessageStartIndex != 1 {
+		t.Errorf("MessageStartIndex = %d, want 1 (turnBase.msgCount captured after pre-loop user append)", res.MessageStartIndex)
+	}
+	if res.MessageEndIndex <= res.MessageStartIndex {
+		t.Errorf("MessageEndIndex = %d must be > MessageStartIndex = %d", res.MessageEndIndex, res.MessageStartIndex)
+	}
+	if res.Reply != "hello from fake llm" {
+		t.Errorf("Reply = %q, want %q", res.Reply, "hello from fake llm")
+	}
+}
+
+// Hard-error path: RunAgent today returns (nil, err); after this task it
+// must return (&RunAgentResult{SessionID, MessageStartIndex, MessageEndIndex,
+// FailureCode}, err) so the scheduler can stamp LastRun on partial transcripts.
+// The three production callers (cmd/daemon.go x2, heartbeat.go) gate on err
+// first and never deref result on error, so this is wire-safe.
+func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
+	// httptest handler that always 500s — every LLM call hits a hard error.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "synthetic upstream failure", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+
+	req := RunAgentRequest{
+		Text:          "fail please",
+		Source:        "heartbeat",
+		BypassRouting: true, // symmetry with the success test (skip route lock + unattended-probe gating)
+		// Ephemeral=false (default): RunAgent's hard-error block calls
+		// sessMgr.Save() and sets savedSessionID, which we assert below.
+	}
+	res, err := RunAgent(context.Background(), deps, req, nullEventHandler{})
+	if err == nil {
+		t.Fatal("expected hard error from always-500 gateway")
+	}
+	if res == nil {
+		t.Fatal("partial result must be non-nil on hard error (scheduler needs sessionID to stamp LastRun)")
+	}
+	if res.SessionID == "" {
+		t.Errorf("partial result should carry saved sessionID, got empty (hard-error block ran sessMgr.Save successfully?)")
+	}
+	// Assert exact values rather than the trivially-true ordering invariant
+	// (0 >= 0). On a fresh session with Source="heartbeat" the pre-loop user
+	// append lands at index 0, so turnBase.msgCount == 1 when captured —
+	// matching the success test. A future refactor that returned zero indices
+	// on hard error would slip through an ordering-only check; this catches it.
+	if res.MessageStartIndex != 1 {
+		t.Errorf("MessageStartIndex = %d, want 1 (turnBase.msgCount captured after pre-loop user append)", res.MessageStartIndex)
+	}
+	if res.MessageEndIndex < res.MessageStartIndex {
+		t.Errorf("indices invariant violated: end %d < start %d", res.MessageEndIndex, res.MessageStartIndex)
+	}
+	// Baseline: always-500 gateway never lets an LLM call succeed AND
+	// nullEventHandler does not implement UsageProvider, so partial Usage
+	// must be the zero value. The companion test PreservesAccumulatedUsage
+	// covers the path where prior calls succeeded before a later hard error.
+	if res.Usage != (RunAgentUsage{}) {
+		t.Errorf("partial Usage on never-succeeded run = %+v, want zero", res.Usage)
+	}
+}
+
+// fakeUsageHandler implements agent.UsageProvider on top of nullEventHandler,
+// letting unit tests pass an accumulator snapshot directly into the helper.
+// Inside RunAgent the handler is wrapped in multiHandler (runner.go:1595),
+// which drops the UsageProvider implementation — so integration-level
+// validation of that branch lives here in the helper test rather than in
+// a RunAgent end-to-end test that would silently take the fallback path.
+type fakeUsageHandler struct {
+	nullEventHandler
+	snapshot agent.AccumulatedUsage
+}
+
+func (h fakeUsageHandler) Usage() agent.AccumulatedUsage { return h.snapshot }
+
+// TestComputeReportedUsage covers the resolver shared by RunAgent's success
+// path and the partial-result hard-error path (GPT review P2). The hard
+// error path used to bypass this helper and return Usage zero even when
+// intermediate LLM calls had incurred cost — that's the regression these
+// cases lock in.
+func TestComputeReportedUsage(t *testing.T) {
+	t.Run("nil_usage_and_plain_handler_returns_zero", func(t *testing.T) {
+		// Hard-error path before any LLM call could populate TurnUsage
+		// AND the production handler doesn't expose UsageProvider —
+		// reported usage is the zero value, which is fine to emit on
+		// the failed schedule_run event.
+		got := computeReportedUsage(nil, nullEventHandler{})
+		if got != (RunAgentUsage{}) {
+			t.Errorf("got %+v, want zero RunAgentUsage", got)
+		}
+	})
+
+	t.Run("turn_usage_preserved_when_no_accumulator", func(t *testing.T) {
+		// Hard-error path AFTER a successful intermediate LLM call —
+		// loop.Run returned a non-nil TurnUsage with spent tokens.
+		// The partial result must carry those tokens (the GPT review's
+		// motivating scenario).
+		turn := &agent.TurnUsage{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+			CostUSD:      0.0001,
+		}
+		want := RunAgentUsage{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+			CostUSD:      0.0001,
+		}
+		got := computeReportedUsage(turn, nullEventHandler{})
+		if got != want {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("accumulator_overrides_turn_usage", func(t *testing.T) {
+		// When the handler is a UsageProvider AND has recorded spend,
+		// it wins — the accumulator folds in cloud_delegate nested
+		// spend that loop.Run's TurnUsage doesn't see. ToolCostUSD
+		// adds onto CostUSD without touching the token fields so
+		// input+output==total stays explainable.
+		handler := fakeUsageHandler{
+			snapshot: agent.AccumulatedUsage{
+				LLM: agent.TurnUsage{
+					InputTokens:  100,
+					OutputTokens: 200,
+					TotalTokens:  300,
+					CostUSD:      0.01,
+					LLMCalls:     2,
+				},
+				ToolCostUSD: 0.001,
+			},
+		}
+		// Loop-level usage is also non-zero; accumulator should still win.
+		turn := &agent.TurnUsage{InputTokens: 5, OutputTokens: 6, TotalTokens: 11, CostUSD: 0.0002}
+		want := RunAgentUsage{
+			InputTokens:  100,
+			OutputTokens: 200,
+			TotalTokens:  300,
+			CostUSD:      0.011, // 0.01 LLM + 0.001 tool
+		}
+		got := computeReportedUsage(turn, handler)
+		if got != want {
+			t.Errorf("got %+v, want %+v (accumulator must override loop-level usage)", got, want)
+		}
+	})
+
+	t.Run("empty_accumulator_falls_back_to_turn_usage", func(t *testing.T) {
+		// Handler implements UsageProvider but the accumulator is empty
+		// (the gating LLMCalls > 0 etc. clause means we keep the loop
+		// usage instead of zeroing the result).
+		handler := fakeUsageHandler{snapshot: agent.AccumulatedUsage{}}
+		turn := &agent.TurnUsage{InputTokens: 7, OutputTokens: 8, TotalTokens: 15, CostUSD: 0.0003}
+		want := RunAgentUsage{InputTokens: 7, OutputTokens: 8, TotalTokens: 15, CostUSD: 0.0003}
+		got := computeReportedUsage(turn, handler)
+		if got != want {
+			t.Errorf("got %+v, want %+v (empty accumulator must not clobber turn usage)", got, want)
+		}
+	})
+}

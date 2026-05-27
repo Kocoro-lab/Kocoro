@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -173,5 +174,58 @@ func TestScheduleRun_RingReplay(t *testing.T) {
 			t.Fatalf("ring event IDs must be monotonic; got %d after %d", evt.ID, lastID)
 		}
 		lastID = evt.ID
+	}
+}
+
+// --- Task 8: usage block on schedule_run succeeded events ------------------
+
+func TestEmitScheduleRun_SucceededIncludesUsage(t *testing.T) {
+	bus := NewEventBus()
+	deps := &ServerDeps{EventBus: bus}
+	s := &Scheduler{deps: deps}
+	sched := schedule.Schedule{ID: "s1", Agent: "a"}
+
+	// Cost uses 0.5 — IEEE-754 exact, no float-equality flakiness after JSON round-trip.
+	s.emitScheduleRunWithUsage("succeeded", sched, "sess-1", nil, ScheduleRunUsage{
+		InputTokens: 1234, OutputTokens: 56, TotalTokens: 1290, CostUSD: 0.5,
+	})
+
+	events := drainScheduleRun(t, bus)
+	if len(events) != 1 {
+		t.Fatalf("want 1 schedule_run event, got %d", len(events))
+	}
+	usage, ok := events[0]["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("schedule_run.usage missing or wrong type: %+v", events[0])
+	}
+	if int(usage["input_tokens"].(float64)) != 1234 {
+		t.Errorf("input_tokens want 1234, got %v", usage["input_tokens"])
+	}
+	if int(usage["output_tokens"].(float64)) != 56 {
+		t.Errorf("output_tokens want 56, got %v", usage["output_tokens"])
+	}
+	if usage["cost_usd"].(float64) != 0.5 {
+		t.Errorf("cost_usd want 0.5, got %v", usage["cost_usd"])
+	}
+}
+
+func TestEmitScheduleRun_FailedOmitsUsage(t *testing.T) {
+	bus := NewEventBus()
+	deps := &ServerDeps{EventBus: bus}
+	s := &Scheduler{deps: deps}
+	sched := schedule.Schedule{ID: "s1"}
+
+	// Failed run before any usage is collected — usage should be omitted, not zero-filled.
+	s.emitScheduleRunWithUsage("failed", sched, "", fmt.Errorf("boom"), ScheduleRunUsage{})
+
+	events := drainScheduleRun(t, bus)
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	if _, present := events[0]["usage"]; present {
+		t.Errorf("failed events with zero usage must omit the usage key, got %+v", events[0])
+	}
+	if events[0]["error"] != "boom" {
+		t.Errorf("error field missing/wrong: %v", events[0]["error"])
 	}
 }
