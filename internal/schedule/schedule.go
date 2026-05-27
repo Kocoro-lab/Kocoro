@@ -33,6 +33,19 @@ type Schedule struct {
 	// only the LLM's view (runner.historySnapshotForRequest) is affected.
 	Stateful *bool `json:"stateful,omitempty"`
 
+	// Broadcast is a three-state opt-in/out for IM channel push:
+	//   nil   → smart default (see internal/daemon/broadcast_gate.shouldBroadcast)
+	//   true  → always broadcast (regardless of CreatedFromSource)
+	//   false → never broadcast (regardless of CreatedFromSource)
+	Broadcast *bool `json:"broadcast,omitempty"`
+
+	// CreatedFromSource snapshots req.Source at creation time. Used by the
+	// daemon's shouldBroadcast helper as the smart-default signal. Examples:
+	// "slack", "feishu", "webview", "tui", "cli", "one-shot".
+	// Empty string means "pre-feature" (the field didn't exist when the
+	// schedule was saved) — treated as unknown and falls through to silent.
+	CreatedFromSource string `json:"created_from_source,omitempty"`
+
 	// LastRunAt is the wall-clock time of the most recent scheduler-triggered
 	// run (succeeded or failed). nil = never run. Stamped by
 	// Manager.MarkLastRun from the scheduler's runWithLifecycle.
