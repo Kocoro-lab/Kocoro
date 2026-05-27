@@ -653,6 +653,135 @@ func TestScheduleCreate_NoCtxSourceLeavesFieldEmpty(t *testing.T) {
 
 func ptrBool(b bool) *bool { return &b }
 
+// --- Task A7: schedule_update broadcast enum ------------------------------
+
+// setupScheduleUpdateTestEnv builds a manager seeded with one existing
+// schedule (so the update branch has something to mutate), plus a tool with
+// action="update". Unlike create, update does NOT capture req.Source, so no
+// agent.WithSource wrapping is needed — keep ctx plain to make that explicit.
+func setupScheduleUpdateTestEnv(t *testing.T, seed schedule.Schedule) (context.Context, *ScheduleTool, *schedule.Manager) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	mgr := schedule.NewManager(filepath.Join(home, ".shannon", "schedules.json"))
+
+	// Manager.Create allocates a fresh ID; we need to use the caller's seed.ID
+	// so the test assertion can fetch it back deterministically. Seed via
+	// CreateWithOpts (so Broadcast is preserved), then overwrite the ID in the
+	// persisted JSON by re-creating the file directly.
+	id, err := mgr.CreateWithOpts(seed.Agent, seed.Cron, seed.Prompt, false, schedule.CreateOpts{
+		Broadcast:         seed.Broadcast,
+		CreatedFromSource: seed.CreatedFromSource,
+	})
+	if err != nil {
+		t.Fatalf("seed CreateWithOpts: %v", err)
+	}
+	// Rename the persisted schedule ID to match seed.ID (so the test can
+	// reference it by a stable string). Simplest path: load → patch → save
+	// via the public Get + a re-write to disk.
+	loaded, err := mgr.Get(id)
+	if err != nil || loaded == nil {
+		t.Fatalf("seed Get: err=%v sched=%v", err, loaded)
+	}
+	loaded.ID = seed.ID
+	// Rewrite the index file with the renamed schedule. We bypass Manager
+	// here because Manager has no rename API, and rolling our own JSON write
+	// is the minimum surface change for a test helper.
+	data, err := json.MarshalIndent([]schedule.Schedule{*loaded}, "", "  ")
+	if err != nil {
+		t.Fatalf("seed marshal: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".shannon", "schedules.json"), data, 0o600); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+
+	tool := &ScheduleTool{manager: mgr, action: "update"}
+	return context.Background(), tool, mgr
+}
+
+func TestScheduleUpdate_BroadcastEnumApplied(t *testing.T) {
+	bTrue := true
+	bFalse := false
+
+	tests := []struct {
+		name          string
+		initial       *bool
+		broadcastArg  string
+		wantBroadcast *bool
+	}{
+		{name: "absent_does_not_change", initial: ptrBool(true), broadcastArg: "", wantBroadcast: ptrBool(true)},
+		{name: "auto_clears_to_nil", initial: ptrBool(true), broadcastArg: "auto", wantBroadcast: nil},
+		{name: "on_sets_true", initial: nil, broadcastArg: "on", wantBroadcast: &bTrue},
+		{name: "off_sets_false", initial: &bTrue, broadcastArg: "off", wantBroadcast: &bFalse},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, tool, mgr := setupScheduleUpdateTestEnv(t, schedule.Schedule{
+				ID:        "s1",
+				Cron:      "* * * * *",
+				Prompt:    "hi",
+				Broadcast: tc.initial,
+			})
+
+			args := map[string]any{
+				"id":          "s1",
+				"description": "update test",
+			}
+			if tc.broadcastArg != "" {
+				args["broadcast"] = tc.broadcastArg
+			}
+			payload, _ := json.Marshal(args)
+
+			result, err := tool.Run(ctx, string(payload))
+			if err != nil {
+				t.Fatalf("Run returned go error: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("Run returned error: %s", result.Content)
+			}
+
+			updated, err := mgr.Get("s1")
+			if err != nil || updated == nil {
+				t.Fatalf("manager Get returned err=%v updated=%v", err, updated)
+			}
+			if (updated.Broadcast == nil) != (tc.wantBroadcast == nil) {
+				t.Errorf("Broadcast nil-ness: got %v want %v", updated.Broadcast, tc.wantBroadcast)
+			}
+			if updated.Broadcast != nil && tc.wantBroadcast != nil && *updated.Broadcast != *tc.wantBroadcast {
+				t.Errorf("Broadcast value: got %v want %v", *updated.Broadcast, *tc.wantBroadcast)
+			}
+		})
+	}
+}
+
+func TestScheduleUpdate_InvalidBroadcastRejected(t *testing.T) {
+	ctx, tool, _ := setupScheduleUpdateTestEnv(t, schedule.Schedule{ID: "s1", Cron: "* * * * *", Prompt: "hi"})
+
+	args := map[string]any{
+		"id":          "s1",
+		"description": "update test",
+		"broadcast":   "maybe",
+	}
+	payload, _ := json.Marshal(args)
+	result, err := tool.Run(ctx, string(payload))
+	if err != nil {
+		t.Fatalf("Run returned go error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected error for invalid broadcast value, got success")
+	}
+	if !strings.Contains(result.Content, "[validation error]") {
+		t.Errorf("expected [validation error] prefix in %q", result.Content)
+	}
+	// Pin the error to the broadcast value (not the generic
+	// "at least one of cron/prompt/..." gate, which also returns a
+	// validation error and would mask a missing broadcast handler).
+	if !strings.Contains(result.Content, "broadcast") {
+		t.Errorf("expected error to mention 'broadcast', got %q", result.Content)
+	}
+}
+
 // The behavior that motivated the entire spec: a named-agent session is
 // shared between interactive chat AND scheduled runs. schedule_show MUST
 // return only the run's slice, not the session's tail.

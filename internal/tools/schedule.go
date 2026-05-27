@@ -116,6 +116,14 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 						"type":        "boolean",
 						"description": "Change history-preservation behaviour for named-agent schedules. Omit to leave unchanged. false = each run starts fresh; true = each run sees prior history. Has no effect on default-agent schedules.",
 					},
+					"broadcast": map[string]any{
+						"type": "string",
+						"enum": []string{"auto", "on", "off"},
+						"description": "Optional. Change the schedule's broadcast intent. " +
+							"Omit = leave the current setting unchanged. " +
+							"\"auto\" = clear back to smart default (decided by the schedule's CreatedFromSource). " +
+							"\"on\" / \"off\" = explicitly override.",
+					},
 					"description": agent.DescriptionFieldSpec,
 				},
 			},
@@ -272,8 +280,28 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		if v, ok := args["stateful"].(bool); ok {
 			opts.Stateful = &v
 		}
-		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil {
-			return agent.ValidationError("at least one of cron, prompt, enabled, or stateful is required"), nil
+		// Parse the optional broadcast enum. Absent → leave field unchanged.
+		// Present → parseBroadcastEnum maps "auto"/"on"/"off" to *bool; the
+		// BroadcastOpt wrapper distinguishes "leave alone" (opts.Broadcast == nil)
+		// from "rewrite to nil/true/false" (opts.Broadcast != nil).
+		if raw, present := args["broadcast"]; present && raw != nil {
+			bStr, isStr := raw.(string)
+			if !isStr {
+				return agent.ValidationError(fmt.Sprintf("broadcast must be a string (\"auto\", \"on\", or \"off\"); got %T", raw)), nil
+			}
+			b, ok := parseBroadcastEnum(bStr)
+			if !ok {
+				return agent.ValidationError(fmt.Sprintf("broadcast must be one of \"auto\", \"on\", \"off\"; got %q", bStr)), nil
+			}
+			opts.Broadcast = &schedule.BroadcastOpt{Value: b}
+		}
+		// When no field is set, treat as a no-op success rather than an
+		// error: a degenerate `{id, description}` call still produced a
+		// well-formed response (the schedule exists, nothing needed to
+		// change). Manager.Update has its own "no fields" guard so we
+		// must short-circuit here before calling it.
+		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil {
+			return agent.ToolResult{Content: fmt.Sprintf("Schedule %s unchanged (no fields specified).", id)}, nil
 		}
 		if err := t.manager.Update(id, opts); err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
