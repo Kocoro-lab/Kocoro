@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 )
@@ -120,5 +121,101 @@ func TestHandlePatchSchedule_MigrateLegacyToStateless(t *testing.T) {
 	got, _ := mgr.Get("legacy")
 	if got.Stateful == nil || *got.Stateful {
 		t.Errorf("legacy → stateless via PATCH failed: %v", got.Stateful)
+	}
+}
+
+// --- Task 7: GET /schedules/{id}/last-run -----------------------------------
+
+func TestHandleScheduleLastRun_NeverRun(t *testing.T) {
+	srv, mgr, _ := newTestServerWithScheduleMgr(t)
+	id, err := mgr.Create("tracker", "0 9 * * *", "p", false)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/schedules/"+id+"/last-run", nil)
+	req.SetPathValue("id", id)
+	w := httptest.NewRecorder()
+	srv.handleScheduleLastRun(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	var got schedule.LastRunSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.SessionID != "" || got.LastRunAt != nil {
+		t.Errorf("never-run should serialize empty/nil, got %+v", got)
+	}
+}
+
+func TestHandleScheduleLastRun_NormalReturn(t *testing.T) {
+	srv, mgr, indexPath := newTestServerWithScheduleMgr(t)
+	id, err := mgr.Create("tracker", "0 9 * * *", "p", false)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	shan := filepath.Dir(indexPath)
+	sessDir := filepath.Join(shan, "agents", "tracker", "sessions")
+	if err := os.MkdirAll(sessDir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, "sess-X.json"), []byte(
+		`{"id":"sess-X","schema_version":1,"messages":[{"role":"assistant","content":"hello world"}]}`,
+	), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := mgr.MarkLastRun(id, "sess-X", time.Now(), 0, 1); err != nil {
+		t.Fatalf("MarkLastRun: %v", err)
+	}
+	srv.deps.ShannonDir = shan
+
+	req := httptest.NewRequest(http.MethodGet, "/schedules/"+id+"/last-run", nil)
+	req.SetPathValue("id", id)
+	w := httptest.NewRecorder()
+	srv.handleScheduleLastRun(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	var got schedule.LastRunSummary
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.SessionID != "sess-X" {
+		t.Errorf("SessionID = %q, want %q", got.SessionID, "sess-X")
+	}
+	if len(got.Turns) != 1 || got.Turns[0].Text != "hello world" {
+		t.Errorf("turns: %+v", got.Turns)
+	}
+}
+
+func TestHandleScheduleLastRun_UnknownID404(t *testing.T) {
+	srv, _, _ := newTestServerWithScheduleMgr(t)
+	req := httptest.NewRequest(http.MethodGet, "/schedules/nope/last-run", nil)
+	req.SetPathValue("id", "nope")
+	w := httptest.NewRecorder()
+	srv.handleScheduleLastRun(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHandleScheduleLastRun_MissingSession500(t *testing.T) {
+	srv, mgr, indexPath := newTestServerWithScheduleMgr(t)
+	id, err := mgr.Create("tracker", "0 9 * * *", "p", false)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.MarkLastRun(id, "sess-gone", time.Now(), 0, 4); err != nil {
+		t.Fatalf("MarkLastRun: %v", err)
+	}
+	srv.deps.ShannonDir = filepath.Dir(indexPath)
+
+	req := httptest.NewRequest(http.MethodGet, "/schedules/"+id+"/last-run", nil)
+	req.SetPathValue("id", id)
+	w := httptest.NewRecorder()
+	srv.handleScheduleLastRun(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 (session file missing)", w.Code)
 	}
 }

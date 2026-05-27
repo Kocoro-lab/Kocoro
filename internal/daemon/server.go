@@ -433,6 +433,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /skills/{name}/assets/{filename}", s.handleDeleteSkillAssets)
 	mux.HandleFunc("GET /schedules", s.handleListSchedules)
 	mux.HandleFunc("GET /schedules/{id}", s.handleGetSchedule)
+	mux.HandleFunc("GET /schedules/{id}/last-run", s.handleScheduleLastRun)
 	mux.HandleFunc("POST /schedules", s.handleCreateSchedule)
 	mux.HandleFunc("PATCH /schedules/{id}", s.handlePatchSchedule)
 	mux.HandleFunc("DELETE /schedules/{id}", s.handleDeleteSchedule)
@@ -3934,6 +3935,40 @@ func (s *Server) handleGetSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, sched)
+}
+
+// handleScheduleLastRun resolves a schedule's most recent run through the
+// shared schedule.SummarizeLastRun resolver. Returns the same JSON shape the
+// schedule_show LLM tool emits — LastRunSummary — so Desktop and any other
+// HTTP client read the same wire format. Optional ?max_turns=N tunes the
+// window (the resolver clamps).
+func (s *Server) handleScheduleLastRun(w http.ResponseWriter, r *http.Request) {
+	if s.deps == nil || s.deps.ScheduleManager == nil {
+		writeError(w, http.StatusInternalServerError, "daemon deps not configured")
+		return
+	}
+	id := r.PathValue("id")
+	sched, err := s.deps.ScheduleManager.Get(id)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	maxTurns := 5
+	if v := r.URL.Query().Get("max_turns"); v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
+			maxTurns = n
+		}
+	}
+	summary, err := schedule.SummarizeLastRun(*sched, s.deps.ShannonDir, maxTurns)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, summary)
 }
 
 func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
