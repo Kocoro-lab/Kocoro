@@ -78,6 +78,15 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 							"false (default, recommended): each run starts with no prior conversation history — best for digests, polling, daily reports, monitoring, and any task where runs are independent. " +
 							"true: each run sees the conversation from prior runs — only choose this when the user explicitly wants the agent to remember and build on previous runs (e.g. continuous research, ongoing project tracking with follow-up questions).",
 					},
+					"broadcast": map[string]any{
+						"type": "string",
+						"enum": []string{"auto", "on", "off"},
+						"description": "Optional. Controls whether the schedule's reply is broadcast to this agent's bound IM channel (Slack / Lark / Feishu / Telegram / WeCom / LINE) when the run finishes. " +
+							"Omit or \"auto\" (smart default, recommended): schedules created from an IM channel broadcast back to that channel; schedules created from Desktop/TUI/CLI stay silent locally. " +
+							"\"on\": even Desktop-created schedules push to the bound IM channel — pick this when the user explicitly wants the result delivered to chat. " +
+							"\"off\": even IM-created schedules stay silent — pick this when the user explicitly wants a quiet local run. " +
+							"Important: do NOT default to \"off\" when the user hasn't expressed an opinion — let the smart default decide.",
+					},
 					"description": agent.DescriptionFieldSpec,
 				},
 			},
@@ -180,7 +189,29 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			return agent.ValidationError("description is required"), nil
 		}
 		stateful, _ := args["stateful"].(bool) // missing → false (Go zero value, matches HTTP/CLI default)
-		id, err := t.manager.Create(agentName, cron, prompt, stateful)
+		// Parse broadcast enum. Absent or "auto" maps to nil (smart default).
+		// Use the explicit "present?" check (not just truthy) so the LLM
+		// passing a non-string value still surfaces as a validation error.
+		var broadcast *bool
+		if raw, present := args["broadcast"]; present && raw != nil {
+			bStr, isStr := raw.(string)
+			if !isStr {
+				return agent.ValidationError(fmt.Sprintf("broadcast must be a string (\"auto\", \"on\", or \"off\"); got %T", raw)), nil
+			}
+			b, ok := parseBroadcastEnum(bStr)
+			if !ok {
+				return agent.ValidationError(fmt.Sprintf("broadcast must be one of \"auto\", \"on\", \"off\"; got %q", bStr)), nil
+			}
+			broadcast = b
+		}
+		// Capture per-call source for the broadcast gate's smart default.
+		// Empty / not-in-ctx both map to "" — downstream treats both as
+		// "unknown source" and the gate falls through to silent.
+		createdFromSource, _ := agent.SourceFromContext(ctx)
+		id, err := t.manager.CreateWithOpts(agentName, cron, prompt, stateful, schedule.CreateOpts{
+			Broadcast:         broadcast,
+			CreatedFromSource: createdFromSource,
+		})
 		if err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
 		}
@@ -358,6 +389,32 @@ func (t *ScheduleTool) triggerConflictWarning(agentName string) string {
 		return ""
 	}
 	return "⚠️ Note: " + warnings[0]
+}
+
+// parseBroadcastEnum maps the schedule_create / schedule_update `broadcast`
+// string enum into a *bool for storage. Returns (*bool, ok). ok=false means
+// the input was not one of the allowed values; callers should return a
+// ValidationError so the LLM gets a clear correction signal.
+//
+// Mapping:
+//   - ""    → (nil, true)   // absent/empty = smart default
+//   - "auto"→ (nil, true)   // smart default
+//   - "on"  → (*true, true) // always broadcast
+//   - "off" → (*false, true)// never broadcast
+//   - other → (nil, false)  // invalid
+func parseBroadcastEnum(s string) (*bool, bool) {
+	switch s {
+	case "", "auto":
+		return nil, true
+	case "on":
+		b := true
+		return &b, true
+	case "off":
+		b := false
+		return &b, true
+	default:
+		return nil, false
+	}
 }
 
 // extractConversationContext pulls a compact context from the live

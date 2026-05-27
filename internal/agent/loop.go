@@ -2160,6 +2160,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// empty string is meaningful (= default agent) and we want tools to be
 	// able to distinguish "no ctx value" from "ctx says default agent".
 	ctx = WithAgentName(ctx, a.agentName)
+	// Inject the per-call originating source so schedule_create can snapshot
+	// it into the new Schedule's CreatedFromSource — drives the broadcast
+	// smart-default gate in internal/daemon/broadcast_gate.shouldBroadcast.
+	// Empty string is meaningful (= unknown/pre-feature caller) so we inject
+	// unconditionally, same rationale as agentName above.
+	ctx = WithSource(ctx, a.source)
 	ctx = context.WithValue(ctx, readTrackerKey{}, readTracker)
 
 	// Loop behavior constants

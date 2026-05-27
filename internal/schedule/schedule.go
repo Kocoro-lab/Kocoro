@@ -201,7 +201,30 @@ func (m *Manager) lockedModify(fn func([]Schedule) ([]Schedule, error)) error {
 	return m.save(schedules)
 }
 
+// CreateOpts carries the optional, non-validated fields a caller can attach
+// to a new schedule. Required fields (agent/cron/prompt/stateful) stay on
+// the function signature so misuse is a compile error. Pointer/string-typed
+// because nil/"" are both legal "not specified" markers downstream.
+type CreateOpts struct {
+	// Broadcast is the IM-channel-push opt-in/out. nil = smart default;
+	// *true = always broadcast; *false = never broadcast. See the schedule
+	// struct comment for the full semantics.
+	Broadcast *bool
+	// CreatedFromSource snapshots the originating req.Source at creation
+	// time (e.g. "slack", "feishu", "webview", "tui"). Drives the smart
+	// default in internal/daemon/broadcast_gate.shouldBroadcast. Empty
+	// string is acceptable and means "unknown / pre-feature caller".
+	CreatedFromSource string
+}
+
 func (m *Manager) Create(agentName, cron, prompt string, stateful bool) (string, error) {
+	return m.CreateWithOpts(agentName, cron, prompt, stateful, CreateOpts{})
+}
+
+// CreateWithOpts is the extended form of Create that accepts the optional
+// broadcast + source fields. Kept as a separate method so the many existing
+// callers of Create stay compilable without churn.
+func (m *Manager) CreateWithOpts(agentName, cron, prompt string, stateful bool, opts CreateOpts) (string, error) {
 	if err := validateAgent(agentName); err != nil {
 		return "", err
 	}
@@ -216,7 +239,12 @@ func (m *Manager) Create(agentName, cron, prompt string, stateful bool) (string,
 	s := Schedule{
 		ID: id, Agent: agentName, Cron: cron, Prompt: prompt,
 		Enabled: true, SyncStatus: "ok", CreatedAt: time.Now(),
-		Stateful: &statefulCopy, // always explicit on Create — never leave nil for new rows
+		Stateful:          &statefulCopy, // always explicit on Create — never leave nil for new rows
+		CreatedFromSource: opts.CreatedFromSource,
+	}
+	if opts.Broadcast != nil {
+		bCopy := *opts.Broadcast
+		s.Broadcast = &bCopy
 	}
 	err := m.lockedModify(func(schedules []Schedule) ([]Schedule, error) {
 		return append(schedules, s), nil

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -499,6 +500,158 @@ func TestScheduleTool_Show_MaxTurnsArg(t *testing.T) {
 		t.Errorf("max_turns=2 must include turns 5 and 6: %q", res.Content)
 	}
 }
+
+// --- Task A6: broadcast enum + Source capture -----------------------------
+
+// setupScheduleCreateTestEnv prepares a tool instance with a real Manager
+// backed by a temp HOME, plus a ctx pre-populated with the originating
+// source (mirroring how AgentLoop.Run wraps ctx for tools in production).
+// Returns (ctx, tool, manager) so the test can inspect the saved schedule
+// directly via Manager.List.
+func setupScheduleCreateTestEnv(t *testing.T, source string) (context.Context, *ScheduleTool, *schedule.Manager) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	mgr := schedule.NewManager(filepath.Join(home, ".shannon", "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+	ctx := agent.WithSource(context.Background(), source)
+	return ctx, tool, mgr
+}
+
+func TestScheduleCreate_BroadcastParamMapping(t *testing.T) {
+	cases := []struct {
+		name          string
+		broadcastArg  any
+		wantBroadcast *bool
+	}{
+		{name: "absent_broadcast_yields_nil", broadcastArg: nil, wantBroadcast: nil},
+		{name: "auto_yields_nil", broadcastArg: "auto", wantBroadcast: nil},
+		{name: "on_yields_true", broadcastArg: "on", wantBroadcast: ptrBool(true)},
+		{name: "off_yields_false", broadcastArg: "off", wantBroadcast: ptrBool(false)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, tool, mgr := setupScheduleCreateTestEnv(t, "slack")
+			args := map[string]any{
+				"cron":        "* * * * *",
+				"prompt":      "hi",
+				"description": "test schedule",
+			}
+			if tc.broadcastArg != nil {
+				args["broadcast"] = tc.broadcastArg
+			}
+			payload, err := json.Marshal(args)
+			if err != nil {
+				t.Fatalf("marshal args: %v", err)
+			}
+
+			result, err := tool.Run(ctx, string(payload))
+			if err != nil {
+				t.Fatalf("Run returned go error: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("Run returned tool error: %s", result.Content)
+			}
+
+			list, err := mgr.List()
+			if err != nil {
+				t.Fatalf("manager.List: %v", err)
+			}
+			if len(list) != 1 {
+				t.Fatalf("want 1 schedule, got %d", len(list))
+			}
+			saved := list[0]
+			if (saved.Broadcast == nil) != (tc.wantBroadcast == nil) {
+				t.Errorf("Broadcast nil-ness: got %v want %v", saved.Broadcast, tc.wantBroadcast)
+			}
+			if saved.Broadcast != nil && tc.wantBroadcast != nil && *saved.Broadcast != *tc.wantBroadcast {
+				t.Errorf("Broadcast value: got %v want %v", *saved.Broadcast, *tc.wantBroadcast)
+			}
+			if saved.CreatedFromSource != "slack" {
+				t.Errorf("CreatedFromSource: got %q want %q", saved.CreatedFromSource, "slack")
+			}
+		})
+	}
+}
+
+func TestScheduleCreate_InvalidBroadcastRejected(t *testing.T) {
+	ctx, tool, mgr := setupScheduleCreateTestEnv(t, "slack")
+	args := map[string]any{
+		"cron":        "* * * * *",
+		"prompt":      "hi",
+		"description": "test",
+		"broadcast":   "maybe", // invalid enum value
+	}
+	payload, err := json.Marshal(args)
+	if err != nil {
+		t.Fatalf("marshal args: %v", err)
+	}
+
+	result, err := tool.Run(ctx, string(payload))
+	if err != nil {
+		t.Fatalf("Run returned go error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected error for invalid broadcast value, got success: %q", result.Content)
+	}
+	// The [validation error] prefix is load-bearing for loop detection — it
+	// short-circuits same-tool+same-args 3-consecutive-error runs to
+	// LoopForceStop. Returning a hand-rolled IsError result drops this signal.
+	if !strings.Contains(result.Content, "[validation error]") {
+		t.Errorf("expected [validation error] prefix in %q", result.Content)
+	}
+	// Defensive: no schedule should have been persisted.
+	if list, _ := mgr.List(); len(list) != 0 {
+		t.Errorf("expected no schedules saved after rejection, got %d", len(list))
+	}
+}
+
+// Source capture is unconditional regardless of broadcast arg: even without
+// a broadcast arg, an IM source captured at creation drives the smart-default
+// downstream. This guards against a regression where the source-capture path
+// is gated on broadcast being explicit.
+func TestScheduleCreate_CapturesSourceWithoutBroadcastArg(t *testing.T) {
+	ctx, tool, mgr := setupScheduleCreateTestEnv(t, "feishu")
+	result, err := tool.Run(ctx, `{"cron":"* * * * *","prompt":"hi","description":"test"}`)
+	if err != nil || result.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, result)
+	}
+	list, _ := mgr.List()
+	if len(list) != 1 {
+		t.Fatalf("want 1 schedule, got %d", len(list))
+	}
+	if list[0].CreatedFromSource != "feishu" {
+		t.Errorf("CreatedFromSource = %q, want %q", list[0].CreatedFromSource, "feishu")
+	}
+	if list[0].Broadcast != nil {
+		t.Errorf("Broadcast = %v, want nil (smart default)", list[0].Broadcast)
+	}
+}
+
+// Backward compat: a tool call from a path that never wraps ctx with
+// WithSource (e.g. older callers, tests) must not crash — CreatedFromSource
+// stays empty and the smart default downstream treats it as "unknown source".
+func TestScheduleCreate_NoCtxSourceLeavesFieldEmpty(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	mgr := schedule.NewManager(filepath.Join(home, ".shannon", "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	result, err := tool.Run(context.Background(), `{"cron":"* * * * *","prompt":"hi","description":"test"}`)
+	if err != nil || result.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, result)
+	}
+	list, _ := mgr.List()
+	if len(list) != 1 {
+		t.Fatalf("want 1 schedule, got %d", len(list))
+	}
+	if list[0].CreatedFromSource != "" {
+		t.Errorf("CreatedFromSource = %q, want empty (no ctx source)", list[0].CreatedFromSource)
+	}
+}
+
+func ptrBool(b bool) *bool { return &b }
 
 // The behavior that motivated the entire spec: a named-agent session is
 // shared between interactive chat AND scheduled runs. schedule_show MUST
