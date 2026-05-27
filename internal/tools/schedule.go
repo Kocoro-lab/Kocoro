@@ -50,8 +50,15 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 							"When the user is creating a schedule from inside a conversation with a named agent (e.g. they are talking to 'analyst' and ask to schedule a daily report), pass that agent's name so future runs use the same persona AND so the user can find the results via session_search inside that same agent. " +
 							"Pass an empty string only when the user explicitly wants the default agent (rare); each run will land in the global ~/.shannon/sessions/ pool and won't be visible to your session_search.",
 					},
-					"cron":   map[string]any{"type": "string", "description": "5-field cron expression (minute hour day month weekday). Supports */5, 1-5, 1,3,5."},
-					"prompt": map[string]any{"type": "string", "description": "The prompt to send to the agent on each run."},
+					"cron": map[string]any{"type": "string", "description": "5-field cron expression (minute hour day month weekday). Supports */5, 1-5, 1,3,5."},
+					"prompt": map[string]any{
+						"type": "string",
+						"description": "The instruction template applied verbatim on each scheduled fire. " +
+							"Write it as a complete, self-contained user-message the agent could execute with zero additional context — the agent gets no memory that this is a scheduled run vs an interactive ask. " +
+							"Restate the user's intent as an actionable instruction; do not just echo keywords from the user's request. " +
+							"BAD: user asks '每分钟说一次你好' → prompt='你好' (agent receives a bare greeting and replies 'how can I help?' — the run produces nothing useful). " +
+							"GOOD: user asks '每分钟说一次你好' → prompt='请生成一句简短的「你好」问候作为本次定时任务的输出,只说一句,不要追问' (agent has a clear deliverable, run produces a useful artifact).",
+					},
 					"stateful": map[string]any{
 						"type":    "boolean",
 						"default": false,
