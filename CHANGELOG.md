@@ -2,6 +2,36 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.1.17 — 2026-05-27 — Built-in MCP catalog, async MCP startup, desktop-only skill suppression
+
+Ships a daemon-owned catalog of pre-bundled MCP servers (first entry: Intercom, disabled by default) and reworks MCP startup to be non-blocking with reliable subprocess cleanup — the daemon-side foundation for a client-driven "toggle MCP server on/off with OAuth confirm" flow. Also adds a producer-side filter that hides desktop-only skills (whose output only renders in a GUI WebView host) from cloud-distributed channels so they can't leak raw HTML into Slack / LINE / Feishu / Lark / WeCom / Telegram / webhook. No wire-protocol break — the new `GET /config/status` fields are additive and older clients ignore them.
+
+> Backlog note: v0.1.13, v0.1.14, and v0.1.16 were tagged without CHANGELOG entries; see their annotated tag messages and the GitHub Releases page until backfilled.
+
+### Added
+
+- **Built-in MCP catalog** (PR #194, `internal/mcp/builtins.go`, `internal/config/config.go mergeBuiltinMCPServers`) — `BuiltinMCPServers` is the in-binary source of truth for command/args/type/url/context; user yaml only persists `disabled` / `env` / `keep_alive` / `connect_timeout_secs`, so daemon upgrades pick up catalog edits without yaml surgery. `config.Load` field-merges the catalog onto user yaml (user wins on tunable fields, Go source wins on immutable fields; `env` is deep-copied + key-by-key merged). `PATCH /config` rejects edits to daemon-owned fields (`409 builtin_mcp_immutable`, `safeguard.go`). `GET /config/status` grows a parallel `mcp_server_info` map `{builtin, display_name, description, auth_hint, requires_auth?, authorized?}` so a client can render a toggle + OAuth confirm modal without hard-coding the catalog. First entry: Intercom (`npx mcp-remote https://mcp.intercom.com/mcp`), `requires_auth: true`, 300s connect timeout.
+- **Async MCP startup** (PR #194, `internal/mcp/client.go StartConnectAll`, `internal/tools/register.go RegisterAllWithBaselineAsync`) — daemon startup and `POST /config/reload` no longer block on MCP handshakes; they build the registry with local + gateway tools, swap deps, then fire per-server connect goroutines. A per-server `inFlight` set (`tryReserveInFlight`) prevents a reload mid-connect from spawning a duplicate subprocess that would crash `EADDRINUSE` on the OAuth loopback port. Per-server timeout resolves `connect_timeout_secs` > `mcp.default_connect_timeout_secs` > 60s floor. Successful connects flip the supervisor to Healthy and rebuild the live registry so tools appear as each server finishes; failed connects write an `mcp_connect` audit row and stay enabled-but-disconnected.
+- **MCP subprocess group reaping** (PR #194, `internal/mcp/processgroup_unix.go`) — stdio MCP servers spawn under `Setpgid=true` with a `cmd.Cancel` that signals `-pgid` SIGTERM then a `WaitDelay=3s` SIGKILL backstop (ladder: SIGTERM-group → SIGKILL-group → SIGKILL-leader). Without this, npx-bridged chains (npx → npm exec → node mcp-remote) leak the grandchild holding the OAuth loopback port. `Close` / `Disconnect` / `Reconnect` cancel the group before `c.Close()`.
+- **Desktop-only skill suppression on cloud channels** (PR #193, #42, `internal/daemon/skill_filter.go`) — a `desktopOnlySkills` registry is filtered out of `loadedSkills` at the producer side in `runner.go` when `isCloudSource(req.Source)` is true, so all three exposure layers (use_skill registry, listing, semantic discovery) see the same view. Only entry today is `kocoro-generative-ui` — its html-artifact fences only render in a GUI WebView host, so activating it from a cloud-distributed channel would surface raw HTML/CSS/JS. Drift test walks `desktopOnlySkills × cloudSourceSet`.
+
+### Fixed
+
+- **Blank Chrome tab at agent-turn start after async startup** (commits `6374747`, `2255ecf`, `internal/daemon/runner.go`) — the async connect flow left playwright at a `Degraded` rest state (post-discovery Disconnect with no intervening probe to demote it). RunAgent's turn-start preflight saw `Degraded != Disconnected`, fired `ProbeNow`, and relaunched CDP Chrome (an `about:blank` tab). Preflight now skips when there is no live client; lazy `ensureChromeDebugPort` still launches Chrome when the agent actually calls a browser tool.
+- **Duplicate connect goroutine on reload** (PR #194, `internal/mcp/client.go`) — `POST /config/reload` fired while a daemon-startup async connect was still inside Initialize/ListTools spawned a second connect for the same server, racing for the OAuth loopback port (`EADDRINUSE`). `tryReserveInFlight` dedups; `Reconnect` honors the same gate.
+- **OAuth re-enable UX** (commit `c986534`, `internal/mcp/oauth_state.go`) — new `MCPRemoteHasToken` helper (md5(serverURL) + glob across `~/.mcp-auth/mcp-remote-*/`) backs the `authorized` field so a client can skip the confirm modal on re-enable. Previously: confirm modal → user clicks Authorize → mcp-remote silently reuses the cached token → no browser opens → looks broken.
+
+### Docs
+
+- `CLAUDE.md` + `AGENTS.md`: four new Daemon Architecture rows (built-in catalog, async startup, subprocess reaping, reload-as-retry) and a Skill Discovery "per-request channel suppression" note.
+- `references/mcp.md` (bundled `kocoro` skill): built-in servers section, `authorized` semantics + client guard pseudocode, per-server connect timeout, and `/config/reload`-as-retry.
+
+### Cross-repo consumers
+
+- **Desktop clients**: read `mcp_server_info.{requires_auth, authorized}` from `GET /config/status`; show the OAuth confirm modal (using `auth_hint` as the body) only when `requires_auth && authorized !== true && currentlyDisabled`. Map the "Retry" affordance to `POST /config/reload`, and poll `GET /config/status` for `disabled → enabled → connected` transitions since reload now returns immediately. All new fields are additive — older clients ignore them.
+
+---
+
 ## v0.1.12 — 2026-05-21 — Empty-response 400 fix, language-drift mitigation, session sort
 
 Three internal-only fixes (no wire-protocol changes, no cross-repo coordination required). The largest is an Anthropic-side 400 root-cause fix: when the model emitted an assistant turn containing only `thinking` blocks (no text / tool_use), the next request carried a `cache_control` on empty `content[]` and the API rejected it. The daemon now refuses to persist empty assistant content, surfaces a neutral friendly fallback, and the context sanitizer repairs the same shape on historical messages so existing sessions keep loading.
