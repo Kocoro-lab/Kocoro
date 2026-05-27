@@ -832,6 +832,7 @@ func TestDecideCDPSeed(t *testing.T) {
 		{"same profile, cookies unchanged", true, "Default", "Default", "fpA", "fpA", false, false},
 		{"upgrade: stored fp empty", true, "Default", "Default", "fpA", "", true, false},
 		{"same profile, no source cookies", true, "Default", "Default", "", "", false, false},
+		{"absence isn't change: source cookies gone", true, "Default", "Default", "", "fpA", false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

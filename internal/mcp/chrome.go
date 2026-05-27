@@ -1644,21 +1644,30 @@ var cookieFingerprintFiles = []string{
 // under Network/. Keyed on file size plus a sha256 of contents — deliberately
 // NOT mtime, so an equivalent in-place rewrite (e.g. a cookie expiry refresh
 // that doesn't change the stored value) doesn't churn the fingerprint and
-// trigger needless re-seeds. The ~1.3 MB read is negligible on a cold start.
+// trigger needless re-seeds. Contents are streamed through the hash so a heavy
+// profile (root + Network/ DBs plus -wal sidecars, 10 MB+) isn't buffered.
+//
+// Note: the source Chrome may be mid-write while we hash. The bytes hashed here
+// are not guaranteed identical to the bytes prepareCDPProfile copies a moment
+// later; worst case is a spurious re-seed on the next cold start (cheap). Like
+// the seed decision itself, this only runs on a Chrome cold start.
 func computeCookieFingerprint(profileDir string) string {
 	h := sha256.New()
 	found := false
 	for _, name := range cookieFingerprintFiles {
-		p := filepath.Join(profileDir, name)
-		fi, err := cdpStat(p)
+		f, err := os.Open(filepath.Join(profileDir, name))
 		if err != nil {
 			continue
 		}
 		found = true
-		fmt.Fprintf(h, "%s:%d\n", name, fi.Size())
-		if data, err := os.ReadFile(p); err == nil {
-			h.Write(data)
+		fi, statErr := f.Stat()
+		size := int64(-1)
+		if statErr == nil {
+			size = fi.Size()
 		}
+		fmt.Fprintf(h, "%s:%d\n", name, size)
+		io.Copy(h, f) //nolint:errcheck
+		f.Close()     //nolint:errcheck
 	}
 	if !found {
 		return ""
@@ -1670,6 +1679,11 @@ func computeCookieFingerprint(profileDir string) string {
 // from the one captured at last clone. An empty stored fingerprint (a clone
 // made by pre-fingerprint code) counts as changed when a live fingerprint
 // exists, so the next cold start refreshes the login state.
+//
+// A "" current fingerprint (no cookie files at the source) is deliberately NOT
+// treated as a change: absence is not divergence. This avoids re-seeding off a
+// transient state where Chrome has momentarily removed/recreated the DB, and
+// avoids clobbering a good clone when the source profile is unreadable.
 func cookieFingerprintChanged(current, stored string) bool {
 	if current == "" {
 		return false
@@ -1791,19 +1805,20 @@ func prepareCDPProfile(srcProfile, profileName, cdpDir string) error {
 	// not the original profile name which would create an empty new directory.
 	patchLocalStateLastUsed(filepath.Join(cdpDir, "Local State"))
 
-	// Critical files are logged on failure; others are best-effort. Login Data
-	// is always expected; the cookie DB is critical only when neither the root
-	// nor the Network/ location exists (modern profiles keep just one).
+	// Critical files are logged on failure; others are best-effort. The cookie
+	// DB isn't listed: its location varies (root vs Network/) and a fresh
+	// profile may legitimately have none, so a copy failure there is expected.
 	criticalFiles := map[string]bool{
 		"Login Data": true,
 	}
 
-	// On a cookie-only re-seed the Default dir is NOT wiped (only profile
-	// switches rebuild it), so a -wal/-journal sidecar left by the previous
-	// clone could survive when the current source no longer has it — SQLite
-	// would then replay/rollback against a stale sidecar and surface the old
-	// login state. Drop every cookie DB + sidecar at the destination first so
-	// the copy below reproduces exactly the source's cookie store.
+	// Matters only on the cookie-only re-seed path: there the Default dir is NOT
+	// wiped, so a -wal/-journal sidecar left by the previous clone could survive
+	// when the current source no longer has it — SQLite would then
+	// replay/rollback against a stale sidecar and surface the old login state.
+	// Drop every cookie DB + sidecar at the destination first so the copy below
+	// reproduces exactly the source's cookie store. (No-op on the profile-switch
+	// path, where LaunchCDPChrome already removed all of Default/.)
 	for _, f := range cookieFingerprintFiles {
 		os.Remove(filepath.Join(defaultDst, f)) //nolint:errcheck
 	}
