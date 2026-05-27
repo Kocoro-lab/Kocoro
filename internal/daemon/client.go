@@ -75,12 +75,20 @@ var Version = "dev"
 // For active-run IM follow-ups, the daemon also forwards an in-place
 // "Queued next" status event to the active channel-stream message when
 // Cloud sends the source as slack/wecom/feishu/lark.
+//
+// "schedule_broadcast_gate" — daemon supports the Schedule.Broadcast +
+// Schedule.CreatedFromSource fields and gates each schedule's reply push
+// through internal/daemon/broadcast_gate.go shouldBroadcast(). Desktops
+// reading this token can show the broadcast badge / picker UI; daemons
+// without the token use the legacy unconditional broadcast (per agent
+// binding). Both daemon shapes interoperate with the same Cloud.
 const (
-	CapDeliveryAck         = "delivery_ack"
-	CapInlineDocumentB64   = "inline_document_b64"
-	CapInlineExtractedText = "inline_extracted_text"
-	CapToolUseIDEvents     = "tool_use_id_events"
-	CapClientMessageQueue  = "client_message_queue"
+	CapDeliveryAck            = "delivery_ack"
+	CapInlineDocumentB64      = "inline_document_b64"
+	CapInlineExtractedText    = "inline_extracted_text"
+	CapToolUseIDEvents        = "tool_use_id_events"
+	CapClientMessageQueue     = "client_message_queue"
+	CapScheduleBroadcastGate  = "schedule_broadcast_gate"
 )
 
 var Capabilities = []string{
@@ -90,6 +98,7 @@ var Capabilities = []string{
 	CapToolUseIDEvents,
 	CapClientMessageQueue,
 	CapIMMessageLifecycleV1,
+	CapScheduleBroadcastGate,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
