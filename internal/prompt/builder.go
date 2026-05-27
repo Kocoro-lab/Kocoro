@@ -247,20 +247,28 @@ func buildStaticSystem(opts PromptOptions) string {
 	// 3.5. IM channel delivery semantics (stable — explains what the volatile
 	// Source/Channel/Sender values in sticky context mean for reply delivery).
 	// Without this, agents seeing Source: slack still look for a Slack-send
-	// tool and degrade to suggesting Webhook+token workarounds. See issue #186
-	// follow-up.
+	// tool and degrade to suggesting Webhook+token workarounds. See Kocoro#186.
 	sb.WriteString("\n\n## IM channel delivery\n")
 	sb.WriteString("If the per-turn sticky context contains a `Source:` line whose " +
 		"value is a Cloud-distributed channel (slack, line, feishu, lark, wecom, " +
 		"telegram, webhook), your final assistant text reply is automatically " +
-		"delivered back to the originating channel by Kocoro Cloud — " +
-		"you do NOT need any tool, Webhook URL, or Bot Token to 'send' to the " +
-		"user, just write your reply as normal text.\n\n" +
-		"Scheduled tasks and heartbeat runs deliver their reply via the same " +
-		"Cloud broadcast path to every channel the named agent is OAuth-bound to. " +
-		"You cannot target an arbitrary different channel than the one the run " +
-		"is anchored to; if a user asks to post to a specific other channel, " +
-		"say it is not supported.")
+		"delivered back to the originating channel by Kocoro Cloud — you do NOT " +
+		"need any tool, Webhook URL, or Bot Token to 'send' to the user, just " +
+		"write your reply as normal text.\n\n" +
+		"The `Agent:` line in sticky context tells you which Kocoro agent " +
+		"identity is handling this conversation — it will read `Agent: default` " +
+		"when the originating channel is bound to the default agent, or " +
+		"`Agent: <name>` when bound to a named agent. **You ARE the agent that " +
+		"Kocoro Cloud routed this message to** — meaning when you create a " +
+		"scheduled task, the schedule defaults to this same agent identity, " +
+		"and the schedule's reply will broadcast back to this same channel " +
+		"(plus any other channels bound to the same agent) via the same " +
+		"proactive path. Default agent works the same way as named agents " +
+		"for this broadcast — the only difference is which agent identity " +
+		"the schedule binds to.\n\n" +
+		"You cannot target an arbitrary OTHER channel than the ones already " +
+		"OAuth-bound to your agent identity. If a user asks to post to a " +
+		"specific other channel, say it is not supported.")
 
 	// 4. macOS automation guidance (only on darwin with relevant tools)
 	if guidance := macOSAutomationGuidance(opts.LocalToolNames); guidance != "" {

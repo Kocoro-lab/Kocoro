@@ -1102,7 +1102,9 @@ func TestSystemPrompt_IncludesIMDeliverySemantics(t *testing.T) {
 		"## IM channel delivery",
 		"Cloud-distributed channel",
 		"you do NOT need any tool",
-		"OAuth-bound",
+		"You ARE the agent",                    // NEW — locks in agent-identity claim
+		"schedule defaults to this same agent", // NEW — locks in self-default claim
+		"Default agent works the same way",     // NEW — closes the named-only loophole
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("system prompt missing IM-delivery phrase %q", want)
