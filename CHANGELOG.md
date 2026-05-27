@@ -2,6 +2,12 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Fixed
+
+- **Blank Chrome window on every non-browser turn after a browser turn** (`internal/daemon/runner.go`, `internal/tools/register.go`) — follow-up to the v0.1.17 blank-tab fix. With Playwright in CDP + `keep_alive=false`, a turn that used the browser tears down Chrome at turn end; the periodic capability probe then re-registers the MCP transport (via `CallTool`'s lazy reconnect) while Chrome stays dead, leaving the steady state `Degraded` **with `IsConnected=true`**. That defeated the v0.1.17 `IsConnected` guard, so the next attended turn's preflight `ProbeNow` fired `maybeRelaunchDegradedCDPChrome` and popped a blank `about:blank` window — repeating on every non-browser follow-up turn. Fix: the turn-start preflight never relaunches Chrome for CDP + `keep_alive=false` (any source — a turn starting is not a signal the turn needs the browser), and `RebuildRegistryForHealth` keeps the cached Playwright tools exposed in the `Degraded` state **only** for Playwright CDP + `keep_alive=false` (with on-demand reconnect), so the browser still recovers the moment the agent actually invokes a browser tool (`mcp_tool.go` pre-call `ensureChromeDebugPort`). Every other Degraded server (non-CDP, `keep_alive=true`, or any non-playwright server) stays hidden so a failing capability probe never surfaces broken cached tools or strips the working legacy browser fallback.
+
 ## v0.1.17 — 2026-05-27 — Built-in MCP catalog, async MCP startup, desktop-only skill suppression
 
 Ships a daemon-owned catalog of pre-bundled MCP servers (first entry: Intercom, disabled by default) and reworks MCP startup to be non-blocking with reliable subprocess cleanup — the daemon-side foundation for a client-driven "toggle MCP server on/off with OAuth confirm" flow. Also adds a producer-side filter that hides desktop-only skills (whose output only renders in a GUI WebView host) from cloud-distributed channels so they can't leak raw HTML into Slack / LINE / Feishu / Lark / WeCom / Telegram / webhook. No wire-protocol break — the new `GET /config/status` fields are additive and older clients ignore them.

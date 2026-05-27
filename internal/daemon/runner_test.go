@@ -1214,117 +1214,104 @@ func TestIsSoftRunError_StreamIdleTimeout(t *testing.T) {
 	}
 }
 
-func TestShouldTrackPlaywrightProbeChromeBefore(t *testing.T) {
-	cdpCfg := mcp.MCPServerConfig{
-		Command: "playwright-mcp",
-		Args:    []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
-	}
-	keepAliveCfg := cdpCfg
-	keepAliveCfg.KeepAlive = true
-	stdioCfg := mcp.MCPServerConfig{Command: "playwright-mcp", Args: []string{"--headless"}}
-
-	cases := []struct {
-		name   string
-		before mcp.ServerHealth
-		cfg    mcp.MCPServerConfig
-		req    RunAgentRequest
-		want   bool
-	}{
-		{
-			name:   "attended degraded cdp keepalive false tracks before probe",
-			before: mcp.ServerHealth{State: mcp.StateDegraded},
-			cfg:    cdpCfg,
-			req:    RunAgentRequest{Source: "kocoro"},
-			want:   true,
-		},
-		{
-			name:   "schedule does not track because probe relaunch is skipped",
-			before: mcp.ServerHealth{State: mcp.StateDegraded},
-			cfg:    cdpCfg,
-			req:    RunAgentRequest{Source: "schedule"},
-		},
-		{
-			name:   "heartbeat bypass does not track because probe relaunch is skipped",
-			before: mcp.ServerHealth{State: mcp.StateDegraded},
-			cfg:    cdpCfg,
-			req:    RunAgentRequest{Source: "heartbeat", BypassRouting: true},
-		},
-		{
-			name:   "webhook does not track because probe relaunch is skipped",
-			before: mcp.ServerHealth{State: mcp.StateDegraded},
-			cfg:    cdpCfg,
-			req:    RunAgentRequest{Source: "webhook"},
-		},
-		{
-			name:   "cron does not track because probe relaunch is skipped",
-			before: mcp.ServerHealth{State: mcp.StateDegraded},
-			cfg:    cdpCfg,
-			req:    RunAgentRequest{Source: "cron"},
-		},
-		{
-			name:   "watcher does not track because probe relaunch is skipped",
-			before: mcp.ServerHealth{State: mcp.StateDegraded},
-			cfg:    cdpCfg,
-			req:    RunAgentRequest{Source: "watcher"},
-		},
-		{
-			name:   "mcp does not track because probe relaunch is skipped",
-			before: mcp.ServerHealth{State: mcp.StateDegraded},
-			cfg:    cdpCfg,
-			req:    RunAgentRequest{Source: "mcp"},
-		},
-		{
-			name:   "healthy does not pretrack",
-			before: mcp.ServerHealth{State: mcp.StateHealthy},
-			cfg:    cdpCfg,
-			req:    RunAgentRequest{Source: "kocoro"},
-		},
-		{
-			name:   "keepalive true does not pretrack",
-			before: mcp.ServerHealth{State: mcp.StateDegraded},
-			cfg:    keepAliveCfg,
-			req:    RunAgentRequest{Source: "kocoro"},
-		},
-		{
-			name:   "non cdp does not pretrack",
-			before: mcp.ServerHealth{State: mcp.StateDegraded},
-			cfg:    stdioCfg,
-			req:    RunAgentRequest{Source: "kocoro"},
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldTrackPlaywrightProbeChromeBefore(tc.before, tc.cfg, tc.req); got != tc.want {
-				t.Fatalf("shouldTrackPlaywrightProbeChromeBefore() = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
 func TestShouldSkipPlaywrightProbeChromeRelaunch(t *testing.T) {
 	cdpCfg := mcp.MCPServerConfig{
 		Command: "playwright-mcp",
 		Args:    []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
 	}
 
-	skipSources := []string{"schedule", "heartbeat", "cron", "watcher", "mcp", "webhook"}
-	for _, src := range skipSources {
+	// Every source — attended (kocoro/desktop) and unattended — must skip the
+	// turn-start Chrome relaunch for CDP + keep_alive=false. A turn starting is
+	// not a signal that the turn needs the browser; Chrome launches on demand at
+	// tool dispatch (mcp_tool.go ensureChromeDebugPort). Relaunching here popped a
+	// blank Chrome window on every non-browser follow-up turn after the first
+	// browser use (Degraded steady state + transport re-registered by the
+	// capability probe defeated the IsConnected guard).
+	allSources := []string{"schedule", "heartbeat", "cron", "watcher", "mcp", "webhook", "kocoro", "desktop", ""}
+	for _, src := range allSources {
 		if !shouldSkipPlaywrightProbeChromeRelaunch(
 			mcp.ServerHealth{State: mcp.StateDegraded},
 			cdpCfg,
 			RunAgentRequest{Source: src},
 		) {
-			t.Fatalf("expected %q degraded CDP probe relaunch to be skipped", src)
+			t.Fatalf("expected %q degraded CDP keep_alive=false probe relaunch to be skipped", src)
 		}
 	}
 
+	// keep_alive=true still warms Chrome at turn start (not skipped).
+	keepAliveCfg := mcp.MCPServerConfig{
+		Command:   "playwright-mcp",
+		Args:      []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+		KeepAlive: true,
+	}
 	if shouldSkipPlaywrightProbeChromeRelaunch(
 		mcp.ServerHealth{State: mcp.StateDegraded},
-		cdpCfg,
+		keepAliveCfg,
 		RunAgentRequest{Source: "kocoro"},
 	) {
-		t.Fatal("interactive degraded CDP probe relaunch must not be skipped")
+		t.Fatal("keep_alive=true degraded CDP probe relaunch must not be skipped (warms Chrome)")
+	}
+}
+
+// TestPlaywrightTurnStartProbeAction walks the full turn-start decision matrix
+// (state × connected × CDP/keep_alive × source) so the whole preflight decision
+// — outer no-client guard AND the CDP keep_alive=false relaunch skip — is
+// validated, not just the shouldSkip sub-predicate. The invariant under test:
+// a turn starting never launches a visible Chrome window; only a browser-tool
+// invocation does.
+func TestPlaywrightTurnStartProbeAction(t *testing.T) {
+	cdpCfg := mcp.MCPServerConfig{
+		Command: "playwright-mcp",
+		Args:    []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+	}
+	cdpKeepAlive := cdpCfg
+	cdpKeepAlive.KeepAlive = true
+	stdioCfg := mcp.MCPServerConfig{Command: "playwright-mcp", Args: []string{"--headless"}}
+
+	cases := []struct {
+		name      string
+		state     mcp.HealthState
+		connected bool
+		cfg       mcp.MCPServerConfig
+		hasCfg    bool
+		source    string
+		want      playwrightTurnStartAction
+	}{
+		// The bug scenario: CDP keep_alive=false steady state after a browser
+		// turn — Degraded + transport re-registered (connected) — must NOT
+		// relaunch, attended or unattended.
+		{"degraded connected cdp attended kocoro", mcp.StateDegraded, true, cdpCfg, true, "kocoro", playwrightProbeSkipRelaunch},
+		{"degraded connected cdp attended desktop", mcp.StateDegraded, true, cdpCfg, true, "desktop", playwrightProbeSkipRelaunch},
+		{"degraded connected cdp attended empty", mcp.StateDegraded, true, cdpCfg, true, "", playwrightProbeSkipRelaunch},
+		{"degraded connected cdp unattended schedule", mcp.StateDegraded, true, cdpCfg, true, "schedule", playwrightProbeSkipRelaunch},
+		{"degraded connected cdp unattended webhook", mcp.StateDegraded, true, cdpCfg, true, "webhook", playwrightProbeSkipRelaunch},
+
+		// No live client: ProbeNow would reconnect+relaunch, so skip.
+		{"disconnected (user closed chrome)", mcp.StateDisconnected, false, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
+		{"disconnected even if connected flag set", mcp.StateDisconnected, true, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
+		{"degraded but not connected (post-discovery disconnect)", mcp.StateDegraded, false, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
+
+		// Probe runs: keep_alive=true warms Chrome; Healthy/non-CDP are
+		// health refreshes whose relaunch is a no-op.
+		{"degraded connected cdp keepalive warms chrome", mcp.StateDegraded, true, cdpKeepAlive, true, "kocoro", playwrightProbeRun},
+		{"healthy connected cdp refresh", mcp.StateHealthy, true, cdpCfg, true, "kocoro", playwrightProbeRun},
+		{"degraded connected non-cdp", mcp.StateDegraded, true, stdioCfg, true, "kocoro", playwrightProbeRun},
+		{"degraded connected but no cfg", mcp.StateDegraded, true, cdpCfg, false, "kocoro", playwrightProbeRun},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := playwrightTurnStartProbeAction(
+				mcp.ServerHealth{State: tc.state},
+				tc.connected,
+				tc.cfg,
+				tc.hasCfg,
+				RunAgentRequest{Source: tc.source},
+			)
+			if got != tc.want {
+				t.Fatalf("playwrightTurnStartProbeAction() = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 

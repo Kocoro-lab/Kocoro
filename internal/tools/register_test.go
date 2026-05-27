@@ -247,6 +247,94 @@ func TestRebuildRegistryForHealth_PlaywrightDisconnected(t *testing.T) {
 	}
 }
 
+func TestRebuildRegistryForHealth_PlaywrightDegraded(t *testing.T) {
+	baseline := agent.NewToolRegistry()
+	baseline.Register(&ThinkTool{})
+	baseline.Register(&BrowserTool{})
+
+	healthStates := map[string]mcp.ServerHealth{
+		"playwright": {State: mcp.StateDegraded},
+	}
+
+	mgr := mcp.NewClientManager()
+	// CDP + keep_alive=false is the only Degraded config whose tools stay exposed.
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command: "playwright-mcp",
+		Args:    []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+	})
+	mgr.SeedToolCache("playwright", []mcp.RemoteTool{
+		{ServerName: "playwright", Tool: mcpproto.Tool{Name: "browser_navigate"}},
+	})
+
+	reg := RebuildRegistryForHealth(baseline, nil, nil, healthStates, mgr, nil)
+	// Degraded (CDP + keep_alive=false steady state after a prior turn's
+	// on-demand teardown) keeps the cached Playwright tools exposed so the
+	// model can recover the browser on demand — invoking a browser tool
+	// relaunches Chrome via mcp_tool.go's pre-call ensureChromeDebugPort.
+	// Hiding them here is what forced the turn-start probe relaunch that
+	// popped a blank Chrome window on non-browser turns.
+	if _, ok := reg.Get("browser_navigate"); !ok {
+		t.Error("browser_navigate should be present from cache when degraded (on-demand recovery)")
+	}
+	// Legacy browser is removed when Playwright tools are present (even degraded).
+	if _, ok := reg.Get("browser"); ok {
+		t.Error("legacy browser should be removed when Playwright tools are present")
+	}
+}
+
+// TestRebuildRegistryForHealth_DegradedExposureScope locks in the narrow
+// contract: Degraded cached tools are exposed ONLY for Playwright in CDP mode
+// with keep_alive=false (the on-demand idle state). Every other Degraded server
+// — keep_alive=true playwright, non-CDP playwright, or any other server — stays
+// hidden so we never surface broken cached tools or strip the working legacy
+// browser fallback.
+func TestRebuildRegistryForHealth_DegradedExposureScope(t *testing.T) {
+	cdpCfg := mcp.MCPServerConfig{Command: "playwright-mcp", Args: []string{"--cdp-endpoint", "http://127.0.0.1:9223"}}
+	cdpKeepAlive := cdpCfg
+	cdpKeepAlive.KeepAlive = true
+	stdioCfg := mcp.MCPServerConfig{Command: "playwright-mcp", Args: []string{"--headless"}}
+
+	cases := []struct {
+		name        string
+		server      string
+		cfg         mcp.MCPServerConfig
+		toolName    string
+		wantExposed bool
+	}{
+		{"playwright cdp keepalive=false exposed", "playwright", cdpCfg, "browser_navigate", true},
+		{"playwright cdp keepalive=true hidden", "playwright", cdpKeepAlive, "browser_navigate", false},
+		{"playwright non-cdp hidden", "playwright", stdioCfg, "browser_navigate", false},
+		{"non-playwright degraded hidden", "other-mcp", mcp.MCPServerConfig{Command: "other-mcp"}, "other_tool", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			baseline := agent.NewToolRegistry()
+			baseline.Register(&ThinkTool{})
+			baseline.Register(&BrowserTool{})
+
+			mgr := mcp.NewClientManager()
+			mgr.SeedConfig(tc.server, tc.cfg)
+			mgr.SeedToolCache(tc.server, []mcp.RemoteTool{
+				{ServerName: tc.server, Tool: mcpproto.Tool{Name: tc.toolName}},
+			})
+			healthStates := map[string]mcp.ServerHealth{tc.server: {State: mcp.StateDegraded}}
+
+			reg := RebuildRegistryForHealth(baseline, nil, nil, healthStates, mgr, nil)
+			if _, exposed := reg.Get(tc.toolName); exposed != tc.wantExposed {
+				t.Fatalf("%s exposed=%v, want %v", tc.toolName, exposed, tc.wantExposed)
+			}
+			_, browserPresent := reg.Get("browser")
+			if tc.wantExposed {
+				if browserPresent && tc.toolName == "browser_navigate" {
+					t.Error("legacy browser should be removed when playwright tools are exposed")
+				}
+			} else if !browserPresent {
+				t.Error("legacy browser fallback should remain when degraded server tools are hidden")
+			}
+		})
+	}
+}
+
 func TestRebuildRegistryForHealth_GatewayAndPostOverlays(t *testing.T) {
 	baseline := agent.NewToolRegistry()
 	baseline.Register(&ThinkTool{})
