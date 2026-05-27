@@ -386,11 +386,12 @@ type ProactiveSender interface {
 }
 
 // broadcastReply forwards a successful schedule reply to every Cloud channel
-// mapped to the named agent (Slack / Lark / Telegram / …). No-op if any
-// precondition fails. Errors are logged, never propagated — the local
-// schedule lifecycle is intentionally decoupled from Cloud delivery.
+// mapped to the agent (Slack / Lark / Telegram / …). Empty agentName is
+// valid — it represents the default agent, and Cloud routes default-bound
+// channels via the COALESCE match on missing config->>'agent_name' keys.
+// Errors are logged, never propagated.
 func broadcastReply(ws ProactiveSender, scheduleID, agentName, reply, sessionID string) {
-	if ws == nil || agentName == "" || reply == "" {
+	if ws == nil || reply == "" {
 		return
 	}
 	if err := ws.SendProactive(agentName, reply, sessionID); err != nil {

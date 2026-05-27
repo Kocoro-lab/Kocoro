@@ -374,11 +374,11 @@ func TestBroadcastReply_Guards(t *testing.T) {
 			wantCall: false,
 		},
 		{
-			name:     "empty agent skips broadcast",
+			name:     "empty agent broadcasts (default agent path)",
 			ws:       &fakeProactiveSender{},
 			agent:    "",
 			reply:    "today's AI news: ...",
-			wantCall: false,
+			wantCall: true,
 		},
 		{
 			name:     "empty reply skips broadcast",
