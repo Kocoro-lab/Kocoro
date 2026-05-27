@@ -39,7 +39,8 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 			Description: "Create a scheduled task that runs an agent on a cron schedule. Supports full cron syntax (ranges, steps, lists). " +
 				"Storage: for a NAMED agent, every run appends turns to that agent's single ongoing session file (one file, growing). " +
 				"For the default agent, every run creates a brand-new session file under ~/.shannon/sessions/. " +
-				"Showing the user the results: when the user asks 'what did the schedule produce' or 'show me yesterday's run', do NOT instruct them to call session_search themselves — call session_search yourself and summarize the findings in your reply. The user is talking to you, not running shell commands." +
+				"Showing the user the results: when the user asks 'what did the schedule produce' or 'show me yesterday's run', do NOT instruct them to call session_search themselves — call session_search yourself and summarize the findings in your reply. The user is talking to you, not running shell commands. " +
+				"Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself." +
 				agent.DescriptionGuidance,
 			Parameters: map[string]any{
 				"type": "object",
@@ -73,14 +74,16 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 		}
 	case "list":
 		return agent.ToolInfo{
-			Name:        "schedule_list",
-			Description: "List all locally scheduled tasks with their status.",
-			Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+			Name: "schedule_list",
+			Description: "List all locally scheduled tasks with their status. " +
+				"Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself.",
+			Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
 		}
 	case "update":
 		return agent.ToolInfo{
 			Name: "schedule_update",
-			Description: "Update an existing scheduled task." +
+			Description: "Update an existing scheduled task. " +
+				"Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself." +
 				agent.DescriptionGuidance,
 			Parameters: map[string]any{
 				"type": "object",
@@ -101,7 +104,8 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 	case "remove":
 		return agent.ToolInfo{
 			Name: "schedule_remove",
-			Description: "Remove a scheduled task." +
+			Description: "Remove a scheduled task. " +
+				"Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself." +
 				agent.DescriptionGuidance,
 			Parameters: map[string]any{
 				"type": "object",
@@ -115,7 +119,8 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 	case "show":
 		return agent.ToolInfo{
 			Name: "schedule_show",
-			Description: "Show the most recent run of a scheduled task. Returns when it last fired plus a summary of the last assistant turns from that run. Use this when the user asks what a schedule produced (e.g. 'what did my daily report say' or 'show me the last run'); do not push the user to call session_search themselves." +
+			Description: "Show the most recent run of a scheduled task. Returns when it last fired plus a summary of the last assistant turns from that run. Use this when the user asks what a schedule produced (e.g. 'what did my daily report say' or 'show me the last run'); do not push the user to call session_search themselves. " +
+				"Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself." +
 				agent.DescriptionGuidance,
 			Parameters: map[string]any{
 				"type": "object",
