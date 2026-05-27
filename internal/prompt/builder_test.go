@@ -1091,3 +1091,21 @@ func TestBuildSystemPrompt_CommunicatingSection_ByteStableAcrossOutputFormat(t *
 		t.Fatalf("System must be byte-equal across OutputFormat values (D2). plain len=%d, markdown len=%d", len(plainParts), len(mdParts))
 	}
 }
+
+func TestSystemPrompt_IncludesIMDeliverySemantics(t *testing.T) {
+	// Locks in the IM-channel delivery contract added for issue #186 follow-up.
+	// If this string disappears, agents will resume suggesting Webhook+token
+	// workarounds when asked to "send to this Slack channel".
+	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
+
+	for _, want := range []string{
+		"## IM channel delivery",
+		"Cloud-distributed channel",
+		"you do NOT need any tool",
+		"OAuth-bound",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("system prompt missing IM-delivery phrase %q", want)
+		}
+	}
+}

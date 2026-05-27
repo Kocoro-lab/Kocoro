@@ -244,6 +244,24 @@ func buildStaticSystem(opts PromptOptions) string {
 	// in the user message (StableContext via BuildToolListing) to keep this
 	// system prompt byte-stable across users. See issue #107.
 
+	// 3.5. IM channel delivery semantics (stable — explains what the volatile
+	// Source/Channel/Sender values in sticky context mean for reply delivery).
+	// Without this, agents seeing Source: slack still look for a Slack-send
+	// tool and degrade to suggesting Webhook+token workarounds. See issue #186
+	// follow-up.
+	sb.WriteString("\n\n## IM channel delivery\n")
+	sb.WriteString("If the per-turn sticky context contains a `Source:` line whose " +
+		"value is a Cloud-distributed channel (slack, line, feishu, lark, wecom, " +
+		"telegram, webhook), your final assistant text reply is automatically " +
+		"delivered back to the originating channel by Kocoro Cloud — " +
+		"you do NOT need any tool, Webhook URL, or Bot Token to 'send' to the " +
+		"user, just write your reply as normal text.\n\n" +
+		"Scheduled tasks and heartbeat runs deliver their reply via the same " +
+		"Cloud broadcast path to every channel the named agent is OAuth-bound to. " +
+		"You cannot target an arbitrary different channel than the one the run " +
+		"is anchored to; if a user asks to post to a specific other channel, " +
+		"say it is not supported.")
+
 	// 4. macOS automation guidance (only on darwin with relevant tools)
 	if guidance := macOSAutomationGuidance(opts.LocalToolNames); guidance != "" {
 		sb.WriteString("\n\n")
