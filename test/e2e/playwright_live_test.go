@@ -2,10 +2,8 @@ package e2e
 
 import (
 	"context"
-	"net"
 	"os"
 	"runtime"
-	"strconv"
 	"testing"
 	"time"
 
@@ -36,8 +34,11 @@ import (
 // Gated by SHANNON_E2E_LIVE=1. Auto-skips when it can't run safely:
 //   - non-macOS (the dedicated-Chrome launch path is macOS-specific), or
 //   - Google Chrome isn't installed, or
-//   - the dedicated CDP port (9223) is already in use — most importantly when a
-//     real daemon is running, so this never disrupts a live daemon's browser.
+//   - the dedicated CDP port isn't in a clean state — i.e.
+//     ShouldPreflightDedicatedChrome is false because a daemon-owned Chrome is
+//     alive or the port is occupied. This is the SAME predicate production uses,
+//     so the skip both matches production loopback behavior and guarantees the
+//     test never tears down a browser it did not launch.
 //
 // Run it with the daemon stopped:  SHANNON_E2E_LIVE=1 go test ./test/e2e/ -run ChromeOnDemand -v
 func TestLive_Playwright_ChromeOnDemandLifecycle(t *testing.T) {
@@ -51,26 +52,33 @@ func TestLive_Playwright_ChromeOnDemandLifecycle(t *testing.T) {
 	}
 
 	const port = mcp.DefaultCDPPort // ShouldPreflightDedicatedChrome only arms on the default port.
-	if portInUse(port) {
-		t.Skipf("CDP port %d already in use (daemon running?) — skipping to avoid disrupting a live browser", port)
+
+	// Safety gate FIRST, before registering any teardown: only run from a clean
+	// state where nothing owns the dedicated CDP port. If it's not clean (daemon
+	// running, Chrome alive, or port occupied), SKIP — never fail — so we can
+	// never trigger a teardown of a browser this test did not launch.
+	if !mcp.ShouldPreflightDedicatedChrome(port) {
+		t.Skipf("CDP port %d not in a clean state (daemon running / Chrome alive / port occupied) — skipping to avoid disrupting a live browser", port)
 	}
 
-	// Always leave the machine clean, even on assertion failure.
+	// Only ever tear down Chrome that THIS test launched. Guarding cleanup on
+	// launchedByTest means an early t.Fatalf (before our own launch) can't kill
+	// someone else's Chrome.
+	launchedByTest := false
 	t.Cleanup(func() {
+		if !launchedByTest {
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		_ = mcp.StopCDPChromeAndWait(ctx)
 	})
 
-	// Precondition: nothing on the port, so a browser tool would (correctly) relaunch.
-	if !mcp.ShouldPreflightDedicatedChrome(port) {
-		t.Fatalf("precondition: ShouldPreflightDedicatedChrome(%d) = false, want true (no Chrome should be running)", port)
-	}
-
 	// 1) Browser turn: launch real Chrome on demand.
 	if err := mcp.EnsureChromeDebugPort(port); err != nil {
 		t.Fatalf("EnsureChromeDebugPort (initial launch): %v", err)
 	}
+	launchedByTest = true
 	if !waitFor(10*time.Second, func() bool { return mcp.IsChromeCDPReachable(port) }) {
 		t.Fatalf("Chrome CDP not reachable on port %d after launch", port)
 	}
@@ -100,16 +108,6 @@ func TestLive_Playwright_ChromeOnDemandLifecycle(t *testing.T) {
 	if !waitFor(10*time.Second, func() bool { return mcp.IsChromeCDPReachable(port) }) {
 		t.Fatalf("Chrome CDP not reachable on port %d after on-demand recovery", port)
 	}
-}
-
-// portInUse reports whether something is already listening on 127.0.0.1:port.
-func portInUse(port int) bool {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 300*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
 }
 
 func waitFor(timeout time.Duration, cond func() bool) bool {
