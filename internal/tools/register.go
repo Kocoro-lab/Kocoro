@@ -792,16 +792,20 @@ func ExtractPostOverlays(full, baseline *agent.ToolRegistry) []agent.Tool {
 }
 
 // RebuildRegistryForHealth creates a new registry from cached layers,
-// including tools from MCP servers. Healthy servers' tools work directly.
-// Disconnected AND Degraded servers with cached tools are included with an
-// on-demand reconnect capability (via supervisor) so the LLM can trigger
-// recovery only when it actually invokes a browser tool. Degraded is the
-// CDP + keep_alive=false steady state after a prior turn's on-demand Chrome
-// teardown (transport alive, Chrome dead) — keeping its tools exposed lets
-// mcp_tool.go's pre-call ensureChromeDebugPort relaunch Chrome on demand
-// instead of forcing the turn-start probe to pop a blank window. When
-// Playwright tools are present (healthy or cached), the legacy browser tool
-// is removed.
+// including tools from MCP servers. Exposure by health state:
+//   - Healthy: tools work directly.
+//   - Disconnected: tools exposed with on-demand reconnect (via supervisor) so
+//     the LLM triggers reconnect only when it actually invokes a tool.
+//   - Degraded: hidden by default — a failing capability probe means a tool
+//     call would surface a broken cached tool (and, for playwright, strip the
+//     working legacy fallback). The ONE exception is Playwright in CDP mode
+//     with keep_alive=false: there Degraded is the expected idle state after a
+//     prior turn's on-demand Chrome teardown, so its tools stay exposed with
+//     on-demand reconnect and mcp_tool.go's pre-call ensureChromeDebugPort
+//     relaunches Chrome when a browser tool is actually invoked.
+//
+// When Playwright tools are present (healthy or cached), the legacy browser
+// tool is removed.
 func RebuildRegistryForHealth(
 	baseline *agent.ToolRegistry,
 	gatewayOverlay []agent.Tool,
@@ -815,9 +819,30 @@ func RebuildRegistryForHealth(
 	playwrightPresent := false
 	if mcpMgr != nil {
 		for serverName, health := range healthStates {
-			if health.State != mcp.StateHealthy &&
-				health.State != mcp.StateDisconnected &&
-				health.State != mcp.StateDegraded {
+			// onDemandDegraded is the one narrow case where a Degraded server's
+			// cached tools stay exposed: Playwright in CDP mode with
+			// keep_alive=false, where Degraded is the expected idle state after a
+			// prior turn's on-demand Chrome teardown. Its tools recover on demand
+			// (mcp_tool.go ensureChromeDebugPort relaunches Chrome before the
+			// call) the moment the agent invokes a browser tool.
+			onDemandDegraded := false
+			switch health.State {
+			case mcp.StateHealthy, mcp.StateDisconnected:
+				// Healthy works directly; Disconnected is exposed with on-demand
+				// reconnect (handled below).
+			case mcp.StateDegraded:
+				// Any OTHER Degraded server (non-CDP playwright, keep_alive=true,
+				// or a future capability-probed server) stays hidden — exposing a
+				// server whose capability probe is failing would surface broken
+				// cached tools and, for playwright, strip the working fallback.
+				cfg, ok := mcpMgr.ConfigFor(serverName)
+				if ok && serverName == "playwright" && mcp.IsPlaywrightCDPMode(cfg) && !cfg.KeepAlive {
+					onDemandDegraded = true
+				} else {
+					continue
+				}
+			default:
+				// Unknown/future state — re-evaluate exposure rules before adding one.
 				continue
 			}
 			tools := mcpMgr.CachedTools(serverName)
@@ -826,10 +851,10 @@ func RebuildRegistryForHealth(
 					continue
 				}
 				mt := NewMCPTool(t.ServerName, t.Tool, mcpMgr)
-				// Disconnected/Degraded servers get the supervisor for on-demand
-				// reconnect: Chrome only relaunches when the LLM actually invokes
-				// a browser tool, never from the turn-start probe.
-				if (health.State == mcp.StateDisconnected || health.State == mcp.StateDegraded) && supervisor != nil {
+				// Disconnected and the scoped on-demand Degraded get the supervisor
+				// for on-demand reconnect: Chrome only relaunches when the LLM
+				// actually invokes a browser tool, never from the turn-start probe.
+				if (health.State == mcp.StateDisconnected || onDemandDegraded) && supervisor != nil {
 					mt.SetSupervisor(supervisor)
 				}
 				reg.Register(mt)
