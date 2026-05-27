@@ -748,6 +748,45 @@ type RunAgentUsage struct {
 	CostUSD      float64 `json:"cost_usd"`
 }
 
+// computeReportedUsage builds the per-run usage block emitted to lifecycle
+// observers (schedule_run, heartbeat callers). Prefers the handler's
+// accumulator snapshot when the handler is a UsageProvider AND has recorded
+// any LLM or tool spend — that snapshot folds in nested cloud_delegate spend
+// and gateway tool billing that the loop's own TurnUsage misses.
+//
+// Used by both the success path (post-final-LLM) and the hard-error path
+// (after an intermediate LLM call has already incurred cost). Keeping a
+// single resolver guarantees the failed schedule_run event reports the same
+// tokens/cost the success event would have reported up to the point of
+// failure — otherwise the failed-run case looks free when it isn't.
+//
+// nil-safe on usage so the hard-error path can call it even if loop.Run
+// returned (nil, nil, err) before producing a TurnUsage.
+func computeReportedUsage(usage *agent.TurnUsage, handler agent.EventHandler) RunAgentUsage {
+	var reported RunAgentUsage
+	if usage != nil {
+		reported = RunAgentUsage{
+			InputTokens:  usage.InputTokens,
+			OutputTokens: usage.OutputTokens,
+			TotalTokens:  usage.TotalTokens,
+			CostUSD:      usage.CostUSD,
+		}
+	}
+	if up, ok := handler.(agent.UsageProvider); ok {
+		acc := up.Usage()
+		llm := acc.LLM
+		if llm.LLMCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 || acc.ToolCostUSD > 0 {
+			reported = RunAgentUsage{
+				InputTokens:  llm.InputTokens,
+				OutputTokens: llm.OutputTokens,
+				TotalTokens:  llm.TotalTokens,
+				CostUSD:      llm.CostUSD + acc.ToolCostUSD,
+			}
+		}
+	}
+	return reported
+}
+
 // ServerDeps holds shared dependencies required by both the WS callback
 // and the HTTP server for running agent loops.
 type ServerDeps struct {
@@ -2074,9 +2113,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// even when the LLM call hard-errored. Production callers (cmd/daemon.go
 		// and heartbeat.go) gate on err first and never deref result on error,
 		// so this is a wire-safe upgrade.
+		//
+		// Usage uses the same resolver as the success path so a turn that
+		// spent tokens before failing on a later LLM call doesn't report
+		// $0 / 0 tokens in the failed schedule_run event.
 		return &RunAgentResult{
 			SessionID:         savedSessionID,
 			Agent:             agentName,
+			Usage:             computeReportedUsage(usage, handler),
 			FailureCode:       status.FailureCode,
 			MessageStartIndex: turnBase.msgCount,
 			MessageEndIndex:   len(sess.Messages),
@@ -2260,24 +2304,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// spend) for the model token fields. Tool billing rolls into CostUSD
 	// on top of LLM cost but never into the token fields, so
 	// input_tokens+output_tokens==total_tokens stays true for API consumers.
-	reportedUsage := RunAgentUsage{
-		InputTokens:  usage.InputTokens,
-		OutputTokens: usage.OutputTokens,
-		TotalTokens:  usage.TotalTokens,
-		CostUSD:      usage.CostUSD,
-	}
-	if up, ok := handler.(agent.UsageProvider); ok {
-		acc := up.Usage()
-		llm := acc.LLM
-		if llm.LLMCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 || acc.ToolCostUSD > 0 {
-			reportedUsage = RunAgentUsage{
-				InputTokens:  llm.InputTokens,
-				OutputTokens: llm.OutputTokens,
-				TotalTokens:  llm.TotalTokens,
-				CostUSD:      llm.CostUSD + acc.ToolCostUSD,
-			}
-		}
-	}
+	// Resolver shared with the hard-error path so the two stay byte-equal.
+	reportedUsage := computeReportedUsage(usage, handler)
 	log.Printf("daemon: reply to %s (%d tokens, $%.4f)", agentName, reportedUsage.TotalTokens, reportedUsage.CostUSD)
 
 	// On save failure, blank SessionID so HTTP/SSE clients can't click through

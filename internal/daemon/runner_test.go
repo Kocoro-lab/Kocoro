@@ -1537,4 +1537,110 @@ func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
 	if res.MessageEndIndex < res.MessageStartIndex {
 		t.Errorf("indices invariant violated: end %d < start %d", res.MessageEndIndex, res.MessageStartIndex)
 	}
+	// Baseline: always-500 gateway never lets an LLM call succeed AND
+	// nullEventHandler does not implement UsageProvider, so partial Usage
+	// must be the zero value. The companion test PreservesAccumulatedUsage
+	// covers the path where prior calls succeeded before a later hard error.
+	if res.Usage != (RunAgentUsage{}) {
+		t.Errorf("partial Usage on never-succeeded run = %+v, want zero", res.Usage)
+	}
+}
+
+// fakeUsageHandler implements agent.UsageProvider on top of nullEventHandler,
+// letting unit tests pass an accumulator snapshot directly into the helper.
+// Inside RunAgent the handler is wrapped in multiHandler (runner.go:1595),
+// which drops the UsageProvider implementation — so integration-level
+// validation of that branch lives here in the helper test rather than in
+// a RunAgent end-to-end test that would silently take the fallback path.
+type fakeUsageHandler struct {
+	nullEventHandler
+	snapshot agent.AccumulatedUsage
+}
+
+func (h fakeUsageHandler) Usage() agent.AccumulatedUsage { return h.snapshot }
+
+// TestComputeReportedUsage covers the resolver shared by RunAgent's success
+// path and the partial-result hard-error path (GPT review P2). The hard
+// error path used to bypass this helper and return Usage zero even when
+// intermediate LLM calls had incurred cost — that's the regression these
+// cases lock in.
+func TestComputeReportedUsage(t *testing.T) {
+	t.Run("nil_usage_and_plain_handler_returns_zero", func(t *testing.T) {
+		// Hard-error path before any LLM call could populate TurnUsage
+		// AND the production handler doesn't expose UsageProvider —
+		// reported usage is the zero value, which is fine to emit on
+		// the failed schedule_run event.
+		got := computeReportedUsage(nil, nullEventHandler{})
+		if got != (RunAgentUsage{}) {
+			t.Errorf("got %+v, want zero RunAgentUsage", got)
+		}
+	})
+
+	t.Run("turn_usage_preserved_when_no_accumulator", func(t *testing.T) {
+		// Hard-error path AFTER a successful intermediate LLM call —
+		// loop.Run returned a non-nil TurnUsage with spent tokens.
+		// The partial result must carry those tokens (the GPT review's
+		// motivating scenario).
+		turn := &agent.TurnUsage{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+			CostUSD:      0.0001,
+		}
+		want := RunAgentUsage{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+			CostUSD:      0.0001,
+		}
+		got := computeReportedUsage(turn, nullEventHandler{})
+		if got != want {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("accumulator_overrides_turn_usage", func(t *testing.T) {
+		// When the handler is a UsageProvider AND has recorded spend,
+		// it wins — the accumulator folds in cloud_delegate nested
+		// spend that loop.Run's TurnUsage doesn't see. ToolCostUSD
+		// adds onto CostUSD without touching the token fields so
+		// input+output==total stays explainable.
+		handler := fakeUsageHandler{
+			snapshot: agent.AccumulatedUsage{
+				LLM: agent.TurnUsage{
+					InputTokens:  100,
+					OutputTokens: 200,
+					TotalTokens:  300,
+					CostUSD:      0.01,
+					LLMCalls:     2,
+				},
+				ToolCostUSD: 0.001,
+			},
+		}
+		// Loop-level usage is also non-zero; accumulator should still win.
+		turn := &agent.TurnUsage{InputTokens: 5, OutputTokens: 6, TotalTokens: 11, CostUSD: 0.0002}
+		want := RunAgentUsage{
+			InputTokens:  100,
+			OutputTokens: 200,
+			TotalTokens:  300,
+			CostUSD:      0.011, // 0.01 LLM + 0.001 tool
+		}
+		got := computeReportedUsage(turn, handler)
+		if got != want {
+			t.Errorf("got %+v, want %+v (accumulator must override loop-level usage)", got, want)
+		}
+	})
+
+	t.Run("empty_accumulator_falls_back_to_turn_usage", func(t *testing.T) {
+		// Handler implements UsageProvider but the accumulator is empty
+		// (the gating LLMCalls > 0 etc. clause means we keep the loop
+		// usage instead of zeroing the result).
+		handler := fakeUsageHandler{snapshot: agent.AccumulatedUsage{}}
+		turn := &agent.TurnUsage{InputTokens: 7, OutputTokens: 8, TotalTokens: 15, CostUSD: 0.0003}
+		want := RunAgentUsage{InputTokens: 7, OutputTokens: 8, TotalTokens: 15, CostUSD: 0.0003}
+		got := computeReportedUsage(turn, handler)
+		if got != want {
+			t.Errorf("got %+v, want %+v (empty accumulator must not clobber turn usage)", got, want)
+		}
+	})
 }
