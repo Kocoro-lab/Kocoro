@@ -705,3 +705,59 @@ func TestClient_DeliveryAck_SentAfterReplySuccess(t *testing.T) {
 		t.Fatal("daemon never sent delivery_ack")
 	}
 }
+
+// TestSendProactive_AllowsEmptyAgentName guards the cross-repo contract with
+// shannon-cloud: default-agent schedules need to broadcast and the daemon must
+// pass empty AgentName through to Cloud, which (post-Cloud-update) routes to
+// default-bound channels via the COALESCE SQL match. The pre-fix daemon
+// silently dropped these messages at the `if agentName == ""` guard before
+// they ever hit the wire.
+func TestSendProactive_AllowsEmptyAgentName(t *testing.T) {
+	var captured DaemonMessage
+	c := &Client{
+		envelopeSender: func(m DaemonMessage) error {
+			captured = m
+			return nil
+		},
+	}
+
+	if err := c.SendProactive("", "hello from default", "sess-1"); err != nil {
+		t.Fatalf("SendProactive returned error: %v", err)
+	}
+	if captured.Type != MsgTypeProactive {
+		t.Fatalf("want MsgTypeProactive, got %q (SendProactive silently dropped the message)", captured.Type)
+	}
+
+	var got ProactivePayload
+	if err := json.Unmarshal(captured.Payload, &got); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if got.AgentName != "" {
+		t.Errorf("want AgentName='' on wire, got %q", got.AgentName)
+	}
+	if got.Text != "hello from default" {
+		t.Errorf("text mismatch: %q", got.Text)
+	}
+	if got.SessionID != "sess-1" {
+		t.Errorf("session id mismatch: %q", got.SessionID)
+	}
+}
+
+// TestSendProactive_StillDropsEmptyText confirms empty text is still rejected
+// — that's a real bug class (silent agent push). Only the agent-name half of
+// the original guard moves; text-empty stays an early return.
+func TestSendProactive_StillDropsEmptyText(t *testing.T) {
+	called := false
+	c := &Client{
+		envelopeSender: func(DaemonMessage) error {
+			called = true
+			return nil
+		},
+	}
+	if err := c.SendProactive("named-agent", "", "sess-2"); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if called {
+		t.Error("envelopeSender should not have been called for empty Text")
+	}
+}
