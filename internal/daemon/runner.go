@@ -1428,6 +1428,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			sessMgr.NewSessionWithID(req.SessionID)
 		}
 	case req.SessionID != "":
+		// Stamp the route before Resume (which does disk IO) so a concurrent
+		// DELETE/RESET on this id observes the binding: CancelBySessionID can
+		// cancel this run and ClearSessionBindings can wait on it, instead of
+		// racing the late storeSessionID below and leaving a stale binding.
+		if route != nil {
+			route.storeSessionID(req.SessionID)
+		}
 		// Resume a specific session by ID (reuses cached manager to avoid DB handle leak).
 		if _, err := sessMgr.Resume(req.SessionID); err != nil {
 			return nil, fmt.Errorf("session not found: %s", req.SessionID)
