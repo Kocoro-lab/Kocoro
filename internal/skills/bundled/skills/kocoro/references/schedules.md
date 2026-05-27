@@ -2,7 +2,7 @@
 
 ## What is this?
 
-Schedules are automated tasks that run on a cron schedule without any human interaction. You define a prompt (what to do), a cron expression (when to do it), and optionally which agent to use. Shannon runs the task at the scheduled time, executes any tool calls automatically, and delivers the reply: to Kocoro Desktop always, and to every Cloud channel (Slack / Lark / Telegram / WeCom / Feishu) the named agent is OAuth-bound to.
+Schedules are automated tasks that run on a cron schedule without any human interaction. You define a prompt (what to do), a cron expression (when to do it), and optionally which agent to use. Shannon runs the task at the scheduled time, executes any tool calls automatically, and delivers the reply: to Kocoro Desktop always, and to every Cloud channel (Slack / Lark / Telegram / WeCom / Feishu) the agent — named or default — is OAuth-bound to.
 
 ## API Endpoints
 
@@ -89,7 +89,7 @@ Format: `minute hour day-of-month month day-of-week`
 - **Runs without interaction**: Scheduled tasks execute automatically and unattended. The agent will use tools without asking for approval. Make sure your prompt is specific enough that the agent knows what to do without needing clarification.
 - **Disable vs delete**: Prefer disabling (PATCH with `enabled: false`) over deleting if you might want the schedule again. Deletion is permanent.
 - **Agent selection**: If no agent is specified, the default agent runs the task. Specify an agent if you need specific tools, instructions, or memory.
-- **Output destinations**: Successful runs are delivered to (a) the local session JSON, (b) Kocoro Desktop via the `schedule_run` SSE event, and (c) **every Cloud channel the agent is OAuth-bound to** (Slack / Lark / Telegram / WeCom / Feishu). The Cloud-channel broadcast applies only when the schedule names a specific agent (`agent` field set) and the reply is non-empty. The default agent has no Cloud channel mapping, so its runs stay local.
+- **Output destinations**: Successful runs are delivered to (a) the local session JSON, (b) Kocoro Desktop via the `schedule_run` SSE event, and (c) **every Cloud channel the agent is OAuth-bound to** (Slack / Lark / Telegram / WeCom / Feishu). The agent identity here is the same one running the schedule — named agent (`agent` field set) or default agent (`agent` field empty). Both bind to channels via the same Cloud mechanism; if the originating Slack/IM channel is bound to the default agent, schedules created in that conversation broadcast back to that channel automatically.
 - **Diagnostic logs**: For debugging, also see `~/.shannon/logs/schedule-{id}.log` (per-schedule run log) and `~/.shannon/logs/audit.log` (cross-cutting tool-call timeline).
 - **Time zone**: Cron expressions use the system time zone of the machine running the Shannon daemon.
 - **Overlapping runs**: If a scheduled task is still running when the next scheduled time arrives, the new run is skipped to prevent overlap.
