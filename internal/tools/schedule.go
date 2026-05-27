@@ -54,8 +54,13 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 					"agent": map[string]any{
 						"type": "string",
 						"description": "Agent name (from ~/.shannon/agents/). " +
-							"When the user is creating a schedule from inside a conversation with a named agent (e.g. they are talking to 'analyst' and ask to schedule a daily report), pass that agent's name so future runs use the same persona AND so the user can find the results via session_search inside that same agent. " +
-							"Pass an empty string only when the user explicitly wants the default agent (rare); each run will land in the global ~/.shannon/sessions/ pool and won't be visible to your session_search.",
+							"When you're handling a conversation as a named agent (sticky context shows `Agent: <name>`), " +
+							"pass that name so future runs use the same persona AND the user can find results via session_search inside the same agent. " +
+							"When you're handling a conversation as the default agent (sticky context shows `Agent: default`), " +
+							"pass an empty string — runs will execute under the default agent identity, results land in the global " +
+							"~/.shannon/sessions/ pool, and the reply broadcasts to whichever channels Cloud has bound to the default agent " +
+							"(including the current Slack/IM channel if that's how this conversation reached you). " +
+							"Treat default and named agents symmetrically — neither is 'rare', the choice follows the current conversation identity.",
 					},
 					"cron": map[string]any{"type": "string", "description": "5-field cron expression (minute hour day month weekday). Supports */5, 1-5, 1,3,5."},
 					"prompt": map[string]any{
