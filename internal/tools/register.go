@@ -793,10 +793,15 @@ func ExtractPostOverlays(full, baseline *agent.ToolRegistry) []agent.Tool {
 
 // RebuildRegistryForHealth creates a new registry from cached layers,
 // including tools from MCP servers. Healthy servers' tools work directly.
-// Disconnected servers with cached tools are included with an on-demand
-// reconnect capability (via supervisor) so the LLM can trigger reconnect
-// only when it actually invokes a browser tool. When Playwright tools are
-// present (healthy or cached), the legacy browser tool is removed.
+// Disconnected AND Degraded servers with cached tools are included with an
+// on-demand reconnect capability (via supervisor) so the LLM can trigger
+// recovery only when it actually invokes a browser tool. Degraded is the
+// CDP + keep_alive=false steady state after a prior turn's on-demand Chrome
+// teardown (transport alive, Chrome dead) — keeping its tools exposed lets
+// mcp_tool.go's pre-call ensureChromeDebugPort relaunch Chrome on demand
+// instead of forcing the turn-start probe to pop a blank window. When
+// Playwright tools are present (healthy or cached), the legacy browser tool
+// is removed.
 func RebuildRegistryForHealth(
 	baseline *agent.ToolRegistry,
 	gatewayOverlay []agent.Tool,
@@ -810,7 +815,9 @@ func RebuildRegistryForHealth(
 	playwrightPresent := false
 	if mcpMgr != nil {
 		for serverName, health := range healthStates {
-			if health.State != mcp.StateHealthy && health.State != mcp.StateDisconnected {
+			if health.State != mcp.StateHealthy &&
+				health.State != mcp.StateDisconnected &&
+				health.State != mcp.StateDegraded {
 				continue
 			}
 			tools := mcpMgr.CachedTools(serverName)
@@ -819,9 +826,10 @@ func RebuildRegistryForHealth(
 					continue
 				}
 				mt := NewMCPTool(t.ServerName, t.Tool, mcpMgr)
-				// Disconnected servers get the supervisor for on-demand reconnect:
-				// Chrome only relaunches when the LLM actually invokes a browser tool.
-				if health.State == mcp.StateDisconnected && supervisor != nil {
+				// Disconnected/Degraded servers get the supervisor for on-demand
+				// reconnect: Chrome only relaunches when the LLM actually invokes
+				// a browser tool, never from the turn-start probe.
+				if (health.State == mcp.StateDisconnected || health.State == mcp.StateDegraded) && supervisor != nil {
 					mt.SetSupervisor(supervisor)
 				}
 				reg.Register(mt)

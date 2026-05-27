@@ -247,6 +247,36 @@ func TestRebuildRegistryForHealth_PlaywrightDisconnected(t *testing.T) {
 	}
 }
 
+func TestRebuildRegistryForHealth_PlaywrightDegraded(t *testing.T) {
+	baseline := agent.NewToolRegistry()
+	baseline.Register(&ThinkTool{})
+	baseline.Register(&BrowserTool{})
+
+	healthStates := map[string]mcp.ServerHealth{
+		"playwright": {State: mcp.StateDegraded},
+	}
+
+	mgr := mcp.NewClientManager()
+	mgr.SeedToolCache("playwright", []mcp.RemoteTool{
+		{ServerName: "playwright", Tool: mcpproto.Tool{Name: "browser_navigate"}},
+	})
+
+	reg := RebuildRegistryForHealth(baseline, nil, nil, healthStates, mgr, nil)
+	// Degraded (CDP + keep_alive=false steady state after a prior turn's
+	// on-demand teardown) keeps the cached Playwright tools exposed so the
+	// model can recover the browser on demand — invoking a browser tool
+	// relaunches Chrome via mcp_tool.go's pre-call ensureChromeDebugPort.
+	// Hiding them here is what forced the turn-start probe relaunch that
+	// popped a blank Chrome window on non-browser turns.
+	if _, ok := reg.Get("browser_navigate"); !ok {
+		t.Error("browser_navigate should be present from cache when degraded (on-demand recovery)")
+	}
+	// Legacy browser is removed when Playwright tools are present (even degraded).
+	if _, ok := reg.Get("browser"); ok {
+		t.Error("legacy browser should be removed when Playwright tools are present")
+	}
+}
+
 func TestRebuildRegistryForHealth_GatewayAndPostOverlays(t *testing.T) {
 	baseline := agent.NewToolRegistry()
 	baseline.Register(&ThinkTool{})
