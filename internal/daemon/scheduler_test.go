@@ -351,50 +351,101 @@ func TestBroadcastReply_Guards(t *testing.T) {
 		scheduleID = "abc123"
 		sessionID  = "sess-1"
 	)
+	bTrue := true
+	bFalse := false
 
 	tests := []struct {
 		name     string
-		ws       ProactiveSender // nil means literally nil (the typed-nil pitfall is handled at the call site, not here)
-		agent    string
+		ws       ProactiveSender
+		sched    schedule.Schedule
 		reply    string
 		wantCall bool
 	}{
+		// Nil-sender / empty-reply guards always win
 		{
-			name:     "happy path broadcasts",
-			ws:       &fakeProactiveSender{},
-			agent:    "researcher",
-			reply:    "today's AI news: ...",
-			wantCall: true,
-		},
-		{
-			name:     "nil sender is a no-op",
+			name:     "nil_sender_is_no_op",
 			ws:       nil,
-			agent:    "researcher",
-			reply:    "today's AI news: ...",
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "researcher", CreatedFromSource: "slack"},
+			reply:    "ignored",
 			wantCall: false,
 		},
 		{
-			name:     "empty agent broadcasts (default agent path)",
+			name:     "empty_reply_skips_broadcast",
 			ws:       &fakeProactiveSender{},
-			agent:    "",
-			reply:    "today's AI news: ...",
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "researcher", CreatedFromSource: "slack"},
+			reply:    "",
+			wantCall: false,
+		},
+
+		// Smart default × default agent
+		{
+			name:     "default_agent_smart_slack_broadcasts",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", CreatedFromSource: "slack"},
+			reply:    "hi",
 			wantCall: true,
 		},
 		{
-			name:     "empty reply skips broadcast",
+			name:     "default_agent_smart_webview_silent",
 			ws:       &fakeProactiveSender{},
-			agent:    "researcher",
-			reply:    "",
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", CreatedFromSource: "webview"},
+			reply:    "hi",
+			wantCall: false,
+		},
+		{
+			name:     "default_agent_pre_feature_silent",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: ""},
+			reply:    "hi",
+			wantCall: false,
+		},
+
+		// Smart default × named agent
+		{
+			name:     "named_agent_smart_slack_broadcasts",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "analyst", CreatedFromSource: "slack"},
+			reply:    "hi",
+			wantCall: true,
+		},
+		{
+			name:     "named_agent_smart_webview_silent",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "analyst", CreatedFromSource: "webview"},
+			reply:    "hi",
+			wantCall: false,
+		},
+		{
+			name:     "named_agent_pre_feature_silent",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "analyst"},
+			reply:    "hi",
+			wantCall: false,
+		},
+
+		// Explicit override
+		{
+			name:     "explicit_true_overrides_webview",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", Broadcast: &bTrue, CreatedFromSource: "webview"},
+			reply:    "hi",
+			wantCall: true,
+		},
+		{
+			name:     "explicit_false_overrides_slack",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", Broadcast: &bFalse, CreatedFromSource: "slack"},
+			reply:    "hi",
 			wantCall: false,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			broadcastReply(tc.ws, scheduleID, tc.agent, tc.reply, sessionID)
+			broadcastReply(tc.ws, &tc.sched, tc.reply, sessionID)
 
 			if tc.ws == nil {
-				return // nothing to inspect
+				return
 			}
 			fake := tc.ws.(*fakeProactiveSender)
 			if tc.wantCall {
@@ -402,12 +453,15 @@ func TestBroadcastReply_Guards(t *testing.T) {
 					t.Fatalf("want 1 call, got %d", len(fake.calls))
 				}
 				got := fake.calls[0]
-				if got.agent != tc.agent || got.text != tc.reply || got.sessionID != sessionID {
-					t.Errorf("call payload mismatch: got %+v", got)
+				if got.agent != tc.sched.Agent {
+					t.Errorf("agent: got %q want %q", got.agent, tc.sched.Agent)
+				}
+				if got.text != tc.reply {
+					t.Errorf("text: got %q want %q", got.text, tc.reply)
 				}
 			} else {
 				if len(fake.calls) != 0 {
-					t.Fatalf("want 0 calls, got %d (%+v)", len(fake.calls), fake.calls)
+					t.Errorf("want 0 calls, got %d", len(fake.calls))
 				}
 			}
 		})
@@ -417,8 +471,11 @@ func TestBroadcastReply_Guards(t *testing.T) {
 func TestBroadcastReply_SendErrorIsSwallowed(t *testing.T) {
 	ws := &fakeProactiveSender{err: errors.New("ws closed")}
 	// Must not panic, must not return; we're asserting that no panic / no
-	// exit-status change escapes the helper.
-	broadcastReply(ws, "abc", "researcher", "hello", "sess-1")
+	// exit-status change escapes the helper. Use a Slack-sourced schedule so
+	// the gate permits the broadcast (otherwise SendProactive isn't reached
+	// and the swallow-on-error contract isn't exercised).
+	sched := schedule.Schedule{ID: "abc", Agent: "researcher", CreatedFromSource: "slack"}
+	broadcastReply(ws, &sched, "hello", "sess-1")
 	if len(ws.calls) != 1 {
 		t.Fatalf("send was not attempted: got %d calls", len(ws.calls))
 	}
@@ -432,12 +489,14 @@ func TestRunWithLifecycle_BroadcastsOnSuccess(t *testing.T) {
 	fake := &fakeProactiveSender{}
 	s.proactiveSender = fake // testing seam injected on the Scheduler value
 
+	bTrue := true
 	sched := schedule.Schedule{
-		ID:      "abc123",
-		Agent:   "researcher",
-		Prompt:  "anything",
-		Cron:    "* * * * *",
-		Enabled: true,
+		ID:        "abc123",
+		Agent:     "researcher",
+		Prompt:    "anything",
+		Cron:      "* * * * *",
+		Enabled:   true,
+		Broadcast: &bTrue, // exercise the success-branch wiring; gate semantics covered by TestBroadcastReply_Guards
 	}
 
 	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {

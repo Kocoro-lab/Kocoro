@@ -284,7 +284,7 @@ func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAge
 		ws = s.deps.WSClient
 	}
 	if result != nil {
-		broadcastReply(ws, sched.ID, sched.Agent, result.Reply, result.SessionID)
+		broadcastReply(ws, &sched, result.Reply, result.SessionID)
 	}
 }
 
@@ -386,15 +386,18 @@ type ProactiveSender interface {
 }
 
 // broadcastReply forwards a successful schedule reply to every Cloud channel
-// mapped to the agent (Slack / Lark / Telegram / …). Empty agentName is
-// valid — it represents the default agent, and Cloud routes default-bound
-// channels via the COALESCE match on missing config->>'agent_name' keys.
+// mapped to the agent when the broadcast gate permits it. The gate uses
+// shouldBroadcast(sched) which combines explicit Broadcast override with a
+// smart default based on Schedule.CreatedFromSource. See broadcast_gate.go.
 // Errors are logged, never propagated.
-func broadcastReply(ws ProactiveSender, scheduleID, agentName, reply, sessionID string) {
-	if ws == nil || reply == "" {
+func broadcastReply(ws ProactiveSender, sched *schedule.Schedule, reply, sessionID string) {
+	if ws == nil || sched == nil || reply == "" {
 		return
 	}
-	if err := ws.SendProactive(agentName, reply, sessionID); err != nil {
-		log.Printf("scheduler: proactive send failed for schedule %s: %v", scheduleID, err)
+	if !shouldBroadcast(sched) {
+		return
+	}
+	if err := ws.SendProactive(sched.Agent, reply, sessionID); err != nil {
+		log.Printf("scheduler: proactive send failed for schedule %s: %v", sched.ID, err)
 	}
 }
