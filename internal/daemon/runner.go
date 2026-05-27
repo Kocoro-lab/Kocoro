@@ -1950,6 +1950,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// that agent (keeping results reachable via session_search inside the
 	// same agent) instead of silently routing to the default agent's pool.
 	loop.SetAgentName(agentName)
+	// Per-call originating source. Tools that capture this (schedule_create)
+	// use it as the smart-default signal for broadcast intent. See
+	// docs/superpowers/specs/2026-05-27-schedule-broadcast-gate-design.md.
+	loop.SetSource(req.Source)
 	loop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)
 	// Inject the per-session ReadTracker so file_read dedup history persists
 	// across the per-message AgentLoop instances created here. nil-safe: an
