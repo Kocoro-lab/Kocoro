@@ -132,8 +132,9 @@ func TestWalkthrough_ScheduleContext(t *testing.T) {
 	}
 
 	args, _ := json.Marshal(map[string]any{
-		"cron":   "0 9 * * 1-5",
-		"prompt": "Check staging deploy health and alert on anomalies.",
+		"cron":        "0 9 * * 1-5",
+		"prompt":      "Check staging deploy health and alert on anomalies.",
+		"description": "create weekday staging-deploy health schedule",
 	})
 	result, err := createTool.Run(ctx, string(args))
 	if err != nil {
