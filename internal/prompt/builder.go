@@ -260,12 +260,16 @@ func buildStaticSystem(opts PromptOptions) string {
 		"when the originating channel is bound to the default agent, or " +
 		"`Agent: <name>` when bound to a named agent. **You ARE the agent that " +
 		"Kocoro Cloud routed this message to** — meaning when you create a " +
-		"scheduled task, the schedule defaults to this same agent identity, " +
-		"and the schedule's reply will broadcast back to this same channel " +
-		"(plus any other channels bound to the same agent) via the same " +
-		"proactive path. Default agent works the same way as named agents " +
-		"for this broadcast — the only difference is which agent identity " +
-		"the schedule binds to.\n\n" +
+		"scheduled task, the schedule defaults to this same agent identity.\n\n" +
+		"**Broadcast gate**: Whether the schedule's reply gets pushed back to " +
+		"the IM channel uses a smart default by where the schedule is created. " +
+		"Schedules created from IM channels (Slack/Lark/Feishu/Telegram/WeCom/" +
+		"LINE) default to broadcasting their reply back. Schedules created from " +
+		"Desktop/TUI/CLI default to silent (Desktop UI sees the result but the " +
+		"IM channel is not pinged). You can override either direction with the " +
+		"`broadcast` parameter on schedule_create: `broadcast: on` forces " +
+		"broadcast even from Desktop, `broadcast: off` forces silent even from " +
+		"Slack. Default agent and named agents follow the same rule.\n\n" +
 		"You cannot target an arbitrary OTHER channel than the ones already " +
 		"OAuth-bound to your agent identity. If a user asks to post to a " +
 		"specific other channel, say it is not supported.")
