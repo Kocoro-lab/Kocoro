@@ -1875,26 +1875,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		loop.SetModelTier(req.ModelOverride)
 	}
 	// Inject session metadata as sticky context so it survives compaction.
-	{
-		var parts []string
-		if req.Source != "" {
-			parts = append(parts, "Source: "+req.Source)
-		}
-		if req.Channel != "" {
-			parts = append(parts, "Channel: "+req.Channel)
-		}
-		if req.Sender != "" {
-			parts = append(parts, "Sender: "+req.Sender)
-		}
-		if agentName != "" {
-			parts = append(parts, "Agent: "+agentName)
-		}
-		if req.StickyContext != "" {
-			parts = append(parts, req.StickyContext)
-		}
-		if len(parts) > 0 {
-			loop.SetStickyContext(strings.Join(parts, "\n"))
-		}
+	if sticky := buildStickyContext(req.Source, req.Channel, req.Sender, agentName, req.StickyContext); sticky != "" {
+		loop.SetStickyContext(sticky)
 	}
 
 	// Output format: cloud-distributed channels use "plain" (Shannon Cloud
