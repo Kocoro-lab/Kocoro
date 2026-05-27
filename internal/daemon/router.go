@@ -706,12 +706,13 @@ func (sc *SessionCache) CancelBySessionID(sessionID string) {
 // that was reset or deleted. Persisted index rows are cleared by the session
 // store; this prevents the live daemon cache from resurrecting the old link.
 //
-// Two-phase locking: snapshot route entry pointers under sc.mu, then take
-// each entry.mu so the clear blocks until any active run on a matching
-// route finishes — matches the user expectation that "clear" really
-// clears, even if the runner's defer would otherwise re-stamp sessionID
-// after we cleared it. The actual sessionID load/store is atomic, but we
-// keep the entry.mu acquire for ordering with the runner's defer.
+// Two-phase locking: snapshot route entry pointers under sc.mu, then for each
+// entry pre-check the lock-free atomic sessionID and only take entry.mu when it
+// matches. A non-matching route (e.g. a different session mid-run) holds its
+// entry.mu for the entire run, so locking every entry unconditionally would
+// block this clear behind an unrelated active run until upstream HTTP timeout.
+// Matching routes still acquire entry.mu to order with the runner's defer that
+// re-stamps sessionID, then re-confirm under the lock before clearing.
 func (sc *SessionCache) ClearSessionBindings(sessionID string) {
 	if sessionID == "" {
 		return
@@ -725,6 +726,9 @@ func (sc *SessionCache) ClearSessionBindings(sessionID string) {
 	}
 	sc.mu.Unlock()
 	for _, entry := range entries {
+		if entry.loadSessionID() != sessionID {
+			continue
+		}
 		entry.mu.Lock()
 		if entry.loadSessionID() == sessionID {
 			entry.storeSessionID("")

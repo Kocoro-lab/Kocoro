@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
@@ -499,6 +500,91 @@ func TestSessionCache_ClearSessionBindings(t *testing.T) {
 	}
 	if got := sc.RouteSessionID("default:slack:T2"); got != "sess-b" {
 		t.Fatalf("untouched route session id = %q, want sess-b", got)
+	}
+}
+
+// TestSessionCache_ClearSessionBindings_DoesNotBlockOnRunningRoute pins the
+// cross-session boundary: clearing session B must not block on a different
+// session A whose route is mid-run (entry.mu held for the whole run). Only the
+// entry bound to the target sessionID may be locked.
+func TestSessionCache_ClearSessionBindings_DoesNotBlockOnRunningRoute(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	defer sc.CloseAll()
+
+	sc.mu.Lock()
+	running := &routeEntry{}
+	running.storeSessionID("sess-a")
+	sc.routes["default:slack:T1"] = running
+	target := &routeEntry{}
+	target.storeSessionID("sess-b")
+	sc.routes["default:slack:T2"] = target
+	sc.mu.Unlock()
+
+	// Simulate session A mid-run: its entry.mu is held and not released.
+	running.mu.Lock()
+	defer running.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		sc.ClearSessionBindings("sess-b")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ClearSessionBindings blocked on a running unrelated route")
+	}
+
+	if got := sc.RouteSessionID("default:slack:T2"); got != "" {
+		t.Fatalf("target route session id = %q, want empty", got)
+	}
+	if got := sc.RouteSessionID("default:slack:T1"); got != "sess-a" {
+		t.Fatalf("running route session id = %q, want sess-a", got)
+	}
+}
+
+// TestSessionCache_ClearSessionBindings_WaitsForMatchingRunningRoute pins the
+// other half of the late-bind contract: a route already bound to the target
+// session (e.g. runner stamped it before Resume) must be waited on and cleared,
+// even while its run holds entry.mu — so the clear cannot be defeated by the
+// runner's defer re-stamping the just-deleted id.
+func TestSessionCache_ClearSessionBindings_WaitsForMatchingRunningRoute(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	defer sc.CloseAll()
+
+	sc.mu.Lock()
+	target := &routeEntry{}
+	target.storeSessionID("sess-b")
+	sc.routes["default:slack:T1"] = target
+	sc.mu.Unlock()
+
+	// Simulate the target session mid-run: entry.mu held until we release it.
+	target.mu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		sc.ClearSessionBindings("sess-b")
+		close(done)
+	}()
+
+	// While the run holds entry.mu the clear must not complete.
+	select {
+	case <-done:
+		t.Fatal("ClearSessionBindings cleared a matching route while its run held entry.mu")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	target.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ClearSessionBindings did not complete after the run released entry.mu")
+	}
+
+	if got := sc.RouteSessionID("default:slack:T1"); got != "" {
+		t.Fatalf("target route session id = %q, want empty", got)
 	}
 }
 

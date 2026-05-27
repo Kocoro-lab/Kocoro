@@ -1428,14 +1428,33 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if !session.IsValidSessionID(req.SessionID) {
 			return nil, fmt.Errorf("invalid session_id format: %q", req.SessionID)
 		}
+		// Stamp before Resume for the same reason as the SessionID branch
+		// below: make the binding visible to a concurrent DELETE/RESET during
+		// the Resume window. Both outcomes here land on req.SessionID, so the
+		// early stamp is always correct.
+		if route != nil {
+			route.storeSessionID(req.SessionID)
+		}
 		if _, err := sessMgr.Resume(req.SessionID); err == nil {
 			resumed = true
 		} else {
 			sessMgr.NewSessionWithID(req.SessionID)
 		}
 	case req.SessionID != "":
+		// Stamp the route before Resume (which does disk IO) so a concurrent
+		// DELETE/RESET on this id observes the binding: CancelBySessionID can
+		// cancel this run and ClearSessionBindings can wait on it, instead of
+		// racing the late storeSessionID below and leaving a stale binding.
+		if route != nil {
+			route.storeSessionID(req.SessionID)
+		}
 		// Resume a specific session by ID (reuses cached manager to avoid DB handle leak).
 		if _, err := sessMgr.Resume(req.SessionID); err != nil {
+			// Drop the early stamp so a phantom id can't linger on this route
+			// until the next run self-heals.
+			if route != nil {
+				route.storeSessionID("")
+			}
 			return nil, fmt.Errorf("session not found: %s", req.SessionID)
 		}
 		resumed = true
