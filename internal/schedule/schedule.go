@@ -233,7 +233,7 @@ func (m *Manager) Get(id string) (*Schedule, error) {
 
 func (m *Manager) Update(id string, opts *UpdateOpts) error {
 	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil {
-		return fmt.Errorf("no fields to update")
+		return fmt.Errorf("no fields to update: provide at least one of cron, prompt, enabled, or stateful")
 	}
 	if opts.Cron != nil {
 		if err := validateCron(*opts.Cron); err != nil {

@@ -9,21 +9,21 @@ Schedules are automated tasks that run on a cron schedule without any human inte
 ### List all schedules
 - Method: GET
 - Path: /schedules
-- Response: `[{"id": "string", "prompt": "string", "cron": "0 9 * * 1-5", "agent": "string", "enabled": true, "last_run_at": "2024-01-15T09:00:00Z", "last_run_session_id": "string"}]`
-- Notes: `last_run_at` is omitted (or `null`) when the schedule has never fired. To see what the run actually produced, call `GET /schedules/{id}/last-run` — the base resource only carries the pointers, not the assistant output.
+- Response: `[{"id": "string", "prompt": "string", "cron": "0 9 * * 1-5", "agent": "string", "enabled": true, "stateful": true, "last_run_at": "2024-01-15T09:00:00Z", "last_run_session_id": "string", "last_run_message_start_index": 12, "last_run_message_end_index": 18}]`
+- Notes: All `last_run_*` keys (including the message-index range) are absent from the JSON when the schedule has never fired — they are not present as `null`. The index range slices the run's turns out of the shared per-agent session; `GET /schedules/{id}/last-run` handles that resolution for you.
 
 ### Get schedule details
 - Method: GET
 - Path: /schedules/{id}
-- Response: `{"id": "string", "prompt": "string", "cron": "string", "agent": "string", "enabled": true, "last_run_at": "string or null", "last_run_session_id": "string"}`
-- Notes: Same shape as the list entry. The textual output of the last run is NOT inlined here; use `GET /schedules/{id}/last-run` for that.
+- Response: `{"id": "string", "prompt": "string", "cron": "string", "agent": "string", "enabled": true, "stateful": true, "last_run_at": "RFC3339 string", "last_run_session_id": "string", "last_run_message_start_index": 12, "last_run_message_end_index": 18}`
+- Notes: Same shape as the list entry; `last_run_*` keys are omitted when never fired (absent, not `null`). The textual output of the last run is NOT inlined here; use `GET /schedules/{id}/last-run` for that.
 
 ### Show last run of a schedule
 - Method: GET
 - Path: /schedules/{id}/last-run
 - Query: `?max_turns=N` (optional, default 5, clamped 1-20)
-- Response: `{"last_run_at": "RFC3339 string or null", "session_id": "string (empty if never run)", "agent_name": "string", "turns": [{"role": "assistant", "text": "..."}]}`
-- Notes: Resolves the schedule's `last_run_session_id` and reads the linked session file, returning the tail of its assistant turns. Empty turns array (with `session_id == ""`) means the schedule has never fired. 404 on unknown schedule id. 500 if the session file is missing (e.g. user manually deleted it from disk).
+- Response: `{"last_run_at": "RFC3339 string", "session_id": "string", "agent_name": "string", "turns": [{"role": "assistant", "text": "..."}]}`
+- Notes: Resolves the schedule's `last_run_session_id` and reads the linked session file, returning the tail of its assistant turns. When the schedule has never fired, `last_run_at` is absent and `session_id` is the empty string; `turns` is `[]` (never `null`). 404 on unknown schedule id. 500 if the session file is missing (e.g. user manually deleted it from disk).
 
 ### Show last run via LLM tool
 - Tool: `schedule_show`

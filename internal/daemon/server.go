@@ -4024,7 +4024,7 @@ func (s *Server) handlePatchSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if patch.Cron == nil && patch.Prompt == nil && patch.Enabled == nil && patch.Stateful == nil {
-		writeError(w, http.StatusBadRequest, "no fields to update")
+		writeError(w, http.StatusBadRequest, "no fields to update: provide at least one of cron, prompt, enabled, or stateful")
 		return
 	}
 	update := &schedule.UpdateOpts{
