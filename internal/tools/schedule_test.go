@@ -183,7 +183,7 @@ func TestScheduleTool_CreateAppendsHeartbeatWarning(t *testing.T) {
 	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
 	tool := &ScheduleTool{manager: mgr, action: "create"}
 
-	res, err := tool.Run(context.Background(), `{"agent":"hb","cron":"*/5 * * * *","prompt":"check"}`)
+	res, err := tool.Run(context.Background(), `{"agent":"hb","cron":"*/5 * * * *","prompt":"check","description":"test"}`)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestScheduleTool_CreateNoWarningWithoutHeartbeat(t *testing.T) {
 	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
 	tool := &ScheduleTool{manager: mgr, action: "create"}
 
-	res, err := tool.Run(context.Background(), `{"agent":"plain","cron":"*/5 * * * *","prompt":"check"}`)
+	res, err := tool.Run(context.Background(), `{"agent":"plain","cron":"*/5 * * * *","prompt":"check","description":"test"}`)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestScheduleTool_UpdateAppendsHeartbeatWarning(t *testing.T) {
 	}
 	tool := &ScheduleTool{manager: mgr, action: "update"}
 
-	res, err := tool.Run(context.Background(), `{"id":"`+id+`","prompt":"updated"}`)
+	res, err := tool.Run(context.Background(), `{"id":"`+id+`","prompt":"updated","description":"test"}`)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestScheduleTool_Create_InheritsAgentFromCtxWhenArgMissing(t *testing.T) {
 	tool := &ScheduleTool{manager: mgr, action: "create"}
 
 	ctx := agent.WithAgentName(context.Background(), "academic-writer")
-	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check"}`)
+	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check","description":"test"}`)
 	if err != nil || res.IsError {
 		t.Fatalf("run failed: err=%v res=%+v", err, res)
 	}
@@ -295,7 +295,7 @@ func TestScheduleTool_Create_ExplicitEmptyAgentRoutesDefault(t *testing.T) {
 	tool := &ScheduleTool{manager: mgr, action: "create"}
 
 	ctx := agent.WithAgentName(context.Background(), "academic-writer")
-	res, err := tool.Run(ctx, `{"agent":"","cron":"*/5 * * * *","prompt":"check"}`)
+	res, err := tool.Run(ctx, `{"agent":"","cron":"*/5 * * * *","prompt":"check","description":"test"}`)
 	if err != nil || res.IsError {
 		t.Fatalf("run failed: err=%v res=%+v", err, res)
 	}
@@ -320,7 +320,7 @@ func TestScheduleTool_Create_ExplicitAgentOverridesCtx(t *testing.T) {
 	tool := &ScheduleTool{manager: mgr, action: "create"}
 
 	ctx := agent.WithAgentName(context.Background(), "academic-writer")
-	res, err := tool.Run(ctx, `{"agent":"explorer","cron":"*/5 * * * *","prompt":"check"}`)
+	res, err := tool.Run(ctx, `{"agent":"explorer","cron":"*/5 * * * *","prompt":"check","description":"test"}`)
 	if err != nil || res.IsError {
 		t.Fatalf("run failed: err=%v res=%+v", err, res)
 	}
@@ -341,7 +341,7 @@ func TestScheduleTool_Create_DefaultCallerOmittedArgStaysDefault(t *testing.T) {
 
 	// ctx says "default agent" (empty string, explicit injection)
 	ctx := agent.WithAgentName(context.Background(), "")
-	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check"}`)
+	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check","description":"test"}`)
 	if err != nil || res.IsError {
 		t.Fatalf("run failed: err=%v res=%+v", err, res)
 	}
@@ -361,7 +361,7 @@ func TestScheduleTool_Create_NoCtxAgentSafelyDefaults(t *testing.T) {
 	mgr := schedule.NewManager(filepath.Join(shan, ".shannon", "schedules.json"))
 	tool := &ScheduleTool{manager: mgr, action: "create"}
 
-	res, err := tool.Run(context.Background(), `{"cron":"*/5 * * * *","prompt":"check"}`)
+	res, err := tool.Run(context.Background(), `{"cron":"*/5 * * * *","prompt":"check","description":"test"}`)
 	if err != nil || res.IsError {
 		t.Fatalf("run failed: err=%v res=%+v", err, res)
 	}
@@ -380,7 +380,7 @@ func TestScheduleTool_Create_StatefulArgHonored(t *testing.T) {
 	tool := &ScheduleTool{manager: mgr, action: "create"}
 
 	ctx := agent.WithAgentName(context.Background(), "tracker")
-	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check","stateful":true}`)
+	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check","description":"test","stateful":true}`)
 	if err != nil || res.IsError {
 		t.Fatalf("run failed: err=%v res=%+v", err, res)
 	}
@@ -412,7 +412,7 @@ func TestScheduleTool_Show_NeverRun(t *testing.T) {
 	id, _ := mgr.Create("tracker", "0 9 * * *", "p", false)
 	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
 
-	res, err := tool.Run(context.Background(), `{"id":"`+id+`"}`)
+	res, err := tool.Run(context.Background(), `{"id":"`+id+`","description":"test"}`)
 	if err != nil || res.IsError {
 		t.Fatalf("show: err=%v res=%+v", err, res)
 	}
@@ -434,7 +434,7 @@ func TestScheduleTool_Show_RendersTurns(t *testing.T) {
 	mgr.MarkLastRun(id, "sess-1", time.Now(), 0, 2)
 
 	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
-	res, err := tool.Run(context.Background(), `{"id":"`+id+`"}`)
+	res, err := tool.Run(context.Background(), `{"id":"`+id+`","description":"test"}`)
 	if err != nil || res.IsError {
 		t.Fatalf("show: err=%v res=%+v", err, res)
 	}
@@ -451,7 +451,7 @@ func TestScheduleTool_Show_UnknownID(t *testing.T) {
 	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
 	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
 
-	res, _ := tool.Run(context.Background(), `{"id":"nope"}`)
+	res, _ := tool.Run(context.Background(), `{"id":"nope","description":"test"}`)
 	if !res.IsError {
 		t.Errorf("unknown id should set IsError, got %+v", res)
 	}
@@ -464,7 +464,7 @@ func TestScheduleTool_Show_MissingSessionFile(t *testing.T) {
 	mgr.MarkLastRun(id, "sess-vanished", time.Now(), 0, 4)
 
 	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
-	res, _ := tool.Run(context.Background(), `{"id":"`+id+`"}`)
+	res, _ := tool.Run(context.Background(), `{"id":"`+id+`","description":"test"}`)
 	if !res.IsError {
 		t.Errorf("missing session should set IsError, got %+v", res)
 	}
@@ -491,7 +491,7 @@ func TestScheduleTool_Show_MaxTurnsArg(t *testing.T) {
 	mgr.MarkLastRun(id, "sess", time.Now(), 0, 6)
 
 	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
-	res, _ := tool.Run(context.Background(), `{"id":"`+id+`","max_turns":2}`)
+	res, _ := tool.Run(context.Background(), `{"id":"`+id+`","max_turns":2,"description":"test"}`)
 	if strings.Contains(res.Content, "turn 4") {
 		t.Errorf("max_turns=2 must NOT include turn 4: %q", res.Content)
 	}
@@ -519,7 +519,7 @@ func TestScheduleTool_Show_RespectsMessageRange(t *testing.T) {
 	mgr.MarkLastRun(id, "sess-shared", time.Now(), 2, 4)
 
 	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
-	res, _ := tool.Run(context.Background(), `{"id":"`+id+`"}`)
+	res, _ := tool.Run(context.Background(), `{"id":"`+id+`","description":"test"}`)
 	if strings.Contains(res.Content, "INTERACTIVE_REPLY") {
 		t.Errorf("interactive chat reply must NOT appear in show output: %q", res.Content)
 	}

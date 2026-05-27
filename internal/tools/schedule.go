@@ -145,7 +145,7 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: "invalid args: " + err.Error(), IsError: true}, nil
+		return agent.ValidationError("invalid args: " + err.Error()), nil
 	}
 	switch t.action {
 	case "create":
@@ -160,8 +160,19 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		}
 		cron, _ := args["cron"].(string)
 		prompt, _ := args["prompt"].(string)
-		if cron == "" || prompt == "" {
-			return agent.ToolResult{Content: "cron and prompt are required", IsError: true}, nil
+		description, _ := args["description"].(string)
+		// Validate every Required field with ValidationError so the loop
+		// detector's [validation error] short-circuit can stop a model
+		// stuck retrying the same missing-field call. Required for
+		// schedule_create: cron, prompt, description.
+		if cron == "" {
+			return agent.ValidationError("cron is required"), nil
+		}
+		if prompt == "" {
+			return agent.ValidationError("prompt is required"), nil
+		}
+		if description == "" {
+			return agent.ValidationError("description is required"), nil
 		}
 		stateful, _ := args["stateful"].(bool) // missing → false (Go zero value, matches HTTP/CLI default)
 		id, err := t.manager.Create(agentName, cron, prompt, stateful)
@@ -204,8 +215,13 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		return agent.ToolResult{Content: sb.String()}, nil
 	case "update":
 		id, _ := args["id"].(string)
+		description, _ := args["description"].(string)
+		// Required for schedule_update: id, description.
 		if id == "" {
-			return agent.ToolResult{Content: "id is required", IsError: true}, nil
+			return agent.ValidationError("id is required"), nil
+		}
+		if description == "" {
+			return agent.ValidationError("description is required"), nil
 		}
 		opts := &schedule.UpdateOpts{}
 		if v, ok := args["cron"].(string); ok {
@@ -221,7 +237,7 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			opts.Stateful = &v
 		}
 		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil {
-			return agent.ToolResult{Content: "at least one of cron, prompt, enabled, or stateful is required", IsError: true}, nil
+			return agent.ValidationError("at least one of cron, prompt, enabled, or stateful is required"), nil
 		}
 		if err := t.manager.Update(id, opts); err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
@@ -238,8 +254,13 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		return agent.ToolResult{Content: msg}, nil
 	case "remove":
 		id, _ := args["id"].(string)
+		description, _ := args["description"].(string)
+		// Required for schedule_remove: id, description.
 		if id == "" {
-			return agent.ToolResult{Content: "id is required", IsError: true}, nil
+			return agent.ValidationError("id is required"), nil
+		}
+		if description == "" {
+			return agent.ValidationError("description is required"), nil
 		}
 		if err := t.manager.Remove(id); err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
@@ -247,8 +268,13 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		return agent.ToolResult{Content: fmt.Sprintf("Schedule %s removed.", id)}, nil
 	case "show":
 		id, _ := args["id"].(string)
+		description, _ := args["description"].(string)
+		// Required for schedule_show: id, description.
 		if id == "" {
-			return agent.ToolResult{Content: "id is required", IsError: true}, nil
+			return agent.ValidationError("id is required"), nil
+		}
+		if description == "" {
+			return agent.ValidationError("description is required"), nil
 		}
 		sched, err := t.manager.Get(id)
 		if err != nil {
