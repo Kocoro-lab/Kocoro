@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -217,5 +218,177 @@ func TestHandleScheduleLastRun_MissingSession500(t *testing.T) {
 	srv.handleScheduleLastRun(w, req)
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500 (session file missing)", w.Code)
+	}
+}
+
+// --- Task A8: broadcast + created_from_source surface --------------------------
+
+// GET /schedules returns the new Broadcast + CreatedFromSource JSON tags so
+// Desktop can render the IM-push state. Backed by plain json.Marshal of the
+// Schedule struct from A1 — this is a regression guard, not new code.
+func TestHandleListSchedules_IncludesBroadcastFields(t *testing.T) {
+	srv, mgr, _ := newTestServerWithScheduleMgr(t)
+	bTrue := true
+	if _, err := mgr.CreateWithOpts("x", "0 9 * * *", "p", false, schedule.CreateOpts{
+		Broadcast:         &bTrue,
+		CreatedFromSource: "slack",
+	}); err != nil {
+		t.Fatalf("CreateWithOpts: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/schedules", nil)
+	w := httptest.NewRecorder()
+	srv.handleListSchedules(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"broadcast":true`) {
+		t.Errorf("response missing broadcast field: %s", body)
+	}
+	if !strings.Contains(body, `"created_from_source":"slack"`) {
+		t.Errorf("response missing created_from_source field: %s", body)
+	}
+}
+
+// GET /schedules/{id} surfaces the same fields for a single-row lookup. The
+// single-resource handler json-marshals *Schedule directly (no list wrapper),
+// so this is a separate code path.
+func TestHandleGetSchedule_IncludesBroadcastFields(t *testing.T) {
+	srv, mgr, _ := newTestServerWithScheduleMgr(t)
+	bFalse := false
+	id, err := mgr.CreateWithOpts("x", "0 9 * * *", "p", false, schedule.CreateOpts{
+		Broadcast:         &bFalse,
+		CreatedFromSource: "feishu",
+	})
+	if err != nil {
+		t.Fatalf("CreateWithOpts: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/schedules/"+id, nil)
+	req.SetPathValue("id", id)
+	w := httptest.NewRecorder()
+	srv.handleGetSchedule(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"broadcast":false`) {
+		t.Errorf("response missing broadcast=false: %s", body)
+	}
+	if !strings.Contains(body, `"created_from_source":"feishu"`) {
+		t.Errorf("response missing created_from_source=feishu: %s", body)
+	}
+}
+
+// PATCH /schedules/{id} accepts the broadcast enum ("auto"|"on"|"off") and
+// rewrites Schedule.Broadcast via UpdateOpts.Broadcast. "on" → *true.
+func TestHandlePatchSchedule_AcceptsBroadcastOn(t *testing.T) {
+	srv, mgr, _ := newTestServerWithScheduleMgr(t)
+	id, err := mgr.Create("x", "0 9 * * *", "p", false)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	body := `{"broadcast":"on"}`
+	req := httptest.NewRequest(http.MethodPatch, "/schedules/"+id, bytes.NewBufferString(body))
+	req.SetPathValue("id", id)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.handlePatchSchedule(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	got, err := mgr.Get(id)
+	if err != nil || got == nil {
+		t.Fatalf("Get: %v %v", err, got)
+	}
+	if got.Broadcast == nil || *got.Broadcast != true {
+		t.Errorf("PATCH broadcast=on did not produce *true: got %v", got.Broadcast)
+	}
+}
+
+// PATCH broadcast=off → *false. Mirrors the on path; the BroadcastOpt wrapper
+// distinguishes "leave alone" (nil) from "rewrite to *false" (non-nil with
+// *false inside), so this catches regressions that drop the latter case.
+func TestHandlePatchSchedule_AcceptsBroadcastOff(t *testing.T) {
+	srv, mgr, _ := newTestServerWithScheduleMgr(t)
+	bTrue := true
+	id, err := mgr.CreateWithOpts("x", "0 9 * * *", "p", false, schedule.CreateOpts{
+		Broadcast: &bTrue,
+	})
+	if err != nil {
+		t.Fatalf("CreateWithOpts: %v", err)
+	}
+
+	body := `{"broadcast":"off"}`
+	req := httptest.NewRequest(http.MethodPatch, "/schedules/"+id, bytes.NewBufferString(body))
+	req.SetPathValue("id", id)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.handlePatchSchedule(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	got, _ := mgr.Get(id)
+	if got.Broadcast == nil || *got.Broadcast != false {
+		t.Errorf("PATCH broadcast=off did not produce *false: got %v", got.Broadcast)
+	}
+}
+
+// PATCH broadcast="auto" clears Broadcast back to nil (smart default).
+func TestHandlePatchSchedule_AcceptsBroadcastAutoClearsBack(t *testing.T) {
+	srv, mgr, _ := newTestServerWithScheduleMgr(t)
+	bTrue := true
+	id, err := mgr.CreateWithOpts("x", "0 9 * * *", "p", false, schedule.CreateOpts{
+		Broadcast: &bTrue,
+	})
+	if err != nil {
+		t.Fatalf("CreateWithOpts: %v", err)
+	}
+
+	body := `{"broadcast":"auto"}`
+	req := httptest.NewRequest(http.MethodPatch, "/schedules/"+id, bytes.NewBufferString(body))
+	req.SetPathValue("id", id)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.handlePatchSchedule(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	got, _ := mgr.Get(id)
+	if got.Broadcast != nil {
+		t.Errorf("PATCH broadcast=auto did not clear back to nil: got %v", got.Broadcast)
+	}
+}
+
+// PATCH with an invalid broadcast value must return 4xx (not silent-accept,
+// not 5xx). The LLM- and Desktop-facing contract is "auto"|"on"|"off".
+func TestHandlePatchSchedule_RejectsInvalidBroadcast(t *testing.T) {
+	srv, mgr, _ := newTestServerWithScheduleMgr(t)
+	id, err := mgr.Create("x", "0 9 * * *", "p", false)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	body := `{"broadcast":"maybe"}`
+	req := httptest.NewRequest(http.MethodPatch, "/schedules/"+id, bytes.NewBufferString(body))
+	req.SetPathValue("id", id)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.handlePatchSchedule(w, req)
+	if w.Code < 400 || w.Code >= 500 {
+		t.Errorf("expected 4xx for invalid broadcast, got %d body %s", w.Code, w.Body.String())
+	}
+	// Stronger assertion: the 4xx must actually mention `broadcast` so we know
+	// the validation fired here, not the pre-existing "no fields to update"
+	// branch (which would also produce a 4xx but mask a regression where the
+	// handler silently accepts unknown enums).
+	if !strings.Contains(w.Body.String(), "broadcast") {
+		t.Errorf("4xx body should reference broadcast validation, got %s", w.Body.String())
+	}
+	got, _ := mgr.Get(id)
+	if got.Broadcast != nil {
+		t.Errorf("invalid broadcast must not mutate stored schedule: got %v", got.Broadcast)
 	}
 }

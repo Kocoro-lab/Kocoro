@@ -206,7 +206,7 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			if !isStr {
 				return agent.ValidationError(fmt.Sprintf("broadcast must be a string (\"auto\", \"on\", or \"off\"); got %T", raw)), nil
 			}
-			b, ok := parseBroadcastEnum(bStr)
+			b, ok := schedule.ParseBroadcastEnum(bStr)
 			if !ok {
 				return agent.ValidationError(fmt.Sprintf("broadcast must be one of \"auto\", \"on\", \"off\"; got %q", bStr)), nil
 			}
@@ -289,7 +289,7 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			if !isStr {
 				return agent.ValidationError(fmt.Sprintf("broadcast must be a string (\"auto\", \"on\", or \"off\"); got %T", raw)), nil
 			}
-			b, ok := parseBroadcastEnum(bStr)
+			b, ok := schedule.ParseBroadcastEnum(bStr)
 			if !ok {
 				return agent.ValidationError(fmt.Sprintf("broadcast must be one of \"auto\", \"on\", \"off\"; got %q", bStr)), nil
 			}
@@ -417,32 +417,6 @@ func (t *ScheduleTool) triggerConflictWarning(agentName string) string {
 		return ""
 	}
 	return "⚠️ Note: " + warnings[0]
-}
-
-// parseBroadcastEnum maps the schedule_create / schedule_update `broadcast`
-// string enum into a *bool for storage. Returns (*bool, ok). ok=false means
-// the input was not one of the allowed values; callers should return a
-// ValidationError so the LLM gets a clear correction signal.
-//
-// Mapping:
-//   - ""    → (nil, true)   // absent/empty = smart default
-//   - "auto"→ (nil, true)   // smart default
-//   - "on"  → (*true, true) // always broadcast
-//   - "off" → (*false, true)// never broadcast
-//   - other → (nil, false)  // invalid
-func parseBroadcastEnum(s string) (*bool, bool) {
-	switch s {
-	case "", "auto":
-		return nil, true
-	case "on":
-		b := true
-		return &b, true
-	case "off":
-		b := false
-		return &b, true
-	default:
-		return nil, false
-	}
 }
 
 // extractConversationContext pulls a compact context from the live
