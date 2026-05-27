@@ -15,6 +15,12 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 )
 
+// scheduleAudienceDisclaimer is appended to every ScheduleTool description so
+// the LLM treats these as its own tools rather than user-typed commands. The
+// 我帮你取消 example is bilingual on purpose — Chinese users in the wild were
+// the original failure mode the line addresses.
+const scheduleAudienceDisclaimer = "Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself."
+
 type ScheduleTool struct {
 	manager    *schedule.Manager
 	action     string
@@ -40,7 +46,7 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 				"Storage: for a NAMED agent, every run appends turns to that agent's single ongoing session file (one file, growing). " +
 				"For the default agent, every run creates a brand-new session file under ~/.shannon/sessions/. " +
 				"Showing the user the results: when the user asks 'what did the schedule produce' or 'show me yesterday's run', do NOT instruct them to call session_search themselves — call session_search yourself and summarize the findings in your reply. The user is talking to you, not running shell commands. " +
-				"Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself." +
+				scheduleAudienceDisclaimer +
 				agent.DescriptionGuidance,
 			Parameters: map[string]any{
 				"type": "object",
@@ -76,14 +82,14 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 		return agent.ToolInfo{
 			Name: "schedule_list",
 			Description: "List all locally scheduled tasks with their status. " +
-				"Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself.",
+				scheduleAudienceDisclaimer,
 			Parameters: map[string]any{"type": "object", "properties": map[string]any{}},
 		}
 	case "update":
 		return agent.ToolInfo{
 			Name: "schedule_update",
 			Description: "Update an existing scheduled task. " +
-				"Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself." +
+				scheduleAudienceDisclaimer +
 				agent.DescriptionGuidance,
 			Parameters: map[string]any{
 				"type": "object",
@@ -105,7 +111,7 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 		return agent.ToolInfo{
 			Name: "schedule_remove",
 			Description: "Remove a scheduled task. " +
-				"Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself." +
+				scheduleAudienceDisclaimer +
 				agent.DescriptionGuidance,
 			Parameters: map[string]any{
 				"type": "object",
@@ -120,7 +126,7 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 		return agent.ToolInfo{
 			Name: "schedule_show",
 			Description: "Show the most recent run of a scheduled task. Returns when it last fired plus a summary of the last assistant turns from that run. Use this when the user asks what a schedule produced (e.g. 'what did my daily report say' or 'show me the last run'); do not push the user to call session_search themselves. " +
-				"Audience: this tool is for YOU to call, not a command the user can type. Never tell the user to 'use schedule_remove' or 'call schedule_show' — just say what you'll do (e.g. '我帮你取消') and call the tool yourself." +
+				scheduleAudienceDisclaimer +
 				agent.DescriptionGuidance,
 			Parameters: map[string]any{
 				"type": "object",
@@ -215,7 +221,7 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			opts.Stateful = &v
 		}
 		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil {
-			return agent.ToolResult{Content: "at least one of cron, prompt, or enabled is required", IsError: true}, nil
+			return agent.ToolResult{Content: "at least one of cron, prompt, enabled, or stateful is required", IsError: true}, nil
 		}
 		if err := t.manager.Update(id, opts); err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil

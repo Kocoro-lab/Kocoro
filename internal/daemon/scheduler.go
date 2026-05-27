@@ -181,6 +181,13 @@ func buildScheduleRequest(sched schedule.Schedule, stickyContext string) RunAgen
 		// Default agent (no name) gets a fresh session per run; named agents
 		// resume their single long-lived session — but if Stateful is *false,
 		// OmitHistory below makes the LLM see an empty history regardless.
+		//
+		// Stateful: true with a default agent is a silent no-op: NewSession=true
+		// forces a fresh session per run so there's never prior history to
+		// preserve. The schedule_create tool description warns the LLM
+		// ("ignored for the default agent") rather than the manager rejecting
+		// the combo — keeps the wire shape simple and lets the user toggle
+		// the flag without an agent rename.
 		NewSession:    sched.Agent == "",
 		OmitHistory:   sched.IsStateless(),
 		StickyContext: stickyContext,

@@ -44,6 +44,16 @@ const lastRunTurnRuneCap = 800 // each assistant turn truncated to keep tool out
 // session's tail." This is mechanically the old behavior; not ideal for
 // shared sessions but better than returning empty for pre-existing rows.
 //
+// Cross-file invariant: the (0,0) sentinel is safe only because
+// runner.go pre-appends a user message for every req.Source != "" run
+// (including schedule), so turnBase.msgCount is captured AFTER the
+// append and is therefore >= 1 when MessageStartIndex is stamped. If a
+// future refactor lets a real schedule run produce MessageStartIndex == 0,
+// this fallback will silently regress to scanning the whole session
+// tail — the exact bug this resolver was written to fix. Touch points
+// to keep aligned: internal/daemon/runner.go pre-loop user append
+// (look for `preLoopUserAppended`) and `captureTurnBaseline`.
+//
 // shannonDir is the root (~/.shannon) — we resolve the per-agent or default
 // sessions directory under it.
 func SummarizeLastRun(sched Schedule, shannonDir string, maxTurns int) (LastRunSummary, error) {
