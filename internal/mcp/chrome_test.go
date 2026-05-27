@@ -718,6 +718,133 @@ func TestPrepareCDPProfile_CustomProfile(t *testing.T) {
 	}
 }
 
+func TestPrepareCDPProfile_CopiesCookieJournal(t *testing.T) {
+	srcDir := t.TempDir()
+	cdpDir := t.TempDir()
+
+	profileDir := filepath.Join(srcDir, "Default")
+	os.MkdirAll(profileDir, 0700)
+	os.WriteFile(filepath.Join(profileDir, "Cookies"), []byte("cookie-db"), 0600)
+	os.WriteFile(filepath.Join(profileDir, "Cookies-journal"), []byte("fresh-login-in-journal"), 0600)
+
+	if err := prepareCDPProfile(srcDir, "Default", cdpDir); err != nil {
+		t.Fatalf("prepareCDPProfile failed: %v", err)
+	}
+
+	journal, err := os.ReadFile(filepath.Join(cdpDir, "Default", "Cookies-journal"))
+	if err != nil {
+		t.Fatalf("Cookies-journal not copied: %v", err)
+	}
+	if string(journal) != "fresh-login-in-journal" {
+		t.Fatalf("unexpected Cookies-journal content: %q", journal)
+	}
+}
+
+func TestComputeCookieFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	if fp := computeCookieFingerprint(dir); fp != "" {
+		t.Fatalf("expected empty fingerprint when Cookies absent, got %q", fp)
+	}
+
+	cookies := filepath.Join(dir, "Cookies")
+	os.WriteFile(cookies, []byte("v1"), 0600)
+	fp1 := computeCookieFingerprint(dir)
+	if fp1 == "" {
+		t.Fatal("expected non-empty fingerprint once Cookies exists")
+	}
+	if fp2 := computeCookieFingerprint(dir); fp2 != fp1 {
+		t.Fatalf("fingerprint should be stable for unchanged files: %q vs %q", fp1, fp2)
+	}
+
+	// Same size, different content → sha256 must catch it.
+	os.WriteFile(cookies, []byte("v2"), 0600)
+	if fp := computeCookieFingerprint(dir); fp == fp1 {
+		t.Fatal("expected fingerprint to change when Cookies content changes")
+	}
+
+	// A fresh login staged only in the journal must move the fingerprint.
+	fpBeforeJournal := computeCookieFingerprint(dir)
+	os.WriteFile(filepath.Join(dir, "Cookies-journal"), []byte("staged-login"), 0600)
+	if fp := computeCookieFingerprint(dir); fp == fpBeforeJournal {
+		t.Fatal("expected fingerprint to change when Cookies-journal appears")
+	}
+}
+
+func TestComputeCookieFingerprint_NetworkLocation(t *testing.T) {
+	dir := t.TempDir()
+	// Modern layout: no root Cookies, DB lives under Network/.
+	netDir := filepath.Join(dir, "Network")
+	os.MkdirAll(netDir, 0700)
+	os.WriteFile(filepath.Join(netDir, "Cookies"), []byte("v1"), 0600)
+
+	fp1 := computeCookieFingerprint(dir)
+	if fp1 == "" {
+		t.Fatal("expected non-empty fingerprint when only Network/Cookies exists")
+	}
+
+	// A change confined to Network/Cookies must move the fingerprint.
+	os.WriteFile(filepath.Join(netDir, "Cookies"), []byte("v2"), 0600)
+	if fp := computeCookieFingerprint(dir); fp == fp1 {
+		t.Fatal("expected fingerprint to change when Network/Cookies changes")
+	}
+}
+
+func TestPrepareCDPProfile_DropsStaleCookieSidecar(t *testing.T) {
+	srcDir := t.TempDir()
+	cdpDir := t.TempDir()
+	defaultDst := filepath.Join(cdpDir, "Default")
+	os.MkdirAll(defaultDst, 0700)
+
+	// Simulate a previous clone that left a -wal sidecar behind.
+	os.WriteFile(filepath.Join(defaultDst, "Cookies"), []byte("old"), 0600)
+	staleSidecar := filepath.Join(defaultDst, "Cookies-wal")
+	os.WriteFile(staleSidecar, []byte("stale-wal"), 0600)
+
+	// New source has only the main Cookies DB, no sidecar.
+	profileDir := filepath.Join(srcDir, "Default")
+	os.MkdirAll(profileDir, 0700)
+	os.WriteFile(filepath.Join(profileDir, "Cookies"), []byte("new"), 0600)
+
+	if err := prepareCDPProfile(srcDir, "Default", cdpDir); err != nil {
+		t.Fatalf("prepareCDPProfile failed: %v", err)
+	}
+
+	if _, err := os.Stat(staleSidecar); !os.IsNotExist(err) {
+		t.Fatalf("expected stale Cookies-wal to be removed, got err=%v", err)
+	}
+	cookies, err := os.ReadFile(filepath.Join(defaultDst, "Cookies"))
+	if err != nil || string(cookies) != "new" {
+		t.Fatalf("expected Cookies overwritten with source content, got %q err=%v", cookies, err)
+	}
+}
+
+func TestDecideCDPSeed(t *testing.T) {
+	cases := []struct {
+		name                         string
+		markerExists                 bool
+		markerProfile, profileName   string
+		currentFP, storedFP          string
+		wantSeed, wantRebuildDefault bool
+	}{
+		{"first launch (no marker)", false, "", "Default", "fpA", "", true, false},
+		{"profile switch wipes Default", true, "Default", "Profile 6", "fpA", "fpA", true, true},
+		{"same profile, cookies changed", true, "Default", "Default", "fpB", "fpA", true, false},
+		{"same profile, cookies unchanged", true, "Default", "Default", "fpA", "fpA", false, false},
+		{"upgrade: stored fp empty", true, "Default", "Default", "fpA", "", true, false},
+		{"same profile, no source cookies", true, "Default", "Default", "", "", false, false},
+		{"absence isn't change: source cookies gone", true, "Default", "Default", "", "fpA", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotSeed, gotRebuild := decideCDPSeed(tc.markerExists, tc.markerProfile, tc.profileName, tc.currentFP, tc.storedFP)
+			if gotSeed != tc.wantSeed || gotRebuild != tc.wantRebuildDefault {
+				t.Fatalf("decideCDPSeed = (seed=%v, rebuild=%v), want (seed=%v, rebuild=%v)",
+					gotSeed, gotRebuild, tc.wantSeed, tc.wantRebuildDefault)
+			}
+		})
+	}
+}
+
 func TestValidChromeProfileName(t *testing.T) {
 	valid := []string{"Default", "Profile 1", "Profile 6", "Profile 42"}
 	for _, n := range valid {
@@ -897,6 +1024,50 @@ func TestGetChromeProfileState_MissingCloneIsNotMarkedStale(t *testing.T) {
 	}
 	if got.LastCloneSource != "" {
 		t.Fatalf("expected empty last clone source, got %q", got.LastCloneSource)
+	}
+}
+
+func TestGetChromeProfileState_StaleWhenCookieFingerprintDiffers(t *testing.T) {
+	home := t.TempDir()
+	chromeDir := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
+	if err := os.MkdirAll(filepath.Join(chromeDir, "Default"), 0o700); err != nil {
+		t.Fatalf("mkdir default profile: %v", err)
+	}
+	// Live source cookies exist; their fingerprint won't match the stale marker.
+	if err := os.WriteFile(filepath.Join(chromeDir, "Default", "Cookies"), []byte("fresh-login"), 0o600); err != nil {
+		t.Fatalf("write cookies: %v", err)
+	}
+	state := map[string]any{"profile": map[string]any{"last_used": "Default"}}
+	data, _ := json.Marshal(state)
+	if err := os.WriteFile(filepath.Join(chromeDir, "Local State"), data, 0o600); err != nil {
+		t.Fatalf("write local state: %v", err)
+	}
+	cdpRoot := filepath.Join(home, ".shannon", "chrome-cdp")
+	if err := os.MkdirAll(cdpRoot, 0o700); err != nil {
+		t.Fatalf("mkdir cdp dir: %v", err)
+	}
+	// Same profile as effective (so the profile-name branch does NOT fire), but
+	// a stale stored cookie fingerprint → must be reported stale.
+	if err := os.WriteFile(filepath.Join(cdpRoot, ".profile_source"), []byte("Default"), 0o600); err != nil {
+		t.Fatalf("write profile marker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cdpRoot, ".cookies_fingerprint"), []byte("stale-fingerprint"), 0o600); err != nil {
+		t.Fatalf("write fingerprint marker: %v", err)
+	}
+
+	oldHome := cdpUserHomeDir
+	cdpUserHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { cdpUserHomeDir = oldHome })
+
+	got, err := GetChromeProfileState("")
+	if err != nil {
+		t.Fatalf("GetChromeProfileState returned error: %v", err)
+	}
+	if got.CloneStatus != ChromeProfileCloneStale {
+		t.Fatalf("expected clone status %q when cookie fingerprint differs, got %q", ChromeProfileCloneStale, got.CloneStatus)
+	}
+	if !got.RefreshRequired {
+		t.Fatal("expected refreshRequired=true when source cookies changed since last clone")
 	}
 }
 

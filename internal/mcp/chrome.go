@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -377,25 +379,32 @@ func LaunchCDPChrome(port int) error {
 		return fmt.Errorf("invalid chrome profile name %q: must be 'Default' or 'Profile N'", profileName)
 	}
 
-	// Re-seed when the source profile has changed or on first launch.
-	// The .profile_source marker is the sole seed trigger — it handles both
-	// first launch (marker missing) and profile switches (marker mismatch).
+	// Re-seed on first launch, profile switch, or when the source login state
+	// (cookies) changed since the last clone. This only fires on a Chrome cold
+	// start: if the dedicated Chrome is already running, EnsureChromeDebugPort
+	// returns on the "CDP reachable" branch and never reaches here — re-logins in
+	// the user's Chrome propagate on the next launch, not via a running-instance
+	// hot reload.
 	profileMarker := filepath.Join(cdpDataDir, ".profile_source")
-	needSeed := false
-	prev, err := os.ReadFile(profileMarker)
-	if err != nil {
-		needSeed = true // first launch or upgrade from old code
-	} else if string(prev) != profileName {
-		needSeed = true
+	fingerprintMarker := filepath.Join(cdpDataDir, ".cookies_fingerprint")
+	srcProfileDir := filepath.Join(srcChromeDir, profileName)
+	currentCookieFP := computeCookieFingerprint(srcProfileDir)
+	prev, markerErr := os.ReadFile(profileMarker)
+	storedFP, _ := os.ReadFile(fingerprintMarker)
+	needSeed, rebuildDefault := decideCDPSeed(markerErr == nil, string(prev), profileName, currentCookieFP, strings.TrimSpace(string(storedFP)))
+	if rebuildDefault {
 		log.Printf("[chrome-cdp] Profile changed from %q to %q, re-seeding", string(prev), profileName)
 		os.RemoveAll(filepath.Join(cdpDataDir, "Default")) //nolint:errcheck
+	} else if needSeed && markerErr == nil {
+		log.Printf("[chrome-cdp] Source cookies changed for %q, re-seeding login state", profileName)
 	}
 	if needSeed {
 		log.Printf("[chrome-cdp] Seeding CDP profile from %q", profileName)
 		if err := prepareCDPProfile(srcChromeDir, profileName, cdpDataDir); err != nil {
 			return fmt.Errorf("failed to prepare CDP profile: %w", err)
 		}
-		os.WriteFile(profileMarker, []byte(profileName), 0600) //nolint:errcheck
+		os.WriteFile(profileMarker, []byte(profileName), 0600)         //nolint:errcheck
+		os.WriteFile(fingerprintMarker, []byte(currentCookieFP), 0600) //nolint:errcheck
 	}
 
 	log.Printf("[chrome-cdp] Launching CDP Chrome minimized (port %d)", port)
@@ -1609,11 +1618,105 @@ func readProfileSourceMarker(home string) string {
 	return strings.TrimSpace(string(data))
 }
 
-func chromeCloneStatus(effective, lastClone string) string {
+func readCookieFingerprintMarker(home string) string {
+	data, err := os.ReadFile(filepath.Join(home, ".shannon", "chrome-cdp", ".cookies_fingerprint"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// cookieFingerprintFiles is the cookie store plus its SQLite sidecars, for both
+// the legacy root location and the modern Network/ subdirectory (Chrome moved
+// the cookie DB to Network/Cookies around M96, so on current profiles the root
+// Cookies file may be absent entirely). The journal (rollback) and WAL pair are
+// included so the fingerprint reflects the whole on-disk cookie store
+// regardless of journaling mode, and so they get copied alongside the main DB
+// to keep the cloned SQLite store self-consistent.
+var cookieFingerprintFiles = []string{
+	"Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm",
+	"Network/Cookies", "Network/Cookies-journal", "Network/Cookies-wal", "Network/Cookies-shm",
+}
+
+// computeCookieFingerprint fingerprints the source profile's cookie store.
+// Returns "" only when none of the cookie files exist (nothing to compare) —
+// it does not require the root Cookies file, since modern profiles keep the DB
+// under Network/. Keyed on file size plus a sha256 of contents — deliberately
+// NOT mtime, so an equivalent in-place rewrite (e.g. a cookie expiry refresh
+// that doesn't change the stored value) doesn't churn the fingerprint and
+// trigger needless re-seeds. Contents are streamed through the hash so a heavy
+// profile (root + Network/ DBs plus -wal sidecars, 10 MB+) isn't buffered.
+//
+// Note: the source Chrome may be mid-write while we hash. The bytes hashed here
+// are not guaranteed identical to the bytes prepareCDPProfile copies a moment
+// later; worst case is a spurious re-seed on the next cold start (cheap). Like
+// the seed decision itself, this only runs on a Chrome cold start.
+func computeCookieFingerprint(profileDir string) string {
+	h := sha256.New()
+	found := false
+	for _, name := range cookieFingerprintFiles {
+		f, err := os.Open(filepath.Join(profileDir, name))
+		if err != nil {
+			continue
+		}
+		found = true
+		fi, statErr := f.Stat()
+		size := int64(-1)
+		if statErr == nil {
+			size = fi.Size()
+		}
+		fmt.Fprintf(h, "%s:%d\n", name, size)
+		io.Copy(h, f) //nolint:errcheck
+		f.Close()     //nolint:errcheck
+	}
+	if !found {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// cookieFingerprintChanged reports whether the live source fingerprint differs
+// from the one captured at last clone. An empty stored fingerprint (a clone
+// made by pre-fingerprint code) counts as changed when a live fingerprint
+// exists, so the next cold start refreshes the login state.
+//
+// A "" current fingerprint (no cookie files at the source) is deliberately NOT
+// treated as a change: absence is not divergence. This avoids re-seeding off a
+// transient state where Chrome has momentarily removed/recreated the DB, and
+// avoids clobbering a good clone when the source profile is unreadable.
+func cookieFingerprintChanged(current, stored string) bool {
+	if current == "" {
+		return false
+	}
+	return current != stored
+}
+
+// decideCDPSeed decides whether the CDP profile must be re-seeded on a cold
+// start. markerExists is whether .profile_source was found; markerProfile is
+// its contents. rebuildDefault is true only on a profile switch, where the
+// whole Default dir is wiped before re-seeding; a cookie-only change re-seeds
+// in place.
+func decideCDPSeed(markerExists bool, markerProfile, profileName, currentCookieFP, storedCookieFP string) (needSeed, rebuildDefault bool) {
+	if !markerExists {
+		return true, false // first launch or upgrade from old code
+	}
+	if markerProfile != profileName {
+		return true, true
+	}
+	if cookieFingerprintChanged(currentCookieFP, storedCookieFP) {
+		return true, false
+	}
+	return false, false
+}
+
+func chromeCloneStatus(effective, lastClone, currentCookieFP, lastCookieFP string) string {
 	if lastClone == "" {
 		return ChromeProfileCloneMissing
 	}
 	if effective != "" && lastClone != effective {
+		return ChromeProfileCloneStale
+	}
+	if cookieFingerprintChanged(currentCookieFP, lastCookieFP) {
 		return ChromeProfileCloneStale
 	}
 	return ChromeProfileCloneCurrent
@@ -1665,7 +1768,9 @@ func GetChromeProfileState(configuredProfile string) (ChromeProfileState, error)
 	}
 
 	lastClone := readProfileSourceMarker(home)
-	cloneStatus := chromeCloneStatus(effective, lastClone)
+	currentCookieFP := computeCookieFingerprint(filepath.Join(chromeDir, effective))
+	lastCookieFP := readCookieFingerprintMarker(home)
+	cloneStatus := chromeCloneStatus(effective, lastClone, currentCookieFP, lastCookieFP)
 	refreshRequired := cloneStatus == ChromeProfileCloneStale
 
 	return ChromeProfileState{
@@ -1700,20 +1805,34 @@ func prepareCDPProfile(srcProfile, profileName, cdpDir string) error {
 	// not the original profile name which would create an empty new directory.
 	patchLocalStateLastUsed(filepath.Join(cdpDir, "Local State"))
 
-	// Critical files are logged on failure; others are best-effort.
+	// Critical files are logged on failure; others are best-effort. The cookie
+	// DB isn't listed: its location varies (root vs Network/) and a fresh
+	// profile may legitimately have none, so a copy failure there is expected.
 	criticalFiles := map[string]bool{
-		"Cookies":    true,
 		"Login Data": true,
 	}
-	sessionFiles := []string{
-		"Cookies",
+
+	// Matters only on the cookie-only re-seed path: there the Default dir is NOT
+	// wiped, so a -wal/-journal sidecar left by the previous clone could survive
+	// when the current source no longer has it — SQLite would then
+	// replay/rollback against a stale sidecar and surface the old login state.
+	// Drop every cookie DB + sidecar at the destination first so the copy below
+	// reproduces exactly the source's cookie store. (No-op on the profile-switch
+	// path, where LaunchCDPChrome already removed all of Default/.)
+	for _, f := range cookieFingerprintFiles {
+		os.Remove(filepath.Join(defaultDst, f)) //nolint:errcheck
+	}
+
+	// cookieFingerprintFiles is the single source of truth for the cookie store
+	// (root + Network/, DB + all sidecars); the rest are other session files.
+	sessionFiles := append([]string{}, cookieFingerprintFiles...)
+	sessionFiles = append(sessionFiles,
 		"Login Data",
 		"Web Data",
 		"Preferences",
 		"Secure Preferences",
-		"Network/Cookies",
 		"Network/TransportSecurity",
-	}
+	)
 	for _, f := range sessionFiles {
 		src := filepath.Join(profileSrc, f)
 		dst := filepath.Join(defaultDst, f)
