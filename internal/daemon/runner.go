@@ -1004,6 +1004,42 @@ func shouldSkipPlaywrightProbeChromeRelaunch(before mcp.ServerHealth, cfg mcp.MC
 		!cfg.KeepAlive
 }
 
+// playwrightTurnStartAction is the outcome of the RunAgent turn-start Playwright
+// probe decision. Extracted as a pure function so the full decision matrix
+// (state × connected × CDP/keep_alive × source) is unit-testable end to end,
+// not just the shouldSkip sub-predicate.
+type playwrightTurnStartAction int
+
+const (
+	// playwrightProbeSkipNoClient: no live client to probe (Disconnected or
+	// never connected). ProbeNow would fire attemptReconnect → relaunch Chrome;
+	// on-demand recovery at tool dispatch handles Chrome instead.
+	playwrightProbeSkipNoClient playwrightTurnStartAction = iota
+	// playwrightProbeSkipRelaunch: a client is connected but this is the CDP +
+	// keep_alive=false idle state — probing would relaunch a blank Chrome on a
+	// turn that may never touch the browser. Skip; Chrome launches on demand.
+	playwrightProbeSkipRelaunch
+	// playwrightProbeRun: probe (refresh health / warm Chrome for keep_alive=true).
+	playwrightProbeRun
+)
+
+// playwrightTurnStartProbeAction decides whether the turn-start probe runs.
+// The invariant: a turn starting must never launch a visible Chrome window on
+// its own — only an actual browser-tool invocation may. Two skips enforce it:
+// no live client (ProbeNow would reconnect+relaunch), and the CDP +
+// keep_alive=false Degraded idle state (ProbeNow → maybeRelaunchDegradedCDPChrome
+// would pop a blank window). Everything else probes: keep_alive=true warms
+// Chrome, Healthy/non-CDP probes are health refreshes whose relaunch is a no-op.
+func playwrightTurnStartProbeAction(before mcp.ServerHealth, playwrightLive bool, cfg mcp.MCPServerConfig, hasCfg bool, req RunAgentRequest) playwrightTurnStartAction {
+	if before.State == mcp.StateDisconnected || !playwrightLive {
+		return playwrightProbeSkipNoClient
+	}
+	if hasCfg && shouldSkipPlaywrightProbeChromeRelaunch(before, cfg, req) {
+		return playwrightProbeSkipRelaunch
+	}
+	return playwrightProbeRun
+}
+
 // resumeNamedAgentColdStart resumes the latest persisted named-agent session.
 // Returns true only when a session was actually loaded from disk; a fresh
 // in-memory session pre-created by the route manager does not count as resumed.
@@ -1132,17 +1168,21 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// tools exposed (RebuildRegistryForHealth), so we never lose recovery.
 		before := sup.HealthFor("playwright")
 		playwrightLive := mgr != nil && mgr.IsConnected("playwright")
-		if before.State != mcp.StateDisconnected && playwrightLive {
-			var pwCfg mcp.MCPServerConfig
-			hasPlaywrightCfg := false
-			if mgr != nil {
-				pwCfg, hasPlaywrightCfg = mgr.ConfigFor("playwright")
-			}
-			if hasPlaywrightCfg && shouldSkipPlaywrightProbeChromeRelaunch(before, pwCfg, req) {
-				log.Printf("daemon: skipping Playwright turn-start Chrome relaunch (CDP keep_alive=false; Chrome launches on demand at tool dispatch)")
-			} else {
-				sup.ProbeNow("playwright")
-			}
+		var pwCfg mcp.MCPServerConfig
+		hasPlaywrightCfg := false
+		if mgr != nil {
+			pwCfg, hasPlaywrightCfg = mgr.ConfigFor("playwright")
+		}
+		switch playwrightTurnStartProbeAction(before, playwrightLive, pwCfg, hasPlaywrightCfg, req) {
+		case playwrightProbeRun:
+			sup.ProbeNow("playwright")
+		case playwrightProbeSkipRelaunch:
+			log.Printf("daemon: skipping Playwright turn-start Chrome relaunch (CDP keep_alive=false; Chrome launches on demand at tool dispatch)")
+		case playwrightProbeSkipNoClient:
+			// No live client (Disconnected, or never connected). ProbeNow would
+			// fire attemptReconnect → relaunch Chrome; skip it. On-demand recovery
+			// at tool dispatch (mcp_tool.go ensureChromeDebugPort) launches Chrome
+			// when the agent actually invokes a browser tool.
 		}
 	}
 	// Phase 2: re-snapshot to get post-swap registry
