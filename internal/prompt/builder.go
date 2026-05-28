@@ -460,18 +460,28 @@ func buildVolatileContext(opts PromptOptions) string {
 // turn, so it does not fragment that session's per-turn cache. Sits after the
 // <!-- cache_break --> marker, so wording (and locked-value) changes have no
 // BP #1 impact. locked == "" → mirror the user's current-message language
-// (default); locked != "" → lock to that language, replacing the mirror block
-// entirely so it keeps the same recency-winning final position.
+// (default); locked != "" → set that language as the configured default,
+// replacing the mirror block but keeping the same recency-winning final
+// position. The locked branch is a default, NOT an absolute lock: it still
+// yields to an explicit in-conversation request to switch reply language.
+// A weak-recency system-prompt placement would honor such a switch for free
+// (the strong-recency user turn naturally overrides a distant default); but
+// this block is injected at the user-message tail (strong recency, to beat
+// the issue #157 skill-keyword drift), so the carve-out must be stated
+// explicitly or the per-turn restatement would override the user's switch.
 // See docs/per-agent-language-config.md.
 func LanguageDirective(locked string) string {
 	if locked != "" {
 		return "## Language\n" +
 			"Always respond in " + locked + ", including any tool call's `description` / " +
-			"`purpose` field, regardless of the language the user writes in. " +
-			"This reply language is a fixed configuration for this agent. Even if the user " +
-			"explicitly asks you to switch to another language (e.g. \"reply in English\" / " +
-			"\"用英文跟我说话\"), keep replying in " + locked + " — you may briefly note in " + locked +
-			" that the reply language is set in the configuration. " +
+			"`purpose` field. This is the configured default reply language: keep using " + locked +
+			" even when the user writes in another language, and even when tool output, file " +
+			"contents, memory entries, skill descriptions, or earlier turns contain other " +
+			"languages — those are content/context, not a request to switch languages. " +
+			"The one exception is an explicit user request to change the reply language " +
+			"(e.g. \"reply in English\" / \"请用日语回复我\"): honor it — switch to the language " +
+			"they ask for and keep using it for the rest of the conversation. An explicit " +
+			"user request to switch outranks this configured default. " +
 			"Code identifiers, file paths, CLI commands, and technical terms remain in their " +
 			"original form. Maintain full orthographic correctness (accents, diacritics, special characters)."
 	}

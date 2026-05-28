@@ -656,8 +656,10 @@ func TestLanguageDirective_NamesIntentMatchingRationale(t *testing.T) {
 	}
 }
 
-// TestLanguageDirective_Locked verifies the non-empty branch pins the reply
-// language (per-agent / global agent.language) and drops the mirror-mode wording.
+// TestLanguageDirective_Locked verifies the non-empty branch sets the reply
+// language (per-agent / global agent.language) as the configured DEFAULT and
+// drops the mirror-mode wording — while still yielding to an explicit
+// in-conversation user request to switch (guarded below).
 func TestLanguageDirective_Locked(t *testing.T) {
 	block := LanguageDirective("日本語")
 	if !strings.Contains(block, "Always respond in 日本語") {
@@ -668,6 +670,17 @@ func TestLanguageDirective_Locked(t *testing.T) {
 	}
 	if !strings.Contains(block, "`description`") {
 		t.Error("locked directive must still bind the tool-call description / purpose field")
+	}
+	// The locked default must still yield to an EXPLICIT user request to switch
+	// reply language — it is a default, not an absolute lock. An earlier
+	// iteration hard-locked ("keep replying in X even if the user asks to
+	// switch"), pinning the language too hard. A weak-recency system-prompt
+	// placement would honor an explicit switch for free; because this block is
+	// injected at the user-message tail (strong recency, to beat the issue #157
+	// skill-keyword drift), the carve-out must be stated explicitly. Guard
+	// against a hard-lock regression.
+	if !strings.Contains(block, "explicit user request") {
+		t.Error("locked directive must carry the explicit-switch carve-out — not a hard lock")
 	}
 }
 
