@@ -206,7 +206,7 @@ func TestSuggestionPromptIsStable(t *testing.T) {
 	if n := len(SuggestionPrompt); n < 50 || n > 2000 {
 		t.Errorf("SuggestionPrompt length out of range: %d (want 50..2000)", n)
 	}
-	const expectedSHA256 = "ee1565894399a6d10a9fdb8aa106c73c9cafe6b0bff632731198aaabbc82837e"
+	const expectedSHA256 = "ffd328c31cdc05890e3ccead5acd5309a67e87761337f672e1323f3fe968f61a"
 	got := fmt.Sprintf("%x", sha256.Sum256([]byte(SuggestionPrompt)))
 	if got != expectedSHA256 {
 		t.Errorf("SuggestionPrompt sha256 = %s\n             want = %s\nIf the change is intentional, update expectedSHA256 in this test.", got, expectedSHA256)

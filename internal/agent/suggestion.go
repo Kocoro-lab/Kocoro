@@ -19,7 +19,7 @@ import (
 // CHANGE WITH CARE: this string is part of the forked request's tail tokens
 // (uncached). Edits do not invalidate the main turn's cache prefix, but they
 // do change suggestion behavior in non-obvious ways.
-const SuggestionPrompt = `<system-instruction>Predict the user's most likely next message in this conversation. Respond with ONLY that next message — 2 to 12 words, matching the user's tone and language. No quotes, no preamble, no explanation. If you cannot confidently predict a useful next message, respond with exactly the word "skip".</system-instruction>`
+const SuggestionPrompt = `<system-instruction>Predict the user's most likely next message in this conversation. Respond with ONLY that next message — 2 to 12 words, matching the user's tone. No quotes, no preamble, no explanation. If you cannot confidently predict a useful next message, respond with exactly the word "skip".</system-instruction>`
 
 // allowedSingleWords contains short imperative action verbs acceptable as
 // 1-word suggestions. Anything outside this set requires ≥2 words. Filler
