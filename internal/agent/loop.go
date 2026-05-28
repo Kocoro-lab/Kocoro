@@ -1506,6 +1506,13 @@ func (a *AgentLoop) SetAgentName(name string) {
 // SetSource records the per-call originating source (e.g. "slack", "webview",
 // "tui"). Tools that need to capture this — currently schedule_create — can
 // read it via Source(). Empty string means unknown.
+//
+// Invariant: runner.RunAgent calls SetSource(req.Source) at the start of
+// each Run, so a stale value from a prior request cannot bleed through.
+// If a future refactor introduces another entry point that does not pass
+// through runner.RunAgent, that entry point MUST also call SetSource — or
+// schedule_create will silently inherit the previous Run's source and the
+// broadcast gate's smart default will fire on the wrong vocabulary.
 func (a *AgentLoop) SetSource(source string) {
 	a.source = source
 }

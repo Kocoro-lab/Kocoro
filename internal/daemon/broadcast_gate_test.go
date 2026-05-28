@@ -60,3 +60,42 @@ func TestShouldBroadcast(t *testing.T) {
 // smart-default check; isCloudSource has its own positive/negative coverage
 // elsewhere. The matrix above asserts the integration end-to-end so this
 // file deliberately doesn't re-test the source enum.
+
+func TestIsValidScheduleSource(t *testing.T) {
+	tests := []struct {
+		source string
+		want   bool
+	}{
+		// Empty is accepted (legacy schedules + CLI leave it unset).
+		{"", true},
+		// Cloud sources flow through isCloudSource.
+		{"slack", true},
+		{"line", true},
+		{"feishu", true},
+		{"lark", true},
+		{"wecom", true},
+		{"telegram", true},
+		{"webhook", true},
+		// Local origins the daemon recognizes.
+		{"kocoro", true},
+		{"webview", true},
+		{"tui", true},
+		{"cli", true},
+		{"one-shot", true},
+		// Case / whitespace normalization mirrors isCloudSource.
+		{"  Slack ", true},
+		{"WEBVIEW", true},
+		// Free-form garbage a buggy client could POST → rejected.
+		{"totally-made-up", false},
+		{"slackk", false},
+		{"../etc/passwd", false},
+		{"discord", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.source, func(t *testing.T) {
+			if got := isValidScheduleSource(tc.source); got != tc.want {
+				t.Errorf("isValidScheduleSource(%q) = %v, want %v", tc.source, got, tc.want)
+			}
+		})
+	}
+}

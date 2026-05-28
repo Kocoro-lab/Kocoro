@@ -84,6 +84,12 @@ var scheduleCreateCmd = &cobra.Command{
 			return fmt.Errorf("--cron and --prompt are required")
 		}
 		mgr := newScheduleManager()
+		// CLI schedules deliberately stay silent: mgr.Create leaves both
+		// CreatedFromSource and Broadcast unset, so the broadcast gate's
+		// smart default falls through to no proactive push. Users who want
+		// CLI-created schedules to broadcast must edit ~/.shannon/schedules.json
+		// or re-create the schedule via the LLM (schedule_create tool) where
+		// the broadcast enum is exposed.
 		id, err := mgr.Create(schedCreateAgent, schedCreateCron, schedCreatePrompt, schedCreateStateful)
 		if err != nil {
 			return err

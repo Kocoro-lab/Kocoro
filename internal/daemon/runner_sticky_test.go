@@ -35,6 +35,28 @@ func TestStickyContext_IMBindings(t *testing.T) {
 	}
 }
 
+func TestStickyContext_EmptyWhenNoRoutingSignal(t *testing.T) {
+	// Pure-local runs (TUI / one-shot CLI) arrive with no source, channel,
+	// sender, agentName, bindings, or extra. buildStickyContext must return
+	// "" so the runner.go `if sticky != ""` guard short-circuits and these
+	// runs stay byte-identical to pre-PR sessions (cache equivalence across
+	// the upgrade boundary).
+	if got := buildStickyContext("", "", "", "", "", ""); got != "" {
+		t.Errorf("want empty sticky context when no routing signal; got %q", got)
+	}
+
+	// A lone agentName (named-agent local run) is still a signal — the model
+	// should know its identity — so it must NOT collapse to empty.
+	if got := buildStickyContext("", "", "", "researcher", "", ""); got == "" {
+		t.Error("named-agent run must still emit sticky context")
+	}
+
+	// A lone extra block is a signal too.
+	if got := buildStickyContext("", "", "", "", "", "Note: foo"); got == "" {
+		t.Error("extra-only sticky context must not collapse to empty")
+	}
+}
+
 func TestStickyContext_OrderAgentBeforeBindings(t *testing.T) {
 	// The LLM-facing routing model in the system prompt assumes a stable
 	// line order: Source / Channel / Sender / Agent / IM bindings / extra.

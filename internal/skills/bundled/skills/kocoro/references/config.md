@@ -31,6 +31,12 @@ Global settings control how Shannon behaves across all agents — which AI model
 - Response: `{"mcp_servers": {"slack": "connected"|"enabled"|"disabled"}}`
 - Notes: Shows live connection status for MCP servers and provider health.
 
+### Get daemon status
+- Method: GET
+- Path: /status
+- Response: `{"is_connected": bool, "active_agent": string, "uptime": int_seconds, "version": string, "capabilities": [string], "memory": {...}}`
+- Notes: `capabilities` is the list of daemon capability tokens this binary advertises — the same set the WS handshake sends to Cloud. UI clients read it to gate features behind a token rather than a version string, so a feature lights up only when the running daemon actually supports it. Current tokens include `tool_use_id_events`, `inline_document_b64`, `inline_extracted_text`, `delivery_ack`, and `schedule_broadcast_gate` (advertises that the daemon honors the per-schedule broadcast gate — see `schedules.md`). `memory` is present only when the memory sidecar is configured (its `reason` / `detail` fields are documented in `memory.md`).
+
 ## Key Config Fields
 
 | Field | Description | Protected |

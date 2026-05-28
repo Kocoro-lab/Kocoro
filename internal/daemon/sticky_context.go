@@ -9,7 +9,17 @@ import "strings"
 // formatIMBindings; pass "" to omit the IM bindings sticky line entirely
 // (no bindings, or Cloud fetch failed — both legitimate "unknown" states).
 // Extra is an optional caller-provided block appended verbatim.
+//
+// Returns "" when every routing input is empty. Pre-PR pure-local runs
+// (TUI / one-shot CLI without source/channel/sender/agentName/imBindings)
+// had no sticky context at all; preserving that lets the runner.go
+// `if sticky != "" { loop.SetStickyContext(sticky) }` guard short-circuit
+// for those, which in turn keeps cache equivalence against pre-PR sessions
+// that resume across the upgrade boundary.
 func buildStickyContext(source, channel, sender, agentName, imBindings, extra string) string {
+	if source == "" && channel == "" && sender == "" && agentName == "" && imBindings == "" && extra == "" {
+		return ""
+	}
 	var parts []string
 	if source != "" {
 		parts = append(parts, "Source: "+source)

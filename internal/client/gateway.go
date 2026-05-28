@@ -955,8 +955,8 @@ type GatewayClient struct {
 	// Bindings change rarely (OAuth install / uninstall); short TTL keeps
 	// per-Run cost bounded while still picking up new bindings within a
 	// reasonable window after the user OAuth-installs a channel.
-	bindingsMu     sync.Mutex
-	bindingsCache  []ChannelBinding
+	bindingsMu       sync.Mutex
+	bindingsCache    []ChannelBinding
 	bindingsCachedAt time.Time
 }
 
@@ -1338,10 +1338,10 @@ func (c *GatewayClient) SubmitTaskStream(ctx context.Context, req TaskRequest) (
 // /api/v1/channels response. Only the fields the daemon actually uses are
 // modelled here — extras in the response are ignored.
 type ChannelBinding struct {
-	Type    string          `json:"type"`              // slack, line, feishu, lark, wecom, telegram, webhook, ...
-	Name    string          `json:"name"`              // human-readable channel name (e.g. "kocoro-test-slack")
+	Type    string          `json:"type"` // slack, line, feishu, lark, wecom, telegram, webhook, ...
+	Name    string          `json:"name"` // human-readable channel name (e.g. "kocoro-test-slack")
 	Enabled bool            `json:"enabled"`
-	Config  json.RawMessage `json:"config,omitempty"`  // raw JSON; AgentName extracted lazily via ChannelBindingAgentName
+	Config  json.RawMessage `json:"config,omitempty"` // raw JSON; AgentName extracted lazily via ChannelBindingAgentName
 }
 
 // ChannelBindingAgentName extracts the bound agent name from a binding's
@@ -1373,7 +1373,10 @@ const channelBindingsTTL = 60 * time.Second
 // callers degrade by omitting the IM bindings sticky-context line.
 func (c *GatewayClient) ListChannelBindings(ctx context.Context) ([]ChannelBinding, error) {
 	c.bindingsMu.Lock()
-	if time.Since(c.bindingsCachedAt) < channelBindingsTTL && c.bindingsCachedAt != (time.Time{}) {
+	// On cold start bindingsCachedAt is the zero time, and time.Since(zero)
+	// is several centuries — well past channelBindingsTTL — so the first
+	// call always misses the cache without needing an explicit guard.
+	if time.Since(c.bindingsCachedAt) < channelBindingsTTL {
 		cached := append([]ChannelBinding(nil), c.bindingsCache...)
 		c.bindingsMu.Unlock()
 		return cached, nil

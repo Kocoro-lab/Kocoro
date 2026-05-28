@@ -3995,6 +3995,10 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 	if req.Stateful != nil {
 		stateful = *req.Stateful
 	}
+	if !isValidScheduleSource(req.CreatedFromSource) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("created_from_source %q is not a recognized origin", req.CreatedFromSource))
+		return
+	}
 	opts := schedule.CreateOpts{CreatedFromSource: req.CreatedFromSource}
 	if req.Broadcast != nil {
 		bPtr, ok := schedule.ParseBroadcastEnum(*req.Broadcast)

@@ -98,6 +98,43 @@ func TestHandleCreateSchedule_RejectsInvalidBroadcast(t *testing.T) {
 	}
 }
 
+func TestHandleCreateSchedule_RejectsUnknownSource(t *testing.T) {
+	srv, _, _ := newTestServerWithScheduleMgr(t)
+	// A free-form origin a buggy client could POST. The broadcast gate must
+	// never see it — the API edge rejects it with a 400.
+	body := `{"agent":"x","cron":"0 9 * * *","prompt":"p","created_from_source":"totally-made-up"}`
+	req := httptest.NewRequest(http.MethodPost, "/schedules", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	srv.handleCreateSchedule(w, req)
+	if w.Code < 400 || w.Code >= 500 {
+		t.Fatalf("expected 4xx for unknown created_from_source, got %d body %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "created_from_source") {
+		t.Errorf("error body should mention created_from_source: %s", w.Body.String())
+	}
+}
+
+func TestHandleCreateSchedule_AcceptsCloudSource(t *testing.T) {
+	srv, _, _ := newTestServerWithScheduleMgr(t)
+	// A cloud source is a legitimate origin for the LLM tool path; the API
+	// edge must accept it (validation closes the vocabulary, it does not
+	// reject recognized cloud sources).
+	body := `{"agent":"x","cron":"0 9 * * *","prompt":"p","created_from_source":"slack"}`
+	req := httptest.NewRequest(http.MethodPost, "/schedules", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	srv.handleCreateSchedule(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for cloud source, got %d body %s", w.Code, w.Body.String())
+	}
+	var got schedule.Schedule
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.CreatedFromSource != "slack" {
+		t.Errorf("created_from_source not applied: %q", got.CreatedFromSource)
+	}
+}
+
 func TestHandlePatchSchedule_FlipStatefulTrue(t *testing.T) {
 	srv, mgr, _ := newTestServerWithScheduleMgr(t)
 	id, _ := mgr.Create("x", "0 9 * * *", "p", false)
