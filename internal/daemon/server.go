@@ -956,6 +956,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"active_agent": s.client.ActiveAgent(),
 		"uptime":       int(s.client.Uptime().Seconds()),
 		"version":      s.version,
+		// Daemon capability tokens — Desktop reads this to gate features
+		// behind tokens advertised by this daemon version. Same list the WS
+		// handshake sends to Cloud (Capabilities in client.go).
+		"capabilities": Capabilities,
 	}
 	if s.memSvc != nil {
 		resp["memory"] = s.memSvc.MemoryProviderStatus()
