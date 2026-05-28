@@ -449,8 +449,13 @@ func TestBuildSystemPrompt_MinimalOptions(t *testing.T) {
 	if !strings.HasPrefix(parts.System, "Base only.") {
 		t.Errorf("System should start with base prompt")
 	}
-	if strings.Contains(parts.System, "## Memory") {
-		t.Error("System should not have Memory section")
+	// The Memory & Retrieval guidance (static rules) is unconditional in System.
+	if !strings.Contains(parts.System, "## Memory & Retrieval") {
+		t.Error("System should contain the Memory & Retrieval guidance")
+	}
+	// MEMORY.md *data* must never sit in System — it belongs in VolatileContext.
+	if strings.Contains(parts.System, "daemon-injected from MEMORY.md") {
+		t.Error("System must not carry MEMORY.md data (belongs in VolatileContext)")
 	}
 }
 
