@@ -244,35 +244,32 @@ func buildStaticSystem(opts PromptOptions) string {
 	// in the user message (StableContext via BuildToolListing) to keep this
 	// system prompt byte-stable across users. See issue #107.
 
-	// 3.5. IM channel delivery semantics (stable — explains what the volatile
-	// Source/Channel/Sender values in sticky context mean for reply delivery).
-	// Without this, agents seeing Source: slack still look for a Slack-send
-	// tool and degrade to suggesting Webhook+token workarounds. See Kocoro#186.
+	// 3.5. IM channel delivery (stable — anchors the routing model on the
+	// three sticky-context lines `Source:`, `Agent:`, `IM bindings:`).
+	// Without this section the model infers IM state from the MCP tool
+	// list (wrong — OAuth bindings and MCP servers are independent) or
+	// reaches for a "send to Slack" tool that doesn't exist. See Kocoro#186.
 	sb.WriteString("\n\n## IM channel delivery\n")
-	sb.WriteString("If the per-turn sticky context contains a `Source:` line whose " +
-		"value is a Cloud-distributed channel (slack, line, feishu, lark, wecom, " +
-		"telegram, webhook), your final assistant text reply is automatically " +
-		"delivered back to the originating channel by Kocoro Cloud — you do NOT " +
-		"need any tool, Webhook URL, or Bot Token to 'send' to the user, just " +
-		"write your reply as normal text.\n\n" +
-		"The `Agent:` line in sticky context tells you which Kocoro agent " +
-		"identity is handling this conversation — it will read `Agent: default` " +
-		"when the originating channel is bound to the default agent, or " +
-		"`Agent: <name>` when bound to a named agent. **You ARE the agent that " +
-		"Kocoro Cloud routed this message to** — meaning when you create a " +
-		"scheduled task, the schedule defaults to this same agent identity.\n\n" +
-		"**Broadcast gate**: Whether the schedule's reply gets pushed back to " +
-		"the IM channel uses a smart default by where the schedule is created. " +
-		"Schedules created from IM channels (Slack/Lark/Feishu/Telegram/WeCom/" +
-		"LINE) default to broadcasting their reply back. Schedules created from " +
-		"Desktop/TUI/CLI default to silent (Desktop UI sees the result but the " +
-		"IM channel is not pinged). You can override either direction with the " +
-		"`broadcast` parameter on schedule_create: `broadcast: on` forces " +
-		"broadcast even from Desktop, `broadcast: off` forces silent even from " +
-		"Slack. Default agent and named agents follow the same rule.\n\n" +
-		"You cannot target an arbitrary OTHER channel than the ones already " +
-		"OAuth-bound to your agent identity. If a user asks to post to a " +
-		"specific other channel, say it is not supported.")
+	sb.WriteString("Three sticky-context lines drive routing: `Source:`, `Agent:`, " +
+		"`IM bindings:`.\n\n" +
+		"**`Source:`** — which surface this turn came from. Cloud-distributed " +
+		"sources (slack, line, feishu, lark, wecom, telegram, webhook) get " +
+		"auto-broadcast: your reply text returns to the originating channel " +
+		"with no tool needed. Local sources (webview, tui, cli, one-shot) stay " +
+		"on that surface — your reply does NOT push to IM even when this agent " +
+		"has IM bindings. **Interactive routing follows Source, not bindings.**\n\n" +
+		"**`IM bindings:`** — `<agent>=<type>:<channel>` pairs (joined by `;`) " +
+		"listing OAuth-bound channels per agent. Absence of the line means no " +
+		"bindings exist. This is authoritative; never infer IM connections " +
+		"from the MCP tool list.\n\n" +
+		"**`schedule_create` broadcast** — independent of session `Source`. The " +
+		"schedule's `broadcast` field decides: `\"auto\"` pushes iff the schedule " +
+		"was created from an IM source; `\"on\"` always pushes; `\"off\"` never. " +
+		"If `\"on\"` but the current agent has no `IM bindings:` entry, the push " +
+		"is a silent no-op.\n\n" +
+		"Schedules default to the current `Agent:`. You cannot route to any IM " +
+		"channel outside `IM bindings:`; tell the user to bind via Desktop → " +
+		"Settings → Connectors.")
 
 	// 4. macOS automation guidance (only on darwin with relevant tools)
 	if guidance := macOSAutomationGuidance(opts.LocalToolNames); guidance != "" {

@@ -1875,7 +1875,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		loop.SetModelTier(req.ModelOverride)
 	}
 	// Inject session metadata as sticky context so it survives compaction.
-	if sticky := buildStickyContext(req.Source, req.Channel, req.Sender, agentName, req.StickyContext); sticky != "" {
+	// imBindings is a best-effort Cloud probe: failures degrade silently so
+	// the rest of the sticky block still ships (the LLM correctly infers
+	// "no bindings known" from the line's absence). 60s cache on the
+	// GatewayClient bounds the per-Run cost.
+	var imBindings string
+	if deps.GW != nil {
+		if bindings, err := deps.GW.ListChannelBindings(ctx); err == nil {
+			imBindings = formatIMBindings(bindings)
+		}
+	}
+	if sticky := buildStickyContext(req.Source, req.Channel, req.Sender, agentName, imBindings, req.StickyContext); sticky != "" {
 		loop.SetStickyContext(sticky)
 	}
 

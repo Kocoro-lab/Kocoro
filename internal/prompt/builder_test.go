@@ -1093,21 +1093,27 @@ func TestBuildSystemPrompt_CommunicatingSection_ByteStableAcrossOutputFormat(t *
 }
 
 func TestSystemPrompt_IncludesIMDeliverySemantics(t *testing.T) {
-	// Locks in the IM-channel delivery contract added for issue #186 follow-up.
-	// If this string disappears, agents will resume suggesting Webhook+token
-	// workarounds when asked to "send to this Slack channel".
+	// Locks in the 5 load-bearing claims of the routing model anchored on the
+	// three sticky-context lines (Source / Agent / IM bindings). If any of
+	// these strings disappear the model regresses to:
+	// - inferring IM state from the MCP tool list (wrong — proved by the
+	//   screenshot in Kocoro#186 follow-up), or
+	// - reaching for a "send to Slack" tool that doesn't exist, or
+	// - pushing Desktop chat replies to IM (we don't — interactive routing
+	//   follows Source, not bindings).
 	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
 
 	for _, want := range []string{
-		"## IM channel delivery",
-		"Cloud-distributed channel",
-		"you do NOT need any tool",
-		"You ARE the agent",                              // NEW — locks in agent-identity claim
-		"schedule defaults to this same agent",           // NEW — locks in self-default claim
-		"Default agent and named agents follow the same", // A10 — closes the named-only loophole (aligned to broadcast-gate prompt body)
-		"smart default by where the schedule is created", // A10 — broadcast gate intro
-		"`broadcast: on`",                                // A10 — broadcast override forces broadcast
-		"`broadcast: off`",                               // A10 — broadcast override forces silent
+		"## IM channel delivery",                          // section anchor
+		"`IM bindings:`",                                  // the data line — model knows where to look
+		"never infer IM connections from the MCP tool list", // defends against the screenshot bug
+		"Interactive routing follows Source, not bindings", // user's "Desktop chat doesn't push" rule
+		"`schedule_create` broadcast",                     // schedule-specific routing block
+		"`\"auto\"` pushes iff",                           // broadcast=auto semantics
+		"`\"on\"` always pushes",                          // broadcast=on
+		"`\"off\"` never",                                 // broadcast=off
+		"silent no-op",                                    // failure mode if "on" + no binding
+		"Desktop → Settings → Connectors",                 // remediation path
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("system prompt missing IM-delivery phrase %q", want)

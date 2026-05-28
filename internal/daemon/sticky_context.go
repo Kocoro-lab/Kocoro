@@ -5,8 +5,11 @@ import "strings"
 // buildStickyContext composes the per-run metadata block injected into the
 // LLM context. Always emits an Agent: line — "default" when agentName is
 // empty — so the model knows which Kocoro agent identity it's running as.
+// imBindings is the formatted `<agent>=<type>:<channel>; ...` line from
+// formatIMBindings; pass "" to omit the IM bindings sticky line entirely
+// (no bindings, or Cloud fetch failed — both legitimate "unknown" states).
 // Extra is an optional caller-provided block appended verbatim.
-func buildStickyContext(source, channel, sender, agentName, extra string) string {
+func buildStickyContext(source, channel, sender, agentName, imBindings, extra string) string {
 	var parts []string
 	if source != "" {
 		parts = append(parts, "Source: "+source)
@@ -23,6 +26,9 @@ func buildStickyContext(source, channel, sender, agentName, extra string) string
 		parts = append(parts, "Agent: default")
 	} else {
 		parts = append(parts, "Agent: "+agentName)
+	}
+	if imBindings != "" {
+		parts = append(parts, "IM bindings: "+imBindings)
 	}
 	if extra != "" {
 		parts = append(parts, extra)
