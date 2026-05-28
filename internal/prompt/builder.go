@@ -244,6 +244,33 @@ func buildStaticSystem(opts PromptOptions) string {
 	// in the user message (StableContext via BuildToolListing) to keep this
 	// system prompt byte-stable across users. See issue #107.
 
+	// 3.5. IM channel delivery (stable — anchors the routing model on the
+	// three sticky-context lines `Source:`, `Agent:`, `IM bindings:`).
+	// Without this section the model infers IM state from the MCP tool
+	// list (wrong — OAuth bindings and MCP servers are independent) or
+	// reaches for a "send to Slack" tool that doesn't exist. See Kocoro#186.
+	sb.WriteString("\n\n## IM channel delivery\n")
+	sb.WriteString("Three sticky-context lines drive routing: `Source:`, `Agent:`, " +
+		"`IM bindings:`.\n\n" +
+		"**`Source:`** — which surface this turn came from. Cloud-distributed " +
+		"sources (slack, line, feishu, lark, wecom, telegram, webhook) get " +
+		"auto-broadcast: your reply text returns to the originating channel " +
+		"with no tool needed. Local sources (webview, tui, cli, one-shot) stay " +
+		"on that surface — your reply does NOT push to IM even when this agent " +
+		"has IM bindings. **Interactive routing follows Source, not bindings.**\n\n" +
+		"**`IM bindings:`** — `<agent>=<type>:<channel>` pairs (joined by `;`) " +
+		"listing OAuth-bound channels per agent. Absence of the line means no " +
+		"bindings exist. This is authoritative; never infer IM connections " +
+		"from the MCP tool list.\n\n" +
+		"**`schedule_create` broadcast** — independent of session `Source`. The " +
+		"schedule's `broadcast` field decides: `\"auto\"` pushes iff the schedule " +
+		"was created from an IM source; `\"on\"` always pushes; `\"off\"` never. " +
+		"If `\"on\"` but the current agent has no `IM bindings:` entry, the push " +
+		"is a silent no-op.\n\n" +
+		"Schedules default to the current `Agent:`. You cannot route to any IM " +
+		"channel outside `IM bindings:`; tell the user to bind via Desktop → " +
+		"Settings → Connectors.")
+
 	// 4. macOS automation guidance (only on darwin with relevant tools)
 	if guidance := macOSAutomationGuidance(opts.LocalToolNames); guidance != "" {
 		sb.WriteString("\n\n")

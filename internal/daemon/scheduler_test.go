@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -325,5 +326,233 @@ func TestRunWithLifecycle_SkipsLastRunWhenNoSession(t *testing.T) {
 	}
 	if got.LastRunMessageStartIndex != 0 || got.LastRunMessageEndIndex != 0 {
 		t.Errorf("indices must remain zero when no session: start=%d end=%d", got.LastRunMessageStartIndex, got.LastRunMessageEndIndex)
+	}
+}
+
+// fakeProactiveSender records SendProactive invocations for assertions.
+type fakeProactiveSender struct {
+	calls []proactiveCall
+	err   error
+}
+
+type proactiveCall struct {
+	agent     string
+	text      string
+	sessionID string
+}
+
+func (f *fakeProactiveSender) SendProactive(agentName, text, sessionID string) error {
+	f.calls = append(f.calls, proactiveCall{agentName, text, sessionID})
+	return f.err
+}
+
+func TestBroadcastReply_Guards(t *testing.T) {
+	const (
+		scheduleID = "abc123"
+		sessionID  = "sess-1"
+	)
+	bTrue := true
+	bFalse := false
+
+	tests := []struct {
+		name     string
+		ws       ProactiveSender
+		sched    schedule.Schedule
+		reply    string
+		wantCall bool
+	}{
+		// Nil-sender / empty-reply guards always win
+		{
+			name:     "nil_sender_is_no_op",
+			ws:       nil,
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "researcher", CreatedFromSource: "slack"},
+			reply:    "ignored",
+			wantCall: false,
+		},
+		{
+			name:     "empty_reply_skips_broadcast",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "researcher", CreatedFromSource: "slack"},
+			reply:    "",
+			wantCall: false,
+		},
+
+		// Smart default × default agent
+		{
+			name:     "default_agent_smart_slack_broadcasts",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", CreatedFromSource: "slack"},
+			reply:    "hi",
+			wantCall: true,
+		},
+		{
+			name:     "default_agent_smart_webview_silent",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", CreatedFromSource: "webview"},
+			reply:    "hi",
+			wantCall: false,
+		},
+		{
+			name:     "default_agent_pre_feature_silent",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: ""},
+			reply:    "hi",
+			wantCall: false,
+		},
+
+		// Smart default × named agent
+		{
+			name:     "named_agent_smart_slack_broadcasts",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "analyst", CreatedFromSource: "slack"},
+			reply:    "hi",
+			wantCall: true,
+		},
+		{
+			name:     "named_agent_smart_webview_silent",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "analyst", CreatedFromSource: "webview"},
+			reply:    "hi",
+			wantCall: false,
+		},
+		{
+			name:     "named_agent_pre_feature_silent",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "analyst"},
+			reply:    "hi",
+			wantCall: false,
+		},
+
+		// Explicit override
+		{
+			name:     "explicit_true_overrides_webview",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", Broadcast: &bTrue, CreatedFromSource: "webview"},
+			reply:    "hi",
+			wantCall: true,
+		},
+		{
+			name:     "explicit_false_overrides_slack",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", Broadcast: &bFalse, CreatedFromSource: "slack"},
+			reply:    "hi",
+			wantCall: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			broadcastReply(tc.ws, &tc.sched, tc.reply, sessionID)
+
+			if tc.ws == nil {
+				return
+			}
+			fake := tc.ws.(*fakeProactiveSender)
+			if tc.wantCall {
+				if len(fake.calls) != 1 {
+					t.Fatalf("want 1 call, got %d", len(fake.calls))
+				}
+				got := fake.calls[0]
+				if got.agent != tc.sched.Agent {
+					t.Errorf("agent: got %q want %q", got.agent, tc.sched.Agent)
+				}
+				if got.text != tc.reply {
+					t.Errorf("text: got %q want %q", got.text, tc.reply)
+				}
+			} else {
+				if len(fake.calls) != 0 {
+					t.Errorf("want 0 calls, got %d", len(fake.calls))
+				}
+			}
+		})
+	}
+}
+
+func TestBroadcastReply_SendErrorIsSwallowed(t *testing.T) {
+	ws := &fakeProactiveSender{err: errors.New("ws closed")}
+	// Must not panic, must not return; we're asserting that no panic / no
+	// exit-status change escapes the helper. Use a Slack-sourced schedule so
+	// the gate permits the broadcast (otherwise SendProactive isn't reached
+	// and the swallow-on-error contract isn't exercised).
+	sched := schedule.Schedule{ID: "abc", Agent: "researcher", CreatedFromSource: "slack"}
+	broadcastReply(ws, &sched, "hello", "sess-1")
+	if len(ws.calls) != 1 {
+		t.Fatalf("send was not attempted: got %d calls", len(ws.calls))
+	}
+}
+
+func TestRunWithLifecycle_BroadcastsOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
+
+	s := NewScheduler(mgr, &ServerDeps{})
+	fake := &fakeProactiveSender{}
+	s.proactiveSender = fake // testing seam injected on the Scheduler value
+
+	bTrue := true
+	sched := schedule.Schedule{
+		ID:        "abc123",
+		Agent:     "researcher",
+		Prompt:    "anything",
+		Cron:      "* * * * *",
+		Enabled:   true,
+		Broadcast: &bTrue, // exercise the success-branch wiring; gate semantics covered by TestBroadcastReply_Guards
+	}
+
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return &RunAgentResult{
+			Reply:     "today's AI news: ...",
+			SessionID: "sess-1",
+			Agent:     "researcher",
+		}, nil
+	})
+
+	if len(fake.calls) != 1 {
+		t.Fatalf("want 1 SendProactive call, got %d", len(fake.calls))
+	}
+	got := fake.calls[0]
+	if got.agent != "researcher" || got.text != "today's AI news: ..." || got.sessionID != "sess-1" {
+		t.Errorf("payload mismatch: %+v", got)
+	}
+}
+
+func TestRunWithLifecycle_NoBroadcastOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
+
+	s := NewScheduler(mgr, &ServerDeps{})
+	fake := &fakeProactiveSender{}
+	s.proactiveSender = fake
+
+	sched := schedule.Schedule{ID: "abc123", Agent: "researcher"}
+
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return nil, errors.New("agent run failed")
+	})
+
+	if len(fake.calls) != 0 {
+		t.Fatalf("want 0 SendProactive calls on failure, got %d", len(fake.calls))
+	}
+}
+
+func TestRunWithLifecycle_NoBroadcastOnNilResult(t *testing.T) {
+	// Defensive: RunAgent in current code always returns either (*result, nil)
+	// or (nil, err). If it ever returns (nil, nil) — pathological success —
+	// the broadcast path must not panic on result.Reply / result.SessionID.
+	dir := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
+
+	s := NewScheduler(mgr, &ServerDeps{})
+	fake := &fakeProactiveSender{}
+	s.proactiveSender = fake
+
+	sched := schedule.Schedule{ID: "abc123", Agent: "researcher"}
+
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return nil, nil
+	})
+
+	if len(fake.calls) != 0 {
+		t.Fatalf("want 0 SendProactive calls on nil result, got %d", len(fake.calls))
 	}
 }

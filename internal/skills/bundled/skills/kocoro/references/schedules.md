@@ -2,7 +2,7 @@
 
 ## What is this?
 
-Schedules are automated tasks that run on a cron schedule without any human interaction. You define a prompt (what to do), a cron expression (when to do it), and optionally which agent to use. Shannon runs the task at the scheduled time, executes any tool calls automatically, and logs the output.
+Schedules are automated tasks that run on a cron schedule without any human interaction. You define a prompt (what to do), a cron expression (when to do it), and optionally which agent to use. Shannon runs the task at the scheduled time, executes any tool calls automatically, and delivers the reply: to Kocoro Desktop always, and to every Cloud channel (Slack / Lark / Telegram / WeCom / Feishu) the agent — named or default — is OAuth-bound to.
 
 ## API Endpoints
 
@@ -89,6 +89,13 @@ Format: `minute hour day-of-month month day-of-week`
 - **Runs without interaction**: Scheduled tasks execute automatically and unattended. The agent will use tools without asking for approval. Make sure your prompt is specific enough that the agent knows what to do without needing clarification.
 - **Disable vs delete**: Prefer disabling (PATCH with `enabled: false`) over deleting if you might want the schedule again. Deletion is permanent.
 - **Agent selection**: If no agent is specified, the default agent runs the task. Specify an agent if you need specific tools, instructions, or memory.
-- **Output**: Schedule run logs go to `~/.shannon/logs/schedule-{id}.log`. Check these if a scheduled task isn't behaving as expected.
+- **Output destinations**: Successful runs are delivered to (a) the local session JSON, (b) Kocoro Desktop via the `schedule_run` SSE event, and (c) **every Cloud channel the agent is OAuth-bound to** (Slack / Lark / Telegram / WeCom / Feishu), gated by the schedule's `broadcast` field.
+- **Broadcast gate**: each schedule carries a `broadcast` setting with three values: `auto` (default), `on`, `off`.
+  - `auto`: smart default by where the schedule was created. IM-source schedules (Slack / Lark / Feishu / Telegram / WeCom / LINE) broadcast their reply; Desktop / TUI / CLI schedules stay local. Pre-2026-05-27 schedules without the field also stay local (safe default).
+  - `on`: always broadcast, regardless of creation source. Use when the user creates a schedule from Desktop but explicitly wants it to push to their bound IM channel.
+  - `off`: never broadcast. Use when the user creates a schedule from IM but explicitly wants it local-only.
+  - Default agent and named agents follow the same rule.
+  - Set via `schedule_create`'s or `schedule_update`'s `broadcast` parameter (string enum `"auto" | "on" | "off"`). Omitting on create defaults to `auto`; omitting on update leaves the existing value unchanged.
+- **Diagnostic logs**: For debugging, also see `~/.shannon/logs/schedule-{id}.log` (per-schedule run log) and `~/.shannon/logs/audit.log` (cross-cutting tool-call timeline).
 - **Time zone**: Cron expressions use the system time zone of the machine running the Shannon daemon.
 - **Overlapping runs**: If a scheduled task is still running when the next scheduled time arrives, the new run is skipped to prevent overlap.

@@ -950,6 +950,14 @@ type GatewayClient struct {
 	// getAPIKey() under an RLock.
 	keyMu  sync.RWMutex
 	apiKey string
+
+	// channel bindings cache — populated by ListChannelBindings, 60s TTL.
+	// Bindings change rarely (OAuth install / uninstall); short TTL keeps
+	// per-Run cost bounded while still picking up new bindings within a
+	// reasonable window after the user OAuth-installs a channel.
+	bindingsMu       sync.Mutex
+	bindingsCache    []ChannelBinding
+	bindingsCachedAt time.Time
 }
 
 func NewGatewayClient(baseURL, apiKey string) *GatewayClient {
@@ -1324,6 +1332,87 @@ func (c *GatewayClient) SubmitTaskStream(ctx context.Context, req TaskRequest) (
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	return &result, nil
+}
+
+// ChannelBinding is the wire shape of one entry in Cloud's
+// /api/v1/channels response. Only the fields the daemon actually uses are
+// modelled here — extras in the response are ignored.
+type ChannelBinding struct {
+	Type    string          `json:"type"` // slack, line, feishu, lark, wecom, telegram, webhook, ...
+	Name    string          `json:"name"` // human-readable channel name (e.g. "kocoro-test-slack")
+	Enabled bool            `json:"enabled"`
+	Config  json.RawMessage `json:"config,omitempty"` // raw JSON; AgentName extracted lazily via ChannelBindingAgentName
+}
+
+// ChannelBindingAgentName extracts the bound agent name from a binding's
+// config blob. Missing key / nil config / empty string all return "",
+// which the broadcast gate interprets as "default agent".
+func ChannelBindingAgentName(b ChannelBinding) string {
+	if len(b.Config) == 0 {
+		return ""
+	}
+	var cfg struct {
+		AgentName string `json:"agent_name"`
+	}
+	_ = json.Unmarshal(b.Config, &cfg)
+	return cfg.AgentName
+}
+
+// channelBindingsTTL bounds how stale the bindings list can get before the
+// next ListChannelBindings call refetches. 60s strikes a balance: brief
+// enough to surface a newly OAuth-installed channel within a couple of
+// chat turns, long enough to keep per-Run latency cost negligible.
+const channelBindingsTTL = 60 * time.Second
+
+// ListChannelBindings fetches the current IM-channel bindings for this
+// daemon's user from Cloud. Caches the result for channelBindingsTTL to
+// avoid one HTTP round-trip per agent Run.
+//
+// Returns nil + nil error when bindings are empty (legitimate "no IM"
+// state). Returns a non-nil error only on a network or decode failure;
+// callers degrade by omitting the IM bindings sticky-context line.
+func (c *GatewayClient) ListChannelBindings(ctx context.Context) ([]ChannelBinding, error) {
+	c.bindingsMu.Lock()
+	// On cold start bindingsCachedAt is the zero time, and time.Since(zero)
+	// is several centuries — well past channelBindingsTTL — so the first
+	// call always misses the cache without needing an explicit guard.
+	if time.Since(c.bindingsCachedAt) < channelBindingsTTL {
+		cached := append([]ChannelBinding(nil), c.bindingsCache...)
+		c.bindingsMu.Unlock()
+		return cached, nil
+	}
+	c.bindingsMu.Unlock()
+
+	endpoint := c.baseURL + "/api/v1/channels"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		errBody := readResponseBody(resp)
+		if errBody != "" {
+			return nil, fmt.Errorf("list channel bindings returned %d: %s", resp.StatusCode, errBody)
+		}
+		return nil, fmt.Errorf("list channel bindings returned %d", resp.StatusCode)
+	}
+	var bindings []ChannelBinding
+	if err := json.NewDecoder(resp.Body).Decode(&bindings); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	c.bindingsMu.Lock()
+	c.bindingsCache = bindings
+	c.bindingsCachedAt = time.Now()
+	c.bindingsMu.Unlock()
+	return bindings, nil
 }
 
 // GetTask fetches the full task result from the REST API.

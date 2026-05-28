@@ -619,3 +619,100 @@ func TestManager_MarkLastRun_EmptySessionIDIsNoop(t *testing.T) {
 		t.Errorf("empty sessionID must not stamp indices, got %d/%d", got.LastRunMessageStartIndex, got.LastRunMessageEndIndex)
 	}
 }
+
+// --- Task A1: Broadcast + CreatedFromSource fields -------------------------
+
+func TestSchedule_BroadcastFieldRoundTrip(t *testing.T) {
+	bTrue := true
+	bFalse := false
+
+	tests := []struct {
+		name            string
+		schedule        Schedule
+		wantContains    []string
+		wantNotContains []string
+	}{
+		{
+			name: "nil Broadcast + empty CreatedFromSource omits both fields",
+			schedule: Schedule{
+				ID:     "s1",
+				Cron:   "* * * * *",
+				Prompt: "hi",
+			},
+			wantContains:    []string{`"id":"s1"`},
+			wantNotContains: []string{`"broadcast"`, `"created_from_source"`},
+		},
+		{
+			name: "Broadcast=true + CreatedFromSource set serialize",
+			schedule: Schedule{
+				ID:                "s2",
+				Cron:              "* * * * *",
+				Prompt:            "hi",
+				Broadcast:         &bTrue,
+				CreatedFromSource: "slack",
+			},
+			wantContains: []string{`"broadcast":true`, `"created_from_source":"slack"`},
+		},
+		{
+			name: "Broadcast=false serializes as false (not omitted)",
+			schedule: Schedule{
+				ID:                "s3",
+				Cron:              "* * * * *",
+				Prompt:            "hi",
+				Broadcast:         &bFalse,
+				CreatedFromSource: "webview",
+			},
+			wantContains: []string{`"broadcast":false`, `"created_from_source":"webview"`},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.schedule)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			got := string(b)
+			for _, want := range tc.wantContains {
+				if !strings.Contains(got, want) {
+					t.Errorf("output missing %q in %s", want, got)
+				}
+			}
+			for _, notWant := range tc.wantNotContains {
+				if strings.Contains(got, notWant) {
+					t.Errorf("output unexpectedly contains %q in %s", notWant, got)
+				}
+			}
+
+			var round Schedule
+			if err := json.Unmarshal(b, &round); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if (round.Broadcast == nil) != (tc.schedule.Broadcast == nil) {
+				t.Errorf("Broadcast nil-ness lost: got %v, want %v", round.Broadcast, tc.schedule.Broadcast)
+			}
+			if round.Broadcast != nil && *round.Broadcast != *tc.schedule.Broadcast {
+				t.Errorf("Broadcast value lost: got %v, want %v", *round.Broadcast, *tc.schedule.Broadcast)
+			}
+			if round.CreatedFromSource != tc.schedule.CreatedFromSource {
+				t.Errorf("CreatedFromSource: got %q, want %q", round.CreatedFromSource, tc.schedule.CreatedFromSource)
+			}
+		})
+	}
+}
+
+func TestSchedule_LegacyJSONUnmarshalsToNilBroadcast(t *testing.T) {
+	// Pre-PR schedules in ~/.shannon/schedules.json don't carry the new fields.
+	// Verify they deserialize cleanly with safe defaults.
+	const legacy = `{"id":"old","cron":"0 9 * * *","prompt":"morning report","agent":""}`
+	var s Schedule
+	if err := json.Unmarshal([]byte(legacy), &s); err != nil {
+		t.Fatalf("legacy unmarshal failed: %v", err)
+	}
+	if s.Broadcast != nil {
+		t.Errorf("pre-PR Schedule should deserialize with Broadcast=nil, got %v", s.Broadcast)
+	}
+	if s.CreatedFromSource != "" {
+		t.Errorf("pre-PR Schedule should deserialize with CreatedFromSource=\"\", got %q", s.CreatedFromSource)
+	}
+}

@@ -1875,26 +1875,18 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		loop.SetModelTier(req.ModelOverride)
 	}
 	// Inject session metadata as sticky context so it survives compaction.
-	{
-		var parts []string
-		if req.Source != "" {
-			parts = append(parts, "Source: "+req.Source)
+	// imBindings is a best-effort Cloud probe: failures degrade silently so
+	// the rest of the sticky block still ships (the LLM correctly infers
+	// "no bindings known" from the line's absence). 60s cache on the
+	// GatewayClient bounds the per-Run cost.
+	var imBindings string
+	if deps.GW != nil {
+		if bindings, err := deps.GW.ListChannelBindings(ctx); err == nil {
+			imBindings = formatIMBindings(bindings)
 		}
-		if req.Channel != "" {
-			parts = append(parts, "Channel: "+req.Channel)
-		}
-		if req.Sender != "" {
-			parts = append(parts, "Sender: "+req.Sender)
-		}
-		if agentName != "" {
-			parts = append(parts, "Agent: "+agentName)
-		}
-		if req.StickyContext != "" {
-			parts = append(parts, req.StickyContext)
-		}
-		if len(parts) > 0 {
-			loop.SetStickyContext(strings.Join(parts, "\n"))
-		}
+	}
+	if sticky := buildStickyContext(req.Source, req.Channel, req.Sender, agentName, imBindings, req.StickyContext); sticky != "" {
+		loop.SetStickyContext(sticky)
 	}
 
 	// Output format: cloud-distributed channels use "plain" (Shannon Cloud
@@ -1968,6 +1960,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// that agent (keeping results reachable via session_search inside the
 	// same agent) instead of silently routing to the default agent's pool.
 	loop.SetAgentName(agentName)
+	// Per-call originating source. Tools that capture this (schedule_create)
+	// use it as the smart-default signal for broadcast intent. See
+	// docs/superpowers/specs/2026-05-27-schedule-broadcast-gate-design.md.
+	loop.SetSource(req.Source)
 	loop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)
 	// Inject the per-session ReadTracker so file_read dedup history persists
 	// across the per-message AgentLoop instances created here. nil-safe: an

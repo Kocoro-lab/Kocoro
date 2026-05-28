@@ -956,6 +956,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"active_agent": s.client.ActiveAgent(),
 		"uptime":       int(s.client.Uptime().Seconds()),
 		"version":      s.version,
+		// Daemon capability tokens — Desktop reads this to gate features
+		// behind tokens advertised by this daemon version. Same list the WS
+		// handshake sends to Cloud (Capabilities in client.go).
+		"capabilities": Capabilities,
 	}
 	if s.memSvc != nil {
 		resp["memory"] = s.memSvc.MemoryProviderStatus()
@@ -3977,10 +3981,12 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Agent    string `json:"agent"`
-		Cron     string `json:"cron"`
-		Prompt   string `json:"prompt"`
-		Stateful *bool  `json:"stateful"` // nil → default (false / stateless); explicit overrides
+		Agent             string  `json:"agent"`
+		Cron              string  `json:"cron"`
+		Prompt            string  `json:"prompt"`
+		Stateful          *bool   `json:"stateful"` // nil → default (false / stateless); explicit overrides
+		Broadcast         *string `json:"broadcast,omitempty"`
+		CreatedFromSource string  `json:"created_from_source,omitempty"`
 	}
 	if !decodeBody(w, r, &req) {
 		return
@@ -3989,7 +3995,20 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 	if req.Stateful != nil {
 		stateful = *req.Stateful
 	}
-	id, err := s.deps.ScheduleManager.Create(req.Agent, req.Cron, req.Prompt, stateful)
+	if !isValidScheduleSource(req.CreatedFromSource) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("created_from_source %q is not a recognized origin", req.CreatedFromSource))
+		return
+	}
+	opts := schedule.CreateOpts{CreatedFromSource: req.CreatedFromSource}
+	if req.Broadcast != nil {
+		bPtr, ok := schedule.ParseBroadcastEnum(*req.Broadcast)
+		if !ok {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("broadcast must be one of \"auto\", \"on\", \"off\"; got %q", *req.Broadcast))
+			return
+		}
+		opts.Broadcast = bPtr
+	}
+	id, err := s.deps.ScheduleManager.CreateWithOpts(req.Agent, req.Cron, req.Prompt, stateful, opts)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, err.Error())
@@ -4015,16 +4034,17 @@ func (s *Server) handlePatchSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	var patch struct {
-		Cron     *string `json:"cron"`
-		Prompt   *string `json:"prompt"`
-		Enabled  *bool   `json:"enabled"`
-		Stateful *bool   `json:"stateful"`
+		Cron      *string `json:"cron"`
+		Prompt    *string `json:"prompt"`
+		Enabled   *bool   `json:"enabled"`
+		Stateful  *bool   `json:"stateful"`
+		Broadcast *string `json:"broadcast,omitempty"` // "auto"|"on"|"off"; absent leaves field unchanged
 	}
 	if !decodeBody(w, r, &patch) {
 		return
 	}
-	if patch.Cron == nil && patch.Prompt == nil && patch.Enabled == nil && patch.Stateful == nil {
-		writeError(w, http.StatusBadRequest, "no fields to update: provide at least one of cron, prompt, enabled, or stateful")
+	if patch.Cron == nil && patch.Prompt == nil && patch.Enabled == nil && patch.Stateful == nil && patch.Broadcast == nil {
+		writeError(w, http.StatusBadRequest, "no fields to update: provide at least one of cron, prompt, enabled, stateful, or broadcast")
 		return
 	}
 	update := &schedule.UpdateOpts{
@@ -4032,6 +4052,19 @@ func (s *Server) handlePatchSchedule(w http.ResponseWriter, r *http.Request) {
 		Prompt:   patch.Prompt,
 		Enabled:  patch.Enabled,
 		Stateful: patch.Stateful,
+	}
+	// Parse the optional broadcast enum. Absent → leave Schedule.Broadcast
+	// alone (UpdateOpts.Broadcast == nil). Present → ParseBroadcastEnum maps
+	// "auto"/"on"/"off" to *bool; the BroadcastOpt wrapper distinguishes
+	// "leave alone" (UpdateOpts.Broadcast == nil) from "rewrite to nil/true/false"
+	// (UpdateOpts.Broadcast != nil with the *bool inside).
+	if patch.Broadcast != nil {
+		b, ok := schedule.ParseBroadcastEnum(*patch.Broadcast)
+		if !ok {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("broadcast must be one of \"auto\", \"on\", \"off\"; got %q", *patch.Broadcast))
+			return
+		}
+		update.Broadcast = &schedule.BroadcastOpt{Value: b}
 	}
 	if err := s.deps.ScheduleManager.Update(id, update); err != nil {
 		if strings.Contains(err.Error(), "not found") {

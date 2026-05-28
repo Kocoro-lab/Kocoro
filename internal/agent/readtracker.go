@@ -69,6 +69,27 @@ func AgentNameFromContext(ctx context.Context) (string, bool) {
 	return v, ok
 }
 
+// sourceKey is the context key for the per-call originating source
+// (e.g. "slack", "feishu", "webview", "tui", "cli", "one-shot").
+type sourceKey struct{}
+
+// WithSource returns a new context with the originating source set. Tools
+// that need to capture where the call came from (currently schedule_create,
+// to feed the broadcast smart-default gate downstream) read it via
+// SourceFromContext. Empty string means "unknown / pre-feature caller".
+func WithSource(ctx context.Context, source string) context.Context {
+	return context.WithValue(ctx, sourceKey{}, source)
+}
+
+// SourceFromContext returns the originating source from context plus an
+// "ok" boolean. ok=false means no source was injected (tool called outside
+// the agent loop); ok=true with empty string means the loop explicitly
+// recorded an unknown source.
+func SourceFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(sourceKey{}).(string)
+	return v, ok
+}
+
 // IsMemoryFile returns true if path resolves to the MEMORY.md inside the
 // agent's configured memory directory. Returns false when no memory dir
 // is set in context (e.g. tool called outside agent loop).

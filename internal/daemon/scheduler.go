@@ -36,6 +36,12 @@ type Scheduler struct {
 	mu        sync.Mutex
 	lastFired map[string]time.Time // scheduleID -> last fired minute (truncated)
 	sem       chan struct{}        // bounded concurrency
+
+	// proactiveSender is the Cloud-broadcast sender for successful runs.
+	// nil at construction; resolved lazily from deps.WSClient at fire time
+	// so a daemon that signs in mid-process picks up the WS client without
+	// re-creating the Scheduler. Tests inject a fake directly.
+	proactiveSender ProactiveSender
 }
 
 // NewScheduler creates a Scheduler that evaluates schedules from mgr.
@@ -272,6 +278,14 @@ func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAge
 		return
 	}
 	s.emitScheduleRunWithUsage("succeeded", sched, sessionID, nil, usage)
+
+	ws := s.proactiveSender
+	if ws == nil && s.deps != nil && s.deps.WSClient != nil {
+		ws = s.deps.WSClient
+	}
+	if result != nil {
+		broadcastReply(ws, &sched, result.Reply, result.SessionID)
+	}
 }
 
 // emitScheduleRun publishes a schedule_run lifecycle event without a usage
@@ -361,4 +375,29 @@ func (h *scheduleHandler) OnCloudPlan(planType, content string, needsReview bool
 // without rewriting scheduler approval flow.
 func (h *scheduleHandler) OnApprovalNeeded(tool string, args string) bool {
 	return !agent.DisallowsUnattendedAutoApproval(tool)
+}
+
+// ProactiveSender is the narrow Cloud-broadcast surface scheduler needs from
+// *daemon.Client. Defined here so tests can substitute a recording fake
+// without standing up a real WebSocket server. Mirrors LifecycleEventSender
+// in lifecycle.go.
+type ProactiveSender interface {
+	SendProactive(agentName, text, sessionID string) error
+}
+
+// broadcastReply forwards a successful schedule reply to every Cloud channel
+// mapped to the agent when the broadcast gate permits it. The gate uses
+// shouldBroadcast(sched) which combines explicit Broadcast override with a
+// smart default based on Schedule.CreatedFromSource. See broadcast_gate.go.
+// Errors are logged, never propagated.
+func broadcastReply(ws ProactiveSender, sched *schedule.Schedule, reply, sessionID string) {
+	if ws == nil || sched == nil || reply == "" {
+		return
+	}
+	if !shouldBroadcast(sched) {
+		return
+	}
+	if err := ws.SendProactive(sched.Agent, reply, sessionID); err != nil {
+		log.Printf("scheduler: proactive send failed for schedule %s: %v", sched.ID, err)
+	}
 }

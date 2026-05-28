@@ -75,12 +75,20 @@ var Version = "dev"
 // For active-run IM follow-ups, the daemon also forwards an in-place
 // "Queued next" status event to the active channel-stream message when
 // Cloud sends the source as slack/wecom/feishu/lark.
+//
+// "schedule_broadcast_gate" — daemon supports the Schedule.Broadcast +
+// Schedule.CreatedFromSource fields and gates each schedule's reply push
+// through internal/daemon/broadcast_gate.go shouldBroadcast(). Desktops
+// reading this token can show the broadcast badge / picker UI; daemons
+// without the token use the legacy unconditional broadcast (per agent
+// binding). Both daemon shapes interoperate with the same Cloud.
 const (
-	CapDeliveryAck         = "delivery_ack"
-	CapInlineDocumentB64   = "inline_document_b64"
-	CapInlineExtractedText = "inline_extracted_text"
-	CapToolUseIDEvents     = "tool_use_id_events"
-	CapClientMessageQueue  = "client_message_queue"
+	CapDeliveryAck            = "delivery_ack"
+	CapInlineDocumentB64      = "inline_document_b64"
+	CapInlineExtractedText    = "inline_extracted_text"
+	CapToolUseIDEvents        = "tool_use_id_events"
+	CapClientMessageQueue     = "client_message_queue"
+	CapScheduleBroadcastGate  = "schedule_broadcast_gate"
 )
 
 var Capabilities = []string{
@@ -90,7 +98,13 @@ var Capabilities = []string{
 	CapToolUseIDEvents,
 	CapClientMessageQueue,
 	CapIMMessageLifecycleV1,
+	CapScheduleBroadcastGate,
 }
+
+// envelopeSenderFn lets tests substitute sendEnvelope without standing up a
+// real WebSocket. Production wiring (NewClient) defaults the field to
+// c.sendEnvelope so callers see zero behavior change.
+type envelopeSenderFn func(DaemonMessage) error
 
 type Client struct {
 	endpoint      string
@@ -118,6 +132,11 @@ type Client struct {
 	// built without an AuthManager (non-darwin legacy path) simply skips
 	// the notification and lets RunWithReconnect exit on ErrWSAuthRejected.
 	onAuthFailure func()
+
+	// envelopeSender dispatches every outgoing DaemonMessage. Defaulted to
+	// c.sendEnvelope in NewClient; tests inject a fake to capture wire
+	// output without a real WebSocket.
+	envelopeSender envelopeSenderFn
 }
 
 // SetEventBus sets the event bus for emitting daemon events.
@@ -158,7 +177,7 @@ func (c *Client) getOnAuthFailure() func() {
 }
 
 func NewClient(endpoint, apiKey string, onMsg func(MessagePayload) string, onSystem func(string)) *Client {
-	return &Client{
+	c := &Client{
 		endpoint:  endpoint,
 		apiKey:    apiKey,
 		onMsg:     onMsg,
@@ -166,6 +185,8 @@ func NewClient(endpoint, apiKey string, onMsg func(MessagePayload) string, onSys
 		sem:       make(chan struct{}, MaxConcurrentAgents),
 		startTime: time.Now(),
 	}
+	c.envelopeSender = c.sendEnvelope
+	return c
 }
 
 func (c *Client) Connect(ctx context.Context) error {
@@ -235,11 +256,11 @@ func (c *Client) sendEnvelope(dm DaemonMessage) error {
 }
 
 func (c *Client) sendClaim(messageID string) error {
-	return c.sendEnvelope(DaemonMessage{Type: MsgTypeClaim, MessageID: messageID})
+	return c.envelopeSender(DaemonMessage{Type: MsgTypeClaim, MessageID: messageID})
 }
 
 func (c *Client) sendProgress(messageID string) error {
-	return c.sendEnvelope(DaemonMessage{Type: MsgTypeProgress, MessageID: messageID})
+	return c.envelopeSender(DaemonMessage{Type: MsgTypeProgress, MessageID: messageID})
 }
 
 // sendDeliveryAck signals to Cloud that the inbound message reached a
@@ -254,14 +275,14 @@ func (c *Client) sendDeliveryAck(messageID string) error {
 	if messageID == "" {
 		return nil
 	}
-	return c.sendEnvelope(DaemonMessage{Type: MsgTypeDeliveryAck, MessageID: messageID})
+	return c.envelopeSender(DaemonMessage{Type: MsgTypeDeliveryAck, MessageID: messageID})
 }
 
 // SendProgressWithWorkflow sends a progress heartbeat with a workflow_id payload.
 // This tells Cloud to start streaming card replies for the originating channel.
 func (c *Client) SendProgressWithWorkflow(messageID, workflowID string) error {
 	payload, _ := json.Marshal(map[string]string{"workflow_id": workflowID})
-	return c.sendEnvelope(DaemonMessage{Type: MsgTypeProgress, MessageID: messageID, Payload: payload})
+	return c.envelopeSender(DaemonMessage{Type: MsgTypeProgress, MessageID: messageID, Payload: payload})
 }
 
 // SendEvent sends a daemon agent loop event to Cloud for channel streaming.
@@ -280,7 +301,7 @@ func (c *Client) SendEvent(messageID string, eventType, message string, data map
 	if err != nil {
 		return err
 	}
-	return c.sendEnvelope(DaemonMessage{
+	return c.envelopeSender(DaemonMessage{
 		Type:      MsgTypeEvent,
 		MessageID: messageID,
 		Payload:   payload,
@@ -297,13 +318,17 @@ func (c *Client) SendReply(messageID string, payload ReplyPayload) error {
 	if err != nil {
 		return err
 	}
-	return c.sendEnvelope(DaemonMessage{Type: MsgTypeReply, MessageID: messageID, Payload: payloadBytes})
+	return c.envelopeSender(DaemonMessage{Type: MsgTypeReply, MessageID: messageID, Payload: payloadBytes})
 }
 
 // SendProactive sends an unsolicited message to all channels mapped to the agent.
 // This is fire-and-forget — no claim/ack cycle.
+//
+// Empty agentName is a valid case: it represents the default agent, which Cloud
+// routes to channels whose config has no agent_name key (default-bound). Cloud
+// owns the "is anyone listening" decision; daemon doesn't pre-filter.
 func (c *Client) SendProactive(agentName, text, sessionID string) error {
-	if agentName == "" || text == "" {
+	if text == "" {
 		return nil
 	}
 	payload, err := json.Marshal(ProactivePayload{
@@ -315,14 +340,14 @@ func (c *Client) SendProactive(agentName, text, sessionID string) error {
 	if err != nil {
 		return fmt.Errorf("marshal proactive payload: %w", err)
 	}
-	return c.sendEnvelope(DaemonMessage{
+	return c.envelopeSender(DaemonMessage{
 		Type:    MsgTypeProactive,
 		Payload: payload,
 	})
 }
 
 func (c *Client) sendDisconnect() error {
-	return c.sendEnvelope(DaemonMessage{Type: MsgTypeDisconnect})
+	return c.envelopeSender(DaemonMessage{Type: MsgTypeDisconnect})
 }
 
 // Close sends a disconnect message and closes the WebSocket connection.
@@ -350,7 +375,7 @@ func (c *Client) SendApprovalRequest(req ApprovalRequest) error {
 	if err != nil {
 		return err
 	}
-	return c.sendEnvelope(DaemonMessage{
+	return c.envelopeSender(DaemonMessage{
 		Type:      MsgTypeApprovalRequest,
 		MessageID: req.MessageID,
 		Payload:   payload,
@@ -363,7 +388,7 @@ func (c *Client) SendApprovalResolved(p ApprovalResolvedPayload) error {
 	if err != nil {
 		return err
 	}
-	return c.sendEnvelope(DaemonMessage{
+	return c.envelopeSender(DaemonMessage{
 		Type:    MsgTypeApprovalResolved,
 		Payload: payload,
 	})

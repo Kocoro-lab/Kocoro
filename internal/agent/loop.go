@@ -766,6 +766,7 @@ type AgentLoop struct {
 	sessionID        string      // session ID for audit log correlation
 	sessionCWD       string      // session-scoped working directory; set by runner/TUI before Run()
 	agentName        string      // current agent name; empty = default agent. Injected into tool ctx for "who is calling me" lookups.
+	source           string      // per-call originating source (e.g. "slack", "webview", "tui"). Read by tools that need to capture it (schedule_create). Empty = unknown.
 	deltaProvider    DeltaProvider
 	injectCh         chan InjectedMessage
 	injectedMessages []string // messages injected during the last Run(); cleared on each Run() call
@@ -1502,6 +1503,25 @@ func (a *AgentLoop) SetAgentName(name string) {
 	a.agentName = name
 }
 
+// SetSource records the per-call originating source (e.g. "slack", "webview",
+// "tui"). Tools that need to capture this — currently schedule_create — can
+// read it via Source(). Empty string means unknown.
+//
+// Invariant: runner.RunAgent calls SetSource(req.Source) at the start of
+// each Run, so a stale value from a prior request cannot bleed through.
+// If a future refactor introduces another entry point that does not pass
+// through runner.RunAgent, that entry point MUST also call SetSource — or
+// schedule_create will silently inherit the previous Run's source and the
+// broadcast gate's smart default will fire on the wrong vocabulary.
+func (a *AgentLoop) SetSource(source string) {
+	a.source = source
+}
+
+// Source returns the per-call source recorded via SetSource. Empty if unset.
+func (a *AgentLoop) Source() string {
+	return a.source
+}
+
 // SetSessionCWD sets the session-scoped working directory for this loop.
 func (a *AgentLoop) SetSessionCWD(cwd string) {
 	a.sessionCWD = cwd
@@ -2147,6 +2167,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// empty string is meaningful (= default agent) and we want tools to be
 	// able to distinguish "no ctx value" from "ctx says default agent".
 	ctx = WithAgentName(ctx, a.agentName)
+	// Inject the per-call originating source so schedule_create can snapshot
+	// it into the new Schedule's CreatedFromSource — drives the broadcast
+	// smart-default gate in internal/daemon/broadcast_gate.shouldBroadcast.
+	// Empty string is meaningful (= unknown/pre-feature caller) so we inject
+	// unconditionally, same rationale as agentName above.
+	ctx = WithSource(ctx, a.source)
 	ctx = context.WithValue(ctx, readTrackerKey{}, readTracker)
 
 	// Loop behavior constants

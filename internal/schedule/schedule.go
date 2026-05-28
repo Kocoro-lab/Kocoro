@@ -33,6 +33,19 @@ type Schedule struct {
 	// only the LLM's view (runner.historySnapshotForRequest) is affected.
 	Stateful *bool `json:"stateful,omitempty"`
 
+	// Broadcast is a three-state opt-in/out for IM channel push:
+	//   nil   → smart default (see internal/daemon/broadcast_gate.shouldBroadcast)
+	//   true  → always broadcast (regardless of CreatedFromSource)
+	//   false → never broadcast (regardless of CreatedFromSource)
+	Broadcast *bool `json:"broadcast,omitempty"`
+
+	// CreatedFromSource snapshots req.Source at creation time. Used by the
+	// daemon's shouldBroadcast helper as the smart-default signal. Examples:
+	// "slack", "feishu", "webview", "tui", "cli", "one-shot".
+	// Empty string means "pre-feature" (the field didn't exist when the
+	// schedule was saved) — treated as unknown and falls through to silent.
+	CreatedFromSource string `json:"created_from_source,omitempty"`
+
 	// LastRunAt is the wall-clock time of the most recent scheduler-triggered
 	// run (succeeded or failed). nil = never run. Stamped by
 	// Manager.MarkLastRun from the scheduler's runWithLifecycle.
@@ -68,6 +81,22 @@ type UpdateOpts struct {
 	Prompt   *string
 	Enabled  *bool
 	Stateful *bool // nil = no change; non-nil = overwrite (including flip to/from legacy nil)
+	// Broadcast follows the same three-state semantics as Schedule.Broadcast.
+	// The opts-level distinction is:
+	//   - opts.Broadcast == nil          → field not touched on the schedule
+	//   - opts.Broadcast == &(nil *bool) (i.e. *opts.Broadcast == nil) → clear schedule.Broadcast back to nil (smart default)
+	//   - opts.Broadcast == &(&true)     → set schedule.Broadcast = &true
+	//   - opts.Broadcast == &(&false)    → set schedule.Broadcast = &false
+	// Go doesn't allow nested-pointer literals naturally, so callers use
+	// the BroadcastOpt wrapper below to express "clear vs leave alone".
+	Broadcast *BroadcastOpt
+}
+
+// BroadcastOpt distinguishes "leave broadcast alone" (UpdateOpts.Broadcast == nil)
+// from "rewrite broadcast" (UpdateOpts.Broadcast != nil; inner Value carries the
+// new pointer, where Value == nil means clear back to smart default).
+type BroadcastOpt struct {
+	Value *bool
 }
 
 type Manager struct {
@@ -188,7 +217,30 @@ func (m *Manager) lockedModify(fn func([]Schedule) ([]Schedule, error)) error {
 	return m.save(schedules)
 }
 
+// CreateOpts carries the optional, non-validated fields a caller can attach
+// to a new schedule. Required fields (agent/cron/prompt/stateful) stay on
+// the function signature so misuse is a compile error. Pointer/string-typed
+// because nil/"" are both legal "not specified" markers downstream.
+type CreateOpts struct {
+	// Broadcast is the IM-channel-push opt-in/out. nil = smart default;
+	// *true = always broadcast; *false = never broadcast. See the schedule
+	// struct comment for the full semantics.
+	Broadcast *bool
+	// CreatedFromSource snapshots the originating req.Source at creation
+	// time (e.g. "slack", "feishu", "webview", "tui"). Drives the smart
+	// default in internal/daemon/broadcast_gate.shouldBroadcast. Empty
+	// string is acceptable and means "unknown / pre-feature caller".
+	CreatedFromSource string
+}
+
 func (m *Manager) Create(agentName, cron, prompt string, stateful bool) (string, error) {
+	return m.CreateWithOpts(agentName, cron, prompt, stateful, CreateOpts{})
+}
+
+// CreateWithOpts is the extended form of Create that accepts the optional
+// broadcast + source fields. Kept as a separate method so the many existing
+// callers of Create stay compilable without churn.
+func (m *Manager) CreateWithOpts(agentName, cron, prompt string, stateful bool, opts CreateOpts) (string, error) {
 	if err := validateAgent(agentName); err != nil {
 		return "", err
 	}
@@ -203,7 +255,12 @@ func (m *Manager) Create(agentName, cron, prompt string, stateful bool) (string,
 	s := Schedule{
 		ID: id, Agent: agentName, Cron: cron, Prompt: prompt,
 		Enabled: true, SyncStatus: "ok", CreatedAt: time.Now(),
-		Stateful: &statefulCopy, // always explicit on Create — never leave nil for new rows
+		Stateful:          &statefulCopy, // always explicit on Create — never leave nil for new rows
+		CreatedFromSource: opts.CreatedFromSource,
+	}
+	if opts.Broadcast != nil {
+		bCopy := *opts.Broadcast
+		s.Broadcast = &bCopy
 	}
 	err := m.lockedModify(func(schedules []Schedule) ([]Schedule, error) {
 		return append(schedules, s), nil
@@ -232,8 +289,8 @@ func (m *Manager) Get(id string) (*Schedule, error) {
 }
 
 func (m *Manager) Update(id string, opts *UpdateOpts) error {
-	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil {
-		return fmt.Errorf("no fields to update: provide at least one of cron, prompt, enabled, or stateful")
+	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil {
+		return fmt.Errorf("no fields to update: provide at least one of cron, prompt, enabled, stateful, or broadcast")
 	}
 	if opts.Cron != nil {
 		if err := validateCron(*opts.Cron); err != nil {
@@ -273,6 +330,17 @@ func (m *Manager) Update(id string, opts *UpdateOpts) error {
 				if opts.Stateful != nil {
 					v := *opts.Stateful
 					schedules[i].Stateful = &v
+				}
+				if opts.Broadcast != nil {
+					// Value == nil here means the caller asked us to clear
+					// Broadcast back to nil (smart default). Copy non-nil
+					// pointers to avoid aliasing the caller's stack value.
+					if opts.Broadcast.Value == nil {
+						schedules[i].Broadcast = nil
+					} else {
+						bCopy := *opts.Broadcast.Value
+						schedules[i].Broadcast = &bCopy
+					}
 				}
 				return schedules, nil
 			}

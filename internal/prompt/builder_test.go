@@ -1091,3 +1091,32 @@ func TestBuildSystemPrompt_CommunicatingSection_ByteStableAcrossOutputFormat(t *
 		t.Fatalf("System must be byte-equal across OutputFormat values (D2). plain len=%d, markdown len=%d", len(plainParts), len(mdParts))
 	}
 }
+
+func TestSystemPrompt_IncludesIMDeliverySemantics(t *testing.T) {
+	// Locks in the 5 load-bearing claims of the routing model anchored on the
+	// three sticky-context lines (Source / Agent / IM bindings). If any of
+	// these strings disappear the model regresses to:
+	// - inferring IM state from the MCP tool list (wrong — proved by the
+	//   screenshot in Kocoro#186 follow-up), or
+	// - reaching for a "send to Slack" tool that doesn't exist, or
+	// - pushing Desktop chat replies to IM (we don't — interactive routing
+	//   follows Source, not bindings).
+	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
+
+	for _, want := range []string{
+		"## IM channel delivery",                          // section anchor
+		"`IM bindings:`",                                  // the data line — model knows where to look
+		"never infer IM connections from the MCP tool list", // defends against the screenshot bug
+		"Interactive routing follows Source, not bindings", // user's "Desktop chat doesn't push" rule
+		"`schedule_create` broadcast",                     // schedule-specific routing block
+		"`\"auto\"` pushes iff",                           // broadcast=auto semantics
+		"`\"on\"` always pushes",                          // broadcast=on
+		"`\"off\"` never",                                 // broadcast=off
+		"silent no-op",                                    // failure mode if "on" + no binding
+		"Desktop → Settings → Connectors",                 // remediation path
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("system prompt missing IM-delivery phrase %q", want)
+		}
+	}
+}

@@ -54,8 +54,13 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 					"agent": map[string]any{
 						"type": "string",
 						"description": "Agent name (from ~/.shannon/agents/). " +
-							"When the user is creating a schedule from inside a conversation with a named agent (e.g. they are talking to 'analyst' and ask to schedule a daily report), pass that agent's name so future runs use the same persona AND so the user can find the results via session_search inside that same agent. " +
-							"Pass an empty string only when the user explicitly wants the default agent (rare); each run will land in the global ~/.shannon/sessions/ pool and won't be visible to your session_search.",
+							"When you're handling a conversation as a named agent (sticky context shows `Agent: <name>`), " +
+							"pass that name so future runs use the same persona AND the user can find results via session_search inside the same agent. " +
+							"When you're handling a conversation as the default agent (sticky context shows `Agent: default`), " +
+							"pass an empty string — runs will execute under the default agent identity, results land in the global " +
+							"~/.shannon/sessions/ pool, and the reply broadcasts to whichever channels Cloud has bound to the default agent " +
+							"(including the current Slack/IM channel if that's how this conversation reached you). " +
+							"Treat default and named agents symmetrically — neither is 'rare', the choice follows the current conversation identity.",
 					},
 					"cron": map[string]any{"type": "string", "description": "5-field cron expression (minute hour day month weekday). Supports */5, 1-5, 1,3,5."},
 					"prompt": map[string]any{
@@ -72,6 +77,15 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 						"description": "Only meaningful for named agents (ignored for the default agent). " +
 							"false (default, recommended): each run starts with no prior conversation history — best for digests, polling, daily reports, monitoring, and any task where runs are independent. " +
 							"true: each run sees the conversation from prior runs — only choose this when the user explicitly wants the agent to remember and build on previous runs (e.g. continuous research, ongoing project tracking with follow-up questions).",
+					},
+					"broadcast": map[string]any{
+						"type": "string",
+						"enum": []string{"auto", "on", "off"},
+						"description": "Optional. Controls whether the schedule's reply is broadcast to this agent's bound IM channel (Slack / Lark / Feishu / Telegram / WeCom / LINE) when the run finishes. " +
+							"Omit or \"auto\" (smart default, recommended): schedules created from an IM channel broadcast back to that channel; schedules created from Desktop/TUI/CLI stay silent locally. " +
+							"\"on\": even Desktop-created schedules push to the bound IM channel — pick this when the user explicitly wants the result delivered to chat. " +
+							"\"off\": even IM-created schedules stay silent — pick this when the user explicitly wants a quiet local run. " +
+							"Important: do NOT default to \"off\" when the user hasn't expressed an opinion — let the smart default decide.",
 					},
 					"description": agent.DescriptionFieldSpec,
 				},
@@ -101,6 +115,14 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 					"stateful": map[string]any{
 						"type":        "boolean",
 						"description": "Change history-preservation behaviour for named-agent schedules. Omit to leave unchanged. false = each run starts fresh; true = each run sees prior history. Has no effect on default-agent schedules.",
+					},
+					"broadcast": map[string]any{
+						"type": "string",
+						"enum": []string{"auto", "on", "off"},
+						"description": "Optional. Change the schedule's broadcast intent. " +
+							"Omit = leave the current setting unchanged. " +
+							"\"auto\" = clear back to smart default (decided by the schedule's CreatedFromSource). " +
+							"\"on\" / \"off\" = explicitly override.",
 					},
 					"description": agent.DescriptionFieldSpec,
 				},
@@ -175,7 +197,29 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			return agent.ValidationError("description is required"), nil
 		}
 		stateful, _ := args["stateful"].(bool) // missing → false (Go zero value, matches HTTP/CLI default)
-		id, err := t.manager.Create(agentName, cron, prompt, stateful)
+		// Parse broadcast enum. Absent or "auto" maps to nil (smart default).
+		// Use the explicit "present?" check (not just truthy) so the LLM
+		// passing a non-string value still surfaces as a validation error.
+		var broadcast *bool
+		if raw, present := args["broadcast"]; present && raw != nil {
+			bStr, isStr := raw.(string)
+			if !isStr {
+				return agent.ValidationError(fmt.Sprintf("broadcast must be a string (\"auto\", \"on\", or \"off\"); got %T", raw)), nil
+			}
+			b, ok := schedule.ParseBroadcastEnum(bStr)
+			if !ok {
+				return agent.ValidationError(fmt.Sprintf("broadcast must be one of \"auto\", \"on\", \"off\"; got %q", bStr)), nil
+			}
+			broadcast = b
+		}
+		// Capture per-call source for the broadcast gate's smart default.
+		// Empty / not-in-ctx both map to "" — downstream treats both as
+		// "unknown source" and the gate falls through to silent.
+		createdFromSource, _ := agent.SourceFromContext(ctx)
+		id, err := t.manager.CreateWithOpts(agentName, cron, prompt, stateful, schedule.CreateOpts{
+			Broadcast:         broadcast,
+			CreatedFromSource: createdFromSource,
+		})
 		if err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
 		}
@@ -236,8 +280,28 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		if v, ok := args["stateful"].(bool); ok {
 			opts.Stateful = &v
 		}
-		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil {
-			return agent.ValidationError("at least one of cron, prompt, enabled, or stateful is required"), nil
+		// Parse the optional broadcast enum. Absent → leave field unchanged.
+		// Present → parseBroadcastEnum maps "auto"/"on"/"off" to *bool; the
+		// BroadcastOpt wrapper distinguishes "leave alone" (opts.Broadcast == nil)
+		// from "rewrite to nil/true/false" (opts.Broadcast != nil).
+		if raw, present := args["broadcast"]; present && raw != nil {
+			bStr, isStr := raw.(string)
+			if !isStr {
+				return agent.ValidationError(fmt.Sprintf("broadcast must be a string (\"auto\", \"on\", or \"off\"); got %T", raw)), nil
+			}
+			b, ok := schedule.ParseBroadcastEnum(bStr)
+			if !ok {
+				return agent.ValidationError(fmt.Sprintf("broadcast must be one of \"auto\", \"on\", \"off\"; got %q", bStr)), nil
+			}
+			opts.Broadcast = &schedule.BroadcastOpt{Value: b}
+		}
+		// When no field is set, treat as a no-op success rather than an
+		// error: a degenerate `{id, description}` call still produced a
+		// well-formed response (the schedule exists, nothing needed to
+		// change). Manager.Update has its own "no fields" guard so we
+		// must short-circuit here before calling it.
+		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil {
+			return agent.ToolResult{Content: fmt.Sprintf("Schedule %s unchanged (no fields specified).", id)}, nil
 		}
 		if err := t.manager.Update(id, opts); err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil

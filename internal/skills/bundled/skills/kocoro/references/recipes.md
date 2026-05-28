@@ -122,7 +122,7 @@ Automate a regular check-in that runs without you needing to be present.
 
 4. **Verify**: GET /schedules → confirm `enabled: true` and the cron expression is correct
 
-The monitor runs every hour automatically. Check `~/.shannon/logs/schedule-{id}.log` to review past runs.
+The monitor runs every hour automatically. Replies are delivered to the agent's OAuth-bound Cloud channels (e.g. Slack); for low-level debugging also see `~/.shannon/logs/schedule-{id}.log`.
 
 ---
 
