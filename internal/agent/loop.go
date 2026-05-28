@@ -747,6 +747,7 @@ type AgentLoop struct {
 	enableStreaming   bool
 	thinking          *client.ThinkingConfig
 	reasoningEffort   string
+	responseLanguage  string
 	temperature       float64
 	specificModel     string
 	agentBasePrompt   string
@@ -1146,6 +1147,13 @@ func buildAssistantMessage(resp *client.CompletionResponse, normalizedToolText s
 
 func (a *AgentLoop) SetReasoningEffort(effort string) {
 	a.reasoningEffort = effort
+}
+
+// SetResponseLanguage locks the reply language; "" mirrors the user's
+// current-message language (the default). Applied per-turn from global
+// agent.language with a per-agent overlay — see runner/cmd/tui call sites.
+func (a *AgentLoop) SetResponseLanguage(lang string) {
+	a.responseLanguage = lang
 }
 
 func (a *AgentLoop) SetTemperature(temp float64) {
@@ -2704,7 +2712,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 	}
 
-	scaffoldedUserText = appendDynamicUserBlocks(scaffoldedUserText, skillListing, prompt.LanguageDirective())
+	scaffoldedUserText = appendDynamicUserBlocks(scaffoldedUserText, skillListing, prompt.LanguageDirective(a.responseLanguage))
 	messages[len(messages)-1] = replaceUserMessageText(messages[len(messages)-1], scaffoldedUserText)
 
 	const discoveryThreshold = 10

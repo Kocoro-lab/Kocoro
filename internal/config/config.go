@@ -73,6 +73,7 @@ type AgentConfig struct {
 	ForceThinkTool  bool   `mapstructure:"force_think_tool" yaml:"force_think_tool" json:"force_think_tool"`
 	ReasoningEffort string `mapstructure:"reasoning_effort" yaml:"reasoning_effort" json:"reasoning_effort"`
 	Model           string `mapstructure:"model"            yaml:"model"            json:"model"`          // specific model override
+	Language        string `mapstructure:"language"         yaml:"language"         json:"language"`        // locked reply language as a native name (e.g. "中文"); empty = mirror the user's current-message language
 	ContextWindow   int    `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"` // model context window in tokens
 	// IdleSoftTimeoutSecs / IdleHardTimeoutSecs: turn-level watchdog measured
 	// against explicit "idle-counted" phases of the agent loop (waiting on an

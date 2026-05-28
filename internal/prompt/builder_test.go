@@ -495,7 +495,7 @@ func TestBuildVolatileContext_OmitsLanguageBlock(t *testing.T) {
 // names the known non-signal sources so the model has a closed list of
 // things to ignore when picking the response language.
 func TestLanguageDirective_HasImmunizationPhrases(t *testing.T) {
-	block := LanguageDirective()
+	block := LanguageDirective("")
 
 	if !strings.HasPrefix(block, "## Language\n") {
 		t.Errorf("LanguageDirective() must start with `## Language\\n`, got: %q", block[:min(40, len(block))])
@@ -525,7 +525,7 @@ func TestLanguageDirective_HasImmunizationPhrases(t *testing.T) {
 // purpose field — the 22-turn self-reinforcing-Japanese loop in that share
 // was driven by description fields drifting away from the user's language.
 func TestLanguageDirective_CoversToolDescAndMicroCompact(t *testing.T) {
-	block := LanguageDirective()
+	block := LanguageDirective("")
 
 	required := []string{
 		"multilingual trigger keywords",
@@ -542,7 +542,7 @@ func TestLanguageDirective_CoversToolDescAndMicroCompact(t *testing.T) {
 // TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present verifies the
 // static system prompt contains a top-level "## Tool call descriptions"
 // section that binds every tool's `description` / `purpose` field to the
-// user's current-message language. Companion to the per-turn directive
+// reply language as set by the final Language directive. Companion to the per-turn directive
 // asserted by TestLanguageDirective_CoversToolDescAndMicroCompact — the
 // system-prompt section is the byte-stable cached statement of the rule,
 // the per-turn directive is the live re-anchor. Both must remain present.
@@ -567,7 +567,7 @@ func TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present(t *testing.T) {
 		"## Tool call descriptions",
 		"`description`",
 		"SAME language as your reply",
-		"language of the user's CURRENT message",
+		"follow the Language directive",
 		// Conditional wording — must NOT regress to "Every tool call carries".
 		"When the field is present",
 		// Computer exemption — must NOT regress to listing `computer`
@@ -601,7 +601,7 @@ func TestBuildSystemPrompt_LanguageSection_CoversShortAckFallback(t *testing.T) 
 	parts := BuildSystemPrompt(PromptOptions{
 		BasePrompt: "Base.",
 	})
-	directive := LanguageDirective()
+	directive := LanguageDirective("")
 
 	staticRequired := []string{
 		"single-token acknowledgement",
@@ -650,9 +650,24 @@ func TestBuildSystemPrompt_ToolDescriptionLanguageLock_GatedOnLocalTools(t *test
 // asserts the prompt-package directive carries the matching phrasing so
 // they evolve together.
 func TestLanguageDirective_NamesIntentMatchingRationale(t *testing.T) {
-	block := LanguageDirective()
+	block := LanguageDirective("")
 	if !strings.Contains(block, "intent matching") {
 		t.Error("LanguageDirective must mention `intent matching` so the rationale for the multilingual-trigger immunization is self-documenting alongside the rule")
+	}
+}
+
+// TestLanguageDirective_Locked verifies the non-empty branch pins the reply
+// language (per-agent / global agent.language) and drops the mirror-mode wording.
+func TestLanguageDirective_Locked(t *testing.T) {
+	block := LanguageDirective("日本語")
+	if !strings.Contains(block, "Always respond in 日本語") {
+		t.Errorf("locked directive must contain `Always respond in 日本語`, got: %q", block)
+	}
+	if strings.Contains(block, "CURRENT message") {
+		t.Error("locked directive must NOT carry the mirror-mode `CURRENT message` wording")
+	}
+	if !strings.Contains(block, "`description`") {
+		t.Error("locked directive must still bind the tool-call description / purpose field")
 	}
 }
 

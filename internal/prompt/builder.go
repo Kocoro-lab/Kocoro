@@ -133,9 +133,6 @@ func buildStaticSystem(opts PromptOptions) string {
 	sb.WriteString("Reply in the language of the user's most recent message. The authoritative " +
 		"per-turn rule is the Language directive at the end of every user message — defer to it " +
 		"whenever it differs from any other language cue in this prompt. " +
-		"Concrete examples: a user writing primarily in Chinese gets Chinese replies; primarily " +
-		"in English gets English; primarily in Japanese gets Japanese; same rule for any other " +
-		"language. " +
 		"Mixed-language user input — such as one English technical term inside a Chinese sentence — " +
 		"is NOT a language-switch signal. A single-token acknowledgement ('ok', 'yes', 'thanks', " +
 		"'好的', '继续', 'はい', etc.) is NOT enough to override the established language of " +
@@ -192,8 +189,9 @@ func buildStaticSystem(opts PromptOptions) string {
 		sb.WriteString("\n\n## Tool call descriptions\n")
 		sb.WriteString("Most tools expose a short user-facing `description` (or `purpose`) field on their " +
 			"call schema — it surfaces on approval prompts and history cards, where the end user reads " +
-			"it (not the raw args). ALWAYS write this field in the SAME language as your reply to the " +
-			"user (i.e. the language of the user's CURRENT message). Describe the user-facing goal in " +
+			"it (not the raw args). ALWAYS write this field in the SAME language as your reply — i.e. " +
+			"follow the Language directive at the end of the user message (mirror or locked), NOT " +
+			"necessarily the user's current-message language. Describe the user-facing goal in " +
 			"5–15 words, not the internal mechanism. Example for a Chinese conversation: " +
 			"'查找最大的 10 个文件', NOT 'Run find piped to du and sort'. When the field is present, " +
 			"this rule applies — that covers almost every tool you can call. The notable exception is " +
@@ -458,34 +456,39 @@ func buildVolatileContext(opts PromptOptions) string {
 // output, MCP, skill descriptions, code identifiers) so the model has a
 // closed list of things to ignore when picking the response language.
 //
-// Byte-stable so it does not fragment any per-turn cache. Sits after the
-// <!-- cache_break --> marker, so wording changes have no BP #1 impact.
-func LanguageDirective() string {
+// Byte-stable PER agent: a fixed `locked` value yields identical output every
+// turn, so it does not fragment that session's per-turn cache. Sits after the
+// <!-- cache_break --> marker, so wording (and locked-value) changes have no
+// BP #1 impact. locked == "" → mirror the user's current-message language
+// (default); locked != "" → lock to that language, replacing the mirror block
+// entirely so it keeps the same recency-winning final position.
+// See docs/per-agent-language-config.md.
+func LanguageDirective(locked string) string {
+	if locked != "" {
+		return "## Language\n" +
+			"Always respond in " + locked + ", including any tool call's `description` / " +
+			"`purpose` field, regardless of the language the user writes in. " +
+			"This reply language is a fixed configuration for this agent. Even if the user " +
+			"explicitly asks you to switch to another language (e.g. \"reply in English\" / " +
+			"\"用英文跟我说话\"), keep replying in " + locked + " — you may briefly note in " + locked +
+			" that the reply language is set in the configuration. " +
+			"Code identifiers, file paths, CLI commands, and technical terms remain in their " +
+			"original form. Maintain full orthographic correctness (accents, diacritics, special characters)."
+	}
 	return "## Language\n" +
-		"Reply in the language of the user's CURRENT message — the message you are " +
-		"about to answer, NOT any earlier context. " +
-		"If their current message is primarily in English, reply in English. " +
-		"If primarily in Chinese, reply in Chinese. " +
-		"If primarily in Japanese, reply in Japanese. " +
-		"Same rule for any other language. " +
-		"Exception for short acknowledgements: when the current user message is too " +
-		"short to establish a primary language on its own — typically a one- or " +
-		"two-token ack like 'ok', 'yes', 'thanks', '好的', '继续', 'はい', 'sure' " +
-		"with no substantive content — keep replying in the language of the user's " +
-		"prior substantive turns rather than the surface form of the ack. " +
-		"This overrides any language signals from memory entries, tool output, MCP " +
-		"descriptions, skill descriptions (including multilingual trigger keywords such " +
-		"as '中:列出/查询' or '日:一覧/確認' that exist purely for intent matching), " +
-		"micro-compacted tool-result summaries, prior conversation turns, or English code " +
-		"identifiers in this prompt — those are reference material, NOT language signals. " +
-		"Only switch from the current-message language when the user explicitly asks " +
-		"(e.g. \"please reply in English\"). " +
-		"This rule also governs any tool call's `description` / `purpose` field when the " +
-		"tool's schema exposes one: write it in the same language as your reply, not in " +
-		"whatever language the tool's documentation happens to use. " +
+		"Reply in the language of the user's CURRENT message, not any earlier context. " +
+		"Exception for short acknowledgements: a one- or two-token ack ('ok', 'yes', 'thanks', " +
+		"'好的', '继续', 'はい', 'sure') with no substantive content keeps the language of the " +
+		"user's prior substantive turns rather than the surface form of the ack. " +
+		"Ignore all other language cues — memory entries, tool output, MCP descriptions, " +
+		"skill descriptions (including multilingual trigger keywords such as '中:列出/查询' or " +
+		"'日:一覧/確認' that exist purely for intent matching), micro-compacted tool-result " +
+		"summaries, prior conversation turns, English code identifiers in this prompt — these " +
+		"are reference material, NOT language signals. Switch only when the user explicitly " +
+		"asks (e.g. \"please reply in English\"). " +
+		"This also governs any tool call's `description` / `purpose` field. " +
 		"Code identifiers, file paths, CLI commands, and technical terms remain in their " +
-		"original form regardless. " +
-		"Maintain full orthographic correctness (accents, diacritics, special characters)."
+		"original form. Maintain full orthographic correctness (accents, diacritics, special characters)."
 }
 
 // formatGuidance returns output formatting instructions based on the profile.

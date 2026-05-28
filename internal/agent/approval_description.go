@@ -27,7 +27,7 @@ package agent
 var DescriptionFieldSpec = map[string]any{
 	"type": "string",
 	"description": "REQUIRED. A short (5-15 word) natural-language summary of WHAT this call does, " +
-		"written in the user's UI language (中文 / English / etc.). " +
+		"written in the same language as your reply (per the Language directive). " +
 		"Describe the user-facing INTENT, not the API/path/syntax. " +
 		"The end user — often non-technical — sees this, not the args, on the approval prompt. " +
 		"Examples: '查看 ui-components 引用', 'Save login page HTML', '生成头像图片', 'List Downloads folder'. " +

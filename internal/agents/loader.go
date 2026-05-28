@@ -127,6 +127,7 @@ func (p *AgentPermissionsConfig) Clone() *AgentPermissionsConfig {
 type AgentModelConfig struct {
 	Model         *string  `yaml:"model" json:"model,omitempty"`
 	ModelTier     *string  `yaml:"model_tier" json:"model_tier,omitempty"`
+	Language      *string  `yaml:"language" json:"language,omitempty"` // nil = inherit global agent.language; "" = force mirror even if global is locked; value = lock to that language
 	MaxIterations *int     `yaml:"max_iterations" json:"max_iterations,omitempty"`
 	Temperature   *float64 `yaml:"temperature" json:"temperature,omitempty"`
 	MaxTokens     *int     `yaml:"max_tokens" json:"max_tokens,omitempty"`

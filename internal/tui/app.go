@@ -446,6 +446,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	if runtimeCfg.Agent.ReasoningEffort != "" {
 		loop.SetReasoningEffort(runtimeCfg.Agent.ReasoningEffort)
 	}
+	loop.SetResponseLanguage(runtimeCfg.Agent.Language)
 	// Per-agent model config overrides
 	if agentOverride != nil && agentOverride.Config != nil && agentOverride.Config.Agent != nil {
 		ac := agentOverride.Config.Agent
@@ -454,6 +455,10 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		// (see applyAgentModelOverlayToLoop in internal/daemon/runner.go).
 		if ac.ModelTier != nil && *ac.ModelTier != "" {
 			loop.SetModelTier(*ac.ModelTier)
+		}
+		// != nil (not != ""): explicit "" forces mirror over a locked global.
+		if ac.Language != nil {
+			loop.SetResponseLanguage(*ac.Language)
 		}
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
@@ -630,6 +635,7 @@ func (m *Model) rebuildAgentLoop() {
 	if m.cfg.Agent.ReasoningEffort != "" {
 		loop.SetReasoningEffort(m.cfg.Agent.ReasoningEffort)
 	}
+	loop.SetResponseLanguage(m.cfg.Agent.Language)
 	if m.agentOverride != nil && m.agentOverride.Config != nil && m.agentOverride.Config.Agent != nil {
 		ac := m.agentOverride.Config.Agent
 		// SetModelTier and SetSpecificModel write to independent fields on the
@@ -637,6 +643,10 @@ func (m *Model) rebuildAgentLoop() {
 		// (see applyAgentModelOverlayToLoop in internal/daemon/runner.go).
 		if ac.ModelTier != nil && *ac.ModelTier != "" {
 			loop.SetModelTier(*ac.ModelTier)
+		}
+		// != nil (not != ""): explicit "" forces mirror over a locked global.
+		if ac.Language != nil {
+			loop.SetResponseLanguage(*ac.Language)
 		}
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)
