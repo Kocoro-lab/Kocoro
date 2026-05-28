@@ -56,15 +56,7 @@ func TestShouldBroadcast(t *testing.T) {
 	}
 }
 
-func TestIsIMSource(t *testing.T) {
-	for _, src := range []string{"slack", "line", "feishu", "lark", "wecom", "telegram", "webhook"} {
-		if !isIMSource(src) {
-			t.Errorf("isIMSource(%q) = false, want true", src)
-		}
-	}
-	for _, src := range []string{"", "webview", "tui", "cli", "one-shot", "research", "schedule", "heartbeat", "unknown"} {
-		if isIMSource(src) {
-			t.Errorf("isIMSource(%q) = true, want false", src)
-		}
-	}
-}
+// shouldBroadcast delegates to isCloudSource (session_cwd.go) for the
+// smart-default check; isCloudSource has its own positive/negative coverage
+// elsewhere. The matrix above asserts the integration end-to-end so this
+// file deliberately doesn't re-test the source enum.

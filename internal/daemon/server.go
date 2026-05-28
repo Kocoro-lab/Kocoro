@@ -3981,10 +3981,12 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Agent    string `json:"agent"`
-		Cron     string `json:"cron"`
-		Prompt   string `json:"prompt"`
-		Stateful *bool  `json:"stateful"` // nil → default (false / stateless); explicit overrides
+		Agent             string  `json:"agent"`
+		Cron              string  `json:"cron"`
+		Prompt            string  `json:"prompt"`
+		Stateful          *bool   `json:"stateful"` // nil → default (false / stateless); explicit overrides
+		Broadcast         *string `json:"broadcast,omitempty"`
+		CreatedFromSource string  `json:"created_from_source,omitempty"`
 	}
 	if !decodeBody(w, r, &req) {
 		return
@@ -3993,7 +3995,16 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 	if req.Stateful != nil {
 		stateful = *req.Stateful
 	}
-	id, err := s.deps.ScheduleManager.Create(req.Agent, req.Cron, req.Prompt, stateful)
+	opts := schedule.CreateOpts{CreatedFromSource: req.CreatedFromSource}
+	if req.Broadcast != nil {
+		bPtr, ok := schedule.ParseBroadcastEnum(*req.Broadcast)
+		if !ok {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("broadcast must be one of \"auto\", \"on\", \"off\"; got %q", *req.Broadcast))
+			return
+		}
+		opts.Broadcast = bPtr
+	}
+	id, err := s.deps.ScheduleManager.CreateWithOpts(req.Agent, req.Cron, req.Prompt, stateful, opts)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, err.Error())

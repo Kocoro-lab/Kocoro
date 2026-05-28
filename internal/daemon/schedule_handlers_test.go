@@ -63,6 +63,41 @@ func TestHandleCreateSchedule_ExplicitStateful(t *testing.T) {
 	}
 }
 
+func TestHandleCreateSchedule_AcceptsBroadcastAndSource(t *testing.T) {
+	srv, _, _ := newTestServerWithScheduleMgr(t)
+	body := `{"agent":"x","cron":"0 9 * * *","prompt":"p","broadcast":"on","created_from_source":"webview"}`
+	req := httptest.NewRequest(http.MethodPost, "/schedules", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	srv.handleCreateSchedule(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	var got schedule.Schedule
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Broadcast == nil || *got.Broadcast != true {
+		t.Errorf("broadcast not applied on create: %v", got.Broadcast)
+	}
+	if got.CreatedFromSource != "webview" {
+		t.Errorf("created_from_source not applied: %q", got.CreatedFromSource)
+	}
+}
+
+func TestHandleCreateSchedule_RejectsInvalidBroadcast(t *testing.T) {
+	srv, _, _ := newTestServerWithScheduleMgr(t)
+	body := `{"agent":"x","cron":"0 9 * * *","prompt":"p","broadcast":"maybe"}`
+	req := httptest.NewRequest(http.MethodPost, "/schedules", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	srv.handleCreateSchedule(w, req)
+	if w.Code < 400 || w.Code >= 500 {
+		t.Fatalf("expected 4xx for invalid broadcast, got %d body %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "broadcast") {
+		t.Errorf("error body should mention broadcast: %s", w.Body.String())
+	}
+}
+
 func TestHandlePatchSchedule_FlipStatefulTrue(t *testing.T) {
 	srv, mgr, _ := newTestServerWithScheduleMgr(t)
 	id, _ := mgr.Create("x", "0 9 * * *", "p", false)
