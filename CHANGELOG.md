@@ -2,6 +2,34 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.1.19 — 2026-05-29 — Schedule proactive push to IM channels + broadcast gate
+
+Scheduled-task output can now be proactively pushed back to the IM channel that created the schedule (Slack / LINE / Feishu / Lark / WeCom / Telegram / webhook), instead of staying invisible until the user next opens an interactive session. Delivery is governed by a per-schedule **broadcast gate** with safe smart defaults — IM-originated schedules broadcast, locally-created ones (HTTP API / one-shot CLI / TUI) stay silent unless explicitly opted in, and pre-feature schedules (empty `created_from_source`) default to silent. No wire-protocol break — all new schedule fields are `omitempty`, legacy `schedules.json` round-trips cleanly, and the proactive push rides the existing Cloud WS channel.
+
+> **Cross-repo contract:** proactive pushes are delivered over the Cloud WS proactive channel; the Cloud side must accept it for this feature to surface in production. The daemon advertises support via the `schedule_broadcast_gate` capability token on the WS handshake.
+
+### Added
+
+- **Schedule proactive push** (PR #200, `internal/daemon/scheduler.go`, `internal/daemon/client.go SendProactive`) — after a successful scheduled run, `broadcastReply(ws, sched, reply, sessionID)` pushes the reply to the originating channel over the Cloud WS proactive channel. Daemon-side guards: non-nil WSClient, non-nil schedule, non-empty reply. Empty `sched.Agent` is the default-agent path (Cloud's `ListByAgentName` matches it via `COALESCE(config->>'agent_name', '') = $3`), so default-agent schedules broadcast symmetrically to named-agent ones.
+- **Broadcast gate** (PR #200, `internal/daemon/broadcast_gate.go`, `internal/schedule/{schedule,broadcast}.go`) — `shouldBroadcast(sched)` resolves delivery intent: an explicit `Schedule.Broadcast *bool` override wins; otherwise a smart default keyed on `Schedule.CreatedFromSource` — cloud-distributed source → broadcast, anything else (local origins, empty pre-feature source) → silent. The cloud-source set reuses the canonical `isCloudSource` helper so it can't drift from the other source lists. `Schedule` gains `Broadcast *bool` + `CreatedFromSource string` fields.
+- **Broadcast controls on tools + HTTP API** (PR #200, `internal/tools/schedule.go`, `internal/daemon/server.go`, `cmd/schedule.go`) — `schedule_create` / `schedule_update` accept `broadcast: "auto" | "on" | "off"` (absent/`auto` → smart default); `schedule_create` captures the caller's source. `POST /schedules` accepts `broadcast` + `created_from_source`; `PATCH /schedules/{id}` mirrors `broadcast`; `GET /schedules` surfaces both fields.
+- **`schedule_broadcast_gate` capability** (PR #200, `internal/daemon/client.go`) — advertised on the WS handshake and in the `GET /status` capabilities list so Desktop can gate the broadcast toggle behind a token rather than a daemon version string.
+- **IM bindings in agent context** (PR #200, `internal/daemon/{im_bindings,sticky_context}.go`, `internal/prompt/builder.go`) — the agent's bound IM identity is injected as a sticky context line (always emitted, default-agent included), and the IM-delivery section of the system prompt was rewritten around a 3-line routing model so the model reasons about channel delivery correctly.
+
+### Fixed
+
+- **Dedupe gate against cloud sources** (PR #200, `internal/daemon/server.go`) — `POST /schedules` dedupe gate is keyed on `isCloudSource` so a cloud-originated create can't collide with a locally-created schedule.
+- **Source validation + local-run sticky guard** (PR #200, `internal/daemon/runner.go`, `internal/schedule/schedule.go`) — `created_from_source` is validated against the recognized origin set (cloud sources via `isCloudSource`, local origins via `localScheduleSources`); the sticky-context line is guarded so a local run doesn't emit a misleading IM binding.
+
+### Docs
+
+- `references/{schedules,config,recipes}.md` (bundled `kocoro` skill): document the `broadcast` enum on `schedule_create`/`schedule_update`, the broadcast gate semantics on `POST`/`PATCH /schedules`, and the `schedule_broadcast_gate` capability token.
+- `CLAUDE.md`: new "Schedule proactive push" daemon-architecture row covering `broadcastReply` / `shouldBroadcast` / `SendProactive`, the smart-default matrix, and the capability token.
+
+### Tests
+
+- `internal/tools/doc_extract_test.go` — `writePptx` test helper now builds a fully-referenced slide (`<p:sldIdLst>` + `ppt/_rels/presentation.xml.rels`); pandoc 3.x walks zero slides on a presentation that doesn't reference its slides, so `TestPptxToText_PrimaryPandoc` was failing on machines with a modern pandoc. Production code unchanged.
+
 ## v0.1.18 — 2026-05-28 — Stateful schedules + last-run visibility, session-delete unblocking, browser hardening
 
 Adds a per-schedule `stateful` toggle and first-class last-run visibility for scheduled tasks, unblocks cross-session delete/reset from hanging behind an unrelated running route, and finishes hardening the Playwright/CDP browser lifecycle started in v0.1.17. No wire-protocol break — all new schedule fields are `omitempty` and legacy `schedules.json` round-trips cleanly; the new `GET /schedules/{id}/last-run` endpoint and `stateful` field on `POST`/`PATCH /schedules` are additive.
