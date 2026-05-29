@@ -457,3 +457,42 @@ func TestRun_AutoWorkflowType_SetsNoForceFlag(t *testing.T) {
 		})
 	}
 }
+
+// TestRun_PartialResultThenTerminalFailure_NeverReportsSuccess covers the gap
+// the prior TestRun_TerminalFailureViaREST left open: when SSE delivered a
+// PARTIAL result AND the workflow then fails (WORKFLOW_FAILED + REST FAILED),
+// the partial must NOT be returned as a nil-error success — the failure wins.
+// Before the fix, the `finalResult != ""` short-circuit returned the partial.
+func TestRun_PartialResultThenTerminalFailure_NeverReportsSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/api/v1/tasks/stream"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"workflow_id": "wf-p", "task_id": "t-p"})
+		case strings.HasPrefix(r.URL.Path, "/api/v1/stream/sse"):
+			// A partial result arrives, THEN the workflow fails.
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "event: LLM_OUTPUT\ndata: {\"response\":\"PARTIAL that must not surface\"}\n\n")
+			fmt.Fprintf(w, "event: WORKFLOW_FAILED\ndata: {\"message\":\"cloud workflow failed\"}\n\n")
+			fmt.Fprintf(w, "event: done\ndata: [DONE]\n\n")
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/api/v1/tasks/"):
+			// REST also confirms terminal failure (not COMPLETED), with the same
+			// stale partial as its result.
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"task_id": "t-p", "status": "TASK_STATUS_FAILED", "result": "PARTIAL that must not surface"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	gw := client.NewGatewayClient(srv.URL, "k")
+	res, err := Run(context.Background(), Request{Gateway: gw, APIKey: "k", Query: "q"}, &captureHandler{})
+	if err == nil {
+		t.Fatalf("expected error (workflow failed with only a partial), got nil (FinalText=%q)", res.FinalText)
+	}
+	if strings.Contains(res.FinalText, "PARTIAL") {
+		t.Fatalf("partial result surfaced as success despite terminal failure: %q", res.FinalText)
+	}
+}

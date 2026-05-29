@@ -417,6 +417,11 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 		// check (the task may have just completed), but do NOT poll for 30s,
 		// which would blow past the very deadline that just fired.
 		recoverViaREST(false)
+		// A terminal REST failure (FAIL/CANCEL/TIMEOUT) must win over any partial
+		// SSE chunk — never surface a failed task as a nil-error success.
+		if workflowErr != nil {
+			return Result{}, workflowErr
+		}
 		if finalResult != "" {
 			prefix := ""
 			if !fullResultConfirmed {
@@ -429,6 +434,11 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 
 	if err != nil {
 		recoverViaREST(true)
+		// A terminal REST failure must win over a partial SSE chunk — never
+		// return a failed task's partial as a nil-error success.
+		if workflowErr != nil {
+			return Result{}, workflowErr
+		}
 		if finalResult != "" {
 			return Result{FinalText: finalResult, Usage: cloudUsage, WorkflowID: resp.WorkflowID, TaskID: taskID, FullResultConfirmed: fullResultConfirmed}, nil
 		}
@@ -437,7 +447,11 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 
 	if workflowErr != nil {
 		recoverViaREST(true)
-		if finalResult != "" {
+		// Only surface a result if REST authoritatively confirmed COMPLETED
+		// (fullResultConfirmed). An SSE-reported failure plus a mere partial
+		// chunk (finalResult set but NOT REST-confirmed) must return the error,
+		// not the partial — otherwise a failed task leaks out as success.
+		if fullResultConfirmed {
 			return Result{FinalText: finalResult, Usage: cloudUsage, WorkflowID: resp.WorkflowID, TaskID: taskID, FullResultConfirmed: fullResultConfirmed}, nil
 		}
 		return Result{}, workflowErr
