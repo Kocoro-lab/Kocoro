@@ -496,7 +496,7 @@ USE CLOUD only when the task has 3+ sub-investigations that EACH need a DIFFEREN
 
 NOT A FALLBACK: cloud_delegate uses the SAME backends (xAI Grok, SERP) as x_search / web_search, so delegating unlocks no new data. Sparse local results reflect data scarcity or transient infrastructure, not a reason to escalate. Return what you collected, note the limitation, and stop.
 
-workflow_type: "research" (deep research across 3+ sources with synthesis), "swarm" (sub-agents sharing a workspace, for open-ended research + computation + writing), "auto" (default; fixed DAG for structured steps). For an independent second opinion on work you just produced, use "auto" and state in the task that you want a fresh-context review — the cloud agent carries no prior session context, which helps it catch issues you might miss.
+workflow_type: "research" (deep research across 3+ sources with synthesis), "auto" (default; fixed DAG for structured steps).
 
 CRITICAL: call cloud_delegate ONCE per task; present its full result verbatim (do not summarize or truncate); never re-call with the same or similar task.`
 

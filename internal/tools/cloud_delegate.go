@@ -91,11 +91,10 @@ func (t *CloudDelegateTool) Info() agent.ToolInfo {
 				},
 				"workflow_type": map[string]any{
 					"type": "string",
-					"enum": []string{"research", "swarm", "auto"},
+					"enum": []string{"research", "auto"},
 					"description": "Execution mode. Assumes the gate in the top-level description has already passed — this parameter does NOT expand eligibility for calling cloud_delegate. " +
 						"'auto' (default): system picks a DAG based on task shape. " +
-						"'research': fixed research DAG, ~5 min. " +
-						"'swarm': dynamic sub-agent spawning with shared workspace, 10-15 min; use only when sub-agents need to exchange intermediate files.",
+						"'research': fixed research DAG, ~5 min.",
 				},
 				"terminal": map[string]any{
 					"type":        "boolean",
