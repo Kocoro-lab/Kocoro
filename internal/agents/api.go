@@ -13,8 +13,9 @@ import (
 
 // AgentAPI is the JSON representation of an agent for the HTTP API.
 type AgentAPI struct {
-	Name       string             `json:"name"`
-	Prompt     string             `json:"prompt"`
+	Name        string             `json:"name"`
+	DisplayName string             `json:"display_name"` // falls back to Name when unset
+	Prompt      string             `json:"prompt"`
 	Memory     *string            `json:"memory"`              // null if no MEMORY.md
 	Config     *AgentConfigAPI    `json:"config"`              // null if no config.yaml
 	Commands   map[string]string  `json:"commands"`            // null if no commands
@@ -47,6 +48,10 @@ func (a *Agent) ToAPI() *AgentAPI {
 	api := &AgentAPI{
 		Name:   a.Name,
 		Prompt: a.Prompt,
+	}
+	api.DisplayName = a.Name
+	if a.Config != nil && a.Config.DisplayName != "" {
+		api.DisplayName = a.Config.DisplayName
 	}
 	if a.Memory != "" {
 		mem := a.Memory

@@ -166,6 +166,26 @@ func TestWriteAgentConfig_PersistsDisplayName(t *testing.T) {
 	}
 }
 
+func TestToAPI_DisplayName(t *testing.T) {
+	// With display_name set in config.
+	withName := &Agent{Name: "agent-aaa111", Prompt: "p",
+		Config: &AgentConfig{DisplayName: "客服助手"}}
+	if got := withName.ToAPI().DisplayName; got != "客服助手" {
+		t.Errorf("DisplayName = %q, want 客服助手", got)
+	}
+	// No config → fallback to slug.
+	noCfg := &Agent{Name: "agent-bbb222", Prompt: "p"}
+	if got := noCfg.ToAPI().DisplayName; got != "agent-bbb222" {
+		t.Errorf("DisplayName = %q, want fallback agent-bbb222", got)
+	}
+	// Config present but display_name empty → fallback to slug.
+	emptyName := &Agent{Name: "agent-ccc333", Prompt: "p",
+		Config: &AgentConfig{CWD: "/tmp"}}
+	if got := emptyName.ToAPI().DisplayName; got != "agent-ccc333" {
+		t.Errorf("DisplayName = %q, want fallback agent-ccc333", got)
+	}
+}
+
 func TestAgentConfigAPI_WatchHeartbeatRoundTrip(t *testing.T) {
 	agent := &Agent{
 		Name:   "test",
