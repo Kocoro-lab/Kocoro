@@ -281,18 +281,24 @@ func AtomicWrite(path string, data []byte) error {
 
 // AgentCreateRequest parses a POST /agents request body.
 type AgentCreateRequest struct {
-	Name     string            `json:"name"`
-	Prompt   string            `json:"prompt"`
-	Memory   *string           `json:"memory,omitempty"`
-	Config   *AgentConfigAPI   `json:"config,omitempty"`
-	Commands map[string]string `json:"commands,omitempty"`
-	Skills   []*skills.Skill   `json:"skills,omitempty"`
+	Name        string            `json:"name"`
+	DisplayName string            `json:"display_name,omitempty"`
+	Prompt      string            `json:"prompt"`
+	Memory      *string           `json:"memory,omitempty"`
+	Config      *AgentConfigAPI   `json:"config,omitempty"`
+	Commands    map[string]string `json:"commands,omitempty"`
+	Skills      []*skills.Skill   `json:"skills,omitempty"`
 }
 
 // Validate checks required fields and runs all validators.
 func (r *AgentCreateRequest) Validate() error {
-	if err := ValidateAgentName(r.Name); err != nil {
-		return err
+	if r.Name == "" && r.DisplayName == "" {
+		return fmt.Errorf("either name or display_name is required")
+	}
+	if r.Name != "" {
+		if err := ValidateAgentName(r.Name); err != nil {
+			return err
+		}
 	}
 	if r.Prompt == "" {
 		return fmt.Errorf("prompt is required")
