@@ -2579,6 +2579,8 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		parsedConfig = &cfg
 	}
 	if req.DisplayName != nil {
+		trimmed := strings.TrimSpace(*req.DisplayName)
+		req.DisplayName = &trimmed
 		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, *req.DisplayName, name)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())

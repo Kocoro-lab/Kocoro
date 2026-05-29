@@ -334,6 +334,7 @@ type AgentCreateRequest struct {
 
 // Validate checks required fields and runs all validators.
 func (r *AgentCreateRequest) Validate() error {
+	r.DisplayName = strings.TrimSpace(r.DisplayName)
 	if r.Name == "" && r.DisplayName == "" {
 		return fmt.Errorf("either name or display_name is required")
 	}

@@ -436,6 +436,10 @@ func TestDisplayNameTaken(t *testing.T) {
 	if taken, _ := DisplayNameTaken(dir, "  ", ""); taken {
 		t.Errorf("empty name should never be taken")
 	}
+	// A slug with no explicit display_name is reserved under its slug-fallback name.
+	if taken, _ := DisplayNameTaken(dir, "agent-bbb222", ""); !taken {
+		t.Errorf("slug-fallback display name should be taken")
+	}
 }
 
 func TestListAgents_DisplayNameFallback(t *testing.T) {

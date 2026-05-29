@@ -155,6 +155,19 @@ func TestAgentCreateRequest_Validate(t *testing.T) {
 	if err := r7.Validate(); err == nil {
 		t.Error("expected error for null skill entry")
 	}
+	// Whitespace-only display_name with no name → error (trimmed to empty).
+	r8 := AgentCreateRequest{DisplayName: "   ", Prompt: "p"}
+	if err := r8.Validate(); err == nil {
+		t.Errorf("whitespace-only display_name with no name should error")
+	}
+	// Whitespace-only display_name WITH a name → valid, trimmed to empty.
+	r9 := AgentCreateRequest{Name: "ops-bot", DisplayName: "  ", Prompt: "p"}
+	if err := r9.Validate(); err != nil {
+		t.Errorf("whitespace display_name with name should be valid: %v", err)
+	}
+	if r9.DisplayName != "" {
+		t.Errorf("display_name should be trimmed to empty, got %q", r9.DisplayName)
+	}
 }
 
 func TestWriteAgentConfig_PersistsDisplayName(t *testing.T) {

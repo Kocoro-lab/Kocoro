@@ -458,6 +458,8 @@ func loadDisplayName(agentsDir, name string) string {
 // DisplayNameTaken reports whether displayName (normalized) is already used by
 // an agent other than excludeSlug. An empty/whitespace name is never taken
 // (it means "no display name"). excludeSlug lets rename keep its own name.
+// Comparison is against the EFFECTIVE display name (explicit display_name or
+// slug fallback) that ListAgents fills in — the value users actually see.
 func DisplayNameTaken(agentsDir, displayName, excludeSlug string) (bool, error) {
 	norm := normalizeDisplayName(displayName)
 	if norm == "" {
@@ -471,7 +473,10 @@ func DisplayNameTaken(agentsDir, displayName, excludeSlug string) (bool, error) 
 		if e.Name == excludeSlug {
 			continue
 		}
-		if normalizeDisplayName(loadDisplayName(agentsDir, e.Name)) == norm {
+		// Compare against the EFFECTIVE display name (explicit display_name or
+		// the slug fallback that ListAgents fills in) — that is what users see,
+		// so a new name must not collide with either.
+		if normalizeDisplayName(e.DisplayName) == norm {
 			return true, nil
 		}
 	}
