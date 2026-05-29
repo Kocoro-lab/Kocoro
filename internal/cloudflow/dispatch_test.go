@@ -31,11 +31,21 @@ func TestRun_NoGateway_ReturnsError(t *testing.T) {
 	}
 }
 
+// cloudAgentEvent is the full (agentID, status, message) triple captured from
+// OnCloudAgent so tests can assert agent_id passthrough (Layer 2), not just the
+// status:message pair the older assertions relied on.
+type cloudAgentEvent struct {
+	agentID string
+	status  string
+	msg     string
+}
+
 // captureHandler records every callback so tests can assert what cloudflow
 // surfaced from a fake Gateway stream. Method set must match agent.EventHandler
 // (internal/agent/loop.go:368-378) exactly.
 type captureHandler struct {
 	cloudAgents   []string
+	cloudEvents   []cloudAgentEvent
 	streamDeltas  []string
 	finalUsage    agent.TurnUsage
 	progressCalls int32
@@ -48,7 +58,10 @@ func (c *captureHandler) OnPreamble(text string)                                
 func (c *captureHandler) OnStreamDelta(d string)                                                         { c.streamDeltas = append(c.streamDeltas, d) }
 func (c *captureHandler) OnApprovalNeeded(tool, args string) bool                                        { return true }
 func (c *captureHandler) OnUsage(u agent.TurnUsage)                                                      { c.finalUsage = u }
-func (c *captureHandler) OnCloudAgent(_, status, msg string)                                             { c.cloudAgents = append(c.cloudAgents, status+":"+msg) }
+func (c *captureHandler) OnCloudAgent(agentID, status, msg string) {
+	c.cloudAgents = append(c.cloudAgents, status+":"+msg)
+	c.cloudEvents = append(c.cloudEvents, cloudAgentEvent{agentID: agentID, status: status, msg: msg})
+}
 func (c *captureHandler) OnCloudProgress(completed, total int)                                           { atomic.AddInt32(&c.progressCalls, 1) }
 func (c *captureHandler) OnCloudPlan(planType, content string, needsReview bool)                         {}
 
@@ -211,5 +224,79 @@ func TestRun_StreamDropsBeforeFinal_RecoversViaGetTask(t *testing.T) {
 	}
 	if !res.FullResultConfirmed {
 		t.Fatalf("expected FullResultConfirmed=true after REST recovery")
+	}
+}
+
+// TestRun_ForwardsAgentIDForActivityEvents pins the Layer-2 contract: a cloud
+// worker's mid-run activity events (AGENT_THINKING, TOOL_INVOKED,
+// TOOL_OBSERVATION) must reach the handler tagged with the originating
+// agent_id (the station nickname) so the desktop can route each event to the
+// right sub-agent row instead of leaving it stuck on "Working…". Before Layer
+// 2 the dispatcher blanked agent_id on thinking/tool events and dropped
+// TOOL_OBSERVATION entirely.
+func TestRun_ForwardsAgentIDForActivityEvents(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/api/v1/tasks/stream"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"workflow_id": "wf-2", "task_id": "t-2"})
+		case strings.HasPrefix(r.URL.Path, "/api/v1/stream/sse"):
+			// One worker ("Osaki") runs a full reason→tool→observe→done cycle.
+			// AGENT_STARTED / AGENT_COMPLETED carry empty messages (the DAG
+			// path's actual behavior); the activity lives in the middle three.
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "event: AGENT_STARTED\ndata: %s\n\n", `{"agent_id":"Osaki","message":""}`)
+			fmt.Fprintf(w, "event: AGENT_THINKING\ndata: %s\n\n", `{"agent_id":"Osaki","message":"Thinking: where to look"}`)
+			fmt.Fprintf(w, "event: TOOL_INVOKED\ndata: %s\n\n", `{"agent_id":"Osaki","message":"Looking this up: 'Google acquisitions'"}`)
+			fmt.Fprintf(w, "event: TOOL_OBSERVATION\ndata: %s\n\n", `{"agent_id":"Osaki","message":"Search: Google has acquired 250+ companies"}`)
+			fmt.Fprintf(w, "event: AGENT_COMPLETED\ndata: %s\n\n", `{"agent_id":"Osaki","message":""}`)
+			fmt.Fprintf(w, "event: WORKFLOW_COMPLETED\ndata: %s\n\n", `{"message":"done"}`)
+			fmt.Fprintf(w, "event: done\ndata: [DONE]\n\n")
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/api/v1/tasks/"):
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"task_id": "t-2", "status": "TASK_STATUS_COMPLETED", "result": "Final."})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	gw := client.NewGatewayClient(srv.URL, "k")
+	h := &captureHandler{}
+	if _, err := Run(context.Background(), Request{Gateway: gw, APIKey: "k", Query: "q", WorkflowType: "research"}, h); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Every mid-run activity event must carry "Osaki" — not the blank agent_id
+	// the pre-Layer-2 dispatcher emitted for thinking/tool events.
+	var sawThinking, sawInvoked, sawObservation bool
+	for _, ev := range h.cloudEvents {
+		switch {
+		case ev.status == "thinking":
+			sawThinking = true
+			if ev.agentID != "Osaki" {
+				t.Errorf("AGENT_THINKING: agentID = %q, want \"Osaki\"", ev.agentID)
+			}
+		case ev.status == "tool" && strings.HasPrefix(ev.msg, "Looking this up"):
+			sawInvoked = true
+			if ev.agentID != "Osaki" {
+				t.Errorf("TOOL_INVOKED: agentID = %q, want \"Osaki\"", ev.agentID)
+			}
+		case ev.status == "tool" && strings.HasPrefix(ev.msg, "Search:"):
+			sawObservation = true
+			if ev.agentID != "Osaki" {
+				t.Errorf("TOOL_OBSERVATION: agentID = %q, want \"Osaki\"", ev.agentID)
+			}
+		}
+	}
+	if !sawThinking {
+		t.Errorf("AGENT_THINKING was not forwarded: %+v", h.cloudEvents)
+	}
+	if !sawInvoked {
+		t.Errorf("TOOL_INVOKED was not forwarded: %+v", h.cloudEvents)
+	}
+	if !sawObservation {
+		t.Errorf("TOOL_OBSERVATION was not forwarded (still dropped?): %+v", h.cloudEvents)
 	}
 }

@@ -247,11 +247,22 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 			}
 		case "AGENT_THINKING":
 			if len(event.Message) <= 100 && handler != nil {
-				handler.OnCloudAgent("", "thinking", event.Message)
+				handler.OnCloudAgent(event.AgentID, "thinking", event.Message)
 			}
 		case "TOOL_INVOKED", "TOOL_STARTED":
 			if handler != nil {
-				handler.OnCloudAgent("", "tool", event.Message)
+				handler.OnCloudAgent(event.AgentID, "tool", event.Message)
+			}
+		case "TOOL_OBSERVATION":
+			// Tool result coming back (e.g. "Search: <summary>"). Cloud already
+			// caps the message at ~80 chars (MsgToolCompleted → extractSummary),
+			// so no extra length guard is needed here. Forwarded as a "tool"
+			// status carrying the originating agent_id so it updates the SAME
+			// sub-agent row that TOOL_INVOKED started — the liveness signal that
+			// the row is progressing rather than stuck. Previously dropped as
+			// "too verbose".
+			if handler != nil && event.Message != "" {
+				handler.OnCloudAgent(event.AgentID, "tool", event.Message)
 			}
 
 		case "DATA_PROCESSING":
@@ -264,9 +275,14 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 			}
 
 		// --- Internal plumbing — silently ignore ---
-		case "WORKFLOW_STARTED", "TOOL_OBSERVATION", "TOOL_COMPLETED",
+		case "WORKFLOW_STARTED", "TOOL_COMPLETED",
 			"DELEGATION", "PROGRESS", "STATUS_UPDATE", "WAITING":
-			// Drop — these are too verbose for the desktop UI
+			// Drop. PROGRESS stays dropped on purpose: on the research/DAG path
+			// its agent_id is a workflow-stage label (citation_agent,
+			// research-refiner, domain_analysis), not a worker station nickname —
+			// routing it to a sub-agent row would spawn confusing non-worker
+			// pills. Worker liveness already comes from AGENT_THINKING /
+			// TOOL_INVOKED / TOOL_OBSERVATION above.
 		case "APPROVAL_DECISION":
 			// no-op
 
