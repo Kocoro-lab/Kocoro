@@ -2434,6 +2434,12 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Name = slug
 	}
+	// display_name is honored only via the dedicated top-level field below
+	// (uniqueness-checked). Ignore any client-supplied config.display_name,
+	// which would otherwise bypass the uniqueness check.
+	if req.Config != nil {
+		req.Config.DisplayName = ""
+	}
 	// Enforce global display-name uniqueness (normalized).
 	if req.DisplayName != "" {
 		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, req.DisplayName, "")
@@ -2644,6 +2650,15 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
+			// display_name is managed only via the dedicated top-level field
+			// (uniqueness-checked). Preserve the existing on-disk value across a
+			// full config rewrite and ignore any client-supplied
+			// config.display_name, which would otherwise bypass the check.
+			if cur, err := agents.LoadAgent(s.deps.AgentsDir, name); err == nil && cur.Config != nil {
+				parsedConfig.DisplayName = cur.Config.DisplayName
+			} else {
+				parsedConfig.DisplayName = ""
+			}
 			if err := agents.WriteAgentConfig(s.deps.AgentsDir, name, parsedConfig); err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return

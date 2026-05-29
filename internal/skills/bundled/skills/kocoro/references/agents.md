@@ -28,6 +28,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
   - `display_name` is an optional human-readable label (any language, e.g. Chinese). Stored in `config.yaml`. Falls back to the slug when not set.
   - At least one of `name` or `display_name` must be provided.
   - `display_name` must be globally unique (comparison is case-folded and whitespace-trimmed). A conflict returns `409` with `{"error": "display name \"X\" is already in use"}`.
+  - `display_name` can **only** be set via the top-level `display_name` field. A `display_name` nested inside the `config` object is silently ignored (it would bypass the uniqueness check).
   - When `name` is provided it must match `^[a-z0-9][a-z0-9_-]{0,63}$` — lowercase ASCII letters, numbers, hyphens, underscores only. No spaces, no non-ASCII characters. **Pass the user's slug verbatim — never translate or transliterate.** See "Name discipline" below.
 
 ### Update agent prompt / instructions
@@ -37,6 +38,8 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Response: `{"status": "updated"}`
 - Notes:
   - `display_name` is optional (`null` or omitted = unchanged). Supplying it renames the agent's display label. Only `config.yaml` is updated — the slug, directory, sessions, schedules, and Cloud bindings are left untouched.
+  - Sending `display_name: ""` (empty string, not null) clears the display name; the agent falls back to its slug. Omitting the field (or `null`) leaves it unchanged.
+  - `display_name` can **only** be set/changed via this top-level field (which is uniqueness-checked). A `display_name` nested inside the `config` object is silently ignored.
   - Renaming to a `display_name` already used by another agent returns `409`. Renaming to the agent's own current `display_name` is a no-op success.
 
 ### Delete agent

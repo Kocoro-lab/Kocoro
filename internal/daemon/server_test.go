@@ -2795,3 +2795,86 @@ func TestMCPConfigChanged_KeepAliveDetected(t *testing.T) {
 		})
 	}
 }
+
+// TestServer_DisplayName_NestedConfigIgnored verifies that a display_name
+// supplied inside the config object is ignored on both POST /agents and
+// PUT /agents/{name}, so the uniqueness check cannot be bypassed.
+func TestServer_DisplayName_NestedConfigIgnored(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+
+	// Create "taken-bot" with top-level display_name so it is registered.
+	resp, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"taken-bot","display_name":"TakenName","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create taken-bot: expected 201, got %d", resp.StatusCode)
+	}
+
+	// POST /agents with display_name only inside config — must not 409 on
+	// uniqueness but the written agent must NOT have the duplicate display_name.
+	resp2, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"bypass-create","prompt":"p","config":{"display_name":"TakenName"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("bypass-create: expected 201, got %d", resp2.StatusCode)
+	}
+	loaded, err := agents.LoadAgent(agentsDir, "bypass-create")
+	if err != nil {
+		t.Fatalf("load bypass-create: %v", err)
+	}
+	if loaded.Config != nil && loaded.Config.DisplayName == "TakenName" {
+		t.Errorf("POST with nested config.display_name wrote duplicate display_name to disk")
+	}
+
+	// Create a second agent to test PUT bypass.
+	resp3, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"bypass-update","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusCreated {
+		t.Fatalf("bypass-update: expected 201, got %d", resp3.StatusCode)
+	}
+
+	// PUT /agents/{name} with display_name only inside config — must not write
+	// the duplicate display_name.
+	req, _ := http.NewRequest(http.MethodPut, base+"/agents/bypass-update",
+		strings.NewReader(`{"config":{"display_name":"TakenName"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp4, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusOK {
+		t.Fatalf("PUT bypass-update: expected 200, got %d", resp4.StatusCode)
+	}
+	loaded2, err := agents.LoadAgent(agentsDir, "bypass-update")
+	if err != nil {
+		t.Fatalf("load bypass-update: %v", err)
+	}
+	if loaded2.Config != nil && loaded2.Config.DisplayName == "TakenName" {
+		t.Errorf("PUT with nested config.display_name wrote duplicate display_name to disk")
+	}
+}
