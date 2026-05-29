@@ -171,6 +171,13 @@ type ToolsConfig struct {
 type CloudConfig struct {
 	Enabled bool `mapstructure:"enabled" yaml:"enabled" json:"enabled"`
 	Timeout int  `mapstructure:"timeout" yaml:"timeout" json:"timeout"` // seconds
+	// StreamIdleTimeoutSecs aborts a cloud-delegate SSE connection when no line
+	// (event or 10s heartbeat) arrives for this many seconds, then reconnects
+	// via Last-Event-ID. Per-connection liveness probe, NOT a workflow time
+	// limit (Timeout bounds total duration). 0 disables. Global-only — NOT a
+	// project/local overlay field (see overlayCloudConfig: cloud overlays
+	// accept only session-safe publish policy).
+	StreamIdleTimeoutSecs int `mapstructure:"stream_idle_timeout_secs" yaml:"stream_idle_timeout_secs" json:"stream_idle_timeout_secs"`
 	// PublishAllowedExtensions extends the publish_to_web extension allowlist.
 	// Values are merged onto the built-in default set; there is no allowlist
 	// override and no user-configurable denylist (denylist must not be widenable).
@@ -360,6 +367,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	viper.SetDefault("cloud.enabled", true)
 	viper.SetDefault("cloud.timeout", 3600)
+	viper.SetDefault("cloud.stream_idle_timeout_secs", 45) // per-connection SSE liveness probe; cloud pings every 10s. 0 disables.
 
 	// sync.* defaults — MUST stay in sync with setSyncDefaults in
 	// internal/sync/config.go. The duplicate exists so internal/sync unit
@@ -1076,6 +1084,9 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.Agent.StreamIdleTimeoutSecs < 0 {
 		return fmt.Errorf("agent.stream_idle_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Agent.StreamIdleTimeoutSecs)
+	}
+	if cfg.Cloud.StreamIdleTimeoutSecs < 0 {
+		return fmt.Errorf("cloud.stream_idle_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Cloud.StreamIdleTimeoutSecs)
 	}
 	return nil
 }
