@@ -239,19 +239,19 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 		// --- Status events — only surface user-facing milestones ---
 		case "AGENT_STARTED":
 			if handler != nil {
-				handler.OnCloudAgent(event.AgentID, "started", statusMsg(event.AgentID, event.Message, "Agent working..."))
+				handler.OnCloudAgent(event.AgentID, "started", event.Message)
 			}
 		case "AGENT_COMPLETED":
 			if handler != nil {
-				handler.OnCloudAgent(event.AgentID, "completed", statusMsg(event.AgentID, event.Message, "Agent completed"))
+				handler.OnCloudAgent(event.AgentID, "completed", event.Message)
 			}
 		case "AGENT_THINKING":
 			if len(event.Message) <= 100 && handler != nil {
-				handler.OnCloudAgent("", "thinking", statusMsg("", event.Message, "Thinking..."))
+				handler.OnCloudAgent("", "thinking", event.Message)
 			}
 		case "TOOL_INVOKED", "TOOL_STARTED":
 			if handler != nil {
-				handler.OnCloudAgent("", "tool", statusMsg("", event.Message, "Calling tool..."))
+				handler.OnCloudAgent("", "tool", event.Message)
 			}
 
 		case "DATA_PROCESSING":
@@ -464,17 +464,4 @@ func accumulateUsage(data string, usage *agent.TurnUsage) {
 	if meta.Metadata.ModelUsed != "" {
 		usage.Model = meta.Metadata.ModelUsed
 	}
-}
-
-// statusMsg returns message if non-empty, otherwise fallback.
-// Prepends agentID label if present and not an internal plumbing ID.
-func statusMsg(agentID, message, fallback string) string {
-	msg := message
-	if msg == "" {
-		msg = fallback
-	}
-	if agentID != "" && agentID != "orchestrator" && agentID != "streaming" {
-		return "[" + agentID + "] " + msg
-	}
-	return msg
 }

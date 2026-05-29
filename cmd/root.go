@@ -20,6 +20,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 	"github.com/Kocoro-lab/ShanClaw/internal/daemon"
@@ -513,7 +514,7 @@ func (h *cliEventHandler) OnCloudAgent(agentID, status, message string) {
 	if p == "" {
 		p = "-"
 	}
-	fmt.Printf("  %s %s\n", p, message)
+	fmt.Printf("  %s %s\n", p, cloudflow.CloudStatusLine(agentID, status, message))
 }
 
 func (h *cliEventHandler) OnCloudProgress(completed, total int) {
