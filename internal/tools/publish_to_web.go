@@ -180,7 +180,7 @@ func (t *PublishToWebTool) Info() agent.ToolInfo {
 					"type":        "string",
 					"minLength":   publishMinPurposeLen,
 					"maxLength":   500,
-					"description": "Quote the user's explicit request to publish or share this file (their actual words asking for a public link / to send it out). Shown to the user during approval. If the user did not actually ask to publish, do NOT call this tool. Vague answers ('share', 'send it', 'test') will be rejected.",
+					"description": "State specifically what the user asked you to publish/share and where it goes — the recipient, the channel, or that they explicitly asked for a public link — grounded in the user's actual request. Shown to the user during approval. If the user did not actually ask to publish, do NOT call this tool. Generic answers lacking specifics ('share', 'send it', 'share with team', 'test') will be rejected — name who/where.",
 				},
 				"description": agent.DescriptionFieldSpec,
 				"filename": map[string]any{
