@@ -196,6 +196,35 @@ func TestToAPI_DisplayName(t *testing.T) {
 	}
 }
 
+func TestSetAgentDisplayName_PreservesOtherFields(t *testing.T) {
+	dir := t.TempDir()
+	ad := filepath.Join(dir, "agent-keep01")
+	os.MkdirAll(ad, 0700)
+	os.WriteFile(filepath.Join(ad, "config.yaml"),
+		[]byte("auto_approve: true\ncwd: /tmp/work\n"), 0600)
+
+	if err := SetAgentDisplayName(dir, "agent-keep01", "客服助手"); err != nil {
+		t.Fatalf("SetAgentDisplayName: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(ad, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var m map[string]interface{}
+	if err := yaml.Unmarshal(data, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m["display_name"] != "客服助手" {
+		t.Errorf("display_name = %v, want 客服助手", m["display_name"])
+	}
+	if m["auto_approve"] != true {
+		t.Errorf("auto_approve lost: %v", m["auto_approve"])
+	}
+	if m["cwd"] != "/tmp/work" {
+		t.Errorf("cwd lost: %v", m["cwd"])
+	}
+}
+
 func TestAgentConfigAPI_WatchHeartbeatRoundTrip(t *testing.T) {
 	agent := &Agent{
 		Name:   "test",

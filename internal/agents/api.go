@@ -181,6 +181,48 @@ func WriteAgentConfig(agentsDir, name string, cfg *AgentConfigAPI) error {
 	return AtomicWrite(path, data)
 }
 
+// SetAgentDisplayName updates only the display_name in an agent's config.yaml,
+// preserving every other field verbatim. It performs a map-based read-modify-
+// write under the config lock so fields not modeled by AgentConfigAPI (e.g.
+// auto_approve, mcp_servers) are not lost on rename. Empty displayName removes
+// the key.
+func SetAgentDisplayName(agentsDir, name, displayName string) error {
+	dir := filepath.Join(agentsDir, name)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	unlock, err := lockAgentConfig(dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	path := filepath.Join(dir, "config.yaml")
+	m := map[string]interface{}{}
+	if data, err := os.ReadFile(path); err == nil {
+		if err := yaml.Unmarshal(data, &m); err != nil {
+			return fmt.Errorf("parse config: %w", err)
+		}
+		if m == nil {
+			m = map[string]interface{}{}
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	if displayName == "" {
+		delete(m, "display_name")
+	} else {
+		m["display_name"] = displayName
+	}
+
+	data, err := yaml.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	return AtomicWrite(path, data)
+}
+
 // WriteAgentCommand writes a single command file.
 func WriteAgentCommand(agentsDir, agentName, cmdName, content string) error {
 	dir := filepath.Join(agentsDir, agentName, "commands")

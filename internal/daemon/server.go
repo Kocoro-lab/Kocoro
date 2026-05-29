@@ -2651,19 +2651,9 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.DisplayName != nil {
-		// Read-modify-write config to preserve other fields; only display_name
-		// changes. Slug/dir/sessions/Cloud bindings are untouched by design.
-		cur, err := agents.LoadAgent(s.deps.AgentsDir, name)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		cfgAPI := cur.ToAPI().Config
-		if cfgAPI == nil {
-			cfgAPI = &agents.AgentConfigAPI{}
-		}
-		cfgAPI.DisplayName = *req.DisplayName
-		if err := agents.WriteAgentConfig(s.deps.AgentsDir, name, cfgAPI); err != nil {
+		// Update only display_name in config.yaml, preserving all other fields.
+		// Slug/dir/sessions/Cloud bindings are untouched by design.
+		if err := agents.SetAgentDisplayName(s.deps.AgentsDir, name, *req.DisplayName); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
