@@ -250,4 +250,3 @@ func TestAgentConfigAPI_WatchHeartbeatRoundTrip(t *testing.T) {
 		t.Errorf("expected 30m, got %s", api.Config.Heartbeat.Every)
 	}
 }
-
