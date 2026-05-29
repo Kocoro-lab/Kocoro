@@ -82,12 +82,15 @@ func TestStreamSSEWithOptions_ReconnectsWithLastEventID(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
 		if n == 1 {
-			// First connection: emit one event with an id, then drop (close
-			// without `done`) by simply returning from the handler.
+			// First connection: emit one event with an id, flush, then STALL
+			// (hang without closing) so the idle watchdog fires and the client
+			// reconnects with Last-Event-ID. An orderly close (return) is NOT a
+			// failure and would NOT trigger a reconnect — only idle/read errors do.
 			fmt.Fprintf(w, "id: 5\nevent: AGENT_STARTED\ndata: {\"agent_id\":\"a\"}\n\n")
 			if flusher != nil {
 				flusher.Flush()
 			}
+			<-r.Context().Done()
 			return
 		}
 		// Reconnect: the client must have sent Last-Event-ID: 5.
@@ -101,6 +104,7 @@ func TestStreamSSEWithOptions_ReconnectsWithLastEventID(t *testing.T) {
 
 	var events []string
 	err := StreamSSEWithOptions(context.Background(), srv.URL, "", StreamSSEOptions{
+		IdleTimeout:          50 * time.Millisecond,
 		MaxReconnects:        3,
 		ReconnectBackoffBase: time.Millisecond,
 	}, func(ev SSEEvent) {

@@ -37,20 +37,16 @@ type StreamSSEOptions struct {
 	// total workflow duration (that is the caller's ctx deadline). 0 disables.
 	IdleTimeout time.Duration
 
-	// MaxReconnects bounds reconnect attempts after an unexpected disconnect
-	// (idle timeout, read error, or clean EOF without an `event: done`).
-	// 0 disables reconnect entirely (single attempt).
+	// MaxReconnects bounds reconnect attempts after a connection FAILURE
+	// (idle timeout or read/connect error). An orderly EOF without a `done`
+	// terminator is treated as end-of-stream, not a failure, so it does not
+	// reconnect. 0 disables reconnect entirely.
 	MaxReconnects int
 
 	// ReconnectBackoffBase is the first backoff delay; it doubles each attempt
 	// up to reconnectMaxBackoff. 0 defaults to 1s. Exposed for fast tests.
 	ReconnectBackoffBase time.Duration
 }
-
-// errStreamEndedWithoutDone marks a connection that closed cleanly (EOF) but
-// never sent `event: done`. With reconnect enabled it is treated as an
-// unexpected disconnect so the loop resumes with Last-Event-ID.
-var errStreamEndedWithoutDone = fmt.Errorf("sse: stream ended without done event")
 
 // ErrSSEIdleTimeout is returned by streamSSEOnce when no line arrived within
 // the idle window. The reconnect loop treats it as a recoverable disconnect.
@@ -79,15 +75,15 @@ func StreamSSEWithOptions(ctx context.Context, url, apiKey string, opts StreamSS
 		if done {
 			return nil
 		}
-		// Clean EOF without "event: done". Zero-options (reconnect disabled)
-		// preserves the legacy StreamSSE contract — a clean EOF is success
-		// (nil). With reconnect enabled, treat a truncated stream as
-		// recoverable and resume via Last-Event-ID.
+		// Clean EOF (orderly FIN) without an `event: done`: treat as
+		// end-of-stream, do NOT reconnect. Reconnect is reserved for genuine
+		// connection failures (idle timeout, read/connect error) where
+		// resuming with Last-Event-ID is correct. An orderly server close is
+		// end-of-stream; the caller (cloudflow) recovers any result via the
+		// REST /tasks/{id} fallback — cheaper and more reliable than re-reading
+		// the SSE. Also preserves the legacy StreamSSE contract (clean EOF → nil).
 		if err == nil {
-			if opts.MaxReconnects <= 0 {
-				return nil
-			}
-			err = errStreamEndedWithoutDone
+			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
