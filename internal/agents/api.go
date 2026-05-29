@@ -335,9 +335,10 @@ func (r *AgentCreateRequest) Validate() error {
 
 // AgentUpdateRequest is a partial update — only non-nil fields are applied.
 type AgentUpdateRequest struct {
-	Prompt   *string           `json:"prompt,omitempty"`
-	Memory   json.RawMessage   `json:"memory,omitempty"` // string or null
-	Config   json.RawMessage   `json:"config,omitempty"` // object or null
-	Commands map[string]string `json:"commands,omitempty"`
-	Skills   []*skills.Skill   `json:"skills,omitempty"`
+	Prompt      *string           `json:"prompt,omitempty"`
+	DisplayName *string           `json:"display_name,omitempty"` // rename; nil = unchanged
+	Memory      json.RawMessage   `json:"memory,omitempty"`       // string or null
+	Config      json.RawMessage   `json:"config,omitempty"`       // object or null
+	Commands    map[string]string `json:"commands,omitempty"`
+	Skills      []*skills.Skill   `json:"skills,omitempty"`
 }

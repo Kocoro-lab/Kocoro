@@ -2572,6 +2572,18 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		parsedConfig = &cfg
 	}
+	if req.DisplayName != nil {
+		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, *req.DisplayName, name)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if taken {
+			writeError(w, http.StatusConflict,
+				fmt.Sprintf("display name %q is already in use", *req.DisplayName))
+			return
+		}
+	}
 	for cmdName := range req.Commands {
 		if err := agents.ValidateCommandName(cmdName); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -2636,6 +2648,24 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+		}
+	}
+	if req.DisplayName != nil {
+		// Read-modify-write config to preserve other fields; only display_name
+		// changes. Slug/dir/sessions/Cloud bindings are untouched by design.
+		cur, err := agents.LoadAgent(s.deps.AgentsDir, name)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		cfgAPI := cur.ToAPI().Config
+		if cfgAPI == nil {
+			cfgAPI = &agents.AgentConfigAPI{}
+		}
+		cfgAPI.DisplayName = *req.DisplayName
+		if err := agents.WriteAgentConfig(s.deps.AgentsDir, name, cfgAPI); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 	}
 	for cmdName, content := range req.Commands {
