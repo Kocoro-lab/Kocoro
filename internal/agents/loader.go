@@ -422,9 +422,60 @@ func LoadGlobalSkills(shannonDir string) ([]*skills.Skill, error) {
 
 // AgentEntry represents an agent in the listing with source metadata.
 type AgentEntry struct {
-	Name     string `json:"name"`
-	Builtin  bool   `json:"builtin"`  // loaded from _builtin
-	Override bool   `json:"override"` // user-defined agent overrides a builtin
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"` // falls back to Name when unset
+	Builtin     bool   `json:"builtin"`      // loaded from _builtin
+	Override    bool   `json:"override"`     // user-defined agent overrides a builtin
+}
+
+// normalizeDisplayName canonicalizes a display name for uniqueness comparison:
+// trim surrounding whitespace and case-fold. CJK has no case so ToLower is a
+// no-op there; it only matters for Latin names ("Bot" vs "bot").
+func normalizeDisplayName(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// loadDisplayName reads display_name from an agent's config.yaml (user dir
+// first, then _builtin). Returns "" when unset or unreadable — callers
+// fall back to the slug. Intentionally cheaper than a full LoadAgent.
+func loadDisplayName(agentsDir, name string) string {
+	for _, base := range []string{agentsDir, filepath.Join(agentsDir, "_builtin")} {
+		data, err := os.ReadFile(filepath.Join(base, name, "config.yaml"))
+		if err != nil {
+			continue
+		}
+		var cfg AgentConfig
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			continue
+		}
+		if cfg.DisplayName != "" {
+			return cfg.DisplayName
+		}
+	}
+	return ""
+}
+
+// DisplayNameTaken reports whether displayName (normalized) is already used by
+// an agent other than excludeSlug. An empty/whitespace name is never taken
+// (it means "no display name"). excludeSlug lets rename keep its own name.
+func DisplayNameTaken(agentsDir, displayName, excludeSlug string) (bool, error) {
+	norm := normalizeDisplayName(displayName)
+	if norm == "" {
+		return false, nil
+	}
+	entries, err := ListAgents(agentsDir)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if e.Name == excludeSlug {
+			continue
+		}
+		if normalizeDisplayName(loadDisplayName(agentsDir, e.Name)) == norm {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func ListAgents(agentsDir string) ([]AgentEntry, error) {
@@ -472,6 +523,14 @@ func ListAgents(agentsDir string) ([]AgentEntry, error) {
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name < entries[j].Name
 	})
+	for i := range entries {
+		if entries[i].DisplayName == "" {
+			entries[i].DisplayName = loadDisplayName(agentsDir, entries[i].Name)
+		}
+		if entries[i].DisplayName == "" {
+			entries[i].DisplayName = entries[i].Name
+		}
+	}
 	return entries, nil
 }
 

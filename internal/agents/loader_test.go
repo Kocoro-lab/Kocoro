@@ -404,6 +404,60 @@ func TestLoadAgent_ModelTierNilWhenAbsent(t *testing.T) {
 	}
 }
 
+func writeAgentWithDisplay(t *testing.T, dir, slug, display string) {
+	t.Helper()
+	ad := filepath.Join(dir, slug)
+	os.MkdirAll(ad, 0700)
+	os.WriteFile(filepath.Join(ad, "AGENT.md"), []byte("x"), 0600)
+	if display != "" {
+		os.WriteFile(filepath.Join(ad, "config.yaml"),
+			[]byte("display_name: "+display+"\n"), 0600)
+	}
+}
+
+func TestDisplayNameTaken(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentWithDisplay(t, dir, "agent-aaa111", "客服助手")
+	writeAgentWithDisplay(t, dir, "agent-bbb222", "")
+
+	taken, err := DisplayNameTaken(dir, "客服助手", "")
+	if err != nil || !taken {
+		t.Errorf("client match: taken=%v err=%v, want true,nil", taken, err)
+	}
+	if taken, _ := DisplayNameTaken(dir, "  客服助手 ", ""); !taken {
+		t.Errorf("normalized match should be taken")
+	}
+	if taken, _ := DisplayNameTaken(dir, "客服助手", "agent-aaa111"); taken {
+		t.Errorf("self-exclude should not be taken")
+	}
+	if taken, _ := DisplayNameTaken(dir, "新名字", ""); taken {
+		t.Errorf("unused name should not be taken")
+	}
+	if taken, _ := DisplayNameTaken(dir, "  ", ""); taken {
+		t.Errorf("empty name should never be taken")
+	}
+}
+
+func TestListAgents_DisplayNameFallback(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentWithDisplay(t, dir, "agent-aaa111", "客服助手")
+	writeAgentWithDisplay(t, dir, "agent-bbb222", "")
+	entries, err := ListAgents(dir)
+	if err != nil {
+		t.Fatalf("ListAgents: %v", err)
+	}
+	got := map[string]string{}
+	for _, e := range entries {
+		got[e.Name] = e.DisplayName
+	}
+	if got["agent-aaa111"] != "客服助手" {
+		t.Errorf("display = %q, want 客服助手", got["agent-aaa111"])
+	}
+	if got["agent-bbb222"] != "agent-bbb222" {
+		t.Errorf("display = %q, want fallback to slug", got["agent-bbb222"])
+	}
+}
+
 func TestGenerateAgentSlug_FormatAndUniqueness(t *testing.T) {
 	dir := t.TempDir()
 	slug, err := GenerateAgentSlug(dir)
