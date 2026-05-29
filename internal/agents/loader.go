@@ -75,6 +75,7 @@ func (h *HeartbeatConfig) IsIsolatedSession() bool {
 
 // AgentConfig is the per-agent config overlay loaded from config.yaml.
 type AgentConfig struct {
+	DisplayName string                  `yaml:"display_name,omitempty"`
 	CWD         string                  `yaml:"cwd"`
 	MCPServers  *AgentMCPConfig         `yaml:"-"` // parsed manually for _inherit
 	Tools       *AgentToolsFilter       `yaml:"tools"`

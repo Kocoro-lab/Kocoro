@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
+	"gopkg.in/yaml.v3"
 )
 
 func TestAgentToAPI_Minimal(t *testing.T) {
@@ -143,6 +144,25 @@ func TestAgentCreateRequest_Validate(t *testing.T) {
 	}
 	if err := r.Validate(); err == nil {
 		t.Error("expected error for null skill entry")
+	}
+}
+
+func TestWriteAgentConfig_PersistsDisplayName(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &AgentConfigAPI{DisplayName: "客服助手"}
+	if err := WriteAgentConfig(dir, "agent-abc123", cfg); err != nil {
+		t.Fatalf("WriteAgentConfig: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "agent-abc123", "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var parsed AgentConfig
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if parsed.DisplayName != "客服助手" {
+		t.Errorf("display_name = %q, want %q", parsed.DisplayName, "客服助手")
 	}
 }
 

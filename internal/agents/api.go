@@ -26,6 +26,7 @@ type AgentAPI struct {
 
 // AgentConfigAPI is the JSON representation of agent config.
 type AgentConfigAPI struct {
+	DisplayName string                  `json:"display_name,omitempty"`
 	CWD         string                  `json:"cwd,omitempty"`
 	Tools       *AgentToolsFilter       `json:"tools,omitempty"`
 	MCPServers  *AgentMCPConfigAPI      `json:"mcp_servers,omitempty"`
@@ -138,6 +139,9 @@ func WriteAgentConfig(agentsDir, name string, cfg *AgentConfigAPI) error {
 	defer unlock()
 
 	m := make(map[string]interface{})
+	if cfg.DisplayName != "" {
+		m["display_name"] = cfg.DisplayName
+	}
 	if cfg.CWD != "" {
 		m["cwd"] = cfg.CWD
 	}
