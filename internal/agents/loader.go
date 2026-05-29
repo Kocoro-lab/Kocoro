@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
@@ -156,6 +157,27 @@ func ValidateAgentName(name string) error {
 	return nil
 }
 
+// maxDisplayNameRunes caps a user-facing agent label. 256 runes is far beyond
+// any real display name (a sentence or two of CJK) while preventing a buggy or
+// malicious client from persisting a multi-MB string into config.yaml. If it
+// ever binds for a legitimate use, lift it here — it is not perf-sensitive.
+const maxDisplayNameRunes = 256
+
+// ValidateDisplayName checks an already-trimmed display name: a length cap and
+// no control characters (newlines, tabs, NUL, etc.). An empty string is valid
+// (it means "no display name" — the agent falls back to its slug).
+func ValidateDisplayName(s string) error {
+	if utf8.RuneCountInString(s) > maxDisplayNameRunes {
+		return fmt.Errorf("display_name too long: %d runes (max %d)", utf8.RuneCountInString(s), maxDisplayNameRunes)
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("display_name contains a control character")
+		}
+	}
+	return nil
+}
+
 // GenerateAgentSlug returns a fresh, unused agent slug of the form
 // "agent-<6 hex>". The slug is the immutable on-disk identity; users never
 // type it (they pick a display_name). Retries on the vanishingly small chance
@@ -168,7 +190,9 @@ func GenerateAgentSlug(agentsDir string) (string, error) {
 			return "", err
 		}
 		slug := "agent-" + hex.EncodeToString(b)
-		if _, err := os.Stat(filepath.Join(agentsDir, slug, "AGENT.md")); os.IsNotExist(err) {
+		_, userErr := os.Stat(filepath.Join(agentsDir, slug, "AGENT.md"))
+		_, builtinErr := os.Stat(filepath.Join(agentsDir, "_builtin", slug, "AGENT.md"))
+		if os.IsNotExist(userErr) && os.IsNotExist(builtinErr) {
 			return slug, nil
 		}
 	}

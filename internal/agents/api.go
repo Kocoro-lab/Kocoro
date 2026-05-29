@@ -182,12 +182,16 @@ func WriteAgentConfig(agentsDir, name string, cfg *AgentConfigAPI) error {
 }
 
 // SetAgentDisplayName updates only the display_name in an agent's config.yaml,
-// preserving every other field verbatim. It performs a map-based read-modify-
+// preserving every other field's value (YAML comments and key ordering are not
+// retained, same as WriteAgentConfig). It performs a map-based read-modify-
 // write under the config lock so fields not modeled by AgentConfigAPI (e.g.
 // auto_approve, mcp_servers) are not lost on rename. Empty displayName removes
 // the key.
 func SetAgentDisplayName(agentsDir, name, displayName string) error {
 	dir := filepath.Join(agentsDir, name)
+	if _, err := os.Stat(filepath.Join(dir, "AGENT.md")); err != nil {
+		return fmt.Errorf("agent %q: %w", name, err)
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
@@ -332,11 +336,14 @@ type AgentCreateRequest struct {
 	Skills      []*skills.Skill   `json:"skills,omitempty"`
 }
 
-// Validate checks required fields and runs all validators.
+// Validate checks required fields and runs all validators. It also trims DisplayName in place.
 func (r *AgentCreateRequest) Validate() error {
 	r.DisplayName = strings.TrimSpace(r.DisplayName)
 	if r.Name == "" && r.DisplayName == "" {
 		return fmt.Errorf("either name or display_name is required")
+	}
+	if err := ValidateDisplayName(r.DisplayName); err != nil {
+		return err
 	}
 	if r.Name != "" {
 		if err := ValidateAgentName(r.Name); err != nil {

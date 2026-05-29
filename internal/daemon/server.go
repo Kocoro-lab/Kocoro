@@ -2587,6 +2587,10 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		// (see handleCreateAgent). Accepted for the single-user local daemon.
 		trimmed := strings.TrimSpace(*req.DisplayName)
 		req.DisplayName = &trimmed
+		if err := agents.ValidateDisplayName(*req.DisplayName); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, *req.DisplayName, name)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -2676,6 +2680,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if req.DisplayName != nil {
 		// Update only display_name in config.yaml, preserving all other fields.
 		// Slug/dir/sessions/Cloud bindings are untouched by design.
+		// When a PUT carries both config and display_name this is a second write (config first, then this); a crash between them is acceptable under the single-user local daemon.
 		if err := agents.SetAgentDisplayName(s.deps.AgentsDir, name, *req.DisplayName); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

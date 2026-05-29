@@ -3,6 +3,7 @@ package agents
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
@@ -168,6 +169,21 @@ func TestAgentCreateRequest_Validate(t *testing.T) {
 	if r9.DisplayName != "" {
 		t.Errorf("display_name should be trimmed to empty, got %q", r9.DisplayName)
 	}
+	// Over-length display_name → error.
+	r10 := AgentCreateRequest{DisplayName: strings.Repeat("x", 257), Prompt: "p"}
+	if err := r10.Validate(); err == nil {
+		t.Errorf("over-length display_name should error")
+	}
+	// Control character (newline) → error.
+	r11 := AgentCreateRequest{DisplayName: "ab\ncd", Prompt: "p"}
+	if err := r11.Validate(); err == nil {
+		t.Errorf("display_name with control char should error")
+	}
+	// Exactly 256 runes → valid.
+	r12 := AgentCreateRequest{DisplayName: strings.Repeat("中", 256), Prompt: "p"}
+	if err := r12.Validate(); err != nil {
+		t.Errorf("256-rune display_name should be valid: %v", err)
+	}
 }
 
 func TestWriteAgentConfig_PersistsDisplayName(t *testing.T) {
@@ -213,6 +229,7 @@ func TestSetAgentDisplayName_PreservesOtherFields(t *testing.T) {
 	dir := t.TempDir()
 	ad := filepath.Join(dir, "agent-keep01")
 	os.MkdirAll(ad, 0700)
+	os.WriteFile(filepath.Join(ad, "AGENT.md"), []byte("You are test."), 0600)
 	os.WriteFile(filepath.Join(ad, "config.yaml"),
 		[]byte("auto_approve: true\ncwd: /tmp/work\n"), 0600)
 
