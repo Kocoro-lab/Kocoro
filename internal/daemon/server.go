@@ -2423,6 +2423,35 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Auto-generate an immutable slug when the client only supplied a
+	// display_name (the common Desktop path). Legacy clients that pass an
+	// explicit name keep it.
+	if req.Name == "" {
+		slug, err := agents.GenerateAgentSlug(s.deps.AgentsDir)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		req.Name = slug
+	}
+	// Enforce global display-name uniqueness (normalized).
+	if req.DisplayName != "" {
+		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, req.DisplayName, "")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if taken {
+			writeError(w, http.StatusConflict,
+				fmt.Sprintf("display name %q is already in use", req.DisplayName))
+			return
+		}
+		// Fold display_name into the config so it is persisted.
+		if req.Config == nil {
+			req.Config = &agents.AgentConfigAPI{}
+		}
+		req.Config.DisplayName = req.DisplayName
+	}
 	if err := s.validateInstalledSkills(skillNamesFromRequest(req.Skills)); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
