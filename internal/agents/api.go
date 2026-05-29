@@ -54,9 +54,10 @@ func (a *Agent) ToAPI() *AgentAPI {
 	}
 	if a.Config != nil {
 		api.Config = &AgentConfigAPI{
-			CWD:   a.Config.CWD,
-			Tools: a.Config.Tools,
-			Agent: a.Config.Agent,
+			DisplayName: a.Config.DisplayName,
+			CWD:         a.Config.CWD,
+			Tools:       a.Config.Tools,
+			Agent:       a.Config.Agent,
 		}
 		if a.Config.MCPServers != nil {
 			api.Config.MCPServers = &AgentMCPConfigAPI{
