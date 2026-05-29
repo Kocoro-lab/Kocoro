@@ -2795,3 +2795,352 @@ func TestMCPConfigChanged_KeepAliveDetected(t *testing.T) {
 		})
 	}
 }
+
+// TestServer_DisplayName_AutoSlug verifies that POSTing without a name but
+// with a display_name auto-generates a slug and returns the display_name.
+func TestServer_DisplayName_AutoSlug(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+
+	resp, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"display_name":"客服助手","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201, got %d body=%s", resp.StatusCode, body)
+	}
+	var api struct {
+		Name        string `json:"name"`
+		DisplayName string `json:"display_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&api); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !strings.HasPrefix(api.Name, "agent-") {
+		t.Errorf("expected auto-slug name to start with 'agent-', got %q", api.Name)
+	}
+	if api.DisplayName != "客服助手" {
+		t.Errorf("expected display_name %q, got %q", "客服助手", api.DisplayName)
+	}
+}
+
+// TestServer_DisplayName_CreateDuplicate verifies that creating a second agent
+// with an already-taken display_name returns 409.
+func TestServer_DisplayName_CreateDuplicate(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+
+	resp, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"first-bot","display_name":"TakenName","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create first-bot: expected 201, got %d", resp.StatusCode)
+	}
+
+	resp2, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"display_name":"TakenName","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusConflict {
+		t.Errorf("duplicate display_name: expected 409, got %d", resp2.StatusCode)
+	}
+}
+
+// TestServer_DisplayName_RenameDuplicate verifies that renaming an agent to an
+// already-taken display_name returns 409.
+func TestServer_DisplayName_RenameDuplicate(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+
+	// Create agent A with display_name "NameA".
+	resp, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"agent-a","display_name":"NameA","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create agent-a: expected 201, got %d", resp.StatusCode)
+	}
+
+	// Create agent B without a display_name.
+	resp2, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"agent-b","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("create agent-b: expected 201, got %d", resp2.StatusCode)
+	}
+
+	// Rename agent B to "NameA" — should 409.
+	dn := "NameA"
+	body, _ := json.Marshal(map[string]interface{}{"display_name": &dn})
+	req, _ := http.NewRequest(http.MethodPut, base+"/agents/agent-b", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp3, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusConflict {
+		t.Errorf("rename to taken display_name: expected 409, got %d", resp3.StatusCode)
+	}
+}
+
+// TestServer_DisplayName_RenameToEmptyClears verifies that setting display_name
+// to "" clears the explicit label so the slug is returned as the effective name.
+func TestServer_DisplayName_RenameToEmptyClears(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+
+	// Create agent with display_name "Temp"; capture the slug.
+	resp, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"clear-bot","display_name":"Temp","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: expected 201, got %d", resp.StatusCode)
+	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	slug := created.Name
+
+	// PUT display_name="" to clear the explicit label.
+	empty := ""
+	putBody, _ := json.Marshal(map[string]interface{}{"display_name": &empty})
+	req, _ := http.NewRequest(http.MethodPut, base+"/agents/"+slug, bytes.NewReader(putBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("PUT display_name='': expected 200, got %d body=%s", resp2.StatusCode, body)
+	}
+
+	// Read back and assert display_name falls back to the slug.
+	a, err := agents.LoadAgent(agentsDir, slug)
+	if err != nil {
+		t.Fatalf("load agent: %v", err)
+	}
+	api := a.ToAPI()
+	if api.DisplayName != slug {
+		t.Errorf("after clearing display_name, expected DisplayName == slug %q, got %q", slug, api.DisplayName)
+	}
+}
+
+// TestServer_DisplayName_RenameHappyPath verifies a successful display_name
+// rename: 200 status, updated display_name, and slug unchanged.
+func TestServer_DisplayName_RenameHappyPath(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+
+	resp, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"rename-bot","display_name":"Old","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: expected 201, got %d", resp.StatusCode)
+	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	slug := created.Name
+
+	newName := "New"
+	putBody, _ := json.Marshal(map[string]interface{}{"display_name": &newName})
+	req, _ := http.NewRequest(http.MethodPut, base+"/agents/"+slug, bytes.NewReader(putBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("PUT rename: expected 200, got %d body=%s", resp2.StatusCode, body)
+	}
+
+	a, err := agents.LoadAgent(agentsDir, slug)
+	if err != nil {
+		t.Fatalf("load agent: %v", err)
+	}
+	api := a.ToAPI()
+	if api.DisplayName != "New" {
+		t.Errorf("expected display_name %q, got %q", "New", api.DisplayName)
+	}
+	if api.Name != slug {
+		t.Errorf("expected slug %q to be unchanged, got %q", slug, api.Name)
+	}
+}
+
+// TestServer_DisplayName_NestedConfigIgnored verifies that a display_name
+// supplied inside the config object is ignored on both POST /agents and
+// PUT /agents/{name}, so the uniqueness check cannot be bypassed.
+func TestServer_DisplayName_NestedConfigIgnored(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+
+	// Create "taken-bot" with top-level display_name so it is registered.
+	resp, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"taken-bot","display_name":"TakenName","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create taken-bot: expected 201, got %d", resp.StatusCode)
+	}
+
+	// POST /agents with display_name only inside config — must not 409 on
+	// uniqueness but the written agent must NOT have the duplicate display_name.
+	resp2, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"bypass-create","prompt":"p","config":{"display_name":"TakenName"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("bypass-create: expected 201, got %d", resp2.StatusCode)
+	}
+	loaded, err := agents.LoadAgent(agentsDir, "bypass-create")
+	if err != nil {
+		t.Fatalf("load bypass-create: %v", err)
+	}
+	if loaded.Config != nil && loaded.Config.DisplayName == "TakenName" {
+		t.Errorf("POST with nested config.display_name wrote duplicate display_name to disk")
+	}
+
+	// Create a second agent to test PUT bypass.
+	resp3, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"bypass-update","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusCreated {
+		t.Fatalf("bypass-update: expected 201, got %d", resp3.StatusCode)
+	}
+
+	// PUT /agents/{name} with display_name only inside config — must not write
+	// the duplicate display_name.
+	req, _ := http.NewRequest(http.MethodPut, base+"/agents/bypass-update",
+		strings.NewReader(`{"config":{"display_name":"TakenName"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp4, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusOK {
+		t.Fatalf("PUT bypass-update: expected 200, got %d", resp4.StatusCode)
+	}
+	loaded2, err := agents.LoadAgent(agentsDir, "bypass-update")
+	if err != nil {
+		t.Fatalf("load bypass-update: %v", err)
+	}
+	if loaded2.Config != nil && loaded2.Config.DisplayName == "TakenName" {
+		t.Errorf("PUT with nested config.display_name wrote duplicate display_name to disk")
+	}
+}

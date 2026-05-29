@@ -2423,6 +2423,45 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Auto-generate an immutable slug when the client only supplied a
+	// display_name (the common Desktop path). Legacy clients that pass an
+	// explicit name keep it.
+	if req.Name == "" {
+		slug, err := agents.GenerateAgentSlug(s.deps.AgentsDir)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		req.Name = slug
+	}
+	// display_name is honored only via the dedicated top-level field below
+	// (uniqueness-checked). Ignore any client-supplied config.display_name,
+	// which would otherwise bypass the uniqueness check.
+	if req.Config != nil {
+		req.Config.DisplayName = ""
+	}
+	// Enforce global display-name uniqueness (normalized). Best-effort: the
+	// check is not serialized against concurrent creates/renames (the route
+	// lock below is per-slug, not per-display-name). Accepted under the
+	// single-user local-daemon model; the failure mode is a duplicate label,
+	// never routing/Cloud corruption.
+	if req.DisplayName != "" {
+		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, req.DisplayName, "")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if taken {
+			writeError(w, http.StatusConflict,
+				fmt.Sprintf("display name %q is already in use", req.DisplayName))
+			return
+		}
+		// Fold display_name into the config so it is persisted.
+		if req.Config == nil {
+			req.Config = &agents.AgentConfigAPI{}
+		}
+		req.Config.DisplayName = req.DisplayName
+	}
 	if err := s.validateInstalledSkills(skillNamesFromRequest(req.Skills)); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -2543,6 +2582,26 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		parsedConfig = &cfg
 	}
+	if req.DisplayName != nil {
+		// Best-effort uniqueness: not serialized against concurrent renames
+		// (see handleCreateAgent). Accepted for the single-user local daemon.
+		trimmed := strings.TrimSpace(*req.DisplayName)
+		req.DisplayName = &trimmed
+		if err := agents.ValidateDisplayName(*req.DisplayName); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, *req.DisplayName, name)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if taken {
+			writeError(w, http.StatusConflict,
+				fmt.Sprintf("display name %q is already in use", *req.DisplayName))
+			return
+		}
+	}
 	for cmdName := range req.Commands {
 		if err := agents.ValidateCommandName(cmdName); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -2603,10 +2662,28 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
+			// display_name is managed only via the dedicated top-level field
+			// (uniqueness-checked). Preserve the existing on-disk value across a
+			// full config rewrite and ignore any client-supplied
+			// config.display_name, which would otherwise bypass the check.
+			if cur, err := agents.LoadAgent(s.deps.AgentsDir, name); err == nil && cur.Config != nil {
+				parsedConfig.DisplayName = cur.Config.DisplayName
+			} else {
+				parsedConfig.DisplayName = ""
+			}
 			if err := agents.WriteAgentConfig(s.deps.AgentsDir, name, parsedConfig); err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+		}
+	}
+	if req.DisplayName != nil {
+		// Update only display_name in config.yaml, preserving all other fields.
+		// Slug/dir/sessions/Cloud bindings are untouched by design.
+		// When a PUT carries both config and display_name this is a second write (config first, then this); a crash between them is acceptable under the single-user local daemon.
+		if err := agents.SetAgentDisplayName(s.deps.AgentsDir, name, *req.DisplayName); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 	}
 	for cmdName, content := range req.Commands {

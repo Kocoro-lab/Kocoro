@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -400,5 +401,88 @@ func TestLoadAgent_ModelTierNilWhenAbsent(t *testing.T) {
 	}
 	if a.Config.Agent.ModelTier != nil {
 		t.Errorf("ModelTier expected nil when omitted, got %q", *a.Config.Agent.ModelTier)
+	}
+}
+
+func writeAgentWithDisplay(t *testing.T, dir, slug, display string) {
+	t.Helper()
+	ad := filepath.Join(dir, slug)
+	os.MkdirAll(ad, 0700)
+	os.WriteFile(filepath.Join(ad, "AGENT.md"), []byte("x"), 0600)
+	if display != "" {
+		os.WriteFile(filepath.Join(ad, "config.yaml"),
+			[]byte("display_name: "+display+"\n"), 0600)
+	}
+}
+
+func TestDisplayNameTaken(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentWithDisplay(t, dir, "agent-aaa111", "客服助手")
+	writeAgentWithDisplay(t, dir, "agent-bbb222", "")
+
+	taken, err := DisplayNameTaken(dir, "客服助手", "")
+	if err != nil || !taken {
+		t.Errorf("client match: taken=%v err=%v, want true,nil", taken, err)
+	}
+	if taken, _ := DisplayNameTaken(dir, "  客服助手 ", ""); !taken {
+		t.Errorf("normalized match should be taken")
+	}
+	if taken, _ := DisplayNameTaken(dir, "客服助手", "agent-aaa111"); taken {
+		t.Errorf("self-exclude should not be taken")
+	}
+	if taken, _ := DisplayNameTaken(dir, "新名字", ""); taken {
+		t.Errorf("unused name should not be taken")
+	}
+	if taken, _ := DisplayNameTaken(dir, "  ", ""); taken {
+		t.Errorf("empty name should never be taken")
+	}
+	// A slug with no explicit display_name is reserved under its slug-fallback name.
+	if taken, _ := DisplayNameTaken(dir, "agent-bbb222", ""); !taken {
+		t.Errorf("slug-fallback display name should be taken")
+	}
+}
+
+func TestListAgents_DisplayNameFallback(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentWithDisplay(t, dir, "agent-aaa111", "客服助手")
+	writeAgentWithDisplay(t, dir, "agent-bbb222", "")
+	entries, err := ListAgents(dir)
+	if err != nil {
+		t.Fatalf("ListAgents: %v", err)
+	}
+	got := map[string]string{}
+	for _, e := range entries {
+		got[e.Name] = e.DisplayName
+	}
+	if got["agent-aaa111"] != "客服助手" {
+		t.Errorf("display = %q, want 客服助手", got["agent-aaa111"])
+	}
+	if got["agent-bbb222"] != "agent-bbb222" {
+		t.Errorf("display = %q, want fallback to slug", got["agent-bbb222"])
+	}
+}
+
+func TestGenerateAgentSlug_FormatAndUniqueness(t *testing.T) {
+	dir := t.TempDir()
+	slug, err := GenerateAgentSlug(dir)
+	if err != nil {
+		t.Fatalf("GenerateAgentSlug: %v", err)
+	}
+	if !strings.HasPrefix(slug, "agent-") {
+		t.Errorf("slug = %q, want prefix agent-", slug)
+	}
+	if err := ValidateAgentName(slug); err != nil {
+		t.Errorf("generated slug %q fails ValidateAgentName: %v", slug, err)
+	}
+	// Existing dir with that slug must be skipped.
+	agentDir := filepath.Join(dir, slug)
+	os.MkdirAll(agentDir, 0700)
+	os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte("x"), 0600)
+	slug2, err := GenerateAgentSlug(dir)
+	if err != nil {
+		t.Fatalf("GenerateAgentSlug 2: %v", err)
+	}
+	if slug2 == slug {
+		t.Errorf("second slug collided with existing: %q", slug2)
 	}
 }

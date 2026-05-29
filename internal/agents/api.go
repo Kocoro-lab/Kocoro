@@ -13,19 +13,21 @@ import (
 
 // AgentAPI is the JSON representation of an agent for the HTTP API.
 type AgentAPI struct {
-	Name       string             `json:"name"`
-	Prompt     string             `json:"prompt"`
-	Memory     *string            `json:"memory"`              // null if no MEMORY.md
-	Config     *AgentConfigAPI    `json:"config"`              // null if no config.yaml
-	Commands   map[string]string  `json:"commands"`            // null if no commands
-	Skills     []skills.SkillMeta `json:"skills"`              // null if no skills
-	Builtin    bool               `json:"builtin"`             // true if agent is a bundled builtin
-	Overridden bool               `json:"overridden"`          // true if builtin has user override
-	Warnings   []string           `json:"warnings,omitempty"`  // non-fatal config advisories (e.g. heartbeat⊕schedule double-fire)
+	Name        string             `json:"name"`
+	DisplayName string             `json:"display_name"` // falls back to Name when unset
+	Prompt      string             `json:"prompt"`
+	Memory      *string            `json:"memory"`             // null if no MEMORY.md
+	Config      *AgentConfigAPI    `json:"config"`             // null if no config.yaml
+	Commands    map[string]string  `json:"commands"`           // null if no commands
+	Skills      []skills.SkillMeta `json:"skills"`             // null if no skills
+	Builtin     bool               `json:"builtin"`            // true if agent is a bundled builtin
+	Overridden  bool               `json:"overridden"`         // true if builtin has user override
+	Warnings    []string           `json:"warnings,omitempty"` // non-fatal config advisories (e.g. heartbeat⊕schedule double-fire)
 }
 
 // AgentConfigAPI is the JSON representation of agent config.
 type AgentConfigAPI struct {
+	DisplayName string                  `json:"display_name,omitempty"`
 	CWD         string                  `json:"cwd,omitempty"`
 	Tools       *AgentToolsFilter       `json:"tools,omitempty"`
 	MCPServers  *AgentMCPConfigAPI      `json:"mcp_servers,omitempty"`
@@ -47,15 +49,20 @@ func (a *Agent) ToAPI() *AgentAPI {
 		Name:   a.Name,
 		Prompt: a.Prompt,
 	}
+	api.DisplayName = a.Name
+	if a.Config != nil && a.Config.DisplayName != "" {
+		api.DisplayName = a.Config.DisplayName
+	}
 	if a.Memory != "" {
 		mem := a.Memory
 		api.Memory = &mem
 	}
 	if a.Config != nil {
 		api.Config = &AgentConfigAPI{
-			CWD:   a.Config.CWD,
-			Tools: a.Config.Tools,
-			Agent: a.Config.Agent,
+			DisplayName: a.Config.DisplayName,
+			CWD:         a.Config.CWD,
+			Tools:       a.Config.Tools,
+			Agent:       a.Config.Agent,
 		}
 		if a.Config.MCPServers != nil {
 			api.Config.MCPServers = &AgentMCPConfigAPI{
@@ -138,6 +145,9 @@ func WriteAgentConfig(agentsDir, name string, cfg *AgentConfigAPI) error {
 	defer unlock()
 
 	m := make(map[string]interface{})
+	if cfg.DisplayName != "" {
+		m["display_name"] = cfg.DisplayName
+	}
 	if cfg.CWD != "" {
 		m["cwd"] = cfg.CWD
 	}
@@ -164,6 +174,52 @@ func WriteAgentConfig(agentsDir, name string, cfg *AgentConfigAPI) error {
 	if cfg.Heartbeat != nil {
 		m["heartbeat"] = cfg.Heartbeat
 	}
+	data, err := yaml.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	return AtomicWrite(path, data)
+}
+
+// SetAgentDisplayName updates only the display_name in an agent's config.yaml,
+// preserving every other field's value (YAML comments and key ordering are not
+// retained, same as WriteAgentConfig). It performs a map-based read-modify-
+// write under the config lock so fields not modeled by AgentConfigAPI (e.g.
+// auto_approve, mcp_servers) are not lost on rename. Empty displayName removes
+// the key.
+func SetAgentDisplayName(agentsDir, name, displayName string) error {
+	dir := filepath.Join(agentsDir, name)
+	if _, err := os.Stat(filepath.Join(dir, "AGENT.md")); err != nil {
+		return fmt.Errorf("agent %q: %w", name, err)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	unlock, err := lockAgentConfig(dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	path := filepath.Join(dir, "config.yaml")
+	m := map[string]interface{}{}
+	if data, err := os.ReadFile(path); err == nil {
+		if err := yaml.Unmarshal(data, &m); err != nil {
+			return fmt.Errorf("parse config: %w", err)
+		}
+		if m == nil {
+			m = map[string]interface{}{}
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	if displayName == "" {
+		delete(m, "display_name")
+	} else {
+		m["display_name"] = displayName
+	}
+
 	data, err := yaml.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -271,18 +327,28 @@ func AtomicWrite(path string, data []byte) error {
 
 // AgentCreateRequest parses a POST /agents request body.
 type AgentCreateRequest struct {
-	Name     string            `json:"name"`
-	Prompt   string            `json:"prompt"`
-	Memory   *string           `json:"memory,omitempty"`
-	Config   *AgentConfigAPI   `json:"config,omitempty"`
-	Commands map[string]string `json:"commands,omitempty"`
-	Skills   []*skills.Skill   `json:"skills,omitempty"`
+	Name        string            `json:"name"`
+	DisplayName string            `json:"display_name,omitempty"`
+	Prompt      string            `json:"prompt"`
+	Memory      *string           `json:"memory,omitempty"`
+	Config      *AgentConfigAPI   `json:"config,omitempty"`
+	Commands    map[string]string `json:"commands,omitempty"`
+	Skills      []*skills.Skill   `json:"skills,omitempty"`
 }
 
-// Validate checks required fields and runs all validators.
+// Validate checks required fields and runs all validators. It also trims DisplayName in place.
 func (r *AgentCreateRequest) Validate() error {
-	if err := ValidateAgentName(r.Name); err != nil {
+	r.DisplayName = strings.TrimSpace(r.DisplayName)
+	if r.Name == "" && r.DisplayName == "" {
+		return fmt.Errorf("either name or display_name is required")
+	}
+	if err := ValidateDisplayName(r.DisplayName); err != nil {
 		return err
+	}
+	if r.Name != "" {
+		if err := ValidateAgentName(r.Name); err != nil {
+			return err
+		}
 	}
 	if r.Prompt == "" {
 		return fmt.Errorf("prompt is required")
@@ -319,9 +385,10 @@ func (r *AgentCreateRequest) Validate() error {
 
 // AgentUpdateRequest is a partial update — only non-nil fields are applied.
 type AgentUpdateRequest struct {
-	Prompt   *string           `json:"prompt,omitempty"`
-	Memory   json.RawMessage   `json:"memory,omitempty"` // string or null
-	Config   json.RawMessage   `json:"config,omitempty"` // object or null
-	Commands map[string]string `json:"commands,omitempty"`
-	Skills   []*skills.Skill   `json:"skills,omitempty"`
+	Prompt      *string           `json:"prompt,omitempty"`
+	DisplayName *string           `json:"display_name,omitempty"` // rename; nil = unchanged
+	Memory      json.RawMessage   `json:"memory,omitempty"`       // string or null
+	Config      json.RawMessage   `json:"config,omitempty"`       // object or null
+	Commands    map[string]string `json:"commands,omitempty"`
+	Skills      []*skills.Skill   `json:"skills,omitempty"`
 }

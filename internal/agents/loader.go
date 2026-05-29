@@ -1,12 +1,15 @@
 package agents
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
@@ -75,6 +78,7 @@ func (h *HeartbeatConfig) IsIsolatedSession() bool {
 
 // AgentConfig is the per-agent config overlay loaded from config.yaml.
 type AgentConfig struct {
+	DisplayName string                  `yaml:"display_name,omitempty"`
 	CWD         string                  `yaml:"cwd"`
 	MCPServers  *AgentMCPConfig         `yaml:"-"` // parsed manually for _inherit
 	Tools       *AgentToolsFilter       `yaml:"tools"`
@@ -152,6 +156,48 @@ func ValidateAgentName(name string) error {
 		return fmt.Errorf("invalid agent name %q: must match %s", name, agentNameRe.String())
 	}
 	return nil
+}
+
+// maxDisplayNameRunes caps a user-facing agent label. 256 runes is far beyond
+// any real display name (a sentence or two of CJK) while preventing a buggy or
+// malicious client from persisting a multi-MB string into config.yaml. If it
+// ever binds for a legitimate use, lift it here — it is not perf-sensitive.
+const maxDisplayNameRunes = 256
+
+// ValidateDisplayName checks an already-trimmed display name: a length cap and
+// no control characters (newlines, tabs, NUL, etc.). An empty string is valid
+// (it means "no display name" — the agent falls back to its slug).
+func ValidateDisplayName(s string) error {
+	if utf8.RuneCountInString(s) > maxDisplayNameRunes {
+		return fmt.Errorf("display_name too long: %d runes (max %d)", utf8.RuneCountInString(s), maxDisplayNameRunes)
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("display_name contains a control character")
+		}
+	}
+	return nil
+}
+
+// GenerateAgentSlug returns a fresh, unused agent slug of the form
+// "agent-<6 hex>". The slug is the immutable on-disk identity; users never
+// type it (they pick a display_name). Retries on the vanishingly small chance
+// of a directory collision. 10 attempts is far beyond any realistic agent
+// count; exhausting it signals a broken rand source, surfaced as an error.
+func GenerateAgentSlug(agentsDir string) (string, error) {
+	for i := 0; i < 10; i++ {
+		b := make([]byte, 3)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		slug := "agent-" + hex.EncodeToString(b)
+		_, userErr := os.Stat(filepath.Join(agentsDir, slug, "AGENT.md"))
+		_, builtinErr := os.Stat(filepath.Join(agentsDir, "_builtin", slug, "AGENT.md"))
+		if os.IsNotExist(userErr) && os.IsNotExist(builtinErr) {
+			return slug, nil
+		}
+	}
+	return "", fmt.Errorf("could not generate a unique agent slug after 10 attempts")
 }
 
 func LoadAgent(agentsDir, name string) (*Agent, error) {
@@ -401,9 +447,65 @@ func LoadGlobalSkills(shannonDir string) ([]*skills.Skill, error) {
 
 // AgentEntry represents an agent in the listing with source metadata.
 type AgentEntry struct {
-	Name     string `json:"name"`
-	Builtin  bool   `json:"builtin"`  // loaded from _builtin
-	Override bool   `json:"override"` // user-defined agent overrides a builtin
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"` // falls back to Name when unset
+	Builtin     bool   `json:"builtin"`      // loaded from _builtin
+	Override    bool   `json:"override"`     // user-defined agent overrides a builtin
+}
+
+// normalizeDisplayName canonicalizes a display name for uniqueness comparison:
+// trim surrounding whitespace and case-fold. CJK has no case so ToLower is a
+// no-op there; it only matters for Latin names ("Bot" vs "bot").
+func normalizeDisplayName(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// loadDisplayName reads display_name from an agent's config.yaml (user dir
+// first, then _builtin). Returns "" when unset or unreadable — callers
+// fall back to the slug. Intentionally cheaper than a full LoadAgent.
+func loadDisplayName(agentsDir, name string) string {
+	for _, base := range []string{agentsDir, filepath.Join(agentsDir, "_builtin")} {
+		data, err := os.ReadFile(filepath.Join(base, name, "config.yaml"))
+		if err != nil {
+			continue
+		}
+		var cfg AgentConfig
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			continue
+		}
+		if cfg.DisplayName != "" {
+			return cfg.DisplayName
+		}
+	}
+	return ""
+}
+
+// DisplayNameTaken reports whether displayName (normalized) is already used by
+// an agent other than excludeSlug. An empty/whitespace name is never taken
+// (it means "no display name"). excludeSlug lets rename keep its own name.
+// Comparison is against the EFFECTIVE display name (explicit display_name or
+// slug fallback) that ListAgents fills in — the value users actually see.
+func DisplayNameTaken(agentsDir, displayName, excludeSlug string) (bool, error) {
+	norm := normalizeDisplayName(displayName)
+	if norm == "" {
+		return false, nil
+	}
+	entries, err := ListAgents(agentsDir)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if e.Name == excludeSlug {
+			continue
+		}
+		// Compare against the EFFECTIVE display name (explicit display_name or
+		// the slug fallback that ListAgents fills in) — that is what users see,
+		// so a new name must not collide with either.
+		if normalizeDisplayName(e.DisplayName) == norm {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func ListAgents(agentsDir string) ([]AgentEntry, error) {
@@ -451,6 +553,14 @@ func ListAgents(agentsDir string) ([]AgentEntry, error) {
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name < entries[j].Name
 	})
+	for i := range entries {
+		if entries[i].DisplayName == "" {
+			entries[i].DisplayName = loadDisplayName(agentsDir, entries[i].Name)
+		}
+		if entries[i].DisplayName == "" {
+			entries[i].DisplayName = entries[i].Name
+		}
+	}
 	return entries, nil
 }
 
