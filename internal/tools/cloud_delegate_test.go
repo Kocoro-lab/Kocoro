@@ -8,7 +8,7 @@ import (
 )
 
 func TestCloudDelegateInfo(t *testing.T) {
-	tool := NewCloudDelegateTool(nil, "", 60*time.Second, nil, "", "")
+	tool := NewCloudDelegateTool(nil, "", 60*time.Second, 0, nil, "", "")
 	info := tool.Info()
 	if info.Name != "cloud_delegate" {
 		t.Errorf("expected name cloud_delegate, got %s", info.Name)
@@ -60,7 +60,7 @@ func TestCloudDelegateTerminalDefault(t *testing.T) {
 }
 
 func TestCloudDelegateRequiresApproval(t *testing.T) {
-	tool := NewCloudDelegateTool(nil, "", 60*time.Second, nil, "", "")
+	tool := NewCloudDelegateTool(nil, "", 60*time.Second, 0, nil, "", "")
 	if !tool.RequiresApproval() {
 		t.Error("cloud_delegate should require approval")
 	}
@@ -70,7 +70,7 @@ func TestCloudDelegateRequiresApproval(t *testing.T) {
 }
 
 func TestCloudDelegateEmptyTask(t *testing.T) {
-	tool := NewCloudDelegateTool(nil, "", 60*time.Second, nil, "", "")
+	tool := NewCloudDelegateTool(nil, "", 60*time.Second, 0, nil, "", "")
 	result, err := tool.Run(context.Background(), `{"task":""}`)
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +81,7 @@ func TestCloudDelegateEmptyTask(t *testing.T) {
 }
 
 func TestCloudDelegateInvalidJSON(t *testing.T) {
-	tool := NewCloudDelegateTool(nil, "", 60*time.Second, nil, "", "")
+	tool := NewCloudDelegateTool(nil, "", 60*time.Second, 0, nil, "", "")
 	result, err := tool.Run(context.Background(), `not json`)
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +92,7 @@ func TestCloudDelegateInvalidJSON(t *testing.T) {
 }
 
 func TestCloudDelegateNoGateway(t *testing.T) {
-	tool := NewCloudDelegateTool(nil, "", 60*time.Second, nil, "", "")
+	tool := NewCloudDelegateTool(nil, "", 60*time.Second, 0, nil, "", "")
 	result, err := tool.Run(context.Background(), `{"task":"test task"}`)
 	if err != nil {
 		t.Fatal(err)
@@ -103,7 +103,7 @@ func TestCloudDelegateNoGateway(t *testing.T) {
 }
 
 func TestCloudDelegateContextTruncation(t *testing.T) {
-	tool := NewCloudDelegateTool(nil, "", 60*time.Second, nil, "", "")
+	tool := NewCloudDelegateTool(nil, "", 60*time.Second, 0, nil, "", "")
 	longCtx := make([]byte, 9000)
 	for i := range longCtx {
 		longCtx[i] = 'x'

@@ -65,6 +65,7 @@ Global settings control how Shannon behaves across all agents — which AI model
 | `permissions.denied_commands` | Bash blocklist | YES |
 | `permissions.always_allow_tools` | **Tool-level approval bypass** (global scope, applies to every agent). List of tool names whose approval prompt is skipped — e.g. `[bash, file_write, http]`. Companion per-agent field lives at `~/.shannon/agents/<name>/config.yaml permissions.always_allow_tools`; the runtime unions both. Persistence is gated by `agent.DisallowsAutoApproval` (currently empty as of 2026-05-18) — no tool is currently refused, but the plumbing stays for future use. High-risk bash command prefixes (`pip install`, `rm -rf`, `python -c`, etc.) still prompt every call regardless. Endpoints: `POST/DELETE /permissions/always-allow` (global), `POST/DELETE /agents/{name}/permissions/always-allow` (per-agent). | No |
 | `cloud.publish_allowed_extensions` | Extra file extensions allowed for `publish_to_web` (e.g. `[".go", ".sql"]`). Additive on top of the built-in default; denylist is **not** user-configurable. | No |
+| `cloud.stream_idle_timeout_secs` | Abort a cloud-delegate SSE connection when no line (event or 10s heartbeat) arrives for this many seconds, then reconnect via Last-Event-ID. Per-connection liveness probe, NOT a workflow time limit (`cloud.timeout` bounds total duration). 0 = disabled. Default: 45. | No |
 | `mcp_servers` | External service integrations (see mcp reference) | No |
 
 ## Common Scenarios

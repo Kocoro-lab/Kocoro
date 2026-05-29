@@ -16,6 +16,7 @@ type CloudDelegateTool struct {
 	gw          *client.GatewayClient
 	apiKey      string
 	timeout     time.Duration
+	idleTimeout time.Duration
 	handler     agent.EventHandler
 	agentName   string
 	agentPrompt string
@@ -29,11 +30,12 @@ type cloudDelegateArgs struct {
 	Terminal     *bool  `json:"terminal,omitempty"`
 }
 
-func NewCloudDelegateTool(gw *client.GatewayClient, apiKey string, timeout time.Duration, handler agent.EventHandler, agentName, agentPrompt string) *CloudDelegateTool {
+func NewCloudDelegateTool(gw *client.GatewayClient, apiKey string, timeout, idleTimeout time.Duration, handler agent.EventHandler, agentName, agentPrompt string) *CloudDelegateTool {
 	return &CloudDelegateTool{
 		gw:          gw,
 		apiKey:      apiKey,
 		timeout:     timeout,
+		idleTimeout: idleTimeout,
 		handler:     handler,
 		agentName:   agentName,
 		agentPrompt: agentPrompt,
@@ -140,6 +142,7 @@ func (t *CloudDelegateTool) Run(ctx context.Context, argsJSON string) (agent.Too
 		UserContext:  args.Context,
 		ExtraContext: extras,
 		Timeout:      t.timeout,
+		IdleTimeout:  t.idleTimeout,
 	}, t.handler)
 
 	if err != nil {

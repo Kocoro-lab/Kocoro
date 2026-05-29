@@ -558,3 +558,37 @@ func TestConfig_StreamIdleTimeoutNegativeRejected(t *testing.T) {
 		t.Errorf("expected error to mention stream_idle_timeout_secs, got %v", err)
 	}
 }
+
+// TestConfig_CloudStreamIdleTimeoutDefault pins the cloud SSE liveness probe
+// default at 45s — load-bearing: if it silently became 0 the per-connection
+// idle watchdog would be disabled on every cloud_delegate / research run.
+func TestConfig_CloudStreamIdleTimeoutDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shannonDir := filepath.Join(home, ".shannon")
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Cloud.StreamIdleTimeoutSecs != 45 {
+		t.Errorf("Cloud.StreamIdleTimeoutSecs default = %d, want 45", cfg.Cloud.StreamIdleTimeoutSecs)
+	}
+}
+
+// TestConfig_CloudStreamIdleTimeoutNegativeRejected ensures a negative cloud
+// value is caught by the validator (a typo can't silently disable or wrap the
+// watchdog).
+func TestConfig_CloudStreamIdleTimeoutNegativeRejected(t *testing.T) {
+	cfg := &Config{}
+	cfg.Cloud.StreamIdleTimeoutSecs = -1
+	err := validateConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error for negative cloud.stream_idle_timeout_secs, got nil")
+	}
+	if !strings.Contains(err.Error(), "cloud.stream_idle_timeout_secs") {
+		t.Errorf("expected error to mention cloud.stream_idle_timeout_secs, got %v", err)
+	}
+}

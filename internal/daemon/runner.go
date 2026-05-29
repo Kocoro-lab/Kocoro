@@ -2683,7 +2683,7 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 	// path at runner.go:946-948 — without this, any approval prompt that
 	// surfaces inside the cloud workflow would Mark the ApprovalTracker
 	// with an empty sessionID and be invisible to GET /approvals on
-	// reconnect. Today /research and /swarm rarely trigger user-facing
+	// reconnect. Today /research, /swarm and /dag rarely trigger user-facing
 	// approvals (most tools auto-route via Gateway), but the asymmetry is
 	// cheap to remove and keeps the contract consistent.
 	if sess != nil {
@@ -2758,6 +2758,10 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		Strategy:     cmd.Strategy,
 		SessionID:    sess.ID,
 		Timeout:      slashTimeout,
+		// Slash path (/research, /swarm, /dag) bypasses the cloud_delegate tool, so
+		// wire the SSE idle watchdog here too or it would run with no liveness
+		// probe. MaxReconnects is left 0 so cloudflow.Run applies its default.
+		IdleTimeout: time.Duration(cfg.Cloud.StreamIdleTimeoutSecs) * time.Second,
 	}
 	res, err := cloudflow.Run(slashCtx, cf, handler)
 	if err != nil {

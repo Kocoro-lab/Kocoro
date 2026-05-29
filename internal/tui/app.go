@@ -26,6 +26,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
@@ -2512,7 +2513,7 @@ func (h *tuiEventHandler) OnCloudAgent(agentID, status, message string) {
 	if p == "" {
 		p = "-"
 	}
-	h.OnStreamDelta(fmt.Sprintf("  %s %s\n", p, message))
+	h.OnStreamDelta(fmt.Sprintf("  %s %s\n", p, cloudflow.CloudStatusLine(agentID, status, message)))
 }
 
 func (h *tuiEventHandler) OnCloudProgress(completed, total int) {
