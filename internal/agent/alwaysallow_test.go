@@ -347,3 +347,18 @@ func TestSwitchAgent_ResetsAlwaysAllowTools(t *testing.T) {
 		t.Error("after SwitchAgent, handler.OnApprovalNeeded should have been invoked")
 	}
 }
+
+// TestSwitchAgent_ResetsResponseLanguage guards against a locked reply language
+// leaking from one agent to the next when an AgentLoop is reused. After
+// SwitchAgent the field must be "" until the caller re-injects via
+// SetResponseLanguage — matching the alwaysAllowTools pattern above.
+func TestSwitchAgent_ResetsResponseLanguage(t *testing.T) {
+	loop, _ := newApprovalProbeLoop(t, nil)
+	loop.SetResponseLanguage("日本語")
+
+	loop.SwitchAgent("new prompt", "/tmp/mem", nil, "", nil)
+
+	if loop.responseLanguage != "" {
+		t.Errorf("after SwitchAgent, responseLanguage should be reset to \"\"; got %q", loop.responseLanguage)
+	}
+}

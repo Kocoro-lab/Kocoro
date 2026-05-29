@@ -1454,11 +1454,12 @@ func (a *AgentLoop) SwitchAgent(basePrompt string, memoryDir string, reg *ToolRe
 	}
 	a.mcpContext = mcpCtx
 	a.agentSkills = agentSkills
-	// Defensive reset: agent-scoped approval bypasses must not survive an
-	// agent switch. The runner / TUI / CLI re-inject by reading the new
-	// agent's config; if a future caller forgets, we fail closed (prompt
-	// for every tool) rather than leaking the previous agent's bypass set.
+	// Defensive reset: agent-scoped fields must not survive an agent switch.
+	// The runner / TUI / CLI re-inject by reading the new agent's config;
+	// if a future caller forgets, we fail closed rather than leaking the
+	// previous agent's state.
 	a.alwaysAllowTools = nil
+	a.responseLanguage = "" // re-injected by SetResponseLanguage(global) + per-agent overlay
 }
 
 // SetSkills updates the agent's skill catalog without touching other fields.
