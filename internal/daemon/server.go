@@ -2440,7 +2440,11 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	if req.Config != nil {
 		req.Config.DisplayName = ""
 	}
-	// Enforce global display-name uniqueness (normalized).
+	// Enforce global display-name uniqueness (normalized). Best-effort: the
+	// check is not serialized against concurrent creates/renames (the route
+	// lock below is per-slug, not per-display-name). Accepted under the
+	// single-user local-daemon model; the failure mode is a duplicate label,
+	// never routing/Cloud corruption.
 	if req.DisplayName != "" {
 		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, req.DisplayName, "")
 		if err != nil {
@@ -2579,6 +2583,8 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		parsedConfig = &cfg
 	}
 	if req.DisplayName != nil {
+		// Best-effort uniqueness: not serialized against concurrent renames
+		// (see handleCreateAgent). Accepted for the single-user local daemon.
 		trimmed := strings.TrimSpace(*req.DisplayName)
 		req.DisplayName = &trimmed
 		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, *req.DisplayName, name)

@@ -1881,9 +1881,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// GatewayClient bounds the per-Run cost.
 	var imBindings string
 	if deps.GW != nil {
-		if bindings, err := deps.GW.ListChannelBindings(ctx); err == nil {
+		// Bound this best-effort Cloud probe: the gateway HTTP client allows up
+		// to 600s, and a cold-cache /channels call must not stall the agent turn
+		// before the model starts. On timeout we degrade silently, exactly like
+		// any other ListChannelBindings error (the cache still serves fast hits).
+		bindCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if bindings, err := deps.GW.ListChannelBindings(bindCtx); err == nil {
 			imBindings = formatIMBindings(bindings)
 		}
+		cancel()
 	}
 	if sticky := buildStickyContext(req.Source, req.Channel, req.Sender, agentName, imBindings, req.StickyContext); sticky != "" {
 		loop.SetStickyContext(sticky)
