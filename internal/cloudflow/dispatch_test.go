@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -411,5 +412,48 @@ func TestRun_ActivityEventFiltering(t *testing.T) {
 	}
 	if !sawCJKThinking {
 		t.Errorf("CJK AGENT_THINKING under the rune cap should be forwarded: %+v", h.cloudEvents)
+	}
+}
+
+// TestRun_AutoWorkflowType_SetsNoForceFlag pins that WorkflowType "auto" (the
+// /dag mapping) and "" send NEITHER force_research nor force_swarm in the task
+// request, letting the orchestrator decide the shape. This is the contract the
+// /dag slash command relies on.
+func TestRun_AutoWorkflowType_SetsNoForceFlag(t *testing.T) {
+	for _, wt := range []string{"auto", ""} {
+		t.Run("wt="+wt, func(t *testing.T) {
+			var body string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/api/v1/tasks/stream"):
+					b, _ := io.ReadAll(r.Body)
+					body = string(b)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					json.NewEncoder(w).Encode(map[string]any{"workflow_id": "wf-a", "task_id": "t-a"})
+				case strings.HasPrefix(r.URL.Path, "/api/v1/stream/sse"):
+					w.Header().Set("Content-Type", "text/event-stream")
+					fmt.Fprintf(w, "event: thread.message.completed\ndata: {\"response\":\"ok\"}\n\n")
+					fmt.Fprintf(w, "event: done\ndata: [DONE]\n\n")
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/api/v1/tasks/"):
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(map[string]any{"task_id": "t-a", "status": "TASK_STATUS_COMPLETED", "result": "ok"})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			gw := client.NewGatewayClient(srv.URL, "k")
+			if _, err := Run(context.Background(), Request{Gateway: gw, APIKey: "k", Query: "q", WorkflowType: wt}, &captureHandler{}); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if strings.Contains(body, "force_research") {
+				t.Errorf("WorkflowType %q sent force_research, want none (body=%s)", wt, body)
+			}
+			if strings.Contains(body, "force_swarm") {
+				t.Errorf("WorkflowType %q sent force_swarm, want none (body=%s)", wt, body)
+			}
+		})
 	}
 }

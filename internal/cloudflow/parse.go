@@ -2,9 +2,9 @@ package cloudflow
 
 import "strings"
 
-// SlashCommand is the parsed form of a `/research` or `/swarm` HTTP message.
+// SlashCommand is the parsed form of a `/research`, `/swarm`, or `/dag` HTTP message.
 type SlashCommand struct {
-	Type     string // "research" or "swarm"
+	Type     string // "research", "swarm", or "auto" (/dag maps to "auto")
 	Strategy string // research only — "quick" | "standard" | "deep" | "academic"
 	Query    string
 }
@@ -45,6 +45,12 @@ func ParseSlash(text string) *SlashCommand {
 		return &SlashCommand{Type: "research", Strategy: strategy, Query: query}
 	case "swarm":
 		return &SlashCommand{Type: "swarm", Query: args}
+	case "dag":
+		// /dag is the user-facing name for cloud auto-orchestration: it maps to
+		// WorkflowType "auto" so dispatch.go sets no force flag, letting the
+		// orchestrator decompose the task and route multi-step work to DAGWorkflow
+		// (parallel multi-agent fan-out). Used by Desktop's multi-agent chip.
+		return &SlashCommand{Type: "auto", Query: args}
 	default:
 		return nil
 	}

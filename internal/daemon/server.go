@@ -1568,7 +1568,7 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Slash-command routing: /research and /swarm dispatch directly to Shannon
+	// Slash-command routing: /research, /swarm and /dag dispatch directly to Shannon
 	// Cloud's Gateway, bypassing the local agent loop AND the in-flight injection
 	// path. A slash request always starts a fresh cloud workflow — never injects
 	// as mid-run user text into an active routed session.
@@ -1849,7 +1849,7 @@ type sseEventHandler struct {
 	autoApprove bool
 	deps        *ServerDeps
 	// agent identifies the per-agent config.yaml to write always-allow tools to.
-	// Empty for default-agent / non-routed paths (e.g. /research, /swarm) — in
+	// Empty for default-agent / non-routed paths (e.g. /research, /swarm, /dag) — in
 	// that case persistAgentAlwaysAllow falls back to session-only.
 	agent string
 	// source mirrors RunAgentRequest.Source ("kocoro" for local Desktop,

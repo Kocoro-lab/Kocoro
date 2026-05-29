@@ -8,7 +8,7 @@ var BuiltinCommands = map[string]bool{
 	"quit": true, "exit": true, "help": true, "clear": true,
 	"sessions": true, "session": true, "model": true, "config": true,
 	"setup": true, "update": true, "copy": true, "research": true,
-	"swarm": true, "search": true,
+	"swarm": true, "search": true, "dag": true,
 }
 
 // ValidateCommandName checks that a command/skill name is valid and doesn't
