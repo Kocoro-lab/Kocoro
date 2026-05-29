@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -400,5 +401,30 @@ func TestLoadAgent_ModelTierNilWhenAbsent(t *testing.T) {
 	}
 	if a.Config.Agent.ModelTier != nil {
 		t.Errorf("ModelTier expected nil when omitted, got %q", *a.Config.Agent.ModelTier)
+	}
+}
+
+func TestGenerateAgentSlug_FormatAndUniqueness(t *testing.T) {
+	dir := t.TempDir()
+	slug, err := GenerateAgentSlug(dir)
+	if err != nil {
+		t.Fatalf("GenerateAgentSlug: %v", err)
+	}
+	if !strings.HasPrefix(slug, "agent-") {
+		t.Errorf("slug = %q, want prefix agent-", slug)
+	}
+	if err := ValidateAgentName(slug); err != nil {
+		t.Errorf("generated slug %q fails ValidateAgentName: %v", slug, err)
+	}
+	// Existing dir with that slug must be skipped.
+	agentDir := filepath.Join(dir, slug)
+	os.MkdirAll(agentDir, 0700)
+	os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte("x"), 0600)
+	slug2, err := GenerateAgentSlug(dir)
+	if err != nil {
+		t.Fatalf("GenerateAgentSlug 2: %v", err)
+	}
+	if slug2 == slug {
+		t.Errorf("second slug collided with existing: %q", slug2)
 	}
 }

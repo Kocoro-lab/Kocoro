@@ -1,6 +1,8 @@
 package agents
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -152,6 +154,25 @@ func ValidateAgentName(name string) error {
 		return fmt.Errorf("invalid agent name %q: must match %s", name, agentNameRe.String())
 	}
 	return nil
+}
+
+// GenerateAgentSlug returns a fresh, unused agent slug of the form
+// "agent-<6 hex>". The slug is the immutable on-disk identity; users never
+// type it (they pick a display_name). Retries on the vanishingly small chance
+// of a directory collision. 10 attempts is far beyond any realistic agent
+// count; exhausting it signals a broken rand source, surfaced as an error.
+func GenerateAgentSlug(agentsDir string) (string, error) {
+	for i := 0; i < 10; i++ {
+		b := make([]byte, 3)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		slug := "agent-" + hex.EncodeToString(b)
+		if _, err := os.Stat(filepath.Join(agentsDir, slug, "AGENT.md")); os.IsNotExist(err) {
+			return slug, nil
+		}
+	}
+	return "", fmt.Errorf("could not generate a unique agent slug after 10 attempts")
 }
 
 func LoadAgent(agentsDir, name string) (*Agent, error) {
