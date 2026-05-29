@@ -62,7 +62,7 @@ func TestSkillExemptInventory(t *testing.T) {
 		{"schedule_list", &ScheduleTool{action: "list"}, false},
 		{"schedule_update", &ScheduleTool{action: "update"}, false},
 		{"schedule_remove", &ScheduleTool{action: "remove"}, false},
-		{"cloud_delegate", NewCloudDelegateTool(nil, "", time.Second, nil, "", ""), false},
+		{"cloud_delegate", NewCloudDelegateTool(nil, "", time.Second, 0, nil, "", ""), false},
 		{"server_tool", NewServerTool(client.ServerToolSchema{Name: "web_search"}, nil), false},
 		{"mcp_tool", NewMCPTool("playwright", mcpproto.Tool{Name: "browser_navigate"}, nil), false},
 		{"publish_to_web", &PublishToWebTool{}, false},

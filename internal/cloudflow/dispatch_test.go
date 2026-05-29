@@ -109,6 +109,7 @@ func newFakeGateway(t *testing.T) *httptest.Server {
 			fmt.Fprintf(w, "event: AGENT_STARTED\ndata: %s\n\n", `{"agent_id":"researcher","message":"Starting"}`)
 			fmt.Fprintf(w, "event: thread.message.completed\ndata: %s\n\n", `{"response":"Final answer."}`)
 			fmt.Fprintf(w, "event: WORKFLOW_COMPLETED\ndata: %s\n\n", `{"message":"done"}`)
+			fmt.Fprintf(w, "event: done\ndata: [DONE]\n\n")
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/api/v1/tasks/"):
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{"task_id": "t-1", "result": "Final answer."})
@@ -169,5 +170,46 @@ func TestRun_FakeGateway_InvokesWorkflowStartedCallback(t *testing.T) {
 	}
 	if *got != "wf-123" {
 		t.Fatalf("callback got workflow_id=%q, want %q", *got, "wf-123")
+	}
+}
+
+// TestRun_StreamDropsBeforeFinal_RecoversViaGetTask exercises the recovery
+// path: the SSE stream emits a status event then drops with NO final result
+// and NO `done`, but the cloud task actually completed — GetTask returns the
+// full result. Run must recover it instead of returning "no response".
+func TestRun_StreamDropsBeforeFinal_RecoversViaGetTask(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/api/v1/tasks/stream"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"workflow_id": "wf-9", "task_id": "t-9"})
+		case strings.HasPrefix(r.URL.Path, "/api/v1/stream/sse"):
+			// Stream ends cleanly (`done`) after a status event but with NO
+			// final result — exercises the recoverViaREST path that used to
+			// sit behind the finalResult != "" gate.
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "event: AGENT_STARTED\ndata: {\"agent_id\":\"a\"}\n\n")
+			fmt.Fprintf(w, "event: done\ndata: [DONE]\n\n")
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/api/v1/tasks/"):
+			// The cloud task actually completed — REST has the full result.
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"task_id": "t-9", "status": "TASK_STATUS_COMPLETED", "result": "Recovered answer."})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	gw := client.NewGatewayClient(srv.URL, "k")
+	res, err := Run(context.Background(), Request{Gateway: gw, APIKey: "k", Query: "q"}, &captureHandler{})
+	if err != nil {
+		t.Fatalf("expected GetTask recovery, got err: %v", err)
+	}
+	if res.FinalText != "Recovered answer." {
+		t.Fatalf("FinalText = %q, want \"Recovered answer.\"", res.FinalText)
+	}
+	if !res.FullResultConfirmed {
+		t.Fatalf("expected FullResultConfirmed=true after REST recovery")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -40,6 +41,14 @@ type Request struct {
 	// they override user_context, force_research, and force_swarm if they
 	// collide. Use this for caller-specific metadata (agent_name, etc.).
 	ExtraContext map[string]any
+
+	// IdleTimeout is the per-connection SSE liveness window passed to
+	// StreamSSEWithOptions. 0 disables the idle watchdog.
+	IdleTimeout time.Duration
+
+	// MaxReconnects bounds SSE reconnect attempts on unexpected disconnect.
+	// 0 lets Run apply its default budget.
+	MaxReconnects int
 }
 
 // Result holds the final assistant message and accumulated cloud usage.
@@ -156,7 +165,14 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 		defer cs.SetCloudStreaming(false)
 	}
 
-	err = client.StreamSSE(timeoutCtx, streamURL, req.APIKey, func(ev client.SSEEvent) {
+	reconnects := req.MaxReconnects
+	if reconnects == 0 {
+		reconnects = 5 // bounded resume budget; cloud ReplaySince is gap-free (seq>N)
+	}
+	err = client.StreamSSEWithOptions(timeoutCtx, streamURL, req.APIKey, client.StreamSSEOptions{
+		IdleTimeout:   req.IdleTimeout,
+		MaxReconnects: reconnects,
+	}, func(ev client.SSEEvent) {
 		var event struct {
 			Message  string                 `json:"message"`
 			AgentID  string                 `json:"agent_id"`
@@ -298,51 +314,113 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 		handler.OnUsage(cloudUsage)
 	}
 
-	// Handle timeout.
-	if err != nil && timeoutCtx.Err() == context.DeadlineExceeded {
-		if finalResult != "" {
-			return Result{
-				FinalText:  fmt.Sprintf("[cloudflow timed out, returning partial result]\n\n%s", finalResult),
-				WorkflowID: resp.WorkflowID,
-				TaskID:     resp.TaskID,
-			}, nil
-		}
-		return Result{}, fmt.Errorf("cloud task timed out with no result")
-	}
-
-	if err != nil {
-		return Result{}, fmt.Errorf("stream error: %w", err)
-	}
-
-	if workflowErr != nil {
-		return Result{}, workflowErr
-	}
-
-	if finalResult == "" {
-		return Result{}, fmt.Errorf("workflow completed but returned no response")
-	}
-
-	// API fallback: SSE events may be truncated (cloud caps at 10K runes).
-	// Always attempt to fetch the full result from the REST API.
-	// FullResultConfirmed defaults to false and is only flipped to true when
-	// the REST API verifies the result — a missing taskID, API error, or
-	// empty task.Result all leave the SSE-only payload unconfirmed.
+	// Always-available REST recovery. Cloud's /tasks/{id} returns the full,
+	// untruncated result even when the SSE stream dropped, timed out, or
+	// errored before delivering it — and reports a terminal status. This is the
+	// only path that can recover a fully-dropped stream, so it runs on EVERY
+	// non-clean termination, not just to upgrade a truncated success.
 	fullResultConfirmed := false
 	taskID := resp.TaskID
 	if taskID == "" {
 		taskID = resp.WorkflowID
 	}
-	if taskID != "" {
-		apiCtx, apiCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer apiCancel()
-		if task, apiErr := req.Gateway.GetTask(apiCtx, taskID); apiErr == nil && task.Result != "" {
-			if len(task.Result) > len(finalResult) {
-				// API returned a longer result — SSE was truncated
-				finalResult = task.Result
-			}
-			// API succeeded with non-empty result: this is the canonical full result.
-			fullResultConfirmed = true
+	// recoverViaREST polls /tasks/{id} until the task settles or a bounded
+	// deadline. A terminal COMPLETED/SUCCEEDED + non-empty result is recovered
+	// success; a terminal FAILED/CANCELLED/TIMEOUT records workflowErr so a
+	// failed task is never reported as success; a still-running task that
+	// doesn't settle within the budget leaves finalResult unchanged. Cloud
+	// status strings are protobuf-style ("TASK_STATUS_COMPLETED"); match
+	// case-insensitive substrings (also robust to a normalized "completed").
+	recoverViaREST := func(poll bool) {
+		if taskID == "" {
+			return
 		}
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			apiCtx, apiCancel := context.WithTimeout(ctx, 10*time.Second)
+			task, apiErr := req.Gateway.GetTask(apiCtx, taskID)
+			apiCancel()
+			if apiErr == nil {
+				st := strings.ToUpper(task.Status)
+				switch {
+				case strings.Contains(st, "FAIL") || strings.Contains(st, "CANCEL") || strings.Contains(st, "TIMEOUT"):
+					if workflowErr == nil {
+						workflowErr = fmt.Errorf("workflow ended in status %s", task.Status)
+					}
+					return
+				case strings.Contains(st, "COMPLETED") || strings.Contains(st, "SUCCEED"):
+					if task.Result != "" {
+						if len(task.Result) > len(finalResult) {
+							finalResult = task.Result
+						}
+						fullResultConfirmed = true
+					}
+					return // terminal — don't retry even if result is empty
+				case task.Result != "":
+					// No explicit terminal status but a result is present (older
+					// gateway / mock without a status field) — accept it.
+					if len(task.Result) > len(finalResult) {
+						finalResult = task.Result
+					}
+					fullResultConfirmed = true
+					return
+				}
+				// Non-terminal, no result yet → retry until deadline.
+			}
+			// poll=false (upgrade-only call) does a single GetTask attempt;
+			// poll=true keeps polling until terminal or the deadline.
+			if !poll || ctx.Err() != nil || !time.Now().Before(deadline) {
+				return
+			}
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+
+	if err != nil && timeoutCtx.Err() == context.DeadlineExceeded {
+		// The user's total deadline (cloud.timeout) elapsed — do a single REST
+		// check (the task may have just completed), but do NOT poll for 30s,
+		// which would blow past the very deadline that just fired.
+		recoverViaREST(false)
+		if finalResult != "" {
+			prefix := ""
+			if !fullResultConfirmed {
+				prefix = "[cloudflow timed out, returning partial result]\n\n"
+			}
+			return Result{FinalText: prefix + finalResult, Usage: cloudUsage, WorkflowID: resp.WorkflowID, TaskID: taskID, FullResultConfirmed: fullResultConfirmed}, nil
+		}
+		return Result{}, fmt.Errorf("cloud task timed out with no result")
+	}
+
+	if err != nil {
+		recoverViaREST(true)
+		if finalResult != "" {
+			return Result{FinalText: finalResult, Usage: cloudUsage, WorkflowID: resp.WorkflowID, TaskID: taskID, FullResultConfirmed: fullResultConfirmed}, nil
+		}
+		return Result{}, fmt.Errorf("stream error: %w", err)
+	}
+
+	if workflowErr != nil {
+		recoverViaREST(true)
+		if finalResult != "" {
+			return Result{FinalText: finalResult, Usage: cloudUsage, WorkflowID: resp.WorkflowID, TaskID: taskID, FullResultConfirmed: fullResultConfirmed}, nil
+		}
+		return Result{}, workflowErr
+	}
+
+	if finalResult == "" {
+		recoverViaREST(true)
+		if finalResult == "" {
+			if workflowErr != nil {
+				return Result{}, workflowErr
+			}
+			return Result{}, fmt.Errorf("workflow completed but returned no response")
+		}
+	} else {
+		recoverViaREST(false) // upgrade-only: single GetTask attempt, don't poll
 	}
 
 	return Result{

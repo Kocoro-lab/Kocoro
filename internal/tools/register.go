@@ -673,7 +673,8 @@ func RegisterCloudDelegate(reg *agent.ToolRegistry, gw *client.GatewayClient, cf
 	if timeout <= 0 {
 		timeout = 3600 * time.Second
 	}
-	reg.Register(NewCloudDelegateTool(gw, cfg.APIKey, timeout, handler, agentName, agentPrompt))
+	idleTimeout := time.Duration(cfg.Cloud.StreamIdleTimeoutSecs) * time.Second
+	reg.Register(NewCloudDelegateTool(gw, cfg.APIKey, timeout, idleTimeout, handler, agentName, agentPrompt))
 }
 
 // RegisterPublishTool registers the publish_to_web tool. It needs the gateway

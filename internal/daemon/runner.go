@@ -2758,6 +2758,10 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		Strategy:     cmd.Strategy,
 		SessionID:    sess.ID,
 		Timeout:      slashTimeout,
+		// Slash path (/research, /swarm) bypasses the cloud_delegate tool, so
+		// wire the SSE idle watchdog here too or it would run with no liveness
+		// probe. MaxReconnects is left 0 so cloudflow.Run applies its default.
+		IdleTimeout: time.Duration(cfg.Cloud.StreamIdleTimeoutSecs) * time.Second,
 	}
 	res, err := cloudflow.Run(slashCtx, cf, handler)
 	if err != nil {
