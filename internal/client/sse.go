@@ -92,7 +92,13 @@ func StreamSSEWithOptions(ctx context.Context, url, apiKey string, opts StreamSS
 			return err
 		}
 		attempt++
-		backoff := min(backoffBase<<uint(attempt-1), reconnectMaxBackoff)
+		// First reconnect is immediate: a transient drop usually resumes
+		// instantly via Last-Event-ID, so don't pay backoffBase before the
+		// cheap retry. Exponential backoff applies from the second attempt on.
+		var backoff time.Duration
+		if attempt > 1 {
+			backoff = min(backoffBase<<uint(attempt-2), reconnectMaxBackoff)
+		}
 		log.Printf("client: SSE reconnect %d/%d after %s (last_event_id=%q): %v",
 			attempt, opts.MaxReconnects, backoff, lastEventID, err)
 		select {

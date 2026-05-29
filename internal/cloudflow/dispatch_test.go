@@ -300,3 +300,116 @@ func TestRun_ForwardsAgentIDForActivityEvents(t *testing.T) {
 		t.Errorf("TOOL_OBSERVATION was not forwarded (still dropped?): %+v", h.cloudEvents)
 	}
 }
+
+// TestRun_TerminalFailureViaREST_NeverReportsSuccess pins the highest-stakes
+// recovery invariant: when the SSE stream ends with no result and the REST
+// /tasks/{id} fallback reports a terminal FAILED / CANCELLED / TIMEOUT status,
+// Run must return an error — never surface a (possibly stale) result as a
+// successful answer.
+func TestRun_TerminalFailureViaREST_NeverReportsSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status string
+	}{
+		{"failed", "TASK_STATUS_FAILED"},
+		{"cancelled", "TASK_STATUS_CANCELLED"},
+		{"timeout", "TASK_STATUS_TIMEOUT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/api/v1/tasks/stream"):
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					json.NewEncoder(w).Encode(map[string]any{"workflow_id": "wf-f", "task_id": "t-f"})
+				case strings.HasPrefix(r.URL.Path, "/api/v1/stream/sse"):
+					// Stream ends cleanly (done) with NO final result.
+					w.Header().Set("Content-Type", "text/event-stream")
+					fmt.Fprintf(w, "event: AGENT_STARTED\ndata: {\"agent_id\":\"a\"}\n\n")
+					fmt.Fprintf(w, "event: done\ndata: [DONE]\n\n")
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/api/v1/tasks/"):
+					// REST reports a terminal failure — but WITH a non-empty
+					// stale partial that must never be returned as success.
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(map[string]any{"task_id": "t-f", "status": tc.status, "result": "stale partial that must not be surfaced"})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			gw := client.NewGatewayClient(srv.URL, "k")
+			res, err := Run(context.Background(), Request{Gateway: gw, APIKey: "k", Query: "q"}, &captureHandler{})
+			if err == nil {
+				t.Fatalf("terminal %s: expected error, got nil (FinalText=%q)", tc.status, res.FinalText)
+			}
+			if strings.Contains(res.FinalText, "stale partial") {
+				t.Fatalf("terminal %s surfaced the stale result as success: %q", tc.status, res.FinalText)
+			}
+		})
+	}
+}
+
+// TestRun_ActivityEventFiltering pins what dispatch forwards vs drops among the
+// liveness events: a multi-byte (CJK) AGENT_THINKING under the 200-rune cap is
+// forwarded (the byte→rune guard fix — a byte cap would have dropped it); an
+// over-cap AGENT_THINKING is dropped; an empty TOOL_OBSERVATION is dropped; and
+// PROGRESS (a stage-label agent_id, not a worker nickname) is dropped entirely.
+func TestRun_ActivityEventFiltering(t *testing.T) {
+	overlong := "Thinking: " + strings.Repeat("あ", 250) // 260 runes > 200-rune cap
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/api/v1/tasks/stream"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{"workflow_id": "wf-3", "task_id": "t-3"})
+		case strings.HasPrefix(r.URL.Path, "/api/v1/stream/sse"):
+			w.Header().Set("Content-Type", "text/event-stream")
+			// CJK thinking ~54 runes / ~162 bytes — UNDER the 200-rune cap but
+			// OVER the old 100-BYTE cap, so it exercises the byte→rune fix: the
+			// old guard would have dropped it, the new one forwards it.
+			fmt.Fprintf(w, "event: AGENT_THINKING\ndata: {\"agent_id\":\"Osaki\",\"message\":\"考え中：%s\"}\n\n", strings.Repeat("あ", 50))
+			// Over-cap thinking → dropped.
+			fmt.Fprintf(w, "event: AGENT_THINKING\ndata: {\"agent_id\":\"Osaki\",\"message\":\"%s\"}\n\n", overlong)
+			// Empty observation → dropped.
+			fmt.Fprintf(w, "event: TOOL_OBSERVATION\ndata: {\"agent_id\":\"Osaki\",\"message\":\"\"}\n\n")
+			// PROGRESS with a stage-label agent_id → dropped, no row.
+			fmt.Fprintf(w, "event: PROGRESS\ndata: {\"agent_id\":\"citation_agent\",\"message\":\"Skipping source attribution\"}\n\n")
+			fmt.Fprintf(w, "event: WORKFLOW_COMPLETED\ndata: {\"message\":\"done\"}\n\n")
+			fmt.Fprintf(w, "event: done\ndata: [DONE]\n\n")
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/api/v1/tasks/"):
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"task_id": "t-3", "status": "TASK_STATUS_COMPLETED", "result": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	gw := client.NewGatewayClient(srv.URL, "k")
+	h := &captureHandler{}
+	if _, err := Run(context.Background(), Request{Gateway: gw, APIKey: "k", Query: "q"}, h); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var sawCJKThinking bool
+	for _, ev := range h.cloudEvents {
+		if ev.status == "thinking" && strings.HasPrefix(ev.msg, "考え中") {
+			sawCJKThinking = true
+			if ev.agentID != "Osaki" {
+				t.Errorf("CJK thinking: agentID = %q, want \"Osaki\"", ev.agentID)
+			}
+		}
+		if strings.Contains(ev.msg, strings.Repeat("あ", 100)) {
+			t.Errorf("over-cap AGENT_THINKING should have been dropped, got: %.20q…", ev.msg)
+		}
+		if ev.status == "tool" && ev.msg == "" {
+			t.Errorf("empty TOOL_OBSERVATION should have been dropped, got: %+v", ev)
+		}
+		if ev.agentID == "citation_agent" {
+			t.Errorf("PROGRESS (stage label) should have been dropped, not forwarded: %+v", ev)
+		}
+	}
+	if !sawCJKThinking {
+		t.Errorf("CJK AGENT_THINKING under the rune cap should be forwarded: %+v", h.cloudEvents)
+	}
+}

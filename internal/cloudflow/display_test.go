@@ -17,6 +17,12 @@ func TestCloudStatusLine(t *testing.T) {
 		{"orchestrator id is not prefixed", "orchestrator", "started", "planning", "planning"},
 		{"streaming id is not prefixed", "streaming", "tool", "searching", "searching"},
 		{"unknown status default fallback", "", "weird", "", "Working..."},
+		{"processing status fallback", "", "processing", "", "Processing data..."},
+		// DATA_PROCESSING rides the synthetic agent_id "preparing", which is NOT
+		// in the deny-list, so it IS bracketed like a worker nickname. Pins
+		// current behavior (whether to filter it out is a UX decision — see the
+		// DATA_PROCESSING case in dispatch.go).
+		{"preparing synthetic id is bracketed", "preparing", "processing", "Gathering context", "[preparing] Gathering context"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

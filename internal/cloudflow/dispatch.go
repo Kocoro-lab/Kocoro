@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -167,6 +168,11 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 
 	reconnects := req.MaxReconnects
 	if reconnects == 0 {
+		// 0 here means "apply the default budget", NOT "disable" — there is
+		// intentionally no caller-facing way to turn reconnect off from
+		// Request (both call sites leave this 0). Note the client layer's
+		// StreamSSEOptions.MaxReconnects DOES treat 0 as off, so the two
+		// layers differ; don't assume 0 propagates as "off".
 		reconnects = 5 // bounded resume budget; cloud ReplaySince is gap-free (seq>N)
 	}
 	err = client.StreamSSEWithOptions(timeoutCtx, streamURL, req.APIKey, client.StreamSSEOptions{
@@ -246,7 +252,12 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 				handler.OnCloudAgent(event.AgentID, "completed", event.Message)
 			}
 		case "AGENT_THINKING":
-			if len(event.Message) <= 100 && handler != nil {
+			// Cap on rune count, not bytes: cloud builds this as
+			// "Thinking: " + truncateQuery(query, 200 runes), so a byte cap
+			// would drop multi-byte (CJK) thinking lines well before cloud's
+			// own limit — and JP/zh is the primary market. 200 runes matches
+			// cloud's cap, so anything cloud forwards gets through.
+			if utf8.RuneCountInString(event.Message) <= 200 && handler != nil {
 				handler.OnCloudAgent(event.AgentID, "thinking", event.Message)
 			}
 		case "TOOL_INVOKED", "TOOL_STARTED":
@@ -254,13 +265,13 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 				handler.OnCloudAgent(event.AgentID, "tool", event.Message)
 			}
 		case "TOOL_OBSERVATION":
-			// Tool result coming back (e.g. "Search: <summary>"). Cloud already
-			// caps the message at ~80 chars (MsgToolCompleted → extractSummary),
-			// so no extra length guard is needed here. Forwarded as a "tool"
-			// status carrying the originating agent_id so it updates the SAME
-			// sub-agent row that TOOL_INVOKED started — the liveness signal that
-			// the row is progressing rather than stuck. Previously dropped as
-			// "too verbose".
+			// Tool result coming back (e.g. "Search: <summary>"). Cloud bounds
+			// it as MsgToolCompleted = "<ToolName>: " + extractSummary(…, 80) —
+			// ~80 chars plus a short tool-name prefix — small enough that no
+			// extra length guard is needed here. Forwarded as a "tool" status
+			// carrying the originating agent_id so it updates the SAME sub-agent
+			// row that TOOL_INVOKED started — the liveness signal that the row is
+			// progressing rather than stuck. Previously dropped as "too verbose".
 			if handler != nil && event.Message != "" {
 				handler.OnCloudAgent(event.AgentID, "tool", event.Message)
 			}
@@ -282,7 +293,9 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 			// research-refiner, domain_analysis), not a worker station nickname —
 			// routing it to a sub-agent row would spawn confusing non-worker
 			// pills. Worker liveness already comes from AGENT_THINKING /
-			// TOOL_INVOKED / TOOL_OBSERVATION above.
+			// TOOL_INVOKED / TOOL_OBSERVATION above. NOTE: swarm PROGRESS *does*
+			// carry a real nickname (MsgAgentProgress(input.AgentID,…)) — revisit
+			// this drop if force_swarm is ever enabled.
 		case "APPROVAL_DECISION":
 			// no-op
 
@@ -308,8 +321,11 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 				}
 			}
 		case "HITL_RESPONSE":
+			// Passthrough the raw cloud message + agent_id rather than baking an
+			// English literal on the wire (Phase B principle); the consumer
+			// formats/localizes. Swarm/HITL-only path.
 			if event.Message != "" && handler != nil {
-				handler.OnCloudAgent("", "thinking", "Lead responding to your input")
+				handler.OnCloudAgent(event.AgentID, "thinking", event.Message)
 			}
 
 		case "WORKFLOW_COMPLETED":

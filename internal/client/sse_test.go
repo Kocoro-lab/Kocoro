@@ -161,3 +161,39 @@ func TestStreamSSEWithOptions_IdleTimeoutThenReconnect(t *testing.T) {
 		t.Fatalf("expected reconnect after idle timeout, conns=%d", conns)
 	}
 }
+
+// TestStreamSSEWithOptions_ReconnectBudgetExhausted verifies the reconnect loop
+// is bounded: when EVERY connection goes idle (never delivers `done`), the loop
+// gives up after exactly MaxReconnects+1 connection attempts and returns the
+// error — it must not spin past the budget.
+func TestStreamSSEWithOptions_ReconnectBudgetExhausted(t *testing.T) {
+	var conns int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&conns, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		// Flush headers so the read loop + idle watchdog start, then go silent
+		// on every connection so the watchdog fires and the client reconnects —
+		// until the budget is exhausted.
+		w.WriteHeader(http.StatusOK)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	const maxReconnects = 2
+	err := StreamSSEWithOptions(context.Background(), srv.URL, "", StreamSSEOptions{
+		IdleTimeout:          30 * time.Millisecond,
+		MaxReconnects:        maxReconnects,
+		ReconnectBackoffBase: time.Millisecond,
+	}, func(ev SSEEvent) {})
+	if err == nil {
+		t.Fatal("expected error after exhausting the reconnect budget, got nil")
+	}
+	// 1 initial attempt + maxReconnects retries = maxReconnects+1 connections.
+	if got := atomic.LoadInt32(&conns); got != maxReconnects+1 {
+		t.Fatalf("connections = %d, want %d (1 initial + %d reconnects, no spin past budget)", got, maxReconnects+1, maxReconnects)
+	}
+}

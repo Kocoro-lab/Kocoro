@@ -14,6 +14,12 @@ func CloudStatusLine(agentID, status, message string) string {
 	if msg == "" {
 		msg = cloudStatusFallback(status)
 	}
+	// Deny-list, not allow-list: cloud's other non-nickname structured IDs
+	// (final_output, synthesis, title_generator, swarm-lead) don't reach a
+	// started/completed/thinking/tool OnCloudAgent call on the research/DAG
+	// path, so only orchestrator/streaming (ControlSignalHandler IDs that ride
+	// the dropped PROGRESS/DELEGATION events) need excluding here. Revisit if
+	// cloud ever emits AGENT_* with one of those IDs.
 	if agentID != "" && agentID != "orchestrator" && agentID != "streaming" {
 		return "[" + agentID + "] " + msg
 	}
