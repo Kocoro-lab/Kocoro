@@ -1046,11 +1046,11 @@ func (h *daemonEventHandler) OnToolResult(name string, args string, toolUseID st
 	}
 }
 func (h *daemonEventHandler) OnText(text string) {
-	if h.wsClient != nil && h.messageID != "" {
-		if err := h.wsClient.SendEvent(h.messageID, "LLM_OUTPUT", text, nil); err != nil {
-			log.Printf("daemon: event forward failed: %v", err)
-		}
-	}
+	// Timeline design: the final answer travels via SendReply → WORKFLOW_COMPLETED
+	// only. Emitting it here as LLM_OUTPUT would double-print as a spurious trailing
+	// timeline segment on an im_timeline_v1 Cloud. Mid-turn narration still flows
+	// through OnPreamble (which keeps sending LLM_OUTPUT).
+	_ = text
 }
 
 // OnPreamble forwards mid-turn narration to Cloud over the same LLM_OUTPUT WS

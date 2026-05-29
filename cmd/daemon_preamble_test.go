@@ -103,6 +103,54 @@ func TestDaemonEventHandler_OnPreamble_DropsEmptyText(t *testing.T) {
 	}
 }
 
+// TestDaemonEventHandler_OnText_DoesNotEmitLLMOutput pins the timeline design:
+// OnText must NOT forward the final answer as an LLM_OUTPUT WS event (it travels
+// via SendReply → WORKFLOW_COMPLETED), while OnPreamble still forwards mid-turn
+// narration as LLM_OUTPUT. On an im_timeline_v1 Cloud an OnText emission would
+// render as a spurious trailing timeline segment duplicating the final.
+func TestDaemonEventHandler_OnText_DoesNotEmitLLMOutput(t *testing.T) {
+	received := make(chan daemon.DaemonMessage, 2)
+	srv := httptestNewWebSocketServer(t, received)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	client := daemon.NewClient(wsURL, "", nil, nil)
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	handler := &daemonEventHandler{wsClient: client, messageID: "msg-123"}
+
+	handler.OnText("This is the final answer.")
+
+	select {
+	case dm := <-received:
+		t.Fatalf("OnText must not forward any WS event, got message type=%q payload=%s", dm.Type, string(dm.Payload))
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// OnPreamble on the same handler must still forward LLM_OUTPUT — proves the
+	// transport is live and the silence above is OnText-specific, not a dead client.
+	handler.OnPreamble("Looking into it.")
+
+	select {
+	case dm := <-received:
+		if dm.Type != daemon.MsgTypeEvent || dm.MessageID != "msg-123" {
+			t.Fatalf("unexpected daemon message: %+v", dm)
+		}
+		var payload daemon.DaemonEventPayload
+		if err := json.Unmarshal(dm.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		if payload.EventType != "LLM_OUTPUT" || payload.Message != "Looking into it." {
+			t.Fatalf("unexpected preamble payload: %+v", payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not receive preamble LLM_OUTPUT after OnText")
+	}
+}
+
 func TestActiveCloudMessageTracker_ClearDoesNotDeleteReplacement(t *testing.T) {
 	tracker := newActiveCloudMessageTracker()
 
