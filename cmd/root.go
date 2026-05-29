@@ -239,6 +239,9 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	if runCfg.Agent.ReasoningEffort != "" {
 		loop.SetReasoningEffort(runCfg.Agent.ReasoningEffort)
 	}
+	// Response language: unconditional global baseline ("" = mirror); the
+	// per-agent overlay below may override (including "" to force mirror).
+	loop.SetResponseLanguage(runCfg.Agent.Language)
 	// Per-agent model config overrides
 	if agentOverride != nil && agentOverride.Config != nil && agentOverride.Config.Agent != nil {
 		ac := agentOverride.Config.Agent
@@ -246,6 +249,10 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		// pin still beats a `model_tier:` family hint when both are set.
 		if ac.ModelTier != nil && *ac.ModelTier != "" {
 			loop.SetModelTier(*ac.ModelTier)
+		}
+		// != nil (not != ""): explicit "" forces mirror over a locked global.
+		if ac.Language != nil {
+			loop.SetResponseLanguage(*ac.Language)
 		}
 		if ac.Model != nil {
 			loop.SetSpecificModel(*ac.Model)

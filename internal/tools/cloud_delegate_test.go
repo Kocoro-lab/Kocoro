@@ -33,11 +33,10 @@ func TestCloudDelegateTerminalDefault(t *testing.T) {
 		wantCloud bool // expected CloudResult (ignoring fullResultConfirmed)
 	}{
 		{"research defaults terminal", `{"task":"t","workflow_type":"research"}`, true},
-		{"swarm defaults non-terminal", `{"task":"t","workflow_type":"swarm"}`, false},
 		{"auto defaults non-terminal", `{"task":"t","workflow_type":"auto"}`, false},
 		{"omitted defaults non-terminal", `{"task":"t"}`, false},
 		{"explicit false overrides research", `{"task":"t","workflow_type":"research","terminal":false}`, false},
-		{"explicit true overrides swarm", `{"task":"t","workflow_type":"swarm","terminal":true}`, true},
+		{"explicit true overrides auto", `{"task":"t","workflow_type":"auto","terminal":true}`, true},
 	}
 
 	for _, tt := range tests {

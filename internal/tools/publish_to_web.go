@@ -147,8 +147,12 @@ func (t *PublishToWebTool) Info() agent.ToolInfo {
 			"— and even after a successful retract, CDN edge caches may serve the\n" +
 			"content for up to 5 more minutes. Treat the URL as a leak vector\n" +
 			"regardless: never publish secrets, credentials, or private data.\n\n" +
-			"USE ONLY when the user explicitly asked to share / publish / send the file\n" +
-			"to an external recipient (Slack/LINE/Feishu reply, web link, email, etc.).\n\n" +
+			"USE ONLY when the user EXPLICITLY asked to publish / share a link / send the\n" +
+			"file out. Generated files and pages stay LOCAL by default — deliver them by\n" +
+			"writing to disk and previewing locally (e.g. browser_navigate file://). If a\n" +
+			"public link would help but the user did not ask for one, OFFER it and let them\n" +
+			"decide — do NOT publish on your own initiative (not 'to preview', not 'just in\n" +
+			"case', not because a page 'looks like it should be online').\n\n" +
 			"DO NOT USE for:\n" +
 			"  - Backup, sync, or 'just in case' uploads\n" +
 			"  - Source code, config files, .env, credentials, private keys, logs\n" +
@@ -176,7 +180,7 @@ func (t *PublishToWebTool) Info() agent.ToolInfo {
 					"type":        "string",
 					"minLength":   publishMinPurposeLen,
 					"maxLength":   500,
-					"description": "One sentence: why does this file need to be PUBLIC? Shown to the user during approval. Be specific. Vague answers ('share', 'send it', 'test') will be rejected.",
+					"description": "State specifically what the user asked you to publish/share and where it goes — the recipient, the channel, or that they explicitly asked for a public link — grounded in the user's actual request. Shown to the user during approval. If the user did not actually ask to publish, do NOT call this tool. Generic answers lacking specifics ('share', 'send it', 'share with team', 'test') will be rejected — name who/where.",
 				},
 				"description": agent.DescriptionFieldSpec,
 				"filename": map[string]any{

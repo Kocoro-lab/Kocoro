@@ -121,7 +121,7 @@ func TestAppendDynamicUserBlocks_LanguageAfterSkillListing(t *testing.T) {
 		"中:列出/查看/查询/创建/修改 agent/skill/MCP/计划. " +
 		"日:一覧/表示/確認/検索/作成 agent/skill/MCP/スケジュール.\n" +
 		"</system-reminder>"
-	langDirective := prompt.LanguageDirective()
+	langDirective := prompt.LanguageDirective("")
 
 	out := appendDynamicUserBlocks("user-query", skillListing, langDirective)
 

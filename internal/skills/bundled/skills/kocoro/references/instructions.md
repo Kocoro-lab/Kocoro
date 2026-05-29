@@ -4,7 +4,7 @@
 
 Instructions and rules shape how agents behave — their tone, language, formatting preferences, and what they should or shouldn't do. There are five levels that combine together: global instructions, global rules, project instructions, project rules, and local instructions. Lower levels can add to or override higher ones, letting you have general behavior globally and specific behavior per project.
 
-**Instructions** are free-form guidance (like a style guide or persona description). **Rules** are named, discrete policies that can be individually managed (like "always respond in Japanese" or "never suggest deleting files").
+**Instructions** are free-form guidance (like a style guide or persona description). **Rules** are named, discrete policies that can be individually managed (like "never push to main without asking" or "never suggest deleting files"). To lock the reply language specifically, prefer the dedicated `agent.language` config over a rule — see config.md and the "Make agents respond in Japanese" scenario below for why.
 
 ## API Endpoints
 
@@ -25,7 +25,7 @@ Instructions and rules shape how agents behave — their tone, language, formatt
 ### List all rules
 - Method: GET
 - Path: /rules
-- Response: `{"rules": [{"name": "respond-in-japanese", "content": "Always respond in Japanese regardless of input language."}]}`
+- Response: `{"rules": [{"name": "no-force-push", "content": "Never force-push to main without explicit confirmation."}]}`
 
 ### Get a rule
 - Method: GET
@@ -48,8 +48,16 @@ Instructions and rules shape how agents behave — their tone, language, formatt
 ## Common Scenarios
 
 ### "Make agents respond in Japanese"
-1. PUT /rules/respond-in-japanese with `{"content": "Always respond in Japanese, regardless of the language the user writes in."}`
-2. All agents immediately use this rule in new conversations.
+Use the dedicated `agent.language` config, NOT a rule. A rule lands in the
+instructions block (a system-prompt prefix) and is overridden by the per-turn
+language directive at the end of the user message, so a "respond in Japanese"
+rule does not reliably hold. `agent.language` is the authoritative reply-language
+lock (it drives that per-turn directive).
+- One agent: GET /agents/{name}, merge `"agent": {"language": "日本語"}` into the
+  returned config, then PUT /agents/{name}/config with the full merged body (PUT
+  replaces the whole config — see agents.md).
+- All agents (global default): PATCH /config with `{"agent": {"language": "日本語"}}`,
+  then POST /config/reload.
 
 ### "Add a code style rule"
 1. PUT /rules/code-style with `{"content": "When writing code examples: use 2-space indentation, include type annotations in TypeScript, add brief comments for non-obvious logic."}`

@@ -152,7 +152,7 @@ Instructions:
 				"description": map[string]any{
 					"type": "string",
 					"description": "REQUIRED. A short (5-15 word) natural-language summary of WHAT this command does, written for a non-technical end user. " +
-						"Use the user's UI language (中文 if the user wrote in Chinese, English if they wrote in English, etc.). " +
+						"Write it in the same language as your reply (per the Language directive). " +
 						"Describe the user-facing INTENT, not the shell syntax. The user will see this — not the command — when approving the call. " +
 						"Examples: '查找最大的 10 个文件', 'Commit current changes', '检查 git 状态', 'Install npm dependencies'. " +
 						"Do NOT just rephrase the command (e.g. avoid 'Run find with du and sort'); describe the goal in plain language.",
