@@ -2,7 +2,17 @@
 
 **An AI cowork agent that lives on your Mac.**
 
+<p align="center">
+  <a href="https://kocoro.ai/en/start/">
+    <img src="assets/kocoro-demo.gif" alt="Kocoro demo — AI agents working hands-on across your Mac" width="720">
+  </a>
+  <br>
+  <sub><a href="https://kocoro.ai/en/start/">▶ Watch the full demo (with audio) →</a></sub>
+</p>
+
 Kocoro runs AI agents locally with full computer access — files, apps, browser, terminal, screen — and connects to your team's Slack / LINE / Feishu / Telegram channels via Shannon Cloud. Named agents with their own memory and tools, MCP-native, daemon-driven. The `shan` CLI is the runtime; **Kocoro Desktop** is the recommended way to use it.
+
+> **What's open source here** — This repo is the Kocoro **engine + daemon**: the `shan` runtime that does the actual work (agent loop, local tools, permission engine, channel messaging, MCP, scheduling). It's fully usable on its own via the CLI, TUI, daemon HTTP API, and MCP. **Kocoro Desktop** — the native GUI app shown above — is a separate, closed-source product that runs *on top of* this daemon.
 
 ### Get Kocoro
 
