@@ -2,6 +2,41 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.1.20 — 2026-05-30 — Cloud workflow stream resilience + `/dag` + agent display names
+
+Two additive feature threads. First, the `cloud_delegate` / cloud-workflow path (`/research`, `/dag`) is hardened so long-running cloud runs survive a dropped SSE stream and surface live per-worker activity instead of looking frozen. Second, non-default agents gain a human-readable `display_name` (any language) decoupled from their on-disk slug, plus rename support. No wire-protocol break — the SSE change is daemon-internal presentation, the agent API additions are all `omitempty` with slug fallback, and legacy configs round-trip cleanly.
+
+> **Cross-repo contract:** the cloud_delegate path now forwards `agent_id` / `status` / `message` as separate presentation-free fields rather than baking an `[agentID]` prefix + English fallback into the wire message. Terminal consumers (TUI, one-shot CLI) re-apply formatting locally via `CloudStatusLine`; structured consumers (Desktop) format on their own side. The matching Desktop consumer that renders live sub-agent rows / `/dag` cards shipped alongside this release.
+
+### Added
+
+- **Resilient cloud SSE streaming** (PR #203, `internal/client/sse.go`) — `StreamSSE` is now a thin wrapper over a new `StreamSSEWithOptions`. Adds a per-connection idle watchdog (scanner runs in a goroutine, the read loop multiplexes lines against an idle timer to catch silently-stalled connections), `Last-Event-ID` resume on reconnect (cloud's `ReplaySince` is `seq>N`, so no event is re-delivered), a bounded reconnect budget with immediate-first-retry then exponential backoff capped at 30s, and end-of-stream detection that does **not** reconnect on an orderly EOF (reserved for genuine connection failures).
+- **`cloud.stream_idle_timeout_secs` config** (PR #203, `internal/config/config.go`) — per-connection SSE liveness window for cloud-delegate (default 45s; cloud pings every 10s). NOT a workflow time limit (`cloud.timeout` still bounds total duration); 0 disables. Global-only, validated `>= 0`.
+- **`/dag` slash command** (PR #203, `internal/cloudflow/parse.go`) — maps to WorkflowType `auto` (no force flag), the user-facing name for cloud auto-orchestration: the orchestrator decomposes the task into a parallel multi-agent DAG. Reserved in `BuiltinCommands` so a user agent/skill can't shadow it.
+- **Live per-worker activity on cloud sub-agent rows** (PR #203, `internal/cloudflow/dispatch.go`) — `AGENT_THINKING` / `TOOL_INVOKED` / `TOOL_OBSERVATION` now forward the originating worker's `agent_id` (previously blanked or dropped), so a cloud sub-agent row shows its worker's live activity instead of a static "Working…". `AGENT_THINKING` is capped on **rune** count (200, matching cloud's own cap) not bytes, so CJK thinking lines aren't dropped early.
+- **Agent display names + rename** (`internal/agents/{loader,api,validate}.go`, `internal/daemon/server.go`) — non-default agents gain an optional human-readable `display_name` (any language, e.g. Japanese / Chinese) stored in `config.yaml`, decoupled from the immutable on-disk slug. `name` (slug) is now optional on `POST /agents`; when omitted the server auto-generates an immutable `agent-<6 hex>` slug via `GenerateAgentSlug` (at least one of `name` / `display_name` required). Rename via `PUT /agents/{name}` with `display_name` touches only `config.yaml` — slug, directory, sessions, schedules, and Cloud bindings are left untouched. `display_name` is globally unique (case-folded, whitespace-trimmed); a conflict returns `409`. `display_name` falls back to the slug everywhere it's read.
+
+### Changed
+
+- **Structured cloud-event passthrough** (PR #203, `internal/cloudflow/{dispatch,display}.go`) — the daemon no longer bakes an `[agentID]` prefix or English fallback into the cloud-event wire message; it forwards raw `agent_id` / `status` / `message` as separate fields. New `CloudStatusLine` re-applies the prefix + per-status fallback for terminal consumers (TUI, one-shot CLI); structured consumers format on their own side with their own localized fallbacks.
+
+### Fixed
+
+- **Cloud workflow REST recovery never reports a failed task as success** (PR #203, `internal/cloudflow/dispatch.go`) — the `/tasks/{id}` REST fallback now runs on *every* non-clean SSE termination (not just to upgrade a truncated success), since it's the only path that can recover a fully-dropped stream's result. A terminal FAILED/CANCELLED/TIMEOUT status records the workflow error and wins over any partial SSE chunk; a partial chunk is only surfaced when REST authoritatively confirms COMPLETED. Status matching is case-insensitive substring (robust to protobuf-style `TASK_STATUS_COMPLETED`).
+- **`display_name` only honored via the dedicated top-level field** (`internal/agents/api.go`, `internal/daemon/server.go`) — a `display_name` nested inside the `config` object is silently ignored on create/update; it would otherwise bypass the uniqueness check. `SetAgentDisplayName` does a map-based read-modify-write under the config lock so fields not modeled by `AgentConfigAPI` (e.g. `auto_approve`, `mcp_servers`) survive a rename. `display_name` length + charset are bounded via `ValidateDisplayName`.
+
+### Docs
+
+- `references/agents.md` (bundled `kocoro` skill): document the optional `display_name` field, optional `name` / auto-slug generation, the global uniqueness constraint + `409`, rename semantics on `PUT /agents/{name}`, and the "nested config display_name is ignored" rule.
+- `references/config.md` (bundled `kocoro` skill): document `cloud.stream_idle_timeout_secs`.
+
+### Tests
+
+- `internal/client/sse_test.go` — reconnect budget exhaustion, idle-timeout reconnect, Last-Event-ID resume, orderly-EOF-no-reconnect.
+- `internal/cloudflow/{dispatch,display,parse}_test.go` — `agent_id` forwarding, `TOOL_OBSERVATION` un-drop, CJK/over-cap thinking filtering, terminal FAILED/CANCELLED never-as-success, `/dag`→`auto`, and `auto`/`""` sending no force flag.
+- `internal/config/config_test.go` — `cloud.stream_idle_timeout_secs` default + `>= 0` validation.
+- `internal/agents/{api,loader}_test.go` + `internal/daemon/server_test.go` — display-name create/rename/uniqueness over HTTP, slug auto-generation, config-field preservation on rename, nested-config `display_name` ignored.
+
 ## v0.1.19 — 2026-05-29 — Schedule proactive push to IM channels + broadcast gate
 
 Scheduled-task output can now be proactively pushed back to the IM channel that created the schedule (Slack / LINE / Feishu / Lark / WeCom / Telegram / webhook), instead of staying invisible until the user next opens an interactive session. Delivery is governed by a per-schedule **broadcast gate** with safe smart defaults — IM-originated schedules broadcast, locally-created ones (HTTP API / one-shot CLI / TUI) stay silent unless explicitly opted in, and pre-feature schedules (empty `created_from_source`) default to silent. No wire-protocol break — all new schedule fields are `omitempty`, legacy `schedules.json` round-trips cleanly, and the proactive push rides the existing Cloud WS channel.
