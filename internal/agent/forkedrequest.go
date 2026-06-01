@@ -62,10 +62,9 @@ type ForkOptions struct {
 // SpecificModel / ReasoningEffort / Temperature / MaxTokens / Thinking /
 // CacheSource / Stream / ToolChoice / SessionID will break cache.
 //
-// The mistake CC's `runForkedAgent` documented hitting (forkedAgent.ts:96-103
-// in their leaked rollback-version source) is exactly this pattern: a fork
-// passes a smaller maxOutputTokens to bound suggestion output, which on their
-// architecture clamps thinking.budget_tokens, which is in the cache key, which
+// A known failure pattern is exactly this: a fork passes a smaller
+// maxOutputTokens to bound suggestion output, which can clamp
+// thinking.budget_tokens, which is in the cache key, which
 // invalidates the cache. We don't have that specific clamping (cloud handles
 // it), but the principle is identical: do NOT touch these fields after
 // BuildForkedRequest returns. Tests in this package include a regression

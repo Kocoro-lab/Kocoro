@@ -18,9 +18,7 @@ const (
 	// aggregateCapThreshold is the per-turn cap on the SUM of all tool result
 	// content lengths. Even when no single result triggers spillThreshold,
 	// 10 parallel tools returning 30K each puts 300K into one user message —
-	// uncapped cache_creation pressure. Mirrors CC's
-	// MAX_TOOL_RESULTS_PER_MESSAGE_CHARS at
-	// claude-code-source/src/constants/toolLimits.ts:49.
+	// uncapped cache_creation pressure.
 	aggregateCapThreshold = 200_000
 	// minAggregateSpillSize: don't spill anything smaller than this when
 	// reducing the aggregate — at small sizes the spill preview header

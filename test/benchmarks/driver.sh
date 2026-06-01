@@ -68,8 +68,8 @@ run_task 2 "batch edit context.Background in memory/" \
 run_task 3 "audit log failure analysis" \
   "分析 ~/.shannon/logs/audit.log 最近 500 条记录，给出失败率最高的 3 个工具（output_summary 包含 error 或 failed 视为失败），每个工具给出 1 条代表性失败记录的 input 和 output 摘要"
 
-run_task 4 "compare context compaction" \
-  "对比 ShanClaw 当前 repo 和 ~/Desktop/projects/study/claude-code-source 两个代码库的 context 压缩策略差异（包括压缩触发点、压缩方式、内存持久化），写到 /tmp/compare.md"
+run_task 4 "analyze context compaction" \
+  "分析 ShanClaw 当前 repo 的 context 压缩策略（包括压缩触发点、压缩方式、内存持久化），写到 /tmp/compare.md"
 
 # Task 5: modifying — use worktree
 WT5=/tmp/maxiter_tests/wt_task5

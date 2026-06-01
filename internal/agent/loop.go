@@ -1081,7 +1081,7 @@ func (a *AgentLoop) operationalRules() string {
 // When resp.ContentBlocks is non-empty (Cloud ≥ 2026-05), it is the source
 // of truth: the verbatim ordered list of blocks Anthropic returned. This
 // preserves thinking content + signatures + their interleaved positions,
-// satisfying CC rule 3 (thinking blocks survive the assistant trajectory).
+// satisfying the thinking-block preservation rule (blocks survive the assistant trajectory).
 //
 // When resp.ContentBlocks is empty (legacy Cloud or non-Anthropic provider
 // that never populates it), fall back to assembling text+tool_use blocks
@@ -2410,7 +2410,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// "the system intercepted the calls before they ran" when in fact
 		// the calls ran and only the next round-trip was blocked
 		// (observed: parallel-sleep test, 2026-05-14 — see plan
-		// 2026-05-14-thinking-blocks-cc-alignment.md post-mortem).
+		// 2026-05-14-thinking-blocks-alignment.md post-mortem).
 		messages = append(messages, client.Message{
 			Role: "user",
 			Content: client.NewTextContent(
@@ -3562,7 +3562,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if afterCheckpoint {
 				afterCheckpoint = false
 				// Preserve thinking content from the post-checkpoint
-				// continuation response (CC rule 3).
+				// continuation response (thinking-block preservation rule).
 				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
 				continue
@@ -3730,7 +3730,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// Native path: build assistant message with tool_use blocks before execution.
 		// Uses buildAssistantMessage so Anthropic thinking content blocks (when
 		// Cloud emits them via resp.ContentBlocks) are preserved verbatim with
-		// signatures intact — CC rule 3. Legacy fallback inside the helper
+		// signatures intact — thinking-block preservation rule. Legacy fallback inside the helper
 		// reconstructs from normalizedToolText + AllToolCalls() when the wire
 		// shape predates 2026-05.
 		var resultBlocks []client.ContentBlock

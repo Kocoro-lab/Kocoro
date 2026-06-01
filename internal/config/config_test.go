@@ -502,7 +502,7 @@ func TestConfig_IdleHardTimeoutDefault540(t *testing.T) {
 }
 
 // TestConfig_StreamIdleTimeoutDefault90 pins the new chunk-gap watchdog
-// default (mirrors CC's CLAUDE_STREAM_IDLE_TIMEOUT_MS).
+// default (90s).
 func TestConfig_StreamIdleTimeoutDefault90(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

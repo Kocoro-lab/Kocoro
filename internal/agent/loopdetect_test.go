@@ -1687,7 +1687,7 @@ func TestFamilyNoProgress_NonRepeatableOriginalThresholds(t *testing.T) {
 // IsEmptyThinkInput on the ToolCallRecord for `think` calls whose args parse
 // to an empty / whitespace-only thought. The flag drives the Check() rule
 // that force-stops after two consecutive empty think calls. See plan
-// 2026-05-14-thinking-blocks-cc-alignment.md Phase 0.2.
+// 2026-05-14-thinking-blocks-alignment.md Phase 0.2.
 func TestLoopDetector_Record_FlagsEmptyThinkInput(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -1723,7 +1723,7 @@ func TestLoopDetector_Record_FlagsEmptyThinkInput(t *testing.T) {
 // consecutive `think` calls with empty input force-stop immediately. The
 // rule defends against Sonnet 4.6 / Opus 4.7 emitting ritual `think({})`
 // calls after native thinking blocks (saw 4 consecutive in one production
-// hang before the fix). See plan 2026-05-14-thinking-blocks-cc-alignment.md.
+// hang before the fix). See plan 2026-05-14-thinking-blocks-alignment.md.
 func TestLoopDetector_EmptyThinkForceStop_OneNotEnough(t *testing.T) {
 	ld := NewLoopDetector()
 	ld.Record("think", `{}`, false, "", "", false)

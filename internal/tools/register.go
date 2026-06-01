@@ -23,14 +23,13 @@ import (
 // shouldRegisterThinkTool reports whether the local `think` tool should be
 // added to the registry. Skipped by default on the gateway path with native
 // thinking enabled — the two signals are redundant on Sonnet 4.6 / Opus 4.7
-// adaptive mode, and Anthropic's own Claude Code product ships zero
-// think-equivalent tools (relies on native interleaved thinking only).
+// adaptive mode.
 // Kept on:
 //   - Ollama (`cfg.Provider == "ollama"`) — OpenAI-shape API has no native thinking.
 //   - Thinking disabled by user (`cfg.Agent.Thinking == false`) — no native fallback.
 //   - Explicit escape hatch (`cfg.Agent.ForceThinkTool == true`).
 //
-// See plan 2026-05-14-thinking-blocks-cc-alignment.md Phase E for the wider
+// See plan 2026-05-14-thinking-blocks-alignment.md Phase E for the wider
 // rationale (the ritual `think({})` empty-input emissions surfaced as a
 // 14-minute production hang before Phase 0's bottom guards landed).
 func shouldRegisterThinkTool(cfg *config.Config) bool {

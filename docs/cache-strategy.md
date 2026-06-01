@@ -6,7 +6,7 @@ How Kocoro + Shannon allocate Anthropic's 4 `cache_control` breakpoints and rout
 
 1. **Maximize cache_read / cache_creation (CER)** on long-running conversations — Slack/LINE/TUI where the user comes back over minutes or hours.
 2. **Minimize paid cache_creation** on one-shot invocations — cron, webhook, MCP, CLI `shan -y ...`, and every internal subagent (`decompose`, `tool_select`, `lead_decide`, `interpretation`, `stub_cleanup`, `verify`, …) where the cache will never be re-read.
-3. **Stay inside the public Anthropic API** — no `cache_edits` protocol, no `DANGEROUS_uncachedSystemPromptSection` marker, no CC-private `<system-reminder>` cache-key-invisible semantics. Kocoro *does* emit `<system-reminder>` tags as plain XML text (Claude is trained to read the tag as framework-internal trusted content — used for skill listings, post-tool nudges, and the instructions block in `prompt/builder.go`), but the wrapped content participates in the cache key like any other byte. The ~5-10 pp CHR gap versus Claude Code is accepted as a structural ceiling.
+3. **Stay inside the public Anthropic API** — no `cache_edits` protocol, no `DANGEROUS_uncachedSystemPromptSection` marker, no non-public `<system-reminder>` cache-key-invisible semantics. Kocoro *does* emit `<system-reminder>` tags as plain XML text (Claude is trained to read the tag as framework-internal trusted content — used for skill listings, post-tool nudges, and the instructions block in `prompt/builder.go`), but the wrapped content participates in the cache key like any other byte. The ~5-10 pp CHR gap versus first-party clients on non-public APIs is accepted as a structural ceiling.
 
 ## Breakpoint allocation (Anthropic cap = 4)
 
@@ -145,11 +145,11 @@ If K9 > 1, the BP #1 still has a per-user drift source — re-audit
 `buildStaticSystem` and any code that contributes to `parts.System` (notably
 `cloudDelegationGuidance` concatenation in `loop.go`).
 
-## What we don't do (vs Claude Code)
+## What we don't do (non-public API features)
 
-These CC mechanisms use non-public Anthropic APIs and are not available to us:
+These mechanisms use non-public Anthropic APIs and are not available to us:
 
-- CC-private `<system-reminder>` cache-key-invisibility — wrapped content participates in the prompt but **not in the cache key**, letting CC re-bind per-user nudges without invalidating the prefix cache
+- Non-public `<system-reminder>` cache-key-invisibility — wrapped content participates in the prompt but **not in the cache key**, letting first-party clients re-bind per-user nudges without invalidating the prefix cache
 - `cache_edits` protocol — partial-invalidation of a cached prefix
 - `DANGEROUS_uncachedSystemPromptSection` — explicit "do not cache this segment" marker
 
@@ -157,10 +157,10 @@ Together these account for a structural 5-10 pp CHR gap that public-API clients 
 
 ### `<system-reminder>` — same tag, different semantics
 
-Kocoro *does* emit `<system-reminder>` tags as plain XML text — see `internal/agent/loop.go:buildSkillListing`, `buildStickySkillReminder`, post-tool nudges in `systemReminder`, and the instructions block in `internal/prompt/builder.go` (issue #125). Anthropic's training causes Claude to treat content inside this tag as **framework-internal trusted content**, which suppresses the prompt-injection false-positive that bare `## Instructions` markdown headers triggered in user-role messages. What we **do not** get from this is CC's cache-key-invisibility — the tag is just text in the message body, so wrapped content is part of the byte stream the cache hashes.
+Kocoro *does* emit `<system-reminder>` tags as plain XML text — see `internal/agent/loop.go:buildSkillListing`, `buildStickySkillReminder`, post-tool nudges in `systemReminder`, and the instructions block in `internal/prompt/builder.go` (issue #125). Anthropic's training causes Claude to treat content inside this tag as **framework-internal trusted content**, which suppresses the prompt-injection false-positive that bare `## Instructions` markdown headers triggered in user-role messages. What we **do not** get from this is cache-key-invisibility — the tag is just text in the message body, so wrapped content is part of the byte stream the cache hashes.
 
 **Workaround for `<system-reminder>` cache-invisibility (issue #107):** dynamic per-user tool
-catalogs that CC routes through `<system-reminder>` (cache-key-invisible)
+catalogs that first-party clients route through `<system-reminder>` (cache-key-invisible)
 are routed in Kocoro through the user message's `StableContext` — they
 land in BP #3 (per-session) rather than BP #1 (cross-user). Cross-user
 share is preserved on BP #1 at the cost of no cross-user share on the

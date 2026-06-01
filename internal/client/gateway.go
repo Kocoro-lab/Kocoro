@@ -430,9 +430,10 @@ type ContentBlock struct {
 	// is the opaque base64 token Anthropic requires us to echo back on the
 	// next request — without it the model drops the block as forged. Type
 	// "redacted_thinking": Data holds the encrypted blob (text unavailable
-	// to us). Both forms pass through unmodified to satisfy CC rule 3:
-	// "Thinking blocks must be preserved for the duration of an assistant
-	// trajectory" (assistant → tool_result → next assistant).
+	// to us). Both forms pass through unmodified to satisfy the
+	// thinking-block preservation rule: "Thinking blocks must be preserved
+	// for the duration of an assistant trajectory" (assistant → tool_result
+	// → next assistant).
 	Thinking  string `json:"thinking,omitempty"`
 	Signature string `json:"signature,omitempty"`
 	Data      string `json:"data,omitempty"`

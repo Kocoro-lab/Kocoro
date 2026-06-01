@@ -84,8 +84,8 @@ func (s *Session) TruncateAt(idx int) (*RestoredMessage, error) {
 // message has assistant content following it (i.e. a reply was generated
 // and a "clean" restore is no longer possible).
 //
-// The "no content after" check is the same guard CC uses for its
-// auto-restore path — restoring a user message that already has a
+// The "no content after" check guards the auto-restore path —
+// restoring a user message that already has a
 // (partial or full) assistant reply downstream would leave the user
 // confused about whether the assistant actually responded.
 func (s *Session) SliceBeforeLastUser() (*RestoredMessage, bool) {

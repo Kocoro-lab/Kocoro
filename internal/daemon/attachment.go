@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	// File caps aligned with claude.ai (500 MB / 20 files) per plan §2 P0.
+	// File caps: 500 MB per file, 20 files per message.
 	maxFileSize     = 500 * 1024 * 1024 // 500 MB per file
 	maxFiles        = 20                // max attachments per message
 	downloadTimeout = 2 * time.Minute

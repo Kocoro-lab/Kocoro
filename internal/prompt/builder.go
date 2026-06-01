@@ -215,8 +215,8 @@ func buildStaticSystem(opts PromptOptions) string {
 	// Text output — stable across sessions/users/format. See
 	// docs/superpowers/specs/2026-05-07-agent-preamble-output-design.md.
 	// Byte-equal across invocations to keep BP #1 (system_stable) cacheable.
-	// Wording aligned with Claude Code's latest "# Text output" section
-	// (2026-05-07 iteration after observing Claude 4 over-applied "silence is correct").
+	// Wording iterated 2026-05-07 after observing Claude 4 over-applied
+	// "silence is correct".
 	sb.WriteString("\n\n## Text output (does not apply to tool calls)\n")
 	sb.WriteString("Assume users can't see most tool calls or thinking — only your text output. " +
 		"Before your first tool call, state in one sentence what you're about to do. " +

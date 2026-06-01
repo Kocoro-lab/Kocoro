@@ -27,9 +27,9 @@ func (s QGState) String() string {
 	return "unknown"
 }
 
-// QueryGuard is a per-route 3-state machine with a generation counter,
-// modeled on Claude Code's QueryGuard. It controls only *who may start a new
-// run on this route* — it does NOT replace the session-mutation lock
+// QueryGuard is a per-route 3-state machine with a generation counter. It
+// controls only *who may start a new run on this route* — it does NOT
+// replace the session-mutation lock
 // (routeEntry.mu) and does NOT serialize session writes.
 //
 // The generation counter exists so finalizers from a force-ended run can
