@@ -635,7 +635,9 @@ var daemonStartCmd = &cobra.Command{
 
 		// Wire the WS broker's bus hooks the same way NewServer wires
 		// s.approvalBroker — both paths publish identical event payloads.
-		daemon.WireApprovalBusHooks(broker, localServer.EventBus())
+		// SendApprovalResolved lets daemon-cleanup paths (timeout / ctx cancel /
+		// disconnect) tell Cloud to clear the channel approval card.
+		daemon.WireApprovalBusHooks(broker, localServer.EventBus(), wsClient.SendApprovalResolved)
 		serverErrCh := make(chan error, 1)
 		go func() {
 			serverErrCh <- localServer.Start(ctx)

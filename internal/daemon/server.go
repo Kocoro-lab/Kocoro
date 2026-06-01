@@ -212,8 +212,14 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	}
 	// Wire approval bus hooks so SSE per-request brokers (which inherit from
 	// s.approvalBroker in handleMessageSSE) publish EventApprovalRequest /
-	// EventApprovalResolved alongside the WS path's broker.
-	WireApprovalBusHooks(s.approvalBroker, s.eventBus)
+	// EventApprovalResolved alongside the WS path's broker. The cloud notifier
+	// is read lazily through s.notifyApprovalResolved: NewServer seeds it with a
+	// no-op and cmd/daemon.go installs the real WS sender via
+	// SetApprovalResolvedNotifier after construction, so the closure must defer
+	// the lookup to cleanup time.
+	WireApprovalBusHooks(s.approvalBroker, s.eventBus, func(p ApprovalResolvedPayload) error {
+		return s.notifyApprovalResolved(p)
+	})
 	if deps != nil {
 		deps.Suggestions = s.suggestions
 		if deps.ApprovalTracker == nil {

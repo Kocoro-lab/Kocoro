@@ -284,6 +284,69 @@ func TestApprovalCleanup_CancelAll(t *testing.T) {
 	}
 }
 
+// Daemon-cleanup paths (ctx cancel + CancelAll) must notify Cloud so the
+// gateway clears the channel approval card, in addition to the local bus emit.
+// Notify runs async, so collect payloads over a buffered channel.
+func TestApprovalCleanup_NotifiesCloud(t *testing.T) {
+	t.Run("ctx cancel", func(t *testing.T) {
+		bus := NewEventBus()
+		got := make(chan ApprovalResolvedPayload, 1)
+		notify := func(p ApprovalResolvedPayload) error { got <- p; return nil }
+		broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
+		WireApprovalBusHooks(broker, bus, notify)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(40 * time.Millisecond)
+			cancel()
+		}()
+		if d := broker.Request(ctx, ApprovalRequestMeta{Channel: "feishu"}, "publish_to_web", `{}`); d != DecisionDeny {
+			t.Fatalf("expected deny on ctx cancel, got %s", d)
+		}
+
+		select {
+		case p := <-got:
+			if p.Decision != DecisionDeny || p.ResolvedBy != "daemon" {
+				t.Errorf("cloud notify payload = %+v, want deny/daemon", p)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cloud notifier never fired on ctx cancel")
+		}
+	})
+
+	t.Run("CancelAll", func(t *testing.T) {
+		bus := NewEventBus()
+		got := make(chan ApprovalResolvedPayload, 3)
+		notify := func(p ApprovalResolvedPayload) error { got <- p; return nil }
+		broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
+		WireApprovalBusHooks(broker, bus, notify)
+
+		var wg sync.WaitGroup
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				broker.Request(context.Background(), ApprovalRequestMeta{}, "bash", `{}`)
+			}()
+		}
+		time.Sleep(100 * time.Millisecond)
+		broker.CancelAll()
+		wg.Wait()
+
+		deadline := time.After(time.Second)
+		for i := 0; i < 3; i++ {
+			select {
+			case p := <-got:
+				if p.Decision != DecisionDeny || p.ResolvedBy != "daemon" {
+					t.Errorf("cloud notify payload = %+v, want deny/daemon", p)
+				}
+			case <-deadline:
+				t.Fatalf("cloud notifier fired only %d/3 times on CancelAll", i)
+			}
+		}
+	})
+}
+
 // Test 3: Cloud-relayed approval_response must emit approval_resolved with
 // the Cloud-provided resolved_by (or "external" when blank) plus ts.
 func TestApprovalResolved_CloudPath(t *testing.T) {
