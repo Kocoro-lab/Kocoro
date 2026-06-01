@@ -1050,7 +1050,6 @@ func (h *daemonEventHandler) OnText(text string) {
 	// only. Emitting it here as LLM_OUTPUT would double-print as a spurious trailing
 	// timeline segment on an im_timeline_v1 Cloud. Mid-turn narration still flows
 	// through OnPreamble (which keeps sending LLM_OUTPUT).
-	_ = text
 }
 
 // OnPreamble forwards mid-turn narration to Cloud over the same LLM_OUTPUT WS
