@@ -82,13 +82,21 @@ var Version = "dev"
 // reading this token can show the broadcast badge / picker UI; daemons
 // without the token use the legacy unconditional broadcast (per agent
 // binding). Both daemon shapes interoperate with the same Cloud.
+//
+// "im_timeline_v1" — daemon emits a single ordered timeline per IM message:
+// mid-turn narration via OnPreamble (LLM_OUTPUT) interleaved with TOOL_RUNNING
+// / TOOL_COMPLETED frames, and the final answer only via SendReply →
+// WORKFLOW_COMPLETED (OnText no longer double-emits it as LLM_OUTPUT). Cloud
+// gates timeline-mode rendering on this token; daemons without it keep the
+// legacy behavior where the final answer is emitted as a trailing LLM_OUTPUT.
 const (
-	CapDeliveryAck            = "delivery_ack"
-	CapInlineDocumentB64      = "inline_document_b64"
-	CapInlineExtractedText    = "inline_extracted_text"
-	CapToolUseIDEvents        = "tool_use_id_events"
-	CapClientMessageQueue     = "client_message_queue"
-	CapScheduleBroadcastGate  = "schedule_broadcast_gate"
+	CapDeliveryAck           = "delivery_ack"
+	CapInlineDocumentB64     = "inline_document_b64"
+	CapInlineExtractedText   = "inline_extracted_text"
+	CapToolUseIDEvents       = "tool_use_id_events"
+	CapClientMessageQueue    = "client_message_queue"
+	CapScheduleBroadcastGate = "schedule_broadcast_gate"
+	CapIMTimelineV1          = "im_timeline_v1"
 )
 
 var Capabilities = []string{
@@ -98,6 +106,7 @@ var Capabilities = []string{
 	CapToolUseIDEvents,
 	CapClientMessageQueue,
 	CapIMMessageLifecycleV1,
+	CapIMTimelineV1,
 	CapScheduleBroadcastGate,
 }
 

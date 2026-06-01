@@ -163,3 +163,16 @@ func TestCapabilitiesIncludesIMMessageLifecycleV1(t *testing.T) {
 		t.Fatal("expected im_message_lifecycle_v1 in Capabilities")
 	}
 }
+
+func TestCapabilitiesIncludesIMTimelineV1(t *testing.T) {
+	found := false
+	for _, c := range Capabilities {
+		if c == CapIMTimelineV1 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected im_timeline_v1 in Capabilities")
+	}
+}
