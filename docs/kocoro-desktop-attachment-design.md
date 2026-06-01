@@ -2,14 +2,14 @@
 
 **Audience:** Kocoro Desktop frontend team.
 
-**Goal:** Align Desktop's user-facing attachment UI with claude.ai conventions while letting the Kocoro daemon's agent loop read arbitrary numbers of local files via tools.
+**Goal:** Align Desktop's user-facing attachment UI with mainstream chat-UI conventions while letting the Kocoro daemon's agent loop read arbitrary numbers of local files via tools.
 
 ## Background
 
 Kocoro #135 surfaced two cases with one fix and one UX gap:
 
 1. A single PNG > 3.75 MB raw triggers `400: image exceeds 5 MB maximum` (now fixed in the daemon via three-layer image guard — see `internal/tools/imaging_compress.go`).
-2. Loading "all screenshots on my desktop" works on Claude Desktop but Desktop's frontend has no upload limit guardrails — users can drag-drop unlimited files without feedback.
+2. Loading "all screenshots on my desktop" works in mainstream desktop chat clients but Desktop's frontend has no upload limit guardrails — users can drag-drop unlimited files without feedback.
 
 Item 2 is what this doc addresses.
 
@@ -39,11 +39,11 @@ User intent: "Analyze everything in /Users/me/Desktop"
 
 ## Layer A: Desktop UI limits (shipped status)
 
-Status as of 2026-05-14. All rows are shipped; the only gap relative to claude.ai is the per-conversation cumulative cap (deferred — see "Not implemented" below).
+Status as of 2026-05-14. All rows are shipped; the only gap relative to mainstream chat UIs is the per-conversation cumulative cap (deferred — see "Not implemented" below).
 
 | Constraint | Value | Status |
 |---|---|---|
-| `maxAttachmentsPerMessage` | **20** | ✅ shipped — total file count cap, matches claude.ai's per-message cap |
+| `maxAttachmentsPerMessage` | **20** | ✅ shipped — total file count cap, matches the common per-message cap |
 | `maxFileSize` per disk file | **500 MB** | ✅ shipped — aligned with daemon Phase 1 |
 | `maxTotalAttachmentSize` | **500 MB** | ✅ shipped |
 | Clipboard inline paste cap | **20 MB** | ✅ shipped — matches daemon's `maxInlineImageDecodedBytes` |
@@ -55,20 +55,20 @@ Status as of 2026-05-14. All rows are shipped; the only gap relative to claude.a
 | Archive types | zip (others fall through to file_ref) | ✅ shipped |
 | Folder drops | treated as directory `file_ref` | ✅ shipped (ShanClawKit; SHA omitted — lives in a separate repo) |
 | Universal accept (unknown ext → file_ref) | ✅ shipped — daemon decides downstream | |
-| Per-violation `lastError` toast | ✅ shipped — only feedback when limit hit, matches claude.ai behavior | |
+| Per-violation `lastError` toast | ✅ shipped — only feedback when limit hit, matches mainstream chat-UI behavior | |
 
 **UX rules** (current behavior):
 - Numbered chip per attachment with thumbnail + filename + size + ✕ remove button.
-- No live counter — claude.ai itself doesn't show one. Capacity info is implicit (the chip strip shows what's attached) and the toast on violation tells the user when they've hit the cap.
+- No live counter — mainstream chat UIs themselves don't show one. Capacity info is implicit (the chip strip shows what's attached) and the toast on violation tells the user when they've hit the cap.
 - On hard block, `AttachmentState.lastError` triggers a toast.
 - Universal acceptance: unknown extensions are accepted as file_ref and the daemon decides whether to extract / passthrough / refuse.
 
-**Rationale for Kocoro's 500 MB-per-file cap (vs claude.ai's 30 MB)**:
-Kocoro daemon auto-compresses images at source (`internal/tools/imaging_compress.go`) and treats disk files as `file_ref` paths (not inline base64). The 5 MB Anthropic inline limit is enforced server-side by the daemon, not gated client-side. The 20-attachments-per-message cap matches claude.ai exactly.
+**Rationale for Kocoro's 500 MB-per-file cap (vs the common 30 MB client cap)**:
+Kocoro daemon auto-compresses images at source (`internal/tools/imaging_compress.go`) and treats disk files as `file_ref` paths (not inline base64). The 5 MB Anthropic inline limit is enforced server-side by the daemon, not gated client-side. The 20-attachments-per-message cap matches the common client cap exactly.
 
 **Not implemented (future / explicit non-goals)**:
-- Image-specific cap (`maxImagesPerMessage`): claude.ai does NOT have one — they use a single per-message attachment cap. Adding an image-only cap was investigated and rejected as scope inflation.
-- Per-conversation cumulative cap (claude.ai has "20 files per conversation" across messages): requires cross-message state tracking and is deferred to follow-up.
+- Image-specific cap (`maxImagesPerMessage`): mainstream chat UIs do NOT have one — they use a single per-message attachment cap. Adding an image-only cap was investigated and rejected as scope inflation.
+- Per-conversation cumulative cap (some clients enforce "20 files per conversation" across messages): requires cross-message state tracking and is deferred to follow-up.
 
 ## Layer B: daemon-side compression (already implemented)
 
@@ -87,7 +87,7 @@ Kocoro daemon auto-compresses images at source (`internal/tools/imaging_compress
 
 ## Reference data (Anthropic public limits)
 
-| Constraint | Anthropic API | claude.ai | Kocoro Desktop (shipped) |
+| Constraint | Anthropic API | Common chat UI | Kocoro Desktop (shipped) |
 |---|---|---|---|
 | Inline image | 5 MB base64 string | 30 MB (server compresses) | 500 MB raw on disk (daemon compresses); 20 MB inline paste |
 | Images per request | 100 (200K) / 600 (others) | no separate per-image cap | no separate per-image cap |
