@@ -2,6 +2,35 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.1.21 — 2026-06-01 — IM timeline output + approval-card cleanup notify + OSS hygiene
+
+Two daemon threads plus open-source hygiene. First, **IM timeline output** (PR #205): the daemon advertises a new `im_timeline_v1` WS capability and stops double-emitting the final answer, so an IM message renders as one ordered timeline (mid-turn narration interleaved with tool frames, then the final reply) instead of a duplicated trailing segment. Second, **daemon-originated approval terminations now notify Cloud**, so a Feishu/Slack approval card whose agent timed out or was cancelled no longer lingers as a zombie with live buttons. Plus open-source hygiene: external developer-tool references scrubbed from comments/docs, and a README demo GIF.
+
+> **Cross-repo contract:** the `im_timeline_v1` capability token is **additive** — a Cloud that doesn't parse it keeps the legacy unconditional-broadcast rendering. But the daemon-side change (`OnText` no longer emits the final answer as a trailing `LLM_OUTPUT`) is **unconditional**: the final answer now reaches Cloud *only* via `SendReply → WORKFLOW_COMPLETED`, and mid-turn narration *only* via `OnPreamble` (which still emits `LLM_OUTPUT`). The matching Cloud WS handshake capability parser must recognize `im_timeline_v1` to render timeline mode. The approval-cleanup notify reuses the existing `SendApprovalResolved` path Cloud already handles for `POST /approval`, so no new Cloud surface is required for the fix.
+
+### Added
+
+- **`im_timeline_v1` WS handshake capability** (PR #205, `internal/daemon/client.go`) — the daemon emits a single ordered timeline per IM message: mid-turn narration via `OnPreamble` (`LLM_OUTPUT`) interleaved with `TOOL_RUNNING` / `TOOL_COMPLETED` frames, and the final answer only via `SendReply → WORKFLOW_COMPLETED`. Cloud gates timeline-mode rendering on this token; daemons without it keep the legacy behavior where the final answer is also emitted as a trailing `LLM_OUTPUT`.
+
+### Changed
+
+- **`daemonEventHandler.OnText` no longer emits the final answer as a trailing `LLM_OUTPUT`** (PR #205, `cmd/daemon.go`) — the final answer travels via `SendReply → WORKFLOW_COMPLETED` only; re-emitting it from `OnText` would double-print as a spurious trailing timeline segment on an `im_timeline_v1` Cloud. Mid-turn narration is unchanged — `OnPreamble` still forwards `LLM_OUTPUT` — so channel rendering on non-timeline Clouds is unaffected.
+
+### Fixed
+
+- **Daemon-originated approval terminations now clear the Cloud channel card** (`internal/daemon/{approval,server}.go`) — 5-min timeout, ctx cancel, and WS-disconnect `CancelAll` previously emitted only a local `EventBus` event and never told Cloud, leaving Feishu/Slack approval cards as zombies whose buttons never disappeared. `WireApprovalBusHooks` now takes a Cloud notifier; the cleanup emitter fires `SendApprovalResolved(deny / daemon)` on its own goroutine so the broker mutex is never held across network IO during `CancelAll`. The at-most-one terminal-event contract is preserved (cleanup notifies only when no ingress — `POST /approval` or a WS `approval_response` — claimed the request first), and a given approval lives in exactly one broker so there is no double-notify across the SSE and WS brokers. Primary value is the timeout / ctx-cancel paths (WS still connected); the disconnect path is belt-and-suspenders, with Cloud's Redis TTL backstop clearing the card when the post-teardown send fails. `ApprovalTimeout` (5 min) unchanged.
+
+### Docs
+
+- `references/*` (bundled `kocoro` skill): document the `im_timeline_v1` capability token (PR #205).
+- **Open-source hygiene** (PR #207) — scrubbed external developer-tool parity/attribution callouts from comments and docs, replaced with neutral technical descriptions (no logic change; the config-migration endpoint paths and bundled third-party skills are intentionally retained). Generalized attachment-cap references to neutral phrasing while keeping the actual caps and their rationale. Trimmed project-guide redundancy and condensed oversized subsystem entries in `CLAUDE.md`.
+- `README.md`: added a demo GIF hero (`assets/kocoro-demo.gif`) and an OSS-scope note (`5a68fab`).
+
+### Tests
+
+- `cmd/daemon_preamble_test.go` — `OnText` is a no-op while `OnPreamble` still emits `LLM_OUTPUT` (timeline design).
+- `internal/daemon/approval_events_test.go` + `types_test.go` — cleanup notify fires on timeout / ctx-cancel / `CancelAll`, no double-notify across brokers, nil notifier no-ops, and the `CancelAll` test polls until all pending entries are emitted before cancelling (deterministic, no fixed sleep).
+
 ## v0.1.20 — 2026-05-30 — Cloud workflow stream resilience + `/dag` + agent display names
 
 Two additive feature threads. First, the `cloud_delegate` / cloud-workflow path (`/research`, `/dag`) is hardened so long-running cloud runs survive a dropped SSE stream and surface live per-worker activity instead of looking frozen. Second, non-default agents gain a human-readable `display_name` (any language) decoupled from their on-disk slug, plus rename support. No wire-protocol break — the SSE change is daemon-internal presentation, the agent API additions are all `omitempty` with slug fallback, and legacy configs round-trip cleanly.
