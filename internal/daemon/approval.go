@@ -343,20 +343,17 @@ const approvalRequestTitleCap = 200
 // regardless of which broker created them (the cmd/daemon.go WS broker or the
 // NewServer-owned approvalBroker that SSE per-request brokers inherit from).
 //
-// The optional notify hook is fired on every daemon-originated cleanup
-// (timeout / ctx cancel / WS disconnect) so Cloud clears the channel approval
-// card (Feishu/Slack) the same way it does when Desktop resolves via
-// POST /approval. Tests that only care about the local bus omit it.
-func WireApprovalBusHooks(b *ApprovalBroker, bus *EventBus, notify ...func(ApprovalResolvedPayload) error) {
+// notify is fired on every daemon-originated cleanup (timeout / ctx cancel /
+// WS disconnect) so Cloud clears the channel approval card (Feishu/Slack) the
+// same way it does when Desktop resolves via POST /approval. Pass nil from
+// tests that only care about the local bus; the cleanup emitter no-ops a nil
+// notify.
+func WireApprovalBusHooks(b *ApprovalBroker, bus *EventBus, notify func(ApprovalResolvedPayload) error) {
 	if b == nil {
 		return
 	}
-	var cloudNotify func(ApprovalResolvedPayload) error
-	if len(notify) > 0 {
-		cloudNotify = notify[0]
-	}
 	b.SetOnRequest(makeApprovalRequestEmitter(bus))
-	b.SetOnCleanup(makeApprovalCleanupEmitter(bus, cloudNotify))
+	b.SetOnCleanup(makeApprovalCleanupEmitter(bus, notify))
 }
 
 // makeApprovalRequestEmitter returns a hook callable as ApprovalBroker.onRequest
@@ -395,12 +392,15 @@ func makeApprovalRequestEmitter(bus *EventBus) func(req ApprovalRequest) {
 //
 // When notify is non-nil it ALSO tells Cloud the approval was resolved so the
 // gateway clears the channel card (Feishu/Slack) — without this, an approval
-// the agent gave up on (timeout / ctx cancel) leaves a zombie card whose
-// buttons never disappear. The notify call runs on its own goroutine: onCleanup
-// is invoked under the broker mutex by CancelAll, and a synchronous WS send
-// there would block the lock (and every other approval) on network IO. Errors
-// are ignored — on WS disconnect the send fails, and Cloud's Redis TTL backstop
-// clears the card regardless.
+// the agent gave up on leaves a zombie card whose buttons never disappear.
+// Primary value is the timeout and ctx-cancel paths, where the WS is still
+// connected and the send actually reaches Cloud; the CancelAll-on-disconnect
+// path is belt-and-suspenders only (the goroutine fires after the connection
+// is already torn down, so the send almost always fails — Cloud's Redis TTL
+// backstop is what clears the card there). The notify call runs on its own
+// goroutine: onCleanup is invoked under the broker mutex by CancelAll, and a
+// synchronous WS send there would block the lock (and every other approval) on
+// network IO. Errors are ignored for the disconnect reason above.
 func makeApprovalCleanupEmitter(bus *EventBus, notify func(ApprovalResolvedPayload) error) func(requestID string) {
 	return func(requestID string) {
 		emitBusJSON(bus, EventApprovalResolved, map[string]any{

@@ -53,6 +53,11 @@ type Server struct {
 	cancel                 context.CancelFunc
 	approvalBroker         *ApprovalBroker
 	eventBus               *EventBus
+	// notifyApprovalResolved is set once at startup (SetApprovalResolvedNotifier,
+	// before the WS connects or any approval can fire) and read without a lock
+	// from both the /approval handler and every cleanup-notify goroutine. Safe
+	// only because of that set-once invariant — switch to an atomic.Pointer if
+	// it ever needs to be re-set at runtime.
 	notifyApprovalResolved func(p ApprovalResolvedPayload) error
 	// pendingBrokers maps requestID → per-request ApprovalBroker.
 	// SSE handlers register here so POST /approval can find the right broker.
@@ -216,7 +221,10 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	// is read lazily through s.notifyApprovalResolved: NewServer seeds it with a
 	// no-op and cmd/daemon.go installs the real WS sender via
 	// SetApprovalResolvedNotifier after construction, so the closure must defer
-	// the lookup to cleanup time.
+	// the lookup to cleanup time. This broker covers the SSE source; the WS
+	// broker in cmd/daemon.go is wired with the same notifier for cloud sources.
+	// A given approval lives in exactly one broker (independent pending maps
+	// keyed by random request IDs), so there is no double-notify.
 	WireApprovalBusHooks(s.approvalBroker, s.eventBus, func(p ApprovalResolvedPayload) error {
 		return s.notifyApprovalResolved(p)
 	})
