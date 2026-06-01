@@ -50,7 +50,7 @@ type approvalEvent struct {
 func TestApprovalRequest_FullPayload(t *testing.T) {
 	bus := NewEventBus()
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-	WireApprovalBusHooks(broker, bus)
+	WireApprovalBusHooks(broker, bus, nil)
 
 	ch := bus.Subscribe()
 	defer bus.Unsubscribe(ch)
@@ -145,7 +145,7 @@ func TestApprovalTitleFallback(t *testing.T) {
 func TestApprovalRequest_NotEmittedOnSendFailure(t *testing.T) {
 	bus := NewEventBus()
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return context.DeadlineExceeded })
-	WireApprovalBusHooks(broker, bus)
+	WireApprovalBusHooks(broker, bus, nil)
 
 	if d := broker.Request(context.Background(), ApprovalRequestMeta{}, "bash", `{}`); d != DecisionDeny {
 		t.Fatalf("expected deny on send failure, got %s", d)
@@ -210,7 +210,7 @@ func TestApprovalResolved_LocalPath(t *testing.T) {
 func TestApprovalCleanup_OnContextCancel(t *testing.T) {
 	bus := NewEventBus()
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-	WireApprovalBusHooks(broker, bus)
+	WireApprovalBusHooks(broker, bus, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -247,7 +247,7 @@ func TestApprovalCleanup_OnContextCancel(t *testing.T) {
 func TestApprovalCleanup_CancelAll(t *testing.T) {
 	bus := NewEventBus()
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-	WireApprovalBusHooks(broker, bus)
+	WireApprovalBusHooks(broker, bus, nil)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 3; i++ {
@@ -282,6 +282,87 @@ func TestApprovalCleanup_CancelAll(t *testing.T) {
 	if resolvedCount != 3 {
 		t.Errorf("daemon-cleanup approval_resolved count: got %d, want 3", resolvedCount)
 	}
+}
+
+// Daemon-cleanup paths (ctx cancel + CancelAll) must notify Cloud so the
+// gateway clears the channel approval card, in addition to the local bus emit.
+// Notify runs async, so collect payloads over a buffered channel.
+func TestApprovalCleanup_NotifiesCloud(t *testing.T) {
+	t.Run("ctx cancel", func(t *testing.T) {
+		bus := NewEventBus()
+		got := make(chan ApprovalResolvedPayload, 1)
+		notify := func(p ApprovalResolvedPayload) error { got <- p; return nil }
+		broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
+		WireApprovalBusHooks(broker, bus, notify)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(40 * time.Millisecond)
+			cancel()
+		}()
+		if d := broker.Request(ctx, ApprovalRequestMeta{Channel: "feishu"}, "publish_to_web", `{}`); d != DecisionDeny {
+			t.Fatalf("expected deny on ctx cancel, got %s", d)
+		}
+
+		select {
+		case p := <-got:
+			if p.Decision != DecisionDeny || p.ResolvedBy != "daemon" {
+				t.Errorf("cloud notify payload = %+v, want deny/daemon", p)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cloud notifier never fired on ctx cancel")
+		}
+	})
+
+	t.Run("CancelAll", func(t *testing.T) {
+		bus := NewEventBus()
+		got := make(chan ApprovalResolvedPayload, 3)
+		notify := func(p ApprovalResolvedPayload) error { got <- p; return nil }
+		broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
+		WireApprovalBusHooks(broker, bus, notify)
+
+		var wg sync.WaitGroup
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				broker.Request(context.Background(), ApprovalRequestMeta{}, "bash", `{}`)
+			}()
+		}
+		// Wait until all 3 entries reach pa.emitted before CancelAll: it only
+		// fires onCleanup (and thus notify) for emitted entries, so a fixed
+		// sleep could race a slow goroutine still between sendFn and the emit
+		// critical section, dropping the count below 3 on a loaded CI box.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			broker.mu.Lock()
+			emitted := 0
+			for _, pa := range broker.pending {
+				if pa.emitted {
+					emitted++
+				}
+			}
+			broker.mu.Unlock()
+			if emitted == 3 {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		broker.CancelAll()
+		wg.Wait()
+
+		collectDeadline := time.After(time.Second)
+		for i := 0; i < 3; i++ {
+			select {
+			case p := <-got:
+				if p.Decision != DecisionDeny || p.ResolvedBy != "daemon" {
+					t.Errorf("cloud notify payload = %+v, want deny/daemon", p)
+				}
+			case <-collectDeadline:
+				t.Fatalf("cloud notifier fired only %d/3 times on CancelAll", i)
+			}
+		}
+	})
 }
 
 // Test 3: Cloud-relayed approval_response must emit approval_resolved with
@@ -358,7 +439,7 @@ func TestApprovalRequest_CancelAllDuringEmitNoOrphan(t *testing.T) {
 	}
 	bus := NewEventBus()
 	broker := NewApprovalBroker(sendFn)
-	WireApprovalBusHooks(broker, bus)
+	WireApprovalBusHooks(broker, bus, nil)
 
 	resultCh := make(chan ApprovalDecision, 1)
 	go func() {
@@ -399,7 +480,7 @@ func TestApprovalRequest_CancelAllDuringEmitNoOrphan(t *testing.T) {
 func TestApprovalRequest_TitleRedactedAndTruncated(t *testing.T) {
 	bus := NewEventBus()
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-	WireApprovalBusHooks(broker, bus)
+	WireApprovalBusHooks(broker, bus, nil)
 
 	long := strings.Repeat("X", approvalRequestTitleCap+50)
 	desc := "leaking AKIAIOSFODNN7EXAMPLE then " + long
@@ -443,7 +524,7 @@ func TestApprovalRequest_TitleRedactedAndTruncated(t *testing.T) {
 func TestApprovalEvents_RingReplay(t *testing.T) {
 	bus := NewEventBus()
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-	WireApprovalBusHooks(broker, bus)
+	WireApprovalBusHooks(broker, bus, nil)
 
 	go func() {
 		time.Sleep(20 * time.Millisecond)
@@ -500,7 +581,7 @@ func TestApprovalEvents_NoConflictingTerminalState(t *testing.T) {
 	for i := 0; i < iterations; i++ {
 		bus := NewEventBus()
 		broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-		WireApprovalBusHooks(broker, bus)
+		WireApprovalBusHooks(broker, bus, nil)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		reqIDCh := make(chan string, 1)
@@ -616,7 +697,7 @@ func TestApprovalResolve_BusEmitBeforeAgentWake(t *testing.T) {
 
 	bus := NewEventBus()
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-	WireApprovalBusHooks(broker, bus)
+	WireApprovalBusHooks(broker, bus, nil)
 
 	requestDone := make(chan struct{})
 	go func() {
@@ -702,7 +783,7 @@ func TestApprovalCancelAll_BusEmitBeforeAgentWake(t *testing.T) {
 
 	bus := NewEventBus()
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-	WireApprovalBusHooks(broker, bus)
+	WireApprovalBusHooks(broker, bus, nil)
 
 	requestDone := make(chan struct{})
 	go func() {
@@ -766,7 +847,7 @@ func TestApprovalCancelAll_BusEmitBeforeAgentWake(t *testing.T) {
 func TestApprovalRequest_FlagsOmittedWhenEmpty(t *testing.T) {
 	bus := NewEventBus()
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-	WireApprovalBusHooks(broker, bus)
+	WireApprovalBusHooks(broker, bus, nil)
 
 	go func() {
 		time.Sleep(30 * time.Millisecond)
@@ -805,7 +886,7 @@ func TestApprovalRequest_FlagsOmittedWhenEmpty(t *testing.T) {
 	// emits an unintended flag for it.
 	bus2 := NewEventBus()
 	broker2 := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
-	WireApprovalBusHooks(broker2, bus2)
+	WireApprovalBusHooks(broker2, bus2, nil)
 	go func() {
 		time.Sleep(30 * time.Millisecond)
 		broker2.mu.Lock()
