@@ -314,7 +314,7 @@ Patch bump in the v0.1.x line. `publish_to_web` is additive (cloud-gated), the `
 Bundles PR #114 (tool-layer cost optimization), PR #113 (webhook agent isolation), the daemon WS approval-message fix, and the five release-blocker fixes that came out of the cross-branch code review.
 
 ### Added
-- **Per-turn 200K aggregate cap on tool results** (`internal/agent/spill.go`) — mirrors Claude Code's `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS`. When parallel tools return >200K runes total, the largest results spill until the aggregate drops back under the cap.
+- **Per-turn 200K aggregate cap on tool results** (`internal/agent/spill.go`) — caps the summed size of all tool results in a turn. When parallel tools return >200K runes total, the largest results spill until the aggregate drops back under the cap.
 - **Per-tool result spill policy + unified spill path** — `MaxResultSizeChars` per tool: default 50K runes; `grep` ~20K; `file_read` is `UnlimitedToolResultSizeChars` and falls back to the 50K spill threshold. Spill files at `~/.shannon/tmp/tool_result_<session>_<call_id>.txt`.
 - **Persisted tool-result budget state** (`internal/agent/toolresult_budget.go`) — `ToolResultReplacements` + `ToolResultSeen` on `session.Session` survive across turns and resume; mid-turn checkpoints (`applyTurnState`) and both terminal save paths persist them.
 - **Context-bloat run-status nudge** (`internal/agent/context_bloat.go`) — `OnRunStatus("tool_result_bloat", …)` surfaces when a single tool's per-turn output exceeds the bloat threshold; SSE/Desktop subscribers can show why a loop slowed.

@@ -97,7 +97,7 @@ var (
 	cachedRendererMu sync.RWMutex
 )
 
-// compactStyle is a Claude Code-inspired style: no margins, minimal spacing,
+// compactStyle is a compact style: no margins, minimal spacing,
 // bold headings without color backgrounds, compact lists.
 var compactStyle = ansi.StyleConfig{
 	Document: ansi.StyleBlock{

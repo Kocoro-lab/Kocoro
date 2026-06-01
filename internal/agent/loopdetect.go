@@ -29,7 +29,7 @@ type ToolCallRecord struct {
 	// IsEmptyThinkInput is true only for `think` tool calls whose parsed
 	// args yield an empty / whitespace-only `thought`. Used by Check() to
 	// force-stop after two consecutive ritual think({}) calls (see plan
-	// 2026-05-14-thinking-blocks-cc-alignment.md Phase 0). Always false for
+	// 2026-05-14-thinking-blocks-alignment.md Phase 0). Always false for
 	// other tools, malformed JSON, or non-empty thought values.
 	IsEmptyThinkInput bool
 }
@@ -57,7 +57,7 @@ type ToolCallRecord struct {
 // tasks. Real polling is now covered by ExactDup (same command repeated),
 // NoProgress (many bash calls without progress), and the idle watchdog
 // (silent long-running commands). See the post-mortem in plan
-// 2026-05-14-thinking-blocks-cc-alignment.md.
+// 2026-05-14-thinking-blocks-alignment.md.
 type LoopDetector struct {
 	history     []ToolCallRecord
 	historySize int
@@ -363,7 +363,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// think({}) calls are a no-op ritual that burns LLM round-trips. Fire
 	// before any other detector so the agent never spins on this pattern.
 	// Streak is broken by a non-think tool OR a think call with content.
-	// See plan 2026-05-14-thinking-blocks-cc-alignment.md Phase 0.3.
+	// See plan 2026-05-14-thinking-blocks-alignment.md Phase 0.3.
 	if name == "think" {
 		h := ld.history
 		n := len(h)
@@ -716,7 +716,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// A dedicated `sleep` count produced false positives on legitimate
 	// parallel-sleep tasks (a user requested "run 3 sleep commands in
 	// parallel" and the model's first iteration tripped the 4-count
-	// threshold — see plan 2026-05-14-thinking-blocks-cc-alignment.md
+	// threshold — see plan 2026-05-14-thinking-blocks-alignment.md
 	// post-mortem). Removed 2026-05.
 	return LoopContinue, ""
 }
@@ -826,7 +826,7 @@ func familyNoProgressMessage(family string, progressCount, familyCount, stage in
 //
 // Matches the soft-error trigger in internal/tools/think.go so the Check()
 // force-stop rule fires on exactly the calls the tool itself treats as
-// no-op hints. See plan 2026-05-14-thinking-blocks-cc-alignment.md Phase 0.
+// no-op hints. See plan 2026-05-14-thinking-blocks-alignment.md Phase 0.
 func isEmptyThinkInput(name, argsJSON string) bool {
 	if name != "think" {
 		return false

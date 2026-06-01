@@ -361,7 +361,7 @@ func TestRebuildRegistryForHealth_GatewayAndPostOverlays(t *testing.T) {
 
 // TestShouldRegisterThinkTool covers the gating predicate that decides whether
 // the local `think` tool is registered. See plan
-// 2026-05-14-thinking-blocks-cc-alignment.md Phase E.
+// 2026-05-14-thinking-blocks-alignment.md Phase E.
 func TestShouldRegisterThinkTool(t *testing.T) {
 	cases := []struct {
 		name string

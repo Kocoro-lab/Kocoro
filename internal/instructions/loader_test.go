@@ -277,8 +277,7 @@ func TestLoadMemory_ShortFile(t *testing.T) {
 
 // TestPrependFileStaleness_FreshFile asserts no header is prepended when
 // mtime is within the staleness threshold. Threshold-gated so daily memory
-// edits don't accumulate header noise (mirrors CC's memoryFreshnessText
-// returning "" for d<=1, scaled to our weekly cadence).
+// edits don't accumulate header noise, using a weekly cadence.
 func TestPrependFileStaleness_FreshFile(t *testing.T) {
 	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
 	mtime := now.AddDate(0, 0, -3) // 3 days old

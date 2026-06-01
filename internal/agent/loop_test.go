@@ -3180,7 +3180,7 @@ func TestCoreRules_EmptyResultRule_AddsDiversificationCase(t *testing.T) {
 }
 
 // TestCoreRules_EmptyResultRule_ProtectsUserSpecifiedScope pins the
-// Codex review finding: when the user explicitly names a scope (mailbox,
+// review finding: when the user explicitly names a scope (mailbox,
 // calendar, folder, specific resource), an empty result MUST be
 // respected as the answer. The diversification rule must NOT encourage
 // the model to cross-account/folder-hunt past the user's contract.
@@ -3196,7 +3196,7 @@ func TestCoreRules_EmptyResultRule_ProtectsUserSpecifiedScope(t *testing.T) {
 	}
 }
 
-// TestCoreRules_EmptyResultRule_ExcludesHTTPTool pins the Codex review
+// TestCoreRules_EmptyResultRule_ExcludesHTTPTool pins the review
 // finding: the http tool legitimately returns [] / {} / 204 for the
 // exact endpoint the user asked about. The rule must explicitly
 // restrict diversification to integrations with list-and-enumerate
@@ -5080,8 +5080,8 @@ func TestBuildAssistantMessage_NilResponseReturnsEmpty(t *testing.T) {
 
 // TestMessagesForLLM_PreservesThinkingBlocks locks the invariant that the
 // pre-flight sanitizer pipeline (oversize image filter, etc.) does NOT
-// strip thinking content blocks from assistant messages. CC rule 3
-// requires those blocks survive the trajectory.
+// strip thinking content blocks from assistant messages. The
+// thinking-block preservation rule requires those blocks survive the trajectory.
 func TestMessagesForLLM_PreservesThinkingBlocks(t *testing.T) {
 	loop := &AgentLoop{}
 	in := []client.Message{

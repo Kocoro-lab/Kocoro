@@ -1368,7 +1368,7 @@ func (m *Model) View() string {
 			sb.WriteString(glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx))
 		}
 		sb.WriteString("\n")
-		// Bottom status bar with model tier + execution timer (like Claude Code)
+		// Bottom status bar with model tier + execution timer
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
 		tierDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
 		rightInfo := tierDim.Render(m.modelDisplayLabel() + " " + elapsed)

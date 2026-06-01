@@ -12,9 +12,8 @@ import (
 
 // SuggestionPrompt is the synthetic user message appended to the main
 // turn's message history to elicit a single short follow-up suggestion.
-// Format constraints mirror Claude Code's promptSuggestion (2-12 words,
-// match user tone, no Claude voice). The model's reply is filtered further
-// by FilterSuggestion before display.
+// Format constraints: 2-12 words, match user tone, no Claude voice. The
+// model's reply is filtered further by FilterSuggestion before display.
 //
 // CHANGE WITH CARE: this string is part of the forked request's tail tokens
 // (uncached). Edits do not invalidate the main turn's cache prefix, but they

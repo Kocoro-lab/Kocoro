@@ -42,7 +42,7 @@ func TestThinkTool_AckNotEcho(t *testing.T) {
 // thinking content block. Hard-erroring on those calls caused the agent loop
 // to spin until force-stop (14-min hang in production). The soft hint lets
 // the model immediately re-orient without burning the loop-detector budget.
-// See plan 2026-05-14-thinking-blocks-cc-alignment.md Phase 0.1.
+// See plan 2026-05-14-thinking-blocks-alignment.md Phase 0.1.
 func TestThinkTool_EmptyThoughtSoftHint(t *testing.T) {
 	tool := &ThinkTool{}
 
