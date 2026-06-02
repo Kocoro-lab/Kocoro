@@ -104,9 +104,9 @@ func runDoctorWithHealth(shannonDir, apiKey, endpoint string, gw *client.Gateway
 }
 
 func formatDoctorResults(checks []doctorCheck) string {
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-	okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	failStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
+	okStyle := lipgloss.NewStyle().Foreground(colorSuccess)
+	failStyle := lipgloss.NewStyle().Foreground(colorError)
 
 	var sb strings.Builder
 	sb.WriteString(dimStyle.Render("  Diagnostics:") + "\n")

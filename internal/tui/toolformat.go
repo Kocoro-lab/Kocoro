@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 // toolKeyArg extracts the most meaningful argument from a tool's JSON args.
@@ -78,9 +76,9 @@ func toolResultBrief(toolName string, content string, elapsed time.Duration) str
 // formatCompactToolResult formats a single-line tool result.
 func formatCompactToolResult(toolName string, args string, isError bool, content string, elapsed time.Duration) string {
 	keyArg := toolKeyArg(toolName, args)
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-	successIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("✓")
-	errorIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("✗")
+	dimStyle := styleDim()
+	successIcon := styleSuccess().Render("✓")
+	errorIcon := styleError().Render("✗")
 
 	icon := successIcon
 	brief := toolResultBrief(toolName, content, elapsed)
@@ -96,23 +94,65 @@ func formatCompactToolResult(toolName string, args string, isError bool, content
 	return dimStyle.Render(line)
 }
 
-// formatExpandedToolResult formats the full expanded tool result.
+// expandedHeadLines / expandedTailLines bound how much multi-line tool output
+// the Ctrl+O expanded view shows. Workload: a `bash`/`grep`/`file_read` result
+// with a long stack trace or many matches. Symptom when it binds: the middle is
+// elided with a "… +N lines" marker. Override: there is none today — bump these
+// consts if power users complain the head/tail window is too tight.
+const (
+	expandedHeadLines = 8
+	expandedTailLines = 4
+)
+
+// truncateHeadTail keeps the first head and last tail lines of content,
+// replacing the elided middle with a "… +N lines" marker. Unlike the old
+// strings.Fields flattening, it PRESERVES line structure — a stack trace, diff,
+// or grep result stays readable instead of collapsing into one run-on line.
+func truncateHeadTail(content string, head, tail int) string {
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) <= head+tail {
+		return strings.Join(lines, "\n")
+	}
+	hidden := len(lines) - head - tail
+	out := make([]string, 0, head+tail+1)
+	out = append(out, lines[:head]...)
+	out = append(out, fmt.Sprintf("… +%d lines", hidden))
+	out = append(out, lines[len(lines)-tail:]...)
+	return strings.Join(out, "\n")
+}
+
+// formatExpandedToolResult formats the full expanded tool result. Multi-line
+// output is preserved (head/tail windowed), each line indented under the
+// compact header.
 func formatExpandedToolResult(toolName string, args string, isError bool, content string, elapsed time.Duration) string {
 	compact := formatCompactToolResult(toolName, args, isError, content, elapsed)
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-
-	// Flatten newlines so expanded view stays compact
-	flat := strings.Join(strings.Fields(content), " ")
+	dimStyle := styleDim()
+	bodyStyle := dimStyle
+	if isError {
+		bodyStyle = styleError()
+	}
 
 	var sb strings.Builder
 	sb.WriteString(compact)
 	sb.WriteString("\n")
-	sb.WriteString(dimStyle.Render(fmt.Sprintf("  Args: %s", truncate(args, 200))))
-	sb.WriteString("\n")
-	if isError {
-		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render(fmt.Sprintf("  Error: %s", truncate(flat, 200))))
-	} else {
-		sb.WriteString(dimStyle.Render(fmt.Sprintf("  Result: %s", truncate(flat, 200))))
+	sb.WriteString(dimStyle.Render("  Args: " + truncate(args, 200)))
+
+	body := truncateHeadTail(content, expandedHeadLines, expandedTailLines)
+	if body != "" {
+		label := "  Result:"
+		if isError {
+			label = "  Error:"
+		}
+		sb.WriteString("\n")
+		sb.WriteString(dimStyle.Render(label))
+		for _, ln := range strings.Split(body, "\n") {
+			sb.WriteString("\n")
+			sb.WriteString(bodyStyle.Render("  " + ln))
+		}
 	}
 	return sb.String()
 }
@@ -128,7 +168,7 @@ func truncateLongResponse(rendered string) string {
 	}
 	kept := strings.Join(lines[:maxResponseDisplayLines], "\n")
 	hidden := len(lines) - maxResponseDisplayLines
-	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	dim := styleDim()
 	notice := dim.Render(fmt.Sprintf("  ... (%d more lines — /copy for full text)", hidden))
 	return kept + "\n" + notice
 }
@@ -145,9 +185,9 @@ func formatToolSummary(results []toolResultEntry) string {
 			errCount++
 		}
 	}
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-	successIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("✓")
-	errorIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("✗")
+	dimStyle := styleDim()
+	successIcon := styleSuccess().Render("✓")
+	errorIcon := styleError().Render("✗")
 
 	var line string
 	if errCount == 0 {

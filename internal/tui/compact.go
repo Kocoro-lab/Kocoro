@@ -120,7 +120,7 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 }
 
 func formatCompactResult(msg compactDoneMsg) string {
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 	var sb strings.Builder
 	sb.WriteString(dimStyle.Render(fmt.Sprintf("  Context compressed: ~%s → ~%s tokens",
 		formatTokenCount(msg.beforeTokens), formatTokenCount(msg.afterTokens))))

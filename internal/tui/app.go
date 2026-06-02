@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -110,6 +111,14 @@ type streamOutputMsg struct {
 	raw  string // original markdown text (empty for plain text)
 }
 
+// streamDeltaMsg carries an incremental token fragment of the in-flight LLM
+// answer. Unlike streamOutputMsg it is NOT committed to scrollback — it feeds a
+// transient live-preview region (m.streamLive) shown under the spinner while a
+// run is processing, then cleared when the segment finalizes into scrollback.
+type streamDeltaMsg struct {
+	delta string
+}
+
 // outputBlock stores both raw and rendered text so output can be re-rendered on resize.
 type outputBlock struct {
 	raw      string                 // original markdown (empty for plain text)
@@ -170,6 +179,7 @@ type Model struct {
 	textarea            textarea.Model
 	output              []outputBlock
 	pendingPrints       []string
+	streamLive          string // transient live-preview of the in-flight answer (not yet in scrollback)
 	processingStartTime time.Time
 	spinnerIdx          int
 	spinnerTexts        []string
@@ -206,6 +216,7 @@ type Model struct {
 	menuVisible   bool
 	menuIndex     int
 	menuItems     []slashCmd
+	menuMatchPos  [][]int // per-item matched rune indices in cmd, aligned with menuItems
 	// Startup header animation
 	headerFrame     int
 	headerDone      bool
@@ -304,9 +315,14 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		width = w
 	}
 
+	// Detect terminal background NOW, before tea.NewProgram grabs stdin, so the
+	// OSC 11 reply isn't swallowed by the event loop. Drives both the adaptive
+	// palette and the markdown renderer's light/dark selection.
+	warmBackgroundColor()
+
 	ta := textarea.New()
 	ta.Placeholder = "Type a message or /help..."
-	promptStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	promptStyle := lipgloss.NewStyle().Foreground(colorInfo)
 	ta.SetPromptFunc(2, func(lineIdx int) string {
 		if lineIdx == 0 {
 			return promptStyle.Render("> ")
@@ -511,7 +527,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		// Default agent: only the global list applies.
 		loop.SetAlwaysAllowTools(runtimeCfg.Permissions.AlwaysAllowTools)
 	}
-	loop.SetEnableStreaming(true) // streaming enabled but deltas are suppressed — only final text rendered
+	loop.SetEnableStreaming(true) // deltas feed the live preview (OnStreamDelta); final answer rendered on agentDoneMsg
 	loop.SetIdleTimeouts(runtimeCfg.Agent.IdleSoftTimeoutSecs, runtimeCfg.Agent.IdleHardTimeoutSecs)
 
 	settings := config.LoadSettings()
@@ -849,6 +865,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case tea.KeyEscape:
 			if m.state == stateProcessing || m.state == stateApproval {
+				m.streamLive = "" // drop any in-flight preview on cancel
 				if m.cancelRun != nil {
 					m.cancelRun()
 					m.cancelRun = nil
@@ -865,7 +882,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// RunMessages be saved by runAgentLoop when it completes.
 				// This preserves tool calls and partial responses so the
 				// next run has full context of what happened before cancel.
-				cancelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+				cancelStyle := lipgloss.NewStyle().Foreground(colorDim)
 				m.appendOutput(cancelStyle.Render("  [Cancelled]"))
 				m.state = stateInput
 				return m, m.rerenderOutput()
@@ -1114,6 +1131,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.state = stateInput
+		m.streamLive = "" // final answer is rendered to scrollback below
 		m.cancelRun = nil
 		m.injectCh = nil
 		if msg.err != nil && !errors.Is(msg.err, context.Canceled) && !errors.Is(msg.err, agent.ErrMaxIterReached) {
@@ -1132,7 +1150,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// and rendered above, but the run ended early. Show a dim hint,
 			// not a red error.
 			if msg.err == nil && msg.status.Partial && msg.status.FailureCode == runstatus.CodeIterationLimit {
-				dim := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Italic(true)
+				dim := lipgloss.NewStyle().Foreground(colorDim).Italic(true)
 				m.appendOutput(dim.Render("  Stopped early after repeated failed attempts."))
 			}
 		}
@@ -1143,7 +1161,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Don't show usage/elapsed for cancelled tasks
 		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) {
 			elapsed := formatElapsed(time.Since(m.processingStartTime))
-			usageDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+			usageDim := lipgloss.NewStyle().Foreground(colorDim)
 			// Prefer session's cumulative usage (captures direct LLM + cloud_delegate
 			// nested LLM calls) over msg.usage (direct LLM only from loop.Run).
 			var sessionUsage *session.UsageSummary
@@ -1195,8 +1213,8 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.state = stateApproval
-		dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-		warnIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("?")
+		dimStyle := lipgloss.NewStyle().Foreground(colorDim)
+		warnIcon := lipgloss.NewStyle().Foreground(colorWarn).Render("?")
 		keyArg := toolKeyArg(msg.tool, msg.args)
 		m.appendOutput(dimStyle.Render(fmt.Sprintf("⏵ %s(%s)  %s  Allow? [y/n/a]", msg.tool, keyArg, warnIcon)))
 		// Full repaint on state transition to avoid cursor mis-positioning
@@ -1239,7 +1257,19 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendOutput("")
 		return m, nil
 
+	case streamDeltaMsg:
+		// Accumulate the in-flight answer into the transient preview region.
+		// Not committed to scrollback — agentDoneMsg renders the final answer.
+		// Bound to a tail: the preview only shows the last streamPreviewLines, so
+		// there's no need to retain (and re-split every View) a 100K-char answer.
+		m.streamLive = boundStreamTail(m.streamLive + msg.delta)
+		return m, nil
+
 	case streamOutputMsg:
+		// Something is being committed to scrollback (a preamble, a status, or a
+		// cloud delta); the live preview for the just-finished segment is now
+		// redundant — drop it so it can't duplicate.
+		m.streamLive = ""
 		if msg.raw != "" {
 			m.appendMarkdownOutput(msg.raw, msg.text)
 		} else {
@@ -1248,6 +1278,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case toolCallMsg:
+		m.streamLive = ""
 		m.pendingToolName = msg.name
 		m.pendingToolArgs = msg.args
 		// Advance spinner phrase on real events
@@ -1255,6 +1286,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case toolResultMsg:
+		m.streamLive = ""
 		// Prefer the result event's own (name, args) — they are paired with the
 		// specific tool_use_id that produced this result. The pendingTool*
 		// scalars are a singleton-style spinner hint and would mis-pair when
@@ -1269,7 +1301,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			toolArgs = m.pendingToolArgs
 		}
 		if toolName == "think" {
-			dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+			dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 			m.appendOutput(dimStyle.Render(msg.content))
 		} else {
 			m.appendOutput(formatCompactToolResult(toolName, toolArgs, msg.isError, msg.content, msg.elapsed))
@@ -1329,10 +1361,78 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// streamPreviewLines bounds the height of the in-flight answer preview. Small
+// on purpose: it is a transient "being typed" hint under the spinner, not a
+// scrollback replacement (the full answer is rendered on completion). Override:
+// none today — bump if the live region feels too cramped.
+const streamPreviewLines = 8
+
+// streamLiveMaxBytes caps the retained preview buffer. Only the last
+// streamPreviewLines are ever shown, so there's no point keeping (and
+// re-splitting each frame) more than a few screenfuls of a long answer.
+const streamLiveMaxBytes = 8192
+
+// boundStreamTail trims s to its last streamLiveMaxBytes, cut at a line boundary
+// so the preview never starts mid-line. Keeps streamPreview's per-frame work
+// O(streamLiveMaxBytes) regardless of total answer length.
+func boundStreamTail(s string) string {
+	if len(s) <= streamLiveMaxBytes {
+		return s
+	}
+	tail := s[len(s)-streamLiveMaxBytes:]
+	if i := strings.IndexByte(tail, '\n'); i >= 0 {
+		return tail[i+1:]
+	}
+	return tail
+}
+
+// streamPreview returns the last maxLines lines of the in-flight stream, each
+// truncated to the terminal width and dimmed. It deliberately truncates rather
+// than wraps so the live region stays a fixed height instead of ballooning.
+func streamPreview(text string, width, maxLines int) string {
+	text = strings.TrimRight(text, "\n")
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	dim := styleDim()
+	var sb strings.Builder
+	for i, ln := range lines {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		if width > 0 {
+			ln = truncateCells(ln, width, "…")
+		}
+		sb.WriteString(dim.Render(ln))
+	}
+	return sb.String()
+}
+
+// composeBar renders a full-width status separator with optional captions
+// embedded at its left and right ends: <left>────────<right>. Both captions may
+// already be ANSI-styled; the fill uses the faint separator color. Width is
+// measured with lipgloss.Width so CJK/ANSI is accounted for.
+func composeBar(width int, left, right string) string {
+	if width < 0 {
+		width = 0
+	}
+	fill := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if fill < 0 {
+		// Captions can't both fit; fall back to a plain full-width separator so
+		// the bar never overflows and wraps the input line on narrow terminals.
+		return styleFaint().Render(strings.Repeat("─", width))
+	}
+	return left + styleFaint().Render(strings.Repeat("─", fill)) + right
+}
+
 func (m *Model) View() string {
 	var sb strings.Builder
 
-	barStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("237"))
+	barStyle := lipgloss.NewStyle().Foreground(colorFaint)
 	bar := barStyle.Render(strings.Repeat("─", m.width))
 
 	// --- Input / status line ---
@@ -1344,20 +1444,24 @@ func (m *Model) View() string {
 		sb.WriteString("\n")
 		sb.WriteString(m.textarea.View())
 		sb.WriteString("\n")
-		// Bottom bar with right-aligned model tier
-		tierDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-		rightInfo := tierDim.Render(m.modelDisplayLabel())
-		barWidth := m.width - lipgloss.Width(rightInfo)
-		if barWidth < 0 {
-			barWidth = 0
-		}
-		sb.WriteString(barStyle.Render(strings.Repeat("─", barWidth)) + rightInfo)
+		// Bottom bar: left hint (slash commands are discoverable by typing "/")
+		// + right-aligned model tier.
+		leftHint := styleDim().Render(" / commands")
+		rightInfo := styleDim().Render(m.modelDisplayLabel())
+		sb.WriteString(composeBar(m.width, leftHint, rightInfo))
 	case stateProcessing:
+		// Live preview of the answer being generated (transient; the finalized
+		// answer is rendered to scrollback on agentDoneMsg). Shown above the
+		// spinner so the user sees real-time progress instead of a frozen dot.
+		if preview := streamPreview(m.streamLive, m.width, streamPreviewLines); preview != "" {
+			sb.WriteString(preview)
+			sb.WriteString("\n")
+		}
 		if m.pendingToolName != "" {
 			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
 			color := spinColors[m.colorIdx%len(spinColors)]
 			glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
-			dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+			dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 			keyArg := toolKeyArg(m.pendingToolName, m.pendingToolArgs)
 			sb.WriteString(glyphStyle.Render(glyph) + dimStyle.Render(fmt.Sprintf(" %s(%s)", m.pendingToolName, keyArg)))
 		} else {
@@ -1368,23 +1472,27 @@ func (m *Model) View() string {
 			sb.WriteString(glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx))
 		}
 		sb.WriteString("\n")
-		// Bottom status bar with model tier + execution timer
+		// Bottom status bar: left "esc to interrupt" hint (cancelling a run is
+		// otherwise undiscoverable) + right model tier and execution timer.
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
-		tierDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-		rightInfo := tierDim.Render(m.modelDisplayLabel() + " " + elapsed)
-		statusBarWidth := m.width - lipgloss.Width(rightInfo)
-		if statusBarWidth < 0 {
-			statusBarWidth = 0
-		}
-		sb.WriteString(barStyle.Render(strings.Repeat("─", statusBarWidth)) + rightInfo + "\n")
+		leftHint := styleDim().Render(" esc to interrupt")
+		rightInfo := styleDim().Render(m.modelDisplayLabel() + " " + elapsed)
+		sb.WriteString(composeBar(m.width, leftHint, rightInfo) + "\n")
 	case stateApproval:
 		sb.WriteString(bar)
 		sb.WriteString("\n")
-		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("  [y/n/a] "))
+		// Labeled keys instead of a bare "[y/n/a]" so non-technical users know
+		// what each choice does.
+		keyStyle := lipgloss.NewStyle().Foreground(colorWarn).Bold(true)
+		labelStyle := styleDim()
+		sb.WriteString("  " +
+			keyStyle.Render("[y]") + labelStyle.Render(" approve   ") +
+			keyStyle.Render("[n]") + labelStyle.Render(" deny   ") +
+			keyStyle.Render("[a]") + labelStyle.Render(" always allow"))
 		sb.WriteString("\n")
 		sb.WriteString(bar)
 	case stateSessionPicker:
-		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("  Sessions (Up/Down, Enter, Esc)"))
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  Sessions (Up/Down, Enter, Esc)"))
 	}
 
 	// --- Dropdown (only when visible) ---
@@ -1426,7 +1534,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.historyIdx = -1
 	m.historySaved = ""
 
-	promptMark := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Render(">")
+	promptMark := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 	m.appendOutput(fmt.Sprintf("%s %s", promptMark, input))
 
 	// Check slash commands
@@ -1453,6 +1561,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// Local agent loop
 	m.state = stateProcessing
 	m.lastToolResults = nil
+	// Reset any live preview before the new run streams into it: a previous
+	// run's late OnStreamDelta (drained after its Esc-cancel) can re-seed
+	// streamLive, and clearing only on Esc would let that stale tail show as
+	// this run's preview until the first commit boundary.
+	m.streamLive = ""
 	m.processingStartTime = time.Now()
 	sess := m.sessions.Current()
 	// Set title from first user message
@@ -1589,7 +1702,7 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 	m.appendOutput("")
 
 	if m.program == nil {
-		pm := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Render(">")
+		pm := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 		for _, msg := range messages {
 			switch msg.Role {
 			case "user":
@@ -1604,7 +1717,7 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 	}
 
 	go func() {
-		pm := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Render(">")
+		pm := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 		for _, msg := range messages {
 			switch msg.Role {
 			case "user":
@@ -1729,28 +1842,38 @@ func spinnerTick() tea.Cmd {
 	})
 }
 
-// renderWaveText renders text with a shimmer effect.
-// Base color 76 (frog green) with a 3-char-wide highlight at
-// 82 (bright lime) that sweeps across the text.
+// shimmer endpoints: resting green → bright lime peak, interpolated in RGB so
+// the highlight glows on and off smoothly instead of snapping between two ANSI
+// indices. lipgloss downsamples to 256/16-color on terminals without truecolor.
+var (
+	shimmerBase = [3]int{0x3A, 0x9A, 0x3A}
+	shimmerPeak = [3]int{0xC6, 0xF0, 0x8C}
+)
+
+// renderWaveText renders text with a soft highlight that sweeps across it. Each
+// character's brightness follows a gaussian falloff from the moving center, so
+// the glow ramps up and down (a raised-cosine "breathing" wave) rather than the
+// old hard 1-character on/off step.
 func renderWaveText(text string, tick int) string {
 	runes := []rune(text)
-	if len(runes) == 0 {
+	n := len(runes)
+	if n == 0 {
 		return ""
 	}
-	waveCenter := tick % (len(runes) + 4)
-	baseStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("76"))
-	shimmerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
+	// A tail gap (period > n) lets the highlight fully exit before restarting.
+	period := n + 6
+	center := float64(tick % period)
+	const sigma = 2.2 // highlight half-width, in characters
+
 	var sb strings.Builder
 	for i, r := range runes {
-		dist := waveCenter - i
-		if dist < 0 {
-			dist = -dist
-		}
-		if dist <= 1 {
-			sb.WriteString(shimmerStyle.Render(string(r)))
-		} else {
-			sb.WriteString(baseStyle.Render(string(r)))
-		}
+		d := center - float64(i)
+		t := math.Exp(-(d * d) / (2 * sigma * sigma)) // falloff in [0,1]
+		cr := shimmerBase[0] + int(float64(shimmerPeak[0]-shimmerBase[0])*t)
+		cg := shimmerBase[1] + int(float64(shimmerPeak[1]-shimmerBase[1])*t)
+		cb := shimmerBase[2] + int(float64(shimmerPeak[2]-shimmerBase[2])*t)
+		hex := fmt.Sprintf("#%02X%02X%02X", cr, cg, cb)
+		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(hex)).Render(string(r)))
 	}
 	return sb.String()
 }
@@ -2019,7 +2142,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		if m.toolRegistry != nil {
 			toolCount = m.toolRegistry.Len()
 		}
-		dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+		dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 		m.appendOutput(dimStyle.Render(fmt.Sprintf(
 			"  Version:     %s\n"+
 				"  Model:       %s\n"+
@@ -2491,10 +2614,20 @@ func (h *tuiEventHandler) OnPreamble(text string) {
 }
 
 func (h *tuiEventHandler) OnStreamDelta(delta string) {
-	// Suppressed for local LLM streaming (View shows thinking indicator, OnText renders final).
-	// cloud_delegate sets cloudStreaming=true so its events render in real time.
-	if h.cloudStreaming && delta != "" {
+	if delta == "" {
+		return
+	}
+	// cloud_delegate streams its nested run's text straight into scrollback.
+	if h.cloudStreaming {
 		h.model.sendOutput(delta)
+		return
+	}
+	// Local LLM: feed the transient live-preview region so the answer is seen
+	// growing in real time instead of appearing all at once when the turn ends.
+	// The finalized answer is still rendered to scrollback by agentDoneMsg; the
+	// preview is cleared at every commit boundary so it never duplicates.
+	if h.model.program != nil {
+		h.model.program.Send(streamDeltaMsg{delta: delta})
 	}
 }
 
@@ -2591,29 +2724,155 @@ func (m *Model) updateMenu() {
 	if !strings.HasPrefix(input, "/") || strings.Contains(input, " ") {
 		m.menuVisible = false
 		m.menuItems = nil
+		m.menuMatchPos = nil
 		m.menuIndex = 0
 		return
 	}
 
-	var matches []slashCmd
+	// Two tiers: exact prefix matches first (the common case), then looser
+	// subsequence matches so a typo'd or abbreviated "/rsch" still finds
+	// "/research". Declaration order is preserved within each tier.
+	lowIn := strings.ToLower(input)
+	inRunes := len([]rune(input))
+	var prefix, fuzzy []slashCmd
+	var prefixPos, fuzzyPos [][]int
 	for _, c := range m.slashCommands {
-		if strings.HasPrefix(c.cmd, input) {
-			matches = append(matches, c)
+		if strings.HasPrefix(strings.ToLower(c.cmd), lowIn) {
+			// The matched run is the first inRunes runes of c.cmd. This relies on
+			// slash-command names being ASCII (lowercasing preserves rune count
+			// and indices); the builtin + custom command set satisfies that.
+			pos := make([]int, inRunes)
+			for i := range pos {
+				pos[i] = i
+			}
+			prefix = append(prefix, c)
+			prefixPos = append(prefixPos, pos)
+			continue
+		}
+		// Only loosen to subsequence matching once enough has been typed to
+		// disambiguate; at 1 char after "/" it would flood with noise (e.g.
+		// "/r" matching "/clear"). Typos worth recovering happen later anyway.
+		if inRunes >= 3 {
+			if pos, ok := fuzzySubsequence(input, c.cmd); ok {
+				fuzzy = append(fuzzy, c)
+				fuzzyPos = append(fuzzyPos, pos)
+			}
 		}
 	}
-	m.menuItems = matches
-	m.menuVisible = len(matches) > 0
-	if m.menuIndex >= len(matches) {
+	m.menuItems = append(prefix, fuzzy...)
+	m.menuMatchPos = append(prefixPos, fuzzyPos...)
+	m.menuVisible = len(m.menuItems) > 0
+	if m.menuIndex >= len(m.menuItems) {
 		m.menuIndex = 0
 	}
+}
+
+// fuzzySubsequence reports whether pattern appears in target as an ordered,
+// case-insensitive subsequence, returning the matched rune indices in target.
+func fuzzySubsequence(pattern, target string) ([]int, bool) {
+	if pattern == "" {
+		return nil, true
+	}
+	p := []rune(strings.ToLower(pattern))
+	t := []rune(strings.ToLower(target))
+	pos := make([]int, 0, len(p))
+	pi := 0
+	for ti := 0; ti < len(t) && pi < len(p); ti++ {
+		if t[ti] == p[pi] {
+			pos = append(pos, ti)
+			pi++
+		}
+	}
+	if pi == len(p) {
+		return pos, true
+	}
+	return nil, false
 }
 
 const dropListSize = 5
 
 func (m *Model) renderMenu() string {
-	return renderDropList(dropListSize, len(m.menuItems), m.menuIndex, func(i int) (string, string) {
-		return m.menuItems[i].cmd, m.menuItems[i].desc
+	return renderHighlightedList(dropListSize, len(m.menuItems), m.menuIndex, func(i int) (string, string, []int) {
+		var pos []int
+		if i < len(m.menuMatchPos) {
+			pos = m.menuMatchPos[i]
+		}
+		return m.menuItems[i].cmd, m.menuItems[i].desc, pos
 	})
+}
+
+// renderHighlightedList is renderDropList plus per-character match highlighting:
+// the runes at pos (rune indices in label) are drawn bold/accented so fuzzy
+// hits stand out. Windowing/padding matches renderDropList for layout stability.
+func renderHighlightedList(maxVisible, total, selected int, item func(i int) (label, desc string, pos []int)) string {
+	if total == 0 {
+		return strings.Repeat("\n", maxVisible)
+	}
+
+	baseLabel := styleDim()
+	selLabel := lipgloss.NewStyle().Foreground(colorSecondary)
+	matchStyle := lipgloss.NewStyle().Foreground(colorSelect).Bold(true)
+	descStyle := styleDim()
+	selDescStyle := lipgloss.NewStyle().Foreground(colorSelectDesc)
+
+	visible := total
+	if visible > maxVisible {
+		visible = maxVisible
+	}
+	start := 0
+	if selected >= maxVisible {
+		start = selected - maxVisible + 1
+	}
+	if start+visible > total {
+		start = total - visible
+	}
+	if start < 0 {
+		start = 0
+	}
+
+	var sb strings.Builder
+	for i := start; i < start+visible; i++ {
+		label, desc, pos := item(i)
+		labelBase := baseLabel
+		ds := descStyle
+		marker := "    "
+		if i == selected {
+			labelBase = selLabel
+			ds = selDescStyle
+			marker = "  > "
+		}
+		styledLabel := highlightChars(label, pos, labelBase, matchStyle)
+		padWidth := 16 - lipgloss.Width(label)
+		if padWidth < 1 {
+			padWidth = 1
+		}
+		sb.WriteString(marker + styledLabel + strings.Repeat(" ", padWidth) + ds.Render(desc) + "\n")
+	}
+	for i := visible; i < maxVisible; i++ {
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// highlightChars renders label with the runes at the given indices drawn in hi
+// and the rest in base.
+func highlightChars(label string, pos []int, base, hi lipgloss.Style) string {
+	if len(pos) == 0 {
+		return base.Render(label)
+	}
+	want := make(map[int]bool, len(pos))
+	for _, p := range pos {
+		want[p] = true
+	}
+	var sb strings.Builder
+	for i, r := range []rune(label) {
+		if want[i] {
+			sb.WriteString(hi.Render(string(r)))
+		} else {
+			sb.WriteString(base.Render(string(r)))
+		}
+	}
+	return sb.String()
 }
 
 // renderDropList renders a scrollable drop-down list with a fixed visible window.
@@ -2624,9 +2883,9 @@ func renderDropList(maxVisible, total, selected int, item func(i int) (label, de
 		return strings.Repeat("\n", maxVisible)
 	}
 
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-	highlightLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true)
-	highlightDesc := lipgloss.NewStyle().Foreground(lipgloss.Color("146"))
+	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
+	highlightLabel := lipgloss.NewStyle().Foreground(colorSelect).Bold(true)
+	highlightDesc := lipgloss.NewStyle().Foreground(colorSelectDesc)
 
 	// Calculate sliding window
 	visible := total
@@ -2785,17 +3044,15 @@ func formatTokenCount(n int) string {
 	return fmt.Sprintf("%d,%03d", n/1000, n%1000)
 }
 
+// truncate caps s to max DISPLAY CELLS (not runes), so CJK/wide text is
+// measured correctly. The "..." suffix counts toward the budget.
 func truncate(s string, max int) string {
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max]) + "..."
+	return truncateCells(s, max, "...")
 }
 
 func formatPermissions(p *permissions.PermissionsConfig) string {
 	var sb strings.Builder
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 
 	sb.WriteString(dimStyle.Render("  Allowed commands:") + "\n")
 	if len(p.AllowedCommands) == 0 {
