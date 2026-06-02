@@ -2715,9 +2715,14 @@ func (m *Model) updateMenu() {
 			prefixPos = append(prefixPos, pos)
 			continue
 		}
-		if pos, ok := fuzzySubsequence(input, c.cmd); ok {
-			fuzzy = append(fuzzy, c)
-			fuzzyPos = append(fuzzyPos, pos)
+		// Only loosen to subsequence matching once enough has been typed to
+		// disambiguate; at 1 char after "/" it would flood with noise (e.g.
+		// "/r" matching "/clear"). Typos worth recovering happen later anyway.
+		if inRunes >= 3 {
+			if pos, ok := fuzzySubsequence(input, c.cmd); ok {
+				fuzzy = append(fuzzy, c)
+				fuzzyPos = append(fuzzyPos, pos)
+			}
 		}
 	}
 	m.menuItems = append(prefix, fuzzy...)
