@@ -412,17 +412,16 @@ func (sc *SessionCache) InjectMessage(key string, msg agent.InjectedMessage) Inj
 	if key == "" {
 		return InjectNoActiveRun
 	}
+	// Normalize the request cwd before taking the lock — EvalSymlinks touches the
+	// filesystem and must not run under sc.mu.
+	requestCWD := normalizeCWDForCompare(msg.CWD)
+
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	entry, ok := sc.routes[key]
 	if !ok || entry == nil {
-		sc.mu.Unlock()
 		return InjectNoActiveRun
 	}
-	ch := entry.injectCh
-	done := entry.done
-	activeCWD := entry.activeCWD
-	cancelPending := entry.cancelPending
-	sc.mu.Unlock()
 	// Treat a route mid-cancellation as "no active run" so the caller can
 	// fall through to starting a fresh RunAgent. Without this, Desktop's
 	// interrupt-send (cancel to SSE close to immediate POST /message) races
@@ -430,21 +429,27 @@ func (sc *SessionCache) InjectMessage(key string, msg agent.InjectedMessage) Inj
 	// here while `done` is still non-nil but `cancelPending` is set,
 	// returning InjectBusy 409 to the client and surfacing as "SSE request
 	// failed" on the Desktop toolbar.
-	if cancelPending {
+	if entry.cancelPending {
 		return InjectNoActiveRun
 	}
-	if done == nil {
+	if entry.done == nil {
 		return InjectNoActiveRun
 	}
-	if ch == nil {
+	if entry.injectCh == nil {
 		return InjectBusy
 	}
-	requestCWD := normalizeCWDForCompare(msg.CWD)
-	if requestCWD != "" && requestCWD != normalizeCWDForCompare(activeCWD) {
+	if requestCWD != "" && requestCWD != normalizeCWDForCompare(entry.activeCWD) {
 		return InjectCWDConflict
 	}
+	// Enqueue under sc.mu so the send is atomic with respect to
+	// DrainSurvivorsOrCloseInject: a follow-up racing run teardown either lands
+	// before the drain (reclaimed as a survivor) or observes the closed window
+	// above and returns InjectNoActiveRun — it can never be orphaned on a
+	// detached channel after returning InjectOK. injectCh is buffered with a
+	// non-blocking select, so holding the lock here cannot deadlock against the
+	// loop's drain (which does not take sc.mu).
 	select {
-	case ch <- msg:
+	case entry.injectCh <- msg:
 		return InjectOK
 	default:
 		return InjectQueueFull
@@ -541,6 +546,67 @@ func (sc *SessionCache) ClearRouteRunState(key string) {
 	// the same route.
 	delete(sc.retractedInjects, key)
 	sc.mu.Unlock()
+}
+
+// DrainSurvivorsOrCloseInject is the atomic core of the end_turn drain-race
+// guard. The agent loop calls it when it is about to return: it drains any
+// follow-ups still buffered on the route (delivered via InjectMessage's
+// InjectOK but not yet consumed) and filters out retracted ones, all under
+// sc.mu.
+//
+//   - If non-retracted survivors remain, they are returned and the inject
+//     window stays OPEN: the loop commits them, continues, and re-checks here
+//     on its next end_turn.
+//   - If nothing survives, the inject window is CLOSED in the SAME critical
+//     section (done/injectCh niled). Because InjectMessage now also sends under
+//     sc.mu, a follow-up racing the loop's return either landed before this
+//     drain (and is returned here) or observes the closed window and returns
+//     InjectNoActiveRun — so the caller starts a fresh run instead of orphaning
+//     the message on a channel the loop will never read again.
+//
+// This closes the window that let an InjectOK message strand silently after the
+// run completed (the IM-burst "last follow-up never enters the loop" bug, plus
+// its sibling "the IM card spins forever"). Stateless Cloud/Slack cannot
+// re-queue client-side the way Desktop does, so the guarantee must live here.
+// Retracted follow-ups are reaped (tombstone consumed), not returned. Safe and
+// idempotent on an unknown or already-closed route.
+func (sc *SessionCache) DrainSurvivorsOrCloseInject(key string) []agent.InjectedMessage {
+	if key == "" {
+		return nil
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	entry, ok := sc.routes[key]
+	if !ok || entry == nil || entry.injectCh == nil {
+		return nil
+	}
+	var survivors []agent.InjectedMessage
+	retracted := sc.retractedInjects[key]
+drainLoop:
+	for {
+		select {
+		case m := <-entry.injectCh:
+			if m.ClientMessageID != "" && retracted[m.ClientMessageID] {
+				// Reap the tombstone (one-shot, mirrors ConsumeInjectRetracted)
+				// so a cancelled follow-up is dropped, not re-dispatched.
+				delete(retracted, m.ClientMessageID)
+				continue
+			}
+			survivors = append(survivors, m)
+		default:
+			break drainLoop
+		}
+	}
+	if len(survivors) == 0 {
+		// Nothing left to process — close the window atomically so a follow-up
+		// racing the loop's return falls through to a fresh run instead of
+		// orphaning. Same teardown as ClearRouteRunState.
+		entry.done = nil
+		entry.injectCh = nil
+		entry.activeCWD = ""
+		delete(sc.retractedInjects, key)
+	}
+	return survivors
 }
 
 // RetractInject marks a client_message_id as cancelled for a route. If the

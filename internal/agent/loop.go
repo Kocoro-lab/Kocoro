@@ -766,6 +766,11 @@ type AgentLoop struct {
 	deltaProvider    DeltaProvider
 	injectCh         chan InjectedMessage
 	injectedMessages []string // messages injected during the last Run(); cleared on each Run() call
+	// injectFinalDrainFn, when set, atomically drains + retraction-filters the
+	// route's pending injects and closes the inject window if none survive (see
+	// SetInjectFinalDrainFn). Replaces the racy len(injectCh) peek at the
+	// end_turn drain-race guard.
+	injectFinalDrainFn func() []InjectedMessage
 	// mailboxConsumeFn, when set, is invoked with the mailbox row IDs of any
 	// InjectedMessage entries the loop drained mid-turn. The daemon installs
 	// this hook to mark those rows consumed in SQLite + emit queue.flushed
@@ -1230,6 +1235,32 @@ func (a *AgentLoop) InvalidateWorkingSet() {
 // so multiple messages are batched.
 func (a *AgentLoop) SetInjectCh(ch chan InjectedMessage) {
 	a.injectCh = ch
+}
+
+// SetInjectFinalDrainFn registers the daemon-backed atomic drain used by the
+// end_turn drain-race guard. When the loop is about to return, it calls this
+// instead of peeking len(injectCh): the daemon drains the route's pending
+// injects under its own lock (already retraction-filtered) and, if none survive,
+// closes the inject window in the same critical section so a follow-up racing
+// the return falls through to a fresh run instead of being orphaned on a channel
+// the loop will never read again. Unset (TUI / tests with no route) → the guard
+// falls back to the local filterRetractedInjects(drainInjected).
+func (a *AgentLoop) SetInjectFinalDrainFn(fn func() []InjectedMessage) {
+	a.injectFinalDrainFn = fn
+}
+
+// finalDrainInjected returns the non-retracted follow-ups to commit at the
+// end_turn boundary. Prefers the daemon-backed atomic drain (which also closes
+// the inject window when empty); falls back to the local channel drain when no
+// route is wired.
+func (a *AgentLoop) finalDrainInjected() []InjectedMessage {
+	if a.injectFinalDrainFn != nil {
+		return a.injectFinalDrainFn()
+	}
+	if a.injectCh == nil {
+		return nil
+	}
+	return a.filterRetractedInjects(drainInjected(a.injectCh))
 }
 
 // SetMailboxConsumeFn registers a callback fired with mailbox row IDs
@@ -3767,28 +3798,23 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if a.handler != nil {
 				a.handler.OnText(fullText)
 			}
-			// Drain-race guard: a user message can land in injectCh while the
-			// LLM is composing this "I'm done" reply. If we return now, the
-			// queued message strands in the mailbox until the next manual
-			// /run — leaving the UI's queue card visibly stuck even though the
-			// run completed. Continuing into another iteration lets the
-			// top-of-loop drain pick it up and respond in the same turn.
-			//
-			// Only continue for NON-retracted input, though: peeking raw
-			// len(injectCh) also counts a follow-up the client already retracted
-			// (the tombstone is applied at drain, not removed from the channel),
-			// and continuing for that re-issues the LLM call and emits a
-			// duplicate final answer (the cancelled-follow-up duplicate-reply
-			// bug). Drain+filter, then commit survivors INLINE via
-			// commitInjectedTurn so the follow-up is recorded even if the very
-			// next iteration trips the maxIter cap — steering injects have no
-			// mailbox backing to replay. commitInjectedTurn returns false for an
-			// empty/all-retracted batch, so we keep the turn alive only when a
-			// real follow-up survived.
-			if a.injectCh != nil && len(a.injectCh) > 0 {
-				if survivors := a.filterRetractedInjects(drainInjected(a.injectCh)); commitInjectedTurn(survivors) {
-					continue
-				}
+			// Drain-race guard: a follow-up can land in injectCh while the LLM is
+			// composing this "I'm done" reply. Returning on a bare len(injectCh)
+			// peek would strand a message that arrives AFTER the peek but before
+			// route teardown on a detached channel — the IM-burst "last follow-up
+			// never enters the loop" bug (and the "card spins forever" sibling).
+			// finalDrainInjected closes that window: with a route wired it
+			// drains + retraction-filters under the daemon's lock and, when nothing
+			// survives, closes the inject window in the SAME critical section, so a
+			// racing follow-up falls through to a fresh run. Retracted follow-ups
+			// are filtered out, so a cancelled message never re-issues the LLM call
+			// (the duplicate-final-answer bug). commitInjectedTurn returns false for
+			// an empty/all-retracted batch, so the turn stays alive only when a real
+			// follow-up survived — and survivors are committed INLINE so they're
+			// recorded even if the next iteration trips the maxIter cap (steering
+			// injects have no mailbox backing to replay).
+			if survivors := a.finalDrainInjected(); commitInjectedTurn(survivors) {
+				continue
 			}
 			return fullText, usage, nil
 		}
