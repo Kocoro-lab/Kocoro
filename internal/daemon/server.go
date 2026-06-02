@@ -999,6 +999,7 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 
 	type agentInfo struct {
 		Name         string `json:"name"`
+		DisplayName  string `json:"display_name"` // falls back to Name when unset
 		Builtin      bool   `json:"builtin"`
 		Override     bool   `json:"override"`
 		HasMemory    bool   `json:"has_memory"`
@@ -1021,6 +1022,7 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		skillFiles, _ := filepath.Glob(filepath.Join(dir, "skills", "*", "SKILL.md"))
 		result = append(result, agentInfo{
 			Name:         entry.Name,
+			DisplayName:  entry.DisplayName,
 			Builtin:      entry.Builtin,
 			Override:     entry.Override,
 			HasMemory:    memErr == nil,

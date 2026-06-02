@@ -2840,6 +2840,61 @@ func TestServer_DisplayName_AutoSlug(t *testing.T) {
 	}
 }
 
+// TestServer_DisplayName_ListIncludesIt verifies GET /agents (the list endpoint,
+// which uses its own DTO) surfaces display_name per entry.
+func TestServer_DisplayName_ListIncludesIt(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+
+	resp, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"display_name":"客服助手","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	listResp, err := http.Get(base + "/agents")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listResp.Body.Close()
+	var list struct {
+		Agents []struct {
+			Name        string `json:"name"`
+			DisplayName string `json:"display_name"`
+		} `json:"agents"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	var got string
+	for _, a := range list.Agents {
+		if a.Name == created.Name {
+			got = a.DisplayName
+		}
+	}
+	if got != "客服助手" {
+		t.Errorf("list entry display_name = %q, want %q", got, "客服助手")
+	}
+}
+
 // TestServer_DisplayName_CreateDuplicate verifies that creating a second agent
 // with an already-taken display_name returns 409.
 func TestServer_DisplayName_CreateDuplicate(t *testing.T) {
