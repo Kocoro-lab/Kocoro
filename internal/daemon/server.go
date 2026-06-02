@@ -42,17 +42,17 @@ import (
 )
 
 type Server struct {
-	port                   int
-	client                 *Client
-	deps                   *ServerDeps
-	server                 *http.Server
-	listenerMu             sync.Mutex // protects listener
-	listener               net.Listener
-	version                string
-	ctx                    context.Context // daemon lifecycle context, set on Start
-	cancel                 context.CancelFunc
-	approvalBroker         *ApprovalBroker
-	eventBus               *EventBus
+	port           int
+	client         *Client
+	deps           *ServerDeps
+	server         *http.Server
+	listenerMu     sync.Mutex // protects listener
+	listener       net.Listener
+	version        string
+	ctx            context.Context // daemon lifecycle context, set on Start
+	cancel         context.CancelFunc
+	approvalBroker *ApprovalBroker
+	eventBus       *EventBus
 	// notifyApprovalResolved is set once at startup (SetApprovalResolvedNotifier,
 	// before the WS connects or any approval can fire) and read without a lock
 	// from both the /approval handler and every cleanup-notify goroutine. Safe
@@ -490,6 +490,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /approval", s.handleApproval)
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
 	mux.HandleFunc("POST /message", s.handleMessage)
+	mux.HandleFunc("POST /inject/retract", s.handleRetractInject)
 	mux.HandleFunc("POST /cancel", s.handleCancel)
 	// Per-route mailbox (see references/queue.md and references/cancel.md).
 	mux.HandleFunc("POST /queue", s.handleEnqueueQueue)
@@ -1599,34 +1600,31 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try injecting into an in-flight run on the same route.
-	// Attachment-bearing messages cannot be injected because InjectedMessage
-	// is a Text/CWD-only envelope; silently dropping req.Content would mean
-	// the LLM sees an attachment-shaped UI chip on Desktop but receives only
-	// the text in its turn. So reject 409 — but ONLY when an active run
-	// actually exists for this route. Without an active run we fall through
-	// to the normal session-start path below; that path consumes req.Content
-	// correctly. The Desktop client always carries a RouteKey on every send
-	// (including new sessions), so gating on RouteKey alone misroutes fresh
-	// requests through the inject path.
+	// Try injecting into an in-flight run on the same route. Both plain-text
+	// and attachment-bearing follow-ups inject: req.Content is lowered to
+	// InjectedMessage.Files via contentBlocksToInjected (reusing
+	// resolveContentBlocks for image compression / file_ref disk reads /
+	// document passthrough). When no active run exists we fall through to the
+	// normal session-start path below, which consumes req.Content via
+	// resolveContentBlocks. The Desktop client always carries a RouteKey on
+	// every send (including new sessions), so gate on an actual active run —
+	// not RouteKey alone — to avoid misrouting fresh requests through inject.
 	if req.RouteKey != "" {
-		if len(req.Content) > 0 {
-			if s.deps.SessionCache.HasActiveRun(req.RouteKey) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusConflict)
-				json.NewEncoder(w).Encode(map[string]string{
-					"status": "rejected",
-					"reason": "active_run_not_ready",
-					"route":  req.RouteKey,
-					"detail": "attachments cannot be injected into an in-flight run; retry after current turn",
-				})
-				return
+		if s.deps.SessionCache.HasActiveRun(req.RouteKey) {
+			injectText := req.Text
+			var injectFiles []agent.InjectedFile
+			if len(req.Content) > 0 {
+				ctext, cfiles := contentBlocksToInjected(req.Content)
+				injectFiles = cfiles
+				if ctext != "" {
+					if injectText != "" {
+						injectText += "\n\n" + ctext
+					} else {
+						injectText = ctext
+					}
+				}
 			}
-			// No active run on this route — skip the inject attempt and let
-			// the normal session-start path below handle it (it will pick up
-			// req.Content via resolveContentBlocks).
-		} else {
-			switch s.deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{Text: req.Text, CWD: req.CWD}) {
+			switch s.deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{Text: injectText, CWD: req.CWD, Files: injectFiles, ClientMessageID: req.ClientMessageID}) {
 			case InjectOK:
 				if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 					w.Header().Set("Content-Type", "text/event-stream")
@@ -1672,9 +1670,25 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			case InjectNoActiveRun:
-				// Fall through to start a new RunAgent
+				// Run ended between HasActiveRun and InjectMessage. Fall through;
+				// the inject_only guard below 409s instead of starting a new run.
 			}
 		}
+	}
+
+	// inject_only clients (Desktop busy-state inject) never start a new run: if
+	// we reach here the follow-up could not be injected into an active run (none
+	// present, or it ended mid-request), so 409 and let the client re-queue
+	// locally instead of spawning a duplicate fresh run.
+	if req.InjectOnly {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "rejected",
+			"reason": "no_active_run",
+			"route":  req.RouteKey,
+		})
+		return
 	}
 
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
@@ -1690,6 +1704,62 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
+}
+
+// handleRetractInject marks a previously-injected steering follow-up as
+// cancelled. The Desktop client calls this when the user retracts a queued-draft
+// card whose inject was already sent to the active run (steering inject fires on
+// enqueue, so a cancel can race ahead of the loop's drain). The agent loop drops
+// the matching client_message_id at the next drain boundary so it never reaches
+// the model. No-op-safe: retracting an id the run already drained, or a route
+// with no active run, just leaves a tombstone reaped at run end.
+func (s *Server) handleRetractInject(w http.ResponseWriter, r *http.Request) {
+	if s.deps == nil || s.deps.SessionCache == nil {
+		http.Error(w, `{"error":"daemon deps not configured"}`, http.StatusInternalServerError)
+		return
+	}
+	var req RunAgentRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.ClientMessageID) == "" {
+		writeError(w, http.StatusBadRequest, "client_message_id is required")
+		return
+	}
+	if req.SessionID != "" {
+		if err := ValidateSessionID(req.SessionID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.Source == "" {
+		req.Source = "kocoro"
+	}
+	if req.Agent == "default" {
+		req.Agent = ""
+	}
+	req.EnsureRouteKey()
+	if req.RouteKey == "" {
+		writeError(w, http.StatusBadRequest, "could not resolve a route to retract from")
+		return
+	}
+	// Only tombstone when a run actually owns this route. A retract for a route
+	// with no in-flight run has nothing to cancel (the follow-up was never
+	// injected, or the run already ended and ClearRouteRunState reaped its
+	// state), and recording a tombstone there leaks a retractedInjects entry
+	// that nothing consumes or reaps — the only reaper, ClearRouteRunState,
+	// never fires for a route that had no run. Idempotent either way: retract
+	// is best-effort and the client can't distinguish "cancelled in time" from
+	// "too late".
+	if s.deps.SessionCache.HasActiveRun(req.RouteKey) {
+		s.deps.SessionCache.RetractInject(req.RouteKey, req.ClientMessageID)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":            "retracted",
+		"route":             req.RouteKey,
+		"client_message_id": req.ClientMessageID,
+	})
 }
 
 // handleMessageSSE streams agent events as SSE.
@@ -1949,6 +2019,21 @@ func (h *sseEventHandler) OnToolResult(name string, args string, toolUseID strin
 // `assistant_text` event would duplicate it. Mid-turn preamble flows through
 // OnPreamble below.
 func (h *sseEventHandler) OnText(text string) {}
+
+// OnInjectedCommitted implements agent.InjectCommitHandler: when the loop drains
+// a mid-run injected follow-up into the live turn, emit an injected_committed
+// SSE frame so the Desktop client flips its queued-draft card (keyed by the
+// client-supplied message_id) into a real user bubble at the consume boundary.
+func (h *sseEventHandler) OnInjectedCommitted(clientMessageID, text string) {
+	if clientMessageID == "" {
+		return
+	}
+	data := mustJSON(map[string]string{"message_id": clientMessageID, "text": text})
+	fmt.Fprintf(h.w, "event: %s\ndata: %s\n\n", EventInjectedCommitted, data)
+	if h.flusher != nil {
+		h.flusher.Flush()
+	}
+}
 
 // OnPreamble streams mid-turn agent narration to the per-request SSE client
 // (HTTP POST /messages with stream=true). Mirrors busEventHandler.OnPreamble

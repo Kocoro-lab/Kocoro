@@ -64,6 +64,28 @@ Phase 4 will populate `attachments` once queued attachments ship; until then the
 
 `QueryGuard.ForceEnd()` is invoked alongside `cancel(reason)` so that stale finalizers from the cancelled run cannot reset state back to `running`.
 
+## `POST /inject/retract` — cancel a single steering follow-up
+
+Distinct from `/cancel` (which kills the whole run): this retracts **one** mid-run injected follow-up by its client-supplied id, without touching the active run. Needed because Desktop's steering inject fires the moment a follow-up is enqueued (so the model sees it at the next iteration boundary), which means a user who then cancels that queued-draft card is racing the loop's drain.
+
+**Request body:**
+
+```json
+{
+  "client_message_id": "string (required)",
+  "session_id": "string (or agent — used to resolve the route)",
+  "agent": "string (optional)",
+  "source": "desktop",
+  "channel": "string"
+}
+```
+
+**Behavior:** the daemon records the `client_message_id` in a per-route retraction set. The agent loop checks this set at its next drain boundary (the `injected_committed` consume point) and **drops** any matching follow-up, so a cancelled message never becomes a user turn / never reaches the model. One-shot: the tombstone is consumed on the first drain check and reaped at run end (`ClearRouteRunState`). No-op-safe — retracting an id the run already drained, or a route with no active run, just leaves a tombstone that gets cleaned up.
+
+**Status codes:** `200 {status:"retracted", route, client_message_id}`; `400` for missing `client_message_id` or an unresolvable route. There is intentionally **no 404** — retract is idempotent (the caller can't always know whether the loop already drained the message).
+
+**Race boundary:** retract only takes effect while the follow-up is still in `injectCh` (not yet drained). Once drained into a user turn it has reached the model and cannot be unsent — the same fundamental limit as `/cancel` not being able to un-run already-executed tools.
+
 ## Related files
 
 - `internal/daemon/server.go` — `handleCancel`.

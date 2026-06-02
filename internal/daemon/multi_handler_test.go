@@ -176,3 +176,45 @@ func TestMultiHandlerOnRunStatusPropagatesToImplementers(t *testing.T) {
 func TestMultiHandlerSatisfiesRunStatusHandlerInterface(t *testing.T) {
 	var _ agent.RunStatusHandler = (*multiHandler)(nil) // compile-time check
 }
+
+// injectCommitSpy implements agent.InjectCommitHandler (and agent.EventHandler
+// via the embedded usageSpy). Used to verify multiHandler.OnInjectedCommitted
+// propagates via type assertion.
+type injectCommitSpy struct {
+	usageSpy
+	calls []string // "id:text"
+}
+
+func (s *injectCommitSpy) OnInjectedCommitted(clientMessageID, text string) {
+	s.calls = append(s.calls, clientMessageID+":"+text)
+}
+
+// The agent loop reaches the SSE handler via a.handler.(InjectCommitHandler);
+// in production the loop handler is a *multiHandler, so the fan-out must
+// forward to wrapped handlers that implement the interface and skip those that
+// don't. If this propagation breaks, the daemon stops emitting injected_committed
+// and Desktop's queued-draft card never flips into a user bubble.
+func TestMultiHandlerOnInjectedCommittedPropagatesToImplementers(t *testing.T) {
+	ich := &injectCommitSpy{}
+	plain := &plainSpy{}
+	m := &multiHandler{handlers: []agent.EventHandler{ich, plain}}
+
+	m.OnInjectedCommitted("local-1", "summarize to desktop")
+
+	if len(ich.calls) != 1 || ich.calls[0] != "local-1:summarize to desktop" {
+		t.Fatalf("ich.calls = %+v, want [local-1:summarize to desktop]", ich.calls)
+	}
+	// plain has no OnInjectedCommitted — the call must not panic and must not
+	// affect ich. Base fan-out must still work after the typed dispatch.
+	m.OnText("x")
+	if plain.text != 1 {
+		t.Fatalf("plain.text = %d, want 1 — OnInjectedCommitted bypass broke base fan-out", plain.text)
+	}
+}
+
+// Verify multiHandler satisfies agent.InjectCommitHandler so the agent loop's
+// `a.handler.(InjectCommitHandler)` assertion succeeds when the loop handler is
+// a *multiHandler — without it, injected_committed never reaches the SSE handler.
+func TestMultiHandlerSatisfiesInjectCommitHandlerInterface(t *testing.T) {
+	var _ agent.InjectCommitHandler = (*multiHandler)(nil) // compile-time check
+}
