@@ -207,6 +207,7 @@ type Model struct {
 	menuVisible   bool
 	menuIndex     int
 	menuItems     []slashCmd
+	menuMatchPos  [][]int // per-item matched rune indices in cmd, aligned with menuItems
 	// Startup header animation
 	headerFrame     int
 	headerDone      bool
@@ -2620,29 +2621,147 @@ func (m *Model) updateMenu() {
 	if !strings.HasPrefix(input, "/") || strings.Contains(input, " ") {
 		m.menuVisible = false
 		m.menuItems = nil
+		m.menuMatchPos = nil
 		m.menuIndex = 0
 		return
 	}
 
-	var matches []slashCmd
+	// Two tiers: exact prefix matches first (the common case), then looser
+	// subsequence matches so a typo'd or abbreviated "/rsch" still finds
+	// "/research". Declaration order is preserved within each tier.
+	lowIn := strings.ToLower(input)
+	inRunes := len([]rune(input))
+	var prefix, fuzzy []slashCmd
+	var prefixPos, fuzzyPos [][]int
 	for _, c := range m.slashCommands {
-		if strings.HasPrefix(c.cmd, input) {
-			matches = append(matches, c)
+		if strings.HasPrefix(strings.ToLower(c.cmd), lowIn) {
+			pos := make([]int, inRunes)
+			for i := range pos {
+				pos[i] = i
+			}
+			prefix = append(prefix, c)
+			prefixPos = append(prefixPos, pos)
+			continue
+		}
+		if pos, ok := fuzzySubsequence(input, c.cmd); ok {
+			fuzzy = append(fuzzy, c)
+			fuzzyPos = append(fuzzyPos, pos)
 		}
 	}
-	m.menuItems = matches
-	m.menuVisible = len(matches) > 0
-	if m.menuIndex >= len(matches) {
+	m.menuItems = append(prefix, fuzzy...)
+	m.menuMatchPos = append(prefixPos, fuzzyPos...)
+	m.menuVisible = len(m.menuItems) > 0
+	if m.menuIndex >= len(m.menuItems) {
 		m.menuIndex = 0
 	}
+}
+
+// fuzzySubsequence reports whether pattern appears in target as an ordered,
+// case-insensitive subsequence, returning the matched rune indices in target.
+func fuzzySubsequence(pattern, target string) ([]int, bool) {
+	if pattern == "" {
+		return nil, true
+	}
+	p := []rune(strings.ToLower(pattern))
+	t := []rune(strings.ToLower(target))
+	pos := make([]int, 0, len(p))
+	pi := 0
+	for ti := 0; ti < len(t) && pi < len(p); ti++ {
+		if t[ti] == p[pi] {
+			pos = append(pos, ti)
+			pi++
+		}
+	}
+	if pi == len(p) {
+		return pos, true
+	}
+	return nil, false
 }
 
 const dropListSize = 5
 
 func (m *Model) renderMenu() string {
-	return renderDropList(dropListSize, len(m.menuItems), m.menuIndex, func(i int) (string, string) {
-		return m.menuItems[i].cmd, m.menuItems[i].desc
+	return renderHighlightedList(dropListSize, len(m.menuItems), m.menuIndex, func(i int) (string, string, []int) {
+		var pos []int
+		if i < len(m.menuMatchPos) {
+			pos = m.menuMatchPos[i]
+		}
+		return m.menuItems[i].cmd, m.menuItems[i].desc, pos
 	})
+}
+
+// renderHighlightedList is renderDropList plus per-character match highlighting:
+// the runes at pos (rune indices in label) are drawn bold/accented so fuzzy
+// hits stand out. Windowing/padding matches renderDropList for layout stability.
+func renderHighlightedList(maxVisible, total, selected int, item func(i int) (label, desc string, pos []int)) string {
+	if total == 0 {
+		return strings.Repeat("\n", maxVisible)
+	}
+
+	baseLabel := styleDim()
+	selLabel := lipgloss.NewStyle().Foreground(colorSecondary)
+	matchStyle := lipgloss.NewStyle().Foreground(colorSelect).Bold(true)
+	descStyle := styleDim()
+	selDescStyle := lipgloss.NewStyle().Foreground(colorSelectDesc)
+
+	visible := total
+	if visible > maxVisible {
+		visible = maxVisible
+	}
+	start := 0
+	if selected >= maxVisible {
+		start = selected - maxVisible + 1
+	}
+	if start+visible > total {
+		start = total - visible
+	}
+	if start < 0 {
+		start = 0
+	}
+
+	var sb strings.Builder
+	for i := start; i < start+visible; i++ {
+		label, desc, pos := item(i)
+		labelBase := baseLabel
+		ds := descStyle
+		marker := "    "
+		if i == selected {
+			labelBase = selLabel
+			ds = selDescStyle
+			marker = "  > "
+		}
+		styledLabel := highlightChars(label, pos, labelBase, matchStyle)
+		padWidth := 16 - lipgloss.Width(label)
+		if padWidth < 1 {
+			padWidth = 1
+		}
+		sb.WriteString(marker + styledLabel + strings.Repeat(" ", padWidth) + ds.Render(desc) + "\n")
+	}
+	for i := visible; i < maxVisible; i++ {
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// highlightChars renders label with the runes at the given indices drawn in hi
+// and the rest in base.
+func highlightChars(label string, pos []int, base, hi lipgloss.Style) string {
+	if len(pos) == 0 {
+		return base.Render(label)
+	}
+	want := make(map[int]bool, len(pos))
+	for _, p := range pos {
+		want[p] = true
+	}
+	var sb strings.Builder
+	for i, r := range []rune(label) {
+		if want[i] {
+			sb.WriteString(hi.Render(string(r)))
+		} else {
+			sb.WriteString(base.Render(string(r)))
+		}
+	}
+	return sb.String()
 }
 
 // renderDropList renders a scrollable drop-down list with a fixed visible window.
