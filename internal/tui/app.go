@@ -304,6 +304,11 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		width = w
 	}
 
+	// Detect terminal background NOW, before tea.NewProgram grabs stdin, so the
+	// OSC 11 reply isn't swallowed by the event loop. Drives both the adaptive
+	// palette and the markdown renderer's light/dark selection.
+	warmBackgroundColor()
+
 	ta := textarea.New()
 	ta.Placeholder = "Type a message or /help..."
 	promptStyle := lipgloss.NewStyle().Foreground(colorInfo)

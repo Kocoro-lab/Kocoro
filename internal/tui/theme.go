@@ -1,6 +1,35 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"sync"
+
+	"github.com/charmbracelet/lipgloss"
+)
+
+var (
+	darkBgOnce sync.Once
+	darkBg     = true // safe default: matches the historical dark-only look
+)
+
+// isDarkBackground reports whether the terminal has a dark background. Detected
+// once (lazily) via lipgloss and cached. Both the markdown renderer and the
+// AdaptiveColor tokens above resolve against this same lipgloss detection, so a
+// single warm-up keeps them consistent.
+//
+// IMPORTANT: warmBackgroundColor MUST run before Bubbletea grabs stdin (i.e. in
+// New, before tea.NewProgram). lipgloss detects the background by writing an
+// OSC 11 query and reading the reply; once the event loop owns stdin that reply
+// is swallowed and detection silently falls back to dark — leaving light
+// terminals on the unreadable dark palette this whole change set fixes.
+func isDarkBackground() bool {
+	darkBgOnce.Do(func() {
+		darkBg = lipgloss.HasDarkBackground()
+	})
+	return darkBg
+}
+
+// warmBackgroundColor forces background detection now, while stdin is still free.
+func warmBackgroundColor() { _ = isDarkBackground() }
 
 // Centralized semantic color palette.
 //

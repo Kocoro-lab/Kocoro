@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/ansi"
+	"github.com/charmbracelet/glamour/styles"
 )
 
 // Matches 2+ consecutive blank-looking lines (may contain whitespace or ANSI escapes)
@@ -90,11 +91,13 @@ func renderSourcesCompact(entries []sourceEntry, width int) string {
 	return sb.String()
 }
 
-// Cached renderer and the width it was built for.
+// Renderers cached by (width, dark-background). The custom compactStyle below
+// hardcodes light-gray code text (#C4C4C4) and other dark-only colors that are
+// invisible on a white terminal, so light backgrounds get glamour's tuned
+// light style instead. Detection is warmed in New() before Bubbletea starts.
 var (
-	cachedRenderer   *glamour.TermRenderer
-	cachedWidth      int
-	cachedRendererMu sync.RWMutex
+	rendererCache   = map[string]*glamour.TermRenderer{}
+	rendererCacheMu sync.RWMutex
 )
 
 // compactStyle is a compact style: no margins, minimal spacing,
@@ -230,41 +233,56 @@ var compactStyle = ansi.StyleConfig{
 	Table:  ansi.StyleTable{},
 }
 
-// getRenderer returns a glamour renderer sized to the given terminal width.
-// The renderer is cached and only rebuilt when the width changes.
-// Safe to call from multiple goroutines.
+// getRenderer returns a glamour renderer sized to the given terminal width and
+// matched to the terminal background. Cached per (width, dark); rebuilt only on
+// a new combination. Safe to call from multiple goroutines.
 func getRenderer(width int) *glamour.TermRenderer {
 	if width <= 0 {
 		width = 120
 	}
-	cachedRendererMu.RLock()
-	if cachedRenderer != nil && cachedWidth == width {
-		r := cachedRenderer
-		cachedRendererMu.RUnlock()
+	dark := isDarkBackground()
+	key := fmt.Sprintf("%d:%t", width, dark)
+
+	rendererCacheMu.RLock()
+	if r, ok := rendererCache[key]; ok {
+		rendererCacheMu.RUnlock()
 		return r
 	}
-	cachedRendererMu.RUnlock()
+	rendererCacheMu.RUnlock()
 
-	cachedRendererMu.Lock()
-	defer cachedRendererMu.Unlock()
-	// Double-check after acquiring write lock.
-	if cachedRenderer != nil && cachedWidth == width {
-		return cachedRenderer
+	rendererCacheMu.Lock()
+	defer rendererCacheMu.Unlock()
+	if r, ok := rendererCache[key]; ok {
+		return r
 	}
-	styleJSON, err := json.Marshal(compactStyle)
+	r, err := buildRenderer(width, dark)
 	if err != nil {
 		return nil
 	}
-	r, err := glamour.NewTermRenderer(
-		glamour.WithStylesFromJSONBytes(styleJSON),
+	rendererCache[key] = r
+	return r
+}
+
+// buildRenderer constructs a glamour renderer for the given width/background.
+func buildRenderer(width int, dark bool) (*glamour.TermRenderer, error) {
+	if dark {
+		styleJSON, err := json.Marshal(compactStyle)
+		if err != nil {
+			return nil, err
+		}
+		return glamour.NewTermRenderer(
+			glamour.WithStylesFromJSONBytes(styleJSON),
+			glamour.WithWordWrap(width),
+		)
+	}
+	// Light terminal: glamour's tuned light palette (dark text on white), with
+	// the document margin dropped to keep our compact look.
+	light := styles.LightStyleConfig
+	light.Document.Margin = uintPtr(0)
+	return glamour.NewTermRenderer(
+		glamour.WithStyles(light),
 		glamour.WithWordWrap(width),
 	)
-	if err != nil {
-		return nil
-	}
-	cachedRenderer = r
-	cachedWidth = width
-	return r
 }
 
 // renderMarkdown renders markdown text with ANSI styling.
