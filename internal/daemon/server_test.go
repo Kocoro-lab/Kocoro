@@ -3303,3 +3303,113 @@ func TestServer_DisplayName_NestedConfigIgnored(t *testing.T) {
 		t.Errorf("expected display_name %q (nested config value ignored on PUT), got %q", "RealUpdate", dn)
 	}
 }
+
+func TestServer_DisplayName_ConfigMutationsPreserveLabel(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+	resp, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"display_name":"KeepMe","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: expected 201, got %d", resp.StatusCode)
+	}
+
+	cwd := t.TempDir()
+	cfgBody, _ := json.Marshal(map[string]any{
+		"cwd":          cwd,
+		"display_name": "NestedBypass",
+	})
+	req, _ := http.NewRequest(http.MethodPut, base+"/agents/"+created.Name+"/config", bytes.NewReader(cfgBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("PUT config: expected 200, got %d", resp2.StatusCode)
+	}
+	loaded, err := agents.LoadAgent(agentsDir, created.Name)
+	if err != nil {
+		t.Fatalf("load after PUT config: %v", err)
+	}
+	if got := loaded.ToAPI().DisplayName; got != "KeepMe" {
+		t.Fatalf("PUT config changed display_name to %q", got)
+	}
+	if loaded.Config == nil || loaded.Config.CWD != cwd {
+		t.Fatalf("PUT config did not write cwd, config=%+v", loaded.Config)
+	}
+
+	reqDel, _ := http.NewRequest(http.MethodDelete, base+"/agents/"+created.Name+"/config", nil)
+	resp3, err := http.DefaultClient.Do(reqDel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE config: expected 200, got %d", resp3.StatusCode)
+	}
+	loaded, err = agents.LoadAgent(agentsDir, created.Name)
+	if err != nil {
+		t.Fatalf("load after DELETE config: %v", err)
+	}
+	if got := loaded.ToAPI().DisplayName; got != "KeepMe" {
+		t.Fatalf("DELETE config cleared display_name to %q", got)
+	}
+	if loaded.Config == nil || loaded.Config.CWD != "" {
+		t.Fatalf("DELETE config should preserve only display_name, config=%+v", loaded.Config)
+	}
+
+	req, _ = http.NewRequest(http.MethodPut, base+"/agents/"+created.Name+"/config", bytes.NewReader(cfgBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp4, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusOK {
+		t.Fatalf("second PUT config: expected 200, got %d", resp4.StatusCode)
+	}
+	reqClear, _ := http.NewRequest(http.MethodPut, base+"/agents/"+created.Name, strings.NewReader(`{"config":null}`))
+	reqClear.Header.Set("Content-Type", "application/json")
+	resp5, err := http.DefaultClient.Do(reqClear)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp5.Body.Close()
+	if resp5.StatusCode != http.StatusOK {
+		t.Fatalf("PUT config:null: expected 200, got %d", resp5.StatusCode)
+	}
+	loaded, err = agents.LoadAgent(agentsDir, created.Name)
+	if err != nil {
+		t.Fatalf("load after config:null: %v", err)
+	}
+	if got := loaded.ToAPI().DisplayName; got != "KeepMe" {
+		t.Fatalf("config:null cleared display_name to %q", got)
+	}
+	if loaded.Config == nil || loaded.Config.CWD != "" {
+		t.Fatalf("config:null should preserve only display_name, config=%+v", loaded.Config)
+	}
+}

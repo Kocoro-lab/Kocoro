@@ -2768,7 +2768,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Config != nil {
 		if isJSONNull(req.Config) {
-			if err := os.Remove(filepath.Join(agentDir, "config.yaml")); err != nil && !os.IsNotExist(err) {
+			if err := clearAgentConfigPreservingDisplayName(s.deps.AgentsDir, name); err != nil {
 				writeError(w, http.StatusInternalServerError, fmt.Sprintf("delete config: %v", err))
 				return
 			}
@@ -2777,11 +2777,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			// (uniqueness-checked). Preserve the existing on-disk value across a
 			// full config rewrite and ignore any client-supplied
 			// config.display_name, which would otherwise bypass the check.
-			if cur, err := agents.LoadAgent(s.deps.AgentsDir, name); err == nil && cur.Config != nil {
-				parsedConfig.DisplayName = cur.Config.DisplayName
-			} else {
-				parsedConfig.DisplayName = ""
-			}
+			parsedConfig.DisplayName = readAgentConfigDisplayName(s.deps.AgentsDir, name)
 			if err := agents.WriteAgentConfig(s.deps.AgentsDir, name, parsedConfig); err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
@@ -2910,6 +2906,30 @@ func (s *Server) materializeIfBuiltin(w http.ResponseWriter, name string) bool {
 	return true
 }
 
+func readAgentConfigDisplayName(agentsDir, name string) string {
+	data, err := os.ReadFile(filepath.Join(agentsDir, name, "config.yaml"))
+	if err != nil {
+		return ""
+	}
+	var cfg agents.AgentConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return ""
+	}
+	return cfg.DisplayName
+}
+
+func clearAgentConfigPreservingDisplayName(agentsDir, name string) error {
+	displayName := readAgentConfigDisplayName(agentsDir, name)
+	if displayName == "" {
+		path := filepath.Join(agentsDir, name, "config.yaml")
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return agents.WriteAgentConfig(agentsDir, name, &agents.AgentConfigAPI{DisplayName: displayName})
+}
+
 func (s *Server) handlePutAgentConfig(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := agents.ValidateAgentName(name); err != nil {
@@ -2933,6 +2953,10 @@ func (s *Server) handlePutAgentConfig(w http.ResponseWriter, r *http.Request) {
 	if !s.materializeIfBuiltin(w, name) {
 		return
 	}
+	// display_name is identity-adjacent metadata owned by the top-level
+	// agent create/rename contract. Config replacement must not clear it or
+	// accept a nested bypass value.
+	cfg.DisplayName = readAgentConfigDisplayName(s.deps.AgentsDir, name)
 	if err := agents.WriteAgentConfig(s.deps.AgentsDir, name, &cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2952,8 +2976,7 @@ func (s *Server) handleDeleteAgentConfig(w http.ResponseWriter, r *http.Request)
 	if !s.materializeIfBuiltin(w, name) {
 		return
 	}
-	path := filepath.Join(s.deps.AgentsDir, name, "config.yaml")
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := clearAgentConfigPreservingDisplayName(s.deps.AgentsDir, name); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
