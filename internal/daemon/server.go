@@ -2688,6 +2688,13 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		// (see handleCreateAgent). Accepted for the single-user local daemon.
 		trimmed := strings.TrimSpace(*req.DisplayName)
 		req.DisplayName = &trimmed
+		// A named agent must keep a human-readable label: reject clearing it to
+		// empty (which would fall back to the opaque auto-generated slug). Use
+		// null / omit the field to leave the display name unchanged.
+		if trimmed == "" {
+			writeError(w, http.StatusBadRequest, "display_name cannot be empty")
+			return
+		}
 		if err := agents.ValidateDisplayName(*req.DisplayName); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return

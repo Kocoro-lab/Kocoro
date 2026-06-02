@@ -3012,7 +3012,7 @@ func TestServer_DisplayName_RenameToEmptyClears(t *testing.T) {
 
 	// Create agent with display_name "Temp"; capture the slug.
 	resp, err := http.Post(base+"/agents", "application/json",
-		strings.NewReader(`{"name":"clear-bot","display_name":"Temp","prompt":"p"}`))
+		strings.NewReader(`{"display_name":"Temp","prompt":"p"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3028,7 +3028,7 @@ func TestServer_DisplayName_RenameToEmptyClears(t *testing.T) {
 	}
 	slug := created.Name
 
-	// PUT display_name="" to clear the explicit label.
+	// PUT display_name="" must be rejected with 400.
 	empty := ""
 	putBody, _ := json.Marshal(map[string]interface{}{"display_name": &empty})
 	req, _ := http.NewRequest(http.MethodPut, base+"/agents/"+slug, bytes.NewReader(putBody))
@@ -3038,19 +3038,18 @@ func TestServer_DisplayName_RenameToEmptyClears(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
+	if resp2.StatusCode != http.StatusBadRequest {
 		body, _ := io.ReadAll(resp2.Body)
-		t.Fatalf("PUT display_name='': expected 200, got %d body=%s", resp2.StatusCode, body)
+		t.Fatalf("PUT display_name='': expected 400, got %d body=%s", resp2.StatusCode, body)
 	}
 
-	// Read back and assert display_name falls back to the slug.
+	// The existing display_name must be unchanged.
 	a, err := agents.LoadAgent(agentsDir, slug)
 	if err != nil {
 		t.Fatalf("load agent: %v", err)
 	}
-	api := a.ToAPI()
-	if api.DisplayName != slug {
-		t.Errorf("after clearing display_name, expected DisplayName == slug %q, got %q", slug, api.DisplayName)
+	if api := a.ToAPI(); api.DisplayName != "Temp" {
+		t.Errorf("display_name should be unchanged after rejected clear, got %q", api.DisplayName)
 	}
 }
 
