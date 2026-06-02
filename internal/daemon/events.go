@@ -7,21 +7,26 @@ import (
 
 // Event types emitted by the daemon.
 const (
-	EventMessageReceived  = "message_received"
-	EventAgentReply       = "agent_reply"
-	EventApprovalRequest  = "approval_request"
-	EventApprovalResolved = "approval_resolved"
-	EventApprovalNotice   = "approval_notice" // post-decision feedback (e.g. "high-risk pattern: not saved")
-	EventAgentError       = "agent_error"
-	EventHeartbeatAlert   = "heartbeat_alert"
-	EventToolStatus       = "tool_status"
-	EventAssistantText    = "assistant_text" // mid-turn agent narration (preamble + state-transition updates); distinct from EventAgentReply (final answer)
-	EventUsage            = "usage"           // per-LLM-call usage snapshot for the run
-	EventCloudAgent       = "cloud_agent"
-	EventCloudProgress    = "cloud_progress"
-	EventCloudPlan        = "cloud_plan"
-	EventNotification     = "notification"
-	EventRunStatus        = "run_status" // watchdog soft/hard events, LLM retries, etc.
+	EventMessageReceived = "message_received"
+	// EventInjectedCommitted fires (per-request SSE only) when a mid-run injected
+	// follow-up is drained into the live turn — the consume boundary. Lets a
+	// client flip its queued-draft card into a real user bubble. Payload:
+	// {message_id, text} where message_id echoes the client-supplied id.
+	EventInjectedCommitted = "injected_committed"
+	EventAgentReply        = "agent_reply"
+	EventApprovalRequest   = "approval_request"
+	EventApprovalResolved  = "approval_resolved"
+	EventApprovalNotice    = "approval_notice" // post-decision feedback (e.g. "high-risk pattern: not saved")
+	EventAgentError        = "agent_error"
+	EventHeartbeatAlert    = "heartbeat_alert"
+	EventToolStatus        = "tool_status"
+	EventAssistantText     = "assistant_text" // mid-turn agent narration (preamble + state-transition updates); distinct from EventAgentReply (final answer)
+	EventUsage             = "usage"          // per-LLM-call usage snapshot for the run
+	EventCloudAgent        = "cloud_agent"
+	EventCloudProgress     = "cloud_progress"
+	EventCloudPlan         = "cloud_plan"
+	EventNotification      = "notification"
+	EventRunStatus         = "run_status" // watchdog soft/hard events, LLM retries, etc.
 	// EventSuggestionReady is emitted by the daemon's post-Run hook after a
 	// prompt suggestion has been generated and stored in SuggestionState.
 	// Payload: {session_id, agent, text}.

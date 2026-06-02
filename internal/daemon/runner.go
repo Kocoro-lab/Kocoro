@@ -60,24 +60,26 @@ type RequestContentBlock struct {
 
 // RunAgentRequest is the input for RunAgent.
 type RunAgentRequest struct {
-	Text           string                `json:"text"`
-	Content        []RequestContentBlock `json:"content,omitempty"` // multimodal content blocks (optional)
-	Agent          string                `json:"agent,omitempty"`
-	SessionID      string                `json:"session_id,omitempty"`
-	NewSession     bool                  `json:"new_session,omitempty"`
-	Source         string                `json:"source,omitempty"`    // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still accepted by router for one release)
-	Sender         string                `json:"sender,omitempty"`    // user identifier from channel
-	Channel        string                `json:"channel,omitempty"`   // channel/thread source context
-	ThreadID       string                `json:"thread_id,omitempty"` // thread context for messaging platforms
-	CWD            string                `json:"cwd,omitempty"`       // absolute project path override
-	RouteKey       string                `json:"-"`                   // internal routing key
-	Ephemeral      bool                  `json:"-"`                   // caller owns persistence + events
-	ModelOverride  string                `json:"-"`                   // overrides agent model tier
-	BypassRouting  bool                  `json:"-"`                   // skip route lock (heartbeat runs)
-	SessionHistory []client.Message      `json:"-"`                   // pre-loaded history for LLM context (BypassRouting runs)
-	OmitHistory    bool                  `json:"-"`                   // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
-	StickyContext  string                `json:"-"`                   // 额外的 sticky context，注入系统提示（对用户不可见）
-	Files          []RemoteFile          `json:"-"`                   // remote file attachments from Cloud (WS only)
+	Text            string                `json:"text"`
+	Content         []RequestContentBlock `json:"content,omitempty"` // multimodal content blocks (optional)
+	Agent           string                `json:"agent,omitempty"`
+	SessionID       string                `json:"session_id,omitempty"`
+	NewSession      bool                  `json:"new_session,omitempty"`
+	Source          string                `json:"source,omitempty"`            // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still accepted by router for one release)
+	Sender          string                `json:"sender,omitempty"`            // user identifier from channel
+	Channel         string                `json:"channel,omitempty"`           // channel/thread source context
+	ThreadID        string                `json:"thread_id,omitempty"`         // thread context for messaging platforms
+	CWD             string                `json:"cwd,omitempty"`               // absolute project path override
+	InjectOnly      bool                  `json:"inject_only,omitempty"`       // busy-state inject: on InjectNoActiveRun race, return 409 instead of starting a new run so the client re-queues locally (avoids duplicate run)
+	ClientMessageID string                `json:"client_message_id,omitempty"` // client-supplied id (e.g. Desktop queued-draft id) echoed back in the injected_committed SSE event when the loop drains this inject, so the client flips its queued card into a real bubble at the consume boundary
+	RouteKey        string                `json:"-"`                           // internal routing key
+	Ephemeral       bool                  `json:"-"`                           // caller owns persistence + events
+	ModelOverride   string                `json:"-"`                           // overrides agent model tier
+	BypassRouting   bool                  `json:"-"`                           // skip route lock (heartbeat runs)
+	SessionHistory  []client.Message      `json:"-"`                           // pre-loaded history for LLM context (BypassRouting runs)
+	OmitHistory     bool                  `json:"-"`                           // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
+	StickyContext   string                `json:"-"`                           // 额外的 sticky context，注入系统提示（对用户不可见）
+	Files           []RemoteFile          `json:"-"`                           // remote file attachments from Cloud (WS only)
 
 	// IM message lifecycle plumbing for the run's PRIMARY user message (first
 	// turn). Mid-run follow-ups carry their own copies on InjectedMessage.
@@ -211,6 +213,39 @@ func resolveContentBlocks(blocks []RequestContentBlock) []client.ContentBlock {
 		}
 	}
 	return out
+}
+
+// contentBlocksToInjected lowers request content blocks to the agent-layer
+// InjectedFile carrier for the mid-turn HTTP inject path. It reuses
+// resolveContentBlocks (image compression, file_ref disk reads, document
+// passthrough) and then downshifts each resolved block to InjectedFile — the
+// inverse of agent.injectedFileToBlock. Text blocks (including file_ref
+// folder/zip/oversize hints) are joined and returned separately so the caller
+// folds them into InjectedMessage.Text. Returns ("", nil) for empty input.
+func contentBlocksToInjected(blocks []RequestContentBlock) (string, []agent.InjectedFile) {
+	if len(blocks) == 0 {
+		return "", nil
+	}
+	resolved := resolveContentBlocks(blocks)
+	var texts []string
+	files := make([]agent.InjectedFile, 0, len(resolved))
+	for _, b := range resolved {
+		switch b.Type {
+		case "text":
+			if b.Text != "" {
+				texts = append(texts, b.Text)
+			}
+		case "image":
+			if b.Source != nil {
+				files = append(files, agent.InjectedFile{Type: "image", MediaType: b.Source.MediaType, Data: b.Source.Data})
+			}
+		case "document":
+			if b.Source != nil {
+				files = append(files, agent.InjectedFile{Type: "document", MediaType: b.Source.MediaType, Data: b.Source.Data})
+			}
+		}
+	}
+	return strings.Join(texts, "\n\n"), files
 }
 
 // ConvertFilesToInjected lowers daemon-layer RemoteFile (cloud wire format)
@@ -1966,6 +2001,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				})
 				deps.EventBus.Emit(Event{Type: EventQueueFlushed, Payload: payload})
 			}
+		})
+		// Desktop steering retract: drop a follow-up at drain time if the client
+		// cancelled its queued-draft card after the inject was already sent to
+		// injectCh (cross-route retraction lives in SessionCache, keyed here).
+		loop.SetInjectRetractedChecker(func(clientMessageID string) bool {
+			return deps.SessionCache.ConsumeInjectRetracted(routeKey, clientMessageID)
 		})
 	}
 	loop.SetSessionID(sess.ID)

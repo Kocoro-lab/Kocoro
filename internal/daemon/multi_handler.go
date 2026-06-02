@@ -117,3 +117,16 @@ func (m *multiHandler) OnRunStatus(code, detail string) {
 		}
 	}
 }
+
+// OnInjectedCommitted propagates the mid-run inject "committed" event to wrapped
+// handlers that implement agent.InjectCommitHandler (the per-request SSE handler
+// does). Present on multiHandler itself so the agent loop's type assertion
+// `a.handler.(InjectCommitHandler)` succeeds when the loop handler is a
+// multiHandler — without this, the wrapped SSE handler never sees the event.
+func (m *multiHandler) OnInjectedCommitted(clientMessageID, text string) {
+	for _, h := range m.handlers {
+		if ich, ok := h.(agent.InjectCommitHandler); ok {
+			ich.OnInjectedCommitted(clientMessageID, text)
+		}
+	}
+}

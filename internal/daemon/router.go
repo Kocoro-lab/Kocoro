@@ -109,6 +109,13 @@ type SessionCache struct {
 	shannonDir   string
 	mailboxStore *MailboxStore
 	mailboxCap   int
+	// retractedInjects holds, per route key, the set of client_message_ids the
+	// client cancelled AFTER the inject was already sent to injectCh. The agent
+	// loop consults this at drain time (via injectRetractedChecker) and skips
+	// any matching follow-up, so a cancelled steering message never reaches the
+	// model — injectCh is a Go channel and cannot remove elements directly, so
+	// the skip happens after drain rather than by mutating the channel.
+	retractedInjects map[string]map[string]bool
 }
 
 // NewSessionCache creates a cache rooted at the given shannon directory.
@@ -126,11 +133,12 @@ func NewSessionCacheWithMailbox(shannonDir string, store *MailboxStore, capacity
 		capacity = 100
 	}
 	return &SessionCache{
-		routes:       make(map[string]*routeEntry),
-		managers:     make(map[string]*session.Manager),
-		shannonDir:   shannonDir,
-		mailboxStore: store,
-		mailboxCap:   capacity,
+		routes:           make(map[string]*routeEntry),
+		managers:         make(map[string]*session.Manager),
+		shannonDir:       shannonDir,
+		mailboxStore:     store,
+		mailboxCap:       capacity,
+		retractedInjects: make(map[string]map[string]bool),
 	}
 }
 
@@ -527,7 +535,60 @@ func (sc *SessionCache) ClearRouteRunState(key string) {
 		entry.injectCh = nil
 		entry.activeCWD = ""
 	}
+	// Drop any unconsumed retraction tombstones for this route — the run is
+	// over, so a leftover retraction (its target was cancelled but never
+	// drained because the run ended first) must not leak into the next run on
+	// the same route.
+	delete(sc.retractedInjects, key)
 	sc.mu.Unlock()
+}
+
+// RetractInject marks a client_message_id as cancelled for a route. If the
+// matching follow-up is still sitting in injectCh (not yet drained), the agent
+// loop's drain-time check (ConsumeInjectRetracted via injectRetractedChecker)
+// will skip it so a cancelled steering message never reaches the model. Safe to
+// call for an id that was already drained or never existed — it just leaves a
+// tombstone that ClearRouteRunState reaps at run end.
+func (sc *SessionCache) RetractInject(key, clientMessageID string) {
+	if key == "" || clientMessageID == "" {
+		return
+	}
+	sc.mu.Lock()
+	// Defensive lazy-init: NewSessionCache seeds this map, but a raw
+	// &SessionCache{} literal (some tests) leaves it nil, and a nil-map write
+	// panics. ConsumeInjectRetracted / ClearRouteRunState only read, so this is
+	// the one writer that must guard.
+	if sc.retractedInjects == nil {
+		sc.retractedInjects = make(map[string]map[string]bool)
+	}
+	set := sc.retractedInjects[key]
+	if set == nil {
+		set = make(map[string]bool)
+		sc.retractedInjects[key] = set
+	}
+	set[clientMessageID] = true
+	sc.mu.Unlock()
+}
+
+// ConsumeInjectRetracted reports whether a client_message_id was retracted for a
+// route, removing it from the set (one-shot) so the tombstone does not linger.
+// Called by the agent loop at drain time for each follow-up carrying a client
+// id; a true result means "drop this follow-up, the user cancelled it".
+func (sc *SessionCache) ConsumeInjectRetracted(key, clientMessageID string) bool {
+	if key == "" || clientMessageID == "" {
+		return false
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	set := sc.retractedInjects[key]
+	if set == nil || !set[clientMessageID] {
+		return false
+	}
+	delete(set, clientMessageID)
+	if len(set) == 0 {
+		delete(sc.retractedInjects, key)
+	}
+	return true
 }
 
 // CancelRoute cancels the in-flight run for a route without waiting.
