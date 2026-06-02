@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,21 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 	"gopkg.in/yaml.v3"
 )
+
+func TestValidateDisplayName_Codes(t *testing.T) {
+	var dne *DisplayNameError
+	if err := ValidateDisplayName(strings.Repeat("x", 257)); !errors.As(err, &dne) || dne.Code != CodeDisplayNameTooLong {
+		t.Errorf("too-long: got %v", err)
+	}
+	dne = nil
+	if err := ValidateDisplayName("a\nb"); !errors.As(err, &dne) || dne.Code != CodeDisplayNameInvalidChars {
+		t.Errorf("control-char: got %v", err)
+	}
+	dne = nil
+	if err := (&AgentCreateRequest{Prompt: "p"}).Validate(); !errors.As(err, &dne) || dne.Code != CodeDisplayNameRequired {
+		t.Errorf("required: got %v", err)
+	}
+}
 
 func TestAgentToAPI_Minimal(t *testing.T) {
 	a := &Agent{Name: "test", Prompt: "hello"}

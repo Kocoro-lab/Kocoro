@@ -2470,6 +2470,14 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+// writeErrorCode writes an error response carrying a stable machine-readable
+// code alongside the English fallback message, so clients can localize by code.
+func writeErrorCode(w http.ResponseWriter, status int, code, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg, "code": code})
+}
+
 // --- Agent CRUD handlers ---
 
 func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
@@ -2521,7 +2529,12 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := req.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		var dne *agents.DisplayNameError
+		if errors.As(err, &dne) {
+			writeErrorCode(w, http.StatusBadRequest, dne.Code, dne.Error())
+		} else {
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
 		return
 	}
 	// Slug is always server-generated and immutable; clients supply only display_name.
@@ -2549,7 +2562,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if taken {
-			writeError(w, http.StatusConflict,
+			writeErrorCode(w, http.StatusConflict, agents.CodeDisplayNameTaken,
 				fmt.Sprintf("display name %q is already in use", req.DisplayName))
 			return
 		}
@@ -2677,11 +2690,16 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		// empty (which would fall back to the opaque auto-generated slug). Use
 		// null / omit the field to leave the display name unchanged.
 		if trimmed == "" {
-			writeError(w, http.StatusBadRequest, "display_name cannot be empty")
+			writeErrorCode(w, http.StatusBadRequest, agents.CodeDisplayNameRequired, "display_name cannot be empty")
 			return
 		}
 		if err := agents.ValidateDisplayName(*req.DisplayName); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			var dne *agents.DisplayNameError
+			if errors.As(err, &dne) {
+				writeErrorCode(w, http.StatusBadRequest, dne.Code, dne.Error())
+			} else {
+				writeError(w, http.StatusBadRequest, err.Error())
+			}
 			return
 		}
 		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, *req.DisplayName, name)
@@ -2690,7 +2708,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if taken {
-			writeError(w, http.StatusConflict,
+			writeErrorCode(w, http.StatusConflict, agents.CodeDisplayNameTaken,
 				fmt.Sprintf("display name %q is already in use", *req.DisplayName))
 			return
 		}

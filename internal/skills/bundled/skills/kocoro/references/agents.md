@@ -26,9 +26,17 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Notes:
   - The slug (`name`) is **always server-generated** — an immutable identifier of the form `agent-<6 hex>` (e.g. `agent-a3f7b2`) minted on the server and returned in the response. Clients do **not** supply it; any `name` sent in the body is ignored. The slug is the on-disk identity (directory name, session routing, Cloud binding) and never changes after creation.
   - `display_name` is **required** — a human-readable label in any language (e.g. Chinese). Stored in `config.yaml` and shown to the user. Missing / whitespace-only `display_name` returns `400`.
-  - `display_name` must be globally unique (comparison is case-folded and whitespace-trimmed). A conflict returns `409` with `{"error": "display name \"X\" is already in use"}`.
+  - `display_name` must be globally unique (comparison is case-folded and whitespace-trimmed). A conflict returns `409` with `{"error": "display name \"X\" is already in use", "code": "display_name_taken"}`.
   - `display_name` must be ≤256 runes and contain no control characters → otherwise `400`.
   - `display_name` can **only** be set via the top-level `display_name` field. A `display_name` nested inside the `config` object is silently ignored (it would bypass the uniqueness check).
+  - **Error codes**: display_name validation/conflict errors return `{"error": "<english msg>", "code": "<stable code>"}`. `error` is a non-localized English fallback; clients should localize by `code`:
+
+    | code | status | meaning |
+    |---|---|---|
+    | `display_name_required` | 400 | missing / whitespace-only on create, or rename clearing to empty |
+    | `display_name_too_long` | 400 | more than 256 runes |
+    | `display_name_invalid_chars` | 400 | contains a control character |
+    | `display_name_taken` | 409 | duplicate (case-folded, trimmed) |
   - To customize a built-in agent (`explorer` / `reviewer`), use `PUT /agents/{name}` against its slug — POST always creates a brand-new agent under a fresh auto-slug.
 
 ### Update agent prompt / instructions
@@ -38,9 +46,10 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Response: `{"status": "updated"}`
 - Notes:
   - `display_name` is optional (`null` or omitted = unchanged). Supplying it renames the agent's display label. Only `config.yaml` is updated — the slug, directory, sessions, schedules, and Cloud bindings are left untouched.
-  - `display_name` cannot be cleared: sending `""` (empty / whitespace-only) returns `400` (`display_name cannot be empty`). A named agent must keep a human-readable label rather than fall back to the opaque auto-generated slug. Omit the field (or send `null`) to leave it unchanged.
+  - `display_name` cannot be cleared: sending `""` (empty / whitespace-only) returns `400` (`{"error": "display_name cannot be empty", "code": "display_name_required"}`). A named agent must keep a human-readable label rather than fall back to the opaque auto-generated slug. Omit the field (or send `null`) to leave it unchanged.
   - `display_name` can **only** be set/changed via this top-level field (which is uniqueness-checked). A `display_name` nested inside the `config` object is silently ignored.
-  - Renaming to a `display_name` already used by another agent returns `409`. Renaming to the agent's own current `display_name` is a no-op success.
+  - Renaming to a `display_name` already used by another agent returns `409` with `{"error": "...", "code": "display_name_taken"}`. Renaming to the agent's own current `display_name` is a no-op success.
+  - display_name errors carry the same `code` table as `POST /agents` above (`display_name_required` 400, `display_name_too_long` 400, `display_name_invalid_chars` 400, `display_name_taken` 409). `error` is a non-localized fallback; clients localize by `code`.
 
 ### Delete agent
 - Method: DELETE

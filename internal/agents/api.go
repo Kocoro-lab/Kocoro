@@ -342,7 +342,7 @@ type AgentCreateRequest struct {
 func (r *AgentCreateRequest) Validate() error {
 	r.DisplayName = strings.TrimSpace(r.DisplayName)
 	if r.DisplayName == "" {
-		return fmt.Errorf("display_name is required")
+		return &DisplayNameError{Code: CodeDisplayNameRequired, Msg: "display_name is required"}
 	}
 	if err := ValidateDisplayName(r.DisplayName); err != nil {
 		return err

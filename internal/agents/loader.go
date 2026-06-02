@@ -164,17 +164,35 @@ func ValidateAgentName(name string) error {
 // ever binds for a legitimate use, lift it here — it is not perf-sensitive.
 const maxDisplayNameRunes = 256
 
+// Stable, localizable error codes for display_name validation. Clients key
+// off these (not the English message) to render localized text.
+const (
+	CodeDisplayNameRequired     = "display_name_required"
+	CodeDisplayNameTooLong      = "display_name_too_long"
+	CodeDisplayNameInvalidChars = "display_name_invalid_chars"
+	CodeDisplayNameTaken        = "display_name_taken"
+)
+
+// DisplayNameError is a validation failure carrying a stable Code so HTTP
+// handlers can surface it for client-side localization.
+type DisplayNameError struct {
+	Code string
+	Msg  string
+}
+
+func (e *DisplayNameError) Error() string { return e.Msg }
+
 // ValidateDisplayName checks an already-trimmed display name: a length cap and
 // no control characters (newlines, tabs, NUL, etc.). An empty string passes
 // this validator in isolation, but both API paths (create requires it, rename
 // rejects clearing) enforce non-empty before calling it.
 func ValidateDisplayName(s string) error {
 	if utf8.RuneCountInString(s) > maxDisplayNameRunes {
-		return fmt.Errorf("display_name too long: %d runes (max %d)", utf8.RuneCountInString(s), maxDisplayNameRunes)
+		return &DisplayNameError{Code: CodeDisplayNameTooLong, Msg: fmt.Sprintf("display_name too long: %d runes (max %d)", utf8.RuneCountInString(s), maxDisplayNameRunes)}
 	}
 	for _, r := range s {
 		if unicode.IsControl(r) {
-			return fmt.Errorf("display_name contains a control character")
+			return &DisplayNameError{Code: CodeDisplayNameInvalidChars, Msg: "display_name contains a control character"}
 		}
 	}
 	return nil

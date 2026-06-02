@@ -3004,9 +3004,14 @@ func TestServer_DisplayName_CreateDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var dup struct{ Error, Code string }
+	json.NewDecoder(resp2.Body).Decode(&dup)
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusConflict {
 		t.Errorf("duplicate display_name: expected 409, got %d", resp2.StatusCode)
+	}
+	if dup.Code != "display_name_taken" {
+		t.Errorf("duplicate display_name: expected code display_name_taken, got %q", dup.Code)
 	}
 }
 
@@ -3121,9 +3126,13 @@ func TestServer_DisplayName_RenameToEmptyRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp2.Body.Close()
+	var empErr struct{ Error, Code string }
+	json.NewDecoder(resp2.Body).Decode(&empErr)
 	if resp2.StatusCode != http.StatusBadRequest {
-		body, _ := io.ReadAll(resp2.Body)
-		t.Fatalf("PUT display_name='': expected 400, got %d body=%s", resp2.StatusCode, body)
+		t.Fatalf("PUT display_name='': expected 400, got %d", resp2.StatusCode)
+	}
+	if empErr.Code != "display_name_required" {
+		t.Errorf("PUT display_name='': expected code display_name_required, got %q", empErr.Code)
 	}
 
 	// The existing display_name must be unchanged.
