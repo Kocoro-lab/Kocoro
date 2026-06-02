@@ -2577,15 +2577,10 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, fmt.Sprintf("agent %q already exists", req.Name))
 		return
 	}
-	// Write all agent files — rollback on any failure.
-	rollback := func() {
-		dir := filepath.Join(s.deps.AgentsDir, req.Name)
-		os.Remove(filepath.Join(dir, "AGENT.md"))
-		os.Remove(filepath.Join(dir, "config.yaml"))
-		os.Remove(filepath.Join(dir, "_attached.yaml"))
-		os.RemoveAll(filepath.Join(dir, "commands"))
-		os.RemoveAll(filepath.Join(dir, "skills"))
-	}
+	// Write all agent files — rollback on any failure. The slug is freshly
+	// minted (GenerateAgentSlug verified nothing exists at agentDir), so there
+	// is no prior runtime state to preserve and a full dir removal is safe.
+	rollback := func() { os.RemoveAll(agentDir) }
 	if err := agents.WriteAgentPrompt(s.deps.AgentsDir, req.Name, req.Prompt); err != nil {
 		rollback()
 		writeError(w, http.StatusInternalServerError, err.Error())

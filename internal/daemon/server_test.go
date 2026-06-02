@@ -2826,6 +2826,53 @@ func TestMCPConfigChanged_KeepAliveDetected(t *testing.T) {
 
 // TestServer_DisplayName_AutoSlug verifies that POSTing without a name but
 // with a display_name auto-generates a slug and returns the display_name.
+// TestServer_CreateAgent_IgnoresClientName pins the breaking-change contract:
+// a client-supplied "name" in the POST body must be ignored (the slug is always
+// server-generated). Guards against a regression where AgentCreateRequest.Name
+// is accidentally given a json tag again, which would re-open slug injection.
+func TestServer_CreateAgent_IgnoresClientName(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+	resp, err := http.Post(base+"/agents", "application/json",
+		strings.NewReader(`{"name":"injected","display_name":"X","prompt":"p"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201, got %d body=%s", resp.StatusCode, body)
+	}
+	var api struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&api); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.HasPrefix(api.Name, "agent-") {
+		t.Errorf("slug = %q, want server-generated agent-<hex>", api.Name)
+	}
+	if api.Name == "injected" {
+		t.Errorf("client-supplied name was honored — slug injection regression")
+	}
+	if _, err := os.Stat(filepath.Join(agentsDir, "injected", "AGENT.md")); err == nil {
+		t.Errorf("an agent dir was created under the client-supplied name")
+	}
+}
+
 func TestServer_DisplayName_AutoSlug(t *testing.T) {
 	agentsDir := t.TempDir()
 	sessDir := t.TempDir()
