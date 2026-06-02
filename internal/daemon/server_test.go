@@ -1009,7 +1009,7 @@ func TestServer_CreateAgent_Conflict(t *testing.T) {
 	go srv.Start(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	body := `{"name":"testbot","prompt":"hello world"}`
+	body := `{"display_name":"testbot","prompt":"hello world"}`
 	resp, err := http.Post(
 		fmt.Sprintf("http://127.0.0.1:%d/agents", srv.Port()),
 		"application/json",
@@ -1023,7 +1023,7 @@ func TestServer_CreateAgent_Conflict(t *testing.T) {
 		t.Fatalf("create: expected 201, got %d", resp.StatusCode)
 	}
 
-	// Duplicate create — should get 409
+	// Duplicate display_name create — should get 409
 	resp2, err := http.Post(
 		fmt.Sprintf("http://127.0.0.1:%d/agents", srv.Port()),
 		"application/json",
@@ -1058,7 +1058,7 @@ func TestServer_CreateAgent_RollbackOnWriteFailure(t *testing.T) {
 	os.Chmod(agentsDir, 0500)
 	defer os.Chmod(agentsDir, 0700) // restore for cleanup
 
-	body := `{"name":"failbot","prompt":"should fail"}`
+	body := `{"display_name":"failbot","prompt":"should fail"}`
 	resp, err := http.Post(
 		fmt.Sprintf("http://127.0.0.1:%d/agents", srv.Port()),
 		"application/json",
@@ -1096,7 +1096,7 @@ func TestServer_CreateAgent_DoesNotCreateSessionManager(t *testing.T) {
 	go srv.Start(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	body := `{"name":"cache-test","prompt":"hello world"}`
+	body := `{"display_name":"cache-test","prompt":"hello world"}`
 	resp, err := http.Post(
 		fmt.Sprintf("http://127.0.0.1:%d/agents", srv.Port()),
 		"application/json",
@@ -1110,12 +1110,19 @@ func TestServer_CreateAgent_DoesNotCreateSessionManager(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create: expected 201, got %d", resp.StatusCode)
 	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
 
+	routeKey := "agent:" + created.Name
 	sessionCache.mu.Lock()
-	route, ok := sessionCache.routes["agent:cache-test"]
+	route, ok := sessionCache.routes[routeKey]
 	sessionCache.mu.Unlock()
 	if !ok {
-		t.Fatalf("expected route cache entry for agent:cache-test to exist")
+		t.Fatalf("expected route cache entry for %s to exist", routeKey)
 	}
 	if route.manager != nil {
 		t.Fatalf("expected create path to avoid creating a route manager")
@@ -1143,7 +1150,7 @@ func TestServer_CreateAgent_AttachesInstalledSkills(t *testing.T) {
 	go srv.Start(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	body := `{"name":"attach-bot","prompt":"hello world","skills":[{"name":"check"}]}`
+	body := `{"display_name":"attach-bot","prompt":"hello world","skills":[{"name":"check"}]}`
 	resp, err := http.Post(
 		fmt.Sprintf("http://127.0.0.1:%d/agents", srv.Port()),
 		"application/json",
@@ -1156,8 +1163,15 @@ func TestServer_CreateAgent_AttachesInstalledSkills(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201, got %d", resp.StatusCode)
 	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	slug := created.Name
 
-	loaded, err := agents.LoadAgent(agentsDir, "attach-bot")
+	loaded, err := agents.LoadAgent(agentsDir, slug)
 	if err != nil {
 		t.Fatalf("load agent: %v", err)
 	}
@@ -1165,7 +1179,7 @@ func TestServer_CreateAgent_AttachesInstalledSkills(t *testing.T) {
 		t.Fatalf("expected attached global skill 'check', got %+v", loaded.Skills)
 	}
 
-	attached, err := agents.ReadAttachedSkills(agentsDir, "attach-bot")
+	attached, err := agents.ReadAttachedSkills(agentsDir, slug)
 	if err != nil {
 		t.Fatalf("read attached skills: %v", err)
 	}
@@ -1173,7 +1187,7 @@ func TestServer_CreateAgent_AttachesInstalledSkills(t *testing.T) {
 		t.Fatalf("expected manifest to contain check, got %v", attached)
 	}
 
-	if _, err := os.Stat(filepath.Join(agentsDir, "attach-bot", "skills")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(agentsDir, slug, "skills")); !os.IsNotExist(err) {
 		t.Fatalf("expected no agent-local skill directory, got err=%v", err)
 	}
 }
@@ -1199,7 +1213,7 @@ func TestServer_PutSkill_AttachesInstalledGlobalSkill(t *testing.T) {
 	go srv.Start(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	createBody := `{"name":"skill-bot","prompt":"hello world"}`
+	createBody := `{"display_name":"skill-bot","prompt":"hello world"}`
 	resp, err := http.Post(
 		fmt.Sprintf("http://127.0.0.1:%d/agents", srv.Port()),
 		"application/json",
@@ -1208,14 +1222,21 @@ func TestServer_PutSkill_AttachesInstalledGlobalSkill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create: expected 201, got %d", resp.StatusCode)
 	}
+	slug := created.Name
 
 	req, err := http.NewRequest(
 		http.MethodPut,
-		fmt.Sprintf("http://127.0.0.1:%d/agents/skill-bot/skills/check", srv.Port()),
+		fmt.Sprintf("http://127.0.0.1:%d/agents/%s/skills/check", srv.Port(), slug),
 		strings.NewReader(`{}`),
 	)
 	if err != nil {
@@ -1231,7 +1252,7 @@ func TestServer_PutSkill_AttachesInstalledGlobalSkill(t *testing.T) {
 		t.Fatalf("attach: expected 200, got %d", resp.StatusCode)
 	}
 
-	loaded, err := agents.LoadAgent(agentsDir, "skill-bot")
+	loaded, err := agents.LoadAgent(agentsDir, slug)
 	if err != nil {
 		t.Fatalf("load agent: %v", err)
 	}
@@ -1261,7 +1282,7 @@ func TestServer_DeleteSkill_DetachesManifestAndCleansLegacySkillDir(t *testing.T
 	go srv.Start(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	createBody := `{"name":"detach-bot","prompt":"hello world","skills":[{"name":"check"}]}`
+	createBody := `{"display_name":"detach-bot","prompt":"hello world","skills":[{"name":"check"}]}`
 	resp, err := http.Post(
 		fmt.Sprintf("http://127.0.0.1:%d/agents", srv.Port()),
 		"application/json",
@@ -1270,12 +1291,19 @@ func TestServer_DeleteSkill_DetachesManifestAndCleansLegacySkillDir(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create: expected 201, got %d", resp.StatusCode)
 	}
+	slug := created.Name
 
-	if err := agents.WriteAgentSkill(agentsDir, "detach-bot", &skills.Skill{
+	if err := agents.WriteAgentSkill(agentsDir, slug, &skills.Skill{
 		Name:        "check",
 		Description: "legacy local copy",
 		Prompt:      "legacy prompt",
@@ -1285,7 +1313,7 @@ func TestServer_DeleteSkill_DetachesManifestAndCleansLegacySkillDir(t *testing.T
 
 	req, err := http.NewRequest(
 		http.MethodDelete,
-		fmt.Sprintf("http://127.0.0.1:%d/agents/detach-bot/skills/check", srv.Port()),
+		fmt.Sprintf("http://127.0.0.1:%d/agents/%s/skills/check", srv.Port(), slug),
 		nil,
 	)
 	if err != nil {
@@ -1300,7 +1328,7 @@ func TestServer_DeleteSkill_DetachesManifestAndCleansLegacySkillDir(t *testing.T
 		t.Fatalf("delete: expected 200, got %d", resp.StatusCode)
 	}
 
-	attached, err := agents.ReadAttachedSkills(agentsDir, "detach-bot")
+	attached, err := agents.ReadAttachedSkills(agentsDir, slug)
 	if err != nil {
 		t.Fatalf("read attached skills: %v", err)
 	}
@@ -1308,7 +1336,7 @@ func TestServer_DeleteSkill_DetachesManifestAndCleansLegacySkillDir(t *testing.T
 		t.Fatalf("expected empty attached skills after delete, got %v", attached)
 	}
 
-	loaded, err := agents.LoadAgent(agentsDir, "detach-bot")
+	loaded, err := agents.LoadAgent(agentsDir, slug)
 	if err != nil {
 		t.Fatalf("load agent: %v", err)
 	}
@@ -1316,7 +1344,7 @@ func TestServer_DeleteSkill_DetachesManifestAndCleansLegacySkillDir(t *testing.T
 		t.Fatalf("expected no loaded skills after detach, got %+v", loaded.Skills)
 	}
 
-	if _, err := os.Stat(filepath.Join(agentsDir, "detach-bot", "skills", "check")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(agentsDir, slug, "skills", "check")); !os.IsNotExist(err) {
 		t.Fatalf("expected legacy agent-local skill dir to be removed, got err=%v", err)
 	}
 }
@@ -2915,7 +2943,7 @@ func TestServer_DisplayName_CreateDuplicate(t *testing.T) {
 	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
 
 	resp, err := http.Post(base+"/agents", "application/json",
-		strings.NewReader(`{"name":"first-bot","display_name":"TakenName","prompt":"p"}`))
+		strings.NewReader(`{"display_name":"TakenName","prompt":"p"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2956,7 +2984,7 @@ func TestServer_DisplayName_RenameDuplicate(t *testing.T) {
 
 	// Create agent A with display_name "NameA".
 	resp, err := http.Post(base+"/agents", "application/json",
-		strings.NewReader(`{"name":"agent-a","display_name":"NameA","prompt":"p"}`))
+		strings.NewReader(`{"display_name":"NameA","prompt":"p"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2965,11 +2993,17 @@ func TestServer_DisplayName_RenameDuplicate(t *testing.T) {
 		t.Fatalf("create agent-a: expected 201, got %d", resp.StatusCode)
 	}
 
-	// Create agent B without a display_name.
+	// Create agent B with display_name "NameB"; capture its server-minted slug.
 	resp2, err := http.Post(base+"/agents", "application/json",
-		strings.NewReader(`{"name":"agent-b","prompt":"p"}`))
+		strings.NewReader(`{"display_name":"NameB","prompt":"p"}`))
 	if err != nil {
 		t.Fatal(err)
+	}
+	var createdB struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&createdB); err != nil {
+		t.Fatalf("decode agent-b create response: %v", err)
 	}
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusCreated {
@@ -2979,7 +3013,7 @@ func TestServer_DisplayName_RenameDuplicate(t *testing.T) {
 	// Rename agent B to "NameA" — should 409.
 	dn := "NameA"
 	body, _ := json.Marshal(map[string]interface{}{"display_name": &dn})
-	req, _ := http.NewRequest(http.MethodPut, base+"/agents/agent-b", bytes.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPut, base+"/agents/"+createdB.Name, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp3, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -2991,9 +3025,11 @@ func TestServer_DisplayName_RenameDuplicate(t *testing.T) {
 	}
 }
 
-// TestServer_DisplayName_RenameToEmptyClears verifies that setting display_name
-// to "" clears the explicit label so the slug is returned as the effective name.
-func TestServer_DisplayName_RenameToEmptyClears(t *testing.T) {
+// TestServer_DisplayName_RenameToEmptyRejected verifies that clearing
+// display_name to "" is rejected with 400 (a named agent must keep a
+// human-readable label rather than fall back to the opaque slug), and that the
+// existing display_name is left unchanged.
+func TestServer_DisplayName_RenameToEmptyRejected(t *testing.T) {
 	agentsDir := t.TempDir()
 	sessDir := t.TempDir()
 	deps := &ServerDeps{
@@ -3073,7 +3109,7 @@ func TestServer_DisplayName_RenameHappyPath(t *testing.T) {
 	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
 
 	resp, err := http.Post(base+"/agents", "application/json",
-		strings.NewReader(`{"name":"rename-bot","display_name":"Old","prompt":"p"}`))
+		strings.NewReader(`{"display_name":"Old","prompt":"p"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3136,9 +3172,10 @@ func TestServer_DisplayName_NestedConfigIgnored(t *testing.T) {
 
 	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
 
-	// Create "taken-bot" with top-level display_name so it is registered.
+	// Create "taken-bot" with top-level display_name so "TakenName" is a real
+	// taken name.
 	resp, err := http.Post(base+"/agents", "application/json",
-		strings.NewReader(`{"name":"taken-bot","display_name":"TakenName","prompt":"p"}`))
+		strings.NewReader(`{"display_name":"TakenName","prompt":"p"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3147,30 +3184,42 @@ func TestServer_DisplayName_NestedConfigIgnored(t *testing.T) {
 		t.Fatalf("create taken-bot: expected 201, got %d", resp.StatusCode)
 	}
 
-	// POST /agents with display_name only inside config — must not 409 on
-	// uniqueness but the written agent must NOT have the duplicate display_name.
+	// POST /agents with a unique top-level display_name plus a nested
+	// config.display_name — the nested value must be ignored (not persisted).
 	resp2, err := http.Post(base+"/agents", "application/json",
-		strings.NewReader(`{"name":"bypass-create","prompt":"p","config":{"display_name":"TakenName"}}`))
+		strings.NewReader(`{"display_name":"RealCreate","prompt":"p","config":{"display_name":"TakenName"}}`))
 	if err != nil {
 		t.Fatal(err)
+	}
+	var createdCreate struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&createdCreate); err != nil {
+		t.Fatalf("decode bypass-create response: %v", err)
 	}
 	resp2.Body.Close()
 	if resp2.StatusCode != http.StatusCreated {
 		t.Fatalf("bypass-create: expected 201, got %d", resp2.StatusCode)
 	}
-	loaded, err := agents.LoadAgent(agentsDir, "bypass-create")
+	loaded, err := agents.LoadAgent(agentsDir, createdCreate.Name)
 	if err != nil {
 		t.Fatalf("load bypass-create: %v", err)
 	}
-	if loaded.Config != nil && loaded.Config.DisplayName == "TakenName" {
-		t.Errorf("POST with nested config.display_name wrote duplicate display_name to disk")
+	if dn := loaded.ToAPI().DisplayName; dn != "RealCreate" {
+		t.Errorf("expected display_name %q (nested config value ignored), got %q", "RealCreate", dn)
 	}
 
 	// Create a second agent to test PUT bypass.
 	resp3, err := http.Post(base+"/agents", "application/json",
-		strings.NewReader(`{"name":"bypass-update","prompt":"p"}`))
+		strings.NewReader(`{"display_name":"RealUpdate","prompt":"p"}`))
 	if err != nil {
 		t.Fatal(err)
+	}
+	var createdUpdate struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp3.Body).Decode(&createdUpdate); err != nil {
+		t.Fatalf("decode bypass-update response: %v", err)
 	}
 	resp3.Body.Close()
 	if resp3.StatusCode != http.StatusCreated {
@@ -3178,8 +3227,8 @@ func TestServer_DisplayName_NestedConfigIgnored(t *testing.T) {
 	}
 
 	// PUT /agents/{name} with display_name only inside config — must not write
-	// the duplicate display_name.
-	req, _ := http.NewRequest(http.MethodPut, base+"/agents/bypass-update",
+	// the duplicate display_name; the existing "RealUpdate" stays.
+	req, _ := http.NewRequest(http.MethodPut, base+"/agents/"+createdUpdate.Name,
 		strings.NewReader(`{"config":{"display_name":"TakenName"}}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp4, err := http.DefaultClient.Do(req)
@@ -3190,11 +3239,11 @@ func TestServer_DisplayName_NestedConfigIgnored(t *testing.T) {
 	if resp4.StatusCode != http.StatusOK {
 		t.Fatalf("PUT bypass-update: expected 200, got %d", resp4.StatusCode)
 	}
-	loaded2, err := agents.LoadAgent(agentsDir, "bypass-update")
+	loaded2, err := agents.LoadAgent(agentsDir, createdUpdate.Name)
 	if err != nil {
 		t.Fatalf("load bypass-update: %v", err)
 	}
-	if loaded2.Config != nil && loaded2.Config.DisplayName == "TakenName" {
-		t.Errorf("PUT with nested config.display_name wrote duplicate display_name to disk")
+	if dn := loaded2.ToAPI().DisplayName; dn != "RealUpdate" {
+		t.Errorf("expected display_name %q (nested config value ignored on PUT), got %q", "RealUpdate", dn)
 	}
 }

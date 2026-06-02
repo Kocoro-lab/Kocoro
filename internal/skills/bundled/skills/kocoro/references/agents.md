@@ -21,15 +21,15 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 ### Create agent
 - Method: POST
 - Path: /agents
-- Body: `{"name": "my-agent", "prompt": "You are a helpful assistant that..."}`
+- Body: `{"display_name": "My Agent", "prompt": "You are a helpful assistant that..."}`
 - Response: `{"name":"...","display_name":"...","prompt":"...","memory":null,"config":null,"commands":null,"skills":null,"builtin":false,"overridden":false}`
 - Notes:
-  - `name` (the slug) is **optional**. When omitted, the server auto-generates an immutable slug of the form `agent-<6 hex>` (e.g. `agent-a3f7b2`). The slug is the on-disk identity (directory name, session routing, Cloud binding) and never changes after creation.
-  - `display_name` is an optional human-readable label (any language, e.g. Chinese). Stored in `config.yaml`. Falls back to the slug when not set.
-  - At least one of `name` or `display_name` must be provided.
+  - The slug (`name`) is **always server-generated** — an immutable identifier of the form `agent-<6 hex>` (e.g. `agent-a3f7b2`) minted on the server and returned in the response. Clients do **not** supply it; any `name` sent in the body is ignored. The slug is the on-disk identity (directory name, session routing, Cloud binding) and never changes after creation.
+  - `display_name` is **required** — a human-readable label in any language (e.g. Chinese). Stored in `config.yaml` and shown to the user. Missing / whitespace-only `display_name` returns `400`.
   - `display_name` must be globally unique (comparison is case-folded and whitespace-trimmed). A conflict returns `409` with `{"error": "display name \"X\" is already in use"}`.
+  - `display_name` must be ≤256 runes and contain no control characters → otherwise `400`.
   - `display_name` can **only** be set via the top-level `display_name` field. A `display_name` nested inside the `config` object is silently ignored (it would bypass the uniqueness check).
-  - When `name` is provided it must match `^[a-z0-9][a-z0-9_-]{0,63}$` — lowercase ASCII letters, numbers, hyphens, underscores only. No spaces, no non-ASCII characters. **Pass the user's slug verbatim — never translate or transliterate.** See "Name discipline" below.
+  - To customize a built-in agent (`explorer` / `reviewer`), use `PUT /agents/{name}` against its slug — POST always creates a brand-new agent under a fresh auto-slug.
 
 ### Update agent prompt / instructions
 - Method: PUT
@@ -226,8 +226,8 @@ wrapper — `event:` is a header line, `data:` is the JSON body.
 ## Common Scenarios
 
 ### "Create an email writer agent"
-1. POST /agents with `{"name": "email-writer", "prompt": "You are an expert email writer. Write professional, concise emails. Always ask for the recipient, purpose, and tone before drafting."}`
-2. Verify: GET /agents/email-writer
+1. POST /agents with `{"display_name": "Email Writer", "prompt": "You are an expert email writer. Write professional, concise emails. Always ask for the recipient, purpose, and tone before drafting."}`
+2. Read the auto-generated slug from the response (`name`, e.g. `agent-a3f7b2`), then verify with GET /agents/{slug}.
 
 ### "Restrict agent to read-only tools"
 1. PUT /agents/{name}/config with `{"tools": {"allow": ["file_read", "glob", "grep", "directory_list"], "deny": ["file_write", "file_edit", "bash"]}}`
@@ -258,10 +258,8 @@ wrapper — `event:` is a header line, `data:` is the JSON body.
 
 ## Safety Notes
 
-- **Name format**: The slug (`name`) must be `^[a-z0-9][a-z0-9_-]{0,63}$`. Use hyphens or underscores instead of spaces. Invalid names are rejected. `display_name` has no format restriction and accepts any language; it is the user-facing label, not the identity key.
+- **Slug is server-generated**: The slug (`name`, `agent-<6 hex>`) is minted by the server on create and is the opaque identity key (directory, routing, Cloud binding). Clients never supply it; send only `display_name` (any language, e.g. `大螃蟹`, `日本茶`, `сергей`) as the user-facing label. After create, read the slug from the response and use it for all subsequent `/agents/{slug}` calls.
 - **display_name uniqueness**: `display_name` must be unique across all agents (case-insensitive, whitespace-trimmed). Conflicts return 409.
-- **Name discipline — use the user's slug verbatim**: When the user supplies a name (e.g. `da-pangxie`, `nihon-cha`, `mon-ami`, `kak-dela`), pass it to the API byte-for-byte as typed. **Never translate, transliterate, or "normalize" it into the source language's native script** — do not turn Pinyin into Chinese characters (`da-pangxie` → `大螃蟹`), Romaji into kana/kanji (`nihon-cha` → `日本茶`), Arabic transliteration into Arabic script, Cyrillic transliteration into Cyrillic, etc. The `name` field is an opaque ASCII identifier, not a translatable label. The user's exact bytes are what they expect to see when listing or referring to the agent later.
-- **What to do when the user's input is non-ASCII**: If the user provides a name containing non-ASCII characters (e.g. `大螃蟹`, `日本茶`, `сергей`), uppercase letters, or spaces, the API will reject it. Ask the user to provide a valid slug — do **not** silently slugify, transliterate, or guess. They may want a specific romanization that you would not pick correctly on your own.
 - **Deletion is permanent**: Agent configuration, instructions, and memory are deleted. Sessions in `~/.shannon/sessions/` are not deleted.
 - **`?confirm=true` required**: DELETE without this parameter returns an error, preventing accidental deletion.
 - **Config changes take effect immediately**: No restart needed. The next conversation with the agent uses the new settings.

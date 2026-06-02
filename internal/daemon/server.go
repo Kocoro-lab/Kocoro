@@ -2524,17 +2524,13 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Auto-generate an immutable slug when the client only supplied a
-	// display_name (the common Desktop path). Legacy clients that pass an
-	// explicit name keep it.
-	if req.Name == "" {
-		slug, err := agents.GenerateAgentSlug(s.deps.AgentsDir)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		req.Name = slug
+	// Slug is always server-generated and immutable; clients supply only display_name.
+	slug, err := agents.GenerateAgentSlug(s.deps.AgentsDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
+	req.Name = slug
 	// display_name is honored only via the dedicated top-level field below
 	// (uniqueness-checked). Ignore any client-supplied config.display_name,
 	// which would otherwise bypass the uniqueness check.
