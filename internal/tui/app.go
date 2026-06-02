@@ -111,6 +111,14 @@ type streamOutputMsg struct {
 	raw  string // original markdown text (empty for plain text)
 }
 
+// streamDeltaMsg carries an incremental token fragment of the in-flight LLM
+// answer. Unlike streamOutputMsg it is NOT committed to scrollback — it feeds a
+// transient live-preview region (m.streamLive) shown under the spinner while a
+// run is processing, then cleared when the segment finalizes into scrollback.
+type streamDeltaMsg struct {
+	delta string
+}
+
 // outputBlock stores both raw and rendered text so output can be re-rendered on resize.
 type outputBlock struct {
 	raw      string                 // original markdown (empty for plain text)
@@ -171,6 +179,7 @@ type Model struct {
 	textarea            textarea.Model
 	output              []outputBlock
 	pendingPrints       []string
+	streamLive          string // transient live-preview of the in-flight answer (not yet in scrollback)
 	processingStartTime time.Time
 	spinnerIdx          int
 	spinnerTexts        []string
@@ -518,7 +527,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		// Default agent: only the global list applies.
 		loop.SetAlwaysAllowTools(runtimeCfg.Permissions.AlwaysAllowTools)
 	}
-	loop.SetEnableStreaming(true) // streaming enabled but deltas are suppressed — only final text rendered
+	loop.SetEnableStreaming(true) // deltas feed the live preview (OnStreamDelta); final answer rendered on agentDoneMsg
 	loop.SetIdleTimeouts(runtimeCfg.Agent.IdleSoftTimeoutSecs, runtimeCfg.Agent.IdleHardTimeoutSecs)
 
 	settings := config.LoadSettings()
@@ -856,6 +865,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case tea.KeyEscape:
 			if m.state == stateProcessing || m.state == stateApproval {
+				m.streamLive = "" // drop any in-flight preview on cancel
 				if m.cancelRun != nil {
 					m.cancelRun()
 					m.cancelRun = nil
@@ -1121,6 +1131,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.state = stateInput
+		m.streamLive = "" // final answer is rendered to scrollback below
 		m.cancelRun = nil
 		m.injectCh = nil
 		if msg.err != nil && !errors.Is(msg.err, context.Canceled) && !errors.Is(msg.err, agent.ErrMaxIterReached) {
@@ -1246,7 +1257,17 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendOutput("")
 		return m, nil
 
+	case streamDeltaMsg:
+		// Accumulate the in-flight answer into the transient preview region.
+		// Not committed to scrollback — agentDoneMsg renders the final answer.
+		m.streamLive += msg.delta
+		return m, nil
+
 	case streamOutputMsg:
+		// Something is being committed to scrollback (a preamble, a status, or a
+		// cloud delta); the live preview for the just-finished segment is now
+		// redundant — drop it so it can't duplicate.
+		m.streamLive = ""
 		if msg.raw != "" {
 			m.appendMarkdownOutput(msg.raw, msg.text)
 		} else {
@@ -1255,6 +1276,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case toolCallMsg:
+		m.streamLive = ""
 		m.pendingToolName = msg.name
 		m.pendingToolArgs = msg.args
 		// Advance spinner phrase on real events
@@ -1262,6 +1284,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case toolResultMsg:
+		m.streamLive = ""
 		// Prefer the result event's own (name, args) — they are paired with the
 		// specific tool_use_id that produced this result. The pendingTool*
 		// scalars are a singleton-style spinner hint and would mis-pair when
@@ -1336,6 +1359,38 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// streamPreviewLines bounds the height of the in-flight answer preview. Small
+// on purpose: it is a transient "being typed" hint under the spinner, not a
+// scrollback replacement (the full answer is rendered on completion). Override:
+// none today — bump if the live region feels too cramped.
+const streamPreviewLines = 8
+
+// streamPreview returns the last maxLines lines of the in-flight stream, each
+// truncated to the terminal width and dimmed. It deliberately truncates rather
+// than wraps so the live region stays a fixed height instead of ballooning.
+func streamPreview(text string, width, maxLines int) string {
+	text = strings.TrimRight(text, "\n")
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	dim := styleDim()
+	var sb strings.Builder
+	for i, ln := range lines {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		if width > 0 {
+			ln = truncateCells(ln, width, "…")
+		}
+		sb.WriteString(dim.Render(ln))
+	}
+	return sb.String()
+}
+
 // composeBar renders a full-width status separator with optional captions
 // embedded at its left and right ends: <left>────────<right>. Both captions may
 // already be ANSI-styled; the fill uses the faint separator color. Width is
@@ -1369,6 +1424,13 @@ func (m *Model) View() string {
 		rightInfo := styleDim().Render(m.modelDisplayLabel())
 		sb.WriteString(composeBar(m.width, leftHint, rightInfo))
 	case stateProcessing:
+		// Live preview of the answer being generated (transient; the finalized
+		// answer is rendered to scrollback on agentDoneMsg). Shown above the
+		// spinner so the user sees real-time progress instead of a frozen dot.
+		if preview := streamPreview(m.streamLive, m.width, streamPreviewLines); preview != "" {
+			sb.WriteString(preview)
+			sb.WriteString("\n")
+		}
 		if m.pendingToolName != "" {
 			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
 			color := spinColors[m.colorIdx%len(spinColors)]
@@ -2521,10 +2583,20 @@ func (h *tuiEventHandler) OnPreamble(text string) {
 }
 
 func (h *tuiEventHandler) OnStreamDelta(delta string) {
-	// Suppressed for local LLM streaming (View shows thinking indicator, OnText renders final).
-	// cloud_delegate sets cloudStreaming=true so its events render in real time.
-	if h.cloudStreaming && delta != "" {
+	if delta == "" {
+		return
+	}
+	// cloud_delegate streams its nested run's text straight into scrollback.
+	if h.cloudStreaming {
 		h.model.sendOutput(delta)
+		return
+	}
+	// Local LLM: feed the transient live-preview region so the answer is seen
+	// growing in real time instead of appearing all at once when the turn ends.
+	// The finalized answer is still rendered to scrollback by agentDoneMsg; the
+	// preview is cleared at every commit boundary so it never duplicates.
+	if h.model.program != nil {
+		h.model.program.Send(streamDeltaMsg{delta: delta})
 	}
 }
 
