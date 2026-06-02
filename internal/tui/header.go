@@ -13,12 +13,13 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
-// Color palette for the startup header.
+// Color palette for the startup header. Routed through the shared adaptive
+// palette (theme.go) so the header stays readable on light terminals too.
 var (
-	borderColor = lipgloss.Color("76")  // frog green — box border
-	accentColor = lipgloss.Color("76")  // frog green — section headers
-	dimColor    = lipgloss.Color("243") // medium gray — secondary text
-	infoColor   = lipgloss.Color("39")  // blue — activity header
+	borderColor = colorAccent // frog green — box border
+	accentColor = colorAccent // frog green — section headers
+	dimColor    = colorDim    // medium gray — secondary text
+	infoColor   = colorInfo   // blue — activity header
 )
 
 const (
@@ -97,7 +98,7 @@ func renderStartupHeader(frame int, width int, version string, modelTier string,
 	} else {
 		s := sessions[0]
 		title := truncateStr(s.Title, rightWidth-4)
-		titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+		titleStyle := lipgloss.NewStyle().Foreground(colorSecondary)
 		agoStyle := lipgloss.NewStyle().Foreground(dimColor)
 		rightLines = append(rightLines, " "+titleStyle.Render(title))
 		rightLines = append(rightLines, " "+agoStyle.Render(fmt.Sprintf("%s, %d msgs", timeAgo(s.UpdatedAt), s.MsgCount)))
@@ -158,16 +159,13 @@ func stripAnsi(s string) string {
 	return ansiRe.ReplaceAllString(s, "")
 }
 
-// truncateStr truncates a string with "..." if it exceeds maxLen.
+// truncateStr truncates a string with "..." if its DISPLAY WIDTH exceeds
+// maxLen cells (CJK/wide runes count as 2). The "..." counts toward the budget.
 func truncateStr(s string, maxLen int) string {
 	if maxLen <= 3 {
 		maxLen = 4
 	}
-	runes := []rune(s)
-	if len(runes) <= maxLen {
-		return s
-	}
-	return string(runes[:maxLen-3]) + "..."
+	return truncateCells(s, maxLen, "...")
 }
 
 // timeAgo returns a human-readable relative time string.

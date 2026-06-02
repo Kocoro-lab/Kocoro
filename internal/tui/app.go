@@ -306,7 +306,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 
 	ta := textarea.New()
 	ta.Placeholder = "Type a message or /help..."
-	promptStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	promptStyle := lipgloss.NewStyle().Foreground(colorInfo)
 	ta.SetPromptFunc(2, func(lineIdx int) string {
 		if lineIdx == 0 {
 			return promptStyle.Render("> ")
@@ -865,7 +865,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// RunMessages be saved by runAgentLoop when it completes.
 				// This preserves tool calls and partial responses so the
 				// next run has full context of what happened before cancel.
-				cancelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+				cancelStyle := lipgloss.NewStyle().Foreground(colorDim)
 				m.appendOutput(cancelStyle.Render("  [Cancelled]"))
 				m.state = stateInput
 				return m, m.rerenderOutput()
@@ -1132,7 +1132,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// and rendered above, but the run ended early. Show a dim hint,
 			// not a red error.
 			if msg.err == nil && msg.status.Partial && msg.status.FailureCode == runstatus.CodeIterationLimit {
-				dim := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Italic(true)
+				dim := lipgloss.NewStyle().Foreground(colorDim).Italic(true)
 				m.appendOutput(dim.Render("  Stopped early after repeated failed attempts."))
 			}
 		}
@@ -1143,7 +1143,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Don't show usage/elapsed for cancelled tasks
 		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) {
 			elapsed := formatElapsed(time.Since(m.processingStartTime))
-			usageDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+			usageDim := lipgloss.NewStyle().Foreground(colorDim)
 			// Prefer session's cumulative usage (captures direct LLM + cloud_delegate
 			// nested LLM calls) over msg.usage (direct LLM only from loop.Run).
 			var sessionUsage *session.UsageSummary
@@ -1195,8 +1195,8 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.state = stateApproval
-		dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-		warnIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("?")
+		dimStyle := lipgloss.NewStyle().Foreground(colorDim)
+		warnIcon := lipgloss.NewStyle().Foreground(colorWarn).Render("?")
 		keyArg := toolKeyArg(msg.tool, msg.args)
 		m.appendOutput(dimStyle.Render(fmt.Sprintf("⏵ %s(%s)  %s  Allow? [y/n/a]", msg.tool, keyArg, warnIcon)))
 		// Full repaint on state transition to avoid cursor mis-positioning
@@ -1269,7 +1269,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			toolArgs = m.pendingToolArgs
 		}
 		if toolName == "think" {
-			dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+			dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 			m.appendOutput(dimStyle.Render(msg.content))
 		} else {
 			m.appendOutput(formatCompactToolResult(toolName, toolArgs, msg.isError, msg.content, msg.elapsed))
@@ -1332,7 +1332,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) View() string {
 	var sb strings.Builder
 
-	barStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("237"))
+	barStyle := lipgloss.NewStyle().Foreground(colorFaint)
 	bar := barStyle.Render(strings.Repeat("─", m.width))
 
 	// --- Input / status line ---
@@ -1345,7 +1345,7 @@ func (m *Model) View() string {
 		sb.WriteString(m.textarea.View())
 		sb.WriteString("\n")
 		// Bottom bar with right-aligned model tier
-		tierDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+		tierDim := lipgloss.NewStyle().Foreground(colorDim)
 		rightInfo := tierDim.Render(m.modelDisplayLabel())
 		barWidth := m.width - lipgloss.Width(rightInfo)
 		if barWidth < 0 {
@@ -1357,7 +1357,7 @@ func (m *Model) View() string {
 			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
 			color := spinColors[m.colorIdx%len(spinColors)]
 			glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
-			dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+			dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 			keyArg := toolKeyArg(m.pendingToolName, m.pendingToolArgs)
 			sb.WriteString(glyphStyle.Render(glyph) + dimStyle.Render(fmt.Sprintf(" %s(%s)", m.pendingToolName, keyArg)))
 		} else {
@@ -1370,7 +1370,7 @@ func (m *Model) View() string {
 		sb.WriteString("\n")
 		// Bottom status bar with model tier + execution timer
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
-		tierDim := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+		tierDim := lipgloss.NewStyle().Foreground(colorDim)
 		rightInfo := tierDim.Render(m.modelDisplayLabel() + " " + elapsed)
 		statusBarWidth := m.width - lipgloss.Width(rightInfo)
 		if statusBarWidth < 0 {
@@ -1380,11 +1380,11 @@ func (m *Model) View() string {
 	case stateApproval:
 		sb.WriteString(bar)
 		sb.WriteString("\n")
-		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("  [y/n/a] "))
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorWarn).Render("  [y/n/a] "))
 		sb.WriteString("\n")
 		sb.WriteString(bar)
 	case stateSessionPicker:
-		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("  Sessions (Up/Down, Enter, Esc)"))
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  Sessions (Up/Down, Enter, Esc)"))
 	}
 
 	// --- Dropdown (only when visible) ---
@@ -1426,7 +1426,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.historyIdx = -1
 	m.historySaved = ""
 
-	promptMark := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Render(">")
+	promptMark := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 	m.appendOutput(fmt.Sprintf("%s %s", promptMark, input))
 
 	// Check slash commands
@@ -1589,7 +1589,7 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 	m.appendOutput("")
 
 	if m.program == nil {
-		pm := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Render(">")
+		pm := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 		for _, msg := range messages {
 			switch msg.Role {
 			case "user":
@@ -1604,7 +1604,7 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 	}
 
 	go func() {
-		pm := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252")).Render(">")
+		pm := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 		for _, msg := range messages {
 			switch msg.Role {
 			case "user":
@@ -2019,7 +2019,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		if m.toolRegistry != nil {
 			toolCount = m.toolRegistry.Len()
 		}
-		dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+		dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 		m.appendOutput(dimStyle.Render(fmt.Sprintf(
 			"  Version:     %s\n"+
 				"  Model:       %s\n"+
@@ -2624,9 +2624,9 @@ func renderDropList(maxVisible, total, selected int, item func(i int) (label, de
 		return strings.Repeat("\n", maxVisible)
 	}
 
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-	highlightLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true)
-	highlightDesc := lipgloss.NewStyle().Foreground(lipgloss.Color("146"))
+	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
+	highlightLabel := lipgloss.NewStyle().Foreground(colorSelect).Bold(true)
+	highlightDesc := lipgloss.NewStyle().Foreground(colorSelectDesc)
 
 	// Calculate sliding window
 	visible := total
@@ -2785,17 +2785,15 @@ func formatTokenCount(n int) string {
 	return fmt.Sprintf("%d,%03d", n/1000, n%1000)
 }
 
+// truncate caps s to max DISPLAY CELLS (not runes), so CJK/wide text is
+// measured correctly. The "..." suffix counts toward the budget.
 func truncate(s string, max int) string {
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max]) + "..."
+	return truncateCells(s, max, "...")
 }
 
 func formatPermissions(p *permissions.PermissionsConfig) string {
 	var sb strings.Builder
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 
 	sb.WriteString(dimStyle.Render("  Allowed commands:") + "\n")
 	if len(p.AllowedCommands) == 0 {
