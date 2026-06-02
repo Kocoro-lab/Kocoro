@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1334,6 +1335,18 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// composeBar renders a full-width status separator with optional captions
+// embedded at its left and right ends: <left>────────<right>. Both captions may
+// already be ANSI-styled; the fill uses the faint separator color. Width is
+// measured with lipgloss.Width so CJK/ANSI is accounted for.
+func composeBar(width int, left, right string) string {
+	fill := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if fill < 0 {
+		fill = 0
+	}
+	return left + styleFaint().Render(strings.Repeat("─", fill)) + right
+}
+
 func (m *Model) View() string {
 	var sb strings.Builder
 
@@ -1349,14 +1362,11 @@ func (m *Model) View() string {
 		sb.WriteString("\n")
 		sb.WriteString(m.textarea.View())
 		sb.WriteString("\n")
-		// Bottom bar with right-aligned model tier
-		tierDim := lipgloss.NewStyle().Foreground(colorDim)
-		rightInfo := tierDim.Render(m.modelDisplayLabel())
-		barWidth := m.width - lipgloss.Width(rightInfo)
-		if barWidth < 0 {
-			barWidth = 0
-		}
-		sb.WriteString(barStyle.Render(strings.Repeat("─", barWidth)) + rightInfo)
+		// Bottom bar: left hint (slash commands are discoverable by typing "/")
+		// + right-aligned model tier.
+		leftHint := styleDim().Render(" / commands")
+		rightInfo := styleDim().Render(m.modelDisplayLabel())
+		sb.WriteString(composeBar(m.width, leftHint, rightInfo))
 	case stateProcessing:
 		if m.pendingToolName != "" {
 			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
@@ -1373,19 +1383,23 @@ func (m *Model) View() string {
 			sb.WriteString(glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx))
 		}
 		sb.WriteString("\n")
-		// Bottom status bar with model tier + execution timer
+		// Bottom status bar: left "esc to interrupt" hint (cancelling a run is
+		// otherwise undiscoverable) + right model tier and execution timer.
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
-		tierDim := lipgloss.NewStyle().Foreground(colorDim)
-		rightInfo := tierDim.Render(m.modelDisplayLabel() + " " + elapsed)
-		statusBarWidth := m.width - lipgloss.Width(rightInfo)
-		if statusBarWidth < 0 {
-			statusBarWidth = 0
-		}
-		sb.WriteString(barStyle.Render(strings.Repeat("─", statusBarWidth)) + rightInfo + "\n")
+		leftHint := styleDim().Render(" esc to interrupt")
+		rightInfo := styleDim().Render(m.modelDisplayLabel() + " " + elapsed)
+		sb.WriteString(composeBar(m.width, leftHint, rightInfo) + "\n")
 	case stateApproval:
 		sb.WriteString(bar)
 		sb.WriteString("\n")
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorWarn).Render("  [y/n/a] "))
+		// Labeled keys instead of a bare "[y/n/a]" so non-technical users know
+		// what each choice does.
+		keyStyle := lipgloss.NewStyle().Foreground(colorWarn).Bold(true)
+		labelStyle := styleDim()
+		sb.WriteString("  " +
+			keyStyle.Render("[y]") + labelStyle.Render(" approve   ") +
+			keyStyle.Render("[n]") + labelStyle.Render(" deny   ") +
+			keyStyle.Render("[a]") + labelStyle.Render(" always allow"))
 		sb.WriteString("\n")
 		sb.WriteString(bar)
 	case stateSessionPicker:
@@ -1734,28 +1748,38 @@ func spinnerTick() tea.Cmd {
 	})
 }
 
-// renderWaveText renders text with a shimmer effect.
-// Base color 76 (frog green) with a 3-char-wide highlight at
-// 82 (bright lime) that sweeps across the text.
+// shimmer endpoints: resting green → bright lime peak, interpolated in RGB so
+// the highlight glows on and off smoothly instead of snapping between two ANSI
+// indices. lipgloss downsamples to 256/16-color on terminals without truecolor.
+var (
+	shimmerBase = [3]int{0x3A, 0x9A, 0x3A}
+	shimmerPeak = [3]int{0xC6, 0xF0, 0x8C}
+)
+
+// renderWaveText renders text with a soft highlight that sweeps across it. Each
+// character's brightness follows a gaussian falloff from the moving center, so
+// the glow ramps up and down (a raised-cosine "breathing" wave) rather than the
+// old hard 1-character on/off step.
 func renderWaveText(text string, tick int) string {
 	runes := []rune(text)
-	if len(runes) == 0 {
+	n := len(runes)
+	if n == 0 {
 		return ""
 	}
-	waveCenter := tick % (len(runes) + 4)
-	baseStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("76"))
-	shimmerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
+	// A tail gap (period > n) lets the highlight fully exit before restarting.
+	period := n + 6
+	center := float64(tick % period)
+	const sigma = 2.2 // highlight half-width, in characters
+
 	var sb strings.Builder
 	for i, r := range runes {
-		dist := waveCenter - i
-		if dist < 0 {
-			dist = -dist
-		}
-		if dist <= 1 {
-			sb.WriteString(shimmerStyle.Render(string(r)))
-		} else {
-			sb.WriteString(baseStyle.Render(string(r)))
-		}
+		d := center - float64(i)
+		t := math.Exp(-(d * d) / (2 * sigma * sigma)) // falloff in [0,1]
+		cr := shimmerBase[0] + int(float64(shimmerPeak[0]-shimmerBase[0])*t)
+		cg := shimmerBase[1] + int(float64(shimmerPeak[1]-shimmerBase[1])*t)
+		cb := shimmerBase[2] + int(float64(shimmerPeak[2]-shimmerBase[2])*t)
+		hex := fmt.Sprintf("#%02X%02X%02X", cr, cg, cb)
+		sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(hex)).Render(string(r)))
 	}
 	return sb.String()
 }
