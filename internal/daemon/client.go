@@ -97,6 +97,11 @@ const (
 	CapClientMessageQueue    = "client_message_queue"
 	CapScheduleBroadcastGate = "schedule_broadcast_gate"
 	CapIMTimelineV1          = "im_timeline_v1"
+	// CapProactiveTargeting tells Cloud the daemon may attach an IMStatusContext
+	// to a ProactivePayload for precise routing. Observability only — the
+	// fallback rule is "non-empty target → targeted; empty → broadcast", so the
+	// token is not load-bearing for correctness.
+	CapProactiveTargeting = "proactive_targeting"
 )
 
 var Capabilities = []string{
@@ -108,6 +113,7 @@ var Capabilities = []string{
 	CapIMMessageLifecycleV1,
 	CapIMTimelineV1,
 	CapScheduleBroadcastGate,
+	CapProactiveTargeting,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
@@ -336,15 +342,20 @@ func (c *Client) SendReply(messageID string, payload ReplyPayload) error {
 // Empty agentName is a valid case: it represents the default agent, which Cloud
 // routes to channels whose config has no agent_name key (default-bound). Cloud
 // owns the "is anyone listening" decision; daemon doesn't pre-filter.
-func (c *Client) SendProactive(agentName, text, sessionID string) error {
+//
+// imStatusContext is the opaque routing target echoed back to Cloud for precise
+// delivery to the originating IM thread; empty (nil) → Cloud falls back to
+// broadcast (preserving pre-targeting behavior).
+func (c *Client) SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage) error {
 	if text == "" {
 		return nil
 	}
 	payload, err := json.Marshal(ProactivePayload{
-		AgentName: agentName,
-		Text:      text,
-		Format:    FormatText,
-		SessionID: sessionID,
+		AgentName:       agentName,
+		Text:            text,
+		Format:          FormatText,
+		SessionID:       sessionID,
+		IMStatusContext: imStatusContext,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal proactive payload: %w", err)

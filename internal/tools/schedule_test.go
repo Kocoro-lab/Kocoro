@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -285,6 +286,55 @@ func TestScheduleTool_Create_InheritsAgentFromCtxWhenArgMissing(t *testing.T) {
 	}
 	if list[0].Agent != "academic-writer" {
 		t.Errorf("agent = %q, want %q (ctx fallback)", list[0].Agent, "academic-writer")
+	}
+}
+
+func TestScheduleTool_Create_SnapshotsIMStatusContext(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "academic-writer", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	// Simulate an IM-originated run: the loop injected the inbound routing blob.
+	blob := json.RawMessage(`{"platform":"slack","channel_id":"C1","message_ts":"123.45"}`)
+	ctx := agent.WithIMStatusContext(agent.WithAgentName(context.Background(), "academic-writer"), blob)
+	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check","description":"test"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+	list, _ := mgr.List()
+	if len(list) != 1 {
+		t.Fatalf("want 1 schedule, got %d", len(list))
+	}
+	// schedules.json is saved with MarshalIndent, which re-indents the opaque
+	// blob; compare semantically (compacted) since Cloud parses it as JSON.
+	var gotBuf, wantBuf bytes.Buffer
+	if err := json.Compact(&gotBuf, list[0].IMStatusContext); err != nil {
+		t.Fatalf("compact stored blob: %v", err)
+	}
+	if err := json.Compact(&wantBuf, blob); err != nil {
+		t.Fatalf("compact want blob: %v", err)
+	}
+	if gotBuf.String() != wantBuf.String() {
+		t.Errorf("IMStatusContext = %s, want %s (snapshot from ctx)", gotBuf.String(), wantBuf.String())
+	}
+}
+
+func TestScheduleTool_Create_NoIMStatusContextWhenAbsent(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "academic-writer", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	ctx := agent.WithAgentName(context.Background(), "academic-writer") // non-IM run: no blob
+	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check","description":"test"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+	list, _ := mgr.List()
+	if len(list) != 1 {
+		t.Fatalf("want 1 schedule, got %d", len(list))
+	}
+	if len(list[0].IMStatusContext) != 0 {
+		t.Errorf("IMStatusContext = %q, want empty (no ctx blob → falls back to broadcast)", list[0].IMStatusContext)
 	}
 }
 

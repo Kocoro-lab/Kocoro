@@ -676,6 +676,42 @@ func TestResolveLatestSession_ReturnsStoredCWD(t *testing.T) {
 	}
 }
 
+func TestResolveLatestSession_SkipsNonInteractive(t *testing.T) {
+	dir := t.TempDir()
+	sessionsDir := dir + "/agents/hb/sessions"
+	store := session.NewStore(sessionsDir)
+	// Only schedule + IM sessions — no interactive chat. Heartbeat must skip.
+	store.Save(&session.Session{ID: "sched", Source: "schedule",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("s")}}})
+	store.Save(&session.Session{ID: "im", Source: "slack",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("i")}}})
+
+	sc := NewSessionCache(dir)
+	if _, err := sc.ResolveLatestSession("agent:hb", sessionsDir); err == nil {
+		t.Fatal("expected error (no interactive session) so heartbeat skips cleanly")
+	}
+}
+
+func TestResolveLatestSession_PicksInteractiveNotNewerSchedule(t *testing.T) {
+	dir := t.TempDir()
+	sessionsDir := dir + "/agents/hb/sessions"
+	store := session.NewStore(sessionsDir)
+	store.Save(&session.Session{ID: "chat", Source: "desktop",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("c")}}})
+	time.Sleep(10 * time.Millisecond)
+	store.Save(&session.Session{ID: "sched", Source: "schedule",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("s")}}})
+
+	sc := NewSessionCache(dir)
+	snapshot, err := sc.ResolveLatestSession("agent:hb", sessionsDir)
+	if err != nil {
+		t.Fatalf("ResolveLatestSession: %v", err)
+	}
+	if snapshot.ID != "chat" {
+		t.Fatalf("resolved %q, want interactive 'chat' (not the newer schedule session)", snapshot.ID)
+	}
+}
+
 func TestAppendToSession_NoRoute(t *testing.T) {
 	sc := NewSessionCache(t.TempDir())
 	err := sc.AppendToSession("agent:nonexistent", "", "some-id", nil)

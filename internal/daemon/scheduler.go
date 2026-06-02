@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"runtime/debug"
@@ -173,31 +174,55 @@ func (s *Scheduler) runSchedule(ctx context.Context, sched schedule.Schedule) {
 }
 
 // buildScheduleRequest constructs the RunAgentRequest for a scheduled run.
-// Extracted as a seam so tests can verify field plumbing — especially the
-// Stateful → OmitHistory mapping — without spinning up the full RunAgent
-// machinery. Legacy schedules (Stateful == nil) preserve their pre-feature
-// stateful behaviour (OmitHistory stays false).
+// Extracted as a seam so tests can verify field plumbing — the SessionScope →
+// route-target mapping and the Stateful → OmitHistory mapping — without
+// spinning up the full RunAgent machinery.
+//
+// Two orthogonal switches:
+//   - SessionScope (scope): fresh → a brand-new session every run, for the
+//     default AND named agents; sticky → one dedicated, accumulating session
+//     per schedule, addressed by a preset route key.
+//   - Stateful (history): controls only the LLM's view of history within the
+//     selected session (runner.historySnapshotForRequest / OmitHistory).
+//     Legacy schedules (Stateful == nil) keep pre-feature stateful behaviour.
+//     For a fresh session there is no prior history regardless, so Stateful is
+//     effectively moot (the UI grays it out).
 func buildScheduleRequest(sched schedule.Schedule, stickyContext string) RunAgentRequest {
-	return RunAgentRequest{
-		Text:    sched.Prompt,
-		Agent:   sched.Agent,
-		Source:  ChannelSchedule,
-		Channel: ChannelSchedule + "-" + sched.ID,
-		Sender:  "scheduler",
-		// Default agent (no name) gets a fresh session per run; named agents
-		// resume their single long-lived session — but if Stateful is *false,
-		// OmitHistory below makes the LLM see an empty history regardless.
-		//
-		// Stateful: true with a default agent is a silent no-op: NewSession=true
-		// forces a fresh session per run so there's never prior history to
-		// preserve. The schedule_create tool description warns the LLM
-		// ("ignored for the default agent") rather than the manager rejecting
-		// the combo — keeps the wire shape simple and lets the user toggle
-		// the flag without an agent rename.
-		NewSession:    sched.Agent == "",
+	req := RunAgentRequest{
+		Text:          sched.Prompt,
+		Agent:         sched.Agent,
+		Source:        ChannelSchedule,
+		Channel:       ChannelSchedule + "-" + sched.ID,
+		Sender:        "scheduler",
 		OmitHistory:   sched.IsStateless(),
 		StickyContext: stickyContext,
 	}
+	if sched.IsSticky() {
+		// Pin the dedicated route key. PinnedRouteKey (not RouteKey) because
+		// RunAgent recomputes RouteKey via ComputeRouteKey after @mention
+		// resolution; ComputeRouteKey returns the pinned key verbatim so it
+		// survives. The composite key persists (shouldPersistRouteKey == true)
+		// and resolves via ResumeLatestByRouteKey, giving one session per
+		// schedule that accumulates across runs and daemon restarts.
+		req.PinnedRouteKey = scheduleStickyRouteKey(sched.Agent, sched.ID)
+	} else {
+		// fresh: a new session every run. Previously only the default agent did
+		// this (NewSession: sched.Agent==""); named agents parasitized the
+		// shared agent:<name> session. Now both honor the scope switch.
+		req.NewSession = true
+	}
+	return req
+}
+
+// scheduleStickyRouteKey is the dedicated route key for a sticky schedule's
+// accumulating session: agent:<name>:schedule:<id> for a named agent, or
+// schedule:<id> for the default agent. Both are composite (non-plain) keys, so
+// they persist on the session and resolve via ResumeLatestByRouteKey.
+func scheduleStickyRouteKey(agent, id string) string {
+	if agent == "" {
+		return "schedule:" + id
+	}
+	return "agent:" + agent + ":schedule:" + id
 }
 
 // ScheduleRunUsage is the per-run token-usage block emitted on succeeded
@@ -263,9 +288,8 @@ func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAge
 	// pointer. MarkLastRun is a silent no-op on empty sessionID (covered
 	// by Manager.MarkLastRun contract), so hard errors that crashed
 	// before session resolution leave LastRun untouched. The index range
-	// pins down the precise slice of sess.Messages this run wrote, which
-	// matters because named-agent sessions are shared across multiple
-	// schedules + interactive chat.
+	// pins down the precise slice of sess.Messages this run wrote, isolating
+	// it from earlier runs in a sticky (accumulating) session.
 	if s.deps != nil && s.deps.ScheduleManager != nil {
 		if err := s.deps.ScheduleManager.MarkLastRun(sched.ID, sessionID, time.Now(), startIdx, endIdx); err != nil {
 			log.Printf("scheduler: MarkLastRun failed for %s: %v", sched.ID, err)
@@ -382,7 +406,7 @@ func (h *scheduleHandler) OnApprovalNeeded(tool string, args string) bool {
 // without standing up a real WebSocket server. Mirrors LifecycleEventSender
 // in lifecycle.go.
 type ProactiveSender interface {
-	SendProactive(agentName, text, sessionID string) error
+	SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage) error
 }
 
 // broadcastReply forwards a successful schedule reply to every Cloud channel
@@ -397,7 +421,9 @@ func broadcastReply(ws ProactiveSender, sched *schedule.Schedule, reply, session
 	if !shouldBroadcast(sched) {
 		return
 	}
-	if err := ws.SendProactive(sched.Agent, reply, sessionID); err != nil {
+	// Pass the schedule's snapshotted IM routing blob (empty for Desktop/cron-
+	// created schedules → Cloud broadcasts, preserving prior behavior).
+	if err := ws.SendProactive(sched.Agent, reply, sessionID, sched.IMStatusContext); err != nil {
 		log.Printf("scheduler: proactive send failed for schedule %s: %v", sched.ID, err)
 	}
 }

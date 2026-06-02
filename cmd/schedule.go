@@ -70,10 +70,11 @@ var scheduleListCmd = &cobra.Command{
 }
 
 var (
-	schedCreateAgent    string
-	schedCreateCron     string
-	schedCreatePrompt   string
-	schedCreateStateful bool
+	schedCreateAgent        string
+	schedCreateCron         string
+	schedCreatePrompt       string
+	schedCreateStateful     bool
+	schedCreateSessionScope string
 )
 
 var scheduleCreateCmd = &cobra.Command{
@@ -90,7 +91,8 @@ var scheduleCreateCmd = &cobra.Command{
 		// CLI-created schedules to broadcast must edit ~/.shannon/schedules.json
 		// or re-create the schedule via the LLM (schedule_create tool) where
 		// the broadcast enum is exposed.
-		id, err := mgr.Create(schedCreateAgent, schedCreateCron, schedCreatePrompt, schedCreateStateful)
+		id, err := mgr.CreateWithOpts(schedCreateAgent, schedCreateCron, schedCreatePrompt, schedCreateStateful,
+			schedule.CreateOpts{SessionScope: schedCreateSessionScope})
 		if err != nil {
 			return err
 		}
@@ -100,9 +102,10 @@ var scheduleCreateCmd = &cobra.Command{
 }
 
 var (
-	schedUpdateCron     string
-	schedUpdatePrompt   string
-	schedUpdateStateful string // "" | parseable bool
+	schedUpdateCron         string
+	schedUpdatePrompt       string
+	schedUpdateStateful     string // "" | parseable bool
+	schedUpdateSessionScope string // "" | "fresh" | "sticky"
 )
 
 var scheduleUpdateCmd = &cobra.Command{
@@ -114,8 +117,8 @@ var scheduleUpdateCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if schedUpdateCron == "" && schedUpdatePrompt == "" && statefulPtr == nil {
-			return fmt.Errorf("at least one of --cron, --prompt, --stateful is required")
+		if schedUpdateCron == "" && schedUpdatePrompt == "" && statefulPtr == nil && schedUpdateSessionScope == "" {
+			return fmt.Errorf("at least one of --cron, --prompt, --stateful, --session-scope is required")
 		}
 		mgr := newScheduleManager()
 		opts := &schedule.UpdateOpts{Stateful: statefulPtr}
@@ -124,6 +127,9 @@ var scheduleUpdateCmd = &cobra.Command{
 		}
 		if schedUpdatePrompt != "" {
 			opts.Prompt = &schedUpdatePrompt
+		}
+		if schedUpdateSessionScope != "" {
+			opts.SessionScope = &schedUpdateSessionScope
 		}
 		if err := mgr.Update(args[0], opts); err != nil {
 			return err
@@ -184,11 +190,16 @@ func init() {
 	scheduleCreateCmd.Flags().BoolVar(&schedCreateStateful, "stateful", false,
 		"Preserve LLM conversation history across runs (default false: each run starts with empty context). "+
 			"Set --stateful for tasks that genuinely need cross-run memory.")
+	scheduleCreateCmd.Flags().StringVar(&schedCreateSessionScope, "session-scope", "",
+		"Session scope for named agents: 'fresh' (default, a new session each run) or 'sticky' "+
+			"(one dedicated session per schedule that accumulates across runs).")
 
 	scheduleUpdateCmd.Flags().StringVar(&schedUpdateCron, "cron", "", "New cron expression")
 	scheduleUpdateCmd.Flags().StringVar(&schedUpdatePrompt, "prompt", "", "New prompt")
 	scheduleUpdateCmd.Flags().StringVar(&schedUpdateStateful, "stateful", "",
 		"Change history-preservation behaviour: 'true', 'false', or omit to leave unchanged.")
+	scheduleUpdateCmd.Flags().StringVar(&schedUpdateSessionScope, "session-scope", "",
+		"Change session scope: 'fresh' or 'sticky'; omit to leave unchanged.")
 
 	scheduleCmd.AddCommand(scheduleListCmd)
 	scheduleCmd.AddCommand(scheduleCreateCmd)

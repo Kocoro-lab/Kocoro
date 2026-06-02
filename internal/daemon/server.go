@@ -1091,6 +1091,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		if _, ok := awaitingIDs[sum.ID]; ok {
 			sum.AwaitingApproval = true
 		}
+		sum.Kind = kindOf(sum.Source)
 		filtered = append(filtered, sum)
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": filtered})
@@ -1582,11 +1583,11 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	if req.Agent == "default" {
 		req.Agent = ""
 	}
-	// Named agents always resume their single long-lived session.
-	// Clear new_session so clients cannot fork a named agent's context.
-	if req.Agent != "" {
-		req.NewSession = false
-	}
+	// Named agents honor new_session / session_id exactly like the default
+	// agent — they are no longer locked to a single long-lived session.
+	// Forking is driven by ComputeRouteKey (session_id → exact resume;
+	// new_session → fresh) and the kind-filtered cold-start fallback
+	// (resumeNamedAgentColdStart resolves the latest interactive session).
 	req.EnsureRouteKey()
 	if err := req.Validate(); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
@@ -4213,6 +4214,7 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		Prompt            string  `json:"prompt"`
 		Stateful          *bool   `json:"stateful"` // nil → default (false / stateless); explicit overrides
 		Broadcast         *string `json:"broadcast,omitempty"`
+		SessionScope      string  `json:"session_scope,omitempty"` // "fresh"|"sticky"; "" → fresh
 		CreatedFromSource string  `json:"created_from_source,omitempty"`
 	}
 	if !decodeBody(w, r, &req) {
@@ -4226,7 +4228,7 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("created_from_source %q is not a recognized origin", req.CreatedFromSource))
 		return
 	}
-	opts := schedule.CreateOpts{CreatedFromSource: req.CreatedFromSource}
+	opts := schedule.CreateOpts{CreatedFromSource: req.CreatedFromSource, SessionScope: req.SessionScope}
 	if req.Broadcast != nil {
 		bPtr, ok := schedule.ParseBroadcastEnum(*req.Broadcast)
 		if !ok {
@@ -4264,21 +4266,23 @@ func (s *Server) handlePatchSchedule(w http.ResponseWriter, r *http.Request) {
 		Cron      *string `json:"cron"`
 		Prompt    *string `json:"prompt"`
 		Enabled   *bool   `json:"enabled"`
-		Stateful  *bool   `json:"stateful"`
-		Broadcast *string `json:"broadcast,omitempty"` // "auto"|"on"|"off"; absent leaves field unchanged
+		Stateful     *bool   `json:"stateful"`
+		Broadcast    *string `json:"broadcast,omitempty"`     // "auto"|"on"|"off"; absent leaves field unchanged
+		SessionScope *string `json:"session_scope,omitempty"` // "fresh"|"sticky"; absent leaves field unchanged
 	}
 	if !decodeBody(w, r, &patch) {
 		return
 	}
-	if patch.Cron == nil && patch.Prompt == nil && patch.Enabled == nil && patch.Stateful == nil && patch.Broadcast == nil {
-		writeError(w, http.StatusBadRequest, "no fields to update: provide at least one of cron, prompt, enabled, stateful, or broadcast")
+	if patch.Cron == nil && patch.Prompt == nil && patch.Enabled == nil && patch.Stateful == nil && patch.Broadcast == nil && patch.SessionScope == nil {
+		writeError(w, http.StatusBadRequest, "no fields to update: provide at least one of cron, prompt, enabled, stateful, broadcast, or session_scope")
 		return
 	}
 	update := &schedule.UpdateOpts{
-		Cron:     patch.Cron,
-		Prompt:   patch.Prompt,
-		Enabled:  patch.Enabled,
-		Stateful: patch.Stateful,
+		Cron:         patch.Cron,
+		Prompt:       patch.Prompt,
+		Enabled:      patch.Enabled,
+		Stateful:     patch.Stateful,
+		SessionScope: patch.SessionScope,
 	}
 	// Parse the optional broadcast enum. Absent → leave Schedule.Broadcast
 	// alone (UpdateOpts.Broadcast == nil). Present → ParseBroadcastEnum maps

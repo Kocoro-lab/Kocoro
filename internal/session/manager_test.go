@@ -158,6 +158,103 @@ func TestManager_ResumeLatestByRouteKey_FindsLatestMatchingRoute(t *testing.T) {
 	}
 }
 
+// interactiveLike stands in for the daemon's isInteractiveSource predicate
+// (the daemon package can't be imported here — it imports session). The real
+// exclusion rule is tested in internal/daemon/sessionkind_test.go.
+func interactiveLike(source string) bool {
+	switch source {
+	case "", "desktop", "kocoro", "tui", "cli":
+		return true
+	default:
+		return false
+	}
+}
+
+func TestManager_ResumeLatestMatching_SkipsNonMatchingAndPicksLatest(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	defer store.Close()
+
+	// Save in increasing updated_at order: the newest overall ("im-new") is an
+	// IM session, so the predicate must skip it and land on the newest
+	// *interactive* session ("chat-2").
+	save := func(id, source string) {
+		store.Save(&Session{
+			ID:     id,
+			Source: source,
+			Messages: []client.Message{
+				{Role: "user", Content: client.NewTextContent(id)},
+			},
+		})
+		time.Sleep(10 * time.Millisecond)
+	}
+	save("im-old", "slack")
+	save("chat-1", "")        // interactive (empty source — legacy/Desktop)
+	save("sched", "schedule") // schedule
+	save("chat-2", "desktop") // interactive — newest interactive
+	save("im-new", "feishu")  // newest overall, but IM
+
+	m := NewManager(dir)
+	defer m.Close()
+	sess, err := m.ResumeLatestMatching(interactiveLike)
+	if err != nil {
+		t.Fatalf("ResumeLatestMatching: %v", err)
+	}
+	if sess == nil {
+		t.Fatal("expected a session, got nil")
+	}
+	if sess.ID != "chat-2" {
+		t.Fatalf("resumed %q, want chat-2 (latest interactive, not the newer IM session)", sess.ID)
+	}
+	if current := m.Current(); current == nil || current.ID != "chat-2" {
+		t.Fatalf("current = %#v, want chat-2", current)
+	}
+}
+
+func TestManager_ResumeLatestMatching_ReturnsNilWhenNoneMatch(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	defer store.Close()
+
+	// Agent with only schedule/IM sessions — no interactive chat to resume.
+	store.Save(&Session{ID: "sched", Source: "schedule",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("s")}}})
+	store.Save(&Session{ID: "im", Source: "slack",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("i")}}})
+
+	m := NewManager(dir)
+	defer m.Close()
+	sess, err := m.ResumeLatestMatching(interactiveLike)
+	if err != nil {
+		t.Fatalf("ResumeLatestMatching: %v", err)
+	}
+	if sess != nil {
+		t.Fatalf("expected nil (no interactive session), got %q", sess.ID)
+	}
+}
+
+func TestManager_ResumeLatestMatching_NilPredFallsBackToLatest(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	defer store.Close()
+
+	store.Save(&Session{ID: "a", Source: "slack",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("a")}}})
+	time.Sleep(10 * time.Millisecond)
+	store.Save(&Session{ID: "b", Source: "schedule",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("b")}}})
+
+	m := NewManager(dir)
+	defer m.Close()
+	sess, err := m.ResumeLatestMatching(nil)
+	if err != nil {
+		t.Fatalf("ResumeLatestMatching(nil): %v", err)
+	}
+	if sess == nil || sess.ID != "b" {
+		t.Fatalf("nil pred should resume newest-regardless (b), got %#v", sess)
+	}
+}
+
 func TestManager_ResetClearsRouteKey(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(dir)

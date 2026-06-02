@@ -78,6 +78,15 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 							"false (default, recommended): each run starts with no prior conversation history — best for digests, polling, daily reports, monitoring, and any task where runs are independent. " +
 							"true: each run sees the conversation from prior runs — only choose this when the user explicitly wants the agent to remember and build on previous runs (e.g. continuous research, ongoing project tracking with follow-up questions).",
 					},
+					"session_scope": map[string]any{
+						"type":    "string",
+						"enum":    []string{"fresh", "sticky"},
+						"default": "fresh",
+						"description": "How runs map onto sessions (orthogonal to stateful; only meaningful for named agents). " +
+							"\"fresh\" (default, recommended): every run starts in a brand-new session — best for digests, polling, reports, monitoring, independent runs. " +
+							"\"sticky\": all runs of this schedule share one dedicated session that accumulates across runs and daemon restarts — choose when the user wants the agent to build continuously on this schedule's OWN prior runs (a rolling standup/journal). " +
+							"stateful decides whether the LLM SEES history; session_scope decides WHICH session runs write to. With \"fresh\", stateful is moot (a new session has no history).",
+					},
 					"broadcast": map[string]any{
 						"type": "string",
 						"enum": []string{"auto", "on", "off"},
@@ -115,6 +124,11 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 					"stateful": map[string]any{
 						"type":        "boolean",
 						"description": "Change history-preservation behaviour for named-agent schedules. Omit to leave unchanged. false = each run starts fresh; true = each run sees prior history. Has no effect on default-agent schedules.",
+					},
+					"session_scope": map[string]any{
+						"type":        "string",
+						"enum":        []string{"fresh", "sticky"},
+						"description": "Change the session scope for named-agent schedules. Omit to leave unchanged. \"fresh\" = new session each run; \"sticky\" = one dedicated accumulating session per schedule.",
 					},
 					"broadcast": map[string]any{
 						"type": "string",
@@ -212,13 +226,32 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			}
 			broadcast = b
 		}
+		// Parse session_scope ("fresh" | "sticky"); absent → "" (defaults to
+		// fresh in the schedule manager).
+		var sessionScope string
+		if raw, present := args["session_scope"]; present && raw != nil {
+			s, isStr := raw.(string)
+			if !isStr {
+				return agent.ValidationError(fmt.Sprintf("session_scope must be a string (\"fresh\" or \"sticky\"); got %T", raw)), nil
+			}
+			if s != "" && s != schedule.SessionScopeFresh && s != schedule.SessionScopeSticky {
+				return agent.ValidationError(fmt.Sprintf("session_scope must be \"fresh\" or \"sticky\"; got %q", s)), nil
+			}
+			sessionScope = s
+		}
 		// Capture per-call source for the broadcast gate's smart default.
 		// Empty / not-in-ctx both map to "" — downstream treats both as
 		// "unknown source" and the gate falls through to silent.
 		createdFromSource, _ := agent.SourceFromContext(ctx)
+		// Snapshot the run's inbound IM routing blob (if any) as the schedule's
+		// proactive-delivery target. Empty for non-IM runs (Desktop/TUI/CLI),
+		// in which case the eventual run falls back to broadcast.
+		imStatusContext, _ := agent.IMStatusContextFromContext(ctx)
 		id, err := t.manager.CreateWithOpts(agentName, cron, prompt, stateful, schedule.CreateOpts{
 			Broadcast:         broadcast,
 			CreatedFromSource: createdFromSource,
+			SessionScope:      sessionScope,
+			IMStatusContext:   imStatusContext,
 		})
 		if err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
@@ -295,12 +328,24 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			}
 			opts.Broadcast = &schedule.BroadcastOpt{Value: b}
 		}
+		// Parse session_scope. Absent → leave unchanged; present → overwrite
+		// ("fresh" | "sticky").
+		if raw, present := args["session_scope"]; present && raw != nil {
+			s, isStr := raw.(string)
+			if !isStr {
+				return agent.ValidationError(fmt.Sprintf("session_scope must be a string (\"fresh\" or \"sticky\"); got %T", raw)), nil
+			}
+			if s != "" && s != schedule.SessionScopeFresh && s != schedule.SessionScopeSticky {
+				return agent.ValidationError(fmt.Sprintf("session_scope must be \"fresh\" or \"sticky\"; got %q", s)), nil
+			}
+			opts.SessionScope = &s
+		}
 		// When no field is set, treat as a no-op success rather than an
 		// error: a degenerate `{id, description}` call still produced a
 		// well-formed response (the schedule exists, nothing needed to
 		// change). Manager.Update has its own "no fields" guard so we
 		// must short-circuit here before calling it.
-		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil {
+		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil && opts.SessionScope == nil {
 			return agent.ToolResult{Content: fmt.Sprintf("Schedule %s unchanged (no fields specified).", id)}, nil
 		}
 		if err := t.manager.Update(id, opts); err != nil {

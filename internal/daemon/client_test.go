@@ -721,7 +721,7 @@ func TestSendProactive_AllowsEmptyAgentName(t *testing.T) {
 		},
 	}
 
-	if err := c.SendProactive("", "hello from default", "sess-1"); err != nil {
+	if err := c.SendProactive("", "hello from default", "sess-1", nil); err != nil {
 		t.Fatalf("SendProactive returned error: %v", err)
 	}
 	if captured.Type != MsgTypeProactive {
@@ -754,7 +754,7 @@ func TestSendProactive_StillDropsEmptyText(t *testing.T) {
 			return nil
 		},
 	}
-	if err := c.SendProactive("named-agent", "", "sess-2"); err != nil {
+	if err := c.SendProactive("named-agent", "", "sess-2", nil); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if called {

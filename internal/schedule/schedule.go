@@ -33,6 +33,18 @@ type Schedule struct {
 	// only the LLM's view (runner.historySnapshotForRequest) is affected.
 	Stateful *bool `json:"stateful,omitempty"`
 
+	// SessionScope selects how scheduled runs map onto sessions (the "session
+	// scope" switch — orthogonal to Stateful):
+	//   "" / "fresh" → a brand-new session every run (default; legacy rows have
+	//                  no value and resolve to fresh via EffectiveSessionScope).
+	//   "sticky"     → one dedicated session per schedule (route key
+	//                  agent:<name>:schedule:<id>, or schedule:<id> for the
+	//                  default agent) that accumulates across runs and daemon
+	//                  restarts.
+	// Stateful still controls the LLM's history view within whichever session
+	// the scope selects.
+	SessionScope string `json:"session_scope,omitempty"`
+
 	// Broadcast is a three-state opt-in/out for IM channel push:
 	//   nil   → smart default (see internal/daemon/broadcast_gate.shouldBroadcast)
 	//   true  → always broadcast (regardless of CreatedFromSource)
@@ -46,6 +58,16 @@ type Schedule struct {
 	// schedule was saved) — treated as unknown and falls through to silent.
 	CreatedFromSource string `json:"created_from_source,omitempty"`
 
+	// IMStatusContext is the opaque platform routing blob snapshotted from the
+	// inbound IM message at schedule-CREATION time (when the schedule is created
+	// during an IM conversation). It is echoed back to Cloud in the proactive
+	// push so a run that fires hours/days later is routed to the originating IM
+	// thread instead of broadcast — the inbound claim's TTL has long expired by
+	// then, which is why it must be snapshotted at creation, not fetched at run
+	// time. Empty when created from Desktop/TUI/CLI/cron (those fall back to
+	// broadcast). The daemon never decodes it. See the proactive-targeting design.
+	IMStatusContext json.RawMessage `json:"im_status_context,omitempty"`
+
 	// LastRunAt is the wall-clock time of the most recent scheduler-triggered
 	// run (succeeded or failed). nil = never run. Stamped by
 	// Manager.MarkLastRun from the scheduler's runWithLifecycle.
@@ -57,12 +79,12 @@ type Schedule struct {
 	LastRunSessionID string `json:"last_run_session_id,omitempty"`
 
 	// LastRunMessageStartIndex / LastRunMessageEndIndex pin down the precise
-	// slice of sess.Messages this run wrote. Required because the named-agent
-	// route key is `agent:<name>` (SessionCache.agentRouteKey in router.go) —
-	// every schedule + every interactive chat with the same agent shares one
-	// session, so without an index range, schedule_show would return the
-	// session's tail (which could be the user's last chat reply, not the
-	// schedule's output). When the schedule has never run, both default to 0;
+	// slice of sess.Messages this run wrote, so SummarizeLastRun returns just
+	// this run's turns. With per-scope dedicated sessions (see SessionScope)
+	// this is reliable: a fresh run owns its whole session, and a sticky
+	// session — though it accumulates many runs — is never polluted by
+	// interactive chat or other schedules, so the range still isolates the
+	// most recent run. When the schedule has never run, both default to 0;
 	// combined with the empty LastRunSessionID this unambiguously signals
 	// never-run.
 	LastRunMessageStartIndex int `json:"last_run_message_start_index,omitempty"`
@@ -74,6 +96,27 @@ type Schedule struct {
 // pre-feature stateful behaviour.
 func (s *Schedule) IsStateless() bool {
 	return s.Stateful != nil && !*s.Stateful
+}
+
+// Session scope values for Schedule.SessionScope.
+const (
+	SessionScopeFresh  = "fresh"
+	SessionScopeSticky = "sticky"
+)
+
+// EffectiveSessionScope resolves SessionScope, defaulting an empty/absent or
+// unrecognized value to "fresh" (the legacy + new-schedule default).
+func (s *Schedule) EffectiveSessionScope() string {
+	if s.SessionScope == SessionScopeSticky {
+		return SessionScopeSticky
+	}
+	return SessionScopeFresh
+}
+
+// IsSticky reports whether scheduled runs share one dedicated, accumulating
+// session (vs a fresh session each run).
+func (s *Schedule) IsSticky() bool {
+	return s.EffectiveSessionScope() == SessionScopeSticky
 }
 
 type UpdateOpts struct {
@@ -90,6 +133,9 @@ type UpdateOpts struct {
 	// Go doesn't allow nested-pointer literals naturally, so callers use
 	// the BroadcastOpt wrapper below to express "clear vs leave alone".
 	Broadcast *BroadcastOpt
+	// SessionScope: nil = no change; non-nil = overwrite ("fresh" | "sticky" |
+	// "" which resolves to fresh). See Schedule.SessionScope.
+	SessionScope *string
 }
 
 // BroadcastOpt distinguishes "leave broadcast alone" (UpdateOpts.Broadcast == nil)
@@ -130,6 +176,15 @@ func validatePrompt(prompt string) error {
 		return fmt.Errorf("prompt contains null bytes")
 	}
 	return nil
+}
+
+func validateSessionScope(scope string) error {
+	switch scope {
+	case "", SessionScopeFresh, SessionScopeSticky:
+		return nil
+	default:
+		return fmt.Errorf("invalid session_scope %q (want %q or %q)", scope, SessionScopeFresh, SessionScopeSticky)
+	}
 }
 
 func (m *Manager) load() ([]Schedule, error) {
@@ -231,6 +286,13 @@ type CreateOpts struct {
 	// default in internal/daemon/broadcast_gate.shouldBroadcast. Empty
 	// string is acceptable and means "unknown / pre-feature caller".
 	CreatedFromSource string
+	// SessionScope is "fresh" | "sticky" | "" (defaults to fresh). See
+	// Schedule.SessionScope.
+	SessionScope string
+	// IMStatusContext snapshots the inbound IM routing blob (proactive
+	// delivery target). Empty for non-IM creation paths. See
+	// Schedule.IMStatusContext.
+	IMStatusContext json.RawMessage
 }
 
 func (m *Manager) Create(agentName, cron, prompt string, stateful bool) (string, error) {
@@ -250,6 +312,9 @@ func (m *Manager) CreateWithOpts(agentName, cron, prompt string, stateful bool, 
 	if err := validatePrompt(prompt); err != nil {
 		return "", err
 	}
+	if err := validateSessionScope(opts.SessionScope); err != nil {
+		return "", err
+	}
 	id := generateScheduleID()
 	statefulCopy := stateful
 	s := Schedule{
@@ -257,6 +322,8 @@ func (m *Manager) CreateWithOpts(agentName, cron, prompt string, stateful bool, 
 		Enabled: true, SyncStatus: "ok", CreatedAt: time.Now(),
 		Stateful:          &statefulCopy, // always explicit on Create — never leave nil for new rows
 		CreatedFromSource: opts.CreatedFromSource,
+		SessionScope:      opts.SessionScope,
+		IMStatusContext:   opts.IMStatusContext,
 	}
 	if opts.Broadcast != nil {
 		bCopy := *opts.Broadcast
@@ -289,8 +356,8 @@ func (m *Manager) Get(id string) (*Schedule, error) {
 }
 
 func (m *Manager) Update(id string, opts *UpdateOpts) error {
-	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil {
-		return fmt.Errorf("no fields to update: provide at least one of cron, prompt, enabled, stateful, or broadcast")
+	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil && opts.SessionScope == nil {
+		return fmt.Errorf("no fields to update: provide at least one of cron, prompt, enabled, stateful, broadcast, or session_scope")
 	}
 	if opts.Cron != nil {
 		if err := validateCron(*opts.Cron); err != nil {
@@ -299,6 +366,11 @@ func (m *Manager) Update(id string, opts *UpdateOpts) error {
 	}
 	if opts.Prompt != nil {
 		if err := validatePrompt(*opts.Prompt); err != nil {
+			return err
+		}
+	}
+	if opts.SessionScope != nil {
+		if err := validateSessionScope(*opts.SessionScope); err != nil {
 			return err
 		}
 	}
@@ -342,6 +414,9 @@ func (m *Manager) Update(id string, opts *UpdateOpts) error {
 						schedules[i].Broadcast = &bCopy
 					}
 				}
+				if opts.SessionScope != nil {
+					schedules[i].SessionScope = *opts.SessionScope
+				}
 				return schedules, nil
 			}
 		}
@@ -357,10 +432,9 @@ func (m *Manager) Update(id string, opts *UpdateOpts) error {
 // actual transcript slice on demand.
 //
 // The index range pins down precisely which slice of sess.Messages came
-// from this run, so SummarizeLastRun can return the correct turns even
-// when the session is shared across multiple schedules + interactive chat
-// (the named-agent route key is `agent:<name>`, which makes sharing the
-// common case).
+// from this run, so SummarizeLastRun can return just this run's turns —
+// in a sticky session that accumulates many runs, the range isolates the
+// most recent one.
 //
 // No-op cases:
 //   - id not found: schedule may have been deleted between dispatch and

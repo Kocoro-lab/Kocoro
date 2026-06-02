@@ -511,6 +511,41 @@ func (m *Manager) ResumeLatestByRouteKey(routeKey string) (*Session, error) {
 	return sess, nil
 }
 
+// ResumeLatestMatching loads the most recently updated session whose Source
+// satisfies pred, skipping sessions that don't match. Returns (nil, nil) when
+// no session matches — the caller should then start fresh. A nil pred falls
+// back to ResumeLatest (newest-regardless).
+//
+// Unlike ResumeLatest's index fast-path (which is route-key/source agnostic),
+// this filters on Source, so it scans the summary list. That is cheap:
+// SessionSummary already carries Source + UpdatedAt, and only the winning
+// session is loaded (via Resume). Resume applies the same current-swap locking
+// and session-close callbacks as ResumeLatestByRouteKey.
+func (m *Manager) ResumeLatestMatching(pred func(source string) bool) (*Session, error) {
+	if pred == nil {
+		return m.ResumeLatest()
+	}
+	summaries, err := m.store.List()
+	if err != nil {
+		return nil, err
+	}
+	var bestID string
+	var bestTime time.Time
+	for _, s := range summaries {
+		if !pred(s.Source) {
+			continue
+		}
+		if bestID == "" || s.UpdatedAt.After(bestTime) {
+			bestTime = s.UpdatedAt
+			bestID = s.ID
+		}
+	}
+	if bestID == "" {
+		return nil, nil
+	}
+	return m.Resume(bestID)
+}
+
 func generateID() string {
 	b := make([]byte, 6)
 	if _, err := rand.Read(b); err != nil {

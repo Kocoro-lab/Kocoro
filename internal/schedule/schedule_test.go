@@ -145,6 +145,53 @@ func TestEnableDisable(t *testing.T) {
 	}
 }
 
+func TestSessionScope_CreateUpdatePersistAndValidate(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(filepath.Join(dir, "schedules.json"))
+
+	id, err := mgr.CreateWithOpts("ops", "0 9 * * *", "standup", true, CreateOpts{SessionScope: SessionScopeSticky})
+	if err != nil {
+		t.Fatalf("CreateWithOpts: %v", err)
+	}
+	got, err := mgr.Get(id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.SessionScope != SessionScopeSticky {
+		t.Errorf("SessionScope = %q, want %q", got.SessionScope, SessionScopeSticky)
+	}
+	if !got.IsSticky() {
+		t.Error("IsSticky() = false, want true")
+	}
+
+	// Update to fresh.
+	if err := mgr.Update(id, &UpdateOpts{SessionScope: strPtr(SessionScopeFresh)}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	got, _ = mgr.Get(id)
+	if got.IsSticky() {
+		t.Error("after update to fresh, IsSticky() = true")
+	}
+
+	// Invalid scope rejected on both create and update.
+	if _, err := mgr.CreateWithOpts("ops", "0 9 * * *", "p", false, CreateOpts{SessionScope: "bogus"}); err == nil {
+		t.Error("CreateWithOpts with invalid scope must error")
+	}
+	if err := mgr.Update(id, &UpdateOpts{SessionScope: strPtr("bogus")}); err == nil {
+		t.Error("Update with invalid scope must error")
+	}
+}
+
+func TestEffectiveSessionScope_LegacyDefaultsFresh(t *testing.T) {
+	s := Schedule{ID: "x", Agent: "a"} // no SessionScope (legacy)
+	if s.EffectiveSessionScope() != SessionScopeFresh {
+		t.Errorf("legacy EffectiveSessionScope = %q, want %q", s.EffectiveSessionScope(), SessionScopeFresh)
+	}
+	if s.IsSticky() {
+		t.Error("legacy IsSticky() = true, want false")
+	}
+}
+
 func TestConcurrentCreates(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))

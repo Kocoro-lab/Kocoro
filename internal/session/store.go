@@ -272,6 +272,13 @@ type SessionSummary struct {
 	// waiting for the user to approve a tool call. Populated at HTTP-list
 	// time from ApprovalTracker; Store.List leaves it false.
 	AwaitingApproval bool `json:"awaiting_approval,omitempty"`
+	// Kind classifies the session by origin (interactive / im / schedule),
+	// derived from Source via the daemon's exclusion rule (see
+	// internal/daemon.kindOf). Populated at HTTP-list time by the daemon —
+	// Store.List leaves it empty because the IM-platform set lives in the
+	// daemon package and importing it here would create a cycle. Clients
+	// (Desktop session grouping) read this directly instead of re-deriving.
+	Kind string `json:"kind,omitempty"`
 	// Pinned mirrors Session.Pinned: sticky-to-top regardless of recency.
 	Pinned bool `json:"pinned,omitempty"`
 	// Favorite mirrors Session.Favorite: starred for filter views.

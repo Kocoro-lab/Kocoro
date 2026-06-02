@@ -73,6 +73,7 @@ type RunAgentRequest struct {
 	InjectOnly      bool                  `json:"inject_only,omitempty"`       // busy-state inject: on InjectNoActiveRun race, return 409 instead of starting a new run so the client re-queues locally (avoids duplicate run)
 	ClientMessageID string                `json:"client_message_id,omitempty"` // client-supplied id (e.g. Desktop queued-draft id) echoed back in the injected_committed SSE event when the loop drains this inject, so the client flips its queued card into a real bubble at the consume boundary
 	RouteKey        string                `json:"-"`                           // internal routing key
+	PinnedRouteKey  string                `json:"-"`                           // internal: returned verbatim by ComputeRouteKey so it survives the post-@mention recompute. Sticky schedules pin their dedicated agent:<name>:schedule:<id> key here; json:"-" so HTTP clients cannot pin an arbitrary route.
 	Ephemeral       bool                  `json:"-"`                           // caller owns persistence + events
 	ModelOverride   string                `json:"-"`                           // overrides agent model tier
 	BypassRouting   bool                  `json:"-"`                           // skip route lock (heartbeat runs)
@@ -113,6 +114,12 @@ func ComputeRouteKey(req RunAgentRequest) string {
 	if req.BypassRouting {
 		return ""
 	}
+	// A pinned key (sticky schedule) wins so the dedicated session survives the
+	// post-@mention recompute, which would otherwise collapse a named-agent
+	// schedule back to the plain agent:<name> key.
+	if req.PinnedRouteKey != "" {
+		return req.PinnedRouteKey
+	}
 	if req.SessionID != "" {
 		return "session:" + sanitizeRouteValue(req.SessionID)
 	}
@@ -135,7 +142,12 @@ func ComputeRouteKey(req RunAgentRequest) string {
 		}
 		return "default:" + sanitizeRouteValue(req.Source) + ":" + sanitizeRouteValue(req.Channel) + ":" + sanitizeRouteValue(req.Sender)
 	}
-	if req.Agent != "" {
+	// A named agent with no explicit session_id and no new_session resumes its
+	// latest interactive session: emit the plain key, resolved by the
+	// kind-filtered cold-start (resumeNamedAgentColdStart). new_session forks —
+	// fall through so the NewSession branch below yields "" and a fresh session
+	// is created (this is the D2 unlock; the branch order matters).
+	if req.Agent != "" && !req.NewSession {
 		return "agent:" + req.Agent
 	}
 	if req.NewSession || shouldBypassRouteCache(req.Source) {
@@ -1079,7 +1091,13 @@ func playwrightTurnStartProbeAction(before mcp.ServerHealth, playwrightLive bool
 // Returns true only when a session was actually loaded from disk; a fresh
 // in-memory session pre-created by the route manager does not count as resumed.
 func resumeNamedAgentColdStart(sessMgr *session.Manager) (bool, error) {
-	latest, err := sessMgr.ResumeLatest()
+	// Resume the latest INTERACTIVE session only — never a schedule/IM session
+	// that happens to be newer in this agent's directory. isInteractiveSource
+	// encodes the exclusion rule (see sessionkind.go); empty-source / "desktop"
+	// sessions (the bulk of real data, including pre-upgrade named-agent
+	// sessions written with no route_key) classify as interactive and resolve
+	// correctly here without any data migration.
+	latest, err := sessMgr.ResumeLatestMatching(isInteractiveSource)
 	if err != nil {
 		return false, err
 	}
