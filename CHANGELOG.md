@@ -2,6 +2,47 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.2.0 — 2026-06-02 — Agent display-name contract (breaking) + mid-run steering + TUI display polish
+
+Three threads. First, the **agent display-name contract is finalized and made breaking**: `POST /agents` no longer accepts a client-supplied slug — the slug is always minted server-side as `agent-<6hex>` and returned in the response, and `display_name` becomes required on create, immutable-via-config, and non-clearable on rename. Second, **mid-run steering** (PR #208): a follow-up sent while a run is in flight is injected into the live loop at the next iteration boundary instead of starting a new run, with a retract path for cancelled drafts. Third, **TUI display polish** (PR #209): live streaming preview, fuzzy slash matching, an adaptive light/dark palette, and CJK-correct display-width truncation.
+
+> **Cross-repo contract:** the breaking change is `POST /agents` — clients that created agents by passing an explicit `name` must now send `display_name` and read the generated slug from the response. Mid-run steering adds `POST /message` `inject_only` + `client_message_id` routing and `POST /inject/retract`, plus an `injected_committed` WS event; consumer is ShanClawDesktop (`DaemonClient`/`Streaming.swift` + `DaemonChatViewModel.swift`). The TUI changes are terminal-local presentation with no wire impact.
+
+### Added
+
+- **Mid-run steering — inject queued follow-ups into the live run** (PR #208, `6d66298`, `internal/daemon/`) — `POST /message` with `inject_only` + `client_message_id` routes a follow-up to the active run's `injectCh` when a run owns the route (text and attachments both inject); `inject_only` with no active run returns `409` so the client falls back to local queueing. The loop drains `injectCh` at each iteration top into one user turn and emits an `injected_committed` event (fanned out via the `InjectCommitHandler` optional interface). `POST /inject/retract` records a per-route one-shot tombstone so a follow-up cancelled before it drains never reaches the model; it only tombstones when a run owns the route, so a retract racing run-completion cannot leak.
+- **Stable error codes on display_name validation** (`f97bf73`, `internal/agents/`) — validation/conflict errors now carry a machine-readable `code` (`display_name_required` | `_too_long` | `_invalid_chars` | `_taken`) alongside the English `error` message, so clients localize by code instead of parsing text. Non-breaking: `error` stays the English fallback.
+- **TUI live streaming preview** (PR #209, `9637eea`, `internal/tui/`) — local LLM deltas are forwarded into a transient live-preview region under the spinner (tail-windowed, width-truncated), killing the "frozen" feel where a long answer showed only a spinner until the turn ended. Cleared at every commit boundary so it never duplicates the finalized answer. No daemon change — the agent loop already emitted `OnStreamDelta`.
+- **TUI fuzzy slash-command matching** (PR #209, `b05efb0`, `5246f77`) — case-insensitive subsequence matching (`/rsch` → `/research`) ranked after prefix hits, with matched-character highlighting; gated to prefix-only until 2+ chars are typed so a single character doesn't flood the menu.
+- **TUI footer key hints** (PR #209, `bb10f42`) — discoverability hints on the status bars (`/ commands`, `esc to interrupt`, labeled approval keys), plus a smoother gaussian-glow shimmer on the thinking spinner.
+
+### Changed
+
+- **`POST /agents` requires `display_name`; slug always server-generated** (breaking, `757dbd2`, `c6d4bf0`, `internal/daemon/server.go`, `internal/agents/`) — the slug is always minted server-side as `agent-<6hex>` and returned in the response; a client-supplied `name` is ignored. To customize a built-in agent, use `PUT` instead. **BREAKING CHANGE:** clients that created agents by passing an explicit `name` must now send `display_name` and read the generated slug from the response.
+- **Rename cannot clear `display_name`** (`d732ac4`) — `PUT /agents/{name}` with an empty/whitespace `display_name` now returns `400` instead of clearing the label; `null`/omitted still leaves it unchanged. A named agent must keep a human-readable name rather than fall back to its opaque slug.
+- **TUI adaptive color palette + CJK-correct display width** (PR #209, `0ddd72e`, `ed82efd`) — a centralized semantic palette (`theme.go`) using lipgloss `AdaptiveColor` replaces scattered raw 256-color indices that vanished on light terminals; markdown rendering falls back to glamour's light palette on light backgrounds (detected once in `New()` before the event loop grabs stdin). `truncate`/`truncateStr` now measure terminal **cells** (a CJK ideograph is 2 cells) instead of `len([]rune)`, fixing overflow that garbled Chinese tool lines / titles. Multi-line tool output in the Ctrl+O view is head/tail windowed (8/4) instead of flattened.
+
+### Fixed
+
+- **Preserve `display_name` across config-mutation paths** (`935c8b9`, `internal/daemon/server.go`) — the display-name contract was bypassable through three config endpoints: `PUT /agents/{name}/config` accepted a nested `config.display_name` and set it (bypassing the create/rename uniqueness check), and `DELETE /agents/{name}/config` / `PUT /agents/{name}` with `config:null` removed `config.yaml` wholesale, dropping the label so the agent fell back to its slug. All three now route through `clearAgentConfigPreservingDisplayName` / `readAgentConfigDisplayName` to preserve the label and ignore client-supplied nested values.
+- **Commit steering survivors inline at the end_turn guard** (PR #208, `aef2870`) — the end_turn drain-race guard stashed non-retracted survivors in a loop-local and relied on the next iteration's top-of-loop drain to commit them, but the `maxIter` check runs before the drain — so an end_turn one iteration before the cap dropped the survivor (steering injects have no mailbox to replay), stranding the client's queued-draft card. The inject-commit body is now extracted into `commitInjectedTurn` and called inline at the guard, so a survivor is recorded (and `injected_committed` fires) before any `maxIter` break.
+- **Include `display_name` in `GET /agents` list response** (`60f8be4`) — the list endpoint built its own DTO and omitted `display_name`, so clients couldn't render display names from the list. Wired `entry.DisplayName` into the response.
+
+### Docs
+
+- `references/agents.md` (bundled `kocoro` skill) — documented the display-name carve-out on the config endpoints (`PUT`/`DELETE /agents/{name}/config`, `config:null`) preserving the label.
+- `references/cancel.md` + `references/events.md` (PR #208) — documented `POST /inject/retract` and the `injected_committed` event.
+
+### Refactor
+
+- **Prune dead create-path branch** (`984c49d`) — slugs are now always server-generated, so the builtin-materialize branch in `handleCreateAgent` was unreachable (builtins are customized via `PUT`); removed it and fixed stale comments on `SetAgentDisplayName` / `ValidateDisplayName` describing an empty-display_name path no HTTP request can reach.
+
+### Tests
+
+- `internal/daemon/server_test.go` — `TestServer_DisplayName_ConfigMutationsPreserveLabel` (all three config-mutation paths), `TestServer_CreateAgent_IgnoresClientName` (pins the `json:"-"` server-generated-slug contract against slug-injection regression).
+- `internal/daemon/` — `maxIter=1` regression for the inline inject-commit, `content_inject` / `inject_busy_e2e` / `router_retract`, and `loop_inject_*` (commit / endturn-repro / retract).
+- `internal/tui/` — color-regression guard, CJK display width, head/tail windowing, plus theme/menu/stream/footer/markdown/width suites.
+
 ## v0.1.21 — 2026-06-01 — IM timeline output + approval-card cleanup notify + OSS hygiene
 
 Two daemon threads plus open-source hygiene. First, **IM timeline output** (PR #205): the daemon advertises a new `im_timeline_v1` WS capability and stops double-emitting the final answer, so an IM message renders as one ordered timeline (mid-turn narration interleaved with tool frames, then the final reply) instead of a duplicated trailing segment. Second, **daemon-originated approval terminations now notify Cloud**, so a Feishu/Slack approval card whose agent timed out or was cancelled no longer lingers as a zombie with live buttons. Plus open-source hygiene: external developer-tool references scrubbed from comments/docs, and a README demo GIF.
