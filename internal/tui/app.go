@@ -1260,7 +1260,9 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamDeltaMsg:
 		// Accumulate the in-flight answer into the transient preview region.
 		// Not committed to scrollback — agentDoneMsg renders the final answer.
-		m.streamLive += msg.delta
+		// Bound to a tail: the preview only shows the last streamPreviewLines, so
+		// there's no need to retain (and re-split every View) a 100K-char answer.
+		m.streamLive = boundStreamTail(m.streamLive + msg.delta)
 		return m, nil
 
 	case streamOutputMsg:
@@ -1365,6 +1367,25 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // none today — bump if the live region feels too cramped.
 const streamPreviewLines = 8
 
+// streamLiveMaxBytes caps the retained preview buffer. Only the last
+// streamPreviewLines are ever shown, so there's no point keeping (and
+// re-splitting each frame) more than a few screenfuls of a long answer.
+const streamLiveMaxBytes = 8192
+
+// boundStreamTail trims s to its last streamLiveMaxBytes, cut at a line boundary
+// so the preview never starts mid-line. Keeps streamPreview's per-frame work
+// O(streamLiveMaxBytes) regardless of total answer length.
+func boundStreamTail(s string) string {
+	if len(s) <= streamLiveMaxBytes {
+		return s
+	}
+	tail := s[len(s)-streamLiveMaxBytes:]
+	if i := strings.IndexByte(tail, '\n'); i >= 0 {
+		return tail[i+1:]
+	}
+	return tail
+}
+
 // streamPreview returns the last maxLines lines of the in-flight stream, each
 // truncated to the terminal width and dimmed. It deliberately truncates rather
 // than wraps so the live region stays a fixed height instead of ballooning.
@@ -1396,9 +1417,14 @@ func streamPreview(text string, width, maxLines int) string {
 // already be ANSI-styled; the fill uses the faint separator color. Width is
 // measured with lipgloss.Width so CJK/ANSI is accounted for.
 func composeBar(width int, left, right string) string {
+	if width < 0 {
+		width = 0
+	}
 	fill := width - lipgloss.Width(left) - lipgloss.Width(right)
 	if fill < 0 {
-		fill = 0
+		// Captions can't both fit; fall back to a plain full-width separator so
+		// the bar never overflows and wraps the input line on narrow terminals.
+		return styleFaint().Render(strings.Repeat("─", width))
 	}
 	return left + styleFaint().Render(strings.Repeat("─", fill)) + right
 }
@@ -1535,6 +1561,11 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// Local agent loop
 	m.state = stateProcessing
 	m.lastToolResults = nil
+	// Reset any live preview before the new run streams into it: a previous
+	// run's late OnStreamDelta (drained after its Esc-cancel) can re-seed
+	// streamLive, and clearing only on Esc would let that stale tail show as
+	// this run's preview until the first commit boundary.
+	m.streamLive = ""
 	m.processingStartTime = time.Now()
 	sess := m.sessions.Current()
 	// Set title from first user message
@@ -2707,6 +2738,9 @@ func (m *Model) updateMenu() {
 	var prefixPos, fuzzyPos [][]int
 	for _, c := range m.slashCommands {
 		if strings.HasPrefix(strings.ToLower(c.cmd), lowIn) {
+			// The matched run is the first inRunes runes of c.cmd. This relies on
+			// slash-command names being ASCII (lowercasing preserves rune count
+			// and indices); the builtin + custom command set satisfies that.
 			pos := make([]int, inRunes)
 			for i := range pos {
 				pos[i] = i

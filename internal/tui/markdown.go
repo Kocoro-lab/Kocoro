@@ -95,6 +95,10 @@ func renderSourcesCompact(entries []sourceEntry, width int) string {
 // hardcodes light-gray code text (#C4C4C4) and other dark-only colors that are
 // invisible on a white terminal, so light backgrounds get glamour's tuned
 // light style instead. Detection is warmed in New() before Bubbletea starts.
+//
+// Retention is unbounded but self-limiting: keys are (distinct width × {dark,
+// light}), so a session accrues at most one renderer per width it resizes
+// through. Each instance is cheap; if this ever matters, add an LRU.
 var (
 	rendererCache   = map[string]*glamour.TermRenderer{}
 	rendererCacheMu sync.RWMutex

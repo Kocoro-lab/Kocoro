@@ -12,6 +12,8 @@ import (
 // stay readable. Intentional non-semantic palettes (spinColors gradient, frog
 // pixel art, the shimmer sweep) use other indices and are unaffected.
 func TestNoRawSemanticColors(t *testing.T) {
+	// Reads sources relative to the package dir; `go test` (incl. CI's
+	// `go test ./internal/tui/`) always runs with cwd set there.
 	banned := []string{"243", "196", "42", "214", "237", "39", "252", "111", "146"}
 	files := []string{"app.go", "header.go", "toolformat.go", "doctor.go", "compact.go"}
 	for _, f := range files {
