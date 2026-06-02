@@ -1247,7 +1247,9 @@ func (a *AgentLoop) SetMailboxConsumeFn(fn func(ids []string)) {
 // follow-up carrying a ClientMessageID the loop calls it, dropping the follow-up
 // when it returns true (the client cancelled it after inject). Daemon callers
 // wire this to SessionCache.ConsumeInjectRetracted. Pass nil to clear. Invoked
-// synchronously inside the drain block — keep it fast.
+// synchronously inside the drain block — keep it fast. Set once before Run: the
+// loop reads injectRetractedChecker without a lock (same set-once-before-Run
+// convention as mailboxConsumeFn), so do not call this after Run has started.
 func (a *AgentLoop) SetInjectRetractedChecker(fn func(clientMessageID string) bool) {
 	a.injectRetractedChecker = fn
 }
@@ -2766,13 +2768,51 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		usage   client.Usage
 	}
 
-	// deferredInjects carries non-retracted follow-ups that the end_turn
-	// drain-race guard pulled off injectCh (to decide whether the turn must
-	// stay alive). The top-of-loop drain below consumes them, so survivors run
-	// through the same append/emit/mailbox path — without re-queuing into
-	// injectCh, whose sole receiver is this loop goroutine (a blocking re-send
-	// on a full channel would deadlock the run).
-	var deferredInjects []InjectedMessage
+	// commitInjectedTurn builds one user turn from already-retraction-filtered
+	// drained follow-ups, appends it, and fires the lifecycle/commit hooks.
+	// Returns false (a no-op) when the batch has no renderable content. Shared by
+	// the top-of-loop drain and the end_turn drain-race guard so the guard can
+	// commit survivors INLINE: committing eagerly there (rather than stashing for
+	// the next iteration) means an immediately-following maxIter break cannot drop
+	// a steering follow-up on the floor — it has no mailbox backing to replay.
+	commitInjectedTurn := func(drained []InjectedMessage) bool {
+		newMsg, ok := buildInjectedUserMessage(drained)
+		if !ok {
+			return false
+		}
+		a.tracker.Enter(PhaseInjectingMessage)
+		// Collect text for latestUserText (deferred-tool continuation nudge), the
+		// legacy a.injectedMessages tracker, and mailbox row IDs for the consume
+		// hook — all in one pass.
+		var texts []string
+		var injectedIDs []string
+		for _, m := range drained {
+			if m.Text != "" {
+				texts = append(texts, m.Text)
+			}
+			if m.ID != "" {
+				injectedIDs = append(injectedIDs, m.ID)
+			}
+		}
+		latestUserText = strings.Join(texts, "\n\n")
+		messages = append(messages, newMsg)
+		stampMessage()
+		a.injectedMessages = append(a.injectedMessages, texts...)
+		if a.handler != nil {
+			a.handler.OnText("")
+		}
+		// Retire the underlying SQLite mailbox rows so runner.go's next-RunAgent
+		// drain does not re-prepend the same text to the next user prompt.
+		if a.mailboxConsumeFn != nil && len(injectedIDs) > 0 {
+			a.mailboxConsumeFn(injectedIDs)
+		}
+		// IM message lifecycle + Desktop steering: one "processing" per drained
+		// follow-up carrying an IMStatusContext, then injected_committed so the
+		// client flips its queued-draft card into a real user bubble here.
+		a.emitDrainedLifecycle(drained)
+		a.emitInjectCommitted(drained)
+		return true
+	}
 
 	for i := 0; ; i++ {
 		effectiveMax := a.effectiveMaxIter(toolsUsed)
@@ -2825,59 +2865,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// Drain injected user messages (non-blocking).
 		// Multiple pending messages are batched into one user turn.
 		if a.injectCh != nil {
-			drained := drainInjected(a.injectCh)
-			// Prepend survivors the end_turn drain-race guard stashed (ahead of
-			// anything that arrived since) so they are committed in order.
-			if len(deferredInjects) > 0 {
-				drained = append(deferredInjects, drained...)
-				deferredInjects = nil
-			}
-			if len(drained) > 0 {
-				// Drop follow-ups the client retracted after they were already
-				// injected into injectCh (queued-draft card cancelled while the
-				// inject was in flight). A Go channel can't remove specific
-				// elements, so filter here, post-drain.
-				drained = a.filterRetractedInjects(drained)
-				if newMsg, ok := buildInjectedUserMessage(drained); ok {
-					a.tracker.Enter(PhaseInjectingMessage)
-					// Collect text for latestUserText (deferred-tool continuation
-					// nudge), the legacy a.injectedMessages tracker, and mailbox
-					// row IDs for the consume hook — all in one pass.
-					var texts []string
-					var injectedIDs []string
-					for _, m := range drained {
-						if m.Text != "" {
-							texts = append(texts, m.Text)
-						}
-						if m.ID != "" {
-							injectedIDs = append(injectedIDs, m.ID)
-						}
-					}
-					latestUserText = strings.Join(texts, "\n\n")
-					messages = append(messages, newMsg)
-					stampMessage()
-					a.injectedMessages = append(a.injectedMessages, texts...)
-					if a.handler != nil {
-						a.handler.OnText("")
-					}
-					// Retire the underlying SQLite mailbox rows so runner.go's
-					// next-RunAgent drain does not re-prepend the same text to
-					// the next user prompt. Missing this hook produced the
-					// "original query bubble shows the queued follow-up text on
-					// top of itself" regression.
-					if a.mailboxConsumeFn != nil && len(injectedIDs) > 0 {
-						a.mailboxConsumeFn(injectedIDs)
-					}
-					// IM message lifecycle: fire one "processing" per drained
-					// follow-up that carries an IMStatusContext. See
-					// emitDrainedLifecycle.
-					a.emitDrainedLifecycle(drained)
-					// Desktop steering: notify the per-request SSE handler that
-					// each drained follow-up with a client id is now committed to
-					// the live turn, so it flips its queued-draft card into a real
-					// user bubble at this consume boundary. See emitInjectCommitted.
-					a.emitInjectCommitted(drained)
-				}
+			// Drop follow-ups the client retracted after they were already injected
+			// into injectCh (queued-draft card cancelled while the inject was in
+			// flight). A Go channel can't remove specific elements, so filter here,
+			// post-drain; commitInjectedTurn does the append/emit/mailbox path.
+			if drained := a.filterRetractedInjects(drainInjected(a.injectCh)); len(drained) > 0 {
+				commitInjectedTurn(drained)
 			}
 		}
 
@@ -3786,12 +3779,14 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// (the tombstone is applied at drain, not removed from the channel),
 			// and continuing for that re-issues the LLM call and emits a
 			// duplicate final answer (the cancelled-follow-up duplicate-reply
-			// bug). Drain+filter to decide; stash survivors so the top-of-loop
-			// drain commits them — no channel re-queue, whose sole receiver is
-			// this goroutine (a blocking re-send would deadlock the run).
+			// bug). Drain+filter, then commit survivors INLINE via
+			// commitInjectedTurn so the follow-up is recorded even if the very
+			// next iteration trips the maxIter cap — steering injects have no
+			// mailbox backing to replay. commitInjectedTurn returns false for an
+			// empty/all-retracted batch, so we keep the turn alive only when a
+			// real follow-up survived.
 			if a.injectCh != nil && len(a.injectCh) > 0 {
-				if survivors := a.filterRetractedInjects(drainInjected(a.injectCh)); len(survivors) > 0 {
-					deferredInjects = survivors
+				if survivors := a.filterRetractedInjects(drainInjected(a.injectCh)); commitInjectedTurn(survivors) {
 					continue
 				}
 			}
