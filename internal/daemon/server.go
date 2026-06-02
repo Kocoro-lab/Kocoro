@@ -999,6 +999,7 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 
 	type agentInfo struct {
 		Name         string `json:"name"`
+		DisplayName  string `json:"display_name"` // falls back to Name when unset
 		Builtin      bool   `json:"builtin"`
 		Override     bool   `json:"override"`
 		HasMemory    bool   `json:"has_memory"`
@@ -1021,6 +1022,7 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		skillFiles, _ := filepath.Glob(filepath.Join(dir, "skills", "*", "SKILL.md"))
 		result = append(result, agentInfo{
 			Name:         entry.Name,
+			DisplayName:  entry.DisplayName,
 			Builtin:      entry.Builtin,
 			Override:     entry.Override,
 			HasMemory:    memErr == nil,
@@ -2468,6 +2470,14 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+// writeErrorCode writes an error response carrying a stable machine-readable
+// code alongside the English fallback message, so clients can localize by code.
+func writeErrorCode(w http.ResponseWriter, status int, code, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg, "code": code})
+}
+
 // --- Agent CRUD handlers ---
 
 func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
@@ -2519,20 +2529,21 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := req.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		var dne *agents.DisplayNameError
+		if errors.As(err, &dne) {
+			writeErrorCode(w, http.StatusBadRequest, dne.Code, dne.Error())
+		} else {
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
 		return
 	}
-	// Auto-generate an immutable slug when the client only supplied a
-	// display_name (the common Desktop path). Legacy clients that pass an
-	// explicit name keep it.
-	if req.Name == "" {
-		slug, err := agents.GenerateAgentSlug(s.deps.AgentsDir)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		req.Name = slug
+	// Slug is always server-generated and immutable; clients supply only display_name.
+	slug, err := agents.GenerateAgentSlug(s.deps.AgentsDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
+	req.Name = slug
 	// display_name is honored only via the dedicated top-level field below
 	// (uniqueness-checked). Ignore any client-supplied config.display_name,
 	// which would otherwise bypass the uniqueness check.
@@ -2551,7 +2562,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if taken {
-			writeError(w, http.StatusConflict,
+			writeErrorCode(w, http.StatusConflict, agents.CodeDisplayNameTaken,
 				fmt.Sprintf("display name %q is already in use", req.DisplayName))
 			return
 		}
@@ -2571,29 +2582,18 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	defer s.deps.SessionCache.UnlockRoute(routeKey)
 
 	agentDir := filepath.Join(s.deps.AgentsDir, req.Name)
+	// Defensive only: GenerateAgentSlug already returns a slug with no existing
+	// AGENT.md, so this collision never fires in practice. Kept as a guard.
+	// (Builtin override on create is impossible now — slugs are always
+	// agent-<hex>, never a builtin name; customize builtins via PUT instead.)
 	if _, err := os.Stat(filepath.Join(agentDir, "AGENT.md")); err == nil {
 		writeError(w, http.StatusConflict, fmt.Sprintf("agent %q already exists", req.Name))
 		return
 	}
-	// If name matches a builtin, materialize user override first so the
-	// subsequent writes land in the user dir and override the builtin.
-	if agents.IsBuiltinAgent(req.Name) {
-		if err := agents.MaterializeBuiltin(s.deps.AgentsDir, req.Name); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to materialize builtin: %s", err))
-			return
-		}
-	}
-	// Write all agent files — rollback on any failure.
-	// Only remove files we materialized; preserve MEMORY.md and sessions/
-	// which are runtime state that may exist from prior builtin agent usage.
-	rollback := func() {
-		dir := filepath.Join(s.deps.AgentsDir, req.Name)
-		os.Remove(filepath.Join(dir, "AGENT.md"))
-		os.Remove(filepath.Join(dir, "config.yaml"))
-		os.Remove(filepath.Join(dir, "_attached.yaml"))
-		os.RemoveAll(filepath.Join(dir, "commands"))
-		os.RemoveAll(filepath.Join(dir, "skills"))
-	}
+	// Write all agent files — rollback on any failure. The slug is freshly
+	// minted (GenerateAgentSlug verified nothing exists at agentDir), so there
+	// is no prior runtime state to preserve and a full dir removal is safe.
+	rollback := func() { os.RemoveAll(agentDir) }
 	if err := agents.WriteAgentPrompt(s.deps.AgentsDir, req.Name, req.Prompt); err != nil {
 		rollback()
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -2686,8 +2686,20 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		// (see handleCreateAgent). Accepted for the single-user local daemon.
 		trimmed := strings.TrimSpace(*req.DisplayName)
 		req.DisplayName = &trimmed
+		// A named agent must keep a human-readable label: reject clearing it to
+		// empty (which would fall back to the opaque auto-generated slug). Use
+		// null / omit the field to leave the display name unchanged.
+		if trimmed == "" {
+			writeErrorCode(w, http.StatusBadRequest, agents.CodeDisplayNameRequired, "display_name cannot be empty")
+			return
+		}
 		if err := agents.ValidateDisplayName(*req.DisplayName); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			var dne *agents.DisplayNameError
+			if errors.As(err, &dne) {
+				writeErrorCode(w, http.StatusBadRequest, dne.Code, dne.Error())
+			} else {
+				writeError(w, http.StatusBadRequest, err.Error())
+			}
 			return
 		}
 		taken, err := agents.DisplayNameTaken(s.deps.AgentsDir, *req.DisplayName, name)
@@ -2696,7 +2708,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if taken {
-			writeError(w, http.StatusConflict,
+			writeErrorCode(w, http.StatusConflict, agents.CodeDisplayNameTaken,
 				fmt.Sprintf("display name %q is already in use", *req.DisplayName))
 			return
 		}

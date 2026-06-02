@@ -185,8 +185,9 @@ func WriteAgentConfig(agentsDir, name string, cfg *AgentConfigAPI) error {
 // preserving every other field's value (YAML comments and key ordering are not
 // retained, same as WriteAgentConfig). It performs a map-based read-modify-
 // write under the config lock so fields not modeled by AgentConfigAPI (e.g.
-// auto_approve, mcp_servers) are not lost on rename. Empty displayName removes
-// the key.
+// auto_approve, mcp_servers) are not lost on rename. An empty displayName
+// removes the key (a defensive default; the daemon's rename path rejects empty
+// before calling this, so no HTTP request reaches that branch).
 func SetAgentDisplayName(agentsDir, name, displayName string) error {
 	dir := filepath.Join(agentsDir, name)
 	if _, err := os.Stat(filepath.Join(dir, "AGENT.md")); err != nil {
@@ -327,7 +328,7 @@ func AtomicWrite(path string, data []byte) error {
 
 // AgentCreateRequest parses a POST /agents request body.
 type AgentCreateRequest struct {
-	Name        string            `json:"name"`
+	Name        string            `json:"-"` // server-generated slug; never client-supplied
 	DisplayName string            `json:"display_name,omitempty"`
 	Prompt      string            `json:"prompt"`
 	Memory      *string           `json:"memory,omitempty"`
@@ -336,19 +337,15 @@ type AgentCreateRequest struct {
 	Skills      []*skills.Skill   `json:"skills,omitempty"`
 }
 
-// Validate checks required fields and runs all validators. It also trims DisplayName in place.
+// Validate checks required fields and runs all validators. It trims DisplayName
+// in place. The slug (Name) is always server-generated, never client-supplied.
 func (r *AgentCreateRequest) Validate() error {
 	r.DisplayName = strings.TrimSpace(r.DisplayName)
-	if r.Name == "" && r.DisplayName == "" {
-		return fmt.Errorf("either name or display_name is required")
+	if r.DisplayName == "" {
+		return &DisplayNameError{Code: CodeDisplayNameRequired, Msg: "display_name is required"}
 	}
 	if err := ValidateDisplayName(r.DisplayName); err != nil {
 		return err
-	}
-	if r.Name != "" {
-		if err := ValidateAgentName(r.Name); err != nil {
-			return err
-		}
 	}
 	if r.Prompt == "" {
 		return fmt.Errorf("prompt is required")

@@ -30,7 +30,8 @@ Use the `http` tool for every operation. Never use bash/file_write/file_edit to 
 **Create an agent:**
 ```
 http POST http://localhost:7533/agents
-body: {"name": "agent-name", "prompt": "You are a ... assistant. You help users ..."}
+body: {"display_name": "Agent Name", "prompt": "You are a ... assistant. You help users ..."}
+# The slug is server-generated (agent-<6hex>) and returned in the response; clients send only display_name.
 ```
 
 **List agents:** `http GET http://localhost:7533/agents`
