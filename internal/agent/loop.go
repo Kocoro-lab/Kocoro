@@ -3082,10 +3082,24 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 						if newMsgOffset >= 0 && newMsgOffset < len(messages) {
 							messages[newMsgOffset] = replaceUserMessageText(messages[newMsgOffset], scaffoldedUserText)
 						}
+					} else if last := len(messages) - 1; last >= 0 && messageIsBareUserPrompt(messages[last]) {
+						// Inject continuation: the end_turn drain-race guard committed
+						// the user's actual follow-up as the last message, so it is NOT
+						// tool results. Both alternatives here are wrong:
+						//   - Appending a separate hint masks the follow-up — the model
+						//     treats the content-less <system-reminder> as the current
+						//     turn and replies "your message had no content".
+						//   - Embedding the hint into the follow-up leaks the reminder
+						//     into the persisted/displayed user bubble: unlike the turn-0
+						//     user message, later-turn messages are NOT scaffold-stripped
+						//     on persist (captureRunMessages only strips the first one).
+						// So skip the discovery hint for an inject continuation: the
+						// follow-up stays the last user message (the model responds to
+						// it), and skills still load on demand via use_skill. Discovery
+						// usage was already metered above.
 					} else {
-						// Later turns: inject as a new message. This is safe
-						// because the last user message is tool results, not
-						// the user's original prompt.
+						// Normal tool continuation: the last user message is tool
+						// results, so a separate hint message is safe.
 						messages = append(messages, client.Message{
 							Role:    "user",
 							Content: client.NewTextContent(hint),
@@ -4888,6 +4902,25 @@ func replaceUserMessageText(msg client.Message, newText string) client.Message {
 		out = append([]client.ContentBlock{{Type: "text", Text: newText}}, out...)
 	}
 	return client.Message{Role: "user", Content: client.NewBlockContent(out)}
+}
+
+// messageIsBareUserPrompt reports whether msg is a user turn carrying the
+// user's own prompt (text and/or attachments) rather than tool results. The
+// skill-discovery hint injector uses it to decide between embedding the hint
+// into the prompt (an inject continuation, where the end_turn drain-race guard
+// committed the user's follow-up as the last message) and appending a separate
+// hint turn (a normal tool continuation, where the last user turn is tool
+// results and a standalone hint is safe).
+func messageIsBareUserPrompt(msg client.Message) bool {
+	if msg.Role != "user" {
+		return false
+	}
+	for _, b := range msg.Content.Blocks() {
+		if b.Type == "tool_result" {
+			return false
+		}
+	}
+	return true
 }
 
 func userMessageTextMatches(msg client.Message, text string) bool {
