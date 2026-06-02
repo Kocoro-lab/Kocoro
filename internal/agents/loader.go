@@ -165,8 +165,9 @@ func ValidateAgentName(name string) error {
 const maxDisplayNameRunes = 256
 
 // ValidateDisplayName checks an already-trimmed display name: a length cap and
-// no control characters (newlines, tabs, NUL, etc.). An empty string is valid
-// (it means "no display name" — the agent falls back to its slug).
+// no control characters (newlines, tabs, NUL, etc.). An empty string passes
+// this validator in isolation, but both API paths (create requires it, rename
+// rejects clearing) enforce non-empty before calling it.
 func ValidateDisplayName(s string) error {
 	if utf8.RuneCountInString(s) > maxDisplayNameRunes {
 		return fmt.Errorf("display_name too long: %d runes (max %d)", utf8.RuneCountInString(s), maxDisplayNameRunes)

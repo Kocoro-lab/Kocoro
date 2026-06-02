@@ -185,8 +185,9 @@ func WriteAgentConfig(agentsDir, name string, cfg *AgentConfigAPI) error {
 // preserving every other field's value (YAML comments and key ordering are not
 // retained, same as WriteAgentConfig). It performs a map-based read-modify-
 // write under the config lock so fields not modeled by AgentConfigAPI (e.g.
-// auto_approve, mcp_servers) are not lost on rename. Empty displayName removes
-// the key.
+// auto_approve, mcp_servers) are not lost on rename. An empty displayName
+// removes the key (a defensive default; the daemon's rename path rejects empty
+// before calling this, so no HTTP request reaches that branch).
 func SetAgentDisplayName(agentsDir, name, displayName string) error {
 	dir := filepath.Join(agentsDir, name)
 	if _, err := os.Stat(filepath.Join(dir, "AGENT.md")); err != nil {

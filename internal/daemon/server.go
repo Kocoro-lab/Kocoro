@@ -2569,21 +2569,15 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	defer s.deps.SessionCache.UnlockRoute(routeKey)
 
 	agentDir := filepath.Join(s.deps.AgentsDir, req.Name)
+	// Defensive only: GenerateAgentSlug already returns a slug with no existing
+	// AGENT.md, so this collision never fires in practice. Kept as a guard.
+	// (Builtin override on create is impossible now — slugs are always
+	// agent-<hex>, never a builtin name; customize builtins via PUT instead.)
 	if _, err := os.Stat(filepath.Join(agentDir, "AGENT.md")); err == nil {
 		writeError(w, http.StatusConflict, fmt.Sprintf("agent %q already exists", req.Name))
 		return
 	}
-	// If name matches a builtin, materialize user override first so the
-	// subsequent writes land in the user dir and override the builtin.
-	if agents.IsBuiltinAgent(req.Name) {
-		if err := agents.MaterializeBuiltin(s.deps.AgentsDir, req.Name); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to materialize builtin: %s", err))
-			return
-		}
-	}
 	// Write all agent files — rollback on any failure.
-	// Only remove files we materialized; preserve MEMORY.md and sessions/
-	// which are runtime state that may exist from prior builtin agent usage.
 	rollback := func() {
 		dir := filepath.Join(s.deps.AgentsDir, req.Name)
 		os.Remove(filepath.Join(dir, "AGENT.md"))
