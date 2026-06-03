@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,6 +41,28 @@ func TestStore_SaveLoad(t *testing.T) {
 	}
 	if len(loaded.Messages) != 2 {
 		t.Errorf("expected 2 messages, got %d", len(loaded.Messages))
+	}
+}
+
+// TestStore_LoadMissingReturnsNotExist locks the contract that Load returns a
+// not-exist error detectable by os.IsNotExist. The daemon's session handlers
+// gate their 404 on os.IsNotExist, which does NOT traverse fmt.Errorf("%w")
+// chains — wrapping the missing-file error here previously made GET
+// /sessions/{id} (e.g. a named-agent session fetched via the default-dir
+// manager when ?agent= was omitted) fall through to 500 instead of 404.
+func TestStore_LoadMissingReturnsNotExist(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+
+	_, err := store.Load("does-not-exist")
+	if err == nil {
+		t.Fatal("expected error loading missing session, got nil")
+	}
+	if !os.IsNotExist(err) {
+		t.Errorf("os.IsNotExist = false for %v; want true (would surface as 500 not 404)", err)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("errors.Is(err, os.ErrNotExist) = false for %v; want true", err)
 	}
 }
 

@@ -1197,7 +1197,9 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
 	sess, err := mgr.Load(id)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// errors.Is traverses %w chains (os.IsNotExist does not), so a future
+		// Store.Load wrap can't regress this 404 to a 500.
+		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
 			return
 		}
@@ -1236,7 +1238,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	// Mirrors handleResetSession's ordering.
 	s.deps.SessionCache.CancelBySessionID(id)
 	if err := mgr.Delete(id); err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
 			return
 		}
@@ -1288,7 +1290,7 @@ func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {
 
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
 	if err := mgr.Reset(id); err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
 			return
 		}
@@ -1453,11 +1455,16 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 	// 截断 session 历史消息
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(body.Agent))
 	if err := mgr.TruncateMessages(id, body.MessageIndex); err != nil {
-		if os.IsNotExist(err) {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
-			return
+		case errors.Is(err, session.ErrMessageIndexOutOfRange):
+			// Genuine client error: the requested index is out of range.
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			// Load corruption / Save IO failure etc. is server-side, not 400.
+			writeError(w, http.StatusInternalServerError, err.Error())
 		}
-		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1514,7 +1521,9 @@ func (s *Server) handleSessionSummary(w http.ResponseWriter, r *http.Request) {
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
 	sess, err := mgr.Load(id)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// errors.Is traverses %w chains (os.IsNotExist does not), so a future
+		// Store.Load wrap can't regress this 404 to a 500.
+		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
 			return
 		}

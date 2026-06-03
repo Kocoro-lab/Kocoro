@@ -3,6 +3,7 @@ package session
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"sync"
@@ -10,6 +11,12 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
+
+// ErrMessageIndexOutOfRange is returned by TruncateMessages when the requested
+// index is outside the session's message range. It is a client-input error
+// (HTTP 400) and must be distinguishable from a load/save IO failure (500) so
+// handleEditMessage can map each to the correct status.
+var ErrMessageIndexOutOfRange = errors.New("message_index out of range")
 
 // validSessionIDPattern restricts client-supplied session IDs to a safe shape.
 // Allowed: 8–80 chars of [A-Za-z0-9._-]. The cap matches generateID's
@@ -426,7 +433,7 @@ func (m *Manager) TruncateMessages(id string, index int) error {
 		return err
 	}
 	if index < 0 || index > len(sess.Messages) {
-		return fmt.Errorf("message_index %d out of range [0, %d]", index, len(sess.Messages))
+		return fmt.Errorf("%w: %d not in [0, %d]", ErrMessageIndexOutOfRange, index, len(sess.Messages))
 	}
 	sess.Messages = sess.Messages[:index]
 	if len(sess.MessageMeta) > index {

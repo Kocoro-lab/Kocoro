@@ -109,8 +109,10 @@ func (s *Server) handleSessionShare(w http.ResponseWriter, r *http.Request) {
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
 	sess, err := mgr.Load(id)
 	if err != nil {
-		// Store.Load wraps the OS error with %w, so os.IsNotExist (Go 1.12-
-		// style, not chain-aware) would miss it; errors.Is unwraps properly.
+		// Store.Load returns the not-exist error UNWRAPPED (other errors stay
+		// %w-wrapped). errors.Is is the wrap-robust idiom: it matches whether
+		// or not the error is wrapped, so this stays correct even if a future
+		// Load path re-wraps. Do NOT switch to os.IsNotExist (not chain-aware).
 		if errors.Is(err, fs.ErrNotExist) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
 			return

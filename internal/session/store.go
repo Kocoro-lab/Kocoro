@@ -500,6 +500,15 @@ func (s *Store) Load(id string) (*Session, error) {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		// Return the not-exist error unwrapped so callers using
+		// os.IsNotExist(err) still detect it — os.IsNotExist does NOT
+		// traverse fmt.Errorf("%w") chains, so wrapping a missing-file
+		// error here made handleGetSession et al. fall through to 500
+		// instead of 404 (e.g. loading a named-agent session via the
+		// default-dir manager when ?agent= was omitted).
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("read session: %w", err)
 	}
 

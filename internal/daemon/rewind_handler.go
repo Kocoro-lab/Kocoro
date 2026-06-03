@@ -3,7 +3,9 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
@@ -108,8 +110,16 @@ func (s *Server) rewindToMessage(sessionID, messageID string) (*session.Restored
 func (s *Server) resolveSessionForRewind(sessionID string) (*session.Session, *session.Manager, error) {
 	mgr := s.deps.SessionCache.GetOrCreate("")
 	if mgr != nil {
-		if sess, err := mgr.Resume(sessionID); err == nil && sess != nil {
+		sess, err := mgr.Resume(sessionID)
+		if err == nil && sess != nil {
 			return sess, mgr, nil
+		}
+		// Only a genuine not-exist falls through to the "missing" path (404).
+		// A corrupt-JSON / IO / permission error must NOT be collapsed into
+		// "session not found" — propagate it so handleRewind returns 500
+		// instead of misreporting a real failure as a missing session.
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("rewind: load session %q: %w", sessionID, err)
 		}
 	}
 	// TODO: extend to scan per-agent managers if a session id wasn't found
