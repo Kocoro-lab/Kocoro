@@ -142,6 +142,22 @@ func ComputeRouteKey(req RunAgentRequest) string {
 		}
 		return "default:" + sanitizeRouteValue(req.Source) + ":" + sanitizeRouteValue(req.Channel) + ":" + sanitizeRouteValue(req.Sender)
 	}
+	// Messaging platform but BOTH thread and sender are empty — e.g. a LINE
+	// group/room event whose UserID the user hasn't consented to disclose.
+	// Must NOT fall through to the plain agent:<name> key below: that would
+	// persist an IM-sourced (kind=im) session under the interactive lane and
+	// let a later Desktop run warm-resume it (an IM→interactive leak bounded
+	// to the daemon lifetime). Keep it in the IM lane keyed by channel, or
+	// fresh ("") when even the channel is unknown.
+	if IsMessagingPlatform(req.Source) {
+		if req.Channel != "" {
+			if req.Agent != "" {
+				return "agent:" + req.Agent + ":" + sanitizeRouteValue(req.Source) + ":" + sanitizeRouteValue(req.Channel)
+			}
+			return "default:" + sanitizeRouteValue(req.Source) + ":" + sanitizeRouteValue(req.Channel)
+		}
+		return ""
+	}
 	// A named agent with no explicit session_id and no new_session resumes its
 	// latest interactive session: emit the plain key, resolved by the
 	// kind-filtered cold-start (resumeNamedAgentColdStart). new_session forks —
