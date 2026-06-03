@@ -14,7 +14,7 @@ description: >
   Covers anything under ~/.shannon/. Do NOT use bash/file_read/file_edit to probe or modify
   these — kocoro routes every op through the daemon HTTP API at localhost:7533 which handles
   validation, atomic writes and audit logging.
-allowed-tools: http file_read think schedule_create schedule_list schedule_update schedule_remove
+allowed-tools: http file_read think schedule_create schedule_list schedule_update schedule_remove schedule_show
 hidden: true
 ---
 
@@ -54,10 +54,10 @@ body: {"display_name": "Agent Name", "prompt": "You are a ... assistant. You hel
 
 **Create rule:** `http PUT http://localhost:7533/rules/{name}` body: `{"content": "..."}`
 
-**Schedules use the native `schedule_*` tools — NOT `http`.** This is the one resource that must be created/updated/removed with the local tools (`schedule_create`, `schedule_list`, `schedule_update`, `schedule_remove`). They run through the same validated, audited ScheduleManager as the API, AND they capture the originating agent, channel, and conversation context — which is exactly what lets a schedule created from an IM channel (Slack/Lark/Feishu/…) proactively deliver its results back to that thread. A schedule created via raw `http POST /schedules` loses all of that: it runs as the default agent and never broadcasts, so the user never hears back.
+**Schedules use the native `schedule_*` tools — NOT `http`.** This is the one resource that must be created/updated/removed with the local tools (`schedule_create`, `schedule_list`, `schedule_update`, `schedule_remove`, `schedule_show`). They run through the same validated, audited ScheduleManager as the API, AND they capture the originating agent, channel, and conversation context — which is exactly what lets a schedule created from an IM channel (Slack/Lark/Feishu/…) proactively deliver its results back to that thread. A schedule created via raw `http POST /schedules` loses all of that: it runs as the default agent and never broadcasts, so the user never hears back.
 - Create: `schedule_create` { cron, prompt, description, [agent], [stateful], [broadcast] }
   - Pass `stateful: true` when the task must remember across runs (the prompt counts runs / "第几次", continues from last time, or tracks progress). Without it each run starts blank and such prompts break. Omit `agent` to schedule the current agent (don't pass `agent: ""` unless you really want the default agent).
-- List / Update / Remove: `schedule_list` · `schedule_update {id, …}` · `schedule_remove {id, …}`
+- List / Show / Update / Remove: `schedule_list` · `schedule_show {id, …}` · `schedule_update {id, …}` · `schedule_remove {id, …}`
 
 **Long markdown content — use `body_from_file` for raw-text endpoints.** When uploading a long markdown file (instructions, rule body, etc.) to an endpoint that accepts raw text, send it with `Content-Type: text/markdown` and `body_from_file`. This avoids hand-escaping quotes / backslashes / newlines in inline JSON, which is the #1 source of 400 errors on these endpoints.
 

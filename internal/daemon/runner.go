@@ -797,8 +797,9 @@ type RunAgentResult struct {
 	//
 	// Scheduler stores these into Schedule.LastRunMessage{Start,End}Index so
 	// schedule_show can return the precise turns from this run instead of the
-	// session's tail (which, on named-agent shared sessions, may be later
-	// interactive chat). Populated on both success and hard-error paths.
+	// session's tail (which, in a stateful schedule's dedicated accumulating
+	// session, may belong to other runs of the same schedule). Populated on
+	// both success and hard-error paths.
 	MessageStartIndex int `json:"message_start_index,omitempty"`
 	MessageEndIndex   int `json:"message_end_index,omitempty"`
 }

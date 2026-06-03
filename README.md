@@ -283,7 +283,7 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 | Tool | Approval | Description |
 |------|----------|-------------|
 | `schedule_create` / `_update` / `_remove` | Yes | Manage launchd-backed scheduled tasks. |
-| `schedule_list` | No | List with sync status. |
+| `schedule_list` / `_show` | No | List with sync status; show a schedule's last run. |
 | `session_search` | No | FTS5 keyword search across past session messages. |
 | `memory_append` | No | Append entries to agent MEMORY.md (flock-protected). |
 | `use_skill` | No | Activate a skill by name — returns full SKILL.md body. Skill discovery auto-suggests relevant skills each turn via `model_tier: small` prefetch. |

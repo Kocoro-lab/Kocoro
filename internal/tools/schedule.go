@@ -71,9 +71,9 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 		return agent.ToolInfo{
 			Name: "schedule_create",
 			Description: "Create a scheduled task that runs an agent on a cron schedule. Supports full cron syntax (ranges, steps, lists). " +
-				"Storage: for a NAMED agent, every run appends turns to that agent's single ongoing session file (one file, growing). " +
-				"For the default agent, every run creates a brand-new session file under ~/.shannon/sessions/. " +
-				"Showing the user the results: when the user asks 'what did the schedule produce' or 'show me yesterday's run', call schedule_show yourself (it returns the last assistant turns of that run, sliced to the run's own message range so you don't see unrelated interactive chat from the shared session). Never tell the user to run session_search themselves. " +
+				"Storage: stateful=false (default) creates a brand-new session for every run and the LLM sees no prior schedule history, for both default and named agents. " +
+				"Storage: stateful=true uses one dedicated accumulating session per schedule (agent:<name>:schedule:<id>, or schedule:<id> for the default agent), and each run sees that schedule's own prior runs. " +
+				"Showing the user the results: when the user asks 'what did the schedule produce' or 'show me yesterday's run', call schedule_show yourself (it returns the last assistant turns of that run, sliced to the run's own message range). Never tell the user to run session_search themselves. " +
 				scheduleAudienceDisclaimer +
 				agent.DescriptionGuidance,
 			Parameters: map[string]any{

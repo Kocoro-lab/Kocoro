@@ -114,13 +114,12 @@ Automate a regular check-in that runs without you needing to be present.
    {"tools": {"allow": ["bash:git *", "bash:curl *", "file_read", "grep"]}}
    ```
 
-3. **Create the schedule**:
+3. **Create the schedule** with `schedule_create`:
    ```
-   POST /schedules
-   {"prompt": "Check for: 1) any git commits since last check, 2) any error patterns in the last hour of logs at ~/app/logs/app.log, 3) whether the app is responding (curl http://localhost:3000/health). Report only if something needs attention.", "cron": "0 * * * *", "agent": "monitor"}
+   {"agent": "monitor", "cron": "0 * * * *", "prompt": "Check for: 1) any git commits since last check, 2) any error patterns in the last hour of logs at ~/app/logs/app.log, 3) whether the app is responding (curl http://localhost:3000/health). Report only if something needs attention.", "description": "create hourly monitoring schedule"}
    ```
 
-4. **Verify**: GET /schedules → confirm `enabled: true` and the cron expression is correct
+4. **Verify**: call `schedule_list` and confirm `enabled=true` and the cron expression is correct
 
 The monitor runs every hour automatically. Replies are delivered to the agent's OAuth-bound Cloud channels (e.g. Slack); for low-level debugging also see `~/.shannon/logs/schedule-{id}.log`.
 
