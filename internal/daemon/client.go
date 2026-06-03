@@ -373,6 +373,17 @@ func (c *Client) SetApprovalBroker(b *ApprovalBroker) {
 	c.broker = b
 }
 
+// ResolveApproval delivers an external decision (e.g. POST /approval from
+// Desktop) to the WS broker, for approvals whose pending request lives only
+// here (cloud/IM sources). Returns false if the broker is unset or the
+// request was already claimed by another terminal path.
+func (c *Client) ResolveApproval(requestID string, decision ApprovalDecision, beforeDeliver func()) bool {
+	if c == nil || c.broker == nil {
+		return false
+	}
+	return c.broker.Resolve(requestID, decision, beforeDeliver)
+}
+
 // SendApprovalRequest sends an approval_request message over WS.
 //
 // The envelope's MessageID is set from req.MessageID (the inbound claim's ID).
