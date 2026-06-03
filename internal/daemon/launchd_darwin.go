@@ -1,5 +1,16 @@
 //go:build darwin
 
+// This file implements the daemon-via-launchctl path used by `shan daemon
+// start` (npm CLI standalone install). It is NOT used by the Kocoro Desktop
+// bundle path — Desktop spawns the daemon directly as a child process via
+// Foundation Process() and tracks lifecycle in its own DaemonManager. See
+// docs/desktop-calendar-rpc.md §4.1 for the Desktop-spawn model and §1.2
+// for the selection rationale.
+//
+// Calendar RPC and other Desktop-RPC-dependent features only function in
+// the Desktop-spawn path; npm CLI users do not have those tools registered
+// (the --rpc-socket / --rpc-pidfile flags are absent here, so cmd/daemon.go
+// never constructs a DesktopRPCBroker and RegisterCalendarTools no-ops).
 package daemon
 
 import (

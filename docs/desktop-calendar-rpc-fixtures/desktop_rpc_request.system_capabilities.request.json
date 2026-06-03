@@ -1,0 +1,13 @@
+{
+  "type": "desktop_rpc_request",
+  "payload": {
+    "request_id": "drpc_0102030405060708",
+    "method": "system.capabilities",
+    "params": {},
+    "timeout_ms": 3000,
+    "session_id": "sess_reconcile",
+    "agent": "default",
+    "source": "kocoro",
+    "ts": "2026-05-26T10:00:00+08:00"
+  }
+}

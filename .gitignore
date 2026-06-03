@@ -24,6 +24,8 @@ docs/*
 !docs/config-reference.md
 !docs/agents-reference.md
 !docs/session-sync-launchd.md
+!docs/desktop-calendar-rpc.md
+!docs/desktop-calendar-rpc-fixtures
 internal/tools/axserver/.build/
 internal/agent/tmp/
 build/

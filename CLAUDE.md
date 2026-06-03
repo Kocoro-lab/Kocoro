@@ -54,6 +54,11 @@ internal/
     auth.go            # AuthManager state machine (email/password, macOS-only)
     auth_handlers.go   # /local/auth/* handlers (state, register, login, sign-out, …)
     ws_controller.go   # WS goroutine start/stop driven by AuthManager
+    desktop_rpc/       # Unix sock reverse-RPC channel to Kocoro Desktop (Calendar RPC v1)
+      types.go         #   Frame / RPCRequest/Result/Error / DesktopEvent + §5.5 string constants
+      codec.go         #   length-prefixed JSON framing (4-byte BE uint32, ≤ 4 MiB body)
+      broker.go        #   DesktopRPCBroker (Request / Resolve / CancelAll; mirrors ApprovalBroker)
+      listener.go      #   Unix sock listen + accept loop + bidirectional method dispatch + system.ping/capabilities responders
   agent/
     loop.go              # AgentLoop.Run(), SwitchAgent()
     tools.go             # Tool interface, ToolRegistry
@@ -121,6 +126,7 @@ Feature changes update README.md (user-facing), CLAUDE.md (this file, developer-
 - agents/skills/schedules/config endpoints → `references/{agents,skills,schedules,config}.md`
 - MCP / permissions / project-init / instructions / recipes / session-sync / memory → matching `references/*.md`
 - `/local/auth/*` endpoints → `references/auth.md`
+- `calendar_*` tools (8) + protocol → `references/calendar.md` + `references/desktop-rpc.md`; the underlying Unix socket protocol spec lives at `docs/desktop-calendar-rpc.md` (versioned outside the skill bundle because Desktop CC consumes it too)
 - Protected config fields, tool filter → `SKILL.md` security section
 
 ### Hardcoded Limit Policy
@@ -182,6 +188,7 @@ Unknown tools → denied (fail-safe). Always-ask gate runs BEFORE the allowlist,
 
 | Subsystem | Where | One-line invariant |
 |---|---|---|
+| Desktop RPC channel | `internal/daemon/desktop_rpc/` + `cmd/daemon.go` + `internal/daemon/launchd_darwin.go` (header note) | Local Unix domain socket (`~/Library/Application Support/run.shannon.shanclaw/daemon.sock` 0600 + parent 0700) reverse-RPC to Kocoro Desktop's EventKit. Daemon spawned by Desktop's `DaemonManager` with `--rpc-socket` + `--rpc-pidfile` CLI flags. Length-prefixed JSON framing (4-byte big-endian uint32 prefix, body ≤ 4 MiB, no application-layer ping). DesktopRPCBroker mirrors ApprovalBroker race-safety. Single-instance accept (second client closed immediately). On sock disconnect → `CancelAll` unblocks all pending RPCs with `desktop_disconnected`. `system.ping` + `system.capabilities` are bidirectional; `system.capabilities` powers spec §4.1.1 reconciliation. ProtocolVersion = `"1.0.0"`; ProtocolMethods (10 entries) returned byte-identically by both responder sides. Sock listen failures are fatal (non-zero exit, no silent retry per spec §7.1). Lifecycle is semi-bound: daemon outlives Desktop UI quit (becomes launchd-orphan), Slack/LINE channels keep working until Mac reboot. Calendar `calendar_*` tools registered conditionally on broker existence (`tools.RegisterCalendarTools`); TUI/one-shot/MCP/scheduled paths skip. `launchd_darwin.go` is the npm-CLI standalone path and is NOT used by Desktop-bundled deployments. Spec: `docs/desktop-calendar-rpc.md` v0.5.1. |
 | WS handshake | `client.go` | Sends `User-Agent: kocoro/<ver>` + `X-Kocoro-Daemon-Version` + `X-Kocoro-Capabilities`. Pre-v0.1.8 daemons used `X-ShanClaw-*`; Cloud accepts both for one release. |
 | Built-in MCP catalog | `internal/mcp/builtins.go` + `internal/config/config.go mergeBuiltinMCPServers` | `BuiltinMCPServers` ships pre-bundled MCP servers (first: `intercom`) disabled by default. `config.Load` field-merges the Go catalog onto user yaml: command/args/url come from the binary (auto-upgrade), disabled/env/keep_alive persist from yaml. PATCH /config refuses to mutate daemon-owned fields on a builtin (`builtin_mcp_immutable`, 409). GET /config/status exposes `mcp_server_info` (`{builtin, display_name, requires_auth?, authorized?}`) so Desktop renders a toggle + OAuth modal without hard-coding the catalog; `authorized` reflects a detected token cache (skip the confirm modal on re-enable). |
 | MCP async startup | `internal/mcp/client.go StartConnectAll` + `register.go RegisterAllWithBaselineAsync` | Startup and `/config/reload` don't block on MCP handshakes — they build the registry with local+gateway tools synchronously, then fire per-server connect goroutines. A per-server `inFlight` set dedups concurrent attempts (a reload during an in-flight connect skips rather than spawning a duplicate subprocess). Timeout: `ConnectTimeoutSeconds` > `DefaultConnectTimeoutSecs` > 60s (Intercom ships 300s for cold-cache npx + OAuth). Success → `Supervisor.ProbeNow` → registry rebuild, tools appear live. Failed connects do NOT auto-reconnect; recovery is user re-toggle or `POST /config/reload`. |
@@ -257,6 +264,7 @@ Scalars override, lists merge+dedup, structs field-level merge. MCP server env-v
 - Sync: marker `~/.shannon/sync_marker.json`, lock `~/.shannon/sync.lock` (never delete), dry-run outbox `~/.shannon/sync_outbox/`
 - Logs: `~/.shannon/logs/audit.log`, `~/.shannon/logs/schedule-<id>.log`
 - Memory: socket `~/.shannon/memory.sock`, bundle root `~/.shannon/memory/`
+- Desktop RPC (when daemon spawned by Kocoro Desktop): sock `~/Library/Application Support/run.shannon.shanclaw/daemon.sock` (0600) + pidfile `daemon.pid` in same dir (0700). Paths passed via `--rpc-socket` + `--rpc-pidfile` CLI flags; daemon never derives one from the other.
 
 ### Atomic Writes
 
@@ -334,3 +342,4 @@ Conditional:
 - `retract_published_file` — same gating. Destructive, requires approval. `agent.DisallowsAutoApproval` is empty as of 2026-05-18, so retract behaves like other approval-required tools (can be persisted to always-allow if the user chooses). Args: `id` (UUID from list) + `description`. 404 conflates not-found/already-retracted/not-yours to avoid existence leak.
 - `generate_image` / `edit_image` — same gating. Always approval (paid quota + permanent CDN). Edit requires `image_urls` 1-4 entries starting with `https://static.kocoro.ai/`.
 - `tool_search` — deferred mode when tool count > 30 (lives in `agent/deferred.go`)
+- **`calendar_*` family (8 tools)** — registered only when daemon is a Kocoro Desktop subprocess (`cmd/daemon.go` sees `--rpc-socket` + `--rpc-pidfile` flags and constructs a `DesktopRPCBroker` in `internal/daemon/desktop_rpc/`). TUI / one-shot CLI / MCP server / scheduled task paths skip registration (`tools.RegisterCalendarTools` no-ops when broker is nil) — model falls back to `applescript` + Calendar.app naturally. Tools: `calendar_check_permission`, `calendar_request_permission` (approval, 5-min envelope timeout for TCC dialog wait), `calendar_list_sources`, `calendar_list_events`, `calendar_get_event`, `calendar_create_event` / `_update_event` / `_delete_event` (approval). Backed by `docs/desktop-calendar-rpc.md` v0.5.1 (Unix domain socket reverse RPC to Desktop's EventKit). `attendees` field is metadata-only — `invitations_sent` is always `false` in v1 (EventKit doesn't auto-send via CalDAV/Exchange). `update_event` rejects `scope=all` client-side; use `delete + create` instead.

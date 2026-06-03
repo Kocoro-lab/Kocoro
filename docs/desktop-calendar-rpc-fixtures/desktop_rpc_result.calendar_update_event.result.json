@@ -1,0 +1,12 @@
+{
+  "type": "desktop_rpc_result",
+  "payload": {
+    "request_id": "drpc_99887766aabbccdd",
+    "ok": true,
+    "result": {
+      "id": "evt_weekly-instance-uuid-bbbb",
+      "pending_remote_sync": true,
+      "invitations_sent": false
+    }
+  }
+}

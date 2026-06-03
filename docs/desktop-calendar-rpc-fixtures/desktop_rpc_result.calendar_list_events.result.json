@@ -1,0 +1,49 @@
+{
+  "type": "desktop_rpc_result",
+  "payload": {
+    "request_id": "drpc_aabbccdd11223344",
+    "ok": true,
+    "result": {
+      "events": [
+        {
+          "id": "evt_one-off-meeting-uuid-aaaa",
+          "calendar_id": "cal_work-icloud-uuid",
+          "title": "Q2 Review",
+          "start": "2026-05-26T14:00:00+08:00",
+          "end": "2026-05-26T15:00:00+08:00",
+          "all_day": false,
+          "location": "Conference Room A",
+          "notes": "见附件",
+          "url": "https://teams.microsoft.com/l/meetup-join/19%3aMeetingId@thread.v2/0",
+          "is_recurring": false,
+          "is_recurring_instance": false,
+          "series_master_id": null,
+          "attendees": [
+            {"email": "alice@example.com", "name": "Alice", "status": "accepted"},
+            {"email": "bob@example.com", "name": "Bob", "status": "needs_action"}
+          ],
+          "organizer_email": "carol@example.com",
+          "has_alarms": true
+        },
+        {
+          "id": "evt_weekly-instance-uuid-bbbb",
+          "calendar_id": "cal_work-google-uuid",
+          "title": "Weekly Sync",
+          "start": "2026-05-26T10:00:00+08:00",
+          "end": "2026-05-26T10:30:00+08:00",
+          "all_day": false,
+          "location": null,
+          "notes": null,
+          "url": null,
+          "is_recurring": true,
+          "is_recurring_instance": true,
+          "series_master_id": "evt_weekly-master-uuid-cccc",
+          "attendees": [],
+          "organizer_email": null,
+          "has_alarms": false
+        }
+      ],
+      "truncated": false
+    }
+  }
+}

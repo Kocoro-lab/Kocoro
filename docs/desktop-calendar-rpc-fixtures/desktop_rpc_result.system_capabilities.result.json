@@ -1,0 +1,27 @@
+{
+  "type": "desktop_rpc_result",
+  "payload": {
+    "request_id": "drpc_0102030405060708",
+    "ok": true,
+    "result": {
+      "version": "1.0.0",
+      "methods": [
+        "system.ping",
+        "system.capabilities",
+        "calendar.list_sources",
+        "calendar.list_events",
+        "calendar.get_event",
+        "calendar.create_event",
+        "calendar.update_event",
+        "calendar.delete_event",
+        "calendar.check_permission",
+        "calendar.request_permission"
+      ],
+      "platform": {
+        "os": "macOS",
+        "os_version": "14.4.1",
+        "app_version": "1.2.3"
+      }
+    }
+  }
+}

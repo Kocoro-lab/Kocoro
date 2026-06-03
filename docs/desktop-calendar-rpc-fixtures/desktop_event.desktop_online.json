@@ -1,0 +1,15 @@
+{
+  "type": "desktop_event",
+  "payload": {
+    "event": "desktop_online",
+    "data": {
+      "version": "1.0.0",
+      "platform": {
+        "os": "macOS",
+        "os_version": "14.4.1",
+        "app_version": "1.2.3"
+      }
+    },
+    "ts": "2026-05-26T10:00:00.500+08:00"
+  }
+}

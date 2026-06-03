@@ -1,0 +1,37 @@
+{
+  "type": "desktop_rpc_request",
+  "payload": {
+    "request_id": "drpc_eeff001122334455",
+    "method": "calendar.create_event",
+    "params": {
+      "calendar_id": null,
+      "title": "Sync with Alice",
+      "start": "2026-05-27T15:00:00+08:00",
+      "end": "2026-05-27T15:30:00+08:00",
+      "all_day": false,
+      "location": "Zoom",
+      "notes": "Q3 planning kickoff",
+      "url": "https://zoom.us/j/123456789",
+      "attendees": [
+        {"email": "alice@example.com", "name": "Alice"}
+      ],
+      "alarms": [
+        {"minutes_before": 15}
+      ],
+      "recurrence_rule": {
+        "frequency": "weekly",
+        "interval": 1,
+        "by_day": ["MO", "WE"],
+        "end_date": "2026-12-31T00:00:00+08:00",
+        "occurrence_count": null,
+        "raw_rrule": "FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261231T000000"
+      },
+      "description": "create a recurring sync meeting with Alice"
+    },
+    "timeout_ms": 30000,
+    "session_id": "sess_slack-create",
+    "agent": "default",
+    "source": "slack",
+    "ts": "2026-05-26T11:00:00+08:00"
+  }
+}

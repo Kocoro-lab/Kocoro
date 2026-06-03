@@ -1,0 +1,10 @@
+{
+  "type": "desktop_event",
+  "payload": {
+    "event": "calendar_permission_changed",
+    "data": {
+      "status": "granted"
+    },
+    "ts": "2026-05-26T10:05:23+08:00"
+  }
+}
