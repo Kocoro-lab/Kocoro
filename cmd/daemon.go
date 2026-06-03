@@ -226,6 +226,26 @@ var daemonStartCmd = &cobra.Command{
 		wsEndpoint += "/v1/ws/messages"
 		scheduleManager := schedule.NewManager(filepath.Join(shanDir, "schedules.json"))
 
+		// One-shot startup signal: pre-feature NAMED-agent schedules stored
+		// without a `stateful` field (Stateful==nil) now run FRESH each run
+		// (no cross-run history) where they previously accumulated in the
+		// shared agent:<name> session. Enumerate the affected IDs so owners can
+		// opt back in with {"stateful": true} instead of silently losing
+		// continuity. Default-agent nil rows already ran fresh pre-feature, so
+		// they are unaffected and not listed.
+		if scheds, lerr := scheduleManager.List(); lerr == nil {
+			var legacyNil []string
+			for _, sc := range scheds {
+				if sc.Agent != "" && sc.Stateful == nil {
+					legacyNil = append(legacyNil, sc.ID)
+				}
+			}
+			if len(legacyNil) > 0 {
+				log.Printf("daemon: %d legacy named-agent schedule(s) have no stateful field and now run fresh per run (previously accumulated history); PATCH {\"stateful\": true} to restore continuity. IDs: %s",
+					len(legacyNil), strings.Join(legacyNil, ", "))
+			}
+		}
+
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
