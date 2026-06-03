@@ -65,6 +65,9 @@ func (t *CalendarListEventsTool) Info() agent.ToolInfo {
 
 func (t *CalendarListEventsTool) RequiresApproval() bool { return false }
 
+// IsReadOnlyCall — see CalendarCheckPermissionTool; concurrent reads are safe.
+func (t *CalendarListEventsTool) IsReadOnlyCall(string) bool { return true }
+
 func (t *CalendarListEventsTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	if t.Broker == nil {
 		return agent.ToolResult{

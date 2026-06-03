@@ -30,6 +30,12 @@ func (t *CalendarCheckPermissionTool) Info() agent.ToolInfo {
 
 func (t *CalendarCheckPermissionTool) RequiresApproval() bool { return false }
 
+// IsReadOnlyCall lets the partitioner batch this with other reads. Each call
+// is an independent RPC (unique request_id); the broker is concurrency-safe
+// and WriteFrame is serialized by the listener's writeMu, so concurrent reads
+// have no correctness cost.
+func (t *CalendarCheckPermissionTool) IsReadOnlyCall(string) bool { return true }
+
 func (t *CalendarCheckPermissionTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	if t.Broker == nil {
 		return agent.ToolResult{

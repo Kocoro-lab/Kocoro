@@ -702,9 +702,9 @@ var daemonStartCmd = &cobra.Command{
 				Platform:    desktop_rpc.DefaultPlatform(Version),
 				Broker:      rpcBroker,
 				EventSink: func(evt *desktop_rpc.DesktopEvent) {
-					// v1: log + emit to EventBus so SSE subscribers (Desktop UI
-					// if it wants) can observe. v1.x will add permission cache
-					// update for calendar_permission_changed.
+					// v1: log only. v1.x will fan these onto the EventBus (so SSE
+					// subscribers can observe) and add a permission-cache update
+					// for calendar_permission_changed.
 					log.Printf("daemon: desktop_rpc event %s: %s", evt.Event, string(evt.Data))
 				},
 			}

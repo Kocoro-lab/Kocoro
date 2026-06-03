@@ -867,8 +867,14 @@ type ServerDeps struct {
 	// Desktop (see docs/desktop-calendar-rpc.md §4.1). nil when daemon is
 	// not running as a Desktop subprocess (TUI / one-shot CLI / MCP server /
 	// scheduled task modes); in those modes calendar_* tools are not
-	// registered (§4.3 conditional registration). Wired by cmd/daemon.go
+	// registered (§4.3 conditional registration). Assigned by cmd/daemon.go
 	// when both --rpc-socket and --rpc-pidfile flags are set.
+	//
+	// NOTE: the calendar tools capture the broker pointer directly at
+	// registration (RegisterCalendarTools), so nothing in internal/daemon
+	// reads this field today. It is held on ServerDeps as the canonical
+	// daemon-scoped handle for v1.x consumers (e.g. fanning desktop_offline
+	// onto the EventBus). Drop it if that never materializes.
 	//
 	// desktop_rpc is a leaf package (imports no internal package), so
 	// importing it here creates no cycle.

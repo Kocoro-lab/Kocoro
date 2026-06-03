@@ -188,10 +188,15 @@ func (l *Listener) Run(ctx context.Context) (retErr error) {
 		}
 		// Reset on successful accept — only consecutive failures matter.
 		consecutiveErrors = 0
-		// v1 single-instance: if a conn is already active, reject the new one.
-		// This avoids racing two clients (e.g. two Kocoro Desktop instances
-		// after a buggy LaunchServices). The first conn wins; second sees EOF.
-		if l.activeConn.Load() != nil {
+		// v1 single-instance: claim the slot synchronously (CAS) here, before
+		// spawning handleConn. The store MUST NOT live inside the goroutine —
+		// two near-simultaneous accepts would both observe nil in the window
+		// between accept and the goroutine's store, both pass the guard, and
+		// both run handleConn (clobbering Broker.SetSendFn against each other).
+		// CompareAndSwap closes that window: the first conn wins the slot, the
+		// second fails the swap and is closed (it sees EOF). handleConn only
+		// CLEARS the slot on exit; it never stores.
+		if !l.activeConn.CompareAndSwap(nil, &conn) {
 			log.Printf("desktop_rpc: rejecting second concurrent client from %v", conn.RemoteAddr())
 			conn.Close()
 			continue
@@ -205,10 +210,12 @@ func (l *Listener) Run(ctx context.Context) (retErr error) {
 // type. On exit, calls broker.CancelAll() to unblock any in-flight requests.
 func (l *Listener) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	// The slot was already claimed via CompareAndSwap in Run; we only clear
+	// it on exit so the next Desktop client can connect. (No Store here — see
+	// the single-instance comment in Run.)
 	defer l.activeConn.Store(nil)
 	defer l.cfg.Broker.CancelAll()
 
-	l.activeConn.Store(&conn)
 	log.Printf("desktop_rpc: client connected from %v", conn.RemoteAddr())
 
 	// Wire SendFn so the broker can push frames to this conn.

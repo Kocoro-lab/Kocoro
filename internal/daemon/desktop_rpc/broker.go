@@ -82,9 +82,10 @@ func (b *DesktopRPCBroker) SetSendFn(fn SendFn) {
 	b.mu.Unlock()
 }
 
-// IsConnected reports whether a SendFn is currently installed. Used by
-// `RegisterCalendarTools` and the `desktop_disconnected` error path to
-// short-circuit before allocating pending entries.
+// IsConnected reports whether a SendFn is currently installed (i.e. a Desktop
+// client is attached). Exposed for diagnostics / callers that want to
+// short-circuit before issuing a Request; v1 Request already returns
+// ErrNotConnected on its own, so the calendar tools don't call this directly.
 func (b *DesktopRPCBroker) IsConnected() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()

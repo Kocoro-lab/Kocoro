@@ -444,6 +444,80 @@ func TestListener_SecondConnRejected(t *testing.T) {
 	}
 }
 
+// TestListener_ConcurrentConnsSingleSurvivor fires several dials with no gap
+// between them, exercising the single-instance guard's race window directly.
+// Before the CompareAndSwap fix the slot was stored inside handleConn (async),
+// so two near-simultaneous accepts could both observe nil and both run the
+// read loop — clobbering Broker.SetSendFn. TestListener_SecondConnRejected
+// misses this because it sleeps + polls IsConnected between the two dials,
+// serializing past the window. Here we assert exactly one conn survives.
+// Run with -race to also surface the SetSendFn data race.
+func TestListener_ConcurrentConnsSingleSurvivor(t *testing.T) {
+	t.Parallel()
+	sockPath, _, broker, _, _ := newListenerTestRig(t)
+
+	const n = 8
+	conns := make([]net.Conn, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release all dials at once
+			c, err := net.Dial("unix", sockPath)
+			if err == nil {
+				conns[i] = c
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	// Let the accept loop process every connection and close the losers.
+	deadline := time.Now().Add(time.Second)
+	survivors := -1
+	for time.Now().Before(deadline) {
+		survivors = countOpenConns(conns)
+		if survivors == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	for _, c := range conns {
+		if c != nil {
+			defer c.Close()
+		}
+	}
+
+	if survivors != 1 {
+		t.Fatalf("expected exactly 1 surviving connection, got %d", survivors)
+	}
+	if !broker.IsConnected() {
+		t.Error("broker should report a live SendFn for the single survivor")
+	}
+}
+
+// countOpenConns probes each conn with a tiny read deadline. A rejected conn
+// returns EOF / reset immediately; the live survivor blocks (the daemon sends
+// nothing unsolicited) and returns a timeout error. Returns the survivor count.
+func countOpenConns(conns []net.Conn) int {
+	open := 0
+	buf := make([]byte, 1)
+	for _, c := range conns {
+		if c == nil {
+			continue
+		}
+		_ = c.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+		_, err := c.Read(buf)
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			open++ // still connected, nothing to read
+		}
+	}
+	return open
+}
+
 // TestListener_CleanupOnCancel verifies sock + pidfile are removed when
 // Run's ctx is cancelled.
 func TestListener_CleanupOnCancel(t *testing.T) {

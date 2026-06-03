@@ -135,15 +135,13 @@ func validateRFC3339(s string) error {
 		return fmt.Errorf("empty time string")
 	}
 	// time.Parse(time.RFC3339Nano) accepts both "Z" and "+offset" variants
-	// plus optional fractional seconds. It REJECTS naked datetime without
-	// a timezone — which is exactly what spec §3.3 requires.
-	if _, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return nil
+	// plus optional fractional seconds (RFC3339Nano is a strict superset of
+	// RFC3339, so a separate RFC3339 fallback would be dead code). It REJECTS
+	// naked datetime without a timezone — exactly what spec §3.3 requires.
+	if _, err := time.Parse(time.RFC3339Nano, s); err != nil {
+		return fmt.Errorf("not a valid RFC 3339 timestamp with offset: %q", s)
 	}
-	if _, err := time.Parse(time.RFC3339, s); err == nil {
-		return nil
-	}
-	return fmt.Errorf("not a valid RFC 3339 timestamp with offset: %q", s)
+	return nil
 }
 
 // clampLimit applies the spec §5.2 calendar.list_events limit bounds:
