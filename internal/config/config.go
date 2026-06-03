@@ -1068,6 +1068,13 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("invalid agent.thinking_mode %q: must be \"adaptive\" or \"enabled\"", cfg.Agent.ThinkingMode)
 		}
 	}
+	// agent.model is a specific model id forwarded to the Gateway as
+	// specific_model. A routing-tier word belongs in model_tier; if one lands
+	// here it is sent verbatim and fails every run with "model_id_unknown".
+	switch cfg.Agent.Model {
+	case "small", "medium", "large":
+		return fmt.Errorf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use model_tier for tiers", cfg.Agent.Model)
+	}
 	if cfg.Agent.IdleSoftTimeoutSecs < 0 {
 		return fmt.Errorf("agent.idle_soft_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Agent.IdleSoftTimeoutSecs)
 	}

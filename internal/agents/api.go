@@ -355,6 +355,11 @@ func (r *AgentCreateRequest) Validate() error {
 			return err
 		}
 	}
+	if r.Config != nil {
+		if err := ValidateAgentModelConfig(r.Config.Agent); err != nil {
+			return err
+		}
+	}
 	for name := range r.Commands {
 		if err := ValidateCommandName(name); err != nil {
 			return err
