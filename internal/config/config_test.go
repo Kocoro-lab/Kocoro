@@ -50,6 +50,41 @@ func TestValidateConfig_IdleTimeouts(t *testing.T) {
 	}
 }
 
+func TestValidateConfig_AgentModelTierKeyword(t *testing.T) {
+	mk := func(model string) *Config {
+		c := &Config{}
+		c.Agent.Model = model
+		return c
+	}
+	tests := []struct {
+		name    string
+		cfg     *Config
+		wantErr string
+	}{
+		{"empty ok", mk(""), ""},
+		{"specific id ok", mk("claude-opus-4-8"), ""},
+		{"tier small rejected", mk("small"), "specific model id"},
+		{"tier medium rejected", mk("medium"), "specific model id"},
+		{"tier large rejected", mk("large"), "specific model id"},
+		{"cased tier rejected", mk("Large"), "specific model id"},
+		{"padded tier rejected", mk(" large "), "specific model id"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateConfig(tt.cfg)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("want no error, got: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("want error containing %q, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
 func TestAppendAllowedCommand(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")

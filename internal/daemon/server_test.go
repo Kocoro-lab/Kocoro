@@ -991,6 +991,37 @@ func TestServer_PatchConfigNullRemovesChromeProfileKey(t *testing.T) {
 	}
 }
 
+func TestServer_PatchConfigRejectsTierKeywordAsModel(t *testing.T) {
+	shannonDir := t.TempDir()
+	initial := "model_tier: medium\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(initial), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	srv := NewServer(0, nil, &ServerDeps{ShannonDir: shannonDir}, "test")
+
+	// Cased variant must be rejected too (normalized match).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(`{"agent":{"model":"Large"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handlePatchConfig(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "specific model id") {
+		t.Fatalf("expected actionable message, got %s", rec.Body.String())
+	}
+	// The bad value must never reach config.yaml.
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(data), "model:") {
+		t.Fatalf("tier keyword should not have been written to config, got %s", string(data))
+	}
+}
+
 // --- Issue 1: rollback on create failure ---
 
 func TestServer_CreateAgent_Conflict(t *testing.T) {
