@@ -883,12 +883,20 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 			"ts":          nowISO(),
 		})
 	}
-	// Look up the per-request broker (SSE path) or fall back to server broker (WS path).
+	// Look up the per-request broker (SSE path), then the server broker (SSE
+	// source), then the WS broker (cloud/IM sources). A given approval lives in
+	// exactly one broker, and Resolve only runs emitResolved after winning the
+	// claim, so the fallback chain emits at most one terminal event. Reaching
+	// the WS broker here is what lets Desktop resolve an IM-originated approval:
+	// without it the request stayed pending until ApprovalTimeout and Cloud was
+	// never told to dismiss the channel card.
 	var claimed bool
 	if b, ok := s.pendingBrokers.Load(req.RequestID); ok {
 		claimed = b.(*ApprovalBroker).Resolve(req.RequestID, req.Decision, emitResolved)
-	} else {
-		claimed = s.approvalBroker.Resolve(req.RequestID, req.Decision, emitResolved)
+	} else if s.approvalBroker.Resolve(req.RequestID, req.Decision, emitResolved) {
+		claimed = true
+	} else if s.client != nil {
+		claimed = s.client.ResolveApproval(req.RequestID, req.Decision, emitResolved)
 	}
 	if claimed {
 		_ = s.notifyApprovalResolved(ApprovalResolvedPayload{

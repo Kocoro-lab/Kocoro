@@ -915,6 +915,106 @@ func TestApprovalRequest_FlagsOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
+// TestApprovalResolved_WSBrokerPath covers an approval that originated from a
+// cloud/IM source: its pending request lives ONLY in the WS broker (not in
+// pendingBrokers, not in server.approvalBroker). Resolving via POST /approval
+// (e.g. the user clicking Allow in Desktop) must reach the WS broker so that
+// (1) the blocked agent run is unblocked with the real decision, and (2) Cloud
+// is notified so it dismisses the channel approval card. Before the fix,
+// handleApproval only touched the first two brokers, leaving the WS request
+// pending until ApprovalTimeout and never notifying Cloud.
+func TestApprovalResolved_WSBrokerPath(t *testing.T) {
+	wsBroker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
+	client := &Client{}
+	client.SetApprovalBroker(wsBroker)
+
+	srv := NewServer(0, client, nil, "test")
+
+	notified := make(chan ApprovalResolvedPayload, 1)
+	srv.SetApprovalResolvedNotifier(func(p ApprovalResolvedPayload) error {
+		notified <- p
+		return nil
+	})
+
+	// Capture the server-generated request id once Request registers it.
+	idCh := make(chan string, 1)
+	wsBroker.onRegister = func(id string) { idCh <- id }
+
+	// A blocked agent run waiting on the WS broker for the user's decision.
+	resultCh := make(chan ApprovalDecision, 1)
+	go func() {
+		resultCh <- wsBroker.Request(context.Background(), ApprovalRequestMeta{Source: "feishu"}, "publish_to_web", `{}`)
+	}()
+
+	var reqID string
+	select {
+	case reqID = <-idCh:
+	case <-time.After(time.Second):
+		t.Fatal("request never registered in WS broker")
+	}
+
+	bus := srv.eventBus
+	ch := bus.Subscribe()
+	defer bus.Unsubscribe(ch)
+
+	body := bytes.NewBufferString(`{"request_id":"` + reqID + `","decision":"allow"}`)
+	req := httptest.NewRequest(http.MethodPost, "/approval", body)
+	w := httptest.NewRecorder()
+	srv.handleApproval(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", w.Code)
+	}
+	if body := strings.TrimSpace(w.Body.String()); body != `{"ok":true}` {
+		t.Fatalf("body: got %q, want {\"ok\":true}", body)
+	}
+
+	// 1) The agent run is unblocked with the real decision.
+	select {
+	case d := <-resultCh:
+		if d != DecisionAllow {
+			t.Fatalf("decision: got %s, want allow", d)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WS broker request never unblocked")
+	}
+
+	// 2) Cloud is notified so it dismisses the IM card.
+	select {
+	case p := <-notified:
+		if p.RequestID != reqID || p.Decision != DecisionAllow || p.ResolvedBy != "kocoro" {
+			t.Fatalf("notify payload: %+v", p)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Cloud was never notified")
+	}
+	// And only once — a WS-broker Resolve must not double-notify.
+	select {
+	case p := <-notified:
+		t.Fatalf("Cloud notified twice: %+v", p)
+	default:
+	}
+
+	// 3) Exactly one terminal bus event, resolved_by=kocoro.
+	select {
+	case evt := <-ch:
+		if evt.Type != EventApprovalResolved {
+			t.Fatalf("expected %s, got %s", EventApprovalResolved, evt.Type)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if payload["request_id"] != reqID {
+			t.Errorf("request_id: got %v, want %s", payload["request_id"], reqID)
+		}
+		if payload["resolved_by"] != "kocoro" {
+			t.Errorf("resolved_by: got %v, want kocoro", payload["resolved_by"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("approval_resolved event never arrived")
+	}
+}
+
 func eventTypes(events []Event) []string {
 	out := make([]string, len(events))
 	for i, e := range events {
