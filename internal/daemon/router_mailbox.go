@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -155,6 +156,53 @@ func (sc *SessionCache) EnqueueMessage(key string, msg agenttypes.QueuedMessage)
 	return MailboxQueued, nil
 }
 
+// ReEnqueueInjectSurvivors rescues follow-ups stranded in injectCh when a run
+// exits on a NON-end_turn path (LLM error, maxIter cap, empty-final). Those
+// paths don't drain injectCh, and the cleanup's ClearRouteRunState would nil it
+// — dropping a follow-up that won InjectMessage (InjectOK) during teardown.
+// Busy-state injects have no mailbox backing to replay, so without this they
+// are silently lost. Drain any survivors and re-queue them to the mailbox so
+// the next run on this route replays them; the drain closes the inject window
+// atomically once empty. Idempotent: the end_turn path already drained+closed
+// the window, so this is a no-op there. Loops so a follow-up arriving between
+// drains can't slip through before the window closes. Returns the count
+// re-queued.
+//
+// Attachments are not carried (text only): a stranded steering follow-up's text
+// is the lost-reply symptom this closes; full InjectedFile→Attachment carry is
+// out of scope for this teardown race.
+func (sc *SessionCache) ReEnqueueInjectSurvivors(key string) int {
+	if key == "" {
+		return 0
+	}
+	requeued := 0
+	for {
+		survivors := sc.DrainSurvivorsOrCloseInject(key)
+		if len(survivors) == 0 {
+			return requeued // window is now closed (or was already)
+		}
+		for _, s := range survivors {
+			if strings.TrimSpace(s.Text) == "" {
+				continue
+			}
+			msg := agenttypes.QueuedMessage{
+				ID:         newQueueID(),
+				RouteKey:   key,
+				Source:     "inject-survivor",
+				CWD:        s.CWD,
+				Text:       s.Text,
+				Priority:   agenttypes.PriorityNext,
+				EnqueuedAt: time.Now().UTC(),
+			}
+			// Best effort: a persist failure here is no worse than the pre-fix
+			// silent drop, and run teardown must not block on it.
+			if _, err := sc.EnqueueMessage(key, msg); err == nil {
+				requeued++
+			}
+		}
+	}
+}
+
 // DrainMailbox dequeues up to limit messages for the route. Returns nil for
 // an empty mailbox or unknown route. Callers MUST invoke MarkMailboxConsumed
 // AFTER appending the messages to the session AND session.Save returns
@@ -298,6 +346,9 @@ func (sc *SessionCache) RegisterAdHocSessionRoute(
 	if sessionID == "" {
 		return "", false
 	}
+	// Pre-normalize OUTSIDE the lock (see SetRouteRunState / P7) so the
+	// InjectMessage cwd comparison under sc.mu needs no EvalSymlinks call.
+	activeCWD = normalizeCWDForCompare(activeCWD)
 	key := "session:" + sanitizeRouteValue(sessionID)
 	sc.mu.Lock()
 	defer sc.mu.Unlock()

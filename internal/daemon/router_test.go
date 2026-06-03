@@ -408,9 +408,13 @@ func TestSessionCache_InjectMessage_CWDConflict(t *testing.T) {
 	projectB := t.TempDir()
 	sc.mu.Lock()
 	sc.routes["agent:test"] = &routeEntry{
-		injectCh:  injectCh,
-		done:      make(chan struct{}),
-		activeCWD: projectA,
+		injectCh: injectCh,
+		done:     make(chan struct{}),
+		// Production setters store activeCWD pre-normalized (P7); mirror that
+		// here since this stuffs the entry directly. t.TempDir() lives under a
+		// symlinked /var → /private/var, so the raw value would never match the
+		// normalized request CWD.
+		activeCWD: normalizeCWDForCompare(projectA),
 	}
 	sc.mu.Unlock()
 
@@ -433,9 +437,12 @@ func TestSessionCache_InjectMessage_SameCWDAllowed(t *testing.T) {
 	project := t.TempDir()
 	sc.mu.Lock()
 	sc.routes["agent:test"] = &routeEntry{
-		injectCh:  injectCh,
-		done:      make(chan struct{}),
-		activeCWD: project,
+		injectCh: injectCh,
+		done:     make(chan struct{}),
+		// Production setters store activeCWD pre-normalized (P7); mirror that
+		// here since this stuffs the entry directly (t.TempDir() is under a
+		// symlinked /var → /private/var).
+		activeCWD: normalizeCWDForCompare(project),
 	}
 	sc.mu.Unlock()
 

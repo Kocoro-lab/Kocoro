@@ -438,16 +438,24 @@ func (sc *SessionCache) InjectMessage(key string, msg agent.InjectedMessage) Inj
 	if entry.injectCh == nil {
 		return InjectBusy
 	}
-	if requestCWD != "" && requestCWD != normalizeCWDForCompare(entry.activeCWD) {
+	// entry.activeCWD is stored pre-normalized (SetRouteRunState /
+	// RegisterAdHocSessionRoute normalize before the lock), so this comparison
+	// runs no EvalSymlinks filesystem call under sc.mu. (P7)
+	if requestCWD != "" && requestCWD != entry.activeCWD {
 		return InjectCWDConflict
 	}
 	// Enqueue under sc.mu so the send is atomic with respect to
 	// DrainSurvivorsOrCloseInject: a follow-up racing run teardown either lands
 	// before the drain (reclaimed as a survivor) or observes the closed window
-	// above and returns InjectNoActiveRun — it can never be orphaned on a
-	// detached channel after returning InjectOK. injectCh is buffered with a
-	// non-blocking select, so holding the lock here cannot deadlock against the
-	// loop's drain (which does not take sc.mu).
+	// above and returns InjectNoActiveRun. On a non-end_turn exit the loop
+	// doesn't drain, but ReEnqueueInjectSurvivors (runner cleanup) drains and
+	// re-queues any survivor to the mailbox before ClearRouteRunState nils the
+	// channel — so a follow-up is never silently dropped after returning
+	// InjectOK. (P5)
+	//
+	// DrainSurvivorsOrCloseInject also takes sc.mu, but the two never nest, and
+	// the send below is a non-blocking select on a buffered channel, so holding
+	// the lock here cannot deadlock against the drain.
 	select {
 	case entry.injectCh <- msg:
 		return InjectOK
@@ -518,12 +526,15 @@ func (sc *SessionCache) SetRouteRunState(key string, done chan struct{}, injectC
 	if key == "" {
 		return
 	}
+	// Pre-normalize OUTSIDE the lock so InjectMessage can compare against
+	// entry.activeCWD under sc.mu without an EvalSymlinks filesystem call. (P7)
+	normalizedCWD := normalizeCWDForCompare(activeCWD)
 	sc.mu.Lock()
 	entry, ok := sc.routes[key]
 	if ok && entry != nil {
 		entry.done = done
 		entry.injectCh = injectCh
-		entry.activeCWD = activeCWD
+		entry.activeCWD = normalizedCWD
 	}
 	sc.mu.Unlock()
 }

@@ -1349,6 +1349,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				ws = deps.WSClient
 			}
 			EmitLifecycleOnRunCompletion(ws, deps.SessionCache, req.RouteKey)
+			// Rescue any follow-up that won InjectMessage during this teardown on
+			// a non-end_turn exit (error / maxIter / empty-final), before the
+			// window is cleared below — otherwise it's stranded in the
+			// about-to-be-niled injectCh. (P5)
+			if n := deps.SessionCache.ReEnqueueInjectSurvivors(req.RouteKey); n > 0 {
+				log.Printf("daemon: re-queued %d stranded inject survivor(s) for route %q", n, req.RouteKey)
+			}
 			deps.SessionCache.ClearRouteRunState(req.RouteKey)
 			closeRouteDone(routeDone)
 			route.cancel = nil

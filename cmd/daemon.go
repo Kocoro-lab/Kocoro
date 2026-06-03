@@ -1074,9 +1074,11 @@ func (h *daemonEventHandler) OnIntermediateAnswer(text string) {
 }
 
 // OnPreamble forwards mid-turn narration to Cloud over the same LLM_OUTPUT WS
-// event used for final-answer text. Cloud distinguishes "preamble vs final" by
-// the surrounding TOOL_RUNNING / TOOL_COMPLETED frames, so reusing the same
-// wire event preserves the existing channel rendering on Slack/Feishu/etc.
+// event used for final-answer text. In timeline mode Cloud appends every
+// non-final LLM_OUTPUT as an ordered timeline segment; the run's final answer
+// arrives separately via WORKFLOW_COMPLETED (from SendReply), so reusing the
+// same wire event preserves the existing channel rendering on Slack/Feishu/etc.
+// without a premature completion. (P11)
 func (h *daemonEventHandler) OnPreamble(text string) {
 	if text == "" {
 		return
