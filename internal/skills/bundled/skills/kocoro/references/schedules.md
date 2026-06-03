@@ -6,7 +6,7 @@ Schedules are automated tasks that run on a cron schedule without any human inte
 
 ## Create / update / remove with the native `schedule_*` tools (NOT `http`)
 
-As the kocoro assistant, manage schedules with the local tools `schedule_create` / `schedule_update` / `schedule_remove` (and `schedule_list` to read) — do NOT `http POST /schedules`. Only the native tools capture the run's originating agent, IM channel, and conversation context. That captured context is what lets a schedule created from a Slack / Lark / Feishu / … thread proactively deliver its results back to that exact thread, run as the right agent, and understand the task background. Creating via raw HTTP loses all of it (the schedule runs as the default agent and never broadcasts, so the user never hears back). The HTTP endpoints below remain documented for external/admin clients and for reads.
+As the kocoro assistant, manage schedules with the local tools `schedule_create` / `schedule_update` / `schedule_remove` / `schedule_show` (and `schedule_list` to read) — do NOT `http POST /schedules` or raw `PATCH /schedules` for schedule management. Only the native tools capture the run's originating agent, IM channel, and conversation context. That captured context is what lets a schedule created from a Slack / Lark / Feishu / … thread proactively deliver its results back to that exact thread, run as the right agent, and understand the task background. Creating via raw HTTP loses all of it (the schedule runs as the default agent and never broadcasts, so the user never hears back). The HTTP endpoints below remain documented for external/admin clients and for reads.
 
 ## API Endpoints
 
@@ -71,22 +71,22 @@ Format: `minute hour day-of-month month day-of-week`
 ## Common Scenarios
 
 ### "Run a daily report at 9am on weekdays"
-1. POST /schedules with:
+1. Call `schedule_create` with:
    ```json
-   {"prompt": "Generate a daily summary: check git log for recent commits, open issues, and any failing tests. Send a brief report.", "cron": "0 9 * * 1-5", "agent": "dev-assistant"}
+   {"agent": "dev-assistant", "cron": "0 9 * * 1-5", "prompt": "Generate a daily summary: check git log for recent commits, open issues, and any failing tests. Send a brief report.", "description": "create weekday daily report schedule"}
    ```
-2. GET /schedules → confirm it's listed and `enabled: true`
+2. Call `schedule_list` to confirm it is listed and `enabled=true`.
 
 ### "Pause a schedule temporarily"
-1. PATCH /schedules/{id} with `{"enabled": false}`
-2. Schedule is preserved but won't run. Re-enable with `{"enabled": true}`.
+1. Call `schedule_update` with `{"id": "<schedule_id>", "enabled": false, "description": "pause schedule temporarily"}`.
+2. Schedule is preserved but won't run. Re-enable with `{"id": "<schedule_id>", "enabled": true, "description": "re-enable schedule"}`.
 
 ### "Change when a schedule runs"
-1. PATCH /schedules/{id} with `{"cron": "0 8 * * *"}` (changes to 8am daily)
+1. Call `schedule_update` with `{"id": "<schedule_id>", "cron": "0 8 * * *", "description": "change schedule to 8am daily"}`.
 
 ### "Check when a schedule last ran and what it did"
-1. GET /schedules/{id}/last-run → returns `last_run_at` + the recent assistant turns from the run's session
-2. Or via LLM: call `schedule_show` with the schedule id
+1. Call `schedule_show` with `{"id": "<schedule_id>", "description": "show latest schedule output"}`.
+2. It returns `last_run_at`, the session id, and the recent assistant turns from that schedule run.
 
 ## Safety Notes
 

@@ -329,7 +329,7 @@ Always registered (`internal/tools/register.go RegisterLocalTools`):
 - **Documents**: pdf_to_text, docx_to_text, xlsx_to_text, pptx_to_text. Prefer poppler/pandoc/xlsx2csv; fall back to unzip+XML strip (no fallback for PDF — surfaces `brew install poppler` hint + suggests upload for native Anthropic document block). Fixed-argv, 60s timeout, 100K-rune output cap. See `doc_extract.go`.
 - **Shell/system**: bash, system_info, process, http, think
 - **macOS GUI**: accessibility (primary), applescript, screenshot, computer, clipboard, notify, browser, wait_for, ghostty
-- **Schedule**: schedule_create / _list / _update / _remove
+- **Schedule**: schedule_create / _list / _update / _remove / _show
 - **Memory**: memory_append (flock-protected MEMORY.md append)
 - **Skills**: use_skill
 
