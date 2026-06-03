@@ -52,7 +52,7 @@ var scheduleListCmd = &cobra.Command{
 			return nil
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tAGENT\tCRON\tENABLED\tSYNC\tPROMPT")
+		fmt.Fprintln(w, "ID\tAGENT\tCRON\tENABLED\tSTATEFUL\tSYNC\tPROMPT")
 		for _, s := range list {
 			prompt := s.Prompt
 			if len([]rune(prompt)) > 50 {
@@ -62,7 +62,17 @@ var scheduleListCmd = &cobra.Command{
 			if agent == "" {
 				agent = "(default)"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%v\t%s\t%s\n", s.ID, agent, s.Cron, s.Enabled, s.SyncStatus, prompt)
+			// on = accumulates context, off = fresh each run, off(legacy) = nil
+			// Stateful (created before the field existed) which now also runs fresh.
+			stateful := "off(legacy)"
+			if s.Stateful != nil {
+				if *s.Stateful {
+					stateful = "on"
+				} else {
+					stateful = "off"
+				}
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%v\t%s\t%s\t%s\n", s.ID, agent, s.Cron, s.Enabled, stateful, s.SyncStatus, prompt)
 		}
 		w.Flush()
 		return nil
