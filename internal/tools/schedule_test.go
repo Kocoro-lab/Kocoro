@@ -423,6 +423,51 @@ func TestScheduleTool_Create_NoCtxAgentSafelyDefaults(t *testing.T) {
 	}
 }
 
+// schedule_list renders the remember-across-runs mode per row so the model can
+// answer "does this schedule remember previous runs?" and so the legacy nil →
+// fresh behavior change is discoverable from a listing, not only the one-shot
+// startup log. Legacy rows (no stateful field on disk) cannot be produced via
+// the create tool (parseStatefulArg defaults a missing arg to false), so they
+// are hand-written here.
+func TestScheduleTool_List_RendersStatefulMode(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "lister", "")
+	path := filepath.Join(shan, "schedules.json")
+	rows := `[
+	  {"id":"sched-on","agent":"lister","cron":"* * * * *","prompt":"p1","enabled":true,"sync_status":"local","stateful":true},
+	  {"id":"sched-off","agent":"lister","cron":"* * * * *","prompt":"p2","enabled":true,"sync_status":"local","stateful":false},
+	  {"id":"sched-legacy","agent":"lister","cron":"* * * * *","prompt":"p3","enabled":true,"sync_status":"local"}
+	]`
+	if err := os.WriteFile(path, []byte(rows), 0o600); err != nil {
+		t.Fatalf("write schedules.json: %v", err)
+	}
+
+	mgr := schedule.NewManager(path)
+	tool := &ScheduleTool{manager: mgr, action: "list"}
+	res, err := tool.Run(context.Background(), `{}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+
+	// The " | sync=" anchor immediately follows the tag, so "stateful=off | sync="
+	// does NOT match the legacy row's "stateful=off(legacy) | sync=".
+	for _, want := range []string{
+		"stateful=on | sync=",
+		"stateful=off | sync=",
+		"stateful=off(legacy) | sync=",
+	} {
+		if !strings.Contains(res.Content, want) {
+			t.Errorf("list output missing %q:\n%s", want, res.Content)
+		}
+	}
+
+	// Pin the legacy row's mapping specifically.
+	for _, ln := range strings.Split(strings.TrimSpace(res.Content), "\n") {
+		if strings.HasPrefix(ln, "sched-legacy ") && !strings.Contains(ln, "stateful=off(legacy)") {
+			t.Errorf("legacy row not tagged off(legacy): %q", ln)
+		}
+	}
+}
+
 // Case 6: stateful=true via tool args is honored (regression for the new
 // schema arg we added).
 func TestScheduleTool_Create_StatefulArgHonored(t *testing.T) {

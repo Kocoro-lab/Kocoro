@@ -289,8 +289,22 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			if t.manager.HasContext(s.ID) {
 				ctxTag = " [ctx]"
 			}
-			fmt.Fprintf(&sb, "%s | agent=%s | cron=%s | enabled=%v | sync=%s | %s%s\n",
-				s.ID, agentDisplay, s.Cron, s.Enabled, s.SyncStatus, s.Prompt, ctxTag)
+			// Surface the remember-across-runs mode so the model can answer
+			// "does this schedule remember previous runs?" and so the legacy
+			// behavior change is discoverable from a listing, not just the
+			// one-shot startup log: on = accumulates context, off = fresh each
+			// run, off(legacy) = nil Stateful (created before the field existed)
+			// which now also runs fresh — PATCH stateful=true to restore it.
+			statefulTag := "off(legacy)"
+			if s.Stateful != nil {
+				if *s.Stateful {
+					statefulTag = "on"
+				} else {
+					statefulTag = "off"
+				}
+			}
+			fmt.Fprintf(&sb, "%s | agent=%s | cron=%s | enabled=%v | stateful=%s | sync=%s | %s%s\n",
+				s.ID, agentDisplay, s.Cron, s.Enabled, statefulTag, s.SyncStatus, s.Prompt, ctxTag)
 		}
 		return agent.ToolResult{Content: sb.String()}, nil
 	case "update":
