@@ -20,6 +20,24 @@ func TestStickyContext_AlwaysIncludesAgent(t *testing.T) {
 	}
 }
 
+// TestStickyContext_ScheduleAddsOutputDiscipline locks that schedule-source
+// runs get the "output only the deliverable" discipline (so the reply doesn't
+// leak the delivery mechanism / session internals), while interactive/IM
+// sources stay byte-stable without it.
+func TestStickyContext_ScheduleAddsOutputDiscipline(t *testing.T) {
+	got := buildStickyContext(ChannelSchedule, ChannelSchedule+"-abc123", "scheduler", "academic-writer", "", "")
+	if !strings.Contains(got, "scheduled task") || !strings.Contains(got, "Output ONLY the user-facing message") {
+		t.Errorf("schedule-source sticky context missing output-discipline clause; got:\n%s", got)
+	}
+
+	// Non-schedule sources must NOT pick up the clause (cache byte-stability).
+	for _, src := range []string{"slack", "webview", "line", "feishu"} {
+		if other := buildStickyContext(src, "C0XXX", "yohei", "researcher", "", ""); strings.Contains(other, "scheduled task") {
+			t.Errorf("source %q must not contain the schedule output-discipline clause; got:\n%s", src, other)
+		}
+	}
+}
+
 func TestStickyContext_IMBindings(t *testing.T) {
 	// Non-empty imBindings → "IM bindings:" line appears between Agent and extra.
 	got := buildStickyContext("webview", "", "hu", "", "default=slack:kocoro-test-slack", "")
