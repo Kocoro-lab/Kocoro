@@ -218,3 +218,49 @@ func TestMultiHandlerOnInjectedCommittedPropagatesToImplementers(t *testing.T) {
 func TestMultiHandlerSatisfiesInjectCommitHandlerInterface(t *testing.T) {
 	var _ agent.InjectCommitHandler = (*multiHandler)(nil) // compile-time check
 }
+
+// intermediateAnswerSpy implements agent.IntermediateAnswerHandler (and
+// agent.EventHandler via the embedded usageSpy). Used to verify
+// multiHandler.OnIntermediateAnswer propagates via type assertion.
+type intermediateAnswerSpy struct {
+	usageSpy
+	calls []string
+}
+
+func (s *intermediateAnswerSpy) OnIntermediateAnswer(text string) {
+	s.calls = append(s.calls, text)
+}
+
+// The agent loop reaches the daemon WS handler via
+// a.handler.(IntermediateAnswerHandler) at the end_turn drain-race guard; in
+// production the loop handler is a *multiHandler, so the fan-out must forward to
+// wrapped handlers that implement the interface and skip those that don't. If
+// this propagation breaks, a turn's final answer that an injected follow-up
+// supersedes is dropped from the IM channel (the "first reply went missing"
+// bug) — exactly the regression that shipped when multiHandler forwarding for
+// this hook was first omitted.
+func TestMultiHandlerOnIntermediateAnswerPropagatesToImplementers(t *testing.T) {
+	iah := &intermediateAnswerSpy{}
+	plain := &plainSpy{}
+	m := &multiHandler{handlers: []agent.EventHandler{iah, plain}}
+
+	m.OnIntermediateAnswer("first turn answer")
+
+	if len(iah.calls) != 1 || iah.calls[0] != "first turn answer" {
+		t.Fatalf("iah.calls = %+v, want [first turn answer]", iah.calls)
+	}
+	// plain has no OnIntermediateAnswer — the call must not panic and must not
+	// affect iah. Base fan-out must still work after the typed dispatch.
+	m.OnText("x")
+	if plain.text != 1 {
+		t.Fatalf("plain.text = %d, want 1 — OnIntermediateAnswer bypass broke base fan-out", plain.text)
+	}
+}
+
+// Verify multiHandler satisfies agent.IntermediateAnswerHandler so the agent
+// loop's `a.handler.(IntermediateAnswerHandler)` assertion succeeds when the
+// loop handler is a *multiHandler — without it, the superseded answer never
+// reaches the daemon handler that re-emits it to the channel.
+func TestMultiHandlerSatisfiesIntermediateAnswerHandlerInterface(t *testing.T) {
+	var _ agent.IntermediateAnswerHandler = (*multiHandler)(nil) // compile-time check
+}

@@ -1054,10 +1054,31 @@ func (h *daemonEventHandler) OnText(text string) {
 	// through OnPreamble (which keeps sending LLM_OUTPUT).
 }
 
+// OnIntermediateAnswer surfaces the final answer of a turn that an injected
+// follow-up superseded (the loop continued past it instead of returning).
+// Because OnText is a no-op and the run-end SendReply only carries the LAST
+// turn's answer, an earlier turn's reply would otherwise be dropped from the
+// channel when rapid follow-ups merge into one run. Emit it as a timeline
+// segment (LLM_OUTPUT — the same wire event as OnPreamble) so it appears inline
+// in the IM timeline; this deliberately avoids a second WORKFLOW_COMPLETED,
+// which would read as a premature run completion on the Cloud side.
+func (h *daemonEventHandler) OnIntermediateAnswer(text string) {
+	if text == "" {
+		return
+	}
+	if h.wsClient != nil && h.messageID != "" {
+		if err := h.wsClient.SendEvent(h.messageID, "LLM_OUTPUT", text, nil); err != nil {
+			log.Printf("daemon: event forward failed: %v", err)
+		}
+	}
+}
+
 // OnPreamble forwards mid-turn narration to Cloud over the same LLM_OUTPUT WS
-// event used for final-answer text. Cloud distinguishes "preamble vs final" by
-// the surrounding TOOL_RUNNING / TOOL_COMPLETED frames, so reusing the same
-// wire event preserves the existing channel rendering on Slack/Feishu/etc.
+// event used for final-answer text. In timeline mode Cloud appends every
+// non-final LLM_OUTPUT as an ordered timeline segment; the run's final answer
+// arrives separately via WORKFLOW_COMPLETED (from SendReply), so reusing the
+// same wire event preserves the existing channel rendering on Slack/Feishu/etc.
+// without a premature completion. (P11)
 func (h *daemonEventHandler) OnPreamble(text string) {
 	if text == "" {
 		return

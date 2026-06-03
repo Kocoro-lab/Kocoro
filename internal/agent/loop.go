@@ -678,6 +678,21 @@ type InjectCommitHandler interface {
 	OnInjectedCommitted(clientMessageID, text string)
 }
 
+// IntermediateAnswerHandler is an optional interface a handler may implement to
+// receive a turn's FINAL answer that an injected follow-up is about to supersede
+// because it extended the run past that answer. The daemon's OnText is a no-op
+// for final answers (they reach the IM channel via SendReply only, at run end),
+// so without this hook every turn's answer but the last is silently dropped when
+// rapid follow-ups merge into one run: the user fires "B" before "A"'s reply
+// posts, the loop injects B and continues, and A's answer never reaches the
+// channel. The daemon implements it to emit the intermediate answer as a
+// timeline segment (LLM_OUTPUT), so each merged turn's reply still shows.
+// Handlers that do not implement it (TUI/tests, whose OnText already renders the
+// text) simply skip these events via the loop's type assertion.
+type IntermediateAnswerHandler interface {
+	OnIntermediateAnswer(text string)
+}
+
 // RunStatusHandler is an optional interface a handler may implement to receive
 // turn-level status updates (watchdog soft/hard idle, retries). The agent loop
 // checks for it via a type assertion, so handlers that do not implement it
@@ -766,6 +781,11 @@ type AgentLoop struct {
 	deltaProvider    DeltaProvider
 	injectCh         chan InjectedMessage
 	injectedMessages []string // messages injected during the last Run(); cleared on each Run() call
+	// injectFinalDrainFn, when set, atomically drains + retraction-filters the
+	// route's pending injects and closes the inject window if none survive (see
+	// SetInjectFinalDrainFn). Replaces the racy len(injectCh) peek at the
+	// end_turn drain-race guard.
+	injectFinalDrainFn func() []InjectedMessage
 	// mailboxConsumeFn, when set, is invoked with the mailbox row IDs of any
 	// InjectedMessage entries the loop drained mid-turn. The daemon installs
 	// this hook to mark those rows consumed in SQLite + emit queue.flushed
@@ -1230,6 +1250,32 @@ func (a *AgentLoop) InvalidateWorkingSet() {
 // so multiple messages are batched.
 func (a *AgentLoop) SetInjectCh(ch chan InjectedMessage) {
 	a.injectCh = ch
+}
+
+// SetInjectFinalDrainFn registers the daemon-backed atomic drain used by the
+// end_turn drain-race guard. When the loop is about to return, it calls this
+// instead of peeking len(injectCh): the daemon drains the route's pending
+// injects under its own lock (already retraction-filtered) and, if none survive,
+// closes the inject window in the same critical section so a follow-up racing
+// the return falls through to a fresh run instead of being orphaned on a channel
+// the loop will never read again. Unset (TUI / tests with no route) → the guard
+// falls back to the local filterRetractedInjects(drainInjected).
+func (a *AgentLoop) SetInjectFinalDrainFn(fn func() []InjectedMessage) {
+	a.injectFinalDrainFn = fn
+}
+
+// finalDrainInjected returns the non-retracted follow-ups to commit at the
+// end_turn boundary. Prefers the daemon-backed atomic drain (which also closes
+// the inject window when empty); falls back to the local channel drain when no
+// route is wired.
+func (a *AgentLoop) finalDrainInjected() []InjectedMessage {
+	if a.injectFinalDrainFn != nil {
+		return a.injectFinalDrainFn()
+	}
+	if a.injectCh == nil {
+		return nil
+	}
+	return a.filterRetractedInjects(drainInjected(a.injectCh))
 }
 
 // SetMailboxConsumeFn registers a callback fired with mailbox row IDs
@@ -3051,10 +3097,24 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 						if newMsgOffset >= 0 && newMsgOffset < len(messages) {
 							messages[newMsgOffset] = replaceUserMessageText(messages[newMsgOffset], scaffoldedUserText)
 						}
+					} else if last := len(messages) - 1; last >= 0 && messageIsBareUserPrompt(messages[last]) {
+						// Inject continuation: the end_turn drain-race guard committed
+						// the user's actual follow-up as the last message, so it is NOT
+						// tool results. Both alternatives here are wrong:
+						//   - Appending a separate hint masks the follow-up — the model
+						//     treats the content-less <system-reminder> as the current
+						//     turn and replies "your message had no content".
+						//   - Embedding the hint into the follow-up leaks the reminder
+						//     into the persisted/displayed user bubble: unlike the turn-0
+						//     user message, later-turn messages are NOT scaffold-stripped
+						//     on persist (captureRunMessages only strips the first one).
+						// So skip the discovery hint for an inject continuation: the
+						// follow-up stays the last user message (the model responds to
+						// it), and skills still load on demand via use_skill. Discovery
+						// usage was already metered above.
 					} else {
-						// Later turns: inject as a new message. This is safe
-						// because the last user message is tool results, not
-						// the user's original prompt.
+						// Normal tool continuation: the last user message is tool
+						// results, so a separate hint message is safe.
 						messages = append(messages, client.Message{
 							Role:    "user",
 							Content: client.NewTextContent(hint),
@@ -3767,28 +3827,34 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if a.handler != nil {
 				a.handler.OnText(fullText)
 			}
-			// Drain-race guard: a user message can land in injectCh while the
-			// LLM is composing this "I'm done" reply. If we return now, the
-			// queued message strands in the mailbox until the next manual
-			// /run — leaving the UI's queue card visibly stuck even though the
-			// run completed. Continuing into another iteration lets the
-			// top-of-loop drain pick it up and respond in the same turn.
-			//
-			// Only continue for NON-retracted input, though: peeking raw
-			// len(injectCh) also counts a follow-up the client already retracted
-			// (the tombstone is applied at drain, not removed from the channel),
-			// and continuing for that re-issues the LLM call and emits a
-			// duplicate final answer (the cancelled-follow-up duplicate-reply
-			// bug). Drain+filter, then commit survivors INLINE via
-			// commitInjectedTurn so the follow-up is recorded even if the very
-			// next iteration trips the maxIter cap — steering injects have no
-			// mailbox backing to replay. commitInjectedTurn returns false for an
-			// empty/all-retracted batch, so we keep the turn alive only when a
-			// real follow-up survived.
-			if a.injectCh != nil && len(a.injectCh) > 0 {
-				if survivors := a.filterRetractedInjects(drainInjected(a.injectCh)); commitInjectedTurn(survivors) {
-					continue
+			// Drain-race guard: a follow-up can land in injectCh while the LLM is
+			// composing this "I'm done" reply. Returning on a bare len(injectCh)
+			// peek would strand a message that arrives AFTER the peek but before
+			// route teardown on a detached channel — the IM-burst "last follow-up
+			// never enters the loop" bug (and the "card spins forever" sibling).
+			// finalDrainInjected closes that window: with a route wired it
+			// drains + retraction-filters under the daemon's lock and, when nothing
+			// survives, closes the inject window in the SAME critical section, so a
+			// racing follow-up falls through to a fresh run. Retracted follow-ups
+			// are filtered out, so a cancelled message never re-issues the LLM call
+			// (the duplicate-final-answer bug). commitInjectedTurn returns false for
+			// an empty/all-retracted batch, so the turn stays alive only when a real
+			// follow-up survived — and survivors are committed INLINE so they're
+			// recorded even if the next iteration trips the maxIter cap (steering
+			// injects have no mailbox backing to replay).
+			if survivors := a.finalDrainInjected(); commitInjectedTurn(survivors) {
+				// The run is continuing for an injected follow-up, so fullText is
+				// the answer to the turn that just finished — an INTERMEDIATE
+				// answer, not the run's final reply. The daemon's OnText above is a
+				// no-op (final answers post to the IM channel via SendReply at run
+				// end), so flush it through the optional hook or it vanishes from
+				// the channel entirely — the "first reply went missing when I fired
+				// a follow-up too fast" bug. Handlers without the hook (TUI/tests)
+				// skip it; their OnText already rendered the text.
+				if h, ok := a.handler.(IntermediateAnswerHandler); ok && strings.TrimSpace(fullText) != "" {
+					h.OnIntermediateAnswer(fullText)
 				}
+				continue
 			}
 			return fullText, usage, nil
 		}
@@ -4862,6 +4928,25 @@ func replaceUserMessageText(msg client.Message, newText string) client.Message {
 		out = append([]client.ContentBlock{{Type: "text", Text: newText}}, out...)
 	}
 	return client.Message{Role: "user", Content: client.NewBlockContent(out)}
+}
+
+// messageIsBareUserPrompt reports whether msg is a user turn carrying the
+// user's own prompt (text and/or attachments) rather than tool results. The
+// skill-discovery hint injector uses it to decide between embedding the hint
+// into the prompt (an inject continuation, where the end_turn drain-race guard
+// committed the user's follow-up as the last message) and appending a separate
+// hint turn (a normal tool continuation, where the last user turn is tool
+// results and a standalone hint is safe).
+func messageIsBareUserPrompt(msg client.Message) bool {
+	if msg.Role != "user" {
+		return false
+	}
+	for _, b := range msg.Content.Blocks() {
+		if b.Type == "tool_result" {
+			return false
+		}
+	}
+	return true
 }
 
 func userMessageTextMatches(msg client.Message, text string) bool {
