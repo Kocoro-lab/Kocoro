@@ -130,3 +130,19 @@ func (m *multiHandler) OnInjectedCommitted(clientMessageID, text string) {
 		}
 	}
 }
+
+// OnIntermediateAnswer propagates a superseded turn's final answer to wrapped
+// handlers that implement agent.IntermediateAnswerHandler (the daemon WS handler
+// does, re-emitting it as an LLM_OUTPUT timeline segment). Present on
+// multiHandler itself so the agent loop's type assertion
+// `a.handler.(IntermediateAnswerHandler)` succeeds when the loop handler is a
+// multiHandler — without this the wrapped daemon handler never sees the event,
+// and a turn's answer is dropped from the IM channel whenever an injected
+// follow-up merges turns (the "first reply went missing" bug).
+func (m *multiHandler) OnIntermediateAnswer(text string) {
+	for _, h := range m.handlers {
+		if iah, ok := h.(agent.IntermediateAnswerHandler); ok {
+			iah.OnIntermediateAnswer(text)
+		}
+	}
+}

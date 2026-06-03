@@ -678,6 +678,21 @@ type InjectCommitHandler interface {
 	OnInjectedCommitted(clientMessageID, text string)
 }
 
+// IntermediateAnswerHandler is an optional interface a handler may implement to
+// receive a turn's FINAL answer that an injected follow-up is about to supersede
+// because it extended the run past that answer. The daemon's OnText is a no-op
+// for final answers (they reach the IM channel via SendReply only, at run end),
+// so without this hook every turn's answer but the last is silently dropped when
+// rapid follow-ups merge into one run: the user fires "B" before "A"'s reply
+// posts, the loop injects B and continues, and A's answer never reaches the
+// channel. The daemon implements it to emit the intermediate answer as a
+// timeline segment (LLM_OUTPUT), so each merged turn's reply still shows.
+// Handlers that do not implement it (TUI/tests, whose OnText already renders the
+// text) simply skip these events via the loop's type assertion.
+type IntermediateAnswerHandler interface {
+	OnIntermediateAnswer(text string)
+}
+
 // RunStatusHandler is an optional interface a handler may implement to receive
 // turn-level status updates (watchdog soft/hard idle, retries). The agent loop
 // checks for it via a type assertion, so handlers that do not implement it
@@ -3828,6 +3843,17 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// recorded even if the next iteration trips the maxIter cap (steering
 			// injects have no mailbox backing to replay).
 			if survivors := a.finalDrainInjected(); commitInjectedTurn(survivors) {
+				// The run is continuing for an injected follow-up, so fullText is
+				// the answer to the turn that just finished — an INTERMEDIATE
+				// answer, not the run's final reply. The daemon's OnText above is a
+				// no-op (final answers post to the IM channel via SendReply at run
+				// end), so flush it through the optional hook or it vanishes from
+				// the channel entirely — the "first reply went missing when I fired
+				// a follow-up too fast" bug. Handlers without the hook (TUI/tests)
+				// skip it; their OnText already rendered the text.
+				if h, ok := a.handler.(IntermediateAnswerHandler); ok && strings.TrimSpace(fullText) != "" {
+					h.OnIntermediateAnswer(fullText)
+				}
 				continue
 			}
 			return fullText, usage, nil
