@@ -222,8 +222,14 @@ func TestBuildScheduleRequest_StatelessNamedAgent(t *testing.T) {
 func TestBuildScheduleRequest_LegacyNamedAgent(t *testing.T) {
 	sched := schedule.Schedule{ID: "s1", Agent: "ai-news-reporter", Prompt: "p"} // Stateful nil
 	req := buildScheduleRequest(sched, "")
-	if req.OmitHistory {
-		t.Error("legacy (nil Stateful) schedule must NOT set OmitHistory — preserve current behaviour")
+	// Legacy (nil Stateful) now runs fresh — same as an explicit stateless
+	// schedule. The single Stateful switch treats nil as false, so a new empty
+	// session each run and no pinned route key.
+	if !req.NewSession {
+		t.Error("legacy (nil Stateful) schedule must run fresh (NewSession=true)")
+	}
+	if got := ComputeRouteKey(req); got != "" {
+		t.Errorf("legacy schedule must not pin a route key, got %q", got)
 	}
 }
 
@@ -236,18 +242,30 @@ func TestBuildScheduleRequest_ExplicitStatefulNamedAgent(t *testing.T) {
 	}
 }
 
-func TestBuildScheduleRequest_DefaultAgentAlwaysNewSession(t *testing.T) {
-	f := false
-	sched := schedule.Schedule{ID: "s1", Agent: "", Prompt: "p", Stateful: &f}
-	req := buildScheduleRequest(sched, "")
-	if !req.NewSession {
-		t.Error("default-agent fresh schedule must keep NewSession=true regardless of Stateful")
+func TestBuildScheduleRequest_DefaultAgentHonorsStateful(t *testing.T) {
+	f, tr := false, true
+	// Stateless default-agent schedule: a fresh session each run, no pinned key.
+	fresh := buildScheduleRequest(schedule.Schedule{ID: "s1", Agent: "", Prompt: "p", Stateful: &f}, "")
+	if !fresh.NewSession {
+		t.Error("default-agent stateless schedule must set NewSession=true")
+	}
+	if got := ComputeRouteKey(fresh); got != "" {
+		t.Errorf("default-agent fresh schedule must not pin a route key, got %q", got)
+	}
+	// Stateful default-agent schedule: a dedicated schedule:<id> session that
+	// accumulates (the default agent now honors Stateful, not always-fresh).
+	sticky := buildScheduleRequest(schedule.Schedule{ID: "s2", Agent: "", Prompt: "p", Stateful: &tr}, "")
+	if sticky.NewSession {
+		t.Error("default-agent stateful schedule must accumulate (NewSession=false)")
+	}
+	if got := ComputeRouteKey(sticky); got != "schedule:s2" {
+		t.Errorf("default-agent stateful route = %q, want schedule:s2", got)
 	}
 }
 
-// --- session scope (switch A) × stateful (switch B) matrix ----------------
+// --- Stateful drives both the session route target and the history view ----
 
-func TestBuildScheduleRequest_SessionScope(t *testing.T) {
+func TestBuildScheduleRequest_Stateful(t *testing.T) {
 	tr, f := true, false
 	tests := []struct {
 		name         string
@@ -257,39 +275,32 @@ func TestBuildScheduleRequest_SessionScope(t *testing.T) {
 		wantOmitHist bool
 	}{
 		{
-			name:         "named sticky stateful: dedicated route key, keep history",
-			sched:        schedule.Schedule{ID: "s1", Agent: "ops", Prompt: "p", SessionScope: schedule.SessionScopeSticky, Stateful: &tr},
+			name:         "named stateful: dedicated route key, keep history",
+			sched:        schedule.Schedule{ID: "s1", Agent: "ops", Prompt: "p", Stateful: &tr},
 			wantNew:      false,
 			wantRoute:    "agent:ops:schedule:s1",
 			wantOmitHist: false,
 		},
 		{
-			name:         "named sticky stateless: dedicated route key, omit history",
-			sched:        schedule.Schedule{ID: "s2", Agent: "ops", Prompt: "p", SessionScope: schedule.SessionScopeSticky, Stateful: &f},
+			name:         "default stateful: schedule:<id> route key, keep history",
+			sched:        schedule.Schedule{ID: "s2", Agent: "", Prompt: "p", Stateful: &tr},
 			wantNew:      false,
-			wantRoute:    "agent:ops:schedule:s2",
+			wantRoute:    "schedule:s2",
+			wantOmitHist: false,
+		},
+		{
+			name:         "named stateless: NewSession, no pinned key, omit history",
+			sched:        schedule.Schedule{ID: "s3", Agent: "ops", Prompt: "p", Stateful: &f},
+			wantNew:      true,
+			wantRoute:    "",
 			wantOmitHist: true,
 		},
 		{
-			name:         "default sticky: schedule:<id> route key",
-			sched:        schedule.Schedule{ID: "s3", Agent: "", Prompt: "p", SessionScope: schedule.SessionScopeSticky},
-			wantNew:      false,
-			wantRoute:    "schedule:s3",
-			wantOmitHist: false, // Stateful nil → legacy stateful
-		},
-		{
-			name:         "named fresh explicit: NewSession, no pinned key",
-			sched:        schedule.Schedule{ID: "s4", Agent: "ops", Prompt: "p", SessionScope: schedule.SessionScopeFresh},
+			name:         "legacy (nil stateful) runs fresh",
+			sched:        schedule.Schedule{ID: "s4", Agent: "ops", Prompt: "p"},
 			wantNew:      true,
 			wantRoute:    "",
-			wantOmitHist: false,
-		},
-		{
-			name:         "legacy (no scope) defaults to fresh",
-			sched:        schedule.Schedule{ID: "s5", Agent: "ops", Prompt: "p"},
-			wantNew:      true,
-			wantRoute:    "",
-			wantOmitHist: false,
+			wantOmitHist: true,
 		},
 	}
 	for _, tt := range tests {

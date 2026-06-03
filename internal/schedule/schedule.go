@@ -25,25 +25,15 @@ type Schedule struct {
 	SyncStatus string    `json:"sync_status"`
 	CreatedAt  time.Time `json:"created_at"`
 
-	// Stateful controls whether scheduled runs preserve LLM context across
-	// triggers. nil = legacy schedule (treated as stateful for backward
-	// compatibility); *false = each run gets an empty history snapshot
-	// (default for new schedules); *true = explicit opt-in to share history
-	// across runs. The session file is appended to on every run regardless —
-	// only the LLM's view (runner.historySnapshotForRequest) is affected.
+	// Stateful is the single "remember across runs" switch for a schedule:
+	//   *true  → runs accumulate in one dedicated session (route key
+	//            agent:<name>:schedule:<id>, or schedule:<id> for the default
+	//            agent) AND each run's LLM call sees that session's history.
+	//   *false → each run starts in a brand-new session with no prior context
+	//            (default for new schedules; best for digests, polling, reviews).
+	//   nil    → legacy schedule with no explicit value; treated as *false.
+	// New schedules always persist an explicit value (never nil). See IsSticky.
 	Stateful *bool `json:"stateful,omitempty"`
-
-	// SessionScope selects how scheduled runs map onto sessions (the "session
-	// scope" switch — orthogonal to Stateful):
-	//   "" / "fresh" → a brand-new session every run (default; legacy rows have
-	//                  no value and resolve to fresh via EffectiveSessionScope).
-	//   "sticky"     → one dedicated session per schedule (route key
-	//                  agent:<name>:schedule:<id>, or schedule:<id> for the
-	//                  default agent) that accumulates across runs and daemon
-	//                  restarts.
-	// Stateful still controls the LLM's history view within whichever session
-	// the scope selects.
-	SessionScope string `json:"session_scope,omitempty"`
 
 	// Broadcast is a three-state opt-in/out for IM channel push:
 	//   nil   → smart default (see internal/daemon/broadcast_gate.shouldBroadcast)
@@ -80,7 +70,7 @@ type Schedule struct {
 
 	// LastRunMessageStartIndex / LastRunMessageEndIndex pin down the precise
 	// slice of sess.Messages this run wrote, so SummarizeLastRun returns just
-	// this run's turns. With per-scope dedicated sessions (see SessionScope)
+	// this run's turns. With per-schedule dedicated sessions (see IsSticky)
 	// this is reliable: a fresh run owns its whole session, and a sticky
 	// session — though it accumulates many runs — is never polluted by
 	// interactive chat or other schedules, so the range still isolates the
@@ -91,32 +81,13 @@ type Schedule struct {
 	LastRunMessageEndIndex   int `json:"last_run_message_end_index,omitempty"`
 }
 
-// IsStateless reports whether this schedule should run with an empty LLM
-// history snapshot. Legacy schedules (Stateful == nil) preserve their
-// pre-feature stateful behaviour.
-func (s *Schedule) IsStateless() bool {
-	return s.Stateful != nil && !*s.Stateful
-}
-
-// Session scope values for Schedule.SessionScope.
-const (
-	SessionScopeFresh  = "fresh"
-	SessionScopeSticky = "sticky"
-)
-
-// EffectiveSessionScope resolves SessionScope, defaulting an empty/absent or
-// unrecognized value to "fresh" (the legacy + new-schedule default).
-func (s *Schedule) EffectiveSessionScope() string {
-	if s.SessionScope == SessionScopeSticky {
-		return SessionScopeSticky
-	}
-	return SessionScopeFresh
-}
-
-// IsSticky reports whether scheduled runs share one dedicated, accumulating
-// session (vs a fresh session each run).
+// IsSticky reports whether scheduled runs accumulate in one dedicated session
+// — and thus see prior runs' history — versus starting fresh each run. A
+// schedule is sticky exactly when Stateful is explicitly true; legacy (nil) and
+// stateless (false) schedules run fresh. This single switch drives both the
+// session route key and the LLM's history view (see buildScheduleRequest).
 func (s *Schedule) IsSticky() bool {
-	return s.EffectiveSessionScope() == SessionScopeSticky
+	return s.Stateful != nil && *s.Stateful
 }
 
 type UpdateOpts struct {
@@ -133,9 +104,6 @@ type UpdateOpts struct {
 	// Go doesn't allow nested-pointer literals naturally, so callers use
 	// the BroadcastOpt wrapper below to express "clear vs leave alone".
 	Broadcast *BroadcastOpt
-	// SessionScope: nil = no change; non-nil = overwrite ("fresh" | "sticky" |
-	// "" which resolves to fresh). See Schedule.SessionScope.
-	SessionScope *string
 }
 
 // BroadcastOpt distinguishes "leave broadcast alone" (UpdateOpts.Broadcast == nil)
@@ -176,15 +144,6 @@ func validatePrompt(prompt string) error {
 		return fmt.Errorf("prompt contains null bytes")
 	}
 	return nil
-}
-
-func validateSessionScope(scope string) error {
-	switch scope {
-	case "", SessionScopeFresh, SessionScopeSticky:
-		return nil
-	default:
-		return fmt.Errorf("invalid session_scope %q (want %q or %q)", scope, SessionScopeFresh, SessionScopeSticky)
-	}
 }
 
 func (m *Manager) load() ([]Schedule, error) {
@@ -286,9 +245,6 @@ type CreateOpts struct {
 	// default in internal/daemon/broadcast_gate.shouldBroadcast. Empty
 	// string is acceptable and means "unknown / pre-feature caller".
 	CreatedFromSource string
-	// SessionScope is "fresh" | "sticky" | "" (defaults to fresh). See
-	// Schedule.SessionScope.
-	SessionScope string
 	// IMStatusContext snapshots the inbound IM routing blob (proactive
 	// delivery target). Empty for non-IM creation paths. See
 	// Schedule.IMStatusContext.
@@ -312,9 +268,6 @@ func (m *Manager) CreateWithOpts(agentName, cron, prompt string, stateful bool, 
 	if err := validatePrompt(prompt); err != nil {
 		return "", err
 	}
-	if err := validateSessionScope(opts.SessionScope); err != nil {
-		return "", err
-	}
 	id := generateScheduleID()
 	statefulCopy := stateful
 	s := Schedule{
@@ -322,7 +275,6 @@ func (m *Manager) CreateWithOpts(agentName, cron, prompt string, stateful bool, 
 		Enabled: true, SyncStatus: "ok", CreatedAt: time.Now(),
 		Stateful:          &statefulCopy, // always explicit on Create — never leave nil for new rows
 		CreatedFromSource: opts.CreatedFromSource,
-		SessionScope:      opts.SessionScope,
 		IMStatusContext:   opts.IMStatusContext,
 	}
 	if opts.Broadcast != nil {
@@ -356,8 +308,8 @@ func (m *Manager) Get(id string) (*Schedule, error) {
 }
 
 func (m *Manager) Update(id string, opts *UpdateOpts) error {
-	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil && opts.SessionScope == nil {
-		return fmt.Errorf("no fields to update: provide at least one of cron, prompt, enabled, stateful, broadcast, or session_scope")
+	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil {
+		return fmt.Errorf("no fields to update: provide at least one of cron, prompt, enabled, stateful, or broadcast")
 	}
 	if opts.Cron != nil {
 		if err := validateCron(*opts.Cron); err != nil {
@@ -366,11 +318,6 @@ func (m *Manager) Update(id string, opts *UpdateOpts) error {
 	}
 	if opts.Prompt != nil {
 		if err := validatePrompt(*opts.Prompt); err != nil {
-			return err
-		}
-	}
-	if opts.SessionScope != nil {
-		if err := validateSessionScope(*opts.SessionScope); err != nil {
 			return err
 		}
 	}
@@ -413,9 +360,6 @@ func (m *Manager) Update(id string, opts *UpdateOpts) error {
 						bCopy := *opts.Broadcast.Value
 						schedules[i].Broadcast = &bCopy
 					}
-				}
-				if opts.SessionScope != nil {
-					schedules[i].SessionScope = *opts.SessionScope
 				}
 				return schedules, nil
 			}

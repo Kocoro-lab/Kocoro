@@ -145,11 +145,13 @@ func TestEnableDisable(t *testing.T) {
 	}
 }
 
-func TestSessionScope_CreateUpdatePersistAndValidate(t *testing.T) {
+// Stateful is the single switch: true → sticky (accumulate + history),
+// false/legacy-nil → fresh. Create/Update persist it and IsSticky derives from it.
+func TestStateful_DrivesStickyAndPersists(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
 
-	id, err := mgr.CreateWithOpts("ops", "0 9 * * *", "standup", true, CreateOpts{SessionScope: SessionScopeSticky})
+	id, err := mgr.CreateWithOpts("ops", "0 9 * * *", "standup", true, CreateOpts{})
 	if err != nil {
 		t.Fatalf("CreateWithOpts: %v", err)
 	}
@@ -157,38 +159,35 @@ func TestSessionScope_CreateUpdatePersistAndValidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if got.SessionScope != SessionScopeSticky {
-		t.Errorf("SessionScope = %q, want %q", got.SessionScope, SessionScopeSticky)
+	if got.Stateful == nil || !*got.Stateful {
+		t.Errorf("Stateful = %v, want *true", got.Stateful)
 	}
 	if !got.IsSticky() {
-		t.Error("IsSticky() = false, want true")
+		t.Error("stateful=true: IsSticky() = false, want true")
 	}
 
-	// Update to fresh.
-	if err := mgr.Update(id, &UpdateOpts{SessionScope: strPtr(SessionScopeFresh)}); err != nil {
+	// Update to stateless → fresh.
+	f := false
+	if err := mgr.Update(id, &UpdateOpts{Stateful: &f}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	got, _ = mgr.Get(id)
 	if got.IsSticky() {
-		t.Error("after update to fresh, IsSticky() = true")
-	}
-
-	// Invalid scope rejected on both create and update.
-	if _, err := mgr.CreateWithOpts("ops", "0 9 * * *", "p", false, CreateOpts{SessionScope: "bogus"}); err == nil {
-		t.Error("CreateWithOpts with invalid scope must error")
-	}
-	if err := mgr.Update(id, &UpdateOpts{SessionScope: strPtr("bogus")}); err == nil {
-		t.Error("Update with invalid scope must error")
+		t.Error("after update to stateful=false, IsSticky() = true")
 	}
 }
 
-func TestEffectiveSessionScope_LegacyDefaultsFresh(t *testing.T) {
-	s := Schedule{ID: "x", Agent: "a"} // no SessionScope (legacy)
-	if s.EffectiveSessionScope() != SessionScopeFresh {
-		t.Errorf("legacy EffectiveSessionScope = %q, want %q", s.EffectiveSessionScope(), SessionScopeFresh)
+func TestIsSticky_LegacyAndStatelessAreFresh(t *testing.T) {
+	if (&Schedule{ID: "x", Agent: "a"}).IsSticky() { // legacy: no Stateful on disk → nil
+		t.Error("legacy (nil Stateful) IsSticky() = true, want false")
 	}
-	if s.IsSticky() {
-		t.Error("legacy IsSticky() = true, want false")
+	f := false
+	if (&Schedule{ID: "x", Stateful: &f}).IsSticky() {
+		t.Error("stateful=false IsSticky() = true, want false")
+	}
+	tr := true
+	if !(&Schedule{ID: "x", Stateful: &tr}).IsSticky() {
+		t.Error("stateful=true IsSticky() = false, want true")
 	}
 }
 
@@ -367,9 +366,9 @@ func TestUpdatePreservesContextWhenPromptSame(t *testing.T) {
 	}
 }
 
-// --- Task 1: Stateful *bool / IsStateless semantics -------------------------
+// --- Stateful *bool / IsSticky semantics ------------------------------------
 
-func TestSchedule_IsStateless_LegacyJSONTreatedAsStateful(t *testing.T) {
+func TestSchedule_LegacyJSONParsesStatefulNilAndRunsFresh(t *testing.T) {
 	raw := `{"id":"abc","agent":"pr-reviewer","cron":"*/30 * * * *","prompt":"check PRs","enabled":true}`
 	var s Schedule
 	if err := json.Unmarshal([]byte(raw), &s); err != nil {
@@ -378,24 +377,8 @@ func TestSchedule_IsStateless_LegacyJSONTreatedAsStateful(t *testing.T) {
 	if s.Stateful != nil {
 		t.Errorf("legacy schedule should leave Stateful nil, got *%v", *s.Stateful)
 	}
-	if s.IsStateless() {
-		t.Error("legacy schedule must be treated as stateful (current behaviour), got stateless")
-	}
-}
-
-func TestSchedule_IsStateless_ExplicitTrue(t *testing.T) {
-	b := true
-	s := Schedule{Stateful: &b}
-	if s.IsStateless() {
-		t.Error("Stateful=*true should not be stateless")
-	}
-}
-
-func TestSchedule_IsStateless_ExplicitFalse(t *testing.T) {
-	b := false
-	s := Schedule{Stateful: &b}
-	if !s.IsStateless() {
-		t.Error("Stateful=*false should be stateless")
+	if s.IsSticky() {
+		t.Error("legacy schedule (nil Stateful) must run fresh, got sticky")
 	}
 }
 

@@ -174,19 +174,17 @@ func (s *Scheduler) runSchedule(ctx context.Context, sched schedule.Schedule) {
 }
 
 // buildScheduleRequest constructs the RunAgentRequest for a scheduled run.
-// Extracted as a seam so tests can verify field plumbing — the SessionScope →
-// route-target mapping and the Stateful → OmitHistory mapping — without
-// spinning up the full RunAgent machinery.
+// Extracted as a seam so tests can verify field plumbing — the Stateful →
+// {route target, history view} mapping — without spinning up the full RunAgent
+// machinery.
 //
-// Two orthogonal switches:
-//   - SessionScope (scope): fresh → a brand-new session every run, for the
-//     default AND named agents; sticky → one dedicated, accumulating session
-//     per schedule, addressed by a preset route key.
-//   - Stateful (history): controls only the LLM's view of history within the
-//     selected session (runner.historySnapshotForRequest / OmitHistory).
-//     Legacy schedules (Stateful == nil) keep pre-feature stateful behaviour.
-//     For a fresh session there is no prior history regardless, so Stateful is
-//     effectively moot (the UI grays it out).
+// Stateful is the single "remember across runs" switch (see
+// schedule.Schedule.IsSticky):
+//   - sticky (Stateful == true): one dedicated, accumulating session per
+//     schedule, addressed by a preset route key, with the LLM seeing its
+//     history.
+//   - fresh (Stateful false/nil): a brand-new empty session every run, for the
+//     default AND named agents, with no prior history.
 func buildScheduleRequest(sched schedule.Schedule, stickyContext string) RunAgentRequest {
 	req := RunAgentRequest{
 		Text:          sched.Prompt,
@@ -194,7 +192,6 @@ func buildScheduleRequest(sched schedule.Schedule, stickyContext string) RunAgen
 		Source:        ChannelSchedule,
 		Channel:       ChannelSchedule + "-" + sched.ID,
 		Sender:        "scheduler",
-		OmitHistory:   sched.IsStateless(),
 		StickyContext: stickyContext,
 	}
 	if sched.IsSticky() {
@@ -203,13 +200,16 @@ func buildScheduleRequest(sched schedule.Schedule, stickyContext string) RunAgen
 		// resolution; ComputeRouteKey returns the pinned key verbatim so it
 		// survives. The composite key persists (shouldPersistRouteKey == true)
 		// and resolves via ResumeLatestByRouteKey, giving one session per
-		// schedule that accumulates across runs and daemon restarts.
+		// schedule that accumulates across runs and daemon restarts. The LLM
+		// sees the accumulated history (OmitHistory stays false).
 		req.PinnedRouteKey = scheduleStickyRouteKey(sched.Agent, sched.ID)
 	} else {
-		// fresh: a new session every run. Previously only the default agent did
-		// this (NewSession: sched.Agent==""); named agents parasitized the
-		// shared agent:<name> session. Now both honor the scope switch.
+		// fresh: a new empty session every run with no prior history. Previously
+		// only the default agent did this (NewSession: sched.Agent==""); named
+		// agents parasitized the shared agent:<name> session. Now both honor the
+		// single Stateful switch.
 		req.NewSession = true
+		req.OmitHistory = true
 	}
 	return req
 }

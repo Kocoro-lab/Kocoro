@@ -1593,7 +1593,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// is gated on activeCWD != "" so a missing value is permissive.
 		if key, ok := deps.SessionCache.RegisterAdHocSessionRoute(sess.ID, cancel, routeDone, routeInjectCh, ""); ok {
 			adHocRouteKey = key
-			log.Printf("daemon: ad-hoc route registered key=%s (default-agent run, session=%s)", adHocRouteKey, sess.ID)
+			log.Printf("daemon: ad-hoc route registered key=%s (session-keyed run, session=%s)", adHocRouteKey, sess.ID)
 			defer func() {
 				deps.SessionCache.UnregisterAdHocSessionRoute(adHocRouteKey)
 				closeRouteDone(routeDone)
