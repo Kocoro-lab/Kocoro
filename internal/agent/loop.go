@@ -3052,14 +3052,18 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 							messages[newMsgOffset] = replaceUserMessageText(messages[newMsgOffset], scaffoldedUserText)
 						}
 					} else {
-						// Later turns: inject as a new message. This is safe
-						// because the last user message is tool results, not
-						// the user's original prompt.
-						messages = append(messages, client.Message{
-							Role:    "user",
-							Content: client.NewTextContent(hint),
-						})
-						markInjected()
+						// Later turns: normally inject as a new message — safe
+						// when the trailing message is tool results. But if a
+						// steer/inject was committed earlier this iteration (the
+						// end_turn drain-race guard or the top-of-loop drain), the
+						// trailing message is the user's words; merge so the steer
+						// stays the last turn the model reads instead of being
+						// buried behind this reminder.
+						var merged bool
+						messages, merged = mergeOrAppendUserInjection(messages, hint)
+						if !merged {
+							markInjected()
+						}
 					}
 				}
 			case <-time.After(2 * time.Second):
@@ -3083,13 +3087,15 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// i == 0, so this branch only executes on i >= 1.
 		if stickyInjectPending {
 			if reminder := buildStickySkillReminder(stickySkillName, stickySkillSnippet); reminder != "" {
-				// Previous user message is tool results; append as a new user
-				// message (same pattern as the discovery hint on i > 0).
-				messages = append(messages, client.Message{
-					Role:    "user",
-					Content: client.NewTextContent(reminder),
-				})
-				markInjected()
+				// Normally appended as a new user message (trailing message is
+				// tool results). But if a steer was committed earlier this
+				// iteration, merge into it so the steer stays last — same
+				// rationale and latent assumption as the discovery hint above.
+				var merged bool
+				messages, merged = mergeOrAppendUserInjection(messages, reminder)
+				if !merged {
+					markInjected()
+				}
 			}
 			stickyInjectPending = false
 		}
@@ -4862,6 +4868,50 @@ func replaceUserMessageText(msg client.Message, newText string) client.Message {
 		out = append([]client.ContentBlock{{Type: "text", Text: newText}}, out...)
 	}
 	return client.Message{Role: "user", Content: client.NewBlockContent(out)}
+}
+
+// mergeOrAppendUserInjection adds system-injected guardrail text (a skill
+// discovery hint or sticky-skill reminder) to the conversation. It is normally
+// appended as its own user message, which is correct when the trailing message
+// is tool results. But when a steering follow-up was committed earlier in the
+// same iteration (the end_turn drain-race guard or the top-of-loop drain), the
+// trailing message is the user's own words; appending after it leaves a
+// content-free <system-reminder> as the last user turn, and the model answers
+// the reminder ("your message came through empty") instead of the steer. In
+// that case the text is merged into the trailing user turn so the user's
+// request stays the last thing the model reads.
+//
+// Returns merged=true when it merged: the caller then skips markInjected so the
+// steer stays a real, persisted user turn (mirrors the i==0 scaffolded fold,
+// which also keeps the hint inside a real user message rather than a separate
+// injected one).
+//
+// A turn "carrying the user's words" is role "user" WITHOUT a tool_result block
+// — tool-result turns are also role "user" (they carry tool_result content
+// blocks), so a bare role check would wrongly splice the hint into a
+// tool_result message.
+func mergeOrAppendUserInjection(messages []client.Message, sysText string) (out []client.Message, merged bool) {
+	if n := len(messages); n > 0 && isPlainUserTurn(messages[n-1]) {
+		combined := messages[n-1].Content.Text() + "\n\n" + sysText
+		messages[n-1] = replaceUserMessageText(messages[n-1], combined)
+		return messages, true
+	}
+	return append(messages, client.Message{Role: "user", Content: client.NewTextContent(sysText)}), false
+}
+
+// isPlainUserTurn reports whether m carries the user's own words rather than
+// tool results. Tool-result messages are role "user" with tool_result content
+// blocks, so role alone is insufficient.
+func isPlainUserTurn(m client.Message) bool {
+	if m.Role != "user" {
+		return false
+	}
+	for _, b := range m.Content.Blocks() {
+		if b.Type == "tool_result" {
+			return false
+		}
+	}
+	return true
 }
 
 func userMessageTextMatches(msg client.Message, text string) bool {
