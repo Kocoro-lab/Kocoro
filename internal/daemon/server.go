@@ -4419,12 +4419,9 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 	// otherwise fail the whole config load at next reload). model_tier is the
 	// knob for small/medium/large.
 	if agentPatch, ok := patch["agent"].(map[string]interface{}); ok {
-		if model, ok := agentPatch["model"].(string); ok {
-			switch model {
-			case "small", "medium", "large":
-				writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use model_tier for tiers", model))
-				return
-			}
+		if model, ok := agentPatch["model"].(string); ok && agents.IsModelTierKeyword(model) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use model_tier for tiers", model))
+			return
 		}
 	}
 

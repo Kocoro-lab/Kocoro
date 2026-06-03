@@ -66,6 +66,8 @@ func TestValidateConfig_AgentModelTierKeyword(t *testing.T) {
 		{"tier small rejected", mk("small"), "specific model id"},
 		{"tier medium rejected", mk("medium"), "specific model id"},
 		{"tier large rejected", mk("large"), "specific model id"},
+		{"cased tier rejected", mk("Large"), "specific model id"},
+		{"padded tier rejected", mk(" large "), "specific model id"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

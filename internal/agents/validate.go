@@ -1,6 +1,9 @@
 package agents
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // BuiltinCommands is the set of slash command names reserved by the TUI.
 // Agent commands and skills must not use these names.
@@ -41,6 +44,16 @@ func ValidateToolsFilter(f *AgentToolsFilter) error {
 // See the precedence chain in references/agents.md.
 var modelTierKeywords = map[string]bool{"small": true, "medium": true, "large": true}
 
+// IsModelTierKeyword reports whether s is a routing-tier name (small/medium/
+// large). It is the single source of truth for "this is a tier, not a model id"
+// across every config write boundary. Matching is case- and whitespace-
+// insensitive: no real model id is ever one of these words, so normalizing
+// catches copy-paste/typo variants (`Large`, ` large`) that would otherwise hit
+// the very model_id_unknown failure this guard exists to prevent.
+func IsModelTierKeyword(s string) bool {
+	return modelTierKeywords[strings.ToLower(strings.TrimSpace(s))]
+}
+
 // ValidateAgentModelConfig rejects a tier keyword wedged into agent.model. Both
 // model and model_tier are free-form strings on the wire, so without this guard
 // `{"model": "large"}` persists silently and only fails far downstream.
@@ -48,7 +61,7 @@ func ValidateAgentModelConfig(c *AgentModelConfig) error {
 	if c == nil || c.Model == nil {
 		return nil
 	}
-	if modelTierKeywords[*c.Model] {
+	if IsModelTierKeyword(*c.Model) {
 		return fmt.Errorf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use agent.model_tier for tiers", *c.Model)
 	}
 	return nil

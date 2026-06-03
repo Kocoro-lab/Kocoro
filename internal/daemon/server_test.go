@@ -1000,8 +1000,9 @@ func TestServer_PatchConfigRejectsTierKeywordAsModel(t *testing.T) {
 
 	srv := NewServer(0, nil, &ServerDeps{ShannonDir: shannonDir}, "test")
 
+	// Cased variant must be rejected too (normalized match).
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(`{"agent":{"model":"large"}}`))
+	req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(`{"agent":{"model":"Large"}}`))
 	req.Header.Set("Content-Type", "application/json")
 	srv.handlePatchConfig(rec, req)
 
@@ -1016,7 +1017,7 @@ func TestServer_PatchConfigRejectsTierKeywordAsModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read config: %v", err)
 	}
-	if strings.Contains(string(data), "model: large") {
+	if strings.Contains(string(data), "model:") {
 		t.Fatalf("tier keyword should not have been written to config, got %s", string(data))
 	}
 }

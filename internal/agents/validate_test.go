@@ -55,8 +55,9 @@ func TestValidateAgentModelConfig(t *testing.T) {
 		t.Errorf("tier in model_tier should be valid: %v", err)
 	}
 
-	// A tier keyword in agent.model is the bug we guard against.
-	for _, tier := range []string{"small", "medium", "large"} {
+	// A tier keyword in agent.model is the bug we guard against — including
+	// cased / whitespace-padded copy-paste variants.
+	for _, tier := range []string{"small", "medium", "large", "Large", " large", "MEDIUM", "Small "} {
 		if err := ValidateAgentModelConfig(&AgentModelConfig{Model: ptr(tier)}); err == nil {
 			t.Errorf("expected error for tier %q in agent.model", tier)
 		}

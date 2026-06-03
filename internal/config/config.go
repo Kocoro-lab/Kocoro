@@ -1071,7 +1071,9 @@ func validateConfig(cfg *Config) error {
 	// agent.model is a specific model id forwarded to the Gateway as
 	// specific_model. A routing-tier word belongs in model_tier; if one lands
 	// here it is sent verbatim and fails every run with "model_id_unknown".
-	switch cfg.Agent.Model {
+	// Normalize case/whitespace — no real model id is a bare tier word, so this
+	// only catches copy-paste/typo variants (`Large`, ` large`).
+	switch strings.ToLower(strings.TrimSpace(cfg.Agent.Model)) {
 	case "small", "medium", "large":
 		return fmt.Errorf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use model_tier for tiers", cfg.Agent.Model)
 	}
