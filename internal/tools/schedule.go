@@ -75,8 +75,8 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 						"type":    "boolean",
 						"default": false,
 						"description": "Whether this schedule remembers across runs (applies to both the default and named agents). " +
-							"false (default, recommended): each run starts in a brand-new session with no prior context — best for digests, polling, daily reports, monitoring, and any task where runs are independent. " +
-							"true: all runs accumulate in one dedicated session and each run sees prior runs' conversation — choose only when the user explicitly wants the agent to build continuously on previous runs (e.g. continuous research, a rolling standup/journal, ongoing project tracking).",
+							"false (default): each run starts in a brand-new session with no prior context — for digests, polling, daily reports, monitoring, and any task whose runs are independent. " +
+							"true: all runs accumulate in ONE dedicated session and each run sees prior runs' conversation. Set true WHENEVER the task needs memory of earlier runs — INCLUDING when the prompt counts runs (\"the Nth time\", \"第几次\"), continues or builds on the last run, tracks progress over time, or references earlier results — as well as continuous research / a rolling standup / journal / ongoing project tracking. Rule of thumb: if the schedule's own prompt refers to prior runs or continuity in ANY way, you MUST set true, otherwise that prompt cannot work (each run would see an empty history).",
 					},
 					"broadcast": map[string]any{
 						"type": "string",
@@ -114,7 +114,7 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 					"enabled": map[string]any{"type": "boolean", "description": "Enable or disable"},
 					"stateful": map[string]any{
 						"type":        "boolean",
-						"description": "Change whether this schedule remembers across runs. Omit to leave unchanged. false = each run starts fresh in a new session; true = all runs accumulate in one dedicated session and each run sees prior history. Applies to both default and named agents.",
+						"description": "Change whether this schedule remembers across runs. Omit to leave unchanged. false = each run starts fresh in a new session; true = all runs accumulate in one dedicated session and each run sees prior history. Set true if the task must remember earlier runs (counting \"Nth time\", continuing from last run, progress tracking); false for independent runs. Applies to both default and named agents.",
 					},
 					"broadcast": map[string]any{
 						"type": "string",

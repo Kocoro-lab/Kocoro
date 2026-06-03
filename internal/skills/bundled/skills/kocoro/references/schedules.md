@@ -4,6 +4,10 @@
 
 Schedules are automated tasks that run on a cron schedule without any human interaction. You define a prompt (what to do), a cron expression (when to do it), and optionally which agent to use. Shannon runs the task at the scheduled time, executes any tool calls automatically, and delivers the reply: to Kocoro Desktop always, and to every Cloud channel (Slack / Lark / Telegram / WeCom / Feishu) the agent — named or default — is OAuth-bound to.
 
+## Create / update / remove with the native `schedule_*` tools (NOT `http`)
+
+As the kocoro assistant, manage schedules with the local tools `schedule_create` / `schedule_update` / `schedule_remove` (and `schedule_list` to read) — do NOT `http POST /schedules`. Only the native tools capture the run's originating agent, IM channel, and conversation context. That captured context is what lets a schedule created from a Slack / Lark / Feishu / … thread proactively deliver its results back to that exact thread, run as the right agent, and understand the task background. Creating via raw HTTP loses all of it (the schedule runs as the default agent and never broadcasts, so the user never hears back). The HTTP endpoints below remain documented for external/admin clients and for reads.
+
 ## API Endpoints
 
 ### List all schedules
