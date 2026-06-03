@@ -9,7 +9,8 @@
 //
 // Calendar RPC and other Desktop-RPC-dependent features only function in
 // the Desktop-spawn path; npm CLI users do not have those tools registered
-// (see conditional registration when ServerDeps.RPCBroker is nil).
+// (the --rpc-socket / --rpc-pidfile flags are absent here, so cmd/daemon.go
+// never constructs a DesktopRPCBroker and RegisterCalendarTools no-ops).
 package daemon
 
 import (

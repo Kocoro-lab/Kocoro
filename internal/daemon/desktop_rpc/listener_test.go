@@ -38,11 +38,13 @@ func newListenerTestRig(t *testing.T) (sockPath, pidfilePath string, broker *Des
 	pidfilePath = filepath.Join(dir, "daemon.pid")
 	broker = NewDesktopRPCBroker()
 	eventCh := make(chan *DesktopEvent, 16)
+	readyCh := make(chan struct{})
 	cfg := ListenerConfig{
 		SockPath:    sockPath,
 		PidfilePath: pidfilePath,
 		Platform:    Platform{OS: "macOS", OSVersion: "14.4.1", AppVersion: "0.0.0-test"},
 		Broker:      broker,
+		ReadyCh:     readyCh,
 		EventSink: func(evt *DesktopEvent) {
 			eventCh <- evt
 		},
@@ -55,33 +57,19 @@ func newListenerTestRig(t *testing.T) (sockPath, pidfilePath string, broker *Des
 		defer close(runDone)
 		runErr <- l.Run(ctx)
 	}()
-	// Wait for listener to be ready — listen + pidfile-write happen in
-	// sequence in Run, so both files must exist before tests can read
-	// either. Polling just sockPath has a short race window between sock
-	// bind (step 5b) and pidfile rename (step 5d).
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		_, sockErr := os.Stat(sockPath)
-		_, pidErr := os.Stat(pidfilePath)
-		if sockErr == nil && pidErr == nil {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if _, err := os.Stat(sockPath); err != nil {
+	// Wait deterministically on ReadyCh: Run closes it only after listen +
+	// chmod + pidfile-write all succeed, so both the sock and pidfile are
+	// guaranteed present once it fires (no os.Stat polling race).
+	select {
+	case <-readyCh:
+		// Listener fully up.
+	case rerr := <-runErr:
+		<-runDone
+		t.Fatalf("listener Run returned before ready: %v", rerr)
+	case <-time.After(2 * time.Second):
 		cancelFn()
 		<-runDone
-		select {
-		case rerr := <-runErr:
-			t.Fatalf("sock never appeared at %s: %v; Run returned: %v", sockPath, err, rerr)
-		default:
-			t.Fatalf("sock never appeared at %s: %v", sockPath, err)
-		}
-	}
-	if _, err := os.Stat(pidfilePath); err != nil {
-		cancelFn()
-		<-runDone
-		t.Fatalf("pidfile never appeared at %s: %v", pidfilePath, err)
+		t.Fatalf("listener did not become ready within 2s")
 	}
 	t.Cleanup(func() {
 		cancelFn()

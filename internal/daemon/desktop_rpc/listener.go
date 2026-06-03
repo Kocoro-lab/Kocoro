@@ -41,6 +41,14 @@ type ListenerConfig struct {
 	Platform    Platform // populated by caller from daemon.Version + runtime info
 	Broker      *DesktopRPCBroker
 	EventSink   EventSink // optional; nil-safe (events are dropped if unset)
+
+	// ReadyCh, if non-nil, is closed by Run once the sock is bound, chmod'd,
+	// and the pidfile is written — i.e. the listener is fully up and the next
+	// accept will be served. Lets callers wait deterministically for readiness
+	// instead of racing a fixed sleep. Run never sends on it (only closes), so
+	// a select on {ReadyCh, errCh} resolves to exactly one outcome: setup
+	// failed (errCh) or setup succeeded (ReadyCh). nil-safe.
+	ReadyCh chan<- struct{}
 }
 
 // Listener owns the daemon-side Unix domain socket: it listens, accepts
@@ -151,6 +159,13 @@ func (l *Listener) Run(ctx context.Context) (retErr error) {
 	}
 
 	log.Printf("desktop_rpc: listening on %s (pidfile %s)", l.cfg.SockPath, l.cfg.PidfilePath)
+
+	// Signal readiness now that every setup step (listen + chmod + pidfile)
+	// has succeeded. Closed exactly once; all setup-failure paths returned
+	// above without reaching here.
+	if l.cfg.ReadyCh != nil {
+		close(l.cfg.ReadyCh)
+	}
 
 	// Close the listener when ctx is done so Accept unblocks.
 	go func() {

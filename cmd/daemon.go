@@ -693,14 +693,16 @@ var daemonStartCmd = &cobra.Command{
 				return fmt.Errorf("daemon: internal: earlyRPCBroker is nil despite both --rpc-* flags set")
 			}
 			rpcBroker := earlyRPCBroker
-			deps.RPCBroker = rpcBroker
 			// (RegisterCalendarTools already ran earlier, before PostOverlays
-			// snapshot — see top-of-RunE for rationale.)
+			// snapshot — see top-of-RunE for rationale. The calendar tools hold
+			// the broker pointer directly, so it isn't threaded through deps.)
+			rpcReadyCh := make(chan struct{})
 			listenerCfg := desktop_rpc.ListenerConfig{
 				SockPath:    rpcSockPath,
 				PidfilePath: rpcPidfilePath,
 				Platform:    desktop_rpc.DefaultPlatform(Version),
 				Broker:      rpcBroker,
+				ReadyCh:     rpcReadyCh,
 				EventSink: func(evt *desktop_rpc.DesktopEvent) {
 					// v1: log only. v1.x will fan these onto the EventBus (so SSE
 					// subscribers can observe) and add a permission-cache update
@@ -712,14 +714,13 @@ var daemonStartCmd = &cobra.Command{
 			go func() {
 				rpcErrCh <- desktop_rpc.NewListener(listenerCfg).Run(ctx)
 			}()
-			// Allow Listen + sock-file creation to complete (or fail) before
-			// proceeding; 200ms is generous on local disk and conservative
-			// against macOS sandbox / sip slowdowns under load.
-			time.Sleep(200 * time.Millisecond)
+			// Wait deterministically: Run closes ReadyCh once listen + chmod +
+			// pidfile all succeed, or returns on rpcErrCh if any setup step
+			// fails. No fixed sleep — whichever fires first is the real outcome.
 			select {
 			case err := <-rpcErrCh:
 				return fmt.Errorf("daemon: desktop_rpc listener failed to start: %w", err)
-			default:
+			case <-rpcReadyCh:
 				log.Printf("daemon: desktop_rpc listening on %s", rpcSockPath)
 			}
 		default:
