@@ -763,6 +763,10 @@ func isFTSSyntaxError(err error) bool {
 // messages_fts (e.g. "channel: foo", a URL, or a "12:30" timestamp).
 // modernc.org/sqlite surfaces this as "no such column: <name>". Such queries
 // were not meant to use FTS column syntax, so the caller falls back to LIKE.
+// Caveat: the substring match is intentionally broad, so a genuinely missing
+// FTS column (schema corruption / a botched migration) is also swallowed into
+// the slower LIKE path rather than surfaced. Acceptable because results stay
+// correct, but worth knowing when diagnosing an unexplained search slowdown.
 func isFTSColumnError(err error) bool {
 	return strings.Contains(err.Error(), "no such column")
 }

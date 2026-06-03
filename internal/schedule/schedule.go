@@ -56,6 +56,9 @@ type Schedule struct {
 	// then, which is why it must be snapshotted at creation, not fetched at run
 	// time. Empty when created from Desktop/TUI/CLI/cron (those fall back to
 	// broadcast). The daemon never decodes it. See the proactive-targeting design.
+	// It holds routing identifiers (channel/message ids), not credentials, and is
+	// persisted in schedules.json for the schedule's whole lifetime with no expiry
+	// — retracting or recreating the schedule is the only thing that clears it.
 	IMStatusContext json.RawMessage `json:"im_status_context,omitempty"`
 
 	// LastRunAt is the wall-clock time of the most recent scheduler-triggered
