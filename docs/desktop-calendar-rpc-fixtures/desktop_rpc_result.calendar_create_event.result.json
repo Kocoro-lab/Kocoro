@@ -1,0 +1,12 @@
+{
+  "type": "desktop_rpc_result",
+  "payload": {
+    "request_id": "drpc_eeff001122334455",
+    "ok": true,
+    "result": {
+      "id": "evt_newly-created-uuid-dddd",
+      "pending_remote_sync": true,
+      "invitations_sent": false
+    }
+  }
+}

@@ -12,6 +12,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	"github.com/Kocoro-lab/ShanClaw/internal/daemon/desktop_rpc"
 	"github.com/Kocoro-lab/ShanClaw/internal/images"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
@@ -661,6 +662,30 @@ func RegisterMemoryTool(reg *agent.ToolRegistry, svc MemoryQuerier, fallback Fal
 		return
 	}
 	reg.Register(&MemoryTool{Service: svc, Fallback: fallback})
+}
+
+// RegisterCalendarTools registers the calendar.* tool family if a
+// DesktopRPCBroker is available. Without a broker (TUI / one-shot CLI / MCP
+// server / scheduled task modes that don't have a Desktop spawn relationship),
+// calendar tools are not registered at all — the model can fall back naturally
+// to the `applescript` tool + Calendar.app per spec §4.3.
+//
+// MUST be called before ExtractPostOverlays in cmd/daemon.go so the calendar
+// tools land in the PostOverlays layer and survive the registry rebuilds
+// triggered by MCP supervisor health changes (see
+// TestCalendarTools_SurviveExtractPostOverlays).
+func RegisterCalendarTools(reg *agent.ToolRegistry, broker *desktop_rpc.DesktopRPCBroker) {
+	if reg == nil || broker == nil {
+		return
+	}
+	reg.Register(&CalendarCheckPermissionTool{Broker: broker})
+	reg.Register(&CalendarRequestPermissionTool{Broker: broker})
+	reg.Register(&CalendarListSourcesTool{Broker: broker})
+	reg.Register(&CalendarListEventsTool{Broker: broker})
+	reg.Register(&CalendarGetEventTool{Broker: broker})
+	reg.Register(&CalendarCreateEventTool{Broker: broker})
+	reg.Register(&CalendarUpdateEventTool{Broker: broker})
+	reg.Register(&CalendarDeleteEventTool{Broker: broker})
 }
 
 // RegisterCloudDelegate registers the cloud_delegate tool if cloud is enabled.

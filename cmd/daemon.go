@@ -24,6 +24,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/daemon"
+	"github.com/Kocoro-lab/ShanClaw/internal/daemon/desktop_rpc"
 	"github.com/Kocoro-lab/ShanClaw/internal/heartbeat"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
@@ -129,6 +130,25 @@ var daemonStartCmd = &cobra.Command{
 		tools.RegisterRetractPublishedFileTool(reg, gw, cfg)
 		tools.RegisterGenerateImageTool(reg, gw, cfg)
 		tools.RegisterEditImageTool(reg, gw, cfg)
+
+		// Calendar RPC v0.5.1: construct the DesktopRPCBroker EARLY (before
+		// ExtractPostOverlays below) so calendar_* tools get folded into
+		// PostOverlays. Otherwise they'd be registered into a `reg` that
+		// gets discarded when deps.Registry is rebuilt from cached layers
+		// at lines ~282/301. The Listener itself is spawned later (after
+		// localServer.Start) — only the broker reference + tool registration
+		// need to happen here.
+		//
+		// Single-flag misuse is caught later at the listener-startup site so
+		// the error message points at the right thing (sock failure surface,
+		// not "you forgot a flag").
+		var earlyRPCBroker *desktop_rpc.DesktopRPCBroker
+		if rpcSockPath, _ := cmd.Flags().GetString("rpc-socket"); rpcSockPath != "" {
+			if rpcPidfilePath, _ := cmd.Flags().GetString("rpc-pidfile"); rpcPidfilePath != "" {
+				earlyRPCBroker = desktop_rpc.NewDesktopRPCBroker()
+				tools.RegisterCalendarTools(reg, earlyRPCBroker)
+			}
+		}
 
 		gatewayOverlay := tools.ExtractGatewayTools(reg)
 		postOverlays := tools.ExtractPostOverlays(reg, baselineReg)
@@ -649,6 +669,61 @@ var daemonStartCmd = &cobra.Command{
 			return fmt.Errorf("daemon: local server failed to start: %w", err)
 		default:
 			log.Printf("daemon: local server listening on http://127.0.0.1:7533")
+		}
+
+		// Calendar RPC v0.5.1: Unix domain socket reverse channel to Kocoro
+		// Desktop. Both flags must be set together; either flag empty disables
+		// the listener (calendar tools won't be registered downstream). Per
+		// spec §7.1, listen failures are fatal — non-zero exit so Desktop's
+		// DaemonManager surfaces the error to the user instead of silently
+		// retrying. See docs/desktop-calendar-rpc.md §4.1 + §4.1.1.
+		rpcSockPath, _ := cmd.Flags().GetString("rpc-socket")
+		rpcPidfilePath, _ := cmd.Flags().GetString("rpc-pidfile")
+		switch {
+		case rpcSockPath == "" && rpcPidfilePath == "":
+			// Neither flag set — running standalone (npm CLI / dev / TUI parent).
+			// No calendar tools will be registered.
+		case rpcSockPath != "" && rpcPidfilePath != "":
+			// Reuse the broker constructed early (before ExtractPostOverlays)
+			// so its handle is the same one calendar tools captured. If
+			// earlyRPCBroker is nil here, that's an internal contradiction
+			// (both flags set then, both flags set now, but no broker) —
+			// fail loud.
+			if earlyRPCBroker == nil {
+				return fmt.Errorf("daemon: internal: earlyRPCBroker is nil despite both --rpc-* flags set")
+			}
+			rpcBroker := earlyRPCBroker
+			deps.RPCBroker = rpcBroker
+			// (RegisterCalendarTools already ran earlier, before PostOverlays
+			// snapshot — see top-of-RunE for rationale.)
+			listenerCfg := desktop_rpc.ListenerConfig{
+				SockPath:    rpcSockPath,
+				PidfilePath: rpcPidfilePath,
+				Platform:    desktop_rpc.DefaultPlatform(Version),
+				Broker:      rpcBroker,
+				EventSink: func(evt *desktop_rpc.DesktopEvent) {
+					// v1: log + emit to EventBus so SSE subscribers (Desktop UI
+					// if it wants) can observe. v1.x will add permission cache
+					// update for calendar_permission_changed.
+					log.Printf("daemon: desktop_rpc event %s: %s", evt.Event, string(evt.Data))
+				},
+			}
+			rpcErrCh := make(chan error, 1)
+			go func() {
+				rpcErrCh <- desktop_rpc.NewListener(listenerCfg).Run(ctx)
+			}()
+			// Allow Listen + sock-file creation to complete (or fail) before
+			// proceeding; 200ms is generous on local disk and conservative
+			// against macOS sandbox / sip slowdowns under load.
+			time.Sleep(200 * time.Millisecond)
+			select {
+			case err := <-rpcErrCh:
+				return fmt.Errorf("daemon: desktop_rpc listener failed to start: %w", err)
+			default:
+				log.Printf("daemon: desktop_rpc listening on %s", rpcSockPath)
+			}
+		default:
+			return fmt.Errorf("daemon: --rpc-socket and --rpc-pidfile must be set together (got --rpc-socket=%q --rpc-pidfile=%q)", rpcSockPath, rpcPidfilePath)
 		}
 
 		log.Printf("daemon: WS endpoint %s", wsEndpoint)
@@ -1255,6 +1330,13 @@ func collectAgentWatches(agentsDir string) map[string][]watcher.WatchEntry {
 func init() {
 	daemonStartCmd.Flags().Bool("force", false, "Stop any existing daemon before starting")
 	daemonStartCmd.Flags().BoolP("detach", "d", false, "Run as background service via launchd (macOS only)")
+	// Calendar RPC v0.5.1 §4.1: Unix socket reverse channel to Kocoro Desktop.
+	// Both flags must be set together — leaving either empty disables the
+	// listener (calendar tools won't be registered). Set by Kocoro Desktop's
+	// DaemonManager when spawning shan as its child process. See spec §4.1.1
+	// for the reconciliation flow that uses these paths.
+	daemonStartCmd.Flags().String("rpc-socket", "", "Unix domain socket path for Kocoro Desktop RPC (set by Desktop spawn)")
+	daemonStartCmd.Flags().String("rpc-pidfile", "", "PID file path written after socket listen succeeds (paired with --rpc-socket)")
 	daemonCmd.AddCommand(daemonStartCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
 	daemonCmd.AddCommand(daemonStatusCmd)

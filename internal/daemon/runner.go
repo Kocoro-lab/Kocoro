@@ -27,6 +27,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
+	"github.com/Kocoro-lab/ShanClaw/internal/daemon/desktop_rpc"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
@@ -861,6 +862,17 @@ type ServerDeps struct {
 	// the daemon HTTP layer can surface "awaiting_approval" without scanning
 	// per-request brokers. nil-safe.
 	ApprovalTracker *ApprovalTracker
+
+	// RPCBroker is the Calendar RPC v0.5.1 reverse-RPC channel to Kocoro
+	// Desktop (see docs/desktop-calendar-rpc.md §4.1). nil when daemon is
+	// not running as a Desktop subprocess (TUI / one-shot CLI / MCP server /
+	// scheduled task modes); in those modes calendar_* tools are not
+	// registered (§4.3 conditional registration). Wired by cmd/daemon.go
+	// when both --rpc-socket and --rpc-pidfile flags are set.
+	//
+	// desktop_rpc is a leaf package (imports no internal package), so
+	// importing it here creates no cycle.
+	RPCBroker *desktop_rpc.DesktopRPCBroker
 
 	// suggestionRegisteredMu + suggestionRegistered dedupe the
 	// SessionManager.OnSessionClose registration in RunAgent: without dedupe

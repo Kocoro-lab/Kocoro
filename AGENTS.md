@@ -17,7 +17,7 @@ Kocoro is the Go CLI/runtime for Shannon AI agents. The main production path is 
 ## Module Map
 
 - cmd: CLI entry points for one-shot, daemon, scheduling, update, and MCP serve.
-- internal/daemon: primary production path; HTTP API server, WebSocket client, routing, approvals, events, launchd, attachments, session CWD, memory fallback, suggestions, email/password auth (`auth.go` / `auth_handlers.go` / `ws_controller.go`).
+- internal/daemon: primary production path; HTTP API server, WebSocket client, routing, approvals, events, launchd, attachments, session CWD, memory fallback, suggestions, email/password auth (`auth.go` / `auth_handlers.go` / `ws_controller.go`), Desktop RPC reverse-channel (`desktop_rpc/` subpackage — Unix sock listener + length-prefixed JSON codec + DesktopRPCBroker for Calendar RPC v1).
 - internal/agent: core loop; tool batching, compaction, spill/budget state, deferred loading, state cache, read tracking, approvals, phase/watchdog, thinking handling, prompt suggestions, forked requests.
 - internal/tools: local, gateway, cloud, schedule, publish/upload, image, memory, MCP, and document tools.
 - internal/keychain: macOS Keychain wrapper for daemon api_key (Backend interface + osBackend/memBackend; non-darwin returns ErrUnsupportedPlatform).

@@ -288,6 +288,21 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 | `memory_append` | No | Append entries to agent MEMORY.md (flock-protected). |
 | `use_skill` | No | Activate a skill by name — returns full SKILL.md body. Skill discovery auto-suggests relevant skills each turn via `model_tier: small` prefetch. |
 
+### Calendar (registered only when daemon is a Kocoro Desktop subprocess)
+
+Operates the user's iCloud / Google / Microsoft 365 / Exchange / Outlook calendars configured under **System Settings → Internet Accounts**. EventKit access lives in Kocoro Desktop (.app); daemon talks to Desktop over a local Unix domain socket. Not available in TUI / one-shot CLI / MCP / scheduled-task modes (fall back to `applescript` driving Calendar.app).
+
+| Tool | Approval | Description |
+|------|----------|-------------|
+| `calendar_check_permission` | No | Returns TCC status: `not_determined` / `restricted` / `denied` / `granted` / `write_only`. |
+| `calendar_request_permission` | Yes | Triggers the macOS TCC system dialog. Blocks up to 5 minutes for user decision. |
+| `calendar_list_sources` | No | Enumerate all configured calendars (id, title, account_type, color, writable). |
+| `calendar_list_events` | No | Query events in a time window. RFC 3339 timestamps with offset. Optional source / query / limit (max 2000). Returns `series_master_id` on recurring instances. |
+| `calendar_get_event` | No | Full event detail including `recurrence_rule` and `alarms`. |
+| `calendar_create_event` | Yes | Create event. `attendees` are written as metadata only — `invitations_sent` is always `false` in v1 (EventKit limitation; v1.x patch will route through AppleScript-Calendar.app fallback to send real invitations). |
+| `calendar_update_event` | Yes | Update with `patch` semantics (missing/null = no change, empty string/array = clear, lists are replaced not merged). `scope`: `this` or `this_and_future` only (no `all` — use delete + create). |
+| `calendar_delete_event` | Yes | Delete one instance / this-and-future / entire recurring series. |
+
 ### Cloud Tools (gated on `cloud.enabled` + `api_key`)
 
 | Tool | Approval | Description |

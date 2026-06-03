@@ -1,0 +1,15 @@
+{
+  "type": "desktop_rpc_result",
+  "payload": {
+    "request_id": "drpc_aabbccdd11223344",
+    "ok": false,
+    "error": {
+      "code": "calendar_permission_denied",
+      "message": "Calendar access denied by the user. Open Kocoro Desktop → Settings → Permissions → Calendar to grant access.",
+      "retriable": false,
+      "details": {
+        "status": "denied"
+      }
+    }
+  }
+}

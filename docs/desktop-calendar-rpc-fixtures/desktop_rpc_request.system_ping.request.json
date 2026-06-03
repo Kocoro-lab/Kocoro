@@ -1,0 +1,15 @@
+{
+  "type": "desktop_rpc_request",
+  "payload": {
+    "request_id": "drpc_a1b2c3d4e5f60718",
+    "method": "system.ping",
+    "params": {
+      "echo": "hello-from-daemon"
+    },
+    "timeout_ms": 5000,
+    "session_id": "sess_local-diagnostic",
+    "agent": "default",
+    "source": "kocoro",
+    "ts": "2026-05-26T10:00:00+08:00"
+  }
+}
