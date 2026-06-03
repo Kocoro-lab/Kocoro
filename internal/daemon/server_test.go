@@ -1022,6 +1022,117 @@ func TestServer_PatchConfigRejectsTierKeywordAsModel(t *testing.T) {
 	}
 }
 
+// TestE2E_ModelTierKeywordRejectedAcrossWritePaths drives a running daemon over
+// real HTTP and verifies the tier-keyword guard holds end-to-end on every
+// config write path: named-agent create, named-agent config replace (PUT), and
+// global PATCH /config — plus that legitimate values (specific model id on
+// agent.model, tier on model_tier) still pass. This is the "enter from outside"
+// regression test for the model_id_unknown stuck-agent bug.
+func TestE2E_ModelTierKeywordRejectedAcrossWritePaths(t *testing.T) {
+	agentsDir := t.TempDir()
+	shannonDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("model_tier: medium\n"), 0o600); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   shannonDir,
+		SessionCache: NewSessionCache(t.TempDir()),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", srv.Port())
+	post := func(path, body string) *http.Response {
+		resp, err := http.Post(base+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		return resp
+	}
+	do := func(method, path, body string) *http.Response {
+		req, err := http.NewRequest(method, base+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("new request %s %s: %v", method, path, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		return resp
+	}
+
+	// 1. Create with a tier word in config.agent.model → rejected, no agent dir.
+	resp := post("/agents", `{"display_name":"tierbot","prompt":"hi","config":{"agent":{"model":"large"}}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("create with tier model: want 400, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if entries, _ := os.ReadDir(agentsDir); len(entries) != 0 {
+		t.Fatalf("rejected create must not write an agent dir, found %d entries", len(entries))
+	}
+
+	// 2. Create a valid agent (specific model id + tier on model_tier) → 201.
+	resp = post("/agents", `{"display_name":"goodbot","prompt":"hi","config":{"agent":{"model":"claude-opus-4-8","model_tier":"large"}}}`)
+	if resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("valid create: want 201, got %d, body=%s", resp.StatusCode, b)
+	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	resp.Body.Close()
+	if created.Name == "" {
+		t.Fatal("create response missing server-generated slug")
+	}
+
+	// 3. PUT that agent's config with a (cased) tier word → rejected.
+	resp = do(http.MethodPut, "/agents/"+created.Name+"/config", `{"agent":{"model":"Large"}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PUT config with tier model: want 400, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 4. Global PATCH /config with a tier word → rejected, not persisted.
+	resp = do(http.MethodPatch, "/config", `{"agent":{"model":" medium "}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PATCH config with tier model: want 400, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(data), "model:") {
+		t.Fatalf("tier keyword leaked into config.yaml: %s", data)
+	}
+
+	// 5. Global PATCH /config with a legitimate model id → accepted + persisted.
+	resp = do(http.MethodPatch, "/config", `{"agent":{"model":"claude-opus-4-8"}}`)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("PATCH config with valid model: want 200, got %d, body=%s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+	data, err = os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !strings.Contains(string(data), "claude-opus-4-8") {
+		t.Fatalf("valid model id should have been persisted, got %s", data)
+	}
+}
+
 // --- Issue 1: rollback on create failure ---
 
 func TestServer_CreateAgent_Conflict(t *testing.T) {
