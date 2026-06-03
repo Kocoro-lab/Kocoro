@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -14,6 +15,33 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 )
+
+// parseStatefulArg reads the optional "stateful" tool argument, tolerating the
+// LLM emitting the JSON boolean as a string ("true"/"false") — a common model
+// quirk. Returns (value, set, err): set is false when the arg is absent/nil.
+// A value that is neither a bool nor a parseable bool-string is a validation
+// error rather than being silently dropped to false. The silent drop was a
+// real bug: an agent asked for context continuity emitted "stateful":"true",
+// the bare `args["stateful"].(bool)` assertion failed, and the schedule was
+// created stateful=false (fresh per run) despite the explicit request.
+func parseStatefulArg(args map[string]any) (val bool, set bool, err error) {
+	raw, present := args["stateful"]
+	if !present || raw == nil {
+		return false, false, nil
+	}
+	switch v := raw.(type) {
+	case bool:
+		return v, true, nil
+	case string:
+		b, perr := strconv.ParseBool(strings.TrimSpace(v))
+		if perr != nil {
+			return false, false, fmt.Errorf("stateful must be a boolean true/false; got %q", v)
+		}
+		return b, true, nil
+	default:
+		return false, false, fmt.Errorf("stateful must be a boolean true/false; got %T", raw)
+	}
+}
 
 // scheduleAudienceDisclaimer is appended to every ScheduleTool description so
 // the LLM treats these as its own tools rather than user-typed commands. The
@@ -74,9 +102,9 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 					"stateful": map[string]any{
 						"type":    "boolean",
 						"default": false,
-						"description": "Only meaningful for named agents (ignored for the default agent). " +
-							"false (default, recommended): each run starts with no prior conversation history — best for digests, polling, daily reports, monitoring, and any task where runs are independent. " +
-							"true: each run sees the conversation from prior runs — only choose this when the user explicitly wants the agent to remember and build on previous runs (e.g. continuous research, ongoing project tracking with follow-up questions).",
+						"description": "Whether this schedule remembers across runs (applies to both the default and named agents). " +
+							"false (default): each run starts in a brand-new session with no prior context — for digests, polling, daily reports, monitoring, and any task whose runs are independent. " +
+							"true: all runs accumulate in ONE dedicated session and each run sees prior runs' conversation. Set true WHENEVER the task needs memory of earlier runs — INCLUDING when the prompt counts runs (\"the Nth time\", \"第几次\"), continues or builds on the last run, tracks progress over time, or references earlier results — as well as continuous research / a rolling standup / journal / ongoing project tracking. Rule of thumb: if the schedule's own prompt refers to prior runs or continuity in ANY way, you MUST set true, otherwise that prompt cannot work (each run would see an empty history).",
 					},
 					"broadcast": map[string]any{
 						"type": "string",
@@ -114,7 +142,7 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 					"enabled": map[string]any{"type": "boolean", "description": "Enable or disable"},
 					"stateful": map[string]any{
 						"type":        "boolean",
-						"description": "Change history-preservation behaviour for named-agent schedules. Omit to leave unchanged. false = each run starts fresh; true = each run sees prior history. Has no effect on default-agent schedules.",
+						"description": "Change whether this schedule remembers across runs. Omit to leave unchanged. false = each run starts fresh in a new session; true = all runs accumulate in one dedicated session and each run sees prior history. Set true if the task must remember earlier runs (counting \"Nth time\", continuing from last run, progress tracking); false for independent runs. Applies to both default and named agents.",
 					},
 					"broadcast": map[string]any{
 						"type": "string",
@@ -196,7 +224,10 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		if description == "" {
 			return agent.ValidationError("description is required"), nil
 		}
-		stateful, _ := args["stateful"].(bool) // missing → false (Go zero value, matches HTTP/CLI default)
+		stateful, _, statefulErr := parseStatefulArg(args) // missing → false; tolerates "true"/"false" strings
+		if statefulErr != nil {
+			return agent.ValidationError(statefulErr.Error()), nil
+		}
 		// Parse broadcast enum. Absent or "auto" maps to nil (smart default).
 		// Use the explicit "present?" check (not just truthy) so the LLM
 		// passing a non-string value still surfaces as a validation error.
@@ -216,9 +247,14 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		// Empty / not-in-ctx both map to "" — downstream treats both as
 		// "unknown source" and the gate falls through to silent.
 		createdFromSource, _ := agent.SourceFromContext(ctx)
+		// Snapshot the run's inbound IM routing blob (if any) as the schedule's
+		// proactive-delivery target. Empty for non-IM runs (Desktop/TUI/CLI),
+		// in which case the eventual run falls back to broadcast.
+		imStatusContext, _ := agent.IMStatusContextFromContext(ctx)
 		id, err := t.manager.CreateWithOpts(agentName, cron, prompt, stateful, schedule.CreateOpts{
 			Broadcast:         broadcast,
 			CreatedFromSource: createdFromSource,
+			IMStatusContext:   imStatusContext,
 		})
 		if err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
@@ -253,8 +289,22 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			if t.manager.HasContext(s.ID) {
 				ctxTag = " [ctx]"
 			}
-			fmt.Fprintf(&sb, "%s | agent=%s | cron=%s | enabled=%v | sync=%s | %s%s\n",
-				s.ID, agentDisplay, s.Cron, s.Enabled, s.SyncStatus, s.Prompt, ctxTag)
+			// Surface the remember-across-runs mode so the model can answer
+			// "does this schedule remember previous runs?" and so the legacy
+			// behavior change is discoverable from a listing, not just the
+			// one-shot startup log: on = accumulates context, off = fresh each
+			// run, off(legacy) = nil Stateful (created before the field existed)
+			// which now also runs fresh — PATCH stateful=true to restore it.
+			statefulTag := "off(legacy)"
+			if s.Stateful != nil {
+				if *s.Stateful {
+					statefulTag = "on"
+				} else {
+					statefulTag = "off"
+				}
+			}
+			fmt.Fprintf(&sb, "%s | agent=%s | cron=%s | enabled=%v | stateful=%s | sync=%s | %s%s\n",
+				s.ID, agentDisplay, s.Cron, s.Enabled, statefulTag, s.SyncStatus, s.Prompt, ctxTag)
 		}
 		return agent.ToolResult{Content: sb.String()}, nil
 	case "update":
@@ -277,7 +327,9 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		if v, ok := args["enabled"].(bool); ok {
 			opts.Enabled = &v
 		}
-		if v, ok := args["stateful"].(bool); ok {
+		if v, set, statefulErr := parseStatefulArg(args); statefulErr != nil {
+			return agent.ValidationError(statefulErr.Error()), nil
+		} else if set {
 			opts.Stateful = &v
 		}
 		// Parse the optional broadcast enum. Absent → leave field unchanged.

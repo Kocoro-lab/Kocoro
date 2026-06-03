@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -288,6 +289,55 @@ func TestScheduleTool_Create_InheritsAgentFromCtxWhenArgMissing(t *testing.T) {
 	}
 }
 
+func TestScheduleTool_Create_SnapshotsIMStatusContext(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "academic-writer", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	// Simulate an IM-originated run: the loop injected the inbound routing blob.
+	blob := json.RawMessage(`{"platform":"slack","channel_id":"C1","message_ts":"123.45"}`)
+	ctx := agent.WithIMStatusContext(agent.WithAgentName(context.Background(), "academic-writer"), blob)
+	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check","description":"test"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+	list, _ := mgr.List()
+	if len(list) != 1 {
+		t.Fatalf("want 1 schedule, got %d", len(list))
+	}
+	// schedules.json is saved with MarshalIndent, which re-indents the opaque
+	// blob; compare semantically (compacted) since Cloud parses it as JSON.
+	var gotBuf, wantBuf bytes.Buffer
+	if err := json.Compact(&gotBuf, list[0].IMStatusContext); err != nil {
+		t.Fatalf("compact stored blob: %v", err)
+	}
+	if err := json.Compact(&wantBuf, blob); err != nil {
+		t.Fatalf("compact want blob: %v", err)
+	}
+	if gotBuf.String() != wantBuf.String() {
+		t.Errorf("IMStatusContext = %s, want %s (snapshot from ctx)", gotBuf.String(), wantBuf.String())
+	}
+}
+
+func TestScheduleTool_Create_NoIMStatusContextWhenAbsent(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "academic-writer", "")
+	mgr := schedule.NewManager(filepath.Join(shan, "schedules.json"))
+	tool := &ScheduleTool{manager: mgr, action: "create"}
+
+	ctx := agent.WithAgentName(context.Background(), "academic-writer") // non-IM run: no blob
+	res, err := tool.Run(ctx, `{"cron":"*/5 * * * *","prompt":"check","description":"test"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+	list, _ := mgr.List()
+	if len(list) != 1 {
+		t.Fatalf("want 1 schedule, got %d", len(list))
+	}
+	if len(list[0].IMStatusContext) != 0 {
+		t.Errorf("IMStatusContext = %q, want empty (no ctx blob → falls back to broadcast)", list[0].IMStatusContext)
+	}
+}
+
 // Case 2: LLM explicit "agent": "" → respects intent, routes to default.
 // This is the key "explicit empty vs missing" distinction.
 func TestScheduleTool_Create_ExplicitEmptyAgentRoutesDefault(t *testing.T) {
@@ -370,6 +420,51 @@ func TestScheduleTool_Create_NoCtxAgentSafelyDefaults(t *testing.T) {
 	list, _ := mgr.List()
 	if list[0].Agent != "" {
 		t.Errorf("agent = %q, want empty (no ctx → default)", list[0].Agent)
+	}
+}
+
+// schedule_list renders the remember-across-runs mode per row so the model can
+// answer "does this schedule remember previous runs?" and so the legacy nil →
+// fresh behavior change is discoverable from a listing, not only the one-shot
+// startup log. Legacy rows (no stateful field on disk) cannot be produced via
+// the create tool (parseStatefulArg defaults a missing arg to false), so they
+// are hand-written here.
+func TestScheduleTool_List_RendersStatefulMode(t *testing.T) {
+	shan := setupShannonHomeWithAgent(t, "lister", "")
+	path := filepath.Join(shan, "schedules.json")
+	rows := `[
+	  {"id":"sched-on","agent":"lister","cron":"* * * * *","prompt":"p1","enabled":true,"sync_status":"local","stateful":true},
+	  {"id":"sched-off","agent":"lister","cron":"* * * * *","prompt":"p2","enabled":true,"sync_status":"local","stateful":false},
+	  {"id":"sched-legacy","agent":"lister","cron":"* * * * *","prompt":"p3","enabled":true,"sync_status":"local"}
+	]`
+	if err := os.WriteFile(path, []byte(rows), 0o600); err != nil {
+		t.Fatalf("write schedules.json: %v", err)
+	}
+
+	mgr := schedule.NewManager(path)
+	tool := &ScheduleTool{manager: mgr, action: "list"}
+	res, err := tool.Run(context.Background(), `{}`)
+	if err != nil || res.IsError {
+		t.Fatalf("run failed: err=%v res=%+v", err, res)
+	}
+
+	// The " | sync=" anchor immediately follows the tag, so "stateful=off | sync="
+	// does NOT match the legacy row's "stateful=off(legacy) | sync=".
+	for _, want := range []string{
+		"stateful=on | sync=",
+		"stateful=off | sync=",
+		"stateful=off(legacy) | sync=",
+	} {
+		if !strings.Contains(res.Content, want) {
+			t.Errorf("list output missing %q:\n%s", want, res.Content)
+		}
+	}
+
+	// Pin the legacy row's mapping specifically.
+	for _, ln := range strings.Split(strings.TrimSpace(res.Content), "\n") {
+		if strings.HasPrefix(ln, "sched-legacy ") && !strings.Contains(ln, "stateful=off(legacy)") {
+			t.Errorf("legacy row not tagged off(legacy): %q", ln)
+		}
 	}
 }
 
@@ -807,5 +902,42 @@ func TestScheduleTool_Show_RespectsMessageRange(t *testing.T) {
 	}
 	if !strings.Contains(res.Content, "SCHEDULED_REPLY") {
 		t.Errorf("scheduled reply must appear in show output: %q", res.Content)
+	}
+}
+
+// TestParseStatefulArg locks that the stateful tool arg tolerates the LLM
+// emitting the JSON boolean as a string ("true"/"false") instead of silently
+// dropping it to false — the bug that made "stateful":"true" create a fresh
+// (non-sticky) schedule despite an explicit continuity request.
+func TestParseStatefulArg(t *testing.T) {
+	cases := []struct {
+		name             string
+		args             map[string]any
+		wantVal, wantSet bool
+		wantErr          bool
+	}{
+		{"absent", map[string]any{}, false, false, false},
+		{"nil", map[string]any{"stateful": nil}, false, false, false},
+		{"bool true", map[string]any{"stateful": true}, true, true, false},
+		{"bool false", map[string]any{"stateful": false}, false, true, false},
+		{"string true", map[string]any{"stateful": "true"}, true, true, false},
+		{"string false", map[string]any{"stateful": "false"}, false, true, false},
+		{"string True", map[string]any{"stateful": "True"}, true, true, false},
+		{"garbage string", map[string]any{"stateful": "yes"}, false, false, true},
+		{"number", map[string]any{"stateful": float64(1)}, false, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			val, set, err := parseStatefulArg(tc.args)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v, wantErr=%v", err, tc.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if val != tc.wantVal || set != tc.wantSet {
+				t.Errorf("got (val=%v set=%v), want (val=%v set=%v)", val, set, tc.wantVal, tc.wantSet)
+			}
+		})
 	}
 }

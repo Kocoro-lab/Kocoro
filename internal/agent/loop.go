@@ -811,6 +811,12 @@ type AgentLoop struct {
 	// firstTurnIMContext so re-entry (compaction retry, etc.) cannot re-emit.
 	firstTurnIMContext      json.RawMessage
 	firstTurnCloudMessageID string
+	// runIMStatusContext holds the run's inbound IMStatusContext for the WHOLE
+	// run (unlike firstTurnIMContext, which is cleared after the first lifecycle
+	// emit). Injected into the per-tool-call context (WithIMStatusContext) so
+	// schedule_create can snapshot a proactive-delivery target onto a new
+	// Schedule. Set once with firstTurnIMContext; never cleared.
+	runIMStatusContext      json.RawMessage
 	runMessages             []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
 	runMsgInjected          []bool           // parallel to runMessages: true = system-injected guardrail/nudge
 	runMsgTimestamps        []time.Time      // parallel to runMessages: when each message was created
@@ -1334,6 +1340,9 @@ func (a *AgentLoop) SetLifecycleEmitter(em LifecycleEmitter) {
 func (a *AgentLoop) SetFirstTurnLifecycle(cloudMessageID string, imStatusContext json.RawMessage) {
 	a.firstTurnCloudMessageID = cloudMessageID
 	a.firstTurnIMContext = imStatusContext
+	// Held for the whole run (not cleared with firstTurnIMContext) so
+	// schedule_create can snapshot the proactive target on any turn.
+	a.runIMStatusContext = imStatusContext
 }
 
 // emitDrainedLifecycle fires OnUserMessageProcessing for each drained
@@ -2278,6 +2287,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// Empty string is meaningful (= unknown/pre-feature caller) so we inject
 	// unconditionally, same rationale as agentName above.
 	ctx = WithSource(ctx, a.source)
+	// Inject the run's inbound IMStatusContext so schedule_create can snapshot
+	// a proactive-delivery target onto a new Schedule. nil/empty for non-IM
+	// runs (downstream falls back to broadcast).
+	ctx = WithIMStatusContext(ctx, a.runIMStatusContext)
 	ctx = context.WithValue(ctx, readTrackerKey{}, readTracker)
 
 	// Loop behavior constants

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -205,8 +206,13 @@ func TestBuildScheduleRequest_StatelessNamedAgent(t *testing.T) {
 	if !req.OmitHistory {
 		t.Error("stateless schedule must set OmitHistory=true")
 	}
-	if req.NewSession {
-		t.Error("named-agent schedule must not set NewSession (uses one session file)")
+	// Default scope is fresh: a named-agent schedule now starts a new session
+	// each run (it no longer parasitizes the shared agent:<name> session).
+	if !req.NewSession {
+		t.Error("fresh-scope named-agent schedule must set NewSession=true")
+	}
+	if got := ComputeRouteKey(req); got != "" {
+		t.Errorf("fresh scope must not pin a route key, ComputeRouteKey = %q, want empty", got)
 	}
 	if req.Source != ChannelSchedule {
 		t.Errorf("Source = %q, want %q", req.Source, ChannelSchedule)
@@ -216,8 +222,14 @@ func TestBuildScheduleRequest_StatelessNamedAgent(t *testing.T) {
 func TestBuildScheduleRequest_LegacyNamedAgent(t *testing.T) {
 	sched := schedule.Schedule{ID: "s1", Agent: "ai-news-reporter", Prompt: "p"} // Stateful nil
 	req := buildScheduleRequest(sched, "")
-	if req.OmitHistory {
-		t.Error("legacy (nil Stateful) schedule must NOT set OmitHistory — preserve current behaviour")
+	// Legacy (nil Stateful) now runs fresh — same as an explicit stateless
+	// schedule. The single Stateful switch treats nil as false, so a new empty
+	// session each run and no pinned route key.
+	if !req.NewSession {
+		t.Error("legacy (nil Stateful) schedule must run fresh (NewSession=true)")
+	}
+	if got := ComputeRouteKey(req); got != "" {
+		t.Errorf("legacy schedule must not pin a route key, got %q", got)
 	}
 }
 
@@ -230,12 +242,80 @@ func TestBuildScheduleRequest_ExplicitStatefulNamedAgent(t *testing.T) {
 	}
 }
 
-func TestBuildScheduleRequest_DefaultAgentAlwaysNewSession(t *testing.T) {
-	f := false
-	sched := schedule.Schedule{ID: "s1", Agent: "", Prompt: "p", Stateful: &f}
-	req := buildScheduleRequest(sched, "")
-	if !req.NewSession {
-		t.Error("default-agent schedule must keep NewSession=true regardless of Stateful")
+func TestBuildScheduleRequest_DefaultAgentHonorsStateful(t *testing.T) {
+	f, tr := false, true
+	// Stateless default-agent schedule: a fresh session each run, no pinned key.
+	fresh := buildScheduleRequest(schedule.Schedule{ID: "s1", Agent: "", Prompt: "p", Stateful: &f}, "")
+	if !fresh.NewSession {
+		t.Error("default-agent stateless schedule must set NewSession=true")
+	}
+	if got := ComputeRouteKey(fresh); got != "" {
+		t.Errorf("default-agent fresh schedule must not pin a route key, got %q", got)
+	}
+	// Stateful default-agent schedule: a dedicated schedule:<id> session that
+	// accumulates (the default agent now honors Stateful, not always-fresh).
+	sticky := buildScheduleRequest(schedule.Schedule{ID: "s2", Agent: "", Prompt: "p", Stateful: &tr}, "")
+	if sticky.NewSession {
+		t.Error("default-agent stateful schedule must accumulate (NewSession=false)")
+	}
+	if got := ComputeRouteKey(sticky); got != "schedule:s2" {
+		t.Errorf("default-agent stateful route = %q, want schedule:s2", got)
+	}
+}
+
+// --- Stateful drives both the session route target and the history view ----
+
+func TestBuildScheduleRequest_Stateful(t *testing.T) {
+	tr, f := true, false
+	tests := []struct {
+		name         string
+		sched        schedule.Schedule
+		wantNew      bool
+		wantRoute    string // expected ComputeRouteKey(req)
+		wantOmitHist bool
+	}{
+		{
+			name:         "named stateful: dedicated route key, keep history",
+			sched:        schedule.Schedule{ID: "s1", Agent: "ops", Prompt: "p", Stateful: &tr},
+			wantNew:      false,
+			wantRoute:    "agent:ops:schedule:s1",
+			wantOmitHist: false,
+		},
+		{
+			name:         "default stateful: schedule:<id> route key, keep history",
+			sched:        schedule.Schedule{ID: "s2", Agent: "", Prompt: "p", Stateful: &tr},
+			wantNew:      false,
+			wantRoute:    "schedule:s2",
+			wantOmitHist: false,
+		},
+		{
+			name:         "named stateless: NewSession, no pinned key, omit history",
+			sched:        schedule.Schedule{ID: "s3", Agent: "ops", Prompt: "p", Stateful: &f},
+			wantNew:      true,
+			wantRoute:    "",
+			wantOmitHist: true,
+		},
+		{
+			name:         "legacy (nil stateful) runs fresh",
+			sched:        schedule.Schedule{ID: "s4", Agent: "ops", Prompt: "p"},
+			wantNew:      true,
+			wantRoute:    "",
+			wantOmitHist: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := buildScheduleRequest(tt.sched, "")
+			if req.NewSession != tt.wantNew {
+				t.Errorf("NewSession = %v, want %v", req.NewSession, tt.wantNew)
+			}
+			if got := ComputeRouteKey(req); got != tt.wantRoute {
+				t.Errorf("ComputeRouteKey = %q, want %q", got, tt.wantRoute)
+			}
+			if req.OmitHistory != tt.wantOmitHist {
+				t.Errorf("OmitHistory = %v, want %v", req.OmitHistory, tt.wantOmitHist)
+			}
+		})
 	}
 }
 
@@ -336,13 +416,14 @@ type fakeProactiveSender struct {
 }
 
 type proactiveCall struct {
-	agent     string
-	text      string
-	sessionID string
+	agent           string
+	text            string
+	sessionID       string
+	imStatusContext json.RawMessage
 }
 
-func (f *fakeProactiveSender) SendProactive(agentName, text, sessionID string) error {
-	f.calls = append(f.calls, proactiveCall{agentName, text, sessionID})
+func (f *fakeProactiveSender) SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage) error {
+	f.calls = append(f.calls, proactiveCall{agentName, text, sessionID, imStatusContext})
 	return f.err
 }
 
@@ -513,6 +594,31 @@ func TestRunWithLifecycle_BroadcastsOnSuccess(t *testing.T) {
 	got := fake.calls[0]
 	if got.agent != "researcher" || got.text != "today's AI news: ..." || got.sessionID != "sess-1" {
 		t.Errorf("payload mismatch: %+v", got)
+	}
+}
+
+func TestBroadcastReply_PassesIMStatusContext(t *testing.T) {
+	dir := t.TempDir()
+	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
+	s := NewScheduler(mgr, &ServerDeps{})
+	fake := &fakeProactiveSender{}
+	s.proactiveSender = fake
+
+	bTrue := true
+	blob := json.RawMessage(`{"platform":"feishu","channel_registry_id":"r1","message_id":"m1"}`)
+	sched := schedule.Schedule{
+		ID: "s1", Agent: "ops", Prompt: "p", Cron: "* * * * *", Enabled: true,
+		Broadcast:       &bTrue,
+		IMStatusContext: blob,
+	}
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return &RunAgentResult{Reply: "done", SessionID: "sess-1", Agent: "ops"}, nil
+	})
+	if len(fake.calls) != 1 {
+		t.Fatalf("want 1 SendProactive call, got %d", len(fake.calls))
+	}
+	if string(fake.calls[0].imStatusContext) != string(blob) {
+		t.Errorf("imStatusContext = %q, want %q (schedule snapshot passed through to SendProactive)", fake.calls[0].imStatusContext, blob)
 	}
 }
 

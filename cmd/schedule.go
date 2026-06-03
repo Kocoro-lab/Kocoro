@@ -52,7 +52,7 @@ var scheduleListCmd = &cobra.Command{
 			return nil
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tAGENT\tCRON\tENABLED\tSYNC\tPROMPT")
+		fmt.Fprintln(w, "ID\tAGENT\tCRON\tENABLED\tSTATEFUL\tSYNC\tPROMPT")
 		for _, s := range list {
 			prompt := s.Prompt
 			if len([]rune(prompt)) > 50 {
@@ -62,7 +62,17 @@ var scheduleListCmd = &cobra.Command{
 			if agent == "" {
 				agent = "(default)"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%v\t%s\t%s\n", s.ID, agent, s.Cron, s.Enabled, s.SyncStatus, prompt)
+			// on = accumulates context, off = fresh each run, off(legacy) = nil
+			// Stateful (created before the field existed) which now also runs fresh.
+			stateful := "off(legacy)"
+			if s.Stateful != nil {
+				if *s.Stateful {
+					stateful = "on"
+				} else {
+					stateful = "off"
+				}
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%v\t%s\t%s\t%s\n", s.ID, agent, s.Cron, s.Enabled, stateful, s.SyncStatus, prompt)
 		}
 		w.Flush()
 		return nil
@@ -90,7 +100,8 @@ var scheduleCreateCmd = &cobra.Command{
 		// CLI-created schedules to broadcast must edit ~/.shannon/schedules.json
 		// or re-create the schedule via the LLM (schedule_create tool) where
 		// the broadcast enum is exposed.
-		id, err := mgr.Create(schedCreateAgent, schedCreateCron, schedCreatePrompt, schedCreateStateful)
+		id, err := mgr.CreateWithOpts(schedCreateAgent, schedCreateCron, schedCreatePrompt, schedCreateStateful,
+			schedule.CreateOpts{})
 		if err != nil {
 			return err
 		}
@@ -182,13 +193,14 @@ func init() {
 	scheduleCreateCmd.Flags().StringVar(&schedCreateCron, "cron", "", "Cron expression (5-field, supports ranges/steps/lists)")
 	scheduleCreateCmd.Flags().StringVar(&schedCreatePrompt, "prompt", "", "Prompt to send")
 	scheduleCreateCmd.Flags().BoolVar(&schedCreateStateful, "stateful", false,
-		"Preserve LLM conversation history across runs (default false: each run starts with empty context). "+
-			"Set --stateful for tasks that genuinely need cross-run memory.")
+		"Remember across runs (default false: each run starts fresh in a new session). "+
+			"Set --stateful for tasks that need cross-run memory: all runs accumulate in one "+
+			"dedicated session and each run sees prior history.")
 
 	scheduleUpdateCmd.Flags().StringVar(&schedUpdateCron, "cron", "", "New cron expression")
 	scheduleUpdateCmd.Flags().StringVar(&schedUpdatePrompt, "prompt", "", "New prompt")
 	scheduleUpdateCmd.Flags().StringVar(&schedUpdateStateful, "stateful", "",
-		"Change history-preservation behaviour: 'true', 'false', or omit to leave unchanged.")
+		"Change whether the schedule remembers across runs: 'true', 'false', or omit to leave unchanged.")
 
 	scheduleCmd.AddCommand(scheduleListCmd)
 	scheduleCmd.AddCommand(scheduleCreateCmd)

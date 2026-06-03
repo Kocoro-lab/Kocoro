@@ -190,6 +190,11 @@ type ProactivePayload struct {
 	Text      string `json:"text"`
 	Format    string `json:"format,omitempty"` // "text" (default) or "markdown"
 	SessionID string `json:"session_id,omitempty"`
+	// IMStatusContext is the opaque platform routing blob the daemon echoes
+	// back so Cloud delivers this push to the originating IM thread instead of
+	// broadcasting. Empty → Cloud falls back to broadcast (backward compatible:
+	// old Cloud ignores the field; new Cloud sees no target from old daemons).
+	IMStatusContext json.RawMessage `json:"im_status_context,omitempty"`
 }
 
 // DaemonEventPayload carries a single agent loop event to Cloud.

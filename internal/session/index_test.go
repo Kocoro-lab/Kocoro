@@ -203,6 +203,45 @@ func TestIndex_Search(t *testing.T) {
 	}
 }
 
+// TestIndex_SearchColonFallsBackToLike locks the fix for a ':' in the query
+// being parsed by FTS5 as a column filter against a non-existent column
+// ("no such column: <word>"). Such a query (a URL, a "12:30" time, or
+// "channel: foo") must fall back to the LIKE path and return results rather
+// than surfacing a raw SQL error — the prior behaviour broke schedule agents
+// that searched their own history to reconstruct context.
+func TestIndex_SearchColonFallsBackToLike(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := OpenIndex(dir)
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+	defer idx.Close()
+
+	now := time.Now().Truncate(time.Second)
+	sess := &Session{
+		ID: "colon-1", Title: "Colon test", CreatedAt: now, UpdatedAt: now,
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("deploy to channel:prod-alerts after the websocket reconnect")},
+		},
+	}
+	if err := idx.UpsertSession(sess); err != nil {
+		t.Fatal(err)
+	}
+
+	// FTS5 parses "channel:prod-alerts" as a column filter and errors with
+	// "no such column: channel"; the fix routes it to the colon-safe LIKE path.
+	results, err := idx.Search("channel:prod-alerts", 20)
+	if err != nil {
+		t.Fatalf("colon query must not error (should fall back to LIKE), got: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected the LIKE fallback to find the session containing 'channel:prod-alerts'")
+	}
+	if results[0].SessionID != "colon-1" {
+		t.Errorf("expected session 'colon-1', got %q", results[0].SessionID)
+	}
+}
+
 func TestIndex_SearchStemming(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := OpenIndex(dir)

@@ -40,6 +40,23 @@ func buildStickyContext(source, channel, sender, agentName, imBindings, extra st
 	if imBindings != "" {
 		parts = append(parts, "IM bindings: "+imBindings)
 	}
+	// Output discipline for scheduled runs. The system prompt already explains
+	// HOW delivery works (auto-broadcast, no send tool); the failure mode here
+	// is the agent NARRATING that to the user — scheduled replies were leaking
+	// "there's no Slack send tool, this auto-broadcasts to <channel>" plus
+	// session-index / "based on history" bookkeeping into the user-facing
+	// message. The agent may still search/reason internally; it just must not
+	// surface any of it. Scoped to schedule runs so interactive/IM turns are
+	// byte-stable.
+	if source == ChannelSchedule {
+		parts = append(parts, "This run is a scheduled task. Your final reply IS the message "+
+			"delivered to the user (auto-broadcast to the originating channel when the "+
+			"schedule's broadcast applies); there is no separate send step or send tool. "+
+			"Output ONLY the user-facing message: do not explain how it will be delivered, "+
+			"do not mention tools / broadcast / Source / channel routing, and do not expose "+
+			"internal details (session indices, your search steps, or \"based on history\" "+
+			"narration). Produce just the deliverable, as if speaking directly to the user.")
+	}
 	if extra != "" {
 		parts = append(parts, extra)
 	}

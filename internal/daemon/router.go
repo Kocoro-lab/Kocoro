@@ -1033,9 +1033,14 @@ func (sc *SessionCache) ResolveLatestSession(routeKey string, sessionsDir string
 	}
 	defer entry.mu.Unlock()
 
-	sess, err := entry.manager.ResumeLatest()
+	// Resolve the latest INTERACTIVE session (never a schedule/IM session) so
+	// heartbeat's "your current conversation context" stays accurate under
+	// named-agent multi-session. An agent with only schedule/IM sessions
+	// resolves nil here → "no interactive session" error → the caller (the sole
+	// production caller is heartbeat) cleanly skips.
+	sess, err := entry.manager.ResumeLatestMatching(isInteractiveSource)
 	if err != nil || sess == nil {
-		return nil, fmt.Errorf("no session for route %q", routeKey)
+		return nil, fmt.Errorf("no interactive session for route %q", routeKey)
 	}
 	return cloneSessionSnapshot(sess), nil
 }
@@ -1057,9 +1062,12 @@ func (sc *SessionCache) AppendToSession(routeKey string, sessionsDir string, exp
 	}
 	defer entry.mu.Unlock()
 
-	sess, err := entry.manager.ResumeLatest()
+	// Re-resolve the latest interactive session (matching the read in
+	// ResolveLatestSession). If the user switched interactive sessions between
+	// snapshot and append, this differs from expectedSessionID → ErrSessionChanged.
+	sess, err := entry.manager.ResumeLatestMatching(isInteractiveSource)
 	if err != nil || sess == nil {
-		return fmt.Errorf("no session for route %q", routeKey)
+		return fmt.Errorf("no interactive session for route %q", routeKey)
 	}
 	if sess.ID != expectedSessionID {
 		return ErrSessionChanged

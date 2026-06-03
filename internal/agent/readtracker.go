@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -87,6 +88,26 @@ func WithSource(ctx context.Context, source string) context.Context {
 // recorded an unknown source.
 func SourceFromContext(ctx context.Context) (string, bool) {
 	v, ok := ctx.Value(sourceKey{}).(string)
+	return v, ok
+}
+
+// imStatusContextKey is the context key for the run's inbound IMStatusContext
+// (the opaque platform routing blob Cloud sent with the triggering message).
+type imStatusContextKey struct{}
+
+// WithIMStatusContext returns a new context carrying the run's inbound
+// IMStatusContext. schedule_create reads it via IMStatusContextFromContext to
+// snapshot a proactive-delivery target onto the new Schedule (so a later
+// scheduled run can be routed back to the originating IM thread). Empty/nil for
+// non-IM runs (TUI/CLI/Desktop/cron) — the downstream falls back to broadcast.
+func WithIMStatusContext(ctx context.Context, blob json.RawMessage) context.Context {
+	return context.WithValue(ctx, imStatusContextKey{}, blob)
+}
+
+// IMStatusContextFromContext returns the run's inbound IMStatusContext (nil
+// when none was injected or the run was non-IM).
+func IMStatusContextFromContext(ctx context.Context) (json.RawMessage, bool) {
+	v, ok := ctx.Value(imStatusContextKey{}).(json.RawMessage)
 	return v, ok
 }
 

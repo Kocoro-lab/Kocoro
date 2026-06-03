@@ -145,6 +145,52 @@ func TestEnableDisable(t *testing.T) {
 	}
 }
 
+// Stateful is the single switch: true → sticky (accumulate + history),
+// false/legacy-nil → fresh. Create/Update persist it and IsSticky derives from it.
+func TestStateful_DrivesStickyAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(filepath.Join(dir, "schedules.json"))
+
+	id, err := mgr.CreateWithOpts("ops", "0 9 * * *", "standup", true, CreateOpts{})
+	if err != nil {
+		t.Fatalf("CreateWithOpts: %v", err)
+	}
+	got, err := mgr.Get(id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Stateful == nil || !*got.Stateful {
+		t.Errorf("Stateful = %v, want *true", got.Stateful)
+	}
+	if !got.IsSticky() {
+		t.Error("stateful=true: IsSticky() = false, want true")
+	}
+
+	// Update to stateless → fresh.
+	f := false
+	if err := mgr.Update(id, &UpdateOpts{Stateful: &f}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	got, _ = mgr.Get(id)
+	if got.IsSticky() {
+		t.Error("after update to stateful=false, IsSticky() = true")
+	}
+}
+
+func TestIsSticky_LegacyAndStatelessAreFresh(t *testing.T) {
+	if (&Schedule{ID: "x", Agent: "a"}).IsSticky() { // legacy: no Stateful on disk → nil
+		t.Error("legacy (nil Stateful) IsSticky() = true, want false")
+	}
+	f := false
+	if (&Schedule{ID: "x", Stateful: &f}).IsSticky() {
+		t.Error("stateful=false IsSticky() = true, want false")
+	}
+	tr := true
+	if !(&Schedule{ID: "x", Stateful: &tr}).IsSticky() {
+		t.Error("stateful=true IsSticky() = false, want true")
+	}
+}
+
 func TestConcurrentCreates(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
@@ -320,9 +366,9 @@ func TestUpdatePreservesContextWhenPromptSame(t *testing.T) {
 	}
 }
 
-// --- Task 1: Stateful *bool / IsStateless semantics -------------------------
+// --- Stateful *bool / IsSticky semantics ------------------------------------
 
-func TestSchedule_IsStateless_LegacyJSONTreatedAsStateful(t *testing.T) {
+func TestSchedule_LegacyJSONParsesStatefulNilAndRunsFresh(t *testing.T) {
 	raw := `{"id":"abc","agent":"pr-reviewer","cron":"*/30 * * * *","prompt":"check PRs","enabled":true}`
 	var s Schedule
 	if err := json.Unmarshal([]byte(raw), &s); err != nil {
@@ -331,24 +377,8 @@ func TestSchedule_IsStateless_LegacyJSONTreatedAsStateful(t *testing.T) {
 	if s.Stateful != nil {
 		t.Errorf("legacy schedule should leave Stateful nil, got *%v", *s.Stateful)
 	}
-	if s.IsStateless() {
-		t.Error("legacy schedule must be treated as stateful (current behaviour), got stateless")
-	}
-}
-
-func TestSchedule_IsStateless_ExplicitTrue(t *testing.T) {
-	b := true
-	s := Schedule{Stateful: &b}
-	if s.IsStateless() {
-		t.Error("Stateful=*true should not be stateless")
-	}
-}
-
-func TestSchedule_IsStateless_ExplicitFalse(t *testing.T) {
-	b := false
-	s := Schedule{Stateful: &b}
-	if !s.IsStateless() {
-		t.Error("Stateful=*false should be stateless")
+	if s.IsSticky() {
+		t.Error("legacy schedule (nil Stateful) must run fresh, got sticky")
 	}
 }
 

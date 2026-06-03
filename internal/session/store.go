@@ -272,6 +272,13 @@ type SessionSummary struct {
 	// waiting for the user to approve a tool call. Populated at HTTP-list
 	// time from ApprovalTracker; Store.List leaves it false.
 	AwaitingApproval bool `json:"awaiting_approval,omitempty"`
+	// Kind classifies the session by origin (interactive / im / schedule),
+	// derived from Source via the daemon's exclusion rule (see
+	// internal/daemon.kindOf). Populated at HTTP-list time by the daemon —
+	// Store.List leaves it empty because the IM-platform set lives in the
+	// daemon package and importing it here would create a cycle. Clients
+	// (Desktop session grouping) read this directly instead of re-deriving.
+	Kind string `json:"kind,omitempty"`
 	// Pinned mirrors Session.Pinned: sticky-to-top regardless of recency.
 	Pinned bool `json:"pinned,omitempty"`
 	// Favorite mirrors Session.Favorite: starred for filter views.
@@ -493,6 +500,15 @@ func (s *Store) Load(id string) (*Session, error) {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		// Return the not-exist error unwrapped so callers using
+		// os.IsNotExist(err) still detect it — os.IsNotExist does NOT
+		// traverse fmt.Errorf("%w") chains, so wrapping a missing-file
+		// error here made handleGetSession et al. fall through to 500
+		// instead of 404 (e.g. loading a named-agent session via the
+		// default-dir manager when ?agent= was omitted).
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("read session: %w", err)
 	}
 

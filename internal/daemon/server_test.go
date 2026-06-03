@@ -2109,22 +2109,25 @@ func TestServer_EditMessage_Validation(t *testing.T) {
 			name:       "empty new_content with content blocks passes validation",
 			sessionID:  "nonexistent",
 			body:       `{"message_index":0,"new_content":"","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]}`,
-			wantStatus: http.StatusBadRequest,
-			wantErr:    "no such file or directory",
+			// Validation passes; the load then 404s because the session is
+			// missing (Store.Load now returns os.ErrNotExist unwrapped, so
+			// handleEditMessage maps it to 404 like the sibling handlers).
+			wantStatus: http.StatusNotFound,
+			wantErr:    "not found",
 		},
 		{
 			name:       "valid new_content only passes validation",
 			sessionID:  "nonexistent",
 			body:       `{"message_index":0,"new_content":"hello"}`,
-			wantStatus: http.StatusBadRequest,
-			wantErr:    "no such file or directory",
+			wantStatus: http.StatusNotFound,
+			wantErr:    "not found",
 		},
 		{
 			name:       "valid new_content with content blocks passes validation",
 			sessionID:  "nonexistent",
 			body:       `{"message_index":0,"new_content":"analyze this","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]}`,
-			wantStatus: http.StatusBadRequest,
-			wantErr:    "no such file or directory",
+			wantStatus: http.StatusNotFound,
+			wantErr:    "not found",
 		},
 		{
 			name:       "missing session id",

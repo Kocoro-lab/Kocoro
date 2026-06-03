@@ -1091,6 +1091,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		if _, ok := awaitingIDs[sum.ID]; ok {
 			sum.AwaitingApproval = true
 		}
+		sum.Kind = kindOf(sum.Source)
 		filtered = append(filtered, sum)
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": filtered})
@@ -1196,7 +1197,9 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
 	sess, err := mgr.Load(id)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// errors.Is traverses %w chains (os.IsNotExist does not), so a future
+		// Store.Load wrap can't regress this 404 to a 500.
+		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
 			return
 		}
@@ -1235,7 +1238,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	// Mirrors handleResetSession's ordering.
 	s.deps.SessionCache.CancelBySessionID(id)
 	if err := mgr.Delete(id); err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
 			return
 		}
@@ -1287,7 +1290,7 @@ func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {
 
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
 	if err := mgr.Reset(id); err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
 			return
 		}
@@ -1452,11 +1455,16 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 	// 截断 session 历史消息
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(body.Agent))
 	if err := mgr.TruncateMessages(id, body.MessageIndex); err != nil {
-		if os.IsNotExist(err) {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
-			return
+		case errors.Is(err, session.ErrMessageIndexOutOfRange):
+			// Genuine client error: the requested index is out of range.
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			// Load corruption / Save IO failure etc. is server-side, not 400.
+			writeError(w, http.StatusInternalServerError, err.Error())
 		}
-		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1513,7 +1521,9 @@ func (s *Server) handleSessionSummary(w http.ResponseWriter, r *http.Request) {
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
 	sess, err := mgr.Load(id)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// errors.Is traverses %w chains (os.IsNotExist does not), so a future
+		// Store.Load wrap can't regress this 404 to a 500.
+		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
 			return
 		}
@@ -1582,11 +1592,11 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	if req.Agent == "default" {
 		req.Agent = ""
 	}
-	// Named agents always resume their single long-lived session.
-	// Clear new_session so clients cannot fork a named agent's context.
-	if req.Agent != "" {
-		req.NewSession = false
-	}
+	// Named agents honor new_session / session_id exactly like the default
+	// agent — they are no longer locked to a single long-lived session.
+	// Forking is driven by ComputeRouteKey (session_id → exact resume;
+	// new_session → fresh) and the kind-filtered cold-start fallback
+	// (resumeNamedAgentColdStart resolves the latest interactive session).
 	req.EnsureRouteKey()
 	if err := req.Validate(); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
@@ -4211,7 +4221,7 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		Agent             string  `json:"agent"`
 		Cron              string  `json:"cron"`
 		Prompt            string  `json:"prompt"`
-		Stateful          *bool   `json:"stateful"` // nil → default (false / stateless); explicit overrides
+		Stateful          *bool   `json:"stateful"` // nil → default (false / stateless + fresh); true → accumulate
 		Broadcast         *string `json:"broadcast,omitempty"`
 		CreatedFromSource string  `json:"created_from_source,omitempty"`
 	}

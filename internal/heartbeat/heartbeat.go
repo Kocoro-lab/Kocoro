@@ -265,8 +265,11 @@ func (m *Manager) tickGoalDriven(ctx context.Context, ah *agentHeartbeat, goals 
 		if errors.Is(appendErr, daemon.ErrRouteActive) {
 			log.Printf("heartbeat: %q skipped_append (run in progress, session=%s, duration=%dms)", ah.name, sessionID, elapsed)
 		} else if errors.Is(appendErr, daemon.ErrSessionChanged) {
-			log.Printf("heartbeat: %q session_changed (session=%s, duration=%dms)", ah.name, sessionID, elapsed)
-			m.emitAlert(ah.name, "Heartbeat completed but session changed — turn dropped", "")
+			// Under named-agent multi-session the user can switch interactive
+			// sessions between heartbeat's read and append; that is expected,
+			// not an error worth alerting on. Drop the turn and log silently —
+			// alerting here would spam on every session switch.
+			log.Printf("heartbeat: %q session_changed — turn dropped silently (session=%s, duration=%dms)", ah.name, sessionID, elapsed)
 		} else {
 			log.Printf("heartbeat: %q append error (session=%s, duration=%dms): %v", ah.name, sessionID, elapsed, appendErr)
 		}
@@ -276,9 +279,12 @@ func (m *Manager) tickGoalDriven(ctx context.Context, ah *agentHeartbeat, goals 
 	log.Printf("heartbeat: %q action (session=%s, duration=%dms): %s", ah.name, sessionID, elapsed, result.Reply)
 	m.emitAlert(ah.name, result.Reply, sessionID)
 
-	// Deliver to Slack/Lark/etc. via Shannon Cloud
+	// Deliver to Slack/Lark/etc. via Shannon Cloud. Heartbeat reads the latest
+	// kind=interactive session (never an IM session), so there is no inbound IM
+	// routing blob to target — pass nil → Cloud broadcasts to the agent's bound
+	// channels, as before.
 	if m.deps.WSClient != nil {
-		if err := m.deps.WSClient.SendProactive(ah.name, result.Reply, sessionID); err != nil {
+		if err := m.deps.WSClient.SendProactive(ah.name, result.Reply, sessionID, nil); err != nil {
 			log.Printf("heartbeat: %q proactive send failed: %v", ah.name, err)
 		}
 	}

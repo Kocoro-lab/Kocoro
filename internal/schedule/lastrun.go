@@ -34,25 +34,26 @@ const lastRunTurnRuneCap = 800 // each assistant turn truncated to keep tool out
 // maxTurns assistant turns from the tail of that slice. Returns an empty
 // summary (no error) when the schedule has never run.
 //
-// Why slice by index range: named-agent sessions are shared between all
-// schedules + interactive chat on that agent. Without the slice, we'd
-// return the session's TAIL — which could be the user's last chat reply,
-// not the schedule's output (the bug that motivated this whole spec).
+// Why slice by index range: a sticky schedule's session accumulates many
+// runs, so its tail could mix this run with earlier ones. The index range
+// isolates exactly the turns this run wrote. (For a fresh run the session
+// holds only this run, so the range spans the whole session.) Both scopes
+// use dedicated sessions — never the user's interactive chat — so the slice
+// can no longer pick up an unrelated chat reply.
 //
 // Legacy fallback: when both Start and End are 0 (e.g. row was stamped
 // before the index fields existed), we fall back to "show the whole
-// session's tail." This is mechanically the old behavior; not ideal for
-// shared sessions but better than returning empty for pre-existing rows.
+// session's tail." Fine for a fresh session; for a legacy accumulating
+// session it may span runs, but it's better than returning empty.
 //
 // Cross-file invariant: the (0,0) sentinel is safe only because
 // runner.go pre-appends a user message for every req.Source != "" run
 // (including schedule), so turnBase.msgCount is captured AFTER the
 // append and is therefore >= 1 when MessageStartIndex is stamped. If a
 // future refactor lets a real schedule run produce MessageStartIndex == 0,
-// this fallback will silently regress to scanning the whole session
-// tail — the exact bug this resolver was written to fix. Touch points
-// to keep aligned: internal/daemon/runner.go pre-loop user append
-// (look for `preLoopUserAppended`) and `captureTurnBaseline`.
+// this fallback silently regresses to scanning the whole session tail.
+// Touch points to keep aligned: internal/daemon/runner.go pre-loop user
+// append (look for `preLoopUserAppended`) and `captureTurnBaseline`.
 //
 // shannonDir is the root (~/.shannon) — we resolve the per-agent or default
 // sessions directory under it.

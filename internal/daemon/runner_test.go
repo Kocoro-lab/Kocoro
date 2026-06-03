@@ -245,6 +245,109 @@ func TestComputeRouteKey_MessagingPlatformThreadRouting(t *testing.T) {
 	}
 }
 
+func TestComputeRouteKey_NamedAgentMultiSession(t *testing.T) {
+	tests := []struct {
+		name string
+		req  RunAgentRequest
+		want string
+	}{
+		{
+			name: "session_id resumes the exact session",
+			req:  RunAgentRequest{Agent: "ops-bot", SessionID: "sess-abc"},
+			want: "session:sess-abc",
+		},
+		{
+			name: "new_session forks — no plain key (D2 unlock)",
+			req:  RunAgentRequest{Agent: "ops-bot", NewSession: true},
+			want: "",
+		},
+		{
+			name: "no session_id, no new_session resumes latest interactive (plain key)",
+			req:  RunAgentRequest{Agent: "ops-bot"},
+			want: "agent:ops-bot",
+		},
+		{
+			name: "default agent new_session still forks",
+			req:  RunAgentRequest{NewSession: true},
+			want: "",
+		},
+		{
+			name: "named agent new_session does not override an explicit session_id",
+			req:  RunAgentRequest{Agent: "ops-bot", NewSession: true, SessionID: "sess-xyz"},
+			want: "session:sess-xyz",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ComputeRouteKey(tt.req); got != tt.want {
+				t.Errorf("ComputeRouteKey(%+v) = %q, want %q", tt.req, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResumeNamedAgentColdStart_ResolvesLatestInteractiveNotSchedule(t *testing.T) {
+	dir := t.TempDir()
+	seed := session.NewManager(dir)
+
+	// Interactive chat (older) followed by a NEWER schedule session. Cold start
+	// must resolve the interactive chat, not the newer schedule session.
+	chat := seed.NewSession()
+	chat.Source = "desktop"
+	chat.Messages = []client.Message{{Role: "user", Content: client.NewTextContent("hi")}}
+	if err := seed.Save(); err != nil {
+		t.Fatalf("Save chat: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	sched := seed.NewSession()
+	sched.Source = ChannelSchedule
+	sched.Messages = []client.Message{{Role: "user", Content: client.NewTextContent("run")}}
+	if err := seed.Save(); err != nil {
+		t.Fatalf("Save sched: %v", err)
+	}
+	seed.Close()
+
+	cold := session.NewManager(dir)
+	defer cold.Close()
+	resumed, err := resumeNamedAgentColdStart(cold)
+	if err != nil {
+		t.Fatalf("resumeNamedAgentColdStart: %v", err)
+	}
+	if !resumed {
+		t.Fatal("expected cold start to resume the interactive session")
+	}
+	if current := cold.Current(); current == nil || current.ID != chat.ID {
+		t.Fatalf("current = %#v, want interactive chat %q (not newer schedule %q)", current, chat.ID, sched.ID)
+	}
+}
+
+func TestResumeNamedAgentColdStart_NoInteractiveStartsFresh(t *testing.T) {
+	dir := t.TempDir()
+	seed := session.NewManager(dir)
+	sched := seed.NewSession()
+	sched.Source = ChannelSchedule
+	sched.Messages = []client.Message{{Role: "user", Content: client.NewTextContent("run")}}
+	if err := seed.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	seed.Close()
+
+	cold := session.NewManager(dir)
+	defer cold.Close()
+	resumed, err := resumeNamedAgentColdStart(cold)
+	if err != nil {
+		t.Fatalf("resumeNamedAgentColdStart: %v", err)
+	}
+	if resumed {
+		t.Fatal("expected NOT to resume (no interactive session); should start fresh")
+	}
+	// A fresh in-memory session is created so Current() is non-nil but is not
+	// the schedule session.
+	if current := cold.Current(); current != nil && current.ID == sched.ID {
+		t.Fatal("cold start must not resume the schedule session")
+	}
+}
+
 func TestResumeRoutedColdStart_UsesPersistedRouteKey(t *testing.T) {
 	dir := t.TempDir()
 	mgr := session.NewManager(dir)

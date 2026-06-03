@@ -384,6 +384,15 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 		query, limit,
 	)
 	if err != nil {
+		// A bare ':' in the query (a URL, a "12:30" time, or "channel: foo")
+		// makes FTS5 parse it as a column filter against a column that isn't
+		// in messages_fts → "no such column: <word>". The caller never meant
+		// column syntax, so fall back to the colon-safe LIKE path instead of
+		// surfacing a raw SQL error (the prior behaviour broke schedule agents
+		// that searched their own history to reconstruct context).
+		if isFTSColumnError(err) {
+			return idx.searchLike(terms, limit)
+		}
 		if isFTSSyntaxError(err) {
 			return nil, fmt.Errorf("invalid search query: %s", query)
 		}
@@ -747,4 +756,17 @@ func isFTSSyntaxError(err error) bool {
 		strings.Contains(msg, "fts5 syntax error") ||
 		strings.Contains(msg, "fts5:") ||
 		strings.Contains(msg, "unterminated string")
+}
+
+// isFTSColumnError reports whether an FTS5 MATCH failed because a ':' in the
+// query was parsed as a column filter against a column not present in
+// messages_fts (e.g. "channel: foo", a URL, or a "12:30" timestamp).
+// modernc.org/sqlite surfaces this as "no such column: <name>". Such queries
+// were not meant to use FTS column syntax, so the caller falls back to LIKE.
+// Caveat: the substring match is intentionally broad, so a genuinely missing
+// FTS column (schema corruption / a botched migration) is also swallowed into
+// the slower LIKE path rather than surfaced. Acceptable because results stay
+// correct, but worth knowing when diagnosing an unexplained search slowdown.
+func isFTSColumnError(err error) bool {
+	return strings.Contains(err.Error(), "no such column")
 }

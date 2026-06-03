@@ -3,6 +3,7 @@ package session
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"sync"
@@ -10,6 +11,12 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
+
+// ErrMessageIndexOutOfRange is returned by TruncateMessages when the requested
+// index is outside the session's message range. It is a client-input error
+// (HTTP 400) and must be distinguishable from a load/save IO failure (500) so
+// handleEditMessage can map each to the correct status.
+var ErrMessageIndexOutOfRange = errors.New("message_index out of range")
 
 // validSessionIDPattern restricts client-supplied session IDs to a safe shape.
 // Allowed: 8–80 chars of [A-Za-z0-9._-]. The cap matches generateID's
@@ -426,7 +433,7 @@ func (m *Manager) TruncateMessages(id string, index int) error {
 		return err
 	}
 	if index < 0 || index > len(sess.Messages) {
-		return fmt.Errorf("message_index %d out of range [0, %d]", index, len(sess.Messages))
+		return fmt.Errorf("%w: %d not in [0, %d]", ErrMessageIndexOutOfRange, index, len(sess.Messages))
 	}
 	sess.Messages = sess.Messages[:index]
 	if len(sess.MessageMeta) > index {
@@ -509,6 +516,41 @@ func (m *Manager) ResumeLatestByRouteKey(routeKey string) (*Session, error) {
 	m.mu.Unlock()
 	runCallbacks(callbacks)
 	return sess, nil
+}
+
+// ResumeLatestMatching loads the most recently updated session whose Source
+// satisfies pred, skipping sessions that don't match. Returns (nil, nil) when
+// no session matches — the caller should then start fresh. A nil pred falls
+// back to ResumeLatest (newest-regardless).
+//
+// Unlike ResumeLatest's index fast-path (which is route-key/source agnostic),
+// this filters on Source, so it scans the summary list. That is cheap:
+// SessionSummary already carries Source + UpdatedAt, and only the winning
+// session is loaded (via Resume). Resume applies the same current-swap locking
+// and session-close callbacks as ResumeLatestByRouteKey.
+func (m *Manager) ResumeLatestMatching(pred func(source string) bool) (*Session, error) {
+	if pred == nil {
+		return m.ResumeLatest()
+	}
+	summaries, err := m.store.List()
+	if err != nil {
+		return nil, err
+	}
+	var bestID string
+	var bestTime time.Time
+	for _, s := range summaries {
+		if !pred(s.Source) {
+			continue
+		}
+		if bestID == "" || s.UpdatedAt.After(bestTime) {
+			bestTime = s.UpdatedAt
+			bestID = s.ID
+		}
+	}
+	if bestID == "" {
+		return nil, nil
+	}
+	return m.Resume(bestID)
 }
 
 func generateID() string {

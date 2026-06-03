@@ -4,13 +4,17 @@
 
 Schedules are automated tasks that run on a cron schedule without any human interaction. You define a prompt (what to do), a cron expression (when to do it), and optionally which agent to use. Shannon runs the task at the scheduled time, executes any tool calls automatically, and delivers the reply: to Kocoro Desktop always, and to every Cloud channel (Slack / Lark / Telegram / WeCom / Feishu) the agent — named or default — is OAuth-bound to.
 
+## Create / update / remove with the native `schedule_*` tools (NOT `http`)
+
+As the kocoro assistant, manage schedules with the local tools `schedule_create` / `schedule_update` / `schedule_remove` (and `schedule_list` to read) — do NOT `http POST /schedules`. Only the native tools capture the run's originating agent, IM channel, and conversation context. That captured context is what lets a schedule created from a Slack / Lark / Feishu / … thread proactively deliver its results back to that exact thread, run as the right agent, and understand the task background. Creating via raw HTTP loses all of it (the schedule runs as the default agent and never broadcasts, so the user never hears back). The HTTP endpoints below remain documented for external/admin clients and for reads.
+
 ## API Endpoints
 
 ### List all schedules
 - Method: GET
 - Path: /schedules
 - Response: `[{"id": "string", "prompt": "string", "cron": "0 9 * * 1-5", "agent": "string", "enabled": true, "stateful": true, "last_run_at": "2024-01-15T09:00:00Z", "last_run_session_id": "string", "last_run_message_start_index": 12, "last_run_message_end_index": 18}]`
-- Notes: All `last_run_*` keys (including the message-index range) are absent from the JSON when the schedule has never fired — they are not present as `null`. The index range slices the run's turns out of the shared per-agent session; `GET /schedules/{id}/last-run` handles that resolution for you.
+- Notes: All `last_run_*` keys (including the message-index range) are absent from the JSON when the schedule has never fired — they are not present as `null`. The index range slices the run's turns out of the schedule's dedicated session; `GET /schedules/{id}/last-run` handles that resolution for you.
 
 ### Get schedule details
 - Method: GET
@@ -35,14 +39,14 @@ Schedules are automated tasks that run on a cron schedule without any human inte
 - Path: /schedules
 - Body: `{"prompt": "Check the sales dashboard and summarize any anomalies", "cron": "0 9 * * 1-5", "agent": "analyst", "stateful": false}`
 - Response: `{"id": "...", "prompt": "...", "cron": "...", "agent": "...", "enabled": true, "stateful": false}`
-- Notes: `agent` is optional — omit to use the default agent. `cron` uses standard 5-field cron format. `stateful` defaults to `false` (each run starts with empty LLM history; recommended for digest/polling/PR-review style tasks). Set `stateful: true` for agents that need cross-run memory (continuous tracking, follow-up analysis).
+- Notes: `agent` is optional — omit to use the default agent. `cron` uses standard 5-field cron format. `stateful` is the single "remember across runs" switch and defaults to `false`: each run starts in a brand-new session with no prior context (recommended for digest/polling/PR-review style tasks). Set `stateful: true` to make the schedule accumulate in one dedicated session and have each run see prior runs' history (continuous tracking, a rolling standup/journal). Applies to both the default and named agents. See the Stateful note below.
 
 ### Update a schedule
 - Method: PATCH
 - Path: /schedules/{id}
 - Body: `{"prompt": "Updated task...", "enabled": false, "stateful": true}`
 - Response: `{"id": "...", "prompt": "...", "cron": "...", "agent": "...", "enabled": false, "stateful": true}`
-- Notes: Only include fields you want to change. `stateful` accepts `true` or `false`; omit to leave existing setting untouched. Legacy schedules created before this field existed have no `stateful` value on disk and behave as if stateful — explicitly send `{"stateful": false}` to migrate them to the new stateless default.
+- Notes: Only include fields you want to change. `stateful` accepts `true` or `false`; omit to leave the existing setting untouched. Legacy schedules created before this field existed have no `stateful` value on disk and run fresh (each run independent) — send `{"stateful": true}` to make them accumulate across runs.
 
 ### Delete a schedule
 - Method: DELETE
@@ -96,6 +100,11 @@ Format: `minute hour day-of-month month day-of-week`
   - `off`: never broadcast. Use when the user creates a schedule from IM but explicitly wants it local-only.
   - Default agent and named agents follow the same rule.
   - Set via `schedule_create`'s or `schedule_update`'s `broadcast` parameter (string enum `"auto" | "on" | "off"`). Omitting on create defaults to `auto`; omitting on update leaves the existing value unchanged.
+  - **Proactive targeting**: a schedule created from an IM thread snapshots that thread's routing context at creation time, so when it later broadcasts, Cloud delivers the reply back to the originating thread (Slack / Feishu / LINE) instead of the channel at large. Schedules created from Desktop/TUI/CLI/cron have no such context and broadcast to all bound channels as before. Transparent — no parameter; falls back to broadcast on unsupported platforms (WeCom / Telegram) or when no thread context was captured.
+- **Stateful (remember across runs)**: each schedule carries a single `stateful` switch (`false` default, or `true`), for both the default and named agents.
+  - `false` (default): every run starts in a brand-new session with no prior context. Best for digests, polling, reports, monitoring — any task whose runs are independent.
+  - `true`: all runs of this schedule accumulate in ONE dedicated session (route key `agent:<name>:schedule:<id>`, or `schedule:<id>` for the default agent) AND each run's LLM call sees that session's history. Choose when the user wants the agent to build continuously on this schedule's own prior runs (a rolling standup/journal, ongoing tracking).
+  - Legacy schedules created before this field existed have no `stateful` on disk and run fresh (a behavior change from the old "named-agent runs shared one session" model — users who want accumulation set `stateful: true` explicitly).
 - **Diagnostic logs**: For debugging, also see `~/.shannon/logs/schedule-{id}.log` (per-schedule run log) and `~/.shannon/logs/audit.log` (cross-cutting tool-call timeline).
 - **Time zone**: Cron expressions use the system time zone of the machine running the Shannon daemon.
 - **Overlapping runs**: If a scheduled task is still running when the next scheduled time arrives, the new run is skipped to prevent overlap.
