@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -14,6 +15,33 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 )
+
+// parseStatefulArg reads the optional "stateful" tool argument, tolerating the
+// LLM emitting the JSON boolean as a string ("true"/"false") — a common model
+// quirk. Returns (value, set, err): set is false when the arg is absent/nil.
+// A value that is neither a bool nor a parseable bool-string is a validation
+// error rather than being silently dropped to false. The silent drop was a
+// real bug: an agent asked for context continuity emitted "stateful":"true",
+// the bare `args["stateful"].(bool)` assertion failed, and the schedule was
+// created stateful=false (fresh per run) despite the explicit request.
+func parseStatefulArg(args map[string]any) (val bool, set bool, err error) {
+	raw, present := args["stateful"]
+	if !present || raw == nil {
+		return false, false, nil
+	}
+	switch v := raw.(type) {
+	case bool:
+		return v, true, nil
+	case string:
+		b, perr := strconv.ParseBool(strings.TrimSpace(v))
+		if perr != nil {
+			return false, false, fmt.Errorf("stateful must be a boolean true/false; got %q", v)
+		}
+		return b, true, nil
+	default:
+		return false, false, fmt.Errorf("stateful must be a boolean true/false; got %T", raw)
+	}
+}
 
 // scheduleAudienceDisclaimer is appended to every ScheduleTool description so
 // the LLM treats these as its own tools rather than user-typed commands. The
@@ -196,7 +224,10 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		if description == "" {
 			return agent.ValidationError("description is required"), nil
 		}
-		stateful, _ := args["stateful"].(bool) // missing → false (Go zero value, matches HTTP/CLI default)
+		stateful, _, statefulErr := parseStatefulArg(args) // missing → false; tolerates "true"/"false" strings
+		if statefulErr != nil {
+			return agent.ValidationError(statefulErr.Error()), nil
+		}
 		// Parse broadcast enum. Absent or "auto" maps to nil (smart default).
 		// Use the explicit "present?" check (not just truthy) so the LLM
 		// passing a non-string value still surfaces as a validation error.
@@ -282,7 +313,9 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		if v, ok := args["enabled"].(bool); ok {
 			opts.Enabled = &v
 		}
-		if v, ok := args["stateful"].(bool); ok {
+		if v, set, statefulErr := parseStatefulArg(args); statefulErr != nil {
+			return agent.ValidationError(statefulErr.Error()), nil
+		} else if set {
 			opts.Stateful = &v
 		}
 		// Parse the optional broadcast enum. Absent → leave field unchanged.

@@ -859,3 +859,40 @@ func TestScheduleTool_Show_RespectsMessageRange(t *testing.T) {
 		t.Errorf("scheduled reply must appear in show output: %q", res.Content)
 	}
 }
+
+// TestParseStatefulArg locks that the stateful tool arg tolerates the LLM
+// emitting the JSON boolean as a string ("true"/"false") instead of silently
+// dropping it to false — the bug that made "stateful":"true" create a fresh
+// (non-sticky) schedule despite an explicit continuity request.
+func TestParseStatefulArg(t *testing.T) {
+	cases := []struct {
+		name             string
+		args             map[string]any
+		wantVal, wantSet bool
+		wantErr          bool
+	}{
+		{"absent", map[string]any{}, false, false, false},
+		{"nil", map[string]any{"stateful": nil}, false, false, false},
+		{"bool true", map[string]any{"stateful": true}, true, true, false},
+		{"bool false", map[string]any{"stateful": false}, false, true, false},
+		{"string true", map[string]any{"stateful": "true"}, true, true, false},
+		{"string false", map[string]any{"stateful": "false"}, false, true, false},
+		{"string True", map[string]any{"stateful": "True"}, true, true, false},
+		{"garbage string", map[string]any{"stateful": "yes"}, false, false, true},
+		{"number", map[string]any{"stateful": float64(1)}, false, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			val, set, err := parseStatefulArg(tc.args)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v, wantErr=%v", err, tc.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if val != tc.wantVal || set != tc.wantSet {
+				t.Errorf("got (val=%v set=%v), want (val=%v set=%v)", val, set, tc.wantVal, tc.wantSet)
+			}
+		})
+	}
+}
