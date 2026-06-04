@@ -159,6 +159,13 @@ type toolResultMsg struct {
 	elapsed time.Duration
 }
 
+// titleGeneratedMsg is sent after the background smart-title upgrade resolves,
+// carrying the final upgraded title so the cached session list can refresh.
+type titleGeneratedMsg struct {
+	sessionID string
+	title     string
+}
+
 type toolResultEntry struct {
 	name    string
 	args    string
@@ -1197,10 +1204,26 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.sessions.Save()
+		// Smart session title: upgrade the placeholder asynchronously on a
+		// successful turn (same shared core as the daemon path). tea.Batch
+		// drops a nil Cmd, so this is a no-op when gating fails.
+		var titleCmd tea.Cmd
+		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) {
+			if sess := m.sessions.Current(); sess != nil {
+				titleCmd = m.generateTitleCmd(sess.ID, sess.Source, sess.Messages, countAssistantTurns(sess.Messages))
+			}
+		}
 		// Full clear-and-repaint so the response, usage line, and input bar
 		// are all positioned correctly — incremental Println can mis-position
 		// lines when the view height changes between processing and input.
-		return m, m.rerenderOutput()
+		return m, tea.Batch(m.rerenderOutput(), titleCmd)
+
+	case titleGeneratedMsg:
+		// UpgradeTitle already persisted + synced the title via
+		// Manager.PatchAutoTitle; refresh the cached session list so the
+		// startup header / sidebar re-render with the upgraded title.
+		m.headerSessions, _ = m.sessions.List()
+		return m, nil
 
 	case approvalRequestMsg:
 		m.pendingApprovalTool = msg.tool
@@ -1803,6 +1826,38 @@ func (m *Model) rerenderOutput() tea.Cmd {
 		tea.Println(strings.Join(lines, "\n")),
 		func() tea.Msg { return rerenderDoneMsg{} },
 	)
+}
+
+// generateTitleCmd upgrades the session title in the background (same shared
+// core as the daemon path) and reports the result so the sidebar refreshes.
+// Returns nil (a no-op Cmd — Bubbletea ignores it) when gating fails. The
+// gateway/manager are captured into locals so the returned closure does NOT
+// close over the Model (Bubbletea value-copies the Model through Update).
+func (m *Model) generateTitleCmd(sessionID, source string, msgs []client.Message, turns int) tea.Cmd {
+	if m.gateway == nil || m.sessions == nil || sessionID == "" || !ctxwin.TitleTriggerTurns[turns] {
+		return nil
+	}
+	gw, mgr := m.gateway, m.sessions
+	msgsCopy := append([]client.Message(nil), msgs...)
+	return func() tea.Msg {
+		final := ctxwin.UpgradeTitle(context.Background(), gw, mgr, sessionID, source, msgsCopy, turns)
+		if final == "" {
+			return nil
+		}
+		return titleGeneratedMsg{sessionID: sessionID, title: final}
+	}
+}
+
+// countAssistantTurns counts assistant messages — the trigger signal for the
+// smart-title upgrade. Local copy: the tui package must not import daemon.
+func countAssistantTurns(messages []client.Message) int {
+	n := 0
+	for _, msg := range messages {
+		if msg.Role == "assistant" {
+			n++
+		}
+	}
+	return n
 }
 
 func markdownCacheKey(text string, width int) string {
