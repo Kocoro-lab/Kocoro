@@ -105,6 +105,24 @@ func TestSplitArtifacts_UnclosedFenceStaysProse(t *testing.T) {
 	}
 }
 
+// An artifact opener inside an UNCLOSED plain code fence must not be hoisted to
+// a live artifact: an unterminated fence runs to EOF as code (markdown
+// semantics), so the inner opener is just part of that code body.
+func TestSplitArtifacts_ArtifactInsideUnclosedPlainFenceStaysProse(t *testing.T) {
+	// The plain ``` fence never gets a backticks-only closer; the inner
+	// html-artifact has only a lenient closer ("```done").
+	src := "```\n" +
+		"```html-artifact title=X\n" +
+		"<div>demo</div>\n" +
+		"```done"
+	segs := splitArtifacts(src)
+	for i, s := range segs {
+		if s.IsArtifact {
+			t.Fatalf("segment %d hoisted to artifact from inside an unclosed plain fence: %+v", i, s)
+		}
+	}
+}
+
 func TestMatchArtifactInfo_Discrimination(t *testing.T) {
 	// Input is the fence info string (text after the backticks).
 	cases := map[string]bool{

@@ -46,8 +46,15 @@ type artifactSegment struct {
 	Markdown string
 
 	// Artifact fields (IsArtifact == true).
-	Title   string
-	MIME    string
+	Title string
+	// MIME is parsed from the fence (text/html default, or image/svg+xml) for
+	// contract completeness, but nothing downstream branches on it yet — SVG
+	// fragments render fine through the same HTML wrapper. Reserved for a future
+	// SVG-specific path, mirroring Desktop which also parses but doesn't use it.
+	MIME string
+	// ID is the explicit fence id, if any. The share renderer ignores it and
+	// mints a render-unique data-artifact-id instead (see textToViewBlocks); kept
+	// here so the parser stays a faithful, testable mirror of the fence contract.
 	ID      string
 	Content string // the raw fragment / document inside the fence
 }
@@ -117,11 +124,12 @@ func splitArtifacts(source string) []artifactSegment {
 				}
 			}
 			if !closed {
-				// Truncated transcript, no closer at all: don't swallow the rest —
-				// keep the opener as prose and move on.
-				prose = append(prose, lines[i])
-				i++
-				continue
+				// No closer at all (truncated transcript / malformed): treat the
+				// rest as prose to EOF, matching how a markdown renderer handles an
+				// unterminated fence. Critically, this means an artifact opener can
+				// never be hoisted out of an enclosing *unclosed* fence.
+				prose = append(prose, lines[i:]...)
+				break
 			}
 			flushProse()
 			// id stays as the explicit fence id (may be ""); a render-unique
@@ -146,7 +154,7 @@ func splitArtifacts(source string) []artifactSegment {
 		// Regular (non-artifact) fenced code block: strict close (a backticks-only
 		// line), kept verbatim as prose so goldmark renders it as <pre><code>.
 		// Strict here avoids mis-closing a code sample that contains a ```-prefixed
-		// line; if never closed, the opener stays prose.
+		// line.
 		j := i + 1
 		closed := false
 		for ; j < len(lines); j++ {
@@ -157,9 +165,11 @@ func splitArtifacts(source string) []artifactSegment {
 			}
 		}
 		if !closed {
-			prose = append(prose, lines[i])
-			i++
-			continue
+			// Unterminated plain fence: everything to EOF is its code body (markdown
+			// semantics). Swallow it as prose so a later artifact opener inside this
+			// runaway fence is NOT promoted to a live artifact.
+			prose = append(prose, lines[i:]...)
+			break
 		}
 		prose = append(prose, lines[i:j+1]...)
 		i = j + 1

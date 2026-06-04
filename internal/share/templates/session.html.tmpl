@@ -526,7 +526,9 @@
     if (!d || d.type !== 'kocoro-artifact-resize' || typeof d.id !== 'string') return;
     var sel = 'iframe.kocoro-artifact[data-artifact-id="' + (window.CSS && CSS.escape ? CSS.escape(d.id) : d.id) + '"]';
     var f = document.querySelector(sel);
-    if (f && typeof d.height === 'number') f.style.height = Math.max(Math.ceil(d.height), 80) + 'px';
+    // Clamp: floor matches the CSS min-height; ceiling guards against a runaway
+    // artifact posting a huge scrollHeight that would stretch the share page.
+    if (f && typeof d.height === 'number') f.style.height = Math.min(Math.max(Math.ceil(d.height), 120), 20000) + 'px';
   });
 })();
 </script>
