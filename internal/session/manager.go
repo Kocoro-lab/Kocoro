@@ -149,15 +149,18 @@ func (m *Manager) Save() error {
 // If the target is the active session, the in-memory title is also updated.
 // Disk is written first so a failed write won't leave memory inconsistent.
 func (m *Manager) PatchTitle(id, title string) error {
-	err := m.store.PatchTitle(id, title)
-	if err != nil {
+	// Hold m.mu across the store read-modify-write so a user rename serializes
+	// against the async smart-title upgrade (PatchAutoTitle) and Save — all
+	// write the same JSON file. Without the lock, a rename's write could
+	// interleave the auto-upgrade goroutine and drop the TitleAuto=false lock.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.store.PatchTitle(id, title); err != nil {
 		return err
 	}
-	m.mu.Lock()
 	if m.current != nil && m.current.ID == id {
 		m.current.Title = title
 	}
-	m.mu.Unlock()
 	return nil
 }
 

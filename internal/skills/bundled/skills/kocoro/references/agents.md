@@ -122,7 +122,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Path: /sessions/{id}[?agent={name}]
 - Body: `{"title": "...", "pinned": true, "favorite": true}` — every field is OPTIONAL; supply only the ones you want to change. At least one of `title` / `pinned` / `favorite` must be present.
 - Response: `{"status": "updated", "title"?, "pinned"?, "favorite"?}` — echoes only the fields that were changed.
-- Notes: `title` must be a non-empty string after trimming. `pinned` / `favorite` are independent booleans (a session can be one, both, or neither). Updates do NOT bump `updated_at`, so list order is preserved when only flags change; pinned sessions float to the top of `GET /sessions` regardless. Use `agent={name}` query parameter to target a named-agent session; omit for default-agent sessions.
+- Notes: `title` must be a non-empty string after trimming. Setting `title` marks it user-chosen and permanently locks it against the automatic smart-title upgrade — once a session is renamed here, the daemon never overwrites that title (every new session otherwise gets a machine-derived title that an async small-model call upgrades to a smart summary on the first/third turn). `pinned` / `favorite` are independent booleans (a session can be one, both, or neither). Updates do NOT bump `updated_at`, so list order is preserved when only flags change; pinned sessions float to the top of `GET /sessions` regardless. Use `agent={name}` query parameter to target a named-agent session; omit for default-agent sessions.
 
 ### List sessions awaiting approval
 - Method: GET
