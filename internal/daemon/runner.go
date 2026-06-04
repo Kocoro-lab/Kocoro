@@ -26,6 +26,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
@@ -2372,6 +2373,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			}
 		}
 
+		// Smart session title: upgrade the placeholder on the first/third
+		// assistant turn, independent of the suggestion gate below. Async +
+		// best-effort; fires only when the session was actually persisted.
+		completedTurns := countAssistantTurns(sess.Messages)
+		if saveErr == nil {
+			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, sess.Messages, completedTurns)
+		}
+
 		// Post-turn prompt suggestion (fire-and-forget). Gated by all of:
 		//   - agent.prompt_suggestion.enabled
 		//   - SuggestionState wired through deps (NewServer wires it; CLI
@@ -2385,7 +2394,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// prefix and warm-cache pricing on the suggestion call.
 		if saveErr == nil && deps.Suggestions != nil && cfg != nil && cfg.Agent.PromptSuggestion.Enabled {
 			ps := cfg.Agent.PromptSuggestion
-			completedTurns := countAssistantTurns(sess.Messages)
 			// Judge cache warmth on the LAST main-turn LLM call, not the
 			// turn-aggregate `usage` — a multi-tool turn that started cold
 			// but ended warm (last iter ~100% cache_read) should NOT be
@@ -2475,6 +2483,31 @@ func countAssistantTurns(messages []client.Message) int {
 		}
 	}
 	return n
+}
+
+// fireTitleAfterRun launches the smart-title upgrade asynchronously
+// (fire-and-forget, outlives the request ctx — same lifecycle as
+// fireSuggestionAfterRun). mgr (*session.Manager) satisfies
+// ctxwin.AutoTitlePatcher and keeps the active-session title synced.
+// Gated to the first/third assistant turn; a nil dep or out-of-range turn
+// is a silent no-op. UpgradeTitle returns "" on generation failure OR a
+// guarded skip (user-locked / straggler); we log only the successful set,
+// since the skip case is expected (e.g. every turn after a user rename).
+func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source string, msgs []client.Message, turns int) {
+	if deps == nil || deps.GW == nil || mgr == nil || sessionID == "" || !ctxwin.TitleTriggerTurns[turns] {
+		return
+	}
+	msgsCopy := append([]client.Message(nil), msgs...)
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("daemon: smart title panic: %v", rec)
+			}
+		}()
+		if final := ctxwin.UpgradeTitle(context.Background(), deps.GW, mgr, sessionID, source, msgsCopy, turns); final != "" {
+			log.Printf("daemon: smart title set for session %s: %q", sessionID, final)
+		}
+	}()
 }
 
 // fireSuggestionAfterRun runs in a detached goroutine after the main turn
@@ -2868,6 +2901,8 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		)
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: failed to save assistant message: %v", err)
+		} else {
+			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, sess.Messages, countAssistantTurns(sess.Messages))
 		}
 	}
 
