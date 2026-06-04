@@ -22,6 +22,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 	"github.com/Kocoro-lab/ShanClaw/internal/daemon"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
@@ -413,6 +414,15 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		usageLine += " | " + llm.Model
 	}
 	fmt.Println(usageLine + "]")
+
+	// Smart title: one-shot is single-turn, so generate once (turn 1) now that
+	// the transcript is persisted and the reply is printed. Synchronous — there
+	// is no event loop and the process is about to exit; best-effort. Gated to
+	// the gateway provider (gw is nil under Ollama). Placed after output so the
+	// ~1s upgrade never delays the user-visible reply.
+	if gw != nil && sess.TitleAuto {
+		ctxwin.UpgradeTitle(context.Background(), gw, sessMgr, sess.ID, sess.Source, sess.Messages, 1)
+	}
 	return nil
 }
 
