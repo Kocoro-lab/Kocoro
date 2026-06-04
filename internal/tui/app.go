@@ -1571,6 +1571,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	// Set title from first user message
 	if sess.Title == "New session" {
 		sess.Title = session.Title(input)
+		sess.TitleAuto = true
 	}
 	userMsgTime := time.Now()
 	sess.Messages = append(sess.Messages, client.Message{Role: "user", Content: client.NewTextContent(input)})

@@ -359,6 +359,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 
 	sess := sessMgr.NewSession()
 	sess.Title = sessionTitleFromQuery(query)
+	sess.TitleAuto = true
 	loop.SetSessionID(sess.ID)
 	sess.CWD = effectiveCWD
 	loop.SetSessionCWD(effectiveCWD)

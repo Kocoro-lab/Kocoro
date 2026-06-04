@@ -1174,7 +1174,9 @@ func TestHandleMessage_SlashCancellable_StopsViaCancelRoute(t *testing.T) {
 
 // TestHandleMessage_SlashWithNamedAgent_DoneCarriesAgent verifies that the
 // done event's RunAgentResult carries Agent=<agentName>, that the persisted
-// session has Title=session.AgentTitle(agentName), and that Source is stamped.
+// session has a first-message-derived placeholder title stamped TitleAuto=true
+// (named agents no longer get a fixed "<name> conversation" title), and that
+// Source is stamped.
 func TestHandleMessage_SlashWithNamedAgent_DoneCarriesAgent(t *testing.T) {
 	_, gwSrv := newFakeGateway(t, researchSSEEvents, "ok")
 	srv := newSlashTestServer(t, gwSrv.URL)
@@ -1219,9 +1221,15 @@ func TestHandleMessage_SlashWithNamedAgent_DoneCarriesAgent(t *testing.T) {
 		t.Fatalf("expected 1 researcher session file, got %d", len(sessions))
 	}
 	sess := sessions[0]
-	wantTitle := session.AgentTitle("researcher")
+	// Named agents now derive the placeholder from the first-message query
+	// (cmd.Query="foo" for "/research foo"; source "shanclaw" yields no
+	// routeTitle), same as the default agent — NOT "researcher conversation".
+	wantTitle := session.Title("foo")
 	if sess.Title != wantTitle {
 		t.Errorf("session Title=%q, want %q", sess.Title, wantTitle)
+	}
+	if !sess.TitleAuto {
+		t.Error("placeholder should be marked TitleAuto=true")
 	}
 	if sess.Source != "shanclaw" {
 		t.Errorf("session Source=%q, want %q", sess.Source, "shanclaw")

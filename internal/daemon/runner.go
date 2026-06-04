@@ -1743,12 +1743,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			sess.Source = req.Source
 			sess.Channel = req.Channel
 		}
-		// Only set source-derived title for non-named-agent routes.
-		// Named agents always get session.AgentTitle in the post-loop block.
-		if sess.Title == "New session" && req.RouteKey != "" && !strings.HasPrefix(req.RouteKey, "agent:") {
-			title := routeTitle(req.Source, req.Channel, req.Sender)
-			if title != "" {
+		// Source-derived title for routed conversations (IM → "Slack · sender",
+		// schedule → "Schedule · scheduler"). Named/default treated identically;
+		// desktop/empty sources yield "" and fall through to the first-line title.
+		if sess.Title == "New session" && req.RouteKey != "" {
+			if title := routeTitle(req.Source, req.Channel, req.Sender); title != "" {
 				sess.Title = title
+				sess.TitleAuto = true
 			}
 		}
 		if err := sessMgr.Save(); err != nil {
@@ -2268,13 +2269,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	// Ephemeral requests skip post-run persistence — the caller owns session lifecycle.
 	if !req.Ephemeral {
-		// Set title from first user message (named agents get a fixed title).
+		// Title from the first user message. Named agents are treated
+		// identically to the default agent — the smart-title upgrade replaces
+		// this placeholder asynchronously.
 		if sess.Title == "New session" {
-			if agentName != "" {
-				sess.Title = session.AgentTitle(agentName)
-			} else {
-				sess.Title = session.Title(prompt)
-			}
+			sess.Title = session.Title(prompt)
+			sess.TitleAuto = true
 		}
 
 		// Final save uses the same (baseline + current snapshot) rebuild as
@@ -2799,22 +2799,16 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 			sess.Source = req.Source
 			sess.Channel = req.Channel
 		}
-		// Title precedence (matches RunAgent's combined behavior at lines
-		// 798-803 + 1147-1152): named agent > route source/channel > derived
-		// from query.
+		// Title from route source/channel (IM) or the first-message query.
+		// Named agents no longer get a fixed title — the smart-title upgrade
+		// replaces this placeholder asynchronously.
 		if sess.Title == "New session" {
-			switch {
-			case agentName != "":
-				sess.Title = session.AgentTitle(agentName)
-			case req.RouteKey != "":
-				if t := routeTitle(req.Source, req.Channel, req.Sender); t != "" {
-					sess.Title = t
-				} else {
-					sess.Title = session.Title(cmd.Query)
-				}
-			default:
+			if t := routeTitle(req.Source, req.Channel, req.Sender); t != "" {
+				sess.Title = t
+			} else {
 				sess.Title = session.Title(cmd.Query)
 			}
+			sess.TitleAuto = true
 		}
 	}
 
