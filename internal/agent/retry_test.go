@@ -26,14 +26,20 @@ func TestIsRetryableLLMError(t *testing.T) {
 		// Wrapped typed APIError (errors.As unwraps)
 		{"wrapped 429", fmt.Errorf("LLM call failed: %w", &client.APIError{StatusCode: 429}), true},
 		{"wrapped 400", fmt.Errorf("LLM call failed: %w", &client.APIError{StatusCode: 400}), false},
-		// Network/stream errors (string-matched)
+		// Network/stream errors (string-matched via client.TransportErrorShape)
 		{"network timeout", fmt.Errorf("request failed: context deadline exceeded"), true},
 		{"connection reset", fmt.Errorf("request failed: connection reset"), true},
 		{"stream read error", fmt.Errorf("stream read error: unexpected EOF"), true},
 		{"stream ended early", fmt.Errorf("stream ended without done event"), true},
+		// Truncated-body decode on the stream->non-stream fallback is a
+		// transport shape (the body was cut mid-flight), so it is retryable.
+		{"decode truncation", fmt.Errorf("decode response: unexpected EOF"), true},
+		// ErrStreamIdleTimeout is a transport shape for LABELING but must stay
+		// NON-retryable — retrying a silent idle timeout just re-hangs.
+		{"stream idle timeout", client.ErrStreamIdleTimeout, false},
+		{"wrapped stream idle timeout", fmt.Errorf("stream aborted: %w", client.ErrStreamIdleTimeout), false},
 		// Non-retryable
 		{"marshal error", fmt.Errorf("marshal request: json error"), false},
-		{"decode error", fmt.Errorf("decode response: unexpected EOF"), false},
 		{"generic error", fmt.Errorf("something unexpected"), false},
 	}
 	for _, tt := range tests {
