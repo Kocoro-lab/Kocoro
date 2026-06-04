@@ -37,6 +37,42 @@ func TestCodeFromError_ClassifiesProviderFailures(t *testing.T) {
 	}
 }
 
+// TestCodeFromError_TransportShapes pins that every transport-layer shape
+// surfaced by the gateway client labels as CodeNetworkInterrupted, not the
+// generic CodeUnexpected. Shares client.TransportErrorShape with the retry
+// path so the failure label and the retry verdict can never diverge again.
+// "stream ended without done event" and the truncated-body "decode response:"
+// EOF were the two shapes that previously fell through to CodeUnexpected.
+func TestCodeFromError_TransportShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"request failed", errors.New("request failed: connection reset by peer")},
+		{"stream read error", errors.New("stream read error: unexpected EOF")},
+		{"stream ended without done", errors.New("stream ended without done event")},
+		{"decode truncation", errors.New("decode response: unexpected EOF")},
+		{"stream idle timeout", client.ErrStreamIdleTimeout},
+		{"wrapped stream idle timeout", fmt.Errorf("stream aborted: %w", client.ErrStreamIdleTimeout)},
+		{"wrapped decode truncation", fmt.Errorf("LLM call failed: %w", errors.New("decode response: unexpected EOF"))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CodeFromError(tc.err); got != CodeNetworkInterrupted {
+				t.Errorf("CodeFromError(%q) = %q, want %q", tc.err, got, CodeNetworkInterrupted)
+			}
+			if got := CodeFromError(tc.err); got == CodeUnexpected {
+				t.Errorf("CodeFromError(%q) fell through to CodeUnexpected — the original defect", tc.err)
+			}
+			// User-facing message must be the interrupted-connection coaching,
+			// not the generic "unexpected error" bubble.
+			if got := FriendlyMessageFromError(tc.err); got == friendlyMessages[CodeUnexpected] {
+				t.Errorf("FriendlyMessageFromError(%q) returned the generic unexpected message", tc.err)
+			}
+		})
+	}
+}
+
 func TestIsFriendlyMessage(t *testing.T) {
 	for code := range friendlyMessages {
 		if !IsFriendlyMessage(FriendlyMessage(code)) {

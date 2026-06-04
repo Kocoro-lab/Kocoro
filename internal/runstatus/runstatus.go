@@ -152,9 +152,19 @@ func codeAndDetailFromError(err error) (Code, *Detail) {
 		return classifyAPIError(apiErr)
 	}
 
+	// Transport-layer failures (dial/connection error, mid-stream read error,
+	// premature stream end, truncated-body decode, silent stream idle timeout).
+	// Shared with the retry decision (agent.isRetryableLLMError) via the same
+	// client.TransportErrorShape classifier so the failure label and the retry
+	// verdict agree on what a transport error is. Checked before the numeric
+	// fallback below because a transport error never carries a 4xx/5xx status.
+	if client.TransportErrorShape(err) {
+		return CodeNetworkInterrupted, nil
+	}
+
 	// Fallback: substring match on the rendered error string. Reaches
-	// errors that didn't carry an APIError wrapper (HTTP transport
-	// failures, decode errors).
+	// errors that didn't carry an APIError wrapper (numeric status codes
+	// rendered into a non-APIError chain).
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "429"):
@@ -163,8 +173,6 @@ func codeAndDetailFromError(err error) (Code, *Detail) {
 		return CodeProviderOverloaded, nil
 	case strings.Contains(msg, "500") || strings.Contains(msg, "502") || strings.Contains(msg, "503") || strings.Contains(msg, "504"):
 		return CodeServiceTemporaryError, nil
-	case strings.Contains(msg, "request failed:") || strings.Contains(msg, "stream read error"):
-		return CodeNetworkInterrupted, nil
 	case strings.Contains(msg, "empty final response"):
 		// String-match on agent.ErrEmptyFinalResponse.Error() — runstatus
 		// cannot import internal/agent (would be a cycle). The string is

@@ -3382,6 +3382,17 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					}
 					// Fall back to non-streaming if gateway doesn't support it
 					if err != nil {
+						// Telemetry (NOT a fix): a streaming call that drops here
+						// re-issues as a non-stream request. If the gateway opened a
+						// fresh upstream for the retry, the new call comes back
+						// cold-cache (cache_read=0) even though the prompt prefix is
+						// identical — the cold-restart signature seen in the
+						// 21-min max_tokens-continuation incident. Capture the
+						// cache-routing inputs the daemon controls (session_id,
+						// cache_source, skip_cache_write) plus the raw error so the
+						// next occurrence's shape is recoverable from client logs.
+						fmt.Fprintf(os.Stderr, "[agent] stream->nonstream fallback iter=%d continuation=%d session_id=%q cache_source=%q skip_cache_write=%t stream_err_type=%T stream_err=%q\n",
+							i, continuationCount, req.SessionID, req.CacheSource, req.SkipCacheWrite, err, err.Error())
 						resp, err = a.client.Complete(ctx, req)
 					}
 				} else {
@@ -3559,6 +3570,13 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				}
 				if !isRetryableLLMError(err) || attempt >= maxLLMRetries-1 {
 					captureRunMessages()
+					// Log the RAW error string + Go type at the point the turn
+					// fails terminally. The user only sees the friendly bubble
+					// derived from CodeFromError; this is the only place the
+					// underlying shape (which drives both the retry verdict and
+					// the failure label) is recoverable for the next incident.
+					fmt.Fprintf(os.Stderr, "[agent] LLM turn failed terminally iter=%d attempt=%d continuation=%d retryable=%t code=%q err_type=%T err=%q\n",
+						i, attempt, continuationCount, isRetryableLLMError(err), runstatus.CodeFromError(err), err, err.Error())
 					setRunStatus(runstatus.CodeFromError(err), false)
 					return "", usage, fmt.Errorf("LLM call failed: %w", err)
 				}
@@ -3692,6 +3710,17 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if isTruncated && resp.OutputText != "" && continuationCount < maxContinuations {
 				continuationCount++
 				truncatedText.WriteString(resp.OutputText)
+				// Telemetry (NOT a fix): the next loop iteration re-issues a
+				// fresh request to continue the truncated output. The
+				// continuation gap is where the incident's transport failure +
+				// cold-cache restart occurred. Record this turn's cache warmth
+				// (cache_read) and the cache-routing inputs so a cold restart on
+				// the continuation call is correlatable. The gateway sets the
+				// prompt-cache breakpoints server-side keyed on session_id +
+				// cache_source (the daemon does not set breakpoints on the wire),
+				// so a cold restart here points at gateway-side cache routing.
+				fmt.Fprintf(os.Stderr, "[agent] max_tokens continuation iter=%d continuation=%d/%d cache_read=%d session_id=%q cache_source=%q streaming=%t\n",
+					i, continuationCount, maxContinuations, resp.Usage.CacheReadTokens, a.sessionID, a.cacheSource, a.enableStreaming && a.handler != nil)
 				// buildAssistantMessage preserves thinking blocks across the
 				// continuation boundary; falls back to a text-only message
 				// when ContentBlocks is empty (legacy Cloud path). The empty
@@ -4737,15 +4766,13 @@ func isRetryableLLMError(err error) bool {
 			return false
 		}
 	}
-	// Network-level and stream-layer failures (timeout, connection reset, etc.)
-	msg := err.Error()
-	if strings.Contains(msg, "request failed:") {
-		return true
-	}
-	if strings.Contains(msg, "stream read error:") || strings.Contains(msg, "stream ended without done event") {
-		return true
-	}
-	return false
+	// Network-level and stream-layer failures (dial/connection error, mid-stream
+	// read error, premature stream end, truncated-body decode). Delegated to the
+	// shared shape classifier so the retry decision and the user-facing failure
+	// label (runstatus.codeAndDetailFromError) agree on what a transport error
+	// is. ErrStreamIdleTimeout is a transport shape but the veto above keeps it
+	// non-retryable — retrying a silent idle timeout just re-hangs.
+	return client.TransportErrorShape(err)
 }
 
 // classifyLLMError returns a human-readable reason for an LLM error.
