@@ -193,7 +193,7 @@ func TestRenderHTML_DisallowedImageMediaTypeDropped(t *testing.T) {
 	}
 }
 
-func TestRenderHTML_ToolUseFolded(t *testing.T) {
+func TestRenderHTML_ToolUseOmitted(t *testing.T) {
 	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
 	input, _ := json.Marshal(map[string]any{"command": "ls -la"})
 	in := RenderInput{
@@ -210,15 +210,14 @@ func TestRenderHTML_ToolUseFolded(t *testing.T) {
 		t.Fatalf("RenderHTML: %v", err)
 	}
 	out := string(html)
-	mustContain(t, out, `<details class="tool">`)
-	mustContain(t, out, "tool call") // badge label in the new template
-	mustContain(t, out, "bash")
-	mustContain(t, out, "ls -la")
-	// The <pre> wrapping should be present so the JSON renders monospace.
-	mustContain(t, out, "<pre>")
+	// Tool execution detail is omitted entirely from shares — no tool <details>,
+	// no "tool call" badge, no tool name, no input JSON.
+	mustNotContain(t, out, `class="tool"`)
+	mustNotContain(t, out, "tool call")
+	mustNotContain(t, out, "ls -la")
 }
 
-func TestRenderHTML_ToolResultErrorClass(t *testing.T) {
+func TestRenderHTML_ToolResultTextOmitted(t *testing.T) {
 	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
 	in := RenderInput{
 		Session: sess,
@@ -234,16 +233,12 @@ func TestRenderHTML_ToolResultErrorClass(t *testing.T) {
 		t.Fatalf("RenderHTML: %v", err)
 	}
 	out := string(html)
-	mustContain(t, out, "tool error") // class indicator on <details>
-	mustContain(t, out, "boom")       // the error text itself, in <pre>
-	// The badge text "error" appears for IsError tool_results in the new
-	// template; a more precise assertion than the previous "(error)" literal.
-	if !strings.Contains(out, `<span class="badge">error</span>`) {
-		t.Fatalf("expected error badge, sample:\n%s", snippet(out))
-	}
+	// The textual tool output (and the error badge/class) is dropped from shares.
+	mustNotContain(t, out, "boom")
+	mustNotContain(t, out, `<span class="badge">error</span>`)
 }
 
-func TestRenderHTML_ToolResultNestedImage(t *testing.T) {
+func TestRenderHTML_ToolResultNestedImageKept(t *testing.T) {
 	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
 	in := RenderInput{
 		Session: sess,
@@ -266,8 +261,128 @@ func TestRenderHTML_ToolResultNestedImage(t *testing.T) {
 		t.Fatalf("RenderHTML: %v", err)
 	}
 	out := string(html)
-	mustContain(t, out, "screenshot below")
+	// The tool's text output is dropped, but images it produced are kept.
+	mustNotContain(t, out, "screenshot below")
 	mustContain(t, out, `src="data:image/png;base64,PNG"`)
+	// A pure tool_result message bearing only an image is re-tagged to the
+	// "tool" role and rendered outside any user-typed bubble.
+	mustContain(t, out, `<article class="msg tool">`)
+}
+
+// An assistant turn that both narrates and calls a tool should keep the prose
+// while dropping the tool call — the common "let me run X" shape.
+func TestRenderHTML_AssistantTextKeptToolUseDropped(t *testing.T) {
+	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
+	input, _ := json.Marshal(map[string]any{"command": "ls -la"})
+	in := RenderInput{
+		Session: sess,
+		Messages: []client.Message{{
+			Role: "assistant",
+			Content: client.NewBlockContent([]client.ContentBlock{
+				{Type: "text", Text: "Let me list the directory."},
+				{Type: "tool_use", ID: "toolu_1", Name: "bash", Input: input},
+			}),
+		}},
+	}
+	html, err := RenderHTML(in)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	out := string(html)
+	mustContain(t, out, "Let me list the directory.")
+	mustNotContain(t, out, "ls -la")
+	mustNotContain(t, out, `class="tool"`)
+}
+
+// An html-artifact fence in assistant text renders as a sandboxed iframe, with
+// the artifact markup confined to the (attribute-escaped) srcdoc — never as an
+// active top-level element on the share page.
+func TestRenderHTML_ArtifactRendersInSandboxedIframe(t *testing.T) {
+	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
+	body := "Here is the chart:\n\n" +
+		"```html-artifact title=\"Q1\" id=art_q1 mime=text/html\n" +
+		"<div id=c></div><script>render('c')</script>\n" +
+		"```\n"
+	in := RenderInput{
+		Session:  sess,
+		Messages: []client.Message{{Role: "assistant", Content: client.NewTextContent(body)}},
+	}
+	html, err := RenderHTML(in)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	out := string(html)
+
+	// Surrounding prose still renders.
+	mustContain(t, out, "Here is the chart:")
+	// A sandboxed iframe is emitted, WITHOUT same-origin or popup escalation
+	// (matching Desktop's iframe config).
+	mustContain(t, out, "<iframe")
+	mustContain(t, out, `sandbox="allow-scripts"`)
+	mustNotContain(t, out, "allow-same-origin")
+	mustNotContain(t, out, "allow-popups")
+	// data-artifact-id is render-assigned (art_N), not the fence's own id.
+	mustContain(t, out, `data-artifact-id="art_1"`)
+	// The Desktop design-system preset is injected into the srcdoc so the
+	// fragment's var(--color-*) / .c-* references resolve. Tokens appear
+	// attribute-escaped inside srcdoc.
+	mustContain(t, out, "--color-background-primary")
+	mustContain(t, out, "kocoro-content")
+	// CSP meta is present (single quotes attribute-escaped to &#39;).
+	mustContain(t, out, "Content-Security-Policy")
+	mustContain(t, out, "default-src")
+	// The artifact's own <script> must be confined to the srcdoc attribute as
+	// escaped text — it must NOT appear as a live top-level script element with
+	// the artifact's body. html/template attribute-escapes "<" to "&lt;".
+	mustContain(t, out, "&lt;script&gt;render(")
+	mustNotContain(t, out, "<script>render('c')</script>")
+}
+
+// Artifacts must get distinct data-artifact-id values even when the model
+// reuses the SAME fence id across turns (Desktop's "update in place" idiom) —
+// a share page shows each version as its own iframe, and a duplicated id would
+// leave all but the first clipped at min-height by the resize listener.
+func TestRenderHTML_ArtifactIDsUniqueAcrossMessages(t *testing.T) {
+	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
+	// Same explicit id=dup in both messages.
+	art := func() string { return "```html-artifact title=X id=dup\n<p>x</p>\n```\n" }
+	in := RenderInput{
+		Session: sess,
+		Messages: []client.Message{
+			{Role: "assistant", Content: client.NewTextContent(art())},
+			{Role: "assistant", Content: client.NewTextContent(art())},
+		},
+	}
+	html, err := RenderHTML(in)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	out := string(html)
+	mustContain(t, out, `data-artifact-id="art_1"`)
+	mustContain(t, out, `data-artifact-id="art_2"`)
+	// The reused fence id must NOT become the element id (it would collide).
+	mustNotContain(t, out, `data-artifact-id="dup"`)
+}
+
+// A plain ```html fence is NOT an artifact: it stays a source code block, no iframe.
+func TestRenderHTML_PlainHTMLFenceStaysCode(t *testing.T) {
+	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
+	body := "example:\n\n```html\n<div>just code</div>\n```\n"
+	in := RenderInput{
+		Session:  sess,
+		Messages: []client.Message{{Role: "assistant", Content: client.NewTextContent(body)}},
+	}
+	html, err := RenderHTML(in)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	out := string(html)
+	mustContain(t, out, "<pre><code")
+	mustContain(t, out, "&lt;div&gt;just code")
+	// No artifact iframe for a plain html fence. A literal "<iframe" only ever
+	// comes from a rendered artifact (the autosize script / CSS reference the
+	// selector and class as strings, never as a literal "<iframe" element).
+	mustNotContain(t, out, "<iframe")
 }
 
 func TestRenderHTML_TextEscapesHTMLAndScripts(t *testing.T) {
@@ -655,11 +770,12 @@ func TestRenderHTML_OGTitleEscaping(t *testing.T) {
 	// HTML-escapes "<" to "<" by default, which is what we rely on for
 	// the security property. Assert the literal didn't slip through.
 	if strings.Contains(out, `</script>`) {
-		// Count occurrences: the legitimate closing `</script>` for the
-		// JSON-LD block and the legitimate one for the localizer script
-		// are expected. Title-derived `</script>` would be a third+ hit.
+		// Count occurrences: three legitimate closing `</script>` tags are
+		// expected — the JSON-LD block, the timestamp localizer, and the
+		// artifact-autosize listener. Title-derived `</script>` would be a
+		// fourth+ hit.
 		got := strings.Count(out, `</script>`)
-		if got > 2 {
+		if got > 3 {
 			t.Fatalf("title-injected </script> appears to have leaked (count=%d):\n%s", got, snippet(out))
 		}
 	}
@@ -868,6 +984,13 @@ func mustContain(t *testing.T, haystack, needle string) {
 	t.Helper()
 	if !strings.Contains(haystack, needle) {
 		t.Fatalf("output missing %q. Sample:\n%s", needle, snippet(haystack))
+	}
+}
+
+func mustNotContain(t *testing.T, haystack, needle string) {
+	t.Helper()
+	if strings.Contains(haystack, needle) {
+		t.Fatalf("output unexpectedly contains %q. Sample:\n%s", needle, snippet(haystack))
 	}
 }
 

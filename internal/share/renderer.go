@@ -119,18 +119,26 @@ type viewMessage struct {
 // viewBlock is the rendered form of one content block. Only the field(s)
 // relevant to the Kind are populated; the template switches on Kind.
 type viewBlock struct {
-	Kind string // "text" / "image" / "tool_use" / "tool_result"
+	Kind string // "text" / "image" / "tool_image" / "artifact"
 	// HTML carries markdown-rendered content for text blocks. Used for both
 	// user and assistant text — most user inputs are short plain prose that
 	// markdown leaves untouched, and assistant output benefits from heading/
 	// list/code-fence formatting.
-	HTML              template.HTML
-	ImageDataURI      template.URL
-	ToolName          string
-	ToolInput         string // pretty-printed JSON for <pre>
-	ToolResultText    string // raw terminal-style output for <pre>
-	ToolResultIsError bool
-	NestedImages      []template.URL
+	HTML         template.HTML
+	ImageDataURI template.URL
+	// NestedImages carries images a tool produced (tool_image kind). The tool's
+	// textual input/output is intentionally not rendered on shared pages.
+	NestedImages []template.URL
+
+	// Artifact fields (Kind == "artifact"): an html-artifact fence the model
+	// emitted, rendered live inside a sandboxed iframe (see buildArtifactSrcdoc).
+	ArtifactTitle string
+	ArtifactID    string
+	// ArtifactSrcdoc is a PLAIN string on purpose: the template writes it into
+	// srcdoc="{{.ArtifactSrcdoc}}" and html/template attribute-escapes it. Do NOT
+	// change this to template.HTML — that would inject the artifact's raw markup
+	// into the share page itself instead of into the isolated iframe.
+	ArtifactSrcdoc string
 }
 
 func buildViewData(in RenderInput) viewData {
@@ -289,6 +297,9 @@ func agentNameFromSession(sess *session.Session) string {
 
 func buildViewMessages(msgs []client.Message, meta []session.MessageMeta) []viewMessage {
 	out := make([]viewMessage, 0, len(msgs))
+	// artifactSeq numbers auto-id'd artifacts across the WHOLE render so their
+	// data-artifact-id values are unique (the resize listener matches by id).
+	artifactSeq := 0
 	for i, m := range msgs {
 		var mm session.MessageMeta
 		if i < len(meta) {
@@ -300,7 +311,7 @@ func buildViewMessages(msgs []client.Message, meta []session.MessageMeta) []view
 			role = "system"
 		}
 
-		blocks := buildViewBlocks(m)
+		blocks := buildViewBlocks(m, &artifactSeq)
 		if len(blocks) == 0 {
 			continue
 		}
@@ -335,13 +346,15 @@ func buildViewMessages(msgs []client.Message, meta []session.MessageMeta) []view
 	return out
 }
 
-// partitionForBubble splits the blocks into the bubble portion (text + image,
-// the kinds that represent direct conversation content) and the aside portion
-// (tool_use + tool_result, rendered outside the bubble as collapsible details).
+// partitionForBubble splits the blocks into the bubble portion (text + image +
+// artifact, the kinds that represent direct conversation content) and the aside
+// portion (tool_image — images a tool produced, rendered outside the
+// conversation bubble). Tool call inputs and textual outputs are dropped before
+// this point.
 func partitionForBubble(blocks []viewBlock) (bubble, aside []viewBlock) {
 	for _, b := range blocks {
 		switch b.Kind {
-		case "text", "image":
+		case "text", "image", "artifact":
 			bubble = append(bubble, b)
 		default:
 			aside = append(aside, b)
@@ -363,22 +376,60 @@ func roleLabel(role string) string {
 	}
 }
 
-func buildViewBlocks(m client.Message) []viewBlock {
+func buildViewBlocks(m client.Message, artifactSeq *int) []viewBlock {
 	if !m.Content.HasBlocks() {
-		text := m.Content.Text()
-		if strings.TrimSpace(text) == "" {
-			return nil
-		}
-		return []viewBlock{{Kind: "text", HTML: renderMarkdown(text)}}
+		return textToViewBlocks(m.Content.Text(), artifactSeq)
 	}
 
 	out := make([]viewBlock, 0, len(m.Content.Blocks()))
 	for _, b := range m.Content.Blocks() {
+		// Text blocks may carry html-artifact fences, so they expand into one or
+		// more view blocks (prose + rendered artifacts) rather than a single one.
+		if b.Type == "text" {
+			out = append(out, textToViewBlocks(b.Text, artifactSeq)...)
+			continue
+		}
 		vb, ok := renderBlock(b)
 		if !ok {
 			continue
 		}
 		out = append(out, vb)
+	}
+	return out
+}
+
+// textToViewBlocks renders an assistant/user text body, splitting out
+// html-artifact fences into live sandboxed-iframe blocks while the surrounding
+// prose renders as markdown. Returns nil for blank input.
+//
+// artifactSeq is a render-wide counter that mints the data-artifact-id for EVERY
+// artifact (art_1, art_2, ...). We deliberately ignore the fence's own `id`:
+// Desktop reuses a stable id to update an artifact in place, but a share page
+// shows every version as its own iframe, so each needs a unique id for the
+// resize listener to size it. A duplicated id would leave all but the first
+// iframe clipped at min-height.
+func textToViewBlocks(text string, artifactSeq *int) []viewBlock {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	segs := splitArtifacts(text)
+	out := make([]viewBlock, 0, len(segs))
+	for _, s := range segs {
+		if s.IsArtifact {
+			*artifactSeq++
+			id := fmt.Sprintf("art_%d", *artifactSeq)
+			out = append(out, viewBlock{
+				Kind:           "artifact",
+				ArtifactTitle:  s.Title,
+				ArtifactID:     id,
+				ArtifactSrcdoc: buildArtifactSrcdoc(s.Content, id),
+			})
+			continue
+		}
+		if strings.TrimSpace(s.Markdown) == "" {
+			continue
+		}
+		out = append(out, viewBlock{Kind: "text", HTML: renderMarkdown(s.Markdown)})
 	}
 	return out
 }
@@ -399,23 +450,20 @@ func renderBlock(b client.ContentBlock) (viewBlock, bool) {
 		return viewBlock{Kind: "image", ImageDataURI: uri}, true
 
 	case "tool_use":
-		return viewBlock{
-			Kind:      "tool_use",
-			ToolName:  b.Name,
-			ToolInput: prettyToolInput(b.Input),
-		}, true
+		// Tool execution detail (the call input) is intentionally omitted from
+		// public shares — it's noise between the actual conversation and can
+		// leak unnecessary execution internals.
+		return viewBlock{}, false
 
 	case "tool_result":
-		text, images := flattenToolResult(b.ToolContent)
-		// Tool results stay as raw <pre> text (terminal-style) rather than
-		// markdown — they're usually CLI / file dumps and shouldn't grow
-		// headings or bold from accidental hash/asterisk characters.
-		return viewBlock{
-			Kind:              "tool_result",
-			ToolResultText:    text,
-			NestedImages:      images,
-			ToolResultIsError: b.IsError,
-		}, true
+		// Drop the textual tool output (CLI / file dumps, error text) from
+		// shares, but keep any images the tool produced (generate_image,
+		// screenshots, ...) — those are visual content worth showing.
+		_, images := flattenToolResult(b.ToolContent)
+		if len(images) == 0 {
+			return viewBlock{}, false
+		}
+		return viewBlock{Kind: "tool_image", NestedImages: images}, true
 
 	default:
 		return viewBlock{}, false
@@ -436,22 +484,6 @@ func imageDataURI(src *client.ImageSource) (template.URL, bool) {
 	//   (b) MediaType is whitelisted above to a fixed set of image MIME types;
 	//   (c) src.Data is base64 — at worst a malformed image, not script.
 	return template.URL("data:" + mt + ";base64," + src.Data), true
-}
-
-func prettyToolInput(raw json.RawMessage) string {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) {
-		return ""
-	}
-	var v any
-	if err := json.Unmarshal(trimmed, &v); err != nil {
-		return string(trimmed)
-	}
-	pretty, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return string(trimmed)
-	}
-	return string(pretty)
 }
 
 // flattenToolResult converts a sanitized tool_result ToolContent into the

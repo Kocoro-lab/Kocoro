@@ -355,79 +355,24 @@
     display: block;
   }
 
-  /* ===== Tool calls — folded by default, muted styling ===== */
-  details.tool {
-    margin: 10px 0;
-    background: var(--surface-2);
-    border: 1px solid var(--border-soft);
-    border-radius: 8px;
-    overflow: hidden;
+  /* html-artifact widgets, rendered live in a sandboxed iframe. The iframe's
+     own design system lives inside its srcdoc (mirrored from Desktop); these
+     rules only frame it on the share page. Height is set by the autosize
+     listener from the iframe's posted scrollHeight. */
+  figure.artifact {
+    margin: 12px 0;
   }
-  details.tool > summary {
-    padding: 9px 14px;
-    cursor: pointer;
+  figure.artifact .artifact-title {
     font-size: 12.5px;
     color: var(--muted);
-    list-style: none;
-    user-select: none;
-    transition: background 0.12s ease;
+    margin-bottom: 6px;
   }
-  details.tool > summary::-webkit-details-marker { display: none; }
-  details.tool > summary::before {
-    content: "▸";
-    display: inline-block;
-    margin-right: 8px;
-    color: var(--muted);
-    font-size: 9px;
-    transform: translateY(-1px);
-    transition: transform 0.15s ease;
-  }
-  details.tool[open] > summary::before { transform: rotate(90deg) translateX(-1px); }
-  details.tool > summary:hover { background: var(--surface); }
-  details.tool > summary .name {
-    color: var(--fg);
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12.5px;
-  }
-  details.tool > summary .badge {
-    display: inline-block;
-    margin-left: 6px;
-    padding: 1px 6px;
-    background: var(--code-bg);
-    color: var(--muted);
-    border-radius: 4px;
-    font-size: 11px;
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  }
-  details.tool .tool-body {
-    padding: 0 14px 12px;
-  }
-  details.tool pre {
-    margin: 8px 0 0;
-    padding: 12px 14px;
-    background: var(--code-bg);
-    border-radius: 6px;
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12.5px;
-    line-height: 1.55;
-    color: var(--code-fg);
-    overflow-x: auto;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    max-height: 480px;
-  }
-  details.tool img {
-    max-width: 100%;
-    height: auto;
-    margin: 8px 0 0;
-    border-radius: 6px;
-    border: 1px solid var(--border-soft);
-  }
-  details.tool.error > summary .name { color: #B84A2A; }
-  details.tool.error > summary .badge { background: #FBE5DC; color: #B84A2A; }
-  @media (prefers-color-scheme: dark) {
-    details.tool.error > summary .name { color: #E37553; }
-    details.tool.error > summary .badge { background: #3D1F14; color: #E37553; }
+  iframe.kocoro-artifact {
+    width: 100%;
+    min-height: 120px;
+    border: 0;
+    display: block;
+    background: transparent;
   }
 
   /* ===== Footer ===== */
@@ -486,6 +431,7 @@
       {{range .BubbleBlocks}}
         {{if eq .Kind "text"}}<div class="content">{{.HTML}}</div>{{end}}
         {{if eq .Kind "image"}}<img class="msg-image" src="{{.ImageDataURI}}" alt="attached image" loading="lazy">{{end}}
+        {{if eq .Kind "artifact"}}{{template "artifact" .}}{{end}}
       {{end}}
     </div>
   {{else if .BubbleBlocks}}
@@ -495,6 +441,7 @@
     {{range .BubbleBlocks}}
       {{if eq .Kind "text"}}<div class="content">{{.HTML}}</div>{{end}}
       {{if eq .Kind "image"}}<img class="msg-image" src="{{.ImageDataURI}}" alt="attached image" loading="lazy">{{end}}
+      {{if eq .Kind "artifact"}}{{template "artifact" .}}{{end}}
     {{end}}
   {{end}}
   {{if .AsideBlocks}}
@@ -504,22 +451,8 @@
       </div>
     {{end}}
     {{range .AsideBlocks}}
-      {{if eq .Kind "tool_use"}}
-        <details class="tool">
-          <summary><span class="name">{{.ToolName}}</span><span class="badge">tool call</span></summary>
-          <div class="tool-body">
-            {{if .ToolInput}}<pre>{{.ToolInput}}</pre>{{end}}
-          </div>
-        </details>
-      {{end}}
-      {{if eq .Kind "tool_result"}}
-        <details class="tool{{if .ToolResultIsError}} error{{end}}">
-          <summary><span class="name">tool result</span><span class="badge">{{if .ToolResultIsError}}error{{else}}output{{end}}</span></summary>
-          <div class="tool-body">
-            {{if .ToolResultText}}<pre>{{.ToolResultText}}</pre>{{end}}
-            {{range .NestedImages}}<img src="{{.}}" alt="tool image" loading="lazy">{{end}}
-          </div>
-        </details>
+      {{if eq .Kind "tool_image"}}
+        {{range .NestedImages}}<img class="msg-image" src="{{.}}" alt="tool image" loading="lazy">{{end}}
       {{end}}
     {{end}}
   {{end}}
@@ -577,5 +510,36 @@
   }
 })();
 </script>
+
+{{/*
+  artifact-autosize: html-artifact iframes are sandboxed WITHOUT allow-same-origin,
+  so they live in a null origin and we cannot read their content height directly.
+  The wrapper document's bridge (buildArtifactSrcdoc) posts a kocoro-artifact-resize
+  message with its scrollHeight; we match the sender to its iframe by
+  data-artifact-id and set the height. This mirrors the receiver in Desktop's
+  message-list.js. kocoro-artifact-error / -csp messages are ignored here.
+*/}}
+<script id="artifact-autosize">
+(function() {
+  window.addEventListener('message', function(e) {
+    var d = e.data;
+    if (!d || d.type !== 'kocoro-artifact-resize' || typeof d.id !== 'string') return;
+    var sel = 'iframe.kocoro-artifact[data-artifact-id="' + (window.CSS && CSS.escape ? CSS.escape(d.id) : d.id) + '"]';
+    var f = document.querySelector(sel);
+    if (f && typeof d.height === 'number') f.style.height = Math.max(Math.ceil(d.height), 80) + 'px';
+  });
+})();
+</script>
 </body>
 </html>
+
+{{define "artifact"}}
+<figure class="artifact">
+  {{if .ArtifactTitle}}<figcaption class="artifact-title">{{.ArtifactTitle}}</figcaption>{{end}}
+  <iframe class="kocoro-artifact" loading="lazy"
+          sandbox="allow-scripts"
+          data-artifact-id="{{.ArtifactID}}"
+          title="{{.ArtifactTitle}}"
+          srcdoc="{{.ArtifactSrcdoc}}"></iframe>
+</figure>
+{{end}}
