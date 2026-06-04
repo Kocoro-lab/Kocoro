@@ -1,0 +1,35 @@
+/*
+ * html-artifact host stylesheet — the design-system preset injected into every
+ * sandboxed artifact iframe on a shared page.
+ *
+ * SOURCE OF TRUTH: ShanClawDesktop/ShanClaw/Resources/WebView/message-list.js
+ *   (the ARTIFACT_HOST_CSS constant). This file is a VERBATIM mirror so an
+ *   artifact renders identically on the public share page and in Desktop's
+ *   WKWebView. Synced 2026-06-04. If Desktop's design tokens / base styles
+ *   change, re-copy ARTIFACT_HOST_CSS here. See CLAUDE.md (session share).
+ *
+ * Do not hand-edit token values here — change them in Desktop and re-sync.
+ */
+:root{--color-background-primary:#fff;--color-background-secondary:#f7f8fa;--color-background-tertiary:#eef0f4;--color-background-info:#e6f1fb;--color-background-danger:#fceaea;--color-background-success:#eaf3de;--color-background-warning:#faeeda;--color-text-primary:#111418;--color-text-secondary:#5b6575;--color-text-tertiary:#8b95a4;--color-text-info:#0c447c;--color-text-danger:#a32d2d;--color-text-success:#3b6d11;--color-text-warning:#854f0b;--color-border-tertiary:rgba(0,0,0,.08);--color-border-secondary:rgba(0,0,0,.16);--color-border-primary:rgba(0,0,0,.24);--color-border-info:#185fa5;--color-border-danger:#e24b4a;--color-border-success:#639922;--color-border-warning:#ba7517;--border-radius-md:8px;--border-radius-lg:12px;--border-radius-xl:16px;--font-sans:-apple-system,"SF Pro",system-ui,sans-serif;--font-serif:"New York","Iowan Old Style",Georgia,serif;--font-mono:"SF Mono",ui-monospace,monospace}
+@media (prefers-color-scheme: dark){:root{--color-background-primary:#1a1d21;--color-background-secondary:#24272c;--color-background-tertiary:#2d3137;--color-background-info:#0c447c;--color-background-danger:#501313;--color-background-success:#173404;--color-background-warning:#412402;--color-text-primary:#e8ebf0;--color-text-secondary:#a8b1bc;--color-text-tertiary:#767f8b;--color-text-info:#b5d4f4;--color-text-danger:#f7c1c1;--color-text-success:#c0dd97;--color-text-warning:#fac775;--color-border-tertiary:rgba(255,255,255,.10);--color-border-secondary:rgba(255,255,255,.20);--color-border-primary:rgba(255,255,255,.30)}}
+body{margin:0;padding:0;font-family:var(--font-sans);font-size:16px;line-height:1.7;color:var(--color-text-primary);background:transparent}
+#kocoro-content{width:100%}
+input[type="text"],input[type="number"],input[type="search"],textarea,select{font:inherit;padding:8px 12px;background:var(--color-background-primary);border:.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);color:var(--color-text-primary)}
+input:focus,textarea:focus,select:focus{outline:0;box-shadow:0 0 0 2px var(--color-border-info)}
+button{font:inherit;padding:8px 14px;background:transparent;border:.5px solid var(--color-border-secondary);border-radius:var(--border-radius-md);color:var(--color-text-primary);cursor:pointer}
+button:hover{background:var(--color-background-secondary)}button:active{transform:scale(.98)}
+input[type="range"]{accent-color:var(--color-border-info)}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.c-blue{background:#E6F1FB;color:#0C447C}.c-blue>rect,.c-blue>circle,.c-blue>ellipse{fill:#E6F1FB;stroke:#185FA5;stroke-width:.5}
+.c-teal{background:#E1F5EE;color:#085041}.c-teal>rect,.c-teal>circle,.c-teal>ellipse{fill:#E1F5EE;stroke:#0F6E56;stroke-width:.5}
+.c-coral{background:#FAECE7;color:#712B13}.c-coral>rect,.c-coral>circle,.c-coral>ellipse{fill:#FAECE7;stroke:#993C1D;stroke-width:.5}
+.c-pink{background:#FBEAF0;color:#72243E}.c-pink>rect,.c-pink>circle,.c-pink>ellipse{fill:#FBEAF0;stroke:#993556;stroke-width:.5}
+.c-purple{background:#EEEDFE;color:#3C3489}.c-purple>rect,.c-purple>circle,.c-purple>ellipse{fill:#EEEDFE;stroke:#534AB7;stroke-width:.5}
+.c-green{background:#EAF3DE;color:#27500A}.c-green>rect,.c-green>circle,.c-green>ellipse{fill:#EAF3DE;stroke:#3B6D11;stroke-width:.5}
+.c-amber{background:#FAEEDA;color:#633806}.c-amber>rect,.c-amber>circle,.c-amber>ellipse{fill:#FAEEDA;stroke:#854F0B;stroke-width:.5}
+.c-red{background:#FCEBEB;color:#791F1F}.c-red>rect,.c-red>circle,.c-red>ellipse{fill:#FCEBEB;stroke:#A32D2D;stroke-width:.5}
+.c-gray{background:#F1EFE8;color:#2C2C2A}.c-gray>rect,.c-gray>circle,.c-gray>ellipse{fill:#F1EFE8;stroke:#444441;stroke-width:.5}
+@media (prefers-color-scheme: dark){.c-blue{background:#0C447C;color:#B5D4F4}.c-blue>rect,.c-blue>circle{fill:#0C447C;stroke:#85B7EB}.c-teal{background:#085041;color:#9FE1CB}.c-teal>rect,.c-teal>circle{fill:#085041;stroke:#5DCAA5}.c-coral{background:#712B13;color:#F5C4B3}.c-coral>rect,.c-coral>circle{fill:#712B13;stroke:#F0997B}.c-pink{background:#72243E;color:#F4C0D1}.c-pink>rect,.c-pink>circle{fill:#72243E;stroke:#ED93B1}.c-purple{background:#3C3489;color:#CECBF6}.c-purple>rect,.c-purple>circle{fill:#3C3489;stroke:#AFA9EC}.c-green{background:#27500A;color:#C0DD97}.c-green>rect,.c-green>circle{fill:#27500A;stroke:#97C459}.c-amber{background:#633806;color:#FAC775}.c-amber>rect,.c-amber>circle{fill:#633806;stroke:#EF9F27}.c-red{background:#791F1F;color:#F7C1C1}.c-red>rect,.c-red>circle{fill:#791F1F;stroke:#F09595}.c-gray{background:#444441;color:#D3D1C7}.c-gray>rect,.c-gray>circle{fill:#444441;stroke:#B4B2A9}}
+text.t{font-family:var(--font-sans);font-size:14px;font-weight:400;fill:var(--color-text-primary)}
+text.ts{font-family:var(--font-sans);font-size:12px;font-weight:400;fill:var(--color-text-secondary)}
+text.th{font-family:var(--font-sans);font-size:14px;font-weight:500;fill:var(--color-text-primary)}
