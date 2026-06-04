@@ -742,6 +742,14 @@ var daemonStartCmd = &cobra.Command{
 				return fmt.Errorf("daemon: desktop_rpc listener failed to start: %w", err)
 			case <-rpcReadyCh:
 				log.Printf("daemon: desktop_rpc listening on %s", rpcSockPath)
+				// Drain rpcErrCh after startup so a post-startup listener
+				// failure (e.g. accept errors, FD exhaustion) surfaces in the
+				// log rather than silently leaving calendar tools broken.
+				go func() {
+					if err := <-rpcErrCh; err != nil {
+						log.Printf("daemon: desktop_rpc listener exited with error: %v; calendar tools unavailable", err)
+					}
+				}()
 			}
 		default:
 			return fmt.Errorf("daemon: --rpc-socket and --rpc-pidfile must be set together (got --rpc-socket=%q --rpc-pidfile=%q)", rpcSockPath, rpcPidfilePath)
