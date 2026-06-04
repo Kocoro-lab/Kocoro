@@ -688,3 +688,48 @@ func TestManager_NewSessionWithID_OverwritesInMemoryButCallerCanResume(t *testin
 		t.Error("NewSessionWithID should not carry forward disk state by itself")
 	}
 }
+
+// TestManager_PatchAutoTitle_SyncsTitleTurnsAgainstSave reproduces the
+// in-memory desync: PatchAutoTitle upgrades the active session's Title but
+// must also bump m.current.TitleTurns, otherwise the next every-turn Save()
+// writes the upgraded Title alongside the STALE placeholder TitleTurns (0),
+// defeating the straggler guard. The assert reloads from disk AFTER a Save()
+// to prove both fields survive the round-trip.
+func TestManager_PatchAutoTitle_SyncsTitleTurnsAgainstSave(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	// Active session mimicking a freshly created placeholder.
+	sess := m.NewSession()
+	id := sess.ID
+	sess.Title = "placeholder"
+	sess.TitleAuto = true
+	sess.TitleTurns = 0
+	if err := m.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	wrote, err := m.PatchAutoTitle(id, "Smart Title", 1)
+	if err != nil || !wrote {
+		t.Fatalf("PatchAutoTitle: wrote=%v err=%v", wrote, err)
+	}
+
+	// The every-turn Save() writes the whole m.current. Without syncing
+	// TitleTurns in PatchAutoTitle, this persists Title="Smart Title" with
+	// the stale TitleTurns=0.
+	if err := m.Save(); err != nil {
+		t.Fatalf("post-patch save: %v", err)
+	}
+
+	got, err := m.Load(id)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Title != "Smart Title" {
+		t.Errorf("Title = %q, want Smart Title", got.Title)
+	}
+	if got.TitleTurns != 1 {
+		t.Errorf("TitleTurns = %d, want 1 (stale value survived Save)", got.TitleTurns)
+	}
+}

@@ -162,18 +162,34 @@ func (m *Manager) PatchTitle(id, title string) error {
 }
 
 // PatchAutoTitle upgrades a machine-derived title via Store.PatchAutoTitle
-// (honoring the user-lock and straggler guards). Syncs the in-memory active
-// session when it matches. Returns whether written.
+// (honoring the user-lock and straggler guards). Returns whether written.
+//
+// The store call's read-modify-write is held under m.mu so it serializes
+// against Save / Reset / TruncateMessages, which write the same JSON file.
+// This method fires async (fire-and-forget around turn completion) while the
+// agent loop's Save() runs every turn, so the disk-write interleave is real:
+// without the lock a stale Store.PatchAutoTitle Load could revert Messages /
+// Usage that a concurrent Save just persisted — message loss, not just a lost
+// title. Store.PatchAutoTitle doesn't call back into Manager, so holding m.mu
+// across it cannot deadlock.
+//
+// Unlike PatchPublishedShares, we do NOT reload m.current from disk: this runs
+// during an active run and m.current may hold in-memory messages not yet
+// Saved, so a reload would clobber them. Instead, sync the in-memory fields
+// directly (the PatchFlags precedent), setting BOTH Title and TitleTurns —
+// otherwise the next Save() writes the upgraded Title with a stale TitleTurns,
+// defeating the straggler guard.
 func (m *Manager) PatchAutoTitle(id, title string, atTurns int) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	wrote, err := m.store.PatchAutoTitle(id, title, atTurns)
 	if err != nil || !wrote {
 		return false, err
 	}
-	m.mu.Lock()
 	if m.current != nil && m.current.ID == id {
 		m.current.Title = title
+		m.current.TitleTurns = atTurns
 	}
-	m.mu.Unlock()
 	return true, nil
 }
 

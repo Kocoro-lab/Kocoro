@@ -940,6 +940,9 @@ func TestPatchAutoTitle(t *testing.T) {
 	if got, _ := store.Load("s1"); got.Title != "Smart Title" {
 		t.Errorf("Title=%q, want Smart Title", got.Title)
 	}
+	if got, _ := store.Load("s1"); got.TitleTurns != 1 {
+		t.Errorf("TitleTurns=%d, want 1", got.TitleTurns)
+	}
 	// user-locked (TitleAuto=false) is never overwritten
 	store.Save(&Session{ID: "s2", Title: "User Named", TitleAuto: false})
 	if ok, _ := store.PatchAutoTitle("s2", "Smart", 1); ok {
