@@ -33,12 +33,39 @@ func TestGenerateTitle(t *testing.T) {
 	}
 }
 
+func TestGenerateTitleErrors(t *testing.T) {
+	// (a) empty transcript → error, title "". A lone system-role message is
+	// skipped by buildTranscript, so the transcript is empty.
+	emptyFC := &fakeCompleter{out: "ignored"}
+	msgs := []client.Message{{Role: "system", Content: client.NewTextContent("you are a bot")}}
+	got, err := GenerateTitle(context.Background(), emptyFC, msgs)
+	if err == nil {
+		t.Errorf("empty transcript: err=nil, want error")
+	}
+	if got != "" {
+		t.Errorf("empty transcript: title=%q, want \"\"", got)
+	}
+
+	// (b) sanitize rejects model output → error, title "". "truncated" is a
+	// rejected marker, so sanitizeTitle returns "".
+	rejectFC := &fakeCompleter{out: "truncated"}
+	got, err = GenerateTitle(context.Background(), rejectFC, []client.Message{
+		{Role: "user", Content: client.NewTextContent("帮我设置一个每分钟跑的任务")},
+	})
+	if err == nil {
+		t.Errorf("rejected output: err=nil, want error")
+	}
+	if got != "" {
+		t.Errorf("rejected output: title=%q, want \"\"", got)
+	}
+}
+
 func TestSanitizeTitle(t *testing.T) {
 	cases := map[string]string{
 		"  Fix login bug  ":          "Fix login bug",
 		"\"Quoted\"":                 "Quoted",
 		"[Incomplete response: ...]": "",
-		strings.Repeat("x", 80):      strings.Repeat("x", 60) + "...",
+		strings.Repeat("x", 80):      strings.Repeat("x", 57) + "...",
 	}
 	for in, want := range cases {
 		if got := sanitizeTitle(in); got != want {

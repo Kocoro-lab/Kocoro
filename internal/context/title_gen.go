@@ -14,8 +14,11 @@ import (
 // (shannon-cloud .../activities/session_title.go); not user-tunable.
 const maxTitleRunes = 60
 
-// maxTitleInputRunes tail-caps the transcript sent to the title model — recent
-// turns matter most; mirrors Claude Code's 1000-char window.
+// maxTitleInputRunes tail-caps the transcript sent to the title model —
+// recent turns matter most (mirrors Claude Code's 1000-char window).
+// Workload: a single chat's first few turns. Symptom if it binds: a long
+// early conversation has its opening dropped from the title input, so the
+// title reflects only the most recent ~1000 runes. Not user-tunable (const).
 const maxTitleInputRunes = 1000
 
 // titleSystemPrompt is adapted from Cloud's title_generator. Language is
@@ -68,7 +71,7 @@ func sanitizeTitle(raw string) string {
 		t = strings.TrimSpace(t[:idx])
 	}
 	if utf8.RuneCountInString(t) > maxTitleRunes {
-		t = string([]rune(t)[:maxTitleRunes]) + "..."
+		t = string([]rune(t)[:maxTitleRunes-3]) + "..."
 	}
 	return t
 }
