@@ -102,6 +102,8 @@ var TitleTriggerTurns = map[int]bool{1: true, 3: true}
 // "Slack"), or "" for interactive sources (desktop/kocoro/empty).
 func SourceLabel(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
+	// Exclusion set mirrors daemon routeTitle (internal/daemon/runner.go);
+	// keep both in sync when adding an interactive (non-IM) source.
 	switch s {
 	case "", "desktop", "shanclaw", "kocoro":
 		return ""

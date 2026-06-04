@@ -99,12 +99,13 @@ func TestDecorateTitle(t *testing.T) {
 type fakePatcher struct {
 	wroteTitle string
 	atTurns    int
+	skip       bool
 }
 
 func (p *fakePatcher) PatchAutoTitle(id, title string, atTurns int) (bool, error) {
 	p.wroteTitle = title
 	p.atTurns = atTurns
-	return true, nil
+	return !p.skip, nil
 }
 
 func TestUpgradeTitle(t *testing.T) {
@@ -117,5 +118,14 @@ func TestUpgradeTitle(t *testing.T) {
 	}
 	if fp.wroteTitle != "Slack · 创建定时任务" || fp.atTurns != 3 {
 		t.Errorf("persisted title=%q turns=%d", fp.wroteTitle, fp.atTurns)
+	}
+}
+
+func TestUpgradeTitleSkipped(t *testing.T) {
+	fc := &fakeCompleter{out: "创建定时任务"}
+	fp := &fakePatcher{skip: true}
+	msgs := []client.Message{{Role: "user", Content: client.NewTextContent("帮我设置任务")}}
+	if got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", msgs, 3); got != "" {
+		t.Errorf("returned %q, want \"\" when patcher skips (locked/straggler)", got)
 	}
 }
