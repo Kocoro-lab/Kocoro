@@ -25,7 +25,7 @@ func classifyAPIError(e *client.APIError) (Code, *Detail) {
 		return parse429(e.Body)
 	case 529:
 		return CodeProviderOverloaded, nil
-	case 500, 502, 503:
+	case 500, 502, 503, 504:
 		return CodeServiceTemporaryError, nil
 	}
 	return CodeUnexpected, nil
