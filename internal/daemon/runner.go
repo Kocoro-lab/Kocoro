@@ -2374,11 +2374,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 
 		// Smart session title: upgrade the placeholder on the first/third
-		// assistant turn, independent of the suggestion gate below. Async +
-		// best-effort; fires only when the session was actually persisted.
-		completedTurns := countAssistantTurns(sess.Messages)
+		// completed conversation turn (final assistant reply — robust to
+		// tool-iteration message inflation). Async, best-effort; fires only
+		// when the session was persisted.
 		if saveErr == nil {
-			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, sess.Messages, completedTurns)
+			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 		}
 
 		// Post-turn prompt suggestion (fire-and-forget). Gated by all of:
@@ -2394,6 +2394,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// prefix and warm-cache pricing on the suggestion call.
 		if saveErr == nil && deps.Suggestions != nil && cfg != nil && cfg.Agent.PromptSuggestion.Enabled {
 			ps := cfg.Agent.PromptSuggestion
+			completedTurns := countAssistantTurns(sess.Messages)
 			// Judge cache warmth on the LAST main-turn LLM call, not the
 			// turn-aggregate `usage` — a multi-tool turn that started cold
 			// but ended warm (last iter ~100% cache_read) should NOT be
@@ -2905,7 +2906,7 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: failed to save assistant message: %v", err)
 		} else {
-			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, sess.Messages, countAssistantTurns(sess.Messages))
+			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 		}
 	}
 

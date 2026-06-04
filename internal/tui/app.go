@@ -1210,7 +1210,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var titleCmd tea.Cmd
 		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) {
 			if sess := m.sessions.Current(); sess != nil {
-				titleCmd = m.generateTitleCmd(sess.ID, sess.Source, sess.Messages, countAssistantTurns(sess.Messages))
+				titleCmd = m.generateTitleCmd(sess.ID, sess.Source, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 			}
 		}
 		// Full clear-and-repaint so the response, usage line, and input bar
@@ -1846,18 +1846,6 @@ func (m *Model) generateTitleCmd(sessionID, source string, msgs []client.Message
 		}
 		return titleGeneratedMsg{sessionID: sessionID, title: final}
 	}
-}
-
-// countAssistantTurns counts assistant messages — the trigger signal for the
-// smart-title upgrade. Local copy: the tui package must not import daemon.
-func countAssistantTurns(messages []client.Message) int {
-	n := 0
-	for _, msg := range messages {
-		if msg.Role == "assistant" {
-			n++
-		}
-	}
-	return n
 }
 
 func markdownCacheKey(text string, width int) string {

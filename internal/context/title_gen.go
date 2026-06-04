@@ -120,6 +120,33 @@ func DecorateTitle(source, smartTitle string) string {
 	return smartTitle
 }
 
+// CountCompletedTurns counts completed conversation turns — assistant messages
+// that are a FINAL reply (no tool_use block). A single user turn that uses
+// tools yields several assistant messages (one tool_use message per iteration)
+// plus the final reply; only the final reply marks a completed turn. Counting
+// raw assistant messages instead would make the TitleTriggerTurns {1,3} gate
+// fire unpredictably — a 1-tool turn yields 2 assistant messages, skipping both
+// triggers. Tool RESULTS arrive as user-role messages and are ignored here.
+func CountCompletedTurns(messages []client.Message) int {
+	n := 0
+	for _, m := range messages {
+		if m.Role != "assistant" {
+			continue
+		}
+		final := true
+		for _, b := range m.Content.Blocks() {
+			if b.Type == "tool_use" {
+				final = false
+				break
+			}
+		}
+		if final {
+			n++
+		}
+	}
+	return n
+}
+
 // UpgradeTitle generates a smart title, decorates it for the source, and
 // persists it via the patcher. Best-effort: returns the final title written,
 // or "" if generation failed / the patcher skipped (locked / straggler). The

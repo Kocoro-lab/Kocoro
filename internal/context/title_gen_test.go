@@ -121,6 +121,46 @@ func TestUpgradeTitle(t *testing.T) {
 	}
 }
 
+func TestCountCompletedTurns(t *testing.T) {
+	toolUse := client.NewBlockContent([]client.ContentBlock{{Type: "tool_use", ID: "t1", Name: "bash"}})
+	toolResult := client.NewBlockContent([]client.ContentBlock{{Type: "tool_result", ToolUseID: "t1"}})
+
+	// A single 1-tool turn: user, assistant(tool_use), user(tool_result), assistant(final text).
+	oneTool := []client.Message{
+		{Role: "user", Content: client.NewTextContent("do X")},
+		{Role: "assistant", Content: toolUse},
+		{Role: "user", Content: toolResult},
+		{Role: "assistant", Content: client.NewTextContent("done")},
+	}
+	if got := CountCompletedTurns(oneTool); got != 1 {
+		t.Errorf("1-tool turn: got %d, want 1", got)
+	}
+
+	// No-tool turn.
+	noTool := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewTextContent("hello")},
+	}
+	if got := CountCompletedTurns(noTool); got != 1 {
+		t.Errorf("no-tool turn: got %d, want 1", got)
+	}
+
+	// Two turns, second uses two tools — still 2 completed turns.
+	twoTurns := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: client.NewTextContent("hello")},
+		{Role: "user", Content: client.NewTextContent("more")},
+		{Role: "assistant", Content: toolUse},
+		{Role: "user", Content: toolResult},
+		{Role: "assistant", Content: toolUse},
+		{Role: "user", Content: toolResult},
+		{Role: "assistant", Content: client.NewTextContent("final")},
+	}
+	if got := CountCompletedTurns(twoTurns); got != 2 {
+		t.Errorf("two turns (2nd multi-tool): got %d, want 2", got)
+	}
+}
+
 func TestUpgradeTitleSkipped(t *testing.T) {
 	fc := &fakeCompleter{out: "创建定时任务"}
 	fp := &fakePatcher{skip: true}
