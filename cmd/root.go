@@ -421,7 +421,13 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	// the gateway provider (gw is nil under Ollama). Placed after output so the
 	// ~1s upgrade never delays the user-visible reply.
 	if gw != nil && sess.TitleAuto {
-		ctxwin.UpgradeTitle(context.Background(), gw, sessMgr, sess.ID, sess.Source, sess.Messages, 1)
+		// Bound the best-effort title call so a stalled gateway can't hang the
+		// shell prompt after the reply is already printed (the async daemon/TUI
+		// paths use a detached goroutine and don't need this). 10s is generous
+		// for a 64-token Haiku title; on timeout the placeholder persists.
+		titleCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		ctxwin.UpgradeTitle(titleCtx, gw, sessMgr, sess.ID, sess.Source, sess.Messages, 1)
 	}
 	return nil
 }
