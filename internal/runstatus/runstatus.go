@@ -161,7 +161,7 @@ func codeAndDetailFromError(err error) (Code, *Detail) {
 		return CodeRateLimited, nil
 	case strings.Contains(msg, "529") || strings.Contains(msg, "overloaded"):
 		return CodeProviderOverloaded, nil
-	case strings.Contains(msg, "500") || strings.Contains(msg, "502") || strings.Contains(msg, "503"):
+	case strings.Contains(msg, "500") || strings.Contains(msg, "502") || strings.Contains(msg, "503") || strings.Contains(msg, "504"):
 		return CodeServiceTemporaryError, nil
 	case strings.Contains(msg, "request failed:") || strings.Contains(msg, "stream read error"):
 		return CodeNetworkInterrupted, nil

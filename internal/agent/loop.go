@@ -4729,7 +4729,9 @@ func isRetryableLLMError(err error) bool {
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.StatusCode {
-		case 429, 500, 502, 503, 529:
+		// 504 (edge/gateway timeout) is transient like 502/503 — a warm-cache
+		// retry often completes under the timeout where the cold attempt did not.
+		case 429, 500, 502, 503, 504, 529:
 			return true
 		default:
 			return false
@@ -4759,7 +4761,7 @@ func classifyLLMError(err error) string {
 			return "rate limited"
 		case 529:
 			return "API overloaded"
-		case 500, 502, 503:
+		case 500, 502, 503, 504:
 			return "server error"
 		default:
 			return fmt.Sprintf("HTTP %d", apiErr.StatusCode)
