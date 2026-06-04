@@ -929,3 +929,36 @@ func TestStore_Delete_RejectsTraversal(t *testing.T) {
 		}
 	}
 }
+
+func TestPatchAutoTitle(t *testing.T) {
+	store := NewStore(t.TempDir())
+	store.Save(&Session{ID: "s1", Title: "placeholder", TitleAuto: true, TitleTurns: 1})
+	ok, err := store.PatchAutoTitle("s1", "Smart Title", 1)
+	if err != nil || !ok {
+		t.Fatalf("upgrade: ok=%v err=%v", ok, err)
+	}
+	if got, _ := store.Load("s1"); got.Title != "Smart Title" {
+		t.Errorf("Title=%q, want Smart Title", got.Title)
+	}
+	// user-locked (TitleAuto=false) is never overwritten
+	store.Save(&Session{ID: "s2", Title: "User Named", TitleAuto: false})
+	if ok, _ := store.PatchAutoTitle("s2", "Smart", 1); ok {
+		t.Error("locked title overwritten")
+	}
+	// reordered straggler (lower turn count) is skipped
+	store.Save(&Session{ID: "s3", Title: "3rd", TitleAuto: true, TitleTurns: 3})
+	if ok, _ := store.PatchAutoTitle("s3", "1st straggler", 1); ok {
+		t.Error("straggler clobbered richer later title")
+	}
+}
+
+func TestPatchTitleLocksAuto(t *testing.T) {
+	store := NewStore(t.TempDir())
+	store.Save(&Session{ID: "s1", Title: "placeholder", TitleAuto: true})
+	if err := store.PatchTitle("s1", "User Rename"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := store.Load("s1"); got.TitleAuto {
+		t.Error("PatchTitle (user rename) must set TitleAuto=false")
+	}
+}

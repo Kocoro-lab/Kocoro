@@ -161,6 +161,22 @@ func (m *Manager) PatchTitle(id, title string) error {
 	return nil
 }
 
+// PatchAutoTitle upgrades a machine-derived title via Store.PatchAutoTitle
+// (honoring the user-lock and straggler guards). Syncs the in-memory active
+// session when it matches. Returns whether written.
+func (m *Manager) PatchAutoTitle(id, title string, atTurns int) (bool, error) {
+	wrote, err := m.store.PatchAutoTitle(id, title, atTurns)
+	if err != nil || !wrote {
+		return false, err
+	}
+	m.mu.Lock()
+	if m.current != nil && m.current.ID == id {
+		m.current.Title = title
+	}
+	m.mu.Unlock()
+	return true, nil
+}
+
 // PatchFlags updates the pinned/favorite flags of the given session.
 // Either pointer may be nil to leave that flag unchanged. If the target
 // is the active session, the in-memory copy is also updated. Disk is
