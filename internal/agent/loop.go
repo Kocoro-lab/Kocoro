@@ -4761,7 +4761,7 @@ func classifyLLMError(err error) string {
 			return "rate limited"
 		case 529:
 			return "API overloaded"
-		case 500, 502, 503:
+		case 500, 502, 503, 504:
 			return "server error"
 		default:
 			return fmt.Sprintf("HTTP %d", apiErr.StatusCode)

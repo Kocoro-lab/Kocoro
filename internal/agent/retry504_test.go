@@ -41,3 +41,16 @@ func TestIsRetryableLLMError_GatewayClass(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyLLMError_GatewayClass guards that the retry-reason label for a 504
+// matches its 502/503 siblings ("server error") rather than the bare "HTTP 504"
+// default, so the log line and the OnCloudAgent retry message stay consistent
+// across the three places that special-case gateway-class status codes.
+func TestClassifyLLMError_GatewayClass(t *testing.T) {
+	for _, status := range []int{500, 502, 503, 504} {
+		err := &client.APIError{StatusCode: status}
+		if got := classifyLLMError(err); got != "server error" {
+			t.Errorf("classifyLLMError(APIError{%d}) = %q, want %q", status, got, "server error")
+		}
+	}
+}
