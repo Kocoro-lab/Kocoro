@@ -2497,6 +2497,9 @@ func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source
 	if deps == nil || deps.GW == nil || mgr == nil || sessionID == "" || !ctxwin.TitleTriggerTurns[turns] {
 		return
 	}
+	// Shallow copy is sufficient ONLY because every existing message mutator
+	// (e.g. filterOversizeImages) replaces Content wholesale; nothing mutates
+	// a block's text in place on the live slice. Revisit if that changes.
 	msgsCopy := append([]client.Message(nil), msgs...)
 	go func() {
 		defer func() {
