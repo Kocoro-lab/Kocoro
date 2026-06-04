@@ -85,3 +85,51 @@ func buildTitleTranscript(messages []client.Message) string {
 	}
 	return full
 }
+
+// AutoTitlePatcher persists a guarded title upgrade. Satisfied by both
+// *session.Manager (daemon/TUI — also syncs the active session) and
+// *session.Store (one-shot/tests), without this package importing session.
+type AutoTitlePatcher interface {
+	PatchAutoTitle(id, title string, atTurns int) (bool, error)
+}
+
+// TitleTriggerTurns are the assistant-turn counts at which a smart title is
+// (re)generated: turn 1 (upgrade the placeholder) and turn 3 (richer context).
+// Mirrors Claude Code's count==1 / count==3 pattern.
+var TitleTriggerTurns = map[int]bool{1: true, 3: true}
+
+// SourceLabel returns the human label for an IM-style source ("slack" →
+// "Slack"), or "" for interactive sources (desktop/kocoro/empty).
+func SourceLabel(source string) string {
+	s := strings.ToLower(strings.TrimSpace(source))
+	switch s {
+	case "", "desktop", "shanclaw", "kocoro":
+		return ""
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// DecorateTitle prefixes a smart title with its IM source ("Slack · <title>")
+// so IM sessions stay distinguishable by channel while gaining real content.
+func DecorateTitle(source, smartTitle string) string {
+	if label := SourceLabel(source); label != "" {
+		return label + " · " + smartTitle
+	}
+	return smartTitle
+}
+
+// UpgradeTitle generates a smart title, decorates it for the source, and
+// persists it via the patcher. Best-effort: returns the final title written,
+// or "" if generation failed / the patcher skipped (locked / straggler). The
+// caller keeps the existing placeholder on "".
+func UpgradeTitle(ctx context.Context, c Completer, p AutoTitlePatcher, sessionID, source string, msgs []client.Message, atTurns int) string {
+	smart, err := GenerateTitle(ctx, c, msgs)
+	if err != nil {
+		return ""
+	}
+	final := DecorateTitle(source, smart)
+	if ok, err := p.PatchAutoTitle(sessionID, final, atTurns); err != nil || !ok {
+		return ""
+	}
+	return final
+}

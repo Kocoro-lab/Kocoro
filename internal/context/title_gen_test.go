@@ -80,3 +80,42 @@ func TestBuildTitleTranscriptTailCap(t *testing.T) {
 		t.Errorf("len=%d, want <= %d", len([]rune(got)), maxTitleInputRunes)
 	}
 }
+
+func TestDecorateTitle(t *testing.T) {
+	cases := []struct{ src, smart, want string }{
+		{"slack", "创建定时任务", "Slack · 创建定时任务"},
+		{"line", "Daily standup", "Line · Daily standup"},
+		{"desktop", "Daily standup", "Daily standup"},
+		{"", "Daily standup", "Daily standup"},
+		{"kocoro", "Daily standup", "Daily standup"},
+	}
+	for _, c := range cases {
+		if got := DecorateTitle(c.src, c.smart); got != c.want {
+			t.Errorf("DecorateTitle(%q,%q)=%q, want %q", c.src, c.smart, got, c.want)
+		}
+	}
+}
+
+type fakePatcher struct {
+	wroteTitle string
+	atTurns    int
+}
+
+func (p *fakePatcher) PatchAutoTitle(id, title string, atTurns int) (bool, error) {
+	p.wroteTitle = title
+	p.atTurns = atTurns
+	return true, nil
+}
+
+func TestUpgradeTitle(t *testing.T) {
+	fc := &fakeCompleter{out: "创建定时任务"}
+	fp := &fakePatcher{}
+	msgs := []client.Message{{Role: "user", Content: client.NewTextContent("帮我设置任务")}}
+	got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", msgs, 3)
+	if got != "Slack · 创建定时任务" {
+		t.Errorf("returned %q, want Slack · 创建定时任务", got)
+	}
+	if fp.wroteTitle != "Slack · 创建定时任务" || fp.atTurns != 3 {
+		t.Errorf("persisted title=%q turns=%d", fp.wroteTitle, fp.atTurns)
+	}
+}
