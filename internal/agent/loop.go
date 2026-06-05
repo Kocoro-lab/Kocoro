@@ -786,6 +786,14 @@ type AgentLoop struct {
 	// SetInjectFinalDrainFn). Replaces the racy len(injectCh) peek at the
 	// end_turn drain-race guard.
 	injectFinalDrainFn func() []InjectedMessage
+	// systemEventDrain, when set, returns the route's queued SystemEvents to
+	// surface on THIS turn. The loop drains + formats them into a
+	// <system-reminder> block appended to the scaffolded user message at
+	// appendDynamicUserBlocks time. Daemon-wired to SystemEventStore.Drain;
+	// nil for TUI / CLI (no out-of-band channel state). The drained block is
+	// ephemeral — it rides the first-turn scaffold and is removed on persist by
+	// the existing captureRunMessages first-turn strip (see loop_system_event_test).
+	systemEventDrain func() []SystemEvent
 	// mailboxConsumeFn, when set, is invoked with the mailbox row IDs of any
 	// InjectedMessage entries the loop drained mid-turn. The daemon installs
 	// this hook to mark those rows consumed in SQLite + emit queue.flushed
@@ -1268,6 +1276,24 @@ func (a *AgentLoop) SetInjectCh(ch chan InjectedMessage) {
 // falls back to the local filterRetractedInjects(drainInjected).
 func (a *AgentLoop) SetInjectFinalDrainFn(fn func() []InjectedMessage) {
 	a.injectFinalDrainFn = fn
+}
+
+// SetSystemEventDrainFn registers the per-route SystemEvent drain. The loop
+// calls it once per Run at scaffold-build time; the returned events are
+// rendered as a <system-reminder> block on the current user turn and the
+// route's queue is emptied by the drain itself. Pass nil (TUI/CLI) to disable.
+func (a *AgentLoop) SetSystemEventDrainFn(fn func() []SystemEvent) {
+	a.systemEventDrain = fn
+}
+
+// drainAndFormatSystemEvents drains the route's queued system events (if a
+// drain fn is wired) and renders them as a <system-reminder> block. Returns ""
+// when no fn is set or no events are queued.
+func (a *AgentLoop) drainAndFormatSystemEvents() string {
+	if a.systemEventDrain == nil {
+		return ""
+	}
+	return formatSystemEventBlock(a.systemEventDrain())
 }
 
 // finalDrainInjected returns the non-retracted follow-ups to commit at the
