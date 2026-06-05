@@ -389,10 +389,13 @@ func (sc *SessionCache) ActiveSessionIDs() map[string]struct{} {
 }
 
 // ActiveRouteKeysForChannel returns active route keys that reference the given
-// platform and channel. BEST-EFFORT: it substring-matches the channelID within
-// the route key. The daemon route key embeds the platform/channel for IM
-// sources, but a route whose key encodes the channel differently is missed — in
-// that case the per-run ConnectionStateCache render (Session Facts) still
+// platform and channel. BEST-EFFORT: the channelID must appear as a delimited
+// segment of the route key — either an interior `:<channelID>:` segment or the
+// trailing `:<channelID>` suffix — so a query for "C1" does NOT leak onto an
+// unrelated "C123" route (substring match would have, violating route
+// isolation). The daemon route key embeds the platform/channel for IM sources,
+// but a route whose key encodes the channel without `:` delimiters is missed —
+// in that case the per-run ConnectionStateCache render (Session Facts) still
 // surfaces the state, so no awareness is lost, only the immediate injection.
 // channelID == "" (binding/transport events) returns all routes containing the
 // platform token.
@@ -404,8 +407,10 @@ func (sc *SessionCache) ActiveRouteKeysForChannel(platform, channelID string) []
 		if !strings.Contains(key, platform) {
 			continue
 		}
-		if channelID != "" && !strings.Contains(key, channelID) {
-			continue
+		if channelID != "" {
+			if !strings.Contains(key, ":"+channelID+":") && !strings.HasSuffix(key, ":"+channelID) {
+				continue
+			}
 		}
 		out = append(out, key)
 	}
