@@ -59,35 +59,42 @@ func TestFireTitleAfterRun_EmitsSessionTitleUpdated(t *testing.T) {
 	// turns=1 is a TitleTriggerTurns value, so the async upgrade fires.
 	fireTitleAfterRun(deps, mgr, id, "slack", "Wayland", "", msgs, 1)
 
-	// Wait on a real signal (the persisted upgrade) instead of sleeping: poll
-	// the store until the placeholder has been replaced, bounded so a hung
-	// goroutine fails the test rather than hanging the suite.
+	// Wait on the EMITTED EVENT, not the persisted title. The goroutine emits
+	// only AFTER UpgradeTitle returns, but the title lands earlier — inside
+	// UpgradeTitle's PatchAutoTitle. Polling the store would therefore race:
+	// it could observe the new title and check the bus before Emit ran, seeing
+	// zero events (this flaked in CI on slower scheduling). Re-scan the bus each
+	// iteration so a duplicate emit is caught too; bounded so a hung goroutine
+	// fails the test rather than hanging the suite.
 	const want = "Slack · Wayland · Fix The Bug"
+	var titleEvents []json.RawMessage
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		got, err := mgr.Load(id)
-		if err != nil {
-			t.Fatalf("reload: %v", err)
+		titleEvents = titleEvents[:0]
+		for _, evt := range bus.EventsSince(0) {
+			if evt.Type == EventSessionTitleUpdated {
+				titleEvents = append(titleEvents, evt.Payload)
+			}
 		}
-		if got.Title == want {
+		if len(titleEvents) > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("title not upgraded within deadline; got %q, want %q", got.Title, want)
+			t.Fatalf("no %s event within deadline", EventSessionTitleUpdated)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Exactly one session_title_updated event, with the decorated title and
-	// snake_case payload keys.
-	var titleEvents []json.RawMessage
-	for _, evt := range bus.EventsSince(0) {
-		if evt.Type == EventSessionTitleUpdated {
-			titleEvents = append(titleEvents, evt.Payload)
-		}
-	}
+	// Exactly one event (not a duplicate), with the decorated title.
 	if len(titleEvents) != 1 {
 		t.Fatalf("expected exactly 1 %s event, got %d", EventSessionTitleUpdated, len(titleEvents))
+	}
+
+	// The event fires only after PatchAutoTitle persisted, so the title is durable.
+	if got, err := mgr.Load(id); err != nil {
+		t.Fatalf("reload: %v", err)
+	} else if got.Title != want {
+		t.Errorf("persisted title = %q, want %q", got.Title, want)
 	}
 
 	// Assert the raw JSON key NAMES (the wire contract), not just the values.
