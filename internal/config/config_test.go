@@ -474,8 +474,8 @@ func TestPromptSuggestionConfig_Defaults(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 
-	if cfg.Agent.PromptSuggestion.Enabled {
-		t.Error("PromptSuggestion.Enabled should default to false")
+	if !cfg.Agent.PromptSuggestion.Enabled {
+		t.Error("PromptSuggestion.Enabled should default to true")
 	}
 	if cfg.Agent.PromptSuggestion.CacheColdThresholdTokens != 10000 {
 		t.Errorf("CacheColdThresholdTokens default = %d, want 10000",

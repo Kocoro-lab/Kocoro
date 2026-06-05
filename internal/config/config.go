@@ -331,11 +331,11 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.time_based_compact.enabled", false)
 	viper.SetDefault("agent.time_based_compact.gap_threshold_minutes", 60)
 	viper.SetDefault("agent.time_based_compact.keep_recent", 5)
-	// Prompt suggestion (post-turn ghost text). Disabled by default —
-	// when enabled, the daemon runs a forked completion call after each
-	// turn to generate a single 2-12 word follow-up suggestion. See
+	// Prompt suggestion (post-turn ghost text). Enabled by default —
+	// the daemon runs a forked completion call after each turn to
+	// generate a single 2-12 word follow-up suggestion. See
 	// internal/config.PromptSuggestionConfig.
-	viper.SetDefault("agent.prompt_suggestion.enabled", false)
+	viper.SetDefault("agent.prompt_suggestion.enabled", true)
 	viper.SetDefault("agent.prompt_suggestion.cache_cold_threshold_tokens", 10000)
 	viper.SetDefault("agent.prompt_suggestion.min_turns", 2)
 	viper.SetDefault("tools.bash_timeout", 120)
