@@ -1985,7 +1985,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		cancel()
 	}
-	if sticky := buildStickyContext(req.Source, req.Channel, req.Sender, agentName, imBindings, req.StickyContext); sticky != "" {
+	if sticky := stickyFromRequest(req.Source, req.Channel, req.Sender, agentName, imBindings, req.StickyContext, req.IMStatusContext); sticky != "" {
 		loop.SetStickyContext(sticky)
 	}
 
