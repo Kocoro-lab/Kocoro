@@ -196,6 +196,23 @@ func TestWriteAgentConfig_PersistsDisplayName(t *testing.T) {
 	}
 }
 
+func TestAgent_DisplayLabel(t *testing.T) {
+	cases := []struct {
+		name string
+		ag   *Agent
+		want string
+	}{
+		{"display_name set", &Agent{Name: "agent-x", Config: &AgentConfig{DisplayName: "客服"}}, "客服"},
+		{"no config", &Agent{Name: "agent-x"}, "agent-x"},
+		{"empty display_name", &Agent{Name: "agent-x", Config: &AgentConfig{}}, "agent-x"},
+	}
+	for _, tc := range cases {
+		if got := tc.ag.DisplayLabel(); got != tc.want {
+			t.Errorf("%s: DisplayLabel() = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestToAPI_DisplayName(t *testing.T) {
 	// With display_name set in config.
 	withName := &Agent{Name: "agent-aaa111", Prompt: "p",
