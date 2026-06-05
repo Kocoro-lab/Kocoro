@@ -6,6 +6,14 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
 
+// NewChannelStateConsumerForDeps builds the channel_state_event consumer wired
+// to the daemon's connection-state cache, system-event store, and the
+// SessionCache route resolver. Exported so cmd/daemon.go can register it on the
+// Client.
+func NewChannelStateConsumerForDeps(cache *ConnectionStateCache, store *SystemEventStore, sc *SessionCache) func(ChannelStateEventPayload) {
+	return newChannelStateConsumer(cache, store, sc.ActiveRouteKeysForChannel, time.Now)
+}
+
 // newChannelStateConsumer returns the handler wired to the Client's
 // onChannelStateEvent callback. It folds the event into the cache (primary
 // surface, rendered per-run into Session Facts) AND enqueues an immediate S0
