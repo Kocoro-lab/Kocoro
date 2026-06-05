@@ -2367,7 +2367,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			if runtime.GOOS == "darwin" && result != "" && shouldEmitReplyBanner(req.Source) {
 				title := "Kocoro"
 				if agentName != "" {
-					title = "Kocoro · " + agentName
+					// Prefer the user-facing display_name over the opaque
+					// server-generated slug (agent-<hex>) in the banner title.
+					label := agentName
+					if agentOverride != nil && agentOverride.Config != nil && agentOverride.Config.DisplayName != "" {
+						label = agentOverride.Config.DisplayName
+					}
+					title = "Kocoro · " + label
 				}
 				body := truncate(stripMarkdownLite(audit.RedactSecrets(result)), 140)
 				if err := tools.SendBanner(ctx, title, body, false); err != nil {
