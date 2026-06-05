@@ -339,6 +339,16 @@ func ensureSystemEventsRunning() {
     _ = sem.wait(timeout: .now() + 2.0)
 }
 
+/// Opens System Settings at the given Privacy & Security anchor; falls back
+/// to the Privacy & Security root if the anchor deep-link is rejected
+/// (anchor names have drifted across macOS versions).
+func openPrivacySettingsPane(_ anchor: String) {
+    let pane = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)")!
+    if !NSWorkspace.shared.open(pane) {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security")!)
+    }
+}
+
 func requestPermissionCLI(_ permission: String) -> [String: String] {
     switch permission {
     case "accessibility":
@@ -353,13 +363,29 @@ func requestPermissionCLI(_ permission: String) -> [String: String] {
         ]
 
     case "screen_recording":
-        // CGRequestScreenCaptureAccess() triggers the system dialog on first call.
-        // Returns true if already granted.
+        // CGRequestScreenCaptureAccess() shows the consent dialog only the
+        // FIRST time ever (no TCC entry). Once the user denied or dismissed
+        // it, every later call silently returns false with no dialog — the
+        // only recovery is toggling the app in System Settings. Open the
+        // Screen Recording pane as a fallback so a user-initiated request
+        // always has a visible effect (mirrors how the accessibility prompt
+        // guides users to System Settings).
+        //
+        // Known trade-off: the call returns false immediately even on a
+        // genuine first request (it does not block on the user's choice), so
+        // in that one case the consent dialog and System Settings open
+        // together. No public API distinguishes "never prompted" from
+        // "already denied" (CGPreflightScreenCaptureAccess is false for
+        // both), so the extra Settings window on the first attempt is the
+        // accepted cost of making the dead state visible.
         let granted = CGRequestScreenCaptureAccess()
+        if !granted {
+            openPrivacySettingsPane("Privacy_ScreenCapture")
+        }
         return [
             "permission": "screen_recording",
-            "status": granted ? "granted" : "prompted",
-            "message": granted ? "" : "Permission dialog shown. Enable in: System Settings > Privacy & Security > Screen Recording",
+            "status": granted ? "granted" : "requires_settings",
+            "message": granted ? "" : "Enable \"Kocoro AX\" in System Settings > Privacy & Security > Screen Recording, then check again.",
         ]
 
     case "automation":

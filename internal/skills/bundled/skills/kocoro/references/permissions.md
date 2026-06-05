@@ -51,8 +51,8 @@ Permissions control what commands and tools agents are allowed to run. Before ex
 - Method: POST
 - Path: /permissions/request
 - Body: `{"permission": "screen_recording"}`
-- Response: `{"permission": "string", "status": "requested"}`
-- Notes: Triggers the macOS system permission dialog for the user to approve.
+- Response: `{"permission": "string", "status": "granted" | "prompted" | "requires_settings" | "unknown" | "unsupported", "message": "string"}`
+- Notes: `granted` means the permission is already held. `prompted` (accessibility, automation) means a macOS consent dialog was triggered. `requires_settings` (screen_recording) means System Settings was opened at the Screen Recording pane and the user must enable "Kocoro AX" there manually — usually because the one-shot consent dialog was already used; on the very first request a consent dialog may also be on screen, so tell the user to use either. `unknown` means the helper could not be reached. `unsupported` means non-macOS. Relay `message` to the user; do NOT retry the request in a loop (each call may re-open System Settings).
 
 ## Common Scenarios
 
@@ -67,7 +67,7 @@ Permissions control what commands and tools agents are allowed to run. Before ex
 ### "Check if screen recording is enabled (for screenshot tool)"
 1. GET /permissions → look at `screen_recording` field
 2. If `"denied"` or `"not_determined"`: POST /permissions/request with `{"permission": "screen_recording"}`
-3. A macOS dialog will appear — click Allow.
+3. If the response status is `"prompted"`, a macOS dialog appeared — tell the user to click Allow. If it is `"requires_settings"`, System Settings was opened — tell the user to enable "Kocoro AX" under Privacy & Security → Screen Recording. Do not retry in a loop.
 
 ### "See what commands are currently blocked"
 1. GET /config → look at `permissions.denied_commands`
