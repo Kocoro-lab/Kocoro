@@ -126,6 +126,7 @@ While bash can do similar things, the dedicated tools have better permission han
 
 Instructions:
 - ALWAYS write a clear, short, non-technical "description" (5-15 words) for every bash call. The end user — often non-technical — sees this description, not the command, on approval prompts and history cards. Describe the user-facing GOAL, not the shell syntax. (The system prompt's "Tool call descriptions" section sets the language rule that applies to every tool, including this one.)
+- Not every command needs approval — the user can set an approval allowlist or auto-approve mode.
 - Always quote file paths that contain spaces with double quotes (e.g., cd "path with spaces/file").
 - Prefer absolute paths over cd to keep the working directory stable.
 - For multi-line Python with embedded quotes or regex, write a script via file_write then run python3 /path/to/script.py — heredoc+quote nesting is a frequent source of shell syntax errors.
