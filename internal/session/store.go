@@ -62,6 +62,14 @@ type Session struct {
 	// Favorite marks the session as starred for filter views. Independent
 	// of Pinned. Set/cleared via PATCH /sessions/{id} {"favorite": bool}.
 	Favorite bool `json:"favorite,omitempty"`
+	// TitleAuto reports whether Title was machine-derived (first-line
+	// placeholder or LLM upgrade) and may still be overwritten by a later
+	// upgrade. A user rename via PATCH /sessions/{id} sets it false, locking it.
+	TitleAuto bool `json:"title_auto,omitempty"`
+	// TitleTurns is the assistant-turn count at which the current auto Title
+	// was generated. A later upgrade triggered at a LOWER turn count is a
+	// reordered straggler and is skipped.
+	TitleTurns int `json:"title_turns,omitempty"`
 	// PublishedShares is the daemon-side source-of-truth for upload_ids
 	// returned by POST /sessions/{id}/share. The UI is the primary keeper of
 	// these IDs (it sends them back on DELETE /sessions/{id}/share), but UI
@@ -384,6 +392,7 @@ func (s *Store) PatchTitle(id, title string) error {
 		return err
 	}
 	sess.Title = title
+	sess.TitleAuto = false // user rename locks the title against auto-upgrade
 
 	data, err := json.MarshalIndent(sess, "", "  ")
 	if err != nil {
@@ -399,6 +408,35 @@ func (s *Store) PatchTitle(id, title string) error {
 		s.index.UpsertSession(sess)
 	}
 	return nil
+}
+
+// PatchAutoTitle overwrites a machine-derived title with a freshly generated
+// one. Guards: (1) a user-locked title (TitleAuto == false) is never touched;
+// (2) a title already generated at a STRICTLY higher turn count is kept — an
+// equal-or-lower turn re-trigger still overwrites, but turn counts are
+// monotonic per session so in practice only a richer later turn wins.
+// Returns true if written.
+func (s *Store) PatchAutoTitle(id, title string, atTurns int) (bool, error) {
+	sess, err := s.Load(id)
+	if err != nil {
+		return false, err
+	}
+	if !sess.TitleAuto || sess.TitleTurns > atTurns {
+		return false, nil
+	}
+	sess.Title = title
+	sess.TitleTurns = atTurns
+	data, err := json.MarshalIndent(sess, "", "  ")
+	if err != nil {
+		return false, fmt.Errorf("marshal session: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(s.dir, sess.ID+".json"), data, 0600); err != nil {
+		return false, err
+	}
+	if s.index != nil {
+		s.index.UpsertSession(sess)
+	}
+	return true, nil
 }
 
 // PatchFlags re-reads the session from disk, applies any non-nil flag, and

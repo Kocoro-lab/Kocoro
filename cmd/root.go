@@ -22,6 +22,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 	"github.com/Kocoro-lab/ShanClaw/internal/daemon"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
@@ -359,6 +360,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 
 	sess := sessMgr.NewSession()
 	sess.Title = sessionTitleFromQuery(query)
+	sess.TitleAuto = true
 	loop.SetSessionID(sess.ID)
 	sess.CWD = effectiveCWD
 	loop.SetSessionCWD(effectiveCWD)
@@ -412,6 +414,23 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		usageLine += " | " + llm.Model
 	}
 	fmt.Println(usageLine + "]")
+
+	// Smart title: one-shot is single-turn, so generate once (turn 1) now that
+	// the transcript is persisted and the reply is printed. Synchronous — there
+	// is no event loop and the process is about to exit; best-effort. Gated to
+	// the gateway provider (gw is nil under Ollama). Placed after output so the
+	// ~1s upgrade never delays the user-visible reply.
+	if gw != nil && sess.TitleAuto {
+		// Bound the best-effort title call so a stalled gateway can't hang the
+		// shell prompt after the reply is already printed (the async daemon/TUI
+		// paths use a detached goroutine and don't need this). 10s is generous
+		// for a 64-token Haiku title; on timeout the placeholder persists.
+		titleCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// One-shot CLI is a non-IM entry point with no per-sender/channel
+		// distinction; pass "" for both.
+		ctxwin.UpgradeTitle(titleCtx, gw, sessMgr, sess.ID, sess.Source, "", "", sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
+	}
 	return nil
 }
 

@@ -85,6 +85,14 @@ const (
 	// Payload: {route_key, text, attachments:[…]}. UI clients fill `text`
 	// back into their input box.
 	EventCancelRestored = "cancel.restored"
+
+	// EventSessionTitleUpdated fires when the async smart-title upgrade
+	// (fireTitleAfterRun) persists a new title for a session — including
+	// background scheduler runs the user's open window did not trigger.
+	// Payload: {session_id, title}. UI clients (Desktop) refresh the matching
+	// row in their session list so the title stops lagging the placeholder
+	// until the next manual GET /sessions.
+	EventSessionTitleUpdated = "session_title_updated"
 )
 
 // Event is a daemon lifecycle event pushed to SSE subscribers.

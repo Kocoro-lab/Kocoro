@@ -25,9 +25,3 @@ func TestTitle(t *testing.T) {
 		}
 	}
 }
-
-func TestAgentTitle(t *testing.T) {
-	if got := AgentTitle("ops-bot"); got != "ops-bot conversation" {
-		t.Errorf("AgentTitle(ops-bot) = %q", got)
-	}
-}

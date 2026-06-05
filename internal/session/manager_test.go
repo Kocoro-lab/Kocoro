@@ -1,9 +1,11 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -252,6 +254,126 @@ func TestManager_ResumeLatestMatching_NilPredFallsBackToLatest(t *testing.T) {
 	}
 	if sess == nil || sess.ID != "b" {
 		t.Fatalf("nil pred should resume newest-regardless (b), got %#v", sess)
+	}
+}
+
+// TestManager_PatchAutoTitle_ConcurrentWithSave is the regression guard for
+// the m.mu invariant documented on Manager.PatchAutoTitle (manager.go): the
+// lock serializes the async title upgrade's read-modify-write against the
+// agent loop's every-turn Save(), so a stale Store.PatchAutoTitle Load can't
+// roll back Messages a concurrent Save just persisted (message loss, not just
+// a lost title).
+//
+// Run under `go test -race ./internal/session` — without the lock, the
+// interleaving is both a data race on m.current AND a lost-update on the JSON
+// file. The post-join asserts catch the lost-update even if the race detector
+// is off: the on-disk message count must equal the count the final Save wrote,
+// and the auto-title fields must reflect a consistent final state.
+func TestManager_PatchAutoTitle_ConcurrentWithSave(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	sess := m.NewSession()
+	id := sess.ID
+	sess.Title = "placeholder"
+	sess.TitleAuto = true
+	sess.TitleTurns = 0
+	sess.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("msg-0")},
+	}
+	if err := m.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	const (
+		savers       = 4
+		appendsEach  = 60
+		patchersIter = 240
+	)
+
+	var wg sync.WaitGroup
+
+	// The real runner runs one turn at a time per session, so its "append to
+	// m.current.Messages, then Save()" sequence is single-threaded. turnMu
+	// models that per-session serialization, keeping the savers from racing
+	// each other on the shared slice. The race under test is Save-vs-async
+	// PatchAutoTitle, which turnMu does NOT cover — only Manager.mu does.
+	var turnMu sync.Mutex
+	for s := 0; s < savers; s++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < appendsEach; i++ {
+				turnMu.Lock()
+				// Mutate the live current pointer (the runner appends a turn to
+				// m.Current().Messages), then Save() — exactly the production
+				// "persist a turn" lifecycle.
+				cur := m.Current()
+				cur.Messages = append(cur.Messages, client.Message{
+					Role:    "user",
+					Content: client.NewTextContent(fmt.Sprintf("w%d-%d", worker, i)),
+				})
+				if err := m.Save(); err != nil {
+					turnMu.Unlock()
+					t.Errorf("Save: %v", err)
+					return
+				}
+				turnMu.Unlock()
+			}
+		}(s)
+	}
+
+	// Patcher goroutine: repeatedly upgrades the auto-title at turn 1. This is
+	// the fire-and-forget async upgrade the production comment warns about. Its
+	// internal Store.PatchAutoTitle does a Load-from-disk RMW; without m.mu that
+	// stale Load would clobber the Messages a concurrent Save committed.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < patchersIter; i++ {
+			if _, err := m.PatchAutoTitle(id, "Smart Title", 1); err != nil {
+				t.Errorf("PatchAutoTitle: %v", err)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	wantCount := 1 + savers*appendsEach
+
+	// In-memory state must reflect every append (no lost-update on m.current).
+	cur := m.Current()
+	if cur == nil || cur.ID != id {
+		t.Fatalf("current session = %#v, want id=%s", cur, id)
+	}
+	if len(cur.Messages) != wantCount {
+		t.Fatalf("in-memory message count = %d, want %d (a concurrent PatchAutoTitle rolled back appends)", len(cur.Messages), wantCount)
+	}
+
+	// On-disk state must match: reload via a fresh manager so we read the JSON
+	// the final Save committed, not the in-memory copy.
+	m2 := NewManager(dir)
+	defer m2.Close()
+	loaded, err := m2.Load(id)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(loaded.Messages) != wantCount {
+		t.Fatalf("on-disk message count = %d, want %d (lost-update: a stale PatchAutoTitle Load reverted Messages)", len(loaded.Messages), wantCount)
+	}
+
+	// Auto-title fields must be consistent: the upgrade ran, the title is still
+	// auto (no user lock involved), and TitleTurns is the patched value.
+	if loaded.Title != "Smart Title" {
+		t.Errorf("Title = %q, want Smart Title (upgrade did not stick)", loaded.Title)
+	}
+	if !loaded.TitleAuto {
+		t.Errorf("TitleAuto = false, want true (no user rename happened)")
+	}
+	if loaded.TitleTurns != 1 {
+		t.Errorf("TitleTurns = %d, want 1", loaded.TitleTurns)
 	}
 }
 
@@ -686,5 +808,50 @@ func TestManager_NewSessionWithID_OverwritesInMemoryButCallerCanResume(t *testin
 	blank := m.NewSessionWithID(id)
 	if blank.Title == "first-was-here" {
 		t.Error("NewSessionWithID should not carry forward disk state by itself")
+	}
+}
+
+// TestManager_PatchAutoTitle_SyncsTitleTurnsAgainstSave reproduces the
+// in-memory desync: PatchAutoTitle upgrades the active session's Title but
+// must also bump m.current.TitleTurns, otherwise the next every-turn Save()
+// writes the upgraded Title alongside the STALE placeholder TitleTurns (0),
+// defeating the straggler guard. The assert reloads from disk AFTER a Save()
+// to prove both fields survive the round-trip.
+func TestManager_PatchAutoTitle_SyncsTitleTurnsAgainstSave(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	// Active session mimicking a freshly created placeholder.
+	sess := m.NewSession()
+	id := sess.ID
+	sess.Title = "placeholder"
+	sess.TitleAuto = true
+	sess.TitleTurns = 0
+	if err := m.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	wrote, err := m.PatchAutoTitle(id, "Smart Title", 1)
+	if err != nil || !wrote {
+		t.Fatalf("PatchAutoTitle: wrote=%v err=%v", wrote, err)
+	}
+
+	// The every-turn Save() writes the whole m.current. Without syncing
+	// TitleTurns in PatchAutoTitle, this persists Title="Smart Title" with
+	// the stale TitleTurns=0.
+	if err := m.Save(); err != nil {
+		t.Fatalf("post-patch save: %v", err)
+	}
+
+	got, err := m.Load(id)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Title != "Smart Title" {
+		t.Errorf("Title = %q, want Smart Title", got.Title)
+	}
+	if got.TitleTurns != 1 {
+		t.Errorf("TitleTurns = %d, want 1 (stale value survived Save)", got.TitleTurns)
 	}
 }

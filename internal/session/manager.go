@@ -149,16 +149,57 @@ func (m *Manager) Save() error {
 // If the target is the active session, the in-memory title is also updated.
 // Disk is written first so a failed write won't leave memory inconsistent.
 func (m *Manager) PatchTitle(id, title string) error {
-	err := m.store.PatchTitle(id, title)
-	if err != nil {
+	// Hold m.mu across the store read-modify-write so a user rename serializes
+	// against the async smart-title upgrade (PatchAutoTitle) and Save — all
+	// write the same JSON file. Without the lock, a rename's write could
+	// interleave the auto-upgrade goroutine and drop the TitleAuto=false lock.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.store.PatchTitle(id, title); err != nil {
 		return err
 	}
-	m.mu.Lock()
 	if m.current != nil && m.current.ID == id {
 		m.current.Title = title
 	}
-	m.mu.Unlock()
 	return nil
+}
+
+// PatchAutoTitle upgrades a machine-derived title via Store.PatchAutoTitle
+// (honoring the user-lock and straggler guards). Returns whether written.
+//
+// The store call's read-modify-write is held under m.mu so it serializes
+// against Save / Reset / TruncateMessages, which write the same JSON file.
+// This method fires async (fire-and-forget around turn completion) while the
+// agent loop's Save() runs every turn, so the disk-write interleave is real:
+// without the lock a stale Store.PatchAutoTitle Load could revert Messages /
+// Usage that a concurrent Save just persisted — message loss, not just a lost
+// title. Store.PatchAutoTitle doesn't call back into Manager, so holding m.mu
+// across it cannot deadlock.
+//
+// Unlike PatchPublishedShares, we do NOT reload m.current from disk: this runs
+// during an active run and m.current may hold in-memory messages not yet
+// Saved, so a reload would clobber them. Instead, sync the in-memory fields
+// directly (the PatchFlags precedent), setting BOTH Title and TitleTurns —
+// otherwise the next Save() writes the upgraded Title with a stale TitleTurns,
+// defeating the straggler guard.
+//
+// SCOPE: m.mu only serializes SAME-manager Save-vs-PatchAutoTitle. A user
+// rename racing this upgrade across DIFFERENT *Manager instances (rename's
+// shared sc.managers[dir] vs. the route's own manager) has a residual,
+// accepted lost-update window — see the §6.1 note on
+// daemon.fireTitleAfterRun (internal/daemon/runner.go).
+func (m *Manager) PatchAutoTitle(id, title string, atTurns int) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	wrote, err := m.store.PatchAutoTitle(id, title, atTurns)
+	if err != nil || !wrote {
+		return false, err
+	}
+	if m.current != nil && m.current.ID == id {
+		m.current.Title = title
+		m.current.TitleTurns = atTurns
+	}
+	return true, nil
 }
 
 // PatchFlags updates the pinned/favorite flags of the given session.

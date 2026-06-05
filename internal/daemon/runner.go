@@ -26,6 +26,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
@@ -755,11 +756,14 @@ func routeTitle(source, channel, sender string) string {
 	if s == "" {
 		return ""
 	}
-	switch s {
-	case "desktop", "shanclaw", "kocoro":
+	// Share the brand-casing + interactive-exclusion logic with the upgrade
+	// path (ctxwin.SourceLabel) so the instant placeholder and the smart-title
+	// upgrade label a channel identically (e.g. both "LINE", not "Line" then
+	// "LINE"). "" covers desktop/shanclaw/kocoro/empty.
+	label := ctxwin.SourceLabel(s)
+	if label == "" {
 		return ""
 	}
-	label := strings.ToUpper(s[:1]) + s[1:]
 
 	// Use sender name when available (e.g. "Slack · Wayland")
 	if sender != "" {
@@ -1743,12 +1747,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			sess.Source = req.Source
 			sess.Channel = req.Channel
 		}
-		// Only set source-derived title for non-named-agent routes.
-		// Named agents always get session.AgentTitle in the post-loop block.
-		if sess.Title == "New session" && req.RouteKey != "" && !strings.HasPrefix(req.RouteKey, "agent:") {
-			title := routeTitle(req.Source, req.Channel, req.Sender)
-			if title != "" {
+		// Source-derived title for routed conversations (IM → "Slack · sender",
+		// schedule → "Schedule · scheduler"). Named/default treated identically;
+		// desktop/empty sources yield "" and fall through to the first-line title.
+		if sess.Title == "New session" && req.RouteKey != "" {
+			if title := routeTitle(req.Source, req.Channel, req.Sender); title != "" {
 				sess.Title = title
+				sess.TitleAuto = true
 			}
 		}
 		if err := sessMgr.Save(); err != nil {
@@ -2268,13 +2273,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	// Ephemeral requests skip post-run persistence — the caller owns session lifecycle.
 	if !req.Ephemeral {
-		// Set title from first user message (named agents get a fixed title).
+		// Title from the first user message. Named agents are treated
+		// identically to the default agent — the smart-title upgrade replaces
+		// this placeholder asynchronously.
 		if sess.Title == "New session" {
-			if agentName != "" {
-				sess.Title = session.AgentTitle(agentName)
-			} else {
-				sess.Title = session.Title(prompt)
-			}
+			sess.Title = session.Title(prompt)
+			sess.TitleAuto = true
 		}
 
 		// Final save uses the same (baseline + current snapshot) rebuild as
@@ -2370,6 +2374,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					log.Printf("daemon: reply-complete banner failed (session=%s): %v", sess.ID, err)
 				}
 			}
+		}
+
+		// Smart session title: upgrade the placeholder on the first/third
+		// completed conversation turn (final assistant reply — robust to
+		// tool-iteration message inflation). Async, best-effort; fires only
+		// when the session was persisted.
+		if saveErr == nil {
+			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, req.Sender, req.Channel, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 		}
 
 		// Post-turn prompt suggestion (fire-and-forget). Gated by all of:
@@ -2475,6 +2487,65 @@ func countAssistantTurns(messages []client.Message) int {
 		}
 	}
 	return n
+}
+
+// fireTitleAfterRun launches the smart-title upgrade asynchronously
+// (fire-and-forget, outlives the request ctx — same lifecycle as
+// fireSuggestionAfterRun). mgr (*session.Manager) satisfies
+// ctxwin.AutoTitlePatcher and keeps the active-session title synced.
+// Gated to the first/third assistant turn; a nil dep or out-of-range turn
+// is a silent no-op. UpgradeTitle returns "" on generation failure OR a
+// guarded skip (user-locked / straggler); we log only the successful set,
+// since the skip case is expected (e.g. every turn after a user rename).
+//
+// §6.1 — RESIDUAL cross-manager race (documented, accepted; NOT hardened):
+// Manager.mu serializes the async upgrade's PatchAutoTitle against the SAME
+// manager's every-turn Save() (guarded by
+// internal/session.TestManager_PatchAutoTitle_ConcurrentWithSave). It does
+// NOT cover a rename racing this upgrade when the two run on DIFFERENT
+// *Manager instances:
+//   - a user rename (PATCH /sessions/{id}) goes through
+//     server.go handlePatchSession → SessionCache.GetOrCreateManager →
+//     shared sc.managers[dir];
+//   - this async upgrade runs on the route's manager (route.manager =
+//     sc.newManager(dir)).
+//
+// Different instances → different m.mu, and Store writes are non-atomic
+// os.WriteFile (no temp+rename). So a rename that lands during the
+// multi-second async upgrade has a low-probability lost-update window: the
+// upgrade can clobber the rename and its TitleAuto=false lock. Accepted as a
+// low-probability edge; the fix would be a temp+rename Store write + a shared
+// per-session write lock, deliberately not taken here.
+func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source, sender, channel string, msgs []client.Message, turns int) {
+	if deps == nil || deps.GW == nil || mgr == nil || sessionID == "" || !ctxwin.TitleTriggerTurns[turns] {
+		return
+	}
+	// Shallow copy is sufficient ONLY because every existing message mutator
+	// (e.g. filterOversizeImages) replaces Content wholesale; nothing mutates
+	// a block's text in place on the live slice. Revisit if that changes.
+	msgsCopy := append([]client.Message(nil), msgs...)
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("daemon: smart title panic: %v", rec)
+			}
+		}()
+		// Bound the throwaway-title call so a hung gateway can't keep this
+		// detached goroutine alive for the gateway's full 600s HTTP timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if final := ctxwin.UpgradeTitle(ctx, deps.GW, mgr, sessionID, source, sender, channel, msgsCopy, turns); final != "" {
+			log.Printf("daemon: smart title set for session %s: %q", sessionID, final)
+			// Push the new title to UI clients (Desktop) over /events so the
+			// session list refreshes without waiting for the next manual
+			// GET /sessions — critical for background scheduler runs the
+			// open window never triggered a re-list for.
+			if deps.EventBus != nil {
+				payload, _ := json.Marshal(map[string]any{"session_id": sessionID, "title": final})
+				deps.EventBus.Emit(Event{Type: EventSessionTitleUpdated, Payload: payload})
+			}
+		}
+	}()
 }
 
 // fireSuggestionAfterRun runs in a detached goroutine after the main turn
@@ -2799,22 +2870,16 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 			sess.Source = req.Source
 			sess.Channel = req.Channel
 		}
-		// Title precedence (matches RunAgent's combined behavior at lines
-		// 798-803 + 1147-1152): named agent > route source/channel > derived
-		// from query.
+		// Title from route source/channel (IM) or the first-message query.
+		// Named agents no longer get a fixed title — the smart-title upgrade
+		// replaces this placeholder asynchronously.
 		if sess.Title == "New session" {
-			switch {
-			case agentName != "":
-				sess.Title = session.AgentTitle(agentName)
-			case req.RouteKey != "":
-				if t := routeTitle(req.Source, req.Channel, req.Sender); t != "" {
-					sess.Title = t
-				} else {
-					sess.Title = session.Title(cmd.Query)
-				}
-			default:
+			if t := routeTitle(req.Source, req.Channel, req.Sender); t != "" {
+				sess.Title = t
+			} else {
 				sess.Title = session.Title(cmd.Query)
 			}
+			sess.TitleAuto = true
 		}
 	}
 
@@ -2874,6 +2939,8 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		)
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: failed to save assistant message: %v", err)
+		} else {
+			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, req.Sender, req.Channel, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 		}
 	}
 
