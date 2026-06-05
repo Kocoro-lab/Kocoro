@@ -398,7 +398,8 @@ func TestRouteTitle(t *testing.T) {
 	}{
 		{"slack", "slack", "Wayland", "Slack · Wayland"},
 		{"slack", "slack", "", "Slack"},
-		{"line", "line", "Tanaka", "Line · Tanaka"},
+		{"line", "line", "Tanaka", "LINE · Tanaka"},
+		{"wecom", "wecom", "", "WeCom"},
 		{"feishu", "feishu", "", "Feishu"},
 		{"slack", "#general", "", "Slack · #general"},
 		{"slack", "#general", "Alice", "Slack · Alice"},

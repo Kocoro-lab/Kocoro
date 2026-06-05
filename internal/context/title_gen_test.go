@@ -2,8 +2,10 @@ package context
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -74,6 +76,27 @@ func TestSanitizeTitle(t *testing.T) {
 	}
 }
 
+func TestSanitizeTitleCJKTruncation(t *testing.T) {
+	// 67 CJK runes ≈ 201 bytes — over the byte-based garbage gate (200) but a
+	// legitimate over-long title, not garbage. It must be truncated to
+	// maxTitleRunes with a trailing "...", NOT dropped to "".
+	in := strings.Repeat("测", 67)
+	if len(in) <= 200 || utf8.RuneCountInString(in) > 200 {
+		t.Fatalf("test setup: input should be >200 bytes and <=200 runes (runes=%d bytes=%d)",
+			utf8.RuneCountInString(in), len(in))
+	}
+	got := sanitizeTitle(in)
+	if got == "" {
+		t.Fatalf("over-long CJK title dropped to \"\"; want truncation")
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("got %q, want trailing \"...\"", got)
+	}
+	if n := utf8.RuneCountInString(got); n != maxTitleRunes {
+		t.Errorf("rune length = %d, want %d", n, maxTitleRunes)
+	}
+}
+
 func TestBuildTitleTranscriptTailCap(t *testing.T) {
 	msgs := []client.Message{{Role: "user", Content: client.NewTextContent(strings.Repeat("a", 2000))}}
 	if got := buildTitleTranscript(msgs); len([]rune(got)) > maxTitleInputRunes {
@@ -81,17 +104,76 @@ func TestBuildTitleTranscriptTailCap(t *testing.T) {
 	}
 }
 
+func TestBuildTitleTranscriptExcludesToolNoise(t *testing.T) {
+	// A tool-heavy first turn: a long tool_use input + a long tool_result would
+	// blow past the tail cap and evict the opening question if serialized. The
+	// title transcript must keep ONLY the user's question + the final reply.
+	question := "How do I set up a cron job?"
+	bigToolInput := json.RawMessage(`{"command":"` + strings.Repeat("noise ", 400) + `"}`)
+	bigToolResult := strings.Repeat("tool output line\n", 400)
+
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent(question)},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "tool_use", ID: "t1", Name: "bash", Input: bigToolInput},
+		})},
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "tool_result", ToolUseID: "t1", ToolContent: bigToolResult},
+		})},
+		{Role: "assistant", Content: client.NewTextContent("Use the schedule_create tool.")},
+	}
+
+	got := buildTitleTranscript(msgs)
+	if !strings.Contains(got, question) {
+		t.Errorf("title transcript dropped the user's question:\n%q", got)
+	}
+	if !strings.Contains(got, "schedule_create") {
+		t.Errorf("title transcript dropped the final assistant reply:\n%q", got)
+	}
+	if strings.Contains(got, "noise") || strings.Contains(got, "tool output line") {
+		t.Errorf("title transcript leaked tool noise:\n%q", got)
+	}
+}
+
+func TestSourceLabel(t *testing.T) {
+	cases := map[string]string{
+		"slack":    "Slack",
+		"line":     "LINE",     // brand override (all-caps)
+		"wecom":    "WeCom",    // brand override (camel-cased)
+		"feishu":   "Feishu",   // upper-first is already correct
+		"lark":     "Lark",     // upper-first is already correct
+		"telegram": "Telegram", // upper-first is already correct
+		"webhook":  "Webhook",  // upper-first is already correct
+		"LINE":     "LINE",     // case-insensitive input
+		// Interactive (non-IM) sources → "".
+		"":         "",
+		"desktop":  "",
+		"shanclaw": "",
+		"kocoro":   "",
+	}
+	for in, want := range cases {
+		if got := SourceLabel(in); got != want {
+			t.Errorf("SourceLabel(%q)=%q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestDecorateTitle(t *testing.T) {
-	cases := []struct{ src, smart, want string }{
-		{"slack", "创建定时任务", "Slack · 创建定时任务"},
-		{"line", "Daily standup", "Line · Daily standup"},
-		{"desktop", "Daily standup", "Daily standup"},
-		{"", "Daily standup", "Daily standup"},
-		{"kocoro", "Daily standup", "Daily standup"},
+	cases := []struct{ src, sender, smart, want string }{
+		{"slack", "", "创建定时任务", "Slack · 创建定时任务"},
+		{"line", "", "Daily standup", "LINE · Daily standup"},
+		{"wecom", "", "Daily standup", "WeCom · Daily standup"},
+		// Sender preserved through the upgrade (shared-channel distinction).
+		{"slack", "Wayland", "My smart title", "Slack · Wayland · My smart title"},
+		{"slack", "", "T", "Slack · T"},
+		// Interactive sources drop both label and sender.
+		{"desktop", "Wayland", "Daily standup", "Daily standup"},
+		{"", "Wayland", "Daily standup", "Daily standup"},
+		{"kocoro", "", "Daily standup", "Daily standup"},
 	}
 	for _, c := range cases {
-		if got := DecorateTitle(c.src, c.smart); got != c.want {
-			t.Errorf("DecorateTitle(%q,%q)=%q, want %q", c.src, c.smart, got, c.want)
+		if got := DecorateTitle(c.src, c.sender, c.smart); got != c.want {
+			t.Errorf("DecorateTitle(%q,%q,%q)=%q, want %q", c.src, c.sender, c.smart, got, c.want)
 		}
 	}
 }
@@ -112,11 +194,11 @@ func TestUpgradeTitle(t *testing.T) {
 	fc := &fakeCompleter{out: "创建定时任务"}
 	fp := &fakePatcher{}
 	msgs := []client.Message{{Role: "user", Content: client.NewTextContent("帮我设置任务")}}
-	got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", msgs, 3)
-	if got != "Slack · 创建定时任务" {
-		t.Errorf("returned %q, want Slack · 创建定时任务", got)
+	got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", "Wayland", msgs, 3)
+	if got != "Slack · Wayland · 创建定时任务" {
+		t.Errorf("returned %q, want Slack · Wayland · 创建定时任务", got)
 	}
-	if fp.wroteTitle != "Slack · 创建定时任务" || fp.atTurns != 3 {
+	if fp.wroteTitle != "Slack · Wayland · 创建定时任务" || fp.atTurns != 3 {
 		t.Errorf("persisted title=%q turns=%d", fp.wroteTitle, fp.atTurns)
 	}
 }
@@ -159,13 +241,43 @@ func TestCountCompletedTurns(t *testing.T) {
 	if got := CountCompletedTurns(twoTurns); got != 2 {
 		t.Errorf("two turns (2nd multi-tool): got %d, want 2", got)
 	}
+
+	// Production shape: the final assistant reply arrives as a block-content
+	// message (NewBlockContent), NOT NewTextContent. NewTextContent's Blocks()
+	// is nil, so the tool_use scan short-circuits trivially; the block shape is
+	// what actually walks hasToolUseBlock. Verify a block-content final reply
+	// (no tool_use) still counts as one completed turn.
+	blockReply := client.NewBlockContent([]client.ContentBlock{{Type: "text", Text: "final answer"}})
+	blockFinal := []client.Message{
+		{Role: "user", Content: client.NewTextContent("do X")},
+		{Role: "assistant", Content: toolUse},
+		{Role: "user", Content: toolResult},
+		{Role: "assistant", Content: blockReply},
+	}
+	if got := CountCompletedTurns(blockFinal); got != 1 {
+		t.Errorf("block-content final reply: got %d, want 1", got)
+	}
+
+	// A thinking+text final reply (interleaved thinking) has blocks but no
+	// tool_use — still a completed turn.
+	thinkingReply := client.NewBlockContent([]client.ContentBlock{
+		{Type: "thinking", Text: "let me reason"},
+		{Type: "text", Text: "the answer"},
+	})
+	thinkingFinal := []client.Message{
+		{Role: "user", Content: client.NewTextContent("hi")},
+		{Role: "assistant", Content: thinkingReply},
+	}
+	if got := CountCompletedTurns(thinkingFinal); got != 1 {
+		t.Errorf("thinking+text final reply: got %d, want 1", got)
+	}
 }
 
 func TestUpgradeTitleSkipped(t *testing.T) {
 	fc := &fakeCompleter{out: "创建定时任务"}
 	fp := &fakePatcher{skip: true}
 	msgs := []client.Message{{Role: "user", Content: client.NewTextContent("帮我设置任务")}}
-	if got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", msgs, 3); got != "" {
+	if got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", "", msgs, 3); got != "" {
 		t.Errorf("returned %q, want \"\" when patcher skips (locked/straggler)", got)
 	}
 }

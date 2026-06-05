@@ -1840,7 +1840,9 @@ func (m *Model) generateTitleCmd(sessionID, source string, msgs []client.Message
 	gw, mgr := m.gateway, m.sessions
 	msgsCopy := append([]client.Message(nil), msgs...)
 	return func() tea.Msg {
-		final := ctxwin.UpgradeTitle(context.Background(), gw, mgr, sessionID, source, msgsCopy, turns)
+		// TUI is an interactive (non-IM) entry point with no per-sender
+		// distinction; pass "" for sender (no Sender field on the session).
+		final := ctxwin.UpgradeTitle(context.Background(), gw, mgr, sessionID, source, "", msgsCopy, turns)
 		if final == "" {
 			return nil
 		}

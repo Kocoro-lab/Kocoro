@@ -756,11 +756,14 @@ func routeTitle(source, channel, sender string) string {
 	if s == "" {
 		return ""
 	}
-	switch s {
-	case "desktop", "shanclaw", "kocoro":
+	// Share the brand-casing + interactive-exclusion logic with the upgrade
+	// path (ctxwin.SourceLabel) so the instant placeholder and the smart-title
+	// upgrade label a channel identically (e.g. both "LINE", not "Line" then
+	// "LINE"). "" covers desktop/shanclaw/kocoro/empty.
+	label := ctxwin.SourceLabel(s)
+	if label == "" {
 		return ""
 	}
-	label := strings.ToUpper(s[:1]) + s[1:]
 
 	// Use sender name when available (e.g. "Slack · Wayland")
 	if sender != "" {
@@ -2378,7 +2381,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// tool-iteration message inflation). Async, best-effort; fires only
 		// when the session was persisted.
 		if saveErr == nil {
-			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
+			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, req.Sender, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 		}
 
 		// Post-turn prompt suggestion (fire-and-forget). Gated by all of:
@@ -2494,7 +2497,7 @@ func countAssistantTurns(messages []client.Message) int {
 // is a silent no-op. UpgradeTitle returns "" on generation failure OR a
 // guarded skip (user-locked / straggler); we log only the successful set,
 // since the skip case is expected (e.g. every turn after a user rename).
-func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source string, msgs []client.Message, turns int) {
+func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source, sender string, msgs []client.Message, turns int) {
 	if deps == nil || deps.GW == nil || mgr == nil || sessionID == "" || !ctxwin.TitleTriggerTurns[turns] {
 		return
 	}
@@ -2508,7 +2511,7 @@ func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source
 				log.Printf("daemon: smart title panic: %v", rec)
 			}
 		}()
-		if final := ctxwin.UpgradeTitle(context.Background(), deps.GW, mgr, sessionID, source, msgsCopy, turns); final != "" {
+		if final := ctxwin.UpgradeTitle(context.Background(), deps.GW, mgr, sessionID, source, sender, msgsCopy, turns); final != "" {
 			log.Printf("daemon: smart title set for session %s: %q", sessionID, final)
 			// Push the new title to UI clients (Desktop) over /events so the
 			// session list refreshes without waiting for the next manual
@@ -2914,7 +2917,7 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: failed to save assistant message: %v", err)
 		} else {
-			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
+			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, req.Sender, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 		}
 	}
 
