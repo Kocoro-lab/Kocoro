@@ -429,7 +429,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		defer cancel()
 		// One-shot CLI is a non-IM entry point with no per-sender distinction;
 		// pass "" for sender (no Sender field on the session).
-		ctxwin.UpgradeTitle(titleCtx, gw, sessMgr, sess.ID, sess.Source, "", sess.Messages, 1)
+		ctxwin.UpgradeTitle(titleCtx, gw, sessMgr, sess.ID, sess.Source, "", sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 	}
 	return nil
 }

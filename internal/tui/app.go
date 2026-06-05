@@ -2368,6 +2368,7 @@ func (m *Model) runRemote(query string, ctx map[string]any, strategy string) tea
 	sess := m.sessions.Current()
 	if sess.Title == "New session" {
 		sess.Title = session.Title(query)
+		sess.TitleAuto = true
 	}
 	return func() tea.Msg {
 		taskReq := client.TaskRequest{
