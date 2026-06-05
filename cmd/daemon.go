@@ -241,6 +241,9 @@ var daemonStartCmd = &cobra.Command{
 			defer mailboxDB.Close()
 		}
 
+		systemEvents := daemon.NewSystemEventStore(viper.GetInt("agent.system_event_cap"))
+		sessionCache.SetSystemEventStore(systemEvents)
+
 		wsEndpoint := strings.Replace(cfg.Endpoint, "https://", "wss://", 1)
 		wsEndpoint = strings.Replace(wsEndpoint, "http://", "ws://", 1)
 		wsEndpoint += "/v1/ws/messages"
@@ -294,6 +297,7 @@ var daemonStartCmd = &cobra.Command{
 			GatewayOverlay:   gatewayOverlay,
 			PostOverlays:     postOverlays,
 			ReadTrackerCache: daemon.NewReadTrackerCache(),
+			SystemEvents:     systemEvents,
 		}
 		defer func() {
 			if deps.Supervisor != nil {

@@ -883,6 +883,10 @@ type ServerDeps struct {
 	// by RunAgent. nil-safe: callers can leave it unset (each turn falls
 	// back to a fresh tracker, equivalent to pre-fix behavior).
 	ReadTrackerCache *ReadTrackerCache
+	// SystemEvents is the route-keyed S0 queue: out-of-band channel-state facts
+	// (delivery failures, membership changes) surfaced to the LLM next turn.
+	// nil-safe (CLI fixtures may leave it unset).
+	SystemEvents *SystemEventStore
 	// Suggestions is the per-session prompt-suggestion store shared between
 	// the HTTP handler (server.go) and the post-Run hook in RunAgent.
 	// Wired by NewServer after construction. nil-safe: when unset (e.g. CLI
@@ -2019,6 +2023,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				return deps.SessionCache.DrainSurvivorsOrCloseInject(rk)
 			})
 		}
+	}
+	if req.RouteKey != "" && deps.SystemEvents != nil {
+		rk := req.RouteKey
+		loop.SetSystemEventDrainFn(func() []agent.SystemEvent {
+			return deps.SystemEvents.Drain(rk)
+		})
 	}
 	// IM message lifecycle: wire the per-run emitter so the agent loop can
 	// fire "processing" + record drained-inflight entries for IM-sourced user

@@ -92,3 +92,18 @@ func TestSystemEventStore_NilSafe(t *testing.T) {
 	}
 	s.Forget("r") // must not panic
 }
+
+// Verifies SessionCache.evictRoute releases the route's system events through
+// the wired store (lifecycle release, mirroring readtracker Forget).
+func TestSessionCache_EvictForgetsSystemEvents(t *testing.T) {
+	store := NewSystemEventStore(20)
+	sc := NewSessionCache(t.TempDir())
+	sc.SetSystemEventStore(store)
+
+	store.Enqueue("agent:default", ev("x", ""))
+	sc.evictRoute("agent:default")
+
+	if got := store.Drain("agent:default"); len(got) != 0 {
+		t.Fatalf("evictRoute should Forget the route's system events, got %+v", got)
+	}
+}

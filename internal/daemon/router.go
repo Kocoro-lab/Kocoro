@@ -116,6 +116,10 @@ type SessionCache struct {
 	// model — injectCh is a Go channel and cannot remove elements directly, so
 	// the skip happens after drain rather than by mutating the channel.
 	retractedInjects map[string]map[string]bool
+	// systemEvents, when set, is Forgotten per route on eviction so an
+	// enqueue-but-never-run route does not leak its bounded queue. Optional —
+	// nil in tests / pure-local paths.
+	systemEvents *SystemEventStore
 }
 
 // NewSessionCache creates a cache rooted at the given shannon directory.
@@ -311,6 +315,14 @@ func (sc *SessionCache) SetRouteCancel(key string, cancel context.CancelFunc) {
 	if pending && cancel != nil {
 		cancel()
 	}
+}
+
+// SetSystemEventStore wires the daemon's S0 store so evictRoute can release a
+// route's queued system events. Safe to call once at startup; nil clears.
+func (sc *SessionCache) SetSystemEventStore(store *SystemEventStore) {
+	sc.mu.Lock()
+	sc.systemEvents = store
+	sc.mu.Unlock()
 }
 
 // SetRouteSessionID stores the current route session id for future resume.
@@ -912,7 +924,9 @@ func (sc *SessionCache) Evict(agent string) {
 func (sc *SessionCache) evictRoute(key string) {
 	sc.mu.Lock()
 	entry := sc.routes[key]
+	se := sc.systemEvents
 	sc.mu.Unlock()
+	se.Forget(key) // nil-safe; releases the route's S0 queue (best-effort)
 	if entry == nil {
 		return
 	}
