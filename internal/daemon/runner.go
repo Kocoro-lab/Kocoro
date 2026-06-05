@@ -1986,10 +1986,35 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		bindCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if bindings, err := deps.GW.ListChannelBindings(bindCtx); err == nil {
 			imBindings = formatIMBindings(bindings)
+			// Poll-as-backstop (C7): a poll confirming a binding is enabled
+			// reconciles stale negative state back to healthy. The push
+			// (channel_state_event) is the primary go-negative signal; the poll
+			// only marks platforms healthy. Marking a platform revoked when its
+			// binding is ABSENT from the poll needs an expected-bindings list the
+			// daemon lacks — that absence-diff is a documented follow-up.
+			if deps.ConnState != nil {
+				for _, b := range bindings {
+					if b.Enabled {
+						deps.ConnState.MarkPlatformHealthy(b.Type)
+					}
+				}
+			}
 		}
 		cancel()
 	}
-	if sticky := stickyFromRequest(req.Source, req.Channel, req.Sender, agentName, imBindings, req.StickyContext, req.IMStatusContext, deps.ConnState); sticky != "" {
+	// New-session preamble (C6): a fresh session gets a one-time platform-wide
+	// connection summary (degraded platforms only; healthy omitted → empty on a
+	// healthy new session). Preamble() is nil-safe.
+	stickyExtra := req.StickyContext
+	if req.NewSession && deps.ConnState != nil {
+		if pre := deps.ConnState.Preamble(); len(pre) > 0 {
+			if stickyExtra != "" {
+				stickyExtra += "\n"
+			}
+			stickyExtra += strings.Join(pre, "\n")
+		}
+	}
+	if sticky := stickyFromRequest(req.Source, req.Channel, req.Sender, agentName, imBindings, stickyExtra, req.IMStatusContext, deps.ConnState); sticky != "" {
 		loop.SetStickyContext(sticky)
 	}
 
