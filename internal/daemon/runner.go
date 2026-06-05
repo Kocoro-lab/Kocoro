@@ -2510,6 +2510,14 @@ func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source
 		}()
 		if final := ctxwin.UpgradeTitle(context.Background(), deps.GW, mgr, sessionID, source, msgsCopy, turns); final != "" {
 			log.Printf("daemon: smart title set for session %s: %q", sessionID, final)
+			// Push the new title to UI clients (Desktop) over /events so the
+			// session list refreshes without waiting for the next manual
+			// GET /sessions — critical for background scheduler runs the
+			// open window never triggered a re-list for.
+			if deps.EventBus != nil {
+				payload, _ := json.Marshal(map[string]any{"session_id": sessionID, "title": final})
+				deps.EventBus.Emit(Event{Type: EventSessionTitleUpdated, Payload: payload})
+			}
 		}
 	}()
 }
