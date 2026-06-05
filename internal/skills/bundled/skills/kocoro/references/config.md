@@ -92,7 +92,7 @@ to send — no speculative pre-run of the next assistant reply.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `false` | Master switch. When `false`, no suggestion calls fire. |
+| `enabled` | bool | `true` | Master switch. When `false`, no suggestion calls fire. Set `false` to opt out of the per-turn forked completion entirely. |
 | `cache_cold_threshold_tokens` | int | `10000` | Skip suggestion when previous turn's uncached input tokens exceed this. Protects against full-price calls. `0` disables the gate. |
 | `min_turns` | int | `2` | Skip suggestion until this many turns have completed. First-turn predictions are usually unhelpful. |
 
