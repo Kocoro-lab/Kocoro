@@ -159,11 +159,14 @@ type toolResultMsg struct {
 	elapsed time.Duration
 }
 
-// titleGeneratedMsg is sent after the background smart-title upgrade resolves,
-// carrying the final upgraded title so the cached session list can refresh.
+// titleGeneratedMsg carries a freshly generated smart title back to the update
+// loop, which persists it (on the main goroutine) and refreshes the cached
+// session list. Generation runs off-thread; persistence does not, so all
+// session mutation stays single-threaded.
 type titleGeneratedMsg struct {
 	sessionID string
 	title     string
+	atTurns   int
 }
 
 type toolResultEntry struct {
@@ -1219,10 +1222,15 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.rerenderOutput(), titleCmd)
 
 	case titleGeneratedMsg:
-		// UpgradeTitle already persisted + synced the title via
-		// Manager.PatchAutoTitle; refresh the cached session list so the
+		// The smart title was generated off-thread; persist it here on the main
+		// goroutine so all session mutation stays single-threaded (the
+		// background goroutine must not write the session the update loop also
+		// mutates unlocked). PatchAutoTitle re-checks the user-lock / straggler
+		// guards. Refresh the cached session list on a successful write so the
 		// startup header / sidebar re-render with the upgraded title.
-		m.headerSessions, _ = m.sessions.List()
+		if ok, _ := m.sessions.PatchAutoTitle(msg.sessionID, msg.title, msg.atTurns); ok {
+			m.headerSessions, _ = m.sessions.List()
+		}
 		return m, nil
 
 	case approvalRequestMsg:
@@ -1828,16 +1836,19 @@ func (m *Model) rerenderOutput() tea.Cmd {
 	)
 }
 
-// generateTitleCmd upgrades the session title in the background (same shared
-// core as the daemon path) and reports the result so the sidebar refreshes.
-// Returns nil (a no-op Cmd — Bubbletea ignores it) when gating fails. The
-// gateway/manager are captured into locals so the returned closure does NOT
-// close over the Model (Bubbletea value-copies the Model through Update).
+// generateTitleCmd generates a smart session title in the background and
+// reports it back to the update loop, which persists it on the main goroutine.
+// Returns nil (a no-op Cmd — Bubbletea ignores it) when gating fails. Only the
+// gateway is captured into a local so the returned closure does NOT close over
+// the Model (Bubbletea value-copies the Model through Update) — and critically,
+// the closure never touches m.sessions, so it cannot write the active session
+// the unlocked update loop also mutates. Persistence (the only session write)
+// happens in the titleGeneratedMsg handler on the main goroutine.
 func (m *Model) generateTitleCmd(sessionID, source string, msgs []client.Message, turns int) tea.Cmd {
 	if m.gateway == nil || m.sessions == nil || sessionID == "" || !ctxwin.TitleTriggerTurns[turns] {
 		return nil
 	}
-	gw, mgr := m.gateway, m.sessions
+	gw := m.gateway
 	msgsCopy := append([]client.Message(nil), msgs...)
 	return func() tea.Msg {
 		// TUI is an interactive (non-IM) entry point with no per-sender/channel
@@ -1845,11 +1856,15 @@ func (m *Model) generateTitleCmd(sessionID, source string, msgs []client.Message
 		// keep this throwaway-title goroutine alive for its full 600s HTTP timeout.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		final := ctxwin.UpgradeTitle(ctx, gw, mgr, sessionID, source, "", "", msgsCopy, turns)
+		smart, err := ctxwin.GenerateTitle(ctx, gw, msgsCopy)
+		if err != nil {
+			return nil
+		}
+		final := ctxwin.DecorateTitle(source, "", "", smart)
 		if final == "" {
 			return nil
 		}
-		return titleGeneratedMsg{sessionID: sessionID, title: final}
+		return titleGeneratedMsg{sessionID: sessionID, title: final, atTurns: turns}
 	}
 }
 
