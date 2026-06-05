@@ -16,14 +16,18 @@ import "strings"
 // Pass nil for non-IM runs or platforms whose blob lacks chat identity (Lark
 // pre-S1b) — the coarse line is used.
 //
+// connState, when non-empty, is a live connection/membership status line for
+// this run's channel (S3), e.g. "the bot was removed from this channel ...".
+// Rendered as a `Connection:` line; empty omits it.
+//
 // Returns "" when every routing input is empty. Pre-PR pure-local runs
 // (TUI / one-shot CLI without source/channel/sender/agentName/imBindings)
 // had no sticky context at all; preserving that lets the runner.go
 // `if sticky != "" { loop.SetStickyContext(sticky) }` guard short-circuit
 // for those, which in turn keeps cache equivalence against pre-PR sessions
 // that resume across the upgrade boundary.
-func buildStickyContext(source, channel, sender, agentName, imBindings, extra string, origin *MessageOrigin) string {
-	if source == "" && channel == "" && sender == "" && agentName == "" && imBindings == "" && extra == "" && origin == nil {
+func buildStickyContext(source, channel, sender, agentName, imBindings, extra string, origin *MessageOrigin, connState string) string {
+	if source == "" && channel == "" && sender == "" && agentName == "" && imBindings == "" && extra == "" && origin == nil && connState == "" {
 		return ""
 	}
 	var parts []string
@@ -37,6 +41,9 @@ func buildStickyContext(source, channel, sender, agentName, imBindings, extra st
 		}
 	} else if channel != "" {
 		parts = append(parts, "Channel: "+channel)
+	}
+	if connState != "" {
+		parts = append(parts, "Connection: "+connState)
 	}
 	if sender != "" {
 		parts = append(parts, "Sender: "+sender)
