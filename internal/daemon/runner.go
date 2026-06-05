@@ -883,6 +883,14 @@ type ServerDeps struct {
 	// by RunAgent. nil-safe: callers can leave it unset (each turn falls
 	// back to a fresh tracker, equivalent to pre-fix behavior).
 	ReadTrackerCache *ReadTrackerCache
+	// SystemEvents is the route-keyed S0 queue: out-of-band channel-state facts
+	// (delivery failures, membership changes) surfaced to the LLM next turn.
+	// nil-safe (CLI fixtures may leave it unset).
+	SystemEvents *SystemEventStore
+	// ConnState is the per-binding connection/membership state cache (S3): live
+	// channel removal / auth revocation, rendered into Session Facts each run.
+	// nil-safe (unset = no Connection line).
+	ConnState *ConnectionStateCache
 	// Suggestions is the per-session prompt-suggestion store shared between
 	// the HTTP handler (server.go) and the post-Run hook in RunAgent.
 	// Wired by NewServer after construction. nil-safe: when unset (e.g. CLI
@@ -1978,10 +1986,35 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		bindCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if bindings, err := deps.GW.ListChannelBindings(bindCtx); err == nil {
 			imBindings = formatIMBindings(bindings)
+			// Poll-as-backstop (C7): a poll confirming a binding is enabled
+			// reconciles stale negative state back to healthy. The push
+			// (channel_state_event) is the primary go-negative signal; the poll
+			// only marks platforms healthy. Marking a platform revoked when its
+			// binding is ABSENT from the poll needs an expected-bindings list the
+			// daemon lacks — that absence-diff is a documented follow-up.
+			if deps.ConnState != nil {
+				for _, b := range bindings {
+					if b.Enabled {
+						deps.ConnState.MarkPlatformHealthy(b.Type)
+					}
+				}
+			}
 		}
 		cancel()
 	}
-	if sticky := buildStickyContext(req.Source, req.Channel, req.Sender, agentName, imBindings, req.StickyContext); sticky != "" {
+	// New-session preamble (C6): a fresh session gets a one-time platform-wide
+	// connection summary (degraded platforms only; healthy omitted → empty on a
+	// healthy new session). Preamble() is nil-safe.
+	stickyExtra := req.StickyContext
+	if req.NewSession && deps.ConnState != nil {
+		if pre := deps.ConnState.Preamble(); len(pre) > 0 {
+			if stickyExtra != "" {
+				stickyExtra += "\n"
+			}
+			stickyExtra += strings.Join(pre, "\n")
+		}
+	}
+	if sticky := stickyFromRequest(req.Source, req.Channel, req.Sender, agentName, imBindings, stickyExtra, req.IMStatusContext, deps.ConnState); sticky != "" {
 		loop.SetStickyContext(sticky)
 	}
 
@@ -2019,6 +2052,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				return deps.SessionCache.DrainSurvivorsOrCloseInject(rk)
 			})
 		}
+	}
+	if req.RouteKey != "" && deps.SystemEvents != nil {
+		rk := req.RouteKey
+		loop.SetSystemEventDrainFn(func() []agent.SystemEvent {
+			return deps.SystemEvents.Drain(rk)
+		})
 	}
 	// IM message lifecycle: wire the per-run emitter so the agent loop can
 	// fire "processing" + record drained-inflight entries for IM-sourced user

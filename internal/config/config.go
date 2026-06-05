@@ -302,6 +302,8 @@ func Load() (*Config, error) {
 	// "batch-process 20 attachments" tasks routinely need >25 iterations.
 	// User-configurable per agent; this is just the default.
 	viper.SetDefault("agent.max_iterations", 40)
+	viper.SetDefault("agent.system_event_cap", 20)
+	viper.SetDefault("agent.reply_route_index_cap", 256)
 	viper.SetDefault("agent.temperature", 0)
 	// agent.max_tokens: 0 = auto, resolved per request via
 	// agent.MaxTokensForModel(specificModel). Explicit non-zero value here

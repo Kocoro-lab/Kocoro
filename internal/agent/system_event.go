@@ -12,8 +12,13 @@ import (
 //
 // Events are ephemeral: they ride in the scaffolded user message as
 // <system-reminder> lines and are stripped from persisted history by the
-// existing first-turn scaffold strip (captureRunMessages). They are NEVER
-// written to the session transcript or fed into compaction.
+// existing first-turn scaffold strip (captureRunMessages), so they never
+// reach the session transcript. Like the rest of the scaffold (skill listing,
+// language directive), the block is NOT separately stripped from in-run
+// compaction summary input; but in the daemon's per-turn-fresh-loop topology it
+// lives only in the current user turn, which ShapeHistory keeps in the recent
+// tail rather than summarizing — so in practice it does not land in a persisted
+// summary.
 type SystemEvent struct {
 	// Text is the human-readable line shown to the model, e.g.
 	// "reply to #shannon FAILED: bot was kicked — the user did not see it".
@@ -81,4 +86,11 @@ func formatSystemEventBlock(events []SystemEvent) string {
 		return ""
 	}
 	return "<system-reminder>\n" + strings.Join(lines, "\n") + "\n</system-reminder>"
+}
+
+// FormatSystemEventBlockForTest drains + formats the loop's wired system events.
+// Test-only seam for cross-package integration tests (the daemon package wires
+// the drain fn). Equivalent to one scaffold-time drain.
+func FormatSystemEventBlockForTest(a *AgentLoop) string {
+	return a.drainAndFormatSystemEvents()
 }

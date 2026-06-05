@@ -101,7 +101,12 @@ const (
 	// to a ProactivePayload for precise routing. Observability only — the
 	// fallback rule is "non-empty target → targeted; empty → broadcast", so the
 	// token is not load-bearing for correctness.
-	CapProactiveTargeting = "proactive_targeting"
+	CapProactiveTargeting    = "proactive_targeting"
+	CapReplyDeliveryResultV1 = "reply_delivery_result_v1"
+	// CapChannelStateEventV1 — daemon consumes channel_state_event frames
+	// (live membership/binding/transport changes). Independent of
+	// CapReplyDeliveryResultV1 so S3 can land separately from S2.
+	CapChannelStateEventV1 = "channel_state_event_v1"
 )
 
 var Capabilities = []string{
@@ -114,6 +119,8 @@ var Capabilities = []string{
 	CapIMTimelineV1,
 	CapScheduleBroadcastGate,
 	CapProactiveTargeting,
+	CapReplyDeliveryResultV1,
+	CapChannelStateEventV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
@@ -122,20 +129,22 @@ var Capabilities = []string{
 type envelopeSenderFn func(DaemonMessage) error
 
 type Client struct {
-	endpoint      string
-	conn          *websocket.Conn
-	writeMu       sync.Mutex
-	onMsg         func(MessagePayload) string // returns reply text
-	onSystem      func(string)                // system notifications
-	sem           chan struct{}
-	pendingClaims sync.Map // map[string]chan bool
-	activeMsgs    sync.Map // map[string]context.CancelFunc
-	eventSeqs     sync.Map // map[string]*atomic.Int64
-	connected     atomic.Bool
-	activeAgent   atomic.Value // stores string
-	startTime     time.Time
-	broker        *ApprovalBroker
-	eventBus      *EventBus
+	endpoint              string
+	conn                  *websocket.Conn
+	writeMu               sync.Mutex
+	onMsg                 func(MessagePayload) string              // returns reply text
+	onSystem              func(string)                             // system notifications
+	onReplyDeliveryResult func(ReplyDeliveryResultPayload, string) // (payload, original message_id)
+	onChannelStateEvent   func(ChannelStateEventPayload)
+	sem                   chan struct{}
+	pendingClaims         sync.Map // map[string]chan bool
+	activeMsgs            sync.Map // map[string]context.CancelFunc
+	eventSeqs             sync.Map // map[string]*atomic.Int64
+	connected             atomic.Bool
+	activeAgent           atomic.Value // stores string
+	startTime             time.Time
+	broker                *ApprovalBroker
+	eventBus              *EventBus
 
 	keyMu  sync.RWMutex
 	apiKey string
@@ -177,6 +186,20 @@ func (c *Client) SetOnAuthFailure(cb func()) {
 	c.keyMu.Lock()
 	c.onAuthFailure = cb
 	c.keyMu.Unlock()
+}
+
+// SetOnReplyDeliveryResult registers the consumer for reply_delivery_result
+// frames. Pass nil to ignore them. Wired in cmd/daemon.go to the
+// SystemEventStore + ReplyRouteIndex.
+func (c *Client) SetOnReplyDeliveryResult(cb func(ReplyDeliveryResultPayload, string)) {
+	c.onReplyDeliveryResult = cb
+}
+
+// SetOnChannelStateEvent registers the consumer for channel_state_event frames.
+// Pass nil to ignore. Wired in cmd/daemon.go to the ConnectionStateCache +
+// SystemEventStore + SessionCache route resolver.
+func (c *Client) SetOnChannelStateEvent(cb func(ChannelStateEventPayload)) {
+	c.onChannelStateEvent = cb
 }
 
 func (c *Client) getAPIKey() string {
@@ -509,6 +532,24 @@ func (c *Client) Listen(ctx context.Context) error {
 				if err := json.Unmarshal(sm.Payload, &text); err == nil {
 					c.onSystem(text)
 				}
+			}
+		case MsgTypeReplyDeliveryResult:
+			if c.onReplyDeliveryResult != nil {
+				var p ReplyDeliveryResultPayload
+				if err := json.Unmarshal(sm.Payload, &p); err != nil {
+					log.Printf("daemon: invalid reply_delivery_result: %v", err)
+					continue
+				}
+				c.onReplyDeliveryResult(p, sm.MessageID)
+			}
+		case MsgTypeChannelStateEvent:
+			if c.onChannelStateEvent != nil {
+				var p ChannelStateEventPayload
+				if err := json.Unmarshal(sm.Payload, &p); err != nil {
+					log.Printf("daemon: invalid channel_state_event: %v", err)
+					continue
+				}
+				c.onChannelStateEvent(p)
 			}
 		default:
 			log.Printf("daemon: unknown message type: %s", sm.Type)

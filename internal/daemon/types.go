@@ -4,10 +4,12 @@ import "encoding/json"
 
 // Server -> Daemon message types
 const (
-	MsgTypeConnected = "connected"
-	MsgTypeMessage   = "message"
-	MsgTypeClaimAck  = "claim_ack"
-	MsgTypeSystem    = "system"
+	MsgTypeConnected           = "connected"
+	MsgTypeMessage             = "message"
+	MsgTypeClaimAck            = "claim_ack"
+	MsgTypeSystem              = "system"
+	MsgTypeReplyDeliveryResult = "reply_delivery_result"
+	MsgTypeChannelStateEvent   = "channel_state_event"
 )
 
 // Daemon -> Server message types
@@ -74,7 +76,7 @@ const ApprovalFlagAlwaysAllowDisabled = "always_allow_disabled"
 // ApprovalResponse is received from the client (via Cloud relay).
 type ApprovalResponse struct {
 	RequestID  string           `json:"request_id"`
-	Decision   ApprovalDecision `json:"decision"`    // "allow", "deny", "always_allow"
+	Decision   ApprovalDecision `json:"decision"`              // "allow", "deny", "always_allow"
 	ResolvedBy string           `json:"resolved_by,omitempty"` // populated by Cloud
 }
 
@@ -123,17 +125,17 @@ type DaemonMessage struct {
 
 // MessagePayload is what the daemon's agent loop processes.
 type MessagePayload struct {
-	Channel   string               `json:"channel"`
-	ThreadID  string               `json:"thread_id"`
-	Sender    string               `json:"sender"`
-	Text      string               `json:"text"`
+	Channel   string                `json:"channel"`
+	ThreadID  string                `json:"thread_id"`
+	Sender    string                `json:"sender"`
+	Text      string                `json:"text"`
 	Content   []RequestContentBlock `json:"content,omitempty"` // multimodal content blocks (reserved for Cloud)
-	AgentName string               `json:"agent_name,omitempty"`
-	MessageID string               `json:"-"` // set locally from envelope, not from JSON
-	Timestamp string               `json:"timestamp"`
-	Source    string               `json:"source,omitempty"` // populated by Cloud; "slack", "line", "webhook"
-	CWD       string               `json:"cwd,omitempty"`    // project path override from Cloud/Desktop
-	Files     []RemoteFile         `json:"files,omitempty"` // file attachments from messaging platforms
+	AgentName string                `json:"agent_name,omitempty"`
+	MessageID string                `json:"-"` // set locally from envelope, not from JSON
+	Timestamp string                `json:"timestamp"`
+	Source    string                `json:"source,omitempty"` // populated by Cloud; "slack", "line", "webhook"
+	CWD       string                `json:"cwd,omitempty"`    // project path override from Cloud/Desktop
+	Files     []RemoteFile          `json:"files,omitempty"`  // file attachments from messaging platforms
 
 	// IMStatusContext is an opaque blob produced by Cloud that identifies the
 	// inbound message on its IM platform. Daemon NEVER decodes this — it is
@@ -181,6 +183,40 @@ type ReplyPayload struct {
 	ThreadID string `json:"thread_id"`
 	Text     string `json:"text"`
 	Format   string `json:"format,omitempty"`
+}
+
+// ReplyDeliveryResultPayload mirrors the Cloud-side struct; the envelope's
+// MessageID is the original inbound message_id the reply was for.
+type ReplyDeliveryResultPayload struct {
+	OK            bool   `json:"ok"`
+	Channel       string `json:"channel"`
+	ThreadID      string `json:"thread_id,omitempty"`
+	PlatformMsgID string `json:"platform_msg_id,omitempty"`
+	// Error is the raw platform error (e.g. "slack API error: not_in_channel");
+	// formatDeliveryFailure renders the classified Reason instead. Kept for the
+	// wire contract + future logging.
+	Error  string `json:"error,omitempty"`
+	Reason string `json:"reason,omitempty"` // classified, user-facing
+	Class  string `json:"class,omitempty"`  // ClassPermanent / ClassTransient
+}
+
+// Delivery classification values carried in ReplyDeliveryResultPayload.Class
+// (mirror Cloud's ClassifyDeliveryError output).
+const (
+	ClassPermanent = "permanent"
+	ClassTransient = "transient"
+)
+
+// ChannelStateEventPayload is the body of a MsgTypeChannelStateEvent frame: a
+// live membership/binding/transport change forwarded by Cloud.
+type ChannelStateEventPayload struct {
+	Axis      string `json:"axis"`
+	Platform  string `json:"platform"`
+	ChannelID string `json:"channel_id,omitempty"`
+	Change    string `json:"change"`
+	Actor     string `json:"actor,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	TS        string `json:"ts"`
 }
 
 // ProactivePayload is sent by the daemon to push an unsolicited message

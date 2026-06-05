@@ -1,6 +1,10 @@
 package daemon
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+)
 
 // buildStickyContext composes the per-run metadata block injected into the
 // LLM context. Always emits an Agent: line — "default" when agentName is
@@ -10,22 +14,40 @@ import "strings"
 // (no bindings, or Cloud fetch failed — both legitimate "unknown" states).
 // Extra is an optional caller-provided block appended verbatim.
 //
+// origin, when non-nil, supplies the specific channel/group/DM + thread the
+// inbound message came from (S1); it upgrades the coarse `Channel: <channel>`
+// line to e.g. `Channel: slack · #shannon · channel` plus a `Thread:` line.
+// Pass nil for non-IM runs or platforms whose blob lacks chat identity (Lark
+// pre-S1b) — the coarse line is used.
+//
+// connState, when non-empty, is a live connection/membership status line for
+// this run's channel (S3), e.g. "the bot was removed from this channel ...".
+// Rendered as a `Connection:` line; empty omits it.
+//
 // Returns "" when every routing input is empty. Pre-PR pure-local runs
 // (TUI / one-shot CLI without source/channel/sender/agentName/imBindings)
 // had no sticky context at all; preserving that lets the runner.go
 // `if sticky != "" { loop.SetStickyContext(sticky) }` guard short-circuit
 // for those, which in turn keeps cache equivalence against pre-PR sessions
 // that resume across the upgrade boundary.
-func buildStickyContext(source, channel, sender, agentName, imBindings, extra string) string {
-	if source == "" && channel == "" && sender == "" && agentName == "" && imBindings == "" && extra == "" {
+func buildStickyContext(source, channel, sender, agentName, imBindings, extra string, origin *MessageOrigin, connState string) string {
+	if source == "" && channel == "" && sender == "" && agentName == "" && imBindings == "" && extra == "" && origin == nil && connState == "" {
 		return ""
 	}
 	var parts []string
 	if source != "" {
 		parts = append(parts, "Source: "+source)
 	}
-	if channel != "" {
+	if origin != nil && origin.ChannelID != "" {
+		parts = append(parts, "Channel: "+origin.renderChannelLine())
+		if origin.ThreadID != "" {
+			parts = append(parts, "Thread: "+agent.SanitizeSystemEventText(origin.ThreadID))
+		}
+	} else if channel != "" {
 		parts = append(parts, "Channel: "+channel)
+	}
+	if connState != "" {
+		parts = append(parts, "Connection: "+connState)
 	}
 	if sender != "" {
 		parts = append(parts, "Sender: "+sender)

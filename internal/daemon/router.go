@@ -116,6 +116,10 @@ type SessionCache struct {
 	// model — injectCh is a Go channel and cannot remove elements directly, so
 	// the skip happens after drain rather than by mutating the channel.
 	retractedInjects map[string]map[string]bool
+	// systemEvents, when set, is Forgotten per route on eviction so an
+	// enqueue-but-never-run route does not leak its bounded queue. Optional —
+	// nil in tests / pure-local paths.
+	systemEvents *SystemEventStore
 }
 
 // NewSessionCache creates a cache rooted at the given shannon directory.
@@ -313,6 +317,14 @@ func (sc *SessionCache) SetRouteCancel(key string, cancel context.CancelFunc) {
 	}
 }
 
+// SetSystemEventStore wires the daemon's S0 store so evictRoute can release a
+// route's queued system events. Safe to call once at startup; nil clears.
+func (sc *SessionCache) SetSystemEventStore(store *SystemEventStore) {
+	sc.mu.Lock()
+	sc.systemEvents = store
+	sc.mu.Unlock()
+}
+
 // SetRouteSessionID stores the current route session id for future resume.
 func (sc *SessionCache) SetRouteSessionID(key, sessionID string) {
 	sc.mu.Lock()
@@ -372,6 +384,41 @@ func (sc *SessionCache) ActiveSessionIDs() map[string]struct{} {
 	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+// ActiveRouteKeysForChannel returns active route keys that reference the given
+// platform and channel. BEST-EFFORT: the channelID must appear as a delimited
+// segment of the route key — either an interior `:<channelID>:` segment or the
+// trailing `:<channelID>` suffix — so a query for "C1" does NOT leak onto an
+// unrelated "C123" route (substring match would have, violating route
+// isolation). The daemon route key embeds the platform/channel for IM sources,
+// but a route whose key encodes the channel without `:` delimiters is missed —
+// in that case the per-run ConnectionStateCache render (Session Facts) still
+// surfaces the state, so no awareness is lost, only the immediate injection.
+// channelID == "" (binding/transport events) returns all routes whose key
+// carries the platform as a delimited `:<platform>:` segment. ComputeRouteKey
+// always embeds Source as an interior segment (preceded by `default:` or
+// `agent:<name>:`, followed by channel/thread/sender), never at the head or
+// tail — so the segment check below cannot miss a legitimate IM route, but a
+// bare substring WOULD mis-match a different-platform route whose channel/sender
+// name merely contains the platform string (e.g. a Telegram channel
+// "slackmirror" matching a Slack event).
+func (sc *SessionCache) ActiveRouteKeysForChannel(platform, channelID string) []string {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	var out []string
+	for key := range sc.routes {
+		if !strings.Contains(key, ":"+platform+":") {
+			continue
+		}
+		if channelID != "" {
+			if !strings.Contains(key, ":"+channelID+":") && !strings.HasSuffix(key, ":"+channelID) {
+				continue
+			}
+		}
+		out = append(out, key)
 	}
 	return out
 }
@@ -912,7 +959,9 @@ func (sc *SessionCache) Evict(agent string) {
 func (sc *SessionCache) evictRoute(key string) {
 	sc.mu.Lock()
 	entry := sc.routes[key]
+	se := sc.systemEvents
 	sc.mu.Unlock()
+	se.Forget(key) // nil-safe; releases the route's S0 queue (best-effort)
 	if entry == nil {
 		return
 	}

@@ -1153,3 +1153,26 @@ func TestSystemPrompt_IncludesIMDeliverySemantics(t *testing.T) {
 		}
 	}
 }
+
+func TestSystemPrompt_IncludesDeliveryReceiptSemantics(t *testing.T) {
+	// S2 delivery receipts are a SILENT-on-success / inject-on-failure safety
+	// net: the daemon enqueues a `reply to … FAILED` system note only when a
+	// reply fails to reach the channel; success injects nothing. Without a
+	// static description of this contract the model has no meta-awareness of the
+	// channel — when asked "did your last message land?" it over-generalizes to
+	// "I never get any delivery feedback" (observed on the Slack kocoro-test
+	// thread), which is wrong: failures DO surface next turn. These phrases give
+	// the model the correct mental model (assume delivered unless notified).
+	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
+
+	for _, want := range []string{
+		"Delivery receipts",                          // sub-section anchor
+		"do NOT receive a positive",                  // no success ack
+		"Absence of that note means",                 // silence ⇒ delivered
+		"Never claim a message failed",               // don't fabricate failures
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("system prompt missing delivery-receipt phrase %q", want)
+		}
+	}
+}
