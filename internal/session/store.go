@@ -412,7 +412,9 @@ func (s *Store) PatchTitle(id, title string) error {
 
 // PatchAutoTitle overwrites a machine-derived title with a freshly generated
 // one. Guards: (1) a user-locked title (TitleAuto == false) is never touched;
-// (2) a title already generated at an equal-or-higher turn count is kept.
+// (2) a title already generated at a STRICTLY higher turn count is kept — an
+// equal-or-lower turn re-trigger still overwrites, but turn counts are
+// monotonic per session so in practice only a richer later turn wins.
 // Returns true if written.
 func (s *Store) PatchAutoTitle(id, title string, atTurns int) (bool, error) {
 	sess, err := s.Load(id)

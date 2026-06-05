@@ -13,9 +13,9 @@ import (
 // fireTitleAfterRun must be a safe no-op when gated out (nil deps, nil mgr,
 // or a turn count outside the trigger set) — it must not panic or spawn work.
 func TestFireTitleAfterRun_GatingIsNoOp(t *testing.T) {
-	fireTitleAfterRun(nil, nil, "", "", "", nil, 2)                         // nil deps
-	fireTitleAfterRun(&ServerDeps{}, nil, "s1", "slack", "Wayland", nil, 1) // nil mgr + nil GW
-	fireTitleAfterRun(&ServerDeps{}, nil, "s1", "slack", "Wayland", nil, 2) // turn not in {1,3}
+	fireTitleAfterRun(nil, nil, "", "", "", "", nil, 2)                         // nil deps
+	fireTitleAfterRun(&ServerDeps{}, nil, "s1", "slack", "Wayland", "", nil, 1) // nil mgr + nil GW
+	fireTitleAfterRun(&ServerDeps{}, nil, "s1", "slack", "Wayland", "", nil, 2) // turn not in {1,3}
 }
 
 // TestFireTitleAfterRun_EmitsSessionTitleUpdated exercises the success path the
@@ -57,7 +57,7 @@ func TestFireTitleAfterRun_EmitsSessionTitleUpdated(t *testing.T) {
 	}
 
 	// turns=1 is a TitleTriggerTurns value, so the async upgrade fires.
-	fireTitleAfterRun(deps, mgr, id, "slack", "Wayland", msgs, 1)
+	fireTitleAfterRun(deps, mgr, id, "slack", "Wayland", "", msgs, 1)
 
 	// Wait on a real signal (the persisted upgrade) instead of sleeping: poll
 	// the store until the placeholder has been replaced, bounded so a hung

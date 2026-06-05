@@ -60,8 +60,8 @@ func TestOneShotTitleUsesCompletedTurnCount(t *testing.T) {
 
 	gw := &fakeTitleCompleter{out: "Schedule A Cron Job"}
 	// Byte-for-byte the root.go one-shot callsite (atTurns wired to
-	// CountCompletedTurns, sender "").
-	final := ctxwin.UpgradeTitle(context.Background(), gw, mgr, sess.ID, sess.Source, "", sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
+	// CountCompletedTurns, sender/channel "").
+	final := ctxwin.UpgradeTitle(context.Background(), gw, mgr, sess.ID, sess.Source, "", "", sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 	if final != "Schedule A Cron Job" {
 		t.Fatalf("UpgradeTitle returned %q, want undecorated smart title", final)
 	}

@@ -1840,9 +1840,12 @@ func (m *Model) generateTitleCmd(sessionID, source string, msgs []client.Message
 	gw, mgr := m.gateway, m.sessions
 	msgsCopy := append([]client.Message(nil), msgs...)
 	return func() tea.Msg {
-		// TUI is an interactive (non-IM) entry point with no per-sender
-		// distinction; pass "" for sender (no Sender field on the session).
-		final := ctxwin.UpgradeTitle(context.Background(), gw, mgr, sessionID, source, "", msgsCopy, turns)
+		// TUI is an interactive (non-IM) entry point with no per-sender/channel
+		// distinction; pass "" for both. Bound the call so a hung gateway can't
+		// keep this throwaway-title goroutine alive for its full 600s HTTP timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		final := ctxwin.UpgradeTitle(ctx, gw, mgr, sessionID, source, "", "", msgsCopy, turns)
 		if final == "" {
 			return nil
 		}

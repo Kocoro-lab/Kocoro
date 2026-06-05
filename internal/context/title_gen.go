@@ -61,6 +61,12 @@ func sanitizeTitle(raw string) string {
 	if t == "" {
 		return ""
 	}
+	// Keep only the first line BEFORE the garbage gate so a valid title with a
+	// trailing explanation ("Title\n\nHere's why…") is salvaged rather than
+	// rejected wholesale by the length check.
+	if idx := strings.IndexAny(t, "\n\r"); idx >= 0 {
+		t = strings.TrimSpace(t[:idx])
+	}
 	low := strings.ToLower(t)
 	// The length check is the garbage gate (the model spat a wall of text
 	// instead of a title). It MUST be rune-based: byte length rejects a pure-CJK
@@ -70,9 +76,6 @@ func sanitizeTitle(raw string) string {
 		strings.Contains(low, "token limit") ||
 		strings.Contains(low, "truncated") || utf8.RuneCountInString(t) > 200 {
 		return ""
-	}
-	if idx := strings.IndexAny(t, "\n\r"); idx >= 0 {
-		t = strings.TrimSpace(t[:idx])
 	}
 	if utf8.RuneCountInString(t) > maxTitleRunes {
 		t = string([]rune(t)[:maxTitleRunes-3]) + "..."
@@ -172,16 +175,20 @@ func SourceLabel(source string) string {
 
 // DecorateTitle rebuilds the channel+sender prefix routeTitle produces (see
 // internal/daemon/runner.go) so an upgraded title keeps the same shape as the
-// instant placeholder: "Slack · Wayland · <title>" when sender is set,
-// "Slack · <title>" when it isn't, and the bare title for interactive sources.
-// The " · " separator must match routeTitle's exactly.
-func DecorateTitle(source, sender, smartTitle string) string {
+// instant placeholder: "Slack · Wayland · <title>" with a sender, "Slack ·
+// #general · <title>" with only a channel, "Slack · <title>" with neither, and
+// the bare title for interactive sources. The sender-then-channel fallback and
+// the " · " separator must match routeTitle's exactly.
+func DecorateTitle(source, sender, channel, smartTitle string) string {
 	label := SourceLabel(source)
 	if label == "" {
 		return smartTitle
 	}
 	if sender != "" {
 		return label + " · " + sender + " · " + smartTitle
+	}
+	if channel != "" && !strings.EqualFold(channel, source) {
+		return label + " · " + channel + " · " + smartTitle
 	}
 	return label + " · " + smartTitle
 }
@@ -210,12 +217,12 @@ func CountCompletedTurns(messages []client.Message) int {
 // persists it via the patcher. Best-effort: returns the final title written,
 // or "" if generation failed / the patcher skipped (locked / straggler). The
 // caller keeps the existing placeholder on "".
-func UpgradeTitle(ctx context.Context, c Completer, p AutoTitlePatcher, sessionID, source, sender string, msgs []client.Message, atTurns int) string {
+func UpgradeTitle(ctx context.Context, c Completer, p AutoTitlePatcher, sessionID, source, sender, channel string, msgs []client.Message, atTurns int) string {
 	smart, err := GenerateTitle(ctx, c, msgs)
 	if err != nil {
 		return ""
 	}
-	final := DecorateTitle(source, sender, smart)
+	final := DecorateTitle(source, sender, channel, smart)
 	if ok, err := p.PatchAutoTitle(sessionID, final, atTurns); err != nil || !ok {
 		return ""
 	}

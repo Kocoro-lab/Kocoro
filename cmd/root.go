@@ -427,9 +427,9 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		// for a 64-token Haiku title; on timeout the placeholder persists.
 		titleCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		// One-shot CLI is a non-IM entry point with no per-sender distinction;
-		// pass "" for sender (no Sender field on the session).
-		ctxwin.UpgradeTitle(titleCtx, gw, sessMgr, sess.ID, sess.Source, "", sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
+		// One-shot CLI is a non-IM entry point with no per-sender/channel
+		// distinction; pass "" for both.
+		ctxwin.UpgradeTitle(titleCtx, gw, sessMgr, sess.ID, sess.Source, "", "", sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 	}
 	return nil
 }

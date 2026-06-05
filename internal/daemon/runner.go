@@ -2381,7 +2381,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// tool-iteration message inflation). Async, best-effort; fires only
 		// when the session was persisted.
 		if saveErr == nil {
-			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, req.Sender, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
+			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, req.Sender, req.Channel, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 		}
 
 		// Post-turn prompt suggestion (fire-and-forget). Gated by all of:
@@ -2516,7 +2516,7 @@ func countAssistantTurns(messages []client.Message) int {
 // upgrade can clobber the rename and its TitleAuto=false lock. Accepted as a
 // low-probability edge; the fix would be a temp+rename Store write + a shared
 // per-session write lock, deliberately not taken here.
-func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source, sender string, msgs []client.Message, turns int) {
+func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source, sender, channel string, msgs []client.Message, turns int) {
 	if deps == nil || deps.GW == nil || mgr == nil || sessionID == "" || !ctxwin.TitleTriggerTurns[turns] {
 		return
 	}
@@ -2530,7 +2530,11 @@ func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source
 				log.Printf("daemon: smart title panic: %v", rec)
 			}
 		}()
-		if final := ctxwin.UpgradeTitle(context.Background(), deps.GW, mgr, sessionID, source, sender, msgsCopy, turns); final != "" {
+		// Bound the throwaway-title call so a hung gateway can't keep this
+		// detached goroutine alive for the gateway's full 600s HTTP timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if final := ctxwin.UpgradeTitle(ctx, deps.GW, mgr, sessionID, source, sender, channel, msgsCopy, turns); final != "" {
 			log.Printf("daemon: smart title set for session %s: %q", sessionID, final)
 			// Push the new title to UI clients (Desktop) over /events so the
 			// session list refreshes without waiting for the next manual
@@ -2936,7 +2940,7 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: failed to save assistant message: %v", err)
 		} else {
-			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, req.Sender, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
+			fireTitleAfterRun(deps, sessMgr, sess.ID, req.Source, req.Sender, req.Channel, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 		}
 	}
 

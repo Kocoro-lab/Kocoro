@@ -159,21 +159,27 @@ func TestSourceLabel(t *testing.T) {
 }
 
 func TestDecorateTitle(t *testing.T) {
-	cases := []struct{ src, sender, smart, want string }{
-		{"slack", "", "创建定时任务", "Slack · 创建定时任务"},
-		{"line", "", "Daily standup", "LINE · Daily standup"},
-		{"wecom", "", "Daily standup", "WeCom · Daily standup"},
+	cases := []struct{ src, sender, channel, smart, want string }{
+		{"slack", "", "", "创建定时任务", "Slack · 创建定时任务"},
+		{"line", "", "", "Daily standup", "LINE · Daily standup"},
+		{"wecom", "", "", "Daily standup", "WeCom · Daily standup"},
 		// Sender preserved through the upgrade (shared-channel distinction).
-		{"slack", "Wayland", "My smart title", "Slack · Wayland · My smart title"},
-		{"slack", "", "T", "Slack · T"},
-		// Interactive sources drop both label and sender.
-		{"desktop", "Wayland", "Daily standup", "Daily standup"},
-		{"", "Wayland", "Daily standup", "Daily standup"},
-		{"kocoro", "", "Daily standup", "Daily standup"},
+		{"slack", "Wayland", "", "My smart title", "Slack · Wayland · My smart title"},
+		// No sender → channel fallback mirrors routeTitle ("Slack · #general").
+		{"slack", "", "#general", "My smart title", "Slack · #general · My smart title"},
+		// Sender wins over channel when both are present.
+		{"slack", "Wayland", "#general", "My smart title", "Slack · Wayland · My smart title"},
+		// Channel equal to the source is dropped (avoid "Slack · slack").
+		{"slack", "", "slack", "T", "Slack · T"},
+		{"slack", "", "", "T", "Slack · T"},
+		// Interactive sources drop label, sender, and channel.
+		{"desktop", "Wayland", "#general", "Daily standup", "Daily standup"},
+		{"", "Wayland", "", "Daily standup", "Daily standup"},
+		{"kocoro", "", "", "Daily standup", "Daily standup"},
 	}
 	for _, c := range cases {
-		if got := DecorateTitle(c.src, c.sender, c.smart); got != c.want {
-			t.Errorf("DecorateTitle(%q,%q,%q)=%q, want %q", c.src, c.sender, c.smart, got, c.want)
+		if got := DecorateTitle(c.src, c.sender, c.channel, c.smart); got != c.want {
+			t.Errorf("DecorateTitle(%q,%q,%q,%q)=%q, want %q", c.src, c.sender, c.channel, c.smart, got, c.want)
 		}
 	}
 }
@@ -194,7 +200,7 @@ func TestUpgradeTitle(t *testing.T) {
 	fc := &fakeCompleter{out: "创建定时任务"}
 	fp := &fakePatcher{}
 	msgs := []client.Message{{Role: "user", Content: client.NewTextContent("帮我设置任务")}}
-	got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", "Wayland", msgs, 3)
+	got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", "Wayland", "", msgs, 3)
 	if got != "Slack · Wayland · 创建定时任务" {
 		t.Errorf("returned %q, want Slack · Wayland · 创建定时任务", got)
 	}
@@ -277,7 +283,7 @@ func TestUpgradeTitleSkipped(t *testing.T) {
 	fc := &fakeCompleter{out: "创建定时任务"}
 	fp := &fakePatcher{skip: true}
 	msgs := []client.Message{{Role: "user", Content: client.NewTextContent("帮我设置任务")}}
-	if got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", "", msgs, 3); got != "" {
+	if got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", "", "", msgs, 3); got != "" {
 		t.Errorf("returned %q, want \"\" when patcher skips (locked/straggler)", got)
 	}
 }
