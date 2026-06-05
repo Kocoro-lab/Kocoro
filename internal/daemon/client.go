@@ -101,7 +101,8 @@ const (
 	// to a ProactivePayload for precise routing. Observability only — the
 	// fallback rule is "non-empty target → targeted; empty → broadcast", so the
 	// token is not load-bearing for correctness.
-	CapProactiveTargeting = "proactive_targeting"
+	CapProactiveTargeting    = "proactive_targeting"
+	CapReplyDeliveryResultV1 = "reply_delivery_result_v1"
 )
 
 var Capabilities = []string{
@@ -114,6 +115,7 @@ var Capabilities = []string{
 	CapIMTimelineV1,
 	CapScheduleBroadcastGate,
 	CapProactiveTargeting,
+	CapReplyDeliveryResultV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
