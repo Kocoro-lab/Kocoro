@@ -54,3 +54,31 @@ func SanitizeSystemEventText(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
 	return s
 }
+
+// formatSystemEventBlock renders drained events as a single <system-reminder>
+// block of `System: [HH:MM:SS] <text>` lines (or `System (untrusted): …` when
+// Trusted=false). Returns "" when no event yields renderable text after
+// sanitization. Mirrors OpenClaw's drainFormattedSystemEvents
+// (src/auto-reply/reply/session-system-events.ts) but with a single XML wrapper
+// instead of bare line prefixes, matching ShanClaw's <system-reminder> idiom.
+func formatSystemEventBlock(events []SystemEvent) string {
+	if len(events) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(events))
+	for _, ev := range events {
+		text := SanitizeSystemEventText(ev.Text)
+		if text == "" {
+			continue
+		}
+		prefix := "System"
+		if !ev.Trusted {
+			prefix = "System (untrusted)"
+		}
+		lines = append(lines, prefix+": ["+ev.TS.Format("15:04:05")+"] "+text)
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "<system-reminder>\n" + strings.Join(lines, "\n") + "\n</system-reminder>"
+}
