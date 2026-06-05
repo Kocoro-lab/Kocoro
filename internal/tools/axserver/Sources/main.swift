@@ -370,6 +370,14 @@ func requestPermissionCLI(_ permission: String) -> [String: String] {
         // Screen Recording pane as a fallback so a user-initiated request
         // always has a visible effect (mirrors how the accessibility prompt
         // guides users to System Settings).
+        //
+        // Known trade-off: the call returns false immediately even on a
+        // genuine first request (it does not block on the user's choice), so
+        // in that one case the consent dialog and System Settings open
+        // together. No public API distinguishes "never prompted" from
+        // "already denied" (CGPreflightScreenCaptureAccess is false for
+        // both), so the extra Settings window on the first attempt is the
+        // accepted cost of making the dead state visible.
         let granted = CGRequestScreenCaptureAccess()
         if !granted {
             openPrivacySettingsPane("Privacy_ScreenCapture")

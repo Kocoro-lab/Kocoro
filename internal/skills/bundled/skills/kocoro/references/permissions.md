@@ -51,8 +51,8 @@ Permissions control what commands and tools agents are allowed to run. Before ex
 - Method: POST
 - Path: /permissions/request
 - Body: `{"permission": "screen_recording"}`
-- Response: `{"permission": "string", "status": "granted" | "prompted" | "requires_settings" | "unknown", "message": "string"}`
-- Notes: `granted` means the permission is already held. `prompted` (accessibility, automation) means a macOS consent dialog was triggered. `requires_settings` (screen_recording) means macOS will no longer show a dialog — the one-shot consent prompt was already used — so System Settings was opened at the Screen Recording pane instead and the user must enable "Kocoro AX" there manually. Relay `message` to the user; do NOT retry the request in a loop (each call may re-open System Settings).
+- Response: `{"permission": "string", "status": "granted" | "prompted" | "requires_settings" | "unknown" | "unsupported", "message": "string"}`
+- Notes: `granted` means the permission is already held. `prompted` (accessibility, automation) means a macOS consent dialog was triggered. `requires_settings` (screen_recording) means System Settings was opened at the Screen Recording pane and the user must enable "Kocoro AX" there manually — usually because the one-shot consent dialog was already used; on the very first request a consent dialog may also be on screen, so tell the user to use either. `unknown` means the helper could not be reached. `unsupported` means non-macOS. Relay `message` to the user; do NOT retry the request in a loop (each call may re-open System Settings).
 
 ## Common Scenarios
 
