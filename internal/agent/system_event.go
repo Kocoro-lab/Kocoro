@@ -82,3 +82,10 @@ func formatSystemEventBlock(events []SystemEvent) string {
 	}
 	return "<system-reminder>\n" + strings.Join(lines, "\n") + "\n</system-reminder>"
 }
+
+// FormatSystemEventBlockForTest drains + formats the loop's wired system events.
+// Test-only seam for cross-package integration tests (the daemon package wires
+// the drain fn). Equivalent to one scaffold-time drain.
+func FormatSystemEventBlockForTest(a *AgentLoop) string {
+	return a.drainAndFormatSystemEvents()
+}
