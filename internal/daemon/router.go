@@ -397,14 +397,20 @@ func (sc *SessionCache) ActiveSessionIDs() map[string]struct{} {
 // but a route whose key encodes the channel without `:` delimiters is missed —
 // in that case the per-run ConnectionStateCache render (Session Facts) still
 // surfaces the state, so no awareness is lost, only the immediate injection.
-// channelID == "" (binding/transport events) returns all routes containing the
-// platform token.
+// channelID == "" (binding/transport events) returns all routes whose key
+// carries the platform as a delimited `:<platform>:` segment. ComputeRouteKey
+// always embeds Source as an interior segment (preceded by `default:` or
+// `agent:<name>:`, followed by channel/thread/sender), never at the head or
+// tail — so the segment check below cannot miss a legitimate IM route, but a
+// bare substring WOULD mis-match a different-platform route whose channel/sender
+// name merely contains the platform string (e.g. a Telegram channel
+// "slackmirror" matching a Slack event).
 func (sc *SessionCache) ActiveRouteKeysForChannel(platform, channelID string) []string {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	var out []string
 	for key := range sc.routes {
-		if !strings.Contains(key, platform) {
+		if !strings.Contains(key, ":"+platform+":") {
 			continue
 		}
 		if channelID != "" {
