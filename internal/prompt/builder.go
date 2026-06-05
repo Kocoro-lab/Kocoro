@@ -269,6 +269,22 @@ func buildStaticSystem(opts PromptOptions) string {
 		"channel outside `IM bindings:`; tell the user to bind via Desktop → " +
 		"Settings → Connectors.")
 
+	// 3.6. Delivery receipts (stable). The daemon's S2 receipt path is
+	// silent-on-success / inject-on-failure: a `reply to … FAILED` system note
+	// is enqueued onto the route ONLY when a reply fails to reach the channel.
+	// Without this paragraph the model has no meta-awareness of that channel —
+	// asked "did my last message land?" it answers "I get no delivery feedback
+	// at all", which is wrong (failures DO surface next turn). Anchor the model
+	// on assume-delivered-unless-notified.
+	sb.WriteString("\n\n**Delivery receipts** — you do NOT receive a positive " +
+		"\"delivered\" acknowledgement for a reply; treat every sent reply as " +
+		"delivered unless told otherwise. If a reply FAILS to reach its channel " +
+		"(bot removed, channel archived, token revoked, or a transient outage), " +
+		"a system note starting `reply to ` appears at the START of your next " +
+		"turn describing the failure. Absence of that note means the reply was " +
+		"delivered. Never claim a message failed to send unless you actually saw " +
+		"such a note this turn.")
+
 	// 4. macOS automation guidance (only on darwin with relevant tools)
 	if guidance := macOSAutomationGuidance(opts.LocalToolNames); guidance != "" {
 		sb.WriteString("\n\n")
