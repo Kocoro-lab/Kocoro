@@ -103,6 +103,10 @@ const (
 	// token is not load-bearing for correctness.
 	CapProactiveTargeting    = "proactive_targeting"
 	CapReplyDeliveryResultV1 = "reply_delivery_result_v1"
+	// CapChannelStateEventV1 — daemon consumes channel_state_event frames
+	// (live membership/binding/transport changes). Independent of
+	// CapReplyDeliveryResultV1 so S3 can land separately from S2.
+	CapChannelStateEventV1 = "channel_state_event_v1"
 )
 
 var Capabilities = []string{
@@ -116,6 +120,7 @@ var Capabilities = []string{
 	CapScheduleBroadcastGate,
 	CapProactiveTargeting,
 	CapReplyDeliveryResultV1,
+	CapChannelStateEventV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a

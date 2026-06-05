@@ -9,6 +9,7 @@ const (
 	MsgTypeClaimAck            = "claim_ack"
 	MsgTypeSystem              = "system"
 	MsgTypeReplyDeliveryResult = "reply_delivery_result"
+	MsgTypeChannelStateEvent   = "channel_state_event"
 )
 
 // Daemon -> Server message types
@@ -194,6 +195,18 @@ type ReplyDeliveryResultPayload struct {
 	Error         string `json:"error,omitempty"`
 	Reason        string `json:"reason,omitempty"`
 	Class         string `json:"class,omitempty"`
+}
+
+// ChannelStateEventPayload is the body of a MsgTypeChannelStateEvent frame: a
+// live membership/binding/transport change forwarded by Cloud.
+type ChannelStateEventPayload struct {
+	Axis      string `json:"axis"`
+	Platform  string `json:"platform"`
+	ChannelID string `json:"channel_id,omitempty"`
+	Change    string `json:"change"`
+	Actor     string `json:"actor,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	TS        string `json:"ts"`
 }
 
 // ProactivePayload is sent by the daemon to push an unsolicited message
