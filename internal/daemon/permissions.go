@@ -8,6 +8,6 @@ type permissionStatus struct {
 
 type permissionResult struct {
 	Permission string `json:"permission"`
-	Status     string `json:"status"` // "granted", "denied", "prompted", "unsupported"
+	Status     string `json:"status"` // "granted", "denied", "prompted", "requires_settings", "unsupported"
 	Message    string `json:"message,omitempty"`
 }
