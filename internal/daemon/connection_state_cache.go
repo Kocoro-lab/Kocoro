@@ -60,8 +60,12 @@ func (c *ConnectionStateCache) Apply(p ChannelStateEventPayload, now time.Time) 
 	}
 }
 
-// MarkChannelHealthy clears a channel's negative state (a re-join, or the
-// binding poll confirming membership). Used by reconciliation. nil-safe.
+// MarkChannelHealthy clears a channel's negative state. RESERVED: nothing in
+// production calls this yet — the 60s poll reconciles only the binding axis
+// (MarkPlatformHealthy), so a channel's kicked/left state currently clears only
+// when Cloud pushes a membership `join` event (Apply overwrites to a change
+// changePhrase renders empty). Wire this into a future per-channel
+// reconciliation pass to also recover from a missed join. nil-safe.
 func (c *ConnectionStateCache) MarkChannelHealthy(platform, channelID string) {
 	if c == nil || channelID == "" {
 		return

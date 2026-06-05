@@ -30,7 +30,7 @@ func formatDeliveryFailure(p ReplyDeliveryResultPayload) string {
 		reason = "delivery failed"
 	}
 	where := channelLabel(p)
-	if p.Class == "permanent" {
+	if p.Class == ClassPermanent {
 		return "reply to " + where + " FAILED: " + reason +
 			" — the user did not see it, and the bot will not receive or deliver messages there until re-added/re-authorized."
 	}

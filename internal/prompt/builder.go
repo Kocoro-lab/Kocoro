@@ -280,8 +280,8 @@ func buildStaticSystem(opts PromptOptions) string {
 		"\"delivered\" acknowledgement for a reply; treat every sent reply as " +
 		"delivered unless told otherwise. If a reply FAILS to reach its channel " +
 		"(bot removed, channel archived, token revoked, or a transient outage), " +
-		"a system note starting `reply to ` appears at the START of your next " +
-		"turn describing the failure. Absence of that note means the reply was " +
+		"a system note starting `reply to ` will appear on your next turn " +
+		"describing the failure. Absence of that note means the reply was " +
 		"delivered. Never claim a message failed to send unless you actually saw " +
 		"such a note this turn.")
 

@@ -192,10 +192,20 @@ type ReplyDeliveryResultPayload struct {
 	Channel       string `json:"channel"`
 	ThreadID      string `json:"thread_id,omitempty"`
 	PlatformMsgID string `json:"platform_msg_id,omitempty"`
-	Error         string `json:"error,omitempty"`
-	Reason        string `json:"reason,omitempty"`
-	Class         string `json:"class,omitempty"`
+	// Error is the raw platform error (e.g. "slack API error: not_in_channel");
+	// formatDeliveryFailure renders the classified Reason instead. Kept for the
+	// wire contract + future logging.
+	Error  string `json:"error,omitempty"`
+	Reason string `json:"reason,omitempty"` // classified, user-facing
+	Class  string `json:"class,omitempty"`  // ClassPermanent / ClassTransient
 }
+
+// Delivery classification values carried in ReplyDeliveryResultPayload.Class
+// (mirror Cloud's ClassifyDeliveryError output).
+const (
+	ClassPermanent = "permanent"
+	ClassTransient = "transient"
+)
 
 // ChannelStateEventPayload is the body of a MsgTypeChannelStateEvent frame: a
 // live membership/binding/transport change forwarded by Cloud.
