@@ -135,6 +135,7 @@ type Client struct {
 	onMsg                 func(MessagePayload) string              // returns reply text
 	onSystem              func(string)                             // system notifications
 	onReplyDeliveryResult func(ReplyDeliveryResultPayload, string) // (payload, original message_id)
+	onChannelStateEvent   func(ChannelStateEventPayload)
 	sem                   chan struct{}
 	pendingClaims         sync.Map // map[string]chan bool
 	activeMsgs            sync.Map // map[string]context.CancelFunc
@@ -192,6 +193,13 @@ func (c *Client) SetOnAuthFailure(cb func()) {
 // SystemEventStore + ReplyRouteIndex.
 func (c *Client) SetOnReplyDeliveryResult(cb func(ReplyDeliveryResultPayload, string)) {
 	c.onReplyDeliveryResult = cb
+}
+
+// SetOnChannelStateEvent registers the consumer for channel_state_event frames.
+// Pass nil to ignore. Wired in cmd/daemon.go to the ConnectionStateCache +
+// SystemEventStore + SessionCache route resolver.
+func (c *Client) SetOnChannelStateEvent(cb func(ChannelStateEventPayload)) {
+	c.onChannelStateEvent = cb
 }
 
 func (c *Client) getAPIKey() string {
@@ -533,6 +541,15 @@ func (c *Client) Listen(ctx context.Context) error {
 					continue
 				}
 				c.onReplyDeliveryResult(p, sm.MessageID)
+			}
+		case MsgTypeChannelStateEvent:
+			if c.onChannelStateEvent != nil {
+				var p ChannelStateEventPayload
+				if err := json.Unmarshal(sm.Payload, &p); err != nil {
+					log.Printf("daemon: invalid channel_state_event: %v", err)
+					continue
+				}
+				c.onChannelStateEvent(p)
 			}
 		default:
 			log.Printf("daemon: unknown message type: %s", sm.Type)
