@@ -182,6 +182,12 @@ func (m *Manager) PatchTitle(id, title string) error {
 // directly (the PatchFlags precedent), setting BOTH Title and TitleTurns —
 // otherwise the next Save() writes the upgraded Title with a stale TitleTurns,
 // defeating the straggler guard.
+//
+// SCOPE: m.mu only serializes SAME-manager Save-vs-PatchAutoTitle. A user
+// rename racing this upgrade across DIFFERENT *Manager instances (rename's
+// shared sc.managers[dir] vs. the route's own manager) has a residual,
+// accepted lost-update window — see the §6.1 note on
+// daemon.fireTitleAfterRun (internal/daemon/runner.go).
 func (m *Manager) PatchAutoTitle(id, title string, atTurns int) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

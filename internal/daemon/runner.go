@@ -2497,6 +2497,25 @@ func countAssistantTurns(messages []client.Message) int {
 // is a silent no-op. UpgradeTitle returns "" on generation failure OR a
 // guarded skip (user-locked / straggler); we log only the successful set,
 // since the skip case is expected (e.g. every turn after a user rename).
+//
+// §6.1 — RESIDUAL cross-manager race (documented, accepted; NOT hardened):
+// Manager.mu serializes the async upgrade's PatchAutoTitle against the SAME
+// manager's every-turn Save() (guarded by
+// internal/session.TestManager_PatchAutoTitle_ConcurrentWithSave). It does
+// NOT cover a rename racing this upgrade when the two run on DIFFERENT
+// *Manager instances:
+//   - a user rename (PATCH /sessions/{id}) goes through
+//     server.go handlePatchSession → SessionCache.GetOrCreateManager →
+//     shared sc.managers[dir];
+//   - this async upgrade runs on the route's manager (route.manager =
+//     sc.newManager(dir)).
+//
+// Different instances → different m.mu, and Store writes are non-atomic
+// os.WriteFile (no temp+rename). So a rename that lands during the
+// multi-second async upgrade has a low-probability lost-update window: the
+// upgrade can clobber the rename and its TitleAuto=false lock. Accepted as a
+// low-probability edge; the fix would be a temp+rename Store write + a shared
+// per-session write lock, deliberately not taken here.
 func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source, sender string, msgs []client.Message, turns int) {
 	if deps == nil || deps.GW == nil || mgr == nil || sessionID == "" || !ctxwin.TitleTriggerTurns[turns] {
 		return

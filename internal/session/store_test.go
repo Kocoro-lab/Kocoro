@@ -955,6 +955,55 @@ func TestPatchAutoTitle(t *testing.T) {
 	}
 }
 
+// TestPatchAutoTitle_LegacySessionWithoutTitleAutoKey pins the migration
+// default for pre-feature sessions. TitleAuto/TitleTurns carry json:omitempty,
+// so a session written before the smart-title feature has NO "title_auto" key
+// on disk. It must deserialize to TitleAuto=false (locked), and a subsequent
+// PatchAutoTitle must be a no-op (ok=false) — otherwise the async upgrade would
+// silently rename every legacy session the user already titled by hand.
+func TestPatchAutoTitle_LegacySessionWithoutTitleAutoKey(t *testing.T) {
+	dir := t.TempDir()
+	// Pre-feature JSON: a normal titled session with neither title_auto nor
+	// title_turns present (the omitempty fields were absent before the feature).
+	legacyJSON := `{
+		"id": "legacy-title",
+		"title": "My Hand-Named Session",
+		"cwd": "/tmp",
+		"messages": [
+			{"role": "user", "content": "hello"}
+		]
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "legacy-title.json"), []byte(legacyJSON), 0600); err != nil {
+		t.Fatalf("write legacy json: %v", err)
+	}
+
+	store := NewStore(dir)
+	defer store.Close()
+
+	loaded, err := store.Load("legacy-title")
+	if err != nil {
+		t.Fatalf("load legacy: %v", err)
+	}
+	if loaded.TitleAuto {
+		t.Errorf("TitleAuto = true, want false for a legacy session with no title_auto key (must be locked)")
+	}
+	if loaded.TitleTurns != 0 {
+		t.Errorf("TitleTurns = %d, want 0 for a legacy session with no title_turns key", loaded.TitleTurns)
+	}
+
+	// The async upgrade must skip a legacy (locked) title.
+	ok, err := store.PatchAutoTitle("legacy-title", "Auto Generated", 1)
+	if err != nil {
+		t.Fatalf("PatchAutoTitle: %v", err)
+	}
+	if ok {
+		t.Error("PatchAutoTitle overwrote a legacy (TitleAuto=false) title; want ok=false")
+	}
+	if got, _ := store.Load("legacy-title"); got.Title != "My Hand-Named Session" {
+		t.Errorf("Title = %q, want the legacy title preserved", got.Title)
+	}
+}
+
 func TestPatchTitleLocksAuto(t *testing.T) {
 	store := NewStore(t.TempDir())
 	store.Save(&Session{ID: "s1", Title: "placeholder", TitleAuto: true})
