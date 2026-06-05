@@ -43,16 +43,24 @@ type AgentMCPConfigAPI struct {
 	Servers map[string]AgentMCPServerRef `json:"servers,omitempty"`
 }
 
+// DisplayLabel returns the user-facing label for the agent: its display_name
+// when set, otherwise the slug (Name). Single source of truth for the
+// display_name → slug fallback used by ToAPI and other user-facing surfaces
+// (e.g. the reply-complete banner).
+func (a *Agent) DisplayLabel() string {
+	if a.Config != nil && a.Config.DisplayName != "" {
+		return a.Config.DisplayName
+	}
+	return a.Name
+}
+
 // ToAPI converts a loaded Agent to the API response shape.
 func (a *Agent) ToAPI() *AgentAPI {
 	api := &AgentAPI{
 		Name:   a.Name,
 		Prompt: a.Prompt,
 	}
-	api.DisplayName = a.Name
-	if a.Config != nil && a.Config.DisplayName != "" {
-		api.DisplayName = a.Config.DisplayName
-	}
+	api.DisplayName = a.DisplayLabel()
 	if a.Memory != "" {
 		mem := a.Memory
 		api.Memory = &mem

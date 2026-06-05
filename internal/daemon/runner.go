@@ -2370,8 +2370,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					// Prefer the user-facing display_name over the opaque
 					// server-generated slug (agent-<hex>) in the banner title.
 					label := agentName
-					if agentOverride != nil && agentOverride.Config != nil && agentOverride.Config.DisplayName != "" {
-						label = agentOverride.Config.DisplayName
+					if agentOverride != nil {
+						label = agentOverride.DisplayLabel()
 					}
 					title = "Kocoro · " + label
 				}
