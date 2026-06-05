@@ -243,6 +243,7 @@ var daemonStartCmd = &cobra.Command{
 
 		systemEvents := daemon.NewSystemEventStore(viper.GetInt("agent.system_event_cap"))
 		sessionCache.SetSystemEventStore(systemEvents)
+		replyRouteIndex := daemon.NewReplyRouteIndex(viper.GetInt("agent.reply_route_index_cap"))
 
 		wsEndpoint := strings.Replace(cfg.Endpoint, "https://", "wss://", 1)
 		wsEndpoint = strings.Replace(wsEndpoint, "http://", "ws://", 1)
@@ -440,6 +441,7 @@ var daemonStartCmd = &cobra.Command{
 				return daemon.FriendlyAgentError(err)
 			}
 			req.EnsureRouteKey()
+			replyRouteIndex.Put(msg.MessageID, req.RouteKey)
 
 			// Try injecting into an active run on the same route.
 			// Probe HasActiveRun first so cold-start routes skip the inject
@@ -534,6 +536,10 @@ var daemonStartCmd = &cobra.Command{
 			return result.Reply
 		}, func(text string) {
 			log.Printf("daemon: [system] %s", text)
+		})
+
+		wsClient.SetOnReplyDeliveryResult(func(p daemon.ReplyDeliveryResultPayload, msgID string) {
+			daemon.HandleReplyDeliveryResult(systemEvents, replyRouteIndex, p, msgID)
 		})
 
 		broker = daemon.NewApprovalBroker(wsClient.SendApprovalRequest)
