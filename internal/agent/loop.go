@@ -1775,8 +1775,9 @@ func assembleUserMessage(parts prompt.PromptParts, userMessage string) string {
 }
 
 // appendDynamicUserBlocks adds turn-time blocks to the end of the
-// scaffolded user message: the skill listing (when there are new skills to
-// announce) and the Language directive.
+// scaffolded user message: the system-event block (out-of-band channel
+// state), the skill listing (when there are new skills to announce), and the
+// Language directive.
 //
 // Ordering invariant (issue #157): the Language directive MUST be the LAST
 // appended block. Skill listings carry multilingual trigger keywords
@@ -1788,7 +1789,10 @@ func assembleUserMessage(parts prompt.PromptParts, userMessage string) string {
 //
 // Pure function — the dedup state for skill listings (which skills to
 // surface this turn) lives in the caller.
-func appendDynamicUserBlocks(scaffoldedUserText, skillListing, languageDirective string) string {
+func appendDynamicUserBlocks(scaffoldedUserText, systemEvents, skillListing, languageDirective string) string {
+	if systemEvents != "" {
+		scaffoldedUserText += "\n\n" + systemEvents
+	}
 	if skillListing != "" {
 		scaffoldedUserText += "\n\n" + skillListing
 	}
@@ -2844,7 +2848,8 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 	}
 
-	scaffoldedUserText = appendDynamicUserBlocks(scaffoldedUserText, skillListing, prompt.LanguageDirective(a.responseLanguage))
+	systemEventBlock := a.drainAndFormatSystemEvents()
+	scaffoldedUserText = appendDynamicUserBlocks(scaffoldedUserText, systemEventBlock, skillListing, prompt.LanguageDirective(a.responseLanguage))
 	messages[len(messages)-1] = replaceUserMessageText(messages[len(messages)-1], scaffoldedUserText)
 
 	const discoveryThreshold = 10

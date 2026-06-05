@@ -29,3 +29,26 @@ func TestDrainAndFormatSystemEvents(t *testing.T) {
 		}
 	})
 }
+
+func TestAppendDynamicUserBlocks_SystemEventsOrder(t *testing.T) {
+	out := appendDynamicUserBlocks(
+		"USER_PAYLOAD",
+		"<system-reminder>\nSystem: [00:00:00] x\n</system-reminder>",
+		"SKILL_LISTING",
+		"LANG_DIRECTIVE",
+	)
+	idxUser := strings.Index(out, "USER_PAYLOAD")
+	idxSys := strings.Index(out, "system-reminder")
+	idxSkill := strings.Index(out, "SKILL_LISTING")
+	idxLang := strings.Index(out, "LANG_DIRECTIVE")
+	if !(idxUser < idxSys && idxSys < idxSkill && idxSkill < idxLang) {
+		t.Fatalf("bad order: user=%d sys=%d skill=%d lang=%d in %q", idxUser, idxSys, idxSkill, idxLang, out)
+	}
+}
+
+func TestAppendDynamicUserBlocks_EmptySystemEvents(t *testing.T) {
+	out := appendDynamicUserBlocks("U", "", "S", "L")
+	if strings.Contains(out, "system-reminder") {
+		t.Fatalf("empty system-events should add nothing: %q", out)
+	}
+}

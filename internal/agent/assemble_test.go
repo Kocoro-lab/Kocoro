@@ -123,7 +123,7 @@ func TestAppendDynamicUserBlocks_LanguageAfterSkillListing(t *testing.T) {
 		"</system-reminder>"
 	langDirective := prompt.LanguageDirective("")
 
-	out := appendDynamicUserBlocks("user-query", skillListing, langDirective)
+	out := appendDynamicUserBlocks("user-query", "", skillListing, langDirective)
 
 	skillIdx := strings.Index(out, "## Available Skills")
 	langIdx := strings.Index(out, "## Language")
@@ -149,13 +149,13 @@ func TestAppendDynamicUserBlocks_LanguageAfterSkillListing(t *testing.T) {
 // no-op for empty inputs — AgentLoop.Run relies on this so it can pass `""`
 // for skill listing when no new skills are present without branching.
 func TestAppendDynamicUserBlocks_OmittedBlocksAreNoOp(t *testing.T) {
-	if got := appendDynamicUserBlocks("user-query", "", ""); got != "user-query" {
+	if got := appendDynamicUserBlocks("user-query", "", "", ""); got != "user-query" {
 		t.Errorf("expected unchanged input when both blocks empty, got: %q", got)
 	}
-	if got := appendDynamicUserBlocks("user-query", "", "## Language\nfoo"); !strings.HasSuffix(got, "## Language\nfoo") {
+	if got := appendDynamicUserBlocks("user-query", "", "", "## Language\nfoo"); !strings.HasSuffix(got, "## Language\nfoo") {
 		t.Errorf("expected Language appended when no skill listing, got: %q", got)
 	}
-	if got := appendDynamicUserBlocks("user-query", "skills", ""); !strings.HasSuffix(got, "skills") {
+	if got := appendDynamicUserBlocks("user-query", "", "skills", ""); !strings.HasSuffix(got, "skills") {
 		t.Errorf("expected skill listing appended when no language directive, got: %q", got)
 	}
 }
