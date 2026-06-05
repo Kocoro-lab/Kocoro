@@ -388,6 +388,30 @@ func (sc *SessionCache) ActiveSessionIDs() map[string]struct{} {
 	return out
 }
 
+// ActiveRouteKeysForChannel returns active route keys that reference the given
+// platform and channel. BEST-EFFORT: it substring-matches the channelID within
+// the route key. The daemon route key embeds the platform/channel for IM
+// sources, but a route whose key encodes the channel differently is missed — in
+// that case the per-run ConnectionStateCache render (Session Facts) still
+// surfaces the state, so no awareness is lost, only the immediate injection.
+// channelID == "" (binding/transport events) returns all routes containing the
+// platform token.
+func (sc *SessionCache) ActiveRouteKeysForChannel(platform, channelID string) []string {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	var out []string
+	for key := range sc.routes {
+		if !strings.Contains(key, platform) {
+			continue
+		}
+		if channelID != "" && !strings.Contains(key, channelID) {
+			continue
+		}
+		out = append(out, key)
+	}
+	return out
+}
+
 // HasActiveRun reports whether the route currently owns an in-flight
 // agent run. Pure lookup, no side effects — safe to call from request
 // handlers that need to decide between "inject into existing run" vs
