@@ -887,6 +887,10 @@ type ServerDeps struct {
 	// (delivery failures, membership changes) surfaced to the LLM next turn.
 	// nil-safe (CLI fixtures may leave it unset).
 	SystemEvents *SystemEventStore
+	// ConnState is the per-binding connection/membership state cache (S3): live
+	// channel removal / auth revocation, rendered into Session Facts each run.
+	// nil-safe (unset = no Connection line).
+	ConnState *ConnectionStateCache
 	// Suggestions is the per-session prompt-suggestion store shared between
 	// the HTTP handler (server.go) and the post-Run hook in RunAgent.
 	// Wired by NewServer after construction. nil-safe: when unset (e.g. CLI
@@ -1985,7 +1989,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		cancel()
 	}
-	if sticky := stickyFromRequest(req.Source, req.Channel, req.Sender, agentName, imBindings, req.StickyContext, req.IMStatusContext); sticky != "" {
+	if sticky := stickyFromRequest(req.Source, req.Channel, req.Sender, agentName, imBindings, req.StickyContext, req.IMStatusContext, deps.ConnState); sticky != "" {
 		loop.SetStickyContext(sticky)
 	}
 
