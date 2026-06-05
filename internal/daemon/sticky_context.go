@@ -1,6 +1,10 @@
 package daemon
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+)
 
 // buildStickyContext composes the per-run metadata block injected into the
 // LLM context. Always emits an Agent: line — "default" when agentName is
@@ -37,7 +41,7 @@ func buildStickyContext(source, channel, sender, agentName, imBindings, extra st
 	if origin != nil && origin.ChannelID != "" {
 		parts = append(parts, "Channel: "+origin.renderChannelLine())
 		if origin.ThreadID != "" {
-			parts = append(parts, "Thread: "+origin.ThreadID)
+			parts = append(parts, "Thread: "+agent.SanitizeSystemEventText(origin.ThreadID))
 		}
 	} else if channel != "" {
 		parts = append(parts, "Channel: "+channel)
