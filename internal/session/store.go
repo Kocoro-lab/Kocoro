@@ -329,6 +329,7 @@ func (s *Store) safeSessionPath(id string) (string, error) {
 
 func NewStore(dir string) *Store {
 	os.MkdirAll(dir, 0700)
+	sweepStaleTempFiles(dir)
 	s := &Store{dir: dir}
 	idx, err := OpenIndex(dir)
 	if err == nil {
@@ -359,6 +360,68 @@ func (s *Store) nextUpdatedAt() time.Time {
 	return now
 }
 
+// sweepStaleTempFiles removes orphaned atomic-write temp files left in dir by a
+// crash between os.CreateTemp and os.Rename in writeFileAtomic. Those temps are
+// dot-prefixed and .tmp-suffixed (".<id>.json-<rand>.tmp"), so the .json
+// session loader already ignores them — this just stops them accumulating
+// across crashes. Best-effort; called once per Store at construction.
+func sweepStaleTempFiles(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		os.Remove(filepath.Join(dir, name))
+	}
+}
+
+// writeFileAtomic writes data to a unique temp file in the same directory and
+// atomically renames it over path. The daemon can hold two Manager instances
+// over the same sessions dir (a user rename via the shared sc.managers manager
+// vs the route's own manager running a turn), so concurrent writes to one
+// <id>.json are real. A plain truncate-in-place os.WriteFile could interleave
+// two writers' bytes into a torn file that fails to parse on the next Load;
+// temp+rename makes every reader observe a complete file (old or new). The
+// residual race collapses to a benign last-writer-wins lost update — never
+// corruption. Mirrors the schedule package's atomic-write pattern.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		tmp.Close()
+		os.Remove(tmpPath)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
 func (s *Store) Save(sess *Session) error {
 	sess.UpdatedAt = s.nextUpdatedAt()
 	if sess.CreatedAt.IsZero() {
@@ -374,7 +437,7 @@ func (s *Store) Save(sess *Session) error {
 	}
 
 	path := filepath.Join(s.dir, sess.ID+".json")
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := writeFileAtomic(path, data, 0600); err != nil {
 		return err
 	}
 
@@ -400,7 +463,7 @@ func (s *Store) PatchTitle(id, title string) error {
 	}
 
 	path := filepath.Join(s.dir, sess.ID+".json")
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := writeFileAtomic(path, data, 0600); err != nil {
 		return err
 	}
 
@@ -430,7 +493,7 @@ func (s *Store) PatchAutoTitle(id, title string, atTurns int) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("marshal session: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(s.dir, sess.ID+".json"), data, 0600); err != nil {
+	if err := writeFileAtomic(filepath.Join(s.dir, sess.ID+".json"), data, 0600); err != nil {
 		return false, err
 	}
 	if s.index != nil {
@@ -464,7 +527,7 @@ func (s *Store) PatchFlags(id string, pinned, favorite *bool) error {
 	}
 
 	path := filepath.Join(s.dir, sess.ID+".json")
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := writeFileAtomic(path, data, 0600); err != nil {
 		return err
 	}
 
@@ -508,7 +571,7 @@ func (s *Store) PatchPublishedShares(id string, mutate func([]PublishedShareEntr
 	}
 
 	path := filepath.Join(s.dir, sess.ID+".json")
-	return os.WriteFile(path, data, 0600)
+	return writeFileAtomic(path, data, 0600)
 }
 
 // PatchSummaryCache 从磁盘重新读取 session 的最新版本，仅更新摘要缓存字段后写回。
@@ -528,7 +591,7 @@ func (s *Store) PatchSummaryCache(id, summary, cacheKey string) error {
 	}
 
 	path := filepath.Join(s.dir, sess.ID+".json")
-	return os.WriteFile(path, data, 0600)
+	return writeFileAtomic(path, data, 0600)
 }
 
 func (s *Store) Load(id string) (*Session, error) {

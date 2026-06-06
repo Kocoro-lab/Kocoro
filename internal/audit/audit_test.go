@@ -351,6 +351,94 @@ func TestRedactSecrets_EnvVarAssignments(t *testing.T) {
 	}
 }
 
+// TestRedactSecrets_FeishuAppSecretInHTTPBody covers the exact production
+// shape the JSON-secret pattern was added for: the `http` tool serializes its
+// request body into the tool-args JSON, so a Feishu/Lark App Secret arrives
+// backslash-escaped inside a JSON-string field (\"app_secret\":\"...\"). The
+// original regex only matched UNescaped quotes and let this leak verbatim.
+func TestRedactSecrets_FeishuAppSecretInHTTPBody(t *testing.T) {
+	// As produced by fc.ArgumentsString() for an http POST whose body is JSON.
+	input := `{"method":"POST","url":"http://localhost:7533/channels/feishu/app-installs","body":"{\"app_id\":\"cli_x\",\"app_secret\":\"SeCrEt0123456789abcdef\"}"}`
+	got := RedactSecrets(input)
+	if strings.Contains(got, "SeCrEt0123456789abcdef") {
+		t.Errorf("Feishu app_secret leaked through redaction: %s", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Errorf("expected [REDACTED] placeholder: %s", got)
+	}
+	// app_id is not secret-shaped and must stay visible for debuggability.
+	if !strings.Contains(got, "cli_x") {
+		t.Errorf("non-secret app_id should be preserved: %s", got)
+	}
+}
+
+// TestRedactSecrets_EmbeddedQuoteInValue covers a JSON secret value that itself
+// contains an escaped quote (e.g. a password). The value matcher must consume
+// escaped characters so the WHOLE value is redacted — not just the head up to
+// the first \", which would leak the tail.
+func TestRedactSecrets_EmbeddedQuoteInValue(t *testing.T) {
+	cases := []struct{ in, leak string }{
+		{`{"app_secret":"HEAD\"TAILSECRET"}`, "TAILSECRET"},
+		{`{"password":"P1\"P2\"P3"}`, "P3"},
+		{`{"access_token":"x\"yz9"}`, "yz9"},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			got := RedactSecrets(c.in)
+			if strings.Contains(got, c.leak) {
+				t.Errorf("RedactSecrets(%q) = %q; leaked %q after embedded quote", c.in, got, c.leak)
+			}
+			if !strings.Contains(got, "[REDACTED]") {
+				t.Errorf("RedactSecrets(%q) = %q; expected [REDACTED]", c.in, got)
+			}
+		})
+	}
+}
+
+// TestRedactSecrets_HyphenatedKey covers header-style secret keys whose name
+// contains a hyphen (x-api-key, x-auth-token). The original [a-z0-9_] key
+// class excluded '-', so these never matched.
+func TestRedactSecrets_HyphenatedKey(t *testing.T) {
+	cases := []string{
+		`{"x-api-key":"abcdef0123456789secretval"}`,
+		`{"x-auth-token":"abcdef0123456789secretval"}`,
+		`{\"x-api-key\":\"abcdef0123456789secretval\"}`,
+	}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			got := RedactSecrets(in)
+			if strings.Contains(got, "abcdef0123456789secretval") {
+				t.Errorf("RedactSecrets(%q) leaked secret: %s", in, got)
+			}
+		})
+	}
+}
+
+// TestAuditLogger_RedactsBeforeTruncate locks the ordering: redaction must run
+// over the FULL input before truncation, so a delimiter-anchored secret regex
+// still sees the closing quote. A truncate-first ordering chops the delimiter
+// of a secret whose value straddles the cap and leaks the value head.
+func TestAuditLogger_RedactsBeforeTruncate(t *testing.T) {
+	dir := t.TempDir()
+	logger, err := NewAuditLogger(dir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger() error: %v", err)
+	}
+	// Opening quote + value head land before the cap; the closing quote falls
+	// past it (value is longer than maxSummaryLen).
+	secret := "LEAKHEAD" + strings.Repeat("z", maxSummaryLen)
+	logger.Log(AuditEntry{InputSummary: `{"app_secret":"` + secret + `"}`})
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Join(dir, "audit.log"))
+	if err != nil {
+		t.Fatalf("failed to read: %v", err)
+	}
+	if strings.Contains(string(data), "LEAKHEAD") {
+		t.Errorf("secret head leaked — redaction must run before truncation: %s", data)
+	}
+}
+
 func TestRedactSecrets_NoFalsePositives(t *testing.T) {
 	safe := []string{
 		"running ls -la",

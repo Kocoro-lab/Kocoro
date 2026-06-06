@@ -1,17 +1,114 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
+
+// TestWriteFileAtomic_ConcurrentReadsNeverTorn locks the atomic-write fix: a
+// reader racing repeated rewrites must always observe a COMPLETE file (the old
+// bytes or the new bytes), never a torn prefix. The daemon runs two Manager
+// instances over the same sessions dir (the user-rename shared manager vs the
+// route's own manager), so concurrent writes to one <id>.json are real; a plain
+// truncate-in-place os.WriteFile could expose a half-written file to Load.
+func TestWriteFileAtomic_ConcurrentReadsNeverTorn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.json")
+	oldData := []byte(`{"v":"` + strings.Repeat("o", 1<<16) + `"}`)
+	newData := []byte(`{"v":"` + strings.Repeat("n", 1<<17) + `"}`) // different size
+	if err := writeFileAtomic(path, oldData, 0600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	var readErr error
+	var mu sync.Mutex
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			b, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			if !bytes.Equal(b, oldData) && !bytes.Equal(b, newData) {
+				mu.Lock()
+				if readErr == nil {
+					readErr = fmt.Errorf("torn read: %d bytes, neither old nor new", len(b))
+				}
+				mu.Unlock()
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		data := oldData
+		if i%2 == 1 {
+			data = newData
+		}
+		if err := writeFileAtomic(path, data, 0600); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+
+	// Mode is honored after rename.
+	if fi, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0600 {
+		t.Errorf("perm = %o, want 0600", fi.Mode().Perm())
+	}
+}
+
+// TestNewStore_SweepsStaleTempFiles verifies the startup sweep removes orphaned
+// atomic-write temp files (left by a crash between os.CreateTemp and os.Rename
+// in writeFileAtomic) while leaving real files untouched. The temp files are
+// dot-prefixed + .tmp-suffixed, so the .json session loader already ignores
+// them; the sweep just stops them accumulating across crashes.
+func TestNewStore_SweepsStaleTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	staleTmp := filepath.Join(dir, ".sess-1.json-12345.tmp")
+	if err := os.WriteFile(staleTmp, []byte("{partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(dir, "keep.txt")
+	if err := os.WriteFile(keep, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	st := NewStore(dir)
+	defer st.Close()
+
+	if _, err := os.Stat(staleTmp); !os.IsNotExist(err) {
+		t.Errorf("stale temp file not swept (err=%v)", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("non-temp file was wrongly removed: %v", err)
+	}
+}
 
 func TestStore_SaveLoad(t *testing.T) {
 	dir := t.TempDir()

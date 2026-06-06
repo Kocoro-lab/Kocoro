@@ -668,6 +668,16 @@ var silentBannerSources = map[string]struct{}{
 	"mcp":       {},
 }
 
+// isAutonomousLocalSource reports whether a source is an autonomous local
+// trigger (heartbeat/watcher/mcp) that piggybacks on the user's interactive
+// session. Such runs must not drive user-facing session metadata — neither the
+// reply-complete banner nor the smart-title upgrade — because they append to a
+// session the user did not initiate this turn.
+func isAutonomousLocalSource(source string) bool {
+	_, ok := silentBannerSources[strings.ToLower(strings.TrimSpace(source))]
+	return ok
+}
+
 // shouldEmitReplyBanner reports whether a reply-complete banner should fire
 // for the given request source. Returns false for cloud-distributed channels
 // (reply delivered elsewhere) and for autonomous local sources that would
@@ -676,8 +686,7 @@ func shouldEmitReplyBanner(source string) bool {
 	if isCloudSource(source) {
 		return false
 	}
-	_, silent := silentBannerSources[strings.ToLower(strings.TrimSpace(source))]
-	return !silent
+	return !isAutonomousLocalSource(source)
 }
 
 // markdownStripRE matches the small set of markdown markers that read poorly
@@ -2058,6 +2067,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		loop.SetSystemEventDrainFn(func() []agent.SystemEvent {
 			return deps.SystemEvents.Drain(rk)
 		})
+		// Recover drained events if the turn fails before the model sees them
+		// (e.g. the outage that caused a delivery failure also fails this turn's
+		// LLM call). Without this, the only carrier of the failure notice is gone.
+		loop.SetSystemEventRequeueFn(func(evs []agent.SystemEvent) {
+			for _, ev := range evs {
+				deps.SystemEvents.Enqueue(rk, ev)
+			}
+		})
 	}
 	// IM message lifecycle: wire the per-run emitter so the agent loop can
 	// fire "processing" + record drained-inflight entries for IM-sourced user
@@ -2563,6 +2580,11 @@ func countAssistantTurns(messages []client.Message) int {
 // per-session write lock, deliberately not taken here.
 func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source, sender, channel string, msgs []client.Message, turns int) {
 	if deps == nil || deps.GW == nil || mgr == nil || sessionID == "" || !ctxwin.TitleTriggerTurns[turns] {
+		return
+	}
+	// Autonomous local runs (watcher/heartbeat/mcp) append to the user's
+	// existing interactive session; they must not relabel its title.
+	if isAutonomousLocalSource(source) {
 		return
 	}
 	// Shallow copy is sufficient ONLY because every existing message mutator

@@ -364,6 +364,41 @@ func TestRenderHTML_ArtifactIDsUniqueAcrossMessages(t *testing.T) {
 	mustNotContain(t, out, `data-artifact-id="dup"`)
 }
 
+// TestRenderHTML_UserArtifactIsInert is a trust-boundary guard: html-artifact
+// fences are only honored from the ASSISTANT (the generative-UI producer). A
+// user-role message — including a third-party IM group member's message that
+// lands in a shared session — must NOT execute as a live sandboxed iframe on the
+// public share page; its raw markup stays inert (escaped markdown).
+func TestRenderHTML_UserArtifactIsInert(t *testing.T) {
+	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}
+	body := "```html-artifact title=\"Invoice\"\n<form><script>steal()</script></form>\n```\n"
+
+	userIn := RenderInput{
+		Session:  sess,
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent(body)}},
+	}
+	html, err := RenderHTML(userIn)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	out := string(html)
+	// No live iframe, and the script is neutralized (escaped), not live.
+	mustNotContain(t, out, "<iframe")
+	mustNotContain(t, out, "<script>steal()</script>")
+
+	// Sanity: the SAME fence from the assistant DOES render an iframe, so this
+	// test pins the role gate, not a parser regression.
+	asstIn := RenderInput{
+		Session:  sess,
+		Messages: []client.Message{{Role: "assistant", Content: client.NewTextContent(body)}},
+	}
+	ahtml, err := RenderHTML(asstIn)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	mustContain(t, string(ahtml), "<iframe")
+}
+
 // A plain ```html fence is NOT an artifact: it stays a source code block, no iframe.
 func TestRenderHTML_PlainHTMLFenceStaysCode(t *testing.T) {
 	sess := &session.Session{ID: "s1", Title: "t", CreatedAt: time.Now()}

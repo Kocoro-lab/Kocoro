@@ -18,6 +18,52 @@ func TestFireTitleAfterRun_GatingIsNoOp(t *testing.T) {
 	fireTitleAfterRun(&ServerDeps{}, nil, "s1", "slack", "Wayland", "", nil, 2) // turn not in {1,3}
 }
 
+// TestFireTitleAfterRun_SkipsAutonomousSource locks the watcher/heartbeat/mcp
+// guard: an autonomous local run appends to the user's interactive session but
+// must NOT relabel it — so no smart-title upgrade fires (no event emitted, the
+// placeholder title is untouched).
+func TestFireTitleAfterRun_SkipsAutonomousSource(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "Watcher Retitle"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	mgr := session.NewManager(t.TempDir())
+	defer mgr.Close()
+	sess := mgr.NewSession()
+	id := sess.ID
+	sess.Title = "placeholder"
+	sess.TitleAuto = true
+	sess.TitleTurns = 0
+	if err := mgr.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	bus := NewEventBus()
+	deps := &ServerDeps{GW: client.NewGatewayClient(ts.URL, "test-key"), EventBus: bus}
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("fs change detected")},
+		{Role: "assistant", Content: client.NewTextContent("noted")},
+	}
+
+	// turns=1 is a trigger turn; only the autonomous-source guard should stop it.
+	fireTitleAfterRun(deps, mgr, id, "watcher", "", "", msgs, 1)
+
+	// The guard returns before spawning the goroutine, so there is nothing to
+	// race; the sleep only catches a regression that wrongly spawned the upgrade.
+	time.Sleep(150 * time.Millisecond)
+
+	for _, evt := range bus.EventsSince(0) {
+		if evt.Type == EventSessionTitleUpdated {
+			t.Fatalf("watcher source must not emit a title update: %s", evt.Payload)
+		}
+	}
+	if got, err := mgr.Load(id); err != nil {
+		t.Fatalf("reload: %v", err)
+	} else if got.Title != "placeholder" {
+		t.Errorf("autonomous run relabeled the user's session: title = %q", got.Title)
+	}
+}
+
 // TestFireTitleAfterRun_EmitsSessionTitleUpdated exercises the success path the
 // gating test deliberately skips: a real gateway + manager drive the async
 // upgrade to completion, and the daemon must emit exactly one

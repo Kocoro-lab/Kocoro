@@ -22,6 +22,24 @@ func TestStickyContext_AlwaysIncludesAgent(t *testing.T) {
 	}
 }
 
+// TestStickyFromRequest_PlatformLineWithoutOrigin covers the observability gap:
+// Feishu/Lark blobs lack a chat_id pre-S1b, so parseMessageOrigin returns nil —
+// but a revoked/disconnected binding state must STILL surface on an EXISTING
+// session, not only on the new-session Preamble. The fallback keys PlatformLine
+// by the source platform.
+func TestStickyFromRequest_PlatformLineWithoutOrigin(t *testing.T) {
+	cache := NewConnectionStateCache()
+	now := time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)
+	cache.Apply(ChannelStateEventPayload{Axis: AxisBinding, Platform: "feishu", Change: ChangeInstallRevoked, TS: "x"}, now)
+
+	// Feishu blob without chat_id → parseMessageOrigin returns nil.
+	blob := json.RawMessage(`{"platform":"feishu","tenant_key":"tk","message_id":"om_x"}`)
+	sticky := stickyFromRequest("feishu", "feishu-group", "alice", "", "", "", blob, cache)
+	if !strings.Contains(sticky, "Connection:") || !strings.Contains(sticky, "authorization was revoked") {
+		t.Fatalf("expected Connection line for revoked feishu binding on existing session, got:\n%s", sticky)
+	}
+}
+
 // TestStickyContext_ScheduleAddsOutputDiscipline locks that schedule-source
 // runs get the "output only the deliverable" discipline (so the reply doesn't
 // leak the delivery mechanism / session internals), while interactive/IM

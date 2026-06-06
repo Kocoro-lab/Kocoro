@@ -89,6 +89,12 @@ func stickyFromRequest(source, channel, sender, agentName, imBindings, extra str
 		if connState == "" {
 			connState = cache.PlatformLine(origin.Platform)
 		}
+	} else {
+		// No fine-grained origin (e.g. Feishu/Lark pre-S1b, whose blob lacks a
+		// chat_id). Still surface a platform-level binding/transport state keyed
+		// by the source platform, so a revoked/disconnected app is visible on
+		// EXISTING sessions too — not only on the new-session Preamble.
+		connState = cache.PlatformLine(strings.ToLower(strings.TrimSpace(source)))
 	}
 	return buildStickyContext(source, channel, sender, agentName, imBindings, extra, origin, connState)
 }

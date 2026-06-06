@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,16 +35,27 @@ type channelState struct {
 // bound to; daemon restart wipes it (the poll re-seeds).
 type ConnectionStateCache struct {
 	mu       sync.RWMutex
-	channels map[string]channelState // key "<platform>:<channelID>"
-	binding  map[string]channelState // key "<platform>"
+	channels map[string]channelState // key "<platform>:<channelID>" (membership axis)
+	binding  map[string]channelState // key "<platform>" (binding axis — actionable, sticky)
+	// transport is kept SEPARATE from binding so a transient transport
+	// "disconnected" blip cannot overwrite an actionable install/token
+	// revocation. binding takes precedence at render time; transport only shows
+	// when there is no binding-axis state for the platform.
+	transport map[string]channelState // key "<platform>" (transport axis — transient)
 }
 
 func NewConnectionStateCache() *ConnectionStateCache {
-	return &ConnectionStateCache{channels: map[string]channelState{}, binding: map[string]channelState{}}
+	return &ConnectionStateCache{
+		channels:  map[string]channelState{},
+		binding:   map[string]channelState{},
+		transport: map[string]channelState{},
+	}
 }
 
 // Apply folds one event into the cache. Membership events update the channel
-// map; binding/transport events update the platform map. nil-safe.
+// map; binding and transport events update their own platform maps (kept
+// separate so a transient transport blip can't mask a binding revocation).
+// nil-safe.
 func (c *ConnectionStateCache) Apply(p ChannelStateEventPayload, now time.Time) {
 	if c == nil {
 		return
@@ -55,8 +67,10 @@ func (c *ConnectionStateCache) Apply(p ChannelStateEventPayload, now time.Time) 
 		if p.ChannelID != "" {
 			c.channels[p.Platform+":"+p.ChannelID] = channelState{change: p.Change, at: now}
 		}
-	case AxisBinding, AxisTransport:
+	case AxisBinding:
 		c.binding[p.Platform] = channelState{change: p.Change, at: now}
+	case AxisTransport:
+		c.transport[p.Platform] = channelState{change: p.Change, at: now}
 	}
 }
 
@@ -75,13 +89,15 @@ func (c *ConnectionStateCache) MarkChannelHealthy(platform, channelID string) {
 	c.mu.Unlock()
 }
 
-// MarkPlatformHealthy clears a platform's negative binding state. nil-safe.
+// MarkPlatformHealthy clears a platform's negative binding AND transport state.
+// nil-safe.
 func (c *ConnectionStateCache) MarkPlatformHealthy(platform string) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	delete(c.binding, platform)
+	delete(c.transport, platform)
 	c.mu.Unlock()
 }
 
@@ -100,13 +116,18 @@ func (c *ConnectionStateCache) ChannelLine(platform, channelID string) string {
 	return changePhrase(platform, st.change)
 }
 
-// PlatformLine renders a platform-level binding fragment, or "". nil-safe.
+// PlatformLine renders a platform-level connection fragment, or "". The
+// actionable binding state (install/token revoked) takes precedence over a
+// transient transport disconnect for the same platform. nil-safe.
 func (c *ConnectionStateCache) PlatformLine(platform string) string {
 	if c == nil {
 		return ""
 	}
 	c.mu.RLock()
 	st, ok := c.binding[platform]
+	if !ok {
+		st, ok = c.transport[platform]
+	}
 	c.mu.RUnlock()
 	if !ok {
 		return ""
@@ -114,7 +135,9 @@ func (c *ConnectionStateCache) PlatformLine(platform string) string {
 	return changePhrase(platform, st.change)
 }
 
-// Preamble renders all currently-degraded platforms as new-session lines.
+// Preamble renders all currently-degraded platforms as new-session lines, one
+// per platform (binding state preferred over transport), in a deterministic
+// (platform-sorted) order so the new-session prompt stays byte-stable.
 // Healthy/unknown platforms are omitted. nil-safe.
 func (c *ConnectionStateCache) Preamble() []string {
 	if c == nil {
@@ -122,9 +145,22 @@ func (c *ConnectionStateCache) Preamble() []string {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	var out []string
-	for platform, st := range c.binding {
-		out = append(out, title(platform)+": "+changePhrase(platform, st.change))
+	// Union of degraded platforms; binding wins over transport per platform.
+	states := make(map[string]channelState, len(c.binding)+len(c.transport))
+	for p, st := range c.transport {
+		states[p] = st
+	}
+	for p, st := range c.binding {
+		states[p] = st
+	}
+	platforms := make([]string, 0, len(states))
+	for p := range states {
+		platforms = append(platforms, p)
+	}
+	sort.Strings(platforms)
+	out := make([]string, 0, len(platforms))
+	for _, p := range platforms {
+		out = append(out, title(p)+": "+changePhrase(p, states[p].change))
 	}
 	return out
 }

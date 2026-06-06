@@ -95,13 +95,7 @@ func buildTitleTranscript(messages []client.Message) string {
 	for _, m := range messages {
 		switch m.Role {
 		case "user":
-			// Tool RESULTS arrive as user-role messages; their text is tool
-			// noise. Skip any user message that carries blocks (a plain user
-			// turn is text-only with no blocks).
-			if m.Content.HasBlocks() {
-				continue
-			}
-			if t := strings.TrimSpace(m.Content.Text()); t != "" {
+			if t := userTitleText(m); t != "" {
 				fmt.Fprintf(&sb, "[user]: %s\n\n", t)
 			}
 		case "assistant":
@@ -118,6 +112,29 @@ func buildTitleTranscript(messages []client.Message) string {
 		return string(r[len(r)-maxTitleInputRunes:])
 	}
 	return full
+}
+
+// userTitleText returns the title-relevant text of a user-role message, or ""
+// to skip it. Tool RESULTS arrive as user-role block messages whose text is
+// tool noise — those are skipped. A multimodal turn (image attachment + a text
+// caption) is ALSO block-content, but its caption is the most title-worthy
+// content, so text blocks are extracted while the tool_result case is excluded.
+func userTitleText(m client.Message) string {
+	if !m.Content.HasBlocks() {
+		return strings.TrimSpace(m.Content.Text())
+	}
+	var parts []string
+	for _, b := range m.Content.Blocks() {
+		switch b.Type {
+		case "tool_result":
+			return "" // tool noise — skip the whole message
+		case "text":
+			if t := strings.TrimSpace(b.Text); t != "" {
+				parts = append(parts, t)
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
 }
 
 // hasToolUseBlock reports whether an assistant message contains a tool_use
@@ -163,8 +180,10 @@ func SourceLabel(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
 	// Exclusion set mirrors daemon routeTitle (internal/daemon/runner.go);
 	// keep both in sync when adding an interactive (non-IM) source.
+	// watcher/heartbeat/mcp are autonomous local sources that piggyback on the
+	// user's interactive session — they must not relabel its title.
 	switch s {
-	case "", "desktop", "shanclaw", "kocoro":
+	case "", "desktop", "shanclaw", "kocoro", "watcher", "heartbeat", "mcp":
 		return ""
 	}
 	if name, ok := brandDisplayNames[s]; ok {
