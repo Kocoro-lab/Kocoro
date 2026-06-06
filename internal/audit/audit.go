@@ -149,6 +149,15 @@ var redactPatterns []*regexp.Regexp
 // audit.log via auditHTTPOpError's output_summary on install failure.
 var urlCredRE = regexp.MustCompile(`(https?://)[^/\s:@]+:[^/\s@]+@`)
 
+// jsonSecretRE redacts the VALUE of a JSON field whose key ends in a
+// secret-like word ("app_secret", "access_token", "api_key", "password", ...),
+// keeping the key name visible. The env-var pattern in init() only catches
+// `NAME=value` shapes; tool-call inputs routed through the `http` tool carry
+// secrets as JSON (`{"app_secret":"<32-char generic>"}`) that no other pattern
+// matches — e.g. a Feishu/Lark App Secret. The key word must be immediately
+// followed by the closing quote so "token_count" / "secret_id" don't match.
+var jsonSecretRE = regexp.MustCompile(`(?i)("(?:[a-z0-9_]*(?:secret|token|password|passwd|api[_-]?key))"\s*:\s*)"[^"]*"`)
+
 func init() {
 	patterns := []string{
 		// AWS access key IDs
@@ -181,6 +190,7 @@ func RedactSecrets(text string) string {
 		result = re.ReplaceAllString(result, "[REDACTED]")
 	}
 	result = urlCredRE.ReplaceAllString(result, "${1}[REDACTED]@")
+	result = jsonSecretRE.ReplaceAllString(result, `${1}"[REDACTED]"`)
 	return result
 }
 

@@ -1416,6 +1416,99 @@ func (c *GatewayClient) ListChannelBindings(ctx context.Context) ([]ChannelBindi
 	return bindings, nil
 }
 
+// FeishuAppInstallRequest is the wire body for registering a self-built
+// Feishu/Lark application via Cloud's POST /api/v1/channels/feishu/app-installs.
+// The bot connects over a Cloud-driven larkws long connection, so there is no
+// Encrypt Key and no webhook URL — only the app credentials are needed.
+// agent_name is optional: an empty value lets Cloud bind the user's default
+// agent (mirrors ChannelBindingAgentName's "" == default contract).
+type FeishuAppInstallRequest struct {
+	ChannelType string `json:"channel_type"` // "feishu" | "lark"
+	AppID       string `json:"app_id"`
+	AppSecret   string `json:"app_secret"`
+	AgentName   string `json:"agent_name,omitempty"`   // empty → Cloud's default agent
+	DisplayName string `json:"display_name,omitempty"` // optional bot display name
+}
+
+// CreateFeishuAppInstall forwards a self-built Feishu/Lark app registration to
+// Cloud using this daemon's API key (X-API-Key). It returns Cloud's HTTP status
+// code and raw response body verbatim so the caller can pass Cloud's field-level
+// validation errors straight through to the LLM without re-modelling them here.
+func (c *GatewayClient) CreateFeishuAppInstall(ctx context.Context, body FeishuAppInstallRequest) (int, []byte, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return 0, nil, fmt.Errorf("marshal request: %w", err)
+	}
+	endpoint := c.baseURL + "/api/v1/channels/feishu/app-installs"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// ListFeishuAppInstalls fetches the user's registered Feishu/Lark app installs
+// from Cloud's GET /api/v1/channels/feishu/app-installs. Returns Cloud's status
+// code and raw body verbatim so the caller can surface the install ids (needed
+// for DeleteFeishuAppInstall) without this layer modelling the response shape.
+func (c *GatewayClient) ListFeishuAppInstalls(ctx context.Context) (int, []byte, error) {
+	endpoint := c.baseURL + "/api/v1/channels/feishu/app-installs"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// DeleteFeishuAppInstall unbinds a registered Feishu/Lark app install by id via
+// Cloud's DELETE /api/v1/channels/feishu/app-installs/{id}. Returns Cloud's
+// status code and raw body verbatim.
+func (c *GatewayClient) DeleteFeishuAppInstall(ctx context.Context, id string) (int, []byte, error) {
+	endpoint := c.baseURL + "/api/v1/channels/feishu/app-installs/" + url.PathEscape(id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
 // GetTask fetches the full task result from the REST API.
 // Unlike SSE events which truncate at 10K chars, the REST response contains
 // the complete untruncated result.

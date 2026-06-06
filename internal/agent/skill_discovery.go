@@ -72,13 +72,19 @@ var platformAnchors = []string{
 	"allowed-tools",
 	"mcp server",
 	"mcp_server",
+	// Channel brand tokens (verbatim across EN/ZH/JA): connecting a Feishu /
+	// Lark self-built app is a daemon-config task handled by the kocoro skill.
+	"feishu",
+	"lark",
+	"larksuite",
 	// ZH platform anchors
 	"定时任务",
 	"守护进程",
 	"计划任务",
+	"飞书",
 	// JA platform anchors
-	"定期実行",   // "scheduled execution" — tech term, near-certain platform
-	"デーモン",   // katakana "daemon" — script-flexible spelling
+	"定期実行", // "scheduled execution" — tech term, near-certain platform
+	"デーモン", // katakana "daemon" — script-flexible spelling
 	"スケジュール実行",
 }
 
@@ -107,12 +113,12 @@ var platformStrongNounsZH = []string{
 // Japanese developers commonly mix with English, so "agent" is already
 // covered by the EN list; these catch pure-JA phrasings.
 var platformStrongNounsJA = []string{
-	"エージェント", // agent
-	"スケジュール", // schedule
-	"スキル",    // skill
+	"エージェント",  // agent
+	"スケジュール",  // schedule
+	"スキル",     // skill
 	"パーミッション", // permission
-	"フック",    // hook
-	"定期",     // "regular/periodic" — strong signal with a verb
+	"フック",     // hook
+	"定期",      // "regular/periodic" — strong signal with a verb
 }
 
 // platformVerbs: scored only when co-occurring with a strong noun or anchor.
@@ -146,15 +152,15 @@ var platformVerbsZH = []string{
 // Note: 管理 shares kanji with ZH list but is matched once per message
 // (stringSliceContains dedupe in scorer).
 var platformVerbsJA = []string{
-	"作成",  // create
+	"作成",   // create
 	"新規作成", // new-create (common UI phrasing)
-	"設定",  // set up / configure
-	"追加",  // add
-	"管理",  // manage
-	"有効化", // enable
-	"無効化", // disable
-	"削除",  // delete
-	"登録",  // register
+	"設定",   // set up / configure
+	"追加",   // add
+	"管理",   // manage
+	"有効化",  // enable
+	"無効化",  // disable
+	"削除",   // delete
+	"登録",   // register
 }
 
 // calendarVeto: strong negative signal suggesting calendar/meeting intent.
@@ -192,21 +198,21 @@ var calendarVetoZH = []string{
 // calendarVetoJA: Japanese calendar/social terms. 予定 intentionally left
 // out because it overlaps with technical "scheduled task" usage.
 var calendarVetoJA = []string{
-	"予約",    // booking / reservation
+	"予約",     // booking / reservation
 	"ミーティング", // meeting
 	"カレンダー",  // calendar
-	"会議",    // meeting (shared kanji w/ ZH)
-	"打ち合わせ", // discussion / meeting
-	"アポ",    // appointment (informal)
+	"会議",     // meeting (shared kanji w/ ZH)
+	"打ち合わせ",  // discussion / meeting
+	"アポ",     // appointment (informal)
 	"アポイント",  // appointment
-	"飲み会",   // drinking party
-	"診察",    // medical consultation
-	"通院",    // hospital visit
-	"ジム",    // gym
-	"デート",   // date
-	"誕生日",   // birthday
-	"忘年会",   // year-end party
-	"歓迎会",   // welcome party
+	"飲み会",    // drinking party
+	"診察",     // medical consultation
+	"通院",     // hospital visit
+	"ジム",     // gym
+	"デート",    // date
+	"誕生日",    // birthday
+	"忘年会",    // year-end party
+	"歓迎会",    // welcome party
 }
 
 // isObserveOnlyMode reports whether SHANNON_SKILL_DISCOVERY_OBSERVE is set
@@ -320,9 +326,11 @@ type intentScoreBreakdown struct {
 
 // tokenizeEN returns a set of ASCII-letter / digit / underscore tokens.
 // CJK characters break the token boundary, which is exactly what we want:
-//   "agented"               -> {"agented"}                (agent ≠ agented)
-//   "设置一个agent"           -> {"agent"}                  (CJK breaks → clean token)
-//   "write a python script" -> {"write", "a", "python", "script"}
+//
+//	"agented"               -> {"agented"}                (agent ≠ agented)
+//	"设置一个agent"           -> {"agent"}                  (CJK breaks → clean token)
+//	"write a python script" -> {"write", "a", "python", "script"}
+//
 // This gives us word-boundary semantics for ASCII terms AND lets EN tokens
 // inside CJK text still match via the EN list — so the ZH noun/verb lists
 // only need to carry pure-CJK terms.
