@@ -311,7 +311,11 @@ func buildViewMessages(msgs []client.Message, meta []session.MessageMeta) []view
 			role = "system"
 		}
 
-		blocks := buildViewBlocks(m, &artifactSeq)
+		// html-artifact fences render as live (script-enabled) sandboxed iframes,
+		// so only honor them from the ASSISTANT — the generative-UI producer.
+		// User-role text (incl. third-party IM group members whose messages land
+		// in the session) renders as inert markdown, never an executable iframe.
+		blocks := buildViewBlocks(m, &artifactSeq, m.Role == "assistant")
 		if len(blocks) == 0 {
 			continue
 		}
@@ -376,9 +380,9 @@ func roleLabel(role string) string {
 	}
 }
 
-func buildViewBlocks(m client.Message, artifactSeq *int) []viewBlock {
+func buildViewBlocks(m client.Message, artifactSeq *int, allowArtifacts bool) []viewBlock {
 	if !m.Content.HasBlocks() {
-		return textToViewBlocks(m.Content.Text(), artifactSeq)
+		return textToViewBlocks(m.Content.Text(), artifactSeq, allowArtifacts)
 	}
 
 	out := make([]viewBlock, 0, len(m.Content.Blocks()))
@@ -386,7 +390,7 @@ func buildViewBlocks(m client.Message, artifactSeq *int) []viewBlock {
 		// Text blocks may carry html-artifact fences, so they expand into one or
 		// more view blocks (prose + rendered artifacts) rather than a single one.
 		if b.Type == "text" {
-			out = append(out, textToViewBlocks(b.Text, artifactSeq)...)
+			out = append(out, textToViewBlocks(b.Text, artifactSeq, allowArtifacts)...)
 			continue
 		}
 		vb, ok := renderBlock(b)
@@ -398,9 +402,11 @@ func buildViewBlocks(m client.Message, artifactSeq *int) []viewBlock {
 	return out
 }
 
-// textToViewBlocks renders an assistant/user text body, splitting out
-// html-artifact fences into live sandboxed-iframe blocks while the surrounding
-// prose renders as markdown. Returns nil for blank input.
+// textToViewBlocks renders a text body. When allowArtifacts is true (assistant
+// messages only) it splits out html-artifact fences into live sandboxed-iframe
+// blocks while the surrounding prose renders as markdown; otherwise the whole
+// body renders as inert markdown (no fence is promoted to an executable iframe).
+// Returns nil for blank input.
 //
 // artifactSeq is a render-wide counter that mints the data-artifact-id for EVERY
 // artifact (art_1, art_2, ...). We deliberately ignore the fence's own `id`:
@@ -408,9 +414,15 @@ func buildViewBlocks(m client.Message, artifactSeq *int) []viewBlock {
 // shows every version as its own iframe, so each needs a unique id for the
 // resize listener to size it. A duplicated id would leave all but the first
 // iframe clipped at min-height.
-func textToViewBlocks(text string, artifactSeq *int) []viewBlock {
+func textToViewBlocks(text string, artifactSeq *int, allowArtifacts bool) []viewBlock {
 	if strings.TrimSpace(text) == "" {
 		return nil
+	}
+	if !allowArtifacts {
+		// Non-assistant text never carries trusted generative UI — render it
+		// whole as inert (escaped) markdown so an html-artifact fence cannot
+		// execute on the public share page.
+		return []viewBlock{{Kind: "text", HTML: renderMarkdown(text)}}
 	}
 	segs := splitArtifacts(text)
 	out := make([]viewBlock, 0, len(segs))

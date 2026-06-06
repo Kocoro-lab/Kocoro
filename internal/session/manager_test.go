@@ -12,6 +12,45 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
+// TestManagerPatchTitle_SyncsTitleAutoLock locks the in-memory consistency fix:
+// a user rename via PatchTitle must clear m.current.TitleAuto too, not just
+// m.current.Title. Otherwise a later whole-session Save() re-persists
+// TitleAuto=true and re-arms the auto-title upgrade to clobber the rename
+// (PatchAutoTitle already syncs both fields for exactly this reason).
+func TestManagerPatchTitle_SyncsTitleAutoLock(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+
+	sess := m.NewSession() // m.current == sess
+	sess.TitleAuto = true
+	id := sess.ID
+	if err := m.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	// User renames the active session.
+	if err := m.PatchTitle(id, "My Renamed Title"); err != nil {
+		t.Fatalf("PatchTitle: %v", err)
+	}
+
+	// A subsequent whole-session Save (e.g. next turn) must NOT revert the lock.
+	if err := m.Save(); err != nil {
+		t.Fatalf("post-rename save: %v", err)
+	}
+
+	got, err := m.store.Load(id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got.TitleAuto {
+		t.Error("PatchTitle did not sync TitleAuto=false in memory; Save reverted the user-lock")
+	}
+	if got.Title != "My Renamed Title" {
+		t.Errorf("title = %q, want %q", got.Title, "My Renamed Title")
+	}
+}
+
 func TestManager_ResumeLatest_EmptyDir(t *testing.T) {
 	dir := t.TempDir()
 	m := NewManager(dir)

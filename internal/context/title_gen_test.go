@@ -135,6 +135,25 @@ func TestBuildTitleTranscriptExcludesToolNoise(t *testing.T) {
 	}
 }
 
+// TestBuildTitleTranscriptKeepsImageCaption covers multimodal opening turns:
+// an image attachment + a text caption arrives as a block-content user message
+// (NOT a tool_result). The caption is the most title-worthy content and must
+// survive into the title transcript — the old HasBlocks() skip dropped it.
+func TestBuildTitleTranscriptKeepsImageCaption(t *testing.T) {
+	caption := "why is this dashboard chart broken?"
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "text", Text: caption},
+			{Type: "image"},
+		})},
+		{Role: "assistant", Content: client.NewTextContent("The Y-axis scale is misconfigured.")},
+	}
+	got := buildTitleTranscript(msgs)
+	if !strings.Contains(got, caption) {
+		t.Errorf("title transcript dropped the image caption:\n%q", got)
+	}
+}
+
 func TestSourceLabel(t *testing.T) {
 	cases := map[string]string{
 		"slack":    "Slack",
@@ -150,6 +169,11 @@ func TestSourceLabel(t *testing.T) {
 		"desktop":  "",
 		"shanclaw": "",
 		"kocoro":   "",
+		// Autonomous local sources that piggyback on the user's interactive
+		// session must NOT prefix its title (e.g. no "Watcher · ...").
+		"watcher":   "",
+		"heartbeat": "",
+		"mcp":       "",
 	}
 	for in, want := range cases {
 		if got := SourceLabel(in); got != want {

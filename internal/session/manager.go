@@ -160,6 +160,11 @@ func (m *Manager) PatchTitle(id, title string) error {
 	}
 	if m.current != nil && m.current.ID == id {
 		m.current.Title = title
+		// Sync the user-lock too (Store.PatchTitle persists TitleAuto=false).
+		// Without this a later whole-session Save() rewrites TitleAuto=true and
+		// re-arms the auto-title upgrade to clobber the rename — PatchAutoTitle
+		// syncs its fields for the same stale-field-survives-Save reason.
+		m.current.TitleAuto = false
 	}
 	return nil
 }
