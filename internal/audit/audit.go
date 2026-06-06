@@ -113,11 +113,15 @@ func NewAuditLogger(logDir string) (*AuditLogger, error) {
 	return &AuditLogger{file: f}, nil
 }
 
-// Log records a tool call event. Input and output summaries are truncated
-// and have secrets redacted before writing.
+// Log records a tool call event. Input and output summaries have secrets
+// redacted and are then truncated before writing. Redaction MUST run over the
+// full text before truncation: the delimiter-anchored secret patterns
+// (jsonSecretRE, urlCredRE) need to see a value's closing delimiter, which a
+// truncate-first ordering could chop off — leaking the value head. Mirrors
+// daemon.redactAndTruncate.
 func (a *AuditLogger) Log(entry AuditEntry) {
-	entry.InputSummary = RedactSecrets(truncate(entry.InputSummary, maxSummaryLen))
-	entry.OutputSummary = RedactSecrets(truncate(entry.OutputSummary, maxSummaryLen))
+	entry.InputSummary = truncate(RedactSecrets(entry.InputSummary), maxSummaryLen)
+	entry.OutputSummary = truncate(RedactSecrets(entry.OutputSummary), maxSummaryLen)
 
 	data, err := json.Marshal(entry)
 	if err != nil {
@@ -149,14 +153,33 @@ var redactPatterns []*regexp.Regexp
 // audit.log via auditHTTPOpError's output_summary on install failure.
 var urlCredRE = regexp.MustCompile(`(https?://)[^/\s:@]+:[^/\s@]+@`)
 
-// jsonSecretRE redacts the VALUE of a JSON field whose key ends in a
-// secret-like word ("app_secret", "access_token", "api_key", "password", ...),
-// keeping the key name visible. The env-var pattern in init() only catches
-// `NAME=value` shapes; tool-call inputs routed through the `http` tool carry
-// secrets as JSON (`{"app_secret":"<32-char generic>"}`) that no other pattern
-// matches — e.g. a Feishu/Lark App Secret. The key word must be immediately
-// followed by the closing quote so "token_count" / "secret_id" don't match.
-var jsonSecretRE = regexp.MustCompile(`(?i)("(?:[a-z0-9_]*(?:secret|token|password|passwd|api[_-]?key))"\s*:\s*)"[^"]*"`)
+// jsonSecretRE and jsonSecretEscapedRE redact the VALUE of a JSON field whose
+// key ends in a secret-like word ("app_secret", "access_token", "api-key",
+// "password", ...), keeping the key name visible. The env-var pattern in init()
+// only catches `NAME=value` shapes; tool-call inputs routed through the `http`
+// tool carry secrets as JSON that no other pattern matches — e.g. a Feishu/Lark
+// App Secret. In both, the key word must be immediately followed by the closing
+// key quote so "token_count" / "secret_id" don't match, and the hyphen in the
+// key class lets header-style keys like "x-api-key" match.
+//
+// Two patterns are needed because `\"` is ambiguous between the two contexts and
+// no single regex can disambiguate them:
+//
+//   - jsonSecretRE — bare object `{"app_secret":"v"}`. The value matcher
+//     (?:\\.|[^"\\])* is JSON-string-safe: it consumes escaped characters, so a
+//     value containing an embedded \" is redacted WHOLE (no leaked tail).
+//   - jsonSecretEscapedRE — a JSON-encoded string `{\"app_secret\":\"v\"}`. The
+//     http tool serializes its request body into the tool-args JSON, so a
+//     one-level-nested body arrives with backslash-escaped quotes. Here \" is
+//     the value DELIMITER, so the value matcher stops at the first backslash
+//     (`[^"\\]*`); the rare doubly-escaped embedded quote in this context at
+//     worst leaks a tail, never the alphanumeric secret it was added to scrub.
+//
+// The two patterns are disjoint (one needs bare quotes, the other backslash-
+// escaped quotes), so application order does not matter.
+var jsonSecretRE = regexp.MustCompile(`(?i)("(?:[a-z0-9_-]*(?:secret|token|password|passwd|api[_-]?key))"\s*:\s*)"(?:\\.|[^"\\])*"`)
+
+var jsonSecretEscapedRE = regexp.MustCompile(`(?i)(\\"(?:[a-z0-9_-]*(?:secret|token|password|passwd|api[_-]?key))\\"\s*:\s*)\\"[^"\\]*\\"`)
 
 func init() {
 	patterns := []string{
@@ -191,6 +214,7 @@ func RedactSecrets(text string) string {
 	}
 	result = urlCredRE.ReplaceAllString(result, "${1}[REDACTED]@")
 	result = jsonSecretRE.ReplaceAllString(result, `${1}"[REDACTED]"`)
+	result = jsonSecretEscapedRE.ReplaceAllString(result, `${1}\"[REDACTED]\"`)
 	return result
 }
 
