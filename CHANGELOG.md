@@ -2,6 +2,76 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.2.2 — 2026-06-06 — Feishu/Lark auto-connect + outbound IM observability + smart titles + share artifacts + review hardening
+
+Feature batch plus a dedicated review-hardening pass. The agent gains **awareness of its own IM channel state** (a per-platform connection-state cache rendered into Session Facts, plus sanitized system-reminder events for membership/delivery changes), **Feishu/Lark bots can be auto-connected from chat**, sessions get **LLM-generated smart titles** across daemon/TUI/one-shot, and **session shares render `html-artifact` fences as sandboxed iframes** with tool runs stripped. The back half of the release ([#229](https://github.com/Kocoro-lab/Kocoro/pull/229)) is bug-fix hardening found by reviewing the feature diff: audit secret-redaction gaps, a lost-system-event path, connection-state masking, non-atomic session writes, and a share-page stored-XSS vector.
+
+> **Cross-repo contract:** outbound observability adds WS/event surface for IM channel-state + delivery-result frames and a connection-state preamble (consumer: Cloud + ShanClawDesktop). The share artifact host CSS / CSP / resize bridge remain VERBATIM mirrors of ShanClawDesktop's `message-list.js`. Feishu/Lark auto-connect adds `POST`/`DELETE /channels/feishu/app-installs` (localhost-only, proxied to Cloud). All additive; no breaking wire changes.
+
+### Added
+
+- **Outbound observability — agent awareness of its IM channel state** (PR #224, `52ab393`, `653f14e`, `06a7c2e`, `internal/daemon/`, `internal/agent/`) — a per-platform `ConnectionStateCache` fed by Cloud `channel_state_event`s renders a `Connection:` Session-Facts line + new-session preamble; membership/delivery-failure changes are surfaced as sanitized `<system-reminder>` `SystemEvent` blocks on the next turn.
+- **Feishu/Lark bot auto-connect from chat** (`b09b4ba`, `internal/daemon/feishu_handler.go`, `internal/client/gateway.go`) — `POST`/`DELETE /channels/feishu/app-installs` register/unbind a bot via Cloud passthrough; the bundled `kocoro` skill drives it from a conversation. App secrets are redacted from the audit log (`06092d7`, hardened in `b8dd0f8`).
+- **Smart session titles** (PR #221, `eadb007`, `internal/context/title_gen.go`) — an async small-tier LLM call upgrades the placeholder title at completed turns {1,3} across daemon, TUI, and one-shot; brand-prefixed for IM sources (`Slack · …`).
+- **Session share: sandboxed html-artifact rendering** (`86883c3`, `b5c60c1`, `internal/share/`) — tool runs are stripped from the rendered page; `html-artifact` fences render live in a sandboxed, CSP-restricted iframe (host CSS / CSP / resize bridge mirror ShanClawDesktop).
+- **Next-prompt suggestion enabled by default** (`c4c8c71`, `internal/config/`).
+
+### Changed
+
+- **`Agent.DisplayLabel()` is the single source of the display_name → slug fallback** (`5a5fb06`, `139bb3f`, `internal/agents/`, `internal/daemon/`) — used by the reply-complete banner title and API responses.
+- **Unified transport-error classification** (`247b88b`, `internal/client/transport_error.go`) — retry and user-facing-label paths share one `TransportErrorShape` marker list.
+- **axserver opens System Settings when screen-recording consent can no longer prompt** (`64a0773`, `0192351`) — status enum `requires_settings`; first-call double-UI documented as an accepted trade-off.
+- **bash tool description notes approval is conditional** (`6150144`).
+
+### Security
+
+- **Audit log secret redaction hardened** (PR #229, `b8dd0f8`, building on `06092d7`, `internal/audit/`) — secrets in nested/escaped JSON tool bodies (e.g. a Feishu/Lark app secret via the `http` tool), embedded-quote values, and hyphenated keys (`x-api-key`) are now redacted; redaction runs before truncation so a value's closing delimiter can't be chopped off.
+- **Share pages render html-artifacts only from assistant messages** (PR #229, `9fe7eea`, `internal/share/renderer.go`) — user / third-party content stays inert escaped markdown, closing a stored-XSS vector on public share URLs.
+
+### Fixed
+
+- **System events recovered on failed turns** (PR #229, `2d68191`, `internal/agent/loop.go`) — delivery-failure / "bot removed" notices are re-enqueued when a turn fails before the model sees them (no double-show once received via a stream delta).
+- **IM connection state on existing sessions + no transient masking** (PR #229, `2d68191`, `internal/daemon/`) — Feishu/Lark revocation surfaces on resumed sessions via `PlatformLine(source)`; binding and transport axes are stored separately so a transient disconnect can't mask a revocation; new-session preamble is deterministically ordered.
+- **Atomic session writes** (PR #229, `9fe7eea`, `eeefb25`, `internal/session/store.go`) — temp + rename eliminates torn/corrupt session files under concurrent writes; orphaned temp files are swept on startup. `Manager.PatchTitle` syncs the `TitleAuto` lock so a rename isn't reverted by a later save.
+- **Autonomous runs don't relabel the user's title; titles keep image captions** (PR #229, `9fe7eea`, `internal/context/`, `internal/daemon/runner.go`) — watcher/heartbeat/mcp are excluded from smart-title relabeling; image+caption turns keep the caption in the title transcript.
+- **TUI smart title persisted on the main goroutine** (`cbff584`) — avoids a session race during the async upgrade.
+
+### Docs
+
+- `references/*` (bundled `kocoro` skill): permission status enums + first-call double-UI trade-off (`0192351`), `prompt_suggestion` default sync (`5870121`), Feishu auto-connect.
+- `CLAUDE.md`: documented IM connection awareness (transport-vs-binding precedence), smart-title autonomous-source skip, and the assistant-only share-artifact gate (`eeefb25`).
+
+### Tests
+
+- Feishu app-install handler gates (`06092d7`); title-emit deflake (`c4bcd48`); plus 18 hardening regression tests across `audit` (escaped/embedded-quote redaction, redact-before-truncate), `agent` (system-event requeue incl. partial-stream), `daemon` (connection-state axes, sticky platform line, autonomous-title skip), `session` (atomic-write concurrency, temp sweep, TitleAuto sync), `share` (assistant-only artifacts), and `context` (image-caption title).
+
+## v0.2.1 — 2026-06-04 — Named-agent multi-session + schedule stateful + Calendar RPC v1 + upstream 504 retry
+
+Daemon capability release. **Named agents become multi-session** (honoring `session_id`/`new_session` like the default agent), **schedules collapse to a single `Stateful` remember-across-runs switch**, and proactive schedule pushes gain **IM targeting**. A new **Calendar RPC v1** channel lets a Desktop-hosted daemon reach EventKit over a reverse Unix-socket RPC (`calendar_*` tools). Plus reliability fixes: cloud/IM approvals resolve through the WS broker from `POST /approval`, upstream `504`s are retried as transient, the model field rejects tier keywords, and several mid-run inject-lifecycle races are closed.
+
+> **Cross-repo contract:** Calendar RPC v1 is a local Unix-socket reverse-RPC to ShanClawDesktop's EventKit (spec `docs/desktop-calendar-rpc.md`); `calendar_*` tools register only when the daemon is a Desktop subprocess. The approval-resolution change reuses the existing `POST /approval` + WS broker path. Named-agent multi-session honors the existing `session_id`/`new_session` fields.
+
+### Added
+
+- **Named-agent multi-session, schedule `Stateful` collapse, proactive IM targeting** (PR #216, `c71ff47`, `internal/daemon/`, `internal/schedule/`) — the plain `agent:<name>` lane resolves to the latest interactive session; `schedule.IsSticky` is the single accumulate-across-runs switch driving both route key and history view; successful schedule runs push to the originating IM channel by smart default.
+- **Calendar RPC v1** (`74720e4`, `internal/daemon/desktop_rpc/`) — length-prefixed JSON reverse-RPC over a 0600 Unix socket to Desktop's EventKit; `calendar_*` tools register only when spawned by Desktop (`--rpc-socket`/`--rpc-pidfile`).
+
+### Changed
+
+- **Cloud/IM approvals resolve via the WS broker from `POST /approval`** (`c893ea1`, `internal/daemon/`) — a single broker resolves an approval regardless of whether the decision arrives over SSE or WS, so cloud-channel approval cards clear correctly.
+
+### Fixed
+
+- **Retry + classify upstream `504`s as transient** (`b0ecd1a`, `6b5d5da`, `internal/agent/`) — a 504 (edge/gateway timeout) is retried like 502/503 and labeled a transient service error rather than an unexpected failure.
+- **Reject tier keyword in the `model` field** (PR #213, `b8496f7`, `602dbff`, `internal/agents/`, `internal/config/`) — a tier keyword (`small`/`medium`/`large`) written into `model` is rejected across all write paths, with an e2e guard.
+- **Mid-run inject lifecycle races closed** (`8a1570b`, `db4c982`, `f5fdf5c`, `bf0ed2f`, `internal/daemon/`, `internal/agent/`) — close the inject-window race so IM follow-ups never orphan, drop the skill-discovery hint on inject continuations, flush superseded turn answers to the IM timeline, plus review follow-ups.
+- **desktop_rpc single-instance race + readiness** (`7c80acc`, `d4008c7`) — deterministic readiness and single-instance accept; dropped a dead field.
+- **Surface post-startup desktop_rpc listener failures** (`beae445`) — drain `rpcErrCh` after startup so a late listener failure reaches the log.
+
+### Docs
+
+- `references/schedules.md` (bundled `kocoro` skill): allow `schedule_show` and resync schedule docs to the stateful model (PR #217, `954dbf8`).
+
 ## v0.2.0 — 2026-06-02 — Agent display-name contract (breaking) + mid-run steering + TUI display polish
 
 Three threads. First, the **agent display-name contract is finalized and made breaking**: `POST /agents` no longer accepts a client-supplied slug — the slug is always minted server-side as `agent-<6hex>` and returned in the response, and `display_name` becomes required on create, immutable-via-config, and non-clearable on rename. Second, **mid-run steering** (PR #208): a follow-up sent while a run is in flight is injected into the live loop at the next iteration boundary instead of starting a new run, with a retract path for cancelled drafts. Third, **TUI display polish** (PR #209): live streaming preview, fuzzy slash matching, an adaptive light/dark palette, and CJK-correct display-width truncation.
