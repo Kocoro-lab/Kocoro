@@ -329,6 +329,7 @@ func (s *Store) safeSessionPath(id string) (string, error) {
 
 func NewStore(dir string) *Store {
 	os.MkdirAll(dir, 0700)
+	sweepStaleTempFiles(dir)
 	s := &Store{dir: dir}
 	idx, err := OpenIndex(dir)
 	if err == nil {
@@ -357,6 +358,25 @@ func (s *Store) nextUpdatedAt() time.Time {
 	}
 	s.lastUpdated = now
 	return now
+}
+
+// sweepStaleTempFiles removes orphaned atomic-write temp files left in dir by a
+// crash between os.CreateTemp and os.Rename in writeFileAtomic. Those temps are
+// dot-prefixed and .tmp-suffixed (".<id>.json-<rand>.tmp"), so the .json
+// session loader already ignores them — this just stops them accumulating
+// across crashes. Best-effort; called once per Store at construction.
+func sweepStaleTempFiles(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		os.Remove(filepath.Join(dir, name))
+	}
 }
 
 // writeFileAtomic writes data to a unique temp file in the same directory and

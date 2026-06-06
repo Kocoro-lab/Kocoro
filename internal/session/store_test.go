@@ -83,6 +83,33 @@ func TestWriteFileAtomic_ConcurrentReadsNeverTorn(t *testing.T) {
 	}
 }
 
+// TestNewStore_SweepsStaleTempFiles verifies the startup sweep removes orphaned
+// atomic-write temp files (left by a crash between os.CreateTemp and os.Rename
+// in writeFileAtomic) while leaving real files untouched. The temp files are
+// dot-prefixed + .tmp-suffixed, so the .json session loader already ignores
+// them; the sweep just stops them accumulating across crashes.
+func TestNewStore_SweepsStaleTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	staleTmp := filepath.Join(dir, ".sess-1.json-12345.tmp")
+	if err := os.WriteFile(staleTmp, []byte("{partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(dir, "keep.txt")
+	if err := os.WriteFile(keep, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	st := NewStore(dir)
+	defer st.Close()
+
+	if _, err := os.Stat(staleTmp); !os.IsNotExist(err) {
+		t.Errorf("stale temp file not swept (err=%v)", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("non-temp file was wrongly removed: %v", err)
+	}
+}
+
 func TestStore_SaveLoad(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)
