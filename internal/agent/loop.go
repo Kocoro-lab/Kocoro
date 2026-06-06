@@ -794,6 +794,14 @@ type AgentLoop struct {
 	// ephemeral — it rides the first-turn scaffold and is removed on persist by
 	// the existing captureRunMessages first-turn strip (see loop_system_event_test).
 	systemEventDrain func() []SystemEvent
+	// systemEventRequeue, when set, re-enqueues drained SystemEvents onto the
+	// route's queue. The loop calls it ONLY when the turn fails terminally
+	// before the model ever saw the drained block (the first LLM response never
+	// arrived) — the destructive drain happens at scaffold-build time, so
+	// without this re-enqueue a delivery-failure / kicked notice would be lost
+	// forever when the same outage that caused it also fails the next turn's LLM
+	// call. Daemon-wired to SystemEventStore.Enqueue; nil for TUI / CLI.
+	systemEventRequeue func([]SystemEvent)
 	// mailboxConsumeFn, when set, is invoked with the mailbox row IDs of any
 	// InjectedMessage entries the loop drained mid-turn. The daemon installs
 	// this hook to mark those rows consumed in SQLite + emit queue.flushed
@@ -1286,14 +1294,29 @@ func (a *AgentLoop) SetSystemEventDrainFn(fn func() []SystemEvent) {
 	a.systemEventDrain = fn
 }
 
-// drainAndFormatSystemEvents drains the route's queued system events (if a
-// drain fn is wired) and renders them as a <system-reminder> block. Returns ""
-// when no fn is set or no events are queued.
-func (a *AgentLoop) drainAndFormatSystemEvents() string {
+// SetSystemEventRequeueFn registers the per-route SystemEvent re-enqueue used to
+// recover drained events when a turn fails terminally before the model sees
+// them. Daemon-wired to SystemEventStore.Enqueue; pass nil (TUI/CLI) to disable.
+func (a *AgentLoop) SetSystemEventRequeueFn(fn func([]SystemEvent)) {
+	a.systemEventRequeue = fn
+}
+
+// drainSystemEvents drains the route's queued system events (if a drain fn is
+// wired). Returns nil when no fn is set or no events are queued. The caller is
+// responsible for re-enqueueing via systemEventRequeue if the model never sees
+// them.
+func (a *AgentLoop) drainSystemEvents() []SystemEvent {
 	if a.systemEventDrain == nil {
-		return ""
+		return nil
 	}
-	return formatSystemEventBlock(a.systemEventDrain())
+	return a.systemEventDrain()
+}
+
+// drainAndFormatSystemEvents drains the route's queued system events and renders
+// them as a <system-reminder> block. Returns "" when no fn is set or no events
+// are queued. Retained for callers/tests that don't need re-enqueue semantics.
+func (a *AgentLoop) drainAndFormatSystemEvents() string {
+	return formatSystemEventBlock(a.drainSystemEvents())
 }
 
 // finalDrainInjected returns the non-retracted follow-ups to commit at the
@@ -2848,7 +2871,23 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 	}
 
-	systemEventBlock := a.drainAndFormatSystemEvents()
+	// Drain the route's queued system events destructively here, BEFORE the
+	// first LLM call. If the turn then fails terminally before the model ever
+	// receives the scaffold (sawSystemEventScaffold stays false), re-enqueue
+	// them so the notice survives — the same outage that fails delivery often
+	// fails the very next turn's LLM call too. Once the model has seen them
+	// (first successful LLM response), they are considered delivered and are
+	// intentionally stripped from persisted history.
+	drainedSystemEvents := a.drainSystemEvents()
+	sawSystemEventScaffold := false
+	if len(drainedSystemEvents) > 0 && a.systemEventRequeue != nil {
+		defer func() {
+			if !sawSystemEventScaffold {
+				a.systemEventRequeue(drainedSystemEvents)
+			}
+		}()
+	}
+	systemEventBlock := formatSystemEventBlock(drainedSystemEvents)
 	scaffoldedUserText = appendDynamicUserBlocks(scaffoldedUserText, systemEventBlock, skillListing, prompt.LanguageDirective(a.responseLanguage))
 	messages[len(messages)-1] = replaceUserMessageText(messages[len(messages)-1], scaffoldedUserText)
 
@@ -3376,6 +3415,13 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				if attempt == 0 && a.enableStreaming && a.handler != nil {
 					streamingText.Reset()
 					resp, err = a.client.CompleteStream(ctx, req, func(delta client.StreamDelta) {
+						// A delta means the model received the request (incl. the
+						// drained system-event scaffold) and is responding — so the
+						// events are delivered and must NOT be re-enqueued even if the
+						// stream then aborts mid-flight (e.g. stream-idle timeout).
+						// The callback fires synchronously on the stream-read
+						// goroutine, before this Run's deferred requeue check.
+						sawSystemEventScaffold = true
 						a.handler.OnStreamDelta(delta.Text)
 						streamingText.WriteString(delta.Text)
 					})
@@ -3433,6 +3479,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					// Mark "last assistant response received" for the time-based
 					// microcompact gap calculation (timebasedcompact.go).
 					a.lastAssistantAt = time.Now()
+					// The model has now received the scaffold (incl. any drained
+					// system events), so they are delivered — do not re-enqueue
+					// them if a later iteration fails.
+					sawSystemEventScaffold = true
 					break
 				}
 				if ctx.Err() != nil {
