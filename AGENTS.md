@@ -90,6 +90,8 @@ The daemon is the production integration point for Cloud channels. Route precede
 
 Capabilities are advertised during the WebSocket handshake. Add a capability token in the same PR that ships an optional protocol feature. `delivery_ack` means the daemon acknowledges an inbound message only after reply delivery succeeds, so Cloud can safely drop it from replay.
 
+Schedule proactive push has two independent three-state knobs (`auto`/`on`/`off`, set via natural language through `schedule_create`/`schedule_update`). `broadcast` gates whether a successful run pushes to IM at all. `thread` controls IM thread anchoring: `auto` follows session state (stateful → one thread, stateless → each run top-level), `on`/`off` force it. The daemon resolves `thread` to `ProactivePayload.UseThread *bool` and sends it to Cloud; `nil` means current behavior (anchored thread) and only an explicit off goes top-level. Platforms without threads ignore it. Capability tokens `schedule_broadcast_gate` and `proactive_thread_mode` are observability only.
+
 ### Output Profiles
 
 Use output profiles rather than per-channel syntax. `markdown` is default; `plain` is for Cloud-distributed channels where Cloud owns final rendering.
