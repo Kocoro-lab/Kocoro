@@ -32,7 +32,7 @@ func TestEstimateTokens(t *testing.T) {
 		msgs := []client.Message{
 			{Role: "system", Content: client.NewTextContent("You are a helpful assistant.")}, // 28 chars
 			{Role: "user", Content: client.NewTextContent("hello")},                          // 5 chars
-			{Role: "assistant", Content: client.NewTextContent("Hi there!")},                  // 9 chars
+			{Role: "assistant", Content: client.NewTextContent("Hi there!")},                 // 9 chars
 		}
 		got := EstimateTokens(msgs)
 		// (28/3.5 + 4) + (5/3.5 + 4) + (9/3.5 + 4) = 12+4 + 2+4 + 3+4 = 29
@@ -541,4 +541,160 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 			t.Errorf("expected no-op when no user msg; dropped=%d", dropped)
 		}
 	})
+
+	// On the 1M-context default the byte cap must SCALE with the window, not
+	// bind at a 200K-era flat char constant. A ~3.6M-char paste (~1M tokens)
+	// crosses 0.90×1M and is clipped — but to ~0.80×0.90×1M ≈ 720K tokens
+	// (~2.5M runes), keeping far more than a fixed 400K-char (≈114K-token) cap
+	// would. Guards against regressing stableUserBudgetFraction back to a flat
+	// char constant (issue #124 review: 200K-era sizing silently over-truncates
+	// on 1M-context families).
+	t.Run("budget scales with 1M context window", func(t *testing.T) {
+		const cw = 1_000_000
+		huge := strings.Repeat("word ", 720_000) // 3.6M chars ≈ 1.03M tokens
+		msgs := []client.Message{
+			{Role: "system", Content: client.NewTextContent("sys")},
+			{Role: "user", Content: client.NewTextContent(huge)},
+		}
+		out, dropped := TruncateOversizedLastUserMessage(msgs, cw)
+		if dropped == 0 {
+			t.Fatalf("expected truncation: input exceeds 0.90×1M tokens")
+		}
+		survived := utf8.RuneCountInString(out[1].Content.Text())
+		// 0.80 × 0.90 × 1M × 3.5 ≈ 2.52M runes survive. A flat 400K-char cap
+		// would leave only ~400K — assert we kept far more.
+		if survived < 2_000_000 {
+			t.Errorf("1M-context cap did not scale: survived %d runes, want >= 2M (a 200K-era flat cap would over-truncate)", survived)
+		}
+	})
+
+	// Aggregate overflow with NO single oversized message: several plain-text
+	// user messages each below singleCap but whose SUM exceeds the compaction
+	// target. The per-message stable cap alone truncates nothing, so without an
+	// aggregate fallback the prompt escapes over budget — and in a short
+	// session (≤ MinShapeable) both ShapeHistory and the reactive backstop are
+	// gated off (ShapeHistory no-ops at len ≤ 9), so it 400s with no recovery.
+	// Regression guard for the equal-split rewrite's coverage gap.
+	t.Run("multiple sub-cap messages summing over target are truncated", func(t *testing.T) {
+		// cw=200K → target=180K tok, singleCap=144K tok. Two 350K-char (~100K
+		// token) messages are each under singleCap but sum to ~200K tok.
+		mid := strings.Repeat("a", 350_000)
+		msgs := []client.Message{
+			{Role: "system", Content: client.NewTextContent("sys")},
+			{Role: "user", Content: client.NewTextContent(mid)},
+			{Role: "assistant", Content: client.NewTextContent("ack")},
+			{Role: "user", Content: client.NewTextContent(mid)},
+		}
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 200_000)
+		if dropped == 0 {
+			t.Fatalf("aggregate overflow not truncated: dropped=0 — prompt escapes over budget; short sessions have no ShapeHistory/reactive backstop")
+		}
+	})
+}
+
+// TestTruncateOversizedLastUserMessageByteStableAcrossTurns is the #124
+// regression. The daemon persists the raw oversized user message to
+// session.json and re-runs TruncateOversizedLastUserMessage in memory on
+// every follow-up turn. The byte boundary MUST depend only on the message
+// itself (and the per-session-stable contextWindow), never on the surrounding
+// history — otherwise the same message truncates to a different byte length
+// each turn, shifting the Anthropic prompt-cache prefix at this message and
+// forcing a full cache_creation re-bill (~$0.67/turn observed 2026-05-11).
+//
+// Pre-fix the budget was target − EstimateTokens(messages); appending a turn
+// pair grows EstimateTokens, shrinks the budget, and clips the SAME message
+// shorter on turn 2. This test calls the function twice on a byte-identical
+// huge message — once alone, once followed by an assistant reply + a new user
+// message — and asserts the truncated body and chars_dropped are byte-equal.
+func TestTruncateOversizedLastUserMessageByteStableAcrossTurns(t *testing.T) {
+	const contextWindow = 200_000
+	// 900K ASCII chars — comfortably over 0.90×200K tokens × 3.5 = 630K chars,
+	// so truncation fires on both turns. ASCII keeps bytes == runes for clarity.
+	huge := strings.Repeat("paragraph body ", 60_000)
+
+	// Turn 1: the oversized message is the entire conversation.
+	r1 := []client.Message{
+		{Role: "system", Content: client.NewTextContent("system prompt")},
+		{Role: "user", Content: client.NewTextContent(huge)},
+	}
+	out1, dropped1 := TruncateOversizedLastUserMessage(r1, contextWindow)
+	if dropped1 == 0 {
+		t.Fatalf("turn 1: expected truncation of the huge user message, dropped=0")
+	}
+	body1 := out1[1].Content.Text()
+
+	// Turn 2: same byte-identical huge message at index 1, now followed by the
+	// assistant's prior reply and a new (smaller) user message — the daemon
+	// resume case. EstimateTokens(r2) > EstimateTokens(r1), which is exactly
+	// what shifted the pre-fix budget.
+	tail := strings.Repeat("follow up text ", 4_000) // ~60K chars of trailing history
+	r2 := []client.Message{
+		{Role: "system", Content: client.NewTextContent("system prompt")},
+		{Role: "user", Content: client.NewTextContent(huge)},
+		{Role: "assistant", Content: client.NewTextContent(tail)},
+		{Role: "user", Content: client.NewTextContent(tail)},
+	}
+	out2, dropped2 := TruncateOversizedLastUserMessage(r2, contextWindow)
+	if dropped2 == 0 {
+		t.Fatalf("turn 2: expected truncation of the huge user message, dropped=0")
+	}
+	body2 := out2[1].Content.Text()
+
+	if body1 != body2 {
+		t.Errorf("byte-unstable truncation across turns (issue #124): turn1=%d bytes, turn2=%d bytes, delta=%d — breaks Anthropic prompt-cache prefix at this message, full cache_creation re-bill every follow-up turn",
+			len(body1), len(body2), len(body1)-len(body2))
+	}
+	if dropped1 != dropped2 {
+		t.Errorf("chars_dropped differs across turns (issue #124): turn1=%d turn2=%d — audit.log compaction_success rows diverge for a byte-identical message",
+			dropped1, dropped2)
+	}
+}
+
+// TestTruncateOversizedEqualSplitByteStableAcrossTurns extends the #124 guard
+// to the equal-split path (two oversized messages). The single-message test
+// above never exercises perMsgTokens = singleCap/N, so a regression that
+// reintroduced slice-dependence only in the multi-message branch would slip
+// through. As long as the oversized SET is unchanged across turns (a later
+// turn only appends a small follow-up), each huge message must truncate to the
+// SAME bytes.
+func TestTruncateOversizedEqualSplitByteStableAcrossTurns(t *testing.T) {
+	const cw = 200_000
+	hugeA := strings.Repeat("a", 700_000) // ~200K tokens, over singleCap (144K)
+	hugeB := strings.Repeat("b", 700_000)
+
+	r1 := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent(hugeA)},
+		{Role: "assistant", Content: client.NewTextContent("ack")},
+		{Role: "user", Content: client.NewTextContent(hugeB)},
+	}
+	out1, d1 := TruncateOversizedLastUserMessage(r1, cw)
+	if d1 == 0 {
+		t.Fatal("turn 1: expected truncation of both oversized messages")
+	}
+	a1, b1 := out1[1].Content.Text(), out1[3].Content.Text()
+
+	// Turn 2: same two huge messages, plus a small follow-up. The tail is below
+	// singleCap so the oversized set stays {hugeA, hugeB} — N stays 2.
+	tail := strings.Repeat("c", 50_000)
+	r2 := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent(hugeA)},
+		{Role: "assistant", Content: client.NewTextContent("ack")},
+		{Role: "user", Content: client.NewTextContent(hugeB)},
+		{Role: "assistant", Content: client.NewTextContent("ok")},
+		{Role: "user", Content: client.NewTextContent(tail)},
+	}
+	out2, d2 := TruncateOversizedLastUserMessage(r2, cw)
+	if d2 == 0 {
+		t.Fatal("turn 2: expected truncation")
+	}
+	if out2[1].Content.Text() != a1 {
+		t.Errorf("equal-split not byte-stable across turns: hugeA turn1=%d bytes, turn2=%d bytes",
+			len(a1), len(out2[1].Content.Text()))
+	}
+	if out2[3].Content.Text() != b1 {
+		t.Errorf("equal-split not byte-stable across turns: hugeB turn1=%d bytes, turn2=%d bytes",
+			len(b1), len(out2[3].Content.Text()))
+	}
 }

@@ -22,6 +22,30 @@ const (
 	// net for the remaining 10K headroom.
 	compactThreshold = 0.90
 
+	// stableUserBudgetFraction is the share of the compaction target that the
+	// oversized plain-text user message(s) may keep after truncation; the
+	// remaining 1−frac is reserved for the system prompt and other messages.
+	// With several oversized messages the share is split equally among them
+	// (see TruncateOversizedLastUserMessage), so the combined survivor still
+	// fits this budget.
+	//
+	// Why a fraction of the (per-session-stable) target and NOT
+	// target − EstimateTokens(messages): the slice-derived budget shifted the
+	// byte boundary every turn as history grew, breaking the Anthropic
+	// prompt-cache prefix at the truncated message and re-billing the whole
+	// message as fresh cache_creation (~$0.67/follow-up turn — issue #124).
+	// A fixed fraction makes the cut a pure function of (contextWindow, the
+	// message, the oversized count), identical across turns. Scaling with
+	// contextWindow rather than a flat char cap keeps 200K-era sizing from
+	// silently over-truncating on 1M-context families (Hardcoded Limit Policy).
+	//
+	// Binds when: a single user message exceeds 0.80 of the target — ~504K
+	// runes on a 200K cap, ~2.52M runes on the 1M default. truncateMessageBody
+	// keeps head+tail so usable signal survives. Override: lower for a tighter
+	// system-prompt reserve; raising past ~0.9 risks the clipped message alone
+	// re-crossing the compaction threshold.
+	stableUserBudgetFraction = 0.80
+
 	// defaultKeepLast is the default number of recent turn pairs to keep.
 	defaultKeepLast = 20
 
@@ -130,10 +154,10 @@ func buildShaped(system, firstUser client.Message, summary string, rest []client
 	return stripOrphanedToolPairs(result)
 }
 
-// TruncateOversizedLastUserMessage applies single-message rune-safe head+tail
-// truncation to the most recent user message when the message count is too
-// small for ShapeHistory to help but the total prompt estimate already
-// exceeds the compaction threshold.
+// TruncateOversizedLastUserMessage rune-safely head+tail truncates the
+// oversized plain-text user message(s) when the message count is too small
+// for ShapeHistory to help but the total prompt estimate already exceeds the
+// compaction threshold.
 //
 // This guards against the "single huge user input" failure mode: a user
 // pastes a 195K-token document as one message, len(messages) is far below
@@ -142,19 +166,33 @@ func buildShaped(system, firstUser client.Message, summary string, rest []client
 // Observed during 2026-05-11 stress testing as Stress D (191K input, no
 // client-side defense fired).
 //
+// A message is truncated only when its own estimate exceeds singleCap (a fixed
+// fraction of the compaction target). When several do, the cap is split equally
+// so their combined post-truncation size still fits — the caller's convergence
+// invariant. Each message's boundary depends only on (contextWindow, that
+// message, the oversized count). For the common case — one huge paste plus
+// small follow-ups — the oversized count stays 1 across turns, so the message
+// reloaded from session.json truncates to the SAME bytes every follow-up turn
+// and the Anthropic prompt-cache prefix is preserved (issue #124). Two rare
+// edge cases trade that byte-stability for staying within budget: a SECOND huge
+// paste on a later turn changes the count and re-clips the earlier ones; and
+// several mid-size messages that individually fit but collectively overflow
+// take the slice-aware aggregate fallback (truncateLargestUserMessageToFit).
+// The common resume path is stable; the edge cases at least converge instead of
+// escaping over budget.
+//
 // Returns messages unchanged when:
 //   - contextWindow is non-positive (caller didn't configure)
 //   - total estimate already fits under the compaction threshold
-//   - the last user message has structured content (tool_result / image
-//     blocks): truncating those is unsafe; ShapeHistory's deeper paths
-//     would be the right place to handle them
-//   - the user message's text body already fits its share of the budget
+//   - the only over-budget content is structured (tool_result / image blocks
+//     are skipped — ShapeHistory's deeper paths handle them)
 //
-// On truncation, replaces the user message's text content with a head+tail
-// concatenation joined by a human-readable marker so the model can note
-// the gap. Always UTF-8 rune-aligned — never splits a codepoint mid-sequence.
-// Returns (messages, droppedChars). droppedChars > 0 means truncation
-// actually happened; callers can use it to emit OnRunStatus or audit.
+// On truncation, replaces each oversized message's text content with a
+// head+tail concatenation joined by a human-readable marker so the model can
+// note the gap. Always UTF-8 rune-aligned — never splits a codepoint
+// mid-sequence. Returns (messages, droppedChars). droppedChars > 0 means
+// truncation actually happened; callers can use it to emit OnRunStatus or
+// audit.
 func TruncateOversizedLastUserMessage(messages []client.Message, contextWindow int) ([]client.Message, int) {
 	if contextWindow <= 0 || len(messages) == 0 {
 		return messages, 0
@@ -165,20 +203,116 @@ func TruncateOversizedLastUserMessage(messages []client.Message, contextWindow i
 		return messages, 0
 	}
 
-	// Find the LARGEST plain-text user message — the one actually pushing
-	// the prompt over the threshold. "Most recent" misses the resume case
-	// (daemon/TUI loaded a huge prior user message from session.json, the
-	// new user message is a small follow-up — truncating the small one
-	// does nothing while the huge one continues to blow up the prompt).
-	// Structured content (tool_result / image blocks) is skipped here;
-	// ShapeHistory's full path handles those when message count allows.
-	idx := -1
-	maxLen := 0
-	for i := 0; i < len(messages); i++ {
-		if messages[i].Role != "user" {
+	// singleCap is the most a single plain-text user message may keep after
+	// truncation — a fixed fraction of the (per-session-stable) target. A
+	// message is "oversized" when its own estimate exceeds this cap; those are
+	// the ones forcing the overflow. Normal follow-ups and assistant replies
+	// fall below it, so the oversized SET is stable across turns even as small
+	// history accumulates — that stability is what keeps the truncation
+	// byte-identical across turns (issue #124).
+	const minUserTokenFloor = 1000
+	singleCap := int(float64(target) * stableUserBudgetFraction)
+	if singleCap < minUserTokenFloor {
+		singleCap = minUserTokenFloor
+	}
+
+	// Collect every oversized plain-text user message. This covers the resume
+	// case ("most recent" would miss a huge prior message reloaded from
+	// session.json behind a small new follow-up) and the multi-paste case (two
+	// huge inputs in one short session). Structured content (tool_result /
+	// image blocks) is skipped: truncating those is unsafe; ShapeHistory's
+	// deeper paths handle them when message count allows.
+	var oversized []int
+	for i := range messages {
+		if messages[i].Role != "user" || messages[i].Content.HasBlocks() {
 			continue
 		}
-		if messages[i].Content.HasBlocks() {
+		text := messages[i].Content.Text()
+		if text == "" {
+			continue
+		}
+		msgTokens := int(math.Ceil(float64(utf8.RuneCountInString(text))/charsPerToken)) + overheadPerMessage
+		if msgTokens > singleCap {
+			oversized = append(oversized, i)
+		}
+	}
+	if len(oversized) == 0 {
+		// Aggregate overflow with no single oversized message: several mid-size
+		// user messages each fit under singleCap but together exceed target.
+		// The per-message cap can't engage, so fall back to clipping the single
+		// largest message toward the remaining headroom (slice-aware, NOT
+		// byte-stable). See truncateLargestUserMessageToFit for why this is
+		// acceptable here.
+		return truncateLargestUserMessageToFit(messages, target, estimated, minUserTokenFloor)
+	}
+
+	// Share singleCap across the oversized messages: N of them each capped at
+	// singleCap/N, so their post-truncation SUM stays within singleCap and the
+	// prompt drops below the preflight threshold even with several huge inputs
+	// (the truncateUserMessageOverBudget caller's convergence invariant,
+	// exercised by TestShortSessionTruncate_RepeatsUntilUnderPreflightThreshold).
+	// Each message's boundary depends only on (contextWindow, that message, the
+	// oversized count) — stable across turns AS LONG AS the oversized set is
+	// stable. A small follow-up never enters the set (it's below singleCap), so
+	// the common resume case is byte-stable; but a SECOND oversized paste
+	// arriving on a later turn changes N and re-clips the earlier ones — a
+	// bounded, rare cache cost for genuine multi-huge-paste resumes (#124).
+	perMsgTokens := singleCap / len(oversized)
+	if perMsgTokens < minUserTokenFloor {
+		perMsgTokens = minUserTokenFloor
+	}
+	perMsgRunes := int(float64(perMsgTokens) * charsPerToken)
+
+	totalDropped := 0
+	for _, idx := range oversized {
+		text := messages[idx].Content.Text()
+		runeCount := utf8.RuneCountInString(text)
+		if runeCount == 0 {
+			continue
+		}
+		// EstimateTokens counts RUNES (chars/3.5) but truncateMessageBody
+		// slices by BYTES. For ASCII bytes == runes; for CJK/emoji (~3
+		// bytes/rune) a rune budget used as a byte cap would over-truncate to
+		// ~1/3. Convert via this text's own bytes-per-rune ratio — a property
+		// of the text, so the boundary stays byte-stable across turns.
+		bytesPerRune := float64(len(text)) / float64(runeCount)
+		byteBudget := int(float64(perMsgRunes) * bytesPerRune)
+		if len(text) <= byteBudget {
+			continue
+		}
+		truncated := truncateMessageBody(text, byteBudget)
+		totalDropped += len(text) - len(truncated)
+		oldContent := messages[idx].Content
+		messages[idx] = client.Message{
+			Role:    messages[idx].Role,
+			Content: client.NewTextContent(truncated),
+		}
+		// Instrument the in-place content rewrite for cache-drift attribution
+		// (CLAUDE.md "Prompt Cache" invariant). Without it, SHANNON_CACHE_DEBUG
+		// shows a prefix flip on this path with no correlating compact row.
+		client.LogCacheCompactEvent("user_truncate", idx, oldContent, messages[idx].Content)
+	}
+	return messages, totalDropped
+}
+
+// truncateLargestUserMessageToFit is the aggregate fallback for the rare short
+// session where several mid-size plain-text user messages each fit under
+// singleCap but together overflow target — the stable per-message cap in
+// TruncateOversizedLastUserMessage can't engage. It clips the single largest
+// plain-text user message toward the remaining headroom; the caller's loop
+// (truncateUserMessageOverBudget) re-invokes until the prompt fits.
+//
+// This branch is slice-aware (budget = target − other messages' tokens) and so
+// NOT byte-stable across turns — acceptable because it fires ONLY when the
+// stable path cannot, where the alternative is the prompt escaping over budget
+// to the API with no ShapeHistory / reactive backstop below MinShapeable (the
+// Stress-D failure class). Single-huge-message #124 stability is unaffected:
+// that case has an oversized message and takes the equal-split path instead.
+func truncateLargestUserMessageToFit(messages []client.Message, target, estimated, minUserTokenFloor int) ([]client.Message, int) {
+	idx := -1
+	maxLen := 0
+	for i := range messages {
+		if messages[i].Role != "user" || messages[i].Content.HasBlocks() {
 			continue
 		}
 		if l := len(messages[i].Content.Text()); l > maxLen {
@@ -190,16 +324,6 @@ func TruncateOversizedLastUserMessage(messages []client.Message, contextWindow i
 		return messages, 0
 	}
 	text := messages[idx].Content.Text()
-	if text == "" {
-		return messages, 0
-	}
-
-	// EstimateTokens measures content in RUNES (chars/3.5 ratio), but
-	// truncateMessageBody slices by BYTES. For pure ASCII bytes == runes so
-	// the two collapse to the same number, but for CJK/emoji (~3 bytes per
-	// rune) a rune-count budget interpreted as byte cap would over-truncate
-	// the content to ~1/3 of the intended size. Convert by sampling this
-	// text's actual bytes-per-rune ratio. (PR review item #5.)
 	runeCount := utf8.RuneCountInString(text)
 	if runeCount == 0 {
 		return messages, 0
@@ -209,26 +333,23 @@ func TruncateOversizedLastUserMessage(messages []client.Message, contextWindow i
 	if otherTokens < 0 {
 		otherTokens = 0
 	}
-	userTokenBudget := target - otherTokens
-	const minUserTokenFloor = 1000
-	if userTokenBudget < minUserTokenFloor {
-		userTokenBudget = minUserTokenFloor
+	budgetTokens := target - otherTokens
+	if budgetTokens < minUserTokenFloor {
+		budgetTokens = minUserTokenFloor
 	}
-	userRuneBudget := int(float64(userTokenBudget) * charsPerToken)
 	bytesPerRune := float64(len(text)) / float64(runeCount)
-	userByteBudget := int(float64(userRuneBudget) * bytesPerRune)
-
-	if len(text) <= userByteBudget {
+	byteBudget := int(float64(budgetTokens) * charsPerToken * bytesPerRune)
+	if len(text) <= byteBudget {
 		return messages, 0
 	}
-
-	truncated := truncateMessageBody(text, userByteBudget)
-	dropped := len(text) - len(truncated)
+	truncated := truncateMessageBody(text, byteBudget)
+	oldContent := messages[idx].Content
 	messages[idx] = client.Message{
 		Role:    messages[idx].Role,
 		Content: client.NewTextContent(truncated),
 	}
-	return messages, dropped
+	client.LogCacheCompactEvent("user_truncate_aggregate", idx, oldContent, messages[idx].Content)
+	return messages, len(text) - len(truncated)
 }
 
 // truncateMessageBody returns s capped at `cap` bytes via head+tail
