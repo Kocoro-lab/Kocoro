@@ -420,10 +420,11 @@ type proactiveCall struct {
 	text            string
 	sessionID       string
 	imStatusContext json.RawMessage
+	useThread       *bool
 }
 
-func (f *fakeProactiveSender) SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage) error {
-	f.calls = append(f.calls, proactiveCall{agentName, text, sessionID, imStatusContext})
+func (f *fakeProactiveSender) SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage, useThread *bool) error {
+	f.calls = append(f.calls, proactiveCall{agentName, text, sessionID, imStatusContext, useThread})
 	return f.err
 }
 

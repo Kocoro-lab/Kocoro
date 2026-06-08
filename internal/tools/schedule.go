@@ -115,6 +115,15 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 							"\"off\": even IM-created schedules stay silent — pick this when the user explicitly wants a quiet local run. " +
 							"Important: do NOT default to \"off\" when the user hasn't expressed an opinion — let the smart default decide.",
 					},
+					"thread": map[string]any{
+						"type": "string",
+						"enum": []string{"auto", "on", "off"},
+						"description": "Optional. Controls whether the IM push lands in a thread (one conversation) or as separate top-level messages. " +
+							"Omit or \"auto\" (recommended): follows the task's memory mode — a stateful schedule collects its runs into one thread, a stateless one posts each run on its own. " +
+							"\"on\": always collect runs in the same thread — pick when the user says they want everything in one place / one thread. " +
+							"\"off\": always post each run separately at the top level — pick when the user says \"send it separately each time\" / don't bundle into a thread. " +
+							"Note: platforms without real threads (LINE / WhatsApp / WeCom / Telegram) ignore this setting.",
+					},
 					"description": agent.DescriptionFieldSpec,
 				},
 			},
@@ -151,6 +160,15 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 							"Omit = leave the current setting unchanged. " +
 							"\"auto\" = clear back to smart default (decided by the schedule's CreatedFromSource). " +
 							"\"on\" / \"off\" = explicitly override.",
+					},
+					"thread": map[string]any{
+						"type": "string",
+						"enum": []string{"auto", "on", "off"},
+						"description": "Optional. Change the IM thread-anchoring intent. " +
+							"Omit = leave the current setting unchanged. " +
+							"\"auto\" = follow the task's memory mode (stateful → one thread, stateless → separate each run). " +
+							"\"on\" = always one thread; \"off\" = always separate top-level messages. " +
+							"Platforms without real threads (LINE / WhatsApp / WeCom / Telegram) ignore this.",
 					},
 					"description": agent.DescriptionFieldSpec,
 				},
@@ -243,6 +261,19 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			}
 			broadcast = b
 		}
+		// Parse thread enum. Absent or "auto" maps to nil (follow session state).
+		var thread *bool
+		if raw, present := args["thread"]; present && raw != nil {
+			tStr, isStr := raw.(string)
+			if !isStr {
+				return agent.ValidationError(fmt.Sprintf("thread must be a string (\"auto\", \"on\", or \"off\"); got %T", raw)), nil
+			}
+			t, ok := schedule.ParseThreadEnum(tStr)
+			if !ok {
+				return agent.ValidationError(fmt.Sprintf("thread must be one of \"auto\", \"on\", \"off\"; got %q", tStr)), nil
+			}
+			thread = t
+		}
 		// Capture per-call source for the broadcast gate's smart default.
 		// Empty / not-in-ctx both map to "" — downstream treats both as
 		// "unknown source" and the gate falls through to silent.
@@ -255,6 +286,7 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			Broadcast:         broadcast,
 			CreatedFromSource: createdFromSource,
 			IMStatusContext:   imStatusContext,
+			Thread:            thread,
 		})
 		if err != nil {
 			return agent.ToolResult{Content: err.Error(), IsError: true}, nil
@@ -347,12 +379,27 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			}
 			opts.Broadcast = &schedule.BroadcastOpt{Value: b}
 		}
+		// Parse the optional thread enum. Absent → leave field unchanged.
+		// Present → ParseThreadEnum maps "auto"/"on"/"off" to *bool; the
+		// ThreadOpt wrapper distinguishes "leave alone" (opts.Thread == nil)
+		// from "rewrite to nil/true/false" (opts.Thread != nil).
+		if raw, present := args["thread"]; present && raw != nil {
+			tStr, isStr := raw.(string)
+			if !isStr {
+				return agent.ValidationError(fmt.Sprintf("thread must be a string (\"auto\", \"on\", or \"off\"); got %T", raw)), nil
+			}
+			t, ok := schedule.ParseThreadEnum(tStr)
+			if !ok {
+				return agent.ValidationError(fmt.Sprintf("thread must be one of \"auto\", \"on\", \"off\"; got %q", tStr)), nil
+			}
+			opts.Thread = &schedule.ThreadOpt{Value: t}
+		}
 		// When no field is set, treat as a no-op success rather than an
 		// error: a degenerate `{id, description}` call still produced a
 		// well-formed response (the schedule exists, nothing needed to
 		// change). Manager.Update has its own "no fields" guard so we
 		// must short-circuit here before calling it.
-		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil {
+		if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil && opts.Thread == nil {
 			return agent.ToolResult{Content: fmt.Sprintf("Schedule %s unchanged (no fields specified).", id)}, nil
 		}
 		if err := t.manager.Update(id, opts); err != nil {

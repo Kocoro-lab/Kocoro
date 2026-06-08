@@ -282,9 +282,10 @@ func (m *Manager) tickGoalDriven(ctx context.Context, ah *agentHeartbeat, goals 
 	// Deliver to Slack/Lark/etc. via Shannon Cloud. Heartbeat reads the latest
 	// kind=interactive session (never an IM session), so there is no inbound IM
 	// routing blob to target — pass nil → Cloud broadcasts to the agent's bound
-	// channels, as before.
+	// channels, as before. useThread nil too: heartbeat has no stateful concept,
+	// so it leaves thread anchoring to Cloud's current default.
 	if m.deps.WSClient != nil {
-		if err := m.deps.WSClient.SendProactive(ah.name, result.Reply, sessionID, nil); err != nil {
+		if err := m.deps.WSClient.SendProactive(ah.name, result.Reply, sessionID, nil, nil); err != nil {
 			log.Printf("heartbeat: %q proactive send failed: %v", ah.name, err)
 		}
 	}

@@ -406,7 +406,7 @@ func (h *scheduleHandler) OnApprovalNeeded(tool string, args string) bool {
 // without standing up a real WebSocket server. Mirrors LifecycleEventSender
 // in lifecycle.go.
 type ProactiveSender interface {
-	SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage) error
+	SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage, useThread *bool) error
 }
 
 // broadcastReply forwards a successful schedule reply to every Cloud channel
@@ -421,9 +421,14 @@ func broadcastReply(ws ProactiveSender, sched *schedule.Schedule, reply, session
 	if !shouldBroadcast(sched) {
 		return
 	}
+	// Resolve the thread-anchor hint from the schedule's thread setting and
+	// session state. Explicit on/off wins; auto follows sticky+blob presence.
+	useThread := resolveThread(sched.Thread, sched.IsSticky(), len(sched.IMStatusContext) > 0)
 	// Pass the schedule's snapshotted IM routing blob (empty for Desktop/cron-
-	// created schedules → Cloud broadcasts, preserving prior behavior).
-	if err := ws.SendProactive(sched.Agent, reply, sessionID, sched.IMStatusContext); err != nil {
+	// created schedules → Cloud broadcasts, preserving prior behavior). The blob
+	// is sent even for stateless/top-level pushes so Cloud can still target the
+	// originating channel — top-level just drops the thread anchor.
+	if err := ws.SendProactive(sched.Agent, reply, sessionID, sched.IMStatusContext, useThread); err != nil {
 		log.Printf("scheduler: proactive send failed for schedule %s: %v", sched.ID, err)
 	}
 }

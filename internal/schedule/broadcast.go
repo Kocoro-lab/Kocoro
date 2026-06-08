@@ -28,3 +28,28 @@ func ParseBroadcastEnum(s string) (*bool, bool) {
 		return nil, false
 	}
 }
+
+// ParseThreadEnum maps the schedule `thread` enum string to a *bool for storage.
+// Mirrors ParseBroadcastEnum. Returns (*bool, ok); ok=false means the input
+// wasn't an allowed value.
+//
+// Mapping:
+//   - ""    → (nil, true)    // absent/empty = auto (follow session state)
+//   - "auto"→ (nil, true)    // auto
+//   - "on"  → (*true, true)  // always thread-anchor
+//   - "off" → (*false, true) // always top-level / independent
+//   - other → (nil, false)   // invalid
+func ParseThreadEnum(s string) (*bool, bool) {
+	switch s {
+	case "", "auto":
+		return nil, true
+	case "on":
+		b := true
+		return &b, true
+	case "off":
+		b := false
+		return &b, true
+	default:
+		return nil, false
+	}
+}
