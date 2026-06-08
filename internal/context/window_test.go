@@ -590,6 +590,31 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 			t.Fatalf("aggregate overflow not truncated: dropped=0 — prompt escapes over budget; short sessions have no ShapeHistory/reactive backstop")
 		}
 	})
+
+	// Re-truncating an already-clipped message must be idempotent so the
+	// caller loop (truncateUserMessageOverBudget) terminates on its
+	// `dropped<=0` break. N=1 with a large, non-truncatable system prompt is
+	// the worst case: even after the user message is clipped to singleCap, the
+	// clipped message still measures marginally over singleCap (perMsgTokens +
+	// overhead) and re-enters the oversized set — but it's already at the byte
+	// cap, so a second call must return dropped=0 rather than re-clip and spin.
+	t.Run("re-truncating an already-clipped message is idempotent (no caller spin)", func(t *testing.T) {
+		const cw = 200_000
+		huge := strings.Repeat("a", 900_000)
+		bigSys := strings.Repeat("s", 200_000) // system content is not truncatable
+		msgs := []client.Message{
+			{Role: "system", Content: client.NewTextContent(bigSys)},
+			{Role: "user", Content: client.NewTextContent(huge)},
+		}
+		out, d1 := TruncateOversizedLastUserMessage(msgs, cw)
+		if d1 == 0 {
+			t.Fatal("first call should truncate the huge user message")
+		}
+		_, d2 := TruncateOversizedLastUserMessage(out, cw)
+		if d2 != 0 {
+			t.Errorf("second call re-clipped an already-truncated message (dropped=%d) — truncateUserMessageOverBudget would not terminate", d2)
+		}
+	})
 }
 
 // TestTruncateOversizedLastUserMessageByteStableAcrossTurns is the #124
