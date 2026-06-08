@@ -1511,10 +1511,37 @@ func TestTruncateUserMessageOverBudget_LongSessionClipsHugeFirstUser(t *testing.
 	if !strings.Contains(out[1].Content.Text(), "user message truncated") {
 		t.Errorf("huge preserved firstUser was not truncated by long-session safety net")
 	}
-	// Small tail messages must not be touched — only the largest user
-	// message gets clipped.
+	// Small tail messages must not be touched — they sit below singleCap so
+	// they never enter the oversized set the truncator clips.
 	if out[9].Content.Text() != "h" {
 		t.Errorf("small tail user message was mutated: got %q", out[9].Content.Text())
+	}
+}
+
+// TestTruncateUserMessageOverBudget_AggregateMidSizeConverges guards the
+// coverage gap the stable-budget rewrite introduced: a short session of
+// several mid-size user messages, each BELOW singleCap (so the per-message
+// equal-split cap never engages) but together OVER target. Below MinShapeable
+// there is no ShapeHistory or reactive backstop, so if the aggregate fallback
+// did not fire the prompt would escape over budget and 400. The caller loop
+// must still converge below the preflight threshold.
+func TestTruncateUserMessageOverBudget_AggregateMidSizeConverges(t *testing.T) {
+	loop := &AgentLoop{contextWindow: 200_000}
+	// ~100K tokens each (350K chars), individually under singleCap (144K) but
+	// summing to ~200K tokens — over target (180K).
+	mid := strings.Repeat("m", 350_000)
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent(mid)},
+		{Role: "assistant", Content: client.NewTextContent("ack")},
+		{Role: "user", Content: client.NewTextContent(mid)},
+	}
+	if !shouldPreflightCompact(messages, loop.contextWindow) {
+		t.Fatal("test setup invariant: input must exceed preflight threshold")
+	}
+	out := loop.truncateUserMessageOverBudget(messages, "test", "short_session")
+	if shouldPreflightCompact(out, loop.contextWindow) {
+		t.Fatalf("aggregate mid-size session left prompt over preflight threshold — no backstop exists below MinShapeable, so this would 400")
 	}
 }
 
