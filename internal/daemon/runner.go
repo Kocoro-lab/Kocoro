@@ -1392,8 +1392,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// persist the text first — pre-loop user save (Source != ""), mid-turn
 	// checkpoint, or post-loop final save (Source == "") — all on this goroutine,
 	// so a plain bool needs no synchronization. The hard-error stub save is
-	// deliberately NOT a call site: it may persist only the error message, so we
-	// leave the rows pending for crash recovery to replay.
+	// deliberately NOT a call site: the turn failed before a clean save, so the
+	// rows stay pending for recovery to replay. For an empty-Source turn the
+	// error-stub rebuild can also persist the user turn carrying the drained
+	// text, so recovery re-delivers a duplicate rather than a pure retry — the
+	// safe direction (a duplicate beats a silent loss).
 	var drainedMailboxIDs []string
 	mailboxConsumed := false
 	consumeDrainedMailbox := func() {
@@ -1469,6 +1472,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// drain and that save leaves the rows pending (consumed_at IS NULL), so
 		// daemon-startup recovery (cmd/daemon.go LoadAllPending → SeedMailbox)
 		// replays them instead of losing them silently.
+		//
+		// Invariant: every routed run that drains here later reaches at least
+		// one of those save sites. Ephemeral runs would NOT (they skip session
+		// persistence), but every Ephemeral caller also sets BypassRouting (empty
+		// RouteKey → never enters this routed branch — see heartbeat.go), so the
+		// drain is unreachable for them today. If a future caller ever pairs
+		// Ephemeral with a non-empty RouteKey, gate this drain on !req.Ephemeral —
+		// otherwise the rows leave the in-memory queue with no save to flag them
+		// consumed and recovery re-delivers them on every restart.
 		if pendingBatch := deps.SessionCache.DrainMailbox(req.RouteKey, 20); len(pendingBatch) > 0 {
 			pendingIDs := make([]string, 0, len(pendingBatch))
 			var b strings.Builder

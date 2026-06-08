@@ -192,6 +192,51 @@ func TestRunAgent_MailboxConsumedAtPreLoopSaveForSourced(t *testing.T) {
 	assertDrainedTextPersisted(t, deps, sessIDForRoute(t, deps, routeKey), "queued from slack")
 }
 
+// TestRunAgent_MailboxStaysPendingOnHardError pins the crash-durability
+// guarantee that is the whole reason for issue #163: a turn that hard-errors
+// before any clean content save must leave the drained row PENDING
+// (consumed_at IS NULL) so daemon-startup recovery replays it. The hard-error
+// stub save is deliberately not a consumeDrainedMailbox call site.
+func TestRunAgent_MailboxStaysPendingOnHardError(t *testing.T) {
+	const sessID = "ordering-test-163-harderror"
+	routeKey := "session:" + sanitizeRouteValue(sessID)
+
+	deps, store := mailboxOrderingDeps(t)
+	defer deps.SessionCache.CloseAll()
+
+	// Always-500 gateway → the first (and only) LLM call hard-errors before any
+	// checkpoint or final save can persist the drained text and consume the row.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "synthetic upstream failure", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+	deps.GW = client.NewGatewayClient(ts.URL, "test-key")
+
+	if out, err := deps.SessionCache.EnqueueMessage(routeKey, agenttypes.QueuedMessage{
+		ID: "mbx-harderr-1", Source: "ws", Text: "queued question",
+		Priority: agenttypes.PriorityNext, EnqueuedAt: time.Now(),
+	}); err != nil || out != MailboxQueued {
+		t.Fatalf("seed enqueue: out=%v err=%v", out, err)
+	}
+
+	_, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:       "live prompt",
+		SessionID:  sessID,
+		NewSession: true, // empty Source → no pre-loop save; hard error before final save
+	}, nullEventHandler{})
+	if err == nil {
+		t.Fatal("expected hard error from always-500 gateway")
+	}
+
+	pend, lerr := store.LoadPendingByRoute(routeKey)
+	if lerr != nil {
+		t.Fatalf("load pending: %v", lerr)
+	}
+	if len(pend) != 1 {
+		t.Fatalf("hard error must leave the drained row pending for recovery, pending = %d, want 1", len(pend))
+	}
+}
+
 // assertDrainedTextPersisted resumes the session by id and fails unless some
 // user message contains want (the drained mailbox text is prepended into the
 // run's first user turn).
