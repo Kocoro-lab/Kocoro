@@ -41,11 +41,12 @@ func shouldBroadcast(s *schedule.Schedule) bool {
 //     stateless run, or a sticky run with no blob to anchor to, posts at the
 //     channel top level.
 //
-// The returned *bool is the wire value: nil here can only happen for the
-// non-existent caller passing thread==nil && (!isSticky || !hasBlob) → &false,
-// so in practice resolveThread always returns a non-nil pointer for a real
-// schedule. Cloud maps nil → current behavior (thread-anchor); the daemon
-// always sends an explicit value so the resolution is unambiguous.
+// The returned *bool is always the wire value: the explicit branch returns the
+// caller's non-nil pointer, and the auto branch returns &(isSticky && hasBlob)
+// — also non-nil. So for any real schedule resolveThread yields a non-nil
+// pointer and the daemon always sends an explicit value, leaving the resolution
+// unambiguous. (Cloud still maps a missing field to thread-anchor for back-compat,
+// but the daemon never relies on that.)
 func resolveThread(thread *bool, isSticky bool, hasBlob bool) *bool {
 	if thread != nil {
 		return thread
