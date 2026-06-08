@@ -41,6 +41,17 @@ type Schedule struct {
 	//   false → never broadcast (regardless of CreatedFromSource)
 	Broadcast *bool `json:"broadcast,omitempty"`
 
+	// Thread is a three-state control for whether a proactive IM push anchors
+	// into a thread (one session ↔ one thread) or posts at the channel top level:
+	//   nil   → auto: follow session state (see daemon.resolveThread). Sticky
+	//           schedules with an IM blob thread-anchor; stateless / blob-less
+	//           runs post independently at top level.
+	//   true  → on: always anchor into the same thread (ignores Stateful).
+	//   false → off: always post top-level / independent (ignores Stateful).
+	// The daemon resolves this to ProactivePayload.UseThread; platforms without
+	// real threads (LINE/WhatsApp/WeCom/Telegram) ignore the hint.
+	Thread *bool `json:"thread,omitempty"`
+
 	// CreatedFromSource snapshots req.Source at creation time. Used by the
 	// daemon's shouldBroadcast helper as the smart-default signal. Examples:
 	// "slack", "feishu", "webview", "tui", "cli", "one-shot".
@@ -107,12 +118,25 @@ type UpdateOpts struct {
 	// Go doesn't allow nested-pointer literals naturally, so callers use
 	// the BroadcastOpt wrapper below to express "clear vs leave alone".
 	Broadcast *BroadcastOpt
+	// Thread follows the same three-state semantics as Schedule.Thread and the
+	// same opts-level distinction as Broadcast above:
+	//   - opts.Thread == nil                       → field not touched
+	//   - opts.Thread != nil, Value == nil         → clear back to auto
+	//   - opts.Thread != nil, Value == &true/&false→ set on/off
+	Thread *ThreadOpt
 }
 
 // BroadcastOpt distinguishes "leave broadcast alone" (UpdateOpts.Broadcast == nil)
 // from "rewrite broadcast" (UpdateOpts.Broadcast != nil; inner Value carries the
 // new pointer, where Value == nil means clear back to smart default).
 type BroadcastOpt struct {
+	Value *bool
+}
+
+// ThreadOpt distinguishes "leave thread alone" (UpdateOpts.Thread == nil) from
+// "rewrite thread" (UpdateOpts.Thread != nil; inner Value carries the new
+// pointer, where Value == nil means clear back to auto). Mirrors BroadcastOpt.
+type ThreadOpt struct {
 	Value *bool
 }
 
@@ -252,6 +276,10 @@ type CreateOpts struct {
 	// delivery target). Empty for non-IM creation paths. See
 	// Schedule.IMStatusContext.
 	IMStatusContext json.RawMessage
+	// Thread is the IM thread-anchor opt-in/out. nil = auto (follow session
+	// state); *true = always thread; *false = always top-level. See the
+	// Schedule.Thread comment for the full semantics.
+	Thread *bool
 }
 
 func (m *Manager) Create(agentName, cron, prompt string, stateful bool) (string, error) {
@@ -284,6 +312,10 @@ func (m *Manager) CreateWithOpts(agentName, cron, prompt string, stateful bool, 
 		bCopy := *opts.Broadcast
 		s.Broadcast = &bCopy
 	}
+	if opts.Thread != nil {
+		tCopy := *opts.Thread
+		s.Thread = &tCopy
+	}
 	err := m.lockedModify(func(schedules []Schedule) ([]Schedule, error) {
 		return append(schedules, s), nil
 	})
@@ -311,8 +343,8 @@ func (m *Manager) Get(id string) (*Schedule, error) {
 }
 
 func (m *Manager) Update(id string, opts *UpdateOpts) error {
-	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil {
-		return fmt.Errorf("no fields to update: provide at least one of cron, prompt, enabled, stateful, or broadcast")
+	if opts.Cron == nil && opts.Prompt == nil && opts.Enabled == nil && opts.Stateful == nil && opts.Broadcast == nil && opts.Thread == nil {
+		return fmt.Errorf("no fields to update: provide at least one of cron, prompt, enabled, stateful, broadcast, or thread")
 	}
 	if opts.Cron != nil {
 		if err := validateCron(*opts.Cron); err != nil {
@@ -362,6 +394,16 @@ func (m *Manager) Update(id string, opts *UpdateOpts) error {
 					} else {
 						bCopy := *opts.Broadcast.Value
 						schedules[i].Broadcast = &bCopy
+					}
+				}
+				if opts.Thread != nil {
+					// Value == nil → clear Thread back to nil (auto). Copy
+					// non-nil pointers to avoid aliasing the caller's value.
+					if opts.Thread.Value == nil {
+						schedules[i].Thread = nil
+					} else {
+						tCopy := *opts.Thread.Value
+						schedules[i].Thread = &tCopy
 					}
 				}
 				return schedules, nil

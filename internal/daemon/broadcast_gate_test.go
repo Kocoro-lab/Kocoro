@@ -61,6 +61,45 @@ func TestShouldBroadcast(t *testing.T) {
 // elsewhere. The matrix above asserts the integration end-to-end so this
 // file deliberately doesn't re-test the source enum.
 
+func TestResolveThread(t *testing.T) {
+	bTrue := true
+	bFalse := false
+
+	tests := []struct {
+		name     string
+		thread   *bool
+		isSticky bool
+		hasBlob  bool
+		want     bool // dereferenced value; resolveThread always returns non-nil
+	}{
+		// auto (thread==nil): follow session state (isSticky && hasBlob).
+		{name: "auto_sticky_blob_anchors", thread: nil, isSticky: true, hasBlob: true, want: true},
+		{name: "auto_stateless_blob_top_level", thread: nil, isSticky: false, hasBlob: true, want: false},
+		{name: "auto_sticky_noblob_top_level", thread: nil, isSticky: true, hasBlob: false, want: false},
+		{name: "auto_stateless_noblob_top_level", thread: nil, isSticky: false, hasBlob: false, want: false},
+
+		// on (thread==&true): always anchor, ignoring isSticky / hasBlob.
+		{name: "on_ignores_stateless_noblob", thread: &bTrue, isSticky: false, hasBlob: false, want: true},
+		{name: "on_ignores_sticky_blob", thread: &bTrue, isSticky: true, hasBlob: true, want: true},
+
+		// off (thread==&false): always top-level, ignoring isSticky / hasBlob.
+		{name: "off_ignores_sticky_blob", thread: &bFalse, isSticky: true, hasBlob: true, want: false},
+		{name: "off_ignores_stateless_noblob", thread: &bFalse, isSticky: false, hasBlob: false, want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveThread(tc.thread, tc.isSticky, tc.hasBlob)
+			if got == nil {
+				t.Fatalf("resolveThread returned nil; want non-nil *bool (%v)", tc.want)
+			}
+			if *got != tc.want {
+				t.Errorf("resolveThread() = %v, want %v", *got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsValidScheduleSource(t *testing.T) {
 	tests := []struct {
 		source string

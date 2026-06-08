@@ -420,10 +420,11 @@ type proactiveCall struct {
 	text            string
 	sessionID       string
 	imStatusContext json.RawMessage
+	useThread       *bool
 }
 
-func (f *fakeProactiveSender) SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage) error {
-	f.calls = append(f.calls, proactiveCall{agentName, text, sessionID, imStatusContext})
+func (f *fakeProactiveSender) SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage, useThread *bool) error {
+	f.calls = append(f.calls, proactiveCall{agentName, text, sessionID, imStatusContext, useThread})
 	return f.err
 }
 
@@ -619,6 +620,64 @@ func TestBroadcastReply_PassesIMStatusContext(t *testing.T) {
 	}
 	if string(fake.calls[0].imStatusContext) != string(blob) {
 		t.Errorf("imStatusContext = %q, want %q (schedule snapshot passed through to SendProactive)", fake.calls[0].imStatusContext, blob)
+	}
+}
+
+// TestBroadcastReply_ResolvesUseThread exercises the auto (thread==nil) branch
+// end-to-end through broadcastReply: a sticky schedule WITH an IM routing blob
+// anchors into its thread (useThread → true); a stateless schedule with a blob
+// posts top-level (useThread → false). Asserts the *bool the fake sender
+// captured, not just whether SendProactive fired.
+func TestBroadcastReply_ResolvesUseThread(t *testing.T) {
+	bTrue := true
+	bFalse := false
+	blob := json.RawMessage(`{"platform":"slack","channel_id":"C1","message_ts":"123.45"}`)
+
+	tests := []struct {
+		name          string
+		stateful      *bool
+		imStatus      json.RawMessage
+		wantUseThread bool // dereferenced; resolveThread always yields non-nil in auto mode
+	}{
+		{
+			name:          "sticky_with_blob_anchors_thread",
+			stateful:      &bTrue,
+			imStatus:      blob,
+			wantUseThread: true,
+		},
+		{
+			name:          "stateless_with_blob_top_level",
+			stateful:      &bFalse,
+			imStatus:      blob,
+			wantUseThread: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeProactiveSender{}
+			// Slack source so the broadcast gate permits the send; Thread is left
+			// nil (auto) so resolveThread follows sticky+blob, the path under test.
+			sched := schedule.Schedule{
+				ID:                "s1",
+				Agent:             "ops",
+				CreatedFromSource: "slack",
+				Stateful:          tc.stateful,
+				IMStatusContext:   tc.imStatus,
+			}
+			broadcastReply(fake, &sched, "hi", "sess-1")
+
+			if len(fake.calls) != 1 {
+				t.Fatalf("want 1 SendProactive call, got %d", len(fake.calls))
+			}
+			got := fake.calls[0].useThread
+			if got == nil {
+				t.Fatalf("useThread is nil; want non-nil *bool (%v)", tc.wantUseThread)
+			}
+			if *got != tc.wantUseThread {
+				t.Errorf("useThread = %v, want %v", *got, tc.wantUseThread)
+			}
+		})
 	}
 }
 

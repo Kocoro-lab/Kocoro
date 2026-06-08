@@ -31,6 +31,30 @@ func shouldBroadcast(s *schedule.Schedule) bool {
 	return isCloudSource(s.CreatedFromSource)
 }
 
+// resolveThread computes the ProactivePayload.UseThread hint for a proactive
+// push from the schedule's thread setting and session state.
+//
+//   - thread != nil (explicit on/off): used verbatim, ignoring isSticky — the
+//     user asked for a specific behavior, session state does not override it.
+//   - thread == nil (auto): follow session state. A sticky schedule WITH an IM
+//     routing blob anchors into its thread (one session ↔ one thread); a
+//     stateless run, or a sticky run with no blob to anchor to, posts at the
+//     channel top level.
+//
+// The returned *bool is always the wire value: the explicit branch returns the
+// caller's non-nil pointer, and the auto branch returns &(isSticky && hasBlob)
+// — also non-nil. So for any real schedule resolveThread yields a non-nil
+// pointer and the daemon always sends an explicit value, leaving the resolution
+// unambiguous. (Cloud still maps a missing field to thread-anchor for back-compat,
+// but the daemon never relies on that.)
+func resolveThread(thread *bool, isSticky bool, hasBlob bool) *bool {
+	if thread != nil {
+		return thread
+	}
+	v := isSticky && hasBlob
+	return &v
+}
+
 // localScheduleSources enumerates the non-cloud origins the daemon attributes
 // schedules to. "kocoro" is the HTTP API's default source (server.go sets it
 // when a RunAgentRequest arrives without one); the rest map to the surfaces a

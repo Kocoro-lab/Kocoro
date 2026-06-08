@@ -702,6 +702,42 @@ func TestScheduleCreate_InvalidBroadcastRejected(t *testing.T) {
 	}
 }
 
+func TestScheduleCreate_InvalidThreadRejected(t *testing.T) {
+	ctx, tool, mgr := setupScheduleCreateTestEnv(t, "slack")
+	args := map[string]any{
+		"cron":        "* * * * *",
+		"prompt":      "hi",
+		"description": "test",
+		"thread":      "maybe", // invalid enum value
+	}
+	payload, err := json.Marshal(args)
+	if err != nil {
+		t.Fatalf("marshal args: %v", err)
+	}
+
+	result, err := tool.Run(ctx, string(payload))
+	if err != nil {
+		t.Fatalf("Run returned go error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected error for invalid thread value, got success: %q", result.Content)
+	}
+	// The [validation error] prefix is load-bearing for loop detection (see
+	// TestScheduleCreate_InvalidBroadcastRejected).
+	if !strings.Contains(result.Content, "[validation error]") {
+		t.Errorf("expected [validation error] prefix in %q", result.Content)
+	}
+	// Pin the error to the thread value so a regression that drops the thread
+	// parse branch (and falls through to success) is caught.
+	if !strings.Contains(result.Content, "thread") {
+		t.Errorf("expected error to mention 'thread', got %q", result.Content)
+	}
+	// Defensive: no schedule should have been persisted.
+	if list, _ := mgr.List(); len(list) != 0 {
+		t.Errorf("expected no schedules saved after rejection, got %d", len(list))
+	}
+}
+
 // Source capture is unconditional regardless of broadcast arg: even without
 // a broadcast arg, an IM source captured at creation drives the smart-default
 // downstream. This guards against a regression where the source-capture path
@@ -874,6 +910,33 @@ func TestScheduleUpdate_InvalidBroadcastRejected(t *testing.T) {
 	// validation error and would mask a missing broadcast handler).
 	if !strings.Contains(result.Content, "broadcast") {
 		t.Errorf("expected error to mention 'broadcast', got %q", result.Content)
+	}
+}
+
+func TestScheduleUpdate_InvalidThreadRejected(t *testing.T) {
+	ctx, tool, _ := setupScheduleUpdateTestEnv(t, schedule.Schedule{ID: "s1", Cron: "* * * * *", Prompt: "hi"})
+
+	args := map[string]any{
+		"id":          "s1",
+		"description": "update test",
+		"thread":      "maybe",
+	}
+	payload, _ := json.Marshal(args)
+	result, err := tool.Run(ctx, string(payload))
+	if err != nil {
+		t.Fatalf("Run returned go error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected error for invalid thread value, got success")
+	}
+	if !strings.Contains(result.Content, "[validation error]") {
+		t.Errorf("expected [validation error] prefix in %q", result.Content)
+	}
+	// Pin the error to the thread value (not the generic
+	// "at least one of cron/prompt/..." gate, which also returns a validation
+	// error and would mask a missing thread handler).
+	if !strings.Contains(result.Content, "thread") {
+		t.Errorf("expected error to mention 'thread', got %q", result.Content)
 	}
 }
 

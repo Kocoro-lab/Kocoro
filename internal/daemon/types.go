@@ -231,6 +231,14 @@ type ProactivePayload struct {
 	// broadcasting. Empty → Cloud falls back to broadcast (backward compatible:
 	// old Cloud ignores the field; new Cloud sees no target from old daemons).
 	IMStatusContext json.RawMessage `json:"im_status_context,omitempty"`
+	// UseThread controls whether Cloud anchors this push into the originating
+	// IM thread or posts at the channel top level. The json tag MUST stay
+	// `use_thread,omitempty` — Cloud reads the same field name.
+	//   nil   → Cloud uses current behavior (thread-anchor). Old daemons omit
+	//           the field, so nil preserves backward compatibility.
+	//   *true → anchor into the thread.
+	//   *false→ post top-level / independent (still targeted to the channel).
+	UseThread *bool `json:"use_thread,omitempty"`
 }
 
 // DaemonEventPayload carries a single agent loop event to Cloud.

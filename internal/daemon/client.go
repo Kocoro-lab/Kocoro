@@ -101,7 +101,12 @@ const (
 	// to a ProactivePayload for precise routing. Observability only — the
 	// fallback rule is "non-empty target → targeted; empty → broadcast", so the
 	// token is not load-bearing for correctness.
-	CapProactiveTargeting    = "proactive_targeting"
+	CapProactiveTargeting = "proactive_targeting"
+	// CapProactiveThreadMode tells Cloud the daemon may attach a UseThread hint
+	// to a ProactivePayload to control IM thread anchoring. Observability only —
+	// Cloud reads the field directly (nil → current thread-anchor behavior), so
+	// the token is not load-bearing for correctness.
+	CapProactiveThreadMode   = "proactive_thread_mode"
 	CapReplyDeliveryResultV1 = "reply_delivery_result_v1"
 	// CapChannelStateEventV1 — daemon consumes channel_state_event frames
 	// (live membership/binding/transport changes). Independent of
@@ -119,6 +124,7 @@ var Capabilities = []string{
 	CapIMTimelineV1,
 	CapScheduleBroadcastGate,
 	CapProactiveTargeting,
+	CapProactiveThreadMode,
 	CapReplyDeliveryResultV1,
 	CapChannelStateEventV1,
 }
@@ -369,7 +375,11 @@ func (c *Client) SendReply(messageID string, payload ReplyPayload) error {
 // imStatusContext is the opaque routing target echoed back to Cloud for precise
 // delivery to the originating IM thread; empty (nil) → Cloud falls back to
 // broadcast (preserving pre-targeting behavior).
-func (c *Client) SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage) error {
+//
+// useThread controls IM thread anchoring (see ProactivePayload.UseThread):
+// nil → Cloud's current thread-anchor behavior; *true → thread; *false →
+// top-level. Callers without a thread opinion (e.g. heartbeat) pass nil.
+func (c *Client) SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage, useThread *bool) error {
 	if text == "" {
 		return nil
 	}
@@ -379,6 +389,7 @@ func (c *Client) SendProactive(agentName, text, sessionID string, imStatusContex
 		Format:          FormatText,
 		SessionID:       sessionID,
 		IMStatusContext: imStatusContext,
+		UseThread:       useThread,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal proactive payload: %w", err)
