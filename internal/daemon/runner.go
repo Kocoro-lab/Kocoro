@@ -1380,6 +1380,40 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	var route *routeEntry
 	var routeDone chan struct{}
 	var routeInjectCh chan agent.InjectedMessage
+
+	// drainedMailboxIDs holds the mailbox rows drained into this run's prompt
+	// (set in the routed branch below). consumeDrainedMailbox durably flags them
+	// consumed + emits EventQueueFlushed, but ONLY the first time it is called
+	// after a session.Save that actually persisted the drained text — issue #163.
+	// DrainMailbox already removed them from the in-memory queue; deferring just
+	// the SQLite consumed_at flag keeps the crash-recovery view accurate
+	// (LoadAllPending filters consumed_at IS NULL) without changing the live
+	// views. The guard makes it idempotent across the three save sites that may
+	// persist the text first — pre-loop user save (Source != ""), mid-turn
+	// checkpoint, or post-loop final save (Source == "") — all on this goroutine,
+	// so a plain bool needs no synchronization. The hard-error stub save is
+	// deliberately NOT a call site: it may persist only the error message, so we
+	// leave the rows pending for crash recovery to replay.
+	var drainedMailboxIDs []string
+	mailboxConsumed := false
+	consumeDrainedMailbox := func() {
+		if mailboxConsumed || len(drainedMailboxIDs) == 0 {
+			return
+		}
+		mailboxConsumed = true
+		if err := deps.SessionCache.MarkMailboxConsumed(drainedMailboxIDs); err != nil {
+			log.Printf("daemon: mailbox mark consumed (%v): %v", drainedMailboxIDs, err)
+		}
+		if deps.EventBus != nil {
+			payload, _ := json.Marshal(map[string]any{
+				"route_key":    req.RouteKey,
+				"consumed_ids": drainedMailboxIDs,
+				"snapshot":     ToDTOs(deps.SessionCache.MailboxSnapshot(req.RouteKey)),
+			})
+			deps.EventBus.Emit(Event{Type: EventQueueFlushed, Payload: payload})
+		}
+	}
+
 	// Empty route key = no cache entry for routing, always start a fresh local session.
 	if req.RouteKey != "" {
 		route = deps.SessionCache.LockRouteWithManager(req.RouteKey, sessionsDir)
@@ -1429,13 +1463,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// startup) and any HTTP/Desktop messages that piled up via the
 		// /queue endpoint while the route was idle.
 		//
-		// Known limitation (P0-4 relaxed): mailbox messages are MarkConsumed
-		// as soon as their text lands in the prompt string — they are NOT
-		// guaranteed to survive a daemon crash that happens between this
-		// point and session.Save. The trade-off bounds blast radius to
-		// "messages enqueued via /queue or recovery, then daemon crashes
-		// in the next ~10ms"; for Cloud-sourced messages the Cloud replay
-		// buffer is the primary durability layer regardless.
+		// Durability (issue #163): the drained rows are only stashed here; the
+		// durable consumed_at flag is written by consumeDrainedMailbox AFTER the
+		// first session.Save that persists the drained text. A crash between this
+		// drain and that save leaves the rows pending (consumed_at IS NULL), so
+		// daemon-startup recovery (cmd/daemon.go LoadAllPending → SeedMailbox)
+		// replays them instead of losing them silently.
 		if pendingBatch := deps.SessionCache.DrainMailbox(req.RouteKey, 20); len(pendingBatch) > 0 {
 			pendingIDs := make([]string, 0, len(pendingBatch))
 			var b strings.Builder
@@ -1482,17 +1515,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				req.Text = prompt
 			}
 			log.Printf("daemon: drained %d mailbox msg(s) into prompt for route %q", len(pendingBatch), req.RouteKey)
-			if err := deps.SessionCache.MarkMailboxConsumed(pendingIDs); err != nil {
-				log.Printf("daemon: mailbox mark consumed (%v): %v", pendingIDs, err)
-			}
-			if deps.EventBus != nil {
-				payload, _ := json.Marshal(map[string]any{
-					"route_key":    req.RouteKey,
-					"consumed_ids": pendingIDs,
-					"snapshot":     ToDTOs(deps.SessionCache.MailboxSnapshot(req.RouteKey)),
-				})
-				deps.EventBus.Emit(Event{Type: EventQueueFlushed, Payload: payload})
-			}
+			// Defer the durable consumed_at flag + EventQueueFlushed to
+			// consumeDrainedMailbox, fired after the first save that persists
+			// this text (issue #163).
+			drainedMailboxIDs = pendingIDs
 		}
 	} else {
 		managerDir := sessionsDir
@@ -1807,16 +1833,21 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		preLoopUserAppended = true
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: failed to pre-save user message: %v", err)
-		} else if deps.EventBus != nil {
-			payload, _ := json.Marshal(map[string]any{
-				"agent":      agentName,
-				"source":     req.Source,
-				"sender":     req.Sender,
-				"session_id": sess.ID,
-				"message_id": msgID,
-				"text":       prompt,
-			})
-			deps.EventBus.Emit(Event{Type: EventMessageReceived, Payload: payload})
+		} else {
+			// The drained mailbox text is now durable in this user message — flag
+			// the rows consumed (issue #163). First of the three save sites.
+			consumeDrainedMailbox()
+			if deps.EventBus != nil {
+				payload, _ := json.Marshal(map[string]any{
+					"agent":      agentName,
+					"source":     req.Source,
+					"sender":     req.Sender,
+					"session_id": sess.ID,
+					"message_id": msgID,
+					"text":       prompt,
+				})
+				deps.EventBus.Emit(Event{Type: EventMessageReceived, Payload: payload})
+			}
 		}
 	}
 
@@ -2240,6 +2271,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			// dirty flag set and the next fire point retries.
 			return err
 		}
+		// For Source == "" runs there is no pre-loop save; the first checkpoint
+		// that persists the loop's transcript is the first durable home of the
+		// drained text (issue #163). No-op once already consumed.
+		consumeDrainedMailbox()
 		return nil
 	})
 
@@ -2389,6 +2424,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				})
 				deps.EventBus.Emit(Event{Type: EventAgentError, Payload: payload})
 			}
+		} else {
+			// Final durability backstop: a fast Source == "" turn that finished
+			// before any checkpoint fired persists the drained text here first
+			// (issue #163). No-op once a pre-loop save / checkpoint already
+			// consumed.
+			consumeDrainedMailbox()
 		}
 
 		// Only emit agent_reply when the session actually persisted. If the
