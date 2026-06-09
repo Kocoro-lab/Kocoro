@@ -1034,6 +1034,7 @@ type fakeGatewayBackend struct {
 	mu       sync.Mutex
 	captured []client.CompletionRequest
 	reply    string
+	usage    *client.Usage // optional; when set, every completion echoes this usage
 }
 
 func (g *fakeGatewayBackend) handler() http.HandlerFunc {
@@ -1044,11 +1045,15 @@ func (g *fakeGatewayBackend) handler() http.HandlerFunc {
 		g.mu.Lock()
 		g.captured = append(g.captured, req)
 		reply := g.reply
+		usage := g.usage
 		g.mu.Unlock()
 		resp := client.CompletionResponse{
 			Provider:   "anthropic",
 			Model:      "test-model",
 			OutputText: reply,
+		}
+		if usage != nil {
+			resp.Usage = *usage
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -1734,4 +1739,88 @@ func TestComputeReportedUsage(t *testing.T) {
 			t.Errorf("got %+v, want %+v (empty accumulator must not clobber turn usage)", got, want)
 		}
 	})
+}
+
+// accumulatingHandler is a UsageProvider over nullEventHandler, mirroring the
+// production daemonEventHandler shape: it embeds an UsageAccumulator, folds
+// OnUsage into it, and exposes Usage(). RunAgent wraps any handler in
+// *multiHandler, so this is the exact path that decides whether the wrapped
+// provider survives the handler.(agent.UsageProvider) assertions.
+type accumulatingHandler struct {
+	nullEventHandler
+	acc agent.UsageAccumulator
+}
+
+func (h *accumulatingHandler) OnUsage(u agent.TurnUsage)     { h.acc.Add(u) }
+func (h *accumulatingHandler) Usage() agent.AccumulatedUsage { return h.acc.Snapshot() }
+
+// TestRunAgent_PersistsSessionUsage locks the production wiring that issue #196
+// exposed. RunAgent wraps the handler in *multiHandler before applyTurnUsage
+// type-asserts it against agent.UsageProvider (runner.go ~2273). If multiHandler
+// doesn't forward UsageProvider the assertion fails, turnUsage is nil,
+// applyTurnUsage no-ops, and sess.Usage is never persisted — and unlike
+// result.Usage (covered by the loop-level TurnUsage fallback) sess.Usage has NO
+// fallback, so it silently stays nil at schema_version 1. Pre-fix this test
+// fails on the nil sess.Usage assertion; post-fix the session carries the
+// accumulator totals at schema_version 2.
+func TestRunAgent_PersistsSessionUsage(t *testing.T) {
+	gw := &fakeGatewayBackend{
+		reply: "done",
+		usage: &client.Usage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150, CostUSD: 0.01},
+	}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+
+	// Routed run (non-empty RouteKey) so the session manager writes to the
+	// durable shanDir/sessions dir. BypassRouting would route to an
+	// os.MkdirTemp dir that RunAgent removes on return — useless for asserting
+	// persistence. A routed source (slack) also mirrors the production paths
+	// the bug actually hit (desktop/slack/schedule).
+	req := RunAgentRequest{
+		Text:     "hi",
+		Source:   "slack",
+		RouteKey: "session:test-usage-persist",
+	}
+	handler := &accumulatingHandler{}
+	res, err := RunAgent(context.Background(), deps, req, handler)
+	if err != nil {
+		t.Fatalf("RunAgent error: %v", err)
+	}
+	if res == nil || res.SessionID == "" {
+		t.Fatalf("RunAgent returned no persisted session id: %+v", res)
+	}
+
+	// result.Usage carries the spend. This path has a loop-TurnUsage fallback,
+	// so it would pass even with the dead override branch — assert it only as a
+	// sanity floor, not as the bug's signal.
+	if res.Usage.CostUSD <= 0 || res.Usage.TotalTokens == 0 {
+		t.Errorf("result.Usage = %+v, want non-zero tokens/cost", res.Usage)
+	}
+
+	// Load-bearing assertion: the persisted session must carry usage. This is
+	// the path with no fallback — exactly what was dead before the fix.
+	sessPath := filepath.Join(deps.ShannonDir, "sessions", res.SessionID+".json")
+	data, readErr := os.ReadFile(sessPath)
+	if readErr != nil {
+		t.Fatalf("read persisted session %s: %v", sessPath, readErr)
+	}
+	var sess session.Session
+	if err := json.Unmarshal(data, &sess); err != nil {
+		t.Fatalf("unmarshal session: %v", err)
+	}
+	if sess.Usage == nil {
+		t.Fatalf("sess.Usage is nil — accumulator never reached applyTurnUsage (multiHandler dropped UsageProvider)")
+	}
+	if sess.Usage.CostUSD != 0.01 {
+		t.Errorf("sess.Usage.CostUSD = %v, want 0.01", sess.Usage.CostUSD)
+	}
+	if sess.Usage.TotalTokens != 150 {
+		t.Errorf("sess.Usage.TotalTokens = %d, want 150", sess.Usage.TotalTokens)
+	}
+	if sess.SchemaVersion < 2 {
+		t.Errorf("sess.SchemaVersion = %d, want >= 2 (applyTurnUsage bumps to 2 when it writes usage)", sess.SchemaVersion)
+	}
 }
