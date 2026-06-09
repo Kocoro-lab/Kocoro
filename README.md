@@ -732,7 +732,7 @@ shan "what schedules are running?"
 shan "cancel the morning health check"
 ```
 
-Cron supports the full 5-field syntax (via [gronx](https://github.com/adhocore/gronx)): ranges (`1-5`), steps (`*/5`), lists (`1,3,5`), and combinations.
+Cron supports the full 5-field syntax (via [gronx](https://github.com/adhocore/gronx)): ranges (`1-5`), steps (`*/5`), lists (`1,3,5`), and combinations. Impossible day/month combinations (e.g. `0 0 31 2 *` — Feb 31) are rejected at create time since they would never fire; use `L` (`0 0 L * *`) for the last day of the month rather than `31`.
 
 **How it works:**
 

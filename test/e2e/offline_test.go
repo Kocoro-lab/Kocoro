@@ -136,7 +136,7 @@ func TestOffline_ScheduleCRUD(t *testing.T) {
 	mgr := schedule.NewManager(filepath.Join(dir, "schedules.json"))
 
 	// Create
-	id, err := mgr.Create("", "0 0 31 2 *", "never runs", false)
+	id, err := mgr.Create("", "0 0 28 2 *", "yearly check", false)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -150,10 +150,10 @@ func TestOffline_ScheduleCRUD(t *testing.T) {
 	for _, item := range items {
 		if item.ID == id {
 			found = true
-			if item.Cron != "0 0 31 2 *" {
+			if item.Cron != "0 0 28 2 *" {
 				t.Errorf("cron mismatch: %q", item.Cron)
 			}
-			if item.Prompt != "never runs" {
+			if item.Prompt != "yearly check" {
 				t.Errorf("prompt mismatch: %q", item.Prompt)
 			}
 		}

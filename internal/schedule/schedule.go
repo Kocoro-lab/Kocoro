@@ -153,7 +153,62 @@ func validateCron(expr string) error {
 	if !g.IsValid(expr) {
 		return fmt.Errorf("invalid cron expression: %q", expr)
 	}
+	if err := validateCronFeasible(expr); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateCronFeasible rejects syntactically-valid cron expressions whose
+// day-of-month / month combination can never occur on a real calendar (e.g.
+// "0 0 31 2 *" — Feb 31). gronx.IsValid only range-checks each field in
+// isolation, so these pass syntax validation, the launchd plist loads, and the
+// schedule silently never fires (issue #160). The failure mode is mostly
+// agent-generated crons ("monthly on the 31st" → 0 0 31 * *), so a hard reject
+// at create/update time is the only signal a user gets.
+//
+// Rather than re-implement cron matching (ranges, steps, lists, L/W/#, and the
+// day-of-month-OR-day-of-week union semantics), we delegate to gronx's own
+// IsDue and probe a fixed, leap-year-inclusive 8-year window (2024 and 2028 are
+// leap years). The window is independent of the current time, so feasibility is
+// a pure function of the expression. Eight calendar years cover every month
+// length plus Feb 29, so any expression that can ever fire on a date does so at
+// least once in the window; only the genuinely impossible combinations come up
+// empty. gronx.NextTickAfter is NOT usable here — its day-field bump relies on
+// Go's time normalization, which rolls Feb 31 to March and returns a bogus
+// "next tick" with a nil error instead of reporting infeasibility.
+func validateCronFeasible(expr string) error {
+	// Segments normalizes to [sec min hour dom month dow (year)] — seconds at
+	// index 0 regardless of the caller's field count — so dom/month/dow sit at
+	// fixed positions 3/4/5.
+	segs, err := gronx.Segments(expr)
+	if err != nil {
+		return nil // unreachable after IsValid; let the syntax path own errors
+	}
+	// Neutralize the time-of-day and year fields so the probe judges ONLY
+	// day-of-month/month/day-of-week feasibility. Forcing minute/hour to "*"
+	// lets the midnight reference below match the time component on every day;
+	// blanking the year keeps a far-future pinned year (out of scope here, and
+	// gronx's own unreachable-year handling owns it) from masquerading as a
+	// date-feasibility failure.
+	segs[0], segs[1], segs[2] = "*", "*", "*"
+	if len(segs) == 7 {
+		segs[6] = "*"
+	}
+	dateExpr := strings.Join(segs, " ")
+
+	g := gronx.New()
+	for ref := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC); ref.Year() <= 2031; ref = ref.AddDate(0, 0, 1) {
+		if due, _ := g.IsDue(dateExpr, ref); due {
+			return nil
+		}
+	}
+	// Lead with "invalid cron expression" so the daemon's HTTP handlers, which
+	// classify schedule errors into status codes by substring-matching the
+	// message ("invalid" → 400), return a 400 here rather than a 500. This keeps
+	// the feasibility rejection consistent with the syntax rejection above —
+	// both are client input errors. See handleCreateSchedule / handlePatchSchedule.
+	return fmt.Errorf("invalid cron expression %q: specifies a day that never occurs in the given month(s) (e.g. Feb 31) and would never fire; use a valid day, or %q for the last day of the month", expr, "L")
 }
 
 func validateAgent(name string) error {

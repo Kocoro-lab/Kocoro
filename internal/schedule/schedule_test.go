@@ -132,6 +132,57 @@ func TestUpdateRejectsInvalidCron(t *testing.T) {
 	}
 }
 
+// Issue #160: gronx range-checks each field in isolation, so impossible
+// day-of-month/month combos (Feb 31, Apr 31) pass IsValid but never fire.
+// validateCron must reject these on both Create and Update.
+func TestCreateRejectsInfeasibleCron(t *testing.T) {
+	infeasible := []string{
+		"0 0 31 2 *",   // Feb 31 — never exists
+		"0 0 30 2 *",   // Feb 30 — never exists
+		"0 0 31 4 *",   // Apr 31 — 30-day month
+		"0 0 31 6,9 *", // Jun + Sep — both 30-day
+		"0 0 31 2,4 *", // Feb + Apr — both impossible
+	}
+	dir := t.TempDir()
+	mgr := NewManager(filepath.Join(dir, "schedules.json"))
+	for _, c := range infeasible {
+		if _, err := mgr.Create("bot", c, "task", false); err == nil {
+			t.Errorf("expected infeasible cron %q to be rejected", c)
+		}
+	}
+}
+
+// Feasible-but-rare expressions must still be accepted: Feb 29 (leap years),
+// the 31st across all months (skips 30-day months but fires the rest),
+// day-of-week union semantics that fire on the weekday regardless of an
+// impossible day-of-month, and the L last-day extension.
+func TestCreateAcceptsFeasibleEdgeCron(t *testing.T) {
+	feasible := []string{
+		"0 0 29 2 *",   // Feb 29 — leap years only, still fires
+		"0 0 31 * *",   // 31st of any month — partial overlap, accepted
+		"0 0 31 1,2 *", // Jan 31 valid even though Feb 31 is not
+		"0 0 30 2 1",   // Feb 30 (never) OR Monday — fires on Mondays
+		"0 0 L 2 *",    // last day of February
+	}
+	dir := t.TempDir()
+	mgr := NewManager(filepath.Join(dir, "schedules.json"))
+	for _, c := range feasible {
+		if _, err := mgr.Create("bot", c, "task", false); err != nil {
+			t.Errorf("expected feasible cron %q to be accepted, got: %v", c, err)
+		}
+	}
+}
+
+func TestUpdateRejectsInfeasibleCron(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(filepath.Join(dir, "schedules.json"))
+	id, _ := mgr.Create("bot", "0 9 * * *", "task", false)
+	bad := "0 0 31 2 *"
+	if err := mgr.Update(id, &UpdateOpts{Cron: &bad}); err == nil {
+		t.Fatal("expected error for infeasible cron update")
+	}
+}
+
 func TestEnableDisable(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(filepath.Join(dir, "schedules.json"))
