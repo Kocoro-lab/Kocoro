@@ -264,3 +264,60 @@ func TestMultiHandlerOnIntermediateAnswerPropagatesToImplementers(t *testing.T) 
 func TestMultiHandlerSatisfiesIntermediateAnswerHandlerInterface(t *testing.T) {
 	var _ agent.IntermediateAnswerHandler = (*multiHandler)(nil) // compile-time check
 }
+
+// usageProviderSpy implements agent.UsageProvider (and agent.EventHandler via
+// the embedded usageSpy). Used to verify multiHandler.Usage() forwards to the
+// first wrapped handler that exposes an accumulator snapshot.
+type usageProviderSpy struct {
+	usageSpy
+	snapshot agent.AccumulatedUsage
+}
+
+func (s *usageProviderSpy) Usage() agent.AccumulatedUsage { return s.snapshot }
+
+// RunAgent wraps the transport handler in a *multiHandler before the usage
+// resolvers (computeReportedUsage + the applyTurnUsage extraction) type-assert
+// it against agent.UsageProvider. Without forwarding here both assertions fail:
+// computeReportedUsage falls back to the loop's TurnUsage (harmless — it has its
+// own fallback), but applyTurnUsage gets a nil provider and never writes
+// sess.Usage, which has NO fallback. This test pins the forward so the wrapped
+// provider stays reachable. See issue #196.
+func TestMultiHandlerUsageForwardsToImplementer(t *testing.T) {
+	want := agent.AccumulatedUsage{
+		LLM:         agent.TurnUsage{InputTokens: 100, OutputTokens: 200, TotalTokens: 300, CostUSD: 0.01, LLMCalls: 2},
+		ToolCalls:   1,
+		ToolCostUSD: 0.001,
+	}
+	provider := &usageProviderSpy{snapshot: want}
+	plain := &plainSpy{}
+
+	// Provider first — production order is [transportHandler, bus].
+	m := &multiHandler{handlers: []agent.EventHandler{provider, plain}}
+	if got := m.Usage(); got != want {
+		t.Fatalf("Usage() = %+v, want %+v", got, want)
+	}
+
+	// Provider second — forwarding must scan past non-providers, not bail on the
+	// first handler (guards the symmetric case where order ever flips).
+	m2 := &multiHandler{handlers: []agent.EventHandler{plain, provider}}
+	if got := m2.Usage(); got != want {
+		t.Fatalf("Usage() with provider second = %+v, want %+v", got, want)
+	}
+}
+
+// No wrapped handler implements UsageProvider → zero snapshot, no panic.
+func TestMultiHandlerUsageNoProviderReturnsZero(t *testing.T) {
+	m := &multiHandler{handlers: []agent.EventHandler{&plainSpy{}, &plainSpy{}}}
+	if got := m.Usage(); got != (agent.AccumulatedUsage{}) {
+		t.Fatalf("Usage() with no provider = %+v, want zero", got)
+	}
+}
+
+// Verify multiHandler satisfies agent.UsageProvider so RunAgent's
+// `handler.(agent.UsageProvider)` assertions (computeReportedUsage and the
+// applyTurnUsage extraction at runner.go) succeed when the loop handler is a
+// *multiHandler — without it, sess.Usage is never persisted on daemon-routed
+// runs.
+func TestMultiHandlerSatisfiesUsageProviderInterface(t *testing.T) {
+	var _ agent.UsageProvider = (*multiHandler)(nil) // compile-time check
+}

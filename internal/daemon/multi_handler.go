@@ -131,6 +131,25 @@ func (m *multiHandler) OnInjectedCommitted(clientMessageID, text string) {
 	}
 }
 
+// Usage forwards the accumulated usage snapshot from the first wrapped handler
+// that implements agent.UsageProvider (in production that's the transport
+// handler — daemon WS / SSE / HTTP / schedule — which embeds an
+// agent.UsageAccumulator; the bus handler does not). Present on multiHandler
+// itself so RunAgent's `handler.(agent.UsageProvider)` assertions succeed when
+// the loop handler is a *multiHandler. Without this, BOTH usage resolvers go
+// dead: computeReportedUsage silently takes the loop-TurnUsage fallback, and —
+// the load-bearing failure — applyTurnUsage receives a nil provider and never
+// writes sess.Usage (that persisted field has no fallback, so it stayed nil at
+// schema_version 1 on every daemon-routed session). See issue #196.
+func (m *multiHandler) Usage() agent.AccumulatedUsage {
+	for _, h := range m.handlers {
+		if up, ok := h.(agent.UsageProvider); ok {
+			return up.Usage()
+		}
+	}
+	return agent.AccumulatedUsage{}
+}
+
 // OnIntermediateAnswer propagates a superseded turn's final answer to wrapped
 // handlers that implement agent.IntermediateAnswerHandler (the daemon WS handler
 // does, re-emitting it as an LLM_OUTPUT timeline segment). Present on
