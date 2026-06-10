@@ -2953,11 +2953,20 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// Check for context cancellation (e.g. user pressed Esc)
 		if ctx.Err() != nil {
 			if lastText != "" {
-				messages = append(messages, client.Message{
-					Role:    "assistant",
-					Content: client.NewTextContent(lastText),
-				})
-				stampMessage()
+				// Flush the partial answer ONLY if it isn't already in the
+				// history. On the native tool path the preamble that set
+				// lastText was persisted by buildAssistantMessage in the same
+				// iteration, so re-appending here doubles the assistant text
+				// on disk (the Cmd+Enter "replied twice" bug). The XML
+				// fallback path never persists the preamble, so the flush is
+				// still its only record.
+				if !lastTextAlreadyPersisted(messages, lastText) {
+					messages = append(messages, client.Message{
+						Role:    "assistant",
+						Content: client.NewTextContent(lastText),
+					})
+					stampMessage()
+				}
 			} else if i == 0 {
 				// First iteration, no LLM response yet. Insert a placeholder so
 				// the session has an assistant turn between user messages. Without
@@ -4736,11 +4745,17 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// Synthesis failed (LLM error, context cancel, etc.). Fall back to
 	// the legacy behavior: return whatever lastText we captured.
 	if lastText != "" {
-		messages = append(messages, client.Message{
-			Role:    "assistant",
-			Content: client.NewTextContent(lastText),
-		})
-		stampMessage()
+		// Same dedup as the cancel teardown above: a native-path preamble is
+		// already persisted, so appending it again would double the text.
+		// The return value is unchanged either way — only the on-disk
+		// history is deduped.
+		if !lastTextAlreadyPersisted(messages, lastText) {
+			messages = append(messages, client.Message{
+				Role:    "assistant",
+				Content: client.NewTextContent(lastText),
+			})
+			stampMessage()
+		}
 		captureRunMessages()
 		setRunStatus(runstatus.CodeIterationLimit, true)
 		return lastText, usage, ErrMaxIterReached
@@ -4753,6 +4768,36 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	captureRunMessages()
 	setRunStatus(runstatus.CodeIterationLimit, true)
 	return "", usage, fmt.Errorf("agent loop exceeded %d iterations: %w", a.effectiveMaxIter(toolsUsed), ErrMaxIterReached)
+}
+
+// lastTextAlreadyPersisted reports whether text is already recorded in
+// messages as the most recent text-bearing assistant turn. The cancel and
+// maxIter teardowns flush lastText so an interrupted run keeps its partial
+// answer, but on the native tool path the preamble that set lastText was
+// already persisted by buildAssistantMessage in the same iteration —
+// re-appending it writes the same assistant text to disk twice. Walking
+// back to the latest assistant message that carries visible text is exact:
+// lastText always holds the text of the most recent text-bearing response,
+// and everything appended after it (tool_use-only turns, tool results,
+// injected user turns) carries no assistant text.
+func lastTextAlreadyPersisted(messages []client.Message, text string) bool {
+	want := strings.TrimSpace(text)
+	if want == "" {
+		return false
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "assistant" {
+			continue
+		}
+		got := strings.TrimSpace(messages[i].Content.Text())
+		if got == "" {
+			// Tool_use-only turn (no visible text) — keep walking to the
+			// response that actually produced lastText.
+			continue
+		}
+		return got == want
+	}
+	return false
 }
 
 // completeWithRetry calls client.Complete with retry+backoff for transient errors.
