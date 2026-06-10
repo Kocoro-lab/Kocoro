@@ -131,6 +131,12 @@ type SessionCache struct {
 	// no window where a retract returns "retracted" for an id the loop is
 	// about to commit. Same TTL + cap reaping as retractedInjects.
 	committedInjects map[string]map[string]time.Time
+	// lastInjectLedgerSweep throttles the cross-route reaping of the two inject
+	// ledgers (see sweepInjectLedgersLocked). The ledgers are keyed like
+	// sc.routes, which never shrinks, so without a periodic sweep every route
+	// that ever committed/retracted an inject would retain its entry for the
+	// daemon's lifetime — the leak flagged in review. Updated under sc.mu.
+	lastInjectLedgerSweep time.Time
 	// systemEvents, when set, is Forgotten per route on eviction so an
 	// enqueue-but-never-run route does not leak its bounded queue. Optional —
 	// nil in tests / pure-local paths.
@@ -199,6 +205,32 @@ func pruneInjectLedgerLocked(ledger map[string]map[string]time.Time, key string,
 	}
 	if len(set) == 0 {
 		delete(ledger, key)
+	}
+}
+
+// injectLedgerSweepInterval throttles the cross-route ledger sweep. The ledgers
+// only grow under inject activity, and the sweep runs on the write path, so a
+// once-per-interval cadence keeps the amortized cost negligible while bounding
+// total retained keys to roughly those active within one TTL window.
+const injectLedgerSweepInterval = time.Minute
+
+// sweepInjectLedgersLocked prunes expired entries across ALL routes in both
+// inject ledgers, throttled to one pass per injectLedgerSweepInterval. Called
+// from the ledger write paths (which already hold sc.mu), so reclamation tracks
+// activity without a background goroutine: an idle daemon does no work and the
+// maps do not grow. This is what keeps the ledgers from shadowing sc.routes
+// (which never shrinks) for the daemon's lifetime. Deleting keys mid-range is
+// safe per the Go spec.
+func (sc *SessionCache) sweepInjectLedgersLocked(now time.Time) {
+	if !sc.lastInjectLedgerSweep.IsZero() && now.Sub(sc.lastInjectLedgerSweep) < injectLedgerSweepInterval {
+		return
+	}
+	sc.lastInjectLedgerSweep = now
+	for key := range sc.retractedInjects {
+		pruneInjectLedgerLocked(sc.retractedInjects, key, now)
+	}
+	for key := range sc.committedInjects {
+		pruneInjectLedgerLocked(sc.committedInjects, key, now)
 	}
 }
 
@@ -772,6 +804,7 @@ func (sc *SessionCache) markInjectCommittedLocked(key, clientMessageID string, n
 	}
 	set[clientMessageID] = now
 	pruneInjectLedgerLocked(sc.committedInjects, key, now)
+	sc.sweepInjectLedgersLocked(now)
 }
 
 // RetractInject marks a client_message_id as cancelled for a route. If the
@@ -806,6 +839,7 @@ func (sc *SessionCache) plantRetractTombstoneLocked(key, clientMessageID string,
 	}
 	set[clientMessageID] = now
 	pruneInjectLedgerLocked(sc.retractedInjects, key, now)
+	sc.sweepInjectLedgersLocked(now)
 }
 
 // RetractInjectWithStatus is the atomic retract used by the HTTP endpoint. It
@@ -1159,6 +1193,13 @@ func (sc *SessionCache) evictRoute(key string) {
 	sc.mu.Lock()
 	entry := sc.routes[key]
 	se := sc.systemEvents
+	// Drop the inject ledgers for an explicitly-evicted route: the agent is
+	// gone, so no future run will honor a tombstone or answer already_committed
+	// for it, and a fresh run on a re-created route re-plants as needed. This
+	// reclaims immediately on agent deletion; the periodic sweep handles routes
+	// that merely go idle without being evicted.
+	delete(sc.retractedInjects, key)
+	delete(sc.committedInjects, key)
 	sc.mu.Unlock()
 	se.Forget(key) // nil-safe; releases the route's S0 queue (best-effort)
 	if entry == nil {

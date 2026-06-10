@@ -219,3 +219,90 @@ func TestPruneInjectLedger_TTLAndCap(t *testing.T) {
 		t.Fatal("emptied set must be deleted from the ledger")
 	}
 }
+
+// TestSessionCache_LedgerSweep_ReapsIdleRoutes pins the leak fix flagged in
+// review: the inject ledgers are keyed like sc.routes (which never shrinks), so
+// a route that committed/retracted an inject and then went idle would retain
+// its entry for the daemon's lifetime. sweepInjectLedgersLocked reclaims those
+// expired keys cross-route on the throttled write path.
+func TestSessionCache_LedgerSweep_ReapsIdleRoutes(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	now := time.Now()
+	expired := now.Add(-injectLedgerTTL - time.Minute)
+
+	sc.mu.Lock()
+	// 50 idle routes, each holding one expired entry in each ledger — the
+	// "every session route that ever drained an inject" shape.
+	for i := 0; i < 50; i++ {
+		key := "session:idle-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		sc.retractedInjects[key] = map[string]time.Time{"r": expired}
+		sc.committedInjects[key] = map[string]time.Time{"c": expired}
+	}
+	// One fresh route that must survive the sweep.
+	sc.committedInjects["session:live"] = map[string]time.Time{"c": now}
+	// Force the throttle open.
+	sc.lastInjectLedgerSweep = time.Time{}
+	sc.sweepInjectLedgersLocked(now)
+	retractKeys := len(sc.retractedInjects)
+	committedKeys := len(sc.committedInjects)
+	_, liveSurvived := sc.committedInjects["session:live"]
+	sc.mu.Unlock()
+
+	if retractKeys != 0 {
+		t.Errorf("expired retract ledger keys not reaped: %d remain", retractKeys)
+	}
+	if committedKeys != 1 || !liveSurvived {
+		t.Errorf("sweep should leave only the live route: %d keys, liveSurvived=%v", committedKeys, liveSurvived)
+	}
+}
+
+// TestSessionCache_LedgerSweep_Throttled verifies the sweep does not run more
+// than once per interval, so the write path stays cheap.
+func TestSessionCache_LedgerSweep_Throttled(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	now := time.Now()
+	expired := now.Add(-injectLedgerTTL - time.Minute)
+
+	sc.mu.Lock()
+	sc.lastInjectLedgerSweep = now // a sweep just ran
+	sc.committedInjects["session:stale"] = map[string]time.Time{"c": expired}
+	// Within the interval: must be a no-op, the stale entry survives.
+	sc.sweepInjectLedgersLocked(now.Add(injectLedgerSweepInterval / 2))
+	_, withinSurvives := sc.committedInjects["session:stale"]
+	// Past the interval: the stale entry is reclaimed.
+	sc.sweepInjectLedgersLocked(now.Add(injectLedgerSweepInterval + time.Second))
+	_, afterReaped := sc.committedInjects["session:stale"]
+	sc.mu.Unlock()
+
+	if !withinSurvives {
+		t.Error("sweep ran inside the throttle interval (should be a no-op)")
+	}
+	if afterReaped {
+		t.Error("sweep did not run after the throttle interval elapsed")
+	}
+}
+
+// TestSessionCache_EvictRoute_ReapsLedgers verifies the immediate-reclaim path:
+// when an agent is evicted, its routes' inject ledgers are dropped at once
+// rather than waiting for the periodic sweep.
+func TestSessionCache_EvictRoute_ReapsLedgers(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	const agentName = "researcher"
+	key := sc.agentRouteKey(agentName) // "agent:researcher" — matches Evict's prefix
+
+	sc.mu.Lock()
+	sc.routes[key] = &routeEntry{lastAccess: time.Now()}
+	sc.retractedInjects[key] = map[string]time.Time{"r": time.Now()}
+	sc.committedInjects[key] = map[string]time.Time{"c": time.Now()}
+	sc.mu.Unlock()
+
+	sc.Evict(agentName)
+
+	sc.mu.Lock()
+	_, retractLeft := sc.retractedInjects[key]
+	_, committedLeft := sc.committedInjects[key]
+	sc.mu.Unlock()
+	if retractLeft || committedLeft {
+		t.Errorf("evict must reap inject ledgers: retract=%v committed=%v", retractLeft, committedLeft)
+	}
+}
