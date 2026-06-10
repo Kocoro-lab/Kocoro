@@ -43,7 +43,7 @@ func TestSessionCache_DrainSurvivorsOrCloseInject_ReturnsSurvivorsKeepsWindowOpe
 		t.Fatalf("InjectMessage = %v, want InjectOK", got)
 	}
 
-	survivors := sc.DrainSurvivorsOrCloseInject(key)
+	survivors := sc.DrainSurvivorsOrCloseInject(key, true)
 	if len(survivors) != 1 || survivors[0].ClientMessageID != "local-last" {
 		t.Fatalf("survivor must be reclaimed for the loop to continue, got %+v", survivors)
 	}
@@ -64,7 +64,7 @@ func TestSessionCache_DrainSurvivorsOrCloseInject_EmptyClosesWindow(t *testing.T
 	sc.routes[key] = &routeEntry{injectCh: make(chan agent.InjectedMessage, 10), done: make(chan struct{})}
 	sc.mu.Unlock()
 
-	survivors := sc.DrainSurvivorsOrCloseInject(key)
+	survivors := sc.DrainSurvivorsOrCloseInject(key, true)
 	if len(survivors) != 0 {
 		t.Fatalf("expected no survivors on the clean path, got %+v", survivors)
 	}
@@ -75,7 +75,7 @@ func TestSessionCache_DrainSurvivorsOrCloseInject_EmptyClosesWindow(t *testing.T
 		t.Fatalf("post-close InjectMessage = %v, want InjectNoActiveRun (caller starts a fresh run)", got)
 	}
 	// Idempotent: re-calling on a closed route is a safe no-op.
-	if survivors := sc.DrainSurvivorsOrCloseInject(key); len(survivors) != 0 {
+	if survivors := sc.DrainSurvivorsOrCloseInject(key, true); len(survivors) != 0 {
 		t.Fatalf("second call must be a no-op, got %+v", survivors)
 	}
 }
@@ -98,7 +98,7 @@ func TestSessionCache_DrainSurvivorsOrCloseInject_AllRetractedClosesWindow(t *te
 	sc.RetractInject(key, "local-c1")
 	sc.RetractInject(key, "local-c2")
 
-	survivors := sc.DrainSurvivorsOrCloseInject(key)
+	survivors := sc.DrainSurvivorsOrCloseInject(key, true)
 	if len(survivors) != 0 {
 		t.Fatalf("all-retracted batch must yield no survivors, got %+v", survivors)
 	}
@@ -122,7 +122,7 @@ func TestSessionCache_DrainSurvivorsOrCloseInject_MixedKeepsWindowOpen(t *testin
 	sc.InjectMessage(key, agent.InjectedMessage{Text: "cancelled", ClientMessageID: "local-drop"})
 	sc.RetractInject(key, "local-drop")
 
-	survivors := sc.DrainSurvivorsOrCloseInject(key)
+	survivors := sc.DrainSurvivorsOrCloseInject(key, true)
 	if len(survivors) != 1 || survivors[0].ClientMessageID != "local-keep" {
 		t.Fatalf("retracted survivor must be skipped, live one returned, got %+v", survivors)
 	}

@@ -60,7 +60,7 @@ func TestSessionCache_ReEnqueueInjectSurvivors_NoopOnClosedWindow(t *testing.T) 
 	sc.mu.Unlock()
 
 	// Simulate the end_turn empty-drain closing the window.
-	_ = sc.DrainSurvivorsOrCloseInject(key)
+	_ = sc.DrainSurvivorsOrCloseInject(key, true)
 
 	if n := sc.ReEnqueueInjectSurvivors(key); n != 0 {
 		t.Fatalf("ReEnqueueInjectSurvivors on a closed window = %d, want 0", n)

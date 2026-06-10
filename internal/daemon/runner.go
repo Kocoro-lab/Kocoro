@@ -2101,7 +2101,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if req.RouteKey != "" {
 			rk := req.RouteKey
 			loop.SetInjectFinalDrainFn(func() []agent.InjectedMessage {
-				return deps.SessionCache.DrainSurvivorsOrCloseInject(rk)
+				// markSurvivorsCommitted=true: end_turn survivors are committed
+				// INLINE into the continuing run, so they enter the committed
+				// ledger in the same critical section as the retraction filter.
+				return deps.SessionCache.DrainSurvivorsOrCloseInject(rk, true)
 			})
 		}
 	}
@@ -2164,8 +2167,25 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// Desktop steering retract: drop a follow-up at drain time if the client
 		// cancelled its queued-draft card after the inject was already sent to
 		// injectCh (cross-route retraction lives in SessionCache, keyed here).
+		// The checker also records non-retracted ids in the committed ledger —
+		// atomically with the filter check — so a late /inject/retract answers
+		// "already_committed" instead of letting the client re-send the text.
 		loop.SetInjectRetractedChecker(func(clientMessageID string) bool {
-			return deps.SessionCache.ConsumeInjectRetracted(routeKey, clientMessageID)
+			return deps.SessionCache.ConsumeInjectRetractedOrMarkCommitted(routeKey, clientMessageID)
+		})
+	}
+	// Ad-hoc (session-keyed) runs: a brand-new session's first run starts with
+	// req.RouteKey == "" and registers a "session:<id>" route once the session
+	// exists (RegisterAdHocSessionRoute above). Injects and retracts address
+	// that key, so the retraction filter + committed ledger must be keyed there
+	// too — otherwise a retract during the first run of a fresh session is
+	// never honored and its commit is never recorded. finalDrainInjected's
+	// local fallback routes through the same checker, so this one hook covers
+	// both the top-of-loop drain and the end_turn drain for ad-hoc runs.
+	if req.RouteKey == "" && adHocRouteKey != "" {
+		rk := adHocRouteKey
+		loop.SetInjectRetractedChecker(func(clientMessageID string) bool {
+			return deps.SessionCache.ConsumeInjectRetractedOrMarkCommitted(rk, clientMessageID)
 		})
 	}
 	loop.SetSessionID(sess.ID)

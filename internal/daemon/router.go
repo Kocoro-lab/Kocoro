@@ -109,13 +109,28 @@ type SessionCache struct {
 	shannonDir   string
 	mailboxStore *MailboxStore
 	mailboxCap   int
-	// retractedInjects holds, per route key, the set of client_message_ids the
+	// retractedInjects holds, per route key, the client_message_ids the
 	// client cancelled AFTER the inject was already sent to injectCh. The agent
 	// loop consults this at drain time (via injectRetractedChecker) and skips
 	// any matching follow-up, so a cancelled steering message never reaches the
 	// model — injectCh is a Go channel and cannot remove elements directly, so
 	// the skip happens after drain rather than by mutating the channel.
-	retractedInjects map[string]map[string]bool
+	// Values are tombstone-creation times: tombstones survive run transitions
+	// (a retract that loses the race against run teardown must still drop a
+	// late inject landing on the NEXT run) and are reaped by TTL + per-route
+	// cap instead of wholesale deletion at run end.
+	retractedInjects map[string]map[string]time.Time
+	// committedInjects holds, per route key, the client_message_ids whose
+	// follow-up passed the retraction filter and entered an LLM turn (it is —
+	// or is about to be — a persisted user message). The retract endpoint
+	// answers "already_committed" from this ledger so the client knows its
+	// retract was too late and must NOT re-send the same text as a fresh
+	// message (the force-send / pop-back duplicate). Marking happens in the
+	// same critical section as the retraction-filter check, so every id
+	// resolves to exactly one of {dropped-by-tombstone, committed} — there is
+	// no window where a retract returns "retracted" for an id the loop is
+	// about to commit. Same TTL + cap reaping as retractedInjects.
+	committedInjects map[string]map[string]time.Time
 	// systemEvents, when set, is Forgotten per route on eviction so an
 	// enqueue-but-never-run route does not leak its bounded queue. Optional —
 	// nil in tests / pure-local paths.
@@ -142,7 +157,48 @@ func NewSessionCacheWithMailbox(shannonDir string, store *MailboxStore, capacity
 		shannonDir:       shannonDir,
 		mailboxStore:     store,
 		mailboxCap:       capacity,
-		retractedInjects: make(map[string]map[string]bool),
+		retractedInjects: make(map[string]map[string]time.Time),
+		committedInjects: make(map[string]map[string]time.Time),
+	}
+}
+
+// injectLedgerTTL bounds how long retraction tombstones and committed-inject
+// ledger entries live. Long enough to cover any realistic retract-vs-teardown
+// race (network latency + run teardown + replacement run start), short enough
+// that the per-route maps cannot accumulate across a long-lived daemon.
+const injectLedgerTTL = 10 * time.Minute
+
+// injectLedgerCap bounds entries per route. A client queues at most a handful
+// of drafts per run; hitting this cap means something is wrong upstream, and
+// dropping the OLDEST entry degrades to the pre-ledger behavior (best-effort
+// retract) instead of growing without bound.
+const injectLedgerCap = 256
+
+// pruneInjectLedgerLocked removes expired entries from one route's ledger map
+// and, if the map is over cap, evicts oldest-first down to the cap. Caller
+// must hold sc.mu. Deletes the route key entirely when the set empties.
+func pruneInjectLedgerLocked(ledger map[string]map[string]time.Time, key string, now time.Time) {
+	set := ledger[key]
+	if set == nil {
+		return
+	}
+	for id, at := range set {
+		if now.Sub(at) > injectLedgerTTL {
+			delete(set, id)
+		}
+	}
+	for len(set) > injectLedgerCap {
+		oldestID := ""
+		var oldestAt time.Time
+		for id, at := range set {
+			if oldestID == "" || at.Before(oldestAt) {
+				oldestID, oldestAt = id, at
+			}
+		}
+		delete(set, oldestID)
+	}
+	if len(set) == 0 {
+		delete(ledger, key)
 	}
 }
 
@@ -358,6 +414,7 @@ const (
 	InjectQueueFull                       // active run exists but queue is saturated
 	InjectBusy                            // run exists but is not yet ready to receive injected messages
 	InjectCWDConflict                     // active run uses a different immutable cwd
+	InjectRetracted                       // client retracted this id before delivery; dropped intentionally
 )
 
 // ActiveSessionIDs returns the set of session IDs whose route currently
@@ -491,6 +548,22 @@ func (sc *SessionCache) InjectMessage(key string, msg agent.InjectedMessage) Inj
 	if requestCWD != "" && requestCWD != entry.activeCWD {
 		return InjectCWDConflict
 	}
+	// Ingestion-time retraction: tombstones survive run transitions, so an
+	// inject POST that arrives AFTER the client already retracted its id —
+	// e.g. delayed past a Cmd+Enter retract+cancel+resend sequence and landing
+	// on the REPLACEMENT run — is dropped here instead of being committed into
+	// a turn that already carries the same text via the force-send payload.
+	if msg.ClientMessageID != "" {
+		if set := sc.retractedInjects[key]; set != nil {
+			if at, ok := set[msg.ClientMessageID]; ok && time.Since(at) <= injectLedgerTTL {
+				delete(set, msg.ClientMessageID)
+				if len(set) == 0 {
+					delete(sc.retractedInjects, key)
+				}
+				return InjectRetracted
+			}
+		}
+	}
 	// Enqueue under sc.mu so the send is atomic with respect to
 	// DrainSurvivorsOrCloseInject: a follow-up racing run teardown either lands
 	// before the drain (reclaimed as a survivor) or observes the closed window
@@ -598,11 +671,14 @@ func (sc *SessionCache) ClearRouteRunState(key string) {
 		entry.injectCh = nil
 		entry.activeCWD = ""
 	}
-	// Drop any unconsumed retraction tombstones for this route — the run is
-	// over, so a leftover retraction (its target was cancelled but never
-	// drained because the run ended first) must not leak into the next run on
-	// the same route.
-	delete(sc.retractedInjects, key)
+	// Tombstones and the committed ledger deliberately SURVIVE run end: a
+	// retract that lost the race against teardown must still drop its target
+	// when the late inject lands on the next run, and a pop-back retract must
+	// still learn "already_committed" after the owning run finished. Reap by
+	// TTL + cap instead of wholesale deletion.
+	now := time.Now()
+	pruneInjectLedgerLocked(sc.retractedInjects, key, now)
+	pruneInjectLedgerLocked(sc.committedInjects, key, now)
 	sc.mu.Unlock()
 }
 
@@ -628,7 +704,16 @@ func (sc *SessionCache) ClearRouteRunState(key string) {
 // re-queue client-side the way Desktop does, so the guarantee must live here.
 // Retracted follow-ups are reaped (tombstone consumed), not returned. Safe and
 // idempotent on an unknown or already-closed route.
-func (sc *SessionCache) DrainSurvivorsOrCloseInject(key string) []agent.InjectedMessage {
+//
+// markSurvivorsCommitted distinguishes the two callers:
+//   - the end_turn drain-race guard passes TRUE — its survivors are committed
+//     INLINE into the continuing run, so they enter the committed ledger here,
+//     in the same critical section as the retraction filter;
+//   - ReEnqueueInjectSurvivors passes FALSE — its survivors go to the durable
+//     mailbox for the NEXT run, and marking them committed would make a
+//     subsequent retract report "already_committed" while the retract cascade
+//     deletes the mailbox row, losing the message entirely.
+func (sc *SessionCache) DrainSurvivorsOrCloseInject(key string, markSurvivorsCommitted bool) []agent.InjectedMessage {
 	if key == "" {
 		return nil
 	}
@@ -640,15 +725,21 @@ func (sc *SessionCache) DrainSurvivorsOrCloseInject(key string) []agent.Injected
 	}
 	var survivors []agent.InjectedMessage
 	retracted := sc.retractedInjects[key]
+	now := time.Now()
 drainLoop:
 	for {
 		select {
 		case m := <-entry.injectCh:
-			if m.ClientMessageID != "" && retracted[m.ClientMessageID] {
-				// Reap the tombstone (one-shot, mirrors ConsumeInjectRetracted)
-				// so a cancelled follow-up is dropped, not re-dispatched.
-				delete(retracted, m.ClientMessageID)
-				continue
+			if m.ClientMessageID != "" && retracted != nil {
+				if at, hit := retracted[m.ClientMessageID]; hit && now.Sub(at) <= injectLedgerTTL {
+					// Reap the tombstone (one-shot, mirrors ConsumeInjectRetracted)
+					// so a cancelled follow-up is dropped, not re-dispatched.
+					delete(retracted, m.ClientMessageID)
+					continue
+				}
+			}
+			if markSurvivorsCommitted && m.ClientMessageID != "" {
+				sc.markInjectCommittedLocked(key, m.ClientMessageID, now)
 			}
 			survivors = append(survivors, m)
 		default:
@@ -658,13 +749,29 @@ drainLoop:
 	if len(survivors) == 0 {
 		// Nothing left to process — close the window atomically so a follow-up
 		// racing the loop's return falls through to a fresh run instead of
-		// orphaning. Same teardown as ClearRouteRunState.
+		// orphaning. Same teardown as ClearRouteRunState. Tombstones survive
+		// (TTL-reaped) so a late retract/inject pair still resolves correctly.
 		entry.done = nil
 		entry.injectCh = nil
 		entry.activeCWD = ""
-		delete(sc.retractedInjects, key)
+		pruneInjectLedgerLocked(sc.retractedInjects, key, now)
 	}
 	return survivors
+}
+
+// markInjectCommittedLocked records a client_message_id in the committed
+// ledger. Caller must hold sc.mu.
+func (sc *SessionCache) markInjectCommittedLocked(key, clientMessageID string, now time.Time) {
+	if sc.committedInjects == nil {
+		sc.committedInjects = make(map[string]map[string]time.Time)
+	}
+	set := sc.committedInjects[key]
+	if set == nil {
+		set = make(map[string]time.Time)
+		sc.committedInjects[key] = set
+	}
+	set[clientMessageID] = now
+	pruneInjectLedgerLocked(sc.committedInjects, key, now)
 }
 
 // RetractInject marks a client_message_id as cancelled for a route. If the
@@ -672,26 +779,65 @@ drainLoop:
 // loop's drain-time check (ConsumeInjectRetracted via injectRetractedChecker)
 // will skip it so a cancelled steering message never reaches the model. Safe to
 // call for an id that was already drained or never existed — it just leaves a
-// tombstone that ClearRouteRunState reaps at run end.
+// TTL-reaped tombstone.
 func (sc *SessionCache) RetractInject(key, clientMessageID string) {
 	if key == "" || clientMessageID == "" {
 		return
 	}
 	sc.mu.Lock()
+	sc.plantRetractTombstoneLocked(key, clientMessageID, time.Now())
+	sc.mu.Unlock()
+}
+
+// plantRetractTombstoneLocked records a retraction tombstone. Caller must hold
+// sc.mu.
+func (sc *SessionCache) plantRetractTombstoneLocked(key, clientMessageID string, now time.Time) {
 	// Defensive lazy-init: NewSessionCache seeds this map, but a raw
 	// &SessionCache{} literal (some tests) leaves it nil, and a nil-map write
-	// panics. ConsumeInjectRetracted / ClearRouteRunState only read, so this is
-	// the one writer that must guard.
+	// panics. Read-only consumers tolerate nil, so this is the one writer that
+	// must guard.
 	if sc.retractedInjects == nil {
-		sc.retractedInjects = make(map[string]map[string]bool)
+		sc.retractedInjects = make(map[string]map[string]time.Time)
 	}
 	set := sc.retractedInjects[key]
 	if set == nil {
-		set = make(map[string]bool)
+		set = make(map[string]time.Time)
 		sc.retractedInjects[key] = set
 	}
-	set[clientMessageID] = true
-	sc.mu.Unlock()
+	set[clientMessageID] = now
+	pruneInjectLedgerLocked(sc.retractedInjects, key, now)
+}
+
+// RetractInjectWithStatus is the atomic retract used by the HTTP endpoint. It
+// resolves, under one critical section, which side of the race this retract
+// landed on:
+//
+//   - "already_committed": the follow-up already passed the retraction filter
+//     and entered (or is entering) an LLM turn — its text lives in the session
+//     as a user message. The client must NOT re-send the same text as a fresh
+//     message; doing so is the force-send / pop-back duplicate.
+//   - "retracted": a tombstone is planted. Any copy still in flight — buffered
+//     in injectCh, surviving into the mailbox, or arriving late on a future
+//     run — will be dropped at its consumption point.
+//
+// The commit marking happens inside the same sc.mu section as the drain filter
+// (ConsumeInjectRetractedOrMarkCommitted / DrainSurvivorsOrCloseInject), so an
+// id can never be reported "retracted" while the loop is concurrently
+// committing it.
+func (sc *SessionCache) RetractInjectWithStatus(key, clientMessageID string) string {
+	if key == "" || clientMessageID == "" {
+		return "retracted"
+	}
+	now := time.Now()
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if set := sc.committedInjects[key]; set != nil {
+		if at, ok := set[clientMessageID]; ok && now.Sub(at) <= injectLedgerTTL {
+			return "already_committed"
+		}
+	}
+	sc.plantRetractTombstoneLocked(key, clientMessageID, now)
+	return "retracted"
 }
 
 // ConsumeInjectRetracted reports whether a client_message_id was retracted for a
@@ -704,15 +850,68 @@ func (sc *SessionCache) ConsumeInjectRetracted(key, clientMessageID string) bool
 	}
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	return sc.consumeInjectRetractedLocked(key, clientMessageID, time.Now())
+}
+
+// consumeInjectRetractedLocked is the lock-held core of ConsumeInjectRetracted.
+func (sc *SessionCache) consumeInjectRetractedLocked(key, clientMessageID string, now time.Time) bool {
 	set := sc.retractedInjects[key]
-	if set == nil || !set[clientMessageID] {
+	if set == nil {
+		return false
+	}
+	at, ok := set[clientMessageID]
+	if !ok {
 		return false
 	}
 	delete(set, clientMessageID)
 	if len(set) == 0 {
 		delete(sc.retractedInjects, key)
 	}
-	return true
+	// An expired tombstone is a miss — the follow-up proceeds. Deleted above
+	// either way (lazy reap).
+	return now.Sub(at) <= injectLedgerTTL
+}
+
+// ConsumeInjectRetractedOrMarkCommitted is the drain-time checker wired into
+// the agent loop (filterRetractedInjects). For each drained follow-up it
+// atomically resolves the id to exactly one of two fates:
+//
+//   - retracted (returns true): tombstone consumed, the loop drops it;
+//   - committed (returns false): recorded in the committed ledger BEFORE the
+//     loop appends the user turn, so a concurrent RetractInjectWithStatus
+//     answers "already_committed" instead of planting a useless tombstone and
+//     letting the client re-send the text.
+//
+// Both transitions happen under one sc.mu section — there is no interleaving
+// where a retract slips between the filter check and the commit marking.
+func (sc *SessionCache) ConsumeInjectRetractedOrMarkCommitted(key, clientMessageID string) bool {
+	if key == "" || clientMessageID == "" {
+		return false
+	}
+	now := time.Now()
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.consumeInjectRetractedLocked(key, clientMessageID, now) {
+		return true
+	}
+	sc.markInjectCommittedLocked(key, clientMessageID, now)
+	return false
+}
+
+// WasInjectCommitted reports whether a client_message_id entered an LLM turn
+// on this route within the ledger TTL. Read-only (no consume).
+func (sc *SessionCache) WasInjectCommitted(key, clientMessageID string) bool {
+	if key == "" || clientMessageID == "" {
+		return false
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	set := sc.committedInjects[key]
+	if set == nil {
+		return false
+	}
+	at, ok := set[clientMessageID]
+	return ok && time.Since(at) <= injectLedgerTTL
 }
 
 // CancelRoute cancels the in-flight run for a route without waiting.

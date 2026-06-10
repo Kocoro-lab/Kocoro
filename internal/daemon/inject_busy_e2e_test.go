@@ -147,12 +147,14 @@ func TestE2E_InjectEndpoint_TextOnly_PropagatesClientMessageID(t *testing.T) {
 	}
 }
 
-// TestE2E_RetractEndpoint_NoActiveRun_NoTombstoneLeak verifies POST
-// /inject/retract for a route with no in-flight run is idempotent (200) but does
-// NOT record a tombstone — recording one would leak a retractedInjects entry
-// that nothing reaps (ClearRouteRunState only fires at the end of a run that
-// actually existed).
-func TestE2E_RetractEndpoint_NoActiveRun_NoTombstoneLeak(t *testing.T) {
+// TestE2E_RetractEndpoint_NoActiveRun_PlantsDurableTombstone verifies POST
+// /inject/retract for a route with no in-flight run is idempotent (200) AND
+// records a tombstone. This deliberately inverts the pre-2026-06 "no tombstone
+// without an active run" rule: the no-active-run window is exactly where a
+// retract racing run teardown used to lose — its target could land on the
+// replacement run or already sit in the mailbox. Unbounded growth is handled
+// by TTL + per-route cap (pruneInjectLedgerLocked), not by refusing to record.
+func TestE2E_RetractEndpoint_NoActiveRun_PlantsDurableTombstone(t *testing.T) {
 	dir := t.TempDir()
 	sc := NewSessionCache(dir) // no route registered → HasActiveRun false
 
@@ -173,14 +175,15 @@ func TestE2E_RetractEndpoint_NoActiveRun_NoTombstoneLeak(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 idempotent, got %d", resp.StatusCode)
 	}
-	if sc.ConsumeInjectRetracted("session:sess-x", "local-ghost") {
-		t.Fatal("retract recorded a tombstone for a route with no active run — leak")
+	var payload map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
 	}
-	sc.mu.Lock()
-	leaked := len(sc.retractedInjects)
-	sc.mu.Unlock()
-	if leaked != 0 {
-		t.Fatalf("retractedInjects has %d leaked entries, want 0", leaked)
+	if payload["status"] != "retracted" {
+		t.Fatalf("status = %q, want retracted", payload["status"])
+	}
+	if !sc.ConsumeInjectRetracted("session:sess-x", "local-ghost") {
+		t.Fatal("retract without an active run must plant a durable tombstone")
 	}
 }
 
