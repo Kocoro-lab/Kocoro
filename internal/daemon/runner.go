@@ -2093,8 +2093,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		loop.SetStickyContext(sticky)
 	}
 
-	// Output format: cloud-distributed channels use "plain" (Shannon Cloud
-	// handles final channel rendering). Local sources keep "markdown" (default).
+	// Output format: most cloud-distributed channels use "plain" (Shannon Cloud
+	// handles final channel rendering); Feishu/Lark cards render markdown, so
+	// they emit GFM. Local sources keep "markdown" (default). See
+	// outputFormatForSource / markdownCloudSources.
 	loop.SetOutputFormat(outputFormatForSource(req.Source))
 
 	loop.SetHandler(handler)

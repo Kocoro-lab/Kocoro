@@ -68,8 +68,9 @@ type PromptOptions struct {
 	// model knows its own identity. See isKnownTierName for the dispatch.
 	ModelID string
 	// OutputFormat controls formatting guidance: "markdown" (default, GFM) or
-	// "plain" (for cloud-distributed sessions where Shannon Cloud handles
-	// final channel rendering). Empty defaults to "markdown".
+	// "plain" (for cloud-distributed sessions where Shannon Cloud handles final
+	// channel rendering — not all cloud channels, e.g. Feishu/Lark stay
+	// markdown; see outputFormatForSource). Empty defaults to "markdown".
 	OutputFormat string
 }
 
