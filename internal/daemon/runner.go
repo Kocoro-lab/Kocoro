@@ -636,15 +636,38 @@ func (req *RunAgentRequest) EnsureRouteKey() {
 	}
 }
 
+// markdownCloudSources are cloud-routed channels whose native message body is
+// standard markdown rather than a bespoke render syntax. Feishu/Lark cards use
+// `tag: markdown`, so the LLM should emit GFM (markdown links, bold) on these
+// channels. This also re-enables file attachments: Cloud's feishu_file_resolver
+// only converts a published `[name](url)` markdown link (whitelisted CDN + URL
+// with a file extension) into a downloadable msg_type=file attachment — a plain
+// raw URL is never converted, so "plain" silently disabled the feature.
+//
+// These sources STAY in cloudSourceSet (no user shell → scratch CWD, skill
+// filtering, banner suppression all keyed off isCloudSource); only their output
+// FORMAT diverges. Other cloud channels (Slack mrkdwn, LINE Flex, WeCom,
+// Telegram) keep "plain" because Cloud owns their final render.
+var markdownCloudSources = map[string]struct{}{
+	ChannelFeishu: {},
+	ChannelLark:   {},
+}
+
 // outputFormatForSource maps a request source to an output format profile.
-// Only explicit cloud-distributed channel sources use "plain" — Shannon Cloud
-// handles final channel rendering for these (Slack mrkdwn, LINE Flex, etc.).
-// Everything else (local, cron, schedule, web, unknown) defaults to "markdown".
+// Cloud-distributed channels default to "plain" — Shannon Cloud handles final
+// channel rendering (Slack mrkdwn, LINE Flex, etc.) — except markdownCloudSources
+// (Feishu/Lark) whose card body is standard markdown. Everything else (local,
+// cron, schedule, web, unknown) defaults to "markdown".
 //
 // Shares its cloud-source definition with ensureCloudSessionTmpDir via
-// isCloudSource; the two paths must agree on what "cloud-routed" means or the
-// allocator and the formatter would drift apart silently.
+// isCloudSource; the two paths agree on what "cloud-routed" means (CWD
+// allocation), and only the format profile intentionally diverges for
+// markdownCloudSources — pinned by TestCloudSourceDefinitionsAgree.
 func outputFormatForSource(source string) string {
+	norm := strings.ToLower(strings.TrimSpace(source))
+	if _, ok := markdownCloudSources[norm]; ok {
+		return "markdown"
+	}
 	if isCloudSource(source) {
 		return "plain"
 	}
@@ -2070,8 +2093,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		loop.SetStickyContext(sticky)
 	}
 
-	// Output format: cloud-distributed channels use "plain" (Shannon Cloud
-	// handles final channel rendering). Local sources keep "markdown" (default).
+	// Output format: most cloud-distributed channels use "plain" (Shannon Cloud
+	// handles final channel rendering); Feishu/Lark cards render markdown, so
+	// they emit GFM. Local sources keep "markdown" (default). See
+	// outputFormatForSource / markdownCloudSources.
 	loop.SetOutputFormat(outputFormatForSource(req.Source))
 
 	loop.SetHandler(handler)

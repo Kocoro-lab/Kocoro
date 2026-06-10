@@ -170,6 +170,21 @@ This only removes the Kocoro-side binding (stops the long connection). It does N
 delete the app from the developer portal — tell the user to delete it there if
 they want the app itself gone.
 
+## Sending files to the user (附件 / 发文件)
+
+Whenever the user wants to RECEIVE a file — judge this by intent, not by exact
+wording. "把这份报告发给我", "我需要 X 文件", "给我那个 PDF", "能不能发我一份" all
+count; there is no fixed phrase to match. Publish it with `publish_to_web` and
+then **always present the result as a markdown link `[文件名](url)`** — never a
+bare URL. Cloud automatically turns a `[name](url)` link pointing at the Kocoro
+CDN (`https://static.kocoro.ai/…`, URL ending in a file extension) into a
+**downloadable Feishu/Lark attachment**.
+A raw URL is delivered as plain text and is NOT converted, so the user would have
+to open it in a browser instead of getting the file inline.
+
+Do this without the user having to ask for "markdown format" — it is the default
+expected behavior on Feishu/Lark. Example reply: `报告好了：[2026-Q2.pdf](https://static.kocoro.ai/…/2026-Q2.pdf)`.
+
 ## Security note
 
 `app_secret` is sensitive. It is stored by Cloud; the daemon only forwards it over

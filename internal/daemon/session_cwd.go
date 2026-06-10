@@ -8,15 +8,17 @@ import (
 )
 
 // cloudSourceSet enumerates request sources whose final rendering is owned by
-// Shannon Cloud (plain-text output profile). These sources never carry an
-// effective CWD from the request path — there is no user shell, agent config,
-// or prior session CWD to fall back to — so the runner allocates a per-session
-// scratch directory under ~/.shannon/tmp/sessions/<id>/ to give filesystem
-// tools (file_read, file_write) and file-producing MCP tools (screenshots,
-// snapshots) a real working directory to land in.
+// Shannon Cloud. These sources never carry an effective CWD from the request
+// path — there is no user shell, agent config, or prior session CWD to fall
+// back to — so the runner allocates a per-session scratch directory under
+// ~/.shannon/tmp/sessions/<id>/ to give filesystem tools (file_read,
+// file_write) and file-producing MCP tools (screenshots, snapshots) a real
+// working directory to land in.
 //
-// Keep this list aligned with outputFormatForSource in runner.go; that mapping
-// is the authoritative definition of "cloud-distributed source".
+// Most cloud sources use the "plain" output profile, but the format axis is
+// decided independently by outputFormatForSource in runner.go — Feishu/Lark are
+// cloud sources that emit "markdown" (see markdownCloudSources). Keep this list
+// aligned with that mapping for the CWD axis; the two need not agree on format.
 var cloudSourceSet = map[string]struct{}{
 	"slack":    {},
 	"line":     {},
