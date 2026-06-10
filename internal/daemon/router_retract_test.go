@@ -22,16 +22,21 @@ func TestSessionCache_RetractInject_OneShot(t *testing.T) {
 	}
 }
 
-// TestSessionCache_RetractInject_ClearReapsTombstone verifies an unconsumed
-// retraction (target cancelled but never drained because the run ended first)
-// does not leak into the next run on the same route.
-func TestSessionCache_RetractInject_ClearReapsTombstone(t *testing.T) {
+// TestSessionCache_RetractInject_SurvivesRunEnd verifies the durable-tombstone
+// semantics: an unconsumed retraction (target cancelled but never drained
+// because the run ended first) SURVIVES ClearRouteRunState, so a late copy of
+// the cancelled follow-up — landing on the next run via inject or mailbox —
+// is still dropped. Reaping is TTL + cap based (pruneInjectLedgerLocked), not
+// wholesale at run end. This deliberately inverts the pre-2026-06 behavior,
+// which reaped at run end and let a retract that lost the teardown race leak
+// its target into the replacement run.
+func TestSessionCache_RetractInject_SurvivesRunEnd(t *testing.T) {
 	sc := NewSessionCache(t.TempDir())
 	const route = "session:r2"
 	sc.RetractInject(route, "local-y")
 	sc.ClearRouteRunState(route)
-	if sc.ConsumeInjectRetracted(route, "local-y") {
-		t.Fatal("ClearRouteRunState should reap unconsumed tombstone")
+	if !sc.ConsumeInjectRetracted(route, "local-y") {
+		t.Fatal("tombstone must survive run end (TTL-reaped, not run-scoped)")
 	}
 }
 

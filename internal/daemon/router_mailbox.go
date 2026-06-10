@@ -177,7 +177,11 @@ func (sc *SessionCache) ReEnqueueInjectSurvivors(key string) int {
 	}
 	requeued := 0
 	for {
-		survivors := sc.DrainSurvivorsOrCloseInject(key)
+		// markSurvivorsCommitted=false: these survivors are NOT entering a
+		// turn — they are being parked in the mailbox for the next run. A
+		// retract arriving later must still be able to reach them (cascade /
+		// DrainMailbox filter), so they must not enter the committed ledger.
+		survivors := sc.DrainSurvivorsOrCloseInject(key, false)
 		if len(survivors) == 0 {
 			return requeued // window is now closed (or was already)
 		}
@@ -186,13 +190,14 @@ func (sc *SessionCache) ReEnqueueInjectSurvivors(key string) int {
 				continue
 			}
 			msg := agenttypes.QueuedMessage{
-				ID:         newQueueID(),
-				RouteKey:   key,
-				Source:     "inject-survivor",
-				CWD:        s.CWD,
-				Text:       s.Text,
-				Priority:   agenttypes.PriorityNext,
-				EnqueuedAt: time.Now().UTC(),
+				ID:              newQueueID(),
+				RouteKey:        key,
+				Source:          "inject-survivor",
+				CWD:             s.CWD,
+				Text:            s.Text,
+				ClientMessageID: s.ClientMessageID,
+				Priority:        agenttypes.PriorityNext,
+				EnqueuedAt:      time.Now().UTC(),
 			}
 			// Best effort: a persist failure here is no worse than the pre-fix
 			// silent drop, and run teardown must not block on it.
@@ -207,6 +212,13 @@ func (sc *SessionCache) ReEnqueueInjectSurvivors(key string) int {
 // an empty mailbox or unknown route. Callers MUST invoke MarkMailboxConsumed
 // AFTER appending the messages to the session AND session.Save returns
 // successfully — see Task 1.7 / P0-4 contract.
+//
+// Rows whose ClientMessageID carries a retraction tombstone are dropped here
+// (defense in depth for the retract-vs-ReEnqueueInjectSurvivors race: a
+// retract that landed between the survivor drain and the mailbox insert finds
+// no row to cascade-delete, but its tombstone catches the row at the next
+// run's drain instead of letting the startup prepend duplicate the text).
+// Dropped rows are deleted from the durable store best-effort.
 func (sc *SessionCache) DrainMailbox(key string, limit int) []agenttypes.QueuedMessage {
 	if key == "" {
 		return nil
@@ -217,7 +229,21 @@ func (sc *SessionCache) DrainMailbox(key string, limit int) []agenttypes.QueuedM
 	if entry == nil || entry.mailbox == nil {
 		return nil
 	}
-	return entry.mailbox.DequeueBatch(limit)
+	batch := entry.mailbox.DequeueBatch(limit)
+	kept := batch[:0]
+	for _, m := range batch {
+		if m.ClientMessageID != "" && sc.ConsumeInjectRetracted(key, m.ClientMessageID) {
+			if sc.mailboxStore != nil {
+				_ = sc.mailboxStore.Delete(m.ID)
+			}
+			continue
+		}
+		kept = append(kept, m)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
 }
 
 // MarkMailboxConsumed durably records that the given mailbox IDs have been
@@ -278,6 +304,38 @@ func (sc *SessionCache) MailboxRetract(key, id string) bool {
 		_ = sc.mailboxStore.Delete(id)
 	}
 	return ok
+}
+
+// RetractMailboxByClientMessageID removes any mailbox row that was rescued
+// from the steering inject with the given client_message_id
+// (ReEnqueueInjectSurvivors stamps the id onto the row). This is the cascade
+// half of /inject/retract: without it, a retract that arrives after run
+// teardown already parked the inject in the durable mailbox has nothing to
+// consume, and the next run's startup drain prepends the supposedly-cancelled
+// text to the new prompt. Returns the number of rows removed.
+func (sc *SessionCache) RetractMailboxByClientMessageID(key, clientMessageID string) int {
+	if key == "" || clientMessageID == "" {
+		return 0
+	}
+	sc.mu.Lock()
+	entry := sc.routes[key]
+	sc.mu.Unlock()
+	if entry == nil || entry.mailbox == nil {
+		return 0
+	}
+	removed := 0
+	for _, m := range entry.mailbox.Snapshot() {
+		if m.ClientMessageID != clientMessageID {
+			continue
+		}
+		if entry.mailbox.Retract(m.ID) {
+			if sc.mailboxStore != nil {
+				_ = sc.mailboxStore.Delete(m.ID)
+			}
+			removed++
+		}
+	}
+	return removed
 }
 
 // MailboxLen returns the route's mailbox length, or 0 for unknown routes.
