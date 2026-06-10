@@ -809,6 +809,12 @@ type AgentLoop struct {
 	// the run and be re-prepended to the next user prompt by runner.go's
 	// startup drain, producing visible "merged user bubble" regressions.
 	mailboxConsumeFn func(ids []string)
+	// injectCommittedBroadcaster, when set, is invoked once per drained
+	// follow-up carrying a ClientMessageID, alongside the per-request
+	// InjectCommitHandler. Daemon wires it to the EventBus so clients that do
+	// NOT own the run's SSE stream (cross-channel mirrors) still observe the
+	// commit. See SetInjectCommittedBroadcaster.
+	injectCommittedBroadcaster func(clientMessageID, text string)
 	// injectRetractedChecker, when set, is consulted at drain time for each
 	// drained follow-up carrying a ClientMessageID. Returning true means the
 	// client cancelled that follow-up after it was already injected, so the
@@ -1417,16 +1423,36 @@ func (a *AgentLoop) emitDrainedLifecycle(drained []InjectedMessage) {
 // emitter. No-op when the handler doesn't implement the interface or the
 // drained message has no client id (TUI keyboard / IM / legacy injects).
 func (a *AgentLoop) emitInjectCommitted(drained []InjectedMessage) {
-	h, ok := a.handler.(InjectCommitHandler)
-	if !ok {
+	h, handlerOK := a.handler.(InjectCommitHandler)
+	if !handlerOK && a.injectCommittedBroadcaster == nil {
 		return
 	}
 	for _, m := range drained {
 		if m.ClientMessageID == "" {
 			continue
 		}
-		h.OnInjectedCommitted(m.ClientMessageID, m.Text)
+		if handlerOK {
+			h.OnInjectedCommitted(m.ClientMessageID, m.Text)
+		}
+		// Broadcast hook (daemon wires this to the EventBus): unlike the
+		// handler above — which only exists on the per-request SSE stream of
+		// the run's OWNING client — the broadcast reaches every /events
+		// subscriber, so a Desktop watching a session whose run belongs to
+		// another channel (kocoro mobile, Slack) still learns the commit and
+		// can flip its queued-draft card.
+		if a.injectCommittedBroadcaster != nil {
+			a.injectCommittedBroadcaster(m.ClientMessageID, m.Text)
+		}
 	}
+}
+
+// SetInjectCommittedBroadcaster registers a channel-agnostic commit notifier
+// invoked alongside the per-request InjectCommitHandler for every drained
+// follow-up carrying a client id. Daemon callers wire this to the EventBus
+// (EventInjectedCommitted). Pass nil to clear. Set once before Run — read
+// without a lock, same convention as mailboxConsumeFn.
+func (a *AgentLoop) SetInjectCommittedBroadcaster(fn func(clientMessageID, text string)) {
+	a.injectCommittedBroadcaster = fn
 }
 
 // emitFirstTurnLifecycle fires OnUserMessageProcessing exactly once for the
