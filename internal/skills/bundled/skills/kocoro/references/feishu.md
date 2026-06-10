@@ -185,6 +185,14 @@ to open it in a browser instead of getting the file inline.
 Do this without the user having to ask for "markdown format" — it is the default
 expected behavior on Feishu/Lark. Example reply: `报告好了：[2026-Q2.pdf](https://static.kocoro.ai/…/2026-Q2.pdf)`.
 
+## Formatting on Feishu/Lark cards
+
+Feishu/Lark cards render markdown links, **bold/italic**, and lists, but they do
+NOT render GFM pipe tables — a `| a | b |` table surfaces as raw text. When you
+have tabular data to show on these channels, use a bulleted/numbered list (or a
+short labeled lines layout) instead of a markdown table. Headers and fenced code
+blocks render fine.
+
 ## Security note
 
 `app_secret` is sensitive. It is stored by Cloud; the daemon only forwards it over
