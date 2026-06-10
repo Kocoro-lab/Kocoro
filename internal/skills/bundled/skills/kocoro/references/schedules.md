@@ -68,6 +68,8 @@ As the kocoro assistant, manage schedules with the local tools `schedule_create`
 
 Format: `minute hour day-of-month month day-of-week`
 
+Day-of-month is validated for feasibility: an impossible day/month combination (e.g. `0 0 31 2 *` — Feb 31, or `0 0 31 4 *` — Apr 31) is rejected at create/update time because it would never fire. For "last day of the month" use `L` (`0 0 L * *`), not `31` — `0 0 31 * *` silently skips every 30-day month and February.
+
 ## Common Scenarios
 
 ### "Run a daily report at 9am on weekdays"

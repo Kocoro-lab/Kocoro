@@ -114,6 +114,24 @@ func TestHandleCreateSchedule_RejectsUnknownSource(t *testing.T) {
 	}
 }
 
+// An impossible day/month combo (Feb 31) is a client input error, so the API
+// edge must return 4xx — NOT 500. The handler classifies schedule errors into
+// status codes by substring-matching the message, so this guards against the
+// feasibility error text drifting away from that "invalid" → 400 mapping.
+func TestHandleCreateSchedule_RejectsInfeasibleCron(t *testing.T) {
+	srv, _, _ := newTestServerWithScheduleMgr(t)
+	body := `{"agent":"x","cron":"0 0 31 2 *","prompt":"p"}`
+	req := httptest.NewRequest(http.MethodPost, "/schedules", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	srv.handleCreateSchedule(w, req)
+	if w.Code < 400 || w.Code >= 500 {
+		t.Fatalf("expected 4xx for infeasible cron, got %d body %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "cron") {
+		t.Errorf("error body should mention cron: %s", w.Body.String())
+	}
+}
+
 func TestHandleCreateSchedule_AcceptsCloudSource(t *testing.T) {
 	srv, _, _ := newTestServerWithScheduleMgr(t)
 	// A cloud source is a legitimate origin for the LLM tool path; the API
