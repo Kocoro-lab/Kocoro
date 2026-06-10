@@ -7,24 +7,30 @@ import (
 	"testing"
 )
 
-// TestCloudSourceDefinitionsAgree pins the two places that must agree on
-// "what counts as a cloud source" — the allocator (isCloudSource) and the
-// output-format profile (outputFormatForSource). Adding a new source to one
-// without the other would silently give it a rendered profile but no scratch
-// CWD (or vice versa). This test drives both paths with the same inputs and
-// asserts identical classification.
+// TestCloudSourceDefinitionsAgree pins the relationship between the two places
+// that classify a request source — the scratch-CWD allocator (isCloudSource)
+// and the output-format profile (outputFormatForSource). Every cloud source
+// gets a scratch CWD; its format is "plain" UNLESS it is a markdownCloudSource
+// (Feishu/Lark cards render standard markdown), which intentionally diverges to
+// "markdown" while staying a cloud source. Non-cloud sources are always
+// "markdown". This guards against adding a source to one path but not the other.
 func TestCloudSourceDefinitionsAgree(t *testing.T) {
 	inputs := []string{
 		"slack", "line", "feishu", "lark", "wecom", "telegram", "webhook",
 		"desktop", "cli", "cron", "schedule", "web", "", "unknown",
-		"SLACK", " Slack ",
+		"SLACK", " Slack ", "FEISHU", " Lark ",
 	}
 	for _, src := range inputs {
 		cloud := isCloudSource(src)
-		plain := outputFormatForSource(src) == "plain"
-		if cloud != plain {
-			t.Errorf("source %q: isCloudSource=%v but outputFormatForSource=%q — definitions drifted",
-				src, cloud, outputFormatForSource(src))
+		format := outputFormatForSource(src)
+		_, isMarkdownCloud := markdownCloudSources[strings.ToLower(strings.TrimSpace(src))]
+		switch {
+		case !cloud && format != "markdown":
+			t.Errorf("source %q: non-cloud must be markdown, got %q", src, format)
+		case cloud && isMarkdownCloud && format != "markdown":
+			t.Errorf("source %q: markdown cloud source must be markdown, got %q", src, format)
+		case cloud && !isMarkdownCloud && format != "plain":
+			t.Errorf("source %q: plain cloud source must be plain, got %q", src, format)
 		}
 	}
 }

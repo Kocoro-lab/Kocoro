@@ -429,12 +429,16 @@ func TestOutputFormatForSource(t *testing.T) {
 		{"slack", "plain"},
 		{"line", "plain"},
 		{"webhook", "plain"},
-		{"feishu", "plain"},
-		{"lark", "plain"},
 		{"wecom", "plain"},
 		{"telegram", "plain"},
 		{"Slack", "plain"}, // case-insensitive
 		{"LINE", "plain"},  // case-insensitive
+		// Feishu/Lark are cloud sources but render standard markdown cards, so
+		// they emit GFM (re-enables [name](url) → file attachment conversion).
+		{"feishu", "markdown"},
+		{"lark", "markdown"},
+		{"FEISHU", "markdown"}, // case-insensitive
+		{" Lark ", "markdown"}, // trim
 		// Everything else → markdown (local, cron, schedule, web, unknown)
 		{"shanclaw", "markdown"},
 		{"desktop", "markdown"},
