@@ -2168,6 +2168,30 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			return deps.SessionCache.ConsumeInjectRetracted(routeKey, clientMessageID)
 		})
 	}
+	// Cross-channel commit broadcast: the per-request InjectCommitHandler only
+	// reaches the run's OWNING client (the SSE stream that started the run). A
+	// Desktop viewing the same session while the run belongs to another channel
+	// (kocoro mobile, Slack, a schedule) never sees that stream, so its
+	// queued-draft card survives the commit and the user can pop the text back
+	// and re-send it — the cross-channel duplicate. Mirror the commit onto the
+	// EventBus so every /events subscriber observes the consume boundary.
+	// Covers routed runs and ad-hoc (session-keyed first-message) runs alike.
+	if deps.EventBus != nil {
+		busRouteKey := req.RouteKey
+		if busRouteKey == "" {
+			busRouteKey = adHocRouteKey
+		}
+		busSessionID := sess.ID
+		loop.SetInjectCommittedBroadcaster(func(clientMessageID, text string) {
+			payload, _ := json.Marshal(map[string]any{
+				"route_key":  busRouteKey,
+				"session_id": busSessionID,
+				"message_id": clientMessageID,
+				"text":       text,
+			})
+			deps.EventBus.Emit(Event{Type: EventInjectedCommitted, Payload: payload})
+		})
+	}
 	loop.SetSessionID(sess.ID)
 	// Make the caller's agent name available to tools via ctx. schedule_create
 	// reads this so a schedule built from an agent conversation defaults to
