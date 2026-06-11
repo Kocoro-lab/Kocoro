@@ -156,7 +156,7 @@ var daemonStartCmd = &cobra.Command{
 		// Tee log output to ~/.shannon/logs/daemon.log so helper-spawned
 		// daemons (whose stdout is owned by the parent Desktop process)
 		// still leave a debuggable trail. The launchd plist already
-		// redirects stdout there, but Desktop's ShanClawBridge spawns the
+		// redirects stdout there, but Desktop spawns the
 		// helper directly and consumes stdout itself — without this tee
 		// the entire run is invisible to anyone but Desktop.
 		if shanDir != "" {

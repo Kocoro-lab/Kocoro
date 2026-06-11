@@ -2,7 +2,7 @@
  * html-artifact host stylesheet — the design-system preset injected into every
  * sandboxed artifact iframe on a shared page.
  *
- * SOURCE OF TRUTH: Kocoro Desktop/ShanClaw/Resources/WebView/message-list.js
+ * SOURCE OF TRUTH: Kocoro Desktop's message-list.js
  *   (the ARTIFACT_HOST_CSS constant). This file is a VERBATIM mirror so an
  *   artifact renders identically on the public share page and in Desktop's
  *   WKWebView. Synced 2026-06-04. If Desktop's design tokens / base styles

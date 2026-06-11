@@ -139,7 +139,7 @@ calendar.request_permission
 ```
 
 Daemon Go side: constants in `internal/daemon/desktop_rpc/types.go` (`Method*` and `ProtocolMethods`).
-Desktop Swift side: constants in `Packages/ShanClawBridge/Sources/ShanClawBridge/DesktopRPC/ProtocolConstants.swift`.
+Desktop Swift side: the mirrored `ProtocolConstants.swift` constants file in the Kocoro Desktop app.
 
 **Both sides must `grep` to ensure no inline literal strings remain after Phase 1** — drift between the two arrays = silent runtime mismatch.
 

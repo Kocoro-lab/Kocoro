@@ -20,7 +20,6 @@ CLAUDE.local.md
 docs/*
 !docs/cache-strategy.md
 !docs/cache-debug.md
-!docs/kocoro-desktop-attachment-design.md
 !docs/config-reference.md
 !docs/agents-reference.md
 !docs/session-sync-launchd.md
