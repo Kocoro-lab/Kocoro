@@ -6,7 +6,7 @@ The Desktop RPC channel is a **local Unix domain socket** that the daemon uses t
 
 This is daemon ↔ local-machine Desktop only. **Never goes through Cloud relay**. Even if a calendar query is triggered by a Slack message that arrives via the daemon's WS connection to Shannon Cloud, the actual EventKit call goes directly local-machine daemon → local-machine Desktop over the sock.
 
-Authoritative spec: `docs/desktop-calendar-rpc.md` v0.5.1.
+Protocol version: v0.5.1 (ProtocolVersion `1.0.0`). This reference is the authoritative description of the channel.
 
 ## Deployment model
 
@@ -164,6 +164,5 @@ All three are tracked as v1.x patches; order: cancel → async permission → at
 
 ## See also
 
-- `docs/desktop-calendar-rpc.md` v0.5.1 — full protocol spec
 - `calendar.md` (in this same references/ directory) — calendar tool reference
 - `docs/desktop-calendar-rpc-fixtures/` — JSON fixtures for round-trip testing

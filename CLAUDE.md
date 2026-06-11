@@ -126,7 +126,7 @@ Feature changes update README.md (user-facing), CLAUDE.md (this file, developer-
 - agents/skills/schedules/config endpoints → `references/{agents,skills,schedules,config}.md`
 - MCP / permissions / project-init / instructions / recipes / session-sync / memory → matching `references/*.md`
 - `/local/auth/*` endpoints → `references/auth.md`
-- `calendar_*` tools (8) + protocol → `references/calendar.md` + `references/desktop-rpc.md`; the underlying Unix socket protocol spec lives at `docs/desktop-calendar-rpc.md` (versioned outside the skill bundle because Desktop CC consumes it too)
+- `calendar_*` tools (8) + protocol → `references/calendar.md` + `references/desktop-rpc.md` (these skill refs are the public protocol reference); the full design doc `docs/desktop-calendar-rpc.md` is local-only / untracked (rationale + closed-app internals, not shipped)
 - Protected config fields, tool filter → `SKILL.md` security section
 
 ### Hardcoded Limit Policy
