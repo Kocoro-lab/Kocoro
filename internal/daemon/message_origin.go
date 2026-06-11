@@ -13,7 +13,7 @@ import (
 // addressed in (S1). Sender is intentionally absent — it rides the existing
 // RunAgentRequest.Sender field and the existing `Sender:` sticky line.
 type MessageOrigin struct {
-	Platform     string // slack / feishu / lark / wecom
+	Platform     string // slack / feishu / lark / wecom / line
 	Scope        string // dm | group | channel | "" (unknown)
 	ChannelID    string // native id (Slack C/G/D, WeCom conversation_id, Lark chat_id [needs S1b])
 	ChannelLabel string // human-readable (#shannon); optional, from S1b best-effort; degrade to ChannelID
@@ -45,6 +45,8 @@ func parseMessageOrigin(source string, blob json.RawMessage) *MessageOrigin {
 		// lark/feishu (added by S1b)
 		ChatID   string `json:"chat_id"`
 		ChatType string `json:"chat_type"`
+		// line
+		LineUserID string `json:"line_user_id"`
 		// optional human label (S1b best-effort, any platform)
 		ChannelLabel string `json:"channel_label"`
 	}
@@ -69,6 +71,11 @@ func parseMessageOrigin(source string, blob json.RawMessage) *MessageOrigin {
 	case "lark", "feishu":
 		o.ChannelID = raw.ChatID // empty until S1b
 		o.Scope = larkScope(raw.ChatType)
+	case "line":
+		// Shared-OA LINE is 1:1 only — every message is a DM with the paired
+		// user, and line_user_id is the only native id the blob carries.
+		o.ChannelID = raw.LineUserID
+		o.Scope = "dm"
 	default:
 		return nil
 	}
