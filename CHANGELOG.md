@@ -2,6 +2,40 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.2.3 — 2026-06-11 — Cmd+Enter duplicate-send fix (durable inject retraction) + schedule thread mode + mailbox crash-safety + cron/truncation hardening
+
+Reliability release. The headline is **eliminating the Cmd+Enter duplicate-reply / duplicate-send family** ([#241](https://github.com/Kocoro-lab/Kocoro/pull/241)): a follow-up retracted while a run is tearing down is now resolved against a durable per-route ledger that distinguishes *dropped-by-tombstone* from *already-committed*, so a racing retract can never strand a queued draft that then re-sends as a fresh message, and a cancel / `maxIter` teardown no longer double-flushes the last assistant text. Plus a new **schedule thread three-state** ([#230](https://github.com/Kocoro-lab/Kocoro/pull/230)) controlling whether proactive IM pushes anchor into a thread, **mailbox crash-safety** ([#233](https://github.com/Kocoro-lab/Kocoro/pull/233)), **infeasible-cron rejection** ([#235](https://github.com/Kocoro-lab/Kocoro/pull/235)), **byte-stable truncation** of oversized user messages ([#231](https://github.com/Kocoro-lab/Kocoro/pull/231)), and **Feishu/Lark markdown output** so published files become downloadable attachments ([#236](https://github.com/Kocoro-lab/Kocoro/pull/236)).
+
+> **Cross-repo contract:** all additive, no breaking wire changes. `POST /inject/retract` now returns a commit-aware status (`already_committed` when the follow-up already entered an LLM turn) so the client knows not to re-send; `injected_committed` is now broadcast on the daemon EventBus (consumer: ShanClawDesktop). Schedule `thread: auto|on|off` resolves to `ProactivePayload.UseThread` for proactive pushes (capability token `proactive_thread_mode`, observability only; consumer: Cloud). Feishu/Lark switches to the `markdown` output profile, re-enabling Cloud's `[name](url)` → file-attachment conversion.
+
+### Added
+
+- **Schedule thread three-state** (PR #230, `24155c7`, `internal/schedule/schedule.go`, `internal/tools/schedule.go`) — `thread: "auto" | "on" | "off"` controls whether a proactive IM push anchors into a thread (one session ↔ one thread) or posts at the channel top level. `auto` (default / legacy-nil) follows session state — sticky schedules with an IM blob thread-anchor, stateless / blob-less post top-level; `on`/`off` force it (ignoring `Stateful`). `schedule_create` / `_update` and `PATCH /schedules/{id}` accept the field; the daemon resolves it to `ProactivePayload.UseThread`. Threadless platforms (LINE/WeCom/Telegram) ignore the hint. Capability token `proactive_thread_mode`.
+- **Durable inject retraction with commit-aware status** (PR #241, `b4a76c5`, `d12a7c7`, `internal/daemon/router.go`, `internal/daemon/router_mailbox.go`, new `internal/agenttypes/`) — per-route `retractedInjects` (tombstones) and `committedInjects` ledgers, TTL-bounded (10 min) and per-route capped (256), survive run transitions so a retract that loses the race against run teardown still drops a late inject landing on the *next* run. `POST /inject/retract` answers `already_committed` from the committed ledger so the client never re-sends text the model already saw. `injected_committed` now also broadcasts on the daemon EventBus.
+
+### Changed
+
+- **Feishu/Lark use the `markdown` output profile** (PR #236, `e074d59`, `internal/daemon/runner.go`) — Feishu/Lark cards render standard markdown, and GFM output re-enables Cloud's `[name](url)` → file-attachment conversion, so files the agent publishes become downloadable attachments instead of inert raw URLs. Added to `markdownCloudSources` (cloud sources that opt out of the `plain` default).
+
+### Fixed
+
+- **Cmd+Enter duplicate-reply / duplicate-send family** (PR #241, `d4cfe20`, `96b8f0b`, `internal/daemon/router.go`, `internal/agent/loop.go`) — inject ledgers are reaped so a stale entry can no longer shadow `sc.routes` forever; the last assistant text is deduped on cancel and `maxIter` teardown so a cancelled / capped turn doesn't double-flush its final reply. Together with the durable-retraction ledger above, this closes the family of Cmd+Enter interrupt-send races that surfaced as a duplicated reply or a re-sent follow-up.
+- **Mailbox consume deferred until first `session.Save`** (PR #233, issue #163, `63ae295`, `internal/daemon/runner.go`) — a queued mailbox message is no longer consumed before the session is first persisted, so a hard error before the initial save can't drop the pending message; it stays in the mailbox for replay.
+- **Reject infeasible cron day/month combos** (PR #235, `1a1fb8a`, `internal/schedule/schedule.go`) — an expression that can never fire on a real calendar (e.g. `0 0 31 2 *` — Feb 31) is now rejected at write time. `gronx.IsValid` only range-checks each field; feasibility is decided by scanning an eight-year window (covers every month length plus Feb 29). `gronx.NextTickAfter` is unusable here because Go's time normalization rolls Feb 31 to March and returns a bogus next tick with a nil error.
+- **Byte-stable truncation of oversized user messages** (PR #231, `ee41c53`, `internal/context/window.go`) — truncation of an oversized user message is now idempotent, so re-truncating an already-truncated message produces identical bytes and can't spin the caller loop.
+- **Forward `UsageProvider` through `multiHandler`** (PR #234, `bc1ffed`, `internal/daemon/multi_handler.go`) — the fan-out `EventHandler` wrapper now forwards the optional `UsageProvider` interface, so per-run usage aggregation isn't dropped when multiple handlers are attached.
+
+### Docs
+
+- `references/schedules.md` (bundled `kocoro` skill): documented the schedule thread three-state (PR #230).
+- `references/feishu.md` (bundled `kocoro` skill): documented the Feishu/Lark markdown output exception (PR #236).
+- `CLAUDE.md`: synced output-profile comments with the Feishu/Lark markdown exception.
+
+### Tests
+
+- **Cmd+Enter incident replayed end to end** (PR #241, `862f735`, `internal/daemon/cmdenter_dup_e2e_test.go`) — reproduces the interrupt-send incident; `router_retract_durable_test.go` covers tombstone-vs-committed resolution, TTL/cap reaping, and the retract-vs-teardown race; `loop_cancel_dedup_test.go` pins the cancel / `maxIter` dedup.
+- Mailbox ordering / pending-on-hard-error (`runner_mailbox_ordering_test.go`, PR #233); re-truncation idempotency pin (PR #231); `multiHandler` UsageProvider forwarding (PR #234); cron feasibility + thread-enum / `resolveThread` coverage (PRs #235, #230).
+
 ## v0.2.2 — 2026-06-06 — Feishu/Lark auto-connect + outbound IM observability + smart titles + share artifacts + review hardening
 
 Feature batch plus a dedicated review-hardening pass. The agent gains **awareness of its own IM channel state** (a per-platform connection-state cache rendered into Session Facts, plus sanitized system-reminder events for membership/delivery changes), **Feishu/Lark bots can be auto-connected from chat**, sessions get **LLM-generated smart titles** across daemon/TUI/one-shot, and **session shares render `html-artifact` fences as sandboxed iframes** with tool runs stripped. The back half of the release ([#229](https://github.com/Kocoro-lab/Kocoro/pull/229)) is bug-fix hardening found by reviewing the feature diff: audit secret-redaction gaps, a lost-system-event path, connection-state masking, non-atomic session writes, and a share-page stored-XSS vector.
