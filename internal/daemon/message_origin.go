@@ -156,7 +156,11 @@ func larkScope(chatType string) string {
 // sticky block). Reuses S0's sanitizer.
 func (o *MessageOrigin) renderChannelLine() string {
 	label := o.ChannelLabel
-	if label == "" {
+	// LINE never falls back to ChannelID: it holds the raw LINE userId, kept
+	// only for the conn-state lookup — an opaque token the agent could echo
+	// into replies. The user's nickname already rides the Sender: line, so
+	// LINE renders "line · dm".
+	if label == "" && o.Platform != "line" {
 		label = o.ChannelID
 	}
 	label = agent.SanitizeSystemEventText(label)

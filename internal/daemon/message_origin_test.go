@@ -69,7 +69,10 @@ func TestParseMessageOrigin_Line(t *testing.T) {
 	if o.Platform != "line" || o.ChannelID != "U4af4980629abc" || o.Scope != "dm" || o.ThreadID != "" {
 		t.Fatalf("origin = %+v", o)
 	}
-	if got := o.renderChannelLine(); got != "line · U4af4980629abc · dm" {
+	// The raw userId must NOT render into the prompt (prompt hygiene) — it
+	// stays on ChannelID solely for the conn-state lookup; the nickname rides
+	// the Sender: line.
+	if got := o.renderChannelLine(); got != "line · dm" {
 		t.Fatalf("renderChannelLine() = %q", got)
 	}
 	// Defense-in-depth: a blob without line_user_id degrades to nil (coarse
