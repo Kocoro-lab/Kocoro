@@ -24,6 +24,7 @@ docs/*
 !docs/agents-reference.md
 !docs/session-sync-launchd.md
 !docs/desktop-calendar-rpc-fixtures
+!docs/desktop-wire-fixtures
 internal/tools/axserver/.build/
 internal/agent/tmp/
 build/

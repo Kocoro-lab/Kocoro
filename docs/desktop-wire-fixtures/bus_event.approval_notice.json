@@ -1,0 +1,6 @@
+{
+  "severity": "warn",
+  "code": "bash_always_ask_not_persisted",
+  "tool": "bash",
+  "message": "Allowed for this turn. Not saved (high-risk command — runs that fetch and execute code or destroy data must be approved each call)."
+}

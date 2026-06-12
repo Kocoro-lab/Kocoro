@@ -1,0 +1,11 @@
+{
+  "name": "demo-agent",
+  "display_name": "demo-agent",
+  "prompt": "You are a demo agent used by wire-fixture tests.\n",
+  "memory": null,
+  "config": null,
+  "commands": null,
+  "skills": null,
+  "builtin": false,
+  "overridden": false
+}

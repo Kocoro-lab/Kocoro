@@ -150,6 +150,10 @@ Session sync is opt-in. It uses a single Run entry point, flock, atomic marker w
 
 Suggestion generation is a forked request after a successful main turn. Cache safety invariant: the fork must be byte-equal to the main request except for the appended assistant reply, suggestion prompt, skip-cache-write flag, and debug-only fork kind. Do not change tools, max tokens, thinking budget, or ordering in the fork.
 
+### Wire Contracts
+
+Payloads decoded by UI clients (bus events, per-request SSE events, HTTP responses) are pinned by canonical fixtures in `docs/desktop-wire-fixtures/` and verified by `internal/daemon/wire_fixtures_test.go`, which emits through the real producer path and decodes producer bytes into consumer-shaped structs. Change a payload → update fixture + test in the same PR. Cross-version contract changes mint a capability token in `Capabilities` (`internal/daemon/client.go`; surfaced on the WS handshake and `GET /status`) — clients gate on tokens, never version-sniff. New event domains use dotted namespaced types with a common envelope; existing flat types are additive-only and never repurposed. See the kocoro skill `references/events.md` for full rules.
+
 ### Prompt Cache
 
 Source-routed TTLs matter: channels/TUI use long cache, one-shot/subagent/helper paths use cheaper short cache. Preserve `cache_source` propagation and canonical tool input normalization.

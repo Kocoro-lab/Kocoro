@@ -1801,6 +1801,19 @@ func (s *Server) handleRetractInject(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// newSSEApprovalSendFn builds the per-request broker sendFn that frames an
+// ApprovalRequest as the `event: approval` SSE frame. Named (rather than an
+// inline closure in handleMessageSSE) so the wire-fixture test exercises the
+// real framing — event name included — instead of reconstructing it.
+func newSSEApprovalSendFn(w io.Writer, flusher http.Flusher) func(ApprovalRequest) error {
+	return func(areq ApprovalRequest) error {
+		data := mustJSON(areq)
+		_, err := fmt.Fprintf(w, "event: approval\ndata: %s\n\n", data)
+		flusher.Flush()
+		return err
+	}
+}
+
 // handleMessageSSE streams agent events as SSE.
 func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req RunAgentRequest) {
 	flusher, ok := w.(http.Flusher)
@@ -1816,12 +1829,7 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 
 	// Create a per-request broker to avoid racing with concurrent SSE requests.
 	// Each SSE stream gets its own broker with its own sendFn and pending map.
-	reqBroker := NewApprovalBroker(func(areq ApprovalRequest) error {
-		data := mustJSON(areq)
-		_, err := fmt.Fprintf(w, "event: approval\ndata: %s\n\n", data)
-		flusher.Flush()
-		return err
-	})
+	reqBroker := NewApprovalBroker(newSSEApprovalSendFn(w, flusher))
 	// Inherit bus hooks from the server broker so EventBus emission stays
 	// consistent with the WS path (request payload + daemon-cleanup deny).
 	reqBroker.onRequest = s.approvalBroker.onRequest

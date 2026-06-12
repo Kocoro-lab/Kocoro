@@ -1,0 +1,6 @@
+{
+  "tool": "bash",
+  "tool_use_id": "toolu_01AbCdEfGhIjKlMnOpQrStUv",
+  "status": "running",
+  "args": "{\"command\":\"go test ./...\",\"description\":\"Run the test suite\"}"
+}

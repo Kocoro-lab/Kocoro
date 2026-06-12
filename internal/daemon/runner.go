@@ -2737,6 +2737,18 @@ func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source
 	}()
 }
 
+// suggestionReadyPayload builds the EventSuggestionReady bus payload. Wire
+// shape is pinned by docs/desktop-wire-fixtures/bus_event.suggestion_ready.json.
+// Marshal of three plain strings cannot fail, so no error is surfaced.
+func suggestionReadyPayload(sessionID, agentName, text string) []byte {
+	payload, _ := json.Marshal(map[string]any{
+		"session_id": sessionID,
+		"agent":      agentName,
+		"text":       text,
+	})
+	return payload
+}
+
 // fireSuggestionAfterRun runs in a detached goroutine after the main turn
 // completes successfully. It generates a forked prompt suggestion, stores it
 // in SuggestionState, emits an SSE event, and writes audit rows that record
@@ -2841,12 +2853,7 @@ func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, se
 	}
 
 	if deps.EventBus != nil {
-		payload, _ := json.Marshal(map[string]any{
-			"session_id": sessionID,
-			"agent":      agentName,
-			"text":       res.Text,
-		})
-		deps.EventBus.Emit(Event{Type: EventSuggestionReady, Payload: payload})
+		deps.EventBus.Emit(Event{Type: EventSuggestionReady, Payload: suggestionReadyPayload(sessionID, agentName, res.Text)})
 	}
 
 	if deps.Auditor != nil {
