@@ -1732,6 +1732,78 @@ func readResponseBody(resp *http.Response) string {
 	return strings.TrimSpace(string(body))
 }
 
+// SyncAgentItem mirrors the cloud PUT/GET /api/v1/agents/sync agent shape.
+// config/skills/profile are raw JSON passthrough (daemon owns the shape).
+type SyncAgentItem struct {
+	AgentKey    string          `json:"agent_key"`
+	DisplayName string          `json:"display_name"`
+	Prompt      string          `json:"prompt"`
+	Memory      *string         `json:"memory"`
+	Config      json.RawMessage `json:"config"`
+	Skills      json.RawMessage `json:"skills"`
+	Profile     json.RawMessage `json:"profile"`
+	DeletedAt   *time.Time      `json:"deleted_at,omitempty"`
+	UpdatedAt   time.Time       `json:"updated_at"`
+}
+
+type syncAgentsBody struct {
+	FullSync bool            `json:"full_sync"`
+	Agents   []SyncAgentItem `json:"agents"`
+}
+
+// SyncAgents PUTs agents to Cloud's mirror. fullSync=true reconciles deletes.
+func (c *GatewayClient) SyncAgents(ctx context.Context, agents []SyncAgentItem, fullSync bool) error {
+	payload, err := json.Marshal(syncAgentsBody{FullSync: fullSync, Agents: agents})
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	endpoint := c.baseURL + "/api/v1/agents/sync"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("sync agents returned %d: %s", resp.StatusCode, readResponseBody(resp))
+	}
+	return nil
+}
+
+// PullAgents GETs the tenant's agent mirror.
+func (c *GatewayClient) PullAgents(ctx context.Context) ([]SyncAgentItem, error) {
+	endpoint := c.baseURL + "/api/v1/agents/sync"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("pull agents returned %d: %s", resp.StatusCode, readResponseBody(resp))
+	}
+	var out struct {
+		Agents []SyncAgentItem `json:"agents"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return out.Agents, nil
+}
+
 // SessionEnvelope wraps one session JSON with its routing hint.
 // agent_name is a sub-partition hint only — tenancy is anchored by API key auth.
 type SessionEnvelope struct {
