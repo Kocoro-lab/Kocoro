@@ -29,6 +29,11 @@ type AgentProfile struct {
 	// category — handled the same as the field being absent in the yaml.
 	Category string `yaml:"category,omitempty"`
 
+	// Avatar is the agent's avatar image URL (CDN). Non-localized. Empty
+	// means no avatar — handled the same as the field being absent. Set via
+	// PROFILE.yaml `avatar:` or the create/update agent API; synced to Cloud.
+	Avatar string `yaml:"avatar,omitempty"`
+
 	// Description: single localized blurb shown on the agent profile surface.
 	Description LocalizedString `yaml:"description,omitempty"`
 

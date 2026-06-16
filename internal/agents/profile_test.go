@@ -423,3 +423,23 @@ func TestLoadAgent_AllBuiltinsHaveValidProfile(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadAgentProfile_WithAvatar(t *testing.T) {
+	dir := t.TempDir()
+	writeYAML(t, dir, `
+category: coding
+avatar: https://cdn.example.com/a.png
+description:
+  en: An agent.
+`)
+	p, err := LoadAgentProfile(dir)
+	if err != nil {
+		t.Fatalf("LoadAgentProfile: %v", err)
+	}
+	if p == nil {
+		t.Fatal("expected non-nil profile")
+	}
+	if p.Avatar != "https://cdn.example.com/a.png" {
+		t.Errorf("Avatar=%q, want the cdn url", p.Avatar)
+	}
+}
