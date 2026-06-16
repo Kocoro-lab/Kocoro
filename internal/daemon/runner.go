@@ -644,6 +644,11 @@ func (req *RunAgentRequest) EnsureRouteKey() {
 // with a file extension) into a downloadable msg_type=file attachment — a plain
 // raw URL is never converted, so "plain" silently disabled the feature.
 //
+// Teams is here too: Cloud's teamsReplyActivity passes the reply text straight
+// into the Bot Framework message body, which renders markdown (incl. tables) —
+// so without this entry, adding Teams to cloudSourceSet would flip its format
+// from "markdown" to "plain" and strip all rich formatting.
+//
 // These sources STAY in cloudSourceSet (no user shell → scratch CWD, skill
 // filtering, banner suppression all keyed off isCloudSource); only their output
 // FORMAT diverges. Other cloud channels (Slack mrkdwn, LINE Flex, WeCom,
@@ -651,6 +656,7 @@ func (req *RunAgentRequest) EnsureRouteKey() {
 var markdownCloudSources = map[string]struct{}{
 	ChannelFeishu: {},
 	ChannelLark:   {},
+	ChannelTeams:  {},
 }
 
 // outputFormatForSource maps a request source to an output format profile.
@@ -760,7 +766,7 @@ func IsMessagingPlatform(source string) bool {
 func cacheSourceFromDaemonSource(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
 	switch s {
-	case "slack", "line", "feishu", "lark", "wecom", "telegram":
+	case "slack", "line", "feishu", "lark", "wecom", "teams", "telegram":
 		// Human-conversation channels: idle gaps > 5m are common, 1h pays off.
 		return s
 	case "tui", "kocoro", "shanclaw":
