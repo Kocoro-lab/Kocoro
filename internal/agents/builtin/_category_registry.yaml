@@ -1,0 +1,61 @@
+# Agent category registry — single source of truth for category codes and
+# their three-language labels. Per-agent PROFILE.yaml references categories
+# by `code`; this file supplies the `label` map inlined into HTTP responses.
+#
+# To add a new category: append an entry below with `code` (lowercase
+# kebab-slug) and `label.{en,zh-Hans,ja}`. Tag the desired agent's PROFILE.yaml
+# with the new code. No client-side ship is required — clients render whatever
+# label the daemon serves.
+#
+# Adding/removing categories here is a wire-compatible change: existing agents
+# referencing a removed code will fail to load (intentional — fail loud at
+# startup, do not silently downgrade to "other").
+
+categories:
+  - code: coding
+    label:
+      en: Coding
+      zh-Hans: 编程
+      ja: コーディング
+
+  - code: writing
+    label:
+      en: Writing
+      zh-Hans: 写作
+      ja: ライティング
+
+  - code: research
+    label:
+      en: Research
+      zh-Hans: 研究
+      ja: リサーチ
+
+  - code: productivity
+    label:
+      en: Productivity
+      zh-Hans: 工作流
+      ja: 業務効率
+
+  - code: data
+    label:
+      en: Data
+      zh-Hans: 数据分析
+      ja: データ
+
+  - code: design
+    label:
+      en: Design
+      zh-Hans: 设计
+      ja: デザイン
+
+  - code: personal
+    label:
+      en: Personal
+      zh-Hans: 生活助手
+      ja: ライフ
+
+  - code: other
+    label:
+      en: Other
+      zh-Hans: 其他
+      ja: その他

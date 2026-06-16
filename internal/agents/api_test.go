@@ -38,6 +38,19 @@ func TestAgentToAPI_Minimal(t *testing.T) {
 	if api.Config != nil {
 		t.Error("expected nil config")
 	}
+	// Without Profile, every new field stays nil — wire null on the JSON side.
+	if api.Category != nil {
+		t.Errorf("expected nil category, got %+v", api.Category)
+	}
+	if api.Description != nil {
+		t.Errorf("expected nil description, got %v", api.Description)
+	}
+	if api.GuidePrompts != nil {
+		t.Errorf("expected nil guide_prompts, got %v", api.GuidePrompts)
+	}
+	if api.Examples != nil {
+		t.Errorf("expected nil examples, got %v", api.Examples)
+	}
 }
 
 func TestAgentToAPI_Full(t *testing.T) {
@@ -63,6 +76,69 @@ func TestAgentToAPI_Full(t *testing.T) {
 	}
 	if len(api.Skills) != 1 {
 		t.Error("expected 1 skill")
+	}
+}
+
+func TestAgentToAPI_WithProfile_InlinesCategoryLabel(t *testing.T) {
+	a := &Agent{
+		Name:   "test",
+		Prompt: "hello",
+		Profile: &AgentProfile{
+			Category:    "coding",
+			Description: LocalizedString{"en": "Test agent", "zh-Hans": "测试智能体"},
+			GuidePrompts: []GuidePrompt{{
+				Title:  LocalizedString{"en": "Hi"},
+				Prompt: LocalizedString{"en": "Hello"},
+			}},
+			Examples: []AgentExample{{
+				Turns: []ExampleTurn{
+					{Role: "user", Text: LocalizedString{"en": "what?"}},
+					{Role: "assistant", Markdown: LocalizedString{"en": "answer"}},
+				},
+			}},
+		},
+	}
+	api := a.ToAPI()
+	if api.Category == nil {
+		t.Fatal("expected non-nil category")
+	}
+	if api.Category.Code != "coding" {
+		t.Errorf("category.code=%q, want coding", api.Category.Code)
+	}
+	if api.Category.Label["en"] != "Coding" {
+		t.Errorf("category.label.en=%q, want Coding (resolved from registry)", api.Category.Label["en"])
+	}
+	if api.Category.Label["zh-Hans"] != "编程" {
+		t.Errorf("category.label.zh-Hans=%q, want 编程", api.Category.Label["zh-Hans"])
+	}
+	if api.Description["en"] != "Test agent" {
+		t.Errorf("description.en=%q", api.Description["en"])
+	}
+	if len(api.GuidePrompts) != 1 || api.GuidePrompts[0].Title["en"] != "Hi" {
+		t.Errorf("guide_prompts: %+v", api.GuidePrompts)
+	}
+	if len(api.Examples) != 1 || len(api.Examples[0].Turns) != 2 {
+		t.Errorf("examples: %+v", api.Examples)
+	}
+}
+
+func TestAgentToAPI_ProfileWithoutCategory_NilCategory(t *testing.T) {
+	// Profile present but Category is empty → api.Category stays nil while
+	// the other three fields populate. Covers an agent that has guide prompts
+	// but the author hasn't picked a category yet.
+	a := &Agent{
+		Name:   "test",
+		Prompt: "hello",
+		Profile: &AgentProfile{
+			Description: LocalizedString{"en": "x"},
+		},
+	}
+	api := a.ToAPI()
+	if api.Category != nil {
+		t.Errorf("expected nil category, got %+v", api.Category)
+	}
+	if api.Description["en"] != "x" {
+		t.Errorf("description.en=%q", api.Description["en"])
 	}
 }
 

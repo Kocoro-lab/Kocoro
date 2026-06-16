@@ -619,6 +619,22 @@ func TestCapabilities_AdvertisesClientMessageQueue(t *testing.T) {
 	}
 }
 
+// TestCapabilities_AdvertisesAgentProfileV1 guards the Desktop contract for
+// the read-only profile metadata on GET /agents/{name}. Clients gate the rich
+// agent-profile UI on this token rather than sniffing nullable response fields.
+func TestCapabilities_AdvertisesAgentProfileV1(t *testing.T) {
+	found := false
+	for _, c := range Capabilities {
+		if c == CapAgentProfileV1 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("default Capabilities = %v, want to contain %q", Capabilities, CapAgentProfileV1)
+	}
+}
+
 // TestSendDeliveryAck_EmptyMessageIDIsNoOp confirms a missing inbound
 // MessageID short-circuits before sendEnvelope. The wire protocol
 // requires non-empty MessageID for delivery_ack (Cloud warns and drops

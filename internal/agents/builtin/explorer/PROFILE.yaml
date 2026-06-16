@@ -1,0 +1,90 @@
+category: coding
+
+description:
+  en: Read-only orientation specialist that maps the relevant surface area of a codebase — files, patterns, architecture, state — so you can act with confidence.
+  zh-Hans: 只读型代码库向导，帮你梳理相关文件、模式、架构和状态，让你在动手前看清全貌。
+  ja: コードベースの全体像（ファイル・パターン・アーキテクチャ・状態）を読み取り専用でマップする案内役。手を動かす前に確信を持つために。
+
+guide_prompts:
+  - title:
+      en: Map authentication flow
+      zh-Hans: 梳理认证流程
+      ja: 認証フローを把握
+    prompt:
+      en: Walk me through the authentication flow in this repo — entry points, key files, and where the session is established.
+      zh-Hans: 帮我梳理一下这个仓库的认证流程：入口点、关键文件、session 是在哪里建立的。
+      ja: このリポジトリの認証フローを教えてください。エントリーポイント、主要ファイル、セッション確立箇所まで。
+
+  - title:
+      en: Summarize project architecture
+      zh-Hans: 总结项目架构
+      ja: プロジェクト構成を要約
+    prompt:
+      en: Give me a top-level architecture summary of this project — main modules, how they depend on each other, and what each is responsible for.
+      zh-Hans: 给我一份这个项目的顶层架构总结：主要模块、它们之间的依赖关系、各自负责什么。
+      ja: このプロジェクトのアーキテクチャ概要を教えてください。主要モジュール、それらの依存関係、各モジュールの責務。
+
+  - title:
+      en: Locate a feature
+      zh-Hans: 定位某个功能
+      ja: 機能の場所を特定
+    prompt:
+      en: Where is the code for [feature name] in this codebase? Show me the entry point and the files it touches.
+      zh-Hans: 这个代码库里 [功能名称] 的代码在哪里？告诉我入口点和它涉及的文件。
+      ja: このコードベースで [機能名] のコードはどこですか? エントリーポイントと関連ファイルを教えてください。
+
+examples:
+  - title:
+      en: Trace a failing test
+      zh-Hans: 追踪失败的测试
+      ja: 失敗テストを追跡
+    turns:
+      - role: user
+        text:
+          en: Why is `TestSessionRouting_NewSession` failing? The error mentions a nil pointer in router.go.
+          zh-Hans: 为什么 `TestSessionRouting_NewSession` 在挂？错误信息说 router.go 里有空指针。
+          ja: "`TestSessionRouting_NewSession` がなぜ失敗していますか? router.go で nil ポインタとエラーが出ています。"
+      - role: assistant
+        markdown:
+          en: |
+            Let me trace what the test exercises.
+          zh-Hans: |
+            我来追一下这个测试到底测的什么。
+          ja: |
+            このテストが何を検証しているのか追跡します。
+        tool_runs:
+          - tool: grep
+            summary:
+              en: Searched router_test.go for the failing test
+              zh-Hans: 在 router_test.go 中定位失败的测试
+              ja: router_test.go から失敗テストを検索
+          - tool: file_read
+            summary:
+              en: Read router.go around the nil-pointer line
+              zh-Hans: 读取 router.go 中空指针所在行的上下文
+              ja: nil ポインタが発生する箇所の router.go を読み取り
+      - role: user
+        text:
+          en: Where is the route built?
+          zh-Hans: 路由是在哪里构造的？
+          ja: ルートはどこで構築されていますか?
+      - role: assistant
+        markdown:
+          en: |
+            The route is built in `ComputeRouteKey` (router.go:42). The nil pointer is at line 78 where `req.SessionContext` is dereferenced — but `NewSession` requests can arrive with `SessionContext == nil`. The test sets up a new-session request without a context.
+
+            **What's wrong:** the new-session branch in `ComputeRouteKey` doesn't guard against a nil `SessionContext`.
+            **Why it matters:** any caller using `new_session: true` without a session blob will crash the daemon goroutine.
+            **Fix direction (not applying):** add a nil-check at router.go:78 and fall back to the channel-key path the way the cron path already does.
+          zh-Hans: |
+            路由是在 `ComputeRouteKey` (router.go:42) 里构造的。空指针出现在第 78 行，那里在解引用 `req.SessionContext`——但 `NewSession` 请求可能携带 `SessionContext == nil`。测试用的就是没有 context 的 new-session 请求。
+
+            **问题：** `ComputeRouteKey` 的 new-session 分支没有防 `SessionContext` 为空。
+            **为什么重要：** 任何带 `new_session: true` 但不带 session blob 的调用都会让 daemon goroutine 崩溃。
+            **修复方向（不动手）：** 在 router.go:78 加一个 nil 判断，仿照 cron 路径那样退回到 channel-key 路径。
+          ja: |
+            ルートは `ComputeRouteKey` (router.go:42) で構築されています。nil ポインタは 78 行目の `req.SessionContext` 参照箇所で発生していて、`NewSession` リクエストは `SessionContext == nil` で届くことがあります。テストはまさに context なしの new-session リクエストを使っています。
+
+            **問題:** `ComputeRouteKey` の new-session 分岐が `SessionContext` の nil をガードしていません。
+            **影響:** `new_session: true` を session blob なしで使う呼び出しはすべて daemon の goroutine をクラッシュさせます。
+            **修正方向（実施はしません）:** router.go:78 に nil チェックを追加し、cron パスと同じ方法で channel-key パスにフォールバックさせる。
