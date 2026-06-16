@@ -554,6 +554,22 @@ func (s *Server) Start(ctx context.Context) error {
 	// not enabled, so it's always safe to start unconditionally here.
 	go s.runSyncLoop(ctx)
 
+	// One-time agent pull on startup: materialize PROFILE.yaml (carrying the
+	// avatar) for cloud agents that are missing locally. Never clobbers local
+	// edits — existing agents are skipped. No-op when Cloud is unconfigured.
+	go func() {
+		gw := s.cloudGateway()
+		if gw == nil {
+			return
+		}
+		pull := func() ([]client.SyncAgentItem, error) {
+			return gw.PullAgents(ctx)
+		}
+		if err := pullAndApplyAgents(pull, s.deps.AgentsDir); err != nil {
+			log.Printf("agentsync: startup pull failed: %v", err)
+		}
+	}()
+
 	// Memory feature (Phase 2.3). Service is constructed once and Start runs
 	// the cold-path gates synchronously then spawns the supervisor goroutine.
 	// Failure modes (provider=disabled, tlm missing, cloud misconfigured) all
@@ -2686,6 +2702,13 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditHTTPOp("POST", "/agents", "created agent "+req.Name)
+	if gw := s.cloudGateway(); gw != nil {
+		go func() {
+			if err := pushAllAgents(context.Background(), gw, s.deps.AgentsDir); err != nil {
+				log.Printf("agentsync: push after agent change failed: %v", err)
+			}
+		}()
+	}
 	writeJSON(w, http.StatusCreated, a.ToAPI())
 }
 
@@ -2881,6 +2904,13 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if gw := s.cloudGateway(); gw != nil {
+		go func() {
+			if err := pushAllAgents(context.Background(), gw, s.deps.AgentsDir); err != nil {
+				log.Printf("agentsync: push after agent change failed: %v", err)
+			}
+		}()
+	}
 	writeJSON(w, http.StatusOK, a.ToAPI())
 }
 
@@ -2937,6 +2967,13 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		os.Remove(agentDir)
 	}
 	s.auditHTTPOp("DELETE", "/agents/"+name, "deleted agent")
+	if gw := s.cloudGateway(); gw != nil {
+		go func() {
+			if err := pushAllAgents(context.Background(), gw, s.deps.AgentsDir); err != nil {
+				log.Printf("agentsync: push after agent change failed: %v", err)
+			}
+		}()
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -5128,6 +5165,19 @@ func (s *Server) runSyncLoop(ctx context.Context) {
 			tick()
 		}
 	}
+}
+
+// cloudGateway lazily constructs a Cloud gateway client from the same viper
+// keys buildSyncDeps uses (sync.endpoint > cloud.endpoint, cloud.api_key).
+// Returns nil when either the endpoint or the api key is unconfigured, so
+// callers can cheaply skip cloud pushes when Cloud is not set up.
+func (s *Server) cloudGateway() *client.GatewayClient {
+	endpoint := syncpkg.ResolveEndpoint(syncpkg.LoadConfig(viper.GetViper()), viper.GetViper())
+	apiKey := viper.GetString("cloud.api_key")
+	if endpoint == "" || apiKey == "" {
+		return nil
+	}
+	return client.NewGatewayClient(endpoint, apiKey)
 }
 
 // buildSyncDeps returns ok=false if the config is incomplete (missing
