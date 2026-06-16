@@ -11,6 +11,7 @@
     "client_message_queue",
     "im_message_lifecycle_v1",
     "im_timeline_v1",
+    "agent_profile_v1",
     "schedule_broadcast_gate",
     "proactive_targeting",
     "proactive_thread_mode",

@@ -15,8 +15,16 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 ### Get agent details
 - Method: GET
 - Path: /agents/{name}
-- Response: `{"name": "string", "display_name": "string", "prompt": "string", "config": {...}, "skills": [...], "commands": [...]}`
-- Notes: `display_name` falls back to the slug when not explicitly set.
+- Response: `{"name": "string", "display_name": "string", "prompt": "string", "config": {...}, "skills": [...], "commands": [...], "category": {...}|null, "description": {...}|null, "guide_prompts": [...]|null, "examples": [...]|null}`
+- Notes:
+  - `display_name` falls back to the slug when not explicitly set.
+  - **Presentation metadata** (`category`, `description`, `guide_prompts`, `examples`) is populated when the agent ships a `PROFILE.yaml`; otherwise all four are `null`. Today only builtin agents (`explorer`, `reviewer`) carry profile data. All four fields are read-only — there is no write endpoint for them in v1. Wire shape:
+    - `category`: `{"code": "coding", "label": {"en": "Coding", "zh-Hans": "编程", "ja": "コーディング"}}`. `code` is a slug from the global category registry; `label` is the daemon-inlined three-language display name. Unknown codes never appear in responses — `LoadAgent` fails loud at load time if a `PROFILE.yaml` references an unregistered code.
+    - `description`: a `LocalizedString` map (`{"en": "...", "zh-Hans": "...", "ja": "..."}`). Plain text, not markdown.
+    - `guide_prompts`: array of `{"title": LocalizedString, "prompt": LocalizedString}` — clickable starter cards.
+    - `examples`: array of multi-turn dialogues. Each example has optional `title` (`LocalizedString`) and a `turns` array. Each turn has `role: "user"|"assistant"` and either `text` (user) or `markdown` + optional `tool_runs` (assistant). `tool_runs` is `[{"tool": "grep", "summary": LocalizedString}]` — compact chips, not full tool cards.
+  - `LocalizedString` is an open `{locale_code: string}` map. Keys are BCP-47 short ids (`en`, `ja`, `zh-Hans`, `zh-Hant`, …). Clients fall back: current locale → primary language → `en` → first non-empty.
+  - Capability gate: Desktop should show the richer profile UI only when `/status.capabilities` includes `agent_profile_v1`.
 
 ### Create agent
 - Method: POST

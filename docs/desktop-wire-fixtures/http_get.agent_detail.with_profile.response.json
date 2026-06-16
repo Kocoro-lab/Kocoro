@@ -1,0 +1,75 @@
+{
+  "name": "profile-demo",
+  "display_name": "profile-demo",
+  "prompt": "You are a demo agent used by the profile-populated wire-fixture tests.\n",
+  "memory": null,
+  "config": null,
+  "commands": null,
+  "skills": null,
+  "builtin": false,
+  "overridden": false,
+  "category": {
+    "code": "coding",
+    "label": {
+      "en": "Coding",
+      "zh-Hans": "编程",
+      "ja": "コーディング"
+    }
+  },
+  "description": {
+    "en": "A demo agent used by wire-fixture tests.",
+    "zh-Hans": "用于线路 fixture 测试的演示智能体。",
+    "ja": "ワイヤフィクスチャテスト用のデモエージェント。"
+  },
+  "guide_prompts": [
+    {
+      "title": {
+        "en": "Find auth code",
+        "zh-Hans": "找认证代码",
+        "ja": "認証コードを探す"
+      },
+      "prompt": {
+        "en": "Where is the authentication logic?",
+        "zh-Hans": "认证逻辑在哪里？",
+        "ja": "認証ロジックはどこ？"
+      }
+    }
+  ],
+  "examples": [
+    {
+      "title": {
+        "en": "Sample dialog",
+        "zh-Hans": "示例对话",
+        "ja": "サンプル対話"
+      },
+      "turns": [
+        {
+          "role": "user",
+          "text": {
+            "en": "Hi.",
+            "zh-Hans": "你好。",
+            "ja": "こんにちは。"
+          }
+        },
+        {
+          "role": "assistant",
+          "markdown": {
+            "en": "Hello! Let me look around.",
+            "zh-Hans": "你好！让我看一下。",
+            "ja": "こんにちは！見てみます。"
+          },
+          "tool_runs": [
+            {
+              "tool": "grep",
+              "summary": {
+                "en": "Searched src/ for entry points",
+                "zh-Hans": "在 src/ 搜索入口点",
+                "ja": "src/ でエントリーポイントを検索"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

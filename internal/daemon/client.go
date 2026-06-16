@@ -89,6 +89,11 @@ var Version = "dev"
 // WORKFLOW_COMPLETED (OnText no longer double-emits it as LLM_OUTPUT). Cloud
 // gates timeline-mode rendering on this token; daemons without it keep the
 // legacy behavior where the final answer is emitted as a trailing LLM_OUTPUT.
+//
+// "agent_profile_v1" — daemon includes read-only agent presentation metadata
+// on GET /agents/{name}: category, description, guide_prompts, and examples.
+// Desktop gates the richer agent-profile UI on this token instead of
+// version-sniffing or inferring support from nullable fields.
 const (
 	CapDeliveryAck           = "delivery_ack"
 	CapInlineDocumentB64     = "inline_document_b64"
@@ -97,6 +102,7 @@ const (
 	CapClientMessageQueue    = "client_message_queue"
 	CapScheduleBroadcastGate = "schedule_broadcast_gate"
 	CapIMTimelineV1          = "im_timeline_v1"
+	CapAgentProfileV1        = "agent_profile_v1"
 	// CapProactiveTargeting tells Cloud the daemon may attach an IMStatusContext
 	// to a ProactivePayload for precise routing. Observability only — the
 	// fallback rule is "non-empty target → targeted; empty → broadcast", so the
@@ -122,6 +128,7 @@ var Capabilities = []string{
 	CapClientMessageQueue,
 	CapIMMessageLifecycleV1,
 	CapIMTimelineV1,
+	CapAgentProfileV1,
 	CapScheduleBroadcastGate,
 	CapProactiveTargeting,
 	CapProactiveThreadMode,

@@ -23,6 +23,23 @@ type AgentAPI struct {
 	Builtin     bool               `json:"builtin"`            // true if agent is a bundled builtin
 	Overridden  bool               `json:"overridden"`         // true if builtin has user override
 	Warnings    []string           `json:"warnings,omitempty"` // non-fatal config advisories (e.g. heartbeat⊕schedule double-fire)
+
+	// User-facing presentation metadata loaded from PROFILE.yaml. All four are
+	// null when the agent has no PROFILE.yaml or the corresponding field is
+	// unset in it. Matches the existing memory/config null-when-absent pattern.
+	Category     *AgentCategoryAPI `json:"category"`
+	Description  LocalizedString   `json:"description"`
+	GuidePrompts []GuidePrompt     `json:"guide_prompts"`
+	Examples     []AgentExample    `json:"examples"`
+}
+
+// AgentCategoryAPI is the inlined `{code, label}` shape returned by the HTTP
+// API. The daemon assembles this from PROFILE.yaml's `category` code by
+// looking up the label in the CategoryRegistry. Clients never need to know
+// the registry — they render the label directly.
+type AgentCategoryAPI struct {
+	Code  string          `json:"code"`
+	Label LocalizedString `json:"label"`
 }
 
 // AgentConfigAPI is the JSON representation of agent config.
@@ -96,6 +113,24 @@ func (a *Agent) ToAPI() *AgentAPI {
 			metas[i] = s.ToMeta()
 		}
 		api.Skills = metas
+	}
+	if a.Profile != nil {
+		// Category: resolve label via the registry. LoadAgent validated the
+		// code so an unknown code here would be a registry race (re-checked).
+		if a.Profile.Category != "" {
+			if entry, err := ResolveCategory(a.Profile.Category); err == nil && entry != nil {
+				api.Category = &AgentCategoryAPI{Code: entry.Code, Label: entry.Label}
+			}
+		}
+		if len(a.Profile.Description) > 0 {
+			api.Description = a.Profile.Description
+		}
+		if len(a.Profile.GuidePrompts) > 0 {
+			api.GuidePrompts = a.Profile.GuidePrompts
+		}
+		if len(a.Profile.Examples) > 0 {
+			api.Examples = a.Profile.Examples
+		}
 	}
 	return api
 }

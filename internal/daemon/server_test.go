@@ -1271,6 +1271,47 @@ func TestServer_CreateAgent_DoesNotCreateSessionManager(t *testing.T) {
 	}
 }
 
+func TestServer_DeleteAgent_RemovesProfileYAML(t *testing.T) {
+	agentsDir := t.TempDir()
+	agentDir := filepath.Join(agentsDir, "profiled")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte("prompt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "PROFILE.yaml"), []byte("category: coding\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Runtime state should survive definition deletion and keeps the directory
+	// around, making a stale PROFILE.yaml easy to detect.
+	if err := os.WriteFile(filepath.Join(agentDir, "MEMORY.md"), []byte("keep me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(t.TempDir()),
+	}
+	srv := NewServer(0, nil, deps, "test")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/agents/profiled?confirm=true", nil)
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE /agents/profiled = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, "PROFILE.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("PROFILE.yaml should be removed, stat err=%v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(agentDir, "MEMORY.md")); err != nil || string(data) != "keep me" {
+		t.Fatalf("MEMORY.md should be preserved, data=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, "AGENT.md")); !os.IsNotExist(err) {
+		t.Fatalf("AGENT.md should be removed, stat err=%v", err)
+	}
+}
+
 func TestServer_CreateAgent_AttachesInstalledSkills(t *testing.T) {
 	shannonDir := t.TempDir()
 	agentsDir := filepath.Join(shannonDir, "agents")

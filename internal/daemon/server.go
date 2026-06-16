@@ -2898,7 +2898,7 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	// so the builtin can resurface with existing history intact.
 	agentDir := filepath.Join(s.deps.AgentsDir, name)
 	var errs []string
-	for _, f := range []string{"AGENT.md", "config.yaml", "_attached.yaml"} {
+	for _, f := range []string{"AGENT.md", "config.yaml", "_attached.yaml", "PROFILE.yaml"} {
 		p := filepath.Join(agentDir, f)
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err.Error())

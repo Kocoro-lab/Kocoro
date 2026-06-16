@@ -8,7 +8,11 @@ import (
 	"strings"
 )
 
-//go:embed builtin
+// `all:` prefix is required so files beginning with `_` (e.g.
+// `_category_registry.yaml`) are NOT excluded — Go's default embed semantics
+// hide leading-underscore and leading-dot files.
+//
+//go:embed all:builtin
 var builtinFS embed.FS
 
 // BuiltinNames lists the names of all bundled specialist agents.
