@@ -8,10 +8,14 @@ import (
 // Event types emitted by the daemon.
 const (
 	EventMessageReceived = "message_received"
-	// EventInjectedCommitted fires (per-request SSE only) when a mid-run injected
-	// follow-up is drained into the live turn — the consume boundary. Lets a
-	// client flip its queued-draft card into a real user bubble. Payload:
-	// {message_id, text} where message_id echoes the client-supplied id.
+	// EventInjectedCommitted fires when a mid-run injected follow-up is
+	// drained into the live turn — the consume boundary. Lets a client flip
+	// its queued-draft card into a real user bubble. Delivered on TWO
+	// surfaces: the run's per-request SSE stream (payload {message_id, text},
+	// owning client only) and, since 2026-06, the broadcast EventBus (payload
+	// {route_key, session_id, message_id, text}) so a Desktop mirroring a
+	// session whose run belongs to another channel also observes the commit.
+	// message_id echoes the client-supplied id.
 	EventInjectedCommitted = "injected_committed"
 	EventAgentReply        = "agent_reply"
 	EventApprovalRequest   = "approval_request"

@@ -1692,6 +1692,17 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 					"route":  req.RouteKey,
 				})
 				return
+			case InjectRetracted:
+				// The client retracted this id before the inject arrived (late
+				// POST racing a Cmd+Enter retract+cancel+resend). Dropping it
+				// here IS the retraction taking effect — report success so the
+				// fire-and-forget client treats it as settled.
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "retracted_before_delivery",
+					"route":  req.RouteKey,
+				})
+				return
 			case InjectNoActiveRun:
 				// Run ended between HasActiveRun and InjectMessage. Fall through;
 				// the inject_only guard below 409s instead of starting a new run.
@@ -1766,23 +1777,41 @@ func (s *Server) handleRetractInject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "could not resolve a route to retract from")
 		return
 	}
-	// Only tombstone when a run actually owns this route. A retract for a route
-	// with no in-flight run has nothing to cancel (the follow-up was never
-	// injected, or the run already ended and ClearRouteRunState reaped its
-	// state), and recording a tombstone there leaks a retractedInjects entry
-	// that nothing consumes or reaps — the only reaper, ClearRouteRunState,
-	// never fires for a route that had no run. Idempotent either way: retract
-	// is best-effort and the client can't distinguish "cancelled in time" from
-	// "too late".
-	if s.deps.SessionCache.HasActiveRun(req.RouteKey) {
-		s.deps.SessionCache.RetractInject(req.RouteKey, req.ClientMessageID)
+	// Atomically resolve which side of the commit race this retract landed on.
+	// "already_committed" tells the client its follow-up already entered an LLM
+	// turn (the text is a persisted user message) and must NOT be re-sent as a
+	// fresh message — the force-send / pop-back duplicate. "retracted" plants a
+	// TTL-reaped tombstone honored at every consumption point: the loop's drain
+	// filter, the end_turn survivor drain, ingestion of a late inject on a
+	// future run, and the next run's mailbox drain. Tombstones are planted even
+	// without an active run — that is exactly the teardown race the durable
+	// ledger exists for.
+	status := s.deps.SessionCache.RetractInjectWithStatus(req.RouteKey, req.ClientMessageID)
+	// Cascade: if the inject already survived into the durable mailbox
+	// (ReEnqueueInjectSurvivors ran before the retract arrived), delete the
+	// row so the next run's startup drain cannot prepend the cancelled text.
+	if status == "retracted" {
+		s.deps.SessionCache.RetractMailboxByClientMessageID(req.RouteKey, req.ClientMessageID)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"status":            "retracted",
+		"status":            status,
 		"route":             req.RouteKey,
 		"client_message_id": req.ClientMessageID,
 	})
+}
+
+// newSSEApprovalSendFn builds the per-request broker sendFn that frames an
+// ApprovalRequest as the `event: approval` SSE frame. Named (rather than an
+// inline closure in handleMessageSSE) so the wire-fixture test exercises the
+// real framing — event name included — instead of reconstructing it.
+func newSSEApprovalSendFn(w io.Writer, flusher http.Flusher) func(ApprovalRequest) error {
+	return func(areq ApprovalRequest) error {
+		data := mustJSON(areq)
+		_, err := fmt.Fprintf(w, "event: approval\ndata: %s\n\n", data)
+		flusher.Flush()
+		return err
+	}
 }
 
 // handleMessageSSE streams agent events as SSE.
@@ -1800,12 +1829,7 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 
 	// Create a per-request broker to avoid racing with concurrent SSE requests.
 	// Each SSE stream gets its own broker with its own sendFn and pending map.
-	reqBroker := NewApprovalBroker(func(areq ApprovalRequest) error {
-		data := mustJSON(areq)
-		_, err := fmt.Fprintf(w, "event: approval\ndata: %s\n\n", data)
-		flusher.Flush()
-		return err
-	})
+	reqBroker := NewApprovalBroker(newSSEApprovalSendFn(w, flusher))
 	// Inherit bus hooks from the server broker so EventBus emission stays
 	// consistent with the WS path (request payload + daemon-cleanup deny).
 	reqBroker.onRequest = s.approvalBroker.onRequest

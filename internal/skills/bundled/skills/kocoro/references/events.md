@@ -43,6 +43,7 @@ All bus events carry `session_id` (string) so subscribers can demux per-session.
 ```json
 {
   "tool": "bash",
+  "tool_use_id": "toolu_01AbCdEf",
   "status": "running",
   "args": "ls -la /tmp",
   "session_id": "sess_abc",
@@ -53,6 +54,7 @@ All bus events carry `session_id` (string) so subscribers can demux per-session.
 ```json
 {
   "tool": "bash",
+  "tool_use_id": "toolu_01AbCdEf",
   "status": "completed",
   "elapsed": 1.234,
   "is_error": false,
@@ -62,7 +64,7 @@ All bus events carry `session_id` (string) so subscribers can demux per-session.
 }
 ```
 
-`args` fires on the `running` event; `preview` and `is_error` fire on `completed` / `denied`. Both are redacted + UTF-8-safe-truncated to 200 bytes.
+`args` fires on the `running` event; `preview` and `is_error` fire on `completed` / `denied`. Both are redacted + UTF-8-safe-truncated to 200 bytes. `tool_use_id` pairs a `running` frame with its `completed` partner so UIs running several tools in parallel can match them (additive; advertised by the `tool_use_id_events` capability token).
 
 ### `usage`
 
@@ -212,3 +214,14 @@ If no events match, `notifications` is `[]` and `next_cursor` echoes the `since`
 - `session_id`, `agent`, `title`, `source`, `channel`, `args`, `flags`, `ts` on `approval_request` and `resolved_by` / `ts` on `approval_resolved` are additive; older Desktop clients that only read `request_id` / `tool` / `decision` keep working.
 - `schedule_run` is a new event type; old clients that don't decode it ignore it.
 - Older builds that don't emit the `usage` event type simply don't fire it; new Desktop code degrades gracefully (usage row stays hidden).
+
+## Adding new events or fields (wire-contract discipline)
+
+UI clients drop unknown event `type`s and ignore unknown JSON keys, so **additive changes are back-compat safe** in both directions. Everything else follows four rules:
+
+1. **Never repurpose an existing type's fields.** Renames and type changes are breaking; add a new field (or a new event type) instead and let the old one age out.
+2. **Mint a capability token for every cross-version contract change a client must detect.** Tokens live in the `Capabilities` list (`internal/daemon/client.go`) and surface on both the WS handshake (`X-Kocoro-Capabilities`) and `GET /status` (`capabilities` array). Clients gate features with a token check — never with version sniffing or decode-failure probing. The `GET /status` wire fixture pins the full token list, so adding a token forces the fixture (and the consumer's expectations) to update in the same change.
+3. **New event domains get a dotted namespace and a common envelope.** Session-scoped events stay flat for back-compat (`tool_status`, `approval_request`, …). A new family (e.g. a hypothetical hardware-device integration) uses `<domain>.<event>` types (`device.status`, `device.action_request`) with a shared envelope: `type`, `ts`, plus `session_id` (session-scoped) or `target_id` (device-scoped), and the domain payload nested under its own keys — never flattened into top-level fields that future events must tiptoe around. The namespace prefix is the consumer's routing key: one switch per domain, not one case per event.
+4. **Pin the shape with a wire fixture + a decode test.** Canonical payloads live in `docs/desktop-wire-fixtures/` (see its README). Every new or changed payload updates the fixture and the matching `TestWireFixture_*` test in `internal/daemon/wire_fixtures_test.go`, which emits through the real producer path and decodes the produced bytes into a consumer-shaped struct. Fixture comparison is semantic, never byte-equal.
+
+One structural note for future request/resolve interactions (user questions, device action approvals, …): `approval_request`/`approval_resolved` is today's only request-lifecycle interaction, and its broker (`internal/daemon/approval.go`) encodes hard-won race-safety invariants (at-most-one terminal event, bus-ID ordering). If a second interaction kind ever lands, factor that broker into a shared pending-interaction core with multiple wire faces — do not copy it.

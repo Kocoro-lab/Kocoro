@@ -14,7 +14,7 @@ import (
 var artifactHostCSS string
 
 // artifactCSP mirrors ARTIFACT_CSP in
-// ShanClawDesktop/ShanClaw/Resources/WebView/message-list.js (synced 2026-06-04).
+// Kocoro Desktop's message-list.js (synced 2026-06-04).
 // default-src 'none' with script/style/connect/font limited to the four read-only
 // CDNs the generative-ui skill declares, and img additionally allowing
 // static.kocoro.ai (conversation-produced images) — NOT widened to the other

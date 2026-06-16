@@ -1,0 +1,14 @@
+{
+  "agents": [
+    {
+      "name": "demo-agent",
+      "display_name": "demo-agent",
+      "builtin": false,
+      "override": false,
+      "has_memory": false,
+      "has_config": false,
+      "command_count": 0,
+      "skill_count": 0
+    }
+  ]
+}

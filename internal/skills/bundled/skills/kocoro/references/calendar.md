@@ -4,7 +4,7 @@
 
 Calendar tools let the agent operate the user's macOS system calendars via Kocoro Desktop. They reach iCloud / Google / Microsoft 365 / Exchange / Outlook calendars that the user has configured under **System Settings → Internet Accounts** with the "Calendars" toggle on — no per-provider OAuth, no third-party API.
 
-The actual EventKit access happens in Kocoro Desktop (the macOS .app); the daemon talks to Desktop over a local Unix domain socket (`docs/desktop-calendar-rpc.md` v0.5.1). When the daemon is **not** running as a Desktop subprocess (TUI / one-shot CLI / MCP server / scheduled task), `calendar_*` tools are not registered — fall back to the `applescript` tool driving Calendar.app for that scope (see "Fallback for non-daemon modes" below).
+The actual EventKit access happens in Kocoro Desktop (the macOS .app); the daemon talks to Desktop over a local Unix domain socket (see `desktop-rpc.md` in this references/ directory). When the daemon is **not** running as a Desktop subprocess (TUI / one-shot CLI / MCP server / scheduled task), `calendar_*` tools are not registered — fall back to the `applescript` tool driving Calendar.app for that scope (see "Fallback for non-daemon modes" below).
 
 ## Permission flow
 
@@ -194,5 +194,4 @@ calendar_delete_event           →
 
 ## See also
 
-- `docs/desktop-calendar-rpc.md` v0.5.1 — full protocol spec
-- `desktop-rpc.md` (in this same references/ directory) — RPC channel details
+- `desktop-rpc.md` (in this same references/ directory) — RPC channel details (protocol v0.5.1)

@@ -2132,7 +2132,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if req.RouteKey != "" {
 			rk := req.RouteKey
 			loop.SetInjectFinalDrainFn(func() []agent.InjectedMessage {
-				return deps.SessionCache.DrainSurvivorsOrCloseInject(rk)
+				// markSurvivorsCommitted=true: end_turn survivors are committed
+				// INLINE into the continuing run, so they enter the committed
+				// ledger in the same critical section as the retraction filter.
+				return deps.SessionCache.DrainSurvivorsOrCloseInject(rk, true)
 			})
 		}
 	}
@@ -2195,8 +2198,49 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// Desktop steering retract: drop a follow-up at drain time if the client
 		// cancelled its queued-draft card after the inject was already sent to
 		// injectCh (cross-route retraction lives in SessionCache, keyed here).
+		// The checker also records non-retracted ids in the committed ledger —
+		// atomically with the filter check — so a late /inject/retract answers
+		// "already_committed" instead of letting the client re-send the text.
 		loop.SetInjectRetractedChecker(func(clientMessageID string) bool {
-			return deps.SessionCache.ConsumeInjectRetracted(routeKey, clientMessageID)
+			return deps.SessionCache.ConsumeInjectRetractedOrMarkCommitted(routeKey, clientMessageID)
+		})
+	}
+	// Ad-hoc (session-keyed) runs: a brand-new session's first run starts with
+	// req.RouteKey == "" and registers a "session:<id>" route once the session
+	// exists (RegisterAdHocSessionRoute above). Injects and retracts address
+	// that key, so the retraction filter + committed ledger must be keyed there
+	// too — otherwise a retract during the first run of a fresh session is
+	// never honored and its commit is never recorded. finalDrainInjected's
+	// local fallback routes through the same checker, so this one hook covers
+	// both the top-of-loop drain and the end_turn drain for ad-hoc runs.
+	if req.RouteKey == "" && adHocRouteKey != "" {
+		rk := adHocRouteKey
+		loop.SetInjectRetractedChecker(func(clientMessageID string) bool {
+			return deps.SessionCache.ConsumeInjectRetractedOrMarkCommitted(rk, clientMessageID)
+		})
+	}
+	// Cross-channel commit broadcast: the per-request InjectCommitHandler only
+	// reaches the run's OWNING client (the SSE stream that started the run). A
+	// Desktop viewing the same session while the run belongs to another channel
+	// (kocoro mobile, Slack, a schedule) never sees that stream, so its
+	// queued-draft card survives the commit and the user can pop the text back
+	// and re-send it — the cross-channel duplicate. Mirror the commit onto the
+	// EventBus so every /events subscriber observes the consume boundary.
+	// Covers routed runs and ad-hoc (session-keyed first-message) runs alike.
+	if deps.EventBus != nil {
+		busRouteKey := req.RouteKey
+		if busRouteKey == "" {
+			busRouteKey = adHocRouteKey
+		}
+		busSessionID := sess.ID
+		loop.SetInjectCommittedBroadcaster(func(clientMessageID, text string) {
+			payload, _ := json.Marshal(map[string]any{
+				"route_key":  busRouteKey,
+				"session_id": busSessionID,
+				"message_id": clientMessageID,
+				"text":       text,
+			})
+			deps.EventBus.Emit(Event{Type: EventInjectedCommitted, Payload: payload})
 		})
 	}
 	loop.SetSessionID(sess.ID)
@@ -2699,6 +2743,18 @@ func fireTitleAfterRun(deps *ServerDeps, mgr *session.Manager, sessionID, source
 	}()
 }
 
+// suggestionReadyPayload builds the EventSuggestionReady bus payload. Wire
+// shape is pinned by docs/desktop-wire-fixtures/bus_event.suggestion_ready.json.
+// Marshal of three plain strings cannot fail, so no error is surfaced.
+func suggestionReadyPayload(sessionID, agentName, text string) []byte {
+	payload, _ := json.Marshal(map[string]any{
+		"session_id": sessionID,
+		"agent":      agentName,
+		"text":       text,
+	})
+	return payload
+}
+
 // fireSuggestionAfterRun runs in a detached goroutine after the main turn
 // completes successfully. It generates a forked prompt suggestion, stores it
 // in SuggestionState, emits an SSE event, and writes audit rows that record
@@ -2803,12 +2859,7 @@ func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, se
 	}
 
 	if deps.EventBus != nil {
-		payload, _ := json.Marshal(map[string]any{
-			"session_id": sessionID,
-			"agent":      agentName,
-			"text":       res.Text,
-		})
-		deps.EventBus.Emit(Event{Type: EventSuggestionReady, Payload: payload})
+		deps.EventBus.Emit(Event{Type: EventSuggestionReady, Payload: suggestionReadyPayload(sessionID, agentName, res.Text)})
 	}
 
 	if deps.Auditor != nil {

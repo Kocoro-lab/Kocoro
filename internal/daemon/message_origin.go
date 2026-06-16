@@ -13,7 +13,7 @@ import (
 // addressed in (S1). Sender is intentionally absent — it rides the existing
 // RunAgentRequest.Sender field and the existing `Sender:` sticky line.
 type MessageOrigin struct {
-	Platform     string // slack / feishu / lark / wecom / teams
+	Platform     string // slack / feishu / lark / wecom / line / teams
 	Scope        string // dm | group | channel | "" (unknown)
 	ChannelID    string // native id (Slack C/G/D, WeCom/Teams conversation_id, Lark chat_id [needs S1b])
 	ChannelLabel string // human-readable (#shannon); optional, from S1b best-effort; degrade to ChannelID
@@ -47,6 +47,8 @@ func parseMessageOrigin(source string, blob json.RawMessage) *MessageOrigin {
 		ChatType string `json:"chat_type"`
 		// teams
 		ConversationType string `json:"conversation_type"`
+		// line
+		LineUserID string `json:"line_user_id"`
 		// optional human label (S1b best-effort, any platform)
 		ChannelLabel string `json:"channel_label"`
 	}
@@ -74,6 +76,11 @@ func parseMessageOrigin(source string, blob json.RawMessage) *MessageOrigin {
 	case "teams":
 		o.ChannelID = raw.ConversationID
 		o.Scope = teamsScope(raw.ConversationType)
+	case "line":
+		// Shared-OA LINE is 1:1 only — every message is a DM with the paired
+		// user, and line_user_id is the only native id the blob carries.
+		o.ChannelID = raw.LineUserID
+		o.Scope = "dm"
 	default:
 		return nil
 	}
@@ -170,7 +177,11 @@ func teamsScope(conversationType string) string {
 // sticky block). Reuses S0's sanitizer.
 func (o *MessageOrigin) renderChannelLine() string {
 	label := o.ChannelLabel
-	if label == "" {
+	// LINE never falls back to ChannelID: it holds the raw LINE userId, kept
+	// only for the conn-state lookup — an opaque token the agent could echo
+	// into replies. The user's nickname already rides the Sender: line, so
+	// LINE renders "line · dm".
+	if label == "" && o.Platform != "line" {
 		label = o.ChannelID
 	}
 	label = agent.SanitizeSystemEventText(label)

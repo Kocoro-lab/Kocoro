@@ -2,18 +2,52 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.2.3 — 2026-06-11 — Cmd+Enter duplicate-send fix (durable inject retraction) + schedule thread mode + mailbox crash-safety + cron/truncation hardening
+
+Reliability release. The headline is **eliminating the Cmd+Enter duplicate-reply / duplicate-send family** ([#241](https://github.com/Kocoro-lab/Kocoro/pull/241)): a follow-up retracted while a run is tearing down is now resolved against a durable per-route ledger that distinguishes *dropped-by-tombstone* from *already-committed*, so a racing retract can never strand a queued draft that then re-sends as a fresh message, and a cancel / `maxIter` teardown no longer double-flushes the last assistant text. Plus a new **schedule thread three-state** ([#230](https://github.com/Kocoro-lab/Kocoro/pull/230)) controlling whether proactive IM pushes anchor into a thread, **mailbox crash-safety** ([#233](https://github.com/Kocoro-lab/Kocoro/pull/233)), **infeasible-cron rejection** ([#235](https://github.com/Kocoro-lab/Kocoro/pull/235)), **byte-stable truncation** of oversized user messages ([#231](https://github.com/Kocoro-lab/Kocoro/pull/231)), and **Feishu/Lark markdown output** so published files become downloadable attachments ([#236](https://github.com/Kocoro-lab/Kocoro/pull/236)).
+
+> **Cross-repo contract:** all additive, no breaking wire changes. `POST /inject/retract` now returns a commit-aware status (`already_committed` when the follow-up already entered an LLM turn) so the client knows not to re-send; `injected_committed` is now broadcast on the daemon EventBus (consumer: Kocoro Desktop). Schedule `thread: auto|on|off` resolves to `ProactivePayload.UseThread` for proactive pushes (capability token `proactive_thread_mode`, observability only; consumer: Cloud). Feishu/Lark switches to the `markdown` output profile, re-enabling Cloud's `[name](url)` → file-attachment conversion.
+
+### Added
+
+- **Schedule thread three-state** (PR #230, `24155c7`, `internal/schedule/schedule.go`, `internal/tools/schedule.go`) — `thread: "auto" | "on" | "off"` controls whether a proactive IM push anchors into a thread (one session ↔ one thread) or posts at the channel top level. `auto` (default / legacy-nil) follows session state — sticky schedules with an IM blob thread-anchor, stateless / blob-less post top-level; `on`/`off` force it (ignoring `Stateful`). `schedule_create` / `_update` and `PATCH /schedules/{id}` accept the field; the daemon resolves it to `ProactivePayload.UseThread`. Threadless platforms (LINE/WeCom/Telegram) ignore the hint. Capability token `proactive_thread_mode`.
+- **Durable inject retraction with commit-aware status** (PR #241, `b4a76c5`, `d12a7c7`, `internal/daemon/router.go`, `internal/daemon/router_mailbox.go`, new `internal/agenttypes/`) — per-route `retractedInjects` (tombstones) and `committedInjects` ledgers, TTL-bounded (10 min) and per-route capped (256), survive run transitions so a retract that loses the race against run teardown still drops a late inject landing on the *next* run. `POST /inject/retract` answers `already_committed` from the committed ledger so the client never re-sends text the model already saw. `injected_committed` now also broadcasts on the daemon EventBus.
+
+### Changed
+
+- **Feishu/Lark use the `markdown` output profile** (PR #236, `e074d59`, `internal/daemon/runner.go`) — Feishu/Lark cards render standard markdown, and GFM output re-enables Cloud's `[name](url)` → file-attachment conversion, so files the agent publishes become downloadable attachments instead of inert raw URLs. Added to `markdownCloudSources` (cloud sources that opt out of the `plain` default).
+
+### Fixed
+
+- **Cmd+Enter duplicate-reply / duplicate-send family** (PR #241, `d4cfe20`, `96b8f0b`, `internal/daemon/router.go`, `internal/agent/loop.go`) — inject ledgers are reaped so a stale entry can no longer shadow `sc.routes` forever; the last assistant text is deduped on cancel and `maxIter` teardown so a cancelled / capped turn doesn't double-flush its final reply. Together with the durable-retraction ledger above, this closes the family of Cmd+Enter interrupt-send races that surfaced as a duplicated reply or a re-sent follow-up.
+- **Mailbox consume deferred until first `session.Save`** (PR #233, issue #163, `63ae295`, `internal/daemon/runner.go`) — a queued mailbox message is no longer consumed before the session is first persisted, so a hard error before the initial save can't drop the pending message; it stays in the mailbox for replay.
+- **Reject infeasible cron day/month combos** (PR #235, `1a1fb8a`, `internal/schedule/schedule.go`) — an expression that can never fire on a real calendar (e.g. `0 0 31 2 *` — Feb 31) is now rejected at write time. `gronx.IsValid` only range-checks each field; feasibility is decided by scanning an eight-year window (covers every month length plus Feb 29). `gronx.NextTickAfter` is unusable here because Go's time normalization rolls Feb 31 to March and returns a bogus next tick with a nil error.
+- **Byte-stable truncation of oversized user messages** (PR #231, `ee41c53`, `internal/context/window.go`) — truncation of an oversized user message is now idempotent, so re-truncating an already-truncated message produces identical bytes and can't spin the caller loop.
+- **Forward `UsageProvider` through `multiHandler`** (PR #234, `bc1ffed`, `internal/daemon/multi_handler.go`) — the fan-out `EventHandler` wrapper now forwards the optional `UsageProvider` interface, so per-run usage aggregation isn't dropped when multiple handlers are attached.
+
+### Docs
+
+- `references/schedules.md` (bundled `kocoro` skill): documented the schedule thread three-state (PR #230).
+- `references/feishu.md` (bundled `kocoro` skill): documented the Feishu/Lark markdown output exception (PR #236).
+- `CLAUDE.md`: synced output-profile comments with the Feishu/Lark markdown exception.
+
+### Tests
+
+- **Cmd+Enter incident replayed end to end** (PR #241, `862f735`, `internal/daemon/cmdenter_dup_e2e_test.go`) — reproduces the interrupt-send incident; `router_retract_durable_test.go` covers tombstone-vs-committed resolution, TTL/cap reaping, and the retract-vs-teardown race; `loop_cancel_dedup_test.go` pins the cancel / `maxIter` dedup.
+- Mailbox ordering / pending-on-hard-error (`runner_mailbox_ordering_test.go`, PR #233); re-truncation idempotency pin (PR #231); `multiHandler` UsageProvider forwarding (PR #234); cron feasibility + thread-enum / `resolveThread` coverage (PRs #235, #230).
+
 ## v0.2.2 — 2026-06-06 — Feishu/Lark auto-connect + outbound IM observability + smart titles + share artifacts + review hardening
 
 Feature batch plus a dedicated review-hardening pass. The agent gains **awareness of its own IM channel state** (a per-platform connection-state cache rendered into Session Facts, plus sanitized system-reminder events for membership/delivery changes), **Feishu/Lark bots can be auto-connected from chat**, sessions get **LLM-generated smart titles** across daemon/TUI/one-shot, and **session shares render `html-artifact` fences as sandboxed iframes** with tool runs stripped. The back half of the release ([#229](https://github.com/Kocoro-lab/Kocoro/pull/229)) is bug-fix hardening found by reviewing the feature diff: audit secret-redaction gaps, a lost-system-event path, connection-state masking, non-atomic session writes, and a share-page stored-XSS vector.
 
-> **Cross-repo contract:** outbound observability adds WS/event surface for IM channel-state + delivery-result frames and a connection-state preamble (consumer: Cloud + ShanClawDesktop). The share artifact host CSS / CSP / resize bridge remain VERBATIM mirrors of ShanClawDesktop's `message-list.js`. Feishu/Lark auto-connect adds `POST`/`DELETE /channels/feishu/app-installs` (localhost-only, proxied to Cloud). All additive; no breaking wire changes.
+> **Cross-repo contract:** outbound observability adds WS/event surface for IM channel-state + delivery-result frames and a connection-state preamble (consumer: Cloud + Kocoro Desktop). The share artifact host CSS / CSP / resize bridge remain VERBATIM mirrors of Kocoro Desktop's `message-list.js`. Feishu/Lark auto-connect adds `POST`/`DELETE /channels/feishu/app-installs` (localhost-only, proxied to Cloud). All additive; no breaking wire changes.
 
 ### Added
 
 - **Outbound observability — agent awareness of its IM channel state** (PR #224, `52ab393`, `653f14e`, `06a7c2e`, `internal/daemon/`, `internal/agent/`) — a per-platform `ConnectionStateCache` fed by Cloud `channel_state_event`s renders a `Connection:` Session-Facts line + new-session preamble; membership/delivery-failure changes are surfaced as sanitized `<system-reminder>` `SystemEvent` blocks on the next turn.
 - **Feishu/Lark bot auto-connect from chat** (`b09b4ba`, `internal/daemon/feishu_handler.go`, `internal/client/gateway.go`) — `POST`/`DELETE /channels/feishu/app-installs` register/unbind a bot via Cloud passthrough; the bundled `kocoro` skill drives it from a conversation. App secrets are redacted from the audit log (`06092d7`, hardened in `b8dd0f8`).
 - **Smart session titles** (PR #221, `eadb007`, `internal/context/title_gen.go`) — an async small-tier LLM call upgrades the placeholder title at completed turns {1,3} across daemon, TUI, and one-shot; brand-prefixed for IM sources (`Slack · …`).
-- **Session share: sandboxed html-artifact rendering** (`86883c3`, `b5c60c1`, `internal/share/`) — tool runs are stripped from the rendered page; `html-artifact` fences render live in a sandboxed, CSP-restricted iframe (host CSS / CSP / resize bridge mirror ShanClawDesktop).
+- **Session share: sandboxed html-artifact rendering** (`86883c3`, `b5c60c1`, `internal/share/`) — tool runs are stripped from the rendered page; `html-artifact` fences render live in a sandboxed, CSP-restricted iframe (host CSS / CSP / resize bridge mirror Kocoro Desktop).
 - **Next-prompt suggestion enabled by default** (`c4c8c71`, `internal/config/`).
 
 ### Changed
@@ -49,7 +83,7 @@ Feature batch plus a dedicated review-hardening pass. The agent gains **awarenes
 
 Daemon capability release. **Named agents become multi-session** (honoring `session_id`/`new_session` like the default agent), **schedules collapse to a single `Stateful` remember-across-runs switch**, and proactive schedule pushes gain **IM targeting**. A new **Calendar RPC v1** channel lets a Desktop-hosted daemon reach EventKit over a reverse Unix-socket RPC (`calendar_*` tools). Plus reliability fixes: cloud/IM approvals resolve through the WS broker from `POST /approval`, upstream `504`s are retried as transient, the model field rejects tier keywords, and several mid-run inject-lifecycle races are closed.
 
-> **Cross-repo contract:** Calendar RPC v1 is a local Unix-socket reverse-RPC to ShanClawDesktop's EventKit (spec `docs/desktop-calendar-rpc.md`); `calendar_*` tools register only when the daemon is a Desktop subprocess. The approval-resolution change reuses the existing `POST /approval` + WS broker path. Named-agent multi-session honors the existing `session_id`/`new_session` fields.
+> **Cross-repo contract:** Calendar RPC v1 is a local Unix-socket reverse-RPC to Kocoro Desktop's EventKit (spec `docs/desktop-calendar-rpc.md`); `calendar_*` tools register only when the daemon is a Desktop subprocess. The approval-resolution change reuses the existing `POST /approval` + WS broker path. Named-agent multi-session honors the existing `session_id`/`new_session` fields.
 
 ### Added
 
@@ -76,7 +110,7 @@ Daemon capability release. **Named agents become multi-session** (honoring `sess
 
 Three threads. First, the **agent display-name contract is finalized and made breaking**: `POST /agents` no longer accepts a client-supplied slug — the slug is always minted server-side as `agent-<6hex>` and returned in the response, and `display_name` becomes required on create, immutable-via-config, and non-clearable on rename. Second, **mid-run steering** (PR #208): a follow-up sent while a run is in flight is injected into the live loop at the next iteration boundary instead of starting a new run, with a retract path for cancelled drafts. Third, **TUI display polish** (PR #209): live streaming preview, fuzzy slash matching, an adaptive light/dark palette, and CJK-correct display-width truncation.
 
-> **Cross-repo contract:** the breaking change is `POST /agents` — clients that created agents by passing an explicit `name` must now send `display_name` and read the generated slug from the response. Mid-run steering adds `POST /message` `inject_only` + `client_message_id` routing and `POST /inject/retract`, plus an `injected_committed` WS event; consumer is ShanClawDesktop (`DaemonClient`/`Streaming.swift` + `DaemonChatViewModel.swift`). The TUI changes are terminal-local presentation with no wire impact.
+> **Cross-repo contract:** the breaking change is `POST /agents` — clients that created agents by passing an explicit `name` must now send `display_name` and read the generated slug from the response. Mid-run steering adds `POST /message` `inject_only` + `client_message_id` routing and `POST /inject/retract`, plus an `injected_committed` WS event; consumer is Kocoro Desktop (`DaemonClient`/`Streaming.swift` + `DaemonChatViewModel.swift`). The TUI changes are terminal-local presentation with no wire impact.
 
 ### Added
 
@@ -347,7 +381,7 @@ Ships inbound attachment support so cloud-fed PDFs and Office documents arrive o
 ### Cross-repo consumers
 
 - **Shannon Cloud**: must populate `RemoteFile.document_b64` (for PDFs ≤18 MB) and `RemoteFile.extracted_text` (for DOCX/XLSX/PPTX/CSV) when serving cloud-fed attachments to daemons advertising the new capability tokens. Older daemons (no `inline_document_b64` / `inline_extracted_text` capability) get the legacy URL-only path. The originally planned `/extract` round-trip is no longer needed — daemons handle the same file types locally via `internal/tools/doc_extract.go`.
-- **ShanClaw Desktop**: helper bundle rebuilt against this tag. The Episodic Memory toggle in Settings → Advanced → Beta now controls `memory.provider` + `sync.enabled` together, both defaulting to off in this release.
+- **Kocoro Desktop**: helper bundle rebuilt against this tag. The Episodic Memory toggle in Settings → Advanced → Beta now controls `memory.provider` + `sync.enabled` together, both defaulting to off in this release.
 
 ---
 
@@ -375,7 +409,7 @@ Ships the full local episodic memory pipeline. The TLM sidecar is now managed by
 
 ### Cross-repo consumers
 
-- **ShanClaw Desktop 0.1.5**: helper bundle rebuilt against this tag. Episodic Memory toggle in Settings → Advanced → Beta controls `memory.provider` + `sync.enabled` together via `PATCH /config`.
+- **Kocoro Desktop 0.1.5**: helper bundle rebuilt against this tag. Episodic Memory toggle in Settings → Advanced → Beta controls `memory.provider` + `sync.enabled` together via `PATCH /config`.
 - **Shannon Cloud**: `UpsertTenantTrainState` (PR #128) ensures the first accepted session sync immediately schedules training. `cloud_memory_enabled` feature flag must be set per tenant for the manifest endpoint to serve bundles.
 - **tensorlogic-memory**: sidecar binary (`tlm`) must be at `v0.6.0`; bundle format version `0.6.x` required. Earlier bundle versions are rejected at the version gate (`versionInRange`).
 
@@ -442,7 +476,7 @@ Bundles two cross-repo tracks and one major new tool. The WS handshake + `delive
 ### Cross-repo consumers
 
 - **Shannon Cloud**: capability handshake is the prerequisite for Phase 4 unacked-tracking + replay-on-reconnect. Cloud-side gates on `"delivery_ack" in conn.capabilities`; old daemons → no tracking → legacy fire-and-forget. The 429 body schemas Cloud emits (per `middleware/quota.go`, `middleware/ratelimit.go`, `openai/handler.go`) are now parsed properly on the daemon side.
-- **ShanClaw Desktop**: helper bundle should rebuild against this tag's SHA to pick up the daemon changes. Templated quota / credits messages currently render as the static fallback in the TUI — full templating needs `RunStatus` to carry `*runstatus.Detail`, deferred to a follow-up.
+- **Kocoro Desktop**: helper bundle should rebuild against this tag's SHA to pick up the daemon changes. Templated quota / credits messages currently render as the static fallback in the TUI — full templating needs `RunStatus` to carry `*runstatus.Detail`, deferred to a follow-up.
 - **npm `@kocoro/shanclaw`**: release CI publishes against this tag.
 
 ### Versioning note
@@ -538,7 +572,7 @@ Bundles PR #114 (tool-layer cost optimization), PR #113 (webhook agent isolation
 - Benchmark analyzer unifies synthesis detection and handles `force_stop` audit events.
 - Skills: frontmatter `name` decoupled from marketplace slug — `Slug` used everywhere directory/URL/manifest identity is needed; secrets lookup uses `Slug`.
 - Daemon: `daemon.auto_approve` settable via `PATCH /config`.
-- Kocoro skill: drop sticky-instructions after opt-in revert; post-create hint steers to ShanClaw Desktop.
+- Kocoro skill: drop sticky-instructions after opt-in revert; post-create hint steers to Kocoro Desktop.
 
 ## v0.0.98 — 2026-04-20
 

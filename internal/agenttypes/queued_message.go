@@ -64,6 +64,14 @@ type QueuedMessage struct {
 	// non-WS sources.
 	CloudMsgID string `json:"cloud_msg_id,omitempty"`
 
+	// ClientMessageID is the client-generated id of the steering inject this
+	// row was rescued from (ReEnqueueInjectSurvivors). It lets a late
+	// /inject/retract reach the row after the inject already moved into the
+	// durable mailbox, and lets the next run's DrainMailbox drop a row whose
+	// id was tombstoned in between. Empty for rows that did not originate as
+	// injects. Persisted via payload_json — no mailbox schema change.
+	ClientMessageID string `json:"client_message_id,omitempty"`
+
 	// Text is the user-visible message body. Phase 1 is text-only; Phase 4
 	// adds Attachments.
 	Text string `json:"text"`

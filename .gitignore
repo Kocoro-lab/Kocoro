@@ -20,12 +20,11 @@ CLAUDE.local.md
 docs/*
 !docs/cache-strategy.md
 !docs/cache-debug.md
-!docs/kocoro-desktop-attachment-design.md
 !docs/config-reference.md
 !docs/agents-reference.md
 !docs/session-sync-launchd.md
-!docs/desktop-calendar-rpc.md
 !docs/desktop-calendar-rpc-fixtures
+!docs/desktop-wire-fixtures
 internal/tools/axserver/.build/
 internal/agent/tmp/
 build/

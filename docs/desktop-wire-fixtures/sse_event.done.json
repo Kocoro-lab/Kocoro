@@ -1,0 +1,11 @@
+{
+  "reply": "All tests pass. The fix is ready for review.",
+  "session_id": "f3b2a1c0-9d8e-4f5a-b6c7-d8e9f0a1b2c3",
+  "agent": "agent-3f2a91",
+  "usage": {
+    "input_tokens": 18432,
+    "output_tokens": 956,
+    "total_tokens": 19388,
+    "cost_usd": 0.0712
+  }
+}

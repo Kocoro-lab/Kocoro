@@ -1,0 +1,11 @@
+{
+  "request_id": "apr_9f2c4b8a01d3e6f7",
+  "session_id": "f3b2a1c0-9d8e-4f5a-b6c7-d8e9f0a1b2c3",
+  "agent": "agent-3f2a91",
+  "tool": "bash",
+  "title": "Install project dependencies",
+  "source": "slack",
+  "channel": "C0123456789",
+  "args": "{\"command\":\"npm install\",\"description\":\"Install project dependencies\"}",
+  "ts": "2026-06-12T09:00:00Z"
+}

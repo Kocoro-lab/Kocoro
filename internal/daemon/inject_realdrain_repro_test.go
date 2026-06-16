@@ -60,7 +60,7 @@ func TestInjectAtEndTurn_RealDrain_ContentReachesNextCall(t *testing.T) {
 	loop := agent.NewAgentLoop(gw, agent.NewToolRegistry(), "medium", "", 10, 2000, 200, nil, nil, nil)
 	loop.SetInjectCh(injectCh)
 	loop.SetInjectFinalDrainFn(func() []agent.InjectedMessage {
-		return sc.DrainSurvivorsOrCloseInject(key)
+		return sc.DrainSurvivorsOrCloseInject(key, true)
 	})
 
 	if _, _, err := loop.Run(context.Background(), "hello", nil, nil); err != nil {

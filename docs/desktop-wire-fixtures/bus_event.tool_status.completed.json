@@ -1,0 +1,10 @@
+{
+  "tool": "bash",
+  "tool_use_id": "toolu_01AbCdEfGhIjKlMnOpQrStUv",
+  "status": "completed",
+  "elapsed": 2.41,
+  "is_error": false,
+  "preview": "ok   example.com/demo/internal 1.92s",
+  "session_id": "f3b2a1c0-9d8e-4f5a-b6c7-d8e9f0a1b2c3",
+  "ts": "2026-06-12T09:00:02Z"
+}

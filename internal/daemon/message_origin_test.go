@@ -76,6 +76,31 @@ func TestParseMessageOrigin_LarkWithS1bFields(t *testing.T) {
 	}
 }
 
+func TestParseMessageOrigin_Line(t *testing.T) {
+	// Producer shape: shannon-cloud buildIMStatusContext "line" case emits
+	// {platform, line_user_id, channel_registry_id} and drops the whole blob
+	// when either id is empty — so a parsed blob always carries the user id.
+	blob := json.RawMessage(`{"platform":"line","line_user_id":"U4af4980629abc","channel_registry_id":"850fe961-2ccb-421b-81ad-8db8bcd8e91c"}`)
+	o := parseMessageOrigin("line", blob)
+	if o == nil {
+		t.Fatal("expected non-nil origin")
+	}
+	if o.Platform != "line" || o.ChannelID != "U4af4980629abc" || o.Scope != "dm" || o.ThreadID != "" {
+		t.Fatalf("origin = %+v", o)
+	}
+	// The raw userId must NOT render into the prompt (prompt hygiene) — it
+	// stays on ChannelID solely for the conn-state lookup; the nickname rides
+	// the Sender: line.
+	if got := o.renderChannelLine(); got != "line · dm" {
+		t.Fatalf("renderChannelLine() = %q", got)
+	}
+	// Defense-in-depth: a blob without line_user_id degrades to nil (coarse
+	// Channel: line), mirroring the channel-less slack case.
+	if o := parseMessageOrigin("line", json.RawMessage(`{"platform":"line","channel_registry_id":"850fe961"}`)); o != nil {
+		t.Fatalf("user-less line blob should be nil, got %+v", o)
+	}
+}
+
 func TestParseMessageOrigin_EmptyOrJunk(t *testing.T) {
 	if o := parseMessageOrigin("slack", nil); o != nil {
 		t.Fatalf("empty blob should be nil, got %+v", o)
