@@ -417,6 +417,7 @@ type AgentCreateRequest struct {
 	Config      *AgentConfigAPI   `json:"config,omitempty"`
 	Commands    map[string]string `json:"commands,omitempty"`
 	Skills      []*skills.Skill   `json:"skills,omitempty"`
+	Avatar      string            `json:"avatar,omitempty"`
 }
 
 // Validate checks required fields and runs all validators. It trims DisplayName
@@ -475,4 +476,5 @@ type AgentUpdateRequest struct {
 	Config      json.RawMessage   `json:"config,omitempty"`       // object or null
 	Commands    map[string]string `json:"commands,omitempty"`
 	Skills      []*skills.Skill   `json:"skills,omitempty"`
+	Avatar      *string           `json:"avatar,omitempty"` // nil = unchanged, "" = clear
 }

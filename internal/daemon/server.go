@@ -2672,6 +2672,13 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.Avatar != "" {
+		if err := agents.WriteAgentProfile(s.deps.AgentsDir, req.Name, &agents.AgentProfile{Avatar: req.Avatar}); err != nil {
+			rollback()
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write profile: %v", err))
+			return
+		}
+	}
 	a, err := agents.LoadAgent(s.deps.AgentsDir, req.Name)
 	if err != nil {
 		rollback()
@@ -2857,6 +2864,17 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		// Clean up any legacy agent-scoped SKILL.md files
 		agentSkillsDir := filepath.Join(s.deps.AgentsDir, name, "skills")
 		_ = os.RemoveAll(agentSkillsDir)
+	}
+	if req.Avatar != nil {
+		cur, _ := agents.LoadAgentProfile(agentDir)
+		if cur == nil {
+			cur = &agents.AgentProfile{}
+		}
+		cur.Avatar = *req.Avatar
+		if err := agents.WriteAgentProfile(s.deps.AgentsDir, name, cur); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write profile: %v", err))
+			return
+		}
 	}
 	a, err := agents.LoadAgent(s.deps.AgentsDir, name)
 	if err != nil {
