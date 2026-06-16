@@ -13,9 +13,9 @@ import (
 // addressed in (S1). Sender is intentionally absent — it rides the existing
 // RunAgentRequest.Sender field and the existing `Sender:` sticky line.
 type MessageOrigin struct {
-	Platform     string // slack / feishu / lark / wecom / line
+	Platform     string // slack / feishu / lark / wecom / line / teams
 	Scope        string // dm | group | channel | "" (unknown)
-	ChannelID    string // native id (Slack C/G/D, WeCom conversation_id, Lark chat_id [needs S1b])
+	ChannelID    string // native id (Slack C/G/D, WeCom/Teams conversation_id, Lark chat_id [needs S1b])
 	ChannelLabel string // human-readable (#shannon); optional, from S1b best-effort; degrade to ChannelID
 	ThreadID     string // Slack message_ts, WeCom thread_key
 }
@@ -45,6 +45,8 @@ func parseMessageOrigin(source string, blob json.RawMessage) *MessageOrigin {
 		// lark/feishu (added by S1b)
 		ChatID   string `json:"chat_id"`
 		ChatType string `json:"chat_type"`
+		// teams
+		ConversationType string `json:"conversation_type"`
 		// line
 		LineUserID string `json:"line_user_id"`
 		// optional human label (S1b best-effort, any platform)
@@ -71,6 +73,9 @@ func parseMessageOrigin(source string, blob json.RawMessage) *MessageOrigin {
 	case "lark", "feishu":
 		o.ChannelID = raw.ChatID // empty until S1b
 		o.Scope = larkScope(raw.ChatType)
+	case "teams":
+		o.ChannelID = raw.ConversationID
+		o.Scope = teamsScope(raw.ConversationType)
 	case "line":
 		// Shared-OA LINE is 1:1 only — every message is a DM with the paired
 		// user, and line_user_id is the only native id the blob carries.
@@ -143,6 +148,22 @@ func larkScope(chatType string) string {
 		return "group"
 	case "p2p":
 		return "dm"
+	default:
+		return ""
+	}
+}
+
+// teamsScope maps a Teams conversationType to a human scope. Teams uses
+// "personal" for 1:1 chats, "groupChat" for ad-hoc group chats, and "channel"
+// for team channels.
+func teamsScope(conversationType string) string {
+	switch conversationType {
+	case "personal":
+		return "dm"
+	case "groupChat":
+		return "group"
+	case "channel":
+		return "channel"
 	default:
 		return ""
 	}

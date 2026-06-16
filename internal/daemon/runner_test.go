@@ -34,6 +34,7 @@ func TestCacheSourceFromDaemonSource(t *testing.T) {
 		{"  line  ", "line"},
 		{"feishu", "feishu"},
 		{"wecom", "wecom"},
+		{"teams", "teams"},
 		{"telegram", "telegram"},
 		{"tui", "tui"},
 		{"shanclaw", "shanclaw"},
