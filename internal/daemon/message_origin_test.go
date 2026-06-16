@@ -42,6 +42,25 @@ func TestParseMessageOrigin_WeCom(t *testing.T) {
 	}
 }
 
+func TestParseMessageOrigin_Teams(t *testing.T) {
+	cases := []struct {
+		convType  string
+		wantScope string
+	}{
+		{"personal", "dm"},
+		{"groupChat", "group"},
+		{"channel", "channel"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		blob := json.RawMessage(`{"platform":"teams","conversation_id":"19:abc@thread.v2","conversation_type":"` + tc.convType + `","channel_registry_id":"r1"}`)
+		o := parseMessageOrigin("teams", blob)
+		if o == nil || o.Platform != "teams" || o.ChannelID != "19:abc@thread.v2" || o.Scope != tc.wantScope {
+			t.Fatalf("conversation_type %q: origin = %+v", tc.convType, o)
+		}
+	}
+}
+
 func TestParseMessageOrigin_LarkDegradesToNil(t *testing.T) {
 	blob := json.RawMessage(`{"platform":"feishu","tenant_key":"tk","message_id":"om_x"}`)
 	if o := parseMessageOrigin("feishu", blob); o != nil {

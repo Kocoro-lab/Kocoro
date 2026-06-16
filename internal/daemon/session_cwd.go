@@ -16,15 +16,16 @@ import (
 // working directory to land in.
 //
 // Most cloud sources use the "plain" output profile, but the format axis is
-// decided independently by outputFormatForSource in runner.go — Feishu/Lark are
-// cloud sources that emit "markdown" (see markdownCloudSources). Keep this list
-// aligned with that mapping for the CWD axis; the two need not agree on format.
+// decided independently by outputFormatForSource in runner.go — Feishu/Lark/Teams
+// are cloud sources that emit "markdown" (see markdownCloudSources). Keep this
+// list aligned with that mapping for the CWD axis; the two need not agree on format.
 var cloudSourceSet = map[string]struct{}{
 	"slack":    {},
 	"line":     {},
 	"feishu":   {},
 	"lark":     {},
 	"wecom":    {},
+	"teams":    {},
 	"telegram": {},
 	"webhook":  {},
 }
