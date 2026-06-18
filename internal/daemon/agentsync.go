@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
@@ -43,7 +44,7 @@ func (s *Server) agentSyncWorker(ctx context.Context) {
 			default:
 			}
 			if gw := s.cloudGateway(); gw != nil {
-				if err := pushAllAgents(ctx, gw, s.deps.AgentsDir); err != nil {
+				if err := s.pushAllAgents(ctx, gw, s.deps.AgentsDir); err != nil {
 					log.Printf("agentsync: push failed: %v", err)
 				}
 			}
@@ -77,7 +78,13 @@ type agentProfileBlob struct {
 // avatar is carried inside the `profile` JSON blob. Agents that fail to load
 // are logged and skipped rather than failing the whole push. UpdatedAt is set
 // to the agent's real last-modified time so cross-device LWW is meaningful.
-func buildSyncItems(agentsDir string) ([]client.SyncAgentItem, error) {
+//
+// Each agent's read (LoadAgent + ToAPI/marshal) runs under the SAME per-route
+// lock the CRUD handlers and pull take, so a push can't snapshot a cross-file-
+// inconsistent agent (e.g. new AGENT.md + old PROFILE.yaml) while a concurrent
+// handleUpdateAgent is mid-write. The lock is acquired per-agent (short critical
+// section) and only AFTER the builtin-skip check.
+func (s *Server) buildSyncItems(agentsDir string) ([]client.SyncAgentItem, error) {
 	entries, err := agents.ListAgents(agentsDir)
 	if err != nil {
 		return nil, err
@@ -90,63 +97,83 @@ func buildSyncItems(agentsDir string) ([]client.SyncAgentItem, error) {
 		if e.Builtin && !e.Override {
 			continue
 		}
-		a, err := agents.LoadAgent(agentsDir, e.Name)
-		if err != nil {
-			log.Printf("agentsync: skipping agent %q: load failed: %v", e.Name, err)
-			continue
+		if item, ok := s.buildSyncItem(agentsDir, e.Name); ok {
+			items = append(items, item)
 		}
-		api := a.ToAPI()
-
-		var category string
-		if api.Category != nil {
-			category = api.Category.Code
-		}
-		profile, err := json.Marshal(agentProfileBlob{
-			Category:     category,
-			Description:  api.Description,
-			GuidePrompts: api.GuidePrompts,
-			Examples:     api.Examples,
-			Avatar:       api.Avatar,
-		})
-		if err != nil {
-			log.Printf("agentsync: skipping agent %q: marshal profile: %v", e.Name, err)
-			continue
-		}
-
-		var config json.RawMessage
-		if api.Config != nil {
-			if b, err := json.Marshal(api.Config); err == nil {
-				config = b
-			}
-		}
-		var skills json.RawMessage
-		if api.Skills != nil {
-			if b, err := json.Marshal(api.Skills); err == nil {
-				skills = b
-			}
-		}
-
-		items = append(items, client.SyncAgentItem{
-			AgentKey:    e.Name,
-			DisplayName: api.DisplayName,
-			Prompt:      api.Prompt,
-			Memory:      api.Memory,
-			Config:      config,
-			Skills:      skills,
-			Profile:     profile,
-			UpdatedAt:   agentLastModified(filepath.Join(agentsDir, e.Name)).UTC(),
-		})
 	}
 	return items, nil
 }
 
-// agentLastModified returns the latest ModTime among an agent's definition
-// files, so cross-device LWW reflects the real local edit time rather than the
-// push time. Falls back to the agent dir's own ModTime when no definition file
-// is present.
+// buildSyncItem snapshots a single agent into a SyncAgentItem under the
+// per-route lock so the read is internally consistent against concurrent CRUD.
+func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bool) {
+	routeKey := "agent:" + name
+	s.deps.SessionCache.LockRoute(routeKey)
+	defer s.deps.SessionCache.UnlockRoute(routeKey)
+
+	a, err := agents.LoadAgent(agentsDir, name)
+	if err != nil {
+		log.Printf("agentsync: skipping agent %q: load failed: %v", name, err)
+		return client.SyncAgentItem{}, false
+	}
+	api := a.ToAPI()
+
+	var category string
+	if api.Category != nil {
+		category = api.Category.Code
+	}
+	profile, err := json.Marshal(agentProfileBlob{
+		Category:     category,
+		Description:  api.Description,
+		GuidePrompts: api.GuidePrompts,
+		Examples:     api.Examples,
+		Avatar:       api.Avatar,
+	})
+	if err != nil {
+		log.Printf("agentsync: skipping agent %q: marshal profile: %v", name, err)
+		return client.SyncAgentItem{}, false
+	}
+
+	var config json.RawMessage
+	if api.Config != nil {
+		if b, err := json.Marshal(api.Config); err == nil {
+			config = b
+		}
+	}
+	var skills json.RawMessage
+	if api.Skills != nil {
+		if b, err := json.Marshal(api.Skills); err == nil {
+			skills = b
+		}
+	}
+
+	return client.SyncAgentItem{
+		AgentKey:    name,
+		DisplayName: api.DisplayName,
+		Prompt:      api.Prompt,
+		Memory:      api.Memory,
+		Config:      config,
+		Skills:      skills,
+		Profile:     profile,
+		UpdatedAt:   agentLastModified(filepath.Join(agentsDir, name)).UTC(),
+	}, true
+}
+
+// agentDefinitionFiles is the set of files whose mtimes drive the cross-device
+// LWW clock. MEMORY.md is deliberately EXCLUDED: it is runtime state mutated by
+// the memory_append tool during normal agent runs (a path that does NOT trigger
+// a sync), so including it would make local memory churn look like a definition
+// edit and silently drop genuine remote profile edits. sessions/ is excluded for
+// the same reason. The stamped set (stampAgentMtime) is kept aligned with this.
+var agentDefinitionFiles = []string{"AGENT.md", "config.yaml", "PROFILE.yaml", "_attached.yaml"}
+
+// agentLastModified returns the latest ModTime among an agent's DEFINITION
+// files, so cross-device LWW reflects the real local definition/presentation
+// edit time rather than runtime memory churn or the push time. Falls back to the
+// agent dir's own ModTime when no definition file is present.
 func agentLastModified(dir string) time.Time {
 	var latest time.Time
-	for _, f := range []string{"AGENT.md", "config.yaml", "PROFILE.yaml", "_attached.yaml", "MEMORY.md"} {
+	for _, f := range agentDefinitionFiles {
 		if fi, err := os.Stat(filepath.Join(dir, f)); err == nil {
 			if fi.ModTime().After(latest) {
 				latest = fi.ModTime()
@@ -166,9 +193,9 @@ func agentLastModified(dir string) time.Time {
 // captured BEFORE the local snapshot so Cloud's gated full_sync soft-delete
 // only removes agents whose cloud updated_at <= that instant — agents created
 // on cloud after this snapshot are not clobbered.
-func pushAllAgents(ctx context.Context, gw *client.GatewayClient, agentsDir string) error {
+func (s *Server) pushAllAgents(ctx context.Context, gw *client.GatewayClient, agentsDir string) error {
 	start := time.Now().UTC()
-	items, err := buildSyncItems(agentsDir)
+	items, err := s.buildSyncItems(agentsDir)
 	if err != nil {
 		return err
 	}
@@ -276,7 +303,19 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 // materializeAgentFromItem writes (or overwrites) all of an agent's definition
 // files from a cloud sync item, then stamps their mtimes to it.UpdatedAt so the
 // next push reports the cloud timestamp (LWW stability — no ping-pong).
+//
+// It is best-effort per-file (logs + continues on a single write error). If ANY
+// write failed the agent is half-written, so the mtime stamp is SKIPPED — the
+// local mtime stays old and the next pull (cloud still strictly-newer) retries.
+// Stamping a half-written agent to it.UpdatedAt would make the next pull see
+// "equal, not strictly newer" and never retry until Cloud bumps UpdatedAt.
+//
+// Note: SyncAgentItem.DisplayName is intentionally NOT applied here — the
+// display name is sourced from the config blob (AgentConfigAPI.DisplayName), so
+// the top-level field would be redundant/conflicting.
 func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
+	writeFailed := false
+
 	// AGENT.md is MANDATORY — it is what makes the agent enumerable. Without
 	// it the agent is invisible to ListAgents and the next full push would
 	// soft-delete it on the cloud.
@@ -307,23 +346,37 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
 	}
 	if err := agents.WriteAgentProfile(agentsDir, it.AgentKey, profile); err != nil {
 		log.Printf("agentsync: write profile for %q failed: %v", it.AgentKey, err)
+		writeFailed = true
 	}
 
 	// config.yaml — decode the same AgentConfigAPI shape the create handler
-	// uses. Overwrite is authoritative (cloud is strictly newer): an empty /
-	// JSON null / empty-object config means the field was CLEARED on the
-	// originating device, so remove the local file rather than keeping a stale
-	// copy. Mirrors handleUpdateAgent's clear-on-null branch.
-	if len(it.Config) == 0 || isJSONNull(it.Config) || string(it.Config) == "{}" {
-		if err := os.Remove(filepath.Join(agentsDir, it.AgentKey, "config.yaml")); err != nil && !os.IsNotExist(err) {
+	// uses. Overwrite is authoritative (cloud is strictly newer). Detect a
+	// CLEARED config SEMANTICALLY (not by exact bytes): empty/JSON-null bytes,
+	// OR bytes that unmarshal to a zero-value AgentConfigAPI (whitespace, "{}",
+	// key reorder, trailing newline). On a real clear, remove the local file. On
+	// a decode error, prefer leaving the existing config untouched + log rather
+	// than wiping it silently (mirrors the skills clear-path robustness).
+	configPath := filepath.Join(agentsDir, it.AgentKey, "config.yaml")
+	if len(it.Config) == 0 || isJSONNull(it.Config) {
+		if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
 			log.Printf("agentsync: remove cleared config for %q failed: %v", it.AgentKey, err)
+			writeFailed = true
 		}
 	} else {
 		var cfg agents.AgentConfigAPI
 		if err := json.Unmarshal(it.Config, &cfg); err != nil {
-			log.Printf("agentsync: pull of %q: config decode (skipped): %v", it.AgentKey, err)
+			// Malformed-but-present config is NOT a clear signal — leave the
+			// existing config untouched rather than wiping it silently.
+			log.Printf("agentsync: pull of %q: config decode (existing kept): %v", it.AgentKey, err)
+		} else if reflect.DeepEqual(cfg, agents.AgentConfigAPI{}) {
+			// Semantically empty → field was cleared on the originating device.
+			if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("agentsync: remove cleared config for %q failed: %v", it.AgentKey, err)
+				writeFailed = true
+			}
 		} else if err := agents.WriteAgentConfig(agentsDir, it.AgentKey, &cfg); err != nil {
 			log.Printf("agentsync: write config for %q failed: %v", it.AgentKey, err)
+			writeFailed = true
 		}
 	}
 
@@ -331,9 +384,11 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
 	if it.Memory == nil || *it.Memory == "" {
 		if err := os.Remove(filepath.Join(agentsDir, it.AgentKey, "MEMORY.md")); err != nil && !os.IsNotExist(err) {
 			log.Printf("agentsync: remove cleared memory for %q failed: %v", it.AgentKey, err)
+			writeFailed = true
 		}
 	} else if err := agents.WriteAgentMemory(agentsDir, it.AgentKey, *it.Memory); err != nil {
 		log.Printf("agentsync: write memory for %q failed: %v", it.AgentKey, err)
+		writeFailed = true
 	}
 
 	// skills — attached-skills manifest. The blob mirrors api.Skills
@@ -364,7 +419,22 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
 	if skillsClear || len(skillNames) > 0 {
 		if err := agents.SetAttachedSkills(agentsDir, it.AgentKey, skillNames); err != nil {
 			log.Printf("agentsync: write skills for %q failed: %v", it.AgentKey, err)
+			writeFailed = true
 		}
+	}
+
+	// A partial write must leave the LWW clock STRICTLY BEFORE it.UpdatedAt so
+	// the next pull still sees cloud as strictly-newer and retries the
+	// half-written agent. Simply skipping the stamp is not enough: the files we
+	// did rewrite carry mtime≈now (>= cloud's), which would make the next pull
+	// see "not strictly newer" and never retry until Cloud bumps UpdatedAt.
+	// Stamp definition files just before the cloud timestamp instead.
+	if writeFailed {
+		log.Printf("agentsync: pull of %q: partial write — backdating mtime so next pull retries", it.AgentKey)
+		if !it.UpdatedAt.IsZero() {
+			stampAgentMtime(filepath.Join(agentsDir, it.AgentKey), it.UpdatedAt.Add(-time.Second))
+		}
+		return
 	}
 
 	// Stamp mtimes to the cloud timestamp so this agent reports UpdatedAt ==
@@ -379,7 +449,9 @@ func stampAgentMtime(dir string, t time.Time) {
 	if t.IsZero() {
 		return
 	}
-	for _, f := range []string{"AGENT.md", "config.yaml", "PROFILE.yaml", "_attached.yaml", "MEMORY.md"} {
+	// Stamp only the definition files (the LWW set) — MEMORY.md is runtime state
+	// in its own lane and is deliberately not part of the LWW clock.
+	for _, f := range agentDefinitionFiles {
 		p := filepath.Join(dir, f)
 		if _, err := os.Stat(p); err == nil {
 			_ = os.Chtimes(p, t, t)

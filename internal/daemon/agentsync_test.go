@@ -31,7 +31,7 @@ func TestBuildSyncItems_IncludesAvatarInProfile(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("prompt"), 0o644)
 	os.WriteFile(filepath.Join(dir, "PROFILE.yaml"), []byte("category: coding\navatar: https://cdn/a.png\n"), 0o644)
 
-	items, err := buildSyncItems(root)
+	items, err := newPullServer(t, root).buildSyncItems(root)
 	if err != nil {
 		t.Fatalf("buildSyncItems: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestBuildSyncItems_SkipsPureBuiltins(t *testing.T) {
 	os.MkdirAll(builtin, 0o755)
 	os.WriteFile(filepath.Join(builtin, "AGENT.md"), []byte("builtin prompt"), 0o644)
 
-	items, err := buildSyncItems(root)
+	items, err := newPullServer(t, root).buildSyncItems(root)
 	if err != nil {
 		t.Fatalf("buildSyncItems: %v", err)
 	}
@@ -188,6 +188,72 @@ func TestPullAndApply_FullyMaterializesMissingAgent(t *testing.T) {
 	// gone: soft-deleted -> not materialized
 	if _, err := os.Stat(filepath.Join(root, "gone")); !os.IsNotExist(err) {
 		t.Errorf("soft-deleted agent should not be materialized")
+	}
+}
+
+// Fix 1 (real bug): MEMORY.md churn from the memory_append tool must NOT make a
+// local agent look "newer" and silently drop a genuine cloud profile/avatar
+// edit. The LWW clock ignores MEMORY.md, so a cloud item whose UpdatedAt is
+// newer than the DEFINITION files (but older than the churned MEMORY.md) still
+// wins.
+func TestPullAndApply_MemoryChurnDoesNotBlockCloudEdit(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("local prompt"), 0o644)
+	os.WriteFile(filepath.Join(dir, "PROFILE.yaml"), []byte("avatar: https://cdn/old.png\n"), 0o644)
+
+	// Definition files are OLD (well in the past).
+	defTime := time.Now().Add(-2 * time.Hour).UTC()
+	stampAgentMtime(dir, defTime)
+
+	// MEMORY.md was just churned by memory_append — its mtime is NOW. This must
+	// not gate the definition LWW clock.
+	os.WriteFile(filepath.Join(dir, "MEMORY.md"), []byte("just appended"), 0o644)
+	now := time.Now().UTC()
+	os.Chtimes(filepath.Join(dir, "MEMORY.md"), now, now)
+
+	// Cloud edit timestamp is between the old definition time and now.
+	cloudTS := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Second)
+	pull := func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{
+			{
+				AgentKey:  "agt",
+				Prompt:    "cloud prompt",
+				Profile:   json.RawMessage(`{"avatar":"https://cdn/new.png"}`),
+				UpdatedAt: cloudTS,
+			},
+		}, nil
+	}
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
+		t.Fatalf("pullAndApplyAgents: %v", err)
+	}
+
+	// The cloud edit MUST have been applied (definition LWW ignores MEMORY.md).
+	if b, _ := os.ReadFile(filepath.Join(dir, "AGENT.md")); string(b) != "cloud prompt" {
+		t.Errorf("cloud edit dropped due to MEMORY.md churn: prompt = %q", b)
+	}
+	prof, _ := agents.LoadAgentProfile(dir)
+	if prof == nil || prof.Avatar != "https://cdn/new.png" {
+		t.Errorf("cloud avatar edit dropped due to MEMORY.md churn: %+v", prof)
+	}
+}
+
+// Fix 1: agentLastModified must reflect ONLY definition files, not MEMORY.md.
+func TestAgentLastModified_IgnoresMemory(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("p"), 0o644)
+	defTime := time.Now().Add(-1 * time.Hour).UTC()
+	stampAgentMtime(dir, defTime)
+
+	// MEMORY.md churned to NOW.
+	os.WriteFile(filepath.Join(dir, "MEMORY.md"), []byte("m"), 0o644)
+	now := time.Now().UTC()
+	os.Chtimes(filepath.Join(dir, "MEMORY.md"), now, now)
+
+	got := agentLastModified(dir).Truncate(time.Second)
+	if got.After(defTime.Add(time.Second)) {
+		t.Errorf("agentLastModified followed MEMORY.md mtime: got %v want ≈ %v", got, defTime)
 	}
 }
 
@@ -443,7 +509,7 @@ func TestBuildSyncItems_SetsRealLastModified(t *testing.T) {
 	}
 	want := fi.ModTime()
 
-	items, err := buildSyncItems(root)
+	items, err := newPullServer(t, root).buildSyncItems(root)
 	if err != nil {
 		t.Fatalf("buildSyncItems: %v", err)
 	}
@@ -627,6 +693,65 @@ func TestPullAndApply_OverwritePreservesPresentFields(t *testing.T) {
 	}
 }
 
+// Fix 3: semantic empty-config detection. A config blob that is non-empty bytes
+// but semantically empty (whitespace / trailing newline / no meaningful fields)
+// must be treated as CLEARED → config.yaml removed.
+func TestPullAndApply_SemanticEmptyConfigCleared(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("old"), 0o644)
+	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("cwd: /tmp\n"), 0o644)
+	stampAgentMtime(dir, time.Now().Add(-1*time.Hour).UTC())
+
+	cloudTS := time.Now().UTC().Truncate(time.Second)
+	pull := func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{
+			{
+				AgentKey:  "agt",
+				Prompt:    "new",
+				Config:    json.RawMessage("  {\n}  \n"), // semantically empty
+				UpdatedAt: cloudTS,
+			},
+		}, nil
+	}
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
+		t.Fatalf("pullAndApplyAgents: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "config.yaml")); !os.IsNotExist(err) {
+		t.Errorf("semantically-empty config should remove config.yaml (err=%v)", err)
+	}
+}
+
+// Fix 3: a malformed-but-present config must NOT wipe the existing config.yaml —
+// leave it untouched rather than deleting on decode error.
+func TestPullAndApply_MalformedConfigLeavesExisting(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("old"), 0o644)
+	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("cwd: /keep\n"), 0o644)
+	stampAgentMtime(dir, time.Now().Add(-1*time.Hour).UTC())
+
+	cloudTS := time.Now().UTC().Truncate(time.Second)
+	pull := func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{
+			{
+				AgentKey:  "agt",
+				Prompt:    "new",
+				Config:    json.RawMessage(`{"cwd":`), // malformed
+				UpdatedAt: cloudTS,
+			},
+		}, nil
+	}
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
+		t.Fatalf("pullAndApplyAgents: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "config.yaml")); string(b) != "cwd: /keep\n" {
+		t.Errorf("malformed config wiped existing config.yaml: %q", b)
+	}
+}
+
 // Fix 3: the tombstone pull path must Evict the session cache (like
 // handleDeleteAgent) so a cloud-originated delete doesn't pull AGENT.md out from
 // under a cached route. Observable effect: GetOrCreate returns a fresh manager.
@@ -652,6 +777,42 @@ func TestPullAndApply_TombstoneEvictsSessionCache(t *testing.T) {
 
 	if mgr2 := s.deps.SessionCache.GetOrCreate("victim"); mgr2 == mgr {
 		t.Error("tombstone pull did not Evict the session cache (stale manager reused)")
+	}
+}
+
+// Fix 4: when a per-file write fails mid-materialize, stampAgentMtime must be
+// SKIPPED so the local mtime stays old and the next pull retries (otherwise the
+// half-written agent's mtime == cloud's and the pull never retries).
+func TestPullAndApply_PartialWriteFailureSkipsMtimeStamp(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("old"), 0o644)
+
+	// Force a write failure: make MEMORY.md a DIRECTORY so the atomic rename in
+	// WriteAgentMemory fails when the cloud item carries non-empty memory.
+	os.MkdirAll(filepath.Join(dir, "MEMORY.md"), 0o755)
+
+	defTime := time.Now().Add(-1 * time.Hour).UTC()
+	stampAgentMtime(dir, defTime)
+
+	mem := "cloud memory"
+	cloudTS := time.Now().UTC().Truncate(time.Second)
+	pull := func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{
+			{AgentKey: "agt", Prompt: "new", Memory: &mem, UpdatedAt: cloudTS},
+		}, nil
+	}
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
+		t.Fatalf("pullAndApplyAgents: %v", err)
+	}
+
+	// AGENT.md still got written (best-effort continues), but mtime must NOT be
+	// stamped to cloudTS — it must remain ≈ the old definition time so the next
+	// pull sees cloud as strictly-newer and retries.
+	got := agentLastModified(dir).Truncate(time.Second)
+	if !got.Before(cloudTS) {
+		t.Errorf("mtime stamped despite partial write failure: got %v, cloudTS %v", got, cloudTS)
 	}
 }
 
