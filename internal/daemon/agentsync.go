@@ -10,6 +10,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
 // agentSyncWorker coalesces agent-change notifications into serialized,
@@ -64,8 +65,8 @@ type agentProfileBlob struct {
 
 // buildSyncItems lists local agents and packs each into a SyncAgentItem. The
 // avatar is carried inside the `profile` JSON blob. Agents that fail to load
-// are logged and skipped rather than failing the whole push. UpdatedAt is left
-// zero; the cloud fills now().
+// are logged and skipped rather than failing the whole push. UpdatedAt is set
+// to the agent's real last-modified time so cross-device LWW is meaningful.
 func buildSyncItems(agentsDir string) ([]client.SyncAgentItem, error) {
 	entries, err := agents.ListAgents(agentsDir)
 	if err != nil {
@@ -123,9 +124,31 @@ func buildSyncItems(agentsDir string) ([]client.SyncAgentItem, error) {
 			Config:      config,
 			Skills:      skills,
 			Profile:     profile,
+			UpdatedAt:   agentLastModified(filepath.Join(agentsDir, e.Name)).UTC(),
 		})
 	}
 	return items, nil
+}
+
+// agentLastModified returns the latest ModTime among an agent's definition
+// files, so cross-device LWW reflects the real local edit time rather than the
+// push time. Falls back to the agent dir's own ModTime when no definition file
+// is present.
+func agentLastModified(dir string) time.Time {
+	var latest time.Time
+	for _, f := range []string{"AGENT.md", "config.yaml", "PROFILE.yaml", "_attached.yaml", "MEMORY.md"} {
+		if fi, err := os.Stat(filepath.Join(dir, f)); err == nil {
+			if fi.ModTime().After(latest) {
+				latest = fi.ModTime()
+			}
+		}
+	}
+	if latest.IsZero() {
+		if fi, err := os.Stat(dir); err == nil {
+			latest = fi.ModTime()
+		}
+	}
+	return latest
 }
 
 // pushAllAgents builds the full local agent set and pushes it to Cloud as a
@@ -138,17 +161,23 @@ func pushAllAgents(ctx context.Context, gw *client.GatewayClient, agentsDir stri
 	return gw.SyncAgents(ctx, items, true)
 }
 
-// pullAndApplyAgents materializes PROFILE.yaml (which carries avatar) for cloud
-// agents that are missing locally. Soft-deleted agents and agents that already
-// exist locally are left untouched — this round only seeds presentation
-// metadata for new agents and never clobbers local edits. The pull function is
-// injected for testability.
+// pullAndApplyAgents fully materializes cloud agents that are missing locally so
+// they are enumerable (AGENT.md present) and never get silently re-deleted by the
+// next full push. It writes the same files handleCreateAgent does — AGENT.md,
+// PROFILE.yaml, config.yaml, MEMORY.md, and the attached-skills manifest.
+// Soft-deleted agents and agents that already exist locally are left untouched
+// (never clobber local edits). The pull function is injected for testability.
 func pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error), agentsDir string) error {
 	items, err := pull()
 	if err != nil {
 		return err
 	}
 	for _, it := range items {
+		// Validate the key before any path construction (path-traversal safety).
+		if err := agents.ValidateAgentName(it.AgentKey); err != nil {
+			log.Printf("agentsync: skipping pull of %q: invalid agent key: %v", it.AgentKey, err)
+			continue
+		}
 		if it.DeletedAt != nil {
 			continue
 		}
@@ -156,11 +185,20 @@ func pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error), agentsDir s
 		if _, err := os.Stat(dir); err == nil {
 			continue // exists locally; do not clobber
 		}
+
+		// AGENT.md is MANDATORY — it is what makes the agent enumerable. Without
+		// it the agent is invisible to ListAgents and the next full push would
+		// soft-delete it on the cloud.
+		if err := agents.WriteAgentPrompt(agentsDir, it.AgentKey, it.Prompt); err != nil {
+			log.Printf("agentsync: write prompt for %q failed: %v", it.AgentKey, err)
+			continue
+		}
+
+		// PROFILE.yaml — presentation metadata (avatar/category/...).
 		var blob agentProfileBlob
 		if len(it.Profile) > 0 {
 			if err := json.Unmarshal(it.Profile, &blob); err != nil {
-				log.Printf("agentsync: skipping pull of %q: profile decode: %v", it.AgentKey, err)
-				continue
+				log.Printf("agentsync: pull of %q: profile decode: %v", it.AgentKey, err)
 			}
 		}
 		profile := &agents.AgentProfile{
@@ -172,6 +210,49 @@ func pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error), agentsDir s
 		}
 		if err := agents.WriteAgentProfile(agentsDir, it.AgentKey, profile); err != nil {
 			log.Printf("agentsync: write profile for %q failed: %v", it.AgentKey, err)
+		}
+
+		// config.yaml — decode the same AgentConfigAPI shape the create handler
+		// uses. Skip empty / JSON null / empty-object configs.
+		if len(it.Config) > 0 && !isJSONNull(it.Config) && string(it.Config) != "{}" {
+			var cfg agents.AgentConfigAPI
+			if err := json.Unmarshal(it.Config, &cfg); err != nil {
+				log.Printf("agentsync: pull of %q: config decode (skipped): %v", it.AgentKey, err)
+			} else if err := agents.WriteAgentConfig(agentsDir, it.AgentKey, &cfg); err != nil {
+				log.Printf("agentsync: write config for %q failed: %v", it.AgentKey, err)
+			}
+		}
+
+		// memory — MEMORY.md.
+		if it.Memory != nil && *it.Memory != "" {
+			if err := agents.WriteAgentMemory(agentsDir, it.AgentKey, *it.Memory); err != nil {
+				log.Printf("agentsync: write memory for %q failed: %v", it.AgentKey, err)
+			}
+		}
+
+		// skills — attached-skills manifest. The blob mirrors api.Skills
+		// ([]skills.SkillMeta); SetAttachedSkills wants the slug (fallback name).
+		if len(it.Skills) > 0 && !isJSONNull(it.Skills) {
+			var metas []skills.SkillMeta
+			if err := json.Unmarshal(it.Skills, &metas); err != nil {
+				log.Printf("agentsync: pull of %q: skills decode (skipped): %v", it.AgentKey, err)
+			} else {
+				names := make([]string, 0, len(metas))
+				for _, m := range metas {
+					ident := m.Slug
+					if ident == "" {
+						ident = m.Name
+					}
+					if ident != "" {
+						names = append(names, ident)
+					}
+				}
+				if len(names) > 0 {
+					if err := agents.SetAttachedSkills(agentsDir, it.AgentKey, names); err != nil {
+						log.Printf("agentsync: write skills for %q failed: %v", it.AgentKey, err)
+					}
+				}
+			}
 		}
 	}
 	return nil

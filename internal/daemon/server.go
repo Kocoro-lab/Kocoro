@@ -2892,7 +2892,11 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		_ = os.RemoveAll(agentSkillsDir)
 	}
 	if req.Avatar != nil {
-		cur, _ := agents.LoadAgentProfile(agentDir)
+		cur, lerr := agents.LoadAgentProfile(agentDir)
+		if lerr != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("load profile: %v", lerr))
+			return
+		}
 		if cur == nil {
 			cur = &agents.AgentProfile{}
 		}
