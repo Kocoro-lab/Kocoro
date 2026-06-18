@@ -577,17 +577,14 @@ func (s *Server) Start(ctx context.Context) error {
 	// when this finishes (success, failure, or unconfigured) so agentSyncWorker
 	// never blocks forever waiting on the gate before its first push.
 	go func() {
-		defer close(s.pullDone)
 		gw := s.cloudGateway()
 		if gw == nil {
+			s.runStartupAgentSync(nil) // unconfigured
 			return
 		}
-		pull := func() ([]client.SyncAgentItem, error) {
+		s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
 			return gw.PullAgents(ctx)
-		}
-		if err := s.pullAndApplyAgents(pull); err != nil {
-			log.Printf("agentsync: startup pull failed: %v", err)
-		}
+		})
 	}()
 
 	// Memory feature (Phase 2.3). Service is constructed once and Start runs
@@ -2846,6 +2843,16 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Serialize all file mutations for this agent on the same per-route lock the
+	// create/delete handlers and the startup pull use, so an async pull can't
+	// interleave with this update and produce mixed file state / a lost update.
+	// Acquired AFTER validation (cheap, no file writes) and held through the
+	// final LoadAgent. Evict is never called inside this lock (no Evict on the
+	// update path), so there is no self-deadlock risk.
+	routeKey := "agent:" + name
+	s.deps.SessionCache.LockRoute(routeKey)
+	defer s.deps.SessionCache.UnlockRoute(routeKey)
+
 	// Materialize builtin AFTER validation passes — avoids orphaned override dirs on bad input.
 	if !s.materializeIfBuiltin(w, name) {
 		return
@@ -2965,10 +2972,14 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	// Evict handles its own per-route locking — do NOT wrap with Lock/Unlock
 	// (that would self-deadlock since Evict calls evictRoute which acquires entry.mu).
+	// It MUST therefore run OUTSIDE the route lock below.
 	s.deps.SessionCache.Evict(name)
 	// Remove only definition files — preserve runtime state (MEMORY.md, sessions/)
-	// so the builtin can resurface with existing history intact.
+	// so the builtin can resurface with existing history intact. Serialize the
+	// file removal on the per-route lock so an async pull can't interleave.
 	agentDir := filepath.Join(s.deps.AgentsDir, name)
+	routeKey := "agent:" + name
+	s.deps.SessionCache.LockRoute(routeKey)
 	var errs []string
 	for _, f := range []string{"AGENT.md", "config.yaml", "_attached.yaml", "PROFILE.yaml"} {
 		p := filepath.Join(agentDir, f)
@@ -2982,13 +2993,14 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 			errs = append(errs, err.Error())
 		}
 	}
+	// Clean up empty dir if no runtime state remains (still under the lock).
+	if entries, err := os.ReadDir(agentDir); err == nil && len(entries) == 0 {
+		os.Remove(agentDir)
+	}
+	s.deps.SessionCache.UnlockRoute(routeKey)
 	if len(errs) > 0 {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("partial delete: %s", strings.Join(errs, "; ")))
 		return
-	}
-	// Clean up empty dir if no runtime state remains
-	if entries, err := os.ReadDir(agentDir); err == nil && len(entries) == 0 {
-		os.Remove(agentDir)
 	}
 	s.auditHTTPOp("DELETE", "/agents/"+name, "deleted agent")
 	s.triggerAgentSync()

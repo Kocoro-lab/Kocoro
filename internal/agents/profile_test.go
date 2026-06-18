@@ -469,3 +469,31 @@ func TestValidateAvatarURL(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadAgentProfile_EnforcesAvatarURL(t *testing.T) {
+	// A hand-authored PROFILE.yaml with an unsafe avatar must fail to load,
+	// closing the bypass where buildSyncItems would otherwise push it to Cloud.
+	bad := []string{
+		"javascript:alert(1)",
+		"http://x/y.png",
+		"data:image/png;base64,AAAA",
+	}
+	for _, av := range bad {
+		dir := t.TempDir()
+		writeYAML(t, dir, "avatar: "+av+"\n")
+		if _, err := LoadAgentProfile(dir); err == nil {
+			t.Errorf("LoadAgentProfile with avatar %q = nil error, want error", av)
+		}
+	}
+	// Valid https avatar and empty/absent avatar load fine.
+	okDir := t.TempDir()
+	writeYAML(t, okDir, "avatar: https://x/y.png\n")
+	if _, err := LoadAgentProfile(okDir); err != nil {
+		t.Errorf("LoadAgentProfile with https avatar = %v, want nil", err)
+	}
+	emptyDir := t.TempDir()
+	writeYAML(t, emptyDir, "category: coding\n")
+	if _, err := LoadAgentProfile(emptyDir); err != nil {
+		t.Errorf("LoadAgentProfile with empty avatar = %v, want nil", err)
+	}
+}

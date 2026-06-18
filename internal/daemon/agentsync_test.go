@@ -654,3 +654,154 @@ func TestPullAndApply_TombstoneEvictsSessionCache(t *testing.T) {
 		t.Error("tombstone pull did not Evict the session cache (stale manager reused)")
 	}
 }
+
+// Fix 1: a SUCCESSFUL startup pull must close pullDone AND trigger exactly one
+// full_sync push (reconciling local-only / locally-newer agents up to Cloud).
+func TestRunStartupAgentSync_SuccessTriggersPush(t *testing.T) {
+	root := t.TempDir()
+	s := newPullServer(t, root)
+	s.pullDone = make(chan struct{})
+	s.agentSyncTrigger = make(chan struct{}, 1)
+
+	s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
+		return nil, nil // clean pull, empty mirror
+	})
+
+	select {
+	case <-s.pullDone:
+	default:
+		t.Fatal("pullDone not closed after startup sync")
+	}
+	if got := len(s.agentSyncTrigger); got != 1 {
+		t.Fatalf("expected exactly one push trigger after clean pull, got %d", got)
+	}
+}
+
+// Fix 1: a FAILED startup pull must still close pullDone (so the worker doesn't
+// hang) but must NOT trigger a push — a full_sync over an un-merged local set
+// could wrongly soft-delete cloud agents.
+func TestRunStartupAgentSync_FailureDoesNotTrigger(t *testing.T) {
+	root := t.TempDir()
+	s := newPullServer(t, root)
+	s.pullDone = make(chan struct{})
+	s.agentSyncTrigger = make(chan struct{}, 1)
+
+	s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
+		return nil, context.DeadlineExceeded
+	})
+
+	select {
+	case <-s.pullDone:
+	default:
+		t.Fatal("pullDone not closed after failed pull")
+	}
+	if got := len(s.agentSyncTrigger); got != 0 {
+		t.Fatalf("expected no push trigger after failed pull, got %d", got)
+	}
+}
+
+// Fix 1: an UNCONFIGURED gateway (pull == nil) must close pullDone but NOT
+// trigger a push.
+func TestRunStartupAgentSync_UnconfiguredDoesNotTrigger(t *testing.T) {
+	s := &Server{pullDone: make(chan struct{}), agentSyncTrigger: make(chan struct{}, 1)}
+
+	s.runStartupAgentSync(nil)
+
+	select {
+	case <-s.pullDone:
+	default:
+		t.Fatal("pullDone not closed when unconfigured")
+	}
+	if got := len(s.agentSyncTrigger); got != 0 {
+		t.Fatalf("expected no push trigger when unconfigured, got %d", got)
+	}
+}
+
+// Fix 2: handleUpdateAgent must acquire the per-agent route lock around its file
+// mutations. Hold the lock from another goroutine and assert the update blocks
+// until released, then completes (proving it serializes on the same lock and
+// does not self-deadlock).
+func TestHandleUpdateAgent_SerializesOnRouteLock(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("old"), 0o644)
+	s := newPullServer(t, root)
+	s.deps.EventBus = NewEventBus()
+
+	routeKey := "agent:agt"
+	s.deps.SessionCache.LockRoute(routeKey)
+
+	done := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPut, "/agents/agt",
+			strings.NewReader(`{"prompt":"new prompt"}`))
+		req.SetPathValue("name", "agt")
+		w := httptest.NewRecorder()
+		s.handleUpdateAgent(w, req)
+		done <- w.Code
+	}()
+
+	// While the lock is held the update must not complete.
+	select {
+	case <-done:
+		t.Fatal("handleUpdateAgent completed while route lock was held")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	s.deps.SessionCache.UnlockRoute(routeKey)
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("update status = %d, want 200", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleUpdateAgent did not complete after lock released (deadlock?)")
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "AGENT.md")); string(got) != "new prompt" {
+		t.Errorf("prompt = %q, want %q", got, "new prompt")
+	}
+}
+
+// Fix 2: handleDeleteAgent must call Evict OUTSIDE the route lock (no
+// self-deadlock) and serialize the file removal under the lock. Holding the
+// lock blocks the removal; releasing it lets the delete complete.
+func TestHandleDeleteAgent_SerializesOnRouteLock(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("p"), 0o644)
+	s := newPullServer(t, root)
+	s.deps.EventBus = NewEventBus()
+
+	routeKey := "agent:agt"
+	s.deps.SessionCache.LockRoute(routeKey)
+
+	done := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodDelete, "/agents/agt?confirm=true", nil)
+		req.SetPathValue("name", "agt")
+		w := httptest.NewRecorder()
+		s.handleDeleteAgent(w, req)
+		done <- w.Code
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("handleDeleteAgent completed while route lock was held")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	s.deps.SessionCache.UnlockRoute(routeKey)
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("delete status = %d, want 200", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleDeleteAgent did not complete after lock released (deadlock?)")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "AGENT.md")); !os.IsNotExist(err) {
+		t.Errorf("AGENT.md still exists after delete: %v", err)
+	}
+}

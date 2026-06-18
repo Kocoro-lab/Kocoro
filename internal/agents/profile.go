@@ -142,6 +142,14 @@ func (p *AgentProfile) Validate() error {
 	if p == nil {
 		return nil
 	}
+	// Enforce the avatar URL invariant here too (not just in the HTTP handlers)
+	// so a hand-authored PROFILE.yaml with a javascript:/data:/http: avatar
+	// fails to load rather than silently syncing an unsafe URL to Cloud.
+	if p.Avatar != "" {
+		if err := ValidateAvatarURL(p.Avatar); err != nil {
+			return err
+		}
+	}
 	if len(p.Description) > 0 && !hasLocalizedText(p.Description) {
 		return fmt.Errorf("description missing text")
 	}

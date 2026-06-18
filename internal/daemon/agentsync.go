@@ -175,6 +175,31 @@ func pushAllAgents(ctx context.Context, gw *client.GatewayClient, agentsDir stri
 	return gw.SyncAgents(ctx, items, true, start)
 }
 
+// runStartupAgentSync runs the one-time startup agent pull, then unblocks the
+// agentSyncWorker (always closes pullDone) and — ONLY after a clean pull —
+// triggers exactly one full_sync push so local-wins agents (local-only /
+// locally-newer) are reconciled up to Cloud.
+//
+// pull == nil means Cloud is unconfigured: close the gate so the worker doesn't
+// hang, but do NOT trigger (a full_sync over an un-merged local set could
+// wrongly soft-delete cloud agents). On pull FAILURE the gate is still closed
+// but the trigger is likewise skipped, for the same safety reason. pullDone is
+// closed BEFORE triggering so the worker can proceed past its gate.
+func (s *Server) runStartupAgentSync(pull func() ([]client.SyncAgentItem, error)) {
+	if pull == nil {
+		close(s.pullDone)
+		return
+	}
+	pullErr := s.pullAndApplyAgents(pull)
+	if pullErr != nil {
+		log.Printf("agentsync: startup pull failed: %v", pullErr)
+	}
+	close(s.pullDone)
+	if pullErr == nil {
+		s.triggerAgentSync()
+	}
+}
+
 // pullAndApplyAgents applies the cloud agent mirror to local disk as a true
 // bidirectional last-writer-wins (LWW) reconciliation:
 //
@@ -216,13 +241,17 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 		routeKey := "agent:" + it.AgentKey
 
 		if it.DeletedAt != nil {
-			// Tombstone: mirror handleDeleteAgent. Evict the session cache
-			// BEFORE removing files so a cloud-originated delete doesn't pull
-			// AGENT.md out from under a cached route. Evict does its own
-			// per-route locking — do NOT wrap with LockRoute (self-deadlock).
+			// Tombstone: mirror handleDeleteAgent EXACTLY. Evict the session
+			// cache BEFORE removing files so a cloud-originated delete doesn't
+			// pull AGENT.md out from under a cached route. Evict does its own
+			// per-route locking — it MUST run OUTSIDE LockRoute (self-deadlock).
+			// The file removal is then serialized on the per-route lock so it
+			// can't interleave with handleCreate/Update/Delete on this agent.
 			if _, statErr := os.Stat(dir); statErr == nil {
 				s.deps.SessionCache.Evict(it.AgentKey)
+				s.deps.SessionCache.LockRoute(routeKey)
 				deleteAgentDefinitionFiles(dir)
+				s.deps.SessionCache.UnlockRoute(routeKey)
 			}
 			continue
 		}
