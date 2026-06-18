@@ -585,7 +585,7 @@ func (s *Server) Start(ctx context.Context) error {
 		pull := func() ([]client.SyncAgentItem, error) {
 			return gw.PullAgents(ctx)
 		}
-		if err := pullAndApplyAgents(pull, s.deps.AgentsDir); err != nil {
+		if err := s.pullAndApplyAgents(pull); err != nil {
 			log.Printf("agentsync: startup pull failed: %v", err)
 		}
 	}()

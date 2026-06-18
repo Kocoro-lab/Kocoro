@@ -15,6 +15,15 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
+// newPullServer builds a minimal *Server with an initialized SessionCache and
+// AgentsDir, sufficient to drive pullAndApplyAgents in tests.
+func newPullServer(t *testing.T, agentsDir string) *Server {
+	t.Helper()
+	sc := NewSessionCache(filepath.Join(agentsDir, "_sessions"))
+	t.Cleanup(func() { sc.CloseAll() })
+	return &Server{deps: &ServerDeps{AgentsDir: agentsDir, ShannonDir: agentsDir, SessionCache: sc}}
+}
+
 func TestBuildSyncItems_IncludesAvatarInProfile(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "demo")
@@ -122,7 +131,7 @@ func TestPullAndApply_FullyMaterializesMissingAgent(t *testing.T) {
 		}, nil
 	}
 
-	if err := pullAndApplyAgents(pull, root); err != nil {
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
 		t.Fatalf("pullAndApplyAgents: %v", err)
 	}
 
@@ -194,7 +203,7 @@ func TestPullAndApply_RejectsInvalidAgentKey(t *testing.T) {
 		}, nil
 	}
 
-	if err := pullAndApplyAgents(pull, root); err != nil {
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
 		t.Fatalf("pullAndApplyAgents: %v", err)
 	}
 
@@ -223,7 +232,7 @@ func TestPullAndApply_TombstoneDeletesLocalAgent(t *testing.T) {
 			{AgentKey: "victim", DeletedAt: &deleted, UpdatedAt: deleted},
 		}, nil
 	}
-	if err := pullAndApplyAgents(pull, root); err != nil {
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
 		t.Fatalf("pullAndApplyAgents: %v", err)
 	}
 
@@ -254,7 +263,7 @@ func TestPullAndApply_TombstoneMissingLocalIsNoop(t *testing.T) {
 			{AgentKey: "ghost", DeletedAt: &deleted, UpdatedAt: deleted},
 		}, nil
 	}
-	if err := pullAndApplyAgents(pull, root); err != nil {
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
 		t.Fatalf("pullAndApplyAgents: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "ghost")); !os.IsNotExist(err) {
@@ -284,7 +293,7 @@ func TestPullAndApply_CloudNewerOverwritesLocal(t *testing.T) {
 			},
 		}, nil
 	}
-	if err := pullAndApplyAgents(pull, root); err != nil {
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
 		t.Fatalf("pullAndApplyAgents: %v", err)
 	}
 
@@ -328,7 +337,7 @@ func TestPullAndApply_CloudOlderDoesNotClobber(t *testing.T) {
 			},
 		}, nil
 	}
-	if err := pullAndApplyAgents(pull, root); err != nil {
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
 		t.Fatalf("pullAndApplyAgents: %v", err)
 	}
 
@@ -353,7 +362,7 @@ func TestPullAndApply_DropsInvalidAvatarKeepsAgent(t *testing.T) {
 			},
 		}, nil
 	}
-	if err := pullAndApplyAgents(pull, root); err != nil {
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
 		t.Fatalf("pullAndApplyAgents: %v", err)
 	}
 	if _, err := agents.LoadAgent(root, "agt"); err != nil {
@@ -373,7 +382,7 @@ func TestPullAndApply_StampsMtimeOnMaterialize(t *testing.T) {
 			{AgentKey: "fresh", Prompt: "p", Profile: json.RawMessage(`{"avatar":"https://cdn/a.png"}`), UpdatedAt: cloudTS},
 		}, nil
 	}
-	if err := pullAndApplyAgents(pull, root); err != nil {
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
 		t.Fatalf("pullAndApplyAgents: %v", err)
 	}
 	if got := agentLastModified(filepath.Join(root, "fresh")).Truncate(time.Second); !got.Equal(cloudTS) {
@@ -485,5 +494,163 @@ func TestHandleUpdateAgent_RejectsBadAvatar(t *testing.T) {
 	s.handleUpdateAgent(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// Fix 1: overwriting an EXISTING agent with a NEWER cloud item whose fields were
+// CLEARED must reconcile (delete) the stale local files, not keep them.
+func TestPullAndApply_ClearedFieldsOnOverwriteRemoveStaleFiles(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("old prompt"), 0o644)
+	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("cwd: /tmp\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "MEMORY.md"), []byte("stale memory"), 0o644)
+	os.WriteFile(filepath.Join(dir, "_attached.yaml"), []byte("skills:\n  - foo\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "PROFILE.yaml"), []byte("avatar: https://cdn/old.png\n"), 0o644)
+
+	// Local is well in the past so the cloud item is strictly newer.
+	past := time.Now().Add(-1 * time.Hour).UTC()
+	stampAgentMtime(dir, past)
+
+	cloudTS := time.Now().UTC().Truncate(time.Second)
+	pull := func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{
+			{
+				AgentKey:  "agt",
+				Prompt:    "new prompt",
+				Memory:    nil,                     // cleared
+				Config:    json.RawMessage(`null`), // cleared
+				Skills:    json.RawMessage(`[]`),   // cleared
+				Profile:   json.RawMessage(`{"avatar":"https://cdn/new.png"}`),
+				UpdatedAt: cloudTS,
+			},
+		}, nil
+	}
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
+		t.Fatalf("pullAndApplyAgents: %v", err)
+	}
+
+	// Cleared fields → files removed.
+	if _, err := os.Stat(filepath.Join(dir, "config.yaml")); !os.IsNotExist(err) {
+		t.Errorf("cleared config.yaml should be removed (err=%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "MEMORY.md")); !os.IsNotExist(err) {
+		t.Errorf("cleared MEMORY.md should be removed (err=%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "_attached.yaml")); !os.IsNotExist(err) {
+		t.Errorf("cleared _attached.yaml should be removed (err=%v)", err)
+	}
+
+	// Mandatory + present fields → updated.
+	if b, _ := os.ReadFile(filepath.Join(dir, "AGENT.md")); string(b) != "new prompt" {
+		t.Errorf("AGENT.md not updated: %q", b)
+	}
+	prof, _ := agents.LoadAgentProfile(dir)
+	if prof == nil || prof.Avatar != "https://cdn/new.png" {
+		t.Errorf("PROFILE not updated: %+v", prof)
+	}
+
+	// mtime stamped to cloud timestamp (no ping-pong).
+	if got := agentLastModified(dir).Truncate(time.Second); !got.Equal(cloudTS) {
+		t.Errorf("mtime not stamped to cloud UpdatedAt: got %v want %v", got, cloudTS)
+	}
+}
+
+// Fix 1 (counterpart): a cloud-OLDER item must NOT clobber locally-newer files,
+// even with cleared fields — LWW still wins for local.
+func TestPullAndApply_ClearedFieldsCloudOlderDoesNotClobber(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("local prompt"), 0o644)
+	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("cwd: /tmp\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "MEMORY.md"), []byte("local memory"), 0o644)
+
+	now := time.Now().UTC()
+	stampAgentMtime(dir, now)
+	cloudTS := now.Add(-1 * time.Hour)
+
+	pull := func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{
+			{AgentKey: "agt", Prompt: "cloud", Config: json.RawMessage(`null`), UpdatedAt: cloudTS},
+		}, nil
+	}
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
+		t.Fatalf("pullAndApplyAgents: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err != nil {
+		t.Errorf("cloud-older clear must NOT remove locally-newer config.yaml: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "MEMORY.md")); string(b) != "local memory" {
+		t.Errorf("cloud-older clear clobbered local MEMORY.md: %q", b)
+	}
+}
+
+// Fix 1 (counterpart): when the cloud item HAS config/memory, overwrite updates
+// (does not remove) them.
+func TestPullAndApply_OverwritePreservesPresentFields(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("old"), 0o644)
+	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("cwd: /old\n"), 0o644)
+	stampAgentMtime(dir, time.Now().Add(-1*time.Hour).UTC())
+
+	cwd := t.TempDir()
+	mem := "new memory"
+	cloudTS := time.Now().UTC().Truncate(time.Second)
+	pull := func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{
+			{
+				AgentKey:  "agt",
+				Prompt:    "new",
+				Memory:    &mem,
+				Config:    json.RawMessage(`{"cwd":"` + cwd + `"}`),
+				Profile:   json.RawMessage(`{"avatar":"https://cdn/a.png"}`),
+				UpdatedAt: cloudTS,
+			},
+		}, nil
+	}
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
+		t.Fatalf("pullAndApplyAgents: %v", err)
+	}
+	a, err := agents.LoadAgent(root, "agt")
+	if err != nil {
+		t.Fatalf("load agt: %v", err)
+	}
+	if a.Config == nil || a.Config.CWD != cwd {
+		t.Errorf("present config not updated: %+v", a.Config)
+	}
+	if a.Memory != "new memory" {
+		t.Errorf("present memory not updated: %q", a.Memory)
+	}
+}
+
+// Fix 3: the tombstone pull path must Evict the session cache (like
+// handleDeleteAgent) so a cloud-originated delete doesn't pull AGENT.md out from
+// under a cached route. Observable effect: GetOrCreate returns a fresh manager.
+func TestPullAndApply_TombstoneEvictsSessionCache(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "victim")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("p"), 0o644)
+
+	s := newPullServer(t, root)
+	mgr := s.deps.SessionCache.GetOrCreate("victim")
+	if mgr == nil {
+		t.Fatal("expected a manager")
+	}
+
+	deleted := time.Now().UTC()
+	pull := func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{{AgentKey: "victim", DeletedAt: &deleted, UpdatedAt: deleted}}, nil
+	}
+	if err := s.pullAndApplyAgents(pull); err != nil {
+		t.Fatalf("pullAndApplyAgents: %v", err)
+	}
+
+	if mgr2 := s.deps.SessionCache.GetOrCreate("victim"); mgr2 == mgr {
+		t.Error("tombstone pull did not Evict the session cache (stale manager reused)")
 	}
 }

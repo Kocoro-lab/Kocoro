@@ -191,36 +191,55 @@ func pushAllAgents(ctx context.Context, gw *client.GatewayClient, agentsDir stri
 // cloud item's UpdatedAt so the next buildSyncItems reports that timestamp (not
 // "now") — without this the freshly-written agent would falsely win the next
 // LWW round and ping-pong. The pull function is injected for testability.
-func pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error), agentsDir string) error {
+//
+// Each per-agent critical section takes the SAME per-route lock the CRUD
+// handlers use, so a pull write/delete never races handleCreate/Update/Delete:
+//   - materialize/overwrite mirrors handleCreate/Update — wrapped in
+//     LockRoute/UnlockRoute("agent:"+key).
+//   - tombstone-delete mirrors handleDeleteAgent — calls SessionCache.Evict
+//     (which does its OWN per-route locking; wrapping it in LockRoute would
+//     self-deadlock on the same entry mutex) then removes the definition files.
+func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error)) error {
+	agentsDir := s.deps.AgentsDir
 	items, err := pull()
 	if err != nil {
 		return err
 	}
 	for _, it := range items {
-		// Validate the key before any path construction (path-traversal safety).
+		// Validate the key before any path construction (path-traversal safety)
+		// and before acquiring any lock.
 		if err := agents.ValidateAgentName(it.AgentKey); err != nil {
 			log.Printf("agentsync: skipping pull of %q: invalid agent key: %v", it.AgentKey, err)
 			continue
 		}
 		dir := filepath.Join(agentsDir, it.AgentKey)
-		_, statErr := os.Stat(dir)
-		existsLocally := statErr == nil
+		routeKey := "agent:" + it.AgentKey
 
 		if it.DeletedAt != nil {
-			if existsLocally {
+			// Tombstone: mirror handleDeleteAgent. Evict the session cache
+			// BEFORE removing files so a cloud-originated delete doesn't pull
+			// AGENT.md out from under a cached route. Evict does its own
+			// per-route locking — do NOT wrap with LockRoute (self-deadlock).
+			if _, statErr := os.Stat(dir); statErr == nil {
+				s.deps.SessionCache.Evict(it.AgentKey)
 				deleteAgentDefinitionFiles(dir)
 			}
 			continue
 		}
 
-		if existsLocally {
+		// Materialize/overwrite under the same per-route lock the create/update
+		// handlers take. Lock per-item (not the whole loop) to keep critical
+		// sections short.
+		s.deps.SessionCache.LockRoute(routeKey)
+		if _, statErr := os.Stat(dir); statErr == nil {
 			// LWW: only overwrite when cloud is strictly newer than local.
 			if !it.UpdatedAt.After(agentLastModified(dir)) {
+				s.deps.SessionCache.UnlockRoute(routeKey)
 				continue // local newer or equal — keep local edits.
 			}
 		}
-
 		materializeAgentFromItem(agentsDir, it)
+		s.deps.SessionCache.UnlockRoute(routeKey)
 	}
 	return nil
 }
@@ -262,8 +281,15 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
 	}
 
 	// config.yaml — decode the same AgentConfigAPI shape the create handler
-	// uses. Skip empty / JSON null / empty-object configs.
-	if len(it.Config) > 0 && !isJSONNull(it.Config) && string(it.Config) != "{}" {
+	// uses. Overwrite is authoritative (cloud is strictly newer): an empty /
+	// JSON null / empty-object config means the field was CLEARED on the
+	// originating device, so remove the local file rather than keeping a stale
+	// copy. Mirrors handleUpdateAgent's clear-on-null branch.
+	if len(it.Config) == 0 || isJSONNull(it.Config) || string(it.Config) == "{}" {
+		if err := os.Remove(filepath.Join(agentsDir, it.AgentKey, "config.yaml")); err != nil && !os.IsNotExist(err) {
+			log.Printf("agentsync: remove cleared config for %q failed: %v", it.AgentKey, err)
+		}
+	} else {
 		var cfg agents.AgentConfigAPI
 		if err := json.Unmarshal(it.Config, &cfg); err != nil {
 			log.Printf("agentsync: pull of %q: config decode (skipped): %v", it.AgentKey, err)
@@ -272,35 +298,43 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
 		}
 	}
 
-	// memory — MEMORY.md.
-	if it.Memory != nil && *it.Memory != "" {
-		if err := agents.WriteAgentMemory(agentsDir, it.AgentKey, *it.Memory); err != nil {
-			log.Printf("agentsync: write memory for %q failed: %v", it.AgentKey, err)
+	// memory — MEMORY.md. Empty/absent means the field was cleared → remove.
+	if it.Memory == nil || *it.Memory == "" {
+		if err := os.Remove(filepath.Join(agentsDir, it.AgentKey, "MEMORY.md")); err != nil && !os.IsNotExist(err) {
+			log.Printf("agentsync: remove cleared memory for %q failed: %v", it.AgentKey, err)
 		}
+	} else if err := agents.WriteAgentMemory(agentsDir, it.AgentKey, *it.Memory); err != nil {
+		log.Printf("agentsync: write memory for %q failed: %v", it.AgentKey, err)
 	}
 
 	// skills — attached-skills manifest. The blob mirrors api.Skills
 	// ([]skills.SkillMeta); SetAttachedSkills wants the slug (fallback name).
+	// An empty / JSON null / empty-array skills field means skills were cleared
+	// → SetAttachedSkills([]) removes _attached.yaml (DeleteAttachedSkills).
+	var skillNames []string
+	skillsClear := true
 	if len(it.Skills) > 0 && !isJSONNull(it.Skills) {
 		var metas []skills.SkillMeta
 		if err := json.Unmarshal(it.Skills, &metas); err != nil {
+			// Malformed-but-present skills is NOT a clear signal — leave the
+			// existing manifest untouched rather than wiping attached skills.
 			log.Printf("agentsync: pull of %q: skills decode (skipped): %v", it.AgentKey, err)
+			skillsClear = false
 		} else {
-			names := make([]string, 0, len(metas))
 			for _, m := range metas {
 				ident := m.Slug
 				if ident == "" {
 					ident = m.Name
 				}
 				if ident != "" {
-					names = append(names, ident)
+					skillNames = append(skillNames, ident)
 				}
 			}
-			if len(names) > 0 {
-				if err := agents.SetAttachedSkills(agentsDir, it.AgentKey, names); err != nil {
-					log.Printf("agentsync: write skills for %q failed: %v", it.AgentKey, err)
-				}
-			}
+		}
+	}
+	if skillsClear || len(skillNames) > 0 {
+		if err := agents.SetAttachedSkills(agentsDir, it.AgentKey, skillNames); err != nil {
+			log.Printf("agentsync: write skills for %q failed: %v", it.AgentKey, err)
 		}
 	}
 
