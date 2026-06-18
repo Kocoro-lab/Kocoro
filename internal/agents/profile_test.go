@@ -443,3 +443,29 @@ description:
 		t.Errorf("Avatar=%q, want the cdn url", p.Avatar)
 	}
 }
+
+func TestValidateAvatarURL(t *testing.T) {
+	ok := []string{
+		"",                                // empty = no avatar, allowed
+		"https://x/y.png",                 // minimal https with host
+		"https://cdn.example.com/a.png",   // typical CDN url
+	}
+	for _, u := range ok {
+		if err := ValidateAvatarURL(u); err != nil {
+			t.Errorf("ValidateAvatarURL(%q) = %v, want nil", u, err)
+		}
+	}
+	bad := []string{
+		"http://x/y.png",      // wrong scheme
+		"javascript:alert(1)", // script scheme
+		"data:image/png;base64,AAAA",
+		"https://",  // empty host
+		"https:///path",
+		"ftp://x/y",
+	}
+	for _, u := range bad {
+		if err := ValidateAvatarURL(u); err == nil {
+			t.Errorf("ValidateAvatarURL(%q) = nil, want error", u)
+		}
+	}
+}

@@ -2,12 +2,34 @@ package agents
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// ValidateAvatarURL rejects avatar URLs that are not https with a non-empty
+// host. An empty string is always allowed (= "no avatar"). The daemon has no
+// CDN config, so the bar is "parseable https URL with a host" rather than a
+// host allowlist — this blocks javascript:, data:, and bare http: payloads.
+func ValidateAvatarURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid avatar URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("avatar URL must use https scheme, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("avatar URL must have a host")
+	}
+	return nil
+}
 
 // LocalizedString is an open map of BCP-47 short locale id → translated text.
 // Keys are not validated (any string accepted); resolution-time fallback is

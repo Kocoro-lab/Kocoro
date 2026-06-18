@@ -91,6 +91,13 @@ type Server struct {
 	// single serialized, debounced full push to Cloud (agentSyncWorker). Buffered
 	// size 1: a pending trigger absorbs a burst of changes into one push.
 	agentSyncTrigger chan struct{}
+
+	// pullDone is closed by Start() once the one-time startup agent pull
+	// completes (success OR failure). agentSyncWorker blocks on it before its
+	// first push so a create/update/delete that races startup cannot trigger a
+	// full_sync over an incomplete local set (which would soft-delete
+	// not-yet-pulled cloud agents).
+	pullDone chan struct{}
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500
@@ -220,6 +227,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		suggestions:            agent.NewSuggestionState(),
 		migratePlans:           claudecode.NewPlanStore(),
 		agentSyncTrigger:       make(chan struct{}, 1),
+		pullDone:               make(chan struct{}),
 	}
 	// Wire approval bus hooks so SSE per-request brokers (which inherit from
 	// s.approvalBroker in handleMessageSSE) publish EventApprovalRequest /
@@ -563,10 +571,13 @@ func (s *Server) Start(ctx context.Context) error {
 	// Serialized, debounced worker that pushes agent changes to Cloud.
 	go s.agentSyncWorker(ctx)
 
-	// One-time agent pull on startup: materialize PROFILE.yaml (carrying the
-	// avatar) for cloud agents that are missing locally. Never clobbers local
-	// edits — existing agents are skipped. No-op when Cloud is unconfigured.
+	// One-time agent pull on startup: applies the cloud mirror to local disk
+	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
+	// tombstoned). No-op when Cloud is unconfigured. pullDone is ALWAYS closed
+	// when this finishes (success, failure, or unconfigured) so agentSyncWorker
+	// never blocks forever waiting on the gate before its first push.
 	go func() {
+		defer close(s.pullDone)
 		gw := s.cloudGateway()
 		if gw == nil {
 			return
@@ -2646,6 +2657,12 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.Avatar != "" {
+		if err := agents.ValidateAvatarURL(req.Avatar); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	// Serialize creates for the same agent name to prevent concurrent rollback races.
 	routeKey := "agent:" + req.Name
 	s.deps.SessionCache.LockRoute(routeKey)
@@ -2821,6 +2838,12 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if err := s.validateInstalledSkills(skillNamesFromRequest(req.Skills)); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if req.Avatar != nil && *req.Avatar != "" {
+		if err := agents.ValidateAvatarURL(*req.Avatar); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	// Materialize builtin AFTER validation passes — avoids orphaned override dirs on bad input.

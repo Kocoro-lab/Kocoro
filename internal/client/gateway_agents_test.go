@@ -25,7 +25,8 @@ func TestSyncAndPullAgents(t *testing.T) {
 
 	c := NewGatewayClient(srv.URL, "k-123")
 	item := SyncAgentItem{AgentKey: "demo", UpdatedAt: time.Now().UTC()}
-	if err := c.SyncAgents(context.Background(), []SyncAgentItem{item}, true); err != nil {
+	start := time.Now().UTC()
+	if err := c.SyncAgents(context.Background(), []SyncAgentItem{item}, true, start); err != nil {
 		t.Fatalf("SyncAgents: %v", err)
 	}
 	if gotMethod != http.MethodPut || gotPath != "/api/v1/agents/sync" || gotKey != "k-123" {
@@ -33,6 +34,9 @@ func TestSyncAndPullAgents(t *testing.T) {
 	}
 	if !gotBody.FullSync || len(gotBody.Agents) != 1 || gotBody.Agents[0].AgentKey != "demo" {
 		t.Fatalf("bad body: %+v", gotBody)
+	}
+	if gotBody.SyncStartedAt.IsZero() {
+		t.Fatalf("sync_started_at not sent in body: %+v", gotBody)
 	}
 	got, err := c.PullAgents(context.Background())
 	if err != nil {

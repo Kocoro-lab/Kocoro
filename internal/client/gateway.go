@@ -1747,13 +1747,17 @@ type SyncAgentItem struct {
 }
 
 type syncAgentsBody struct {
-	FullSync bool            `json:"full_sync"`
-	Agents   []SyncAgentItem `json:"agents"`
+	FullSync      bool            `json:"full_sync"`
+	SyncStartedAt time.Time       `json:"sync_started_at"`
+	Agents        []SyncAgentItem `json:"agents"`
 }
 
 // SyncAgents PUTs agents to Cloud's mirror. fullSync=true reconciles deletes.
-func (c *GatewayClient) SyncAgents(ctx context.Context, agents []SyncAgentItem, fullSync bool) error {
-	payload, err := json.Marshal(syncAgentsBody{FullSync: fullSync, Agents: agents})
+// syncStartedAt is the instant the local snapshot was taken; Cloud gates
+// full_sync soft-delete on it (only deletes agents whose cloud updated_at <=
+// syncStartedAt) so agents created on cloud after the snapshot survive.
+func (c *GatewayClient) SyncAgents(ctx context.Context, agents []SyncAgentItem, fullSync bool, syncStartedAt time.Time) error {
+	payload, err := json.Marshal(syncAgentsBody{FullSync: fullSync, SyncStartedAt: syncStartedAt, Agents: agents})
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
