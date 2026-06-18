@@ -23,6 +23,24 @@ type AgentAPI struct {
 	Builtin     bool               `json:"builtin"`            // true if agent is a bundled builtin
 	Overridden  bool               `json:"overridden"`         // true if builtin has user override
 	Warnings    []string           `json:"warnings,omitempty"` // non-fatal config advisories (e.g. heartbeat⊕schedule double-fire)
+
+	// User-facing presentation metadata loaded from PROFILE.yaml. All four are
+	// null when the agent has no PROFILE.yaml or the corresponding field is
+	// unset in it. Matches the existing memory/config null-when-absent pattern.
+	Category     *AgentCategoryAPI `json:"category"`
+	Description  LocalizedString   `json:"description"`
+	GuidePrompts []GuidePrompt     `json:"guide_prompts"`
+	Examples     []AgentExample    `json:"examples"`
+	Avatar       string            `json:"avatar"`
+}
+
+// AgentCategoryAPI is the inlined `{code, label}` shape returned by the HTTP
+// API. The daemon assembles this from PROFILE.yaml's `category` code by
+// looking up the label in the CategoryRegistry. Clients never need to know
+// the registry — they render the label directly.
+type AgentCategoryAPI struct {
+	Code  string          `json:"code"`
+	Label LocalizedString `json:"label"`
 }
 
 // AgentConfigAPI is the JSON representation of agent config.
@@ -97,7 +115,63 @@ func (a *Agent) ToAPI() *AgentAPI {
 		}
 		api.Skills = metas
 	}
+	if a.Profile != nil {
+		// Category: resolve label via the registry. LoadAgent validated the
+		// code so an unknown code here would be a registry race (re-checked).
+		if a.Profile.Category != "" {
+			if entry, err := ResolveCategory(a.Profile.Category); err == nil && entry != nil {
+				api.Category = &AgentCategoryAPI{Code: entry.Code, Label: entry.Label}
+			}
+		}
+		if len(a.Profile.Description) > 0 {
+			api.Description = a.Profile.Description
+		}
+		if len(a.Profile.GuidePrompts) > 0 {
+			api.GuidePrompts = a.Profile.GuidePrompts
+		}
+		if len(a.Profile.Examples) > 0 {
+			api.Examples = a.Profile.Examples
+		}
+		api.Avatar = a.Profile.Avatar
+	}
 	return api
+}
+
+// WriteAgentProfile writes <agentsDir>/<name>/PROFILE.yaml atomically. A nil
+// profile removes the file. Only non-empty fields are emitted so an
+// avatar-only profile stays minimal.
+func WriteAgentProfile(agentsDir, name string, profile *AgentProfile) error {
+	path := filepath.Join(agentsDir, name, "PROFILE.yaml")
+	if profile == nil {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Join(agentsDir, name), 0o700); err != nil {
+		return err
+	}
+	m := map[string]interface{}{}
+	if profile.Category != "" {
+		m["category"] = profile.Category
+	}
+	if profile.Avatar != "" {
+		m["avatar"] = profile.Avatar
+	}
+	if len(profile.Description) > 0 {
+		m["description"] = profile.Description
+	}
+	if len(profile.GuidePrompts) > 0 {
+		m["guide_prompts"] = profile.GuidePrompts
+	}
+	if len(profile.Examples) > 0 {
+		m["examples"] = profile.Examples
+	}
+	data, err := yaml.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("marshal profile: %w", err)
+	}
+	return AtomicWrite(path, data)
 }
 
 // WriteAgentPrompt writes AGENT.md atomically.
@@ -343,6 +417,7 @@ type AgentCreateRequest struct {
 	Config      *AgentConfigAPI   `json:"config,omitempty"`
 	Commands    map[string]string `json:"commands,omitempty"`
 	Skills      []*skills.Skill   `json:"skills,omitempty"`
+	Avatar      string            `json:"avatar,omitempty"`
 }
 
 // Validate checks required fields and runs all validators. It trims DisplayName
@@ -401,4 +476,5 @@ type AgentUpdateRequest struct {
 	Config      json.RawMessage   `json:"config,omitempty"`       // object or null
 	Commands    map[string]string `json:"commands,omitempty"`
 	Skills      []*skills.Skill   `json:"skills,omitempty"`
+	Avatar      *string           `json:"avatar,omitempty"` // nil = unchanged, "" = clear
 }

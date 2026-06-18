@@ -149,6 +149,7 @@ type Agent struct {
 	Config   *AgentConfig      // nil = inherit everything (backwards-compatible)
 	Commands map[string]string // agent-scoped slash commands (name → content)
 	Skills   []*skills.Skill   // agent-scoped skills (prompt, tool_chain, sub_agent)
+	Profile  *AgentProfile     // optional user-facing presentation metadata (PROFILE.yaml)
 }
 
 func ValidateAgentName(name string) error {
@@ -264,6 +265,21 @@ func LoadAgent(agentsDir, name string) (*Agent, error) {
 
 	// Load agent-scoped commands (optional)
 	ag.Commands = loadAgentCommands(filepath.Join(dir, "commands"))
+
+	// Load user-facing presentation profile (optional). Validate the category
+	// code against the registry now so a typo in PROFILE.yaml fails loud at
+	// load time rather than producing a silently-dropped category field in
+	// the API response.
+	profile, err := LoadAgentProfile(dir)
+	if err != nil {
+		return nil, fmt.Errorf("agent %q: %w", name, err)
+	}
+	if profile != nil && profile.Category != "" {
+		if _, err := ResolveCategory(profile.Category); err != nil {
+			return nil, fmt.Errorf("agent %q: PROFILE.yaml: %w", name, err)
+		}
+	}
+	ag.Profile = profile
 
 	// Load skills from _attached.yaml manifest
 	shannonDir := filepath.Dir(agentsDir)

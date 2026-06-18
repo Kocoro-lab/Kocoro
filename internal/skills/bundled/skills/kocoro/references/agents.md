@@ -15,8 +15,16 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 ### Get agent details
 - Method: GET
 - Path: /agents/{name}
-- Response: `{"name": "string", "display_name": "string", "prompt": "string", "config": {...}, "skills": [...], "commands": [...]}`
-- Notes: `display_name` falls back to the slug when not explicitly set.
+- Response: `{"name": "string", "display_name": "string", "prompt": "string", "config": {...}, "skills": [...], "commands": [...], "category": {...}|null, "description": {...}|null, "guide_prompts": [...]|null, "examples": [...]|null}`
+- Notes:
+  - `display_name` falls back to the slug when not explicitly set.
+  - **Presentation metadata** (`category`, `description`, `guide_prompts`, `examples`) is populated when the agent ships a `PROFILE.yaml`; otherwise all four are `null`. Today only builtin agents (`explorer`, `reviewer`) carry profile data. All four fields are read-only — there is no write endpoint for them in v1. Wire shape:
+    - `category`: `{"code": "coding", "label": {"en": "Coding", "zh-Hans": "编程", "ja": "コーディング"}}`. `code` is a slug from the global category registry; `label` is the daemon-inlined three-language display name. Unknown codes never appear in responses — `LoadAgent` fails loud at load time if a `PROFILE.yaml` references an unregistered code.
+    - `description`: a `LocalizedString` map (`{"en": "...", "zh-Hans": "...", "ja": "..."}`). Plain text, not markdown.
+    - `guide_prompts`: array of `{"title": LocalizedString, "prompt": LocalizedString}` — clickable starter cards.
+    - `examples`: array of multi-turn dialogues. Each example has optional `title` (`LocalizedString`) and a `turns` array. Each turn has `role: "user"|"assistant"` and either `text` (user) or `markdown` + optional `tool_runs` (assistant). `tool_runs` is `[{"tool": "grep", "summary": LocalizedString}]` — compact chips, not full tool cards.
+  - `LocalizedString` is an open `{locale_code: string}` map. Keys are BCP-47 short ids (`en`, `ja`, `zh-Hans`, `zh-Hant`, …). Clients fall back: current locale → primary language → `en` → first non-empty.
+  - Capability gate: Desktop should show the richer profile UI only when `/status.capabilities` includes `agent_profile_v1`.
 
 ### Create agent
 - Method: POST
@@ -38,6 +46,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
     | `display_name_invalid_chars` | 400 | contains a control character |
     | `display_name_taken` | 409 | duplicate (case-folded, trimmed) |
   - To customize a built-in agent (`explorer` / `reviewer`), use `PUT /agents/{name}` against its slug — POST always creates a brand-new agent under a fresh auto-slug.
+  - `avatar` is **optional** — the agent's avatar image URL, stored in `PROFILE.yaml` and synced to Cloud. Must be an `https://` CDN URL with a host; any other scheme (`http://`, `javascript:`, `data:`) returns `400`. Omit / send `""` for no avatar. Avatar editing is gated on the daemon advertising `agent_avatar_v1` in `/status.capabilities` — Desktop should expose the avatar field only when that capability is present.
 
 ### Update agent prompt / instructions
 - Method: PUT
@@ -50,6 +59,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
   - `display_name` can **only** be set/changed via this top-level field (which is uniqueness-checked). A `display_name` nested inside the `config` object is silently ignored.
   - Renaming to a `display_name` already used by another agent returns `409` with `{"error": "...", "code": "display_name_taken"}`. Renaming to the agent's own current `display_name` is a no-op success.
   - display_name errors carry the same `code` table as `POST /agents` above (`display_name_required` 400, `display_name_too_long` 400, `display_name_invalid_chars` 400, `display_name_taken` 409). `error` is a non-localized fallback; clients localize by `code`.
+  - `avatar` is optional (omit = unchanged). Sending an `https://` CDN URL sets it; sending `""` clears it. Non-`https` values (`http://`, `javascript:`, `data:`) return `400`. Avatar editing is gated on the daemon advertising `agent_avatar_v1` in `/status.capabilities`.
 
 ### Delete agent
 - Method: DELETE

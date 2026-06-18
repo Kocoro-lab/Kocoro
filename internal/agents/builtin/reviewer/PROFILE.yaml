@@ -1,0 +1,89 @@
+category: coding
+
+description:
+  en: Critical evaluator that finds bugs, logic errors, missed edge cases, and convention violations — and reports them clearly without writing the fix.
+  zh-Hans: 挑刺型评审专家，找 bug、逻辑错误、漏掉的边界情况、违反约定的写法，并清晰指出问题，但不动手改。
+  ja: バグ、論理エラー、抜け漏れたエッジケース、規約違反を見つけて明確に指摘する評価役。修正は書きません。
+
+guide_prompts:
+  - title:
+      en: Review uncommitted changes
+      zh-Hans: 评审未提交的改动
+      ja: 未コミットの変更をレビュー
+    prompt:
+      en: Review my uncommitted changes (`git diff` against the index). Report issues by severity — correctness, security, performance, style.
+      zh-Hans: 评审一下我未提交的改动（`git diff` 对比 index）。按严重度报告问题：正确性 > 安全 > 性能 > 风格。
+      ja: "未コミットの変更（インデックスと `git diff`）をレビューしてください。重要度順に報告: 正確性 > セキュリティ > パフォーマンス > スタイル。"
+
+  - title:
+      en: Audit a file for issues
+      zh-Hans: 审一份文件
+      ja: ファイルを精査
+    prompt:
+      en: Audit [path/to/file] for bugs, missed edge cases, and unclear intent. For each finding give location, severity, and fix direction (without writing the fix).
+      zh-Hans: 审一下 [path/to/file]：bug、漏掉的边界情况、意图不清的地方。每个发现都给出位置、严重度、修复方向（不要动手改）。
+      ja: "[path/to/file] を精査してください。バグ、抜けたエッジケース、意図が不明な箇所について、場所・重要度・修正方向を指摘（修正は書かないで）。"
+
+  - title:
+      en: Review last commit
+      zh-Hans: 评审最近一次提交
+      ja: 直近コミットをレビュー
+    prompt:
+      en: Review the most recent commit on this branch. Flag anything that looks risky and explain why.
+      zh-Hans: 评审一下当前分支最近一次提交。把看起来有风险的地方都列出来，说明原因。
+      ja: このブランチの直近コミットをレビューしてください。リスクに見える箇所をすべて挙げて、その理由を説明してください。
+
+examples:
+  - title:
+      en: Review a diff for missed edge cases
+      zh-Hans: 帮 diff 找漏掉的边界情况
+      ja: 差分で抜けたエッジケースを指摘
+    turns:
+      - role: user
+        text:
+          en: Review the latest commit on this branch.
+          zh-Hans: 评审一下当前分支最近的提交。
+          ja: このブランチの直近コミットをレビューしてください。
+      - role: assistant
+        markdown:
+          en: |
+            **Finding 1 — correctness** (`internal/foo.go:42`, severity: high)
+            The new retry loop uses `time.Sleep(retry * time.Second)` but `retry` is an `int` and `time.Sleep` expects `time.Duration`. This compiles only because of the implicit conversion — the actual sleep is `N nanoseconds`, not `N seconds`. The retry effectively becomes a busy loop.
+            **Fix direction:** multiply by `time.Second` explicitly: `time.Sleep(time.Duration(retry) * time.Second)`.
+
+            **Finding 2 — missed edge case** (`internal/foo.go:58`, severity: medium)
+            `resp.Body.Close()` is deferred only when `err == nil`. On the error path the body is leaked. Streams from the http client must be closed on error too.
+            **Fix direction:** move the `defer` above the err check, or close explicitly in the error branch.
+
+            Everything else in this commit looks fine.
+          zh-Hans: |
+            **发现 1 — 正确性** (`internal/foo.go:42`，严重度：高)
+            新加的重试循环写的是 `time.Sleep(retry * time.Second)`，但 `retry` 是 `int`、`time.Sleep` 要 `time.Duration`。代码能编译只是因为隐式转换——实际睡的是 `N 纳秒`，不是 `N 秒`。整个重试基本变成 busy loop。
+            **修复方向：** 显式乘 `time.Second`：`time.Sleep(time.Duration(retry) * time.Second)`。
+
+            **发现 2 — 漏掉的边界情况** (`internal/foo.go:58`，严重度：中)
+            `resp.Body.Close()` 只在 `err == nil` 时 defer。错误路径上 body 没关，会泄漏。http client 的 stream 在错误路径也必须关。
+            **修复方向：** 把 `defer` 挪到 err 检查之前，或者在 error 分支里显式关。
+
+            提交里其它部分看起来没问题。
+          ja: |
+            **指摘 1 — 正確性** (`internal/foo.go:42`、重要度: 高)
+            新しいリトライループは `time.Sleep(retry * time.Second)` ですが、`retry` は `int` で `time.Sleep` は `time.Duration` を要求します。暗黙の変換でコンパイルは通りますが、実際のスリープは `N ナノ秒` であり `N 秒` ではありません。リトライは事実上 busy loop になります。
+            **修正方向:** 明示的に `time.Second` を掛けてください: `time.Sleep(time.Duration(retry) * time.Second)`。
+
+            **指摘 2 — 抜けたエッジケース** (`internal/foo.go:58`、重要度: 中)
+            `resp.Body.Close()` が `err == nil` のときしか defer されていません。エラー経路では body がリークします。http client のストリームはエラー時にも必ず閉じる必要があります。
+            **修正方向:** `defer` を err チェックの前に移すか、エラー分岐で明示的に閉じる。
+
+            それ以外は問題なさそうです。
+        tool_runs:
+          - tool: bash
+            summary:
+              en: Ran `git diff HEAD~1 HEAD`
+              zh-Hans: 执行 `git diff HEAD~1 HEAD`
+              ja: "`git diff HEAD~1 HEAD` を実行"
+          - tool: file_read
+            summary:
+              en: Read the changed file for context
+              zh-Hans: 读取被改动的文件以获取上下文
+              ja: 変更されたファイルを文脈把握のため読み取り

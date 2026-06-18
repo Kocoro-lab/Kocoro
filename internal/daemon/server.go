@@ -86,6 +86,18 @@ type Server struct {
 	// 404 is the legitimate "task expired" response in that case.
 	shareTasksMu sync.RWMutex
 	shareTasks   map[string]*shareTaskState
+
+	// agentSyncTrigger coalesces agent create/update/delete notifications into a
+	// single serialized, debounced full push to Cloud (agentSyncWorker). Buffered
+	// size 1: a pending trigger absorbs a burst of changes into one push.
+	agentSyncTrigger chan struct{}
+
+	// pullDone is closed by Start() once the one-time startup agent pull
+	// completes (success OR failure). agentSyncWorker blocks on it before its
+	// first push so a create/update/delete that races startup cannot trigger a
+	// full_sync over an incomplete local set (which would soft-delete
+	// not-yet-pulled cloud agents).
+	pullDone chan struct{}
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500
@@ -214,6 +226,8 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		secretsStore:           store,
 		suggestions:            agent.NewSuggestionState(),
 		migratePlans:           claudecode.NewPlanStore(),
+		agentSyncTrigger:       make(chan struct{}, 1),
+		pullDone:               make(chan struct{}),
 	}
 	// Wire approval bus hooks so SSE per-request brokers (which inherit from
 	// s.approvalBroker in handleMessageSSE) publish EventApprovalRequest /
@@ -553,6 +567,25 @@ func (s *Server) Start(ctx context.Context) error {
 	// Spawn the gated session-sync ticker. It self-disables when sync is
 	// not enabled, so it's always safe to start unconditionally here.
 	go s.runSyncLoop(ctx)
+
+	// Serialized, debounced worker that pushes agent changes to Cloud.
+	go s.agentSyncWorker(ctx)
+
+	// One-time agent pull on startup: applies the cloud mirror to local disk
+	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
+	// tombstoned). No-op when Cloud is unconfigured. pullDone is ALWAYS closed
+	// when this finishes (success, failure, or unconfigured) so agentSyncWorker
+	// never blocks forever waiting on the gate before its first push.
+	go func() {
+		gw := s.cloudGateway()
+		if gw == nil {
+			s.runStartupAgentSync(nil) // unconfigured
+			return
+		}
+		s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
+			return gw.PullAgents(ctx)
+		})
+	}()
 
 	// Memory feature (Phase 2.3). Service is constructed once and Start runs
 	// the cold-path gates synchronously then spawns the supervisor goroutine.
@@ -2621,6 +2654,12 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.Avatar != "" {
+		if err := agents.ValidateAvatarURL(req.Avatar); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	// Serialize creates for the same agent name to prevent concurrent rollback races.
 	routeKey := "agent:" + req.Name
 	s.deps.SessionCache.LockRoute(routeKey)
@@ -2672,6 +2711,13 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.Avatar != "" {
+		if err := agents.WriteAgentProfile(s.deps.AgentsDir, req.Name, &agents.AgentProfile{Avatar: req.Avatar}); err != nil {
+			rollback()
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write profile: %v", err))
+			return
+		}
+	}
 	a, err := agents.LoadAgent(s.deps.AgentsDir, req.Name)
 	if err != nil {
 		rollback()
@@ -2679,6 +2725,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditHTTPOp("POST", "/agents", "created agent "+req.Name)
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusCreated, a.ToAPI())
 }
 
@@ -2789,6 +2836,22 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.Avatar != nil && *req.Avatar != "" {
+		if err := agents.ValidateAvatarURL(*req.Avatar); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	// Serialize all file mutations for this agent on the same per-route lock the
+	// create/delete handlers and the startup pull use, so an async pull can't
+	// interleave with this update and produce mixed file state / a lost update.
+	// Acquired AFTER validation (cheap, no file writes) and held through the
+	// final LoadAgent. Evict is never called inside this lock (no Evict on the
+	// update path), so there is no self-deadlock risk.
+	routeKey := "agent:" + name
+	s.deps.SessionCache.LockRoute(routeKey)
+	defer s.deps.SessionCache.UnlockRoute(routeKey)
 
 	// Materialize builtin AFTER validation passes — avoids orphaned override dirs on bad input.
 	if !s.materializeIfBuiltin(w, name) {
@@ -2858,11 +2921,27 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		agentSkillsDir := filepath.Join(s.deps.AgentsDir, name, "skills")
 		_ = os.RemoveAll(agentSkillsDir)
 	}
+	if req.Avatar != nil {
+		cur, lerr := agents.LoadAgentProfile(agentDir)
+		if lerr != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("load profile: %v", lerr))
+			return
+		}
+		if cur == nil {
+			cur = &agents.AgentProfile{}
+		}
+		cur.Avatar = *req.Avatar
+		if err := agents.WriteAgentProfile(s.deps.AgentsDir, name, cur); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write profile: %v", err))
+			return
+		}
+	}
 	a, err := agents.LoadAgent(s.deps.AgentsDir, name)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, a.ToAPI())
 }
 
@@ -2893,12 +2972,16 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	// Evict handles its own per-route locking — do NOT wrap with Lock/Unlock
 	// (that would self-deadlock since Evict calls evictRoute which acquires entry.mu).
+	// It MUST therefore run OUTSIDE the route lock below.
 	s.deps.SessionCache.Evict(name)
 	// Remove only definition files — preserve runtime state (MEMORY.md, sessions/)
-	// so the builtin can resurface with existing history intact.
+	// so the builtin can resurface with existing history intact. Serialize the
+	// file removal on the per-route lock so an async pull can't interleave.
 	agentDir := filepath.Join(s.deps.AgentsDir, name)
+	routeKey := "agent:" + name
+	s.deps.SessionCache.LockRoute(routeKey)
 	var errs []string
-	for _, f := range []string{"AGENT.md", "config.yaml", "_attached.yaml"} {
+	for _, f := range []string{"AGENT.md", "config.yaml", "_attached.yaml", "PROFILE.yaml"} {
 		p := filepath.Join(agentDir, f)
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err.Error())
@@ -2910,15 +2993,17 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 			errs = append(errs, err.Error())
 		}
 	}
+	// Clean up empty dir if no runtime state remains (still under the lock).
+	if entries, err := os.ReadDir(agentDir); err == nil && len(entries) == 0 {
+		os.Remove(agentDir)
+	}
+	s.deps.SessionCache.UnlockRoute(routeKey)
 	if len(errs) > 0 {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("partial delete: %s", strings.Join(errs, "; ")))
 		return
 	}
-	// Clean up empty dir if no runtime state remains
-	if entries, err := os.ReadDir(agentDir); err == nil && len(entries) == 0 {
-		os.Remove(agentDir)
-	}
 	s.auditHTTPOp("DELETE", "/agents/"+name, "deleted agent")
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -5110,6 +5195,23 @@ func (s *Server) runSyncLoop(ctx context.Context) {
 			tick()
 		}
 	}
+}
+
+// cloudGateway returns the live Cloud gateway client when Cloud is usable,
+// else nil. It reuses s.deps.GW (whose API key is hot-swapped on login via
+// SetAPIKey) rather than constructing a new client from viper, which holds a
+// stale/empty key after a runtime login on macOS (the key lives in the
+// keychain; viper's copy is blanked by config.Save). The "usable" predicate
+// mirrors the sibling cloud features (uploads / share / feishu install).
+func (s *Server) cloudGateway() *client.GatewayClient {
+	if s == nil || s.deps == nil {
+		return nil
+	}
+	cfg, _, _ := s.deps.Snapshot()
+	if cfg == nil || !cfg.Cloud.Enabled || s.liveAPIKey(cfg) == "" || s.deps.GW == nil {
+		return nil
+	}
+	return s.deps.GW
 }
 
 // buildSyncDeps returns ok=false if the config is incomplete (missing

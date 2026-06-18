@@ -585,3 +585,185 @@ func TestWireFixture_HTTPAgents(t *testing.T) {
 		t.Fatalf("consumer decode (detail) lost fields: %+v", detail)
 	}
 }
+
+// TestWireFixture_HTTPAgentDetailWithProfile pins the shape of GET
+// /agents/{name} when the agent has a populated PROFILE.yaml. Covers all four
+// new fields (category, description, guide_prompts, examples), the nested
+// {code, label} category shape, and the ExampleTurn omitempty rules (user
+// turns omit `markdown`/`tool_runs`, assistant turns omit `text`).
+func TestWireFixture_HTTPAgentDetailWithProfile(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.agent_detail.with_profile.response.json")
+
+	agentsDir := t.TempDir()
+	agentDir := filepath.Join(agentsDir, "profile-demo")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prompt := fixture["prompt"].(string)
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte(prompt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// PROFILE.yaml must produce the exact JSON shape in the fixture. Any
+	// drift here is a wire-contract change that breaks the Desktop side too —
+	// the fixture is the single source of truth.
+	profileYAML := `category: coding
+description:
+  en: A demo agent used by wire-fixture tests.
+  zh-Hans: 用于线路 fixture 测试的演示智能体。
+  ja: ワイヤフィクスチャテスト用のデモエージェント。
+guide_prompts:
+  - title:
+      en: Find auth code
+      zh-Hans: 找认证代码
+      ja: 認証コードを探す
+    prompt:
+      en: Where is the authentication logic?
+      zh-Hans: 认证逻辑在哪里？
+      ja: 認証ロジックはどこ？
+examples:
+  - title:
+      en: Sample dialog
+      zh-Hans: 示例对话
+      ja: サンプル対話
+    turns:
+      - role: user
+        text:
+          en: Hi.
+          zh-Hans: 你好。
+          ja: こんにちは。
+      - role: assistant
+        markdown:
+          en: Hello! Let me look around.
+          zh-Hans: 你好！让我看一下。
+          ja: こんにちは！見てみます。
+        tool_runs:
+          - tool: grep
+            summary:
+              en: Searched src/ for entry points
+              zh-Hans: 在 src/ 搜索入口点
+              ja: src/ でエントリーポイントを検索
+`
+	if err := os.WriteFile(filepath.Join(agentDir, "PROFILE.yaml"), []byte(profileYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := &ServerDeps{AgentsDir: agentsDir, ShannonDir: t.TempDir()}
+	srv := NewServer(0, nil, deps, "test")
+	handler := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/agents/profile-demo", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /agents/profile-demo = %d, body %s", rec.Code, rec.Body.String())
+	}
+	assertSemanticEqual(t, fixture, parseJSONMap(t, rec.Body.Bytes()))
+
+	// Consumer-shaped decode: pin the field path Desktop will hit. category
+	// is a nested object with {code, label}; description / guide_prompts /
+	// examples decode into client-shaped structs without losing locale keys.
+	var detail struct {
+		Name     string `json:"name"`
+		Category *struct {
+			Code  string            `json:"code"`
+			Label map[string]string `json:"label"`
+		} `json:"category"`
+		Description  map[string]string `json:"description"`
+		GuidePrompts []struct {
+			Title  map[string]string `json:"title"`
+			Prompt map[string]string `json:"prompt"`
+		} `json:"guide_prompts"`
+		Examples []struct {
+			Title map[string]string `json:"title"`
+			Turns []struct {
+				Role     string            `json:"role"`
+				Text     map[string]string `json:"text"`
+				Markdown map[string]string `json:"markdown"`
+				ToolRuns []struct {
+					Tool    string            `json:"tool"`
+					Summary map[string]string `json:"summary"`
+				} `json:"tool_runs"`
+			} `json:"turns"`
+		} `json:"examples"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if detail.Category == nil || detail.Category.Code != "coding" {
+		t.Fatalf("category lost: %+v", detail.Category)
+	}
+	if detail.Category.Label["ja"] != "コーディング" {
+		t.Errorf("category.label.ja=%q", detail.Category.Label["ja"])
+	}
+	if detail.Description["zh-Hans"] == "" {
+		t.Errorf("description.zh-Hans empty")
+	}
+	if len(detail.GuidePrompts) != 1 || detail.GuidePrompts[0].Title["en"] != "Find auth code" {
+		t.Errorf("guide_prompts decode: %+v", detail.GuidePrompts)
+	}
+	if len(detail.Examples) != 1 {
+		t.Fatalf("examples len=%d", len(detail.Examples))
+	}
+	turns := detail.Examples[0].Turns
+	if len(turns) != 2 {
+		t.Fatalf("turns len=%d", len(turns))
+	}
+	if turns[0].Role != "user" || turns[0].Text["en"] != "Hi." {
+		t.Errorf("turn 0: %+v", turns[0])
+	}
+	if turns[1].Role != "assistant" || turns[1].Markdown["en"] == "" {
+		t.Errorf("turn 1 markdown: %+v", turns[1])
+	}
+	if len(turns[1].ToolRuns) != 1 || turns[1].ToolRuns[0].Tool != "grep" {
+		t.Errorf("turn 1 tool_runs: %+v", turns[1].ToolRuns)
+	}
+}
+
+// TestWireFixture_HTTPAgentDetailWithAvatar pins the shape of GET
+// /agents/{name} when the agent has a PROFILE.yaml containing only avatar and
+// category (minimal profile). Verifies that avatar is propagated through
+// LoadAgent → ToAPI() → HTTP response and matches the committed fixture.
+func TestWireFixture_HTTPAgentDetailWithAvatar(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.agent_detail.with_avatar.response.json")
+
+	agentsDir := t.TempDir()
+	agentDir := filepath.Join(agentsDir, "avatar-demo")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prompt := fixture["prompt"].(string)
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte(prompt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	profileYAML := `category: coding
+avatar: https://cdn.example.com/a.png
+description:
+  en: Demo
+`
+	if err := os.WriteFile(filepath.Join(agentDir, "PROFILE.yaml"), []byte(profileYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := &ServerDeps{AgentsDir: agentsDir, ShannonDir: t.TempDir()}
+	srv := NewServer(0, nil, deps, "test")
+	handler := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/agents/avatar-demo", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /agents/avatar-demo = %d, body %s", rec.Code, rec.Body.String())
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	assertSemanticEqual(t, fixture, produced)
+
+	// Consumer-shaped decode: pin that avatar reaches Desktop as a string.
+	var detail struct {
+		Name   string `json:"name"`
+		Avatar string `json:"avatar"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if detail.Avatar != "https://cdn.example.com/a.png" {
+		t.Fatalf("avatar=%q, want cdn url", detail.Avatar)
+	}
+}

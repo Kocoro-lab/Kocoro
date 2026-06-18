@@ -7,5 +7,10 @@
   "commands": null,
   "skills": null,
   "builtin": false,
-  "overridden": false
+  "overridden": false,
+  "category": null,
+  "description": null,
+  "guide_prompts": null,
+  "examples": null,
+  "avatar": ""
 }
