@@ -41,6 +41,57 @@ func TestBuildSyncItems_IncludesAvatarInProfile(t *testing.T) {
 	}
 }
 
+func TestBuildSyncItems_SkipsPureBuiltins(t *testing.T) {
+	root := t.TempDir()
+
+	// User agent: directly under root -> Builtin=false -> synced.
+	user := filepath.Join(root, "myagent")
+	os.MkdirAll(user, 0o755)
+	os.WriteFile(filepath.Join(user, "AGENT.md"), []byte("user prompt"), 0o644)
+
+	// Pure builtin: lives under _builtin and is NOT overridden -> skipped.
+	builtin := filepath.Join(root, "_builtin", "builtinagent")
+	os.MkdirAll(builtin, 0o755)
+	os.WriteFile(filepath.Join(builtin, "AGENT.md"), []byte("builtin prompt"), 0o644)
+
+	items, err := buildSyncItems(root)
+	if err != nil {
+		t.Fatalf("buildSyncItems: %v", err)
+	}
+	keys := make(map[string]bool, len(items))
+	for _, it := range items {
+		keys[it.AgentKey] = true
+	}
+	if !keys["myagent"] {
+		t.Errorf("user agent should be synced, got items %v", keys)
+	}
+	if keys["builtinagent"] {
+		t.Errorf("pure builtin must NOT be synced, got items %v", keys)
+	}
+}
+
+func TestTriggerAgentSync_CoalescesWithoutBlocking(t *testing.T) {
+	s := &Server{agentSyncTrigger: make(chan struct{}, 1)}
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			s.triggerAgentSync()
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("triggerAgentSync blocked on a full buffer")
+	}
+
+	if got := len(s.agentSyncTrigger); got != 1 {
+		t.Errorf("expected exactly 1 pending trigger, got %d", got)
+	}
+}
+
 func TestPullAndApply_MaterializesMissingProfileOnly(t *testing.T) {
 	root := t.TempDir()
 

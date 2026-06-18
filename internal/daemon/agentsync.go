@@ -6,10 +6,49 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
+
+// agentSyncWorker coalesces agent-change notifications into serialized,
+// debounced full pushes to Cloud. One push at a time, latest state wins.
+func (s *Server) agentSyncWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.agentSyncTrigger:
+			// debounce: collect a burst of changes into one push
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			// drain any extra triggers that arrived during the debounce
+			select {
+			case <-s.agentSyncTrigger:
+			default:
+			}
+			if gw := s.cloudGateway(); gw != nil {
+				if err := pushAllAgents(ctx, gw, s.deps.AgentsDir); err != nil {
+					log.Printf("agentsync: push failed: %v", err)
+				}
+			}
+		}
+	}
+}
+
+// triggerAgentSync requests a coalesced push from agentSyncWorker. Non-blocking:
+// if a push is already pending, the trigger is dropped (the pending push will
+// pick up the latest state).
+func (s *Server) triggerAgentSync() {
+	select {
+	case s.agentSyncTrigger <- struct{}{}:
+	default: // a push is already pending; coalesced
+	}
+}
 
 // agentProfileBlob is the JSON shape carried in SyncAgentItem.Profile. It packs
 // the user-facing presentation metadata (incl. avatar) so the avatar rides
@@ -34,6 +73,12 @@ func buildSyncItems(agentsDir string) ([]client.SyncAgentItem, error) {
 	}
 	items := make([]client.SyncAgentItem, 0, len(entries))
 	for _, e := range entries {
+		// Only sync user-defined agents (and user-overridden builtins, which
+		// carry user edits). Pure builtins live in the app bundle and must not
+		// be pushed to Cloud.
+		if e.Builtin && !e.Override {
+			continue
+		}
 		a, err := agents.LoadAgent(agentsDir, e.Name)
 		if err != nil {
 			log.Printf("agentsync: skipping agent %q: load failed: %v", e.Name, err)

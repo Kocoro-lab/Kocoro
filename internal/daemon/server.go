@@ -86,6 +86,11 @@ type Server struct {
 	// 404 is the legitimate "task expired" response in that case.
 	shareTasksMu sync.RWMutex
 	shareTasks   map[string]*shareTaskState
+
+	// agentSyncTrigger coalesces agent create/update/delete notifications into a
+	// single serialized, debounced full push to Cloud (agentSyncWorker). Buffered
+	// size 1: a pending trigger absorbs a burst of changes into one push.
+	agentSyncTrigger chan struct{}
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500
@@ -214,6 +219,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		secretsStore:           store,
 		suggestions:            agent.NewSuggestionState(),
 		migratePlans:           claudecode.NewPlanStore(),
+		agentSyncTrigger:       make(chan struct{}, 1),
 	}
 	// Wire approval bus hooks so SSE per-request brokers (which inherit from
 	// s.approvalBroker in handleMessageSSE) publish EventApprovalRequest /
@@ -553,6 +559,9 @@ func (s *Server) Start(ctx context.Context) error {
 	// Spawn the gated session-sync ticker. It self-disables when sync is
 	// not enabled, so it's always safe to start unconditionally here.
 	go s.runSyncLoop(ctx)
+
+	// Serialized, debounced worker that pushes agent changes to Cloud.
+	go s.agentSyncWorker(ctx)
 
 	// One-time agent pull on startup: materialize PROFILE.yaml (carrying the
 	// avatar) for cloud agents that are missing locally. Never clobbers local
@@ -2702,13 +2711,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditHTTPOp("POST", "/agents", "created agent "+req.Name)
-	if gw := s.cloudGateway(); gw != nil {
-		go func() {
-			if err := pushAllAgents(context.Background(), gw, s.deps.AgentsDir); err != nil {
-				log.Printf("agentsync: push after agent change failed: %v", err)
-			}
-		}()
-	}
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusCreated, a.ToAPI())
 }
 
@@ -2904,13 +2907,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if gw := s.cloudGateway(); gw != nil {
-		go func() {
-			if err := pushAllAgents(context.Background(), gw, s.deps.AgentsDir); err != nil {
-				log.Printf("agentsync: push after agent change failed: %v", err)
-			}
-		}()
-	}
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, a.ToAPI())
 }
 
@@ -2967,13 +2964,7 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		os.Remove(agentDir)
 	}
 	s.auditHTTPOp("DELETE", "/agents/"+name, "deleted agent")
-	if gw := s.cloudGateway(); gw != nil {
-		go func() {
-			if err := pushAllAgents(context.Background(), gw, s.deps.AgentsDir); err != nil {
-				log.Printf("agentsync: push after agent change failed: %v", err)
-			}
-		}()
-	}
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -5167,17 +5158,21 @@ func (s *Server) runSyncLoop(ctx context.Context) {
 	}
 }
 
-// cloudGateway lazily constructs a Cloud gateway client from the same viper
-// keys buildSyncDeps uses (sync.endpoint > cloud.endpoint, cloud.api_key).
-// Returns nil when either the endpoint or the api key is unconfigured, so
-// callers can cheaply skip cloud pushes when Cloud is not set up.
+// cloudGateway returns the live Cloud gateway client when Cloud is usable,
+// else nil. It reuses s.deps.GW (whose API key is hot-swapped on login via
+// SetAPIKey) rather than constructing a new client from viper, which holds a
+// stale/empty key after a runtime login on macOS (the key lives in the
+// keychain; viper's copy is blanked by config.Save). The "usable" predicate
+// mirrors the sibling cloud features (uploads / share / feishu install).
 func (s *Server) cloudGateway() *client.GatewayClient {
-	endpoint := syncpkg.ResolveEndpoint(syncpkg.LoadConfig(viper.GetViper()), viper.GetViper())
-	apiKey := viper.GetString("cloud.api_key")
-	if endpoint == "" || apiKey == "" {
+	if s == nil || s.deps == nil {
 		return nil
 	}
-	return client.NewGatewayClient(endpoint, apiKey)
+	cfg, _, _ := s.deps.Snapshot()
+	if cfg == nil || !cfg.Cloud.Enabled || s.liveAPIKey(cfg) == "" || s.deps.GW == nil {
+		return nil
+	}
+	return s.deps.GW
 }
 
 // buildSyncDeps returns ok=false if the config is incomplete (missing
