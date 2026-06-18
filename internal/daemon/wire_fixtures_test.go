@@ -717,3 +717,53 @@ examples:
 		t.Errorf("turn 1 tool_runs: %+v", turns[1].ToolRuns)
 	}
 }
+
+// TestWireFixture_HTTPAgentDetailWithAvatar pins the shape of GET
+// /agents/{name} when the agent has a PROFILE.yaml containing only avatar and
+// category (minimal profile). Verifies that avatar is propagated through
+// LoadAgent → ToAPI() → HTTP response and matches the committed fixture.
+func TestWireFixture_HTTPAgentDetailWithAvatar(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.agent_detail.with_avatar.response.json")
+
+	agentsDir := t.TempDir()
+	agentDir := filepath.Join(agentsDir, "avatar-demo")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prompt := fixture["prompt"].(string)
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte(prompt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	profileYAML := `category: coding
+avatar: https://cdn.example.com/a.png
+description:
+  en: Demo
+`
+	if err := os.WriteFile(filepath.Join(agentDir, "PROFILE.yaml"), []byte(profileYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := &ServerDeps{AgentsDir: agentsDir, ShannonDir: t.TempDir()}
+	srv := NewServer(0, nil, deps, "test")
+	handler := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/agents/avatar-demo", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /agents/avatar-demo = %d, body %s", rec.Code, rec.Body.String())
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	assertSemanticEqual(t, fixture, produced)
+
+	// Consumer-shaped decode: pin that avatar reaches Desktop as a string.
+	var detail struct {
+		Name   string `json:"name"`
+		Avatar string `json:"avatar"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if detail.Avatar != "https://cdn.example.com/a.png" {
+		t.Fatalf("avatar=%q, want cdn url", detail.Avatar)
+	}
+}

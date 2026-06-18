@@ -423,3 +423,77 @@ func TestLoadAgent_AllBuiltinsHaveValidProfile(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadAgentProfile_WithAvatar(t *testing.T) {
+	dir := t.TempDir()
+	writeYAML(t, dir, `
+category: coding
+avatar: https://cdn.example.com/a.png
+description:
+  en: An agent.
+`)
+	p, err := LoadAgentProfile(dir)
+	if err != nil {
+		t.Fatalf("LoadAgentProfile: %v", err)
+	}
+	if p == nil {
+		t.Fatal("expected non-nil profile")
+	}
+	if p.Avatar != "https://cdn.example.com/a.png" {
+		t.Errorf("Avatar=%q, want the cdn url", p.Avatar)
+	}
+}
+
+func TestValidateAvatarURL(t *testing.T) {
+	ok := []string{
+		"",                                // empty = no avatar, allowed
+		"https://x/y.png",                 // minimal https with host
+		"https://cdn.example.com/a.png",   // typical CDN url
+	}
+	for _, u := range ok {
+		if err := ValidateAvatarURL(u); err != nil {
+			t.Errorf("ValidateAvatarURL(%q) = %v, want nil", u, err)
+		}
+	}
+	bad := []string{
+		"http://x/y.png",      // wrong scheme
+		"javascript:alert(1)", // script scheme
+		"data:image/png;base64,AAAA",
+		"https://",  // empty host
+		"https:///path",
+		"ftp://x/y",
+	}
+	for _, u := range bad {
+		if err := ValidateAvatarURL(u); err == nil {
+			t.Errorf("ValidateAvatarURL(%q) = nil, want error", u)
+		}
+	}
+}
+
+func TestLoadAgentProfile_EnforcesAvatarURL(t *testing.T) {
+	// A hand-authored PROFILE.yaml with an unsafe avatar must fail to load,
+	// closing the bypass where buildSyncItems would otherwise push it to Cloud.
+	bad := []string{
+		"javascript:alert(1)",
+		"http://x/y.png",
+		"data:image/png;base64,AAAA",
+	}
+	for _, av := range bad {
+		dir := t.TempDir()
+		writeYAML(t, dir, "avatar: "+av+"\n")
+		if _, err := LoadAgentProfile(dir); err == nil {
+			t.Errorf("LoadAgentProfile with avatar %q = nil error, want error", av)
+		}
+	}
+	// Valid https avatar and empty/absent avatar load fine.
+	okDir := t.TempDir()
+	writeYAML(t, okDir, "avatar: https://x/y.png\n")
+	if _, err := LoadAgentProfile(okDir); err != nil {
+		t.Errorf("LoadAgentProfile with https avatar = %v, want nil", err)
+	}
+	emptyDir := t.TempDir()
+	writeYAML(t, emptyDir, "category: coding\n")
+	if _, err := LoadAgentProfile(emptyDir); err != nil {
+		t.Errorf("LoadAgentProfile with empty avatar = %v, want nil", err)
+	}
+}

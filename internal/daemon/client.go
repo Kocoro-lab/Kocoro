@@ -103,6 +103,9 @@ const (
 	CapScheduleBroadcastGate = "schedule_broadcast_gate"
 	CapIMTimelineV1          = "im_timeline_v1"
 	CapAgentProfileV1        = "agent_profile_v1"
+	// CapAgentAvatarV1 — daemon supports avatar on PROFILE.yaml (write + Cloud
+	// sync). Desktop gates avatar editing UI on this token.
+	CapAgentAvatarV1 = "agent_avatar_v1"
 	// CapProactiveTargeting tells Cloud the daemon may attach an IMStatusContext
 	// to a ProactivePayload for precise routing. Observability only — the
 	// fallback rule is "non-empty target → targeted; empty → broadcast", so the
@@ -129,6 +132,7 @@ var Capabilities = []string{
 	CapIMMessageLifecycleV1,
 	CapIMTimelineV1,
 	CapAgentProfileV1,
+	CapAgentAvatarV1,
 	CapScheduleBroadcastGate,
 	CapProactiveTargeting,
 	CapProactiveThreadMode,

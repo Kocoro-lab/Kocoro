@@ -3599,3 +3599,108 @@ func TestServer_DisplayName_ConfigMutationsPreserveLabel(t *testing.T) {
 		t.Fatalf("config:null should preserve only display_name, config=%+v", loaded.Config)
 	}
 }
+
+func TestServer_CreateAgent_WritesAvatar(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	body := `{"display_name":"avatar-bot","prompt":"hi","avatar":"https://cdn.example.com/a.png"}`
+	resp, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d/agents", srv.Port()), "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	agentDir := filepath.Join(agentsDir, created.Name)
+	profile, err := agents.LoadAgentProfile(agentDir)
+	if err != nil {
+		t.Fatalf("LoadAgentProfile: %v", err)
+	}
+	if profile == nil {
+		t.Fatal("expected PROFILE.yaml to be written, got nil")
+	}
+	if profile.Avatar != "https://cdn.example.com/a.png" {
+		t.Fatalf("avatar = %q, want %q", profile.Avatar, "https://cdn.example.com/a.png")
+	}
+}
+
+func TestServer_UpdateAgent_WritesAvatar(t *testing.T) {
+	agentsDir := t.TempDir()
+	sessDir := t.TempDir()
+	deps := &ServerDeps{
+		AgentsDir:    agentsDir,
+		ShannonDir:   t.TempDir(),
+		SessionCache: NewSessionCache(sessDir),
+	}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	// Create agent first
+	createBody := `{"display_name":"update-avatar-bot","prompt":"hi"}`
+	resp, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d/agents", srv.Port()), "application/json", strings.NewReader(createBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status=%d", resp.StatusCode)
+	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	// Update with avatar
+	updateBody := `{"avatar":"https://cdn.example.com/b.png"}`
+	req, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("http://127.0.0.1:%d/agents/%s", srv.Port(), created.Name), strings.NewReader(updateBody))
+	req.Header.Set("Content-Type", "application/json")
+	updateResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer updateResp.Body.Close()
+	if updateResp.StatusCode != http.StatusOK {
+		t.Fatalf("update status=%d", updateResp.StatusCode)
+	}
+
+	agentDir := filepath.Join(agentsDir, created.Name)
+	profile, err := agents.LoadAgentProfile(agentDir)
+	if err != nil {
+		t.Fatalf("LoadAgentProfile: %v", err)
+	}
+	if profile == nil {
+		t.Fatal("expected PROFILE.yaml to be written, got nil")
+	}
+	if profile.Avatar != "https://cdn.example.com/b.png" {
+		t.Fatalf("avatar = %q, want %q", profile.Avatar, "https://cdn.example.com/b.png")
+	}
+}

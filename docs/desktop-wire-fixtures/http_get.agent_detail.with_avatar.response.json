@@ -1,0 +1,25 @@
+{
+  "name": "avatar-demo",
+  "display_name": "avatar-demo",
+  "prompt": "Demo agent\n",
+  "memory": null,
+  "config": null,
+  "commands": null,
+  "skills": null,
+  "builtin": false,
+  "overridden": false,
+  "category": {
+    "code": "coding",
+    "label": {
+      "en": "Coding",
+      "zh-Hans": "编程",
+      "ja": "コーディング"
+    }
+  },
+  "description": {
+    "en": "Demo"
+  },
+  "guide_prompts": null,
+  "examples": null,
+  "avatar": "https://cdn.example.com/a.png"
+}

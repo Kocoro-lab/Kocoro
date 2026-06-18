@@ -339,6 +339,26 @@ func TestSetAgentDisplayName_PreservesOtherFields(t *testing.T) {
 	}
 }
 
+func TestWriteAndLoadAgentProfile_Avatar(t *testing.T) {
+	root := t.TempDir()
+	if err := WriteAgentProfile(root, "demo", &AgentProfile{
+		Category: "coding",
+		Avatar:   "https://cdn.example.com/a.png",
+	}); err != nil {
+		t.Fatalf("WriteAgentProfile: %v", err)
+	}
+	p, err := LoadAgentProfile(filepath.Join(root, "demo"))
+	if err != nil {
+		t.Fatalf("LoadAgentProfile: %v", err)
+	}
+	if p == nil || p.Avatar != "https://cdn.example.com/a.png" {
+		t.Fatalf("avatar not round-tripped: %+v", p)
+	}
+	if p.Category != "coding" {
+		t.Fatalf("category not round-tripped: %+v", p)
+	}
+}
+
 func TestAgentConfigAPI_WatchHeartbeatRoundTrip(t *testing.T) {
 	agent := &Agent{
 		Name:   "test",

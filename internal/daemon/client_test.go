@@ -759,6 +759,15 @@ func TestSendProactive_AllowsEmptyAgentName(t *testing.T) {
 	}
 }
 
+func TestCapabilities_IncludesAgentAvatarV1(t *testing.T) {
+	for _, c := range Capabilities {
+		if c == CapAgentAvatarV1 {
+			return
+		}
+	}
+	t.Fatalf("CapAgentAvatarV1 (%q) not advertised", CapAgentAvatarV1)
+}
+
 // TestSendProactive_StillDropsEmptyText confirms empty text is still rejected
 // — that's a real bug class (silent agent push). Only the agent-name half of
 // the original guard moves; text-empty stays an early return.

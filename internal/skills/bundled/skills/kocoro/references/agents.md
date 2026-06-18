@@ -46,6 +46,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
     | `display_name_invalid_chars` | 400 | contains a control character |
     | `display_name_taken` | 409 | duplicate (case-folded, trimmed) |
   - To customize a built-in agent (`explorer` / `reviewer`), use `PUT /agents/{name}` against its slug — POST always creates a brand-new agent under a fresh auto-slug.
+  - `avatar` is **optional** — the agent's avatar image URL, stored in `PROFILE.yaml` and synced to Cloud. Must be an `https://` CDN URL with a host; any other scheme (`http://`, `javascript:`, `data:`) returns `400`. Omit / send `""` for no avatar. Avatar editing is gated on the daemon advertising `agent_avatar_v1` in `/status.capabilities` — Desktop should expose the avatar field only when that capability is present.
 
 ### Update agent prompt / instructions
 - Method: PUT
@@ -58,6 +59,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
   - `display_name` can **only** be set/changed via this top-level field (which is uniqueness-checked). A `display_name` nested inside the `config` object is silently ignored.
   - Renaming to a `display_name` already used by another agent returns `409` with `{"error": "...", "code": "display_name_taken"}`. Renaming to the agent's own current `display_name` is a no-op success.
   - display_name errors carry the same `code` table as `POST /agents` above (`display_name_required` 400, `display_name_too_long` 400, `display_name_invalid_chars` 400, `display_name_taken` 409). `error` is a non-localized fallback; clients localize by `code`.
+  - `avatar` is optional (omit = unchanged). Sending an `https://` CDN URL sets it; sending `""` clears it. Non-`https` values (`http://`, `javascript:`, `data:`) return `400`. Avatar editing is gated on the daemon advertising `agent_avatar_v1` in `/status.capabilities`.
 
 ### Delete agent
 - Method: DELETE

@@ -2,12 +2,34 @@ package agents
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// ValidateAvatarURL rejects avatar URLs that are not https with a non-empty
+// host. An empty string is always allowed (= "no avatar"). The daemon has no
+// CDN config, so the bar is "parseable https URL with a host" rather than a
+// host allowlist — this blocks javascript:, data:, and bare http: payloads.
+func ValidateAvatarURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid avatar URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("avatar URL must use https scheme, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("avatar URL must have a host")
+	}
+	return nil
+}
 
 // LocalizedString is an open map of BCP-47 short locale id → translated text.
 // Keys are not validated (any string accepted); resolution-time fallback is
@@ -28,6 +50,11 @@ type AgentProfile struct {
 	// CategoryRegistry at API-serialization time. Empty string means no
 	// category — handled the same as the field being absent in the yaml.
 	Category string `yaml:"category,omitempty"`
+
+	// Avatar is the agent's avatar image URL (CDN). Non-localized. Empty
+	// means no avatar — handled the same as the field being absent. Set via
+	// PROFILE.yaml `avatar:` or the create/update agent API; synced to Cloud.
+	Avatar string `yaml:"avatar,omitempty"`
 
 	// Description: single localized blurb shown on the agent profile surface.
 	Description LocalizedString `yaml:"description,omitempty"`
@@ -114,6 +141,14 @@ func LoadAgentProfile(dir string) (*AgentProfile, error) {
 func (p *AgentProfile) Validate() error {
 	if p == nil {
 		return nil
+	}
+	// Enforce the avatar URL invariant here too (not just in the HTTP handlers)
+	// so a hand-authored PROFILE.yaml with a javascript:/data:/http: avatar
+	// fails to load rather than silently syncing an unsafe URL to Cloud.
+	if p.Avatar != "" {
+		if err := ValidateAvatarURL(p.Avatar); err != nil {
+			return err
+		}
 	}
 	if len(p.Description) > 0 && !hasLocalizedText(p.Description) {
 		return fmt.Errorf("description missing text")
