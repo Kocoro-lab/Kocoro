@@ -66,7 +66,7 @@ func (t *WaitTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	// Resolve PID from app name
 	var pid int
 	if args.App != "" {
-		if !validAppNamePattern.MatchString(args.App) {
+		if !ValidAppNamePattern.MatchString(args.App) {
 			return agent.ToolResult{
 				Content: fmt.Sprintf("invalid app name %q", args.App),
 				IsError: true,

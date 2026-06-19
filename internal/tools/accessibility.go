@@ -151,14 +151,16 @@ func (t *AccessibilityTool) Run(ctx context.Context, argsJSON string) (agent.Too
 	}
 }
 
-// validAppName checks that an app name contains only safe characters.
-var validAppNamePattern = regexp.MustCompile(`^[a-zA-Z0-9 ._\-()]+$`)
+// ValidAppNamePattern matches safe app name characters.
+// It is exported so other packages (e.g. daemon HTTP handlers) can apply the
+// same validation before a request ever reaches ax_server.
+var ValidAppNamePattern = regexp.MustCompile(`^[a-zA-Z0-9 ._\-()]+$`)
 
 func (t *AccessibilityTool) resolvePID(ctx context.Context, appName string) (int, error) {
 	if appName == "" {
 		return 0, nil // ax_server will use frontmost
 	}
-	if !validAppNamePattern.MatchString(appName) {
+	if !ValidAppNamePattern.MatchString(appName) {
 		return 0, fmt.Errorf("invalid app name %q — only letters, numbers, spaces, dots, hyphens, underscores, and parentheses allowed", appName)
 	}
 	result, err := t.client.Call(ctx, "resolve_pid", map[string]any{"app_name": appName})
