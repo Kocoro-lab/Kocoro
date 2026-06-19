@@ -61,3 +61,22 @@ func TestScreenshotWindow_SuccessReturnsImage(t *testing.T) {
 		t.Fatalf("body = %+v, want image AAAA width 100", body)
 	}
 }
+
+func TestFormatForegroundHint_NilAndEmpty(t *testing.T) {
+	if formatForegroundHint(nil) != "" {
+		t.Fatal("nil hint should produce empty string")
+	}
+	if formatForegroundHint(&ForegroundHint{}) != "" {
+		t.Fatal("empty hint should produce empty string")
+	}
+}
+
+func TestFormatForegroundHint_IncludesAppAndPID(t *testing.T) {
+	got := formatForegroundHint(&ForegroundHint{PID: 1234, AppName: "WeChat", BundleID: "com.tencent.xinWeChat"})
+	if !strings.Contains(got, "WeChat") || !strings.Contains(got, "1234") {
+		t.Fatalf("hint note missing app/pid: %q", got)
+	}
+	if !strings.Contains(got, "accessibility") {
+		t.Fatalf("hint note should steer the agent to the accessibility tool: %q", got)
+	}
+}

@@ -1651,6 +1651,17 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	if req.Agent == "default" {
 		req.Agent = ""
 	}
+	// Fold the foreground-app hint into StickyContext so screen-reading tools
+	// (accessibility / screenshot) default to the user's actual app. Appended
+	// after any existing StickyContext content so IM/agent/schedule discipline
+	// already composed there is never clobbered.
+	if note := formatForegroundHint(req.ForegroundHint); note != "" {
+		if req.StickyContext != "" {
+			req.StickyContext += "\n" + note
+		} else {
+			req.StickyContext = note
+		}
+	}
 	// Named agents honor new_session / session_id exactly like the default
 	// agent — they are no longer locked to a single long-lived session.
 	// Forking is driven by ComputeRouteKey (session_id → exact resume;

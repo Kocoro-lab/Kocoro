@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
@@ -27,6 +28,28 @@ type captureWindowResult struct {
 	ImageBase64 string `json:"image_base64"`
 	Width       int    `json:"width"`
 	Height      int    `json:"height"`
+}
+
+// formatForegroundHint renders a one-line system-context note steering the agent
+// to read the user's foreground app on-demand. Empty when there is nothing usable.
+func formatForegroundHint(h *ForegroundHint) string {
+	if h == nil {
+		return ""
+	}
+	if h.AppName == "" && h.PID <= 0 {
+		return ""
+	}
+	target := h.AppName
+	if target == "" {
+		target = fmt.Sprintf("pid %d", h.PID)
+	}
+	return fmt.Sprintf(
+		"[Active app when the user asked: %q (pid %d). When the user refers to "+
+			"the current app / what they're looking at / this screen, use the "+
+			"accessibility tool (app: %q) to read its real content, or the screenshot "+
+			"tool for purely visual content. Do not target Kocoro itself.]",
+		target, h.PID, target,
+	)
 }
 
 // handleScreenshotWindow serves POST /local/screenshot/window. It delegates a

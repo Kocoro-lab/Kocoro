@@ -81,6 +81,7 @@ type RunAgentRequest struct {
 	SessionHistory  []client.Message      `json:"-"`                           // pre-loaded history for LLM context (BypassRouting runs)
 	OmitHistory     bool                  `json:"-"`                           // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
 	StickyContext   string                `json:"-"`                           // 额外的 sticky context，注入系统提示（对用户不可见）
+	ForegroundHint  *ForegroundHint       `json:"foreground_hint,omitempty"`   // app the user was looking at when they summoned the quick panel; folded into StickyContext so screen-reading tools default to it
 	Files           []RemoteFile          `json:"-"`                           // remote file attachments from Cloud (WS only)
 
 	// IM message lifecycle plumbing for the run's PRIMARY user message (first
@@ -90,6 +91,16 @@ type RunAgentRequest struct {
 	// Both empty for non-IM sources (TUI/CLI/webhook/cron).
 	CloudMessageID  string          `json:"-"`
 	IMStatusContext json.RawMessage `json:"-"`
+}
+
+// ForegroundHint identifies the app that was frontmost when the user summoned
+// the Desktop quick panel (captured before Kocoro stole focus). Folded into the
+// run's StickyContext so the agent's accessibility/screenshot tools target this
+// app instead of Kocoro when the user refers to "the current app".
+type ForegroundHint struct {
+	PID      int    `json:"pid,omitempty"`
+	AppName  string `json:"app_name,omitempty"`
+	BundleID string `json:"bundle_id,omitempty"`
 }
 
 // Validate checks that the request has the minimum required fields.
