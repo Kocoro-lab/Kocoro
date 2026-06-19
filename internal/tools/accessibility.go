@@ -154,7 +154,11 @@ func (t *AccessibilityTool) Run(ctx context.Context, argsJSON string) (agent.Too
 // ValidAppNamePattern matches safe app name characters.
 // It is exported so other packages (e.g. daemon HTTP handlers) can apply the
 // same validation before a request ever reaches ax_server.
-var ValidAppNamePattern = regexp.MustCompile(`^[a-zA-Z0-9 ._\-()]+$`)
+// Uses Unicode letter/number classes (\p{L}/\p{N}) so localized app names —
+// e.g. "访达" (Finder), "活动监视器" (Activity Monitor), "Café" — are accepted;
+// the remaining allow-list (space . _ - ()) still blocks shell/AppleScript
+// injection characters (quotes, semicolons, slashes, etc.).
+var ValidAppNamePattern = regexp.MustCompile(`^[\p{L}\p{N} ._\-()]+$`)
 
 func (t *AccessibilityTool) resolvePID(ctx context.Context, appName string) (int, error) {
 	if appName == "" {

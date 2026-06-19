@@ -65,7 +65,11 @@ func (s *Server) handleScreenshotWindow(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "pid or app_name required")
 		return
 	}
-	if req.AppName != "" && !tools.ValidAppNamePattern.MatchString(req.AppName) {
+	// Validate app_name ONLY when it will actually be used to resolve a window
+	// (i.e. no usable pid). When a pid is provided it is the authoritative
+	// routing key — ax_server ignores app_name — so a localized name the client
+	// sends alongside the pid must not gate the request.
+	if req.PID <= 0 && req.AppName != "" && !tools.ValidAppNamePattern.MatchString(req.AppName) {
 		writeError(w, http.StatusBadRequest, "invalid app_name — only letters, numbers, spaces, dots, hyphens, underscores, and parentheses allowed")
 		return
 	}
