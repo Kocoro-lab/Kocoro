@@ -839,6 +839,52 @@ func TestWireFixture_ScreenshotWindowDenied(t *testing.T) {
 	}
 }
 
+// TestWireFixture_ScreenshotWindowSuccess drives POST /local/screenshot/window
+// through the real handler with a mock ax_server returning a successful capture,
+// and asserts the HTTP 200 body matches the fixture. Also decodes the body into
+// consumer-shaped struct to anchor all three key names (image_base64/width/height).
+func TestWireFixture_ScreenshotWindowSuccess(t *testing.T) {
+	fixture := loadWireFixture(t, "local_screenshot_window_success.json")
+
+	orig := captureWindowVia
+	captureWindowVia = func(_ context.Context, _ map[string]any) (json.RawMessage, error) {
+		return json.Marshal(captureWindowResult{OK: true, ImageBase64: "AAAA", Width: 100, Height: 50})
+	}
+	defer func() { captureWindowVia = orig }()
+
+	srv := NewServer(0, nil, nil, "test")
+	body := strings.NewReader(`{"pid":1234,"app_name":"WeChat"}`)
+	req := httptest.NewRequest(http.MethodPost, "/local/screenshot/window", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	assertSemanticEqual(t, fixture, produced)
+
+	// Consumer-shaped decode: Desktop CaptureWindowResult keys on image_base64/width/height.
+	var result struct {
+		ImageBase64 string `json:"image_base64"`
+		Width       int    `json:"width"`
+		Height      int    `json:"height"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if result.ImageBase64 != "AAAA" {
+		t.Fatalf("image_base64=%q, want AAAA", result.ImageBase64)
+	}
+	if result.Width != 100 {
+		t.Fatalf("width=%d, want 100", result.Width)
+	}
+	if result.Height != 50 {
+		t.Fatalf("height=%d, want 50", result.Height)
+	}
+}
+
 // TestWireFixture_MessageForegroundHintRequest decodes the request fixture
 // through the real RunAgentRequest struct and asserts the foreground_hint
 // sub-object round-trips correctly. The fixture represents the POST /message

@@ -78,6 +78,7 @@ Three transport surfaces, named by file prefix:
 |---|---|---|
 | `local_screenshot_window_request.json` | Desktop → `POST /local/screenshot/window` | `screenshotWindowRequest` struct; `window_title` included as empty string; `pid` + `app_name` both present (either is sufficient for the handler) |
 | `local_screenshot_window_denied.json` | `screenshot_window.go handleScreenshotWindow` (403 branch) | `writeErrorCode` shape: `{"error":…,"code":…}`; `code` is the stable i18n key Desktop localises on; emitted when ax_server returns `screen_recording_denied` |
+| `local_screenshot_window_success.json` | `screenshot_window.go handleScreenshotWindow` (200 branch) | `{"image_base64":…,"width":…,"height":…}`; anchors key names consumed by Desktop's `CaptureWindowResult` |
 | `message_foreground_hint_request.json` | Desktop → `POST /message` | `RunAgentRequest` with `foreground_hint` populated; `source: "kocoro"` is the quick-panel source string; `foreground_hint` is folded into `StickyContext` by the runner, never forwarded to Cloud |
 
 ## Comparison Rule: Semantic Equality, Not Byte Equality
