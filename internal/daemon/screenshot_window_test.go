@@ -33,9 +33,24 @@ func TestScreenshotWindow_MapsDeniedTo403(t *testing.T) {
 		t.Fatalf("status = %d, want 403", rec.Code)
 	}
 	var body struct{ Code string `json:"code"` }
-	json.Unmarshal(rec.Body.Bytes(), &body)
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
 	if body.Code != "screen_recording_denied" {
 		t.Fatalf("code = %q, want screen_recording_denied", body.Code)
+	}
+}
+
+func TestScreenshotWindow_RejectsInvalidAppName(t *testing.T) {
+	s := &Server{}
+	for _, badName := range []string{"../etc/passwd", "foo;rm -rf /", "app<script>", "name\x00null"} {
+		body, _ := json.Marshal(map[string]string{"app_name": badName})
+		req := httptest.NewRequest(http.MethodPost, "/local/screenshot/window", strings.NewReader(string(body)))
+		rec := httptest.NewRecorder()
+		s.handleScreenshotWindow(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("app_name %q: status = %d, want 400", badName, rec.Code)
+		}
 	}
 }
 
@@ -56,7 +71,9 @@ func TestScreenshotWindow_SuccessReturnsImage(t *testing.T) {
 		ImageBase64 string `json:"image_base64"`
 		Width       int    `json:"width"`
 	}
-	json.Unmarshal(rec.Body.Bytes(), &body)
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
 	if body.ImageBase64 != "AAAA" || body.Width != 100 {
 		t.Fatalf("body = %+v, want image AAAA width 100", body)
 	}

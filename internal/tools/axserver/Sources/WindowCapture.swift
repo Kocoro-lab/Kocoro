@@ -84,8 +84,18 @@ func captureWindow(pid: Int?, appName: String?, windowTitle: String?) -> Capture
     // Capture the chosen window (async → sync).
     let filter = SCContentFilter(desktopIndependentWindow: chosen)
     let config = SCStreamConfiguration()
-    config.width = Int(chosen.frame.width)
-    config.height = Int(chosen.frame.height)
+    // SCWindow.frame is in points; SCStreamConfiguration.width/height are in pixels.
+    // Multiply by the backing scale factor of the display the window is on (2.0 on
+    // Retina) so the capture is at native resolution rather than half-res.
+    let windowCenter = CGPoint(
+        x: chosen.frame.midX,
+        y: chosen.frame.midY
+    )
+    let scale: CGFloat = NSScreen.screens.first(where: { $0.frame.contains(windowCenter) })?.backingScaleFactor
+        ?? NSScreen.main?.backingScaleFactor
+        ?? 1.0
+    config.width = Int((chosen.frame.width * scale).rounded())
+    config.height = Int((chosen.frame.height * scale).rounded())
     config.showsCursor = false
 
     var captured: CGImage?
