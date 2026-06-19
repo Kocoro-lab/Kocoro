@@ -52,6 +52,7 @@ func captureWindow(pid: Int?, appName: String?, windowTitle: String?) -> Capture
     var shareable: SCShareableContent?
     let contentSem = DispatchSemaphore(value: 0)
     SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+        // Error intentionally dropped: nil content is handled below as screen_recording_denied.
         shareable = content
         contentSem.signal()
     }
@@ -62,6 +63,7 @@ func captureWindow(pid: Int?, appName: String?, windowTitle: String?) -> Capture
 
     // Pick the window.
     let candidates = content.windows.filter {
+        // Int32(pid_t) → Int widening is intentional and safe on 64-bit platforms.
         Int($0.owningApplication?.processID ?? -1) == targetPID && $0.isOnScreen
     }
     guard !candidates.isEmpty else {
@@ -94,12 +96,22 @@ func captureWindow(pid: Int?, appName: String?, windowTitle: String?) -> Capture
     }
     _ = shotSem.wait(timeout: .now() + 5.0)
     guard let cgImage = captured else {
+        // Re-check the grant: a nil capture can mean the permission was revoked
+        // between the preflight check above and the actual SCK call (a race).
+        guard CGPreflightScreenCaptureAccess() else {
+            return .failure("screen_recording_denied")
+        }
+        // Grant still present → window vanished between enumeration and capture,
+        // or an internal SCK failure. The 3-code contract has no generic
+        // capture-failure code, so collapse to window_not_found.
         return .failure("window_not_found")
     }
 
     // CGImage → PNG → base64.
     let rep = NSBitmapImageRep(cgImage: cgImage)
     guard let pngData = rep.representation(using: .png, properties: [:]) else {
+        // PNG encoding failure collapsed to window_not_found — documented
+        // limitation of the 3-code contract (no encoding/internal-error code).
         return .failure("window_not_found")
     }
     return .success(pngData.base64EncodedString(), cgImage.width, cgImage.height)
