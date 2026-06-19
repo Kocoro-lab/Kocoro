@@ -767,3 +767,133 @@ description:
 		t.Fatalf("avatar=%q, want cdn url", detail.Avatar)
 	}
 }
+
+// --- Quick-panel surfaces (POST /local/screenshot/window + foreground_hint) --
+
+// TestWireFixture_ScreenshotWindowRequest decodes the request fixture through
+// the real screenshotWindowRequest struct and asserts every field survives
+// round-trip unmarshal. The fixture represents the POST body Desktop sends.
+func TestWireFixture_ScreenshotWindowRequest(t *testing.T) {
+	fixture := loadWireFixture(t, "local_screenshot_window_request.json")
+
+	raw, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatalf("re-marshal fixture: %v", err)
+	}
+	var req screenshotWindowRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if req.PID != 1234 {
+		t.Fatalf("pid=%d, want 1234", req.PID)
+	}
+	if req.AppName != "WeChat" {
+		t.Fatalf("app_name=%q, want WeChat", req.AppName)
+	}
+	// window_title is present with empty value — omitempty means it is
+	// omitted on re-encode, which is acceptable (empty string == absent).
+
+	// Consumer-side assertion: Desktop sends pid+app_name together; either is
+	// sufficient for the handler, but the fixture has both.
+	if req.PID <= 0 && req.AppName == "" {
+		t.Fatal("fixture must supply at least pid or app_name")
+	}
+}
+
+// TestWireFixture_ScreenshotWindowDenied drives POST /local/screenshot/window
+// through the real handler with a mock ax_server returning
+// screen_recording_denied, and asserts the HTTP 403 body matches the fixture.
+func TestWireFixture_ScreenshotWindowDenied(t *testing.T) {
+	fixture := loadWireFixture(t, "local_screenshot_window_denied.json")
+
+	// Install a seam override that simulates ax_server denying Screen Recording.
+	orig := captureWindowVia
+	captureWindowVia = func(_ context.Context, _ map[string]any) (json.RawMessage, error) {
+		return json.Marshal(captureWindowResult{OK: false, Code: "screen_recording_denied"})
+	}
+	defer func() { captureWindowVia = orig }()
+
+	srv := NewServer(0, nil, nil, "test")
+	body := strings.NewReader(`{"pid":1234,"app_name":"WeChat"}`)
+	req := httptest.NewRequest(http.MethodPost, "/local/screenshot/window", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403", rec.Code)
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	assertSemanticEqual(t, fixture, produced)
+
+	// Consumer-shaped decode: Desktop keys localisation on `code`.
+	var errResp struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if errResp.Code != "screen_recording_denied" || errResp.Error == "" {
+		t.Fatalf("consumer decode lost fields: %+v", errResp)
+	}
+}
+
+// TestWireFixture_MessageForegroundHintRequest decodes the request fixture
+// through the real RunAgentRequest struct and asserts the foreground_hint
+// sub-object round-trips correctly. The fixture represents the POST /message
+// body Desktop sends from the quick panel.
+func TestWireFixture_MessageForegroundHintRequest(t *testing.T) {
+	fixture := loadWireFixture(t, "message_foreground_hint_request.json")
+
+	raw, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatalf("re-marshal fixture: %v", err)
+	}
+	var req RunAgentRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if req.Text != "summarize what I'm looking at" {
+		t.Fatalf("text=%q", req.Text)
+	}
+	if req.Source != "kocoro" {
+		t.Fatalf("source=%q, want kocoro", req.Source)
+	}
+	if !req.NewSession {
+		t.Fatal("new_session must be true in fixture")
+	}
+	if req.ForegroundHint == nil {
+		t.Fatal("foreground_hint missing after decode")
+	}
+	h := req.ForegroundHint
+	if h.PID != 1234 {
+		t.Fatalf("foreground_hint.pid=%d, want 1234", h.PID)
+	}
+	if h.AppName != "WeChat" {
+		t.Fatalf("foreground_hint.app_name=%q, want WeChat", h.AppName)
+	}
+	if h.BundleID != "com.tencent.xinWeChat" {
+		t.Fatalf("foreground_hint.bundle_id=%q, want com.tencent.xinWeChat", h.BundleID)
+	}
+
+	// Re-encode through the production struct and compare semantically: this
+	// catches any json tag rename on the producer side (e.g. pid→window_pid).
+	reEncoded, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("re-encode failed: %v", err)
+	}
+	produced := parseJSONMap(t, reEncoded)
+	// RunAgentRequest has json:"-" fields that won't appear; compare only the
+	// wire-visible fields from the fixture. We check sub-map equality manually.
+	fh, _ := fixture["foreground_hint"].(map[string]any)
+	ph, _ := produced["foreground_hint"].(map[string]any)
+	if fh == nil || ph == nil {
+		t.Fatalf("foreground_hint missing in fixture=%v or produced=%v", fh, ph)
+	}
+	if !reflect.DeepEqual(fh, ph) {
+		fj, _ := json.MarshalIndent(fh, "", "  ")
+		pj, _ := json.MarshalIndent(ph, "", "  ")
+		t.Fatalf("foreground_hint drifted\n--- fixture ---\n%s\n--- produced ---\n%s", fj, pj)
+	}
+}

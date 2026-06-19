@@ -72,6 +72,14 @@ Three transport surfaces, named by file prefix:
 | `http_get.agents.response.json` | `server.go handleAgents` | list items use `override` |
 | `http_get.agent_detail.response.json` | `server.go handleGetAgent` (`AgentAPI`) | detail uses `overridden` — historical field-name divergence, pinned here so neither side "fixes" it unilaterally. `memory`/`config`/`commands`/`skills` are explicit-null when absent |
 
+### Quick-panel surfaces (POST request bodies + error responses)
+
+| File | Producer | Notes |
+|---|---|---|
+| `local_screenshot_window_request.json` | Desktop → `POST /local/screenshot/window` | `screenshotWindowRequest` struct; `window_title` included as empty string; `pid` + `app_name` both present (either is sufficient for the handler) |
+| `local_screenshot_window_denied.json` | `screenshot_window.go handleScreenshotWindow` (403 branch) | `writeErrorCode` shape: `{"error":…,"code":…}`; `code` is the stable i18n key Desktop localises on; emitted when ax_server returns `screen_recording_denied` |
+| `message_foreground_hint_request.json` | Desktop → `POST /message` | `RunAgentRequest` with `foreground_hint` populated; `source: "kocoro"` is the quick-panel source string; `foreground_hint` is folded into `StickyContext` by the runner, never forwarded to Cloud |
+
 ## Comparison Rule: Semantic Equality, Not Byte Equality
 
 Go map serialization does not guarantee key order, and several producers build
