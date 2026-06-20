@@ -3,6 +3,7 @@
     {
       "name": "demo-agent",
       "display_name": "demo-agent",
+      "avatar": "",
       "builtin": false,
       "override": false,
       "has_memory": false,

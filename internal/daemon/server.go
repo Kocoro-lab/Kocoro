@@ -1044,6 +1044,7 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	type agentInfo struct {
 		Name         string `json:"name"`
 		DisplayName  string `json:"display_name"` // falls back to Name when unset
+		Avatar       string `json:"avatar"`       // empty when unset
 		Builtin      bool   `json:"builtin"`
 		Override     bool   `json:"override"`
 		HasMemory    bool   `json:"has_memory"`
@@ -1053,7 +1054,10 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	}
 	result := make([]agentInfo, 0, len(entries))
 	for _, entry := range entries {
-		// Resolve effective directory for definition files
+		// Resolve effective directory for definition files. This matches
+		// LoadAgent's two-step resolution (user dir wins, _builtin fallback),
+		// so the PROFILE.yaml we read here is the same one GET /agents/{name}
+		// serves — the avatar stays consistent between list and detail.
 		dir := filepath.Join(s.deps.AgentsDir, entry.Name)
 		if entry.Builtin {
 			dir = filepath.Join(s.deps.AgentsDir, "_builtin", entry.Name)
@@ -1064,9 +1068,16 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		_, cfgErr := os.Stat(filepath.Join(dir, "config.yaml"))
 		cmdFiles, _ := filepath.Glob(filepath.Join(dir, "commands", "*.md"))
 		skillFiles, _ := filepath.Glob(filepath.Join(dir, "skills", "*", "SKILL.md"))
+		// Avatar lives in <dir>/PROFILE.yaml. Best-effort: a missing or
+		// malformed profile just yields no avatar (the list must not fail).
+		avatar := ""
+		if profile, perr := agents.LoadAgentProfile(dir); perr == nil && profile != nil {
+			avatar = profile.Avatar
+		}
 		result = append(result, agentInfo{
 			Name:         entry.Name,
 			DisplayName:  entry.DisplayName,
+			Avatar:       avatar,
 			Builtin:      entry.Builtin,
 			Override:     entry.Override,
 			HasMemory:    memErr == nil,
