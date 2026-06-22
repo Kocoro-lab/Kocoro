@@ -836,6 +836,9 @@ func TestRunStartupAgentSync_SuccessTriggersPush(t *testing.T) {
 	if got := len(s.agentSyncTrigger); got != 1 {
 		t.Fatalf("expected exactly one push trigger after clean pull, got %d", got)
 	}
+	if !s.agentPullClean.Load() {
+		t.Fatal("agentPullClean must be set after a clean pull (else pushes stay upsert-only)")
+	}
 }
 
 // Fix 1: a FAILED startup pull must still close pullDone (so the worker doesn't
@@ -859,6 +862,9 @@ func TestRunStartupAgentSync_FailureDoesNotTrigger(t *testing.T) {
 	if got := len(s.agentSyncTrigger); got != 0 {
 		t.Fatalf("expected no push trigger after failed pull, got %d", got)
 	}
+	if s.agentPullClean.Load() {
+		t.Fatal("agentPullClean must stay false after a failed pull (pushes must remain upsert-only)")
+	}
 }
 
 // Fix 1: an UNCONFIGURED gateway (pull == nil) must close pullDone but NOT
@@ -875,6 +881,54 @@ func TestRunStartupAgentSync_UnconfiguredDoesNotTrigger(t *testing.T) {
 	}
 	if got := len(s.agentSyncTrigger); got != 0 {
 		t.Fatalf("expected no push trigger when unconfigured, got %d", got)
+	}
+	if s.agentPullClean.Load() {
+		t.Fatal("agentPullClean must stay false when Cloud is unconfigured")
+	}
+}
+
+// Fix 1 (data-loss guard): pushAllAgents must NOT reconcile deletes (full_sync)
+// until a clean startup pull has merged the cloud mirror. A failed/never-run
+// pull leaves agentPullClean=false, so a push driven by a later user edit goes
+// up upsert-only and can't soft-delete cloud-only agents the pull never pulled.
+func TestPushAllAgents_GatesFullSyncOnCleanPull(t *testing.T) {
+	root := t.TempDir()
+	// One local agent so the push is non-empty.
+	dir := filepath.Join(root, "agt")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("prompt"), 0o644)
+
+	var gotFullSync bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			var body struct {
+				FullSync bool `json:"full_sync"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			gotFullSync = body.FullSync
+			w.Write([]byte(`{"synced":1,"soft_deleted":0}`))
+		}
+	}))
+	defer srv.Close()
+	gw := client.NewGatewayClient(srv.URL, "k")
+
+	s := newPullServer(t, root)
+
+	// No clean pull yet → upsert-only (full_sync must be false).
+	if err := s.pushAllAgents(context.Background(), gw, root); err != nil {
+		t.Fatalf("pushAllAgents (pre-pull): %v", err)
+	}
+	if gotFullSync {
+		t.Fatal("push reconciled deletes (full_sync=true) before a clean pull — can soft-delete cloud-only agents")
+	}
+
+	// After a clean pull → full_sync may reconcile deletes.
+	s.agentPullClean.Store(true)
+	if err := s.pushAllAgents(context.Background(), gw, root); err != nil {
+		t.Fatalf("pushAllAgents (post-pull): %v", err)
+	}
+	if !gotFullSync {
+		t.Fatal("push did not reconcile deletes (full_sync=false) after a clean pull")
 	}
 }
 

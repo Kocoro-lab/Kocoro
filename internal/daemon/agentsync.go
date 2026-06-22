@@ -188,18 +188,32 @@ func agentLastModified(dir string) time.Time {
 	return latest
 }
 
-// pushAllAgents builds the full local agent set and pushes it to Cloud as a
-// full sync (so deletes are reconciled). The sync_started_at timestamp is
-// captured BEFORE the local snapshot so Cloud's gated full_sync soft-delete
-// only removes agents whose cloud updated_at <= that instant — agents created
-// on cloud after this snapshot are not clobbered.
+// pushAllAgents builds the full local agent set and pushes it to Cloud. Deletes
+// are reconciled (full_sync=true) ONLY once a clean startup pull has merged the
+// cloud mirror into the local set (s.agentPullClean) — before that, the push is
+// upsert-only so a push over a never-merged set can't soft-delete cloud-only
+// agents the failed/never-run pull never brought down. The sync_started_at
+// timestamp is captured BEFORE the local snapshot so Cloud's gated full_sync
+// soft-delete only removes agents whose cloud updated_at <= that instant —
+// agents created on cloud after this snapshot are not clobbered.
 func (s *Server) pushAllAgents(ctx context.Context, gw *client.GatewayClient, agentsDir string) error {
 	start := time.Now().UTC()
 	items, err := s.buildSyncItems(agentsDir)
 	if err != nil {
 		return err
 	}
-	return gw.SyncAgents(ctx, items, true, start)
+	fullSync := s.agentPullClean.Load()
+	res, err := gw.SyncAgents(ctx, items, fullSync, start)
+	if err != nil {
+		return err
+	}
+	// Surface the destructive count: a push that tombstones cloud agents should
+	// never be silent (this is the observability that exposes an unexpected
+	// mass-delete in the daemon log).
+	if res != nil && res.SoftDeleted > 0 {
+		log.Printf("agentsync: WARNING: push synced %d agent(s), soft-deleted %d on cloud (full_sync=%v)", res.Synced, res.SoftDeleted, fullSync)
+	}
+	return nil
 }
 
 // runStartupAgentSync runs the one-time startup agent pull, then unblocks the
@@ -212,6 +226,11 @@ func (s *Server) pushAllAgents(ctx context.Context, gw *client.GatewayClient, ag
 // wrongly soft-delete cloud agents). On pull FAILURE the gate is still closed
 // but the trigger is likewise skipped, for the same safety reason. pullDone is
 // closed BEFORE triggering so the worker can proceed past its gate.
+//
+// Only a SUCCESSFUL pull flips s.agentPullClean — until then every push (incl.
+// pushes driven by later user edits, which run regardless of pull outcome) goes
+// up as upsert-only so it can't soft-delete cloud-only agents. The flag is set
+// BEFORE pullDone closes so the worker always observes the reconciled state.
 func (s *Server) runStartupAgentSync(pull func() ([]client.SyncAgentItem, error)) {
 	if pull == nil {
 		close(s.pullDone)
@@ -220,6 +239,8 @@ func (s *Server) runStartupAgentSync(pull func() ([]client.SyncAgentItem, error)
 	pullErr := s.pullAndApplyAgents(pull)
 	if pullErr != nil {
 		log.Printf("agentsync: startup pull failed: %v", pullErr)
+	} else {
+		s.agentPullClean.Store(true)
 	}
 	close(s.pullDone)
 	if pullErr == nil {

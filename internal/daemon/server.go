@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -98,6 +99,16 @@ type Server struct {
 	// full_sync over an incomplete local set (which would soft-delete
 	// not-yet-pulled cloud agents).
 	pullDone chan struct{}
+
+	// agentPullClean gates the DESTRUCTIVE half of the push. It flips true only
+	// after a successful startup pull has reconciled the cloud mirror into the
+	// local set. Until then, pushes go up as upsert-only (full_sync=false) so a
+	// push driven by a later user edit can't soft-delete cloud-only agents the
+	// failed/never-run pull never brought down (e.g. agents created on another
+	// device). Set-once, never reset; written by runStartupAgentSync BEFORE
+	// pullDone closes, read by the push worker (which only pushes after the gate
+	// opens), so a plain atomic is sufficient.
+	agentPullClean atomic.Bool
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500

@@ -26,8 +26,12 @@ func TestSyncAndPullAgents(t *testing.T) {
 	c := NewGatewayClient(srv.URL, "k-123")
 	item := SyncAgentItem{AgentKey: "demo", UpdatedAt: time.Now().UTC()}
 	start := time.Now().UTC()
-	if err := c.SyncAgents(context.Background(), []SyncAgentItem{item}, true, start); err != nil {
+	ack, err := c.SyncAgents(context.Background(), []SyncAgentItem{item}, true, start)
+	if err != nil {
 		t.Fatalf("SyncAgents: %v", err)
+	}
+	if ack == nil || ack.Synced != 1 || ack.SoftDeleted != 0 {
+		t.Fatalf("sync ack not decoded: %+v", ack)
 	}
 	if gotMethod != http.MethodPut || gotPath != "/api/v1/agents/sync" || gotKey != "k-123" {
 		t.Fatalf("bad request: %s %s key=%s", gotMethod, gotPath, gotKey)
