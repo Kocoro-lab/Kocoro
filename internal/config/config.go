@@ -247,6 +247,11 @@ type SkillsConfig struct {
 }
 
 type MarketplaceConfig struct {
+	// Source selects the catalog backend: "clawhub" (default) reads ClawHub's
+	// live HTTP API; "registry" reads the static RegistryURL index.
+	Source string `mapstructure:"source" yaml:"source" json:"source"`
+	// ClawHubURL is the ClawHub base URL used when Source == "clawhub".
+	ClawHubURL  string `mapstructure:"clawhub_url" yaml:"clawhub_url" json:"clawhub_url"`
 	RegistryURL string `mapstructure:"registry_url" yaml:"registry_url" json:"registry_url"`
 }
 
@@ -366,6 +371,8 @@ func Load() (*Config, error) {
 	// 60s matches the pre-async legacy hardcoded value; OAuth-bridged servers
 	// (Intercom) override to ~300s in the built-in catalog.
 	viper.SetDefault("mcp.default_connect_timeout_secs", 60)
+	viper.SetDefault("skills.marketplace.source", "clawhub")
+	viper.SetDefault("skills.marketplace.clawhub_url", "https://clawhub.ai")
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	viper.SetDefault("cloud.enabled", true)
 	viper.SetDefault("cloud.timeout", 3600)

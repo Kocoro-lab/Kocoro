@@ -176,6 +176,28 @@ func resolveRegistryURL(deps *ServerDeps) string {
 	return defaultURL
 }
 
+// newMarketplaceClient builds the catalog client per config. With a real config
+// the default source is ClawHub's live API; "registry" selects the static index
+// at RegistryURL. Nil deps/config (test fixtures) fall back to the registry
+// client — those tests inject their own client anyway.
+func newMarketplaceClient(deps *ServerDeps) *skills.MarketplaceClient {
+	if deps != nil && deps.Config != nil {
+		mc := deps.Config.Skills.Marketplace
+		source := mc.Source
+		if source == "" {
+			source = "clawhub"
+		}
+		if source == "clawhub" {
+			base := mc.ClawHubURL
+			if base == "" {
+				base = "https://clawhub.ai"
+			}
+			return skills.NewClawHubMarketplaceClient(base, 1*time.Hour)
+		}
+	}
+	return skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour)
+}
+
 var (
 	showChromeOnPortFn        = mcp.ShowCDPChromeOnPort
 	hideChromeOnPortFn        = mcp.HideCDPChromeOnPort
@@ -209,7 +231,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		approvalBroker:         NewApprovalBroker(func(req ApprovalRequest) error { return nil }),
 		eventBus:               NewEventBus(),
 		notifyApprovalResolved: func(p ApprovalResolvedPayload) error { return nil },
-		marketplace:            skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour),
+		marketplace:            newMarketplaceClient(deps),
 		slugLocks:              skills.NewSlugLocks(),
 		secretsStore:           store,
 		suggestions:            agent.NewSuggestionState(),
@@ -431,6 +453,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /channels/feishu/app-installs/{id}", s.handleDeleteFeishuAppInstall)
 	mux.HandleFunc("GET /skills/marketplace", s.handleMarketplaceList)
 	mux.HandleFunc("GET /skills/marketplace/entry/{slug}", s.handleMarketplaceDetail)
+	mux.HandleFunc("GET /skills/marketplace/entry/{slug}/files", s.handleMarketplaceFiles)
+	mux.HandleFunc("GET /skills/marketplace/entry/{slug}/file", s.handleMarketplaceFile)
 	mux.HandleFunc("GET /skills", s.handleListSkills)
 	mux.HandleFunc("GET /skills/{name}", s.handleGetSkill)
 	mux.HandleFunc("PUT /skills/{name}", s.handlePutGlobalSkill)
@@ -3313,14 +3337,7 @@ func (s *Server) handleMarketplaceList(w http.ResponseWriter, r *http.Request) {
 	if !s.requireDeps(w) {
 		return
 	}
-	idx, err := s.marketplace.Load(r.Context())
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
-		return
-	}
-
 	q := r.URL.Query()
-	page := parseIntParam(q.Get("page"), 1)
 	size := parseIntParam(q.Get("size"), 20)
 	sortKey := q.Get("sort")
 	if sortKey == "" {
@@ -3328,27 +3345,62 @@ func (s *Server) handleMarketplaceList(w http.ResponseWriter, r *http.Request) {
 	}
 	search := q.Get("q")
 
-	entries, total := skills.FilterSortPaginate(idx.Skills, search, sortKey, page, size)
-
-	// Mark `installed` flag for entries already on disk.
-	installed := installedSkillSet(s.deps.ShannonDir)
 	type listItem struct {
 		skills.MarketplaceEntry
 		Installed bool `json:"installed"`
 	}
+	installed := installedSkillSet(s.deps.ShannonDir)
+
+	// ClawHub is a ~12k-entry, cursor-paginated catalog — too large to cache
+	// whole, so proxy one page per request. `cursor` is ClawHub's opaque
+	// cursor; the response carries `next_cursor` for the client to page with.
+	if s.marketplace.IsClawHub() {
+		entries, next, err := s.marketplace.FetchClawHubPage(r.Context(), search, sortKey, q.Get("cursor"), size)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+			return
+		}
+		items := make([]listItem, 0, len(entries))
+		for _, e := range entries {
+			items = append(items, listItem{MarketplaceEntry: e, Installed: installed[e.Slug]})
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"skills":      items,
+			"size":        size,
+			"next_cursor": next,
+		})
+		return
+	}
+
+	// Registry source: full static index, filtered/sorted/paged in memory.
+	// `cursor` carries a page number so the same client pager works; `page`
+	// is still accepted for back-compat.
+	idx, err := s.marketplace.Load(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+		return
+	}
+	page := parseIntParam(q.Get("cursor"), parseIntParam(q.Get("page"), 1))
+
+	entries, total := skills.FilterSortPaginate(idx.Skills, search, sortKey, page, size)
 	items := make([]listItem, 0, len(entries))
 	for _, e := range entries {
 		items = append(items, listItem{MarketplaceEntry: e, Installed: installed[e.Slug]})
+	}
+	nextCursor := ""
+	if page*size < total {
+		nextCursor = strconv.Itoa(page + 1)
 	}
 
 	if s.marketplace.IsStale() {
 		w.Header().Set("X-Cache-Stale", "true")
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"total":  total,
-		"page":   page,
-		"size":   size,
-		"skills": items,
+		"total":       total,
+		"page":        page,
+		"size":        size,
+		"next_cursor": nextCursor,
+		"skills":      items,
 	})
 }
 
@@ -3384,26 +3436,36 @@ func (s *Server) handleMarketplaceInstall(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	idx, err := s.marketplace.Load(r.Context())
-	if err != nil {
-		s.auditHTTPOpError("POST", endpoint, "marketplace unavailable", err)
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
-		return
-	}
 	var entry *skills.MarketplaceEntry
-	for i := range idx.Skills {
-		if idx.Skills[i].Slug == slug {
-			entry = &idx.Skills[i]
-			break
+	if s.marketplace.IsClawHub() {
+		// ClawHub zip URL is deterministic from the slug — no catalog lookup
+		// needed. ValidateSkillName above already constrains the slug.
+		entry = &skills.MarketplaceEntry{
+			Slug:        slug,
+			Name:        slug,
+			DownloadURL: s.marketplace.ClawHubDownloadURL(slug),
+		}
+	} else {
+		idx, err := s.marketplace.Load(r.Context())
+		if err != nil {
+			s.auditHTTPOpError("POST", endpoint, "marketplace unavailable", err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+			return
+		}
+		for i := range idx.Skills {
+			if idx.Skills[i].Slug == slug {
+				entry = &idx.Skills[i]
+				break
+			}
+		}
+		if entry == nil {
+			s.auditHTTPOpError("POST", endpoint, "not in marketplace index", nil)
+			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
+			return
 		}
 	}
-	if entry == nil {
-		s.auditHTTPOpError("POST", endpoint, "not in marketplace index", nil)
-		writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
-		return
-	}
 
-	err = skills.InstallFromMarketplace(r.Context(), s.deps.ShannonDir, *entry, s.slugLocks)
+	err := skills.InstallFromMarketplace(r.Context(), s.deps.ShannonDir, *entry, s.slugLocks)
 	switch {
 	case err == nil:
 		// Audit success here, before the metadata-load early returns below,
@@ -3538,40 +3600,56 @@ func (s *Server) handleMarketplaceDetail(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	idx, err := s.marketplace.Load(r.Context())
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
-		return
-	}
-	var entry *skills.MarketplaceEntry
-	for i := range idx.Skills {
-		if idx.Skills[i].Slug == slug {
-			entry = &idx.Skills[i]
-			break
-		}
-	}
-	if entry == nil {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
-		return
-	}
-
-	// Consistent with list + install: malicious entries are hidden.
-	if entry.IsMalicious() {
-		writeError(w, http.StatusForbidden, "skill blocked by security scan")
-		return
-	}
-
-	// Response wraps the registry entry plus live state. Preview holds the
-	// installed SKILL.md body when present — empty string otherwise, so the
-	// field is always part of the schema. NO omitempty so Desktop clients
-	// can rely on the field's existence regardless of install state.
+	// Response wraps the entry plus live state. Preview holds the SKILL.md body
+	// (from ClawHub for not-yet-installed skills, or from disk once installed);
+	// empty string otherwise, so the field is always part of the schema. NO
+	// omitempty so Desktop clients can rely on the field's existence.
 	type detailResponse struct {
 		skills.MarketplaceEntry
 		Installed bool   `json:"installed"`
 		Preview   string `json:"preview"`
 	}
+	var resp detailResponse
 
-	resp := detailResponse{MarketplaceEntry: *entry}
+	if s.marketplace.IsClawHub() {
+		// Build the entry straight from ClawHub's detail endpoint (owner,
+		// homepage, stats, and the full SKILL.md preview) — no cached catalog.
+		d, err := s.marketplace.FetchClawHubDetail(r.Context(), slug)
+		if err != nil {
+			// Distinguish "skill not on ClawHub" (404) from "ClawHub down" (503).
+			if strings.Contains(err.Error(), "status 404") {
+				writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
+			} else {
+				writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+			}
+			return
+		}
+		resp = detailResponse{MarketplaceEntry: d.Entry, Preview: d.Preview}
+	} else {
+		idx, err := s.marketplace.Load(r.Context())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+			return
+		}
+		var entry *skills.MarketplaceEntry
+		for i := range idx.Skills {
+			if idx.Skills[i].Slug == slug {
+				entry = &idx.Skills[i]
+				break
+			}
+		}
+		if entry == nil {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
+			return
+		}
+		// Consistent with list + install: malicious entries are hidden.
+		if entry.IsMalicious() {
+			writeError(w, http.StatusForbidden, "skill blocked by security scan")
+			return
+		}
+		resp = detailResponse{MarketplaceEntry: *entry}
+	}
+
 	skillDir := filepath.Join(s.deps.ShannonDir, "skills", slug)
 	skillFile := filepath.Join(skillDir, "SKILL.md")
 	if body, err := os.ReadFile(skillFile); err == nil {
@@ -3580,6 +3658,65 @@ func (s *Server) handleMarketplaceDetail(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleMarketplaceFiles returns the file manifest for a ClawHub skill version,
+// so the desktop can render a file tree. ClawHub-source only.
+func (s *Server) handleMarketplaceFiles(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
+	slug := r.PathValue("slug")
+	if err := skills.ValidateSkillName(slug); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !s.marketplace.IsClawHub() {
+		writeError(w, http.StatusNotFound, "file listing not available for this marketplace source")
+		return
+	}
+	version, files, err := s.marketplace.FetchClawHubFiles(r.Context(), slug, r.URL.Query().Get("version"))
+	if err != nil {
+		if strings.Contains(err.Error(), "status 404") {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
+		} else {
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"version": version, "files": files})
+}
+
+// handleMarketplaceFile returns the raw text content of one file in a ClawHub
+// skill version. ClawHub-source only.
+func (s *Server) handleMarketplaceFile(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
+	slug := r.PathValue("slug")
+	if err := skills.ValidateSkillName(slug); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	path := r.URL.Query().Get("path")
+	if path == "" || len(path) > 512 {
+		writeError(w, http.StatusBadRequest, "missing or invalid path")
+		return
+	}
+	if !s.marketplace.IsClawHub() {
+		writeError(w, http.StatusNotFound, "file content not available for this marketplace source")
+		return
+	}
+	content, err := s.marketplace.FetchClawHubFile(r.Context(), slug, r.URL.Query().Get("version"), path)
+	if err != nil {
+		if strings.Contains(err.Error(), "status 404") {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("file %q not found", path))
+		} else {
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"path": path, "content": content})
 }
 
 // parseIntParam parses a positive int query parameter, falling back to def
