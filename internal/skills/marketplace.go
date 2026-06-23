@@ -1175,7 +1175,7 @@ func (c *MarketplaceClient) clawhubSearchToEntry(r clawhubSearchResult) Marketpl
 		Name:        name,
 		Description: r.Summary,
 		Author:      r.Owner.Handle,
-		DownloadURL: c.ClawHubDownloadURL(r.Slug),
+		DownloadURL: c.ClawHubDownloadURL(r.Slug, r.Owner.Handle),
 		Downloads:   r.Downloads,
 		Version:     r.Version,
 	}
@@ -1186,9 +1186,15 @@ func (c *MarketplaceClient) clawhubSearchToEntry(r clawhubSearchResult) Marketpl
 }
 
 // ClawHubDownloadURL is the deterministic zip artifact URL for a slug. Lets the
-// install/detail handlers build an entry without a full catalog lookup.
-func (c *MarketplaceClient) ClawHubDownloadURL(slug string) string {
-	return fmt.Sprintf("%s/api/v1/download?slug=%s", c.clawhubBase, url.QueryEscape(slug))
+// install/detail handlers build an entry without a full catalog lookup. owner
+// disambiguates slugs shared by multiple publishers (ClawHub returns 409 for a
+// bare ambiguous slug); pass "" when unknown.
+func (c *MarketplaceClient) ClawHubDownloadURL(slug, owner string) string {
+	u := fmt.Sprintf("%s/api/v1/download?slug=%s", c.clawhubBase, url.QueryEscape(slug))
+	if owner != "" {
+		u += "&owner=" + url.QueryEscape(owner)
+	}
+	return u
 }
 
 func (c *MarketplaceClient) clawhubItemToEntry(it clawhubItem) MarketplaceEntry {
@@ -1210,7 +1216,8 @@ func (c *MarketplaceClient) clawhubItemToEntry(it clawhubItem) MarketplaceEntry 
 		Description: it.Summary,
 		License:     license,
 		// ClawHub serves skills as zip artifacts; install uses this download URL.
-		DownloadURL: c.ClawHubDownloadURL(it.Slug),
+		// Browse items carry no owner handle, so the slug is left bare here.
+		DownloadURL: c.ClawHubDownloadURL(it.Slug, ""),
 		Downloads:   it.Stats.Downloads,
 		Stars:       it.Stats.Stars,
 		Version:     version,
@@ -1229,11 +1236,14 @@ type ClawHubDetail struct {
 // FetchClawHubDetail loads a single skill's detail from ClawHub and assembles a
 // MarketplaceEntry (including owner handle → author + homepage, and the full
 // SKILL.md as preview). Only valid on a ClawHub-sourced client.
-func (c *MarketplaceClient) FetchClawHubDetail(ctx context.Context, slug string) (*ClawHubDetail, error) {
+func (c *MarketplaceClient) FetchClawHubDetail(ctx context.Context, slug, owner string) (*ClawHubDetail, error) {
 	if c.clawhubBase == "" {
 		return nil, errors.New("not a clawhub client")
 	}
 	u := fmt.Sprintf("%s/api/v1/skills/%s", c.clawhubBase, url.PathEscape(slug))
+	if owner != "" {
+		u += "?owner=" + url.QueryEscape(owner)
+	}
 	var dr struct {
 		Skill struct {
 			Slug        string            `json:"slug"`
@@ -1270,7 +1280,7 @@ func (c *MarketplaceClient) FetchClawHubDetail(ctx context.Context, slug string)
 		Description: dr.Skill.Summary,
 		Author:      dr.Owner.Handle,
 		License:     license,
-		DownloadURL: c.ClawHubDownloadURL(slug),
+		DownloadURL: c.ClawHubDownloadURL(slug, dr.Owner.Handle),
 		Downloads:   dr.Skill.Stats.Downloads,
 		Stars:       dr.Skill.Stats.Stars,
 		Version:     version,
@@ -1290,12 +1300,12 @@ type ClawHubFile struct {
 }
 
 // resolveClawHubVersion returns version if non-empty, else the skill's latest
-// version (via the detail endpoint).
-func (c *MarketplaceClient) resolveClawHubVersion(ctx context.Context, slug, version string) (string, error) {
+// version (via the detail endpoint). owner disambiguates shared slugs.
+func (c *MarketplaceClient) resolveClawHubVersion(ctx context.Context, slug, version, owner string) (string, error) {
 	if version != "" {
 		return version, nil
 	}
-	d, err := c.FetchClawHubDetail(ctx, slug)
+	d, err := c.FetchClawHubDetail(ctx, slug, owner)
 	if err != nil {
 		return "", err
 	}
@@ -1304,15 +1314,18 @@ func (c *MarketplaceClient) resolveClawHubVersion(ctx context.Context, slug, ver
 
 // FetchClawHubFiles returns the file manifest for a skill version (the resolved
 // version is returned too, useful when the caller passed "" for latest).
-func (c *MarketplaceClient) FetchClawHubFiles(ctx context.Context, slug, version string) (string, []ClawHubFile, error) {
+func (c *MarketplaceClient) FetchClawHubFiles(ctx context.Context, slug, version, owner string) (string, []ClawHubFile, error) {
 	if c.clawhubBase == "" {
 		return "", nil, errors.New("not a clawhub client")
 	}
-	ver, err := c.resolveClawHubVersion(ctx, slug, version)
+	ver, err := c.resolveClawHubVersion(ctx, slug, version, owner)
 	if err != nil {
 		return "", nil, err
 	}
 	u := fmt.Sprintf("%s/api/v1/skills/%s/versions/%s", c.clawhubBase, url.PathEscape(slug), url.PathEscape(ver))
+	if owner != "" {
+		u += "?owner=" + url.QueryEscape(owner)
+	}
 	var vr struct {
 		Version struct {
 			Files []struct {
@@ -1333,16 +1346,19 @@ func (c *MarketplaceClient) FetchClawHubFiles(ctx context.Context, slug, version
 }
 
 // FetchClawHubFile returns the raw text content of one file in a skill version.
-func (c *MarketplaceClient) FetchClawHubFile(ctx context.Context, slug, version, path string) (string, error) {
+func (c *MarketplaceClient) FetchClawHubFile(ctx context.Context, slug, version, path, owner string) (string, error) {
 	if c.clawhubBase == "" {
 		return "", errors.New("not a clawhub client")
 	}
-	ver, err := c.resolveClawHubVersion(ctx, slug, version)
+	ver, err := c.resolveClawHubVersion(ctx, slug, version, owner)
 	if err != nil {
 		return "", err
 	}
 	u := fmt.Sprintf("%s/api/v1/skills/%s/file?path=%s&version=%s",
 		c.clawhubBase, url.PathEscape(slug), url.QueryEscape(path), url.QueryEscape(ver))
+	if owner != "" {
+		u += "&owner=" + url.QueryEscape(owner)
+	}
 	return c.getText(ctx, u)
 }
 

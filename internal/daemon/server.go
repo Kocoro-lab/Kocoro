@@ -2403,6 +2403,38 @@ func (s *Server) resolveSkillDir(name string) (string, string, bool, error) {
 	return "", "", false, os.ErrNotExist
 }
 
+// resolveSkillIdent maps a client-supplied skill identifier to the canonical
+// on-disk slug. Clients should address skills by Slug, but the SKILL.md display
+// Name is kept as a backward-compat alias — the macOS Desktop addresses skills
+// by Name, which diverges from Slug for marketplace skills (e.g. name "Docker"
+// → slug "docker", name "self-improvement" → slug "self-improving-agent").
+// Returns the canonical slug and true on a match; ("", false) when nothing
+// matches, so the caller keeps the original identifier and lets normal
+// validation / 404 handling apply (e.g. creating a brand-new skill via PUT).
+func (s *Server) resolveSkillIdent(ident string) (string, bool) {
+	sources, err := s.skillSources()
+	if err != nil {
+		return "", false
+	}
+	list, err := skills.LoadSkills(sources...)
+	if err != nil {
+		return "", false
+	}
+	// Exact slug match wins, so a skill whose display Name happens to equal
+	// another skill's Slug can't shadow the real one.
+	for _, sk := range list {
+		if sk.Slug == ident {
+			return sk.Slug, true
+		}
+	}
+	for _, sk := range list {
+		if strings.EqualFold(sk.Name, ident) {
+			return sk.Slug, true
+		}
+	}
+	return "", false
+}
+
 func isValidSkillFileName(name string) bool {
 	if len(name) == 0 || len(name) > 255 {
 		return false
@@ -3427,6 +3459,11 @@ func (s *Server) handleSkillUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -3604,52 +3641,64 @@ func (s *Server) handleMarketplaceDetail(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	slug := r.PathValue("slug")
+	// The macOS Desktop addresses installed skills by display name; canonicalize
+	// to the on-disk slug so a name-addressed lookup hits the registry / ClawHub.
+	if canon, ok := s.resolveSkillIdent(slug); ok {
+		slug = canon
+	}
 	if err := skills.ValidateSkillName(slug); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	idx, err := s.marketplace.Load(r.Context())
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
-		return
-	}
-	var entry *skills.MarketplaceEntry
-	for i := range idx.Skills {
-		if idx.Skills[i].Slug == slug {
-			entry = &idx.Skills[i]
-			break
-		}
-	}
-	if entry == nil {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
-		return
-	}
 
-	// Consistent with list + install: malicious entries are hidden.
-	if entry.IsMalicious() {
-		writeError(w, http.StatusForbidden, "skill blocked by security scan")
-		return
-	}
-
-	// Response wraps the registry entry plus live state. Preview holds the
-	// installed SKILL.md body when present — empty string otherwise, so the
-	// field is always part of the schema. NO omitempty so Desktop clients
-	// can rely on the field's existence regardless of install state.
+	// Response wraps the entry plus live state. Preview holds the installed
+	// SKILL.md body when present — empty string otherwise, so the field is
+	// always part of the schema (no omitempty) for Desktop clients.
 	type detailResponse struct {
 		skills.MarketplaceEntry
 		Installed bool   `json:"installed"`
 		Preview   string `json:"preview"`
 	}
-
-	resp := detailResponse{MarketplaceEntry: *entry}
-	skillDir := filepath.Join(s.deps.ShannonDir, "skills", slug)
-	skillFile := filepath.Join(skillDir, "SKILL.md")
-	if body, err := os.ReadFile(skillFile); err == nil {
-		resp.Installed = true
-		resp.Preview = string(body)
+	overlayInstalled := func(resp *detailResponse) {
+		skillFile := filepath.Join(s.deps.ShannonDir, "skills", slug, "SKILL.md")
+		if body, err := os.ReadFile(skillFile); err == nil {
+			resp.Installed = true
+			resp.Preview = string(body)
+		}
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	// Primary surface: the static registry (the contract the macOS Desktop
+	// consumes). Registry-down is non-fatal — fall through to ClawHub.
+	if idx, err := s.marketplace.Load(r.Context()); err == nil {
+		for i := range idx.Skills {
+			if idx.Skills[i].Slug == slug {
+				entry := idx.Skills[i]
+				// Consistent with list + install: malicious entries are hidden.
+				if entry.IsMalicious() {
+					writeError(w, http.StatusForbidden, "skill blocked by security scan")
+					return
+				}
+				resp := detailResponse{MarketplaceEntry: entry}
+				overlayInstalled(&resp)
+				writeJSON(w, http.StatusOK, resp)
+				return
+			}
+		}
+	}
+
+	// Not in the static registry — fall back to ClawHub's live catalog so a
+	// skill installed from ClawHub (which never appears in the registry) still
+	// resolves its detail (e.g. the Desktop's "View details" on such a skill).
+	if s.clawhub != nil {
+		if d, cerr := s.clawhub.FetchClawHubDetail(r.Context(), slug, r.URL.Query().Get("owner")); cerr == nil {
+			resp := detailResponse{MarketplaceEntry: d.Entry, Preview: d.Preview}
+			overlayInstalled(&resp)
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+	}
+
+	writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
 }
 
 // --- ClawHub handlers ---
@@ -3718,7 +3767,9 @@ func (s *Server) handleClawHubDetail(w http.ResponseWriter, r *http.Request) {
 		Installed bool   `json:"installed"`
 		Preview   string `json:"preview"`
 	}
-	d, err := s.clawhub.FetchClawHubDetail(r.Context(), slug)
+	// owner disambiguates slugs shared by multiple publishers (the desktop
+	// passes the entry's author); without it ClawHub 409s on an ambiguous slug.
+	d, err := s.clawhub.FetchClawHubDetail(r.Context(), slug, r.URL.Query().Get("owner"))
 	if err != nil {
 		// Distinguish "skill not on ClawHub" (404) from "ClawHub down" (503).
 		if strings.Contains(err.Error(), "status 404") {
@@ -3754,7 +3805,9 @@ func (s *Server) handleClawHubInstall(w http.ResponseWriter, r *http.Request) {
 	entry := skills.MarketplaceEntry{
 		Slug:        slug,
 		Name:        slug,
-		DownloadURL: s.clawhub.ClawHubDownloadURL(slug),
+		// owner disambiguates slugs shared by multiple publishers; without it
+		// ClawHub's download endpoint 409s on an ambiguous slug.
+		DownloadURL: s.clawhub.ClawHubDownloadURL(slug, r.URL.Query().Get("owner")),
 	}
 	err := skills.InstallFromMarketplace(r.Context(), s.deps.ShannonDir, entry, s.slugLocks)
 	switch {
@@ -3807,7 +3860,7 @@ func (s *Server) handleClawHubFiles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	version, files, err := s.clawhub.FetchClawHubFiles(r.Context(), slug, r.URL.Query().Get("version"))
+	version, files, err := s.clawhub.FetchClawHubFiles(r.Context(), slug, r.URL.Query().Get("version"), r.URL.Query().Get("owner"))
 	if err != nil {
 		if strings.Contains(err.Error(), "status 404") {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
@@ -3835,7 +3888,7 @@ func (s *Server) handleClawHubFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing or invalid path")
 		return
 	}
-	content, err := s.clawhub.FetchClawHubFile(r.Context(), slug, r.URL.Query().Get("version"), path)
+	content, err := s.clawhub.FetchClawHubFile(r.Context(), slug, r.URL.Query().Get("version"), path, r.URL.Query().Get("owner"))
 	if err != nil {
 		if strings.Contains(err.Error(), "status 404") {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("file %q not found", path))
@@ -3973,6 +4026,11 @@ func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
 	// management). Hidden is a browse-list display filter, not an access
 	// control. Do not add a hidden check here without revisiting handleListSkills.
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4019,6 +4077,11 @@ func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePutGlobalSkill(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	// NOTE: deliberately NO display-name canonicalization here. PUT create/update
+	// must target the literal slug — otherwise creating a brand-new skill could
+	// be silently retargeted onto an existing skill whose display name collides
+	// with the chosen slug, overwriting it. (Read/delete/secrets endpoints do
+	// canonicalize, since name-addressing an existing skill is the intent there.)
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4165,6 +4228,11 @@ func (s *Server) handleDeleteGlobalSkill(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4197,6 +4265,11 @@ func (s *Server) handleDeleteGlobalSkill(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handlePutSkillSecrets(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4228,6 +4301,11 @@ func (s *Server) handlePutSkillSecrets(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteSkillSecrets(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4242,6 +4320,9 @@ func (s *Server) handleDeleteSkillSecrets(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleDeleteSkillSecretKey(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	key := r.PathValue("key")
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -4297,6 +4378,11 @@ func (s *Server) handleDeleteSkillAssets(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleListSkillSubresource(w http.ResponseWriter, r *http.Request, subdir string) {
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4333,6 +4419,11 @@ func (s *Server) handleListSkillSubresource(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) handlePutSkillSubresource(w http.ResponseWriter, r *http.Request, subdir string) {
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4405,6 +4496,11 @@ func (s *Server) handlePutSkillSubresource(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleDeleteSkillSubresource(w http.ResponseWriter, r *http.Request, subdir string) {
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
