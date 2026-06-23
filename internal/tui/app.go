@@ -341,7 +341,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	})
 	ta.Focus()
 	ta.SetHeight(1)
-	ta.SetWidth(width)
+	ta.SetWidth(width - inputBorderOverhead)
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0 // unlimited
 	// Remove cursor line highlight — we use border bars instead
@@ -1113,7 +1113,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		oldWidth := m.width
 		m.width = msg.Width
 		m.height = msg.Height
-		m.textarea.SetWidth(msg.Width)
+		m.textarea.SetWidth(msg.Width - inputBorderOverhead)
 		if oldWidth != msg.Width && oldWidth > 0 && len(m.output) > 0 {
 			return m, m.rerenderOutput()
 		}
@@ -1460,6 +1460,25 @@ func composeBar(width int, left, right string) string {
 	return left + styleFaint().Render(strings.Repeat("─", fill)) + right
 }
 
+// inputBorderOverhead is the columns the rounded composer border consumes
+// (1 left + 1 right). The textarea width is reduced by this so the boxed
+// composer renders at exactly the terminal width.
+const inputBorderOverhead = 2
+
+// renderInputBox wraps the composer view in a rounded, brand-colored border of
+// the given total width. Narrow widths pass the content through unboxed so the
+// frame never overflows.
+func renderInputBox(taView string, totalWidth int) string {
+	if totalWidth < 4 {
+		return taView
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorAccent).
+		Width(totalWidth - inputBorderOverhead).
+		Render(taView)
+}
+
 func (m *Model) View() string {
 	var sb strings.Builder
 
@@ -1471,12 +1490,12 @@ func (m *Model) View() string {
 	case stateStartup:
 		sb.WriteString(renderStartupHeader(m.headerFrame, m.width, m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD, m.headerSessions, m.headerTipIdx))
 	case stateInput:
-		sb.WriteString(bar)
+		// Composer wrapped in a rounded brand-colored border (its top border
+		// replaces the old plain separator). The textarea is sized to leave room
+		// for the border (inputBorderOverhead) at init/resize.
+		sb.WriteString(renderInputBox(m.textarea.View(), m.width))
 		sb.WriteString("\n")
-		sb.WriteString(m.textarea.View())
-		sb.WriteString("\n")
-		// Bottom bar: left hint (slash commands are discoverable by typing "/")
-		// + right-aligned model tier.
+		// Bottom bar: left hint (slash commands by typing "/") + model tier.
 		leftHint := styleDim().Render(" / commands")
 		rightInfo := styleDim().Render(m.modelDisplayLabel())
 		sb.WriteString(composeBar(m.width, leftHint, rightInfo))

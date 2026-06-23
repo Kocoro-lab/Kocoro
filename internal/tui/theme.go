@@ -66,8 +66,10 @@ var (
 	// colorWarn — warnings and the approval prompt.
 	colorWarn = lipgloss.AdaptiveColor{Light: "130", Dark: "214"}
 
-	// colorAccent — brand accent (the frog green) for headers/emphasis.
-	colorAccent = lipgloss.AdaptiveColor{Light: "28", Dark: "76"}
+	// colorAccent — Kocoro brand accent (pink) for headers/emphasis/border.
+	// Matches the brand swirl gradient (#F40752→#F9AB8F): a bright pink on dark
+	// terminals, a deeper pink that stays readable on light ones.
+	colorAccent = lipgloss.AdaptiveColor{Light: "#C9105A", Dark: "#FF5C8A"}
 
 	// colorInfo — informational blue: section headers, session picker.
 	colorInfo = lipgloss.AdaptiveColor{Light: "25", Dark: "39"}
