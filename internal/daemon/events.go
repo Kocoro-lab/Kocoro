@@ -97,6 +97,18 @@ const (
 	// row in their session list so the title stops lagging the placeholder
 	// until the next manual GET /sessions.
 	EventSessionTitleUpdated = "session_title_updated"
+
+	// EventDeliverable fires when the present_deliverable tool surfaces a
+	// finished artifact (PDF/PPTX/XLSX/DOCX/HTML/image/…) the agent produced.
+	// Payload: {session_id, agent, source, id, path, filename, title, mime,
+	// byte_size, ts}. The path is daemon-validated as a real regular local file
+	// before emission, but it may live outside the session working directory.
+	// Clients may trust the metadata came from the daemon, but must not treat it
+	// as sandbox authorization or proof of authorship. Desktop renders it as a
+	// card in the session's Deliverables sidebar. The call also persists as the
+	// present_deliverable tool_use/tool_result pair, so the deliverable
+	// re-surfaces when the session is reopened.
+	EventDeliverable = "deliverable"
 )
 
 // Event is a daemon lifecycle event pushed to SSE subscribers.

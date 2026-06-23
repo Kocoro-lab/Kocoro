@@ -50,6 +50,7 @@ func TestReadOnly_AlwaysWrite(t *testing.T) {
 		&CloudDelegateTool{},
 		&MemoryAppendTool{},
 		&NotifyTool{},
+		&PresentDeliverableTool{},
 		&ProcessTool{},
 		&GhosttyTool{tabs: newTabRegistry()},
 		newUseSkillTool(nil),

@@ -97,6 +97,7 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	reg.Register(&SystemInfoTool{})
 	reg.Register(&ClipboardTool{})
 	reg.Register(&NotifyTool{})
+	reg.Register(&PresentDeliverableTool{})
 	reg.Register(&ProcessTool{})
 	reg.Register(&AppleScriptTool{})
 	axClient := SharedAXClient()
@@ -563,14 +564,14 @@ func resolveMCPServers(cfg *config.Config, agentDef ...*agents.Agent) map[string
 // discover-then-disconnect optimization on every reload.
 //
 // Without this check the loop is:
-//   1. daemon startup → async connect playwright → tools cached
-//   2. PostConnectDisconnectIfDiscoveryOnly intentionally Disconnects
-//   3. user POSTs /config/reload (e.g. Desktop's startup sync ping)
-//   4. retry sees playwright "not connected" → StartConnectAll again
-//   5. successful connect → ProbeNow → serverLoop probeNowCh handler →
-//      maybeRelaunchDegradedCDPChrome relaunches Chrome because the
-//      capability probe ran without Chrome on the previous cycle and
-//      left state=Degraded
+//  1. daemon startup → async connect playwright → tools cached
+//  2. PostConnectDisconnectIfDiscoveryOnly intentionally Disconnects
+//  3. user POSTs /config/reload (e.g. Desktop's startup sync ping)
+//  4. retry sees playwright "not connected" → StartConnectAll again
+//  5. successful connect → ProbeNow → serverLoop probeNowCh handler →
+//     maybeRelaunchDegradedCDPChrome relaunches Chrome because the
+//     capability probe ran without Chrome on the previous cycle and
+//     left state=Degraded
 //
 // Net effect: a blank Chrome window pops every time the Desktop client
 // reconnects. mgr.CachedTools() being non-empty is the "we already

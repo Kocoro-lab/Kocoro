@@ -8,6 +8,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
+	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
 // busEventHandler implements agent.EventHandler (and agent.RunStatusHandler)
@@ -49,6 +50,34 @@ func (h *busEventHandler) OnPreamble(text string) {
 // No-op passthroughs — bus emits progress signals + agent narration above, not token deltas.
 func (h *busEventHandler) OnStreamDelta(delta string)              {}
 func (h *busEventHandler) OnApprovalNeeded(tool, args string) bool { return false }
+
+func deliverableEventPayload(sessionID, agentName, source string, d tools.Deliverable) []byte {
+	payload, _ := json.Marshal(map[string]any{
+		"session_id": sessionID,
+		"agent":      agentName,
+		"source":     source,
+		"id":         d.ID,
+		"path":       d.Path,
+		"filename":   d.Filename,
+		"title":      d.Title,
+		"mime":       d.MIME,
+		"byte_size":  d.ByteSize,
+		"ts":         nowISO(),
+	})
+	return payload
+}
+
+func makeDeliverableEventHandler(bus *EventBus, sessionID, agentName, source string) tools.DeliverableHandler {
+	return func(d tools.Deliverable) bool {
+		if bus == nil {
+			return false
+		}
+		return bus.EmitTo(Event{
+			Type:    EventDeliverable,
+			Payload: deliverableEventPayload(sessionID, agentName, source, d),
+		}) > 0
+	}
+}
 
 // OnToolCall emits a "running" event when a tool is invoked. Args are redacted
 // (secrets) and truncated (size budget) before emission. The tool_use_id pairs

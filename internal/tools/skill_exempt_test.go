@@ -47,6 +47,7 @@ func TestSkillExemptInventory(t *testing.T) {
 		{"system_info", &SystemInfoTool{}, false},
 		{"clipboard", &ClipboardTool{}, false},
 		{"notify", &NotifyTool{}, false},
+		{"present_deliverable", &PresentDeliverableTool{}, false},
 		{"process", &ProcessTool{}, false},
 		{"applescript", &AppleScriptTool{}, false},
 		{"accessibility", &AccessibilityTool{}, false},

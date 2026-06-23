@@ -1,0 +1,12 @@
+{
+  "session_id": "sess_deliverable",
+  "agent": "demo",
+  "source": "desktop",
+  "id": "dlv_0123456789abcdef",
+  "path": "/Users/alice/Work/Kocoro/session/q3-deck.pptx",
+  "filename": "q3-deck.pptx",
+  "title": "Q3 Sales Deck",
+  "mime": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "byte_size": 24576,
+  "ts": "2026-06-22T08:00:00Z"
+}

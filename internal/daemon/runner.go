@@ -1817,6 +1817,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			})
 			return deps.EventBus.EmitTo(Event{Type: EventNotification, Payload: payload}) > 0
 		})
+
+		// Surface present_deliverable calls to attached clients (Desktop) so
+		// finished artifacts appear in the session's Deliverables sidebar. Like
+		// notify, this rides the EventBus; with no client attached the
+		// tool_use/tool_result still persists, so the deliverable shows when the
+		// session is later opened in Desktop. The path was already validated
+		// inside the tool (a real regular local file; not necessarily under
+		// the session CWD) before this fires, so the emitted metadata is
+		// daemon-vouched.
+		ctx = tools.WithDeliverableHandler(ctx, makeDeliverableEventHandler(deps.EventBus, sessID, notifyAgent, notifySource))
 	}
 
 	// Persist session to disk before loop.Run() so there's a record even if

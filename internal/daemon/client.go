@@ -94,6 +94,11 @@ var Version = "dev"
 // on GET /agents/{name}: category, description, guide_prompts, and examples.
 // Desktop gates the richer agent-profile UI on this token instead of
 // version-sniffing or inferring support from nullable fields.
+//
+// "deliverable_event_v1" — daemon emits EventDeliverable when the
+// present_deliverable tool records daemon-validated metadata for a local regular
+// file. Desktop gates the Deliverables sidebar live-SSE path on this token,
+// then dedupes live, replayed, and persisted records by deliverable id.
 const (
 	CapDeliveryAck           = "delivery_ack"
 	CapInlineDocumentB64     = "inline_document_b64"
@@ -121,6 +126,7 @@ const (
 	// (live membership/binding/transport changes). Independent of
 	// CapReplyDeliveryResultV1 so S3 can land separately from S2.
 	CapChannelStateEventV1 = "channel_state_event_v1"
+	CapDeliverableEventV1  = "deliverable_event_v1"
 )
 
 var Capabilities = []string{
@@ -138,6 +144,7 @@ var Capabilities = []string{
 	CapProactiveThreadMode,
 	CapReplyDeliveryResultV1,
 	CapChannelStateEventV1,
+	CapDeliverableEventV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
