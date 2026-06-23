@@ -545,6 +545,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /approval", s.handleApproval)
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
 	mux.HandleFunc("POST /message", s.handleMessage)
+	mux.HandleFunc("POST /local/screenshot/window", s.handleScreenshotWindow)
 	mux.HandleFunc("POST /inject/retract", s.handleRetractInject)
 	mux.HandleFunc("POST /cancel", s.handleCancel)
 	// Per-route mailbox (see references/queue.md and references/cancel.md).
@@ -1719,6 +1720,17 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// Normalize "default" → "" early so downstream guards are consistent.
 	if req.Agent == "default" {
 		req.Agent = ""
+	}
+	// Fold the foreground-app hint into StickyContext so screen-reading tools
+	// (accessibility / screenshot) default to the user's actual app. Appended
+	// after any existing StickyContext content so IM/agent/schedule discipline
+	// already composed there is never clobbered.
+	if note := formatForegroundHint(req.ForegroundHint); note != "" {
+		if req.StickyContext != "" {
+			req.StickyContext += "\n" + note
+		} else {
+			req.StickyContext = note
+		}
 	}
 	// Named agents honor new_session / session_id exactly like the default
 	// agent — they are no longer locked to a single long-lived session.

@@ -1,0 +1,11 @@
+{
+  "text": "summarize what I'm looking at",
+  "agent": "",
+  "new_session": true,
+  "source": "kocoro",
+  "foreground_hint": {
+    "pid": 1234,
+    "app_name": "WeChat",
+    "bundle_id": "com.tencent.xinWeChat"
+  }
+}
