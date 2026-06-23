@@ -122,12 +122,13 @@ internal/
 
 Feature changes update README.md (user-facing), CLAUDE.md (this file, developer-facing), and AGENTS.md (external-agent-facing, mirrors structure tree + conventions).
 
-**Kocoro skill is the AI's source of truth for the daemon HTTP API** — every `mux.HandleFunc(...)` in `internal/daemon/server.go` must have a matching entry in `internal/skills/bundled/skills/kocoro/references/*.md`. When adding endpoints, update the matching reference file in the same PR. Maps:
+**Kocoro skill is the AI's source of truth for the daemon HTTP API** — `references/*.md` are injected into the **kocoro agent's** context, so the rule covers only endpoints the agent calls or must understand: every such `mux.HandleFunc(...)` in `internal/daemon/server.go` needs a matching `references/*.md` entry in the same PR. Maps:
 - agents/skills/schedules/config endpoints → `references/{agents,skills,schedules,config}.md`
 - MCP / permissions / project-init / instructions / recipes / session-sync / memory → matching `references/*.md`
 - `/local/auth/*` endpoints → `references/auth.md`
 - `calendar_*` tools (8) + protocol → `references/calendar.md` + `references/desktop-rpc.md` (these skill refs are the public protocol reference); the full design doc `docs/desktop-calendar-rpc.md` is local-only / untracked (rationale + closed-app internals, not shipped)
 - Protected config fields, tool filter → `SKILL.md` security section
+- Desktop-only transport endpoints the agent never calls → NOT in references; their Desktop↔daemon wire contract lives in `docs/desktop-wire-fixtures/`
 
 ### Hardcoded Limit Policy
 
