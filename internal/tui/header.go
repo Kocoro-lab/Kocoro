@@ -57,52 +57,45 @@ func renderStartupHeader(frame int, width int, version string, modelTier string,
 	innerWidth := width - 2                        // inside box borders (│ on each side)
 	rightWidth := innerWidth - headerLeftWidth - 1 // -1 for middle divider
 
-	// --- Build left column lines ---
-	var leftLines []string
-
-	// Pixel-art frog: startup animation (crouch→jump→land→blink).
-	// Center the 10-col frog within the headerLeftWidth column.
-	const frogVisualWidth = 10
-	frogIndent := strings.Repeat(" ", (headerLeftWidth-frogVisualWidth)/2)
-	for _, line := range renderFrogGrid(frogAnimFrame(frame)) {
-		leftLines = append(leftLines, frogIndent+line)
-	}
-
-	// Model + CWD + Endpoint — always visible.
-	modelStyle := lipgloss.NewStyle().Foreground(accentColor).Bold(true)
-	cwdStyle := lipgloss.NewStyle().Foreground(dimColor)
-	epStyle := lipgloss.NewStyle().Foreground(dimColor)
-	versionStyle := lipgloss.NewStyle().Foreground(dimColor)
-	leftLines = append(leftLines, "  "+modelStyle.Render(modelTier)+"  "+versionStyle.Render("v"+version))
-	leftLines = append(leftLines, "  "+cwdStyle.Render(truncateStr(cwd, headerLeftWidth-4)))
-	leftLines = append(leftLines, "  "+epStyle.Render(truncateStr(endpoint, headerLeftWidth-4)))
+	// --- Build left column lines: the Kocoro brand swirl (draws in on startup). ---
+	// renderKocoroGrid returns 8 lines, each exactly headerLeftWidth (16) cols.
+	leftLines := renderKocoroGrid(frame)
 
 	// --- Build right column lines (all immediate) ---
 	var rightLines []string
+	dimStyle := lipgloss.NewStyle().Foreground(dimColor)
+	modelStyle := lipgloss.NewStyle().Foreground(accentColor).Bold(true)
 
 	// Tips.
 	tipHeader := lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render("Tips")
-	tipStyle := lipgloss.NewStyle().Foreground(dimColor)
 	rightLines = append(rightLines, " "+tipHeader)
-	rightLines = append(rightLines, " "+tipStyle.Render(truncateStr(headerTips[tipIdx%len(headerTips)], rightWidth-3)))
+	rightLines = append(rightLines, " "+dimStyle.Render(truncateStr(headerTips[tipIdx%len(headerTips)], rightWidth-3)))
 
 	// Divider.
-	rightLines = append(rightLines, " "+lipgloss.NewStyle().Foreground(dimColor).Render(strings.Repeat("─", rightWidth-2)))
+	rightLines = append(rightLines, " "+dimStyle.Render(strings.Repeat("─", rightWidth-2)))
 
 	// Recent activity.
 	actHeader := lipgloss.NewStyle().Foreground(infoColor).Bold(true).Render("Recent activity")
 	rightLines = append(rightLines, " "+actHeader)
 
 	if len(sessions) == 0 {
-		rightLines = append(rightLines, " "+lipgloss.NewStyle().Foreground(dimColor).Render("No recent sessions"))
+		rightLines = append(rightLines, " "+dimStyle.Render("No recent sessions"))
+		rightLines = append(rightLines, "")
 	} else {
 		s := sessions[0]
-		title := truncateStr(s.Title, rightWidth-4)
 		titleStyle := lipgloss.NewStyle().Foreground(colorSecondary)
-		agoStyle := lipgloss.NewStyle().Foreground(dimColor)
-		rightLines = append(rightLines, " "+titleStyle.Render(title))
-		rightLines = append(rightLines, " "+agoStyle.Render(fmt.Sprintf("%s, %d msgs", timeAgo(s.UpdatedAt), s.MsgCount)))
+		rightLines = append(rightLines, " "+titleStyle.Render(truncateStr(s.Title, rightWidth-4)))
+		rightLines = append(rightLines, " "+dimStyle.Render(fmt.Sprintf("%s, %d msgs", timeAgo(s.UpdatedAt), s.MsgCount)))
 	}
+
+	// Model / version / endpoint / cwd — moved here from the (now icon-filled)
+	// left column. Two lines pad the right column to the icon's 8-line height.
+	rightLines = append(rightLines, " "+dimStyle.Render(truncateStr(cwd, rightWidth-3)))
+	info := modelStyle.Render(modelTier) + dimStyle.Render(" · v"+version)
+	if budget := rightWidth - lipgloss.Width(info) - 5; budget >= 6 {
+		info += dimStyle.Render(" · " + truncateStr(endpoint, budget))
+	}
+	rightLines = append(rightLines, " "+info)
 
 	// Equalize line counts between columns.
 	for len(leftLines) < len(rightLines) {
@@ -118,7 +111,7 @@ func renderStartupHeader(frame int, width int, version string, modelTier string,
 	var sb strings.Builder
 
 	// Top border with title.
-	titlePart := "─ Shannon CLI "
+	titlePart := "─ Kocoro CLI "
 	titleVisWidth := lipgloss.Width(titlePart)
 	remaining := innerWidth - titleVisWidth
 	if remaining < 0 {

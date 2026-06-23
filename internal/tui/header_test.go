@@ -10,7 +10,7 @@ import (
 
 func TestRenderStartupHeader_FirstFrame(t *testing.T) {
 	result := renderStartupHeader(0, 60, "dev", "small", "https://api.test.com", "/tmp", nil, 0)
-	if !strings.Contains(result, "Shannon CLI") {
+	if !strings.Contains(result, "Kocoro CLI") {
 		t.Error("first frame should contain title in top border")
 	}
 	if !strings.Contains(result, "▀") && !strings.Contains(result, "█") {
@@ -33,7 +33,7 @@ func TestRenderStartupHeader_FinalFrame(t *testing.T) {
 	}
 	result := renderStartupHeader(headerTotalFrames-1, 80, "v0.1.0", "large", "https://api.test.com", "/home/user/project", sessions, 0)
 
-	if !strings.Contains(result, "Shannon CLI") {
+	if !strings.Contains(result, "Kocoro CLI") {
 		t.Error("final frame should contain title")
 	}
 	if !strings.Contains(result, "▀") && !strings.Contains(result, "█") {

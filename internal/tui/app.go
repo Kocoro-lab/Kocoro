@@ -331,7 +331,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	warmBackgroundColor()
 
 	ta := textarea.New()
-	ta.Placeholder = "Type a message or /help..."
+	ta.Placeholder = "Ask Kocoro anything…"
 	promptStyle := lipgloss.NewStyle().Foreground(colorInfo)
 	ta.SetPromptFunc(2, func(lineIdx int) string {
 		if lineIdx == 0 {
@@ -3009,7 +3009,7 @@ func statusMessage(msg, fallback string) string {
 
 func formatConfigDisplay(cfg *config.Config) string {
 	var sb strings.Builder
-	sb.WriteString("Shannon CLI Configuration\n")
+	sb.WriteString("Kocoro CLI Configuration\n")
 
 	if cfg.Provider == "ollama" {
 		sb.WriteString(fmt.Sprintf("  provider: ollama\n"))
