@@ -205,6 +205,7 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 	baseline := agent.NewToolRegistry()
 	baseline.Register(&ThinkTool{})
 	baseline.Register(&BrowserTool{})
+	baseline.Register(&AccessibilityTool{})
 
 	healthStates := map[string]mcp.ServerHealth{
 		"playwright": {State: mcp.StateHealthy},
@@ -221,6 +222,11 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 	}
 	if _, ok := reg.Get("browser_navigate"); !ok {
 		t.Error("browser_navigate should be registered from healthy Playwright")
+	}
+	// accessibility reads the AX tree of native apps (e.g. WeChat) — playwright
+	// cannot, so it must survive Playwright (regression: it was wrongly removed).
+	if _, ok := reg.Get("accessibility"); !ok {
+		t.Error("accessibility must NOT be removed when Playwright is present")
 	}
 }
 
