@@ -114,8 +114,20 @@ func captureWindow(pid: Int?, appName: String?, windowTitle: String?) -> Capture
     } catch {
         return .failure("window_not_found")
     }
-    proc.waitUntilExit()
     defer { try? FileManager.default.removeItem(atPath: tmpPath) }
+    // Watchdog: screencapture can hang (window-server stall, target window vanished
+    // mid-capture, heavy load). ax_server serves requests serially, so an unbounded
+    // waitUntilExit() here would wedge EVERY subsequent AX call until the helper is
+    // killed by hand. Bound it, then SIGTERM and fail closed (the 3-code contract has
+    // no generic capture-failure code, so collapse to window_not_found).
+    let captureDeadline = Date().addingTimeInterval(8)
+    while proc.isRunning && Date() < captureDeadline {
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    if proc.isRunning {
+        proc.terminate()
+        return .failure("window_not_found")
+    }
 
     guard let data = FileManager.default.contents(atPath: tmpPath), !data.isEmpty else {
         // No/empty output: re-check the grant (revoked mid-flight) else the

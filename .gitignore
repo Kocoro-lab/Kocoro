@@ -29,3 +29,6 @@ internal/tools/axserver/.build/
 internal/agent/tmp/
 build/
 .idea/
+
+# Agent SDD process reports — scratch, not shipped
+sdd/task-*-report.md

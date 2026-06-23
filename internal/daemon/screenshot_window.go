@@ -39,16 +39,24 @@ func formatForegroundHint(h *ForegroundHint) string {
 	if h.AppName == "" && h.PID <= 0 {
 		return ""
 	}
-	target := h.AppName
-	if target == "" {
-		target = fmt.Sprintf("pid %d", h.PID)
+	if h.AppName != "" {
+		return fmt.Sprintf(
+			"[Active app when the user asked: %q (pid %d). When the user refers to "+
+				"the current app / what they're looking at / this screen, use the "+
+				"accessibility tool (app: %q) to read its real content, or the screenshot "+
+				"tool for purely visual content. Do not target Kocoro itself.]",
+			h.AppName, h.PID, h.AppName,
+		)
 	}
+	// PID-only (the client had no resolvable app name, e.g. nil localizedName):
+	// resolvePID matches on localizedName/bundle, so "app: pid N" would ALWAYS fail
+	// to resolve. Steer by pid via the screenshot tool instead of handing the agent
+	// a name it cannot resolve.
 	return fmt.Sprintf(
-		"[Active app when the user asked: %q (pid %d). When the user refers to "+
-			"the current app / what they're looking at / this screen, use the "+
-			"accessibility tool (app: %q) to read its real content, or the screenshot "+
-			"tool for purely visual content. Do not target Kocoro itself.]",
-		target, h.PID, target,
+		"[Active app when the user asked: pid %d. When the user refers to the current "+
+			"app / what they're looking at / this screen, use the screenshot tool to "+
+			"capture it for visual content. Do not target Kocoro itself.]",
+		h.PID,
 	)
 }
 

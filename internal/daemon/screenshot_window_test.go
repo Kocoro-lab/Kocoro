@@ -97,3 +97,19 @@ func TestFormatForegroundHint_IncludesAppAndPID(t *testing.T) {
 		t.Fatalf("hint note should steer the agent to the accessibility tool: %q", got)
 	}
 }
+
+func TestFormatForegroundHint_PIDOnlyOmitsBogusAppArg(t *testing.T) {
+	// PID but no app name: resolvePID matches on localizedName/bundle, so an
+	// "app: pid N" clause would always fail to resolve. The hint must mention the
+	// pid but NOT hand the agent a bogus, name-shaped app: argument.
+	got := formatForegroundHint(&ForegroundHint{PID: 4321})
+	if got == "" {
+		t.Fatal("PID-only hint should be non-empty")
+	}
+	if !strings.Contains(got, "4321") {
+		t.Fatalf("PID-only hint should mention the pid: %q", got)
+	}
+	if strings.Contains(got, "app:") {
+		t.Fatalf("PID-only hint must not claim a bogus app: arg the agent cannot resolve: %q", got)
+	}
+}
