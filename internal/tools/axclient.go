@@ -121,14 +121,22 @@ func (c *AXClient) startBundled(ctx context.Context, bundlePath string) error {
 			return fmt.Errorf("ax_server launch: %w", err)
 		}
 
-		// Wait for socket to appear
+		// Wait for socket to appear. Poll ctx-aware so a cancelled request (e.g. the
+		// Desktop capture timeout) does not pin Ensure's lock for the full 10s, which
+		// would block both the user's retry and any concurrent AX call.
+		// Trade-off: a cancel mid-launch can let a retry spawn a second instance via
+		// `open -n` (narrow window; Close() reaps strays) — acceptable vs. a 10s stall.
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
 			conn, err = net.Dial("unix", socketPath)
 			if err == nil {
 				break
 			}
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
 	}
 	if conn == nil {
@@ -188,10 +196,19 @@ func (c *AXClient) startFallback(binPath string) error {
 	return nil
 }
 
+// axMaxResponseLine bounds a single NDJSON response line from ax_server.
+// capture_window returns a base64-encoded PNG of a whole window inline on one
+// line; a retina-resolution screenshot's base64 runs several MB and overran the
+// old 1 MiB cap, which surfaced as a bogus "unexpected EOF" — the scanner
+// stopped with bufio.ErrTooLong and readLoop misreported it as a disconnect.
+// 64 MiB fits any single-window capture with headroom; bufio.Scanner only grows
+// the buffer toward this on demand.
+const axMaxResponseLine = 64 * 1024 * 1024
+
 // readLoop reads NDJSON responses and dispatches them to pending callers.
 func (c *AXClient) readLoop(reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 1024*1024), axMaxResponseLine)
 	for scanner.Scan() {
 		var resp AXResponse
 		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
@@ -207,10 +224,18 @@ func (c *AXClient) readLoop(reader io.Reader) {
 			ch <- resp
 		}
 	}
-	// EOF: ax_server died or disconnected — unblock all pending callers
+	// Loop exited. A clean EOF means ax_server disconnected; a scanner error
+	// (e.g. a response line exceeding axMaxResponseLine) means the stream is
+	// still alive but unreadable. Report whichever it was instead of always
+	// claiming a disconnect — the old hardcoded "unexpected EOF" masked the
+	// oversized-capture case and cost real debugging time.
+	disconnectMsg := "ax_server: unexpected EOF"
+	if err := scanner.Err(); err != nil {
+		disconnectMsg = fmt.Sprintf("ax_server: read error: %v", err)
+	}
 	c.pendingMu.Lock()
 	for id, ch := range c.pending {
-		ch <- AXResponse{ID: id, Error: &AXError{Code: -1, Message: "ax_server: unexpected EOF"}}
+		ch <- AXResponse{ID: id, Error: &AXError{Code: -1, Message: disconnectMsg}}
 		delete(c.pending, id)
 	}
 	c.pendingMu.Unlock()

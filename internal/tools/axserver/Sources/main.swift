@@ -238,6 +238,10 @@ func dispatch(id: Int64, method: String, params: Params) -> Response {
         }
         return Response(id: id, result: AnyCodable(result))
 
+    case "capture_window":
+        let result = captureWindow(pid: params.pid, appName: params.appName, windowTitle: params.windowTitle)
+        return Response(id: id, result: AnyCodable(result))
+
     case "check_permissions":
         let status = checkAllPermissions()
         return Response(id: id, result: AnyCodable(status))

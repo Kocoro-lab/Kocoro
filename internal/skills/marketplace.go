@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,6 +114,12 @@ type MarketplaceClient struct {
 	ttl  time.Duration
 	http *http.Client
 
+	// clawhubBase, when non-empty, switches Load() to fetch the catalog from
+	// ClawHub's live HTTP API (paging /api/v1/skills) instead of the static
+	// registry index at url. The fetched items are mapped into the same
+	// RegistryIndex shape so handlers and install stay transport-agnostic.
+	clawhubBase string
+
 	// staleCooldown bounds how often we re-attempt an upstream fetch
 	// while in stale mode. Exposed as a field (not a constructor arg)
 	// so tests can set a short cooldown directly.
@@ -131,6 +138,18 @@ type MarketplaceClient struct {
 func NewMarketplaceClient(url string, ttl time.Duration) *MarketplaceClient {
 	return &MarketplaceClient{
 		url:           url,
+		ttl:           ttl,
+		http:          &http.Client{Timeout: 15 * time.Second},
+		staleCooldown: defaultStaleCooldown,
+	}
+}
+
+// NewClawHubMarketplaceClient constructs a client that sources the catalog from
+// ClawHub's live API at base (e.g. "https://clawhub.ai"). Same caching/stale
+// semantics as the registry client.
+func NewClawHubMarketplaceClient(base string, ttl time.Duration) *MarketplaceClient {
+	return &MarketplaceClient{
+		clawhubBase:   strings.TrimRight(base, "/"),
 		ttl:           ttl,
 		http:          &http.Client{Timeout: 15 * time.Second},
 		staleCooldown: defaultStaleCooldown,
@@ -990,4 +1009,401 @@ func (c *MarketplaceClient) fetch(ctx context.Context) (*RegistryIndex, error) {
 		return nil, fmt.Errorf("parse registry: %w", err)
 	}
 	return &idx, nil
+}
+
+// ---- ClawHub live API source -------------------------------------------
+
+// ClawHub /api/v1/skills response shapes. Only the fields we map are declared.
+type clawhubListResp struct {
+	Items      []clawhubItem `json:"items"`
+	NextCursor *string       `json:"nextCursor"`
+}
+
+type clawhubItem struct {
+	Slug          string            `json:"slug"`
+	DisplayName   string            `json:"displayName"`
+	Summary       string            `json:"summary"`
+	Topics        []string          `json:"topics"`
+	Tags          map[string]string `json:"tags"`
+	Stats         clawhubStats      `json:"stats"`
+	LatestVersion clawhubVersion    `json:"latestVersion"`
+}
+
+type clawhubStats struct {
+	Downloads       int `json:"downloads"`
+	InstallsAllTime int `json:"installsAllTime"`
+	Stars           int `json:"stars"`
+}
+
+type clawhubVersion struct {
+	Version string  `json:"version"`
+	License *string `json:"license"`
+}
+
+// clawhubSort maps the desktop sort keys to ClawHub's supported /api/v1/skills
+// sort values. Unknown keys fall back to ClawHub's default ordering.
+func clawhubSort(sort string) string {
+	switch sort {
+	case "recommended", "":
+		return "recommended"
+	case "downloads":
+		return "downloads"
+	case "stars":
+		return "stars"
+	case "trending":
+		return "trending"
+	case "newest", "createdAt":
+		return "createdAt"
+	case "updated":
+		return "updated"
+	default:
+		return ""
+	}
+}
+
+// clawhubSearchResp / clawhubSearchResult model the dedicated full-text search
+// endpoint (/api/v1/search), whose shape differs from the list endpoint and
+// which actually honors the query (the list endpoint's ?q= is ignored upstream).
+type clawhubSearchResp struct {
+	Results []clawhubSearchResult `json:"results"`
+}
+
+type clawhubSearchResult struct {
+	Slug        string `json:"slug"`
+	DisplayName string `json:"displayName"`
+	Summary     string `json:"summary"`
+	Version     string `json:"version"`
+	Downloads   int    `json:"downloads"`
+	UpdatedAt   int64  `json:"updatedAt"`
+	Owner       struct {
+		Handle string `json:"handle"`
+	} `json:"owner"`
+}
+
+// clawhubSearchPool is how many relevance-ranked search hits to fetch so that
+// client-side re-sorting (by downloads / recency) is meaningful, not just a
+// reorder of the top few.
+const clawhubSearchPool = 100
+
+// FetchClawHubPage returns one page of the ClawHub catalog. The full catalog is
+// ~12k skills, so we never cache it whole — each request is proxied straight to
+// ClawHub.
+//
+//   - With a query: hit /api/v1/search (relevance-ranked; the list endpoint's
+//     ?q= is ignored by ClawHub). Search is not cursor-paginated, so next is "".
+//   - Without a query: hit /api/v1/skills with sort + cursor (Load-more paging).
+func (c *MarketplaceClient) FetchClawHubPage(ctx context.Context, q, sortKey, cursor string, limit int) ([]MarketplaceEntry, string, error) {
+	if c.clawhubBase == "" {
+		return nil, "", errors.New("not a clawhub client")
+	}
+	// <=0 → default page size; oversize → clamp to the ceiling (rather than
+	// silently snapping back to the default, which made size=201 yield 20).
+	if limit <= 0 {
+		limit = 20
+	} else if limit > 200 {
+		limit = 200
+	}
+
+	if q != "" {
+		// ClawHub search is relevance-ranked and ignores sort. Fetch a larger
+		// pool and re-order it ourselves so a chosen sort still applies within a
+		// query/category. Only downloads and recency are available on search
+		// results; other sort keys keep the relevance order.
+		pool := limit
+		if pool < clawhubSearchPool {
+			pool = clawhubSearchPool
+		}
+		u := fmt.Sprintf("%s/api/v1/search?limit=%d&q=%s", c.clawhubBase, pool, url.QueryEscape(q))
+		var sr clawhubSearchResp
+		if err := c.getJSON(ctx, u, &sr); err != nil {
+			return nil, "", err
+		}
+		switch sortKey {
+		case "downloads":
+			sort.SliceStable(sr.Results, func(i, j int) bool {
+				return sr.Results[i].Downloads > sr.Results[j].Downloads
+			})
+		case "newest", "createdAt", "updated":
+			sort.SliceStable(sr.Results, func(i, j int) bool {
+				return sr.Results[i].UpdatedAt > sr.Results[j].UpdatedAt
+			})
+		}
+		// Search has no cursor pagination: this pool IS the complete result set
+		// for the query, so we return all of it (next cursor "") rather than
+		// capping to limit — capping would hide most of a category with no way
+		// to load more.
+		entries := make([]MarketplaceEntry, 0, len(sr.Results))
+		for _, r := range sr.Results {
+			entries = append(entries, c.clawhubSearchToEntry(r))
+		}
+		return entries, "", nil
+	}
+
+	// nonSuspiciousOnly lets ClawHub drop flagged skills server-side — the
+	// closest equivalent to the registry path's IsMalicious() gate, since
+	// ClawHub list items carry no scan data for us to filter on locally.
+	u := fmt.Sprintf("%s/api/v1/skills?limit=%d&nonSuspiciousOnly=true", c.clawhubBase, limit)
+	if s := clawhubSort(sortKey); s != "" {
+		u += "&sort=" + url.QueryEscape(s)
+	}
+	if cursor != "" {
+		u += "&cursor=" + url.QueryEscape(cursor)
+	}
+	var lr clawhubListResp
+	if err := c.getJSON(ctx, u, &lr); err != nil {
+		return nil, "", err
+	}
+	entries := make([]MarketplaceEntry, 0, len(lr.Items))
+	for _, it := range lr.Items {
+		entries = append(entries, c.clawhubItemToEntry(it))
+	}
+	next := ""
+	if lr.NextCursor != nil {
+		next = *lr.NextCursor
+	}
+	return entries, next, nil
+}
+
+func (c *MarketplaceClient) clawhubSearchToEntry(r clawhubSearchResult) MarketplaceEntry {
+	name := r.DisplayName
+	if name == "" {
+		name = r.Slug
+	}
+	e := MarketplaceEntry{
+		Slug:        r.Slug,
+		Name:        name,
+		Description: r.Summary,
+		Author:      r.Owner.Handle,
+		DownloadURL: c.ClawHubDownloadURL(r.Slug, r.Owner.Handle),
+		Downloads:   r.Downloads,
+		Version:     r.Version,
+	}
+	if r.Owner.Handle != "" {
+		e.Homepage = fmt.Sprintf("%s/%s/%s", c.clawhubBase, r.Owner.Handle, r.Slug)
+	}
+	return e
+}
+
+// ClawHubDownloadURL is the deterministic zip artifact URL for a slug. Lets the
+// install/detail handlers build an entry without a full catalog lookup. owner
+// disambiguates slugs shared by multiple publishers (ClawHub returns 409 for a
+// bare ambiguous slug); pass "" when unknown.
+func (c *MarketplaceClient) ClawHubDownloadURL(slug, owner string) string {
+	u := fmt.Sprintf("%s/api/v1/download?slug=%s", c.clawhubBase, url.QueryEscape(slug))
+	if owner != "" {
+		u += "&owner=" + url.QueryEscape(owner)
+	}
+	return u
+}
+
+func (c *MarketplaceClient) clawhubItemToEntry(it clawhubItem) MarketplaceEntry {
+	name := it.DisplayName
+	if name == "" {
+		name = it.Slug
+	}
+	version := it.Tags["latest"]
+	if version == "" {
+		version = it.LatestVersion.Version
+	}
+	license := ""
+	if it.LatestVersion.License != nil {
+		license = *it.LatestVersion.License
+	}
+	return MarketplaceEntry{
+		Slug:        it.Slug,
+		Name:        name,
+		Description: it.Summary,
+		License:     license,
+		// ClawHub serves skills as zip artifacts; install uses this download URL.
+		// Browse items carry no owner handle, so the slug is left bare here.
+		DownloadURL: c.ClawHubDownloadURL(it.Slug, ""),
+		Downloads:   it.Stats.Downloads,
+		Stars:       it.Stats.Stars,
+		Version:     version,
+		Tags:        it.Topics,
+	}
+}
+
+// ClawHubDetail is a fully-built marketplace entry for one slug plus the SKILL.md
+// body usable as a pre-install preview. Built entirely from ClawHub's detail
+// endpoint, so the detail handler needs no cached catalog.
+type ClawHubDetail struct {
+	Entry   MarketplaceEntry
+	Preview string
+}
+
+// FetchClawHubDetail loads a single skill's detail from ClawHub and assembles a
+// MarketplaceEntry (including owner handle → author + homepage, and the full
+// SKILL.md as preview). Only valid on a ClawHub-sourced client.
+func (c *MarketplaceClient) FetchClawHubDetail(ctx context.Context, slug, owner string) (*ClawHubDetail, error) {
+	if c.clawhubBase == "" {
+		return nil, errors.New("not a clawhub client")
+	}
+	u := fmt.Sprintf("%s/api/v1/skills/%s", c.clawhubBase, url.PathEscape(slug))
+	if owner != "" {
+		u += "?owner=" + url.QueryEscape(owner)
+	}
+	var dr struct {
+		Skill struct {
+			Slug        string            `json:"slug"`
+			DisplayName string            `json:"displayName"`
+			Summary     string            `json:"summary"`
+			Description string            `json:"description"`
+			Topics      []string          `json:"topics"`
+			Tags        map[string]string `json:"tags"`
+			Stats       clawhubStats      `json:"stats"`
+		} `json:"skill"`
+		Owner struct {
+			Handle string `json:"handle"`
+		} `json:"owner"`
+		LatestVersion clawhubVersion `json:"latestVersion"`
+	}
+	if err := c.getJSON(ctx, u, &dr); err != nil {
+		return nil, err
+	}
+	name := dr.Skill.DisplayName
+	if name == "" {
+		name = slug
+	}
+	version := dr.Skill.Tags["latest"]
+	if version == "" {
+		version = dr.LatestVersion.Version
+	}
+	license := ""
+	if dr.LatestVersion.License != nil {
+		license = *dr.LatestVersion.License
+	}
+	entry := MarketplaceEntry{
+		Slug:        slug,
+		Name:        name,
+		Description: dr.Skill.Summary,
+		Author:      dr.Owner.Handle,
+		License:     license,
+		DownloadURL: c.ClawHubDownloadURL(slug, dr.Owner.Handle),
+		Downloads:   dr.Skill.Stats.Downloads,
+		Stars:       dr.Skill.Stats.Stars,
+		Version:     version,
+		Tags:        dr.Skill.Topics,
+	}
+	if dr.Owner.Handle != "" {
+		entry.Homepage = fmt.Sprintf("%s/%s/%s", c.clawhubBase, dr.Owner.Handle, slug)
+	}
+	return &ClawHubDetail{Entry: entry, Preview: dr.Skill.Description}, nil
+}
+
+// ClawHubFile is one file entry in a skill version's manifest.
+type ClawHubFile struct {
+	Path        string `json:"path"`
+	Size        int    `json:"size"`
+	ContentType string `json:"content_type"`
+}
+
+// resolveClawHubVersion returns version if non-empty, else the skill's latest
+// version (via the detail endpoint). owner disambiguates shared slugs.
+func (c *MarketplaceClient) resolveClawHubVersion(ctx context.Context, slug, version, owner string) (string, error) {
+	if version != "" {
+		return version, nil
+	}
+	d, err := c.FetchClawHubDetail(ctx, slug, owner)
+	if err != nil {
+		return "", err
+	}
+	return d.Entry.Version, nil
+}
+
+// FetchClawHubFiles returns the file manifest for a skill version (the resolved
+// version is returned too, useful when the caller passed "" for latest).
+func (c *MarketplaceClient) FetchClawHubFiles(ctx context.Context, slug, version, owner string) (string, []ClawHubFile, error) {
+	if c.clawhubBase == "" {
+		return "", nil, errors.New("not a clawhub client")
+	}
+	ver, err := c.resolveClawHubVersion(ctx, slug, version, owner)
+	if err != nil {
+		return "", nil, err
+	}
+	u := fmt.Sprintf("%s/api/v1/skills/%s/versions/%s", c.clawhubBase, url.PathEscape(slug), url.PathEscape(ver))
+	if owner != "" {
+		u += "?owner=" + url.QueryEscape(owner)
+	}
+	var vr struct {
+		Version struct {
+			Files []struct {
+				Path        string `json:"path"`
+				Size        int    `json:"size"`
+				ContentType string `json:"contentType"`
+			} `json:"files"`
+		} `json:"version"`
+	}
+	if err := c.getJSON(ctx, u, &vr); err != nil {
+		return "", nil, err
+	}
+	files := make([]ClawHubFile, 0, len(vr.Version.Files))
+	for _, f := range vr.Version.Files {
+		files = append(files, ClawHubFile{Path: f.Path, Size: f.Size, ContentType: f.ContentType})
+	}
+	return ver, files, nil
+}
+
+// FetchClawHubFile returns the raw text content of one file in a skill version.
+func (c *MarketplaceClient) FetchClawHubFile(ctx context.Context, slug, version, path, owner string) (string, error) {
+	if c.clawhubBase == "" {
+		return "", errors.New("not a clawhub client")
+	}
+	ver, err := c.resolveClawHubVersion(ctx, slug, version, owner)
+	if err != nil {
+		return "", err
+	}
+	u := fmt.Sprintf("%s/api/v1/skills/%s/file?path=%s&version=%s",
+		c.clawhubBase, url.PathEscape(slug), url.QueryEscape(path), url.QueryEscape(ver))
+	if owner != "" {
+		u += "&owner=" + url.QueryEscape(owner)
+	}
+	return c.getText(ctx, u)
+}
+
+// getText performs a GET and returns the raw response body as a string. Used for
+// file content (ClawHub caps single files at 200KB); 1 MB ceiling as a guard.
+func (c *MarketplaceClient) getText(ctx context.Context, rawURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch clawhub: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("fetch clawhub: status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+	if err != nil {
+		return "", fmt.Errorf("read clawhub body: %w", err)
+	}
+	return string(body), nil
+}
+
+// getJSON performs a GET and decodes the JSON body into v, sharing the HTTP
+// client, body cap, and error wrapping with the registry fetch path.
+func (c *MarketplaceClient) getJSON(ctx context.Context, rawURL string, v any) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch clawhub: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("fetch clawhub: status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024)) // 10 MB cap
+	if err != nil {
+		return fmt.Errorf("read clawhub body: %w", err)
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		return fmt.Errorf("parse clawhub: %w", err)
+	}
+	return nil
 }

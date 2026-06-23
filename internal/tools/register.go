@@ -308,9 +308,11 @@ func CompleteRegistration(ctx context.Context, gw *client.GatewayClient, cfg *co
 			}
 		}
 		// Disable legacy browser/automation tools when Playwright MCP is available.
-		// AppleScript, accessibility, and screenshot are macOS-native fallbacks that
-		// the LLM picks when playwright tools hit errors — remove them so the agent
-		// stays on playwright for all browser automation.
+		// AppleScript and screenshot are macOS-native browser fallbacks the LLM picks
+		// when playwright tools hit errors — remove them so the agent stays on
+		// playwright for all browser automation. `accessibility` is deliberately
+		// KEPT: it reads the AX tree of arbitrary native apps (e.g. WeChat), which
+		// playwright cannot do, so removing it broke reading non-web apps.
 		if hasPlaywright {
 			// Shut down any chromedp Chrome instance before removing the tool
 			if bt, ok := reg.Get("browser"); ok {
@@ -318,7 +320,7 @@ func CompleteRegistration(ctx context.Context, gw *client.GatewayClient, cfg *co
 					browserTool.Cleanup()
 				}
 			}
-			for _, legacy := range []string{"browser", "applescript", "accessibility", "screenshot", "wait_for"} {
+			for _, legacy := range []string{"browser", "applescript", "screenshot", "wait_for"} {
 				reg.Remove(legacy)
 			}
 			log.Printf("Playwright MCP connected — disabled legacy browser/automation tools")
@@ -894,7 +896,7 @@ func RebuildRegistryForHealth(
 	// Do NOT call browserTool.Cleanup() — in-flight sessions share the instance.
 	// Only remove from the NEW registry.
 	if playwrightPresent {
-		for _, legacy := range []string{"browser", "applescript", "accessibility", "screenshot", "wait_for"} {
+		for _, legacy := range []string{"browser", "applescript", "screenshot", "wait_for"} {
 			reg.Remove(legacy)
 		}
 	}
