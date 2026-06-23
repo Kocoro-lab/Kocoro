@@ -30,6 +30,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
+	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
 const wireFixturesDir = "../../docs/desktop-wire-fixtures"
@@ -369,6 +370,56 @@ func TestWireFixture_ToolStatus_Bus(t *testing.T) {
 	}
 }
 
+func TestWireFixture_Deliverable_Bus(t *testing.T) {
+	fixture := loadWireFixture(t, "bus_event.deliverable.json")
+
+	bus := NewEventBus()
+	sub := bus.Subscribe()
+	defer bus.Unsubscribe(sub)
+
+	d := tools.Deliverable{
+		ID:       fixture["id"].(string),
+		Path:     fixture["path"].(string),
+		Filename: fixture["filename"].(string),
+		Title:    fixture["title"].(string),
+		MIME:     fixture["mime"].(string),
+		ByteSize: int64(fixture["byte_size"].(float64)),
+	}
+	handler := makeDeliverableEventHandler(
+		bus,
+		fixture["session_id"].(string),
+		fixture["agent"].(string),
+		fixture["source"].(string),
+	)
+	if !handler(d) {
+		t.Fatal("deliverable handler reported no subscriber delivery")
+	}
+
+	evt := waitBusEvent(t, sub, EventDeliverable)
+	produced := parseJSONMap(t, evt.Payload)
+	normalizeRFC3339(t, produced, fixture, "ts")
+	assertSemanticEqual(t, fixture, produced)
+
+	var card struct {
+		SessionID string `json:"session_id"`
+		Agent     string `json:"agent"`
+		Source    string `json:"source"`
+		ID        string `json:"id"`
+		Path      string `json:"path"`
+		Filename  string `json:"filename"`
+		Title     string `json:"title"`
+		MIME      string `json:"mime"`
+		ByteSize  int64  `json:"byte_size"`
+		TS        string `json:"ts"`
+	}
+	if err := json.Unmarshal(evt.Payload, &card); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if card.ID == "" || !strings.HasPrefix(card.ID, "dlv_") || card.Path == "" || card.ByteSize == 0 {
+		t.Fatalf("consumer decode lost fields: %+v", card)
+	}
+}
+
 func TestWireFixture_Tool_PerRequestSSE(t *testing.T) {
 	running := loadWireFixture(t, "sse_event.tool.running.json")
 	completed := loadWireFixture(t, "sse_event.tool.completed.json")
@@ -516,6 +567,9 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	}
 	if !has(CapToolUseIDEvents) {
 		t.Fatalf("capabilities lost %q: %v", CapToolUseIDEvents, *status.Capabilities)
+	}
+	if !has(CapDeliverableEventV1) {
+		t.Fatalf("capabilities lost %q: %v", CapDeliverableEventV1, *status.Capabilities)
 	}
 	if status.Memory == nil || status.Memory.Provider != "disabled" || status.Memory.Reason != nil {
 		t.Fatalf("memory block decode mismatch: %+v", status.Memory)

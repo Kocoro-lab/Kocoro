@@ -63,6 +63,7 @@ Three transport surfaces, named by file prefix:
 | `sse_event.done.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | optional fields omitted here: `partial`, `failure_code`, `message_start_index`, `message_end_index` (all omitempty, soft-failure metadata) |
 | `bus_event.cloud_progress.json` | `bus_handler.go OnCloudProgress` | counts-only today; a future `items` array extension will be additive + capability-gated |
 | `bus_event.suggestion_ready.json` | `runner.go fireSuggestionAfterRun` | post-turn suggested next user prompt |
+| `bus_event.deliverable.json` | `bus_handler.go makeDeliverableEventHandler` | daemon-validated local regular-file metadata emitted by `present_deliverable`; Desktop dedupes live/replay/history records by `id` |
 
 ### HTTP responses
 
