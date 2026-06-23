@@ -64,7 +64,8 @@ type Server struct {
 	pendingBrokers sync.Map // map[string]*ApprovalBroker
 	onReload       func()   // called after config reload to restart watchers/heartbeat
 
-	marketplace  *skills.MarketplaceClient
+	marketplace  *skills.MarketplaceClient // static registry → /skills/marketplace/*
+	clawhub      *skills.MarketplaceClient // ClawHub live catalog → /skills/clawhub/*
 	slugLocks    *skills.SlugLocks
 	secretsStore *skills.SecretsStore
 	memSvc       *memory.Service
@@ -176,26 +177,23 @@ func resolveRegistryURL(deps *ServerDeps) string {
 	return defaultURL
 }
 
-// newMarketplaceClient builds the catalog client per config. With a real config
-// the default source is ClawHub's live API; "registry" selects the static index
-// at RegistryURL. Nil deps/config (test fixtures) fall back to the registry
-// client — those tests inject their own client anyway.
+// newMarketplaceClient builds the static-registry catalog client that backs the
+// /skills/marketplace/* endpoints (the contract the macOS Desktop consumes).
 func newMarketplaceClient(deps *ServerDeps) *skills.MarketplaceClient {
+	return skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour)
+}
+
+// newClawHubClient builds the live ClawHub catalog client that backs the
+// separate /skills/clawhub/* endpoints. Base URL comes from config; empty (or
+// nil deps/config, as in test fixtures) falls back to the public host.
+func newClawHubClient(deps *ServerDeps) *skills.MarketplaceClient {
+	base := "https://clawhub.ai"
 	if deps != nil && deps.Config != nil {
-		mc := deps.Config.Skills.Marketplace
-		source := mc.Source
-		if source == "" {
-			source = "clawhub"
-		}
-		if source == "clawhub" {
-			base := mc.ClawHubURL
-			if base == "" {
-				base = "https://clawhub.ai"
-			}
-			return skills.NewClawHubMarketplaceClient(base, 1*time.Hour)
+		if u := deps.Config.Skills.Marketplace.ClawHubURL; u != "" {
+			base = u
 		}
 	}
-	return skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour)
+	return skills.NewClawHubMarketplaceClient(base, 1*time.Hour)
 }
 
 var (
@@ -232,6 +230,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		eventBus:               NewEventBus(),
 		notifyApprovalResolved: func(p ApprovalResolvedPayload) error { return nil },
 		marketplace:            newMarketplaceClient(deps),
+		clawhub:                newClawHubClient(deps),
 		slugLocks:              skills.NewSlugLocks(),
 		secretsStore:           store,
 		suggestions:            agent.NewSuggestionState(),
@@ -453,8 +452,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /channels/feishu/app-installs/{id}", s.handleDeleteFeishuAppInstall)
 	mux.HandleFunc("GET /skills/marketplace", s.handleMarketplaceList)
 	mux.HandleFunc("GET /skills/marketplace/entry/{slug}", s.handleMarketplaceDetail)
-	mux.HandleFunc("GET /skills/marketplace/entry/{slug}/files", s.handleMarketplaceFiles)
-	mux.HandleFunc("GET /skills/marketplace/entry/{slug}/file", s.handleMarketplaceFile)
+	// ClawHub live-catalog API — separate surface from /skills/marketplace.
+	mux.HandleFunc("GET /skills/clawhub", s.handleClawHubList)
+	mux.HandleFunc("GET /skills/clawhub/entry/{slug}", s.handleClawHubDetail)
+	mux.HandleFunc("GET /skills/clawhub/entry/{slug}/files", s.handleClawHubFiles)
+	mux.HandleFunc("GET /skills/clawhub/entry/{slug}/file", s.handleClawHubFile)
+	mux.HandleFunc("POST /skills/clawhub/install/{slug}", s.handleClawHubInstall)
 	mux.HandleFunc("GET /skills", s.handleListSkills)
 	mux.HandleFunc("GET /skills/{name}", s.handleGetSkill)
 	mux.HandleFunc("PUT /skills/{name}", s.handlePutGlobalSkill)
@@ -549,6 +552,49 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /shutdown", s.handleShutdown)
 }
 
+// isLocalOrigin reports whether a browser Origin header belongs to the local
+// Desktop renderer: a localhost / 127.0.0.1 origin on any port, or the literal
+// "null" (file:// documents). Anything else is rejected so the daemon is not
+// reachable cross-origin from arbitrary web pages.
+func isLocalOrigin(origin string) bool {
+	switch {
+	case origin == "null":
+		return true
+	case origin == "http://localhost" || strings.HasPrefix(origin, "http://localhost:"):
+		return true
+	case origin == "http://127.0.0.1" || strings.HasPrefix(origin, "http://127.0.0.1:"):
+		return true
+	case strings.HasPrefix(origin, "https://localhost:") || strings.HasPrefix(origin, "https://127.0.0.1:"):
+		return true
+	}
+	return false
+}
+
+// withLocalCORS lets the local Desktop renderer (a Chromium origin on localhost)
+// call the daemon directly via fetch / EventSource. Only localhost origins (see
+// isLocalOrigin) get CORS headers; requests without an Origin (curl, same
+// process) pass through unchanged. Preflight OPTIONS requests are answered here
+// with 204 because the ServeMux registers no OPTIONS routes (they 405 otherwise).
+func withLocalCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" && isLocalOrigin(origin) {
+			hdr := w.Header()
+			hdr.Set("Access-Control-Allow-Origin", origin)
+			hdr.Add("Vary", "Origin")
+			hdr.Set("Access-Control-Allow-Credentials", "true")
+			hdr.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			// Last-Event-ID covers the SSE /events reconnection header.
+			hdr.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID")
+			hdr.Set("Access-Control-Max-Age", "600")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
 // Handler returns an http.Handler with every route registered. Used by
 // offline E2E tests that need to exercise HTTP handlers without listening
 // on a port or starting the memSvc / sync ticker side effects of Start.
@@ -556,7 +602,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
-	return mux
+	return withLocalCORS(mux)
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -572,7 +618,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.listenerMu.Lock()
 	s.listener = ln
 	s.listenerMu.Unlock()
-	s.server = &http.Server{Handler: mux}
+	s.server = &http.Server{Handler: withLocalCORS(mux)}
 
 	// Spawn the gated session-sync ticker. It self-disables when sync is
 	// not enabled, so it's always safe to start unconditionally here.
@@ -3337,7 +3383,14 @@ func (s *Server) handleMarketplaceList(w http.ResponseWriter, r *http.Request) {
 	if !s.requireDeps(w) {
 		return
 	}
+	idx, err := s.marketplace.Load(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+		return
+	}
+
 	q := r.URL.Query()
+	page := parseIntParam(q.Get("page"), 1)
 	size := parseIntParam(q.Get("size"), 20)
 	sortKey := q.Get("sort")
 	if sortKey == "" {
@@ -3345,62 +3398,27 @@ func (s *Server) handleMarketplaceList(w http.ResponseWriter, r *http.Request) {
 	}
 	search := q.Get("q")
 
+	entries, total := skills.FilterSortPaginate(idx.Skills, search, sortKey, page, size)
+
+	// Mark `installed` flag for entries already on disk.
+	installed := installedSkillSet(s.deps.ShannonDir)
 	type listItem struct {
 		skills.MarketplaceEntry
 		Installed bool `json:"installed"`
 	}
-	installed := installedSkillSet(s.deps.ShannonDir)
-
-	// ClawHub is a ~12k-entry, cursor-paginated catalog — too large to cache
-	// whole, so proxy one page per request. `cursor` is ClawHub's opaque
-	// cursor; the response carries `next_cursor` for the client to page with.
-	if s.marketplace.IsClawHub() {
-		entries, next, err := s.marketplace.FetchClawHubPage(r.Context(), search, sortKey, q.Get("cursor"), size)
-		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
-			return
-		}
-		items := make([]listItem, 0, len(entries))
-		for _, e := range entries {
-			items = append(items, listItem{MarketplaceEntry: e, Installed: installed[e.Slug]})
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"skills":      items,
-			"size":        size,
-			"next_cursor": next,
-		})
-		return
-	}
-
-	// Registry source: full static index, filtered/sorted/paged in memory.
-	// `cursor` carries a page number so the same client pager works; `page`
-	// is still accepted for back-compat.
-	idx, err := s.marketplace.Load(r.Context())
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
-		return
-	}
-	page := parseIntParam(q.Get("cursor"), parseIntParam(q.Get("page"), 1))
-
-	entries, total := skills.FilterSortPaginate(idx.Skills, search, sortKey, page, size)
 	items := make([]listItem, 0, len(entries))
 	for _, e := range entries {
 		items = append(items, listItem{MarketplaceEntry: e, Installed: installed[e.Slug]})
-	}
-	nextCursor := ""
-	if page*size < total {
-		nextCursor = strconv.Itoa(page + 1)
 	}
 
 	if s.marketplace.IsStale() {
 		w.Header().Set("X-Cache-Stale", "true")
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"total":       total,
-		"page":        page,
-		"size":        size,
-		"next_cursor": nextCursor,
-		"skills":      items,
+		"total":  total,
+		"page":   page,
+		"size":   size,
+		"skills": items,
 	})
 }
 
@@ -3436,36 +3454,26 @@ func (s *Server) handleMarketplaceInstall(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	idx, err := s.marketplace.Load(r.Context())
+	if err != nil {
+		s.auditHTTPOpError("POST", endpoint, "marketplace unavailable", err)
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+		return
+	}
 	var entry *skills.MarketplaceEntry
-	if s.marketplace.IsClawHub() {
-		// ClawHub zip URL is deterministic from the slug — no catalog lookup
-		// needed. ValidateSkillName above already constrains the slug.
-		entry = &skills.MarketplaceEntry{
-			Slug:        slug,
-			Name:        slug,
-			DownloadURL: s.marketplace.ClawHubDownloadURL(slug),
-		}
-	} else {
-		idx, err := s.marketplace.Load(r.Context())
-		if err != nil {
-			s.auditHTTPOpError("POST", endpoint, "marketplace unavailable", err)
-			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
-			return
-		}
-		for i := range idx.Skills {
-			if idx.Skills[i].Slug == slug {
-				entry = &idx.Skills[i]
-				break
-			}
-		}
-		if entry == nil {
-			s.auditHTTPOpError("POST", endpoint, "not in marketplace index", nil)
-			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
-			return
+	for i := range idx.Skills {
+		if idx.Skills[i].Slug == slug {
+			entry = &idx.Skills[i]
+			break
 		}
 	}
+	if entry == nil {
+		s.auditHTTPOpError("POST", endpoint, "not in marketplace index", nil)
+		writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
+		return
+	}
 
-	err := skills.InstallFromMarketplace(r.Context(), s.deps.ShannonDir, *entry, s.slugLocks)
+	err = skills.InstallFromMarketplace(r.Context(), s.deps.ShannonDir, *entry, s.slugLocks)
 	switch {
 	case err == nil:
 		// Audit success here, before the metadata-load early returns below,
@@ -3600,56 +3608,40 @@ func (s *Server) handleMarketplaceDetail(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Response wraps the entry plus live state. Preview holds the SKILL.md body
-	// (from ClawHub for not-yet-installed skills, or from disk once installed);
-	// empty string otherwise, so the field is always part of the schema. NO
-	// omitempty so Desktop clients can rely on the field's existence.
+	idx, err := s.marketplace.Load(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+		return
+	}
+	var entry *skills.MarketplaceEntry
+	for i := range idx.Skills {
+		if idx.Skills[i].Slug == slug {
+			entry = &idx.Skills[i]
+			break
+		}
+	}
+	if entry == nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
+		return
+	}
+
+	// Consistent with list + install: malicious entries are hidden.
+	if entry.IsMalicious() {
+		writeError(w, http.StatusForbidden, "skill blocked by security scan")
+		return
+	}
+
+	// Response wraps the registry entry plus live state. Preview holds the
+	// installed SKILL.md body when present — empty string otherwise, so the
+	// field is always part of the schema. NO omitempty so Desktop clients
+	// can rely on the field's existence regardless of install state.
 	type detailResponse struct {
 		skills.MarketplaceEntry
 		Installed bool   `json:"installed"`
 		Preview   string `json:"preview"`
 	}
-	var resp detailResponse
 
-	if s.marketplace.IsClawHub() {
-		// Build the entry straight from ClawHub's detail endpoint (owner,
-		// homepage, stats, and the full SKILL.md preview) — no cached catalog.
-		d, err := s.marketplace.FetchClawHubDetail(r.Context(), slug)
-		if err != nil {
-			// Distinguish "skill not on ClawHub" (404) from "ClawHub down" (503).
-			if strings.Contains(err.Error(), "status 404") {
-				writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
-			} else {
-				writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
-			}
-			return
-		}
-		resp = detailResponse{MarketplaceEntry: d.Entry, Preview: d.Preview}
-	} else {
-		idx, err := s.marketplace.Load(r.Context())
-		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
-			return
-		}
-		var entry *skills.MarketplaceEntry
-		for i := range idx.Skills {
-			if idx.Skills[i].Slug == slug {
-				entry = &idx.Skills[i]
-				break
-			}
-		}
-		if entry == nil {
-			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
-			return
-		}
-		// Consistent with list + install: malicious entries are hidden.
-		if entry.IsMalicious() {
-			writeError(w, http.StatusForbidden, "skill blocked by security scan")
-			return
-		}
-		resp = detailResponse{MarketplaceEntry: *entry}
-	}
-
+	resp := detailResponse{MarketplaceEntry: *entry}
 	skillDir := filepath.Join(s.deps.ShannonDir, "skills", slug)
 	skillFile := filepath.Join(skillDir, "SKILL.md")
 	if body, err := os.ReadFile(skillFile); err == nil {
@@ -3660,9 +3652,55 @@ func (s *Server) handleMarketplaceDetail(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleMarketplaceFiles returns the file manifest for a ClawHub skill version,
-// so the desktop can render a file tree. ClawHub-source only.
-func (s *Server) handleMarketplaceFiles(w http.ResponseWriter, r *http.Request) {
+// --- ClawHub handlers ---
+//
+// The /skills/clawhub/* endpoints are a SEPARATE API surface backed by
+// ClawHub's live online catalog (s.clawhub). They are intentionally decoupled
+// from /skills/marketplace/* (the static registry contract the macOS Desktop
+// consumes) so the two can evolve independently: ClawHub uses opaque cursor
+// pagination and exposes per-version file browsing that the registry can't.
+
+// handleClawHubList proxies one page of ClawHub's ~12k-entry, cursor-paginated
+// catalog. `cursor` is ClawHub's opaque cursor; the response carries
+// `next_cursor` for the client to page with (empty when exhausted / searching).
+func (s *Server) handleClawHubList(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
+	q := r.URL.Query()
+	size := parseIntParam(q.Get("size"), 20)
+	sortKey := q.Get("sort")
+	if sortKey == "" {
+		sortKey = "downloads"
+	}
+	search := q.Get("q")
+
+	entries, next, err := s.clawhub.FetchClawHubPage(r.Context(), search, sortKey, q.Get("cursor"), size)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
+		return
+	}
+	installed := installedSkillSet(s.deps.ShannonDir)
+	type listItem struct {
+		skills.MarketplaceEntry
+		Installed bool `json:"installed"`
+	}
+	items := make([]listItem, 0, len(entries))
+	for _, e := range entries {
+		items = append(items, listItem{MarketplaceEntry: e, Installed: installed[e.Slug]})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"skills":      items,
+		"size":        size,
+		"next_cursor": next,
+	})
+}
+
+// handleClawHubDetail builds the entry straight from ClawHub's detail endpoint
+// (owner, homepage, stats, and the full SKILL.md preview) — no cached catalog.
+// If the skill is already installed locally, the on-disk SKILL.md overlays the
+// preview and `installed` flips true.
+func (s *Server) handleClawHubDetail(w http.ResponseWriter, r *http.Request) {
 	if !s.requireDeps(w) {
 		return
 	}
@@ -3671,25 +3709,119 @@ func (s *Server) handleMarketplaceFiles(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if !s.marketplace.IsClawHub() {
-		writeError(w, http.StatusNotFound, "file listing not available for this marketplace source")
+	// Preview holds the SKILL.md body (from ClawHub for not-yet-installed
+	// skills, or from disk once installed); empty string otherwise, so the
+	// field is always part of the schema. NO omitempty so Desktop clients can
+	// rely on the field's existence.
+	type detailResponse struct {
+		skills.MarketplaceEntry
+		Installed bool   `json:"installed"`
+		Preview   string `json:"preview"`
+	}
+	d, err := s.clawhub.FetchClawHubDetail(r.Context(), slug)
+	if err != nil {
+		// Distinguish "skill not on ClawHub" (404) from "ClawHub down" (503).
+		if strings.Contains(err.Error(), "status 404") {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
+		} else {
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
+		}
 		return
 	}
-	version, files, err := s.marketplace.FetchClawHubFiles(r.Context(), slug, r.URL.Query().Get("version"))
+	resp := detailResponse{MarketplaceEntry: d.Entry, Preview: d.Preview}
+	skillFile := filepath.Join(s.deps.ShannonDir, "skills", slug, "SKILL.md")
+	if body, err := os.ReadFile(skillFile); err == nil {
+		resp.Installed = true
+		resp.Preview = string(body)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleClawHubInstall installs a ClawHub skill. The zip URL is deterministic
+// from the slug — no catalog lookup needed. ValidateSkillName constrains the
+// slug. Mirrors handleMarketplaceInstall's success/error handling.
+func (s *Server) handleClawHubInstall(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
+	slug := r.PathValue("slug")
+	endpoint := "/skills/clawhub/install/" + slug
+	if err := skills.ValidateSkillName(slug); err != nil {
+		s.auditHTTPOpError("POST", endpoint, "invalid slug", err)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	entry := skills.MarketplaceEntry{
+		Slug:        slug,
+		Name:        slug,
+		DownloadURL: s.clawhub.ClawHubDownloadURL(slug),
+	}
+	err := skills.InstallFromMarketplace(r.Context(), s.deps.ShannonDir, entry, s.slugLocks)
+	switch {
+	case err == nil:
+		s.auditHTTPOp("POST", endpoint, "installed skill: "+entry.Slug)
+		sources, _ := s.skillSources()
+		list, _ := skills.LoadSkills(sources...)
+		for _, skill := range list {
+			if skill.Slug == entry.Slug {
+				writeJSON(w, http.StatusCreated, skill.ToMeta())
+				return
+			}
+		}
+		fallbackName := entry.Name
+		if fallbackName == "" {
+			fallbackName = entry.Slug
+		}
+		writeJSON(w, http.StatusCreated, skills.SkillMeta{
+			Name:        fallbackName,
+			Slug:        entry.Slug,
+			Description: entry.Description,
+			Source:      "global",
+		})
+	case errors.Is(err, skills.ErrMaliciousSkill):
+		s.auditHTTPOpError("POST", endpoint, "malicious skill", err)
+		writeError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, skills.ErrSkillAlreadyInstalled):
+		s.auditHTTPOpError("POST", endpoint, "already installed", err)
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, skills.ErrInvalidSkillPayload):
+		s.auditHTTPOpError("POST", endpoint, "invalid payload", err)
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+	case errors.Is(err, skills.ErrMarketplaceUpstreamFailure):
+		s.auditHTTPOpError("POST", endpoint, "upstream failure", err)
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("install failed: %v", err))
+	default:
+		s.auditHTTPOpError("POST", endpoint, "install failed", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("install failed: %v", err))
+	}
+}
+
+// handleClawHubFiles returns the file manifest for a ClawHub skill version, so
+// the desktop can render a file tree.
+func (s *Server) handleClawHubFiles(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
+	slug := r.PathValue("slug")
+	if err := skills.ValidateSkillName(slug); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	version, files, err := s.clawhub.FetchClawHubFiles(r.Context(), slug, r.URL.Query().Get("version"))
 	if err != nil {
 		if strings.Contains(err.Error(), "status 404") {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
 		} else {
-			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
 		}
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"version": version, "files": files})
 }
 
-// handleMarketplaceFile returns the raw text content of one file in a ClawHub
-// skill version. ClawHub-source only.
-func (s *Server) handleMarketplaceFile(w http.ResponseWriter, r *http.Request) {
+// handleClawHubFile returns the raw text content of one file in a ClawHub skill
+// version.
+func (s *Server) handleClawHubFile(w http.ResponseWriter, r *http.Request) {
 	if !s.requireDeps(w) {
 		return
 	}
@@ -3703,16 +3835,12 @@ func (s *Server) handleMarketplaceFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing or invalid path")
 		return
 	}
-	if !s.marketplace.IsClawHub() {
-		writeError(w, http.StatusNotFound, "file content not available for this marketplace source")
-		return
-	}
-	content, err := s.marketplace.FetchClawHubFile(r.Context(), slug, r.URL.Query().Get("version"), path)
+	content, err := s.clawhub.FetchClawHubFile(r.Context(), slug, r.URL.Query().Get("version"), path)
 	if err != nil {
 		if strings.Contains(err.Error(), "status 404") {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("file %q not found", path))
 		} else {
-			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
 		}
 		return
 	}

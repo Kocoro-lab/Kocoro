@@ -23,8 +23,52 @@ Skills are knowledge packages that teach agents specific abilities — like read
 ### List marketplace skills
 - Method: GET
 - Path: /skills/marketplace
-- Response: `[{"slug": "string", "name": "string", "description": "string", "author": "string"}]`
-- Notes: Community-contributed skills from the Shannon marketplace.
+- Query: `?page=1&size=20&sort=downloads&q=<search>` (all optional; `sort` defaults to `downloads`)
+- Response: `{"total": <int>, "page": <int>, "size": <int>, "skills": [{"slug": "...", "name": "...", "description": "...", "author": "...", "installed": <bool>, ...}]}`
+- Notes: Community-contributed skills from the Shannon **static registry**. Integer page-based pagination. Sets `X-Cache-Stale: true` header when the cached index is being served stale. This is the contract the macOS Desktop consumes — see GET /skills/clawhub below for the separate ClawHub live-catalog API.
+
+### Marketplace skill detail
+- Method: GET
+- Path: /skills/marketplace/entry/{slug}
+- Response: `{"slug": "...", "name": "...", "description": "...", "author": "...", "homepage": "...", "installed": <bool>, "preview": "<SKILL.md body or empty>"}`
+- Notes: Registry source. Malicious entries return 403. `preview` is the on-disk SKILL.md when installed, else empty (always present in the schema). 404 if the slug is not in the registry index.
+
+## ClawHub live-catalog API (separate surface)
+
+The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~12k skills), a SEPARATE API from `/skills/marketplace/*`. They use opaque cursor pagination and expose per-version file browsing. Base URL is `skills.marketplace.clawhub_url` (default `https://clawhub.ai`). Install via either surface lands the skill on disk identically.
+
+### Browse ClawHub
+- Method: GET
+- Path: /skills/clawhub
+- Query: `?cursor=<opaque>&size=20&sort=downloads&q=<search>` (all optional)
+- Response: `{"skills": [{"slug": "...", "name": "...", "description": "...", "installed": <bool>, ...}], "size": <int>, "next_cursor": "<opaque or empty>"}`
+- Notes: **No `total`/`page`** — page forward by passing the returned `next_cursor` back as `cursor`. Empty `next_cursor` means no more pages (also empty for `q=` searches, which return the full relevance-ranked result set in one response). 503 when ClawHub is unreachable.
+
+### ClawHub skill detail
+- Method: GET
+- Path: /skills/clawhub/entry/{slug}
+- Response: `{"slug": "...", "name": "...", "author": "...", "homepage": "...", "version": "...", "installed": <bool>, "preview": "<SKILL.md body>"}`
+- Notes: Built live from ClawHub's detail endpoint (owner, homepage, stats, full SKILL.md preview). On-disk SKILL.md overlays the preview once installed. 404 if not on ClawHub, 503 if ClawHub is down.
+
+### ClawHub skill file manifest
+- Method: GET
+- Path: /skills/clawhub/entry/{slug}/files
+- Query: `?version=<ver>` (optional; resolves to latest when omitted)
+- Response: `{"version": "<resolved>", "files": [{"path": "...", "size": <int>, "content_type": "..."}]}`
+- Notes: For rendering a file tree before install. 404 if slug/version not found.
+
+### ClawHub skill file content
+- Method: GET
+- Path: /skills/clawhub/entry/{slug}/file
+- Query: `?path=<file>&version=<ver>` (`path` required, ≤512 bytes; `version` optional → latest)
+- Response: `{"path": "...", "content": "<raw text, ≤1 MB>"}`
+- Notes: 400 on missing/over-long path; 404 if the file is absent.
+
+### Install a ClawHub skill
+- Method: POST
+- Path: /skills/clawhub/install/{slug}
+- Response: `{"slug": "...", "name": "...", "description": "...", "install_source": "marketplace"}`
+- Notes: Downloads the deterministic zip artifact for the slug and installs it. Same response/error matrix as POST /skills/marketplace/install/{slug} (409 already installed, 403 malicious, 422 invalid payload, 502 upstream).
 
 ### Install a bundled skill
 - Method: POST
