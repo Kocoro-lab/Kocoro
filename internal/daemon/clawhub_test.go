@@ -1,14 +1,37 @@
 package daemon
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
+
+// clawhubSkillZip builds a minimal valid skill zip (one SKILL.md with
+// frontmatter) for the fake ClawHub download endpoint.
+func clawhubSkillZip(t *testing.T, slug string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	f, err := zw.Create("SKILL.md")
+	if err != nil {
+		t.Fatalf("zip create: %v", err)
+	}
+	if _, err := f.Write([]byte("---\nname: " + slug + "\ndescription: installed from clawhub\n---\nbody")); err != nil {
+		t.Fatalf("zip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+	return buf.Bytes()
+}
 
 // newTestServerWithClawHub wires a Server whose ClawHub client points at a fake
 // upstream that routes the /api/v1/* surface FetchClawHub* methods consume.
@@ -57,6 +80,29 @@ func newTestServerWithClawHub(t *testing.T) (*Server, *httptest.Server) {
 			return
 		}
 		_, _ = w.Write([]byte("# Alpha\n\nbody"))
+	})
+	// Full-text search (distinct shape from the list endpoint; honors q).
+	mux.HandleFunc("/api/v1/search", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"results": []map[string]interface{}{
+				{"slug": "gamma", "displayName": "Gamma", "summary": "matched",
+					"version": "3.0.0", "downloads": 5, "updatedAt": 100,
+					"owner": map[string]string{"handle": "acme"}},
+				{"slug": "delta", "displayName": "Delta", "summary": "matched too",
+					"version": "1.2.0", "downloads": 50, "updatedAt": 200,
+					"owner": map[string]string{"handle": "globex"}},
+			},
+		})
+	})
+	// Deterministic zip artifact download (install transport).
+	mux.HandleFunc("/api/v1/download", func(w http.ResponseWriter, r *http.Request) {
+		slug := r.URL.Query().Get("slug")
+		if slug == "" {
+			http.Error(w, "missing slug", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		_, _ = w.Write(clawhubSkillZip(t, slug))
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -206,5 +252,79 @@ func TestHandleClawHubFileMissingPath(t *testing.T) {
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestHandleClawHubListSearch covers the q != "" branch: ClawHub's full-text
+// search endpoint is hit (distinct shape from browse), results are returned in
+// one page, and next_cursor is empty (search is not cursor-paginated).
+func TestHandleClawHubListSearch(t *testing.T) {
+	s, _ := newTestServerWithClawHub(t)
+
+	req := httptest.NewRequest("GET", "/skills/clawhub?q=match&sort=downloads", nil)
+	rr := httptest.NewRecorder()
+	s.handleClawHubList(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Skills     []skills.MarketplaceEntry `json:"skills"`
+		NextCursor string                    `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.NextCursor != "" {
+		t.Errorf("next_cursor = %q, want empty for a search", body.NextCursor)
+	}
+	if len(body.Skills) != 2 {
+		t.Fatalf("skills len = %d, want 2", len(body.Skills))
+	}
+	// sort=downloads re-orders the relevance-ranked pool: delta(50) before gamma(5).
+	if body.Skills[0].Slug != "delta" {
+		t.Errorf("re-sort by downloads wrong: got %q first, want delta", body.Skills[0].Slug)
+	}
+	// Search results carry the owner handle as author.
+	if body.Skills[0].Author != "globex" {
+		t.Errorf("author = %q, want globex", body.Skills[0].Author)
+	}
+}
+
+// TestHandleClawHubInstall covers the install handler: it builds the entry from
+// the deterministic download URL, installs the fetched zip, and returns 201 with
+// the on-disk skill metadata.
+func TestHandleClawHubInstall(t *testing.T) {
+	s, _ := newTestServerWithClawHub(t)
+
+	req := httptest.NewRequest("POST", "/skills/clawhub/install/alpha", nil)
+	req.SetPathValue("slug", "alpha")
+	rr := httptest.NewRecorder()
+	s.handleClawHubInstall(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(s.deps.ShannonDir, "skills", "alpha", "SKILL.md")); err != nil {
+		t.Errorf("installed file missing: %v", err)
+	}
+	var meta skills.SkillMeta
+	if err := json.Unmarshal(rr.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if meta.Slug != "alpha" {
+		t.Errorf("meta.Slug = %q, want alpha", meta.Slug)
+	}
+	if meta.InstallSource != skills.InstallSourceMarketplace {
+		t.Errorf("meta.InstallSource = %q, want %q", meta.InstallSource, skills.InstallSourceMarketplace)
+	}
+
+	// Second install of the same slug must conflict (409).
+	req2 := httptest.NewRequest("POST", "/skills/clawhub/install/alpha", nil)
+	req2.SetPathValue("slug", "alpha")
+	rr2 := httptest.NewRecorder()
+	s.handleClawHubInstall(rr2, req2)
+	if rr2.Code != http.StatusConflict {
+		t.Errorf("second install status = %d, want 409; body = %s", rr2.Code, rr2.Body.String())
 	}
 }

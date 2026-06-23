@@ -156,11 +156,6 @@ func NewClawHubMarketplaceClient(base string, ttl time.Duration) *MarketplaceCli
 	}
 }
 
-// IsClawHub reports whether this client sources the catalog from ClawHub's API.
-func (c *MarketplaceClient) IsClawHub() bool {
-	return c != nil && c.clawhubBase != ""
-}
-
 // Load returns the current registry index, refetching when the cache is
 // empty or past TTL. See the type doc for stale-on-error semantics.
 func (c *MarketplaceClient) Load(ctx context.Context) (*RegistryIndex, error) {
@@ -1101,8 +1096,12 @@ func (c *MarketplaceClient) FetchClawHubPage(ctx context.Context, q, sortKey, cu
 	if c.clawhubBase == "" {
 		return nil, "", errors.New("not a clawhub client")
 	}
-	if limit <= 0 || limit > 200 {
+	// <=0 → default page size; oversize → clamp to the ceiling (rather than
+	// silently snapping back to the default, which made size=201 yield 20).
+	if limit <= 0 {
 		limit = 20
+	} else if limit > 200 {
+		limit = 200
 	}
 
 	if q != "" {
