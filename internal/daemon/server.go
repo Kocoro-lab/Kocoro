@@ -65,7 +65,8 @@ type Server struct {
 	pendingBrokers sync.Map // map[string]*ApprovalBroker
 	onReload       func()   // called after config reload to restart watchers/heartbeat
 
-	marketplace  *skills.MarketplaceClient
+	marketplace  *skills.MarketplaceClient // static registry → /skills/marketplace/*
+	clawhub      *skills.MarketplaceClient // ClawHub live catalog → /skills/clawhub/*
 	slugLocks    *skills.SlugLocks
 	secretsStore *skills.SecretsStore
 	memSvc       *memory.Service
@@ -199,6 +200,25 @@ func resolveRegistryURL(deps *ServerDeps) string {
 	return defaultURL
 }
 
+// newMarketplaceClient builds the static-registry catalog client that backs the
+// /skills/marketplace/* endpoints (the contract the macOS Desktop consumes).
+func newMarketplaceClient(deps *ServerDeps) *skills.MarketplaceClient {
+	return skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour)
+}
+
+// newClawHubClient builds the live ClawHub catalog client that backs the
+// separate /skills/clawhub/* endpoints. Base URL comes from config; empty (or
+// nil deps/config, as in test fixtures) falls back to the public host.
+func newClawHubClient(deps *ServerDeps) *skills.MarketplaceClient {
+	base := "https://clawhub.ai"
+	if deps != nil && deps.Config != nil {
+		if u := deps.Config.Skills.Marketplace.ClawHubURL; u != "" {
+			base = u
+		}
+	}
+	return skills.NewClawHubMarketplaceClient(base, 1*time.Hour)
+}
+
 var (
 	showChromeOnPortFn        = mcp.ShowCDPChromeOnPort
 	hideChromeOnPortFn        = mcp.HideCDPChromeOnPort
@@ -232,7 +252,8 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		approvalBroker:         NewApprovalBroker(func(req ApprovalRequest) error { return nil }),
 		eventBus:               NewEventBus(),
 		notifyApprovalResolved: func(p ApprovalResolvedPayload) error { return nil },
-		marketplace:            skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour),
+		marketplace:            newMarketplaceClient(deps),
+		clawhub:                newClawHubClient(deps),
 		slugLocks:              skills.NewSlugLocks(),
 		secretsStore:           store,
 		suggestions:            agent.NewSuggestionState(),
@@ -456,6 +477,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /channels/feishu/app-installs/{id}", s.handleDeleteFeishuAppInstall)
 	mux.HandleFunc("GET /skills/marketplace", s.handleMarketplaceList)
 	mux.HandleFunc("GET /skills/marketplace/entry/{slug}", s.handleMarketplaceDetail)
+	// ClawHub live-catalog API — separate surface from /skills/marketplace.
+	mux.HandleFunc("GET /skills/clawhub", s.handleClawHubList)
+	mux.HandleFunc("GET /skills/clawhub/entry/{slug}", s.handleClawHubDetail)
+	mux.HandleFunc("GET /skills/clawhub/entry/{slug}/files", s.handleClawHubFiles)
+	mux.HandleFunc("GET /skills/clawhub/entry/{slug}/file", s.handleClawHubFile)
+	mux.HandleFunc("POST /skills/clawhub/install/{slug}", s.handleClawHubInstall)
 	mux.HandleFunc("GET /skills", s.handleListSkills)
 	mux.HandleFunc("GET /skills/{name}", s.handleGetSkill)
 	mux.HandleFunc("PUT /skills/{name}", s.handlePutGlobalSkill)
@@ -550,6 +577,49 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /shutdown", s.handleShutdown)
 }
 
+// isLocalOrigin reports whether a browser Origin header belongs to the local
+// Desktop renderer: a localhost / 127.0.0.1 origin on any port, or the literal
+// "null" (file:// documents). Anything else is rejected so the daemon is not
+// reachable cross-origin from arbitrary web pages.
+func isLocalOrigin(origin string) bool {
+	switch {
+	case origin == "null":
+		return true
+	case origin == "http://localhost" || strings.HasPrefix(origin, "http://localhost:"):
+		return true
+	case origin == "http://127.0.0.1" || strings.HasPrefix(origin, "http://127.0.0.1:"):
+		return true
+	case strings.HasPrefix(origin, "https://localhost:") || strings.HasPrefix(origin, "https://127.0.0.1:"):
+		return true
+	}
+	return false
+}
+
+// withLocalCORS lets the local Desktop renderer (a Chromium origin on localhost)
+// call the daemon directly via fetch / EventSource. Only localhost origins (see
+// isLocalOrigin) get CORS headers; requests without an Origin (curl, same
+// process) pass through unchanged. Preflight OPTIONS requests are answered here
+// with 204 because the ServeMux registers no OPTIONS routes (they 405 otherwise).
+func withLocalCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" && isLocalOrigin(origin) {
+			hdr := w.Header()
+			hdr.Set("Access-Control-Allow-Origin", origin)
+			hdr.Add("Vary", "Origin")
+			hdr.Set("Access-Control-Allow-Credentials", "true")
+			hdr.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			// Last-Event-ID covers the SSE /events reconnection header.
+			hdr.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID")
+			hdr.Set("Access-Control-Max-Age", "600")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
 // Handler returns an http.Handler with every route registered. Used by
 // offline E2E tests that need to exercise HTTP handlers without listening
 // on a port or starting the memSvc / sync ticker side effects of Start.
@@ -557,7 +627,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
-	return mux
+	return withLocalCORS(mux)
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -573,7 +643,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.listenerMu.Lock()
 	s.listener = ln
 	s.listenerMu.Unlock()
-	s.server = &http.Server{Handler: mux}
+	s.server = &http.Server{Handler: withLocalCORS(mux)}
 
 	// Spawn the gated session-sync ticker. It self-disables when sync is
 	// not enabled, so it's always safe to start unconditionally here.
@@ -2388,6 +2458,38 @@ func (s *Server) resolveSkillDir(name string) (string, string, bool, error) {
 	return "", "", false, os.ErrNotExist
 }
 
+// resolveSkillIdent maps a client-supplied skill identifier to the canonical
+// on-disk slug. Clients should address skills by Slug, but the SKILL.md display
+// Name is kept as a backward-compat alias — the macOS Desktop addresses skills
+// by Name, which diverges from Slug for marketplace skills (e.g. name "Docker"
+// → slug "docker", name "self-improvement" → slug "self-improving-agent").
+// Returns the canonical slug and true on a match; ("", false) when nothing
+// matches, so the caller keeps the original identifier and lets normal
+// validation / 404 handling apply (e.g. creating a brand-new skill via PUT).
+func (s *Server) resolveSkillIdent(ident string) (string, bool) {
+	sources, err := s.skillSources()
+	if err != nil {
+		return "", false
+	}
+	list, err := skills.LoadSkills(sources...)
+	if err != nil {
+		return "", false
+	}
+	// Exact slug match wins, so a skill whose display Name happens to equal
+	// another skill's Slug can't shadow the real one.
+	for _, sk := range list {
+		if sk.Slug == ident {
+			return sk.Slug, true
+		}
+	}
+	for _, sk := range list {
+		if strings.EqualFold(sk.Name, ident) {
+			return sk.Slug, true
+		}
+	}
+	return "", false
+}
+
 func isValidSkillFileName(name string) bool {
 	if len(name) == 0 || len(name) > 255 {
 		return false
@@ -3464,6 +3566,11 @@ func (s *Server) handleSkillUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -3641,52 +3748,263 @@ func (s *Server) handleMarketplaceDetail(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	slug := r.PathValue("slug")
+	// The macOS Desktop addresses installed skills by display name; canonicalize
+	// to the on-disk slug so a name-addressed lookup hits the registry / ClawHub.
+	if canon, ok := s.resolveSkillIdent(slug); ok {
+		slug = canon
+	}
 	if err := skills.ValidateSkillName(slug); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	idx, err := s.marketplace.Load(r.Context())
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("marketplace unavailable: %v", err))
-		return
-	}
-	var entry *skills.MarketplaceEntry
-	for i := range idx.Skills {
-		if idx.Skills[i].Slug == slug {
-			entry = &idx.Skills[i]
-			break
-		}
-	}
-	if entry == nil {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
-		return
-	}
 
-	// Consistent with list + install: malicious entries are hidden.
-	if entry.IsMalicious() {
-		writeError(w, http.StatusForbidden, "skill blocked by security scan")
-		return
-	}
-
-	// Response wraps the registry entry plus live state. Preview holds the
-	// installed SKILL.md body when present — empty string otherwise, so the
-	// field is always part of the schema. NO omitempty so Desktop clients
-	// can rely on the field's existence regardless of install state.
+	// Response wraps the entry plus live state. Preview holds the installed
+	// SKILL.md body when present — empty string otherwise, so the field is
+	// always part of the schema (no omitempty) for Desktop clients.
 	type detailResponse struct {
 		skills.MarketplaceEntry
 		Installed bool   `json:"installed"`
 		Preview   string `json:"preview"`
 	}
+	overlayInstalled := func(resp *detailResponse) {
+		skillFile := filepath.Join(s.deps.ShannonDir, "skills", slug, "SKILL.md")
+		if body, err := os.ReadFile(skillFile); err == nil {
+			resp.Installed = true
+			resp.Preview = string(body)
+		}
+	}
 
-	resp := detailResponse{MarketplaceEntry: *entry}
-	skillDir := filepath.Join(s.deps.ShannonDir, "skills", slug)
-	skillFile := filepath.Join(skillDir, "SKILL.md")
+	// Primary surface: the static registry (the contract the macOS Desktop
+	// consumes). Registry-down is non-fatal — fall through to ClawHub.
+	if idx, err := s.marketplace.Load(r.Context()); err == nil {
+		for i := range idx.Skills {
+			if idx.Skills[i].Slug == slug {
+				entry := idx.Skills[i]
+				// Consistent with list + install: malicious entries are hidden.
+				if entry.IsMalicious() {
+					writeError(w, http.StatusForbidden, "skill blocked by security scan")
+					return
+				}
+				resp := detailResponse{MarketplaceEntry: entry}
+				overlayInstalled(&resp)
+				writeJSON(w, http.StatusOK, resp)
+				return
+			}
+		}
+	}
+
+	// Not in the static registry — fall back to ClawHub's live catalog so a
+	// skill installed from ClawHub (which never appears in the registry) still
+	// resolves its detail (e.g. the Desktop's "View details" on such a skill).
+	if s.clawhub != nil {
+		if d, cerr := s.clawhub.FetchClawHubDetail(r.Context(), slug, r.URL.Query().Get("owner")); cerr == nil {
+			resp := detailResponse{MarketplaceEntry: d.Entry, Preview: d.Preview}
+			overlayInstalled(&resp)
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+	}
+
+	writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
+}
+
+// --- ClawHub handlers ---
+//
+// The /skills/clawhub/* endpoints are a SEPARATE API surface backed by
+// ClawHub's live online catalog (s.clawhub). They are intentionally decoupled
+// from /skills/marketplace/* (the static registry contract the macOS Desktop
+// consumes) so the two can evolve independently: ClawHub uses opaque cursor
+// pagination and exposes per-version file browsing that the registry can't.
+
+// handleClawHubList proxies one page of ClawHub's ~12k-entry, cursor-paginated
+// catalog. `cursor` is ClawHub's opaque cursor; the response carries
+// `next_cursor` for the client to page with (empty when exhausted / searching).
+func (s *Server) handleClawHubList(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
+	q := r.URL.Query()
+	size := parseIntParam(q.Get("size"), 20)
+	sortKey := q.Get("sort")
+	if sortKey == "" {
+		sortKey = "downloads"
+	}
+	search := q.Get("q")
+
+	entries, next, err := s.clawhub.FetchClawHubPage(r.Context(), search, sortKey, q.Get("cursor"), size)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
+		return
+	}
+	installed := installedSkillSet(s.deps.ShannonDir)
+	type listItem struct {
+		skills.MarketplaceEntry
+		Installed bool `json:"installed"`
+	}
+	items := make([]listItem, 0, len(entries))
+	for _, e := range entries {
+		items = append(items, listItem{MarketplaceEntry: e, Installed: installed[e.Slug]})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"skills":      items,
+		"size":        size,
+		"next_cursor": next,
+	})
+}
+
+// handleClawHubDetail builds the entry straight from ClawHub's detail endpoint
+// (owner, homepage, stats, and the full SKILL.md preview) — no cached catalog.
+// If the skill is already installed locally, the on-disk SKILL.md overlays the
+// preview and `installed` flips true.
+func (s *Server) handleClawHubDetail(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
+	slug := r.PathValue("slug")
+	if err := skills.ValidateSkillName(slug); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Preview holds the SKILL.md body (from ClawHub for not-yet-installed
+	// skills, or from disk once installed); empty string otherwise, so the
+	// field is always part of the schema. NO omitempty so Desktop clients can
+	// rely on the field's existence.
+	type detailResponse struct {
+		skills.MarketplaceEntry
+		Installed bool   `json:"installed"`
+		Preview   string `json:"preview"`
+	}
+	// owner disambiguates slugs shared by multiple publishers (the desktop
+	// passes the entry's author); without it ClawHub 409s on an ambiguous slug.
+	d, err := s.clawhub.FetchClawHubDetail(r.Context(), slug, r.URL.Query().Get("owner"))
+	if err != nil {
+		// Distinguish "skill not on ClawHub" (404) from "ClawHub down" (503).
+		if strings.Contains(err.Error(), "status 404") {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
+		} else {
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
+		}
+		return
+	}
+	resp := detailResponse{MarketplaceEntry: d.Entry, Preview: d.Preview}
+	skillFile := filepath.Join(s.deps.ShannonDir, "skills", slug, "SKILL.md")
 	if body, err := os.ReadFile(skillFile); err == nil {
 		resp.Installed = true
 		resp.Preview = string(body)
 	}
-
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleClawHubInstall installs a ClawHub skill. The zip URL is deterministic
+// from the slug — no catalog lookup needed. ValidateSkillName constrains the
+// slug. Mirrors handleMarketplaceInstall's success/error handling.
+func (s *Server) handleClawHubInstall(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
+	slug := r.PathValue("slug")
+	endpoint := "/skills/clawhub/install/" + slug
+	if err := skills.ValidateSkillName(slug); err != nil {
+		s.auditHTTPOpError("POST", endpoint, "invalid slug", err)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	entry := skills.MarketplaceEntry{
+		Slug:        slug,
+		Name:        slug,
+		// owner disambiguates slugs shared by multiple publishers; without it
+		// ClawHub's download endpoint 409s on an ambiguous slug.
+		DownloadURL: s.clawhub.ClawHubDownloadURL(slug, r.URL.Query().Get("owner")),
+	}
+	err := skills.InstallFromMarketplace(r.Context(), s.deps.ShannonDir, entry, s.slugLocks)
+	switch {
+	case err == nil:
+		s.auditHTTPOp("POST", endpoint, "installed skill: "+entry.Slug)
+		sources, _ := s.skillSources()
+		list, _ := skills.LoadSkills(sources...)
+		for _, skill := range list {
+			if skill.Slug == entry.Slug {
+				writeJSON(w, http.StatusCreated, skill.ToMeta())
+				return
+			}
+		}
+		fallbackName := entry.Name
+		if fallbackName == "" {
+			fallbackName = entry.Slug
+		}
+		writeJSON(w, http.StatusCreated, skills.SkillMeta{
+			Name:        fallbackName,
+			Slug:        entry.Slug,
+			Description: entry.Description,
+			Source:      "global",
+		})
+	case errors.Is(err, skills.ErrMaliciousSkill):
+		s.auditHTTPOpError("POST", endpoint, "malicious skill", err)
+		writeError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, skills.ErrSkillAlreadyInstalled):
+		s.auditHTTPOpError("POST", endpoint, "already installed", err)
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, skills.ErrInvalidSkillPayload):
+		s.auditHTTPOpError("POST", endpoint, "invalid payload", err)
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+	case errors.Is(err, skills.ErrMarketplaceUpstreamFailure):
+		s.auditHTTPOpError("POST", endpoint, "upstream failure", err)
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("install failed: %v", err))
+	default:
+		s.auditHTTPOpError("POST", endpoint, "install failed", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("install failed: %v", err))
+	}
+}
+
+// handleClawHubFiles returns the file manifest for a ClawHub skill version, so
+// the desktop can render a file tree.
+func (s *Server) handleClawHubFiles(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
+	slug := r.PathValue("slug")
+	if err := skills.ValidateSkillName(slug); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	version, files, err := s.clawhub.FetchClawHubFiles(r.Context(), slug, r.URL.Query().Get("version"), r.URL.Query().Get("owner"))
+	if err != nil {
+		if strings.Contains(err.Error(), "status 404") {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
+		} else {
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"version": version, "files": files})
+}
+
+// handleClawHubFile returns the raw text content of one file in a ClawHub skill
+// version.
+func (s *Server) handleClawHubFile(w http.ResponseWriter, r *http.Request) {
+	if !s.requireDeps(w) {
+		return
+	}
+	slug := r.PathValue("slug")
+	if err := skills.ValidateSkillName(slug); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	path := r.URL.Query().Get("path")
+	if path == "" || len(path) > 512 {
+		writeError(w, http.StatusBadRequest, "missing or invalid path")
+		return
+	}
+	content, err := s.clawhub.FetchClawHubFile(r.Context(), slug, r.URL.Query().Get("version"), path, r.URL.Query().Get("owner"))
+	if err != nil {
+		if strings.Contains(err.Error(), "status 404") {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("file %q not found", path))
+		} else {
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"path": path, "content": content})
 }
 
 // parseIntParam parses a positive int query parameter, falling back to def
@@ -3815,6 +4133,11 @@ func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
 	// management). Hidden is a browse-list display filter, not an access
 	// control. Do not add a hidden check here without revisiting handleListSkills.
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -3861,6 +4184,11 @@ func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePutGlobalSkill(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	// NOTE: deliberately NO display-name canonicalization here. PUT create/update
+	// must target the literal slug — otherwise creating a brand-new skill could
+	// be silently retargeted onto an existing skill whose display name collides
+	// with the chosen slug, overwriting it. (Read/delete/secrets endpoints do
+	// canonicalize, since name-addressing an existing skill is the intent there.)
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4007,6 +4335,11 @@ func (s *Server) handleDeleteGlobalSkill(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4039,6 +4372,11 @@ func (s *Server) handleDeleteGlobalSkill(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handlePutSkillSecrets(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4070,6 +4408,11 @@ func (s *Server) handlePutSkillSecrets(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteSkillSecrets(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4084,6 +4427,9 @@ func (s *Server) handleDeleteSkillSecrets(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleDeleteSkillSecretKey(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	key := r.PathValue("key")
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -4139,6 +4485,11 @@ func (s *Server) handleDeleteSkillAssets(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleListSkillSubresource(w http.ResponseWriter, r *http.Request, subdir string) {
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4175,6 +4526,11 @@ func (s *Server) handleListSkillSubresource(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) handlePutSkillSubresource(w http.ResponseWriter, r *http.Request, subdir string) {
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4247,6 +4603,11 @@ func (s *Server) handlePutSkillSubresource(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleDeleteSkillSubresource(w http.ResponseWriter, r *http.Request, subdir string) {
 	name := r.PathValue("name")
+	// Accept a display-name alias (backward compat) by canonicalizing it to the
+	// on-disk slug before validation/lookup; unknown idents pass through.
+	if slug, ok := s.resolveSkillIdent(name); ok {
+		name = slug
+	}
 	if err := skills.ValidateSkillName(name); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

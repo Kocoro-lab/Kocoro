@@ -107,7 +107,7 @@ internal/
   memory/                # Memory sidecar client (UDS, bundle pull, tenant fingerprint)
   mcp/                   # MCP client manager + JSON-RPC server + Chrome lifecycle
   runstatus/             # User-facing run state codes + 429 sub-shape parser
-  skills/                # Skill registry, loader, secrets, marketplace
+  skills/                # Skill registry, loader, secrets, marketplace (two sources: static registry → /skills/marketplace/*; ClawHub live catalog → /skills/clawhub/*)
   tools/                 # Tool implementations (see Local Tools below)
   uploads/               # /api/v1/uploads client (POST/GET/DELETE)
   images/                # /api/v1/images/{generations,edits} client
@@ -205,6 +205,7 @@ Unknown tools → denied (fail-safe). Always-ask gate runs BEFORE the allowlist,
 | file_read dedup | `agent/readtracker.go` + `daemon/readtracker_cache.go` | Records `(path, offset, limit, mtime, size)`; re-reads return a stub. Per-session, released via `SessionManager.OnSessionClose`. |
 | Image size guard | `imaging_compress.go` + `oversize_image.go` | Three layers: source-time compression (`EncodeImage` decode→2000×2000→JPEG ladder), wire-time sanitizer (`filterOversizeImages` in `messagesForLLM`), persist-time guard (`SanitizedRunMessages`). |
 | Skill secrets | `skills/secrets.go` | Keychain `com.shannon.skill.<name>` + plaintext index of key NAMES only. Env-var-only injection, scoped to skills activated by `use_skill` in the current run. |
+| Skill marketplace sources | `daemon/server.go` (`s.marketplace` / `s.clawhub`) + `config.MarketplaceConfig` | TWO independent API surfaces, never share a response shape. `/skills/marketplace/*` = static registry (`registry_url`), integer `page` pagination, `{total,page,size,skills}` — **this is the frozen macOS Desktop contract; do not add source-conditional branches here.** `/skills/clawhub/*` = ClawHub live catalog (`clawhub_url`, default `https://clawhub.ai`), opaque `cursor` pagination (`{skills,size,next_cursor}`), plus per-version `/files` + `/file` browsing and `/install/{slug}` via deterministic zip URL. Both back the same `MarketplaceClient` (mode set by constructor) and install to the same on-disk location. |
 | Turn phase tracker | `agent/phase.go` | Only `PhaseAwaitingLLM` and `PhaseForceStop` idle-counted. Fail-closed: panics under `testing.Testing()` or `SHANNON_PHASE_STRICT=1`. |
 | Idle watchdog | `agent/watchdog.go` + `client/gateway.go` | Two layers. Turn-elapsed: `OnRunStatus("idle_soft")` at `agent.idle_soft_timeout_secs` (default 90), `ctx.Cancel(ErrHardIdleTimeout)` at hard (default 540; opt out via `0` + startup WARN). Streaming chunk-gap: `CompleteStream` returns `ErrStreamIdleTimeout` if no SSE chunk arrives within `agent.stream_idle_timeout_secs` (default 90). The loop short-circuits the streaming→Complete fallback on `ErrStreamIdleTimeout` and `isRetryableLLMError` refuses to retry it. `completeWithRetry` prefers `context.Cause(ctx)`. |
 | Mid-turn checkpoint | runner `applyTurn*` helpers | Fires at three phase-exit boundaries; 2s debounce. Same helpers run from checkpoint, final save, and hard-error save. `session.InProgress` non-zero on reload = crash recovery. |

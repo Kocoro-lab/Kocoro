@@ -24,7 +24,7 @@ Kocoro is the Go CLI/runtime for Shannon AI agents. The main production path is 
 - internal/client: gateway/SSE/Ollama clients plus AuthClient (`/api/v1/auth/*` REST wrapper).
 - internal/session: session persistence, lifecycle, titles, and SQLite FTS index.
 - internal/config: config loading, merging, settings, and setup.
-- internal/skills: skill registry, bundled skills, marketplace install, provenance, secrets, validation.
+- internal/skills: skill registry, bundled skills, marketplace install, provenance, secrets, validation. Marketplace has two independent API surfaces: `/skills/marketplace/*` (static registry, integer-page pagination — the frozen macOS Desktop contract) and `/skills/clawhub/*` (ClawHub live catalog, opaque cursor pagination + per-version file browsing).
 - internal/memory: sidecar client/supervisor, bundle puller, tenant safety, audit, service orchestration.
 - internal/sync: opt-in session sync; locking, markers, scanning, batching, upload, backoff.
 - internal/mcp: MCP client/server and browser profile lifecycle.
