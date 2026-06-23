@@ -1273,20 +1273,26 @@ func (c *MarketplaceClient) FetchClawHubDetail(ctx context.Context, slug, owner 
 	if dr.LatestVersion.License != nil {
 		license = *dr.LatestVersion.License
 	}
+	// Use the canonical slug ClawHub resolved the request to (the requested
+	// path may be a non-canonical alias), falling back to the request slug.
+	resolvedSlug := dr.Skill.Slug
+	if resolvedSlug == "" {
+		resolvedSlug = slug
+	}
 	entry := MarketplaceEntry{
-		Slug:        slug,
+		Slug:        resolvedSlug,
 		Name:        name,
 		Description: dr.Skill.Summary,
 		Author:      dr.Owner.Handle,
 		License:     license,
-		DownloadURL: c.ClawHubDownloadURL(slug, dr.Owner.Handle),
+		DownloadURL: c.ClawHubDownloadURL(resolvedSlug, dr.Owner.Handle),
 		Downloads:   dr.Skill.Stats.Downloads,
 		Stars:       dr.Skill.Stats.Stars,
 		Version:     version,
 		Tags:        dr.Skill.Topics,
 	}
 	if dr.Owner.Handle != "" {
-		entry.Homepage = fmt.Sprintf("%s/%s/%s", c.clawhubBase, dr.Owner.Handle, slug)
+		entry.Homepage = fmt.Sprintf("%s/%s/%s", c.clawhubBase, dr.Owner.Handle, resolvedSlug)
 	}
 	return &ClawHubDetail{Entry: entry, Preview: dr.Skill.Description}, nil
 }
