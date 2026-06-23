@@ -1752,19 +1752,30 @@ type syncAgentsBody struct {
 	Agents        []SyncAgentItem `json:"agents"`
 }
 
+// SyncAgentsResult is the ack Cloud returns from the agent-sync PUT. Synced is
+// the number of agents accepted; SoftDeleted is how many cloud agents the
+// full_sync reconciliation tombstoned (always 0 on an upsert-only push). The
+// daemon logs SoftDeleted so an unexpected mass-delete is visible in the log.
+type SyncAgentsResult struct {
+	Synced      int `json:"synced"`
+	SoftDeleted int `json:"soft_deleted"`
+}
+
 // SyncAgents PUTs agents to Cloud's mirror. fullSync=true reconciles deletes.
 // syncStartedAt is the instant the local snapshot was taken; Cloud gates
 // full_sync soft-delete on it (only deletes agents whose cloud updated_at <=
-// syncStartedAt) so agents created on cloud after the snapshot survive.
-func (c *GatewayClient) SyncAgents(ctx context.Context, agents []SyncAgentItem, fullSync bool, syncStartedAt time.Time) error {
+// syncStartedAt) so agents created on cloud after the snapshot survive. A 200
+// carries a JSON ack ({synced, soft_deleted}); a malformed non-empty success
+// body is surfaced as an error rather than swallowed (an empty body is allowed).
+func (c *GatewayClient) SyncAgents(ctx context.Context, agents []SyncAgentItem, fullSync bool, syncStartedAt time.Time) (*SyncAgentsResult, error) {
 	payload, err := json.Marshal(syncAgentsBody{FullSync: fullSync, SyncStartedAt: syncStartedAt, Agents: agents})
 	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+		return nil, fmt.Errorf("marshal: %w", err)
 	}
 	endpoint := c.baseURL + "/api/v1/agents/sync"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if key := c.getAPIKey(); key != "" {
@@ -1772,13 +1783,17 @@ func (c *GatewayClient) SyncAgents(ctx context.Context, agents []SyncAgentItem, 
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("sync agents returned %d: %s", resp.StatusCode, readResponseBody(resp))
+		return nil, fmt.Errorf("sync agents returned %d: %s", resp.StatusCode, readResponseBody(resp))
 	}
-	return nil
+	var out SyncAgentsResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil && err != io.EOF {
+		return nil, fmt.Errorf("decode sync ack: %w", err)
+	}
+	return &out, nil
 }
 
 // PullAgents GETs the tenant's agent mirror.
