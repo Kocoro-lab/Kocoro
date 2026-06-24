@@ -1667,7 +1667,10 @@ func (m *Model) View() string {
 		// Live preview of the answer being generated (transient; the finalized
 		// answer is rendered to scrollback on agentDoneMsg). Shown above the
 		// spinner so the user sees real-time progress instead of a frozen dot.
-		if preview := streamPreview(m.streamLive, m.width, streamPreviewLines); preview != "" {
+		// width-1: keep preview lines one column short of full width. A live
+		// line that fills the FULL width breaks Bubbletea's inline line
+		// accounting and ghosts the lines below it (the messy duplicated text).
+		if preview := streamPreview(m.streamLive, m.width-1, streamPreviewLines); preview != "" {
 			sb.WriteString(preview)
 			sb.WriteString("\n")
 		}

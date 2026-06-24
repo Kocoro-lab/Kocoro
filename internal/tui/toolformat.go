@@ -31,6 +31,8 @@ func toolKeyArg(toolName string, argsJSON string) string {
 		key = strVal(m, "url")
 	case "web_search":
 		key = strVal(m, "query")
+	case "use_skill":
+		key = strVal(m, "skill_name")
 	case "screenshot":
 		key = "screen"
 	case "computer":
