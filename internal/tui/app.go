@@ -1667,42 +1667,32 @@ func (m *Model) View() string {
 		// Live preview of the answer being generated (transient; the finalized
 		// answer is rendered to scrollback on agentDoneMsg). Shown above the
 		// spinner so the user sees real-time progress instead of a frozen dot.
-		// Live preview of the in-flight answer, one column short of full width so
-		// the inline renderer never wrap-miscounts a row (the same logical-vs-
-		// physical row bug fixed for the status bar below).
-		if preview := streamPreview(m.streamLive, m.width-1, streamPreviewLines); preview != "" {
-			sb.WriteString(preview)
-			sb.WriteString("\n")
-		}
+		// CRITICAL — streaming live region is ONLY short lines. During a turn the
+		// agent commits tool lines + answer segments via tea.Println MID-TURN.
+		// Any near-full-width line in this animated live region physically wraps
+		// on CJK / braille (the terminal undercounts display width by MORE than
+		// one cell), so Bubbletea's inline CursorUp undershoots and tea.Println
+		// freezes the live region into scrollback — the "ghost text marching down
+		// the screen" bug. So: NO answer preview, NO composer box, NO width-
+		// filling status bar here; just a spinner line + a short status line,
+		// both kept well under terminal width. The composer returns in
+		// stateInput/stateApproval; the full answer renders on agentDoneMsg.
+		glyph := dotFrames[m.glyphIdx%len(dotFrames)]
+		glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(spinColors[m.colorIdx%len(spinColors)]))
+		var spin string
 		if m.pendingToolName != "" {
-			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
-			color := spinColors[m.colorIdx%len(spinColors)]
-			glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
-			dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 			keyArg := toolKeyArg(m.pendingToolName, m.pendingToolArgs)
-			sb.WriteString(glyphStyle.Render(glyph) + dimStyle.Render(" "+formatToolCallLabel(m.pendingToolName, keyArg)))
+			spin = glyphStyle.Render(glyph) + styleDim().Render(" "+formatToolCallLabel(m.pendingToolName, keyArg))
 		} else {
-			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
-			color := spinColors[m.colorIdx%len(spinColors)]
-			glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
-			spinnerText := m.spinnerTexts[m.spinnerIdx%len(m.spinnerTexts)]
-			sb.WriteString(glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx))
+			spin = glyphStyle.Render(glyph) + " " + renderWaveText(m.spinnerTexts[m.spinnerIdx%len(m.spinnerTexts)], m.glyphIdx)
 		}
+		// Truncate so a long (possibly CJK) tool arg can never approach width.
+		sb.WriteString(truncateCells(spin, m.width-2, "…"))
 		sb.WriteString("\n")
-		// Keep the composer visible (dimmed) so the chat box doesn't vanish while
-		// the agent works. (Its box is width-1 already, so it's not the leak.)
-		sb.WriteString(renderDimComposer(m.textarea.Value(), m.width))
-		sb.WriteString("\n")
-		// Bottom status bar: left "esc to interrupt" hint (cancelling a run is
-		// otherwise undiscoverable) + right model tier and execution timer.
+		// Short status line (no width fill) — cancel hint + model + timer.
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
-		leftHint := styleDim().Render(" esc to interrupt")
-		rightInfo := styleDim().Render(m.modelDisplayLabel() + " " + elapsed)
-		// width-1: a live-region line built to EXACTLY m.width has zero slack —
-		// if the terminal renders it one cell wider than StringWidth counts (CJK,
-		// braille spinner), it physically wraps, Bubbletea's inline CursorUp
-		// undershoots, and the bar is frozen into scrollback on the next Println.
-		sb.WriteString(composeBar(m.width-1, leftHint, rightInfo) + "\n")
+		sb.WriteString(styleDim().Render("  esc to interrupt · " + m.modelDisplayLabel() + " · " + elapsed))
+		sb.WriteString("\n")
 	case stateApproval:
 		// Keep the composer visible (dimmed) above the approval prompt so the
 		// chat box doesn't vanish while awaiting a y/n/a decision.
