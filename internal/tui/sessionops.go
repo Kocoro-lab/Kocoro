@@ -40,7 +40,6 @@ func (m *Model) forkSession(id string) tea.Cmd {
 		m.appendOutput(fmt.Sprintf("  Fork failed: %v", err))
 		return m.flushPrints()
 	}
-	n := len(src.Messages)
 	srcTitle := src.Title
 
 	fork := m.sessions.NewSession()
@@ -52,6 +51,9 @@ func (m *Model) forkSession(id string) tea.Cmd {
 	m.resumedSession = true
 	m.sessionAllowed = make(map[string]bool)
 	m.applyRuntimeContext(fork)
-	m.appendOutput(fmt.Sprintf("  Forked from \"%s\" — %d messages carried over", srcTitle, n))
-	return m.flushPrints()
+	// Render the forked conversation to scrollback — mirrors the resume path
+	// (loadSessionHistory renders async, hence no flushPrints). The "(fork)"
+	// title tells the user this is a branch of the original.
+	m.loadSessionHistory(fork)
+	return nil
 }

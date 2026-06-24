@@ -3,7 +3,16 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
+
+// pastePlaceholder is the exact composer placeholder for a stashed paste. It
+// includes the char count so (a) the user sees how big the paste was and (b) a
+// user can't realistically type the placeholder verbatim — guarding expandPastes
+// from clobbering literal "[Pasted text #N]" text the user happens to type.
+func pastePlaceholder(n int, text string) string {
+	return fmt.Sprintf("[Pasted text #%d (%d chars)]", n, utf8.RuneCountInString(text))
+}
 
 // pasteTruncateThreshold: a bracketed paste longer than this many runes is
 // stashed and replaced in the composer with a [Pasted text #N] placeholder, so
@@ -20,7 +29,7 @@ func expandPastes(input string, pastes map[int]string) string {
 	}
 	out := input
 	for n, text := range pastes {
-		out = strings.ReplaceAll(out, fmt.Sprintf("[Pasted text #%d]", n), text)
+		out = strings.ReplaceAll(out, pastePlaceholder(n, text), text)
 	}
 	return out
 }
@@ -33,5 +42,5 @@ func (m *Model) stashPaste(text string) {
 	}
 	m.pasteCounter++
 	m.pastes[m.pasteCounter] = text
-	m.textarea.InsertString(fmt.Sprintf("[Pasted text #%d]", m.pasteCounter))
+	m.textarea.InsertString(pastePlaceholder(m.pasteCounter, text))
 }
