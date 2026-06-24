@@ -93,7 +93,7 @@ func parseMessageOrigin(source string, blob json.RawMessage) *MessageOrigin {
 // stickyFromRequest parses the inbound blob into a MessageOrigin and builds the
 // sticky-context block. Extracted from runner.go so the parse→render glue is
 // unit-testable without a full RunAgent.
-func stickyFromRequest(source, channel, sender, agentName, imBindings, extra string, blob json.RawMessage, cache *ConnectionStateCache) string {
+func stickyFromRequest(source, channel, sender, agentName, imBindings string, participants []string, extra string, blob json.RawMessage, cache *ConnectionStateCache) string {
 	origin := parseMessageOrigin(source, blob)
 	connState := ""
 	if origin != nil {
@@ -108,7 +108,7 @@ func stickyFromRequest(source, channel, sender, agentName, imBindings, extra str
 		// EXISTING sessions too — not only on the new-session Preamble.
 		connState = cache.PlatformLine(strings.ToLower(strings.TrimSpace(source)))
 	}
-	return buildStickyContext(source, channel, sender, agentName, imBindings, extra, origin, connState)
+	return buildStickyContext(source, channel, sender, agentName, imBindings, participants, extra, origin, connState)
 }
 
 // slackScope maps a Slack channel id's leading char to a human scope.

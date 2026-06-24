@@ -1176,3 +1176,40 @@ func TestSystemPrompt_IncludesDeliveryReceiptSemantics(t *testing.T) {
 		}
 	}
 }
+
+func TestSystemPrompt_IncludesMentionSemantics(t *testing.T) {
+	// The @-mention section anchors two load-bearing contracts:
+	//   1. ID hygiene: the agent only ever has display names — never the
+	//      platform's internal UUID / 29:… / aadObjectId / U… IDs. Removing the
+	//      "NEVER write internal user identifiers" sentence would let the model
+	//      hallucinate IDs and ship them to Cloud, which would then either
+	//      mis-route the mention or surface raw IDs to other users.
+	//   2. Roster authority: when Cloud injects a `Conversation participants:`
+	//      sticky line (Bot Framework /pagedmembers for Teams, channels.members
+	//      for Slack, ...), the agent may @-mention ANY name on it, not only
+	//      people it has seen speak. Removing the "Who you may @-mention"
+	//      paragraph regresses Teams to refuse-to-mention behavior even when
+	//      Cloud could have resolved the name.
+	// Both regressions are silent — they don't break compilation or tests
+	// elsewhere — so we lock the phrases here.
+	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
+
+	for _, want := range []string{
+		"**@mentions (mentioning other users)**",     // sub-section anchor
+		"`@<display name>`",                          // the format the agent must use
+		"EXACT name you have seen",                   // forbids paraphrasing
+		"NEVER write internal user identifiers",      // ID hygiene
+		"`aadObjectId`",                              // exemplar IDs the model must not write
+		"Slack `U…`",                                 // exemplar IDs (Slack form)
+		"**Who you may @-mention:**",                 // roster-vs-seen-speak sub-anchor
+		"`Conversation participants:` list",          // names the sticky block (bulleted list, not flat line)
+		"each bullet (`- <name>`) is one atomic name", // teaches the model the bullet format protects "Smith, Bob" as one name
+		"\"Smith, Bob\" is ONE person, not two",      // negative example so the model doesn't mis-split enterprise names
+		"roster is authoritative",                    // unblocks Teams roster path
+		"silently degrades to plain text",            // safety-net wording (prevents over-refusal)
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("system prompt missing @-mention phrase %q", want)
+		}
+	}
+}

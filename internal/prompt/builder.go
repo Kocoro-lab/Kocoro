@@ -286,6 +286,42 @@ func buildStaticSystem(opts PromptOptions) string {
 		"delivered. Never claim a message failed to send unless you actually saw " +
 		"such a note this turn.")
 
+	// 3.7. @mentions (stable). The agent only ever sees other participants by
+	// their human-readable display name — Cloud strips platform IDs out of the
+	// inbound text before the model sees it. The outbound path mirrors this:
+	// the agent writes `@<display name>` inline using the exact name it has
+	// seen, and Cloud resolves it to the platform's user identifier
+	// (Teams aadObjectId / `29:…`, Slack `U…`, etc.) at send time. The
+	// authoritative set of who-may-be-mentioned is the `Conversation
+	// participants:` bulleted list Cloud injects into sticky context
+	// (forwarded from the platform roster, e.g. Bot Framework /pagedmembers
+	// for Teams); one name per bullet so enterprise "Last, First" names
+	// ("Smith, Bob") stay atomic. Surfaces without a roster (1:1 chat, TUI,
+	// ...) omit the list, and the model falls back to gating on participants
+	// it has seen speak. Without this paragraph the model either invents an
+	// ID (hallucination — it has none) or refuses to mention roster members
+	// it hasn't seen speak.
+	sb.WriteString("\n\n**@mentions (mentioning other users)** — when you want " +
+		"to ping another participant inline, write `@<display name>` using the " +
+		"EXACT name you have seen for that person in this conversation (same " +
+		"spelling, casing, and spacing, including any commas — a name like " +
+		"\"Smith, Bob\" is ONE person, not two). On channels that support " +
+		"mentions (Teams, Slack, …), Cloud resolves the name to the platform's " +
+		"user identifier when it sends; channels without mention support render " +
+		"plain text. NEVER write internal user identifiers — UUIDs, Teams " +
+		"`29:…`, `aadObjectId`, Slack `U…` IDs, and so on — you do not have " +
+		"them, and writing one accomplishes nothing.\n\n" +
+		"**Who you may @-mention:** when a `Conversation participants:` list is " +
+		"present in the sticky context above, you may @-mention ANY name on it " +
+		"— each bullet (`- <name>`) is one atomic name (commas inside a bullet " +
+		"belong to that single name), and you do not need to have seen that " +
+		"person speak in this conversation; the roster is authoritative. When " +
+		"no such list is present (1:1 chat, single-user surface, or roster " +
+		"unavailable), only @-mention people you have actually seen speak. " +
+		"Cloud safety net: an unrecognized or ambiguous name silently degrades " +
+		"to plain text — no notification, no harm — so do not refuse to mention " +
+		"on a hunch; try the name.")
+
 	// 4. macOS automation guidance (only on darwin with relevant tools)
 	if guidance := macOSAutomationGuidance(opts.LocalToolNames); guidance != "" {
 		sb.WriteString("\n\n")

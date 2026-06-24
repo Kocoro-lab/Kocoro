@@ -84,6 +84,13 @@ type RunAgentRequest struct {
 	ForegroundHint  *ForegroundHint       `json:"foreground_hint,omitempty"`   // app the user was looking at when they summoned the quick panel; folded into StickyContext so screen-reading tools default to it
 	Files           []RemoteFile          `json:"-"`                           // remote file attachments from Cloud (WS only)
 
+	// Participants is the live conversation roster (display names) Cloud
+	// forwards from the inbound MessagePayload. Carried through to
+	// stickyFromRequest so the prompt's "Conversation participants:" line
+	// can list everyone the agent is allowed to @-mention. Empty for
+	// non-roster surfaces (TUI / one-shot / webview / 1:1 chats).
+	Participants []string `json:"-"`
+
 	// IM message lifecycle plumbing for the run's PRIMARY user message (first
 	// turn). Mid-run follow-ups carry their own copies on InjectedMessage.
 	// CloudMessageID is the Cloud envelope id; IMStatusContext is the opaque
@@ -2116,7 +2123,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			stickyExtra += strings.Join(pre, "\n")
 		}
 	}
-	if sticky := stickyFromRequest(req.Source, req.Channel, req.Sender, agentName, imBindings, stickyExtra, req.IMStatusContext, deps.ConnState); sticky != "" {
+	if sticky := stickyFromRequest(req.Source, req.Channel, req.Sender, agentName, imBindings, req.Participants, stickyExtra, req.IMStatusContext, deps.ConnState); sticky != "" {
 		loop.SetStickyContext(sticky)
 	}
 
