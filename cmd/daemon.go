@@ -419,6 +419,7 @@ var daemonStartCmd = &cobra.Command{
 				Sender:          msg.Sender,
 				CWD:             msg.CWD,
 				Files:           msg.Files,
+				Participants:    msg.Participants,
 				CloudMessageID:  msg.MessageID,
 				IMStatusContext: msg.IMStatusContext,
 			}
