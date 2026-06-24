@@ -221,13 +221,16 @@ func (m *Model) switchToAgent(name string) tea.Cmd {
 
 	m.rebuildAgentLoop()
 
-	// Fresh conversation (same pattern as /clear); applyRuntimeContext also
-	// rebuilds the slash commands for the new agent.
+	// Fresh conversation state, but APPEND the notice to scrollback rather than
+	// ClearScreen+re-print: ClearScreen (\x1b[2J) does not clear the terminal's
+	// saved-lines, so rerenderOutput would leave the old startup header in
+	// history and stack a duplicate. flushPrints just emits the notice; the
+	// prior conversation stays as immutable scrollback above it.
 	m.output = nil
 	sess := m.sessions.NewSession()
 	m.resumedSession = false
 	m.sessionAllowed = make(map[string]bool)
 	m.applyRuntimeContext(sess)
 	m.appendOutput("  Switched to agent: " + m.agentLabel())
-	return m.rerenderOutput()
+	return m.flushPrints()
 }
