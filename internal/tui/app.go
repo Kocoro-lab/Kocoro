@@ -206,6 +206,7 @@ type Model struct {
 	pasteCounter        int            // last [Pasted text #N] number
 	promptSuggestion    string         // current follow-up suggestion (ghost text under composer)
 	suggestionGen       int            // bumped each turn; stales in-flight suggestions
+	ctrlCArmed          bool           // first Ctrl+C cleared the conversation; the next exits
 	state               state
 	width               int
 	height              int
@@ -865,18 +866,58 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.finishHeaderAnimation()
 		}
 
+		// Any non-Ctrl+C key disarms the "Ctrl+C again to exit" prompt, so only
+		// two CONSECUTIVE Ctrl+C presses exit.
+		if msg.Type != tea.KeyCtrlC {
+			m.ctrlCArmed = false
+		}
+
 		switch msg.Type {
 		case tea.KeyCtrlC:
-			m.hookRunner.RunStop(context.Background(), "")
-			m.sessions.Save()
-			m.sessions.Close()
-			if m.toolCleanup != nil {
-				m.toolCleanup()
+			// During the brief startup animation, Ctrl+C exits immediately.
+			if m.state == stateStartup {
+				return m, m.quitCmd()
 			}
-			if m.remoteCleanup != nil {
-				m.remoteCleanup()
+			// Cancel an in-flight run (like Esc) rather than clearing/exiting.
+			if m.state == stateProcessing || m.state == stateApproval {
+				m.streamLive = ""
+				if m.cancelRun != nil {
+					m.cancelRun()
+					m.cancelRun = nil
+					m.injectCh = nil
+				}
+				if m.state == stateApproval {
+					select {
+					case m.approvalCh <- false:
+					default:
+					}
+				}
+				m.appendOutput(lipgloss.NewStyle().Foreground(colorDim).Render("  [Cancelled]"))
+				m.state = stateInput
+				m.ctrlCArmed = false
+				return m, m.rerenderOutput()
 			}
-			return m, tea.Quit
+			// A non-empty composer clears first (one undo-able step).
+			if m.state == stateInput && strings.TrimSpace(m.textarea.Value()) != "" {
+				m.textarea.Reset()
+				m.textarea.SetHeight(1)
+				m.ctrlCArmed = false
+				return m, nil
+			}
+			// First Ctrl+C on an empty composer: clear the conversation + arm exit.
+			if !m.ctrlCArmed {
+				m.ctrlCArmed = true
+				m.output = nil
+				m.clearSuggestion()
+				sess := m.sessions.NewSession()
+				m.resumedSession = false
+				m.sessionAllowed = make(map[string]bool)
+				m.applyRuntimeContext(sess)
+				m.appendOutput(lipgloss.NewStyle().Foreground(colorDim).Render("  Conversation cleared. Press Ctrl+C again to exit."))
+				return m, tea.Sequence(tea.ClearScreen, m.flushPrints())
+			}
+			// Second consecutive Ctrl+C: exit.
+			return m, m.quitCmd()
 		case tea.KeyEscape:
 			if m.state == stateProcessing || m.state == stateApproval {
 				m.streamLive = "" // drop any in-flight preview on cancel
@@ -1694,16 +1735,34 @@ func (m *Model) View() string {
 	return sb.String()
 }
 
+// quitCmd runs shutdown cleanup (hooks, session save/close, tool + remote
+// teardown) and returns tea.Quit. Shared by the Ctrl+C exit paths.
+func (m *Model) quitCmd() tea.Cmd {
+	m.hookRunner.RunStop(context.Background(), "")
+	m.sessions.Save()
+	m.sessions.Close()
+	if m.toolCleanup != nil {
+		m.toolCleanup()
+	}
+	if m.remoteCleanup != nil {
+		m.remoteCleanup()
+	}
+	return tea.Quit
+}
+
 // renderUserMessage renders a user turn as a distinct background block (a role
 // cell): a subtle bg + bright text reads as "my turn" far better than a text
 // color alone. Shared by the live echo and resumed/forked history.
-func renderUserMessage(text string) string {
-	return lipgloss.NewStyle().
+func renderUserMessage(text string, width int) string {
+	style := lipgloss.NewStyle().
 		Foreground(lipgloss.AdaptiveColor{Light: "#102A43", Dark: "#E6EEF8"}).
 		Background(lipgloss.AdaptiveColor{Light: "#DCE8F5", Dark: "#243447"}).
 		Bold(true).
-		Padding(0, 1).
-		Render("› " + text)
+		Padding(0, 1)
+	if width > 4 {
+		style = style.Width(width) // fill the full terminal row (CC-style bar)
+	}
+	return style.Render("› " + text)
 }
 
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
@@ -1726,7 +1785,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.historyIdx = -1
 	m.historySaved = ""
 
-	m.appendOutput(renderUserMessage(input))
+	m.appendOutput(renderUserMessage(input, m.width))
 
 	// Expand [Pasted text #N] placeholders to their stashed full text for the
 	// model; the echo + history above keep the compact placeholder form.
@@ -1903,7 +1962,7 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 		for _, msg := range messages {
 			switch msg.Role {
 			case "user":
-				m.appendOutput(renderUserMessage(msg.Content.Text()))
+				m.appendOutput(renderUserMessage(msg.Content.Text(), width))
 			case "assistant":
 				raw := msg.Content.Text()
 				m.appendMarkdownOutput(raw, m.renderMarkdownCached(raw, width))
@@ -1917,7 +1976,7 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 		for _, msg := range messages {
 			switch msg.Role {
 			case "user":
-				m.sendOutput(renderUserMessage(msg.Content.Text()))
+				m.sendOutput(renderUserMessage(msg.Content.Text(), width))
 			case "assistant":
 				raw := msg.Content.Text()
 				m.sendMarkdownOutput(raw, m.renderMarkdownCached(raw, width))
