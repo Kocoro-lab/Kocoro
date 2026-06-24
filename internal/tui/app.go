@@ -352,6 +352,10 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	// Remove cursor line highlight — we use border bars instead
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.BlurredStyle.CursorLine = lipgloss.NewStyle()
+	// The default cursor block is reverse-video (a stark white block on dark
+	// terminals). Tint it with the brand accent so the composer doesn't read as
+	// "turning white".
+	ta.Cursor.Style = lipgloss.NewStyle().Foreground(colorAccent)
 
 	shannonDir := config.ShannonDir()
 	agentsDir := filepath.Join(shannonDir, "agents")
@@ -1612,15 +1616,19 @@ func renderInputBox(taView string, totalWidth int) string {
 // renderDimComposer renders the composer with a muted border, shown while the
 // agent is working or awaiting approval so the chat box stays visible (dimmed
 // to signal it's paused) instead of vanishing until the run ends.
-func renderDimComposer(taView string, totalWidth int) string {
+func renderDimComposer(value string, totalWidth int) string {
 	if totalWidth < 4 {
-		return taView
+		return value
 	}
+	// Render the draft STATICALLY (no live cursor): the composer is paused while
+	// the agent works, and keystrokes don't reach it until stateInput — a live
+	// cursor here just flashes a distracting block.
+	inner := lipgloss.NewStyle().Foreground(colorDim).Render("> " + strings.TrimRight(value, "\n"))
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorDim).
 		Width(totalWidth - inputBorderOverhead).
-		Render(taView)
+		Render(inner)
 }
 
 func (m *Model) View() string {
@@ -1680,7 +1688,7 @@ func (m *Model) View() string {
 		sb.WriteString("\n")
 		// Keep the composer visible (dimmed) so the chat box doesn't vanish
 		// while the agent works.
-		sb.WriteString(renderDimComposer(m.textarea.View(), m.width))
+		sb.WriteString(renderDimComposer(m.textarea.Value(), m.width))
 		sb.WriteString("\n")
 		// Bottom status bar: left "esc to interrupt" hint (cancelling a run is
 		// otherwise undiscoverable) + right model tier and execution timer.
@@ -1691,7 +1699,7 @@ func (m *Model) View() string {
 	case stateApproval:
 		// Keep the composer visible (dimmed) above the approval prompt so the
 		// chat box doesn't vanish while awaiting a y/n/a decision.
-		sb.WriteString(renderDimComposer(m.textarea.View(), m.width))
+		sb.WriteString(renderDimComposer(m.textarea.Value(), m.width))
 		sb.WriteString("\n")
 		// Labeled keys instead of a bare "[y/n/a]" so non-technical users know
 		// what each choice does.
