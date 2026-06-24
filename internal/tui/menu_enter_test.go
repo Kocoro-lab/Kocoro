@@ -2,6 +2,19 @@ package tui
 
 import "testing"
 
+// TestShowCommandPalette: the palette key lists every command (not just ones
+// matching typed text) and makes the menu visible for arrow-selection.
+func TestShowCommandPalette(t *testing.T) {
+	m := &Model{}
+	m.showCommandPalette()
+	if !m.menuVisible {
+		t.Error("palette should make the command menu visible")
+	}
+	if len(m.menuItems) != len(baseSlashCommands) {
+		t.Errorf("palette should list all %d commands, got %d", len(baseSlashCommands), len(m.menuItems))
+	}
+}
+
 // TestIsImmediateCommand: in the slash autocomplete menu, Enter executes a
 // command that needs no argument (pickers like /agent & /model, and bare no-arg
 // commands) instead of merely autocompleting it; commands that need a typed

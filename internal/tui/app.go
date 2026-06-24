@@ -202,6 +202,8 @@ type Model struct {
 	pickerOpts          []pickerOption // current picker rows
 	pickerIdx           int            // highlighted row
 	pickerKind          pickerKind     // dispatches Enter to the right apply
+	pastes              map[int]string // stashed large pastes (placeholder N → full text)
+	pasteCounter        int            // last [Pasted text #N] number
 	state               state
 	width               int
 	height              int
@@ -1418,6 +1420,22 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.state == stateInput {
+		// "?" on an empty composer opens the full command palette (discoverable
+		// without knowing to type "/"). A non-empty composer types "?" normally.
+		if km, ok := msg.(tea.KeyMsg); ok && !m.menuVisible && m.textarea.Value() == "" &&
+			km.Type == tea.KeyRunes && !km.Paste && string(km.Runes) == "?" {
+			m.showCommandPalette()
+			return m, nil
+		}
+		// Large bracketed paste: stash it and insert a [Pasted text #N]
+		// placeholder instead of flooding the composer (and the prompt echo)
+		// with the raw text. Expanded back to full text on submit.
+		if km, ok := msg.(tea.KeyMsg); ok && km.Paste && len(km.Runes) > pasteTruncateThreshold {
+			m.stashPaste(string(km.Runes))
+			m.adjustTextareaHeight()
+			m.updateMenu()
+			return m, nil
+		}
 		var taCmd tea.Cmd
 		m.textarea, taCmd = m.textarea.Update(msg)
 		m.adjustTextareaHeight()
@@ -1544,7 +1562,7 @@ func (m *Model) View() string {
 		agentSeg := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(m.agentLabel())
 		modelSeg := styleSecondary().Render(m.modelDisplayLabel())
 		left := " " + marker + " " + agentSeg + " " + styleDim().Render("·") + " " + modelSeg
-		right := styleDim().Render("/ for commands")
+		right := styleDim().Render("? for commands")
 		sb.WriteString(composeBar(m.width, left, right))
 	case stateProcessing:
 		// Live preview of the answer being generated (transient; the finalized
@@ -1641,6 +1659,12 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 
 	promptMark := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 	m.appendOutput(fmt.Sprintf("%s %s", promptMark, input))
+
+	// Expand [Pasted text #N] placeholders to their stashed full text for the
+	// model; the echo + history above keep the compact placeholder form.
+	input = expandPastes(input, m.pastes)
+	m.pastes = nil
+	m.pasteCounter = 0
 
 	// Check slash commands
 	if strings.HasPrefix(input, "/") {
@@ -2201,6 +2225,8 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		} else {
 			m.appendOutput("No messages in session")
 		}
+	case "/export":
+		m.exportTranscript()
 	case "/rename":
 		newTitle := strings.TrimSpace(strings.TrimPrefix(input, "/rename "))
 		if newTitle == "" {
@@ -2671,6 +2697,7 @@ Commands:
   /agent [name]                  Switch agent (picker if no name)
   /rename <title>                Rename current session
   /copy                          Copy last response to clipboard
+  /export                        Export the conversation to a file
   /clear                         New session + clear screen
   /reset                         Clear current session history in place
   /compact [instructions]        Compress context, keep summary
@@ -2823,6 +2850,7 @@ var baseSlashCommands = []slashCmd{
 	{"/research", "Remote research"},
 	{"/swarm", "Multi-agent swarm"},
 	{"/copy", "Copy last response"},
+	{"/export", "Export transcript to a file"},
 	{"/model", "Switch model tier"},
 	{"/agent", "Switch agent"},
 	{"/config", "Show configuration"},
@@ -2852,10 +2880,19 @@ var immediateCommands = map[string]bool{
 	"/config": true, "/setup": true, "/sessions": true, "/session": true,
 	"/clear": true, "/reset": true, "/compact": true, "/status": true,
 	"/doctor": true, "/permissions": true, "/update": true,
-	"/quit": true, "/exit": true, "/copy": true,
+	"/quit": true, "/exit": true, "/copy": true, "/export": true,
 }
 
 func isImmediateCommand(cmd string) bool { return immediateCommands[cmd] }
+
+// showCommandPalette opens the full command list (every command + description)
+// for arrow-selection — a discoverable alternative to typing "/" for users who
+// don't know the slash commands. Bound to "?" on an empty composer.
+func (m *Model) showCommandPalette() {
+	m.menuItems = append([]slashCmd(nil), baseSlashCommands...)
+	m.menuIndex = 0
+	m.menuVisible = true
+}
 
 func (m *Model) updateMenu() {
 	input := m.textarea.Value()
