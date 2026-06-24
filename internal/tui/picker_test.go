@@ -1,6 +1,32 @@
 package tui
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+)
+
+// TestAgentPickerOptions: the /agent picker lists the default agent first, then
+// each named agent, with the entry's name as the option value.
+func TestAgentPickerOptions(t *testing.T) {
+	entries := []agents.AgentEntry{
+		{Name: "research-bot"},
+		{Name: "ops", Builtin: true},
+	}
+	opts := agentPickerOptions(entries)
+	if len(opts) != 3 {
+		t.Fatalf("got %d options, want 3 (default + 2 named)", len(opts))
+	}
+	if opts[0].label != "default" || opts[0].value != "" {
+		t.Errorf("first option must be the default agent, got %+v", opts[0])
+	}
+	if opts[1].value != "research-bot" {
+		t.Errorf("opts[1].value = %q, want research-bot", opts[1].value)
+	}
+	if opts[2].value != "ops" {
+		t.Errorf("opts[2].value = %q, want ops", opts[2].value)
+	}
+}
 
 // TestModelTierOptions: the model picker offers the three routing tiers, in
 // order, each with a description (config.go validates small/medium/large).

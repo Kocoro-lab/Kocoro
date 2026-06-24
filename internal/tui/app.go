@@ -1091,16 +1091,17 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pickerIdx = pickerWrap(m.pickerIdx+1, len(m.pickerOpts))
 				return m, nil
 			case tea.KeyEnter:
+				m.state = stateInput
 				if len(m.pickerOpts) > 0 {
 					sel := m.pickerOpts[m.pickerIdx].value
-					m.state = stateInput
 					switch m.pickerKind {
 					case pickerKindModel:
 						m.applyModelTier(sel)
+						return m, m.flushPrints()
+					case pickerKindAgent:
+						return m, m.switchToAgent(sel)
 					}
-					return m, nil
 				}
-				m.state = stateInput
 				return m, nil
 			case tea.KeyEscape:
 				m.state = stateInput
@@ -1527,9 +1528,10 @@ func (m *Model) View() string {
 		// for the border (inputBorderOverhead) at init/resize.
 		sb.WriteString(renderInputBox(m.textarea.View(), m.width))
 		sb.WriteString("\n")
-		// Bottom bar: left hint (slash commands by typing "/") + model tier.
+		// Bottom bar: left hint (slash commands by typing "/") + active agent
+		// and model tier (agent name is a persistent control, mirroring Desktop).
 		leftHint := styleDim().Render(" / commands")
-		rightInfo := styleDim().Render(m.modelDisplayLabel())
+		rightInfo := styleDim().Render(m.agentLabel() + " · " + m.modelDisplayLabel())
 		sb.WriteString(composeBar(m.width, leftHint, rightInfo))
 	case stateProcessing:
 		// Live preview of the answer being generated (transient; the finalized
@@ -2175,6 +2177,11 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				m.openModelPicker() // bare /model — interactive picker
 			}
 		}
+	case "/agent", "/agents":
+		if len(parts) > 1 {
+			return m, m.switchToAgent(parts[1]) // /agent <name> — direct
+		}
+		m.openAgentPicker() // bare /agent — interactive picker
 	case "/config":
 		m.appendOutput(formatConfigDisplay(m.cfg))
 	case "/setup":
@@ -2667,6 +2674,7 @@ Commands:
   /session new                   Start new session
   /session resume <id>           Resume a saved session
   /model [small|medium|large]    Switch model tier
+  /agent [name]                  Switch agent (picker if no name)
   /rename <title>                Rename current session
   /copy                          Copy last response to clipboard
   /clear                         New session + clear screen
@@ -2822,6 +2830,7 @@ var baseSlashCommands = []slashCmd{
 	{"/swarm", "Multi-agent swarm"},
 	{"/copy", "Copy last response"},
 	{"/model", "Switch model tier"},
+	{"/agent", "Switch agent"},
 	{"/config", "Show configuration"},
 	{"/setup", "Reconfigure endpoint & API key"},
 	{"/sessions", "List saved sessions"},

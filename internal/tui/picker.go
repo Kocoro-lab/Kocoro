@@ -2,8 +2,13 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
 // pickerOption is one selectable row in the generic statePicker dropdown.
@@ -19,6 +24,7 @@ type pickerKind int
 
 const (
 	pickerKindModel pickerKind = iota
+	pickerKindAgent
 )
 
 // modelTierOptions lists the routing tiers offered by the /model picker.
@@ -80,4 +86,110 @@ func (m *Model) applyModelTier(tier string) {
 	} else {
 		m.appendOutput(fmt.Sprintf("Model tier: %s (saved)", tier))
 	}
+}
+
+// agentLabel is the display name of the active agent ("default" when none is
+// overridden). Surfaced in the status line and switch confirmations.
+func (m *Model) agentLabel() string {
+	if m.agentOverride != nil {
+		return m.agentOverride.Name
+	}
+	return "default"
+}
+
+// agentPickerOptions builds the /agent picker rows: the default (built-in)
+// agent first, then each named agent. The option value is the agent name
+// ("" = default).
+func agentPickerOptions(entries []agents.AgentEntry) []pickerOption {
+	opts := []pickerOption{{label: "default", desc: "the built-in assistant", value: ""}}
+	for _, e := range entries {
+		label := e.Name
+		if e.DisplayName != "" {
+			label = e.DisplayName
+		}
+		desc := "agent"
+		if e.Builtin {
+			desc = "built-in agent"
+		}
+		opts = append(opts, pickerOption{label: label, desc: desc, value: e.Name})
+	}
+	return opts
+}
+
+// openAgentPicker enters the interactive agent picker, pre-selecting the active
+// agent. Invoked by bare `/agent`.
+func (m *Model) openAgentPicker() {
+	entries, _ := agents.ListAgents(filepath.Join(m.shannonDir, "agents"))
+	opts := agentPickerOptions(entries)
+	current := ""
+	if m.agentOverride != nil {
+		current = m.agentOverride.Name
+	}
+	m.pickerTitle = "Agent"
+	m.pickerOpts = opts
+	m.pickerKind = pickerKindAgent
+	m.pickerIdx = 0
+	for i, o := range opts {
+		if o.value == current {
+			m.pickerIdx = i
+		}
+	}
+	m.menuVisible = false
+	m.state = statePicker
+}
+
+// switchToAgent switches the live agent (loop, skills, per-agent session
+// directory) and starts a fresh conversation — mirroring Desktop, where
+// switching an agent stops the current chat and begins a new one. name == ""
+// selects the default agent.
+func (m *Model) switchToAgent(name string) tea.Cmd {
+	current := ""
+	if m.agentOverride != nil {
+		current = m.agentOverride.Name
+	}
+	if name == current {
+		m.appendOutput("  Already on agent: " + m.agentLabel())
+		return m.flushPrints()
+	}
+
+	var override *agents.Agent
+	if name != "" {
+		a, err := agents.LoadAgent(filepath.Join(m.shannonDir, "agents"), name)
+		if err != nil {
+			m.appendOutput(fmt.Sprintf("  Error loading agent %q: %v", name, err))
+			return m.flushPrints()
+		}
+		override = a
+	}
+	m.agentOverride = override
+
+	// Skills: agent-scoped or the global set for the default agent.
+	if override != nil {
+		m.loadedSkills = override.Skills
+	} else if sk, err := agents.LoadGlobalSkills(m.shannonDir); err == nil {
+		m.loadedSkills = sk
+	}
+	if m.skillsPtr != nil {
+		*m.skillsPtr = m.loadedSkills
+	}
+
+	// Named agents are multi-session under their own directory; the default
+	// agent uses the top-level sessions dir.
+	sessDir := filepath.Join(m.shannonDir, "sessions")
+	if override != nil {
+		sessDir = filepath.Join(m.shannonDir, "agents", override.Name, "sessions")
+	}
+	m.sessions = session.NewManager(sessDir)
+
+	m.rebuildAgentLoop()
+
+	// Fresh conversation (same pattern as /clear); applyRuntimeContext also
+	// rebuilds the slash commands for the new agent.
+	m.output = nil
+	sess := m.sessions.NewSession()
+	m.resumedSession = false
+	m.sessionAllowed = make(map[string]bool)
+	m.applyRuntimeContext(sess)
+	m.appendOutput("  Switched to agent: " + m.agentLabel())
+	return m.rerenderOutput()
 }
