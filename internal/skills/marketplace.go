@@ -641,6 +641,13 @@ func installFromZip(ctx context.Context, entry MarketplaceEntry, stageDir string
 // bounds peak memory and the uncompressed cap guards against decompression
 // bombs (a tiny archive expanding to fill disk/RAM). Variables (not consts)
 // so tests can set a small cap to exercise the guard cheaply.
+//
+// Caveat (consciously accepted): these bound a SINGLE upload. The daemon does
+// not gate aggregate in-flight uploads — slugLocks only serializes the same
+// slug — so N concurrent uploads of distinct slugs can each pin ~1 GiB of RAM
+// and OOM the daemon. Acceptable here because the server is localhost-only and
+// the Kocoro Desktop client uploads serially (one modal, button disabled while
+// busy); revisit with a global in-flight gate if a client ever fans these out.
 var (
 	maxZipCompressedBytes   int64 = 1 * 1024 * 1024 * 1024 // 1 GiB (RAM backstop)
 	maxZipUncompressedBytes int64 = 1 * 1024 * 1024 * 1024 // 1 GiB (zip-bomb guard)

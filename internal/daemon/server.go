@@ -3710,7 +3710,7 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			s.auditHTTPOpError("POST", "/skills/upload", "request body too large", err)
-			writeError(w, http.StatusRequestEntityTooLarge, "zip too large: archive or extracted contents exceed the size backstop")
+			writeError(w, http.StatusRequestEntityTooLarge, "zip too large: archive or extracted contents exceed the size backstop (1 GiB)")
 			return
 		}
 		s.auditHTTPOpError("POST", "/skills/upload", "invalid multipart form", err)
@@ -3748,7 +3748,7 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "skill_is_builtin")
 	case errors.Is(err, skills.ErrZipTooLarge):
 		s.auditHTTPOpError("POST", "/skills/upload", "zip too large", err)
-		writeError(w, http.StatusRequestEntityTooLarge, "zip too large: archive or extracted contents exceed the size backstop")
+		writeError(w, http.StatusRequestEntityTooLarge, "zip too large: archive or extracted contents exceed the size backstop (1 GiB)")
 	case errors.Is(err, skills.ErrInvalidSkillPayload):
 		s.auditHTTPOpError("POST", "/skills/upload", "invalid payload", err)
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
