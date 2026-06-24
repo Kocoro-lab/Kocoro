@@ -28,6 +28,18 @@ func TestAgentPickerOptions(t *testing.T) {
 	}
 }
 
+// TestColorPickerOptions: the /color picker lists every accent preset, with the
+// default brand "kocoro" first.
+func TestColorPickerOptions(t *testing.T) {
+	opts := colorPickerOptions()
+	if len(opts) != len(accentPresets) {
+		t.Fatalf("got %d options, want %d presets", len(opts), len(accentPresets))
+	}
+	if opts[0].value != "kocoro" {
+		t.Errorf("first preset should be the default 'kocoro', got %q", opts[0].value)
+	}
+}
+
 // TestModelTierOptions: the model picker offers the three routing tiers, in
 // order, each with a description (config.go validates small/medium/large).
 func TestModelTierOptions(t *testing.T) {

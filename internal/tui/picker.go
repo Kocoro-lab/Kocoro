@@ -25,7 +25,40 @@ type pickerKind int
 const (
 	pickerKindModel pickerKind = iota
 	pickerKindAgent
+	pickerKindColor
 )
+
+// colorPickerOptions lists the accent presets for the /color picker.
+func colorPickerOptions() []pickerOption {
+	opts := make([]pickerOption, 0, len(accentPresets))
+	for _, p := range accentPresets {
+		opts = append(opts, pickerOption{label: p.name, desc: p.desc, value: p.name})
+	}
+	return opts
+}
+
+// openColorPicker enters the accent-color picker (bare /color).
+func (m *Model) openColorPicker() {
+	m.pickerTitle = "Accent color"
+	m.pickerOpts = colorPickerOptions()
+	m.pickerKind = pickerKindColor
+	m.pickerIdx = 0
+	m.menuVisible = false
+	m.state = statePicker
+}
+
+// applyAccentByName swaps the accent color to the named preset. Shared by the
+// picker and the direct /color <name> form.
+func (m *Model) applyAccentByName(name string) {
+	for _, p := range accentPresets {
+		if p.name == name {
+			applyAccent(p)
+			m.appendOutput("  Accent color: " + p.name)
+			return
+		}
+	}
+	m.appendOutput("  Unknown color: " + name)
+}
 
 // modelTierOptions lists the routing tiers offered by the /model picker.
 // config.go validates exactly these three.

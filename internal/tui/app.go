@@ -1130,6 +1130,9 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, m.flushPrints()
 					case pickerKindAgent:
 						return m, m.switchToAgent(sel)
+					case pickerKindColor:
+						m.applyAccentByName(sel)
+						return m, m.flushPrints()
 					}
 				}
 				return m, nil
@@ -2258,6 +2261,12 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		// bare /agent, or a typed name that doesn't exist → selectable picker
 		// (so "I'll just type it" / a typo still lands on the list, not an error)
 		m.openAgentPicker()
+	case "/color", "/theme":
+		if len(parts) > 1 {
+			m.applyAccentByName(parts[1]) // /color <name> — direct
+		} else {
+			m.openColorPicker() // bare /color — interactive picker
+		}
 	case "/config":
 		m.appendOutput(formatConfigDisplay(m.cfg))
 	case "/setup":
@@ -2764,6 +2773,7 @@ Commands:
   /session resume <id>           Resume a saved session
   /model [small|medium|large]    Switch model tier
   /agent [name]                  Switch agent (picker if no name)
+  /color [name]                  Change accent color (picker if no name)
   /rename <title>                Rename current session
   /copy                          Copy last response to clipboard
   /export                        Export the conversation to a file
@@ -2922,6 +2932,7 @@ var baseSlashCommands = []slashCmd{
 	{"/export", "Export transcript to a file"},
 	{"/model", "Switch model tier"},
 	{"/agent", "Switch agent"},
+	{"/color", "Change accent color"},
 	{"/config", "Show configuration"},
 	{"/setup", "Reconfigure endpoint & API key"},
 	{"/sessions", "List saved sessions"},
@@ -2946,6 +2957,7 @@ var baseSlashCommands = []slashCmd{
 // /search, /rename) are absent so they still autocomplete for the argument.
 var immediateCommands = map[string]bool{
 	"/help": true, "/agent": true, "/agents": true, "/model": true,
+	"/color": true, "/theme": true,
 	"/config": true, "/setup": true, "/sessions": true, "/session": true,
 	"/clear": true, "/reset": true, "/compact": true, "/status": true,
 	"/doctor": true, "/permissions": true, "/update": true,
