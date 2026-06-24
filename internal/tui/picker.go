@@ -116,6 +116,25 @@ func agentPickerOptions(entries []agents.AgentEntry) []pickerOption {
 	return opts
 }
 
+// openSessionPicker enters the session picker (stateSessionPicker). Shared by
+// `/sessions`, bare `/session`, and `/session resume` (no id) so resuming is a
+// selection, not a typed id.
+func (m *Model) openSessionPicker() {
+	sessions, err := m.sessions.List()
+	if err != nil {
+		m.appendOutput(fmt.Sprintf("Error: %v", err))
+		return
+	}
+	if len(sessions) == 0 {
+		m.appendOutput("No saved sessions")
+		return
+	}
+	m.lastSessions = sessions
+	m.sessionPickerIdx = 0
+	m.menuVisible = false
+	m.state = stateSessionPicker
+}
+
 // openAgentPicker enters the interactive agent picker, pre-selecting the active
 // agent. Invoked by bare `/agent`.
 func (m *Model) openAgentPicker() {

@@ -60,7 +60,7 @@ func TestFinishHeaderAnimation_HeaderBlockRerendersOnResize(t *testing.T) {
 		t.Fatal("expected rerender command when not processing")
 	}
 
-	want := renderStartupHeader(headerTotalFrames-1, 60, "dev", "medium", "https://api.test.com", "/tmp/project", nil, 0)
+	want := renderStartupHeader(headerTotalFrames-1, 60, "dev", "medium", "https://api.test.com", "/tmp/project", nil, 0, "default")
 	if got := m.output[0].rendered; got != want {
 		t.Fatal("expected startup header to rerender at the new width")
 	}
@@ -76,7 +76,7 @@ func TestRerenderOutput_RepaintsWhileProcessing(t *testing.T) {
 		t.Fatal("expected rerender command while processing")
 	}
 
-	want := renderStartupHeader(headerTotalFrames-1, 60, "dev", "medium", "https://api.test.com", "/tmp/project", nil, 0)
+	want := renderStartupHeader(headerTotalFrames-1, 60, "dev", "medium", "https://api.test.com", "/tmp/project", nil, 0, "default")
 	if got := m.output[0].rendered; got != want {
 		t.Fatal("expected stored header rendering to update immediately")
 	}

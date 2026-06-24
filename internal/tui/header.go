@@ -46,7 +46,7 @@ func headerFrameTick() tea.Cmd {
 
 // renderStartupHeader builds the animated two-column startup header for the given frame.
 // tipIdx and cwd should be pre-computed by the caller (no I/O inside this function).
-func renderStartupHeader(frame int, width int, version string, modelTier string, endpoint string, cwd string, sessions []session.SessionSummary, tipIdx int) string {
+func renderStartupHeader(frame int, width int, version string, modelTier string, endpoint string, cwd string, sessions []session.SessionSummary, tipIdx int, agentLabel string) string {
 	if width < 50 {
 		width = 50
 	}
@@ -91,7 +91,13 @@ func renderStartupHeader(frame int, width int, version string, modelTier string,
 	// Model / version / endpoint / cwd — moved here from the (now icon-filled)
 	// left column. Two lines pad the right column to the icon's 8-line height.
 	rightLines = append(rightLines, " "+dimStyle.Render(truncateStr(cwd, rightWidth-3)))
-	info := modelStyle.Render(modelTier) + dimStyle.Render(" · v"+version)
+	// Lead the state line with the active agent — the most prominent element
+	// (brand marker + bold name) — then model / version / endpoint.
+	info := ""
+	if agentLabel != "" {
+		info = lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render("▌ "+agentLabel) + dimStyle.Render("  ·  ")
+	}
+	info += modelStyle.Render(modelTier) + dimStyle.Render(" · v"+version)
 	if budget := rightWidth - lipgloss.Width(info) - 5; budget >= 6 {
 		info += dimStyle.Render(" · " + truncateStr(endpoint, budget))
 	}

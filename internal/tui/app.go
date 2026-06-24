@@ -289,15 +289,16 @@ func (m *Model) cwd() string {
 // finishHeaderAnimation completes the startup animation, flushes the final
 // header to scrollback, and transitions to stateInput.
 func (m *Model) finishHeaderAnimation() tea.Cmd {
-	finalHeader := renderStartupHeader(headerTotalFrames-1, m.width, m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD, m.headerSessions, m.headerTipIdx)
+	finalHeader := renderStartupHeader(headerTotalFrames-1, m.width, m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD, m.headerSessions, m.headerTipIdx, m.agentLabel())
 	// Capture stable values for the rerender closure so the header can be
 	// re-rendered at a new width on terminal resize.
 	version, tier, ep, cwd := m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD
 	sessions, tipIdx := m.headerSessions, m.headerTipIdx
+	agentLabel := m.agentLabel()
 	m.output = append(m.output, outputBlock{
 		rendered: finalHeader,
 		rerender: func(width int) string {
-			return renderStartupHeader(headerTotalFrames-1, width, version, tier, ep, cwd, sessions, tipIdx)
+			return renderStartupHeader(headerTotalFrames-1, width, version, tier, ep, cwd, sessions, tipIdx, agentLabel)
 		},
 	})
 	m.appendOutput("")
@@ -933,8 +934,15 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.menuVisible && len(m.menuItems) > 0 {
 				selected := m.menuItems[m.menuIndex]
-				m.textarea.SetValue(selected.cmd + " ")
 				m.menuVisible = false
+				if isImmediateCommand(selected.cmd) {
+					// No-argument command (e.g. a picker) — execute on this Enter
+					// instead of autocompleting and waiting for a second Enter.
+					m.textarea.SetValue(selected.cmd)
+					return m.handleSubmit()
+				}
+				// Needs a typed argument — autocomplete and let the user type it.
+				m.textarea.SetValue(selected.cmd + " ")
 				return m, nil
 			}
 			if m.state == stateApproval {
@@ -1525,7 +1533,7 @@ func (m *Model) View() string {
 	// --- Input / status line ---
 	switch m.state {
 	case stateStartup:
-		sb.WriteString(renderStartupHeader(m.headerFrame, m.width, m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD, m.headerSessions, m.headerTipIdx))
+		sb.WriteString(renderStartupHeader(m.headerFrame, m.width, m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD, m.headerSessions, m.headerTipIdx, m.agentLabel()))
 	case stateInput:
 		// Composer wrapped in a rounded brand-colored border (its top border
 		// replaces the old plain separator). The textarea is sized to leave room
@@ -2089,18 +2097,13 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.applyRuntimeContext(m.sessions.Current())
 		return m, m.rerenderOutput()
 	case "/sessions":
-		sessions, err := m.sessions.List()
-		if err != nil {
-			m.appendOutput(fmt.Sprintf("Error: %v", err))
-		} else if len(sessions) == 0 {
-			m.appendOutput("No saved sessions")
-		} else {
-			m.lastSessions = sessions
-			m.sessionPickerIdx = 0
-			m.state = stateSessionPicker
-		}
+		m.openSessionPicker()
 	case "/session":
-		if len(parts) > 1 {
+		if len(parts) < 2 {
+			m.openSessionPicker() // bare /session → selectable list
+			break
+		}
+		{
 			switch parts[1] {
 			case "new":
 				sess := m.sessions.NewSession()
@@ -2110,7 +2113,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				m.appendOutput("Started new session")
 			case "resume":
 				if len(parts) < 3 {
-					m.appendOutput("Usage: /session resume <number or id>")
+					m.openSessionPicker() // /session resume → selectable list
 				} else {
 					target := parts[2]
 					// Try as 1-based index from /sessions list
@@ -2852,6 +2855,21 @@ var baseSlashCommands = []slashCmd{
 	{"/quit", "Exit"},
 	{"/exit", "Exit"},
 }
+
+// immediateCommands take no required argument, so a single Enter in the
+// autocomplete menu executes them (opening the /agent, /model, or /session
+// picker, or running a no-arg command) instead of autocompleting and waiting
+// for a second Enter. Commands needing a typed argument (/research, /swarm,
+// /search, /rename) are absent so they still autocomplete for the argument.
+var immediateCommands = map[string]bool{
+	"/help": true, "/agent": true, "/agents": true, "/model": true,
+	"/config": true, "/setup": true, "/sessions": true, "/session": true,
+	"/clear": true, "/reset": true, "/compact": true, "/status": true,
+	"/doctor": true, "/permissions": true, "/update": true,
+	"/quit": true, "/exit": true, "/copy": true,
+}
+
+func isImmediateCommand(cmd string) bool { return immediateCommands[cmd] }
 
 func (m *Model) updateMenu() {
 	input := m.textarea.Value()
