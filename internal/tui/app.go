@@ -1044,6 +1044,13 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.textarea.SetCursor(i)
 				}
 				return m, nil
+			case tea.KeyCtrlR: // Recall: fill from the most recent matching past input
+				if got, ok := searchHistory(m.inputHistory, m.textarea.Value()); ok {
+					m.textarea.SetValue(got)
+					m.textarea.CursorEnd()
+					m.adjustTextareaHeight()
+				}
+				return m, nil
 			case tea.KeyCtrlL: // Clear screen
 				m.output = nil
 				return m, m.rerenderOutput()
@@ -1062,6 +1069,14 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.sessionPickerIdx++
 				if m.sessionPickerIdx >= len(m.lastSessions) {
 					m.sessionPickerIdx = 0
+				}
+				return m, nil
+			case tea.KeyRunes:
+				// 'f' forks the highlighted session into a new branch.
+				if string(msg.Runes) == "f" && len(m.lastSessions) > 0 {
+					target := m.lastSessions[m.sessionPickerIdx].ID
+					m.state = stateInput
+					return m, m.forkSession(target)
 				}
 				return m, nil
 			case tea.KeyEnter:
@@ -1607,7 +1622,7 @@ func (m *Model) View() string {
 		sb.WriteString("\n")
 		sb.WriteString(bar)
 	case stateSessionPicker:
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  Sessions (Up/Down, Enter, Esc)"))
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  Sessions (Up/Down, Enter=resume, f=fork, Esc)"))
 	case statePicker:
 		sb.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  " + m.pickerTitle + " (Up/Down, Enter, Esc)"))
 	}
