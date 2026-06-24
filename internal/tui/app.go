@@ -1890,14 +1890,9 @@ func (m *Model) rerenderOutput() tea.Cmd {
 	m.pendingPrints = m.pendingPrints[:0]
 	m.rerenderPending = true
 
-	// ClearScreen erases only the VISIBLE screen (\x1b[2J). Any blocks that had
-	// scrolled into the terminal's saved-lines (scrollback) survive and would be
-	// duplicated by the re-print below — the symptom is a second startup header
-	// appearing after enough output (e.g. /help) pushes the first one up.
-	// Prepend \x1b[3J ("erase saved lines") so the scrollback is cleared too.
 	return tea.Sequence(
 		tea.ClearScreen,
-		tea.Println("\x1b[3J"+strings.Join(lines, "\n")),
+		tea.Println(strings.Join(lines, "\n")),
 		func() tea.Msg { return rerenderDoneMsg{} },
 	)
 }
