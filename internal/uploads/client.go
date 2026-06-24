@@ -225,7 +225,28 @@ func (c *Client) Upload(
 		return nil, fmt.Errorf("%w: invalid kind %q (allowed: session_share, report, landing_page, image, other)", ErrBadRequest, opts.Kind)
 	}
 	return doWithRetry(ctx, c.maxAttempts, c.backoff, func(ctx context.Context) (*UploadResponse, error) {
-		return c.uploadOnce(ctx, openBody, opts)
+		return c.uploadOnce(ctx, "/api/v1/uploads", openBody, opts)
+	})
+}
+
+// UploadEphemeral streams body to /api/v1/uploads/ephemeral and returns the
+// parsed response. Unlike Upload, the ephemeral endpoint does NOT record the
+// file in the user's upload library (it never shows up in List / the Published
+// Files UI and can't be retracted) — it just stores the bytes on the public CDN
+// and returns an unguessable permanent URL. Use it for assets that are
+// referenced by URL but aren't user-managed "published files", e.g. agent
+// avatars. Only Filename and ContentType are honored; Kind/Metadata are ignored
+// by this endpoint (it has no library row to classify).
+func (c *Client) UploadEphemeral(
+	ctx context.Context,
+	openBody func() (io.ReadCloser, error),
+	opts UploadOptions,
+) (*UploadResponse, error) {
+	if openBody == nil {
+		return nil, fmt.Errorf("upload: openBody is required")
+	}
+	return doWithRetry(ctx, c.maxAttempts, c.backoff, func(ctx context.Context) (*UploadResponse, error) {
+		return c.uploadOnce(ctx, "/api/v1/uploads/ephemeral", openBody, opts)
 	})
 }
 
@@ -303,6 +324,7 @@ func isRetriable(err error) bool {
 // reader so net/http drains it incrementally without buffering the file.
 func (c *Client) uploadOnce(
 	ctx context.Context,
+	path string,
 	openBody func() (io.ReadCloser, error),
 	opts UploadOptions,
 ) (*UploadResponse, error) {
@@ -365,7 +387,7 @@ func (c *Client) uploadOnce(
 		}
 	}()
 
-	endpoint := c.baseURL + "/api/v1/uploads"
+	endpoint := c.baseURL + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, pr)
 	if err != nil {
 		// Unblock the writer goroutine before returning, otherwise it sits

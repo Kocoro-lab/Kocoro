@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -288,5 +290,194 @@ func TestHandleDeleteUpload_CloudDisabledReturns503(t *testing.T) {
 
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", rr.Code)
+	}
+}
+
+// --- handleCreateUpload ---
+
+// newImageUploadRequest builds a multipart POST /uploads carrying a "file" part
+// (with the given content_type as the part header) and an optional content_type
+// form field. Passing fieldType="" omits the form field, exercising the
+// fallback to the part's own Content-Type.
+func newImageUploadRequest(t *testing.T, partType, fieldType string, data []byte) *http.Request {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	hdr := make(map[string][]string)
+	hdr["Content-Disposition"] = []string{`form-data; name="file"; filename="avatar.png"`}
+	if partType != "" {
+		hdr["Content-Type"] = []string{partType}
+	}
+	part, err := mw.CreatePart(hdr)
+	if err != nil {
+		t.Fatalf("create part: %v", err)
+	}
+	if _, err := part.Write(data); err != nil {
+		t.Fatalf("write part: %v", err)
+	}
+	if fieldType != "" {
+		if err := mw.WriteField("content_type", fieldType); err != nil {
+			t.Fatalf("write field: %v", err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/uploads", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	return req
+}
+
+func TestHandleCreateUpload_HappyPath(t *testing.T) {
+	var gotMethod, gotPath, gotAPIKey, gotKind string
+	s, _ := newTestServerWithCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAPIKey = r.Header.Get("X-API-Key")
+		_ = r.ParseMultipartForm(1 << 20)
+		gotKind = r.FormValue("kind")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"url":"https://static.kocoro.ai/public/h/avatar.png","key":"k","size":4,"content_type":"image/png"}`))
+	})
+
+	req := newImageUploadRequest(t, "image/png", "image/png", []byte("\x89PNG"))
+	rr := httptest.NewRecorder()
+	s.handleCreateUpload(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	// Avatars use the EPHEMERAL endpoint so they aren't recorded in the user's
+	// upload library.
+	if gotMethod != "POST" || gotPath != "/api/v1/uploads/ephemeral" {
+		t.Errorf("upstream = %s %s, want POST /api/v1/uploads/ephemeral", gotMethod, gotPath)
+	}
+	if gotAPIKey != "sk_test_key" {
+		t.Errorf("X-API-Key not forwarded; got %q", gotAPIKey)
+	}
+	// The ephemeral endpoint has no library row to classify — no kind sent.
+	if gotKind != "" {
+		t.Errorf("kind = %q, want empty (ephemeral upload sends no kind)", gotKind)
+	}
+	var body struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !strings.HasPrefix(body.URL, "https://static.kocoro.ai/") {
+		t.Errorf("url = %q, want a static.kocoro.ai URL", body.URL)
+	}
+}
+
+func TestHandleCreateUpload_MissingFileReturns400(t *testing.T) {
+	s, _ := newTestServerWithCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("upstream should not be hit when file is missing")
+	})
+	// A valid multipart form with no "file" part.
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("content_type", "image/png")
+	_ = mw.Close()
+	req := httptest.NewRequest("POST", "/uploads", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rr := httptest.NewRecorder()
+	s.handleCreateUpload(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestHandleCreateUpload_BadTypeReturns400(t *testing.T) {
+	s, _ := newTestServerWithCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("upstream should not be hit for a disallowed type")
+	})
+	req := newImageUploadRequest(t, "application/pdf", "application/pdf", []byte("%PDF"))
+	rr := httptest.NewRecorder()
+	s.handleCreateUpload(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestHandleCreateUpload_FileTooLargeMapsTo413(t *testing.T) {
+	s, _ := newTestServerWithCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(`{"error":"file_too_large","message":"exceeds 50 MiB"}`))
+	})
+	req := newImageUploadRequest(t, "image/png", "image/png", []byte("\x89PNG"))
+	rr := httptest.NewRecorder()
+	s.handleCreateUpload(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413 (cloud 413 must round-trip)", rr.Code)
+	}
+}
+
+func TestHandleCreateUpload_CloudDisabledReturns503(t *testing.T) {
+	s := &Server{
+		deps: &ServerDeps{
+			ShannonDir: t.TempDir(),
+			Config:     &config.Config{APIKey: "sk_test"}, // Cloud.Enabled = false
+			GW:         client.NewGatewayClient("http://nope", "sk_test"),
+		},
+	}
+	req := newImageUploadRequest(t, "image/png", "image/png", []byte("\x89PNG"))
+	rr := httptest.NewRecorder()
+	s.handleCreateUpload(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rr.Code)
+	}
+}
+
+// Over the daemon's own 10 MiB MaxBytesReader cap → 413 locally, before any
+// cloud round trip (distinct from FileTooLargeMapsTo413, which tests the cloud's
+// 413 propagating back).
+func TestHandleCreateUpload_OverLocalCapReturns413(t *testing.T) {
+	s, _ := newTestServerWithCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("upstream must not be hit when the body exceeds the local cap")
+	})
+	big := make([]byte, 11<<20) // 11 MiB > maxUploadSize (10 MiB)
+	req := newImageUploadRequest(t, "image/png", "image/png", big)
+	rr := httptest.NewRecorder()
+	s.handleCreateUpload(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413 (local cap)", rr.Code)
+	}
+}
+
+// content_type form field omitted → MIME resolves from the file part's own
+// Content-Type header.
+func TestHandleCreateUpload_ContentTypeFromPartHeader(t *testing.T) {
+	s, _ := newTestServerWithCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"url":"https://static.kocoro.ai/public/h/a.png"}`))
+	})
+	req := newImageUploadRequest(t, "image/png", "" /* no content_type field */, []byte("\x89PNG"))
+	rr := httptest.NewRecorder()
+	s.handleCreateUpload(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s (part-header MIME should be honored)", rr.Code, rr.Body.String())
+	}
+}
+
+// A "; charset=…" suffix on the declared MIME is stripped before the whitelist
+// check, so it still validates as image/png.
+func TestHandleCreateUpload_StripsCharsetParam(t *testing.T) {
+	s, _ := newTestServerWithCloud(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"url":"https://static.kocoro.ai/public/h/a.png"}`))
+	})
+	req := newImageUploadRequest(t, "image/png", "image/png; charset=utf-8", []byte("\x89PNG"))
+	rr := httptest.NewRecorder()
+	s.handleCreateUpload(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s (charset param should be stripped)", rr.Code, rr.Body.String())
 	}
 }
