@@ -2836,6 +2836,7 @@ var baseSlashCommands = []slashCmd{
 	{"/sessions", "List saved sessions"},
 	{"/search", "Search session history"},
 	{"/session", "new | resume <n>"},
+	{"/rename", "Rename current session"},
 	{"/clear", "New session + clear screen"},
 	{"/reset", "Clear current session history in place"},
 	{"/compact", "Compress context (keep summary)"},
@@ -2844,6 +2845,7 @@ var baseSlashCommands = []slashCmd{
 	{"/permissions", "Manage tool permissions"},
 	{"/update", "Check for updates"},
 	{"/quit", "Exit"},
+	{"/exit", "Exit"},
 }
 
 func (m *Model) updateMenu() {
