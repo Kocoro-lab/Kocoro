@@ -1662,14 +1662,14 @@ func (m *Model) View() string {
 		modelSeg := styleSecondary().Render(m.modelDisplayLabel())
 		left := " " + marker + " " + agentSeg + " " + styleDim().Render("·") + " " + modelSeg
 		right := styleDim().Render("? for commands")
-		sb.WriteString(composeBar(m.width, left, right))
+		sb.WriteString(composeBar(m.width-1, left, right)) // width-1: same zero-slack rule as the processing bar
 	case stateProcessing:
 		// Live preview of the answer being generated (transient; the finalized
 		// answer is rendered to scrollback on agentDoneMsg). Shown above the
 		// spinner so the user sees real-time progress instead of a frozen dot.
-		// width-1: keep preview lines one column short of full width. A live
-		// line that fills the FULL width breaks Bubbletea's inline line
-		// accounting and ghosts the lines below it (the messy duplicated text).
+		// Live preview of the in-flight answer, one column short of full width so
+		// the inline renderer never wrap-miscounts a row (the same logical-vs-
+		// physical row bug fixed for the status bar below).
 		if preview := streamPreview(m.streamLive, m.width-1, streamPreviewLines); preview != "" {
 			sb.WriteString(preview)
 			sb.WriteString("\n")
@@ -1689,8 +1689,8 @@ func (m *Model) View() string {
 			sb.WriteString(glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx))
 		}
 		sb.WriteString("\n")
-		// Keep the composer visible (dimmed) so the chat box doesn't vanish
-		// while the agent works.
+		// Keep the composer visible (dimmed) so the chat box doesn't vanish while
+		// the agent works. (Its box is width-1 already, so it's not the leak.)
 		sb.WriteString(renderDimComposer(m.textarea.Value(), m.width))
 		sb.WriteString("\n")
 		// Bottom status bar: left "esc to interrupt" hint (cancelling a run is
@@ -1698,7 +1698,11 @@ func (m *Model) View() string {
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
 		leftHint := styleDim().Render(" esc to interrupt")
 		rightInfo := styleDim().Render(m.modelDisplayLabel() + " " + elapsed)
-		sb.WriteString(composeBar(m.width, leftHint, rightInfo) + "\n")
+		// width-1: a live-region line built to EXACTLY m.width has zero slack —
+		// if the terminal renders it one cell wider than StringWidth counts (CJK,
+		// braille spinner), it physically wraps, Bubbletea's inline CursorUp
+		// undershoots, and the bar is frozen into scrollback on the next Println.
+		sb.WriteString(composeBar(m.width-1, leftHint, rightInfo) + "\n")
 	case stateApproval:
 		// Keep the composer visible (dimmed) above the approval prompt so the
 		// chat box doesn't vanish while awaiting a y/n/a decision.
