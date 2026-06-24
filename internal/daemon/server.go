@@ -507,6 +507,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /schedules/{id}", s.handlePatchSchedule)
 	mux.HandleFunc("DELETE /schedules/{id}", s.handleDeleteSchedule)
 	mux.HandleFunc("GET /uploads", s.handleListUploads)
+	mux.HandleFunc("POST /uploads", s.handleCreateUpload)
 	mux.HandleFunc("DELETE /uploads/{id}", s.handleDeleteUpload)
 	mux.HandleFunc("GET /config", s.handleGetConfig)
 	mux.HandleFunc("GET /config/status", s.handleConfigStatus)
