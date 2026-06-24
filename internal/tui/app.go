@@ -1694,6 +1694,18 @@ func (m *Model) View() string {
 	return sb.String()
 }
 
+// renderUserMessage renders a user turn as a distinct background block (a role
+// cell): a subtle bg + bright text reads as "my turn" far better than a text
+// color alone. Shared by the live echo and resumed/forked history.
+func renderUserMessage(text string) string {
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.AdaptiveColor{Light: "#102A43", Dark: "#E6EEF8"}).
+		Background(lipgloss.AdaptiveColor{Light: "#DCE8F5", Dark: "#243447"}).
+		Bold(true).
+		Padding(0, 1).
+		Render("› " + text)
+}
+
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.clearSuggestion() // a new turn stales any in-flight / shown suggestion
 	input := strings.TrimSpace(m.textarea.Value())
@@ -1714,10 +1726,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.historyIdx = -1
 	m.historySaved = ""
 
-	// Echo the user's message in a distinct bold color so "what I said" stands
-	// out from the assistant's answer (white) and tool lines (dim gray).
-	userStyle := lipgloss.NewStyle().Bold(true).Foreground(colorInfo)
-	m.appendOutput(userStyle.Render("› " + input))
+	m.appendOutput(renderUserMessage(input))
 
 	// Expand [Pasted text #N] placeholders to their stashed full text for the
 	// model; the echo + history above keep the compact placeholder form.
@@ -1891,11 +1900,10 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 	m.appendOutput("")
 
 	if m.program == nil {
-		pm := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 		for _, msg := range messages {
 			switch msg.Role {
 			case "user":
-				m.appendOutput(fmt.Sprintf("%s %s", pm, msg.Content.Text()))
+				m.appendOutput(renderUserMessage(msg.Content.Text()))
 			case "assistant":
 				raw := msg.Content.Text()
 				m.appendMarkdownOutput(raw, m.renderMarkdownCached(raw, width))
@@ -1906,11 +1914,10 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 	}
 
 	go func() {
-		pm := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 		for _, msg := range messages {
 			switch msg.Role {
 			case "user":
-				m.sendOutput(fmt.Sprintf("%s %s", pm, msg.Content.Text()))
+				m.sendOutput(renderUserMessage(msg.Content.Text()))
 			case "assistant":
 				raw := msg.Content.Text()
 				m.sendMarkdownOutput(raw, m.renderMarkdownCached(raw, width))
