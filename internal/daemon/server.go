@@ -3685,11 +3685,12 @@ func (s *Server) handleMarketplaceInstall(w http.ResponseWriter, r *http.Request
 }
 
 // uploadSkillMaxBodyBytes caps the entire multipart request body. The actual
-// 50 MB ZIP limit lives in skills.maxZipCompressedBytes; the extra ~2 MB here
-// is headroom for multipart boundaries / form-field overhead so a 50 MB ZIP
-// isn't rejected at the HTTP layer before reaching skills.InstallFromZipData
-// (which performs the authoritative size check and returns ErrZipTooLarge).
-const uploadSkillMaxBodyBytes int64 = 52 * 1024 * 1024
+// ZIP size backstop lives in skills.maxZipCompressedBytes; the extra ~16 MB
+// here is headroom for multipart boundaries / form-field overhead so a
+// max-size ZIP isn't rejected at the HTTP layer before reaching
+// skills.InstallFromZipData (which performs the authoritative size check and
+// returns ErrZipTooLarge).
+const uploadSkillMaxBodyBytes int64 = 1*1024*1024*1024 + 16*1024*1024
 
 // uploadSkillInMemoryBytes is the multipart in-memory threshold; anything over
 // this spills the form to a tempfile via mime/multipart. Note this only bounds
@@ -3708,7 +3709,7 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			s.auditHTTPOpError("POST", "/skills/upload", "request body too large", err)
-			writeError(w, http.StatusRequestEntityTooLarge, "zip too large (maximum 50 MB)")
+			writeError(w, http.StatusRequestEntityTooLarge, "zip too large: archive or extracted contents exceed the size backstop")
 			return
 		}
 		s.auditHTTPOpError("POST", "/skills/upload", "invalid multipart form", err)
@@ -3746,7 +3747,7 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "skill_is_builtin")
 	case errors.Is(err, skills.ErrZipTooLarge):
 		s.auditHTTPOpError("POST", "/skills/upload", "zip too large", err)
-		writeError(w, http.StatusRequestEntityTooLarge, "zip too large (maximum 50 MB)")
+		writeError(w, http.StatusRequestEntityTooLarge, "zip too large: archive or extracted contents exceed the size backstop")
 	case errors.Is(err, skills.ErrInvalidSkillPayload):
 		s.auditHTTPOpError("POST", "/skills/upload", "invalid payload", err)
 		writeError(w, http.StatusUnprocessableEntity, err.Error())

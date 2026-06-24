@@ -633,14 +633,17 @@ func installFromZip(ctx context.Context, entry MarketplaceEntry, stageDir string
 	return nil
 }
 
-// Caps for zip-based skill installs. 50 MB is more than generous for
-// any realistic skill (ontology was 12 KB); 200 MB uncompressed guards
-// against zip bombs. Variables (not consts) so tests can set a small
-// cap to exercise the guard without allocating 200 MB of in-memory
-// content.
+// Caps for zip-based skill installs. These are intentionally generous —
+// effectively "no limit" for any realistic local skill — because the data
+// lives on the user's own disk. They are NOT arbitrary size limits but
+// memory/zip-bomb backstops: extractZipToSkill buffers the compressed
+// payload (and each entry) in RAM via io.ReadAll, so the compressed cap
+// bounds peak memory and the uncompressed cap guards against decompression
+// bombs (a tiny archive expanding to fill disk/RAM). Variables (not consts)
+// so tests can set a small cap to exercise the guard cheaply.
 var (
-	maxZipCompressedBytes   int64 = 50 * 1024 * 1024
-	maxZipUncompressedBytes int64 = 200 * 1024 * 1024
+	maxZipCompressedBytes   int64 = 1 * 1024 * 1024 * 1024 // 1 GiB (RAM backstop)
+	maxZipUncompressedBytes int64 = 1 * 1024 * 1024 * 1024 // 1 GiB (zip-bomb guard)
 )
 
 // extractZipToSkill reads a zip archive from body and extracts it into
