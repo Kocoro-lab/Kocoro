@@ -2008,12 +2008,13 @@ func spinnerTick() tea.Cmd {
 	})
 }
 
-// shimmer endpoints: resting green → bright lime peak, interpolated in RGB so
-// the highlight glows on and off smoothly instead of snapping between two ANSI
-// indices. lipgloss downsamples to 256/16-color on terminals without truecolor.
+// shimmer endpoints: resting deep-pink → bright peach peak — the Kocoro brand
+// gradient (#F40752→#F9AB8F), so the "thinking" status text reads on-brand
+// instead of green. Interpolated in RGB so the highlight glows on and off
+// smoothly; lipgloss downsamples to 256/16-color on non-truecolor terminals.
 var (
-	shimmerBase = [3]int{0x3A, 0x9A, 0x3A}
-	shimmerPeak = [3]int{0xC6, 0xF0, 0x8C}
+	shimmerBase = [3]int{0xC0, 0x2A, 0x55}
+	shimmerPeak = [3]int{0xF9, 0xAB, 0x8F}
 )
 
 // renderWaveText renders text with a soft highlight that sweeps across it. Each
