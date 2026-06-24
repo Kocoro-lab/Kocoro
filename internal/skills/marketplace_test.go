@@ -541,6 +541,29 @@ func TestExtractZipToSkillZipBombActualBytes(t *testing.T) {
 	}
 }
 
+// TestExtractZipToSkillRejectsCompressedCap verifies the compressed-payload cap
+// fires — the io.ReadAll RAM backstop. Shrinks maxZipCompressedBytes so a tiny
+// fixture trips it without allocating the real ~1 GiB cap.
+func TestExtractZipToSkillRejectsCompressedCap(t *testing.T) {
+	original := maxZipCompressedBytes
+	maxZipCompressedBytes = 64
+	defer func() { maxZipCompressedBytes = original }()
+
+	// Even a single-entry zip's headers + central directory exceed 64 bytes.
+	zipBytes := makeZipFixture(t, []zipFileSpec{
+		{name: "SKILL.md", body: "---\nname: demo\ndescription: d\n---\n"},
+	})
+
+	destDir := filepath.Join(t.TempDir(), "stage")
+	err := extractZipToSkill(bytes.NewReader(zipBytes), destDir)
+	if err == nil {
+		t.Fatal("expected compressed-cap rejection, got nil")
+	}
+	if !strings.Contains(err.Error(), "compressed payload exceeds") {
+		t.Errorf("error should mention compressed payload cap, got: %v", err)
+	}
+}
+
 func TestExtractZipToSkillRejectsSizeCap(t *testing.T) {
 	// Build a tiny zip but feed it through a reader capped tinier than the
 	// compressed size. Simulates a server returning more bytes than the cap.
@@ -1339,7 +1362,7 @@ func TestInstallFromZipData_MalformedFrontmatter_ReportsParseError(t *testing.T)
 }
 
 // TestInstallFromZipData_ConflictPromptTruncation caps the prompt fields in
-// the 409 conflict response so a near-50 MB skill can't produce a huge JSON
+// the 409 conflict response so a near-cap skill can't produce a huge JSON
 // response body.
 func TestInstallFromZipData_ConflictPromptTruncation(t *testing.T) {
 	dir := t.TempDir()
