@@ -1239,21 +1239,12 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// from the stored summary alone. Users who want the per-
 				// turn breakdown can see it in the one-shot CLI footer.
 				total := sessionUsage.CostUSD + sessionUsage.ToolCostUSD
-				usageStr := fmt.Sprintf("  tokens: %d in / %d out | cost: $%.4f | calls: %d",
-					sessionUsage.InputTokens, sessionUsage.OutputTokens,
-					total, sessionUsage.LLMCalls)
-				if sessionUsage.Model != "" {
-					usageStr += " | " + sessionUsage.Model
-				}
-				usageStr += " | " + elapsed
-				m.appendOutput(usageDim.Render(usageStr))
+				// Friendly turn footer: cost + elapsed only. The full token /
+				// call / model breakdown lives in /status, kept off every turn
+				// for non-technical users.
+				m.appendOutput(usageDim.Render("  " + friendlyCost(total) + " · " + elapsed))
 			case msg.usage != nil:
-				usageStr := fmt.Sprintf("  tokens: %d | cost: $%.4f", msg.usage.TotalTokens, msg.usage.CostUSD)
-				if msg.usage.Model != "" {
-					usageStr += " | model: " + msg.usage.Model
-				}
-				usageStr += " | " + elapsed
-				m.appendOutput(usageDim.Render(usageStr))
+				m.appendOutput(usageDim.Render("  " + friendlyCost(msg.usage.CostUSD) + " · " + elapsed))
 			default:
 				m.appendOutput(usageDim.Render("  " + elapsed))
 			}
@@ -2316,6 +2307,17 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			formatTokenCount(tokenEst), formatTokenCount(ctxWindow), pct,
 			toolCount,
 		)))
+		// Usage breakdown lives here (kept off every turn footer). Cumulative
+		// for the session; cost is Cloud's computed cost_usd, not re-derived.
+		if sess != nil && sess.Usage != nil && (sess.Usage.InputTokens > 0 || sess.Usage.OutputTokens > 0) {
+			u := sess.Usage
+			usageLine := fmt.Sprintf("  Usage:       %d in / %d out · $%.4f · %d calls",
+				u.InputTokens, u.OutputTokens, u.CostUSD+u.ToolCostUSD, u.LLMCalls)
+			if u.Model != "" {
+				usageLine += " · " + u.Model
+			}
+			m.appendOutput(dimStyle.Render(usageLine))
+		}
 	case "/doctor":
 		m.appendOutput("Running diagnostics...")
 		m.state = stateProcessing
