@@ -23,13 +23,16 @@ func TestView_StateInput_StatusBarShowsAgentAndModel(t *testing.T) {
 
 	out := m.View()
 
-	if !strings.Contains(out, "/ commands") {
-		t.Errorf("status bar '/ commands' hint missing; View()=\n%q", out)
+	if !strings.Contains(out, statusAgentMarker) {
+		t.Errorf("status bar should lead with the agent marker %q; View()=\n%q", statusAgentMarker, out)
 	}
 	if !strings.Contains(out, "default") {
 		t.Errorf("status bar must show active agent 'default'; View()=\n%q", out)
 	}
 	if !strings.Contains(out, "medium") {
 		t.Errorf("status bar must show model 'medium'; View()=\n%q", out)
+	}
+	if !strings.Contains(out, "commands") {
+		t.Errorf("status bar should keep a slash-command hint; View()=\n%q", out)
 	}
 }

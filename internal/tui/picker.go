@@ -138,11 +138,30 @@ func (m *Model) openAgentPicker() {
 	m.state = statePicker
 }
 
+// agentExists reports whether name is a switchable agent. "" and "default"
+// both mean the built-in default (always valid); named agents must exist on
+// disk. Used to fall back to the picker on a typed-but-unknown name.
+func (m *Model) agentExists(name string) bool {
+	if name == "" || name == "default" {
+		return true
+	}
+	entries, _ := agents.ListAgents(filepath.Join(m.shannonDir, "agents"))
+	for _, e := range entries {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // switchToAgent switches the live agent (loop, skills, per-agent session
 // directory) and starts a fresh conversation — mirroring Desktop, where
 // switching an agent stops the current chat and begins a new one. name == ""
-// selects the default agent.
+// (or "default") selects the built-in default agent.
 func (m *Model) switchToAgent(name string) tea.Cmd {
+	if name == "default" {
+		name = "" // the built-in default agent has no named directory
+	}
 	current := ""
 	if m.agentOverride != nil {
 		current = m.agentOverride.Name

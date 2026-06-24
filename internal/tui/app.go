@@ -1498,6 +1498,10 @@ func composeBar(width int, left, right string) string {
 // composer renders at exactly the terminal width.
 const inputBorderOverhead = 2
 
+// statusAgentMarker leads the input status line — a brand-colored bar that
+// draws the eye to the active-agent segment.
+const statusAgentMarker = "▌"
+
 // renderInputBox wraps the composer view in a rounded, brand-colored border of
 // the given total width. Narrow widths pass the content through unboxed so the
 // frame never overflows.
@@ -1528,11 +1532,15 @@ func (m *Model) View() string {
 		// for the border (inputBorderOverhead) at init/resize.
 		sb.WriteString(renderInputBox(m.textarea.View(), m.width))
 		sb.WriteString("\n")
-		// Bottom bar: left hint (slash commands by typing "/") + active agent
-		// and model tier (agent name is a persistent control, mirroring Desktop).
-		leftHint := styleDim().Render(" / commands")
-		rightInfo := styleDim().Render(m.agentLabel() + " · " + m.modelDisplayLabel())
-		sb.WriteString(composeBar(m.width, leftHint, rightInfo))
+		// Status line: the active agent is the prominent left segment (brand
+		// marker + bold name) followed by the model tier; the slash hint sits
+		// dim on the right. agentLabel is a persistent control (Desktop).
+		marker := lipgloss.NewStyle().Foreground(colorAccent).Render(statusAgentMarker)
+		agentSeg := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(m.agentLabel())
+		modelSeg := styleSecondary().Render(m.modelDisplayLabel())
+		left := " " + marker + " " + agentSeg + " " + styleDim().Render("·") + " " + modelSeg
+		right := styleDim().Render("/ for commands")
+		sb.WriteString(composeBar(m.width, left, right))
 	case stateProcessing:
 		// Live preview of the answer being generated (transient; the finalized
 		// answer is rendered to scrollback on agentDoneMsg). Shown above the
@@ -2173,10 +2181,12 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "/agent", "/agents":
-		if len(parts) > 1 {
-			return m, m.switchToAgent(parts[1]) // /agent <name> — direct
+		if len(parts) > 1 && m.agentExists(parts[1]) {
+			return m, m.switchToAgent(parts[1]) // /agent <valid-name> — direct
 		}
-		m.openAgentPicker() // bare /agent — interactive picker
+		// bare /agent, or a typed name that doesn't exist → selectable picker
+		// (so "I'll just type it" / a typo still lands on the list, not an error)
+		m.openAgentPicker()
 	case "/config":
 		m.appendOutput(formatConfigDisplay(m.cfg))
 	case "/setup":
