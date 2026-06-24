@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -33,7 +34,7 @@ func newResizeTestModel(t *testing.T, width int) *Model {
 	return m
 }
 
-func TestFinishHeaderAnimation_HeaderBlockRerendersOnResize(t *testing.T) {
+func TestFinishHeaderAnimation_CommitsHeaderOnce(t *testing.T) {
 	m := &Model{
 		cfg: &config.Config{
 			ModelTier: "medium",
@@ -45,49 +46,51 @@ func TestFinishHeaderAnimation_HeaderBlockRerendersOnResize(t *testing.T) {
 		markdownCache: map[string]string{},
 	}
 	if cmd := m.finishHeaderAnimation(); cmd == nil {
-		t.Fatal("expected startup finish to trigger a repaint")
+		t.Fatal("expected startup finish to return a command (clear + flush)")
 	}
 	if len(m.output) == 0 {
-		t.Fatal("expected startup header in output")
+		t.Fatal("expected startup header committed to output")
 	}
-	if m.output[0].rerender == nil {
-		t.Fatal("expected startup header to store a rerender function")
-	}
-
-	m.width = 60
-	cmd := m.rerenderOutput()
-	if cmd == nil {
-		t.Fatal("expected rerender command when not processing")
-	}
-
-	want := renderStartupHeader(headerTotalFrames-1, 60, "dev", "medium", "https://api.test.com", "/tmp/project", nil, 0, "default")
-	if got := m.output[0].rendered; got != want {
-		t.Fatal("expected startup header to rerender at the new width")
+	if !strings.Contains(m.output[0].rendered, "Kocoro CLI") {
+		t.Fatal("expected the committed first block to be the startup header")
 	}
 }
 
-func TestRerenderOutput_RepaintsWhileProcessing(t *testing.T) {
+// Write-once scrollback: rerenderOutput must NOT re-render committed blocks at a
+// new width (resize keeps original wrap width, as in Codex/Claude Code).
+func TestRerenderOutput_WriteOnce_DoesNotRerenderScrollback(t *testing.T) {
 	m := newResizeTestModel(t, 120)
+	before := m.output[0].rendered
 
-	m.state = stateProcessing
 	m.width = 60
-	cmd := m.rerenderOutput()
-	if cmd == nil {
-		t.Fatal("expected rerender command while processing")
-	}
+	m.rerenderOutput()
 
-	want := renderStartupHeader(headerTotalFrames-1, 60, "dev", "medium", "https://api.test.com", "/tmp/project", nil, 0, "default")
-	if got := m.output[0].rendered; got != want {
-		t.Fatal("expected stored header rendering to update immediately")
+	if m.output[0].rendered != before {
+		t.Fatal("write-once: committed scrollback must not be re-rendered on resize")
 	}
 }
 
-func TestUpdate_WindowResizeWhileProcessingTriggersRepaint(t *testing.T) {
+// When the caller wiped the conversation (/clear, /reset, Ctrl+L), rerenderOutput
+// returns a clear command; otherwise it only flushes newly-appended blocks.
+func TestRerenderOutput_ClearsWhenOutputEmpty(t *testing.T) {
 	m := newResizeTestModel(t, 120)
-	m.state = stateProcessing
+	m.output = nil
+	if cmd := m.rerenderOutput(); cmd == nil {
+		t.Fatal("expected a clear command when output was wiped")
+	}
+}
+
+func TestUpdate_WindowResize_UpdatesWidthWithoutReflowing(t *testing.T) {
+	m := newResizeTestModel(t, 120)
 	m.height = 40
-	_, cmd := m.update(tea.WindowSizeMsg{Width: 60, Height: 40})
-	if cmd == nil {
-		t.Fatal("expected resize during processing to trigger a repaint")
+	before := m.output[0].rendered
+
+	m.update(tea.WindowSizeMsg{Width: 60, Height: 40})
+
+	if m.width != 60 {
+		t.Fatalf("resize should update width to 60, got %d", m.width)
+	}
+	if m.output[0].rendered != before {
+		t.Fatal("resize must not re-flow committed scrollback (write-once)")
 	}
 }

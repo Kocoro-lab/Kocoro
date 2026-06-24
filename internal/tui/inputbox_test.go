@@ -17,9 +17,12 @@ func TestRenderInputBox_BordersContent(t *testing.T) {
 	if !strings.Contains(out, "╭") || !strings.Contains(out, "╰") {
 		t.Error("box should have rounded top/bottom borders")
 	}
+	// The box is one column short of the requested width: the trailing column is
+	// left blank so Bubbletea's inline differ erases the line cleanly (see
+	// inputBorderOverhead) and doesn't clip the status bar below it.
 	first := strings.SplitN(out, "\n", 2)[0]
-	if w := lipgloss.Width(first); w != 30 {
-		t.Errorf("box top border width = %d, want 30", w)
+	if w := lipgloss.Width(first); w != 29 {
+		t.Errorf("box top border width = %d, want 29 (totalWidth-1)", w)
 	}
 }
 

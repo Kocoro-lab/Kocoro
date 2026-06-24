@@ -290,17 +290,9 @@ func (m *Model) cwd() string {
 // header to scrollback, and transitions to stateInput.
 func (m *Model) finishHeaderAnimation() tea.Cmd {
 	finalHeader := renderStartupHeader(headerTotalFrames-1, m.width, m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD, m.headerSessions, m.headerTipIdx, m.agentLabel())
-	// Capture stable values for the rerender closure so the header can be
-	// re-rendered at a new width on terminal resize.
-	version, tier, ep, cwd := m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD
-	sessions, tipIdx := m.headerSessions, m.headerTipIdx
-	agentLabel := m.agentLabel()
-	m.output = append(m.output, outputBlock{
-		rendered: finalHeader,
-		rerender: func(width int) string {
-			return renderStartupHeader(headerTotalFrames-1, width, version, tier, ep, cwd, sessions, tipIdx, agentLabel)
-		},
-	})
+	// Commit the startup banner to scrollback exactly once (write-once: no
+	// rerender closure — resize keeps its original width, as in Codex/CC).
+	m.appendOutput(finalHeader)
 	m.appendOutput("")
 	m.headerDone = true
 	m.state = stateInput
@@ -321,7 +313,9 @@ func (m *Model) finishHeaderAnimation() tea.Cmd {
 		m.appendOutput("")
 		m.headerHealth = nil
 	}
-	return m.rerenderOutput()
+	// Wipe the animating header from the live region, then emit the committed
+	// banner + health lines to scrollback once.
+	return tea.Sequence(tea.ClearScreen, m.flushPrints())
 }
 
 func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model {
@@ -1501,10 +1495,13 @@ func composeBar(width int, left, right string) string {
 	return left + styleFaint().Render(strings.Repeat("─", fill)) + right
 }
 
-// inputBorderOverhead is the columns the rounded composer border consumes
-// (1 left + 1 right). The textarea width is reduced by this so the boxed
-// composer renders at exactly the terminal width.
-const inputBorderOverhead = 2
+// inputBorderOverhead reserves columns around the composer: 1 left border +
+// 1 right border + 1 trailing column left blank. The trailing blank is
+// load-bearing: a live line that fills the FULL terminal width gets no
+// EraseLineRight from Bubbletea's inline differ (it only erases lines shorter
+// than the width), which desyncs line accounting and clips the trailing status
+// bar on each keystroke. Keeping the box 1 column short keeps the differ honest.
+const inputBorderOverhead = 3
 
 // statusAgentMarker leads the input status line — a brand-colored bar that
 // draws the eye to the active-agent segment.
@@ -1879,38 +1876,27 @@ func (m *Model) flushPrints() tea.Cmd {
 	return tea.Println(strings.Join(texts, "\n"))
 }
 
-// rerenderOutput re-renders all output blocks at the current width and reprints them.
-// Used when the terminal is resized and when handing off from the startup
-// animation to scrollback-backed output.
+// rerenderOutput is the write-once scrollback gate. Terminal scrollback is
+// immutable once emitted: tea.ClearScreen erases only the VISIBLE screen
+// (\x1b[2J), not the saved-lines, so re-printing m.output stacks duplicates
+// every turn, and the ClearScreen→Println→rerenderDoneMsg round-trip leaves the
+// composer needing a second keypress to repaint ("double Enter"). Two behaviors:
 //
-// Sets rerenderPending to suppress flushPrints during the ClearScreen→Println
-// sequence, preventing streamOutputMsg from interleaving (fixes resize race).
+//   - The caller wiped the conversation (m.output niled: /clear, /reset,
+//     Ctrl+L) → wipe the visible screen; there is nothing left to reprint.
+//   - Otherwise → emit ONLY the newly-appended blocks (flushPrints) and never
+//     reprint the backlog, which already lives in terminal scrollback.
+//
+// This generalizes the switchToAgent fix (picker.go) to every caller, killing
+// the header duplication and the double-Enter together. Tradeoff (accepted, and
+// the choice Codex/Claude Code also make): resize does not re-flow already-
+// committed scrollback — old lines keep their original wrap width.
 func (m *Model) rerenderOutput() tea.Cmd {
-	width := m.width
-
-	// Re-render blocks at new width.
-	for i, b := range m.output {
-		if b.rerender != nil {
-			m.output[i].rendered = b.rerender(width)
-		} else if b.raw != "" {
-			m.output[i].rendered = m.renderMarkdownCached(b.raw, width)
-		}
+	if len(m.output) == 0 {
+		m.pendingPrints = m.pendingPrints[:0]
+		return tea.ClearScreen
 	}
-
-	lines := make([]string, 0, len(m.output))
-	for _, b := range m.output {
-		lines = append(lines, b.rendered)
-	}
-
-	// Suppress incremental prints until the full repaint completes.
-	m.pendingPrints = m.pendingPrints[:0]
-	m.rerenderPending = true
-
-	return tea.Sequence(
-		tea.ClearScreen,
-		tea.Println(strings.Join(lines, "\n")),
-		func() tea.Msg { return rerenderDoneMsg{} },
-	)
+	return m.flushPrints()
 }
 
 // generateTitleCmd generates a smart session title in the background and
