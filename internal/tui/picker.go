@@ -227,6 +227,7 @@ func (m *Model) switchToAgent(name string) tea.Cmd {
 	// history and stack a duplicate. flushPrints just emits the notice; the
 	// prior conversation stays as immutable scrollback above it.
 	m.output = nil
+	m.clearSuggestion()
 	sess := m.sessions.NewSession()
 	m.resumedSession = false
 	m.sessionAllowed = make(map[string]bool)

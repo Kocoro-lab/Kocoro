@@ -204,6 +204,8 @@ type Model struct {
 	pickerKind          pickerKind     // dispatches Enter to the right apply
 	pastes              map[int]string // stashed large pastes (placeholder N → full text)
 	pasteCounter        int            // last [Pasted text #N] number
+	promptSuggestion    string         // current follow-up suggestion (ghost text under composer)
+	suggestionGen       int            // bumped each turn; stales in-flight suggestions
 	state               state
 	width               int
 	height              int
@@ -921,6 +923,15 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.menuVisible = false
 				return m, nil
 			}
+			// Accept the ghost-text follow-up: fill the composer, do NOT send
+			// (matches Desktop). Only when the composer is empty.
+			if m.state == stateInput && m.promptSuggestion != "" && strings.TrimSpace(m.textarea.Value()) == "" {
+				m.textarea.SetValue(m.promptSuggestion)
+				m.textarea.CursorEnd()
+				m.promptSuggestion = ""
+				m.adjustTextareaHeight()
+				return m, nil
+			}
 		case tea.KeyEnter:
 			// Alt+Enter: insert newline instead of submitting
 			if m.state == stateInput && !m.menuVisible && msg.Alt {
@@ -1262,7 +1273,16 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Full clear-and-repaint so the response, usage line, and input bar
 		// are all positioned correctly — incremental Println can mis-position
 		// lines when the view height changes between processing and input.
-		return m, tea.Batch(m.rerenderOutput(), titleCmd)
+		return m, tea.Batch(m.rerenderOutput(), titleCmd, m.maybeSuggestCmd(msg, m.suggestionGen))
+
+	case suggestionReadyMsg:
+		// Ghost-text follow-up. Show only if it belongs to the current turn
+		// (not staled by a newer submit) and we're back at the composer. Never
+		// auto-sent — the user presses Tab to fill it.
+		if msg.gen == m.suggestionGen && m.state == stateInput && strings.TrimSpace(msg.text) != "" {
+			m.promptSuggestion = msg.text
+		}
+		return m, nil
 
 	case titleGeneratedMsg:
 		// The smart title was generated off-thread; persist it here on the main
@@ -1575,6 +1595,13 @@ func (m *Model) View() string {
 		// for the border (inputBorderOverhead) at init/resize.
 		sb.WriteString(renderInputBox(m.textarea.View(), m.width))
 		sb.WriteString("\n")
+		// Ghost-text follow-up suggestion (Tab to use), shown only on an empty
+		// composer so it never fights what the user is typing.
+		if m.promptSuggestion != "" && strings.TrimSpace(m.textarea.Value()) == "" {
+			sb.WriteString(styleDim().Render("  ↳ "+truncateStr(m.promptSuggestion, m.width-16)) +
+				styleFaint().Render("  Tab"))
+			sb.WriteString("\n")
+		}
 		// Status line: the active agent is the prominent left segment (brand
 		// marker + bold name) followed by the model tier; the slash hint sits
 		// dim on the right. agentLabel is a persistent control (Desktop).
@@ -1665,6 +1692,7 @@ func (m *Model) View() string {
 }
 
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
+	m.clearSuggestion() // a new turn stales any in-flight / shown suggestion
 	input := strings.TrimSpace(m.textarea.Value())
 	m.textarea.Reset()
 	m.textarea.SetHeight(1)
@@ -1683,8 +1711,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.historyIdx = -1
 	m.historySaved = ""
 
-	promptMark := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
-	m.appendOutput(fmt.Sprintf("%s %s", promptMark, input))
+	// Echo the user's message in a distinct bold color so "what I said" stands
+	// out from the assistant's answer (white) and tool lines (dim gray).
+	userStyle := lipgloss.NewStyle().Bold(true).Foreground(colorInfo)
+	m.appendOutput(userStyle.Render("› " + input))
 
 	// Expand [Pasted text #N] placeholders to their stashed full text for the
 	// model; the echo + history above keep the compact placeholder form.
@@ -2114,6 +2144,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.appendOutput(helpText())
 	case "/clear":
 		m.output = nil
+		m.clearSuggestion()
 		sess := m.sessions.NewSession()
 		m.resumedSession = false
 		m.sessionAllowed = make(map[string]bool)
