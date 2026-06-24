@@ -1598,7 +1598,7 @@ func (m *Model) View() string {
 			glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
 			dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 			keyArg := toolKeyArg(m.pendingToolName, m.pendingToolArgs)
-			sb.WriteString(glyphStyle.Render(glyph) + dimStyle.Render(fmt.Sprintf(" %s(%s)", m.pendingToolName, keyArg)))
+			sb.WriteString(glyphStyle.Render(glyph) + dimStyle.Render(" "+formatToolCallLabel(m.pendingToolName, keyArg)))
 		} else {
 			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
 			color := spinColors[m.colorIdx%len(spinColors)]
