@@ -50,6 +50,7 @@ const (
 	stateProcessing
 	stateApproval
 	stateSessionPicker
+	statePicker
 )
 
 // tuiMemoryFallback adapts session.Manager to the tools.FallbackQuery
@@ -197,6 +198,10 @@ type Model struct {
 	colorIdx            int
 	lastSessions        []session.SessionSummary // cached for session picker
 	sessionPickerIdx    int
+	pickerTitle         string         // generic selection picker (statePicker)
+	pickerOpts          []pickerOption // current picker rows
+	pickerIdx           int            // highlighted row
+	pickerKind          pickerKind     // dispatches Enter to the right apply
 	state               state
 	width               int
 	height              int
@@ -1077,6 +1082,33 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		if m.state == statePicker {
+			switch msg.Type {
+			case tea.KeyUp:
+				m.pickerIdx = pickerWrap(m.pickerIdx-1, len(m.pickerOpts))
+				return m, nil
+			case tea.KeyDown:
+				m.pickerIdx = pickerWrap(m.pickerIdx+1, len(m.pickerOpts))
+				return m, nil
+			case tea.KeyEnter:
+				if len(m.pickerOpts) > 0 {
+					sel := m.pickerOpts[m.pickerIdx].value
+					m.state = stateInput
+					switch m.pickerKind {
+					case pickerKindModel:
+						m.applyModelTier(sel)
+					}
+					return m, nil
+				}
+				m.state = stateInput
+				return m, nil
+			case tea.KeyEscape:
+				m.state = stateInput
+				return m, nil
+			}
+			return m, nil
+		}
+
 		if m.state == stateApproval {
 			switch msg.String() {
 			case "y", "Y":
@@ -1543,6 +1575,8 @@ func (m *Model) View() string {
 		sb.WriteString(bar)
 	case stateSessionPicker:
 		sb.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  Sessions (Up/Down, Enter, Esc)"))
+	case statePicker:
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  " + m.pickerTitle + " (Up/Down, Enter, Esc)"))
 	}
 
 	// --- Dropdown (only when visible) ---
@@ -1559,6 +1593,12 @@ func (m *Model) View() string {
 			}
 			desc := fmt.Sprintf("[%s] %d msgs", s.UpdatedAt.Format("Jan 02 15:04"), s.MsgCount)
 			return title, desc
+		}))
+	} else if m.state == statePicker {
+		sb.WriteString("\n")
+		sb.WriteString(renderDropList(dropListSize, len(m.pickerOpts), m.pickerIdx, func(i int) (string, string) {
+			o := m.pickerOpts[i]
+			return o.label, o.desc
 		}))
 	}
 
@@ -1848,9 +1888,14 @@ func (m *Model) rerenderOutput() tea.Cmd {
 	m.pendingPrints = m.pendingPrints[:0]
 	m.rerenderPending = true
 
+	// ClearScreen erases only the VISIBLE screen (\x1b[2J). Any blocks that had
+	// scrolled into the terminal's saved-lines (scrollback) survive and would be
+	// duplicated by the re-print below — the symptom is a second startup header
+	// appearing after enough output (e.g. /help) pushes the first one up.
+	// Prepend \x1b[3J ("erase saved lines") so the scrollback is cleared too.
 	return tea.Sequence(
 		tea.ClearScreen,
-		tea.Println(strings.Join(lines, "\n")),
+		tea.Println("\x1b[3J"+strings.Join(lines, "\n")),
 		func() tea.Msg { return rerenderDoneMsg{} },
 	)
 }
@@ -2125,20 +2170,9 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			}
 		} else {
 			if len(parts) > 1 {
-				saveCfg := m.cfg
-				if m.baseCfg != nil {
-					m.baseCfg.ModelTier = parts[1]
-					saveCfg = m.baseCfg
-				}
-				m.cfg.ModelTier = parts[1]
-				m.agentLoop.SetModelTier(parts[1])
-				if err := config.Save(saveCfg); err != nil {
-					m.appendOutput(fmt.Sprintf("Model tier: %s (failed to save: %v)", parts[1], err))
-				} else {
-					m.appendOutput(fmt.Sprintf("Model tier: %s (saved)", parts[1]))
-				}
+				m.applyModelTier(parts[1]) // /model <tier> — direct (power users)
 			} else {
-				m.appendOutput(fmt.Sprintf("Current model tier: %s", m.cfg.ModelTier))
+				m.openModelPicker() // bare /model — interactive picker
 			}
 		}
 	case "/config":
