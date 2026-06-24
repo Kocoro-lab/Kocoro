@@ -18,7 +18,8 @@
     "proactive_thread_mode",
     "reply_delivery_result_v1",
     "channel_state_event_v1",
-    "deliverable_event_v1"
+    "deliverable_event_v1",
+    "mention_roster_v1"
   ],
   "memory": {
     "provider": "disabled",

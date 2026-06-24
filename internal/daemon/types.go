@@ -195,10 +195,16 @@ type ReplyPayload struct {
 	// Mentions is an optional disambiguation anchor list for outbound @mentions
 	// on platforms that require a user identifier (Teams, Slack, ...). When the
 	// agent embeds "@name" in Text but the channel roster has duplicate display
-	// names, Mentions pins which person each "@name" refers to (by Email/UPN).
-	// Empty (omitted) is the common case — Cloud resolves unambiguous "@name"
-	// matches from the channel roster alone. Mirrors shannon-cloud
-	// ReplyPayload.Mentions byte-for-byte.
+	// names, Mentions would pin which person each "@name" refers to (by
+	// Email/UPN). Mirrors shannon-cloud ReplyPayload.Mentions byte-for-byte.
+	//
+	// RESERVED — daemon does not currently populate this field. The agent emits
+	// `@<display name>` as free text and SendReply (client.go) constructs the
+	// payload without a Mentions value, so duplicate-display-name disambiguation
+	// is Cloud-side-only today (resolves unambiguously by name or degrades to
+	// plain text). The wire field is in place so a future revision can add a
+	// producer (e.g. parsing a `@[name](mailto:upn)` markdown-link syntax in
+	// the agent's final text) without a second contract change.
 	Mentions []Mention `json:"mentions,omitempty"`
 }
 
