@@ -90,12 +90,12 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 ### Upload a skill from a ZIP file
 - Method: POST
 - Path: /skills/upload?force=true
-- Body: `multipart/form-data`; field `file` = ZIP payload (max 50 MB compressed, 200 MB uncompressed)
+- Body: `multipart/form-data`; field `file` = ZIP payload. Size is bounded only by a memory / zip-bomb backstop (1 GiB compressed and 1 GiB uncompressed), not a product limit — skills install to the user's local disk.
 - Response 201: `{"name": "...", "slug": "...", "description": "...", "install_source": "local"}`
 - Response 409: `{"error": "skill_already_exists", "existing_name": "...", "existing_description": "...", "existing_prompt": "...", "new_description": "...", "new_prompt": "..."}`
 - Response 403: `{"error": "skill_is_builtin"}` — returned when the ZIP targets an auto-installed builtin (`kocoro`, `kocoro-generative-ui`). `force=true` does NOT override this; the builtin guard is unconditional because `EnsureBuiltinSkills` would wipe any override on the next daemon restart.
-- Response 400: `{"error": "invalid multipart form: ..."}` — returned when the multipart body is malformed or the `file` field is missing. Distinct from 413 (which means body exceeded 50 MB).
-- Response 413: zip exceeds 50 MB compressed or 200 MB uncompressed
+- Response 400: `{"error": "invalid multipart form: ..."}` — returned when the multipart body is malformed or the `file` field is missing. Distinct from 413 (which means the archive or its extracted contents exceeded the size backstop).
+- Response 413: the ZIP archive or its extracted contents exceed the size backstop (1 GiB compressed / 1 GiB uncompressed)
 - Response 422: invalid skill payload (missing SKILL.md, malformed frontmatter, invalid name)
 - Notes: GitHub/Finder-style ZIPs (single top-level directory) are auto-unwrapped, and `__MACOSX` metadata directories are ignored. The slug is derived from the SKILL.md frontmatter `name` field. Use `force=true` to overwrite an existing user-installed skill (does not apply to builtins). The 409 body includes both existing and new descriptions/prompts so the frontend can render a side-by-side compare sheet. `install_source` is set to `local` to distinguish uploads from `bundled` / `marketplace` installs.
 

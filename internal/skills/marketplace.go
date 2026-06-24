@@ -219,8 +219,8 @@ var (
 )
 
 // ConflictPromptPreviewBytes caps the prompt fields surfaced in a 409 conflict
-// response. ZIP payloads can be ~50 MB and the extracted SKILL.md prompt may
-// be most of that; returning the raw bytes inline produces an unmanageable
+// response. ZIP payloads can be up to 1 GiB and the extracted SKILL.md prompt
+// may be much of that; returning the raw bytes inline produces an unmanageable
 // JSON response. 8 KB is enough for a meaningful compare preview while
 // keeping the response body bounded. Exported so the daemon's PUT /skills/{name}
 // path can apply the same cap when surfacing the same 409 shape.

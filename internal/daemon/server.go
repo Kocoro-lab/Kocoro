@@ -3695,9 +3695,10 @@ const uploadSkillMaxBodyBytes int64 = 1*1024*1024*1024 + 16*1024*1024
 // uploadSkillInMemoryBytes is the multipart in-memory threshold; anything over
 // this spills the form to a tempfile via mime/multipart. Note this only bounds
 // multipart parser scratch — InstallFromZipData reads the file part fully into
-// memory (io.ReadAll under the 50 MB zip cap) for extraction, so each in-flight
+// memory (io.ReadAll under the 1 GiB zip cap) for extraction, so each in-flight
 // upload of a different slug still costs roughly the compressed payload size
-// in RAM. Concurrent uploads of the same slug are serialized by s.slugLocks.
+// in RAM (worst case ~1 GiB each — the cap is a backstop, not a small ceiling).
+// Concurrent uploads of the same slug are serialized by s.slugLocks.
 const uploadSkillInMemoryBytes int64 = 1 << 20 // 1 MB
 
 func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
