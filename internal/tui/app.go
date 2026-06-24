@@ -1545,6 +1545,20 @@ func renderInputBox(taView string, totalWidth int) string {
 		Render(taView)
 }
 
+// renderDimComposer renders the composer with a muted border, shown while the
+// agent is working or awaiting approval so the chat box stays visible (dimmed
+// to signal it's paused) instead of vanishing until the run ends.
+func renderDimComposer(taView string, totalWidth int) string {
+	if totalWidth < 4 {
+		return taView
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Width(totalWidth - inputBorderOverhead).
+		Render(taView)
+}
+
 func (m *Model) View() string {
 	var sb strings.Builder
 
@@ -1593,6 +1607,10 @@ func (m *Model) View() string {
 			sb.WriteString(glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx))
 		}
 		sb.WriteString("\n")
+		// Keep the composer visible (dimmed) so the chat box doesn't vanish
+		// while the agent works.
+		sb.WriteString(renderDimComposer(m.textarea.View(), m.width))
+		sb.WriteString("\n")
 		// Bottom status bar: left "esc to interrupt" hint (cancelling a run is
 		// otherwise undiscoverable) + right model tier and execution timer.
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
@@ -1600,7 +1618,9 @@ func (m *Model) View() string {
 		rightInfo := styleDim().Render(m.modelDisplayLabel() + " " + elapsed)
 		sb.WriteString(composeBar(m.width, leftHint, rightInfo) + "\n")
 	case stateApproval:
-		sb.WriteString(bar)
+		// Keep the composer visible (dimmed) above the approval prompt so the
+		// chat box doesn't vanish while awaiting a y/n/a decision.
+		sb.WriteString(renderDimComposer(m.textarea.View(), m.width))
 		sb.WriteString("\n")
 		// Labeled keys instead of a bare "[y/n/a]" so non-technical users know
 		// what each choice does.
