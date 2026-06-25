@@ -1862,16 +1862,16 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		return m.handleSlashCommand(input)
 	}
 
-	// If already processing, inject into running loop instead of blocking
+	// If already processing, inject into running loop instead of blocking.
 	if m.state == stateProcessing && m.injectCh != nil {
 		select {
 		case m.injectCh <- agent.InjectedMessage{Text: input}:
-			// Append to session messages for context persistence
-			sess := m.sessions.Current()
-			sess.Messages = append(sess.Messages, client.Message{
-				Role: "user", Content: client.NewTextContent(input),
-			})
-			sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local", Timestamp: session.TimePtr(time.Now())})
+			// Do NOT append to sess.Messages here. The loop drains this follow-up
+			// as a new user turn into RunMessages(), and runAgentLoop's persist
+			// block writes RunMessages()[1:] to sess.Messages once the run ends —
+			// so appending here too duplicated the turn on resume/fork (and raced
+			// the background runAgentLoop goroutine on the same slice). The visual
+			// echo above (appendOutput) is enough for the live transcript.
 		default:
 			m.appendOutput("(injection queue full — message dropped)")
 		}
