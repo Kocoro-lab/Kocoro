@@ -290,7 +290,8 @@ The daemon cross-compiles to macOS / Linux / Windows (`CGO_ENABLED=0`). POSIX-on
 - **Process-group kill** → per-package `*_proc_{unix,windows}.go` helpers (`internal/hooks`, `internal/tools` for bash, `internal/memory` for the sidecar; `internal/mcp/processgroup_{unix,windows}.go` is the original): POSIX `Setpgid` + `Kill(-pid)` vs Windows `CREATE_NEW_PROCESS_GROUP` + `taskkill /T /F`. Windows has no usable graceful step for console children (graceful `taskkill` no-ops), so the sidecar force-kills directly.
 - **`shan daemon stop`** → `cmd/proc_signal_{unix,windows}.go` (`terminateDaemon`): POSIX SIGTERM vs Windows `taskkill`. HTTP `/shutdown` remains the cross-platform graceful primary; signal/taskkill is the PID-file fallback.
 - **macOS-only GUI tools** (`accessibility`/`applescript`/`clipboard`/`computer`/`screenshot`/`ghostty`) gate on `runtime.GOOS != "darwin"` and return a clean "only available on macOS" error elsewhere. `notify` is NOT gated — it has a cross-platform Desktop route; only its osascript fallback is darwin-gated.
-- **Known Windows gaps (not yet ported)**: memory bundle `current` pointer uses `os.Symlink` (`internal/memory/bundle.go`) which needs Developer Mode / a junction-or-pointer-file fallback on Windows; `bash` runs `sh -c` and requires Git Bash/WSL on PATH (returns a clean error otherwise).
+- **Memory bundle `current` pointer** → `internal/memory/bundle_link_{unix,windows}.go` (`swapCurrent`): a symlink (atomic tmp+rename) on POSIX vs an unprivileged directory junction (`mklink /J`, remove+recreate) on Windows — `os.Symlink` would fail with ERROR_PRIVILEGE_NOT_HELD off Developer Mode. Both keep `current/<file>` transparently traversable by the `tlm` sidecar and resolvable by `os.Readlink` (`currentTs`).
+- **Known Windows gaps (not yet ported)**: `bash` runs `sh -c` and requires Git Bash/WSL on PATH (returns a clean error otherwise).
 
 ### Prompt Cache
 
