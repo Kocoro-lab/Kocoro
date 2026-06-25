@@ -2,10 +2,17 @@ package cmd
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/koe"
 )
 
 // koeConfig holds the resolved settings for one `shan koe` voice session.
@@ -60,5 +67,52 @@ func init() {
 	rootCmd.AddCommand(koeCmd)
 }
 
-// stub — replaced in Task 5
-func runKoeCall(ctx context.Context, cfg koeConfig) error { return fmt.Errorf("not implemented") }
+const koePersona = "You are Kocoro, a calm, professional voice assistant. Speak in the first person as Kocoro. " +
+	"When the user asks for real work, call do_task and then say the result in one or two short spoken sentences. " +
+	"Never read markdown, code, JSON, URLs, or file paths aloud. Confirm irreversible actions by restating them and waiting for a clear yes. " +
+	"Never narrate that you are delegating — just do it and report back as yourself."
+
+func newBurstID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return "burst-" + hex.EncodeToString(b[:])
+}
+
+func runKoeCall(ctx context.Context, cfg koeConfig) error {
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// Plan B wiring: link + resolver + dispatcher + per-call state.
+	client := koe.NewDaemonClient(cfg.daemonURL)
+	agents, err := client.ListAgents(ctx)
+	if err != nil {
+		log.Printf("koe: list agents failed (continuing with empty registry): %v", err)
+	}
+	resolver := koe.NewAgentResolver(agents, koe.NoopSemanticMatcher{})
+	state := koe.NewCallState(newBurstID(), cfg.agent)
+	disp := koe.NewDispatcher(client, resolver, state, nil) // controlApp nil in C-minimal (no Desktop)
+
+	// Audio + WebRTC.
+	audio, err := koe.NewAudioIO()
+	if err != nil {
+		return fmt.Errorf("audio init: %v", err)
+	}
+	if err := audio.Start(); err != nil {
+		return fmt.Errorf("audio start: %v", err)
+	}
+	defer audio.Stop()
+
+	ek, err := koe.MintEphemeral(ctx, cfg.openAIKey, cfg.model) // DEV-KEY: the deferred daemon mint relay replaces this
+	if err != nil {
+		return fmt.Errorf("mint: %v", err)
+	}
+	conn, err := koe.Connect(ctx, audio, ek, koePersona, state, disp)
+	if err != nil {
+		return fmt.Errorf("connect: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Println("Kocoro is listening. Speak; Ctrl-C to end.")
+	<-ctx.Done()
+	return nil
+}

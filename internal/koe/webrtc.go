@@ -161,3 +161,36 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 
 // Close tears down the peer connection.
 func (rc *RealtimeConn) Close() { _ = rc.pc.Close() }
+
+// MintEphemeral is the exported dev-key mint (C-minimal). The deferred daemon mint relay swaps the body
+// for a via-daemon call; the signature stays so cmd/koe.go is unchanged.
+// DEV-KEY: replaced by the deferred daemon mint relay (→ Plan D Cloud mint).
+func MintEphemeral(ctx context.Context, apiKey, model string) (string, error) {
+	return mintEphemeral(ctx, apiKey, model)
+}
+
+// Connect builds the peer connection, dials OpenAI, configures the session, and
+// starts the send-pump + event-dispatch loops. Returns once connected.
+func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *CallState, disp *Dispatcher) (*RealtimeConn, error) {
+	rc, err := newPeerConnection(audio)
+	if err != nil {
+		return nil, err
+	}
+	h := newEventHandler(disp, state, func(v any) error {
+		b, _ := json.Marshal(v)
+		return rc.dc.SendText(string(b))
+	})
+	rc.dc.OnOpen(func() {
+		b, _ := json.Marshal(sessionConfig(persona, "marin"))
+		_ = rc.dc.SendText(string(b))
+	})
+	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
+		h.handleEvent(ctx, m.Data)
+	})
+	if err := rc.dialOpenAI(ctx, ek); err != nil {
+		rc.Close()
+		return nil, err
+	}
+	go rc.pumpSendTrack(ctx)
+	return rc, nil
+}
