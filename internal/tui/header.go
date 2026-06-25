@@ -17,8 +17,8 @@ import (
 // Color palette for the startup header. Routed through the shared adaptive
 // palette (theme.go) so the header stays readable on light terminals too.
 var (
-	borderColor = colorAccent // frog green — box border
-	accentColor = colorAccent // frog green — section headers
+	borderColor = colorAccent // Kocoro pink — box border
+	accentColor = colorAccent // Kocoro pink — section headers
 	dimColor    = colorDim    // medium gray — secondary text
 	infoColor   = colorInfo   // blue — activity header
 )

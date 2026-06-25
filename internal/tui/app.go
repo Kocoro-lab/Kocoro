@@ -970,17 +970,13 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.ctrlCArmed = false
 				return m, nil
 			}
-			// First Ctrl+C on an empty composer: clear the conversation + arm exit.
+			// First Ctrl+C on an empty composer: arm exit only. Do NOT clear the
+			// conversation — a reflexive Ctrl+C (to stop/cancel) must not silently
+			// discard the session. The "press again to exit" hint shows in the
+			// status bar while armed; clearing is /clear and Ctrl+L.
 			if !m.ctrlCArmed {
 				m.ctrlCArmed = true
-				m.output = nil
-				m.clearSuggestion()
-				sess := m.sessions.NewSession()
-				m.resumedSession = false
-				m.sessionAllowed = make(map[string]bool)
-				m.applyRuntimeContext(sess)
-				m.appendOutput(lipgloss.NewStyle().Foreground(colorDim).Render("  Conversation cleared. Press Ctrl+C again to exit."))
-				return m, tea.Sequence(tea.ClearScreen, m.markDirty())
+				return m, nil
 			}
 			// Second consecutive Ctrl+C: exit.
 			return m, m.quitCmd()
@@ -1719,7 +1715,13 @@ func (m *Model) bottomRegion() string {
 		agentSeg := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(m.agentLabel())
 		modelSeg := styleSecondary().Render(m.modelDisplayLabel())
 		left := " " + marker + " " + agentSeg + " " + styleDim().Render("·") + " " + modelSeg
+		// While Ctrl+C is armed, the right segment becomes a transient exit hint
+		// (no conversation mutation — see the Ctrl+C handler). Any other key
+		// disarms it and the slash hint returns.
 		right := styleDim().Render("? for commands")
+		if m.ctrlCArmed {
+			right = lipgloss.NewStyle().Foreground(colorWarn).Render("Press Ctrl+C again to exit")
+		}
 		sb.WriteString(composeBar(m.width-1, left, right)) // width-1: same zero-slack rule as the processing bar
 	case stateProcessing:
 		// Composer stays visible AND usable while the agent works (Claude-Code

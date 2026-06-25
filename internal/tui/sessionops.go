@@ -51,9 +51,9 @@ func (m *Model) forkSession(id string) tea.Cmd {
 	m.resumedSession = true
 	m.sessionAllowed = make(map[string]bool)
 	m.applyRuntimeContext(fork)
-	// Render the forked conversation to scrollback — mirrors the resume path
-	// (loadSessionHistory renders async, hence no flushPrints). The "(fork)"
-	// title tells the user this is a branch of the original.
+	// Load the forked conversation into the viewport — mirrors the resume path
+	// (loadSessionHistory renders the history blocks async). The "(fork)" title
+	// tells the user this is a branch of the original.
 	m.loadSessionHistory(fork)
 	return nil
 }
