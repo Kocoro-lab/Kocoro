@@ -781,6 +781,65 @@ examples:
 	}
 }
 
+// TestWireFixture_HTTPAgentsWithProfile pins the shape of GET /agents (list)
+// when an agent ships a PROFILE.yaml with a description. The profile-less list
+// fixture covers the omitted-description case; this one pins the localized
+// `description` map that the front-side agent-resolver decodes off the list.
+func TestWireFixture_HTTPAgentsWithProfile(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.agents.with_profile.response.json")
+
+	agentsDir := t.TempDir()
+	agentDir := filepath.Join(agentsDir, "profile-demo")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte("You are a demo agent.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Only `description` flows from PROFILE.yaml into the list row (avatar stays
+	// ""); the JSON shape must match the committed fixture byte-for-field.
+	profileYAML := `description:
+  en: A demo agent used by wire-fixture tests.
+  zh-Hans: 用于线路 fixture 测试的演示智能体。
+  ja: ワイヤフィクスチャテスト用のデモエージェント。
+`
+	if err := os.WriteFile(filepath.Join(agentDir, "PROFILE.yaml"), []byte(profileYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := &ServerDeps{AgentsDir: agentsDir, ShannonDir: t.TempDir()}
+	srv := NewServer(0, nil, deps, "test")
+	handler := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/agents", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /agents = %d, body %s", rec.Code, rec.Body.String())
+	}
+	assertSemanticEqual(t, fixture, parseJSONMap(t, rec.Body.Bytes()))
+
+	// Consumer-shaped decode: the front-side resolver reads `description` as a
+	// locale→text map off each list row.
+	var list struct {
+		Agents []struct {
+			Name        string            `json:"name"`
+			Description map[string]string `json:"description"`
+		} `json:"agents"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if len(list.Agents) != 1 || list.Agents[0].Name != "profile-demo" {
+		t.Fatalf("consumer decode lost fields: %+v", list)
+	}
+	if list.Agents[0].Description["en"] != "A demo agent used by wire-fixture tests." {
+		t.Errorf("description.en=%q", list.Agents[0].Description["en"])
+	}
+	if list.Agents[0].Description["zh-Hans"] == "" {
+		t.Errorf("description.zh-Hans empty")
+	}
+}
+
 // TestWireFixture_HTTPAgentDetailWithAvatar pins the shape of GET
 // /agents/{name} when the agent has a PROFILE.yaml containing only avatar and
 // category (minimal profile). Verifies that avatar is propagated through
