@@ -38,3 +38,23 @@ func TestKoeMessagingClassification(t *testing.T) {
 		}
 	}
 }
+
+func TestKoeRouteKey(t *testing.T) {
+	// Bound agent + burst-id thread → dedicated burst lane.
+	bound := ComputeRouteKey(RunAgentRequest{Source: "koe", ThreadID: "burst-123", Agent: "finance"})
+	if bound != "agent:finance:koe:burst-123" {
+		t.Errorf("bound koe route = %q, want agent:finance:koe:burst-123", bound)
+	}
+	// Default agent (no Agent field) → default burst lane.
+	def := ComputeRouteKey(RunAgentRequest{Source: "koe", ThreadID: "burst-123"})
+	if def != "default:koe:burst-123" {
+		t.Errorf("default koe route = %q, want default:koe:burst-123", def)
+	}
+	// koe is never bypassed (must persist + resume across a burst's do_task calls).
+	if shouldBypassNamedAgentRoute("koe") {
+		t.Error("shouldBypassNamedAgentRoute(koe) = true, want false")
+	}
+	if shouldBypassRouteCache("koe") {
+		t.Error("shouldBypassRouteCache(koe) = true, want false")
+	}
+}
