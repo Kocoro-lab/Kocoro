@@ -92,7 +92,11 @@ func SummarizeLastRun(sched Schedule, shannonDir string, maxTurns int) (LastRunS
 		// recreates a session and re-points LastRunSessionID. Genuine read
 		// errors (permissions, I/O) still propagate.
 		if os.IsNotExist(err) {
+			// Return the exact never-ran shape (no id, no timestamp, empty turns)
+			// so every consumer — all of which key off an empty SessionID —
+			// renders the same neutral state.
 			out.SessionID = ""
+			out.LastRunAt = nil
 			return out, nil
 		}
 		return out, fmt.Errorf("session file %s: %w", sched.LastRunSessionID, err)
