@@ -220,7 +220,7 @@ func (m *Model) switchToAgent(name string) tea.Cmd {
 	}
 	if name == current {
 		m.appendOutput("  Already on agent: " + m.agentLabel())
-		return m.flushPrints()
+		return m.markDirty()
 	}
 
 	var override *agents.Agent
@@ -228,7 +228,7 @@ func (m *Model) switchToAgent(name string) tea.Cmd {
 		a, err := agents.LoadAgent(filepath.Join(m.shannonDir, "agents"), name)
 		if err != nil {
 			m.appendOutput(fmt.Sprintf("  Error loading agent %q: %v", name, err))
-			return m.flushPrints()
+			return m.markDirty()
 		}
 		override = a
 	}
@@ -266,5 +266,5 @@ func (m *Model) switchToAgent(name string) tea.Cmd {
 	m.sessionAllowed = make(map[string]bool)
 	m.applyRuntimeContext(sess)
 	m.appendOutput("  Switched to agent: " + m.agentLabel())
-	return m.flushPrints()
+	return m.markDirty()
 }

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 )
@@ -14,12 +15,15 @@ import (
 // the report that the bar (and the agent on it) was missing.
 func TestView_StateInput_StatusBarShowsAgentAndModel(t *testing.T) {
 	m := &Model{
-		state: stateInput,
-		width: 80,
-		cfg:   &config.Config{ModelTier: "medium"},
+		state:    stateInput,
+		width:    80,
+		height:   24,
+		viewport: viewport.New(80, 20),
+		cfg:      &config.Config{ModelTier: "medium"},
 	}
 	m.textarea = textarea.New()
 	m.textarea.SetWidth(78)
+	m.layoutViewport()
 
 	out := m.View()
 

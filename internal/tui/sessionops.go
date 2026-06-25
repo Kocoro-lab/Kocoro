@@ -38,7 +38,7 @@ func (m *Model) forkSession(id string) tea.Cmd {
 	src, err := m.sessions.Resume(id)
 	if err != nil {
 		m.appendOutput(fmt.Sprintf("  Fork failed: %v", err))
-		return m.flushPrints()
+		return m.markDirty()
 	}
 	srcTitle := src.Title
 
