@@ -171,3 +171,35 @@ func (c *DaemonClient) Cancel(ctx context.Context, req CancelRequest) error {
 	}
 	return nil
 }
+
+// AgentSummary is the subset of GET /agents the resolver needs. Description is
+// the localized blurb (locale → text); the resolver flattens it before matching.
+type AgentSummary struct {
+	Slug        string            `json:"name"`
+	DisplayName string            `json:"display_name"`
+	Description map[string]string `json:"description"`
+}
+
+// ListAgents fetches the daemon's agent registry for name resolution.
+func (c *DaemonClient) ListAgents(ctx context.Context) ([]AgentSummary, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/agents", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.controlClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("list agents failed (status %d): %s", resp.StatusCode, string(raw))
+	}
+	var parsed struct {
+		Agents []AgentSummary `json:"agents"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+	return parsed.Agents, nil
+}

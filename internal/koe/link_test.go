@@ -105,3 +105,33 @@ func TestCancelRejectsUnknownReason(t *testing.T) {
 		t.Fatal("Cancel with unknown reason should error before hitting the network")
 	}
 }
+
+func TestListAgents(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/agents" {
+			t.Errorf("path = %s, want /agents", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"agents": []map[string]any{
+				{"name": "finance", "display_name": "金融分析 agent", "description": map[string]string{"en": "markets", "zh": "金融"}},
+				{"name": "default", "display_name": "Kocoro"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := NewDaemonClient(srv.URL)
+	agents, err := c.ListAgents(context.Background())
+	if err != nil {
+		t.Fatalf("ListAgents: %v", err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("got %d agents, want 2", len(agents))
+	}
+	if agents[0].Slug != "finance" || agents[0].DisplayName != "金融分析 agent" {
+		t.Errorf("agent[0] = %+v", agents[0])
+	}
+	if agents[0].Description["zh"] != "金融" {
+		t.Errorf("agent[0].Description[zh] = %q, want 金融", agents[0].Description["zh"])
+	}
+}
