@@ -28,6 +28,7 @@ type AudioIO struct {
 	speaking atomic.Bool
 	encMu    sync.Mutex
 	decMu    sync.Mutex
+	stopOnce sync.Once
 }
 
 // NewAudioIO builds the codec (no device opened yet — Start() opens it, so unit
@@ -56,7 +57,10 @@ func (a *AudioIO) dropCapture() bool  { return a.speaking.Load() }
 // Frames yields captured 48 kHz mono 20 ms frames (gated while speaking).
 func (a *AudioIO) Frames() <-chan []int16 { return a.frames }
 
-// Play enqueues a decoded PCM frame for playback.
+// Play enqueues a decoded PCM frame for playback. It takes ownership of pcm
+// without copying — the slice is read later on the audio callback thread, so the
+// caller must NOT reuse or mutate it after this call. (Safe today: DecodeFrame
+// returns a fresh slice per call.)
 func (a *AudioIO) Play(pcm []int16) {
 	select {
 	case a.playBuf <- pcm:
@@ -102,6 +106,14 @@ func (a *AudioIO) Start() error {
 	cfg.Capture.Channels = audioChannels
 	cfg.Playback.Format = malgo.FormatS16
 	cfg.Playback.Channels = audioChannels
+	// Pin the callback to exactly one 20 ms Opus frame. miniaudio's default period
+	// is 10 ms (480 samples @ 48k) with fixed-size callbacks ON, so without this the
+	// callback would hand onData 480-sample buffers: Frames() would emit non-960
+	// frames that opus.Encode rejects, and a 960-sample decoded frame would only
+	// half-fill the 480-sample playback buffer. Pinning to 960 makes both sides line
+	// up with the Opus frame size. (C-full: ring-buffer to be robust to backends that
+	// ignore the hint; for now miniaudio's fixed-size callback honors it.)
+	cfg.PeriodSizeInFrames = audioFrameSize
 
 	onData := func(out, in []byte, n uint32) {
 		// Capture: bytes → []int16, publish unless gated.
@@ -125,22 +137,31 @@ func (a *AudioIO) Start() error {
 
 	dev, err := malgo.InitDevice(ctx.Context, cfg, malgo.DeviceCallbacks{Data: onData})
 	if err != nil {
+		// InitContext succeeded but the device did not — free the context here
+		// rather than leaking it until a caller happens to invoke Stop().
+		_ = ctx.Uninit()
+		ctx.Free()
+		a.ctx = nil
 		return err
 	}
 	a.dev = dev
 	return dev.Start()
 }
 
-// Stop tears the device down.
+// Stop tears the device down. Guarded by stopOnce so a second call (e.g. a
+// caller's `defer Stop()` plus an explicit Stop on an error path) does not
+// re-run Uninit/Free on already-freed C memory (use-after-free).
 func (a *AudioIO) Stop() {
-	if a.dev != nil {
-		_ = a.dev.Stop()
-		a.dev.Uninit()
-	}
-	if a.ctx != nil {
-		_ = a.ctx.Uninit()
-		a.ctx.Free()
-	}
+	a.stopOnce.Do(func() {
+		if a.dev != nil {
+			_ = a.dev.Stop()
+			a.dev.Uninit()
+		}
+		if a.ctx != nil {
+			_ = a.ctx.Uninit()
+			a.ctx.Free()
+		}
+	})
 }
 
 func bytesToS16(b []byte) []int16 {
