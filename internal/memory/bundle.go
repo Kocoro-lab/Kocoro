@@ -13,8 +13,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 )
 
 type ManifestFile struct {
@@ -92,11 +93,11 @@ func (p *Puller) tick(ctx context.Context) error {
 		return err
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := fslock.TryLock(f.Fd()); err != nil {
 		// Contention: another caller is mid-pull; we'll get the next tick.
 		return nil
 	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(f.Fd())
 
 	// Step 2: tenant check (cloud-only — caller ensures provider==cloud
 	// before invoking tick).

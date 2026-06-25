@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -208,19 +208,26 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// The bash tool runs POSIX shell syntax via `sh -c`. On Windows `sh` is not
+	// present on a stock host (it ships with Git Bash / WSL); surface a clear,
+	// actionable error here rather than the cryptic `exec: "sh": executable file
+	// not found` the agent would otherwise see on every call. No effect on
+	// macOS/Linux, where sh always resolves.
+	if runtime.GOOS == "windows" {
+		if _, err := exec.LookPath("sh"); err != nil {
+			return agent.ToolResult{
+				Content: "bash tool requires a POSIX shell (sh) on PATH; on Windows install Git Bash or WSL, or use a different tool",
+				IsError: true,
+			}, nil
+		}
+	}
+
 	cmd := exec.CommandContext(ctx, "sh", "-c", args.Command)
 	// Put sh and any children it spawns into a new process group so we can
-	// SIGKILL the whole tree on timeout. Without Setpgid, exec's default
-	// Cancel kills only sh's PID — long-running grandchildren (e.g.
-	// `python -m http.server` backgrounded from sh) survive as orphans
-	// and keep ports bound until the user kills them by hand.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process != nil {
-			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-		return os.ErrProcessDone
-	}
+	// kill the whole tree on timeout (platform-specific: POSIX Setpgid+Kill
+	// vs Windows taskkill /T). Without it, exec's default Cancel kills only
+	// sh's PID and backgrounded grandchildren survive as orphans.
+	setBashProcGroup(cmd)
 	// Cap how long Wait() blocks after Cancel fires. Without WaitDelay, a
 	// stuck child that ignores SIGKILL (zombie, uninterruptible sleep) can
 	// keep CombinedOutput pinned forever.

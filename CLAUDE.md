@@ -97,6 +97,7 @@ internal/
   config/                # Config struct, multi-level merge, --setup wizard
   cwdctx/                # Session-scoped CWD propagation
   context/               # EstimateTokens, GenerateSummary, PersistLearnings
+  fslock/                # Cross-platform advisory file lock (flock vs LockFileEx); see Cross-Platform Support
   schedule/              # Schedule CRUD + atomic writes (plist gen lives in daemon/)
   permissions/           # bash resolution pipeline (see Permission Model below)
   audit/                 # JSON-lines logger + RedactSecrets
@@ -279,7 +280,17 @@ Scalars override, lists merge+dedup, structs field-level merge. MCP server env-v
 
 ### Atomic Writes
 
-`schedules.json` and `secrets-index.json` use write-to-temp + `os.Rename` + `syscall.Flock` on a persistent `.lock` file. **Never delete the lock file** (causes flock race on different inodes).
+`schedules.json` and `secrets-index.json` use write-to-temp + `os.Rename` + an exclusive lock (via `internal/fslock`, NOT raw `syscall.Flock` — see Cross-Platform Support) on a persistent `.lock` file. **Never delete the lock file** (causes lock race on different inodes). Atomic-rename targets are read lock-free (the rename is atomic, so readers always see a complete file); never hold a lock on the destination file itself — on Windows a mandatory `LockFileEx` would block the rename-over-open.
+
+### Cross-Platform Support
+
+The daemon cross-compiles to macOS / Linux / Windows (`CGO_ENABLED=0`). POSIX-only syscalls are confined behind build tags so the Windows build stays green:
+
+- **File locking** → `internal/fslock` (`Lock`/`RLock`/`TryLock`/`Unlock`/`IsWouldBlock`): `lock_unix.go` wraps `flock(2)`, `lock_windows.go` wraps `LockFileEx`/`UnlockFileEx` (the only `golang.org/x/sys/windows` consumer). All lock call sites go through this — do NOT reintroduce raw `syscall.Flock` (breaks Windows).
+- **Process-group kill** → per-package `*_proc_{unix,windows}.go` helpers (`internal/hooks`, `internal/tools` for bash, `internal/memory` for the sidecar; `internal/mcp/processgroup_{unix,windows}.go` is the original): POSIX `Setpgid` + `Kill(-pid)` vs Windows `CREATE_NEW_PROCESS_GROUP` + `taskkill /T /F`. Windows has no usable graceful step for console children (graceful `taskkill` no-ops), so the sidecar force-kills directly.
+- **`shan daemon stop`** → `cmd/proc_signal_{unix,windows}.go` (`terminateDaemon`): POSIX SIGTERM vs Windows `taskkill`. HTTP `/shutdown` remains the cross-platform graceful primary; signal/taskkill is the PID-file fallback.
+- **macOS-only GUI tools** (`accessibility`/`applescript`/`clipboard`/`computer`/`screenshot`/`ghostty`) gate on `runtime.GOOS != "darwin"` and return a clean "only available on macOS" error elsewhere. `notify` is NOT gated — it has a cross-platform Desktop route; only its osascript fallback is darwin-gated.
+- **Known Windows gaps (not yet ported)**: memory bundle `current` pointer uses `os.Symlink` (`internal/memory/bundle.go`) which needs Developer Mode / a junction-or-pointer-file fallback on Windows; `bash` runs `sh -c` and requires Git Bash/WSL on PATH (returns a clean error otherwise).
 
 ### Prompt Cache
 

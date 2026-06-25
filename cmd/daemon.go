@@ -870,10 +870,10 @@ var daemonStopCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("cannot find daemon process %d: %w", pid, err)
 		}
-		if err := proc.Signal(syscall.SIGTERM); err != nil {
-			return fmt.Errorf("failed to send SIGTERM to PID %d: %w", pid, err)
+		if err := terminateDaemon(proc); err != nil {
+			return fmt.Errorf("failed to stop daemon (PID %d): %w", pid, err)
 		}
-		fmt.Printf("Sent SIGTERM to daemon (PID %d).\n", pid)
+		fmt.Printf("Sent stop signal to daemon (PID %d).\n", pid)
 
 		// Wait for process to exit (up to 5s).
 		deadline := time.After(5 * time.Second)
@@ -1311,7 +1311,7 @@ func stopExistingDaemon(pidPath string) {
 	if err != nil {
 		if pid, locked := daemon.IsLocked(pidPath); locked && pid > 0 {
 			if proc, err := os.FindProcess(pid); err == nil {
-				proc.Signal(syscall.SIGTERM)
+				terminateDaemon(proc)
 			}
 		}
 	}

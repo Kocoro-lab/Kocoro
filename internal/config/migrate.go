@@ -9,12 +9,12 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
 )
 
@@ -88,11 +88,11 @@ func RunPendingMigrations(shannonDir string) {
 		return
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
 		fmt.Fprintf(os.Stderr, "kocoro: lock migrations: %v (skipping migrations)\n", err)
 		return
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	state, _ := loadMigrationsState(shannonDir)
 	if state.Applied == nil {

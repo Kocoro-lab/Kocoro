@@ -9,10 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 	"github.com/adhocore/gronx"
 )
 
@@ -229,20 +229,20 @@ func validatePrompt(prompt string) error {
 }
 
 func (m *Manager) load() ([]Schedule, error) {
-	f, err := os.Open(m.indexPath)
+	// No lock on the index file itself: writes always land via save()'s
+	// temp-file + atomic os.Rename, so a reader sees either the complete old
+	// file or the complete new one — never a torn write. This matches the
+	// lock-free read in lockedModify (os.ReadFile). Holding a mandatory
+	// LockFileEx here on Windows would also block save()'s rename-over-open.
+	data, err := os.ReadFile(m.indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
-		return nil, fmt.Errorf("flock shared: %w", err)
-	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	var schedules []Schedule
-	if err := json.NewDecoder(f).Decode(&schedules); err != nil {
+	if err := json.Unmarshal(data, &schedules); err != nil {
 		return nil, err
 	}
 	return schedules, nil
@@ -258,11 +258,9 @@ func (m *Manager) save(schedules []Schedule) error {
 		return fmt.Errorf("create temp: %w", err)
 	}
 	tmpPath := tmp.Name()
-	if err := syscall.Flock(int(tmp.Fd()), syscall.LOCK_EX); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("flock exclusive: %w", err)
-	}
+	// No flock on tmp: it's a freshly-created, uniquely-named private file no
+	// other process can open, so the lock synchronized nothing. Write
+	// serialization is provided by the caller (lockedModify holds the .lock).
 	data, err := json.MarshalIndent(schedules, "", "  ")
 	if err != nil {
 		tmp.Close()
@@ -298,10 +296,10 @@ func (m *Manager) lockedModify(fn func([]Schedule) ([]Schedule, error)) error {
 	defer lockFile.Close()
 	// Do NOT os.Remove the lock file — concurrent goroutines may flock
 	// on different inodes if the file is deleted and recreated between them.
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
 		return fmt.Errorf("flock: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 	var schedules []Schedule
 	if data, err := os.ReadFile(m.indexPath); err == nil {
 		json.Unmarshal(data, &schedules)

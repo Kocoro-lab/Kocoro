@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -96,6 +97,12 @@ func SendBanner(ctx context.Context, title, body string, sound bool) error {
 		if h(title, body, sound) {
 			return nil
 		}
+	}
+	// The Desktop route above is cross-platform; the osascript fallback below is
+	// macOS-only. On other platforms without a handler, return a clean error
+	// rather than a cryptic `exec: "osascript": file not found`.
+	if runtime.GOOS != "darwin" {
+		return fmt.Errorf("desktop notifications require macOS or the Kocoro Desktop app")
 	}
 	script := buildNotifyScript(title, body, sound)
 	cmd := exec.CommandContext(ctx, "osascript", "-e", script)

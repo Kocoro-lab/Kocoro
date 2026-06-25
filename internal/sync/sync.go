@@ -2,14 +2,13 @@ package sync
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 )
 
 // AuditLogger is a structured logger sink. Satisfied by *audit.Logger in
@@ -21,11 +20,11 @@ type AuditLogger interface {
 // Deps groups the runtime collaborators required by Run. Now is injectable so
 // tests can pin time without freezing the whole package.
 type Deps struct {
-	Cfg       Config
-	HomeDir   string           // ~/.shannon
-	ClientVer string           // for SyncBatchRequest.ClientVersion
-	Uploader  Uploader
-	Loader    SessionLoader
+	Cfg        Config
+	HomeDir    string // ~/.shannon
+	ClientVer  string // for SyncBatchRequest.ClientVersion
+	Uploader   Uploader
+	Loader     SessionLoader
 	Audit      AuditLogger
 	Now        func() time.Time
 	OnSyncDone func() // optional: called when ≥1 session was accepted; wakes memory bundle puller
@@ -246,14 +245,14 @@ func acquireFlock(ctx context.Context, path string, timeout time.Duration) (rele
 
 	deadline := time.Now().Add(timeout)
 	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := fslock.TryLock(f.Fd())
 		if err == nil {
 			return func() {
-				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				_ = fslock.Unlock(f.Fd())
 				_ = f.Close()
 			}, nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
+		if !fslock.IsWouldBlock(err) {
 			f.Close()
 			return nil, fmt.Errorf("flock: %w", err)
 		}
