@@ -51,10 +51,10 @@ var koeCmd = &cobra.Command{
 		}
 		cfg.language, _ = cmd.Flags().GetString("language")
 
-		if cfg.openAIKey == "" {
-			return fmt.Errorf("no OpenAI key: set OPENAI_API_KEY or --openai-key (C-minimal dev key; the deferred daemon mint relay replaces this in prod)")
-		}
-		return runKoeCall(cmd.Context(), cfg) // implemented in Task 5
+		// No key check: with no --openai-key/OPENAI_API_KEY, runKoeCall mints via
+		// the daemon (production path — Koe holds no credential). A dev key, if set,
+		// takes the direct mint path instead.
+		return runKoeCall(cmd.Context(), cfg)
 	},
 }
 
@@ -102,7 +102,16 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	}
 	defer audio.Stop()
 
-	ek, err := koe.MintEphemeral(ctx, cfg.openAIKey, cfg.model) // DEV-KEY: the deferred daemon mint relay replaces this
+	// Mint the ephemeral secret. Production path is the via-daemon relay (Koe
+	// never holds a long-lived credential). A dev key (--openai-key/OPENAI_API_KEY)
+	// takes the direct mint instead — the C-minimal escape hatch for running
+	// without a signed-in daemon.
+	var ek string
+	if cfg.openAIKey != "" {
+		ek, err = koe.MintEphemeral(ctx, cfg.openAIKey, cfg.model) // DEV-KEY: direct dev mint
+	} else {
+		ek, err = client.MintViaDaemon(ctx, cfg.model) // via daemon → Cloud
+	}
 	if err != nil {
 		return fmt.Errorf("mint: %v", err)
 	}

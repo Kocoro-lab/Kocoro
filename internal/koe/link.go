@@ -36,6 +36,36 @@ func NewDaemonClient(baseURL string) *DaemonClient {
 	}
 }
 
+// MintViaDaemon asks the daemon to mint an OpenAI Realtime ephemeral client
+// secret on Koe's behalf (the via-daemon design — the front brain holds no
+// long-lived credential; the daemon mints through Cloud with its own key). It
+// returns the ephemeral "value" (ek_...). This is the production mint path that
+// replaces C-minimal's direct dev-key mint. A fast localhost call → controlClient.
+func (c *DaemonClient) MintViaDaemon(ctx context.Context, model string) (string, error) {
+	body, _ := json.Marshal(map[string]any{"model": model})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/koe/realtime/mint", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.controlClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("daemon mint failed: HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+	var mint struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(raw, &mint); err != nil || mint.Value == "" {
+		return "", fmt.Errorf("daemon mint parse failed: %v body=%s", err, string(raw))
+	}
+	return mint.Value, nil
+}
+
 // DoTaskRequest is the subset of the daemon's POST /message body that Koe sends.
 // Source is always "koe". ThreadID is the per-call burst id; Agent is the
 // resolved slug ("" = daemon default).

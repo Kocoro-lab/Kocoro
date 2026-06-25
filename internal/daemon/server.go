@@ -583,6 +583,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /approval", s.handleApproval)
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
 	mux.HandleFunc("POST /message", s.handleMessage)
+	mux.HandleFunc("POST /koe/realtime/mint", s.handleKoeRealtimeMint)
 	mux.HandleFunc("POST /local/screenshot/window", s.handleScreenshotWindow)
 	mux.HandleFunc("POST /inject/retract", s.handleRetractInject)
 	mux.HandleFunc("POST /cancel", s.handleCancel)
