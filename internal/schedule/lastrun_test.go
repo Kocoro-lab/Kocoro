@@ -234,3 +234,30 @@ func TestSummarizeLastRun_MissingFileTreatedAsNoRun(t *testing.T) {
 		t.Errorf("Turns should be empty, got %d", len(out.Turns))
 	}
 }
+
+// A genuine (non-IsNotExist) read error must still propagate — only the
+// "file missing" case degrades to no-run. We provoke a portable read error by
+// putting a directory where the session file is expected (os.ReadFile then
+// fails with EISDIR, which is not IsNotExist).
+func TestSummarizeLastRun_ReadErrorPropagates(t *testing.T) {
+	shan := t.TempDir()
+	sessDir := filepath.Join(shan, "agents", "explorer", "sessions")
+	if err := os.MkdirAll(filepath.Join(sessDir, "sess-dir.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sched := Schedule{
+		ID:                       "x",
+		Agent:                    "explorer",
+		LastRunSessionID:         "sess-dir",
+		LastRunMessageStartIndex: 0,
+		LastRunMessageEndIndex:   2,
+	}
+
+	_, err := SummarizeLastRun(sched, shan, 5)
+	if err == nil {
+		t.Fatal("a non-IsNotExist read error must propagate, got nil")
+	}
+	if !strings.Contains(err.Error(), "session file") {
+		t.Errorf("error should mention session file, got %v", err)
+	}
+}
