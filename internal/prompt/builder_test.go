@@ -831,6 +831,19 @@ func TestBuildSystemPrompt_OutputFormatPlain(t *testing.T) {
 	}
 }
 
+func TestFormatGuidanceKoe(t *testing.T) {
+	g := formatGuidance("koe")
+	for _, want := range []string{"voice", "spoken", "short"} {
+		if !strings.Contains(strings.ToLower(g), want) {
+			t.Errorf("formatGuidance(\"koe\") missing %q; got: %s", want, g)
+		}
+	}
+	// Voice guidance must steer AWAY from rich text, not toward it.
+	if strings.Contains(strings.ToLower(g), "github-flavored markdown") {
+		t.Errorf("formatGuidance(\"koe\") should not request markdown; got: %s", g)
+	}
+}
+
 func TestBuildSystemPrompt_SkillsListCompact(t *testing.T) {
 	opts := PromptOptions{
 		BasePrompt: "You are Shannon.",

@@ -557,6 +557,14 @@ func LanguageDirective(locked string) string {
 // formatGuidance returns output formatting instructions based on the profile.
 func formatGuidance(format string) string {
 	switch format {
+	case "koe":
+		return "You are speaking aloud through a voice interface; your reply is read out by a text-to-speech voice. " +
+			"Respond in short, natural spoken sentences — usually one or two. " +
+			"Never read markdown, code, JSON, raw URLs, or file paths aloud; they sound like noise when spoken. " +
+			"If a result is long or structured (a list, a table, code, a document), save it to a file or send it " +
+			"through the right channel and say in one sentence where it is, instead of reading it out. " +
+			"When something is better shown than spoken, you may display it on screen and say you've put it there. " +
+			"Restate any irreversible action in plain speech and wait for a clear yes before doing it."
 	case "plain":
 		return "Format responses as plain text. Use short paragraphs and simple bullet points. " +
 			"Avoid markdown tables, fenced code blocks, headers, bold/italic, and other rich formatting. " +

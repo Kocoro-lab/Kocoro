@@ -58,3 +58,11 @@ func TestKoeRouteKey(t *testing.T) {
 		t.Error("shouldBypassRouteCache(koe) = true, want false")
 	}
 }
+
+func TestKoeOutputFormat(t *testing.T) {
+	for _, src := range []string{"koe", "koe-reachy", " KOE "} {
+		if got := outputFormatForSource(src); got != "koe" {
+			t.Errorf("outputFormatForSource(%q) = %q, want \"koe\"", src, got)
+		}
+	}
+}

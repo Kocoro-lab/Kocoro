@@ -689,6 +689,13 @@ var markdownCloudSources = map[string]struct{}{
 // markdownCloudSources — pinned by TestCloudSourceDefinitionsAgree.
 func outputFormatForSource(source string) string {
 	norm := strings.ToLower(strings.TrimSpace(source))
+	if isKoeSource(norm) {
+		// Voice front-brain: spoken output, not rendered text. The actual
+		// directives live in prompt.formatGuidance("koe"). koe is non-cloud, so
+		// TestCloudSourceDefinitionsAgree treats it as a documented exception to
+		// the "non-cloud ⇒ markdown" rule.
+		return "koe"
+	}
 	if _, ok := markdownCloudSources[norm]; ok {
 		return "markdown"
 	}
