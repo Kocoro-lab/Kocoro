@@ -1163,15 +1163,16 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type agentInfo struct {
-		Name         string `json:"name"`
-		DisplayName  string `json:"display_name"` // falls back to Name when unset
-		Avatar       string `json:"avatar"`       // empty when unset
-		Builtin      bool   `json:"builtin"`
-		Override     bool   `json:"override"`
-		HasMemory    bool   `json:"has_memory"`
-		HasConfig    bool   `json:"has_config"`
-		CommandCount int    `json:"command_count"`
-		SkillCount   int    `json:"skill_count"`
+		Name         string                 `json:"name"`
+		DisplayName  string                 `json:"display_name"`          // falls back to Name when unset
+		Description  agents.LocalizedString `json:"description,omitempty"` // localized blurb from PROFILE.yaml; empty when unset
+		Avatar       string                 `json:"avatar"`                // empty when unset
+		Builtin      bool                   `json:"builtin"`
+		Override     bool                   `json:"override"`
+		HasMemory    bool                   `json:"has_memory"`
+		HasConfig    bool                   `json:"has_config"`
+		CommandCount int                    `json:"command_count"`
+		SkillCount   int                    `json:"skill_count"`
 	}
 	result := make([]agentInfo, 0, len(entries))
 	for _, entry := range entries {
@@ -1192,12 +1193,15 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		// Avatar lives in <dir>/PROFILE.yaml. Best-effort: a missing or
 		// malformed profile just yields no avatar (the list must not fail).
 		avatar := ""
+		var description agents.LocalizedString
 		if profile, perr := agents.LoadAgentProfile(dir); perr == nil && profile != nil {
 			avatar = profile.Avatar
+			description = profile.Description
 		}
 		result = append(result, agentInfo{
 			Name:         entry.Name,
 			DisplayName:  entry.DisplayName,
+			Description:  description,
 			Avatar:       avatar,
 			Builtin:      entry.Builtin,
 			Override:     entry.Override,

@@ -9,8 +9,9 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 ### List all agents
 - Method: GET
 - Path: /agents
-- Response: `{"agents": [{"name": "...", "display_name": "...", "avatar": "", "builtin": false, "override": false}]}`
+- Response: `{"agents": [{"name": "...", "display_name": "...", "description": {"en": "..."}, "avatar": "", "builtin": false, "override": false}]}`
 - Notes: Each entry includes `display_name` and `avatar`. When an agent has no display_name set, `display_name` falls back to the slug (`name`). `avatar` is the agent's avatar URL from `PROFILE.yaml`, or `""` when unset.
+  - `description`: localized blurb (locale→text map) from `PROFILE.yaml`; empty when unset.
 
 ### Get agent details
 - Method: GET
