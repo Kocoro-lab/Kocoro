@@ -205,7 +205,7 @@ func TestSummarizeLastRun_NeverRun_TurnsIsEmptyArrayNotNull(t *testing.T) {
 	}
 }
 
-func TestSummarizeLastRun_MissingFileGracefulError(t *testing.T) {
+func TestSummarizeLastRun_MissingFileTreatedAsNoRun(t *testing.T) {
 	shan := t.TempDir()
 	sched := Schedule{
 		ID:                       "x",
@@ -215,11 +215,16 @@ func TestSummarizeLastRun_MissingFileGracefulError(t *testing.T) {
 		LastRunMessageEndIndex:   2,
 	}
 
-	_, err := SummarizeLastRun(sched, shan, 5)
-	if err == nil {
-		t.Fatal("missing session file should error")
+	// A deleted last-run session must not error: it degrades to the same empty
+	// shape as a schedule that has never run, so clients render a neutral state.
+	out, err := SummarizeLastRun(sched, shan, 5)
+	if err != nil {
+		t.Fatalf("missing session file should not error, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "session file") {
-		t.Errorf("error should mention session file, got %v", err)
+	if out.SessionID != "" {
+		t.Errorf("SessionID should be cleared when the session is gone, got %q", out.SessionID)
+	}
+	if len(out.Turns) != 0 {
+		t.Errorf("Turns should be empty, got %d", len(out.Turns))
 	}
 }
