@@ -178,6 +178,14 @@ var brandDisplayNames = map[string]string{
 // "Slack"), or "" for interactive sources (desktop/kocoro/empty).
 func SourceLabel(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
+	// koe is the voice front-brain. "Koe" is an INTERNAL code name that must never
+	// surface in a user-facing session title (the brand is "Kocoro"). Return ""
+	// so koe bursts get a bare smart title. The prefix guard mirrors
+	// daemon.isKoeSource so future carriers (koe-reachy, koe-bot) are covered too;
+	// this package cannot import internal/daemon, hence the inlined check.
+	if s == "koe" || strings.HasPrefix(s, "koe-") {
+		return ""
+	}
 	// Exclusion set mirrors daemon routeTitle (internal/daemon/runner.go);
 	// keep both in sync when adding an interactive (non-IM) source.
 	// watcher/heartbeat/mcp are autonomous local sources that piggyback on the
