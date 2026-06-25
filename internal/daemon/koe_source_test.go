@@ -1,6 +1,10 @@
 package daemon
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/session"
+)
 
 func TestIsKoeSource(t *testing.T) {
 	cases := map[string]bool{
@@ -89,5 +93,35 @@ func TestKoeCacheSource(t *testing.T) {
 	}
 	if got := cacheSourceFromDaemonSource("koe-reachy"); got != "koe-reachy" {
 		t.Errorf("cacheSourceFromDaemonSource(\"koe-reachy\") = %q, want \"koe-reachy\"", got)
+	}
+}
+
+func TestStampSessionOrigin(t *testing.T) {
+	// koe with empty Channel: Source MUST be persisted (else misclassified interactive).
+	koe := &session.Session{}
+	stampSessionOrigin(koe, RunAgentRequest{Source: "koe", ThreadID: "burst-1"})
+	if koe.Source != "koe" {
+		t.Errorf("koe burst: sess.Source = %q, want \"koe\"", koe.Source)
+	}
+
+	// Interactive source with empty Channel: Source must STAY empty (stays interactive).
+	desktop := &session.Session{}
+	stampSessionOrigin(desktop, RunAgentRequest{Source: "desktop"})
+	if desktop.Source != "" {
+		t.Errorf("desktop: sess.Source = %q, want \"\" (interactive sources stay unstamped)", desktop.Source)
+	}
+
+	// IM source with a Channel: both Source and Channel persisted (unchanged behavior).
+	slack := &session.Session{}
+	stampSessionOrigin(slack, RunAgentRequest{Source: "slack", Channel: "C123"})
+	if slack.Source != "slack" || slack.Channel != "C123" {
+		t.Errorf("slack: Source=%q Channel=%q, want \"slack\"/\"C123\"", slack.Source, slack.Channel)
+	}
+
+	// Empty source: no-op, no panic.
+	empty := &session.Session{}
+	stampSessionOrigin(empty, RunAgentRequest{})
+	if empty.Source != "" {
+		t.Errorf("empty source: sess.Source = %q, want \"\"", empty.Source)
 	}
 }

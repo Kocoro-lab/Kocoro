@@ -792,6 +792,29 @@ func wantsPromptSuggestion(source string) bool {
 	return ok
 }
 
+// stampSessionOrigin persists the request's Source (and Channel when present)
+// onto the session so kindOf / isInteractiveSource classify it correctly after a
+// reload. The original inline guard required BOTH Source and Channel to be
+// non-empty, which silently dropped Source for thread-routed sources that carry
+// no Channel — koe routes by burst-id via ThreadID with Channel="". Without a
+// persisted Source, kindOf("") => SessionKindInteractive misclassifies the burst
+// session as the user's interactive chat, so heartbeat / cold-start could resume
+// onto it. Interactive sources (desktop/tui/kocoro/"") stay UNSTAMPED on purpose
+// so they remain Source="" => interactive — only koe gains channel-less stamping.
+func stampSessionOrigin(sess *session.Session, req RunAgentRequest) {
+	if sess == nil || req.Source == "" {
+		return
+	}
+	if req.Channel != "" {
+		sess.Source = req.Source
+		sess.Channel = req.Channel
+		return
+	}
+	if isKoeSource(req.Source) {
+		sess.Source = req.Source
+	}
+}
+
 // markdownStripRE matches the small set of markdown markers that read poorly
 // in a macOS notification: backticks (inline code + fences), bold/italic
 // asterisks and underscores, leading hashes for headers, and the `[text](url)`
@@ -1941,10 +1964,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if shouldPersistRouteKey(req.RouteKey) {
 			sess.RouteKey = req.RouteKey
 		}
-		if req.Source != "" && req.Channel != "" {
-			sess.Source = req.Source
-			sess.Channel = req.Channel
-		}
+		stampSessionOrigin(sess, req)
 		// Source-derived title for routed conversations (IM → "Slack · sender",
 		// schedule → "Schedule · scheduler"). Named/default treated identically;
 		// desktop/empty sources yield "" and fall through to the first-line title.
@@ -3221,10 +3241,7 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		if shouldPersistRouteKey(req.RouteKey) {
 			sess.RouteKey = req.RouteKey
 		}
-		if req.Source != "" && req.Channel != "" {
-			sess.Source = req.Source
-			sess.Channel = req.Channel
-		}
+		stampSessionOrigin(sess, req)
 		// Title from route source/channel (IM) or the first-message query.
 		// Named agents no longer get a fixed title — the smart-title upgrade
 		// replaces this placeholder asynchronously.
