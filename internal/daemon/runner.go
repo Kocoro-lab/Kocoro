@@ -847,6 +847,14 @@ func IsMessagingPlatform(source string) bool {
 // Shannon routes unknown to 5m (fail cheap, not fail expensive).
 func cacheSourceFromDaemonSource(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
+	if isKoeSource(s) {
+		// Voice burst: idle gaps of 3–5 min between do_task calls are common, so
+		// the 1h prompt-cache bucket pays off. Cloud's TTL resolver must map
+		// "koe"/"koe-*" to the long bucket (Plan D, cross-repo) — until it does,
+		// an unrecognized source routes to 5m (fail cheap). Return the normalized
+		// source verbatim so per-carrier attribution survives.
+		return s
+	}
 	switch s {
 	case "slack", "line", "feishu", "lark", "wecom", "teams", "telegram":
 		// Human-conversation channels: idle gaps > 5m are common, 1h pays off.

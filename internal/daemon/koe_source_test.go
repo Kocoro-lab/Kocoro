@@ -79,3 +79,15 @@ func TestKoeBannerAndTitlePreservation(t *testing.T) {
 		}
 	}
 }
+
+func TestKoeCacheSource(t *testing.T) {
+	if got := cacheSourceFromDaemonSource("koe"); got != "koe" {
+		t.Errorf("cacheSourceFromDaemonSource(\"koe\") = %q, want \"koe\"", got)
+	}
+	if got := cacheSourceFromDaemonSource(" KOE "); got != "koe" {
+		t.Errorf("cacheSourceFromDaemonSource(\" KOE \") = %q, want \"koe\" (normalized)", got)
+	}
+	if got := cacheSourceFromDaemonSource("koe-reachy"); got != "koe-reachy" {
+		t.Errorf("cacheSourceFromDaemonSource(\"koe-reachy\") = %q, want \"koe-reachy\"", got)
+	}
+}
