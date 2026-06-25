@@ -148,7 +148,7 @@ Session sync is opt-in. It uses a single Run entry point, flock, atomic marker w
 
 ### Prompt Suggestions
 
-Suggestion generation is a forked request after a successful main turn. Cache safety invariant: the fork must be byte-equal to the main request except for the appended assistant reply, suggestion prompt, skip-cache-write flag, and debug-only fork kind. Do not change tools, max tokens, thinking budget, or ordering in the fork.
+Suggestion generation is a forked request after a successful main turn. Cache safety invariant: the fork must be byte-equal to the main request except for the appended assistant reply, suggestion prompt, skip-cache-write flag, and debug-only fork kind. Do not change tools, max tokens, thinking budget, or ordering in the fork. The fork is also source-gated (`wantsPromptSuggestion` allow-list in `daemon/runner.go`): only foreground sources with a UI consumer — `desktop`, `kocoro`, `web` — generate a suggestion; IM channels, schedule/cron, and autonomous local sources (heartbeat/watcher/mcp) are skipped. It is an allow-list, so any new background source defaults to skipped.
 
 ### Wire Contracts
 

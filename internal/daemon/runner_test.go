@@ -459,6 +459,62 @@ func TestOutputFormatForSource(t *testing.T) {
 	}
 }
 
+// wantsPromptSuggestion gates the post-turn prompt-suggestion fork. The
+// suggestion has a UI consumer only on foreground interactive sources that
+// reach the daemon: "kocoro" (Desktop's HTTP /run chat — Source defaults to
+// "kocoro" in handleMessage) and "web" (web front-end sessions). Everything
+// else — cloud-routed IM channels (slack/feishu/...), scheduled runs
+// (schedule/cron), and autonomous local sources (heartbeat/watcher/mcp) — has
+// no consumer for it, so the fork is dead work AND a real billed LLM call.
+// Implemented as an explicit allow-list so any future background source
+// defaults to skipped, not silently billed.
+//
+// (TUI / one-shot CLI never reach RunAgent — they run a bare AgentLoop with no
+// suggestion path at all — so they are out of scope for this gate.)
+func TestWantsPromptSuggestion(t *testing.T) {
+	tests := []struct {
+		source string
+		want   bool
+	}{
+		// Foreground interactive sources with a suggestion consumer — KEEP.
+		{"desktop", true}, // Desktop chat producer (ShanClawBridge POST /message hardcodes "desktop")
+		{"kocoro", true},  // HTTP /message default when caller omits source (bare curl, etc.)
+		{"web", true},     // web front-end session
+		{"Desktop", true}, // case-insensitive
+		{" web ", true},   // trim
+		// Cloud-routed IM channels — SKIP (reply delivered over WS, no consumer).
+		{"slack", false},
+		{"line", false},
+		{"feishu", false},
+		{"lark", false},
+		{"wecom", false},
+		{"teams", false},
+		{"telegram", false},
+		{"webhook", false},
+		{"discord", false},
+		{"wechat", false},
+		{"Slack", false}, // case-insensitive
+		// Scheduled runs — SKIP (no foreground client; user's explicit ask).
+		{"schedule", false},
+		{"cron", false},
+		// Autonomous local sources — SKIP (piggyback on the user's session).
+		{"heartbeat", false},
+		{"watcher", false},
+		{"mcp", false},
+		// Unknown / unclassified — SKIP (allow-list default is fail-closed).
+		{"", false},
+		{"local", false},
+		{"global", false},
+		{"system", false},
+		{"custom-bot", false},
+	}
+	for _, tt := range tests {
+		if got := wantsPromptSuggestion(tt.source); got != tt.want {
+			t.Errorf("wantsPromptSuggestion(%q) = %v, want %v", tt.source, got, tt.want)
+		}
+	}
+}
+
 func TestRunAgentRequestSource(t *testing.T) {
 	req := RunAgentRequest{
 		Text:   "hello",
