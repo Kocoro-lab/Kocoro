@@ -291,7 +291,7 @@ func TestHandleScheduleLastRun_UnknownID404(t *testing.T) {
 	}
 }
 
-func TestHandleScheduleLastRun_MissingSession500(t *testing.T) {
+func TestHandleScheduleLastRun_MissingSessionNoRun(t *testing.T) {
 	srv, mgr, indexPath := newTestServerWithScheduleMgr(t)
 	id, err := mgr.Create("tracker", "0 9 * * *", "p", false)
 	if err != nil {
@@ -306,8 +306,24 @@ func TestHandleScheduleLastRun_MissingSession500(t *testing.T) {
 	req.SetPathValue("id", id)
 	w := httptest.NewRecorder()
 	srv.handleScheduleLastRun(w, req)
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want 500 (session file missing)", w.Code)
+
+	// A deleted last-run session degrades to the never-ran shape (200 with empty
+	// session_id / turns) rather than a 500.
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (deleted session degrades to no-run)", w.Code)
+	}
+	var body struct {
+		SessionID string `json:"session_id"`
+		Turns     []any  `json:"turns"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if body.SessionID != "" {
+		t.Errorf("session_id = %q, want empty", body.SessionID)
+	}
+	if len(body.Turns) != 0 {
+		t.Errorf("turns = %d, want 0", len(body.Turns))
 	}
 }
 
