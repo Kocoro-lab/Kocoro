@@ -1839,6 +1839,17 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	m.appendOutput(renderUserMessage(input, m.width))
+
+	// Expand [Pasted text #N] placeholders to their stashed full text for the
+	// model. The live echo above keeps the compact placeholder form, but history
+	// (below) records the EXPANDED text: the stash (m.pastes) is cleared right
+	// after, so storing the placeholder would make a recalled entry unexpandable
+	// and submit the literal "[Pasted text #N]" to the model.
+	input = expandPastes(input, m.pastes)
+	m.pastes = nil
+	m.pasteCounter = 0
+
 	// Record in history (skip duplicates of last entry)
 	if len(m.inputHistory) == 0 || m.inputHistory[len(m.inputHistory)-1] != input {
 		m.inputHistory = append(m.inputHistory, input)
@@ -1848,14 +1859,6 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	}
 	m.historyIdx = -1
 	m.historySaved = ""
-
-	m.appendOutput(renderUserMessage(input, m.width))
-
-	// Expand [Pasted text #N] placeholders to their stashed full text for the
-	// model; the echo + history above keep the compact placeholder form.
-	input = expandPastes(input, m.pastes)
-	m.pastes = nil
-	m.pasteCounter = 0
 
 	// Check slash commands
 	if strings.HasPrefix(input, "/") {

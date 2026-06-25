@@ -250,6 +250,12 @@ func (m *Model) switchToAgent(name string) tea.Cmd {
 	if override != nil {
 		sessDir = filepath.Join(m.shannonDir, "agents", override.Name, "sessions")
 	}
+	// Close the outgoing manager before swapping — it owns a SQLite store handle
+	// plus registered close callbacks (ReadTracker cleanup, etc.) that would
+	// otherwise leak on every /agent switch (quit only closes the last one).
+	if m.sessions != nil {
+		m.sessions.Close()
+	}
 	m.sessions = session.NewManager(sessDir)
 
 	m.rebuildAgentLoop()

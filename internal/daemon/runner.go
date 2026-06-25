@@ -738,14 +738,19 @@ func shouldEmitReplyBanner(source string) bool {
 
 // promptSuggestionSources is the allow-list of request sources whose post-turn
 // prompt-suggestion fork has a UI consumer:
-//   - "desktop": Kocoro Desktop's foreground chat. ShanClawBridge's
-//     sendMessageStreaming hardcodes "source":"desktop" on POST /message (see
-//     ShanClawDesktop DaemonClient+Streaming.swift); Desktop renders the
+//   - "desktop": Kocoro Desktop's foreground chat. The Desktop client's message
+//     bridge hardcodes "source":"desktop" on POST /message; Desktop renders the
 //     suggestion as an Island chip / suggestion_ready bus event. THIS is the
 //     value real Desktop traffic carries — do not drop it.
 //   - "kocoro":  the value the daemon's POST /message handler backfills when a
 //     caller omits Source entirely (bare curl, scripts). Kept so those
 //     foreground-equivalent callers still get suggestions.
+//   - "shanclaw": legacy alias for the Kocoro Desktop client, still accepted by
+//     the router for one release (mirrors cacheSourceFromDaemonSource). Old
+//     Desktop builds in the field may still emit it; without this entry they
+//     silently lose suggestions during the rolling upgrade. Removed in 7.4
+//     alongside the cache-source alias once Cloud confirms all clients emit
+//     "kocoro"/"desktop".
 //   - "web":     web front-end interactive sessions.
 //
 // Everything NOT in this set is skipped: cloud-routed IM channels (slack/
@@ -761,9 +766,10 @@ func shouldEmitReplyBanner(source string) bool {
 // (TUI / one-shot CLI never reach RunAgent — they run a bare AgentLoop with no
 // suggestion path — so they are out of scope for this gate.)
 var promptSuggestionSources = map[string]struct{}{
-	"desktop": {},
-	"kocoro":  {},
-	"web":     {},
+	"desktop":  {},
+	"kocoro":   {},
+	"shanclaw": {},
+	"web":      {},
 }
 
 // wantsPromptSuggestion reports whether the post-turn prompt-suggestion fork

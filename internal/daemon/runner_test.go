@@ -477,11 +477,12 @@ func TestWantsPromptSuggestion(t *testing.T) {
 		want   bool
 	}{
 		// Foreground interactive sources with a suggestion consumer — KEEP.
-		{"desktop", true}, // Desktop chat producer (ShanClawBridge POST /message hardcodes "desktop")
-		{"kocoro", true},  // HTTP /message default when caller omits source (bare curl, etc.)
-		{"web", true},     // web front-end session
-		{"Desktop", true}, // case-insensitive
-		{" web ", true},   // trim
+		{"desktop", true},  // Desktop chat producer (the Desktop message bridge POST /message hardcodes "desktop")
+		{"kocoro", true},   // HTTP /message default when caller omits source (bare curl, etc.)
+		{"shanclaw", true}, // legacy Kocoro Desktop alias, still accepted one release (mirrors cacheSourceFromDaemonSource)
+		{"web", true},      // web front-end session
+		{"Desktop", true},  // case-insensitive
+		{" web ", true},    // trim
 		// Cloud-routed IM channels — SKIP (reply delivered over WS, no consumer).
 		{"slack", false},
 		{"line", false},
@@ -1573,16 +1574,16 @@ func TestHistorySnapshot_OmitHistoryReturnsEmpty(t *testing.T) {
 // notifications; the tests only inspect the returned *RunAgentResult.
 type nullEventHandler struct{}
 
-func (nullEventHandler) OnToolCall(string, string, string)                          {}
+func (nullEventHandler) OnToolCall(string, string, string)                                    {}
 func (nullEventHandler) OnToolResult(string, string, string, agent.ToolResult, time.Duration) {}
-func (nullEventHandler) OnText(string)                                              {}
-func (nullEventHandler) OnPreamble(string)                                          {}
-func (nullEventHandler) OnStreamDelta(string)                                       {}
-func (nullEventHandler) OnApprovalNeeded(string, string) bool                       { return true }
-func (nullEventHandler) OnUsage(agent.TurnUsage)                                    {}
-func (nullEventHandler) OnCloudAgent(string, string, string)                        {}
-func (nullEventHandler) OnCloudProgress(int, int)                                   {}
-func (nullEventHandler) OnCloudPlan(string, string, bool)                           {}
+func (nullEventHandler) OnText(string)                                                        {}
+func (nullEventHandler) OnPreamble(string)                                                    {}
+func (nullEventHandler) OnStreamDelta(string)                                                 {}
+func (nullEventHandler) OnApprovalNeeded(string, string) bool                                 { return true }
+func (nullEventHandler) OnUsage(agent.TurnUsage)                                              {}
+func (nullEventHandler) OnCloudAgent(string, string, string)                                  {}
+func (nullEventHandler) OnCloudProgress(int, int)                                             {}
+func (nullEventHandler) OnCloudPlan(string, string, bool)                                     {}
 
 // runAgentContractTestDeps builds a minimal ServerDeps that passes RunAgent's
 // validation gates and points the gateway at the supplied httptest URL. The
