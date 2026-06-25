@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -46,6 +47,21 @@ func headerFrameTick() tea.Cmd {
 
 // renderStartupHeader builds the animated two-column startup header for the given frame.
 // tipIdx and cwd should be pre-computed by the caller (no I/O inside this function).
+// buildTimeLabel returns the running binary's build time (its file mtime) as
+// HH:MM. A rebuild does not update an already-running TUI process, so showing
+// this in the header makes "am I on the new build?" unambiguous.
+func buildTimeLabel() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	fi, err := os.Stat(exe)
+	if err != nil {
+		return ""
+	}
+	return fi.ModTime().Format("15:04")
+}
+
 func renderStartupHeader(frame int, width int, version string, modelTier string, endpoint string, cwd string, sessions []session.SessionSummary, tipIdx int, agentLabel string) string {
 	if width < 50 {
 		width = 50
@@ -98,6 +114,11 @@ func renderStartupHeader(frame int, width int, version string, modelTier string,
 		info = lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render("▌ "+agentLabel) + dimStyle.Render("  ·  ")
 	}
 	info += modelStyle.Render(modelTier) + dimStyle.Render(" · v"+version)
+	if bt := buildTimeLabel(); bt != "" {
+		// Stamp the running binary's build time so it's unambiguous which build
+		// is live (a rebuild does NOT update an already-running TUI process).
+		info += dimStyle.Render(" · built " + bt)
+	}
 	if budget := rightWidth - lipgloss.Width(info) - 5; budget >= 6 {
 		info += dimStyle.Render(" · " + truncateStr(endpoint, budget))
 	}
