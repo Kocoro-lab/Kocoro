@@ -66,3 +66,16 @@ func TestKoeOutputFormat(t *testing.T) {
 		}
 	}
 }
+
+func TestKoeBannerAndTitlePreservation(t *testing.T) {
+	for _, src := range []string{"koe", "koe-reachy"} {
+		if shouldEmitReplyBanner(src) {
+			t.Errorf("shouldEmitReplyBanner(%q) = true, want false (Koe voices the reply itself)", src)
+		}
+		// koe must NOT be an autonomous-local source: that gate also disables the
+		// smart-title upgrade, which we want to KEEP for voice bursts.
+		if isAutonomousLocalSource(src) {
+			t.Errorf("isAutonomousLocalSource(%q) = true, want false (smart titles must stay enabled)", src)
+		}
+	}
+}

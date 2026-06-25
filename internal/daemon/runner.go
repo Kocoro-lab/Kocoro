@@ -740,6 +740,12 @@ func shouldEmitReplyBanner(source string) bool {
 	if isCloudSource(source) {
 		return false
 	}
+	if isKoeSource(source) {
+		// Koe reads the reply aloud during the call; a macOS banner would be a
+		// duplicate. Note koe stays OUT of silentBannerSources on purpose — that
+		// set ALSO suppresses the smart-title upgrade, which voice bursts keep.
+		return false
+	}
 	return !isAutonomousLocalSource(source)
 }
 
