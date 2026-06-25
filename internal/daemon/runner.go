@@ -736,6 +736,43 @@ func shouldEmitReplyBanner(source string) bool {
 	return !isAutonomousLocalSource(source)
 }
 
+// promptSuggestionSources is the allow-list of request sources whose post-turn
+// prompt-suggestion fork has a UI consumer:
+//   - "desktop": Kocoro Desktop's foreground chat. ShanClawBridge's
+//     sendMessageStreaming hardcodes "source":"desktop" on POST /message (see
+//     ShanClawDesktop DaemonClient+Streaming.swift); Desktop renders the
+//     suggestion as an Island chip / suggestion_ready bus event. THIS is the
+//     value real Desktop traffic carries — do not drop it.
+//   - "kocoro":  the value the daemon's POST /message handler backfills when a
+//     caller omits Source entirely (bare curl, scripts). Kept so those
+//     foreground-equivalent callers still get suggestions.
+//   - "web":     web front-end interactive sessions.
+//
+// Everything NOT in this set is skipped: cloud-routed IM channels (slack/
+// feishu/...) deliver over the WS path with no /suggestion consumer; scheduled
+// runs (schedule/cron) and autonomous local sources (heartbeat/watcher/mcp)
+// have no foreground client awaiting a suggestion. For all of those the fork is
+// dead work AND a real billed LLM call.
+//
+// An allow-list (not a deny-list) is deliberate: any source added later —
+// a new background trigger, a new channel — defaults to skipped, not silently
+// billed. Add a source here only once it has a confirmed suggestion consumer.
+//
+// (TUI / one-shot CLI never reach RunAgent — they run a bare AgentLoop with no
+// suggestion path — so they are out of scope for this gate.)
+var promptSuggestionSources = map[string]struct{}{
+	"desktop": {},
+	"kocoro":  {},
+	"web":     {},
+}
+
+// wantsPromptSuggestion reports whether the post-turn prompt-suggestion fork
+// should run for the given request source. See promptSuggestionSources.
+func wantsPromptSuggestion(source string) bool {
+	_, ok := promptSuggestionSources[strings.ToLower(strings.TrimSpace(source))]
+	return ok
+}
+
 // markdownStripRE matches the small set of markdown markers that read poorly
 // in a macOS notification: backticks (inline code + fences), bold/italic
 // asterisks and underscores, leading hashes for headers, and the `[text](url)`
@@ -2603,6 +2640,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 
 		// Post-turn prompt suggestion (fire-and-forget). Gated by all of:
+		//   - wantsPromptSuggestion(req.Source): only foreground sources with a
+		//     UI consumer (kocoro/web). IM channels, scheduled runs, and
+		//     autonomous local sources have none, so the fork would be dead work
+		//     AND a real billed LLM call — skip them entirely.
 		//   - agent.prompt_suggestion.enabled
 		//   - SuggestionState wired through deps (NewServer wires it; CLI
 		//     fixtures that build ServerDeps directly leave it nil — no-op)
@@ -2613,7 +2654,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// The captured request snapshot is the last successful main-turn
 		// dispatch (LastSentRequest); forking from it gives byte-equal
 		// prefix and warm-cache pricing on the suggestion call.
-		if saveErr == nil && deps.Suggestions != nil && cfg != nil && cfg.Agent.PromptSuggestion.Enabled {
+		if saveErr == nil && deps.Suggestions != nil && cfg != nil && cfg.Agent.PromptSuggestion.Enabled && wantsPromptSuggestion(req.Source) {
 			ps := cfg.Agent.PromptSuggestion
 			completedTurns := countAssistantTurns(sess.Messages)
 			// Judge cache warmth on the LAST main-turn LLM call, not the

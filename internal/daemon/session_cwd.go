@@ -19,6 +19,13 @@ import (
 // decided independently by outputFormatForSource in runner.go — Feishu/Lark/Teams
 // are cloud sources that emit "markdown" (see markdownCloudSources). Keep this
 // list aligned with that mapping for the CWD axis; the two need not agree on format.
+//
+// Cross-reference: prompt suggestions are gated to a separate foreground
+// allow-list (promptSuggestionSources in runner.go). Sources here are excluded
+// from it by construction — IM channels have no /suggestion consumer. The two
+// lists are intentionally disjoint, but if you add a NEW foreground source
+// (one with a suggestion UI), remember to add it to that allow-list too, or it
+// will silently never receive suggestions. The gate is fail-closed.
 var cloudSourceSet = map[string]struct{}{
 	"slack":    {},
 	"line":     {},

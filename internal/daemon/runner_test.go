@@ -459,6 +459,62 @@ func TestOutputFormatForSource(t *testing.T) {
 	}
 }
 
+// wantsPromptSuggestion gates the post-turn prompt-suggestion fork. The
+// suggestion has a UI consumer only on foreground interactive sources that
+// reach the daemon: "kocoro" (Desktop's HTTP /run chat — Source defaults to
+// "kocoro" in handleMessage) and "web" (web front-end sessions). Everything
+// else — cloud-routed IM channels (slack/feishu/...), scheduled runs
+// (schedule/cron), and autonomous local sources (heartbeat/watcher/mcp) — has
+// no consumer for it, so the fork is dead work AND a real billed LLM call.
+// Implemented as an explicit allow-list so any future background source
+// defaults to skipped, not silently billed.
+//
+// (TUI / one-shot CLI never reach RunAgent — they run a bare AgentLoop with no
+// suggestion path at all — so they are out of scope for this gate.)
+func TestWantsPromptSuggestion(t *testing.T) {
+	tests := []struct {
+		source string
+		want   bool
+	}{
+		// Foreground interactive sources with a suggestion consumer — KEEP.
+		{"desktop", true}, // Desktop chat producer (ShanClawBridge POST /message hardcodes "desktop")
+		{"kocoro", true},  // HTTP /message default when caller omits source (bare curl, etc.)
+		{"web", true},     // web front-end session
+		{"Desktop", true}, // case-insensitive
+		{" web ", true},   // trim
+		// Cloud-routed IM channels — SKIP (reply delivered over WS, no consumer).
+		{"slack", false},
+		{"line", false},
+		{"feishu", false},
+		{"lark", false},
+		{"wecom", false},
+		{"teams", false},
+		{"telegram", false},
+		{"webhook", false},
+		{"discord", false},
+		{"wechat", false},
+		{"Slack", false}, // case-insensitive
+		// Scheduled runs — SKIP (no foreground client; user's explicit ask).
+		{"schedule", false},
+		{"cron", false},
+		// Autonomous local sources — SKIP (piggyback on the user's session).
+		{"heartbeat", false},
+		{"watcher", false},
+		{"mcp", false},
+		// Unknown / unclassified — SKIP (allow-list default is fail-closed).
+		{"", false},
+		{"local", false},
+		{"global", false},
+		{"system", false},
+		{"custom-bot", false},
+	}
+	for _, tt := range tests {
+		if got := wantsPromptSuggestion(tt.source); got != tt.want {
+			t.Errorf("wantsPromptSuggestion(%q) = %v, want %v", tt.source, got, tt.want)
+		}
+	}
+}
+
 func TestRunAgentRequestSource(t *testing.T) {
 	req := RunAgentRequest{
 		Text:   "hello",
@@ -1808,6 +1864,14 @@ func TestRunAgent_PersistsSessionUsage(t *testing.T) {
 	// Load-bearing assertion: the persisted session must carry usage. This is
 	// the path with no fallback — exactly what was dead before the fix.
 	sessPath := filepath.Join(deps.ShannonDir, "sessions", res.SessionID+".json")
+	// A "slack" source at turn 1 triggers the async smart-title goroutine
+	// (fireTitleAfterRun), which runs on context.Background() and re-writes the
+	// session file AFTER RunAgent returns. Without joining it, t.TempDir's
+	// RemoveAll races that late write ("unlinkat: directory not empty", ~10%).
+	// The title write is the only post-return writer here (suggestion is
+	// source-gated off for slack), and it always lands under the fake gateway,
+	// so polling for the persisted title is a deterministic happens-after join.
+	waitForTitlePersisted(t, sessPath)
 	data, readErr := os.ReadFile(sessPath)
 	if readErr != nil {
 		t.Fatalf("read persisted session %s: %v", sessPath, readErr)
@@ -1827,5 +1891,42 @@ func TestRunAgent_PersistsSessionUsage(t *testing.T) {
 	}
 	if sess.SchemaVersion < 2 {
 		t.Errorf("sess.SchemaVersion = %d, want >= 2 (applyTurnUsage bumps to 2 when it writes usage)", sess.SchemaVersion)
+	}
+}
+
+// waitForTitlePersisted blocks until the async smart-title goroutine has
+// re-written sessPath, joining that detached writer before the caller's
+// t.TempDir cleanup runs. fireTitleAfterRun spawns on context.Background() and
+// is not tied to any route's done channel, so there is no other handle to join
+// it.
+//
+// The poll condition is TitleTurns >= 1, NOT a non-empty Title: RunAgent's main
+// flow already writes an initial placeholder title (sess.Title = prompt) before
+// it returns, leaving TitleTurns at 0; only the smart-title goroutine's
+// PatchAutoTitle stamps TitleTurns = atTurns (1) when it re-writes the file.
+// Waiting on Title alone returns instantly against the placeholder and never
+// joins the goroutine — the bug this helper exists to close.
+//
+// Under the fake gateway the title write always lands (sanitizeTitle accepts
+// the fake reply), so the poll is deterministic: a never-stamped TitleTurns
+// means the production path broke, not a timing race, which is why the upper
+// bound is loose (it is not a timing competitor). Partial reads of the
+// non-atomic os.WriteFile (no temp+rename, see runner.go) unmarshal-fail and
+// simply re-poll.
+func waitForTitlePersisted(t *testing.T, sessPath string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		data, err := os.ReadFile(sessPath)
+		if err == nil {
+			var s session.Session
+			if json.Unmarshal(data, &s) == nil && s.TitleTurns >= 1 {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("smart-title never persisted to %s within 5s — the async title goroutine did not land (production path broken, not a timing race)", sessPath)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
