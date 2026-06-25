@@ -148,3 +148,23 @@ func TestApplyMCPServerScope_DefaultDenylistDoesNotAffectNamed(t *testing.T) {
 		t.Error("named agent wrongly lost serverB to the default-agent denylist")
 	}
 }
+
+// TestApplyMCPServerScope_DefaultAgentEmptyDenylistKeepsAllTools guards the
+// failure mode the default agent gained when it started running scope on every
+// run: with an EMPTY denylist scoping must be a true no-op, even for an MCP tool
+// whose server is not a key in cfg.MCPServers (dynamically registered, or a
+// built-in not yet merged). allowed[] is built only from cfg.MCPServers, so
+// without the empty-denylist early return such a tool is silently stripped.
+func TestApplyMCPServerScope_DefaultAgentEmptyDenylistKeepsAllTools(t *testing.T) {
+	reg := mcpScopeRegistry()
+	reg.Register(NewMCPTool("serverC", mcpproto.Tool{Name: "c_tool"}, nil)) // server NOT in cfg
+	cfg := twoServerCfg()                                                   // only serverA, serverB; empty denylist
+
+	out := ApplyMCPServerScope(reg, cfg) // default agent
+
+	for _, n := range []string{"think", "a_tool", "b_tool", "c_tool"} {
+		if !out.Has(n) {
+			t.Errorf("default agent with empty denylist must keep %q (no-op), but it was stripped", n)
+		}
+	}
+}

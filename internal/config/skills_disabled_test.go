@@ -106,3 +106,28 @@ func TestRemoveGlobalDisabledSkill(t *testing.T) {
 		t.Errorf("removing from non-existent config should be no-op: %v", err)
 	}
 }
+
+// TestClone_IsolatesDenylists guards the data race where Clone shallow-copies
+// the per-agent denylists. RuntimeConfigForCWD→Clone must hand a run its own
+// copy of Skills.Disabled and MCP.DefaultAgentDisabled — otherwise a concurrent
+// DELETE /skills/disabled (which rewrites the backing array in place via [:0])
+// races with a run reading that slice. Mirrors the Permissions/Hooks deep-copies
+// already in Clone.
+func TestClone_IsolatesDenylists(t *testing.T) {
+	base := &Config{
+		Skills: SkillsConfig{Disabled: []string{"a", "b"}},
+		MCP:    MCPConfig{DefaultAgentDisabled: []string{"x", "y"}},
+	}
+	cloned := Clone(base)
+
+	// Simulate the DELETE handler rewriting the backing array in place.
+	base.Skills.Disabled = append(base.Skills.Disabled[:0], "OVERWRITTEN")
+	base.MCP.DefaultAgentDisabled = append(base.MCP.DefaultAgentDisabled[:0], "OVERWRITTEN")
+
+	if len(cloned.Skills.Disabled) != 2 || cloned.Skills.Disabled[0] != "a" {
+		t.Errorf("Clone aliases Skills.Disabled backing array: got %v, want [a b]", cloned.Skills.Disabled)
+	}
+	if len(cloned.MCP.DefaultAgentDisabled) != 2 || cloned.MCP.DefaultAgentDisabled[0] != "x" {
+		t.Errorf("Clone aliases MCP.DefaultAgentDisabled backing array: got %v, want [x y]", cloned.MCP.DefaultAgentDisabled)
+	}
+}

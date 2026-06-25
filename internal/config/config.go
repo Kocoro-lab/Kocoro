@@ -524,6 +524,13 @@ func Clone(cfg *Config) *Config {
 		}
 	}
 
+	// Per-agent denylists: deep-copy so a per-run Clone never aliases the live
+	// config's backing array. The /skills/disabled + /mcp/default-disabled DELETE
+	// handlers rewrite these in place (slice[:0]); without this copy a run reading
+	// the denylist races with a concurrent delete.
+	cloned.Skills.Disabled = append([]string(nil), cfg.Skills.Disabled...)
+	cloned.MCP.DefaultAgentDisabled = append([]string(nil), cfg.MCP.DefaultAgentDisabled...)
+
 	return &cloned
 }
 

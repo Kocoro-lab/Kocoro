@@ -690,12 +690,12 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// are NOT fully exempt — the exact-dup, same-error, and sleep
 	// detectors still catch real loops at their own thresholds.
 	//
-	// Batch-tolerant tools (bash + MCP tool names) additionally get a
-	// uniqueness gate: when ≥50% of same-name calls carry distinct
-	// argsHash, treat the stream as legitimate enumeration and fall
-	// through to the remaining detectors. Generic NoProgress for
-	// think/http/file_*/grep/glob stays fully active — those tools still
-	// need "called repeatedly with unique args" caught as a spin signal.
+	// Batch-tolerant tools (http) additionally get a uniqueness gate: when
+	// ≥50% of same-name calls carry distinct argsHash, treat the stream as
+	// legitimate enumeration (e.g. paging an API, polling distinct URLs) and
+	// fall through to the remaining detectors. Generic NoProgress for
+	// think/file_*/grep/glob stays fully active — those tools still need
+	// "called repeatedly with unique args" caught as a spin signal.
 	if !isRepeatableToolName(ld.repeatableTools, name) && family != "search" {
 		count := 0
 		seen := make(map[string]struct{}, ld.historySize)

@@ -274,6 +274,15 @@ func ApplyToolFilter(reg *agent.ToolRegistry, agentDef ...*agents.Agent) *agent.
 // the shared registry let every agent call every connected server's tools
 // regardless of its mcp_servers config. Scoping the registry here closes that.
 func ApplyMCPServerScope(reg *agent.ToolRegistry, cfg *config.Config, agentDef ...*agents.Agent) *agent.ToolRegistry {
+	// Default agent with an empty denylist: nothing to subtract, so return the
+	// registry untouched. Keeps the default path a true no-op even for an MCP
+	// tool whose server is not a key in cfg.MCPServers (allowed[] below is built
+	// only from cfg.MCPServers, so such a tool would otherwise be silently
+	// stripped). Named agents and a non-empty default denylist fall through.
+	isDefaultAgent := len(agentDef) == 0 || agentDef[0] == nil
+	if isDefaultAgent && (cfg == nil || len(cfg.MCP.DefaultAgentDisabled) == 0) {
+		return reg
+	}
 	resolved := resolveMCPServers(cfg, agentDef...)
 	allowed := make(map[string]bool, len(resolved))
 	for name, srv := range resolved {
