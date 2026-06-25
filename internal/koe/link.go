@@ -124,3 +124,50 @@ func (c *DaemonClient) DoTask(ctx context.Context, req DoTaskRequest) (DoTaskOut
 		return DoTaskOutcome{Kind: OutcomeRejected, Route: parsed.Route, Reason: parsed.Reason}, nil
 	}
 }
+
+// cancelReasons mirrors agenttypes.ParseCancelReason on the daemon (server.go:898).
+// Validating client-side avoids a guaranteed 400 round-trip. The daemon accepts
+// five reasons (the fifth, sibling_error, is missing from its own 400 message
+// string but accepted by ParseCancelReason) — keep this list complete.
+var cancelReasons = map[string]struct{}{
+	"user_cancel": {}, "interrupt": {}, "background": {}, "idle_timeout": {}, "sibling_error": {},
+}
+
+// CancelRequest cancels the in-flight run on a route. RouteKey is the burst key
+// (agent:<bound>:koe:<burst-id>). RestoreLast asks the daemon to slice the
+// session back to before this run.
+type CancelRequest struct {
+	RouteKey    string `json:"route_key,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	RestoreLast bool   `json:"restore_last,omitempty"`
+}
+
+// Cancel POSTs /cancel. Returns an error for an unknown reason (caught locally),
+// transport failure, or a non-2xx daemon response.
+func (c *DaemonClient) Cancel(ctx context.Context, req CancelRequest) error {
+	if req.Reason == "" {
+		req.Reason = "user_cancel"
+	}
+	if _, ok := cancelReasons[req.Reason]; !ok {
+		return fmt.Errorf("unknown cancel reason %q (want user_cancel|interrupt|background|idle_timeout)", req.Reason)
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/cancel", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.controlClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("cancel failed (status %d): %s", resp.StatusCode, string(raw))
+	}
+	return nil
+}

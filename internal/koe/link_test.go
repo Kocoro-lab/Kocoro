@@ -77,3 +77,31 @@ func TestDoTaskRejected(t *testing.T) {
 		t.Errorf("Kind=%v Reason=%q, want OutcomeRejected/cwd_conflict", out.Kind, out.Reason)
 	}
 }
+
+func TestCancel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/cancel" {
+			t.Errorf("path = %s, want /cancel", r.URL.Path)
+		}
+		var got map[string]any
+		json.NewDecoder(r.Body).Decode(&got)
+		if got["route_key"] != "agent:finance:koe:burst-1" || got["reason"] != "user_cancel" {
+			t.Errorf("unexpected cancel body: %v", got)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "status": "cancelled"})
+	}))
+	defer srv.Close()
+
+	c := NewDaemonClient(srv.URL)
+	if err := c.Cancel(context.Background(), CancelRequest{RouteKey: "agent:finance:koe:burst-1", Reason: "user_cancel"}); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+}
+
+func TestCancelRejectsUnknownReason(t *testing.T) {
+	c := NewDaemonClient("http://127.0.0.1:0")
+	err := c.Cancel(context.Background(), CancelRequest{RouteKey: "r", Reason: "bogus"})
+	if err == nil {
+		t.Fatal("Cancel with unknown reason should error before hitting the network")
+	}
+}
