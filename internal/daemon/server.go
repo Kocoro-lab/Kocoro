@@ -5282,6 +5282,19 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Expose Koe (voice front brain) settings so Kocoro Desktop's settings panel
+	// can render the enable toggle + bound agent/voice/model. Credential-free by
+	// design — Koe mints via the daemon relay, no key is ever surfaced here.
+	if cfg != nil {
+		resp["koe"] = map[string]interface{}{
+			"enabled":  cfg.Koe.Enabled,
+			"model":    cfg.Koe.Model,
+			"voice":    cfg.Koe.Voice,
+			"agent":    cfg.Koe.Agent,
+			"language": cfg.Koe.Language,
+		}
+	}
+
 	_, _, sup := s.deps.Snapshot()
 	if sup != nil {
 		healthData := make(map[string]interface{})

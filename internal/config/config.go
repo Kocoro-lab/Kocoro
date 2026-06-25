@@ -40,7 +40,21 @@ type Config struct {
 	Hooks              hooks.HookConfig               `mapstructure:"hooks"             yaml:"hooks"             json:"hooks"`
 	MCPServers         map[string]mcp.MCPServerConfig `mapstructure:"mcp_servers"       yaml:"mcp_servers"       json:"mcp_servers"`
 	MCP                MCPConfig                      `mapstructure:"mcp"               yaml:"mcp"               json:"mcp"`
+	Koe                KoeConfig                      `mapstructure:"koe"               yaml:"koe"               json:"koe"`
 	Sources            map[string]ConfigSource        `mapstructure:"-"                 yaml:"-"                 json:"-"`
+}
+
+// KoeConfig holds settings for the `shan koe` voice front brain. The daemon
+// persists these so Kocoro Desktop's settings panel can read them (GET
+// /config/status) and write them (PATCH /config), then pass them when it spawns
+// `shan koe`. NO credential lives here — Koe mints its OpenAI ephemeral secret
+// via the daemon relay (POST /koe/realtime/mint), never holding a long-lived key.
+type KoeConfig struct {
+	Enabled  bool   `mapstructure:"enabled"  yaml:"enabled,omitempty"  json:"enabled,omitempty"`
+	Model    string `mapstructure:"model"    yaml:"model,omitempty"    json:"model,omitempty"`
+	Voice    string `mapstructure:"voice"    yaml:"voice,omitempty"    json:"voice,omitempty"`
+	Agent    string `mapstructure:"agent"    yaml:"agent,omitempty"    json:"agent,omitempty"`
+	Language string `mapstructure:"language" yaml:"language,omitempty" json:"language,omitempty"`
 }
 
 // MCPConfig holds client-side settings shared across all MCP servers.
