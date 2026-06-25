@@ -39,6 +39,10 @@ const e2eModel = "gpt-realtime-mini-2025-12-15"
 // carry words the mock can match back, proving ASR understanding end-to-end.
 const e2eSpoken = "Add a reminder to call mom at six."
 
+// e2ePersona instructs the front brain to delegate real work — passed to the
+// production sessionConfig so "auto" tool_choice reliably picks do_task here.
+const e2ePersona = "You are a voice assistant. For any request that is real work, call do_task with the user's words."
+
 func TestKoeVoiceE2E(t *testing.T) {
 	if os.Getenv("KOE_E2E") != "1" {
 		t.Skip("headless voice E2E: set KOE_E2E=1 + OPENAI_API_KEY (live OpenAI, ~$0.01)")
@@ -111,7 +115,8 @@ func TestKoeVoiceE2E(t *testing.T) {
 		eventLog []string
 	)
 	connected := make(chan struct{})
-	var once sync.Once
+	configured := make(chan struct{}) // closed on session.updated — config must apply BEFORE audio
+	var once, cfgOnce sync.Once
 	rc.pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		t.Logf("[conn] %s", s)
 		if s == webrtc.PeerConnectionStateConnected {
@@ -119,20 +124,10 @@ func TestKoeVoiceE2E(t *testing.T) {
 		}
 	})
 	rc.dc.OnOpen(func() {
-		// TEST-ONLY session.update: force tool_choice to do_task so the assertion
-		// is deterministic (production sessionConfig uses "auto", which the mini
-		// model satisfies nondeterministically). The forced choice still proves
-		// ASR — OpenAI fills the task arg from the spoken words.
-		su := map[string]any{
-			"type": "session.update",
-			"session": map[string]any{
-				"type":         "realtime",
-				"instructions": "You are a voice assistant. For any request that is real work, call do_task with the user's words.",
-				"tools":        ToolDefs(),
-				"tool_choice":  map[string]any{"type": "function", "name": "do_task"},
-			},
-		}
-		b, _ := json.Marshal(su)
+		// Use the PRODUCTION sessionConfig so this E2E verifies the REAL config
+		// (GA schema: output_modalities + audio.output.voice + auto tool_choice),
+		// not a parallel copy — a regression to the beta shape would fail here.
+		b, _ := json.Marshal(sessionConfig(e2ePersona, "marin"))
 		_ = rc.dc.SendText(string(b))
 	})
 	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
@@ -143,6 +138,14 @@ func TestKoeVoiceE2E(t *testing.T) {
 		mu.Lock()
 		eventLog = append(eventLog, ev.Type)
 		mu.Unlock()
+		// Gate the audio feed on session.updated (config must precede the audio,
+		// else the VAD auto response snapshots the default tools:[] config).
+		if ev.Type == "session.updated" {
+			cfgOnce.Do(func() { close(configured) })
+		}
+		if strings.Contains(ev.Type, "error") { // surface any rejection on failure
+			t.Logf("[event %s] %s", ev.Type, string(m.Data))
+		}
 		h.handleEvent(ctx, m.Data)
 	})
 	if err := rc.dialOpenAI(ctx, ek); err != nil {
@@ -158,7 +161,14 @@ func TestKoeVoiceE2E(t *testing.T) {
 		case <-ctx.Done():
 			return
 		}
-		time.Sleep(300 * time.Millisecond) // let dc open + session.update land
+		// Wait for session.updated so tools + tool_choice + audio modality are in
+		// effect BEFORE the audio (and the VAD-auto response it triggers). Without
+		// this, the auto response snapshots the default config (tools:[], auto).
+		select {
+		case <-configured:
+		case <-ctx.Done():
+			return
+		}
 		ticker := time.NewTicker(audioFrameMs * time.Millisecond)
 		defer ticker.Stop()
 		for off := 0; off+audioFrameSize <= len(pcm); off += audioFrameSize {
@@ -171,7 +181,7 @@ func TestKoeVoiceE2E(t *testing.T) {
 		}
 		// trailing silence so server-VAD marks end-of-turn.
 		silence := make([]int16, audioFrameSize)
-		for i := 0; i < 60; i++ { // ~1.2s
+		for range 60 { // ~1.2s
 			select {
 			case <-ctx.Done():
 				return

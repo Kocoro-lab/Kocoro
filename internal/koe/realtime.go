@@ -21,16 +21,25 @@ func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn 
 }
 
 // sessionConfig builds the session.update event: persona instructions + Plan B's
-// five tools. Voice/turn-detection defaults are server-VAD (OpenAI segments).
+// five tools. GA Realtime schema — output_modalities locks audio output and the
+// voice lives under audio.output (the beta top-level "voice" + missing
+// output_modalities silently fell back to TEXT output, so Koe never spoke and
+// tool calls were emitted as text; verified against the live API in e2e_test.go).
+// tool_choice stays "auto" — forcing a specific function under output_modalities
+// ["audio"] makes GA emit the call as text instead of a real function call.
+// turn-detection defaults to server-VAD (OpenAI segments).
 func sessionConfig(persona, voice string) map[string]any {
 	return map[string]any{
 		"type": "session.update",
 		"session": map[string]any{
-			"type":         "realtime",
-			"instructions": persona,
-			"voice":        voice,
-			"tools":        ToolDefs(),
-			"tool_choice":  "auto",
+			"type":              "realtime",
+			"instructions":      persona,
+			"output_modalities": []string{"audio"},
+			"audio": map[string]any{
+				"output": map[string]any{"voice": voice},
+			},
+			"tools":       ToolDefs(),
+			"tool_choice": "auto",
 		},
 	}
 }

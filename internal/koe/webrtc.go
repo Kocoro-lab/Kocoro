@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -180,17 +181,37 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 		b, _ := json.Marshal(v)
 		return rc.dc.SendText(string(b))
 	})
+	// configured closes when OpenAI acks our session.update. The send pump waits
+	// on it: if mic audio reaches the server before the tools/voice config lands,
+	// the VAD-triggered auto response snapshots the default config (no tools) and
+	// the first turn can't delegate. Verified against the live API in e2e_test.go.
+	configured := make(chan struct{})
+	var cfgOnce sync.Once
 	rc.dc.OnOpen(func() {
 		b, _ := json.Marshal(sessionConfig(persona, "marin"))
 		_ = rc.dc.SendText(string(b))
 	})
 	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(m.Data, &ev)
+		if ev.Type == "session.updated" {
+			cfgOnce.Do(func() { close(configured) })
+		}
 		h.handleEvent(ctx, m.Data)
 	})
 	if err := rc.dialOpenAI(ctx, ek); err != nil {
 		rc.Close()
 		return nil, err
 	}
-	go rc.pumpSendTrack(ctx)
+	go func() {
+		select {
+		case <-configured:
+		case <-ctx.Done():
+			return
+		}
+		rc.pumpSendTrack(ctx)
+	}()
 	return rc, nil
 }
