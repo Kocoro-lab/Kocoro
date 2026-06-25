@@ -169,6 +169,18 @@ var semiRepeatableProdTools = map[string]bool{
 	"bash": true,
 }
 
+// batchTolerantTools lists tools whose NoProgress nudge is gated on argument
+// uniqueness: when >=50% of same-name calls in the window carry distinct
+// argsHash, the run is treated as legitimate batch enumeration and exempted
+// (the exact-dup / same-error detectors still catch genuine spins). http is
+// here so an agent batch-disabling many items (POST /skills/disabled with a
+// distinct body each — e.g. clearing a 100+ longbridge skill family) is not
+// flagged as a no-progress loop; identical-args polling stays caught because
+// it fails the uniqueness gate.
+var batchTolerantTools = map[string]bool{
+	"http": true,
+}
+
 // readVerbs and writeVerbs classify MCP tool names by the conventional
 // verb word. Only tools whose primary verb (position 0, 1, or 2 after
 // tokenizing on _ or -) is in readVerbs AND whose first three tokens
@@ -289,6 +301,7 @@ func NewLoopDetector() *LoopDetector {
 		repeatableTools:         repeatableGUITools,
 		semiRepeatableTools:     semiRepeatableProdTools,
 		semiRepeatableThreshold: 16, // v2: 12 → 16 (bash multi-step scripting)
+		batchTolerant:           batchTolerantTools,
 	}
 }
 

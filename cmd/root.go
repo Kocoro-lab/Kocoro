@@ -303,6 +303,9 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		if err != nil {
 			log.Printf("WARNING: failed to load global skills: %v", err)
 		}
+		// Default agent: honor config.skills.disabled (shared denylist with the
+		// daemon + TUI, all on ~/.shannon/config.yaml).
+		loadedSkills = agents.FilterDisabledSkills(loadedSkills, runCfg.Skills.Disabled)
 	}
 	*skillsPtr = loadedSkills
 

@@ -262,6 +262,49 @@ func ApplyToolFilter(reg *agent.ToolRegistry, agentDef ...*agents.Agent) *agent.
 	return reg
 }
 
+// ApplyMCPServerScope removes MCP tools whose server is not in the agent's
+// resolved, enabled MCP server set (per-agent mcp_servers config). Returns a
+// new registry, or the original if nothing is scoped out. Local and gateway
+// tools are never touched — only *MCPTool, which is the sole agent.SourceMCP
+// implementation (see ToolRegistry.partitionBySourceLocked). The default agent
+// (no agentDef) resolves to the full global set, so this is a no-op there.
+//
+// This is the ENFORCEMENT half of per-agent MCP config: resolveMCPServers
+// previously only fed the system-prompt context string, so on the daemon path
+// the shared registry let every agent call every connected server's tools
+// regardless of its mcp_servers config. Scoping the registry here closes that.
+func ApplyMCPServerScope(reg *agent.ToolRegistry, cfg *config.Config, agentDef ...*agents.Agent) *agent.ToolRegistry {
+	resolved := resolveMCPServers(cfg, agentDef...)
+	allowed := make(map[string]bool, len(resolved))
+	for name, srv := range resolved {
+		if !srv.Disabled {
+			allowed[name] = true
+		}
+	}
+	// Default agent (no agentDef): subtract the default-agent MCP denylist
+	// (config.mcp.default_agent_disabled). Named agents already express their
+	// selection through mcp_servers above and must not be touched by it.
+	if cfg != nil && (len(agentDef) == 0 || agentDef[0] == nil) {
+		for _, name := range cfg.MCP.DefaultAgentDisabled {
+			delete(allowed, name)
+		}
+	}
+	var deny []string
+	for _, t := range reg.All() {
+		mt, ok := t.(*MCPTool)
+		if !ok {
+			continue
+		}
+		if !allowed[mt.ServerName()] {
+			deny = append(deny, mt.Info().Name)
+		}
+	}
+	if len(deny) == 0 {
+		return reg
+	}
+	return reg.FilterByDeny(deny)
+}
+
 // CompleteRegistration connects MCP servers and gateway tools on top of a base
 // local-only registry, then applies per-agent tool filtering. The filter runs
 // AFTER all tool sources are registered so it applies to MCP and gateway tools too.

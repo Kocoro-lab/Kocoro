@@ -55,6 +55,12 @@ type MCPConfig struct {
 	// fans out connection goroutines. Per-server MCPServerConfig.ConnectTimeoutSeconds
 	// overrides this. 0 keeps the hardcoded 60s fallback.
 	DefaultConnectTimeoutSecs int `mapstructure:"default_connect_timeout_secs" yaml:"default_connect_timeout_secs,omitempty" json:"default_connect_timeout_secs,omitempty"`
+	// DefaultAgentDisabled lists MCP server names the DEFAULT agent must not use.
+	// Default-agent-only: named agents select servers via their per-agent
+	// mcp_servers config and are unaffected. Empty = default agent uses every
+	// globally-enabled server (back-compat). Written via POST/DELETE
+	// /mcp/default-disabled.
+	DefaultAgentDisabled []string `mapstructure:"default_agent_disabled" yaml:"default_agent_disabled,omitempty" json:"default_agent_disabled,omitempty"`
 }
 
 type AgentConfig struct {
@@ -244,6 +250,12 @@ type ShareMetadataConfig struct {
 
 type SkillsConfig struct {
 	Marketplace MarketplaceConfig `mapstructure:"marketplace" yaml:"marketplace" json:"marketplace"`
+	// Disabled lists skill Name/Slug values the DEFAULT agent must not load.
+	// Default-agent-only: named agents select skills via their _attached.yaml
+	// allowlist and are never narrowed by this list. Empty/absent = load every
+	// installed skill (back-compat — installs predating this field keep current
+	// behavior). Written via POST/DELETE /skills/disabled.
+	Disabled []string `mapstructure:"disabled" yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
 type MarketplaceConfig struct {
@@ -1391,6 +1403,339 @@ func RemoveGlobalAlwaysAllowTool(shannonDir, tool string) error {
 		delete(perms, "always_allow_tools")
 	} else {
 		perms["always_allow_tools"] = filtered
+	}
+
+	out, err := yaml.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	tmpPath := cfgPath + ".tmp"
+	if err := os.WriteFile(tmpPath, out, 0600); err != nil {
+		return fmt.Errorf("write temp: %w", err)
+	}
+	return os.Rename(tmpPath, cfgPath)
+}
+
+// AppendGlobalDisabledSkill adds a skill identifier (Name or Slug) to the global
+// config.yaml skills.disabled list, so the DEFAULT agent stops loading it. Named
+// agents are unaffected (they select skills via _attached.yaml). Idempotent;
+// creates config.yaml if absent. Mirrors AppendGlobalAlwaysAllowTool: flock +
+// read-modify-write on the raw YAML so unrelated keys (and casing) survive.
+func AppendGlobalDisabledSkill(shannonDir, skill string) error {
+	if skill == "" {
+		return fmt.Errorf("skill name is empty")
+	}
+	return AppendGlobalDisabledSkills(shannonDir, []string{skill})
+}
+
+// AppendGlobalDisabledSkills adds one or more skills to config.skills.disabled
+// in a SINGLE flock + read-modify-write, deduping against existing entries and
+// within the batch. Empty names are skipped; empty/all-present input is a no-op.
+// The batch form exists so an agent disabling a large skill family (e.g. a 100+
+// longbridge-* set) writes config once instead of once-per-skill — the
+// per-skill path caused a 126-call http spin that bloated context and tripped
+// the loop detector.
+func AppendGlobalDisabledSkills(shannonDir string, skills []string) error {
+	want := make([]string, 0, len(skills))
+	for _, s := range skills {
+		if s != "" {
+			want = append(want, s)
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	cfgPath := filepath.Join(shannonDir, "config.yaml")
+	lockPath := cfgPath + ".lock"
+
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("flock: %w", err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	var raw map[string]interface{}
+	if len(data) > 0 {
+		if err := yaml.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("parse config: %w", err)
+		}
+	}
+	if raw == nil {
+		raw = make(map[string]interface{})
+	}
+
+	sk, _ := raw["skills"].(map[string]interface{})
+	if sk == nil {
+		sk = make(map[string]interface{})
+		raw["skills"] = sk
+	}
+
+	var existing []interface{}
+	if v, ok := sk["disabled"].([]interface{}); ok {
+		existing = v
+	}
+	have := make(map[string]bool, len(existing))
+	for _, v := range existing {
+		if s, ok := v.(string); ok {
+			have[s] = true
+		}
+	}
+
+	changed := false
+	for _, s := range want {
+		if !have[s] {
+			existing = append(existing, s)
+			have[s] = true
+			changed = true
+		}
+	}
+	if !changed {
+		return nil // all already present
+	}
+	sk["disabled"] = existing
+
+	out, err := yaml.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+
+	tmpPath := cfgPath + ".tmp"
+	if err := os.WriteFile(tmpPath, out, 0600); err != nil {
+		return fmt.Errorf("write temp: %w", err)
+	}
+	return os.Rename(tmpPath, cfgPath)
+}
+
+// RemoveGlobalDisabledSkill is the symmetric delete for
+// AppendGlobalDisabledSkill. No-op if the skill is absent, the list is empty, or
+// config.yaml doesn't exist. Drops the skills.disabled key (and the skills block
+// if it becomes empty) to keep the YAML clean.
+func RemoveGlobalDisabledSkill(shannonDir, skill string) error {
+	if skill == "" {
+		return fmt.Errorf("skill name is empty")
+	}
+	return RemoveGlobalDisabledSkills(shannonDir, []string{skill})
+}
+
+// RemoveGlobalDisabledSkills removes one or more skills from
+// config.skills.disabled in a SINGLE flock, re-enabling them for the default
+// agent. No-op for absent names / empty input. Drops the disabled key (and the
+// skills block) when it becomes empty. Symmetric to AppendGlobalDisabledSkills.
+func RemoveGlobalDisabledSkills(shannonDir string, skills []string) error {
+	toRemove := make(map[string]bool, len(skills))
+	for _, s := range skills {
+		if s != "" {
+			toRemove[s] = true
+		}
+	}
+	if len(toRemove) == 0 {
+		return nil
+	}
+	cfgPath := filepath.Join(shannonDir, "config.yaml")
+	lockPath := cfgPath + ".lock"
+
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("flock: %w", err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	if raw == nil {
+		return nil
+	}
+	sk, _ := raw["skills"].(map[string]interface{})
+	if sk == nil {
+		return nil
+	}
+	existing, _ := sk["disabled"].([]interface{})
+	if len(existing) == 0 {
+		return nil
+	}
+	filtered := make([]interface{}, 0, len(existing))
+	removed := false
+	for _, v := range existing {
+		if s, ok := v.(string); ok && toRemove[s] {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, v)
+	}
+	if !removed {
+		return nil
+	}
+	if len(filtered) == 0 {
+		delete(sk, "disabled")
+		if len(sk) == 0 {
+			delete(raw, "skills")
+		}
+	} else {
+		sk["disabled"] = filtered
+	}
+
+	out, err := yaml.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	tmpPath := cfgPath + ".tmp"
+	if err := os.WriteFile(tmpPath, out, 0600); err != nil {
+		return fmt.Errorf("write temp: %w", err)
+	}
+	return os.Rename(tmpPath, cfgPath)
+}
+
+// AppendDefaultAgentDisabledMCPServer adds an MCP server name to the global
+// config.mcp.default_agent_disabled list so the DEFAULT agent stops using it.
+// Named agents are unaffected (they select servers via per-agent mcp_servers).
+// Idempotent; creates config.yaml if absent. Mirrors AppendGlobalDisabledSkill.
+func AppendDefaultAgentDisabledMCPServer(shannonDir, server string) error {
+	if server == "" {
+		return fmt.Errorf("server name is empty")
+	}
+	cfgPath := filepath.Join(shannonDir, "config.yaml")
+	lockPath := cfgPath + ".lock"
+
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("flock: %w", err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	var raw map[string]interface{}
+	if len(data) > 0 {
+		if err := yaml.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("parse config: %w", err)
+		}
+	}
+	if raw == nil {
+		raw = make(map[string]interface{})
+	}
+
+	mcpBlk, _ := raw["mcp"].(map[string]interface{})
+	if mcpBlk == nil {
+		mcpBlk = make(map[string]interface{})
+		raw["mcp"] = mcpBlk
+	}
+
+	var existing []interface{}
+	if v, ok := mcpBlk["default_agent_disabled"].([]interface{}); ok {
+		existing = v
+	}
+	for _, v := range existing {
+		if s, ok := v.(string); ok && s == server {
+			return nil // already present
+		}
+	}
+
+	existing = append(existing, server)
+	mcpBlk["default_agent_disabled"] = existing
+
+	out, err := yaml.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	tmpPath := cfgPath + ".tmp"
+	if err := os.WriteFile(tmpPath, out, 0600); err != nil {
+		return fmt.Errorf("write temp: %w", err)
+	}
+	return os.Rename(tmpPath, cfgPath)
+}
+
+// RemoveDefaultAgentDisabledMCPServer is the symmetric delete. No-op if the
+// server is absent, the list is empty, or config.yaml doesn't exist. Drops the
+// mcp.default_agent_disabled key (and the mcp block if it becomes empty).
+func RemoveDefaultAgentDisabledMCPServer(shannonDir, server string) error {
+	if server == "" {
+		return fmt.Errorf("server name is empty")
+	}
+	cfgPath := filepath.Join(shannonDir, "config.yaml")
+	lockPath := cfgPath + ".lock"
+
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("flock: %w", err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	if raw == nil {
+		return nil
+	}
+	mcpBlk, _ := raw["mcp"].(map[string]interface{})
+	if mcpBlk == nil {
+		return nil
+	}
+	existing, _ := mcpBlk["default_agent_disabled"].([]interface{})
+	if len(existing) == 0 {
+		return nil
+	}
+	filtered := make([]interface{}, 0, len(existing))
+	removed := false
+	for _, v := range existing {
+		if s, ok := v.(string); ok && s == server {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, v)
+	}
+	if !removed {
+		return nil
+	}
+	if len(filtered) == 0 {
+		delete(mcpBlk, "default_agent_disabled")
+		if len(mcpBlk) == 0 {
+			delete(raw, "mcp")
+		}
+	} else {
+		mcpBlk["default_agent_disabled"] = filtered
 	}
 
 	out, err := yaml.Marshal(raw)

@@ -246,6 +246,34 @@ func TestLoopDetector_NoProgress_Nudge(t *testing.T) {
 	}
 }
 
+func TestLoopDetector_HTTPBatchTolerant_DistinctArgsExempt(t *testing.T) {
+	ld := NewLoopDetector()
+	// 20 http calls with DISTINCT bodies (batch enumeration — e.g. disabling
+	// many skills via POST /skills/disabled) must NOT trigger NoProgress. http
+	// gets the args-uniqueness gate: >=50% distinct argsHash -> legitimate batch,
+	// exempt. This is the "disable 126 longbridge skills" path that hit nudge.
+	for i := range 20 {
+		ld.Record("http", fmt.Sprintf(`{"method":"POST","path":"/skills/disabled","body":"longbridge-%d"}`, i), false, "", "", false)
+	}
+	action, msg := ld.Check("http")
+	if action == LoopNudge || action == LoopForceStop {
+		t.Errorf("20 distinct-args http (batch) should be exempt from NoProgress, got %v (%s)", action, msg)
+	}
+}
+
+func TestLoopDetector_HTTPSameArgsStillCaught(t *testing.T) {
+	ld := NewLoopDetector()
+	// Same-args http repeated (polling spin) must STILL be caught — the
+	// uniqueness gate only exempts distinct-args batches, not identical repeats.
+	for range 8 {
+		ld.Record("http", `{"method":"GET","path":"/status"}`, false, "", "", false)
+	}
+	action, _ := ld.Check("http")
+	if action == LoopContinue {
+		t.Error("8 identical http calls (polling spin) should still trigger a loop signal")
+	}
+}
+
 func TestLoopDetector_GUIExemptFromNoProgress(t *testing.T) {
 	ld := NewLoopDetector()
 

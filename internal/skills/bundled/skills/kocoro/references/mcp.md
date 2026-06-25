@@ -18,8 +18,8 @@ MCP servers are configured through the config API — there is no separate MCP e
 ### Check connection status
 - Method: GET
 - Path: /config/status
-- Response: `{"mcp_servers": {"my-server": "connected"|"enabled"|"disabled"}}`
-- Notes: Shows whether each MCP server connected successfully and how many tools it provides.
+- Response: `{"mcp_servers": {"my-server": "connected"|"enabled"|"disabled"}, "mcp_default_agent_disabled": ["server-x"]}`
+- Notes: Shows whether each MCP server connected successfully and how many tools it provides. `mcp_default_agent_disabled` (present only when non-empty) lists servers the DEFAULT agent is configured not to use — see "Disable an MCP server for the default agent" below.
 
 ### Activate config changes
 - Method: POST
@@ -43,6 +43,16 @@ MCP servers are configured through the config API — there is no separate MCP e
 - Path: /config
 - Body: `{"mcp_servers": {"my-server": null}}`
 - Notes: Setting the server to `null` removes it entirely from config. Built-in servers cannot be removed this way — the daemon re-injects them on the next config load. Use `disabled: true` to turn them off.
+
+### Per-agent MCP server selection
+Named agents restrict which MCP servers they use via their per-agent `mcp_servers` config (`_inherit` + per-server entries; see agents.md). As of capability `per_agent_mcp_scope`, the daemon **enforces** this at tool-dispatch time: a named agent can only call tools from servers in its resolved, enabled set — not every globally-connected server. (Pre-`per_agent_mcp_scope` daemons only used `mcp_servers` to shape the prompt context string; the tools were still callable.) Servers disabled globally (`mcp_servers.<name>.disabled`) are off for every agent.
+
+### Disable an MCP server for the default agent
+- Method: POST (disable) / DELETE (enable)
+- Path: /mcp/default-disabled
+- Body: `{"server": "<server-name>"}`
+- Response: `{"status": "disabled"}` (POST) / `{"status": "removed"}` (DELETE)
+- Notes: Controls which MCP servers the **default agent** uses. The default agent uses every globally-enabled server by default; POST adds the server to `config.mcp.default_agent_disabled` so the default agent can no longer call its tools, and DELETE re-enables it. Both are idempotent and persist to `~/.shannon/config.yaml`. **Default-agent-only** — named agents use their own `mcp_servers` config and are unaffected. GET /config/status reflects the state via `mcp_default_agent_disabled`. Requires capability `per_agent_mcp_scope`.
 
 ## Built-in MCP Servers
 
