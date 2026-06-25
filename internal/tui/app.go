@@ -20,6 +20,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -50,6 +51,7 @@ const (
 	stateProcessing
 	stateApproval
 	stateSessionPicker
+	statePicker
 )
 
 // tuiMemoryFallback adapts session.Manager to the tools.FallbackQuery
@@ -112,9 +114,9 @@ type streamOutputMsg struct {
 }
 
 // streamDeltaMsg carries an incremental token fragment of the in-flight LLM
-// answer. Unlike streamOutputMsg it is NOT committed to scrollback — it feeds a
-// transient live-preview region (m.streamLive) shown under the spinner while a
-// run is processing, then cleared when the segment finalizes into scrollback.
+// answer. Unlike streamOutputMsg it is NOT committed to history — it accumulates
+// into m.streamLive, shown as a dimmed tail at the bottom of the viewport while
+// a run is processing, then cleared when the final answer commits.
 type streamDeltaMsg struct {
 	delta string
 }
@@ -125,10 +127,6 @@ type outputBlock struct {
 	rendered string                 // width-specific rendered text
 	rerender func(width int) string // optional: re-render at new width (e.g. startup header)
 }
-
-// rerenderDoneMsg signals that the ClearScreen→Println sequence from
-// rerenderOutput has completed, so incremental flushPrints can resume.
-type rerenderDoneMsg struct{}
 
 // historyLoadedMsg is sent after session history finishes loading in a
 // goroutine, so we can re-render at the current terminal width.
@@ -187,9 +185,13 @@ type Model struct {
 	toolCleanup         func()
 	agentLoop           *agent.AgentLoop
 	textarea            textarea.Model
+	viewport            viewport.Model // scrollable conversation history (alt-screen)
 	output              []outputBlock
-	pendingPrints       []string
-	streamLive          string // transient live-preview of the in-flight answer (not yet in scrollback)
+	committedContent    string // cached concat of rendered output blocks (rebuilt on committedDirty)
+	committedDirty      bool   // output or width changed; rebuild committedContent
+	viewportDirty       bool   // viewport content changed; rebuild on next layout
+	followBottom        bool   // auto-scroll to newest unless the user scrolled up
+	streamLive          string // in-flight answer, rendered live as normal markdown at the viewport tail
 	processingStartTime time.Time
 	spinnerIdx          int
 	spinnerTexts        []string
@@ -197,6 +199,15 @@ type Model struct {
 	colorIdx            int
 	lastSessions        []session.SessionSummary // cached for session picker
 	sessionPickerIdx    int
+	pickerTitle         string         // generic selection picker (statePicker)
+	pickerOpts          []pickerOption // current picker rows
+	pickerIdx           int            // highlighted row
+	pickerKind          pickerKind     // dispatches Enter to the right apply
+	pastes              map[int]string // stashed large pastes (placeholder N → full text)
+	pasteCounter        int            // last [Pasted text #N] number
+	promptSuggestion    string         // current follow-up suggestion (ghost text under composer)
+	suggestionGen       int            // bumped each turn; stales in-flight suggestions
+	ctrlCArmed          bool           // first Ctrl+C cleared the conversation; the next exits
 	state               state
 	width               int
 	height              int
@@ -243,7 +254,6 @@ type Model struct {
 	lastEscTime         time.Time       // for double-escape detection
 	sessionAllowed      map[string]bool // tools always-allowed for this session
 	pendingApprovalTool string          // tool name awaiting approval
-	rerenderPending     bool            // true while rerenderOutput sequence is in flight
 }
 
 type slashCmd struct {
@@ -281,20 +291,12 @@ func (m *Model) cwd() string {
 	return dir
 }
 
-// finishHeaderAnimation completes the startup animation, flushes the final
-// header to scrollback, and transitions to stateInput.
+// finishHeaderAnimation completes the startup animation, commits the final
+// header as the first viewport block, and transitions to stateInput.
 func (m *Model) finishHeaderAnimation() tea.Cmd {
-	finalHeader := renderStartupHeader(headerTotalFrames-1, m.width, m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD, m.headerSessions, m.headerTipIdx)
-	// Capture stable values for the rerender closure so the header can be
-	// re-rendered at a new width on terminal resize.
-	version, tier, ep, cwd := m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD
-	sessions, tipIdx := m.headerSessions, m.headerTipIdx
-	m.output = append(m.output, outputBlock{
-		rendered: finalHeader,
-		rerender: func(width int) string {
-			return renderStartupHeader(headerTotalFrames-1, width, version, tier, ep, cwd, sessions, tipIdx)
-		},
-	})
+	finalHeader := renderStartupHeader(headerTotalFrames-1, m.width, m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD, m.headerSessions, m.headerTipIdx, m.agentLabel())
+	// Commit the startup banner as the first scroll-history block.
+	m.appendOutput(finalHeader)
 	m.appendOutput("")
 	m.headerDone = true
 	m.state = stateInput
@@ -315,7 +317,8 @@ func (m *Model) finishHeaderAnimation() tea.Cmd {
 		m.appendOutput("")
 		m.headerHealth = nil
 	}
-	return m.rerenderOutput()
+	// Content changed; the alt-screen renderer repaints from the viewport.
+	return m.markDirty()
 }
 
 func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model {
@@ -331,7 +334,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	warmBackgroundColor()
 
 	ta := textarea.New()
-	ta.Placeholder = "Type a message or /help..."
+	ta.Placeholder = "Ask Kocoro anything…"
 	promptStyle := lipgloss.NewStyle().Foreground(colorInfo)
 	ta.SetPromptFunc(2, func(lineIdx int) string {
 		if lineIdx == 0 {
@@ -341,12 +344,20 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	})
 	ta.Focus()
 	ta.SetHeight(1)
-	ta.SetWidth(width)
+	ta.SetWidth(width - inputBorderOverhead)
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0 // unlimited
 	// Remove cursor line highlight — we use border bars instead
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.BlurredStyle.CursorLine = lipgloss.NewStyle()
+	// The default cursor block is reverse-video (a stark white block on dark
+	// terminals). Tint it with the brand accent so the composer doesn't read as
+	// "turning white".
+	ta.Cursor.Style = lipgloss.NewStyle().Foreground(colorAccent)
+
+	// Scrollable conversation history. Real size is set on the first
+	// WindowSizeMsg; seed with a sane width so pre-resize renders aren't 0-wide.
+	vp := viewport.New(width, 20)
 
 	shannonDir := config.ShannonDir()
 	agentsDir := filepath.Join(shannonDir, "agents")
@@ -552,6 +563,8 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		sessions:       sessMgr,
 		agentLoop:      loop,
 		textarea:       ta,
+		viewport:       vp,
+		followBottom:   true,
 		width:          width,
 		version:        version,
 		approvalCh:     make(chan bool, 1),
@@ -770,6 +783,7 @@ func (m *Model) Init() tea.Cmd {
 	}
 
 	return tea.Batch(
+		tea.EnterAltScreen, // own the full screen; history scrolls in a viewport, not native scrollback
 		textarea.Blink,
 		headerFrameTick(),
 		m.checkHealth(),
@@ -837,19 +851,51 @@ func (m *Model) checkHealth() tea.Cmd {
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	model, cmd := m.update(msg)
-	// Suppress incremental flushes while a rerenderOutput sequence is in
-	// flight — prevents streamOutputMsg from interleaving between
-	// ClearScreen and Println (Bug #3 fix).
-	if !m.rerenderPending {
-		if flush := m.flushPrints(); flush != nil {
-			if cmd != nil {
-				cmd = tea.Sequence(flush, cmd)
-			} else {
-				cmd = flush
-			}
-		}
-	}
+	// Single ordered post-update layout pass — done here, never in View(), so
+	// View stays side-effect-free and followBottom can't fight a mid-render
+	// resize. Cheap: content only rebuilds when viewportDirty was set.
+	m.layoutViewport()
 	return model, cmd
+}
+
+// layoutViewport rebuilds (if dirty) and sizes the conversation viewport. Order
+// matters: SetContent must run before TotalLineCount (drives height) which must
+// run before GotoBottom (clamps to maxYOffset, derived from height).
+//
+// Height is min(content, available), NOT the full available height: with little
+// content the viewport shrinks so the composer sits right under the conversation
+// (the pre-alt-screen feel the user asked to keep) instead of being shoved to
+// the screen bottom behind a gap. Once content exceeds the screen it caps and
+// scrolls. A short View is fine in alt-screen — bubbletea EraseScreenBelow-clears
+// the rows beneath it each frame.
+func (m *Model) layoutViewport() {
+	if m.width <= 0 || m.height <= 0 || m.state == stateStartup {
+		return
+	}
+	if m.viewport.Width != m.width {
+		m.viewport.Width = m.width
+		m.committedDirty = true // width changed → re-flow committed markdown
+		m.viewportDirty = true
+	}
+	if m.viewportDirty {
+		m.viewport.SetContent(m.buildViewportContent())
+		m.viewportDirty = false
+	}
+	avail := m.height - lipgloss.Height(m.bottomRegion())
+	if avail < 1 {
+		avail = 1
+	}
+	vpH := m.viewport.TotalLineCount()
+	if vpH > avail {
+		vpH = avail
+	}
+	if vpH < 1 {
+		vpH = 1
+	}
+	m.viewport.Height = vpH
+	if m.followBottom {
+		m.viewport.GotoBottom()
+	}
 }
 
 func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -861,18 +907,79 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.finishHeaderAnimation()
 		}
 
+		// Any non-Ctrl+C key disarms the "Ctrl+C again to exit" prompt, so only
+		// two CONSECUTIVE Ctrl+C presses exit.
+		if msg.Type != tea.KeyCtrlC {
+			m.ctrlCArmed = false
+		}
+
+		// Scroll the conversation viewport. PgUp/PgDn page; Shift+↑/↓ nudge a few
+		// lines. These don't collide with typing, history (plain ↑/↓), or picker
+		// navigation, so they work in every state. Scrolling up stops auto-follow;
+		// returning to the bottom re-arms it so new output tracks again. (Mouse
+		// wheel is deliberately left to the terminal's alternate-scroll so text
+		// selection / copy keeps working — no full mouse capture.)
+		switch msg.Type {
+		case tea.KeyPgUp:
+			m.viewport.PageUp()
+			m.followBottom = m.viewport.AtBottom()
+			return m, nil
+		case tea.KeyPgDown:
+			m.viewport.PageDown()
+			m.followBottom = m.viewport.AtBottom()
+			return m, nil
+		case tea.KeyShiftUp:
+			m.viewport.ScrollUp(3)
+			m.followBottom = m.viewport.AtBottom()
+			return m, nil
+		case tea.KeyShiftDown:
+			m.viewport.ScrollDown(3)
+			m.followBottom = m.viewport.AtBottom()
+			return m, nil
+		}
+
 		switch msg.Type {
 		case tea.KeyCtrlC:
-			m.hookRunner.RunStop(context.Background(), "")
-			m.sessions.Save()
-			m.sessions.Close()
-			if m.toolCleanup != nil {
-				m.toolCleanup()
+			// During the brief startup animation, Ctrl+C exits immediately.
+			if m.state == stateStartup {
+				return m, m.quitCmd()
 			}
-			if m.remoteCleanup != nil {
-				m.remoteCleanup()
+			// Cancel an in-flight run (like Esc) rather than clearing/exiting.
+			if m.state == stateProcessing || m.state == stateApproval {
+				m.streamLive = ""
+				if m.cancelRun != nil {
+					m.cancelRun()
+					m.cancelRun = nil
+					m.injectCh = nil
+				}
+				if m.state == stateApproval {
+					select {
+					case m.approvalCh <- false:
+					default:
+					}
+				}
+				m.appendOutput(lipgloss.NewStyle().Foreground(colorDim).Render("  [Cancelled]"))
+				m.state = stateInput
+				m.ctrlCArmed = false
+				return m, m.rerenderOutput()
 			}
-			return m, tea.Quit
+			// A non-empty composer clears first (one undo-able step).
+			if m.state == stateInput && strings.TrimSpace(m.textarea.Value()) != "" {
+				m.textarea.Reset()
+				m.textarea.SetHeight(1)
+				m.ctrlCArmed = false
+				return m, nil
+			}
+			// First Ctrl+C on an empty composer: arm exit only. Do NOT clear the
+			// conversation — a reflexive Ctrl+C (to stop/cancel) must not silently
+			// discard the session. The "press again to exit" hint shows in the
+			// status bar while armed; clearing is /clear and Ctrl+L.
+			if !m.ctrlCArmed {
+				m.ctrlCArmed = true
+				return m, nil
+			}
+			// Second consecutive Ctrl+C: exit.
+			return m, m.quitCmd()
 		case tea.KeyEscape:
 			if m.state == stateProcessing || m.state == stateApproval {
 				m.streamLive = "" // drop any in-flight preview on cancel
@@ -919,6 +1026,15 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.menuVisible = false
 				return m, nil
 			}
+			// Accept the ghost-text follow-up: fill the composer, do NOT send
+			// (matches Desktop). Only when the composer is empty.
+			if m.state == stateInput && m.promptSuggestion != "" && strings.TrimSpace(m.textarea.Value()) == "" {
+				m.textarea.SetValue(m.promptSuggestion)
+				m.textarea.CursorEnd()
+				m.promptSuggestion = ""
+				m.adjustTextareaHeight()
+				return m, nil
+			}
 		case tea.KeyEnter:
 			// Alt+Enter: insert newline instead of submitting
 			if m.state == stateInput && !m.menuVisible && msg.Alt {
@@ -928,13 +1044,22 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.menuVisible && len(m.menuItems) > 0 {
 				selected := m.menuItems[m.menuIndex]
-				m.textarea.SetValue(selected.cmd + " ")
 				m.menuVisible = false
+				if isImmediateCommand(selected.cmd) {
+					// No-argument command (e.g. a picker) — execute on this Enter
+					// instead of autocompleting and waiting for a second Enter.
+					m.textarea.SetValue(selected.cmd)
+					return m.handleSubmit()
+				}
+				// Needs a typed argument — autocomplete and let the user type it.
+				m.textarea.SetValue(selected.cmd + " ")
 				return m, nil
 			}
 			if m.state == stateApproval {
 				// handled below
-			} else if m.state == stateInput {
+			} else if m.state == stateInput || m.state == stateProcessing {
+				// stateProcessing: handleSubmit injects the text into the running
+				// loop (queue a follow-up) instead of starting a new turn.
 				return m.handleSubmit()
 			}
 		case tea.KeyUp:
@@ -992,7 +1117,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.appendOutput(formatExpandedToolResult(r.name, r.args, r.isError, r.content, r.elapsed))
 			}
 			m.toolExpandLevel = 1
-			return m, m.flushPrints()
+			return m, m.markDirty()
 		}
 
 		// Readline shortcuts (only in stateInput, single-line, not during menus).
@@ -1035,6 +1160,13 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.textarea.SetCursor(i)
 				}
 				return m, nil
+			case tea.KeyCtrlR: // Recall: fill from the most recent matching past input
+				if got, ok := searchHistory(m.inputHistory, m.textarea.Value()); ok {
+					m.textarea.SetValue(got)
+					m.textarea.CursorEnd()
+					m.adjustTextareaHeight()
+				}
+				return m, nil
 			case tea.KeyCtrlL: // Clear screen
 				m.output = nil
 				return m, m.rerenderOutput()
@@ -1055,6 +1187,14 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.sessionPickerIdx = 0
 				}
 				return m, nil
+			case tea.KeyRunes:
+				// 'f' forks the highlighted session into a new branch.
+				if string(msg.Runes) == "f" && len(m.lastSessions) > 0 {
+					target := m.lastSessions[m.sessionPickerIdx].ID
+					m.state = stateInput
+					return m, m.forkSession(target)
+				}
+				return m, nil
 			case tea.KeyEnter:
 				if len(m.lastSessions) > 0 {
 					target := m.lastSessions[m.sessionPickerIdx].ID
@@ -1069,6 +1209,37 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.state = stateInput
+				return m, nil
+			case tea.KeyEscape:
+				m.state = stateInput
+				return m, nil
+			}
+			return m, nil
+		}
+
+		if m.state == statePicker {
+			switch msg.Type {
+			case tea.KeyUp:
+				m.pickerIdx = pickerWrap(m.pickerIdx-1, len(m.pickerOpts))
+				return m, nil
+			case tea.KeyDown:
+				m.pickerIdx = pickerWrap(m.pickerIdx+1, len(m.pickerOpts))
+				return m, nil
+			case tea.KeyEnter:
+				m.state = stateInput
+				if len(m.pickerOpts) > 0 {
+					sel := m.pickerOpts[m.pickerIdx].value
+					switch m.pickerKind {
+					case pickerKindModel:
+						m.applyModelTier(sel)
+						return m, m.markDirty()
+					case pickerKindAgent:
+						return m, m.switchToAgent(sel)
+					case pickerKindColor:
+						m.applyAccentByName(sel)
+						return m, m.markDirty()
+					}
+				}
 				return m, nil
 			case tea.KeyEscape:
 				m.state = stateInput
@@ -1110,19 +1281,21 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.WindowSizeMsg:
-		oldWidth := m.width
 		m.width = msg.Width
 		m.height = msg.Height
-		m.textarea.SetWidth(msg.Width)
-		if oldWidth != msg.Width && oldWidth > 0 && len(m.output) > 0 {
-			return m, m.rerenderOutput()
-		}
+		m.textarea.SetWidth(msg.Width - inputBorderOverhead)
+		// relayout (in the Update wrapper) resizes the viewport; mark dirty so the
+		// content re-flows markdown at the new width and re-clamps the scroll.
+		m.viewportDirty = true
 		return m, nil
 
 	case spinnerFrameMsg:
 		if m.state == stateProcessing {
 			m.glyphIdx++
 			m.colorIdx++
+			// The spinner glyph lives in the bottom region, which re-renders on
+			// every View(); streaming content refreshes on its own deltas. So the
+			// tick just advances the animation — no viewport rebuild needed.
 			return m, spinnerFrameTick()
 		}
 		return m, nil
@@ -1187,21 +1360,12 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// from the stored summary alone. Users who want the per-
 				// turn breakdown can see it in the one-shot CLI footer.
 				total := sessionUsage.CostUSD + sessionUsage.ToolCostUSD
-				usageStr := fmt.Sprintf("  tokens: %d in / %d out | cost: $%.4f | calls: %d",
-					sessionUsage.InputTokens, sessionUsage.OutputTokens,
-					total, sessionUsage.LLMCalls)
-				if sessionUsage.Model != "" {
-					usageStr += " | " + sessionUsage.Model
-				}
-				usageStr += " | " + elapsed
-				m.appendOutput(usageDim.Render(usageStr))
+				// Friendly turn footer: cost + elapsed only. The full token /
+				// call / model breakdown lives in /status, kept off every turn
+				// for non-technical users.
+				m.appendOutput(usageDim.Render("  " + friendlyCost(total) + " · " + elapsed))
 			case msg.usage != nil:
-				usageStr := fmt.Sprintf("  tokens: %d | cost: $%.4f", msg.usage.TotalTokens, msg.usage.CostUSD)
-				if msg.usage.Model != "" {
-					usageStr += " | model: " + msg.usage.Model
-				}
-				usageStr += " | " + elapsed
-				m.appendOutput(usageDim.Render(usageStr))
+				m.appendOutput(usageDim.Render("  " + friendlyCost(msg.usage.CostUSD) + " · " + elapsed))
 			default:
 				m.appendOutput(usageDim.Render("  " + elapsed))
 			}
@@ -1219,7 +1383,16 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Full clear-and-repaint so the response, usage line, and input bar
 		// are all positioned correctly — incremental Println can mis-position
 		// lines when the view height changes between processing and input.
-		return m, tea.Batch(m.rerenderOutput(), titleCmd)
+		return m, tea.Batch(m.rerenderOutput(), titleCmd, m.maybeSuggestCmd(msg, m.suggestionGen))
+
+	case suggestionReadyMsg:
+		// Ghost-text follow-up. Show only if it belongs to the current turn
+		// (not staled by a newer submit) and we're back at the composer. Never
+		// auto-sent — the user presses Tab to fill it.
+		if msg.gen == m.suggestionGen && m.state == stateInput && strings.TrimSpace(msg.text) != "" {
+			m.promptSuggestion = msg.text
+		}
+		return m, nil
 
 	case titleGeneratedMsg:
 		// The smart title was generated off-thread; persist it here on the main
@@ -1289,11 +1462,13 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case streamDeltaMsg:
-		// Accumulate the in-flight answer into the transient preview region.
-		// Not committed to scrollback — agentDoneMsg renders the final answer.
-		// Bound to a tail: the preview only shows the last streamPreviewLines, so
-		// there's no need to retain (and re-split every View) a 100K-char answer.
+		// Accumulate the in-flight answer and refresh now (not just on the spinner
+		// tick) so the reply forms smoothly as chunks arrive — Claude-Code style —
+		// rather than jumping in 100 ms steps. The committed history is cached, so
+		// each refresh only re-renders streamLive's markdown (bounded by
+		// boundStreamTail), keeping this cheap.
 		m.streamLive = boundStreamTail(m.streamLive + msg.delta)
+		m.viewportDirty = true
 		return m, nil
 
 	case streamOutputMsg:
@@ -1361,14 +1536,6 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.rerenderOutput()
 
-	case rerenderDoneMsg:
-		m.rerenderPending = false
-		// Flush any output that arrived during the rerender sequence
-		if flush := m.flushPrints(); flush != nil {
-			return m, flush
-		}
-		return m, nil
-
 	case historyLoadedMsg:
 		// Re-render at current width in case terminal was resized during load
 		return m, m.rerenderOutput()
@@ -1382,30 +1549,50 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if m.state == stateInput {
+	// Typing is live in both the idle composer AND while the agent works (the
+	// latter queues a follow-up via injection on Enter — Claude-Code style).
+	if m.state == stateInput || m.state == stateProcessing {
+		// "?"-palette and the slash-command menu are idle-only affordances; during
+		// a run "?" types normally and there is no menu.
+		if m.state == stateInput {
+			if km, ok := msg.(tea.KeyMsg); ok && !m.menuVisible && m.textarea.Value() == "" &&
+				km.Type == tea.KeyRunes && !km.Paste && string(km.Runes) == "?" {
+				m.showCommandPalette()
+				return m, nil
+			}
+		}
+		// Large bracketed paste: stash it and insert a [Pasted text #N]
+		// placeholder instead of flooding the composer (and the prompt echo)
+		// with the raw text. Expanded back to full text on submit.
+		if km, ok := msg.(tea.KeyMsg); ok && km.Paste && len(km.Runes) > pasteTruncateThreshold {
+			m.stashPaste(string(km.Runes))
+			m.adjustTextareaHeight()
+			if m.state == stateInput {
+				m.updateMenu()
+			}
+			return m, nil
+		}
 		var taCmd tea.Cmd
 		m.textarea, taCmd = m.textarea.Update(msg)
 		m.adjustTextareaHeight()
-		m.updateMenu()
+		if m.state == stateInput {
+			m.updateMenu()
+		}
 		return m, taCmd
 	}
 	return m, nil
 }
 
-// streamPreviewLines bounds the height of the in-flight answer preview. Small
-// on purpose: it is a transient "being typed" hint under the spinner, not a
-// scrollback replacement (the full answer is rendered on completion). Override:
-// none today — bump if the live region feels too cramped.
-const streamPreviewLines = 8
-
-// streamLiveMaxBytes caps the retained preview buffer. Only the last
-// streamPreviewLines are ever shown, so there's no point keeping (and
-// re-splitting each frame) more than a few screenfuls of a long answer.
-const streamLiveMaxBytes = 8192
+// streamLiveMaxBytes caps the retained in-flight answer. The streaming tail is
+// re-rendered as markdown on every refresh, so this bounds that per-refresh
+// cost; it is generous enough that virtually all answers stream in full and only
+// a very long answer's head scrolls out of the live view before it commits.
+// 32 KiB ≈ 6k words. Bump if long reports visibly truncate mid-stream.
+const streamLiveMaxBytes = 32768
 
 // boundStreamTail trims s to its last streamLiveMaxBytes, cut at a line boundary
-// so the preview never starts mid-line. Keeps streamPreview's per-frame work
-// O(streamLiveMaxBytes) regardless of total answer length.
+// so the live answer never starts mid-line. Keeps the per-refresh markdown
+// render O(streamLiveMaxBytes) regardless of total answer length.
 func boundStreamTail(s string) string {
 	if len(s) <= streamLiveMaxBytes {
 		return s
@@ -1415,32 +1602,6 @@ func boundStreamTail(s string) string {
 		return tail[i+1:]
 	}
 	return tail
-}
-
-// streamPreview returns the last maxLines lines of the in-flight stream, each
-// truncated to the terminal width and dimmed. It deliberately truncates rather
-// than wraps so the live region stays a fixed height instead of ballooning.
-func streamPreview(text string, width, maxLines int) string {
-	text = strings.TrimRight(text, "\n")
-	if text == "" {
-		return ""
-	}
-	lines := strings.Split(text, "\n")
-	if len(lines) > maxLines {
-		lines = lines[len(lines)-maxLines:]
-	}
-	dim := styleDim()
-	var sb strings.Builder
-	for i, ln := range lines {
-		if i > 0 {
-			sb.WriteString("\n")
-		}
-		if width > 0 {
-			ln = truncateCells(ln, width, "…")
-		}
-		sb.WriteString(dim.Render(ln))
-	}
-	return sb.String()
 }
 
 // composeBar renders a full-width status separator with optional captions
@@ -1460,57 +1621,137 @@ func composeBar(width int, left, right string) string {
 	return left + styleFaint().Render(strings.Repeat("─", fill)) + right
 }
 
+// inputBorderOverhead reserves columns around the composer: 1 left border +
+// 1 right border + 1 trailing column left blank. The trailing blank is
+// load-bearing: a live line that fills the FULL terminal width gets no
+// EraseLineRight from Bubbletea's inline differ (it only erases lines shorter
+// than the width), which desyncs line accounting and clips the trailing status
+// bar on each keystroke. Keeping the box 1 column short keeps the differ honest.
+const inputBorderOverhead = 3
+
+// statusAgentMarker leads the input status line — a brand-colored bar that
+// draws the eye to the active-agent segment.
+const statusAgentMarker = "▌"
+
+// renderInputBox wraps the composer view in a rounded, brand-colored border of
+// the given total width. Narrow widths pass the content through unboxed so the
+// frame never overflows.
+func renderInputBox(taView string, totalWidth int) string {
+	if totalWidth < 4 {
+		return taView
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorAccent).
+		Width(totalWidth - inputBorderOverhead).
+		Render(taView)
+}
+
+// renderDimComposer renders the composer with a muted border, shown while the
+// agent is working or awaiting approval so the chat box stays visible (dimmed
+// to signal it's paused) instead of vanishing until the run ends.
+func renderDimComposer(value string, totalWidth int) string {
+	if totalWidth < 4 {
+		return value
+	}
+	// Render the draft STATICALLY (no live cursor): the composer is paused while
+	// the agent works, and keystrokes don't reach it until stateInput — a live
+	// cursor here just flashes a distracting block.
+	inner := lipgloss.NewStyle().Foreground(colorDim).Render("> " + strings.TrimRight(value, "\n"))
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorDim).
+		Width(totalWidth - inputBorderOverhead).
+		Render(inner)
+}
+
+// View composes the full alt-screen frame: the scrollable conversation
+// (viewport) on top, the state-specific bottom region (composer / spinner /
+// status / picker) below. Sizing + content are done in Update (relayout +
+// refreshViewport) so View stays side-effect-free. The total height is exactly
+// m.height because viewport.View() pads/truncates to m.viewport.Height and
+// relayout set that to m.height - bottomRegionHeight.
 func (m *Model) View() string {
+	if m.width <= 0 || m.height <= 0 {
+		return "" // pre-size; the first WindowSizeMsg lays everything out
+	}
+	if m.state == stateStartup {
+		// Full-screen animated banner; pad to the exact terminal height so the
+		// alt-screen frame is well-formed before the first turn.
+		return lipgloss.NewStyle().Width(m.width).Height(m.height).MaxHeight(m.height).Render(
+			renderStartupHeader(m.headerFrame, m.width, m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD, m.headerSessions, m.headerTipIdx, m.agentLabel()))
+	}
+	return m.viewport.View() + "\n" + m.bottomRegion()
+}
+
+// bottomRegion renders the fixed UI below the scroll viewport for the current
+// state, WITHOUT a trailing newline. relayout measures its height to size the
+// viewport, and View joins it under viewport.View(); both call this with the
+// same state so the heights always agree.
+func (m *Model) bottomRegion() string {
 	var sb strings.Builder
 
 	barStyle := lipgloss.NewStyle().Foreground(colorFaint)
 	bar := barStyle.Render(strings.Repeat("─", m.width))
 
-	// --- Input / status line ---
 	switch m.state {
-	case stateStartup:
-		sb.WriteString(renderStartupHeader(m.headerFrame, m.width, m.version, m.modelDisplayLabel(), m.cfg.Endpoint, m.headerCWD, m.headerSessions, m.headerTipIdx))
 	case stateInput:
-		sb.WriteString(bar)
+		// Composer wrapped in a rounded brand-colored border (its top border
+		// replaces the old plain separator). The textarea is sized to leave room
+		// for the border (inputBorderOverhead) at init/resize.
+		sb.WriteString(renderInputBox(m.textarea.View(), m.width))
 		sb.WriteString("\n")
-		sb.WriteString(m.textarea.View())
-		sb.WriteString("\n")
-		// Bottom bar: left hint (slash commands are discoverable by typing "/")
-		// + right-aligned model tier.
-		leftHint := styleDim().Render(" / commands")
-		rightInfo := styleDim().Render(m.modelDisplayLabel())
-		sb.WriteString(composeBar(m.width, leftHint, rightInfo))
-	case stateProcessing:
-		// Live preview of the answer being generated (transient; the finalized
-		// answer is rendered to scrollback on agentDoneMsg). Shown above the
-		// spinner so the user sees real-time progress instead of a frozen dot.
-		if preview := streamPreview(m.streamLive, m.width, streamPreviewLines); preview != "" {
-			sb.WriteString(preview)
+		// Ghost-text follow-up suggestion (Tab to use), shown only on an empty
+		// composer so it never fights what the user is typing.
+		if m.promptSuggestion != "" && strings.TrimSpace(m.textarea.Value()) == "" {
+			sb.WriteString(styleDim().Render("  ↳ "+truncateStr(m.promptSuggestion, m.width-16)) +
+				styleFaint().Render("  Tab"))
 			sb.WriteString("\n")
 		}
-		if m.pendingToolName != "" {
-			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
-			color := spinColors[m.colorIdx%len(spinColors)]
-			glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
-			dimStyle := lipgloss.NewStyle().Foreground(colorDim)
-			keyArg := toolKeyArg(m.pendingToolName, m.pendingToolArgs)
-			sb.WriteString(glyphStyle.Render(glyph) + dimStyle.Render(fmt.Sprintf(" %s(%s)", m.pendingToolName, keyArg)))
-		} else {
-			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
-			color := spinColors[m.colorIdx%len(spinColors)]
-			glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
-			spinnerText := m.spinnerTexts[m.spinnerIdx%len(m.spinnerTexts)]
-			sb.WriteString(glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx))
+		// Status line: the active agent is the prominent left segment (brand
+		// marker + bold name) followed by the model tier; the slash hint sits
+		// dim on the right. agentLabel is a persistent control (Desktop).
+		marker := lipgloss.NewStyle().Foreground(colorAccent).Render(statusAgentMarker)
+		agentSeg := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(m.agentLabel())
+		modelSeg := styleSecondary().Render(m.modelDisplayLabel())
+		left := " " + marker + " " + agentSeg + " " + styleDim().Render("·") + " " + modelSeg
+		// While Ctrl+C is armed, the right segment becomes a transient exit hint
+		// (no conversation mutation — see the Ctrl+C handler). Any other key
+		// disarms it and the slash hint returns.
+		right := styleDim().Render("? for commands")
+		if m.ctrlCArmed {
+			right = lipgloss.NewStyle().Foreground(colorWarn).Render("Press Ctrl+C again to exit")
 		}
+		sb.WriteString(composeBar(m.width-1, left, right)) // width-1: same zero-slack rule as the processing bar
+	case stateProcessing:
+		// Composer stays visible AND usable while the agent works (Claude-Code
+		// style): typing + Enter injects a follow-up into the running loop. Same
+		// rounded brand border as the idle input — NOT the old dim/near-white box.
+		sb.WriteString(renderInputBox(m.textarea.View(), m.width))
 		sb.WriteString("\n")
-		// Bottom status bar: left "esc to interrupt" hint (cancelling a run is
-		// otherwise undiscoverable) + right model tier and execution timer.
+		// Status line UNDER the composer: animated glyph + the current tool-call
+		// label or a shimmering status phrase on the left; esc hint + model +
+		// elapsed on the right. The in-flight answer itself streams in the viewport
+		// above, so this region is a fixed composer + one status line.
+		glyph := dotFrames[m.glyphIdx%len(dotFrames)]
+		color := spinColors[m.colorIdx%len(spinColors)]
+		glyphStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+		var status string
+		if m.pendingToolName != "" {
+			keyArg := toolKeyArg(m.pendingToolName, m.pendingToolArgs)
+			label := truncateCellsSafe(formatToolCallLabel(m.pendingToolName, keyArg), m.width/2)
+			status = glyphStyle.Render(glyph) + lipgloss.NewStyle().Foreground(colorDim).Render(" "+label)
+		} else {
+			spinnerText := m.spinnerTexts[m.spinnerIdx%len(m.spinnerTexts)]
+			status = glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx)
+		}
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
-		leftHint := styleDim().Render(" esc to interrupt")
-		rightInfo := styleDim().Render(m.modelDisplayLabel() + " " + elapsed)
-		sb.WriteString(composeBar(m.width, leftHint, rightInfo) + "\n")
+		rightInfo := styleDim().Render("esc to interrupt · " + m.modelDisplayLabel() + " " + elapsed)
+		sb.WriteString(composeBar(m.width-1, " "+status, rightInfo))
 	case stateApproval:
-		sb.WriteString(bar)
+		// Keep the composer visible (dimmed) above the approval prompt so the
+		// chat box doesn't vanish while awaiting a y/n/a decision.
+		sb.WriteString(renderDimComposer(m.textarea.Value(), m.width))
 		sb.WriteString("\n")
 		// Labeled keys instead of a bare "[y/n/a]" so non-technical users know
 		// what each choice does.
@@ -1523,7 +1764,9 @@ func (m *Model) View() string {
 		sb.WriteString("\n")
 		sb.WriteString(bar)
 	case stateSessionPicker:
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  Sessions (Up/Down, Enter, Esc)"))
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  Sessions (Up/Down, Enter=resume, f=fork, Esc)"))
+	case statePicker:
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorInfo).Render("  " + m.pickerTitle + " (Up/Down, Enter, Esc)"))
 	}
 
 	// --- Dropdown (only when visible) ---
@@ -1541,12 +1784,53 @@ func (m *Model) View() string {
 			desc := fmt.Sprintf("[%s] %d msgs", s.UpdatedAt.Format("Jan 02 15:04"), s.MsgCount)
 			return title, desc
 		}))
+	} else if m.state == statePicker {
+		sb.WriteString("\n")
+		sb.WriteString(renderDropList(dropListSize, len(m.pickerOpts), m.pickerIdx, func(i int) (string, string) {
+			o := m.pickerOpts[i]
+			return o.label, o.desc
+		}))
 	}
 
-	return sb.String()
+	// No trailing newline: View joins this under viewport.View() with a single
+	// "\n", and relayout sized the viewport assuming exactly lipgloss.Height(this)
+	// rows. A stray trailing newline would add a phantom row and push the total
+	// past m.height.
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// quitCmd runs shutdown cleanup (hooks, session save/close, tool + remote
+// teardown) and returns tea.Quit. Shared by the Ctrl+C exit paths.
+func (m *Model) quitCmd() tea.Cmd {
+	m.hookRunner.RunStop(context.Background(), "")
+	m.sessions.Save()
+	m.sessions.Close()
+	if m.toolCleanup != nil {
+		m.toolCleanup()
+	}
+	if m.remoteCleanup != nil {
+		m.remoteCleanup()
+	}
+	return tea.Quit
+}
+
+// renderUserMessage renders a user turn as a distinct background block (a role
+// cell): a subtle bg + bright text reads as "my turn" far better than a text
+// color alone. Shared by the live echo and resumed/forked history.
+func renderUserMessage(text string, width int) string {
+	style := lipgloss.NewStyle().
+		Foreground(lipgloss.AdaptiveColor{Light: "#102A43", Dark: "#E6EEF8"}).
+		Background(lipgloss.AdaptiveColor{Light: "#DCE8F5", Dark: "#243447"}).
+		Bold(true).
+		Padding(0, 1)
+	if width > 4 {
+		style = style.Width(width) // fill the full terminal row (CC-style bar)
+	}
+	return style.Render("› " + text)
 }
 
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
+	m.clearSuggestion() // a new turn stales any in-flight / shown suggestion
 	input := strings.TrimSpace(m.textarea.Value())
 	m.textarea.Reset()
 	m.textarea.SetHeight(1)
@@ -1565,24 +1849,29 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.historyIdx = -1
 	m.historySaved = ""
 
-	promptMark := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
-	m.appendOutput(fmt.Sprintf("%s %s", promptMark, input))
+	m.appendOutput(renderUserMessage(input, m.width))
+
+	// Expand [Pasted text #N] placeholders to their stashed full text for the
+	// model; the echo + history above keep the compact placeholder form.
+	input = expandPastes(input, m.pastes)
+	m.pastes = nil
+	m.pasteCounter = 0
 
 	// Check slash commands
 	if strings.HasPrefix(input, "/") {
 		return m.handleSlashCommand(input)
 	}
 
-	// If already processing, inject into running loop instead of blocking
+	// If already processing, inject into running loop instead of blocking.
 	if m.state == stateProcessing && m.injectCh != nil {
 		select {
 		case m.injectCh <- agent.InjectedMessage{Text: input}:
-			// Append to session messages for context persistence
-			sess := m.sessions.Current()
-			sess.Messages = append(sess.Messages, client.Message{
-				Role: "user", Content: client.NewTextContent(input),
-			})
-			sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local", Timestamp: session.TimePtr(time.Now())})
+			// Do NOT append to sess.Messages here. The loop drains this follow-up
+			// as a new user turn into RunMessages(), and runAgentLoop's persist
+			// block writes RunMessages()[1:] to sess.Messages once the run ends —
+			// so appending here too duplicated the turn on resume/fork (and raced
+			// the background runAgentLoop goroutine on the same slice). The visual
+			// echo above (appendOutput) is enough for the live transcript.
 		default:
 			m.appendOutput("(injection queue full — message dropped)")
 		}
@@ -1726,7 +2015,8 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 
 func (m *Model) loadSessionHistory(sess *session.Session) {
 	m.output = nil
-	m.pendingPrints = nil
+	m.committedDirty = true
+	m.viewportDirty = true
 
 	messages := append([]client.Message(nil), sess.Messages...)
 	width := m.width
@@ -1734,11 +2024,10 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 	m.appendOutput("")
 
 	if m.program == nil {
-		pm := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 		for _, msg := range messages {
 			switch msg.Role {
 			case "user":
-				m.appendOutput(fmt.Sprintf("%s %s", pm, msg.Content.Text()))
+				m.appendOutput(renderUserMessage(msg.Content.Text(), width))
 			case "assistant":
 				raw := msg.Content.Text()
 				m.appendMarkdownOutput(raw, m.renderMarkdownCached(raw, width))
@@ -1749,11 +2038,10 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 	}
 
 	go func() {
-		pm := lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(">")
 		for _, msg := range messages {
 			switch msg.Role {
 			case "user":
-				m.sendOutput(fmt.Sprintf("%s %s", pm, msg.Content.Text()))
+				m.sendOutput(renderUserMessage(msg.Content.Text(), width))
 			case "assistant":
 				raw := msg.Content.Text()
 				m.sendMarkdownOutput(raw, m.renderMarkdownCached(raw, width))
@@ -1771,12 +2059,14 @@ func (m *Model) loadSessionHistory(sess *session.Session) {
 
 func (m *Model) appendOutput(text string) {
 	m.output = append(m.output, outputBlock{rendered: text})
-	m.pendingPrints = append(m.pendingPrints, text)
+	m.committedDirty = true
+	m.viewportDirty = true
 }
 
 func (m *Model) appendMarkdownOutput(raw, rendered string) {
 	m.output = append(m.output, outputBlock{raw: raw, rendered: rendered})
-	m.pendingPrints = append(m.pendingPrints, rendered)
+	m.committedDirty = true
+	m.viewportDirty = true
 }
 
 func (m *Model) adjustTextareaHeight() {
@@ -1791,49 +2081,81 @@ func (m *Model) adjustTextareaHeight() {
 	m.textarea.SetHeight(height)
 }
 
-// flushPrints returns a Cmd that prints all pending output above the view.
-func (m *Model) flushPrints() tea.Cmd {
-	if len(m.pendingPrints) == 0 {
-		return nil
-	}
-	texts := make([]string, len(m.pendingPrints))
-	copy(texts, m.pendingPrints)
-	m.pendingPrints = m.pendingPrints[:0]
-	return tea.Println(strings.Join(texts, "\n"))
+// markDirty flags the viewport content as stale so the Update wrapper rebuilds
+// it after the current message. Returns a nil Cmd for ergonomic use at call
+// sites that previously returned a flush command (`return m, m.markDirty()`).
+// The actual repaint is the alt-screen renderer's job; nothing is written here.
+func (m *Model) markDirty() tea.Cmd {
+	m.viewportDirty = true
+	return nil
 }
 
-// rerenderOutput re-renders all output blocks at the current width and reprints them.
-// Used when the terminal is resized and when handing off from the startup
-// animation to scrollback-backed output.
-//
-// Sets rerenderPending to suppress flushPrints during the ClearScreen→Println
-// sequence, preventing streamOutputMsg from interleaving (fixes resize race).
-func (m *Model) rerenderOutput() tea.Cmd {
-	width := m.width
+// buildViewportContent returns the full scroll content: the committed history
+// (cached) followed by the in-flight answer rendered as NORMAL markdown — the
+// same renderer the final answer uses, in full brand color, NOT a dimmed/
+// truncated preview. Because the streaming text and the committed text render
+// identically, the turn finishes with zero visual "pop": the answer simply stops
+// growing. This matches Claude Code's streaming feel.
+func (m *Model) buildViewportContent() string {
+	if m.committedDirty {
+		m.committedContent = m.renderCommitted()
+		m.committedDirty = false
+	}
+	if m.streamLive == "" {
+		return m.committedContent
+	}
+	width := m.viewport.Width
+	if width <= 0 {
+		width = m.width
+	}
+	// renderMarkdown (uncached) — streamLive changes every refresh, so caching it
+	// would only churn/bloat the (raw,width) markdown cache.
+	tail := strings.TrimRight(renderMarkdown(m.streamLive, width), "\n")
+	if m.committedContent == "" {
+		return tail
+	}
+	return m.committedContent + "\n" + tail
+}
 
-	// Re-render blocks at new width.
-	for i, b := range m.output {
-		if b.rerender != nil {
-			m.output[i].rendered = b.rerender(width)
-		} else if b.raw != "" {
-			m.output[i].rendered = m.renderMarkdownCached(b.raw, width)
+// renderCommitted concatenates the committed history blocks, re-flowed at the
+// current viewport width: a width-specific closure wins (startup banner), else
+// cached markdown from the raw source, else the pre-rendered text. The markdown
+// cache is keyed by (raw,width), so same-width rebuilds are O(1) lookups and a
+// resize re-renders each block once.
+func (m *Model) renderCommitted() string {
+	width := m.viewport.Width
+	if width <= 0 {
+		width = m.width
+	}
+	var b strings.Builder
+	for i, blk := range m.output {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		switch {
+		case blk.rerender != nil:
+			b.WriteString(blk.rerender(width))
+		case blk.raw != "":
+			b.WriteString(m.renderMarkdownCached(blk.raw, width))
+		default:
+			b.WriteString(blk.rendered)
 		}
 	}
+	return b.String()
+}
 
-	lines := make([]string, 0, len(m.output))
-	for _, b := range m.output {
-		lines = append(lines, b.rendered)
-	}
-
-	// Suppress incremental prints until the full repaint completes.
-	m.pendingPrints = m.pendingPrints[:0]
-	m.rerenderPending = true
-
-	return tea.Sequence(
-		tea.ClearScreen,
-		tea.Println(strings.Join(lines, "\n")),
-		func() tea.Msg { return rerenderDoneMsg{} },
-	)
+// rerenderOutput is retained as the single "content changed, repaint" entry
+// point used by callers that wiped or rebuilt m.output (/clear, cancel, agent
+// switch). Under the viewport it simply re-renders; the alt-screen renderer
+// handles the visible clear, so there is no tea.ClearScreen round-trip (and thus
+// no "double Enter" the old main-screen path had to work around). Resize NOW
+// re-flows committed history at the new width (a strict improvement over the old
+// write-once scrollback, which froze each line's original wrap width).
+func (m *Model) rerenderOutput() tea.Cmd {
+	m.followBottom = true
+	m.committedDirty = true // callers mutate m.output (wipe/rebuild) before calling
+	m.viewportDirty = true
+	return nil
 }
 
 // generateTitleCmd generates a smart session title in the background and
@@ -1906,12 +2228,13 @@ func spinnerTick() tea.Cmd {
 	})
 }
 
-// shimmer endpoints: resting green → bright lime peak, interpolated in RGB so
-// the highlight glows on and off smoothly instead of snapping between two ANSI
-// indices. lipgloss downsamples to 256/16-color on terminals without truecolor.
+// shimmer endpoints: resting deep-pink → bright peach peak — the Kocoro brand
+// gradient (#F40752→#F9AB8F), so the "thinking" status text reads on-brand
+// instead of green. Interpolated in RGB so the highlight glows on and off
+// smoothly; lipgloss downsamples to 256/16-color on non-truecolor terminals.
 var (
-	shimmerBase = [3]int{0x3A, 0x9A, 0x3A}
-	shimmerPeak = [3]int{0xC6, 0xF0, 0x8C}
+	shimmerBase = [3]int{0xC0, 0x2A, 0x55}
+	shimmerPeak = [3]int{0xF9, 0xAB, 0x8F}
 )
 
 // renderWaveText renders text with a soft highlight that sweeps across it. Each
@@ -2000,6 +2323,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.appendOutput(helpText())
 	case "/clear":
 		m.output = nil
+		m.clearSuggestion()
 		sess := m.sessions.NewSession()
 		m.resumedSession = false
 		m.sessionAllowed = make(map[string]bool)
@@ -2020,18 +2344,13 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.applyRuntimeContext(m.sessions.Current())
 		return m, m.rerenderOutput()
 	case "/sessions":
-		sessions, err := m.sessions.List()
-		if err != nil {
-			m.appendOutput(fmt.Sprintf("Error: %v", err))
-		} else if len(sessions) == 0 {
-			m.appendOutput("No saved sessions")
-		} else {
-			m.lastSessions = sessions
-			m.sessionPickerIdx = 0
-			m.state = stateSessionPicker
-		}
+		m.openSessionPicker()
 	case "/session":
-		if len(parts) > 1 {
+		if len(parts) < 2 {
+			m.openSessionPicker() // bare /session → selectable list
+			break
+		}
+		{
 			switch parts[1] {
 			case "new":
 				sess := m.sessions.NewSession()
@@ -2041,7 +2360,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				m.appendOutput("Started new session")
 			case "resume":
 				if len(parts) < 3 {
-					m.appendOutput("Usage: /session resume <number or id>")
+					m.openSessionPicker() // /session resume → selectable list
 				} else {
 					target := parts[2]
 					// Try as 1-based index from /sessions list
@@ -2106,21 +2425,23 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			}
 		} else {
 			if len(parts) > 1 {
-				saveCfg := m.cfg
-				if m.baseCfg != nil {
-					m.baseCfg.ModelTier = parts[1]
-					saveCfg = m.baseCfg
-				}
-				m.cfg.ModelTier = parts[1]
-				m.agentLoop.SetModelTier(parts[1])
-				if err := config.Save(saveCfg); err != nil {
-					m.appendOutput(fmt.Sprintf("Model tier: %s (failed to save: %v)", parts[1], err))
-				} else {
-					m.appendOutput(fmt.Sprintf("Model tier: %s (saved)", parts[1]))
-				}
+				m.applyModelTier(parts[1]) // /model <tier> — direct (power users)
 			} else {
-				m.appendOutput(fmt.Sprintf("Current model tier: %s", m.cfg.ModelTier))
+				m.openModelPicker() // bare /model — interactive picker
 			}
+		}
+	case "/agent", "/agents":
+		if len(parts) > 1 && m.agentExists(parts[1]) {
+			return m, m.switchToAgent(parts[1]) // /agent <valid-name> — direct
+		}
+		// bare /agent, or a typed name that doesn't exist → selectable picker
+		// (so "I'll just type it" / a typo still lands on the list, not an error)
+		m.openAgentPicker()
+	case "/color", "/theme":
+		if len(parts) > 1 {
+			m.applyAccentByName(parts[1]) // /color <name> — direct
+		} else {
+			m.openColorPicker() // bare /color — interactive picker
 		}
 	case "/config":
 		m.appendOutput(formatConfigDisplay(m.cfg))
@@ -2147,6 +2468,8 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		} else {
 			m.appendOutput("No messages in session")
 		}
+	case "/export":
+		m.exportTranscript()
 	case "/rename":
 		newTitle := strings.TrimSpace(strings.TrimPrefix(input, "/rename "))
 		if newTitle == "" {
@@ -2220,6 +2543,17 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			formatTokenCount(tokenEst), formatTokenCount(ctxWindow), pct,
 			toolCount,
 		)))
+		// Usage breakdown lives here (kept off every turn footer). Cumulative
+		// for the session; cost is Cloud's computed cost_usd, not re-derived.
+		if sess != nil && sess.Usage != nil && (sess.Usage.InputTokens > 0 || sess.Usage.OutputTokens > 0) {
+			u := sess.Usage
+			usageLine := fmt.Sprintf("  Usage:       %d in / %d out · $%.4f · %d calls",
+				u.InputTokens, u.OutputTokens, u.CostUSD+u.ToolCostUSD, u.LLMCalls)
+			if u.Model != "" {
+				usageLine += " · " + u.Model
+			}
+			m.appendOutput(dimStyle.Render(usageLine))
+		}
 	case "/doctor":
 		m.appendOutput("Running diagnostics...")
 		m.state = stateProcessing
@@ -2614,8 +2948,11 @@ Commands:
   /session new                   Start new session
   /session resume <id>           Resume a saved session
   /model [small|medium|large]    Switch model tier
+  /agent [name]                  Switch agent (picker if no name)
+  /color [name]                  Change accent color (picker if no name)
   /rename <title>                Rename current session
   /copy                          Copy last response to clipboard
+  /export                        Export the conversation to a file
   /clear                         New session + clear screen
   /reset                         Clear current session history in place
   /compact [instructions]        Compress context, keep summary
@@ -2768,12 +3105,16 @@ var baseSlashCommands = []slashCmd{
 	{"/research", "Remote research"},
 	{"/swarm", "Multi-agent swarm"},
 	{"/copy", "Copy last response"},
+	{"/export", "Export transcript to a file"},
 	{"/model", "Switch model tier"},
+	{"/agent", "Switch agent"},
+	{"/color", "Change accent color"},
 	{"/config", "Show configuration"},
 	{"/setup", "Reconfigure endpoint & API key"},
 	{"/sessions", "List saved sessions"},
 	{"/search", "Search session history"},
 	{"/session", "new | resume <n>"},
+	{"/rename", "Rename current session"},
 	{"/clear", "New session + clear screen"},
 	{"/reset", "Clear current session history in place"},
 	{"/compact", "Compress context (keep summary)"},
@@ -2782,6 +3123,32 @@ var baseSlashCommands = []slashCmd{
 	{"/permissions", "Manage tool permissions"},
 	{"/update", "Check for updates"},
 	{"/quit", "Exit"},
+	{"/exit", "Exit"},
+}
+
+// immediateCommands take no required argument, so a single Enter in the
+// autocomplete menu executes them (opening the /agent, /model, or /session
+// picker, or running a no-arg command) instead of autocompleting and waiting
+// for a second Enter. Commands needing a typed argument (/research, /swarm,
+// /search, /rename) are absent so they still autocomplete for the argument.
+var immediateCommands = map[string]bool{
+	"/help": true, "/agent": true, "/agents": true, "/model": true,
+	"/color": true, "/theme": true,
+	"/config": true, "/setup": true, "/sessions": true, "/session": true,
+	"/clear": true, "/reset": true, "/compact": true, "/status": true,
+	"/doctor": true, "/permissions": true, "/update": true,
+	"/quit": true, "/exit": true, "/copy": true, "/export": true,
+}
+
+func isImmediateCommand(cmd string) bool { return immediateCommands[cmd] }
+
+// showCommandPalette opens the full command list (every command + description)
+// for arrow-selection — a discoverable alternative to typing "/" for users who
+// don't know the slash commands. Bound to "?" on an empty composer.
+func (m *Model) showCommandPalette() {
+	m.menuItems = append([]slashCmd(nil), baseSlashCommands...)
+	m.menuIndex = 0
+	m.menuVisible = true
 }
 
 func (m *Model) updateMenu() {
@@ -3009,7 +3376,7 @@ func statusMessage(msg, fallback string) string {
 
 func formatConfigDisplay(cfg *config.Config) string {
 	var sb strings.Builder
-	sb.WriteString("Shannon CLI Configuration\n")
+	sb.WriteString("Kocoro CLI Configuration\n")
 
 	if cfg.Provider == "ollama" {
 		sb.WriteString(fmt.Sprintf("  provider: ollama\n"))

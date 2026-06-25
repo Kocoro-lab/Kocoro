@@ -66,8 +66,10 @@ var (
 	// colorWarn — warnings and the approval prompt.
 	colorWarn = lipgloss.AdaptiveColor{Light: "130", Dark: "214"}
 
-	// colorAccent — brand accent (the frog green) for headers/emphasis.
-	colorAccent = lipgloss.AdaptiveColor{Light: "28", Dark: "76"}
+	// colorAccent — Kocoro brand accent (pink) for headers/emphasis/border.
+	// Matches the brand swirl gradient (#F40752→#F9AB8F): a bright pink on dark
+	// terminals, a deeper pink that stays readable on light ones.
+	colorAccent = lipgloss.AdaptiveColor{Light: "#C9105A", Dark: "#FF5C8A"}
 
 	// colorInfo — informational blue: section headers, session picker.
 	colorInfo = lipgloss.AdaptiveColor{Light: "25", Dark: "39"}
@@ -76,6 +78,30 @@ var (
 	colorSelect     = lipgloss.AdaptiveColor{Light: "25", Dark: "111"}
 	colorSelectDesc = lipgloss.AdaptiveColor{Light: "242", Dark: "146"}
 )
+
+// accentPreset is a selectable accent color for the /color picker. Only the
+// accent var is swapped (the most visible brand color: header border/title,
+// status bar, pickers, tool markers). Style constructors read the var fresh
+// each render, so a swap applies to all NEW renders; already-committed
+// scrollback keeps its original color. Not yet persisted — resets on restart.
+type accentPreset struct {
+	name        string
+	desc        string
+	dark, light string
+}
+
+var accentPresets = []accentPreset{
+	{"kocoro", "brand pink (default)", "#FF5C8A", "#C9105A"},
+	{"ocean", "calm blue", "#5CA8FF", "#1060C9"},
+	{"forest", "green", "#5CCB6E", "#1A8A3A"},
+	{"sunset", "warm orange", "#FF9C5C", "#C95A10"},
+	{"violet", "purple", "#B98CFF", "#6A30C9"},
+}
+
+// applyAccent swaps the global accent color to the preset.
+func applyAccent(p accentPreset) {
+	colorAccent = lipgloss.AdaptiveColor{Light: p.light, Dark: p.dark}
+}
 
 // Convenience style constructors. These return a fresh style each call (cheap;
 // lipgloss styles are value types) so callers can chain .Bold()/.Italic().

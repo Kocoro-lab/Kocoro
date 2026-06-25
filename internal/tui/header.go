@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -16,8 +17,8 @@ import (
 // Color palette for the startup header. Routed through the shared adaptive
 // palette (theme.go) so the header stays readable on light terminals too.
 var (
-	borderColor = colorAccent // frog green — box border
-	accentColor = colorAccent // frog green — section headers
+	borderColor = colorAccent // Kocoro pink — box border
+	accentColor = colorAccent // Kocoro pink — section headers
 	dimColor    = colorDim    // medium gray — secondary text
 	infoColor   = colorInfo   // blue — activity header
 )
@@ -46,7 +47,22 @@ func headerFrameTick() tea.Cmd {
 
 // renderStartupHeader builds the animated two-column startup header for the given frame.
 // tipIdx and cwd should be pre-computed by the caller (no I/O inside this function).
-func renderStartupHeader(frame int, width int, version string, modelTier string, endpoint string, cwd string, sessions []session.SessionSummary, tipIdx int) string {
+// buildTimeLabel returns the running binary's build time (its file mtime) as
+// HH:MM. A rebuild does not update an already-running TUI process, so showing
+// this in the header makes "am I on the new build?" unambiguous.
+func buildTimeLabel() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	fi, err := os.Stat(exe)
+	if err != nil {
+		return ""
+	}
+	return fi.ModTime().Format("15:04")
+}
+
+func renderStartupHeader(frame int, width int, version string, modelTier string, endpoint string, cwd string, sessions []session.SessionSummary, tipIdx int, agentLabel string) string {
 	if width < 50 {
 		width = 50
 	}
@@ -57,52 +73,56 @@ func renderStartupHeader(frame int, width int, version string, modelTier string,
 	innerWidth := width - 2                        // inside box borders (│ on each side)
 	rightWidth := innerWidth - headerLeftWidth - 1 // -1 for middle divider
 
-	// --- Build left column lines ---
-	var leftLines []string
-
-	// Pixel-art frog: startup animation (crouch→jump→land→blink).
-	// Center the 10-col frog within the headerLeftWidth column.
-	const frogVisualWidth = 10
-	frogIndent := strings.Repeat(" ", (headerLeftWidth-frogVisualWidth)/2)
-	for _, line := range renderFrogGrid(frogAnimFrame(frame)) {
-		leftLines = append(leftLines, frogIndent+line)
-	}
-
-	// Model + CWD + Endpoint — always visible.
-	modelStyle := lipgloss.NewStyle().Foreground(accentColor).Bold(true)
-	cwdStyle := lipgloss.NewStyle().Foreground(dimColor)
-	epStyle := lipgloss.NewStyle().Foreground(dimColor)
-	versionStyle := lipgloss.NewStyle().Foreground(dimColor)
-	leftLines = append(leftLines, "  "+modelStyle.Render(modelTier)+"  "+versionStyle.Render("v"+version))
-	leftLines = append(leftLines, "  "+cwdStyle.Render(truncateStr(cwd, headerLeftWidth-4)))
-	leftLines = append(leftLines, "  "+epStyle.Render(truncateStr(endpoint, headerLeftWidth-4)))
+	// --- Build left column lines: the Kocoro brand swirl (draws in on startup). ---
+	// renderKocoroGrid returns 8 lines, each exactly headerLeftWidth (16) cols.
+	leftLines := renderKocoroGrid(frame)
 
 	// --- Build right column lines (all immediate) ---
 	var rightLines []string
+	dimStyle := lipgloss.NewStyle().Foreground(dimColor)
+	modelStyle := lipgloss.NewStyle().Foreground(accentColor).Bold(true)
 
 	// Tips.
 	tipHeader := lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render("Tips")
-	tipStyle := lipgloss.NewStyle().Foreground(dimColor)
 	rightLines = append(rightLines, " "+tipHeader)
-	rightLines = append(rightLines, " "+tipStyle.Render(truncateStr(headerTips[tipIdx%len(headerTips)], rightWidth-3)))
+	rightLines = append(rightLines, " "+dimStyle.Render(truncateStr(headerTips[tipIdx%len(headerTips)], rightWidth-3)))
 
 	// Divider.
-	rightLines = append(rightLines, " "+lipgloss.NewStyle().Foreground(dimColor).Render(strings.Repeat("─", rightWidth-2)))
+	rightLines = append(rightLines, " "+dimStyle.Render(strings.Repeat("─", rightWidth-2)))
 
 	// Recent activity.
 	actHeader := lipgloss.NewStyle().Foreground(infoColor).Bold(true).Render("Recent activity")
 	rightLines = append(rightLines, " "+actHeader)
 
 	if len(sessions) == 0 {
-		rightLines = append(rightLines, " "+lipgloss.NewStyle().Foreground(dimColor).Render("No recent sessions"))
+		rightLines = append(rightLines, " "+dimStyle.Render("No recent sessions"))
+		rightLines = append(rightLines, "")
 	} else {
 		s := sessions[0]
-		title := truncateStr(s.Title, rightWidth-4)
 		titleStyle := lipgloss.NewStyle().Foreground(colorSecondary)
-		agoStyle := lipgloss.NewStyle().Foreground(dimColor)
-		rightLines = append(rightLines, " "+titleStyle.Render(title))
-		rightLines = append(rightLines, " "+agoStyle.Render(fmt.Sprintf("%s, %d msgs", timeAgo(s.UpdatedAt), s.MsgCount)))
+		rightLines = append(rightLines, " "+titleStyle.Render(truncateStr(s.Title, rightWidth-4)))
+		rightLines = append(rightLines, " "+dimStyle.Render(fmt.Sprintf("%s, %d msgs", timeAgo(s.UpdatedAt), s.MsgCount)))
 	}
+
+	// Model / version / endpoint / cwd — moved here from the (now icon-filled)
+	// left column. Two lines pad the right column to the icon's 8-line height.
+	rightLines = append(rightLines, " "+dimStyle.Render(truncateStr(cwd, rightWidth-3)))
+	// Lead the state line with the active agent — the most prominent element
+	// (brand marker + bold name) — then model / version / endpoint.
+	info := ""
+	if agentLabel != "" {
+		info = lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render("▌ "+agentLabel) + dimStyle.Render("  ·  ")
+	}
+	info += modelStyle.Render(modelTier) + dimStyle.Render(" · v"+version)
+	if bt := buildTimeLabel(); bt != "" {
+		// Stamp the running binary's build time so it's unambiguous which build
+		// is live (a rebuild does NOT update an already-running TUI process).
+		info += dimStyle.Render(" · built " + bt)
+	}
+	if budget := rightWidth - lipgloss.Width(info) - 5; budget >= 6 {
+		info += dimStyle.Render(" · " + truncateStr(endpoint, budget))
+	}
+	rightLines = append(rightLines, " "+info)
 
 	// Equalize line counts between columns.
 	for len(leftLines) < len(rightLines) {
@@ -118,7 +138,7 @@ func renderStartupHeader(frame int, width int, version string, modelTier string,
 	var sb strings.Builder
 
 	// Top border with title.
-	titlePart := "─ Shannon CLI "
+	titlePart := "─ Kocoro CLI "
 	titleVisWidth := lipgloss.Width(titlePart)
 	remaining := innerWidth - titleVisWidth
 	if remaining < 0 {

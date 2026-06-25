@@ -47,11 +47,13 @@ tar -xzf "${TMP}/${FILENAME}" -C "$TMP"
 
 if [ -w "$INSTALL_DIR" ]; then
     mv "${TMP}/shan" "${INSTALL_DIR}/shan"
+    ln -sf shan "${INSTALL_DIR}/kocoro"
 else
     sudo mv "${TMP}/shan" "${INSTALL_DIR}/shan"
+    sudo ln -sf shan "${INSTALL_DIR}/kocoro"
 fi
 
 rm -rf "$TMP"
 
-echo "shan v${LATEST} installed to ${INSTALL_DIR}/shan"
-echo "Run 'shan' to get started."
+echo "Kocoro CLI v${LATEST} installed to ${INSTALL_DIR}/shan (also: kocoro)"
+echo "Run 'kocoro' (or 'shan') to get started."

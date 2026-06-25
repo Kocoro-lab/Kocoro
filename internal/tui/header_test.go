@@ -8,9 +8,16 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
+func TestRenderStartupHeader_ShowsAgent(t *testing.T) {
+	out := renderStartupHeader(headerTotalFrames-1, 90, "1.0.0", "medium", "http://localhost:8080", "/tmp", nil, 0, "researcher")
+	if !strings.Contains(out, "researcher") {
+		t.Errorf("startup header should show the active agent prominently; got:\n%s", out)
+	}
+}
+
 func TestRenderStartupHeader_FirstFrame(t *testing.T) {
-	result := renderStartupHeader(0, 60, "dev", "small", "https://api.test.com", "/tmp", nil, 0)
-	if !strings.Contains(result, "Shannon CLI") {
+	result := renderStartupHeader(0, 60, "dev", "small", "https://api.test.com", "/tmp", nil, 0, "default")
+	if !strings.Contains(result, "Kocoro CLI") {
 		t.Error("first frame should contain title in top border")
 	}
 	if !strings.Contains(result, "▀") && !strings.Contains(result, "█") {
@@ -31,9 +38,9 @@ func TestRenderStartupHeader_FinalFrame(t *testing.T) {
 			MsgCount:  5,
 		},
 	}
-	result := renderStartupHeader(headerTotalFrames-1, 80, "v0.1.0", "large", "https://api.test.com", "/home/user/project", sessions, 0)
+	result := renderStartupHeader(headerTotalFrames-1, 80, "v0.1.0", "large", "https://api.test.com", "/home/user/project", sessions, 0, "default")
 
-	if !strings.Contains(result, "Shannon CLI") {
+	if !strings.Contains(result, "Kocoro CLI") {
 		t.Error("final frame should contain title")
 	}
 	if !strings.Contains(result, "▀") && !strings.Contains(result, "█") {
@@ -51,14 +58,14 @@ func TestRenderStartupHeader_FinalFrame(t *testing.T) {
 }
 
 func TestRenderStartupHeader_NarrowTerminal(t *testing.T) {
-	result := renderStartupHeader(headerTotalFrames-1, 40, "dev", "small", "https://api.test.com", "/tmp", nil, 0)
+	result := renderStartupHeader(headerTotalFrames-1, 40, "dev", "small", "https://api.test.com", "/tmp", nil, 0, "default")
 	if result == "" {
 		t.Error("should render something even on narrow terminal")
 	}
 }
 
 func TestRenderStartupHeader_WideTerminal(t *testing.T) {
-	result := renderStartupHeader(headerTotalFrames-1, 200, "dev", "small", "https://api.test.com", "/tmp", nil, 0)
+	result := renderStartupHeader(headerTotalFrames-1, 200, "dev", "small", "https://api.test.com", "/tmp", nil, 0, "default")
 	lines := strings.Split(result, "\n")
 	for _, line := range lines {
 		visible := stripAnsi(line)
@@ -70,7 +77,7 @@ func TestRenderStartupHeader_WideTerminal(t *testing.T) {
 }
 
 func TestRenderStartupHeader_LogoAlwaysVisible(t *testing.T) {
-	result := renderStartupHeader(0, 80, "dev", "small", "https://api.test.com", "/tmp", nil, 0)
+	result := renderStartupHeader(0, 80, "dev", "small", "https://api.test.com", "/tmp", nil, 0, "default")
 	if !strings.Contains(result, "▀") && !strings.Contains(result, "█") {
 		t.Error("frame 0 should show pixel frog logo")
 	}
@@ -78,8 +85,8 @@ func TestRenderStartupHeader_LogoAlwaysVisible(t *testing.T) {
 
 func TestRenderStartupHeader_EyeBlinkAnimation(t *testing.T) {
 	// Frames 0-2 show eyes open, frames 3-5 show eyes closed.
-	eyesOpen := renderStartupHeader(0, 80, "dev", "small", "https://api.test.com", "/tmp", nil, 0)
-	eyesClosed := renderStartupHeader(3, 80, "dev", "small", "https://api.test.com", "/tmp", nil, 0)
+	eyesOpen := renderStartupHeader(0, 80, "dev", "small", "https://api.test.com", "/tmp", nil, 0, "default")
+	eyesClosed := renderStartupHeader(3, 80, "dev", "small", "https://api.test.com", "/tmp", nil, 0, "default")
 	if eyesOpen == eyesClosed {
 		t.Error("animation frames from different poses should differ")
 	}

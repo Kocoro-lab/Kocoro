@@ -3,7 +3,8 @@
   "version": "0.0.0",
   "description": "AI-powered CLI agent with local tools, permissions, and session management",
   "bin": {
-    "shan": "bin/shan"
+    "shan": "bin/shan",
+    "kocoro": "bin/shan"
   },
   "scripts": {
     "postinstall": "node install.js"

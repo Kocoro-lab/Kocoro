@@ -31,6 +31,8 @@ func toolKeyArg(toolName string, argsJSON string) string {
 		key = strVal(m, "url")
 	case "web_search":
 		key = strVal(m, "query")
+	case "use_skill":
+		key = strVal(m, "skill_name")
 	case "screenshot":
 		key = "screen"
 	case "computer":
@@ -73,6 +75,56 @@ func toolResultBrief(toolName string, content string, elapsed time.Duration) str
 	return strings.Join(parts, "  ")
 }
 
+// toolFriendlyLabels maps raw tool names to plain-language labels for the tool
+// status lines, so a non-technical user sees "Searching the web" rather than
+// "web_search(...)". Unknown tools keep their raw call form (friendlyToolLabel
+// returns the name unchanged).
+var toolFriendlyLabels = map[string]string{
+	"web_search":      "Searching the web",
+	"web_fetch":       "Reading a web page",
+	"bash":            "Running a command",
+	"use_skill":       "Using a skill",
+	"file_read":       "Reading a file",
+	"file_write":      "Writing a file",
+	"file_edit":       "Editing a file",
+	"glob":            "Finding files",
+	"grep":            "Searching in files",
+	"directory_list":  "Listing files",
+	"http":            "Calling a service",
+	"screenshot":      "Taking a screenshot",
+	"browser":         "Browsing",
+	"memory_append":   "Saving to memory",
+	"memory_recall":   "Recalling memory",
+	"schedule_create": "Scheduling a task",
+	"cloud_delegate":  "Delegating to the cloud",
+	"generate_image":  "Generating an image",
+	"edit_image":      "Editing an image",
+}
+
+// friendlyToolLabel returns a plain-language label for a tool, or the raw name
+// for tools not in the map.
+func friendlyToolLabel(name string) string {
+	if label, ok := toolFriendlyLabels[name]; ok {
+		return label
+	}
+	return name
+}
+
+// formatToolCallLabel renders "Searching the web: market" for a known tool, or
+// the raw "name(args)" form for unknown tools. Shared by the live pending line
+// and the completed-result line so both read the same.
+func formatToolCallLabel(name, keyArg string) string {
+	label := friendlyToolLabel(name)
+	switch {
+	case label != name && keyArg != "":
+		return label + ": " + keyArg
+	case label != name:
+		return label
+	default:
+		return fmt.Sprintf("%s(%s)", name, keyArg)
+	}
+}
+
 // formatCompactToolResult formats a single-line tool result.
 func formatCompactToolResult(toolName string, args string, isError bool, content string, elapsed time.Duration) string {
 	keyArg := toolKeyArg(toolName, args)
@@ -87,7 +139,7 @@ func formatCompactToolResult(toolName string, args string, isError bool, content
 		brief = truncate(content, 60)
 	}
 
-	line := fmt.Sprintf("⏵ %s(%s)  %s", toolName, keyArg, icon)
+	line := fmt.Sprintf("⏵ %s  %s", formatToolCallLabel(toolName, keyArg), icon)
 	if brief != "" {
 		line += "  " + brief
 	}

@@ -76,7 +76,7 @@ func hydrateAPIKeyFromKeychain(cfg *Config) {
 func RunSetup(cfg *Config, in io.Reader, out io.Writer) error {
 	reader := bufio.NewReader(in)
 
-	fmt.Fprintln(out, "Shannon CLI Setup")
+	fmt.Fprintln(out, "Kocoro CLI Setup")
 	fmt.Fprintln(out)
 
 	// Provider selection
