@@ -1664,16 +1664,14 @@ func (m *Model) View() string {
 		right := styleDim().Render("? for commands")
 		sb.WriteString(composeBar(m.width-1, left, right)) // width-1: same zero-slack rule as the processing bar
 	case stateProcessing:
-		// Live preview of the answer being generated (transient; the finalized
-		// answer is rendered to scrollback on agentDoneMsg). Shown above the
-		// spinner so the user sees real-time progress instead of a frozen dot.
-		// Live preview of the in-flight answer, one column short of full width so
-		// the inline renderer never wrap-miscounts a row (the same logical-vs-
-		// physical row bug fixed for the status bar below).
-		if preview := streamPreview(m.streamLive, m.width-1, streamPreviewLines); preview != "" {
-			sb.WriteString(preview)
-			sb.WriteString("\n")
-		}
+		// No in-flight answer preview. A multi-line CJK preview in the live
+		// region is the last scrollback-ghost source: the terminal renders some
+		// CJK / fullwidth punctuation wider than StringWidth counts, the line
+		// wraps, and the inline renderer strands a copy in scrollback (the text
+		// offset to the right). The preamble + final answer are committed via
+		// tea.Println — once, never re-rendered, clean — so the live region holds
+		// only the spinner + a short status line. A real-time answer preview
+		// would need a scroll-region insert renderer, a much larger change.
 		if m.pendingToolName != "" {
 			glyph := dotFrames[m.glyphIdx%len(dotFrames)]
 			color := spinColors[m.colorIdx%len(spinColors)]
