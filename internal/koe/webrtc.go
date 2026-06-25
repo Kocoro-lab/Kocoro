@@ -176,7 +176,7 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	if err != nil {
 		return nil, err
 	}
-	h := newEventHandler(disp, state, func(v any) error {
+	h := newEventHandler(disp, state, audio, func(v any) error {
 		b, _ := json.Marshal(v)
 		return rc.dc.SendText(string(b))
 	})

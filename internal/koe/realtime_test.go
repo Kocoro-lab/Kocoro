@@ -46,12 +46,38 @@ func TestHandleFunctionCallDoTask(t *testing.T) {
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	cap := &captureSender{}
-	h := newEventHandler(disp, state, cap.send)
+	h := newEventHandler(disp, state, nil, cap.send)
 
 	h.handleFunctionCall(context.Background(), "call-1", "do_task", []byte(`{"task":"weather?"}`))
 
 	// The function_call_output frame must carry the say-contract reply.
 	if !cap.sentContains("It's sunny.") {
 		t.Errorf("no sent frame carried the reply say; sent=%v", cap.sent)
+	}
+}
+
+// TestHandleEventGatesMicWhileSpeaking locks the half-duplex gate into the event
+// loop: a structurally-correct gate (C2) is inert unless handleEvent actually
+// toggles it. This also pins the exact OpenAI event names — a rename would make
+// the gate silently never fire, which this test would catch.
+func TestHandleEventGatesMicWhileSpeaking(t *testing.T) {
+	audio, err := NewAudioIO() // codec only, no device — SetSpeaking/dropCapture work headless
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+
+	if audio.dropCapture() {
+		t.Fatal("mic must not be gated before any speaking event")
+	}
+	h.handleEvent(context.Background(), []byte(`{"type":"response.output_audio.delta"}`))
+	if !audio.dropCapture() {
+		t.Error("response.output_audio.delta must gate the mic (SetSpeaking true)")
+	}
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done"}`))
+	if audio.dropCapture() {
+		t.Error("response.done must ungate the mic (SetSpeaking false)")
 	}
 }

@@ -12,11 +12,12 @@ import (
 type eventHandler struct {
 	disp   *Dispatcher
 	state  *CallState
+	audio  *AudioIO // nil in unit tests; the production half-duplex gate target
 	sendFn func(any) error
 }
 
-func newEventHandler(disp *Dispatcher, state *CallState, sendFn func(any) error) *eventHandler {
-	return &eventHandler{disp: disp, state: state, sendFn: sendFn}
+func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error) *eventHandler {
+	return &eventHandler{disp: disp, state: state, audio: audio, sendFn: sendFn}
 }
 
 // sessionConfig builds the session.update event: persona instructions + Plan B's
@@ -48,10 +49,19 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		args := unwrapArgs(ev.Arguments)
 		h.handleFunctionCall(ctx, ev.CallID, ev.Name, args)
 	case "response.output_audio.delta":
-		// Koe started speaking → gate the mic (half-duplex echo control).
-		// (No-op here if audio is nil; wired in Task 5.)
+		// Koe started/continues speaking → gate the mic so server-VAD doesn't
+		// hear Koe through the speaker as a new turn (half-duplex echo control,
+		// v1; C-full replaces with VPIO AEC). Event name follows the GA flattened
+		// convention confirmed via the spike's response.output_audio_transcript.delta.
+		if h.audio != nil {
+			h.audio.SetSpeaking(true)
+		}
 	case "response.done":
-		// Turn finished → ungate mic; usage is captured for billing by the deferred daemon usage-relay (→ Plan D Cloud ingest).
+		// Turn finished → ungate the mic. (Usage token capture for billing is the
+		// deferred daemon usage-relay → Plan D Cloud ingest.)
+		if h.audio != nil {
+			h.audio.SetSpeaking(false)
+		}
 	}
 }
 
