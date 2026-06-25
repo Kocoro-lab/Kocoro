@@ -808,6 +808,14 @@ func stripMarkdownLite(s string) string {
 // invariants differ (CWD allocation vs. @mention handling), but if a channel
 // is cloud-routed it almost always belongs in both lists.
 func IsMessagingPlatform(source string) bool {
+	// koe is messaging-routed (thread/burst keying, kind=im) even though its
+	// transport is daemon-local — keep it here, NOT in cloudSourceSet. This is the
+	// single edit that cascades into kindOf → SessionKindIM and
+	// isInteractiveSource → false, keeping voice bursts out of the user's
+	// interactive cold-start / heartbeat lane.
+	if isKoeSource(source) {
+		return true
+	}
 	switch strings.ToLower(strings.TrimSpace(source)) {
 	case ChannelSlack, ChannelFeishu, ChannelLark, ChannelWeCom,
 		ChannelLINE, ChannelWeChat, ChannelTeams, ChannelDiscord,

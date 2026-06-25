@@ -24,3 +24,17 @@ func TestIsKoeSource(t *testing.T) {
 		t.Errorf("ChannelKoe = %q, want \"koe\"", ChannelKoe)
 	}
 }
+
+func TestKoeMessagingClassification(t *testing.T) {
+	for _, src := range []string{"koe", "koe-reachy", " KOE "} {
+		if !IsMessagingPlatform(src) {
+			t.Errorf("IsMessagingPlatform(%q) = false, want true", src)
+		}
+		if got := kindOf(src); got != SessionKindIM {
+			t.Errorf("kindOf(%q) = %q, want %q", src, got, SessionKindIM)
+		}
+		if isInteractiveSource(src) {
+			t.Errorf("isInteractiveSource(%q) = true, want false (koe is a burst session, not the user's interactive chat)", src)
+		}
+	}
+}
