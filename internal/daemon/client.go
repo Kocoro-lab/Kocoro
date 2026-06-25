@@ -126,7 +126,20 @@ const (
 	// (live membership/binding/transport changes). Independent of
 	// CapReplyDeliveryResultV1 so S3 can land separately from S2.
 	CapChannelStateEventV1 = "channel_state_event_v1"
-	CapDeliverableEventV1  = "deliverable_event_v1"
+	CapDeliverableEventV1 = "deliverable_event_v1"
+	// CapMentionRosterV1 tells Cloud the daemon (a) accepts
+	// MessagePayload.Participants and renders the conversation roster into
+	// sticky context as a "Conversation participants:" bulleted list the
+	// prompt's @-mention path resolves against, and (b) lets the agent emit
+	// inline `@<display name>` in reply text for Cloud-side resolution to a
+	// platform user identifier. Observability only — `participants` and the
+	// inline `@name` convention both rely on omitempty + ignore-on-decode for
+	// silent degradation across mismatched versions, but the token lets Cloud
+	// detect support without version sniffing (CLAUDE.md Wire Contract
+	// Discipline). The ReplyPayload.Mentions structured-disambiguation field
+	// is reserved for a future revision — daemon does not currently populate
+	// it.
+	CapMentionRosterV1 = "mention_roster_v1"
 )
 
 var Capabilities = []string{
@@ -145,6 +158,7 @@ var Capabilities = []string{
 	CapReplyDeliveryResultV1,
 	CapChannelStateEventV1,
 	CapDeliverableEventV1,
+	CapMentionRosterV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a

@@ -44,8 +44,8 @@ var agentName string
 
 var rootCmd = &cobra.Command{
 	Use:     "shan [query]",
-	Short:   "Shannon AI agent CLI",
-	Long:    "Interactive AI agent powered by Shannon. Local file/bash tools + remote research/swarm orchestration.",
+	Short:   "Kocoro AI agent CLI",
+	Long:    "Kocoro — interactive AI agent. Local file/bash tools + remote research/swarm orchestration.",
 	Version: Version,
 	Args:    cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -97,6 +97,12 @@ var rootCmd = &cobra.Command{
 		// Interactive mode
 		m := tui.New(cfg, Version, agentOverride)
 		m.SetBypassPermissions(dangerouslySkipPermissions)
+		// Route logs to a file so MCP/Chrome subsystem log.Printf calls during
+		// the session don't tear the Bubbletea alt-screen render (the garbled
+		// input-bar symptom). Restored to stderr when the TUI exits.
+		if restore, lerr := tui.RedirectLogs(config.ShannonDir()); lerr == nil {
+			defer restore()
+		}
 		p := tea.NewProgram(m)
 		m.SetProgram(p)
 		_, err = p.Run()

@@ -1,4 +1,4 @@
-# Kocoro (`shan`)
+# Kocoro (`kocoro` / `shan`)
 
 **An AI cowork agent that lives on your Mac.**
 
@@ -42,6 +42,8 @@ Built on **[Shannon](https://github.com/Kocoro-lab/Shannon)** — the open-sourc
 
 ## Installation
 
+> The CLI installs as two interchangeable commands — **`kocoro`** and **`shan`** (a built-in alias). Examples in this README use `shan`; `kocoro` works identically.
+
 **npm (recommended)** — auto-updates on every launch:
 
 ```bash
@@ -59,10 +61,11 @@ curl -fsSL https://raw.githubusercontent.com/Kocoro-lab/Kocoro/main/install.sh |
 ```bash
 git clone https://github.com/Kocoro-lab/Kocoro.git
 cd Kocoro
-go install .
+go build -o "$(go env GOPATH)/bin/shan" .
+ln -sf shan "$(go env GOPATH)/bin/kocoro"   # optional: kocoro alias, matching the npm/script installs
 ```
 
-`go install` places the binary in `$GOPATH/bin` (default `~/go/bin`). Add `export PATH="$HOME/go/bin:$PATH"` to your shell rc if it's not already on PATH.
+`go build -o` names the binary `shan` and drops it in `$GOPATH/bin` (default `~/go/bin`) — plain `go install .` would name it `ShanClaw` after the Go module path, so the `shan --help` check below wouldn't resolve. Add `export PATH="$HOME/go/bin:$PATH"` to your shell rc if it's not already on PATH.
 
 Verify with `shan --help`.
 

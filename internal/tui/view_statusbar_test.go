@@ -1,0 +1,42 @@
+package tui
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
+)
+
+// TestView_StateInput_StatusBarShowsAgentAndModel: in the input state the
+// bottom status bar must render the active agent and model tier. Reproduces
+// the report that the bar (and the agent on it) was missing.
+func TestView_StateInput_StatusBarShowsAgentAndModel(t *testing.T) {
+	m := &Model{
+		state:    stateInput,
+		width:    80,
+		height:   24,
+		viewport: viewport.New(80, 20),
+		cfg:      &config.Config{ModelTier: "medium"},
+	}
+	m.textarea = textarea.New()
+	m.textarea.SetWidth(78)
+	m.layoutViewport()
+
+	out := m.View()
+
+	if !strings.Contains(out, statusAgentMarker) {
+		t.Errorf("status bar should lead with the agent marker %q; View()=\n%q", statusAgentMarker, out)
+	}
+	if !strings.Contains(out, "default") {
+		t.Errorf("status bar must show active agent 'default'; View()=\n%q", out)
+	}
+	if !strings.Contains(out, "medium") {
+		t.Errorf("status bar must show model 'medium'; View()=\n%q", out)
+	}
+	if !strings.Contains(out, "commands") {
+		t.Errorf("status bar should keep a slash-command hint; View()=\n%q", out)
+	}
+}

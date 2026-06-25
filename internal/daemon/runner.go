@@ -84,6 +84,13 @@ type RunAgentRequest struct {
 	ForegroundHint  *ForegroundHint       `json:"foreground_hint,omitempty"`   // app the user was looking at when they summoned the quick panel; folded into StickyContext so screen-reading tools default to it
 	Files           []RemoteFile          `json:"-"`                           // remote file attachments from Cloud (WS only)
 
+	// Participants is the live conversation roster (display names) Cloud
+	// forwards from the inbound MessagePayload. Carried through to
+	// stickyFromRequest so the prompt's "Conversation participants:" line
+	// can list everyone the agent is allowed to @-mention. Empty for
+	// non-roster surfaces (TUI / one-shot / webview / 1:1 chats).
+	Participants []string `json:"-"`
+
 	// IM message lifecycle plumbing for the run's PRIMARY user message (first
 	// turn). Mid-run follow-ups carry their own copies on InjectedMessage.
 	// CloudMessageID is the Cloud envelope id; IMStatusContext is the opaque
@@ -727,6 +734,49 @@ func shouldEmitReplyBanner(source string) bool {
 		return false
 	}
 	return !isAutonomousLocalSource(source)
+}
+
+// promptSuggestionSources is the allow-list of request sources whose post-turn
+// prompt-suggestion fork has a UI consumer:
+//   - "desktop": Kocoro Desktop's foreground chat. The Desktop client's message
+//     bridge hardcodes "source":"desktop" on POST /message; Desktop renders the
+//     suggestion as an Island chip / suggestion_ready bus event. THIS is the
+//     value real Desktop traffic carries — do not drop it.
+//   - "kocoro":  the value the daemon's POST /message handler backfills when a
+//     caller omits Source entirely (bare curl, scripts). Kept so those
+//     foreground-equivalent callers still get suggestions.
+//   - "shanclaw": legacy alias for the Kocoro Desktop client, still accepted by
+//     the router for one release (mirrors cacheSourceFromDaemonSource). Old
+//     Desktop builds in the field may still emit it; without this entry they
+//     silently lose suggestions during the rolling upgrade. Removed in 7.4
+//     alongside the cache-source alias once Cloud confirms all clients emit
+//     "kocoro"/"desktop".
+//   - "web":     web front-end interactive sessions.
+//
+// Everything NOT in this set is skipped: cloud-routed IM channels (slack/
+// feishu/...) deliver over the WS path with no /suggestion consumer; scheduled
+// runs (schedule/cron) and autonomous local sources (heartbeat/watcher/mcp)
+// have no foreground client awaiting a suggestion. For all of those the fork is
+// dead work AND a real billed LLM call.
+//
+// An allow-list (not a deny-list) is deliberate: any source added later —
+// a new background trigger, a new channel — defaults to skipped, not silently
+// billed. Add a source here only once it has a confirmed suggestion consumer.
+//
+// (TUI / one-shot CLI never reach RunAgent — they run a bare AgentLoop with no
+// suggestion path — so they are out of scope for this gate.)
+var promptSuggestionSources = map[string]struct{}{
+	"desktop":  {},
+	"kocoro":   {},
+	"shanclaw": {},
+	"web":      {},
+}
+
+// wantsPromptSuggestion reports whether the post-turn prompt-suggestion fork
+// should run for the given request source. See promptSuggestionSources.
+func wantsPromptSuggestion(source string) bool {
+	_, ok := promptSuggestionSources[strings.ToLower(strings.TrimSpace(source))]
+	return ok
 }
 
 // markdownStripRE matches the small set of markdown markers that read poorly
@@ -2116,7 +2166,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			stickyExtra += strings.Join(pre, "\n")
 		}
 	}
-	if sticky := stickyFromRequest(req.Source, req.Channel, req.Sender, agentName, imBindings, stickyExtra, req.IMStatusContext, deps.ConnState); sticky != "" {
+	if sticky := stickyFromRequest(req.Source, req.Channel, req.Sender, agentName, imBindings, req.Participants, stickyExtra, req.IMStatusContext, deps.ConnState); sticky != "" {
 		loop.SetStickyContext(sticky)
 	}
 
@@ -2596,6 +2646,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 
 		// Post-turn prompt suggestion (fire-and-forget). Gated by all of:
+		//   - wantsPromptSuggestion(req.Source): only foreground sources with a
+		//     UI consumer (kocoro/web). IM channels, scheduled runs, and
+		//     autonomous local sources have none, so the fork would be dead work
+		//     AND a real billed LLM call — skip them entirely.
 		//   - agent.prompt_suggestion.enabled
 		//   - SuggestionState wired through deps (NewServer wires it; CLI
 		//     fixtures that build ServerDeps directly leave it nil — no-op)
@@ -2606,7 +2660,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// The captured request snapshot is the last successful main-turn
 		// dispatch (LastSentRequest); forking from it gives byte-equal
 		// prefix and warm-cache pricing on the suggestion call.
-		if saveErr == nil && deps.Suggestions != nil && cfg != nil && cfg.Agent.PromptSuggestion.Enabled {
+		if saveErr == nil && deps.Suggestions != nil && cfg != nil && cfg.Agent.PromptSuggestion.Enabled && wantsPromptSuggestion(req.Source) {
 			ps := cfg.Agent.PromptSuggestion
 			completedTurns := countAssistantTurns(sess.Messages)
 			// Judge cache warmth on the LAST main-turn LLM call, not the

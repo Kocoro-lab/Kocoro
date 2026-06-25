@@ -289,4 +289,11 @@ func TestE2E_LateRetract_ReportsAlreadyCommitted(t *testing.T) {
 	if status := deps.SessionCache.RetractInjectWithStatus(route, "local-late-1"); status != "already_committed" {
 		t.Fatalf("late retract status = %q, want already_committed", status)
 	}
+
+	// The desktop-source runs fire the async smart-title goroutine
+	// (fireTitleAfterRun) on context.Background(); it re-writes the session
+	// file after this body returns, racing t.TempDir's RemoveAll
+	// ("sessions: directory not empty", ~10% on CI). Join it before cleanup,
+	// mirroring e7e41d3's fix for TestRunAgent_PersistsSessionUsage.
+	waitForTitlePersisted(t, filepath.Join(deps.ShannonDir, "sessions", sid+".json"))
 }

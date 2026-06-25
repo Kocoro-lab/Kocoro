@@ -137,6 +137,15 @@ type MessagePayload struct {
 	CWD       string                `json:"cwd,omitempty"`    // project path override from Cloud/Desktop
 	Files     []RemoteFile          `json:"files,omitempty"`  // file attachments from messaging platforms
 
+	// Participants is the live conversation roster (display names) Cloud
+	// fetched from the platform — Bot Framework /pagedmembers for Teams,
+	// channels.members for Slack, etc. Empty when the surface has no roster
+	// (1:1 chats, webview, tui). The daemon renders this into the sticky
+	// context line "Conversation participants:" so the agent knows the full
+	// set of names it is allowed to @-mention. Mirrors shannon-cloud's same
+	// field; keep the json tag byte-identical.
+	Participants []string `json:"participants,omitempty"`
+
 	// IMStatusContext is an opaque blob produced by Cloud that identifies the
 	// inbound message on its IM platform. Daemon NEVER decodes this — it is
 	// stored on route state and echoed verbatim inside MESSAGE_LIFECYCLE events
@@ -183,6 +192,30 @@ type ReplyPayload struct {
 	ThreadID string `json:"thread_id"`
 	Text     string `json:"text"`
 	Format   string `json:"format,omitempty"`
+	// Mentions is an optional disambiguation anchor list for outbound @mentions
+	// on platforms that require a user identifier (Teams, Slack, ...). When the
+	// agent embeds "@name" in Text but the channel roster has duplicate display
+	// names, Mentions would pin which person each "@name" refers to (by
+	// Email/UPN). Mirrors shannon-cloud ReplyPayload.Mentions byte-for-byte.
+	//
+	// RESERVED — daemon does not currently populate this field. The agent emits
+	// `@<display name>` as free text and SendReply (client.go) constructs the
+	// payload without a Mentions value, so duplicate-display-name disambiguation
+	// is Cloud-side-only today (resolves unambiguously by name or degrades to
+	// plain text). The wire field is in place so a future revision can add a
+	// producer (e.g. parsing a `@[name](mailto:upn)` markdown-link syntax in
+	// the agent's final text) without a second contract change.
+	Mentions []Mention `json:"mentions,omitempty"`
+}
+
+// Mention is a disambiguation anchor for outbound @mentions on platforms that
+// require a user identifier (Teams, Slack, ...). Name is the display name the
+// agent wrote inline; Email is the optional UPN/email the agent has seen in
+// the conversation, used to resolve duplicates. Mirrors shannon-cloud
+// Mention byte-for-byte.
+type Mention struct {
+	Name  string `json:"name"`
+	Email string `json:"email,omitempty"`
 }
 
 // ReplyDeliveryResultPayload mirrors the Cloud-side struct; the envelope's

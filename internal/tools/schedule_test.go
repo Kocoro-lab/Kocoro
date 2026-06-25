@@ -559,13 +559,16 @@ func TestScheduleTool_Show_MissingSessionFile(t *testing.T) {
 	id, _ := mgr.Create("tracker", "0 9 * * *", "p", false)
 	mgr.MarkLastRun(id, "sess-vanished", time.Now(), 0, 4)
 
+	// A deleted last-run session is not an error: SummarizeLastRun degrades to
+	// the never-ran shape (empty SessionID), so the tool reports "has not run
+	// yet" rather than failing.
 	tool := &ScheduleTool{manager: mgr, action: "show", shannonDir: shan}
 	res, _ := tool.Run(context.Background(), `{"id":"`+id+`","description":"test"}`)
-	if !res.IsError {
-		t.Errorf("missing session should set IsError, got %+v", res)
+	if res.IsError {
+		t.Errorf("missing session should not set IsError, got %+v", res)
 	}
-	if !strings.Contains(res.Content, "session") {
-		t.Errorf("error should mention session, got %q", res.Content)
+	if !strings.Contains(res.Content, "has not run yet") {
+		t.Errorf("should report the schedule has not run yet, got %q", res.Content)
 	}
 }
 

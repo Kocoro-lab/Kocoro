@@ -507,6 +507,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /schedules/{id}", s.handlePatchSchedule)
 	mux.HandleFunc("DELETE /schedules/{id}", s.handleDeleteSchedule)
 	mux.HandleFunc("GET /uploads", s.handleListUploads)
+	mux.HandleFunc("POST /uploads", s.handleCreateUpload)
 	mux.HandleFunc("DELETE /uploads/{id}", s.handleDeleteUpload)
 	mux.HandleFunc("GET /config", s.handleGetConfig)
 	mux.HandleFunc("GET /config/status", s.handleConfigStatus)
@@ -3684,18 +3685,20 @@ func (s *Server) handleMarketplaceInstall(w http.ResponseWriter, r *http.Request
 }
 
 // uploadSkillMaxBodyBytes caps the entire multipart request body. The actual
-// 50 MB ZIP limit lives in skills.maxZipCompressedBytes; the extra ~2 MB here
-// is headroom for multipart boundaries / form-field overhead so a 50 MB ZIP
-// isn't rejected at the HTTP layer before reaching skills.InstallFromZipData
-// (which performs the authoritative size check and returns ErrZipTooLarge).
-const uploadSkillMaxBodyBytes int64 = 52 * 1024 * 1024
+// ZIP size backstop lives in skills.maxZipCompressedBytes; the extra ~16 MB
+// here is headroom for multipart boundaries / form-field overhead so a
+// max-size ZIP isn't rejected at the HTTP layer before reaching
+// skills.InstallFromZipData (which performs the authoritative size check and
+// returns ErrZipTooLarge).
+const uploadSkillMaxBodyBytes int64 = 1*1024*1024*1024 + 16*1024*1024
 
 // uploadSkillInMemoryBytes is the multipart in-memory threshold; anything over
 // this spills the form to a tempfile via mime/multipart. Note this only bounds
 // multipart parser scratch — InstallFromZipData reads the file part fully into
-// memory (io.ReadAll under the 50 MB zip cap) for extraction, so each in-flight
+// memory (io.ReadAll under the 1 GiB zip cap) for extraction, so each in-flight
 // upload of a different slug still costs roughly the compressed payload size
-// in RAM. Concurrent uploads of the same slug are serialized by s.slugLocks.
+// in RAM (worst case ~1 GiB each — the cap is a backstop, not a small ceiling).
+// Concurrent uploads of the same slug are serialized by s.slugLocks.
 const uploadSkillInMemoryBytes int64 = 1 << 20 // 1 MB
 
 func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
@@ -3707,7 +3710,7 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			s.auditHTTPOpError("POST", "/skills/upload", "request body too large", err)
-			writeError(w, http.StatusRequestEntityTooLarge, "zip too large (maximum 50 MB)")
+			writeError(w, http.StatusRequestEntityTooLarge, "zip too large: archive or extracted contents exceed the size backstop (1 GiB)")
 			return
 		}
 		s.auditHTTPOpError("POST", "/skills/upload", "invalid multipart form", err)
@@ -3745,7 +3748,7 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "skill_is_builtin")
 	case errors.Is(err, skills.ErrZipTooLarge):
 		s.auditHTTPOpError("POST", "/skills/upload", "zip too large", err)
-		writeError(w, http.StatusRequestEntityTooLarge, "zip too large (maximum 50 MB)")
+		writeError(w, http.StatusRequestEntityTooLarge, "zip too large: archive or extracted contents exceed the size backstop (1 GiB)")
 	case errors.Is(err, skills.ErrInvalidSkillPayload):
 		s.auditHTTPOpError("POST", "/skills/upload", "invalid payload", err)
 		writeError(w, http.StatusUnprocessableEntity, err.Error())

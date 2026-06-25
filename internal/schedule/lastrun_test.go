@@ -205,19 +205,57 @@ func TestSummarizeLastRun_NeverRun_TurnsIsEmptyArrayNotNull(t *testing.T) {
 	}
 }
 
-func TestSummarizeLastRun_MissingFileGracefulError(t *testing.T) {
+func TestSummarizeLastRun_MissingFileTreatedAsNoRun(t *testing.T) {
 	shan := t.TempDir()
+	ranAt := time.Now()
 	sched := Schedule{
 		ID:                       "x",
 		Agent:                    "explorer",
 		LastRunSessionID:         "sess-gone",
+		LastRunAt:                &ranAt,
+		LastRunMessageStartIndex: 0,
+		LastRunMessageEndIndex:   2,
+	}
+
+	// A deleted last-run session must not error: it degrades to the exact same
+	// empty shape as a schedule that has never run (no id, no timestamp, no
+	// turns), so clients render a neutral state.
+	out, err := SummarizeLastRun(sched, shan, 5)
+	if err != nil {
+		t.Fatalf("missing session file should not error, got %v", err)
+	}
+	if out.SessionID != "" {
+		t.Errorf("SessionID should be cleared when the session is gone, got %q", out.SessionID)
+	}
+	if out.LastRunAt != nil {
+		t.Errorf("LastRunAt should be cleared when the session is gone, got %v", out.LastRunAt)
+	}
+	if len(out.Turns) != 0 {
+		t.Errorf("Turns should be empty, got %d", len(out.Turns))
+	}
+}
+
+// A genuine (non-IsNotExist) read error must still propagate — only the
+// "file missing" case degrades to no-run. We provoke a portable read error by
+// putting a directory where the session file is expected (os.ReadFile then
+// fails with EISDIR, which is not IsNotExist).
+func TestSummarizeLastRun_ReadErrorPropagates(t *testing.T) {
+	shan := t.TempDir()
+	sessDir := filepath.Join(shan, "agents", "explorer", "sessions")
+	if err := os.MkdirAll(filepath.Join(sessDir, "sess-dir.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sched := Schedule{
+		ID:                       "x",
+		Agent:                    "explorer",
+		LastRunSessionID:         "sess-dir",
 		LastRunMessageStartIndex: 0,
 		LastRunMessageEndIndex:   2,
 	}
 
 	_, err := SummarizeLastRun(sched, shan, 5)
 	if err == nil {
-		t.Fatal("missing session file should error")
+		t.Fatal("a non-IsNotExist read error must propagate, got nil")
 	}
 	if !strings.Contains(err.Error(), "session file") {
 		t.Errorf("error should mention session file, got %v", err)
