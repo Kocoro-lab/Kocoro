@@ -183,23 +183,34 @@ func (c *MarketplaceClient) SetRetryPolicy(maxAttempts int, base time.Duration) 
 // empty or past TTL. See the type doc for stale-on-error semantics.
 func (c *MarketplaceClient) Load(ctx context.Context) (*RegistryIndex, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	// Fresh cache → return immediately.
 	if c.cache != nil && time.Since(c.fetched) < c.ttl {
 		c.stale = false
-		return c.cache, nil
+		cached := c.cache
+		c.mu.Unlock()
+		return cached, nil
 	}
-
 	// Stale-mode cooldown in effect → keep serving stale without
 	// re-attempting the upstream fetch. Prevents retry storms during
 	// registry outages.
 	if c.cache != nil && !c.retryAfter.IsZero() && time.Now().Before(c.retryAfter) {
 		c.stale = true
-		return c.cache, nil
+		cached := c.cache
+		c.mu.Unlock()
+		return cached, nil
 	}
+	c.mu.Unlock()
 
+	// Fetch WITHOUT holding c.mu: the fetch now retries with backoff sleeps
+	// (up to tens of seconds during an outage), and holding the lock across it
+	// would serialize every concurrent Load()/IsStale() caller for that whole
+	// window. The cost is that a cold-cache stampede may run a few fetches in
+	// parallel; the staleCooldown set on the first failure quickly suppresses
+	// further ones, and jittered backoff spreads the load.
 	idx, err := c.fetch(ctx)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if err != nil {
 		if c.cache != nil {
 			c.stale = true
@@ -208,7 +219,6 @@ func (c *MarketplaceClient) Load(ctx context.Context) (*RegistryIndex, error) {
 		}
 		return nil, err
 	}
-
 	c.cache = idx
 	c.fetched = time.Now()
 	c.stale = false
@@ -635,11 +645,18 @@ func gitCloneWithRetry(ctx context.Context, entry MarketplaceEntry, tmpRoot stri
 // the in-flight download. marketplaceDownloadClient provides a 2-minute
 // safety ceiling when ctx has no deadline.
 func installFromZip(ctx context.Context, entry MarketplaceEntry, stageDir string) error {
-	// Retry transient upstream failures (503/5xx/429 + network) before the
-	// request body is consumed. A mid-stream read failure during extraction is
-	// not retried (rare, and the body is already partially drained) — it
-	// surfaces as ErrMarketplaceUpstreamFailure and the user can reinstall.
-	resp, err := doGETWithRetry(ctx, marketplaceDownloadClient, entry.DownloadURL, defaultMarketplaceMaxAttempts, defaultMarketplaceRetryBase)
+	// Single attempt (no doGETWithRetry): the zip download uses the 2-minute
+	// marketplaceDownloadClient, so multiplying it by retries would let a
+	// hanging upstream stall a user's Install for many minutes — and the
+	// per-request retry policy isn't reachable here anyway. Transient
+	// resilience already covers the catalog GETs (incl. install's slug
+	// resolution); a failed download surfaces as ErrMarketplaceUpstreamFailure
+	// (→502) and the user can reinstall.
+	req, err := http.NewRequestWithContext(ctx, "GET", entry.DownloadURL, nil)
+	if err != nil {
+		return fmt.Errorf("%w: build download request: %v", ErrMarketplaceUpstreamFailure, err)
+	}
+	resp, err := marketplaceDownloadClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("%w: download: %v", ErrMarketplaceUpstreamFailure, err)
 	}
@@ -1021,7 +1038,7 @@ func FilterSortPaginate(entries []MarketplaceEntry, query, sortKey string, page,
 }
 
 func (c *MarketplaceClient) fetch(ctx context.Context) (*RegistryIndex, error) {
-	resp, err := doGETWithRetry(ctx, c.http, c.url, c.maxAttempts, c.retryBase)
+	resp, err := doGETWithRetry(ctx, c.http, c.url, c.maxAttempts, c.retryBase, marketplaceCatalogRetryBudget)
 	if err != nil {
 		return nil, fmt.Errorf("fetch registry: %w", err)
 	}
@@ -1399,7 +1416,7 @@ func (c *MarketplaceClient) FetchClawHubFile(ctx context.Context, slug, version,
 // getText performs a GET and returns the raw response body as a string. Used for
 // file content (ClawHub caps single files at 200KB); 1 MB ceiling as a guard.
 func (c *MarketplaceClient) getText(ctx context.Context, rawURL string) (string, error) {
-	resp, err := doGETWithRetry(ctx, c.http, rawURL, c.maxAttempts, c.retryBase)
+	resp, err := doGETWithRetry(ctx, c.http, rawURL, c.maxAttempts, c.retryBase, marketplaceCatalogRetryBudget)
 	if err != nil {
 		return "", fmt.Errorf("fetch clawhub: %w", err)
 	}
@@ -1417,7 +1434,7 @@ func (c *MarketplaceClient) getText(ctx context.Context, rawURL string) (string,
 // getJSON performs a GET and decodes the JSON body into v, sharing the HTTP
 // client, body cap, and error wrapping with the registry fetch path.
 func (c *MarketplaceClient) getJSON(ctx context.Context, rawURL string, v any) error {
-	resp, err := doGETWithRetry(ctx, c.http, rawURL, c.maxAttempts, c.retryBase)
+	resp, err := doGETWithRetry(ctx, c.http, rawURL, c.maxAttempts, c.retryBase, marketplaceCatalogRetryBudget)
 	if err != nil {
 		return fmt.Errorf("fetch clawhub: %w", err)
 	}

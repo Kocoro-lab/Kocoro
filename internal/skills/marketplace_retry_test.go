@@ -59,7 +59,7 @@ func TestDoGETWithRetry_RetriesThenSucceeds(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	resp, err := doGETWithRetry(context.Background(), http.DefaultClient, ts.URL, 3, fastBase)
+	resp, err := doGETWithRetry(context.Background(), http.DefaultClient, ts.URL, 3, fastBase, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestDoGETWithRetry_ExhaustedReturnsLastResponse(t *testing.T) {
 
 	// On exhaustion the helper returns the final (still-503) response so the
 	// caller can produce its own "status %d" error — it does NOT swallow it.
-	resp, err := doGETWithRetry(context.Background(), http.DefaultClient, ts.URL, 3, fastBase)
+	resp, err := doGETWithRetry(context.Background(), http.DefaultClient, ts.URL, 3, fastBase, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestDoGETWithRetry_NoRetryOn404(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	resp, err := doGETWithRetry(context.Background(), http.DefaultClient, ts.URL, 3, fastBase)
+	resp, err := doGETWithRetry(context.Background(), http.DefaultClient, ts.URL, 3, fastBase, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -124,8 +124,32 @@ func TestDoGETWithRetry_ContextCancelStopsRetry(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled
-	if _, err := doGETWithRetry(ctx, http.DefaultClient, ts.URL, 5, time.Second); err == nil {
+	if _, err := doGETWithRetry(ctx, http.DefaultClient, ts.URL, 5, time.Second, 0); err == nil {
 		t.Fatal("expected error from cancelled context")
+	}
+}
+
+func TestDoGETWithRetry_BudgetBoundsTotal(t *testing.T) {
+	var hits int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		time.Sleep(100 * time.Millisecond) // slower than the budget below
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	// 20 attempts would run for seconds without a budget; a 50ms budget must
+	// abort the whole call (here mid first request) well before that.
+	start := time.Now()
+	_, err := doGETWithRetry(context.Background(), http.DefaultClient, ts.URL, 20, fastBase, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected error when budget is exceeded")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("budget not enforced: call took %v", elapsed)
+	}
+	if got := atomic.LoadInt32(&hits); got >= 20 {
+		t.Fatalf("budget should have cut retries short, but got %d attempts", got)
 	}
 }
 

@@ -204,10 +204,21 @@ func resolveRegistryURL(deps *ServerDeps) string {
 // retry policy (skills.marketplace.max_attempts / .retry_base_backoff_secs)
 // into a catalog client. Non-positive values leave the client's defaults.
 func applyMarketplaceRetryPolicy(c *skills.MarketplaceClient) *skills.MarketplaceClient {
-	c.SetRetryPolicy(
-		viper.GetInt("skills.marketplace.max_attempts"),
-		time.Duration(viper.GetInt("skills.marketplace.retry_base_backoff_secs"))*time.Second,
-	)
+	// Clamp to sane ranges so an absurd config value can't overflow
+	// time.Duration or produce a pathological attempt count; the per-sleep cap
+	// (marketplaceRetryMaxDelay) still bounds actual backoff.
+	attempts := viper.GetInt("skills.marketplace.max_attempts")
+	if attempts > 100 {
+		attempts = 100
+	}
+	baseSecs := viper.GetInt("skills.marketplace.retry_base_backoff_secs")
+	if baseSecs > 60 {
+		baseSecs = 60
+	}
+	if baseSecs < 0 {
+		baseSecs = 0
+	}
+	c.SetRetryPolicy(attempts, time.Duration(baseSecs)*time.Second)
 	return c
 }
 

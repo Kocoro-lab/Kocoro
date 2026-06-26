@@ -22,10 +22,20 @@ import (
 const (
 	defaultMarketplaceMaxAttempts = 3
 	defaultMarketplaceRetryBase   = 1 * time.Second
-	// marketplaceRetryMaxDelay caps a single backoff sleep so a hostile or
-	// huge Retry-After can't stall a request indefinitely; the ctx-aware
-	// sleep still aborts earlier if the caller's deadline fires.
+	// marketplaceRetryMaxDelay caps a single backoff sleep. This is a hard
+	// safety ceiling (overflow / hostile-or-huge Retry-After guard), NOT a
+	// workload cap an operator tunes — backoff *shape* is tuned via
+	// retry_base_backoff_secs; this only bounds one sleep. A server Retry-After
+	// above 30s is re-honored on the next attempt anyway, so clamping here is
+	// harmless. Deliberately a const, not a viper knob.
 	marketplaceRetryMaxDelay = 30 * time.Second
+	// marketplaceCatalogRetryBudget bounds the TOTAL wall-clock of a catalog
+	// GET across all attempts (incl. backoff), so a hard outage where every
+	// attempt hangs to the 15s client timeout fails in ~one extra attempt's
+	// time rather than maxAttempts × 15s. Fast transient 503s (the common case)
+	// retry well within it. Applied only when the caller's ctx has no shorter
+	// deadline.
+	marketplaceCatalogRetryBudget = 30 * time.Second
 )
 
 // isRetryableStatus reports whether an HTTP status is a transient upstream
@@ -95,22 +105,38 @@ func drainClose(resp *http.Response) {
 
 // doGETWithRetry issues GET rawURL on hc, retrying transient failures (network
 // errors on the idempotent GET, plus 429/5xx) with exponential backoff + jitter,
-// up to maxAttempts. It returns the response for the caller to status-check and
-// read — including a final still-failing retryable status (e.g. 503), so the
-// caller's own "status %d" error wrapping (and the daemon's 404-vs-503 split)
-// is preserved. Retried responses are drained+closed internally. The backoff
-// sleep is ctx-aware, so retries never exceed the caller's deadline.
-func doGETWithRetry(ctx context.Context, hc *http.Client, rawURL string, maxAttempts int, base time.Duration) (*http.Response, error) {
+// up to maxAttempts and within an overall `budget` (0 = no budget). It returns
+// the response for the caller to status-check and read — including a final
+// still-failing retryable status (e.g. 503), so the caller's own "status %d"
+// error wrapping (and the daemon's 404-vs-503 split) is preserved. Retried
+// responses are drained+closed internally. The backoff sleep is ctx-aware, so
+// retries never exceed the caller's deadline (or the budget).
+//
+// This is deliberately NOT built on the generic uploads.doWithRetry[T] /
+// images.doWithRetry: those return an ErrTransient sentinel, whereas this must
+// hand back the raw *http.Response so each caller preserves the upstream status
+// code that the daemon greps to map 404 vs 503. Keep that contract if
+// consolidating.
+func doGETWithRetry(ctx context.Context, hc *http.Client, rawURL string, maxAttempts int, base time.Duration, budget time.Duration) (*http.Response, error) {
 	if maxAttempts < 1 {
 		maxAttempts = 1
+	}
+	if budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
 	}
 	var retryAfter time.Duration
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
+			// time.NewTimer (+Stop) rather than time.After so a ctx-cancel
+			// during the sleep doesn't leak a pending timer until it fires.
+			timer := time.NewTimer(retryDelay(attempt-1, base, retryAfter))
 			select {
-			case <-time.After(retryDelay(attempt-1, base, retryAfter)):
+			case <-timer.C:
 			case <-ctx.Done():
+				timer.Stop()
 				return nil, ctx.Err()
 			}
 			retryAfter = 0
@@ -124,7 +150,7 @@ func doGETWithRetry(ctx context.Context, hc *http.Client, rawURL string, maxAtte
 		if err != nil {
 			lastErr = err
 			// Any transport error on an idempotent GET is retryable unless the
-			// caller's ctx is what cancelled it (don't fight a cancel/deadline).
+			// caller's ctx (or the budget) is what cancelled it.
 			if attempt < maxAttempts && ctx.Err() == nil {
 				continue
 			}
