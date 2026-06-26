@@ -1227,7 +1227,7 @@ func AppendAllowedCommand(shannonDir, pattern string) error {
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return fmt.Errorf("flock: %w", err)
+		return fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
@@ -1300,7 +1300,7 @@ func AppendGlobalAlwaysAllowTool(shannonDir, tool string) error {
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return fmt.Errorf("flock: %w", err)
+		return fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
@@ -1367,7 +1367,7 @@ func RemoveGlobalAlwaysAllowTool(shannonDir, tool string) error {
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return fmt.Errorf("flock: %w", err)
+		return fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
@@ -1460,10 +1460,10 @@ func AppendGlobalDisabledSkills(shannonDir string, skills []string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -1555,10 +1555,10 @@ func RemoveGlobalDisabledSkills(shannonDir string, skills []string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -1631,10 +1631,10 @@ func AppendDefaultAgentDisabledMCPServer(shannonDir, server string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -1696,10 +1696,10 @@ func RemoveDefaultAgentDisabledMCPServer(shannonDir, server string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
