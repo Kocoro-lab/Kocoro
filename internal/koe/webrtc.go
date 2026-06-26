@@ -60,6 +60,11 @@ type RealtimeConn struct {
 	sendTrack *webrtc.TrackLocalStaticSample
 	dc        *webrtc.DataChannel
 	audio     *AudioIO
+	// callActive (nil-safe) gates mic capture: when set and it returns false, the
+	// send pump drops mic audio so Koe is NOT listening (Desktop press-to-talk —
+	// a call must be started via the control channel). nil = always send (the
+	// standalone CLI / E2E always-listen behaviour).
+	callActive func() bool
 }
 
 // newPeerConnection builds the pion PC with a send track + recvonly transceiver +
@@ -149,6 +154,12 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case frame := <-rc.audio.Frames():
+			// Press-to-talk gate: while no call is active, drop captured mic audio so
+			// OpenAI never hears the room (Koe stays idle). Drain the frame either way
+			// to keep the capture pipeline from backing up.
+			if rc.callActive != nil && !rc.callActive() {
+				continue
+			}
 			enc, err := rc.audio.EncodeFrame(frame)
 			if err != nil {
 				continue
@@ -175,6 +186,11 @@ type ConnectOptions struct {
 	OnVoiceState func(string)          // G2: Desktop control channel voice state (listening/thinking/speaking)
 	Model        string                // G3: realtime model id stamped into usage reports
 	OnUsage      func(json.RawMessage) // G3: per-turn usage relay (→ daemon → Cloud)
+	// CallActive (nil-safe) gates mic capture for Desktop press-to-talk: when set
+	// and it returns false, the send pump drops mic audio (Koe is idle, not
+	// listening) until the double-tap (or the menu / settings-configured trigger)
+	// starts a call. nil = always send (standalone CLI / E2E always-listen).
+	CallActive func() bool
 }
 
 // Connect builds the peer connection, dials OpenAI, configures the session, and
@@ -192,6 +208,7 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	h.onVoiceState = opts.OnVoiceState
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
+	rc.callActive = opts.CallActive
 	// configured closes when OpenAI acks our session.update. The send pump waits
 	// on it: if mic audio reaches the server before the tools/voice config lands,
 	// the VAD-triggered auto response snapshots the default config (no tools) and

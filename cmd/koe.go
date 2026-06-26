@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -106,8 +107,21 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	// port = standalone CLI (no control channel).
 	var onVoiceState func(string)
 	var controlApp koe.ControlAppFunc
+	// callGate is the Desktop press-to-talk switch: mic stays muted until a call is
+	// started (double-tap ⌥ / menu / the settings-configured trigger). callActive
+	// stays nil in standalone/E2E mode → always-listen.
+	var callGate atomic.Bool
+	var callActive func() bool
 	if cfg.controlPort != "" {
-		ctrl := koe.NewControlServer(nil, nil)
+		callActive = callGate.Load
+		var ctrl *koe.ControlServer
+		ctrl = koe.NewControlServer(
+			// onStart: a call began (POST /call/start from the double-tap, menu, or
+			// configured trigger) — open the mic gate + show the listening sprite.
+			func() { callGate.Store(true); ctrl.EmitVoiceState("listening") },
+			// onEnd: the call ended — mute the mic + clear the sprite/popup.
+			func() { callGate.Store(false); ctrl.EmitVoiceState("idle") },
+		)
 		onVoiceState = ctrl.EmitVoiceState
 		controlApp = func(_ context.Context, action string) error {
 			ctrl.EmitControlApp(action)
@@ -174,6 +188,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		OnVoiceState: onVoiceState,
 		Model:        cfg.model,
 		OnUsage:      onUsage,
+		CallActive:   callActive,
 	})
 	if err != nil {
 		return fmt.Errorf("connect: %v", err)
