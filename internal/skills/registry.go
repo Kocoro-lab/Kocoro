@@ -72,6 +72,11 @@ type SkillMeta struct {
 	Hidden            bool         `json:"hidden,omitempty"`
 	RequiredSecrets   []SecretSpec `json:"required_secrets,omitempty"`
 	ConfiguredSecrets []string     `json:"configured_secrets,omitempty"`
+	// DefaultAgentDisabled is set by handleListSkills (not ToMeta) when the skill
+	// appears in config.skills.disabled — i.e. the DEFAULT agent will not load it.
+	// Named agents are unaffected (they select skills via _attached.yaml). Lets
+	// the Desktop default-agent UI seed its enable/disable toggles.
+	DefaultAgentDisabled bool `json:"default_agent_disabled,omitempty"`
 }
 
 // ToMeta returns API-safe metadata without the full prompt body.

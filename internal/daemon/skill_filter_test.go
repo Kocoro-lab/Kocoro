@@ -137,3 +137,96 @@ func TestDesktopOnlySkillsCoverage_Drift(t *testing.T) {
 		}
 	}
 }
+
+// makeDenylistTestSkills mirrors makeTestSkills but includes a Name!=Slug entry
+// so the denylist's match-Name-or-Slug contract is exercised.
+func makeDenylistTestSkills() []*skills.Skill {
+	return []*skills.Skill{
+		{Name: "pdf-reader", Slug: "pdf-reader", Description: "read pdfs"},
+		{Name: "Security Review", Slug: "security-review", Description: "audit code"},
+		{Name: "file-tools", Slug: "file-tools", Description: "file helpers"},
+	}
+}
+
+// TestApplyDefaultAgentSkillDenylist_DefaultRemovesNamedSurvives is the
+// load-bearing test for the default-agent skill denylist: a disabled skill must
+// vanish from the DEFAULT agent's set while the SAME denylist leaves a NAMED
+// agent untouched. Named agents select skills via their _attached.yaml allowlist
+// (opposite semantics) — applying the default-agent denylist to them would
+// silently strip skills the user explicitly attached.
+func TestApplyDefaultAgentSkillDenylist_DefaultRemovesNamedSurvives(t *testing.T) {
+	disabled := []string{"file-tools"}
+
+	// Default agent (isDefaultAgent == true): file-tools must be gone.
+	outDefault := applyDefaultAgentSkillDenylist(makeTestSkills(), disabled, true)
+	if len(outDefault) != 2 {
+		t.Fatalf("default agent: got %d skills, want 2", len(outDefault))
+	}
+	for _, s := range outDefault {
+		if s.Name == "file-tools" {
+			t.Fatalf("default agent: disabled skill file-tools leaked through")
+		}
+	}
+
+	// Named agent (isDefaultAgent == false): the same denylist must NOT apply.
+	inNamed := makeTestSkills()
+	outNamed := applyDefaultAgentSkillDenylist(inNamed, disabled, false)
+	if len(outNamed) != len(inNamed) {
+		t.Fatalf("named agent: denylist narrowed skills (got %d, want %d)", len(outNamed), len(inNamed))
+	}
+	survived := false
+	for _, s := range outNamed {
+		if s.Name == "file-tools" {
+			survived = true
+		}
+	}
+	if !survived {
+		t.Fatalf("named agent: file-tools wrongly removed by default-agent denylist")
+	}
+}
+
+// TestApplyDefaultAgentSkillDenylist_EmptyListPassThrough locks back-compat: a
+// config with no skills.disabled field (nil/empty) leaves the default agent's
+// full set intact — existing installs keep loading every skill.
+func TestApplyDefaultAgentSkillDenylist_EmptyListPassThrough(t *testing.T) {
+	for _, disabled := range [][]string{nil, {}} {
+		out := applyDefaultAgentSkillDenylist(makeTestSkills(), disabled, true)
+		if len(out) != 3 {
+			t.Fatalf("disabled=%v: got %d skills, want 3 (empty denylist = full set)", disabled, len(out))
+		}
+	}
+}
+
+// TestApplyDefaultAgentSkillDenylist_MatchesNameOrSlug verifies a skill is
+// dropped whether the user disabled it by Name or by Slug — handleListSkills
+// surfaces both identifiers and Desktop may persist either.
+func TestApplyDefaultAgentSkillDenylist_MatchesNameOrSlug(t *testing.T) {
+	// Disable by Slug "security-review" — the entry whose Name is "Security Review".
+	out := applyDefaultAgentSkillDenylist(makeDenylistTestSkills(), []string{"security-review"}, true)
+	for _, s := range out {
+		if s.Slug == "security-review" {
+			t.Fatalf("skill disabled by slug leaked through (Name=%q)", s.Name)
+		}
+	}
+	if len(out) != 2 {
+		t.Fatalf("got %d skills, want 2", len(out))
+	}
+}
+
+// TestApplyDefaultAgentSkillDenylist_DoesNotMutateInput guards against an
+// in-place filter that would leak the narrowed view (loadedSkills is shared
+// across concurrent sessions — same rationale as filterSkillsForSource).
+func TestApplyDefaultAgentSkillDenylist_DoesNotMutateInput(t *testing.T) {
+	in := makeTestSkills()
+	snapshot := make([]*skills.Skill, len(in))
+	copy(snapshot, in)
+	_ = applyDefaultAgentSkillDenylist(in, []string{"file-tools"}, true)
+	if len(in) != len(snapshot) {
+		t.Fatalf("input length changed: got %d, want %d", len(in), len(snapshot))
+	}
+	for i := range snapshot {
+		if in[i] != snapshot[i] {
+			t.Fatalf("input element %d identity changed", i)
+		}
+	}
+}

@@ -480,6 +480,39 @@ func LoadGlobalSkills(shannonDir string) ([]*skills.Skill, error) {
 	)
 }
 
+// FilterDisabledSkills returns a new slice with skills whose Name or Slug is in
+// the disabled list removed. This is the DEFAULT agent's skill denylist
+// (config.skills.disabled) — every default-agent code path (daemon, one-shot
+// CLI, TUI) calls this after LoadGlobalSkills so a disabled skill is uniformly
+// hidden, since all three share ~/.shannon/config.yaml. Named agents select
+// skills via their _attached.yaml allowlist and must NOT be passed through here.
+//
+// Empty/nil disabled → input returned unchanged (back-compat: installs with no
+// skills.disabled field keep loading every skill). The input slice is not
+// mutated (it may be shared across concurrent sessions).
+func FilterDisabledSkills(loaded []*skills.Skill, disabled []string) []*skills.Skill {
+	if len(disabled) == 0 {
+		return loaded
+	}
+	deny := make(map[string]struct{}, len(disabled))
+	for _, d := range disabled {
+		deny[d] = struct{}{}
+	}
+	out := make([]*skills.Skill, 0, len(loaded))
+	for _, s := range loaded {
+		if _, blocked := deny[s.Name]; blocked {
+			continue
+		}
+		if s.Slug != "" {
+			if _, blocked := deny[s.Slug]; blocked {
+				continue
+			}
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
 // AgentEntry represents an agent in the listing with source metadata.
 type AgentEntry struct {
 	Name        string `json:"name"`

@@ -483,6 +483,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /skills/clawhub/entry/{slug}/files", s.handleClawHubFiles)
 	mux.HandleFunc("GET /skills/clawhub/entry/{slug}/file", s.handleClawHubFile)
 	mux.HandleFunc("POST /skills/clawhub/install/{slug}", s.handleClawHubInstall)
+	mux.HandleFunc("POST /skills/disabled", s.handleAddGlobalDisabledSkill)
+	mux.HandleFunc("DELETE /skills/disabled", s.handleRemoveGlobalDisabledSkill)
 	mux.HandleFunc("GET /skills", s.handleListSkills)
 	mux.HandleFunc("GET /skills/{name}", s.handleGetSkill)
 	mux.HandleFunc("PUT /skills/{name}", s.handlePutGlobalSkill)
@@ -513,6 +515,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /config/status", s.handleConfigStatus)
 	mux.HandleFunc("PATCH /config", s.handlePatchConfig)
 	mux.HandleFunc("POST /config/reload", s.handleConfigReload)
+	mux.HandleFunc("POST /mcp/default-disabled", s.handleAddDefaultAgentDisabledMCP)
+	mux.HandleFunc("DELETE /mcp/default-disabled", s.handleRemoveDefaultAgentDisabledMCP)
 	mux.HandleFunc("GET /instructions", s.handleGetInstructions)
 	mux.HandleFunc("PUT /instructions", s.handlePutInstructions)
 	mux.HandleFunc("GET /rules", s.handleListRules)
@@ -3400,6 +3404,194 @@ func (s *Server) handleRemoveGlobalAlwaysAllow(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
 
+// skillDisabledRequest is the body for POST/DELETE /skills/disabled. Accepts a
+// single skill, a batch (skills), and/or a prefix (expanded against installed
+// skills by Name or Slug). The batch/prefix forms exist so an agent disabling a
+// large family (e.g. longbridge-*) does it in ONE call — the one-per-skill path
+// caused a 126-call http spin that bloated context and tripped the loop detector.
+type skillDisabledRequest struct {
+	Skill  string   `json:"skill,omitempty"`
+	Skills []string `json:"skills,omitempty"`
+	Prefix string   `json:"prefix,omitempty"`
+}
+
+// resolveSkillTargets collects the skill names a request targets: explicit
+// Skill, batch Skills, and/or Prefix (expanded against installed skills by Name
+// or Slug). Deduped, order-stable.
+func (s *Server) resolveSkillTargets(req skillDisabledRequest) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	add := func(n string) {
+		if n != "" && !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	add(req.Skill)
+	for _, n := range req.Skills {
+		add(n)
+	}
+	if req.Prefix != "" {
+		list, err := agents.LoadGlobalSkills(s.deps.ShannonDir)
+		if err != nil {
+			return nil, fmt.Errorf("load skills for prefix match: %w", err)
+		}
+		for _, sk := range list {
+			if strings.HasPrefix(sk.Name, req.Prefix) || strings.HasPrefix(sk.Slug, req.Prefix) {
+				add(sk.Name)
+			}
+		}
+	}
+	return out, nil
+}
+
+// handleAddGlobalDisabledSkill adds one or more skills (by Name/Slug, batch, or
+// prefix) to config.skills.disabled so the DEFAULT agent stops loading them.
+// Named agents are unaffected — they select skills via their _attached.yaml
+// allowlist. Idempotent. Persists via the batch config helper (single flock),
+// then mirrors into the in-memory config so the next routed turn sees the
+// change without a full reload.
+func (s *Server) handleAddGlobalDisabledSkill(w http.ResponseWriter, r *http.Request) {
+	var req skillDisabledRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	targets, err := s.resolveSkillTargets(req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(targets) == 0 {
+		writeError(w, http.StatusBadRequest, "skill, skills, or prefix is required")
+		return
+	}
+	if err := config.AppendGlobalDisabledSkills(s.deps.ShannonDir, targets); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.deps.WriteLock()
+	sk := &s.deps.Config.Skills
+	have := make(map[string]bool, len(sk.Disabled))
+	for _, d := range sk.Disabled {
+		have[d] = true
+	}
+	for _, t := range targets {
+		if !have[t] {
+			sk.Disabled = append(sk.Disabled, t)
+			have[t] = true
+		}
+	}
+	s.deps.WriteUnlock()
+	s.auditHTTPOp("POST", "/skills/disabled", fmt.Sprintf("disabled %d skill(s)", len(targets)))
+	writeJSON(w, http.StatusOK, map[string]any{"status": "disabled", "count": len(targets), "skills": targets})
+}
+
+// handleRemoveGlobalDisabledSkill removes a skill from config.skills.disabled,
+// re-enabling it for the default agent. No-op (200) if absent.
+func (s *Server) handleRemoveGlobalDisabledSkill(w http.ResponseWriter, r *http.Request) {
+	var req skillDisabledRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	targets, err := s.resolveSkillTargets(req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(targets) == 0 {
+		writeError(w, http.StatusBadRequest, "skill, skills, or prefix is required")
+		return
+	}
+	if err := config.RemoveGlobalDisabledSkills(s.deps.ShannonDir, targets); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	rm := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		rm[t] = true
+	}
+	s.deps.WriteLock()
+	sk := &s.deps.Config.Skills
+	filtered := sk.Disabled[:0]
+	for _, d := range sk.Disabled {
+		if !rm[d] {
+			filtered = append(filtered, d)
+		}
+	}
+	sk.Disabled = filtered
+	s.deps.WriteUnlock()
+	s.auditHTTPOp("DELETE", "/skills/disabled", fmt.Sprintf("enabled %d skill(s)", len(targets)))
+	writeJSON(w, http.StatusOK, map[string]any{"status": "removed", "count": len(targets), "skills": targets})
+}
+
+// mcpDefaultDisabledRequest is the body for POST/DELETE /mcp/default-disabled.
+type mcpDefaultDisabledRequest struct {
+	Server string `json:"server"`
+}
+
+// handleAddDefaultAgentDisabledMCP adds an MCP server to
+// config.mcp.default_agent_disabled so the DEFAULT agent stops using it. Named
+// agents are unaffected — they select servers via per-agent mcp_servers.
+// Idempotent. Mirrors the skills-disabled handlers.
+func (s *Server) handleAddDefaultAgentDisabledMCP(w http.ResponseWriter, r *http.Request) {
+	var req mcpDefaultDisabledRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.Server == "" {
+		writeError(w, http.StatusBadRequest, "server is required")
+		return
+	}
+	if err := config.AppendDefaultAgentDisabledMCPServer(s.deps.ShannonDir, req.Server); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.deps.WriteLock()
+	mc := &s.deps.Config.MCP
+	found := false
+	for _, d := range mc.DefaultAgentDisabled {
+		if d == req.Server {
+			found = true
+			break
+		}
+	}
+	if !found {
+		mc.DefaultAgentDisabled = append(mc.DefaultAgentDisabled, req.Server)
+	}
+	s.deps.WriteUnlock()
+	s.auditHTTPOp("POST", "/mcp/default-disabled", "disabled "+req.Server)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "disabled"})
+}
+
+// handleRemoveDefaultAgentDisabledMCP re-enables an MCP server for the default
+// agent. No-op (200) if absent.
+func (s *Server) handleRemoveDefaultAgentDisabledMCP(w http.ResponseWriter, r *http.Request) {
+	var req mcpDefaultDisabledRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.Server == "" {
+		writeError(w, http.StatusBadRequest, "server is required")
+		return
+	}
+	if err := config.RemoveDefaultAgentDisabledMCPServer(s.deps.ShannonDir, req.Server); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.deps.WriteLock()
+	mc := &s.deps.Config.MCP
+	filtered := mc.DefaultAgentDisabled[:0]
+	for _, d := range mc.DefaultAgentDisabled {
+		if d != req.Server {
+			filtered = append(filtered, d)
+		}
+	}
+	mc.DefaultAgentDisabled = filtered
+	s.deps.WriteUnlock()
+	s.auditHTTPOp("DELETE", "/mcp/default-disabled", "enabled "+req.Server)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
+}
+
 func (s *Server) handlePutCommand(w http.ResponseWriter, r *http.Request) {
 	agentName := r.PathValue("name")
 	cmdName := r.PathValue("cmd")
@@ -4072,6 +4264,19 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 	// hidden: true is display-only — the skill is still loaded and invokable
 	// via use_skill. Admin/management UIs can pass ?include_hidden=true.
 	includeHidden := r.URL.Query().Get("include_hidden") == "true"
+
+	// default_agent_disabled annotation: mark a skill if its Name or Slug is in
+	// config.skills.disabled (default-agent-only; named agents are unaffected).
+	// Config may be nil in lightweight test servers.
+	denySet := map[string]struct{}{}
+	s.deps.WriteLock()
+	if s.deps.Config != nil {
+		for _, d := range s.deps.Config.Skills.Disabled {
+			denySet[d] = struct{}{}
+		}
+	}
+	s.deps.WriteUnlock()
+
 	metas := make([]skills.SkillMeta, 0, len(list))
 	for _, skill := range list {
 		if skill.Hidden && !includeHidden {
@@ -4080,6 +4285,11 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 		meta := skill.ToMeta()
 		meta.RequiredSecrets = skill.RequiredSecrets()
 		meta.ConfiguredSecrets = s.secretsStore.ConfiguredKeys(skill.Slug)
+		if _, ok := denySet[skill.Name]; ok {
+			meta.DefaultAgentDisabled = true
+		} else if _, ok := denySet[skill.Slug]; ok {
+			meta.DefaultAgentDisabled = true
+		}
 		metas = append(metas, meta)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"skills": metas})
@@ -5024,6 +5234,12 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 		resp["mcp_servers"] = mcpStatus
 		if len(mcpServerInfo) > 0 {
 			resp["mcp_server_info"] = mcpServerInfo
+		}
+		// Servers the default agent is configured not to use. Desktop reads this
+		// to seed the default agent's per-server MCP toggles; named agents use
+		// their own mcp_servers config, not this list.
+		if len(cfg.MCP.DefaultAgentDisabled) > 0 {
+			resp["mcp_default_agent_disabled"] = cfg.MCP.DefaultAgentDisabled
 		}
 	}
 

@@ -1967,6 +1967,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	reg := tools.CloneWithRuntimeConfig(baseReg, runCfg)
 	if agentOverride != nil {
 		reg = tools.ApplyToolFilter(reg, agentOverride)
+		// Enforce per-agent MCP server selection: drop MCP tools whose server is
+		// not in this agent's resolved mcp_servers set. Without this the shared
+		// registry exposes every connected server's tools to every agent
+		// regardless of config. No-op when the agent inherits the full global set.
+		reg = tools.ApplyMCPServerScope(reg, runCfg, agentOverride)
+	} else {
+		// Default agent: apply the default-agent MCP denylist
+		// (config.mcp.default_agent_disabled). No-op when empty.
+		reg = tools.ApplyMCPServerScope(reg, runCfg)
 	}
 
 	// Attach SecretsStore to the session-scoped bash tool so use_skill
@@ -2006,6 +2015,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// discovery). Filtering at this single producer-side point keeps the three
 	// LLM-facing exposure paths consistent — see internal/daemon/skill_filter.go.
 	loadedSkills = filterSkillsForSource(loadedSkills, req.Source)
+
+	// Default-agent skill denylist (config.skills.disabled). Gated on
+	// agentOverride==nil so it never narrows a named agent's _attached.yaml
+	// allowlist (the opposite semantics). Placed after filterSkillsForSource and
+	// the PDF auto-inject above so an explicit user disable wins over auto-
+	// injection, and before every loadedSkills consumer (SetRegistrySkills here +
+	// SwitchAgent/SetSkills below) so a disabled skill vanishes from all three
+	// LLM-facing paths including use_skill's runtime lookup.
+	loadedSkills = applyDefaultAgentSkillDenylist(loadedSkills, runCfg.Skills.Disabled, agentOverride == nil)
 
 	tools.SetRegistrySkills(reg, loadedSkills)
 
