@@ -268,9 +268,20 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		if curConn != nil {
 			return // already in a call
 		}
+		// fail unwinds a half-started call AND tells Desktop the call is over —
+		// Connect emits "connecting" before it can fail, so without an "ended" the
+		// Desktop sprite would hang on the connecting state.
+		fail := func(msg string, err error, a *koe.AudioIO) {
+			log.Printf("koe: %s: %v", msg, err)
+			if a != nil {
+				a.Stop()
+			}
+			ctrl.EmitVoiceState("idle")
+			ctrl.EmitCallState("ended")
+		}
 		audio, aerr := koe.NewAudioIO()
 		if aerr != nil {
-			log.Printf("koe: audio init failed: %v", aerr)
+			fail("audio init failed", aerr, nil)
 			return
 		}
 		start := audio.Start
@@ -278,16 +289,14 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			start = audio.StartVPIO
 		}
 		if serr := start(); serr != nil {
-			log.Printf("koe: audio start failed: %v", serr)
-			audio.Stop()
+			fail("audio start failed", serr, audio)
 			return
 		}
 		mctx, mcancel := context.WithTimeout(ctx, 15*time.Second)
 		ek, merr := mintEK(mctx)
 		mcancel()
 		if merr != nil {
-			log.Printf("koe: mint failed: %v", merr)
-			audio.Stop()
+			fail("mint failed", merr, audio)
 			return
 		}
 		callCtx, cancel := context.WithCancel(ctx)
@@ -299,9 +308,8 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			OnUsage:      onUsage,
 		})
 		if cerr != nil {
-			log.Printf("koe: connect failed: %v", cerr)
 			cancel()
-			audio.Stop()
+			fail("connect failed", cerr, audio)
 			return
 		}
 		curAudio, curConn, callCancel = audio, conn, cancel
