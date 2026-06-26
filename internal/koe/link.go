@@ -66,6 +66,34 @@ func (c *DaemonClient) MintViaDaemon(ctx context.Context, model string) (string,
 	return mint.Value, nil
 }
 
+// FetchPersona pulls the small-tier-distilled spoken-persona context (who the
+// user is, how to address them — derived from the user's instructions + memory)
+// from the daemon, to append to Koe's base persona before the session.update.
+// Best-effort: an empty result or any error means Koe uses its base persona only,
+// never blocking the call.
+func (c *DaemonClient) FetchPersona(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/koe/persona", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.controlClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("daemon persona failed: HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Persona string `json:"persona"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", err
+	}
+	return out.Persona, nil
+}
+
 // SendRealtimeUsage reports a realtime usage record (model, response_id, token
 // details — built from a response.done event) to the daemon, which relays it to
 // Cloud for server-side cost + quota. Fire-and-forget from the call loop: a usage

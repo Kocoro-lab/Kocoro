@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -158,7 +159,18 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 			}
 		}()
 	}
-	conn, err := koe.Connect(ctx, audio, ek, koePersona, state, disp, koe.ConnectOptions{
+	// persona-profile: append the daemon's small-tier-distilled user context (who
+	// the user is, how to address them) to the base persona, so Kocoro greets the
+	// user as themselves. Bounded to 3s + best-effort — a slow/failed distill must
+	// not delay or block the call; Koe then speaks with its base persona only.
+	persona := koePersona
+	pctx, pcancel := context.WithTimeout(ctx, 3*time.Second)
+	if extra, perr := client.FetchPersona(pctx); perr == nil && extra != "" {
+		persona = koePersona + " " + extra
+	}
+	pcancel()
+
+	conn, err := koe.Connect(ctx, audio, ek, persona, state, disp, koe.ConnectOptions{
 		OnVoiceState: onVoiceState,
 		Model:        cfg.model,
 		OnUsage:      onUsage,
