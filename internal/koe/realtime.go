@@ -49,6 +49,20 @@ func (h *eventHandler) voiceState() string {
 	return "idle"
 }
 
+// bargeIn cuts Kocoro off mid-reply when the user talks over it (E2): cancel the
+// in-flight response, clear the server's WebRTC output-audio buffer, and drop the
+// locally-queued playback so Kocoro goes quiet immediately. The caller flips the
+// voice state to listening.
+func (h *eventHandler) bargeIn() {
+	_ = h.sendFn(map[string]any{"type": "response.cancel"})
+	_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
+	if h.audio != nil {
+		h.audio.SetSpeaking(false)
+		h.audio.ClearPlayback()
+	}
+	h.respBusy.Store(false)
+}
+
 // reportUsage extracts response_id + usage from a response.done event and fires
 // the billing relay (fire-and-forget; a usage failure must not break the call).
 func (h *eventHandler) reportUsage(raw []byte) {
@@ -114,11 +128,19 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	_ = json.Unmarshal(raw, &ev)
 	switch ev.Type {
 	case "input_audio_buffer.speech_started":
-		// Server-VAD detected the user talking — the reactive "I hear you" moment
-		// (Q4: distinguishes idle-listening from actively-hearing) and the barge-in
-		// trigger (workstream E). We are already in "listening"; re-emit so a UI that
-		// animates on this event reacts to the user's voice.
+		// Server-VAD detected the user talking. If this lands WHILE Kocoro is speaking
+		// it is a barge-in (E2) — cut Kocoro off. (Only reachable on a full-duplex/AEC
+		// backend: the v1 half-duplex gate mutes the mic while speaking, so the server
+		// can't hear the user then. With VPIO the gate is moot and this fires for real.)
+		if h.voiceState() == "speaking" {
+			h.bargeIn()
+		}
+		// The reactive "I hear you" moment (Q4) + barge-in entry: we are listening.
 		h.emitVoiceState("listening")
+	case "input_audio_buffer.speech_stopped":
+		// The user finished talking; the server now generates a response. Stay in
+		// listening until the reply audio starts (output_audio_buffer.started). Handled
+		// explicitly so the event is acknowledged rather than silently dropped.
 	case "response.created":
 		// A response is now generating — injectResult must wait for its
 		// response.done before sending another response.create.
