@@ -10,9 +10,18 @@ Skills are knowledge packages that teach agents specific abilities — like read
 - Method: GET
 - Path: /skills
 - Query: `?include_hidden=true` (optional) — include skills with frontmatter `hidden: true`
-- Response: `{"skills": [{"name": "...", "slug": "...", "description": "...", "source": "global", "install_source": "...", "hidden": true, "required_secrets": [...], "configured_secrets": [...]}]}`
+- Response: `{"skills": [{"name": "...", "slug": "...", "description": "...", "source": "global", "install_source": "...", "hidden": true, "required_secrets": [...], "configured_secrets": [...], "default_agent_disabled": false}]}`
+- `default_agent_disabled`: `true` when the skill is in `config.skills.disabled` — i.e. the **default agent** will not load it (named agents are unaffected). Toggle via POST/DELETE /skills/disabled below. Requires capability `default_agent_skill_denylist`.
 - Notes: Shows all skills currently installed in your Shannon instance. Prefer `slug` (the on-disk / URL-safe identifier) for all subsequent CRUD calls; `name` is a free-form display label that may contain uppercase letters or CJK characters and is not guaranteed to match the slug. The by-name skill endpoints (`GET/PUT/DELETE /skills/{name}`, `/{name}/usage`, `/{name}/secrets`, `/{name}/scripts|references|assets`) accept **either** the slug or the display `name` (canonicalized to the slug server-side) as a backward-compat alias, but slug is the canonical, unambiguous key.
 - Hidden skills: By default the response omits skills whose SKILL.md frontmatter sets `hidden: true` (e.g. `kocoro` itself) — this is a display-only filter so user-facing frontends hide internal/policy skills. The skill is still loaded, still invokable via `use_skill`, and still participates in skill discovery. Pass `?include_hidden=true` to see them (e.g. for an admin/management UI that needs to manage their secrets or config).
+
+### Disable / enable a skill for the default agent
+- Method: POST (disable) / DELETE (enable)
+- Path: /skills/disabled
+- Body: one of — `{"skill": "<slug-or-name>"}` (single), `{"skills": ["a","b"]}` (batch), or `{"prefix": "longbridge-"}` (every installed skill whose name OR slug starts with the prefix). The forms compose and are deduped.
+- Response: `{"status": "disabled", "count": N, "skills": [...]}` (POST) / `{"status": "removed", "count": N, "skills": [...]}` (DELETE)
+- **Disabling/enabling MANY skills: use `prefix` or `skills[]` — NEVER loop single calls.** Going one-by-one over a large family (e.g. 100+ `longbridge-*`) is one HTTP call per skill, which bloats context and trips the loop detector; `{"prefix":"longbridge-"}` does the whole family in a single call + single config write. Same for DELETE (re-enable).
+- Notes: Controls which installed skills the **default agent** loads. The default agent loads every installed skill by default; POST adds the skill to `config.skills.disabled` so it is no longer listed, discovered, or invokable via `use_skill` for the default agent, and DELETE re-enables it. Both are idempotent and persist to `~/.shannon/config.yaml`. This is **default-agent-only** — named agents select skills via their `_attached.yaml` allowlist (PUT/DELETE /agents/{name}/skills/{skill}) and are never narrowed by this list. GET /skills reflects per-skill state via `default_agent_disabled`. Requires the daemon capability token `default_agent_skill_denylist`.
 
 ### List downloadable skills (bundled)
 - Method: GET

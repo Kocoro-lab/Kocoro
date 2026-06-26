@@ -1,6 +1,9 @@
 package daemon
 
-import "github.com/Kocoro-lab/ShanClaw/internal/skills"
+import (
+	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/skills"
+)
 
 // desktopOnlySkills enumerates builtin skills whose output only renders in
 // Kocoro Desktop (e.g. kocoro-generative-ui emits html-artifact fences that
@@ -49,4 +52,18 @@ func filterSkillsForSource(loaded []*skills.Skill, source string) []*skills.Skil
 		out = append(out, s)
 	}
 	return out
+}
+
+// applyDefaultAgentSkillDenylist applies the default-agent skill denylist
+// (config.skills.disabled), gated on isDefaultAgent so it never narrows a named
+// agent's _attached.yaml allowlist (the opposite semantics). The filtering
+// itself is shared with the one-shot CLI and TUI default-agent paths via
+// agents.FilterDisabledSkills, so a disabled skill is hidden uniformly across
+// all three (they share ~/.shannon/config.yaml). Callers pass
+// `agentOverride == nil` for isDefaultAgent.
+func applyDefaultAgentSkillDenylist(loaded []*skills.Skill, disabled []string, isDefaultAgent bool) []*skills.Skill {
+	if !isDefaultAgent {
+		return loaded
+	}
+	return agents.FilterDisabledSkills(loaded, disabled)
 }

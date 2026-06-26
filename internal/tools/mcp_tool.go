@@ -179,6 +179,10 @@ func (t *MCPTool) RequiresApproval() bool { return false }
 // ToolSource implements agent.ToolSourcer for deterministic tool ordering.
 func (t *MCPTool) ToolSource() agent.ToolSource { return agent.SourceMCP }
 
+// ServerName returns the MCP server this tool belongs to, for per-agent MCP
+// scoping (tools.ApplyMCPServerScope).
+func (t *MCPTool) ServerName() string { return t.serverName }
+
 // maybeRewriteFileProducingArg rewrites the first relative output-path arg
 // (per fileProducingMCPArgs) to an absolute path under the session CWD. It
 // mutates args in place and returns the rewritten absolute path, or "" when

@@ -126,7 +126,7 @@ const (
 	// (live membership/binding/transport changes). Independent of
 	// CapReplyDeliveryResultV1 so S3 can land separately from S2.
 	CapChannelStateEventV1 = "channel_state_event_v1"
-	CapDeliverableEventV1 = "deliverable_event_v1"
+	CapDeliverableEventV1  = "deliverable_event_v1"
 	// CapMentionRosterV1 tells Cloud the daemon (a) accepts
 	// MessagePayload.Participants and renders the conversation roster into
 	// sticky context as a "Conversation participants:" bulleted list the
@@ -140,6 +140,19 @@ const (
 	// is reserved for a future revision — daemon does not currently populate
 	// it.
 	CapMentionRosterV1 = "mention_roster_v1"
+	// CapDefaultAgentSkillDenylist — daemon supports per-skill enable/disable for
+	// the DEFAULT agent via config.skills.disabled + POST/DELETE /skills/disabled,
+	// and annotates GET /skills with default_agent_disabled. Desktop gates its
+	// default-agent skills UI on this token (old daemons → hide the UI, default
+	// agent keeps loading every installed skill).
+	CapDefaultAgentSkillDenylist = "default_agent_skill_denylist"
+	// CapPerAgentMCPScope — daemon enforces per-agent MCP server selection:
+	// named agents are limited to their mcp_servers set at tool-dispatch time
+	// (not just prompt context), and the default agent honors
+	// config.mcp.default_agent_disabled (POST/DELETE /mcp/default-disabled +
+	// GET /config/status mcp_default_agent_disabled). Desktop gates its per-agent
+	// MCP selection UI on this.
+	CapPerAgentMCPScope = "per_agent_mcp_scope"
 )
 
 var Capabilities = []string{
@@ -159,6 +172,8 @@ var Capabilities = []string{
 	CapChannelStateEventV1,
 	CapDeliverableEventV1,
 	CapMentionRosterV1,
+	CapDefaultAgentSkillDenylist,
+	CapPerAgentMCPScope,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a

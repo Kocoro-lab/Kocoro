@@ -525,6 +525,9 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		if err != nil {
 			log.Printf("WARNING: failed to load global skills: %v", err)
 		}
+		// Default agent: honor config.skills.disabled (shared denylist with the
+		// daemon + one-shot CLI, all on ~/.shannon/config.yaml).
+		loadedSkills = agents.FilterDisabledSkills(loadedSkills, runtimeCfg.Skills.Disabled)
 	}
 	*skillsPtr = loadedSkills
 
