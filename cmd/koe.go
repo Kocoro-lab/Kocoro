@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,11 +18,12 @@ import (
 
 // koeConfig holds the resolved settings for one `shan koe` voice session.
 type koeConfig struct {
-	openAIKey string // DEV-KEY: replaced by the deferred daemon mint relay (→ Plan D Cloud mint)
-	daemonURL string
-	agent     string
-	model     string
-	language  string
+	openAIKey   string // DEV-KEY: replaced by the deferred daemon mint relay (→ Plan D Cloud mint)
+	daemonURL   string
+	agent       string
+	model       string
+	language    string
+	controlPort string // Desktop↔Koe control server port (Kocoro Desktop passes it); empty = no control channel
 }
 
 func defaultKoeConfig() koeConfig {
@@ -50,6 +52,7 @@ var koeCmd = &cobra.Command{
 			cfg.model = v
 		}
 		cfg.language, _ = cmd.Flags().GetString("language")
+		cfg.controlPort, _ = cmd.Flags().GetString("control-port")
 
 		// No key check: with no --openai-key/OPENAI_API_KEY, runKoeCall mints via
 		// the daemon (production path — Koe holds no credential). A dev key, if set,
@@ -64,6 +67,7 @@ func init() {
 	koeCmd.Flags().String("agent", "", "bound back-brain agent slug (empty = daemon default)")
 	koeCmd.Flags().String("model", "", "realtime model (default gpt-realtime-mini-2025-12-15)")
 	koeCmd.Flags().String("language", "", "conversation language hint")
+	koeCmd.Flags().String("control-port", "", "Desktop↔Koe control server port (Kocoro Desktop passes it)")
 	rootCmd.AddCommand(koeCmd)
 }
 
@@ -90,7 +94,28 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	}
 	resolver := koe.NewAgentResolver(agents, koe.NoopSemanticMatcher{})
 	state := koe.NewCallState(newBurstID(), cfg.agent)
-	disp := koe.NewDispatcher(client, resolver, state, nil) // controlApp nil in C-minimal (no Desktop)
+
+	// G2: Kocoro Desktop control channel. When Desktop spawns `shan koe
+	// --control-port N`, stand up the control server so it receives voice_state /
+	// control_app SSE and the control_app tool routes to the Desktop window. No
+	// port = standalone CLI (no control channel).
+	var onVoiceState func(string)
+	var controlApp koe.ControlAppFunc
+	if cfg.controlPort != "" {
+		ctrl := koe.NewControlServer(nil, nil)
+		onVoiceState = ctrl.EmitVoiceState
+		controlApp = func(_ context.Context, action string) error {
+			ctrl.EmitControlApp(action)
+			return nil
+		}
+		go func() {
+			addr := "127.0.0.1:" + cfg.controlPort
+			if err := http.ListenAndServe(addr, ctrl.Handler()); err != nil {
+				log.Printf("koe: control server on %s exited: %v", addr, err)
+			}
+		}()
+	}
+	disp := koe.NewDispatcher(client, resolver, state, controlApp)
 
 	// Audio + WebRTC.
 	audio, err := koe.NewAudioIO()
@@ -115,7 +140,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	if err != nil {
 		return fmt.Errorf("mint: %v", err)
 	}
-	conn, err := koe.Connect(ctx, audio, ek, koePersona, state, disp)
+	conn, err := koe.Connect(ctx, audio, ek, koePersona, state, disp, onVoiceState)
 	if err != nil {
 		return fmt.Errorf("connect: %v", err)
 	}

@@ -21,6 +21,15 @@ type eventHandler struct {
 	// conversation_already_has_active_response — surfaced in the async-injection
 	// de-risk). Maintained from response.created/response.done in handleEvent.
 	respBusy atomic.Bool
+	// onVoiceState (nil-safe) pushes the ambient voice state to the Desktop control
+	// channel (G2) so the Kocoro Island sprite tracks listening/thinking/speaking.
+	onVoiceState func(string)
+}
+
+func (h *eventHandler) emitVoiceState(state string) {
+	if h.onVoiceState != nil {
+		h.onVoiceState(state)
+	}
 }
 
 func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error) *eventHandler {
@@ -76,6 +85,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if h.audio != nil {
 			h.audio.SetSpeaking(true)
 		}
+		h.emitVoiceState("speaking")
 	case "response.done":
 		// Turn finished → ungate the mic + mark the response slot free. (Usage
 		// token capture for billing is the deferred daemon usage-relay → Plan D.)
@@ -83,6 +93,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if h.audio != nil {
 			h.audio.SetSpeaking(false)
 		}
+		h.emitVoiceState("listening")
 	}
 }
 
@@ -120,6 +131,7 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 		h.state.SetInFlight(req.Text)
 		h.sendOutput(callID, SayResult{Status: "injected", Say: "在弄了"})
 		go func() {
+			h.emitVoiceState("thinking") // delegating to the back-brain
 			out, derr := h.disp.client.DoTask(ctx, req)
 			h.state.ClearInFlight()
 			h.injectResult(ctx, MapDoTaskOutcome(out, derr))

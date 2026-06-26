@@ -171,8 +171,10 @@ func MintEphemeral(ctx context.Context, apiKey, model string) (string, error) {
 }
 
 // Connect builds the peer connection, dials OpenAI, configures the session, and
-// starts the send-pump + event-dispatch loops. Returns once connected.
-func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *CallState, disp *Dispatcher) (*RealtimeConn, error) {
+// starts the send-pump + event-dispatch loops. Returns once connected. onVoiceState
+// (nil-safe) receives listening/thinking/speaking transitions for the Desktop
+// control channel (G2 → Kocoro Island sprite).
+func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *CallState, disp *Dispatcher, onVoiceState func(string)) (*RealtimeConn, error) {
 	rc, err := newPeerConnection(audio)
 	if err != nil {
 		return nil, err
@@ -181,6 +183,7 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 		b, _ := json.Marshal(v)
 		return rc.dc.SendText(string(b))
 	})
+	h.onVoiceState = onVoiceState
 	// configured closes when OpenAI acks our session.update. The send pump waits
 	// on it: if mic audio reaches the server before the tools/voice config lands,
 	// the VAD-triggered auto response snapshots the default config (no tools) and
