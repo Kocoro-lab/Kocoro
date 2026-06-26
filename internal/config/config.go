@@ -395,6 +395,13 @@ func Load() (*Config, error) {
 	// client timeout). Override in ~/.shannon/config.yaml.
 	viper.SetDefault("skills.marketplace.max_attempts", 3)
 	viper.SetDefault("skills.marketplace.retry_base_backoff_secs", 1)
+	// skills.marketplace.clawhub_cache_ttl_secs: TTL for the ClawHub live-catalog
+	// response cache (browse/search/detail/files/file). Short by design — absorbs
+	// request bursts/repeat browsing (cutting upstream calls and 503 exposure)
+	// without serving a noticeably stale catalog. Symptom if too high: a newly
+	// published/edited skill takes up to the TTL to appear. 0 disables caching.
+	// Override in ~/.shannon/config.yaml.
+	viper.SetDefault("skills.marketplace.clawhub_cache_ttl_secs", 60)
 	viper.SetDefault("cloud.enabled", true)
 	viper.SetDefault("cloud.timeout", 3600)
 	viper.SetDefault("cloud.stream_idle_timeout_secs", 45) // per-connection SSE liveness probe; cloud pings every 10s. 0 disables.

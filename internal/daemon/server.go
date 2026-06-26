@@ -200,10 +200,10 @@ func resolveRegistryURL(deps *ServerDeps) string {
 	return defaultURL
 }
 
-// applyMarketplaceRetryPolicy injects the config-tunable transient-failure
-// retry policy (skills.marketplace.max_attempts / .retry_base_backoff_secs)
-// into a catalog client. Non-positive values leave the client's defaults.
-func applyMarketplaceRetryPolicy(c *skills.MarketplaceClient) *skills.MarketplaceClient {
+// applyMarketplaceConfig injects the config-tunable retry policy
+// (skills.marketplace.max_attempts / .retry_base_backoff_secs) and ClawHub
+// cache TTL (.clawhub_cache_ttl_secs) into a catalog client.
+func applyMarketplaceConfig(c *skills.MarketplaceClient) *skills.MarketplaceClient {
 	// Clamp to sane ranges so an absurd config value can't overflow
 	// time.Duration or produce a pathological attempt count; the per-sleep cap
 	// (marketplaceRetryMaxDelay) still bounds actual backoff.
@@ -219,13 +219,24 @@ func applyMarketplaceRetryPolicy(c *skills.MarketplaceClient) *skills.Marketplac
 		baseSecs = 0
 	}
 	c.SetRetryPolicy(attempts, time.Duration(baseSecs)*time.Second)
+
+	// ClawHub response-cache TTL (no-op on the static-registry client). Clamp to
+	// a sane ceiling; negative → 0 (disabled).
+	ttlSecs := viper.GetInt("skills.marketplace.clawhub_cache_ttl_secs")
+	if ttlSecs > 3600 {
+		ttlSecs = 3600
+	}
+	if ttlSecs < 0 {
+		ttlSecs = 0
+	}
+	c.SetClawHubCacheTTL(time.Duration(ttlSecs) * time.Second)
 	return c
 }
 
 // newMarketplaceClient builds the static-registry catalog client that backs the
 // /skills/marketplace/* endpoints (the contract the macOS Desktop consumes).
 func newMarketplaceClient(deps *ServerDeps) *skills.MarketplaceClient {
-	return applyMarketplaceRetryPolicy(skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour))
+	return applyMarketplaceConfig(skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour))
 }
 
 // newClawHubClient builds the live ClawHub catalog client that backs the
@@ -238,7 +249,7 @@ func newClawHubClient(deps *ServerDeps) *skills.MarketplaceClient {
 			base = u
 		}
 	}
-	return applyMarketplaceRetryPolicy(skills.NewClawHubMarketplaceClient(base, 1*time.Hour))
+	return applyMarketplaceConfig(skills.NewClawHubMarketplaceClient(base, 1*time.Hour))
 }
 
 var (

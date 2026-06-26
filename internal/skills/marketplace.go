@@ -132,6 +132,11 @@ type MarketplaceClient struct {
 	maxAttempts int
 	retryBase   time.Duration
 
+	// clawhubCache is the TTL response cache for the ClawHub live-catalog reads
+	// (getJSON/getText). Non-nil only on a ClawHub client; the static-registry
+	// client caches at the Load() layer instead. nil → no caching.
+	clawhubCache *clawhubCache
+
 	mu         sync.Mutex
 	cache      *RegistryIndex
 	fetched    time.Time
@@ -164,6 +169,15 @@ func NewClawHubMarketplaceClient(base string, ttl time.Duration) *MarketplaceCli
 		staleCooldown: defaultStaleCooldown,
 		maxAttempts:   defaultMarketplaceMaxAttempts,
 		retryBase:     defaultMarketplaceRetryBase,
+		clawhubCache:  newClawHubCache(defaultClawHubCacheTTL, defaultStaleCooldown),
+	}
+}
+
+// SetClawHubCacheTTL overrides the ClawHub response-cache TTL (config-injected
+// by the daemon). ttl <= 0 disables the cache. No-op on a non-ClawHub client.
+func (c *MarketplaceClient) SetClawHubCacheTTL(ttl time.Duration) {
+	if c.clawhubCache != nil {
+		c.clawhubCache.ttl = ttl
 	}
 }
 
@@ -1416,35 +1430,55 @@ func (c *MarketplaceClient) FetchClawHubFile(ctx context.Context, slug, version,
 // getText performs a GET and returns the raw response body as a string. Used for
 // file content (ClawHub caps single files at 200KB); 1 MB ceiling as a guard.
 func (c *MarketplaceClient) getText(ctx context.Context, rawURL string) (string, error) {
-	resp, err := doGETWithRetry(ctx, c.http, rawURL, c.maxAttempts, c.retryBase, marketplaceCatalogRetryBudget)
+	body, err := c.clawhubGet(ctx, rawURL, 1*1024*1024)
 	if err != nil {
 		return "", fmt.Errorf("fetch clawhub: %w", err)
 	}
+	return string(body), nil
+}
+
+// clawhubGet fetches rawURL (with transient retry) and returns the response body
+// capped at maxBytes. Results are cached for the ClawHub cache TTL keyed by URL;
+// on an upstream failure (network/transient 5xx, after retries) a still-cached
+// body is served as stale. Definitive 4xx (404/409/422) and parse-able non-2xx
+// surface as a "status %d" error so getJSON/getText preserve the daemon's
+// 404-vs-503 mapping. Non-2xx is never cached.
+func (c *MarketplaceClient) clawhubGet(ctx context.Context, rawURL string, maxBytes int64) ([]byte, error) {
+	if data, ok := c.clawhubCache.lookup(rawURL); ok {
+		return data, nil
+	}
+	resp, err := doGETWithRetry(ctx, c.http, rawURL, c.maxAttempts, c.retryBase, marketplaceCatalogRetryBudget)
+	if err != nil {
+		if data, ok := c.clawhubCache.staleOnError(rawURL); ok {
+			return data, nil
+		}
+		return nil, err
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("fetch clawhub: status %d", resp.StatusCode)
+		// Serve stale only for transient upstream failures; definitive 4xx
+		// must surface (e.g. 404 → "not found", 409 → ambiguous slug).
+		if isRetryableStatus(resp.StatusCode) {
+			if data, ok := c.clawhubCache.staleOnError(rawURL); ok {
+				return data, nil
+			}
+		}
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
 	if err != nil {
-		return "", fmt.Errorf("read clawhub body: %w", err)
+		return nil, fmt.Errorf("read clawhub body: %w", err)
 	}
-	return string(body), nil
+	c.clawhubCache.store(rawURL, body)
+	return body, nil
 }
 
 // getJSON performs a GET and decodes the JSON body into v, sharing the HTTP
 // client, body cap, and error wrapping with the registry fetch path.
 func (c *MarketplaceClient) getJSON(ctx context.Context, rawURL string, v any) error {
-	resp, err := doGETWithRetry(ctx, c.http, rawURL, c.maxAttempts, c.retryBase, marketplaceCatalogRetryBudget)
+	body, err := c.clawhubGet(ctx, rawURL, 10*1024*1024) // 10 MB cap
 	if err != nil {
 		return fmt.Errorf("fetch clawhub: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("fetch clawhub: status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024)) // 10 MB cap
-	if err != nil {
-		return fmt.Errorf("read clawhub body: %w", err)
 	}
 	if err := json.Unmarshal(body, v); err != nil {
 		return fmt.Errorf("parse clawhub: %w", err)
