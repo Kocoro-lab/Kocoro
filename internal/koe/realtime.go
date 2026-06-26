@@ -3,8 +3,10 @@ package koe
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 // eventHandler dispatches decoded oai-events and composes do_task. sendFn frames a
@@ -100,7 +102,12 @@ func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn 
 // tool calls were emitted as text; verified against the live API in e2e_test.go).
 // tool_choice stays "auto" — forcing a specific function under output_modalities
 // ["audio"] makes GA emit the call as text instead of a real function call.
-// turn-detection defaults to server-VAD (OpenAI segments).
+//
+// Turn detection uses server-VAD, but create_response is false: OpenAI segments
+// and transcribes the user's turn, then Koe decides whether the transcript is
+// clear enough to answer. This mirrors kocoro-reachy's "first door" discipline
+// for the Desktop push-to-talk shape: noise / stray words should not make Kocoro
+// improvise a reply.
 func sessionConfig(persona, voice string) map[string]any {
 	return map[string]any{
 		"type": "session.update",
@@ -109,6 +116,19 @@ func sessionConfig(persona, voice string) map[string]any {
 			"instructions":      persona,
 			"output_modalities": []string{"audio"},
 			"audio": map[string]any{
+				"input": map[string]any{
+					"transcription": map[string]any{
+						"model": "gpt-4o-mini-transcribe",
+					},
+					"turn_detection": map[string]any{
+						"type":                "server_vad",
+						"threshold":           0.65,
+						"prefix_padding_ms":   300,
+						"silence_duration_ms": 700,
+						"create_response":     false,
+						"interrupt_response":  true,
+					},
+				},
 				"output": map[string]any{"voice": voice},
 			},
 			"tools":       ToolDefs(),
@@ -120,10 +140,11 @@ func sessionConfig(persona, voice string) map[string]any {
 // handleEvent routes one decoded oai-events message.
 func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	var ev struct {
-		Type      string          `json:"type"`
-		Name      string          `json:"name"`      // function_call_arguments.done
-		CallID    string          `json:"call_id"`   // function call id
-		Arguments json.RawMessage `json:"arguments"` // function args (string-encoded JSON)
+		Type       string          `json:"type"`
+		Name       string          `json:"name"`      // function_call_arguments.done
+		CallID     string          `json:"call_id"`   // function call id
+		Arguments  json.RawMessage `json:"arguments"` // function args (string-encoded JSON)
+		Transcript string          `json:"transcript"`
 	}
 	_ = json.Unmarshal(raw, &ev)
 	switch ev.Type {
@@ -138,9 +159,13 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// The reactive "I hear you" moment (Q4) + barge-in entry: we are listening.
 		h.emitVoiceState("listening")
 	case "input_audio_buffer.speech_stopped":
-		// The user finished talking; the server now generates a response. Stay in
-		// listening until the reply audio starts (output_audio_buffer.started). Handled
-		// explicitly so the event is acknowledged rather than silently dropped.
+		// The user finished talking. create_response=false, so the server will
+		// transcribe this turn and Koe will decide whether to answer.
+	case "conversation.item.input_audio_transcription.completed":
+		h.handleInputTranscript(ctx, ev.Transcript)
+	case "conversation.item.input_audio_transcription.failed":
+		// Treat failed ASR like unclear audio. Do not guess.
+		h.emitVoiceState("listening")
 	case "response.created":
 		// A response is now generating — injectResult must wait for its
 		// response.done before sending another response.create.
@@ -184,6 +209,66 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	}
 }
 
+// handleInputTranscript is the response gate for one user turn. With
+// create_response=false, Realtime will not answer until Koe sends response.create.
+// That lets us suppress noise, filler, and too-short stray speech instead of
+// letting the model hallucinate a conversational turn.
+func (h *eventHandler) handleInputTranscript(ctx context.Context, transcript string) {
+	if !shouldAnswerTranscript(transcript) {
+		h.emitVoiceState("listening")
+		return
+	}
+	h.waitRespIdle(ctx)
+	_ = h.sendFn(map[string]any{"type": "response.create"})
+}
+
+func shouldAnswerTranscript(transcript string) bool {
+	norm := normalizeTranscript(transcript)
+	if norm == "" {
+		return false
+	}
+	if isFillerTranscript(norm) {
+		return false
+	}
+	// One CJK rune or one short ASCII token is usually a false wake/noise fragment
+	// in live mic use ("嗯", "啊", "uh"). Let two-rune turns like "你好" through.
+	runes := []rune(norm)
+	if len(runes) < 2 {
+		return false
+	}
+	if len(runes) <= 3 && isAllASCII(runes) {
+		return false
+	}
+	return true
+}
+
+func normalizeTranscript(transcript string) string {
+	return strings.TrimFunc(strings.ToLower(transcript), func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r)
+	})
+}
+
+func isFillerTranscript(norm string) bool {
+	switch norm {
+	case "um", "uh", "umm", "hmm", "mm", "ah", "oh", "er",
+		"嗯", "呃", "啊", "哦", "额", "唔", "哎", "诶",
+		"嗯嗯", "啊啊", "哦哦", "呃呃",
+		"はい", "えっと", "あの", "うん":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAllASCII(runes []rune) bool {
+	for _, r := range runes {
+		if r > unicode.MaxASCII {
+			return false
+		}
+	}
+	return true
+}
+
 // unwrapArgs normalizes the arguments field: OpenAI sends function arguments as a
 // JSON STRING, so "{\"task\":\"x\"}" must be unquoted to raw JSON bytes.
 func unwrapArgs(raw json.RawMessage) []byte {
@@ -216,7 +301,7 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 		// Koe-process context (Connect's), so the turn is cancelled on Ctrl-C but
 		// outlives this (already-closed) realtime turn.
 		h.state.SetInFlight(req.Text)
-		h.sendOutput(callID, SayResult{Status: "injected", Say: "在弄了"})
+		h.sendOutput(callID, SayResult{Status: "injected", Say: taskAcknowledgement(req.Text)})
 		go func() {
 			h.emitVoiceState("thinking") // delegating to the back-brain
 			out, derr := h.disp.client.DoTask(ctx, req)
@@ -233,6 +318,20 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 	}
 	var raw json.RawMessage = outBytes
 	h.sendRaw(callID, raw)
+}
+
+func taskAcknowledgement(task string) string {
+	for _, r := range task {
+		if unicode.In(r, unicode.Hiragana, unicode.Katakana) {
+			return "確認します。終わったら伝えます。"
+		}
+	}
+	for _, r := range task {
+		if unicode.In(r, unicode.Han) {
+			return "我来处理，弄好就告诉你。"
+		}
+	}
+	return "I'll handle that and tell you when it's ready."
 }
 
 // sendOutput frames a SayResult as a function_call_output + asks for a spoken

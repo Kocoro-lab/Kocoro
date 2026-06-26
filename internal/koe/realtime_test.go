@@ -76,6 +76,19 @@ func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 	t.Error("injected do_task result never sent")
 }
 
+func TestTaskAcknowledgementMatchesRequestLanguage(t *testing.T) {
+	tests := map[string]string{
+		"remind me to call mom": "I'll handle that and tell you when it's ready.",
+		"帮我查明天的天气":              "我来处理，弄好就告诉你。",
+		"明日の天気を確認して":            "確認します。終わったら伝えます。",
+	}
+	for task, want := range tests {
+		if got := taskAcknowledgement(task); got != want {
+			t.Fatalf("taskAcknowledgement(%q) = %q, want %q", task, got, want)
+		}
+	}
+}
+
 // TestHandleEventGatesMicWhileSpeaking locks the half-duplex gate into the event
 // loop: a structurally-correct gate (C2) is inert unless handleEvent actually
 // toggles it. This also pins the exact OpenAI event names — a rename would make
@@ -162,6 +175,43 @@ func TestHandleEventNoBargeWhenListening(t *testing.T) {
 	}
 }
 
+func TestSessionConfigUsesTranscriptGatedVAD(t *testing.T) {
+	cfg := sessionConfig("persona", "marin")
+	raw, _ := json.Marshal(cfg)
+	s := string(raw)
+
+	for _, want := range []string{
+		`"transcription":{"model":"gpt-4o-mini-transcribe"}`,
+		`"turn_detection"`,
+		`"type":"server_vad"`,
+		`"create_response":false`,
+		`"interrupt_response":true`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("sessionConfig missing %s in %s", want, s)
+		}
+	}
+}
+
+func TestHandleInputTranscriptCreatesResponseOnlyForClearSpeech(t *testing.T) {
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+
+	for _, transcript := range []string{"", "嗯", "uh", "...", "啊啊"} {
+		h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":`+mustJSONString(transcript)+`}`))
+	}
+	if cap.sentContains("response.create") {
+		t.Fatal("unclear/noise transcripts must not create a response")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"帮我查一下明天的天气"}`))
+	if !cap.sentContains("response.create") {
+		t.Fatal("clear transcript must create a response")
+	}
+}
+
 // TestHandleEventVoiceStateSequence pins the precise state machine (D1w): the
 // WebRTC output_audio_buffer.started/stopped markers drive SPEAKING/IDLE, and
 // input_audio_buffer.speech_started surfaces the reactive listening moment. A
@@ -204,4 +254,9 @@ func TestHandleEventVoiceStateSequence(t *testing.T) {
 	if audio.dropCapture() {
 		t.Error("output_audio_buffer.stopped must ungate the mic")
 	}
+}
+
+func mustJSONString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
