@@ -169,26 +169,7 @@ func TestKoeVoiceE2E(t *testing.T) {
 		case <-ctx.Done():
 			return
 		}
-		ticker := time.NewTicker(audioFrameMs * time.Millisecond)
-		defer ticker.Stop()
-		for off := 0; off+audioFrameSize <= len(pcm); off += audioFrameSize {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-			audio.frames <- append([]int16(nil), pcm[off:off+audioFrameSize]...)
-		}
-		// trailing silence so server-VAD marks end-of-turn.
-		silence := make([]int16, audioFrameSize)
-		for range 60 { // ~1.2s
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-			audio.frames <- append([]int16(nil), silence...)
-		}
+		feedWAV(ctx, audio, pcm)
 		t.Log("[send] speech + trailing silence streamed")
 	}()
 
@@ -206,6 +187,164 @@ func TestKoeVoiceE2E(t *testing.T) {
 		mu.Unlock()
 		t.Fatalf("VERDICT: FAIL — no do_task reached the mock daemon within timeout.\noai-events seen: %v\n"+
 			"(if function_call_arguments.done is absent, OpenAI never invoked the tool; if present but no POST, the do_task→daemon dispatch broke)", log)
+	}
+}
+
+// feedWAV streams pcm into audio.frames at the 20ms frame cadence, then ~1.2s of
+// trailing silence so server-VAD marks end-of-turn. Call from a goroutine AFTER
+// the connection is established AND session.updated has landed.
+func feedWAV(ctx context.Context, audio *AudioIO, pcm []int16) {
+	ticker := time.NewTicker(audioFrameMs * time.Millisecond)
+	defer ticker.Stop()
+	for off := 0; off+audioFrameSize <= len(pcm); off += audioFrameSize {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		audio.frames <- append([]int16(nil), pcm[off:off+audioFrameSize]...)
+	}
+	silence := make([]int16, audioFrameSize)
+	for range 60 { // ~1.2s
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		audio.frames <- append([]int16(nil), silence...)
+	}
+}
+
+// TestKoeAsyncInjectionE2E de-risks the async result-injection mechanism (C-full
+// Task 1): after the model calls do_task, fast-ack the call (so the first turn
+// closes), then inject a RESULT out-of-band and assert the model SPEAKS it in a
+// second response. This is the unverified GA mechanism async do_task depends on.
+// Run it to LEARN the working recipe, not as a pre-known pass.
+func TestKoeAsyncInjectionE2E(t *testing.T) {
+	if os.Getenv("KOE_E2E") != "1" {
+		t.Skip("async-injection de-risk: set KOE_E2E=1 + OPENAI_API_KEY")
+	}
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		t.Skip("OPENAI_API_KEY required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	pcm := synthSpokenWAV(t, e2eSpoken)
+	ek, err := mintEphemeral(ctx, apiKey, e2eModel)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	audio, _ := NewAudioIO()
+	rc, err := newPeerConnection(audio)
+	if err != nil {
+		t.Fatalf("pc: %v", err)
+	}
+	defer rc.Close()
+	send := func(v any) { b, _ := json.Marshal(v); _ = rc.dc.SendText(string(b)) }
+
+	const injectedText = "Done — I added a reminder to call mom at six."
+	var (
+		mu           sync.Mutex
+		transcripts  []string
+		responseDone int
+		injected     bool
+		spokeResult  bool
+	)
+	connected := make(chan struct{})
+	configured := make(chan struct{})
+	var once, cfgOnce sync.Once
+	rc.pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		if s == webrtc.PeerConnectionStateConnected {
+			once.Do(func() { close(connected) })
+		}
+	})
+	rc.dc.OnOpen(func() { send(sessionConfig(e2ePersona, "marin")) })
+	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
+		var ev struct {
+			Type       string `json:"type"`
+			CallID     string `json:"call_id"`
+			Transcript string `json:"transcript"`
+		}
+		_ = json.Unmarshal(m.Data, &ev)
+		mu.Lock()
+		defer mu.Unlock()
+		switch ev.Type {
+		case "session.updated":
+			cfgOnce.Do(func() { close(configured) })
+		case "response.function_call_arguments.done":
+			// (a) fast-ack the call so the first realtime turn closes.
+			send(map[string]any{"type": "conversation.item.create", "item": map[string]any{
+				"type": "function_call_output", "call_id": ev.CallID, "output": `{"say":"On it.","status":"injected"}`}})
+			send(map[string]any{"type": "response.create"})
+		case "response.output_audio_transcript.done":
+			t.Logf("[spoke] %q", ev.Transcript)
+			transcripts = append(transcripts, ev.Transcript)
+			if strings.Contains(strings.ToLower(ev.Transcript), "mom") || strings.Contains(strings.ToLower(ev.Transcript), "reminder") {
+				spokeResult = true
+			}
+		case "response.done":
+			responseDone++
+			// VERIFIED async-injection recipe (live GA Realtime, 2026-06-26):
+			//   1. fast-ack: conversation.item.create{function_call_output} + response.create
+			//   2. WAIT for that response's response.done
+			//   3. inject: conversation.item.create{message, role:assistant, output_text}
+			//      + response.create  → the model SPEAKS the injected text.
+			// CAVEAT for Task 2: step-3's response.create MUST wait for the prior
+			// response.done, else GA returns error `conversation_already_has_active_response`
+			// (seen here as a benign race) — injectResult must serialize response.create.
+			if responseDone == 1 && !injected {
+				injected = true
+				send(map[string]any{"type": "conversation.item.create", "item": map[string]any{
+					"type": "message", "role": "assistant",
+					"content": []map[string]any{{"type": "output_text", "text": injectedText}}}})
+				send(map[string]any{"type": "response.create"})
+			}
+		case "error", "response.failed":
+			t.Logf("[event %s] %s", ev.Type, string(m.Data))
+		}
+	})
+	if err := rc.dialOpenAI(ctx, ek); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	go rc.pumpSendTrack(ctx)
+	go func() {
+		select {
+		case <-connected:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-configured:
+		case <-ctx.Done():
+			return
+		}
+		feedWAV(ctx, audio, pcm)
+	}()
+
+	deadline := time.After(80 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			mu.Lock()
+			t.Fatalf("RECIPE A did not make the model speak the injected result. transcripts=%v (try RECIPE B: function_call_output for a synthetic second call)", transcripts)
+			mu.Unlock()
+		case <-time.After(1 * time.Second):
+			mu.Lock()
+			ok := spokeResult
+			done := responseDone
+			mu.Unlock()
+			if ok {
+				t.Logf("RECIPE A VERIFIED: assistant-message injection + response.create made the model speak the result")
+				return
+			}
+			if done >= 2 && !ok {
+				mu.Lock()
+				t.Fatalf("two responses but injected result not spoken — recipe A insufficient. transcripts=%v", transcripts)
+				mu.Unlock()
+			}
+		}
 	}
 }
 
