@@ -45,10 +45,13 @@ func ToolDefs() []ToolDef {
 // fixed for the call; boundAgent changes via switch_agent; inFlight tracks the
 // active do_task for get_status.
 type CallState struct {
-	mu       sync.Mutex
-	burstID  string
-	bound    string
-	inFlight string
+	mu        sync.Mutex
+	burstID   string
+	bound     string
+	inFlight  string
+	inFlightN int // concurrent do_task count — a follow-up ("change it to 6pm")
+	// spawns a 2nd do_task goroutine while the 1st runs; the in-flight text must
+	// survive until the LAST one clears, not the first.
 }
 
 func NewCallState(burstID, boundAgent string) *CallState {
@@ -62,9 +65,18 @@ func (s *CallState) BurstID() string    { s.mu.Lock(); defer s.mu.Unlock(); retu
 // SetInFlight / ClearInFlight are exported because C's async do_task goroutine
 // (NOT a blocking Dispatch) owns the in-flight lifecycle: set before delegating,
 // clear when the result returns. get_status reads InFlight.
-func (s *CallState) SetInFlight(t string) { s.mu.Lock(); s.inFlight = t; s.mu.Unlock() }
-func (s *CallState) ClearInFlight()       { s.mu.Lock(); s.inFlight = ""; s.mu.Unlock() }
-func (s *CallState) InFlight() string     { s.mu.Lock(); defer s.mu.Unlock(); return s.inFlight }
+func (s *CallState) SetInFlight(t string) { s.mu.Lock(); s.inFlight = t; s.inFlightN++; s.mu.Unlock() }
+func (s *CallState) ClearInFlight() {
+	s.mu.Lock()
+	if s.inFlightN > 0 {
+		s.inFlightN--
+	}
+	if s.inFlightN == 0 {
+		s.inFlight = "" // only idle once the last concurrent do_task has returned
+	}
+	s.mu.Unlock()
+}
+func (s *CallState) InFlight() string { s.mu.Lock(); defer s.mu.Unlock(); return s.inFlight }
 
 // burstRouteKey reconstructs the daemon route key for this call's burst,
 // byte-identical to ComputeRouteKey (daemon runner.go:143/145) so cancel hits the

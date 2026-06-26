@@ -30,3 +30,23 @@ func TestDispatchGetStatusDuringInFlight(t *testing.T) {
 		t.Errorf("get_status should be idle after ClearInFlight; got %s", out)
 	}
 }
+
+// TestCallStateConcurrentInFlight covers the follow-up case: a 2nd do_task
+// ("change it to 6pm") spawns a goroutine while the 1st still runs. The in-flight
+// state must survive until the LAST one clears, not the first — otherwise
+// get_status would report idle while a delegation is still running.
+func TestCallStateConcurrentInFlight(t *testing.T) {
+	s := NewCallState("burst-x", "")
+	s.SetInFlight("add a reminder")  // do_task #1 goroutine
+	s.SetInFlight("change it to 6pm") // do_task #2 (follow-up) goroutine
+
+	s.ClearInFlight() // #2 returns fast (injected into #1's running turn)
+	if s.InFlight() == "" {
+		t.Error("in-flight cleared while a concurrent do_task is still running")
+	}
+
+	s.ClearInFlight() // #1 returns (final result)
+	if s.InFlight() != "" {
+		t.Errorf("in-flight should be idle after the last do_task; got %q", s.InFlight())
+	}
+}
