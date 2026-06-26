@@ -4109,8 +4109,13 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				// skip it; their OnText already rendered the text.
 				if h, ok := a.handler.(IntermediateAnswerHandler); ok && strings.TrimSpace(fullText) != "" {
 					h.OnIntermediateAnswer(fullText, supersededReplyID)
-					// Its reply+ack were just sent under supersededReplyID, so the
-					// daemon must not co-ack it again at run end.
+					// Drop it from the pending set. On success its reply+ack were
+					// just sent, so the daemon must not co-ack it again at run end.
+					// OnIntermediateAnswer is fire-and-forget: if its SendReply
+					// failed it did NOT ack, and removing it here intentionally
+					// leaves it un-acked so Cloud replays it on reconnect — no
+					// double-ack, no silent loss. Do NOT "fix" this into a retained
+					// co-ack; that would ack a reply that was never delivered.
 					a.removePendingAck(supersededReplyID)
 				}
 				continue
