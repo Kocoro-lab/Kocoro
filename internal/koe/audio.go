@@ -29,6 +29,11 @@ type AudioIO struct {
 	encMu    sync.Mutex
 	decMu    sync.Mutex
 	stopOnce sync.Once
+	// vpioActive / vpioDone track the alternative VoiceProcessingIO backend
+	// (audio_vpio.go, terminal full-duplex AEC). When set, Stop() tears down VPIO
+	// instead of malgo and the half-duplex gate is moot (VPIO cancels echo natively).
+	vpioActive bool
+	vpioDone   chan struct{}
 }
 
 // NewAudioIO builds the codec (no device opened yet — Start() opens it, so unit
@@ -153,6 +158,10 @@ func (a *AudioIO) Start() error {
 // re-run Uninit/Free on already-freed C memory (use-after-free).
 func (a *AudioIO) Stop() {
 	a.stopOnce.Do(func() {
+		if a.vpioActive {
+			a.stopVPIO() // audio_vpio.go: stop VPIO + the bridge goroutines
+			return
+		}
 		if a.dev != nil {
 			_ = a.dev.Stop()
 			a.dev.Uninit()
