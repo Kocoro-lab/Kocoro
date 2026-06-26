@@ -3,6 +3,8 @@ package koe
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
+	"time"
 )
 
 // eventHandler dispatches decoded oai-events and composes do_task. sendFn frames a
@@ -14,6 +16,11 @@ type eventHandler struct {
 	state  *CallState
 	audio  *AudioIO // nil in unit tests; the production half-duplex gate target
 	sendFn func(any) error
+	// respBusy is true while a realtime response is generating. injectResult must
+	// not send response.create while one is active (GA rejects it with
+	// conversation_already_has_active_response — surfaced in the async-injection
+	// de-risk). Maintained from response.created/response.done in handleEvent.
+	respBusy atomic.Bool
 }
 
 func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error) *eventHandler {
@@ -54,6 +61,10 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	}
 	_ = json.Unmarshal(raw, &ev)
 	switch ev.Type {
+	case "response.created":
+		// A response is now generating — injectResult must wait for its
+		// response.done before sending another response.create.
+		h.respBusy.Store(true)
 	case "response.function_call_arguments.done":
 		args := unwrapArgs(ev.Arguments)
 		h.handleFunctionCall(ctx, ev.CallID, ev.Name, args)
@@ -66,8 +77,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.audio.SetSpeaking(true)
 		}
 	case "response.done":
-		// Turn finished → ungate the mic. (Usage token capture for billing is the
-		// deferred daemon usage-relay → Plan D Cloud ingest.)
+		// Turn finished → ungate the mic + mark the response slot free. (Usage
+		// token capture for billing is the deferred daemon usage-relay → Plan D.)
+		h.respBusy.Store(false)
 		if h.audio != nil {
 			h.audio.SetSpeaking(false)
 		}
@@ -100,12 +112,18 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 			h.sendOutput(callID, *clarify)
 			return
 		}
-		// C-minimal: BLOCK for the back-brain turn (simplest first loop). C-full
-		// fast-acks "在弄了" and runs this in a goroutine via the same mapper.
+		// C-full async (deferred-ack): fast-ack so Koe speaks a short "on it"
+		// instead of going silent for the whole back-brain job, then run the turn
+		// in a goroutine and inject the result so Koe voices it. ctx is the
+		// Koe-process context (Connect's), so the turn is cancelled on Ctrl-C but
+		// outlives this (already-closed) realtime turn.
 		h.state.SetInFlight(req.Text)
-		out, derr := h.disp.client.DoTask(ctx, req)
-		h.state.ClearInFlight()
-		h.sendOutput(callID, MapDoTaskOutcome(out, derr))
+		h.sendOutput(callID, SayResult{Status: "injected", Say: "在弄了"})
+		go func() {
+			out, derr := h.disp.client.DoTask(ctx, req)
+			h.state.ClearInFlight()
+			h.injectResult(ctx, MapDoTaskOutcome(out, derr))
+		}()
 		return
 	}
 	// Fast tools (cancel/get_status/control_app/switch_agent).
@@ -135,4 +153,39 @@ func (h *eventHandler) sendRaw(callID string, output json.RawMessage) {
 		},
 	})
 	_ = h.sendFn(map[string]any{"type": "response.create"})
+}
+
+// injectResult voices an async do_task result by injecting it as an assistant
+// message + asking for a spoken response — the async-injection recipe verified
+// live in e2e_test.go (a function_call_output won't re-voice; an assistant
+// output_text message does). It serializes response.create against the in-flight
+// (fast-ack) response so GA doesn't reject it with
+// conversation_already_has_active_response.
+func (h *eventHandler) injectResult(ctx context.Context, r SayResult) {
+	if r.Status == "injected" || r.Say == "" {
+		return // OutcomeInjected carries an empty say — nothing new to voice.
+	}
+	_ = h.sendFn(map[string]any{
+		"type": "conversation.item.create",
+		"item": map[string]any{
+			"type":    "message",
+			"role":    "assistant",
+			"content": []map[string]any{{"type": "output_text", "text": r.Say}},
+		},
+	})
+	h.waitRespIdle(ctx)
+	_ = h.sendFn(map[string]any{"type": "response.create"})
+}
+
+// waitRespIdle blocks until no realtime response is generating (or ctx is done).
+// In basic async the fast-ack response is long finished by the time DoTask
+// returns, so this returns immediately; it guards the edge where DoTask is fast.
+func (h *eventHandler) waitRespIdle(ctx context.Context) {
+	for h.respBusy.Load() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }
