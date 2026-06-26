@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -117,7 +116,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Plan B wiring: link + resolver + dispatcher + per-call state.
+	// Plan B wiring: link + resolver + per-call state.
 	client := koe.NewDaemonClient(cfg.daemonURL)
 	agents, err := client.ListAgents(ctx)
 	if err != nil {
@@ -126,44 +125,44 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	resolver := koe.NewAgentResolver(agents, koe.NoopSemanticMatcher{})
 	state := koe.NewCallState(newBurstID(), cfg.agent)
 
-	// G2: Kocoro Desktop control channel. When Desktop spawns `shan koe
-	// --control-port N`, stand up the control server so it receives voice_state /
-	// control_app SSE and the control_app tool routes to the Desktop window. No
-	// port = standalone CLI (no control channel).
-	var onVoiceState func(string)
-	var onCallState func(string)
-	var controlApp koe.ControlAppFunc
-	// callGate is the Desktop press-to-talk switch: mic stays muted until a call is
-	// started (double-tap ⌥ / menu / the settings-configured trigger). callActive
-	// stays nil in standalone/E2E mode → always-listen.
-	var callGate atomic.Bool
-	var callActive func() bool
-	if cfg.controlPort != "" {
-		callActive = callGate.Load
-		var ctrl *koe.ControlServer
-		ctrl = koe.NewControlServer(
-			// onStart: a call began (POST /call/start from the double-tap, menu, or
-			// configured trigger) — open the mic gate + show the listening sprite.
-			func() { callGate.Store(true); ctrl.EmitVoiceState("listening") },
-			// onEnd: the call ended — mute the mic + clear the sprite/popup + report ended.
-			func() { callGate.Store(false); ctrl.EmitVoiceState("idle"); ctrl.EmitCallState("ended") },
-		)
-		onVoiceState = ctrl.EmitVoiceState
-		onCallState = ctrl.EmitCallState
-		controlApp = func(_ context.Context, action string) error {
-			ctrl.EmitControlApp(action)
-			return nil
-		}
+	// G3: relay each turn's token usage via the daemon to Cloud (fire-and-forget; a
+	// usage failure never interrupts the call, and Koe never sees pricing).
+	onUsage := func(usage json.RawMessage) {
 		go func() {
-			addr := "127.0.0.1:" + cfg.controlPort
-			if err := http.ListenAndServe(addr, ctrl.Handler()); err != nil {
-				log.Printf("koe: control server on %s exited: %v", addr, err)
+			if uerr := client.SendRealtimeUsage(context.Background(), usage); uerr != nil {
+				log.Printf("koe: usage relay failed: %v", uerr)
 			}
 		}()
 	}
-	disp := koe.NewDispatcher(client, resolver, state, controlApp)
+	// mintEK mints a fresh ephemeral secret (ephemeral keys are short-lived, so this
+	// runs per call): a dev key (--openai-key/OPENAI_API_KEY) takes the direct mint,
+	// else the via-daemon relay (Koe holds no long-lived credential).
+	mintEK := func(mctx context.Context) (string, error) {
+		if cfg.openAIKey != "" {
+			return koe.MintEphemeral(mctx, cfg.openAIKey, cfg.model)
+		}
+		return client.MintViaDaemon(mctx, cfg.model)
+	}
+	// persona-profile: the daemon's small-tier-distilled user context appended to the
+	// base persona (who the user is, how to address them), fetched once — bounded to
+	// 3s, best-effort — and reused across calls.
+	persona := koePersona
+	pctx, pcancel := context.WithTimeout(ctx, 3*time.Second)
+	if extra, perr := client.FetchPersona(pctx); perr == nil && extra != "" {
+		persona = koePersona + " " + extra
+	}
+	pcancel()
 
-	// Audio + WebRTC.
+	// ── Kocoro Desktop (control-port) mode: per-call device + session lifecycle ──
+	// The mic device and the OpenAI session are opened on /call/start and torn down
+	// on /call/end, so the macOS mic indicator is transient and the mic is never held
+	// open while idle (B1 / F1). koe stays resident but idle between calls.
+	if cfg.controlPort != "" {
+		return runDesktopCall(ctx, cfg, client, resolver, state, persona, mintEK, onUsage)
+	}
+
+	// ── Standalone / headless mode: always-on (CLI + E2E + --say/--audio-in) ──
+	disp := koe.NewDispatcher(client, resolver, state, nil)
 	audio, err := koe.NewAudioIO()
 	if err != nil {
 		return fmt.Errorf("audio init: %v", err)
@@ -190,52 +189,19 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	}
 	defer audio.Stop()
 
-	// Mint the ephemeral secret. Production path is the via-daemon relay (Koe
-	// never holds a long-lived credential). A dev key (--openai-key/OPENAI_API_KEY)
-	// takes the direct mint instead — the C-minimal escape hatch for running
-	// without a signed-in daemon.
-	var ek string
-	if cfg.openAIKey != "" {
-		ek, err = koe.MintEphemeral(ctx, cfg.openAIKey, cfg.model) // DEV-KEY: direct dev mint
-	} else {
-		ek, err = client.MintViaDaemon(ctx, cfg.model) // via daemon → Cloud
-	}
+	ek, err := mintEK(ctx)
 	if err != nil {
 		return fmt.Errorf("mint: %v", err)
 	}
-	// G3: relay each turn's token usage via the daemon to Cloud for server-side
-	// cost + quota (fire-and-forget; a usage failure never interrupts the call,
-	// and Koe never sees pricing). Active whenever the daemon is reachable.
-	onUsage := func(usage json.RawMessage) {
-		go func() {
-			if err := client.SendRealtimeUsage(context.Background(), usage); err != nil {
-				log.Printf("koe: usage relay failed: %v", err)
-			}
-		}()
-	}
-	// persona-profile: append the daemon's small-tier-distilled user context (who
-	// the user is, how to address them) to the base persona, so Kocoro greets the
-	// user as themselves. Bounded to 3s + best-effort — a slow/failed distill must
-	// not delay or block the call; Koe then speaks with its base persona only.
-	persona := koePersona
-	pctx, pcancel := context.WithTimeout(ctx, 3*time.Second)
-	if extra, perr := client.FetchPersona(pctx); perr == nil && extra != "" {
-		persona = koePersona + " " + extra
-	}
-	pcancel()
 
 	// Debug harness: --once exits a short grace after the reply finishes (→
 	// "listening"), pausing the timer while thinking/speaking so do_task latency
-	// doesn't trip it; --timeout is a hard fallback. Wired even in standalone file
-	// mode (no control channel) by composing onto any existing emitter.
+	// doesn't trip it; --timeout is a hard fallback.
+	var onVoiceState func(string)
 	if cfg.once {
-		prev := onVoiceState
 		var graceMu sync.Mutex
 		var graceTimer *time.Timer
 		onVoiceState = func(s string) {
-			if prev != nil {
-				prev(s)
-			}
 			graceMu.Lock()
 			defer graceMu.Unlock()
 			if graceTimer != nil {
@@ -252,10 +218,8 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 
 	conn, err := koe.Connect(ctx, audio, ek, persona, state, disp, koe.ConnectOptions{
 		OnVoiceState: onVoiceState,
-		OnCallState:  onCallState,
 		Model:        cfg.model,
 		OnUsage:      onUsage,
-		CallActive:   callActive,
 	})
 	if err != nil {
 		return fmt.Errorf("connect: %v", err)
@@ -271,5 +235,101 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		log.Printf("koe[debug]: captured %d samples (%.2fs) rms=%.4f peak=%.4f disc=%.4f silence=%.2f clip=%.4f",
 			m.Samples, float64(m.Samples)/48000, m.RMS, m.Peak, m.DiscontinuityRatio, m.SilenceRatio, m.ClippingRatio)
 	}
+	return nil
+}
+
+// runDesktopCall is the resident control-port loop. It stands up the Desktop
+// control server and opens the mic device + OpenAI session ONLY for the duration of
+// a call (/call/start → /call/end). Between calls koe holds no device and no
+// network session, so the macOS mic indicator is transient (B1 / F1). A fresh
+// AudioIO + RealtimeConn + ephemeral key is minted per call; the process-wide oto
+// playback context is reused across calls.
+func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient,
+	resolver *koe.AgentResolver, state *koe.CallState, persona string,
+	mintEK func(context.Context) (string, error), onUsage func(json.RawMessage)) error {
+
+	var ctrl *koe.ControlServer
+	disp := koe.NewDispatcher(client, resolver, state, func(_ context.Context, action string) error {
+		ctrl.EmitControlApp(action)
+		return nil
+	})
+
+	// The AudioIO + RealtimeConn live only between start and end; callCancel stops
+	// the conn's send pump (which runs on callCtx, not the process ctx, so a hang-up
+	// doesn't leak it across calls).
+	var sessMu sync.Mutex
+	var curAudio *koe.AudioIO
+	var curConn *koe.RealtimeConn
+	var callCancel context.CancelFunc
+
+	startCall := func() {
+		sessMu.Lock()
+		defer sessMu.Unlock()
+		if curConn != nil {
+			return // already in a call
+		}
+		audio, aerr := koe.NewAudioIO()
+		if aerr != nil {
+			log.Printf("koe: audio init failed: %v", aerr)
+			return
+		}
+		start := audio.Start
+		if cfg.aec == "vpio" {
+			start = audio.StartVPIO
+		}
+		if serr := start(); serr != nil {
+			log.Printf("koe: audio start failed: %v", serr)
+			audio.Stop()
+			return
+		}
+		mctx, mcancel := context.WithTimeout(ctx, 15*time.Second)
+		ek, merr := mintEK(mctx)
+		mcancel()
+		if merr != nil {
+			log.Printf("koe: mint failed: %v", merr)
+			audio.Stop()
+			return
+		}
+		callCtx, cancel := context.WithCancel(ctx)
+		conn, cerr := koe.Connect(callCtx, audio, ek, persona, state, disp, koe.ConnectOptions{
+			OnVoiceState: ctrl.EmitVoiceState,
+			OnCallState:  ctrl.EmitCallState,
+			Model:        cfg.model,
+			OnUsage:      onUsage,
+		})
+		if cerr != nil {
+			log.Printf("koe: connect failed: %v", cerr)
+			cancel()
+			audio.Stop()
+			return
+		}
+		curAudio, curConn, callCancel = audio, conn, cancel
+		ctrl.EmitVoiceState("listening")
+	}
+
+	endCall := func() {
+		sessMu.Lock()
+		defer sessMu.Unlock()
+		if curConn == nil {
+			return
+		}
+		callCancel() // stop the send pump + any in-flight do_task
+		curConn.Close()
+		curAudio.Stop() // closes the mic device → the macOS indicator goes away
+		curAudio, curConn, callCancel = nil, nil, nil
+		ctrl.EmitVoiceState("idle")
+		ctrl.EmitCallState("ended")
+	}
+
+	ctrl = koe.NewControlServer(startCall, endCall)
+	go func() {
+		addr := "127.0.0.1:" + cfg.controlPort
+		if err := http.ListenAndServe(addr, ctrl.Handler()); err != nil {
+			log.Printf("koe: control server on %s exited: %v", addr, err)
+		}
+	}()
+
+	<-ctx.Done()
+	endCall() // tear down any in-flight call on process shutdown
 	return nil
 }
