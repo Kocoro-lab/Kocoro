@@ -1227,7 +1227,7 @@ func AppendAllowedCommand(shannonDir, pattern string) error {
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return fmt.Errorf("flock: %w", err)
+		return fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
@@ -1300,7 +1300,7 @@ func AppendGlobalAlwaysAllowTool(shannonDir, tool string) error {
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return fmt.Errorf("flock: %w", err)
+		return fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
@@ -1367,7 +1367,7 @@ func RemoveGlobalAlwaysAllowTool(shannonDir, tool string) error {
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return fmt.Errorf("flock: %w", err)
+		return fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
@@ -1461,7 +1461,7 @@ func AppendGlobalDisabledSkills(shannonDir string, skills []string) error {
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return fmt.Errorf("flock: %w", err)
+		return fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
@@ -1556,7 +1556,7 @@ func RemoveGlobalDisabledSkills(shannonDir string, skills []string) error {
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return fmt.Errorf("flock: %w", err)
+		return fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
@@ -1632,7 +1632,7 @@ func AppendDefaultAgentDisabledMCPServer(shannonDir, server string) error {
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return fmt.Errorf("flock: %w", err)
+		return fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
@@ -1697,7 +1697,7 @@ func RemoveDefaultAgentDisabledMCPServer(shannonDir, server string) error {
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return fmt.Errorf("flock: %w", err)
+		return fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
