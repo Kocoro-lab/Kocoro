@@ -200,10 +200,21 @@ func resolveRegistryURL(deps *ServerDeps) string {
 	return defaultURL
 }
 
+// applyMarketplaceRetryPolicy injects the config-tunable transient-failure
+// retry policy (skills.marketplace.max_attempts / .retry_base_backoff_secs)
+// into a catalog client. Non-positive values leave the client's defaults.
+func applyMarketplaceRetryPolicy(c *skills.MarketplaceClient) *skills.MarketplaceClient {
+	c.SetRetryPolicy(
+		viper.GetInt("skills.marketplace.max_attempts"),
+		time.Duration(viper.GetInt("skills.marketplace.retry_base_backoff_secs"))*time.Second,
+	)
+	return c
+}
+
 // newMarketplaceClient builds the static-registry catalog client that backs the
 // /skills/marketplace/* endpoints (the contract the macOS Desktop consumes).
 func newMarketplaceClient(deps *ServerDeps) *skills.MarketplaceClient {
-	return skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour)
+	return applyMarketplaceRetryPolicy(skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour))
 }
 
 // newClawHubClient builds the live ClawHub catalog client that backs the
@@ -216,7 +227,7 @@ func newClawHubClient(deps *ServerDeps) *skills.MarketplaceClient {
 			base = u
 		}
 	}
-	return skills.NewClawHubMarketplaceClient(base, 1*time.Hour)
+	return applyMarketplaceRetryPolicy(skills.NewClawHubMarketplaceClient(base, 1*time.Hour))
 }
 
 var (
@@ -4117,8 +4128,8 @@ func (s *Server) handleClawHubInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	entry := skills.MarketplaceEntry{
-		Slug:        slug,
-		Name:        slug,
+		Slug: slug,
+		Name: slug,
 		// owner disambiguates slugs shared by multiple publishers; without it
 		// ClawHub's download endpoint 409s on an ambiguous slug.
 		DownloadURL: s.clawhub.ClawHubDownloadURL(slug, r.URL.Query().Get("owner")),
