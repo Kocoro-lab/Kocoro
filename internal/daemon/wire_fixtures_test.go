@@ -448,6 +448,13 @@ func TestWireFixture_Tool_PerRequestSSE(t *testing.T) {
 // handleMessageSSE marshals *RunAgentResult directly (mustJSON(result)), so
 // serializing the producer type IS the production path; running a full
 // RunAgent here would require an LLM.
+//
+// RunAgentResult also carries reply_to_message_id and pending_ack_message_ids
+// (both omitempty): set only when the run absorbed mid-run injected follow-ups
+// and answers/acks them under their own cloud ids (WS reply addressing). They are
+// absent from this typical fixture; Desktop's done consumer ignores them (it
+// renders from the disk-refreshed transcript), but the consumer struct below
+// lists them so the additive fields stay decode-checked.
 func TestWireFixture_Done_PerRequestSSE(t *testing.T) {
 	fixture := loadWireFixture(t, "sse_event.done.json")
 
@@ -467,10 +474,12 @@ func TestWireFixture_Done_PerRequestSSE(t *testing.T) {
 	assertSemanticEqual(t, fixture, produced)
 
 	var done struct {
-		Reply     string `json:"reply"`
-		SessionID string `json:"session_id"`
-		Agent     string `json:"agent"`
-		Usage     struct {
+		Reply                string   `json:"reply"`
+		ReplyToMessageID     string   `json:"reply_to_message_id"`
+		PendingAckMessageIDs []string `json:"pending_ack_message_ids"`
+		SessionID            string   `json:"session_id"`
+		Agent                string   `json:"agent"`
+		Usage                struct {
 			InputTokens  int     `json:"input_tokens"`
 			OutputTokens int     `json:"output_tokens"`
 			TotalTokens  int     `json:"total_tokens"`

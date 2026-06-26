@@ -877,10 +877,24 @@ func routeTitle(source, channel, sender string) string {
 
 // RunAgentResult is the output from RunAgent.
 type RunAgentResult struct {
-	Reply     string        `json:"reply"`
-	SessionID string        `json:"session_id"`
-	Agent     string        `json:"agent"`
-	Usage     RunAgentUsage `json:"usage"`
+	Reply string `json:"reply"`
+	// ReplyToMessageID is the cloud message id the final Reply should be
+	// addressed to — the LAST inbound message the run processed. It differs from
+	// the run's primary inbound id when a mid-run injected follow-up (a rapid or
+	// multi-user message) was absorbed: the run answers that follow-up under its
+	// own id so the channel renders separate messages instead of one merged
+	// reply. Empty when the loop carried no id (non-IM / non-routed paths);
+	// callers fall back to the inbound message id.
+	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
+	// PendingAckMessageIDs lists every inbound cloud message id the run absorbed
+	// but did not independently reply to (intermediate answers are already
+	// reply+acked). The daemon acks ALL of these only AFTER the final reply is
+	// delivered, so a reply failure replays them instead of losing the answer.
+	// Includes ReplyToMessageID. Empty for non-IM / non-routed runs.
+	PendingAckMessageIDs []string      `json:"pending_ack_message_ids,omitempty"`
+	SessionID            string        `json:"session_id"`
+	Agent                string        `json:"agent"`
+	Usage                RunAgentUsage `json:"usage"`
 	// Partial=true + FailureCode indicate the run completed "softly" — the
 	// reply is valid and should be shown, but the loop layer flagged it as
 	// abnormal (e.g. loop-detector force-stop). Treat as a soft warning, not
@@ -2263,6 +2277,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// "processing" exactly once at first-turn entry. Empty fields short-
 	// circuit inside the loop's first-turn check.
 	loop.SetFirstTurnLifecycle(req.CloudMessageID, req.IMStatusContext)
+	// Seed the reply target with the primary inbound message id. The loop
+	// advances it to a drained follow-up's id (commitInjectedTurn); the final
+	// value (ReplyCloudMessageID) addresses the run's final channel reply, so an
+	// absorbed follow-up is answered under its own id instead of the primary's.
+	loop.SetReplyCloudMessageID(req.CloudMessageID)
 	// Wire mailbox row consumption for legacy injected mailbox IDs. The
 	// modern POST /queue path is queue-only, but this keeps older injected
 	// ID paths idempotent if they appear in a live loop.
@@ -2513,20 +2532,25 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		// Return a partial result alongside the error so schedulers (and any
 		// other lifecycle observer) can stamp "last run pointed at session X"
-		// even when the LLM call hard-errored. Production callers (cmd/daemon.go
-		// and heartbeat.go) gate on err first and never deref result on error,
-		// so this is a wire-safe upgrade.
+		// even when the LLM call hard-errored. Callers gate on err first;
+		// cmd/daemon.go additionally reads the reply-addressing fields
+		// (ReplyToMessageID / PendingAckMessageIDs) on this post-loop error path
+		// behind a nil guard, so a failed run that already absorbed follow-ups
+		// addresses the error to the last processed id and acks every absorbed
+		// inbound after delivery. heartbeat.go does not deref result on error.
 		//
 		// Usage uses the same resolver as the success path so a turn that
 		// spent tokens before failing on a later LLM call doesn't report
 		// $0 / 0 tokens in the failed schedule_run event.
 		return &RunAgentResult{
-			SessionID:         savedSessionID,
-			Agent:             agentName,
-			Usage:             computeReportedUsage(usage, handler),
-			FailureCode:       status.FailureCode,
-			MessageStartIndex: turnBase.msgCount,
-			MessageEndIndex:   len(sess.Messages),
+			SessionID:            savedSessionID,
+			Agent:                agentName,
+			Usage:                computeReportedUsage(usage, handler),
+			FailureCode:          status.FailureCode,
+			ReplyToMessageID:     loop.ReplyCloudMessageID(),
+			PendingAckMessageIDs: loop.PendingAckIDs(),
+			MessageStartIndex:    turnBase.msgCount,
+			MessageEndIndex:      len(sess.Messages),
 		}, fmt.Errorf("agent error for %s: %w", agentName, runErr)
 	}
 	if errors.Is(runErr, agent.ErrMaxIterReached) {
@@ -2741,14 +2765,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		returnedSessionID = ""
 	}
 	return &RunAgentResult{
-		Reply:             result,
-		SessionID:         returnedSessionID,
-		Agent:             agentName,
-		Usage:             reportedUsage,
-		Partial:           status.Partial,
-		FailureCode:       status.FailureCode,
-		MessageStartIndex: turnBase.msgCount,
-		MessageEndIndex:   len(sess.Messages),
+		Reply:                result,
+		ReplyToMessageID:     loop.ReplyCloudMessageID(),
+		PendingAckMessageIDs: loop.PendingAckIDs(),
+		SessionID:            returnedSessionID,
+		Agent:                agentName,
+		Usage:                reportedUsage,
+		Partial:              status.Partial,
+		FailureCode:          status.FailureCode,
+		MessageStartIndex:    turnBase.msgCount,
+		MessageEndIndex:      len(sess.Messages),
 	}, nil
 }
 

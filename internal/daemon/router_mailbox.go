@@ -190,10 +190,19 @@ func (sc *SessionCache) ReEnqueueInjectSurvivors(key string) int {
 				continue
 			}
 			msg := agenttypes.QueuedMessage{
-				ID:              newQueueID(),
-				RouteKey:        key,
-				Source:          "inject-survivor",
-				CWD:             s.CWD,
+				ID:       newQueueID(),
+				RouteKey: key,
+				Source:   "inject-survivor",
+				CWD:      s.CWD,
+				// Carry the survivor's cloud id so a reconnect replay of the SAME
+				// inbound is INSERT-OR-IGNORE deduped against this row instead of
+				// processed twice. Caveat: the next run's mailbox drain does NOT ack
+				// this CloudMsgID (mailbox-drained rows don't feed the reply/ack
+				// path), so a suppressed inject stranded here stays un-acked until a
+				// run answers it or Cloud's replay TTL expires — fallback-to-replay,
+				// never silent loss. (The pre-suppress code acked injects on accept;
+				// this teardown-race path now defers that to replay.)
+				CloudMsgID:      s.CloudMessageID,
 				Text:            s.Text,
 				ClientMessageID: s.ClientMessageID,
 				Priority:        agenttypes.PriorityNext,

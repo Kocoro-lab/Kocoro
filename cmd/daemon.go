@@ -472,18 +472,18 @@ var daemonStartCmd = &cobra.Command{
 					// later when the agent loop drains it. No-op on non-IM sources
 					// (empty IMStatusContext); see emitLifecycleReceived guards.
 					emitLifecycleReceived(wsClient, msg.MessageID, msg.IMStatusContext)
-					// Message injected — running loop will incorporate it.
-					// Suppress the explicit ack on messaging platforms: the user's
-					// own message is already visible in the thread and the active
-					// run's streamer (Slack/Feishu/WeCom) is already updating an
-					// in-place "Processing..." block. The bracket text would just
-					// be persistent noise. CLI/TUI flows still get the ack so
-					// users typing into a running agent know their input was
-					// queued. See daemon.IsMessagingPlatform.
-					if daemon.IsMessagingPlatform(source) {
-						return ""
-					}
-					return "[message received, processing...]"
+					// The active run that absorbed this follow-up delivers its real
+					// reply under THIS message's own cloud id: the loop advances its
+					// reply target on drain, then OnIntermediateAnswer (superseded
+					// turns) and SetReplyPlan (final reply + co-acks) address the
+					// run's replies per inbound message. Suppress this message's own
+					// reply AND ack here so each inbound gets exactly one completion
+					// from the owning run — not an empty reply that lets Cloud
+					// collapse two answers into a single channel message (the Teams
+					// "two replies merged into one" bug). The owning run acks this id
+					// only after its real reply is delivered (ack-after-delivery).
+					wsClient.SuppressReply(msg.MessageID)
+					return ""
 				case daemon.InjectQueueFull:
 					// Active run exists but queue saturated — don't start a new run.
 					log.Printf("daemon: inject queue full for route %q, message dropped", req.RouteKey)
@@ -532,10 +532,25 @@ var daemonStartCmd = &cobra.Command{
 			result, err := daemon.RunAgent(msgCtx, deps, req, handler)
 			if err != nil {
 				// Full error already logged inside RunAgent; return clean message.
+				// On the post-loop error path RunAgent returns a non-nil result, so
+				// a run that already absorbed follow-ups can still address the error
+				// to the last processed id and ack every absorbed id after delivery
+				// — otherwise the error strands on the primary while injected
+				// handlers suppressed their own replies. Guard for the early-setup
+				// errors that return a nil result.
+				if result != nil && result.ReplyToMessageID != "" {
+					wsClient.SetReplyPlan(msg.MessageID, result.ReplyToMessageID, result.PendingAckMessageIDs)
+				}
 				return daemon.FriendlyAgentError(err)
 			}
 
 			log.Printf("daemon: reply to %s (%d tokens, $%.4f)", result.Agent, result.Usage.TotalTokens, result.Usage.CostUSD)
+			// Finalize the reply plan: address the final reply to the LAST message
+			// the run processed (a run that absorbed mid-run follow-ups answers the
+			// latest one) and ack every absorbed inbound id only AFTER that reply
+			// is delivered. Earlier turns answered via OnIntermediateAnswer are
+			// already reply+acked and excluded from PendingAckMessageIDs.
+			wsClient.SetReplyPlan(msg.MessageID, result.ReplyToMessageID, result.PendingAckMessageIDs)
 			return result.Reply
 		}, func(text string) {
 			log.Printf("daemon: [system] %s", text)
@@ -586,8 +601,8 @@ var daemonStartCmd = &cobra.Command{
 			}
 			authClient := client.NewAuthClient(cfg.Endpoint, gw.HTTPClient())
 			authMgr = daemon.NewAuthManager(daemon.AuthManagerConfig{
-				Keychain: kcStore,
-				Cloud:    authClient,
+				Keychain:   kcStore,
+				Cloud:      authClient,
 				Gateway:    gw,
 				WSClient:   wsClient,
 				Cfg:        cfg,
@@ -1173,22 +1188,39 @@ func (h *daemonEventHandler) OnText(text string) {
 	// through OnPreamble (which keeps sending LLM_OUTPUT).
 }
 
-// OnIntermediateAnswer surfaces the final answer of a turn that an injected
-// follow-up superseded (the loop continued past it instead of returning).
-// Because OnText is a no-op and the run-end SendReply only carries the LAST
-// turn's answer, an earlier turn's reply would otherwise be dropped from the
-// channel when rapid follow-ups merge into one run. Emit it as a timeline
-// segment (LLM_OUTPUT — the same wire event as OnPreamble) so it appears inline
-// in the IM timeline; this deliberately avoids a second WORKFLOW_COMPLETED,
-// which would read as a premature run completion on the Cloud side.
-func (h *daemonEventHandler) OnIntermediateAnswer(text string) {
+// OnIntermediateAnswer completes the channel reply for the inbound message THIS
+// turn answered (cloudMessageID) — the run continued past it for an injected
+// follow-up, so it is not the run's final reply. Sending it as a normal reply
+// (SendReply + delivery ack) addressed to that message's own cloud id makes a
+// run that merged rapid / multi-user follow-ups render one channel message per
+// inbound message instead of collapsing them into the final reply (the Teams
+// "two replies merged into one" bug). It is the same wire shape Cloud already
+// renders as one message per message_id; because this id differs from the run's
+// final reply id, the extra WORKFLOW_COMPLETED is a separate stream's legitimate
+// completion, not a premature one. Falls back to the run's primary id when the
+// loop carried none (non-routed paths).
+func (h *daemonEventHandler) OnIntermediateAnswer(text, cloudMessageID string) {
 	if text == "" {
 		return
 	}
-	if h.wsClient != nil && h.messageID != "" {
-		if err := h.wsClient.SendEvent(h.messageID, "LLM_OUTPUT", text, nil); err != nil {
-			log.Printf("daemon: event forward failed: %v", err)
-		}
+	replyID := cloudMessageID
+	if replyID == "" {
+		replyID = h.messageID
+	}
+	if h.wsClient == nil || replyID == "" {
+		return
+	}
+	if err := h.wsClient.SendReply(replyID, daemon.ReplyPayload{
+		Channel:  h.channel,
+		ThreadID: h.threadID,
+		Text:     text,
+		Format:   daemon.FormatText,
+	}); err != nil {
+		log.Printf("daemon: intermediate reply failed for %s: %v", replyID, err)
+		return
+	}
+	if err := h.wsClient.SendDeliveryAck(replyID); err != nil {
+		log.Printf("daemon: intermediate delivery_ack failed for %s: %v", replyID, err)
 	}
 }
 
