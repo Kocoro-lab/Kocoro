@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -140,7 +141,21 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	if err != nil {
 		return fmt.Errorf("mint: %v", err)
 	}
-	conn, err := koe.Connect(ctx, audio, ek, koePersona, state, disp, onVoiceState)
+	// G3: relay each turn's token usage via the daemon to Cloud for server-side
+	// cost + quota (fire-and-forget; a usage failure never interrupts the call,
+	// and Koe never sees pricing). Active whenever the daemon is reachable.
+	onUsage := func(usage json.RawMessage) {
+		go func() {
+			if err := client.SendRealtimeUsage(context.Background(), usage); err != nil {
+				log.Printf("koe: usage relay failed: %v", err)
+			}
+		}()
+	}
+	conn, err := koe.Connect(ctx, audio, ek, koePersona, state, disp, koe.ConnectOptions{
+		OnVoiceState: onVoiceState,
+		Model:        cfg.model,
+		OnUsage:      onUsage,
+	})
 	if err != nil {
 		return fmt.Errorf("connect: %v", err)
 	}

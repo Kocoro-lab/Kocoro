@@ -170,11 +170,17 @@ func MintEphemeral(ctx context.Context, apiKey, model string) (string, error) {
 	return mintEphemeral(ctx, apiKey, model)
 }
 
+// ConnectOptions carries the optional Desktop/billing hooks (all nil/zero-safe).
+type ConnectOptions struct {
+	OnVoiceState func(string)          // G2: Desktop control channel voice state (listening/thinking/speaking)
+	Model        string                // G3: realtime model id stamped into usage reports
+	OnUsage      func(json.RawMessage) // G3: per-turn usage relay (→ daemon → Cloud)
+}
+
 // Connect builds the peer connection, dials OpenAI, configures the session, and
-// starts the send-pump + event-dispatch loops. Returns once connected. onVoiceState
-// (nil-safe) receives listening/thinking/speaking transitions for the Desktop
-// control channel (G2 → Kocoro Island sprite).
-func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *CallState, disp *Dispatcher, onVoiceState func(string)) (*RealtimeConn, error) {
+// starts the send-pump + event-dispatch loops. Returns once connected. opts
+// carries the optional Desktop (G2) + billing (G3) hooks.
+func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions) (*RealtimeConn, error) {
 	rc, err := newPeerConnection(audio)
 	if err != nil {
 		return nil, err
@@ -183,7 +189,9 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 		b, _ := json.Marshal(v)
 		return rc.dc.SendText(string(b))
 	})
-	h.onVoiceState = onVoiceState
+	h.onVoiceState = opts.OnVoiceState
+	h.model = opts.Model
+	h.onUsage = opts.OnUsage
 	// configured closes when OpenAI acks our session.update. The send pump waits
 	// on it: if mic audio reaches the server before the tools/voice config lands,
 	// the VAD-triggered auto response snapshots the default config (no tools) and

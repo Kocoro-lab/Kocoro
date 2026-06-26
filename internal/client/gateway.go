@@ -1098,6 +1098,35 @@ func (c *GatewayClient) MintRealtime(ctx context.Context, model, voice string) (
 	return json.RawMessage(raw), nil
 }
 
+// SendRealtimeUsage forwards a realtime usage report (from a `response.done`
+// event: model, response_id, token details) to the Cloud usage-ingest endpoint,
+// which computes the cost server-side and debits quota. The daemon relays Koe's
+// usage body verbatim — Koe never sees pricing. Returns the raw Cloud JSON
+// ({cost_usd, billable_tokens, ...}).
+func (c *GatewayClient) SendRealtimeUsage(ctx context.Context, body json.RawMessage) (json.RawMessage, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/usage/realtime", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		httpReq.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(raw)}
+	}
+	return json.RawMessage(raw), nil
+}
+
 // StreamDelta represents an incremental text chunk from streaming completion.
 type StreamDelta struct {
 	Text string

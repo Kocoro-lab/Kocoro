@@ -24,12 +24,43 @@ type eventHandler struct {
 	// onVoiceState (nil-safe) pushes the ambient voice state to the Desktop control
 	// channel (G2) so the Kocoro Island sprite tracks listening/thinking/speaking.
 	onVoiceState func(string)
+	// model + onUsage (nil-safe) report per-turn token usage for billing (G3): on
+	// each response.done, build {model, response_id, usage} and fire onUsage, which
+	// relays via the daemon to Cloud (server-side cost). Koe never sees pricing.
+	model   string
+	onUsage func(json.RawMessage)
 }
 
 func (h *eventHandler) emitVoiceState(state string) {
 	if h.onVoiceState != nil {
 		h.onVoiceState(state)
 	}
+}
+
+// reportUsage extracts response_id + usage from a response.done event and fires
+// the billing relay (fire-and-forget; a usage failure must not break the call).
+func (h *eventHandler) reportUsage(raw []byte) {
+	if h.onUsage == nil {
+		return
+	}
+	var rd struct {
+		Response struct {
+			ID    string          `json:"id"`
+			Usage json.RawMessage `json:"usage"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(raw, &rd); err != nil || rd.Response.ID == "" || len(rd.Response.Usage) == 0 {
+		return // no usage on this response.done (e.g. an early/failed turn)
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":       h.model,
+		"response_id": rd.Response.ID,
+		"usage":       rd.Response.Usage,
+	})
+	if err != nil {
+		return
+	}
+	h.onUsage(body)
 }
 
 func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error) *eventHandler {
@@ -94,6 +125,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.audio.SetSpeaking(false)
 		}
 		h.emitVoiceState("listening")
+		h.reportUsage(raw)
 	}
 }
 

@@ -66,6 +66,28 @@ func (c *DaemonClient) MintViaDaemon(ctx context.Context, model string) (string,
 	return mint.Value, nil
 }
 
+// SendRealtimeUsage reports a realtime usage record (model, response_id, token
+// details — built from a response.done event) to the daemon, which relays it to
+// Cloud for server-side cost + quota. Fire-and-forget from the call loop: a usage
+// POST failing must never interrupt the conversation. Koe never sees pricing.
+func (c *DaemonClient) SendRealtimeUsage(ctx context.Context, usage json.RawMessage) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/koe/realtime/usage", bytes.NewReader(usage))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.controlClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("daemon usage relay: HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // DoTaskRequest is the subset of the daemon's POST /message body that Koe sends.
 // Source is always "koe". ThreadID is the per-call burst id; Agent is the
 // resolved slug ("" = daemon default).
