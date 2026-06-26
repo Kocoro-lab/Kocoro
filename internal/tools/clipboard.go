@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"runtime"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
@@ -36,6 +37,9 @@ func (t *ClipboardTool) Info() agent.ToolInfo {
 }
 
 func (t *ClipboardTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if runtime.GOOS != "darwin" {
+		return agent.ToolResult{Content: "clipboard tool is only available on macOS", IsError: true}, nil
+	}
 	var args clipboardArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil

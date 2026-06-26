@@ -11,9 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills/bundled"
 	"gopkg.in/yaml.v3"
 )
@@ -22,22 +22,22 @@ import (
 // Includes prompt body and source, unlike SkillMeta (metadata only)
 // or Skill (which hides Source/Dir via json:"-" tags).
 type SkillDetail struct {
-	Name              string         `json:"name"`
-	Slug              string         `json:"slug"`
-	Description       string         `json:"description"`
-	Prompt            string         `json:"prompt"`
-	Source            string         `json:"source"`
-	InstallSource     string         `json:"install_source"`
-	MarketplaceSlug   string         `json:"marketplace_slug,omitempty"`
-	License           string         `json:"license,omitempty"`
-	Compatibility     string         `json:"compatibility,omitempty"`
-	Metadata          map[string]any `json:"metadata,omitempty"`
-	AllowedTools      []string       `json:"allowed_tools,omitempty"`
-	StickyInstructions bool          `json:"sticky_instructions,omitempty"`
-	Hidden            bool           `json:"hidden,omitempty"`
-	StickySnippet     string         `json:"sticky_snippet,omitempty"`
-	RequiredSecrets   []SecretSpec   `json:"required_secrets,omitempty"`
-	ConfiguredSecrets []string       `json:"configured_secrets,omitempty"`
+	Name               string         `json:"name"`
+	Slug               string         `json:"slug"`
+	Description        string         `json:"description"`
+	Prompt             string         `json:"prompt"`
+	Source             string         `json:"source"`
+	InstallSource      string         `json:"install_source"`
+	MarketplaceSlug    string         `json:"marketplace_slug,omitempty"`
+	License            string         `json:"license,omitempty"`
+	Compatibility      string         `json:"compatibility,omitempty"`
+	Metadata           map[string]any `json:"metadata,omitempty"`
+	AllowedTools       []string       `json:"allowed_tools,omitempty"`
+	StickyInstructions bool           `json:"sticky_instructions,omitempty"`
+	Hidden             bool           `json:"hidden,omitempty"`
+	StickySnippet      string         `json:"sticky_snippet,omitempty"`
+	RequiredSecrets    []SecretSpec   `json:"required_secrets,omitempty"`
+	ConfiguredSecrets  []string       `json:"configured_secrets,omitempty"`
 }
 
 // WriteGlobalSkill writes a skill to the global skills directory
@@ -210,10 +210,10 @@ func EnsureBuiltinSkills(shannonDir string) error {
 		return fmt.Errorf("open builtin lock: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
 		return fmt.Errorf("lock builtin: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	// Best-effort cleanup of the legacy version sidecar from the previous
 	// design. Safe to ignore errors — it is purely informational and an
