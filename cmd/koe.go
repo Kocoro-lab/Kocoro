@@ -25,6 +25,7 @@ type koeConfig struct {
 	model       string
 	language    string
 	controlPort string // Desktop↔Koe control server port (Kocoro Desktop passes it); empty = no control channel
+	aec         string // echo control: "" / "gate" = v1 half-duplex gate (default), "vpio" = Apple VoiceProcessingIO full-duplex AEC
 }
 
 func defaultKoeConfig() koeConfig {
@@ -54,6 +55,7 @@ var koeCmd = &cobra.Command{
 		}
 		cfg.language, _ = cmd.Flags().GetString("language")
 		cfg.controlPort, _ = cmd.Flags().GetString("control-port")
+		cfg.aec, _ = cmd.Flags().GetString("aec")
 
 		// No key check: with no --openai-key/OPENAI_API_KEY, runKoeCall mints via
 		// the daemon (production path — Koe holds no credential). A dev key, if set,
@@ -69,6 +71,7 @@ func init() {
 	koeCmd.Flags().String("model", "", "realtime model (default gpt-realtime-mini-2025-12-15)")
 	koeCmd.Flags().String("language", "", "conversation language hint")
 	koeCmd.Flags().String("control-port", "", "Desktop↔Koe control server port (Kocoro Desktop passes it)")
+	koeCmd.Flags().String("aec", "", "echo control: gate (default, half-duplex) | vpio (Apple VoiceProcessingIO full-duplex AEC)")
 	rootCmd.AddCommand(koeCmd)
 }
 
@@ -123,7 +126,11 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	if err != nil {
 		return fmt.Errorf("audio init: %v", err)
 	}
-	if err := audio.Start(); err != nil {
+	startAudio := audio.Start
+	if cfg.aec == "vpio" {
+		startAudio = audio.StartVPIO // Apple VoiceProcessingIO full-duplex AEC (terminal); default is the v1 half-duplex gate
+	}
+	if err := startAudio(); err != nil {
 		return fmt.Errorf("audio start: %v", err)
 	}
 	defer audio.Stop()
