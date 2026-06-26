@@ -24,6 +24,9 @@ type eventHandler struct {
 	// onVoiceState (nil-safe) pushes the ambient voice state to the Desktop control
 	// channel (G2) so the Kocoro Island sprite tracks listening/thinking/speaking.
 	onVoiceState func(string)
+	// curState holds the last emitted voice state (string) so the D3w level pump
+	// knows whether to report input (listening) or output (speaking) RMS.
+	curState atomic.Value
 	// model + onUsage (nil-safe) report per-turn token usage for billing (G3): on
 	// each response.done, build {model, response_id, usage} and fire onUsage, which
 	// relays via the daemon to Cloud (server-side cost). Koe never sees pricing.
@@ -32,9 +35,18 @@ type eventHandler struct {
 }
 
 func (h *eventHandler) emitVoiceState(state string) {
+	h.curState.Store(state)
 	if h.onVoiceState != nil {
 		h.onVoiceState(state)
 	}
+}
+
+// voiceState returns the last emitted voice state ("idle" before the first one).
+func (h *eventHandler) voiceState() string {
+	if v := h.curState.Load(); v != nil {
+		return v.(string)
+	}
+	return "idle"
 }
 
 // reportUsage extracts response_id + usage from a response.done event and fires

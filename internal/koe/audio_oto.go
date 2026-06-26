@@ -81,6 +81,7 @@ func (s *otoSource) Read(p []byte) (int, error) {
 	// 2. Pre-roll: until primed, emit silence until enough frames have queued.
 	if !s.primed {
 		if len(s.a.playBuf) < otoPrerollFrames {
+			s.a.setOutputLevel(0) // D3w: silent while pre-rolling
 			zeroBytes(p[i:])
 			return len(p), nil
 		}
@@ -91,6 +92,7 @@ func (s *otoSource) Read(p []byte) (int, error) {
 	for i < len(p) {
 		select {
 		case pcm := <-s.a.playBuf:
+			s.a.setOutputLevel(rmsLevel(pcm)) // D3w: reactive speaking amplitude
 			b := s16Bytes(pcm)
 			n := copy(p[i:], b)
 			i += n
@@ -99,6 +101,7 @@ func (s *otoSource) Read(p []byte) (int, error) {
 			}
 		default:
 			s.primed = false
+			s.a.setOutputLevel(0) // D3w: underran → silent
 			zeroBytes(p[i:])
 			return len(p), nil
 		}

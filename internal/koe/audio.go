@@ -3,6 +3,7 @@ package koe
 import (
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -46,7 +47,32 @@ type AudioIO struct {
 	// `shan koe --audio-in`/`--say`. When set, Stop() tears it down.
 	file   *fileBackend
 	primed atomic.Bool // file-backend renderInto pre-roll gate (audio_file.go)
+	// inLevel / outLevel hold the most recent captured / played frame RMS (0..1, as
+	// float64 bits) for the D3w reactive Island sprite. Updated on the audio threads,
+	// read by the level pump (webrtc.go).
+	inLevel  atomic.Uint64
+	outLevel atomic.Uint64
 }
+
+// rmsLevel returns the RMS amplitude of a PCM frame normalized to 0..1.
+func rmsLevel(pcm []int16) float64 {
+	if len(pcm) == 0 {
+		return 0
+	}
+	var sumSq float64
+	for _, s := range pcm {
+		v := float64(s)
+		sumSq += v * v
+	}
+	return math.Sqrt(sumSq/float64(len(pcm))) / 32768.0
+}
+
+func (a *AudioIO) setInputLevel(l float64)  { a.inLevel.Store(math.Float64bits(l)) }
+func (a *AudioIO) setOutputLevel(l float64) { a.outLevel.Store(math.Float64bits(l)) }
+
+// InputLevel / OutputLevel report the latest captured / played frame RMS (0..1).
+func (a *AudioIO) InputLevel() float64  { return math.Float64frombits(a.inLevel.Load()) }
+func (a *AudioIO) OutputLevel() float64 { return math.Float64frombits(a.outLevel.Load()) }
 
 // NewAudioIO builds the codec (no device opened yet — Start() opens it, so unit
 // tests can exercise Encode/Decode/gate without audio hardware).
@@ -190,6 +216,7 @@ func (a *AudioIO) Start() error {
 		// playback is oto's job now.)
 		if !a.dropCapture() {
 			frame := bytesToS16(in)
+			a.setInputLevel(rmsLevel(frame)) // D3w: reactive listening amplitude
 			select {
 			case a.frames <- frame:
 			default: // drop if the send path is behind

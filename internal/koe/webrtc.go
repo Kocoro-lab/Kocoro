@@ -196,6 +196,9 @@ type ConnectOptions struct {
 	// (~2s), "on_call" once OpenAI acks the session. "ended" is emitted by the
 	// control server on hang-up.
 	OnCallState func(string)
+	// OnVoiceLevel (nil-safe, D3w) receives (state, rms) at animation cadence while
+	// listening/speaking so the Desktop Island sprite tracks the real signal level.
+	OnVoiceLevel func(string, float64)
 }
 
 // Connect builds the peer connection, dials OpenAI, configures the session, and
@@ -254,5 +257,37 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 		}
 		rc.pumpSendTrack(ctx)
 	}()
+	// Level pump (D3w): emit the reactive RMS amplitude for the Desktop Island sprite
+	// at animation cadence while listening/speaking. thinking/idle carry no level
+	// (the sprite is self-driven there).
+	if opts.OnVoiceLevel != nil {
+		go func() {
+			ticker := time.NewTicker(levelPumpInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					// thinking is self-driven (no reactive level). speaking → output
+					// amplitude. Everything else (idle before the first event, or
+					// listening) means the mic is open → report the input amplitude.
+					switch h.voiceState() {
+					case "thinking":
+					case "speaking":
+						opts.OnVoiceLevel("speaking", audio.OutputLevel())
+					default:
+						opts.OnVoiceLevel("listening", audio.InputLevel())
+					}
+				}
+			}
+		}()
+	}
 	return rc, nil
 }
+
+// levelPumpInterval is the cadence of D3w reactive-amplitude updates. WORKLOAD: a
+// Desktop sprite animating to the voice level; SYMPTOM if too slow: choppy/laggy
+// amplitude; if too fast: needless SSE traffic. ~80 ms (~12 fps) is smooth for a
+// small sprite while staying well under the 20 ms audio-frame rate it samples.
+const levelPumpInterval = 80 * time.Millisecond

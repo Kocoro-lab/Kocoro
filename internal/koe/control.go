@@ -9,13 +9,20 @@ import (
 // controlEvent is one Koe→Desktop SSE payload, discriminated by Type. Wire shapes
 // are pinned in Plan E (the Desktop client) — keep them byte-identical:
 //
-//	{"type":"voice_state","state":"idle"|"listening"|"thinking"|"speaking"}
+//	{"type":"voice_state","state":"idle"|"listening"|"thinking"|"speaking"[,"level":0..1]}
 //	{"type":"control_app","action":"show"|"hide"|"new_conversation"|"open_settings"}
 //	{"type":"call_state","state":"connecting"|"on_call"|"ended"}
+//
+// level (D3w) is an additive, omitempty field carrying the reactive RMS amplitude
+// while listening (input) / speaking (output) so the Desktop Island sprite tracks
+// the real signal instead of a canned animation; absent on transition events and
+// for thinking/idle. The koe↔Desktop control channel has no handshake, so this is
+// additive-only (old Desktop ignores the field) — no capability token applies here.
 type controlEvent struct {
-	Type   string `json:"type"`
-	State  string `json:"state,omitempty"`  // voice_state / call_state
-	Action string `json:"action,omitempty"` // control_app
+	Type   string  `json:"type"`
+	State  string  `json:"state,omitempty"`  // voice_state / call_state
+	Action string  `json:"action,omitempty"` // control_app
+	Level  float64 `json:"level,omitempty"`  // voice_state reactive RMS amplitude (0..1)
 }
 
 // ControlServer is the Koe-side HTTP+SSE control channel for Kocoro Desktop: it
@@ -111,6 +118,13 @@ func (s *ControlServer) broadcast(ev controlEvent) {
 // EmitVoiceState pushes the ambient voice state to Desktop (drives the Island sprite).
 func (s *ControlServer) EmitVoiceState(state string) {
 	s.broadcast(controlEvent{Type: "voice_state", State: state})
+}
+
+// EmitVoiceLevel pushes a voice_state with the reactive RMS amplitude (D3w): the
+// level pump calls this at animation cadence while listening/speaking so the sprite
+// tracks the real signal. Same event type as EmitVoiceState — just with level set.
+func (s *ControlServer) EmitVoiceLevel(state string, level float64) {
+	s.broadcast(controlEvent{Type: "voice_state", State: state, Level: level})
 }
 
 // EmitControlApp asks Desktop to perform a window action (the control_app tool).

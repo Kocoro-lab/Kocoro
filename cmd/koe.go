@@ -294,6 +294,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		conn, cerr := koe.Connect(callCtx, audio, ek, persona, state, disp, koe.ConnectOptions{
 			OnVoiceState: ctrl.EmitVoiceState,
 			OnCallState:  ctrl.EmitCallState,
+			OnVoiceLevel: ctrl.EmitVoiceLevel,
 			Model:        cfg.model,
 			OnUsage:      onUsage,
 		})
