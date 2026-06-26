@@ -569,7 +569,7 @@ func TestClient_SendApprovalRequest_PutsMessageIDOnEnvelope(t *testing.T) {
 // TestCapabilities_AdvertisesDeliveryAck guards the contract the cloud
 // agent's tracker depends on: the daemon must announce "delivery_ack"
 // in its handshake whenever it ships ack-emission code. Drop this token
-// only by also removing the sendDeliveryAck call site — otherwise Cloud
+// only by also removing the SendDeliveryAck call site — otherwise Cloud
 // stops tracking but the daemon keeps emitting acks Cloud will warn on.
 func TestCapabilities_AdvertisesDeliveryAck(t *testing.T) {
 	found := false
@@ -643,8 +643,8 @@ func TestCapabilities_AdvertisesAgentProfileV1(t *testing.T) {
 // callers shouldn't have to guard.
 func TestSendDeliveryAck_EmptyMessageIDIsNoOp(t *testing.T) {
 	c := NewClient("ws://localhost:1/x", "", nil, nil)
-	if err := c.sendDeliveryAck(""); err != nil {
-		t.Errorf("sendDeliveryAck(\"\") = %v, want nil (no-op)", err)
+	if err := c.SendDeliveryAck(""); err != nil {
+		t.Errorf("SendDeliveryAck(\"\") = %v, want nil (no-op)", err)
 	}
 }
 
@@ -784,5 +784,147 @@ func TestSendProactive_StillDropsEmptyText(t *testing.T) {
 	}
 	if called {
 		t.Error("envelopeSender should not have been called for empty Text")
+	}
+}
+
+// TestClient_RedirectReply verifies the reply plan a run sets via SetReplyPlan:
+// the final reply is addressed to the redirected message id (the absorbed
+// follow-up), and EVERY id in the plan's ack list (the absorbed primary + the
+// followup) is delivery-acked — so a merged-follow-up run renders as the
+// follow-up's own channel message instead of collapsing into the primary's
+// reply, and no absorbed inbound is left un-acked.
+func TestClient_RedirectReply(t *testing.T) {
+	type frame struct {
+		typ  string
+		id   string
+		text string
+	}
+	frames := make(chan frame, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		payload, _ := json.Marshal(MessagePayload{Channel: "slack", Text: "hi"})
+		conn.WriteJSON(ServerMessage{Type: MsgTypeMessage, MessageID: "msg-primary", Payload: payload})
+		for {
+			var dm DaemonMessage
+			if err := conn.ReadJSON(&dm); err != nil {
+				return
+			}
+			switch dm.Type {
+			case MsgTypeClaim:
+				ack, _ := json.Marshal(ClaimAckPayload{Granted: true})
+				conn.WriteJSON(ServerMessage{Type: MsgTypeClaimAck, MessageID: dm.MessageID, Payload: ack})
+			case MsgTypeReply:
+				var rp ReplyPayload
+				json.Unmarshal(dm.Payload, &rp)
+				frames <- frame{typ: "reply", id: dm.MessageID, text: rp.Text}
+			case MsgTypeDeliveryAck:
+				frames <- frame{typ: "ack", id: dm.MessageID}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var c *Client
+	c = NewClient(wsURL, "", func(msg MessagePayload) string {
+		// A run that absorbed a follow-up: final reply → msg-followup; both the
+		// absorbed primary and the followup must be acked, but only AFTER the
+		// reply is delivered.
+		c.SetReplyPlan(msg.MessageID, "msg-followup", []string{"msg-primary", "msg-followup"})
+		return "final-answer"
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	go c.Listen(ctx)
+
+	// The run answered the injected follow-up (msg-followup), so its reply+ack go
+	// there. The primary (msg-primary) was absorbed into the run; whether or not
+	// it produced a standalone answer, it MUST still be acked so Cloud clears it
+	// from the replay buffer — otherwise it is redelivered on reconnect (the
+	// top-of-loop-drain regression: a follow-up arriving during tool use absorbs
+	// the primary with no intermediate answer, leaving it un-acked).
+	gotReply := false
+	acks := map[string]bool{}
+	for !(gotReply && acks["msg-primary"] && acks["msg-followup"]) {
+		select {
+		case f := <-frames:
+			switch f.typ {
+			case "reply":
+				gotReply = true
+				if f.id != "msg-followup" || f.text != "final-answer" {
+					t.Fatalf("reply = {id:%s text:%s}, want {id:msg-followup text:final-answer}", f.id, f.text)
+				}
+			case "ack":
+				acks[f.id] = true
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out: reply=%v acks=%v; want reply→msg-followup + acks for BOTH msg-primary (absorbed) and msg-followup", gotReply, acks)
+		}
+	}
+}
+
+// TestClient_SuppressReply verifies that when the onMsg callback suppresses the
+// reply (the message was injected into another active run that completes it under
+// its own id), handleMessage sends NEITHER a reply NOR an ack — the owning run
+// acks this id only after ITS reply is delivered (ack-after-delivery). An ack
+// here would drop the inbound from Cloud's replay buffer before the real reply
+// lands, losing the answer on a reply failure or crash.
+func TestClient_SuppressReply(t *testing.T) {
+	frames := make(chan DaemonMessage, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		payload, _ := json.Marshal(MessagePayload{Channel: "slack", Text: "hi"})
+		conn.WriteJSON(ServerMessage{Type: MsgTypeMessage, MessageID: "msg-inj", Payload: payload})
+		for {
+			var dm DaemonMessage
+			if err := conn.ReadJSON(&dm); err != nil {
+				return
+			}
+			if dm.Type == MsgTypeClaim {
+				ack, _ := json.Marshal(ClaimAckPayload{Granted: true})
+				conn.WriteJSON(ServerMessage{Type: MsgTypeClaimAck, MessageID: dm.MessageID, Payload: ack})
+				continue
+			}
+			frames <- dm
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	var c *Client
+	c = NewClient(wsURL, "", func(msg MessagePayload) string {
+		c.SuppressReply(msg.MessageID)
+		return "should-be-suppressed"
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	go c.Listen(ctx)
+
+	// The injected message's handler must send NEITHER a reply NOR an ack: the
+	// owning run completes + acks this id after ITS reply is delivered. Acking
+	// here would clear the replay buffer before the real reply lands.
+	select {
+	case dm := <-frames:
+		t.Fatalf("suppressed message must send no reply and no ack, got %s for %s", dm.Type, dm.MessageID)
+	case <-time.After(500 * time.Millisecond):
+		// good — nothing sent for the suppressed inbound
 	}
 }

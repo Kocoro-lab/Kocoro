@@ -685,12 +685,17 @@ type InjectCommitHandler interface {
 // so without this hook every turn's answer but the last is silently dropped when
 // rapid follow-ups merge into one run: the user fires "B" before "A"'s reply
 // posts, the loop injects B and continues, and A's answer never reaches the
-// channel. The daemon implements it to emit the intermediate answer as a
-// timeline segment (LLM_OUTPUT), so each merged turn's reply still shows.
-// Handlers that do not implement it (TUI/tests, whose OnText already renders the
-// text) simply skip these events via the loop's type assertion.
+// channel.
+//
+// cloudMessageID is the inbound message THIS turn was answering (the run's
+// primary id, or a previously-drained follow-up's id) — captured BEFORE the
+// superseding follow-up is committed. The daemon completes that message's own
+// channel reply with it, so merged turns render as separate channel messages
+// rather than one reply that swallows the others. Handlers that do not implement
+// it (TUI/tests, whose OnText already renders the text) skip these events via
+// the loop's type assertion.
 type IntermediateAnswerHandler interface {
-	OnIntermediateAnswer(text string)
+	OnIntermediateAnswer(text, cloudMessageID string)
 }
 
 // RunStatusHandler is an optional interface a handler may implement to receive
@@ -833,22 +838,38 @@ type AgentLoop struct {
 	// firstTurnIMContext so re-entry (compaction retry, etc.) cannot re-emit.
 	firstTurnIMContext      json.RawMessage
 	firstTurnCloudMessageID string
+	// replyCloudMessageID tracks which inbound message the CURRENT turn is
+	// answering. Seeded with the run's primary message id (SetReplyCloudMessageID)
+	// and advanced to a drained follow-up's CloudMessageID inside
+	// commitInjectedTurn. Unlike firstTurnCloudMessageID it is never cleared, so
+	// after Run() it holds the id of the LAST message processed — the daemon uses
+	// it to address the run's final channel reply, and the pre-commit value to
+	// address each superseded turn's own reply (OnIntermediateAnswer). This is
+	// what makes rapid / multi-user follow-ups render as separate channel
+	// messages instead of one merged reply.
+	replyCloudMessageID string
+	// pendingAckIDs lists inbound cloud message ids the run absorbed but has not
+	// independently reply+acked yet (seeded with the primary, appended on drain,
+	// pruned when OnIntermediateAnswer flushes one). The daemon acks them only
+	// after the final reply is delivered — the ack-after-delivery invariant for
+	// absorbed/merged messages. See PendingAckIDs.
+	pendingAckIDs []string
 	// runIMStatusContext holds the run's inbound IMStatusContext for the WHOLE
 	// run (unlike firstTurnIMContext, which is cleared after the first lifecycle
 	// emit). Injected into the per-tool-call context (WithIMStatusContext) so
 	// schedule_create can snapshot a proactive-delivery target onto a new
 	// Schedule. Set once with firstTurnIMContext; never cleared.
-	runIMStatusContext      json.RawMessage
-	runMessages             []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
-	runMsgInjected          []bool           // parallel to runMessages: true = system-injected guardrail/nudge
-	runMsgTimestamps        []time.Time      // parallel to runMessages: when each message was created
-	lastRunStatus           RunStatus
-	toolRefSupported        bool   // true when the configured model supports defer_loading + tool_reference protocol
-	cacheSource             string // tag sent to gateway on every Complete call for prompt-cache TTL routing
-	skillDiscovery          bool   // call small-tier model on first turn to identify relevant skills (default true)
-	memoryPreflight         MemoryPreflightFunc
-	sentSkillNames          map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
-	readTracker             *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
+	runIMStatusContext json.RawMessage
+	runMessages        []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
+	runMsgInjected     []bool           // parallel to runMessages: true = system-injected guardrail/nudge
+	runMsgTimestamps   []time.Time      // parallel to runMessages: when each message was created
+	lastRunStatus      RunStatus
+	toolRefSupported   bool   // true when the configured model supports defer_loading + tool_reference protocol
+	cacheSource        string // tag sent to gateway on every Complete call for prompt-cache TTL routing
+	skillDiscovery     bool   // call small-tier model on first turn to identify relevant skills (default true)
+	memoryPreflight    MemoryPreflightFunc
+	sentSkillNames     map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
+	readTracker        *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
 	// toolResultReplacements stores stable query-time replacements for large
 	// historical tool_result blocks. It is session-scoped and persisted by
 	// daemon/TUI callers so resumed sessions replay identical bytes.
@@ -1398,6 +1419,65 @@ func (a *AgentLoop) SetFirstTurnLifecycle(cloudMessageID string, imStatusContext
 	// Held for the whole run (not cleared with firstTurnIMContext) so
 	// schedule_create can snapshot the proactive target on any turn.
 	a.runIMStatusContext = imStatusContext
+}
+
+// SetReplyCloudMessageID seeds the run's primary inbound cloud message id — the
+// message the first turn answers. The loop advances it as injected follow-ups
+// are drained (commitInjectedTurn); ReplyCloudMessageID returns the final value.
+// Empty (non-IM runs) is fine: callers fall back to their own message id. It also
+// seeds the pending-ack set so the daemon acks the primary only after the run's
+// reply is actually delivered.
+func (a *AgentLoop) SetReplyCloudMessageID(id string) {
+	a.replyCloudMessageID = id
+	if id == "" {
+		a.pendingAckIDs = nil
+		return
+	}
+	a.pendingAckIDs = []string{id}
+}
+
+// ReplyCloudMessageID returns the cloud message id of the LAST inbound message
+// the run processed — the id the daemon addresses the final channel reply to.
+// Equals the primary message id when no follow-up was injected.
+func (a *AgentLoop) ReplyCloudMessageID() string {
+	return a.replyCloudMessageID
+}
+
+// PendingAckIDs returns every inbound cloud message id the run absorbed but did
+// NOT independently reply to (ids flushed via OnIntermediateAnswer are already
+// reply+acked and removed). The daemon acks all of these only AFTER the final
+// reply is delivered, so a reply failure replays them instead of dropping the
+// answer. Includes ReplyCloudMessageID (the final reply's own target).
+func (a *AgentLoop) PendingAckIDs() []string {
+	return a.pendingAckIDs
+}
+
+// appendPendingAck records a newly absorbed inbound id (deduped, order kept).
+func (a *AgentLoop) appendPendingAck(id string) {
+	if id == "" {
+		return
+	}
+	for _, existing := range a.pendingAckIDs {
+		if existing == id {
+			return
+		}
+	}
+	a.pendingAckIDs = append(a.pendingAckIDs, id)
+}
+
+// removePendingAck drops an id whose reply+ack the loop already emitted via
+// OnIntermediateAnswer, so the daemon does not co-ack it again at run end.
+func (a *AgentLoop) removePendingAck(id string) {
+	if id == "" {
+		return
+	}
+	out := make([]string, 0, len(a.pendingAckIDs))
+	for _, existing := range a.pendingAckIDs {
+		if existing != id {
+			out = append(out, existing)
+		}
+	}
+	a.pendingAckIDs = out
 }
 
 // emitDrainedLifecycle fires OnUserMessageProcessing for each drained
@@ -2948,6 +3028,20 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			if m.ID != "" {
 				injectedIDs = append(injectedIDs, m.ID)
 			}
+			// Advance the reply target to this follow-up's inbound message: the
+			// turn this drained batch starts now answers it, so its final answer
+			// (and the run's final reply) belongs to this id, not the primary's.
+			// Last non-empty wins when several follow-ups are drained into ONE
+			// turn: the combined turn produces a single answer addressed to the
+			// last id; earlier merged ids get no standalone channel reply (their
+			// question folded into the combined turn) but are still ack'd by their
+			// own handler (SuppressReply on the daemon side), so they are never
+			// replayed. One merged answer for a batch drained together is the
+			// intended behavior.
+			if m.CloudMessageID != "" {
+				a.replyCloudMessageID = m.CloudMessageID
+				a.appendPendingAck(m.CloudMessageID)
+			}
 		}
 		latestUserText = strings.Join(texts, "\n\n")
 		messages = append(messages, newMsg)
@@ -4000,6 +4094,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// follow-up survived — and survivors are committed INLINE so they're
 			// recorded even if the next iteration trips the maxIter cap (steering
 			// injects have no mailbox backing to replay).
+			// Capture which inbound message THIS turn answered before
+			// commitInjectedTurn advances replyCloudMessageID to the superseding
+			// follow-up, so the intermediate is addressed to its own message.
+			supersededReplyID := a.replyCloudMessageID
 			if survivors := a.finalDrainInjected(); commitInjectedTurn(survivors) {
 				// The run is continuing for an injected follow-up, so fullText is
 				// the answer to the turn that just finished — an INTERMEDIATE
@@ -4010,7 +4108,10 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				// a follow-up too fast" bug. Handlers without the hook (TUI/tests)
 				// skip it; their OnText already rendered the text.
 				if h, ok := a.handler.(IntermediateAnswerHandler); ok && strings.TrimSpace(fullText) != "" {
-					h.OnIntermediateAnswer(fullText)
+					h.OnIntermediateAnswer(fullText, supersededReplyID)
+					// Its reply+ack were just sent under supersededReplyID, so the
+					// daemon must not co-ack it again at run end.
+					a.removePendingAck(supersededReplyID)
 				}
 				continue
 			}

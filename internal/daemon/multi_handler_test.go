@@ -225,10 +225,12 @@ func TestMultiHandlerSatisfiesInjectCommitHandlerInterface(t *testing.T) {
 type intermediateAnswerSpy struct {
 	usageSpy
 	calls []string
+	ids   []string
 }
 
-func (s *intermediateAnswerSpy) OnIntermediateAnswer(text string) {
+func (s *intermediateAnswerSpy) OnIntermediateAnswer(text, cloudMessageID string) {
 	s.calls = append(s.calls, text)
+	s.ids = append(s.ids, cloudMessageID)
 }
 
 // The agent loop reaches the daemon WS handler via
@@ -244,10 +246,16 @@ func TestMultiHandlerOnIntermediateAnswerPropagatesToImplementers(t *testing.T) 
 	plain := &plainSpy{}
 	m := &multiHandler{handlers: []agent.EventHandler{iah, plain}}
 
-	m.OnIntermediateAnswer("first turn answer")
+	m.OnIntermediateAnswer("first turn answer", "msg-1")
 
 	if len(iah.calls) != 1 || iah.calls[0] != "first turn answer" {
 		t.Fatalf("iah.calls = %+v, want [first turn answer]", iah.calls)
+	}
+	// The cloud message id of the message this turn answered must propagate so
+	// the daemon completes that message's own reply (the per-message addressing
+	// that keeps merged follow-ups as separate channel messages).
+	if len(iah.ids) != 1 || iah.ids[0] != "msg-1" {
+		t.Fatalf("iah.ids = %+v, want [msg-1] — cloudMessageID must propagate", iah.ids)
 	}
 	// plain has no OnIntermediateAnswer — the call must not panic and must not
 	// affect iah. Base fan-out must still work after the typed dispatch.
