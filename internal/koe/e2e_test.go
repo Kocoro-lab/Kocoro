@@ -17,14 +17,11 @@ package koe
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -348,70 +345,16 @@ func TestKoeAsyncInjectionE2E(t *testing.T) {
 	}
 }
 
-// synthSpokenWAV uses macOS say (quiet, -o file) + afconvert to make a 48k mono
-// S16 WAV of text, verifies the format with afinfo, and returns its PCM samples.
+// synthSpokenWAV wraps synthSpeech (macOS say + afconvert → 48k mono S16) with
+// test semantics: skip if the tools are unavailable, fatal if unusably short.
 func synthSpokenWAV(t *testing.T, text string) []int16 {
 	t.Helper()
-	dir := t.TempDir()
-	aiff := filepath.Join(dir, "spoken.aiff")
-	wav := filepath.Join(dir, "spoken.wav")
-	if out, err := exec.Command("say", text, "-o", aiff).CombinedOutput(); err != nil {
-		t.Skipf("`say` unavailable (%v): %s", err, out)
-	}
-	// 48 kHz, mono, little-endian signed 16-bit — exactly what the Opus/WebRTC path expects.
-	if out, err := exec.Command("afconvert", "-f", "WAVE", "-d", "LEI16@48000", "-c", "1", aiff, wav).CombinedOutput(); err != nil {
-		t.Skipf("`afconvert` failed (%v): %s", err, out)
-	}
-	if info, err := exec.Command("afinfo", wav).CombinedOutput(); err == nil {
-		s := string(info)
-		if !strings.Contains(s, "48000") || !strings.Contains(s, "1 ch") {
-			t.Fatalf("afconvert did not produce 48k mono: %s", s)
-		}
-	}
-	pcm, err := readWavS16(wav)
+	pcm, err := synthSpeech(text)
 	if err != nil {
-		t.Fatalf("readWavS16: %v", err)
+		t.Skipf("speech synth unavailable: %v", err)
 	}
 	if len(pcm) < audioFrameSize {
-		t.Fatalf("WAV too short: %d samples", len(pcm))
+		t.Fatalf("synth WAV too short: %d samples", len(pcm))
 	}
 	return pcm
 }
-
-// readWavS16 reads a PCM16 WAV, locating the data chunk (header not assumed 44 bytes).
-func readWavS16(path string) ([]int16, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	if len(b) < 12 || string(b[0:4]) != "RIFF" || string(b[8:12]) != "WAVE" {
-		return nil, errNotWave
-	}
-	for i := 12; i+8 <= len(b); {
-		id := string(b[i : i+4])
-		sz := int(binary.LittleEndian.Uint32(b[i+4 : i+8]))
-		if id == "data" {
-			start, end := i+8, i+8+sz
-			if end > len(b) {
-				end = len(b)
-			}
-			d := b[start:end]
-			out := make([]int16, len(d)/2)
-			for j := range out {
-				out[j] = int16(binary.LittleEndian.Uint16(d[2*j:]))
-			}
-			return out, nil
-		}
-		i += 8 + sz + (sz & 1)
-	}
-	return nil, errNoDataChunk
-}
-
-var (
-	errNotWave     = &wavErr{"not a RIFF/WAVE file"}
-	errNoDataChunk = &wavErr{"no data chunk"}
-)
-
-type wavErr struct{ s string }
-
-func (e *wavErr) Error() string { return e.s }

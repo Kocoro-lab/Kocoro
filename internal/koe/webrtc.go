@@ -191,6 +191,11 @@ type ConnectOptions struct {
 	// listening) until the double-tap (or the menu / settings-configured trigger)
 	// starts a call. nil = always send (standalone CLI / E2E always-listen).
 	CallActive func() bool
+	// OnCallState (nil-safe) reports the call lifecycle to Desktop (Q2b feedback so
+	// the user knows it's working): "connecting" while the WebRTC/session setup runs
+	// (~2s), "on_call" once OpenAI acks the session. "ended" is emitted by the
+	// control server on hang-up.
+	OnCallState func(string)
 }
 
 // Connect builds the peer connection, dials OpenAI, configures the session, and
@@ -209,6 +214,9 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
 	rc.callActive = opts.CallActive
+	if opts.OnCallState != nil {
+		opts.OnCallState("connecting") // Q2b: the ~2s mint+SDP+session.update setup
+	}
 	// configured closes when OpenAI acks our session.update. The send pump waits
 	// on it: if mic audio reaches the server before the tools/voice config lands,
 	// the VAD-triggered auto response snapshots the default config (no tools) and
@@ -225,7 +233,12 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 		}
 		_ = json.Unmarshal(m.Data, &ev)
 		if ev.Type == "session.updated" {
-			cfgOnce.Do(func() { close(configured) })
+			cfgOnce.Do(func() {
+				close(configured)
+				if opts.OnCallState != nil {
+					opts.OnCallState("on_call") // session is live — Koe is ready
+				}
+			})
 		}
 		h.handleEvent(ctx, m.Data)
 	})

@@ -101,3 +101,47 @@ func TestHandleEventGatesMicWhileSpeaking(t *testing.T) {
 		t.Error("response.done must ungate the mic (SetSpeaking false)")
 	}
 }
+
+// TestHandleEventVoiceStateSequence pins the precise state machine (D1w): the
+// WebRTC output_audio_buffer.started/stopped markers drive SPEAKING/IDLE, and
+// input_audio_buffer.speech_started surfaces the reactive listening moment. A
+// rename of any of these GA event names would silently break the Island sprite —
+// this test catches it.
+func TestHandleEventVoiceStateSequence(t *testing.T) {
+	audio, _ := NewAudioIO()
+	state := NewCallState("burst-seq", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+	var states []string
+	h.onVoiceState = func(s string) { states = append(states, s) }
+
+	for _, e := range []string{
+		`{"type":"input_audio_buffer.speech_started"}`, // user talking → listening
+		`{"type":"response.created"}`,                  // thinking (no voice_state)
+		`{"type":"output_audio_buffer.started"}`,       // reply audio begins → speaking
+		`{"type":"output_audio_buffer.stopped"}`,       // reply drained → listening
+		`{"type":"response.done"}`,                     // turn done → listening
+	} {
+		h.handleEvent(context.Background(), []byte(e))
+	}
+	want := []string{"listening", "speaking", "listening", "listening"}
+	if len(states) != len(want) {
+		t.Fatalf("voice states = %v, want %v", states, want)
+	}
+	for i := range want {
+		if states[i] != want[i] {
+			t.Fatalf("voice state[%d] = %q, want %q (full: %v)", i, states[i], want[i], states)
+		}
+	}
+
+	// The precise WebRTC markers must also drive the mic gate.
+	h2 := newEventHandler(disp, state, audio, func(any) error { return nil })
+	h2.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	if !audio.dropCapture() {
+		t.Error("output_audio_buffer.started must gate the mic")
+	}
+	h2.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.stopped"}`))
+	if audio.dropCapture() {
+		t.Error("output_audio_buffer.stopped must ungate the mic")
+	}
+}

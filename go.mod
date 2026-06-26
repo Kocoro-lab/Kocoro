@@ -13,6 +13,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
 	github.com/chromedp/chromedp v0.14.2
 	github.com/creativeprojects/go-selfupdate v1.5.2
+	github.com/ebitengine/oto/v3 v3.4.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gen2brain/malgo v0.11.25
 	github.com/gorilla/websocket v1.5.3
@@ -56,6 +57,7 @@ require (
 	github.com/davidmz/go-pageant v1.0.2 // indirect
 	github.com/dlclark/regexp2 v1.11.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/ebitengine/purego v0.9.0 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/go-fed/httpsig v1.1.0 // indirect
 	github.com/go-json-experiment/json v0.0.0-20250725192818-e39067aee2d2 // indirect

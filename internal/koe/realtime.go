@@ -101,6 +101,12 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	}
 	_ = json.Unmarshal(raw, &ev)
 	switch ev.Type {
+	case "input_audio_buffer.speech_started":
+		// Server-VAD detected the user talking — the reactive "I hear you" moment
+		// (Q4: distinguishes idle-listening from actively-hearing) and the barge-in
+		// trigger (workstream E). We are already in "listening"; re-emit so a UI that
+		// animates on this event reacts to the user's voice.
+		h.emitVoiceState("listening")
 	case "response.created":
 		// A response is now generating — injectResult must wait for its
 		// response.done before sending another response.create.
@@ -108,15 +114,30 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	case "response.function_call_arguments.done":
 		args := unwrapArgs(ev.Arguments)
 		h.handleFunctionCall(ctx, ev.CallID, ev.Name, args)
-	case "response.output_audio.delta":
-		// Koe started/continues speaking → gate the mic so server-VAD doesn't
-		// hear Koe through the speaker as a new turn (half-duplex echo control,
-		// v1; C-full replaces with VPIO AEC). Event name follows the GA flattened
-		// convention confirmed via the spike's response.output_audio_transcript.delta.
+	case "output_audio_buffer.started":
+		// WebRTC-only: the server began streaming reply audio — the PRECISE
+		// THINKING→SPEAKING boundary (cleaner than inferring from the first audio
+		// delta). Gate the mic so server-VAD doesn't hear Koe through the speaker.
 		if h.audio != nil {
 			h.audio.SetSpeaking(true)
 		}
 		h.emitVoiceState("speaking")
+	case "response.output_audio.delta":
+		// Redundant safety: also gate on the first audio delta in case the
+		// output_audio_buffer.* markers are absent on some transport. Idempotent
+		// with output_audio_buffer.started. Half-duplex echo control (v1; VPIO AEC
+		// supersedes). Event name is the GA flattened convention.
+		if h.audio != nil {
+			h.audio.SetSpeaking(true)
+		}
+		h.emitVoiceState("speaking")
+	case "output_audio_buffer.stopped":
+		// WebRTC-only: reply audio fully drained (fires after response.done) — the
+		// PRECISE SPEAKING→IDLE boundary. Ungate the mic.
+		if h.audio != nil {
+			h.audio.SetSpeaking(false)
+		}
+		h.emitVoiceState("listening")
 	case "response.done":
 		// Turn finished → ungate the mic + mark the response slot free. (Usage
 		// token capture for billing is the deferred daemon usage-relay → Plan D.)
