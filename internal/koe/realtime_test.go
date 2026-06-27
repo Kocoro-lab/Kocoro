@@ -29,6 +29,19 @@ func (c *captureSender) send(v any) error {
 	return nil
 }
 
+// countType counts captured frames whose "type" equals typ.
+func (c *captureSender) countType(typ string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, m := range c.sent {
+		if m["type"] == typ {
+			n++
+		}
+	}
+	return n
+}
+
 // sentContains reports whether any captured frame's JSON contains sub.
 func (c *captureSender) sentContains(sub string) bool {
 	c.mu.Lock()
@@ -198,17 +211,67 @@ func TestHandleInputTranscriptCreatesResponseOnlyForClearSpeech(t *testing.T) {
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	cap := &captureSender{}
 	h := newEventHandler(disp, state, nil, cap.send)
+	// response.create is now sent by the serialized sender goroutine, so start it and
+	// poll (rather than asserting synchronously).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
 
 	for _, transcript := range []string{"", "嗯", "uh", "...", "啊啊"} {
-		h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":`+mustJSONString(transcript)+`}`))
+		h.handleEvent(ctx, []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":`+mustJSONString(transcript)+`}`))
 	}
+	time.Sleep(100 * time.Millisecond) // the sender would have fired by now if anything were queued
 	if cap.sentContains("response.create") {
 		t.Fatal("unclear/noise transcripts must not create a response")
 	}
 
-	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"帮我查一下明天的天气"}`))
-	if !cap.sentContains("response.create") {
-		t.Fatal("clear transcript must create a response")
+	h.handleEvent(ctx, []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"帮我查一下明天的天气"}`))
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cap.sentContains("response.create") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("clear transcript must create a response")
+}
+
+// TestResponseSenderRetriesOnActiveResponseRejection pins the core robustness of the
+// serialized sender: when GA rejects a response.create with
+// conversation_already_has_active_response, the sender retries instead of silently
+// dropping the turn (the bug under create_response=false).
+func TestResponseSenderRetriesOnActiveResponseRejection(t *testing.T) {
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	waitUntil := func(cond func() bool, msg string) {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal(msg)
+	}
+
+	h.requestResponse()
+	waitUntil(func() bool { return cap.countType("response.create") >= 1 }, "first response.create never sent")
+
+	// Reject it → the sender must retry with a second response.create.
+	h.handleEvent(ctx, []byte(`{"type":"error","error":{"code":"conversation_already_has_active_response"}}`))
+	waitUntil(func() bool { return cap.countType("response.create") >= 2 }, "rejection did not trigger a retry")
+
+	// Accept the retry; no further creates after that.
+	h.handleEvent(ctx, []byte(`{"type":"response.created"}`))
+	time.Sleep(200 * time.Millisecond)
+	if n := cap.countType("response.create"); n != 2 {
+		t.Errorf("expected exactly 2 response.create (1 + 1 retry), got %d", n)
 	}
 }
 

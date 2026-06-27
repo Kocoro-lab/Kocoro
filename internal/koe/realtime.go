@@ -34,6 +34,15 @@ type eventHandler struct {
 	// relays via the daemon to Cloud (server-side cost). Koe never sees pricing.
 	model   string
 	onUsage func(json.RawMessage)
+	// Serialized response.create (runResponseSender), adapted from kocoro-reachy's
+	// _response_sender_loop to Go/WebRTC: under create_response=false every reply is
+	// a MANUAL response.create, and GA rejects one sent while a response is still
+	// active (conversation_already_has_active_response). The naive fire-and-forget
+	// silently dropped that turn. requestResponse() queues; the sender goroutine
+	// sends serially, waits for respCreated/respRejected, and retries a rejection.
+	respReq      chan struct{} // queued response.create requests
+	respCreated  chan struct{} // signalled (buffered 1) on response.created
+	respRejected chan struct{} // signalled (buffered 1) on the active-response error
 }
 
 func (h *eventHandler) emitVoiceState(state string) {
@@ -92,7 +101,93 @@ func (h *eventHandler) reportUsage(raw []byte) {
 }
 
 func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error) *eventHandler {
-	return &eventHandler{disp: disp, state: state, audio: audio, sendFn: sendFn}
+	return &eventHandler{
+		disp: disp, state: state, audio: audio, sendFn: sendFn,
+		respReq:      make(chan struct{}, 8),
+		respCreated:  make(chan struct{}, 1),
+		respRejected: make(chan struct{}, 1),
+	}
+}
+
+const (
+	// maxResponseCreateRetries bounds retries when GA rejects an overlapping
+	// response.create (mirrors kocoro-reachy's max_retries=5). WORKLOAD: rapid
+	// turns under create_response=false; SYMPTOM if unhandled: Kocoro silently skips
+	// the turn whose create was rejected. OVERRIDE: raise if a slow back-brain keeps
+	// a response active longer than the retries cover.
+	maxResponseCreateRetries = 5
+	// responseCreateAckTimeout caps the wait for response.created / a rejection after
+	// sending. A turn with nothing to say yields neither; we stop rather than spin.
+	responseCreateAckTimeout = 5 * time.Second
+	// responseRejectRetryDelay spaces retries so we don't hammer the server while an
+	// active response drains.
+	responseRejectRetryDelay = 150 * time.Millisecond
+)
+
+// requestResponse queues exactly one response.create. The serialized sender does the
+// actual send — decoupled from the event-handler goroutine so waiting for the
+// server's ack can never deadlock the event loop (handleEvent must keep running to
+// deliver response.created / response.done).
+func (h *eventHandler) requestResponse() {
+	select {
+	case h.respReq <- struct{}{}:
+	default: // queue saturated (a request flood) — drop rather than block the loop
+	}
+}
+
+// runResponseSender is Koe's serialized response.create worker (started by Connect),
+// adapted from kocoro-reachy's _response_sender_loop. For each queued request it
+// waits for any active response to finish, sends response.create, waits for
+// response.created or the active-response rejection, and retries a rejection.
+func (h *eventHandler) runResponseSender(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-h.respReq:
+			h.sendResponseCreate(ctx)
+		}
+	}
+}
+
+func (h *eventHandler) sendResponseCreate(ctx context.Context) {
+	for attempt := 0; attempt <= maxResponseCreateRetries; attempt++ {
+		if !h.waitRespIdle(ctx) {
+			return // ctx done
+		}
+		drainSignal(h.respCreated) // clear stale acks from the previous turn
+		drainSignal(h.respRejected)
+		_ = h.sendFn(map[string]any{"type": "response.create"})
+		select {
+		case <-ctx.Done():
+			return
+		case <-h.respCreated:
+			return // accepted
+		case <-h.respRejected:
+			// Overlapped an active response — wait a beat for it to drain, then retry.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(responseRejectRetryDelay):
+			}
+		case <-time.After(responseCreateAckTimeout):
+			return // neither created nor rejected (nothing to say) — don't spin
+		}
+	}
+}
+
+func drainSignal(c chan struct{}) {
+	select {
+	case <-c:
+	default:
+	}
+}
+
+func signalNonBlocking(c chan struct{}) {
+	select {
+	case c <- struct{}{}:
+	default:
+	}
 }
 
 // sessionConfig builds the session.update event: persona instructions + Plan B's
@@ -145,6 +240,10 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		CallID     string          `json:"call_id"`   // function call id
 		Arguments  json.RawMessage `json:"arguments"` // function args (string-encoded JSON)
 		Transcript string          `json:"transcript"`
+		Error      struct {
+			Code string `json:"code"`
+			Type string `json:"type"`
+		} `json:"error"` // type=="error" events
 	}
 	_ = json.Unmarshal(raw, &ev)
 	switch ev.Type {
@@ -170,6 +269,14 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// A response is now generating — injectResult must wait for its
 		// response.done before sending another response.create.
 		h.respBusy.Store(true)
+		signalNonBlocking(h.respCreated) // ack the sender's pending response.create
+	case "error":
+		// GA rejects a response.create sent while a response is active. Signal the
+		// sender to retry instead of silently losing the turn (the exact code
+		// kocoro-reachy matches: conversation_already_has_active_response).
+		if ev.Error.Code == "conversation_already_has_active_response" {
+			signalNonBlocking(h.respRejected)
+		}
 	case "response.function_call_arguments.done":
 		args := unwrapArgs(ev.Arguments)
 		h.handleFunctionCall(ctx, ev.CallID, ev.Name, args)
@@ -218,8 +325,7 @@ func (h *eventHandler) handleInputTranscript(ctx context.Context, transcript str
 		h.emitVoiceState("listening")
 		return
 	}
-	h.waitRespIdle(ctx)
-	_ = h.sendFn(map[string]any{"type": "response.create"})
+	h.requestResponse()
 }
 
 func shouldAnswerTranscript(transcript string) bool {
@@ -350,7 +456,7 @@ func (h *eventHandler) sendRaw(callID string, output json.RawMessage) {
 			"output":  string(output),
 		},
 	})
-	_ = h.sendFn(map[string]any{"type": "response.create"})
+	h.requestResponse()
 }
 
 // injectResult voices an async do_task result by injecting it as an assistant
@@ -371,19 +477,20 @@ func (h *eventHandler) injectResult(ctx context.Context, r SayResult) {
 			"content": []map[string]any{{"type": "output_text", "text": r.Say}},
 		},
 	})
-	h.waitRespIdle(ctx)
-	_ = h.sendFn(map[string]any{"type": "response.create"})
+	h.requestResponse()
 }
 
-// waitRespIdle blocks until no realtime response is generating (or ctx is done).
-// In basic async the fast-ack response is long finished by the time DoTask
-// returns, so this returns immediately; it guards the edge where DoTask is fast.
-func (h *eventHandler) waitRespIdle(ctx context.Context) {
+// waitRespIdle blocks until no realtime response is generating, returning true when
+// idle and false if ctx is done. Called only by the response sender goroutine (never
+// the event-handler goroutine), so it can poll respBusy without deadlocking the loop
+// that clears it.
+func (h *eventHandler) waitRespIdle(ctx context.Context) bool {
 	for h.respBusy.Load() {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+	return true
 }

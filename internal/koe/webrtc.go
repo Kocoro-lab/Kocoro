@@ -217,6 +217,7 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
 	rc.callActive = opts.CallActive
+	go h.runResponseSender(ctx) // serialized response.create (create_response=false)
 	if opts.OnCallState != nil {
 		opts.OnCallState("connecting") // Q2b: the ~2s mint+SDP+session.update setup
 	}
