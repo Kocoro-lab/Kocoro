@@ -212,14 +212,14 @@ func feedWAV(ctx context.Context, audio *AudioIO, pcm []int16) {
 	}
 }
 
-// TestKoeAsyncInjectionE2E de-risks the async result-injection mechanism (C-full
-// Task 1): after the model calls do_task, fast-ack the call (so the first turn
-// closes), then inject a RESULT out-of-band and assert the model SPEAKS it in a
-// second response. This is the unverified GA mechanism async do_task depends on.
-// Run it to LEARN the working recipe, not as a pre-known pass.
-func TestKoeAsyncInjectionE2E(t *testing.T) {
+// TestKoeSayAndAskE2E de-risks the production say-and-ask do_task voicing against
+// live GA Realtime: after the model calls do_task, feed the RESULT back as the
+// single function_call_output for that call_id + response.create, and assert the
+// model SPEAKS it. Mirrors realtime.go handleFunctionCall — no placeholder fast-ack
+// or assistant-message inject (that extra voiced turn made the model improvise).
+func TestKoeSayAndAskE2E(t *testing.T) {
 	if os.Getenv("KOE_E2E") != "1" {
-		t.Skip("async-injection de-risk: set KOE_E2E=1 + OPENAI_API_KEY")
+		t.Skip("say-and-ask do_task de-risk: set KOE_E2E=1 + OPENAI_API_KEY")
 	}
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
@@ -246,7 +246,6 @@ func TestKoeAsyncInjectionE2E(t *testing.T) {
 		mu           sync.Mutex
 		transcripts  []string
 		responseDone int
-		injected     bool
 		spokeResult  bool
 	)
 	connected := make(chan struct{})
@@ -271,9 +270,13 @@ func TestKoeAsyncInjectionE2E(t *testing.T) {
 		case "session.updated":
 			cfgOnce.Do(func() { close(configured) })
 		case "response.function_call_arguments.done":
-			// (a) fast-ack the call so the first realtime turn closes.
+			// reachy say-and-ask (production flow, realtime.go handleFunctionCall): the
+			// do_task RESULT is the SINGLE function_call_output for this call_id; a
+			// response.create then voices it. No placeholder fast-ack + separate
+			// assistant-message inject (that extra voiced turn made the model improvise).
+			out, _ := json.Marshal(map[string]any{"say": injectedText, "status": "ok"})
 			send(map[string]any{"type": "conversation.item.create", "item": map[string]any{
-				"type": "function_call_output", "call_id": ev.CallID, "output": `{"say":"On it.","status":"injected"}`}})
+				"type": "function_call_output", "call_id": ev.CallID, "output": string(out)}})
 			send(map[string]any{"type": "response.create"})
 		case "response.output_audio_transcript.done":
 			t.Logf("[spoke] %q", ev.Transcript)
@@ -283,21 +286,6 @@ func TestKoeAsyncInjectionE2E(t *testing.T) {
 			}
 		case "response.done":
 			responseDone++
-			// VERIFIED async-injection recipe (live GA Realtime, 2026-06-26):
-			//   1. fast-ack: conversation.item.create{function_call_output} + response.create
-			//   2. WAIT for that response's response.done
-			//   3. inject: conversation.item.create{message, role:assistant, output_text}
-			//      + response.create  → the model SPEAKS the injected text.
-			// CAVEAT for Task 2: step-3's response.create MUST wait for the prior
-			// response.done, else GA returns error `conversation_already_has_active_response`
-			// (seen here as a benign race) — injectResult must serialize response.create.
-			if responseDone == 1 && !injected {
-				injected = true
-				send(map[string]any{"type": "conversation.item.create", "item": map[string]any{
-					"type": "message", "role": "assistant",
-					"content": []map[string]any{{"type": "output_text", "text": injectedText}}}})
-				send(map[string]any{"type": "response.create"})
-			}
 		case "error", "response.failed":
 			t.Logf("[event %s] %s", ev.Type, string(m.Data))
 		}
@@ -325,7 +313,7 @@ func TestKoeAsyncInjectionE2E(t *testing.T) {
 		select {
 		case <-deadline:
 			mu.Lock()
-			t.Fatalf("RECIPE A did not make the model speak the injected result. transcripts=%v (try RECIPE B: function_call_output for a synthetic second call)", transcripts)
+			t.Fatalf("say-and-ask: the model did not speak the do_task result. transcripts=%v", transcripts)
 			mu.Unlock()
 		case <-time.After(1 * time.Second):
 			mu.Lock()
@@ -333,12 +321,12 @@ func TestKoeAsyncInjectionE2E(t *testing.T) {
 			done := responseDone
 			mu.Unlock()
 			if ok {
-				t.Logf("RECIPE A VERIFIED: assistant-message injection + response.create made the model speak the result")
+				t.Logf("say-and-ask VERIFIED: result-as-function_call_output + response.create made the model speak the result")
 				return
 			}
 			if done >= 2 && !ok {
 				mu.Lock()
-				t.Fatalf("two responses but injected result not spoken — recipe A insufficient. transcripts=%v", transcripts)
+				t.Fatalf("two responses but the do_task result was not spoken. transcripts=%v", transcripts)
 				mu.Unlock()
 			}
 		}
