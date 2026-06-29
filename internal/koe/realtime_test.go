@@ -209,34 +209,21 @@ func TestSessionConfigUsesAutoResponseVAD(t *testing.T) {
 	}
 }
 
-func TestHandleInputTranscriptCreatesResponseOnlyForClearSpeech(t *testing.T) {
+func TestTranscriptCompletedDoesNotCreateResponse(t *testing.T) {
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	cap := &captureSender{}
 	h := newEventHandler(disp, state, nil, cap.send)
-	// response.create is now sent by the serialized sender goroutine, so start it and
-	// poll (rather than asserting synchronously).
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go h.runResponseSender(ctx)
-
-	for _, transcript := range []string{"", "嗯", "uh", "...", "啊啊"} {
-		h.handleEvent(ctx, []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":`+mustJSONString(transcript)+`}`))
-	}
-	time.Sleep(100 * time.Millisecond) // the sender would have fired by now if anything were queued
-	if cap.sentContains("response.create") {
-		t.Fatal("unclear/noise transcripts must not create a response")
-	}
-
+	// Under create_response:true the SERVER auto-creates the response; the transcript
+	// handler is diagnostic only and must NOT also fire response.create (double-reply).
 	h.handleEvent(ctx, []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"帮我查一下明天的天气"}`))
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if cap.sentContains("response.create") {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond) // the sender would have flushed by now if anything were queued
+	if cap.sentContains("response.create") {
+		t.Fatal("transcript.completed must not create a response under create_response:true")
 	}
-	t.Fatal("clear transcript must create a response")
 }
 
 // TestResponseSenderRetriesOnActiveResponseRejection pins the core robustness of the
@@ -320,9 +307,4 @@ func TestHandleEventVoiceStateSequence(t *testing.T) {
 	if audio.dropCapture() {
 		t.Error("output_audio_buffer.stopped must ungate the mic")
 	}
-}
-
-func mustJSONString(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
 }

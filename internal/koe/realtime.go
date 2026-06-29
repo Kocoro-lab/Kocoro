@@ -3,7 +3,8 @@ package koe
 import (
 	"context"
 	"encoding/json"
-	"strings"
+	"log"
+	"os"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -261,7 +262,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// The user finished talking. create_response=false, so the server will
 		// transcribe this turn and Koe will decide whether to answer.
 	case "conversation.item.input_audio_transcription.completed":
-		h.handleInputTranscript(ctx, ev.Transcript)
+		h.handleInputTranscript(ev.Transcript)
 	case "conversation.item.input_audio_transcription.failed":
 		// Treat failed ASR like unclear audio. Do not guess.
 		h.emitVoiceState("listening")
@@ -316,63 +317,14 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	}
 }
 
-// handleInputTranscript is the response gate for one user turn. With
-// create_response=false, Realtime will not answer until Koe sends response.create.
-// That lets us suppress noise, filler, and too-short stray speech instead of
-// letting the model hallucinate a conversational turn.
-func (h *eventHandler) handleInputTranscript(ctx context.Context, transcript string) {
-	if !shouldAnswerTranscript(transcript) {
-		h.emitVoiceState("listening")
-		return
+// handleInputTranscript logs the user's transcript for diagnostics only. Under
+// create_response:true the server already auto-creates the response, so this must
+// NOT send response.create. Off by default (privacy: user voice content); opt in
+// with KOE_TRANSCRIPT_LOG=1.
+func (h *eventHandler) handleInputTranscript(transcript string) {
+	if os.Getenv("KOE_TRANSCRIPT_LOG") == "1" {
+		log.Printf("koe[transcript]: %q", transcript)
 	}
-	h.requestResponse()
-}
-
-func shouldAnswerTranscript(transcript string) bool {
-	norm := normalizeTranscript(transcript)
-	if norm == "" {
-		return false
-	}
-	if isFillerTranscript(norm) {
-		return false
-	}
-	// One CJK rune or one short ASCII token is usually a false wake/noise fragment
-	// in live mic use ("嗯", "啊", "uh"). Let two-rune turns like "你好" through.
-	runes := []rune(norm)
-	if len(runes) < 2 {
-		return false
-	}
-	if len(runes) <= 3 && isAllASCII(runes) {
-		return false
-	}
-	return true
-}
-
-func normalizeTranscript(transcript string) string {
-	return strings.TrimFunc(strings.ToLower(transcript), func(r rune) bool {
-		return unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r)
-	})
-}
-
-func isFillerTranscript(norm string) bool {
-	switch norm {
-	case "um", "uh", "umm", "hmm", "mm", "ah", "oh", "er",
-		"嗯", "呃", "啊", "哦", "额", "唔", "哎", "诶",
-		"嗯嗯", "啊啊", "哦哦", "呃呃",
-		"はい", "えっと", "あの", "うん":
-		return true
-	default:
-		return false
-	}
-}
-
-func isAllASCII(runes []rune) bool {
-	for _, r := range runes {
-		if r > unicode.MaxASCII {
-			return false
-		}
-	}
-	return true
 }
 
 // unwrapArgs normalizes the arguments field: OpenAI sends function arguments as a
