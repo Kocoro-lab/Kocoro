@@ -115,6 +115,9 @@ func TestMarketplaceClientStaleOnError(t *testing.T) {
 
 	// Zero TTL so every call tries to refetch.
 	client := NewMarketplaceClient(ts.URL, 0)
+	// Single attempt: this test isolates stale-on-error from transient retry
+	// (covered by marketplace_retry_test.go) and avoids real backoff sleeps.
+	client.maxAttempts = 1
 	if _, err := client.Load(context.Background()); err != nil {
 		t.Fatalf("priming Load: %v", err)
 	}
@@ -153,6 +156,9 @@ func TestMarketplaceClientStaleCooldown(t *testing.T) {
 	// Generous cooldown so it definitely covers the test window.
 	client := NewMarketplaceClient(ts.URL, 0)
 	client.staleCooldown = 10 * time.Second
+	// Single attempt: isolate stale-cooldown accounting from transient retry
+	// (which would multiply the per-Load hit count) and skip backoff sleeps.
+	client.maxAttempts = 1
 
 	// Prime the cache.
 	if _, err := client.Load(context.Background()); err != nil {
@@ -189,6 +195,7 @@ func TestMarketplaceClientStaleCooldown(t *testing.T) {
 func TestMarketplaceClientNoCacheNoServer(t *testing.T) {
 	// Unreachable URL, no prior cache → must return error.
 	client := NewMarketplaceClient("http://127.0.0.1:1/no-such", 1*time.Hour)
+	client.maxAttempts = 1 // skip transient-retry backoff against the dead address
 	_, err := client.Load(context.Background())
 	if err == nil {
 		t.Fatal("expected error with no cache and unreachable URL")
