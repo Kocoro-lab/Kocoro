@@ -7,7 +7,6 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
-	"unicode"
 )
 
 // eventHandler dispatches decoded oai-events and composes do_task. sendFn frames a
@@ -19,10 +18,10 @@ type eventHandler struct {
 	state  *CallState
 	audio  *AudioIO // nil in unit tests; the production half-duplex gate target
 	sendFn func(any) error
-	// respBusy is true while a realtime response is generating. injectResult must
-	// not send response.create while one is active (GA rejects it with
-	// conversation_already_has_active_response — surfaced in the async-injection
-	// de-risk). Maintained from response.created/response.done in handleEvent.
+	// respBusy is true while a realtime response is generating. The serialized
+	// sender must not send response.create while one is active (GA rejects it with
+	// conversation_already_has_active_response). Maintained from
+	// response.created/response.done in handleEvent.
 	respBusy atomic.Bool
 	// onVoiceState (nil-safe) pushes the ambient voice state to the Desktop control
 	// channel (G2) so the Kocoro Island sprite tracks listening/thinking/speaking.
@@ -267,8 +266,8 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// Treat failed ASR like unclear audio. Do not guess.
 		h.emitVoiceState("listening")
 	case "response.created":
-		// A response is now generating — injectResult must wait for its
-		// response.done before sending another response.create.
+		// A response is now generating — the serialized sender waits for its
+		// response.done before sending the next response.create.
 		h.respBusy.Store(true)
 		signalNonBlocking(h.respCreated) // ack the sender's pending response.create
 	case "error":
@@ -353,18 +352,23 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 			h.sendOutput(callID, *clarify)
 			return
 		}
-		// C-full async (deferred-ack): fast-ack so Koe speaks a short "on it"
-		// instead of going silent for the whole back-brain job, then run the turn
-		// in a goroutine and inject the result so Koe voices it. ctx is the
-		// Koe-process context (Connect's), so the turn is cancelled on Ctrl-C but
-		// outlives this (already-closed) realtime turn.
+		// reachy say-and-ask: the model speaks its own short ack out loud in the
+		// call turn (persona-driven), so we do NOT inject a placeholder fast-ack —
+		// that extra voiced turn is where the model improvised a guessed answer. Run
+		// the back-brain turn in the background and feed the REAL result back as the
+		// single function_call_output for this call_id, then voice it (mirroring
+		// reachy's BackgroundToolManager). ctx is Connect's, cancelled on Ctrl-C.
 		h.state.SetInFlight(req.Text)
-		h.sendOutput(callID, SayResult{Status: "injected", Say: taskAcknowledgement(req.Text)})
+		h.emitVoiceState("thinking") // delegating; the model's call-turn ack already played
 		go func() {
-			h.emitVoiceState("thinking") // delegating to the back-brain
 			out, derr := h.disp.client.DoTask(ctx, req)
 			h.state.ClearInFlight()
-			h.injectResult(ctx, MapDoTaskOutcome(out, derr))
+			r := MapDoTaskOutcome(out, derr)
+			b, _ := json.Marshal(r)
+			h.sendFunctionOutput(callID, b) // satisfy the protocol for this call_id
+			if r.Status != "injected" && r.Say != "" {
+				h.requestResponse() // voice the result (skip when the daemon already replied)
+			}
 		}()
 		return
 	}
@@ -378,28 +382,18 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 	h.sendRaw(callID, raw)
 }
 
-func taskAcknowledgement(task string) string {
-	for _, r := range task {
-		if unicode.In(r, unicode.Hiragana, unicode.Katakana) {
-			return "確認します。終わったら伝えます。"
-		}
-	}
-	for _, r := range task {
-		if unicode.In(r, unicode.Han) {
-			return "我来处理，弄好就告诉你。"
-		}
-	}
-	return "I'll handle that and tell you when it's ready."
-}
-
 // sendOutput frames a SayResult as a function_call_output + asks for a spoken
-// response.
+// response (the synchronous error/clarify + fast-tool path).
 func (h *eventHandler) sendOutput(callID string, r SayResult) {
 	b, _ := json.Marshal(r)
 	h.sendRaw(callID, b)
 }
 
-func (h *eventHandler) sendRaw(callID string, output json.RawMessage) {
+// sendFunctionOutput submits the function_call_output for call_id (required by the
+// protocol after a function_call). It does NOT request a voiced response — the
+// caller decides whether to voice (the async do_task result voices; an
+// already-replied/injected outcome does not).
+func (h *eventHandler) sendFunctionOutput(callID string, output json.RawMessage) {
 	_ = h.sendFn(map[string]any{
 		"type": "conversation.item.create",
 		"item": map[string]any{
@@ -408,27 +402,10 @@ func (h *eventHandler) sendRaw(callID string, output json.RawMessage) {
 			"output":  string(output),
 		},
 	})
-	h.requestResponse()
 }
 
-// injectResult voices an async do_task result by injecting it as an assistant
-// message + asking for a spoken response — the async-injection recipe verified
-// live in e2e_test.go (a function_call_output won't re-voice; an assistant
-// output_text message does). It serializes response.create against the in-flight
-// (fast-ack) response so GA doesn't reject it with
-// conversation_already_has_active_response.
-func (h *eventHandler) injectResult(ctx context.Context, r SayResult) {
-	if r.Status == "injected" || r.Say == "" {
-		return // OutcomeInjected carries an empty say — nothing new to voice.
-	}
-	_ = h.sendFn(map[string]any{
-		"type": "conversation.item.create",
-		"item": map[string]any{
-			"type":    "message",
-			"role":    "assistant",
-			"content": []map[string]any{{"type": "output_text", "text": r.Say}},
-		},
-	})
+func (h *eventHandler) sendRaw(callID string, output json.RawMessage) {
+	h.sendFunctionOutput(callID, output)
 	h.requestResponse()
 }
 

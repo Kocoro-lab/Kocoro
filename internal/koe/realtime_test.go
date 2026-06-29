@@ -74,11 +74,9 @@ func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 
 	h.handleFunctionCall(context.Background(), "call-1", "do_task", []byte(`{"task":"remind me"}`))
 
-	// The fast-ack must already be on the wire SYNCHRONOUSLY (Koe speaks "on it").
-	if !cap.sentContains("function_call_output") {
-		t.Fatal("fast-ack function_call_output not sent synchronously")
-	}
-	// The result is injected after the back-brain turn — wait for it.
+	// reachy say-and-ask: NO synchronous placeholder ack — the model spoke its own
+	// ack in the call turn. The single function_call_output carrying the REAL result
+	// is sent after the back-brain turn completes.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if cap.sentContains("Reminder added.") {
@@ -86,20 +84,7 @@ func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Error("injected do_task result never sent")
-}
-
-func TestTaskAcknowledgementMatchesRequestLanguage(t *testing.T) {
-	tests := map[string]string{
-		"remind me to call mom": "I'll handle that and tell you when it's ready.",
-		"帮我查明天的天气":              "我来处理，弄好就告诉你。",
-		"明日の天気を確認して":            "確認します。終わったら伝えます。",
-	}
-	for task, want := range tests {
-		if got := taskAcknowledgement(task); got != want {
-			t.Fatalf("taskAcknowledgement(%q) = %q, want %q", task, got, want)
-		}
-	}
+	t.Error("do_task result function_call_output never sent")
 }
 
 // TestHandleEventGatesMicWhileSpeaking locks the half-duplex gate into the event
