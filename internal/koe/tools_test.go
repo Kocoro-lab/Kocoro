@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -124,5 +125,38 @@ func TestDispatchControlAppStub(t *testing.T) {
 	}
 	if seen != "open_settings" {
 		t.Errorf("control_app action = %q, want open_settings", seen)
+	}
+}
+
+// TestDoTaskDescriptionUsesOneSelfFraming pins the schema-level framing: the tool
+// description the model reads when deciding whether to call do_task must NOT
+// contradict the one-self persona ("back-brain" / "delegate to" frame it as
+// someone else, which let the model improvise must-delegate intents like math),
+// and must give a concrete reason to delegate.
+func TestDoTaskDescriptionUsesOneSelfFraming(t *testing.T) {
+	var doTask, switchAgent string
+	for _, d := range ToolDefs() {
+		switch d.Name {
+		case "do_task":
+			doTask = strings.ToLower(d.Description)
+		case "switch_agent":
+			switchAgent = strings.ToLower(d.Description)
+		}
+	}
+	if doTask == "" {
+		t.Fatal("do_task tool not found")
+	}
+	for _, banned := range []string{"back-brain", "back brain", "delegate to"} {
+		if strings.Contains(doTask, banned) {
+			t.Errorf("do_task description must not contain %q (contradicts one-self persona)", banned)
+		}
+	}
+	for _, want := range []string{"calculate precisely", "never answer", "own tools"} {
+		if !strings.Contains(doTask, want) {
+			t.Errorf("do_task description missing %q", want)
+		}
+	}
+	if strings.Contains(switchAgent, "back-brain") {
+		t.Error("switch_agent description must not contain 'back-brain'")
 	}
 }
