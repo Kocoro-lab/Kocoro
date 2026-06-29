@@ -47,6 +47,10 @@ Skills are knowledge packages that teach agents specific abilities — like read
 
 The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~12k skills), a SEPARATE API from `/skills/marketplace/*`. They use opaque cursor pagination and expose per-version file browsing. Base URL is `skills.marketplace.clawhub_url` (default `https://clawhub.ai`). Install via either surface lands the skill on disk identically.
 
+**Transient-failure handling:** browse/detail/files/file (and the static `/skills/marketplace/*` reads) retry transient upstream failures — HTTP 429/500/502/503/504 and network errors — with exponential backoff + jitter before surfacing an error, so an occasional ClawHub blip no longer fails the request. A `503`/`502` is returned only after retries are exhausted. Tunable via `skills.marketplace.max_attempts` (default 3) and `skills.marketplace.retry_base_backoff_secs` (default 1). 4xx (404/409/422) are not retried. The install zip download is a single attempt (no retry) — it uses a 2-minute timeout, so a failed install surfaces promptly as 502 and you simply retry the install.
+
+**Caching:** ClawHub read responses (browse/search/detail/files/file) are cached for a short TTL (`skills.marketplace.clawhub_cache_ttl_secs`, default 60s) keyed by full URL, so repeated/burst browsing within the window doesn't re-hit clawhub.ai. On an upstream failure a still-cached body is served as stale (with a cooldown), the same way the static registry serves stale on error. A newly published or edited skill can therefore take up to the TTL to appear; set the TTL to 0 to disable caching.
+
 **Ambiguous slugs:** ClawHub slugs are not unique across publishers (e.g. two `data-analysis` from different authors). The detail/files/file/install endpoints accept an optional `?owner=<handle>` query param (the entry's `author`) to disambiguate; without it ClawHub returns 409 for a shared slug, surfaced as 503 (detail/files/file) or 502 (install). Search results carry the `author`; browse-list items do not.
 
 ### Browse ClawHub

@@ -193,6 +193,7 @@ type Client struct {
 	pendingClaims         sync.Map // map[string]chan bool
 	activeMsgs            sync.Map // map[string]context.CancelFunc
 	eventSeqs             sync.Map // map[string]*atomic.Int64
+	pendingReplies        sync.Map // map[string]pendingReply — per-message reply override set by onMsg during RunAgent
 	connected             atomic.Bool
 	activeAgent           atomic.Value // stores string
 	startTime             time.Time
@@ -354,15 +355,61 @@ func (c *Client) sendProgress(messageID string) error {
 	return c.envelopeSender(DaemonMessage{Type: MsgTypeProgress, MessageID: messageID})
 }
 
-// sendDeliveryAck signals to Cloud that the inbound message reached a
+// pendingReply carries a per-message reply override set by the onMsg callback
+// while RunAgent is in flight, consumed once in handleMessage:
+//   - ReplyToID redirects the final reply+ack to a DIFFERENT inbound message id
+//     (a run that absorbed a mid-run injected follow-up answers it under its own
+//     cloud id, so the channel renders separate messages, not one merged reply).
+//   - Suppress drops the reply+ack entirely (this message was injected into
+//     another active run, which completes it under its own id).
+type pendingReply struct {
+	// ReplyToID addresses the final reply (empty = inbound id).
+	ReplyToID string
+	// AckIDs are acked AFTER the reply is delivered — every inbound id the run
+	// absorbed but did not reply to independently (includes ReplyToID). Empty
+	// means ack just the replied id.
+	AckIDs []string
+	// Suppress skips reply AND ack: the owning run completes + acks this id once
+	// ITS reply is delivered (the ack-after-delivery invariant for injects).
+	Suppress bool
+}
+
+// SetReplyPlan records how handleMessage should finalize inboundID: send the
+// final reply to replyToID (empty = inboundID) and, AFTER it is delivered, ack
+// every id in ackIDs — the inbound ids this run absorbed but did not reply to
+// independently. Acking only post-delivery preserves the delivery-ack invariant
+// for absorbed/merged messages (a reply failure replays them rather than losing
+// the answer). Set by the onMsg callback before returning; consumed once in
+// handleMessage.
+func (c *Client) SetReplyPlan(inboundID, replyToID string, ackIDs []string) {
+	if inboundID == "" {
+		return
+	}
+	c.pendingReplies.Store(inboundID, pendingReply{ReplyToID: replyToID, AckIDs: ackIDs})
+}
+
+// SuppressReply records that inboundID's reply AND ack must be skipped in
+// handleMessage — the message was injected into an active run that completes it
+// (reply + ack) under its own id once that run's reply is delivered. Set by the
+// onMsg callback for injected follow-ups.
+func (c *Client) SuppressReply(inboundID string) {
+	if inboundID == "" {
+		return
+	}
+	c.pendingReplies.Store(inboundID, pendingReply{Suppress: true})
+}
+
+// SendDeliveryAck signals to Cloud that the inbound message reached a
 // terminal state (success or error reply already delivered to the
 // user). Cloud drops the entry from its replay buffer so a subsequent
 // disconnect+reconnect doesn't re-deliver the same message. Called
 // only on SendReply success — if the reply itself failed to flush,
-// the user wasn't informed and Cloud must replay on reconnect.
+// the user wasn't informed and Cloud must replay on reconnect. Exported
+// so the daemon event handler can ack a superseded turn's own reply
+// (OnIntermediateAnswer) under that message's cloud id.
 //
 // Empty messageID is a no-op so callers don't have to guard.
-func (c *Client) sendDeliveryAck(messageID string) error {
+func (c *Client) SendDeliveryAck(messageID string) error {
 	if messageID == "" {
 		return nil
 	}
@@ -689,17 +736,45 @@ func (c *Client) handleMessage(ctx context.Context, sm ServerMessage) {
 	heartbeatCancel()
 	c.activeMsgs.Delete(sm.MessageID)
 
+	// Resolve the per-message reply override the onMsg callback may have set
+	// during RunAgent. Suppress: this message was injected into another active
+	// run that completes it under its own id — nothing to send here. ReplyToID:
+	// the run absorbed an injected follow-up and answers it under that
+	// follow-up's own cloud id, so the final reply+ack is addressed there
+	// instead of the inbound id (separate channel messages, not one merged).
+	replyID := sm.MessageID
+	var ackIDs []string
+	if v, ok := c.pendingReplies.LoadAndDelete(sm.MessageID); ok {
+		pr := v.(pendingReply)
+		if pr.Suppress {
+			// Injected into an active run that completes this id (reply + ack)
+			// once ITS reply is delivered. Skip BOTH here: acking now would drop
+			// the inbound from Cloud's replay buffer before the owning run's reply
+			// actually lands, losing the answer if that reply fails or the daemon
+			// crashes first.
+			return
+		}
+		if pr.ReplyToID != "" {
+			replyID = pr.ReplyToID
+		}
+		// Ack every absorbed id, but only AFTER the reply below is delivered.
+		ackIDs = pr.AckIDs
+	}
+	if len(ackIDs) == 0 {
+		ackIDs = []string{replyID}
+	}
+
 	// Send reply, then ack on success so Cloud can drop the inbound
 	// message from its replay buffer. Reply failure must skip the ack so
 	// the un-delivered message is replayed on the next reconnect — the
 	// user wasn't informed yet.
-	if err := c.SendReply(sm.MessageID, ReplyPayload{
+	if err := c.SendReply(replyID, ReplyPayload{
 		Channel:  payload.Channel,
 		ThreadID: payload.ThreadID,
 		Text:     result,
 		Format:   FormatText,
 	}); err != nil {
-		log.Printf("daemon: SendReply failed for message %s: %v", sm.MessageID, err)
+		log.Printf("daemon: SendReply failed for message %s: %v", replyID, err)
 		if c.eventBus != nil {
 			// Match the source fallback applied at the WS callback entry point
 			// (cmd/daemon.go) so consumers see a consistent source field during
@@ -715,7 +790,7 @@ func (c *Client) handleMessage(ctx context.Context, sm ServerMessage) {
 			// form rather than the local display string.
 			errPayload, _ := json.Marshal(map[string]any{
 				"agent":      payload.AgentName,
-				"message_id": sm.MessageID,
+				"message_id": replyID,
 				"source":     source,
 				"error":      fmt.Sprintf("reply delivery failed: %v", err),
 			})
@@ -723,8 +798,12 @@ func (c *Client) handleMessage(ctx context.Context, sm ServerMessage) {
 		}
 		return
 	}
-	if err := c.sendDeliveryAck(sm.MessageID); err != nil {
-		log.Printf("daemon: delivery_ack failed for message %s: %v", sm.MessageID, err)
+	// Reply delivered — now ack every absorbed id (ack-after-delivery). The reply
+	// failure path above returns early WITHOUT acking, so Cloud replays them all.
+	for _, id := range ackIDs {
+		if err := c.SendDeliveryAck(id); err != nil {
+			log.Printf("daemon: delivery_ack failed for message %s: %v", id, err)
+		}
 	}
 }
 

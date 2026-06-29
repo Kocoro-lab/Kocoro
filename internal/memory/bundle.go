@@ -13,8 +13,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 )
 
 type ManifestFile struct {
@@ -92,11 +93,11 @@ func (p *Puller) tick(ctx context.Context) error {
 		return err
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := fslock.TryLock(f.Fd()); err != nil {
 		// Contention: another caller is mid-pull; we'll get the next tick.
 		return nil
 	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(f.Fd())
 
 	// Step 2: tenant check (cloud-only — caller ensures provider==cloud
 	// before invoking tick).
@@ -158,8 +159,9 @@ func (p *Puller) fetchManifest(ctx context.Context) (*Manifest, error) {
 	return &mf, nil
 }
 
-// currentTs reads the symlink target for <bundleRoot>/current and returns its
-// basename (the bundle ts). Empty string if the symlink is absent or unreadable.
+// currentTs reads the <bundleRoot>/current pointer (a symlink on POSIX, a
+// directory junction on Windows — os.Readlink resolves both) and returns its
+// basename (the bundle ts). Empty string if the pointer is absent or unreadable.
 func (p *Puller) currentTs() string {
 	target, err := os.Readlink(filepath.Join(p.cfg.BundleRoot, "current"))
 	if err != nil {
@@ -292,9 +294,10 @@ func escapedManifestPath(raw string) string {
 	return strings.Join(out, "/")
 }
 
-// atomicInstall renames the staging dir into bundles/<ts> and atomically
-// swaps the `current` symlink. Both rename + symlink-swap are POSIX-atomic
-// on the same filesystem.
+// atomicInstall renames the staging dir into bundles/<ts> and points the
+// `current` pointer at it. The pointer is a symlink on POSIX and a directory
+// junction on Windows (see swapCurrent in bundle_link_{unix,windows}.go) —
+// both leave current/<file> transparently traversable by the tlm sidecar.
 func (p *Puller) atomicInstall(stagingDir, ts string) error {
 	bundlesDir := filepath.Join(p.cfg.BundleRoot, "bundles")
 	if err := os.MkdirAll(bundlesDir, 0o700); err != nil {
@@ -304,15 +307,7 @@ func (p *Puller) atomicInstall(stagingDir, ts string) error {
 	if err := os.Rename(stagingDir, finalDir); err != nil {
 		return fmt.Errorf("rename staging→bundle: %w", err)
 	}
-	tmpLink := filepath.Join(p.cfg.BundleRoot, "current.tmp")
-	_ = os.Remove(tmpLink)
-	if err := os.Symlink(finalDir, tmpLink); err != nil {
-		return fmt.Errorf("symlink current.tmp: %w", err)
-	}
-	if err := os.Rename(tmpLink, filepath.Join(p.cfg.BundleRoot, "current")); err != nil {
-		return fmt.Errorf("swap current symlink: %w", err)
-	}
-	return nil
+	return swapCurrent(p.cfg.BundleRoot, finalDir)
 }
 
 // reloadSidecar pings the sidecar's /bundle/reload endpoint via UDS so it

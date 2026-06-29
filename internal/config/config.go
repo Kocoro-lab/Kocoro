@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
@@ -79,7 +79,7 @@ type AgentConfig struct {
 	ForceThinkTool  bool   `mapstructure:"force_think_tool" yaml:"force_think_tool" json:"force_think_tool"`
 	ReasoningEffort string `mapstructure:"reasoning_effort" yaml:"reasoning_effort" json:"reasoning_effort"`
 	Model           string `mapstructure:"model"            yaml:"model"            json:"model"`          // specific model override
-	Language        string `mapstructure:"language"         yaml:"language"         json:"language"`        // locked reply language as a native name (e.g. "中文"); empty = mirror the user's current-message language
+	Language        string `mapstructure:"language"         yaml:"language"         json:"language"`       // locked reply language as a native name (e.g. "中文"); empty = mirror the user's current-message language
 	ContextWindow   int    `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"` // model context window in tokens
 	// IdleSoftTimeoutSecs / IdleHardTimeoutSecs: turn-level watchdog measured
 	// against explicit "idle-counted" phases of the agent loop (waiting on an
@@ -386,6 +386,22 @@ func Load() (*Config, error) {
 	viper.SetDefault("mcp.default_connect_timeout_secs", 60)
 	viper.SetDefault("skills.marketplace.clawhub_url", "https://clawhub.ai")
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
+	// skills.marketplace.max_attempts / .retry_base_backoff_secs: in-client
+	// retry of transient upstream failures (503/5xx/429 + network) on catalog
+	// GETs. ClawHub returned ~22% 503s under a 50-request load test; with no
+	// retry that surfaced as user-visible "marketplace unavailable". Symptom if
+	// too low: occasional spurious browse/install failures. Symptom if too high:
+	// slow failure when ClawHub is genuinely down (each attempt waits the 15s
+	// client timeout). Override in ~/.shannon/config.yaml.
+	viper.SetDefault("skills.marketplace.max_attempts", 3)
+	viper.SetDefault("skills.marketplace.retry_base_backoff_secs", 1)
+	// skills.marketplace.clawhub_cache_ttl_secs: TTL for the ClawHub live-catalog
+	// response cache (browse/search/detail/files/file). Short by design — absorbs
+	// request bursts/repeat browsing (cutting upstream calls and 503 exposure)
+	// without serving a noticeably stale catalog. Symptom if too high: a newly
+	// published/edited skill takes up to the TTL to appear. 0 disables caching.
+	// Override in ~/.shannon/config.yaml.
+	viper.SetDefault("skills.marketplace.clawhub_cache_ttl_secs", 60)
 	viper.SetDefault("cloud.enabled", true)
 	viper.SetDefault("cloud.timeout", 3600)
 	viper.SetDefault("cloud.stream_idle_timeout_secs", 45) // per-connection SSE liveness probe; cloud pings every 10s. 0 disables.
@@ -1226,10 +1242,10 @@ func AppendAllowedCommand(shannonDir, pattern string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -1299,10 +1315,10 @@ func AppendGlobalAlwaysAllowTool(shannonDir, tool string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -1366,10 +1382,10 @@ func RemoveGlobalAlwaysAllowTool(shannonDir, tool string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -1460,10 +1476,10 @@ func AppendGlobalDisabledSkills(shannonDir string, skills []string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -1555,10 +1571,10 @@ func RemoveGlobalDisabledSkills(shannonDir string, skills []string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -1631,10 +1647,10 @@ func AppendDefaultAgentDisabledMCPServer(shannonDir, server string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -1696,10 +1712,10 @@ func RemoveDefaultAgentDisabledMCPServer(shannonDir, server string) error {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {

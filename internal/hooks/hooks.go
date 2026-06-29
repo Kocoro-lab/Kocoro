@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -27,9 +26,9 @@ const (
 )
 
 const (
-	defaultTimeout   = 10 * time.Second
-	maxOutputBytes   = 10 * 1024 // 10KB
-	exitCodeDeny     = 2
+	defaultTimeout = 10 * time.Second
+	maxOutputBytes = 10 * 1024 // 10KB
+	exitCodeDeny   = 2
 )
 
 // HookConfig uses PascalCase event names in both YAML and JSON to match the
@@ -244,11 +243,8 @@ func (h *HookRunner) runHook(ctx context.Context, entry HookEntry, input HookInp
 	cmd.Stdin = bytes.NewReader(inputJSON)
 
 	// Create a new process group so we can kill the entire tree on timeout
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		// Kill the entire process group (negative PID)
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
+	// (platform-specific: POSIX Setpgid+Kill vs Windows taskkill /T).
+	setProcGroupKill(cmd)
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &limitedWriter{buf: &stdoutBuf, limit: maxOutputBytes}

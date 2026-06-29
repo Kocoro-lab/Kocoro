@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"syscall"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 	"github.com/zalando/go-keyring"
 )
 
@@ -186,10 +186,10 @@ func (s *SecretsStore) modifyIndex(fn func(*secretsIndex)) error {
 		return err
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
 		return err
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 	// Do NOT os.Remove the lock file — concurrent goroutines may flock
 	// on different inodes if the file is deleted and recreated.
 

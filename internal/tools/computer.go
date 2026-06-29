@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 
@@ -103,7 +104,7 @@ func normalizeArgs(args *computerArgs) {
 
 func (t *ComputerTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
-		Name:        "computer",
+		Name: "computer",
 		// computer is registered as an Anthropic native tool
 		// (NativeToolDef below). agent.buildToolSchema sends only the
 		// native fields on the wire and DROPS Parameters/Description — so a
@@ -141,6 +142,9 @@ func (t *ComputerTool) NativeToolDef() *client.NativeToolDef {
 }
 
 func (t *ComputerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if runtime.GOOS != "darwin" {
+		return agent.ToolResult{Content: "computer tool is only available on macOS", IsError: true}, nil
+	}
 	var args computerArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil

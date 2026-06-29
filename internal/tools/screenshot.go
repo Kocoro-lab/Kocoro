@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -39,6 +40,9 @@ func (t *ScreenshotTool) RequiresApproval() bool { return false }
 func (t *ScreenshotTool) IsReadOnlyCall(string) bool { return true }
 
 func (t *ScreenshotTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if runtime.GOOS != "darwin" {
+		return agent.ToolResult{Content: "screenshot tool is only available on macOS", IsError: true}, nil
+	}
 	var args screenshotArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil

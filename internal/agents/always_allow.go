@@ -7,8 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"syscall"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 	"gopkg.in/yaml.v3"
 )
 
@@ -168,12 +168,12 @@ func lockAgentConfig(agentDir string) (release func(), err error) {
 	if err != nil {
 		return nil, fmt.Errorf("open lock file: %w", err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := fslock.Lock(f.Fd()); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("flock: %w", err)
 	}
 	return func() {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		fslock.Unlock(f.Fd())
 		f.Close()
 	}, nil
 }

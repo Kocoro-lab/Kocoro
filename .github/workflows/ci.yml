@@ -50,6 +50,20 @@ jobs:
       - name: Build
         run: go build ./...
 
+      - name: Cross-compile check (windows, linux)
+        # The daemon must keep cross-compiling for the Electron desktop app's
+        # release CI, which builds it for windows/amd64 and linux/amd64. This
+        # job runs on macOS, so without this guard a PR that reaches for a
+        # POSIX-only syscall (syscall.Flock/Kill/Setpgid, os.Symlink, a
+        # unix-only import) would pass green and silently break the Windows
+        # binary. CGO is off, so no cross toolchain is needed. This also vets
+        # the windows-tagged files (_windows.go) the macOS test job never
+        # compiles.
+        run: |
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...
+
       - name: Test
         # -count=1 disables the test result cache so CI actually runs
         # tests rather than replaying cached success from a prior run.

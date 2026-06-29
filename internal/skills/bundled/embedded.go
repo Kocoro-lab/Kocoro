@@ -8,7 +8,8 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
-	"syscall"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 )
 
 //go:embed skills
@@ -33,10 +34,10 @@ func ExtractBundledSkills(shannonDir string) (string, error) {
 		return "", fmt.Errorf("open bundle lock: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
 		return "", fmt.Errorf("lock bundle: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer fslock.Unlock(lockFile.Fd())
 
 	currentVersion, err := os.ReadFile(filepath.Join(bundledDir, versionFileName))
 	if err == nil && strings.TrimSpace(string(currentVersion)) == bundledVersion() {

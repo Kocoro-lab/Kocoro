@@ -11,12 +11,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"testing"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 )
 
 func holdFlock(f *os.File) error {
-	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	return fslock.TryLock(f.Fd())
 }
 
 func TestPuller_VersionOutOfRange(t *testing.T) {

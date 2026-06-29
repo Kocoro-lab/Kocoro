@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -148,7 +147,7 @@ func (s *Sidecar) Spawn(ctx context.Context) error {
 	args := append([]string{}, s.extraArg...)
 	args = append(args, "serve", "--socket", s.cfg.SocketPath, "--bundle-root", s.cfg.BundleRoot)
 	cmd := exec.Command(bin, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn: %w", err)
 	}
@@ -280,21 +279,7 @@ func (s *Sidecar) Shutdown(grace time.Duration) error {
 		s.mu.Unlock()
 		return nil
 	}
-	pgid, err := syscall.Getpgid(cmd.Process.Pid)
-	if err != nil {
-		// Fallback: signal the process directly.
-		pgid = cmd.Process.Pid
-	}
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	select {
-	case <-done:
-	case <-time.After(grace):
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-		}
-	}
+	terminateProcessTree(cmd.Process, done, grace)
 	s.mu.Lock()
 	if s.cfg.SocketPath != "" {
 		_ = os.Remove(s.cfg.SocketPath)

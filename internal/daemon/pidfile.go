@@ -3,9 +3,11 @@ package daemon
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 )
 
 // PIDFile manages a flock-guarded PID file for daemon single-instance enforcement.
@@ -27,7 +29,7 @@ func AcquirePIDFile(path string) (*PIDFile, error) {
 	}
 
 	// Non-blocking exclusive lock.
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := fslock.TryLock(f.Fd()); err != nil {
 		// Lock held by another process — read existing PID for the error message.
 		existingPID := readPIDFromFile(f)
 		f.Close()
@@ -39,22 +41,22 @@ func AcquirePIDFile(path string) (*PIDFile, error) {
 
 	// Lock acquired — write our PID.
 	if err := f.Truncate(0); err != nil {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		fslock.Unlock(f.Fd())
 		f.Close()
 		return nil, fmt.Errorf("truncate pid file: %w", err)
 	}
 	if _, err := f.Seek(0, 0); err != nil {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		fslock.Unlock(f.Fd())
 		f.Close()
 		return nil, fmt.Errorf("seek pid file: %w", err)
 	}
 	if _, err := fmt.Fprintf(f, "%d\n", os.Getpid()); err != nil {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		fslock.Unlock(f.Fd())
 		f.Close()
 		return nil, fmt.Errorf("write pid: %w", err)
 	}
 	if err := f.Sync(); err != nil {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		fslock.Unlock(f.Fd())
 		f.Close()
 		return nil, fmt.Errorf("sync pid file: %w", err)
 	}
@@ -69,9 +71,22 @@ func (p *PIDFile) Close() {
 	if p.file == nil {
 		return
 	}
-	os.Remove(p.path)
-	syscall.Flock(int(p.file.Fd()), syscall.LOCK_UN)
-	p.file.Close()
+	if runtime.GOOS == "windows" {
+		// Windows can't delete a file that still has an open handle. Release
+		// the lock and close first, then remove. If another instance grabbed
+		// the file in the window after Close, os.Remove fails harmlessly with a
+		// sharing violation and leaves that instance's pidfile intact.
+		fslock.Unlock(p.file.Fd())
+		p.file.Close()
+		os.Remove(p.path)
+	} else {
+		// POSIX: remove while the lock is still held so a newly-starting
+		// instance can't acquire the lock on a file we're about to unlink
+		// (single-instance handoff). unlink-while-open is allowed here.
+		os.Remove(p.path)
+		fslock.Unlock(p.file.Fd())
+		p.file.Close()
+	}
 	p.file = nil
 }
 
@@ -94,16 +109,22 @@ func ReadPID(path string) (int, error) {
 
 // IsLocked checks whether the PID file at path is currently locked by another process.
 // Returns the PID if locked, 0 if not locked or file doesn't exist.
+//
+// The handle is opened O_RDWR (not O_RDONLY): on Windows fslock.TryLock maps to
+// LockFileEx(LOCKFILE_EXCLUSIVE_LOCK), which requires a writable handle — a
+// read-only handle fails with ERROR_ACCESS_DENIED even when no one holds the
+// lock, which would make this probe always report "locked". POSIX flock works
+// on any fd, so this is harmless there.
 func IsLocked(path string) (int, bool) {
-	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return 0, false
 	}
 	defer f.Close()
 
 	// Try non-blocking lock — if we get it, no one else holds it.
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	if err := fslock.TryLock(f.Fd()); err == nil {
+		fslock.Unlock(f.Fd())
 		return 0, false
 	}
 

@@ -9,10 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 )
 
 const (
@@ -158,10 +158,10 @@ func BoundedAppend(memoryDir, content string) error {
 	}
 	defer lockFile.Close()
 
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
 		return fmt.Errorf("flock: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) //nolint:errcheck
+	defer fslock.Unlock(lockFile.Fd()) //nolint:errcheck
 
 	// Read existing file under lock
 	existing, _ := os.ReadFile(memoryPath)
@@ -258,10 +258,10 @@ func ConsolidateMemory(ctx context.Context, c Completer, memoryDir string) (clie
 		return client.Usage{}, fmt.Errorf("consolidate: open lock: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
 		return client.Usage{}, fmt.Errorf("consolidate: flock: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) //nolint:errcheck
+	defer fslock.Unlock(lockFile.Fd()) //nolint:errcheck
 
 	// Read and split MEMORY.md into user vs auto content
 	existing, _ := os.ReadFile(memoryPath)

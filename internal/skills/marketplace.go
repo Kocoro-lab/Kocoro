@@ -125,6 +125,18 @@ type MarketplaceClient struct {
 	// so tests can set a short cooldown directly.
 	staleCooldown time.Duration
 
+	// maxAttempts / retryBase bound the in-client retry of transient upstream
+	// failures on catalog GETs (fetch/getJSON/getText). Defaulted in the
+	// constructors; overridable via SetRetryPolicy (server.go injects config
+	// values). Fields (not constructor args) so tests set them directly.
+	maxAttempts int
+	retryBase   time.Duration
+
+	// clawhubCache is the TTL response cache for the ClawHub live-catalog reads
+	// (getJSON/getText). Non-nil only on a ClawHub client; the static-registry
+	// client caches at the Load() layer instead. nil → no caching.
+	clawhubCache *clawhubCache
+
 	mu         sync.Mutex
 	cache      *RegistryIndex
 	fetched    time.Time
@@ -141,6 +153,8 @@ func NewMarketplaceClient(url string, ttl time.Duration) *MarketplaceClient {
 		ttl:           ttl,
 		http:          &http.Client{Timeout: 15 * time.Second},
 		staleCooldown: defaultStaleCooldown,
+		maxAttempts:   defaultMarketplaceMaxAttempts,
+		retryBase:     defaultMarketplaceRetryBase,
 	}
 }
 
@@ -153,6 +167,29 @@ func NewClawHubMarketplaceClient(base string, ttl time.Duration) *MarketplaceCli
 		ttl:           ttl,
 		http:          &http.Client{Timeout: 15 * time.Second},
 		staleCooldown: defaultStaleCooldown,
+		maxAttempts:   defaultMarketplaceMaxAttempts,
+		retryBase:     defaultMarketplaceRetryBase,
+		clawhubCache:  newClawHubCache(defaultClawHubCacheTTL, defaultStaleCooldown),
+	}
+}
+
+// SetClawHubCacheTTL overrides the ClawHub response-cache TTL (config-injected
+// by the daemon). ttl <= 0 disables the cache. No-op on a non-ClawHub client.
+func (c *MarketplaceClient) SetClawHubCacheTTL(ttl time.Duration) {
+	if c.clawhubCache != nil {
+		c.clawhubCache.ttl = ttl
+	}
+}
+
+// SetRetryPolicy overrides the transient-failure retry policy for catalog GETs
+// (fetch/getJSON/getText). Called by the daemon with config-derived values;
+// non-positive args are ignored so callers can pass 0 to keep the default.
+func (c *MarketplaceClient) SetRetryPolicy(maxAttempts int, base time.Duration) {
+	if maxAttempts > 0 {
+		c.maxAttempts = maxAttempts
+	}
+	if base > 0 {
+		c.retryBase = base
 	}
 }
 
@@ -160,23 +197,34 @@ func NewClawHubMarketplaceClient(base string, ttl time.Duration) *MarketplaceCli
 // empty or past TTL. See the type doc for stale-on-error semantics.
 func (c *MarketplaceClient) Load(ctx context.Context) (*RegistryIndex, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	// Fresh cache → return immediately.
 	if c.cache != nil && time.Since(c.fetched) < c.ttl {
 		c.stale = false
-		return c.cache, nil
+		cached := c.cache
+		c.mu.Unlock()
+		return cached, nil
 	}
-
 	// Stale-mode cooldown in effect → keep serving stale without
 	// re-attempting the upstream fetch. Prevents retry storms during
 	// registry outages.
 	if c.cache != nil && !c.retryAfter.IsZero() && time.Now().Before(c.retryAfter) {
 		c.stale = true
-		return c.cache, nil
+		cached := c.cache
+		c.mu.Unlock()
+		return cached, nil
 	}
+	c.mu.Unlock()
 
+	// Fetch WITHOUT holding c.mu: the fetch now retries with backoff sleeps
+	// (up to tens of seconds during an outage), and holding the lock across it
+	// would serialize every concurrent Load()/IsStale() caller for that whole
+	// window. The cost is that a cold-cache stampede may run a few fetches in
+	// parallel; the staleCooldown set on the first failure quickly suppresses
+	// further ones, and jittered backoff spreads the load.
 	idx, err := c.fetch(ctx)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if err != nil {
 		if c.cache != nil {
 			c.stale = true
@@ -185,7 +233,6 @@ func (c *MarketplaceClient) Load(ctx context.Context) (*RegistryIndex, error) {
 		}
 		return nil, err
 	}
-
 	c.cache = idx
 	c.fetched = time.Now()
 	c.stale = false
@@ -612,6 +659,13 @@ func gitCloneWithRetry(ctx context.Context, entry MarketplaceEntry, tmpRoot stri
 // the in-flight download. marketplaceDownloadClient provides a 2-minute
 // safety ceiling when ctx has no deadline.
 func installFromZip(ctx context.Context, entry MarketplaceEntry, stageDir string) error {
+	// Single attempt (no doGETWithRetry): the zip download uses the 2-minute
+	// marketplaceDownloadClient, so multiplying it by retries would let a
+	// hanging upstream stall a user's Install for many minutes — and the
+	// per-request retry policy isn't reachable here anyway. Transient
+	// resilience already covers the catalog GETs (incl. install's slug
+	// resolution); a failed download surfaces as ErrMarketplaceUpstreamFailure
+	// (→502) and the user can reinstall.
 	req, err := http.NewRequestWithContext(ctx, "GET", entry.DownloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("%w: build download request: %v", ErrMarketplaceUpstreamFailure, err)
@@ -998,11 +1052,7 @@ func FilterSortPaginate(entries []MarketplaceEntry, query, sortKey string, page,
 }
 
 func (c *MarketplaceClient) fetch(ctx context.Context) (*RegistryIndex, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", c.url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	resp, err := c.http.Do(req)
+	resp, err := doGETWithRetry(ctx, c.http, c.url, c.maxAttempts, c.retryBase, marketplaceCatalogRetryBudget)
 	if err != nil {
 		return nil, fmt.Errorf("fetch registry: %w", err)
 	}
@@ -1380,43 +1430,55 @@ func (c *MarketplaceClient) FetchClawHubFile(ctx context.Context, slug, version,
 // getText performs a GET and returns the raw response body as a string. Used for
 // file content (ClawHub caps single files at 200KB); 1 MB ceiling as a guard.
 func (c *MarketplaceClient) getText(ctx context.Context, rawURL string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
-	}
-	resp, err := c.http.Do(req)
+	body, err := c.clawhubGet(ctx, rawURL, 1*1024*1024)
 	if err != nil {
 		return "", fmt.Errorf("fetch clawhub: %w", err)
 	}
+	return string(body), nil
+}
+
+// clawhubGet fetches rawURL (with transient retry) and returns the response body
+// capped at maxBytes. Results are cached for the ClawHub cache TTL keyed by URL;
+// on an upstream failure (network/transient 5xx, after retries) a still-cached
+// body is served as stale. Definitive 4xx (404/409/422) and parse-able non-2xx
+// surface as a "status %d" error so getJSON/getText preserve the daemon's
+// 404-vs-503 mapping. Non-2xx is never cached.
+func (c *MarketplaceClient) clawhubGet(ctx context.Context, rawURL string, maxBytes int64) ([]byte, error) {
+	if data, ok := c.clawhubCache.lookup(rawURL); ok {
+		return data, nil
+	}
+	resp, err := doGETWithRetry(ctx, c.http, rawURL, c.maxAttempts, c.retryBase, marketplaceCatalogRetryBudget)
+	if err != nil {
+		if data, ok := c.clawhubCache.staleOnError(rawURL); ok {
+			return data, nil
+		}
+		return nil, err
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("fetch clawhub: status %d", resp.StatusCode)
+		// Serve stale only for transient upstream failures; definitive 4xx
+		// must surface (e.g. 404 → "not found", 409 → ambiguous slug).
+		if isRetryableStatus(resp.StatusCode) {
+			if data, ok := c.clawhubCache.staleOnError(rawURL); ok {
+				return data, nil
+			}
+		}
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
 	if err != nil {
-		return "", fmt.Errorf("read clawhub body: %w", err)
+		return nil, fmt.Errorf("read clawhub body: %w", err)
 	}
-	return string(body), nil
+	c.clawhubCache.store(rawURL, body)
+	return body, nil
 }
 
 // getJSON performs a GET and decodes the JSON body into v, sharing the HTTP
 // client, body cap, and error wrapping with the registry fetch path.
 func (c *MarketplaceClient) getJSON(ctx context.Context, rawURL string, v any) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
-	resp, err := c.http.Do(req)
+	body, err := c.clawhubGet(ctx, rawURL, 10*1024*1024) // 10 MB cap
 	if err != nil {
 		return fmt.Errorf("fetch clawhub: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("fetch clawhub: status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024)) // 10 MB cap
-	if err != nil {
-		return fmt.Errorf("read clawhub body: %w", err)
 	}
 	if err := json.Unmarshal(body, v); err != nil {
 		return fmt.Errorf("parse clawhub: %w", err)

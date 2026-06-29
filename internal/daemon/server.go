@@ -200,10 +200,43 @@ func resolveRegistryURL(deps *ServerDeps) string {
 	return defaultURL
 }
 
+// applyMarketplaceConfig injects the config-tunable retry policy
+// (skills.marketplace.max_attempts / .retry_base_backoff_secs) and ClawHub
+// cache TTL (.clawhub_cache_ttl_secs) into a catalog client.
+func applyMarketplaceConfig(c *skills.MarketplaceClient) *skills.MarketplaceClient {
+	// Clamp to sane ranges so an absurd config value can't overflow
+	// time.Duration or produce a pathological attempt count; the per-sleep cap
+	// (marketplaceRetryMaxDelay) still bounds actual backoff.
+	attempts := viper.GetInt("skills.marketplace.max_attempts")
+	if attempts > 100 {
+		attempts = 100
+	}
+	baseSecs := viper.GetInt("skills.marketplace.retry_base_backoff_secs")
+	if baseSecs > 60 {
+		baseSecs = 60
+	}
+	if baseSecs < 0 {
+		baseSecs = 0
+	}
+	c.SetRetryPolicy(attempts, time.Duration(baseSecs)*time.Second)
+
+	// ClawHub response-cache TTL (no-op on the static-registry client). Clamp to
+	// a sane ceiling; negative → 0 (disabled).
+	ttlSecs := viper.GetInt("skills.marketplace.clawhub_cache_ttl_secs")
+	if ttlSecs > 3600 {
+		ttlSecs = 3600
+	}
+	if ttlSecs < 0 {
+		ttlSecs = 0
+	}
+	c.SetClawHubCacheTTL(time.Duration(ttlSecs) * time.Second)
+	return c
+}
+
 // newMarketplaceClient builds the static-registry catalog client that backs the
 // /skills/marketplace/* endpoints (the contract the macOS Desktop consumes).
 func newMarketplaceClient(deps *ServerDeps) *skills.MarketplaceClient {
-	return skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour)
+	return applyMarketplaceConfig(skills.NewMarketplaceClient(resolveRegistryURL(deps), 1*time.Hour))
 }
 
 // newClawHubClient builds the live ClawHub catalog client that backs the
@@ -216,7 +249,7 @@ func newClawHubClient(deps *ServerDeps) *skills.MarketplaceClient {
 			base = u
 		}
 	}
-	return skills.NewClawHubMarketplaceClient(base, 1*time.Hour)
+	return applyMarketplaceConfig(skills.NewClawHubMarketplaceClient(base, 1*time.Hour))
 }
 
 var (
@@ -4117,8 +4150,8 @@ func (s *Server) handleClawHubInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	entry := skills.MarketplaceEntry{
-		Slug:        slug,
-		Name:        slug,
+		Slug: slug,
+		Name: slug,
 		// owner disambiguates slugs shared by multiple publishers; without it
 		// ClawHub's download endpoint 409s on an ambiguous slug.
 		DownloadURL: s.clawhub.ClawHubDownloadURL(slug, r.URL.Query().Get("owner")),

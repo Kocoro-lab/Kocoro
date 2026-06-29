@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -35,6 +36,9 @@ func (t *AppleScriptTool) Info() agent.ToolInfo {
 }
 
 func (t *AppleScriptTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if runtime.GOOS != "darwin" {
+		return agent.ToolResult{Content: "applescript tool is only available on macOS", IsError: true}, nil
+	}
 	var args appleScriptArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
