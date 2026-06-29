@@ -232,6 +232,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		} `json:"error"` // type=="error" events
 	}
 	_ = json.Unmarshal(raw, &ev)
+	if os.Getenv("KOE_EVENT_LOG") == "1" {
+		log.Printf("koe[event]: %s", ev.Type)
+	}
 	switch ev.Type {
 	case "input_audio_buffer.speech_started":
 		// Server-VAD detected the user talking — the reactive "I hear you" moment.
