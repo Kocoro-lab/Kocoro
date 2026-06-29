@@ -220,7 +220,7 @@ func sessionConfig(persona, voice string) map[string]any {
 						"threshold":           0.65,
 						"prefix_padding_ms":   300,
 						"silence_duration_ms": 700,
-						"create_response":     false,
+						"create_response":     true,
 						"interrupt_response":  true,
 					},
 				},

@@ -188,7 +188,7 @@ func TestHandleEventNoBargeWhenListening(t *testing.T) {
 	}
 }
 
-func TestSessionConfigUsesTranscriptGatedVAD(t *testing.T) {
+func TestSessionConfigUsesAutoResponseVAD(t *testing.T) {
 	cfg := sessionConfig("persona", "marin")
 	raw, _ := json.Marshal(cfg)
 	s := string(raw)
@@ -197,12 +197,15 @@ func TestSessionConfigUsesTranscriptGatedVAD(t *testing.T) {
 		`"transcription":{"model":"gpt-4o-mini-transcribe"}`,
 		`"turn_detection"`,
 		`"type":"server_vad"`,
-		`"create_response":false`,
+		`"create_response":true`,
 		`"interrupt_response":true`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("sessionConfig missing %s in %s", want, s)
 		}
+	}
+	if strings.Contains(s, `"create_response":false`) {
+		t.Fatalf("sessionConfig must not gate responses (create_response must be true): %s", s)
 	}
 }
 
