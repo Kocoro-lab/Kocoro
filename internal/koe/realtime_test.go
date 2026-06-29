@@ -113,66 +113,6 @@ func TestHandleEventGatesMicWhileSpeaking(t *testing.T) {
 	}
 }
 
-// TestHandleEventBargeIn pins E2: a speech_started WHILE speaking cancels the reply,
-// clears the server + local output audio, ungates the mic, and flips to listening.
-func TestHandleEventBargeIn(t *testing.T) {
-	audio, err := NewAudioIO()
-	if err != nil {
-		t.Fatalf("NewAudioIO: %v", err)
-	}
-	state := NewCallState("burst-x", "")
-	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	cap := &captureSender{}
-	h := newEventHandler(disp, state, audio, cap.send)
-
-	// Enter speaking + queue some reply audio locally.
-	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
-	if h.voiceState() != "speaking" {
-		t.Fatalf("setup: expected speaking, got %q", h.voiceState())
-	}
-	audio.Play(make([]int16, audioFrameSize))
-	audio.Play(make([]int16, audioFrameSize))
-	if len(audio.playBuf) == 0 {
-		t.Fatal("setup: playBuf should have queued frames")
-	}
-
-	// The user talks over Kocoro.
-	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
-
-	if !cap.sentContains("response.cancel") {
-		t.Error("barge-in must cancel the in-flight response")
-	}
-	if !cap.sentContains("output_audio_buffer.clear") {
-		t.Error("barge-in must clear the server output-audio buffer")
-	}
-	if len(audio.playBuf) != 0 {
-		t.Errorf("barge-in must drain local playback, playBuf len = %d", len(audio.playBuf))
-	}
-	if audio.dropCapture() {
-		t.Error("barge-in must ungate the mic")
-	}
-	if h.voiceState() != "listening" {
-		t.Errorf("barge-in must flip to listening, got %q", h.voiceState())
-	}
-}
-
-// TestHandleEventNoBargeWhenListening: a speech_started while merely listening must
-// NOT fire the interrupt (no spurious response.cancel), only re-affirm listening.
-func TestHandleEventNoBargeWhenListening(t *testing.T) {
-	state := NewCallState("burst-x", "")
-	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	cap := &captureSender{}
-	h := newEventHandler(disp, state, nil, cap.send)
-
-	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
-	if cap.sentContains("response.cancel") {
-		t.Error("speech_started while listening must not cancel a response")
-	}
-	if h.voiceState() != "listening" {
-		t.Errorf("expected listening, got %q", h.voiceState())
-	}
-}
-
 func TestSessionConfigUsesAutoResponseVAD(t *testing.T) {
 	cfg := sessionConfig("persona", "marin")
 	raw, _ := json.Marshal(cfg)

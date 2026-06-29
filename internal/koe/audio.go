@@ -111,19 +111,6 @@ func (a *AudioIO) Play(pcm []int16) {
 	}
 }
 
-// ClearPlayback drops every queued playback frame. Barge-in (E2) calls it so
-// Kocoro's already-decoded reply stops the instant the user talks over it, instead
-// of draining the buffer first.
-func (a *AudioIO) ClearPlayback() {
-	for {
-		select {
-		case <-a.playBuf:
-		default:
-			return
-		}
-	}
-}
-
 // EncodeFrame Opus-encodes one 960-sample frame.
 func (a *AudioIO) EncodeFrame(frame []int16) ([]byte, error) {
 	a.encMu.Lock()
