@@ -149,6 +149,7 @@ func (rc *RealtimeConn) dialOpenAI(ctx context.Context, ek string) error {
 
 // pumpSendTrack Opus-encodes captured frames and writes them to the send track.
 func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
+	rc.audio.markSendReady() // unblock the file backend's feedFrames — the session is configured
 	for {
 		select {
 		case <-ctx.Done():

@@ -94,6 +94,15 @@ func (a *AudioIO) CapturedMetrics() WavMetrics {
 // trailing silence so server-VAD marks end-of-turn. Shared by the file backend
 // and the --real-output path (where the reply plays through the real speaker).
 func (a *AudioIO) feedFrames(inPCM []int16, done <-chan struct{}) {
+	// Wait until the send pump is draining (OpenAI session configured) before
+	// streaming this one-shot utterance, so it isn't fed into the 64-frame buffer
+	// before the pump is ready to drain it — that overflow dropped/bursted the
+	// synthesized speech and caused the silent/truncated --say runs. Cancellable.
+	select {
+	case <-a.sendReady:
+	case <-done:
+		return
+	}
 	ticker := time.NewTicker(audioFrameMs * time.Millisecond)
 	defer ticker.Stop()
 	emit := func(frame []int16) bool {

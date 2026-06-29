@@ -38,6 +38,14 @@ type AudioIO struct {
 	encMu     sync.Mutex
 	decMu     sync.Mutex
 	stopOnce  sync.Once
+	// sendReady is closed (once) when pumpSendTrack starts draining — i.e. the OpenAI
+	// session is configured. The file backend's feedFrames waits on it so a one-shot
+	// --say/--audio-in utterance is streamed in sync with the send pump, never fed
+	// into the 64-frame buffer before the pump is ready to drain it (that overflow
+	// dropped/bursted the synthesized speech → the silent/truncated --say runs). The
+	// real-mic path streams continuously and never waits; closing it is harmless.
+	sendReady     chan struct{}
+	sendReadyOnce sync.Once
 	// file is the headless debug backend (audio_file.go), non-nil only under
 	// `shan koe --audio-in`/`--say`. When set, Stop() tears it down.
 	file   *fileBackend
@@ -81,12 +89,18 @@ func NewAudioIO() (*AudioIO, error) {
 		return nil, err
 	}
 	return &AudioIO{
-		enc:     enc,
-		dec:     dec,
-		frames:  make(chan []int16, 64),
-		playBuf: make(chan []int16, 256),
+		enc:       enc,
+		dec:       dec,
+		frames:    make(chan []int16, 64),
+		playBuf:   make(chan []int16, 256),
+		sendReady: make(chan struct{}),
 	}, nil
 }
+
+// markSendReady signals (once) that the send pump has started draining captured
+// frames — the OpenAI session is configured. The file backend's feedFrames waits on
+// this before streaming a one-shot utterance so it lands in sync with the pump.
+func (a *AudioIO) markSendReady() { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
 
 // SetSpeaking gates the mic during playback (v1 half-duplex echo control).
 func (a *AudioIO) SetSpeaking(s bool) { a.speaking.Store(s) }
