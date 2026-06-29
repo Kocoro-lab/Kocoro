@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -26,14 +25,15 @@ const (
 	hintLocal = "Running locally? See https://github.com/Kocoro-lab/Shannon for self-hosting docs."
 )
 
-// keychainStoreOpener returns the Keychain store used by setup-time
+// keychainStoreOpener returns the OS credential store used by setup-time
 // codepaths (Load hydration, setupGateway api_key persist). Production
-// uses keychain.NewOSStore which talks to macOS Keychain; tests replace
-// this with an in-memory backend to avoid polluting the developer's
-// real Keychain.
+// uses keychain.NewOSStore which talks to the macOS Keychain or Windows
+// Credential Manager; tests replace this with an in-memory backend to
+// avoid polluting the developer's real credential store.
 //
-// Returns nil-Store + non-nil-err on non-darwin (ErrUnsupportedPlatform)
-// so callers can short-circuit cleanly.
+// Returns nil-Store + non-nil-err on platforms without a credential store
+// (Linux & others: ErrUnsupportedPlatform) so callers can short-circuit
+// cleanly.
 var keychainStoreOpener = func() (*keychain.Store, error) {
 	return keychain.NewOSStore(nil)
 }
@@ -53,7 +53,7 @@ func NeedsSetup(cfg *Config) bool {
 }
 
 func hydrateAPIKeyFromKeychain(cfg *Config) {
-	if cfg == nil || cfg.APIKey != "" || runtime.GOOS != "darwin" {
+	if cfg == nil || cfg.APIKey != "" || !keychain.Supported() {
 		return
 	}
 	if testing.Testing() && os.Getenv("KOCORO_FORCE_KEYCHAIN_HYDRATE") != "1" {
@@ -173,18 +173,19 @@ func setupGateway(cfg *Config, in io.Reader, reader *bufio.Reader, out io.Writer
 		break
 	}
 
-	// On macOS, route the pasted api_key into the Keychain "legacy" account
-	// so AuthManager.Bootstrap can adopt it (resolve user_id via /auth/me,
-	// rename the entry). Clear cfg.APIKey so it does not end up in yaml.
-	// Other platforms continue to persist cfg.APIKey to yaml (legacy path).
-	if runtime.GOOS == "darwin" && cfg.APIKey != "" {
+	// On platforms with an OS credential store (macOS Keychain / Windows
+	// Credential Manager), route the pasted api_key into the "legacy"
+	// account so AuthManager.Bootstrap can adopt it (resolve user_id via
+	// /auth/me, rename the entry). Clear cfg.APIKey so it does not end up in
+	// yaml. Other platforms continue to persist cfg.APIKey to yaml (legacy path).
+	if keychain.Supported() && cfg.APIKey != "" {
 		if store, err := keychainStoreOpener(); err == nil {
 			if err := store.Write(keychain.ServiceDaemonAPIKey, keychain.AccountLegacy, cfg.APIKey); err == nil {
 				_ = store.Write(keychain.ServiceDaemonState, keychain.AccountCurrentUser, keychain.AccountLegacy)
 				cfg.APIKey = ""
-				fmt.Fprintln(out, "API key stored in macOS Keychain (ai.kocoro.daemon.api_key).")
+				fmt.Fprintln(out, "API key stored in the OS credential store (ai.kocoro.daemon.api_key).")
 			} else {
-				fmt.Fprintf(out, "Warning: could not write keychain (%v); falling back to yaml plaintext.\n", err)
+				fmt.Fprintf(out, "Warning: could not write credential store (%v); falling back to yaml plaintext.\n", err)
 			}
 		}
 	}

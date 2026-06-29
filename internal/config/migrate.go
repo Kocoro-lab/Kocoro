@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -292,15 +291,17 @@ type apiKeyToKeychainMigration struct{}
 func (m *apiKeyToKeychainMigration) ID() string { return migrationIDAPIKeyToKeychain }
 
 func (m *apiKeyToKeychainMigration) Apply(shannonDir string) (bool, error) {
-	if runtime.GOOS != "darwin" {
+	if !keychain.Supported() {
 		return false, nil
 	}
-	// Skip the actual Keychain write under `go test` runs. zalando/go-keyring
-	// shells out to the macOS `security` binary which prompts the user
-	// (e.g. "kocoro wants to use the Keychain") through the GUI; in a
-	// headless CI runner there is no UI to dismiss it and the call hangs
-	// indefinitely, killing the test with a timeout. testing.Testing() is
-	// the Go-1.21+ standard guard for this kind of side-effect skip.
+	// Skip the actual credential-store write under `go test` runs. On macOS
+	// zalando/go-keyring shells out to the `security` binary which prompts
+	// the user (e.g. "kocoro wants to use the Keychain") through the GUI; in
+	// a headless CI runner there is no UI to dismiss it and the call hangs
+	// indefinitely, killing the test with a timeout. (Windows Credential
+	// Manager does not prompt, but we skip there too — tests must not touch
+	// the real store.) testing.Testing() is the Go-1.21+ standard guard for
+	// this kind of side-effect skip.
 	//
 	// Setting KOCORO_FORCE_KEYCHAIN_MIGRATION=1 re-enables it for the rare
 	// case where an integration test actually wants to exercise the path
@@ -331,9 +332,11 @@ func (m *apiKeyToKeychainMigration) Apply(shannonDir string) (bool, error) {
 
 	store, err := keychain.NewOSStore(nil)
 	if err != nil {
-		// macOS but keyring access denied (CI sandbox, Headless SSH).
-		// Don't strand the key — leave yaml intact and retry next launch.
-		return false, fmt.Errorf("open keychain: %w", err)
+		// Credential store unavailable despite keychain.Supported() (e.g.
+		// macOS keyring access denied in a CI sandbox / headless SSH, or a
+		// Windows Credential Manager error). Don't strand the key — leave
+		// yaml intact and retry next launch.
+		return false, fmt.Errorf("open credential store: %w", err)
 	}
 	// Write under "legacy" account; AuthManager.Bootstrap renames it
 	// after /auth/me resolves the real user_id. If an entry already

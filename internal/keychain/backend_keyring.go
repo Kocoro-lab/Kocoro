@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin || windows
 
 package keychain
 
@@ -9,10 +9,15 @@ import (
 	"github.com/zalando/go-keyring"
 )
 
-// osBackend talks to the macOS Keychain via zalando/go-keyring, which
-// invokes /usr/bin/security under the hood. Reads/writes can prompt the
-// user the first time an unsigned daemon binary touches a service —
-// "Always Allow" persists the trust per service.
+// osBackend talks to the OS credential store via zalando/go-keyring. On
+// macOS it invokes /usr/bin/security (the Keychain) — reads/writes can
+// prompt the user the first time an unsigned daemon binary touches a
+// service, and "Always Allow" persists the trust per service. On Windows
+// it uses the Windows Credential Manager (danieljoos/wincred), which is an
+// always-available OS service and never prompts. Linux (go-keyring's
+// Secret Service / dbus backend) is intentionally NOT enabled here — see
+// backend_other.go — because headless servers usually have no Secret
+// Service daemon and every read/write would fail at runtime.
 type osBackend struct{}
 
 func newOSBackend() Backend { return osBackend{} }
@@ -43,7 +48,8 @@ func (osBackend) Delete(service, account string) error {
 	return err
 }
 
-// NewOSStore returns a Store backed by the macOS Keychain.
+// NewOSStore returns a Store backed by the OS credential store (macOS
+// Keychain or Windows Credential Manager).
 func NewOSStore(logger *log.Logger) (*Store, error) {
 	return NewStore(newOSBackend(), logger), nil
 }

@@ -845,6 +845,7 @@ go vet ./...                 # lint
 - **Vision**: screenshots are captured, resized (1200px max), sent as base64 image content blocks. The `computer` tool uses Anthropic's native `computer_20251124` schema with coordinate scaling for retina displays. Vision models may blend what they see with training knowledge — verify critical details.
 - **Streaming**: one-shot mode does not stream; waits for the full LLM response before display.
 - **Windows/Linux**: local tools (clipboard, notifications, AppleScript, screenshot, computer) and scheduled tasks (launchd) are macOS-only.
+- **Account login**: email/password sign-in stores the api_key in the OS credential store — macOS Keychain and **Windows Credential Manager** are supported. On Linux (and other platforms) login is unavailable; set `api_key` in `~/.shannon/config.yaml` instead.
 - **Daemon background mode**: `shan daemon start -d` uses launchd (macOS only).
 - **Scheduled tasks**: launchd-only. Complex cron expressions (ranges, steps) fall back to `StartInterval` instead of `StartCalendarInterval`.
 
