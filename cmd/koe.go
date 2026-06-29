@@ -27,7 +27,6 @@ type koeConfig struct {
 	model       string
 	language    string
 	controlPort string // Desktop↔Koe control server port (Kocoro Desktop passes it); empty = no control channel
-	aec         string // echo control: "" / "gate" = v1 half-duplex gate (default), "vpio" = Apple VoiceProcessingIO full-duplex AEC
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
 	// mic/ears. All empty/zero = normal mic+speaker device.
 	sayText     string // --say: synthesize this text (macOS say) as the mic input
@@ -65,7 +64,6 @@ var koeCmd = &cobra.Command{
 		}
 		cfg.language, _ = cmd.Flags().GetString("language")
 		cfg.controlPort, _ = cmd.Flags().GetString("control-port")
-		cfg.aec, _ = cmd.Flags().GetString("aec")
 		cfg.sayText, _ = cmd.Flags().GetString("say")
 		cfg.audioIn, _ = cmd.Flags().GetString("audio-in")
 		cfg.audioOut, _ = cmd.Flags().GetString("audio-out")
@@ -87,7 +85,6 @@ func init() {
 	koeCmd.Flags().String("model", "", "realtime model (default gpt-realtime-mini-2025-12-15)")
 	koeCmd.Flags().String("language", "", "conversation language hint")
 	koeCmd.Flags().String("control-port", "", "Desktop↔Koe control server port (Kocoro Desktop passes it)")
-	koeCmd.Flags().String("aec", "", "echo control: gate (default, half-duplex) | vpio (Apple VoiceProcessingIO full-duplex AEC)")
 	koeCmd.Flags().String("say", "", "debug: synthesize this text as the mic input (macOS say) — headless file mode")
 	koeCmd.Flags().String("audio-in", "", "debug: WAV file to feed as the mic input — headless file mode")
 	koeCmd.Flags().String("audio-out", "", "debug: capture the reply audio to this WAV")
@@ -204,9 +201,6 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		return fmt.Errorf("audio init: %v", err)
 	}
 	startAudio := audio.Start
-	if cfg.aec == "vpio" {
-		startAudio = audio.StartVPIO // Apple VoiceProcessingIO full-duplex AEC (terminal); default is the v1 half-duplex gate
-	}
 	// Headless debug mode (workstream A): --say/--audio-in replace the mic+speaker
 	// with a file backend (feed a WAV, capture the reply to --audio-out) so the
 	// whole path runs without a mic or ears.
@@ -321,9 +315,6 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			return
 		}
 		start := audio.Start
-		if cfg.aec == "vpio" {
-			start = audio.StartVPIO
-		}
 		if serr := start(); serr != nil {
 			fail("audio start failed", serr, audio)
 			return

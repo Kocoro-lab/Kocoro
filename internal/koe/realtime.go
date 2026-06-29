@@ -273,8 +273,8 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	case "response.output_audio.delta":
 		// Redundant safety: also gate on the first audio delta in case the
 		// output_audio_buffer.* markers are absent on some transport. Idempotent
-		// with output_audio_buffer.started. Half-duplex echo control (v1; VPIO AEC
-		// supersedes). Event name is the GA flattened convention.
+		// with output_audio_buffer.started. Half-duplex echo control. Event name is
+		// the GA flattened convention.
 		if h.audio != nil {
 			h.audio.SetSpeaking(true)
 		}

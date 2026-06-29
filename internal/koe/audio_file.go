@@ -6,12 +6,12 @@ import (
 )
 
 // audio_file.go — the file/debug audio backend (workstream A). It replaces the
-// malgo/VPIO device for headless runs: instead of a mic it streams a WAV (or
+// malgo device for headless runs: instead of a mic it streams a WAV (or
 // `say`-synthesized speech) into a.frames at the 20 ms cadence; instead of a
 // speaker it drains a.playBuf through the SHARED renderInto — so the real
 // 480-vs-960 render path is exercised, not a copy — into a capture buffer that is
 // flushed to a WAV on Stop. Selected by `shan koe --audio-in` / `--say`. Mirrors
-// the vpioActive lifecycle in audio.go's Stop().
+// the file-backend lifecycle in audio.go's Stop().
 type fileBackend struct {
 	outPath     string
 	pullSamples int           // samples per renderInto pull (audioFrameSize/2 reproduces the bug)

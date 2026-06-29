@@ -31,18 +31,13 @@ type AudioIO struct {
 	frames  chan []int16
 	playBuf chan []int16
 	// otoPlayer is the PRODUCTION playback path (audio_oto.go): oto drains playBuf
-	// through macOS AudioToolbox. nil in the file/VPIO/playback-only debug backends,
+	// through macOS AudioToolbox. nil in the file/playback-only debug backends,
 	// which keep the malgo renderInto path. Set by Start(), closed by Stop().
 	otoPlayer *oto.Player
 	speaking  atomic.Bool
 	encMu     sync.Mutex
 	decMu     sync.Mutex
 	stopOnce  sync.Once
-	// vpioActive / vpioDone track the alternative VoiceProcessingIO backend
-	// (audio_vpio.go, terminal full-duplex AEC). When set, Stop() tears down VPIO
-	// instead of malgo and the half-duplex gate is moot (VPIO cancels echo natively).
-	vpioActive bool
-	vpioDone   chan struct{}
 	// file is the headless debug backend (audio_file.go), non-nil only under
 	// `shan koe --audio-in`/`--say`. When set, Stop() tears it down.
 	file   *fileBackend
@@ -257,10 +252,6 @@ func (a *AudioIO) Stop() {
 	a.stopOnce.Do(func() {
 		if a.file != nil {
 			a.stopFile() // audio_file.go: stop feed+capture goroutines, flush the WAV
-			return
-		}
-		if a.vpioActive {
-			a.stopVPIO() // audio_vpio.go: stop VPIO + the bridge goroutines
 			return
 		}
 		a.closeOtoPlayer() // production playback (nil-safe for the playback-only debug path)
