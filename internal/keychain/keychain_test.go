@@ -1,8 +1,34 @@
 package keychain
 
 import (
+	"errors"
 	"testing"
 )
+
+// TestSupportedMatchesBuildTag enforces the invariant that the runtime
+// Supported() predicate (hand-maintained as darwin || windows in keychain.go)
+// stays in lockstep with the build tags selecting the real NewOSStore
+// (backend_keyring.go) vs the ErrUnsupportedPlatform stub (backend_other.go).
+// Without this, adding a platform to one and forgetting the other would only
+// surface at runtime as a spurious ErrUnsupportedPlatform. This is build-tag
+// agnostic, so it runs on every CI job (Linux + macOS) — no Windows runner
+// needed. NewOSStore only constructs the backend; it never touches the real
+// credential store, so there is no GUI prompt to hang CI.
+func TestSupportedMatchesBuildTag(t *testing.T) {
+	store, err := NewOSStore(nil)
+	if Supported() != (err == nil) {
+		t.Fatalf("Supported()=%v but NewOSStore err=%v — predicate and build tags out of sync", Supported(), err)
+	}
+	if Supported() {
+		if store == nil {
+			t.Fatal("supported platform: NewOSStore returned nil store with nil error")
+		}
+	} else {
+		if !errors.Is(err, ErrUnsupportedPlatform) {
+			t.Fatalf("unsupported platform: expected ErrUnsupportedPlatform, got %v", err)
+		}
+	}
+}
 
 func newTestStore() (*Store, *MemBackend) {
 	be := NewMemBackend()

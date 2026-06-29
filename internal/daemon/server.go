@@ -5615,15 +5615,18 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	// in place today.
 	//
 	// api_key change needs a restart ONLY when there is no AuthManager
-	// running the live key rotation:
-	//   - On macOS with AuthManager installed: sign-in/sign-out/Bootstrap
-	//     call applyAPIKey which propagates the new key to GatewayClient
-	//     and WS Client at runtime. yaml api_key field is also irrelevant
-	//     because v1 migration has moved it into Keychain. Mutating yaml's
-	//     api_key on this path is a no-op for in-process state, and
-	//     surfacing restart_required to Desktop made it chain a /shutdown
-	//     after every sign-out (the "Bug 2" reported 2026-05-20).
-	//   - On non-darwin / AuthManager-absent path: reload does NOT push
+	// running the live key rotation. The split is by AuthManager presence,
+	// NOT by OS — AuthManager backs both macOS and Windows (the credential
+	// store platforms), and is absent on Linux & others:
+	//   - With AuthManager installed (macOS / Windows): sign-in/sign-out/
+	//     Bootstrap call applyAPIKey which propagates the new key to
+	//     GatewayClient and WS Client at runtime. yaml api_key field is also
+	//     irrelevant because v1 migration has moved it into the credential
+	//     store. Mutating yaml's api_key on this path is a no-op for
+	//     in-process state, and surfacing restart_required to Desktop made
+	//     it chain a /shutdown after every sign-out (the "Bug 2" reported
+	//     2026-05-20).
+	//   - AuthManager-absent path (Linux & others): reload does NOT push
 	//     newCfg.APIKey into GatewayClient (captured value), so a yaml
 	//     api_key edit really does need a restart to take effect.
 	needsRestart := false

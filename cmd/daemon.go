@@ -572,11 +572,13 @@ var daemonStartCmd = &cobra.Command{
 		deps.EventBus = localServer.EventBus()
 		deps.WSClient = wsClient
 
-		// AuthManager wiring. Keychain is macOS-only — on Linux/Windows
-		// authMgr stays nil and /local/auth/* responds 503. Legacy path
-		// (cfg.APIKey set via setup wizard or yaml) continues to work
-		// because wsClient was already constructed with that key above
-		// and WSController.Start below dials directly.
+		// AuthManager wiring. The OS credential store backs macOS + Windows
+		// (keychain.NewOSStore succeeds → authMgr non-nil → /local/auth/*
+		// fully wired). On Linux & other platforms NewOSStore returns
+		// ErrUnsupportedPlatform → authMgr stays nil and /local/auth/*
+		// responds 503; the legacy path (cfg.APIKey set via setup wizard or
+		// yaml) continues to work because wsClient was already constructed
+		// with that key above and WSController.Start below dials directly.
 		var authMgr *daemon.AuthManager
 		var wsCtl *daemon.WSController
 		kcStore, kcErr := keychain.NewOSStore(log.Default())
@@ -795,9 +797,9 @@ var daemonStartCmd = &cobra.Command{
 			// already populated).
 			go authMgr.Bootstrap(ctx)
 		} else if wsClient != nil {
-			// Legacy path (non-darwin or Keychain disabled): start WS
-			// directly with whatever key the user pasted via setup
-			// wizard. No AuthManager, no /local/auth/*.
+			// Legacy path (no credential store — Linux & others, or store
+			// disabled): start WS directly with whatever key the user
+			// pasted via setup wizard. No AuthManager, no /local/auth/*.
 			wsCtl = daemon.NewWSController(ctx, wsClient)
 			wsCtl.Start(ctx)
 		}

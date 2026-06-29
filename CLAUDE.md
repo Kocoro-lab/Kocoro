@@ -51,7 +51,7 @@ internal/
     readtracker_cache.go # Per-session ReadTracker cache
     suggestion_handler.go # GET /suggestion + POST /accept
     uploads_handler.go # /uploads GET (list) + DELETE (retract) proxies
-    auth.go            # AuthManager state machine (email/password, macOS-only)
+    auth.go            # AuthManager state machine (email/password; macOS + Windows)
     auth_handlers.go   # /local/auth/* handlers (state, register, login, sign-out, …)
     ws_controller.go   # WS goroutine start/stop driven by AuthManager
     desktop_rpc/       # Unix sock reverse-RPC channel to Kocoro Desktop (Calendar RPC v1)
@@ -89,7 +89,7 @@ internal/
     suggestion_state.go  # Per-session suggestion text/state
     forkedrequest.go     # BuildForkedRequest (byte-equality contract)
   agents/                # AGENT.md loader, CRUD, validate, embed.FS builtins
-  keychain/              # macOS Keychain wrapper (Backend interface + osBackend/memBackend); api_key source of truth
+  keychain/              # OS credential store wrapper — macOS Keychain / Windows Credential Manager via go-keyring (Backend interface + osBackend/memBackend); api_key source of truth. Non-darwin/non-windows → ErrUnsupportedPlatform
   client/                # GatewayClient (Anthropic via Cloud), OllamaClient, SSE, AuthClient (/auth/*)
   cloudflow/             # /research, /swarm Gateway workflow runner
   heartbeat/             # Per-agent HEARTBEAT.md + alerts
@@ -221,7 +221,7 @@ Unknown tools → denied (fail-safe). Always-ask gate runs BEFORE the allowlist,
 | Thinking blocks | `client.ContentBlock` + `agent.buildAssistantMessage` | Cloud relays full ordered `content_blocks` incl. `thinking`/`redacted_thinking`. Persisted verbatim; `internal/sync/strip_thinking.go` removes from upload-side copy before size check. Sanitizers in `messagesForLLM` / time-based / micro-compact / `BuildForkedRequest` preserve them. |
 | Conditional `think` tool | `tools/register.go shouldRegisterThinkTool` | Not registered on default gateway+thinking path. Still registered when thinking disabled, Ollama provider, or `ForceThinkTool=true`. `operationalRules()` strips `### Planning` bullet only when think absent, keeping prompt byte-equal otherwise. |
 | Prompt suggestion | `agent/suggestion.go` + `daemon/runner.go` | Forked LLM call after each main turn. **CACHE SAFETY**: byte-equal to main request except 2 appended messages + `SkipCacheWrite: true`. Any other divergence fragments the cache. **Source-gated** (`wantsPromptSuggestion` allow-list): only foreground sources with a UI consumer — `desktop` (the Desktop message bridge POST /message hardcodes it), `kocoro` (handler backfill when Source omitted), `shanclaw` (legacy Desktop alias, one release), `web` — fork a suggestion. IM channels, schedule/cron, and autonomous local sources (heartbeat/watcher/mcp) are skipped (no consumer → dead work + a billed call). Allow-list, not deny-list: new background sources default to skipped. |
-| Email/password auth (macOS only) | `internal/daemon/auth.go` + `auth_handlers.go` + `ws_controller.go` + `internal/keychain/` | `/local/auth/*` proxy to Cloud `/api/v1/auth/*`. AuthManager state machine drives WS lifecycle — WS runs only in `signed_in`. api_key is the source-of-truth credential in Keychain (`ai.kocoro.daemon.api_key/<user_id>`); the yaml field is migrated away on first launch. Non-darwin: AuthManager nil, endpoints 503, legacy `cfg.APIKey` path. |
+| Email/password auth (macOS + Windows) | `internal/daemon/auth.go` + `auth_handlers.go` + `ws_controller.go` + `internal/keychain/` | `/local/auth/*` proxy to Cloud `/api/v1/auth/*`. AuthManager state machine drives WS lifecycle — WS runs only in `signed_in`. api_key is the source-of-truth credential in the OS credential store (`ai.kocoro.daemon.api_key/<user_id>`); the yaml field is migrated away on first launch. The supported-platform set is `keychain.Supported()` (darwin \|\| windows) — it MUST stay in sync with the `backend_keyring.go` build tags. On unsupported platforms (Linux & others): AuthManager nil, endpoints 503 `platform_unsupported`, legacy `cfg.APIKey` path. (Linux is excluded because go-keyring's Secret Service/dbus backend fails on headless hosts.) |
 
 ### Daemon Approval Protocol
 
@@ -272,7 +272,7 @@ Scalars override, lists merge+dedup, structs field-level merge. MCP server env-v
 - Schedules: `~/.shannon/schedules.json` + `~/Library/LaunchAgents/com.shannon.schedule.<id>.plist`
 - Notification history: `~/.shannon/notifications.jsonl` (JSONL append-only, capped at 500 entries; trimmed + atomically rewritten on daemon startup, survives restarts)
 - Skill secrets index: `~/.shannon/secrets-index.json` (chmod 600, flock-protected, names only); values in macOS Keychain (service `com.shannon.skill.<name>`)
-- Daemon api_key (macOS only): macOS Keychain service `ai.kocoro.daemon.api_key`, account = Cloud user_id (UUID). Active user pointer at service `ai.kocoro.daemon.state`, account `current_user_id`. `cfg.APIKey` (yaml) is now empty after the v1 migration; Bootstrap reads Keychain instead
+- Daemon api_key (macOS + Windows): OS credential store service `ai.kocoro.daemon.api_key`, account = Cloud user_id (UUID) — macOS Keychain or Windows Credential Manager. Active user pointer at service `ai.kocoro.daemon.state`, account `current_user_id`. `cfg.APIKey` (yaml) is empty after the v1 migration; Bootstrap reads the credential store instead. On Linux & other platforms the credential store is unavailable and `cfg.APIKey` stays in yaml (legacy path)
 - Sync: marker `~/.shannon/sync_marker.json`, lock `~/.shannon/sync.lock` (never delete), dry-run outbox `~/.shannon/sync_outbox/`
 - Logs: `~/.shannon/logs/audit.log`, `~/.shannon/logs/schedule-<id>.log`
 - Memory: socket `~/.shannon/memory.sock`, bundle root `~/.shannon/memory/`
@@ -291,6 +291,7 @@ The daemon cross-compiles to macOS / Linux / Windows (`CGO_ENABLED=0`). POSIX-on
 - **`shan daemon stop`** → `cmd/proc_signal_{unix,windows}.go` (`terminateDaemon`): POSIX SIGTERM vs Windows `taskkill`. HTTP `/shutdown` remains the cross-platform graceful primary; signal/taskkill is the PID-file fallback.
 - **macOS-only GUI tools** (`accessibility`/`applescript`/`clipboard`/`computer`/`screenshot`/`ghostty`) gate on `runtime.GOOS != "darwin"` and return a clean "only available on macOS" error elsewhere. `notify` is NOT gated — it has a cross-platform Desktop route; only its osascript fallback is darwin-gated.
 - **Memory bundle `current` pointer** → `internal/memory/bundle_link_{unix,windows}.go` (`swapCurrent`): a symlink (atomic tmp+rename) on POSIX vs an unprivileged directory junction (`mklink /J`, remove+recreate) on Windows — `os.Symlink` would fail with ERROR_PRIVILEGE_NOT_HELD off Developer Mode. Both keep `current/<file>` transparently traversable by the `tlm` sidecar and resolvable by `os.Readlink` (`currentTs`).
+- **OS credential store (daemon api_key)** → `internal/keychain/backend_keyring.go` (`//go:build darwin || windows`, go-keyring → macOS Keychain / Windows Credential Manager) vs `backend_other.go` (`//go:build !darwin && !windows`, `NewOSStore` returns `ErrUnsupportedPlatform`). Runtime callers (config hydrate/save/migrate/setup, auth gating) MUST gate on `keychain.Supported()` (the single source of truth, kept in sync with the build tags — enforced by `TestSupportedMatchesBuildTag`), never a raw `runtime.GOOS == "darwin"`. **Linux is intentionally excluded** — go-keyring's Secret Service/dbus backend has no daemon on headless hosts and would fail every read/write; Linux stays on the legacy `cfg.APIKey` yaml path. **Test-coverage note**: CI only cross-compiles the Windows target (`go build`/`go vet`); the unit suite runs on macOS/Linux, so the live wincred round-trip (and its no-prompt assumption) is exercised only by manual Windows E2E — the build-tag/Supported() invariant test is the automated backstop.
 - **Known Windows gaps (not yet ported)**: `bash` runs `sh -c` and requires Git Bash/WSL on PATH (returns a clean error otherwise).
 
 ### Prompt Cache

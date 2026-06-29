@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -85,10 +84,11 @@ func TestRunSetup_GatewayProvider(t *testing.T) {
 	if cfg.Provider != "" && cfg.Provider != "gateway" {
 		t.Errorf("expected provider=gateway or empty, got %q", cfg.Provider)
 	}
-	if runtime.GOOS == "darwin" {
-		// macOS path: api_key is routed to Keychain and cleared from cfg.
+	if keychain.Supported() {
+		// Credential-store platforms (macOS / Windows): api_key is routed to
+		// the store and cleared from cfg.
 		if cfg.APIKey != "" {
-			t.Errorf("on darwin, cfg.APIKey should be cleared after Keychain write, got %q", cfg.APIKey)
+			t.Errorf("on credential-store platform, cfg.APIKey should be cleared after store write, got %q", cfg.APIKey)
 		}
 		snap := be.Snapshot()
 		var legacyVal string
@@ -98,10 +98,10 @@ func TestRunSetup_GatewayProvider(t *testing.T) {
 			}
 		}
 		if legacyVal != "test-key" {
-			t.Errorf("expected Keychain legacy entry=test-key, got %q (snapshot=%v)", legacyVal, snap)
+			t.Errorf("expected credential-store legacy entry=test-key, got %q (snapshot=%v)", legacyVal, snap)
 		}
 	} else {
-		// Non-darwin: api_key stays in cfg.APIKey (legacy yaml path).
+		// Unsupported platforms (Linux & others): api_key stays in cfg.APIKey (legacy yaml path).
 		if cfg.APIKey != "test-key" {
 			t.Errorf("expected api_key=test-key, got %q", cfg.APIKey)
 		}
@@ -109,8 +109,8 @@ func TestRunSetup_GatewayProvider(t *testing.T) {
 }
 
 func TestHydrateAPIKeyFromKeychain(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("Keychain hydration is macOS-only")
+	if !keychain.Supported() {
+		t.Skip("credential-store hydration requires an OS credential store (macOS / Windows)")
 	}
 	t.Setenv("KOCORO_FORCE_KEYCHAIN_HYDRATE", "1")
 	be := withTestKeychain(t)
@@ -127,8 +127,8 @@ func TestHydrateAPIKeyFromKeychain(t *testing.T) {
 }
 
 func TestLoad_HydratedAPIKeySeedsViper(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("Keychain hydration is macOS-only")
+	if !keychain.Supported() {
+		t.Skip("credential-store hydration requires an OS credential store (macOS / Windows)")
 	}
 	t.Setenv("KOCORO_FORCE_KEYCHAIN_HYDRATE", "1")
 	t.Setenv("HOME", t.TempDir())

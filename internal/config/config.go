@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
+	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
 	"github.com/spf13/viper"
@@ -613,7 +613,7 @@ func Save(cfg *Config) error {
 	viper.Set("provider", cfg.Provider)
 	viper.Set("endpoint", cfg.Endpoint)
 	apiKey := strings.TrimSpace(cfg.APIKey)
-	if runtime.GOOS == "darwin" && cfg.apiKeyFromKeychain {
+	if keychain.Supported() && cfg.apiKeyFromKeychain {
 		apiKey = ""
 	}
 	viper.Set("api_key", apiKey)
