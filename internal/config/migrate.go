@@ -330,12 +330,13 @@ func (m *apiKeyToKeychainMigration) Apply(shannonDir string) (bool, error) {
 		return false, nil
 	}
 
-	store, err := keychain.NewOSStore(nil)
+	store, err := keychain.NewOSStoreAt(shannonDir, nil)
 	if err != nil {
 		// Credential store unavailable despite keychain.Supported() (e.g.
 		// macOS keyring access denied in a CI sandbox / headless SSH, or a
-		// Windows Credential Manager error). Don't strand the key — leave
-		// yaml intact and retry next launch.
+		// Windows Credential Manager error, or ~/.shannon unwritable on
+		// Linux). Don't strand the key — leave yaml intact and retry next
+		// launch.
 		return false, fmt.Errorf("open credential store: %w", err)
 	}
 	// Write under "legacy" account; AuthManager.Bootstrap renames it
@@ -347,6 +348,16 @@ func (m *apiKeyToKeychainMigration) Apply(shannonDir string) (bool, error) {
 	}
 	if err := store.Write(keychain.ServiceDaemonState, keychain.AccountCurrentUser, keychain.AccountLegacy); err != nil {
 		return false, fmt.Errorf("keychain write current_user_id: %w", err)
+	}
+
+	// Read-back verification before we strip the key from yaml. The store
+	// write above can "succeed" yet not round-trip (e.g. a macOS keyring
+	// write that a later read can't retrieve); only strip the yaml once we
+	// have confirmed the key is actually retrievable, so it is never
+	// stranded. (Store.Read maps a missing entry to "", so a mismatch here
+	// also covers the absent case.)
+	if got, rerr := store.Read(keychain.ServiceDaemonAPIKey, keychain.AccountLegacy); rerr != nil || got != apiKey {
+		return false, fmt.Errorf("keychain read-back verification failed (key left in yaml): err=%v match=%v", rerr, got == apiKey)
 	}
 
 	// Strip api_key from yaml. Preserve original mode + formatting via a

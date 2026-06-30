@@ -572,16 +572,17 @@ var daemonStartCmd = &cobra.Command{
 		deps.EventBus = localServer.EventBus()
 		deps.WSClient = wsClient
 
-		// AuthManager wiring. The OS credential store backs macOS + Windows
-		// (keychain.NewOSStore succeeds → authMgr non-nil → /local/auth/*
-		// fully wired). On Linux & other platforms NewOSStore returns
+		// AuthManager wiring. A credential store backs macOS (Keychain),
+		// Windows (Credential Manager), and Linux (file store) — so
+		// keychain.NewOSStoreAt succeeds → authMgr non-nil → /local/auth/*
+		// fully wired. On other platforms NewOSStoreAt returns
 		// ErrUnsupportedPlatform → authMgr stays nil and /local/auth/*
 		// responds 503; the legacy path (cfg.APIKey set via setup wizard or
 		// yaml) continues to work because wsClient was already constructed
 		// with that key above and WSController.Start below dials directly.
 		var authMgr *daemon.AuthManager
 		var wsCtl *daemon.WSController
-		kcStore, kcErr := keychain.NewOSStore(log.Default())
+		kcStore, kcErr := keychain.NewOSStoreAt(shanDir, log.Default())
 		if kcErr == nil {
 			// Pre-seed viper's cloud.api_key from Keychain so the memory
 			// subsystem's cold-start gate (memory.ResolveAPIKey at
@@ -797,7 +798,7 @@ var daemonStartCmd = &cobra.Command{
 			// already populated).
 			go authMgr.Bootstrap(ctx)
 		} else if wsClient != nil {
-			// Legacy path (no credential store — Linux & others, or store
+			// Legacy path (no credential store on this platform, or store
 			// disabled): start WS directly with whatever key the user
 			// pasted via setup wizard. No AuthManager, no /local/auth/*.
 			wsCtl = daemon.NewWSController(ctx, wsClient)
