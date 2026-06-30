@@ -181,8 +181,16 @@ func setupGateway(cfg *Config, in io.Reader, reader *bufio.Reader, out io.Writer
 	// (legacy path).
 	if keychain.Supported() && cfg.APIKey != "" {
 		if store, err := keychainStoreOpener(ShannonDir()); err == nil {
-			if err := store.Write(keychain.ServiceDaemonAPIKey, keychain.AccountLegacy, cfg.APIKey); err == nil {
-				_ = store.Write(keychain.ServiceDaemonState, keychain.AccountCurrentUser, keychain.AccountLegacy)
+			// Both writes must succeed before we clear cfg.APIKey: if the
+			// api_key lands but the current_user_id pointer write fails, the
+			// key is stored yet unreachable (GetAPIKey resolves via
+			// current_user_id) — clearing yaml would then orphan the only
+			// copy. On any failure, keep cfg.APIKey so it persists to yaml.
+			err = store.Write(keychain.ServiceDaemonAPIKey, keychain.AccountLegacy, cfg.APIKey)
+			if err == nil {
+				err = store.Write(keychain.ServiceDaemonState, keychain.AccountCurrentUser, keychain.AccountLegacy)
+			}
+			if err == nil {
 				cfg.APIKey = ""
 				fmt.Fprintln(out, "API key stored in the OS credential store (ai.kocoro.daemon.api_key).")
 			} else {

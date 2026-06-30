@@ -121,21 +121,31 @@ func TestFileBackend_NoLeftoverTempFiles(t *testing.T) {
 	}
 }
 
-func TestFileBackend_CorruptFileTreatedEmpty(t *testing.T) {
+func TestFileBackend_CorruptFileSurfacesError(t *testing.T) {
 	be, dir := newTestFileBackend(t)
-	// Write garbage directly, then ensure Read treats it as empty (ErrNotFound,
-	// not a parse error) and a subsequent Write recovers.
+	// A present-but-unparseable file must surface a read error (NOT be silently
+	// treated as an empty store) — otherwise, after the yaml key was migrated
+	// away, a corrupt store would look like "no credential" and the daemon
+	// would start silently unauthenticated. macOS/Windows backends surface
+	// read errors; the file backend must match.
 	if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte("{not json"), 0o600); err != nil {
 		t.Fatalf("seed corrupt file: %v", err)
 	}
+	if _, err := be.Read(ServiceDaemonAPIKey, "user-1"); err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("corrupt file Read: want a surfaced parse error, got %v", err)
+	}
+	// Write also loads first, so it refuses to clobber a corrupt file — the
+	// user recovers from the .pre-migrate .bak rather than losing other entries.
+	if err := be.Write(ServiceDaemonAPIKey, "user-1", "sk"); err == nil {
+		t.Fatalf("Write over corrupt file: want error, got nil")
+	}
+
+	// A genuinely empty file (e.g. a 0-byte artifact) is still a fresh store.
+	if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(""), 0o600); err != nil {
+		t.Fatalf("seed empty file: %v", err)
+	}
 	if _, err := be.Read(ServiceDaemonAPIKey, "user-1"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("corrupt file Read: want ErrNotFound, got %v", err)
-	}
-	if err := be.Write(ServiceDaemonAPIKey, "user-1", "sk"); err != nil {
-		t.Fatalf("Write after corrupt: %v", err)
-	}
-	if got, _ := be.Read(ServiceDaemonAPIKey, "user-1"); got != "sk" {
-		t.Fatalf("after recovery got %q", got)
+		t.Fatalf("empty file Read: want ErrNotFound, got %v", err)
 	}
 }
 

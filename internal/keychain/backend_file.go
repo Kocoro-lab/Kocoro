@@ -3,6 +3,7 @@ package keychain
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -73,10 +74,14 @@ func (b *fileBackend) withLock(write bool, fn func() error) error {
 	return fn()
 }
 
-// load reads and parses credentials.json. A missing, empty, or corrupt file
-// is treated as an empty store (callers then see ErrNotFound, never a parse
-// error) — a fresh credential store simply has no entries. A subsequent Write
-// rewrites a corrupt file cleanly.
+// load reads and parses credentials.json. A missing or empty file is a fresh
+// store (no entries) and returns an empty map with no error. A file that is
+// present but unparseable is NOT silently downgraded to empty — that would
+// make a corrupt store look like "no credential" and start the daemon silently
+// unauthenticated (whereas the macOS/Windows backends surface a read error).
+// Instead the parse error is returned so callers see it; the user can restore
+// from the .pre-migrate .bak or re-login. A normal Write still rewrites the
+// file cleanly once it parses.
 func (b *fileBackend) load() (credStore, error) {
 	raw, err := os.ReadFile(b.path)
 	if err != nil {
@@ -90,7 +95,7 @@ func (b *fileBackend) load() (credStore, error) {
 	}
 	var m credStore
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return credStore{}, nil
+		return nil, fmt.Errorf("keychain: credentials.json is corrupt (%s): %w", b.path, err)
 	}
 	if m == nil {
 		m = credStore{}
