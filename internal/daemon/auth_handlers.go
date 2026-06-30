@@ -221,7 +221,7 @@ func (s *Server) requireAuth(w http.ResponseWriter) bool {
 	if s == nil || s.auth == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error":   "platform_unsupported",
-			"message": "Email/password authentication requires macOS Keychain. Configure cfg.APIKey via setup wizard or upgrade to macOS.",
+			"message": "Email/password authentication is unavailable on this platform. Set api_key in ~/.shannon/config.yaml instead.",
 		})
 		return false
 	}

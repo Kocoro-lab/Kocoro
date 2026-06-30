@@ -25,17 +25,17 @@ const (
 	hintLocal = "Running locally? See https://github.com/Kocoro-lab/Shannon for self-hosting docs."
 )
 
-// keychainStoreOpener returns the OS credential store used by setup-time
-// codepaths (Load hydration, setupGateway api_key persist). Production
-// uses keychain.NewOSStore which talks to the macOS Keychain or Windows
-// Credential Manager; tests replace this with an in-memory backend to
-// avoid polluting the developer's real credential store.
+// keychainStoreOpener returns the credential store used by setup-time
+// codepaths (Load hydration, setupGateway api_key persist). dir is the
+// daemon's shannon dir (config.ShannonDir()) — used by the Linux file
+// backend; ignored by the macOS Keychain / Windows Credential Manager
+// backends. Tests replace this with an in-memory backend to avoid polluting
+// the developer's real credential store.
 //
 // Returns nil-Store + non-nil-err on platforms without a credential store
-// (Linux & others: ErrUnsupportedPlatform) so callers can short-circuit
-// cleanly.
-var keychainStoreOpener = func() (*keychain.Store, error) {
-	return keychain.NewOSStore(nil)
+// (ErrUnsupportedPlatform) so callers can short-circuit cleanly.
+var keychainStoreOpener = func(dir string) (*keychain.Store, error) {
+	return keychain.NewOSStoreAt(dir, nil)
 }
 
 // NeedsSetup returns true if the config has no API key and the endpoint
@@ -52,14 +52,14 @@ func NeedsSetup(cfg *Config) bool {
 	return !isLocalEndpoint(cfg.Endpoint)
 }
 
-func hydrateAPIKeyFromKeychain(cfg *Config) {
+func hydrateAPIKeyFromKeychain(cfg *Config, shannonDir string) {
 	if cfg == nil || cfg.APIKey != "" || !keychain.Supported() {
 		return
 	}
 	if testing.Testing() && os.Getenv("KOCORO_FORCE_KEYCHAIN_HYDRATE") != "1" {
 		return
 	}
-	store, err := keychainStoreOpener()
+	store, err := keychainStoreOpener(shannonDir)
 	if err != nil {
 		return
 	}
@@ -173,13 +173,14 @@ func setupGateway(cfg *Config, in io.Reader, reader *bufio.Reader, out io.Writer
 		break
 	}
 
-	// On platforms with an OS credential store (macOS Keychain / Windows
-	// Credential Manager), route the pasted api_key into the "legacy"
-	// account so AuthManager.Bootstrap can adopt it (resolve user_id via
-	// /auth/me, rename the entry). Clear cfg.APIKey so it does not end up in
-	// yaml. Other platforms continue to persist cfg.APIKey to yaml (legacy path).
+	// On platforms with a credential store (macOS Keychain / Windows
+	// Credential Manager / Linux file store), route the pasted api_key into
+	// the "legacy" account so AuthManager.Bootstrap can adopt it (resolve
+	// user_id via /auth/me, rename the entry). Clear cfg.APIKey so it does not
+	// end up in yaml. Other platforms continue to persist cfg.APIKey to yaml
+	// (legacy path).
 	if keychain.Supported() && cfg.APIKey != "" {
-		if store, err := keychainStoreOpener(); err == nil {
+		if store, err := keychainStoreOpener(ShannonDir()); err == nil {
 			if err := store.Write(keychain.ServiceDaemonAPIKey, keychain.AccountLegacy, cfg.APIKey); err == nil {
 				_ = store.Write(keychain.ServiceDaemonState, keychain.AccountCurrentUser, keychain.AccountLegacy)
 				cfg.APIKey = ""

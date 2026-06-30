@@ -74,9 +74,9 @@ type Server struct {
 	migratePlans *claudecode.PlanStore
 
 	// auth manages the /local/auth/* email/password flow. May be nil on
-	// non-darwin platforms where Keychain is unavailable — handlers
-	// short-circuit to 503 in that case so the path stays observable in
-	// Desktop logs rather than silently 404-ing.
+	// platforms without a credential store (everything except macOS /
+	// Windows / Linux) — handlers short-circuit to 503 in that case so the
+	// path stays observable in Desktop logs rather than silently 404-ing.
 	auth *AuthManager
 
 	// shareTasks tracks in-flight and recently-completed async share
@@ -399,7 +399,7 @@ func (s *Server) SetOnReload(fn func()) {
 }
 
 // SetAuth installs the AuthManager so /local/auth/* handlers can serve.
-// Nil is permitted (non-darwin platforms) — handlers respond 503.
+// Nil is permitted (platforms without a credential store) — handlers respond 503.
 func (s *Server) SetAuth(a *AuthManager) {
 	s.auth = a
 }
@@ -602,8 +602,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /migrate/claude-code/apply", s.handleClaudeMigrateApply)
 
 	// /local/auth/* — email/password authentication endpoints for the
-	// Kocoro Desktop UI. macOS-only; on other platforms s.auth is nil
-	// and the handlers return 503 platform_unsupported.
+	// Kocoro Desktop UI. Available on macOS / Windows / Linux; on platforms
+	// without a credential store s.auth is nil and the handlers return 503
+	// platform_unsupported.
 	mux.HandleFunc("GET /local/auth/state", s.handleAuthState)
 	mux.HandleFunc("POST /local/auth/register", s.handleAuthRegister)
 	mux.HandleFunc("POST /local/auth/login", s.handleAuthLogin)

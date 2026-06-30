@@ -3,9 +3,10 @@
 // Cloud API key (sk_…) that Bootstrap reads on startup and Login writes
 // after Cloud /auth/api-keys.
 //
-// Supported on macOS (zalando/go-keyring → Keychain) and Windows
-// (→ Credential Manager). NewOSStore returns ErrUnsupportedPlatform on
-// other GOOS values (Linux and friends); callers fall back to the legacy
+// Supported on macOS (zalando/go-keyring → Keychain), Windows (→ Credential
+// Manager), and Linux (file store at ~/.shannon/credentials.json, mode 0600 —
+// see backend_linux.go / backend_file.go). NewOSStoreAt returns
+// ErrUnsupportedPlatform on other GOOS values; callers fall back to the legacy
 // ~/.shannon/config.yaml api_key path.
 package keychain
 
@@ -16,14 +17,16 @@ import (
 	"runtime"
 )
 
-// Supported reports whether this platform has an OS credential store
-// backing NewOSStore. It MUST stay in sync with the build tags on
-// backend_keyring.go (darwin || windows) / backend_other.go. Runtime
-// callers (config hydrate/save/migrate/setup) gate on this instead of
-// checking runtime.GOOS directly, so the supported-platform set lives in
-// one place.
+// Supported reports whether this platform has a credential store backing
+// NewOSStoreAt. It MUST stay in sync with the build tags on the backend
+// files: backend_keyring.go (darwin || windows), backend_linux.go (linux),
+// backend_other.go (everything else → ErrUnsupportedPlatform). The invariant
+// Supported() == (NewOSStoreAt err == nil) is enforced by
+// TestSupportedMatchesBuildTag. Runtime callers (config hydrate/save/migrate/
+// setup) gate on this instead of checking runtime.GOOS directly, so the
+// supported-platform set lives in one place.
 func Supported() bool {
-	return runtime.GOOS == "darwin" || runtime.GOOS == "windows"
+	return runtime.GOOS == "darwin" || runtime.GOOS == "windows" || runtime.GOOS == "linux"
 }
 
 // Service / account identifiers. Constants — never assemble these inline.
@@ -47,9 +50,9 @@ const (
 	AccountLegacy = "legacy"
 )
 
-// ErrUnsupportedPlatform is returned by NewOSStore on platforms without an
-// OS credential store backend (currently anything other than macOS / Windows).
-var ErrUnsupportedPlatform = errors.New("keychain: no OS credential store on this platform")
+// ErrUnsupportedPlatform is returned by NewOSStoreAt on platforms without a
+// credential-store backend (anything other than macOS / Windows / Linux).
+var ErrUnsupportedPlatform = errors.New("keychain: no credential store on this platform")
 
 // ErrNotFound is returned when an entry does not exist. Callers normally
 // treat this as "empty string" rather than an error condition.

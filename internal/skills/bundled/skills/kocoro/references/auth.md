@@ -2,9 +2,11 @@
 
 ## What is this?
 
-Email/password authentication for Kocoro Desktop. The daemon proxies registration, login, verification, and password reset to Shannon Cloud (`apiv1.kocoro.ai/api/v1/auth/*`), stores the issued long-lived API key in the OS credential store (service `ai.kocoro.daemon.api_key` — macOS Keychain or Windows Credential Manager), and broadcasts state changes over `/events` SSE.
+Email/password authentication for Kocoro Desktop. The daemon proxies registration, login, verification, and password reset to Shannon Cloud (`apiv1.kocoro.ai/api/v1/auth/*`), stores the issued long-lived API key in the credential store (service `ai.kocoro.daemon.api_key` — macOS Keychain / Windows Credential Manager / Linux file store at `~/.shannon/credentials.json`, mode 0600), and broadcasts state changes over `/events` SSE.
 
-**Platform support**: macOS and Windows. On Linux (and other platforms without an OS credential store) the daemon falls back to the legacy `~/.shannon/config.yaml` `api_key` path; `/local/auth/*` endpoints return 503 `platform_unsupported`.
+**Platform support**: macOS, Windows, and Linux. On other platforms (no credential store) the daemon falls back to the legacy `~/.shannon/config.yaml` `api_key` path; `/local/auth/*` endpoints return 503 `platform_unsupported`.
+
+**Linux IaC caveat**: on Linux the sign-in / migration moves `api_key` out of `config.yaml` into `~/.shannon/credentials.json`. If `config.yaml` is managed by config tooling (Ansible/Puppet) that re-adds `api_key`, the daemon's self-heal re-strips it on each launch — treat `credentials.json` as the source of truth, not the yaml field. The Linux store is plaintext-at-rest 0600 (parity with the legacy yaml path), not GNOME-Keyring encryption: this is deliberate so login works on headless servers / Docker where Secret Service is absent.
 
 ## State Machine
 
@@ -93,7 +95,7 @@ All endpoints listen on `127.0.0.1:7533` (daemon HTTP). Localhost-only, no auth 
 - Errors:
   - 400 `invalid_request` (missing / empty `api_key`)
   - 401 `invalid_api_key` (Cloud rejected the key — passthrough)
-  - 503 `platform_unsupported` (Linux & others without an OS credential store; macOS + Windows are supported; legacy `cfg.APIKey` yaml path applies)
+  - 503 `platform_unsupported` (platforms without a credential store; macOS + Windows + Linux are supported; legacy `cfg.APIKey` yaml path applies elsewhere)
 - Client note: a **404** here means the daemon predates this endpoint — that (or an unreachable daemon) is the ONLY signal a client should use to fall back to the legacy config.yaml path. A 401 / 500 is a hard failure and must NOT fall back.
 
 ## Events on /events SSE stream
@@ -147,4 +149,4 @@ POST /local/auth/sign-out-full → POST /local/auth/login with the new credentia
 Daemon stores `pending_email` in RAM only. If daemon restarts the field is empty, but the user can still POST /local/auth/login with their credentials — Cloud returns 403 `email_not_verified` which deterministically restores pending_verification state. The user can also POST /local/auth/resend-verification with the email explicitly.
 
 ### "Migration from old yaml-stored api_key"
-On daemon startup (macOS + Windows), config.yaml's `api_key` field is moved into the OS credential store under account `legacy` and the yaml field is stripped (backup written to `config.yaml.pre-migrate-<ts>.bak`). AuthManager.Bootstrap then calls /auth/me to resolve the real user_id and renames the entry. If /me returns 401 the migration leaves the credential store populated; the next login over the same key will adopt the entry properly.
+On daemon startup (macOS + Windows + Linux), config.yaml's `api_key` field is moved into the credential store under account `legacy` and the yaml field is stripped (backup written to `config.yaml.pre-migrate-<ts>.bak`). A read-back verification confirms the key round-trips through the store before the yaml is stripped, so a failed store write never strands the key. AuthManager.Bootstrap then calls /auth/me to resolve the real user_id and renames the entry. If /me returns 401 the migration leaves the credential store populated; the next login over the same key will adopt the entry properly.
