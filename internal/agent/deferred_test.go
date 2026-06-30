@@ -148,6 +148,30 @@ func TestToolSearchTool_KeywordSearch(t *testing.T) {
 	}
 }
 
+func TestToolSearchTool_KeywordSearchTokenizesMultiWordQuery(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockMCPTool{name: "search_gmail_messages"})
+	reg.Register(&mockMCPTool{name: "get_gmail_messages_content_batch"})
+	reg.Register(&mockMCPTool{name: "calendar_list_events"})
+	ts := newToolSearchTool(reg, map[string]bool{
+		"search_gmail_messages":            true,
+		"get_gmail_messages_content_batch": true,
+		"calendar_list_events":             true,
+	})
+
+	result, err := ts.Run(context.Background(), `{"query":"email mail inbox"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if !strings.Contains(header, "search_gmail_messages") {
+		t.Fatalf("multi-word query should match Gmail tools by token; got header: %s", header)
+	}
+	if strings.Contains(header, "calendar_list_events") {
+		t.Fatalf("multi-word Gmail query should not match unrelated calendar tool; got header: %s", header)
+	}
+}
+
 func TestToolSearchTool_NoMatches(t *testing.T) {
 	ts := newTestToolSearchAgent()
 	result, err := ts.Run(context.Background(), `{"query":"nonexistent_xyz"}`)
@@ -361,7 +385,7 @@ func TestModelSupportsToolRef(t *testing.T) {
 		{"claude-sonnet-4-20250514", true},
 		{"claude-opus-4-6", true},
 		{"claude-opus-4-5", true},
-		{"claude-haiku-4-5-20251001", false}, // Haiku excluded per Anthropic docs
+		{"claude-haiku-4-5-20251001", false},  // Haiku excluded per Anthropic docs
 		{"claude-3-5-sonnet-20241022", false}, // Pre-4 excluded
 		{"gpt-4o", false},
 		{"llama3", false},

@@ -833,7 +833,7 @@ func TestBuildSystemPrompt_OutputFormatPlain(t *testing.T) {
 
 func TestFormatGuidanceKoe(t *testing.T) {
 	g := formatGuidance("koe")
-	for _, want := range []string{"voice", "spoken", "short"} {
+	for _, want := range []string{"voice", "spoken", "short", "generic follow-up"} {
 		if !strings.Contains(strings.ToLower(g), want) {
 			t.Errorf("formatGuidance(\"koe\") missing %q; got: %s", want, g)
 		}
@@ -1150,16 +1150,16 @@ func TestSystemPrompt_IncludesIMDeliverySemantics(t *testing.T) {
 	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
 
 	for _, want := range []string{
-		"## IM channel delivery",                          // section anchor
-		"`IM bindings:`",                                  // the data line — model knows where to look
+		"## IM channel delivery", // section anchor
+		"`IM bindings:`",         // the data line — model knows where to look
 		"never infer IM connections from the MCP tool list", // defends against the screenshot bug
-		"Interactive routing follows Source, not bindings", // user's "Desktop chat doesn't push" rule
-		"`schedule_create` broadcast",                     // schedule-specific routing block
-		"`\"auto\"` pushes iff",                           // broadcast=auto semantics
-		"`\"on\"` always pushes",                          // broadcast=on
-		"`\"off\"` never",                                 // broadcast=off
-		"silent no-op",                                    // failure mode if "on" + no binding
-		"Desktop → Settings → Connectors",                 // remediation path
+		"Interactive routing follows Source, not bindings",  // user's "Desktop chat doesn't push" rule
+		"`schedule_create` broadcast",                       // schedule-specific routing block
+		"`\"auto\"` pushes iff",                             // broadcast=auto semantics
+		"`\"on\"` always pushes",                            // broadcast=on
+		"`\"off\"` never",                                   // broadcast=off
+		"silent no-op",                                      // failure mode if "on" + no binding
+		"Desktop → Settings → Connectors",                   // remediation path
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("system prompt missing IM-delivery phrase %q", want)
@@ -1179,10 +1179,10 @@ func TestSystemPrompt_IncludesDeliveryReceiptSemantics(t *testing.T) {
 	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
 
 	for _, want := range []string{
-		"Delivery receipts",                          // sub-section anchor
-		"do NOT receive a positive",                  // no success ack
-		"Absence of that note means",                 // silence ⇒ delivered
-		"Never claim a message failed",               // don't fabricate failures
+		"Delivery receipts",            // sub-section anchor
+		"do NOT receive a positive",    // no success ack
+		"Absence of that note means",   // silence ⇒ delivered
+		"Never claim a message failed", // don't fabricate failures
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("system prompt missing delivery-receipt phrase %q", want)
@@ -1208,18 +1208,18 @@ func TestSystemPrompt_IncludesMentionSemantics(t *testing.T) {
 	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
 
 	for _, want := range []string{
-		"**@mentions (mentioning other users)**",     // sub-section anchor
-		"`@<display name>`",                          // the format the agent must use
-		"EXACT name you have seen",                   // forbids paraphrasing
-		"NEVER write internal user identifiers",      // ID hygiene
-		"`aadObjectId`",                              // exemplar IDs the model must not write
-		"Slack `U…`",                                 // exemplar IDs (Slack form)
-		"**Who you may @-mention:**",                 // roster-vs-seen-speak sub-anchor
-		"`Conversation participants:` list",          // names the sticky block (bulleted list, not flat line)
+		"**@mentions (mentioning other users)**",      // sub-section anchor
+		"`@<display name>`",                           // the format the agent must use
+		"EXACT name you have seen",                    // forbids paraphrasing
+		"NEVER write internal user identifiers",       // ID hygiene
+		"`aadObjectId`",                               // exemplar IDs the model must not write
+		"Slack `U…`",                                  // exemplar IDs (Slack form)
+		"**Who you may @-mention:**",                  // roster-vs-seen-speak sub-anchor
+		"`Conversation participants:` list",           // names the sticky block (bulleted list, not flat line)
 		"each bullet (`- <name>`) is one atomic name", // teaches the model the bullet format protects "Smith, Bob" as one name
-		"\"Smith, Bob\" is ONE person, not two",      // negative example so the model doesn't mis-split enterprise names
-		"roster is authoritative",                    // unblocks Teams roster path
-		"silently degrades to plain text",            // safety-net wording (prevents over-refusal)
+		"\"Smith, Bob\" is ONE person, not two",       // negative example so the model doesn't mis-split enterprise names
+		"roster is authoritative",                     // unblocks Teams roster path
+		"silently degrades to plain text",             // safety-net wording (prevents over-refusal)
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("system prompt missing @-mention phrase %q", want)

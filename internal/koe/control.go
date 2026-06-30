@@ -2,6 +2,7 @@ package koe
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"sync"
 )
@@ -25,6 +26,14 @@ type controlEvent struct {
 	Level  float64 `json:"level,omitempty"`  // voice_state reactive RMS amplitude (0..1)
 }
 
+// StartCallRequest is the optional Desktop→Koe context payload for POST
+// /call/start. Older Desktop builds send only {"command":"start_call"}; that
+// still decodes with zero values.
+type StartCallRequest struct {
+	CWD            string          `json:"cwd,omitempty"`
+	ForegroundHint *ForegroundHint `json:"foreground_hint,omitempty"`
+}
+
 // ControlServer is the Koe-side HTTP+SSE control channel for Kocoro Desktop: it
 // accepts POST /call/start|end and broadcasts GET /events (voice_state,
 // control_app, call_state). This is the SERVER half of the Desktop↔Koe contract
@@ -34,12 +43,12 @@ type controlEvent struct {
 type ControlServer struct {
 	mu          sync.Mutex
 	subscribers map[chan controlEvent]struct{}
-	onStart     func() // Desktop pressed talk: start a call
-	onEnd       func() // Desktop ended: tear the call down
+	onStart     func(StartCallRequest) // Desktop pressed talk: start a call
+	onEnd       func()                 // Desktop ended: tear the call down
 }
 
 // NewControlServer wires the Desktop-driven start/end callbacks (either may be nil).
-func NewControlServer(onStart, onEnd func()) *ControlServer {
+func NewControlServer(onStart func(StartCallRequest), onEnd func()) *ControlServer {
 	return &ControlServer{
 		subscribers: make(map[chan controlEvent]struct{}),
 		onStart:     onStart,
@@ -51,8 +60,13 @@ func NewControlServer(onStart, onEnd func()) *ControlServer {
 func (s *ControlServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /call/start", func(w http.ResponseWriter, r *http.Request) {
+		var req StartCallRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil && err != io.EOF {
+			http.Error(w, "invalid start payload", http.StatusBadRequest)
+			return
+		}
 		if s.onStart != nil {
-			s.onStart()
+			s.onStart(req)
 		}
 		writeControlOK(w)
 	})

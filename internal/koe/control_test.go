@@ -19,7 +19,7 @@ func (s *ControlServer) subscriberCount() int {
 
 func TestControlServerStartEnd(t *testing.T) {
 	var started, ended bool
-	s := NewControlServer(func() { started = true }, func() { ended = true })
+	s := NewControlServer(func(StartCallRequest) { started = true }, func() { ended = true })
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
@@ -43,6 +43,28 @@ func TestControlServerStartEnd(t *testing.T) {
 	resp2.Body.Close()
 	if !ended {
 		t.Error("POST /call/end did not invoke onEnd")
+	}
+}
+
+func TestControlServerStartCarriesContext(t *testing.T) {
+	got := make(chan StartCallRequest, 1)
+	s := NewControlServer(func(req StartCallRequest) { got <- req }, nil)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	body := `{"command":"start_call","cwd":"/Users/hu/project","foreground_hint":{"pid":123,"app_name":"Mail","bundle_id":"com.apple.mail"}}`
+	resp, err := http.Post(srv.URL+"/call/start", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /call/start: %v", err)
+	}
+	resp.Body.Close()
+
+	req := <-got
+	if req.CWD != "/Users/hu/project" || req.ForegroundHint == nil {
+		t.Fatalf("start context = %+v", req)
+	}
+	if req.ForegroundHint.PID != 123 || req.ForegroundHint.AppName != "Mail" || req.ForegroundHint.BundleID != "com.apple.mail" {
+		t.Fatalf("foreground hint = %+v", req.ForegroundHint)
 	}
 }
 

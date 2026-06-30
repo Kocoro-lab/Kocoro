@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -71,19 +72,7 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 			}
 		}
 	} else {
-		query := strings.ToLower(args.Query)
-		for name := range t.deferred {
-			tool, ok := t.registry.Get(name)
-			if !ok {
-				continue
-			}
-			info := tool.Info()
-			if strings.Contains(strings.ToLower(info.Name), query) ||
-				strings.Contains(strings.ToLower(info.Description), query) {
-				matched = append(matched, name)
-			}
-		}
-		sort.Strings(matched)
+		matched = t.matchKeyword(args.Query)
 	}
 	matched = expandDeferredFamilyCore(t.registry, t.deferred, matched)
 
@@ -120,6 +109,56 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 		Content:       sb.String(),
 		ContentBlocks: blocks,
 	}, nil
+}
+
+var toolSearchTokenRE = regexp.MustCompile(`[a-z0-9_]+`)
+
+func (t *toolSearchTool) matchKeyword(query string) []string {
+	terms := toolSearchTerms(query)
+	if len(terms) == 0 {
+		return nil
+	}
+
+	var matched []string
+	for name := range t.deferred {
+		tool, ok := t.registry.Get(name)
+		if !ok {
+			continue
+		}
+		info := tool.Info()
+		haystack := strings.ToLower(info.Name + " " + info.Description)
+		for _, term := range terms {
+			if strings.Contains(haystack, term) {
+				matched = append(matched, name)
+				break
+			}
+		}
+	}
+	sort.Strings(matched)
+	return matched
+}
+
+func toolSearchTerms(query string) []string {
+	raw := toolSearchTokenRE.FindAllString(strings.ToLower(query), -1)
+	seen := make(map[string]bool, len(raw))
+	terms := make([]string, 0, len(raw))
+	for _, term := range raw {
+		if len(term) < 3 || seen[term] || toolSearchStopWord(term) {
+			continue
+		}
+		seen[term] = true
+		terms = append(terms, term)
+	}
+	return terms
+}
+
+func toolSearchStopWord(term string) bool {
+	switch term {
+	case "the", "and", "for", "with", "tool", "tools", "use", "get", "set", "run", "new":
+		return true
+	default:
+		return false
+	}
 }
 
 func expandDeferredFamilyCore(reg *ToolRegistry, deferred map[string]bool, matched []string) []string {

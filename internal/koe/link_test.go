@@ -23,23 +23,36 @@ func TestDoTaskCompleted(t *testing.T) {
 		if got.Agent != "finance" || got.ThreadID != "burst-1" || got.Text != "check NVDA" {
 			t.Errorf("unexpected req: %+v", got)
 		}
+		if got.ForegroundHint == nil || got.ForegroundHint.AppName != "Mail" || got.ForegroundHint.BundleID != "com.apple.mail" {
+			t.Errorf("foreground hint = %+v", got.ForegroundHint)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"reply": "NVDA is up two percent today.", "session_id": "s1", "agent": "finance",
+			"reply":          "NVDA is up two percent today.\n\nFull table omitted here.",
+			"spoken_summary": "NVDA is up two percent today.",
+			"session_id":     "s1", "agent": "finance",
 		})
 	}))
 	defer srv.Close()
 
 	c := NewDaemonClient(srv.URL)
-	out, err := c.DoTask(context.Background(), DoTaskRequest{Text: "check NVDA", Agent: "finance", ThreadID: "burst-1"})
+	out, err := c.DoTask(context.Background(), DoTaskRequest{
+		Text:           "check NVDA",
+		Agent:          "finance",
+		ThreadID:       "burst-1",
+		ForegroundHint: &ForegroundHint{AppName: "Mail", BundleID: "com.apple.mail"},
+	})
 	if err != nil {
 		t.Fatalf("DoTask: %v", err)
 	}
 	if out.Kind != OutcomeCompleted {
 		t.Fatalf("Kind = %v, want OutcomeCompleted", out.Kind)
 	}
-	if out.Reply != "NVDA is up two percent today." {
-		t.Errorf("Reply = %q", out.Reply)
+	if out.Reply != "NVDA is up two percent today.\n\nFull table omitted here." {
+		t.Fatalf("Reply = %q", out.Reply)
+	}
+	if out.SpokenSummary != "NVDA is up two percent today." {
+		t.Fatalf("SpokenSummary = %q", out.SpokenSummary)
 	}
 }
 

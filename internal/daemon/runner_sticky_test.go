@@ -58,6 +58,23 @@ func TestStickyContext_ScheduleAddsOutputDiscipline(t *testing.T) {
 	}
 }
 
+func TestStickyContext_KoeAddsVoiceTurnDiscipline(t *testing.T) {
+	for _, src := range []string{"koe", "koe-reachy"} {
+		got := buildStickyContext(src, "", "", "default", "", nil, "", nil, "")
+		for _, want := range []string{"live voice conversation", "normal Kocoro agent work", "exact calculation", "MUST call at least one relevant tool", "calculation-capable tool", "voice-first", "Koe to read aloud", "Desktop session history"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("source %q sticky context missing %q; got:\n%s", src, want, got)
+			}
+		}
+	}
+
+	for _, src := range []string{"desktop", "slack", "web"} {
+		if got := buildStickyContext(src, "", "", "default", "", nil, "", nil, ""); strings.Contains(got, "live voice conversation") {
+			t.Fatalf("source %q must not inherit Koe voice discipline; got:\n%s", src, got)
+		}
+	}
+}
+
 func TestStickyContext_IMBindings(t *testing.T) {
 	// Non-empty imBindings → "IM bindings:" line appears between Agent and extra.
 	got := buildStickyContext("webview", "", "hu", "", "default=slack:kocoro-test-slack", nil, "", nil, "")

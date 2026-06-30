@@ -120,11 +120,22 @@ func (c *DaemonClient) SendRealtimeUsage(ctx context.Context, usage json.RawMess
 // Source is always "koe". ThreadID is the per-call burst id; Agent is the
 // resolved slug ("" = daemon default).
 type DoTaskRequest struct {
-	Text     string `json:"text"`
-	Source   string `json:"source"`
-	Agent    string `json:"agent,omitempty"`
-	ThreadID string `json:"thread_id,omitempty"`
-	CWD      string `json:"cwd,omitempty"`
+	Text           string          `json:"text"`
+	Source         string          `json:"source"`
+	Agent          string          `json:"agent,omitempty"`
+	ThreadID       string          `json:"thread_id,omitempty"`
+	CWD            string          `json:"cwd,omitempty"`
+	ForegroundHint *ForegroundHint `json:"foreground_hint,omitempty"`
+}
+
+// ForegroundHint mirrors daemon.RunAgentRequest.foreground_hint without importing
+// internal/daemon into the Koe package. Desktop sends it on /call/start so a
+// spoken "this window/app" task can use the same AX/screenshot targeting path as
+// the quick panel.
+type ForegroundHint struct {
+	PID      int    `json:"pid,omitempty"`
+	AppName  string `json:"app_name,omitempty"`
+	BundleID string `json:"bundle_id,omitempty"`
 }
 
 // OutcomeKind discriminates the polymorphic POST /message response.
@@ -138,14 +149,15 @@ const (
 
 // DoTaskOutcome carries exactly one meaningful payload, keyed by Kind.
 type DoTaskOutcome struct {
-	Kind        OutcomeKind
-	Reply       string // Completed
-	SessionID   string // Completed
-	Agent       string // Completed
-	Partial     bool   // Completed (soft force-stop)
-	FailureCode string // Completed (soft)
-	Route       string // Injected / Rejected
-	Reason      string // Rejected (queue_full|active_run_not_ready|cwd_conflict)
+	Kind          OutcomeKind
+	Reply         string // Completed
+	SpokenSummary string // Completed; voice-safe projection of Reply when present
+	SessionID     string // Completed
+	Agent         string // Completed
+	Partial       bool   // Completed (soft force-stop)
+	FailureCode   string // Completed (soft)
+	Route         string // Injected / Rejected
+	Reason        string // Rejected (queue_full|active_run_not_ready|cwd_conflict)
 }
 
 // DoTask POSTs a delegated task and blocks until the back-brain turn completes
@@ -175,15 +187,16 @@ func (c *DaemonClient) DoTask(ctx context.Context, req DoTaskRequest) (DoTaskOut
 	}
 
 	var parsed struct {
-		Reply       string `json:"reply"`
-		SessionID   string `json:"session_id"`
-		Agent       string `json:"agent"`
-		Partial     bool   `json:"partial"`
-		FailureCode string `json:"failure_code"`
-		Status      string `json:"status"`
-		Route       string `json:"route"`
-		Reason      string `json:"reason"`
-		Error       string `json:"error"`
+		Reply         string `json:"reply"`
+		SpokenSummary string `json:"spoken_summary"`
+		SessionID     string `json:"session_id"`
+		Agent         string `json:"agent"`
+		Partial       bool   `json:"partial"`
+		FailureCode   string `json:"failure_code"`
+		Status        string `json:"status"`
+		Route         string `json:"route"`
+		Reason        string `json:"reason"`
+		Error         string `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return DoTaskOutcome{}, fmt.Errorf("decode POST /message response (status %d): %w; body=%s", resp.StatusCode, err, string(raw))
@@ -195,7 +208,7 @@ func (c *DaemonClient) DoTask(ctx context.Context, req DoTaskRequest) (DoTaskOut
 	switch parsed.Status {
 	case "":
 		return DoTaskOutcome{
-			Kind: OutcomeCompleted, Reply: parsed.Reply, SessionID: parsed.SessionID,
+			Kind: OutcomeCompleted, Reply: parsed.Reply, SpokenSummary: parsed.SpokenSummary, SessionID: parsed.SessionID,
 			Agent: parsed.Agent, Partial: parsed.Partial, FailureCode: parsed.FailureCode,
 		}, nil
 	case "injected", "retracted_before_delivery":

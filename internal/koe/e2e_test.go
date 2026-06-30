@@ -124,7 +124,7 @@ func TestKoeVoiceE2E(t *testing.T) {
 		// Use the PRODUCTION sessionConfig so this E2E verifies the REAL config
 		// (GA schema: output_modalities + audio.output.voice + auto tool_choice),
 		// not a parallel copy — a regression to the beta shape would fail here.
-		b, _ := json.Marshal(sessionConfig(e2ePersona, "marin"))
+		b, _ := json.Marshal(sessionConfig(e2ePersona, "marin", false))
 		_ = rc.dc.SendText(string(b))
 	})
 	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
@@ -256,7 +256,7 @@ func TestKoeSayAndAskE2E(t *testing.T) {
 			once.Do(func() { close(connected) })
 		}
 	})
-	rc.dc.OnOpen(func() { send(sessionConfig(e2ePersona, "marin")) })
+	rc.dc.OnOpen(func() { send(sessionConfig(e2ePersona, "marin", false)) })
 	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
 		var ev struct {
 			Type       string `json:"type"`

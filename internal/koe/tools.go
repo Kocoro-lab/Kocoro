@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sort"
 	"sync"
 )
 
@@ -45,13 +46,16 @@ func ToolDefs() []ToolDef {
 // fixed for the call; boundAgent changes via switch_agent; inFlight tracks the
 // active do_task for get_status.
 type CallState struct {
-	mu        sync.Mutex
-	burstID   string
-	bound     string
-	inFlight  string
-	inFlightN int // concurrent do_task count — a follow-up ("change it to 6pm")
+	mu             sync.Mutex
+	burstID        string
+	bound          string
+	cwd            string
+	foregroundHint *ForegroundHint
+	inFlight       string
+	inFlightN      int // concurrent do_task count — a follow-up ("change it to 6pm")
 	// spawns a 2nd do_task goroutine while the 1st runs; the in-flight text must
 	// survive until the LAST one clears, not the first.
+	inFlightRoutes map[string]int
 }
 
 func NewCallState(burstID, boundAgent string) *CallState {
@@ -62,21 +66,109 @@ func (s *CallState) BoundAgent() string { s.mu.Lock(); defer s.mu.Unlock(); retu
 func (s *CallState) setBound(a string)  { s.mu.Lock(); s.bound = a; s.mu.Unlock() }
 func (s *CallState) BurstID() string    { s.mu.Lock(); defer s.mu.Unlock(); return s.burstID }
 
+func (s *CallState) SetCallContext(ctx StartCallRequest) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cwd = ctx.CWD
+	if ctx.ForegroundHint != nil {
+		hint := *ctx.ForegroundHint
+		s.foregroundHint = &hint
+	} else {
+		s.foregroundHint = nil
+	}
+}
+
+func (s *CallState) callContextLocked() (string, *ForegroundHint) {
+	var hint *ForegroundHint
+	if s.foregroundHint != nil {
+		copy := *s.foregroundHint
+		hint = &copy
+	}
+	return s.cwd, hint
+}
+
 // SetInFlight / ClearInFlight are exported because C's async do_task goroutine
 // (NOT a blocking Dispatch) owns the in-flight lifecycle: set before delegating,
 // clear when the result returns. get_status reads InFlight.
-func (s *CallState) SetInFlight(t string) { s.mu.Lock(); s.inFlight = t; s.inFlightN++; s.mu.Unlock() }
+func (s *CallState) SetInFlight(t string) {
+	s.mu.Lock()
+	agent := s.bound
+	s.mu.Unlock()
+	s.SetInFlightForAgent(t, agent)
+}
+
+func (s *CallState) SetInFlightForAgent(t, agent string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inFlight = t
+	s.inFlightN++
+	if s.inFlightRoutes == nil {
+		s.inFlightRoutes = make(map[string]int)
+	}
+	s.inFlightRoutes[burstRouteKey(agent, s.burstID)]++
+}
+
 func (s *CallState) ClearInFlight() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clearOneInFlightLocked("")
+}
+
+func (s *CallState) ClearInFlightForAgent(agent string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clearOneInFlightLocked(burstRouteKey(agent, s.burstID))
+}
+
+func (s *CallState) ClearAllInFlight() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inFlight = ""
+	s.inFlightN = 0
+	s.inFlightRoutes = nil
+}
+
+func (s *CallState) clearOneInFlightLocked(route string) {
 	if s.inFlightN > 0 {
 		s.inFlightN--
 	}
+	if len(s.inFlightRoutes) > 0 {
+		if route == "" {
+			for k := range s.inFlightRoutes {
+				route = k
+				break
+			}
+		}
+		if n := s.inFlightRoutes[route]; n <= 1 {
+			delete(s.inFlightRoutes, route)
+		} else {
+			s.inFlightRoutes[route] = n - 1
+		}
+	}
 	if s.inFlightN == 0 {
 		s.inFlight = "" // only idle once the last concurrent do_task has returned
+		s.inFlightRoutes = nil
 	}
-	s.mu.Unlock()
 }
+
 func (s *CallState) InFlight() string { s.mu.Lock(); defer s.mu.Unlock(); return s.inFlight }
+
+func (s *CallState) ActiveRouteKeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.inFlightRoutes) == 0 {
+		if s.inFlightN == 0 {
+			return nil
+		}
+		return []string{burstRouteKey(s.bound, s.burstID)}
+	}
+	keys := make([]string, 0, len(s.inFlightRoutes))
+	for key := range s.inFlightRoutes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 // burstRouteKey reconstructs the daemon route key for this call's burst,
 // byte-identical to ComputeRouteKey (daemon runner.go:143/145) so cancel hits the
@@ -118,12 +210,15 @@ func NewDispatcher(client *DaemonClient, resolver *AgentResolver, state *CallSta
 }
 
 // SayResult is the do_task function_call_output contract (spec §4): only the
-// spoken sentence + a status, never the back-brain's tools/reasoning/transcript.
-// Exported so C's async do_task goroutine consumes MapDoTaskOutcome's return.
+// spoken projection + a status, never the back-brain's tools/reasoning/transcript.
+// spoken_summary is the canonical field; say stays as a compatibility alias for
+// older prompt text/tests. Exported so C's async do_task goroutine consumes
+// MapDoTaskOutcome's return.
 type SayResult struct {
-	Say        string `json:"say"`
-	Status     string `json:"status"` // ok | failed | injected | clarify
-	FailReason string `json:"fail_reason,omitempty"`
+	SpokenSummary string `json:"spoken_summary,omitempty"`
+	Say           string `json:"say,omitempty"`
+	Status        string `json:"status"` // ok | failed | injected | clarify
+	FailReason    string `json:"fail_reason,omitempty"`
 }
 
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
@@ -151,10 +246,16 @@ func (d *Dispatcher) Dispatch(ctx context.Context, name string, argsJSON []byte)
 		if reason == "" {
 			reason = "user_cancel"
 		}
-		if err := d.client.Cancel(ctx, CancelRequest{RouteKey: key, Reason: reason}); err != nil {
-			return mustJSON(map[string]string{"status": "failed", "error": err.Error()}), nil
+		keys := d.state.ActiveRouteKeys()
+		if len(keys) == 0 {
+			keys = []string{key}
 		}
-		d.state.ClearInFlight()
+		for _, key := range keys {
+			if err := d.client.Cancel(ctx, CancelRequest{RouteKey: key, Reason: reason}); err != nil {
+				return mustJSON(map[string]string{"status": "failed", "error": err.Error()}), nil
+			}
+		}
+		d.state.ClearAllInFlight()
 		return mustJSON(map[string]string{"status": "ok"}), nil
 	case "get_status":
 		running := d.state.InFlight()
@@ -225,14 +326,20 @@ func (d *Dispatcher) PrepareDoTask(argsJSON []byte) (DoTaskRequest, *SayResult, 
 			agent = res.Slug
 		case ResolveAmbiguous:
 			return DoTaskRequest{}, &SayResult{Status: "clarify",
-				Say: "你是指哪个 agent？" + joinHuman(res.Candidates)}, nil
+				SpokenSummary: "你是指哪个 agent？" + joinHuman(res.Candidates),
+				Say:           "你是指哪个 agent？" + joinHuman(res.Candidates)}, nil
 		default:
 			// Unknown named agent → ask rather than silently using the default.
 			return DoTaskRequest{}, &SayResult{Status: "clarify",
-				Say: "我没找到这个 agent，你是指哪一个？"}, nil
+				SpokenSummary: "我没找到这个 agent，你是指哪一个？",
+				Say:           "我没找到这个 agent，你是指哪一个？"}, nil
 		}
 	}
-	return DoTaskRequest{Text: a.Task, Agent: agent, ThreadID: d.state.BurstID()}, nil, nil
+	d.state.mu.Lock()
+	burstID := d.state.burstID
+	cwd, foregroundHint := d.state.callContextLocked()
+	d.state.mu.Unlock()
+	return DoTaskRequest{Text: a.Task, Agent: agent, ThreadID: burstID, CWD: cwd, ForegroundHint: foregroundHint}, nil, nil
 }
 
 // MapDoTaskOutcome converts a delegation result (or transport error) into the
@@ -243,7 +350,8 @@ func (d *Dispatcher) PrepareDoTask(argsJSON []byte) (DoTaskRequest, *SayResult, 
 func MapDoTaskOutcome(out DoTaskOutcome, err error) SayResult {
 	if err != nil {
 		return SayResult{Status: "failed", FailReason: err.Error(),
-			Say: "抱歉，刚才没能完成，连接出了点问题。"}
+			SpokenSummary: "抱歉，刚才没能完成，连接出了点问题。",
+			Say:           "抱歉，刚才没能完成，连接出了点问题。"}
 	}
 	switch out.Kind {
 	case OutcomeCompleted:
@@ -251,12 +359,17 @@ func MapDoTaskOutcome(out DoTaskOutcome, err error) SayResult {
 		if out.Partial {
 			status = "failed"
 		}
-		return SayResult{Status: status, Say: out.Reply, FailReason: out.FailureCode}
+		spoken := out.SpokenSummary
+		if spoken == "" {
+			spoken = out.Reply
+		}
+		return SayResult{Status: status, SpokenSummary: spoken, Say: spoken, FailReason: out.FailureCode}
 	case OutcomeInjected:
 		return SayResult{Status: "injected"}
 	default: // OutcomeRejected
 		return SayResult{Status: "failed", FailReason: out.Reason,
-			Say: "现在有点忙，稍等一下再说一次好吗？"}
+			SpokenSummary: "现在有点忙，稍等一下再说一次好吗？",
+			Say:           "现在有点忙，稍等一下再说一次好吗？"}
 	}
 }
 

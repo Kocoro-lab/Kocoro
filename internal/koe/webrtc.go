@@ -150,6 +150,10 @@ func (rc *RealtimeConn) dialOpenAI(ctx context.Context, ek string) error {
 // pumpSendTrack Opus-encodes captured frames and writes them to the send track.
 func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 	rc.audio.markSendReady() // unblock the file backend's feedFrames — the session is configured
+	gate := newMicNoiseGate()
+	defer gate.logStats()
+	pacer := time.NewTicker(audioFrameMs * time.Millisecond)
+	defer pacer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -159,15 +163,23 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 			// OpenAI never hears the room (Koe stays idle). Drain the frame either way
 			// to keep the capture pipeline from backing up.
 			if rc.callActive != nil && !rc.callActive() {
+				gate.resetState()
 				continue
 			}
-			enc, err := rc.audio.EncodeFrame(frame)
-			if err != nil {
-				continue
+			for _, out := range gate.process(frame) {
+				enc, err := rc.audio.EncodeFrame(out)
+				if err != nil {
+					continue
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-pacer.C:
+				}
+				_ = rc.sendTrack.WriteSample(media.Sample{
+					Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
+				})
 			}
-			_ = rc.sendTrack.WriteSample(media.Sample{
-				Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
-			})
 		}
 	}
 }
@@ -200,6 +212,13 @@ type ConnectOptions struct {
 	// OnVoiceLevel (nil-safe, D3w) receives (state, rms) at animation cadence while
 	// listening/speaking so the Desktop Island sprite tracks the real signal level.
 	OnVoiceLevel func(string, float64)
+	// FullDuplexAEC selects the VPIO/AEC audio path. Server-side interruption still
+	// stays off by default; explicit barge-in experiments opt in via environment.
+	FullDuplexAEC bool
+	// OnClosed is called when the underlying WebRTC/DataChannel path closes or fails.
+	// Desktop warm sessions use this to retire stale idle sessions before the next
+	// double-tap can land on a dead connection.
+	OnClosed func(error)
 }
 
 // Connect builds the peer connection, dials OpenAI, configures the session, and
@@ -217,8 +236,22 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	h.onVoiceState = opts.OnVoiceState
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
+	h.fullDuplexAEC = opts.FullDuplexAEC
 	rc.callActive = opts.CallActive
-	go h.runResponseSender(ctx) // serialized response.create (create_response=false)
+	var closedOnce sync.Once
+	notifyClosed := func(err error) {
+		if opts.OnClosed == nil {
+			return
+		}
+		closedOnce.Do(func() { opts.OnClosed(err) })
+	}
+	rc.pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		switch s {
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+			notifyClosed(fmt.Errorf("peer connection %s", s.String()))
+		}
+	})
+	go h.runResponseSender(ctx) // serialized response.create for tool-result voicing
 	if opts.OnCallState != nil {
 		opts.OnCallState("connecting") // Q2b: the ~2s mint+SDP+session.update setup
 	}
@@ -229,8 +262,14 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	configured := make(chan struct{})
 	var cfgOnce sync.Once
 	rc.dc.OnOpen(func() {
-		b, _ := json.Marshal(sessionConfig(persona, "marin"))
+		b, _ := json.Marshal(sessionConfig(persona, "marin", opts.FullDuplexAEC))
 		_ = rc.dc.SendText(string(b))
+	})
+	rc.dc.OnClose(func() {
+		notifyClosed(fmt.Errorf("data channel closed"))
+	})
+	rc.dc.OnError(func(err error) {
+		notifyClosed(fmt.Errorf("data channel error: %w", err))
 	})
 	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
 		var ev struct {

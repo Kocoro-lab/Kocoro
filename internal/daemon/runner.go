@@ -677,6 +677,44 @@ var markdownCloudSources = map[string]struct{}{
 	ChannelTeams:  {},
 }
 
+func applyKoeResponseLanguage(loop *agent.AgentLoop, source, text string) {
+	if loop == nil || !isKoeSource(source) {
+		return
+	}
+	// Voice turns should follow the language the user just spoke. The Desktop
+	// global language preference is a text-UI default and can otherwise make an
+	// English spoken request come back in Chinese.
+	loop.SetResponseLanguage(inferKoeResponseLanguage(text))
+}
+
+func inferKoeResponseLanguage(text string) string {
+	var latin, han, kana, hangul int
+	for _, r := range text {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z':
+			latin++
+		case r >= 0x3040 && r <= 0x30FF:
+			kana++
+		case r >= 0xAC00 && r <= 0xD7AF:
+			hangul++
+		case (r >= 0x3400 && r <= 0x9FFF) || (r >= 0xF900 && r <= 0xFAFF):
+			han++
+		}
+	}
+	switch {
+	case kana > 0:
+		return "日本語"
+	case hangul > 0:
+		return "한국어"
+	case han > 0 && han >= latin:
+		return "中文"
+	case latin >= 3:
+		return "English"
+	default:
+		return ""
+	}
+}
+
 // outputFormatForSource maps a request source to an output format profile.
 // Cloud-distributed channels default to "plain" — Shannon Cloud handles final
 // channel rendering (Slack mrkdwn, LINE Flex, etc.) — except markdownCloudSources
@@ -703,6 +741,151 @@ func outputFormatForSource(source string) string {
 		return "plain"
 	}
 	return "markdown"
+}
+
+const spokenSummaryMaxRunes = 240
+
+type spokenSummaryLine struct {
+	text string
+	list bool
+}
+
+var (
+	spokenRawURLRE       = regexp.MustCompile(`https?://\S+`)
+	spokenListMarkerRE   = regexp.MustCompile(`^\s*(?:[-*+•]\s+|\d+[\.)]\s+)`)
+	spokenQuoteMarkerRE  = regexp.MustCompile(`^\s*>+\s*`)
+	spokenTableRuleRE    = regexp.MustCompile(`^[\s|:-]+$`)
+	spokenWhitespaceRE   = regexp.MustCompile(`\s+`)
+	spokenMarkdownMarkRE = regexp.MustCompile("[`*_~]+")
+)
+
+func spokenSummaryForSource(source, reply string) string {
+	if !isKoeSource(source) {
+		return ""
+	}
+	return makeSpokenSummary(reply)
+}
+
+func makeSpokenSummary(reply string) string {
+	lines := spokenSummaryLines(reply)
+	if len(lines) == 0 {
+		return ""
+	}
+	text := spokenSummaryText(lines)
+	if text == "" {
+		return ""
+	}
+	return limitSpokenSummary(text)
+}
+
+func spokenSummaryLines(reply string) []spokenSummaryLine {
+	reply = strings.ReplaceAll(reply, "\r\n", "\n")
+	reply = strings.ReplaceAll(reply, "\r", "\n")
+	var lines []spokenSummaryLine
+	inFence := false
+	for _, raw := range strings.Split(reply, "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			inFence = !inFence
+			continue
+		}
+		if inFence || trimmed == "" || spokenTableRuleRE.MatchString(trimmed) {
+			continue
+		}
+		line := cleanSpokenSummaryLine(trimmed)
+		if line.text != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func cleanSpokenSummaryLine(line string) spokenSummaryLine {
+	line = spokenQuoteMarkerRE.ReplaceAllString(line, "")
+	isList := spokenListMarkerRE.MatchString(line)
+	line = spokenListMarkerRE.ReplaceAllString(line, "")
+	line = stripMarkdownLite(line)
+	line = spokenRawURLRE.ReplaceAllString(line, "")
+	line = spokenMarkdownMarkRE.ReplaceAllString(line, "")
+	line = spokenWhitespaceRE.ReplaceAllString(strings.TrimSpace(line), " ")
+	line = strings.Trim(line, " \t-–—")
+	return spokenSummaryLine{text: line, list: isList}
+}
+
+func spokenSummaryText(lines []spokenSummaryLine) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	if len(lines) > 1 && !lines[0].list && lines[1].list {
+		parts := []string{trimSpokenLineEnd(lines[0].text)}
+		for i := 1; i < len(lines) && i <= 2; i++ {
+			if !lines[i].list {
+				break
+			}
+			parts = append(parts, ensureSpokenSentence(lines[i].text))
+		}
+		return strings.Join(parts, " ")
+	}
+	parts := make([]string, 0, len(lines))
+	for _, line := range lines {
+		parts = append(parts, ensureSpokenSentence(line.text))
+	}
+	return strings.Join(parts, " ")
+}
+
+func limitSpokenSummary(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= spokenSummaryMaxRunes {
+		return text
+	}
+	lastCut := 0
+	sentenceCount := 0
+	for i, r := range runes[:spokenSummaryMaxRunes] {
+		switch r {
+		case '.', '!', '?', '。', '！', '？':
+			lastCut = i + 1
+			sentenceCount++
+			if sentenceCount >= 2 {
+				return strings.TrimSpace(string(runes[:lastCut]))
+			}
+		}
+	}
+	if lastCut > 0 {
+		return strings.TrimSpace(string(runes[:lastCut]))
+	}
+	return strings.TrimSpace(string(runes[:spokenSummaryMaxRunes])) + "..."
+}
+
+func trimSpokenLineEnd(s string) string {
+	return strings.TrimRight(strings.TrimSpace(s), "：:")
+}
+
+func ensureSpokenSentence(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	switch []rune(s)[len([]rune(s))-1] {
+	case '.', '!', '?', '。', '！', '？', '：', ':':
+		return s
+	}
+	if containsCJK(s) {
+		return s + "。"
+	}
+	return s + "."
+}
+
+func containsCJK(s string) bool {
+	for _, r := range s {
+		if (r >= 0x3400 && r <= 0x9FFF) || (r >= 0xF900 && r <= 0xFAFF) {
+			return true
+		}
+	}
+	return false
 }
 
 // silentBannerSources lists request sources whose `agent_reply` should NOT
@@ -929,7 +1112,8 @@ func routeTitle(source, channel, sender string) string {
 
 // RunAgentResult is the output from RunAgent.
 type RunAgentResult struct {
-	Reply string `json:"reply"`
+	Reply         string `json:"reply"`
+	SpokenSummary string `json:"spoken_summary,omitempty"`
 	// ReplyToMessageID is the cloud message id the final Reply should be
 	// addressed to — the LAST inbound message the run processed. It differs from
 	// the run's primary inbound id when a mid-run injected follow-up (a rapid or
@@ -2204,6 +2388,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			runCfg.Agent.IdleHardTimeoutSecs = *ac.IdleHardTimeoutSecs
 		}
 	}
+	applyKoeResponseLanguage(loop, req.Source, req.Text)
 	// Apply idle-timeout config AFTER per-agent overrides have been folded
 	// into runCfg, otherwise agent-level opt-in/override silently does nothing.
 	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)
@@ -2820,6 +3005,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	return &RunAgentResult{
 		Reply:                result,
+		SpokenSummary:        spokenSummaryForSource(req.Source, result),
 		ReplyToMessageID:     loop.ReplyCloudMessageID(),
 		PendingAckMessageIDs: loop.PendingAckIDs(),
 		SessionID:            returnedSessionID,

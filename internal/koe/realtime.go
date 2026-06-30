@@ -3,8 +3,10 @@ package koe
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -34,15 +36,37 @@ type eventHandler struct {
 	// relays via the daemon to Cloud (server-side cost). Koe never sees pricing.
 	model   string
 	onUsage func(json.RawMessage)
+	// fullDuplexAEC means the local audio backend already has echo cancellation
+	// (VPIO). Even in that mode, server interruption is off by default because a
+	// laptop speaker/mic pair still needs an intent-level barge-in gate, not just
+	// energy. Set KOE_INTERRUPT_RESPONSE=1 only for explicit barge-in experiments.
+	fullDuplexAEC bool
+	// Timing markers for event-log diagnostics. They are intentionally best-effort:
+	// Realtime can emit multiple responses for one user turn (e.g. spoken ack then
+	// function call), so these describe the most recent active segment.
+	speechStartedAt   time.Time
+	speechStoppedAt   time.Time
+	responseCreatedAt time.Time
+	outputStartedAt   time.Time
+	responseDoneAt    time.Time
+	// outputBufferActive tracks WebRTC playback markers. response.done can arrive
+	// before the local output buffer is fully drained, so it must not immediately
+	// release the echo gate while speaker tail is still audible.
+	outputBufferActive atomic.Bool
+	speakingEpoch      atomic.Int64
 	// Serialized response.create (runResponseSender), adapted from kocoro-reachy's
-	// _response_sender_loop to Go/WebRTC: under create_response=false every reply is
-	// a MANUAL response.create, and GA rejects one sent while a response is still
+	// _response_sender_loop to Go/WebRTC: do_task results and fast-tool outputs still
+	// need a MANUAL response.create, and GA rejects one sent while a response is
 	// active (conversation_already_has_active_response). The naive fire-and-forget
 	// silently dropped that turn. requestResponse() queues; the sender goroutine
 	// sends serially, waits for respCreated/respRejected, and retries a rejection.
-	respReq      chan struct{} // queued response.create requests
-	respCreated  chan struct{} // signalled (buffered 1) on response.created
-	respRejected chan struct{} // signalled (buffered 1) on the active-response error
+	respReq      chan responseCreateRequest // queued response.create requests
+	respCreated  chan struct{}              // signalled (buffered 1) on response.created
+	respRejected chan struct{}              // signalled (buffered 1) on the active-response error
+}
+
+type responseCreateRequest struct {
+	instructions string
 }
 
 func (h *eventHandler) emitVoiceState(state string) {
@@ -58,6 +82,45 @@ func (h *eventHandler) voiceState() string {
 		return v.(string)
 	}
 	return "idle"
+}
+
+const (
+	defaultSpeakingTailMS     = 900
+	defaultSpeakingFailsafeMS = 60000
+)
+
+func (h *eventHandler) markSpeaking() {
+	h.speakingEpoch.Add(1)
+	if h.audio != nil {
+		h.audio.SetPlaybackEnabled(true)
+		h.audio.SetSpeaking(true)
+	}
+	h.emitVoiceState("speaking")
+}
+
+func (h *eventHandler) releaseSpeakingAfter(delay time.Duration) {
+	epoch := h.speakingEpoch.Add(1)
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		<-timer.C
+		if h.speakingEpoch.Load() != epoch {
+			return
+		}
+		if h.audio != nil {
+			h.audio.SetSpeaking(false)
+			h.audio.SetPlaybackEnabled(false)
+		}
+		h.emitVoiceState("listening")
+	}()
+}
+
+func (h *eventHandler) releaseSpeakingTail() {
+	h.releaseSpeakingAfter(time.Duration(koeEnvInt("KOE_SPEAKING_TAIL_MS", defaultSpeakingTailMS)) * time.Millisecond)
+}
+
+func (h *eventHandler) releaseSpeakingFailsafe() {
+	h.releaseSpeakingAfter(time.Duration(koeEnvInt("KOE_SPEAKING_FAILSAFE_MS", defaultSpeakingFailsafeMS)) * time.Millisecond)
 }
 
 // reportUsage extracts response_id + usage from a response.done event and fires
@@ -89,7 +152,7 @@ func (h *eventHandler) reportUsage(raw []byte) {
 func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error) *eventHandler {
 	return &eventHandler{
 		disp: disp, state: state, audio: audio, sendFn: sendFn,
-		respReq:      make(chan struct{}, 8),
+		respReq:      make(chan responseCreateRequest, 8),
 		respCreated:  make(chan struct{}, 1),
 		respRejected: make(chan struct{}, 1),
 	}
@@ -97,10 +160,10 @@ func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn 
 
 const (
 	// maxResponseCreateRetries bounds retries when GA rejects an overlapping
-	// response.create (mirrors kocoro-reachy's max_retries=5). WORKLOAD: rapid
-	// turns under create_response=false; SYMPTOM if unhandled: Kocoro silently skips
-	// the turn whose create was rejected. OVERRIDE: raise if a slow back-brain keeps
-	// a response active longer than the retries cover.
+	// response.create (mirrors kocoro-reachy's max_retries=5). WORKLOAD: async
+	// do_task result voicing while another response is active; SYMPTOM if unhandled:
+	// Kocoro silently skips the turn whose create was rejected. OVERRIDE: raise if a
+	// slow back-brain keeps a response active longer than the retries cover.
 	maxResponseCreateRetries = 5
 	// responseCreateAckTimeout caps the wait for response.created / a rejection after
 	// sending. A turn with nothing to say yields neither; we stop rather than spin.
@@ -115,8 +178,21 @@ const (
 // server's ack can never deadlock the event loop (handleEvent must keep running to
 // deliver response.created / response.done).
 func (h *eventHandler) requestResponse() {
+	h.requestResponseWith(responseCreateRequest{})
+}
+
+func (h *eventHandler) requestResponseForSpeech(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		h.requestResponse()
+		return
+	}
+	h.requestResponseWith(responseCreateRequest{instructions: exactSpeechInstructions(text)})
+}
+
+func (h *eventHandler) requestResponseWith(req responseCreateRequest) {
 	select {
-	case h.respReq <- struct{}{}:
+	case h.respReq <- req:
 	default: // queue saturated (a request flood) — drop rather than block the loop
 	}
 }
@@ -130,20 +206,20 @@ func (h *eventHandler) runResponseSender(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-h.respReq:
-			h.sendResponseCreate(ctx)
+		case req := <-h.respReq:
+			h.sendResponseCreate(ctx, req)
 		}
 	}
 }
 
-func (h *eventHandler) sendResponseCreate(ctx context.Context) {
+func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreateRequest) {
 	for attempt := 0; attempt <= maxResponseCreateRetries; attempt++ {
 		if !h.waitRespIdle(ctx) {
 			return // ctx done
 		}
 		drainSignal(h.respCreated) // clear stale acks from the previous turn
 		drainSignal(h.respRejected)
-		_ = h.sendFn(map[string]any{"type": "response.create"})
+		_ = h.sendFn(responseCreatePayload(req))
 		select {
 		case <-ctx.Done():
 			return
@@ -162,6 +238,19 @@ func (h *eventHandler) sendResponseCreate(ctx context.Context) {
 	}
 }
 
+func responseCreatePayload(req responseCreateRequest) map[string]any {
+	payload := map[string]any{"type": "response.create"}
+	if strings.TrimSpace(req.instructions) != "" {
+		payload["response"] = map[string]any{"instructions": req.instructions}
+	}
+	return payload
+}
+
+func exactSpeechInstructions(text string) string {
+	text = strings.ReplaceAll(strings.TrimSpace(text), "</spoken_summary>", "</spoken-summary>")
+	return "Speak the completed Kocoro result to the user. Say exactly the text between <spoken_summary> and </spoken_summary>. Do not add a greeting, preface, follow-up question, extra fact, markdown, JSON, or tool detail.\n<spoken_summary>\n" + text + "\n</spoken_summary>"
+}
+
 func drainSignal(c chan struct{}) {
 	select {
 	case <-c:
@@ -176,6 +265,53 @@ func signalNonBlocking(c chan struct{}) {
 	}
 }
 
+func eventLogEnabled() bool { return os.Getenv("KOE_EVENT_LOG") == "1" }
+
+func transcriptLogEnabled() bool { return os.Getenv("KOE_TRANSCRIPT_LOG") == "1" }
+
+func logMaybeText(s string, max int) string {
+	if transcriptLogEnabled() {
+		return shortLogString(s, max)
+	}
+	return fmt.Sprintf("<redacted chars=%d>", len([]rune(s)))
+}
+
+func logMaybeBytes(b []byte, max int) string {
+	if transcriptLogEnabled() {
+		return shortLogString(string(b), max)
+	}
+	return fmt.Sprintf("<redacted bytes=%d>", len(b))
+}
+
+func shortLogString(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if max > 0 && len(r) > max {
+		return string(r[:max]) + "..."
+	}
+	return s
+}
+
+func elapsedMS(from, to time.Time) int64 {
+	if from.IsZero() || to.IsZero() {
+		return -1
+	}
+	return to.Sub(from).Milliseconds()
+}
+
+func outcomeKindLog(kind OutcomeKind) string {
+	switch kind {
+	case OutcomeCompleted:
+		return "completed"
+	case OutcomeInjected:
+		return "injected"
+	case OutcomeRejected:
+		return "rejected"
+	default:
+		return "unknown"
+	}
+}
+
 // sessionConfig builds the session.update event: persona instructions + Plan B's
 // five tools. GA Realtime schema — output_modalities locks audio output and the
 // voice lives under audio.output (the beta top-level "voice" + missing
@@ -184,12 +320,51 @@ func signalNonBlocking(c chan struct{}) {
 // tool_choice stays "auto" — forcing a specific function under output_modalities
 // ["audio"] makes GA emit the call as text instead of a real function call.
 //
-// Turn detection uses server-VAD, but create_response is false: OpenAI segments
-// and transcribes the user's turn, then Koe decides whether the transcript is
-// clear enough to answer. This mirrors kocoro-reachy's "first door" discipline
-// for the Desktop push-to-talk shape: noise / stray words should not make Kocoro
-// improvise a reply.
-func sessionConfig(persona, voice string) map[string]any {
+// Turn detection uses Realtime VAD with create_response=true: OpenAI owns turn
+// segmentation and starts the spoken response automatically. Desktop defaults to
+// deterministic server_vad because the local VPIO + mic gate already absorbs
+// noise, and server_vad endpoints promptly after the local endpoint-silence tail.
+// Set KOE_TURN_DETECTION=semantic_vad to compare the semantic path.
+// Server-side interruption is disabled by default even with VPIO/AEC: without a
+// reliable intent gate, server-side barge-in is exactly how residual speaker echo
+// turns into self-interruption. Set KOE_INTERRUPT_RESPONSE=1 only for explicit
+// barge-in experiments. Far-field noise reduction is enabled by default for the
+// laptop speaker/mic case; set KOE_NOISE_REDUCTION=off to compare raw input.
+func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
+	vadThreshold := koeEnvFloat("KOE_VAD_THRESHOLD", 0.70)
+	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", 900)
+	interruptResponse := false
+	if fullDuplexAEC {
+		interruptResponse = koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
+	}
+	var turnDetection map[string]any
+	if strings.EqualFold(koeEnvString("KOE_TURN_DETECTION", "server_vad"), "semantic_vad") {
+		turnDetection = map[string]any{
+			"type":               "semantic_vad",
+			"eagerness":          koeEnvString("KOE_SEMANTIC_VAD_EAGERNESS", "low"),
+			"create_response":    true,
+			"interrupt_response": interruptResponse,
+		}
+	} else {
+		turnDetection = map[string]any{
+			"type":                "server_vad",
+			"threshold":           vadThreshold,
+			"prefix_padding_ms":   300,
+			"silence_duration_ms": vadSilenceMS,
+			"create_response":     true,
+			"interrupt_response":  interruptResponse,
+		}
+	}
+	input := map[string]any{
+		"transcription": map[string]any{
+			"model": "gpt-4o-mini-transcribe",
+		},
+		"turn_detection": turnDetection,
+	}
+	noiseReduction := koeEnvString("KOE_NOISE_REDUCTION", "far_field")
+	if !strings.EqualFold(noiseReduction, "off") {
+		input["noise_reduction"] = map[string]any{"type": noiseReduction}
+	}
 	return map[string]any{
 		"type": "session.update",
 		"session": map[string]any{
@@ -197,19 +372,7 @@ func sessionConfig(persona, voice string) map[string]any {
 			"instructions":      persona,
 			"output_modalities": []string{"audio"},
 			"audio": map[string]any{
-				"input": map[string]any{
-					"transcription": map[string]any{
-						"model": "gpt-4o-mini-transcribe",
-					},
-					"turn_detection": map[string]any{
-						"type":                "server_vad",
-						"threshold":           0.65,
-						"prefix_padding_ms":   300,
-						"silence_duration_ms": 700,
-						"create_response":     true,
-						"interrupt_response":  true,
-					},
-				},
+				"input":  input,
 				"output": map[string]any{"voice": voice},
 			},
 			"tools":       ToolDefs(),
@@ -237,23 +400,41 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	}
 	switch ev.Type {
 	case "input_audio_buffer.speech_started":
+		h.speechStartedAt = time.Now()
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: speech_started")
+		}
 		// Server-VAD detected the user talking — the reactive "I hear you" moment.
-		// No client-side barge-in: the half-duplex oto gate mutes the mic while Kocoro
-		// speaks, so this can't fire mid-reply. interrupt_response:true is the
-		// server-side path if a full-duplex AEC backend ever lands.
+		// In the default VPIO policy, local capture is still muted while Kocoro
+		// speaks, so self-echo should not reach server VAD.
 		h.emitVoiceState("listening")
 	case "input_audio_buffer.speech_stopped":
-		// The user finished talking. create_response=false, so the server will
-		// transcribe this turn and Koe will decide whether to answer.
+		h.speechStoppedAt = time.Now()
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: speech_stopped speech_ms=%d", elapsedMS(h.speechStartedAt, h.speechStoppedAt))
+		}
+		// The user finished talking. create_response=true lets the server start the
+		// spoken response automatically.
 	case "conversation.item.input_audio_transcription.completed":
 		h.handleInputTranscript(ev.Transcript)
 	case "conversation.item.input_audio_transcription.failed":
 		// Treat failed ASR like unclear audio. Do not guess.
 		h.emitVoiceState("listening")
 	case "response.created":
+		h.responseCreatedAt = time.Now()
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: response_created after_speech_stop_ms=%d", elapsedMS(h.speechStoppedAt, h.responseCreatedAt))
+		}
 		// A response is now generating — the serialized sender waits for its
-		// response.done before sending the next response.create.
+		// response.done before sending the next response.create. Gate capture
+		// immediately, not only once output_audio_buffer.started arrives: otherwise
+		// slow tail audio / room noise in the response-created→first-audio gap can
+		// become the next user turn.
 		h.respBusy.Store(true)
+		if h.audio != nil {
+			h.audio.SetPlaybackEnabled(true)
+			h.audio.SetSpeaking(true)
+		}
 		signalNonBlocking(h.respCreated) // ack the sender's pending response.create
 	case "error":
 		// GA rejects a response.create sent while a response is active. Signal the
@@ -264,40 +445,56 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 	case "response.function_call_arguments.done":
 		args := unwrapArgs(ev.Arguments)
+		if eventLogEnabled() {
+			log.Printf("koe[tool]: call name=%q call_id=%q args=%s", ev.Name, ev.CallID, logMaybeBytes(args, 500))
+		}
 		h.handleFunctionCall(ctx, ev.CallID, ev.Name, args)
 	case "output_audio_buffer.started":
+		h.outputStartedAt = time.Now()
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: output_started after_response_created_ms=%d", elapsedMS(h.responseCreatedAt, h.outputStartedAt))
+		}
 		// WebRTC-only: the server began streaming reply audio — the PRECISE
 		// THINKING→SPEAKING boundary (cleaner than inferring from the first audio
-		// delta). Gate the mic so server-VAD doesn't hear Koe through the speaker.
-		if h.audio != nil {
-			h.audio.SetSpeaking(true)
-		}
-		h.emitVoiceState("speaking")
+		// delta). This drives the local speaking gate so playback does not feed back
+		// into the next turn.
+		h.outputBufferActive.Store(true)
+		h.markSpeaking()
 	case "response.output_audio.delta":
 		// Redundant safety: also gate on the first audio delta in case the
 		// output_audio_buffer.* markers are absent on some transport. Idempotent
-		// with output_audio_buffer.started. Half-duplex echo control. Event name is
-		// the GA flattened convention.
-		if h.audio != nil {
-			h.audio.SetSpeaking(true)
-		}
-		h.emitVoiceState("speaking")
+		// with output_audio_buffer.started. Event name is the GA flattened
+		// convention.
+		h.markSpeaking()
 	case "output_audio_buffer.stopped":
+		now := time.Now()
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: output_stopped after_response_done_ms=%d output_ms=%d", elapsedMS(h.responseDoneAt, now), elapsedMS(h.outputStartedAt, now))
+		}
 		// WebRTC-only: reply audio fully drained (fires after response.done) — the
-		// PRECISE SPEAKING→IDLE boundary. Ungate the mic.
-		if h.audio != nil {
-			h.audio.SetSpeaking(false)
-		}
-		h.emitVoiceState("listening")
+		// PRECISE SPEAKING→IDLE boundary. Keep a short local tail because CoreAudio
+		// can still have speaker energy after the server says its output buffer ended.
+		h.outputBufferActive.Store(false)
+		h.releaseSpeakingTail()
 	case "response.done":
-		// Turn finished → ungate the mic + mark the response slot free. (Usage
-		// token capture for billing is the deferred daemon usage-relay → Plan D.)
-		h.respBusy.Store(false)
-		if h.audio != nil {
-			h.audio.SetSpeaking(false)
+		h.responseDoneAt = time.Now()
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: response_done response_ms=%d output_elapsed_ms=%d", elapsedMS(h.responseCreatedAt, h.responseDoneAt), elapsedMS(h.outputStartedAt, h.responseDoneAt))
 		}
-		h.emitVoiceState("listening")
+		// Turn finished → mark the response slot free. Do not immediately ungate the
+		// mic if output_audio_buffer.started fired; response.done can precede local
+		// playback drain, and releasing here lets Koe hear its own tail.
+		h.respBusy.Store(false)
+		if h.outputBufferActive.Load() {
+			h.releaseSpeakingFailsafe()
+		} else {
+			h.releaseSpeakingTail()
+		}
 		h.reportUsage(raw)
+	case "response.output_audio_transcript.done":
+		if transcriptLogEnabled() && ev.Transcript != "" {
+			log.Printf("koe[assistant]: %q", shortLogString(ev.Transcript, 500))
+		}
 	}
 }
 
@@ -330,10 +527,16 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 	if name == "do_task" {
 		req, clarify, err := h.disp.PrepareDoTask(args)
 		if err != nil {
-			h.sendOutput(callID, SayResult{Status: "failed", Say: "我没听清，能再说一次吗？"})
+			if eventLogEnabled() {
+				log.Printf("koe[task]: prepare failed call_id=%q err=%v args=%s", callID, err, logMaybeBytes(args, 500))
+			}
+			h.sendOutput(callID, SayResult{Status: "failed", SpokenSummary: "我没听清，能再说一次吗？", Say: "我没听清，能再说一次吗？"})
 			return
 		}
 		if clarify != nil {
+			if eventLogEnabled() {
+				log.Printf("koe[task]: clarify call_id=%q status=%s say_len=%d", callID, clarify.Status, len([]rune(clarify.Say)))
+			}
 			h.sendOutput(callID, *clarify)
 			return
 		}
@@ -343,16 +546,28 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 		// the back-brain turn in the background and feed the REAL result back as the
 		// single function_call_output for this call_id, then voice it (mirroring
 		// reachy's BackgroundToolManager). ctx is Connect's, cancelled on Ctrl-C.
-		h.state.SetInFlight(req.Text)
+		h.state.SetInFlightForAgent(req.Text, req.Agent)
 		h.emitVoiceState("thinking") // delegating; the model's call-turn ack already played
 		go func() {
+			started := time.Now()
+			if eventLogEnabled() {
+				log.Printf("koe[task]: start call_id=%q agent=%q burst=%q task=%s", callID, req.Agent, req.ThreadID, logMaybeText(req.Text, 500))
+			}
 			out, derr := h.disp.client.DoTask(ctx, req)
-			h.state.ClearInFlight()
+			h.state.ClearInFlightForAgent(req.Agent)
 			r := MapDoTaskOutcome(out, derr)
+			if eventLogEnabled() {
+				log.Printf("koe[task]: done call_id=%q kind=%s status=%s session=%q partial=%t failure=%q reason=%q spoken_len=%d reply_len=%d duration_ms=%d err=%v",
+					callID, outcomeKindLog(out.Kind), r.Status, out.SessionID, out.Partial, out.FailureCode, out.Reason,
+					len([]rune(r.SpokenSummary)), len([]rune(out.Reply)), time.Since(started).Milliseconds(), derr)
+			}
 			b, _ := json.Marshal(r)
 			h.sendFunctionOutput(callID, b) // satisfy the protocol for this call_id
+			if eventLogEnabled() {
+				log.Printf("koe[tool]: output call_id=%q status=%s voice=%t output=%s", callID, r.Status, r.Status != "injected" && r.Say != "", logMaybeBytes(b, 500))
+			}
 			if r.Status != "injected" && r.Say != "" {
-				h.requestResponse() // voice the result (skip when the daemon already replied)
+				h.requestResponseForSpeech(r.Say) // voice the result (skip when the daemon already replied)
 			}
 		}()
 		return
@@ -360,8 +575,14 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 	// Fast tools (cancel/get_status/control_app/switch_agent).
 	outBytes, err := h.disp.Dispatch(ctx, name, args)
 	if err != nil {
+		if eventLogEnabled() {
+			log.Printf("koe[tool]: dispatch failed name=%q call_id=%q err=%v args=%s", name, callID, err, logMaybeBytes(args, 500))
+		}
 		h.sendOutput(callID, SayResult{Status: "failed", FailReason: err.Error()})
 		return
+	}
+	if eventLogEnabled() {
+		log.Printf("koe[tool]: dispatch done name=%q call_id=%q output=%s", name, callID, logMaybeBytes(outBytes, 500))
 	}
 	var raw json.RawMessage = outBytes
 	h.sendRaw(callID, raw)
@@ -371,7 +592,12 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 // response (the synchronous error/clarify + fast-tool path).
 func (h *eventHandler) sendOutput(callID string, r SayResult) {
 	b, _ := json.Marshal(r)
-	h.sendRaw(callID, b)
+	h.sendFunctionOutput(callID, b)
+	if r.Say != "" {
+		h.requestResponseForSpeech(r.Say)
+		return
+	}
+	h.requestResponse()
 }
 
 // sendFunctionOutput submits the function_call_output for call_id (required by the

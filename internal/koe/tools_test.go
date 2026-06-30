@@ -51,6 +51,29 @@ func TestPrepareDoTaskUsesBoundAgent(t *testing.T) {
 	}
 }
 
+func TestPrepareDoTaskCarriesCallContext(t *testing.T) {
+	state := NewCallState("burst-1", "finance")
+	state.SetCallContext(StartCallRequest{
+		CWD: "/Users/hu/project",
+		ForegroundHint: &ForegroundHint{
+			PID:      123,
+			AppName:  "Mail",
+			BundleID: "com.apple.mail",
+		},
+	})
+	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	req, clarify, err := d.PrepareDoTask([]byte(`{"task":"summarize this window"}`))
+	if err != nil || clarify != nil {
+		t.Fatalf("PrepareDoTask err=%v clarify=%v", err, clarify)
+	}
+	if req.CWD != "/Users/hu/project" || req.ForegroundHint == nil {
+		t.Fatalf("request did not carry call context: %+v", req)
+	}
+	if req.ForegroundHint.PID != 123 || req.ForegroundHint.AppName != "Mail" || req.ForegroundHint.BundleID != "com.apple.mail" {
+		t.Fatalf("foreground hint = %+v", req.ForegroundHint)
+	}
+}
+
 func TestPrepareDoTaskClarifyOnUnknownAgent(t *testing.T) {
 	state := NewCallState("burst-1", "default")
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
@@ -64,8 +87,11 @@ func TestPrepareDoTaskClarifyOnUnknownAgent(t *testing.T) {
 }
 
 func TestMapDoTaskOutcome(t *testing.T) {
-	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "done"}, nil); got.Status != "ok" || got.Say != "done" {
-		t.Errorf("completed → %+v", got)
+	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "long done", SpokenSummary: "done"}, nil); got.Status != "ok" || got.SpokenSummary != "done" || got.Say != "done" {
+		t.Errorf("completed: %+v", got)
+	}
+	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "done"}, nil); got.SpokenSummary != "done" {
+		t.Errorf("completed without spoken summary: %+v", got)
 	}
 	// injected MUST carry an empty say so the front brain doesn't double-speak.
 	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeInjected}, nil); got.Status != "injected" || got.Say != "" {
@@ -101,6 +127,51 @@ func TestDispatchCancelUsesBurstKey(t *testing.T) {
 	d := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	if _, err := d.Dispatch(context.Background(), "cancel", []byte(`{"reason":"user_cancel"}`)); err != nil {
 		t.Fatalf("cancel: %v", err)
+	}
+}
+
+func TestDispatchCancelUsesInFlightPerCallAgentRoute(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got map[string]any
+		json.NewDecoder(r.Body).Decode(&got)
+		if got["route_key"] != "agent:finance:koe:burst-1" {
+			t.Errorf("cancel route_key = %v, want agent:finance:koe:burst-1", got["route_key"])
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	state := NewCallState("burst-1", "")
+	state.SetInFlightForAgent("check NVDA", "finance")
+	d := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	if _, err := d.Dispatch(context.Background(), "cancel", []byte(`{"reason":"user_cancel"}`)); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if got := state.InFlight(); got != "" {
+		t.Fatalf("cancel should clear all in-flight state, got %q", got)
+	}
+}
+
+func TestDispatchCancelCancelsAllInFlightRoutes(t *testing.T) {
+	var routes []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got map[string]any
+		json.NewDecoder(r.Body).Decode(&got)
+		routes = append(routes, got["route_key"].(string))
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	state := NewCallState("burst-1", "")
+	state.SetInFlightForAgent("check NVDA", "finance")
+	state.SetInFlightForAgent("review contract", "legal")
+	d := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	if _, err := d.Dispatch(context.Background(), "cancel", []byte(`{"reason":"user_cancel"}`)); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	want := []string{"agent:finance:koe:burst-1", "agent:legal:koe:burst-1"}
+	if strings.Join(routes, ",") != strings.Join(want, ",") {
+		t.Fatalf("cancel routes = %v, want %v", routes, want)
 	}
 }
 

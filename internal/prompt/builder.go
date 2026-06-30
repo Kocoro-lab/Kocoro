@@ -559,7 +559,9 @@ func formatGuidance(format string) string {
 	switch format {
 	case "koe":
 		return "You are speaking aloud through a voice interface; your reply is read out by a text-to-speech voice. " +
-			"Respond in short, natural spoken sentences — usually one or two. " +
+			"Start with a short, natural spoken summary — usually one or two sentences. " +
+			"After that, include concise details only when they are useful for the Desktop session history. " +
+			"Do not add generic follow-up offers such as \"let me know\" or \"would you like details\" unless the user asked to continue or a confirmation is required. " +
 			"Never read markdown, code, JSON, raw URLs, or file paths aloud; they sound like noise when spoken. " +
 			"If a result is long or structured (a list, a table, code, a document), save it to a file or send it " +
 			"through the right channel and say in one sentence where it is, instead of reading it out. " +

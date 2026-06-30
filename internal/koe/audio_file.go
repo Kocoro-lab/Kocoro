@@ -90,9 +90,9 @@ func (a *AudioIO) CapturedMetrics() WavMetrics {
 	return wavMetrics(a.file.captured)
 }
 
-// feedFrames streams inPCM into a.frames at the 20 ms cadence, then ~1.2 s of
-// trailing silence so server-VAD marks end-of-turn. Shared by the file backend
-// and the --real-output path (where the reply plays through the real speaker).
+// feedFrames streams inPCM into a.frames at the 20 ms cadence, then continuous
+// silence until the backend stops. Real mic devices never stop producing frames;
+// the file backend must mirror that so semantic/server VAD can endpoint turns.
 func (a *AudioIO) feedFrames(inPCM []int16, done <-chan struct{}) {
 	// Wait until the send pump is draining (OpenAI session configured) before
 	// streaming this one-shot utterance, so it isn't fed into the 64-frame buffer
@@ -123,8 +123,8 @@ func (a *AudioIO) feedFrames(inPCM []int16, done <-chan struct{}) {
 		}
 	}
 	silence := make([]int16, audioFrameSize)
-	for range 60 { // ~1.2 s trailing silence
-		if !emit(append([]int16(nil), silence...)) {
+	for {
+		if !emit(silence) {
 			return
 		}
 	}

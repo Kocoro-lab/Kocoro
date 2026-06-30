@@ -54,3 +54,28 @@ func TestStartFileCapturesPlayback(t *testing.T) {
 	}
 	t.Logf("captured %d samples, rms=%.4f disc=%.4f", m.Samples, m.RMS, m.DiscontinuityRatio)
 }
+
+func TestFeedFramesContinuesSilenceUntilStopped(t *testing.T) {
+	a, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	a.markSendReady()
+	done := make(chan struct{})
+	defer close(done)
+	go a.feedFrames(nil, done)
+
+	deadline := time.After(300 * time.Millisecond)
+	got := 0
+	for got < 5 {
+		select {
+		case frame := <-a.Frames():
+			got++
+			if rmsLevel(frame) != 0 {
+				t.Fatal("trailing file-backend frames must be silence")
+			}
+		case <-deadline:
+			t.Fatalf("feedFrames stopped early after %d silence frames", got)
+		}
+	}
+}

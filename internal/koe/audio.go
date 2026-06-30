@@ -18,11 +18,15 @@ const (
 	audioChannels   = 1                                     // mono capture/playback
 	audioFrameMs    = 20                                    // 20 ms frames
 	audioFrameSize  = audioSampleRate / 1000 * audioFrameMs // 960 samples
+	// inputBufferFrames covers the cold-start window before session.updated starts
+	// the send pump. Desktop normally uses a warm session, but keeping ~5s here
+	// prevents first words from being dropped during network stalls or startup.
+	inputBufferFrames = 256
 )
 
-// AudioIO owns the malgo duplex device and the Opus codec. Capture frames are
-// published on Frames(); playback PCM is enqueued via Play(). While SetSpeaking
-// is true, capture is gated (half-duplex echo control).
+// AudioIO owns the selected realtime audio backend and the Opus codec. The
+// default backend is oto playback + malgo capture with a half-duplex gate. The
+// opt-in VPIO backend uses Apple's VoiceProcessingIO for full-duplex AEC.
 type AudioIO struct {
 	ctx     *malgo.AllocatedContext
 	dev     *malgo.Device
@@ -30,14 +34,31 @@ type AudioIO struct {
 	dec     *opus.Decoder
 	frames  chan []int16
 	playBuf chan []int16
-	// otoPlayer is the PRODUCTION playback path (audio_oto.go): oto drains playBuf
-	// through macOS AudioToolbox. nil in the file/playback-only debug backends,
-	// which keep the malgo renderInto path. Set by Start(), closed by Stop().
+	// otoPlayer is the default playback path (audio_oto.go): oto drains playBuf
+	// through macOS AudioToolbox. nil in the file/VPIO/playback-only debug
+	// backends, which keep their own render paths. Set by Start(), closed by Stop().
 	otoPlayer *oto.Player
 	speaking  atomic.Bool
+	playback  atomic.Bool
 	encMu     sync.Mutex
 	decMu     sync.Mutex
 	stopOnce  sync.Once
+	// vpioActive / vpioDone track the opt-in VoiceProcessingIO backend
+	// (audio_vpio.go). VPIO supplies native echo cancellation, but the product
+	// default still mutes capture while speaking; explicit barge-in experiments can
+	// opt into a stricter local energy gate.
+	vpioActive      bool
+	vpioDone        chan struct{}
+	vpioWG          sync.WaitGroup
+	vpioBargeFrames int
+	vpioNoiseFloor  float64
+	vpioForwarded   atomic.Uint64
+	vpioGateDropped atomic.Uint64
+	vpioBargePassed atomic.Uint64
+	vpioMaxInput    atomic.Uint64
+	vpioMaxOutput   atomic.Uint64
+	vpioStatsMu     sync.Mutex
+	vpioStatsBase   vpioDebugStats
 	// sendReady is closed (once) when pumpSendTrack starts draining — i.e. the OpenAI
 	// session is configured. The file backend's feedFrames waits on it so a one-shot
 	// --say/--audio-in utterance is streamed in sync with the send pump, never fed
@@ -70,8 +91,11 @@ func rmsLevel(pcm []int16) float64 {
 	return math.Sqrt(sumSq/float64(len(pcm))) / 32768.0
 }
 
-func (a *AudioIO) setInputLevel(l float64)  { a.inLevel.Store(math.Float64bits(l)) }
-func (a *AudioIO) setOutputLevel(l float64) { a.outLevel.Store(math.Float64bits(l)) }
+func (a *AudioIO) setInputLevel(l float64) { a.inLevel.Store(math.Float64bits(l)) }
+func (a *AudioIO) setOutputLevel(l float64) {
+	a.outLevel.Store(math.Float64bits(l))
+	a.trackVPIOMaxOutput(l)
+}
 
 // InputLevel / OutputLevel report the latest captured / played frame RMS (0..1).
 func (a *AudioIO) InputLevel() float64  { return math.Float64frombits(a.inLevel.Load()) }
@@ -88,13 +112,15 @@ func NewAudioIO() (*AudioIO, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &AudioIO{
+	a := &AudioIO{
 		enc:       enc,
 		dec:       dec,
-		frames:    make(chan []int16, 64),
+		frames:    make(chan []int16, inputBufferFrames),
 		playBuf:   make(chan []int16, 256),
 		sendReady: make(chan struct{}),
-	}, nil
+	}
+	a.playback.Store(true)
+	return a, nil
 }
 
 // markSendReady signals (once) that the send pump has started draining captured
@@ -102,21 +128,150 @@ func NewAudioIO() (*AudioIO, error) {
 // this before streaming a one-shot utterance so it lands in sync with the pump.
 func (a *AudioIO) markSendReady() { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
 
-// SetSpeaking gates the mic during playback (v1 half-duplex echo control).
+// SetSpeaking marks playback as active. Production treats it as a hard mute while
+// Kocoro speaks unless experimental VPIO barge-in is explicitly enabled.
 func (a *AudioIO) SetSpeaking(s bool) { a.speaking.Store(s) }
 func (a *AudioIO) dropCapture() bool  { return a.speaking.Load() }
 
-// Frames yields captured 48 kHz mono 20 ms frames (gated while speaking).
+// Frames yields captured 48 kHz mono 20 ms frames.
 func (a *AudioIO) Frames() <-chan []int16 { return a.frames }
+
+const (
+	// VPIO already performs native AEC. This extra local guard is deliberately
+	// conservative: while Koe is speaking, drop mic frames by default. Experimental
+	// barge-in can be enabled with KOE_VPIO_BARGE_IN=1; then frames pass only after
+	// sustained post-AEC energy that is much louder than residual speaker bleed.
+	// Tune with KOE_VPIO_BARGE_THRESHOLD, KOE_VPIO_BARGE_MS, and
+	// KOE_VPIO_BARGE_NOISE_MULTIPLIER.
+	defaultVPIOBargeInThreshold       = 0.045
+	defaultVPIOBargeInMS              = 500
+	defaultVPIOBargeInNoiseMultiplier = 6.0
+	vpioNoiseFloorAlpha               = 0.02
+)
+
+func (a *AudioIO) shouldForwardVPIOCapture(level float64) bool {
+	if !a.dropCapture() {
+		a.vpioBargeFrames = 0
+		a.vpioNoiseFloor = 0
+		a.vpioForwarded.Add(1)
+		return true
+	}
+	if !koeEnvBool("KOE_VPIO_BARGE_IN", false) {
+		a.vpioBargeFrames = 0
+		a.updateVPIONoiseFloor(level)
+		a.vpioGateDropped.Add(1)
+		return false
+	}
+	threshold := a.vpioBargeInThreshold()
+	if level < threshold {
+		a.vpioBargeFrames = 0
+		a.updateVPIONoiseFloor(level)
+		a.vpioGateDropped.Add(1)
+		return false
+	}
+	a.vpioBargeFrames++
+	if a.vpioBargeFrames >= vpioBargeInFrames() {
+		a.vpioBargePassed.Add(1)
+		a.vpioForwarded.Add(1)
+		return true
+	}
+	a.vpioGateDropped.Add(1)
+	return false
+}
+
+func (a *AudioIO) vpioBargeInThreshold() float64 {
+	base := koeEnvFloat("KOE_VPIO_BARGE_THRESHOLD", defaultVPIOBargeInThreshold)
+	adaptive := a.vpioNoiseFloor * koeEnvFloat("KOE_VPIO_BARGE_NOISE_MULTIPLIER", defaultVPIOBargeInNoiseMultiplier)
+	return math.Max(base, adaptive)
+}
+
+func vpioBargeInFrames() int {
+	ms := koeEnvInt("KOE_VPIO_BARGE_MS", defaultVPIOBargeInMS)
+	frames := (ms + audioFrameMs - 1) / audioFrameMs
+	if frames < 1 {
+		return 1
+	}
+	return frames
+}
+
+func (a *AudioIO) updateVPIONoiseFloor(level float64) {
+	if level <= 0 {
+		return
+	}
+	if a.vpioNoiseFloor == 0 {
+		a.vpioNoiseFloor = level
+		return
+	}
+	a.vpioNoiseFloor = (1-vpioNoiseFloorAlpha)*a.vpioNoiseFloor + vpioNoiseFloorAlpha*level
+}
+
+func (a *AudioIO) trackVPIOMaxInput(level float64) {
+	for {
+		oldBits := a.vpioMaxInput.Load()
+		old := math.Float64frombits(oldBits)
+		if level <= old {
+			return
+		}
+		if a.vpioMaxInput.CompareAndSwap(oldBits, math.Float64bits(level)) {
+			return
+		}
+	}
+}
+
+// SetPlaybackEnabled controls whether inbound Realtime audio is accepted. Desktop
+// keeps a warm WebRTC session while idle, and OpenAI may still send silent RTP;
+// dropping it until a response starts keeps the hardware jitter buffer clean.
+func (a *AudioIO) SetPlaybackEnabled(s bool) {
+	a.playback.Store(s)
+	if !s {
+		a.setOutputLevel(0)
+		a.clearVPIOBuffers()
+		for {
+			select {
+			case <-a.playBuf:
+			default:
+				return
+			}
+		}
+	}
+}
 
 // Play enqueues a decoded PCM frame for playback. It takes ownership of pcm
 // without copying — the slice is read later on the audio callback thread, so the
 // caller must NOT reuse or mutate it after this call. (Safe today: DecodeFrame
 // returns a fresh slice per call.)
 func (a *AudioIO) Play(pcm []int16) {
+	if !a.playback.Load() {
+		return
+	}
 	select {
 	case a.playBuf <- pcm:
 	default: // drop on overflow rather than block the decode path
+	}
+}
+
+// PrepareForCall clears stale capture/playback queued while Desktop was idle.
+// Desktop keeps the VPIO device open across calls for smooth double-tap latency,
+// so the next WebRTC session must start from fresh buffers.
+func (a *AudioIO) PrepareForCall() {
+	a.SetSpeaking(false)
+	a.SetPlaybackEnabled(false)
+	a.primed.Store(false)
+	for {
+		select {
+		case <-a.frames:
+		default:
+			goto drainPlay
+		}
+	}
+drainPlay:
+	for {
+		select {
+		case <-a.playBuf:
+		default:
+			a.resetVPIOCallStats()
+			return
+		}
 	}
 }
 
@@ -268,6 +423,11 @@ func (a *AudioIO) Stop() {
 			a.stopFile() // audio_file.go: stop feed+capture goroutines, flush the WAV
 			return
 		}
+		if a.vpioActive {
+			a.LogDebugStats()
+			a.stopVPIO()
+			return
+		}
 		a.closeOtoPlayer() // production playback (nil-safe for the playback-only debug path)
 		if a.dev != nil {
 			_ = a.dev.Stop()
@@ -278,6 +438,72 @@ func (a *AudioIO) Stop() {
 			a.ctx.Free()
 		}
 	})
+}
+
+func (a *AudioIO) LogDebugStats() {
+	if os.Getenv("KOE_AUDIO_LOG") != "1" && os.Getenv("KOE_EVENT_LOG") != "1" {
+		return
+	}
+	if a.vpioActive {
+		log.Printf("koe[audio]: vpio stats: %+v", a.vpioDebugStatsSinceBase())
+	}
+}
+
+func (a *AudioIO) resetVPIOCallStats() {
+	if !a.vpioActive {
+		return
+	}
+	a.vpioStatsMu.Lock()
+	defer a.vpioStatsMu.Unlock()
+	a.vpioStatsBase = a.vpioDebugStats()
+	a.vpioMaxInput.Store(0)
+	a.vpioMaxOutput.Store(0)
+	a.vpioStatsBase.MaxInputLevel = 0
+	a.vpioStatsBase.MaxOutputLevel = 0
+}
+
+func (a *AudioIO) vpioDebugStatsSinceBase() vpioDebugStats {
+	a.vpioStatsMu.Lock()
+	base := a.vpioStatsBase
+	a.vpioStatsMu.Unlock()
+	cur := a.vpioDebugStats()
+	return vpioDebugStats{
+		InputCallbacks:  subUint64(cur.InputCallbacks, base.InputCallbacks),
+		OutputCallbacks: subUint64(cur.OutputCallbacks, base.OutputCallbacks),
+		InputFrames:     subUint64(cur.InputFrames, base.InputFrames),
+		OutputFrames:    subUint64(cur.OutputFrames, base.OutputFrames),
+		PlayUnderruns:   subUint64(cur.PlayUnderruns, base.PlayUnderruns),
+		PlayOverwrites:  subUint64(cur.PlayOverwrites, base.PlayOverwrites),
+		PlayBuffered:    cur.PlayBuffered,
+		PlayCapacity:    cur.PlayCapacity,
+		ForwardedFrames: subUint64(cur.ForwardedFrames, base.ForwardedFrames),
+		GateDropped:     subUint64(cur.GateDropped, base.GateDropped),
+		BargePassed:     subUint64(cur.BargePassed, base.BargePassed),
+		MaxInputLevel:   cur.MaxInputLevel,
+		MaxOutputLevel:  cur.MaxOutputLevel,
+	}
+}
+
+func (a *AudioIO) trackVPIOMaxOutput(level float64) {
+	if !a.vpioActive {
+		return
+	}
+	for {
+		curBits := a.vpioMaxOutput.Load()
+		if level <= math.Float64frombits(curBits) {
+			return
+		}
+		if a.vpioMaxOutput.CompareAndSwap(curBits, math.Float64bits(level)) {
+			return
+		}
+	}
+}
+
+func subUint64(cur, base uint64) uint64 {
+	if cur < base {
+		return 0
+	}
+	return cur - base
 }
 
 func bytesToS16(b []byte) []int16 {
