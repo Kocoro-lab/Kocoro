@@ -83,6 +83,30 @@ func TestResolveStripsAgentFiller(t *testing.T) {
 	}
 }
 
+func TestResolveDefaultRevertsToImplicit(t *testing.T) {
+	// "default" is not a named registry entry (agents are academic-writer,
+	// investment-analyst, ...) — it is the implicit default (empty slug). Without
+	// this a user could switch TO a specialist by voice but never back to default.
+	agents := []AgentSummary{{Slug: "investment-analyst", DisplayName: "investment-analyst"}}
+	r := NewAgentResolver(agents, NoopSemanticMatcher{})
+	for _, ref := range []string{"default", "默认", "the default agent", "默认 agent"} {
+		got := r.Resolve(ref)
+		if got.Status != ResolveResolved || got.Slug != "" {
+			t.Errorf("Resolve(%q) = %+v, want Resolved/\"\" (implicit default)", ref, got)
+		}
+	}
+}
+
+func TestResolveLiteralDefaultSlugStillWins(t *testing.T) {
+	// If a real agent is literally named "default", the exact-slug match wins over
+	// the implicit-default shortcut.
+	agents := []AgentSummary{{Slug: "default", DisplayName: "Kocoro"}}
+	r := NewAgentResolver(agents, NoopSemanticMatcher{})
+	if got := r.Resolve("default"); got.Status != ResolveResolved || got.Slug != "default" {
+		t.Errorf("Resolve(default) = %+v, want the literal default slug", got)
+	}
+}
+
 type funcSemanticMatcher func(ref string, agents []AgentSummary) string
 
 func (f funcSemanticMatcher) Match(ref string, agents []AgentSummary) string { return f(ref, agents) }

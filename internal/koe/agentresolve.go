@@ -62,6 +62,14 @@ func (r *AgentResolver) Resolve(ref string) ResolveResult {
 		}
 	}
 
+	// "default" / "默认" = the implicit default agent (empty slug). It is not a
+	// named registry entry, so without this a user can switch TO a specialist by
+	// voice but never back to the default. The exact-slug loop above still wins if
+	// a real agent is literally named "default".
+	if norm == "default" || norm == "默认" {
+		return ResolveResult{Status: ResolveResolved, Slug: ""}
+	}
+
 	// ② display-name substring (bidirectional: "金融" ⊂ "金融分析 agent", and a
 	//    longer spoken phrase still matches a short display name).
 	var hits []string
