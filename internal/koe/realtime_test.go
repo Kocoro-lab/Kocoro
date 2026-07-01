@@ -404,6 +404,28 @@ func TestHandleEventReleasesWhenOutputBufferStopIsLate(t *testing.T) {
 	}
 }
 
+func TestHandleEventKeepsMicGatedUntilLateOutputBufferStop(t *testing.T) {
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "200")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done"}`))
+	time.Sleep(50 * time.Millisecond)
+	if !audio.dropCapture() {
+		t.Fatal("response.done must not release the mic while output buffer is still active")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.stopped"}`))
+	waitUntil(t, func() bool { return !audio.dropCapture() }, "output_audio_buffer.stopped did not release the mic")
+}
+
 func TestHandleEventIgnoresStaleOutputBufferStopAfterLocalRelease(t *testing.T) {
 	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
 	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "1")
@@ -449,7 +471,7 @@ func TestHandleEventMarksSpeakingWithFullDuplexAEC(t *testing.T) {
 	}
 }
 
-func TestSessionConfigUsesHalfDuplexSpeakerSafeVADByDefault(t *testing.T) {
+func TestSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 	cfg := sessionConfig("persona", "marin", false)
 	raw, _ := json.Marshal(cfg)
 	s := string(raw)
@@ -457,9 +479,8 @@ func TestSessionConfigUsesHalfDuplexSpeakerSafeVADByDefault(t *testing.T) {
 	for _, want := range []string{
 		`"transcription":{"model":"gpt-4o-mini-transcribe"}`,
 		`"turn_detection"`,
-		`"type":"server_vad"`,
-		`"threshold":0.5`,
-		`"silence_duration_ms":900`,
+		`"type":"semantic_vad"`,
+		`"eagerness":"low"`,
 		`"create_response":true`,
 		`"interrupt_response":false`,
 		`"noise_reduction":{"type":"far_field"}`,
@@ -473,15 +494,16 @@ func TestSessionConfigUsesHalfDuplexSpeakerSafeVADByDefault(t *testing.T) {
 	}
 }
 
-func TestSessionConfigCanUseSemanticVAD(t *testing.T) {
-	t.Setenv("KOE_TURN_DETECTION", "semantic_vad")
+func TestSessionConfigCanUseServerVAD(t *testing.T) {
+	t.Setenv("KOE_TURN_DETECTION", "server_vad")
 	cfg := sessionConfig("persona", "marin", true)
 	raw, _ := json.Marshal(cfg)
 	s := string(raw)
 
 	for _, want := range []string{
-		`"type":"semantic_vad"`,
-		`"eagerness":"low"`,
+		`"type":"server_vad"`,
+		`"threshold":0.5`,
+		`"silence_duration_ms":900`,
 		`"create_response":true`,
 		`"interrupt_response":false`,
 	} {
@@ -499,9 +521,8 @@ func TestSessionConfigKeepsInterruptDisabledForVPIOByDefault(t *testing.T) {
 	for _, want := range []string{
 		`"create_response":true`,
 		`"interrupt_response":false`,
-		`"type":"server_vad"`,
-		`"threshold":0.5`,
-		`"silence_duration_ms":900`,
+		`"type":"semantic_vad"`,
+		`"eagerness":"low"`,
 		`"noise_reduction":{"type":"far_field"}`,
 	} {
 		if !strings.Contains(s, want) {

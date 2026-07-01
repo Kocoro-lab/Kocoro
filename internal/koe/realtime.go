@@ -89,7 +89,7 @@ func (h *eventHandler) voiceState() string {
 
 const (
 	defaultSpeakingTailMS         = 900
-	defaultOutputBufferStopWaitMS = 2500
+	defaultOutputBufferStopWaitMS = 12000
 )
 
 func (h *eventHandler) markSpeaking() {
@@ -371,9 +371,9 @@ func outcomeKindLog(kind OutcomeKind) string {
 //
 // Turn detection uses Realtime VAD with create_response=true: OpenAI owns turn
 // segmentation and starts the spoken response automatically. Desktop defaults to
-// deterministic server_vad because the local VPIO + mic gate already absorbs
-// noise, and server_vad endpoints promptly after the local endpoint-silence tail.
-// Set KOE_TURN_DETECTION=semantic_vad to compare the semantic path.
+// semantic_vad because it is less eager on ambient/noisy audio while still deciding
+// end-of-turn server-side. Set KOE_TURN_DETECTION=server_vad to compare the lower
+// latency deterministic path.
 // Server-side interruption is disabled by default even with VPIO/AEC: without a
 // reliable intent gate, server-side barge-in is exactly how residual speaker echo
 // turns into self-interruption. Set KOE_INTERRUPT_RESPONSE=1 only for explicit
@@ -387,7 +387,7 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 		interruptResponse = koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
 	}
 	var turnDetection map[string]any
-	if strings.EqualFold(koeEnvString("KOE_TURN_DETECTION", "server_vad"), "semantic_vad") {
+	if strings.EqualFold(koeEnvString("KOE_TURN_DETECTION", "semantic_vad"), "semantic_vad") {
 		turnDetection = map[string]any{
 			"type":               "semantic_vad",
 			"eagerness":          koeEnvString("KOE_SEMANTIC_VAD_EAGERNESS", "low"),

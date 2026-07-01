@@ -338,24 +338,38 @@ func zeroBytes(b []byte) {
 	}
 }
 
+func audioProbe(step string) {
+	if os.Getenv("KOE_AUDIO_PROBE") == "1" {
+		log.Printf("koe[audio-probe]: %s", step)
+	}
+}
+
 // Start opens oto for playback (the production path — malgo's low-level playback
 // is static on this hardware, see audio_oto.go) and a malgo CAPTURE-ONLY device
 // for the mic.
 func (a *AudioIO) Start() error {
 	// Playback: oto (macOS AudioToolbox, high-level). Reuse the process-wide context,
 	// then a fresh player draining playBuf via otoSource.
+	audioProbe("gate start enter")
+	audioProbe("oto context begin")
 	octx, err := ensureOtoContext()
 	if err != nil {
 		return fmt.Errorf("oto playback init: %w", err)
 	}
+	audioProbe("oto context done")
+	audioProbe("oto player begin")
 	a.otoPlayer = octx.NewPlayer(&otoSource{a: a})
+	audioProbe("oto player done")
+	audioProbe("oto play begin")
 	a.otoPlayer.Play()
+	audioProbe("oto play done")
 
 	// Capture: malgo CAPTURE-ONLY (not Duplex). A duplex device whose native rate
 	// differs from ours forces two-way resampling and trips miniaudio's ring-buffer
 	// bug #191 (the Bluetooth static); capturing alone sidesteps it. The half-duplex
 	// gate (SetSpeaking → dropCapture) still mutes the mic while Kocoro speaks.
 	probe := os.Getenv("KOE_AUDIO_PROBE") == "1"
+	audioProbe("malgo context begin")
 	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(msg string) {
 		if probe {
 			log.Printf("miniaudio: %s", msg)
@@ -365,6 +379,7 @@ func (a *AudioIO) Start() error {
 		a.closeOtoPlayer()
 		return err
 	}
+	audioProbe("malgo context done")
 	a.ctx = ctx
 
 	cfg := malgo.DefaultDeviceConfig(malgo.Capture)
@@ -387,6 +402,7 @@ func (a *AudioIO) Start() error {
 		}
 	}
 
+	audioProbe("malgo device init begin")
 	dev, err := malgo.InitDevice(ctx.Context, cfg, malgo.DeviceCallbacks{Data: onData})
 	if err != nil {
 		// InitContext succeeded but the device did not — free the context (and the
@@ -397,8 +413,14 @@ func (a *AudioIO) Start() error {
 		a.closeOtoPlayer()
 		return err
 	}
+	audioProbe("malgo device init done")
 	a.dev = dev
-	return dev.Start()
+	audioProbe("malgo device start begin")
+	if err := dev.Start(); err != nil {
+		return err
+	}
+	audioProbe("malgo device start done")
+	return nil
 }
 
 // closeOtoPlayer stops the production playback player (idempotent). oto v3.4

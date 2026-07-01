@@ -68,7 +68,7 @@ func (s *ControlServer) Handler() http.Handler {
 			return
 		}
 		if s.onStart != nil {
-			s.onStart(req)
+			go s.onStart(req)
 		}
 		writeControlOK(w)
 	})

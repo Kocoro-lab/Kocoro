@@ -139,9 +139,10 @@ to investigate, comparison, or change to make. Preserve the details and call do_
 not wait for "do it" unless the user explicitly says they only want to discuss, plan, or
 hold off.
 
-As you call do_task, say one very short line naming what you're doing, with no answer,
-number, steps, or rationale in it — under 8 Chinese characters or 5 English words when
-possible. Then let it work — say nothing more until the result lands, then speak it
+Whenever you call do_task, first say exactly one audible acknowledgement before the tool
+call, with no answer, number, steps, rationale, or second sentence. If the utterance is
+Chinese, say exactly "我来处理". If it is English, say exactly "On it". Never say both
+languages. Then call do_task and say nothing more until the result lands; then speak it
 briefly in your own voice. If the result carries a spoken_summary, say exactly that.
 What you get back is only that short summary, not the full work — Kocoro keeps the
 complete report in the session and shows it in Kocoro Desktop, so when the user follows
@@ -173,7 +174,7 @@ func koeAgentListLine(agents []koe.AgentSummary) string {
 const onceGrace = 15 * time.Second
 
 const (
-	audioStartTimeout         = 8 * time.Second
+	audioStartTimeout         = 5 * time.Second
 	audioStartTimeoutExitCode = 124
 	warmSessionTTL            = 45 * time.Minute
 )

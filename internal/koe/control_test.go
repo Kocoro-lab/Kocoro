@@ -18,9 +18,10 @@ func (s *ControlServer) subscriberCount() int {
 }
 
 func TestControlServerStartEnd(t *testing.T) {
-	var started, ended, interrupted bool
+	started := make(chan struct{}, 1)
+	var ended, interrupted bool
 	s := NewControlServer(
-		func(StartCallRequest) { started = true },
+		func(StartCallRequest) { started <- struct{}{} },
 		func() { ended = true },
 		func() { interrupted = true },
 	)
@@ -33,7 +34,9 @@ func TestControlServerStartEnd(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if !started {
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
 		t.Error("POST /call/start did not invoke onStart")
 	}
 	if !strings.Contains(string(body), `"status":"ok"`) {
@@ -56,6 +59,34 @@ func TestControlServerStartEnd(t *testing.T) {
 	resp3.Body.Close()
 	if !interrupted {
 		t.Error("POST /call/interrupt did not invoke onInterrupt")
+	}
+}
+
+func TestControlServerStartDoesNotBlockHTTP(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	block := make(chan struct{})
+	s := NewControlServer(func(StartCallRequest) {
+		entered <- struct{}{}
+		<-block
+	}, nil, nil)
+	defer close(block)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Post(srv.URL+"/call/start", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST /call/start should return while start work continues: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `"status":"ok"`) {
+		t.Errorf("start response = %s", body)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onStart was not invoked")
 	}
 }
 
