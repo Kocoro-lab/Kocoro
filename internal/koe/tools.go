@@ -26,7 +26,7 @@ func ToolDefs() []ToolDef {
 	return []ToolDef{
 		{Type: "function", Name: "do_task",
 			Description: "do_task — how you actually get things done: your own hands on a full computer. As Kocoro on Kocoro Desktop you can browse and research the web, read and write files, run code and calculate precisely, manage schedules, send email and messages, and run multi-step jobs. Reach for it for ANYTHING beyond chat that needs real data, a current fact, an exact calculation, or a real action — never answer those from memory or guess. The moment you call it, say one short first-person line naming what you're doing, then speak the result in your own voice when it lands. It is you working with your own tools — never describe it to the user as a colleague, back-end, or other system.",
-			Parameters:  obj(`{"type":"object","properties":{"task":{"type":"string","description":"The task to perform, in the user's own words."},"agent":{"type":"string","description":"Optional: the agent the user named for this task, verbatim (e.g. \"金融\", \"finance\"). Omit to use the bound agent."}},"required":["task"]}`)},
+			Parameters:  obj(`{"type":"object","properties":{"task":{"type":"string","description":"The task to perform, in the user's own words."},"agent":{"type":"string","description":"Optional: the agent the user named for this task, verbatim. Omit to use the bound agent."}},"required":["task"]}`)},
 		{Type: "function", Name: "cancel",
 			Description: "Cancel the task that is currently running.",
 			Parameters:  obj(`{"type":"object","properties":{"reason":{"type":"string","enum":["user_cancel","interrupt"],"description":"Why the task is being cancelled."}},"required":[]}`)},
@@ -37,7 +37,7 @@ func ToolDefs() []ToolDef {
 			Description: "Control the Kocoro desktop window or conversation.",
 			Parameters:  obj(`{"type":"object","properties":{"action":{"type":"string","enum":["show","hide","new_conversation","open_settings"],"description":"The UI action to perform."}},"required":["action"]}`)},
 		{Type: "function", Name: "switch_agent",
-			Description: "Switch which specialist handles your real-work tasks from now on (the user named one, verbatim, e.g. \"金融\", \"finance\").",
+			Description: "Switch which specialist handles your real-work tasks from now on — only when the user explicitly names one; otherwise stay on the current agent.",
 			Parameters:  obj(`{"type":"object","properties":{"agent":{"type":"string","description":"The agent the user named, verbatim."}},"required":["agent"]}`)},
 	}
 }

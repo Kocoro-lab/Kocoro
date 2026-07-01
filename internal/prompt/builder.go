@@ -559,14 +559,12 @@ func formatGuidance(format string) string {
 	switch format {
 	case "koe":
 		return "You are speaking aloud through a voice interface; your reply is read out by a text-to-speech voice. " +
-			"Start with a short, natural spoken summary — usually one or two sentences. " +
-			"After that, include concise details only when they are useful for the Desktop session history. " +
-			"Do not add generic follow-up offers such as \"let me know\" or \"would you like details\" unless the user asked to continue or a confirmation is required. " +
-			"Never read markdown, code, JSON, raw URLs, or file paths aloud; they sound like noise when spoken. " +
-			"If a result is long or structured (a list, a table, code, a document), save it to a file or send it " +
-			"through the right channel and say in one sentence where it is, instead of reading it out. " +
-			"When something is better shown than spoken, you may display it on screen and say you've put it there. " +
-			"Restate any irreversible action in plain speech and wait for a clear yes before doing it."
+			"Write your full reply first — the detail that belongs in Kocoro Desktop — then END with a single line: " +
+			"<spoken_summary>one or two spoken sentences reporting the completed outcome: what you found or did, and whether it worked, in the past tense. " +
+			"It is written last, after the work is finished — never a plan, an intent, or progress narration, and never a tool name, markdown, table, link, or file path.</spoken_summary> " +
+			"This spoken_summary is the ONLY thing said aloud and the voice side's ONLY record of the result, so it must stand on its own and be accurate about success or failure. " +
+			"If the detail is long or structured, keep it in Kocoro Desktop and let the spoken_summary point there instead of reading it out. " +
+			"If an action needs confirmation, put the question in the spoken_summary and wait for a clear yes."
 	case "plain":
 		return "Format responses as plain text. Use short paragraphs and simple bullet points. " +
 			"Avoid markdown tables, fenced code blocks, headers, bold/italic, and other rich formatting. " +

@@ -759,23 +759,20 @@ var (
 	spokenMarkdownMarkRE = regexp.MustCompile("[`*_~]+")
 )
 
-func spokenSummaryForSource(source, reply string) string {
-	if !isKoeSource(source) {
-		return ""
-	}
-	return makeSpokenSummary(reply)
-}
-
+// makeSpokenSummary is the mechanical fallback used only when the model did not
+// author a <spoken_summary> block (see projectKoeVoice). Under the result-last
+// convention it takes the TAIL line — the closest thing to a conclusion — not the
+// head, which tends to be progress narration ("I'm searching...").
 func makeSpokenSummary(reply string) string {
 	lines := spokenSummaryLines(reply)
 	if len(lines) == 0 {
 		return ""
 	}
-	text := spokenSummaryText(lines)
-	if text == "" {
+	last := lines[len(lines)-1].text
+	if last == "" {
 		return ""
 	}
-	return limitSpokenSummary(text)
+	return limitSpokenSummary(ensureSpokenSentence(last))
 }
 
 func spokenSummaryLines(reply string) []spokenSummaryLine {
@@ -812,27 +809,6 @@ func cleanSpokenSummaryLine(line string) spokenSummaryLine {
 	return spokenSummaryLine{text: line, list: isList}
 }
 
-func spokenSummaryText(lines []spokenSummaryLine) string {
-	if len(lines) == 0 {
-		return ""
-	}
-	if len(lines) > 1 && !lines[0].list && lines[1].list {
-		parts := []string{trimSpokenLineEnd(lines[0].text)}
-		for i := 1; i < len(lines) && i <= 2; i++ {
-			if !lines[i].list {
-				break
-			}
-			parts = append(parts, ensureSpokenSentence(lines[i].text))
-		}
-		return strings.Join(parts, " ")
-	}
-	parts := make([]string, 0, len(lines))
-	for _, line := range lines {
-		parts = append(parts, ensureSpokenSentence(line.text))
-	}
-	return strings.Join(parts, " ")
-}
-
 func limitSpokenSummary(text string) string {
 	text = strings.Join(strings.Fields(text), " ")
 	if text == "" {
@@ -858,10 +834,6 @@ func limitSpokenSummary(text string) string {
 		return strings.TrimSpace(string(runes[:lastCut]))
 	}
 	return strings.TrimSpace(string(runes[:spokenSummaryMaxRunes])) + "..."
-}
-
-func trimSpokenLineEnd(s string) string {
-	return strings.TrimRight(strings.TrimSpace(s), "：:")
 }
 
 func ensureSpokenSentence(s string) string {
@@ -2796,6 +2768,20 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		log.Printf("daemon: agent %s hit iteration limit, saving partial result", agentName)
 	}
 
+	// Koe voice projection: pull the model-authored <spoken_summary> line out of
+	// result and strip the tag so it never reaches the agent_reply bus event, the
+	// HTTP reply Koe reads back, or the flat-text fallback persist below. The
+	// normal transcript copy (rebuilt from the loop) is cleaned separately after
+	// the persist block. Non-koe sources: no-op.
+	var koeSpoken string
+	if isKoeSource(req.Source) {
+		var authored bool
+		koeSpoken, result, authored = projectKoeVoice(result)
+		if !authored && strings.TrimSpace(result) != "" {
+			log.Printf("daemon: koe spoken_summary contract miss (source=%s) — mechanical fallback", req.Source)
+		}
+	}
+
 	// Tracks persistence outcome so the return value can blank SessionID on
 	// failure (in addition to the agent_reply gate inside the block below).
 	// Stays nil for ephemeral requests, which is the desired "no failure" state.
@@ -2842,6 +2828,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			sess.MessageMeta = append(sess.MessageMeta,
 				session.MessageMeta{Source: checkpointSource, Timestamp: session.TimePtr(replyTime)},
 			)
+		}
+		// Koe: the normal path rebuilt the transcript from the loop's run messages,
+		// which still carry the head <spoken_summary> tag; strip it from the last
+		// assistant message so Desktop history / FTS / next-turn reload never see
+		// the raw tag. No-op on the flat-text fallback above (already used the
+		// cleaned result).
+		if isKoeSource(req.Source) {
+			stripSpokenSummaryFromLastAssistant(sess.Messages)
 		}
 		applyTurnUsage(sess, turnUsage, turnBase) // idempotent: baseline + current
 		// Persist tool-result budget state. Mid-turn checkpoints (applyTurnState)
@@ -3005,7 +2999,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	return &RunAgentResult{
 		Reply:                result,
-		SpokenSummary:        spokenSummaryForSource(req.Source, result),
+		SpokenSummary:        koeSpoken,
 		ReplyToMessageID:     loop.ReplyCloudMessageID(),
 		PendingAckMessageIDs: loop.PendingAckIDs(),
 		SessionID:            returnedSessionID,

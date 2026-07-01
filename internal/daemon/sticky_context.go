@@ -131,10 +131,7 @@ func buildStickyContext(source, channel, sender, agentName, imBindings string, p
 	if isKoeSource(source) {
 		parts = append(parts, "This run came from the user's live voice conversation with Kocoro. "+
 			"Do normal Kocoro agent work, including tools, files, browser, and multi-step tasks when needed. "+
-			"If the voice request needs exact calculation, current facts, email/messages, files, web, schedules, or any real action, you MUST call at least one relevant tool before your final answer; do not answer those from memory. "+
-			"For exact calculations, verify with bash, Python, or another calculation-capable tool even when the arithmetic looks simple. "+
-			"Make the final reply voice-first: start with a short spoken answer, usually one or two sentences, "+
-			"suitable for Koe to read aloud; put longer details after that only when useful for Desktop session history. "+
+			"If the request needs exact calculation, current facts, email/messages, files, web, schedules, or any real action, you MUST call at least one relevant tool before your final answer; do not answer those from memory, and verify arithmetic with a calculation tool even when it looks simple. "+
 			"Do not narrate voice routing, Source, daemon, backend, or internal delivery.")
 	}
 	if extra != "" {

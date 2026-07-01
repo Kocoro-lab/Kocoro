@@ -5,16 +5,6 @@ import (
 	"testing"
 )
 
-func TestSpokenSummaryForKoeOnly(t *testing.T) {
-	reply := strings.Repeat("This is a long result sentence. ", 20)
-	if got := spokenSummaryForSource("desktop", reply); got != "" {
-		t.Fatalf("desktop spoken summary = %q, want empty", got)
-	}
-	if got := spokenSummaryForSource("koe", reply); got == "" {
-		t.Fatal("koe spoken summary is empty")
-	}
-}
-
 func TestMakeSpokenSummaryKeepsShortReply(t *testing.T) {
 	reply := "Done. I saved the report."
 	if got := makeSpokenSummary(reply); got != reply {
@@ -34,31 +24,31 @@ func TestMakeSpokenSummaryPrefersSentenceBoundary(t *testing.T) {
 }
 
 func TestMakeSpokenSummaryStripsMarkdownAndListNoise(t *testing.T) {
-	reply := "Today I found 3 emails:\n\n" +
+	// Result-last convention: the fallback surfaces the concluding tail line, with
+	// markdown/URL/list noise stripped — never a head progress line.
+	reply := "I checked your inbox:\n\n" +
 		"1. **Acme** — [Receipt](https://example.com/r)\n" +
-		"2. `GitHub` — Build failed https://example.com/build\n" +
-		"3. Promo — Summer sale"
+		"2. `GitHub` — Build failed https://example.com/build\n\n" +
+		"You have **three** new emails."
 
 	got := makeSpokenSummary(reply)
-	for _, bad := range []string{"1.", "**", "`", "https://"} {
+	for _, bad := range []string{"**", "`", "https://", "[Receipt]"} {
 		if strings.Contains(got, bad) {
 			t.Fatalf("summary contains voice-hostile marker %q: %q", bad, got)
 		}
 	}
-	for _, want := range []string{"Today I found 3 emails", "Acme", "GitHub"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("summary missing %q: %q", want, got)
-		}
+	if !strings.Contains(got, "three new emails") {
+		t.Fatalf("summary missing the tail conclusion: %q", got)
 	}
 }
 
 func TestMakeSpokenSummarySkipsCodeBlocks(t *testing.T) {
-	reply := "I saved the report.\n\n```json\n{\"secret\":\"do not read\"}\n```\n\nYou can open it from Desktop."
+	reply := "I saved the report.\n\n```json\n{\"secret\":\"do not read\"}\n```\n\nYou can open it from Kocoro Desktop."
 	got := makeSpokenSummary(reply)
 	if strings.Contains(got, "secret") || strings.Contains(got, "json") {
 		t.Fatalf("summary should skip fenced code blocks, got %q", got)
 	}
-	if !strings.Contains(got, "I saved the report") {
-		t.Fatalf("summary missing spoken lead, got %q", got)
+	if !strings.Contains(got, "open it") {
+		t.Fatalf("summary missing the tail line, got %q", got)
 	}
 }

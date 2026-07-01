@@ -61,7 +61,10 @@ func TestStickyContext_ScheduleAddsOutputDiscipline(t *testing.T) {
 func TestStickyContext_KoeAddsVoiceTurnDiscipline(t *testing.T) {
 	for _, src := range []string{"koe", "koe-reachy"} {
 		got := buildStickyContext(src, "", "", "default", "", nil, "", nil, "")
-		for _, want := range []string{"live voice conversation", "normal Kocoro agent work", "exact calculation", "MUST call at least one relevant tool", "calculation-capable tool", "voice-first", "Koe to read aloud", "Desktop session history"} {
+		// The koe sticky carries behavior discipline (do real work, call a tool for
+		// facts/calc, don't narrate routing). The spoken-output format — the
+		// <spoken_summary> block — moved to prompt.formatGuidance("koe").
+		for _, want := range []string{"live voice conversation", "normal Kocoro agent work", "exact calculation", "MUST call at least one relevant tool", "verify arithmetic", "Do not narrate voice routing"} {
 			if !strings.Contains(got, want) {
 				t.Fatalf("source %q sticky context missing %q; got:\n%s", src, want, got)
 			}
