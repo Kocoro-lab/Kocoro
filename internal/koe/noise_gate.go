@@ -12,7 +12,7 @@ const (
 	// endpoint, so the user had to say a second phrase. OVERRIDE: KOE_MIC_GATE_*.
 	defaultMicGateThreshold       = 0.010
 	defaultMicGateNoiseMultiplier = 2.0
-	defaultMicGateStartMS         = 240
+	defaultMicGateStartMS         = 160
 	defaultMicGateHangoverMS      = 2000
 	defaultMicGateEndpointMS      = 2000
 	micGateHotEvidenceWeight      = 2

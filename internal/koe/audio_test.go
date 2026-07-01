@@ -250,6 +250,34 @@ func TestMicNoiseGateOpensOnBrokenHumanSpeechCadence(t *testing.T) {
 	}
 }
 
+func TestMicNoiseGateRejectsSparseEchoBurstsByDefault(t *testing.T) {
+	g := newMicNoiseGate()
+	echo := make([]int16, audioFrameSize)
+	for i := range echo {
+		echo[i] = 600
+	}
+	quiet := make([]int16, audioFrameSize)
+
+	for cycle := 0; cycle < 10; cycle++ {
+		for i := 0; i < 2; i++ {
+			if out := g.process(echo); len(out) != 1 || !allZeroSamples(out[0]) {
+				t.Fatalf("sparse echo burst cycle %d frame %d should stay muted", cycle, i)
+			}
+		}
+		for i := 0; i < 6; i++ {
+			if out := g.process(quiet); len(out) != 1 || !allZeroSamples(out[0]) {
+				t.Fatalf("quiet gap cycle %d frame %d should stay muted", cycle, i)
+			}
+		}
+	}
+	if got := g.stats.SpeechStarts; got != 0 {
+		t.Fatalf("sparse echo bursts opened the gate %d time(s)", got)
+	}
+	if got, want := g.stats.StartScoreMax, 4; got != want {
+		t.Fatalf("StartScoreMax = %d, want %d", got, want)
+	}
+}
+
 func TestMicNoiseGateDoesNotLearnSpeechAsNoiseFloor(t *testing.T) {
 	g := newMicNoiseGate()
 	softStart := make([]int16, audioFrameSize)
