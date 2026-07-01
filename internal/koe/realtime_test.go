@@ -292,6 +292,40 @@ func TestHandleEventDoesNotUngateBeforeOutputBufferStops(t *testing.T) {
 	waitUntil(t, func() bool { return !audio.dropCapture() }, "output_audio_buffer.stopped did not release the speaking gate")
 }
 
+func TestHandleEventKeepsThinkingWhileAsyncTaskPending(t *testing.T) {
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "1")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, nil, func(any) error { return nil })
+
+	var mu sync.Mutex
+	var states []string
+	h.onVoiceState = func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		states = append(states, s)
+	}
+	lastState := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(states) == 0 {
+			return ""
+		}
+		return states[len(states)-1]
+	}
+
+	h.asyncTaskPending.Store(true)
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done"}`))
+	waitUntil(t, func() bool { return lastState() == "thinking" }, "pending do_task should keep voice state thinking after output release")
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created"}`))
+	if h.asyncTaskPending.Load() {
+		t.Fatal("result response.created should clear async task pending")
+	}
+}
+
 func TestHandleEventReleasesWhenOutputBufferStopIsLate(t *testing.T) {
 	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
 	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "10")

@@ -205,11 +205,13 @@ func TestDispatchControlAppStub(t *testing.T) {
 // someone else, which let the model improvise must-delegate intents like math),
 // and must give a concrete reason to delegate.
 func TestDoTaskDescriptionUsesOneSelfFraming(t *testing.T) {
-	var doTask, switchAgent string
+	var doTask, controlApp, switchAgent string
 	for _, d := range ToolDefs() {
 		switch d.Name {
 		case "do_task":
 			doTask = strings.ToLower(d.Description)
+		case "control_app":
+			controlApp = strings.ToLower(d.Description)
 		case "switch_agent":
 			switchAgent = strings.ToLower(d.Description)
 		}
@@ -222,9 +224,14 @@ func TestDoTaskDescriptionUsesOneSelfFraming(t *testing.T) {
 			t.Errorf("do_task description must not contain %q (contradicts one-self persona)", banned)
 		}
 	}
-	for _, want := range []string{"calculate precisely", "never answer", "own tools", "long or multi-part"} {
+	for _, want := range []string{"calculate precisely", "never answer", "own tools", "long or multi-part", "content/results to show in kocoro desktop"} {
 		if !strings.Contains(doTask, want) {
 			t.Errorf("do_task description missing %q", want)
+		}
+	}
+	for _, want := range []string{"never use this to display", "use do_task for content/results"} {
+		if !strings.Contains(controlApp, want) {
+			t.Errorf("control_app description missing %q", want)
 		}
 	}
 	if strings.Contains(switchAgent, "back-brain") {

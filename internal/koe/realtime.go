@@ -54,6 +54,9 @@ type eventHandler struct {
 	// release the echo gate while speaker tail is still audible.
 	outputBufferActive atomic.Bool
 	speakingEpoch      atomic.Int64
+	// asyncTaskPending keeps Desktop/--once in "thinking" after the model's short
+	// spoken ack while do_task is still running or its result speech is queued.
+	asyncTaskPending atomic.Bool
 	// Serialized response.create (runResponseSender), adapted from kocoro-reachy's
 	// _response_sender_loop to Go/WebRTC: do_task results and fast-tool outputs still
 	// need a MANUAL response.create, and GA rejects one sent while a response is
@@ -111,8 +114,15 @@ func (h *eventHandler) releaseSpeakingAfter(delay time.Duration) {
 			h.audio.SetSpeaking(false)
 			h.audio.SetPlaybackEnabled(false)
 		}
-		h.emitVoiceState("listening")
+		h.emitVoiceState(h.voiceStateAfterSpeaking())
 	}()
+}
+
+func (h *eventHandler) voiceStateAfterSpeaking() string {
+	if h.asyncTaskPending.Load() {
+		return "thinking"
+	}
+	return "listening"
 }
 
 func (h *eventHandler) releaseSpeakingTail() {
@@ -135,7 +145,7 @@ func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 			h.audio.SetSpeaking(false)
 			h.audio.SetPlaybackEnabled(false)
 		}
-		h.emitVoiceState("listening")
+		h.emitVoiceState(h.voiceStateAfterSpeaking())
 	}()
 }
 
@@ -436,13 +446,14 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	case "conversation.item.input_audio_transcription.failed":
 		// Treat failed ASR like unclear audio. Do not guess.
 		h.emitVoiceState("listening")
-	case "response.created":
-		h.responseCreatedAt = time.Now()
-		if eventLogEnabled() {
-			log.Printf("koe[timing]: response_created after_speech_stop_ms=%d", elapsedMS(h.speechStoppedAt, h.responseCreatedAt))
-		}
-		// A response is now generating — the serialized sender waits for its
-		// response.done before sending the next response.create. Gate capture
+		case "response.created":
+			h.responseCreatedAt = time.Now()
+			if eventLogEnabled() {
+				log.Printf("koe[timing]: response_created after_speech_stop_ms=%d", elapsedMS(h.speechStoppedAt, h.responseCreatedAt))
+			}
+			h.asyncTaskPending.Store(false)
+			// A response is now generating — the serialized sender waits for its
+			// response.done before sending the next response.create. Gate capture
 		// immediately, not only once output_audio_buffer.started arrives: otherwise
 		// slow tail audio / room noise in the response-created→first-audio gap can
 		// become the next user turn.
@@ -568,6 +579,7 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 		// single function_call_output for this call_id, then voice it (mirroring
 		// reachy's BackgroundToolManager). ctx is Connect's, cancelled on Ctrl-C.
 		h.state.SetInFlightForAgent(req.Text, req.Agent)
+		h.asyncTaskPending.Store(true)
 		h.emitVoiceState("thinking") // delegating; the model's call-turn ack already played
 		go func() {
 			started := time.Now()
@@ -589,6 +601,9 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 			}
 			if r.Status != "injected" && r.Say != "" {
 				h.requestResponseForSpeech(r.Say) // voice the result (skip when the daemon already replied)
+			} else {
+				h.asyncTaskPending.Store(false)
+				h.emitVoiceState("listening")
 			}
 		}()
 		return

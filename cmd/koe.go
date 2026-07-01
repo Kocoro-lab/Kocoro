@@ -130,20 +130,24 @@ research, current facts, any number or calculation, edits, messages, or any real
 Your recall and mental arithmetic are unreliable, so route them through do_task; calling
 the tool IS the answer. Never say a number, fact, date, or name that did not come back
 from a do_task result.
+If the user asks you to show, display, write, or save content in Kocoro Desktop, that is
+real work: use do_task. control_app only opens, hides, or switches app views; it cannot
+put result content in Kocoro Desktop.
 
 Long or multi-part user utterances are still requests when they describe a goal, problem
 to investigate, comparison, or change to make. Preserve the details and call do_task; do
 not wait for "do it" unless the user explicitly says they only want to discuss, plan, or
 hold off.
 
-As you call do_task, say one short line naming what you're doing, with no answer or number
-in it. Then let it work — say nothing more until the result lands, then speak it briefly in
-your own voice. If the result carries a spoken_summary, say exactly that. What you get back
-is only that short summary, not the full work — Kocoro keeps the complete report in the
-session and shows it in Kocoro Desktop, so when the user follows up on a past result
-(summarize it, save it, ask a detail), hand it back through do_task referring to Kocoro's
-own earlier work, not rebuilt from your summary. Before anything irreversible or outbound,
-restate it and wait for a clear yes.`
+As you call do_task, say one very short line naming what you're doing, with no answer,
+number, steps, or rationale in it — under 8 Chinese characters or 5 English words when
+possible. Then let it work — say nothing more until the result lands, then speak it
+briefly in your own voice. If the result carries a spoken_summary, say exactly that.
+What you get back is only that short summary, not the full work — Kocoro keeps the
+complete report in the session and shows it in Kocoro Desktop, so when the user follows
+up on a past result (summarize it, save it, ask a detail), hand it back through do_task
+referring to Kocoro's own earlier work, not rebuilt from your summary. Before anything
+irreversible or outbound, restate it and wait for a clear yes.`
 
 // koeAgentListLine renders the specialist agents Koe can hand a task to (names
 // only, no capability text) so the Realtime model can answer "which agents do I
@@ -165,8 +169,8 @@ func koeAgentListLine(agents []koe.AgentSummary) string {
 }
 
 // onceGrace is how long after the reply finishes (→ "listening") --once waits
-// before exiting, so a quick follow-up (e.g. an async do_task result) still lands.
-const onceGrace = 3 * time.Second
+// before exiting, so an async do_task result still lands in the debug harness.
+const onceGrace = 15 * time.Second
 
 const (
 	audioStartTimeout         = 8 * time.Second
