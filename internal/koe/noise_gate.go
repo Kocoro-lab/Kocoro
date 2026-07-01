@@ -15,17 +15,19 @@ const (
 	defaultMicGateStartMS         = 240
 	defaultMicGateHangoverMS      = 2000
 	defaultMicGateEndpointMS      = 2000
+	micGateHotEvidenceWeight      = 2
 	micGateNoiseAlpha             = 0.04
 )
 
 type micGateStats struct {
-	PassedFrames uint64
-	MutedFrames  uint64
-	SpeechStarts uint64
-	MaxLevel     float64
-	NoiseFloor   float64
-	HotFramesMax int
-	StartFrames  int
+	PassedFrames  uint64
+	MutedFrames   uint64
+	SpeechStarts  uint64
+	MaxLevel      float64
+	NoiseFloor    float64
+	HotFramesMax  int
+	StartScoreMax int
+	StartFrames   int
 }
 
 type micNoiseGate struct {
@@ -40,6 +42,7 @@ type micNoiseGate struct {
 	noiseFloor float64
 	maxLevel   float64
 	hotFrames  int
+	startScore int
 	hangover   int
 	endpoint   int
 	open       bool
@@ -100,22 +103,38 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 		}
 	}
 
+	// Real speech often has low-energy consonant gaps; score evidence lets those
+	// gaps decay gradually instead of resetting the start window to zero.
 	if hot {
 		g.endpoint = 0
 		g.hotFrames++
+		g.startScore += micGateHotEvidenceWeight
+		if g.startScore > g.startFrames {
+			g.startScore = g.startFrames
+		}
 		if g.hotFrames > g.stats.HotFramesMax {
 			g.stats.HotFramesMax = g.hotFrames
 		}
+	} else {
+		g.hotFrames = 0
+		if g.startScore > 0 {
+			g.startScore--
+		}
+		if g.startScore == 0 {
+			g.pending = g.pending[:0]
+		}
+		g.updateNoiseFloorIfAmbient(level)
+	}
+	if g.startScore > g.stats.StartScoreMax {
+		g.stats.StartScoreMax = g.startScore
+	}
+	if g.startScore > 0 {
 		g.pending = append(g.pending, append([]int16(nil), frame...))
 		if len(g.pending) > g.startFrames {
 			g.pending = g.pending[len(g.pending)-g.startFrames:]
 		}
-	} else {
-		g.hotFrames = 0
-		g.pending = g.pending[:0]
-		g.updateNoiseFloorIfAmbient(level)
 	}
-	if g.hotFrames >= g.startFrames {
+	if g.startScore >= g.startFrames {
 		g.open = true
 		g.hangover = g.hangoverFrames
 		g.stats.SpeechStarts++
@@ -135,6 +154,7 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 
 func (g *micNoiseGate) resetState() {
 	g.hotFrames = 0
+	g.startScore = 0
 	g.hangover = 0
 	g.endpoint = 0
 	g.open = false

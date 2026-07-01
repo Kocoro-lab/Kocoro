@@ -195,7 +195,8 @@ func TestMicNoiseGateRejectsShortNoiseBurstByDefault(t *testing.T) {
 		burst[i] = 1800
 	}
 
-	for i := 0; i < msToAudioFrames(defaultMicGateStartMS)-1; i++ {
+	required := requiredMicGateHotEvidenceFrames(msToAudioFrames(defaultMicGateStartMS))
+	for i := 0; i < required-1; i++ {
 		if out := g.process(burst); len(out) != 1 || !allZeroSamples(out[0]) {
 			t.Fatalf("short noise burst frame %d should produce only digital silence before sustained gate start", i)
 		}
@@ -203,13 +204,13 @@ func TestMicNoiseGateRejectsShortNoiseBurstByDefault(t *testing.T) {
 	if got := g.stats.SpeechStarts; got != 0 {
 		t.Fatalf("short noise burst opened the gate %d time(s)", got)
 	}
-	if out := g.process(burst); len(out) != msToAudioFrames(defaultMicGateStartMS) || !sameSamples(out[0], burst) {
+	if out := g.process(burst); len(out) != required || !sameSamples(out[0], burst) {
 		t.Fatalf("sustained speech should pass with pre-roll once the default start window is satisfied, got %d frame(s)", len(out))
 	}
 }
 
 func TestMicNoiseGateTracksHotStreakForDiagnostics(t *testing.T) {
-	t.Setenv("KOE_MIC_GATE_START_MS", "100")
+	t.Setenv("KOE_MIC_GATE_START_MS", "500")
 	g := newMicNoiseGate()
 	burst := make([]int16, audioFrameSize)
 	for i := range burst {
@@ -221,6 +222,31 @@ func TestMicNoiseGateTracksHotStreakForDiagnostics(t *testing.T) {
 	}
 	if got, want := g.stats.HotFramesMax, msToAudioFrames(100)-1; got != want {
 		t.Fatalf("HotFramesMax = %d, want %d", got, want)
+	}
+}
+
+func TestMicNoiseGateOpensOnBrokenHumanSpeechCadence(t *testing.T) {
+	g := newMicNoiseGate()
+	speech := make([]int16, audioFrameSize)
+	for i := range speech {
+		speech[i] = 1800
+	}
+	quiet := make([]int16, audioFrameSize)
+
+	for cycle := 0; cycle < 4 && g.stats.SpeechStarts == 0; cycle++ {
+		for i := 0; i < 3 && g.stats.SpeechStarts == 0; i++ {
+			_ = g.process(speech)
+		}
+		if g.stats.SpeechStarts == 0 {
+			_ = g.process(quiet)
+		}
+	}
+	if got := g.stats.SpeechStarts; got != 1 {
+		t.Fatalf("broken but repeated speech evidence opened %d time(s), want 1; hot max=%d score max=%d",
+			got, g.stats.HotFramesMax, g.stats.StartScoreMax)
+	}
+	if got := g.stats.HotFramesMax; got > 3 {
+		t.Fatalf("test cadence unexpectedly had %d consecutive hot frames", got)
 	}
 }
 
@@ -238,7 +264,8 @@ func TestMicNoiseGateDoesNotLearnSpeechAsNoiseFloor(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		_ = g.process(softStart)
 	}
-	for i := 0; i < msToAudioFrames(defaultMicGateStartMS)-1; i++ {
+	required := requiredMicGateHotEvidenceFrames(msToAudioFrames(defaultMicGateStartMS))
+	for i := 0; i < required-1; i++ {
 		if out := g.process(speech); len(out) != 1 || !allZeroSamples(out[0]) {
 			t.Fatalf("speech frame %d should produce only digital silence before sustained start window", i)
 		}
@@ -252,7 +279,7 @@ func TestMicNoiseGateDoesNotLearnSpeechAsNoiseFloor(t *testing.T) {
 }
 
 func TestMicNoiseGateRequiresSustainedSpeechAndHangover(t *testing.T) {
-	t.Setenv("KOE_MIC_GATE_START_MS", "60")
+	t.Setenv("KOE_MIC_GATE_START_MS", "100")
 	t.Setenv("KOE_MIC_GATE_HANGOVER_MS", "60")
 	t.Setenv("KOE_MIC_GATE_ENDPOINT_MS", "60")
 	g := newMicNoiseGate()
@@ -293,7 +320,7 @@ func TestMicNoiseGateRequiresSustainedSpeechAndHangover(t *testing.T) {
 }
 
 func TestMicNoiseGateResetStateDropsPendingPreroll(t *testing.T) {
-	t.Setenv("KOE_MIC_GATE_START_MS", "60")
+	t.Setenv("KOE_MIC_GATE_START_MS", "100")
 	g := newMicNoiseGate()
 	loud := make([]int16, audioFrameSize)
 	for i := range loud {
@@ -312,6 +339,10 @@ func TestMicNoiseGateResetStateDropsPendingPreroll(t *testing.T) {
 	if len(g.pending) != 1 {
 		t.Fatalf("pending after reset + one hot frame = %d, want 1", len(g.pending))
 	}
+}
+
+func requiredMicGateHotEvidenceFrames(startFrames int) int {
+	return (startFrames + micGateHotEvidenceWeight - 1) / micGateHotEvidenceWeight
 }
 
 func onlyFrame(frames [][]int16) []int16 {
