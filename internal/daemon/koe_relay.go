@@ -45,41 +45,6 @@ func (s *Server) handleKoeRealtimeMint(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(raw)
 }
 
-// handleKoeAudition synthesizes a short TTS sample of a voice so Settings can
-// preview it ("listen to this voice"). Mirrors handleKoeRealtimeMint: the daemon
-// holds no OpenAI key, so it relays through the Cloud gateway (which pins the TTS
-// model and resolves the user from X-API-Key). The audio bytes are streamed back
-// to the Desktop verbatim with their Content-Type. Unlike the realtime path, this
-// is a one-shot TTS clip, not a live session — the previewed timbre is close to
-// but not identical to the realtime voice (separate OpenAI model).
-func (s *Server) handleKoeAudition(w http.ResponseWriter, r *http.Request) {
-	gw := s.cloudGateway()
-	if gw == nil {
-		writeError(w, http.StatusServiceUnavailable, "cloud not configured (sign in, or set cloud.enabled + api_key)")
-		return
-	}
-	var req struct {
-		Voice string `json:"voice"`
-		Text  string `json:"text"`
-	}
-	// Both optional — the gateway/llm-service defaults the sample line and rejects
-	// a voice outside its allowlist.
-	_ = json.NewDecoder(r.Body).Decode(&req)
-
-	audio, contentType, err := gw.SynthesizeSpeech(r.Context(), req.Voice, req.Text)
-	if err != nil {
-		var apiErr *client.APIError
-		if errors.As(err, &apiErr) {
-			writeError(w, apiErr.StatusCode, "audition failed: "+apiErr.Body)
-			return
-		}
-		writeError(w, http.StatusBadGateway, "audition relay failed: "+err.Error())
-		return
-	}
-	w.Header().Set("Content-Type", contentType)
-	_, _ = w.Write(audio)
-}
-
 // handleKoeRealtimeUsage relays Koe's realtime usage report (from a response.done
 // event: model, response_id, token details) to the Cloud usage-ingest endpoint
 // via the daemon's API key. Koe never holds a credential and never sees pricing —

@@ -1098,51 +1098,6 @@ func (c *GatewayClient) MintRealtime(ctx context.Context, model, voice string) (
 	return json.RawMessage(raw), nil
 }
 
-// SynthesizeSpeech generates a short TTS audition clip for `voice` via the Cloud
-// gateway (which holds the OpenAI key and pins the TTS model server-side). Mirrors
-// MintRealtime's auth (X-API-Key resolves user/tenant); returns the raw audio bytes
-// and their Content-Type so the daemon can stream them to the Desktop preview
-// player. model/text are optional — the gateway defaults the TTS model and the
-// sample sentence. voice empty lets the gateway use its own default.
-func (c *GatewayClient) SynthesizeSpeech(ctx context.Context, voice, text string) ([]byte, string, error) {
-	reqBody := map[string]any{}
-	if voice != "" {
-		reqBody["voice"] = voice
-	}
-	if text != "" {
-		reqBody["text"] = text
-	}
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, "", fmt.Errorf("marshal request: %w", err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/audio/speech", bytes.NewReader(body))
-	if err != nil {
-		return nil, "", fmt.Errorf("create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if key := c.getAPIKey(); key != "" {
-		httpReq.Header.Set("X-API-Key", key)
-	}
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("read response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", &APIError{StatusCode: resp.StatusCode, Body: string(raw)}
-	}
-	contentType := resp.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "audio/mpeg"
-	}
-	return raw, contentType, nil
-}
-
 // SendRealtimeUsage forwards a realtime usage report (from a `response.done`
 // event: model, response_id, token details) to the Cloud usage-ingest endpoint,
 // which computes the cost server-side and debits quota. The daemon relays Koe's
