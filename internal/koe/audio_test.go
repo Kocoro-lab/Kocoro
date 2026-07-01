@@ -208,6 +208,22 @@ func TestMicNoiseGateRejectsShortNoiseBurstByDefault(t *testing.T) {
 	}
 }
 
+func TestMicNoiseGateTracksHotStreakForDiagnostics(t *testing.T) {
+	t.Setenv("KOE_MIC_GATE_START_MS", "100")
+	g := newMicNoiseGate()
+	burst := make([]int16, audioFrameSize)
+	for i := range burst {
+		burst[i] = 1800
+	}
+
+	for i := 0; i < msToAudioFrames(100)-1; i++ {
+		_ = g.process(burst)
+	}
+	if got, want := g.stats.HotFramesMax, msToAudioFrames(100)-1; got != want {
+		t.Fatalf("HotFramesMax = %d, want %d", got, want)
+	}
+}
+
 func TestMicNoiseGateDoesNotLearnSpeechAsNoiseFloor(t *testing.T) {
 	g := newMicNoiseGate()
 	softStart := make([]int16, audioFrameSize)

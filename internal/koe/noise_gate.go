@@ -24,6 +24,8 @@ type micGateStats struct {
 	SpeechStarts uint64
 	MaxLevel     float64
 	NoiseFloor   float64
+	HotFramesMax int
+	StartFrames  int
 }
 
 type micNoiseGate struct {
@@ -101,6 +103,9 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 	if hot {
 		g.endpoint = 0
 		g.hotFrames++
+		if g.hotFrames > g.stats.HotFramesMax {
+			g.stats.HotFramesMax = g.hotFrames
+		}
 		g.pending = append(g.pending, append([]int16(nil), frame...))
 		if len(g.pending) > g.startFrames {
 			g.pending = g.pending[len(g.pending)-g.startFrames:]
@@ -160,5 +165,6 @@ func (g *micNoiseGate) logStats() {
 	}
 	g.stats.MaxLevel = g.maxLevel
 	g.stats.NoiseFloor = g.noiseFloor
+	g.stats.StartFrames = g.startFrames
 	log.Printf("koe[audio]: mic gate stats: %+v", g.stats)
 }
