@@ -357,7 +357,7 @@ func outcomeKindLog(kind OutcomeKind) string {
 // barge-in experiments. Far-field noise reduction is enabled by default for the
 // laptop speaker/mic case; set KOE_NOISE_REDUCTION=off to compare raw input.
 func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
-	vadThreshold := koeEnvFloat("KOE_VAD_THRESHOLD", 0.70)
+	vadThreshold := koeEnvFloat("KOE_VAD_THRESHOLD", 0.50)
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", 900)
 	interruptResponse := false
 	if fullDuplexAEC {

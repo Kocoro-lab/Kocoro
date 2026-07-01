@@ -180,8 +180,8 @@ func TestMicNoiseGateDropsQuietFrames(t *testing.T) {
 	}
 
 	out := g.process(quiet)
-	if len(out) != 0 {
-		t.Fatal("quiet background should not be sent to OpenAI")
+	if len(out) != 1 || !allZeroSamples(out[0]) {
+		t.Fatal("quiet background should be replaced with digital silence for server VAD")
 	}
 	if got := g.stats.MutedFrames; got != 1 {
 		t.Fatalf("muted frames = %d, want 1", got)
@@ -196,8 +196,8 @@ func TestMicNoiseGateRejectsShortNoiseBurstByDefault(t *testing.T) {
 	}
 
 	for i := 0; i < msToAudioFrames(defaultMicGateStartMS)-1; i++ {
-		if out := g.process(burst); len(out) != 0 {
-			t.Fatalf("short noise burst frame %d passed before sustained gate start", i)
+		if out := g.process(burst); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("short noise burst frame %d should produce only digital silence before sustained gate start", i)
 		}
 	}
 	if got := g.stats.SpeechStarts; got != 0 {
@@ -212,7 +212,7 @@ func TestMicNoiseGateDoesNotLearnSpeechAsNoiseFloor(t *testing.T) {
 	g := newMicNoiseGate()
 	softStart := make([]int16, audioFrameSize)
 	for i := range softStart {
-		softStart[i] = 700
+		softStart[i] = 150
 	}
 	speech := make([]int16, audioFrameSize)
 	for i := range speech {
@@ -223,8 +223,8 @@ func TestMicNoiseGateDoesNotLearnSpeechAsNoiseFloor(t *testing.T) {
 		_ = g.process(softStart)
 	}
 	for i := 0; i < msToAudioFrames(defaultMicGateStartMS)-1; i++ {
-		if out := g.process(speech); len(out) != 0 {
-			t.Fatalf("speech frame %d passed before sustained start window", i)
+		if out := g.process(speech); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("speech frame %d should produce only digital silence before sustained start window", i)
 		}
 	}
 	if out := g.process(speech); len(out) == 0 {
@@ -247,8 +247,8 @@ func TestMicNoiseGateRequiresSustainedSpeechAndHangover(t *testing.T) {
 	quiet := make([]int16, audioFrameSize)
 
 	for i := 0; i < 2; i++ {
-		if out := g.process(loud); len(out) != 0 {
-			t.Fatalf("speech frame %d passed before sustained start", i)
+		if out := g.process(loud); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("speech frame %d should produce only digital silence before sustained start", i)
 		}
 	}
 	if out := g.process(loud); len(out) != 3 || !sameSamples(out[0], loud) || !sameSamples(out[2], loud) {
@@ -268,8 +268,8 @@ func TestMicNoiseGateRequiresSustainedSpeechAndHangover(t *testing.T) {
 			t.Fatalf("endpoint silence frame %d missing", i)
 		}
 	}
-	if out := g.process(quiet); len(out) != 0 {
-		t.Fatal("gate should stop sending audio after endpoint silence")
+	if out := g.process(quiet); len(out) != 1 || !allZeroSamples(out[0]) {
+		t.Fatal("gate should keep server-VAD silence flowing after endpoint silence")
 	}
 	if got := g.stats.SpeechStarts; got != 1 {
 		t.Fatalf("speech starts = %d, want 1", got)
@@ -285,12 +285,12 @@ func TestMicNoiseGateResetStateDropsPendingPreroll(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		if out := g.process(loud); len(out) != 0 {
-			t.Fatalf("speech frame %d passed before sustained start", i)
+		if out := g.process(loud); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("speech frame %d should produce only digital silence before sustained start", i)
 		}
 	}
 	g.resetState()
-	if out := g.process(loud); len(out) != 0 {
+	if out := g.process(loud); len(out) != 1 || !allZeroSamples(out[0]) {
 		t.Fatal("reset gate should require a fresh sustained start")
 	}
 	if len(g.pending) != 1 {
@@ -318,6 +318,18 @@ func sameSamples(a, b []int16) bool {
 	}
 	for i := range a {
 		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func allZeroSamples(a []int16) bool {
+	if len(a) == 0 {
+		return false
+	}
+	for _, v := range a {
+		if v != 0 {
 			return false
 		}
 	}

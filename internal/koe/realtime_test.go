@@ -401,7 +401,7 @@ func TestSessionConfigUsesHalfDuplexSpeakerSafeVADByDefault(t *testing.T) {
 		`"transcription":{"model":"gpt-4o-mini-transcribe"}`,
 		`"turn_detection"`,
 		`"type":"server_vad"`,
-		`"threshold":0.7`,
+		`"threshold":0.5`,
 		`"silence_duration_ms":900`,
 		`"create_response":true`,
 		`"interrupt_response":false`,
@@ -443,7 +443,7 @@ func TestSessionConfigKeepsInterruptDisabledForVPIOByDefault(t *testing.T) {
 		`"create_response":true`,
 		`"interrupt_response":false`,
 		`"type":"server_vad"`,
-		`"threshold":0.7`,
+		`"threshold":0.5`,
 		`"silence_duration_ms":900`,
 		`"noise_reduction":{"type":"far_field"}`,
 	} {
