@@ -45,14 +45,16 @@ type ControlServer struct {
 	subscribers map[chan controlEvent]struct{}
 	onStart     func(StartCallRequest) // Desktop pressed talk: start a call
 	onEnd       func()                 // Desktop ended: tear the call down
+	onInterrupt func()                 // Desktop explicitly interrupted playback
 }
 
 // NewControlServer wires the Desktop-driven start/end callbacks (either may be nil).
-func NewControlServer(onStart func(StartCallRequest), onEnd func()) *ControlServer {
+func NewControlServer(onStart func(StartCallRequest), onEnd func(), onInterrupt func()) *ControlServer {
 	return &ControlServer{
 		subscribers: make(map[chan controlEvent]struct{}),
 		onStart:     onStart,
 		onEnd:       onEnd,
+		onInterrupt: onInterrupt,
 	}
 }
 
@@ -73,6 +75,12 @@ func (s *ControlServer) Handler() http.Handler {
 	mux.HandleFunc("POST /call/end", func(w http.ResponseWriter, r *http.Request) {
 		if s.onEnd != nil {
 			s.onEnd()
+		}
+		writeControlOK(w)
+	})
+	mux.HandleFunc("POST /call/interrupt", func(w http.ResponseWriter, r *http.Request) {
+		if s.onInterrupt != nil {
+			s.onInterrupt()
 		}
 		writeControlOK(w)
 	})

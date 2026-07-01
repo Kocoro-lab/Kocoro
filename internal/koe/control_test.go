@@ -18,8 +18,12 @@ func (s *ControlServer) subscriberCount() int {
 }
 
 func TestControlServerStartEnd(t *testing.T) {
-	var started, ended bool
-	s := NewControlServer(func(StartCallRequest) { started = true }, func() { ended = true })
+	var started, ended, interrupted bool
+	s := NewControlServer(
+		func(StartCallRequest) { started = true },
+		func() { ended = true },
+		func() { interrupted = true },
+	)
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
@@ -44,11 +48,20 @@ func TestControlServerStartEnd(t *testing.T) {
 	if !ended {
 		t.Error("POST /call/end did not invoke onEnd")
 	}
+
+	resp3, err := http.Post(srv.URL+"/call/interrupt", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST /call/interrupt: %v", err)
+	}
+	resp3.Body.Close()
+	if !interrupted {
+		t.Error("POST /call/interrupt did not invoke onInterrupt")
+	}
 }
 
 func TestControlServerStartCarriesContext(t *testing.T) {
 	got := make(chan StartCallRequest, 1)
-	s := NewControlServer(func(req StartCallRequest) { got <- req }, nil)
+	s := NewControlServer(func(req StartCallRequest) { got <- req }, nil, nil)
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
@@ -69,7 +82,7 @@ func TestControlServerStartCarriesContext(t *testing.T) {
 }
 
 func TestControlServerSSEDelivers(t *testing.T) {
-	s := NewControlServer(nil, nil)
+	s := NewControlServer(nil, nil, nil)
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 

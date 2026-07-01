@@ -42,6 +42,17 @@ func (c *captureSender) countType(typ string) int {
 	return n
 }
 
+func (c *captureSender) types() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.sent))
+	for _, m := range c.sent {
+		typ, _ := m["type"].(string)
+		out = append(out, typ)
+	}
+	return out
+}
+
 // sentContains reports whether any captured frame's JSON contains sub.
 func (c *captureSender) sentContains(sub string) bool {
 	c.mu.Lock()
@@ -290,6 +301,52 @@ func TestHandleEventDoesNotUngateBeforeOutputBufferStops(t *testing.T) {
 	}
 	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.stopped"}`))
 	waitUntil(t, func() bool { return !audio.dropCapture() }, "output_audio_buffer.stopped did not release the speaking gate")
+}
+
+func TestInterruptOutputStopsPlaybackAndClearsRealtimeBuffers(t *testing.T) {
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, audio, cap.send)
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	audio.Play(make([]int16, audioFrameSize))
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.interruptOutput()
+
+	if audio.dropCapture() {
+		t.Fatal("interruptOutput must reopen local capture immediately")
+	}
+	if got := len(audio.playBuf); got != 0 {
+		t.Fatalf("interruptOutput must drain local playback queue, got %d frame(s)", got)
+	}
+	if h.respBusy.Load() || h.outputBufferActive.Load() {
+		t.Fatal("interruptOutput must clear local response/output state")
+	}
+	want := []string{"input_audio_buffer.clear", "response.cancel", "output_audio_buffer.clear"}
+	if got := cap.types(); !equalStringSlices(got, want) {
+		t.Fatalf("sent event types = %v, want %v", got, want)
+	}
+}
+
+func TestInterruptOutputWhenIdleOnlyClearsInput(t *testing.T) {
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+
+	h.interruptOutput()
+
+	want := []string{"input_audio_buffer.clear"}
+	if got := cap.types(); !equalStringSlices(got, want) {
+		t.Fatalf("sent event types = %v, want %v", got, want)
+	}
 }
 
 func TestHandleEventKeepsThinkingWhileAsyncTaskPending(t *testing.T) {
@@ -599,4 +656,16 @@ func waitUntil(t *testing.T, cond func() bool, msg string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal(msg)
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

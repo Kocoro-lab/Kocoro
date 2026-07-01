@@ -56,10 +56,11 @@ func mintEphemeralAt(ctx context.Context, url, apiKey, model string) (string, er
 
 // RealtimeConn is one connected WebRTC session to OpenAI Realtime.
 type RealtimeConn struct {
-	pc        *webrtc.PeerConnection
-	sendTrack *webrtc.TrackLocalStaticSample
-	dc        *webrtc.DataChannel
-	audio     *AudioIO
+	pc              *webrtc.PeerConnection
+	sendTrack       *webrtc.TrackLocalStaticSample
+	dc              *webrtc.DataChannel
+	audio           *AudioIO
+	interruptOutput func()
 	// callActive (nil-safe) gates mic capture: when set and it returns false, the
 	// send pump drops mic audio so Koe is NOT listening (Desktop press-to-talk —
 	// a call must be started via the control channel). nil = always send (the
@@ -187,6 +188,17 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 // Close tears down the peer connection.
 func (rc *RealtimeConn) Close() { _ = rc.pc.Close() }
 
+// InterruptOutput stops any local assistant playback and asks Realtime to cancel
+// the active response / clear buffered output. It is an explicit user action, not
+// automatic barge-in.
+func (rc *RealtimeConn) InterruptOutput() bool {
+	if rc == nil || rc.interruptOutput == nil {
+		return false
+	}
+	rc.interruptOutput()
+	return true
+}
+
 // MintEphemeral is the exported dev-key mint (C-minimal). The deferred daemon mint relay swaps the body
 // for a via-daemon call; the signature stays so cmd/koe.go is unchanged.
 // DEV-KEY: replaced by the deferred daemon mint relay (→ Plan D Cloud mint).
@@ -238,6 +250,7 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
 	h.fullDuplexAEC = opts.FullDuplexAEC
+	rc.interruptOutput = h.interruptOutput
 	rc.callActive = opts.CallActive
 	var closedOnce sync.Once
 	notifyClosed := func(err error) {

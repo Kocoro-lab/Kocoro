@@ -855,7 +855,18 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		stopSessionResources(conn, cancel, audio)
 	}
 
-	ctrl = koe.NewControlServer(startCall, endCall)
+	interruptCall := func() {
+		sessMu.Lock()
+		if !callActive || curConn == nil {
+			sessMu.Unlock()
+			return
+		}
+		conn := curConn
+		sessMu.Unlock()
+		conn.InterruptOutput()
+	}
+
+	ctrl = koe.NewControlServer(startCall, endCall, interruptCall)
 	go func() {
 		addr := "127.0.0.1:" + cfg.controlPort
 		if err := http.ListenAndServe(addr, ctrl.Handler()); err != nil {

@@ -149,6 +149,29 @@ func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 	}()
 }
 
+func (h *eventHandler) interruptOutput() {
+	hadResponse := h.respBusy.Load()
+	hadOutput := h.outputBufferActive.Load()
+	if h.audio != nil && h.audio.dropCapture() {
+		hadOutput = true
+	}
+	h.speakingEpoch.Add(1)
+	h.outputBufferActive.Store(false)
+	h.respBusy.Store(false)
+	if h.audio != nil {
+		h.audio.SetSpeaking(false)
+		h.audio.SetPlaybackEnabled(false)
+	}
+	_ = h.sendFn(map[string]any{"type": "input_audio_buffer.clear"})
+	if hadResponse {
+		_ = h.sendFn(map[string]any{"type": "response.cancel"})
+	}
+	if hadOutput {
+		_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
+	}
+	h.emitVoiceState(h.voiceStateAfterSpeaking())
+}
+
 // reportUsage extracts response_id + usage from a response.done event and fires
 // the billing relay (fire-and-forget; a usage failure must not break the call).
 func (h *eventHandler) reportUsage(raw []byte) {
@@ -446,14 +469,14 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	case "conversation.item.input_audio_transcription.failed":
 		// Treat failed ASR like unclear audio. Do not guess.
 		h.emitVoiceState("listening")
-		case "response.created":
-			h.responseCreatedAt = time.Now()
-			if eventLogEnabled() {
-				log.Printf("koe[timing]: response_created after_speech_stop_ms=%d", elapsedMS(h.speechStoppedAt, h.responseCreatedAt))
-			}
-			h.asyncTaskPending.Store(false)
-			// A response is now generating — the serialized sender waits for its
-			// response.done before sending the next response.create. Gate capture
+	case "response.created":
+		h.responseCreatedAt = time.Now()
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: response_created after_speech_stop_ms=%d", elapsedMS(h.speechStoppedAt, h.responseCreatedAt))
+		}
+		h.asyncTaskPending.Store(false)
+		// A response is now generating — the serialized sender waits for its
+		// response.done before sending the next response.create. Gate capture
 		// immediately, not only once output_audio_buffer.started arrives: otherwise
 		// slow tail audio / room noise in the response-created→first-audio gap can
 		// become the next user turn.

@@ -56,7 +56,7 @@ func TestAudioLevelAccessors(t *testing.T) {
 // TestEmitVoiceLevelSSE pins the D3w wire shape: voice_state carries an additive
 // `level` field. The Desktop sprite decoder mirrors this.
 func TestEmitVoiceLevelSSE(t *testing.T) {
-	s := NewControlServer(nil, nil)
+	s := NewControlServer(nil, nil, nil)
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
