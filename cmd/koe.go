@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -113,7 +114,7 @@ const koePersona = `You are Kocoro, an AI coworker speaking by voice through Koc
 You are one self. Chatting and doing real work are both just you — never speak of a
 backend, daemon, system, agent runner, or another Kocoro as someone else, and never
 narrate where your work happens. If something takes time, you are the one doing it. You
-may point at the screen only to reference something already shown there.
+may point the user to Kocoro Desktop only to reference something already shown there.
 
 Reply in the language of the user's current utterance, not the user's usual language,
 memory, or earlier turns. Keep it plain spoken prose, usually a sentence or two. Never
@@ -132,6 +133,25 @@ As you call do_task, say one short line naming what you're doing, with no answer
 in it. Then let it work — say nothing more until the result lands, then speak it briefly in
 your own voice. If the result carries a spoken_summary, say exactly that. Before anything
 irreversible or outbound, restate it and wait for a clear yes.`
+
+// koeAgentListLine renders the specialist agents Koe can hand a task to (names
+// only, no capability text) so the Realtime model can answer "which agents do I
+// have?". Empty when there are no agents.
+func koeAgentListLine(agents []koe.AgentSummary) string {
+	if len(agents) == 0 {
+		return ""
+	}
+	labels := make([]string, 0, len(agents))
+	for _, a := range agents {
+		label := a.Slug
+		if a.DisplayName != "" && !strings.EqualFold(a.DisplayName, a.Slug) {
+			label = a.DisplayName + " (" + a.Slug + ")"
+		}
+		labels = append(labels, label)
+	}
+	return "Specialist agents you can hand a task to (say the name to switch; otherwise the current one handles it): " +
+		strings.Join(labels, ", ") + ". If the user asks which agents exist, tell them these."
+}
 
 // onceGrace is how long after the reply finishes (→ "listening") --once waits
 // before exiting, so a quick follow-up (e.g. an async do_task result) still lands.
@@ -335,6 +355,13 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		persona = koePersona + " " + extra
 	}
 	pcancel()
+	// Inject the agent registry so Koe can name the specialists it can hand a task
+	// to. The resolver already has the list for matching, but the Realtime model
+	// needs it in context to answer "which agents do I have?". Names only — no
+	// capability dumps; matching stays the resolver's job.
+	if list := koeAgentListLine(agents); list != "" {
+		persona += "\n\n" + list
+	}
 
 	// A user-pinned reply language (Settings → Voice → Language) overrides
 	// koePersona's default "reply in the user's current utterance language".

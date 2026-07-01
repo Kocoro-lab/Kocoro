@@ -56,6 +56,33 @@ func TestResolveSemanticHook(t *testing.T) {
 	}
 }
 
+func TestResolveHyphenSpaceEquivalence(t *testing.T) {
+	// Real agents often have hyphenated slugs and no display name (display_name
+	// falls back to the slug); a user naturally says the name with spaces. Live
+	// bug: "investment analyst" did not resolve to slug "investment-analyst".
+	agents := []AgentSummary{{Slug: "investment-analyst", DisplayName: "investment-analyst"}}
+	r := NewAgentResolver(agents, NoopSemanticMatcher{})
+	for _, ref := range []string{"investment analyst", "investment-analyst", "Investment Analyst"} {
+		got := r.Resolve(ref)
+		if got.Status != ResolveResolved || got.Slug != "investment-analyst" {
+			t.Errorf("Resolve(%q) = %+v, want Resolved/investment-analyst", ref, got)
+		}
+	}
+}
+
+func TestResolveStripsAgentFiller(t *testing.T) {
+	// A user says "use the investment agent"; the trailing filler word must not
+	// break the match.
+	agents := []AgentSummary{{Slug: "investment-analyst", DisplayName: "investment-analyst"}}
+	r := NewAgentResolver(agents, NoopSemanticMatcher{})
+	for _, ref := range []string{"investment agent", "the investment agent", "investment"} {
+		got := r.Resolve(ref)
+		if got.Status != ResolveResolved || got.Slug != "investment-analyst" {
+			t.Errorf("Resolve(%q) = %+v, want Resolved/investment-analyst", ref, got)
+		}
+	}
+}
+
 type funcSemanticMatcher func(ref string, agents []AgentSummary) string
 
 func (f funcSemanticMatcher) Match(ref string, agents []AgentSummary) string { return f(ref, agents) }

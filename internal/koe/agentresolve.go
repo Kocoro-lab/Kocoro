@@ -48,14 +48,16 @@ func NewAgentResolver(agents []AgentSummary, sem SemanticMatcher) *AgentResolver
 // Resolve runs the deterministic-first ladder. It never silently picks one of
 // several substring hits — that returns Ambiguous so the caller can ask.
 func (r *AgentResolver) Resolve(ref string) ResolveResult {
-	norm := strings.ToLower(strings.TrimSpace(ref))
+	norm := normalizeAgentRef(ref)
 	if norm == "" {
 		return ResolveResult{Status: ResolveNotFound}
 	}
 
-	// ① exact slug wins outright (a display name can never shadow a real slug).
+	// ① exact (normalized) slug wins outright (a display name can never shadow a
+	//    real slug). Normalization unifies separators, so a spoken "investment
+	//    analyst" matches the hyphenated slug "investment-analyst".
 	for _, a := range r.agents {
-		if strings.ToLower(a.Slug) == norm {
+		if normalizeAgentRef(a.Slug) == norm {
 			return ResolveResult{Status: ResolveResolved, Slug: a.Slug}
 		}
 	}
@@ -64,7 +66,7 @@ func (r *AgentResolver) Resolve(ref string) ResolveResult {
 	//    longer spoken phrase still matches a short display name).
 	var hits []string
 	for _, a := range r.agents {
-		dn := strings.ToLower(strings.TrimSpace(a.DisplayName))
+		dn := normalizeAgentRef(a.DisplayName)
 		if dn == "" {
 			continue
 		}
@@ -86,4 +88,19 @@ func (r *AgentResolver) Resolve(ref string) ResolveResult {
 
 	// ④ nothing matched.
 	return ResolveResult{Status: ResolveNotFound}
+}
+
+// normalizeAgentRef canonicalizes a spoken agent reference (or a slug / display
+// name) for matching: lowercase, separators (- _) unified to spaces, whitespace
+// collapsed, and a leading "the" / trailing "agent(s)" filler word stripped. A
+// spoken "investment analyst" or "the investment agent" thus matches the
+// hyphenated slug "investment-analyst".
+func normalizeAgentRef(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.NewReplacer("-", " ", "_", " ").Replace(s)
+	s = strings.Join(strings.Fields(s), " ")
+	s = strings.TrimPrefix(s, "the ")
+	s = strings.TrimSuffix(s, " agents")
+	s = strings.TrimSuffix(s, " agent")
+	return strings.TrimSpace(s)
 }

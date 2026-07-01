@@ -5,7 +5,24 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/koe"
 )
+
+func TestKoeAgentListLine(t *testing.T) {
+	got := koeAgentListLine([]koe.AgentSummary{
+		{Slug: "investment-analyst"},
+		{Slug: "finance", DisplayName: "金融分析"},
+	})
+	for _, want := range []string{"investment-analyst", "finance", "金融分析", "which agents exist"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("koeAgentListLine missing %q; got: %s", want, got)
+		}
+	}
+	if koeAgentListLine(nil) != "" {
+		t.Error("empty agents should yield empty line")
+	}
+}
 
 func TestKoeCmdRegistered(t *testing.T) {
 	var found bool
