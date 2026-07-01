@@ -566,6 +566,69 @@ func TestTranscriptCompletedDoesNotCreateResponse(t *testing.T) {
 	}
 }
 
+func TestLocalCommitFallbackCommitsWhenServerVADMisses(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(ctx)
+
+	waitUntil(t, func() bool { return cap.countType("input_audio_buffer.commit") == 1 }, "local fallback did not commit input audio")
+	waitUntil(t, func() bool { return cap.countType("response.create") == 1 }, "local fallback did not request a response")
+}
+
+func TestLocalCommitFallbackSkipsWhenServerAlreadyCommitted(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.observeLocalSpeechStarted()
+	h.handleEvent(ctx, []byte(`{"type":"input_audio_buffer.committed"}`))
+	h.observeLocalSpeechEnded(ctx)
+
+	time.Sleep(50 * time.Millisecond)
+	if got := cap.countType("input_audio_buffer.commit"); got != 0 {
+		t.Fatalf("server-committed speech must not be committed again, got %d commits", got)
+	}
+	if got := cap.countType("response.create"); got != 0 {
+		t.Fatalf("server-committed speech must not request a duplicate response, got %d creates", got)
+	}
+}
+
+func TestLocalCommitFallbackSkipsWhenServerAlreadyResponded(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.observeLocalSpeechStarted()
+	h.handleEvent(ctx, []byte(`{"type":"response.created"}`))
+	h.observeLocalSpeechEnded(ctx)
+
+	time.Sleep(50 * time.Millisecond)
+	if got := cap.countType("input_audio_buffer.commit"); got != 0 {
+		t.Fatalf("server-responded speech must not be committed again, got %d commits", got)
+	}
+	if got := cap.countType("response.create"); got != 0 {
+		t.Fatalf("server-responded speech must not request a duplicate response, got %d creates", got)
+	}
+}
+
 // TestResponseSenderRetriesOnActiveResponseRejection pins the core robustness of the
 // serialized sender: when GA rejects a response.create with
 // conversation_already_has_active_response, the sender retries instead of silently

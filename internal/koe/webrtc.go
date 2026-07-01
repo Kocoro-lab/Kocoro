@@ -56,11 +56,13 @@ func mintEphemeralAt(ctx context.Context, url, apiKey, model string) (string, er
 
 // RealtimeConn is one connected WebRTC session to OpenAI Realtime.
 type RealtimeConn struct {
-	pc              *webrtc.PeerConnection
-	sendTrack       *webrtc.TrackLocalStaticSample
-	dc              *webrtc.DataChannel
-	audio           *AudioIO
-	interruptOutput func()
+	pc                   *webrtc.PeerConnection
+	sendTrack            *webrtc.TrackLocalStaticSample
+	dc                   *webrtc.DataChannel
+	audio                *AudioIO
+	interruptOutput      func()
+	onLocalSpeechStarted func()
+	onLocalSpeechEnded   func()
 	// callActive (nil-safe) gates mic capture: when set and it returns false, the
 	// send pump drops mic audio so Koe is NOT listening (Desktop press-to-talk —
 	// a call must be started via the control channel). nil = always send (the
@@ -173,6 +175,7 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 				gate.resetState()
 				continue
 			}
+			wasOpen := gate.open
 			for _, out := range gate.process(frame) {
 				enc, err := rc.audio.EncodeFrame(out)
 				if err != nil {
@@ -186,6 +189,12 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 				_ = rc.sendTrack.WriteSample(media.Sample{
 					Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
 				})
+			}
+			if !wasOpen && gate.open && rc.onLocalSpeechStarted != nil {
+				rc.onLocalSpeechStarted()
+			}
+			if wasOpen && !gate.open && rc.onLocalSpeechEnded != nil {
+				rc.onLocalSpeechEnded()
 			}
 		}
 	}
@@ -257,6 +266,8 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	h.onUsage = opts.OnUsage
 	h.fullDuplexAEC = opts.FullDuplexAEC
 	rc.interruptOutput = h.interruptOutput
+	rc.onLocalSpeechStarted = h.observeLocalSpeechStarted
+	rc.onLocalSpeechEnded = func() { h.observeLocalSpeechEnded(ctx) }
 	rc.callActive = opts.CallActive
 	rc.fullDuplexAEC = opts.FullDuplexAEC
 	var closedOnce sync.Once

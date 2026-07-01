@@ -57,6 +57,15 @@ type eventHandler struct {
 	// asyncTaskPending keeps Desktop/--once in "thinking" after the model's short
 	// spoken ack while do_task is still running or its result speech is queued.
 	asyncTaskPending atomic.Bool
+	// Local speech endpoint fallback: Realtime VAD can miss low-energy post-VPIO
+	// speech even after the local gate has opened. When local speech closes and the
+	// server has not committed or created a response, Koe commits the input buffer
+	// once and asks for a response.
+	localSpeechSeq        atomic.Int64
+	localStartCommitSeq   atomic.Int64
+	localStartResponseSeq atomic.Int64
+	inputCommitSeq        atomic.Int64
+	responseSeq           atomic.Int64
 	// Serialized response.create (runResponseSender), adapted from kocoro-reachy's
 	// _response_sender_loop to Go/WebRTC: do_task results and fast-tool outputs still
 	// need a MANUAL response.create, and GA rejects one sent while a response is
@@ -90,6 +99,7 @@ func (h *eventHandler) voiceState() string {
 const (
 	defaultSpeakingTailMS         = 900
 	defaultOutputBufferStopWaitMS = 12000
+	defaultLocalCommitFallbackMS  = 500
 )
 
 func (h *eventHandler) markSpeaking() {
@@ -170,6 +180,54 @@ func (h *eventHandler) interruptOutput() {
 		_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
 	}
 	h.emitVoiceState(h.voiceStateAfterSpeaking())
+}
+
+func (h *eventHandler) observeLocalSpeechStarted() {
+	seq := h.localSpeechSeq.Add(1)
+	h.localStartCommitSeq.Store(h.inputCommitSeq.Load())
+	h.localStartResponseSeq.Store(h.responseSeq.Load())
+	if eventLogEnabled() {
+		log.Printf("koe[timing]: local_speech_started seq=%d", seq)
+	}
+}
+
+func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
+	if !koeEnvBool("KOE_LOCAL_COMMIT_FALLBACK", true) {
+		return
+	}
+	seq := h.localSpeechSeq.Load()
+	if seq == 0 {
+		return
+	}
+	startCommitSeq := h.localStartCommitSeq.Load()
+	startResponseSeq := h.localStartResponseSeq.Load()
+	delay := time.Duration(koeEnvInt("KOE_LOCAL_COMMIT_FALLBACK_MS", defaultLocalCommitFallbackMS)) * time.Millisecond
+	if eventLogEnabled() {
+		log.Printf("koe[timing]: local_speech_ended seq=%d fallback_ms=%d", seq, delay.Milliseconds())
+	}
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if h.localSpeechSeq.Load() != seq {
+			return
+		}
+		if h.inputCommitSeq.Load() != startCommitSeq || h.responseSeq.Load() != startResponseSeq {
+			return
+		}
+		if h.respBusy.Load() || h.outputBufferActive.Load() {
+			return
+		}
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: local_commit_fallback seq=%d", seq)
+		}
+		_ = h.sendFn(map[string]any{"type": "input_audio_buffer.commit"})
+		h.requestResponse()
+	}()
 }
 
 // reportUsage extracts response_id + usage from a response.done event and fires
@@ -464,12 +522,15 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 		// The user finished talking. create_response=true lets the server start the
 		// spoken response automatically.
+	case "input_audio_buffer.committed":
+		h.inputCommitSeq.Add(1)
 	case "conversation.item.input_audio_transcription.completed":
 		h.handleInputTranscript(ev.Transcript)
 	case "conversation.item.input_audio_transcription.failed":
 		// Treat failed ASR like unclear audio. Do not guess.
 		h.emitVoiceState("listening")
 	case "response.created":
+		h.responseSeq.Add(1)
 		h.responseCreatedAt = time.Now()
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: response_created after_speech_stop_ms=%d", elapsedMS(h.speechStoppedAt, h.responseCreatedAt))
