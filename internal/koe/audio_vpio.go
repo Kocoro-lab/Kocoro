@@ -8,6 +8,7 @@ package koe
 #include <AudioToolbox/AudioToolbox.h>
 #include <AudioUnit/AudioUnit.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -113,6 +114,17 @@ static unsigned long long gInputFrames = 0;
 static unsigned long long gOutputFrames = 0;
 static unsigned long long gPlayUnderruns = 0;
 static unsigned long long gPlayOverwrites = 0;
+
+static int vpioProbeEnabled(void) {
+    const char *v = getenv("KOE_VPIO_PROBE");
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
+static void vpioProbe(const char *step) {
+    if (!vpioProbeEnabled()) return;
+    fprintf(stderr, "koe[vpio]: %s\n", step);
+    fflush(stderr);
+}
 
 static void zeroABL(AudioBufferList *ioData) {
     if (!ioData) return;
@@ -225,6 +237,7 @@ static void vpioCleanupC(void) {
 }
 
 static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples) {
+    vpioProbe("start enter");
     ringInit(&gMicRing, ringCap, NULL);
     ringInit(&gPlayRing, ringCap, &gPlayOverwrites);
     gInputFloatScratch = (Float32 *)calloc(ringCap, sizeof(Float32));
@@ -253,22 +266,33 @@ static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples) {
         vpioCleanupC();
         return -1;
     }
+    vpioProbe("component found");
+    vpioProbe("AudioComponentInstanceNew begin");
     OSStatus st = AudioComponentInstanceNew(comp, &gVAU);
     if (st != noErr) {
         vpioCleanupC();
         return st;
     }
+    vpioProbe("AudioComponentInstanceNew done");
 
     UInt32 one = 1;
     UInt32 zero = 0;
+    vpioProbe("EnableIO input begin");
     st = AudioUnitSetProperty(gVAU, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &one, sizeof(one));
     if (st != noErr) { vpioCleanupC(); return st; }
+    vpioProbe("EnableIO input done");
+    vpioProbe("EnableIO output begin");
     st = AudioUnitSetProperty(gVAU, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &one, sizeof(one));
     if (st != noErr) { vpioCleanupC(); return st; }
+    vpioProbe("EnableIO output done");
+    vpioProbe("BypassVoiceProcessing begin");
     st = AudioUnitSetProperty(gVAU, kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global, 0, &zero, sizeof(zero));
     if (st != noErr) { vpioCleanupC(); return st; }
+    vpioProbe("BypassVoiceProcessing done");
+    vpioProbe("VoiceProcessingEnableAGC begin");
     st = AudioUnitSetProperty(gVAU, kAUVoiceIOProperty_VoiceProcessingEnableAGC, kAudioUnitScope_Global, 0, &one, sizeof(one));
     if (st != noErr) { vpioCleanupC(); return st; }
+    vpioProbe("VoiceProcessingEnableAGC done");
 
     AudioStreamBasicDescription fmt = {0};
     fmt.mSampleRate = sampleRate;
@@ -279,25 +303,37 @@ static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples) {
     fmt.mBitsPerChannel = 32;
     fmt.mBytesPerFrame = 4;
     fmt.mBytesPerPacket = 4;
+    vpioProbe("StreamFormat input-side begin");
     st = AudioUnitSetProperty(gVAU, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &fmt, sizeof(fmt));
     if (st != noErr) { vpioCleanupC(); return st; }
+    vpioProbe("StreamFormat input-side done");
+    vpioProbe("StreamFormat output-side begin");
     st = AudioUnitSetProperty(gVAU, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &fmt, sizeof(fmt));
     if (st != noErr) { vpioCleanupC(); return st; }
+    vpioProbe("StreamFormat output-side done");
 
     AURenderCallbackStruct inputCB = {0};
     inputCB.inputProc = vpioInputCB;
+    vpioProbe("SetInputCallback begin");
     st = AudioUnitSetProperty(gVAU, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 1, &inputCB, sizeof(inputCB));
     if (st != noErr) { vpioCleanupC(); return st; }
+    vpioProbe("SetInputCallback done");
 
     AURenderCallbackStruct outputCB = {0};
     outputCB.inputProc = vpioOutputCB;
+    vpioProbe("SetRenderCallback begin");
     st = AudioUnitSetProperty(gVAU, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &outputCB, sizeof(outputCB));
     if (st != noErr) { vpioCleanupC(); return st; }
+    vpioProbe("SetRenderCallback done");
 
+    vpioProbe("AudioUnitInitialize begin");
     st = AudioUnitInitialize(gVAU);
     if (st != noErr) { vpioCleanupC(); return st; }
+    vpioProbe("AudioUnitInitialize done");
+    vpioProbe("AudioOutputUnitStart begin");
     st = AudioOutputUnitStart(gVAU);
     if (st != noErr) { vpioCleanupC(); return st; }
+    vpioProbe("AudioOutputUnitStart done");
     return noErr;
 }
 

@@ -169,7 +169,7 @@ func koeAgentListLine(agents []koe.AgentSummary) string {
 const onceGrace = 3 * time.Second
 
 const (
-	audioStartTimeout         = 20 * time.Second
+	audioStartTimeout         = 8 * time.Second
 	audioStartTimeoutExitCode = 124
 	warmSessionTTL            = 45 * time.Minute
 )
@@ -283,6 +283,28 @@ func armAudioStartWatchdog(label string, timeout time.Duration) func() {
 		}
 	}()
 	return func() { close(done) }
+}
+
+func onceVoiceStateHandler(cancel func(), grace time.Duration) func(string) {
+	var graceMu sync.Mutex
+	var graceTimer *time.Timer
+	sawAssistantOutput := false
+	return func(s string) {
+		graceMu.Lock()
+		defer graceMu.Unlock()
+		if graceTimer != nil {
+			graceTimer.Stop()
+			graceTimer = nil
+		}
+		switch s {
+		case "speaking", "thinking":
+			sawAssistantOutput = true
+		case "listening":
+			if sawAssistantOutput {
+				graceTimer = time.AfterFunc(grace, cancel)
+			}
+		}
+	}
 }
 
 func desktopParentDone(ctx context.Context) <-chan struct{} {
@@ -435,18 +457,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	// doesn't trip it; --timeout is a hard fallback.
 	var onVoiceState func(string)
 	if cfg.once {
-		var graceMu sync.Mutex
-		var graceTimer *time.Timer
-		onVoiceState = func(s string) {
-			graceMu.Lock()
-			defer graceMu.Unlock()
-			if graceTimer != nil {
-				graceTimer.Stop()
-			}
-			if s == "listening" {
-				graceTimer = time.AfterFunc(onceGrace, cancel)
-			}
-		}
+		onVoiceState = onceVoiceStateHandler(cancel, onceGrace)
 	}
 	if cfg.timeoutSec > 0 {
 		time.AfterFunc(time.Duration(cfg.timeoutSec)*time.Second, cancel)

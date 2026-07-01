@@ -106,6 +106,26 @@ func TestKoeAudioStartTimeoutDefaultAndOverride(t *testing.T) {
 	}
 }
 
+func TestOnceVoiceStateHandlerWaitsForAssistantOutput(t *testing.T) {
+	canceled := make(chan struct{}, 1)
+	handler := onceVoiceStateHandler(func() { canceled <- struct{}{} }, 10*time.Millisecond)
+
+	handler("listening")
+	select {
+	case <-canceled:
+		t.Fatal("initial user-speech listening state must not cancel --once")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	handler("speaking")
+	handler("listening")
+	select {
+	case <-canceled:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("post-assistant listening state should cancel --once")
+	}
+}
+
 func TestKoeWarmSessionTTLDefaultAndOverride(t *testing.T) {
 	t.Setenv("KOE_WARM_SESSION_TTL_MS", "")
 	if got := koeWarmSessionTTL(); got != warmSessionTTL {
