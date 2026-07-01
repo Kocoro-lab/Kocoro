@@ -81,6 +81,14 @@ func TestKoePersonaSummaryAndDesktopDiscipline(t *testing.T) {
 	}
 }
 
+func TestKoePersonaTreatsLongCompoundRequestsAsActionable(t *testing.T) {
+	for _, want := range []string{"Long or multi-part user utterances", "not wait for \"do it\""} {
+		if !strings.Contains(koePersona, want) {
+			t.Errorf("koePersona missing long-request execution guidance %q", want)
+		}
+	}
+}
+
 func TestKoeAudioStartTimeoutDefaultAndOverride(t *testing.T) {
 	t.Setenv("KOE_AUDIO_START_TIMEOUT_MS", "")
 	if got := koeAudioStartTimeout(); got != audioStartTimeout {

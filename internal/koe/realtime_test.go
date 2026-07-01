@@ -270,6 +270,7 @@ func TestHandleEventGatesMicAsSoonAsResponseStarts(t *testing.T) {
 
 func TestHandleEventDoesNotUngateBeforeOutputBufferStops(t *testing.T) {
 	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "200")
 	audio, err := NewAudioIO()
 	if err != nil {
 		t.Fatalf("NewAudioIO: %v", err)
@@ -289,6 +290,50 @@ func TestHandleEventDoesNotUngateBeforeOutputBufferStops(t *testing.T) {
 	}
 	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.stopped"}`))
 	waitUntil(t, func() bool { return !audio.dropCapture() }, "output_audio_buffer.stopped did not release the speaking gate")
+}
+
+func TestHandleEventReleasesWhenOutputBufferStopIsLate(t *testing.T) {
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "10")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done"}`))
+	waitUntil(t, func() bool { return !audio.dropCapture() }, "late output_audio_buffer.stopped left the mic gated")
+
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.stopped"}`))
+	if audio.dropCapture() {
+		t.Fatal("stale output_audio_buffer.stopped must not re-gate capture")
+	}
+}
+
+func TestHandleEventIgnoresStaleOutputBufferStopAfterLocalRelease(t *testing.T) {
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done"}`))
+	waitUntil(t, func() bool { return !audio.dropCapture() }, "first response did not release")
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.stopped"}`))
+	time.Sleep(20 * time.Millisecond)
+	if !audio.dropCapture() {
+		t.Fatal("stale output_audio_buffer.stopped must not ungate a new response-created gate")
+	}
 }
 
 func TestHandleEventMarksSpeakingWithFullDuplexAEC(t *testing.T) {

@@ -222,7 +222,7 @@ func TestDoTaskDescriptionUsesOneSelfFraming(t *testing.T) {
 			t.Errorf("do_task description must not contain %q (contradicts one-self persona)", banned)
 		}
 	}
-	for _, want := range []string{"calculate precisely", "never answer", "own tools"} {
+	for _, want := range []string{"calculate precisely", "never answer", "own tools", "long or multi-part"} {
 		if !strings.Contains(doTask, want) {
 			t.Errorf("do_task description missing %q", want)
 		}

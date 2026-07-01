@@ -85,8 +85,8 @@ func (h *eventHandler) voiceState() string {
 }
 
 const (
-	defaultSpeakingTailMS     = 900
-	defaultSpeakingFailsafeMS = 60000
+	defaultSpeakingTailMS         = 900
+	defaultOutputBufferStopWaitMS = 2500
 )
 
 func (h *eventHandler) markSpeaking() {
@@ -119,8 +119,24 @@ func (h *eventHandler) releaseSpeakingTail() {
 	h.releaseSpeakingAfter(time.Duration(koeEnvInt("KOE_SPEAKING_TAIL_MS", defaultSpeakingTailMS)) * time.Millisecond)
 }
 
-func (h *eventHandler) releaseSpeakingFailsafe() {
-	h.releaseSpeakingAfter(time.Duration(koeEnvInt("KOE_SPEAKING_FAILSAFE_MS", defaultSpeakingFailsafeMS)) * time.Millisecond)
+func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
+	wait := time.Duration(koeEnvInt("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", defaultOutputBufferStopWaitMS)) * time.Millisecond
+	tail := time.Duration(koeEnvInt("KOE_SPEAKING_TAIL_MS", defaultSpeakingTailMS)) * time.Millisecond
+	epoch := h.speakingEpoch.Add(1)
+	go func() {
+		timer := time.NewTimer(wait + tail)
+		defer timer.Stop()
+		<-timer.C
+		if h.speakingEpoch.Load() != epoch {
+			return
+		}
+		h.outputBufferActive.Store(false)
+		if h.audio != nil {
+			h.audio.SetSpeaking(false)
+			h.audio.SetPlaybackEnabled(false)
+		}
+		h.emitVoiceState("listening")
+	}()
 }
 
 // reportUsage extracts response_id + usage from a response.done event and fires
@@ -471,10 +487,15 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: output_stopped after_response_done_ms=%d output_ms=%d", elapsedMS(h.responseDoneAt, now), elapsedMS(h.outputStartedAt, now))
 		}
+		if !h.outputBufferActive.Swap(false) {
+			if eventLogEnabled() {
+				log.Printf("koe[timing]: output_stopped ignored after local release")
+			}
+			return
+		}
 		// WebRTC-only: reply audio fully drained (fires after response.done) — the
 		// PRECISE SPEAKING→IDLE boundary. Keep a short local tail because CoreAudio
 		// can still have speaker energy after the server says its output buffer ended.
-		h.outputBufferActive.Store(false)
 		h.releaseSpeakingTail()
 	case "response.done":
 		h.responseDoneAt = time.Now()
@@ -486,7 +507,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// playback drain, and releasing here lets Koe hear its own tail.
 		h.respBusy.Store(false)
 		if h.outputBufferActive.Load() {
-			h.releaseSpeakingFailsafe()
+			h.releaseSpeakingAfterOutputBufferWait()
 		} else {
 			h.releaseSpeakingTail()
 		}
