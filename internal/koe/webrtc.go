@@ -198,6 +198,7 @@ func MintEphemeral(ctx context.Context, apiKey, model string) (string, error) {
 type ConnectOptions struct {
 	OnVoiceState func(string)          // G2: Desktop control channel voice state (listening/thinking/speaking)
 	Model        string                // G3: realtime model id stamped into usage reports
+	Voice        string                // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback
 	OnUsage      func(json.RawMessage) // G3: per-turn usage relay (→ daemon → Cloud)
 	// CallActive (nil-safe) gates mic capture for Desktop press-to-talk: when set
 	// and it returns false, the send pump drops mic audio (Koe is idle, not
@@ -262,7 +263,11 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	configured := make(chan struct{})
 	var cfgOnce sync.Once
 	rc.dc.OnOpen(func() {
-		b, _ := json.Marshal(sessionConfig(persona, "marin", opts.FullDuplexAEC))
+		voice := opts.Voice
+		if voice == "" {
+			voice = "marin" // CLI/E2E and any caller that didn't set a voice keep the original default
+		}
+		b, _ := json.Marshal(sessionConfig(persona, voice, opts.FullDuplexAEC))
 		_ = rc.dc.SendText(string(b))
 	})
 	rc.dc.OnClose(func() {

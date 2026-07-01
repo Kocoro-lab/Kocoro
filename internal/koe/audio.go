@@ -45,8 +45,8 @@ type AudioIO struct {
 	stopOnce  sync.Once
 	// vpioActive / vpioDone track the opt-in VoiceProcessingIO backend
 	// (audio_vpio.go). VPIO supplies native echo cancellation, but the product
-	// default still mutes capture while speaking; explicit barge-in experiments can
-	// opt into a stricter local energy gate.
+	// keeps Desktop audio call-scoped so macOS does not hold the mic while idle.
+	// Explicit barge-in experiments can opt into a stricter local energy gate.
 	vpioActive      bool
 	vpioDone        chan struct{}
 	vpioWG          sync.WaitGroup
@@ -250,9 +250,8 @@ func (a *AudioIO) Play(pcm []int16) {
 	}
 }
 
-// PrepareForCall clears stale capture/playback queued while Desktop was idle.
-// Desktop keeps the VPIO device open across calls for smooth double-tap latency,
-// so the next WebRTC session must start from fresh buffers.
+// PrepareForCall clears stale capture/playback queued before a session starts
+// sending user audio.
 func (a *AudioIO) PrepareForCall() {
 	a.SetSpeaking(false)
 	a.SetPlaybackEnabled(false)
