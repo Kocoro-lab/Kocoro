@@ -67,6 +67,20 @@ func TestKoePersonaPinsCurrentUtteranceLanguage(t *testing.T) {
 	}
 }
 
+func TestKoePersonaSummaryAndDesktopDiscipline(t *testing.T) {
+	// Point 3: the do_task result is only a short summary; follow-ups go back to
+	// Kocoro (which keeps the full report) rather than being rebuilt from it.
+	for _, want := range []string{"only that short summary", "hand it back through do_task"} {
+		if !strings.Contains(koePersona, want) {
+			t.Errorf("koePersona missing point-3 guidance %q", want)
+		}
+	}
+	// Point 2: Kocoro Desktop is a proper noun, distinct from the desktop folder.
+	if !strings.Contains(koePersona, "not the computer's desktop folder") {
+		t.Error("koePersona should distinguish Kocoro Desktop from the computer's desktop folder")
+	}
+}
+
 func TestKoeAudioStartTimeoutDefaultAndOverride(t *testing.T) {
 	t.Setenv("KOE_AUDIO_START_TIMEOUT_MS", "")
 	if got := koeAudioStartTimeout(); got != audioStartTimeout {

@@ -836,7 +836,7 @@ func TestFormatGuidanceKoe(t *testing.T) {
 	// New contract: Kocoro writes the full reply, then ENDS with a <spoken_summary>
 	// block reporting the completed outcome (the voice line the daemon extracts).
 	// See internal/daemon/koe_spoken_summary.go.
-	for _, want := range []string{"voice", "<spoken_summary>", "kocoro desktop", "outcome"} {
+	for _, want := range []string{"voice", "<spoken_summary>", "kocoro desktop", "outcome", "in full"} {
 		if !strings.Contains(strings.ToLower(g), want) {
 			t.Errorf("formatGuidance(\"koe\") missing %q; got: %s", want, g)
 		}
