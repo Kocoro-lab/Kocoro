@@ -11,10 +11,8 @@ const (
 	// floor or short hangover made the local gate stop RTP before server_vad could
 	// endpoint, so the user had to say a second phrase. OVERRIDE: KOE_MIC_GATE_*.
 	defaultMicGateThreshold       = 0.010
-	defaultMicGateSoftThreshold   = 0.006
 	defaultMicGateNoiseMultiplier = 2.0
 	defaultMicGateStartMS         = 160
-	defaultMicGateSoftStartMS     = 480
 	defaultMicGateHangoverMS      = 2000
 	defaultMicGateEndpointMS      = 2000
 	micGateHotEvidenceWeight      = 2
@@ -22,33 +20,28 @@ const (
 )
 
 type micGateStats struct {
-	PassedFrames    uint64
-	MutedFrames     uint64
-	SpeechStarts    uint64
-	MaxLevel        float64
-	NoiseFloor      float64
-	HotFramesMax    int
-	SoftFramesMax   int
-	StartScoreMax   int
-	StartFrames     int
-	SoftStartFrames int
+	PassedFrames  uint64
+	MutedFrames   uint64
+	SpeechStarts  uint64
+	MaxLevel      float64
+	NoiseFloor    float64
+	HotFramesMax  int
+	StartScoreMax int
+	StartFrames   int
 }
 
 type micNoiseGate struct {
 	enabled bool
 
 	threshold       float64
-	softThreshold   float64
 	noiseMultiplier float64
 	startFrames     int
-	softStartFrames int
 	hangoverFrames  int
 	endpointFrames  int
 
 	noiseFloor float64
 	maxLevel   float64
 	hotFrames  int
-	softFrames int
 	startScore int
 	hangover   int
 	endpoint   int
@@ -64,10 +57,8 @@ func newMicNoiseGate() *micNoiseGate {
 	return &micNoiseGate{
 		enabled:         !koeEnvBool("KOE_MIC_GATE_OFF", false),
 		threshold:       koeEnvFloat("KOE_MIC_GATE_THRESHOLD", defaultMicGateThreshold),
-		softThreshold:   koeEnvFloat("KOE_MIC_GATE_SOFT_THRESHOLD", defaultMicGateSoftThreshold),
 		noiseMultiplier: koeEnvFloat("KOE_MIC_GATE_NOISE_MULTIPLIER", defaultMicGateNoiseMultiplier),
 		startFrames:     msToAudioFrames(koeEnvInt("KOE_MIC_GATE_START_MS", defaultMicGateStartMS)),
-		softStartFrames: msToAudioFrames(koeEnvInt("KOE_MIC_GATE_SOFT_START_MS", defaultMicGateSoftStartMS)),
 		hangoverFrames:  msToAudioFrames(koeEnvInt("KOE_MIC_GATE_HANGOVER_MS", defaultMicGateHangoverMS)),
 		endpointFrames:  msToAudioFrames(koeEnvInt("KOE_MIC_GATE_ENDPOINT_MS", defaultMicGateEndpointMS)),
 		zero:            make([]int16, audioFrameSize),
@@ -92,12 +83,10 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 		g.maxLevel = level
 	}
 	threshold := math.Max(g.threshold, g.noiseFloor*g.noiseMultiplier)
-	softThreshold := math.Max(g.softThreshold, g.noiseFloor*g.noiseMultiplier)
 	hot := level >= threshold
-	soft := !hot && level >= softThreshold
 
 	if g.open {
-		if hot || soft {
+		if hot {
 			g.hangover = g.hangoverFrames
 		} else {
 			g.updateNoiseFloorIfAmbient(level)
@@ -105,9 +94,6 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 			if g.hangover <= 0 {
 				g.open = false
 				g.hotFrames = 0
-				g.softFrames = 0
-				g.startScore = 0
-				g.pending = g.pending[:0]
 				g.endpoint = g.endpointFrames
 			}
 		}
@@ -122,7 +108,6 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 	if hot {
 		g.endpoint = 0
 		g.hotFrames++
-		g.softFrames = 0
 		g.startScore += micGateHotEvidenceWeight
 		if g.startScore > g.startFrames {
 			g.startScore = g.startFrames
@@ -130,25 +115,12 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 		if g.hotFrames > g.stats.HotFramesMax {
 			g.stats.HotFramesMax = g.hotFrames
 		}
-	} else if soft {
-		// Low-volume speech gets a slower continuous path instead of lowering the
-		// fixed hot threshold, which proved too eager for speaker bleed.
-		g.endpoint = 0
-		g.hotFrames = 0
-		g.softFrames++
-		if g.softFrames > g.stats.SoftFramesMax {
-			g.stats.SoftFramesMax = g.softFrames
-		}
-		if g.startScore > 0 {
-			g.startScore--
-		}
 	} else {
 		g.hotFrames = 0
-		g.softFrames = 0
 		if g.startScore > 0 {
 			g.startScore--
 		}
-		if g.startScore == 0 && g.softFrames == 0 {
+		if g.startScore == 0 {
 			g.pending = g.pending[:0]
 		}
 		g.updateNoiseFloorIfAmbient(level)
@@ -156,17 +128,13 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 	if g.startScore > g.stats.StartScoreMax {
 		g.stats.StartScoreMax = g.startScore
 	}
-	if g.startScore > 0 || g.softFrames > 0 {
+	if g.startScore > 0 {
 		g.pending = append(g.pending, append([]int16(nil), frame...))
-		pendingCap := g.startFrames
-		if g.softStartFrames > pendingCap {
-			pendingCap = g.softStartFrames
-		}
-		if len(g.pending) > pendingCap {
-			g.pending = g.pending[len(g.pending)-pendingCap:]
+		if len(g.pending) > g.startFrames {
+			g.pending = g.pending[len(g.pending)-g.startFrames:]
 		}
 	}
-	if g.startScore >= g.startFrames || g.softFrames >= g.softStartFrames {
+	if g.startScore >= g.startFrames {
 		g.open = true
 		g.hangover = g.hangoverFrames
 		g.stats.SpeechStarts++
@@ -186,7 +154,6 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 
 func (g *micNoiseGate) resetState() {
 	g.hotFrames = 0
-	g.softFrames = 0
 	g.startScore = 0
 	g.hangover = 0
 	g.endpoint = 0
@@ -219,6 +186,5 @@ func (g *micNoiseGate) logStats() {
 	g.stats.MaxLevel = g.maxLevel
 	g.stats.NoiseFloor = g.noiseFloor
 	g.stats.StartFrames = g.startFrames
-	g.stats.SoftStartFrames = g.softStartFrames
 	log.Printf("koe[audio]: mic gate stats: %+v", g.stats)
 }
