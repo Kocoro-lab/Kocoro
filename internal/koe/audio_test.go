@@ -209,6 +209,62 @@ func TestMicNoiseGateRejectsShortNoiseBurstByDefault(t *testing.T) {
 	}
 }
 
+func TestDefaultMicNoiseGateRejectsPostAECQuietSpeechLevel(t *testing.T) {
+	g := newMicNoiseGate()
+	quietSpeech := make([]int16, audioFrameSize)
+	for i := range quietSpeech {
+		quietSpeech[i] = 140
+	}
+
+	for i := 0; i < requiredMicGateHotEvidenceFrames(msToAudioFrames(defaultMicGateStartMS))+2; i++ {
+		if out := g.process(quietSpeech); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("default gate should keep post-AEC low-level frame %d muted", i)
+		}
+	}
+	if got := g.stats.SpeechStarts; got != 0 {
+		t.Fatalf("default gate opened on post-AEC quiet speech level %d time(s)", got)
+	}
+}
+
+func TestVPIOMicNoiseGateOpensOnPostAECQuietSpeechLevel(t *testing.T) {
+	g := newVPIOMicNoiseGate()
+	quietSpeech := make([]int16, audioFrameSize)
+	for i := range quietSpeech {
+		quietSpeech[i] = 140
+	}
+
+	required := requiredMicGateHotEvidenceFrames(msToAudioFrames(defaultMicGateStartMS))
+	for i := 0; i < required-1; i++ {
+		if out := g.process(quietSpeech); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("VPIO gate should wait for sustained speech before opening, frame %d", i)
+		}
+	}
+	if got := g.stats.SpeechStarts; got != 0 {
+		t.Fatalf("VPIO gate opened early %d time(s)", got)
+	}
+	if out := g.process(quietSpeech); len(out) != required || !sameSamples(out[0], quietSpeech) {
+		t.Fatalf("VPIO gate should open on sustained post-AEC quiet speech, got %d frame(s)", len(out))
+	}
+}
+
+func TestVPIOMicNoiseGateHonorsGlobalThresholdOverride(t *testing.T) {
+	t.Setenv("KOE_MIC_GATE_THRESHOLD", "0.010")
+	g := newVPIOMicNoiseGate()
+	quietSpeech := make([]int16, audioFrameSize)
+	for i := range quietSpeech {
+		quietSpeech[i] = 140
+	}
+
+	for i := 0; i < requiredMicGateHotEvidenceFrames(msToAudioFrames(defaultMicGateStartMS))+2; i++ {
+		if out := g.process(quietSpeech); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("global override should keep post-AEC low-level frame %d muted", i)
+		}
+	}
+	if got := g.stats.SpeechStarts; got != 0 {
+		t.Fatalf("global override was ignored; gate opened %d time(s)", got)
+	}
+}
+
 func TestMicNoiseGateTracksHotStreakForDiagnostics(t *testing.T) {
 	t.Setenv("KOE_MIC_GATE_START_MS", "500")
 	g := newMicNoiseGate()

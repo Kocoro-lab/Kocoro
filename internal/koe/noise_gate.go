@@ -11,6 +11,7 @@ const (
 	// floor or short hangover made the local gate stop RTP before server_vad could
 	// endpoint, so the user had to say a second phrase. OVERRIDE: KOE_MIC_GATE_*.
 	defaultMicGateThreshold       = 0.010
+	defaultVPIOMicGateThreshold   = 0.0038
 	defaultMicGateNoiseMultiplier = 2.0
 	defaultMicGateStartMS         = 160
 	defaultMicGateHangoverMS      = 2000
@@ -25,6 +26,7 @@ type micGateStats struct {
 	SpeechStarts  uint64
 	MaxLevel      float64
 	NoiseFloor    float64
+	Threshold     float64
 	HotFramesMax  int
 	StartScoreMax int
 	StartFrames   int
@@ -63,6 +65,18 @@ func newMicNoiseGate() *micNoiseGate {
 		endpointFrames:  msToAudioFrames(koeEnvInt("KOE_MIC_GATE_ENDPOINT_MS", defaultMicGateEndpointMS)),
 		zero:            make([]int16, audioFrameSize),
 	}
+}
+
+func newVPIOMicNoiseGate() *micNoiseGate {
+	g := newMicNoiseGate()
+	if raw := os.Getenv("KOE_VPIO_MIC_GATE_THRESHOLD"); raw != "" {
+		g.threshold = koeEnvFloat("KOE_VPIO_MIC_GATE_THRESHOLD", defaultVPIOMicGateThreshold)
+		return g
+	}
+	if os.Getenv("KOE_MIC_GATE_THRESHOLD") == "" {
+		g.threshold = defaultVPIOMicGateThreshold
+	}
+	return g
 }
 
 func msToAudioFrames(ms int) int {
@@ -185,6 +199,7 @@ func (g *micNoiseGate) logStats() {
 	}
 	g.stats.MaxLevel = g.maxLevel
 	g.stats.NoiseFloor = g.noiseFloor
+	g.stats.Threshold = g.threshold
 	g.stats.StartFrames = g.startFrames
 	log.Printf("koe[audio]: mic gate stats: %+v", g.stats)
 }

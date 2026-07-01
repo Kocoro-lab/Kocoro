@@ -66,6 +66,9 @@ type RealtimeConn struct {
 	// a call must be started via the control channel). nil = always send (the
 	// standalone CLI / E2E always-listen behaviour).
 	callActive func() bool
+	// fullDuplexAEC means the capture stream has already passed through VPIO's
+	// voice processing, so the local mic gate can use a lower post-AEC floor.
+	fullDuplexAEC bool
 }
 
 // newPeerConnection builds the pion PC with a send track + recvonly transceiver +
@@ -152,6 +155,9 @@ func (rc *RealtimeConn) dialOpenAI(ctx context.Context, ek string) error {
 func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 	rc.audio.markSendReady() // unblock the file backend's feedFrames — the session is configured
 	gate := newMicNoiseGate()
+	if rc.fullDuplexAEC {
+		gate = newVPIOMicNoiseGate()
+	}
 	defer gate.logStats()
 	pacer := time.NewTicker(audioFrameMs * time.Millisecond)
 	defer pacer.Stop()
@@ -252,6 +258,7 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	h.fullDuplexAEC = opts.FullDuplexAEC
 	rc.interruptOutput = h.interruptOutput
 	rc.callActive = opts.CallActive
+	rc.fullDuplexAEC = opts.FullDuplexAEC
 	var closedOnce sync.Once
 	notifyClosed := func(err error) {
 		if opts.OnClosed == nil {
