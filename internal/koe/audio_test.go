@@ -250,6 +250,29 @@ func TestMicNoiseGateOpensOnBrokenHumanSpeechCadence(t *testing.T) {
 	}
 }
 
+func TestMicNoiseGateOpensOnSustainedQuietSpeechByDefault(t *testing.T) {
+	g := newMicNoiseGate()
+	quietSpeech := make([]int16, audioFrameSize)
+	for i := range quietSpeech {
+		quietSpeech[i] = 230
+	}
+
+	for i := 0; i < g.softStartFrames-1; i++ {
+		if out := g.process(quietSpeech); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("quiet speech frame %d should stay muted before soft start", i)
+		}
+	}
+	if got := g.stats.SpeechStarts; got != 0 {
+		t.Fatalf("quiet speech opened early %d time(s)", got)
+	}
+	if out := g.process(quietSpeech); len(out) != g.softStartFrames || !sameSamples(out[0], quietSpeech) {
+		t.Fatalf("sustained quiet speech should open with soft pre-roll, got %d frame(s)", len(out))
+	}
+	if got, want := g.stats.SoftFramesMax, g.softStartFrames; got != want {
+		t.Fatalf("SoftFramesMax = %d, want %d", got, want)
+	}
+}
+
 func TestMicNoiseGateRejectsSparseEchoBurstsByDefault(t *testing.T) {
 	g := newMicNoiseGate()
 	echo := make([]int16, audioFrameSize)
@@ -275,6 +298,34 @@ func TestMicNoiseGateRejectsSparseEchoBurstsByDefault(t *testing.T) {
 	}
 	if got, want := g.stats.StartScoreMax, 4; got != want {
 		t.Fatalf("StartScoreMax = %d, want %d", got, want)
+	}
+}
+
+func TestMicNoiseGateRejectsSparseQuietEchoByDefault(t *testing.T) {
+	g := newMicNoiseGate()
+	echo := make([]int16, audioFrameSize)
+	for i := range echo {
+		echo[i] = 230
+	}
+	quiet := make([]int16, audioFrameSize)
+
+	for cycle := 0; cycle < 10; cycle++ {
+		for i := 0; i < 4; i++ {
+			if out := g.process(echo); len(out) != 1 || !allZeroSamples(out[0]) {
+				t.Fatalf("sparse quiet echo cycle %d frame %d should stay muted", cycle, i)
+			}
+		}
+		for i := 0; i < 4; i++ {
+			if out := g.process(quiet); len(out) != 1 || !allZeroSamples(out[0]) {
+				t.Fatalf("quiet gap cycle %d frame %d should stay muted", cycle, i)
+			}
+		}
+	}
+	if got := g.stats.SpeechStarts; got != 0 {
+		t.Fatalf("sparse quiet echo opened the gate %d time(s)", got)
+	}
+	if got := g.stats.SoftFramesMax; got != 4 {
+		t.Fatalf("SoftFramesMax = %d, want 4", got)
 	}
 }
 
