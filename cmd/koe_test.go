@@ -81,6 +81,31 @@ func TestKoePersonaSummaryAndDesktopDiscipline(t *testing.T) {
 	}
 }
 
+// TestKoePersonaDropsOneSelfLecture: the "You are one self" identity lecture was
+// removed on user decision (2026-07-02) — occasional first-person narration like
+// "我去查一下" is acceptable; the paragraph was not earning its tokens. The
+// Kocoro Desktop proper-noun rule it shared a paragraph with must survive.
+func TestKoePersonaDropsOneSelfLecture(t *testing.T) {
+	if strings.Contains(koePersona, "You are one self") {
+		t.Fatal("the one-self lecture should be gone from koePersona")
+	}
+	if !strings.Contains(koePersona, "not the computer's desktop folder") {
+		t.Fatal("dropping the one-self lecture must keep the Kocoro Desktop naming rule")
+	}
+}
+
+// TestKoePersonaForbidsDetailQuizzing pins the anti-interrogation rule (live
+// 2026-07-02: Koe kept asking for the user's own email address across several
+// calls instead of delegating): the ONLY allowed follow-up question is a repeat
+// for unclear audio; vague or incomplete requests go to do_task as spoken.
+func TestKoePersonaForbidsDetailQuizzing(t *testing.T) {
+	for _, want := range []string{"never quiz the user", "could not clearly hear", "call do_task with it as spoken"} {
+		if !strings.Contains(koePersona, want) {
+			t.Fatalf("koePersona missing anti-quizzing rule %q", want)
+		}
+	}
+}
+
 // TestKoePersonaAckIsVariedButContentFree: the do_task acknowledgement allows
 // natural wording variety, but the no-content gate (no answer/number/step before
 // the result) is load-bearing — it is what blocks hallucinated pre-answers.

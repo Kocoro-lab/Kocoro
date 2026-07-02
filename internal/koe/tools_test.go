@@ -40,7 +40,7 @@ func TestDoTaskDescriptionMatchesPersonaContract(t *testing.T) {
 			desc = d.Description
 		}
 	}
-	for _, want := range []string{"vary", "one obvious step"} {
+	for _, want := range []string{"vary", "one obvious step", "never quiz the user"} {
 		if !strings.Contains(desc, want) {
 			t.Fatalf("do_task description missing %q", want)
 		}
