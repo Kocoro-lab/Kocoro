@@ -19,7 +19,7 @@ func withTestKeychain(t *testing.T) *keychain.MemBackend {
 	t.Helper()
 	be := keychain.NewMemBackend()
 	prev := keychainStoreOpener
-	keychainStoreOpener = func() (*keychain.Store, error) {
+	keychainStoreOpener = func(string) (*keychain.Store, error) {
 		return keychain.NewStore(be, nil), nil
 	}
 	t.Cleanup(func() { keychainStoreOpener = prev })
@@ -120,7 +120,7 @@ func TestHydrateAPIKeyFromKeychain(t *testing.T) {
 	}
 
 	cfg := &Config{}
-	hydrateAPIKeyFromKeychain(cfg)
+	hydrateAPIKeyFromKeychain(cfg, t.TempDir())
 	if cfg.APIKey != "sk_from_keychain" {
 		t.Fatalf("APIKey=%q", cfg.APIKey)
 	}

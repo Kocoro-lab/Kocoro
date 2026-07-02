@@ -466,7 +466,7 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
-	hydrateAPIKeyFromKeychain(&cfg)
+	hydrateAPIKeyFromKeychain(&cfg, dir)
 	if cfg.apiKeyFromKeychain {
 		// Keep the hydrated key in-process for older call sites that read
 		// viper directly. Save still strips it back out, so Keychain remains

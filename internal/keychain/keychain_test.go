@@ -6,22 +6,26 @@ import (
 )
 
 // TestSupportedMatchesBuildTag enforces the invariant that the runtime
-// Supported() predicate (hand-maintained as darwin || windows in keychain.go)
-// stays in lockstep with the build tags selecting the real NewOSStore
-// (backend_keyring.go) vs the ErrUnsupportedPlatform stub (backend_other.go).
-// Without this, adding a platform to one and forgetting the other would only
-// surface at runtime as a spurious ErrUnsupportedPlatform. This is build-tag
-// agnostic, so it runs on every CI job (Linux + macOS) — no Windows runner
-// needed. NewOSStore only constructs the backend; it never touches the real
-// credential store, so there is no GUI prompt to hang CI.
+// Supported() predicate (hand-maintained as darwin || windows || linux in
+// keychain.go) stays in lockstep with the build tags selecting a real
+// NewOSStoreAt (backend_keyring.go for darwin/windows, backend_linux.go for
+// linux) vs the ErrUnsupportedPlatform stub (backend_other.go). Without this,
+// adding a platform to one and forgetting the other would only surface at
+// runtime as a spurious ErrUnsupportedPlatform. This is build-tag agnostic, so
+// it runs on every CI job (Linux + macOS) — no Windows runner needed.
+//
+// A temp dir is passed so the Linux file backend writes there, not the real
+// ~/.shannon: NewOSStoreAt has filesystem side effects on Linux (it creates
+// the dir), so the invariant test must point it at a throwaway location. The
+// dir is ignored by the macOS/Windows backends.
 func TestSupportedMatchesBuildTag(t *testing.T) {
-	store, err := NewOSStore(nil)
+	store, err := NewOSStoreAt(t.TempDir(), nil)
 	if Supported() != (err == nil) {
-		t.Fatalf("Supported()=%v but NewOSStore err=%v — predicate and build tags out of sync", Supported(), err)
+		t.Fatalf("Supported()=%v but NewOSStoreAt err=%v — predicate and build tags out of sync", Supported(), err)
 	}
 	if Supported() {
 		if store == nil {
-			t.Fatal("supported platform: NewOSStore returned nil store with nil error")
+			t.Fatal("supported platform: NewOSStoreAt returned nil store with nil error")
 		}
 	} else {
 		if !errors.Is(err, ErrUnsupportedPlatform) {
