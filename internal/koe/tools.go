@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -25,7 +26,7 @@ func obj(raw string) json.RawMessage { return json.RawMessage(raw) }
 func ToolDefs() []ToolDef {
 	return []ToolDef{
 		{Type: "function", Name: "do_task",
-			Description: "do_task — how you actually get things done: your own hands on a full computer. As Kocoro on Kocoro Desktop you can browse and research the web, read and write files, run code and calculate precisely, manage schedules, send email and messages, and run multi-step jobs. Reach for it for ANYTHING whose answer needs the world outside this conversation — real data, a current fact, a date or price, system state, a real action, any calculation beyond one obvious step, or content/results to show in Kocoro Desktop — never answer those from memory or guess. Only conversation-internal one-step replies (small talk, restating an earlier result, trivial arithmetic like 1+1) are answered without it. Call it even when the request is vague or missing details — never quiz the user for them first: Kocoro already knows the user's own context (contacts, addresses, accounts, files, history), and the result will say if something is truly missing. Long or multi-part spoken requests still count: preserve the user's details and do the task instead of waiting for a follow-up like \"do it\". The moment you call it, say exactly one short acknowledgement before the tool call, in the language of the utterance; vary the wording naturally (我来处理 / 我看看 / On it / Let me check), never include an answer, number, fact, or step, and no second sentence. Then speak the result in your own voice when it lands. It is you working with your own tools — never describe it to the user as a colleague, back-end, or other system. What comes back to you is a short spoken summary, not the full result; the complete report stays in the session and on Kocoro Desktop, so for a follow-up on a previous result, call do_task again referring to that earlier work rather than rebuilding it from the summary.",
+			Description: "do_task — how you actually get things done: your own hands on a full computer. As Kocoro on Kocoro Desktop you can browse and research the web, read and write files, run code and calculate precisely, manage schedules, send email and messages, and run multi-step jobs. Reach for it for ANYTHING whose answer needs the world outside this conversation — real data, a current fact, a date or price, system state, a real action, any calculation beyond one obvious step, or content/results to show in Kocoro Desktop — never answer those from memory or guess. Only conversation-internal one-step replies (small talk, restating an earlier result, trivial arithmetic like 1+1) are answered without it. Call it even when the request is vague or missing details — never quiz the user for them first: Kocoro already knows the user's own context (contacts, addresses, accounts, files, history), and the result will say if something is truly missing. Long or multi-part spoken requests still count: preserve the user's details and do the task instead of waiting for a follow-up like \"do it\". The moment you call it, say exactly one short acknowledgement before the tool call, in the language of the utterance; vary the wording naturally (我来处理 / 我看看 / On it / Let me check), never include an answer, number, fact, or step, and no second sentence. Then speak the result in your own voice when it lands. What comes back to you is a short spoken line plus a context digest of the full answer: use the digest to answer recaps and follow-up questions directly, and call do_task again only for detail, action, or freshness beyond it — referring to that earlier work. The complete report stays in the session and on Kocoro Desktop; mention Kocoro Desktop only when there is genuinely more worth opening there (a long report, a table, code, or images), never as a routine sign-off.",
 			Parameters:  obj(`{"type":"object","properties":{"task":{"type":"string","description":"The task to perform, in the user's own words."},"agent":{"type":"string","description":"Optional: the agent the user named for this task, verbatim. Omit to use the bound agent."}},"required":["task"]}`)},
 		{Type: "function", Name: "cancel",
 			Description: "Cancel the task that is currently running.",
@@ -209,16 +210,47 @@ func NewDispatcher(client *DaemonClient, resolver *AgentResolver, state *CallSta
 	return &Dispatcher{client: client, resolver: resolver, state: state, controlApp: controlApp}
 }
 
-// SayResult is the do_task function_call_output contract (spec §4): only the
-// spoken projection + a status, never the back-brain's tools/reasoning/transcript.
-// spoken_summary is the canonical field; say stays as a compatibility alias for
-// older prompt text/tests. Exported so C's async do_task goroutine consumes
-// MapDoTaskOutcome's return.
+// SayResult is the do_task function_call_output contract (spec §4): the spoken
+// projection + a status + a capped context digest of the final answer — never the
+// back-brain's tools/reasoning/transcript. spoken_summary is the canonical field;
+// say stays as a compatibility alias for older prompt text/tests. Exported so C's
+// async do_task goroutine consumes MapDoTaskOutcome's return.
 type SayResult struct {
 	SpokenSummary string `json:"spoken_summary,omitempty"`
 	Say           string `json:"say,omitempty"`
-	Status        string `json:"status"` // ok | failed | injected | clarify
-	FailReason    string `json:"fail_reason,omitempty"`
+	// Context is a digest of the full answer for the Realtime model's OWN use
+	// (recaps and follow-up questions in the same call) — background context,
+	// never read aloud verbatim.
+	Context    string `json:"context,omitempty"`
+	Status     string `json:"status"` // ok | failed | injected | clarify
+	FailReason string `json:"fail_reason,omitempty"`
+}
+
+// defaultVoiceContextCap bounds the context digest attached to a completed
+// do_task result. WORKLOAD: same-call recaps and follow-ups — with only the two
+// spoken sentences, every "简单总结一下刚才的" costs another 10-60s do_task round
+// trip (live 2026-07-02: 2 of 4 delegations in one call were re-fetch recaps).
+// SYMPTOM if too low: follow-ups fall back to do_task again; if too high: the
+// 32k audio-heavy Realtime session truncates older turns sooner. OVERRIDE:
+// KOE_VOICE_CONTEXT_CAP.
+const defaultVoiceContextCap = 800
+
+// voiceContextDigest caps the reply into the SayResult context field; empty when
+// it would add nothing over the spoken line.
+func voiceContextDigest(reply, spoken string) string {
+	r := strings.TrimSpace(reply)
+	if r == "" || r == strings.TrimSpace(spoken) {
+		return ""
+	}
+	limit := koeEnvInt("KOE_VOICE_CONTEXT_CAP", defaultVoiceContextCap)
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(r)
+	if len(runes) > limit {
+		return string(runes[:limit]) + "…"
+	}
+	return r
 }
 
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
@@ -363,7 +395,8 @@ func MapDoTaskOutcome(out DoTaskOutcome, err error) SayResult {
 		if spoken == "" {
 			spoken = out.Reply
 		}
-		return SayResult{Status: status, SpokenSummary: spoken, Say: spoken, FailReason: out.FailureCode}
+		return SayResult{Status: status, SpokenSummary: spoken, Say: spoken,
+			Context: voiceContextDigest(out.Reply, spoken), FailReason: out.FailureCode}
 	case OutcomeInjected:
 		return SayResult{Status: "injected"}
 	default: // OutcomeRejected

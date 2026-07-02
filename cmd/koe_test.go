@@ -68,16 +68,30 @@ func TestKoePersonaPinsCurrentUtteranceLanguage(t *testing.T) {
 }
 
 func TestKoePersonaSummaryAndDesktopDiscipline(t *testing.T) {
-	// Point 3: the do_task result is only a short summary; follow-ups go back to
-	// Kocoro (which keeps the full report) rather than being rebuilt from it.
-	for _, want := range []string{"only that short summary", "hand it back through do_task"} {
+	// The do_task result carries a context digest: recaps/follow-ups the digest
+	// covers are answered directly (live 2026-07-02: half the delegations in one
+	// call were re-fetch recaps); only detail beyond it goes back through do_task.
+	// Kocoro Desktop is mentioned only for genuinely long/structured results.
+	for _, want := range []string{"context digest", "never call do_task to re-fetch", "mention it only when"} {
 		if !strings.Contains(koePersona, want) {
-			t.Errorf("koePersona missing point-3 guidance %q", want)
+			t.Errorf("koePersona missing result-handling guidance %q", want)
 		}
 	}
-	// Point 2: Kocoro Desktop is a proper noun, distinct from the desktop folder.
+	// Kocoro Desktop is a proper noun, distinct from the desktop folder.
 	if !strings.Contains(koePersona, "not the computer's desktop folder") {
 		t.Error("koePersona should distinguish Kocoro Desktop from the computer's desktop folder")
+	}
+}
+
+// TestKoePersonaUsesRealisticDirectAnswerExamples: nobody asks a voice assistant
+// "1+1" — the direct-answer examples must be the things users actually do:
+// recapping and follow-ups on what was already said in the call.
+func TestKoePersonaUsesRealisticDirectAnswerExamples(t *testing.T) {
+	if strings.Contains(koePersona, "1+1") {
+		t.Fatal("koePersona should not use toy arithmetic as the direct-answer example")
+	}
+	if !strings.Contains(koePersona, "already said in this call") {
+		t.Fatal("koePersona direct-answer examples should center on in-call content")
 	}
 }
 

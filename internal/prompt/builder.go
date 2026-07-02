@@ -563,7 +563,7 @@ func formatGuidance(format string) string {
 			"<spoken_summary>one or two spoken sentences reporting the completed outcome: what you found or did, and whether it worked, in the past tense. " +
 			"It is written last, after the work is finished — never a plan, an intent, or progress narration, and never a tool name, markdown, table, link, or file path.</spoken_summary> " +
 			"This spoken_summary is the ONLY thing said aloud and the voice side's ONLY record of the result, so it must stand on its own and be accurate about success or failure. " +
-			"If the detail is long or structured, keep it in Kocoro Desktop (name the app in full, not \"desktop\" or the computer's desktop folder) and let the spoken_summary point there instead of reading it out. " +
+			"Most answers fit entirely in the spoken_summary — do not mention Kocoro Desktop in it unless the result is genuinely long or structured (a full report, a table, code, or images); then keep that detail in Kocoro Desktop (name the app in full, not \"desktop\" or the computer's desktop folder) and let the spoken_summary point there instead of reading it out. " +
 			"If an action needs confirmation, put the question in the spoken_summary and wait for a clear yes."
 	case "plain":
 		return "Format responses as plain text. Use short paragraphs and simple bullet points. " +

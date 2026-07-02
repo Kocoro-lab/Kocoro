@@ -40,7 +40,7 @@ func TestDoTaskDescriptionMatchesPersonaContract(t *testing.T) {
 			desc = d.Description
 		}
 	}
-	for _, want := range []string{"vary", "one obvious step", "never quiz the user"} {
+	for _, want := range []string{"vary", "one obvious step", "never quiz the user", "context digest"} {
 		if !strings.Contains(desc, want) {
 			t.Fatalf("do_task description missing %q", want)
 		}
@@ -104,6 +104,33 @@ func TestPrepareDoTaskClarifyOnUnknownAgent(t *testing.T) {
 	}
 	if clarify == nil || clarify.Status != "clarify" {
 		t.Errorf("expected clarify SayResult, got %+v", clarify)
+	}
+}
+
+// TestMapDoTaskOutcomeAttachesContextDigest: the completed result must carry a
+// capped digest of the full reply so the Realtime model can answer recaps and
+// follow-ups directly. Live 2026-07-02: 2 of 4 delegations in one call were
+// re-fetch recaps because Koe only ever held the two spoken sentences.
+func TestMapDoTaskOutcomeAttachesContextDigest(t *testing.T) {
+	long := strings.Repeat("详情内容", 300) // 1200 runes, over the cap
+	r := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: long, SpokenSummary: "查完了。"}, nil)
+	if r.Context == "" {
+		t.Fatal("completed result must carry a context digest of the reply")
+	}
+	if got := len([]rune(r.Context)); got > defaultVoiceContextCap+1 {
+		t.Fatalf("context digest not capped: %d runes", got)
+	}
+	if !strings.HasPrefix(long, strings.TrimSuffix(r.Context, "…")) {
+		t.Fatal("context digest must be a prefix of the reply")
+	}
+
+	// No added information → no digest (don't waste session tokens).
+	same := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "查完了。", SpokenSummary: "查完了。"}, nil)
+	if same.Context != "" {
+		t.Fatalf("reply identical to spoken line must not attach a digest, got %q", same.Context)
+	}
+	if inj := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeInjected}, nil); inj.Context != "" {
+		t.Fatal("injected outcome must not attach a digest")
 	}
 }
 
@@ -245,7 +272,9 @@ func TestDoTaskDescriptionUsesOneSelfFraming(t *testing.T) {
 			t.Errorf("do_task description must not contain %q (contradicts one-self persona)", banned)
 		}
 	}
-	for _, want := range []string{"calculate precisely", "never answer", "own tools", "long or multi-part", "content/results to show in kocoro desktop"} {
+	// "own hands" (not the removed "own tools" lecture sentence): first-person
+	// framing survives in the description head after the one-self trim (2026-07-02).
+	for _, want := range []string{"calculate precisely", "never answer", "own hands", "long or multi-part", "content/results to show in kocoro desktop"} {
 		if !strings.Contains(doTask, want) {
 			t.Errorf("do_task description missing %q", want)
 		}
