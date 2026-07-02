@@ -39,10 +39,17 @@ type AudioIO struct {
 	// backends, which keep their own render paths. Set by Start(), closed by Stop().
 	otoPlayer *oto.Player
 	speaking  atomic.Bool
-	playback  atomic.Bool
-	encMu     sync.Mutex
-	decMu     sync.Mutex
-	stopOnce  sync.Once
+	// userMicOff is the user-initiated "mic off while a do_task runs" gate
+	// (Desktop double-tap / mic button via POST /call/mic). Independent of the
+	// speaking gate on purpose: the response lifecycle flips SetSpeaking
+	// (response.done → false), which would silently undo a user's mute.
+	// Capture keeps flowing as silent keepalive frames (resolveCaptureFrame),
+	// so the send-track RTP timeline stays continuous during long mutes.
+	userMicOff atomic.Bool
+	playback   atomic.Bool
+	encMu      sync.Mutex
+	decMu      sync.Mutex
+	stopOnce   sync.Once
 	// vpioActive / vpioDone track the opt-in VoiceProcessingIO backend
 	// (audio_vpio.go). VPIO supplies native echo cancellation, but the product
 	// keeps Desktop audio call-scoped so macOS does not hold the mic while idle.
@@ -97,8 +104,17 @@ func (a *AudioIO) setOutputLevel(l float64) {
 	a.trackVPIOMaxOutput(l)
 }
 
-// InputLevel / OutputLevel report the latest captured / played frame RMS (0..1).
-func (a *AudioIO) InputLevel() float64  { return math.Float64frombits(a.inLevel.Load()) }
+// InputLevel reports the latest captured frame RMS (0..1). While the user
+// mic-off gate is active it reports 0 — the wire hears zeros and the Desktop
+// sprite must visibly agree (trust: "it can't hear us").
+func (a *AudioIO) InputLevel() float64 {
+	if a.userMicOff.Load() {
+		return 0
+	}
+	return math.Float64frombits(a.inLevel.Load())
+}
+
+// OutputLevel reports the latest played frame RMS (0..1).
 func (a *AudioIO) OutputLevel() float64 { return math.Float64frombits(a.outLevel.Load()) }
 
 // playbackIdleLevelEps separates "reply audio audibly playing" from silence /
@@ -147,6 +163,15 @@ func (a *AudioIO) markSendReady() { a.sendReadyOnce.Do(func() { close(a.sendRead
 func (a *AudioIO) SetSpeaking(s bool) { a.speaking.Store(s) }
 func (a *AudioIO) dropCapture() bool  { return a.speaking.Load() }
 
+// SetUserMicOff toggles the user mic-off gate (koe-mic-off design). Task-window
+// enforcement lives in the /call/mic handler; auto-restore in maybeRestoreUserMic.
+func (a *AudioIO) SetUserMicOff(off bool) { a.userMicOff.Store(off) }
+func (a *AudioIO) UserMicOff() bool       { return a.userMicOff.Load() }
+
+// captureSuppressed is the capture-path gate: speaking gate OR user mic off.
+// Both resolve to silent keepalive frames downstream.
+func (a *AudioIO) captureSuppressed() bool { return a.dropCapture() || a.userMicOff.Load() }
+
 // captureSilenceFrame is the shared 20 ms zero frame forwarded while the
 // speak-gate suppresses capture. Read-only downstream (the gate copies frames it
 // buffers; the encoder only reads), so sharing one slice is safe.
@@ -186,6 +211,14 @@ const (
 )
 
 func (a *AudioIO) shouldForwardVPIOCapture(level float64) bool {
+	if a.userMicOff.Load() {
+		// User mic-off outranks everything, including KOE_VPIO_BARGE_IN:
+		// barge-in may forward frames while Koe speaks, but never while the
+		// user asked for silence.
+		a.vpioBargeFrames = 0
+		a.vpioGateDropped.Add(1)
+		return false
+	}
 	if !a.dropCapture() {
 		a.vpioBargeFrames = 0
 		a.vpioNoiseFloor = 0
@@ -432,7 +465,8 @@ func (a *AudioIO) Start() error {
 		// while Kocoro speaks — then a silent keepalive frame keeps the send track's
 		// RTP timeline continuous (see resolveCaptureFrame). (out is the empty
 		// playback half of a capture device — playback is oto's job now.)
-		forward := !a.dropCapture()
+		// User mic off (koe-mic-off) suppresses the same way.
+		forward := !a.captureSuppressed()
 		var frame []int16
 		if forward {
 			frame = bytesToS16(in)
