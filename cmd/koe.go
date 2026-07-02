@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -546,6 +547,12 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	var curState *koe.CallState
 	var curAudio *koe.AudioIO
 	var curAudioStarted bool
+	// Snapshot pointers for the control server's voice_state stamping. The
+	// providers run inside ControlServer.broadcast — sometimes under sessMu
+	// (emitReadyLocked) — so they must NOT take sessMu themselves. CallState /
+	// AudioIO have their own locks, safe to touch here.
+	var snapState atomic.Pointer[koe.CallState]
+	var snapAudio atomic.Pointer[koe.AudioIO]
 	var sessionCancel context.CancelFunc
 	var sessionSeq uint64
 	var warming bool
@@ -606,6 +613,8 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		conn, cancel := curConn, sessionCancel
 		audio := curAudio
 		curConn, curState, curAudio, sessionCancel = nil, nil, nil, nil
+		snapState.Store(nil)
+		snapAudio.Store(nil)
 		curAudioStarted = false
 		callContext = koe.StartCallRequest{}
 		warming = false
@@ -704,6 +713,8 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		state, disp := newSessionState()
 		curState = state
 		curAudio = audio
+		snapState.Store(state)
+		snapAudio.Store(audio)
 		curAudioStarted = false
 		sessionCtx, cancel := context.WithCancel(ctx)
 		sessionCancel = cancel
@@ -888,6 +899,27 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	}
 
 	ctrl = koe.NewControlServer(startCall, endCall, interruptCall)
+	ctrl.SetSnapshotProviders(
+		func() bool { s := snapState.Load(); return s != nil && s.InFlight() != "" },
+		func() bool { a := snapAudio.Load(); return a != nil && a.UserMicOff() },
+	)
+	ctrl.SetMicHandler(func(off bool) error {
+		sessMu.Lock()
+		audio := curAudio
+		state := curState
+		active := callActive
+		sessMu.Unlock()
+		if !active || audio == nil {
+			return koe.ErrNoActiveCall
+		}
+		if off && (state == nil || state.InFlight() == "") {
+			// Mic-off exists only inside the do_task window (koe-mic-off design).
+			return koe.ErrNoTaskPending
+		}
+		audio.SetUserMicOff(off)
+		ctrl.ReemitVoiceState()
+		return nil
+	})
 	go func() {
 		addr := "127.0.0.1:" + cfg.controlPort
 		if err := http.ListenAndServe(addr, ctrl.Handler()); err != nil {
