@@ -29,6 +29,27 @@ func TestToolDefsShape(t *testing.T) {
 	}
 }
 
+// TestDoTaskDescriptionMatchesPersonaContract keeps the tool description in sync
+// with the persona: varied content-free acknowledgement (no single mandated
+// phrase) and the information-source split (conversation-internal one-step
+// replies may be answered directly; the outside world goes through do_task).
+func TestDoTaskDescriptionMatchesPersonaContract(t *testing.T) {
+	var desc string
+	for _, d := range ToolDefs() {
+		if d.Name == "do_task" {
+			desc = d.Description
+		}
+	}
+	for _, want := range []string{"vary", "one obvious step"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("do_task description missing %q", want)
+		}
+	}
+	if strings.Contains(desc, `Chinese utterance -> "我来处理"`) {
+		t.Fatal("do_task description must not mandate a single fixed acknowledgement phrase anymore")
+	}
+}
+
 func TestBurstRouteKey(t *testing.T) {
 	// MUST equal the keys Plan A Task 3 pins daemon-side.
 	if got := burstRouteKey("finance", "burst-123"); got != "agent:finance:koe:burst-123" {

@@ -81,6 +81,35 @@ func TestKoePersonaSummaryAndDesktopDiscipline(t *testing.T) {
 	}
 }
 
+// TestKoePersonaAckIsVariedButContentFree: the do_task acknowledgement allows
+// natural wording variety, but the no-content gate (no answer/number/step before
+// the result) is load-bearing — it is what blocks hallucinated pre-answers.
+func TestKoePersonaAckIsVariedButContentFree(t *testing.T) {
+	for _, want := range []string{"Vary the wording", "must not contain any answer"} {
+		if !strings.Contains(koePersona, want) {
+			t.Fatalf("koePersona missing ack contract %q", want)
+		}
+	}
+	if strings.Contains(koePersona, `say exactly "我来处理"`) {
+		t.Fatal("koePersona must not mandate a single fixed acknowledgement phrase anymore")
+	}
+}
+
+// TestKoePersonaDividesByInformationSource pins the front/back-brain split: the
+// line is where the answer COMES FROM (conversation-internal one-step vs the
+// outside world), not task difficulty. The old blanket "any number or
+// calculation" rule routed 1+1 through a full agent turn.
+func TestKoePersonaDividesByInformationSource(t *testing.T) {
+	for _, want := range []string{"one obvious step", "outside this conversation"} {
+		if !strings.Contains(koePersona, want) {
+			t.Fatalf("koePersona missing information-source split %q", want)
+		}
+	}
+	if strings.Contains(koePersona, "any number or calculation") {
+		t.Fatal("koePersona must not keep the blanket number/calculation ban")
+	}
+}
+
 func TestKoePersonaTreatsLongCompoundRequestsAsActionable(t *testing.T) {
 	for _, want := range []string{"Long or multi-part user utterances", "not wait for \"do it\""} {
 		if !strings.Contains(koePersona, want) {
