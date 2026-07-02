@@ -433,7 +433,10 @@ func (a *AudioIO) vpioCaptureLoop() {
 			level := rmsLevel(frame)
 			a.setInputLevel(level)
 			a.trackVPIOMaxInput(level)
-			if !a.shouldForwardVPIOCapture(level) {
+			// Suppressed frames become silent keepalives so the send track's RTP
+			// timeline stays continuous while Kocoro speaks (see resolveCaptureFrame).
+			frame = a.resolveCaptureFrame(frame, a.shouldForwardVPIOCapture(level))
+			if frame == nil {
 				continue
 			}
 			select {

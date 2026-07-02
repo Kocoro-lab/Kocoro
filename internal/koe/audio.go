@@ -133,6 +133,28 @@ func (a *AudioIO) markSendReady() { a.sendReadyOnce.Do(func() { close(a.sendRead
 func (a *AudioIO) SetSpeaking(s bool) { a.speaking.Store(s) }
 func (a *AudioIO) dropCapture() bool  { return a.speaking.Load() }
 
+// captureSilenceFrame is the shared 20 ms zero frame forwarded while the
+// speak-gate suppresses capture. Read-only downstream (the gate copies frames it
+// buffers; the encoder only reads), so sharing one slice is safe.
+var captureSilenceFrame = make([]int16, audioFrameSize)
+
+// resolveCaptureFrame decides what a capture callback forwards into a.frames.
+// forward=true passes the real frame through. When the speak-gate suppresses the
+// frame, a SILENT frame is forwarded instead of nothing (KOE_CAPTURE_KEEPALIVE=0
+// restores the legacy drop): halting the send track glues the pre/post-speech RTP
+// timelines together, and the drift accumulated over a few assistant turns is the
+// prime suspect for the 2026-07-02 mid-call server-VAD deafness. The mute itself
+// is unchanged — the server hears zeros, never residual speaker echo.
+func (a *AudioIO) resolveCaptureFrame(frame []int16, forward bool) []int16 {
+	if forward {
+		return frame
+	}
+	if !koeEnvBool("KOE_CAPTURE_KEEPALIVE", true) {
+		return nil
+	}
+	return captureSilenceFrame
+}
+
 // Frames yields captured 48 kHz mono 20 ms frames.
 func (a *AudioIO) Frames() <-chan []int16 { return a.frames }
 
@@ -390,15 +412,21 @@ func (a *AudioIO) Start() error {
 
 	onData := func(out, in []byte, n uint32) {
 		// Capture only: publish the mic frame unless the half-duplex gate is muting it
-		// while Kocoro speaks. (out is the empty playback half of a capture device —
-		// playback is oto's job now.)
-		if !a.dropCapture() {
-			frame := bytesToS16(in)
+		// while Kocoro speaks — then a silent keepalive frame keeps the send track's
+		// RTP timeline continuous (see resolveCaptureFrame). (out is the empty
+		// playback half of a capture device — playback is oto's job now.)
+		forward := !a.dropCapture()
+		var frame []int16
+		if forward {
+			frame = bytesToS16(in)
 			a.setInputLevel(rmsLevel(frame)) // D3w: reactive listening amplitude
-			select {
-			case a.frames <- frame:
-			default: // drop if the send path is behind
-			}
+		}
+		if frame = a.resolveCaptureFrame(frame, forward); frame == nil {
+			return
+		}
+		select {
+		case a.frames <- frame:
+		default: // drop if the send path is behind
 		}
 	}
 

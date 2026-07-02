@@ -28,6 +28,35 @@ func TestOpusRoundTrip(t *testing.T) {
 	}
 }
 
+// TestResolveCaptureFrameKeepaliveSilence pins the RTP-continuity contract: when
+// the speak-gate suppresses capture, the pipeline must forward a SILENT frame by
+// default instead of halting the send track. Halting glues the pre/post-speech RTP
+// timelines together; the drift accumulated over a few assistant turns is the
+// prime suspect for the 2026-07-02 mid-call server-VAD deafness.
+func TestResolveCaptureFrameKeepaliveSilence(t *testing.T) {
+	a := &AudioIO{}
+	frame := []int16{1, 2, 3}
+
+	if got := a.resolveCaptureFrame(frame, true); len(got) != 3 || &got[0] != &frame[0] {
+		t.Fatal("forwarded capture must pass the original frame through unchanged")
+	}
+
+	got := a.resolveCaptureFrame(frame, false)
+	if len(got) != audioFrameSize {
+		t.Fatalf("suppressed capture must forward a full silent keepalive frame, got len %d", len(got))
+	}
+	for i, v := range got {
+		if v != 0 {
+			t.Fatalf("keepalive frame must be silent, got %d at index %d", v, i)
+		}
+	}
+
+	t.Setenv("KOE_CAPTURE_KEEPALIVE", "0")
+	if got := a.resolveCaptureFrame(frame, false); got != nil {
+		t.Fatal("KOE_CAPTURE_KEEPALIVE=0 must restore the legacy drop behaviour")
+	}
+}
+
 func TestHalfDuplexGateDropsWhileSpeaking(t *testing.T) {
 	a, _ := NewAudioIO()
 	a.SetSpeaking(true)
