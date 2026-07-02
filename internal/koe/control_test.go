@@ -163,3 +163,86 @@ func safeIdx(s []string, i int) string {
 	}
 	return "<missing>"
 }
+
+func TestCallMicEndpoint(t *testing.T) {
+	var got []bool
+	s := NewControlServer(nil, nil, nil)
+	s.SetMicHandler(func(off bool) error {
+		got = append(got, off)
+		if off && len(got) > 1 {
+			return ErrNoTaskPending
+		}
+		return nil
+	})
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/call/mic", "application/json", strings.NewReader(`{"mic":"off"}`))
+	if err != nil {
+		t.Fatalf("POST /call/mic: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(got) != 1 || got[0] != true {
+		t.Fatalf("mic off: status=%d handler calls=%v", resp.StatusCode, got)
+	}
+
+	resp2, _ := http.Post(srv.URL+"/call/mic", "application/json", strings.NewReader(`{"mic":"bogus"}`))
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bogus mic value: status=%d, want 400", resp2.StatusCode)
+	}
+
+	resp3, _ := http.Post(srv.URL+"/call/mic", "application/json", strings.NewReader(`{"mic":"off"}`))
+	body3, _ := io.ReadAll(resp3.Body)
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusConflict || !strings.Contains(string(body3), "no_task_pending") {
+		t.Fatalf("rejected mic off: status=%d body=%s, want 409 no_task_pending", resp3.StatusCode, body3)
+	}
+}
+
+func TestVoiceStateSnapshotStamped(t *testing.T) {
+	s := NewControlServer(nil, nil, nil)
+	taskPending, micOff := true, true
+	s.SetSnapshotProviders(func() bool { return taskPending }, func() bool { return micOff })
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /events: %v", err)
+	}
+	defer resp.Body.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for s.subscriberCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	s.EmitVoiceState("thinking")
+	taskPending, micOff = false, false
+	s.ReemitVoiceState()
+	s.EmitVoiceLevel("listening", 0.25)
+
+	want := []string{
+		`{"type":"voice_state","state":"thinking","task_pending":true,"mic":"off"}`,
+		`{"type":"voice_state","state":"thinking"}`,
+		`{"type":"voice_state","state":"listening","level":0.25}`,
+	}
+	br := bufio.NewReader(resp.Body)
+	var gotLines []string
+	readDeadline := time.Now().Add(3 * time.Second)
+	for len(gotLines) < len(want) && time.Now().Before(readDeadline) {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			break
+		}
+		if data, ok := strings.CutPrefix(line, "data: "); ok {
+			gotLines = append(gotLines, strings.TrimSpace(data))
+		}
+	}
+	for i, w := range want {
+		if i >= len(gotLines) || gotLines[i] != w {
+			t.Errorf("SSE line %d = %q, want %q (all: %v)", i, safeIdx(gotLines, i), w, gotLines)
+		}
+	}
+}
