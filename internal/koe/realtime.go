@@ -195,6 +195,12 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 	if !koeEnvBool("KOE_LOCAL_COMMIT_FALLBACK", true) {
 		return
 	}
+	if h.asyncTaskPending.Load() {
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: local_commit_fallback skipped: task pending")
+		}
+		return
+	}
 	seq := h.localSpeechSeq.Load()
 	if seq == 0 {
 		return
@@ -217,6 +223,12 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 			return
 		}
 		if h.inputCommitSeq.Load() != startCommitSeq || h.responseSeq.Load() != startResponseSeq {
+			return
+		}
+		if h.asyncTaskPending.Load() {
+			if eventLogEnabled() {
+				log.Printf("koe[timing]: local_commit_fallback skipped after delay: task pending")
+			}
 			return
 		}
 		if h.respBusy.Load() || h.outputBufferActive.Load() {

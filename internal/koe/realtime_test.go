@@ -629,6 +629,29 @@ func TestLocalCommitFallbackSkipsWhenServerAlreadyResponded(t *testing.T) {
 	}
 }
 
+func TestLocalCommitFallbackSkipsWhileTaskPending(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.asyncTaskPending.Store(true)
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(ctx)
+
+	time.Sleep(50 * time.Millisecond)
+	if got := cap.countType("input_audio_buffer.commit"); got != 0 {
+		t.Fatalf("pending do_task must not be committed over by local fallback, got %d commits", got)
+	}
+	if got := cap.countType("response.create"); got != 0 {
+		t.Fatalf("pending do_task must not get a premature fallback response, got %d creates", got)
+	}
+}
+
 // TestResponseSenderRetriesOnActiveResponseRejection pins the core robustness of the
 // serialized sender: when GA rejects a response.create with
 // conversation_already_has_active_response, the sender retries instead of silently
