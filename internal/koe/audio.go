@@ -101,6 +101,20 @@ func (a *AudioIO) setOutputLevel(l float64) {
 func (a *AudioIO) InputLevel() float64  { return math.Float64frombits(a.inLevel.Load()) }
 func (a *AudioIO) OutputLevel() float64 { return math.Float64frombits(a.outLevel.Load()) }
 
+// playbackIdleLevelEps separates "reply audio audibly playing" from silence /
+// warm-session comfort noise for PlaybackIdle. WORKLOAD: TTS speech RMS runs
+// well above 0.01; decoded silent RTP and drained pipelines sit near 0. SYMPTOM
+// if too high: the speaking watchdog releases (and cuts) mid-speech; if too low:
+// residual noise keeps the watchdog waiting until its hard cap. OVERRIDE: none —
+// revisit alongside the playback paths' level reporting.
+const playbackIdleLevelEps = 0.005
+
+// PlaybackIdle reports whether reply audio is audibly playing. All playback
+// paths (oto, VPIO, renderInto file/debug) zero the output level when their
+// pipeline drains, so a sustained-idle poll over this is the speaking watchdog's
+// drain signal.
+func (a *AudioIO) PlaybackIdle() bool { return a.OutputLevel() < playbackIdleLevelEps }
+
 // NewAudioIO builds the codec (no device opened yet — Start() opens it, so unit
 // tests can exercise Encode/Decode/gate without audio hardware).
 func NewAudioIO() (*AudioIO, error) {
@@ -337,6 +351,7 @@ const prerollFrames = 8
 func (a *AudioIO) renderInto(out []byte) {
 	if !a.primed.Load() {
 		if len(a.playBuf) < prerollFrames {
+			a.setOutputLevel(0) // pre-rolling → nothing audible yet
 			zeroBytes(out)
 			return
 		}
@@ -344,12 +359,14 @@ func (a *AudioIO) renderInto(out []byte) {
 	}
 	select {
 	case pcm := <-a.playBuf:
+		a.setOutputLevel(rmsLevel(pcm)) // keep the drain signal honest on this path too
 		n := s16ToBytes(pcm, out)
 		for i := n; i < len(out); i++ { // zero any tail a >1-frame device buffer leaves
 			out[i] = 0
 		}
 	default:
 		a.primed.Store(false) // underran → re-prime before resuming
+		a.setOutputLevel(0)
 		zeroBytes(out)
 	}
 }

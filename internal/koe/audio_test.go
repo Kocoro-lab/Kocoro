@@ -28,6 +28,42 @@ func TestOpusRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRenderIntoReportsOutputLevelAndIdle pins the drain signal the speaking
+// watchdog relies on: while frames play the output level is non-zero (not idle);
+// on underrun the level returns to zero and PlaybackIdle reports true. Without
+// the level honestly zeroing, the watchdog either cuts long replies mid-word
+// (the 2026-07-02 "Koe interrupts itself" report) or never releases the mic.
+func TestRenderIntoReportsOutputLevelAndIdle(t *testing.T) {
+	a, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	a.SetPlaybackEnabled(true)
+	if !a.PlaybackIdle() {
+		t.Fatal("fresh AudioIO must report playback idle")
+	}
+
+	loud := make([]int16, audioFrameSize)
+	for i := range loud {
+		loud[i] = 8000
+	}
+	for i := 0; i < prerollFrames; i++ {
+		a.Play(append([]int16(nil), loud...))
+	}
+	out := make([]byte, audioFrameSize*2)
+	a.renderInto(out)
+	if a.PlaybackIdle() {
+		t.Fatal("playing a loud frame must not report idle")
+	}
+
+	for i := 0; i < prerollFrames+1; i++ { // drain the queue, then one underrun render
+		a.renderInto(out)
+	}
+	if !a.PlaybackIdle() {
+		t.Fatalf("underrun must zero the output level and report idle, level=%f", a.OutputLevel())
+	}
+}
+
 // TestResolveCaptureFrameKeepaliveSilence pins the RTP-continuity contract: when
 // the speak-gate suppresses capture, the pipeline must forward a SILENT frame by
 // default instead of halting the send track. Halting glues the pre/post-speech RTP

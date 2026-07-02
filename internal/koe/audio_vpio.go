@@ -462,6 +462,11 @@ func (a *AudioIO) vpioPlaybackLoop() {
 			}
 			a.setOutputLevel(rmsLevel(pcm))
 			C.vpioWritePlay((*C.SInt16)(unsafe.Pointer(&pcm[0])), C.int(len(pcm)))
+		case <-time.After(3 * audioFrameMs * time.Millisecond):
+			// No inbound frames → the playout is draining; zero the level so
+			// PlaybackIdle (the speaking watchdog's drain signal) turns true
+			// instead of sticking at the last frame's amplitude.
+			a.setOutputLevel(0)
 		}
 	}
 }

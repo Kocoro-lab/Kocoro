@@ -428,6 +428,57 @@ func TestHandleEventKeepsMicGatedUntilLateOutputBufferStop(t *testing.T) {
 	waitUntil(t, func() bool { return !audio.dropCapture() }, "output_audio_buffer.stopped did not release the mic")
 }
 
+// TestReleaseWaitsForPlaybackDrain reproduces the 2026-07-02 "Koe interrupts
+// itself" report: a long do_task result keeps PLAYING well past response.done,
+// and the old fixed 12s watchdog cut it mid-word. The watchdog must wait while
+// audio is audibly playing and release only once the output level drains.
+func TestReleaseWaitsForPlaybackDrain(t *testing.T) {
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "60000")
+	t.Setenv("KOE_PLAYBACK_IDLE_HOLD_MS", "40")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+
+	audio.setOutputLevel(0.4) // reply audio still audibly playing
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done"}`))
+
+	time.Sleep(200 * time.Millisecond)
+	if !audio.dropCapture() {
+		t.Fatal("watchdog must not cut playback that is still audibly playing")
+	}
+
+	audio.setOutputLevel(0) // playout drained
+	waitUntil(t, func() bool { return !audio.dropCapture() }, "drained playback did not release the mic")
+}
+
+// TestReleaseHardCapFiresWhileStillAudible pins the lost-stop-event backstop:
+// even if the level never drains (e.g. a wedged level reading), the hard cap
+// still releases the mic so the call cannot go permanently deaf.
+func TestReleaseHardCapFiresWhileStillAudible(t *testing.T) {
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "120")
+	t.Setenv("KOE_PLAYBACK_IDLE_HOLD_MS", "60000")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+
+	audio.setOutputLevel(0.4)
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done"}`))
+
+	waitUntil(t, func() bool { return !audio.dropCapture() }, "hard cap did not release the mic")
+}
+
 func TestHandleEventIgnoresStaleOutputBufferStopAfterLocalRelease(t *testing.T) {
 	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
 	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "1")

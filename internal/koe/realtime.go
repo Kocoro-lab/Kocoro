@@ -97,9 +97,26 @@ func (h *eventHandler) voiceState() string {
 }
 
 const (
-	defaultSpeakingTailMS         = 900
-	defaultOutputBufferStopWaitMS = 12000
-	defaultLocalCommitFallbackMS  = 500
+	defaultSpeakingTailMS = 900
+	// defaultOutputBufferStopWaitMS is the HARD CAP backstop for a lost
+	// output_audio_buffer.stopped event — no longer the primary release (that is
+	// the drain-aware PlaybackIdle poll). WORKLOAD: long do_task result reads play
+	// 15-30s+ past response.done; the old 12s cap cut them mid-word (2026-07-02
+	// "Koe interrupts itself"). SYMPTOM if too low: long replies truncated; if too
+	// high: a wedged level reading keeps the mic muted this long. OVERRIDE:
+	// KOE_OUTPUT_BUFFER_STOP_WAIT_MS.
+	defaultOutputBufferStopWaitMS = 60000
+	// defaultPlaybackIdleHoldMS is how long the output level must stay silent
+	// before the watchdog treats playout as drained. WORKLOAD: TTS speech has
+	// sub-second pauses at sentence boundaries. SYMPTOM if too low: a long pause
+	// reads as drained and the tail gets cut; if too high: dead air before the mic
+	// reopens when the stop event was lost. OVERRIDE: KOE_PLAYBACK_IDLE_HOLD_MS.
+	defaultPlaybackIdleHoldMS = 1500
+	// playbackIdlePollInterval paces the drain poll; only bounds how quickly the
+	// idle hold and hard cap are noticed.
+	playbackIdlePollInterval = 25 * time.Millisecond
+
+	defaultLocalCommitFallbackMS = 500
 	// defaultLocalCommitAckMS is how long the fallback waits for the server to ack
 	// its manual input_audio_buffer.commit before concluding the user's audio never
 	// reached the server. WORKLOAD: one WebRTC data-channel round trip (~100-300 ms
@@ -155,14 +172,43 @@ func (h *eventHandler) releaseSpeakingTail() {
 	h.releaseSpeakingAfter(time.Duration(koeEnvInt("KOE_SPEAKING_TAIL_MS", defaultSpeakingTailMS)) * time.Millisecond)
 }
 
+// releaseSpeakingAfterOutputBufferWait is the missing-stop-event watchdog: after
+// response.done with the output buffer still active, it releases the speaking
+// gate once local playout has actually DRAINED (output level silent for the idle
+// hold), with the wait+tail hard cap as backstop. Releasing on a fixed clock cut
+// long result reads mid-word — audio playout routinely outlives response.done by
+// 15-30s. A real output_audio_buffer.stopped (or a new response) bumps the epoch
+// and this poller stands down.
 func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 	wait := time.Duration(koeEnvInt("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", defaultOutputBufferStopWaitMS)) * time.Millisecond
 	tail := time.Duration(koeEnvInt("KOE_SPEAKING_TAIL_MS", defaultSpeakingTailMS)) * time.Millisecond
+	hold := time.Duration(koeEnvInt("KOE_PLAYBACK_IDLE_HOLD_MS", defaultPlaybackIdleHoldMS)) * time.Millisecond
 	epoch := h.speakingEpoch.Add(1)
 	go func() {
-		timer := time.NewTimer(wait + tail)
-		defer timer.Stop()
-		<-timer.C
+		deadline := time.Now().Add(wait + tail)
+		ticker := time.NewTicker(playbackIdlePollInterval)
+		defer ticker.Stop()
+		var idleSince time.Time
+		for {
+			<-ticker.C
+			if h.speakingEpoch.Load() != epoch {
+				return // the real stop event (or a new response) took over
+			}
+			now := time.Now()
+			if h.audio == nil || h.audio.PlaybackIdle() {
+				if idleSince.IsZero() {
+					idleSince = now
+				}
+				if now.Sub(idleSince) >= hold {
+					break // playout genuinely drained — safe to release
+				}
+			} else {
+				idleSince = time.Time{} // still audible — keep waiting
+			}
+			if now.After(deadline) {
+				break // hard cap: never leave the mic muted on a lost stop event
+			}
+		}
 		if h.speakingEpoch.Load() != epoch {
 			return
 		}
