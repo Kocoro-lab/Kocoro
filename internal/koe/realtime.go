@@ -100,7 +100,23 @@ const (
 	defaultSpeakingTailMS         = 900
 	defaultOutputBufferStopWaitMS = 12000
 	defaultLocalCommitFallbackMS  = 500
+	// defaultLocalCommitAckMS is how long the fallback waits for the server to ack
+	// its manual input_audio_buffer.commit before concluding the user's audio never
+	// reached the server. WORKLOAD: one WebRTC data-channel round trip (~100-300 ms
+	// live). SYMPTOM if too low: a commit that would have landed gets answered with
+	// the ask-to-repeat prompt; if too high: extra dead air before Koe reacts to a
+	// missed utterance. OVERRIDE: KOE_LOCAL_COMMIT_ACK_MS.
+	defaultLocalCommitAckMS = 600
+	// localCommitAckPollInterval paces the ack-wait loop; only bounds how quickly a
+	// commit ack/response is noticed within the ack window.
+	localCommitAckPollInterval = 10 * time.Millisecond
 )
+
+// missedSpeechInstructions steers the fallback response when the manual commit was
+// NOT acked: the user's words never became a conversation item (observed live
+// 2026-07-02 — semantic_vad rejects the commit with an error and the audio is
+// gone), so answering from stale context would be a non-sequitur. Ask to repeat.
+const missedSpeechInstructions = "The user's last spoken words were lost before they reached you (audio capture problem on this call). In the language of this conversation, briefly tell the user you could not hear what they just said and ask them to say it again. One short sentence. Do not repeat earlier answers and do not guess what they said."
 
 func (h *eventHandler) markSpeaking() {
 	h.speakingEpoch.Add(1)
@@ -191,11 +207,21 @@ func (h *eventHandler) observeLocalSpeechStarted() {
 	}
 }
 
+// taskInFlight reports whether a back-brain do_task is actually running.
+// asyncTaskPending is NOT that signal: any response.created (e.g. the spoken
+// "on it" ack) and injected follow-ups clear it while the task keeps running —
+// live 2026-07-02 10:19:56 a mid-task fallback response hallucinated a result the
+// real task delivered 18s later. CallState in-flight tracking is cleared only
+// when DoTask returns.
+func (h *eventHandler) taskInFlight() bool {
+	return h.state != nil && h.state.InFlight() != ""
+}
+
 func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 	if !koeEnvBool("KOE_LOCAL_COMMIT_FALLBACK", true) {
 		return
 	}
-	if h.asyncTaskPending.Load() {
+	if h.asyncTaskPending.Load() || h.taskInFlight() {
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: local_commit_fallback skipped: task pending")
 		}
@@ -225,7 +251,7 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 		if h.inputCommitSeq.Load() != startCommitSeq || h.responseSeq.Load() != startResponseSeq {
 			return
 		}
-		if h.asyncTaskPending.Load() {
+		if h.asyncTaskPending.Load() || h.taskInFlight() {
 			if eventLogEnabled() {
 				log.Printf("koe[timing]: local_commit_fallback skipped after delay: task pending")
 			}
@@ -237,8 +263,43 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: local_commit_fallback seq=%d", seq)
 		}
+		// Best-effort salvage: if the server-side buffer still holds the audio, the
+		// commit turns it into a real user item. Under semantic_vad the commit is
+		// usually rejected (server-managed buffer, observed live 2026-07-02), so wait
+		// for the ack before deciding how to respond.
 		_ = h.sendFn(map[string]any{"type": "input_audio_buffer.commit"})
-		h.requestResponse()
+		ackWait := time.Duration(koeEnvInt("KOE_LOCAL_COMMIT_ACK_MS", defaultLocalCommitAckMS)) * time.Millisecond
+		deadline := time.Now().Add(ackWait)
+		for time.Now().Before(deadline) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(localCommitAckPollInterval):
+			}
+			if h.responseSeq.Load() != startResponseSeq {
+				// The server started a response on its own (late natural VAD
+				// recovery) — do not stack a second one.
+				if eventLogEnabled() {
+					log.Printf("koe[timing]: local_commit_fallback seq=%d yielded to server response", seq)
+				}
+				return
+			}
+			if h.inputCommitSeq.Load() != startCommitSeq {
+				// Commit acked — the user's audio became a conversation item; a
+				// plain response answers it.
+				if eventLogEnabled() {
+					log.Printf("koe[timing]: local_commit_fallback seq=%d commit acked", seq)
+				}
+				h.requestResponse()
+				return
+			}
+		}
+		// No ack, no response: the audio never reached the server. Answering from
+		// stale context would be a non-sequitur — ask the user to repeat instead.
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: local_commit_fallback seq=%d commit not acked; asking user to repeat", seq)
+		}
+		h.requestResponseWith(responseCreateRequest{instructions: missedSpeechInstructions})
 	}()
 }
 
@@ -509,8 +570,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		Arguments  json.RawMessage `json:"arguments"` // function args (string-encoded JSON)
 		Transcript string          `json:"transcript"`
 		Error      struct {
-			Code string `json:"code"`
-			Type string `json:"type"`
+			Code    string `json:"code"`
+			Type    string `json:"type"`
+			Message string `json:"message"`
 		} `json:"error"` // type=="error" events
 	}
 	_ = json.Unmarshal(raw, &ev)
@@ -560,6 +622,11 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 		signalNonBlocking(h.respCreated) // ack the sender's pending response.create
 	case "error":
+		// Always log the payload, not just the type: the 2026-07-02 mid-call VAD
+		// failures were undiagnosable from "koe[event]: error" alone (commit
+		// rejection reason invisible). Errors are rare, so this is not gated on
+		// KOE_EVENT_LOG.
+		log.Printf("koe[error]: server error code=%q type=%q message=%q", ev.Error.Code, ev.Error.Type, ev.Error.Message)
 		// GA rejects a response.create sent while a response is active. Signal the
 		// sender to retry instead of silently losing the turn (the exact code
 		// kocoro-reachy matches: conversation_already_has_active_response).

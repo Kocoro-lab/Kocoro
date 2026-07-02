@@ -1,8 +1,10 @@
 package koe
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -649,6 +651,175 @@ func TestLocalCommitFallbackSkipsWhileTaskPending(t *testing.T) {
 	}
 	if got := cap.countType("response.create"); got != 0 {
 		t.Fatalf("pending do_task must not get a premature fallback response, got %d creates", got)
+	}
+}
+
+// TestHandleEventLogsErrorPayload pins the error-observability contract: server
+// error events must always log code/type/message. The 2026-07-02 live failures
+// (fallback commit rejected mid-call) were undiagnosable because only a bare
+// "koe[event]: error" line reached koe.log.
+func TestHandleEventLogsErrorPayload(t *testing.T) {
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	h.handleEvent(ctx, []byte(`{"type":"error","error":{"code":"input_audio_buffer_commit_empty","type":"invalid_request_error","message":"buffer too small"}}`))
+
+	got := buf.String()
+	for _, want := range []string{"input_audio_buffer_commit_empty", "invalid_request_error", "buffer too small"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("error event log missing %q, got %q", want, got)
+		}
+	}
+}
+
+// TestLocalCommitFallbackAsksToRepeatWhenCommitNotAcked reproduces the 2026-07-02
+// live failure: under semantic_vad the manual fallback commit is rejected (error
+// event, no committed ack), so a bare response.create answers from stale context
+// and the user's words are silently lost. The recovery response must instead carry
+// the missed-speech instructions so Koe asks the user to repeat.
+func TestLocalCommitFallbackAsksToRepeatWhenCommitNotAcked(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
+	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "40")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(ctx)
+
+	waitUntil(t, func() bool { return cap.countType("input_audio_buffer.commit") == 1 }, "local fallback did not commit input audio")
+	waitUntil(t, func() bool { return cap.countType("response.create") == 1 }, "local fallback did not request a response")
+	instr := cap.responseCreateInstructions()
+	if len(instr) != 1 || instr[0] != missedSpeechInstructions {
+		t.Fatalf("unacked commit must ask the user to repeat, got instructions %#v", instr)
+	}
+}
+
+// TestLocalCommitFallbackUsesPlainResponseWhenCommitLands: when the server DOES
+// ack the fallback commit (input_audio_buffer.committed), the user's audio became
+// a conversation item, so the response must be a plain response.create.
+func TestLocalCommitFallbackUsesPlainResponseWhenCommitLands(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
+	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "500")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(ctx)
+
+	waitUntil(t, func() bool { return cap.countType("input_audio_buffer.commit") == 1 }, "local fallback did not commit input audio")
+	h.handleEvent(ctx, []byte(`{"type":"input_audio_buffer.committed"}`))
+
+	waitUntil(t, func() bool { return cap.countType("response.create") == 1 }, "acked commit did not request a response")
+	instr := cap.responseCreateInstructions()
+	if len(instr) != 1 || instr[0] != "" {
+		t.Fatalf("acked commit must request a plain response, got instructions %#v", instr)
+	}
+}
+
+// TestLocalCommitFallbackYieldsWhenServerRespondsDuringAckWait: if the server
+// starts its own response while the fallback is waiting for the commit ack (late
+// natural VAD recovery), the fallback must yield instead of stacking a second
+// response.create.
+func TestLocalCommitFallbackYieldsWhenServerRespondsDuringAckWait(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
+	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "200")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(ctx)
+
+	waitUntil(t, func() bool { return cap.countType("input_audio_buffer.commit") == 1 }, "local fallback did not commit input audio")
+	h.handleEvent(ctx, []byte(`{"type":"response.created"}`))
+
+	time.Sleep(350 * time.Millisecond)
+	if got := cap.countType("response.create"); got != 0 {
+		t.Fatalf("server response during ack wait must suppress the fallback response, got %d creates", got)
+	}
+}
+
+// TestLocalCommitFallbackSkipsWhileTaskInFlight: asyncTaskPending is cleared by
+// ANY response.created (the do_task spoken ack) and by injected follow-ups, so it
+// is false for most of a long task run. The fallback must consult the REAL
+// in-flight state (CallState.InFlight) — live 2026-07-02 10:19:56 a mid-task
+// fallback response hallucinated a stock price while the true do_task result was
+// still 18s away.
+func TestLocalCommitFallbackSkipsWhileTaskInFlight(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
+	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "30")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	state.SetInFlightForAgent("查一下特斯拉股价", "")
+	// The spoken ack's response.created has already cleared asyncTaskPending —
+	// exactly the mid-task window where the live hallucination happened.
+	h.asyncTaskPending.Store(false)
+
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+	if got := cap.countType("input_audio_buffer.commit"); got != 0 {
+		t.Fatalf("in-flight task must suppress the fallback commit, got %d", got)
+	}
+	if got := cap.countType("response.create"); got != 0 {
+		t.Fatalf("in-flight task must suppress the fallback response, got %d creates", got)
+	}
+}
+
+// TestLocalCommitFallbackSkipsWhenTaskStartsDuringDelay: a do_task that starts
+// between local speech end and the fallback timer firing must also suppress the
+// fallback (the user's utterance most likely WAS that task request, heard fine).
+func TestLocalCommitFallbackSkipsWhenTaskStartsDuringDelay(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "120")
+	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "30")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(ctx)
+	state.SetInFlightForAgent("查一下特斯拉股价", "") // lands inside the 120 ms fallback delay
+
+	time.Sleep(300 * time.Millisecond)
+	if got := cap.countType("input_audio_buffer.commit"); got != 0 {
+		t.Fatalf("task starting during the fallback delay must suppress the commit, got %d", got)
+	}
+	if got := cap.countType("response.create"); got != 0 {
+		t.Fatalf("task starting during the fallback delay must suppress the response, got %d creates", got)
 	}
 }
 

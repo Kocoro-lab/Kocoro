@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -153,6 +155,52 @@ func (rc *RealtimeConn) dialOpenAI(ctx context.Context, ek string) error {
 	})
 }
 
+// sendTrackStats reconciles "gate passed N frames" with "track actually wrote M
+// frames": when the server goes deaf mid-call the counters rule silent
+// WriteSample/encode failures in or out (they are swallowed on the hot path).
+type sendTrackStats struct {
+	written    uint64
+	writeErrs  uint64
+	encodeErrs uint64
+
+	segStartPassed     uint64
+	segStartWritten    uint64
+	segStartWriteErrs  uint64
+	segStartEncodeErrs uint64
+}
+
+func (s *sendTrackStats) noteWrite(err error) {
+	if err != nil {
+		s.writeErrs++
+		return
+	}
+	s.written++
+}
+
+func (s *sendTrackStats) noteEncodeErr() { s.encodeErrs++ }
+
+// beginSegment snapshots the counters when the mic gate opens; gatePassed is the
+// gate's cumulative PassedFrames at that moment.
+func (s *sendTrackStats) beginSegment(gatePassed uint64) {
+	s.segStartPassed = gatePassed
+	s.segStartWritten = s.written
+	s.segStartWriteErrs = s.writeErrs
+	s.segStartEncodeErrs = s.encodeErrs
+}
+
+// segmentLine renders the per-utterance deltas when the gate closes.
+func (s *sendTrackStats) segmentLine(gatePassed uint64) string {
+	return fmt.Sprintf("gate_passed=%d written=%d write_err=%d encode_err=%d",
+		gatePassed-s.segStartPassed,
+		s.written-s.segStartWritten,
+		s.writeErrs-s.segStartWriteErrs,
+		s.encodeErrs-s.segStartEncodeErrs)
+}
+
+func (s *sendTrackStats) totalsLine() string {
+	return fmt.Sprintf("written=%d write_err=%d encode_err=%d", s.written, s.writeErrs, s.encodeErrs)
+}
+
 // pumpSendTrack Opus-encodes captured frames and writes them to the send track.
 func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 	rc.audio.markSendReady() // unblock the file backend's feedFrames — the session is configured
@@ -161,6 +209,12 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 		gate = newVPIOMicNoiseGate()
 	}
 	defer gate.logStats()
+	stats := &sendTrackStats{}
+	defer func() {
+		if eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1" {
+			log.Printf("koe[audio]: send track stats: %s", stats.totalsLine())
+		}
+	}()
 	pacer := time.NewTicker(audioFrameMs * time.Millisecond)
 	defer pacer.Stop()
 	for {
@@ -179,6 +233,7 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 			for _, out := range gate.process(frame) {
 				enc, err := rc.audio.EncodeFrame(out)
 				if err != nil {
+					stats.noteEncodeErr()
 					continue
 				}
 				select {
@@ -186,15 +241,23 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 					return
 				case <-pacer.C:
 				}
-				_ = rc.sendTrack.WriteSample(media.Sample{
+				stats.noteWrite(rc.sendTrack.WriteSample(media.Sample{
 					Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
-				})
+				}))
 			}
-			if !wasOpen && gate.open && rc.onLocalSpeechStarted != nil {
-				rc.onLocalSpeechStarted()
+			if !wasOpen && gate.open {
+				stats.beginSegment(gate.stats.PassedFrames)
+				if rc.onLocalSpeechStarted != nil {
+					rc.onLocalSpeechStarted()
+				}
 			}
-			if wasOpen && !gate.open && rc.onLocalSpeechEnded != nil {
-				rc.onLocalSpeechEnded()
+			if wasOpen && !gate.open {
+				if eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1" {
+					log.Printf("koe[audio]: send segment: %s", stats.segmentLine(gate.stats.PassedFrames))
+				}
+				if rc.onLocalSpeechEnded != nil {
+					rc.onLocalSpeechEnded()
+				}
 			}
 		}
 	}

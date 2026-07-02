@@ -3,11 +3,39 @@ package koe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+// TestSendTrackStatsSegmentsAndTotals pins the send-side accounting used to
+// reconcile "gate passed N frames" with "track actually wrote M frames" — the
+// counters that rule WriteSample/encode failures in or out when the server goes
+// deaf mid-call (2026-07-02).
+func TestSendTrackStatsSegmentsAndTotals(t *testing.T) {
+	var s sendTrackStats
+	s.beginSegment(10) // gate had already passed 10 frames before this segment
+	s.noteWrite(nil)
+	s.noteWrite(nil)
+	s.noteWrite(errors.New("track closed"))
+	s.noteEncodeErr()
+
+	seg := s.segmentLine(14) // gate passed 4 more frames during the segment
+	for _, want := range []string{"gate_passed=4", "written=2", "write_err=1", "encode_err=1"} {
+		if !strings.Contains(seg, want) {
+			t.Fatalf("segment line missing %q, got %q", want, seg)
+		}
+	}
+
+	totals := s.totalsLine()
+	for _, want := range []string{"written=2", "write_err=1", "encode_err=1"} {
+		if !strings.Contains(totals, want) {
+			t.Fatalf("totals line missing %q, got %q", want, totals)
+		}
+	}
+}
 
 func TestMintEphemeralRequest(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
