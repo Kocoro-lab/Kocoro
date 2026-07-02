@@ -149,6 +149,17 @@ func TestKoePersonaDividesByInformationSource(t *testing.T) {
 	}
 }
 
+// TestKoePersonaGuardsMidTaskCancel: background speech overheard mid-task must
+// not kill the run — cancel only on a clear, explicit stop request; unsure →
+// confirm briefly first (live 2026-07-02: noise cancelled a 53s report task).
+func TestKoePersonaGuardsMidTaskCancel(t *testing.T) {
+	for _, want := range []string{"clear, explicit request to stop", "ask briefly first"} {
+		if !strings.Contains(koePersona, want) {
+			t.Fatalf("koePersona missing mid-task cancel guard %q", want)
+		}
+	}
+}
+
 func TestKoePersonaTreatsLongCompoundRequestsAsActionable(t *testing.T) {
 	for _, want := range []string{"Long or multi-part user utterances", "not wait for \"do it\""} {
 		if !strings.Contains(koePersona, want) {

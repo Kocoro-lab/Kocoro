@@ -29,6 +29,23 @@ func TestToolDefsShape(t *testing.T) {
 	}
 }
 
+// TestCancelDescriptionRequiresExplicitStopRequest: live 2026-07-02 13:57 the
+// S2S model heard 5.8s of background noise mid-task and called cancel, killing a
+// 53s task. The description must set an explicit-request bar for cancelling.
+func TestCancelDescriptionRequiresExplicitStopRequest(t *testing.T) {
+	var desc string
+	for _, d := range ToolDefs() {
+		if d.Name == "cancel" {
+			desc = d.Description
+		}
+	}
+	for _, want := range []string{"clearly and explicitly", "not addressed to you"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("cancel description missing %q", want)
+		}
+	}
+}
+
 // TestDoTaskDescriptionMatchesPersonaContract keeps the tool description in sync
 // with the persona: varied content-free acknowledgement (no single mandated
 // phrase) and the information-source split (conversation-internal one-step
@@ -131,6 +148,26 @@ func TestMapDoTaskOutcomeAttachesContextDigest(t *testing.T) {
 	}
 	if inj := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeInjected}, nil); inj.Context != "" {
 		t.Fatal("injected outcome must not attach a digest")
+	}
+}
+
+// TestMapDoTaskOutcomeCancelledStaysSilent: a user-cancelled run's reply is the
+// tail of whatever was streaming when the run died — live 2026-07-02 13:57 Koe
+// read the killed run's progress line "正在将报告要点写入桌面 Markdown 文件。"
+// right after announcing the cancel. A cancelled outcome must carry status only:
+// the model already acknowledged the stop in its own words when the cancel tool
+// returned, so there is nothing to voice (and no canned phrase either).
+func TestMapDoTaskOutcomeCancelledStaysSilent(t *testing.T) {
+	r := MapDoTaskOutcome(DoTaskOutcome{
+		Kind:        OutcomeCompleted,
+		Reply:       "正在将报告要点写入桌面 Markdown 文件。",
+		FailureCode: "user_cancelled",
+	}, nil)
+	if r.Status != "cancelled" {
+		t.Fatalf("cancelled run status = %q, want cancelled", r.Status)
+	}
+	if r.Say != "" || r.SpokenSummary != "" || r.Context != "" {
+		t.Fatalf("cancelled run must carry no speech or digest, got say=%q spoken=%q ctx=%q", r.Say, r.SpokenSummary, r.Context)
 	}
 }
 

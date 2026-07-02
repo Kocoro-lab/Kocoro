@@ -29,7 +29,7 @@ func ToolDefs() []ToolDef {
 			Description: "do_task — how you actually get things done: your own hands on a full computer. As Kocoro on Kocoro Desktop you can browse and research the web, read and write files, run code and calculate precisely, manage schedules, send email and messages, and run multi-step jobs. Reach for it for ANYTHING whose answer needs the world outside this conversation — real data, a current fact, a date or price, system state, a real action, any calculation beyond one obvious step, or content/results to show in Kocoro Desktop — never answer those from memory or guess. Only conversation-internal one-step replies (small talk, restating an earlier result, trivial arithmetic like 1+1) are answered without it. Call it even when the request is vague or missing details — never quiz the user for them first: Kocoro already knows the user's own context (contacts, addresses, accounts, files, history), and the result will say if something is truly missing. Long or multi-part spoken requests still count: preserve the user's details and do the task instead of waiting for a follow-up like \"do it\". The moment you call it, say exactly one short acknowledgement before the tool call, in the language of the utterance; vary the wording naturally (我来处理 / 我看看 / On it / Let me check), never include an answer, number, fact, or step, and no second sentence. Then speak the result in your own voice when it lands. What comes back to you is a short spoken line plus a context digest of the full answer: use the digest to answer recaps and follow-up questions directly, and call do_task again only for detail, action, or freshness beyond it — referring to that earlier work. The complete report stays in the session and on Kocoro Desktop; mention Kocoro Desktop only when there is genuinely more worth opening there (a long report, a table, code, or images), never as a routine sign-off.",
 			Parameters:  obj(`{"type":"object","properties":{"task":{"type":"string","description":"The task to perform, in the user's own words."},"agent":{"type":"string","description":"Optional: the agent the user named for this task, verbatim. Omit to use the bound agent."}},"required":["task"]}`)},
 		{Type: "function", Name: "cancel",
-			Description: "Cancel the task that is currently running.",
+			Description: "Cancel the task that is currently running. Call it only when the user clearly and explicitly asked you to stop that task. Speech overheard mid-task that is ambiguous, off-topic, or possibly not addressed to you is NOT a cancel request — ignore it, or briefly confirm before cancelling if you think the user might have meant to stop.",
 			Parameters:  obj(`{"type":"object","properties":{"reason":{"type":"string","enum":["user_cancel","interrupt"],"description":"Why the task is being cancelled."}},"required":[]}`)},
 		{Type: "function", Name: "get_status",
 			Description: "Check whether a delegated task is still running.",
@@ -387,6 +387,14 @@ func MapDoTaskOutcome(out DoTaskOutcome, err error) SayResult {
 	}
 	switch out.Kind {
 	case OutcomeCompleted:
+		// A user-cancelled run carries no result to voice: its reply is the tail
+		// of whatever was streaming when the run died (live 2026-07-02: the killed
+		// run's progress line got read aloud right after the cancel). The model
+		// already acknowledged the stop in its own words when the cancel tool
+		// returned — status is all it needs here.
+		if out.FailureCode == "user_cancelled" { // runstatus.CodeUserCancelled, mirrored (koe never imports daemon-side packages)
+			return SayResult{Status: "cancelled", FailReason: out.FailureCode}
+		}
 		status := "ok"
 		if out.Partial {
 			status = "failed"
