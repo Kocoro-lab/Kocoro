@@ -157,6 +157,7 @@ func (h *eventHandler) releaseSpeakingAfter(delay time.Duration) {
 			h.audio.SetSpeaking(false)
 			h.audio.SetPlaybackEnabled(false)
 		}
+		h.maybeRestoreUserMic()
 		h.emitVoiceState(h.voiceStateAfterSpeaking())
 	}()
 }
@@ -217,6 +218,7 @@ func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 			h.audio.SetSpeaking(false)
 			h.audio.SetPlaybackEnabled(false)
 		}
+		h.maybeRestoreUserMic()
 		h.emitVoiceState(h.voiceStateAfterSpeaking())
 	}()
 }
@@ -241,6 +243,7 @@ func (h *eventHandler) interruptOutput() {
 	if hadOutput {
 		_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
 	}
+	h.maybeRestoreUserMic()
 	h.emitVoiceState(h.voiceStateAfterSpeaking())
 }
 
@@ -261,6 +264,22 @@ func (h *eventHandler) observeLocalSpeechStarted() {
 // when DoTask returns.
 func (h *eventHandler) taskInFlight() bool {
 	return h.state != nil && h.state.InFlight() != ""
+}
+
+// maybeRestoreUserMic lifts the user's mic-off once no do_task remains in
+// flight and playback is releasing (koe-mic-off design: restore hooks onto the
+// playback-drain/interrupt release, never the task-zero instant, so room speech
+// cannot race the result response in the ~100ms gap). Called at every
+// speaking-gate release point plus the no-speech task tail — always BEFORE the
+// voice_state emission, so the emitted snapshot already carries mic="on".
+func (h *eventHandler) maybeRestoreUserMic() {
+	if h.audio == nil || !h.audio.UserMicOff() || h.taskInFlight() {
+		return
+	}
+	h.audio.SetUserMicOff(false)
+	if eventLogEnabled() {
+		log.Printf("koe[mic]: user mic restored (tasks drained)")
+	}
 }
 
 func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
@@ -812,6 +831,7 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 				h.requestResponseForSpeech(r.Say) // voice the result (skip when the daemon already replied)
 			} else {
 				h.asyncTaskPending.Store(false)
+				h.maybeRestoreUserMic()
 				h.emitVoiceState("listening")
 			}
 		}()
