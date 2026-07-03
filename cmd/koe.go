@@ -614,6 +614,13 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}
 		ctrl.EmitCallState("on_call")
 		ctrl.EmitVoiceState("listening")
+		// Sound the "ready" earcon once per call (async — the speaking gate mutes
+		// the mic for its duration, so it can't self-trigger the server VAD; see
+		// koe.PlayReadyEarcon). readyEmitted above already guarantees single-fire.
+		if curAudio != nil && koe.ReadyEarconEnabled() {
+			audio := curAudio
+			go audio.PlayReadyEarcon()
+		}
 	}
 	closeSessionLocked := func() (*koe.RealtimeConn, context.CancelFunc, *koe.AudioIO) {
 		sessionSeq++

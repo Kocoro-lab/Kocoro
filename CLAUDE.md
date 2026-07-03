@@ -124,6 +124,7 @@ internal/
     webrtc.go            #   pion mint + SDP + Opus tracks + oai-events data channel + Connect orchestrator (ConnectOptions)
     realtime.go          #   GA session config (create_response:true auto-respond) + oai-events dispatch + reachy say-and-ask do_task (result is the single function_call_output) + voice_state/usage hooks
     control.go           #   ControlServer: Desktop↔Koe HTTP+SSE (POST /call/start|end|interrupt|mic, GET /events: voice_state[+task_pending/mic]/control_app/call_state)
+    earcon.go            #   "ready" earcon (go:embed assets/ready.pcm, 48k mono): PlayReadyEarcon() at emitReadyLocked, SetSpeaking-gated so it can't self-trigger VAD; KOE_READY_EARCON=0 disables
 
 ## Key Conventions
 
