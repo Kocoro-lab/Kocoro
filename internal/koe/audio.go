@@ -46,10 +46,17 @@ type AudioIO struct {
 	// Capture keeps flowing as silent keepalive frames (resolveCaptureFrame),
 	// so the send-track RTP timeline stays continuous during long mutes.
 	userMicOff atomic.Bool
-	playback   atomic.Bool
-	encMu      sync.Mutex
-	decMu      sync.Mutex
-	stopOnce   sync.Once
+	// preferredMicUID / preferredSpeakerUID are CoreAudio device UIDs bound in
+	// Desktop settings (koe.mic_device / koe.speaker_device → --mic-device /
+	// --speaker-device). Empty = system default. Only the VPIO backend honors
+	// them (voice-settings wave §W4); the gate backend logs and ignores —
+	// Desktop, the only device-binding UI, always runs vpio.
+	preferredMicUID     string
+	preferredSpeakerUID string
+	playback            atomic.Bool
+	encMu               sync.Mutex
+	decMu               sync.Mutex
+	stopOnce            sync.Once
 	// vpioActive / vpioDone track the opt-in VoiceProcessingIO backend
 	// (audio_vpio.go). VPIO supplies native echo cancellation, but the product
 	// keeps Desktop audio call-scoped so macOS does not hold the mic while idle.
@@ -167,6 +174,13 @@ func (a *AudioIO) dropCapture() bool  { return a.speaking.Load() }
 // enforcement lives in the /call/mic handler; auto-restore in maybeRestoreUserMic.
 func (a *AudioIO) SetUserMicOff(off bool) { a.userMicOff.Store(off) }
 func (a *AudioIO) UserMicOff() bool       { return a.userMicOff.Load() }
+
+// SetPreferredDevices records the CoreAudio device UIDs StartVPIO binds
+// (empty = system default). Call after NewAudioIO, before Start/StartVPIO.
+func (a *AudioIO) SetPreferredDevices(micUID, speakerUID string) {
+	a.preferredMicUID = micUID
+	a.preferredSpeakerUID = speakerUID
+}
 
 // captureSuppressed is the capture-path gate: speaking gate OR user mic off.
 // Both resolve to silent keepalive frames downstream.
@@ -420,6 +434,9 @@ func audioProbe(step string) {
 // is static on this hardware, see audio_oto.go) and a malgo CAPTURE-ONLY device
 // for the mic.
 func (a *AudioIO) Start() error {
+	if a.preferredMicUID != "" || a.preferredSpeakerUID != "" {
+		log.Printf("koe[audio]: device binding is vpio-only; gate backend uses system defaults")
+	}
 	// Playback: oto (macOS AudioToolbox, high-level). Reuse the process-wide context,
 	// then a fresh player draining playBuf via otoSource.
 	audioProbe("gate start enter")

@@ -531,3 +531,14 @@ func allZeroSamples(a []int16) bool {
 	}
 	return true
 }
+
+func TestSetPreferredDevices(t *testing.T) {
+	a, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	a.SetPreferredDevices("mic-uid", "spk-uid")
+	if a.preferredMicUID != "mic-uid" || a.preferredSpeakerUID != "spk-uid" {
+		t.Fatalf("preferred devices not stored: %q %q", a.preferredMicUID, a.preferredSpeakerUID)
+	}
+}
