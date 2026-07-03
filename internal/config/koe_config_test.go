@@ -20,6 +20,8 @@ func TestLoad_KoeSection(t *testing.T) {
 		"  enabled: true\n" +
 		"  model: gpt-realtime-mini-2025-12-15\n" +
 		"  voice: marin\n" +
+		"  mic_device: BuiltInMicrophoneDevice\n" +
+		"  speaker_device: BuiltInSpeakerDevice\n" +
 		"  agent: finance\n" +
 		"  language: ja\n"
 	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(yaml), 0600); err != nil {
@@ -38,6 +40,9 @@ func TestLoad_KoeSection(t *testing.T) {
 	}
 	if cfg.Koe.Voice != "marin" || cfg.Koe.Agent != "finance" || cfg.Koe.Language != "ja" {
 		t.Errorf("koe section not loaded as expected: %+v", cfg.Koe)
+	}
+	if cfg.Koe.MicDevice != "BuiltInMicrophoneDevice" || cfg.Koe.SpeakerDevice != "BuiltInSpeakerDevice" {
+		t.Fatalf("koe device fields not parsed: mic=%q speaker=%q", cfg.Koe.MicDevice, cfg.Koe.SpeakerDevice)
 	}
 }
 

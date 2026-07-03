@@ -55,6 +55,12 @@ type KoeConfig struct {
 	Voice    string `mapstructure:"voice"    yaml:"voice,omitempty"    json:"voice,omitempty"`
 	Agent    string `mapstructure:"agent"    yaml:"agent,omitempty"    json:"agent,omitempty"`
 	Language string `mapstructure:"language" yaml:"language,omitempty" json:"language,omitempty"`
+	// MicDevice / SpeakerDevice are CoreAudio device UIDs the user bound in
+	// Kocoro Desktop (Settings → Voice → Audio Devices). Empty = system
+	// default. Desktop forwards them to `shan koe` as --mic-device /
+	// --speaker-device; only the VPIO backend honors them.
+	MicDevice     string `mapstructure:"mic_device"     yaml:"mic_device,omitempty"     json:"mic_device,omitempty"`
+	SpeakerDevice string `mapstructure:"speaker_device" yaml:"speaker_device,omitempty" json:"speaker_device,omitempty"`
 }
 
 // MCPConfig holds client-side settings shared across all MCP servers.
