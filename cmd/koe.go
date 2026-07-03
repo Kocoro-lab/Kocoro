@@ -939,8 +939,11 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	})
 	go func() {
 		addr := "127.0.0.1:" + cfg.controlPort
+		// A dead control channel makes this process unreachable to Desktop, whose
+		// respawn logic sees a live PID and never restarts it — so exit and let
+		// Desktop's terminationHandler respawn koe cleanly on a fresh port.
 		if err := http.ListenAndServe(addr, ctrl.Handler()); err != nil {
-			log.Printf("koe: control server on %s exited: %v", addr, err)
+			log.Fatalf("koe: control server on %s exited: %v", addr, err)
 		}
 	}()
 

@@ -63,7 +63,7 @@ func (c *DaemonClient) MintViaDaemon(ctx context.Context, model string) (string,
 		Value string `json:"value"`
 	}
 	if err := json.Unmarshal(raw, &mint); err != nil || mint.Value == "" {
-		return "", fmt.Errorf("daemon mint parse failed: %v body=%s", err, string(raw))
+		return "", fmt.Errorf("daemon mint parse failed: %v (body %d bytes)", err, len(raw))
 	}
 	return mint.Value, nil
 }

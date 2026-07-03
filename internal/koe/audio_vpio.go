@@ -436,7 +436,7 @@ func (a *AudioIO) StartVPIO() error {
 	if st := C.vpioStartC(C.double(audioSampleRate), C.int(ringCap), C.int(prerollFrames*audioFrameSize), micUID, spkUID); st != 0 {
 		return fmt.Errorf("vpio start: OSStatus %d", int(st))
 	}
-	a.vpioActive = true
+	a.vpioActive.Store(true)
 	a.vpioDone = make(chan struct{})
 	a.vpioWG.Add(2)
 	go a.vpioCaptureLoop()
@@ -445,7 +445,7 @@ func (a *AudioIO) StartVPIO() error {
 }
 
 func (a *AudioIO) clearVPIOBuffers() {
-	if a.vpioActive {
+	if a.vpioActive.Load() {
 		C.vpioClearBuffers()
 	}
 }
@@ -457,7 +457,7 @@ func (a *AudioIO) stopVPIO() {
 	}
 	a.vpioWG.Wait()
 	C.vpioFreeRingsC()
-	a.vpioActive = false
+	a.vpioActive.Store(false)
 	a.vpioDone = nil
 }
 

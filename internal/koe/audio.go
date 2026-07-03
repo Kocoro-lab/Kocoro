@@ -63,7 +63,7 @@ type AudioIO struct {
 	// (audio_vpio.go). VPIO supplies native echo cancellation, but the product
 	// keeps Desktop audio call-scoped so macOS does not hold the mic while idle.
 	// Explicit barge-in experiments can opt into a stricter local energy gate.
-	vpioActive      bool
+	vpioActive      atomic.Bool
 	vpioDone        chan struct{}
 	vpioWG          sync.WaitGroup
 	vpioBargeFrames int
@@ -515,6 +515,14 @@ func (a *AudioIO) Start() error {
 	a.dev = dev
 	audioProbe("malgo device start begin")
 	if err := dev.Start(); err != nil {
+		// The device inited but did not start — uninit it and free the context
+		// (and the oto player) here rather than leaking until a caller invokes Stop().
+		dev.Uninit()
+		a.dev = nil
+		_ = ctx.Uninit()
+		ctx.Free()
+		a.ctx = nil
+		a.closeOtoPlayer()
 		return err
 	}
 	audioProbe("malgo device start done")
@@ -542,7 +550,7 @@ func (a *AudioIO) Stop() {
 			a.stopFile() // audio_file.go: stop feed+capture goroutines, flush the WAV
 			return
 		}
-		if a.vpioActive {
+		if a.vpioActive.Load() {
 			a.LogDebugStats()
 			a.stopVPIO()
 			return
@@ -563,13 +571,13 @@ func (a *AudioIO) LogDebugStats() {
 	if os.Getenv("KOE_AUDIO_LOG") != "1" && os.Getenv("KOE_EVENT_LOG") != "1" {
 		return
 	}
-	if a.vpioActive {
+	if a.vpioActive.Load() {
 		log.Printf("koe[audio]: vpio stats: %+v", a.vpioDebugStatsSinceBase())
 	}
 }
 
 func (a *AudioIO) resetVPIOCallStats() {
-	if !a.vpioActive {
+	if !a.vpioActive.Load() {
 		return
 	}
 	a.vpioStatsMu.Lock()
@@ -604,7 +612,7 @@ func (a *AudioIO) vpioDebugStatsSinceBase() vpioDebugStats {
 }
 
 func (a *AudioIO) trackVPIOMaxOutput(level float64) {
-	if !a.vpioActive {
+	if !a.vpioActive.Load() {
 		return
 	}
 	for {

@@ -25,7 +25,7 @@ maybe_load_openai_key() {
   if [[ -n "${OPENAI_API_KEY:-}" ]]; then
     return
   fi
-  local env_file="${KOE_OPENAI_ENV_FILE:-$HOME/Desktop/projects/reachy/kocoro-reachy/.env}"
+  local env_file="${KOE_OPENAI_ENV_FILE:-}"
   if [[ -f "$env_file" ]]; then
     OPENAI_API_KEY="$(grep '^OPENAI_API_KEY=' "$env_file" | head -1 | cut -d= -f2- || true)"
     export OPENAI_API_KEY

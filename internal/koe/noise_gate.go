@@ -17,7 +17,6 @@ const (
 	defaultMicGateNoiseMultiplier = 2.0
 	defaultMicGateStartMS         = 160
 	defaultMicGateHangoverMS      = 2000
-	defaultMicGateEndpointMS      = 2000
 	micGateHotEvidenceWeight      = 2
 	micGateNoiseAlpha             = 0.04
 )
@@ -41,14 +40,12 @@ type micNoiseGate struct {
 	noiseMultiplier float64
 	startFrames     int
 	hangoverFrames  int
-	endpointFrames  int
 
 	noiseFloor float64
 	maxLevel   float64
 	hotFrames  int
 	startScore int
 	hangover   int
-	endpoint   int
 	open       bool
 	pending    [][]int16
 
@@ -64,7 +61,6 @@ func newMicNoiseGate() *micNoiseGate {
 		noiseMultiplier: koeEnvFloat("KOE_MIC_GATE_NOISE_MULTIPLIER", defaultMicGateNoiseMultiplier),
 		startFrames:     msToAudioFrames(koeEnvInt("KOE_MIC_GATE_START_MS", defaultMicGateStartMS)),
 		hangoverFrames:  msToAudioFrames(koeEnvInt("KOE_MIC_GATE_HANGOVER_MS", defaultMicGateHangoverMS)),
-		endpointFrames:  msToAudioFrames(koeEnvInt("KOE_MIC_GATE_ENDPOINT_MS", defaultMicGateEndpointMS)),
 		zero:            make([]int16, audioFrameSize),
 	}
 }
@@ -110,7 +106,6 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 			if g.hangover <= 0 {
 				g.open = false
 				g.hotFrames = 0
-				g.endpoint = g.endpointFrames
 			}
 		}
 		if g.open {
@@ -122,7 +117,6 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 	// Real speech often has low-energy consonant gaps; score evidence lets those
 	// gaps decay gradually instead of resetting the start window to zero.
 	if hot {
-		g.endpoint = 0
 		g.hotFrames++
 		g.startScore += micGateHotEvidenceWeight
 		if g.startScore > g.startFrames {
@@ -161,10 +155,6 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 	}
 
 	g.stats.MutedFrames++
-	if g.endpoint > 0 {
-		g.endpoint--
-		return [][]int16{g.zero}
-	}
 	return [][]int16{g.zero}
 }
 
@@ -172,7 +162,6 @@ func (g *micNoiseGate) resetState() {
 	g.hotFrames = 0
 	g.startScore = 0
 	g.hangover = 0
-	g.endpoint = 0
 	g.open = false
 	g.pending = g.pending[:0]
 }

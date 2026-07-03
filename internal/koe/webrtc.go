@@ -53,7 +53,7 @@ func mintEphemeralAt(ctx context.Context, url, apiKey, model string) (string, er
 		Value string `json:"value"`
 	}
 	if err := json.Unmarshal(raw, &mint); err != nil || mint.Value == "" {
-		return "", fmt.Errorf("mint parse failed: %v body=%s", err, string(raw))
+		return "", fmt.Errorf("mint parse failed: %v (body %d bytes)", err, len(raw))
 	}
 	return mint.Value, nil
 }

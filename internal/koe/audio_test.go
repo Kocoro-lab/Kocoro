@@ -160,7 +160,7 @@ func TestSubUint64ClampsCounterReset(t *testing.T) {
 
 func TestVPIODebugStatsTracksMaxOutputLevel(t *testing.T) {
 	a, _ := NewAudioIO()
-	a.vpioActive = true
+	a.vpioActive.Store(true)
 	a.resetVPIOCallStats()
 
 	a.setOutputLevel(0.12)
