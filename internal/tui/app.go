@@ -447,6 +447,11 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	loop := agent.NewAgentLoop(llmClient, reg, runtimeCfg.ModelTier, shannonDir, runtimeCfg.Agent.MaxIterations, runtimeCfg.Tools.ResultTruncation, runtimeCfg.Tools.ArgsTruncation, &runtimeCfg.Permissions, auditor, hookRunner)
 	loop.SetMaxTokens(runtimeCfg.Agent.MaxTokens)
 	loop.SetTemperature(runtimeCfg.Agent.Temperature)
+	// Browser/GUI context trimming (config-gated; defaults ON via viper).
+	loop.SetObservationWindow(runtimeCfg.Agent.ObservationWindow)
+	loop.SetBrowserObservationMaxChars(runtimeCfg.Tools.BrowserResultTruncation)
+	loop.SetMaxRecentImages(runtimeCfg.Agent.MaxRecentImages)
+	loop.SetMaxRecentBrowserImages(runtimeCfg.Agent.MaxRecentBrowserImages)
 	// Seed from the configured model and the session's last-seen model so
 	// the first preflight check after a resume/agent-switch uses the right
 	// cap, instead of falling back to the static config until the next
@@ -641,6 +646,11 @@ func (m *Model) rebuildAgentLoop() {
 	loop := agent.NewAgentLoop(m.llmClient, m.toolRegistry, m.cfg.ModelTier, m.shannonDir, m.cfg.Agent.MaxIterations, m.cfg.Tools.ResultTruncation, m.cfg.Tools.ArgsTruncation, &m.cfg.Permissions, m.auditor, m.hookRunner)
 	loop.SetMaxTokens(m.cfg.Agent.MaxTokens)
 	loop.SetTemperature(m.cfg.Agent.Temperature)
+	// Browser/GUI context trimming (config-gated; defaults ON via viper).
+	loop.SetObservationWindow(m.cfg.Agent.ObservationWindow)
+	loop.SetBrowserObservationMaxChars(m.cfg.Tools.BrowserResultTruncation)
+	loop.SetMaxRecentImages(m.cfg.Agent.MaxRecentImages)
+	loop.SetMaxRecentBrowserImages(m.cfg.Agent.MaxRecentBrowserImages)
 	// Seed the soft context window from the configured model + the
 	// currently-active session's last-seen model. After an agent switch
 	// the session may already carry usage from prior turns served by a

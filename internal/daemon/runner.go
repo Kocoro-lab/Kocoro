@@ -2060,6 +2060,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		&runCfg.Permissions, deps.Auditor, deps.HookRunner)
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
+	// Browser/GUI context trimming (config-gated; defaults ON via viper).
+	loop.SetObservationWindow(runCfg.Agent.ObservationWindow)
+	loop.SetBrowserObservationMaxChars(runCfg.Tools.BrowserResultTruncation)
+	loop.SetMaxRecentImages(runCfg.Agent.MaxRecentImages)
+	loop.SetMaxRecentBrowserImages(runCfg.Agent.MaxRecentBrowserImages)
 	// Seed the soft context window from the configured model or the last
 	// model observed on this session, falling back to the static config.
 	// Without this, every routed daemon turn would re-seed at the static
