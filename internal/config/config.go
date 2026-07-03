@@ -81,6 +81,19 @@ type AgentConfig struct {
 	Model           string `mapstructure:"model"            yaml:"model"            json:"model"`          // specific model override
 	Language        string `mapstructure:"language"         yaml:"language"         json:"language"`       // locked reply language as a native name (e.g. "中文"); empty = mirror the user's current-message language
 	ContextWindow   int    `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"` // model context window in tokens
+	// ObservationWindow keeps only the N most recent browser/GUI tool
+	// observations at full fidelity; older ones are stubbed to bound the
+	// page/DOM history a long browser loop re-sends each iteration. 0 disables.
+	// Default 3 (see agent.defaultObservationWindow).
+	ObservationWindow int `mapstructure:"observation_window" yaml:"observation_window" json:"observation_window"`
+	// MaxRecentImages keeps the N most recent image-bearing messages before
+	// older screenshots are replaced with a placeholder (all images). Default
+	// 50; 0 disables the global filter (keep all).
+	MaxRecentImages int `mapstructure:"max_recent_images" yaml:"max_recent_images" json:"max_recent_images"`
+	// MaxRecentBrowserImages keeps only the N most recent browser/GUI
+	// screenshots (scoped by tool); user uploads + non-GUI images stay under
+	// MaxRecentImages. Default 1; 0 disables the browser-scoped filter.
+	MaxRecentBrowserImages int `mapstructure:"max_recent_browser_images" yaml:"max_recent_browser_images" json:"max_recent_browser_images"`
 	// IdleSoftTimeoutSecs / IdleHardTimeoutSecs: turn-level watchdog measured
 	// against explicit "idle-counted" phases of the agent loop (waiting on an
 	// LLM response). Other phases (tool execution, approval wait, compaction
@@ -172,6 +185,10 @@ type ToolsConfig struct {
 	ResultTruncation  int `mapstructure:"result_truncation"   yaml:"result_truncation"   json:"result_truncation"`
 	ArgsTruncation    int `mapstructure:"args_truncation"     yaml:"args_truncation"     json:"args_truncation"`
 	ServerToolTimeout int `mapstructure:"server_tool_timeout" yaml:"server_tool_timeout" json:"server_tool_timeout"`
+	// BrowserResultTruncation caps a single browser/GUI observation at capture
+	// time; smaller than ResultTruncation because page/DOM dumps are large and
+	// front-loaded. 0 falls back to the generic cap. Default 24000.
+	BrowserResultTruncation int `mapstructure:"browser_result_truncation" yaml:"browser_result_truncation" json:"browser_result_truncation"`
 }
 
 type CloudConfig struct {
@@ -351,6 +368,12 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.time_based_compact.enabled", false)
 	viper.SetDefault("agent.time_based_compact.gap_threshold_minutes", 60)
 	viper.SetDefault("agent.time_based_compact.keep_recent", 5)
+	// Browser/GUI context trimming (see internal/agent/observation_window.go).
+	// Defaults ON: they bound the accumulated page/DOM history a long browser
+	// loop re-sends each iteration. observation_window=0 disables the window.
+	viper.SetDefault("agent.observation_window", 3)
+	viper.SetDefault("agent.max_recent_images", 50)
+	viper.SetDefault("agent.max_recent_browser_images", 1)
 	// Prompt suggestion (post-turn ghost text). Enabled by default —
 	// the daemon runs a forked completion call after each turn to
 	// generate a single 2-12 word follow-up suggestion. See
@@ -362,6 +385,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("tools.bash_max_timeout", 600)
 	viper.SetDefault("tools.bash_max_output", 30000)
 	viper.SetDefault("tools.result_truncation", 30000)
+	viper.SetDefault("tools.browser_result_truncation", 24000) // tighter per-observation cap for browser/GUI page/DOM dumps; 0 = fall back to result_truncation
 	viper.SetDefault("tools.args_truncation", 200)
 	viper.SetDefault("tools.server_tool_timeout", 5)
 	viper.SetDefault("daemon.auto_approve", false)
@@ -678,16 +702,19 @@ type overlayMemoryConfig struct {
 }
 
 type overlayAgentConfig struct {
-	MaxIterations   *int     `yaml:"max_iterations"`
-	Temperature     *float64 `yaml:"temperature"`
-	MaxTokens       *int     `yaml:"max_tokens"`
-	Thinking        *bool    `yaml:"thinking"`
-	ThinkingMode    *string  `yaml:"thinking_mode"`
-	ThinkingBudget  *int     `yaml:"thinking_budget"`
-	ForceThinkTool  *bool    `yaml:"force_think_tool"`
-	ReasoningEffort *string  `yaml:"reasoning_effort"`
-	Model           *string  `yaml:"model"`
-	ContextWindow   *int     `yaml:"context_window"`
+	MaxIterations          *int     `yaml:"max_iterations"`
+	Temperature            *float64 `yaml:"temperature"`
+	MaxTokens              *int     `yaml:"max_tokens"`
+	Thinking               *bool    `yaml:"thinking"`
+	ThinkingMode           *string  `yaml:"thinking_mode"`
+	ThinkingBudget         *int     `yaml:"thinking_budget"`
+	ForceThinkTool         *bool    `yaml:"force_think_tool"`
+	ReasoningEffort        *string  `yaml:"reasoning_effort"`
+	Model                  *string  `yaml:"model"`
+	ContextWindow          *int     `yaml:"context_window"`
+	ObservationWindow      *int     `yaml:"observation_window"`
+	MaxRecentImages        *int     `yaml:"max_recent_images"`
+	MaxRecentBrowserImages *int     `yaml:"max_recent_browser_images"`
 
 	IdleSoftTimeoutSecs   *int  `yaml:"idle_soft_timeout_secs"`
 	IdleHardTimeoutSecs   *int  `yaml:"idle_hard_timeout_secs"`
@@ -716,41 +743,46 @@ type overlayPromptSuggestionConfig struct {
 }
 
 type overlayToolsConfig struct {
-	BashTimeout       *int `yaml:"bash_timeout"`
-	BashMaxTimeout    *int `yaml:"bash_max_timeout"`
-	BashMaxOutput     *int `yaml:"bash_max_output"`
-	ResultTruncation  *int `yaml:"result_truncation"`
-	ArgsTruncation    *int `yaml:"args_truncation"`
-	ServerToolTimeout *int `yaml:"server_tool_timeout"`
+	BashTimeout             *int `yaml:"bash_timeout"`
+	BashMaxTimeout          *int `yaml:"bash_max_timeout"`
+	BashMaxOutput           *int `yaml:"bash_max_output"`
+	ResultTruncation        *int `yaml:"result_truncation"`
+	ArgsTruncation          *int `yaml:"args_truncation"`
+	ServerToolTimeout       *int `yaml:"server_tool_timeout"`
+	BrowserResultTruncation *int `yaml:"browser_result_truncation"`
 }
 
 // buildDefaultSources returns source entries for all config keys set to "default".
 func buildDefaultSources() map[string]ConfigSource {
 	return map[string]ConfigSource{
-		"endpoint":                       {Level: "default"},
-		"api_key":                        {Level: "default"},
-		"model_tier":                     {Level: "default"},
-		"auto_update_check":              {Level: "default"},
-		"agent.max_iterations":           {Level: "default"},
-		"agent.temperature":              {Level: "default"},
-		"agent.max_tokens":               {Level: "default"},
-		"agent.thinking":                 {Level: "default"},
-		"agent.thinking_mode":            {Level: "default"},
-		"agent.thinking_budget":          {Level: "default"},
-		"agent.force_think_tool":         {Level: "default"},
-		"agent.reasoning_effort":         {Level: "default"},
-		"agent.model":                    {Level: "default"},
-		"agent.context_window":           {Level: "default"},
-		"agent.idle_soft_timeout_secs":   {Level: "default"},
-		"agent.idle_hard_timeout_secs":   {Level: "default"},
-		"agent.stream_idle_timeout_secs": {Level: "default"},
-		"agent.bash_concurrency_enabled": {Level: "default"},
-		"tools.bash_timeout":             {Level: "default"},
-		"tools.bash_max_timeout":         {Level: "default"},
-		"tools.bash_max_output":          {Level: "default"},
-		"tools.result_truncation":        {Level: "default"},
-		"tools.args_truncation":          {Level: "default"},
-		"tools.server_tool_timeout":      {Level: "default"},
+		"endpoint":                        {Level: "default"},
+		"api_key":                         {Level: "default"},
+		"model_tier":                      {Level: "default"},
+		"auto_update_check":               {Level: "default"},
+		"agent.max_iterations":            {Level: "default"},
+		"agent.temperature":               {Level: "default"},
+		"agent.max_tokens":                {Level: "default"},
+		"agent.thinking":                  {Level: "default"},
+		"agent.thinking_mode":             {Level: "default"},
+		"agent.thinking_budget":           {Level: "default"},
+		"agent.force_think_tool":          {Level: "default"},
+		"agent.reasoning_effort":          {Level: "default"},
+		"agent.model":                     {Level: "default"},
+		"agent.context_window":            {Level: "default"},
+		"agent.observation_window":        {Level: "default"},
+		"agent.max_recent_images":         {Level: "default"},
+		"agent.max_recent_browser_images": {Level: "default"},
+		"agent.idle_soft_timeout_secs":    {Level: "default"},
+		"agent.idle_hard_timeout_secs":    {Level: "default"},
+		"agent.stream_idle_timeout_secs":  {Level: "default"},
+		"agent.bash_concurrency_enabled":  {Level: "default"},
+		"tools.bash_timeout":              {Level: "default"},
+		"tools.bash_max_timeout":          {Level: "default"},
+		"tools.bash_max_output":           {Level: "default"},
+		"tools.result_truncation":         {Level: "default"},
+		"tools.browser_result_truncation": {Level: "default"},
+		"tools.args_truncation":           {Level: "default"},
+		"tools.server_tool_timeout":       {Level: "default"},
 	}
 }
 
@@ -800,6 +832,15 @@ func markGlobalSources(cfg *Config, file string) {
 	if viper.IsSet("agent.context_window") {
 		cfg.Sources["agent.context_window"] = src
 	}
+	if viper.IsSet("agent.observation_window") {
+		cfg.Sources["agent.observation_window"] = src
+	}
+	if viper.IsSet("agent.max_recent_images") {
+		cfg.Sources["agent.max_recent_images"] = src
+	}
+	if viper.IsSet("agent.max_recent_browser_images") {
+		cfg.Sources["agent.max_recent_browser_images"] = src
+	}
 	if viper.IsSet("agent.idle_soft_timeout_secs") {
 		cfg.Sources["agent.idle_soft_timeout_secs"] = src
 	}
@@ -823,6 +864,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("tools.result_truncation") {
 		cfg.Sources["tools.result_truncation"] = src
+	}
+	if viper.IsSet("tools.browser_result_truncation") {
+		cfg.Sources["tools.browser_result_truncation"] = src
 	}
 	if viper.IsSet("tools.args_truncation") {
 		cfg.Sources["tools.args_truncation"] = src
@@ -931,6 +975,18 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 			cfg.Agent.ContextWindow = *overlay.Agent.ContextWindow
 			cfg.Sources["agent.context_window"] = src
 		}
+		if overlay.Agent.ObservationWindow != nil {
+			cfg.Agent.ObservationWindow = *overlay.Agent.ObservationWindow
+			cfg.Sources["agent.observation_window"] = src
+		}
+		if overlay.Agent.MaxRecentImages != nil {
+			cfg.Agent.MaxRecentImages = *overlay.Agent.MaxRecentImages
+			cfg.Sources["agent.max_recent_images"] = src
+		}
+		if overlay.Agent.MaxRecentBrowserImages != nil {
+			cfg.Agent.MaxRecentBrowserImages = *overlay.Agent.MaxRecentBrowserImages
+			cfg.Sources["agent.max_recent_browser_images"] = src
+		}
 		if overlay.Agent.IdleSoftTimeoutSecs != nil {
 			cfg.Agent.IdleSoftTimeoutSecs = *overlay.Agent.IdleSoftTimeoutSecs
 			cfg.Sources["agent.idle_soft_timeout_secs"] = src
@@ -999,6 +1055,10 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Tools.ResultTruncation != nil {
 			cfg.Tools.ResultTruncation = *overlay.Tools.ResultTruncation
 			cfg.Sources["tools.result_truncation"] = src
+		}
+		if overlay.Tools.BrowserResultTruncation != nil {
+			cfg.Tools.BrowserResultTruncation = *overlay.Tools.BrowserResultTruncation
+			cfg.Sources["tools.browser_result_truncation"] = src
 		}
 		if overlay.Tools.ArgsTruncation != nil {
 			cfg.Tools.ArgsTruncation = *overlay.Tools.ArgsTruncation
@@ -1140,6 +1200,20 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.Cloud.StreamIdleTimeoutSecs < 0 {
 		return fmt.Errorf("cloud.stream_idle_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Cloud.StreamIdleTimeoutSecs)
+	}
+	// Browser/GUI context-trimming knobs: 0 is a valid "disabled/fallback"
+	// sentinel; negative is a typo that would silently disable the feature.
+	if cfg.Agent.ObservationWindow < 0 {
+		return fmt.Errorf("agent.observation_window (%d) must be >= 0 (0 = disabled)", cfg.Agent.ObservationWindow)
+	}
+	if cfg.Agent.MaxRecentImages < 0 {
+		return fmt.Errorf("agent.max_recent_images (%d) must be >= 0 (0 = disabled)", cfg.Agent.MaxRecentImages)
+	}
+	if cfg.Agent.MaxRecentBrowserImages < 0 {
+		return fmt.Errorf("agent.max_recent_browser_images (%d) must be >= 0 (0 = disabled)", cfg.Agent.MaxRecentBrowserImages)
+	}
+	if cfg.Tools.BrowserResultTruncation < 0 {
+		return fmt.Errorf("tools.browser_result_truncation (%d) must be >= 0 (0 = fall back to result_truncation)", cfg.Tools.BrowserResultTruncation)
 	}
 	return nil
 }
