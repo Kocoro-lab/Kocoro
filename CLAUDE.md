@@ -24,7 +24,7 @@ cmd/
   daemon.go            # shan daemon start/stop/status
   schedule.go          # shan schedule CRUD
   update.go            # /update command
-  koe.go               # shan koe — voice front-brain (OpenAI Realtime + Desktop control + via-daemon mint)
+  koe.go               # shan koe — voice front-brain (OpenAI Realtime + Desktop control + via-daemon mint); --mic-device/--speaker-device pass CoreAudio device UIDs (from koe.mic_device/speaker_device) that the VPIO backend binds, empty = system default
 
 internal/
   daemon/                              # ── PRIMARY PRODUCTION PATH ──

@@ -315,7 +315,7 @@ static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples,
         st = AudioUnitSetProperty(gVAU, kAudioOutputUnitProperty_CurrentDevice,
             kAudioUnitScope_Global, 1, &inDev, sizeof(inDev));
         if (st != noErr) fprintf(stderr, "koe[vpio]: bind input device failed OSStatus %d - using default\n", (int)st);
-        else vpioProbe("input device bound");
+        else fprintf(stderr, "koe[vpio]: bound input device %s\n", micUID);
     } else if (micUID && micUID[0]) {
         fprintf(stderr, "koe[vpio]: input device UID not found - using default\n");
     }
@@ -324,7 +324,7 @@ static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples,
         st = AudioUnitSetProperty(gVAU, kAudioOutputUnitProperty_CurrentDevice,
             kAudioUnitScope_Global, 0, &outDev, sizeof(outDev));
         if (st != noErr) fprintf(stderr, "koe[vpio]: bind output device failed OSStatus %d - using default\n", (int)st);
-        else vpioProbe("output device bound");
+        else fprintf(stderr, "koe[vpio]: bound output device %s\n", spkUID);
     } else if (spkUID && spkUID[0]) {
         fprintf(stderr, "koe[vpio]: output device UID not found - using default\n");
     }
