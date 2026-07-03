@@ -123,7 +123,7 @@ internal/
     audio.go             #   malgo duplex (CoreAudio) + Opus codec + half-duplex gate (cgo: PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig)
     webrtc.go            #   pion mint + SDP + Opus tracks + oai-events data channel + Connect orchestrator (ConnectOptions)
     realtime.go          #   GA session config (create_response:true auto-respond) + oai-events dispatch + reachy say-and-ask do_task (result is the single function_call_output) + voice_state/usage hooks
-    control.go           #   ControlServer: Desktop↔Koe HTTP+SSE (POST /call/start|end, GET /events: voice_state/control_app/call_state)
+    control.go           #   ControlServer: Desktop↔Koe HTTP+SSE (POST /call/start|end|interrupt|mic, GET /events: voice_state[+task_pending/mic]/control_app/call_state)
 
 ## Key Conventions
 
