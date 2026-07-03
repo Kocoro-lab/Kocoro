@@ -236,7 +236,29 @@ static void vpioCleanupC(void) {
     vpioFreeRingsC();
 }
 
-static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples) {
+// vpioDeviceForUID resolves a CoreAudio device UID to its AudioDeviceID.
+// Returns kAudioObjectUnknown for empty/NULL/unresolvable UIDs (caller keeps
+// the system default in that case).
+static AudioDeviceID vpioDeviceForUID(const char *uid) {
+    if (!uid || uid[0] == '\0') return kAudioObjectUnknown;
+    CFStringRef cfuid = CFStringCreateWithCString(NULL, uid, kCFStringEncodingUTF8);
+    if (!cfuid) return kAudioObjectUnknown;
+    AudioDeviceID dev = kAudioObjectUnknown;
+    UInt32 size = sizeof(dev);
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyTranslateUIDToDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    OSStatus st = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr,
+        sizeof(cfuid), &cfuid, &size, &dev);
+    CFRelease(cfuid);
+    if (st != noErr) return kAudioObjectUnknown;
+    return dev;
+}
+
+static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples,
+                           const char *micUID, const char *spkUID) {
     vpioProbe("start enter");
     ringInit(&gMicRing, ringCap, NULL);
     ringInit(&gPlayRing, ringCap, &gPlayOverwrites);
@@ -285,6 +307,27 @@ static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples) {
     st = AudioUnitSetProperty(gVAU, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &one, sizeof(one));
     if (st != noErr) { vpioCleanupC(); return st; }
     vpioProbe("EnableIO output done");
+    // Optional device binding (voice-settings wave §W4): input on element 1,
+    // output on element 0 — the Chromium VPIO pattern. Failure is non-fatal:
+    // warn to stderr (→ koe.log) and keep the system default.
+    AudioDeviceID inDev = vpioDeviceForUID(micUID);
+    if (inDev != kAudioObjectUnknown) {
+        st = AudioUnitSetProperty(gVAU, kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global, 1, &inDev, sizeof(inDev));
+        if (st != noErr) fprintf(stderr, "koe[vpio]: bind input device failed OSStatus %d - using default\n", (int)st);
+        else vpioProbe("input device bound");
+    } else if (micUID && micUID[0]) {
+        fprintf(stderr, "koe[vpio]: input device UID not found - using default\n");
+    }
+    AudioDeviceID outDev = vpioDeviceForUID(spkUID);
+    if (outDev != kAudioObjectUnknown) {
+        st = AudioUnitSetProperty(gVAU, kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global, 0, &outDev, sizeof(outDev));
+        if (st != noErr) fprintf(stderr, "koe[vpio]: bind output device failed OSStatus %d - using default\n", (int)st);
+        else vpioProbe("output device bound");
+    } else if (spkUID && spkUID[0]) {
+        fprintf(stderr, "koe[vpio]: output device UID not found - using default\n");
+    }
     vpioProbe("BypassVoiceProcessing begin");
     st = AudioUnitSetProperty(gVAU, kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global, 0, &zero, sizeof(zero));
     if (st != noErr) { vpioCleanupC(); return st; }
@@ -386,7 +429,11 @@ type vpioDebugStats struct {
 // quiet during playback by default. Experimental barge-in must opt in.
 func (a *AudioIO) StartVPIO() error {
 	const ringCap = audioSampleRate * 2 // ~2s of mono S16 per direction
-	if st := C.vpioStartC(C.double(audioSampleRate), C.int(ringCap), C.int(prerollFrames*audioFrameSize)); st != 0 {
+	micUID := C.CString(a.preferredMicUID)
+	spkUID := C.CString(a.preferredSpeakerUID)
+	defer C.free(unsafe.Pointer(micUID))
+	defer C.free(unsafe.Pointer(spkUID))
+	if st := C.vpioStartC(C.double(audioSampleRate), C.int(ringCap), C.int(prerollFrames*audioFrameSize), micUID, spkUID); st != 0 {
 		return fmt.Errorf("vpio start: OSStatus %d", int(st))
 	}
 	a.vpioActive = true
