@@ -1,3 +1,5 @@
+//go:build darwin && cgo
+
 // Package koe is the voice front-brain's process-local library: the HTTP link to
 // the daemon back-brain, the agent name-resolution ladder, and the voice-tool
 // schemas. It talks to the daemon over localhost JSON and never imports

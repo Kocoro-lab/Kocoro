@@ -1,3 +1,5 @@
+//go:build darwin && cgo
+
 package koe
 
 // Headless voice E2E for C-minimal. Instead of a live mic + ears, it speaks a

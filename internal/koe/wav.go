@@ -1,3 +1,5 @@
+//go:build darwin && cgo
+
 package koe
 
 // wav.go — WAV read/write, audio metrics, and speech synthesis for the headless
