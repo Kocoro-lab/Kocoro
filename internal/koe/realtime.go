@@ -820,11 +820,21 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 		h.asyncTaskPending.Store(true)
 		h.emitVoiceState("thinking") // delegating; the model's call-turn ack already played
 		go func() {
+			// do_task must survive session teardown: a hangup cancels the session ctx
+			// that Connect rides, which would abort this in-flight POST /message and
+			// kill the back-brain run mid-turn — contradicting do_task's contract that
+			// the report persists in the session / Kocoro Desktop. So the delegation
+			// call + its result tail ride a cancel-detached copy. The goroutine's only
+			// remaining lifetime bound is the daemon responding, guaranteed by the
+			// daemon's idle watchdog (matches doTaskClient's Timeout:0, daemon-controlled).
+			// The tail no-ops gracefully when the call is already gone: sendFn errors are
+			// ignored, requestResponse* drops non-blockingly, onVoiceState is isActive-gated.
+			taskCtx := context.WithoutCancel(ctx)
 			started := time.Now()
 			if eventLogEnabled() {
 				log.Printf("koe[task]: start call_id=%q agent=%q burst=%q task=%s", callID, req.Agent, req.ThreadID, logMaybeText(req.Text, 500))
 			}
-			out, derr := h.disp.client.DoTask(ctx, req)
+			out, derr := h.disp.client.DoTask(taskCtx, req)
 			h.state.ClearInFlightForAgent(req.Agent)
 			r := MapDoTaskOutcome(out, derr)
 			if eventLogEnabled() {

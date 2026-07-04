@@ -121,6 +121,43 @@ func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 	t.Error("do_task result function_call_output never sent")
 }
 
+// TestHandleFunctionCallDoTaskSurvivesSessionCtxCancel verifies S2: a hangup that
+// cancels the session ctx while a do_task is in flight must NOT abort the
+// delegation. The daemon reply is held until after the caller cancels the ctx; a
+// fix riding context.WithoutCancel still surfaces "Reminder added.", while the
+// pre-fix code (passing the cancelled ctx straight to DoTask) would surface the
+// Chinese transport-failure fallback instead.
+func TestHandleFunctionCallDoTaskSurvivesSessionCtxCancel(t *testing.T) {
+	released := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case <-released:
+		case <-time.After(2 * time.Second): // safety net so a wiring bug can't hang the test
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"reply": "Reminder added.", "agent": "default"})
+	}))
+	defer srv.Close()
+
+	state := NewCallState("burst-cancel", "")
+	disp := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.handleFunctionCall(ctx, "call-1", "do_task", []byte(`{"task":"remind me"}`))
+	cancel()        // simulate hangup teardown while the delegation is in flight
+	close(released) // let the daemon finish its back-brain turn
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cap.sentContains("Reminder added.") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("delegation aborted on session ctx cancel; sent=%v", cap.types())
+}
+
 func TestHandleFunctionCallInjectedFollowupDoesNotDoubleSpeak(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
