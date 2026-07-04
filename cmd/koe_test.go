@@ -4,7 +4,14 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -265,4 +272,123 @@ func TestWarmMintTakeMintsWhenExpired(t *testing.T) {
 	if got != "ek_fresh" || cached || calls != 1 {
 		t.Fatalf("take = %q cached=%v calls=%d, want fresh mint", got, cached, calls)
 	}
+}
+
+// TestBaseKoePersona: the pre-fetch warm-session persona is the base persona plus
+// (only) the pinned language — no user context / agent list yet.
+func TestBaseKoePersona(t *testing.T) {
+	if got := baseKoePersona(koeConfig{language: ""}); got != koePersona {
+		t.Errorf("empty language should give the bare base persona")
+	}
+	zh := baseKoePersona(koeConfig{language: "zh"})
+	if !strings.HasPrefix(zh, koePersona) || !strings.Contains(zh, koeLanguageInstruction("zh")) {
+		t.Errorf("zh base persona missing base or language pin: %q", zh)
+	}
+}
+
+// TestBuildKoePersonaAssembly: the full persona folds in the daemon-distilled user
+// context, the agent list, and the pinned language.
+func TestBuildKoePersonaAssembly(t *testing.T) {
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/koe/persona" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"persona": "USER_CONTEXT_MARKER"})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer daemon.Close()
+
+	agents := []koe.AgentSummary{{Slug: "finance", DisplayName: "Finance"}}
+	got := buildKoePersona(context.Background(), koe.NewDaemonClient(daemon.URL), koeConfig{language: "en"}, agents)
+	for _, want := range []string{koePersona, "USER_CONTEXT_MARKER", koeAgentListLine(agents), koeLanguageInstruction("en")} {
+		if !strings.Contains(got, want) {
+			t.Errorf("buildKoePersona missing %q", want)
+		}
+	}
+}
+
+// TestRunDesktopCallBindsControlPortBeforeSlowAgentFetch verifies S9: the control
+// listener must answer while the (slow) agent-registry fetch is still blocked, so
+// Desktop is not locked out during a slow-daemon window. The mock daemon holds
+// GET /agents open; the test asserts POST /call/mic already returns 409 no_active_call.
+func TestRunDesktopCallBindsControlPortBeforeSlowAgentFetch(t *testing.T) {
+	agentsHit := make(chan struct{})
+	releaseAgents := make(chan struct{})
+	var agentsOnce sync.Once
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/agents":
+			agentsOnce.Do(func() { close(agentsHit) })
+			select {
+			case <-releaseAgents:
+			case <-time.After(10 * time.Second): // safety net
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"agents": []any{}})
+		case "/koe/persona":
+			_ = json.NewEncoder(w).Encode(map[string]any{"persona": ""})
+		default:
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		}
+	}))
+	defer daemon.Close()
+
+	port := freeTCPPort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- runDesktopCall(ctx, koeConfig{controlPort: port, daemonURL: daemon.URL, model: "gpt-realtime-mini"},
+			koe.NewDaemonClient(daemon.URL),
+			func(context.Context) (string, error) { return "", fmt.Errorf("no mint in test") },
+			func(json.RawMessage) {})
+	}()
+
+	select {
+	case <-agentsHit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListAgents was never called — setup blocked before the fetch")
+	}
+
+	// /agents is now blocked. The control port must already respond.
+	base := "http://127.0.0.1:" + port
+	var resp *http.Response
+	var err error
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequest(http.MethodPost, base+"/call/mic", strings.NewReader(`{"mic":"off"}`))
+		if resp, err = http.DefaultClient.Do(req); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("control port unreachable while the agent fetch is blocked: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "no_active_call") {
+		t.Fatalf("/call/mic during pre-warm = %d %s, want 409 no_active_call", resp.StatusCode, body)
+	}
+
+	close(releaseAgents)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runDesktopCall did not return after ctx cancel")
+	}
+}
+
+// freeTCPPort grabs an ephemeral localhost port and releases it for the caller to
+// bind. A tiny TOCTOU window is acceptable in a test.
+func freeTCPPort(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("freeTCPPort: %v", err)
+	}
+	defer l.Close()
+	_, port, _ := net.SplitHostPort(l.Addr().String())
+	return port
 }

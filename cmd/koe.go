@@ -383,17 +383,45 @@ func koeLanguageInstruction(lang string) string {
 	}
 }
 
+// buildKoePersona assembles the full spoken persona: the base persona + the daemon's
+// small-tier-distilled user context (who the user is / how to address them —
+// best-effort, bounded to 3s) + the agent-registry list (so the Realtime model can
+// answer "which agents do I have?"; names only, matching stays the resolver's job) +
+// the pinned reply language. The standalone path calls this synchronously; the
+// desktop path calls it AFTER its control listener binds and hot-swaps the result in.
+func buildKoePersona(ctx context.Context, client *koe.DaemonClient, cfg koeConfig, agents []koe.AgentSummary) string {
+	persona := koePersona
+	pctx, pcancel := context.WithTimeout(ctx, 3*time.Second)
+	if extra, perr := client.FetchPersona(pctx); perr == nil && extra != "" {
+		persona = koePersona + " " + extra
+	}
+	pcancel()
+	if list := koeAgentListLine(agents); list != "" {
+		persona += "\n\n" + list
+	}
+	if instr := koeLanguageInstruction(cfg.language); instr != "" {
+		persona = persona + " " + instr
+	}
+	return persona
+}
+
+// baseKoePersona is what a desktop warm session uses before the async registry +
+// persona fetch lands (or if a /call/start races that window): the base persona +
+// the pinned language, without the daemon-distilled user context or agent list yet.
+func baseKoePersona(cfg koeConfig) string {
+	persona := koePersona
+	if instr := koeLanguageInstruction(cfg.language); instr != "" {
+		persona = persona + " " + instr
+	}
+	return persona
+}
+
 func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Plan B wiring: link + resolver + per-call state.
+	// Plan B wiring: link to the daemon back-brain.
 	client := koe.NewDaemonClient(cfg.daemonURL)
-	agents, err := client.ListAgents(ctx)
-	if err != nil {
-		log.Printf("koe: list agents failed (continuing with empty registry): %v", err)
-	}
-	resolver := koe.NewAgentResolver(agents, koe.NoopSemanticMatcher{})
 
 	// G3: relay each turn's token usage via the daemon to Cloud (fire-and-forget; a
 	// usage failure never interrupts the call, and Koe never sees pricing).
@@ -413,39 +441,25 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		}
 		return client.MintViaDaemon(mctx, cfg.model)
 	}
-	// persona-profile: the daemon's small-tier-distilled user context appended to the
-	// base persona (who the user is, how to address them), fetched once — bounded to
-	// 3s, best-effort — and reused across calls.
-	persona := koePersona
-	pctx, pcancel := context.WithTimeout(ctx, 3*time.Second)
-	if extra, perr := client.FetchPersona(pctx); perr == nil && extra != "" {
-		persona = koePersona + " " + extra
-	}
-	pcancel()
-	// Inject the agent registry so Koe can name the specialists it can hand a task
-	// to. The resolver already has the list for matching, but the Realtime model
-	// needs it in context to answer "which agents do I have?". Names only — no
-	// capability dumps; matching stays the resolver's job.
-	if list := koeAgentListLine(agents); list != "" {
-		persona += "\n\n" + list
-	}
-
-	// A user-pinned reply language (Settings → Voice → Language) overrides
-	// koePersona's default "reply in the user's current utterance language".
-	// Empty (follow system / auto) keeps that default behavior.
-	if instr := koeLanguageInstruction(cfg.language); instr != "" {
-		persona = persona + " " + instr
-	}
 
 	// ── Kocoro Desktop (control-port) mode: warm session + call-scoped audio ──
 	// Koe pre-warms the next OpenAI session while idle, but it opens the local audio
-	// device only for an active Desktop call. This keeps VPIO from holding the mic
-	// and macOS voice-processing output path while Kocoro voice is idle.
+	// device only for an active Desktop call. The agent-registry + persona fetches
+	// are done INSIDE runDesktopCall, AFTER its control listener binds, so Desktop can
+	// reach koe during a slow-daemon window (those fetches used to run here first,
+	// blocking for up to ~33s while koe's control port stayed unbound).
 	if cfg.controlPort != "" {
-		return runDesktopCall(ctx, cfg, client, resolver, persona, mintEK, onUsage)
+		return runDesktopCall(ctx, cfg, client, mintEK, onUsage)
 	}
 
 	// ── Standalone / headless mode: always-on (CLI + E2E + --say/--audio-in) ──
+	// No control port to keep reachable, so fetch the registry + persona synchronously.
+	agents, err := client.ListAgents(ctx)
+	if err != nil {
+		log.Printf("koe: list agents failed (continuing with empty registry): %v", err)
+	}
+	resolver := koe.NewAgentResolver(agents, koe.NoopSemanticMatcher{})
+	persona := buildKoePersona(ctx, client, cfg, agents)
 	state := koe.NewCallState(newBurstID(), cfg.agent)
 	disp := koe.NewDispatcher(client, resolver, state, nil)
 	audio, err := koe.NewAudioIO()
@@ -528,17 +542,28 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 // the selected backend, /call/end closes the used session and audio, then warms
 // the next session without touching the mic.
 func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient,
-	resolver *koe.AgentResolver, persona string,
 	mintEK func(context.Context) (string, error), onUsage func(json.RawMessage)) error {
 
 	fullDuplexAEC := cfg.aec == "vpio"
+
+	// The agent registry + persona are fetched AFTER the control listener binds (see
+	// below), so they start as an empty registry + base persona and are hot-swapped
+	// in once the fetch lands. Each warm session reads the CURRENT holder value at
+	// creation time (newSessionState / connectWith run per session), so a swap applies
+	// to the next warm session; the atomics let the fetch goroutine publish without
+	// taking sessMu (which a /call/start also needs).
+	var resolverHolder atomic.Pointer[koe.AgentResolver]
+	resolverHolder.Store(koe.NewAgentResolver(nil, koe.NoopSemanticMatcher{}))
+	base := baseKoePersona(cfg)
+	var personaHolder atomic.Pointer[string]
+	personaHolder.Store(&base)
 
 	var ctrl *koe.ControlServer
 	var callContext koe.StartCallRequest
 	newSessionState := func() (*koe.CallState, *koe.Dispatcher) {
 		state := koe.NewCallState(newBurstID(), cfg.agent)
 		state.SetCallContext(callContext)
-		disp := koe.NewDispatcher(client, resolver, state, func(_ context.Context, action string) error {
+		disp := koe.NewDispatcher(client, resolverHolder.Load(), state, func(_ context.Context, action string) error {
 			if ctrl == nil {
 				return nil
 			}
@@ -803,7 +828,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			}
 
 			connectWith := func(secret string) (*koe.RealtimeConn, error) {
-				return koe.Connect(sessionCtx, audio, secret, persona, state, disp, koe.ConnectOptions{
+				return koe.Connect(sessionCtx, audio, secret, *personaHolder.Load(), state, disp, koe.ConnectOptions{
 					OnVoiceState:  onVoiceState,
 					OnCallState:   onCallState,
 					OnVoiceLevel:  onVoiceLevel,
@@ -948,6 +973,22 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			log.Fatalf("koe: control server on %s exited: %v", addr, err)
 		}
 	}()
+
+	// Fetch the agent registry + persona ONLY AFTER the listener above is bound, so
+	// Desktop can already reach koe (409 no_active_call on /call/mic, or /call/start
+	// kicking a warm session) during a slow-daemon window — ListAgents alone can block
+	// up to 30s. Failure semantics are unchanged: a ListAgents error → empty registry,
+	// FetchPersona → base persona. The values are published to the holders the warm
+	// sessions read; a /call/start that races this window uses the base persona /
+	// empty registry (graceful degradation), and the swapped-in full values apply from
+	// the next warm session onward.
+	agents, err := client.ListAgents(ctx)
+	if err != nil {
+		log.Printf("koe: list agents failed (continuing with empty registry): %v", err)
+	}
+	resolverHolder.Store(koe.NewAgentResolver(agents, koe.NoopSemanticMatcher{}))
+	full := buildKoePersona(ctx, client, cfg, agents)
+	personaHolder.Store(&full)
 
 	sessMu.Lock()
 	ensureWarmSessionLocked("startup")
