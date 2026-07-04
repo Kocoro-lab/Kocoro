@@ -128,6 +128,12 @@ func buildStickyContext(source, channel, sender, agentName, imBindings string, p
 			"internal details (session indices, your search steps, or \"based on history\" "+
 			"narration). Produce just the deliverable, as if speaking directly to the user.")
 	}
+	if isKoeSource(source) {
+		parts = append(parts, "This run came from the user's live voice conversation with Kocoro. "+
+			"Do normal Kocoro agent work, including tools, files, browser, and multi-step tasks when needed. "+
+			"If the request needs exact calculation, current facts, email/messages, files, web, schedules, or any real action, you MUST call at least one relevant tool before your final answer; do not answer those from memory, and verify arithmetic with a calculation tool even when it looks simple. "+
+			"Do not narrate voice routing, Source, daemon, backend, or internal delivery.")
+	}
 	if extra != "" {
 		parts = append(parts, extra)
 	}

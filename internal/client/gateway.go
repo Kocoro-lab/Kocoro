@@ -1057,6 +1057,76 @@ func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*C
 	return &result, nil
 }
 
+// MintRealtime mints an OpenAI Realtime ephemeral client secret via the Cloud
+// gateway. The gateway holds the OpenAI key and resolves user/tenant from the
+// X-API-Key header, so the daemon relay needs only its own key. Returns the raw
+// gateway JSON ({value, expires_at, session}) so the daemon can relay it verbatim
+// to Koe — the front brain never sees a long-lived credential (the via-daemon
+// design). model/voice are optional (the gateway defaults the allowlisted model).
+func (c *GatewayClient) MintRealtime(ctx context.Context, model, voice string) (json.RawMessage, error) {
+	reqBody := map[string]any{}
+	if model != "" {
+		reqBody["model"] = model
+	}
+	if voice != "" {
+		reqBody["voice"] = voice
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/realtime/client_secrets", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		httpReq.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(raw)}
+	}
+	return json.RawMessage(raw), nil
+}
+
+// SendRealtimeUsage forwards a realtime usage report (from a `response.done`
+// event: model, response_id, token details) to the Cloud usage-ingest endpoint,
+// which computes the cost server-side and debits quota. The daemon relays Koe's
+// usage body verbatim — Koe never sees pricing. Returns the raw Cloud JSON
+// ({cost_usd, billable_tokens, ...}).
+func (c *GatewayClient) SendRealtimeUsage(ctx context.Context, body json.RawMessage) (json.RawMessage, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/usage/realtime", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		httpReq.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(raw)}
+	}
+	return json.RawMessage(raw), nil
+}
+
 // StreamDelta represents an incremental text chunk from streaming completion.
 type StreamDelta struct {
 	Text string

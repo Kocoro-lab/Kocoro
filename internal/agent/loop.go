@@ -1093,6 +1093,13 @@ func (a *AgentLoop) SpecificModel() string {
 	return a.specificModel
 }
 
+// ResponseLanguage returns the currently-configured reply language. Test-only
+// accessor; production callers should set it through SetResponseLanguage and let
+// messagesForLLM inject the matching Language directive.
+func (a *AgentLoop) ResponseLanguage() string {
+	return a.responseLanguage
+}
+
 func (a *AgentLoop) SetMCPContext(ctx string) {
 	a.mcpContext = ctx
 }

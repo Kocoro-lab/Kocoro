@@ -28,8 +28,8 @@ Global settings control how Shannon behaves across all agents — which AI model
 ### Get config status
 - Method: GET
 - Path: /config/status
-- Response: `{"mcp_servers": {"slack": "connected"|"enabled"|"disabled"}}`
-- Notes: Shows live connection status for MCP servers and provider health.
+- Response: `{"mcp_servers": {"slack": "connected"|"enabled"|"disabled"}, "koe": {"enabled": bool, "model": "...", "voice": "...", "agent": "...", "language": "..."}}`
+- Notes: Shows live connection status for MCP servers and provider health. The `koe` block reflects the voice front brain's settings (managed by Kocoro Desktop's settings panel; credential-free — Koe mints via the daemon, no key here).
 
 ### Get daemon status
 - Method: GET

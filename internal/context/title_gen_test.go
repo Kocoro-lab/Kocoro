@@ -182,6 +182,18 @@ func TestSourceLabel(t *testing.T) {
 	}
 }
 
+func TestSourceLabelKoeHidden(t *testing.T) {
+	for _, src := range []string{"koe", "koe-reachy", " KOE "} {
+		if got := SourceLabel(src); got != "" {
+			t.Errorf("SourceLabel(%q) = %q, want \"\" (internal name must not surface in titles)", src, got)
+		}
+	}
+	// Regression guard: real channels keep their brand label.
+	if got := SourceLabel("slack"); got == "" {
+		t.Errorf("SourceLabel(\"slack\") = \"\", want a non-empty brand label")
+	}
+}
+
 func TestDecorateTitle(t *testing.T) {
 	cases := []struct{ src, sender, channel, smart, want string }{
 		{"slack", "", "", "创建定时任务", "Slack · 创建定时任务"},

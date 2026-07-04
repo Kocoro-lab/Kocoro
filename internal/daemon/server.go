@@ -583,6 +583,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /approval", s.handleApproval)
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
 	mux.HandleFunc("POST /message", s.handleMessage)
+	mux.HandleFunc("POST /koe/realtime/mint", s.handleKoeRealtimeMint)
+	mux.HandleFunc("POST /koe/realtime/usage", s.handleKoeRealtimeUsage)
+	mux.HandleFunc("GET /koe/persona", s.handleKoePersona)
 	mux.HandleFunc("POST /local/screenshot/window", s.handleScreenshotWindow)
 	mux.HandleFunc("POST /inject/retract", s.handleRetractInject)
 	mux.HandleFunc("POST /cancel", s.handleCancel)
@@ -1163,15 +1166,16 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type agentInfo struct {
-		Name         string `json:"name"`
-		DisplayName  string `json:"display_name"` // falls back to Name when unset
-		Avatar       string `json:"avatar"`       // empty when unset
-		Builtin      bool   `json:"builtin"`
-		Override     bool   `json:"override"`
-		HasMemory    bool   `json:"has_memory"`
-		HasConfig    bool   `json:"has_config"`
-		CommandCount int    `json:"command_count"`
-		SkillCount   int    `json:"skill_count"`
+		Name         string                 `json:"name"`
+		DisplayName  string                 `json:"display_name"`          // falls back to Name when unset
+		Description  agents.LocalizedString `json:"description,omitempty"` // localized blurb from PROFILE.yaml; empty when unset
+		Avatar       string                 `json:"avatar"`                // empty when unset
+		Builtin      bool                   `json:"builtin"`
+		Override     bool                   `json:"override"`
+		HasMemory    bool                   `json:"has_memory"`
+		HasConfig    bool                   `json:"has_config"`
+		CommandCount int                    `json:"command_count"`
+		SkillCount   int                    `json:"skill_count"`
 	}
 	result := make([]agentInfo, 0, len(entries))
 	for _, entry := range entries {
@@ -1192,12 +1196,15 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		// Avatar lives in <dir>/PROFILE.yaml. Best-effort: a missing or
 		// malformed profile just yields no avatar (the list must not fail).
 		avatar := ""
+		var description agents.LocalizedString
 		if profile, perr := agents.LoadAgentProfile(dir); perr == nil && profile != nil {
 			avatar = profile.Avatar
+			description = profile.Description
 		}
 		result = append(result, agentInfo{
 			Name:         entry.Name,
 			DisplayName:  entry.DisplayName,
+			Description:  description,
 			Avatar:       avatar,
 			Builtin:      entry.Builtin,
 			Override:     entry.Override,
@@ -5274,6 +5281,19 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 		// their own mcp_servers config, not this list.
 		if len(cfg.MCP.DefaultAgentDisabled) > 0 {
 			resp["mcp_default_agent_disabled"] = cfg.MCP.DefaultAgentDisabled
+		}
+	}
+
+	// Expose Koe (voice front brain) settings so Kocoro Desktop's settings panel
+	// can render the enable toggle + bound agent/voice/model. Credential-free by
+	// design — Koe mints via the daemon relay, no key is ever surfaced here.
+	if cfg != nil {
+		resp["koe"] = map[string]interface{}{
+			"enabled":  cfg.Koe.Enabled,
+			"model":    cfg.Koe.Model,
+			"voice":    cfg.Koe.Voice,
+			"agent":    cfg.Koe.Agent,
+			"language": cfg.Koe.Language,
 		}
 	}
 
