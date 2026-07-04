@@ -18,6 +18,23 @@ import (
 //go:embed assets/ready.pcm
 var readyEarconPCM []byte
 
+const (
+	// earconDrainIdleHoldMS is how long the earcon output level must read silent —
+	// PAST the nominal-playout floor — before PlayReadyEarcon treats the cue as
+	// drained and releases the speaking gate. WORKLOAD: a ~540ms brand cue on the
+	// Desktop call-open path. SYMPTOM if too low: the gate releases while a
+	// buffering-delayed tail is still audible on the speaker, re-opening the
+	// self-trigger window; if too high: a brief dead mic after the cue ends.
+	// OVERRIDE: KOE_EARCON_IDLE_HOLD_MS.
+	earconDrainIdleHoldMS = 250
+	// earconDrainMaxExtraMS is the slack added to the cue's nominal playout length to
+	// form the hard cap on how long PlayReadyEarcon holds the speaking gate waiting
+	// for drain. WORKLOAD: the same ~540ms cue under real device buffering. SYMPTOM if
+	// it binds: a wedged/absent output-level reading would otherwise pin the mic shut
+	// past the cue; the cap guarantees the mic reopens. OVERRIDE: KOE_EARCON_MAX_EXTRA_MS.
+	earconDrainMaxExtraMS = 1000
+)
+
 // ReadyEarconEnabled reports whether the ready earcon should play. Default on;
 // KOE_READY_EARCON=0 disables it for users who find the cue intrusive. WORKLOAD:
 // Desktop voice calls. SYMPTOM if it binds: a user wants silence on connect.
@@ -74,12 +91,46 @@ func (a *AudioIO) PlayReadyEarcon() {
 		a.Play(f)
 	}
 
-	// Hold the speaking gate until playback has fully drained. Releasing at feed
-	// time would unmute the mic while the tail is still audible on the speaker,
-	// re-opening the self-trigger window. Wall time = pre-roll fill + one 20ms
-	// device tick per frame, plus a small margin.
-	playMs := (len(frames) + prerollFrames + 2) * audioFrameMs
-	time.Sleep(time.Duration(playMs) * time.Millisecond)
+	// Hold the speaking gate until playback has actually DRAINED, not on a fixed
+	// clock: releasing exactly at the computed wall time cut the tail (or left it
+	// audible on the speaker → self-trigger window) whenever device buffering pushed
+	// the real playout past the estimate. Two parts:
+	//   (1) a floor at the nominal playout length — the cue's frames physically need
+	//       that long to render at one 20ms device tick each, and the "aurora" cue has
+	//       soft internal passages whose RMS dips below playbackIdleLevelEps, so a
+	//       pure level poll would false-release mid-cue; never release before the floor.
+	//   (2) past the floor, the drain-aware PlaybackIdle poll (mirrors realtime.go's
+	//       releaseSpeakingAfterOutputBufferWait): release once the output level has
+	//       read silent for the idle hold — extending past nominal if buffering delayed
+	//       the tail — with a nominal+slack hard cap so a wedged/absent level reading
+	//       can never pin the mic shut.
+	nominal := time.Duration((len(frames)+prerollFrames+2)*audioFrameMs) * time.Millisecond
+	hold := time.Duration(koeEnvInt("KOE_EARCON_IDLE_HOLD_MS", earconDrainIdleHoldMS)) * time.Millisecond
+	floor := started.Add(nominal)
+	deadline := floor.Add(time.Duration(koeEnvInt("KOE_EARCON_MAX_EXTRA_MS", earconDrainMaxExtraMS)) * time.Millisecond)
+	ticker := time.NewTicker(playbackIdlePollInterval)
+	defer ticker.Stop()
+	var idleSince time.Time
+	for {
+		<-ticker.C
+		now := time.Now()
+		if now.Before(floor) {
+			continue // still within the cue's nominal playout — keep the gate up
+		}
+		if a.PlaybackIdle() {
+			if idleSince.IsZero() {
+				idleSince = now
+			}
+			if now.Sub(idleSince) >= hold {
+				break // drained past the floor — safe to release
+			}
+		} else {
+			idleSince = time.Time{} // tail ran past nominal (buffering) — keep waiting
+		}
+		if now.After(deadline) {
+			break // hard cap: never leave the mic muted on a wedged level reading
+		}
+	}
 
 	a.SetSpeaking(prevSpeaking)
 	a.SetPlaybackEnabled(prevPlayback)
