@@ -314,6 +314,86 @@ type ConnectOptions struct {
 	OnClosed func(error)
 }
 
+// defaultSessionConfigTimeoutMS bounds how long Connect waits for OpenAI to ack our
+// session.update (session.updated) before giving up. WORKLOAD: a Desktop double-tap
+// warms a Realtime session; mint+SDP+session.update normally lands in ~2s. SYMPTOM if
+// it binds: a rejected or dropped session.update would otherwise wedge the call in
+// "connecting" forever; at 10s Connect returns an error and the caller retires the
+// warm session + emits call_state ended. OVERRIDE: KOE_SESSION_CONFIG_TIMEOUT_MS.
+const defaultSessionConfigTimeoutMS = 10000
+
+// sessionConfigWatcher tracks the session.update handshake over the oai-events
+// stream so a rejected config can't wedge the call in "connecting". session.updated
+// is the ack (closes configured, fires onConfigured once); an error arriving BEFORE
+// the ack is a rejected session.update — it records the reason and closes
+// configFailed. Extracted from Connect's OnMessage so the wedge-on-rejected-config
+// logic is unit-testable without a live peer connection.
+type sessionConfigWatcher struct {
+	configured   chan struct{}
+	configFailed chan struct{}
+	cfgOnce      sync.Once
+	failOnce     sync.Once
+	cfgErr       error // set once inside failOnce before close(configFailed); read only after <-configFailed
+	onConfigured func()
+}
+
+func newSessionConfigWatcher(onConfigured func()) *sessionConfigWatcher {
+	return &sessionConfigWatcher{
+		configured:   make(chan struct{}),
+		configFailed: make(chan struct{}),
+		onConfigured: onConfigured,
+	}
+}
+
+// observe folds one oai-events frame into the handshake state. An error AFTER the ack
+// is a mid-call error (handled by handleEvent's retry path), not a config failure, so
+// the pre-ack guard (`select { case <-configured: }`) skips it.
+func (w *sessionConfigWatcher) observe(raw []byte) {
+	var ev struct {
+		Type  string `json:"type"`
+		Error struct {
+			Code    string `json:"code"`
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &ev)
+	switch ev.Type {
+	case "session.updated":
+		w.cfgOnce.Do(func() {
+			close(w.configured)
+			if w.onConfigured != nil {
+				w.onConfigured()
+			}
+		})
+	case "error":
+		select {
+		case <-w.configured:
+		default:
+			w.failOnce.Do(func() {
+				w.cfgErr = fmt.Errorf("session config rejected before ack: code=%q type=%q message=%q", ev.Error.Code, ev.Error.Type, ev.Error.Message)
+				close(w.configFailed)
+			})
+		}
+	}
+}
+
+// wait blocks until the session is configured, a pre-ack error arrives, the timeout
+// elapses, or ctx is cancelled. Only a clean ack returns nil; every other exit is an
+// error so Connect's caller retires the wedged session and emits call_state ended.
+func (w *sessionConfigWatcher) wait(ctx context.Context, timeout time.Duration) error {
+	select {
+	case <-w.configured:
+		return nil
+	case <-w.configFailed:
+		return w.cfgErr
+	case <-time.After(timeout):
+		return fmt.Errorf("session config timeout after %s", timeout)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Connect builds the peer connection, dials OpenAI, configures the session, and
 // starts the send-pump + event-dispatch loops. Returns once connected. opts
 // carries the optional Desktop (G2) + billing (G3) hooks.
@@ -352,12 +432,19 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	if opts.OnCallState != nil {
 		opts.OnCallState("connecting") // Q2b: the ~2s mint+SDP+session.update setup
 	}
-	// configured closes when OpenAI acks our session.update. The send pump waits
-	// on it: if mic audio reaches the server before the tools/voice config lands,
-	// the VAD-triggered auto response snapshots the default config (no tools) and
-	// the first turn can't delegate. Verified against the live API in e2e_test.go.
-	configured := make(chan struct{})
-	var cfgOnce sync.Once
+	// watcher.configured closes when OpenAI acks our session.update. The send pump
+	// waits on it: if mic audio reaches the server before the tools/voice config
+	// lands, the VAD-triggered auto response snapshots the default config (no tools)
+	// and the first turn can't delegate. Verified against the live API in e2e_test.go.
+	// A REJECTED session.update (bad model/tool schema/auth) sends an error instead of
+	// session.updated, which would leave configured un-closed forever and wedge the
+	// call in "connecting"; the watcher closes configFailed on that so Connect returns
+	// an error (below) and the caller retires the session.
+	watcher := newSessionConfigWatcher(func() {
+		if opts.OnCallState != nil {
+			opts.OnCallState("on_call") // session is live — Koe is ready
+		}
+	})
 	rc.dc.OnOpen(func() {
 		voice := opts.Voice
 		if voice == "" {
@@ -373,27 +460,28 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 		notifyClosed(fmt.Errorf("data channel error: %w", err))
 	})
 	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
-		var ev struct {
-			Type string `json:"type"`
-		}
-		_ = json.Unmarshal(m.Data, &ev)
-		if ev.Type == "session.updated" {
-			cfgOnce.Do(func() {
-				close(configured)
-				if opts.OnCallState != nil {
-					opts.OnCallState("on_call") // session is live — Koe is ready
-				}
-			})
-		}
+		watcher.observe(m.Data)
 		h.handleEvent(ctx, m.Data)
 	})
 	if err := rc.dialOpenAI(ctx, ek); err != nil {
 		rc.Close()
 		return nil, err
 	}
+	// Block until the session is configured before returning success. Previously
+	// Connect returned as soon as the dial succeeded, so a rejected/silent
+	// session.update left the send pump parked on `configured` forever and the call
+	// wedged in "connecting" (no on_call, no ended). A pre-ack error or the timeout
+	// now surfaces as an error; both callers cancel ctx on the error path (standalone
+	// runKoeCall via defer cancel, warm path via stopSessionResources), so the send /
+	// level pumps below unblock and the session is retired + emits call_state ended.
+	timeout := time.Duration(koeEnvInt("KOE_SESSION_CONFIG_TIMEOUT_MS", defaultSessionConfigTimeoutMS)) * time.Millisecond
+	if err := watcher.wait(ctx, timeout); err != nil {
+		rc.Close()
+		return nil, err
+	}
 	go func() {
 		select {
-		case <-configured:
+		case <-watcher.configured:
 		case <-ctx.Done():
 			return
 		}
