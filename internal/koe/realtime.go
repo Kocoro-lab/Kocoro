@@ -682,6 +682,14 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// immediately, not only once output_audio_buffer.started arrives: otherwise
 		// slow tail audio / room noise in the response-created→first-audio gap can
 		// become the next user turn.
+		//
+		// Bump speakingEpoch like the other gate-set sites (markSpeaking /
+		// interruptOutput): re-gating without it lets a pending release tail from the
+		// PRIOR turn (releaseSpeakingTail / releaseSpeakingAfterOutputBufferWait, which
+		// captured the old epoch) fire mid-new-response, clipping the reply start and
+		// re-opening the mic. Only the epoch is bumped, not markSpeaking(): there is no
+		// audio yet, so the voice_state must stay "thinking", not flip to "speaking".
+		h.speakingEpoch.Add(1)
 		h.respBusy.Store(true)
 		if h.audio != nil {
 			h.audio.SetPlaybackEnabled(true)

@@ -283,6 +283,40 @@ func TestHandleEventGatesMicAsSoonAsResponseStarts(t *testing.T) {
 	waitUntil(t, func() bool { return !audio.dropCapture() }, "response.done did not ungate response-created capture gate")
 }
 
+// TestHandleEventResponseCreatedInvalidatesStaleReleaseTail pins S4: when a new
+// turn's response.created re-gates capture, it must bump speakingEpoch so the
+// PRIOR turn's still-pending release tail cannot fire and ungate the mic
+// mid-response. Turn 1 schedules an 80ms tail; turn 2's response.created lands
+// before it fires; the mic must stay gated past the tail delay.
+func TestHandleEventResponseCreatedInvalidatesStaleReleaseTail(t *testing.T) {
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "80")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+
+	// Turn 1: speak, then response.done (outputBufferActive false → releaseSpeakingTail)
+	// schedules an 80ms release tail.
+	h.handleEvent(context.Background(), []byte(`{"type":"response.output_audio.delta"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done"}`))
+	if !audio.dropCapture() {
+		t.Fatal("mic must be gated while the release tail is pending")
+	}
+
+	// Turn 2 begins before the turn-1 tail fires: response.created re-gates capture.
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created"}`))
+
+	// Wait past the turn-1 tail delay; without the speakingEpoch bump on the
+	// response.created re-gate, the stale tail fires and ungates the mic mid-turn-2.
+	time.Sleep(160 * time.Millisecond)
+	if !audio.dropCapture() {
+		t.Fatal("stale release tail from the prior turn ungated the mic mid-response")
+	}
+}
+
 func TestHandleEventDoesNotUngateBeforeOutputBufferStops(t *testing.T) {
 	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
 	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "200")
