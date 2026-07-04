@@ -19,6 +19,89 @@ func (s *ControlServer) subscriberCount() int {
 	return len(s.subscribers)
 }
 
+func TestControlServerAuthToken(t *testing.T) {
+	started := make(chan struct{}, 1)
+	s := NewControlServer(func(StartCallRequest) { started <- struct{}{} }, nil, nil)
+	s.SetMicHandler(func(bool) error { return nil })
+	s.SetToken("secret-token")
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	tests := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPost, "/call/start", "{}"},
+		{http.MethodPost, "/call/end", "{}"},
+		{http.MethodPost, "/call/interrupt", "{}"},
+		{http.MethodPost, "/call/mic", `{"mic":"off"}`},
+		{http.MethodGet, "/events", ""},
+	}
+	for _, tt := range tests {
+		req, _ := http.NewRequest(tt.method, srv.URL+tt.path, strings.NewReader(tt.body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s without token: %v", tt.method, tt.path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(string(body), "unauthorized") {
+			t.Fatalf("%s %s without token = %d %s, want 401 unauthorized", tt.method, tt.path, resp.StatusCode, body)
+		}
+
+		req, _ = http.NewRequest(tt.method, srv.URL+tt.path, strings.NewReader(tt.body))
+		req.Header.Set("Authorization", "Bearer wrong-token")
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s with wrong token: %v", tt.method, tt.path, err)
+		}
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(string(body), "unauthorized") {
+			t.Fatalf("%s %s with wrong token = %d %s, want 401 unauthorized", tt.method, tt.path, resp.StatusCode, body)
+		}
+
+		req, _ = http.NewRequest(tt.method, srv.URL+tt.path, strings.NewReader(tt.body))
+		req.Header.Set("Authorization", "Bearer secret-token")
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s with token: %v", tt.method, tt.path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s %s with token = %d, want 200", tt.method, tt.path, resp.StatusCode)
+		}
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("authorized /call/start did not invoke onStart")
+	}
+	select {
+	case <-started:
+		t.Fatal("unauthorized /call/start invoked onStart")
+	default:
+	}
+}
+
+func TestControlServerEmptyTokenAllowsRequests(t *testing.T) {
+	s := NewControlServer(nil, nil, nil)
+	s.SetToken("")
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/call/end", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST /call/end: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("empty token status=%d, want 200", resp.StatusCode)
+	}
+}
+
 func TestControlServerStartEnd(t *testing.T) {
 	started := make(chan struct{}, 1)
 	var ended, interrupted bool

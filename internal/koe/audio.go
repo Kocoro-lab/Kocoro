@@ -28,7 +28,8 @@ const (
 
 // AudioIO owns the selected realtime audio backend and the Opus codec. The
 // default backend is oto playback + malgo capture with a half-duplex gate. The
-// opt-in VPIO backend uses Apple's VoiceProcessingIO for full-duplex AEC.
+// opt-in VPIO backend uses Apple's VoiceProcessingIO for full-duplex AEC. Local
+// tests need the opus/opusfile/pkg-config cgo deps installed and discoverable.
 type AudioIO struct {
 	ctx     *malgo.AllocatedContext
 	dev     *malgo.Device

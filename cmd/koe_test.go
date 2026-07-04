@@ -392,3 +392,25 @@ func freeTCPPort(t *testing.T) string {
 	_, port, _ := net.SplitHostPort(l.Addr().String())
 	return port
 }
+
+func TestResolveDevKey(t *testing.T) {
+	tests := []struct {
+		name        string
+		flagKey     string
+		envKey      string
+		controlPort string
+		want        string
+	}{
+		{"standalone env fallback", "", "sk-env", "", "sk-env"},
+		{"desktop mode ignores env", "", "sk-env", "17654", ""},
+		{"explicit flag wins in desktop mode", "sk-flag", "sk-env", "17654", "sk-flag"},
+		{"explicit flag wins standalone", "sk-flag", "sk-env", "", "sk-flag"},
+		{"nothing set", "", "", "17654", ""},
+	}
+	for _, tt := range tests {
+		if got := resolveDevKey(tt.flagKey, tt.envKey, tt.controlPort); got != tt.want {
+			t.Errorf("%s: resolveDevKey(%q, %q, %q) = %q, want %q",
+				tt.name, tt.flagKey, tt.envKey, tt.controlPort, got, tt.want)
+		}
+	}
+}

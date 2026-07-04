@@ -186,6 +186,8 @@ SHANNON_E2E_LIVE=1 go test ./test/e2e/ -v
 go build ./...
 ```
 
+Koe tests link cgo audio deps. On macOS, install them with `brew install opus opusfile pkg-config` and set `PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` if pkg-config cannot find the Homebrew files.
+
 Schedule tests use temp directories and do not write to the real LaunchAgents directory. Run live E2E before releases.
 
 ## Build And Release

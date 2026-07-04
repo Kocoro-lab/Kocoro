@@ -120,10 +120,10 @@ internal/
     link.go              #   DaemonClient: DoTask/Cancel/ListAgents + MintViaDaemon + SendRealtimeUsage (HTTP to daemon, NEVER imports internal/daemon)
     agentresolve.go      #   agent name-resolution ladder (exact → bidirectional-substring → semantic-noop → not-found)
     tools.go             #   5 OpenAI-Realtime voice tools (do_task/cancel/get_status/control_app/switch_agent) + Dispatcher + CallState
-    audio.go             #   malgo duplex (CoreAudio) + Opus codec + half-duplex gate (cgo: PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig)
+    audio.go             #   malgo duplex (CoreAudio) + Opus codec + half-duplex gate (cgo deps: brew install opus opusfile pkg-config; PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig)
     webrtc.go            #   pion mint + SDP + Opus tracks + oai-events data channel + Connect orchestrator (ConnectOptions)
     realtime.go          #   GA session config (create_response:true auto-respond) + oai-events dispatch + reachy say-and-ask do_task (result is the single function_call_output) + voice_state/usage hooks
-    control.go           #   ControlServer: Desktop↔Koe HTTP+SSE (POST /call/start|end|interrupt|mic, GET /events: voice_state[+task_pending/mic]/control_app/call_state)
+    control.go           #   ControlServer: Desktop↔Koe HTTP+SSE (POST /call/start|end|interrupt|mic, GET /events: voice_state[+task_pending/mic]/control_app/call_state); optional Bearer auth via KOE_CONTROL_TOKEN env, never argv
     earcon.go            #   "ready" earcon (go:embed assets/ready.pcm, 48k mono): PlayReadyEarcon() at emitReadyLocked, SetSpeaking-gated so it can't self-trigger VAD; KOE_READY_EARCON=0 disables
 
 ## Key Conventions
@@ -342,6 +342,8 @@ go test ./test/e2e/ -v                     # E2E offline (CI)
 SHANNON_E2E_LIVE=1 go test ./test/e2e/ -v  # E2E live (run before each release)
 go build ./...
 ```
+
+Koe tests link cgo audio deps. On macOS, install them with `brew install opus opusfile pkg-config` and set `PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` if pkg-config cannot find the Homebrew files.
 
 Schedule tests use temp dirs — never write to real `~/Library/LaunchAgents/`. Launchd plist coverage lives with daemon tests.
 

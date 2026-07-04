@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,6 +34,7 @@ type koeConfig struct {
 	voice         string // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback in sessionConfig
 	language      string
 	controlPort   string // Desktop↔Koe control server port (Kocoro Desktop passes it); empty = no control channel
+	controlToken  string // Desktop-owned Bearer token from KOE_CONTROL_TOKEN; never passed via argv
 	aec           string // echo control: "" / "gate" = oto half-duplex fallback, "vpio" = Apple VoiceProcessingIO full-duplex AEC
 	micDevice     string // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
 	speakerDevice string // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
@@ -53,6 +55,22 @@ func defaultKoeConfig() koeConfig {
 	}
 }
 
+// resolveDevKey picks the dev OpenAI key for the direct-mint path. An explicit
+// --openai-key flag always wins. The OPENAI_API_KEY env fallback applies ONLY in
+// standalone mode (no --control-port): Kocoro Desktop inherits the login-shell
+// env, so on a machine with a personal key exported, the fallback would silently
+// bypass the daemon mint production path — billing the personal key while the
+// usage relay still debits Cloud quota.
+func resolveDevKey(flagKey, envKey, controlPort string) string {
+	if flagKey != "" {
+		return flagKey
+	}
+	if controlPort == "" {
+		return envKey
+	}
+	return ""
+}
+
 var koeCmd = &cobra.Command{
 	Use:   "koe",
 	Short: "Voice front-brain: a realtime voice agent that delegates to the daemon",
@@ -60,9 +78,6 @@ var koeCmd = &cobra.Command{
 		cfg := defaultKoeConfig()
 		if v, _ := cmd.Flags().GetString("openai-key"); v != "" {
 			cfg.openAIKey = v
-		}
-		if cfg.openAIKey == "" {
-			cfg.openAIKey = os.Getenv("OPENAI_API_KEY") // DEV-KEY: replaced by the deferred daemon mint relay (→ Plan D Cloud mint)
 		}
 		if v, _ := cmd.Flags().GetString("daemon-url"); v != "" {
 			cfg.daemonURL = v
@@ -74,6 +89,8 @@ var koeCmd = &cobra.Command{
 		cfg.voice, _ = cmd.Flags().GetString("voice")
 		cfg.language, _ = cmd.Flags().GetString("language")
 		cfg.controlPort, _ = cmd.Flags().GetString("control-port")
+		cfg.controlToken = os.Getenv("KOE_CONTROL_TOKEN")
+		cfg.openAIKey = resolveDevKey(cfg.openAIKey, os.Getenv("OPENAI_API_KEY"), cfg.controlPort)
 		if v, _ := cmd.Flags().GetString("aec"); v != "" {
 			cfg.aec = v
 		} else {
@@ -437,6 +454,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	// else the via-daemon relay (Koe holds no long-lived credential).
 	mintEK := func(mctx context.Context) (string, error) {
 		if cfg.openAIKey != "" {
+			log.Printf("koe: using dev OpenAI key (direct mint, bypassing daemon relay)")
 			return koe.MintEphemeral(mctx, cfg.openAIKey, cfg.model)
 		}
 		return client.MintViaDaemon(mctx, cfg.model)
@@ -943,6 +961,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	}
 
 	ctrl = koe.NewControlServer(startCall, endCall, interruptCall)
+	ctrl.SetToken(cfg.controlToken)
 	ctrl.SetSnapshotProviders(
 		func() bool { s := snapState.Load(); return s != nil && s.InFlight() != "" },
 		func() bool { a := snapAudio.Load(); return a != nil && a.UserMicOff() },
@@ -964,12 +983,17 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		ctrl.ReemitVoiceState()
 		return nil
 	})
+	addr := "127.0.0.1:" + cfg.controlPort
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("control listen %s: %w", addr, err)
+	}
+	var controlClosing atomic.Bool
 	go func() {
-		addr := "127.0.0.1:" + cfg.controlPort
 		// A dead control channel makes this process unreachable to Desktop, whose
 		// respawn logic sees a live PID and never restarts it — so exit and let
 		// Desktop's terminationHandler respawn koe cleanly on a fresh port.
-		if err := http.ListenAndServe(addr, ctrl.Handler()); err != nil {
+		if err := http.Serve(ln, ctrl.Handler()); err != nil && !controlClosing.Load() {
 			log.Fatalf("koe: control server on %s exited: %v", addr, err)
 		}
 	}()
@@ -998,6 +1022,8 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	case <-ctx.Done():
 	case <-desktopParentDone(ctx):
 	}
+	controlClosing.Store(true)
+	_ = ln.Close()
 	sessMu.Lock()
 	conn, cancel, audio := closeSessionLocked()
 	sessMu.Unlock()

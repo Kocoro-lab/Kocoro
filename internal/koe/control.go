@@ -3,10 +3,12 @@
 package koe
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -31,8 +33,8 @@ var (
 // for thinking/idle. task_pending and mic are additive, omit-when-default snapshot
 // fields stamped on every voice_state (koe-mic-off): absent task_pending means
 // false (no do_task in flight), absent mic means "on". The koe↔Desktop control
-// channel has no handshake, so these are additive-only (old Desktop ignores the
-// fields) — no capability token applies here.
+// channel is localhost-only and may be protected by a Desktop-generated Bearer
+// token; these fields remain additive-only.
 type controlEvent struct {
 	Type        string  `json:"type"`
 	State       string  `json:"state,omitempty"`        // voice_state / call_state
@@ -65,6 +67,7 @@ type ControlServer struct {
 	onMic       func(off bool) error   // POST /call/mic (nil until SetMicHandler)
 	taskPending func() bool            // nil-safe snapshot providers, stamped on every voice_state
 	micOff      func() bool
+	token       string       // optional Bearer token for Desktop-owned requests
 	lastVoice   atomic.Value // string: last voice_state, replayed by ReemitVoiceState
 }
 
@@ -81,6 +84,10 @@ func NewControlServer(onStart func(StartCallRequest), onEnd func(), onInterrupt 
 // SetMicHandler wires POST /call/mic. Called once at startup, before Handler()
 // serves — no locking needed.
 func (s *ControlServer) SetMicHandler(h func(off bool) error) { s.onMic = h }
+
+// SetToken enables Bearer-token auth for every control request. Empty preserves
+// older Desktop builds and test harnesses.
+func (s *ControlServer) SetToken(token string) { s.token = token }
 
 // SetSnapshotProviders wires the task_pending / mic snapshot stamped on every
 // voice_state event. Providers must be sessMu-free (EmitVoiceState is called
@@ -157,7 +164,30 @@ func (s *ControlServer) Handler() http.Handler {
 		writeControlOK(w)
 	})
 	mux.HandleFunc("GET /events", s.handleEvents)
-	return mux
+	if s.token == "" {
+		return mux
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !authorizedControlRequest(r, s.token) {
+			writeControlUnauthorized(w)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+func authorizedControlRequest(r *http.Request, token string) bool {
+	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok || got == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
+func writeControlUnauthorized(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
 }
 
 func writeControlOK(w http.ResponseWriter) {
