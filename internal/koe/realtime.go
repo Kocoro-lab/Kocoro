@@ -38,6 +38,11 @@ type eventHandler struct {
 	// relays via the daemon to Cloud (server-side cost). Koe never sees pricing.
 	model   string
 	onUsage func(json.RawMessage)
+	// language is the user-pinned koe reply language ("en"/"ja"/"zh"; "" = follow the
+	// utterance). It picks the language of the MECHANICAL spoken fallbacks (transport
+	// failure / busy / misheard / agent clarify) that bypass the Realtime model; when
+	// empty, fallbackLang infers from the utterance. Set from ConnectOptions.Language.
+	language string
 	// fullDuplexAEC means the local audio backend already has echo cancellation
 	// (VPIO). Even in that mode, server interruption is off by default because a
 	// laptop speaker/mic pair still needs an intent-level barge-in gate, not just
@@ -795,12 +800,18 @@ func unwrapArgs(raw json.RawMessage) []byte {
 // fast tools through Dispatch, then sends the function_call_output back.
 func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name string, args []byte) {
 	if name == "do_task" {
-		req, clarify, err := h.disp.PrepareDoTask(args)
+		// Resolve the mechanical-fallback language once for this call: the pinned koe
+		// language wins, else the utterance decides (the task text is a JSON string
+		// inside args, so a Han rune anywhere in args signals a Chinese utterance —
+		// the JSON keys and agent slugs are ASCII).
+		lang := fallbackLang(h.language, string(args))
+		req, clarify, err := h.disp.PrepareDoTask(args, lang)
 		if err != nil {
 			if eventLogEnabled() {
 				log.Printf("koe[task]: prepare failed call_id=%q err=%v args=%s", callID, err, logMaybeBytes(args, 500))
 			}
-			h.sendOutput(callID, SayResult{Status: "failed", SpokenSummary: "我没听清，能再说一次吗？", Say: "我没听清，能再说一次吗？"})
+			say := fallbackSay(lang, "misheard")
+			h.sendOutput(callID, SayResult{Status: "failed", SpokenSummary: say, Say: say})
 			return
 		}
 		if clarify != nil {
@@ -836,7 +847,7 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 			}
 			out, derr := h.disp.client.DoTask(taskCtx, req)
 			h.state.ClearInFlightForAgent(req.Agent)
-			r := MapDoTaskOutcome(out, derr)
+			r := MapDoTaskOutcome(out, derr, lang)
 			if eventLogEnabled() {
 				log.Printf("koe[task]: done call_id=%q kind=%s status=%s session=%q partial=%t failure=%q reason=%q spoken_len=%d reply_len=%d duration_ms=%d err=%v",
 					callID, outcomeKindLog(out.Kind), r.Status, out.SessionID, out.Partial, out.FailureCode, out.Reason,

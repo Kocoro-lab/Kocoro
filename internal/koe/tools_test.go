@@ -82,7 +82,7 @@ func TestBurstRouteKey(t *testing.T) {
 func TestPrepareDoTaskUsesBoundAgent(t *testing.T) {
 	state := NewCallState("burst-1", "finance")
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	req, clarify, err := d.PrepareDoTask([]byte(`{"task":"check NVDA"}`))
+	req, clarify, err := d.PrepareDoTask([]byte(`{"task":"check NVDA"}`), "zh")
 	if err != nil || clarify != nil {
 		t.Fatalf("PrepareDoTask err=%v clarify=%v", err, clarify)
 	}
@@ -102,7 +102,7 @@ func TestPrepareDoTaskCarriesCallContext(t *testing.T) {
 		},
 	})
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	req, clarify, err := d.PrepareDoTask([]byte(`{"task":"summarize this window"}`))
+	req, clarify, err := d.PrepareDoTask([]byte(`{"task":"summarize this window"}`), "zh")
 	if err != nil || clarify != nil {
 		t.Fatalf("PrepareDoTask err=%v clarify=%v", err, clarify)
 	}
@@ -117,7 +117,7 @@ func TestPrepareDoTaskCarriesCallContext(t *testing.T) {
 func TestPrepareDoTaskClarifyOnUnknownAgent(t *testing.T) {
 	state := NewCallState("burst-1", "default")
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	_, clarify, err := d.PrepareDoTask([]byte(`{"task":"x","agent":"nonexistent zzz"}`))
+	_, clarify, err := d.PrepareDoTask([]byte(`{"task":"x","agent":"nonexistent zzz"}`), "zh")
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -132,7 +132,7 @@ func TestPrepareDoTaskClarifyOnUnknownAgent(t *testing.T) {
 // re-fetch recaps because Koe only ever held the two spoken sentences.
 func TestMapDoTaskOutcomeAttachesContextDigest(t *testing.T) {
 	long := strings.Repeat("详情内容", 300) // 1200 runes, over the cap
-	r := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: long, SpokenSummary: "查完了。"}, nil)
+	r := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: long, SpokenSummary: "查完了。"}, nil, "zh")
 	if r.Context == "" {
 		t.Fatal("completed result must carry a context digest of the reply")
 	}
@@ -144,11 +144,11 @@ func TestMapDoTaskOutcomeAttachesContextDigest(t *testing.T) {
 	}
 
 	// No added information → no digest (don't waste session tokens).
-	same := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "查完了。", SpokenSummary: "查完了。"}, nil)
+	same := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "查完了。", SpokenSummary: "查完了。"}, nil, "zh")
 	if same.Context != "" {
 		t.Fatalf("reply identical to spoken line must not attach a digest, got %q", same.Context)
 	}
-	if inj := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeInjected}, nil); inj.Context != "" {
+	if inj := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeInjected}, nil, "zh"); inj.Context != "" {
 		t.Fatal("injected outcome must not attach a digest")
 	}
 }
@@ -164,7 +164,7 @@ func TestMapDoTaskOutcomeCancelledStaysSilent(t *testing.T) {
 		Kind:        OutcomeCompleted,
 		Reply:       "正在将报告要点写入桌面 Markdown 文件。",
 		FailureCode: "user_cancelled",
-	}, nil)
+	}, nil, "zh")
 	if r.Status != "cancelled" {
 		t.Fatalf("cancelled run status = %q, want cancelled", r.Status)
 	}
@@ -174,20 +174,20 @@ func TestMapDoTaskOutcomeCancelledStaysSilent(t *testing.T) {
 }
 
 func TestMapDoTaskOutcome(t *testing.T) {
-	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "long done", SpokenSummary: "done"}, nil); got.Status != "ok" || got.SpokenSummary != "done" || got.Say != "done" {
+	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "long done", SpokenSummary: "done"}, nil, "zh"); got.Status != "ok" || got.SpokenSummary != "done" || got.Say != "done" {
 		t.Errorf("completed: %+v", got)
 	}
-	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "done"}, nil); got.SpokenSummary != "done" {
+	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "done"}, nil, "zh"); got.SpokenSummary != "done" {
 		t.Errorf("completed without spoken summary: %+v", got)
 	}
 	// injected MUST carry an empty say so the front brain doesn't double-speak.
-	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeInjected}, nil); got.Status != "injected" || got.Say != "" {
+	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeInjected}, nil, "zh"); got.Status != "injected" || got.Say != "" {
 		t.Errorf("injected → %+v", got)
 	}
-	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeRejected, Reason: "cwd_conflict"}, nil); got.Status != "failed" {
+	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeRejected, Reason: "cwd_conflict"}, nil, "zh"); got.Status != "failed" {
 		t.Errorf("rejected → %+v", got)
 	}
-	if got := MapDoTaskOutcome(DoTaskOutcome{}, fmt.Errorf("boom")); got.Status != "failed" {
+	if got := MapDoTaskOutcome(DoTaskOutcome{}, fmt.Errorf("boom"), "zh"); got.Status != "failed" {
 		t.Errorf("transport error → %+v", got)
 	}
 }

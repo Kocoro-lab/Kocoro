@@ -292,6 +292,10 @@ type ConnectOptions struct {
 	Model        string                // G3: realtime model id stamped into usage reports
 	Voice        string                // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback
 	OnUsage      func(json.RawMessage) // G3: per-turn usage relay (→ daemon → Cloud)
+	// Language is the user-pinned koe reply language ("en"/"ja"/"zh"; "" = follow the
+	// utterance). It selects the language of the mechanical spoken fallbacks (transport
+	// failure / busy / misheard / agent clarify); empty defers to per-utterance inference.
+	Language string
 	// CallActive (nil-safe) gates mic capture for Desktop press-to-talk: when set
 	// and it returns false, the send pump drops mic audio (Koe is idle, not
 	// listening) until the double-tap (or the menu / settings-configured trigger)
@@ -409,6 +413,7 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	h.onVoiceState = opts.OnVoiceState
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
+	h.language = opts.Language
 	h.fullDuplexAEC = opts.FullDuplexAEC
 	rc.interruptOutput = h.interruptOutput
 	rc.onLocalSpeechStarted = h.observeLocalSpeechStarted

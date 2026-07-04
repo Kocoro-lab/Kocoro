@@ -503,6 +503,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		Model:         cfg.model,
 		Voice:         cfg.voice,
 		OnUsage:       onUsage,
+		Language:      cfg.language,
 		FullDuplexAEC: fullDuplexAEC,
 	})
 	if err != nil {
@@ -810,6 +811,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 					Model:         cfg.model,
 					Voice:         cfg.voice,
 					OnUsage:       onUsage,
+					Language:      cfg.language,
 					FullDuplexAEC: fullDuplexAEC,
 					OnClosed:      func(err error) { handleSessionClosed(seq, err) },
 				})

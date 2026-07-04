@@ -340,11 +340,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, name string, argsJSON []byte)
 //   - (_, clarify, nil) → voice clarify now; do NOT delegate (ambiguous/unknown agent).
 //   - (_, nil, err)     → malformed call.
 //
+// lang selects the clarify language (see fallbackLang); the caller resolves it from
+// the pinned koe language + the utterance before calling.
+//
 // Per-call agent override (Model 2): a named agent resolves for THIS task only;
 // otherwise the persistent binding (CallState.bound) is used. PrepareDoTask does
 // NOT set inFlight — C's goroutine owns that (SetInFlight before, ClearInFlight
 // after) so get_status reflects the async delegation, not a blocking call.
-func (d *Dispatcher) PrepareDoTask(argsJSON []byte) (DoTaskRequest, *SayResult, error) {
+func (d *Dispatcher) PrepareDoTask(argsJSON []byte, lang string) (DoTaskRequest, *SayResult, error) {
 	var a struct {
 		Task  string `json:"task"`
 		Agent string `json:"agent"`
@@ -359,14 +362,12 @@ func (d *Dispatcher) PrepareDoTask(argsJSON []byte) (DoTaskRequest, *SayResult, 
 		case ResolveResolved:
 			agent = res.Slug
 		case ResolveAmbiguous:
-			return DoTaskRequest{}, &SayResult{Status: "clarify",
-				SpokenSummary: "你是指哪个 agent？" + joinHuman(res.Candidates),
-				Say:           "你是指哪个 agent？" + joinHuman(res.Candidates)}, nil
+			say := clarifyWhich(lang, res.Candidates)
+			return DoTaskRequest{}, &SayResult{Status: "clarify", SpokenSummary: say, Say: say}, nil
 		default:
 			// Unknown named agent → ask rather than silently using the default.
-			return DoTaskRequest{}, &SayResult{Status: "clarify",
-				SpokenSummary: "我没找到这个 agent，你是指哪一个？",
-				Say:           "我没找到这个 agent，你是指哪一个？"}, nil
+			say := fallbackSay(lang, "clarify_unknown")
+			return DoTaskRequest{}, &SayResult{Status: "clarify", SpokenSummary: say, Say: say}, nil
 		}
 	}
 	d.state.mu.Lock()
@@ -380,12 +381,14 @@ func (d *Dispatcher) PrepareDoTask(argsJSON []byte) (DoTaskRequest, *SayResult, 
 // say-contract output. Pure + exported so C's async goroutine reuses it without
 // going through Dispatch. status ∈ ok|failed|injected. OutcomeInjected carries an
 // empty say so the front brain doesn't double-speak (the original do_task voices
-// the final result).
-func MapDoTaskOutcome(out DoTaskOutcome, err error) SayResult {
+// the final result). lang selects the mechanical fallback language (transport
+// failure / busy rejection); see fallbackLang. Completed/injected outcomes speak
+// the back-brain's own text and ignore lang.
+func MapDoTaskOutcome(out DoTaskOutcome, err error, lang string) SayResult {
 	if err != nil {
+		say := fallbackSay(lang, "transport_failed")
 		return SayResult{Status: "failed", FailReason: err.Error(),
-			SpokenSummary: "抱歉，刚才没能完成，连接出了点问题。",
-			Say:           "抱歉，刚才没能完成，连接出了点问题。"}
+			SpokenSummary: say, Say: say}
 	}
 	switch out.Kind {
 	case OutcomeCompleted:
@@ -410,24 +413,8 @@ func MapDoTaskOutcome(out DoTaskOutcome, err error) SayResult {
 	case OutcomeInjected:
 		return SayResult{Status: "injected"}
 	default: // OutcomeRejected
+		say := fallbackSay(lang, "busy")
 		return SayResult{Status: "failed", FailReason: out.Reason,
-			SpokenSummary: "现在有点忙，稍等一下再说一次好吗？",
-			Say:           "现在有点忙，稍等一下再说一次好吗？"}
-	}
-}
-
-// joinHuman renders candidate slugs into a spoken "A 还是 B" choice.
-func joinHuman(slugs []string) string {
-	switch len(slugs) {
-	case 0:
-		return ""
-	case 1:
-		return slugs[0]
-	default:
-		out := slugs[0]
-		for _, s := range slugs[1:] {
-			out += " 还是 " + s
-		}
-		return out
+			SpokenSummary: say, Say: say}
 	}
 }
