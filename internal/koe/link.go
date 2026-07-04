@@ -96,26 +96,74 @@ func (c *DaemonClient) FetchPersona(ctx context.Context) (string, error) {
 	return out.Persona, nil
 }
 
+// realtimeUsageMaxAttempts bounds retries on the usage relay. WORKLOAD: the Cloud
+// usage-ingest endpoint returns 503 (retryable) when a realtime usage report fails
+// to persist transiently, and the daemon propagates that status back to Koe; each
+// voice turn emits exactly one usage report, so dropping it on the first 503
+// silently under-bills that turn. SYMPTOM if too low: a transient Cloud/DB blip
+// drops a turn's usage; if too high: a persistent outage keeps the fire-and-forget
+// goroutine spinning longer before giving up. OVERRIDE: KOE_USAGE_RELAY_MAX_ATTEMPTS.
+const realtimeUsageMaxAttempts = 3
+
+// realtimeUsageRetryBackoffMS is the base backoff between usage-relay attempts
+// (multiplied by the attempt index, so 200ms then 400ms for the default 3 attempts).
+// OVERRIDE: KOE_USAGE_RELAY_BACKOFF_MS.
+const realtimeUsageRetryBackoffMS = 200
+
 // SendRealtimeUsage reports a realtime usage record (model, response_id, token
 // details — built from a response.done event) to the daemon, which relays it to
 // Cloud for server-side cost + quota. Fire-and-forget from the call loop: a usage
 // POST failing must never interrupt the conversation. Koe never sees pricing.
+//
+// Cloud returns 503 when the usage report fails to persist transiently (the daemon
+// forwards that status verbatim), so a 5xx or a transport error is retried with a
+// short backoff up to realtimeUsageMaxAttempts. A 4xx (bad body / auth) is permanent
+// and returns immediately without retry.
 func (c *DaemonClient) SendRealtimeUsage(ctx context.Context, usage json.RawMessage) error {
+	attempts := koeEnvInt("KOE_USAGE_RELAY_MAX_ATTEMPTS", realtimeUsageMaxAttempts)
+	backoff := time.Duration(koeEnvInt("KOE_USAGE_RELAY_BACKOFF_MS", realtimeUsageRetryBackoffMS)) * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		status, err := c.postRealtimeUsage(ctx, usage)
+		switch {
+		case err != nil:
+			lastErr = err // transport error — retryable
+		case status == http.StatusOK:
+			return nil
+		case status >= 500:
+			lastErr = fmt.Errorf("daemon usage relay: HTTP %d", status) // transient (incl. 503) — retryable
+		default:
+			return fmt.Errorf("daemon usage relay: HTTP %d", status) // 4xx — permanent, do not retry
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt < attempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff * time.Duration(attempt)):
+			}
+		}
+	}
+	return lastErr
+}
+
+// postRealtimeUsage performs one POST /koe/realtime/usage attempt, returning the
+// HTTP status (0 on transport error) so SendRealtimeUsage can gate its retry on 5xx.
+func (c *DaemonClient) postRealtimeUsage(ctx context.Context, usage json.RawMessage) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/koe/realtime/usage", bytes.NewReader(usage))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.controlClient.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("daemon usage relay: HTTP %d", resp.StatusCode)
-	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 // DoTaskRequest is the subset of the daemon's POST /message body that Koe sends.

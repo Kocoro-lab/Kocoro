@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -30,6 +31,49 @@ func TestSendRealtimeUsage(t *testing.T) {
 	}
 	if !strings.Contains(string(gotBody), `"response_id":"r1"`) {
 		t.Errorf("daemon did not receive the usage body; got %s", gotBody)
+	}
+}
+
+// TestSendRealtimeUsageRetriesOn503 verifies S2b: Cloud returns 503 when a usage
+// report fails to persist transiently (daemon forwards it verbatim), so the relay
+// retries and succeeds once the daemon recovers.
+func TestSendRealtimeUsageRetriesOn503(t *testing.T) {
+	t.Setenv("KOE_USAGE_RELAY_BACKOFF_MS", "1") // keep the test fast
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&calls, 1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable) // transient persist failure
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"cost_usd":0.01}`))
+	}))
+	defer srv.Close()
+
+	if err := NewDaemonClient(srv.URL).SendRealtimeUsage(context.Background(), json.RawMessage(`{"model":"m"}`)); err != nil {
+		t.Fatalf("SendRealtimeUsage should succeed after retrying 503: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Errorf("expected 3 attempts (503, 503, 200); got %d", got)
+	}
+}
+
+// TestSendRealtimeUsageDoesNotRetryOn400 verifies a 4xx (bad body / auth) is
+// permanent — retrying it just re-sends a request Cloud will reject identically.
+func TestSendRealtimeUsageDoesNotRetryOn400(t *testing.T) {
+	t.Setenv("KOE_USAGE_RELAY_BACKOFF_MS", "1")
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	if err := NewDaemonClient(srv.URL).SendRealtimeUsage(context.Background(), json.RawMessage(`{"model":"m"}`)); err == nil {
+		t.Fatal("SendRealtimeUsage should return an error on 400")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("4xx must not be retried; expected 1 attempt, got %d", got)
 	}
 }
 
