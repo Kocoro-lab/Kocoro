@@ -701,12 +701,20 @@ func inferKoeResponseLanguage(text string) string {
 			han++
 		}
 	}
+	// A CJK speaker who sprinkles English loanwords ("帮我 review 这个 PR",
+	// "この PR を review してください") must not be locked to English by raw
+	// Latin-character count — the old `han >= latin` comparison misfired exactly
+	// there. A run of >=2 characters in any CJK script is a strong enough signal
+	// to win over Latin regardless of how much Latin is present; English is
+	// chosen only when no such CJK signal exists. Kana is checked before han
+	// because Japanese mixes kana with kanji (kanji fall in the han range) and
+	// should classify as Japanese.
 	switch {
-	case kana > 0:
+	case kana >= 2:
 		return "日本語"
-	case hangul > 0:
+	case hangul >= 2:
 		return "한국어"
-	case han > 0 && han >= latin:
+	case han >= 2:
 		return "中文"
 	case latin >= 3:
 		return "English"
