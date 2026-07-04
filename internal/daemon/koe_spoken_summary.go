@@ -109,18 +109,21 @@ func stripSpokenSummaryFromContent(mc client.MessageContent) client.MessageConte
 	return client.NewBlockContent(out)
 }
 
-// stripSpokenSummaryFromLastAssistant cleans the spoken_summary block out of the
-// most recent assistant message in the transcript, in place. Safe after
-// applyTurnMessages because that appends COPIES of the loop's run messages, so
-// mutating sess.Messages never touches the loop's cache-attribution slice — same
-// shape as SanitizedRunMessages replacing content before persist, so no
-// client.LogCacheCompactEvent is required.
-func stripSpokenSummaryFromLastAssistant(messages []client.Message) {
-	for i := len(messages) - 1; i >= 0; i-- {
+// stripSpokenSummaryFromAssistants cleans the spoken_summary block out of EVERY
+// assistant message in the slice, in place. Callers pass the run's freshly
+// persisted messages (sess.Messages[turnBase.msgCount:]): a run that absorbed
+// injected follow-ups persists more than one assistant answer, and each
+// intermediate answer carries its own head <spoken_summary> tag — cleaning only
+// the last would leak every earlier answer's raw tag into the transcript / FTS /
+// Desktop history. Safe after applyTurnMessages because that appends COPIES of the
+// loop's run messages, so mutating sess.Messages never touches the loop's
+// cache-attribution slice — same shape as SanitizedRunMessages replacing content
+// before persist, so no client.LogCacheCompactEvent is required.
+func stripSpokenSummaryFromAssistants(messages []client.Message) {
+	for i := range messages {
 		if messages[i].Role != "assistant" {
 			continue
 		}
 		messages[i].Content = stripSpokenSummaryFromContent(messages[i].Content)
-		return
 	}
 }

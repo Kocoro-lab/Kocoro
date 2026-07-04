@@ -2838,12 +2838,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			)
 		}
 		// Koe: the normal path rebuilt the transcript from the loop's run messages,
-		// which still carry the head <spoken_summary> tag; strip it from the last
-		// assistant message so Desktop history / FTS / next-turn reload never see
-		// the raw tag. No-op on the flat-text fallback above (already used the
+		// which still carry the head <spoken_summary> tag; strip it from EVERY
+		// assistant message this run persisted (a run that absorbed injected
+		// follow-ups produces more than one answer, each with its own tag) so
+		// Desktop history / FTS / next-turn reload never see the raw tag. Scoped to
+		// this run's slice; no-op on the flat-text fallback above (already used the
 		// cleaned result).
 		if isKoeSource(req.Source) {
-			stripSpokenSummaryFromLastAssistant(sess.Messages)
+			stripSpokenSummaryFromAssistants(sess.Messages[turnBase.msgCount:])
 		}
 		applyTurnUsage(sess, turnUsage, turnBase) // idempotent: baseline + current
 		// Persist tool-result budget state. Mid-turn checkpoints (applyTurnState)

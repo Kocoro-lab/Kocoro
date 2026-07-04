@@ -185,16 +185,27 @@ func TestStripSpokenSummaryFromContent_PreservesThinkingBlock(t *testing.T) {
 	}
 }
 
-func TestStripSpokenSummaryFromLastAssistant(t *testing.T) {
+func TestStripSpokenSummaryFromAssistants(t *testing.T) {
+	// A run that absorbed an injected follow-up persists two assistant answers,
+	// each with its own tag. Both must be stripped — a last-only strip would leave
+	// the intermediate answer's raw tag in the transcript.
 	msgs := []client.Message{
-		{Role: "user", Content: client.NewTextContent("what's up")},
-		{Role: "assistant", Content: client.NewTextContent("details\n<spoken_summary>All good.</spoken_summary>")},
+		{Role: "user", Content: client.NewTextContent("first question")},
+		{Role: "assistant", Content: client.NewTextContent("intermediate answer\n<spoken_summary>First done.</spoken_summary>")},
+		{Role: "user", Content: client.NewTextContent("follow-up")},
+		{Role: "assistant", Content: client.NewTextContent("final answer\n<spoken_summary>All good.</spoken_summary>")},
 	}
-	stripSpokenSummaryFromLastAssistant(msgs)
+	stripSpokenSummaryFromAssistants(msgs)
 	if strings.Contains(msgs[1].Content.Text(), "spoken_summary") {
-		t.Fatalf("last assistant still has tag: %q", msgs[1].Content.Text())
+		t.Fatalf("intermediate assistant still has tag: %q", msgs[1].Content.Text())
 	}
-	if msgs[0].Content.Text() != "what's up" {
+	if strings.Contains(msgs[3].Content.Text(), "spoken_summary") {
+		t.Fatalf("final assistant still has tag: %q", msgs[3].Content.Text())
+	}
+	if !strings.Contains(msgs[1].Content.Text(), "intermediate answer") {
+		t.Fatalf("intermediate assistant lost body: %q", msgs[1].Content.Text())
+	}
+	if msgs[0].Content.Text() != "first question" {
 		t.Fatalf("user message was touched: %q", msgs[0].Content.Text())
 	}
 }
