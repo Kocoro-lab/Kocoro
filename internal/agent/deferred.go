@@ -116,7 +116,16 @@ var toolSearchTokenRE = regexp.MustCompile(`[a-z0-9_]+`)
 func (t *toolSearchTool) matchKeyword(query string) []string {
 	terms := toolSearchTerms(query)
 	if len(terms) == 0 {
-		return nil
+		// Tokenization dropped everything the ASCII token regex can see — a CJK
+		// query (邮件), an all-stopword query, or any script it can't split. Fall
+		// back to a single lowercase substring match on the raw trimmed query so
+		// non-Latin scripts still resolve, matching the pre-tokenizer substring
+		// behavior instead of reporting the tool as nonexistent.
+		raw := strings.ToLower(strings.TrimSpace(query))
+		if raw == "" {
+			return nil
+		}
+		terms = []string{raw}
 	}
 
 	var matched []string
@@ -143,7 +152,9 @@ func toolSearchTerms(query string) []string {
 	seen := make(map[string]bool, len(raw))
 	terms := make([]string, 0, len(raw))
 	for _, term := range raw {
-		if len(term) < 3 || seen[term] || toolSearchStopWord(term) {
+		// Keep 2-char tokens ("db", "ax", "id") — dropping them made short but
+		// meaningful queries tokenize to nothing and match no tool.
+		if len(term) < 2 || seen[term] || toolSearchStopWord(term) {
 			continue
 		}
 		seen[term] = true
