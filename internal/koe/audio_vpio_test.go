@@ -164,6 +164,40 @@ func TestVPIOHardwareBurstPlaybackDoesNotOverwriteRing(t *testing.T) {
 	t.Logf("VPIO burst playback stats: before=%+v after=%+v", before, after)
 }
 
+// TestStopVPIOSkipsTeardownWhenOwnershipTransferred pins S1: after a newer
+// StartVPIO on a different instance takes ownership of the process-global VPIO
+// unit/rings, a late stopVPIO from the old instance must NOT run the C teardown
+// (that would dispose the new session's live unit/rings → silence / UAF).
+// claimVPIOTeardown is the pure-Go ownership gate stopVPIO uses; exercise it
+// directly so no audio hardware is needed. Holds vpioLifecycleMu (the invariant)
+// and restores the global on exit.
+func TestStopVPIOSkipsTeardownWhenOwnershipTransferred(t *testing.T) {
+	vpioLifecycleMu.Lock()
+	prev := vpioOwner
+	defer func() {
+		vpioOwner = prev
+		vpioLifecycleMu.Unlock()
+	}()
+
+	old := &AudioIO{}
+	fresh := &AudioIO{}
+	vpioOwner = fresh // a newer StartVPIO already claimed ownership
+
+	if old.claimVPIOTeardown() {
+		t.Fatal("stale stopVPIO from a non-owner must skip C teardown")
+	}
+	if vpioOwner != fresh {
+		t.Fatal("non-owner teardown must leave the current owner intact")
+	}
+
+	if !fresh.claimVPIOTeardown() {
+		t.Fatal("the current owner must run C teardown")
+	}
+	if vpioOwner != nil {
+		t.Fatal("owner teardown must clear vpioOwner")
+	}
+}
+
 func drainCapturedFrames(a *AudioIO, d time.Duration) {
 	timer := time.NewTimer(d)
 	defer timer.Stop()

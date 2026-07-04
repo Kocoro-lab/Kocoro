@@ -402,11 +402,26 @@ import "C"
 import (
 	"fmt"
 	"math"
+	"sync"
 	"time"
 	"unsafe"
 )
 
 const vpioPlaybackHighWaterSamples = audioSampleRate / 2 // keep hardware ring latency around 500 ms
+
+// vpioLifecycleMu serializes StartVPIO / stopVPIO across DIFFERENT AudioIO
+// instances, and vpioOwner names the AudioIO that currently owns the process-global
+// VPIO unit + rings (gVAU / gMicRing / gPlayRing). cmd/koe.go tears down the OLD
+// session's audio (a.Stop → stopVPIO) AFTER releasing sessMu, while a NEW session's
+// StartVPIO can run under the lock — so without this the old stopVPIO could dispose
+// the new session's live unit/rings (silence or a use-after-free crash). Holding the
+// mutex across both operations makes them strictly ordered: Stop-then-Start (old
+// fully torn down first) OR Start-then-(stale)Stop-noop (old sees it is no longer the
+// owner and skips ALL C disposal). Guarded by vpioLifecycleMu.
+var (
+	vpioLifecycleMu sync.Mutex
+	vpioOwner       *AudioIO
+)
 
 type vpioDebugStats struct {
 	InputCallbacks  uint64
@@ -433,9 +448,16 @@ func (a *AudioIO) StartVPIO() error {
 	spkUID := C.CString(a.preferredSpeakerUID)
 	defer C.free(unsafe.Pointer(micUID))
 	defer C.free(unsafe.Pointer(spkUID))
+	// Hold vpioLifecycleMu across init + ownership claim so a concurrent stopVPIO on a
+	// different instance can never interleave on the process-global unit/rings (see
+	// vpioLifecycleMu / stopVPIO). Ownership is claimed only after vpioStartC succeeds,
+	// so a failed start leaves any prior owner intact.
+	vpioLifecycleMu.Lock()
+	defer vpioLifecycleMu.Unlock()
 	if st := C.vpioStartC(C.double(audioSampleRate), C.int(ringCap), C.int(prerollFrames*audioFrameSize), micUID, spkUID); st != 0 {
 		return fmt.Errorf("vpio start: OSStatus %d", int(st))
 	}
+	vpioOwner = a
 	a.vpioActive.Store(true)
 	a.vpioDone = make(chan struct{})
 	a.vpioWG.Add(2)
@@ -450,13 +472,41 @@ func (a *AudioIO) clearVPIOBuffers() {
 	}
 }
 
+// claimVPIOTeardown reports, under vpioLifecycleMu, whether this AudioIO still owns
+// the process-global VPIO unit/rings and must therefore run the C teardown, clearing
+// the owner when it does. A newer StartVPIO on a different instance transfers
+// ownership, so a late stopVPIO from the old instance returns false — the pure-Go
+// ownership gate that keeps the old teardown from disposing the new session's live
+// unit/rings. Caller MUST hold vpioLifecycleMu.
+func (a *AudioIO) claimVPIOTeardown() bool {
+	if vpioOwner != a {
+		return false
+	}
+	vpioOwner = nil
+	return true
+}
+
 func (a *AudioIO) stopVPIO() {
-	C.vpioStopUnitC()
+	vpioLifecycleMu.Lock()
+	defer vpioLifecycleMu.Unlock()
+	owner := a.claimVPIOTeardown()
+	if owner {
+		C.vpioStopUnitC()
+	}
+	// Always stop THIS instance's goroutines, owner or not: they select on vpioDone
+	// (bounded — the capture loop's inner drain empties the ring in ~1 tick and
+	// breaks), so closing it makes them exit and Wait blocks until they have. In the
+	// stale (non-owner) case the rings are the NEW owner's LIVE buffers, not freed
+	// memory, so the departing goroutines touching them is at worst a stray frame, not
+	// a UAF — and we skip both C.vpioStopUnitC and C.vpioFreeRingsC so the new session
+	// is untouched.
 	if a.vpioDone != nil {
 		close(a.vpioDone)
 	}
 	a.vpioWG.Wait()
-	C.vpioFreeRingsC()
+	if owner {
+		C.vpioFreeRingsC()
+	}
 	a.vpioActive.Store(false)
 	a.vpioDone = nil
 }
