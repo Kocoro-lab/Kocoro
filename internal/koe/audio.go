@@ -49,6 +49,9 @@ type AudioIO struct {
 	// Capture keeps flowing as silent keepalive frames (resolveCaptureFrame),
 	// so the send-track RTP timeline stays continuous during long mutes.
 	userMicOff atomic.Bool
+	// userMicSticky marks a MANUAL mute (user muted outside a task window).
+	// Sticky mutes survive maybeRestoreUserMic — only the user restores them.
+	userMicSticky atomic.Bool
 	// preferredMicUID / preferredSpeakerUID are CoreAudio device UIDs bound in
 	// Desktop settings (koe.mic_device / koe.speaker_device → --mic-device /
 	// --speaker-device). Empty = system default. Only the VPIO backend honors
@@ -177,6 +180,12 @@ func (a *AudioIO) dropCapture() bool  { return a.speaking.Load() }
 // enforcement lives in the /call/mic handler; auto-restore in maybeRestoreUserMic.
 func (a *AudioIO) SetUserMicOff(off bool) { a.userMicOff.Store(off) }
 func (a *AudioIO) UserMicOff() bool       { return a.userMicOff.Load() }
+
+// SetUserMicSticky marks/clears the manual-mute latch: set when the user mutes
+// with no task in flight (plain conversation), cleared on any user restore.
+// A sticky mute is exempt from the task-drain auto-restore.
+func (a *AudioIO) SetUserMicSticky(s bool) { a.userMicSticky.Store(s) }
+func (a *AudioIO) UserMicSticky() bool     { return a.userMicSticky.Load() }
 
 // SetPreferredDevices records the CoreAudio device UIDs StartVPIO binds
 // (empty = system default). Call after NewAudioIO, before Start/StartVPIO.

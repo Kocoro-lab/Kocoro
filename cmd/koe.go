@@ -975,9 +975,15 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		if !active || audio == nil {
 			return koe.ErrNoActiveCall
 		}
-		if off && (state == nil || state.InFlight() == "") {
-			// Mic-off exists only inside the do_task window (koe-mic-off design).
-			return koe.ErrNoTaskPending
+		// Mute works in ANY active call (the Desktop trigger gesture mutes
+		// instead of hanging up). A mute taken OUTSIDE a task window is
+		// sticky: maybeRestoreUserMic's task-drain auto-restore must not
+		// lift it — only the user does. Task-window mutes keep the original
+		// koe-mic-off auto-restore. Any user restore clears the latch.
+		if off {
+			audio.SetUserMicSticky(state == nil || state.InFlight() == "")
+		} else {
+			audio.SetUserMicSticky(false)
 		}
 		audio.SetUserMicOff(off)
 		ctrl.ReemitVoiceState()

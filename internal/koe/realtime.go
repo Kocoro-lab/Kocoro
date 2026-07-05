@@ -283,6 +283,10 @@ func (h *eventHandler) maybeRestoreUserMic() {
 	if h.audio == nil || !h.audio.UserMicOff() || h.taskInFlight() {
 		return
 	}
+	if h.audio.UserMicSticky() {
+		// Manual mute (plain conversation) — only the user lifts it.
+		return
+	}
 	h.audio.SetUserMicOff(false)
 	if eventLogEnabled() {
 		log.Printf("koe[mic]: user mic restored (tasks drained)")
