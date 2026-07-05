@@ -32,7 +32,7 @@ func TestLoad_KoeSection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if !cfg.Koe.Enabled {
+	if cfg.Koe.Enabled == nil || !*cfg.Koe.Enabled {
 		t.Error("koe.enabled should be true after Load")
 	}
 	if cfg.Koe.Model != "gpt-realtime-mini-2025-12-15" {
@@ -46,8 +46,9 @@ func TestLoad_KoeSection(t *testing.T) {
 	}
 }
 
-// TestLoad_KoeSectionAbsent confirms an omitted koe section is the zero value
-// (disabled) rather than a load error — koe is opt-in.
+// TestLoad_KoeSectionAbsent confirms an omitted koe section loads as nil
+// Enabled ("never set") rather than a load error — consumers apply the
+// default-ON policy to nil.
 func TestLoad_KoeSectionAbsent(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -62,7 +63,29 @@ func TestLoad_KoeSectionAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if cfg.Koe.Enabled {
-		t.Error("koe.enabled should default to false when the section is absent")
+	if cfg.Koe.Enabled != nil {
+		t.Error("koe.enabled should be nil (never set) when the section is absent")
+	}
+}
+
+// TestLoad_KoeExplicitFalse confirms an explicit opt-out survives load as
+// &false — distinguishable from the nil "never set" state (the default-ON
+// policy must not resurrect voice for users who turned it off).
+func TestLoad_KoeExplicitFalse(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shannonDir := filepath.Join(home, ".shannon")
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		t.Fatalf("mkdir shannon dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("koe:\n  enabled: false\n"), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if cfg.Koe.Enabled == nil || *cfg.Koe.Enabled {
+		t.Errorf("koe.enabled = %v, want explicit false", cfg.Koe.Enabled)
 	}
 }

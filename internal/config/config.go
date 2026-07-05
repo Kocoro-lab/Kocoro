@@ -50,7 +50,12 @@ type Config struct {
 // `shan koe`. NO credential lives here — Koe mints its OpenAI ephemeral secret
 // via the daemon relay (POST /koe/realtime/mint), never holding a long-lived key.
 type KoeConfig struct {
-	Enabled  bool   `mapstructure:"enabled"  yaml:"enabled,omitempty"  json:"enabled,omitempty"`
+	// Enabled is a *bool so "never set" (nil, omitted) and "explicitly off"
+	// (&false, serialized) are both representable. Voice is default-ON when
+	// the key is absent — Kocoro Desktop treats nil as enabled — so a plain
+	// bool could not round-trip the user's opt-out (omitempty swallowed
+	// false; dropping omitempty would serialize false for untouched configs).
+	Enabled  *bool  `mapstructure:"enabled"  yaml:"enabled,omitempty"  json:"enabled,omitempty"`
 	Model    string `mapstructure:"model"    yaml:"model,omitempty"    json:"model,omitempty"`
 	Voice    string `mapstructure:"voice"    yaml:"voice,omitempty"    json:"voice,omitempty"`
 	Agent    string `mapstructure:"agent"    yaml:"agent,omitempty"    json:"agent,omitempty"`
