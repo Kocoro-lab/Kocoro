@@ -189,6 +189,15 @@ func (a *AudioIO) SetPreferredDevices(micUID, speakerUID string) {
 // Both resolve to silent keepalive frames downstream.
 func (a *AudioIO) captureSuppressed() bool { return a.dropCapture() || a.userMicOff.Load() }
 
+// CaptureExpected reports whether the mic is currently expected to be capturing
+// REAL input — i.e. not user-muted and not gated by Kocoro speaking. The
+// silent-input watchdog only advances its silence timer while this is true, so a
+// legitimately-suppressed mic never trips the "can't hear you" warning.
+func (a *AudioIO) CaptureExpected() bool { return !a.captureSuppressed() }
+
+// VPIOActive reports whether the VoiceProcessingIO capture backend is live.
+func (a *AudioIO) VPIOActive() bool { return a.vpioActive.Load() }
+
 // captureSilenceFrame is the shared 20 ms zero frame forwarded while the
 // speak-gate suppresses capture. Read-only downstream (the gate copies frames it
 // buffers; the encoder only reads), so sharing one slice is safe.

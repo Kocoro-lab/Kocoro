@@ -264,3 +264,12 @@ func (s *ControlServer) EmitControlApp(action string) {
 func (s *ControlServer) EmitCallState(state string) {
 	s.broadcast(controlEvent{Type: "call_state", State: state})
 }
+
+// EmitMicStatus reports microphone health to Desktop. "silent" = the bound input
+// produced no signal for the watchdog window while capture was expected (e.g. a
+// clamshell built-in mic with the lid shut); "ok" = input recovered. Additive
+// event — older Desktop builds skip the unknown type, so it is safe to emit
+// unconditionally.
+func (s *ControlServer) EmitMicStatus(status string) {
+	s.broadcast(controlEvent{Type: "mic_status", State: status})
+}

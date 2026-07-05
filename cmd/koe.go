@@ -998,6 +998,48 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}
 	}()
 
+	// Silent-input watchdog: in clamshell mode the OS default input stays the
+	// built-in mic, which is covered and delivers pure silence — VPIO starts fine
+	// and forwards ~0-RMS frames forever, so the call looks live but the model's
+	// VAD never fires and Kocoro never responds. Sample the live input level and,
+	// if it stays sub-floor while capture is expected, tell Desktop so it can warn
+	// the user ("Kocoro can't hear you — check your microphone"). We do NOT restart
+	// or rebind: in the reported case there is no other input device to switch to,
+	// and a restart re-opens the same dead default (crash loop).
+	go func() {
+		floor := koe.MicSilenceFloor()
+		window := koe.MicSilenceWindow()
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		var watch koe.MicSilenceState
+		var lastAudio *koe.AudioIO
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				audio := snapAudio.Load()
+				if audio != lastAudio { // new call (or call ended) → fresh watch
+					lastAudio = audio
+					watch.Reset()
+				}
+				capturing := audio != nil && audio.VPIOActive() && audio.CaptureExpected()
+				level := 0.0
+				if audio != nil {
+					level = audio.InputLevel()
+				}
+				switch watch.Observe(now, capturing, level, floor, window) {
+				case koe.MicSilenceSilent:
+					log.Printf("koe[mic]: no input above %.4f RMS for %s while capturing — mic likely unavailable (clamshell/covered/dead)", floor, window)
+					ctrl.EmitMicStatus("silent")
+				case koe.MicSilenceRecovered:
+					log.Printf("koe[mic]: input recovered")
+					ctrl.EmitMicStatus("ok")
+				}
+			}
+		}
+	}()
+
 	// Fetch the agent registry + persona ONLY AFTER the listener above is bound, so
 	// Desktop can already reach koe (409 no_active_call on /call/mic, or /call/start
 	// kicking a warm session) during a slow-daemon window — ListAgents alone can block
