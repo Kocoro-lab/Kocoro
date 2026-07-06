@@ -423,6 +423,23 @@ var daemonStartCmd = &cobra.Command{
 				CloudMessageID:  msg.MessageID,
 				IMStatusContext: msg.IMStatusContext,
 			}
+			// Thread snapshot from Cloud (e.g. a Slack thread): load it as the
+			// run's history so the agent sees the whole thread, not just messages
+			// addressed to it. This OVERWRITES the session each turn (runner.go
+			// applies req.SessionHistory over sess.Messages), so a stable
+			// thread-scoped route key stays one session with no cross-turn
+			// duplication. Empty for all other flows → untouched.
+			if len(msg.ThreadHistory) > 0 {
+				hist := make([]client.Message, 0, len(msg.ThreadHistory))
+				for _, m := range msg.ThreadHistory {
+					role := m.Role
+					if role != "assistant" {
+						role = "user"
+					}
+					hist = append(hist, client.Message{Role: role, Content: client.NewTextContent(m.Text)})
+				}
+				req.SessionHistory = hist
+			}
 			// Fall back to @mention parsing if cloud didn't set agent name.
 			// Skip for messaging-platform sources: there the gateway delivers an
 			// explicit AgentName (or empty = use default), and any "@<botname>"

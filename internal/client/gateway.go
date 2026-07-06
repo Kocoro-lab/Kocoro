@@ -1579,6 +1579,97 @@ func (c *GatewayClient) DeleteFeishuAppInstall(ctx context.Context, id string) (
 	return resp.StatusCode, respBody, nil
 }
 
+// SlackAppInstallRequest is the wire body for registering a bring-your-own-app
+// Slack application via Cloud's POST /api/v1/channels/slack/app-installs. The
+// user supplies their own Slack app's credentials; Cloud runs the per-app OAuth
+// (returning a slack.com authorize URL) and receives events at its public URL.
+type SlackAppInstallRequest struct {
+	AppID         string `json:"app_id"`
+	ClientID      string `json:"client_id"`
+	ClientSecret  string `json:"client_secret"`
+	SigningSecret string `json:"signing_secret"`
+	AgentName     string `json:"agent_name,omitempty"`
+	DisplayName   string `json:"display_name,omitempty"`
+}
+
+// CreateSlackAppInstall forwards a BYOA Slack registration to Cloud with this
+// daemon's API key. Returns Cloud's status + raw body verbatim (the body
+// carries the slack.com authorize_url the renderer must open).
+func (c *GatewayClient) CreateSlackAppInstall(ctx context.Context, body SlackAppInstallRequest) (int, []byte, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return 0, nil, fmt.Errorf("marshal request: %w", err)
+	}
+	endpoint := c.baseURL + "/api/v1/channels/slack/app-installs"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// ListSlackAppInstalls fetches the user's BYOA Slack installs from Cloud.
+func (c *GatewayClient) ListSlackAppInstalls(ctx context.Context) (int, []byte, error) {
+	endpoint := c.baseURL + "/api/v1/channels/slack/app-installs"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// DeleteSlackAppInstall unbinds a BYOA Slack install by id via Cloud.
+func (c *GatewayClient) DeleteSlackAppInstall(ctx context.Context, id string) (int, []byte, error) {
+	endpoint := c.baseURL + "/api/v1/channels/slack/app-installs/" + url.PathEscape(id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// CloudBaseURL returns the Cloud gateway base URL (e.g. https://api-dev.shannon.run).
+// The renderer needs it to build the Slack app manifest's request_url + OAuth
+// redirect_url, which must point at this Cloud.
+func (c *GatewayClient) CloudBaseURL() string { return c.baseURL }
+
 // GetTask fetches the full task result from the REST API.
 // Unlike SSE events which truncate at 10K chars, the REST response contains
 // the complete untruncated result.
