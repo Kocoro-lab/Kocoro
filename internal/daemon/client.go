@@ -163,6 +163,11 @@ const (
 	// (an unlimited single-scope response also has has_more:false, so shape
 	// sniffing is ambiguous).
 	CapSessionsScopeAll = "sessions_scope_all"
+	// CapRemoteControlV1 — daemon accepts Cloud-relayed remote_request frames
+	// for a narrow allowlisted local API subset and forwards EventBus events as
+	// remote_event frames. Mobile clients use this to control the user's Mac via
+	// Shannon Cloud without exposing localhost.
+	CapRemoteControlV1 = "remote_control_v1"
 )
 
 var Capabilities = []string{
@@ -185,6 +190,7 @@ var Capabilities = []string{
 	CapDefaultAgentSkillDenylist,
 	CapPerAgentMCPScope,
 	CapSessionsScopeAll,
+	CapRemoteControlV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
@@ -200,8 +206,16 @@ type Client struct {
 	onSystem              func(string)                             // system notifications
 	onReplyDeliveryResult func(ReplyDeliveryResultPayload, string) // (payload, original message_id)
 	onChannelStateEvent   func(ChannelStateEventPayload)
+	onRemoteRequest       func(context.Context, RemoteRequest) RemoteResponse
+	onRemoteRun           func(context.Context, RemoteRunRequest)
+	onRemoteRunCancel     func(RemoteRunCancel)
+	onRemoteApproval      func(RemoteApprovalResponse)
+	onRemoteRunReplay     func()
 	sem                   chan struct{}
 	pendingClaims         sync.Map // map[string]chan bool
+	pendingPairingCodes   sync.Map // map[string]chan PairingCodeResponse
+	pendingRemotePairings sync.Map // map[string]chan RemotePairingsResponse
+	pendingRemoteRevokes  sync.Map // map[string]chan RemoteHostRevokeResponse
 	activeMsgs            sync.Map // map[string]context.CancelFunc
 	eventSeqs             sync.Map // map[string]*atomic.Int64
 	pendingReplies        sync.Map // map[string]pendingReply — per-message reply override set by onMsg during RunAgent
@@ -210,6 +224,7 @@ type Client struct {
 	startTime             time.Time
 	broker                *ApprovalBroker
 	eventBus              *EventBus
+	deviceInfo            DeviceInfo
 
 	keyMu  sync.RWMutex
 	apiKey string
@@ -267,6 +282,33 @@ func (c *Client) SetOnChannelStateEvent(cb func(ChannelStateEventPayload)) {
 	c.onChannelStateEvent = cb
 }
 
+// SetRemoteRequestHandler registers the local handler for Cloud-relayed remote
+// control requests. The handler is installed by the daemon HTTP server so it
+// can reuse the same local API implementation and allowlist.
+func (c *Client) SetRemoteRequestHandler(cb func(context.Context, RemoteRequest) RemoteResponse) {
+	c.onRemoteRequest = cb
+}
+
+func (c *Client) SetRemoteRunHandler(cb func(context.Context, RemoteRunRequest)) {
+	c.onRemoteRun = cb
+}
+
+func (c *Client) SetRemoteRunCancelHandler(cb func(RemoteRunCancel)) {
+	c.onRemoteRunCancel = cb
+}
+
+func (c *Client) SetRemoteApprovalHandler(cb func(RemoteApprovalResponse)) {
+	c.onRemoteApproval = cb
+}
+
+func (c *Client) SetRemoteRunReplayHandler(cb func()) {
+	c.onRemoteRunReplay = cb
+}
+
+func (c *Client) SetDeviceInfo(info DeviceInfo) {
+	c.deviceInfo = info
+}
+
 func (c *Client) getAPIKey() string {
 	c.keyMu.RLock()
 	defer c.keyMu.RUnlock()
@@ -299,6 +341,15 @@ func (c *Client) Connect(ctx context.Context) error {
 	header.Set("X-Kocoro-Daemon-Version", Version)
 	if len(Capabilities) > 0 {
 		header.Set("X-Kocoro-Capabilities", strings.Join(Capabilities, ","))
+	}
+	if c.deviceInfo.DeviceID != "" {
+		header.Set("X-Kocoro-Device-ID", c.deviceInfo.DeviceID)
+	}
+	if c.deviceInfo.DisplayName != "" {
+		header.Set("X-Kocoro-Device-Name", c.deviceInfo.DisplayName)
+	}
+	if c.deviceInfo.Platform != "" {
+		header.Set("X-Kocoro-Platform", c.deviceInfo.Platform)
 	}
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
@@ -564,6 +615,143 @@ func (c *Client) SendApprovalResolved(p ApprovalResolvedPayload) error {
 	})
 }
 
+// SendRemoteEvent forwards a local EventBus event to Cloud for mobile/remote
+// subscribers. It is best-effort; callers should log and continue on error.
+func (c *Client) SendRemoteEvent(evt Event) error {
+	payload, err := json.Marshal(RemoteEvent{
+		ID:      evt.ID,
+		Type:    evt.Type,
+		Payload: evt.Payload,
+	})
+	if err != nil {
+		return err
+	}
+	return c.envelopeSender(DaemonMessage{
+		Type:    MsgTypeRemoteEvent,
+		Payload: payload,
+	})
+}
+
+func (c *Client) SendRemoteRunEvent(evt RemoteRunEvent) error {
+	payload, err := json.Marshal(evt)
+	if err != nil {
+		return err
+	}
+	return c.envelopeSender(DaemonMessage{
+		Type:    MsgTypeRemoteRunEvent,
+		Payload: payload,
+	})
+}
+
+func (c *Client) RequestPairingCode(ctx context.Context) (PairingCodeResponse, error) {
+	if c == nil || c.envelopeSender == nil {
+		return PairingCodeResponse{}, fmt.Errorf("remote pairing unavailable")
+	}
+	messageID := generateRequestID()
+	ch := make(chan PairingCodeResponse, 1)
+	c.pendingPairingCodes.Store(messageID, ch)
+	defer c.pendingPairingCodes.Delete(messageID)
+	payload, err := json.Marshal(PairingCodeRequest{
+		DeviceID:    c.deviceInfo.DeviceID,
+		DisplayName: c.deviceInfo.DisplayName,
+		Platform:    c.deviceInfo.Platform,
+	})
+	if err != nil {
+		return PairingCodeResponse{}, err
+	}
+	if err := c.envelopeSender(DaemonMessage{
+		Type:      MsgTypePairingCodeReq,
+		MessageID: messageID,
+		Payload:   payload,
+	}); err != nil {
+		return PairingCodeResponse{}, err
+	}
+	select {
+	case resp := <-ch:
+		if resp.Error != "" {
+			return resp, errors.New(resp.Error)
+		}
+		return resp, nil
+	case <-ctx.Done():
+		return PairingCodeResponse{}, ctx.Err()
+	}
+}
+
+func (c *Client) RequestRemotePairings(ctx context.Context) (RemotePairingsResponse, error) {
+	if c == nil || c.envelopeSender == nil {
+		return RemotePairingsResponse{}, fmt.Errorf("remote pairings unavailable")
+	}
+	messageID := generateRequestID()
+	ch := make(chan RemotePairingsResponse, 1)
+	c.pendingRemotePairings.Store(messageID, ch)
+	defer c.pendingRemotePairings.Delete(messageID)
+	payload, err := json.Marshal(RemotePairingsRequest{})
+	if err != nil {
+		return RemotePairingsResponse{}, err
+	}
+	if err := c.envelopeSender(DaemonMessage{
+		Type:      MsgTypeRemotePairingsReq,
+		MessageID: messageID,
+		Payload:   payload,
+	}); err != nil {
+		return RemotePairingsResponse{}, err
+	}
+	select {
+	case resp := <-ch:
+		if resp.Error != "" {
+			return resp, errors.New(resp.Error)
+		}
+		return resp, nil
+	case <-ctx.Done():
+		return RemotePairingsResponse{}, ctx.Err()
+	}
+}
+
+func (c *Client) RequestRemoteHostRevoke(ctx context.Context) (RemoteHostRevokeResponse, error) {
+	if c == nil || c.envelopeSender == nil {
+		return RemoteHostRevokeResponse{}, fmt.Errorf("remote host revoke unavailable")
+	}
+	messageID := generateRequestID()
+	ch := make(chan RemoteHostRevokeResponse, 1)
+	c.pendingRemoteRevokes.Store(messageID, ch)
+	defer c.pendingRemoteRevokes.Delete(messageID)
+	payload, err := json.Marshal(RemoteHostRevokeRequest{})
+	if err != nil {
+		return RemoteHostRevokeResponse{}, err
+	}
+	if err := c.envelopeSender(DaemonMessage{
+		Type:      MsgTypeRemoteHostRevokeReq,
+		MessageID: messageID,
+		Payload:   payload,
+	}); err != nil {
+		return RemoteHostRevokeResponse{}, err
+	}
+	select {
+	case resp := <-ch:
+		if resp.Error != "" {
+			return resp, errors.New(resp.Error)
+		}
+		return resp, nil
+	case <-ctx.Done():
+		return RemoteHostRevokeResponse{}, ctx.Err()
+	}
+}
+
+func (c *Client) sendRemoteResponse(messageID string, resp RemoteResponse) error {
+	if resp.Status == 0 {
+		resp.Status = http.StatusOK
+	}
+	payload, err := json.Marshal(resp)
+	if err != nil {
+		return err
+	}
+	return c.envelopeSender(DaemonMessage{
+		Type:      MsgTypeRemoteResponse,
+		MessageID: messageID,
+		Payload:   payload,
+	})
+}
+
 // Listen reads messages from the WebSocket and dispatches them.
 // It blocks until the context is cancelled or the connection drops.
 func (c *Client) Listen(ctx context.Context) error {
@@ -603,6 +791,9 @@ func (c *Client) Listen(ctx context.Context) error {
 		switch sm.Type {
 		case MsgTypeConnected:
 			log.Println("daemon: connected to Shannon Cloud")
+			if c.onRemoteRunReplay != nil {
+				go c.onRemoteRunReplay()
+			}
 		case MsgTypeMessage:
 			go c.handleMessage(ctx, sm)
 		case MsgTypeClaimAck:
@@ -667,8 +858,136 @@ func (c *Client) Listen(ctx context.Context) error {
 				}
 				c.onChannelStateEvent(p)
 			}
+		case MsgTypeRemoteRequest:
+			go c.handleRemoteRequest(ctx, sm)
+		case MsgTypeRemoteRunRequest:
+			go c.handleRemoteRun(ctx, sm)
+		case MsgTypeRemoteRunCancel:
+			c.handleRemoteRunCancel(sm)
+		case MsgTypeRemoteApproval:
+			c.handleRemoteApproval(sm)
+		case MsgTypePairingCodeResponse:
+			c.handlePairingCodeResponse(sm)
+		case MsgTypeRemotePairingsResponse:
+			c.handleRemotePairingsResponse(sm)
+		case MsgTypeRemoteHostRevokeResponse:
+			c.handleRemoteHostRevokeResponse(sm)
 		default:
 			log.Printf("daemon: unknown message type: %s", sm.Type)
+		}
+	}
+}
+
+func (c *Client) handleRemoteRequest(ctx context.Context, sm ServerMessage) {
+	if sm.MessageID == "" {
+		log.Printf("daemon: remote_request missing message_id")
+		return
+	}
+	if c.onRemoteRequest == nil {
+		_ = c.sendRemoteResponse(sm.MessageID, RemoteResponse{
+			Status: http.StatusServiceUnavailable,
+			Error:  "remote control handler unavailable",
+		})
+		return
+	}
+	var req RemoteRequest
+	if err := json.Unmarshal(sm.Payload, &req); err != nil {
+		_ = c.sendRemoteResponse(sm.MessageID, RemoteResponse{
+			Status: http.StatusBadRequest,
+			Error:  "invalid remote_request payload",
+		})
+		return
+	}
+	resp := c.onRemoteRequest(ctx, req)
+	if err := c.sendRemoteResponse(sm.MessageID, resp); err != nil {
+		log.Printf("daemon: remote_response failed for %s: %v", sm.MessageID, err)
+	}
+}
+
+func (c *Client) handleRemoteRun(ctx context.Context, sm ServerMessage) {
+	if c.onRemoteRun == nil {
+		log.Printf("daemon: remote_run_request handler unavailable")
+		return
+	}
+	var req RemoteRunRequest
+	if err := json.Unmarshal(sm.Payload, &req); err != nil {
+		log.Printf("daemon: invalid remote_run_request payload: %v", err)
+		return
+	}
+	c.onRemoteRun(ctx, req)
+}
+
+func (c *Client) handleRemoteRunCancel(sm ServerMessage) {
+	if c.onRemoteRunCancel == nil {
+		return
+	}
+	var req RemoteRunCancel
+	if err := json.Unmarshal(sm.Payload, &req); err != nil {
+		log.Printf("daemon: invalid remote_run_cancel payload: %v", err)
+		return
+	}
+	c.onRemoteRunCancel(req)
+}
+
+func (c *Client) handleRemoteApproval(sm ServerMessage) {
+	if c.onRemoteApproval == nil {
+		return
+	}
+	var resp RemoteApprovalResponse
+	if err := json.Unmarshal(sm.Payload, &resp); err != nil {
+		log.Printf("daemon: invalid remote_approval_response payload: %v", err)
+		return
+	}
+	c.onRemoteApproval(resp)
+}
+
+func (c *Client) handlePairingCodeResponse(sm ServerMessage) {
+	if sm.MessageID == "" {
+		return
+	}
+	var resp PairingCodeResponse
+	if err := json.Unmarshal(sm.Payload, &resp); err != nil {
+		resp = PairingCodeResponse{Error: "invalid pairing response payload"}
+	}
+	if ch, ok := c.pendingPairingCodes.Load(sm.MessageID); ok {
+		select {
+		case ch.(chan PairingCodeResponse) <- resp:
+		default:
+		}
+	}
+}
+
+func (c *Client) handleRemotePairingsResponse(sm ServerMessage) {
+	if sm.MessageID == "" {
+		return
+	}
+	var resp RemotePairingsResponse
+	if err := json.Unmarshal(sm.Payload, &resp); err != nil {
+		resp = RemotePairingsResponse{Error: "invalid remote pairings response payload"}
+	}
+	if resp.Controllers == nil {
+		resp.Controllers = []RemotePairingController{}
+	}
+	if ch, ok := c.pendingRemotePairings.Load(sm.MessageID); ok {
+		select {
+		case ch.(chan RemotePairingsResponse) <- resp:
+		default:
+		}
+	}
+}
+
+func (c *Client) handleRemoteHostRevokeResponse(sm ServerMessage) {
+	if sm.MessageID == "" {
+		return
+	}
+	var resp RemoteHostRevokeResponse
+	if err := json.Unmarshal(sm.Payload, &resp); err != nil {
+		resp = RemoteHostRevokeResponse{Error: "invalid remote host revoke response payload"}
+	}
+	if ch, ok := c.pendingRemoteRevokes.Load(sm.MessageID); ok {
+		select {
+		case ch.(chan RemoteHostRevokeResponse) <- resp:
+		default:
 		}
 	}
 }

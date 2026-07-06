@@ -1,26 +1,42 @@
 package daemon
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Server -> Daemon message types
 const (
-	MsgTypeConnected           = "connected"
-	MsgTypeMessage             = "message"
-	MsgTypeClaimAck            = "claim_ack"
-	MsgTypeSystem              = "system"
-	MsgTypeReplyDeliveryResult = "reply_delivery_result"
-	MsgTypeChannelStateEvent   = "channel_state_event"
+	MsgTypeConnected                = "connected"
+	MsgTypeMessage                  = "message"
+	MsgTypeClaimAck                 = "claim_ack"
+	MsgTypeSystem                   = "system"
+	MsgTypeReplyDeliveryResult      = "reply_delivery_result"
+	MsgTypeChannelStateEvent        = "channel_state_event"
+	MsgTypeRemoteRequest            = "remote_request"
+	MsgTypeRemoteRunRequest         = "remote_run_request"
+	MsgTypeRemoteRunCancel          = "remote_run_cancel"
+	MsgTypeRemoteApproval           = "remote_approval_response"
+	MsgTypePairingCodeResponse      = "remote_pairing_code_response"
+	MsgTypeRemotePairingsResponse   = "remote_pairings_response"
+	MsgTypeRemoteHostRevokeResponse = "remote_host_revoke_response"
 )
 
 // Daemon -> Server message types
 const (
-	MsgTypeClaim       = "claim"
-	MsgTypeReply       = "reply"
-	MsgTypeProgress    = "progress"
-	MsgTypeDisconnect  = "disconnect"
-	MsgTypeEvent       = "event"
-	MsgTypeProactive   = "proactive"
-	MsgTypeDeliveryAck = "delivery_ack"
+	MsgTypeClaim               = "claim"
+	MsgTypeReply               = "reply"
+	MsgTypeProgress            = "progress"
+	MsgTypeDisconnect          = "disconnect"
+	MsgTypeEvent               = "event"
+	MsgTypeProactive           = "proactive"
+	MsgTypeDeliveryAck         = "delivery_ack"
+	MsgTypeRemoteResponse      = "remote_response"
+	MsgTypeRemoteEvent         = "remote_event"
+	MsgTypeRemoteRunEvent      = "remote_run_event"
+	MsgTypePairingCodeReq      = "remote_pairing_code_request"
+	MsgTypeRemotePairingsReq   = "remote_pairings_request"
+	MsgTypeRemoteHostRevokeReq = "remote_host_revoke_request"
 )
 
 // Approval protocol (bidirectional relay via Cloud)
@@ -126,6 +142,101 @@ type DaemonMessage struct {
 	Type      string          `json:"type"`
 	MessageID string          `json:"message_id,omitempty"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
+}
+
+// RemoteRequest is a Cloud-relayed, authenticated request from a paired
+// controller such as Kocoro iOS. It intentionally models a narrow HTTP-like
+// subset so the daemon can reuse existing local handlers while still enforcing
+// an allowlist before any handler is invoked.
+type RemoteRequest struct {
+	Method  string            `json:"method"`
+	Path    string            `json:"path"`
+	Body    json.RawMessage   `json:"body,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// RemoteResponse is the daemon's response to a RemoteRequest.
+type RemoteResponse struct {
+	Status  int               `json:"status"`
+	Body    []byte            `json:"body,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Error   string            `json:"error,omitempty"`
+}
+
+// RemoteEvent forwards a daemon EventBus event to Shannon Cloud so mobile
+// clients can subscribe without connecting to localhost.
+type RemoteEvent struct {
+	ID      uint64          `json:"id,omitempty"`
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+// RemoteRunRequest starts an asynchronous mobile-originated local agent run.
+type RemoteRunRequest struct {
+	RunID           string                `json:"run_id"`
+	Text            string                `json:"text"`
+	Content         []RequestContentBlock `json:"content,omitempty"`
+	SessionID       string                `json:"session_id,omitempty"`
+	Agent           string                `json:"agent,omitempty"`
+	NewSession      bool                  `json:"new_session,omitempty"`
+	ClientMessageID string                `json:"client_message_id,omitempty"`
+	Files           []RemoteFile          `json:"files,omitempty"`
+}
+
+type RemoteRunCancel struct {
+	RunID string `json:"run_id"`
+}
+
+type RemoteApprovalResponse struct {
+	RunID      string           `json:"run_id"`
+	RequestID  string           `json:"request_id"`
+	Decision   ApprovalDecision `json:"decision"`
+	ResolvedBy string           `json:"resolved_by,omitempty"`
+}
+
+type RemoteRunEvent struct {
+	RunID     string          `json:"run_id"`
+	Seq       int64           `json:"seq,omitempty"`
+	Type      string          `json:"type"`
+	SessionID string          `json:"session_id,omitempty"`
+	RequestID string          `json:"request_id,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+}
+
+type PairingCodeRequest struct {
+	DeviceID    string `json:"device_id,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+	Platform    string `json:"platform,omitempty"`
+}
+
+type PairingCodeResponse struct {
+	Code      string `json:"code,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+type RemotePairingsRequest struct{}
+
+type RemotePairingController struct {
+	ID                 string     `json:"id"`
+	ControllerDeviceID string     `json:"controller_device_id"`
+	DisplayName        string     `json:"display_name,omitempty"`
+	Platform           string     `json:"platform,omitempty"`
+	AppVersion         string     `json:"app_version,omitempty"`
+	PairedAt           time.Time  `json:"paired_at"`
+	LastSeenAt         time.Time  `json:"last_seen_at"`
+	RevokedAt          *time.Time `json:"revoked_at,omitempty"`
+}
+
+type RemotePairingsResponse struct {
+	Controllers []RemotePairingController `json:"controllers"`
+	Error       string                    `json:"error,omitempty"`
+}
+
+type RemoteHostRevokeRequest struct{}
+
+type RemoteHostRevokeResponse struct {
+	Error string `json:"error,omitempty"`
 }
 
 // MessagePayload is what the daemon's agent loop processes.
