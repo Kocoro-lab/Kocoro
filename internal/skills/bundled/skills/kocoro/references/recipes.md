@@ -121,7 +121,7 @@ Automate a regular check-in that runs without you needing to be present.
 
 4. **Verify**: call `schedule_list` and confirm `enabled=true` and the cron expression is correct
 
-The monitor runs every hour automatically. Replies are delivered to the agent's OAuth-bound Cloud channels (e.g. Slack); for low-level debugging also see `~/.shannon/logs/schedule-{id}.log`.
+The monitor runs every hour automatically. If the schedule was created from an IM conversation, replies are delivered back to that channel (results always land in the session either way); for low-level debugging also see `~/.shannon/logs/schedule-{id}.log`.
 
 ---
 

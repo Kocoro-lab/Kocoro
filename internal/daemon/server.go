@@ -5162,6 +5162,13 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("created_from_source %q is not a recognized origin", req.CreatedFromSource))
 		return
 	}
+	// Note: this endpoint has no way to supply an IMStatusContext (the
+	// origin-channel routing blob is only captured by schedule_create inside an
+	// IM-sourced run), so HTTP-created schedules never push to IM — even with
+	// broadcast:"on" (broadcastReply's origin-only gate skips them, with a log).
+	// broadcast is still accepted rather than rejected because Desktop's
+	// createSchedule sends it (frozen client contract) and PATCH legitimately
+	// toggles it on IM-created schedules.
 	opts := schedule.CreateOpts{CreatedFromSource: req.CreatedFromSource}
 	if req.Broadcast != nil {
 		bPtr, ok := schedule.ParseBroadcastEnum(*req.Broadcast)
