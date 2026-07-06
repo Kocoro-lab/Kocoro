@@ -435,6 +435,7 @@ func TestBroadcastReply_Guards(t *testing.T) {
 	)
 	bTrue := true
 	bFalse := false
+	blob := json.RawMessage(`{"platform":"slack","channel_registry_id":"r1","channel_id":"C1","message_ts":"1.2"}`)
 
 	tests := []struct {
 		name     string
@@ -447,23 +448,23 @@ func TestBroadcastReply_Guards(t *testing.T) {
 		{
 			name:     "nil_sender_is_no_op",
 			ws:       nil,
-			sched:    schedule.Schedule{ID: scheduleID, Agent: "researcher", CreatedFromSource: "slack"},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "researcher", CreatedFromSource: "slack", IMStatusContext: blob},
 			reply:    "ignored",
 			wantCall: false,
 		},
 		{
 			name:     "empty_reply_skips_broadcast",
 			ws:       &fakeProactiveSender{},
-			sched:    schedule.Schedule{ID: scheduleID, Agent: "researcher", CreatedFromSource: "slack"},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "researcher", CreatedFromSource: "slack", IMStatusContext: blob},
 			reply:    "",
 			wantCall: false,
 		},
 
 		// Smart default × default agent
 		{
-			name:     "default_agent_smart_slack_broadcasts",
+			name:     "default_agent_smart_slack_pushes_to_origin",
 			ws:       &fakeProactiveSender{},
-			sched:    schedule.Schedule{ID: scheduleID, Agent: "", CreatedFromSource: "slack"},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", CreatedFromSource: "slack", IMStatusContext: blob},
 			reply:    "hi",
 			wantCall: true,
 		},
@@ -484,9 +485,9 @@ func TestBroadcastReply_Guards(t *testing.T) {
 
 		// Smart default × named agent
 		{
-			name:     "named_agent_smart_slack_broadcasts",
+			name:     "named_agent_smart_slack_pushes_to_origin",
 			ws:       &fakeProactiveSender{},
-			sched:    schedule.Schedule{ID: scheduleID, Agent: "analyst", CreatedFromSource: "slack"},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "analyst", CreatedFromSource: "slack", IMStatusContext: blob},
 			reply:    "hi",
 			wantCall: true,
 		},
@@ -507,16 +508,35 @@ func TestBroadcastReply_Guards(t *testing.T) {
 
 		// Explicit override
 		{
-			name:     "explicit_true_overrides_webview",
+			name:     "explicit_true_with_blob_pushes",
 			ws:       &fakeProactiveSender{},
-			sched:    schedule.Schedule{ID: scheduleID, Agent: "", Broadcast: &bTrue, CreatedFromSource: "webview"},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", Broadcast: &bTrue, CreatedFromSource: "slack", IMStatusContext: blob},
 			reply:    "hi",
 			wantCall: true,
 		},
 		{
 			name:     "explicit_false_overrides_slack",
 			ws:       &fakeProactiveSender{},
-			sched:    schedule.Schedule{ID: scheduleID, Agent: "", Broadcast: &bFalse, CreatedFromSource: "slack"},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", Broadcast: &bFalse, CreatedFromSource: "slack", IMStatusContext: blob},
+			reply:    "hi",
+			wantCall: false,
+		},
+
+		// No-blob gate: a schedule may only push to its originating channel;
+		// without the snapshotted blob there is no legitimate IM target, so
+		// even an explicit broadcast=on never sends (wrong-audience delivery
+		// is worse than no delivery).
+		{
+			name:     "explicit_true_without_blob_silent",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", Broadcast: &bTrue, CreatedFromSource: "desktop"},
+			reply:    "hi",
+			wantCall: false,
+		},
+		{
+			name:     "im_source_without_blob_silent",
+			ws:       &fakeProactiveSender{},
+			sched:    schedule.Schedule{ID: scheduleID, Agent: "", CreatedFromSource: "teams"},
 			reply:    "hi",
 			wantCall: false,
 		},
@@ -553,10 +573,13 @@ func TestBroadcastReply_Guards(t *testing.T) {
 func TestBroadcastReply_SendErrorIsSwallowed(t *testing.T) {
 	ws := &fakeProactiveSender{err: errors.New("ws closed")}
 	// Must not panic, must not return; we're asserting that no panic / no
-	// exit-status change escapes the helper. Use a Slack-sourced schedule so
-	// the gate permits the broadcast (otherwise SendProactive isn't reached
-	// and the swallow-on-error contract isn't exercised).
-	sched := schedule.Schedule{ID: "abc", Agent: "researcher", CreatedFromSource: "slack"}
+	// exit-status change escapes the helper. Use a Slack-sourced schedule with
+	// a routing blob so the gates permit the push (otherwise SendProactive
+	// isn't reached and the swallow-on-error contract isn't exercised).
+	sched := schedule.Schedule{
+		ID: "abc", Agent: "researcher", CreatedFromSource: "slack",
+		IMStatusContext: json.RawMessage(`{"platform":"slack","channel_registry_id":"r1"}`),
+	}
 	broadcastReply(ws, &sched, "hello", "sess-1")
 	if len(ws.calls) != 1 {
 		t.Fatalf("send was not attempted: got %d calls", len(ws.calls))
@@ -573,12 +596,13 @@ func TestRunWithLifecycle_BroadcastsOnSuccess(t *testing.T) {
 
 	bTrue := true
 	sched := schedule.Schedule{
-		ID:        "abc123",
-		Agent:     "researcher",
-		Prompt:    "anything",
-		Cron:      "* * * * *",
-		Enabled:   true,
-		Broadcast: &bTrue, // exercise the success-branch wiring; gate semantics covered by TestBroadcastReply_Guards
+		ID:              "abc123",
+		Agent:           "researcher",
+		Prompt:          "anything",
+		Cron:            "* * * * *",
+		Enabled:         true,
+		Broadcast:       &bTrue, // exercise the success-branch wiring; gate semantics covered by TestBroadcastReply_Guards
+		IMStatusContext: json.RawMessage(`{"platform":"slack","channel_registry_id":"r1"}`),
 	}
 
 	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {

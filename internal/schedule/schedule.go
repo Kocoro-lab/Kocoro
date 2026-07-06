@@ -37,8 +37,11 @@ type Schedule struct {
 
 	// Broadcast is a three-state opt-in/out for IM channel push:
 	//   nil   → smart default (see internal/daemon/broadcast_gate.shouldBroadcast)
-	//   true  → always broadcast (regardless of CreatedFromSource)
-	//   false → never broadcast (regardless of CreatedFromSource)
+	//   true  → push (regardless of CreatedFromSource)
+	//   false → never push (regardless of CreatedFromSource)
+	// It only decides WHETHER to push; the target is always the originating
+	// channel in IMStatusContext. A schedule with no IMStatusContext never
+	// pushes, even with Broadcast=true (daemon.broadcastReply gate).
 	Broadcast *bool `json:"broadcast,omitempty"`
 
 	// Thread is a three-state control for whether a proactive IM push anchors
@@ -61,12 +64,14 @@ type Schedule struct {
 
 	// IMStatusContext is the opaque platform routing blob snapshotted from the
 	// inbound IM message at schedule-CREATION time (when the schedule is created
-	// during an IM conversation). It is echoed back to Cloud in the proactive
-	// push so a run that fires hours/days later is routed to the originating IM
-	// thread instead of broadcast — the inbound claim's TTL has long expired by
-	// then, which is why it must be snapshotted at creation, not fetched at run
-	// time. Empty when created from Desktop/TUI/CLI/cron (those fall back to
-	// broadcast). The daemon never decodes it. See the proactive-targeting design.
+	// during an IM conversation). It is the schedule's ONLY legitimate IM
+	// delivery target: echoed back to Cloud in the proactive push so a run that
+	// fires hours/days later is routed to the originating IM thread — the
+	// inbound claim's TTL has long expired by then, which is why it must be
+	// snapshotted at creation, not fetched at run time. Empty when created from
+	// Desktop/TUI/CLI/cron/HTTP (those never push to IM, even with
+	// Broadcast=true). The daemon never decodes it. See the proactive-targeting
+	// design.
 	// It holds routing identifiers (channel/message ids), not credentials, and is
 	// persisted in schedules.json for the schedule's whole lifetime with no expiry
 	// — retracting or recreating the schedule is the only thing that clears it.

@@ -86,8 +86,8 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 							"pass that name so future runs use the same persona AND the user can find results via session_search inside the same agent. " +
 							"When you're handling a conversation as the default agent (sticky context shows `Agent: default`), " +
 							"pass an empty string — runs will execute under the default agent identity, results land in the global " +
-							"~/.shannon/sessions/ pool, and the reply broadcasts to whichever channels Cloud has bound to the default agent " +
-							"(including the current Slack/IM channel if that's how this conversation reached you). " +
+							"~/.shannon/sessions/ pool, and the reply is pushed back to the IM channel this conversation is happening in " +
+							"(if this conversation reached you via Slack/Teams/another IM). " +
 							"Treat default and named agents symmetrically — neither is 'rare', the choice follows the current conversation identity.",
 					},
 					"cron": map[string]any{"type": "string", "description": "5-field cron expression (minute hour day month weekday). Supports */5, 1-5, 1,3,5."},
@@ -109,10 +109,11 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 					"broadcast": map[string]any{
 						"type": "string",
 						"enum": []string{"auto", "on", "off"},
-						"description": "Optional. Controls whether the schedule's reply is broadcast to this agent's bound IM channel (Slack / Lark / Feishu / Telegram / WeCom / LINE) when the run finishes. " +
-							"Omit or \"auto\" (smart default, recommended): schedules created from an IM channel broadcast back to that channel; schedules created from Desktop/TUI/CLI stay silent locally. " +
-							"\"on\": even Desktop-created schedules push to the bound IM channel — pick this when the user explicitly wants the result delivered to chat. " +
-							"\"off\": even IM-created schedules stay silent — pick this when the user explicitly wants a quiet local run. " +
+						"description": "Optional. Controls whether the schedule's reply is pushed back to the IM channel it was created in (Slack / Teams / Lark / Feishu / LINE / ...) when the run finishes. " +
+							"The push target is always the originating channel — a schedule can never deliver to any other channel, and schedules created outside an IM chat (Desktop/TUI/CLI) have no push target and always stay silent (results remain in the session). " +
+							"Omit or \"auto\" (smart default, recommended): schedules created from an IM channel push back to that channel; others stay silent. " +
+							"\"off\": even IM-created schedules stay silent — pick this when the user explicitly wants a quiet run. " +
+							"\"on\": explicitly pin the push on for an IM-created schedule. " +
 							"Important: do NOT default to \"off\" when the user hasn't expressed an opinion — let the smart default decide.",
 					},
 					"thread": map[string]any{
@@ -156,7 +157,7 @@ func (t *ScheduleTool) Info() agent.ToolInfo {
 					"broadcast": map[string]any{
 						"type": "string",
 						"enum": []string{"auto", "on", "off"},
-						"description": "Optional. Change the schedule's broadcast intent. " +
+						"description": "Optional. Change the schedule's broadcast intent (whether the reply is pushed back to the IM channel the schedule was created in — never any other channel; non-IM-created schedules always stay silent). " +
 							"Omit = leave the current setting unchanged. " +
 							"\"auto\" = clear back to smart default (decided by the schedule's CreatedFromSource). " +
 							"\"on\" / \"off\" = explicitly override.",
@@ -280,7 +281,8 @@ func (t *ScheduleTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		createdFromSource, _ := agent.SourceFromContext(ctx)
 		// Snapshot the run's inbound IM routing blob (if any) as the schedule's
 		// proactive-delivery target. Empty for non-IM runs (Desktop/TUI/CLI),
-		// in which case the eventual run falls back to broadcast.
+		// in which case the eventual run never pushes to IM (origin-only
+		// delivery — see daemon.broadcastReply).
 		imStatusContext, _ := agent.IMStatusContextFromContext(ctx)
 		id, err := t.manager.CreateWithOpts(agentName, cron, prompt, stateful, schedule.CreateOpts{
 			Broadcast:         broadcast,

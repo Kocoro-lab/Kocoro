@@ -409,10 +409,17 @@ type ProactiveSender interface {
 	SendProactive(agentName, text, sessionID string, imStatusContext json.RawMessage, useThread *bool) error
 }
 
-// broadcastReply forwards a successful schedule reply to every Cloud channel
-// mapped to the agent when the broadcast gate permits it. The gate uses
+// broadcastReply pushes a successful schedule reply back to the IM channel the
+// schedule was created in, when the broadcast gate permits it. The gate uses
 // shouldBroadcast(sched) which combines explicit Broadcast override with a
 // smart default based on Schedule.CreatedFromSource. See broadcast_gate.go.
+//
+// A schedule may only push to its originating channel: the snapshotted
+// IMStatusContext blob IS that channel's address. Schedules with no blob
+// (Desktop/TUI/CLI/webhook-created, or IM schedules predating the snapshot
+// feature) have no legitimate IM target, so they never push — wrong-audience
+// delivery (group chats with third parties) is worse than no delivery. The
+// result stays in the session either way.
 // Errors are logged, never propagated.
 func broadcastReply(ws ProactiveSender, sched *schedule.Schedule, reply, sessionID string) {
 	if ws == nil || sched == nil || reply == "" {
@@ -421,13 +428,17 @@ func broadcastReply(ws ProactiveSender, sched *schedule.Schedule, reply, session
 	if !shouldBroadcast(sched) {
 		return
 	}
+	if len(sched.IMStatusContext) == 0 {
+		log.Printf("scheduler: schedule %s wants IM push but has no origin-channel snapshot (created from %q) — skipping; recreate it from the target IM channel to enable delivery", sched.ID, sched.CreatedFromSource)
+		return
+	}
 	// Resolve the thread-anchor hint from the schedule's thread setting and
-	// session state. Explicit on/off wins; auto follows sticky+blob presence.
-	useThread := resolveThread(sched.Thread, sched.IsSticky(), len(sched.IMStatusContext) > 0)
-	// Pass the schedule's snapshotted IM routing blob (empty for Desktop/cron-
-	// created schedules → Cloud broadcasts, preserving prior behavior). The blob
-	// is sent even for stateless/top-level pushes so Cloud can still target the
-	// originating channel — top-level just drops the thread anchor.
+	// session state. Explicit on/off wins; auto follows stickiness. hasBlob is
+	// unconditionally true here — the origin-only gate above already returned
+	// on an empty IMStatusContext.
+	useThread := resolveThread(sched.Thread, sched.IsSticky(), true)
+	// The blob is sent even for stateless/top-level pushes so Cloud can still
+	// target the originating channel — top-level just drops the thread anchor.
 	if err := ws.SendProactive(sched.Agent, reply, sessionID, sched.IMStatusContext, useThread); err != nil {
 		log.Printf("scheduler: proactive send failed for schedule %s: %v", sched.ID, err)
 	}
