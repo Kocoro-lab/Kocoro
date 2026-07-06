@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -63,7 +66,14 @@ type Server struct {
 	// pendingBrokers maps requestID → per-request ApprovalBroker.
 	// SSE handlers register here so POST /approval can find the right broker.
 	pendingBrokers sync.Map // map[string]*ApprovalBroker
-	onReload       func()   // called after config reload to restart watchers/heartbeat
+	remoteRuns     sync.Map // map[string]*remoteRunState
+	remoteRunSlots chan struct{}
+	// Remote run events are sequenced and kept briefly so a Cloud WS reconnect can
+	// replay events that were emitted while the socket was down.
+	remoteRunOutboxMu sync.Mutex
+	remoteRunSeqs     sync.Map // map[string]*atomic.Int64
+	remoteRunOutbox   sync.Map // map[string][]remoteRunEventRecord
+	onReload          func()   // called after config reload to restart watchers/heartbeat
 
 	marketplace  *skills.MarketplaceClient // static registry → /skills/marketplace/*
 	clawhub      *skills.MarketplaceClient // ClawHub live catalog → /skills/clawhub/*
@@ -285,6 +295,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		approvalBroker:         NewApprovalBroker(func(req ApprovalRequest) error { return nil }),
 		eventBus:               NewEventBus(),
 		notifyApprovalResolved: func(p ApprovalResolvedPayload) error { return nil },
+		remoteRunSlots:         make(chan struct{}, MaxConcurrentAgents),
 		marketplace:            newMarketplaceClient(deps),
 		clawhub:                newClawHubClient(deps),
 		slugLocks:              skills.NewSlugLocks(),
@@ -329,6 +340,20 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		if store != nil {
 			s.eventBus.SetNotifPersister(store.Append)
 		}
+	}
+	if client != nil {
+		if shannonDir != "" {
+			if info, err := loadOrCreateDeviceInfo(shannonDir); err == nil {
+				client.SetDeviceInfo(info)
+			} else {
+				log.Printf("daemon: device identity unavailable: %v", err)
+			}
+		}
+		client.SetRemoteRequestHandler(s.HandleRemoteRequest)
+		client.SetRemoteRunHandler(s.HandleRemoteRunRequest)
+		client.SetRemoteRunCancelHandler(s.HandleRemoteRunCancel)
+		client.SetRemoteApprovalHandler(s.HandleRemoteApprovalResponse)
+		client.SetRemoteRunReplayHandler(s.ReplayRemoteRunEvents)
 	}
 	return s
 }
@@ -588,6 +613,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /permissions/request", s.handlePermissionsRequest)
 	mux.HandleFunc("POST /approval", s.handleApproval)
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
+	mux.HandleFunc("POST /remote/pairing-code", s.handleRemotePairingCode)
+	mux.HandleFunc("GET /remote/pairings", s.handleRemotePairings)
+	mux.HandleFunc("POST /remote/revoke", s.handleRemoteRevoke)
 	mux.HandleFunc("POST /message", s.handleMessage)
 	mux.HandleFunc("POST /koe/realtime/mint", s.handleKoeRealtimeMint)
 	mux.HandleFunc("POST /koe/realtime/usage", s.handleKoeRealtimeUsage)
@@ -658,7 +686,7 @@ func withLocalCORS(h http.Handler) http.Handler {
 			hdr.Set("Access-Control-Allow-Credentials", "true")
 			hdr.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			// Last-Event-ID covers the SSE /events reconnection header.
-			hdr.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID")
+			hdr.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID, X-Kocoro-Local-Presence")
 			hdr.Set("Access-Control-Max-Age", "600")
 		}
 		if r.Method == http.MethodOptions {
@@ -684,6 +712,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.recoverMigrationOrphans()
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
+	go s.forwardRemoteEvents(ctx)
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", s.port))
 	if err != nil {
@@ -761,6 +790,173 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+const (
+	// maxRemoteRequestBodyBytes covers lightweight mobile-control metadata. If it
+	// binds, the remote RPC returns 413 and the controller should use the existing
+	// upload / attachment paths; raise through a future daemon.remote.max_body_bytes
+	// config only if mobile clients need larger non-file control messages.
+	maxRemoteRequestBodyBytes = 1 * 1024 * 1024
+
+	// maxRemoteResponseBodyBytes caps daemon -> Cloud relay bodies before JSON
+	// base64 expansion. Cloud currently enforces a 2 MiB daemon WS frame limit;
+	// keeping raw bodies to 1 MiB leaves room for the envelope and prevents a
+	// large transcript from tearing down the shared daemon connection.
+	maxRemoteResponseBodyBytes = 1 * 1024 * 1024
+)
+
+// forwardRemoteEvents mirrors the daemon EventBus to Cloud for remote-control
+// subscribers. It starts with the local server so it observes the same events
+// Desktop receives over /events; send failures are expected while the WS is
+// disconnected and are intentionally ignored.
+func (s *Server) forwardRemoteEvents(ctx context.Context) {
+	if s == nil || s.client == nil || s.eventBus == nil {
+		return
+	}
+	ch := s.eventBus.Subscribe()
+	defer s.eventBus.Unsubscribe(ch)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt := <-ch:
+			if !remoteEventAllowed(evt) {
+				continue
+			}
+			_ = s.client.SendRemoteEvent(evt)
+		}
+	}
+}
+
+func remoteEventAllowed(evt Event) bool {
+	switch evt.Type {
+	case EventApprovalRequest, EventApprovalResolved, EventApprovalNotice:
+		return false
+	default:
+		return true
+	}
+}
+
+// HandleRemoteRequest executes a Cloud-relayed remote-control request against a
+// narrow allowlisted subset of the local HTTP API. This deliberately does not
+// expose POST /message because the non-SSE local path auto-approves tools; the
+// mobile composer will use a dedicated remote-run path with its own approval
+// broker.
+func (s *Server) HandleRemoteRequest(ctx context.Context, req RemoteRequest) RemoteResponse {
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	if len(req.Body) > maxRemoteRequestBodyBytes {
+		return RemoteResponse{Status: http.StatusRequestEntityTooLarge, Error: "remote request body too large"}
+	}
+	parsed, err := url.ParseRequestURI(req.Path)
+	if err != nil || parsed.Path == "" {
+		return RemoteResponse{Status: http.StatusBadRequest, Error: "invalid remote request path"}
+	}
+	if !remoteRequestAllowed(method, parsed.Path) {
+		return RemoteResponse{Status: http.StatusForbidden, Error: "remote request path is not allowed"}
+	}
+
+	mux := http.NewServeMux()
+	s.registerRoutes(mux)
+	httpReq := httptest.NewRequest(method, parsed.RequestURI(), bytes.NewReader(req.Body)).WithContext(ctx)
+	for k, v := range req.Headers {
+		if remoteRequestHeaderAllowed(k) {
+			httpReq.Header.Set(k, v)
+		}
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httpReq)
+	result := rec.Result()
+	defer result.Body.Close()
+	body, tooLarge := readRemoteResponseBody(result.Body)
+	if tooLarge {
+		return RemoteResponse{Status: http.StatusRequestEntityTooLarge, Error: "remote response body too large"}
+	}
+	headers := map[string]string{}
+	if ct := result.Header.Get("Content-Type"); ct != "" {
+		headers["Content-Type"] = ct
+	}
+	return RemoteResponse{
+		Status:  result.StatusCode,
+		Body:    body,
+		Headers: headers,
+	}
+}
+
+func readRemoteResponseBody(r io.Reader) ([]byte, bool) {
+	body, _ := io.ReadAll(io.LimitReader(r, maxRemoteResponseBodyBytes+1))
+	if len(body) > maxRemoteResponseBodyBytes {
+		return nil, true
+	}
+	return body, false
+}
+
+func remoteRequestHeaderAllowed(name string) bool {
+	switch strings.ToLower(name) {
+	case "accept", "content-type":
+		return true
+	default:
+		return false
+	}
+}
+
+func remoteRequestAllowed(method, p string) bool {
+	switch {
+	case method == http.MethodGet && (p == "/status" || p == "/agents"):
+		return true
+	case method == http.MethodGet && p == "/sessions":
+		return true
+	case method == http.MethodGet && remoteSinglePath(p, "/sessions/"):
+		return true
+	default:
+		return false
+	}
+}
+
+func remoteSinglePath(p, prefix string) bool {
+	if !strings.HasPrefix(p, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(p, prefix)
+	return rest != "" && !strings.Contains(rest, "/")
+}
+
+func injectedMessageFromRunRequest(ctx context.Context, req RunAgentRequest) agent.InjectedMessage {
+	injectText := req.Text
+	var injectFiles []agent.InjectedFile
+	if len(req.Content) > 0 {
+		ctext, cfiles := contentBlocksToInjected(req.Content)
+		injectFiles = append(injectFiles, cfiles...)
+		if ctext != "" {
+			if injectText != "" {
+				injectText += "\n\n" + ctext
+			} else {
+				injectText = ctext
+			}
+		}
+	}
+	if len(req.Files) > 0 {
+		injectFiles = append(injectFiles, ConvertFilesToInjected(ctx, req.Files)...)
+	}
+	return agent.InjectedMessage{
+		Text:            injectText,
+		CWD:             req.CWD,
+		Files:           injectFiles,
+		ClientMessageID: req.ClientMessageID,
+	}
+}
+
+func (s *Server) injectIntoActiveRun(ctx context.Context, req RunAgentRequest) InjectResult {
+	if s == nil || s.deps == nil || s.deps.SessionCache == nil || req.RouteKey == "" {
+		return InjectNoActiveRun
+	}
+	if !s.deps.SessionCache.HasActiveRun(req.RouteKey) {
+		return InjectNoActiveRun
+	}
+	return s.deps.SessionCache.InjectMessage(req.RouteKey, injectedMessageFromRunRequest(ctx, req))
 }
 
 func (s *Server) handleChromeShow(w http.ResponseWriter, r *http.Request) {
@@ -2024,20 +2220,7 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// not RouteKey alone — to avoid misrouting fresh requests through inject.
 	if req.RouteKey != "" {
 		if s.deps.SessionCache.HasActiveRun(req.RouteKey) {
-			injectText := req.Text
-			var injectFiles []agent.InjectedFile
-			if len(req.Content) > 0 {
-				ctext, cfiles := contentBlocksToInjected(req.Content)
-				injectFiles = cfiles
-				if ctext != "" {
-					if injectText != "" {
-						injectText += "\n\n" + ctext
-					} else {
-						injectText = ctext
-					}
-				}
-			}
-			switch s.deps.SessionCache.InjectMessage(req.RouteKey, agent.InjectedMessage{Text: injectText, CWD: req.CWD, Files: injectFiles, ClientMessageID: req.ClientMessageID}) {
+			switch s.injectIntoActiveRun(r.Context(), req) {
 			case InjectOK:
 				if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 					w.Header().Set("Content-Type", "text/event-stream")

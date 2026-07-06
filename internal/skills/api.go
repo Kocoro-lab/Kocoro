@@ -158,6 +158,15 @@ func IsDownloadable(name string) bool {
 // these are always available without user action.
 var builtinSkills = []string{"kocoro", "kocoro-generative-ui"}
 
+// BuiltinSkillNames returns the slugs of the always-available builtin skills
+// that EnsureBuiltinSkills auto-installs into the global skills dir. Returned as
+// a fresh slice so callers cannot mutate the package-level source of truth.
+func BuiltinSkillNames() []string {
+	out := make([]string, len(builtinSkills))
+	copy(out, builtinSkills)
+	return out
+}
+
 // IsBuiltinSkill reports whether slug is one of the auto-installed builtins
 // that EnsureBuiltinSkills syncs into the global skills dir on every startup.
 // Uploads / overrides targeting these slugs are rejected because the next

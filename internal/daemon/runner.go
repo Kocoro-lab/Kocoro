@@ -644,6 +644,27 @@ func injectBundledSkill(existing []*skills.Skill, shannonDir, name string) []*sk
 	return existing
 }
 
+// injectBuiltinSkills ensures the always-available builtin skills (kocoro,
+// kocoro-generative-ui) are present. The default agent loads these via
+// LoadGlobalSkills, but a named agent only sees its _attached.yaml manifest and
+// would silently lose the platform-management policy skill and the generative-UI
+// capability — so this is called on the named-agent path. Idempotent: skills
+// already attached (matched by Name) are not duplicated.
+//
+// Works on a copy: agentOverride.Skills may be shared across concurrent sessions
+// for the same agent (see filterSkillsForSource), so appending in place could
+// corrupt a sibling session's view. Cloud-channel suppression still runs after
+// this via filterSkillsForSource, so kocoro-generative-ui stays Desktop-only.
+func injectBuiltinSkills(existing []*skills.Skill, shannonDir string) []*skills.Skill {
+	names := skills.BuiltinSkillNames()
+	out := make([]*skills.Skill, len(existing), len(existing)+len(names))
+	copy(out, existing)
+	for _, name := range names {
+		out = injectBundledSkill(out, shannonDir, name)
+	}
+	return out
+}
+
 // EnsureRouteKey computes and sets the route key if not already set.
 func (req *RunAgentRequest) EnsureRouteKey() {
 	if req == nil {
@@ -2241,7 +2262,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// Load skills (agent-scoped or global) and wire to registry
 	var loadedSkills []*skills.Skill
 	if agentOverride != nil {
-		loadedSkills = agentOverride.Skills
+		// Named agents only see their _attached.yaml manifest. Inject the
+		// always-available builtins so they aren't silently lost (the default
+		// agent gets them via LoadGlobalSkills below).
+		loadedSkills = injectBuiltinSkills(agentOverride.Skills, deps.ShannonDir)
 	} else {
 		var err error
 		loadedSkills, err = agents.LoadGlobalSkills(deps.ShannonDir)

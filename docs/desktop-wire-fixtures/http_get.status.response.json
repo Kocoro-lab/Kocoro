@@ -22,7 +22,8 @@
     "mention_roster_v1",
     "default_agent_skill_denylist",
     "per_agent_mcp_scope",
-    "sessions_scope_all"
+    "sessions_scope_all",
+    "remote_control_v1"
   ],
   "memory": {
     "provider": "disabled",

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -114,6 +115,43 @@ func TestConnect_AdvertisesVersionAndUserAgent(t *testing.T) {
 	}
 }
 
+func TestConnect_AdvertisesDeviceHeaders(t *testing.T) {
+	captured := make(chan http.Header, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured <- r.Header.Clone()
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	c := NewClient(wsURL, "", nil, nil)
+	c.SetDeviceInfo(DeviceInfo{DeviceID: "dev_test", DisplayName: "Nan's Mac", Platform: "darwin"})
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	select {
+	case hdr := <-captured:
+		if got := hdr.Get("X-Kocoro-Device-ID"); got != "dev_test" {
+			t.Errorf("device id header = %q", got)
+		}
+		if got := hdr.Get("X-Kocoro-Device-Name"); got != "Nan's Mac" {
+			t.Errorf("device name header = %q", got)
+		}
+		if got := hdr.Get("X-Kocoro-Platform"); got != "darwin" {
+			t.Errorf("platform header = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not see upgrade request")
+	}
+}
+
 // TestConnect_AdvertisesCapabilities confirms the X-Kocoro-Capabilities
 // header carries every token in the package-level Capabilities slice and is
 // omitted entirely when the slice is empty (so Cloud's "no header = legacy"
@@ -167,6 +205,25 @@ func TestConnect_AdvertisesCapabilities(t *testing.T) {
 				t.Fatal("server did not see upgrade request")
 			}
 		})
+	}
+}
+
+func TestClientSendRemoteRunEventRejectsOversizePayload(t *testing.T) {
+	c := &Client{
+		envelopeSender: func(DaemonMessage) error {
+			t.Fatal("oversized remote_run_event should not be sent")
+			return nil
+		},
+	}
+
+	err := c.SendRemoteRunEvent(RemoteRunEvent{
+		RunID:   "run-big",
+		Type:    "delta",
+		Payload: rawJSON(map[string]string{"text": strings.Repeat("x", maxRemoteRunEventBytes)}),
+	})
+
+	if !errors.Is(err, errRemoteRunEventTooLarge) {
+		t.Fatalf("error = %v, want errRemoteRunEventTooLarge", err)
 	}
 }
 

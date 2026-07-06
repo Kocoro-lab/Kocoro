@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -669,6 +670,51 @@ func TestResolveContentBlocks_ImageFileRef(t *testing.T) {
 	}
 	if resolved[1].Source.Data != base64.StdEncoding.EncodeToString(raw) {
 		t.Errorf("image data mismatch: got %q", resolved[1].Source.Data)
+	}
+}
+
+func TestRemoteInlineImageMaterializesToMacOSImageFileRefShape(t *testing.T) {
+	dir := t.TempDir()
+	raw := []byte("fake-jpeg-data")
+	blocks := []RequestContentBlock{
+		{Type: "image", Source: &client.ImageSource{
+			Type:      "base64",
+			MediaType: "image/jpeg",
+			Data:      base64.StdEncoding.EncodeToString(raw),
+		}},
+	}
+
+	materialized, cleanup := materializeInlineImageBlocks(dir, blocks)
+	defer func() {
+		if cleanup != nil {
+			cleanup()
+		}
+	}()
+
+	if len(materialized) != 1 || materialized[0].Type != "file_ref" {
+		t.Fatalf("expected inline remote image to become one file_ref, got %+v", materialized)
+	}
+	if materialized[0].Filename != "attachment_0.jpg" {
+		t.Fatalf("expected generated jpg filename, got %q", materialized[0].Filename)
+	}
+
+	resolved := resolveContentBlocks(materialized)
+	if len(resolved) != 2 {
+		t.Fatalf("expected macOS image file_ref shape (hint + image), got %d blocks: %+v", len(resolved), resolved)
+	}
+	if resolved[0].Type != "text" ||
+		!strings.Contains(resolved[0].Text, "[User attached image: attachment_0.jpg") ||
+		!strings.Contains(resolved[0].Text, "the image is included inline below for vision") {
+		t.Fatalf("expected macOS-style image hint, got %+v", resolved[0])
+	}
+	if resolved[1].Type != "image" || resolved[1].Source == nil {
+		t.Fatalf("expected second block to be model-visible image, got %+v", resolved[1])
+	}
+	if resolved[1].Source.MediaType != "image/jpeg" {
+		t.Fatalf("expected image/jpeg, got %q", resolved[1].Source.MediaType)
+	}
+	if resolved[1].Source.Data != base64.StdEncoding.EncodeToString(raw) {
+		t.Fatalf("image data changed unexpectedly: got %q", resolved[1].Source.Data)
 	}
 }
 
