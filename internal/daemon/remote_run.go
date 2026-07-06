@@ -23,10 +23,11 @@ type remoteRunState struct {
 }
 
 const (
-	localPresenceEnv     = "KOCORO_LOCAL_PRESENCE_TOKEN"
-	localPresenceHeader  = "X-Kocoro-Local-Presence"
-	remoteRunOutboxLimit = 500
-	remoteRunOutboxTTL   = 10 * time.Minute
+	localPresenceEnv       = "KOCORO_LOCAL_PRESENCE_TOKEN"
+	localPresenceHeader    = "X-Kocoro-Local-Presence"
+	remoteRunOutboxLimit   = 500
+	remoteRunOutboxTTL     = 10 * time.Minute
+	maxRemoteRunEventBytes = maxRemoteResponseBodyBytes
 )
 
 type remoteRunEventRecord struct {
@@ -65,6 +66,10 @@ func localPresenceAuthorized(r *http.Request) bool {
 }
 
 func (s *Server) handleRemotePairings(w http.ResponseWriter, r *http.Request) {
+	if !localPresenceAuthorized(r) {
+		writeError(w, http.StatusForbidden, "local presence confirmation required")
+		return
+	}
 	if s.client == nil {
 		writeError(w, http.StatusServiceUnavailable, "cloud websocket unavailable")
 		return
@@ -85,6 +90,10 @@ func (s *Server) handleRemotePairings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRemoteRevoke(w http.ResponseWriter, r *http.Request) {
+	if !localPresenceAuthorized(r) {
+		writeError(w, http.StatusForbidden, "local presence confirmation required")
+		return
+	}
 	if s.client == nil {
 		writeError(w, http.StatusServiceUnavailable, "cloud websocket unavailable")
 		return
@@ -343,6 +352,7 @@ func (s *Server) prepareRemoteRunEvent(evt RemoteRunEvent) RemoteRunEvent {
 		counter, _ := s.remoteRunSeqs.LoadOrStore(evt.RunID, &atomic.Int64{})
 		evt.Seq = counter.(*atomic.Int64).Add(1)
 	}
+	evt = constrainRemoteRunEvent(evt)
 	s.rememberRemoteRunEvent(evt)
 	return evt
 }
@@ -406,10 +416,63 @@ func (s *Server) scheduleRemoteRunOutboxCleanup(runID string) {
 func remoteRunEventTerminal(typ string) bool {
 	switch typ {
 	case "done", "error", "cancelled", "injected":
+		// "injected" is terminal for the submitting run_id: the actual follow-up
+		// output is emitted under the active absorbing run_id.
 		return true
 	default:
 		return false
 	}
+}
+
+func constrainRemoteRunEvent(evt RemoteRunEvent) RemoteRunEvent {
+	if remoteRunEventSize(evt) <= maxRemoteRunEventBytes {
+		return evt
+	}
+	if evt.Type == "done" {
+		evt = omitRemoteRunDoneReply(evt)
+		if remoteRunEventSize(evt) <= maxRemoteRunEventBytes {
+			return evt
+		}
+	}
+	log.Printf("daemon: remote_run_event payload trimmed run=%s seq=%d type=%s bytes>%d", evt.RunID, evt.Seq, evt.Type, maxRemoteRunEventBytes)
+	evt.Payload = rawJSON(map[string]any{
+		"payload_omitted": true,
+		"reason":          "remote run event exceeded size limit",
+	})
+	if remoteRunEventSize(evt) > maxRemoteRunEventBytes {
+		evt.Payload = nil
+	}
+	return evt
+}
+
+func remoteRunEventSize(evt RemoteRunEvent) int {
+	data, err := json.Marshal(evt)
+	if err != nil {
+		return maxRemoteRunEventBytes + 1
+	}
+	return len(data)
+}
+
+func omitRemoteRunDoneReply(evt RemoteRunEvent) RemoteRunEvent {
+	if len(evt.Payload) == 0 {
+		return evt
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+		return evt
+	}
+	replyBytes := 0
+	if raw, ok := payload["reply"]; ok {
+		replyBytes = len(raw)
+		delete(payload, "reply")
+		payload["reply_omitted"] = json.RawMessage(`true`)
+		payload["reply_json_bytes"] = rawJSON(replyBytes)
+	}
+	evt.Payload = rawJSON(payload)
+	if replyBytes > 0 {
+		log.Printf("daemon: remote_run_event done reply omitted run=%s seq=%d reply_json_bytes=%d", evt.RunID, evt.Seq, replyBytes)
+	}
+	return evt
 }
 
 type remoteRunEventHandler struct {

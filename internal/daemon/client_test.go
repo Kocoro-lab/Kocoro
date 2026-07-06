@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -204,6 +205,25 @@ func TestConnect_AdvertisesCapabilities(t *testing.T) {
 				t.Fatal("server did not see upgrade request")
 			}
 		})
+	}
+}
+
+func TestClientSendRemoteRunEventRejectsOversizePayload(t *testing.T) {
+	c := &Client{
+		envelopeSender: func(DaemonMessage) error {
+			t.Fatal("oversized remote_run_event should not be sent")
+			return nil
+		},
+	}
+
+	err := c.SendRemoteRunEvent(RemoteRunEvent{
+		RunID:   "run-big",
+		Type:    "delta",
+		Payload: rawJSON(map[string]string{"text": strings.Repeat("x", maxRemoteRunEventBytes)}),
+	})
+
+	if !errors.Is(err, errRemoteRunEventTooLarge) {
+		t.Fatalf("error = %v, want errRemoteRunEventTooLarge", err)
 	}
 }
 

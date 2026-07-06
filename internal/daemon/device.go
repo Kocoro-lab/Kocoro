@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -35,7 +36,9 @@ func loadOrCreateDeviceInfo(shannonDir string) (DeviceInfo, error) {
 	}
 	path := filepath.Join(shannonDir, deviceFileName)
 	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &info)
+		if err := json.Unmarshal(data, &info); err != nil {
+			log.Printf("daemon: failed to parse %s; rotating device id: %v", path, err)
+		}
 	}
 	if info.DeviceID == "" {
 		id, err := generateDeviceID()

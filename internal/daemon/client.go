@@ -24,6 +24,8 @@ import (
 // already invalidated.
 var ErrWSAuthRejected = errors.New("websocket auth rejected")
 
+var errRemoteRunEventTooLarge = errors.New("remote_run_event payload too large")
+
 // MaxConcurrentAgents limits how many agent loops can run simultaneously.
 const MaxConcurrentAgents = 5
 
@@ -636,6 +638,9 @@ func (c *Client) SendRemoteRunEvent(evt RemoteRunEvent) error {
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
+	}
+	if len(payload) > maxRemoteRunEventBytes {
+		return fmt.Errorf("%w: %d bytes > %d", errRemoteRunEventTooLarge, len(payload), maxRemoteRunEventBytes)
 	}
 	return c.envelopeSender(DaemonMessage{
 		Type:    MsgTypeRemoteRunEvent,

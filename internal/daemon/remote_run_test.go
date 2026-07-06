@@ -65,6 +65,32 @@ func TestRemotePairingCodeAcceptsLocalPresence(t *testing.T) {
 	}
 }
 
+func TestRemotePairingsRequireLocalPresence(t *testing.T) {
+	t.Setenv(localPresenceEnv, "secret")
+	srv := NewServer(0, &Client{}, nil, "test")
+	req := httptest.NewRequest(http.MethodGet, "/remote/pairings", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleRemotePairings(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRemoteRevokeRequiresLocalPresence(t *testing.T) {
+	t.Setenv(localPresenceEnv, "secret")
+	srv := NewServer(0, &Client{}, nil, "test")
+	req := httptest.NewRequest(http.MethodPost, "/remote/revoke", nil)
+	rr := httptest.NewRecorder()
+
+	srv.handleRemoteRevoke(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestRemotePairingErrorPreservesCloudError(t *testing.T) {
 	status, message := remotePairingError(errors.New("remote pairing unavailable"))
 	if status != http.StatusBadGateway {
@@ -132,6 +158,61 @@ func TestRemoteRunRejectsWhenConcurrencyLimitReached(t *testing.T) {
 	}
 	if _, ok := srv.remoteRuns.Load("run-1"); ok {
 		t.Fatal("rejected run should not remain in remoteRuns")
+	}
+}
+
+func TestRemoteRunEventOmitsOversizedDoneReply(t *testing.T) {
+	got := make(chan RemoteRunEvent, 1)
+	client := &Client{
+		envelopeSender: func(dm DaemonMessage) error {
+			if len(dm.Payload) > maxRemoteRunEventBytes {
+				t.Fatalf("payload size = %d, want <= %d", len(dm.Payload), maxRemoteRunEventBytes)
+			}
+			var evt RemoteRunEvent
+			if err := json.Unmarshal(dm.Payload, &evt); err != nil {
+				return err
+			}
+			got <- evt
+			return nil
+		},
+	}
+	srv := NewServer(0, client, &ServerDeps{}, "test")
+	result := RunAgentResult{
+		Reply:     strings.Repeat("x", maxRemoteRunEventBytes),
+		SessionID: "sess-1",
+		Agent:     "default",
+		Usage:     RunAgentUsage{TotalTokens: 42},
+	}
+
+	if err := srv.sendRemoteRunEvent(RemoteRunEvent{
+		RunID:     "run-big",
+		Type:      "done",
+		SessionID: result.SessionID,
+		Payload:   rawJSON(result),
+	}); err != nil {
+		t.Fatalf("sendRemoteRunEvent: %v", err)
+	}
+
+	select {
+	case evt := <-got:
+		if evt.Type != "done" || evt.RunID != "run-big" || evt.Seq != 1 {
+			t.Fatalf("event = %+v", evt)
+		}
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := payload["reply"]; ok {
+			t.Fatalf("oversized done payload still contains reply")
+		}
+		if string(payload["reply_omitted"]) != "true" {
+			t.Fatalf("reply_omitted = %s, want true", payload["reply_omitted"])
+		}
+		if string(payload["session_id"]) != `"sess-1"` {
+			t.Fatalf("session_id payload = %s", payload["session_id"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote run event was not sent")
 	}
 }
 
