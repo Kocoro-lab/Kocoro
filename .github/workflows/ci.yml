@@ -33,6 +33,18 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install libopus (cgo dep for the koe voice package)
+        # internal/koe imports gopkg.in/hraban/opus.v2, which is cgo and
+        # links system libopus via `#cgo pkg-config: opus opusfile`. The
+        # macos-latest runner does not ship opus.pc, so go vet/build/test
+        # ./... (which all compile internal/koe) fail without this. malgo
+        # bundles miniaudio and needs no system lib. Exporting PKG_CONFIG_PATH
+        # to GITHUB_ENV makes it visible to every later step. brew --prefix
+        # keeps the path correct on both arm64 and intel runners.
+        run: |
+          brew install opus opusfile pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
+
       - name: Verify modules
         run: go mod verify
 

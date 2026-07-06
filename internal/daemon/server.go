@@ -589,6 +589,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /approval", s.handleApproval)
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
 	mux.HandleFunc("POST /message", s.handleMessage)
+	mux.HandleFunc("POST /koe/realtime/mint", s.handleKoeRealtimeMint)
+	mux.HandleFunc("POST /koe/realtime/usage", s.handleKoeRealtimeUsage)
+	mux.HandleFunc("GET /koe/persona", s.handleKoePersona)
 	mux.HandleFunc("POST /local/screenshot/window", s.handleScreenshotWindow)
 	mux.HandleFunc("POST /inject/retract", s.handleRetractInject)
 	mux.HandleFunc("POST /cancel", s.handleCancel)
@@ -1169,15 +1172,16 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type agentInfo struct {
-		Name         string `json:"name"`
-		DisplayName  string `json:"display_name"` // falls back to Name when unset
-		Avatar       string `json:"avatar"`       // empty when unset
-		Builtin      bool   `json:"builtin"`
-		Override     bool   `json:"override"`
-		HasMemory    bool   `json:"has_memory"`
-		HasConfig    bool   `json:"has_config"`
-		CommandCount int    `json:"command_count"`
-		SkillCount   int    `json:"skill_count"`
+		Name         string                 `json:"name"`
+		DisplayName  string                 `json:"display_name"`          // falls back to Name when unset
+		Description  agents.LocalizedString `json:"description,omitempty"` // localized blurb from PROFILE.yaml; empty when unset
+		Avatar       string                 `json:"avatar"`                // empty when unset
+		Builtin      bool                   `json:"builtin"`
+		Override     bool                   `json:"override"`
+		HasMemory    bool                   `json:"has_memory"`
+		HasConfig    bool                   `json:"has_config"`
+		CommandCount int                    `json:"command_count"`
+		SkillCount   int                    `json:"skill_count"`
 	}
 	result := make([]agentInfo, 0, len(entries))
 	for _, entry := range entries {
@@ -1198,12 +1202,15 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 		// Avatar lives in <dir>/PROFILE.yaml. Best-effort: a missing or
 		// malformed profile just yields no avatar (the list must not fail).
 		avatar := ""
+		var description agents.LocalizedString
 		if profile, perr := agents.LoadAgentProfile(dir); perr == nil && profile != nil {
 			avatar = profile.Avatar
+			description = profile.Description
 		}
 		result = append(result, agentInfo{
 			Name:         entry.Name,
 			DisplayName:  entry.DisplayName,
+			Description:  description,
 			Avatar:       avatar,
 			Builtin:      entry.Builtin,
 			Override:     entry.Override,
@@ -1225,6 +1232,37 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scopeAll := r.URL.Query().Get("scope") == "all"
+	limit, offset := parseSessionPageParams(r, scopeAll)
+
+	// scope=all merges the default scope with every named agent's sessions.
+	// Any other value (including absent) preserves single-scope behavior.
+	if scopeAll {
+		scopes, err := s.allSessionScopes()
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		var summaries []session.SessionSummary
+		for _, scope := range scopes {
+			mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(scope))
+			scoped, err := mgr.List()
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
+			for _, sum := range scoped {
+				sum.Agent = scope
+				summaries = append(summaries, sum)
+			}
+		}
+		s.writeSessionsPage(w, summaries, limit, offset)
+		return
+	}
+
 	agentName := r.URL.Query().Get("agent")
 	if agentName != "" {
 		if err := agents.ValidateAgentName(agentName); err != nil {
@@ -1237,14 +1275,116 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// If the directory doesn't exist, return empty list.
 		if os.IsNotExist(err) {
-			json.NewEncoder(w).Encode(map[string]interface{}{"sessions": []interface{}{}})
+			s.writeSessionsPage(w, nil, limit, offset)
 			return
 		}
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	// Enrich each summary with runtime state so the frontend can flag
-	// "running" / "awaiting approval" sessions without a second round-trip.
+	for i := range summaries {
+		summaries[i].Agent = agentName
+	}
+	s.writeSessionsPage(w, summaries, limit, offset)
+}
+
+// defaultSessionsPageLimit is the page size applied to scope=all when the
+// client omits `limit`. The single-scope path is NOT capped by default (see
+// parseSessionPageParams) — omitting `limit` there preserves the historical
+// "return every session" behavior for existing callers (e.g. Desktop's
+// listSessions(agent:)). Pagination on the single-scope path is opt-in via an
+// explicit `limit`. Search stays unpaginated for buried history.
+const defaultSessionsPageLimit = 100
+
+// unlimitedSessionsPage is the sentinel `limit` meaning "no page cap" — every
+// row is returned and has_more is always false.
+const unlimitedSessionsPage = 0
+
+// parseSessionPageParams reads limit/offset from the query. An explicit,
+// positive `limit` is always honored. When `limit` is absent/invalid, the
+// default depends on scope: scope=all falls back to defaultSessionsPageLimit
+// (paginated), while a single scope falls back to unlimited (uncapped — the
+// pre-pagination contract). Negative/invalid offset falls back to 0. Lenient
+// parsing (never 400) matches the other list endpoints so a malformed client
+// cursor can't block the sidebar.
+func parseSessionPageParams(r *http.Request, scopeAll bool) (limit, offset int) {
+	if scopeAll {
+		limit = defaultSessionsPageLimit
+	} else {
+		limit = unlimitedSessionsPage
+	}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			offset = parsed
+		}
+	}
+	return limit, offset
+}
+
+// writeSessionsPage enriches (filter empties + stamp runtime state), sorts by
+// pinned DESC then updated_at DESC, applies offset/limit, and writes the paged
+// response with a has_more flag and the full (pre-page) total. A limit of
+// unlimitedSessionsPage (0) returns every row from `offset` on (has_more
+// false). Pinned sessions are capped well under a page, so they naturally lead
+// the first page without special-casing.
+func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.SessionSummary, limit, offset int) {
+	enriched := s.enrichSummaries(summaries)
+	sort.SliceStable(enriched, func(i, j int) bool {
+		if enriched[i].Pinned != enriched[j].Pinned {
+			return enriched[i].Pinned // pinned first
+		}
+		return enriched[i].UpdatedAt.After(enriched[j].UpdatedAt)
+	})
+
+	total := len(enriched)
+	start := offset
+	if start > total {
+		start = total
+	}
+	end := total
+	if limit > unlimitedSessionsPage {
+		end = start + limit
+		if end > total {
+			end = total
+		}
+	}
+	page := enriched[start:end]
+	if page == nil {
+		page = []session.SessionSummary{}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessions": page,
+		"total":    total,
+		"has_more": end < total,
+	})
+}
+
+// allSessionScopes returns every session scope to iterate for scope=all: the
+// default scope (empty string) followed by each named agent slug.
+func (s *Server) allSessionScopes() ([]string, error) {
+	entries, err := agents.ListAgents(s.deps.AgentsDir)
+	if err != nil {
+		return nil, err
+	}
+	scopes := make([]string, 0, len(entries)+1)
+	scopes = append(scopes, "") // default agent
+	for _, e := range entries {
+		scopes = append(scopes, e.Name)
+	}
+	return scopes, nil
+}
+
+// enrichSummaries filters out empty sessions and stamps runtime state
+// (in-progress / awaiting-approval / kind) onto each summary. Runtime sources
+// are keyed by session ID, which is globally unique across agent scopes, so
+// this is safe to apply after a cross-scope merge. The Agent field is expected
+// to already be set by the caller.
+func (s *Server) enrichSummaries(summaries []session.SessionSummary) []session.SessionSummary {
 	// Both sources are nil-safe: cache is always non-nil here, tracker may
 	// be nil when deps was constructed outside NewServer.
 	activeIDs := s.deps.SessionCache.ActiveSessionIDs()
@@ -1253,7 +1393,6 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		awaitingIDs = s.deps.ApprovalTracker.AwaitingSet()
 	}
 
-	// Filter out empty sessions (created but never used).
 	filtered := make([]session.SessionSummary, 0, len(summaries))
 	for _, sum := range summaries {
 		if sum.MsgCount == 0 {
@@ -1268,60 +1407,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		sum.Kind = kindOf(sum.Source)
 		filtered = append(filtered, sum)
 	}
-
-	// Unified list (no ?agent): also surface IM-kind sessions that were routed
-	// to a NAMED agent (e.g. a Slack message @-addressed to "data-analyst").
-	// Those live under ~/.shannon/agents/<name>/sessions, separate from the
-	// default workspace enumerated above, so without this they'd be invisible in
-	// the recent-conversations list. Only IM sessions are merged — a named
-	// agent's local/interactive sessions stay in its own agent view to avoid
-	// cluttering the unified list. Each merged row carries Agent=<name> so the
-	// client opens it with the right ?agent scope.
-	if agentName == "" {
-		filtered = append(filtered, s.gatherNamedAgentIMSessions(activeIDs, awaitingIDs)...)
-	}
-
-	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": filtered})
-}
-
-// gatherNamedAgentIMSessions scans every named-agent session dir and returns the
-// non-empty IM-kind sessions, annotated with Agent + runtime flags. Best-effort:
-// unreadable agents/dirs are skipped so one bad agent can't fail the whole list.
-func (s *Server) gatherNamedAgentIMSessions(activeIDs, awaitingIDs map[string]struct{}) []session.SessionSummary {
-	entries, err := os.ReadDir(s.deps.SessionCache.AgentsRoot())
-	if err != nil {
-		return nil // no agents dir yet, or unreadable — nothing to merge
-	}
-	var out []session.SessionSummary
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		agentName := e.Name()
-		if agents.ValidateAgentName(agentName) != nil {
-			continue
-		}
-		mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
-		sums, lerr := mgr.List()
-		if lerr != nil {
-			continue
-		}
-		for _, sum := range sums {
-			if sum.MsgCount == 0 || !IsMessagingPlatform(strings.ToLower(strings.TrimSpace(sum.Source))) {
-				continue
-			}
-			if _, ok := activeIDs[sum.ID]; ok {
-				sum.InProgress = true
-			}
-			if _, ok := awaitingIDs[sum.ID]; ok {
-				sum.AwaitingApproval = true
-			}
-			sum.Kind = kindOf(sum.Source)
-			sum.Agent = agentName
-			out = append(out, sum)
-		}
-	}
-	return out
+	return filtered
 }
 
 // handleApprovals returns the set of session IDs currently blocked on a
@@ -1645,17 +1731,47 @@ func (s *Server) handleSessionSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		http.Error(w, `{"error":"q parameter required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// scope=all searches every scope (default + named agents) and merges hits.
+	// Any other value (including absent) preserves single-scope behavior.
+	if r.URL.Query().Get("scope") == "all" {
+		scopes, err := s.allSessionScopes()
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		results := []session.SearchResult{}
+		for _, scope := range scopes {
+			mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(scope))
+			scoped, err := mgr.Search(query, 20)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
+			for _, res := range scoped {
+				res.Agent = scope
+				results = append(results, res)
+			}
+		}
+		// Most recent first, across all scopes.
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].CreatedAt.After(results[j].CreatedAt)
+		})
+		json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
+		return
+	}
+
 	agentName := r.URL.Query().Get("agent")
 	if agentName != "" {
 		if err := agents.ValidateAgentName(agentName); err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
 			return
 		}
-	}
-	query := r.URL.Query().Get("q")
-	if query == "" {
-		http.Error(w, `{"error":"q parameter required"}`, http.StatusBadRequest)
-		return
 	}
 
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
@@ -1666,6 +1782,9 @@ func (s *Server) handleSessionSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	if results == nil {
 		results = []session.SearchResult{}
+	}
+	for i := range results {
+		results[i].Agent = agentName
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
 }
@@ -5369,6 +5488,19 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 		// their own mcp_servers config, not this list.
 		if len(cfg.MCP.DefaultAgentDisabled) > 0 {
 			resp["mcp_default_agent_disabled"] = cfg.MCP.DefaultAgentDisabled
+		}
+	}
+
+	// Expose Koe (voice front brain) settings so Kocoro Desktop's settings panel
+	// can render the enable toggle + bound agent/voice/model. Credential-free by
+	// design — Koe mints via the daemon relay, no key is ever surfaced here.
+	if cfg != nil {
+		resp["koe"] = map[string]interface{}{
+			"enabled":  cfg.Koe.Enabled,
+			"model":    cfg.Koe.Model,
+			"voice":    cfg.Koe.Voice,
+			"agent":    cfg.Koe.Agent,
+			"language": cfg.Koe.Language,
 		}
 	}
 

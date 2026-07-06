@@ -101,6 +101,11 @@ const (
 	ChannelTelegram = "telegram"
 	ChannelSchedule = "schedule"
 	ChannelSystem   = "system"
+	// ChannelKoe is the voice front-brain (Koe). daemon-LOCAL transport (NOT in
+	// cloudSourceSet) but messaging-platform ROUTING (in IsMessagingPlatform):
+	// thread keyed by a per-call burst-id. Carrier-neutral — future carriers
+	// append a suffix ("koe-reachy") and are matched by isKoeSource, not by ==.
+	ChannelKoe = "koe"
 )
 
 // Reply format types

@@ -840,6 +840,8 @@ go test ./...                # run all tests
 go vet ./...                 # lint
 ```
 
+Koe voice tests link cgo audio deps on macOS; install them with `brew install opus opusfile pkg-config` and set `PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` if pkg-config cannot find the Homebrew files.
+
 ## Known Limitations
 
 - **Vision**: screenshots are captured, resized (1200px max), sent as base64 image content blocks. The `computer` tool uses Anthropic's native `computer_20251124` schema with coordinate scaling for retina displays. Vision models may blend what they see with training knowledge — verify critical details.

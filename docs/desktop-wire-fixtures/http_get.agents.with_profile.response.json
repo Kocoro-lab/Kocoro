@@ -1,0 +1,20 @@
+{
+  "agents": [
+    {
+      "name": "profile-demo",
+      "display_name": "profile-demo",
+      "description": {
+        "en": "A demo agent used by wire-fixture tests.",
+        "zh-Hans": "用于线路 fixture 测试的演示智能体。",
+        "ja": "ワイヤフィクスチャテスト用のデモエージェント。"
+      },
+      "avatar": "",
+      "builtin": false,
+      "override": false,
+      "has_memory": false,
+      "has_config": false,
+      "command_count": 0,
+      "skill_count": 0
+    }
+  ]
+}

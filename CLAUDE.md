@@ -24,6 +24,7 @@ cmd/
   daemon.go            # shan daemon start/stop/status
   schedule.go          # shan schedule CRUD
   update.go            # /update command
+  koe.go               # shan koe — voice front-brain (OpenAI Realtime + Desktop control + via-daemon mint); --mic-device/--speaker-device pass CoreAudio device UIDs (from koe.mic_device/speaker_device) that the VPIO backend binds, empty = system default
 
 internal/
   daemon/                              # ── PRIMARY PRODUCTION PATH ──
@@ -115,7 +116,16 @@ internal/
   tui/                   # Bubbletea TUI + /compact + /doctor
   update/                # GitHub release auto-update
   sync/                  # Daily session JSON upload to Cloud
-```
+  koe/                   # ── VOICE FRONT-BRAIN (shan koe) ── cgo since audio.go
+    link.go              #   DaemonClient: DoTask/Cancel/ListAgents + MintViaDaemon + SendRealtimeUsage (HTTP to daemon, NEVER imports internal/daemon)
+    agentresolve.go      #   agent name-resolution ladder (exact → bidirectional-substring → semantic-noop → not-found)
+    tools.go             #   5 OpenAI-Realtime voice tools (do_task/cancel/get_status/control_app/switch_agent) + Dispatcher + CallState
+    audio.go             #   malgo duplex (CoreAudio) + Opus codec + half-duplex gate (cgo deps: brew install opus opusfile pkg-config; PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig)
+    webrtc.go            #   pion mint + SDP + Opus tracks + oai-events data channel + Connect orchestrator (ConnectOptions)
+    realtime.go          #   GA session config (create_response:true auto-respond) + oai-events dispatch + reachy say-and-ask do_task (result is the single function_call_output) + voice_state/usage hooks
+    control.go           #   ControlServer: Desktop↔Koe HTTP+SSE (POST /call/start|end|interrupt|mic, GET /events: voice_state[+task_pending/mic]/control_app/call_state/mic_status); optional Bearer auth via KOE_CONTROL_TOKEN env, never argv
+    micwatchdog.go       #   MicSilenceState: pure silent-input watchdog core (clamshell/covered mic → mic_status "silent"/"ok" to Desktop; driver ticker in cmd/koe.go; KOE_MIC_SILENCE_FLOOR/_MS tunable; no restart/rebind by design)
+    earcon.go            #   "ready" earcon (go:embed assets/ready.pcm, 48k mono): PlayReadyEarcon() at emitReadyLocked, SetSpeaking-gated so it can't self-trigger VAD; KOE_READY_EARCON=0 disables
 
 ## Key Conventions
 
@@ -333,6 +343,8 @@ go test ./test/e2e/ -v                     # E2E offline (CI)
 SHANNON_E2E_LIVE=1 go test ./test/e2e/ -v  # E2E live (run before each release)
 go build ./...
 ```
+
+Koe tests link cgo audio deps. On macOS, install them with `brew install opus opusfile pkg-config` and set `PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` if pkg-config cannot find the Homebrew files.
 
 Schedule tests use temp dirs — never write to real `~/Library/LaunchAgents/`. Launchd plist coverage lives with daemon tests.
 

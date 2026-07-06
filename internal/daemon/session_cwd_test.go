@@ -19,12 +19,18 @@ func TestCloudSourceDefinitionsAgree(t *testing.T) {
 		"slack", "line", "feishu", "lark", "wecom", "teams", "telegram", "webhook",
 		"desktop", "cli", "cron", "schedule", "web", "", "unknown",
 		"SLACK", " Slack ", "FEISHU", " Lark ",
+		"koe", "koe-reachy", " KOE ",
 	}
 	for _, src := range inputs {
 		cloud := isCloudSource(src)
 		format := outputFormatForSource(src)
 		_, isMarkdownCloud := markdownCloudSources[strings.ToLower(strings.TrimSpace(src))]
 		switch {
+		case isKoeSource(src):
+			// koe is the documented exception: non-cloud but voice-profiled.
+			if format != "koe" {
+				t.Errorf("source %q: koe must use the voice profile, got %q", src, format)
+			}
 		case !cloud && format != "markdown":
 			t.Errorf("source %q: non-cloud must be markdown, got %q", src, format)
 		case cloud && isMarkdownCloud && format != "markdown":

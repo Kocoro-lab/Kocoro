@@ -287,17 +287,16 @@ type SessionSummary struct {
 	// daemon package and importing it here would create a cycle. Clients
 	// (Desktop session grouping) read this directly instead of re-deriving.
 	Kind string `json:"kind,omitempty"`
-	// Agent is the named agent this session belongs to; its sessions live under
-	// ~/.shannon/agents/<name>/sessions. Empty = the default workspace
-	// (~/.shannon/sessions). Populated at HTTP-list time when GET /sessions
-	// aggregates named-agent IM sessions into the unified list, so the client can
-	// open / route the session with the correct agent scope (?agent=<name>).
-	// Store.List leaves it empty.
-	Agent string `json:"agent,omitempty"`
 	// Pinned mirrors Session.Pinned: sticky-to-top regardless of recency.
 	Pinned bool `json:"pinned,omitempty"`
 	// Favorite mirrors Session.Favorite: starred for filter views.
 	Favorite bool `json:"favorite,omitempty"`
+	// Agent identifies the agent scope this session belongs to: empty string
+	// for the default agent, otherwise the agent slug. Populated at HTTP-list
+	// time by the daemon (Store.List has no view of which scope it serves) so
+	// cross-agent views (GET /sessions?scope=all) can attribute each session.
+	// Always emitted (even when empty) so clients can rely on its presence.
+	Agent string `json:"agent"`
 }
 
 type Store struct {

@@ -741,28 +741,35 @@ type InjectedMessage struct {
 }
 
 type AgentLoop struct {
-	client            client.LLMClient
-	tools             *ToolRegistry
-	modelTier         string
-	handler           EventHandler
-	shannonDir        string
-	maxIter           int
-	maxTokens         int
-	resultTrunc       int
-	argsTrunc         int
-	permissions       *permissions.PermissionsConfig
-	auditor           *audit.AuditLogger
-	hookRunner        *hooks.HookRunner
-	mcpContext        string
-	bypassPermissions bool
-	enableStreaming   bool
-	thinking          *client.ThinkingConfig
-	reasoningEffort   string
-	responseLanguage  string
-	temperature       float64
-	specificModel     string
-	agentBasePrompt   string
-	agentSkills       []*skills.Skill
+	client      client.LLMClient
+	tools       *ToolRegistry
+	modelTier   string
+	handler     EventHandler
+	shannonDir  string
+	maxIter     int
+	maxTokens   int
+	resultTrunc int
+	argsTrunc   int
+	// Browser/GUI context trimming (see observation_window.go). All default to
+	// the package-level defaults in NewAgentLoop so every construction path
+	// (daemon/TUI/one-shot) gets the cost reduction; runner overrides from config.
+	observationWindow      int // sliding-window size for browser/GUI observations; 0 disables
+	browserObsMaxChars     int // per-observation capture cap for browser/GUI results; 0 = generic cap
+	maxRecentImages        int // count-based old-image pruning, all images (filterOldImages); 0 disables
+	maxRecentBrowserImages int // browser-scoped screenshot pruning (filterOldBrowserImages); 0 disables
+	permissions            *permissions.PermissionsConfig
+	auditor                *audit.AuditLogger
+	hookRunner             *hooks.HookRunner
+	mcpContext             string
+	bypassPermissions      bool
+	enableStreaming        bool
+	thinking               *client.ThinkingConfig
+	reasoningEffort        string
+	responseLanguage       string
+	temperature            float64
+	specificModel          string
+	agentBasePrompt        string
+	agentSkills            []*skills.Skill
 	// contextWindowExplicit is true when set via user config (e.g. per-agent
 	// override); locks against auto-detect from observed model.
 	contextWindow         int
@@ -976,6 +983,10 @@ func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, sh
 		skillDiscovery:         true,
 		readTracker:            NewReadTracker(),
 		toolResultReplacements: NewToolResultReplacementState(nil),
+		observationWindow:      defaultObservationWindow,
+		browserObsMaxChars:     defaultBrowserObservationMaxChars,
+		maxRecentImages:        defaultMaxRecentImages,
+		maxRecentBrowserImages: defaultMaxRecentBrowserImages,
 	}
 }
 
@@ -1080,6 +1091,13 @@ func (a *AgentLoop) ModelTier() string {
 // past the precedence-chain regression test.
 func (a *AgentLoop) SpecificModel() string {
 	return a.specificModel
+}
+
+// ResponseLanguage returns the currently-configured reply language. Test-only
+// accessor; production callers should set it through SetResponseLanguage and let
+// messagesForLLM inject the matching Language directive.
+func (a *AgentLoop) ResponseLanguage() string {
+	return a.responseLanguage
 }
 
 func (a *AgentLoop) SetMCPContext(ctx string) {
@@ -1260,6 +1278,35 @@ func (a *AgentLoop) SetContextWindowExplicit(tokens int) {
 // SetMaxIterations overrides the maximum number of agent loop iterations.
 func (a *AgentLoop) SetMaxIterations(n int) {
 	a.maxIter = n
+}
+
+// SetObservationWindow overrides how many recent browser/GUI observations are
+// kept at full fidelity (older ones are stubbed). A non-positive value disables
+// the sliding window. See observation_window.go.
+func (a *AgentLoop) SetObservationWindow(n int) {
+	a.observationWindow = n
+}
+
+// SetBrowserObservationMaxChars overrides the per-observation capture cap for
+// browser/GUI tool results (runes). A non-positive value falls back to the
+// generic tools.result_truncation cap.
+func (a *AgentLoop) SetBrowserObservationMaxChars(n int) {
+	a.browserObsMaxChars = n
+}
+
+// SetMaxRecentImages overrides how many recent image-bearing messages are kept
+// before older screenshots are replaced with a placeholder (filterOldImages).
+// Pass-through: 0 disables the global image filter (keep all), negative is
+// rejected upstream by validateConfig — this setter does not silently clamp.
+func (a *AgentLoop) SetMaxRecentImages(n int) {
+	a.maxRecentImages = n
+}
+
+// SetMaxRecentBrowserImages overrides how many recent browser/GUI screenshots
+// are kept before older ones are replaced with a placeholder
+// (filterOldBrowserImages). 0 disables the browser-scoped filter.
+func (a *AgentLoop) SetMaxRecentBrowserImages(n int) {
+	a.maxRecentBrowserImages = n
 }
 
 // SetMemoryDir sets the directory containing MEMORY.md for write-before-compact.
@@ -2454,15 +2501,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 	// Loop behavior constants
 	//
-	// maxRecentImages: runaway defense — caps screenshot bytes in context if an
-	// agent gets stuck in a screenshot loop. Reference agent implementations
-	// generally rely on token-based context management rather than count-based
-	// image pruning; we keep this as a safety net but at a value that won't
-	// bind on legit "describe N screenshots" tasks. With Layer 1 compression
-	// each image is ≤ 5 MB base64 (~6-12 K tokens), so 50 images ≈ 300-600 K
-	// tokens — comfortably under our 1 M-token default context window. Was 5
-	// (pre-#135, too conservative for batch-vision use cases).
-	const maxRecentImages = 50 // keep only last N screenshot messages in context
+	// Old-image pruning (a.maxRecentImages, default defaultMaxRecentImages) is a
+	// count-based runaway defense; see observation_window.go for the rationale
+	// and override path. Configurable via agent.max_recent_images.
 	const compressAfter = 8    // compress tool results older than N from the end
 	const maxResultChars = 300 // compressed tool result max chars
 
@@ -3150,8 +3191,25 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			}
 		}
 
-		// Filter old screenshots to stay within context budget
-		filterOldImages(messages, maxRecentImages)
+		// Browser-scoped screenshot pruning: keep only the most recent browser/
+		// GUI screenshot, leaving user uploads + non-GUI tool images to the
+		// looser global filter below. Runs first so the global filter sees the
+		// already-thinned set (see observation_window.go).
+		_ = filterOldBrowserImages(messages, a.maxRecentBrowserImages)
+
+		// Filter old screenshots (all images) to stay within context budget.
+		// Guarded so max_recent_images=0 disables the global filter (keep all)
+		// rather than stripping every image — 0 is the "disabled" sentinel.
+		if a.maxRecentImages > 0 {
+			filterOldImages(messages, a.maxRecentImages)
+		}
+
+		// Sliding window over browser/GUI text observations: keep the most
+		// recent a.observationWindow at full fidelity, stub older ones. This
+		// bounds the accumulated page/DOM history that a long browser loop
+		// otherwise re-sends every iteration (see observation_window.go).
+		// No-op when the window is disabled (<=0) or history is within it.
+		_ = filterOldObservations(messages, a.observationWindow)
 
 		// Time-based microcompact (see timebasedcompact.go). No-op unless
 		// Enabled AND the gap since the last assistant response exceeds
@@ -4587,7 +4645,20 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			cleanResult = applyPerResultSpill(cleanResult, fc.Name, a.shannonDir, a.sessionID, toolResultPolicy)
 
 			maxChars := contextResultMaxChars(fc.Name, result.CloudResult, a.resultTrunc, toolResultPolicy)
-			contextResult := truncateStr(cleanResult, maxChars)
+			var contextResult string
+			// Browser/GUI observations get a tighter capture cap with a
+			// self-describing truncation marker — page/DOM dumps are large and
+			// front-loaded (see observation_window.go). Never tighten cloud
+			// deliverables, which the user reads verbatim.
+			if a.browserObsMaxChars > 0 && !result.CloudResult && isGUIToolName(fc.Name) {
+				obsMax := a.browserObsMaxChars
+				if maxChars > 0 && maxChars < obsMax {
+					obsMax = maxChars
+				}
+				contextResult = truncateObservation(cleanResult, obsMax)
+			} else {
+				contextResult = truncateStr(cleanResult, maxChars)
+			}
 
 			// System reminders: append short contextual hints to high-signal
 			// tool results to reinforce instructions in long sessions.

@@ -104,6 +104,12 @@ agent:
     enabled: false
     gap_threshold_minutes: 60      # fire when last assistant response is older than this
     keep_recent: 5                 # number of trailing tool_result blocks to keep (floor: 1)
+
+  # Browser/GUI context trimming (on by default) — bounds the accumulated
+  # page/DOM snapshot history a long browser loop re-sends each iteration.
+  observation_window: 3            # keep the N most recent browser/GUI observations at full fidelity; older ones are stubbed. 0 disables. Negative is rejected.
+  max_recent_images: 50            # keep the N most recent image-bearing messages (all images); older screenshots become a placeholder. 0 disables (keep all). Negative is rejected.
+  max_recent_browser_images: 1     # keep only the N most recent browser/GUI screenshots; user uploads + non-GUI images stay under max_recent_images. 0 disables. Negative is rejected.
 ```
 
 ## Tool Settings
@@ -114,6 +120,7 @@ tools:
   bash_max_timeout: 600            # hard cap; per-call `timeout` arg above this is clamped and logged
   bash_max_output: 30000           # max chars in bash output (default: 30000)
   result_truncation: 30000         # max chars in tool result
+  browser_result_truncation: 24000 # tighter per-observation cap for browser/GUI page/DOM dumps, with a truncation marker (0 = fall back to result_truncation)
   args_truncation: 200             # max chars in displayed args
   server_tool_timeout: 5           # gateway tool timeout, seconds
 ```
