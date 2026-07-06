@@ -1384,6 +1384,14 @@ func (sc *SessionCache) sessionsDir(agent string) string {
 	return filepath.Join(sc.shannonDir, "agents", agent, "sessions")
 }
 
+// AgentsRoot returns the directory that holds per-named-agent state
+// (~/.shannon/agents). Each subdir is one agent whose sessions live under
+// <name>/sessions. GET /sessions scans this to aggregate named-agent IM
+// sessions into the unified recent-conversations list.
+func (sc *SessionCache) AgentsRoot() string {
+	return filepath.Join(sc.shannonDir, "agents")
+}
+
 func (sc *SessionCache) agentRouteKey(agent string) string {
 	return "agent:" + agent
 }

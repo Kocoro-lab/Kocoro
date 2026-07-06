@@ -1437,8 +1437,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	req.Agent = agentName
 	explicitAgent := agentName != "" // explicitly requested, not parsed from @mention
 
-	// Parse @mention if no explicit agent was provided.
-	if agentName == "" {
+	// Parse @mention if no explicit agent was provided. Skip for messaging
+	// platforms: there the gateway delivers an explicit AgentName (or empty =
+	// use the default agent), and any "@<botname>" in the message body is a
+	// user-facing Slack/Teams mention, NOT an agent name in the local registry.
+	// Without this guard, a message that @-mentions ANOTHER app (e.g. "@data-analyst
+	// @Kocoro hi" delivered to the default-bound Kocoro app with Agent="") would be
+	// re-routed here to that other agent, so two apps collapse onto one agent and
+	// answer identically. Mirrors the same guard in cmd/daemon.go onMsg.
+	if agentName == "" && !IsMessagingPlatform(req.Source) {
 		agentName, prompt = agents.ParseAgentMention(req.Text)
 	}
 	if prompt == "" {
@@ -1798,10 +1805,23 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		deps.Suggestions.Clear(sess.ID)
 	}
 
-	// Seed pre-loaded history for bypass-routed runs (e.g., heartbeat).
-	// The throwaway manager has an empty session; this gives the LLM context.
+	// Seed pre-loaded history (bypass-routed runs like heartbeat, and cloud
+	// thread snapshots such as a Slack thread). The seed REPLACES the message
+	// list wholesale, so MessageMeta must be rebuilt to the same length to keep
+	// the len(Messages)==len(MessageMeta) invariant. A bypass run's throwaway
+	// session starts with empty meta, but a thread-scoped IM session (stable
+	// route key) is RESUMED from disk and still holds the prior turn's meta —
+	// leaving it untouched would drift the two slices permanently and corrupt
+	// per-message Source/SystemInjected lookups (both index meta by message
+	// position). Seeded turns are context only, so one source-tagged meta entry
+	// per message is sufficient.
 	if len(req.SessionHistory) > 0 {
 		sess.Messages = req.SessionHistory
+		meta := make([]session.MessageMeta, len(req.SessionHistory))
+		for i := range meta {
+			meta[i] = session.MessageMeta{Source: req.Source}
+		}
+		sess.MessageMeta = meta
 	}
 
 	// Resolve effective CWD: request > resumed session > agent config. When all

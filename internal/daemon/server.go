@@ -508,6 +508,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /channels/feishu/app-installs", s.handleCreateFeishuAppInstall)
 	mux.HandleFunc("GET /channels/feishu/app-installs", s.handleListFeishuAppInstalls)
 	mux.HandleFunc("DELETE /channels/feishu/app-installs/{id}", s.handleDeleteFeishuAppInstall)
+	// Bring-your-own-app Slack — thin proxy to Cloud (which owns per-app OAuth +
+	// Events ingestion). Separate from the legacy shared-app Slack OAuth flow.
+	mux.HandleFunc("GET /channels/slack/cloud-info", s.handleSlackCloudInfo)
+	mux.HandleFunc("POST /channels/slack/app-installs", s.handleCreateSlackAppInstall)
+	mux.HandleFunc("GET /channels/slack/app-installs", s.handleListSlackAppInstalls)
+	mux.HandleFunc("DELETE /channels/slack/app-installs/{id}", s.handleDeleteSlackAppInstall)
 	mux.HandleFunc("GET /skills/marketplace", s.handleMarketplaceList)
 	mux.HandleFunc("GET /skills/marketplace/entry/{slug}", s.handleMarketplaceDetail)
 	// ClawHub live-catalog API — separate surface from /skills/marketplace.
@@ -1262,7 +1268,60 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		sum.Kind = kindOf(sum.Source)
 		filtered = append(filtered, sum)
 	}
+
+	// Unified list (no ?agent): also surface IM-kind sessions that were routed
+	// to a NAMED agent (e.g. a Slack message @-addressed to "data-analyst").
+	// Those live under ~/.shannon/agents/<name>/sessions, separate from the
+	// default workspace enumerated above, so without this they'd be invisible in
+	// the recent-conversations list. Only IM sessions are merged — a named
+	// agent's local/interactive sessions stay in its own agent view to avoid
+	// cluttering the unified list. Each merged row carries Agent=<name> so the
+	// client opens it with the right ?agent scope.
+	if agentName == "" {
+		filtered = append(filtered, s.gatherNamedAgentIMSessions(activeIDs, awaitingIDs)...)
+	}
+
 	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": filtered})
+}
+
+// gatherNamedAgentIMSessions scans every named-agent session dir and returns the
+// non-empty IM-kind sessions, annotated with Agent + runtime flags. Best-effort:
+// unreadable agents/dirs are skipped so one bad agent can't fail the whole list.
+func (s *Server) gatherNamedAgentIMSessions(activeIDs, awaitingIDs map[string]struct{}) []session.SessionSummary {
+	entries, err := os.ReadDir(s.deps.SessionCache.AgentsRoot())
+	if err != nil {
+		return nil // no agents dir yet, or unreadable — nothing to merge
+	}
+	var out []session.SessionSummary
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		agentName := e.Name()
+		if agents.ValidateAgentName(agentName) != nil {
+			continue
+		}
+		mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
+		sums, lerr := mgr.List()
+		if lerr != nil {
+			continue
+		}
+		for _, sum := range sums {
+			if sum.MsgCount == 0 || !IsMessagingPlatform(strings.ToLower(strings.TrimSpace(sum.Source))) {
+				continue
+			}
+			if _, ok := activeIDs[sum.ID]; ok {
+				sum.InProgress = true
+			}
+			if _, ok := awaitingIDs[sum.ID]; ok {
+				sum.AwaitingApproval = true
+			}
+			sum.Kind = kindOf(sum.Source)
+			sum.Agent = agentName
+			out = append(out, sum)
+		}
+	}
+	return out
 }
 
 // handleApprovals returns the set of session IDs currently blocked on a
@@ -1377,6 +1436,42 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sess)
 }
 
+// sessionManagerFor returns the session.Manager whose store holds `id`. With an
+// explicit agent it trusts that scope. Without one it prefers the default
+// workspace and, failing that, scans named-agent session dirs — so an operation
+// on a named-agent IM session (surfaced in the unified GET /sessions list, where
+// the client may not track which agent owns it) resolves to the correct store
+// instead of 404ing against the default dir. Falls back to the default manager
+// when not found anywhere, so callers still emit their normal not-found error.
+func (s *Server) sessionManagerFor(id, agent string) *session.Manager {
+	sc := s.deps.SessionCache
+	if agent != "" {
+		return sc.GetOrCreateManager(sc.SessionsDir(agent))
+	}
+	def := sc.GetOrCreateManager(sc.SessionsDir(""))
+	if _, err := def.Load(id); err == nil {
+		return def
+	}
+	entries, err := os.ReadDir(sc.AgentsRoot())
+	if err != nil {
+		return def
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		an := e.Name()
+		if agents.ValidateAgentName(an) != nil {
+			continue
+		}
+		m := sc.GetOrCreateManager(sc.SessionsDir(an))
+		if _, lerr := m.Load(id); lerr == nil {
+			return m
+		}
+	}
+	return def
+}
+
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	if s.deps == nil {
 		writeError(w, http.StatusInternalServerError, "daemon deps not configured")
@@ -1398,7 +1493,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
+	mgr := s.sessionManagerFor(id, agentName)
 	// Cancel any active route bound to this session before clearing in-memory
 	// bindings. ClearSessionBindings now takes per-entry locks, which blocks
 	// behind any long bash/browser run on a route bound to id; without the
@@ -1510,7 +1605,7 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
+	mgr := s.sessionManagerFor(id, agentName)
 	resp := map[string]interface{}{"status": "updated"}
 	if body.Title != nil {
 		if err := mgr.PatchTitle(id, title); err != nil {
