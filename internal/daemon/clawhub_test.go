@@ -328,3 +328,109 @@ func TestHandleClawHubInstall(t *testing.T) {
 		t.Errorf("second install status = %d, want 409; body = %s", rr2.Code, rr2.Body.String())
 	}
 }
+
+// newTestServerWithAmbiguousClawHub wires a Server against a fake ClawHub where
+// slug "ambi" is shared by two publishers: a bare (owner-less) request 409s
+// (AMBIGUOUS_SKILL_SLUG), exactly as clawhub.ai does. Only owner=popular resolves
+// to 200. The search endpoint (the only surface that carries owner handles)
+// returns both publishers so resolveAmbiguousOwner can pick the most-downloaded.
+func newTestServerWithAmbiguousClawHub(t *testing.T) *Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	// Detail: 409 without owner (ambiguous), 200 for the resolved owner.
+	mux.HandleFunc("/api/v1/skills/ambi", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("owner") != "popular" {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"code": "AMBIGUOUS_SKILL_SLUG",
+				"matches": []map[string]string{
+					{"ownerHandle": "popular"}, {"ownerHandle": "tiny"},
+				},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"skill": map[string]interface{}{
+				"slug": "ambi", "displayName": "Ambi", "summary": "shared slug",
+				"description": "# Ambi\n\nbody",
+			},
+			"owner":         map[string]string{"handle": "popular"},
+			"latestVersion": map[string]string{"version": "1.0.0"},
+		})
+	})
+	// Search carries owner handles + downloads; popular(100) beats tiny(3).
+	mux.HandleFunc("/api/v1/search", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"results": []map[string]interface{}{
+				{"slug": "ambi", "downloads": 3, "owner": map[string]string{"handle": "tiny"}},
+				{"slug": "ambi", "downloads": 100, "owner": map[string]string{"handle": "popular"}},
+			},
+		})
+	})
+	// Download 409s on a bare ambiguous slug; only a concrete owner serves the zip.
+	mux.HandleFunc("/api/v1/download", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("owner") == "" && r.URL.Query().Get("ownerHandle") == "" {
+			http.Error(w, "ambiguous", http.StatusConflict)
+			return
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		_, _ = w.Write(clawhubSkillZip(t, "ambi"))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &Server{
+		deps:      &ServerDeps{ShannonDir: t.TempDir(), AgentsDir: t.TempDir()},
+		clawhub:   skills.NewClawHubMarketplaceClient(srv.URL, 1*time.Hour),
+		slugLocks: skills.NewSlugLocks(),
+	}
+}
+
+// TestHandleClawHubDetailAmbiguousSlug is the regression for the reported bug:
+// a browse entry carries no owner, so an ambiguous slug 409'd upstream and the
+// daemon surfaced a misleading 503 "clawhub unavailable". The daemon must now
+// auto-resolve the most-popular publisher and return 200 with that author.
+func TestHandleClawHubDetailAmbiguousSlug(t *testing.T) {
+	s := newTestServerWithAmbiguousClawHub(t)
+
+	req := httptest.NewRequest("GET", "/skills/clawhub/entry/ambi", nil)
+	req.SetPathValue("slug", "ambi")
+	rr := httptest.NewRecorder()
+	s.handleClawHubDetail(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (auto-resolved); body = %s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Slug    string `json:"slug"`
+		Author  string `json:"author"`
+		Preview string `json:"preview"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.Slug != "ambi" || body.Author != "popular" {
+		t.Errorf("expected resolved author=popular for ambi, got %+v", body)
+	}
+	if body.Preview != "# Ambi\n\nbody" {
+		t.Errorf("preview = %q, want SKILL.md body", body.Preview)
+	}
+}
+
+// TestHandleClawHubInstallAmbiguousSlug asserts install also auto-resolves an
+// owner (browse-card installs pass no owner) so the download targets a concrete
+// publisher instead of 409ing.
+func TestHandleClawHubInstallAmbiguousSlug(t *testing.T) {
+	s := newTestServerWithAmbiguousClawHub(t)
+
+	req := httptest.NewRequest("POST", "/skills/clawhub/install/ambi", nil)
+	req.SetPathValue("slug", "ambi")
+	rr := httptest.NewRecorder()
+	s.handleClawHubInstall(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(s.deps.ShannonDir, "skills", "ambi", "SKILL.md")); err != nil {
+		t.Errorf("installed file missing: %v", err)
+	}
+}

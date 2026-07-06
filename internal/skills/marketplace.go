@@ -1299,9 +1299,12 @@ func (c *MarketplaceClient) FetchClawHubDetail(ctx context.Context, slug, owner 
 	if c.clawhubBase == "" {
 		return nil, errors.New("not a clawhub client")
 	}
-	u := fmt.Sprintf("%s/api/v1/skills/%s", c.clawhubBase, url.PathEscape(slug))
-	if owner != "" {
-		u += "?owner=" + url.QueryEscape(owner)
+	urlFor := func(o string) string {
+		u := fmt.Sprintf("%s/api/v1/skills/%s", c.clawhubBase, url.PathEscape(slug))
+		if o != "" {
+			u += "?owner=" + url.QueryEscape(o)
+		}
+		return u
 	}
 	var dr struct {
 		Skill struct {
@@ -1318,8 +1321,16 @@ func (c *MarketplaceClient) FetchClawHubDetail(ctx context.Context, slug, owner 
 		} `json:"owner"`
 		LatestVersion clawhubVersion `json:"latestVersion"`
 	}
-	if err := c.getJSON(ctx, u, &dr); err != nil {
-		return nil, err
+	// A bare (owner-less) ambiguous slug 409s upstream; clawhubGetOwnerAware
+	// resolves a concrete publisher and retries once, so browse-sourced entries
+	// (the list endpoint carries no owner) still load. dr.Owner.Handle then
+	// reflects the resolved publisher, so DownloadURL/homepage/author stay correct.
+	body, _, err := c.clawhubGetOwnerAware(ctx, slug, owner, urlFor, 10*1024*1024)
+	if err != nil {
+		return nil, fmt.Errorf("fetch clawhub: %w", err)
+	}
+	if err := json.Unmarshal(body, &dr); err != nil {
+		return nil, fmt.Errorf("parse clawhub: %w", err)
 	}
 	name := dr.Skill.DisplayName
 	if name == "" {
@@ -1365,16 +1376,20 @@ type ClawHubFile struct {
 }
 
 // resolveClawHubVersion returns version if non-empty, else the skill's latest
-// version (via the detail endpoint). owner disambiguates shared slugs.
-func (c *MarketplaceClient) resolveClawHubVersion(ctx context.Context, slug, version, owner string) (string, error) {
+// version (via the detail endpoint). It also returns the owner to use for the
+// caller's follow-up version/file GET: when version is empty, the detail fetch
+// resolves a concrete publisher for an ambiguous slug (d.Entry.Author), which is
+// threaded out so the follow-up request targets the same publisher instead of
+// 409ing again.
+func (c *MarketplaceClient) resolveClawHubVersion(ctx context.Context, slug, version, owner string) (string, string, error) {
 	if version != "" {
-		return version, nil
+		return version, owner, nil
 	}
 	d, err := c.FetchClawHubDetail(ctx, slug, owner)
 	if err != nil {
-		return "", err
+		return "", owner, err
 	}
-	return d.Entry.Version, nil
+	return d.Entry.Version, d.Entry.Author, nil
 }
 
 // FetchClawHubFiles returns the file manifest for a skill version (the resolved
@@ -1383,13 +1398,16 @@ func (c *MarketplaceClient) FetchClawHubFiles(ctx context.Context, slug, version
 	if c.clawhubBase == "" {
 		return "", nil, errors.New("not a clawhub client")
 	}
-	ver, err := c.resolveClawHubVersion(ctx, slug, version, owner)
+	ver, owner, err := c.resolveClawHubVersion(ctx, slug, version, owner)
 	if err != nil {
 		return "", nil, err
 	}
-	u := fmt.Sprintf("%s/api/v1/skills/%s/versions/%s", c.clawhubBase, url.PathEscape(slug), url.PathEscape(ver))
-	if owner != "" {
-		u += "?owner=" + url.QueryEscape(owner)
+	urlFor := func(o string) string {
+		u := fmt.Sprintf("%s/api/v1/skills/%s/versions/%s", c.clawhubBase, url.PathEscape(slug), url.PathEscape(ver))
+		if o != "" {
+			u += "?owner=" + url.QueryEscape(o)
+		}
+		return u
 	}
 	var vr struct {
 		Version struct {
@@ -1400,8 +1418,12 @@ func (c *MarketplaceClient) FetchClawHubFiles(ctx context.Context, slug, version
 			} `json:"files"`
 		} `json:"version"`
 	}
-	if err := c.getJSON(ctx, u, &vr); err != nil {
-		return "", nil, err
+	body, _, err := c.clawhubGetOwnerAware(ctx, slug, owner, urlFor, 10*1024*1024)
+	if err != nil {
+		return "", nil, fmt.Errorf("fetch clawhub: %w", err)
+	}
+	if err := json.Unmarshal(body, &vr); err != nil {
+		return "", nil, fmt.Errorf("parse clawhub: %w", err)
 	}
 	files := make([]ClawHubFile, 0, len(vr.Version.Files))
 	for _, f := range vr.Version.Files {
@@ -1415,22 +1437,20 @@ func (c *MarketplaceClient) FetchClawHubFile(ctx context.Context, slug, version,
 	if c.clawhubBase == "" {
 		return "", errors.New("not a clawhub client")
 	}
-	ver, err := c.resolveClawHubVersion(ctx, slug, version, owner)
+	ver, owner, err := c.resolveClawHubVersion(ctx, slug, version, owner)
 	if err != nil {
 		return "", err
 	}
-	u := fmt.Sprintf("%s/api/v1/skills/%s/file?path=%s&version=%s",
-		c.clawhubBase, url.PathEscape(slug), url.QueryEscape(path), url.QueryEscape(ver))
-	if owner != "" {
-		u += "&owner=" + url.QueryEscape(owner)
+	urlFor := func(o string) string {
+		u := fmt.Sprintf("%s/api/v1/skills/%s/file?path=%s&version=%s",
+			c.clawhubBase, url.PathEscape(slug), url.QueryEscape(path), url.QueryEscape(ver))
+		if o != "" {
+			u += "&owner=" + url.QueryEscape(o)
+		}
+		return u
 	}
-	return c.getText(ctx, u)
-}
-
-// getText performs a GET and returns the raw response body as a string. Used for
-// file content (ClawHub caps single files at 200KB); 1 MB ceiling as a guard.
-func (c *MarketplaceClient) getText(ctx context.Context, rawURL string) (string, error) {
-	body, err := c.clawhubGet(ctx, rawURL, 1*1024*1024)
+	// 1 MB ceiling as a guard (ClawHub caps single files at 200KB).
+	body, _, err := c.clawhubGetOwnerAware(ctx, slug, owner, urlFor, 1*1024*1024)
 	if err != nil {
 		return "", fmt.Errorf("fetch clawhub: %w", err)
 	}
@@ -1484,4 +1504,75 @@ func (c *MarketplaceClient) getJSON(ctx context.Context, rawURL string, v any) e
 		return fmt.Errorf("parse clawhub: %w", err)
 	}
 	return nil
+}
+
+// isAmbiguousSlugErr reports whether err is ClawHub's 409 AMBIGUOUS_SKILL_SLUG
+// response — the only 409 the read endpoints (detail/versions/file) return. A
+// bare slug shared by multiple publishers 409s; the caller resolves an owner and
+// retries. Matches the "status 409" the daemon handlers also grep on.
+func isAmbiguousSlugErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "status 409")
+}
+
+// resolveAmbiguousOwner picks a concrete publisher for a slug shared by several
+// owners, so an owner-less browse entry can still load detail/files and install.
+// It queries ClawHub's search endpoint (the list endpoint carries no owner) and
+// selects the exact-slug match with the most downloads — the publisher a user is
+// most likely to want — with a deterministic handle tie-break for stability.
+// Returns "" when search yields no exact-slug match carrying an owner. The search
+// response is cached (clawhubCache), so repeat resolutions of the same slug
+// within the TTL cost no extra upstream calls.
+func (c *MarketplaceClient) resolveAmbiguousOwner(ctx context.Context, slug string) (string, error) {
+	u := fmt.Sprintf("%s/api/v1/search?limit=%d&q=%s", c.clawhubBase, clawhubSearchPool, url.QueryEscape(slug))
+	var sr clawhubSearchResp
+	if err := c.getJSON(ctx, u, &sr); err != nil {
+		return "", err
+	}
+	best, bestDownloads := "", -1
+	for _, r := range sr.Results {
+		if r.Owner.Handle == "" || !strings.EqualFold(r.Slug, slug) {
+			continue
+		}
+		if r.Downloads > bestDownloads ||
+			(r.Downloads == bestDownloads && (best == "" || r.Owner.Handle < best)) {
+			best, bestDownloads = r.Owner.Handle, r.Downloads
+		}
+	}
+	return best, nil
+}
+
+// clawhubGetOwnerAware fetches urlFor(owner). When owner is empty and ClawHub
+// answers 409 (ambiguous slug), it resolves a concrete publisher for slug and
+// retries once against urlFor(resolvedOwner). Returns the body plus the owner
+// actually used, so callers can thread the resolved owner into follow-up
+// requests (version/file fetches) that must target the same publisher. On a
+// failed or empty resolution the original ambiguous-slug error is preserved, so
+// the daemon's 404-vs-409-vs-503 mapping still applies.
+func (c *MarketplaceClient) clawhubGetOwnerAware(ctx context.Context, slug, owner string, urlFor func(owner string) string, maxBytes int64) ([]byte, string, error) {
+	body, err := c.clawhubGet(ctx, urlFor(owner), maxBytes)
+	if err == nil || owner != "" || !isAmbiguousSlugErr(err) {
+		return body, owner, err
+	}
+	resolved, rerr := c.resolveAmbiguousOwner(ctx, slug)
+	if rerr != nil || resolved == "" {
+		return nil, owner, err // keep the original ambiguous-slug error
+	}
+	body, err = c.clawhubGet(ctx, urlFor(resolved), maxBytes)
+	if err != nil {
+		return nil, owner, err
+	}
+	return body, resolved, nil
+}
+
+// ResolveClawHubOwner returns owner unchanged when non-empty; otherwise it
+// resolves a concrete publisher for the slug (see resolveAmbiguousOwner) so the
+// install download URL targets one publisher instead of 409ing on a bare
+// ambiguous slug. Returns "" (no error) when the slug can't be resolved, leaving
+// the caller to attempt a bare-slug download (which still succeeds for a slug
+// with a single publisher).
+func (c *MarketplaceClient) ResolveClawHubOwner(ctx context.Context, slug, owner string) (string, error) {
+	if owner != "" {
+		return owner, nil
+	}
+	return c.resolveAmbiguousOwner(ctx, slug)
 }

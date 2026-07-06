@@ -4333,10 +4333,15 @@ func (s *Server) handleClawHubDetail(w http.ResponseWriter, r *http.Request) {
 	// passes the entry's author); without it ClawHub 409s on an ambiguous slug.
 	d, err := s.clawhub.FetchClawHubDetail(r.Context(), slug, r.URL.Query().Get("owner"))
 	if err != nil {
-		// Distinguish "skill not on ClawHub" (404) from "ClawHub down" (503).
-		if strings.Contains(err.Error(), "status 404") {
+		// Distinguish "skill not on ClawHub" (404), "ambiguous slug the daemon
+		// couldn't auto-resolve" (409 → actionable, pass ?owner=), and "ClawHub
+		// down / rate-limited" (503). A bare 409 must NOT read as an outage.
+		switch {
+		case strings.Contains(err.Error(), "status 404"):
 			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
-		} else {
+		case strings.Contains(err.Error(), "status 409"):
+			writeError(w, http.StatusConflict, fmt.Sprintf("skill %q is published by multiple owners; retry with ?owner=<handle>", slug))
+		default:
 			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
 		}
 		return
@@ -4364,12 +4369,22 @@ func (s *Server) handleClawHubInstall(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// owner disambiguates slugs shared by multiple publishers; without it
+	// ClawHub's download endpoint 409s on an ambiguous slug. Browse-sourced
+	// entries carry no owner (the list endpoint omits it), so resolve a concrete
+	// publisher here — matching the detail preview's auto-resolution — before
+	// building the download URL. Resolution failure is non-fatal: fall through
+	// with a bare slug, which still succeeds for a single-publisher slug.
+	owner := r.URL.Query().Get("owner")
+	if owner == "" {
+		if resolved, rerr := s.clawhub.ResolveClawHubOwner(r.Context(), slug, owner); rerr == nil {
+			owner = resolved
+		}
+	}
 	entry := skills.MarketplaceEntry{
-		Slug: slug,
-		Name: slug,
-		// owner disambiguates slugs shared by multiple publishers; without it
-		// ClawHub's download endpoint 409s on an ambiguous slug.
-		DownloadURL: s.clawhub.ClawHubDownloadURL(slug, r.URL.Query().Get("owner")),
+		Slug:        slug,
+		Name:        slug,
+		DownloadURL: s.clawhub.ClawHubDownloadURL(slug, owner),
 	}
 	err := skills.InstallFromMarketplace(r.Context(), s.deps.ShannonDir, entry, s.slugLocks)
 	switch {
@@ -4424,9 +4439,12 @@ func (s *Server) handleClawHubFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	version, files, err := s.clawhub.FetchClawHubFiles(r.Context(), slug, r.URL.Query().Get("version"), r.URL.Query().Get("owner"))
 	if err != nil {
-		if strings.Contains(err.Error(), "status 404") {
+		switch {
+		case strings.Contains(err.Error(), "status 404"):
 			writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in marketplace", slug))
-		} else {
+		case strings.Contains(err.Error(), "status 409"):
+			writeError(w, http.StatusConflict, fmt.Sprintf("skill %q is published by multiple owners; retry with ?owner=<handle>", slug))
+		default:
 			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
 		}
 		return
@@ -4452,9 +4470,12 @@ func (s *Server) handleClawHubFile(w http.ResponseWriter, r *http.Request) {
 	}
 	content, err := s.clawhub.FetchClawHubFile(r.Context(), slug, r.URL.Query().Get("version"), path, r.URL.Query().Get("owner"))
 	if err != nil {
-		if strings.Contains(err.Error(), "status 404") {
+		switch {
+		case strings.Contains(err.Error(), "status 404"):
 			writeError(w, http.StatusNotFound, fmt.Sprintf("file %q not found", path))
-		} else {
+		case strings.Contains(err.Error(), "status 409"):
+			writeError(w, http.StatusConflict, fmt.Sprintf("skill %q is published by multiple owners; retry with ?owner=<handle>", slug))
+		default:
 			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
 		}
 		return
