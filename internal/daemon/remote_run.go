@@ -584,6 +584,22 @@ func (h *remoteRunEventHandler) OnApprovalNeeded(tool string, args string) bool 
 	if h.autoApprove {
 		if !agent.DisallowsUnattendedAutoApproval(tool) {
 			log.Printf("daemon: remote run auto-approving %s (auto_approve=true)", tool)
+			// Auto-approval bypasses the broker, so no approval_requested event
+			// reaches the controller (the phone). Emit an explicit approval_auto
+			// notice so the unattended tool execution is observable on-device and
+			// in the run's replay buffer — otherwise a remote-initiated bash/http
+			// call runs with zero controller-visible telemetry, only a local log.
+			if h.server != nil {
+				_ = h.server.sendRemoteRunEvent(RemoteRunEvent{
+					RunID:     h.runID,
+					Type:      "approval_auto",
+					SessionID: h.sessionID,
+					Payload: rawJSON(map[string]string{
+						"tool":   tool,
+						"reason": "auto_approve",
+					}),
+				})
+			}
 			return true
 		}
 		log.Printf("daemon: remote run %s requires per-call approval (auto_approve=true); prompting via broker", tool)

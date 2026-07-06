@@ -121,6 +121,55 @@ func TestRemoteRunEventHandlerAutoApproveSkipsBroker(t *testing.T) {
 	}
 }
 
+// TestRemoteRunAutoApproveEmitsObservableNotice locks in the visibility fix:
+// when a remote run auto-approves a tool (auto_approve=true), the broker is
+// bypassed so no approval_requested reaches the controller. The daemon must
+// instead emit an approval_auto notice so the unattended execution is visible
+// on the phone / in the replay buffer rather than only in the local log.
+func TestRemoteRunAutoApproveEmitsObservableNotice(t *testing.T) {
+	got := make(chan DaemonMessage, 1)
+	client := &Client{
+		envelopeSender: func(msg DaemonMessage) error {
+			got <- msg
+			return nil
+		},
+	}
+	srv := NewServer(0, client, &ServerDeps{}, "test")
+	handler := &remoteRunEventHandler{
+		server:      srv,
+		runID:       "run-auto",
+		sessionID:   "sess-auto",
+		ctx:         context.Background(),
+		autoApprove: true,
+	}
+
+	if !handler.OnApprovalNeeded("bash", `{"command":"ls"}`) {
+		t.Fatal("autoApprove=true should approve")
+	}
+
+	select {
+	case dm := <-got:
+		if dm.Type != MsgTypeRemoteRunEvent {
+			t.Fatalf("message type = %q, want %q", dm.Type, MsgTypeRemoteRunEvent)
+		}
+		var evt RemoteRunEvent
+		if err := json.Unmarshal(dm.Payload, &evt); err != nil {
+			t.Fatalf("invalid remote run event: %v", err)
+		}
+		if evt.Type != "approval_auto" {
+			t.Fatalf("event type = %q, want approval_auto", evt.Type)
+		}
+		if evt.RunID != "run-auto" || evt.SessionID != "sess-auto" {
+			t.Fatalf("event ids = (%q,%q), want (run-auto,sess-auto)", evt.RunID, evt.SessionID)
+		}
+		if !strings.Contains(string(evt.Payload), `"tool":"bash"`) {
+			t.Fatalf("payload = %s, want tool=bash", evt.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("auto-approved remote run emitted no approval_auto notice")
+	}
+}
+
 func TestRemoteRunRejectsWhenConcurrencyLimitReached(t *testing.T) {
 	got := make(chan DaemonMessage, 1)
 	client := &Client{
