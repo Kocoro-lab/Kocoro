@@ -4377,8 +4377,12 @@ func (s *Server) handleClawHubInstall(w http.ResponseWriter, r *http.Request) {
 	// with a bare slug, which still succeeds for a single-publisher slug.
 	owner := r.URL.Query().Get("owner")
 	if owner == "" {
-		if resolved, rerr := s.clawhub.ResolveClawHubOwner(r.Context(), slug, owner); rerr == nil {
+		if resolved, rerr := s.clawhub.ResolveClawHubOwner(r.Context(), slug, owner); rerr == nil && resolved != "" {
 			owner = resolved
+			// Trust boundary: which publisher's SKILL.md lands on disk was chosen
+			// by popularity, not by the user (the client normally pins the owner it
+			// previewed). Record the auto-selection so it is auditable.
+			s.auditHTTPOp("POST", endpoint, fmt.Sprintf("auto-resolved ambiguous slug %q to owner %q", slug, owner))
 		}
 	}
 	entry := skills.MarketplaceEntry{
