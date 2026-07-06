@@ -777,3 +777,40 @@ func TestWriteGlobalSkill_RoundTripsSticky(t *testing.T) {
 		}
 	})
 }
+
+// TestBundledGenerativeUISkill_RetainsToolAllowlist is a manifest guard for the
+// kocoro-generative-ui builtin. That skill is visualization-only — it emits
+// html-artifact fences that render in Desktop's WKWebView sandbox and must NOT
+// be able to fetch live data or run arbitrary tools. The restriction is enforced
+// at execution time (loop.go) from the skill's `allowed-tools` frontmatter, and
+// an EMPTY AllowedTools clears that filter entirely, silently granting the skill
+// every registered tool (bash, http, browser, web search…). Commit 39fee8f
+// dropped this line once as an accidental side effect of an unrelated feature;
+// this test walks the real embed → extract → parse path so any future drop (or
+// unreviewed widening) fails loudly here instead of in production.
+func TestBundledGenerativeUISkill_RetainsToolAllowlist(t *testing.T) {
+	src, err := BundledSkillSource(t.TempDir())
+	if err != nil {
+		t.Fatalf("BundledSkillSource: %v", err)
+	}
+	loaded, err := LoadSkills(src)
+	if err != nil {
+		t.Fatalf("LoadSkills: %v", err)
+	}
+	var gui *Skill
+	for _, s := range loaded {
+		if s.Slug == "kocoro-generative-ui" {
+			gui = s
+			break
+		}
+	}
+	if gui == nil {
+		t.Fatal("kocoro-generative-ui skill not found in bundled set")
+	}
+	const want = "file_read file_write publish_to_web think"
+	if got := strings.Join(gui.AllowedTools, " "); got != want {
+		t.Errorf("kocoro-generative-ui allowed-tools = %q, want %q\n"+
+			"(a visualization-only skill must stay tool-restricted; an empty allowlist "+
+			"clears the loop.go execution filter and grants every registered tool)", got, want)
+	}
+}

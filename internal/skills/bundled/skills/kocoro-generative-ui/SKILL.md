@@ -6,6 +6,7 @@ description: |
   Desktop chat. Use when the user asks to "visualize", "chart", "diagram",
   "explain visually", "show me", or when data is denser than a paragraph of
   prose.
+allowed-tools: file_read file_write publish_to_web think
 hidden: true
 metadata:
   version: "1.0.3"
