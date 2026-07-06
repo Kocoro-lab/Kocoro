@@ -433,8 +433,10 @@ func broadcastReply(ws ProactiveSender, sched *schedule.Schedule, reply, session
 		return
 	}
 	// Resolve the thread-anchor hint from the schedule's thread setting and
-	// session state. Explicit on/off wins; auto follows sticky+blob presence.
-	useThread := resolveThread(sched.Thread, sched.IsSticky(), len(sched.IMStatusContext) > 0)
+	// session state. Explicit on/off wins; auto follows stickiness. hasBlob is
+	// unconditionally true here — the origin-only gate above already returned
+	// on an empty IMStatusContext.
+	useThread := resolveThread(sched.Thread, sched.IsSticky(), true)
 	// The blob is sent even for stateless/top-level pushes so Cloud can still
 	// target the originating channel — top-level just drops the thread anchor.
 	if err := ws.SendProactive(sched.Agent, reply, sessionID, sched.IMStatusContext, useThread); err != nil {
