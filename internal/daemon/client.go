@@ -153,6 +153,16 @@ const (
 	// GET /config/status mcp_default_agent_disabled). Desktop gates its per-agent
 	// MCP selection UI on this.
 	CapPerAgentMCPScope = "per_agent_mcp_scope"
+	// CapSessionsScopeAll — daemon supports the cross-agent session list/search:
+	// GET /sessions?scope=all and GET /sessions/search?scope=all merge the
+	// default scope with every named agent's sessions, each row carrying an
+	// `agent` attribution field, and GET /sessions gains limit/offset+total/
+	// has_more pagination. Desktop gates its "All agents" global session UI on
+	// this token — an old daemon that predates scope=all reports no token, so
+	// Desktop disables the global view rather than sniffing the response shape
+	// (an unlimited single-scope response also has has_more:false, so shape
+	// sniffing is ambiguous).
+	CapSessionsScopeAll = "sessions_scope_all"
 )
 
 var Capabilities = []string{
@@ -174,6 +184,7 @@ var Capabilities = []string{
 	CapMentionRosterV1,
 	CapDefaultAgentSkillDenylist,
 	CapPerAgentMCPScope,
+	CapSessionsScopeAll,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a

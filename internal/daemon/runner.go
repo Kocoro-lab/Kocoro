@@ -698,6 +698,52 @@ var markdownCloudSources = map[string]struct{}{
 	ChannelTeams:  {},
 }
 
+func applyKoeResponseLanguage(loop *agent.AgentLoop, source, text string) {
+	if loop == nil || !isKoeSource(source) {
+		return
+	}
+	// Voice turns should follow the language the user just spoke. The Desktop
+	// global language preference is a text-UI default and can otherwise make an
+	// English spoken request come back in Chinese.
+	loop.SetResponseLanguage(inferKoeResponseLanguage(text))
+}
+
+func inferKoeResponseLanguage(text string) string {
+	var latin, han, kana, hangul int
+	for _, r := range text {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z':
+			latin++
+		case r >= 0x3040 && r <= 0x30FF:
+			kana++
+		case r >= 0xAC00 && r <= 0xD7AF:
+			hangul++
+		case (r >= 0x3400 && r <= 0x9FFF) || (r >= 0xF900 && r <= 0xFAFF):
+			han++
+		}
+	}
+	// A CJK speaker who sprinkles English loanwords ("帮我 review 这个 PR",
+	// "この PR を review してください") must not be locked to English by raw
+	// Latin-character count — the old `han >= latin` comparison misfired exactly
+	// there. A run of >=2 characters in any CJK script is a strong enough signal
+	// to win over Latin regardless of how much Latin is present; English is
+	// chosen only when no such CJK signal exists. Kana is checked before han
+	// because Japanese mixes kana with kanji (kanji fall in the han range) and
+	// should classify as Japanese.
+	switch {
+	case kana >= 2:
+		return "日本語"
+	case hangul >= 2:
+		return "한국어"
+	case han >= 2:
+		return "中文"
+	case latin >= 3:
+		return "English"
+	default:
+		return ""
+	}
+}
+
 // outputFormatForSource maps a request source to an output format profile.
 // Cloud-distributed channels default to "plain" — Shannon Cloud handles final
 // channel rendering (Slack mrkdwn, LINE Flex, etc.) — except markdownCloudSources
@@ -710,6 +756,13 @@ var markdownCloudSources = map[string]struct{}{
 // markdownCloudSources — pinned by TestCloudSourceDefinitionsAgree.
 func outputFormatForSource(source string) string {
 	norm := strings.ToLower(strings.TrimSpace(source))
+	if isKoeSource(norm) {
+		// Voice front-brain: spoken output, not rendered text. The actual
+		// directives live in prompt.formatGuidance("koe"). koe is non-cloud, so
+		// TestCloudSourceDefinitionsAgree treats it as a documented exception to
+		// the "non-cloud ⇒ markdown" rule.
+		return "koe"
+	}
 	if _, ok := markdownCloudSources[norm]; ok {
 		return "markdown"
 	}
@@ -717,6 +770,123 @@ func outputFormatForSource(source string) string {
 		return "plain"
 	}
 	return "markdown"
+}
+
+const spokenSummaryMaxRunes = 240
+
+type spokenSummaryLine struct {
+	text string
+	list bool
+}
+
+var (
+	spokenRawURLRE       = regexp.MustCompile(`https?://\S+`)
+	spokenListMarkerRE   = regexp.MustCompile(`^\s*(?:[-*+•]\s+|\d+[\.)]\s+)`)
+	spokenQuoteMarkerRE  = regexp.MustCompile(`^\s*>+\s*`)
+	spokenTableRuleRE    = regexp.MustCompile(`^[\s|:-]+$`)
+	spokenWhitespaceRE   = regexp.MustCompile(`\s+`)
+	spokenMarkdownMarkRE = regexp.MustCompile("[`*_~]+")
+)
+
+// makeSpokenSummary is the mechanical fallback used only when the model did not
+// author a <spoken_summary> block (see projectKoeVoice). Under the result-last
+// convention it takes the TAIL line — the closest thing to a conclusion — not the
+// head, which tends to be progress narration ("I'm searching...").
+func makeSpokenSummary(reply string) string {
+	lines := spokenSummaryLines(reply)
+	if len(lines) == 0 {
+		return ""
+	}
+	last := lines[len(lines)-1].text
+	if last == "" {
+		return ""
+	}
+	return limitSpokenSummary(ensureSpokenSentence(last))
+}
+
+func spokenSummaryLines(reply string) []spokenSummaryLine {
+	reply = strings.ReplaceAll(reply, "\r\n", "\n")
+	reply = strings.ReplaceAll(reply, "\r", "\n")
+	var lines []spokenSummaryLine
+	inFence := false
+	for _, raw := range strings.Split(reply, "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			inFence = !inFence
+			continue
+		}
+		if inFence || trimmed == "" || spokenTableRuleRE.MatchString(trimmed) {
+			continue
+		}
+		line := cleanSpokenSummaryLine(trimmed)
+		if line.text != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func cleanSpokenSummaryLine(line string) spokenSummaryLine {
+	line = spokenQuoteMarkerRE.ReplaceAllString(line, "")
+	isList := spokenListMarkerRE.MatchString(line)
+	line = spokenListMarkerRE.ReplaceAllString(line, "")
+	line = stripMarkdownLite(line)
+	line = spokenRawURLRE.ReplaceAllString(line, "")
+	line = spokenMarkdownMarkRE.ReplaceAllString(line, "")
+	line = spokenWhitespaceRE.ReplaceAllString(strings.TrimSpace(line), " ")
+	line = strings.Trim(line, " \t-–—")
+	return spokenSummaryLine{text: line, list: isList}
+}
+
+func limitSpokenSummary(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= spokenSummaryMaxRunes {
+		return text
+	}
+	lastCut := 0
+	sentenceCount := 0
+	for i, r := range runes[:spokenSummaryMaxRunes] {
+		switch r {
+		case '.', '!', '?', '。', '！', '？':
+			lastCut = i + 1
+			sentenceCount++
+			if sentenceCount >= 2 {
+				return strings.TrimSpace(string(runes[:lastCut]))
+			}
+		}
+	}
+	if lastCut > 0 {
+		return strings.TrimSpace(string(runes[:lastCut]))
+	}
+	return strings.TrimSpace(string(runes[:spokenSummaryMaxRunes])) + "..."
+}
+
+func ensureSpokenSentence(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	switch []rune(s)[len([]rune(s))-1] {
+	case '.', '!', '?', '。', '！', '？', '：', ':':
+		return s
+	}
+	if containsCJK(s) {
+		return s + "。"
+	}
+	return s + "."
+}
+
+func containsCJK(s string) bool {
+	for _, r := range s {
+		if (r >= 0x3400 && r <= 0x9FFF) || (r >= 0xF900 && r <= 0xFAFF) {
+			return true
+		}
+	}
+	return false
 }
 
 // silentBannerSources lists request sources whose `agent_reply` should NOT
@@ -752,6 +922,12 @@ func isAutonomousLocalSource(source string) bool {
 // spam the notification center.
 func shouldEmitReplyBanner(source string) bool {
 	if isCloudSource(source) {
+		return false
+	}
+	if isKoeSource(source) {
+		// Koe reads the reply aloud during the call; a macOS banner would be a
+		// duplicate. Note koe stays OUT of silentBannerSources on purpose — that
+		// set ALSO suppresses the smart-title upgrade, which voice bursts keep.
 		return false
 	}
 	return !isAutonomousLocalSource(source)
@@ -800,6 +976,29 @@ func wantsPromptSuggestion(source string) bool {
 	return ok
 }
 
+// stampSessionOrigin persists the request's Source (and Channel when present)
+// onto the session so kindOf / isInteractiveSource classify it correctly after a
+// reload. The original inline guard required BOTH Source and Channel to be
+// non-empty, which silently dropped Source for thread-routed sources that carry
+// no Channel — koe routes by burst-id via ThreadID with Channel="". Without a
+// persisted Source, kindOf("") => SessionKindInteractive misclassifies the burst
+// session as the user's interactive chat, so heartbeat / cold-start could resume
+// onto it. Interactive sources (desktop/tui/kocoro/"") stay UNSTAMPED on purpose
+// so they remain Source="" => interactive — only koe gains channel-less stamping.
+func stampSessionOrigin(sess *session.Session, req RunAgentRequest) {
+	if sess == nil || req.Source == "" {
+		return
+	}
+	if req.Channel != "" {
+		sess.Source = req.Source
+		sess.Channel = req.Channel
+		return
+	}
+	if isKoeSource(req.Source) {
+		sess.Source = req.Source
+	}
+}
+
 // markdownStripRE matches the small set of markdown markers that read poorly
 // in a macOS notification: backticks (inline code + fences), bold/italic
 // asterisks and underscores, leading hashes for headers, and the `[text](url)`
@@ -829,6 +1028,14 @@ func stripMarkdownLite(s string) string {
 // invariants differ (CWD allocation vs. @mention handling), but if a channel
 // is cloud-routed it almost always belongs in both lists.
 func IsMessagingPlatform(source string) bool {
+	// koe is messaging-routed (thread/burst keying, kind=im) even though its
+	// transport is daemon-local — keep it here, NOT in cloudSourceSet. This is the
+	// single edit that cascades into kindOf → SessionKindIM and
+	// isInteractiveSource → false, keeping voice bursts out of the user's
+	// interactive cold-start / heartbeat lane.
+	if isKoeSource(source) {
+		return true
+	}
 	switch strings.ToLower(strings.TrimSpace(source)) {
 	case ChannelSlack, ChannelFeishu, ChannelLark, ChannelWeCom,
 		ChannelLINE, ChannelWeChat, ChannelTeams, ChannelDiscord,
@@ -847,6 +1054,14 @@ func IsMessagingPlatform(source string) bool {
 // Shannon routes unknown to 5m (fail cheap, not fail expensive).
 func cacheSourceFromDaemonSource(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
+	if isKoeSource(s) {
+		// Voice burst: idle gaps of 3–5 min between do_task calls are common, so
+		// the 1h prompt-cache bucket pays off. Cloud's TTL resolver must map
+		// "koe"/"koe-*" to the long bucket (Plan D, cross-repo) — until it does,
+		// an unrecognized source routes to 5m (fail cheap). Return the normalized
+		// source verbatim so per-carrier attribution survives.
+		return s
+	}
 	switch s {
 	case "slack", "line", "feishu", "lark", "wecom", "teams", "telegram":
 		// Human-conversation channels: idle gaps > 5m are common, 1h pays off.
@@ -898,7 +1113,8 @@ func routeTitle(source, channel, sender string) string {
 
 // RunAgentResult is the output from RunAgent.
 type RunAgentResult struct {
-	Reply string `json:"reply"`
+	Reply         string `json:"reply"`
+	SpokenSummary string `json:"spoken_summary,omitempty"`
 	// ReplyToMessageID is the cloud message id the final Reply should be
 	// addressed to — the LAST inbound message the run processed. It differs from
 	// the run's primary inbound id when a mid-run injected follow-up (a rapid or
@@ -1458,8 +1674,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	req.Agent = agentName
 	explicitAgent := agentName != "" // explicitly requested, not parsed from @mention
 
-	// Parse @mention if no explicit agent was provided.
-	if agentName == "" {
+	// Parse @mention if no explicit agent was provided. Skip for messaging
+	// platforms: there the gateway delivers an explicit AgentName (or empty =
+	// use the default agent), and any "@<botname>" in the message body is a
+	// user-facing Slack/Teams mention, NOT an agent name in the local registry.
+	// Without this guard, a message that @-mentions ANOTHER app (e.g. "@data-analyst
+	// @Kocoro hi" delivered to the default-bound Kocoro app with Agent="") would be
+	// re-routed here to that other agent, so two apps collapse onto one agent and
+	// answer identically. Mirrors the same guard in cmd/daemon.go onMsg.
+	if agentName == "" && !IsMessagingPlatform(req.Source) {
 		agentName, prompt = agents.ParseAgentMention(req.Text)
 	}
 	if prompt == "" {
@@ -1819,10 +2042,23 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		deps.Suggestions.Clear(sess.ID)
 	}
 
-	// Seed pre-loaded history for bypass-routed runs (e.g., heartbeat).
-	// The throwaway manager has an empty session; this gives the LLM context.
+	// Seed pre-loaded history (bypass-routed runs like heartbeat, and cloud
+	// thread snapshots such as a Slack thread). The seed REPLACES the message
+	// list wholesale, so MessageMeta must be rebuilt to the same length to keep
+	// the len(Messages)==len(MessageMeta) invariant. A bypass run's throwaway
+	// session starts with empty meta, but a thread-scoped IM session (stable
+	// route key) is RESUMED from disk and still holds the prior turn's meta —
+	// leaving it untouched would drift the two slices permanently and corrupt
+	// per-message Source/SystemInjected lookups (both index meta by message
+	// position). Seeded turns are context only, so one source-tagged meta entry
+	// per message is sufficient.
 	if len(req.SessionHistory) > 0 {
 		sess.Messages = req.SessionHistory
+		meta := make([]session.MessageMeta, len(req.SessionHistory))
+		for i := range meta {
+			meta[i] = session.MessageMeta{Source: req.Source}
+		}
+		sess.MessageMeta = meta
 	}
 
 	// Resolve effective CWD: request > resumed session > agent config. When all
@@ -1933,10 +2169,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if shouldPersistRouteKey(req.RouteKey) {
 			sess.RouteKey = req.RouteKey
 		}
-		if req.Source != "" && req.Channel != "" {
-			sess.Source = req.Source
-			sess.Channel = req.Channel
-		}
+		stampSessionOrigin(sess, req)
 		// Source-derived title for routed conversations (IM → "Slack · sender",
 		// schedule → "Schedule · scheduler"). Named/default treated identically;
 		// desktop/empty sources yield "" and fall through to the first-line title.
@@ -2084,6 +2317,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		&runCfg.Permissions, deps.Auditor, deps.HookRunner)
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
+	// Browser/GUI context trimming (config-gated; defaults ON via viper).
+	loop.SetObservationWindow(runCfg.Agent.ObservationWindow)
+	loop.SetBrowserObservationMaxChars(runCfg.Tools.BrowserResultTruncation)
+	loop.SetMaxRecentImages(runCfg.Agent.MaxRecentImages)
+	loop.SetMaxRecentBrowserImages(runCfg.Agent.MaxRecentBrowserImages)
 	// Seed the soft context window from the configured model or the last
 	// model observed on this session, falling back to the static config.
 	// Without this, every routed daemon turn would re-seed at the static
@@ -2174,6 +2412,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			runCfg.Agent.IdleHardTimeoutSecs = *ac.IdleHardTimeoutSecs
 		}
 	}
+	applyKoeResponseLanguage(loop, req.Source, req.Text)
 	// Apply idle-timeout config AFTER per-agent overrides have been folded
 	// into runCfg, otherwise agent-level opt-in/override silently does nothing.
 	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)
@@ -2581,6 +2820,20 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		log.Printf("daemon: agent %s hit iteration limit, saving partial result", agentName)
 	}
 
+	// Koe voice projection: pull the model-authored <spoken_summary> line out of
+	// result and strip the tag so it never reaches the agent_reply bus event, the
+	// HTTP reply Koe reads back, or the flat-text fallback persist below. The
+	// normal transcript copy (rebuilt from the loop) is cleaned separately after
+	// the persist block. Non-koe sources: no-op.
+	var koeSpoken string
+	if isKoeSource(req.Source) {
+		var authored bool
+		koeSpoken, result, authored = projectKoeVoice(result)
+		if !authored && strings.TrimSpace(result) != "" {
+			log.Printf("daemon: koe spoken_summary contract miss (source=%s) — mechanical fallback", req.Source)
+		}
+	}
+
 	// Tracks persistence outcome so the return value can blank SessionID on
 	// failure (in addition to the agent_reply gate inside the block below).
 	// Stays nil for ephemeral requests, which is the desired "no failure" state.
@@ -2627,6 +2880,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			sess.MessageMeta = append(sess.MessageMeta,
 				session.MessageMeta{Source: checkpointSource, Timestamp: session.TimePtr(replyTime)},
 			)
+		}
+		// Koe: the normal path rebuilt the transcript from the loop's run messages,
+		// which still carry the head <spoken_summary> tag; strip it from EVERY
+		// assistant message this run persisted (a run that absorbed injected
+		// follow-ups produces more than one answer, each with its own tag) so
+		// Desktop history / FTS / next-turn reload never see the raw tag. Scoped to
+		// this run's slice; no-op on the flat-text fallback above (already used the
+		// cleaned result).
+		if isKoeSource(req.Source) {
+			stripSpokenSummaryFromAssistants(sess.Messages[turnBase.msgCount:])
 		}
 		applyTurnUsage(sess, turnUsage, turnBase) // idempotent: baseline + current
 		// Persist tool-result budget state. Mid-turn checkpoints (applyTurnState)
@@ -2790,6 +3053,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	return &RunAgentResult{
 		Reply:                result,
+		SpokenSummary:        koeSpoken,
 		ReplyToMessageID:     loop.ReplyCloudMessageID(),
 		PendingAckMessageIDs: loop.PendingAckIDs(),
 		SessionID:            returnedSessionID,
@@ -3211,10 +3475,7 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		if shouldPersistRouteKey(req.RouteKey) {
 			sess.RouteKey = req.RouteKey
 		}
-		if req.Source != "" && req.Channel != "" {
-			sess.Source = req.Source
-			sess.Channel = req.Channel
-		}
+		stampSessionOrigin(sess, req)
 		// Title from route source/channel (IM) or the first-message query.
 		// Named agents no longer get a fixed title — the smart-title upgrade
 		// replaces this placeholder asynchronously.

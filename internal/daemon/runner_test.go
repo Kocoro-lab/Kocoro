@@ -1541,6 +1541,49 @@ func TestApplyAgentModelOverlayToLoop_EmptyTierIgnored(t *testing.T) {
 	}
 }
 
+func TestApplyKoeResponseLanguage(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetResponseLanguage("中文")
+	applyKoeResponseLanguage(loop, "koe", "Calculate 47 times 89.")
+	if got := loop.ResponseLanguage(); got != "English" {
+		t.Fatalf("English koe response language = %q, want English", got)
+	}
+
+	loop.SetResponseLanguage("English")
+	applyKoeResponseLanguage(loop, "koe", "帮我查一下邮箱。")
+	if got := loop.ResponseLanguage(); got != "中文" {
+		t.Fatalf("Chinese koe response language = %q, want 中文", got)
+	}
+
+	loop.SetResponseLanguage("中文")
+	applyKoeResponseLanguage(loop, "desktop", "Calculate 47 times 89.")
+	if got := loop.ResponseLanguage(); got != "中文" {
+		t.Fatalf("desktop response language = %q, want configured language", got)
+	}
+
+	// Mixed language: a Chinese request with English loanwords must stay Chinese
+	// even though Latin characters outnumber the Han ones.
+	loop.SetResponseLanguage("English")
+	applyKoeResponseLanguage(loop, "koe", "帮我 review 这个 PR")
+	if got := loop.ResponseLanguage(); got != "中文" {
+		t.Fatalf("mixed zh+latin koe response language = %q, want 中文", got)
+	}
+
+	// Pure English is unchanged.
+	loop.SetResponseLanguage("中文")
+	applyKoeResponseLanguage(loop, "koe", "Please refactor the parser.")
+	if got := loop.ResponseLanguage(); got != "English" {
+		t.Fatalf("pure English koe response language = %q, want English", got)
+	}
+
+	// Mixed Japanese (kana + Latin loanword) classifies as Japanese, not English.
+	loop.SetResponseLanguage("English")
+	applyKoeResponseLanguage(loop, "koe", "この PR を review してください")
+	if got := loop.ResponseLanguage(); got != "日本語" {
+		t.Fatalf("mixed ja+latin koe response language = %q, want 日本語", got)
+	}
+}
+
 // --- Task 4: history snapshot honours OmitHistory --------------------------
 
 func TestHistorySnapshot_OmitHistoryReturnsEmpty(t *testing.T) {

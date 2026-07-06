@@ -28,8 +28,8 @@ Global settings control how Shannon behaves across all agents — which AI model
 ### Get config status
 - Method: GET
 - Path: /config/status
-- Response: `{"mcp_servers": {"slack": "connected"|"enabled"|"disabled"}}`
-- Notes: Shows live connection status for MCP servers and provider health.
+- Response: `{"mcp_servers": {"slack": "connected"|"enabled"|"disabled"}, "koe": {"enabled": bool, "model": "...", "voice": "...", "agent": "...", "language": "..."}}`
+- Notes: Shows live connection status for MCP servers and provider health. The `koe` block reflects the voice front brain's settings (managed by Kocoro Desktop's settings panel; credential-free — Koe mints via the daemon, no key here).
 
 ### Get daemon status
 - Method: GET
@@ -59,7 +59,11 @@ Global settings control how Shannon behaves across all agents — which AI model
 | `agent.time_based_compact.enabled` | Master switch for time-gated tool_result clearing (default: false) | No |
 | `agent.time_based_compact.gap_threshold_minutes` | Fire when (now − last assistant response) exceeds this; matches the Anthropic 1h cache TTL ceiling so no extra cache miss is forced (default: 60) | No |
 | `agent.time_based_compact.keep_recent` | Most-recent compactable tool_results to retain verbatim; older ones are replaced with a placeholder marker (default: 5, floor: 1) | No |
+| `agent.observation_window` | Keep the N most recent browser/GUI tool observations (navigate/snapshot/etc.) at full fidelity; older ones are replaced with a one-line stub, bounding the accumulated page/DOM history a long browser loop re-sends each iteration. 0 disables the window. Default: 3. | No |
+| `agent.max_recent_images` | Keep the N most recent image-bearing messages; older screenshots become a `[previous screenshot removed to save context]` placeholder. Applies to all images (browser screenshots, uploads). Default: 50. 0 disables (keep all); negative is rejected at config load. | No |
+| `agent.max_recent_browser_images` | Keep only the N most recent browser/GUI screenshots (scoped by tool); user uploads and non-GUI tool images stay under `agent.max_recent_images`. Default: 1. 0 disables the browser-scoped filter; negative is rejected at config load. | No |
 | `tools.bash_timeout` | Max seconds a bash command can run (default: 120) | No |
+| `tools.browser_result_truncation` | Per-observation capture cap (chars) for browser/GUI page/DOM dumps — tighter than `tools.result_truncation` because page dumps are large and front-loaded; truncation adds a self-describing marker. 0 = fall back to `result_truncation`. Default: 24000. | No |
 | `daemon.auto_approve` | Skip approval prompts for all tool calls | No |
 | `permissions.allowed_commands` | Bash command-string allowlist (literal/glob + token-prefix family). See `permissions.md`. | No |
 | `permissions.denied_commands` | Bash blocklist | YES |

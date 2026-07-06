@@ -148,6 +148,83 @@ func TestToolSearchTool_KeywordSearch(t *testing.T) {
 	}
 }
 
+func TestToolSearchTool_KeywordSearchTokenizesMultiWordQuery(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockMCPTool{name: "search_gmail_messages"})
+	reg.Register(&mockMCPTool{name: "get_gmail_messages_content_batch"})
+	reg.Register(&mockMCPTool{name: "calendar_list_events"})
+	ts := newToolSearchTool(reg, map[string]bool{
+		"search_gmail_messages":            true,
+		"get_gmail_messages_content_batch": true,
+		"calendar_list_events":             true,
+	})
+
+	result, err := ts.Run(context.Background(), `{"query":"email mail inbox"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if !strings.Contains(header, "search_gmail_messages") {
+		t.Fatalf("multi-word query should match Gmail tools by token; got header: %s", header)
+	}
+	if strings.Contains(header, "calendar_list_events") {
+		t.Fatalf("multi-word Gmail query should not match unrelated calendar tool; got header: %s", header)
+	}
+}
+
+// mockDescTool is an MCP-classified tool with a caller-supplied description, so
+// keyword-match tests can exercise matching against non-default (e.g. CJK) text.
+type mockDescTool struct {
+	name string
+	desc string
+}
+
+func (m *mockDescTool) Info() ToolInfo {
+	return ToolInfo{Name: m.name, Description: m.desc, Parameters: map[string]any{"type": "object", "properties": map[string]any{}}}
+}
+func (m *mockDescTool) Run(context.Context, string) (ToolResult, error) { return ToolResult{}, nil }
+func (m *mockDescTool) RequiresApproval() bool                          { return false }
+func (m *mockDescTool) ToolSource() ToolSource                          { return SourceMCP }
+func (m *mockDescTool) IsReadOnlyCall(string) bool                      { return false }
+
+func TestToolSearchTool_KeywordSearchCJKFallback(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockDescTool{name: "send_gmail", desc: "发送邮件到指定地址"})
+	reg.Register(&mockDescTool{name: "calendar_list", desc: "list calendar events"})
+	ts := newToolSearchTool(reg, map[string]bool{"send_gmail": true, "calendar_list": true})
+
+	result, err := ts.Run(context.Background(), `{"query":"邮件"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if !strings.Contains(header, "send_gmail") {
+		t.Fatalf("CJK query 邮件 should match tool with Chinese description; got header: %s", header)
+	}
+	if strings.Contains(header, "calendar_list") {
+		t.Fatalf("CJK query should not match unrelated tool; got header: %s", header)
+	}
+}
+
+func TestToolSearchTool_KeywordSearchShortToken(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockDescTool{name: "query_db", desc: "run a db query"})
+	reg.Register(&mockDescTool{name: "http_get", desc: "make an http request"})
+	ts := newToolSearchTool(reg, map[string]bool{"query_db": true, "http_get": true})
+
+	result, err := ts.Run(context.Background(), `{"query":"db"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if !strings.Contains(header, "query_db") {
+		t.Fatalf("short token 'db' should match query_db; got header: %s", header)
+	}
+	if strings.Contains(header, "http_get") {
+		t.Fatalf("'db' should not match http_get; got header: %s", header)
+	}
+}
+
 func TestToolSearchTool_NoMatches(t *testing.T) {
 	ts := newTestToolSearchAgent()
 	result, err := ts.Run(context.Background(), `{"query":"nonexistent_xyz"}`)
@@ -361,7 +438,7 @@ func TestModelSupportsToolRef(t *testing.T) {
 		{"claude-sonnet-4-20250514", true},
 		{"claude-opus-4-6", true},
 		{"claude-opus-4-5", true},
-		{"claude-haiku-4-5-20251001", false}, // Haiku excluded per Anthropic docs
+		{"claude-haiku-4-5-20251001", false},  // Haiku excluded per Anthropic docs
 		{"claude-3-5-sonnet-20241022", false}, // Pre-4 excluded
 		{"gpt-4o", false},
 		{"llama3", false},

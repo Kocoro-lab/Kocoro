@@ -291,6 +291,12 @@ type SessionSummary struct {
 	Pinned bool `json:"pinned,omitempty"`
 	// Favorite mirrors Session.Favorite: starred for filter views.
 	Favorite bool `json:"favorite,omitempty"`
+	// Agent identifies the agent scope this session belongs to: empty string
+	// for the default agent, otherwise the agent slug. Populated at HTTP-list
+	// time by the daemon (Store.List has no view of which scope it serves) so
+	// cross-agent views (GET /sessions?scope=all) can attribute each session.
+	// Always emitted (even when empty) so clients can rely on its presence.
+	Agent string `json:"agent"`
 }
 
 type Store struct {

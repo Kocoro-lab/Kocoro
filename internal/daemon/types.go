@@ -101,6 +101,11 @@ const (
 	ChannelTelegram = "telegram"
 	ChannelSchedule = "schedule"
 	ChannelSystem   = "system"
+	// ChannelKoe is the voice front-brain (Koe). daemon-LOCAL transport (NOT in
+	// cloudSourceSet) but messaging-platform ROUTING (in IsMessagingPlatform):
+	// thread keyed by a per-call burst-id. Carrier-neutral — future carriers
+	// append a suffix ("koe-reachy") and are matched by isKoeSource, not by ==.
+	ChannelKoe = "koe"
 )
 
 // Reply format types
@@ -152,6 +157,25 @@ type MessagePayload struct {
 	// so Cloud can call platform reaction/status APIs. Empty for non-IM sources
 	// (TUI, CLI, scheduled, webhook, etc.).
 	IMStatusContext json.RawMessage `json:"im_status_context,omitempty"`
+
+	// ThreadHistory is a Cloud-provided snapshot of the conversation thread this
+	// message belongs to (e.g. a Slack thread with several participants / bots).
+	// When present, cmd/daemon.go loads it as the run's SessionHistory so the
+	// agent sees the FULL thread context, not just messages addressed to it —
+	// and because it OVERWRITES the session each turn (not appends), there is no
+	// duplication across turns. Empty for every existing flow (macOS shared
+	// Slack, Feishu, etc.), which therefore keep their per-session accumulation
+	// behavior unchanged.
+	ThreadHistory []ThreadHistoryMessage `json:"thread_history,omitempty"`
+}
+
+// ThreadHistoryMessage is one prior message in a Cloud-provided thread snapshot.
+// Role is "user" or "assistant" (from the bound bot's perspective — its own
+// posts are "assistant", everyone else's are "user"). Consecutive same-role
+// messages are pre-merged by Cloud so the sequence alternates.
+type ThreadHistoryMessage struct {
+	Role string `json:"role"`
+	Text string `json:"text"`
 }
 
 // RemoteFile describes a file attachment forwarded by Cloud from a messaging platform.

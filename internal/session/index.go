@@ -84,6 +84,11 @@ type SearchResult struct {
 	Snippet      string    `json:"snippet"`
 	MsgIndex     int       `json:"msg_index"`
 	CreatedAt    time.Time `json:"created_at"`
+	// Agent identifies the agent scope this result belongs to: empty string
+	// for the default agent, otherwise the agent slug. Populated at HTTP-search
+	// time by the daemon so cross-agent search (GET /sessions/search?scope=all)
+	// can attribute each hit. Always emitted so clients can rely on its presence.
+	Agent string `json:"agent"`
 }
 
 type Index struct {

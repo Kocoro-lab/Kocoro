@@ -579,6 +579,126 @@ func TestConfig_IdleHardTimeoutYamlOverridesDefault(t *testing.T) {
 	}
 }
 
+// TestConfig_BrowserTrimmingDefaults pins the browser/GUI context-trimming
+// defaults so they stay ON. An absent key must resolve to the default
+// (backward-compat: old config files with none of these keys keep parsing and
+// pick up the trimming for free).
+func TestConfig_BrowserTrimmingDefaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".shannon"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Agent.ObservationWindow != 3 {
+		t.Errorf("ObservationWindow default = %d, want 3", cfg.Agent.ObservationWindow)
+	}
+	if cfg.Agent.MaxRecentImages != 50 {
+		t.Errorf("MaxRecentImages default = %d, want 50", cfg.Agent.MaxRecentImages)
+	}
+	if cfg.Agent.MaxRecentBrowserImages != 1 {
+		t.Errorf("MaxRecentBrowserImages default = %d, want 1", cfg.Agent.MaxRecentBrowserImages)
+	}
+	if cfg.Tools.BrowserResultTruncation != 24000 {
+		t.Errorf("BrowserResultTruncation default = %d, want 24000", cfg.Tools.BrowserResultTruncation)
+	}
+}
+
+// TestConfig_BrowserTrimmingNegativeRejected pins the validateConfig rejection
+// of negative values for the new knobs (0 stays valid as the disabled/fallback
+// sentinel), matching the idle-timeout sibling precedent.
+func TestConfig_BrowserTrimmingNegativeRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"observation_window", "agent:\n  observation_window: -1\n", "agent.observation_window"},
+		{"max_recent_images", "agent:\n  max_recent_images: -1\n", "agent.max_recent_images"},
+		{"max_recent_browser_images", "agent:\n  max_recent_browser_images: -1\n", "agent.max_recent_browser_images"},
+		{"browser_result_truncation", "tools:\n  browser_result_truncation: -1\n", "tools.browser_result_truncation"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			shannonDir := filepath.Join(home, ".shannon")
+			if err := os.MkdirAll(shannonDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(tc.yaml), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("negative %s accepted, want validation error", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not mention %q", err.Error(), tc.want)
+			}
+		})
+	}
+
+	// 0 must be accepted (disabled/fallback sentinel), not rejected.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shannonDir := filepath.Join(home, ".shannon")
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	yaml := "agent:\n  observation_window: 0\n  max_recent_images: 0\n  max_recent_browser_images: 0\ntools:\n  browser_result_truncation: 0\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err != nil {
+		t.Fatalf("zero values rejected, want accepted (disabled sentinel): %v", err)
+	}
+}
+
+// TestConfig_BrowserTrimmingYamlOverrides verifies yaml-supplied values beat
+// the defaults, including 0 (window disabled / cap falls back to generic).
+func TestConfig_BrowserTrimmingYamlOverrides(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shannonDir := filepath.Join(home, ".shannon")
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	yaml := "agent:\n  observation_window: 5\n  max_recent_images: 2\n  max_recent_browser_images: 3\ntools:\n  browser_result_truncation: 0\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Agent.ObservationWindow != 5 {
+		t.Errorf("ObservationWindow = %d, want 5 (yaml override)", cfg.Agent.ObservationWindow)
+	}
+	if cfg.Agent.MaxRecentImages != 2 {
+		t.Errorf("MaxRecentImages = %d, want 2 (yaml override)", cfg.Agent.MaxRecentImages)
+	}
+	if cfg.Agent.MaxRecentBrowserImages != 3 {
+		t.Errorf("MaxRecentBrowserImages = %d, want 3 (yaml override)", cfg.Agent.MaxRecentBrowserImages)
+	}
+	if cfg.Tools.BrowserResultTruncation != 0 {
+		t.Errorf("BrowserResultTruncation = %d, want 0 (yaml override)", cfg.Tools.BrowserResultTruncation)
+	}
+	// Provenance: values set in the GLOBAL config file must report source
+	// "global", not "default" (markGlobalSources must mark the new keys).
+	for _, key := range []string{
+		"agent.observation_window", "agent.max_recent_images",
+		"agent.max_recent_browser_images", "tools.browser_result_truncation",
+	} {
+		if src := cfg.Sources[key]; src.Level != "global" {
+			t.Errorf("Sources[%q].Level = %q, want \"global\"", key, src.Level)
+		}
+	}
+}
+
 // TestConfig_StreamIdleTimeoutNegativeRejected ensures the validator catches
 // nonsensical values so a typo can't silently disable the watchdog or wrap
 // into a positive duration via int conversion.

@@ -1,0 +1,24 @@
+{
+  "sessions": [
+    {
+      "id": "2026-07-05-aaaaaaaaaaaa",
+      "title": "agent chat",
+      "created_at": "2026-07-05T10:00:01Z",
+      "updated_at": "2026-07-05T10:00:01Z",
+      "msg_count": 1,
+      "kind": "interactive",
+      "agent": "agent-abc123"
+    },
+    {
+      "id": "2026-07-05-bbbbbbbbbbbb",
+      "title": "default chat",
+      "created_at": "2026-07-05T10:00:00Z",
+      "updated_at": "2026-07-05T10:00:00Z",
+      "msg_count": 1,
+      "kind": "interactive",
+      "agent": ""
+    }
+  ],
+  "total": 2,
+  "has_more": false
+}
