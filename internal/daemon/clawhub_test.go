@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -432,5 +433,50 @@ func TestHandleClawHubInstallAmbiguousSlug(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(s.deps.ShannonDir, "skills", "ambi", "SKILL.md")); err != nil {
 		t.Errorf("installed file missing: %v", err)
+	}
+}
+
+// newTestServerWithUnresolvableClawHub wires a fake ClawHub where a shared slug
+// cannot be auto-resolved: search returns no owner-bearing match, and the
+// download endpoint 409s on the resulting bare slug. This is the case the
+// install handler must surface as an actionable 409, NOT a 502 upstream failure.
+func newTestServerWithUnresolvableClawHub(t *testing.T) *Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	// Search carries no exact-slug owner match → resolveAmbiguousOwner yields "".
+	mux.HandleFunc("/api/v1/search", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"results": []map[string]interface{}{}})
+	})
+	// Download 409s on the bare (owner-less) slug and never resolves.
+	mux.HandleFunc("/api/v1/download", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "ambiguous", http.StatusConflict)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &Server{
+		deps:      &ServerDeps{ShannonDir: t.TempDir(), AgentsDir: t.TempDir()},
+		clawhub:   skills.NewClawHubMarketplaceClient(srv.URL, 1*time.Hour),
+		slugLocks: skills.NewSlugLocks(),
+	}
+}
+
+// TestHandleClawHubInstallUnresolvableAmbiguousReturns409 is the regression for
+// the doc-vs-behavior gap: when a shared slug can't be auto-resolved, install
+// must return an actionable 409 ("retry with ?owner=") — the same shape as
+// detail/files/file — rather than the misleading 502 the raw upstream-failure
+// path would produce.
+func TestHandleClawHubInstallUnresolvableAmbiguousReturns409(t *testing.T) {
+	s := newTestServerWithUnresolvableClawHub(t)
+
+	req := httptest.NewRequest("POST", "/skills/clawhub/install/ambi", nil)
+	req.SetPathValue("slug", "ambi")
+	rr := httptest.NewRecorder()
+	s.handleClawHubInstall(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (actionable, not 502); body = %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "multiple owners") {
+		t.Errorf("body = %s, want actionable 'multiple owners; retry with ?owner=' message", rr.Body.String())
 	}
 }

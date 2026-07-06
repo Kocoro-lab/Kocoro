@@ -51,7 +51,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 
 **Caching:** ClawHub read responses (browse/search/detail/files/file) are cached for a short TTL (`skills.marketplace.clawhub_cache_ttl_secs`, default 60s) keyed by full URL, so repeated/burst browsing within the window doesn't re-hit clawhub.ai. On an upstream failure a still-cached body is served as stale (with a cooldown), the same way the static registry serves stale on error. A newly published or edited skill can therefore take up to the TTL to appear; set the TTL to 0 to disable caching.
 
-**Ambiguous slugs:** ClawHub slugs are not unique across publishers (e.g. two `data-analysis` from different authors). The detail/files/file/install endpoints accept an optional `?owner=<handle>` query param (the entry's `author`) to disambiguate; without it ClawHub returns 409 for a shared slug, surfaced as 503 (detail/files/file) or 502 (install). Search results carry the `author`; browse-list items do not.
+**Ambiguous slugs:** ClawHub slugs are not unique across publishers (e.g. two `data-analysis` from different authors). The detail/files/file/install endpoints accept an optional `?owner=<handle>` query param (the entry's `author`) to pin a specific publisher. **Without `?owner=`, the daemon now auto-resolves a shared slug** to the publisher with the most downloads (deterministic; ties broken by the lexicographically-smallest handle) and, on install, audit-logs the auto-selected owner. Only when it genuinely cannot resolve (search returns no exact-slug match carrying an owner) does it return **409 `skill "…" is published by multiple owners; retry with ?owner=<handle>`** — an actionable client error, no longer a misleading 503/502. Pass `?owner=` explicitly when you already know which publisher you want (search results carry the `author`; browse-list items do not). The auto-pick is a popularity heuristic, so prefer an explicit `?owner=` for a security-sensitive install.
 
 ### Browse ClawHub
 - Method: GET
@@ -86,7 +86,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 - Path: /skills/clawhub/install/{slug}
 - Query: `?owner=<handle>` (optional; disambiguates a slug shared by multiple publishers)
 - Response: `{"slug": "...", "name": "...", "description": "...", "install_source": "marketplace"}`
-- Notes: Downloads the deterministic zip artifact for the slug and installs it. Same response/error matrix as POST /skills/marketplace/install/{slug} (409 already installed, 403 malicious, 422 invalid payload, 502 upstream).
+- Notes: Downloads the deterministic zip artifact for the slug and installs it. Same response/error matrix as POST /skills/marketplace/install/{slug} (409 already installed, 403 malicious, 422 invalid payload, 502 upstream). An ambiguous shared slug passed without `?owner=` is auto-resolved to the most-downloaded publisher (audit-logged) rather than failing — see **Ambiguous slugs** above.
 
 ### Install a bundled skill
 - Method: POST

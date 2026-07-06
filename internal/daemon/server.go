@@ -4604,6 +4604,14 @@ func (s *Server) handleClawHubInstall(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, skills.ErrInvalidSkillPayload):
 		s.auditHTTPOpError("POST", endpoint, "invalid payload", err)
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
+	case owner == "" && errors.Is(err, skills.ErrMarketplaceUpstreamFailure) && strings.Contains(err.Error(), "status 409"):
+		// Unresolved shared slug: owner resolution found no match, so the
+		// bare-slug download 409'd (AMBIGUOUS_SKILL_SLUG). Surface the same
+		// actionable 409 as detail/files/file instead of a misleading 502
+		// upstream failure — reuses the "status 409" convention the read
+		// handlers and isAmbiguousSlugErr already grep on.
+		s.auditHTTPOpError("POST", endpoint, "ambiguous slug unresolved", err)
+		writeError(w, http.StatusConflict, fmt.Sprintf("skill %q is published by multiple owners; retry with ?owner=<handle>", slug))
 	case errors.Is(err, skills.ErrMarketplaceUpstreamFailure):
 		s.auditHTTPOpError("POST", endpoint, "upstream failure", err)
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("install failed: %v", err))
