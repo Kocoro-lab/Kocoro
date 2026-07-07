@@ -86,6 +86,8 @@ func applyBargeInEnv(bargeIn bool) {
 	}
 	os.Setenv("KOE_VPIO_BARGE_IN", "1")
 	os.Setenv("KOE_INTERRUPT_RESPONSE", "1")
+	log.Printf("koe[barge]: --barge-in on — KOE_VPIO_BARGE_IN=%s KOE_INTERRUPT_RESPONSE=%s",
+		os.Getenv("KOE_VPIO_BARGE_IN"), os.Getenv("KOE_INTERRUPT_RESPONSE"))
 }
 
 var koeCmd = &cobra.Command{

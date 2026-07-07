@@ -254,6 +254,21 @@ func (h *eventHandler) interruptOutput() {
 	h.emitVoiceState(h.voiceStateAfterSpeaking())
 }
 
+// bargeInStopPlayback silences Kocoro's buffered playback the instant the server VAD
+// reports the user talking over (input_audio_buffer.speech_started) while barge-in is
+// on. Local-only, and deliberately narrower than interruptOutput: it does NOT send
+// input_audio_buffer.clear (the server is mid-capture of the user's barge-in
+// utterance — clearing it would throw the interruption away) and does NOT send
+// response.cancel (interrupt_response=true already cancels server-side). SetPlaybackEnabled(false)
+// drains the local play buffer; the epoch bump matches the other gate-set sites so a
+// pending release tail can't re-enable playback under us.
+func (h *eventHandler) bargeInStopPlayback() {
+	h.speakingEpoch.Add(1)
+	if h.audio != nil {
+		h.audio.SetPlaybackEnabled(false)
+	}
+}
+
 func (h *eventHandler) observeLocalSpeechStarted() {
 	seq := h.localSpeechSeq.Add(1)
 	h.localStartCommitSeq.Store(h.inputCommitSeq.Load())
@@ -587,14 +602,29 @@ func outcomeKindLog(kind OutcomeKind) string {
 // barge-in experiments. Far-field noise reduction is enabled by default for the
 // laptop speaker/mic case; set KOE_NOISE_REDUCTION=off to compare raw input.
 func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
-	vadThreshold := koeEnvFloat("KOE_VAD_THRESHOLD", 0.50)
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", 900)
 	interruptResponse := false
 	if fullDuplexAEC {
 		interruptResponse = koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
 	}
+	// Barge-in (interruptResponse) forwards the mic continuously during playback and
+	// leans on the server VAD to detect talk-over. Default to server_vad there — it
+	// reacts to the user speaking over Kocoro more directly than semantic_vad's
+	// "wait for a complete thought" — and raise the detection threshold so residual
+	// speaker echo on the uplink is less likely to self-interrupt (headphones need it
+	// less, speakers more). Barge-in off keeps the low-eagerness semantic_vad. Both
+	// stay env-overridable (KOE_TURN_DETECTION / KOE_VAD_THRESHOLD).
+	defaultTurn := "semantic_vad"
+	defaultThreshold := 0.50
+	if interruptResponse {
+		defaultTurn = "server_vad"
+		defaultThreshold = 0.60
+	}
+	vadThreshold := koeEnvFloat("KOE_VAD_THRESHOLD", defaultThreshold)
+	turnMode := koeEnvString("KOE_TURN_DETECTION", defaultTurn)
+	log.Printf("koe[barge]: sessionConfig fullDuplexAEC=%v interrupt_response=%v turn=%s threshold=%.2f", fullDuplexAEC, interruptResponse, turnMode, vadThreshold)
 	var turnDetection map[string]any
-	if strings.EqualFold(koeEnvString("KOE_TURN_DETECTION", "semantic_vad"), "semantic_vad") {
+	if strings.EqualFold(turnMode, "semantic_vad") {
 		turnDetection = map[string]any{
 			"type":               "semantic_vad",
 			"eagerness":          koeEnvString("KOE_SEMANTIC_VAD_EAGERNESS", "low"),
@@ -662,8 +692,15 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			log.Printf("koe[timing]: speech_started")
 		}
 		// Server-VAD detected the user talking — the reactive "I hear you" moment.
-		// In the default VPIO policy, local capture is still muted while Kocoro
-		// speaks, so self-echo should not reach server VAD.
+		// Barge-in off (default): local capture is muted while Kocoro speaks, so this
+		// fires only between turns. Barge-in on: the mic stays live during playback, so
+		// this is the talk-over signal — stop Kocoro's buffered speech immediately so
+		// the interruption is instant (interrupt_response=true cancels the response
+		// server-side in parallel).
+		if h.respBusy.Load() && koeEnvBool("KOE_VPIO_BARGE_IN", false) {
+			log.Printf("koe[barge]: talk-over detected — stopping playback")
+			h.bargeInStopPlayback()
+		}
 		h.emitVoiceState("listening")
 	case "input_audio_buffer.speech_stopped":
 		h.speechStoppedAt = time.Now()
