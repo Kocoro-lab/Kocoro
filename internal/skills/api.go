@@ -413,6 +413,43 @@ func InstallSkill(shannonDir, name string) error {
 	return installFromRepo(shannonDir, name, destDir)
 }
 
+// ErrPreviewUnavailable is returned by PreviewSkill when a downloadable skill
+// has no locally-available SKILL.md — it is neither installed nor present in the
+// embedded bundle. The four proprietary skills (docx/pdf/pptx/xlsx) ship only as
+// a git-fetched install and have no bundled copy, so there is nothing to preview
+// before installing.
+var ErrPreviewUnavailable = errors.New("no local preview available for skill")
+
+// PreviewSkill returns the raw SKILL.md content for a downloadable skill WITHOUT
+// installing it, so the UI can show a full preview before the user commits. The
+// content is served entirely from the daemon (never the network):
+//   1. Already installed on disk → read the on-disk SKILL.md.
+//   2. Bundled (embedded in the binary) → read from the extracted bundled dir.
+// If neither exists (a proprietary skill not yet installed), returns
+// ErrPreviewUnavailable so the caller can fall back to the short description.
+func PreviewSkill(shannonDir, name string) (string, error) {
+	if err := ValidateSkillName(name); err != nil {
+		return "", err
+	}
+	if !IsDownloadable(name) {
+		return "", fmt.Errorf("skill %q is not available for download", name)
+	}
+
+	// 1. Installed copy on disk (also reflects any local edits).
+	if data, err := os.ReadFile(filepath.Join(shannonDir, "skills", name, "SKILL.md")); err == nil {
+		return string(data), nil
+	}
+
+	// 2. Bundled (embedded) source — offline, no network.
+	if bundledSrc, err := BundledSkillSource(shannonDir); err == nil {
+		if data, err := os.ReadFile(filepath.Join(bundledSrc.Dir, name, "SKILL.md")); err == nil {
+			return string(data), nil
+		}
+	}
+
+	return "", ErrPreviewUnavailable
+}
+
 // installFromBundled copies a skill from the embedded bundled directory to global.
 func installFromBundled(shannonDir, name, destDir string) error {
 	bundledSrc, err := BundledSkillSource(shannonDir)

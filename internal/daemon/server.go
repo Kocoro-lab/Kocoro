@@ -527,6 +527,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /agents/{name}/skills/{skill}", s.handlePutSkill)
 	mux.HandleFunc("DELETE /agents/{name}/skills/{skill}", s.handleDeleteSkill)
 	mux.HandleFunc("GET /skills/downloadable", s.handleListDownloadableSkills)
+	mux.HandleFunc("GET /skills/downloadable/{name}/preview", s.handlePreviewDownloadableSkill)
 	mux.HandleFunc("POST /skills/install/{name}", s.handleInstallSkill)
 	mux.HandleFunc("POST /skills/marketplace/install/{slug}", s.handleMarketplaceInstall)
 	mux.HandleFunc("POST /skills/upload", s.handleUploadSkill)
@@ -4774,6 +4775,31 @@ func (s *Server) handleListDownloadableSkills(w http.ResponseWriter, r *http.Req
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"skills": result})
+}
+
+// handlePreviewDownloadableSkill serves an official skill's SKILL.md so the UI
+// can render a full preview before install. Content comes from the daemon only
+// (installed copy or embedded bundle) — never the network. Skills with no local
+// copy (the proprietary docx/pdf/pptx/xlsx before install) return 404 so the
+// client falls back to the short description.
+func (s *Server) handlePreviewDownloadableSkill(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	endpoint := "/skills/downloadable/" + name + "/preview"
+	if !skills.IsDownloadable(name) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("skill %q is not available for download", name))
+		return
+	}
+	content, err := skills.PreviewSkill(s.deps.ShannonDir, name)
+	if err != nil {
+		if errors.Is(err, skills.ErrPreviewUnavailable) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		s.auditHTTPOpError("GET", endpoint, "preview failed", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"name": name, "content": content})
 }
 
 func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
