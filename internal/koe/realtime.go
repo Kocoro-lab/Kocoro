@@ -78,12 +78,16 @@ type eventHandler struct {
 	localStartResponseSeq atomic.Int64
 	inputCommitSeq        atomic.Int64
 	responseSeq           atomic.Int64
-	// doTaskDispatchSeq counts do_task dispatches over the call. Captured at each
-	// dispatch so a completed result can tell whether ANOTHER do_task was dispatched
-	// while it ran (a follow-up refining the same task → still voice) versus a bare
-	// mid-task user turn with no follow-up (a correction / topic change → the result is
-	// stale, suppress the voicing). See shouldVoiceDoTaskResult.
-	doTaskDispatchSeq atomic.Int64
+	// lastDoTaskCommitSeq is inputCommitSeq snapshotted at the MOST RECENT do_task
+	// dispatch. A completed result compares it against inputCommitSeq at land-time: if
+	// the user committed a turn since the last do_task (and it did not itself become a
+	// do_task, else lastDoTaskCommitSeq would have advanced), they moved on to plain
+	// conversation — the result is stale, suppress the voicing. A follow-up that
+	// refines the task advances this marker, so its combined result still voices.
+	// Comparing against the LAST do_task (not each result's own dispatch) is what makes
+	// "asked for email, it ran 60s, meanwhile I moved on to another topic" suppress
+	// correctly. See shouldVoiceDoTaskResult.
+	lastDoTaskCommitSeq atomic.Int64
 	// Serialized response.create (runResponseSender), adapted from kocoro-reachy's
 	// _response_sender_loop to Go/WebRTC: do_task results and fast-tool outputs still
 	// need a MANUAL response.create, and GA rejects one sent while a response is
@@ -879,20 +883,18 @@ func unwrapArgs(raw json.RawMessage) []byte {
 // it — the sole thing that makes Kocoro open its mouth, since an out-of-band tool
 // result never triggers the server's auto-response.
 //
-// Suppressed when the user took the floor mid-task: a new input turn committed while
-// the task ran (newUserTurn) AND it did not spawn another do_task (followUpDispatched
-// stays false). That is a correction / topic change ("你弄错了") — the result is now
-// stale, and voicing it would barge into a conversation that already moved on. A
-// follow-up that refines the same task DOES dispatch another do_task, so its combined
-// result is still voiced. Injected/empty outcomes never voice (the owning run does).
-func shouldVoiceDoTaskResult(r SayResult, newUserTurn, followUpDispatched bool) bool {
+// Suppressed when the user moved on to plain conversation after the most recent
+// do_task (userSpokeSinceLastDoTask): a correction, a topic change ("你弄错了"), or a
+// verbal question asked while a long task ran — voicing the now-stale result would
+// barge into a conversation that already moved on. A follow-up that refines the task
+// dispatches its own do_task, which advances the last-do_task marker, so it does NOT
+// count as moving on and the combined result still voices. Injected/empty outcomes
+// never voice (the owning run does).
+func shouldVoiceDoTaskResult(r SayResult, userSpokeSinceLastDoTask bool) bool {
 	if r.Status == "injected" || r.Say == "" {
 		return false
 	}
-	if newUserTurn && !followUpDispatched {
-		return false
-	}
-	return true
+	return !userSpokeSinceLastDoTask
 }
 
 // handleFunctionCall composes do_task synchronously (C-minimal) or routes the
@@ -926,13 +928,12 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 		// the back-brain turn in the background and feed the REAL result back as the
 		// single function_call_output for this call_id, then voice it (mirroring
 		// reachy's BackgroundToolManager). ctx is Connect's, cancelled on Ctrl-C.
-		// Mark this dispatch and snapshot the turn counters. A completed result
-		// compares against these at land-time to tell a stale correction from a
-		// live follow-up (shouldVoiceDoTaskResult). Same-goroutine (handleEvent)
-		// increments both counters, so Add-then-Load here is race-free.
-		h.doTaskDispatchSeq.Add(1)
-		startCommit := h.inputCommitSeq.Load()
-		startDispatch := h.doTaskDispatchSeq.Load()
+		// Snapshot the commit count at THIS (now the most recent) do_task dispatch. A
+		// completed result compares the live inputCommitSeq against this at land-time to
+		// tell "user moved on to conversation" from "user is still waiting / a follow-up
+		// refined the task" (shouldVoiceDoTaskResult). handleEvent is single-goroutine,
+		// so this Store races with no other writer.
+		h.lastDoTaskCommitSeq.Store(h.inputCommitSeq.Load())
 		h.state.SetInFlightForAgent(req.Text, req.Agent)
 		h.asyncTaskPending.Store(true)
 		h.emitVoiceState("thinking") // delegating; the model's call-turn ack already played
@@ -962,20 +963,20 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 			b, _ := json.Marshal(r)
 			h.sendFunctionOutput(callID, b) // satisfy the protocol for this call_id
 			// The result is always in the conversation now; only decide whether to VOICE
-			// it. Suppress a result the user has moved past (correction / topic change
-			// mid-task) unless a follow-up do_task refined the same task. Overridable via
-			// KOE_SUPPRESS_STALE_RESULT=0 (rollback to always-voice) if it ever misfires.
-			newUserTurn := h.inputCommitSeq.Load() != startCommit
-			followUp := h.doTaskDispatchSeq.Load() != startDispatch
-			voice := shouldVoiceDoTaskResult(r, newUserTurn, followUp)
-			suppressedAsStale := !voice && newUserTurn && !followUp && r.Status != "injected" && r.Say != ""
+			// it. Suppress when the user has moved on to conversation since the most
+			// recent do_task (correction / topic change / a verbal question during a long
+			// task); a follow-up that refined the task advances lastDoTaskCommitSeq so it
+			// still voices. Overridable via KOE_SUPPRESS_STALE_RESULT=0 (rollback).
+			userSpokeSinceLastDoTask := h.inputCommitSeq.Load() > h.lastDoTaskCommitSeq.Load()
+			voice := shouldVoiceDoTaskResult(r, userSpokeSinceLastDoTask)
+			suppressedAsStale := !voice && userSpokeSinceLastDoTask && r.Status != "injected" && r.Say != ""
 			if suppressedAsStale && !koeEnvBool("KOE_SUPPRESS_STALE_RESULT", true) {
 				voice = true // rollback switch: restore the old always-voice behavior
 				suppressedAsStale = false
 			}
 			if eventLogEnabled() {
-				log.Printf("koe[tool]: output call_id=%q status=%s voice=%t newTurn=%t followUp=%t output=%s",
-					callID, r.Status, voice, newUserTurn, followUp, logMaybeBytes(b, 500))
+				log.Printf("koe[tool]: output call_id=%q status=%s voice=%t userSpokeSince=%t output=%s",
+					callID, r.Status, voice, userSpokeSinceLastDoTask, logMaybeBytes(b, 500))
 			}
 			if voice {
 				h.requestResponseForSpeech(r.Say) // voice the result (skip when the daemon already replied)
