@@ -38,6 +38,7 @@ type koeConfig struct {
 	aec           string // echo control: "" / "gate" = oto half-duplex fallback, "vpio" = Apple VoiceProcessingIO full-duplex AEC
 	micDevice     string // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
 	speakerDevice string // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
+	bargeIn       bool   // --barge-in: allow interrupting Kocoro while it speaks (enables KOE_VPIO_BARGE_IN + KOE_INTERRUPT_RESPONSE; vpio backend only)
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
 	// mic/ears. All empty/zero = normal mic+speaker device.
 	sayText     string // --say: synthesize this text (macOS say) as the mic input
@@ -71,6 +72,22 @@ func resolveDevKey(flagKey, envKey, controlPort string) string {
 	return ""
 }
 
+// applyBargeInEnv turns the two env-gated barge-in behaviors on when the user
+// enabled barge-in in Kocoro Desktop (forwarded as --barge-in). KOE_VPIO_BARGE_IN
+// lets sustained user speech pass the half-duplex capture gate while Kocoro speaks
+// (audio.go); KOE_INTERRUPT_RESPONSE lets Realtime cancel its own response on that
+// speech (realtime.go, honored only on the VPIO backend). Both are no-ops on the
+// gate backend, so setting them when the flag is on is safe. The flag is the
+// Desktop-facing switch; leaving it off preserves the raw KOE_* env vars as a
+// power-user escape hatch.
+func applyBargeInEnv(bargeIn bool) {
+	if !bargeIn {
+		return
+	}
+	os.Setenv("KOE_VPIO_BARGE_IN", "1")
+	os.Setenv("KOE_INTERRUPT_RESPONSE", "1")
+}
+
 var koeCmd = &cobra.Command{
 	Use:   "koe",
 	Short: "Voice front-brain: a realtime voice agent that delegates to the daemon",
@@ -98,6 +115,7 @@ var koeCmd = &cobra.Command{
 		}
 		cfg.micDevice, _ = cmd.Flags().GetString("mic-device")
 		cfg.speakerDevice, _ = cmd.Flags().GetString("speaker-device")
+		cfg.bargeIn, _ = cmd.Flags().GetBool("barge-in")
 		cfg.sayText, _ = cmd.Flags().GetString("say")
 		cfg.audioIn, _ = cmd.Flags().GetString("audio-in")
 		cfg.audioOut, _ = cmd.Flags().GetString("audio-out")
@@ -126,6 +144,7 @@ func init() {
 	koeCmd.Flags().String("aec", "", "echo control: gate (default, oto half-duplex) | vpio (Apple VoiceProcessingIO full-duplex AEC)")
 	koeCmd.Flags().String("mic-device", "", "CoreAudio input device UID (empty = system default; vpio backend only)")
 	koeCmd.Flags().String("speaker-device", "", "CoreAudio output device UID (empty = system default; vpio backend only)")
+	koeCmd.Flags().Bool("barge-in", false, "allow interrupting Kocoro while it speaks (barge-in; enables KOE_VPIO_BARGE_IN + KOE_INTERRUPT_RESPONSE, vpio backend only)")
 	koeCmd.Flags().String("say", "", "debug: synthesize this text as the mic input (macOS say) — headless file mode")
 	koeCmd.Flags().String("audio-in", "", "debug: WAV file to feed as the mic input — headless file mode")
 	koeCmd.Flags().String("audio-out", "", "debug: capture the reply audio to this WAV")
@@ -164,6 +183,9 @@ action, and any calculation beyond one obvious step. Your memory of the world an
 multi-step arithmetic are unreliable; calling the tool IS the answer. Never state a fact,
 number, date, or name that neither came back from a do_task result nor follows in one
 obvious step from this conversation.
+The user's name, how they want to be addressed, and any personal context given in your
+instructions are established facts — use them naturally; that rule only bars inventing
+facts you were never given.
 If the user asks you to show, display, write, or save content in Kocoro Desktop, that is
 real work: use do_task. control_app only opens, hides, or switches app views; it cannot
 put result content in Kocoro Desktop.
@@ -436,6 +458,10 @@ func baseKoePersona(cfg koeConfig) string {
 func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// --barge-in flips the two env-gated barge-in knobs on before any audio/session
+	// code reads them (covers both the Desktop and standalone branches below).
+	applyBargeInEnv(cfg.bargeIn)
 
 	// Plan B wiring: link to the daemon back-brain.
 	client := koe.NewDaemonClient(cfg.daemonURL)

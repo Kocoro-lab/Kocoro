@@ -23,7 +23,10 @@ func TestLoad_KoeSection(t *testing.T) {
 		"  mic_device: BuiltInMicrophoneDevice\n" +
 		"  speaker_device: BuiltInSpeakerDevice\n" +
 		"  agent: finance\n" +
-		"  language: ja\n"
+		"  language: ja\n" +
+		"  barge_in: true\n" +
+		"  persona_source: custom\n" +
+		"  custom_persona: The user is Alice.\n"
 	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(yaml), 0600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -43,6 +46,12 @@ func TestLoad_KoeSection(t *testing.T) {
 	}
 	if cfg.Koe.MicDevice != "BuiltInMicrophoneDevice" || cfg.Koe.SpeakerDevice != "BuiltInSpeakerDevice" {
 		t.Fatalf("koe device fields not parsed: mic=%q speaker=%q", cfg.Koe.MicDevice, cfg.Koe.SpeakerDevice)
+	}
+	if cfg.Koe.BargeIn == nil || !*cfg.Koe.BargeIn {
+		t.Errorf("koe.barge_in = %v, want &true", cfg.Koe.BargeIn)
+	}
+	if cfg.Koe.PersonaSource != "custom" || cfg.Koe.CustomPersona != "The user is Alice." {
+		t.Fatalf("koe persona fields not parsed: source=%q custom=%q", cfg.Koe.PersonaSource, cfg.Koe.CustomPersona)
 	}
 }
 

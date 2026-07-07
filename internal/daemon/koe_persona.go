@@ -27,8 +27,14 @@ no quoting of the rules. If there is nothing useful, reply with exactly: NONE`
 // context, no gateway, or the model finds nothing — Koe then uses its base
 // persona only. Never injects the raw instructions (those carry task rules).
 func (s *Server) buildKoePersona(ctx context.Context) (string, error) {
-	// Global instructions + MEMORY.md are the user-context source. projectDir is
-	// empty: the persona is about the user, not the cwd.
+	// Custom source: the user authored a spoken persona in Kocoro Desktop, so use it
+	// verbatim (already voice-friendly) and skip the distill call entirely. Empty
+	// custom text falls through to "" so Koe uses its base persona only.
+	if s.deps.Config != nil && s.deps.Config.Koe.PersonaSource == "custom" {
+		return strings.TrimSpace(s.deps.Config.Koe.CustomPersona), nil
+	}
+	// Global (default) source: distill the user's instructions + memory. projectDir
+	// is empty: the persona is about the user, not the cwd.
 	instr, _ := instructions.LoadInstructions(s.deps.ShannonDir, "", 8000)
 	mem, _ := instructions.LoadMemory(s.deps.ShannonDir, 200)
 	src := strings.TrimSpace(strings.TrimSpace(instr) + "\n\n" + strings.TrimSpace(mem))

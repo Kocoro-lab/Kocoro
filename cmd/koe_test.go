@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -412,5 +413,47 @@ func TestResolveDevKey(t *testing.T) {
 			t.Errorf("%s: resolveDevKey(%q, %q, %q) = %q, want %q",
 				tt.name, tt.flagKey, tt.envKey, tt.controlPort, got, tt.want)
 		}
+	}
+}
+
+func TestKoeCmdHasBargeInFlag(t *testing.T) {
+	f := koeCmd.Flags().Lookup("barge-in")
+	if f == nil {
+		t.Fatal("koe command missing --barge-in flag")
+	}
+	if f.DefValue != "false" {
+		t.Fatalf("--barge-in default = %q, want false", f.DefValue)
+	}
+}
+
+// TestApplyBargeInEnv locks the flag→env bridge: --barge-in on flips both env-gated
+// knobs to "1"; off leaves them untouched (power-user env escape hatch preserved).
+func TestApplyBargeInEnv(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "")
+
+	applyBargeInEnv(false)
+	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "" {
+		t.Fatalf("barge-in off set KOE_VPIO_BARGE_IN=%q, want unchanged", v)
+	}
+	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "" {
+		t.Fatalf("barge-in off set KOE_INTERRUPT_RESPONSE=%q, want unchanged", v)
+	}
+
+	applyBargeInEnv(true)
+	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
+		t.Fatalf("KOE_VPIO_BARGE_IN=%q, want 1", v)
+	}
+	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "1" {
+		t.Fatalf("KOE_INTERRUPT_RESPONSE=%q, want 1", v)
+	}
+}
+
+// TestKoePersonaAllowsUserNameFromInstructions guards the Q2 fix: the
+// anti-hallucination clause must carry an explicit exemption so the model can speak
+// the persona-injected user name instead of conservatively suppressing it.
+func TestKoePersonaAllowsUserNameFromInstructions(t *testing.T) {
+	if !strings.Contains(koePersona, "established facts") {
+		t.Fatal("koePersona missing the user-name/personal-context exemption to the anti-hallucination rule")
 	}
 }
