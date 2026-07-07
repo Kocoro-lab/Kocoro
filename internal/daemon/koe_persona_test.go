@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
@@ -22,6 +24,28 @@ func TestBuildKoePersonaCustomSource(t *testing.T) {
 	want := "The user is Alice, a product designer who prefers English."
 	if got != want {
 		t.Fatalf("custom persona = %q, want %q (verbatim, trimmed, no distill)", got, want)
+	}
+}
+
+// TestBuildKoePersonaReadsFreshConfigAfterPatch is the regression for the stale-config
+// bug: PATCH /config writes config.yaml but does not refresh s.deps.Config, so
+// buildKoePersona must read the file to see a persona the user just saved from Desktop
+// (otherwise it takes effect only after a daemon reload/restart).
+func TestBuildKoePersonaReadsFreshConfigAfterPatch(t *testing.T) {
+	dir := t.TempDir()
+	yaml := "koe:\n  persona_source: custom\n  custom_persona: \"The user is Kanye.\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(yaml), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	// s.deps.Config is STALE (no persona set) — the post-PATCH, pre-reload state.
+	s := &Server{deps: &ServerDeps{ShannonDir: dir, Config: &config.Config{}}}
+
+	got, err := s.buildKoePersona(context.Background())
+	if err != nil {
+		t.Fatalf("buildKoePersona: %v", err)
+	}
+	if got != "The user is Kanye." {
+		t.Fatalf("persona = %q, want the fresh custom text read from config.yaml", got)
 	}
 }
 
