@@ -424,6 +424,122 @@ func TestInterruptOutputWhenIdleOnlyClearsInput(t *testing.T) {
 	}
 }
 
+func sentContains(types []string, want string) bool {
+	for _, t := range types {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBargeInStopsPlaybackDuringDrainTail pins the drain-tail gap: response.done
+// clears respBusy while local playout keeps draining for many seconds (the long
+// reads users most want to interrupt). A talk-over speech_started in that window
+// must still stop playback, so the barge guard cannot require respBusy.
+func TestBargeInStopsPlaybackDuringDrainTail(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_PLAYBACK_IDLE_HOLD_MS", "5000")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "5000")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	audio.Play(make([]int16, audioFrameSize))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done"}`))
+	if h.respBusy.Load() {
+		t.Fatal("respBusy should be false after response.done (drain tail)")
+	}
+	if !audio.dropCapture() {
+		t.Fatal("Kocoro should still be speaking during the drain tail")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	if audio.dropCapture() {
+		t.Fatal("barge-in during the drain tail must stop playback (guard must not require respBusy)")
+	}
+	if got := len(audio.playBuf); got != 0 {
+		t.Fatalf("barge-in must drain buffered playback, got %d frame(s)", got)
+	}
+}
+
+// TestBargeInSuppressesTrailingAudioDeltas pins that a trailing audio delta from the
+// now-cancelled response cannot re-open the playback the barge-in just stopped, while
+// a genuinely new response still resumes speaking.
+func TestBargeInSuppressesTrailingAudioDeltas(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	if !audio.dropCapture() {
+		t.Fatal("Kocoro should be speaking")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	if audio.dropCapture() {
+		t.Fatal("barge-in must stop speaking")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.output_audio.delta"}`))
+	if audio.dropCapture() {
+		t.Fatal("a trailing delta after barge-in must not re-open the playback the barge just stopped")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created"}`))
+	if !audio.dropCapture() {
+		t.Fatal("a new response after barge-in must resume speaking")
+	}
+}
+
+// TestBargeInTruncatesOutputButKeepsInput pins that the barge stop frees the response
+// slot (so the serialized sender never stalls) and truncates the server output buffer
+// (so unheard audio does not linger in history), but never clears the input buffer —
+// the server is mid-capture of the user's barge-in utterance.
+func TestBargeInTruncatesOutputButKeepsInput(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, audio, cap.send)
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	audio.Play(make([]int16, audioFrameSize))
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+
+	if h.respBusy.Load() {
+		t.Fatal("barge-in must free the response slot so the sender never stalls")
+	}
+	if got := len(audio.playBuf); got != 0 {
+		t.Fatalf("barge-in must drain local playback, got %d frame(s)", got)
+	}
+	sent := cap.types()
+	if sentContains(sent, "input_audio_buffer.clear") {
+		t.Fatalf("barge-in must NOT clear the input buffer (server is capturing the user's speech); sent %v", sent)
+	}
+	if !sentContains(sent, "output_audio_buffer.clear") {
+		t.Fatalf("barge-in must truncate the server output buffer; sent %v", sent)
+	}
+}
+
 func TestHandleEventKeepsThinkingWhileAsyncTaskPending(t *testing.T) {
 	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
 	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "1")

@@ -77,6 +77,28 @@ func TestLoad_KoeSectionAbsent(t *testing.T) {
 	}
 }
 
+// TestLoad_KoeBargeInExplicitFalse confirms barge_in: false survives load as &false,
+// not nil — the *bool contract the field documents (so Desktop's RFC-7386 PATCH can
+// persist barge-in OFF, exactly as Enabled does via TestLoad_KoeExplicitFalse).
+func TestLoad_KoeBargeInExplicitFalse(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shannonDir := filepath.Join(home, ".shannon")
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		t.Fatalf("mkdir shannon dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("koe:\n  barge_in: false\n"), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if cfg.Koe.BargeIn == nil || *cfg.Koe.BargeIn {
+		t.Errorf("koe.barge_in = %v, want explicit &false", cfg.Koe.BargeIn)
+	}
+}
+
 // TestLoad_KoeExplicitFalse confirms an explicit opt-out survives load as
 // &false — distinguishable from the nil "never set" state (the default-ON
 // policy must not resurrect voice for users who turned it off).

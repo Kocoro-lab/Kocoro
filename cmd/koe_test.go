@@ -449,6 +449,26 @@ func TestApplyBargeInEnv(t *testing.T) {
 	}
 }
 
+// TestBargeInBackendWarning: --barge-in only works on the VPIO backend, so enabling
+// it on the gate/oto backend must surface a warning instead of silently no-op'ing.
+func TestBargeInBackendWarning(t *testing.T) {
+	if got := bargeInBackendWarning(true, "vpio"); got != "" {
+		t.Errorf("barge-in on vpio should not warn, got %q", got)
+	}
+	if got := bargeInBackendWarning(false, "gate"); got != "" {
+		t.Errorf("barge-in off should not warn, got %q", got)
+	}
+	if got := bargeInBackendWarning(false, ""); got != "" {
+		t.Errorf("barge-in off should not warn, got %q", got)
+	}
+	if bargeInBackendWarning(true, "gate") == "" {
+		t.Error("barge-in on the gate backend must warn (it is a silent no-op otherwise)")
+	}
+	if bargeInBackendWarning(true, "") == "" {
+		t.Error("barge-in with an empty backend (defaults to gate) must warn")
+	}
+}
+
 // TestKoePersonaAllowsUserNameFromInstructions guards the Q2 fix: the
 // anti-hallucination clause must carry an explicit exemption so the model can speak
 // the persona-injected user name instead of conservatively suppressing it.

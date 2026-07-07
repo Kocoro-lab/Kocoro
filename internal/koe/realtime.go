@@ -61,6 +61,11 @@ type eventHandler struct {
 	// release the echo gate while speaker tail is still audible.
 	outputBufferActive atomic.Bool
 	speakingEpoch      atomic.Int64
+	// barged is set when a barge-in / explicit interrupt supersedes the active
+	// response, and cleared on the next response.created. While set, markSpeaking
+	// ignores the cancelled response's trailing audio deltas so they cannot re-open
+	// the playback the interrupt just stopped.
+	barged atomic.Bool
 	// asyncTaskPending keeps Desktop/--once in "thinking" after the model's short
 	// spoken ack while do_task is still running or its result speech is queued.
 	asyncTaskPending atomic.Bool
@@ -149,6 +154,12 @@ const (
 const missedSpeechInstructions = "The user's last spoken words were lost before they reached you (audio capture problem on this call). In the language of this conversation, briefly tell the user you could not hear what they just said and ask them to say it again. One short sentence. Do not repeat earlier answers and do not guess what they said."
 
 func (h *eventHandler) markSpeaking() {
+	if h.barged.Load() {
+		// A barge-in / interrupt superseded this response; ignore its trailing audio
+		// deltas so they don't re-open the playback we just stopped. The next
+		// response.created clears the flag for the new turn.
+		return
+	}
 	h.speakingEpoch.Add(1)
 	if h.audio != nil {
 		h.audio.SetPlaybackEnabled(true)
@@ -236,20 +247,39 @@ func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 	}()
 }
 
-func (h *eventHandler) interruptOutput() {
+// interruptOutput is the explicit interrupt (Desktop /call/interrupt): it also
+// clears the input buffer, discarding any in-progress user audio.
+func (h *eventHandler) interruptOutput() { h.stopOutput(false) }
+
+// bargeInStopPlayback stops Kocoro's playback the instant the server VAD reports the
+// user talking over (input_audio_buffer.speech_started) while barge-in is on. It
+// keeps the input buffer: the server is mid-capture of the user's barge-in utterance,
+// so clearing it would throw the interruption away.
+func (h *eventHandler) bargeInStopPlayback() { h.stopOutput(true) }
+
+// stopOutput tears down the active response's local playback and its server-side turn
+// state. It frees the response slot (respBusy) itself rather than waiting for a
+// response.done that a cancelled turn may never send, marks `barged` so trailing audio
+// deltas can't re-open playback, and truncates the server output buffer so unheard
+// audio doesn't linger in history. keepInput preserves the input buffer for barge-in
+// (the user is mid-utterance); the explicit interrupt clears it.
+func (h *eventHandler) stopOutput(keepInput bool) {
 	hadResponse := h.respBusy.Load()
 	hadOutput := h.outputBufferActive.Load()
 	if h.audio != nil && h.audio.dropCapture() {
 		hadOutput = true
 	}
 	h.speakingEpoch.Add(1)
+	h.barged.Store(true)
 	h.outputBufferActive.Store(false)
 	h.respBusy.Store(false)
 	if h.audio != nil {
 		h.audio.SetSpeaking(false)
 		h.audio.SetPlaybackEnabled(false)
 	}
-	_ = h.sendFn(map[string]any{"type": "input_audio_buffer.clear"})
+	if !keepInput {
+		_ = h.sendFn(map[string]any{"type": "input_audio_buffer.clear"})
+	}
 	if hadResponse {
 		_ = h.sendFn(map[string]any{"type": "response.cancel"})
 	}
@@ -260,19 +290,15 @@ func (h *eventHandler) interruptOutput() {
 	h.emitVoiceState(h.voiceStateAfterSpeaking())
 }
 
-// bargeInStopPlayback silences Kocoro's buffered playback the instant the server VAD
-// reports the user talking over (input_audio_buffer.speech_started) while barge-in is
-// on. Local-only, and deliberately narrower than interruptOutput: it does NOT send
-// input_audio_buffer.clear (the server is mid-capture of the user's barge-in
-// utterance — clearing it would throw the interruption away) and does NOT send
-// response.cancel (interrupt_response=true already cancels server-side). SetPlaybackEnabled(false)
-// drains the local play buffer; the epoch bump matches the other gate-set sites so a
-// pending release tail can't re-enable playback under us.
-func (h *eventHandler) bargeInStopPlayback() {
-	h.speakingEpoch.Add(1)
-	if h.audio != nil {
-		h.audio.SetPlaybackEnabled(false)
+// isSpeakingOrResponding reports whether Kocoro is currently generating or playing a
+// reply — true from response.created through the local playout drain (which routinely
+// outlives response.done by many seconds). The barge-in stop keys on this, not on
+// respBusy alone, so talk-over during the drain tail still interrupts.
+func (h *eventHandler) isSpeakingOrResponding() bool {
+	if h.respBusy.Load() || h.outputBufferActive.Load() {
+		return true
 	}
+	return h.audio != nil && h.audio.dropCapture()
 }
 
 func (h *eventHandler) observeLocalSpeechStarted() {
@@ -598,15 +624,15 @@ func outcomeKindLog(kind OutcomeKind) string {
 // ["audio"] makes GA emit the call as text instead of a real function call.
 //
 // Turn detection uses Realtime VAD with create_response=true: OpenAI owns turn
-// segmentation and starts the spoken response automatically. Desktop defaults to
-// semantic_vad because it is less eager on ambient/noisy audio while still deciding
-// end-of-turn server-side. Set KOE_TURN_DETECTION=server_vad to compare the lower
-// latency deterministic path.
-// Server-side interruption is disabled by default even with VPIO/AEC: without a
-// reliable intent gate, server-side barge-in is exactly how residual speaker echo
-// turns into self-interruption. Set KOE_INTERRUPT_RESPONSE=1 only for explicit
-// barge-in experiments. Far-field noise reduction is enabled by default for the
-// laptop speaker/mic case; set KOE_NOISE_REDUCTION=off to compare raw input.
+// segmentation and starts the spoken response automatically. The default (barge-in
+// off) is semantic_vad — less eager on ambient/noisy audio and more tolerant of
+// backchannels while still deciding end-of-turn server-side, with server-side
+// interruption OFF (half-duplex, the mic is muted while Kocoro speaks).
+// Barge-in ON inverts both: it defaults to server_vad (reacts to talk-over more
+// directly) with interrupt_response ON and a higher VAD threshold (0.60) to resist
+// residual speaker echo self-interrupting. KOE_TURN_DETECTION / KOE_VAD_THRESHOLD /
+// KOE_INTERRUPT_RESPONSE override either mode. Far-field noise reduction is on by
+// default for the laptop speaker/mic case; set KOE_NOISE_REDUCTION=off for raw input.
 func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", 900)
 	interruptResponse := false
@@ -703,7 +729,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// this is the talk-over signal — stop Kocoro's buffered speech immediately so
 		// the interruption is instant (interrupt_response=true cancels the response
 		// server-side in parallel).
-		if h.respBusy.Load() && koeEnvBool("KOE_VPIO_BARGE_IN", false) {
+		if koeEnvBool("KOE_VPIO_BARGE_IN", false) && h.isSpeakingOrResponding() {
 			log.Printf("koe[barge]: talk-over detected — stopping playback")
 			h.bargeInStopPlayback()
 		}
@@ -729,6 +755,10 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			log.Printf("koe[timing]: response_created after_speech_stop_ms=%d", elapsedMS(h.speechStoppedAt, h.responseCreatedAt))
 		}
 		h.asyncTaskPending.Store(false)
+		// New turn — clear any barge/interrupt suppression so this response's audio
+		// deltas re-open playback normally (markSpeaking is otherwise a no-op while
+		// barged is set).
+		h.barged.Store(false)
 		// A response is now generating — the serialized sender waits for its
 		// response.done before sending the next response.create. Gate capture
 		// immediately, not only once output_audio_buffer.started arrives: otherwise

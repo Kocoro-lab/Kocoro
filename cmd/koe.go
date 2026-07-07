@@ -90,6 +90,17 @@ func applyBargeInEnv(bargeIn bool) {
 		os.Getenv("KOE_VPIO_BARGE_IN"), os.Getenv("KOE_INTERRUPT_RESPONSE"))
 }
 
+// bargeInBackendWarning returns a non-empty warning when barge-in is enabled on a
+// backend that cannot honor it. Barge-in lives entirely on the VPIO capture path
+// (shouldForwardVPIOCapture) and the fullDuplexAEC-gated interrupt_response; the
+// gate/oto fallback never reads either, so --barge-in there is a silent no-op.
+func bargeInBackendWarning(bargeIn bool, aec string) string {
+	if bargeIn && aec != "vpio" {
+		return "barge-in has no effect on the current audio backend — it needs the VPIO backend (--aec vpio); the mic stays half-duplex while Kocoro speaks"
+	}
+	return ""
+}
+
 var koeCmd = &cobra.Command{
 	Use:   "koe",
 	Short: "Voice front-brain: a realtime voice agent that delegates to the daemon",
@@ -464,6 +475,9 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	// --barge-in flips the two env-gated barge-in knobs on before any audio/session
 	// code reads them (covers both the Desktop and standalone branches below).
 	applyBargeInEnv(cfg.bargeIn)
+	if w := bargeInBackendWarning(cfg.bargeIn, cfg.aec); w != "" {
+		log.Printf("koe[barge]: WARNING — %s", w)
+	}
 
 	// Plan B wiring: link to the daemon back-brain.
 	client := koe.NewDaemonClient(cfg.daemonURL)
