@@ -73,6 +73,12 @@ type eventHandler struct {
 	localStartResponseSeq atomic.Int64
 	inputCommitSeq        atomic.Int64
 	responseSeq           atomic.Int64
+	// doTaskDispatchSeq counts do_task dispatches over the call. Captured at each
+	// dispatch so a completed result can tell whether ANOTHER do_task was dispatched
+	// while it ran (a follow-up refining the same task → still voice) versus a bare
+	// mid-task user turn with no follow-up (a correction / topic change → the result is
+	// stale, suppress the voicing). See shouldVoiceDoTaskResult.
+	doTaskDispatchSeq atomic.Int64
 	// Serialized response.create (runResponseSender), adapted from kocoro-reachy's
 	// _response_sender_loop to Go/WebRTC: do_task results and fast-tool outputs still
 	// need a MANUAL response.create, and GA rejects one sent while a response is
@@ -837,6 +843,28 @@ func unwrapArgs(raw json.RawMessage) []byte {
 	return raw // already an object
 }
 
+// shouldVoiceDoTaskResult decides whether a completed do_task result should be
+// spoken aloud. The function_call_output is ALWAYS submitted (protocol + it stays
+// in context / on Kocoro Desktop); this only gates the response.create that voices
+// it — the sole thing that makes Kocoro open its mouth, since an out-of-band tool
+// result never triggers the server's auto-response.
+//
+// Suppressed when the user took the floor mid-task: a new input turn committed while
+// the task ran (newUserTurn) AND it did not spawn another do_task (followUpDispatched
+// stays false). That is a correction / topic change ("你弄错了") — the result is now
+// stale, and voicing it would barge into a conversation that already moved on. A
+// follow-up that refines the same task DOES dispatch another do_task, so its combined
+// result is still voiced. Injected/empty outcomes never voice (the owning run does).
+func shouldVoiceDoTaskResult(r SayResult, newUserTurn, followUpDispatched bool) bool {
+	if r.Status == "injected" || r.Say == "" {
+		return false
+	}
+	if newUserTurn && !followUpDispatched {
+		return false
+	}
+	return true
+}
+
 // handleFunctionCall composes do_task synchronously (C-minimal) or routes the
 // fast tools through Dispatch, then sends the function_call_output back.
 func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name string, args []byte) {
@@ -868,6 +896,13 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 		// the back-brain turn in the background and feed the REAL result back as the
 		// single function_call_output for this call_id, then voice it (mirroring
 		// reachy's BackgroundToolManager). ctx is Connect's, cancelled on Ctrl-C.
+		// Mark this dispatch and snapshot the turn counters. A completed result
+		// compares against these at land-time to tell a stale correction from a
+		// live follow-up (shouldVoiceDoTaskResult). Same-goroutine (handleEvent)
+		// increments both counters, so Add-then-Load here is race-free.
+		h.doTaskDispatchSeq.Add(1)
+		startCommit := h.inputCommitSeq.Load()
+		startDispatch := h.doTaskDispatchSeq.Load()
 		h.state.SetInFlightForAgent(req.Text, req.Agent)
 		h.asyncTaskPending.Store(true)
 		h.emitVoiceState("thinking") // delegating; the model's call-turn ack already played
@@ -896,12 +931,28 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 			}
 			b, _ := json.Marshal(r)
 			h.sendFunctionOutput(callID, b) // satisfy the protocol for this call_id
-			if eventLogEnabled() {
-				log.Printf("koe[tool]: output call_id=%q status=%s voice=%t output=%s", callID, r.Status, r.Status != "injected" && r.Say != "", logMaybeBytes(b, 500))
+			// The result is always in the conversation now; only decide whether to VOICE
+			// it. Suppress a result the user has moved past (correction / topic change
+			// mid-task) unless a follow-up do_task refined the same task. Overridable via
+			// KOE_SUPPRESS_STALE_RESULT=0 (rollback to always-voice) if it ever misfires.
+			newUserTurn := h.inputCommitSeq.Load() != startCommit
+			followUp := h.doTaskDispatchSeq.Load() != startDispatch
+			voice := shouldVoiceDoTaskResult(r, newUserTurn, followUp)
+			suppressedAsStale := !voice && newUserTurn && !followUp && r.Status != "injected" && r.Say != ""
+			if suppressedAsStale && !koeEnvBool("KOE_SUPPRESS_STALE_RESULT", true) {
+				voice = true // rollback switch: restore the old always-voice behavior
+				suppressedAsStale = false
 			}
-			if r.Status != "injected" && r.Say != "" {
+			if eventLogEnabled() {
+				log.Printf("koe[tool]: output call_id=%q status=%s voice=%t newTurn=%t followUp=%t output=%s",
+					callID, r.Status, voice, newUserTurn, followUp, logMaybeBytes(b, 500))
+			}
+			if voice {
 				h.requestResponseForSpeech(r.Say) // voice the result (skip when the daemon already replied)
 			} else {
+				if suppressedAsStale {
+					log.Printf("koe[task]: stale result NOT voiced — user took the floor mid-task, call_id=%q", callID)
+				}
 				h.asyncTaskPending.Store(false)
 				h.maybeRestoreUserMic()
 				h.emitVoiceState("listening")
