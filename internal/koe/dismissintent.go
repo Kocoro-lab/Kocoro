@@ -46,6 +46,15 @@ var baseDismissPhrases = map[string]struct{}{
 	"終わり": {}, "終了": {}, "さようなら": {}, "バイバイ": {}, "終わって": {},
 }
 
+// taskAmbiguousDismissPhrases are words that can mean "stop the current task" while
+// a do_task is in flight. They may still dismiss an idle conversation, but the
+// deterministic backstop must not bypass the cancel tool during work.
+var taskAmbiguousDismissPhrases = map[string]struct{}{
+	"stop": {}, "stop it": {},
+	"停": {}, "停止": {}, "停一下": {}, "停一停": {}, "停下": {}, "停下来": {}, "停下來": {},
+	"止まって": {}, "止まれ": {}, "止めて": {}, "やめて": {}, "やめろ": {}, "もうやめて": {},
+}
+
 // normalizeDismissPhrase strips surrounding whitespace and punctuation (ASCII and CJK,
 // e.g. "." "!" "。" "！" "，") and lowercases. Trimming is end-only, so internal
 // spaces ("shut up") are preserved. ToLower is a no-op for CJK.
@@ -82,4 +91,10 @@ func isDismissPhrase(transcript string) bool {
 		}
 	}
 	return false
+}
+
+func isTaskAmbiguousDismissPhrase(transcript string) bool {
+	norm := normalizeDismissPhrase(transcript)
+	_, ok := taskAmbiguousDismissPhrases[norm]
+	return ok
 }

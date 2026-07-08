@@ -54,12 +54,12 @@ func TestIsDismissPhraseHits(t *testing.T) {
 func TestIsDismissPhraseMisses(t *testing.T) {
 	misses := []string{
 		"",
-		"取消",             // bare cancel = the cancel TOOL's job (stop a task), NOT hang up
-		"继续",             // keep going
-		"别停",             // don't stop
+		"取消", // bare cancel = the cancel TOOL's job (stop a task), NOT hang up
+		"继续", // keep going
+		"别停", // don't stop
 		"don't stop",
-		"帮我查一下天气",       // a real request
-		"解释一下量子纠缠",     // a real request
+		"帮我查一下天气",  // a real request
+		"解释一下量子纠缠", // a real request
 		"stop talking about the weather",
 		"止まらないで",
 	}
@@ -87,5 +87,20 @@ func TestIsDismissPhraseEnvExtra(t *testing.T) {
 	}
 	if isDismissPhrase("继续说") {
 		t.Error("'继续说' must not match")
+	}
+}
+
+func TestTaskAmbiguousDismissPhrase(t *testing.T) {
+	hits := []string{"stop", "Stop.", "停", "停止", "停一下", "やめて"}
+	for _, h := range hits {
+		if !isTaskAmbiguousDismissPhrase(h) {
+			t.Errorf("isTaskAmbiguousDismissPhrase(%q) = false, want true", h)
+		}
+	}
+	misses := []string{"闭嘴", "再见", "bye", "退出", "that's all"}
+	for _, m := range misses {
+		if isTaskAmbiguousDismissPhrase(m) {
+			t.Errorf("isTaskAmbiguousDismissPhrase(%q) = true, want false", m)
+		}
 	}
 }

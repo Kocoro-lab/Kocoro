@@ -44,6 +44,38 @@ func TestEndCallToolTriggersHangupWithoutOutput(t *testing.T) {
 	}
 }
 
+func TestEndCallToolClearsActiveOutputBeforeHangup(t *testing.T) {
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-end-active", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, audio, cap.send)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	called := make(chan struct{}, 1)
+	h.onEndCall = func() { called <- struct{}{} }
+
+	ev, _ := json.Marshal(map[string]any{
+		"type": "response.function_call_arguments.done",
+		"name": "end_call", "call_id": "c1", "arguments": "{}",
+	})
+	h.handleEvent(context.Background(), ev)
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("end_call did not invoke onEndCall")
+	}
+	for _, want := range []string{"input_audio_buffer.clear", "response.cancel", "output_audio_buffer.clear"} {
+		if n := cap.countType(want); n != 1 {
+			t.Errorf("end_call active-output cleanup sent %d %s messages, want 1", n, want)
+		}
+	}
+}
+
 // TestDismissTranscriptHangsUp pins the deterministic backstop: a whole-utterance
 // dismiss phrase in the input transcription hangs up (onEndCall) even when the model
 // never calls the end_call tool — the reliable path for the fixed vocabulary. A
@@ -85,6 +117,26 @@ func TestDismissTranscriptHangsUp(t *testing.T) {
 		case <-hung:
 			t.Fatal("a normal request must not hang up")
 		case <-time.After(300 * time.Millisecond):
+		}
+	})
+	t.Run("ambiguous stop while task running is left to the model", func(t *testing.T) {
+		h, hung := newH()
+		h.state.SetInFlight("running task")
+		feed(h, "停止")
+		select {
+		case <-hung:
+			t.Fatal("ambiguous stop during a task must not deterministic-hangup")
+		case <-time.After(300 * time.Millisecond):
+		}
+	})
+	t.Run("explicit dismiss still hangs up while task running", func(t *testing.T) {
+		h, hung := newH()
+		h.state.SetInFlight("running task")
+		feed(h, "闭嘴")
+		select {
+		case <-hung:
+		case <-time.After(2 * time.Second):
+			t.Fatal("explicit dismiss during a task did not hang up")
 		}
 	})
 }

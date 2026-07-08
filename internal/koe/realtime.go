@@ -873,6 +873,12 @@ func (h *eventHandler) handleInputTranscript(transcript string) {
 	// cannot depend on it. onEndCall (Desktop endCall / standalone cancel) is idempotent,
 	// so a racing tool call is harmless. Runs regardless of KOE_TRANSCRIPT_LOG.
 	if h.onEndCall != nil && isDismissPhrase(transcript) {
+		if h.taskInFlight() && isTaskAmbiguousDismissPhrase(transcript) {
+			if eventLogEnabled() {
+				log.Printf("koe[call]: dismiss phrase %q left to model while task is running", transcript)
+			}
+			return
+		}
 		if eventLogEnabled() {
 			log.Printf("koe[call]: dismiss phrase %q — hanging up", transcript)
 		}
@@ -1021,6 +1027,7 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 			log.Printf("koe[call]: end_call requested call_id=%q", callID)
 		}
 		if h.onEndCall != nil {
+			h.interruptOutput()
 			go h.onEndCall()
 		}
 		return

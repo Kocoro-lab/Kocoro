@@ -728,10 +728,10 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 
 	var dismissOnce sync.Once
 	conn, err := koe.Connect(ctx, audio, ek, persona, state, disp, koe.ConnectOptions{
-		OnVoiceState:  onVoiceState,
-		Model:         cfg.model,
-		Voice:         cfg.voice,
-		OnUsage:       onUsage,
+		OnVoiceState: onVoiceState,
+		Model:        cfg.model,
+		Voice:        cfg.voice,
+		OnUsage:      onUsage,
 		// Standalone/CLI dismiss (end_call tool or a dismiss phrase) = play the goodbye
 		// cue, then exit the process (there is no warm-session teardown to return to).
 		// sync.Once makes it idempotent: the tool and the deterministic phrase can both
@@ -1166,13 +1166,23 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		ctrl.EmitCallState("ended")
 		ensureWarmSessionLocked("post_call")
 		sessMu.Unlock()
-		// Goodbye cue on the live device (Esc / menu Stop / the end_call voice tool all
-		// land here) — closeSessionLocked only detaches; the device stays open until
-		// stopSessionResources below, so the earcon plays before it is torn down.
+		// Stop/clear the old Realtime output before the goodbye cue. The audio device
+		// stays open just long enough to play the cue, then is torn down below.
+		if conn != nil {
+			conn.InterruptOutput()
+		}
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
+			conn.Close()
+		}
 		if audio != nil && koe.DismissEarconEnabled() {
 			audio.PlayDismissEarcon()
 		}
-		stopSessionResources(conn, cancel, audio)
+		if audio != nil {
+			audio.Stop()
+		}
 	}
 
 	interruptCall := func() {
