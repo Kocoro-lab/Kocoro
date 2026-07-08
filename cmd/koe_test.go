@@ -298,6 +298,22 @@ func TestKoePersonaPinsCurrentUtteranceLanguage(t *testing.T) {
 	}
 }
 
+// TestKoePersonaTeachesEndCallOnDismiss keeps the dismiss/hang-up guidance in the
+// system prompt: gpt-realtime-mini does not call end_call without it (live 2026-07-08
+// it verbally acknowledged "闭嘴" instead). It must name end_call, give concrete
+// dismiss words, the double-tap re-activation, and separate it from cancel.
+func TestKoePersonaTeachesEndCallOnDismiss(t *testing.T) {
+	for _, want := range []string{"end_call", "闭嘴", "double-tapping the", "NOT cancel"} {
+		if !strings.Contains(koePersona, want) {
+			t.Errorf("koePersona missing dismiss/end_call guidance %q", want)
+		}
+	}
+	// The old line that made the model verbally "stop" instead of hanging up is gone.
+	if strings.Contains(koePersona, "if they tell you to stop, stop") {
+		t.Error("koePersona still has the verbal-stop line that suppressed end_call")
+	}
+}
+
 func TestKoePersonaSummaryAndDesktopDiscipline(t *testing.T) {
 	// The do_task result carries a context digest: recaps/follow-ups the digest
 	// covers are answered directly (live 2026-07-02: half the delegations in one

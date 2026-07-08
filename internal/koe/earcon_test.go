@@ -32,6 +32,42 @@ func TestReadyEarconFramesDecode(t *testing.T) {
 	t.Logf("decoded %d frames (%dms), peak=%d", len(frames), len(frames)*audioFrameMs, peak)
 }
 
+// TestDismissEarconFramesDecode checks the embedded goodbye cue decodes into whole,
+// non-silent audioFrameSize frames.
+func TestDismissEarconFramesDecode(t *testing.T) {
+	frames := decodeEarconFrames(dismissEarconPCM)
+	if len(frames) == 0 {
+		t.Fatal("no frames decoded from embedded assets/dismiss.pcm")
+	}
+	var peak int16
+	for i, f := range frames {
+		if len(f) != audioFrameSize {
+			t.Fatalf("frame %d has %d samples, want %d", i, len(f), audioFrameSize)
+		}
+		for _, s := range f {
+			if s > peak {
+				peak = s
+			}
+		}
+	}
+	if peak == 0 {
+		t.Fatal("embedded dismiss earcon decoded to silence")
+	}
+	t.Logf("decoded %d frames (%dms), peak=%d", len(frames), len(frames)*audioFrameMs, peak)
+}
+
+// TestDismissEarconEnabledEnv pins the kill-switch: default on, KOE_DISMISS_EARCON toggles.
+func TestDismissEarconEnabledEnv(t *testing.T) {
+	t.Setenv("KOE_DISMISS_EARCON", "")
+	if !DismissEarconEnabled() {
+		t.Error("default should be enabled")
+	}
+	t.Setenv("KOE_DISMISS_EARCON", "0")
+	if DismissEarconEnabled() {
+		t.Error("KOE_DISMISS_EARCON=0 should disable")
+	}
+}
+
 // TestReadyEarconEnabledEnv pins the kill-switch semantics: default on, and the
 // KOE_READY_EARCON env var toggles it.
 func TestReadyEarconEnabledEnv(t *testing.T) {

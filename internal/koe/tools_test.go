@@ -21,13 +21,34 @@ func TestToolDefsShape(t *testing.T) {
 			t.Errorf("tool %q type = %q, want function", d.Name, d.Type)
 		}
 	}
-	for _, want := range []string{"do_task", "cancel", "get_status", "control_app", "switch_agent"} {
+	for _, want := range []string{"do_task", "cancel", "get_status", "control_app", "switch_agent", "end_call"} {
 		if !names[want] {
 			t.Errorf("missing tool %q", want)
 		}
 	}
-	if len(defs) != 5 {
-		t.Errorf("got %d tools, want exactly 5", len(defs))
+	if len(defs) != 6 {
+		t.Errorf("got %d tools, want exactly 6", len(defs))
+	}
+}
+
+// TestEndCallDescriptionSignalsDismissIntent keeps end_call scoped to a real
+// conversation-ending dismiss (not a topic change or a single-task cancel), tells
+// the model to judge from audio (the input transcription garbles short phrases),
+// and to stay silent. It also pins the re-activation contract (double-tap Option).
+func TestEndCallDescriptionSignalsDismissIntent(t *testing.T) {
+	var desc string
+	for _, d := range ToolDefs() {
+		if d.Name == "end_call" {
+			desc = d.Description
+		}
+	}
+	if desc == "" {
+		t.Fatal("end_call tool missing")
+	}
+	for _, want := range []string{"闭嘴", "goodbye", "double-tap the Option", "Say NOTHING", "cancel", "unsure"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("end_call description missing %q", want)
+		}
 	}
 }
 

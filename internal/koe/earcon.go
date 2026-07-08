@@ -18,6 +18,14 @@ import (
 //go:embed assets/ready.pcm
 var readyEarconPCM []byte
 
+// dismiss.pcm is the "goodbye" earcon played once when a call ends (Esc / menu Stop
+// / the end_call voice tool) — a short soft descending cue signalling the call is
+// over and Kocoro is going dormant (re-activate with a double-tap Option). Same
+// format as ready.pcm: 48kHz mono 16-bit LE PCM, frame-aligned to audioFrameSize.
+//
+//go:embed assets/dismiss.pcm
+var dismissEarconPCM []byte
+
 const (
 	// earconDrainIdleHoldMS is how long the earcon output level must read silent —
 	// PAST the nominal-playout floor — before PlayReadyEarcon treats the cue as
@@ -41,11 +49,15 @@ const (
 // OVERRIDE: this env var (there is no config surface — it's a personal cue).
 func ReadyEarconEnabled() bool { return koeEnvBool("KOE_READY_EARCON", true) }
 
-// readyEarconFrames decodes the embedded PCM into audioFrameSize int16 frames.
-// Each frame is a freshly allocated slice because Play() takes ownership of the
-// slice it is handed without copying.
-func readyEarconFrames() [][]int16 {
-	n := len(readyEarconPCM) / 2
+// DismissEarconEnabled reports whether the goodbye earcon should play on call end.
+// Default on; KOE_DISMISS_EARCON=0 disables it for users who want a silent hangup.
+func DismissEarconEnabled() bool { return koeEnvBool("KOE_DISMISS_EARCON", true) }
+
+// decodeEarconFrames decodes embedded PCM into audioFrameSize int16 frames. Each
+// frame is a freshly allocated slice because Play() takes ownership of the slice it
+// is handed without copying.
+func decodeEarconFrames(pcm []byte) [][]int16 {
+	n := len(pcm) / 2
 	if n < audioFrameSize {
 		return nil
 	}
@@ -53,26 +65,32 @@ func readyEarconFrames() [][]int16 {
 	for off := 0; off+audioFrameSize <= n; off += audioFrameSize {
 		frame := make([]int16, audioFrameSize)
 		for i := range audioFrameSize {
-			frame[i] = int16(binary.LittleEndian.Uint16(readyEarconPCM[(off+i)*2:]))
+			frame[i] = int16(binary.LittleEndian.Uint16(pcm[(off+i)*2:]))
 		}
 		frames = append(frames, frame)
 	}
 	return frames
 }
 
-// PlayReadyEarcon plays the embedded ready earcon through the playback path with
-// the mic muted for the cue's full duration, then restores the prior gate state.
-// It blocks until playback drains, so call it in a goroutine.
+// readyEarconFrames decodes the embedded ready cue (kept for callers/tests).
+func readyEarconFrames() [][]int16 { return decodeEarconFrames(readyEarconPCM) }
+
+// PlayReadyEarcon plays the ready cue; PlayDismissEarcon plays the goodbye cue.
+func (a *AudioIO) PlayReadyEarcon()   { a.playEarcon("ready", readyEarconFrames()) }
+func (a *AudioIO) PlayDismissEarcon() { a.playEarcon("dismiss", decodeEarconFrames(dismissEarconPCM)) }
+
+// playEarcon plays a decoded earcon through the playback path with the mic muted for
+// the cue's full duration, then restores the prior gate state. It blocks until
+// playback drains, so call it in a goroutine.
 //
 // Self-trigger safety: it raises the speaking gate (SetSpeaking), which BOTH
 // backends honor — the oto half-duplex path drops capture while speaking, and the
 // VPIO path's shouldForwardVPIOCapture drops capture while speaking too (default,
 // barge-in off). So the cue is never fed to the server VAD and cannot make Koe
-// "answer" its own sound. At the listening moment no reply is in flight
-// (PrepareForCall zeroed the gates), so nothing is clobbered; the captured prior
-// state is restored on return regardless.
-func (a *AudioIO) PlayReadyEarcon() {
-	frames := readyEarconFrames()
+// "answer" its own sound. At a call boundary no reply is in flight (PrepareForCall
+// zeroed the gates), so nothing is clobbered; the captured prior state is restored
+// on return regardless.
+func (a *AudioIO) playEarcon(name string, frames [][]int16) {
 	if len(frames) == 0 {
 		return
 	}
@@ -134,5 +152,5 @@ func (a *AudioIO) PlayReadyEarcon() {
 
 	a.SetSpeaking(prevSpeaking)
 	a.SetPlaybackEnabled(prevPlayback)
-	log.Printf("koe[earcon]: ready earcon played frames=%d dur=%dms", len(frames), time.Since(started).Milliseconds())
+	log.Printf("koe[earcon]: %s earcon played frames=%d dur=%dms", name, len(frames), time.Since(started).Milliseconds())
 }
