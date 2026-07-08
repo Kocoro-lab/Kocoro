@@ -22,6 +22,7 @@ func TestLoad_KoeSection(t *testing.T) {
 		"  voice: marin\n" +
 		"  mic_device: BuiltInMicrophoneDevice\n" +
 		"  speaker_device: BuiltInSpeakerDevice\n" +
+		"  audio_processing: clean_device\n" +
 		"  agent: finance\n" +
 		"  language: ja\n" +
 		"  barge_in: true\n" +
@@ -46,6 +47,9 @@ func TestLoad_KoeSection(t *testing.T) {
 	}
 	if cfg.Koe.MicDevice != "BuiltInMicrophoneDevice" || cfg.Koe.SpeakerDevice != "BuiltInSpeakerDevice" {
 		t.Fatalf("koe device fields not parsed: mic=%q speaker=%q", cfg.Koe.MicDevice, cfg.Koe.SpeakerDevice)
+	}
+	if cfg.Koe.AudioProcessing != "clean_device" {
+		t.Fatalf("koe.audio_processing = %q, want clean_device", cfg.Koe.AudioProcessing)
 	}
 	if cfg.Koe.BargeIn == nil || !*cfg.Koe.BargeIn {
 		t.Errorf("koe.barge_in = %v, want &true", cfg.Koe.BargeIn)

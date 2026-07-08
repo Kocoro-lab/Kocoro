@@ -67,16 +67,17 @@ type AudioIO struct {
 	// (audio_vpio.go). VPIO supplies native echo cancellation, but the product
 	// keeps Desktop audio call-scoped so macOS does not hold the mic while idle.
 	// Explicit barge-in experiments can opt into a stricter local energy gate.
-	vpioActive      atomic.Bool
-	vpioDone        chan struct{}
-	vpioWG          sync.WaitGroup
-	vpioForwarded   atomic.Uint64
-	vpioGateDropped atomic.Uint64
-	vpioBargePassed atomic.Uint64
-	vpioMaxInput    atomic.Uint64
-	vpioMaxOutput   atomic.Uint64
-	vpioStatsMu     sync.Mutex
-	vpioStatsBase   vpioDebugStats
+	vpioActive                atomic.Bool
+	vpioBypassVoiceProcessing atomic.Bool
+	vpioDone                  chan struct{}
+	vpioWG                    sync.WaitGroup
+	vpioForwarded             atomic.Uint64
+	vpioGateDropped           atomic.Uint64
+	vpioBargePassed           atomic.Uint64
+	vpioMaxInput              atomic.Uint64
+	vpioMaxOutput             atomic.Uint64
+	vpioStatsMu               sync.Mutex
+	vpioStatsBase             vpioDebugStats
 	// sendReady is closed (once) when pumpSendTrack starts draining — i.e. the OpenAI
 	// session is configured. The file backend's feedFrames waits on it so a one-shot
 	// --say/--audio-in utterance is streamed in sync with the send pump, never fed
@@ -204,6 +205,20 @@ func (a *AudioIO) CaptureExpected() bool { return !a.captureSuppressed() }
 
 // VPIOActive reports whether the VoiceProcessingIO capture backend is live.
 func (a *AudioIO) VPIOActive() bool { return a.vpioActive.Load() }
+
+// SetVPIOVoiceProcessingBypassed controls Apple's built-in VoiceProcessingIO
+// processing before StartVPIO opens the AudioUnit. false = normal Mac voice
+// processing/AEC; true = keep VPIO device binding/playback but use cleaner raw
+// input from devices or apps that already perform voice cleanup.
+func (a *AudioIO) SetVPIOVoiceProcessingBypassed(bypass bool) {
+	a.vpioBypassVoiceProcessing.Store(bypass)
+}
+
+// VPIOVoiceProcessingBypassed exposes the pending StartVPIO setting for tests and
+// diagnostics. It is meaningful before and during a VPIO run.
+func (a *AudioIO) VPIOVoiceProcessingBypassed() bool {
+	return a.vpioBypassVoiceProcessing.Load()
+}
 
 // captureSilenceFrame is the shared 20 ms zero frame forwarded while the
 // speak-gate suppresses capture. Read-only downstream (the gate copies frames it

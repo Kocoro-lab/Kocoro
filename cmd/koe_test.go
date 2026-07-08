@@ -57,11 +57,97 @@ func TestKoeConfigDefaults(t *testing.T) {
 	if cfg.aec != "" {
 		t.Errorf("default aec = %q, want empty gate fallback", cfg.aec)
 	}
+	if cfg.audioProcessing != audioProcessingAuto {
+		t.Errorf("default audioProcessing = %q, want auto", cfg.audioProcessing)
+	}
 }
 
-func TestKoeCmdHasAECFlag(t *testing.T) {
+func TestKoeCmdHasAudioFlags(t *testing.T) {
 	if koeCmd.Flags().Lookup("aec") == nil {
 		t.Fatal("koe command must expose --aec for VPIO opt-in testing")
+	}
+	if koeCmd.Flags().Lookup("audio-processing") == nil {
+		t.Fatal("koe command must expose --audio-processing for device voice processing control")
+	}
+}
+
+func TestResolveAudioProcessingMode(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         string
+		mic         string
+		speaker     string
+		want        string
+		wantBypass  bool
+		wantReason  string
+		wantErrPart string
+	}{
+		{
+			name:       "auto unknown defaults to mac voice",
+			raw:        "",
+			mic:        "BuiltInMicrophoneDevice",
+			speaker:    "BuiltInSpeakerDevice",
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "default_mac_voice",
+		},
+		{
+			name:       "auto reachy uses clean device input",
+			raw:        audioProcessingAuto,
+			mic:        "Reachy Mini Audio XVF3800",
+			speaker:    "Reachy Mini Audio XVF3800",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device",
+		},
+		{
+			name:       "auto only trusts the microphone device",
+			raw:        audioProcessingAuto,
+			mic:        "BuiltInMicrophoneDevice",
+			speaker:    "Reachy Mini Audio XVF3800",
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "default_mac_voice",
+		},
+		{
+			name:       "explicit mac voice",
+			raw:        audioProcessingMacVoice,
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "explicit_mac_voice",
+		},
+		{
+			name:       "explicit clean device",
+			raw:        audioProcessingCleanDevice,
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "explicit_clean_device",
+		},
+		{
+			name:        "invalid",
+			raw:         "raw",
+			wantErrPart: "invalid --audio-processing",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveAudioProcessingMode(tt.raw, tt.mic, tt.speaker)
+			if tt.wantErrPart != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrPart) {
+					t.Fatalf("resolve error = %v, want containing %q", err, tt.wantErrPart)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if got.Resolved != tt.want || got.Bypass != tt.wantBypass {
+				t.Fatalf("decision = %+v, want resolved=%s bypass=%v", got, tt.want, tt.wantBypass)
+			}
+			if !strings.Contains(got.Reason, tt.wantReason) {
+				t.Fatalf("reason = %q, want containing %q", got.Reason, tt.wantReason)
+			}
+		})
 	}
 }
 

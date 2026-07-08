@@ -66,6 +66,13 @@ type KoeConfig struct {
 	// --speaker-device; only the VPIO backend honors them.
 	MicDevice     string `mapstructure:"mic_device"     yaml:"mic_device,omitempty"     json:"mic_device,omitempty"`
 	SpeakerDevice string `mapstructure:"speaker_device" yaml:"speaker_device,omitempty" json:"speaker_device,omitempty"`
+	// AudioProcessing selects how Koe treats microphone-side voice cleanup:
+	// "auto" (default), "mac_voice" (Apple VoiceProcessingIO), or
+	// "clean_device" (device/app already cleaned voice; bypass Apple's voice
+	// processing while keeping VPIO for device binding/playback). Desktop presents
+	// this only under advanced voice settings and forwards it as
+	// --audio-processing.
+	AudioProcessing string `mapstructure:"audio_processing" yaml:"audio_processing,omitempty" json:"audio_processing,omitempty"`
 	// BargeIn opts into interrupting Kocoro while it speaks (barge-in) instead of
 	// the default half-duplex "finish then listen". A *bool for the same reason as
 	// Enabled: the off state (&false) must survive Desktop's RFC-7386 PATCH merge,

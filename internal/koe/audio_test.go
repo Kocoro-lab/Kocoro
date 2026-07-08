@@ -124,6 +124,21 @@ func TestAudioInputBufferCoversColdStartWindow(t *testing.T) {
 	}
 }
 
+func TestVPIOVoiceProcessingBypassSetting(t *testing.T) {
+	a, _ := NewAudioIO()
+	if a.VPIOVoiceProcessingBypassed() {
+		t.Fatal("VPIO voice processing bypass should default off")
+	}
+	a.SetVPIOVoiceProcessingBypassed(true)
+	if !a.VPIOVoiceProcessingBypassed() {
+		t.Fatal("VPIO voice processing bypass should be settable")
+	}
+	a.SetVPIOVoiceProcessingBypassed(false)
+	if a.VPIOVoiceProcessingBypassed() {
+		t.Fatal("VPIO voice processing bypass should clear")
+	}
+}
+
 func TestPlaybackGateDropsFramesUntilEnabled(t *testing.T) {
 	a, _ := NewAudioIO()
 	frame := make([]int16, audioFrameSize)
