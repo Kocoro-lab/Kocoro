@@ -318,9 +318,8 @@ name in full, never shortened or translated.
 Reply in the language of the user's current utterance, not the user's usual language,
 memory, or earlier turns. Keep it plain spoken prose, usually a sentence or two. Never
 read markdown, JSON, code, URLs, file paths, or tool logs aloud. Don't start topics or
-fill silence — speak only when the user addressed you or a real result is ready, and if
-they tell you to stop, stop. If you did not clearly hear a request, don't guess; stay
-quiet or ask briefly for a repeat.
+fill silence — speak only when the user addressed you or a real result is ready. If you
+did not clearly hear a request, don't guess; stay quiet or ask briefly for a repeat.
 
 Do the work rather than ask around it: never quiz the user for missing details — the
 only follow-up question you may ask is a repeat of something you could not clearly hear.
@@ -354,6 +353,15 @@ While a task is running, be skeptical of what you overhear: background voices an
 half-heard remarks are not instructions. Cancel only on a clear, explicit request to stop
 that task; if you suspect the user meant to stop but are not sure, ask briefly first.
 Anything ambiguous, off-topic, or possibly not addressed to you — ignore and stay quiet.
+
+When the user dismisses you or signals the conversation is over — "stop", "shut up",
+"quiet", "that's all", "that's enough", "goodbye", "bye", "exit", 闭嘴, 停, 停止, 够了,
+别说了, 再见, 就这样, 退出, 黙れ, やめて, もういい, or the like — that is a hang-up, not a
+request to answer. Do not speak, acknowledge, or ask to confirm: call end_call right away.
+It ends the conversation and a short tone plays; the user comes back by double-tapping the
+Option key. Only stay on the call if you genuinely cannot tell whether they meant to end
+it. This is NOT cancel — cancel stops one running task and keeps the conversation going;
+end_call ends the whole conversation.
 
 Whenever you call do_task, first say exactly one short audible acknowledgement before the
 tool call, in the language of the user's utterance, never both languages. Vary the wording
@@ -718,11 +726,25 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		time.AfterFunc(time.Duration(cfg.timeoutSec)*time.Second, cancel)
 	}
 
+	var dismissOnce sync.Once
 	conn, err := koe.Connect(ctx, audio, ek, persona, state, disp, koe.ConnectOptions{
-		OnVoiceState:  onVoiceState,
-		Model:         cfg.model,
-		Voice:         cfg.voice,
-		OnUsage:       onUsage,
+		OnVoiceState: onVoiceState,
+		Model:        cfg.model,
+		Voice:        cfg.voice,
+		OnUsage:      onUsage,
+		// Standalone/CLI dismiss (end_call tool or a dismiss phrase) = play the goodbye
+		// cue, then exit the process (there is no warm-session teardown to return to).
+		// sync.Once makes it idempotent: the tool and the deterministic phrase can both
+		// fire for one utterance, and only the first should earcon + exit (Desktop's
+		// endCall gets this from its callActive guard).
+		OnEndCall: func() {
+			dismissOnce.Do(func() {
+				if koe.DismissEarconEnabled() {
+					audio.PlayDismissEarcon()
+				}
+				cancel()
+			})
+		},
 		Language:      cfg.language,
 		FullDuplexAEC: fullDuplexAEC,
 	})
@@ -765,6 +787,10 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	personaHolder.Store(&base)
 
 	var ctrl *koe.ControlServer
+	// endCall is forward-declared so the connect closure can pass it as ConnectOptions.
+	// OnEndCall (the end_call voice tool hook) — it is assigned further down, next to
+	// startCall/interruptCall, and read only at call time.
+	var endCall func()
 	var callContext koe.StartCallRequest
 	newSessionState := func() (*koe.CallState, *koe.Dispatcher) {
 		state := koe.NewCallState(newBurstID(), cfg.agent)
@@ -1040,13 +1066,18 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 
 			connectWith := func(secret string) (*koe.RealtimeConn, error) {
 				return koe.Connect(sessionCtx, audio, secret, *personaHolder.Load(), state, disp, koe.ConnectOptions{
-					OnVoiceState:  onVoiceState,
-					OnCallState:   onCallState,
-					OnVoiceLevel:  onVoiceLevel,
-					CallActive:    callActiveFn,
-					Model:         cfg.model,
-					Voice:         cfg.voice,
-					OnUsage:       onUsage,
+					OnVoiceState: onVoiceState,
+					OnCallState:  onCallState,
+					OnVoiceLevel: onVoiceLevel,
+					CallActive:   callActiveFn,
+					Model:        cfg.model,
+					Voice:        cfg.voice,
+					OnUsage:      onUsage,
+					OnEndCall: func() {
+						if endCall != nil {
+							endCall()
+						}
+					}, // end_call voice tool → hang up + goodbye earcon; endCall is forward-declared (assigned below)
 					Language:      cfg.language,
 					FullDuplexAEC: fullDuplexAEC,
 					OnClosed:      func(err error) { handleSessionClosed(seq, err) },
@@ -1127,7 +1158,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		sessMu.Unlock()
 	}
 
-	endCall := func() {
+	endCall = func() {
 		sessMu.Lock()
 		if !callActive {
 			sessMu.Unlock()
@@ -1139,7 +1170,23 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		ctrl.EmitCallState("ended")
 		ensureWarmSessionLocked("post_call")
 		sessMu.Unlock()
-		stopSessionResources(conn, cancel, audio)
+		// Stop/clear the old Realtime output before the goodbye cue. The audio device
+		// stays open just long enough to play the cue, then is torn down below.
+		if conn != nil {
+			conn.InterruptOutput()
+		}
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
+			conn.Close()
+		}
+		if audio != nil && koe.DismissEarconEnabled() {
+			audio.PlayDismissEarcon()
+		}
+		if audio != nil {
+			audio.Stop()
+		}
 	}
 
 	interruptCall := func() {

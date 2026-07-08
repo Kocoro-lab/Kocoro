@@ -22,9 +22,11 @@ type ToolDef struct {
 
 func obj(raw string) json.RawMessage { return json.RawMessage(raw) }
 
-// ToolDefs returns the five (and only five) voice tools. Enum'd where applicable;
-// no parallel calls. Voice end-of-call is NOT a tool — Koe detects stop-words
-// locally (spec §5).
+// ToolDefs returns the voice tools. Enum'd where applicable; no parallel calls.
+// end_call ends the whole conversation (dismiss / hang up) — the model judges the
+// intent from the audio, which is more robust than matching the garbled input
+// transcription; a tone plays and the call goes dormant (re-activate with a
+// double-tap Option). This replaces the earlier local stop-word approach.
 func ToolDefs() []ToolDef {
 	return []ToolDef{
 		{Type: "function", Name: "do_task",
@@ -42,6 +44,9 @@ func ToolDefs() []ToolDef {
 		{Type: "function", Name: "switch_agent",
 			Description: "Switch which specialist handles your real-work tasks for the rest of this conversation — only when the user explicitly names one; otherwise stay on the current agent.",
 			Parameters:  obj(`{"type":"object","properties":{"agent":{"type":"string","description":"The agent the user named, verbatim."}},"required":["agent"]}`)},
+		{Type: "function", Name: "end_call",
+			Description: "End the whole voice conversation and go dormant — a hang up. Call this the moment the user clearly tells you to stop talking, dismisses you, or says goodbye: \"闭嘴\" \"够了\" \"停\"/\"停止\" \"别说了\" \"再见\" \"就这样\" \"没事了\" \"bye\" \"goodbye\" \"that's all\" \"stop\" \"黙れ\" \"やめて\" \"もういい\" — and similar. Judge it from what you actually heard, not just the on-screen transcription. After this, the call is over and the user must double-tap the Option key to talk again. Say NOTHING — do not acknowledge, do not ask to confirm; a short tone plays and the call ends. Do NOT call it for a topic change, a brief pause, or to stop one running task (that is `cancel`), and when you are unsure whether they meant to end, keep listening instead.",
+			Parameters:  obj(`{"type":"object","properties":{},"required":[]}`)},
 	}
 }
 

@@ -292,6 +292,11 @@ type ConnectOptions struct {
 	Model        string                // G3: realtime model id stamped into usage reports
 	Voice        string                // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback
 	OnUsage      func(json.RawMessage) // G3: per-turn usage relay (→ daemon → Cloud)
+	// OnEndCall (nil-safe) is invoked when the model calls the end_call voice tool
+	// (dismiss / hang up). In the Desktop path it is the endCall closure that plays
+	// the goodbye earcon and tears the call down; the standalone/CLI path wires it to
+	// a goodbye earcon + process exit; nil only in unit tests.
+	OnEndCall func()
 	// Language is the user-pinned koe reply language ("en"/"ja"/"zh"; "" = follow the
 	// utterance). It selects the language of the mechanical spoken fallbacks (transport
 	// failure / busy / misheard / agent clarify); empty defers to per-utterance inference.
@@ -411,6 +416,7 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 		return rc.dc.SendText(string(b))
 	})
 	h.onVoiceState = opts.OnVoiceState
+	h.onEndCall = opts.OnEndCall
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
 	h.language = opts.Language

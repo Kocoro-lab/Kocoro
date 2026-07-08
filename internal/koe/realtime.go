@@ -30,6 +30,12 @@ type eventHandler struct {
 	// onVoiceState (nil-safe) pushes the ambient voice state to the Desktop control
 	// channel (G2) so the Kocoro Island sprite tracks listening/thinking/speaking.
 	onVoiceState func(string)
+	// onEndCall (nil-safe) tears the call down when the model calls the end_call
+	// voice tool (dismiss / hang up). In the Desktop path it is the endCall closure
+	// (plays the goodbye earcon, then closes the session + audio); the standalone/CLI
+	// path wires it to a goodbye earcon + process exit; nil only in unit tests, where
+	// end_call is a no-op.
+	onEndCall func()
 	// curState holds the last emitted voice state (string) so the D3w level pump
 	// knows whether to report input (listening) or output (speaking) RMS.
 	curState atomic.Value
@@ -862,6 +868,28 @@ func (h *eventHandler) handleInputTranscript(transcript string) {
 	if os.Getenv("KOE_TRANSCRIPT_LOG") == "1" {
 		log.Printf("koe[transcript]: %q", transcript)
 	}
+	// Deterministic dismiss backstop: a whole-utterance control phrase (闭嘴/停/够了/
+	// 退出/再见/bye/…) hangs up regardless of whether the model also calls end_call —
+	// gpt-realtime-mini is unreliable at that tool (1/7 live), so the fixed vocabulary
+	// cannot depend on it. onEndCall (Desktop endCall / standalone cancel) is idempotent,
+	// so a racing tool call is harmless. Runs regardless of KOE_TRANSCRIPT_LOG.
+	if h.onEndCall != nil && isDismissPhrase(transcript) {
+		if h.taskInFlight() && isTaskAmbiguousDismissPhrase(transcript) {
+			if eventLogEnabled() {
+				log.Printf("koe[call]: dismiss phrase %q left to model while task is running", transcript)
+			}
+			return
+		}
+		if eventLogEnabled() {
+			log.Printf("koe[call]: dismiss phrase %q — hanging up", transcript)
+		}
+		// Cut any in-progress auto-response audio IMMEDIATELY (create_response:true may
+		// have already started voicing a reply to the dismiss utterance) so nothing
+		// leaks before the goodbye earcon. interruptOutput drops local playback + sends
+		// response.cancel/output_audio_buffer.clear; the teardown then hangs up.
+		h.interruptOutput()
+		go h.onEndCall()
+	}
 }
 
 // unwrapArgs normalizes the arguments field: OpenAI sends function arguments as a
@@ -989,6 +1017,20 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 				h.emitVoiceState("listening")
 			}
 		}()
+		return
+	}
+	if name == "end_call" {
+		// Dismiss / hang up. Do NOT send a function_call_output or a spoken reply: the
+		// teardown closes the session, and the goodbye earcon (played inside onEndCall)
+		// is the only feedback. Run in a goroutine — onEndCall closes THIS connection,
+		// and the event loop calling it must not block on its own teardown.
+		if eventLogEnabled() {
+			log.Printf("koe[call]: end_call requested call_id=%q", callID)
+		}
+		if h.onEndCall != nil {
+			h.interruptOutput()
+			go h.onEndCall()
+		}
 		return
 	}
 	// Fast tools (cancel/get_status/control_app/switch_agent).
