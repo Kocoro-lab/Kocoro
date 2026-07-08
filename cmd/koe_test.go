@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -56,11 +57,232 @@ func TestKoeConfigDefaults(t *testing.T) {
 	if cfg.aec != "" {
 		t.Errorf("default aec = %q, want empty gate fallback", cfg.aec)
 	}
+	if cfg.audioProcessing != audioProcessingAuto {
+		t.Errorf("default audioProcessing = %q, want auto", cfg.audioProcessing)
+	}
 }
 
-func TestKoeCmdHasAECFlag(t *testing.T) {
+func TestKoeCmdHasAudioFlags(t *testing.T) {
 	if koeCmd.Flags().Lookup("aec") == nil {
 		t.Fatal("koe command must expose --aec for VPIO opt-in testing")
+	}
+	if koeCmd.Flags().Lookup("audio-processing") == nil {
+		t.Fatal("koe command must expose --audio-processing for device voice processing control")
+	}
+}
+
+func TestResolveAudioProcessingMode(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         string
+		mic         string
+		speaker     string
+		want        string
+		wantBypass  bool
+		wantReason  string
+		wantErrPart string
+	}{
+		{
+			name:       "auto unknown defaults to mac voice",
+			raw:        "",
+			mic:        "BuiltInMicrophoneDevice",
+			speaker:    "BuiltInSpeakerDevice",
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "default_mac_voice",
+		},
+		{
+			name:       "auto reachy uses clean device input",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Pollen Robotics:Reachy Mini Audio XVF3800:1,2",
+			speaker:    "Reachy Mini Audio XVF3800",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device",
+		},
+		{
+			name:       "auto conference speakerphone uses clean device input",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Jabra:SPEAK 750:1,2",
+			speaker:    "AppleUSBAudioEngine:Jabra:SPEAK 750:1,2",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device:jabra speak",
+		},
+		{
+			name:       "auto poly sync uses clean device input",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Poly:Sync 20:1,2",
+			speaker:    "AppleUSBAudioEngine:Poly:Sync 20:1,2",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device:poly sync",
+		},
+		{
+			name:       "auto yealink conference phone uses clean device input",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Yealink:CP900:1,2",
+			speaker:    "AppleUSBAudioEngine:Yealink:CP900:1,2",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device:yealink cp",
+		},
+		{
+			name:       "auto logitech room device uses clean device input",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Logitech:Rally Bar:1,2",
+			speaker:    "AppleUSBAudioEngine:Logitech:Rally Bar:1,2",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device:logitech rally",
+		},
+		{
+			name:       "auto shure stem uses clean device input",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Shure:STEM TABLE:1,2",
+			speaker:    "AppleUSBAudioEngine:Shure:STEM TABLE:1,2",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device:shure stem",
+		},
+		{
+			name:       "auto epos expand uses clean device input",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:EPOS:EXPAND 30:1,2",
+			speaker:    "AppleUSBAudioEngine:EPOS:EXPAND 30:1,2",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device:epos expand",
+		},
+		{
+			name:       "auto yamaha yvc uses clean device input",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Yamaha Corporation:YVC-200:1,2",
+			speaker:    "AppleUSBAudioEngine:Yamaha Corporation:YVC-200:1,2",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device:yamaha yvc",
+		},
+		{
+			name:       "auto konftel uses clean device input",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Konftel:Ego:1,2",
+			speaker:    "AppleUSBAudioEngine:Konftel:Ego:1,2",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device:konftel",
+		},
+		{
+			name:       "auto krisp requires routed speaker",
+			raw:        audioProcessingAuto,
+			mic:        "Krisp Microphone",
+			speaker:    "Krisp Speaker",
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "known_self_processed_device:krisp",
+		},
+		{
+			name:       "auto ignores self processed speaker without matching mic",
+			raw:        audioProcessingAuto,
+			mic:        "BuiltInMicrophoneDevice",
+			speaker:    "Reachy Mini Audio XVF3800",
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "default_mac_voice",
+		},
+		{
+			name:       "auto conference speakerphone mic alone keeps mac voice processing",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Jabra:SPEAK 750:1,2",
+			speaker:    "BuiltInSpeakerDevice",
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "default_mac_voice",
+		},
+		{
+			name:       "auto does not trust generic brand headset",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Jabra:Evolve2 65:1,2",
+			speaker:    "BuiltInSpeakerDevice",
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "default_mac_voice",
+		},
+		{
+			name:       "auto does not trust broad yealink brand",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:Yealink:USB Headset:1,2",
+			speaker:    "BuiltInSpeakerDevice",
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "default_mac_voice",
+		},
+		{
+			name:       "auto krisp mic alone keeps mac voice processing",
+			raw:        audioProcessingAuto,
+			mic:        "Krisp Microphone",
+			speaker:    "BuiltInSpeakerDevice",
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "default_mac_voice",
+		},
+		{
+			name:       "auto does not trust camera noise suppression devices",
+			raw:        audioProcessingAuto,
+			mic:        "AppleUSBAudioEngine:OBSBOT:Tiny 2:1,2",
+			speaker:    "BuiltInSpeakerDevice",
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "default_mac_voice",
+		},
+		{
+			name:       "auto does not trust nvidia broadcast mic alone",
+			raw:        audioProcessingAuto,
+			mic:        "NVIDIA Broadcast",
+			speaker:    "BuiltInSpeakerDevice",
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "default_mac_voice",
+		},
+		{
+			name:       "explicit mac voice",
+			raw:        audioProcessingMacVoice,
+			want:       audioProcessingMacVoice,
+			wantBypass: false,
+			wantReason: "explicit_mac_voice",
+		},
+		{
+			name:       "explicit clean device",
+			raw:        audioProcessingCleanDevice,
+			want:       audioProcessingCleanDevice,
+			wantBypass: true,
+			wantReason: "explicit_clean_device",
+		},
+		{
+			name:        "invalid",
+			raw:         "raw",
+			wantErrPart: "invalid --audio-processing",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveAudioProcessingMode(tt.raw, tt.mic, tt.speaker)
+			if tt.wantErrPart != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrPart) {
+					t.Fatalf("resolve error = %v, want containing %q", err, tt.wantErrPart)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if got.Resolved != tt.want || got.Bypass != tt.wantBypass {
+				t.Fatalf("decision = %+v, want resolved=%s bypass=%v", got, tt.want, tt.wantBypass)
+			}
+			if !strings.Contains(got.Reason, tt.wantReason) {
+				t.Fatalf("reason = %q, want containing %q", got.Reason, tt.wantReason)
+			}
+		})
 	}
 }
 
@@ -412,5 +634,67 @@ func TestResolveDevKey(t *testing.T) {
 			t.Errorf("%s: resolveDevKey(%q, %q, %q) = %q, want %q",
 				tt.name, tt.flagKey, tt.envKey, tt.controlPort, got, tt.want)
 		}
+	}
+}
+
+func TestKoeCmdHasBargeInFlag(t *testing.T) {
+	f := koeCmd.Flags().Lookup("barge-in")
+	if f == nil {
+		t.Fatal("koe command missing --barge-in flag")
+	}
+	if f.DefValue != "false" {
+		t.Fatalf("--barge-in default = %q, want false", f.DefValue)
+	}
+}
+
+// TestApplyBargeInEnv locks the flag→env bridge: --barge-in on flips both env-gated
+// knobs to "1"; off leaves them untouched (power-user env escape hatch preserved).
+func TestApplyBargeInEnv(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "")
+
+	applyBargeInEnv(false)
+	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "" {
+		t.Fatalf("barge-in off set KOE_VPIO_BARGE_IN=%q, want unchanged", v)
+	}
+	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "" {
+		t.Fatalf("barge-in off set KOE_INTERRUPT_RESPONSE=%q, want unchanged", v)
+	}
+
+	applyBargeInEnv(true)
+	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
+		t.Fatalf("KOE_VPIO_BARGE_IN=%q, want 1", v)
+	}
+	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "1" {
+		t.Fatalf("KOE_INTERRUPT_RESPONSE=%q, want 1", v)
+	}
+}
+
+// TestBargeInBackendWarning: --barge-in only works on the VPIO backend, so enabling
+// it on the gate/oto backend must surface a warning instead of silently no-op'ing.
+func TestBargeInBackendWarning(t *testing.T) {
+	if got := bargeInBackendWarning(true, "vpio"); got != "" {
+		t.Errorf("barge-in on vpio should not warn, got %q", got)
+	}
+	if got := bargeInBackendWarning(false, "gate"); got != "" {
+		t.Errorf("barge-in off should not warn, got %q", got)
+	}
+	if got := bargeInBackendWarning(false, ""); got != "" {
+		t.Errorf("barge-in off should not warn, got %q", got)
+	}
+	if bargeInBackendWarning(true, "gate") == "" {
+		t.Error("barge-in on the gate backend must warn (it is a silent no-op otherwise)")
+	}
+	if bargeInBackendWarning(true, "") == "" {
+		t.Error("barge-in with an empty backend (defaults to gate) must warn")
+	}
+}
+
+// TestKoePersonaAllowsUserNameFromInstructions guards the Q2 fix: the
+// anti-hallucination clause must carry an explicit exemption so the model can speak
+// the persona-injected user name instead of conservatively suppressing it.
+func TestKoePersonaAllowsUserNameFromInstructions(t *testing.T) {
+	if !strings.Contains(koePersona, "established facts") {
+		t.Fatal("koePersona missing the user-name/personal-context exemption to the anti-hallucination rule")
 	}
 }

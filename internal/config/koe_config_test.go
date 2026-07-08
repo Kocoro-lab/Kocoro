@@ -22,8 +22,12 @@ func TestLoad_KoeSection(t *testing.T) {
 		"  voice: marin\n" +
 		"  mic_device: BuiltInMicrophoneDevice\n" +
 		"  speaker_device: BuiltInSpeakerDevice\n" +
+		"  audio_processing: clean_device\n" +
 		"  agent: finance\n" +
-		"  language: ja\n"
+		"  language: ja\n" +
+		"  barge_in: true\n" +
+		"  persona_source: custom\n" +
+		"  custom_persona: The user is Alice.\n"
 	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(yaml), 0600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -43,6 +47,15 @@ func TestLoad_KoeSection(t *testing.T) {
 	}
 	if cfg.Koe.MicDevice != "BuiltInMicrophoneDevice" || cfg.Koe.SpeakerDevice != "BuiltInSpeakerDevice" {
 		t.Fatalf("koe device fields not parsed: mic=%q speaker=%q", cfg.Koe.MicDevice, cfg.Koe.SpeakerDevice)
+	}
+	if cfg.Koe.AudioProcessing != "clean_device" {
+		t.Fatalf("koe.audio_processing = %q, want clean_device", cfg.Koe.AudioProcessing)
+	}
+	if cfg.Koe.BargeIn == nil || !*cfg.Koe.BargeIn {
+		t.Errorf("koe.barge_in = %v, want &true", cfg.Koe.BargeIn)
+	}
+	if cfg.Koe.PersonaSource != "custom" || cfg.Koe.CustomPersona != "The user is Alice." {
+		t.Fatalf("koe persona fields not parsed: source=%q custom=%q", cfg.Koe.PersonaSource, cfg.Koe.CustomPersona)
 	}
 }
 
@@ -65,6 +78,28 @@ func TestLoad_KoeSectionAbsent(t *testing.T) {
 	}
 	if cfg.Koe.Enabled != nil {
 		t.Error("koe.enabled should be nil (never set) when the section is absent")
+	}
+}
+
+// TestLoad_KoeBargeInExplicitFalse confirms barge_in: false survives load as &false,
+// not nil — the *bool contract the field documents (so Desktop's RFC-7386 PATCH can
+// persist barge-in OFF, exactly as Enabled does via TestLoad_KoeExplicitFalse).
+func TestLoad_KoeBargeInExplicitFalse(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	shannonDir := filepath.Join(home, ".shannon")
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		t.Fatalf("mkdir shannon dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("koe:\n  barge_in: false\n"), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if cfg.Koe.BargeIn == nil || *cfg.Koe.BargeIn {
+		t.Errorf("koe.barge_in = %v, want explicit &false", cfg.Koe.BargeIn)
 	}
 }
 

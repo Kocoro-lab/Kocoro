@@ -66,6 +66,27 @@ type KoeConfig struct {
 	// --speaker-device; only the VPIO backend honors them.
 	MicDevice     string `mapstructure:"mic_device"     yaml:"mic_device,omitempty"     json:"mic_device,omitempty"`
 	SpeakerDevice string `mapstructure:"speaker_device" yaml:"speaker_device,omitempty" json:"speaker_device,omitempty"`
+	// AudioProcessing selects how Koe treats microphone-side voice cleanup:
+	// "auto" (default), "mac_voice" (Apple VoiceProcessingIO), or
+	// "clean_device" (device/app already cleaned voice; bypass Apple's voice
+	// processing while keeping VPIO for device binding/playback). Desktop presents
+	// this only under advanced voice settings and forwards it as
+	// --audio-processing.
+	AudioProcessing string `mapstructure:"audio_processing" yaml:"audio_processing,omitempty" json:"audio_processing,omitempty"`
+	// BargeIn opts into interrupting Kocoro while it speaks (barge-in) instead of
+	// the default half-duplex "finish then listen". A *bool for the same reason as
+	// Enabled: the off state (&false) must survive Desktop's RFC-7386 PATCH merge,
+	// which a plain bool+omitempty would swallow. Desktop forwards this as the
+	// `--barge-in` flag; it is a no-op unless the VPIO backend is active.
+	BargeIn *bool `mapstructure:"barge_in" yaml:"barge_in,omitempty" json:"barge_in,omitempty"`
+	// PersonaSource selects where Koe's spoken persona comes from: "" / "global"
+	// (default) distills the user's global instructions + memory; "custom" uses
+	// CustomPersona verbatim instead, skipping the distill call.
+	PersonaSource string `mapstructure:"persona_source" yaml:"persona_source,omitempty" json:"persona_source,omitempty"`
+	// CustomPersona is the user-authored spoken-persona text used when
+	// PersonaSource == "custom". Injected as-is (already voice-friendly), wrapped
+	// by Koe's base persona; empty falls back to the base persona only.
+	CustomPersona string `mapstructure:"custom_persona" yaml:"custom_persona,omitempty" json:"custom_persona,omitempty"`
 }
 
 // MCPConfig holds client-side settings shared across all MCP servers.

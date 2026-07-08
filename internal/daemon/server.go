@@ -5745,11 +5745,12 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 	// design — Koe mints via the daemon relay, no key is ever surfaced here.
 	if cfg != nil {
 		resp["koe"] = map[string]interface{}{
-			"enabled":  cfg.Koe.Enabled,
-			"model":    cfg.Koe.Model,
-			"voice":    cfg.Koe.Voice,
-			"agent":    cfg.Koe.Agent,
-			"language": cfg.Koe.Language,
+			"enabled":          cfg.Koe.Enabled,
+			"model":            cfg.Koe.Model,
+			"voice":            cfg.Koe.Voice,
+			"agent":            cfg.Koe.Agent,
+			"language":         cfg.Koe.Language,
+			"audio_processing": cfg.Koe.AudioProcessing,
 		}
 	}
 

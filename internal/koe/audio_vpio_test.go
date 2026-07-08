@@ -74,7 +74,7 @@ func TestStartVPIOHardwareCapturesAndPlays(t *testing.T) {
 	t.Logf("VPIO hardware stats: %+v", stats)
 }
 
-func TestVPIOHardwareDropsCaptureWhileSpeaking(t *testing.T) {
+func TestVPIOHardwareSendsOnlySilenceWhileSpeaking(t *testing.T) {
 	if os.Getenv("KOE_VPIO_TEST") != "1" {
 		t.Skip("set KOE_VPIO_TEST=1 to exercise the macOS VPIO hardware backend")
 	}
@@ -107,10 +107,15 @@ func TestVPIOHardwareDropsCaptureWhileSpeaking(t *testing.T) {
 	}()
 
 	deadline := time.After(4 * time.Second)
+	keepaliveFrames := 0
+	maxForwardedLevel := 0.0
 	for {
 		select {
 		case frame := <-a.Frames():
-			t.Fatalf("captured frame forwarded while speaking; rms=%.5f", rmsLevel(frame))
+			keepaliveFrames++
+			if level := rmsLevel(frame); level > maxForwardedLevel {
+				maxForwardedLevel = level
+			}
 		case <-done:
 			after := a.vpioDebugStats()
 			if after.GateDropped <= before.GateDropped {
@@ -119,10 +124,18 @@ func TestVPIOHardwareDropsCaptureWhileSpeaking(t *testing.T) {
 			if after.ForwardedFrames != before.ForwardedFrames {
 				t.Fatalf("VPIO forwarded capture while speaking: before=%+v after=%+v", before, after)
 			}
+			if keepaliveFrames == 0 {
+				t.Fatalf("speaking gate should send silent keepalive frames to preserve capture timing: before=%+v after=%+v", before, after)
+			}
+			if maxForwardedLevel > 0.0001 {
+				t.Fatalf("speaking gate leaked audible capture, max forwarded RMS=%.5f frames=%d before=%+v after=%+v",
+					maxForwardedLevel, keepaliveFrames, before, after)
+			}
 			if after.PlayUnderruns != before.PlayUnderruns {
 				t.Fatalf("VPIO playback underrun while testing speaking gate: before=%+v after=%+v", before, after)
 			}
-			t.Logf("VPIO speaking-gate stats: before=%+v after=%+v", before, after)
+			t.Logf("VPIO speaking-gate stats: keepalive=%d max_rms=%.5f before=%+v after=%+v",
+				keepaliveFrames, maxForwardedLevel, before, after)
 			return
 		case <-deadline:
 			t.Fatalf("timed out waiting for speaking-gate playback; stats=%+v", a.vpioDebugStats())

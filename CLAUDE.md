@@ -24,7 +24,7 @@ cmd/
   daemon.go            # shan daemon start/stop/status
   schedule.go          # shan schedule CRUD
   update.go            # /update command
-  koe.go               # shan koe — voice front-brain (OpenAI Realtime + Desktop control + via-daemon mint); --mic-device/--speaker-device pass CoreAudio device UIDs (from koe.mic_device/speaker_device) that the VPIO backend binds, empty = system default
+  koe.go               # shan koe — voice front-brain (OpenAI Realtime + Desktop control + via-daemon mint); --mic-device/--speaker-device pass CoreAudio device UIDs (from koe.mic_device/speaker_device) that the VPIO backend binds, empty = system default; --barge-in (from koe.barge_in) opts into interrupt-while-speaking by flipping KOE_VPIO_BARGE_IN + KOE_INTERRUPT_RESPONSE via applyBargeInEnv (vpio-only, no-op on gate); koe.persona_source ("global" distill default | "custom" → koe.custom_persona verbatim) selects the spoken persona (daemon buildKoePersona)
 
 internal/
   daemon/                              # ── PRIMARY PRODUCTION PATH ──

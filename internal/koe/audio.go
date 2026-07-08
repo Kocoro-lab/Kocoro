@@ -67,18 +67,17 @@ type AudioIO struct {
 	// (audio_vpio.go). VPIO supplies native echo cancellation, but the product
 	// keeps Desktop audio call-scoped so macOS does not hold the mic while idle.
 	// Explicit barge-in experiments can opt into a stricter local energy gate.
-	vpioActive      atomic.Bool
-	vpioDone        chan struct{}
-	vpioWG          sync.WaitGroup
-	vpioBargeFrames int
-	vpioNoiseFloor  float64
-	vpioForwarded   atomic.Uint64
-	vpioGateDropped atomic.Uint64
-	vpioBargePassed atomic.Uint64
-	vpioMaxInput    atomic.Uint64
-	vpioMaxOutput   atomic.Uint64
-	vpioStatsMu     sync.Mutex
-	vpioStatsBase   vpioDebugStats
+	vpioActive                atomic.Bool
+	vpioBypassVoiceProcessing atomic.Bool
+	vpioDone                  chan struct{}
+	vpioWG                    sync.WaitGroup
+	vpioForwarded             atomic.Uint64
+	vpioGateDropped           atomic.Uint64
+	vpioBargePassed           atomic.Uint64
+	vpioMaxInput              atomic.Uint64
+	vpioMaxOutput             atomic.Uint64
+	vpioStatsMu               sync.Mutex
+	vpioStatsBase             vpioDebugStats
 	// sendReady is closed (once) when pumpSendTrack starts draining — i.e. the OpenAI
 	// session is configured. The file backend's feedFrames waits on it so a one-shot
 	// --say/--audio-in utterance is streamed in sync with the send pump, never fed
@@ -207,6 +206,20 @@ func (a *AudioIO) CaptureExpected() bool { return !a.captureSuppressed() }
 // VPIOActive reports whether the VoiceProcessingIO capture backend is live.
 func (a *AudioIO) VPIOActive() bool { return a.vpioActive.Load() }
 
+// SetVPIOVoiceProcessingBypassed controls Apple's built-in VoiceProcessingIO
+// processing before StartVPIO opens the AudioUnit. false = normal Mac voice
+// processing/AEC; true = keep VPIO device binding/playback but use cleaner raw
+// input from devices or apps that already perform voice cleanup.
+func (a *AudioIO) SetVPIOVoiceProcessingBypassed(bypass bool) {
+	a.vpioBypassVoiceProcessing.Store(bypass)
+}
+
+// VPIOVoiceProcessingBypassed exposes the pending StartVPIO setting for tests and
+// diagnostics. It is meaningful before and during a VPIO run.
+func (a *AudioIO) VPIOVoiceProcessingBypassed() bool {
+	return a.vpioBypassVoiceProcessing.Load()
+}
+
 // captureSilenceFrame is the shared 20 ms zero frame forwarded while the
 // speak-gate suppresses capture. Read-only downstream (the gate copies frames it
 // buffers; the encoder only reads), so sharing one slice is safe.
@@ -232,81 +245,38 @@ func (a *AudioIO) resolveCaptureFrame(frame []int16, forward bool) []int16 {
 // Frames yields captured 48 kHz mono 20 ms frames.
 func (a *AudioIO) Frames() <-chan []int16 { return a.frames }
 
-const (
-	// VPIO already performs native AEC. This extra local guard is deliberately
-	// conservative: while Koe is speaking, drop mic frames by default. Experimental
-	// barge-in can be enabled with KOE_VPIO_BARGE_IN=1; then frames pass only after
-	// sustained post-AEC energy that is much louder than residual speaker bleed.
-	// Tune with KOE_VPIO_BARGE_THRESHOLD, KOE_VPIO_BARGE_MS, and
-	// KOE_VPIO_BARGE_NOISE_MULTIPLIER.
-	defaultVPIOBargeInThreshold       = 0.045
-	defaultVPIOBargeInMS              = 500
-	defaultVPIOBargeInNoiseMultiplier = 6.0
-	vpioNoiseFloorAlpha               = 0.02
-)
-
+// shouldForwardVPIOCapture decides whether a captured mic frame is sent upstream
+// while VPIO is active. The `level` is unused now that barge-in defers detection to
+// the server VAD (see below); it is kept in the signature for the caller's RMS.
 func (a *AudioIO) shouldForwardVPIOCapture(level float64) bool {
+	_ = level
 	if a.userMicOff.Load() {
-		// User mic-off outranks everything, including KOE_VPIO_BARGE_IN:
-		// barge-in may forward frames while Koe speaks, but never while the
-		// user asked for silence.
-		a.vpioBargeFrames = 0
+		// User mic-off outranks everything, including barge-in: never forward while
+		// the user has explicitly asked for silence.
 		a.vpioGateDropped.Add(1)
 		return false
 	}
 	if !a.dropCapture() {
-		a.vpioBargeFrames = 0
-		a.vpioNoiseFloor = 0
 		a.vpioForwarded.Add(1)
 		return true
 	}
+	// Kocoro is speaking. Default policy is half-duplex: drop the mic so its own
+	// voice cannot loop back (barge-in off).
 	if !koeEnvBool("KOE_VPIO_BARGE_IN", false) {
-		a.vpioBargeFrames = 0
-		a.updateVPIONoiseFloor(level)
 		a.vpioGateDropped.Add(1)
 		return false
 	}
-	threshold := a.vpioBargeInThreshold()
-	if level < threshold {
-		a.vpioBargeFrames = 0
-		a.updateVPIONoiseFloor(level)
-		a.vpioGateDropped.Add(1)
-		return false
-	}
-	a.vpioBargeFrames++
-	if a.vpioBargeFrames >= vpioBargeInFrames() {
-		a.vpioBargePassed.Add(1)
-		a.vpioForwarded.Add(1)
-		return true
-	}
-	a.vpioGateDropped.Add(1)
-	return false
-}
-
-func (a *AudioIO) vpioBargeInThreshold() float64 {
-	base := koeEnvFloat("KOE_VPIO_BARGE_THRESHOLD", defaultVPIOBargeInThreshold)
-	adaptive := a.vpioNoiseFloor * koeEnvFloat("KOE_VPIO_BARGE_NOISE_MULTIPLIER", defaultVPIOBargeInNoiseMultiplier)
-	return math.Max(base, adaptive)
-}
-
-func vpioBargeInFrames() int {
-	ms := koeEnvInt("KOE_VPIO_BARGE_MS", defaultVPIOBargeInMS)
-	frames := (ms + audioFrameMs - 1) / audioFrameMs
-	if frames < 1 {
-		return 1
-	}
-	return frames
-}
-
-func (a *AudioIO) updateVPIONoiseFloor(level float64) {
-	if level <= 0 {
-		return
-	}
-	if a.vpioNoiseFloor == 0 {
-		a.vpioNoiseFloor = level
-		return
-	}
-	a.vpioNoiseFloor = (1-vpioNoiseFloorAlpha)*a.vpioNoiseFloor + vpioNoiseFloorAlpha*level
+	// Barge-in on: keep the mic live during playback and let the server decide.
+	// VPIO's AEC removes Kocoro's own voice from the uplink; the Realtime server's
+	// VAD + interrupt_response detect the user talking over and cancel the reply.
+	// A client-side energy gate here only blinds that server VAD — real speech dips
+	// below any fixed threshold between syllables and never sustains a window — which
+	// is exactly why barge-in never fired. Echo suppression is AEC's job; talk-over
+	// detection is the server VAD's; the client only stops playback (on speech_started)
+	// and truncates. See docs/… industry pattern (LiveKit/Pipecat/OpenAI Realtime).
+	a.vpioBargePassed.Add(1)
+	a.vpioForwarded.Add(1)
+	return true
 }
 
 func (a *AudioIO) trackVPIOMaxInput(level float64) {
@@ -592,6 +562,10 @@ func (a *AudioIO) LogDebugStats() {
 	}
 	if a.vpioActive.Load() {
 		log.Printf("koe[audio]: vpio stats: %+v", a.vpioDebugStatsSinceBase())
+		// Barge-in diagnostics: with barge-in on, ForwardedFrames should climb while
+		// speaking (mic stays live for the server VAD). enabled=false means the
+		// flag→env wiring failed.
+		log.Printf("koe[barge]: enabled=%v", koeEnvBool("KOE_VPIO_BARGE_IN", false))
 	}
 }
 

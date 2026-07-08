@@ -28,7 +28,7 @@ Global settings control how Shannon behaves across all agents — which AI model
 ### Get config status
 - Method: GET
 - Path: /config/status
-- Response: `{"mcp_servers": {"slack": "connected"|"enabled"|"disabled"}, "koe": {"enabled": bool, "model": "...", "voice": "...", "agent": "...", "language": "..."}}`
+- Response: `{"mcp_servers": {"slack": "connected"|"enabled"|"disabled"}, "koe": {"enabled": bool, "model": "...", "voice": "...", "agent": "...", "language": "...", "audio_processing": "auto"|"mac_voice"|"clean_device"}}`
 - Notes: Shows live connection status for MCP servers and provider health. The `koe` block reflects the voice front brain's settings (managed by Kocoro Desktop's settings panel; credential-free — Koe mints via the daemon, no key here).
 
 ### Get daemon status
@@ -71,6 +71,7 @@ Global settings control how Shannon behaves across all agents — which AI model
 | `cloud.publish_allowed_extensions` | Extra file extensions allowed for `publish_to_web` (e.g. `[".go", ".sql"]`). Additive on top of the built-in default; denylist is **not** user-configurable. | No |
 | `cloud.stream_idle_timeout_secs` | Abort a cloud-delegate SSE connection when no line (event or 10s heartbeat) arrives for this many seconds, then reconnect via Last-Event-ID. Per-connection liveness probe, NOT a workflow time limit (`cloud.timeout` bounds total duration). 0 = disabled. Default: 45. | No |
 | `mcp_servers` | External service integrations (see mcp reference) | No |
+| `koe.audio_processing` | Voice microphone processing mode: `auto` (default), `mac_voice` (use Apple VoiceProcessingIO voice processing/AEC), or `clean_device` (for microphones/apps that already clean voice; keep VPIO device binding/playback but bypass Apple's voice processing). In `auto`, Koe uses `clean_device` only for a conservative list of known self-processed conference device/app pairs and otherwise keeps Mac voice processing. Kocoro Desktop exposes this under Voice → Advanced and forwards it to `shan koe --audio-processing`. | No |
 
 ## Common Scenarios
 

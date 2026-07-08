@@ -3,10 +3,13 @@ package daemon
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/instructions"
+	"gopkg.in/yaml.v3"
 )
 
 // koePersonaDistillPrompt turns the user's global instructions + memory into a
@@ -27,8 +30,15 @@ no quoting of the rules. If there is nothing useful, reply with exactly: NONE`
 // context, no gateway, or the model finds nothing — Koe then uses its base
 // persona only. Never injects the raw instructions (those carry task rules).
 func (s *Server) buildKoePersona(ctx context.Context) (string, error) {
-	// Global instructions + MEMORY.md are the user-context source. projectDir is
-	// empty: the persona is about the user, not the cwd.
+	// Custom source: the user authored a spoken persona in Kocoro Desktop, so use it
+	// verbatim (already voice-friendly) and skip the distill call entirely. Empty
+	// custom text falls through to "" so Koe uses its base persona only.
+	source, custom := s.freshKoePersonaConfig()
+	if source == "custom" {
+		return strings.TrimSpace(custom), nil
+	}
+	// Global (default) source: distill the user's instructions + memory. projectDir
+	// is empty: the persona is about the user, not the cwd.
 	instr, _ := instructions.LoadInstructions(s.deps.ShannonDir, "", 8000)
 	mem, _ := instructions.LoadMemory(s.deps.ShannonDir, 200)
 	src := strings.TrimSpace(strings.TrimSpace(instr) + "\n\n" + strings.TrimSpace(mem))
@@ -57,6 +67,36 @@ func (s *Server) buildKoePersona(ctx context.Context) (string, error) {
 		return "", nil
 	}
 	return out, nil
+}
+
+// freshKoePersonaConfig reads koe.persona_source / koe.custom_persona straight from
+// the on-disk config.yaml, falling back to the in-memory config on any read error.
+// PATCH /config (patchGlobalConfig) writes the file but does NOT refresh the daemon's
+// in-memory s.deps.Config until a reload, so reading s.deps.Config here would return a
+// persona the user saved from Kocoro Desktop only after a reload/restart. Koe fetches
+// the persona on (re)start, right after Desktop PATCHes it — so the file is the fresh
+// source of truth, matching how GET /config surfaces just-saved koe fields.
+func (s *Server) freshKoePersonaConfig() (source, custom string) {
+	if s.deps != nil && s.deps.Config != nil {
+		source, custom = s.deps.Config.Koe.PersonaSource, s.deps.Config.Koe.CustomPersona
+	}
+	if s.deps == nil || s.deps.ShannonDir == "" {
+		return source, custom
+	}
+	data, err := os.ReadFile(filepath.Join(s.deps.ShannonDir, "config.yaml"))
+	if err != nil {
+		return source, custom
+	}
+	var raw struct {
+		Koe struct {
+			PersonaSource string `yaml:"persona_source"`
+			CustomPersona string `yaml:"custom_persona"`
+		} `yaml:"koe"`
+	}
+	if yaml.Unmarshal(data, &raw) == nil {
+		source, custom = raw.Koe.PersonaSource, raw.Koe.CustomPersona
+	}
+	return source, custom
 }
 
 // handleKoePersona returns the distilled spoken-persona context for Koe to append

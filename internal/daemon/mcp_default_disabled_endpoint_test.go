@@ -78,6 +78,7 @@ func TestConfigStatus_MCPDefaultAgentDisabled(t *testing.T) {
 				"serverB": {},
 			},
 			MCP: config.MCPConfig{DefaultAgentDisabled: []string{"serverB"}},
+			Koe: config.KoeConfig{AudioProcessing: "clean_device"},
 		},
 	}
 	srv := NewServer(0, nil, deps, "test")
@@ -105,5 +106,12 @@ func TestConfigStatus_MCPDefaultAgentDisabled(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("mcp_default_agent_disabled should contain serverB, got %v", raw)
+	}
+	koeBlock, ok := resp["koe"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("response missing koe block: %v", resp)
+	}
+	if got := koeBlock["audio_processing"]; got != "clean_device" {
+		t.Fatalf("koe.audio_processing = %v, want clean_device", got)
 	}
 }

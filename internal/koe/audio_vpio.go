@@ -258,7 +258,8 @@ static AudioDeviceID vpioDeviceForUID(const char *uid) {
 }
 
 static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples,
-                           const char *micUID, const char *spkUID) {
+                           const char *micUID, const char *spkUID,
+                           int bypassVoiceProcessing) {
     vpioProbe("start enter");
     ringInit(&gMicRing, ringCap, NULL);
     ringInit(&gPlayRing, ringCap, &gPlayOverwrites);
@@ -298,7 +299,8 @@ static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples,
     vpioProbe("AudioComponentInstanceNew done");
 
     UInt32 one = 1;
-    UInt32 zero = 0;
+    UInt32 bypass = bypassVoiceProcessing ? 1 : 0;
+    UInt32 agc = bypassVoiceProcessing ? 0 : 1;
     vpioProbe("EnableIO input begin");
     st = AudioUnitSetProperty(gVAU, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &one, sizeof(one));
     if (st != noErr) { vpioCleanupC(); return st; }
@@ -329,13 +331,14 @@ static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples,
         fprintf(stderr, "koe[vpio]: output device UID not found - using default\n");
     }
     vpioProbe("BypassVoiceProcessing begin");
-    st = AudioUnitSetProperty(gVAU, kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global, 0, &zero, sizeof(zero));
+    st = AudioUnitSetProperty(gVAU, kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global, 0, &bypass, sizeof(bypass));
     if (st != noErr) { vpioCleanupC(); return st; }
     vpioProbe("BypassVoiceProcessing done");
     vpioProbe("VoiceProcessingEnableAGC begin");
-    st = AudioUnitSetProperty(gVAU, kAUVoiceIOProperty_VoiceProcessingEnableAGC, kAudioUnitScope_Global, 0, &one, sizeof(one));
+    st = AudioUnitSetProperty(gVAU, kAUVoiceIOProperty_VoiceProcessingEnableAGC, kAudioUnitScope_Global, 0, &agc, sizeof(agc));
     if (st != noErr) { vpioCleanupC(); return st; }
     vpioProbe("VoiceProcessingEnableAGC done");
+    fprintf(stderr, "koe[vpio]: voice processing bypass=%u agc=%u\n", bypass, agc);
 
     AudioStreamBasicDescription fmt = {0};
     fmt.mSampleRate = sampleRate;
@@ -454,7 +457,11 @@ func (a *AudioIO) StartVPIO() error {
 	// so a failed start leaves any prior owner intact.
 	vpioLifecycleMu.Lock()
 	defer vpioLifecycleMu.Unlock()
-	if st := C.vpioStartC(C.double(audioSampleRate), C.int(ringCap), C.int(prerollFrames*audioFrameSize), micUID, spkUID); st != 0 {
+	bypass := C.int(0)
+	if a.vpioBypassVoiceProcessing.Load() {
+		bypass = 1
+	}
+	if st := C.vpioStartC(C.double(audioSampleRate), C.int(ringCap), C.int(prerollFrames*audioFrameSize), micUID, spkUID, bypass); st != 0 {
 		return fmt.Errorf("vpio start: OSStatus %d", int(st))
 	}
 	vpioOwner = a

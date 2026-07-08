@@ -124,6 +124,21 @@ func TestAudioInputBufferCoversColdStartWindow(t *testing.T) {
 	}
 }
 
+func TestVPIOVoiceProcessingBypassSetting(t *testing.T) {
+	a, _ := NewAudioIO()
+	if a.VPIOVoiceProcessingBypassed() {
+		t.Fatal("VPIO voice processing bypass should default off")
+	}
+	a.SetVPIOVoiceProcessingBypassed(true)
+	if !a.VPIOVoiceProcessingBypassed() {
+		t.Fatal("VPIO voice processing bypass should be settable")
+	}
+	a.SetVPIOVoiceProcessingBypassed(false)
+	if a.VPIOVoiceProcessingBypassed() {
+		t.Fatal("VPIO voice processing bypass should clear")
+	}
+}
+
 func TestPlaybackGateDropsFramesUntilEnabled(t *testing.T) {
 	a, _ := NewAudioIO()
 	frame := make([]int16, audioFrameSize)
@@ -177,7 +192,7 @@ func TestVPIOGateSuppressesWhileSpeakingByDefault(t *testing.T) {
 	a, _ := NewAudioIO()
 	a.SetSpeaking(true)
 
-	for i := 0; i < vpioBargeInFrames()*2; i++ {
+	for i := 0; i < 50; i++ {
 		if a.shouldForwardVPIOCapture(1.0) {
 			t.Fatalf("speaking capture frame %d should not pass without explicit barge-in opt-in", i)
 		}
@@ -192,30 +207,22 @@ func TestVPIOGateSuppressesWhileSpeakingByDefault(t *testing.T) {
 	}
 }
 
-func TestVPIOBargeInGateRequiresSustainedLoudSpeechWhenEnabled(t *testing.T) {
+func TestVPIOBargeInForwardsContinuouslyWhileSpeaking(t *testing.T) {
+	// Approach A: with barge-in enabled the mic stays live during playback and the
+	// server VAD decides — the client no longer energy-gates. Every captured frame
+	// forwards immediately regardless of level, so real speech (which dips between
+	// syllables) is never dropped before it reaches the server.
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	a, _ := NewAudioIO()
 	a.SetSpeaking(true)
-	threshold := defaultVPIOBargeInThreshold + 0.01
 
-	for i := 0; i < vpioBargeInFrames()-1; i++ {
-		if a.shouldForwardVPIOCapture(threshold) {
-			t.Fatalf("frame %d forwarded before sustained barge-in threshold", i)
+	for i, level := range []float64{0.5, 0.001, 0.2, 0.0, 0.05} {
+		if !a.shouldForwardVPIOCapture(level) {
+			t.Fatalf("frame %d (level=%.3f) should forward continuously while barge-in is on", i, level)
 		}
-	}
-	if !a.shouldForwardVPIOCapture(threshold) {
-		t.Fatal("sustained loud speech should be forwarded as barge-in")
 	}
 	if got := a.vpioBargePassed.Load(); got == 0 {
-		t.Fatal("barge-in gate should count passed VPIO frames")
-	}
-	if a.shouldForwardVPIOCapture(defaultVPIOBargeInThreshold / 2) {
-		t.Fatal("quiet residual echo should be suppressed and reset the barge-in window")
-	}
-	for i := 0; i < vpioBargeInFrames()-1; i++ {
-		if a.shouldForwardVPIOCapture(threshold) {
-			t.Fatalf("frame %d forwarded after reset before sustained threshold", i)
-		}
+		t.Fatal("barge-in should count frames forwarded while speaking")
 	}
 
 	a.SetSpeaking(false)
@@ -224,18 +231,15 @@ func TestVPIOBargeInGateRequiresSustainedLoudSpeechWhenEnabled(t *testing.T) {
 	}
 }
 
-func TestVPIOBargeInGateUsesAdaptiveNoiseFloor(t *testing.T) {
+func TestVPIOBargeInNeverOverridesUserMicOff(t *testing.T) {
+	// User mic-off outranks barge-in: never forward while the user asked for silence.
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	a, _ := NewAudioIO()
 	a.SetSpeaking(true)
+	a.userMicOff.Store(true)
 
-	for i := 0; i < 100; i++ {
-		if a.shouldForwardVPIOCapture(0.02) {
-			t.Fatalf("residual echo frame %d should not pass the speaking gate", i)
-		}
-	}
-	if a.vpioBargeInThreshold() <= defaultVPIOBargeInThreshold {
-		t.Fatalf("adaptive threshold did not rise above the fixed floor: %.4f", a.vpioBargeInThreshold())
+	if a.shouldForwardVPIOCapture(0.9) {
+		t.Fatal("mic-off must suppress capture even with barge-in enabled")
 	}
 }
 

@@ -27,17 +27,19 @@ import (
 
 // koeConfig holds the resolved settings for one `shan koe` voice session.
 type koeConfig struct {
-	openAIKey     string // DEV-KEY: replaced by the deferred daemon mint relay (→ Plan D Cloud mint)
-	daemonURL     string
-	agent         string
-	model         string
-	voice         string // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback in sessionConfig
-	language      string
-	controlPort   string // Desktop↔Koe control server port (Kocoro Desktop passes it); empty = no control channel
-	controlToken  string // Desktop-owned Bearer token from KOE_CONTROL_TOKEN; never passed via argv
-	aec           string // echo control: "" / "gate" = oto half-duplex fallback, "vpio" = Apple VoiceProcessingIO full-duplex AEC
-	micDevice     string // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
-	speakerDevice string // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
+	openAIKey       string // DEV-KEY: replaced by the deferred daemon mint relay (→ Plan D Cloud mint)
+	daemonURL       string
+	agent           string
+	model           string
+	voice           string // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback in sessionConfig
+	language        string
+	controlPort     string // Desktop↔Koe control server port (Kocoro Desktop passes it); empty = no control channel
+	controlToken    string // Desktop-owned Bearer token from KOE_CONTROL_TOKEN; never passed via argv
+	aec             string // echo control: "" / "gate" = oto half-duplex fallback, "vpio" = Apple VoiceProcessingIO full-duplex AEC
+	audioProcessing string // auto | mac_voice | clean_device; controls whether VPIO applies or bypasses Apple's voice processing
+	micDevice       string // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
+	speakerDevice   string // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
+	bargeIn         bool   // --barge-in: allow interrupting Kocoro while it speaks (enables KOE_VPIO_BARGE_IN + KOE_INTERRUPT_RESPONSE; vpio backend only)
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
 	// mic/ears. All empty/zero = normal mic+speaker device.
 	sayText     string // --say: synthesize this text (macOS say) as the mic input
@@ -50,8 +52,9 @@ type koeConfig struct {
 
 func defaultKoeConfig() koeConfig {
 	return koeConfig{
-		daemonURL: "http://127.0.0.1:7533", // must match the daemon's listen addr; Desktop (Plan E) passes the real one
-		model:     "gpt-realtime-mini-2025-12-15",
+		daemonURL:       "http://127.0.0.1:7533", // must match the daemon's listen addr; Desktop (Plan E) passes the real one
+		model:           "gpt-realtime-mini-2025-12-15",
+		audioProcessing: audioProcessingAuto,
 	}
 }
 
@@ -69,6 +72,164 @@ func resolveDevKey(flagKey, envKey, controlPort string) string {
 		return envKey
 	}
 	return ""
+}
+
+// applyBargeInEnv turns the two env-gated barge-in behaviors on when the user
+// enabled barge-in in Kocoro Desktop (forwarded as --barge-in). KOE_VPIO_BARGE_IN
+// lets sustained user speech pass the half-duplex capture gate while Kocoro speaks
+// (audio.go); KOE_INTERRUPT_RESPONSE lets Realtime cancel its own response on that
+// speech (realtime.go, honored only on the VPIO backend). Both are no-ops on the
+// gate backend, so setting them when the flag is on is safe. The flag is the
+// Desktop-facing switch; leaving it off preserves the raw KOE_* env vars as a
+// power-user escape hatch.
+func applyBargeInEnv(bargeIn bool) {
+	if !bargeIn {
+		return
+	}
+	os.Setenv("KOE_VPIO_BARGE_IN", "1")
+	os.Setenv("KOE_INTERRUPT_RESPONSE", "1")
+	log.Printf("koe[barge]: --barge-in on — KOE_VPIO_BARGE_IN=%s KOE_INTERRUPT_RESPONSE=%s",
+		os.Getenv("KOE_VPIO_BARGE_IN"), os.Getenv("KOE_INTERRUPT_RESPONSE"))
+}
+
+// bargeInBackendWarning returns a non-empty warning when barge-in is enabled on a
+// backend that cannot honor it. Barge-in lives entirely on the VPIO capture path
+// (shouldForwardVPIOCapture) and the fullDuplexAEC-gated interrupt_response; the
+// gate/oto fallback never reads either, so --barge-in there is a silent no-op.
+func bargeInBackendWarning(bargeIn bool, aec string) string {
+	if bargeIn && aec != "vpio" {
+		return "barge-in has no effect on the current audio backend — it needs the VPIO backend (--aec vpio); the mic stays half-duplex while Kocoro speaks"
+	}
+	return ""
+}
+
+const (
+	audioProcessingAuto        = "auto"
+	audioProcessingMacVoice    = "mac_voice"
+	audioProcessingCleanDevice = "clean_device"
+)
+
+type selfProcessedAudioDeviceRule struct {
+	reason         string
+	micMarkers     []string
+	speakerMarkers []string
+}
+
+func selfProcessedHardwareDeviceRule(reason string, markers ...string) selfProcessedAudioDeviceRule {
+	return selfProcessedAudioDeviceRule{reason: reason, micMarkers: markers, speakerMarkers: markers}
+}
+
+var selfProcessedAudioDeviceRules = []selfProcessedAudioDeviceRule{
+	selfProcessedHardwareDeviceRule("reachy mini audio", "reachy mini audio", "xvf3800", "pollen robotics"),
+	selfProcessedHardwareDeviceRule("anker powerconf", "powerconf", "ankerwork powerconf", "anker powerconf"),
+	selfProcessedHardwareDeviceRule("jabra speak", "jabra speak"),
+	selfProcessedHardwareDeviceRule("poly sync", "poly sync"),
+	selfProcessedHardwareDeviceRule("yealink cp", "yealink cp"),
+	selfProcessedHardwareDeviceRule("logitech rally", "logitech rally", "rally bar"),
+	selfProcessedHardwareDeviceRule("logitech meetup", "logitech meetup", "meetup 2"),
+	selfProcessedHardwareDeviceRule("logitech group", "logitech group"),
+	selfProcessedHardwareDeviceRule("shure stem", "shure stem", "stem table", "stem wall", "stem ceiling", "stem hub"),
+	selfProcessedHardwareDeviceRule("epos expand", "epos expand", "sennheiser sp 30", "sennheiser sp30"),
+	selfProcessedHardwareDeviceRule("yamaha yvc", "yamaha yvc", "yvc 200", "yvc 330", "yvc 1000"),
+	selfProcessedHardwareDeviceRule("konftel", "konftel"),
+	{reason: "krisp", micMarkers: []string{"krisp microphone", "krisp"}, speakerMarkers: []string{"krisp speaker", "krisp"}},
+}
+
+type audioProcessingDecision struct {
+	Requested string
+	Resolved  string
+	Bypass    bool
+	Reason    string
+}
+
+func normalizeAudioProcessingMode(raw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	if mode == "" {
+		mode = audioProcessingAuto
+	}
+	switch mode {
+	case audioProcessingAuto, audioProcessingMacVoice, audioProcessingCleanDevice:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid --audio-processing %q (want auto, mac_voice, or clean_device)", raw)
+	}
+}
+
+func resolveAudioProcessingMode(raw, micDevice, speakerDevice string) (audioProcessingDecision, error) {
+	mode, err := normalizeAudioProcessingMode(raw)
+	if err != nil {
+		return audioProcessingDecision{}, err
+	}
+	switch mode {
+	case audioProcessingMacVoice:
+		return audioProcessingDecision{Requested: mode, Resolved: mode, Bypass: false, Reason: "explicit_mac_voice"}, nil
+	case audioProcessingCleanDevice:
+		return audioProcessingDecision{Requested: mode, Resolved: mode, Bypass: true, Reason: "explicit_clean_device"}, nil
+	}
+	if marker := selfProcessedAudioDeviceMarker(micDevice, speakerDevice); marker != "" {
+		return audioProcessingDecision{Requested: mode, Resolved: audioProcessingCleanDevice, Bypass: true, Reason: "known_self_processed_device:" + marker}, nil
+	}
+	return audioProcessingDecision{Requested: mode, Resolved: audioProcessingMacVoice, Bypass: false, Reason: "default_mac_voice"}, nil
+}
+
+func selfProcessedAudioDeviceMarker(micDevice, speakerDevice string) string {
+	mic := normalizeAudioDeviceName(micDevice)
+	speaker := normalizeAudioDeviceName(speakerDevice)
+	for _, rule := range selfProcessedAudioDeviceRules {
+		if !audioDeviceNameContainsAny(mic, rule.micMarkers) {
+			continue
+		}
+		if len(rule.speakerMarkers) > 0 && !audioDeviceNameContainsAny(speaker, rule.speakerMarkers) {
+			continue
+		}
+		return rule.reason
+	}
+	return ""
+}
+
+func audioDeviceNameContainsAny(device string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(device, normalizeAudioDeviceName(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeAudioDeviceName(device string) string {
+	device = strings.ToLower(device)
+	var b strings.Builder
+	lastSpace := true
+	for _, r := range device {
+		isWord := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if isWord {
+			b.WriteRune(r)
+			lastSpace = false
+			continue
+		}
+		if !lastSpace {
+			b.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func applyAudioProcessing(audio *koe.AudioIO, cfg koeConfig, fullDuplexAEC bool) (audioProcessingDecision, error) {
+	decision, err := resolveAudioProcessingMode(cfg.audioProcessing, cfg.micDevice, cfg.speakerDevice)
+	if err != nil {
+		return audioProcessingDecision{}, err
+	}
+	if !fullDuplexAEC {
+		if cfg.audioProcessing != "" && cfg.audioProcessing != audioProcessingAuto {
+			log.Printf("koe[audio]: audio_processing=%s ignored because aec=%q does not use VPIO", decision.Requested, cfg.aec)
+		}
+		return decision, nil
+	}
+	audio.SetVPIOVoiceProcessingBypassed(decision.Bypass)
+	log.Printf("koe[audio]: audio_processing=%s resolved=%s bypass_voice_processing=%t reason=%s",
+		decision.Requested, decision.Resolved, decision.Bypass, decision.Reason)
+	return decision, nil
 }
 
 var koeCmd = &cobra.Command{
@@ -96,8 +257,14 @@ var koeCmd = &cobra.Command{
 		} else {
 			cfg.aec = os.Getenv("KOE_AEC")
 		}
+		if v, _ := cmd.Flags().GetString("audio-processing"); v != "" {
+			cfg.audioProcessing = v
+		} else if v := os.Getenv("KOE_AUDIO_PROCESSING"); v != "" {
+			cfg.audioProcessing = v
+		}
 		cfg.micDevice, _ = cmd.Flags().GetString("mic-device")
 		cfg.speakerDevice, _ = cmd.Flags().GetString("speaker-device")
+		cfg.bargeIn, _ = cmd.Flags().GetBool("barge-in")
 		cfg.sayText, _ = cmd.Flags().GetString("say")
 		cfg.audioIn, _ = cmd.Flags().GetString("audio-in")
 		cfg.audioOut, _ = cmd.Flags().GetString("audio-out")
@@ -111,6 +278,11 @@ var koeCmd = &cobra.Command{
 		if cfg.aec != "" && cfg.aec != "gate" && cfg.aec != "vpio" {
 			return fmt.Errorf("invalid --aec %q (want gate or vpio)", cfg.aec)
 		}
+		mode, err := normalizeAudioProcessingMode(cfg.audioProcessing)
+		if err != nil {
+			return err
+		}
+		cfg.audioProcessing = mode
 		return runKoeCall(cmd.Context(), cfg)
 	},
 }
@@ -124,8 +296,10 @@ func init() {
 	koeCmd.Flags().String("language", "", "conversation language hint")
 	koeCmd.Flags().String("control-port", "", "Desktop↔Koe control server port (Kocoro Desktop passes it)")
 	koeCmd.Flags().String("aec", "", "echo control: gate (default, oto half-duplex) | vpio (Apple VoiceProcessingIO full-duplex AEC)")
+	koeCmd.Flags().String("audio-processing", "", "voice processing: auto (default) | mac_voice | clean_device")
 	koeCmd.Flags().String("mic-device", "", "CoreAudio input device UID (empty = system default; vpio backend only)")
 	koeCmd.Flags().String("speaker-device", "", "CoreAudio output device UID (empty = system default; vpio backend only)")
+	koeCmd.Flags().Bool("barge-in", false, "allow interrupting Kocoro while it speaks (barge-in; enables KOE_VPIO_BARGE_IN + KOE_INTERRUPT_RESPONSE, vpio backend only)")
 	koeCmd.Flags().String("say", "", "debug: synthesize this text as the mic input (macOS say) — headless file mode")
 	koeCmd.Flags().String("audio-in", "", "debug: WAV file to feed as the mic input — headless file mode")
 	koeCmd.Flags().String("audio-out", "", "debug: capture the reply audio to this WAV")
@@ -164,6 +338,9 @@ action, and any calculation beyond one obvious step. Your memory of the world an
 multi-step arithmetic are unreliable; calling the tool IS the answer. Never state a fact,
 number, date, or name that neither came back from a do_task result nor follows in one
 obvious step from this conversation.
+The user's name, how they want to be addressed, and any personal context given in your
+instructions are established facts — use them naturally; that rule only bars inventing
+facts you were never given.
 If the user asks you to show, display, write, or save content in Kocoro Desktop, that is
 real work: use do_task. control_app only opens, hides, or switches app views; it cannot
 put result content in Kocoro Desktop.
@@ -437,6 +614,13 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// --barge-in flips the two env-gated barge-in knobs on before any audio/session
+	// code reads them (covers both the Desktop and standalone branches below).
+	applyBargeInEnv(cfg.bargeIn)
+	if w := bargeInBackendWarning(cfg.bargeIn, cfg.aec); w != "" {
+		log.Printf("koe[barge]: WARNING — %s", w)
+	}
+
 	// Plan B wiring: link to the daemon back-brain.
 	client := koe.NewDaemonClient(cfg.daemonURL)
 
@@ -500,7 +684,11 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 			len(inPCM), float64(len(inPCM))/48000, cfg.audioOut, cfg.audioPeriod)
 		startAudio = func() error { return audio.StartFile(inPCM, cfg.audioOut, cfg.audioPeriod) }
 		fullDuplexAEC = false
-	} else if fullDuplexAEC {
+	}
+	if _, err := applyAudioProcessing(audio, cfg, fullDuplexAEC); err != nil {
+		return err
+	}
+	if !fileMode && fullDuplexAEC {
 		startAudio = audio.StartVPIO
 	}
 	disarmAudioWatchdog := func() {}
@@ -764,6 +952,11 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			return
 		}
 		audio.SetPreferredDevices(cfg.micDevice, cfg.speakerDevice)
+		if _, err := applyAudioProcessing(audio, cfg, fullDuplexAEC); err != nil {
+			failActiveCallLocked("audio processing config failed", err)
+			scheduleWarmRetry("audio_processing_retry")
+			return
+		}
 		audio.SetPlaybackEnabled(false)
 		started := time.Now()
 		warming = true
