@@ -1045,6 +1045,35 @@ func IsMessagingPlatform(source string) bool {
 	return false
 }
 
+// channelHasInteractiveApproval reports whether a channel can render an
+// Allow/Deny approval prompt AND route the user's decision back to the daemon.
+// Kept in sync with shannon-cloud's RouteApproval supported set
+// (slack/line/feishu/lark/teams); everything else cannot prompt.
+func channelHasInteractiveApproval(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case ChannelSlack, ChannelFeishu, ChannelLark, ChannelTeams, ChannelLINE:
+		return true
+	}
+	return false
+}
+
+// IsNonInteractiveApprovalChannel reports whether a run originates from an IM
+// channel that has NO way to prompt the user for tool approval (no Allow/Deny
+// UI): WeChat, WeCom, Discord, Telegram, voice, etc. The cloud cannot route an
+// approval card to these (RouteApproval returns "approval not supported"), so an
+// emitted approval request would block until the 5-minute timeout and then be
+// denied — surfacing to the user as a truncated "(Response may be incomplete)".
+// The approval broker auto-approves these locally instead.
+//
+// Interactive IM channels (Slack/Feishu/Teams/LINE) keep the normal human
+// approval flow; local sources (Desktop/CLI) are not messaging platforms and
+// are unaffected. Note: hard-blocked/denied tool calls are rejected upstream by
+// the permission engine before ever reaching the broker, so auto-approve here
+// only clears the residual "ask" prompts.
+func IsNonInteractiveApprovalChannel(source string) bool {
+	return IsMessagingPlatform(source) && !channelHasInteractiveApproval(source)
+}
+
 // cacheSourceFromDaemonSource maps the daemon-level source (slack/webhook/
 // cron/mcp/tui/...) to the cache_source string Shannon uses for prompt-cache
 // TTL routing. Channel messages + interactive use → long bucket (1h). Fire-and-

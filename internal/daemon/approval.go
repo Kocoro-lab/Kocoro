@@ -100,6 +100,18 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 		return DecisionAllow
 	}
 
+	// Non-interactive IM channels (WeChat/WeCom/Discord/Telegram/voice) have no
+	// Allow/Deny UI, and the cloud can't route an approval card to them — an
+	// emitted request would stall until ApprovalTimeout and then deny, surfacing
+	// as a truncated "(Response may be incomplete)". Auto-approve locally so the
+	// agent can act. Denied/hard-blocked tools are already rejected upstream by
+	// the permission engine before reaching the broker; only "ask" prompts land
+	// here. See IsNonInteractiveApprovalChannel for the channel classification.
+	if IsNonInteractiveApprovalChannel(meta.Source) {
+		log.Printf("approval: auto-approving tool %q for non-interactive channel %q (no approval UI)", tool, meta.Source)
+		return DecisionAllow
+	}
+
 	reqID := generateRequestID()
 	pa := &pendingApproval{ch: make(chan ApprovalDecision, 1)}
 
