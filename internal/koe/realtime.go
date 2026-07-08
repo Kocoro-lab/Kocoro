@@ -31,9 +31,10 @@ type eventHandler struct {
 	// channel (G2) so the Kocoro Island sprite tracks listening/thinking/speaking.
 	onVoiceState func(string)
 	// onEndCall (nil-safe) tears the call down when the model calls the end_call
-	// voice tool (dismiss / hang up). In production it is the Desktop path's endCall
-	// closure (plays the goodbye earcon, then closes the session + audio); nil in the
-	// standalone/CLI path and unit tests, where end_call is a no-op.
+	// voice tool (dismiss / hang up). In the Desktop path it is the endCall closure
+	// (plays the goodbye earcon, then closes the session + audio); the standalone/CLI
+	// path wires it to a goodbye earcon + process exit; nil only in unit tests, where
+	// end_call is a no-op.
 	onEndCall func()
 	// curState holds the last emitted voice state (string) so the D3w level pump
 	// knows whether to report input (listening) or output (speaking) RMS.

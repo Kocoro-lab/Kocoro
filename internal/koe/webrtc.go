@@ -294,7 +294,8 @@ type ConnectOptions struct {
 	OnUsage      func(json.RawMessage) // G3: per-turn usage relay (→ daemon → Cloud)
 	// OnEndCall (nil-safe) is invoked when the model calls the end_call voice tool
 	// (dismiss / hang up). In the Desktop path it is the endCall closure that plays
-	// the goodbye earcon and tears the call down; nil in standalone/CLI.
+	// the goodbye earcon and tears the call down; the standalone/CLI path wires it to
+	// a goodbye earcon + process exit; nil only in unit tests.
 	OnEndCall func()
 	// Language is the user-pinned koe reply language ("en"/"ja"/"zh"; "" = follow the
 	// utterance). It selects the language of the mechanical spoken fallbacks (transport

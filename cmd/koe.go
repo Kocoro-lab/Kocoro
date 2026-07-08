@@ -1066,14 +1066,18 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 
 			connectWith := func(secret string) (*koe.RealtimeConn, error) {
 				return koe.Connect(sessionCtx, audio, secret, *personaHolder.Load(), state, disp, koe.ConnectOptions{
-					OnVoiceState:  onVoiceState,
-					OnCallState:   onCallState,
-					OnVoiceLevel:  onVoiceLevel,
-					CallActive:    callActiveFn,
-					Model:         cfg.model,
-					Voice:         cfg.voice,
-					OnUsage:       onUsage,
-					OnEndCall:     func() { endCall() }, // end_call voice tool → hang up + goodbye earcon
+					OnVoiceState: onVoiceState,
+					OnCallState:  onCallState,
+					OnVoiceLevel: onVoiceLevel,
+					CallActive:   callActiveFn,
+					Model:        cfg.model,
+					Voice:        cfg.voice,
+					OnUsage:      onUsage,
+					OnEndCall: func() {
+						if endCall != nil {
+							endCall()
+						}
+					}, // end_call voice tool → hang up + goodbye earcon; endCall is forward-declared (assigned below)
 					Language:      cfg.language,
 					FullDuplexAEC: fullDuplexAEC,
 					OnClosed:      func(err error) { handleSessionClosed(seq, err) },
