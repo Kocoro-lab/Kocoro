@@ -109,17 +109,30 @@ const (
 	audioProcessingCleanDevice = "clean_device"
 )
 
-var selfProcessedAudioDeviceMarkers = []string{
-	"reachy mini audio",
-	"xvf3800",
-	"pollen robotics",
-	"krisp",
-	"nvidia broadcast",
-	"obsbot",
-	"ankerwork",
-	"jabra speak",
-	"poly sync",
-	"yealink",
+type selfProcessedAudioDeviceRule struct {
+	reason         string
+	micMarkers     []string
+	speakerMarkers []string
+}
+
+func selfProcessedHardwareDeviceRule(reason string, markers ...string) selfProcessedAudioDeviceRule {
+	return selfProcessedAudioDeviceRule{reason: reason, micMarkers: markers, speakerMarkers: markers}
+}
+
+var selfProcessedAudioDeviceRules = []selfProcessedAudioDeviceRule{
+	selfProcessedHardwareDeviceRule("reachy mini audio", "reachy mini audio", "xvf3800", "pollen robotics"),
+	selfProcessedHardwareDeviceRule("anker powerconf", "powerconf", "ankerwork powerconf", "anker powerconf"),
+	selfProcessedHardwareDeviceRule("jabra speak", "jabra speak"),
+	selfProcessedHardwareDeviceRule("poly sync", "poly sync"),
+	selfProcessedHardwareDeviceRule("yealink cp", "yealink cp"),
+	selfProcessedHardwareDeviceRule("logitech rally", "logitech rally", "rally bar"),
+	selfProcessedHardwareDeviceRule("logitech meetup", "logitech meetup", "meetup 2"),
+	selfProcessedHardwareDeviceRule("logitech group", "logitech group"),
+	selfProcessedHardwareDeviceRule("shure stem", "shure stem", "stem table", "stem wall", "stem ceiling", "stem hub"),
+	selfProcessedHardwareDeviceRule("epos expand", "epos expand", "sennheiser sp 30", "sennheiser sp30"),
+	selfProcessedHardwareDeviceRule("yamaha yvc", "yamaha yvc", "yvc 200", "yvc 330", "yvc 1000"),
+	selfProcessedHardwareDeviceRule("konftel", "konftel"),
+	{reason: "krisp", micMarkers: []string{"krisp microphone", "krisp"}, speakerMarkers: []string{"krisp speaker", "krisp"}},
 }
 
 type audioProcessingDecision struct {
@@ -153,20 +166,53 @@ func resolveAudioProcessingMode(raw, micDevice, speakerDevice string) (audioProc
 	case audioProcessingCleanDevice:
 		return audioProcessingDecision{Requested: mode, Resolved: mode, Bypass: true, Reason: "explicit_clean_device"}, nil
 	}
-	if marker := selfProcessedAudioDeviceMarker(micDevice); marker != "" {
+	if marker := selfProcessedAudioDeviceMarker(micDevice, speakerDevice); marker != "" {
 		return audioProcessingDecision{Requested: mode, Resolved: audioProcessingCleanDevice, Bypass: true, Reason: "known_self_processed_device:" + marker}, nil
 	}
 	return audioProcessingDecision{Requested: mode, Resolved: audioProcessingMacVoice, Bypass: false, Reason: "default_mac_voice"}, nil
 }
 
-func selfProcessedAudioDeviceMarker(micDevice string) string {
-	combined := strings.ToLower(micDevice)
-	for _, marker := range selfProcessedAudioDeviceMarkers {
-		if strings.Contains(combined, marker) {
-			return marker
+func selfProcessedAudioDeviceMarker(micDevice, speakerDevice string) string {
+	mic := normalizeAudioDeviceName(micDevice)
+	speaker := normalizeAudioDeviceName(speakerDevice)
+	for _, rule := range selfProcessedAudioDeviceRules {
+		if !audioDeviceNameContainsAny(mic, rule.micMarkers) {
+			continue
 		}
+		if len(rule.speakerMarkers) > 0 && !audioDeviceNameContainsAny(speaker, rule.speakerMarkers) {
+			continue
+		}
+		return rule.reason
 	}
 	return ""
+}
+
+func audioDeviceNameContainsAny(device string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(device, normalizeAudioDeviceName(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeAudioDeviceName(device string) string {
+	device = strings.ToLower(device)
+	var b strings.Builder
+	lastSpace := true
+	for _, r := range device {
+		isWord := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if isWord {
+			b.WriteRune(r)
+			lastSpace = false
+			continue
+		}
+		if !lastSpace {
+			b.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func applyAudioProcessing(audio *koe.AudioIO, cfg koeConfig, fullDuplexAEC bool) (audioProcessingDecision, error) {
