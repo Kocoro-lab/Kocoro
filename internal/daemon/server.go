@@ -540,6 +540,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /channels/slack/app-installs", s.handleCreateSlackAppInstall)
 	mux.HandleFunc("GET /channels/slack/app-installs", s.handleListSlackAppInstalls)
 	mux.HandleFunc("DELETE /channels/slack/app-installs/{id}", s.handleDeleteSlackAppInstall)
+	// Personal WeChat (iLink) — thin proxy to Cloud (which owns the QR login,
+	// the long-poll message pump, and install persistence). QR-scan connect
+	// flow: qr-start then a polled qr-wait.
+	mux.HandleFunc("POST /channels/wechat/qr-start", s.handleWeChatQRStart)
+	mux.HandleFunc("POST /channels/wechat/qr-wait", s.handleWeChatQRWait)
+	mux.HandleFunc("GET /channels/wechat/installs", s.handleListWeChatInstalls)
+	mux.HandleFunc("DELETE /channels/wechat/installs/{id}", s.handleDeleteWeChatInstall)
 	mux.HandleFunc("GET /skills/marketplace", s.handleMarketplaceList)
 	mux.HandleFunc("GET /skills/marketplace/entry/{slug}", s.handleMarketplaceDetail)
 	// ClawHub live-catalog API — separate surface from /skills/marketplace.
