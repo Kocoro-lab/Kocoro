@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // baseDismissPhrases is the curated closed-vocabulary of "end the conversation"
@@ -44,6 +45,58 @@ var baseDismissPhrases = map[string]struct{}{
 	"止まって": {}, "止まれ": {}, "止めて": {}, "やめて": {}, "やめろ": {}, "もうやめて": {},
 	"黙って": {}, "黙れ": {}, "静かに": {}, "うるさい": {}, "ストップ": {}, "もういい": {},
 	"終わり": {}, "終了": {}, "さようなら": {}, "バイバイ": {}, "終わって": {},
+}
+
+// strongDismissTokens are dismiss words so unambiguous that a SHORT utterance merely
+// CONTAINING one is still a deterministic hang-up ("不需要了,闭嘴吧" / "我说不需要你闭嘴",
+// both observed live 2026-07-09: the whole-utterance gate missed the decoration and
+// gpt-realtime-2.1-mini answered the first with a non-sequitur instead of end_call).
+// Only words practically never quoted innocently at an assistant qualify; weak/common
+// words (停/结束/再见/stop/enough) stay whole-utterance-only. Guarded three ways:
+// strongDismissNegators veto, maxStrongDismissRunes length cap, KOE_DISMISS_CONTAIN=0
+// kill switch.
+var strongDismissTokens = []string{"闭嘴", "閉嘴", "住口", "住嘴", "shut up", "黙れ"}
+
+// strongDismissNegators veto the containment rule anywhere in the normalized
+// utterance: negation or attribution means the user is talking ABOUT the word, not
+// saying it ("别闭嘴" / "没让你闭嘴" / "谁让你闭嘴" / "i didn't say shut up"). Kept
+// narrow — "不要"/"不是" are safe because "不需要" does not contain either as a
+// consecutive substring, so genuine dismissals like "不需要了,闭嘴吧" still pass.
+var strongDismissNegators = []string{"别闭", "別閉", "不要", "不是", "没", "沒", "谁让", "誰讓", "don't", "didn't", "did not", "do not", "never", "黙らない"}
+
+// maxStrongDismissRunes bounds the containment rule to short imperatives. WORKLOAD:
+// live decorated dismissals are a few words ("不需要了,闭嘴" = 7 runes normalized,
+// "i said shut up" = 14). SYMPTOM if too high: longer meta-talk that mentions the
+// word ("刚才开会他老让我闭嘴…") hangs the call up; if too low: decorated dismissals
+// fall back to flaky model judgment. OVERRIDE: KOE_DISMISS_CONTAIN_MAX_RUNES.
+const maxStrongDismissRunes = 16
+
+// isStrongDismissContained is the containment half of the deterministic gate: norm
+// (already normalized) is short, contains a strong dismiss token, and carries no
+// negator. Kill switch: KOE_DISMISS_CONTAIN=0.
+func isStrongDismissContained(norm string) bool {
+	if !koeEnvBool("KOE_DISMISS_CONTAIN", true) {
+		return false
+	}
+	if utf8.RuneCountInString(norm) > koeEnvInt("KOE_DISMISS_CONTAIN_MAX_RUNES", maxStrongDismissRunes) {
+		return false
+	}
+	hasStrong := false
+	for _, tok := range strongDismissTokens {
+		if strings.Contains(norm, tok) {
+			hasStrong = true
+			break
+		}
+	}
+	if !hasStrong {
+		return false
+	}
+	for _, neg := range strongDismissNegators {
+		if strings.Contains(norm, neg) {
+			return false
+		}
+	}
+	return true
 }
 
 // taskAmbiguousDismissPhrases are words that can mean "stop the current task" while
@@ -90,7 +143,7 @@ func isDismissPhrase(transcript string) bool {
 			return true
 		}
 	}
-	return false
+	return isStrongDismissContained(norm)
 }
 
 func isTaskAmbiguousDismissPhrase(transcript string) bool {
