@@ -70,6 +70,50 @@ func TestIsDismissPhraseMisses(t *testing.T) {
 	}
 }
 
+// TestIsDismissPhraseStrongContainment: a short utterance that CONTAINS an
+// unambiguous dismiss word ("闭嘴" / "shut up" / "黙れ" …) with light decoration is
+// still a deterministic hang-up. Both zh hits were observed live 2026-07-09: the
+// whole-utterance gate missed them (prefix "不需要了,"), and gpt-realtime-2.1-mini
+// answered the first with a non-sequitur instead of calling end_call.
+func TestIsDismissPhraseStrongContainment(t *testing.T) {
+	hits := []string{
+		"不需要了,闭嘴吧。", // live 2026-07-09 16:31:26 — model offered to continue the topic
+		"我说不需要你闭嘴。", // live 2026-07-09 16:31:37 — model got this one right; gate should too
+		"好了闭嘴",
+		"I said shut up",
+		"もういいから黙れ",
+	}
+	for _, h := range hits {
+		if !isDismissPhrase(h) {
+			t.Errorf("isDismissPhrase(%q) = false, want true (strong containment)", h)
+		}
+	}
+	misses := []string{
+		"别闭嘴",                 // negated
+		"没让你闭嘴",               // negated
+		"我又没有让你闭嘴",            // negated
+		"谁让你闭嘴了",              // negated
+		"i didn't say shut up", // negated
+		"刚才开会他老让我闭嘴你说这人讨厌不讨厌",  // meta-talk mentioning the word — over the length cap
+		"停一下再继续",              // weak word only, never containment-matched
+	}
+	for _, m := range misses {
+		if isDismissPhrase(m) {
+			t.Errorf("isDismissPhrase(%q) = true, want false", m)
+		}
+	}
+}
+
+func TestIsDismissPhraseStrongContainmentKillSwitch(t *testing.T) {
+	t.Setenv("KOE_DISMISS_CONTAIN", "0")
+	if isDismissPhrase("不需要了,闭嘴吧。") {
+		t.Error("KOE_DISMISS_CONTAIN=0 must disable the containment rule")
+	}
+	if !isDismissPhrase("闭嘴") {
+		t.Error("whole-utterance match must survive KOE_DISMISS_CONTAIN=0")
+	}
+}
+
 func TestIsDismissPhraseKillSwitch(t *testing.T) {
 	t.Setenv("KOE_DISMISS_DETECT", "0")
 	if isDismissPhrase("退出") {
