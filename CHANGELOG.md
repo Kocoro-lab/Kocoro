@@ -2,6 +2,35 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.3.1 — 2026-07-09 — Remote control + Slack BYOA multi-agent + WeChat iLink + koe voice hardening
+
+Feature-and-fix release building on v0.3.0. A new **remote-control** surface lets a paired device drive the daemon (pair → receive run requests → run). **Slack** gains a bring-your-own-app install proxy with multi-agent routing, and **personal WeChat (iLink)** channel setup is now proxied to Cloud. The **koe** voice front-brain gets barge-in, a custom persona, name-use and audio-processing settings, a reliable end-of-call/dismiss path, and a fix for the commit-empty ask-to-repeat loop. Plus skills, schedule, and approval fixes.
+
+> **Cross-repo contract:** all additive, no breaking wire changes. One new capability token — `remote_control_v1` — surfaces on the WS handshake (`X-Kocoro-Capabilities`) and `GET /status` so consumers detect the remote-control channel without version sniffing (pinned in `docs/desktop-wire-fixtures/http_get.status.response.json`).
+
+### Added
+
+- **Remote control — device pairing + remote run** ([#268](https://github.com/Kocoro-lab/Kocoro/pull/268), `internal/daemon/device.go`, `remote_run.go`, `server.go`, `types.go`) — a paired remote device can be authorized to submit run requests to the daemon and receive results. Gated by the new `remote_control_v1` capability token; the pairing/run wire shapes are pinned in the status fixture.
+- **Slack BYOA app-install proxy + multi-agent routing** ([#265](https://github.com/Kocoro-lab/Kocoro/pull/265), `internal/daemon/slack_handler.go`, `internal/client/gateway.go`, `router.go`, `runner.go`) — a bring-your-own-app Slack install flow proxied through Cloud, with multi-agent routing fixes so a single Slack workspace can address multiple agents.
+- **Personal WeChat (iLink) channel setup proxy** ([#271](https://github.com/Kocoro-lab/Kocoro/pull/271), `internal/daemon/wechat_handler.go`, `internal/client/gateway.go`) — proxies personal WeChat (iLink) channel setup to Cloud, mirroring the other channel-onboarding proxies.
+- **koe: barge-in, custom persona, name-use, and audio-processing voice settings** ([#269](https://github.com/Kocoro-lab/Kocoro/pull/269), `internal/koe/`, `cmd/koe.go`) — opt-in interrupt-while-speaking (`koe.barge_in`), a selectable spoken persona (`koe.persona_source` global-distill default or `custom` verbatim), name-use, and audio-processing controls.
+- **koe: voice dismiss via `end_call` tool + deterministic hang-up backstop** ([#270](https://github.com/Kocoro-lab/Kocoro/pull/270), `internal/koe/tools.go`, `realtime.go`, `dismissintent.go`) — the model can hang up via an `end_call` tool judged from audio, backed by a deterministic transcript backstop (closed-vocabulary + strong-dismiss-token containment) so a clear "stop/goodbye" reliably ends the call.
+- **Local SKILL.md preview endpoint for official skills** (`e2337c7`, `internal/daemon/server.go`, `internal/skills/`) — serves a skill's local `SKILL.md` for preview without a marketplace round-trip.
+- **Preset builtin skills default-install to named agents** ([#268](https://github.com/Kocoro-lab/Kocoro/pull/268), `internal/skills/api.go`, `internal/daemon/runner.go`) — builtin skills are injected for named agents, not only the default agent.
+- **`publish_to_web` extension allowlist expanded** (`42c979b`, `internal/tools/`) — additional file extensions are accepted by the publish allowlist.
+
+### Changed
+
+- **Auto-approve tool calls for non-interactive IM channels** ([#271](https://github.com/Kocoro-lab/Kocoro/pull/271), `internal/daemon/`) — tool calls originating from non-interactive IM channels are auto-approved (permission engine still enforced), with an observable `EventApprovalNotice` when a remote run auto-approves (`c8928b6`) so the decision is auditable rather than silent.
+- **koe realtime model default → 2.1 "mini" tier** (`9292661`) — updates the koe realtime session defaults to the gpt-realtime 2.1 mini model.
+- **Schedule: origin-only IM delivery for schedule pushes** (`9814c15`, `internal/schedule/`, `internal/daemon/`) — a schedule's proactive push targets only its snapshotted origin channel; schedules with no origin blob never push (wrong-audience delivery beats no delivery).
+
+### Fixed
+
+- **koe: stop `commit_empty` rejections from voicing "ask to repeat"** ([#273](https://github.com/Kocoro-lab/Kocoro/pull/273), `internal/koe/realtime.go`) — a `commit_empty` rejection (far-field fragment gate-open) is classified as a fragment and dropped silently instead of triggering a spoken "couldn't hear you" loop; the local-commit fallback stays opt-in (`KOE_LOCAL_COMMIT_FALLBACK`). Also hangs up on a short utterance containing a strong dismiss word (`660503c`).
+- **Skills: auto-resolve ambiguous ClawHub slugs** ([#267](https://github.com/Kocoro-lab/Kocoro/pull/267), `internal/skills/`, `internal/daemon/`) — an ambiguous slug/owner now auto-resolves (audit-logging the selected publisher) instead of surfacing as a 503; a genuinely unresolvable-ambiguous install maps to an actionable 409 (`92c1dcb`).
+- **Skill: restore generative-ui tool allowlist + guard test** (`2af82e6`, `internal/skills/bundled/skills/kocoro-generative-ui/`) — restores the `kocoro-generative-ui` tool allowlist with a regression guard.
+
 ## v0.3.0 — 2026-07-05 — Voice front-brain (`shan koe`) + Windows/Linux account login + cross-agent session listing
 
 Feature release across four surfaces. **`shan koe`** lands as the voice front-brain for Kocoro Desktop — a realtime voice agent (OpenAI Realtime over WebRTC) that holds the conversation locally and delegates real work to the daemon via `do_task`, so the voice layer stays thin and the agent loop keeps full tool access. **Account login** (`/local/auth/*`) now works on **Windows** and **Linux**, not just macOS, by broadening the credential-store backend. A **cross-agent session listing** (`GET /sessions?scope=all`) lets a client browse every agent's sessions in one paginated call. Plus **bounded browser-observation context growth** for long GUI sessions and **retry + caching** to absorb transient skills-marketplace blips.
