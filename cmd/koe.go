@@ -53,7 +53,7 @@ type koeConfig struct {
 func defaultKoeConfig() koeConfig {
 	return koeConfig{
 		daemonURL:       "http://127.0.0.1:7533", // must match the daemon's listen addr; Desktop (Plan E) passes the real one
-		model:           "gpt-realtime-mini-2025-12-15",
+		model:           "gpt-realtime-2.1-mini",
 		audioProcessing: audioProcessingAuto,
 	}
 }
@@ -291,7 +291,7 @@ func init() {
 	koeCmd.Flags().String("openai-key", "", "OpenAI API key (dev; C-minimal only)")
 	koeCmd.Flags().String("daemon-url", "", "daemon base URL (default http://127.0.0.1:7533)")
 	koeCmd.Flags().String("agent", "", "bound back-brain agent slug (empty = daemon default)")
-	koeCmd.Flags().String("model", "", "realtime model (default gpt-realtime-mini-2025-12-15)")
+	koeCmd.Flags().String("model", "", "realtime model (default gpt-realtime-2.1-mini)")
 	koeCmd.Flags().String("voice", "", "realtime output voice (marin/cedar/shimmer/…; empty = marin)")
 	koeCmd.Flags().String("language", "", "conversation language hint")
 	koeCmd.Flags().String("control-port", "", "Desktop↔Koe control server port (Kocoro Desktop passes it)")

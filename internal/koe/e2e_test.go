@@ -32,7 +32,7 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-const e2eModel = "gpt-realtime-mini-2025-12-15"
+const e2eModel = "gpt-realtime-2.1-mini"
 
 // the spoken sentence is chosen to clearly demand real work (→ do_task) and to
 // carry words the mock can match back, proving ASR understanding end-to-end.

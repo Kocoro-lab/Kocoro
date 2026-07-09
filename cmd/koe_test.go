@@ -48,7 +48,7 @@ func TestKoeCmdRegistered(t *testing.T) {
 
 func TestKoeConfigDefaults(t *testing.T) {
 	cfg := defaultKoeConfig()
-	if cfg.model != "gpt-realtime-mini-2025-12-15" {
+	if cfg.model != "gpt-realtime-2.1-mini" {
 		t.Errorf("default model = %q", cfg.model)
 	}
 	if cfg.daemonURL == "" {

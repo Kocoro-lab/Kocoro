@@ -18,7 +18,7 @@ func TestLoad_KoeSection(t *testing.T) {
 	}
 	yaml := "koe:\n" +
 		"  enabled: true\n" +
-		"  model: gpt-realtime-mini-2025-12-15\n" +
+		"  model: gpt-realtime-2.1-mini\n" +
 		"  voice: marin\n" +
 		"  mic_device: BuiltInMicrophoneDevice\n" +
 		"  speaker_device: BuiltInSpeakerDevice\n" +
@@ -39,7 +39,7 @@ func TestLoad_KoeSection(t *testing.T) {
 	if cfg.Koe.Enabled == nil || !*cfg.Koe.Enabled {
 		t.Error("koe.enabled should be true after Load")
 	}
-	if cfg.Koe.Model != "gpt-realtime-mini-2025-12-15" {
+	if cfg.Koe.Model != "gpt-realtime-2.1-mini" {
 		t.Errorf("koe.model = %q", cfg.Koe.Model)
 	}
 	if cfg.Koe.Voice != "marin" || cfg.Koe.Agent != "finance" || cfg.Koe.Language != "ja" {
