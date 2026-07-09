@@ -822,7 +822,11 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 		// An empty-buffer commit rejection means the manual fallback commit found
 		// (nearly) no audio server-side — signal the fallback's ack wait so it
-		// classifies the turn as a fragment instead of a missed utterance.
+		// classifies the turn as a fragment instead of a missed utterance. The
+		// attribution is sound only while observeLocalSpeechEnded stays the ONLY
+		// sender of input_audio_buffer.commit (server VAD commits its own buffer
+		// server-side and never produces this error); a second manual-commit site
+		// would need its own snapshot of this counter.
 		if ev.Error.Code == "input_audio_buffer_commit_empty" {
 			h.commitEmptySeq.Add(1)
 		}

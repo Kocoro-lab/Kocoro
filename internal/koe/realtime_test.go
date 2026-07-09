@@ -1132,6 +1132,36 @@ func TestLocalCommitFallbackSkipsWhenTaskStartsDuringDelay(t *testing.T) {
 	}
 }
 
+// TestDismissContainmentHangsUpWhileTaskInFlight pins the task-in-flight split of
+// the deterministic dismiss gate: ambiguous stop words (停/stop) are left to the
+// model mid-task (they usually mean "cancel the task", the cancel tool's job), but
+// a strong dismiss like "闭嘴" — including its decorated containment form — is about
+// talking, not the task, and must still hang up.
+func TestDismissContainmentHangsUpWhileTaskInFlight(t *testing.T) {
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	state.SetInFlightForAgent("查一下特斯拉股价", "")
+
+	h.handleInputTranscript("停") // ambiguous while a task runs — left to the model
+	select {
+	case <-ended:
+		t.Fatal("ambiguous stop word must not hang up while a task is in flight")
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	h.handleInputTranscript("不需要了,闭嘴吧。") // strong containment — still a hang-up
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("strong dismiss containment must hang up even while a task is in flight")
+	}
+}
+
 // TestResponseSenderRetriesOnActiveResponseRejection pins the core robustness of the
 // serialized sender: when GA rejects a response.create with
 // conversation_already_has_active_response, the sender retries instead of silently
