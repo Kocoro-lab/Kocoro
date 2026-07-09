@@ -79,6 +79,12 @@ var pathDenySuffixes = map[string]bool{
 // .msi/.dmg/.app/.ps1/…) are deliberately EXCLUDED — the CDN is public and such
 // files are a distribution/abuse risk. Extend at runtime via
 // cloud.publish_allowed_extensions.
+//
+// Caveat: the executable/script exclusion is porous for archives — a .zip/.7z/
+// .rar can wrap the very binaries the allowlist rejects, and we do not inspect
+// archive contents. Acceptable because the CDN is already public (anyone could
+// host such a file elsewhere), but callers should not read the archive entries
+// as "scanned/safe".
 var defaultExtAllowlist = map[string]bool{
 	// documents
 	".html": true, ".htm": true, ".md": true, ".txt": true, ".pdf": true, ".rtf": true, ".epub": true,

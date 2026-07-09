@@ -59,6 +59,7 @@ type ApprovalBroker struct {
 	onCleanup       func(requestID string) // daemon-originated terminal paths (timeout/ctx/CancelAll)
 	onRegister      func(requestID string) // called when a pending entry is created
 	onDeregister    func(requestID string) // called when a pending entry is cleaned up
+	onAutoApprove   func(meta ApprovalRequestMeta, tool string) // called when a tool is auto-approved without prompting
 }
 
 // NewApprovalBroker creates a broker. sendFn sends an approval_request over WS.
@@ -88,6 +89,14 @@ func (b *ApprovalBroker) SetOnCleanup(fn func(requestID string)) {
 	b.onCleanup = fn
 }
 
+// SetOnAutoApprove sets a callback invoked when the broker auto-approves a tool
+// without prompting (non-interactive IM channels). Used to emit EventApprovalAuto
+// so the unattended execution is observable, mirroring the approval_auto notice
+// the remote-run auto_approve path emits on its per-run SSE stream.
+func (b *ApprovalBroker) SetOnAutoApprove(fn func(meta ApprovalRequestMeta, tool string)) {
+	b.onAutoApprove = fn
+}
+
 // Request sends an approval_request and blocks until the response arrives
 // or ctx is cancelled. Returns DecisionDeny if send fails or ctx is done.
 //
@@ -104,11 +113,28 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 	// Allow/Deny UI, and the cloud can't route an approval card to them — an
 	// emitted request would stall until ApprovalTimeout and then deny, surfacing
 	// as a truncated "(Response may be incomplete)". Auto-approve locally so the
-	// agent can act. Denied/hard-blocked tools are already rejected upstream by
+	// agent can act. Hard-blocked/denied tools are already rejected upstream by
 	// the permission engine before reaching the broker; only "ask" prompts land
 	// here. See IsNonInteractiveApprovalChannel for the channel classification.
 	if IsNonInteractiveApprovalChannel(meta.Source) {
+		// Route through the SAME unattended-approval gate as the remote-run
+		// auto_approve path (remote_run.go OnApprovalNeeded), so the two paths stay
+		// consistent: a tool on the DisallowsUnattendedAutoApproval denylist (e.g.
+		// account deletion, payment auth) must never be blanket-approved just
+		// because it arrived from a UI-less channel. The denylist is empty today,
+		// so every current tool is still auto-approved; a denied one fails safe
+		// (deny immediately rather than stall until ApprovalTimeout).
+		if agentpkg.DisallowsUnattendedAutoApproval(tool) {
+			log.Printf("approval: denying tool %q for non-interactive channel %q (disallows unattended auto-approval, no approval UI)", tool, meta.Source)
+			return DecisionDeny
+		}
 		log.Printf("approval: auto-approving tool %q for non-interactive channel %q (no approval UI)", tool, meta.Source)
+		// Emit an observability notice: auto-approval bypasses the normal
+		// approval_request flow, so this is the only controller-visible record
+		// that an unattended tool ran on this channel.
+		if b.onAutoApprove != nil {
+			b.onAutoApprove(meta, tool)
+		}
 		return DecisionAllow
 	}
 
@@ -366,6 +392,25 @@ func WireApprovalBusHooks(b *ApprovalBroker, bus *EventBus, notify func(Approval
 	}
 	b.SetOnRequest(makeApprovalRequestEmitter(bus))
 	b.SetOnCleanup(makeApprovalCleanupEmitter(bus, notify))
+	b.SetOnAutoApprove(makeApprovalAutoEmitter(bus))
+}
+
+// makeApprovalAutoEmitter returns a hook callable as ApprovalBroker.onAutoApprove
+// that publishes EventApprovalAuto to bus so an unattended (non-interactive
+// channel) tool execution is observable in the replay buffer and on Desktop —
+// the counterpart to the approval_auto notice the remote-run path emits.
+func makeApprovalAutoEmitter(bus *EventBus) func(meta ApprovalRequestMeta, tool string) {
+	return func(meta ApprovalRequestMeta, tool string) {
+		emitBusJSON(bus, EventApprovalAuto, map[string]any{
+			"session_id": meta.SessionID,
+			"agent":      meta.Agent,
+			"tool":       tool,
+			"source":     meta.Source,
+			"channel":    meta.Channel,
+			"reason":     "non_interactive_channel",
+			"ts":         nowISO(),
+		})
+	}
 }
 
 // makeApprovalRequestEmitter returns a hook callable as ApprovalBroker.onRequest

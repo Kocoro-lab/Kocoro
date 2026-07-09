@@ -2415,6 +2415,7 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	// consistent with the WS path (request payload + daemon-cleanup deny).
 	reqBroker.onRequest = s.approvalBroker.onRequest
 	reqBroker.onCleanup = s.approvalBroker.onCleanup
+	reqBroker.onAutoApprove = s.approvalBroker.onAutoApprove
 	// Register pending requestIDs so POST /approval can find this broker.
 	reqBroker.onRegister = func(requestID string) { s.pendingBrokers.Store(requestID, reqBroker) }
 	reqBroker.onDeregister = func(requestID string) { s.pendingBrokers.Delete(requestID) }

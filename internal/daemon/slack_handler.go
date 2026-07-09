@@ -70,7 +70,7 @@ func (s *Server) handleCreateSlackAppInstall(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
 	}
-	writeFeishuPassthrough(w, status, body)
+	writeCloudPassthrough(w, status, body)
 }
 
 // handleListSlackAppInstalls proxies GET /channels/slack/app-installs to Cloud.
@@ -83,7 +83,7 @@ func (s *Server) handleListSlackAppInstalls(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
 	}
-	writeFeishuPassthrough(w, status, body)
+	writeCloudPassthrough(w, status, body)
 }
 
 // handleDeleteSlackAppInstall proxies DELETE /channels/slack/app-installs/{id}.
@@ -101,5 +101,5 @@ func (s *Server) handleDeleteSlackAppInstall(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
 	}
-	writeFeishuPassthrough(w, status, body)
+	writeCloudPassthrough(w, status, body)
 }

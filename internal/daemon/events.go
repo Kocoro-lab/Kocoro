@@ -21,6 +21,14 @@ const (
 	EventApprovalRequest   = "approval_request"
 	EventApprovalResolved  = "approval_resolved"
 	EventApprovalNotice    = "approval_notice" // post-decision feedback (e.g. "high-risk pattern: not saved")
+	// EventApprovalAuto is emitted when the broker auto-approves a tool that would
+	// otherwise have prompted — currently only for non-interactive IM channels
+	// (WeChat/WeCom/…) that have no Allow/Deny UI. Because auto-approval bypasses
+	// the normal approval_request flow, this notice is the ONLY controller-visible
+	// telemetry (replay buffer + Desktop) that an unattended tool ran; without it
+	// a channel-driven bash/http call executes with just a local log line. Payload:
+	// {session_id, agent, tool, source, channel, reason, ts}.
+	EventApprovalAuto = "approval_auto"
 	EventAgentError        = "agent_error"
 	EventHeartbeatAlert    = "heartbeat_alert"
 	EventToolStatus        = "tool_status"

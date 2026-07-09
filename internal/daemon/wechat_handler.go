@@ -50,7 +50,7 @@ func (s *Server) handleWeChatQRStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
 	}
-	writeFeishuPassthrough(w, status, body)
+	writeCloudPassthrough(w, status, body)
 }
 
 // handleWeChatQRWait proxies POST /channels/wechat/qr-wait to Cloud. Request
@@ -76,7 +76,7 @@ func (s *Server) handleWeChatQRWait(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
 	}
-	writeFeishuPassthrough(w, status, body)
+	writeCloudPassthrough(w, status, body)
 }
 
 // handleListWeChatInstalls proxies GET /channels/wechat/installs to Cloud.
@@ -89,7 +89,7 @@ func (s *Server) handleListWeChatInstalls(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
 	}
-	writeFeishuPassthrough(w, status, body)
+	writeCloudPassthrough(w, status, body)
 }
 
 // handleDeleteWeChatInstall proxies DELETE /channels/wechat/installs/{id} to Cloud.
@@ -107,5 +107,5 @@ func (s *Server) handleDeleteWeChatInstall(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
 	}
-	writeFeishuPassthrough(w, status, body)
+	writeCloudPassthrough(w, status, body)
 }
