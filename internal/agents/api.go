@@ -51,8 +51,13 @@ type AgentConfigAPI struct {
 	MCPServers  *AgentMCPConfigAPI      `json:"mcp_servers,omitempty"`
 	Agent       *AgentModelConfig       `json:"agent,omitempty"`
 	Permissions *AgentPermissionsConfig `json:"permissions,omitempty"`
-	Watch       []WatchEntry            `json:"watch,omitempty"`
-	Heartbeat   *HeartbeatConfig        `json:"heartbeat,omitempty"`
+	// AutoApprove is the per-agent tool-approval override: true = auto-approve
+	// every tool call (skip all prompts), false = always ask, nil = inherit the
+	// global daemon setting. The runtime already honors config.AutoApprove; this
+	// exposes it through the HTTP API so clients can read/write it.
+	AutoApprove *bool            `json:"auto_approve,omitempty"`
+	Watch       []WatchEntry     `json:"watch,omitempty"`
+	Heartbeat   *HeartbeatConfig `json:"heartbeat,omitempty"`
 }
 
 // AgentMCPConfigAPI is the JSON-friendly MCP config.
@@ -102,6 +107,7 @@ func (a *Agent) ToAPI() *AgentAPI {
 		// remain shared pointers — that is a pre-existing pattern across this
 		// file and addressing it belongs in a separate cleanup PR.
 		api.Config.Permissions = a.Config.Permissions.Clone()
+		api.Config.AutoApprove = a.Config.AutoApprove
 		api.Config.Watch = a.Config.Watch
 		api.Config.Heartbeat = a.Config.Heartbeat
 	}
@@ -249,6 +255,9 @@ func WriteAgentConfig(agentsDir, name string, cfg *AgentConfigAPI) error {
 	}
 	if cfg.Permissions != nil && !cfg.Permissions.IsEmpty() {
 		m["permissions"] = cfg.Permissions
+	}
+	if cfg.AutoApprove != nil {
+		m["auto_approve"] = *cfg.AutoApprove
 	}
 	if len(cfg.Watch) > 0 {
 		m["watch"] = cfg.Watch

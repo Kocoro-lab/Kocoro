@@ -272,6 +272,40 @@ func TestWriteAgentConfig_PersistsDisplayName(t *testing.T) {
 	}
 }
 
+func TestWriteAgentConfig_AutoApproveRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	yes := true
+	cfg := &AgentConfigAPI{DisplayName: "probe", AutoApprove: &yes}
+	if err := WriteAgentConfig(dir, "agent-abc123", cfg); err != nil {
+		t.Fatalf("WriteAgentConfig: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "agent-abc123", "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var parsed AgentConfig
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if parsed.AutoApprove == nil || *parsed.AutoApprove != true {
+		t.Fatalf("auto_approve not persisted: %+v (yaml: %s)", parsed.AutoApprove, data)
+	}
+	// Read path: ToAPI must echo it back so the editor can hydrate the state.
+	api := (&Agent{Name: "agent-abc123", Prompt: "p", Config: &parsed}).ToAPI()
+	if api.Config == nil || api.Config.AutoApprove == nil || *api.Config.AutoApprove != true {
+		t.Fatalf("ToAPI dropped auto_approve: %+v", api.Config)
+	}
+	// nil (inherit) must be omitted from yaml, not written as false.
+	cfg2 := &AgentConfigAPI{DisplayName: "probe2"}
+	if err := WriteAgentConfig(dir, "agent-def456", cfg2); err != nil {
+		t.Fatalf("WriteAgentConfig nil: %v", err)
+	}
+	d2, _ := os.ReadFile(filepath.Join(dir, "agent-def456", "config.yaml"))
+	if strings.Contains(string(d2), "auto_approve") {
+		t.Errorf("nil AutoApprove should be omitted, got: %s", d2)
+	}
+}
+
 func TestAgent_DisplayLabel(t *testing.T) {
 	cases := []struct {
 		name string
