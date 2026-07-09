@@ -2,6 +2,14 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.3.2 — 2026-07-09 — Accept 0.7.0 memory bundle format
+
+Compatibility patch. The daemon's memory bundle version gate widens from `[0.4.0, 0.7.0)` to `[0.4.0, 0.8.0)` so it accepts the `0.7.0` bundle format (plan4a temporal/event schema). The daemon does not parse bundle internals — it only pulls, gates, downloads, and hands off to the sidecar — so admitting `0.7.0` is safe; without this, `Puller.tick` would reject the `0.7.0` package at the download step and memory updates would stall (not downgrade).
+
+### Changed
+
+- **Memory bundle version gate → `[0.4.0, 0.8.0)`** (`internal/memory/bundle.go`) — `versionInRange` now admits minor versions `4`–`7`, accepting the `0.7.0` bundle format. The sidecar stays the schema-parsing authority; the daemon is the stricter series gate in front of it.
+
 ## v0.3.1 — 2026-07-09 — Remote control + Slack BYOA multi-agent + WeChat iLink + koe voice hardening
 
 Feature-and-fix release building on v0.3.0. A new **remote-control** surface lets a paired device drive the daemon (pair → receive run requests → run). **Slack** gains a bring-your-own-app install proxy with multi-agent routing, and **personal WeChat (iLink)** channel setup is now proxied to Cloud. The **koe** voice front-brain gets barge-in, a custom persona, name-use and audio-processing settings, a reliable end-of-call/dismiss path, and a fix for the commit-empty ask-to-repeat loop. Plus skills, schedule, and approval fixes.
