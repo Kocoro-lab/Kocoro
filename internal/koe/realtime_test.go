@@ -809,6 +809,7 @@ func TestTranscriptCompletedDoesNotCreateResponse(t *testing.T) {
 }
 
 func TestLocalCommitFallbackCommitsWhenServerVADMisses(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
@@ -826,6 +827,7 @@ func TestLocalCommitFallbackCommitsWhenServerVADMisses(t *testing.T) {
 }
 
 func TestLocalCommitFallbackSkipsWhenServerAlreadyCommitted(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
@@ -849,6 +851,7 @@ func TestLocalCommitFallbackSkipsWhenServerAlreadyCommitted(t *testing.T) {
 }
 
 func TestLocalCommitFallbackSkipsWhenServerAlreadyResponded(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
@@ -872,6 +875,7 @@ func TestLocalCommitFallbackSkipsWhenServerAlreadyResponded(t *testing.T) {
 }
 
 func TestLocalCommitFallbackSkipsWhileTaskPending(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
@@ -927,6 +931,7 @@ func TestHandleEventLogsErrorPayload(t *testing.T) {
 // and the user's words are silently lost. The recovery response must instead carry
 // the missed-speech instructions so Koe asks the user to repeat.
 func TestLocalCommitFallbackAsksToRepeatWhenCommitNotAcked(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "40")
 	state := NewCallState("burst-x", "")
@@ -948,10 +953,71 @@ func TestLocalCommitFallbackAsksToRepeatWhenCommitNotAcked(t *testing.T) {
 	}
 }
 
+// TestLocalCommitFallbackCommitEmptyNeverAsksToRepeat reproduces the 2026-07-09
+// Reachy far-field loop: the local gate opens on a <100ms fragment (residual
+// echo / room noise), the manual fallback commit is rejected with
+// input_audio_buffer_commit_empty, and the fallback — after waiting out the full
+// ack window — asked the user to repeat, turning every fragment into a spoken
+// "could not hear you". A commit rejected as EMPTY means the gate opened on a
+// fragment, not that a real utterance was lost: the fallback must drop it
+// silently (no response.create at all), even when explicitly enabled.
+func TestLocalCommitFallbackCommitEmptyNeverAsksToRepeat(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
+	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "200")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(ctx)
+
+	waitUntil(t, func() bool { return cap.countType("input_audio_buffer.commit") == 1 }, "local fallback did not commit input audio")
+	h.handleEvent(ctx, []byte(`{"type":"error","error":{"code":"input_audio_buffer_commit_empty","type":"invalid_request_error","message":"Error committing input audio buffer: buffer only has 0.00ms of audio."}}`))
+
+	time.Sleep(350 * time.Millisecond) // well past the ack window, where the ask-to-repeat used to fire
+	if got := cap.countType("response.create"); got != 0 {
+		t.Fatalf("commit rejected as empty must be dropped silently, got %d response.create (instructions %#v)", got, cap.responseCreateInstructions())
+	}
+}
+
+// TestLocalCommitFallbackDisabledByDefault: the manual-commit fallback is opt-in
+// (KOE_LOCAL_COMMIT_FALLBACK=1). Server-managed VAD with create_response:true
+// handles clear speech on its own; the fallback's premise ("local gate open = a
+// real utterance") breaks in far-field/noisy rooms (Reachy 2026-07-09), where
+// fragment gate-opens became commit_empty rejections and spoken repeat requests.
+func TestLocalCommitFallbackDisabledByDefault(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
+	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "30")
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(ctx)
+
+	time.Sleep(100 * time.Millisecond)
+	if got := cap.countType("input_audio_buffer.commit"); got != 0 {
+		t.Fatalf("fallback must be off by default, got %d commits", got)
+	}
+	if got := cap.countType("response.create"); got != 0 {
+		t.Fatalf("fallback must be off by default, got %d response.create", got)
+	}
+}
+
 // TestLocalCommitFallbackUsesPlainResponseWhenCommitLands: when the server DOES
 // ack the fallback commit (input_audio_buffer.committed), the user's audio became
 // a conversation item, so the response must be a plain response.create.
 func TestLocalCommitFallbackUsesPlainResponseWhenCommitLands(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "500")
 	state := NewCallState("burst-x", "")
@@ -980,6 +1046,7 @@ func TestLocalCommitFallbackUsesPlainResponseWhenCommitLands(t *testing.T) {
 // natural VAD recovery), the fallback must yield instead of stacking a second
 // response.create.
 func TestLocalCommitFallbackYieldsWhenServerRespondsDuringAckWait(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "200")
 	state := NewCallState("burst-x", "")
@@ -1009,6 +1076,7 @@ func TestLocalCommitFallbackYieldsWhenServerRespondsDuringAckWait(t *testing.T) 
 // fallback response hallucinated a stock price while the true do_task result was
 // still 18s away.
 func TestLocalCommitFallbackSkipsWhileTaskInFlight(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "30")
 	state := NewCallState("burst-x", "")
@@ -1040,6 +1108,7 @@ func TestLocalCommitFallbackSkipsWhileTaskInFlight(t *testing.T) {
 // between local speech end and the fallback timer firing must also suppress the
 // fallback (the user's utterance most likely WAS that task request, heard fine).
 func TestLocalCommitFallbackSkipsWhenTaskStartsDuringDelay(t *testing.T) {
+	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "120")
 	t.Setenv("KOE_LOCAL_COMMIT_ACK_MS", "30")
 	state := NewCallState("burst-x", "")

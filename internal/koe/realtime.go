@@ -75,15 +75,24 @@ type eventHandler struct {
 	// asyncTaskPending keeps Desktop/--once in "thinking" after the model's short
 	// spoken ack while do_task is still running or its result speech is queued.
 	asyncTaskPending atomic.Bool
-	// Local speech endpoint fallback: Realtime VAD can miss low-energy post-VPIO
-	// speech even after the local gate has opened. When local speech closes and the
-	// server has not committed or created a response, Koe commits the input buffer
-	// once and asks for a response.
+	// Local speech endpoint fallback (opt-in, KOE_LOCAL_COMMIT_FALLBACK=1):
+	// Realtime VAD can miss low-energy post-VPIO speech even after the local gate
+	// has opened. When local speech closes and the server has not committed or
+	// created a response, Koe commits the input buffer once and asks for a
+	// response. Default off since 2026-07-09: far-field/noisy rooms (Reachy) open
+	// the gate on fragments, and the resulting commit_empty rejections turned
+	// into spoken "could not hear you" loops.
 	localSpeechSeq        atomic.Int64
 	localStartCommitSeq   atomic.Int64
 	localStartResponseSeq atomic.Int64
 	inputCommitSeq        atomic.Int64
-	responseSeq           atomic.Int64
+	// commitEmptySeq counts input_audio_buffer_commit_empty rejections. The
+	// fallback's ack wait snapshots it before the manual commit: a bump means the
+	// buffer held (nearly) no audio — the gate opened on a fragment, not a lost
+	// utterance — so the fallback drops the turn silently instead of asking the
+	// user to repeat.
+	commitEmptySeq atomic.Int64
+	responseSeq    atomic.Int64
 	// lastDoTaskCommitSeq is inputCommitSeq snapshotted at the MOST RECENT do_task
 	// dispatch. A completed result compares it against inputCommitSeq at land-time: if
 	// the user committed a turn since the last do_task (and it did not itself become a
@@ -351,7 +360,7 @@ func (h *eventHandler) maybeRestoreUserMic() {
 }
 
 func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
-	if !koeEnvBool("KOE_LOCAL_COMMIT_FALLBACK", true) {
+	if !koeEnvBool("KOE_LOCAL_COMMIT_FALLBACK", false) {
 		return
 	}
 	if h.asyncTaskPending.Load() || h.taskInFlight() {
@@ -400,6 +409,7 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 		// commit turns it into a real user item. Under semantic_vad the commit is
 		// usually rejected (server-managed buffer, observed live 2026-07-02), so wait
 		// for the ack before deciding how to respond.
+		startCommitEmptySeq := h.commitEmptySeq.Load()
 		_ = h.sendFn(map[string]any{"type": "input_audio_buffer.commit"})
 		ackWait := time.Duration(koeEnvInt("KOE_LOCAL_COMMIT_ACK_MS", defaultLocalCommitAckMS)) * time.Millisecond
 		deadline := time.Now().Add(ackWait)
@@ -424,6 +434,16 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 					log.Printf("koe[timing]: local_commit_fallback seq=%d commit acked", seq)
 				}
 				h.requestResponse()
+				return
+			}
+			if h.commitEmptySeq.Load() != startCommitEmptySeq {
+				// Rejected as EMPTY: the gate opened on a fragment (residual echo /
+				// room noise), not a lost utterance — drop silently. Asking to
+				// repeat here amplified every fragment into a spoken turn
+				// (2026-07-09 Reachy far-field loop).
+				if eventLogEnabled() {
+					log.Printf("koe[timing]: local_commit_fallback seq=%d commit rejected as empty; dropping fragment", seq)
+				}
 				return
 			}
 		}
@@ -799,6 +819,12 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// kocoro-reachy matches: conversation_already_has_active_response).
 		if ev.Error.Code == "conversation_already_has_active_response" {
 			signalNonBlocking(h.respRejected)
+		}
+		// An empty-buffer commit rejection means the manual fallback commit found
+		// (nearly) no audio server-side — signal the fallback's ack wait so it
+		// classifies the turn as a fragment instead of a missed utterance.
+		if ev.Error.Code == "input_audio_buffer_commit_empty" {
+			h.commitEmptySeq.Add(1)
 		}
 	case "response.function_call_arguments.done":
 		args := unwrapArgs(ev.Arguments)
