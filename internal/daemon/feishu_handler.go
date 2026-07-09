@@ -24,10 +24,10 @@ func (s *Server) feishuCloudReady(w http.ResponseWriter) bool {
 	return true
 }
 
-// writeFeishuPassthrough relays Cloud's status code and raw body verbatim so the
+// writeCloudPassthrough relays Cloud's status code and raw body verbatim so the
 // LLM sees Cloud's field-level errors unchanged, without this layer re-modelling
-// them.
-func writeFeishuPassthrough(w http.ResponseWriter, status int, body []byte) {
+// them. Shared by the Feishu/Slack/WeChat channel-setup proxy handlers.
+func writeCloudPassthrough(w http.ResponseWriter, status int, body []byte) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
@@ -82,7 +82,7 @@ func (s *Server) handleCreateFeishuAppInstall(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
 	}
-	writeFeishuPassthrough(w, status, body)
+	writeCloudPassthrough(w, status, body)
 }
 
 // handleListFeishuAppInstalls proxies GET /channels/feishu/app-installs to Cloud.
@@ -97,7 +97,7 @@ func (s *Server) handleListFeishuAppInstalls(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
 	}
-	writeFeishuPassthrough(w, status, body)
+	writeCloudPassthrough(w, status, body)
 }
 
 // handleDeleteFeishuAppInstall proxies DELETE /channels/feishu/app-installs/{id}
@@ -118,5 +118,5 @@ func (s *Server) handleDeleteFeishuAppInstall(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
 	}
-	writeFeishuPassthrough(w, status, body)
+	writeCloudPassthrough(w, status, body)
 }

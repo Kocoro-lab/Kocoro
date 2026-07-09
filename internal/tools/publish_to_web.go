@@ -73,19 +73,34 @@ var pathDenySuffixes = map[string]bool{
 	".gpg":      true,
 }
 
-// defaultExtAllowlist is the baseline set of extensions allowed for publish.
-// Skewed toward "things you'd share with an external recipient" — documents,
-// images, public data, media. Source code, configs, and archives are
-// deliberately excluded because they're the most common accidental leak.
+// defaultExtAllowlist is the built-in set of file extensions publish_to_web may
+// put on the public CDN. It covers common document / office / image / data /
+// media / archive formats. Executable and script types (.exe/.sh/.bat/.js/.jar/
+// .msi/.dmg/.app/.ps1/…) are deliberately EXCLUDED — the CDN is public and such
+// files are a distribution/abuse risk. Extend at runtime via
+// cloud.publish_allowed_extensions.
+//
+// Caveat: the executable/script exclusion is porous for archives — a .zip/.7z/
+// .rar can wrap the very binaries the allowlist rejects, and we do not inspect
+// archive contents. Acceptable because the CDN is already public (anyone could
+// host such a file elsewhere), but callers should not read the archive entries
+// as "scanned/safe".
 var defaultExtAllowlist = map[string]bool{
 	// documents
-	".html": true, ".htm": true, ".md": true, ".txt": true, ".pdf": true,
+	".html": true, ".htm": true, ".md": true, ".txt": true, ".pdf": true, ".rtf": true, ".epub": true,
+	// office documents
+	".docx": true, ".doc": true, ".xlsx": true, ".xls": true, ".pptx": true, ".ppt": true,
+	".odt": true, ".ods": true, ".odp": true,
 	// images
 	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true, ".svg": true,
+	".bmp": true, ".ico": true, ".tif": true, ".tiff": true, ".heic": true, ".avif": true,
 	// data / reports
-	".csv": true, ".json": true,
+	".csv": true, ".tsv": true, ".json": true, ".xml": true, ".yaml": true, ".yml": true, ".log": true,
 	// media
-	".mp4": true, ".mp3": true, ".wav": true, ".webm": true,
+	".mp4": true, ".mov": true, ".m4v": true, ".webm": true, ".mkv": true, ".avi": true,
+	".mp3": true, ".wav": true, ".m4a": true, ".aac": true, ".ogg": true, ".flac": true,
+	// archives
+	".zip": true, ".tar": true, ".gz": true, ".tgz": true, ".7z": true, ".rar": true,
 }
 
 // vaguePurposes are placeholder strings LLMs fall back to when forced to fill
@@ -164,7 +179,11 @@ func (t *PublishToWebTool) Info() agent.ToolInfo {
 			"user via Slack reply'). Vague purposes ('share', 'send it', 'test') are rejected.\n\n" +
 			"Constraints:\n" +
 			"  - 50 MiB hard limit per file\n" +
-			"  - Allowed extensions: html, md, txt, pdf, png, jpg, jpeg, gif, webp, svg, csv, json, mp4, mp3, wav, webm\n" +
+			"  - Allowed: common document (html, md, txt, pdf, rtf, epub), office (docx, xlsx,\n" +
+			"    pptx, doc, xls, ppt, odt/ods/odp), image (png, jpg, gif, webp, svg, bmp, tiff,\n" +
+			"    heic, avif), data (csv, tsv, json, xml, yaml, log), media (mp4, mov, webm, mp3,\n" +
+			"    wav, m4a, aac, ogg, flac) and archive (zip, tar, gz, 7z, rar) formats. Executable\n" +
+			"    and script types are not allowed. Extend via cloud.publish_allowed_extensions.\n" +
 			"  - Each upload returns a fresh URL — no idempotent re-upload\n\n" +
 			"Companion tools: `list_my_published_files` (review what's still live) and\n" +
 			"`retract_published_file` (delete by id)." +

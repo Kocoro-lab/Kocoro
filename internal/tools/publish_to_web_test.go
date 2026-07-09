@@ -193,12 +193,18 @@ func TestPublishSensitiveDisguisedFilenames(t *testing.T) {
 }
 
 func TestPublishExtensionNotInAllowlist(t *testing.T) {
+	// Source/script/executable types stay disallowed even though the allowlist
+	// now covers documents, data (incl. yaml/xml), media and archives (zip/tar/…).
 	for _, p := range []string{
 		"/tmp/source.go",
 		"/tmp/script.py",
-		"/tmp/archive.zip",
 		"/tmp/binary.exe",
-		"/tmp/config.yaml",
+		"/tmp/run.sh",
+		"/tmp/macro.bat",
+		"/tmp/installer.msi",
+		"/tmp/app.dmg",
+		"/tmp/script.ps1",
+		"/tmp/lib.jar",
 		"/tmp/noext",
 	} {
 		t.Run(p, func(t *testing.T) {

@@ -1670,6 +1670,109 @@ func (c *GatewayClient) DeleteSlackAppInstall(ctx context.Context, id string) (i
 // redirect_url, which must point at this Cloud.
 func (c *GatewayClient) CloudBaseURL() string { return c.baseURL }
 
+// ---------------------------------------------------------------------------
+// Personal WeChat (iLink) — QR-login installs. Cloud owns the iLink client, the
+// long-poll message pump, and install persistence; the daemon only proxies the
+// QR-scan connect flow (qr-start / qr-wait) and install management with the
+// user's API key attached server-side. Mirrors the Slack BYOA proxy above.
+// ---------------------------------------------------------------------------
+
+// WeChatQRStartRequest starts a QR login. agent_name/display_name are optional
+// and, on confirmation, bind the resulting install to that agent.
+type WeChatQRStartRequest struct {
+	AgentName   string `json:"agent_name,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+}
+
+// WeChatQRWaitRequest polls a pending QR login by its session key.
+type WeChatQRWaitRequest struct {
+	SessionKey string `json:"session_key"`
+}
+
+// WeChatQRStart forwards POST /api/v1/channels/wechat/qr-start to Cloud. Returns
+// Cloud's status + raw body (the body carries {session_key, qrcode, qrcode_img}).
+func (c *GatewayClient) WeChatQRStart(ctx context.Context, body WeChatQRStartRequest) (int, []byte, error) {
+	return c.postJSONWithKey(ctx, "/api/v1/channels/wechat/qr-start", body)
+}
+
+// WeChatQRWait forwards POST /api/v1/channels/wechat/qr-wait to Cloud. Returns
+// Cloud's status + raw body ({status, install?}); this is a long-poll the
+// renderer calls repeatedly until status is "confirmed" or "expired".
+func (c *GatewayClient) WeChatQRWait(ctx context.Context, body WeChatQRWaitRequest) (int, []byte, error) {
+	return c.postJSONWithKey(ctx, "/api/v1/channels/wechat/qr-wait", body)
+}
+
+// ListWeChatInstalls fetches the user's WeChat installs from Cloud.
+func (c *GatewayClient) ListWeChatInstalls(ctx context.Context) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/channels/wechat/installs", nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// DeleteWeChatInstall unbinds a WeChat install by id via Cloud.
+func (c *GatewayClient) DeleteWeChatInstall(ctx context.Context, id string) (int, []byte, error) {
+	endpoint := c.baseURL + "/api/v1/channels/wechat/installs/" + url.PathEscape(id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// postJSONWithKey marshals body and POSTs it to endpoint with the user's API
+// key attached, returning Cloud's status + raw body verbatim. Shared by the
+// WeChat qr-start / qr-wait proxies.
+func (c *GatewayClient) postJSONWithKey(ctx context.Context, endpoint string, body any) (int, []byte, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return 0, nil, fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
 // GetTask fetches the full task result from the REST API.
 // Unlike SSE events which truncate at 10K chars, the REST response contains
 // the complete untruncated result.
