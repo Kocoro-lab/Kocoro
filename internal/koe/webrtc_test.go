@@ -119,7 +119,7 @@ func TestMintEphemeralRequest(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ek, err := mintEphemeralAt(context.Background(), srv.URL, "dev-key", "gpt-realtime-mini-2025-12-15")
+	ek, err := mintEphemeralAt(context.Background(), srv.URL, "dev-key", "gpt-realtime-2.1-mini")
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}

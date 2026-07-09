@@ -79,7 +79,7 @@ func TestSendRealtimeUsageDoesNotRetryOn400(t *testing.T) {
 
 func TestReportUsageBuildsBillingBody(t *testing.T) {
 	var got json.RawMessage
-	h := &eventHandler{model: "gpt-realtime-mini-2025-12-15", onUsage: func(b json.RawMessage) { got = b }}
+	h := &eventHandler{model: "gpt-realtime-2.1-mini", onUsage: func(b json.RawMessage) { got = b }}
 	h.reportUsage([]byte(`{"type":"response.done","response":{"id":"resp_1","usage":{"total_tokens":42,"output_token_details":{"audio_tokens":30}}}}`))
 
 	if got == nil {
@@ -87,7 +87,7 @@ func TestReportUsageBuildsBillingBody(t *testing.T) {
 	}
 	s := string(got)
 	if !strings.Contains(s, `"response_id":"resp_1"`) ||
-		!strings.Contains(s, `"model":"gpt-realtime-mini-2025-12-15"`) ||
+		!strings.Contains(s, `"model":"gpt-realtime-2.1-mini"`) ||
 		!strings.Contains(s, `"total_tokens":42`) {
 		t.Errorf("billing body missing fields: %s", s)
 	}

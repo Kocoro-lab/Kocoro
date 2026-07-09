@@ -19,7 +19,7 @@ func TestMintViaDaemon(t *testing.T) {
 			Model string `json:"model"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&got)
-		if got.Model != "gpt-realtime-mini-2025-12-15" {
+		if got.Model != "gpt-realtime-2.1-mini" {
 			t.Errorf("model = %q, want the pinned realtime model", got.Model)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -28,7 +28,7 @@ func TestMintViaDaemon(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ek, err := NewDaemonClient(srv.URL).MintViaDaemon(context.Background(), "gpt-realtime-mini-2025-12-15")
+	ek, err := NewDaemonClient(srv.URL).MintViaDaemon(context.Background(), "gpt-realtime-2.1-mini")
 	if err != nil {
 		t.Fatalf("MintViaDaemon: %v", err)
 	}
