@@ -159,6 +159,7 @@ func TestSourceLabel(t *testing.T) {
 		"slack":    "Slack",
 		"line":     "LINE",     // brand override (all-caps)
 		"wecom":    "WeCom",    // brand override (camel-cased)
+		"wechat":   "WeChat",   // brand override (camel-cased)
 		"feishu":   "Feishu",   // upper-first is already correct
 		"lark":     "Lark",     // upper-first is already correct
 		"telegram": "Telegram", // upper-first is already correct
