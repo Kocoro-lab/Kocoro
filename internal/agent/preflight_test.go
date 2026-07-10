@@ -350,3 +350,100 @@ func TestAgentLoop_MemoryPreflightAuditTraceIncludesErrorClass(t *testing.T) {
 		t.Fatalf("unexpected trace: %+v", decoded)
 	}
 }
+
+func TestAgentLoop_MemoryPreflightDumpPersistsInjectedBlock(t *testing.T) {
+	t.Setenv("SHANNON_PREFLIGHT_DUMP", "1")
+	shannonDir := t.TempDir()
+
+	llm := &budgetCaptureLLMClient{responses: []*client.CompletionResponse{{
+		OutputText:   "ok",
+		FinishReason: "end_turn",
+		Usage:        client.Usage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12},
+	}, {
+		OutputText:   "ok again",
+		FinishReason: "end_turn",
+		Usage:        client.Usage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12},
+	}}}
+	loop := NewAgentLoop(llm, NewToolRegistry(), "medium", shannonDir, 3, 2000, 200, nil, nil, nil)
+	loop.SetSkillDiscovery(false)
+	loop.SetSessionID("sess-dump-1")
+	injected := "<private_memory>\n- Example Contact [strength=corroborated] via collaborated_with\n</private_memory>"
+	loop.SetMemoryPreflight(func(ctx context.Context, query string, opts MemoryPreflightOptions) *MemoryPreflightResult {
+		return &MemoryPreflightResult{Context: injected}
+	})
+
+	if _, _, err := loop.Run(context.Background(), "who is Example Contact to me?", nil, nil); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	dumpPath := filepath.Join(shannonDir, "logs", "preflight_dump.jsonl")
+	data, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("read dump: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("dump lines=%d want 1:\n%s", len(lines), data)
+	}
+	var row struct {
+		Timestamp string `json:"timestamp"`
+		SessionID string `json:"session_id"`
+		Context   string `json:"context"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &row); err != nil {
+		t.Fatalf("decode dump row: %v", err)
+	}
+	if row.SessionID != "sess-dump-1" {
+		t.Fatalf("session_id=%q want sess-dump-1", row.SessionID)
+	}
+	if row.Context != injected {
+		t.Fatalf("context=%q want the injected block verbatim", row.Context)
+	}
+	if row.Timestamp == "" {
+		t.Fatal("timestamp missing")
+	}
+	info, err := os.Stat(dumpPath)
+	if err != nil {
+		t.Fatalf("stat dump: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Fatalf("dump file perm=%o want 0600 (contains private memory content)", perm)
+	}
+
+	// A second run must APPEND a second row, not truncate the file — this is
+	// the assertion that would catch an accidental O_TRUNC regression.
+	if _, _, err := loop.Run(context.Background(), "and who else?", nil, nil); err != nil {
+		t.Fatalf("second Run failed: %v", err)
+	}
+	data, err = os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("re-read dump: %v", err)
+	}
+	lines = strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("dump lines after second run=%d want 2 (append, not truncate):\n%s", len(lines), data)
+	}
+}
+
+func TestAgentLoop_MemoryPreflightDumpDisabledByDefault(t *testing.T) {
+	t.Setenv("SHANNON_PREFLIGHT_DUMP", "") // isolate from ambient env; empty != "1" so the dump stays off
+	shannonDir := t.TempDir()
+
+	llm := &budgetCaptureLLMClient{responses: []*client.CompletionResponse{{
+		OutputText:   "ok",
+		FinishReason: "end_turn",
+		Usage:        client.Usage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12},
+	}}}
+	loop := NewAgentLoop(llm, NewToolRegistry(), "medium", shannonDir, 3, 2000, 200, nil, nil, nil)
+	loop.SetSkillDiscovery(false)
+	loop.SetMemoryPreflight(func(ctx context.Context, query string, opts MemoryPreflightOptions) *MemoryPreflightResult {
+		return &MemoryPreflightResult{Context: "<private_memory>\n- Example Contact\n</private_memory>"}
+	})
+
+	if _, _, err := loop.Run(context.Background(), "who is Example Contact to me?", nil, nil); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(shannonDir, "logs", "preflight_dump.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("dump file must not exist when SHANNON_PREFLIGHT_DUMP is unset, stat err=%v", err)
+	}
+}

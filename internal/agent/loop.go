@@ -2364,6 +2364,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				messages[newMsgOffset] = replaceUserMessageText(messages[newMsgOffset], scaffoldedUserText)
 				client.LogCacheCompactEvent("preflight_inject", newMsgOffset, oldContent, messages[newMsgOffset].Content)
 				trace.ContextInjected = true
+				if preflightDumpEnabled() {
+					dumpPreflightContext(a.shannonDir, a.sessionID, privateContext)
+				}
 			}
 		}
 		if trace.Outcome == "" {

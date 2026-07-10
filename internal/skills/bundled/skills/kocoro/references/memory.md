@@ -150,6 +150,13 @@ Many memory questions are answered on turn 0 without an explicit
   `context_injected` / `outcome` / `error_class` / `http_status`. Query
   text, anchor mentions, relation labels, and recalled content are never
   logged.
+- Debug dump: restarting the daemon with `SHANNON_PREFLIGHT_DUMP=1` appends
+  every injected `<private_memory>` block verbatim to
+  `~/.shannon/logs/preflight_dump.jsonl` (`{timestamp, session_id, context}`
+  rows, file 0600). This is the only record of what the block contained —
+  use it to attribute "did the model ever see fact X" incidents, keep it
+  off in normal operation, and delete the file after debugging (it holds
+  private memory content).
 - Outcomes worth tracing (the rich set is set inside the preflight; loop.go
   only fills `Outcome` if still empty):
   - `context_injected` — happy path, model received the block
