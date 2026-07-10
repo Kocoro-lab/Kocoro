@@ -331,14 +331,18 @@ func TestKoePersonaSummaryAndDesktopDiscipline(t *testing.T) {
 }
 
 // TestKoePersonaUsesRealisticDirectAnswerExamples: nobody asks a voice assistant
-// "1+1" — the direct-answer examples must be the things users actually do:
-// recapping and follow-ups on what was already said in the call.
+// "1+1" — the direct-answer examples must be things users actually do. Since the
+// 2026-07-10 tool-gating rework these span both stable public knowledge the model
+// already holds (how reinforcement learning works, Newton's laws) and recapping
+// what was already said in the call — not just in-call content.
 func TestKoePersonaUsesRealisticDirectAnswerExamples(t *testing.T) {
 	if strings.Contains(koePersona, "1+1") {
 		t.Fatal("koePersona should not use toy arithmetic as the direct-answer example")
 	}
-	if !strings.Contains(koePersona, "already said in this call") {
-		t.Fatal("koePersona direct-answer examples should center on in-call content")
+	for _, want := range []string{"how reinforcement learning works", "recapping anything already said"} {
+		if !strings.Contains(koePersona, want) {
+			t.Fatalf("koePersona direct-answer examples missing %q", want)
+		}
 	}
 }
 
@@ -367,11 +371,14 @@ func TestKoePersonaForbidsDetailQuizzing(t *testing.T) {
 	}
 }
 
-// TestKoePersonaAckIsVariedButContentFree: the do_task acknowledgement allows
-// natural wording variety, but the no-content gate (no answer/number/step before
-// the result) is load-bearing — it is what blocks hallucinated pre-answers.
-func TestKoePersonaAckIsVariedButContentFree(t *testing.T) {
-	for _, want := range []string{"Vary the wording", "must not contain any answer"} {
+// TestKoePersonaAckVariedAndNoPreAnswer: the do_task acknowledgement allows
+// natural, task-fitting wording variety and MAY name the action ("我查一下新闻"),
+// which the pre-2026-07-10 content-free rule wrongly forbade. The load-bearing
+// half survives, narrowed: no answer/number/result before it lands — that is what
+// blocks hallucinated pre-answers. It is also spoken only when do_task is actually
+// being called, so a direct answer never gets a stray "let me check" first.
+func TestKoePersonaAckVariedAndNoPreAnswer(t *testing.T) {
+	for _, want := range []string{"vary it between turns", "You may name what you are about to do", "before it lands", "only when you are actually about to call do_task"} {
 		if !strings.Contains(koePersona, want) {
 			t.Fatalf("koePersona missing ack contract %q", want)
 		}
@@ -381,18 +388,21 @@ func TestKoePersonaAckIsVariedButContentFree(t *testing.T) {
 	}
 }
 
-// TestKoePersonaDividesByInformationSource pins the front/back-brain split: the
-// line is where the answer COMES FROM (conversation-internal one-step vs the
-// outside world), not task difficulty. The old blanket "any number or
-// calculation" rule routed 1+1 through a full agent turn.
+// TestKoePersonaDividesByInformationSource pins the split: the line is the NATURE
+// OF THE INFORMATION the answer needs — stable public knowledge the model holds vs
+// current/private/action — not task difficulty, and not the model's own sense of
+// what it knows. The 2026-07-10 rework dropped the "your memory is unreliable"
+// scare that pushed even settled knowledge (RL, Newton's laws) through do_task.
 func TestKoePersonaDividesByInformationSource(t *testing.T) {
-	for _, want := range []string{"one obvious step", "outside this conversation"} {
+	for _, want := range []string{"one obvious step", "stable and public, versus current"} {
 		if !strings.Contains(koePersona, want) {
 			t.Fatalf("koePersona missing information-source split %q", want)
 		}
 	}
-	if strings.Contains(koePersona, "any number or calculation") {
-		t.Fatal("koePersona must not keep the blanket number/calculation ban")
+	for _, banned := range []string{"any number or calculation", "memory of the world", "calling the tool IS the answer"} {
+		if strings.Contains(koePersona, banned) {
+			t.Fatalf("koePersona must not keep removed scare/ban %q", banned)
+		}
 	}
 }
 
