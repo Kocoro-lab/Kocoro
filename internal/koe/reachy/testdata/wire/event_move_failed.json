@@ -1,0 +1,11 @@
+{
+  "type": "motion_event",
+  "payload": {
+    "event": "move_failed",
+    "data": {
+      "id": "m-9f2c",
+      "reason": "motor bus error"
+    },
+    "ts": "2026-07-09T12:00:04Z"
+  }
+}

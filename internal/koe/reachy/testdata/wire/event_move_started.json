@@ -1,0 +1,12 @@
+{
+  "type": "motion_event",
+  "payload": {
+    "event": "move_started",
+    "data": {
+      "id": "m-9f2c",
+      "name": "happy1",
+      "duration_s": 2.4
+    },
+    "ts": "2026-07-09T12:00:01Z"
+  }
+}

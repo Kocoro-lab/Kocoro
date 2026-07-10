@@ -1,0 +1,12 @@
+{
+  "type": "motion_rpc_result",
+  "payload": {
+    "request_id": "r-003",
+    "ok": false,
+    "error": {
+      "code": "unknown_move",
+      "message": "no such move: happy99",
+      "retriable": false
+    }
+  }
+}

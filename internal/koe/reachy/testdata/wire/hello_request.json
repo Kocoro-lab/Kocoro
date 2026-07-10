@@ -1,0 +1,14 @@
+{
+  "type": "motion_rpc_request",
+  "payload": {
+    "request_id": "r-001",
+    "method": "system.hello",
+    "params": {
+      "proto": "1.0",
+      "client": "koe",
+      "client_version": "0.2.1"
+    },
+    "timeout_ms": 3000,
+    "ts": "2026-07-09T12:00:00Z"
+  }
+}

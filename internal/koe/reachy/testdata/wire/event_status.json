@@ -1,0 +1,12 @@
+{
+  "type": "motion_event",
+  "payload": {
+    "event": "status",
+    "data": {
+      "motors_ok": true,
+      "daemon_ok": true,
+      "queue_len": 0
+    },
+    "ts": "2026-07-09T12:00:02Z"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "type": "motion_rpc_result",
+  "payload": {
+    "request_id": "r-001",
+    "ok": true,
+    "result": {
+      "proto": "1.0",
+      "bridge_version": "0.1.0",
+      "sdk_version": "1.8.0",
+      "moves": [
+        "happy1",
+        "dance_samba"
+      ],
+      "capabilities": [
+        "moves",
+        "look_at",
+        "listening",
+        "wobble",
+        "face_offsets",
+        "wake_sleep",
+        "status"
+      ]
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "type": "motion_stream",
+  "payload": {
+    "stream": "face_offsets",
+    "data": {
+      "dx": 0.01,
+      "dy": -0.02,
+      "dz": 0,
+      "droll": 0,
+      "dpitch": 0.05,
+      "dyaw": -0.12
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "type": "motion_event",
+  "payload": {
+    "event": "move_finished",
+    "data": {
+      "id": "m-9f2c"
+    },
+    "ts": "2026-07-09T12:00:04Z"
+  }
+}

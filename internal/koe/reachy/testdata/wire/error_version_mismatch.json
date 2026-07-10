@@ -1,0 +1,12 @@
+{
+  "type": "motion_rpc_result",
+  "payload": {
+    "request_id": "r-001",
+    "ok": false,
+    "error": {
+      "code": "version_mismatch",
+      "message": "bridge speaks 2.0, client asked 1.0",
+      "retriable": false
+    }
+  }
+}

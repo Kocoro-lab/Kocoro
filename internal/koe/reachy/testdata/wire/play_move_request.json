@@ -1,0 +1,13 @@
+{
+  "type": "motion_rpc_request",
+  "payload": {
+    "request_id": "r-002",
+    "method": "motion.play_move",
+    "params": {
+      "name": "happy1",
+      "preempt": false
+    },
+    "timeout_ms": 3000,
+    "ts": "2026-07-09T12:00:01Z"
+  }
+}

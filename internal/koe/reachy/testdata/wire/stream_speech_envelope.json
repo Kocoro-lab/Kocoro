@@ -1,0 +1,9 @@
+{
+  "type": "motion_stream",
+  "payload": {
+    "stream": "speech_envelope",
+    "data": {
+      "level": 0.42
+    }
+  }
+}

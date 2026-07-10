@@ -1,0 +1,11 @@
+{
+  "type": "motion_rpc_result",
+  "payload": {
+    "request_id": "r-002",
+    "ok": true,
+    "result": {
+      "move_id": "m-9f2c",
+      "queued": 1
+    }
+  }
+}
