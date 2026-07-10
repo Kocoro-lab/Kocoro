@@ -163,15 +163,16 @@ type AutoTitlePatcher interface {
 var TitleTriggerTurns = map[int]bool{1: true, 3: true}
 
 // brandDisplayNames overrides the default upper-first casing for sources whose
-// canonical brand spelling differs (LINE is all-caps, WeCom is camel-cased).
+// canonical brand spelling differs (LINE is all-caps, WeCom/WeChat are camel-cased).
 // slack/feishu/lark/telegram/webhook upper-first to their correct form, so they
 // need no entry. routeTitle (internal/daemon/runner.go) does the same
 // upper-first transform on the raw source — keep that in sync; the helper here
 // is the single source of truth, but routeTitle builds its own prefix string
 // for the instant placeholder before this package is reachable.
 var brandDisplayNames = map[string]string{
-	"line":  "LINE",
-	"wecom": "WeCom",
+	"line":   "LINE",
+	"wecom":  "WeCom",
+	"wechat": "WeChat",
 }
 
 // SourceLabel returns the human label for an IM-style source ("slack" →

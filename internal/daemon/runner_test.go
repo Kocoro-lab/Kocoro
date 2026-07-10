@@ -35,6 +35,7 @@ func TestCacheSourceFromDaemonSource(t *testing.T) {
 		{"  line  ", "line"},
 		{"feishu", "feishu"},
 		{"wecom", "wecom"},
+		{"wechat", "wechat"}, // personal WeChat (iLink): human-conversation long bucket
 		{"teams", "teams"},
 		{"telegram", "telegram"},
 		{"tui", "tui"},

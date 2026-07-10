@@ -16,7 +16,7 @@ import (
 // "markdown". This guards against adding a source to one path but not the other.
 func TestCloudSourceDefinitionsAgree(t *testing.T) {
 	inputs := []string{
-		"slack", "line", "feishu", "lark", "wecom", "teams", "telegram", "webhook",
+		"slack", "line", "feishu", "lark", "wecom", "wechat", "teams", "telegram", "webhook",
 		"desktop", "cli", "cron", "schedule", "web", "", "unknown",
 		"SLACK", " Slack ", "FEISHU", " Lark ",
 		"koe", "koe-reachy", " KOE ",
@@ -50,6 +50,7 @@ func TestIsCloudSource(t *testing.T) {
 		"feishu":   true,
 		"lark":     true,
 		"wecom":    true,
+		"wechat":   true,
 		"telegram": true,
 		"webhook":  true,
 		"desktop":  false,
