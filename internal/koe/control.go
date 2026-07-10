@@ -26,6 +26,7 @@ var (
 //	{"type":"voice_state","state":"idle"|"listening"|"thinking"|"speaking"[,"level":0..1][,"task_pending":true][,"mic":"off"]}
 //	{"type":"control_app","action":"show"|"hide"|"new_conversation"|"open_settings"}
 //	{"type":"call_state","state":"connecting"|"on_call"|"ended"}
+//	{"type":"bridge_status","state":"disabled"|"connecting"|"connected"|"degraded"}
 //
 // level (D3w) is an additive, omitempty field carrying the reactive RMS amplitude
 // while listening (input) / speaking (output) so the Desktop Island sprite tracks
@@ -69,6 +70,9 @@ type ControlServer struct {
 	micOff      func() bool
 	token       string       // optional Bearer token for Desktop-owned requests
 	lastVoice   atomic.Value // string: last voice_state, replayed by ReemitVoiceState
+
+	carrier      *CarrierProfile // resolved carrier identity for GET /carrier/status (nil = not injected)
+	carrierBound func() bool     // reports audio.bound; nil → false
 }
 
 // NewControlServer wires the Desktop-driven start/end callbacks (either may be nil).
@@ -96,6 +100,15 @@ func (s *ControlServer) SetToken(token string) { s.token = token }
 func (s *ControlServer) SetSnapshotProviders(taskPending, micOff func() bool) {
 	s.taskPending = taskPending
 	s.micOff = micOff
+}
+
+// SetCarrierProfile wires GET /carrier/status. Called once at startup before
+// Handler() serves — no locking needed. audioBound reports whether Koe is bound
+// to explicit device UIDs rather than the system default (§03 audio.bound); nil
+// reports false.
+func (s *ControlServer) SetCarrierProfile(p CarrierProfile, audioBound func() bool) {
+	s.carrier = &p
+	s.carrierBound = audioBound
 }
 
 func (s *ControlServer) stampVoice(ev controlEvent) controlEvent {
@@ -164,6 +177,9 @@ func (s *ControlServer) Handler() http.Handler {
 		writeControlOK(w)
 	})
 	mux.HandleFunc("GET /events", s.handleEvents)
+	mux.HandleFunc("GET /carrier/status", func(w http.ResponseWriter, r *http.Request) {
+		s.writeCarrierStatus(w)
+	})
 	if s.token == "" {
 		return mux
 	}
@@ -272,4 +288,67 @@ func (s *ControlServer) EmitCallState(state string) {
 // unconditionally.
 func (s *ControlServer) EmitMicStatus(status string) {
 	s.broadcast(controlEvent{Type: "mic_status", State: status})
+}
+
+// EmitBridgeStatus reports the motion-bridge connection state to Desktop (the
+// Kocoro Robot card "motion" light). Additive flat event; M1 always emits
+// "disabled" (no bridge yet), M3 drives connecting/connected/degraded.
+func (s *ControlServer) EmitBridgeStatus(state string) {
+	s.broadcast(controlEvent{Type: "bridge_status", State: state})
+}
+
+// bridgeStateDisabled is the only bridge state Koe reports in M1 (no motion
+// bridge yet); M3 drives connecting/connected/degraded.
+const bridgeStateDisabled = "disabled"
+
+// carrierStatusResponse is the GET /carrier/status body (desktop-koe-carrier-
+// control-spec §3). Additive + field-presence-gated on the Desktop side: an old
+// Koe with no route 404s, which Desktop reads as "feature absent".
+type carrierStatusResponse struct {
+	Carrier string              `json:"carrier"`
+	Caps    []string            `json:"caps"`
+	Audio   carrierAudioStatus  `json:"audio"`
+	Bridge  carrierBridgeStatus `json:"bridge"`
+	Model   string              `json:"model"`
+	Agent   string              `json:"agent"`
+}
+
+type carrierAudioStatus struct {
+	Backend    string `json:"backend"`
+	MicUID     string `json:"mic_uid"`
+	SpeakerUID string `json:"speaker_uid"`
+	Bound      bool   `json:"bound"`
+}
+
+type carrierBridgeStatus struct {
+	State string `json:"state"`
+}
+
+func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
+	var p CarrierProfile
+	if s.carrier != nil {
+		p = *s.carrier
+	}
+	caps := p.Caps
+	if caps == nil {
+		caps = []string{} // never serialize null — Desktop gates on membership
+	}
+	bound := false
+	if s.carrierBound != nil {
+		bound = s.carrierBound()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(carrierStatusResponse{
+		Carrier: p.Carrier,
+		Caps:    caps,
+		Audio: carrierAudioStatus{
+			Backend:    p.AudioBackend,
+			MicUID:     p.MicUID,
+			SpeakerUID: p.SpeakerUID,
+			Bound:      bound,
+		},
+		Bridge: carrierBridgeStatus{State: bridgeStateDisabled},
+		Model:  p.Model,
+		Agent:  p.Agent,
+	})
 }

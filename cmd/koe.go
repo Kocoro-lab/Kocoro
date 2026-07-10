@@ -45,6 +45,7 @@ type koeConfig struct {
 	speakerDevice   string // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
 	bargeIn         bool   // --barge-in: allow interruption while Kocoro speaks (vpio backend only)
 	bargeInSet      bool   // whether --barge-in was explicit; false must override an inherited debug env
+	carrier         koe.CarrierProfile // resolved carrier identity (--carrier/--caps/--bridge-socket/--reachy-daemon-url); immutable for the process lifetime (§18)
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
 	// mic/ears. All empty/zero = normal mic+speaker device.
 	sayText     string // --say: synthesize this text (macOS say) as the mic input
@@ -242,6 +243,32 @@ func applyAudioProcessing(audio *koe.AudioIO, cfg koeConfig, fullDuplexAEC bool)
 	return decision, nil
 }
 
+// resolveCarrierProfile builds Koe's immutable carrier identity from the resolved
+// cfg plus the four carrier flags, applying the carrier's audio-backend preset to
+// cfg.aec. The preset fires only for reachy_lite (its mic/speaker device UIDs bind
+// on the VPIO backend); mac stays byte-identical. Unknown carrier/caps fail loud —
+// Desktop generates the argv, so a bad value is a bug, not user input.
+func resolveCarrierProfile(cfg *koeConfig, carrier, caps, bridgeSocket, reachyDaemonURL string) (koe.CarrierProfile, error) {
+	prof, err := koe.ParseCarrierProfile(koe.CarrierInputs{
+		Carrier:         carrier,
+		CapsCSV:         caps,
+		BridgeSocket:    bridgeSocket,
+		ReachyDaemonURL: reachyDaemonURL,
+		AEC:             cfg.aec,
+		MicUID:          cfg.micDevice,
+		SpeakerUID:      cfg.speakerDevice,
+		Model:           cfg.model,
+		Agent:           cfg.agent,
+	})
+	if err != nil {
+		return koe.CarrierProfile{}, err
+	}
+	if prof.Carrier == koe.CarrierReachyLite {
+		cfg.aec = prof.AudioBackend
+	}
+	return prof, nil
+}
+
 var koeCmd = &cobra.Command{
 	Use:   "koe",
 	Short: "Voice front-brain: a realtime voice agent that delegates to the daemon",
@@ -321,6 +348,17 @@ var koeCmd = &cobra.Command{
 			return err
 		}
 		cfg.audioProcessing = mode
+
+		carrierFlag, _ := cmd.Flags().GetString("carrier")
+		capsFlag, _ := cmd.Flags().GetString("caps")
+		bridgeSocketFlag, _ := cmd.Flags().GetString("bridge-socket")
+		reachyDaemonURLFlag, _ := cmd.Flags().GetString("reachy-daemon-url")
+		prof, err := resolveCarrierProfile(&cfg, carrierFlag, capsFlag, bridgeSocketFlag, reachyDaemonURLFlag)
+		if err != nil {
+			return err
+		}
+		cfg.carrier = prof
+
 		return runKoeCall(cmd.Context(), cfg)
 	},
 }
@@ -347,6 +385,10 @@ func init() {
 	koeCmd.Flags().Int("audio-period", 0, "debug: renderInto pull size in samples (480 reproduces the framing bug; 0=960)")
 	koeCmd.Flags().Bool("once", false, "debug: exit shortly after the reply finishes")
 	koeCmd.Flags().Int("timeout", 0, "debug: hard exit after N seconds (0=none)")
+	koeCmd.Flags().String("carrier", "", "physical carrier: mac (default) | reachy_lite")
+	koeCmd.Flags().String("caps", "", "capability bits, comma-separated (empty = carrier default set): full_duplex,has_camera,has_body,has_face,has_screen")
+	koeCmd.Flags().String("bridge-socket", "", "reachy motion-bridge UDS path (empty = motion disabled)")
+	koeCmd.Flags().String("reachy-daemon-url", "", "Pollen daemon read-plane URL (reachy_lite default http://127.0.0.1:7534; ignored on mac)")
 	rootCmd.AddCommand(koeCmd)
 }
 
@@ -1399,6 +1441,13 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 
 	ctrl = koe.NewControlServer(startCall, endCall, interruptCall)
 	ctrl.SetToken(cfg.controlToken)
+	// GET /carrier/status: bound = Koe is wired to explicit device UIDs (not the
+	// system default). reachy_lite's fail-loud guarantees both are set; mac with no
+	// UIDs is the system default → false.
+	carrierProfile := cfg.carrier
+	ctrl.SetCarrierProfile(carrierProfile, func() bool {
+		return carrierProfile.MicUID != "" && carrierProfile.SpeakerUID != ""
+	})
 	ctrl.SetSnapshotProviders(
 		func() bool { s := snapState.Load(); return s != nil && s.InFlight() != "" },
 		func() bool { a := snapAudio.Load(); return a != nil && a.UserMicOff() },
