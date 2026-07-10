@@ -387,8 +387,9 @@ func (d *Dispatcher) PrepareDoTask(argsJSON []byte, lang string) (DoTaskRequest,
 // going through Dispatch. status ∈ ok|failed|injected. OutcomeInjected carries an
 // empty say so the front brain doesn't double-speak (the original do_task voices
 // the final result). lang selects the mechanical fallback language (transport
-// failure / busy rejection); see fallbackLang. Completed/injected outcomes speak
-// the back-brain's own text and ignore lang.
+// failure / busy rejection / partial "incomplete" line); see fallbackLang. A fully
+// completed outcome speaks the back-brain's own text and ignores lang; a partial
+// one speaks the canned "incomplete" line in lang instead of its progress tail.
 func MapDoTaskOutcome(out DoTaskOutcome, err error, lang string) SayResult {
 	if err != nil {
 		say := fallbackSay(lang, "transport_failed")
@@ -405,15 +406,23 @@ func MapDoTaskOutcome(out DoTaskOutcome, err error, lang string) SayResult {
 		if out.FailureCode == "user_cancelled" { // runstatus.CodeUserCancelled, mirrored (koe never imports daemon-side packages)
 			return SayResult{Status: "cancelled", FailReason: out.FailureCode}
 		}
-		status := "ok"
+		// A partial run (soft idle timeout / max-iter / force-stop, NOT
+		// user_cancelled) returned only the tail of whatever was streaming when it
+		// died — typically a tool preamble or progress line ("现在整理成结构化报告。").
+		// Reply/SpokenSummary here is that untrustworthy fragment, so voicing it (or
+		// seeding it as a recap digest) reads a progress narration aloud as if it
+		// were the finished result — the same failure the user_cancelled guard above
+		// fixed. Speak a safe status line instead, claim no completion, seed no
+		// digest. Repro: internal/koe/tools_test.go TestMapDoTaskOutcomePartial*.
 		if out.Partial {
-			status = "failed"
+			say := fallbackSay(lang, "incomplete")
+			return SayResult{Status: "failed", SpokenSummary: say, Say: say, FailReason: out.FailureCode}
 		}
 		spoken := out.SpokenSummary
 		if spoken == "" {
 			spoken = out.Reply
 		}
-		return SayResult{Status: status, SpokenSummary: spoken, Say: spoken,
+		return SayResult{Status: "ok", SpokenSummary: spoken, Say: spoken,
 			Context: voiceContextDigest(out.Reply, spoken), FailReason: out.FailureCode}
 	case OutcomeInjected:
 		return SayResult{Status: "injected"}

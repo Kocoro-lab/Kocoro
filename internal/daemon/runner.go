@@ -2858,9 +2858,19 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if isKoeSource(req.Source) {
 		var authored bool
 		koeSpoken, result, authored = projectKoeVoice(result)
-		if !authored && strings.TrimSpace(result) != "" {
-			log.Printf("daemon: koe spoken_summary contract miss (source=%s) — mechanical fallback", req.Source)
+		// Voice-projection provenance. `kind` distinguishes an authored
+		// <spoken_summary> from the mechanical tail fallback; `partial` flags a
+		// soft-stopped run whose tail is an untrustworthy progress fragment (the
+		// koe side then replaces it with a safe line — see MapDoTaskOutcome).
+		// Logged on EVERY koe turn (not just misses) so the authored rate on
+		// COMPLETE runs — the real clean-success signal — is measurable, and so a
+		// mechanical projection on a partial run isn't miscounted as a contract miss.
+		kind := "authored"
+		if !authored {
+			kind = "mechanical"
 		}
+		log.Printf("daemon: koe voice projection source=%s kind=%s partial=%t failure_code=%s spoken_len=%d",
+			req.Source, kind, status.Partial, status.FailureCode, len([]rune(koeSpoken)))
 	}
 
 	// Tracks persistence outcome so the return value can blank SessionID on
