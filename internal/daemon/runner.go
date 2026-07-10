@@ -691,7 +691,14 @@ func (req *RunAgentRequest) EnsureRouteKey() {
 // These sources STAY in cloudSourceSet (no user shell → scratch CWD, skill
 // filtering, banner suppression all keyed off isCloudSource); only their output
 // FORMAT diverges. Other cloud channels (Slack mrkdwn, LINE Flex, WeCom,
-// Telegram) keep "plain" because Cloud owns their final render.
+// WeChat, Telegram) keep "plain" because Cloud owns their final render.
+//
+// WeChat deliberately stays "plain" (NOT here) even though it sends native
+// images/files: Cloud's iLink outbound extracts RAW CDN URLs from the plain
+// text (shannon-cloud wechat_streamer.go / cdn_images.go). Do NOT add it here —
+// a markdown link `[name](url)` would leave a "[name]()" shell after Cloud
+// strips the URL, because its cleanup only removes `![]()` image shells and
+// `<>` autolinks, never `[]()` links.
 var markdownCloudSources = map[string]struct{}{
 	ChannelFeishu: {},
 	ChannelLark:   {},
@@ -891,8 +898,8 @@ func containsCJK(s string) bool {
 
 // silentBannerSources lists request sources whose `agent_reply` should NOT
 // trigger the daemon's reply-complete macOS banner. Cloud-distributed channels
-// (slack/line/feishu/lark/telegram/webhook) are filtered separately via
-// isCloudSource — those deliver the reply elsewhere. The entries here are the
+// (slack/line/feishu/lark/wecom/wechat/teams/telegram/webhook) are filtered
+// separately via isCloudSource — those deliver the reply elsewhere. The entries here are the
 // autonomous local sources that fire frequently without a foregrounded user:
 //   - heartbeat: per-agent self-pings on a timer (internal/heartbeat)
 //   - watcher:   filesystem-change triggered runs (cmd/daemon.go watcher)
@@ -1063,8 +1070,12 @@ func cacheSourceFromDaemonSource(source string) string {
 		return s
 	}
 	switch s {
-	case "slack", "line", "feishu", "lark", "wecom", "teams", "telegram":
+	case "slack", "line", "feishu", "lark", "wecom", "wechat", "teams", "telegram":
 		// Human-conversation channels: idle gaps > 5m are common, 1h pays off.
+		// wechat (iLink) is a personal-DM channel with the same idle profile;
+		// as with koe, the 1h bucket only lands once Cloud's TTL resolver maps
+		// "wechat" to the long bucket — until then an unrecognized source falls
+		// back to 5m (fail cheap), so returning it here is forward-compatible.
 		return s
 	case "tui", "kocoro", "shanclaw":
 		// Interactive sessions: TUI and Kocoro Desktop both have idle gaps >> 5m.
@@ -2067,8 +2078,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// tools (glob, grep, file_read, directory_list) will refuse any relative
 	// paths at the tool level. Web-only and pure-reasoning tasks are unaffected.
 	//
-	// Cloud-routed sources (slack/line/feishu/lark/telegram/webhook) are the
-	// one exception: they arrive with no user shell and no persisted CWD, so a
+	// Cloud-routed sources (slack/line/feishu/lark/wecom/wechat/teams/telegram/webhook)
+	// are the one exception: they arrive with no user shell and no persisted CWD, so a
 	// tool like browser_snapshot(filename="x.md") has nowhere to land and
 	// file_read("x.md") can't resolve it. For those we allocate a per-session
 	// scratch dir under ~/.shannon/tmp/sessions/<id>/ as the lowest-priority

@@ -10,7 +10,7 @@ import (
 // Order of precedence:
 //  1. Explicit Broadcast override (true/false)
 //  2. Smart default by CreatedFromSource:
-//     - Cloud-distributed source (slack/line/feishu/lark/wecom/telegram/webhook) → broadcast
+//     - Cloud-distributed source (slack/line/feishu/lark/wecom/wechat/telegram/webhook) → broadcast
 //     - Other / unknown (webview/tui/cli/one-shot/...) → silent
 //     - Empty CreatedFromSource (pre-feature schedules) → silent (safe)
 //

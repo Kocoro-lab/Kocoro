@@ -252,7 +252,7 @@ func buildStaticSystem(opts PromptOptions) string {
 	sb.WriteString("Three sticky-context lines drive routing: `Source:`, `Agent:`, " +
 		"`IM bindings:`.\n\n" +
 		"**`Source:`** — which surface this turn came from. Cloud-distributed " +
-		"sources (slack, line, feishu, lark, wecom, telegram, webhook) get " +
+		"sources (slack, line, feishu, lark, wecom, wechat, teams, telegram, webhook) get " +
 		"auto-broadcast: your reply text returns to the originating channel " +
 		"with no tool needed. Local sources (webview, tui, cli, one-shot) stay " +
 		"on that surface — your reply does NOT push to IM even when this agent " +
