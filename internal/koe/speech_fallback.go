@@ -17,6 +17,7 @@ var fallbackSpeech = map[string]map[string]string{
 		"misheard":         "我没听清，能再说一次吗？",
 		"clarify_which":    "你是指哪个 agent？",
 		"clarify_unknown":  "我没找到这个 agent，你是指哪一个？",
+		"incomplete":       "这个刚才没能做完，你要我再试一次吗？",
 	},
 	"en": {
 		"transport_failed": "Sorry, I couldn't finish that — there was a connection problem.",
@@ -24,6 +25,7 @@ var fallbackSpeech = map[string]map[string]string{
 		"misheard":         "I didn't catch that — could you say it again?",
 		"clarify_which":    "Which agent do you mean?",
 		"clarify_unknown":  "I couldn't find that agent — which one do you mean?",
+		"incomplete":       "I didn't manage to finish that — want me to try again?",
 	},
 }
 

@@ -194,6 +194,61 @@ func TestMapDoTaskOutcomeCancelledStaysSilent(t *testing.T) {
 	}
 }
 
+// TestMapDoTaskOutcomePartialDoesNotVoiceProgress: a partial run (soft timeout /
+// max-iter / idle stop, NOT user_cancelled) returns only the tail of whatever was
+// streaming — often a tool preamble / progress line ("正在整理成结构化报告。").
+// Voicing that (or seeding it as a recap digest) reads a progress narration aloud
+// as if it were the finished result. A partial outcome must speak a safe status
+// line instead and claim no completion. Repro 2026-07-10: a timed-out MARL research
+// delegation had its progress line "已收集足够信息，现在整理成结构化报告。" projected
+// into spoken_summary.
+func TestMapDoTaskOutcomePartialDoesNotVoiceProgress(t *testing.T) {
+	progress := "已收集足够信息，现在整理成结构化报告。"
+	// Every partial finish reason (idle/deadline timeout, iteration limit, or an
+	// unlabelled soft stop) leaves Reply/SpokenSummary as an untrustworthy progress
+	// tail. None of them may be voiced or seeded as a digest.
+	for _, failure := range []string{"deadline_exceeded", "iteration_limit", ""} {
+		r := MapDoTaskOutcome(DoTaskOutcome{
+			Kind:          OutcomeCompleted,
+			Reply:         progress,
+			SpokenSummary: progress, // mechanical fallback over the partial lastText
+			Partial:       true,
+			FailureCode:   failure,
+		}, nil, "zh")
+		if r.Status != "failed" {
+			t.Fatalf("partial(%q) status = %q, want failed", failure, r.Status)
+		}
+		if strings.Contains(r.Say, progress) || strings.Contains(r.SpokenSummary, progress) {
+			t.Fatalf("partial(%q) must NOT voice the progress line, got say=%q spoken=%q", failure, r.Say, r.SpokenSummary)
+		}
+		if r.Context != "" {
+			t.Fatalf("partial(%q) must not seed a recap digest, got %q", failure, r.Context)
+		}
+		if want := fallbackSay("zh", "incomplete"); r.Say == "" || r.Say != want {
+			t.Fatalf("partial(%q) say = %q, want the safe canned line %q", failure, r.Say, want)
+		}
+	}
+}
+
+// TestMapDoTaskOutcomeCancelBeatsPartial: a user-cancelled run may ALSO be flagged
+// partial (the cancel force-stops mid-stream). The cancel guard runs first, so it
+// must win — status "cancelled" with no speech, never the partial "incomplete"
+// line, so Koe stays silent (the model already acknowledged the stop).
+func TestMapDoTaskOutcomeCancelBeatsPartial(t *testing.T) {
+	r := MapDoTaskOutcome(DoTaskOutcome{
+		Kind:        OutcomeCompleted,
+		Reply:       "正在整理…",
+		Partial:     true,
+		FailureCode: "user_cancelled",
+	}, nil, "zh")
+	if r.Status != "cancelled" {
+		t.Fatalf("cancelled+partial status = %q, want cancelled", r.Status)
+	}
+	if r.Say != "" || r.SpokenSummary != "" || r.Context != "" {
+		t.Fatalf("cancelled+partial must stay silent, got say=%q spoken=%q ctx=%q", r.Say, r.SpokenSummary, r.Context)
+	}
+}
+
 func TestMapDoTaskOutcome(t *testing.T) {
 	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "long done", SpokenSummary: "done"}, nil, "zh"); got.Status != "ok" || got.SpokenSummary != "done" || got.Say != "done" {
 		t.Errorf("completed: %+v", got)
