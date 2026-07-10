@@ -79,6 +79,43 @@ func ToolDefs() []ToolDef {
 	return defs
 }
 
+// ExpressResult is the outcome of an express{intent} call: a body gesture either
+// played (Expressed, with the chosen Clip) or was gated out (Reason ∈
+// invalid_intent|quiet|over_budget|cooldown|not_connected). The model only needs
+// "done"; Clip/Reason are for logs and tests.
+type ExpressResult struct {
+	Expressed bool
+	Clip      string
+	Reason    string
+}
+
+// ExpressFunc plays a body gesture for an emotional intent, applying the express
+// house rules (≤1/response, cooldown, activity tier, clip availability). It is the
+// seam the runtime fills with the MotionController; nil for a carrier with no body
+// (mac), where the express tool is never offered so Dispatch never reaches it.
+type ExpressFunc func(ctx context.Context, intent string) ExpressResult
+
+// expressToolDef builds the express{intent} voice tool. intents is the runtime
+// enum (ExpressIntents()); callers only add it for a carrier with a body.
+func expressToolDef(intents []string) ToolDef {
+	enum, _ := json.Marshal(intents)
+	params := fmt.Sprintf(`{"type":"object","properties":{"intent":{"type":"string","enum":%s,"description":"The emotion to embody as a brief physical gesture."}},"required":["intent"]}`, enum)
+	return ToolDef{Type: "function", Name: "express",
+		Description: "express — play a brief physical gesture with your body to punctuate an emotion (you have a physical robot body). Pick the intent matching the feeling of the moment: happy, excited, curious, attentive, thinking, surprised, sad, sorry, confused, proud, or dance. This is a SILENT side-gesture, not speech — keep talking normally; it never replaces your words and you must never narrate it. Use it sparingly and only when a gesture genuinely fits (a delight, a beat of thought, a surprise), at most once per reply; most replies need none.",
+		Parameters:  obj(params)}
+}
+
+// ToolDefsForCarrier returns the voice tools for a carrier. expressIntents is the
+// express enum for a carrier with a body; when empty (mac) the result is
+// byte-identical to ToolDefs() — no express tool, so the mac session is unchanged.
+func ToolDefsForCarrier(expressIntents []string) []ToolDef {
+	defs := ToolDefs()
+	if len(expressIntents) > 0 {
+		defs = append(defs, expressToolDef(expressIntents))
+	}
+	return defs
+}
+
 // CallState holds the per-call mutable binding + in-flight tracker. burstID is
 // fixed for the call; boundAgent changes via switch_agent; inFlight tracks the
 // active do_task for get_status.
@@ -256,11 +293,16 @@ type Dispatcher struct {
 	resolver   *AgentResolver
 	state      *CallState
 	controlApp ControlAppFunc
+	express    ExpressFunc // nil unless the carrier has a body (SetExpressHandler)
 }
 
 func NewDispatcher(client *DaemonClient, resolver *AgentResolver, state *CallState, controlApp ControlAppFunc) *Dispatcher {
 	return &Dispatcher{client: client, resolver: resolver, state: state, controlApp: controlApp}
 }
+
+// SetExpressHandler wires the body-gesture seam (MotionController). Called only for
+// a carrier with a body; leaving it nil keeps express a graceful no-op.
+func (d *Dispatcher) SetExpressHandler(fn ExpressFunc) { d.express = fn }
 
 // SayResult is the do_task result contract shared with Realtime. Successful
 // results carry Kocoro's complete final user-facing reply plus validated
@@ -372,6 +414,23 @@ func (d *Dispatcher) Dispatch(ctx context.Context, name string, argsJSON []byte)
 			return mustJSON(map[string]string{"status": "failed", "error": err.Error()}), nil
 		}
 		return mustJSON(map[string]string{"status": "ok"}), nil
+	case "express":
+		var a struct {
+			Intent string `json:"intent"`
+		}
+		if err := json.Unmarshal(argsJSON, &a); err != nil || a.Intent == "" {
+			return nil, fmt.Errorf("express requires an intent")
+		}
+		if d.express == nil {
+			// No body on this carrier (or bridge not wired): accept silently so the
+			// model isn't derailed by an error it can't act on.
+			return mustJSON(map[string]string{"status": "skipped"}), nil
+		}
+		res := d.express(ctx, a.Intent)
+		if res.Expressed {
+			return mustJSON(map[string]string{"status": "expressed"}), nil
+		}
+		return mustJSON(map[string]string{"status": "skipped"}), nil
 	case "switch_agent":
 		var a struct {
 			Agent string `json:"agent"`

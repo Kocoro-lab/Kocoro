@@ -104,6 +104,56 @@ func TestExpressGate_AllKnownIntentsResolve(t *testing.T) {
 	}
 }
 
+func TestExpressGate_SetAvailableMovesFiltersToExposedClips(t *testing.T) {
+	now := time.Unix(1000, 0)
+	g := NewExpressGate(ActivityStandard, WithClock(fixedClock(&now)))
+	// The bridge exposes only a subset of the "happy" pool
+	// (cheerful1/laughing1/laughing2/loving1/relief1).
+	g.SetAvailableMoves([]string{"laughing1", "loving1", "curious1"})
+	allowed := map[string]bool{"laughing1": true, "loving1": true}
+	for i := 0; i < 8; i++ {
+		g.NewResponse()
+		now = now.Add(30 * time.Second)
+		clip, ok, _ := g.Allow("happy")
+		if !ok {
+			t.Fatalf("happy should fire (iter %d)", i)
+		}
+		if !allowed[clip] {
+			t.Errorf("clip %q is not in the exposed subset — a missing clip would make the bridge reject it (unknown_move)", clip)
+		}
+	}
+}
+
+func TestExpressGate_SetAvailableMovesDropsFullyMissingIntent(t *testing.T) {
+	now := time.Unix(1000, 0)
+	g := NewExpressGate(ActivityStandard, WithClock(fixedClock(&now)))
+	// Expose NONE of the "sad" pool (sad1/sad2/downcast1/lonely1) but a "happy" clip.
+	g.SetAvailableMoves([]string{"laughing1", "curious1"})
+	if _, ok, reason := g.Allow("sad"); ok || reason != "invalid_intent" {
+		t.Errorf("an intent whose entire pool is missing must skip as invalid_intent: ok=%v reason=%q", ok, reason)
+	}
+	g.NewResponse()
+	now = now.Add(30 * time.Second)
+	if _, ok, _ := g.Allow("happy"); !ok {
+		t.Error("happy should still fire (laughing1 is exposed)")
+	}
+}
+
+func TestExpressGate_SetAvailableMovesEmptyKeepsFullMapping(t *testing.T) {
+	// A disconnected/never-filtered gate (no bridge moves yet) must behave as the
+	// unfiltered gate — an empty move set means "unknown", not "nothing allowed".
+	now := time.Unix(1000, 0)
+	g := NewExpressGate(ActivityStandard, WithClock(fixedClock(&now)))
+	g.SetAvailableMoves(nil)
+	for _, intent := range ExpressIntents() {
+		g.NewResponse()
+		now = now.Add(30 * time.Second)
+		if _, ok, _ := g.Allow(intent); !ok {
+			t.Errorf("intent %q should still resolve when the move set is empty (unfiltered)", intent)
+		}
+	}
+}
+
 func TestExpressIntents_IsSmallEnum(t *testing.T) {
 	// §19: the enum must stay small (realtime 16k tool budget); ~12 intents.
 	if n := len(ExpressIntents()); n == 0 || n > 16 {

@@ -1,7 +1,10 @@
 package koe
 
 import (
+	"log"
 	"math/rand"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -61,15 +64,19 @@ func ExpressIntents() []string {
 }
 
 // ExpressGate is the Koe-side deterministic gate for express{intent}. Not
-// goroutine-safe: the realtime dispatch loop owns it single-threaded.
+// goroutine-safe: the realtime dispatch loop (via MotionController) owns it
+// single-threaded and serializes Allow / NewResponse / SetAvailableMoves.
 type ExpressGate struct {
 	tier     ActivityTier
 	cooldown time.Duration
 	lastFire time.Time
 	fired    bool // an express already fired in the current response (≤1/response)
 	lastClip map[string]string
-	pick     func(n int) int
-	now      func() time.Time
+	// clips is this gate's live intent→clip pool: a copy of intentClips, narrowed
+	// to what the bridge actually exposes via SetAvailableMoves (spec §5 hello.moves).
+	clips map[string][]string
+	pick  func(n int) int
+	now   func() time.Time
 }
 
 // ExpressOption configures an ExpressGate (clock/picker injection for tests).
@@ -87,6 +94,7 @@ func NewExpressGate(tier ActivityTier, opts ...ExpressOption) *ExpressGate {
 		tier:     tier,
 		cooldown: cooldownForTier(tier),
 		lastClip: make(map[string]string),
+		clips:    cloneClipMap(intentClips),
 		pick:     func(n int) int { return rand.Intn(n) },
 		now:      time.Now,
 	}
@@ -112,7 +120,7 @@ func (g *ExpressGate) NewResponse() { g.fired = false }
 // invalid_intent | quiet | over_budget | cooldown. A skip is silent (no motion,
 // no interruption of speech).
 func (g *ExpressGate) Allow(intent string) (clip string, ok bool, reason string) {
-	clips, known := intentClips[intent]
+	clips, known := g.clips[intent]
 	if !known || len(clips) == 0 {
 		return "", false, "invalid_intent"
 	}
@@ -131,6 +139,56 @@ func (g *ExpressGate) Allow(intent string) (clip string, ok bool, reason string)
 	g.lastFire = now
 	g.lastClip[intent] = clip
 	return clip, true, ""
+}
+
+// SetAvailableMoves narrows each intent's clip pool to the moves the bridge
+// actually exposes (spec §5 hello.moves). A clip absent from the current dataset
+// would make the bridge reject the play with unknown_move AFTER the gate already
+// spent the response budget + cooldown — a silent no-op — so it is dropped here
+// (logged). An intent whose entire pool is missing goes dark (Allow →
+// invalid_intent). An empty move set means "not connected / unknown" and restores
+// the full mapping — the unfiltered default, never "nothing allowed". Always
+// re-derived from the canonical intentClips so reconnects are idempotent.
+func (g *ExpressGate) SetAvailableMoves(moves []string) {
+	if len(moves) == 0 {
+		g.clips = cloneClipMap(intentClips)
+		return
+	}
+	avail := make(map[string]bool, len(moves))
+	for _, m := range moves {
+		avail[m] = true
+	}
+	filtered := make(map[string][]string, len(intentClips))
+	var dropped []string
+	for intent, pool := range intentClips {
+		kept := make([]string, 0, len(pool))
+		for _, c := range pool {
+			if avail[c] {
+				kept = append(kept, c)
+			} else {
+				dropped = append(dropped, c)
+			}
+		}
+		if len(kept) > 0 {
+			filtered[intent] = kept
+		}
+	}
+	g.clips = filtered
+	if len(dropped) > 0 {
+		sort.Strings(dropped)
+		log.Printf("koe[express]: %d clip(s) not in the bridge move set, dropped from intent pools: %s",
+			len(dropped), strings.Join(dropped, ", "))
+	}
+}
+
+func cloneClipMap(src map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(src))
+	for k, v := range src {
+		cp := make([]string, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
 }
 
 // resolveVariant picks a clip for the intent, avoiding the one it played last for

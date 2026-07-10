@@ -52,6 +52,11 @@ type eventHandler struct {
 	// ending becomes true.
 	terminalMu sync.Mutex
 	ending     atomic.Bool
+	// onResponseStarted (nil-safe) fires on each response.created — the start of a
+	// new model response. The express body-gesture gate uses it to reset its
+	// ≤1/response budget so the next response may express again. nil for carriers
+	// with no body (mac) and in unit tests.
+	onResponseStarted func()
 	// curState holds the last emitted voice state (string) so the D3w level pump
 	// knows whether to report input (listening) or output (speaking) RMS.
 	curState atomic.Value
@@ -1830,6 +1835,13 @@ func outcomeKindLog(kind OutcomeKind) string {
 // off and uses create_response=false so Koe can first ask the same S2S model a
 // narrow raw-audio floor question; no transcript gates the normal turn.
 func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
+	return sessionConfigForCarrier(persona, voice, fullDuplexAEC, nil)
+}
+
+// sessionConfigForCarrier builds the session.update. expressIntents adds the
+// express{intent} tool for a carrier with a body; empty (mac) yields a tool set
+// byte-identical to the pre-carrier build.
+func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressIntents []string) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
 	interruptResponse := false
 	if fullDuplexAEC {
@@ -1894,7 +1906,7 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 				"input":  input,
 				"output": map[string]any{"voice": voice},
 			},
-			"tools":               ToolDefs(),
+			"tools":               ToolDefsForCarrier(expressIntents),
 			"tool_choice":         "auto",
 			"parallel_tool_calls": true,
 			"reasoning": map[string]any{
@@ -2200,6 +2212,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		matchedPending := h.bindCreatedResponse(ev.Response.ID, ev.Response.Metadata)
 		h.setActiveResponseID(ev.Response.ID)
 		h.responseSeq.Add(1)
+		if h.onResponseStarted != nil {
+			h.onResponseStarted() // reset the express ≤1/response budget for the new response
+		}
 		h.responseCreatedAt = time.Now()
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: response_created after_speech_stop_ms=%d", elapsedMS(h.speechStoppedAt, h.responseCreatedAt))

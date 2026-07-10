@@ -37,14 +37,14 @@ type koeConfig struct {
 	qwenModel       string
 	qwenVoice       string
 	language        string
-	controlPort     string // Desktop↔Koe control server port (Kocoro Desktop passes it); empty = no control channel
-	controlToken    string // Desktop-owned Bearer token from KOE_CONTROL_TOKEN; never passed via argv
-	aec             string // echo control: "" / "gate" = oto half-duplex fallback, "vpio" = Apple VoiceProcessingIO full-duplex AEC
-	audioProcessing string // auto | mac_voice | clean_device; controls whether VPIO applies or bypasses Apple's voice processing
-	micDevice       string // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
-	speakerDevice   string // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
-	bargeIn         bool   // --barge-in: allow interruption while Kocoro speaks (vpio backend only)
-	bargeInSet      bool   // whether --barge-in was explicit; false must override an inherited debug env
+	controlPort     string             // Desktop↔Koe control server port (Kocoro Desktop passes it); empty = no control channel
+	controlToken    string             // Desktop-owned Bearer token from KOE_CONTROL_TOKEN; never passed via argv
+	aec             string             // echo control: "" / "gate" = oto half-duplex fallback, "vpio" = Apple VoiceProcessingIO full-duplex AEC
+	audioProcessing string             // auto | mac_voice | clean_device; controls whether VPIO applies or bypasses Apple's voice processing
+	micDevice       string             // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
+	speakerDevice   string             // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
+	bargeIn         bool               // --barge-in: allow interruption while Kocoro speaks (vpio backend only)
+	bargeInSet      bool               // whether --barge-in was explicit; false must override an inherited debug env
 	carrier         koe.CarrierProfile // resolved carrier identity (--carrier/--caps/--bridge-socket/--reachy-daemon-url); immutable for the process lifetime (§18)
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
 	// mic/ears. All empty/zero = normal mic+speaker device.
@@ -1017,6 +1017,10 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	personaHolder.Store(&base)
 
 	var ctrl *koe.ControlServer
+	// motionCtrl is the process-long reachy motion-bridge client for a carrier with a
+	// body (nil for mac / no bridge socket). Assigned after ctrl is built; captured by
+	// newSessionState (express handler) + connectWith (express tool + response reset).
+	var motionCtrl *koe.MotionController
 	// endCall is forward-declared so the connect closure can pass it as ConnectOptions.
 	// OnEndCall (the end_call voice tool hook) — it is assigned further down, next to
 	// startCall/interruptCall, and read only at call time.
@@ -1036,6 +1040,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			ctrl.EmitControlApp(action)
 			return nil
 		})
+		if motionCtrl != nil {
+			disp.SetExpressHandler(motionCtrl.Express) // body carrier: wire the express gesture seam
+		}
 		return state, disp
 	}
 	if cfg.provider != koe.ProviderQwen {
@@ -1312,6 +1319,12 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				return seq == sessionSeq && callActive
 			}
 
+			var expressIntents []string
+			var onResponseStarted func()
+			if motionCtrl != nil {
+				expressIntents = koe.ExpressIntents()
+				onResponseStarted = motionCtrl.NewResponse
+			}
 			connectOpts := koe.ConnectOptions{
 				OnVoiceState:  onVoiceState,
 				OnCallState:   onCallState,
@@ -1324,9 +1337,11 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 						endCall()
 					}
 				}, // end_call voice tool → hang up + goodbye earcon; endCall is forward-declared (assigned below)
-				Language:      cfg.language,
-				FullDuplexAEC: fullDuplexAEC,
-				OnClosed:      func(err error) { handleSessionClosed(seq, err) },
+				Language:          cfg.language,
+				FullDuplexAEC:     fullDuplexAEC,
+				OnClosed:          func(err error) { handleSessionClosed(seq, err) },
+				ExpressIntents:    expressIntents,
+				OnResponseStarted: onResponseStarted,
 			}
 			persona := desktopSessionPersona(*personaHolder.Load(), reason)
 			conn, provider, cerr := connector.connect(sessionCtx, audio, persona, state, disp, connectOpts)
@@ -1448,6 +1463,18 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	ctrl.SetCarrierProfile(carrierProfile, func() bool {
 		return carrierProfile.MicUID != "" && carrierProfile.SpeakerUID != ""
 	})
+	// Motion bridge (carrier with a body): a process-long client that plays express
+	// gestures and drives bridge_status. nil for mac / no bridge socket, so express
+	// stays unwired and the tool is never offered.
+	if carrierProfile.HasCap(koe.CapHasBody) && carrierProfile.BridgeSocket != "" {
+		motionCtrl = koe.NewMotionController(carrierProfile.BridgeSocket, koe.ActivityStandard, func(s string) {
+			if ctrl != nil {
+				ctrl.EmitBridgeStatus(s)
+			}
+		})
+		go motionCtrl.Run(ctx)
+		log.Printf("koe[reachy]: motion bridge client starting (socket %s)", carrierProfile.BridgeSocket)
+	}
 	ctrl.SetSnapshotProviders(
 		func() bool { s := snapState.Load(); return s != nil && s.InFlight() != "" },
 		func() bool { a := snapAudio.Load(); return a != nil && a.UserMicOff() },

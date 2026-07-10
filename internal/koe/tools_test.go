@@ -889,3 +889,82 @@ func TestPerCallAgentOverrideTrustsNativeExplicitAgent(t *testing.T) {
 		t.Fatalf("rollback guard rejected contained agent: req=%+v clarify=%+v err=%v", req, clarify, err)
 	}
 }
+
+func TestToolDefsForCarrierByteIdenticalWithoutBody(t *testing.T) {
+	a, _ := json.Marshal(ToolDefs())
+	b, _ := json.Marshal(ToolDefsForCarrier(nil))
+	if string(a) != string(b) {
+		t.Error("a no-body carrier (mac) must get a byte-identical tool set — no express tool")
+	}
+}
+
+func TestToolDefsForCarrierAddsExpressWithBody(t *testing.T) {
+	defs := ToolDefsForCarrier(ExpressIntents())
+	var found *ToolDef
+	for i := range defs {
+		if defs[i].Name == "express" {
+			found = &defs[i]
+		}
+	}
+	if found == nil {
+		t.Fatal("a carrier with a body must get the express tool")
+	}
+	if !strings.Contains(string(found.Parameters), `"happy"`) || !strings.Contains(string(found.Parameters), `"dance"`) {
+		t.Errorf("express tool params must enumerate the intents, got %s", found.Parameters)
+	}
+}
+
+func TestDispatchExpressExpressed(t *testing.T) {
+	state := NewCallState("b", "default")
+	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	var gotIntent string
+	d.SetExpressHandler(func(ctx context.Context, intent string) ExpressResult {
+		gotIntent = intent
+		return ExpressResult{Expressed: true, Clip: "cheerful1"}
+	})
+	out, err := d.Dispatch(context.Background(), "express", []byte(`{"intent":"happy"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotIntent != "happy" {
+		t.Errorf("intent not forwarded: %q", gotIntent)
+	}
+	if !strings.Contains(string(out), "expressed") {
+		t.Errorf("expected expressed status, got %s", out)
+	}
+}
+
+func TestDispatchExpressSkipped(t *testing.T) {
+	state := NewCallState("b", "default")
+	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	d.SetExpressHandler(func(ctx context.Context, intent string) ExpressResult {
+		return ExpressResult{Reason: "cooldown"}
+	})
+	out, err := d.Dispatch(context.Background(), "express", []byte(`{"intent":"happy"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "skipped") {
+		t.Errorf("a gated express must report skipped, got %s", out)
+	}
+}
+
+func TestDispatchExpressNoHandlerSkipsGracefully(t *testing.T) {
+	// mac (no body) leaves the handler nil; the tool is never offered, but if it is
+	// ever called it must skip cleanly, not error/derail the model.
+	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), NewCallState("b", "default"), nil)
+	out, err := d.Dispatch(context.Background(), "express", []byte(`{"intent":"happy"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "skipped") {
+		t.Errorf("no-handler express must skip gracefully, got %s", out)
+	}
+}
+
+func TestDispatchExpressRequiresIntent(t *testing.T) {
+	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), NewCallState("b", "default"), nil)
+	if _, err := d.Dispatch(context.Background(), "express", []byte(`{}`)); err == nil {
+		t.Error("express with no intent must error (missing required field)")
+	}
+}

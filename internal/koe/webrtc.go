@@ -753,6 +753,13 @@ type ConnectOptions struct {
 	// read only while CallActive is true; idle and prewarmed sessions upload none.
 	// OpenAI ignores this field and keeps its existing image-input path.
 	VideoSource *RealtimeVideoSource
+	// ExpressIntents is the express{intent} enum for a carrier with a body (Reachy).
+	// Non-empty adds the express voice tool to the session; empty (mac) keeps the
+	// tool set byte-identical to the pre-carrier build.
+	ExpressIntents []string
+	// OnResponseStarted (nil-safe) fires on each response.created — the express gate
+	// resets its ≤1/response budget here. Wired only for a carrier with a body.
+	OnResponseStarted func()
 }
 
 // defaultSessionConfigTimeoutMS bounds how long Connect waits for OpenAI to ack our
@@ -858,7 +865,7 @@ func realtimeSessionPayload(provider RealtimeProvider, persona, openAIVoice, qwe
 	if provider == ProviderQwen {
 		return qwenSessionConfig(persona, qwenVoice, hasLiveVideo)
 	}
-	return sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
+	return sessionConfigForCarrier(persona, openAIVoice, opts.FullDuplexAEC, opts.ExpressIntents)
 }
 
 func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvider, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions, dial func(*RealtimeConn) error) (*RealtimeConn, error) {
@@ -893,6 +900,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	// Only that dialect gets the ledger's lazy bind; other providers keep the
 	// original no-authority-without-a-bind contract.
 	h.toolLoop.setLazyBind(provider == ProviderQwen)
+	h.onResponseStarted = opts.OnResponseStarted
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
 	h.language = opts.Language
