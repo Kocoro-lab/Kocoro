@@ -447,6 +447,52 @@ func TestRenderPrivateMemoryContext_FitsBodyUnderCapUnchanged(t *testing.T) {
 	}
 }
 
+func TestRenderPrivateMemoryContext_RendersEvidenceStrengthMarkers(t *testing.T) {
+	intents := []memory.QueryIntent{{
+		Mode:           memory.ModeDirectRelation,
+		AnchorMentions: []string{"Example Person"},
+	}}
+	results := []memory.QueryResult{{
+		Class: memory.ClassOK,
+		Envelope: &memory.ResponseEnvelope{MemoryBlock: &memory.MemoryBlock{
+			Groups: []memory.MemoryCandidateGroup{
+				{Value: "Northstar Labs", EvidenceTier: "corroborated", SupportCount: 2},
+				{Value: "Moon Harbor", EvidenceTier: "singleton", SupportCount: 1},
+				{Value: "Silver Pine", EvidenceTier: "derived"},
+				{Value: "Amber Field", EvidenceTier: "text"},
+				{Value: "Legacy Record"},
+				{Value: "Future Record", EvidenceTier: "future-tier"},
+			},
+		}},
+	}}
+
+	out := renderPrivateMemoryContext(intents, results)
+
+	for _, marker := range []string{
+		"Northstar Labs [strength=corroborated]",
+		"Moon Harbor [strength=singleton]",
+		"Silver Pine [strength=derived]",
+		"Amber Field [strength=text]",
+		"Legacy Record [strength=unrated]",
+		"Future Record [strength=unrated]",
+	} {
+		if !strings.Contains(out, marker) {
+			t.Errorf("rendered context missing %q:\n%s", marker, out)
+		}
+	}
+	for _, rule := range []string{
+		"Current user statements and verified current observations take precedence",
+		"preserve the recorded value",
+		"do not quote evidence_tier field names, bracketed markers, or counts",
+		"keep relevant weaker items but qualify them",
+		"Do not add people, organizations, roles, or attributes",
+	} {
+		if !strings.Contains(out, rule) {
+			t.Errorf("private-memory preamble missing rule %q", rule)
+		}
+	}
+}
+
 func TestRenderPrivateMemoryContext_TruncatesOversizedBody(t *testing.T) {
 	// Build 30 groups (the worst-case observed: 3 intents × result_limit=10)
 	// each carrying ~500 chars of free-form text, well over the 8 KiB cap.
@@ -518,7 +564,7 @@ func TestTruncatePrivateMemoryBody_FallsBackToRuneBoundary(t *testing.T) {
 	// Single-line body with multibyte runes ('世' is 3 bytes in UTF-8).
 	// Cap chosen so the byte cut would land mid-rune; truncatePrivateMemoryBody
 	// must back up to a rune boundary so the result is valid UTF-8.
-	in := strings.Repeat("世", 100)         // 300 bytes, no newlines
+	in := strings.Repeat("世", 100)           // 300 bytes, no newlines
 	got := truncatePrivateMemoryBody(in, 50) // 50 not a multiple of 3
 	body := strings.SplitN(got, "\n…(truncated", 2)[0]
 	if !utf8.ValidString(body) {

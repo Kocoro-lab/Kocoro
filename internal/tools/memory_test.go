@@ -282,6 +282,22 @@ func TestMemoryTool_Info(t *testing.T) {
 	if !strings.Contains(info.Description, "past records") {
 		t.Fatal("description should mandate user-facing 'past records' wording")
 	}
+	for _, rule := range []string{
+		"evidence_tier",
+		"corroborated",
+		"singleton",
+		"derived",
+		"text",
+		"missing/unknown",
+		"do not quote evidence_tier field names, bracketed markers, or counts",
+		"Current user statements and verified current observations take precedence",
+		"Never substitute training knowledge for a recorded value",
+		"keep relevant weaker items but qualify them",
+	} {
+		if !strings.Contains(info.Description, rule) {
+			t.Errorf("description missing evidence-fidelity rule %q", rule)
+		}
+	}
 	if !strings.Contains(info.Description, "do not surface internal labels") && !strings.Contains(info.Description, "do not surface raw event IDs") {
 		t.Fatal("description should forbid surfacing internal labels in user-facing output")
 	}
@@ -312,6 +328,7 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 				Value:              "Nexus",
 				Score:              1.37,
 				Evidence:           "observed",
+				EvidenceTier:       "corroborated",
 				SupportCount:       2,
 				SupportingEventIDs: []string{"ev_a", "ev_b"},
 				EntityIDs:          []string{"ent_1"},
@@ -343,6 +360,9 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 		t.Fatalf("groups=%+v", groups)
 	}
 	g0, _ := groups[0].(map[string]any)
+	if got := g0["evidence_tier"]; got != "corroborated" {
+		t.Fatalf("group[0].evidence_tier=%v want corroborated", got)
+	}
 	via, _ := g0["via_relations"].([]any)
 	if len(via) != 1 || via[0] != "created" {
 		t.Fatalf("group[0].via_relations=%+v", via)

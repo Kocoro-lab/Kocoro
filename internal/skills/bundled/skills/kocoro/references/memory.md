@@ -135,6 +135,16 @@ Many memory questions are answered on turn 0 without an explicit
 - The `<private_memory>` block is in-message-only — never persisted to the
   session transcript, never replayed, and stripped from compaction summaries
   at every `GenerateSummary` site.
+- Both implicit preflight and explicit `memory_recall` consume the sidecar's
+  per-group `evidence_tier`: `corroborated` may be stated plainly as a past
+  record; `singleton`, `derived`, `text`, and missing/unknown tiers must be
+  qualified. Current user statements and verified current observations take
+  precedence; recorded values are never silently replaced with training
+  knowledge. Exhaustive answers retain relevant weaker items with hedging,
+  while space-limited summaries prioritize corroborated items. Tier labels,
+  support counts, event IDs, and other raw provenance stay internal unless the
+  user asks for them; translate strength into natural confidence wording
+  instead of quoting field names, bracketed markers, or counts.
 - Audit event `memory_preflight` records a content-free trace:
   `attempted` / `helper_used` / `intents_count` / `results_count` /
   `context_injected` / `outcome` / `error_class` / `http_status`. Query

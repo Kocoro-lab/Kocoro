@@ -65,6 +65,7 @@ type MemoryCandidateGroup struct {
 	Value              string      `json:"value"`
 	Score              float64     `json:"score"`
 	Evidence           string      `json:"evidence"`
+	EvidenceTier       string      `json:"evidence_tier,omitempty"`
 	SupportCount       int         `json:"support_count"`
 	SupportingEventIDs []string    `json:"supporting_event_ids"`
 	EntityIDs          []string    `json:"entity_ids"`
@@ -150,7 +151,7 @@ type HealthPayload struct {
 // MemoryStatus is the structured view of the memory sidecar state embedded
 // in the daemon GET /status response under the "memory" key.
 type MemoryStatus struct {
-	Provider string         `json:"provider"`        // "enabled" or "disabled"
+	Provider string         `json:"provider"`         // "enabled" or "disabled"
 	Reason   *string        `json:"reason"`           // nil when ok; see Reason* constants in sidecar.go
 	Detail   map[string]any `json:"detail,omitempty"` // {"restart_attempts": N} when degraded
 }

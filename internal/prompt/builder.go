@@ -23,6 +23,17 @@ const (
 // text and emit site.
 const UserInstructionsTag = "<user_instructions>"
 
+// MemoryEvidenceGuidance is the shared answer-fidelity policy for every
+// structured-memory surface: the stable system prompt, explicit memory_recall
+// tool guidance, and the in-message <private_memory> preflight. Keep this
+// byte-stable; edits invalidate the prompt-cache prefix once per rollout.
+const MemoryEvidenceGuidance = "Current user statements and verified current observations take precedence over past records. " +
+	"For facts covered by past records, preserve the recorded value. Never substitute training knowledge for a recorded value. " +
+	"Use evidence_tier when present: corroborated may be stated plainly as a past record; singleton, derived, text, or missing/unknown are weaker and must be qualified. " +
+	"Translate evidence strength into natural confidence wording; do not quote evidence_tier field names, bracketed markers, or counts unless the user asks for provenance. " +
+	"In exhaustive answers, keep relevant weaker items but qualify them; when space is limited, prioritize corroborated items. " +
+	"Do not add people, organizations, roles, or attributes absent from the current conversation, verified observations, or the records."
+
 // DeferredToolSummary is a lightweight name+description pair for deferred tool listings.
 // Mirrors agent.ToolSummary but avoids importing the agent package from prompt.
 type DeferredToolSummary struct {
@@ -209,9 +220,9 @@ func buildStaticSystem(opts PromptOptions) string {
 		"- MEMORY.md: persistent notes shown in the context section; write with memory_append.\n\n" +
 		"Sometimes the system pre-fetches relevant records into your message inside a <private_memory> block — when present, follow the guidance inside it. You do not call this yourself; memory_recall is your on-demand path to the same records.\n\n" +
 		"When to use: when the question references the user's past, or they explicitly ask you to check / recall / remember. If the user tells you to ignore or not use memory, do not apply, cite, compare against, or mention it for that request.\n\n" +
-		"Before you trust it: a remembered detail was true when it was recorded — not necessarily now. Before acting on it, or stating it as a current fact, sanity-check against what you can observe (open the file, run the tool, read the current data). If it conflicts with what you observe, trust the observation. If you cannot verify it, present it as a past record, not a confirmed fact.\n\n" +
+		"Before you trust it: " + MemoryEvidenceGuidance + " A remembered detail was true when it was recorded — not necessarily now. Before acting on it, or stating it as a current fact, sanity-check against what you can observe (open the file, run the tool, read the current data). If you cannot verify current truth, present it as a past record, not a confirmed current fact.\n\n" +
 		"Acting on it: do NOT take actions the user did not ask for just because memory shows a past preference, plan, or task. Answer the current message; apply a remembered preference only when this message actually calls for it.\n\n" +
-		"Don't surface raw provenance (event IDs, support counts, scope tags) unless asked.")
+		"Don't surface raw provenance (event IDs, support counts, tier labels, scope tags) unless asked.")
 
 	// Text output — stable across sessions/users/format. See
 	// docs/superpowers/specs/2026-05-07-agent-preamble-output-design.md.

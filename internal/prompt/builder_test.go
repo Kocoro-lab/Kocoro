@@ -459,6 +459,27 @@ func TestBuildSystemPrompt_MinimalOptions(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_MemoryGuidanceTracksEvidenceStrength(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{BasePrompt: "Base."})
+
+	for _, rule := range []string{
+		"Current user statements and verified current observations take precedence over past records",
+		"Never substitute training knowledge for a recorded value",
+		"corroborated",
+		"singleton, derived, text, or missing/unknown",
+		"do not quote evidence_tier field names, bracketed markers, or counts",
+		"keep relevant weaker items but qualify them",
+		"Do not add people, organizations, roles, or attributes",
+	} {
+		if !strings.Contains(parts.System, rule) {
+			t.Errorf("system memory guidance missing %q", rule)
+		}
+	}
+	if !strings.Contains(parts.System, "tier labels") {
+		t.Error("system memory guidance should keep tier labels out of normal user-facing replies")
+	}
+}
+
 func TestBuildSystemPrompt_MemoryTruncation(t *testing.T) {
 	bigMemory := strings.Repeat("m", maxMemoryChars+500)
 	parts := BuildSystemPrompt(PromptOptions{

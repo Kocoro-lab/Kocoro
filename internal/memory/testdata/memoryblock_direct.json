@@ -70,6 +70,7 @@
                 "value": "Nexus",
                 "score": 1.3732653608351373,
                 "evidence": "observed",
+                "evidence_tier": "corroborated",
                 "support_count": 2,
                 "supporting_event_ids": [
                     "ev_000000000001",

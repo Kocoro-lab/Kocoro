@@ -94,6 +94,9 @@ func TestResponseEnvelope_MemoryBlockFixtureRoundTrip(t *testing.T) {
 			if len(first.MemoryBlock.Groups) == 0 {
 				t.Fatal("expected at least one group in memory_block")
 			}
+			if got := first.MemoryBlock.Groups[0].EvidenceTier; got != "corroborated" {
+				t.Fatalf("evidence_tier=%q want corroborated", got)
+			}
 
 			out, err := json.Marshal(first)
 			if err != nil {
@@ -112,6 +115,24 @@ func TestResponseEnvelope_MemoryBlockFixtureRoundTrip(t *testing.T) {
 				t.Fatalf("round-trip JSON differs:\nfirst-marshal:  %s\nsecond-marshal: %s", out, out2)
 			}
 		})
+	}
+}
+
+func TestMemoryCandidateGroup_LegacyPayloadDefaultsEvidenceTier(t *testing.T) {
+	raw := `{"value":"Nexus","score":0.9,"evidence":"observed","support_count":2}`
+	var group MemoryCandidateGroup
+	if err := json.Unmarshal([]byte(raw), &group); err != nil {
+		t.Fatal(err)
+	}
+	if group.EvidenceTier != "" {
+		t.Fatalf("legacy evidence_tier=%q want empty", group.EvidenceTier)
+	}
+	out, err := json.Marshal(group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(out, []byte(`"evidence_tier"`)) {
+		t.Fatalf("legacy empty evidence_tier should stay omitted on re-marshal: %s", out)
 	}
 }
 
