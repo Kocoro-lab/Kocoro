@@ -160,6 +160,11 @@ func (mc *MotionController) Run(ctx context.Context) {
 				mc.applyMoves()
 				lastStatus = mc.now()
 				setState(bridgeStateConnected)
+				// Wake the robot so its motors are live and it comes alive (idle breathing +
+				// speech wobble + express). The daemon is launched --no-wake-up-on-start
+				// (§16), so torque is off until we ask; wake is idempotent across reconnects.
+				// Fire-and-forget off the state loop (Wake is a blocking RPC).
+				go func() { _ = mc.client.Wake(ctx) }()
 			}
 			// §10 watchdog: heartbeats stalled → degraded; resumed → connected.
 			if !lastStatus.IsZero() {
