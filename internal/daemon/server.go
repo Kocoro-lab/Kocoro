@@ -547,6 +547,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /channels/wechat/qr-wait", s.handleWeChatQRWait)
 	mux.HandleFunc("GET /channels/wechat/installs", s.handleListWeChatInstalls)
 	mux.HandleFunc("DELETE /channels/wechat/installs/{id}", s.handleDeleteWeChatInstall)
+	// Generic integrations — thin proxy to Cloud (which owns the per-provider
+	// OAuth exchange). The daemon attaches the API key and forwards.
+	mux.HandleFunc("POST /integrations/{provider}/connect", s.handleConnectIntegration)
+	mux.HandleFunc("GET /integrations", s.handleListIntegrations)
+	mux.HandleFunc("GET /integrations/{id}", s.handleGetIntegration)
+	mux.HandleFunc("DELETE /integrations/{id}", s.handleDeleteIntegration)
 	mux.HandleFunc("GET /skills/marketplace", s.handleMarketplaceList)
 	mux.HandleFunc("GET /skills/marketplace/entry/{slug}", s.handleMarketplaceDetail)
 	// ClawHub live-catalog API — separate surface from /skills/marketplace.

@@ -1671,6 +1671,102 @@ func (c *GatewayClient) DeleteSlackAppInstall(ctx context.Context, id string) (i
 func (c *GatewayClient) CloudBaseURL() string { return c.baseURL }
 
 // ---------------------------------------------------------------------------
+// Generic integrations — thin proxy to Cloud's /api/v1/integrations/*. The
+// daemon forwards with the user's API key; Cloud owns the per-provider OAuth
+// exchange. Mirrors the Slack BYOA proxy above (status + raw body verbatim).
+// ---------------------------------------------------------------------------
+
+// IntegrationConnect starts an OAuth connect for the given provider via Cloud.
+// Returns Cloud's status + raw body verbatim (the body carries the oauth_url the
+// renderer must open, plus a connection_id).
+func (c *GatewayClient) IntegrationConnect(ctx context.Context, provider string) (int, []byte, error) {
+	endpoint := c.baseURL + "/api/v1/integrations/" + url.PathEscape(provider) + "/connect"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// ListIntegrations fetches the user's integrations from Cloud.
+func (c *GatewayClient) ListIntegrations(ctx context.Context) (int, []byte, error) {
+	endpoint := c.baseURL + "/api/v1/integrations"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// GetIntegration fetches a single integration by id from Cloud.
+func (c *GatewayClient) GetIntegration(ctx context.Context, id string) (int, []byte, error) {
+	endpoint := c.baseURL + "/api/v1/integrations/" + url.PathEscape(id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// DeleteIntegration unbinds an integration by id via Cloud.
+func (c *GatewayClient) DeleteIntegration(ctx context.Context, id string) (int, []byte, error) {
+	endpoint := c.baseURL + "/api/v1/integrations/" + url.PathEscape(id)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// ---------------------------------------------------------------------------
 // Personal WeChat (iLink) — QR-login installs. Cloud owns the iLink client, the
 // long-poll message pump, and install persistence; the daemon only proxies the
 // QR-scan connect flow (qr-start / qr-wait) and install management with the
