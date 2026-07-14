@@ -84,16 +84,44 @@ func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	}
 
 	content := string(data)
+	var fuzzySpans []matchSpan
 	count := strings.Count(content, args.OldString)
 	if count == 0 {
-		return agent.ValidationError("old_string not found in file"), nil
+		// Exact match failed. Fall back to a punctuation-normalizing match
+		// that tolerates smart quotes — the most common cause of "not found".
+		// See file_edit_match.go.
+		if spans := fuzzyFindPunct(content, args.OldString); len(spans) > 0 {
+			fuzzySpans = spans
+			count = len(spans)
+		} else if spans := fuzzyFindLines(content, args.OldString); len(spans) > 0 {
+			fuzzySpans = spans
+			count = len(spans)
+		} else {
+			// Nothing matched even fuzzily. Invalidate this file's read dedup so
+			// the agent's next file_read returns fresh bytes (not the unchanged
+			// stub) and can inspect how old_string differs. See readtracker.go.
+			agent.InvalidateReadCache(ctx, args.Path)
+			msg := "old_string not found in file"
+			if hint := diagnoseNoMatch(content, args.OldString); hint != "" {
+				msg += "." + hint
+			}
+			return agent.ValidationError(msg), nil
+		}
 	}
 	if !args.ReplaceAll && count > 1 {
+		// Ambiguous match: file untouched, so invalidate dedup too — a diagnostic
+		// re-read should return fresh bytes, not the unchanged stub.
+		agent.InvalidateReadCache(ctx, args.Path)
 		return agent.ValidationError(fmt.Sprintf("old_string found %d times (must be unique unless replace_all=true)", count)), nil
 	}
 
 	var newContent string
-	if args.ReplaceAll {
+	if len(fuzzySpans) > 0 {
+		// Fuzzy matchers return exact byte spans, so different quote forms,
+		// whitespace, and line contexts are replaced at the locations actually
+		// matched rather than through a second global substring search.
+		newContent = replaceMatchSpans(content, fuzzySpans, args.NewString)
+	} else if args.ReplaceAll {
 		newContent = strings.ReplaceAll(content, args.OldString, args.NewString)
 	} else {
 		newContent = strings.Replace(content, args.OldString, args.NewString, 1)
