@@ -16,3 +16,12 @@ func TestReplyDeliveryResultCapabilityAdvertised(t *testing.T) {
 		t.Fatalf("frame type = %q", MsgTypeReplyDeliveryResult)
 	}
 }
+
+func TestAgentDefaultCWDV1CapabilityAdvertised(t *testing.T) {
+	for _, c := range Capabilities {
+		if c == CapAgentDefaultCWDV1 {
+			return
+		}
+	}
+	t.Fatalf("CapAgentDefaultCWDV1 (%q) not in advertised Capabilities", CapAgentDefaultCWDV1)
+}

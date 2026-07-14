@@ -12,6 +12,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
+	"gopkg.in/yaml.v3"
 )
 
 // agentSyncWorker coalesces agent-change notifications into serialized,
@@ -136,8 +137,14 @@ func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bo
 
 	var config json.RawMessage
 	if api.Config != nil {
-		if b, err := json.Marshal(api.Config); err == nil {
-			config = b
+		// cwd is a device-local absolute path. Never upload it: a path valid on
+		// this Mac can make the same agent unusable after another device pulls.
+		syncConfig := *api.Config
+		syncConfig.CWD = ""
+		if !reflect.DeepEqual(syncConfig, agents.AgentConfigAPI{}) {
+			if b, err := json.Marshal(&syncConfig); err == nil {
+				config = b
+			}
 		}
 	}
 	var skills json.RawMessage
@@ -337,6 +344,11 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
 	writeFailed := false
 
+	// Capture the local cwd before any writes. It is device-local state: remote
+	// config (including payloads produced by older daemons) must never replace
+	// it, and a remote config clear must preserve it.
+	localCWD := readDeviceLocalAgentCWD(agentsDir, it.AgentKey)
+
 	// AGENT.md is MANDATORY — it is what makes the agent enumerable. Without
 	// it the agent is invisible to ListAgents and the next full push would
 	// soft-delete it on the cloud.
@@ -370,34 +382,46 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
 		writeFailed = true
 	}
 
-	// config.yaml — decode the same AgentConfigAPI shape the create handler
-	// uses. Overwrite is authoritative (cloud is strictly newer). Detect a
-	// CLEARED config SEMANTICALLY (not by exact bytes): empty/JSON-null bytes,
-	// OR bytes that unmarshal to a zero-value AgentConfigAPI (whitespace, "{}",
-	// key reorder, trailing newline). On a real clear, remove the local file. On
-	// a decode error, prefer leaving the existing config untouched + log rather
-	// than wiping it silently (mirrors the skills clear-path robustness).
+	// config.yaml — cloud remains authoritative for syncable fields, while cwd
+	// is always restored from this device. Detect a CLEARED config SEMANTICALLY
+	// (not by exact bytes): empty/JSON-null bytes, OR bytes that unmarshal to a
+	// zero-value AgentConfigAPI. On a decode error, leave the existing config
+	// untouched rather than wiping it silently.
 	configPath := filepath.Join(agentsDir, it.AgentKey, "config.yaml")
-	if len(it.Config) == 0 || isJSONNull(it.Config) {
+	clearSyncedConfig := func() {
+		if localCWD != "" {
+			if err := agents.WriteAgentConfig(agentsDir, it.AgentKey, &agents.AgentConfigAPI{CWD: localCWD}); err != nil {
+				log.Printf("agentsync: preserve local cwd for %q failed: %v", it.AgentKey, err)
+				writeFailed = true
+			}
+			return
+		}
 		if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
 			log.Printf("agentsync: remove cleared config for %q failed: %v", it.AgentKey, err)
 			writeFailed = true
 		}
+	}
+	if len(it.Config) == 0 || isJSONNull(it.Config) {
+		clearSyncedConfig()
 	} else {
 		var cfg agents.AgentConfigAPI
 		if err := json.Unmarshal(it.Config, &cfg); err != nil {
 			// Malformed-but-present config is NOT a clear signal — leave the
 			// existing config untouched rather than wiping it silently.
 			log.Printf("agentsync: pull of %q: config decode (existing kept): %v", it.AgentKey, err)
-		} else if reflect.DeepEqual(cfg, agents.AgentConfigAPI{}) {
-			// Semantically empty → field was cleared on the originating device.
-			if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
-				log.Printf("agentsync: remove cleared config for %q failed: %v", it.AgentKey, err)
-				writeFailed = true
+		} else {
+			// Discard remote cwd even if this payload came from an older daemon
+			// that still synced it, then merge this device's value back in.
+			cfg.CWD = ""
+			if reflect.DeepEqual(cfg, agents.AgentConfigAPI{}) {
+				clearSyncedConfig()
+			} else {
+				cfg.CWD = localCWD
+				if err := agents.WriteAgentConfig(agentsDir, it.AgentKey, &cfg); err != nil {
+					log.Printf("agentsync: write config for %q failed: %v", it.AgentKey, err)
+					writeFailed = true
+				}
 			}
-		} else if err := agents.WriteAgentConfig(agentsDir, it.AgentKey, &cfg); err != nil {
-			log.Printf("agentsync: write config for %q failed: %v", it.AgentKey, err)
-			writeFailed = true
 		}
 	}
 
@@ -461,6 +485,30 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
 	// Stamp mtimes to the cloud timestamp so this agent reports UpdatedAt ==
 	// it.UpdatedAt on the next push (LWW no-op) rather than "now".
 	stampAgentMtime(filepath.Join(agentsDir, it.AgentKey), it.UpdatedAt)
+}
+
+// readDeviceLocalAgentCWD reads only the active definition's config.yaml so
+// preserving cwd does not depend on unrelated prompt/profile/skills parsing.
+// It mirrors LoadAgent's user-definition-first, builtin-fallback resolution.
+func readDeviceLocalAgentCWD(agentsDir, name string) string {
+	dir := filepath.Join(agentsDir, name)
+	if _, err := os.Stat(filepath.Join(dir, "AGENT.md")); err != nil {
+		dir = filepath.Join(agentsDir, "_builtin", name)
+		if _, err := os.Stat(filepath.Join(dir, "AGENT.md")); err != nil {
+			return ""
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		return ""
+	}
+	var cfg struct {
+		CWD string `yaml:"cwd"`
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return ""
+	}
+	return cfg.CWD
 }
 
 // stampAgentMtime sets the modification time of an agent's definition files

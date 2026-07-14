@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -116,14 +117,14 @@ func TestPullAndApply_FullyMaterializesMissingAgent(t *testing.T) {
 
 	deleted := time.Now().UTC()
 	mem := "cloud memory"
-	cwd := t.TempDir()
+	remoteCWD := t.TempDir()
 	pull := func() ([]client.SyncAgentItem, error) {
 		return []client.SyncAgentItem{
 			{
 				AgentKey: "fresh",
 				Prompt:   "fresh prompt",
 				Memory:   &mem,
-				Config:   json.RawMessage(`{"cwd":"` + cwd + `"}`),
+				Config:   json.RawMessage(`{"cwd":"` + remoteCWD + `","auto_approve":true}`),
 				Profile:  json.RawMessage(`{"category":"coding","avatar":"https://cdn/fresh.png"}`),
 			},
 			{AgentKey: "keep", Prompt: "cloud prompt", Profile: json.RawMessage(`{"avatar":"https://cdn/cloud.png"}`)},
@@ -146,8 +147,11 @@ func TestPullAndApply_FullyMaterializesMissingAgent(t *testing.T) {
 	if a.Memory != "cloud memory" {
 		t.Errorf("fresh memory not materialized: %q", a.Memory)
 	}
-	if a.Config == nil || a.Config.CWD != cwd {
-		t.Errorf("fresh config not materialized: %+v", a.Config)
+	if a.Config == nil || a.Config.AutoApprove == nil || !*a.Config.AutoApprove {
+		t.Errorf("fresh syncable config not materialized: %+v", a.Config)
+	}
+	if a.Config.CWD != "" {
+		t.Errorf("cloud cwd must not materialize on another device: %+v", a.Config)
 	}
 
 	// Enumerable: ListAgents must now include the freshly-materialized agent.
@@ -531,6 +535,53 @@ func TestBuildSyncItems_SetsRealLastModified(t *testing.T) {
 	}
 }
 
+func TestBuildSyncItems_StripsDeviceLocalCWD(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "demo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("prompt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	yes := true
+	if err := agents.WriteAgentConfig(root, "demo", &agents.AgentConfigAPI{
+		CWD:         t.TempDir(),
+		AutoApprove: &yes,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := newPullServer(t, root).buildSyncItems(root)
+	if err != nil {
+		t.Fatalf("buildSyncItems: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(items[0].Config, &cfg); err != nil {
+		t.Fatalf("config json: %v", err)
+	}
+	if _, ok := cfg["cwd"]; ok {
+		t.Fatalf("device-local cwd leaked into sync payload: %s", items[0].Config)
+	}
+	if cfg["auto_approve"] != true {
+		t.Fatalf("syncable sibling field lost: %s", items[0].Config)
+	}
+
+	if err := agents.WriteAgentConfig(root, "demo", &agents.AgentConfigAPI{CWD: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	items, err = newPullServer(t, root).buildSyncItems(root)
+	if err != nil {
+		t.Fatalf("buildSyncItems cwd-only: %v", err)
+	}
+	if len(items) != 1 || len(items[0].Config) != 0 {
+		t.Fatalf("cwd-only config should be absent from sync payload: %+v", items)
+	}
+}
+
 func TestHandleCreateAgent_RejectsBadAvatar(t *testing.T) {
 	root := t.TempDir()
 	s := &Server{deps: &ServerDeps{AgentsDir: root, ShannonDir: root, EventBus: NewEventBus()}}
@@ -563,8 +614,120 @@ func TestHandleUpdateAgent_RejectsBadAvatar(t *testing.T) {
 	}
 }
 
-// Fix 1: overwriting an EXISTING agent with a NEWER cloud item whose fields were
-// CLEARED must reconcile (delete) the stale local files, not keep them.
+func TestAgentConfigWrites_RejectInvalidCWDWithoutMutation(t *testing.T) {
+	missingCWD := filepath.Join(t.TempDir(), "missing")
+
+	t.Run("create", func(t *testing.T) {
+		root := t.TempDir()
+		s := &Server{deps: &ServerDeps{AgentsDir: root, ShannonDir: root}}
+		body, _ := json.Marshal(map[string]any{
+			"display_name": "Bad CWD",
+			"prompt":       "hello",
+			"config":       map[string]any{"cwd": missingCWD},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/agents", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		s.handleCreateAgent(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+		}
+		if entries, _ := os.ReadDir(root); len(entries) != 0 {
+			t.Fatalf("invalid create mutated agents dir: %v", entries)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		path string
+		body func() []byte
+		call func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name: "full update",
+			path: "/agents/agt",
+			body: func() []byte {
+				b, _ := json.Marshal(map[string]any{"prompt": "must not apply", "config": map[string]any{"cwd": missingCWD}})
+				return b
+			},
+			call: (*Server).handleUpdateAgent,
+		},
+		{
+			name: "config put",
+			path: "/agents/agt/config",
+			body: func() []byte {
+				b, _ := json.Marshal(map[string]any{"cwd": missingCWD})
+				return b
+			},
+			call: (*Server).handlePutAgentConfig,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "agt")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("original prompt"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			originalConfig := []byte("display_name: Agent\nauto_approve: true\n")
+			if err := os.WriteFile(filepath.Join(dir, "config.yaml"), originalConfig, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			s := &Server{deps: &ServerDeps{AgentsDir: root, ShannonDir: root}}
+			req := httptest.NewRequest(http.MethodPut, tc.path, bytes.NewReader(tc.body()))
+			req.SetPathValue("name", "agt")
+			w := httptest.NewRecorder()
+			tc.call(s, w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+			}
+			if got, _ := os.ReadFile(filepath.Join(dir, "AGENT.md")); string(got) != "original prompt" {
+				t.Fatalf("invalid request changed prompt: %q", got)
+			}
+			if got, _ := os.ReadFile(filepath.Join(dir, "config.yaml")); !bytes.Equal(got, originalConfig) {
+				t.Fatalf("invalid request changed config:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestHandleGetAgent_InvalidCWDReturnsWarning(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agt")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("prompt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missingCWD := filepath.Join(t.TempDir(), "deleted")
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("cwd: "+missingCWD+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{deps: &ServerDeps{AgentsDir: root, ShannonDir: root}}
+	req := httptest.NewRequest(http.MethodGet, "/agents/agt", nil)
+	req.SetPathValue("name", "agt")
+	w := httptest.NewRecorder()
+	s.handleGetAgent(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var api agents.AgentAPI
+	if err := json.Unmarshal(w.Body.Bytes(), &api); err != nil {
+		t.Fatal(err)
+	}
+	if api.Config == nil || api.Config.CWD != missingCWD {
+		t.Fatalf("broken cwd is not repairable from response: %+v", api.Config)
+	}
+	if len(api.Warnings) != 1 || !strings.Contains(api.Warnings[0], "cwd") {
+		t.Fatalf("warnings = %v, want cwd warning", api.Warnings)
+	}
+}
+
+// A cloud clear removes synced config fields but preserves cwd, which belongs
+// to this device and must never be overwritten by cross-device sync.
 func TestPullAndApply_ClearedFieldsOnOverwriteRemoveStaleFiles(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "agt")
@@ -597,9 +760,13 @@ func TestPullAndApply_ClearedFieldsOnOverwriteRemoveStaleFiles(t *testing.T) {
 		t.Fatalf("pullAndApplyAgents: %v", err)
 	}
 
-	// Cleared fields → files removed.
-	if _, err := os.Stat(filepath.Join(dir, "config.yaml")); !os.IsNotExist(err) {
-		t.Errorf("cleared config.yaml should be removed (err=%v)", err)
+	// Synced config fields clear, but device-local cwd survives.
+	loaded, err := agents.LoadAgent(root, "agt")
+	if err != nil {
+		t.Fatalf("load after clear: %v", err)
+	}
+	if loaded.Config == nil || loaded.Config.CWD != "/tmp" {
+		t.Fatalf("cloud clear removed device-local cwd: %+v", loaded.Config)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "MEMORY.md")); !os.IsNotExist(err) {
 		t.Errorf("cleared MEMORY.md should be removed (err=%v)", err)
@@ -653,17 +820,20 @@ func TestPullAndApply_ClearedFieldsCloudOlderDoesNotClobber(t *testing.T) {
 	}
 }
 
-// Fix 1 (counterpart): when the cloud item HAS config/memory, overwrite updates
-// (does not remove) them.
+// When cloud has config, synced fields update while the local cwd survives.
 func TestPullAndApply_OverwritePreservesPresentFields(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "agt")
 	os.MkdirAll(dir, 0o755)
 	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("old"), 0o644)
-	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("cwd: /old\n"), 0o644)
+	localCWD := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("cwd: "+localCWD+"\nauto_approve: false\n"), 0o644)
+	// CWD preservation must not depend on a full LoadAgent succeeding; an
+	// unrelated bad profile should not let cloud sync erase device-local state.
+	os.WriteFile(filepath.Join(dir, "PROFILE.yaml"), []byte("category: not-a-real-category\n"), 0o644)
 	stampAgentMtime(dir, time.Now().Add(-1*time.Hour).UTC())
 
-	cwd := t.TempDir()
+	remoteCWD := t.TempDir()
 	mem := "new memory"
 	cloudTS := time.Now().UTC().Truncate(time.Second)
 	pull := func() ([]client.SyncAgentItem, error) {
@@ -672,7 +842,7 @@ func TestPullAndApply_OverwritePreservesPresentFields(t *testing.T) {
 				AgentKey:  "agt",
 				Prompt:    "new",
 				Memory:    &mem,
-				Config:    json.RawMessage(`{"cwd":"` + cwd + `"}`),
+				Config:    json.RawMessage(`{"cwd":"` + remoteCWD + `","auto_approve":true}`),
 				Profile:   json.RawMessage(`{"avatar":"https://cdn/a.png"}`),
 				UpdatedAt: cloudTS,
 			},
@@ -685,17 +855,18 @@ func TestPullAndApply_OverwritePreservesPresentFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load agt: %v", err)
 	}
-	if a.Config == nil || a.Config.CWD != cwd {
-		t.Errorf("present config not updated: %+v", a.Config)
+	if a.Config == nil || a.Config.CWD != localCWD {
+		t.Errorf("cloud config overwrote device-local cwd: %+v", a.Config)
+	}
+	if a.Config.AutoApprove == nil || !*a.Config.AutoApprove {
+		t.Errorf("synced config field not updated: %+v", a.Config)
 	}
 	if a.Memory != "new memory" {
 		t.Errorf("present memory not updated: %q", a.Memory)
 	}
 }
 
-// Fix 3: semantic empty-config detection. A config blob that is non-empty bytes
-// but semantically empty (whitespace / trailing newline / no meaningful fields)
-// must be treated as CLEARED → config.yaml removed.
+// Semantic empty-config detection clears synced fields but preserves cwd.
 func TestPullAndApply_SemanticEmptyConfigCleared(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "agt")
@@ -718,8 +889,12 @@ func TestPullAndApply_SemanticEmptyConfigCleared(t *testing.T) {
 	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
 		t.Fatalf("pullAndApplyAgents: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "config.yaml")); !os.IsNotExist(err) {
-		t.Errorf("semantically-empty config should remove config.yaml (err=%v)", err)
+	a, err := agents.LoadAgent(root, "agt")
+	if err != nil {
+		t.Fatalf("load after semantic clear: %v", err)
+	}
+	if a.Config == nil || a.Config.CWD != "/tmp" {
+		t.Fatalf("semantic clear removed device-local cwd: %+v", a.Config)
 	}
 }
 

@@ -150,6 +150,7 @@ type Agent struct {
 	Commands map[string]string // agent-scoped slash commands (name → content)
 	Skills   []*skills.Skill   // agent-scoped skills (prompt, tool_chain, sub_agent)
 	Profile  *AgentProfile     // optional user-facing presentation metadata (PROFILE.yaml)
+	Warnings []string          // non-fatal config advisories surfaced by AgentAPI
 }
 
 func ValidateAgentName(name string) error {
@@ -257,7 +258,7 @@ func LoadAgent(agentsDir, name string) (*Agent, error) {
 		}
 		if agCfg.CWD != "" {
 			if err := cwdctx.ValidateCWD(agCfg.CWD); err != nil {
-				return nil, fmt.Errorf("agent %s: %w", name, err)
+				ag.Warnings = append(ag.Warnings, fmt.Sprintf("configured cwd is unavailable: %v", err))
 			}
 		}
 		ag.Config = agCfg

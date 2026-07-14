@@ -580,6 +580,9 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	if !has(CapDeliverableEventV1) {
 		t.Fatalf("capabilities lost %q: %v", CapDeliverableEventV1, *status.Capabilities)
 	}
+	if !has(CapAgentDefaultCWDV1) {
+		t.Fatalf("capabilities lost %q: %v", CapAgentDefaultCWDV1, *status.Capabilities)
+	}
 	if status.Memory == nil || status.Memory.Provider != "disabled" || status.Memory.Reason != nil {
 		t.Fatalf("memory block decode mismatch: %+v", status.Memory)
 	}

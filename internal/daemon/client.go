@@ -165,6 +165,12 @@ const (
 	// (an unlimited single-scope response also has has_more:false, so shape
 	// sniffing is ambiguous).
 	CapSessionsScopeAll = "sessions_scope_all"
+	// CapAgentDefaultCWDV1 — named-agent cwd writes are validated before any
+	// mutation, invalid persisted cwd is surfaced as a non-fatal warning, and
+	// cross-device agent sync treats cwd as device-local (never pushed or
+	// overwritten by pull). Desktop gates editable default-working-folder UI on
+	// this complete contract rather than probing individual behaviors.
+	CapAgentDefaultCWDV1 = "agent_default_cwd_v1"
 	// CapRemoteControlV1 — daemon accepts Cloud-relayed remote_request frames
 	// for a narrow allowlisted local API subset and forwards EventBus events as
 	// remote_event frames. Mobile clients use this to control the user's Mac via
@@ -192,6 +198,7 @@ var Capabilities = []string{
 	CapDefaultAgentSkillDenylist,
 	CapPerAgentMCPScope,
 	CapSessionsScopeAll,
+	CapAgentDefaultCWDV1,
 	CapRemoteControlV1,
 }
 

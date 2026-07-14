@@ -330,7 +330,7 @@ func TestLoadAgent_MemoryFromRuntimeDir(t *testing.T) {
 	}
 }
 
-func TestAgentConfig_CWD_RejectsRelativePath(t *testing.T) {
+func TestAgentConfig_CWD_InvalidPathIsWarning(t *testing.T) {
 	dir := t.TempDir()
 	agentDir := filepath.Join(dir, "test-agent")
 	os.MkdirAll(agentDir, 0755)
@@ -339,9 +339,15 @@ func TestAgentConfig_CWD_RejectsRelativePath(t *testing.T) {
 	os.WriteFile(filepath.Join(agentDir, "config.yaml"), []byte(configYAML), 0644)
 	os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte("test agent"), 0644)
 
-	_, err := LoadAgent(dir, "test-agent")
-	if err == nil {
-		t.Fatal("expected error for relative cwd path")
+	agent, err := LoadAgent(dir, "test-agent")
+	if err != nil {
+		t.Fatalf("invalid cwd should not make the agent unloadable: %v", err)
+	}
+	if agent.Config == nil || agent.Config.CWD != "relative/path" {
+		t.Fatalf("configured cwd should remain visible for repair, config=%+v", agent.Config)
+	}
+	if len(agent.Warnings) != 1 || !strings.Contains(agent.Warnings[0], "cwd") {
+		t.Fatalf("warnings = %v, want one cwd warning", agent.Warnings)
 	}
 }
 

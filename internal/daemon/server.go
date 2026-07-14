@@ -3175,7 +3175,7 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 			for _, sc := range list {
 				refs = append(refs, agents.ScheduleRef{ID: sc.ID, Agent: sc.Agent, Enabled: sc.Enabled})
 			}
-			api.Warnings = agents.DetectTriggerConflicts(s.deps.AgentsDir, name, refs)
+			api.Warnings = append(api.Warnings, agents.DetectTriggerConflicts(s.deps.AgentsDir, name, refs)...)
 		}
 	}
 
@@ -3351,6 +3351,10 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
+		}
+		if err := agents.ValidateAgentConfigCWD(&cfg); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
 		}
 		if err := agents.ValidateAgentModelConfig(cfg.Agent); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -3663,6 +3667,10 @@ func (s *Server) handlePutAgentConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+	}
+	if err := agents.ValidateAgentConfigCWD(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if err := agents.ValidateAgentModelConfig(cfg.Agent); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

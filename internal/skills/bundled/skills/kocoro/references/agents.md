@@ -19,6 +19,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Response: `{"name": "string", "display_name": "string", "prompt": "string", "config": {...}, "skills": [...], "commands": [...], "category": {...}|null, "description": {...}|null, "guide_prompts": [...]|null, "examples": [...]|null}`
 - Notes:
   - `display_name` falls back to the slug when not explicitly set.
+  - `warnings` contains non-fatal config advisories. In particular, an agent whose configured `cwd` was deleted or is otherwise invalid still returns `200` with its original `config.cwd` plus a warning, so clients can surface and repair it instead of losing access to the whole agent.
   - **Presentation metadata** (`category`, `description`, `guide_prompts`, `examples`) is populated when the agent ships a `PROFILE.yaml`; otherwise all four are `null`. Today only builtin agents (`explorer`, `reviewer`) carry profile data. All four fields are read-only — there is no write endpoint for them in v1. Wire shape:
     - `category`: `{"code": "coding", "label": {"en": "Coding", "zh-Hans": "编程", "ja": "コーディング"}}`. `code` is a slug from the global category registry; `label` is the daemon-inlined three-language display name. Unknown codes never appear in responses — `LoadAgent` fails loud at load time if a `PROFILE.yaml` references an unregistered code.
     - `description`: a `LocalizedString` map (`{"en": "...", "zh-Hans": "...", "ja": "..."}`). Plain text, not markdown.
@@ -48,6 +49,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
     | `display_name_taken` | 409 | duplicate (case-folded, trimmed) |
   - To customize a built-in agent (`explorer` / `reviewer`), use `PUT /agents/{name}` against its slug — POST always creates a brand-new agent under a fresh auto-slug.
   - `avatar` is **optional** — the agent's avatar image URL, stored in `PROFILE.yaml` and synced to Cloud. Must be an `https://` CDN URL with a host; any other scheme (`http://`, `javascript:`, `data:`) returns `400`. Omit / send `""` for no avatar. Avatar editing is gated on the daemon advertising `agent_avatar_v1` in `/status.capabilities` — Desktop should expose the avatar field only when that capability is present.
+  - A non-empty `config.cwd` must be an absolute path to an existing directory. Invalid values return `400` before any agent files are written.
 
 ### Update agent prompt / instructions
 - Method: PUT
@@ -61,6 +63,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
   - Renaming to a `display_name` already used by another agent returns `409` with `{"error": "...", "code": "display_name_taken"}`. Renaming to the agent's own current `display_name` is a no-op success.
   - display_name errors carry the same `code` table as `POST /agents` above (`display_name_required` 400, `display_name_too_long` 400, `display_name_invalid_chars` 400, `display_name_taken` 409). `error` is a non-localized fallback; clients localize by `code`.
   - `avatar` is optional (omit = unchanged). Sending an `https://` CDN URL sets it; sending `""` clears it. Non-`https` values (`http://`, `javascript:`, `data:`) return `400`. Avatar editing is gated on the daemon advertising `agent_avatar_v1` in `/status.capabilities`.
+  - When `config` is supplied, a non-empty `config.cwd` must be an absolute path to an existing directory. Invalid values return `400` before prompt, memory, config, or profile mutations are applied.
 
 ### Delete agent
 - Method: DELETE
@@ -75,6 +78,8 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Response: `{"status": "updated"}`
 - Notes: Supports `cwd`, `agent.model`, `agent.model_tier`, `agent.language`, `agent.temperature`, `tools.allow`, `tools.deny`, `mcp_servers`, `permissions.always_allow_tools`. `agent.model_tier` (one of `small` | `medium` | `large`) overrides the global `model_tier` for this agent only; omit to inherit. When both are set, `agent.model` (specific model id) wins over `agent.model_tier`. **`agent.model` must be a concrete model id (e.g. `claude-opus-4-8`), NEVER a tier word — to select a tier use `agent.model_tier`. A tier keyword (`small`/`medium`/`large`) in `agent.model` is rejected with HTTP 400; if it ever slipped through it would reach the Gateway as `specific_model` and fail every run with `model_id_unknown`.** Full precedence (highest first): `agent.model` (specific model id always wins) → `RunAgentRequest.ModelOverride` (heartbeat tier override) → `agent.model_tier` → local / project / global `model_tier` → viper default `"medium"`. `agent.language` locks the reply language (three-state: omit = inherit global; `""` = force mirror the user; native name like `日本語` = lock).
 - **This endpoint REPLACES the whole agent config (PUT semantics), except `display_name`.** To change a single config field, GET /agents/{name} first, merge your field into the returned config, then PUT the full body — otherwise sibling fields (`cwd`, `tools`, `mcp_servers`, `permissions`, `watch`, `heartbeat`, other `agent.*`) are dropped. `display_name` is preserved and can only be changed by the top-level `PUT /agents/{name}` `display_name` field; nested `config.display_name` is ignored.
+- A non-empty `cwd` must be an absolute path to an existing directory. Invalid values return `400` before the existing config is changed.
+- `cwd` is device-local and is excluded from cross-device agent sync. Pulling a newer cloud config updates every synced config field but preserves this device's current `cwd`; even a cloud config clear does not clear a local `cwd`. Older cloud payloads that still contain `cwd` are ignored. This complete behavior is advertised by `agent_default_cwd_v1`; clients should gate editable default-working-folder UI on that capability.
 - Deleting or nulling config (`DELETE /agents/{name}/config`, or `PUT /agents/{name}` with `"config": null`) clears config fields but preserves `display_name` so the agent does not fall back to its opaque slug.
 
 ### Add tool to agent's always-allow list

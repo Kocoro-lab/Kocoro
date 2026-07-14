@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 	"gopkg.in/yaml.v3"
 )
@@ -84,6 +85,9 @@ func (a *Agent) ToAPI() *AgentAPI {
 		Prompt: a.Prompt,
 	}
 	api.DisplayName = a.DisplayLabel()
+	if len(a.Warnings) > 0 {
+		api.Warnings = append([]string(nil), a.Warnings...)
+	}
 	if a.Memory != "" {
 		mem := a.Memory
 		api.Memory = &mem
@@ -448,6 +452,9 @@ func (r *AgentCreateRequest) Validate() error {
 		}
 	}
 	if r.Config != nil {
+		if err := ValidateAgentConfigCWD(r.Config); err != nil {
+			return err
+		}
 		if err := ValidateAgentModelConfig(r.Config.Agent); err != nil {
 			return err
 		}
@@ -475,6 +482,15 @@ func (r *AgentCreateRequest) Validate() error {
 		}
 	}
 	return nil
+}
+
+// ValidateAgentConfigCWD applies the write-time invariant shared by all agent
+// config endpoints. Empty means "inherit/fallback" and remains valid.
+func ValidateAgentConfigCWD(cfg *AgentConfigAPI) error {
+	if cfg == nil {
+		return nil
+	}
+	return cwdctx.ValidateCWD(cfg.CWD)
 }
 
 // AgentUpdateRequest is a partial update — only non-nil fields are applied.
