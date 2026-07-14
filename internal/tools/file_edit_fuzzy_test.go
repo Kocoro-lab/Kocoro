@@ -126,3 +126,37 @@ func TestFileEdit_FuzzyReplaceAll_MixedSmartQuoteBytes(t *testing.T) {
 		t.Errorf("fuzzy spans must replace both quote variants:\n  want: %q\n  got:  %q", want, string(got))
 	}
 }
+
+func TestFileEdit_ReplaceAll_PrefersExactMatchesOverPunctuationVariants(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "quotes.txt")
+	original := "\"x\"\n“x”\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := agent.NewReadTracker()
+	tracker.MarkRead(path)
+	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
+	args, err := json.Marshal(fileEditArgs{
+		Path: path, OldString: `"x"`, NewString: "X", ReplaceAll: true,
+		Description: "replace only literal quote matches",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&FileEditTool{}).Run(ctx, string(args))
+	if err != nil {
+		t.Fatalf("transport error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected exact replace_all to succeed, got: %s", result.Content)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "X\n“x”\n"; string(got) != want {
+		t.Errorf("exact matches must win over fuzzy variants:\n  want: %q\n  got:  %q", want, string(got))
+	}
+}

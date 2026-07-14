@@ -46,6 +46,9 @@ func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
+	if args.OldString == "" {
+		return agent.ValidationError("old_string must not be empty"), nil
+	}
 	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
 	if resolveErr != nil {
 		if errors.Is(resolveErr, cwdctx.ErrNoSessionCWD) {
@@ -79,13 +82,12 @@ func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		return agent.ToolResult{Content: fmt.Sprintf("error reading file: %v", err), IsError: true}, nil
 	}
 
-	if args.OldString == "" {
-		return agent.ValidationError("old_string must not be empty"), nil
-	}
-
 	content := string(data)
 	var fuzzySpans []matchSpan
 	count := strings.Count(content, args.OldString)
+	// Preserve literal semantics whenever at least one exact match exists. Fuzzy
+	// normalization is a fallback, so replace_all does not unexpectedly expand a
+	// precise edit to punctuation or whitespace variants elsewhere in the file.
 	if count == 0 {
 		// Exact match failed. Fall back to a punctuation-normalizing match
 		// that tolerates smart quotes — the most common cause of "not found".
@@ -112,6 +114,9 @@ func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		// Ambiguous match: file untouched, so invalidate dedup too — a diagnostic
 		// re-read should return fresh bytes, not the unchanged stub.
 		agent.InvalidateReadCache(ctx, args.Path)
+		if len(fuzzySpans) > 0 {
+			return agent.ValidationError(fmt.Sprintf("old_string fuzzily matched %d times (must be unique unless replace_all=true)", count)), nil
+		}
 		return agent.ValidationError(fmt.Sprintf("old_string found %d times (must be unique unless replace_all=true)", count)), nil
 	}
 

@@ -11,6 +11,55 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
 
+func TestFileEdit_RejectsEmptyOldStringBeforeFileIO(t *testing.T) {
+	missingPath := filepath.Join(t.TempDir(), "missing.txt")
+	args, err := json.Marshal(fileEditArgs{
+		Path: missingPath, OldString: "", NewString: "replacement", Description: "invalid empty match",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&FileEditTool{}).Run(context.Background(), string(args))
+	if err != nil {
+		t.Fatalf("transport error: %v", err)
+	}
+	if !result.IsError || !contains(result.Content, "old_string must not be empty") {
+		t.Fatalf("expected early old_string validation, got: %s", result.Content)
+	}
+}
+
+func TestFileEdit_FuzzyAmbiguityWording(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "quotes.txt")
+	original := "“x”\n„x“\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tracker := agent.NewReadTracker()
+	tracker.MarkRead(path)
+	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
+	args, err := json.Marshal(fileEditArgs{
+		Path: path, OldString: `"x"`, NewString: "X", Description: "ambiguous fuzzy edit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&FileEditTool{}).Run(ctx, string(args))
+	if err != nil {
+		t.Fatalf("transport error: %v", err)
+	}
+	if !result.IsError || !contains(result.Content, "old_string fuzzily matched 2 times") {
+		t.Fatalf("expected fuzzy ambiguity wording, got: %s", result.Content)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Fatalf("ambiguous fuzzy edit changed file: want %q, got %q", original, string(got))
+	}
+}
+
 // TestFileEdit_FuzzyReplaceAll_NoPartialWrite reproduces the reviewer's
 // correctness finding: a fuzzy replace_all where the matches have DIFFERENT
 // raw bytes replaces only the bytes equal to the first match, yet reports
