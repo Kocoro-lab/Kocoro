@@ -24,7 +24,8 @@
     "per_agent_mcp_scope",
     "sessions_scope_all",
     "agent_default_cwd_v1",
-    "remote_control_v1"
+    "remote_control_v1",
+    "clawhub_exclude_installed"
   ],
   "memory": {
     "provider": "disabled",

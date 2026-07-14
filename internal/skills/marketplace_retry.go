@@ -121,11 +121,24 @@ func doGETWithRetry(ctx context.Context, hc *http.Client, rawURL string, maxAtte
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
+	// budget bounds the TOTAL wall-clock of the GET *including the caller's body
+	// read*, so it must NOT be torn down with a bare `defer cancel()`: that
+	// cancels the request context the instant this function returns — i.e.
+	// BEFORE the caller reads resp.Body — and a large, not-yet-buffered body then
+	// fails with "context canceled" (small bodies survive only by luck of
+	// transport buffering). Instead cancel fires on every error return (via the
+	// deferred guard below) and, on success, is transferred to the returned
+	// body's Close (cancelReadCloser) so the deadline still covers the read.
+	cancel := context.CancelFunc(func() {})
 	if budget > 0 {
-		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, budget)
-		defer cancel()
 	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			cancel()
+		}
+	}()
 	var retryAfter time.Duration
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -161,7 +174,32 @@ func doGETWithRetry(ctx context.Context, hc *http.Client, rawURL string, maxAtte
 			drainClose(resp)
 			continue
 		}
-		return resp, nil // 2xx, non-retryable status, or final attempt
+		// 2xx, non-retryable status, or final attempt. Keep the budget context
+		// alive across the caller's body read: transfer cancel to Body.Close so
+		// the deadline still bounds the read but is not torn down on return.
+		if budget > 0 {
+			resp.Body = &cancelReadCloser{ReadCloser: resp.Body, cancel: cancel}
+			transferred = true
+		}
+		return resp, nil
 	}
 	return nil, lastErr // unreachable: the loop always returns on the last attempt
+}
+
+// cancelReadCloser transfers ownership of a context cancel func to an
+// http.Response body, so the budget context doGETWithRetry created stays live
+// while the caller reads the body and is canceled only when the body is closed.
+// Callers of doGETWithRetry MUST close the returned body (all do via
+// `defer resp.Body.Close()`); if one ever failed to, the context would simply
+// linger until the budget deadline fired — a leak bounded by the budget, not a
+// correctness bug.
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }

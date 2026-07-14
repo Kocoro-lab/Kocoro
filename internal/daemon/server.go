@@ -738,6 +738,16 @@ func (s *Server) Start(ctx context.Context) error {
 	// Serialized, debounced worker that pushes agent changes to Cloud.
 	go s.agentSyncWorker(ctx)
 
+	// Warm the default ClawHub browse page ONCE at startup so the first open of
+	// the marketplace tab has a stale fallback and doesn't surface the
+	// intermittent "registry unreachable" (注册表不可达) 503 on the default view
+	// during a clawhub.ai blip. Deliberately one-shot, not a poll loop: during
+	// active browsing the user's own requests keep the cache warm, and the
+	// 30-min view-agnostic golden slot covers idle gaps — so an unused
+	// (air-gapped / IM-only) daemon makes at most this single request. Gated by
+	// skills.marketplace.clawhub_warm_on_startup (default true).
+	go s.warmClawHubOnce(ctx)
+
 	// One-time agent pull on startup: applies the cloud mirror to local disk
 	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
 	// tombstoned). No-op when Cloud is unconfigured. pullDone is ALWAYS closed
@@ -818,6 +828,23 @@ const (
 // subscribers. It starts with the local server so it observes the same events
 // Desktop receives over /events; send failures are expected while the WS is
 // disconnected and are intentionally ignored.
+// warmClawHubOnce does a single best-effort warm of the default ClawHub browse
+// page at startup (see the call site for why it is one-shot). Best-effort:
+// failure is logged once and never fatal, so an offline daemon simply degrades
+// to "warm on first successful browse". Gated by clawhub_warm_on_startup, which
+// defaults to false when config.Load hasn't run (e.g. daemon unit tests) — so
+// the test suite never issues a live clawhub.ai request.
+func (s *Server) warmClawHubOnce(ctx context.Context) {
+	if s.clawhub == nil || !viper.GetBool("skills.marketplace.clawhub_warm_on_startup") {
+		return
+	}
+	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := s.clawhub.WarmClawHub(wctx); err != nil {
+		log.Printf("daemon clawhub startup warm (non-fatal): %v", err)
+	}
+}
+
 func (s *Server) forwardRemoteEvents(ctx context.Context) {
 	if s == nil || s.client == nil || s.eventBus == nil {
 		return
@@ -4485,13 +4512,39 @@ func (s *Server) handleClawHubList(w http.ResponseWriter, r *http.Request) {
 		sortKey = "downloads"
 	}
 	search := q.Get("q")
+	cursor := q.Get("cursor")
+	// exclude_installed hides skills already installed locally. "Installed" is a
+	// purely local notion clawhub.ai can't filter on, so the daemon fetches
+	// normally then drops installed slugs, refilling from subsequent pages so the
+	// page stays populated (see FetchClawHubPageExcludingInstalled). Opt-in and
+	// additive — old clients (and the default marketplace view) are unaffected.
+	excludeInstalled := q.Get("exclude_installed") == "true"
+	installed := installedSkillSet(s.deps.ShannonDir)
 
-	entries, next, err := s.clawhub.FetchClawHubPage(r.Context(), search, sortKey, q.Get("cursor"), size)
+	var entries []skills.MarketplaceEntry
+	var next string
+	var stale bool
+	var err error
+	if excludeInstalled {
+		maxPages := viper.GetInt("skills.marketplace.clawhub_exclude_fill_max_pages")
+		entries, next, stale, err = s.clawhub.FetchClawHubPageExcludingInstalled(r.Context(), search, sortKey, cursor, size, installed, maxPages)
+	} else {
+		entries, next, stale, err = s.clawhub.FetchClawHubPage(r.Context(), search, sortKey, cursor, size)
+	}
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("clawhub unavailable: %v", err))
 		return
 	}
-	installed := installedSkillSet(s.deps.ShannonDir)
+	// When the DEFAULT view (no search, no cursor) was served from the stale
+	// golden-slot fallback, hint the client so it can show "cached results" —
+	// the list may be mis-sorted vs. the request and is a single non-paginating
+	// page. Mirrors the static registry's X-Cache-Stale. `stale` is the freshness
+	// of THIS fetch (not a process-global flag), so concurrent browses can't
+	// cross-contaminate the header. Scoped to the default view so a later
+	// search/deep-page response never inherits a stale flag.
+	if search == "" && cursor == "" && stale {
+		w.Header().Set("X-Cache-Stale", "true")
+	}
 	type listItem struct {
 		skills.MarketplaceEntry
 		Installed bool `json:"installed"`

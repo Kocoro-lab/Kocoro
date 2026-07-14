@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -136,6 +137,18 @@ type MarketplaceClient struct {
 	// (getJSON/getText). Non-nil only on a ClawHub client; the static-registry
 	// client caches at the Load() layer instead. nil → no caching.
 	clawhubCache *clawhubCache
+
+	// firstPage is a view-agnostic "last known good default browse page": the
+	// mapped entries from the most recent SUCCESSFUL no-query/no-cursor list
+	// fetch (any size/sort), served — as a single stale page — whenever a fresh
+	// default (cursor=="" && q=="") list fetch fails while the exact-URL cache
+	// is cold. This masks a clawhub.ai outage on the default marketplace view
+	// with a populated (if slightly mis-sorted, single-page) list instead of
+	// the 503 "registry unreachable" banner. Guarded by firstPageMu, NOT c.mu
+	// (the fetch path deliberately holds no lock across network I/O).
+	firstPageMu      sync.Mutex
+	firstPage        []MarketplaceEntry
+	firstPageFetched time.Time
 
 	mu         sync.Mutex
 	cache      *RegistryIndex
@@ -1145,6 +1158,15 @@ type clawhubSearchResult struct {
 // reorder of the top few.
 const clawhubSearchPool = 100
 
+// clawhubMaxListPageSize caps the per-page browse size passed to ClawHub (and
+// the exclude-installed accumulator's initial capacity). ClawHub itself rejects
+// nothing above this, but a caller-supplied `size` is otherwise unbounded — so
+// without a clamp, sizing a slice from it (make([]…, 0, size)) turns a hostile
+// `?size=1e9` into a multi-GB allocation / OOM. Symptom if it binds: a client
+// asking for >200 per page silently gets 200. Deliberately a const (matches the
+// ceiling ClawHub's own paging comfortably serves); not an operator knob.
+const clawhubMaxListPageSize = 200
+
 // FetchClawHubPage returns one page of the ClawHub catalog. The full catalog is
 // ~12k skills, so we never cache it whole — each request is proxied straight to
 // ClawHub.
@@ -1152,16 +1174,20 @@ const clawhubSearchPool = 100
 //   - With a query: hit /api/v1/search (relevance-ranked; the list endpoint's
 //     ?q= is ignored by ClawHub). Search is not cursor-paginated, so next is "".
 //   - Without a query: hit /api/v1/skills with sort + cursor (Load-more paging).
-func (c *MarketplaceClient) FetchClawHubPage(ctx context.Context, q, sortKey, cursor string, limit int) ([]MarketplaceEntry, string, error) {
+//
+// The bool return reports whether this specific call was served from the stale
+// golden-slot fallback (a per-call signal the caller threads to X-Cache-Stale);
+// it replaced a process-global flag that raced across concurrent browses.
+func (c *MarketplaceClient) FetchClawHubPage(ctx context.Context, q, sortKey, cursor string, limit int) ([]MarketplaceEntry, string, bool, error) {
 	if c.clawhubBase == "" {
-		return nil, "", errors.New("not a clawhub client")
+		return nil, "", false, errors.New("not a clawhub client")
 	}
 	// <=0 → default page size; oversize → clamp to the ceiling (rather than
 	// silently snapping back to the default, which made size=201 yield 20).
 	if limit <= 0 {
 		limit = 20
-	} else if limit > 200 {
-		limit = 200
+	} else if limit > clawhubMaxListPageSize {
+		limit = clawhubMaxListPageSize
 	}
 
 	if q != "" {
@@ -1176,7 +1202,7 @@ func (c *MarketplaceClient) FetchClawHubPage(ctx context.Context, q, sortKey, cu
 		u := fmt.Sprintf("%s/api/v1/search?limit=%d&q=%s", c.clawhubBase, pool, url.QueryEscape(q))
 		var sr clawhubSearchResp
 		if err := c.getJSON(ctx, u, &sr); err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
 		switch sortKey {
 		case "downloads":
@@ -1196,7 +1222,7 @@ func (c *MarketplaceClient) FetchClawHubPage(ctx context.Context, q, sortKey, cu
 		for _, r := range sr.Results {
 			entries = append(entries, c.clawhubSearchToEntry(r))
 		}
-		return entries, "", nil
+		return entries, "", false, nil
 	}
 
 	// nonSuspiciousOnly lets ClawHub drop flagged skills server-side — the
@@ -1211,7 +1237,21 @@ func (c *MarketplaceClient) FetchClawHubPage(ctx context.Context, q, sortKey, cu
 	}
 	var lr clawhubListResp
 	if err := c.getJSON(ctx, u, &lr); err != nil {
-		return nil, "", err
+		// View-agnostic stale fallback, DEFAULT first page only (no cursor) AND
+		// only for TRANSIENT upstream failures (5xx/429/network/parse). A
+		// definitive 4xx — endpoint gone (404), bad param (400/422), ambiguous
+		// (409) — must surface immediately, NOT be masked by a ≤30-min-stale
+		// page (which would also hide a real endpoint break and let installs
+		// launch from stale rows). Serve the last-good default browse page as a
+		// single stale page (next="", stale=true) so the handler can set
+		// X-Cache-Stale. Deep pages (cursor!="") never fall back — a page-1 body
+		// can't stand in for an arbitrary deep cursor.
+		if cursor == "" && isTransientListErr(err) {
+			if fp, ok := c.lastGoodFirstPage(); ok {
+				return fp, "", true, nil
+			}
+		}
+		return nil, "", false, err
 	}
 	entries := make([]MarketplaceEntry, 0, len(lr.Items))
 	for _, it := range lr.Items {
@@ -1221,7 +1261,140 @@ func (c *MarketplaceClient) FetchClawHubPage(ctx context.Context, q, sortKey, cu
 	if lr.NextCursor != nil {
 		next = *lr.NextCursor
 	}
-	return entries, next, nil
+	// A fresh default browse refreshes the view-agnostic last-good slot.
+	if cursor == "" && len(entries) > 0 {
+		c.storeFirstPage(entries)
+	}
+	return entries, next, false, nil
+}
+
+// storeFirstPage records the entries of a successful default (no-query,
+// no-cursor) browse as the view-agnostic last-good first page.
+func (c *MarketplaceClient) storeFirstPage(entries []MarketplaceEntry) {
+	cp := make([]MarketplaceEntry, len(entries))
+	copy(cp, entries)
+	c.firstPageMu.Lock()
+	c.firstPage = cp
+	c.firstPageFetched = time.Now()
+	c.firstPageMu.Unlock()
+}
+
+// lastGoodFirstPage returns the stored default browse page when present and
+// fresher than clawhubFirstPageMaxAge. The max-age guard stops a long-idle
+// daemon from serving a badly outdated catalog as if it were current.
+func (c *MarketplaceClient) lastGoodFirstPage() ([]MarketplaceEntry, bool) {
+	c.firstPageMu.Lock()
+	defer c.firstPageMu.Unlock()
+	if len(c.firstPage) == 0 || time.Since(c.firstPageFetched) > clawhubFirstPageMaxAge {
+		return nil, false
+	}
+	cp := make([]MarketplaceEntry, len(c.firstPage))
+	copy(cp, c.firstPage)
+	return cp, true
+}
+
+// isTransientListErr reports whether a default-list fetch error is a transient
+// upstream failure worth masking with the stale golden page, vs. a definitive
+// client/endpoint error that must surface immediately. It mirrors clawhubGet's
+// own serve-stale policy EXACTLY by reusing isRetryableStatus: only 429 + 5xx
+// (and non-status errors — network, read-body, parse) are transient; every
+// other HTTP status (400/401/403/404/405/409/410/422/451/… — bad param, auth,
+// forbidden, gone, ambiguous) is definitive and surfaces. A prior blacklist of
+// just 400/404/409/422 wrongly masked 401/403/410 behind ≤30-min-stale data
+// (and could launch installs from stale rows). Status errors are wrapped as
+// "status %d" by clawhubGet/getJSON.
+func isTransientListErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	const marker = "status "
+	if i := strings.LastIndex(msg, marker); i >= 0 {
+		rest := msg[i+len(marker):]
+		j := 0
+		for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+			j++
+		}
+		if code, convErr := strconv.Atoi(rest[:j]); convErr == nil {
+			return isRetryableStatus(code)
+		}
+	}
+	// No parseable HTTP status → network / read-body / parse error → transient.
+	return true
+}
+
+// WarmClawHub proactively fetches the canonical default browse page (limit=20,
+// sort=downloads, no cursor/query — the documented default the desktop's "all"
+// view requests) so the per-URL response cache is fresh and the view-agnostic
+// last-good first page is populated. Called once at daemon startup (see the
+// daemon's warmClawHubOnce) so the FIRST open of the marketplace view has a
+// stale fallback and doesn't surface a cold-cache 503 during a clawhub.ai blip.
+// No-op on a non-ClawHub client.
+func (c *MarketplaceClient) WarmClawHub(ctx context.Context) error {
+	if c.clawhubBase == "" {
+		return nil
+	}
+	_, _, _, err := c.FetchClawHubPage(ctx, "", "downloads", "", 20)
+	return err
+}
+
+// FetchClawHubPageExcludingInstalled behaves like FetchClawHubPage but drops
+// entries whose slug is in `installed`, fetching up to maxPages upstream pages
+// to refill the dropped slots so the caller still gets a populated page. It
+// returns the accumulated non-installed entries — which may EXCEED size, since
+// ClawHub's cursor is page-granular and a page cannot be split, so the last
+// fetched page is included whole — and the cursor to resume from (empty when
+// the catalog is exhausted). Resuming from that cursor never duplicates or
+// drops an entry because it is always aligned to a fetched-page boundary.
+//
+// "Installed" is a purely LOCAL notion (a directory under ~/.shannon/skills);
+// clawhub.ai has no knowledge of it and silently ignores an exclude param, so
+// the filter necessarily runs here, not upstream. maxPages bounds the upstream
+// fan-out for one caller page (see the daemon's clawhub_exclude_fill_max_pages).
+// On a mid-fill upstream error AFTER some entries were gathered, those entries
+// are returned with the cursor of the failed page (partial success beats
+// failing the whole page); a first-page error propagates. The bool return
+// carries the golden-slot stale signal from the underlying fetch (only the
+// cursor=="" fetch can be stale, and it returns next="", so the loop stops
+// after it) so the handler can still set X-Cache-Stale in the exclude view.
+func (c *MarketplaceClient) FetchClawHubPageExcludingInstalled(ctx context.Context, q, sortKey, cursor string, size int, installed map[string]bool, maxPages int) ([]MarketplaceEntry, string, bool, error) {
+	if maxPages < 1 {
+		maxPages = 1
+	}
+	// Clamp size the same way FetchClawHubPage does BEFORE using it as the
+	// accumulator capacity: an unbounded client `?size=…` would otherwise turn
+	// make([]…, 0, size) into a huge allocation even though the real result is
+	// capped at clawhubMaxListPageSize × maxPages.
+	if size <= 0 {
+		size = 20
+	} else if size > clawhubMaxListPageSize {
+		size = clawhubMaxListPageSize
+	}
+	out := make([]MarketplaceEntry, 0, size)
+	next := cursor
+	stale := false
+	for page := 0; page < maxPages; page++ {
+		entries, n, st, err := c.FetchClawHubPage(ctx, q, sortKey, next, size)
+		if err != nil {
+			if len(out) > 0 {
+				// next still points at the page that just failed (n is assigned
+				// only on success), so the caller resumes exactly there.
+				return out, next, stale, nil
+			}
+			return nil, "", false, err
+		}
+		stale = st
+		for _, e := range entries {
+			if !installed[e.Slug] {
+				out = append(out, e)
+			}
+		}
+		next = n
+		if next == "" || len(out) >= size {
+			break
+		}
+	}
+	return out, next, stale, nil
 }
 
 func (c *MarketplaceClient) clawhubSearchToEntry(r clawhubSearchResult) MarketplaceEntry {

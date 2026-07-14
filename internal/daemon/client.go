@@ -176,6 +176,13 @@ const (
 	// remote_event frames. Mobile clients use this to control the user's Mac via
 	// Shannon Cloud without exposing localhost.
 	CapRemoteControlV1 = "remote_control_v1"
+	// CapClawHubExcludeInstalled — daemon's GET /skills/clawhub accepts
+	// exclude_installed=true, dropping already-installed skills from the browse/
+	// search list and refilling from subsequent pages so the page stays
+	// populated. Desktop gates its "hide installed" marketplace toggle on this
+	// token; old daemons ignore the param (return the full list incl. installed),
+	// so without the token Desktop hides the toggle rather than silently no-oping.
+	CapClawHubExcludeInstalled = "clawhub_exclude_installed"
 )
 
 var Capabilities = []string{
@@ -200,6 +207,7 @@ var Capabilities = []string{
 	CapSessionsScopeAll,
 	CapAgentDefaultCWDV1,
 	CapRemoteControlV1,
+	CapClawHubExcludeInstalled,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
