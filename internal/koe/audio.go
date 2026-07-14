@@ -16,10 +16,8 @@ import (
 )
 
 const (
-	audioSampleRate = 48000                                 // WebRTC/Opus path (NOT the 24k WS path)
-	audioChannels   = 1                                     // mono capture/playback
-	audioFrameMs    = 20                                    // 20 ms frames
-	audioFrameSize  = audioSampleRate / 1000 * audioFrameMs // 960 samples
+	// Audio format constants (audioSampleRate/audioChannels/audioFrameMs/
+	// audioFrameSize) live in audioformat.go (tagless) so the linux path shares them.
 	// inputBufferFrames covers the cold-start window before session.updated starts
 	// the send pump. Desktop normally uses a warm session, but keeping ~5s here
 	// prevents first words from being dropped during network stalls or startup.
@@ -119,18 +117,7 @@ type AudioIO struct {
 	outLevel atomic.Uint64
 }
 
-// rmsLevel returns the RMS amplitude of a PCM frame normalized to 0..1.
-func rmsLevel(pcm []int16) float64 {
-	if len(pcm) == 0 {
-		return 0
-	}
-	var sumSq float64
-	for _, s := range pcm {
-		v := float64(s)
-		sumSq += v * v
-	}
-	return math.Sqrt(sumSq/float64(len(pcm))) / 32768.0
-}
+// rmsLevel lives in audioformat.go (tagless, shared with the linux path).
 
 func (a *AudioIO) setInputLevel(l float64) { a.inLevel.Store(math.Float64bits(l)) }
 func (a *AudioIO) setOutputLevel(l float64) {
@@ -455,14 +442,7 @@ func (a *AudioIO) DecodeFrame(payload []byte) ([]int16, error) {
 	return pcm[:n], nil
 }
 
-// prerollFrames is the playback jitter cushion. WORKLOAD: OpenAI streams reply
-// audio over WebRTC in network-paced bursts, but the real CoreAudio device drains
-// at a strict 48k hardware clock. SYMPTOM when it binds: with no cushion the first
-// frames drain before the next burst lands → constant underrun → the "电流杂音"
-// the user heard (clean in the lenient software-ticker file backend, garbled on
-// the strict hardware clock). 8 frames = ~160 ms, the low end of typical voice
-// jitter buffers. OVERRIDE: raise this const if a slow link still underruns.
-const prerollFrames = 8
+// prerollFrames lives in audioformat.go (tagless, shared with the linux path).
 
 // renderInto fills out with the next playback bytes, behind a pre-roll jitter
 // buffer: hold (silence) until prerollFrames have accumulated, then drain FIFO;
