@@ -251,6 +251,15 @@ func TestAgentCreateRequest_Validate(t *testing.T) {
 	if err := r7.Validate(); err == nil {
 		t.Error("expected error for null skill entry")
 	}
+	// A configured cwd must exist at write time.
+	r8 := &AgentCreateRequest{
+		DisplayName: "cwd-bot",
+		Prompt:      "hi",
+		Config:      &AgentConfigAPI{CWD: filepath.Join(t.TempDir(), "missing")},
+	}
+	if err := r8.Validate(); err == nil {
+		t.Error("expected error for nonexistent cwd")
+	}
 }
 
 func TestWriteAgentConfig_PersistsDisplayName(t *testing.T) {

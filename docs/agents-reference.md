@@ -21,7 +21,9 @@ An agent without `config.yaml` inherits all tools, global MCP servers, and defau
 ## Full config.yaml
 
 ```yaml
-# Default project directory for this agent. Must be an absolute path.
+# Default project directory for this agent. Must be an absolute path to an
+# existing directory when written through the daemon API. Device-local: agent
+# sync never uploads it or overwrites it from another device.
 # Drives: prompt context, instructions, file tools, bash, auto-approval
 # scope, read-before-edit tracking. Request-level cwd and resumed sessions
 # can override this default.
@@ -104,6 +106,10 @@ Effective `cwd` for a run is resolved in this order:
 4. Process working directory fallback
 
 This means: a request can target a project, resumed sessions return to the same project, and agents can define a default.
+
+The daemon validates a non-empty agent `cwd` on create and config update before making any mutation. If a previously valid directory is later deleted, `GET /agents/{name}` still succeeds and returns the configured path in `config.cwd` plus a non-fatal `warnings` entry so a client can repair or clear it. Runtime execution continues to reject an invalid effective directory.
+
+Agent `cwd` is device-local. It is stripped from cross-device sync pushes, ignored in pulls from older daemons that included it, and preserved when a newer cloud config overwrites or clears the other config fields. Daemons advertising `agent_default_cwd_v1` provide this complete contract.
 
 ### What `cwd` affects
 
