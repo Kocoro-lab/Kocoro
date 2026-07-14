@@ -385,7 +385,7 @@ func init() {
 	koeCmd.Flags().Int("audio-period", 0, "debug: renderInto pull size in samples (480 reproduces the framing bug; 0=960)")
 	koeCmd.Flags().Bool("once", false, "debug: exit shortly after the reply finishes")
 	koeCmd.Flags().Int("timeout", 0, "debug: hard exit after N seconds (0=none)")
-	koeCmd.Flags().String("carrier", "", "physical carrier: mac (default) | reachy_lite")
+	koeCmd.Flags().String("carrier", "", "physical carrier: mac (default) | reachy_lite | reachy_wireless")
 	koeCmd.Flags().String("caps", "", "capability bits, comma-separated (empty = carrier default set): full_duplex,has_camera,has_body,has_face,has_screen")
 	koeCmd.Flags().String("bridge-socket", "", "reachy motion-bridge UDS path (empty = motion disabled)")
 	koeCmd.Flags().String("reachy-daemon-url", "", "Pollen daemon read-plane URL (reachy_lite default http://127.0.0.1:7534; ignored on mac)")

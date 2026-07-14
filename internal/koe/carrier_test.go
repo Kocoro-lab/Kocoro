@@ -57,12 +57,54 @@ func TestParseCarrierProfile_ExplicitCapsOverrideAndSort(t *testing.T) {
 }
 
 func TestParseCarrierProfile_UnknownCarrierFailsLoud(t *testing.T) {
-	_, err := ParseCarrierProfile(CarrierInputs{Carrier: "reachy_wireless"})
+	_, err := ParseCarrierProfile(CarrierInputs{Carrier: "reachy_pro"})
 	if err == nil {
 		t.Fatal("unknown --carrier must fail loud, got nil err")
 	}
 	if !strings.Contains(err.Error(), "carrier") {
 		t.Errorf("error should mention carrier, got: %v", err)
+	}
+}
+
+func TestParseCarrierProfile_ReachyWirelessDefaultCaps(t *testing.T) {
+	// reachy_wireless (Wireless SKU, §07/§21): a body that hears/sees/moves but
+	// has NO screen — the caps superset drops has_screen vs reachy_lite.
+	p, err := ParseCarrierProfile(CarrierInputs{Carrier: CarrierReachyWireless})
+	if err != nil {
+		t.Fatalf("reachy_wireless should parse, got err: %v", err)
+	}
+	want := []string{CapFullDuplex, CapHasBody, CapHasCamera, CapHasFace} // no has_screen, sorted
+	if !slices.Equal(p.Caps, want) {
+		t.Errorf("reachy_wireless default caps = %v, want %v (superset minus has_screen)", p.Caps, want)
+	}
+}
+
+func TestParseCarrierProfile_ReachyWirelessHasNoScreen(t *testing.T) {
+	p, err := ParseCarrierProfile(CarrierInputs{Carrier: CarrierReachyWireless})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if p.HasCap(CapHasScreen) {
+		t.Error("reachy_wireless HasCap(has_screen) = true, want false (no display on the wireless body)")
+	}
+	for _, cap := range []string{CapFullDuplex, CapHasBody, CapHasCamera, CapHasFace} {
+		if !p.HasCap(cap) {
+			t.Errorf("reachy_wireless HasCap(%s) = false, want true", cap)
+		}
+	}
+}
+
+func TestParseCarrierProfile_ReachyWirelessNoDeviceUIDsRequired(t *testing.T) {
+	// Unlike reachy_lite (Mac CoreAudio UID binding), reachy_wireless audio lives
+	// on the CM4/ALSA side, so Koe binds no CoreAudio device UID — the lite
+	// missing-UID fail-loud must NOT apply. The ALSA-side "bind card 0, fail loud"
+	// rule is the audio layer's (U1 un-darwin), not the carrier profile's.
+	p, err := ParseCarrierProfile(CarrierInputs{Carrier: CarrierReachyWireless})
+	if err != nil {
+		t.Fatalf("reachy_wireless must parse without mic/speaker UIDs, got err: %v", err)
+	}
+	if p.MicUID != "" || p.SpeakerUID != "" {
+		t.Errorf("reachy_wireless should carry no CoreAudio UIDs, got mic=%q spk=%q", p.MicUID, p.SpeakerUID)
 	}
 }
 

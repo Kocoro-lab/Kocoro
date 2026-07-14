@@ -10,8 +10,9 @@ import (
 // lifetime. The carrier and its capability bits (§18) are injected statically at
 // startup and never flip mid-process; ParseCarrierProfile resolves them once.
 const (
-	CarrierMac        = "mac"
-	CarrierReachyLite = "reachy_lite"
+	CarrierMac            = "mac"
+	CarrierReachyLite     = "reachy_lite"
+	CarrierReachyWireless = "reachy_wireless"
 )
 
 // Capability bits — the closed set (desktop-koe-carrier-control-spec §2). Adding
@@ -43,6 +44,9 @@ var validCaps = map[string]struct{}{
 var carrierDefaultCaps = map[string][]string{
 	CarrierMac:        {CapHasScreen},
 	CarrierReachyLite: {CapFullDuplex, CapHasCamera, CapHasBody, CapHasFace, CapHasScreen},
+	// reachy_wireless is the same body as reachy_lite MINUS the screen (§07/§21):
+	// the Wireless SKU has no display, so has_screen is dropped from the superset.
+	CarrierReachyWireless: {CapFullDuplex, CapHasCamera, CapHasBody, CapHasFace},
 }
 
 // CarrierInputs is the raw, already-resolved configuration passed to
@@ -83,8 +87,8 @@ func ParseCarrierProfile(in CarrierInputs) (CarrierProfile, error) {
 	if carrier == "" {
 		carrier = CarrierMac
 	}
-	if carrier != CarrierMac && carrier != CarrierReachyLite {
-		return CarrierProfile{}, fmt.Errorf("invalid --carrier %q (want mac or reachy_lite)", in.Carrier)
+	if carrier != CarrierMac && carrier != CarrierReachyLite && carrier != CarrierReachyWireless {
+		return CarrierProfile{}, fmt.Errorf("invalid --carrier %q (want mac, reachy_lite, or reachy_wireless)", in.Carrier)
 	}
 
 	caps, err := resolveCaps(carrier, in.CapsCSV)
