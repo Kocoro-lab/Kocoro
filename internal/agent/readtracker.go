@@ -226,7 +226,7 @@ func CheckFileReadDedup(ctx context.Context, path string, offset, limit int, mti
 	}
 	if entry.mtime.Equal(mtime) && entry.size == size {
 		stub := fmt.Sprintf(
-			"[file unchanged since last read at %s — to force re-read, modify the file or use a different offset/limit range]",
+			"[file unchanged since last read at %s — refer to the earlier file_read result in this conversation; it is still current. Use a different offset/limit to force a fresh read.]",
 			entry.when.Format("15:04:05"),
 		)
 		return true, stub
@@ -253,6 +253,32 @@ func RecordFileRead(ctx context.Context, path string, offset, limit int, mtime t
 		offset: offset,
 		limit:  limit,
 		when:   time.Now(),
+	}
+	rt.mu.Unlock()
+}
+
+// InvalidateReadCache drops every per-range file_read dedup entry for path on
+// the context's ReadTracker, so the next file_read of that path returns fresh
+// disk content instead of an "unchanged since last read" stub. file_edit calls
+// this when it fails to match: the file is left untouched (mtime/size
+// unchanged), so without invalidation the agent's diagnostic re-read would hit
+// the stub and never see how its old_string differs from the real bytes. No-op
+// when no tracker is in context. Read-before-write state (rt.read) is left
+// intact — only the dedup history is cleared.
+func InvalidateReadCache(ctx context.Context, path string) {
+	rt, ok := ctx.Value(readTrackerKey{}).(*ReadTracker)
+	if !ok || rt == nil {
+		return
+	}
+	norm := normalizePathWithCWD(path, rt.cwd)
+	if norm == "" {
+		return
+	}
+	rt.mu.Lock()
+	for k := range rt.lastReads {
+		if k.path == norm {
+			delete(rt.lastReads, k)
+		}
 	}
 	rt.mu.Unlock()
 }
