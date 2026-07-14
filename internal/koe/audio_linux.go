@@ -361,6 +361,23 @@ func (a *AudioIO) Stop() {
 	})
 }
 
+// ---- darwin-backend stubs (cmd/koe.go references these; inert on linux) ----
+
+// StartVPIO is a macOS-only backend (Apple VoiceProcessingIO AEC, used by
+// reachy_lite). Wireless routes audio through the carrier UDS, so it fails loud
+// rather than silently doing nothing when a mis-wired argv selects it.
+func (a *AudioIO) StartVPIO() error {
+	return fmt.Errorf("koe[audio]: vpio backend is macOS-only; wireless audio uses the carrier UDS")
+}
+
+// StartFile is the macOS-only headless WAV debug backend (--say / --audio-in).
+func (a *AudioIO) StartFile(inPCM []int16, outWAV string, pullSamples int) error {
+	return fmt.Errorf("koe[audio]: --say/--audio-in file backend is macOS-only")
+}
+
+// CapturedMetrics returns the WAV debug backend's metrics — always zero on linux.
+func (a *AudioIO) CapturedMetrics() WavMetrics { return WavMetrics{} }
+
 // ---- helpers ----
 
 // toCodecPCM converts a carrier mic frame (per its header format/rate/channels) to
