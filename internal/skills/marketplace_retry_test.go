@@ -2,8 +2,10 @@ package skills
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -45,6 +47,54 @@ func TestParseRetryAfter(t *testing.T) {
 		if got := parseRetryAfter(h); got != want {
 			t.Errorf("parseRetryAfter(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+// TestDoGETWithRetry_BodyReadableAfterReturnWithBudget pins the fix for the
+// context-lifetime bug: with a positive budget, doGETWithRetry used to
+// `defer cancel()` its budget context, canceling it the instant it returned —
+// before the caller read resp.Body. A large, not-yet-buffered body then failed
+// with "context canceled" (the daemon symptom: ClawHub /api/v1/search 503s
+// "read clawhub body: context canceled" while small browse lists succeeded).
+// The body must remain fully readable after the call and until Body.Close.
+func TestDoGETWithRetry_BodyReadableAfterReturnWithBudget(t *testing.T) {
+	// Large enough that io.ReadAll must pull from the connection after
+	// doGETWithRetry returns, rather than serving entirely from transport buffer.
+	const payloadLen = 4 << 20 // 4 MiB
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(payloadLen))
+		w.WriteHeader(http.StatusOK)
+		buf := make([]byte, 64<<10)
+		for i := range buf {
+			buf[i] = 'x'
+		}
+		written := 0
+		for written < payloadLen {
+			n, err := w.Write(buf)
+			if err != nil {
+				return
+			}
+			written += n
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}))
+	defer ts.Close()
+
+	// budget > 0 exercises the WithTimeout branch; generous so the deadline
+	// itself never fires during the read (isolating the cancel-on-return bug).
+	resp, err := doGETWithRetry(context.Background(), http.DefaultClient, ts.URL, 3, fastBase, 30*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body after return: %v", err)
+	}
+	if len(body) != payloadLen {
+		t.Fatalf("body len = %d, want %d", len(body), payloadLen)
 	}
 }
 
@@ -168,7 +218,7 @@ func TestClawHubFetch_RetryExhaustedPreservesStatusString(t *testing.T) {
 	client.maxAttempts = 3
 	client.retryBase = fastBase
 
-	_, _, err := client.FetchClawHubPage(context.Background(), "", "", "", 10)
+	_, _, _, err := client.FetchClawHubPage(context.Background(), "", "", "", 10)
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
 	}
@@ -192,7 +242,7 @@ func TestClawHubFetch_NoRetryOn404PreservesStatusString(t *testing.T) {
 	client.maxAttempts = 3
 	client.retryBase = fastBase
 
-	_, _, err := client.FetchClawHubPage(context.Background(), "", "", "", 10)
+	_, _, _, err := client.FetchClawHubPage(context.Background(), "", "", "", 10)
 	if err == nil || !strings.Contains(err.Error(), "status 404") {
 		t.Fatalf("expected error containing \"status 404\", got %v", err)
 	}
