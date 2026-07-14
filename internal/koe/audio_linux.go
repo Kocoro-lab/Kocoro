@@ -205,6 +205,15 @@ func (a *AudioIO) DecodeFrame(payload []byte) ([]int16, error) {
 // if too large: added latency. OVERRIDE: KOE_SPK_RING_FRAMES.
 const spkRingFrames = 15
 
+// carrierWireRate is the UDS sample rate for BOTH legs of the carrier link. The
+// daemon SDK's audio I/O is 16 kHz and its playback appsrc caps pin 16k with no
+// resampling (recon 2026-07-14: AudioBase.SAMPLE_RATE=16000). So koe owns the
+// transcode on both legs (spec §9-b.1): mic downlink up-rates 16k→48k in
+// toCodecPCM; spk uplink down-rates the 48k codec audio to 16k in toCarrierPCM so
+// the carrier stays a thin no-DSP relay. audioSampleRate (48k, the Opus/OpenAI
+// path) is unchanged.
+const carrierWireRate = 16000
+
 type helloMsg struct {
 	Type  string `json:"type"`
 	Proto string `json:"proto"`
@@ -333,13 +342,14 @@ func (a *AudioIO) spkPump() {
 		case <-a.done:
 			return
 		case pcm := <-ring:
-			payload := s16PCMToBytes(pcm)
+			wire := toCarrierPCM(pcm) // 48k codec → 16k wire; carrier stays thin (§9-b.1)
+			payload := s16PCMToBytes(wire)
 			hdr := audiobridge.Header{
 				Magic:      audiobridge.MagicSpk,
 				Format:     audiobridge.FormatS16LE,
 				Channels:   audioChannels,
-				SampleRate: audioSampleRate,
-				NSamples:   uint32(len(pcm)),
+				SampleRate: carrierWireRate,
+				NSamples:   uint32(len(wire)),
 				Seq:        a.upSeq.Add(1),
 			}
 			if err := audiobridge.WriteFrame(a.conn, hdr, payload); err != nil {
@@ -379,6 +389,20 @@ func (a *AudioIO) StartFile(inPCM []int16, outWAV string, pullSamples int) error
 func (a *AudioIO) CapturedMetrics() WavMetrics { return WavMetrics{} }
 
 // ---- helpers ----
+
+// toCarrierPCM down-rates the codec's 48k mono S16 to the carrier wire rate (16k,
+// daemon-native) so the carrier is a thin no-DSP relay (spec §9-b.1). Symmetric to
+// toCodecPCM on the mic leg.
+func toCarrierPCM(pcm []int16) []int16 {
+	if audioSampleRate == carrierWireRate {
+		return pcm
+	}
+	mono := make([]float64, len(pcm))
+	for i, v := range pcm {
+		mono[i] = float64(v) / 32768.0
+	}
+	return floatToS16(resampleLinear(mono, audioSampleRate, carrierWireRate))
+}
 
 // toCodecPCM converts a carrier mic frame (per its header format/rate/channels) to
 // the codec's 48k mono S16. TODO(u2-fidelity): the carrier is thin and sends the
