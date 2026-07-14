@@ -21,6 +21,16 @@ const defaultClawHubCacheTTL = 60 * time.Second
 // within one TTL window.
 const clawhubCacheMaxEntries = 256
 
+// clawhubFirstPageMaxAge bounds how old the view-agnostic last-good default
+// browse page (MarketplaceClient.firstPage) may be and still be served as an
+// outage fallback. Workload: a daemon that warmed the default page then sat
+// idle for a long stretch while clawhub.ai went down — serving a page up to
+// 30min old beats the "registry unreachable" error. Symptom if it binds:
+// during a sustained clawhub outage the default view shows the error again
+// once the last-good page ages past this. Not a hot-path knob; deliberately a
+// const (raise here if a deployment wants a longer outage grace).
+const clawhubFirstPageMaxAge = 30 * time.Minute
+
 type clawhubCacheEntry struct {
 	data       []byte
 	fetchedAt  time.Time

@@ -472,6 +472,27 @@ func Load() (*Config, error) {
 	// published/edited skill takes up to the TTL to appear. 0 disables caching.
 	// Override in ~/.shannon/config.yaml.
 	viper.SetDefault("skills.marketplace.clawhub_cache_ttl_secs", 60)
+	// skills.marketplace.clawhub_warm_on_startup: warm the default ClawHub browse
+	// page (size=20, sort=downloads) once at daemon startup so the FIRST open of
+	// the marketplace tab has a stale fallback and doesn't surface the
+	// intermittent "registry unreachable" (注册表不可达) 503 during a clawhub.ai
+	// blip. One-shot, not a poll loop: active browsing keeps the cache warm and
+	// the 30-min view-agnostic golden slot covers idle, so an unused (air-gapped
+	// / IM-only) daemon makes at most this one startup request. Set false to skip
+	// even that. Override in ~/.shannon/config.yaml.
+	viper.SetDefault("skills.marketplace.clawhub_warm_on_startup", true)
+	// skills.marketplace.clawhub_exclude_fill_max_pages: how many upstream ClawHub
+	// pages a single `exclude_installed=true` browse may fetch while filtering out
+	// already-installed skills, so a user whose top (most-downloaded) skills are
+	// mostly installed still gets a populated page instead of a nearly-empty one.
+	// Workload: default size=20 with a few dozen installed skills clustered near
+	// the top of the downloads sort refills in ~2-3 pages; 5 leaves headroom.
+	// Symptom if too low: an exclude_installed page comes back short (< size) even
+	// though more non-installed skills exist deeper — nothing is lost (the client
+	// keeps paging via next_cursor), it just takes an extra scroll. Symptom if too
+	// high: one browse can fan out to that many clawhub.ai GETs. Override in
+	// ~/.shannon/config.yaml.
+	viper.SetDefault("skills.marketplace.clawhub_exclude_fill_max_pages", 5)
 	viper.SetDefault("cloud.enabled", true)
 	viper.SetDefault("cloud.timeout", 3600)
 	viper.SetDefault("cloud.stream_idle_timeout_secs", 45) // per-connection SSE liveness probe; cloud pings every 10s. 0 disables.
