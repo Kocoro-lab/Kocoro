@@ -471,7 +471,7 @@ func (h *eventHandler) stopOutput(keepInput bool) {
 	h.clearActiveResponseID("")
 	if h.audio != nil {
 		h.audio.SetSpeaking(false)
-		h.audio.SetPlaybackEnabled(false)
+		h.audio.InterruptPlayback()
 	}
 	if !keepInput {
 		_ = h.sendFn(map[string]any{"type": "input_audio_buffer.clear"})

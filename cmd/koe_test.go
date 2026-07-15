@@ -998,23 +998,33 @@ func TestApplyBargeInEnv(t *testing.T) {
 	}
 }
 
-// TestBargeInBackendWarning: --barge-in only works on the VPIO backend, so enabling
-// it on the gate/oto backend must surface a warning instead of silently no-op'ing.
+func TestFullDuplexAECForConfig(t *testing.T) {
+	wireless, err := koe.ParseCarrierProfile(koe.CarrierInputs{Carrier: koe.CarrierReachyWireless})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fullDuplexAECForConfig(koeConfig{carrier: wireless}) {
+		t.Fatal("Wireless full_duplex carrier must use its XVF3800 AEC stream")
+	}
+	if !fullDuplexAECForConfig(koeConfig{aec: "vpio"}) {
+		t.Fatal("VPIO must remain an AEC-capable full-duplex path")
+	}
+	if fullDuplexAECForConfig(koeConfig{}) {
+		t.Fatal("plain Mac gate backend must remain half-duplex")
+	}
+}
+
+// TestBargeInBackendWarning: barge-in works on either VPIO or an AEC-capable
+// carrier; other paths must warn instead of silently no-op'ing.
 func TestBargeInBackendWarning(t *testing.T) {
-	if got := bargeInBackendWarning(true, "vpio"); got != "" {
-		t.Errorf("barge-in on vpio should not warn, got %q", got)
+	if got := bargeInBackendWarning(true, true); got != "" {
+		t.Errorf("barge-in on a full-duplex AEC path should not warn, got %q", got)
 	}
-	if got := bargeInBackendWarning(false, "gate"); got != "" {
+	if got := bargeInBackendWarning(false, false); got != "" {
 		t.Errorf("barge-in off should not warn, got %q", got)
 	}
-	if got := bargeInBackendWarning(false, ""); got != "" {
-		t.Errorf("barge-in off should not warn, got %q", got)
-	}
-	if bargeInBackendWarning(true, "gate") == "" {
-		t.Error("barge-in on the gate backend must warn (it is a silent no-op otherwise)")
-	}
-	if bargeInBackendWarning(true, "") == "" {
-		t.Error("barge-in with an empty backend (defaults to gate) must warn")
+	if bargeInBackendWarning(true, false) == "" {
+		t.Error("barge-in on a half-duplex path must warn")
 	}
 }
 

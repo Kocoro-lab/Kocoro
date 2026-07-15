@@ -42,7 +42,7 @@ type koeConfig struct {
 	micDevice       string             // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
 	speakerDevice   string             // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
 	audioSocket     string             // --audio-socket: carrier PCM UDS path (Wireless; the linux carrier audio backend dials it; ignored on darwin)
-	bargeIn         bool               // --barge-in: allow interruption while Kocoro speaks (vpio backend only)
+	bargeIn         bool               // --barge-in: allow native-S2S interruption while Kocoro speaks (requires an AEC-capable full-duplex carrier or VPIO)
 	bargeInSet      bool               // whether --barge-in was explicit; false must override an inherited debug env
 	carrier         koe.CarrierProfile // resolved carrier identity (--carrier/--caps/--bridge-socket/--reachy-daemon-url); immutable for the process lifetime (§18)
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
@@ -81,7 +81,8 @@ func resolveDevKey(flagKey, envKey, controlPort string) string {
 	return ""
 }
 
-// applyBargeInEnv enables the VPIO raw-audio floor loop. Playback pauses locally;
+// applyBargeInEnv enables the raw-audio floor loop. VPIO and XVF3800 both
+// provide the echo-cancelled capture it needs. Playback pauses locally;
 // Realtime then chooses resume_playback or accept_turn without ASR admission.
 // KOE_NATIVE_FLOOR=0 plus KOE_INTERRUPT_RESPONSE=1 remains the rollback to the old
 // irreversible server-cancel experiment.
@@ -102,13 +103,21 @@ func applyBargeInEnv(bargeIn, explicit bool) {
 		os.Getenv("KOE_VPIO_BARGE_IN"), os.Getenv("KOE_NATIVE_FLOOR"), os.Getenv("KOE_INTERRUPT_RESPONSE"))
 }
 
+// fullDuplexAECForConfig separates signal provenance from the local device backend.
+// VPIO performs AEC on Mac/Lite. Wireless receives an already AEC-processed stream
+// from XVF3800 through the daemon WebRTC carrier, so it is full-duplex even though
+// its local backend is UDS (and must never attempt the macOS-only StartVPIO path).
+func fullDuplexAECForConfig(cfg koeConfig) bool {
+	return cfg.aec == "vpio" ||
+		(cfg.carrier.Carrier == koe.CarrierReachyWireless && cfg.carrier.HasCap(koe.CapFullDuplex))
+}
+
 // bargeInBackendWarning returns a non-empty warning when barge-in is enabled on a
-// backend that cannot honor it. Barge-in lives entirely on the VPIO capture path
-// (shouldForwardVPIOCapture) and the fullDuplexAEC-gated native floor; the
-// gate/oto fallback never reads either, so --barge-in there is a silent no-op.
-func bargeInBackendWarning(bargeIn bool, aec string) string {
-	if bargeIn && aec != "vpio" {
-		return "barge-in has no effect on the current audio backend — it needs the VPIO backend (--aec vpio); the mic stays half-duplex while Kocoro speaks"
+// capture path that cannot honor it. This keeps Mac gate/oto fail-visible while
+// allowing the Wireless XVF3800 hardware-AEC carrier.
+func bargeInBackendWarning(bargeIn, fullDuplexAEC bool) string {
+	if bargeIn && !fullDuplexAEC {
+		return "barge-in has no effect on the current audio path — it needs VPIO or an AEC-capable full-duplex carrier; the mic stays half-duplex while Kocoro speaks"
 	}
 	return ""
 }
@@ -379,7 +388,7 @@ func init() {
 	koeCmd.Flags().String("mic-device", "", "CoreAudio input device UID (empty = system default; vpio backend only)")
 	koeCmd.Flags().String("speaker-device", "", "CoreAudio output device UID (empty = system default; vpio backend only)")
 	koeCmd.Flags().String("audio-socket", "", "carrier PCM UDS path (Wireless; the linux carrier audio backend dials it; ignored on darwin)")
-	koeCmd.Flags().Bool("barge-in", false, "allow native-S2S interruption while Kocoro speaks (reversible pause; vpio backend only)")
+	koeCmd.Flags().Bool("barge-in", false, "allow native-S2S interruption while Kocoro speaks (reversible pause; requires VPIO or an AEC-capable full-duplex carrier)")
 	koeCmd.Flags().String("say", "", "debug: synthesize this text as the mic input (macOS say) — headless file mode")
 	koeCmd.Flags().String("audio-in", "", "debug: WAV file to feed as the mic input — headless file mode")
 	koeCmd.Flags().String("audio-out", "", "debug: capture the reply audio to this WAV")
@@ -846,7 +855,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	// --barge-in selects native floor control before any audio/session code reads
 	// the env gates (covers both Desktop and standalone branches below).
 	applyBargeInEnv(cfg.bargeIn, cfg.bargeInSet)
-	if w := bargeInBackendWarning(cfg.bargeIn, cfg.aec); w != "" {
+	if w := bargeInBackendWarning(cfg.bargeIn, fullDuplexAECForConfig(cfg)); w != "" {
 		log.Printf("koe[barge]: WARNING — %s", w)
 	}
 
@@ -917,7 +926,8 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	audio.SetPreferredDevices(cfg.micDevice, cfg.speakerDevice)
 	audio.SetAudioSocket(cfg.audioSocket) // Wireless: carrier UDS path (no-op on darwin)
 	startAudio := audio.Start
-	fullDuplexAEC := cfg.aec == "vpio"
+	useVPIO := cfg.aec == "vpio"
+	fullDuplexAEC := fullDuplexAECForConfig(cfg)
 	// Headless debug mode (workstream A): --say/--audio-in replace the mic+speaker
 	// with a file backend (feed a WAV, capture the reply to --audio-out) so the
 	// whole path runs without a mic or ears.
@@ -935,11 +945,11 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	if _, err := applyAudioProcessing(audio, cfg, fullDuplexAEC); err != nil {
 		return err
 	}
-	if !fileMode && fullDuplexAEC {
+	if !fileMode && useVPIO {
 		startAudio = audio.StartVPIO
 	}
 	disarmAudioWatchdog := func() {}
-	if fullDuplexAEC && !fileMode {
+	if useVPIO && !fileMode {
 		disarmAudioWatchdog = armAudioStartWatchdog("standalone vpio", koeAudioStartTimeout())
 	}
 	if err := startAudio(); err != nil {
@@ -1015,7 +1025,8 @@ func closeDesktopSessionState(mailbox *koe.ResultMailbox, state *koe.CallState, 
 func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient,
 	connector *realtimeConnector, onUsage func(json.RawMessage)) error {
 
-	fullDuplexAEC := cfg.aec == "vpio"
+	useVPIO := cfg.aec == "vpio"
+	fullDuplexAEC := fullDuplexAECForConfig(cfg)
 	wirelessLazy := cfg.carrier.Carrier == koe.CarrierReachyWireless
 	gazeCfg := koe.DefaultGazeConfig()
 	if wirelessLazy {
@@ -1130,7 +1141,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}
 		curAudio.PrepareForCall()
 		startAudio := curAudio.Start
-		if fullDuplexAEC {
+		if useVPIO {
 			startAudio = curAudio.StartVPIO
 		}
 		started := time.Now()
@@ -1142,7 +1153,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		curAudioStarted = true
 		curAudio.SetPlaybackEnabled(false)
 		disarmAudioWatchdog()
-		log.Printf("koe[timing]: desktop call audio ready in %dms aec=%s reason=%s", time.Since(started).Milliseconds(), cfg.aec, reason)
+		log.Printf("koe[timing]: desktop call audio ready in %dms aec=%s full_duplex=%t reason=%s", time.Since(started).Milliseconds(), cfg.aec, fullDuplexAEC, reason)
 		return nil
 	}
 	emitReadyLocked := func() {

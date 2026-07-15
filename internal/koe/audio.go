@@ -378,6 +378,11 @@ func (a *AudioIO) SetPlaybackPaused(paused bool) {
 
 func (a *AudioIO) PlaybackPaused() bool { return a.playbackPaused.Load() }
 
+// InterruptPlayback immediately drops all local playback on the Mac/VPIO paths.
+// Wireless additionally sends the carrier protocol's barge_in control frame in
+// audio_linux.go so daemon-side queued audio is flushed too.
+func (a *AudioIO) InterruptPlayback() { a.SetPlaybackEnabled(false) }
+
 // Play enqueues a decoded PCM frame for playback. It takes ownership of pcm
 // without copying — the slice is read later on the audio callback thread, so the
 // caller must NOT reuse or mutate it after this call. (Safe today: DecodeFrame

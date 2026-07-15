@@ -1,11 +1,68 @@
 package koe
 
 import (
+	"encoding/json"
 	"math"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/koe/audiobridge"
 )
+
+func TestWirelessBargeInForwardsCaptureWhileSpeaking(t *testing.T) {
+	a := &AudioIO{}
+	a.SetSpeaking(true)
+	t.Setenv("KOE_VPIO_BARGE_IN", "")
+	if !a.captureSuppressed() {
+		t.Fatal("Wireless must retain half-duplex rollback when barge-in is off")
+	}
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	if a.captureSuppressed() {
+		t.Fatal("Wireless XVF capture must stay live while speaking when barge-in is on")
+	}
+	a.SetUserMicOff(true)
+	if !a.captureSuppressed() {
+		t.Fatal("explicit user mic-off must outrank Wireless barge-in")
+	}
+}
+
+func TestWirelessInterruptPlaybackSendsCarrierFlush(t *testing.T) {
+	koeConn, carrierConn := net.Pipe()
+	defer koeConn.Close()
+	defer carrierConn.Close()
+	a := &AudioIO{conn: koeConn, playBuf: make(chan []int16, 2)}
+	a.playback.Store(true)
+	a.Play([]int16{1, 2, 3})
+
+	got := make(chan []byte, 1)
+	go func() {
+		body, err := readControl(carrierConn)
+		if err == nil {
+			got <- body
+		}
+	}()
+	a.InterruptPlayback()
+
+	select {
+	case body := <-got:
+		var msg map[string]string
+		if err := json.Unmarshal(body, &msg); err != nil {
+			t.Fatalf("decode control: %v", err)
+		}
+		if msg["type"] != "barge_in" {
+			t.Fatalf("control type = %q, want barge_in", msg["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for carrier barge_in control")
+	}
+	if got := len(a.playBuf); got != 0 {
+		t.Fatalf("Koe playback queue retained %d frame(s)", got)
+	}
+	if a.playback.Load() {
+		t.Fatal("playback must be disabled after interruption")
+	}
+}
 
 // spkTestIO builds a minimal AudioIO carrying only the spk-leg resampler, so the
 // toCarrierPCM tests exercise the down-rate path without constructing the cgo Opus

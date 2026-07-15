@@ -45,6 +45,7 @@ type AudioIO struct {
 	playback      atomic.Bool
 	encMu         sync.Mutex
 	decMu         sync.Mutex
+	writeMu       sync.Mutex // serialize speaker and control frames on the UDS
 	stopOnce      sync.Once
 	sendReady     chan struct{}
 	sendReadyOnce sync.Once
@@ -58,6 +59,7 @@ type AudioIO struct {
 	done       chan struct{}
 	wg         sync.WaitGroup
 	upSeq      atomic.Uint32 // spk uplink frame seq
+	spkEpoch   atomic.Uint64 // invalidates Koe-side queued playback on interruption
 
 	// Anti-aliasing resamplers for the two carrier legs (spec §9-b.1). Stateful:
 	// they retain filter history across frames so per-frame Process() calls stream
@@ -125,9 +127,17 @@ func (a *AudioIO) SetUserMicOff(off bool)  { a.userMicOff.Store(off) }
 func (a *AudioIO) UserMicOff() bool        { return a.userMicOff.Load() }
 func (a *AudioIO) SetUserMicSticky(s bool) { a.userMicSticky.Store(s) }
 func (a *AudioIO) UserMicSticky() bool     { return a.userMicSticky.Load() }
-func (a *AudioIO) captureSuppressed() bool { return a.dropCapture() || a.userMicOff.Load() }
-func (a *AudioIO) CaptureExpected() bool   { return !a.captureSuppressed() }
-func (a *AudioIO) Frames() <-chan []int16  { return a.frames }
+func (a *AudioIO) captureSuppressed() bool {
+	if a.userMicOff.Load() {
+		return true
+	}
+	// XVF3800 has already removed the robot's own speaker signal before this
+	// stream reaches Koe. With explicit barge-in enabled, keep forwarding the mic
+	// while speaking; otherwise retain the half-duplex rollback gate.
+	return a.dropCapture() && !koeEnvBool("KOE_VPIO_BARGE_IN", false)
+}
+func (a *AudioIO) CaptureExpected() bool  { return !a.captureSuppressed() }
+func (a *AudioIO) Frames() <-chan []int16 { return a.frames }
 
 // SetPreferredDevices is a no-op on linux: CoreAudio device UIDs are darwin/VPIO
 // only; the wireless mic/speaker reach Koe through the carrier UDS, not a device UID.
@@ -192,6 +202,23 @@ func (a *AudioIO) SetPlaybackEnabled(s bool) {
 	a.playback.Store(s)
 	if !s {
 		a.setOutputLevel(0)
+		a.spkEpoch.Add(1)
+		drain(a.playBuf)
+	}
+}
+
+// InterruptPlayback flushes every Wireless playback layer: Koe's play queue and
+// epoch-tagged jitter ring, then the carrier ring and the daemon SDK 1.9 player via
+// the v0.2 barge_in control frame. The write lock prevents interleaving this JSON
+// frame with a concurrently emitted speaker PCM frame.
+func (a *AudioIO) InterruptPlayback() {
+	a.SetPlaybackEnabled(false)
+	if a.conn == nil {
+		return
+	}
+	body, _ := json.Marshal(map[string]string{"type": "barge_in"})
+	if err := a.sendControl(body); err != nil {
+		log.Printf("koe[barge]: carrier playback flush failed: %v", err)
 	}
 }
 
@@ -292,7 +319,7 @@ func (a *AudioIO) handshake() error {
 	body, _ := json.Marshal(mine)
 	h := audiobridge.Header{Magic: audiobridge.MagicControl, Format: audiobridge.FormatS16LE, Channels: 1, NSamples: uint32(len(body)) / 2}
 	// control payload is opaque JSON bytes; encode its exact length via a raw write.
-	if err := writeControl(a.conn, body); err != nil {
+	if err := a.sendControl(body); err != nil {
 		return fmt.Errorf("koe[audio]: send hello: %w", err)
 	}
 	peer, err := readControl(a.conn)
@@ -366,7 +393,11 @@ func (a *AudioIO) spkPump() {
 	if capacity < 1 {
 		capacity = defaultSpkRingFrames
 	}
-	ring := make(chan []int16, capacity)
+	type queuedSpeakerFrame struct {
+		pcm   []int16
+		epoch uint64
+	}
+	ring := make(chan queuedSpeakerFrame, capacity)
 	go func() {
 		for {
 			select {
@@ -374,9 +405,10 @@ func (a *AudioIO) spkPump() {
 				return
 			case pcm := <-a.playBuf:
 				a.setOutputLevel(rmsLevel(pcm))
+				queued := queuedSpeakerFrame{pcm: pcm, epoch: a.spkEpoch.Load()}
 				for {
 					select {
-					case ring <- pcm:
+					case ring <- queued:
 					default:
 						select {
 						case <-ring: // drop oldest, then retry
@@ -393,8 +425,11 @@ func (a *AudioIO) spkPump() {
 		select {
 		case <-a.done:
 			return
-		case pcm := <-ring:
-			wire := a.toCarrierPCM(pcm) // 48k codec → 16k wire; carrier stays thin (§9-b.1)
+		case queued := <-ring:
+			if queued.epoch != a.spkEpoch.Load() || !a.playback.Load() {
+				continue
+			}
+			wire := a.toCarrierPCM(queued.pcm) // 48k codec → 16k wire; carrier stays thin (§9-b.1)
 			payload := s16PCMToBytes(wire)
 			hdr := audiobridge.Header{
 				Magic:      audiobridge.MagicSpk,
@@ -404,7 +439,7 @@ func (a *AudioIO) spkPump() {
 				NSamples:   uint32(len(wire)),
 				Seq:        a.upSeq.Add(1),
 			}
-			if err := audiobridge.WriteFrame(a.conn, hdr, payload); err != nil {
+			if err := a.sendFrame(hdr, payload); err != nil {
 				return
 			}
 		}
@@ -541,6 +576,18 @@ func writeControl(w net.Conn, body []byte) error {
 	buf := make([]byte, h.PayloadLen())
 	copy(buf, body)
 	return audiobridge.WriteFrame(w, h, buf)
+}
+
+func (a *AudioIO) sendControl(body []byte) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	return writeControl(a.conn, body)
+}
+
+func (a *AudioIO) sendFrame(h audiobridge.Header, payload []byte) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	return audiobridge.WriteFrame(a.conn, h, payload)
 }
 
 func readControl(r net.Conn) ([]byte, error) {
