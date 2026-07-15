@@ -917,6 +917,11 @@ Remote workflows (`/research`, `/swarm`) stream events:
 
 ## Building & Testing
 
+Reachy Wireless builds can expose a capability-gated `camera` voice tool. It
+requests one current JPEG from the robot audio carrier's existing WebRTC stream
+only when the user asks Koe to look; it does not start a second camera session,
+persist frames, or route ordinary visual description through the back-brain.
+
 ```bash
 go build -o shan .           # build
 go test ./...                # run all tests

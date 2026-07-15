@@ -42,6 +42,7 @@ type koeConfig struct {
 	micDevice       string             // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
 	speakerDevice   string             // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
 	audioSocket     string             // --audio-socket: carrier PCM UDS path (Wireless; the linux carrier audio backend dials it; ignored on darwin)
+	cameraSocket    string             // --camera-socket: private on-demand JPEG UDS (Wireless; required with has_camera)
 	bargeIn         bool               // --barge-in: allow native-S2S interruption while Kocoro speaks (requires an AEC-capable full-duplex carrier or VPIO)
 	bargeInSet      bool               // whether --barge-in was explicit; false must override an inherited debug env
 	activity        koe.ActivityTier   // --activity: expression budget/personality tier (quiet | standard | lively)
@@ -335,6 +336,7 @@ var koeCmd = &cobra.Command{
 		cfg.micDevice, _ = cmd.Flags().GetString("mic-device")
 		cfg.speakerDevice, _ = cmd.Flags().GetString("speaker-device")
 		cfg.audioSocket, _ = cmd.Flags().GetString("audio-socket")
+		cfg.cameraSocket, _ = cmd.Flags().GetString("camera-socket")
 		cfg.bargeIn, _ = cmd.Flags().GetBool("barge-in")
 		activityFlag, _ := cmd.Flags().GetString("activity")
 		activity, err := parseActivityTier(activityFlag)
@@ -388,6 +390,9 @@ var koeCmd = &cobra.Command{
 			return err
 		}
 		cfg.carrier = prof
+		if cfg.carrier.Carrier == koe.CarrierReachyWireless && cfg.carrier.HasCap(koe.CapHasCamera) && cfg.cameraSocket == "" {
+			return fmt.Errorf("wireless has_camera requires --camera-socket")
+		}
 
 		return runKoeCall(cmd.Context(), cfg)
 	},
@@ -409,6 +414,7 @@ func init() {
 	koeCmd.Flags().String("mic-device", "", "CoreAudio input device UID (empty = system default; vpio backend only)")
 	koeCmd.Flags().String("speaker-device", "", "CoreAudio output device UID (empty = system default; vpio backend only)")
 	koeCmd.Flags().String("audio-socket", "", "carrier PCM UDS path (Wireless; the linux carrier audio backend dials it; ignored on darwin)")
+	koeCmd.Flags().String("camera-socket", "", "private on-demand JPEG UDS path (Wireless has_camera)")
 	koeCmd.Flags().Bool("barge-in", false, "allow native-S2S interruption while Kocoro speaks (reversible pause; requires VPIO or an AEC-capable full-duplex carrier)")
 	koeCmd.Flags().String("activity", "standard", "robot expression activity: quiet | standard | lively")
 	koeCmd.Flags().String("say", "", "debug: synthesize this text as the mic input (macOS say) — headless file mode")
@@ -939,6 +945,12 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	persona := buildKoePersona(ctx, client, cfg, agents)
 	state := koe.NewCallState(newBurstID(), cfg.agent)
 	disp := koe.NewDispatcher(client, resolver, state, nil)
+	cameraEnabled := cfg.carrier.Carrier == koe.CarrierReachyWireless && cfg.carrier.HasCap(koe.CapHasCamera)
+	if cameraEnabled {
+		disp.SetCameraHandler(func(cctx context.Context) (koe.CameraSnapshot, error) {
+			return koe.CaptureCameraSnapshot(cctx, cfg.cameraSocket)
+		})
+	}
 	resultMailbox := koe.NewResultMailbox()
 	resultMailbox.BeginBurst(state.BurstID())
 	audio, err := koe.NewAudioIO()
@@ -1014,6 +1026,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		},
 		Language:      cfg.language,
 		FullDuplexAEC: fullDuplexAEC,
+		CameraEnabled: cameraEnabled,
 	})
 	if err != nil {
 		return fmt.Errorf("connect: %v", err)
@@ -1045,6 +1058,7 @@ func closeDesktopSessionState(mailbox *koe.ResultMailbox, state *koe.CallState, 
 // warm Realtime session with call-scoped audio. Wireless is lazy: a manual start
 // or the local gaze gate prepares the session/audio, and idle uploads no room.
 var probeAudioCarrier = koe.ProbeAudioCarrier
+var probeCameraCarrier = koe.ProbeCameraCarrier
 
 func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient,
 	connector *realtimeConnector, onUsage func(json.RawMessage)) error {
@@ -1053,6 +1067,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	fullDuplexAEC := fullDuplexAECForConfig(cfg)
 	wirelessLazy := cfg.carrier.Carrier == koe.CarrierReachyWireless
 	wirelessAudioVerified := false
+	wirelessCameraVerified := false
 	gazeCfg := koe.DefaultGazeConfig()
 	if wirelessLazy {
 		if err := probeAudioCarrier(cfg.audioSocket); err != nil {
@@ -1060,6 +1075,13 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}
 		wirelessAudioVerified = true
 		log.Printf("koe[audio]: wireless carrier v0.2 startup hello verified; idle probe connection closed")
+		if cfg.carrier.HasCap(koe.CapHasCamera) {
+			if err := probeCameraCarrier(ctx, cfg.cameraSocket); err != nil {
+				return fmt.Errorf("wireless camera carrier readiness: %w", err)
+			}
+			log.Printf("koe[camera]: wireless carrier v0.1 startup probe verified; no frame captured")
+			wirelessCameraVerified = true
+		}
 		var err error
 		gazeCfg, err = koe.GazeConfigFromEnv()
 		if err != nil {
@@ -1111,6 +1133,11 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		})
 		if motionCtrl != nil {
 			disp.SetExpressHandler(motionCtrl.Express) // body carrier: wire the express gesture seam
+		}
+		if wirelessLazy && cfg.carrier.HasCap(koe.CapHasCamera) {
+			disp.SetCameraHandler(func(cctx context.Context) (koe.CameraSnapshot, error) {
+				return koe.CaptureCameraSnapshot(cctx, cfg.cameraSocket)
+			})
 		}
 		return state, disp
 	}
@@ -1445,6 +1472,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				FullDuplexAEC:     fullDuplexAEC,
 				OnClosed:          func(err error) { handleSessionClosed(seq, err) },
 				ExpressIntents:    expressIntents,
+				CameraEnabled:     wirelessLazy && cfg.carrier.HasCap(koe.CapHasCamera),
 				OnResponseStarted: onResponseStarted,
 				OnUserTranscript:  onUserTranscript,
 			}
@@ -1628,6 +1656,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	})
 	if carrierProfile.Carrier == koe.CarrierReachyWireless {
 		ctrl.SetWirelessAudioStatus(cfg.audioSocket != "", wirelessAudioVerified)
+		ctrl.SetWirelessCameraStatus(cfg.cameraSocket != "", wirelessCameraVerified)
 	}
 	// Motion bridge (carrier with a body): a process-long client that plays express
 	// gestures and drives bridge_status. nil for mac / no bridge socket, so express

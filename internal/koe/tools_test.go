@@ -920,6 +920,26 @@ func TestToolDefsForCarrierAddsExpressWithBody(t *testing.T) {
 	}
 }
 
+func TestToolDefsForCarrierAddsCameraOnlyWithCapability(t *testing.T) {
+	without, _ := json.Marshal(ToolDefsForCarrier(ExpressIntents()))
+	if strings.Contains(string(without), `"name":"camera"`) {
+		t.Fatal("camera tool must not appear without has_camera")
+	}
+	defs := ToolDefsForCarrier(ExpressIntents(), true)
+	var camera *ToolDef
+	for i := range defs {
+		if defs[i].Name == "camera" {
+			camera = &defs[i]
+		}
+	}
+	if camera == nil {
+		t.Fatal("has_camera carrier must get the camera tool")
+	}
+	if !strings.Contains(camera.Description, "current frame") || !strings.Contains(camera.Description, "do not claim to recognize") {
+		t.Fatalf("camera privacy/current-scene contract missing: %q", camera.Description)
+	}
+}
+
 func TestDispatchExpressExpressed(t *testing.T) {
 	state := NewCallState("b", "default")
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)

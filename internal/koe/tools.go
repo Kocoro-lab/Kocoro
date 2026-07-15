@@ -93,6 +93,10 @@ type ExpressResult struct {
 // (mac), where the express tool is never offered so Dispatch never reaches it.
 type ExpressFunc func(ctx context.Context, intent string) ExpressResult
 
+// CameraFunc captures one current frame from a carrier-owned camera stream. The
+// image remains in memory and is injected directly into the active Realtime turn.
+type CameraFunc func(ctx context.Context) (CameraSnapshot, error)
+
 // expressToolDef builds the express{intent} voice tool. intents is the runtime
 // enum (ExpressIntents()); callers only add it for a carrier with a body.
 func expressToolDef(intents []string) ToolDef {
@@ -103,11 +107,20 @@ func expressToolDef(intents []string) ToolDef {
 		Parameters:  obj(params)}
 }
 
+func cameraToolDef() ToolDef {
+	return ToolDef{Type: "function", Name: "camera",
+		Description: "camera — look through your Reachy Mini camera at the scene in front of your physical body. Call this only when the user asks you to look, see, inspect, identify, read, or describe something currently visible to the robot. The tool captures one current frame and gives it back to you directly; answer from that image in this same conversation. Do not call it merely because vision could be interesting, do not claim to recognize a person's identity, and do not route ordinary visual description through do_task.",
+		Parameters:  obj(`{"type":"object","properties":{},"required":[]}`)}
+}
+
 // ToolDefsForCarrier returns the voice tools for a carrier. expressIntents is the
 // express enum for a carrier with a body; when empty (mac) the result is
 // byte-identical to ToolDefs() — no express tool, so the mac session is unchanged.
-func ToolDefsForCarrier(expressIntents []string) []ToolDef {
+func ToolDefsForCarrier(expressIntents []string, hasCamera ...bool) []ToolDef {
 	defs := ToolDefs()
+	if len(hasCamera) > 0 && hasCamera[0] {
+		defs = append(defs, cameraToolDef())
+	}
 	if len(expressIntents) > 0 {
 		defs = append(defs, expressToolDef(expressIntents))
 	}
@@ -292,6 +305,7 @@ type Dispatcher struct {
 	state      *CallState
 	controlApp ControlAppFunc
 	express    ExpressFunc // nil unless the carrier has a body (SetExpressHandler)
+	camera     CameraFunc  // nil unless the carrier has a camera (SetCameraHandler)
 }
 
 func NewDispatcher(client *DaemonClient, resolver *AgentResolver, state *CallState, controlApp ControlAppFunc) *Dispatcher {
@@ -301,6 +315,17 @@ func NewDispatcher(client *DaemonClient, resolver *AgentResolver, state *CallSta
 // SetExpressHandler wires the body-gesture seam (MotionController). Called only for
 // a carrier with a body; leaving it nil keeps express a graceful no-op.
 func (d *Dispatcher) SetExpressHandler(fn ExpressFunc) { d.express = fn }
+
+// SetCameraHandler wires the private snapshot UDS seam. It is intentionally
+// independent from MotionController: camera remains available if motion degrades.
+func (d *Dispatcher) SetCameraHandler(fn CameraFunc) { d.camera = fn }
+
+func (d *Dispatcher) CaptureCamera(ctx context.Context) (CameraSnapshot, error) {
+	if d.camera == nil {
+		return CameraSnapshot{}, fmt.Errorf("camera capture not wired")
+	}
+	return d.camera(ctx)
+}
 
 // SayResult is the do_task result contract shared with Realtime. Successful
 // results carry Kocoro's complete final user-facing reply plus validated

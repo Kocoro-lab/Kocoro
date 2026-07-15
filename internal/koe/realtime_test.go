@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -1316,6 +1317,57 @@ func TestSuccessfulDanceIsPhysicalOnlyWhileOtherExpressContinues(t *testing.T) {
 	waitUntil(t, func() bool { return len(h.respReq) == 1 }, "skipped dance continuation was not queued")
 	if got := len(h.respReq); got != 1 {
 		t.Fatalf("skipped dance queued %d followups, want normal continuation", got)
+	}
+}
+
+func TestCameraToolInjectsCurrentImageAfterFunctionOutput(t *testing.T) {
+	state := NewCallState("burst-camera", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	disp.SetCameraHandler(func(context.Context) (CameraSnapshot, error) {
+		return CameraSnapshot{JPEG: []byte{0xff, 0xd8, 1, 0xff, 0xd9}, MediaType: "image/jpeg"}, nil
+	})
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	h.handleFunctionCall(context.Background(), "camera-call", "camera", []byte(`{}`))
+	waitUntil(t, func() bool { return cap.countType("conversation.item.create") == 2 }, "camera image was not injected")
+
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	if len(cap.sent) != 2 {
+		t.Fatalf("camera events = %d, want function output + image", len(cap.sent))
+	}
+	firstItem, _ := cap.sent[0]["item"].(map[string]any)
+	secondItem, _ := cap.sent[1]["item"].(map[string]any)
+	if firstItem["type"] != "function_call_output" || firstItem["call_id"] != "camera-call" {
+		t.Fatalf("first event = %#v, want function output", cap.sent[0])
+	}
+	if secondItem["type"] != "message" || secondItem["role"] != "user" {
+		t.Fatalf("second event = %#v, want user image message", cap.sent[1])
+	}
+	b, _ := json.Marshal(secondItem)
+	if !strings.Contains(string(b), `"type":"input_image"`) || !strings.Contains(string(b), "data:image/jpeg;base64,") {
+		t.Fatalf("image item = %s", b)
+	}
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("camera queued response count = %d, want 1", got)
+	}
+}
+
+func TestCameraToolFailureDoesNotInjectImage(t *testing.T) {
+	state := NewCallState("burst-camera-fail", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	disp.SetCameraHandler(func(context.Context) (CameraSnapshot, error) {
+		return CameraSnapshot{}, fmt.Errorf("private transport detail")
+	})
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	h.handleFunctionCall(context.Background(), "camera-call", "camera", []byte(`{}`))
+	waitUntil(t, func() bool { return cap.countType("conversation.item.create") == 1 }, "camera failure output was not submitted")
+	if cap.sentContains("input_image") || cap.sentContains("private transport detail") {
+		t.Fatal("camera failure must not inject an image or expose private transport detail")
+	}
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("camera failure queued response count = %d, want 1", got)
 	}
 }
 

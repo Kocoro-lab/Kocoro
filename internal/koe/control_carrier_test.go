@@ -26,6 +26,12 @@ type carrierStatusWant struct {
 		WireRateHz       int    `json:"wire_rate_hz"`
 		SocketConfigured bool   `json:"socket_configured"`
 	} `json:"audio"`
+	Camera struct {
+		State            string `json:"state"`
+		Transport        string `json:"transport"`
+		Proto            string `json:"proto"`
+		SocketConfigured bool   `json:"socket_configured"`
+	} `json:"camera"`
 	Bridge struct {
 		State         string `json:"state"`
 		Proto         string `json:"proto"`
@@ -48,6 +54,7 @@ func TestCarrierStatusEndpoint_ReachyWirelessRuntimeContract(t *testing.T) {
 	}
 	s.SetCarrierProfile(prof, func() bool { return true })
 	s.SetWirelessAudioStatus(true, true)
+	s.SetWirelessCameraStatus(true, true)
 	s.SetBridgeDetailsProvider(func() (string, string) { return "1.0", "0.1.0" })
 	s.EmitBridgeStatus("connected")
 	s.EmitCallState("connecting")
@@ -73,6 +80,9 @@ func TestCarrierStatusEndpoint_ReachyWirelessRuntimeContract(t *testing.T) {
 	}
 	if got.Audio.State != "connected" || got.Audio.WireRateHz != 16000 || !got.Audio.SocketConfigured {
 		t.Errorf("wireless audio status = %+v", got.Audio)
+	}
+	if got.Camera.State != "ready" || got.Camera.Transport != "uds" || got.Camera.Proto != "0.1" || !got.Camera.SocketConfigured {
+		t.Errorf("wireless camera status = %+v", got.Camera)
 	}
 	if got.Bridge.Proto != "1.0" || got.Bridge.BridgeVersion != "0.1.0" {
 		t.Errorf("bridge hello details = %+v", got.Bridge)

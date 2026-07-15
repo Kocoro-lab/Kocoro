@@ -1855,7 +1855,7 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 // sessionConfigForCarrier builds the session.update. expressIntents adds the
 // express{intent} tool for a carrier with a body; empty (mac) yields a tool set
 // byte-identical to the pre-carrier build.
-func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressIntents []string) map[string]any {
+func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressIntents []string, hasCamera ...bool) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
 	interruptResponse := false
 	if fullDuplexAEC {
@@ -1939,7 +1939,7 @@ func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressI
 				"input":  input,
 				"output": map[string]any{"voice": voice},
 			},
-			"tools":               ToolDefsForCarrier(expressIntents),
+			"tools":               ToolDefsForCarrier(expressIntents, hasCamera...),
 			"tool_choice":         "auto",
 			"parallel_tool_calls": true,
 			"reasoning": map[string]any{
@@ -2848,6 +2848,13 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 		h.requestEndCall(callID)
 		return
 	}
+	if name == "camera" {
+		// Snapshot I/O can take up to three seconds. Keep the event loop free so
+		// response.done/error events continue to release the serialized response
+		// sender while the carrier obtains the current frame.
+		go h.handleCameraFunctionCall(ctx, callID)
+		return
+	}
 	// A dance tool call can arrive just before the completed input transcript that
 	// authorizes it locally. Dispatch only that call off the event loop, allowing
 	// the transcript event to land while MotionController waits briefly. Other fast
@@ -2857,6 +2864,44 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 		return
 	}
 	h.handleFastFunctionCall(ctx, responseID, callID, name, args)
+}
+
+func (h *eventHandler) handleCameraFunctionCall(ctx context.Context, callID string) {
+	started := time.Now()
+	snapshot, err := h.disp.CaptureCamera(ctx)
+	if err != nil {
+		if eventLogEnabled() {
+			log.Printf("koe[camera]: capture failed call_id=%q duration_ms=%d err=%v", callID, time.Since(started).Milliseconds(), err)
+		}
+		h.sendFunctionOutput(callID, mustJSON(map[string]string{
+			"status": "failed", "error": "camera_unavailable",
+		}))
+		h.requestResponse()
+		return
+	}
+	// Satisfy the function call first, then attach the image as a user message.
+	// This ordering follows the GA Realtime function-call contract while keeping
+	// the image in the default conversation for the model's immediate answer.
+	h.sendFunctionOutput(callID, mustJSON(map[string]any{
+		"status": "captured", "media_type": snapshot.MediaType,
+	}))
+	if err := h.sendFn(map[string]any{
+		"type": "conversation.item.create",
+		"item": map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]any{{
+				"type": "input_image", "image_url": snapshot.DataURL(),
+			}},
+		},
+	}); err != nil {
+		log.Printf("koe[camera]: image injection failed call_id=%q err=%v", callID, err)
+		return
+	}
+	if eventLogEnabled() {
+		log.Printf("koe[camera]: captured call_id=%q bytes=%d duration_ms=%d", callID, len(snapshot.JPEG), time.Since(started).Milliseconds())
+	}
+	h.requestResponse()
 }
 
 func (h *eventHandler) handleFastFunctionCall(ctx context.Context, responseID, callID, name string, args []byte) {

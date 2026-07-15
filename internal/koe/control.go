@@ -72,11 +72,13 @@ type ControlServer struct {
 	lastCall     atomic.Value // string: current call snapshot; ended normalizes back to idle
 	lastRealtime atomic.Value // string: disconnected | connecting | connected
 
-	carrier                       *CarrierProfile // resolved carrier identity for GET /carrier/status (nil = not injected)
-	carrierBound                  func() bool     // reports audio.bound; nil → false
-	wirelessAudioSocketConfigured atomic.Bool
-	wirelessAudioVerified         atomic.Bool
-	bridgeDetails                 func() (proto, bridgeVersion string)
+	carrier                        *CarrierProfile // resolved carrier identity for GET /carrier/status (nil = not injected)
+	carrierBound                   func() bool     // reports audio.bound; nil → false
+	wirelessAudioSocketConfigured  atomic.Bool
+	wirelessAudioVerified          atomic.Bool
+	wirelessCameraSocketConfigured atomic.Bool
+	wirelessCameraVerified         atomic.Bool
+	bridgeDetails                  func() (proto, bridgeVersion string)
 }
 
 // NewControlServer wires the Desktop-driven start/end callbacks (either may be nil).
@@ -126,6 +128,12 @@ func (s *ControlServer) SetCarrierProfile(p CarrierProfile, audioBound func() bo
 func (s *ControlServer) SetWirelessAudioStatus(socketConfigured, verified bool) {
 	s.wirelessAudioSocketConfigured.Store(socketConfigured)
 	s.wirelessAudioVerified.Store(verified)
+}
+
+// SetWirelessCameraStatus records the no-capture v0.1 startup probe result.
+func (s *ControlServer) SetWirelessCameraStatus(socketConfigured, verified bool) {
+	s.wirelessCameraSocketConfigured.Store(socketConfigured)
+	s.wirelessCameraVerified.Store(verified)
 }
 
 // SetBridgeDetailsProvider exposes the current motion hello metadata. The
@@ -338,14 +346,15 @@ const bridgeStateDisabled = "disabled"
 // control-spec §3). Additive + field-presence-gated on the Desktop side: an old
 // Koe with no route 404s, which Desktop reads as "feature absent".
 type carrierStatusResponse struct {
-	Carrier       string              `json:"carrier"`
-	Caps          []string            `json:"caps"`
-	Audio         carrierAudioStatus  `json:"audio"`
-	Bridge        carrierBridgeStatus `json:"bridge"`
-	Model         string              `json:"model"`
-	Agent         string              `json:"agent"`
-	CallState     string              `json:"call_state,omitempty"`
-	RealtimeState string              `json:"realtime_state,omitempty"`
+	Carrier       string               `json:"carrier"`
+	Caps          []string             `json:"caps"`
+	Audio         carrierAudioStatus   `json:"audio"`
+	Camera        *carrierCameraStatus `json:"camera,omitempty"`
+	Bridge        carrierBridgeStatus  `json:"bridge"`
+	Model         string               `json:"model"`
+	Agent         string               `json:"agent"`
+	CallState     string               `json:"call_state,omitempty"`
+	RealtimeState string               `json:"realtime_state,omitempty"`
 }
 
 type carrierAudioStatus struct {
@@ -363,6 +372,13 @@ type carrierBridgeStatus struct {
 	State         string `json:"state"`
 	Proto         string `json:"proto,omitempty"`
 	BridgeVersion string `json:"bridge_version,omitempty"`
+}
+
+type carrierCameraStatus struct {
+	State            string `json:"state"`
+	Transport        string `json:"transport"`
+	Proto            string `json:"proto,omitempty"`
+	SocketConfigured bool   `json:"socket_configured"`
 }
 
 func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
@@ -391,6 +407,7 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 	bridgeStatus := carrierBridgeStatus{State: bridgeState}
 	callState := ""
 	realtimeState := ""
+	var cameraStatus *carrierCameraStatus
 	if p.Carrier == CarrierReachyWireless {
 		socketConfigured := s.wirelessAudioSocketConfigured.Load()
 		audioState := "unavailable"
@@ -404,6 +421,16 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 			State:            audioState,
 			WireRateHz:       wirelessCarrierWireRate,
 			SocketConfigured: &socketConfigured,
+		}
+		cameraConfigured := s.wirelessCameraSocketConfigured.Load()
+		cameraState := "unavailable"
+		cameraProto := ""
+		if s.wirelessCameraVerified.Load() {
+			cameraState = "ready"
+			cameraProto = cameraSnapshotProto
+		}
+		cameraStatus = &carrierCameraStatus{
+			State: cameraState, Transport: "uds", Proto: cameraProto, SocketConfigured: cameraConfigured,
 		}
 		if value, ok := s.lastCall.Load().(string); ok {
 			callState = value
@@ -420,6 +447,7 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 		Carrier:       p.Carrier,
 		Caps:          caps,
 		Audio:         audioStatus,
+		Camera:        cameraStatus,
 		Bridge:        bridgeStatus,
 		Model:         p.Model,
 		Agent:         p.Agent,
