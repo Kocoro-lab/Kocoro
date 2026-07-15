@@ -7,6 +7,13 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/koe/audiobridge"
 )
 
+// spkTestIO builds a minimal AudioIO carrying only the spk-leg resampler, so the
+// toCarrierPCM tests exercise the down-rate path without constructing the cgo Opus
+// codec that NewAudioIO would.
+func spkTestIO() *AudioIO {
+	return &AudioIO{spkRS: NewResampler(audioSampleRate, carrierWireRate)}
+}
+
 // The carrier is a thin no-DSP relay: koe owns the transcode on BOTH legs
 // (spec §9-b.1). On the spk uplink koe must down-rate its 48k codec audio to the
 // carrier wire rate (16k, daemon-native) before framing, so the carrier only does
@@ -23,7 +30,7 @@ func TestCarrierWireRateIs16k(t *testing.T) {
 func TestToCarrierPCMDownratesToWireRate(t *testing.T) {
 	// 48k → 16k is a 3:1 decimation: N input samples → N/3 output samples.
 	in := make([]int16, audioFrameSize) // 960 samples @ 48k = 20 ms
-	got := toCarrierPCM(in)
+	got := spkTestIO().toCarrierPCM(in)
 	want := audioFrameSize * carrierWireRate / audioSampleRate // 960*16000/48000 = 320
 	if len(got) != want {
 		t.Fatalf("toCarrierPCM len = %d, want %d (48k→16k on a 20ms frame)", len(got), want)
@@ -31,17 +38,24 @@ func TestToCarrierPCMDownratesToWireRate(t *testing.T) {
 }
 
 func TestToCarrierPCMPreservesDCLevel(t *testing.T) {
-	// A constant (DC) signal must survive resampling unchanged — catches a stub
-	// that drops the resample or corrupts amplitude.
+	// A constant (DC) signal must survive resampling unchanged. The anti-alias FIR
+	// ramps up over its first ~N/M output samples (inherent to any windowed-sinc
+	// resampler), so feed several frames through one stateful resampler and assert
+	// DC survives on the settled tail rather than from sample 0.
 	const level int16 = 8000
 	in := make([]int16, audioFrameSize)
 	for i := range in {
 		in[i] = level
 	}
-	got := toCarrierPCM(in)
-	for i, v := range got {
-		if math.Abs(float64(v)-float64(level)) > 2 { // ±2 for float round-trip
-			t.Fatalf("sample %d = %d, want ~%d (DC must survive down-rate)", i, v, level)
+	a := spkTestIO()
+	var got []int16
+	for range 4 {
+		got = append(got, a.toCarrierPCM(in)...)
+	}
+	tail := got[len(got)-100:] // steady state, past the filter ramp-up
+	for i, v := range tail {
+		if math.Abs(float64(v)-float64(level)) > 20 { // ±20 for passband ripple + float round-trip
+			t.Fatalf("steady-state sample %d = %d, want ~%d (DC must survive down-rate)", i, v, level)
 		}
 	}
 }
@@ -49,7 +63,7 @@ func TestToCarrierPCMPreservesDCLevel(t *testing.T) {
 // A frame framed after toCarrierPCM must declare the wire rate in its header so the
 // carrier and the audiobridge PayloadLen check agree.
 func TestSpkFrameHeaderDeclaresWireRate(t *testing.T) {
-	pcm := toCarrierPCM(make([]int16, audioFrameSize))
+	pcm := spkTestIO().toCarrierPCM(make([]int16, audioFrameSize))
 	h := audiobridge.Header{
 		Magic:      audiobridge.MagicSpk,
 		Format:     audiobridge.FormatS16LE,

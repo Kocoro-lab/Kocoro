@@ -56,6 +56,13 @@ type AudioIO struct {
 	done       chan struct{}
 	wg         sync.WaitGroup
 	upSeq      atomic.Uint32 // spk uplink frame seq
+
+	// Anti-aliasing resamplers for the two carrier legs (spec §9-b.1). Stateful:
+	// they retain filter history across frames so per-frame Process() calls stream
+	// without boundary transients. spkRS down-rates the 48k codec audio to 16k;
+	// micRS up-rates the 16k carrier mic to 48k.
+	spkRS *Resampler
+	micRS *Resampler
 }
 
 // NewAudioIO builds the codec (no UDS opened yet — Start() dials the carrier, so
@@ -77,6 +84,8 @@ func NewAudioIO() (*AudioIO, error) {
 		playBuf:   make(chan []int16, 256),
 		sendReady: make(chan struct{}),
 		done:      make(chan struct{}),
+		spkRS:     NewResampler(audioSampleRate, carrierWireRate),
+		micRS:     NewResampler(carrierWireRate, audioSampleRate),
 	}
 	a.playback.Store(true)
 	return a, nil
@@ -153,6 +162,8 @@ func (a *AudioIO) PrepareForCall() {
 	a.SetPlaybackEnabled(false)
 	drain(a.frames)
 	drain(a.playBuf)
+	a.spkRS.Reset() // drop the previous call's resampler tail
+	a.micRS.Reset()
 }
 
 func drain(ch chan []int16) {
@@ -293,7 +304,7 @@ func (a *AudioIO) micPump() {
 		if hdr.Magic != audiobridge.MagicMic {
 			continue // control/spk echoes are ignored on the downlink
 		}
-		frame := toCodecPCM(hdr, payload) // → 48k mono S16
+		frame := a.toCodecPCM(hdr, payload) // → 48k mono S16
 		forward := !a.captureSuppressed()
 		if forward {
 			a.setInputLevel(rmsLevel(frame))
@@ -342,7 +353,7 @@ func (a *AudioIO) spkPump() {
 		case <-a.done:
 			return
 		case pcm := <-ring:
-			wire := toCarrierPCM(pcm) // 48k codec → 16k wire; carrier stays thin (§9-b.1)
+			wire := a.toCarrierPCM(pcm) // 48k codec → 16k wire; carrier stays thin (§9-b.1)
 			payload := s16PCMToBytes(wire)
 			hdr := audiobridge.Header{
 				Magic:      audiobridge.MagicSpk,
@@ -393,7 +404,7 @@ func (a *AudioIO) CapturedMetrics() WavMetrics { return WavMetrics{} }
 // toCarrierPCM down-rates the codec's 48k mono S16 to the carrier wire rate (16k,
 // daemon-native) so the carrier is a thin no-DSP relay (spec §9-b.1). Symmetric to
 // toCodecPCM on the mic leg.
-func toCarrierPCM(pcm []int16) []int16 {
+func (a *AudioIO) toCarrierPCM(pcm []int16) []int16 {
 	if audioSampleRate == carrierWireRate {
 		return pcm
 	}
@@ -401,20 +412,25 @@ func toCarrierPCM(pcm []int16) []int16 {
 	for i, v := range pcm {
 		mono[i] = float64(v) / 32768.0
 	}
-	return floatToS16(resampleLinear(mono, audioSampleRate, carrierWireRate))
+	return floatToS16(a.spkRS.Process(mono))
 }
 
 // toCodecPCM converts a carrier mic frame (per its header format/rate/channels) to
 // the codec's 48k mono S16. TODO(u2-fidelity): the carrier is thin and sends the
 // SDK-native F32LE/16k/2ch (§9-b); this does the format+downmix and a linear
 // resample. Replace with a windowed resampler if the naive one aliases audibly.
-func toCodecPCM(h audiobridge.Header, payload []byte) []int16 {
+func (a *AudioIO) toCodecPCM(h audiobridge.Header, payload []byte) []int16 {
 	// Decode payload → mono float samples at the source rate.
 	mono := decodeToMono(h, payload)
 	if int(h.SampleRate) == audioSampleRate || h.SampleRate == 0 {
 		return floatToS16(mono)
 	}
-	return floatToS16(resampleLinear(mono, int(h.SampleRate), audioSampleRate))
+	if int(h.SampleRate) == carrierWireRate {
+		return floatToS16(a.micRS.Process(mono)) // stateful 16k→48k, streams across frames
+	}
+	// Off-spec carrier rate (the carrier fixes 16k; defensive path only): one-shot
+	// resample, no retained state — a rate change mid-stream would need a new filter.
+	return floatToS16(NewResampler(int(h.SampleRate), audioSampleRate).Process(mono))
 }
 
 func decodeToMono(h audiobridge.Header, payload []byte) []float64 {
@@ -450,26 +466,6 @@ func decodeToMono(h audiobridge.Header, payload []byte) []float64 {
 		mono[i] = sum / float64(ch)
 	}
 	return mono
-}
-
-func resampleLinear(in []float64, srcRate, dstRate int) []float64 {
-	if len(in) == 0 || srcRate == dstRate {
-		return in
-	}
-	outLen := len(in) * dstRate / srcRate
-	out := make([]float64, outLen)
-	ratio := float64(srcRate) / float64(dstRate)
-	for i := range out {
-		pos := float64(i) * ratio
-		j := int(pos)
-		frac := pos - float64(j)
-		if j+1 < len(in) {
-			out[i] = in[j]*(1-frac) + in[j+1]*frac
-		} else if j < len(in) {
-			out[i] = in[j]
-		}
-	}
-	return out
 }
 
 func floatToS16(in []float64) []int16 {
