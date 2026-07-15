@@ -7,14 +7,17 @@ import (
 
 const (
 	// The XVF3800 still emits isolated speech_detected pulses for residual speaker
-	// echo even after its AEC reports converged. Requiring three consecutive 100 ms
-	// samples rejects those pulses while keeping a normal interruption sub-second.
-	defaultBargePerceptionHits = 3
+	// echo even after its AEC reports converged. Three front-directed hits are still
+	// required, but loaded CM4 REST polling is sparse enough that real near-end speech
+	// can contain a no-speech sample between hits. Bound evidence by wall time instead
+	// of assuming consecutive 100 ms samples.
+	defaultBargePerceptionHits   = 3
+	defaultBargePerceptionWindow = 2500 * time.Millisecond
 	// Once sustained near-end speech opens the gate, keep it open long enough for
-	// Realtime server VAD to observe the utterance. The XVF DOA endpoint can briefly
-	// report no sample during double-talk; that transport gap must not chop an
-	// already-authorized speaker back into isolated tail fragments.
-	defaultBargePerceptionHold = 3 * time.Second
+	// both the local energy gate and Realtime server VAD to observe the utterance.
+	// Wireless live evidence reached speech_started about 3s after authorization,
+	// so 5s leaves bounded polling/VAD jitter without weakening the opening gate.
+	defaultBargePerceptionHold = 5 * time.Second
 	defaultBargeFrontHalfAngle = math.Pi / 3
 )
 
@@ -32,7 +35,7 @@ type BargePerceptionDecision struct {
 // the resident runtime feeds it the same robot-local DOA stream as the IDLE gaze
 // gate and applies Authorized to the current AudioIO.
 type BargePerceptionGate struct {
-	hits            int
+	hitTimes        []time.Time
 	authorized      bool
 	authorizedUntil time.Time
 }
@@ -54,21 +57,26 @@ func (g *BargePerceptionGate) Update(now time.Time, callActive, speaking bool, s
 		}
 		return g.reset(reason)
 	}
+	g.pruneHits(now)
 	if !snapshot.DOA.Available || !snapshot.DOA.Fresh {
-		g.hits = 0
 		if g.authorized && !g.authorizedUntil.IsZero() && now.Before(g.authorizedUntil) {
-			return BargePerceptionDecision{Authorized: true, Reason: "holding_doa_gap"}
+			return BargePerceptionDecision{Authorized: true, Reason: "holding_doa_gap", Hits: len(g.hitTimes)}
 		}
-		return g.reset("doa_unavailable")
+		changed := g.authorized
+		g.authorized = false
+		g.authorizedUntil = time.Time{}
+		return BargePerceptionDecision{Changed: changed, Reason: "doa_unavailable", Hits: len(g.hitTimes)}
 	}
 
 	front := math.Abs(snapshot.DOA.Angle-math.Pi/2) <= defaultBargeFrontHalfAngle
 	if snapshot.DOA.SpeechDetected && front {
-		g.hits++
-	} else {
-		g.hits = 0
+		g.hitTimes = append(g.hitTimes, now)
+	} else if snapshot.DOA.SpeechDetected {
+		// A positive sample from outside the front cone is conflicting evidence,
+		// not a transport/VAD gap. Start a fresh candidate utterance.
+		g.hitTimes = nil
 	}
-	if g.hits >= defaultBargePerceptionHits {
+	if len(g.hitTimes) >= defaultBargePerceptionHits {
 		g.authorizedUntil = now.Add(defaultBargePerceptionHold)
 	}
 	authorized := !g.authorizedUntil.IsZero() && now.Before(g.authorizedUntil)
@@ -82,12 +90,23 @@ func (g *BargePerceptionGate) Update(now time.Time, callActive, speaking bool, s
 	}
 	changed := authorized != g.authorized
 	g.authorized = authorized
-	return BargePerceptionDecision{Authorized: authorized, Changed: changed, Reason: reason, Hits: g.hits}
+	return BargePerceptionDecision{Authorized: authorized, Changed: changed, Reason: reason, Hits: len(g.hitTimes)}
+}
+
+func (g *BargePerceptionGate) pruneHits(now time.Time) {
+	cutoff := now.Add(-defaultBargePerceptionWindow)
+	keep := 0
+	for keep < len(g.hitTimes) && g.hitTimes[keep].Before(cutoff) {
+		keep++
+	}
+	if keep > 0 {
+		g.hitTimes = append(g.hitTimes[:0], g.hitTimes[keep:]...)
+	}
 }
 
 func (g *BargePerceptionGate) reset(reason string) BargePerceptionDecision {
 	changed := g.authorized
-	g.hits = 0
+	g.hitTimes = nil
 	g.authorized = false
 	g.authorizedUntil = time.Time{}
 	return BargePerceptionDecision{Changed: changed, Reason: reason}
