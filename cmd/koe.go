@@ -44,6 +44,7 @@ type koeConfig struct {
 	audioSocket     string             // --audio-socket: carrier PCM UDS path (Wireless; the linux carrier audio backend dials it; ignored on darwin)
 	bargeIn         bool               // --barge-in: allow native-S2S interruption while Kocoro speaks (requires an AEC-capable full-duplex carrier or VPIO)
 	bargeInSet      bool               // whether --barge-in was explicit; false must override an inherited debug env
+	activity        koe.ActivityTier   // --activity: expression budget/personality tier (quiet | standard | lively)
 	carrier         koe.CarrierProfile // resolved carrier identity (--carrier/--caps/--bridge-socket/--reachy-daemon-url); immutable for the process lifetime (§18)
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
 	// mic/ears. All empty/zero = normal mic+speaker device.
@@ -62,6 +63,20 @@ func defaultKoeConfig() koeConfig {
 		model:           koe.DefaultOpenAIRealtimeModel,
 		qwenModel:       koe.DefaultQwenRealtimeModel,
 		audioProcessing: audioProcessingAuto,
+		activity:        koe.ActivityStandard,
+	}
+}
+
+func parseActivityTier(raw string) (koe.ActivityTier, error) {
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case "", "standard":
+		return koe.ActivityStandard, nil
+	case "quiet":
+		return koe.ActivityQuiet, nil
+	case "lively":
+		return koe.ActivityLively, nil
+	default:
+		return koe.ActivityStandard, fmt.Errorf("invalid --activity %q (want quiet, standard, or lively)", raw)
 	}
 }
 
@@ -321,6 +336,12 @@ var koeCmd = &cobra.Command{
 		cfg.speakerDevice, _ = cmd.Flags().GetString("speaker-device")
 		cfg.audioSocket, _ = cmd.Flags().GetString("audio-socket")
 		cfg.bargeIn, _ = cmd.Flags().GetBool("barge-in")
+		activityFlag, _ := cmd.Flags().GetString("activity")
+		activity, err := parseActivityTier(activityFlag)
+		if err != nil {
+			return err
+		}
+		cfg.activity = activity
 		cfg.bargeInSet = cmd.Flags().Changed("barge-in")
 		cfg.sayText, _ = cmd.Flags().GetString("say")
 		cfg.audioIn, _ = cmd.Flags().GetString("audio-in")
@@ -389,6 +410,7 @@ func init() {
 	koeCmd.Flags().String("speaker-device", "", "CoreAudio output device UID (empty = system default; vpio backend only)")
 	koeCmd.Flags().String("audio-socket", "", "carrier PCM UDS path (Wireless; the linux carrier audio backend dials it; ignored on darwin)")
 	koeCmd.Flags().Bool("barge-in", false, "allow native-S2S interruption while Kocoro speaks (reversible pause; requires VPIO or an AEC-capable full-duplex carrier)")
+	koeCmd.Flags().String("activity", "standard", "robot expression activity: quiet | standard | lively")
 	koeCmd.Flags().String("say", "", "debug: synthesize this text as the mic input (macOS say) — headless file mode")
 	koeCmd.Flags().String("audio-in", "", "debug: WAV file to feed as the mic input — headless file mode")
 	koeCmd.Flags().String("audio-out", "", "debug: capture the reply audio to this WAV")
@@ -1611,7 +1633,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	// gestures and drives bridge_status. nil for mac / no bridge socket, so express
 	// stays unwired and the tool is never offered.
 	if carrierProfile.HasCap(koe.CapHasBody) && carrierProfile.BridgeSocket != "" {
-		motionCtrl = koe.NewMotionController(carrierProfile.BridgeSocket, koe.ActivityStandard, func(s string) {
+		motionCtrl = koe.NewMotionController(carrierProfile.BridgeSocket, cfg.activity, func(s string) {
 			if ctrl != nil {
 				ctrl.EmitBridgeStatus(s)
 			}
