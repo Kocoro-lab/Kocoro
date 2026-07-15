@@ -1376,9 +1376,11 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 
 			var expressIntents []string
 			var onResponseStarted func()
+			var onUserTranscript func(string)
 			if motionCtrl != nil {
 				expressIntents = koe.ExpressIntents()
 				onResponseStarted = motionCtrl.NewResponse
+				onUserTranscript = motionCtrl.ObserveUserTranscript
 			}
 			connectOpts := koe.ConnectOptions{
 				OnVoiceState:  onVoiceState,
@@ -1397,6 +1399,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				OnClosed:          func(err error) { handleSessionClosed(seq, err) },
 				ExpressIntents:    expressIntents,
 				OnResponseStarted: onResponseStarted,
+				OnUserTranscript:  onUserTranscript,
 			}
 			persona := desktopSessionPersona(*personaHolder.Load(), reason)
 			conn, provider, cerr := connector.connect(sessionCtx, audio, persona, state, disp, connectOpts)

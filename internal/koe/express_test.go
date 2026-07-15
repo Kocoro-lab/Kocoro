@@ -16,6 +16,33 @@ func TestExpressGate_InvalidIntentSkipped(t *testing.T) {
 	}
 }
 
+func TestExplicitDanceRequest(t *testing.T) {
+	tests := []struct {
+		transcript string
+		want       bool
+	}{
+		{"请跳个舞。", true},
+		{"Kocoro，给我跳舞吧！", true},
+		{"Please dance for me.", true},
+		{"Can you dance for me?", true},
+		{"Could you dance for us, please?", true},
+		{"踊ってみて。", true},
+		{"ダンスして！", true},
+		{"你会跳舞吗？", false},
+		{"什么是跳舞？", false},
+		{"Can you dance?", false},
+		{"Please explain dance for me.", false},
+		{"不要给我跳舞。", false},
+		{"Please don't dance.", false},
+		{"来首适合跳舞的音乐。", false},
+	}
+	for _, tc := range tests {
+		if got := explicitDanceRequest(tc.transcript); got != tc.want {
+			t.Errorf("explicitDanceRequest(%q) = %t, want %t", tc.transcript, got, tc.want)
+		}
+	}
+}
+
 func TestExpressGate_QuietTierAlwaysSkips(t *testing.T) {
 	now := time.Unix(1000, 0)
 	g := NewExpressGate(ActivityQuiet, WithClock(fixedClock(&now)))

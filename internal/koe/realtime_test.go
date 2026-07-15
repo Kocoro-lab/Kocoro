@@ -1247,6 +1247,18 @@ func TestTranscriptCompletedDoesNotCreateResponse(t *testing.T) {
 	}
 }
 
+func TestTranscriptCompletedFeedsExpressionPolicy(t *testing.T) {
+	state := NewCallState("burst-expression", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, nil, func(any) error { return nil })
+	var got string
+	h.onUserTranscript = func(transcript string) { got = transcript }
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"请跳个舞"}`))
+	if got != "请跳个舞" {
+		t.Fatalf("expression transcript callback = %q, want explicit request", got)
+	}
+}
+
 func TestLocalCommitFallbackCommitsWhenServerVADMisses(t *testing.T) {
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")

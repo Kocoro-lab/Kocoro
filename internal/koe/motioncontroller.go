@@ -2,6 +2,7 @@ package koe
 
 import (
 	"context"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,10 @@ const (
 const (
 	reachyHeartbeatInterval = 2 * time.Second
 	reachyHeartbeatMisses   = 3
+	// ASR completion and the response tool call normally land within a few seconds.
+	// Bound the authorization so an abandoned dance request cannot leak into a
+	// later turn; a new non-dance transcript clears it immediately as well.
+	danceAuthorizationWindow = 12 * time.Second
 )
 
 // MotionController owns the reachy motion-bridge client + the express gate for a
@@ -47,6 +52,8 @@ type MotionController struct {
 
 	now          func() time.Time
 	movesApplied atomic.Bool
+
+	danceAuthorizedUntil time.Time
 }
 
 // NewMotionController builds a controller for the motion bridge at socketPath.
@@ -70,22 +77,47 @@ func (mc *MotionController) IsConnected() bool { return mc.client.IsConnected() 
 // set at least once since the current connection came up.
 func (mc *MotionController) MovesApplied() bool { return mc.movesApplied.Load() }
 
+// ObserveUserTranscript updates the server-side dance authorization for the
+// current user turn. It stores no transcript and logs no content. Every new
+// non-request clears the grant; an explicit request grants one bounded attempt.
+func (mc *MotionController) ObserveUserTranscript(transcript string) {
+	allowed := explicitDanceRequest(transcript)
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	if allowed {
+		mc.danceAuthorizedUntil = mc.now().Add(danceAuthorizationWindow)
+	} else {
+		mc.danceAuthorizedUntil = time.Time{}
+	}
+}
+
 // Express runs a gated body gesture: the gate picks a clip (≤1/response, cooldown,
 // activity tier, availability), then the bridge plays it. A gate skip or a
 // disconnected bridge returns a non-Expressed result — never an error the model
 // must handle (a missed gesture is invisible; the conversation continues).
 func (mc *MotionController) Express(ctx context.Context, intent string) ExpressResult {
 	mc.mu.Lock()
+	if intent == "dance" && (mc.danceAuthorizedUntil.IsZero() || mc.now().After(mc.danceAuthorizedUntil)) {
+		mc.mu.Unlock()
+		log.Printf("koe[express]: intent=dance status=skipped reason=not_explicit")
+		return ExpressResult{Reason: "not_explicit"}
+	}
 	clip, ok, reason := mc.gate.Allow(intent)
+	if ok && intent == "dance" {
+		mc.danceAuthorizedUntil = time.Time{} // one explicit utterance authorizes one attempt
+	}
 	mc.mu.Unlock()
 	if !ok {
+		log.Printf("koe[express]: intent=%s status=skipped reason=%s", intent, reason)
 		return ExpressResult{Reason: reason}
 	}
 	if err := mc.client.PlayMove(ctx, clip, false); err != nil {
 		// Bridge dropped between the gate decision and the play — the budget is spent
 		// but the gesture didn't happen; report a skip, don't surface the error.
+		log.Printf("koe[express]: intent=%s clip=%s status=skipped reason=not_connected", intent, clip)
 		return ExpressResult{Reason: "not_connected"}
 	}
+	log.Printf("koe[express]: intent=%s clip=%s status=expressed", intent, clip)
 	return ExpressResult{Expressed: true, Clip: clip}
 }
 

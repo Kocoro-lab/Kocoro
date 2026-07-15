@@ -55,6 +55,9 @@ type eventHandler struct {
 	// ≤1/response budget so the next response may express again. nil for carriers
 	// with no body (mac) and in unit tests.
 	onResponseStarted func()
+	// onUserTranscript (nil-safe) feeds only the deterministic body-expression
+	// authorization policy. The callback stores no transcript; nil on Mac/no body.
+	onUserTranscript func(string)
 	// curState holds the last emitted voice state (string) so the D3w level pump
 	// knows whether to report input (listening) or output (speaking) RMS.
 	curState atomic.Value
@@ -2481,6 +2484,9 @@ func isTerminalProviderError(provider, errorType, code, message string) bool {
 func (h *eventHandler) handleInputTranscript(transcript string) {
 	if os.Getenv("KOE_TRANSCRIPT_LOG") == "1" {
 		log.Printf("koe[transcript]: %q", transcript)
+	}
+	if h.onUserTranscript != nil {
+		h.onUserTranscript(transcript)
 	}
 	// The raw-audio floor controller is authoritative when available. Provider
 	// paths without that controller use completed ASR for exact dismiss phrases.

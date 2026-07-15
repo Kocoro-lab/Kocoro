@@ -825,6 +825,10 @@ type ConnectOptions struct {
 	// OnResponseStarted (nil-safe) fires on each response.created — the express gate
 	// resets its ≤1/response budget here. Wired only for a carrier with a body.
 	OnResponseStarted func()
+	// OnUserTranscript (nil-safe) receives a completed input transcript for local
+	// deterministic expression policy. The body controller uses it only to grant or
+	// clear a bounded explicit-dance authorization; it does not retain the text.
+	OnUserTranscript func(string)
 }
 
 // defaultSessionConfigTimeoutMS bounds how long Connect waits for OpenAI to ack our
@@ -966,6 +970,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	// original no-authority-without-a-bind contract.
 	h.toolLoop.setLazyBind(provider == ProviderQwen)
 	h.onResponseStarted = opts.OnResponseStarted
+	h.onUserTranscript = opts.OnUserTranscript
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
 	h.language = opts.Language

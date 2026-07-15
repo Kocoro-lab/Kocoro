@@ -912,6 +912,9 @@ func TestToolDefsForCarrierAddsExpressWithBody(t *testing.T) {
 	if !strings.Contains(string(found.Parameters), `"happy"`) || !strings.Contains(string(found.Parameters), `"dance"`) {
 		t.Errorf("express tool params must enumerate the intents, got %s", found.Parameters)
 	}
+	if !strings.Contains(found.Description, "Never choose dance unless") || !strings.Contains(found.Description, "not permission") {
+		t.Errorf("express tool must state the explicit-dance rule, got %q", found.Description)
+	}
 }
 
 func TestDispatchExpressExpressed(t *testing.T) {

@@ -79,7 +79,7 @@ func ToolDefs() []ToolDef {
 
 // ExpressResult is the outcome of an express{intent} call: a body gesture either
 // played (Expressed, with the chosen Clip) or was gated out (Reason ∈
-// invalid_intent|quiet|over_budget|cooldown|not_connected). The model only needs
+// invalid_intent|quiet|over_budget|cooldown|not_explicit|not_connected). The model only needs
 // "done"; Clip/Reason are for logs and tests.
 type ExpressResult struct {
 	Expressed bool
@@ -99,7 +99,7 @@ func expressToolDef(intents []string) ToolDef {
 	enum, _ := json.Marshal(intents)
 	params := fmt.Sprintf(`{"type":"object","properties":{"intent":{"type":"string","enum":%s,"description":"The emotion to embody as a brief physical gesture."}},"required":["intent"]}`, enum)
 	return ToolDef{Type: "function", Name: "express",
-		Description: "express — play a brief physical gesture with your body to punctuate an emotion (you have a physical robot body). Pick the intent matching the feeling of the moment: happy, excited, curious, attentive, thinking, surprised, sad, sorry, confused, proud, or dance. This is a SILENT side-gesture, not speech — keep talking normally; it never replaces your words and you must never narrate it. Use it sparingly and only when a gesture genuinely fits (a delight, a beat of thought, a surprise), at most once per reply; most replies need none.",
+		Description: "express — play a brief physical gesture with your body to punctuate an emotion (you have a physical robot body). Pick the intent matching the feeling of the moment: happy, excited, curious, attentive, thinking, surprised, sad, sorry, confused, proud, or dance. This is a SILENT side-gesture, not speech — keep talking normally; it never replaces your words and you must never narrate it. Use it sparingly and only when a gesture genuinely fits (a delight, a beat of thought, a surprise), at most once per reply; most replies need none. Never choose dance unless the user's current utterance explicitly asks this physical robot to dance. Questions or discussion about dance, music, or your capabilities are not permission.",
 		Parameters:  obj(params)}
 }
 

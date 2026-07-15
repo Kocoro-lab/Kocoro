@@ -173,6 +173,51 @@ func TestMotionControllerExpressReachesBridge(t *testing.T) {
 	}
 }
 
+func TestMotionControllerDanceRequiresExplicitCurrentTranscript(t *testing.T) {
+	fb := newFakeBridge(t, []string{"dance1", "laughing1"})
+	defer fb.close()
+	mc := NewMotionController(fb.path, ActivityStandard, nil)
+	mc.pollInterval = 15 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mc.Run(ctx)
+	waitForKMC(t, 2*time.Second, mc.IsConnected)
+	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+
+	if res := mc.Express(ctx, "dance"); res.Expressed || res.Reason != "not_explicit" {
+		t.Fatalf("dance without a request = %+v, want not_explicit", res)
+	}
+	mc.ObserveUserTranscript("What is dance?")
+	if res := mc.Express(ctx, "dance"); res.Expressed || res.Reason != "not_explicit" {
+		t.Fatalf("dance discussion = %+v, want not_explicit", res)
+	}
+
+	mc.ObserveUserTranscript("Please dance for me.")
+	res := mc.Express(ctx, "dance")
+	if !res.Expressed || res.Clip != "dance1" {
+		t.Fatalf("explicit dance request = %+v, want dance1", res)
+	}
+	waitForKMC(t, 2*time.Second, func() bool { return fb.lastPlay() == "dance1" })
+
+	// The grant is single-use even if a later response resets the ordinary express
+	// per-response budget.
+	mc.NewResponse()
+	if res := mc.Express(ctx, "dance"); res.Expressed || res.Reason != "not_explicit" {
+		t.Fatalf("reused dance grant = %+v, want not_explicit", res)
+	}
+}
+
+func TestMotionControllerDanceAuthorizationExpires(t *testing.T) {
+	now := time.Unix(1000, 0)
+	mc := NewMotionController("/tmp/not-used.sock", ActivityStandard, nil)
+	mc.now = func() time.Time { return now }
+	mc.ObserveUserTranscript("跳个舞")
+	now = now.Add(danceAuthorizationWindow + time.Millisecond)
+	if res := mc.Express(context.Background(), "dance"); res.Expressed || res.Reason != "not_explicit" {
+		t.Fatalf("expired dance grant = %+v, want not_explicit", res)
+	}
+}
+
 func TestMotionControllerDrivesBridgeStatusConnected(t *testing.T) {
 	fb := newFakeBridge(t, []string{"laughing1"})
 	defer fb.close()

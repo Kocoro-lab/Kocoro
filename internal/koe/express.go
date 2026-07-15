@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Expression layer (§19): the model's only expressive tool is express{intent}, a
@@ -54,6 +55,64 @@ var intentClips = map[string][]string{
 	"confused":  {"confused1", "lost1", "incomprehensible2"},
 	"proud":     {"proud1", "proud2", "proud3", "success1", "success2"},
 	"dance":     {"dance1", "dance2", "dance3", "groovy_sway_and_roll", "side_to_side_sway"},
+}
+
+// explicitDanceRequest is the deterministic half of §19's "dance only when the
+// user explicitly asks" rule. The model still chooses whether a dance fits, but
+// capability questions, discussion, and negated requests never authorize motion.
+// This intentionally favors a missed dance over an unsolicited full-body move.
+func explicitDanceRequest(transcript string) bool {
+	norm := normalizeExpressionTranscript(transcript)
+	if norm == "" {
+		return false
+	}
+	for _, denied := range []string{
+		"不要跳舞", "别跳舞", "不用跳舞", "不许跳舞", "不要给我跳舞", "别给我跳舞",
+		"don t dance", "do not dance", "please don t dance", "stop dancing",
+		"踊らないで", "踊るな", "ダンスしないで", "춤추지 마",
+	} {
+		if strings.Contains(norm, denied) {
+			return false
+		}
+	}
+	for _, discussion := range []string{
+		"什么是跳舞", "你会跳舞吗", "会不会跳舞", "聊聊跳舞",
+		"what is dance", "explain dance", "tell me about dance", "do you know how to dance",
+	} {
+		if strings.Contains(norm, discussion) {
+			return false
+		}
+	}
+	for _, capabilityQuestion := range []string{
+		"can you dance", "could you dance", "would you dance",
+	} {
+		if norm == capabilityQuestion {
+			return false
+		}
+	}
+	for _, request := range []string{
+		"跳个舞", "跳支舞", "跳一支舞", "跳段舞", "跳一段舞", "跳一下舞",
+		"给我跳舞", "跳舞给我", "跳舞吧", "来个舞", "来支舞", "来一段舞", "舞一个",
+		"please dance", "dance for me", "dance for us", "do a dance", "show me a dance", "show us a dance",
+		"show me your dance", "can you dance for", "could you dance for", "would you dance for", "let s dance",
+		"踊って", "ダンスして", "ダンスをして", "춤춰", "춤을 춰",
+		"baila para", "haz un baile", "danse pour", "fais une danse", "tanz für", "tanze für",
+	} {
+		if strings.Contains(norm, request) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeExpressionTranscript(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			return unicode.ToLower(r)
+		}
+		return ' '
+	}, s)
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // ExpressIntents returns the intent enum (a copy) for the tool schema + validation.
