@@ -1104,14 +1104,28 @@ func (s *Server) Start(ctx context.Context) error {
 		go s.forwardRemoteEvents(ctx)
 	}
 
-	ln, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", s.port))
+	// Wireless / W-中: optionally expose the API on all interfaces for a remote
+	// Koe on the robot's CM4, gated by a bearer token (withKoeLANAuth). Off by
+	// default → localhost-only, unchanged. koeLANBind requires BOTH lan_bind and a
+	// non-empty lan_token, so a mis-set flag can't open an unauthenticated hole.
+	var cfg *config.Config
+	if s.deps != nil {
+		cfg = s.deps.Config
+	}
+	bindHost, lanToken := koeLANBind(cfg)
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindHost, s.port))
 	if err != nil {
 		return fmt.Errorf("daemon server listen: %w", err)
 	}
 	s.listenerMu.Lock()
 	s.listener = ln
 	s.listenerMu.Unlock()
-	s.server = &http.Server{Handler: withLocalCORS(mux)}
+	handler := withLocalCORS(mux)
+	if lanToken != "" {
+		handler = withKoeLANAuth(lanToken, handler)
+		log.Printf("daemon: LAN-exposed on :%d for remote Koe — bearer auth ON, loopback exempt", s.port)
+	}
+	s.server = &http.Server{Handler: handler}
 	backgroundCleanup := func() {}
 	if s.isolated {
 		// Preserve the unconditional pullDone invariant even though the isolated

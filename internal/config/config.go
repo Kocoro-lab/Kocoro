@@ -112,6 +112,16 @@ type KoeConfig struct {
 	//   nil (unset) / &true  → allow a do_task classified as fast (default ON)
 	//   &false               → every voice-triggered task runs full.
 	FastEffort *bool `mapstructure:"fast_effort" yaml:"fast_effort,omitempty" json:"fast_effort,omitempty"`
+	// LANBind exposes the daemon's HTTP API on all interfaces (not just localhost)
+	// so a Koe front-brain on the robot's CM4 (Wireless / W-中) can reach the Mac
+	// back-brain over the LAN for mint / do_task. Off by default — the daemon stays
+	// localhost-only unless this is set together with a non-empty LANToken.
+	LANBind bool `mapstructure:"lan_bind" yaml:"lan_bind,omitempty" json:"lan_bind,omitempty"`
+	// LANToken is the bearer token a remote (non-loopback) Koe must present on
+	// every daemon request once LANBind is on. Loopback callers stay exempt;
+	// non-loopback callers without a matching token are rejected (fail-closed).
+	// Never logged.
+	LANToken string `mapstructure:"lan_token" yaml:"lan_token,omitempty" json:"lan_token,omitempty"`
 }
 
 // MCPConfig holds client-side settings shared across all MCP servers.
