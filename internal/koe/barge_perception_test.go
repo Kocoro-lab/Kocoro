@@ -51,6 +51,11 @@ func TestBargePerceptionGateAuthorizesSustainedFrontSpeechAndHolds(t *testing.T)
 	if !d.Authorized {
 		t.Fatal("brief DOA gap must not chop an authorized utterance")
 	}
+	now = now.Add(100 * time.Millisecond)
+	d = g.Update(now, true, true, PerceptionSnapshot{ObservedAt: now})
+	if !d.Authorized || d.Changed || d.Reason != "holding_doa_gap" {
+		t.Fatalf("unavailable DOA during hold decision=%+v, want held authorization", d)
+	}
 	now = now.Add(defaultBargePerceptionHold + time.Millisecond)
 	d = g.Update(now, true, true, bargeSnapshot(now, false, math.Pi/2))
 	if d.Authorized || !d.Changed {
@@ -61,19 +66,8 @@ func TestBargePerceptionGateAuthorizesSustainedFrontSpeechAndHolds(t *testing.T)
 func TestBargePerceptionGateFailsClosed(t *testing.T) {
 	g := NewBargePerceptionGate()
 	now := time.Unix(300, 0)
-	for range defaultBargePerceptionHits {
-		g.Update(now, true, true, bargeSnapshot(now, true, math.Pi/2))
-		now = now.Add(100 * time.Millisecond)
-	}
 	if d := g.Update(now, true, true, PerceptionSnapshot{ObservedAt: now}); d.Authorized {
-		t.Fatalf("unavailable DOA decision=%+v, want fail closed", d)
-	}
-	for range defaultBargePerceptionHits {
-		d := g.Update(now, true, true, bargeSnapshot(now, true, 0))
-		if d.Authorized {
-			t.Fatal("rear/side speech must not authorize front talk-over")
-		}
-		now = now.Add(100 * time.Millisecond)
+		t.Fatalf("unavailable DOA before authorization decision=%+v, want closed", d)
 	}
 	for range defaultBargePerceptionHits {
 		g.Update(now, true, true, bargeSnapshot(now, true, math.Pi/2))
@@ -81,5 +75,12 @@ func TestBargePerceptionGateFailsClosed(t *testing.T) {
 	}
 	if d := g.Update(now, false, true, bargeSnapshot(now, true, math.Pi/2)); d.Authorized {
 		t.Fatalf("inactive call decision=%+v, want closed", d)
+	}
+	for range defaultBargePerceptionHits {
+		d := g.Update(now, true, true, bargeSnapshot(now, true, 0))
+		if d.Authorized {
+			t.Fatal("rear/side speech must not authorize front talk-over")
+		}
+		now = now.Add(100 * time.Millisecond)
 	}
 }

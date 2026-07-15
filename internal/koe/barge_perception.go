@@ -10,7 +10,11 @@ const (
 	// echo even after its AEC reports converged. Requiring three consecutive 100 ms
 	// samples rejects those pulses while keeping a normal interruption sub-second.
 	defaultBargePerceptionHits = 3
-	defaultBargePerceptionHold = 1500 * time.Millisecond
+	// Once sustained near-end speech opens the gate, keep it open long enough for
+	// Realtime server VAD to observe the utterance. The XVF DOA endpoint can briefly
+	// report no sample during double-talk; that transport gap must not chop an
+	// already-authorized speaker back into isolated tail fragments.
+	defaultBargePerceptionHold = 3 * time.Second
 	defaultBargeFrontHalfAngle = math.Pi / 3
 )
 
@@ -51,6 +55,10 @@ func (g *BargePerceptionGate) Update(now time.Time, callActive, speaking bool, s
 		return g.reset(reason)
 	}
 	if !snapshot.DOA.Available || !snapshot.DOA.Fresh {
+		g.hits = 0
+		if g.authorized && !g.authorizedUntil.IsZero() && now.Before(g.authorizedUntil) {
+			return BargePerceptionDecision{Authorized: true, Reason: "holding_doa_gap"}
+		}
 		return g.reset("doa_unavailable")
 	}
 
