@@ -41,7 +41,9 @@ func mintEphemeralAt(ctx context.Context, url, apiKey, model string) (string, er
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	client := newRealtimeHTTPClient()
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -62,6 +64,7 @@ func mintEphemeralAt(ctx context.Context, url, apiKey, model string) (string, er
 // RealtimeConn is one connected WebRTC session to OpenAI Realtime.
 type RealtimeConn struct {
 	pc        *webrtc.PeerConnection
+	sdpHTTP   *http.Client
 	sendTrack audioSampleWriter
 	// outboundAudioMu keeps stateful Opus encoding and the corresponding RTP
 	// sample write in one order. Moving encode outside this lock can let the Qwen
@@ -166,6 +169,16 @@ func (s *RealtimeVideoSource) frameInterval() time.Duration {
 	return s.FrameInterval
 }
 
+// Realtime mint and SDP exchange are one-shot requests. A private transport
+// prevents http.DefaultClient from retaining an api.openai.com keep-alive after
+// the peer connection has been closed, keeping kernel connection evidence in
+// sync with the control plane's disconnected state.
+func newRealtimeHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	return &http.Client{Transport: transport}
+}
+
 // newPeerConnection builds the pion PC with a send track + recvonly transceiver +
 // the oai-events data channel. Grounded in spike stage2-webrtc + stage2b-duplex.
 func newPeerConnection(audio *AudioIO) (*RealtimeConn, error) {
@@ -198,7 +211,7 @@ func newPeerConnectionForProviderWithVideo(audio *AudioIO, provider RealtimeProv
 		pc.Close()
 		return nil, err
 	}
-	rc := &RealtimeConn{pc: pc, sendTrack: track, audio: audio}
+	rc := &RealtimeConn{pc: pc, sdpHTTP: newRealtimeHTTPClient(), sendTrack: track, audio: audio}
 	if provider == ProviderQwen && videoSource != nil {
 		capability, videoErr := videoSource.codecCapability()
 		if videoErr != nil {
@@ -503,7 +516,9 @@ func exchangeSDP(ctx context.Context, url, ek string, offer []byte) (string, err
 	}
 	req.Header.Set("Authorization", "Bearer "+ek)
 	req.Header.Set("Content-Type", "application/sdp")
-	resp, err := http.DefaultClient.Do(req)
+	client := newRealtimeHTTPClient()
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -748,12 +763,15 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 	}
 }
 
-// Close tears down the peer connection.
+// Close tears down the peer connection and any one-shot HTTP transport state.
 func (rc *RealtimeConn) Close() {
 	if rc.cancel != nil {
 		rc.cancel()
 	}
 	_ = rc.pc.Close()
+	if rc.sdpHTTP != nil {
+		rc.sdpHTTP.CloseIdleConnections()
+	}
 }
 
 // InterruptOutput stops any local assistant playback and asks Realtime to cancel

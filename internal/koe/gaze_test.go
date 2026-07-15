@@ -143,7 +143,58 @@ func TestGazeGateArmTimeoutCancelsAndBlocksSameEncounter(t *testing.T) {
 	}
 }
 
-func TestGazeGateFailsClosedAndCancelsPreparation(t *testing.T) {
+func TestGazeGateKeepsPreparationAcrossOneTransportGap(t *testing.T) {
+	now := time.Unix(100, 0)
+	g, _ := NewGazeGate(DefaultGazeConfig())
+	for i := 0; i < 2; i++ {
+		g.Update(GazeInput{Now: now, Snapshot: healthyGazeSnapshot(now, true, false, math.Pi/2)})
+		now = now.Add(100 * time.Millisecond)
+	}
+	s := healthyGazeSnapshot(now, true, true, math.Pi/2)
+	s.Health = PerceptionDaemonUnreachable
+	d := g.Update(GazeInput{Now: now, Prepared: true, Snapshot: s})
+	if d.State != GazeArming || d.Reason != "perception_gap" || len(d.Actions) != 0 {
+		t.Fatalf("transient gap decision = %+v", d)
+	}
+
+	now = now.Add(100 * time.Millisecond)
+	d = g.Update(GazeInput{Now: now, Prepared: true, Snapshot: healthyGazeSnapshot(now, true, true, math.Pi/2)})
+	if d.State != GazeArmed || len(d.Actions) != 0 {
+		t.Fatalf("recovered decision = %+v", d)
+	}
+}
+
+func TestGazeGatePersistentTransportFailureCancelsAndBlocksSameEncounter(t *testing.T) {
+	now := time.Unix(100, 0)
+	g, _ := NewGazeGate(DefaultGazeConfig())
+	for i := 0; i < 2; i++ {
+		g.Update(GazeInput{Now: now, Snapshot: healthyGazeSnapshot(now, true, false, math.Pi/2)})
+		now = now.Add(100 * time.Millisecond)
+	}
+	s := healthyGazeSnapshot(now, true, true, math.Pi/2)
+	s.Health = PerceptionDaemonUnreachable
+	g.Update(GazeInput{Now: now, Prepared: true, Snapshot: s})
+	now = now.Add(defaultGazeHealthGrace + time.Millisecond)
+	d := g.Update(GazeInput{Now: now, Prepared: true, Snapshot: s})
+	if d.State != GazeDegraded || len(d.Actions) != 1 || d.Actions[0].Kind != GazeCancelPreparation {
+		t.Fatalf("persistent gap decision = %+v", d)
+	}
+
+	now = now.Add(100 * time.Millisecond)
+	d = g.Update(GazeInput{Now: now, Snapshot: healthyGazeSnapshot(now, true, false, math.Pi/2)})
+	if d.State != GazeIdle {
+		t.Fatalf("recovery decision = %+v", d)
+	}
+	for i := 0; i < 4; i++ {
+		now = now.Add(100 * time.Millisecond)
+		d = g.Update(GazeInput{Now: now, Snapshot: healthyGazeSnapshot(now, true, false, math.Pi/2)})
+	}
+	if len(d.Actions) != 0 {
+		t.Fatalf("same encounter rearmed after failure: %+v", d)
+	}
+}
+
+func TestGazeGateInvalidSensorStateCancelsImmediately(t *testing.T) {
 	now := time.Unix(100, 0)
 	g, _ := NewGazeGate(DefaultGazeConfig())
 	for i := 0; i < 2; i++ {
@@ -154,7 +205,7 @@ func TestGazeGateFailsClosedAndCancelsPreparation(t *testing.T) {
 	s.Health = PerceptionFaceStale
 	d := g.Update(GazeInput{Now: now, Prepared: true, Snapshot: s})
 	if d.State != GazeDegraded || len(d.Actions) != 1 || d.Actions[0].Kind != GazeCancelPreparation {
-		t.Fatalf("degraded decision = %+v", d)
+		t.Fatalf("invalid sensor decision = %+v", d)
 	}
 }
 
@@ -176,6 +227,7 @@ func TestGazeConfigFromEnvOverridesAndRejectsInvalid(t *testing.T) {
 		"KOE_GAZE_FRONT_DEG":          "45",
 		"KOE_GAZE_REARM_COOLDOWN_MS":  "1500",
 		"KOE_GAZE_ENCOUNTER_RESET_MS": "2500",
+		"KOE_GAZE_HEALTH_GRACE_MS":    "1750",
 	}
 	lookup := func(k string) (string, bool) { v, ok := values[k]; return v, ok }
 	cfg, err := gazeConfigFromLookup(lookup)
@@ -184,7 +236,8 @@ func TestGazeConfigFromEnvOverridesAndRejectsInvalid(t *testing.T) {
 	}
 	if cfg.Enabled || cfg.FaceHits != 3 || cfg.VADHits != 1 || cfg.FaceHold != 900*time.Millisecond ||
 		cfg.ArmTimeout != 12*time.Second || cfg.RearmCooldown != 1500*time.Millisecond ||
-		cfg.EncounterReset != 2500*time.Millisecond || math.Abs(cfg.FrontHalfAngle-math.Pi/4) > 1e-9 {
+		cfg.EncounterReset != 2500*time.Millisecond || cfg.HealthGrace != 1750*time.Millisecond ||
+		math.Abs(cfg.FrontHalfAngle-math.Pi/4) > 1e-9 {
 		t.Fatalf("overrides = %+v", cfg)
 	}
 

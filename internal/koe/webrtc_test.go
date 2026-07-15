@@ -741,3 +741,14 @@ func TestExchangeSDPDoesNotReplayFailedCreate(t *testing.T) {
 		t.Fatalf("calls=%d, want no replay for a failed create call", calls.Load())
 	}
 }
+
+func TestRealtimeHTTPClientDoesNotRetainOpenAIKeepAlives(t *testing.T) {
+	client := newRealtimeHTTPClient()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", client.Transport)
+	}
+	if !transport.DisableKeepAlives {
+		t.Fatal("Realtime one-shot HTTP must not retain an external keep-alive")
+	}
+}

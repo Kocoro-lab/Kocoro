@@ -17,7 +17,11 @@ import (
 
 const (
 	defaultPerceptionPollInterval = 100 * time.Millisecond
-	defaultPerceptionHTTPTimeout  = 250 * time.Millisecond
+	// Loaded CM4 probes have a ~190 ms p95 per endpoint and occasional 250 ms
+	// outliers while WebRTC is active. Keep the serialized stream bounded, but
+	// leave enough headroom that ordinary scheduler jitter is not reported as a
+	// daemon outage to the gaze policy.
+	defaultPerceptionHTTPTimeout = 750 * time.Millisecond
 	// YuNet inference on the CM4 advances its monotonic source timestamp at about
 	// 2 Hz, with first-hand loaded gaps up to 1.247 s. Two seconds still fails
 	// closed quickly on a stopped tracker without flapping during healthy inference.

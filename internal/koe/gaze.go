@@ -16,6 +16,7 @@ const (
 	defaultGazeArmTimeout     = 8 * time.Second
 	defaultGazeRearmCooldown  = 2 * time.Second
 	defaultGazeEncounterReset = 2 * time.Second
+	defaultGazeHealthGrace    = 1500 * time.Millisecond
 )
 
 type GazeState string
@@ -55,6 +56,7 @@ type GazeConfig struct {
 	ArmTimeout     time.Duration
 	RearmCooldown  time.Duration
 	EncounterReset time.Duration
+	HealthGrace    time.Duration
 	FrontHalfAngle float64
 }
 
@@ -67,6 +69,7 @@ func DefaultGazeConfig() GazeConfig {
 		ArmTimeout:     defaultGazeArmTimeout,
 		RearmCooldown:  defaultGazeRearmCooldown,
 		EncounterReset: defaultGazeEncounterReset,
+		HealthGrace:    defaultGazeHealthGrace,
 		FrontHalfAngle: math.Pi / 3,
 	}
 }
@@ -115,6 +118,7 @@ func gazeConfigFromLookup(lookup func(string) (string, bool)) (GazeConfig, error
 		{"KOE_GAZE_ARM_TIMEOUT_MS", &cfg.ArmTimeout, 1_000, 60_000},
 		{"KOE_GAZE_REARM_COOLDOWN_MS", &cfg.RearmCooldown, 100, 10_000},
 		{"KOE_GAZE_ENCOUNTER_RESET_MS", &cfg.EncounterReset, 100, 10_000},
+		{"KOE_GAZE_HEALTH_GRACE_MS", &cfg.HealthGrace, 100, 10_000},
 	}
 	for _, item := range durations {
 		if raw, ok := lookup(item.name); ok {
@@ -142,7 +146,7 @@ func (c GazeConfig) validate() error {
 	if c.FaceHits < 1 || c.FaceHits > 20 || c.VADHits < 1 || c.VADHits > 20 {
 		return fmt.Errorf("koe[gaze]: face/vad hit counts must be in 1..20")
 	}
-	if c.FaceHold <= 0 || c.ArmTimeout <= 0 || c.RearmCooldown <= 0 || c.EncounterReset <= 0 {
+	if c.FaceHold <= 0 || c.ArmTimeout <= 0 || c.RearmCooldown <= 0 || c.EncounterReset <= 0 || c.HealthGrace <= 0 {
 		return fmt.Errorf("koe[gaze]: durations must be positive")
 	}
 	if !finite(c.FrontHalfAngle) || c.FrontHalfAngle <= 0 || c.FrontHalfAngle >= math.Pi/2 {
@@ -174,6 +178,7 @@ type GazeGate struct {
 	encounterBlocked bool
 	activateIssued   bool
 	wasCallActive    bool
+	unhealthySince   time.Time
 }
 
 func NewGazeGate(cfg GazeConfig) (*GazeGate, error) {
@@ -219,10 +224,27 @@ func (g *GazeGate) Update(in GazeInput) GazeDecision {
 	}
 
 	if !in.Snapshot.Healthy() {
+		// A single loaded-daemon HTTP timeout must not tear down a session that
+		// was just prepared for the same face. During this bounded grace period
+		// all speech evidence is discarded, so stale DOA can never activate a
+		// call. Other health failures already represent sustained/invalid sensor
+		// state and continue to fail closed immediately.
+		if in.Snapshot.Health == PerceptionDaemonUnreachable &&
+			(g.state == GazeArming || g.state == GazeArmed) {
+			if g.unhealthySince.IsZero() {
+				g.unhealthySince = now
+			}
+			g.vadHits = 0
+			if now.Sub(g.unhealthySince) < g.cfg.HealthGrace {
+				return GazeDecision{State: g.state, Reason: "perception_gap"}
+			}
+			g.encounterBlocked = true
+		}
 		actions := g.cancelIfPreparing()
 		g.resetEvidence()
 		return g.transition(GazeDegraded, string(in.Snapshot.Health), actions...)
 	}
+	g.unhealthySince = time.Time{}
 	if g.state == GazeDegraded {
 		g.resetEvidence()
 		return g.transition(GazeIdle, "perception_recovered")
@@ -306,6 +328,7 @@ func (g *GazeGate) resetEvidence() {
 	g.lastFaceSeen = time.Time{}
 	g.armDeadline = time.Time{}
 	g.activateIssued = false
+	g.unhealthySince = time.Time{}
 }
 
 func (g *GazeGate) cancelIfPreparing() []GazeAction {
