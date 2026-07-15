@@ -4757,12 +4757,16 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 
 		// Skill tool filter: when use_skill is called, update the filter.
-		// - Skill with allowed-tools: restrict to those tools + use_skill.
-		// - Skill without allowed-tools: clear any prior restriction.
+		// - Skill with a non-nil allowed-tools: restrict to those tools
+			//   (+ SkillExempt ones). A present-but-empty list restricts to ZERO
+			//   tools — the empty map below denies every non-exempt call.
+		// - Skill with no allowed-tools (nil filter): clear any restriction.
+			// Gate on != nil, NOT len > 0, so an explicit empty allowlist means
+			// "grant nothing" rather than silently "grant everything".
 		for _, ac := range approved {
 			er := execResults[ac.index]
 			if ac.fc.Name == "use_skill" && !er.result.IsError {
-				if len(er.result.SkillToolFilter) > 0 {
+				if er.result.SkillToolFilter != nil {
 					activeSkillFilter = make(map[string]bool, len(er.result.SkillToolFilter))
 					sorted := make([]string, len(er.result.SkillToolFilter))
 					copy(sorted, er.result.SkillToolFilter)

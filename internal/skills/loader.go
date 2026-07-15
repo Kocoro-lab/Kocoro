@@ -44,17 +44,31 @@ func BundledSkillSource(shannonDir string) (SkillSource, error) {
 type stringOrList []string
 
 func (s *stringOrList) UnmarshalYAML(value *yaml.Node) error {
+	// This method runs ONLY when the key is present in the frontmatter, so it
+	// always assigns a NON-NIL slice (even when empty). That lets callers
+	// distinguish "field absent" (nil → no tool restriction) from "field
+	// present but empty" (non-nil empty → restrict to zero tools). Without this
+	// invariant, `allowed-tools: []` — a natural way to write "grant nothing" —
+	// would silently clear the execution filter and grant EVERY tool. See the
+	// allowlist filter in internal/agent/loop.go and internal/tools/skill.go.
 	switch value.Kind {
 	case yaml.ScalarNode:
 		var str string
 		if err := value.Decode(&str); err != nil {
 			return err
 		}
-		*s = strings.Fields(str)
+		fields := strings.Fields(str)
+		if fields == nil {
+			fields = []string{}
+		}
+		*s = fields
 	case yaml.SequenceNode:
 		var list []string
 		if err := value.Decode(&list); err != nil {
 			return err
+		}
+		if list == nil {
+			list = []string{}
 		}
 		*s = list
 	default:

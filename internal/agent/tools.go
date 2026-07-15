@@ -73,10 +73,12 @@ type ToolResult struct {
 	// tool_result content when the gateway/model supports the protocol.
 	// When nil, loop.go falls back to the Content string path.
 	ContentBlocks []client.ContentBlock
-	// SkillToolFilter, when non-nil, restricts the tool schemas sent to
-	// the LLM for the remainder of this Run() call. Only tools whose names
-	// appear in this list (plus use_skill itself) will be visible. Set by
-	// use_skill when the activated skill declares allowed-tools.
+	// SkillToolFilter, when non-nil, restricts the tools callable for the
+	// remainder of this Run() call to exactly those named here (plus the
+	// SkillExempt ones: use_skill/think/tool_search). A NON-NIL EMPTY slice is
+	// meaningful — it restricts the skill to zero tools. A nil slice means no
+	// restriction. Set by use_skill from the activated skill's allowed-tools
+	// (nil when the field is absent, non-nil — possibly empty — when present).
 	SkillToolFilter []string
 	// SkillToolHint, when non-empty, contains a <system-reminder> text to
 	// append to the tool_result content, guiding the LLM to restrict itself
