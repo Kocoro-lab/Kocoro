@@ -68,7 +68,9 @@ func WriteGlobalSkill(shannonDir string, skill *Skill) error {
 		Hidden:             skill.Hidden,
 	}
 	if len(skill.AllowedTools) > 0 {
-		fm.AllowedTools = strings.Join(skill.AllowedTools, " ")
+		// stringOrList.MarshalYAML re-joins these into the scalar string form,
+		// so the on-disk SKILL.md is byte-identical to the previous behavior.
+		fm.AllowedTools = stringOrList(skill.AllowedTools)
 	}
 	// Only marshal the sticky-snippet when the author explicitly pinned one
 	// (via StickySnippetOverride). The resolved StickySnippet may come from

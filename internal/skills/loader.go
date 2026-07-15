@@ -32,6 +32,44 @@ func BundledSkillSource(shannonDir string) (SkillSource, error) {
 	return SkillSource{Dir: dir, Source: SourceBundled}, nil
 }
 
+// stringOrList unmarshals a YAML value that may be EITHER a scalar string
+// ("Read Write Bash") OR a sequence (["Read", "Write", "Bash"]). ClawHub skill
+// authors commonly declare `allowed-tools` as a list, while the Agent Skills
+// spec and Anthropic's bundled skills use the scalar form. Typing the field as
+// a plain string rejects the list form outright: yaml.Unmarshal fails with
+// "cannot unmarshal !!seq into string", which makes loadSkillMD error, which
+// (a) 422s the marketplace install and (b) fail-open skips the skill from GET
+// /skills — so a perfectly valid ClawHub skill silently never installs. Accept
+// both forms so that can't happen.
+type stringOrList []string
+
+func (s *stringOrList) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		var str string
+		if err := value.Decode(&str); err != nil {
+			return err
+		}
+		*s = strings.Fields(str)
+	case yaml.SequenceNode:
+		var list []string
+		if err := value.Decode(&list); err != nil {
+			return err
+		}
+		*s = list
+	default:
+		return fmt.Errorf("allowed-tools: expected a string or a list of strings")
+	}
+	return nil
+}
+
+// MarshalYAML re-serializes as a single space-separated scalar, so re-saving a
+// skill (WriteGlobalSkill) keeps the spec-compliant string form on disk and the
+// output is byte-identical to the previous `strings.Join(..., " ")` behavior.
+func (s stringOrList) MarshalYAML() (interface{}, error) {
+	return strings.Join([]string(s), " "), nil
+}
+
 type skillFrontmatter struct {
 	Name string `yaml:"name"`
 	// Slug is not part of the Agent Skills spec nor the openclaw/clawhub
@@ -50,7 +88,9 @@ type skillFrontmatter struct {
 	// value and surface as ErrInvalidSkillPayload / HTTP 422 "malformed"
 	// — see the regression test in marketplace_test.go.
 	Metadata     map[string]any `yaml:"metadata,omitempty"`
-	AllowedTools string         `yaml:"allowed-tools,omitempty"`
+	// AllowedTools accepts both the scalar-string and YAML-list forms — see
+	// stringOrList. On disk it is always re-serialized as the scalar form.
+	AllowedTools stringOrList `yaml:"allowed-tools,omitempty"`
 	// StickyInstructions opts the skill into post-activation / post-drift
 	// <system-reminder> reinjection. Opt-in only. See Skill.StickyInstructions.
 	// omitempty so skills that never set it don't gain a noisy
@@ -161,10 +201,9 @@ func loadSkillMD(path, dirName, source string) (*Skill, error) {
 	if fm.Description == "" {
 		return nil, fmt.Errorf("skill description is required")
 	}
-	var allowedTools []string
-	if fm.AllowedTools != "" {
-		allowedTools = strings.Fields(fm.AllowedTools)
-	}
+	// stringOrList already normalized both the scalar and list YAML forms into
+	// a []string during unmarshal.
+	allowedTools := []string(fm.AllowedTools)
 	prompt := strings.TrimSpace(string(body))
 	override := strings.TrimSpace(fm.StickySnippet)
 	snippet := override
