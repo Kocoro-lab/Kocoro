@@ -194,6 +194,27 @@ func TestRemoteTimeline_DoesNotSplitToolUseAndResult(t *testing.T) {
 	}
 }
 
+func TestRemoteTimeline_RejectsCursorThatSplitsToolUseAndResult(t *testing.T) {
+	messages := []client.Message{
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{client.NewToolUseBlock("tool-1", "bash", json.RawMessage(`{"command":"pwd"}`))})},
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{client.NewToolResultBlock("tool-1", "/tmp", false)})},
+		{Role: "assistant", Content: client.NewTextContent("finished")},
+	}
+	srv, sess := newRemoteTimelineTestServer(t, messages, nil)
+
+	resp := srv.HandleRemoteRequest(context.Background(), RemoteRequest{
+		Method: http.MethodGet,
+		Path:   "/sessions/" + sess.ID + "?view=remote_timeline&before=1",
+	})
+	if resp.Status != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400; body=%s", resp.Status, resp.Body)
+	}
+	if !strings.Contains(string(resp.Body), "invalid_remote_timeline_page") ||
+		!strings.Contains(string(resp.Body), "splits a tool-use/result pair") {
+		t.Fatalf("body=%s", resp.Body)
+	}
+}
+
 func TestRemoteTimeline_RejectsMalformedCursor(t *testing.T) {
 	srv, sess := newRemoteTimelineTestServer(t, []client.Message{{Role: "user", Content: client.NewTextContent("hello")}}, nil)
 	resp := srv.HandleRemoteRequest(context.Background(), RemoteRequest{
@@ -228,5 +249,136 @@ func TestRemoteTimeline_DropsReasoningWithoutUserVisibleOmission(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), "private reasoning") || strings.Contains(string(encoded), "thinking") {
 		t.Fatalf("reasoning leaked into remote timeline: %s", encoded)
+	}
+}
+
+func TestRemoteTimelinePageSizerMatchesJSONMarshal(t *testing.T) {
+	messages := []client.Message{
+		{Role: "user", Content: client.NewTextContent("first <message> \"quoted\"")},
+		{Role: "assistant", Content: client.NewTextContent("第二条消息")},
+		{Role: "user", Content: client.NewTextContent("last")},
+	}
+	meta := []session.MessageMeta{
+		{Source: `source"<>&`, MessageID: "message-1"},
+		{Source: "mobile", MessageID: "message-2", SystemInjected: true},
+		{},
+	}
+	sess := &session.Session{
+		ID:          `session"<>&`,
+		Title:       "Timeline <title> \"quoted\"",
+		CWD:         `/tmp/project"<>&`,
+		Messages:    messages,
+		MessageMeta: meta,
+	}
+	page := newRemoteTimelinePage(sess, len(messages))
+	sizer, err := newRemoteTimelinePageSizer(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertExact := func() {
+		t.Helper()
+		got, err := sizer.encodedBytes(page.StartIndex, page.HasMore, page.NextCursor, page.OmittedContentCount)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(page)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != len(encoded) {
+			t.Fatalf("incremental size=%d, json.Marshal size=%d, page=%s", got, len(encoded), encoded)
+		}
+	}
+	assertExact()
+
+	firstMessages := messages[1:]
+	firstMeta := meta[1:]
+	sizer, err = sizer.withGroup(firstMessages, firstMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page.Messages = firstMessages
+	page.MessageMeta = firstMeta
+	page.StartIndex = 1
+	page.HasMore = true
+	page.NextCursor = "1"
+	page.OmittedContentCount = 12
+	assertExact()
+
+	sizer, err = sizer.withGroup(messages[:1], meta[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	page.Messages = messages
+	page.MessageMeta = meta
+	page.StartIndex = 0
+	page.HasMore = false
+	page.NextCursor = ""
+	page.OmittedContentCount = 123
+	assertExact()
+}
+
+func TestRemoteTimelineIncrementalSizerStopsAtExactBudgetBoundary(t *testing.T) {
+	messages := make([]client.Message, remoteTimelineMaxLimit)
+	meta := make([]session.MessageMeta, remoteTimelineMaxLimit)
+	for i := range messages {
+		messages[i] = client.Message{Role: "user", Content: client.NewTextContent(strings.Repeat("x", 12*1024))}
+		meta[i] = session.MessageMeta{Source: "mobile", MessageID: fmt.Sprintf("message-%d", i)}
+	}
+	sess := &session.Session{ID: "budget", Title: "Budget boundary", Messages: messages, MessageMeta: meta}
+	req := httptest.NewRequest(http.MethodGet, "/sessions/budget?view=remote_timeline&limit=100", nil)
+
+	page, err := buildRemoteTimelinePage(sess, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded)+1 > remoteTimelineResponseBudgetBytes {
+		t.Fatalf("page bytes=%d exceed budget=%d", len(encoded)+1, remoteTimelineResponseBudgetBytes)
+	}
+	if page.StartIndex <= 0 || !page.HasMore {
+		t.Fatalf("byte budget did not bind: start=%d has_more=%v messages=%d", page.StartIndex, page.HasMore, len(page.Messages))
+	}
+
+	nextMessage, omitted := projectRemoteTimelineMessage(messages[page.StartIndex-1])
+	candidate := *page
+	candidate.Messages = append([]client.Message{nextMessage}, page.Messages...)
+	candidate.MessageMeta = append([]session.MessageMeta{meta[page.StartIndex-1]}, page.MessageMeta...)
+	candidate.StartIndex--
+	candidate.OmittedContentCount += omitted
+	candidate.HasMore = candidate.StartIndex > 0
+	candidate.NextCursor = remoteTimelineCursor(candidate.StartIndex)
+	candidateEncoded, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidateEncoded)+1 <= remoteTimelineResponseBudgetBytes {
+		t.Fatalf("page stopped early: current=%d candidate=%d budget=%d", len(encoded)+1, len(candidateEncoded)+1, remoteTimelineResponseBudgetBytes)
+	}
+}
+
+func BenchmarkBuildRemoteTimelinePage(b *testing.B) {
+	messages := make([]client.Message, remoteTimelineMaxLimit)
+	meta := make([]session.MessageMeta, remoteTimelineMaxLimit)
+	for i := range messages {
+		messages[i] = client.Message{
+			Role:    "user",
+			Content: client.NewTextContent(strings.Repeat("message payload ", 400)),
+		}
+		meta[i] = session.MessageMeta{Source: "mobile", MessageID: fmt.Sprintf("message-%d", i)}
+	}
+	sess := &session.Session{ID: "benchmark", Title: "Benchmark", Messages: messages, MessageMeta: meta}
+	req := httptest.NewRequest(http.MethodGet, "/sessions/benchmark?view=remote_timeline&limit=100", nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := buildRemoteTimelinePage(sess, req); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

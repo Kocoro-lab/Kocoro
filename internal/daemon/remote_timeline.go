@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -52,6 +53,18 @@ type remoteTimelinePage struct {
 	OmittedContentCount int                   `json:"omitted_content_count"`
 }
 
+// remoteTimelinePageSizer tracks the exact JSON size of the two growing page
+// arrays. The fixed page envelope is encoded once; each projected message and
+// metadata entry is then encoded once as it is considered. This keeps budget
+// enforcement exact without repeatedly marshaling the accumulated page.
+type remoteTimelinePageSizer struct {
+	baseBytes           int
+	messageContentBytes int
+	messageCount        int
+	metaContentBytes    int
+	metaCount           int
+}
+
 func buildRemoteTimelinePage(sess *session.Session, r *http.Request) (*remoteTimelinePage, error) {
 	end := len(sess.Messages)
 	if raw := strings.TrimSpace(r.URL.Query().Get("before")); raw != "" {
@@ -62,6 +75,9 @@ func buildRemoteTimelinePage(sess *session.Session, r *http.Request) (*remoteTim
 		if parsed < end {
 			end = parsed
 		}
+	}
+	if remoteTimelineSplitsToolPair(sess.Messages, end) {
+		return nil, fmt.Errorf("invalid remote timeline cursor: cursor splits a tool-use/result pair")
 	}
 
 	limit := remoteTimelineDefaultLimit
@@ -77,13 +93,16 @@ func buildRemoteTimelinePage(sess *session.Session, r *http.Request) (*remoteTim
 	}
 
 	page := newRemoteTimelinePage(sess, end)
+	pageSizer, err := newRemoteTimelinePageSizer(page)
+	if err != nil {
+		return nil, err
+	}
 	start := end
 	for start > 0 {
 		groupStart := start - 1
 		// Keep an assistant tool_use beside the immediately following user
 		// tool_result so a page never renders a permanently-running orphan card.
-		if remoteTimelineHasToolResult(sess.Messages[groupStart]) &&
-			groupStart > 0 && remoteTimelineHasToolUse(sess.Messages[groupStart-1]) {
+		if remoteTimelineSplitsToolPair(sess.Messages, groupStart) {
 			groupStart--
 		}
 		groupLen := start - groupStart
@@ -98,19 +117,19 @@ func buildRemoteTimelinePage(sess *session.Session, r *http.Request) (*remoteTim
 			projected = append(projected, msg)
 			omitted += count
 		}
-		candidate := *page
-		candidate.Messages = append(projected, page.Messages...)
-		candidate.MessageMeta = append(remoteTimelineMetaRange(sess, groupStart, start), page.MessageMeta...)
-		candidate.StartIndex = groupStart
-		candidate.OmittedContentCount += omitted
-		candidate.HasMore = groupStart > 0
-		candidate.NextCursor = remoteTimelineCursor(groupStart)
-
-		encoded, err := json.Marshal(candidate)
+		projectedMeta := remoteTimelineMetaRange(sess, groupStart, start)
+		candidateSizer, err := pageSizer.withGroup(projected, projectedMeta)
 		if err != nil {
-			return nil, fmt.Errorf("encode remote timeline page: %w", err)
+			return nil, err
 		}
-		if len(encoded)+1 > remoteTimelineResponseBudgetBytes {
+		candidateOmitted := page.OmittedContentCount + omitted
+		candidateHasMore := groupStart > 0
+		candidateCursor := remoteTimelineCursor(groupStart)
+		encodedBytes, err := candidateSizer.encodedBytes(groupStart, candidateHasMore, candidateCursor, candidateOmitted)
+		if err != nil {
+			return nil, err
+		}
+		if encodedBytes+1 > remoteTimelineResponseBudgetBytes {
 			// Per-message projection keeps a single logical group well below the
 			// page budget. If the page already has content, stop at this boundary.
 			if len(page.Messages) > 0 {
@@ -119,13 +138,94 @@ func buildRemoteTimelinePage(sess *session.Session, r *http.Request) (*remoteTim
 			return nil, fmt.Errorf("remote timeline projection exceeds response budget")
 		}
 
-		*page = candidate
+		// Groups arrive newest-to-oldest. Append each group in reverse order,
+		// then reverse the completed arrays once so page assembly stays linear.
+		for i := len(projected) - 1; i >= 0; i-- {
+			page.Messages = append(page.Messages, projected[i])
+			page.MessageMeta = append(page.MessageMeta, projectedMeta[i])
+		}
+		page.StartIndex = groupStart
+		page.OmittedContentCount = candidateOmitted
+		page.HasMore = candidateHasMore
+		page.NextCursor = candidateCursor
+		pageSizer = candidateSizer
 		start = groupStart
 	}
 
+	slices.Reverse(page.Messages)
+	slices.Reverse(page.MessageMeta)
 	page.HasMore = page.StartIndex > 0
 	page.NextCursor = remoteTimelineCursor(page.StartIndex)
+	encodedBytes, err := pageSizer.encodedBytes(page.StartIndex, page.HasMore, page.NextCursor, page.OmittedContentCount)
+	if err != nil {
+		return nil, err
+	}
+	if encodedBytes+1 > remoteTimelineResponseBudgetBytes {
+		return nil, fmt.Errorf("remote timeline projection exceeds response budget")
+	}
 	return page, nil
+}
+
+func newRemoteTimelinePageSizer(page *remoteTimelinePage) (remoteTimelinePageSizer, error) {
+	base := *page
+	base.Messages = []client.Message{}
+	base.MessageMeta = []session.MessageMeta{}
+	base.StartIndex = 0
+	base.HasMore = false
+	base.NextCursor = ""
+	base.OmittedContentCount = 0
+
+	encoded, err := json.Marshal(base)
+	if err != nil {
+		return remoteTimelinePageSizer{}, fmt.Errorf("encode remote timeline page envelope: %w", err)
+	}
+	return remoteTimelinePageSizer{baseBytes: len(encoded)}, nil
+}
+
+func (s remoteTimelinePageSizer) withGroup(messages []client.Message, meta []session.MessageMeta) (remoteTimelinePageSizer, error) {
+	next := s
+	for _, msg := range messages {
+		encoded, err := json.Marshal(msg)
+		if err != nil {
+			return remoteTimelinePageSizer{}, fmt.Errorf("encode remote timeline message: %w", err)
+		}
+		if next.messageCount > 0 {
+			next.messageContentBytes++ // comma between array elements
+		}
+		next.messageContentBytes += len(encoded)
+		next.messageCount++
+	}
+	for _, item := range meta {
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			return remoteTimelinePageSizer{}, fmt.Errorf("encode remote timeline metadata: %w", err)
+		}
+		if next.metaCount > 0 {
+			next.metaContentBytes++ // comma between array elements
+		}
+		next.metaContentBytes += len(encoded)
+		next.metaCount++
+	}
+	return next, nil
+}
+
+func (s remoteTimelinePageSizer) encodedBytes(startIndex int, hasMore bool, nextCursor string, omittedContentCount int) (int, error) {
+	size := s.baseBytes + s.messageContentBytes + s.metaContentBytes
+	size += len(strconv.Itoa(startIndex)) - len("0")
+	size += len(strconv.Itoa(omittedContentCount)) - len("0")
+	if hasMore {
+		size += len("true") - len("false")
+	}
+	if nextCursor != "" {
+		encodedCursor, err := json.Marshal(nextCursor)
+		if err != nil {
+			return 0, fmt.Errorf("encode remote timeline cursor: %w", err)
+		}
+		// The empty-cursor envelope omits this field. Adding it introduces the
+		// key/value plus one additional comma among the surrounding fields.
+		size += len(`"next_cursor":`) + len(encodedCursor) + 1
+	}
+	return size, nil
 }
 
 func newRemoteTimelinePage(sess *session.Session, end int) *remoteTimelinePage {
@@ -153,6 +253,15 @@ func remoteTimelineCursor(start int) string {
 	// Clients treat this as opaque. A decimal cursor keeps v1 debuggable while
 	// leaving room to change the encoding behind the capability in a future v2.
 	return strconv.Itoa(start)
+}
+
+// remoteTimelineSplitsToolPair reports whether boundary falls between an
+// assistant tool_use and its immediately following user tool_result group.
+// Both server-issued cursors and client-supplied cursors use this same rule.
+func remoteTimelineSplitsToolPair(messages []client.Message, boundary int) bool {
+	return boundary > 0 && boundary < len(messages) &&
+		remoteTimelineHasToolUse(messages[boundary-1]) &&
+		remoteTimelineHasToolResult(messages[boundary])
 }
 
 func remoteTimelineMetaRange(sess *session.Session, start, end int) []session.MessageMeta {
