@@ -150,3 +150,23 @@ func TestBridgeStatusSSEEvent(t *testing.T) {
 		t.Errorf("bridge_status SSE = %q, want disabled flat event", line)
 	}
 }
+
+func TestBridgeStatusUpdatesCarrierSnapshot(t *testing.T) {
+	s := NewControlServer(nil, nil, nil)
+	s.EmitBridgeStatus("connected")
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/carrier/status")
+	if err != nil {
+		t.Fatalf("GET /carrier/status: %v", err)
+	}
+	defer resp.Body.Close()
+	var got carrierStatusWant
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Bridge.State != "connected" {
+		t.Fatalf("bridge.state = %q, want latest connected snapshot", got.Bridge.State)
+	}
+}

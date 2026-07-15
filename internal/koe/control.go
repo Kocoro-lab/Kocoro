@@ -68,6 +68,7 @@ type ControlServer struct {
 	micOff      func() bool
 	token       string       // optional Bearer token for Desktop-owned requests
 	lastVoice   atomic.Value // string: last voice_state, replayed by ReemitVoiceState
+	lastBridge  atomic.Value // string: latest bridge_status, exposed by /carrier/status
 
 	carrier      *CarrierProfile // resolved carrier identity for GET /carrier/status (nil = not injected)
 	carrierBound func() bool     // reports audio.bound; nil → false
@@ -75,12 +76,14 @@ type ControlServer struct {
 
 // NewControlServer wires the Desktop-driven start/end callbacks (either may be nil).
 func NewControlServer(onStart func(StartCallRequest), onEnd func(), onInterrupt func()) *ControlServer {
-	return &ControlServer{
+	s := &ControlServer{
 		subscribers: make(map[chan controlEvent]struct{}),
 		onStart:     onStart,
 		onEnd:       onEnd,
 		onInterrupt: onInterrupt,
 	}
+	s.lastBridge.Store(bridgeStateDisabled)
+	return s
 }
 
 // SetMicHandler wires POST /call/mic. Called once at startup, before Handler()
@@ -292,6 +295,7 @@ func (s *ControlServer) EmitMicStatus(status string) {
 // Kocoro Robot card "motion" light). Additive flat event; M1 always emits
 // "disabled" (no bridge yet), M3 drives connecting/connected/degraded.
 func (s *ControlServer) EmitBridgeStatus(state string) {
+	s.lastBridge.Store(state)
 	s.broadcast(controlEvent{Type: "bridge_status", State: state})
 }
 
@@ -335,6 +339,10 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 	if s.carrierBound != nil {
 		bound = s.carrierBound()
 	}
+	bridgeState := bridgeStateDisabled
+	if state, ok := s.lastBridge.Load().(string); ok && state != "" {
+		bridgeState = state
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(carrierStatusResponse{
 		Carrier: p.Carrier,
@@ -345,7 +353,7 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 			SpeakerUID: p.SpeakerUID,
 			Bound:      bound,
 		},
-		Bridge: carrierBridgeStatus{State: bridgeStateDisabled},
+		Bridge: carrierBridgeStatus{State: bridgeState},
 		Model:  p.Model,
 		Agent:  p.Agent,
 	})
