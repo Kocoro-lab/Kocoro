@@ -2569,6 +2569,16 @@ func shouldSuppressDanceFollowup(name string, args, output []byte) bool {
 		request.Intent == "dance" && result.Status == "expressed" && result.Delivery == "physical_silent"
 }
 
+func isDanceExpressCall(name string, args []byte) bool {
+	if name != "express" {
+		return false
+	}
+	var request struct {
+		Intent string `json:"intent"`
+	}
+	return json.Unmarshal(args, &request) == nil && request.Intent == "dance"
+}
+
 func (h *eventHandler) requestEndCall(callID string) bool {
 	if h == nil || h.onEndCall == nil {
 		return false
@@ -2825,7 +2835,18 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 		h.requestEndCall(callID)
 		return
 	}
-	// Fast tools (cancel/get_status/control_app/switch_agent).
+	// A dance tool call can arrive just before the completed input transcript that
+	// authorizes it locally. Dispatch only that call off the event loop, allowing
+	// the transcript event to land while MotionController waits briefly. Other fast
+	// tools remain synchronous and byte-for-byte unchanged.
+	if isDanceExpressCall(name, args) {
+		go h.handleFastFunctionCall(ctx, responseID, callID, name, args)
+		return
+	}
+	h.handleFastFunctionCall(ctx, responseID, callID, name, args)
+}
+
+func (h *eventHandler) handleFastFunctionCall(ctx context.Context, responseID, callID, name string, args []byte) {
 	outBytes, err := h.disp.Dispatch(ctx, name, args)
 	if err != nil {
 		log.Printf("koe[tool]: dispatch failed name=%q call_id=%q err=%v args=%s", name, callID, err, logMaybeBytes(args, 500))

@@ -178,6 +178,7 @@ func TestMotionControllerDanceRequiresExplicitCurrentTranscript(t *testing.T) {
 	defer fb.close()
 	mc := NewMotionController(fb.path, ActivityStandard, nil)
 	mc.pollInterval = 15 * time.Millisecond
+	mc.danceAuthWait = time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go mc.Run(ctx)
@@ -211,10 +212,37 @@ func TestMotionControllerDanceAuthorizationExpires(t *testing.T) {
 	now := time.Unix(1000, 0)
 	mc := NewMotionController("/tmp/not-used.sock", ActivityStandard, nil)
 	mc.now = func() time.Time { return now }
+	mc.danceAuthWait = 0
 	mc.ObserveUserTranscript("跳个舞")
 	now = now.Add(danceAuthorizationWindow + time.Millisecond)
 	if res := mc.Express(context.Background(), "dance"); res.Expressed || res.Reason != "not_explicit" {
 		t.Fatalf("expired dance grant = %+v, want not_explicit", res)
+	}
+}
+
+func TestMotionControllerDanceWaitsForLateTranscript(t *testing.T) {
+	fb := newFakeBridge(t, []string{"dance1"})
+	defer fb.close()
+	mc := NewMotionController(fb.path, ActivityStandard, nil)
+	mc.pollInterval = 15 * time.Millisecond
+	mc.danceAuthWait = 500 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mc.Run(ctx)
+	waitForKMC(t, 2*time.Second, mc.IsConnected)
+	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+
+	result := make(chan ExpressResult, 1)
+	go func() { result <- mc.Express(ctx, "dance") }()
+	time.Sleep(20 * time.Millisecond)
+	mc.ObserveUserTranscript("请给我跳个舞")
+	select {
+	case res := <-result:
+		if !res.Expressed || res.Clip != "dance1" {
+			t.Fatalf("late authorized dance = %+v, want dance1", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dance did not resume after late transcript authorization")
 	}
 }
 

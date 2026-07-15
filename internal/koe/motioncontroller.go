@@ -30,6 +30,10 @@ const (
 	// Bound the authorization so an abandoned dance request cannot leak into a
 	// later turn; a new non-dance transcript clears it immediately as well.
 	danceAuthorizationWindow = 12 * time.Second
+	// Realtime can finish a dance tool call just before input transcription lands.
+	// The tool dispatch runs off the event loop and waits briefly for that final
+	// transcript; silence/capability questions still fail closed at the deadline.
+	danceAuthorizationWait = 1500 * time.Millisecond
 )
 
 // MotionController owns the reachy motion-bridge client + the express gate for a
@@ -54,6 +58,8 @@ type MotionController struct {
 	movesApplied atomic.Bool
 
 	danceAuthorizedUntil time.Time
+	danceAuthWait        time.Duration
+	danceAuthNotify      chan struct{}
 }
 
 // NewMotionController builds a controller for the motion bridge at socketPath.
@@ -67,6 +73,8 @@ func NewMotionController(socketPath string, tier ActivityTier, onBridgeStatus fu
 		heartbeatInterval: reachyHeartbeatInterval,
 		misses:            reachyHeartbeatMisses,
 		now:               time.Now,
+		danceAuthWait:     danceAuthorizationWait,
+		danceAuthNotify:   make(chan struct{}, 1),
 	}
 }
 
@@ -86,9 +94,42 @@ func (mc *MotionController) ObserveUserTranscript(transcript string) {
 	defer mc.mu.Unlock()
 	if allowed {
 		mc.danceAuthorizedUntil = mc.now().Add(danceAuthorizationWindow)
+		select {
+		case mc.danceAuthNotify <- struct{}{}:
+		default:
+		}
 	} else {
 		mc.danceAuthorizedUntil = time.Time{}
+		select {
+		case <-mc.danceAuthNotify:
+		default:
+		}
 	}
+}
+
+func (mc *MotionController) awaitDanceAuthorization(ctx context.Context) bool {
+	mc.mu.Lock()
+	authorized := !mc.danceAuthorizedUntil.IsZero() && !mc.now().After(mc.danceAuthorizedUntil)
+	wait := mc.danceAuthWait
+	notify := mc.danceAuthNotify
+	mc.mu.Unlock()
+	if authorized {
+		return true
+	}
+	if wait <= 0 {
+		return false
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+	case <-notify:
+	}
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	return !mc.danceAuthorizedUntil.IsZero() && !mc.now().After(mc.danceAuthorizedUntil)
 }
 
 // Express runs a gated body gesture: the gate picks a clip (≤1/response, cooldown,
@@ -96,15 +137,18 @@ func (mc *MotionController) ObserveUserTranscript(transcript string) {
 // disconnected bridge returns a non-Expressed result — never an error the model
 // must handle (a missed gesture is invisible; the conversation continues).
 func (mc *MotionController) Express(ctx context.Context, intent string) ExpressResult {
-	mc.mu.Lock()
-	if intent == "dance" && (mc.danceAuthorizedUntil.IsZero() || mc.now().After(mc.danceAuthorizedUntil)) {
-		mc.mu.Unlock()
+	if intent == "dance" && !mc.awaitDanceAuthorization(ctx) {
 		log.Printf("koe[express]: intent=dance status=skipped reason=not_explicit")
 		return ExpressResult{Reason: "not_explicit"}
 	}
+	mc.mu.Lock()
 	clip, ok, reason := mc.gate.Allow(intent)
 	if ok && intent == "dance" {
 		mc.danceAuthorizedUntil = time.Time{} // one explicit utterance authorizes one attempt
+		select {
+		case <-mc.danceAuthNotify:
+		default:
+		}
 	}
 	mc.mu.Unlock()
 	if !ok {

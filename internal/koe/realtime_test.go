@@ -1270,6 +1270,7 @@ func TestSuccessfulDanceIsPhysicalOnlyWhileOtherExpressContinues(t *testing.T) {
 
 	h, cap := newHandler(ExpressResult{Expressed: true, Clip: "dance1"})
 	h.handleFunctionCall(context.Background(), "dance-call", "express", []byte(`{"intent":"dance"}`))
+	waitUntil(t, func() bool { return cap.countType("conversation.item.create") == 1 }, "dance output was not submitted")
 	if got := cap.countType("conversation.item.create"); got != 1 {
 		t.Fatalf("successful dance function outputs = %d, want 1", got)
 	}
@@ -1285,9 +1286,37 @@ func TestSuccessfulDanceIsPhysicalOnlyWhileOtherExpressContinues(t *testing.T) {
 
 	h, _ = newHandler(ExpressResult{Reason: "cooldown"})
 	h.handleFunctionCall(context.Background(), "skipped-call", "express", []byte(`{"intent":"dance"}`))
+	waitUntil(t, func() bool { return len(h.respReq) == 1 }, "skipped dance continuation was not queued")
 	if got := len(h.respReq); got != 1 {
 		t.Fatalf("skipped dance queued %d followups, want normal continuation", got)
 	}
+}
+
+func TestDanceDispatchDoesNotBlockTranscriptEventLoop(t *testing.T) {
+	state := NewCallState("burst-dance-order", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	disp.SetExpressHandler(func(context.Context, string) ExpressResult {
+		close(started)
+		<-release
+		return ExpressResult{Reason: "not_explicit"}
+	})
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+
+	begin := time.Now()
+	h.handleFunctionCall(context.Background(), "dance-call", "express", []byte(`{"intent":"dance"}`))
+	if elapsed := time.Since(begin); elapsed > 50*time.Millisecond {
+		t.Fatalf("dance dispatch blocked event loop for %s", elapsed)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("asynchronous dance dispatch did not start")
+	}
+	close(release)
+	waitUntil(t, func() bool { return cap.countType("conversation.item.create") == 1 }, "dance output was not submitted")
 }
 
 func TestLocalCommitFallbackCommitsWhenServerVADMisses(t *testing.T) {
