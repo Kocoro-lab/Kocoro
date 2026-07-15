@@ -26,6 +26,8 @@ var protectedFields = map[string]string{
 // protectedNestedFields maps [parent, child] to a reason.
 var protectedNestedFields = map[[2]string]string{
 	{"permissions", "denied_commands"}: "removes security restrictions",
+	{"koe", "lan_token"}:               "changes the LAN bearer secret gating mint/do_task",
+	{"koe", "lan_bind"}:                "toggles daemon LAN exposure",
 	// viper aliases cloud.endpoint/cloud.api_key onto the protected top-level
 	// keys — the nested spelling must not bypass the wall above.
 	{"cloud", "endpoint"}: "changes API connection target",

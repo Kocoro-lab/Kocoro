@@ -81,6 +81,37 @@ func TestCheckProtectedFields_PermissionsDeniedCommands(t *testing.T) {
 	}
 }
 
+func TestCheckProtectedFields_KoeLANToken(t *testing.T) {
+	// koe.lan_token is the LAN bearer secret gating mint/do_task once the daemon
+	// binds beyond loopback (P4). A PATCH /config must never change it out from
+	// under an active LAN session.
+	patch := map[string]interface{}{
+		"koe": map[string]interface{}{
+			"lan_token": "deadbeef",
+		},
+	}
+	reason, isProtected := checkProtectedFields(patch)
+	if !isProtected {
+		t.Fatal("expected isProtected=true for koe.lan_token (LAN bearer secret)")
+	}
+	if reason == "" {
+		t.Error("expected a non-empty reason")
+	}
+}
+
+func TestCheckProtectedFields_KoeLANBind(t *testing.T) {
+	// koe.lan_bind exposes the daemon on all interfaces; flipping it via API would
+	// widen the attack surface without operator intent.
+	patch := map[string]interface{}{
+		"koe": map[string]interface{}{
+			"lan_bind": true,
+		},
+	}
+	if _, isProtected := checkProtectedFields(patch); !isProtected {
+		t.Fatal("expected isProtected=true for koe.lan_bind (LAN exposure toggle)")
+	}
+}
+
 func TestCheckProtectedFields_DaemonAutoApprove(t *testing.T) {
 	patch := map[string]interface{}{
 		"daemon": map[string]interface{}{
@@ -387,4 +418,3 @@ func TestValidateBuiltinMCPPatch_IgnoresNonBuiltinServer(t *testing.T) {
 		t.Errorf("non-builtin server should pass through; blocked on %q", field)
 	}
 }
-
