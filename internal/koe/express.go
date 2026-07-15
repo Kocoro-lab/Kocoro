@@ -54,7 +54,10 @@ var intentClips = map[string][]string{
 	"sorry":     {"shy1", "resigned1", "oops2", "uncomfortable1"},
 	"confused":  {"confused1", "lost1", "incomprehensible2"},
 	"proud":     {"proud1", "proud2", "proud3", "success1", "success2"},
-	"dance":     {"dance1", "dance2", "dance3", "groovy_sway_and_roll", "side_to_side_sway"},
+	// Keep dance brief and conservative. On the production 1.9 dataset dance1 is
+	// 3.24s with small head/body travel; dance2/dance3 run for 17–18s with much
+	// larger body yaw. Add variants only after their live envelope is accepted.
+	"dance": {"dance1"},
 }
 
 // explicitDanceRequest is the deterministic half of §19's "dance only when the

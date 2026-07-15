@@ -1,6 +1,7 @@
 package koe
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -40,6 +41,13 @@ func TestExplicitDanceRequest(t *testing.T) {
 		if got := explicitDanceRequest(tc.transcript); got != tc.want {
 			t.Errorf("explicitDanceRequest(%q) = %t, want %t", tc.transcript, got, tc.want)
 		}
+	}
+}
+
+func TestDancePoolUsesOnlyBriefVerifiedClip(t *testing.T) {
+	want := []string{"dance1"}
+	if got := intentClips["dance"]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("dance clip pool = %v, want verified brief pool %v", got, want)
 	}
 }
 
