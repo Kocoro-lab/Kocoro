@@ -176,6 +176,11 @@ const (
 	// remote_event frames. Mobile clients use this to control the user's Mac via
 	// Shannon Cloud without exposing localhost.
 	CapRemoteControlV1 = "remote_control_v1"
+	// CapRemoteSessionTimelineV1 — GET /sessions/{id}?view=remote_timeline
+	// returns a byte-bounded newest-first page whose large images, thinking
+	// blocks, and verbose tool payloads are explicitly projected for mobile.
+	// The legacy GET /sessions/{id} response remains the complete session.
+	CapRemoteSessionTimelineV1 = "remote_session_timeline_v1"
 	// CapClawHubExcludeInstalled — daemon's GET /skills/clawhub accepts
 	// exclude_installed=true, dropping already-installed skills from the browse/
 	// search list and refilling from subsequent pages so the page stays
@@ -207,6 +212,7 @@ var Capabilities = []string{
 	CapSessionsScopeAll,
 	CapAgentDefaultCWDV1,
 	CapRemoteControlV1,
+	CapRemoteSessionTimelineV1,
 	CapClawHubExcludeInstalled,
 }
 

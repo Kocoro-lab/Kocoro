@@ -29,7 +29,9 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
+	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
@@ -583,8 +585,81 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	if !has(CapAgentDefaultCWDV1) {
 		t.Fatalf("capabilities lost %q: %v", CapAgentDefaultCWDV1, *status.Capabilities)
 	}
+	if !has(CapRemoteSessionTimelineV1) {
+		t.Fatalf("capabilities lost %q: %v", CapRemoteSessionTimelineV1, *status.Capabilities)
+	}
 	if status.Memory == nil || status.Memory.Provider != "disabled" || status.Memory.Reason != nil {
 		t.Fatalf("memory block decode mismatch: %+v", status.Memory)
+	}
+}
+
+func TestWireFixture_HTTPRemoteSessionTimeline(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.session.remote_timeline.response.json")
+	dir := t.TempDir()
+	deps := &ServerDeps{ShannonDir: dir, SessionCache: NewSessionCache(dir)}
+	mgr := deps.SessionCache.GetOrCreate("")
+	sess := mgr.NewSession()
+	sess.Title = fixture["title"].(string)
+	sess.CWD = fixture["cwd"].(string)
+	sess.CreatedAt = time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+	sess.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("older message")},
+		{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+			client.NewToolUseBlock("tool-1", "bash", json.RawMessage(`{"command":"pwd"}`)),
+		})},
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			client.NewToolResultBlock("tool-1", "/tmp/project", false),
+		})},
+	}
+	firstMetaTime := time.Date(2026, 7, 15, 0, 0, 9, 0, time.UTC)
+	toolTime := time.Date(2026, 7, 15, 0, 0, 10, 0, time.UTC)
+	resultTime := time.Date(2026, 7, 15, 0, 0, 11, 0, time.UTC)
+	sess.MessageMeta = []session.MessageMeta{
+		{Source: "kocoro", Timestamp: &firstMetaTime},
+		{Source: "kocoro", Timestamp: &toolTime},
+		{Source: "kocoro", Timestamp: &resultTime},
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatalf("save fixture session: %v", err)
+	}
+
+	srv := NewServer(0, &Client{}, deps, "test")
+	rec := httptest.NewRecorder()
+	path := "/sessions/" + sess.ID + "?view=remote_timeline&limit=2"
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s = %d body=%s", path, rec.Code, rec.Body.String())
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	produced["id"] = fixture["id"]
+	produced["created_at"] = fixture["created_at"]
+	produced["updated_at"] = fixture["updated_at"]
+	assertSemanticEqual(t, fixture, produced)
+
+	// Consumer-shaped decode mirrors RemoteDaemonSessionDetail plus its paging
+	// additions. This catches producer field renames independently of the fixture.
+	var detail struct {
+		PageVersion int `json:"page_version"`
+		Messages    []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+		MessageMeta []struct {
+			Source    string `json:"source"`
+			Timestamp string `json:"timestamp"`
+		} `json:"message_meta"`
+		StartIndex          int    `json:"start_index"`
+		TotalMessages       int    `json:"total_messages"`
+		HasMore             bool   `json:"has_more"`
+		NextCursor          string `json:"next_cursor"`
+		OmittedContentCount int    `json:"omitted_content_count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if detail.PageVersion != 1 || len(detail.Messages) != 2 || len(detail.MessageMeta) != 2 ||
+		detail.StartIndex != 1 || detail.TotalMessages != 3 || !detail.HasMore || detail.NextCursor != "1" {
+		t.Fatalf("consumer decode lost timeline fields: %+v", detail)
 	}
 }
 
