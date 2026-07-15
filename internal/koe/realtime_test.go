@@ -157,8 +157,15 @@ func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 	disp := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	cap := &captureSender{}
 	h := newEventHandler(disp, state, nil, cap.send)
+	completed := make(chan struct{}, 1)
+	h.onTaskCompleted = func() { completed <- struct{}{} }
 
 	h.handleFunctionCall(context.Background(), "call-1", "do_task", []byte(`{"task":"remind me"}`))
+	select {
+	case <-completed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("successful do_task did not fire deterministic task-complete event")
+	}
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {

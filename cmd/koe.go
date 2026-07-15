@@ -1112,6 +1112,14 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	// body (nil for mac / no bridge socket). Assigned after ctrl is built; captured by
 	// newSessionState (express handler) + connectWith (express tool + response reset).
 	var motionCtrl *koe.MotionController
+	emitVoiceState := func(state string) {
+		if ctrl != nil {
+			ctrl.EmitVoiceState(state)
+		}
+		if motionCtrl != nil {
+			motionCtrl.ObserveVoiceState(state)
+		}
+	}
 	// endCall is forward-declared so the connect closure can pass it as ConnectOptions.
 	// OnEndCall (the end_call voice tool hook) — it is assigned further down, next to
 	// startCall/interruptCall, and read only at call time.
@@ -1222,7 +1230,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			log.Printf("koe[timing]: call ready in %dms warm_session=true", time.Since(callStarted).Milliseconds())
 		}
 		ctrl.EmitCallState("on_call")
-		ctrl.EmitVoiceState("listening")
+		emitVoiceState("listening")
 		// Sound the "ready" earcon once per call (async — the speaking gate mutes
 		// the mic for its duration, so it can't self-trigger the server VAD; see
 		// koe.PlayReadyEarcon). readyEmitted above already guarantees single-fire.
@@ -1333,7 +1341,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			if wirelessLazy {
 				sessionWanted = false
 			}
-			ctrl.EmitVoiceState("idle")
+			emitVoiceState("idle")
 			ctrl.EmitCallState("ended")
 			conn, cancel, audio := closeSessionLocked(true)
 			if shouldHaveSessionLocked() {
@@ -1356,7 +1364,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			}
 			callStarted = time.Time{}
 			readyEmitted = false
-			ctrl.EmitVoiceState("idle")
+			emitVoiceState("idle")
 			ctrl.EmitCallState("ended")
 		}
 	}
@@ -1415,7 +1423,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			}
 			onVoiceState := func(s string) {
 				if isActive() {
-					ctrl.EmitVoiceState(s)
+					emitVoiceState(s)
 				}
 			}
 			onVoiceLevel := func(s string, level float64) {
@@ -1451,10 +1459,16 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			var expressIntents []string
 			var onResponseStarted func()
 			var onUserTranscript func(string)
+			var onTaskCompleted func()
 			if motionCtrl != nil {
 				expressIntents = koe.ExpressIntents()
 				onResponseStarted = motionCtrl.NewResponse
 				onUserTranscript = motionCtrl.ObserveUserTranscript
+				onTaskCompleted = func() {
+					if isActive() {
+						motionCtrl.TriggerTaskComplete()
+					}
+				}
 			}
 			connectOpts := koe.ConnectOptions{
 				OnVoiceState:  onVoiceState,
@@ -1475,6 +1489,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				CameraEnabled:     wirelessLazy && cfg.carrier.HasCap(koe.CapHasCamera),
 				OnResponseStarted: onResponseStarted,
 				OnUserTranscript:  onUserTranscript,
+				OnTaskCompleted:   onTaskCompleted,
 			}
 			persona := desktopSessionPersona(*personaHolder.Load(), reason)
 			conn, provider, cerr := connector.connect(sessionCtx, audio, persona, state, disp, connectOpts)
@@ -1530,7 +1545,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}
 		if err := startSessionAudioLocked("call_start"); err != nil {
 			log.Printf("koe: audio start failed: %v", err)
-			ctrl.EmitVoiceState("idle")
+			emitVoiceState("idle")
 			ctrl.EmitCallState("ended")
 			if wirelessLazy {
 				sessionWanted = false
@@ -1565,7 +1580,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			sessionWanted = false
 		}
 		conn, cancel, audio := closeSessionLocked(true)
-		ctrl.EmitVoiceState("idle")
+		emitVoiceState("idle")
 		ctrl.EmitCallState("ended")
 		if shouldHaveSessionLocked() {
 			ensureWarmSessionLocked("post_call")
@@ -1764,7 +1779,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	// IDLE gaze gate is disabled: without sustained DOA evidence Linux capture
 	// fails closed while Kocoro speaks, preventing residual XVF echo from cancelling
 	// its own response.
-	if wirelessLazy && (gazeCfg.Enabled || cfg.bargeIn) {
+	if wirelessLazy && (gazeCfg.Enabled || cfg.bargeIn || motionCtrl != nil) {
 		perception, perr := koe.NewPerceptionClient(cfg.carrier.ReachyDaemonURL)
 		gazeGate, gerr := koe.NewGazeGate(gazeCfg)
 		bargeGate := koe.NewBargePerceptionGate()
@@ -1784,6 +1799,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 						}
 					}()
 					for snapshot := range stream {
+						if motionCtrl != nil {
+							motionCtrl.ObservePerception(snapshot)
+						}
 						sessMu.Lock()
 						prepared := sessionWanted && sessionReady && curAudioStarted && curConn != nil
 						active := callActive

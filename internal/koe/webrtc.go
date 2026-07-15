@@ -833,6 +833,10 @@ type ConnectOptions struct {
 	// deterministic expression policy. The body controller uses it only to grant or
 	// clear a bounded explicit-dance authorization; it does not retain the text.
 	OnUserTranscript func(string)
+	// OnTaskCompleted (nil-safe) fires after a successful do_task result is accepted
+	// for this live conversation. The body controller maps it to the deterministic
+	// event lane; no model tool call is involved.
+	OnTaskCompleted func()
 }
 
 // defaultSessionConfigTimeoutMS bounds how long Connect waits for OpenAI to ack our
@@ -975,6 +979,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	h.toolLoop.setLazyBind(provider == ProviderQwen)
 	h.onResponseStarted = opts.OnResponseStarted
 	h.onUserTranscript = opts.OnUserTranscript
+	h.onTaskCompleted = opts.OnTaskCompleted
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
 	h.language = opts.Language

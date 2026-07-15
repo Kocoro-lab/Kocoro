@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -27,7 +28,13 @@ type fakeBridge struct {
 	mu      sync.Mutex
 	writeMu sync.Mutex
 	plays   []string
+	rpcs    []fakeBridgeRPC
 	conns   []net.Conn
+}
+
+type fakeBridgeRPC struct {
+	method string
+	params json.RawMessage
 }
 
 func newFakeBridge(t *testing.T, moves []string) *fakeBridge {
@@ -103,6 +110,9 @@ func (fb *fakeBridge) handle(conn net.Conn) {
 		}
 		var rq reachy.RPCRequest
 		_ = json.Unmarshal(f.Payload, &rq)
+		fb.mu.Lock()
+		fb.rpcs = append(fb.rpcs, fakeBridgeRPC{method: rq.Method, params: append(json.RawMessage(nil), rq.Params...)})
+		fb.mu.Unlock()
 		if rq.Method == reachy.MethodPlayMove {
 			var p struct {
 				Name string `json:"name"`
@@ -116,6 +126,34 @@ func (fb *fakeBridge) handle(conn net.Conn) {
 			_ = fb.writeFrame(conn, reachy.FrameRPCResult, reachy.RPCResult{RequestID: rq.RequestID, OK: true, Result: json.RawMessage(`{}`)})
 		}
 	}
+}
+
+func (fb *fakeBridge) rpcParams(method string) []json.RawMessage {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	var out []json.RawMessage
+	for _, rpc := range fb.rpcs {
+		if rpc.method == method {
+			out = append(out, append(json.RawMessage(nil), rpc.params...))
+		}
+	}
+	return out
+}
+
+func (fb *fakeBridge) rpcSequence(methods ...string) []string {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	wanted := make(map[string]bool, len(methods))
+	for _, method := range methods {
+		wanted[method] = true
+	}
+	var out []string
+	for _, rpc := range fb.rpcs {
+		if wanted[rpc.method] {
+			out = append(out, rpc.method)
+		}
+	}
+	return out
 }
 
 func (fb *fakeBridge) lastPlay() string {
@@ -243,6 +281,133 @@ func TestMotionControllerDanceWaitsForLateTranscript(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("dance did not resume after late transcript authorization")
+	}
+}
+
+func TestMotionControllerVoiceStateDrivesListeningReflex(t *testing.T) {
+	fb := newFakeBridge(t, []string{"success1"})
+	defer fb.close()
+	mc := NewMotionController(fb.path, ActivityStandard, nil)
+	mc.pollInterval = 15 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mc.Run(ctx)
+	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+
+	mc.ObserveVoiceState("listening")
+	waitForKMC(t, 2*time.Second, func() bool {
+		params := fb.rpcParams(reachy.MethodSetListen)
+		if len(params) == 0 {
+			return false
+		}
+		var got struct {
+			On bool `json:"on"`
+		}
+		_ = json.Unmarshal(params[len(params)-1], &got)
+		return got.On
+	})
+
+	mc.ObserveVoiceState("speaking")
+	waitForKMC(t, 2*time.Second, func() bool {
+		params := fb.rpcParams(reachy.MethodSetListen)
+		if len(params) < 2 {
+			return false
+		}
+		var got struct {
+			On bool `json:"on"`
+		}
+		_ = json.Unmarshal(params[len(params)-1], &got)
+		return !got.On
+	})
+}
+
+func TestMotionControllerDOAReflectionRequiresSustainedSpeechWithoutFace(t *testing.T) {
+	fb := newFakeBridge(t, []string{"success1"})
+	defer fb.close()
+	mc := NewMotionController(fb.path, ActivityStandard, nil)
+	mc.pollInterval = 15 * time.Millisecond
+	mc.doaHitsRequired = 3
+	mc.doaCooldown = 0
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mc.Run(ctx)
+	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+
+	now := time.Unix(100, 0)
+	snapshot := PerceptionSnapshot{
+		ObservedAt: now,
+		Face:       FaceSample{Available: true, Fresh: true, Detected: false},
+		DOA:        DOASample{Available: true, Fresh: true, Angle: math.Pi / 4, SpeechDetected: true},
+	}
+	mc.ObservePerception(snapshot)
+	snapshot.ObservedAt = now.Add(100 * time.Millisecond)
+	mc.ObservePerception(snapshot)
+	if got := len(fb.rpcParams(reachy.MethodLookAt)); got != 0 {
+		t.Fatalf("DOA reflection fired before sustained threshold: %d", got)
+	}
+	snapshot.ObservedAt = now.Add(200 * time.Millisecond)
+	mc.ObservePerception(snapshot)
+	waitForKMC(t, 2*time.Second, func() bool { return len(fb.rpcParams(reachy.MethodLookAt)) == 1 })
+
+	var params struct {
+		World struct {
+			X float64 `json:"x"`
+			Y float64 `json:"y"`
+			Z float64 `json:"z"`
+		} `json:"world"`
+	}
+	_ = json.Unmarshal(fb.rpcParams(reachy.MethodLookAt)[0], &params)
+	if math.Abs(params.World.X-math.Sqrt(0.5)) > 1e-6 || math.Abs(params.World.Y-math.Sqrt(0.5)) > 1e-6 || params.World.Z != 0 {
+		t.Fatalf("look-at world target = %+v, want front-left unit direction", params.World)
+	}
+}
+
+func TestMotionControllerFaceTrackingSuppressesDOAHeadWriter(t *testing.T) {
+	fb := newFakeBridge(t, []string{"success1"})
+	defer fb.close()
+	mc := NewMotionController(fb.path, ActivityStandard, nil)
+	mc.pollInterval = 15 * time.Millisecond
+	mc.doaHitsRequired = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mc.Run(ctx)
+	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+
+	mc.ObservePerception(PerceptionSnapshot{
+		ObservedAt: time.Now(),
+		Face:       FaceSample{Available: true, Fresh: true, Detected: true},
+		DOA:        DOASample{Available: true, Fresh: true, Angle: 0, SpeechDetected: true},
+	})
+	time.Sleep(75 * time.Millisecond)
+	if got := len(fb.rpcParams(reachy.MethodLookAt)); got != 0 {
+		t.Fatalf("tracked face must retain head ownership, got %d DOA look-at RPC(s)", got)
+	}
+}
+
+func TestMotionControllerTaskCompleteTurnsThenPlaysFixedSuccess(t *testing.T) {
+	fb := newFakeBridge(t, []string{"success1", "laughing1"})
+	defer fb.close()
+	mc := NewMotionController(fb.path, ActivityQuiet, nil) // quiet disables model express, not events
+	mc.pollInterval = 15 * time.Millisecond
+	now := time.Unix(200, 0)
+	mc.now = func() time.Time { return now }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mc.Run(ctx)
+	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+
+	// A tracked face prevents the immediate DOA reflex but still records who spoke;
+	// the event lane uses that angle after the task completes.
+	mc.ObservePerception(PerceptionSnapshot{
+		ObservedAt: now,
+		Face:       FaceSample{Available: true, Fresh: true, Detected: true},
+		DOA:        DOASample{Available: true, Fresh: true, Angle: math.Pi, SpeechDetected: true},
+	})
+	mc.TriggerTaskComplete()
+	waitForKMC(t, 2*time.Second, func() bool { return fb.lastPlay() == taskCompleteClip })
+	sequence := fb.rpcSequence(reachy.MethodLookAt, reachy.MethodPlayMove)
+	if len(sequence) < 2 || sequence[len(sequence)-2] != reachy.MethodLookAt || sequence[len(sequence)-1] != reachy.MethodPlayMove {
+		t.Fatalf("task-complete sequence = %v, want look_at then play_move", sequence)
 	}
 }
 

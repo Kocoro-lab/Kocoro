@@ -218,7 +218,8 @@ func (c *Client) SendFaceOffsets(dx, dy, dz, droll, dpitch, dyaw float64) error 
 	})
 }
 
-// PlayMove / StopMoves / SetListening / Wake / Sleep wrap Call for the common RPCs.
+// PlayMove / StopMoves / LookAtWorld / SetListening / Wake / Sleep wrap Call
+// for the common RPCs.
 func (c *Client) PlayMove(ctx context.Context, name string, preempt bool) error {
 	_, err := c.Call(ctx, MethodPlayMove, map[string]any{"name": name, "preempt": preempt})
 	return err
@@ -226,6 +227,13 @@ func (c *Client) PlayMove(ctx context.Context, name string, preempt bool) error 
 
 func (c *Client) StopMoves(ctx context.Context) error {
 	_, err := c.Call(ctx, MethodStopMoves, map[string]any{})
+	return err
+}
+
+func (c *Client) LookAtWorld(ctx context.Context, x, y, z float64) error {
+	_, err := c.Call(ctx, MethodLookAt, map[string]any{
+		"world": map[string]float64{"x": x, "y": y, "z": z},
+	})
 	return err
 }
 

@@ -58,6 +58,9 @@ type eventHandler struct {
 	// onUserTranscript (nil-safe) feeds only the deterministic body-expression
 	// authorization policy. The callback stores no transcript; nil on Mac/no body.
 	onUserTranscript func(string)
+	// onTaskCompleted (nil-safe) drives the event expression lane after an accepted
+	// successful do_task result. It is deliberately separate from express/model.
+	onTaskCompleted func()
 	// curState holds the last emitted voice state (string) so the D3w level pump
 	// knows whether to report input (listening) or output (speaking) RMS.
 	curState atomic.Value
@@ -2796,6 +2799,9 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 			// part to the Realtime connection that happened to start the task.
 			userSpokeSinceLastDoTask := h.inputCommitSeq.Load() > h.lastDoTaskCommitSeq.Load()
 			if koeEnvBool("KOE_RESULT_DELIVERY", true) {
+				if r.Status == "ok" && h.onTaskCompleted != nil {
+					h.onTaskCompleted()
+				}
 				enqueued := h.resultMailbox.EnqueueTaskResult(resultTicket, r, userSpokeSinceLastDoTask)
 				if eventLogEnabled() {
 					log.Printf("koe[tool]: output call_id=%q status=%s mailbox_id=%d resumptive=%t output=%s",
@@ -2824,6 +2830,9 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 				suppressedAsStale = false
 			}
 			if voice {
+				if legacyResult.Status == "ok" && h.onTaskCompleted != nil {
+					h.onTaskCompleted()
+				}
 				h.requestResponseForSpeech(legacySpeech)
 				return
 			}
