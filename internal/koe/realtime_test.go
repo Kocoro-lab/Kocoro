@@ -1259,6 +1259,37 @@ func TestTranscriptCompletedFeedsExpressionPolicy(t *testing.T) {
 	}
 }
 
+func TestSuccessfulDanceIsPhysicalOnlyWhileOtherExpressContinues(t *testing.T) {
+	newHandler := func(result ExpressResult) (*eventHandler, *captureSender) {
+		state := NewCallState("burst-express-followup", "")
+		disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+		disp.SetExpressHandler(func(context.Context, string) ExpressResult { return result })
+		cap := &captureSender{}
+		return newEventHandler(disp, state, nil, cap.send), cap
+	}
+
+	h, cap := newHandler(ExpressResult{Expressed: true, Clip: "dance1"})
+	h.handleFunctionCall(context.Background(), "dance-call", "express", []byte(`{"intent":"dance"}`))
+	if got := cap.countType("conversation.item.create"); got != 1 {
+		t.Fatalf("successful dance function outputs = %d, want 1", got)
+	}
+	if got := len(h.respReq); got != 0 {
+		t.Fatalf("successful dance queued %d spoken followups, want none", got)
+	}
+
+	h, _ = newHandler(ExpressResult{Expressed: true, Clip: "cheerful1"})
+	h.handleFunctionCall(context.Background(), "happy-call", "express", []byte(`{"intent":"happy"}`))
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("non-dance express queued %d followups, want normal continuation", got)
+	}
+
+	h, _ = newHandler(ExpressResult{Reason: "cooldown"})
+	h.handleFunctionCall(context.Background(), "skipped-call", "express", []byte(`{"intent":"dance"}`))
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("skipped dance queued %d followups, want normal continuation", got)
+	}
+}
+
 func TestLocalCommitFallbackCommitsWhenServerVADMisses(t *testing.T) {
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK", "1")
 	t.Setenv("KOE_LOCAL_COMMIT_FALLBACK_MS", "1")

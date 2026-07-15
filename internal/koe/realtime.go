@@ -2548,6 +2548,27 @@ func shouldVoiceDoTaskResult(r SayResult, userSpokeSinceLastDoTask bool) bool {
 	return !userSpokeSinceLastDoTask
 }
 
+// shouldSuppressDanceFollowup makes a successful, explicitly requested physical
+// dance the complete answer. The function_call_output still enters conversation
+// history, but no second response.create is sent for the model to narrate what the
+// user can already see. Other express intents and skipped dances keep the normal
+// fast-tool continuation so they cannot swallow a conversational answer.
+func shouldSuppressDanceFollowup(name string, args, output []byte) bool {
+	if name != "express" {
+		return false
+	}
+	var request struct {
+		Intent string `json:"intent"`
+	}
+	var result struct {
+		Status   string `json:"status"`
+		Delivery string `json:"delivery"`
+	}
+	return json.Unmarshal(args, &request) == nil &&
+		json.Unmarshal(output, &result) == nil &&
+		request.Intent == "dance" && result.Status == "expressed" && result.Delivery == "physical_silent"
+}
+
 func (h *eventHandler) requestEndCall(callID string) bool {
 	if h == nil || h.onEndCall == nil {
 		return false
@@ -2815,6 +2836,11 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 		log.Printf("koe[tool]: dispatch done name=%q call_id=%q output=%s", name, callID, logMaybeBytes(outBytes, 500))
 	}
 	var raw json.RawMessage = outBytes
+	if shouldSuppressDanceFollowup(name, args, outBytes) {
+		h.sendFunctionOutput(callID, raw)
+		log.Printf("koe[express]: intent=dance status=spoken_followup_suppressed")
+		return
+	}
 	h.sendRawForResponse(responseID, callID, raw)
 }
 

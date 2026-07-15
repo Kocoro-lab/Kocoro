@@ -936,8 +936,7 @@ func TestDispatchExpressExpressed(t *testing.T) {
 		t.Errorf("intent not forwarded: %q", gotIntent)
 	}
 	if !strings.Contains(string(out), `"status":"expressed"`) ||
-		!strings.Contains(string(out), `"delivery":"physical_silent"`) ||
-		!strings.Contains(string(out), "without describing the gesture") {
+		!strings.Contains(string(out), `"delivery":"physical_silent"`) {
 		t.Errorf("expected silent physical delivery guidance, got %s", out)
 	}
 }

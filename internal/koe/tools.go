@@ -429,8 +429,6 @@ func (d *Dispatcher) Dispatch(ctx context.Context, name string, argsJSON []byte)
 			return mustJSON(map[string]string{
 				"status":   "expressed",
 				"delivery": "physical_silent",
-				"follow_up": "Continue naturally without describing the gesture, asking the user to imagine it, " +
-					"or claiming anatomy the robot does not have.",
 			}), nil
 		}
 		return mustJSON(map[string]string{"status": "skipped"}), nil
