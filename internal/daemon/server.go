@@ -609,6 +609,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}/shares", s.handleSessionShares)
 	mux.HandleFunc("GET /sessions/{id}/share/tasks/{task_id}", s.handleSessionShareTask)
 	mux.HandleFunc("GET /sessions/search", s.handleSessionSearch)
+	mux.HandleFunc("GET /search", s.handleSearch)
 	mux.HandleFunc("GET /agents/{name}/sessions/{id}/suggestion", s.handleGetSuggestion)
 	mux.HandleFunc("POST /agents/{name}/sessions/{id}/suggestion/accept", s.handleAcceptSuggestion)
 	// Default-agent parallel routes — validateSuggestionRoute returns
@@ -2027,6 +2028,128 @@ func (s *Server) handleSessionSearch(w http.ResponseWriter, r *http.Request) {
 		results[i].Agent = agentName
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
+}
+
+// handleSearch is the session-grouped content search behind the desktop ⌘K
+// palette (capability search_v1). GET /search?q=&scope=all|default|<agent>&
+// limit=&offset= — returns one hit per matching session with a pre-segmented
+// highlighted snippet, match_count, and total/has_more paging. Title matching is
+// deliberately NOT done here: the client fuzzy-matches its in-memory session
+// list for instant title hits and merges these content hits in.
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.deps == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"results": []interface{}{}, "total": 0, "has_more": false})
+		return
+	}
+	query := r.URL.Query().Get("q")
+	if strings.TrimSpace(query) == "" {
+		http.Error(w, `{"error":"q parameter required"}`, http.StatusBadRequest)
+		return
+	}
+
+	limit := 30
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	offset := 0
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			offset = n
+		}
+	}
+
+	scope := r.URL.Query().Get("scope")
+	if scope == "" {
+		scope = "all"
+	}
+
+	var hits []session.SessionHit
+	if scope == "all" {
+		scopes, err := s.allSessionScopes()
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		// Best-effort across scopes: a single agent whose index failed to open
+		// must not sink the whole search. Remember the first error and only
+		// surface it if NO scope produced any hits — that way a genuine
+		// query-validation error (which fails identically in every scope, e.g.
+		// short term + boolean operator) is still reported, while a lone broken
+		// per-agent index is tolerated when other scopes matched.
+		var firstErr error
+		for _, sc := range scopes {
+			mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(sc))
+			scoped, err := mgr.SearchSessions(query)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			for i := range scoped {
+				scoped[i].Agent = sc
+			}
+			hits = append(hits, scoped...)
+		}
+		if len(hits) == 0 && firstErr != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, firstErr.Error()), http.StatusBadRequest)
+			return
+		}
+		// Per-scope indexes rank independently, so order the merged set by
+		// recency (a stable, comparable cross-scope signal); tie-break on
+		// session id so identical timestamps order deterministically.
+		sort.Slice(hits, func(i, j int) bool {
+			if !hits[i].UpdatedAt.Equal(hits[j].UpdatedAt) {
+				return hits[i].UpdatedAt.After(hits[j].UpdatedAt)
+			}
+			return hits[i].SessionID < hits[j].SessionID
+		})
+	} else {
+		agentName := r.URL.Query().Get("agent")
+		if scope != "default" {
+			agentName = scope
+		}
+		if agentName != "" {
+			if err := agents.ValidateAgentName(agentName); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+				return
+			}
+		}
+		mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
+		scoped, err := mgr.SearchSessions(query)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			return
+		}
+		for i := range scoped {
+			scoped[i].Agent = agentName
+		}
+		hits = scoped
+	}
+
+	total := len(hits)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	page := hits[offset:end]
+	if page == nil {
+		page = []session.SessionHit{}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"results":  page,
+		"total":    total,
+		"has_more": end < total,
+	})
 }
 
 // handleEditMessage truncates session history and re-runs the agent with new content.

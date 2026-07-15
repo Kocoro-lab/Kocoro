@@ -745,6 +745,14 @@ func (s *Store) Search(query string, limit int) ([]SearchResult, error) {
 	return s.index.Search(query, limit)
 }
 
+// SearchSessions runs a session-grouped content search (see Index.SearchSessions).
+func (s *Store) SearchSessions(query string) ([]SessionHit, error) {
+	if s.index == nil {
+		return nil, fmt.Errorf("search index not available")
+	}
+	return s.index.SearchSessions(query)
+}
+
 func (s *Store) Close() error {
 	if s.index != nil {
 		return s.index.Close()
