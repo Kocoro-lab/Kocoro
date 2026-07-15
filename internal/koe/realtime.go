@@ -493,7 +493,7 @@ func (h *eventHandler) stopOutput(keepInput bool) {
 		_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
 	}
 	if keepInput && eventLogEnabled() {
-		log.Printf("koe[barge]: playback flushed in %dms server_cancel=%t", playbackFlush.Milliseconds(), serverOwnsBargeCancel)
+		log.Printf("koe[barge]: carrier flush signaled in %dms server_cancel=%t", playbackFlush.Milliseconds(), serverOwnsBargeCancel)
 	}
 	h.maybeRestoreUserMic()
 	h.emitVoiceState(h.voiceStateAfterSpeaking())
