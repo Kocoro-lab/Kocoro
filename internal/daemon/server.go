@@ -2030,6 +2030,17 @@ func (s *Server) handleSessionSearch(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
 }
 
+// searchErrStatus maps a SearchSessions error to an HTTP status: query-shape
+// problems (short term + boolean operator, unparseable FTS) are the caller's
+// fault (400); anything else — index unavailable, DB/scan failure — is a
+// server-side condition (500).
+func searchErrStatus(err error) int {
+	if err != nil && strings.HasPrefix(err.Error(), "invalid search query") {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
 // handleSearch is the session-grouped content search behind the desktop ⌘K
 // palette (capability search_v1). GET /search?q=&scope=all|default|<agent>&
 // limit=&offset= — returns one hit per matching session with a pre-segmented
@@ -2098,7 +2109,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			hits = append(hits, scoped...)
 		}
 		if len(hits) == 0 && firstErr != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, firstErr.Error()), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, firstErr.Error()), searchErrStatus(firstErr))
 			return
 		}
 		// Per-scope indexes rank independently, so order the merged set by
@@ -2111,7 +2122,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			return hits[i].SessionID < hits[j].SessionID
 		})
 	} else {
-		agentName := r.URL.Query().Get("agent")
+		// `scope` is authoritative: "default" targets the default agent, any
+		// other value is the agent slug. (No separate ?agent= param — it only
+		// created ambiguity with scope.)
+		agentName := ""
 		if scope != "default" {
 			agentName = scope
 		}
@@ -2124,7 +2138,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
 		scoped, err := mgr.SearchSessions(query)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), searchErrStatus(err))
 			return
 		}
 		for i := range scoped {

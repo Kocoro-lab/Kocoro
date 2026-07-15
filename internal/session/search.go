@@ -133,6 +133,10 @@ func (idx *Index) SearchSessions(query string) ([]SessionHit, error) {
 		}
 	}
 
+	// Terms to highlight in snippets: the query words minus FTS operators, so a
+	// query like "cat OR dog" doesn't <mark> a literal "OR"/"and" in the body.
+	hlTerms := highlightTerms(terms)
+
 	// Group by session, preserving the query's best-first row order.
 	order := make([]string, 0, len(rows))
 	byID := make(map[string]*SessionHit, len(rows))
@@ -151,7 +155,7 @@ func (idx *Index) SearchSessions(query string) ([]SessionHit, error) {
 			UpdatedAt: r.updated,
 			MsgIndex:  r.msgIndex,
 			Role:      r.role,
-			Snippet:   buildSnippetSegs(r.content, terms),
+			Snippet:   buildSnippetSegs(r.content, hlTerms),
 		}
 	}
 	hits := make([]SessionHit, 0, len(order))
@@ -297,6 +301,23 @@ func buildSnippetSegs(content string, terms []string) []SnippetSeg {
 		segs = append(segs, SnippetSeg{Text: "…"})
 	}
 	return segs
+}
+
+// highlightTerms strips FTS5 operator tokens (AND/OR/NOT/NEAR) and wildcard
+// markers from the query terms so snippet highlighting doesn't <mark> a literal
+// operator word that happens to appear in the body. Matching already ran on the
+// full query; this only affects which substrings are visually highlighted.
+func highlightTerms(terms []string) []string {
+	out := make([]string, 0, len(terms))
+	for _, t := range terms {
+		if t == "AND" || t == "OR" || t == "NOT" || strings.HasPrefix(t, "NEAR(") {
+			continue
+		}
+		if t = strings.Trim(t, "*"); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // runeIndexOf returns the index in hay of the first occurrence of needle at or
