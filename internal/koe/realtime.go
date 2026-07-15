@@ -469,18 +469,31 @@ func (h *eventHandler) stopOutput(keepInput bool) {
 	h.outputBufferActive.Store(false)
 	h.respBusy.Store(false)
 	h.clearActiveResponseID("")
+	var playbackFlush time.Duration
 	if h.audio != nil {
 		h.audio.SetSpeaking(false)
+		flushStarted := time.Now()
 		h.audio.InterruptPlayback()
+		playbackFlush = time.Since(flushStarted)
 	}
 	if !keepInput {
 		_ = h.sendFn(map[string]any{"type": "input_audio_buffer.clear"})
 	}
-	if hadResponse {
+	// With server interrupt_response=true, the speech_started event means Realtime
+	// has already accepted responsibility for cancelling this response. Sending a
+	// second response.cancel races that automatic cancellation and produces the
+	// noisy response_cancel_not_active error observed on the first Wireless E2E.
+	// Keep the explicit cancel for /call/interrupt and for power-user configurations
+	// that open the local barge gate without server-side interruption.
+	serverOwnsBargeCancel := keepInput && koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
+	if hadResponse && !serverOwnsBargeCancel {
 		_ = h.sendFn(map[string]any{"type": "response.cancel"})
 	}
 	if hadOutput && h.provider != string(ProviderQwen) {
 		_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
+	}
+	if keepInput && eventLogEnabled() {
+		log.Printf("koe[barge]: playback flushed in %dms server_cancel=%t", playbackFlush.Milliseconds(), serverOwnsBargeCancel)
 	}
 	h.maybeRestoreUserMic()
 	h.emitVoiceState(h.voiceStateAfterSpeaking())

@@ -234,12 +234,12 @@ func normalizeAudioDeviceName(device string) string {
 	return strings.TrimSpace(b.String())
 }
 
-func applyAudioProcessing(audio *koe.AudioIO, cfg koeConfig, fullDuplexAEC bool) (audioProcessingDecision, error) {
+func applyAudioProcessing(audio *koe.AudioIO, cfg koeConfig, useVPIO bool) (audioProcessingDecision, error) {
 	decision, err := resolveAudioProcessingMode(cfg.audioProcessing, cfg.micDevice, cfg.speakerDevice)
 	if err != nil {
 		return audioProcessingDecision{}, err
 	}
-	if !fullDuplexAEC {
+	if !useVPIO {
 		if cfg.audioProcessing != "" && cfg.audioProcessing != audioProcessingAuto {
 			log.Printf("koe[audio]: audio_processing=%s ignored because aec=%q does not use VPIO", decision.Requested, cfg.aec)
 		}
@@ -942,7 +942,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		startAudio = func() error { return audio.StartFile(inPCM, cfg.audioOut, cfg.audioPeriod) }
 		fullDuplexAEC = false
 	}
-	if _, err := applyAudioProcessing(audio, cfg, fullDuplexAEC); err != nil {
+	if _, err := applyAudioProcessing(audio, cfg, useVPIO); err != nil {
 		return err
 	}
 	if !fileMode && useVPIO {
@@ -1318,7 +1318,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}
 		audio.SetPreferredDevices(cfg.micDevice, cfg.speakerDevice)
 		audio.SetAudioSocket(cfg.audioSocket) // Wireless resident mode: same required UDS as standalone
-		if _, err := applyAudioProcessing(audio, cfg, fullDuplexAEC); err != nil {
+		if _, err := applyAudioProcessing(audio, cfg, useVPIO); err != nil {
 			failActiveCallLocked("audio processing config failed", err)
 			scheduleWarmRetry("audio_processing_retry")
 			return

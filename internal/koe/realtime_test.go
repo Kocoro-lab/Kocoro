@@ -761,6 +761,33 @@ func TestBargeInTruncatesOutputButKeepsInput(t *testing.T) {
 	}
 }
 
+func TestBargeInDoesNotDoubleCancelServerOwnedInterruption(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, audio, cap.send)
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+
+	sent := cap.types()
+	if sentContains(sent, "response.cancel") {
+		t.Fatalf("server-owned barge-in must not race automatic cancellation; sent %v", sent)
+	}
+	if !sentContains(sent, "output_audio_buffer.clear") {
+		t.Fatalf("local unheard output must still be truncated; sent %v", sent)
+	}
+}
+
 func TestHandleEventKeepsThinkingWhileAsyncTaskPending(t *testing.T) {
 	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
 	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "1")
