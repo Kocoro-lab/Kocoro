@@ -327,6 +327,11 @@ func (m *Manager) Search(query string, limit int) ([]SearchResult, error) {
 	return m.store.Search(query, limit)
 }
 
+// SearchSessions runs a session-grouped content search (see Index.SearchSessions).
+func (m *Manager) SearchSessions(query string) ([]SessionHit, error) {
+	return m.store.SearchSessions(query)
+}
+
 // OnClose registers a function to be called when the manager is closed.
 // Used for manager-wide cleanup that is not tied to a specific session.
 func (m *Manager) OnClose(fn func()) {

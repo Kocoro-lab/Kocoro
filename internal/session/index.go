@@ -27,7 +27,10 @@ import (
 //	3 — adds source column to sessions table for sync.exclude_sources.
 //	4 — adds route_key column for daemon route resume after restart.
 //	5 — adds pinned + favorite columns for session pin/star UI.
-const indexSchemaVersion = 5
+//	6 — index clean body text only (user questions + final assistant replies),
+//	    excluding tool_result/tool_use dumps; forces a rebuild that drops the old
+//	    tool-output content and shrinks the index. See searchableMessageText.
+const indexSchemaVersion = 6
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -236,7 +239,10 @@ func (idx *Index) UpsertSession(sess *Session) error {
 		if i < len(sess.MessageMeta) && sess.MessageMeta[i].SystemInjected {
 			continue
 		}
-		text := msg.Content.Text()
+		// Index only clean conversation text (user questions + final assistant
+		// replies), never tool_result/tool_use dumps — keeps search results
+		// relevant and the FTS index small. See searchableMessageText.
+		text := searchableMessageText(msg)
 		if text == "" {
 			continue
 		}
@@ -553,6 +559,12 @@ func (idx *Index) Rebuild(store *Store) error {
 		}
 	}
 	idx.needsRebuild = false
+	// Reclaim pages freed by dropping the old (pre-v6, tool-dump-laden) content
+	// and by repeated schema migrations. Best-effort: VACUUM can't run in a tx
+	// and needs no other open work, which holds here (single-conn, post-rebuild).
+	if _, err := idx.db.Exec(`VACUUM`); err != nil {
+		log.Printf("session.Rebuild: VACUUM failed (non-fatal): %v", err)
+	}
 	return nil
 }
 

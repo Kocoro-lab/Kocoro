@@ -188,6 +188,13 @@ const (
 	// token; old daemons ignore the param (return the full list incl. installed),
 	// so without the token Desktop hides the toggle rather than silently no-oping.
 	CapClawHubExcludeInstalled = "clawhub_exclude_installed"
+	// CapSearchV1 — daemon exposes GET /search: a session-grouped content search
+	// over clean message text (tool_result/tool_use dumps excluded), returning
+	// pre-segmented highlighted snippets + match counts + limit/offset paging +
+	// total/has_more, scoped default|<agent>|all. Desktop gates its ⌘K content
+	// search on this token; an old daemon omits it, so Desktop falls back to
+	// title-only (in-memory) search rather than calling a 404 route.
+	CapSearchV1 = "search_v1"
 )
 
 var Capabilities = []string{
@@ -214,6 +221,7 @@ var Capabilities = []string{
 	CapRemoteControlV1,
 	CapRemoteSessionTimelineV1,
 	CapClawHubExcludeInstalled,
+	CapSearchV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
