@@ -41,6 +41,7 @@ type koeConfig struct {
 	audioProcessing string             // auto | mac_voice | clean_device; controls whether VPIO applies or bypasses Apple's voice processing
 	micDevice       string             // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
 	speakerDevice   string             // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
+	audioSocket     string             // --audio-socket: carrier PCM UDS path (Wireless; the linux carrier audio backend dials it; ignored on darwin)
 	bargeIn         bool               // --barge-in: allow interruption while Kocoro speaks (vpio backend only)
 	bargeInSet      bool               // whether --barge-in was explicit; false must override an inherited debug env
 	carrier         koe.CarrierProfile // resolved carrier identity (--carrier/--caps/--bridge-socket/--reachy-daemon-url); immutable for the process lifetime (§18)
@@ -309,6 +310,7 @@ var koeCmd = &cobra.Command{
 		}
 		cfg.micDevice, _ = cmd.Flags().GetString("mic-device")
 		cfg.speakerDevice, _ = cmd.Flags().GetString("speaker-device")
+		cfg.audioSocket, _ = cmd.Flags().GetString("audio-socket")
 		cfg.bargeIn, _ = cmd.Flags().GetBool("barge-in")
 		cfg.bargeInSet = cmd.Flags().Changed("barge-in")
 		cfg.sayText, _ = cmd.Flags().GetString("say")
@@ -376,6 +378,7 @@ func init() {
 	koeCmd.Flags().String("audio-processing", "", "voice processing: auto (default) | mac_voice | clean_device")
 	koeCmd.Flags().String("mic-device", "", "CoreAudio input device UID (empty = system default; vpio backend only)")
 	koeCmd.Flags().String("speaker-device", "", "CoreAudio output device UID (empty = system default; vpio backend only)")
+	koeCmd.Flags().String("audio-socket", "", "carrier PCM UDS path (Wireless; the linux carrier audio backend dials it; ignored on darwin)")
 	koeCmd.Flags().Bool("barge-in", false, "allow native-S2S interruption while Kocoro speaks (reversible pause; vpio backend only)")
 	koeCmd.Flags().String("say", "", "debug: synthesize this text as the mic input (macOS say) — headless file mode")
 	koeCmd.Flags().String("audio-in", "", "debug: WAV file to feed as the mic input — headless file mode")
@@ -897,6 +900,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		return fmt.Errorf("audio init: %v", err)
 	}
 	audio.SetPreferredDevices(cfg.micDevice, cfg.speakerDevice)
+	audio.SetAudioSocket(cfg.audioSocket) // Wireless: carrier UDS path (no-op on darwin)
 	startAudio := audio.Start
 	fullDuplexAEC := cfg.aec == "vpio"
 	// Headless debug mode (workstream A): --say/--audio-in replace the mic+speaker

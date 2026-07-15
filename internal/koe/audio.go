@@ -211,6 +211,12 @@ func (a *AudioIO) SetPreferredDevices(micUID, speakerUID string) {
 	a.preferredSpeakerUID = speakerUID
 }
 
+// SetAudioSocket is a no-op on darwin: the CoreAudio backend uses the local mic
+// and speaker, not the carrier UDS. It exists so the platform-neutral cmd/koe.go
+// can wire --audio-socket unconditionally; the linux carrier backend has the real
+// implementation (audio_linux.go).
+func (a *AudioIO) SetAudioSocket(string) {}
+
 // captureSuppressed is the capture-path gate: speaking gate OR user mic off.
 // Both resolve to silent keepalive frames downstream.
 func (a *AudioIO) captureSuppressed() bool {
