@@ -219,6 +219,13 @@ func (a *AudioIO) SetPreferredDevices(micUID, speakerUID string) {
 // implementation (audio_linux.go).
 func (a *AudioIO) SetAudioSocket(string) {}
 
+// ProbeAudioCarrier is Linux/Wireless-only. The Darwin stub keeps cmd/koe.go
+// cross-platform and fails loud if a Wireless argv is accidentally launched on
+// a Mac build.
+func ProbeAudioCarrier(string) error {
+	return fmt.Errorf("koe[audio]: carrier UDS startup probe is linux-only")
+}
+
 // captureSuppressed is the capture-path gate: speaking gate OR user mic off.
 // Both resolve to silent keepalive frames downstream.
 func (a *AudioIO) captureSuppressed() bool {

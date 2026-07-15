@@ -17,16 +17,83 @@ type carrierStatusWant struct {
 	Carrier string   `json:"carrier"`
 	Caps    []string `json:"caps"`
 	Audio   struct {
-		Backend    string `json:"backend"`
-		MicUID     string `json:"mic_uid"`
-		SpeakerUID string `json:"speaker_uid"`
-		Bound      bool   `json:"bound"`
+		Backend          string `json:"backend"`
+		MicUID           string `json:"mic_uid"`
+		SpeakerUID       string `json:"speaker_uid"`
+		Bound            bool   `json:"bound"`
+		Transport        string `json:"transport"`
+		State            string `json:"state"`
+		WireRateHz       int    `json:"wire_rate_hz"`
+		SocketConfigured bool   `json:"socket_configured"`
 	} `json:"audio"`
 	Bridge struct {
-		State string `json:"state"`
+		State         string `json:"state"`
+		Proto         string `json:"proto"`
+		BridgeVersion string `json:"bridge_version"`
 	} `json:"bridge"`
-	Model string `json:"model"`
-	Agent string `json:"agent"`
+	Model         string `json:"model"`
+	Agent         string `json:"agent"`
+	CallState     string `json:"call_state"`
+	RealtimeState string `json:"realtime_state"`
+}
+
+func TestCarrierStatusEndpoint_ReachyWirelessRuntimeContract(t *testing.T) {
+	s := NewControlServer(nil, nil, nil)
+	prof, err := ParseCarrierProfile(CarrierInputs{
+		Carrier: CarrierReachyWireless,
+		Model:   "gpt-realtime-2.1-mini",
+	})
+	if err != nil {
+		t.Fatalf("build profile: %v", err)
+	}
+	s.SetCarrierProfile(prof, func() bool { return true })
+	s.SetWirelessAudioStatus(true, true)
+	s.SetBridgeDetailsProvider(func() (string, string) { return "1.0", "0.1.0" })
+	s.EmitBridgeStatus("connected")
+	s.EmitCallState("connecting")
+	s.SetRealtimeState("connecting")
+
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/carrier/status")
+	if err != nil {
+		t.Fatalf("GET /carrier/status: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var got carrierStatusWant
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Audio.Backend != "carrier_uds" || got.Audio.Transport != "uds" {
+		t.Errorf("wireless audio transport = backend %q transport %q", got.Audio.Backend, got.Audio.Transport)
+	}
+	if got.Audio.Bound {
+		t.Error("wireless audio.bound must retain CoreAudio UID semantics and stay false")
+	}
+	if got.Audio.State != "connected" || got.Audio.WireRateHz != 16000 || !got.Audio.SocketConfigured {
+		t.Errorf("wireless audio status = %+v", got.Audio)
+	}
+	if got.Bridge.Proto != "1.0" || got.Bridge.BridgeVersion != "0.1.0" {
+		t.Errorf("bridge hello details = %+v", got.Bridge)
+	}
+	if got.CallState != "connecting" || got.RealtimeState != "connecting" {
+		t.Errorf("runtime state = call %q realtime %q", got.CallState, got.RealtimeState)
+	}
+
+	s.EmitCallState("ended")
+	s.SetRealtimeState("disconnected")
+	resp2, err := http.Get(srv.URL + "/carrier/status")
+	if err != nil {
+		t.Fatalf("GET idle /carrier/status: %v", err)
+	}
+	defer resp2.Body.Close()
+	if err := json.NewDecoder(resp2.Body).Decode(&got); err != nil {
+		t.Fatalf("decode idle: %v", err)
+	}
+	if got.CallState != "idle" || got.RealtimeState != "disconnected" {
+		t.Errorf("idle runtime state = call %q realtime %q", got.CallState, got.RealtimeState)
+	}
 }
 
 func TestCarrierStatusEndpoint_ReachyLite(t *testing.T) {

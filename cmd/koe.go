@@ -1022,14 +1022,22 @@ func closeDesktopSessionState(mailbox *koe.ResultMailbox, state *koe.CallState, 
 // runDesktopCall is the resident control-port loop. Mac/Lite keep the existing
 // warm Realtime session with call-scoped audio. Wireless is lazy: a manual start
 // or the local gaze gate prepares the session/audio, and idle uploads no room.
+var probeAudioCarrier = koe.ProbeAudioCarrier
+
 func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient,
 	connector *realtimeConnector, onUsage func(json.RawMessage)) error {
 
 	useVPIO := cfg.aec == "vpio"
 	fullDuplexAEC := fullDuplexAECForConfig(cfg)
 	wirelessLazy := cfg.carrier.Carrier == koe.CarrierReachyWireless
+	wirelessAudioVerified := false
 	gazeCfg := koe.DefaultGazeConfig()
 	if wirelessLazy {
+		if err := probeAudioCarrier(cfg.audioSocket); err != nil {
+			return fmt.Errorf("wireless audio carrier readiness: %w", err)
+		}
+		wirelessAudioVerified = true
+		log.Printf("koe[audio]: wireless carrier v0.2 startup hello verified; idle probe connection closed")
 		var err error
 		gazeCfg, err = koe.GazeConfigFromEnv()
 		if err != nil {
@@ -1189,6 +1197,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		curAudioStarted = false
 		warming = false
 		sessionReady = false
+		if ctrl != nil {
+			ctrl.SetRealtimeState("disconnected")
+		}
 		readyEmitted = false
 		return conn, cancel, audio
 	}
@@ -1327,6 +1338,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		started := time.Now()
 		warming = true
 		sessionReady = false
+		if ctrl != nil {
+			ctrl.SetRealtimeState("connecting")
+		}
 		readyEmitted = false
 		sessionSeq++
 		seq := sessionSeq
@@ -1436,6 +1450,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			}
 			curConn = conn
 			warming = false
+			ctrl.SetRealtimeState("connected")
 			emitReadyLocked()
 			sessMu.Unlock()
 		}()
@@ -1589,6 +1604,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	ctrl.SetCarrierProfile(carrierProfile, func() bool {
 		return carrierProfile.MicUID != "" && carrierProfile.SpeakerUID != ""
 	})
+	if carrierProfile.Carrier == koe.CarrierReachyWireless {
+		ctrl.SetWirelessAudioStatus(cfg.audioSocket != "", wirelessAudioVerified)
+	}
 	// Motion bridge (carrier with a body): a process-long client that plays express
 	// gestures and drives bridge_status. nil for mac / no bridge socket, so express
 	// stays unwired and the tool is never offered.
@@ -1598,6 +1616,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				ctrl.EmitBridgeStatus(s)
 			}
 		})
+		ctrl.SetBridgeDetailsProvider(motionCtrl.BridgeDetails)
 		go motionCtrl.Run(ctx)
 		log.Printf("koe[reachy]: motion bridge client starting (socket %s)", carrierProfile.BridgeSocket)
 	}

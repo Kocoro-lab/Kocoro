@@ -802,6 +802,14 @@ func TestRunDesktopCallBindsControlPortBeforeSlowAgentFetch(t *testing.T) {
 
 func TestRunDesktopCallWirelessDoesNotMintWhileIdle(t *testing.T) {
 	t.Setenv("KOE_GAZE_GATE", "false")
+	previousProbe := probeAudioCarrier
+	probeAudioCarrier = func(path string) error {
+		if path != "/tmp/test-wireless-audio.sock" {
+			return fmt.Errorf("unexpected audio probe path %q", path)
+		}
+		return nil
+	}
+	t.Cleanup(func() { probeAudioCarrier = previousProbe })
 	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/agents":
@@ -822,6 +830,7 @@ func TestRunDesktopCallWirelessDoesNotMintWhileIdle(t *testing.T) {
 		done <- runDesktopCall(ctx, koeConfig{
 			controlPort: port,
 			daemonURL:   daemon.URL,
+			audioSocket: "/tmp/test-wireless-audio.sock",
 			model:       "gpt-realtime-mini",
 			carrier: koe.CarrierProfile{
 				Carrier:         koe.CarrierReachyWireless,
@@ -841,13 +850,22 @@ func TestRunDesktopCallWirelessDoesNotMintWhileIdle(t *testing.T) {
 
 	base := "http://127.0.0.1:" + port
 	deadline := time.Now().Add(3 * time.Second)
+	var status map[string]any
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(base + "/carrier/status")
 		if err == nil {
+			_ = json.NewDecoder(resp.Body).Decode(&status)
 			resp.Body.Close()
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if status["call_state"] != "idle" || status["realtime_state"] != "disconnected" {
+		t.Fatalf("wireless idle status = call %v realtime %v", status["call_state"], status["realtime_state"])
+	}
+	audioStatus, _ := status["audio"].(map[string]any)
+	if audioStatus["state"] != "connected" {
+		t.Fatalf("wireless audio status = %v", audioStatus)
 	}
 	time.Sleep(100 * time.Millisecond)
 	if got := mintCalls.Load(); got != 0 {

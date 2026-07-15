@@ -58,20 +58,25 @@ type StartCallRequest struct {
 // ControlAppFunc seam: when the model calls control_app, the dispatcher's hook
 // calls EmitControlApp and Desktop performs the actual window action.
 type ControlServer struct {
-	mu          sync.Mutex
-	subscribers map[chan controlEvent]struct{}
-	onStart     func(StartCallRequest) // Desktop pressed talk: start a call
-	onEnd       func()                 // Desktop ended: tear the call down
-	onInterrupt func()                 // Desktop explicitly interrupted playback
-	onMic       func(off bool) error   // POST /call/mic (nil until SetMicHandler)
-	taskPending func() bool            // nil-safe snapshot providers, stamped on every voice_state
-	micOff      func() bool
-	token       string       // optional Bearer token for Desktop-owned requests
-	lastVoice   atomic.Value // string: last voice_state, replayed by ReemitVoiceState
-	lastBridge  atomic.Value // string: latest bridge_status, exposed by /carrier/status
+	mu           sync.Mutex
+	subscribers  map[chan controlEvent]struct{}
+	onStart      func(StartCallRequest) // Desktop pressed talk: start a call
+	onEnd        func()                 // Desktop ended: tear the call down
+	onInterrupt  func()                 // Desktop explicitly interrupted playback
+	onMic        func(off bool) error   // POST /call/mic (nil until SetMicHandler)
+	taskPending  func() bool            // nil-safe snapshot providers, stamped on every voice_state
+	micOff       func() bool
+	token        string       // optional Bearer token for Desktop-owned requests
+	lastVoice    atomic.Value // string: last voice_state, replayed by ReemitVoiceState
+	lastBridge   atomic.Value // string: latest bridge_status, exposed by /carrier/status
+	lastCall     atomic.Value // string: current call snapshot; ended normalizes back to idle
+	lastRealtime atomic.Value // string: disconnected | connecting | connected
 
-	carrier      *CarrierProfile // resolved carrier identity for GET /carrier/status (nil = not injected)
-	carrierBound func() bool     // reports audio.bound; nil → false
+	carrier                       *CarrierProfile // resolved carrier identity for GET /carrier/status (nil = not injected)
+	carrierBound                  func() bool     // reports audio.bound; nil → false
+	wirelessAudioSocketConfigured atomic.Bool
+	wirelessAudioVerified         atomic.Bool
+	bridgeDetails                 func() (proto, bridgeVersion string)
 }
 
 // NewControlServer wires the Desktop-driven start/end callbacks (either may be nil).
@@ -83,6 +88,8 @@ func NewControlServer(onStart func(StartCallRequest), onEnd func(), onInterrupt 
 		onInterrupt: onInterrupt,
 	}
 	s.lastBridge.Store(bridgeStateDisabled)
+	s.lastCall.Store("idle")
+	s.lastRealtime.Store("disconnected")
 	return s
 }
 
@@ -111,6 +118,25 @@ func (s *ControlServer) SetCarrierProfile(p CarrierProfile, audioBound func() bo
 	s.carrier = &p
 	s.carrierBound = audioBound
 }
+
+// SetWirelessAudioStatus records the startup carrier hello result without
+// retaining the probe connection. A verified=true snapshot means Koe completed
+// the v0.2 hello against the configured UDS during startup; it does not mean an
+// idle media session is being held open.
+func (s *ControlServer) SetWirelessAudioStatus(socketConfigured, verified bool) {
+	s.wirelessAudioSocketConfigured.Store(socketConfigured)
+	s.wirelessAudioVerified.Store(verified)
+}
+
+// SetBridgeDetailsProvider exposes the current motion hello metadata. The
+// provider is consulted only for a connected bridge snapshot.
+func (s *ControlServer) SetBridgeDetailsProvider(provider func() (proto, bridgeVersion string)) {
+	s.bridgeDetails = provider
+}
+
+// SetRealtimeState updates the runtime snapshot reported by /carrier/status.
+// Callers drive it from the actual mint/connect/close state machine.
+func (s *ControlServer) SetRealtimeState(state string) { s.lastRealtime.Store(state) }
 
 func (s *ControlServer) stampVoice(ev controlEvent) controlEvent {
 	if s.taskPending != nil && s.taskPending() {
@@ -279,6 +305,11 @@ func (s *ControlServer) EmitControlApp(action string) {
 
 // EmitCallState reports the call lifecycle to Desktop.
 func (s *ControlServer) EmitCallState(state string) {
+	snapshot := state
+	if state == "ended" {
+		snapshot = "idle"
+	}
+	s.lastCall.Store(snapshot)
 	s.broadcast(controlEvent{Type: "call_state", State: state})
 }
 
@@ -307,23 +338,31 @@ const bridgeStateDisabled = "disabled"
 // control-spec §3). Additive + field-presence-gated on the Desktop side: an old
 // Koe with no route 404s, which Desktop reads as "feature absent".
 type carrierStatusResponse struct {
-	Carrier string              `json:"carrier"`
-	Caps    []string            `json:"caps"`
-	Audio   carrierAudioStatus  `json:"audio"`
-	Bridge  carrierBridgeStatus `json:"bridge"`
-	Model   string              `json:"model"`
-	Agent   string              `json:"agent"`
+	Carrier       string              `json:"carrier"`
+	Caps          []string            `json:"caps"`
+	Audio         carrierAudioStatus  `json:"audio"`
+	Bridge        carrierBridgeStatus `json:"bridge"`
+	Model         string              `json:"model"`
+	Agent         string              `json:"agent"`
+	CallState     string              `json:"call_state,omitempty"`
+	RealtimeState string              `json:"realtime_state,omitempty"`
 }
 
 type carrierAudioStatus struct {
-	Backend    string `json:"backend"`
-	MicUID     string `json:"mic_uid"`
-	SpeakerUID string `json:"speaker_uid"`
-	Bound      bool   `json:"bound"`
+	Backend          string `json:"backend"`
+	MicUID           string `json:"mic_uid"`
+	SpeakerUID       string `json:"speaker_uid"`
+	Bound            bool   `json:"bound"`
+	Transport        string `json:"transport,omitempty"`
+	State            string `json:"state,omitempty"`
+	WireRateHz       int    `json:"wire_rate_hz,omitempty"`
+	SocketConfigured *bool  `json:"socket_configured,omitempty"`
 }
 
 type carrierBridgeStatus struct {
-	State string `json:"state"`
+	State         string `json:"state"`
+	Proto         string `json:"proto,omitempty"`
+	BridgeVersion string `json:"bridge_version,omitempty"`
 }
 
 func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
@@ -343,18 +382,48 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 	if state, ok := s.lastBridge.Load().(string); ok && state != "" {
 		bridgeState = state
 	}
+	audioStatus := carrierAudioStatus{
+		Backend:    p.AudioBackend,
+		MicUID:     p.MicUID,
+		SpeakerUID: p.SpeakerUID,
+		Bound:      bound,
+	}
+	bridgeStatus := carrierBridgeStatus{State: bridgeState}
+	callState := ""
+	realtimeState := ""
+	if p.Carrier == CarrierReachyWireless {
+		socketConfigured := s.wirelessAudioSocketConfigured.Load()
+		audioState := "unavailable"
+		if s.wirelessAudioVerified.Load() {
+			audioState = "connected"
+		}
+		audioStatus = carrierAudioStatus{
+			Backend:          "carrier_uds",
+			Bound:            false,
+			Transport:        "uds",
+			State:            audioState,
+			WireRateHz:       wirelessCarrierWireRate,
+			SocketConfigured: &socketConfigured,
+		}
+		if value, ok := s.lastCall.Load().(string); ok {
+			callState = value
+		}
+		if value, ok := s.lastRealtime.Load().(string); ok {
+			realtimeState = value
+		}
+	}
+	if bridgeState == bridgeStateConnected && s.bridgeDetails != nil {
+		bridgeStatus.Proto, bridgeStatus.BridgeVersion = s.bridgeDetails()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(carrierStatusResponse{
-		Carrier: p.Carrier,
-		Caps:    caps,
-		Audio: carrierAudioStatus{
-			Backend:    p.AudioBackend,
-			MicUID:     p.MicUID,
-			SpeakerUID: p.SpeakerUID,
-			Bound:      bound,
-		},
-		Bridge: carrierBridgeStatus{State: bridgeState},
-		Model:  p.Model,
-		Agent:  p.Agent,
+		Carrier:       p.Carrier,
+		Caps:          caps,
+		Audio:         audioStatus,
+		Bridge:        bridgeStatus,
+		Model:         p.Model,
+		Agent:         p.Agent,
+		CallState:     callState,
+		RealtimeState: realtimeState,
 	})
 }

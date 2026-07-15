@@ -29,6 +29,9 @@ const (
 const (
 	audioBackendVPIO = "vpio"
 	audioBackendGate = "gate"
+	// wirelessCarrierWireRate is shared by the cross-platform status contract
+	// and the Linux carrier codec implementation.
+	wirelessCarrierWireRate = 16000
 )
 
 // Pollen daemon read-plane defaults differ by topology: Lite runs the daemon on

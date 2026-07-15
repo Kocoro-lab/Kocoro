@@ -304,7 +304,7 @@ func speakerRingFramesFromEnv() (int, error) {
 // toCodecPCM; spk uplink down-rates the 48k codec audio to 16k in toCarrierPCM so
 // the carrier stays a thin no-DSP relay. audioSampleRate (48k, the Opus/OpenAI
 // path) is unchanged.
-const carrierWireRate = 16000
+const carrierWireRate = wirelessCarrierWireRate
 
 type helloMsg struct {
 	Type  string `json:"type"`
@@ -322,14 +322,9 @@ func (a *AudioIO) Start() error {
 	if a.socketPath == "" {
 		return fmt.Errorf("koe[audio]: no carrier socket (--audio-socket); wireless audio needs the carrier UDS")
 	}
-	conn, err := net.Dial("unixpacket", a.socketPath)
+	conn, err := dialAudioCarrier(a.socketPath)
 	if err != nil {
-		// SEQPACKET may be unavailable; fall back to stream framing (audiobridge
-		// WriteFrame/ReadFrame length-frame either way).
-		conn, err = net.Dial("unix", a.socketPath)
-		if err != nil {
-			return fmt.Errorf("koe[audio]: dial carrier %q: %w", a.socketPath, err)
-		}
+		return err
 	}
 	a.conn = conn
 	if err := a.handshake(); err != nil {
@@ -343,17 +338,53 @@ func (a *AudioIO) Start() error {
 	return nil
 }
 
+func dialAudioCarrier(path string) (net.Conn, error) {
+	conn, err := net.Dial("unixpacket", path)
+	if err == nil {
+		return conn, nil
+	}
+	// SEQPACKET may be unavailable; fall back to stream framing (audiobridge
+	// WriteFrame/ReadFrame length-frames either way).
+	conn, err = net.Dial("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("koe[audio]: dial carrier %q: %w", path, err)
+	}
+	return conn, nil
+}
+
+// ProbeAudioCarrier performs the same v0.2 hello as a real call, then closes the
+// socket. Wireless startup uses this as first-hand protocol evidence while
+// preserving the idle invariant: no audio-UDS connection remains open and no
+// Realtime session is minted merely because Koe is resident.
+func ProbeAudioCarrier(path string) error {
+	if path == "" {
+		return fmt.Errorf("koe[audio]: no carrier socket (--audio-socket); wireless audio needs the carrier UDS")
+	}
+	conn, err := dialAudioCarrier(path)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if err := handshakeAudioCarrier(conn); err != nil {
+		return fmt.Errorf("koe[audio]: startup probe: %w", err)
+	}
+	return nil
+}
+
 // handshake sends our hello and validates the carrier's, per §4.1 (fail-loud on a
 // proto mismatch — a future header v2 must not be silently misparsed).
 func (a *AudioIO) handshake() error {
+	return handshakeAudioCarrier(a.conn)
+}
+
+func handshakeAudioCarrier(conn net.Conn) error {
 	mine := helloMsg{Type: "hello", Proto: audioProto, Role: "koe"}
 	body, _ := json.Marshal(mine)
-	h := audiobridge.Header{Magic: audiobridge.MagicControl, Format: audiobridge.FormatS16LE, Channels: 1, NSamples: uint32(len(body)) / 2}
-	// control payload is opaque JSON bytes; encode its exact length via a raw write.
-	if err := a.sendControl(body); err != nil {
+	if err := writeControl(conn, body); err != nil {
 		return fmt.Errorf("koe[audio]: send hello: %w", err)
 	}
-	peer, err := readControl(a.conn)
+	peer, err := readControl(conn)
 	if err != nil {
 		return fmt.Errorf("koe[audio]: read carrier hello: %w", err)
 	}
@@ -364,7 +395,6 @@ func (a *AudioIO) handshake() error {
 	if got.Proto != audioProto {
 		return fmt.Errorf("koe[audio]: carrier proto %q != %q — closing", got.Proto, audioProto)
 	}
-	_ = h
 	return nil
 }
 

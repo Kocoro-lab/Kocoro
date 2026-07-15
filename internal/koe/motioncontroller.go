@@ -81,6 +81,15 @@ func NewMotionController(socketPath string, tier ActivityTier, onBridgeStatus fu
 // IsConnected reports whether the bridge handshake is live.
 func (mc *MotionController) IsConnected() bool { return mc.client.IsConnected() }
 
+// BridgeDetails returns metadata from the currently-live system.hello. Empty
+// values mean the bridge is disconnected or has not completed its handshake.
+func (mc *MotionController) BridgeDetails() (proto, bridgeVersion string) {
+	if hello := mc.client.Hello(); hello != nil {
+		return hello.Proto, hello.BridgeVersion
+	}
+	return "", ""
+}
+
 // MovesApplied reports whether the clip pool has been narrowed to the bridge move
 // set at least once since the current connection came up.
 func (mc *MotionController) MovesApplied() bool { return mc.movesApplied.Load() }
