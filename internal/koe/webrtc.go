@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -567,6 +568,43 @@ func (s *sendTrackStats) totalsLine() string {
 	return fmt.Sprintf("written=%d write_err=%d encode_err=%d", s.written, s.writeErrs, s.encodeErrs)
 }
 
+// micPreRollFrames retains 500 ms of local-only capture while a prepared
+// Wireless session is not active. On gaze activation the frames pass through the
+// normal energy gate before any encoded write, preserving the first syllable
+// without uploading an idle room.
+const micPreRollFrames = 500 / audioFrameMs
+
+type micPreRoll struct {
+	capacity int
+	frames   [][]int16
+}
+
+func newMicPreRoll(capacity int) *micPreRoll {
+	return &micPreRoll{capacity: capacity, frames: make([][]int16, 0, max(capacity, 0))}
+}
+
+func (r *micPreRoll) Push(frame []int16) {
+	if r.capacity <= 0 {
+		return
+	}
+	copyFrame := slices.Clone(frame)
+	if len(r.frames) == r.capacity {
+		copy(r.frames, r.frames[1:])
+		r.frames[len(r.frames)-1] = copyFrame
+		return
+	}
+	r.frames = append(r.frames, copyFrame)
+}
+
+func (r *micPreRoll) Drain(current []int16) [][]int16 {
+	out := make([][]int16, 0, len(r.frames)+1)
+	out = append(out, r.frames...)
+	out = append(out, current)
+	clear(r.frames)
+	r.frames = r.frames[:0]
+	return out
+}
+
 func resetMicGateAtAssistantBoundary(gate *micNoiseGate, wasSpeaking, speaking bool) bool {
 	if gate == nil || !speaking || wasSpeaking {
 		return false
@@ -588,6 +626,8 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 	}
 	defer gate.logStats()
 	stats := &sendTrackStats{}
+	preRoll := newMicPreRoll(micPreRollFrames)
+	captureWasActive := rc.callActive == nil || rc.callActive()
 	defer func() {
 		if eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1" {
 			log.Printf("koe[audio]: send track stats: %s", stats.totalsLine())
@@ -606,12 +646,19 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 			// Press-to-talk gate: while no call is active, drop captured mic audio so
 			// OpenAI never hears the room (Koe stays idle). Drain the frame either way
 			// to keep the capture pipeline from backing up.
-			if rc.callActive != nil && !rc.callActive() {
+			captureActive := rc.callActive == nil || rc.callActive()
+			if !captureActive {
 				gate.resetState()
+				preRoll.Push(frame)
+				captureWasActive = false
 				assistantWasSpeaking = false
 				continue
 			}
-			wasOpen := gate.open
+			captured := [][]int16{frame}
+			if !captureWasActive {
+				captured = preRoll.Drain(frame)
+				captureWasActive = true
+			}
 			assistantSpeaking := rc.audio.dropCapture()
 			// A user turn can leave the local noise gate open for its two-second
 			// hangover. Qwen often starts replying before that closes; carrying the
@@ -632,62 +679,68 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 				// threshold and hangover preserve quiet syllables.
 				startThreshold = bargeStartGate.threshold(assistantSpeaking, rc.audio.OutputLevel())
 			}
-			for _, out := range gate.processWithStartThreshold(frame, startThreshold) {
-				select {
-				case <-ctx.Done():
-					return
-				case <-pacer.C:
-				}
-				rc.outboundAudioMu.Lock()
-				enc, err := rc.audio.EncodeFrame(out)
-				if err != nil {
+			if len(captured) > 1 && (eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1") {
+				log.Printf("koe[audio]: flushing local mic pre-roll frames=%d", len(captured)-1)
+			}
+			for _, captureFrame := range captured {
+				wasOpen := gate.open
+				for _, out := range gate.processWithStartThreshold(captureFrame, startThreshold) {
+					select {
+					case <-ctx.Done():
+						return
+					case <-pacer.C:
+					}
+					rc.outboundAudioMu.Lock()
+					enc, err := rc.audio.EncodeFrame(out)
+					if err != nil {
+						rc.outboundAudioMu.Unlock()
+						stats.noteEncodeErr()
+						continue
+					}
+					writeErr := rc.sendTrack.WriteSample(media.Sample{
+						Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
+					})
+					if writeErr == nil {
+						rc.micAudioWritten.Store(true)
+						if !rc.outboundAudioReady.Load() {
+							rc.outboundAudioReadyAt.Store(time.Now().UnixNano())
+							rc.outboundAudioReady.Store(true)
+						}
+					}
 					rc.outboundAudioMu.Unlock()
-					stats.noteEncodeErr()
-					continue
+					stats.noteWrite(writeErr)
 				}
-				writeErr := rc.sendTrack.WriteSample(media.Sample{
-					Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
-				})
-				if writeErr == nil {
-					rc.micAudioWritten.Store(true)
-					if !rc.outboundAudioReady.Load() {
-						rc.outboundAudioReadyAt.Store(time.Now().UnixNano())
-						rc.outboundAudioReady.Store(true)
+				if !wasOpen && gate.open {
+					stats.beginSegment(gate.stats.PassedFrames)
+					if eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1" {
+						if assistantSpeaking {
+							log.Printf("koe[barge]: local talk-over admitted input_rms=%.4f output_rms=%.4f start_threshold=%.4f",
+								rmsLevel(captureFrame), rc.audio.OutputLevel(), startThreshold)
+						}
+						log.Printf(
+							"koe[audio]: mic_gate_open level=%.4f threshold=%.4f noise_floor=%.4f start_score=%d",
+							gate.lastLevel,
+							gate.effectiveThreshold(),
+							gate.noiseFloor,
+							gate.startScore,
+						)
+					}
+					if rc.onLocalSpeechStarted != nil {
+						rc.onLocalSpeechStarted()
 					}
 				}
-				rc.outboundAudioMu.Unlock()
-				stats.noteWrite(writeErr)
-			}
-			if !wasOpen && gate.open {
-				if assistantSpeaking && (eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1") {
-					log.Printf("koe[barge]: local talk-over admitted input_rms=%.4f output_rms=%.4f start_threshold=%.4f",
-						rmsLevel(frame), rc.audio.OutputLevel(), startThreshold)
-				}
-				stats.beginSegment(gate.stats.PassedFrames)
-				if eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1" {
-					log.Printf(
-						"koe[audio]: mic_gate_open level=%.4f threshold=%.4f noise_floor=%.4f start_score=%d",
-						gate.lastLevel,
-						gate.effectiveThreshold(),
-						gate.noiseFloor,
-						gate.startScore,
-					)
-				}
-				if rc.onLocalSpeechStarted != nil {
-					rc.onLocalSpeechStarted()
-				}
-			}
-			if wasOpen && !gate.open {
-				if eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1" {
-					log.Printf(
-						"koe[audio]: mic_gate_closed level=%.4f threshold=%.4f; send segment: %s",
-						gate.lastLevel,
-						gate.effectiveThreshold(),
-						stats.segmentLine(gate.stats.PassedFrames),
-					)
-				}
-				if rc.onLocalSpeechEnded != nil {
-					rc.onLocalSpeechEnded()
+				if wasOpen && !gate.open {
+					if eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1" {
+						log.Printf(
+							"koe[audio]: mic_gate_closed level=%.4f threshold=%.4f; send segment: %s",
+							gate.lastLevel,
+							gate.effectiveThreshold(),
+							stats.segmentLine(gate.stats.PassedFrames),
+						)
+					}
+					if rc.onLocalSpeechEnded != nil {
+						rc.onLocalSpeechEnded()
+					}
 				}
 			}
 		}

@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -665,6 +666,21 @@ func TestWarmMintTakeMintsWhenExpired(t *testing.T) {
 	}
 }
 
+func TestLazyMintDoesNotPrefetch(t *testing.T) {
+	var calls atomic.Int32
+	w := newLazyMint(func(context.Context) (string, error) {
+		calls.Add(1)
+		return "ek_lazy", nil
+	}, time.Minute)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("lazy constructor minted %d time(s), want 0", got)
+	}
+	secret, cached, err := w.take(context.Background())
+	if err != nil || cached || secret != "ek_lazy" || calls.Load() != 1 {
+		t.Fatalf("take = %q cached=%t calls=%d err=%v", secret, cached, calls.Load(), err)
+	}
+}
+
 // TestBaseKoePersona: the pre-fetch warm-session persona is the base persona plus
 // (only) the pinned language — no user context / agent list yet.
 func TestBaseKoePersona(t *testing.T) {
@@ -781,6 +797,70 @@ func TestRunDesktopCallBindsControlPortBeforeSlowAgentFetch(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("runDesktopCall did not return after ctx cancel")
+	}
+}
+
+func TestRunDesktopCallWirelessDoesNotMintWhileIdle(t *testing.T) {
+	t.Setenv("KOE_GAZE_GATE", "false")
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/agents":
+			_ = json.NewEncoder(w).Encode(map[string]any{"agents": []any{}})
+		case "/koe/persona":
+			_ = json.NewEncoder(w).Encode(map[string]any{"persona": ""})
+		default:
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		}
+	}))
+	defer daemon.Close()
+
+	var mintCalls atomic.Int32
+	port := freeTCPPort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runDesktopCall(ctx, koeConfig{
+			controlPort: port,
+			daemonURL:   daemon.URL,
+			model:       "gpt-realtime-mini",
+			carrier: koe.CarrierProfile{
+				Carrier:         koe.CarrierReachyWireless,
+				ReachyDaemonURL: daemon.URL,
+			},
+		}, koe.NewDaemonClient(daemon.URL), &realtimeConnector{
+			mode:        koe.ProviderAuto,
+			openAIModel: "gpt-realtime-mini",
+			qwenModel:   koe.DefaultQwenRealtimeModel,
+			mint: func(context.Context) (string, error) {
+				mintCalls.Add(1)
+				return "ek_unexpected", nil
+			},
+			circuit: koe.NewOpenAICircuit(time.Minute),
+		}, func(json.RawMessage) {})
+	}()
+
+	base := "http://127.0.0.1:" + port
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(base + "/carrier/status")
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := mintCalls.Load(); got != 0 {
+		t.Fatalf("wireless idle minted %d time(s), want 0", got)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runDesktopCall: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runDesktopCall did not stop")
 	}
 }
 

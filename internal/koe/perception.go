@@ -22,6 +22,10 @@ const (
 	maxPerceptionResponseBytes    = 64 << 10
 )
 
+// DefaultPerceptionPollInterval is the product cadence for the robot-local
+// snapshot stream. Exported so the resident runtime does not duplicate it.
+func DefaultPerceptionPollInterval() time.Duration { return defaultPerceptionPollInterval }
+
 // PerceptionHealth is the fail-closed aggregate health of one robot-local
 // face/DOA poll. It is deliberately small: operator-facing details stay in Error,
 // while the gaze gate only needs to distinguish healthy from unavailable input.
@@ -274,6 +278,11 @@ func (c *PerceptionClient) Stream(ctx context.Context, interval time.Duration) (
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			publishLatest(out, c.Poll(ctx))
 			select {
 			case <-ctx.Done():

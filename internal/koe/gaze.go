@@ -3,6 +3,9 @@ package koe
 import (
 	"fmt"
 	"math"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -66,6 +69,73 @@ func DefaultGazeConfig() GazeConfig {
 		EncounterReset: defaultGazeEncounterReset,
 		FrontHalfAngle: math.Pi / 3,
 	}
+}
+
+// GazeConfigFromEnv resolves bounded developer/rollback overrides. These are
+// intentionally not user settings; the product surface eventually selects only
+// enabled/disabled while the sensor constants stay engineering-owned.
+func GazeConfigFromEnv() (GazeConfig, error) {
+	return gazeConfigFromLookup(os.LookupEnv)
+}
+
+func gazeConfigFromLookup(lookup func(string) (string, bool)) (GazeConfig, error) {
+	cfg := DefaultGazeConfig()
+	if raw, ok := lookup("KOE_GAZE_GATE"); ok {
+		v, err := strconv.ParseBool(strings.TrimSpace(raw))
+		if err != nil {
+			return GazeConfig{}, fmt.Errorf("koe[gaze]: KOE_GAZE_GATE must be a boolean")
+		}
+		cfg.Enabled = v
+	}
+	ints := []struct {
+		name string
+		dst  *int
+		min  int
+		max  int
+	}{
+		{"KOE_GAZE_FACE_HITS", &cfg.FaceHits, 1, 20},
+		{"KOE_GAZE_VAD_HITS", &cfg.VADHits, 1, 20},
+	}
+	for _, item := range ints {
+		if raw, ok := lookup(item.name); ok {
+			v, err := strconv.Atoi(strings.TrimSpace(raw))
+			if err != nil || v < item.min || v > item.max {
+				return GazeConfig{}, fmt.Errorf("koe[gaze]: %s must be an integer in %d..%d", item.name, item.min, item.max)
+			}
+			*item.dst = v
+		}
+	}
+	durations := []struct {
+		name string
+		dst  *time.Duration
+		min  int
+		max  int
+	}{
+		{"KOE_GAZE_FACE_HOLD_MS", &cfg.FaceHold, 100, 10_000},
+		{"KOE_GAZE_ARM_TIMEOUT_MS", &cfg.ArmTimeout, 1_000, 60_000},
+		{"KOE_GAZE_REARM_COOLDOWN_MS", &cfg.RearmCooldown, 100, 10_000},
+		{"KOE_GAZE_ENCOUNTER_RESET_MS", &cfg.EncounterReset, 100, 10_000},
+	}
+	for _, item := range durations {
+		if raw, ok := lookup(item.name); ok {
+			v, err := strconv.Atoi(strings.TrimSpace(raw))
+			if err != nil || v < item.min || v > item.max {
+				return GazeConfig{}, fmt.Errorf("koe[gaze]: %s must be an integer in %d..%d", item.name, item.min, item.max)
+			}
+			*item.dst = time.Duration(v) * time.Millisecond
+		}
+	}
+	if raw, ok := lookup("KOE_GAZE_FRONT_DEG"); ok {
+		v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil || !finite(v) || v < 1 || v > 89 {
+			return GazeConfig{}, fmt.Errorf("koe[gaze]: KOE_GAZE_FRONT_DEG must be a number in 1..89")
+		}
+		cfg.FrontHalfAngle = v * math.Pi / 180
+	}
+	if err := cfg.validate(); err != nil {
+		return GazeConfig{}, err
+	}
+	return cfg, nil
 }
 
 func (c GazeConfig) validate() error {

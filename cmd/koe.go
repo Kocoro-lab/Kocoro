@@ -547,6 +547,10 @@ func newWarmMint(ctx context.Context, mint func(context.Context) (string, error)
 	return w
 }
 
+func newLazyMint(mint func(context.Context) (string, error), ttl time.Duration) *warmMint {
+	return &warmMint{mint: mint, ttl: ttl}
+}
+
 func (w *warmMint) take(ctx context.Context) (string, bool, error) {
 	now := time.Now()
 	w.mu.Lock()
@@ -994,14 +998,25 @@ func closeDesktopSessionState(mailbox *koe.ResultMailbox, state *koe.CallState, 
 	return nil
 }
 
-// runDesktopCall is the resident control-port loop. Desktop keeps a warm Realtime
-// session ready while idle, but the audio device is call-scoped: /call/start opens
-// the selected backend, /call/end closes the used session and audio, then warms
-// the next session without touching the mic.
+// runDesktopCall is the resident control-port loop. Mac/Lite keep the existing
+// warm Realtime session with call-scoped audio. Wireless is lazy: a manual start
+// or the local gaze gate prepares the session/audio, and idle uploads no room.
 func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient,
 	connector *realtimeConnector, onUsage func(json.RawMessage)) error {
 
 	fullDuplexAEC := cfg.aec == "vpio"
+	wirelessLazy := cfg.carrier.Carrier == koe.CarrierReachyWireless
+	gazeCfg := koe.DefaultGazeConfig()
+	if wirelessLazy {
+		var err error
+		gazeCfg, err = koe.GazeConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		if !cfg.carrier.HasCap(koe.CapHasFace) {
+			gazeCfg.Enabled = false
+		}
+	}
 	// One mailbox spans every warm Realtime session in this resident process. A
 	// do_task can outlive the session that dispatched it; its spoken result must not.
 	resultMailbox := koe.NewResultMailbox()
@@ -1048,12 +1063,17 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		return state, disp
 	}
 	if cfg.provider != koe.ProviderQwen {
-		connector.warm = newWarmMint(ctx, connector.mint, warmMintTTL)
+		if wirelessLazy {
+			connector.warm = newLazyMint(connector.mint, warmMintTTL)
+		} else {
+			connector.warm = newWarmMint(ctx, connector.mint, warmMintTTL)
+		}
 	}
 
-	// The RealtimeConn is warmed while idle, then consumed by one foreground call.
-	// callActive gates mic frames inside pumpSendTrack; inactive sessions drain and
-	// discard local capture, so OpenAI never hears the room before the double-tap.
+	// Mac/Lite warm the RealtimeConn while idle; Wireless creates it only for a
+	// manual call or a bounded gaze encounter. callActive gates mic frames inside
+	// pumpSendTrack; inactive Wireless capture stays in a bounded local-only ring,
+	// so OpenAI never hears the room before activation.
 	var sessMu sync.Mutex
 	var curConn *koe.RealtimeConn
 	var curState *koe.CallState
@@ -1070,9 +1090,14 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	var warming bool
 	var sessionReady bool
 	var callActive bool
+	// Mac/Lite retain an always-wanted warm session. Wireless sets this only for
+	// a manual call or one bounded gaze encounter, so no 24/7 Realtime session is
+	// created merely because the robot process is alive.
+	sessionWanted := !wirelessLazy
 	var callStarted time.Time
 	var readyEmitted bool
 	idleSessionTTL := koeWarmSessionTTL()
+	shouldHaveSessionLocked := func() bool { return !wirelessLazy || sessionWanted }
 
 	stopSessionResources := func(conn *koe.RealtimeConn, cancel context.CancelFunc, audio *koe.AudioIO) {
 		if cancel != nil {
@@ -1149,6 +1174,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	var scheduleWarmRotationLocked func(uint64, string)
 	var handleSessionClosed func(uint64, error)
 	scheduleWarmRetry := func(reason string) {
+		if wirelessLazy {
+			return // one gaze encounter / manual attempt is bounded; never retry forever while idle
+		}
 		go func() {
 			select {
 			case <-time.After(5 * time.Second):
@@ -1163,7 +1191,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}()
 	}
 	scheduleWarmRotationLocked = func(seq uint64, reason string) {
-		if idleSessionTTL <= 0 {
+		if wirelessLazy || idleSessionTTL <= 0 {
 			return
 		}
 		go func() {
@@ -1193,7 +1221,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		log.Printf("koe: warm session closed: %v", err)
 		if !callActive {
 			conn, cancel, audio := closeSessionLocked(true)
-			ensureWarmSessionLocked("session_closed")
+			if shouldHaveSessionLocked() {
+				ensureWarmSessionLocked("session_closed")
+			}
 			sessMu.Unlock()
 			stopSessionResources(conn, cancel, audio)
 			return
@@ -1218,10 +1248,15 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		if err := startSessionAudioLocked("active_session_reconnect"); err != nil {
 			log.Printf("koe: audio restart failed: %v", err)
 			callActive = false
+			if wirelessLazy {
+				sessionWanted = false
+			}
 			ctrl.EmitVoiceState("idle")
 			ctrl.EmitCallState("ended")
 			conn, cancel, audio := closeSessionLocked(true)
-			ensureWarmSessionLocked("audio_restart_retry")
+			if shouldHaveSessionLocked() {
+				ensureWarmSessionLocked("audio_restart_retry")
+			}
 			sessMu.Unlock()
 			stopSessionResources(conn, cancel, audio)
 			return
@@ -1234,6 +1269,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		log.Printf("koe: %s: %v", msg, err)
 		if callActive {
 			callActive = false
+			if wirelessLazy {
+				sessionWanted = false
+			}
 			callStarted = time.Time{}
 			readyEmitted = false
 			ctrl.EmitVoiceState("idle")
@@ -1242,6 +1280,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	}
 	ensureWarmSessionLocked = func(reason string) {
 		if ctx.Err() != nil {
+			return
+		}
+		if !shouldHaveSessionLocked() {
 			return
 		}
 		if curConn != nil || warming {
@@ -1381,6 +1422,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			sessMu.Unlock()
 			return
 		}
+		if wirelessLazy {
+			sessionWanted = true
+		}
 		callContext = req
 		if curState != nil {
 			// Warm sessions are created before Desktop knows which app/window was
@@ -1398,8 +1442,13 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			log.Printf("koe: audio start failed: %v", err)
 			ctrl.EmitVoiceState("idle")
 			ctrl.EmitCallState("ended")
+			if wirelessLazy {
+				sessionWanted = false
+			}
 			conn, cancel, audio := closeSessionLocked(true)
-			ensureWarmSessionLocked("audio_start_retry")
+			if shouldHaveSessionLocked() {
+				ensureWarmSessionLocked("audio_start_retry")
+			}
 			sessMu.Unlock()
 			stopSessionResources(conn, cancel, audio)
 			return
@@ -1422,10 +1471,15 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			return
 		}
 		callActive = false
+		if wirelessLazy {
+			sessionWanted = false
+		}
 		conn, cancel, audio := closeSessionLocked(true)
 		ctrl.EmitVoiceState("idle")
 		ctrl.EmitCallState("ended")
-		ensureWarmSessionLocked("post_call")
+		if shouldHaveSessionLocked() {
+			ensureWarmSessionLocked("post_call")
+		}
 		sessMu.Unlock()
 		// Stop/clear the old Realtime output before the goodbye cue. The audio device
 		// stays open just long enough to play the cue, then is torn down below.
@@ -1455,6 +1509,50 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		conn := curConn
 		sessMu.Unlock()
 		conn.InterruptOutput()
+	}
+
+	prepareGazeSession := func() {
+		var conn *koe.RealtimeConn
+		var cancel context.CancelFunc
+		var audio *koe.AudioIO
+		sessMu.Lock()
+		if callActive {
+			sessMu.Unlock()
+			return
+		}
+		sessionWanted = true
+		ensureWarmSessionLocked("gaze_face")
+		if curAudio == nil {
+			sessionWanted = false
+			log.Printf("koe[gaze]: preparation unavailable: audio session was not created")
+			sessMu.Unlock()
+			return
+		}
+		if err := startSessionAudioLocked("gaze_face"); err != nil {
+			log.Printf("koe[gaze]: preparation audio failed: %v", err)
+			sessionWanted = false
+			conn, cancel, audio = closeSessionLocked(true)
+		}
+		sessMu.Unlock()
+		stopSessionResources(conn, cancel, audio)
+	}
+	cancelGazePreparation := func(reason string) {
+		var conn *koe.RealtimeConn
+		var cancel context.CancelFunc
+		var audio *koe.AudioIO
+		cancelled := false
+		sessMu.Lock()
+		if !callActive {
+			sessionWanted = false
+			conn, cancel, audio = closeSessionLocked(true)
+			cancelled = true
+		}
+		sessMu.Unlock()
+		if !cancelled {
+			return // a manual call won the race; perception no longer owns this session
+		}
+		stopSessionResources(conn, cancel, audio)
+		log.Printf("koe[gaze]: preparation cancelled reason=%s", reason)
 	}
 
 	ctrl = koe.NewControlServer(startCall, endCall, interruptCall)
@@ -1561,6 +1659,53 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			}
 		}
 	}()
+
+	if wirelessLazy {
+		log.Printf("koe[gaze]: wireless lazy sessions enabled gaze=%t face_hits=%d vad_hits=%d arm_timeout=%s",
+			gazeCfg.Enabled, gazeCfg.FaceHits, gazeCfg.VADHits, gazeCfg.ArmTimeout)
+	}
+	if wirelessLazy && gazeCfg.Enabled {
+		perception, perr := koe.NewPerceptionClient(cfg.carrier.ReachyDaemonURL)
+		gate, gerr := koe.NewGazeGate(gazeCfg)
+		if perr != nil {
+			log.Printf("koe[gaze]: degraded: perception setup failed: %v", perr)
+		} else if gerr != nil {
+			log.Printf("koe[gaze]: degraded: gate setup failed: %v", gerr)
+		} else {
+			stream, serr := perception.Stream(ctx, koe.DefaultPerceptionPollInterval())
+			if serr != nil {
+				log.Printf("koe[gaze]: degraded: perception stream failed: %v", serr)
+			} else {
+				go func() {
+					for snapshot := range stream {
+						sessMu.Lock()
+						prepared := sessionWanted && sessionReady && curAudioStarted && curConn != nil
+						active := callActive
+						sessMu.Unlock()
+						decision := gate.Update(koe.GazeInput{
+							Now:        snapshot.ObservedAt,
+							Snapshot:   snapshot,
+							Prepared:   prepared,
+							CallActive: active,
+						})
+						if decision.Changed || decision.Reason == "speech_front" {
+							log.Printf("koe[gaze]: state=%s reason=%s", decision.State, decision.Reason)
+						}
+						for _, action := range decision.Actions {
+							switch action.Kind {
+							case koe.GazePrepare:
+								prepareGazeSession()
+							case koe.GazeActivate:
+								startCall(koe.StartCallRequest{})
+							case koe.GazeCancelPreparation:
+								cancelGazePreparation(decision.Reason)
+							}
+						}
+					}
+				}()
+			}
+		}
+	}
 
 	// Fetch the agent registry + persona ONLY AFTER the listener above is bound, so
 	// Desktop can already reach koe (409 no_active_call on /call/mic, or /call/start

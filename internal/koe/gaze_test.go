@@ -165,3 +165,31 @@ func TestGazeConfigValidation(t *testing.T) {
 		t.Fatal("invalid front cone should fail")
 	}
 }
+
+func TestGazeConfigFromEnvOverridesAndRejectsInvalid(t *testing.T) {
+	values := map[string]string{
+		"KOE_GAZE_GATE":               "false",
+		"KOE_GAZE_FACE_HITS":          "3",
+		"KOE_GAZE_VAD_HITS":           "1",
+		"KOE_GAZE_FACE_HOLD_MS":       "900",
+		"KOE_GAZE_ARM_TIMEOUT_MS":     "12000",
+		"KOE_GAZE_FRONT_DEG":          "45",
+		"KOE_GAZE_REARM_COOLDOWN_MS":  "1500",
+		"KOE_GAZE_ENCOUNTER_RESET_MS": "2500",
+	}
+	lookup := func(k string) (string, bool) { v, ok := values[k]; return v, ok }
+	cfg, err := gazeConfigFromLookup(lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Enabled || cfg.FaceHits != 3 || cfg.VADHits != 1 || cfg.FaceHold != 900*time.Millisecond ||
+		cfg.ArmTimeout != 12*time.Second || cfg.RearmCooldown != 1500*time.Millisecond ||
+		cfg.EncounterReset != 2500*time.Millisecond || math.Abs(cfg.FrontHalfAngle-math.Pi/4) > 1e-9 {
+		t.Fatalf("overrides = %+v", cfg)
+	}
+
+	values["KOE_GAZE_FRONT_DEG"] = "90"
+	if _, err := gazeConfigFromLookup(lookup); err == nil {
+		t.Fatal("out-of-range front cone should fail")
+	}
+}

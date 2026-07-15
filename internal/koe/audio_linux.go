@@ -337,9 +337,23 @@ func (a *AudioIO) micPump() {
 		if frame = a.resolveCaptureFrame(frame, forward); frame == nil {
 			continue
 		}
+		enqueueLatestPCM(a.frames, frame)
+	}
+}
+
+// enqueueLatestPCM bounds cold-start capture while mint/SDP is still connecting.
+// When full, drop the oldest frame before inserting the newest so gaze activation
+// retains speech onset near "now" instead of a stale five-second-old room prefix.
+func enqueueLatestPCM(ch chan []int16, frame []int16) {
+	for {
 		select {
-		case a.frames <- frame:
-		default: // send path behind → drop (latest-wins, §3)
+		case ch <- frame:
+			return
+		default:
+			select {
+			case <-ch:
+			default:
+			}
 		}
 	}
 }

@@ -60,6 +60,19 @@ func TestSpeakerRingFramesInvalidFailsLoud(t *testing.T) {
 	}
 }
 
+func TestMicCaptureQueueDropsOldest(t *testing.T) {
+	ch := make(chan []int16, 2)
+	enqueueLatestPCM(ch, []int16{1})
+	enqueueLatestPCM(ch, []int16{2})
+	enqueueLatestPCM(ch, []int16{3})
+	if got := (<-ch)[0]; got != 2 {
+		t.Fatalf("oldest retained = %d, want 2", got)
+	}
+	if got := (<-ch)[0]; got != 3 {
+		t.Fatalf("latest retained = %d, want 3", got)
+	}
+}
+
 func TestToCarrierPCMDownratesToWireRate(t *testing.T) {
 	// 48k → 16k is a 3:1 decimation: N input samples → N/3 output samples.
 	in := make([]int16, audioFrameSize) // 960 samples @ 48k = 20 ms
