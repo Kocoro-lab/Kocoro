@@ -500,7 +500,7 @@ func (h *eventHandler) observeLocalSpeechStarted() {
 	h.localStartCommitSeq.Store(h.inputCommitSeq.Load())
 	h.localStartResponseSeq.Store(h.responseSeq.Load())
 	if eventLogEnabled() {
-		log.Printf("koe[timing]: local_speech_started seq=%d", seq)
+		log.Printf("koe[timing]: mic_gate_open seq=%d", seq)
 	}
 }
 
@@ -560,7 +560,7 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 	startResponseSeq := h.localStartResponseSeq.Load()
 	delay := time.Duration(koeEnvInt("KOE_LOCAL_COMMIT_FALLBACK_MS", defaultLocalCommitFallbackMS)) * time.Millisecond
 	if eventLogEnabled() {
-		log.Printf("koe[timing]: local_speech_ended seq=%d fallback_ms=%d", seq, delay.Milliseconds())
+		log.Printf("koe[timing]: mic_gate_closed seq=%d fallback_ms=%d", seq, delay.Milliseconds())
 	}
 	go func() {
 		timer := time.NewTimer(delay)
@@ -1864,16 +1864,36 @@ func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressI
 	}
 	vadThreshold := koeEnvFloat("KOE_VAD_THRESHOLD", defaultThreshold)
 	turnMode := koeEnvString("KOE_TURN_DETECTION", defaultTurn)
-	log.Printf("koe[barge]: sessionConfig fullDuplexAEC=%v native_floor=%v create_response=%v interrupt_response=%v turn=%s threshold=%.2f silence_ms=%d", fullDuplexAEC, nativeFloor, createResponse, interruptResponse, turnMode, vadThreshold, vadSilenceMS)
+	semanticEagerness := koeEnvString("KOE_SEMANTIC_VAD_EAGERNESS", "low")
+	noiseReduction := koeEnvString("KOE_NOISE_REDUCTION", "far_field")
 	var turnDetection map[string]any
 	if strings.EqualFold(turnMode, "semantic_vad") {
+		log.Printf(
+			"koe[barge]: sessionConfig fullDuplexAEC=%v native_floor=%v create_response=%v interrupt_response=%v turn=semantic_vad eagerness=%s noise_reduction=%s",
+			fullDuplexAEC,
+			nativeFloor,
+			createResponse,
+			interruptResponse,
+			semanticEagerness,
+			noiseReduction,
+		)
 		turnDetection = map[string]any{
 			"type":               "semantic_vad",
-			"eagerness":          koeEnvString("KOE_SEMANTIC_VAD_EAGERNESS", "low"),
+			"eagerness":          semanticEagerness,
 			"create_response":    createResponse,
 			"interrupt_response": interruptResponse,
 		}
 	} else {
+		log.Printf(
+			"koe[barge]: sessionConfig fullDuplexAEC=%v native_floor=%v create_response=%v interrupt_response=%v turn=server_vad threshold=%.2f silence_ms=%d noise_reduction=%s",
+			fullDuplexAEC,
+			nativeFloor,
+			createResponse,
+			interruptResponse,
+			vadThreshold,
+			vadSilenceMS,
+			noiseReduction,
+		)
 		turnDetection = map[string]any{
 			"type":                "server_vad",
 			"threshold":           vadThreshold,
@@ -1889,7 +1909,6 @@ func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressI
 		},
 		"turn_detection": turnDetection,
 	}
-	noiseReduction := koeEnvString("KOE_NOISE_REDUCTION", "far_field")
 	if !strings.EqualFold(noiseReduction, "off") {
 		input["noise_reduction"] = map[string]any{"type": noiseReduction}
 	}

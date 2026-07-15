@@ -1015,6 +1015,15 @@ func TestSessionConfigCanOverrideServerVADSilence(t *testing.T) {
 	}
 }
 
+func TestSessionConfigCanTuneSemanticVADEagerness(t *testing.T) {
+	t.Setenv("KOE_SEMANTIC_VAD_EAGERNESS", "medium")
+	cfg := sessionConfig("persona", "marin", false)
+	raw, _ := json.Marshal(cfg)
+	if !strings.Contains(string(raw), `"eagerness":"medium"`) {
+		t.Fatalf("KOE_SEMANTIC_VAD_EAGERNESS was not applied: %s", raw)
+	}
+}
+
 func TestSessionConfigKeepsInterruptDisabledForVPIOByDefault(t *testing.T) {
 	cfg := sessionConfig("persona", "marin", true)
 	raw, _ := json.Marshal(cfg)

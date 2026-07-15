@@ -664,13 +664,27 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 						rmsLevel(frame), rc.audio.OutputLevel(), startThreshold)
 				}
 				stats.beginSegment(gate.stats.PassedFrames)
+				if eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1" {
+					log.Printf(
+						"koe[audio]: mic_gate_open level=%.4f threshold=%.4f noise_floor=%.4f start_score=%d",
+						gate.lastLevel,
+						gate.effectiveThreshold(),
+						gate.noiseFloor,
+						gate.startScore,
+					)
+				}
 				if rc.onLocalSpeechStarted != nil {
 					rc.onLocalSpeechStarted()
 				}
 			}
 			if wasOpen && !gate.open {
 				if eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1" {
-					log.Printf("koe[audio]: send segment: %s", stats.segmentLine(gate.stats.PassedFrames))
+					log.Printf(
+						"koe[audio]: mic_gate_closed level=%.4f threshold=%.4f; send segment: %s",
+						gate.lastLevel,
+						gate.effectiveThreshold(),
+						stats.segmentLine(gate.stats.PassedFrames),
+					)
 				}
 				if rc.onLocalSpeechEnded != nil {
 					rc.onLocalSpeechEnded()

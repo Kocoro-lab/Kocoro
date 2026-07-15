@@ -45,6 +45,7 @@ type micNoiseGate struct {
 
 	noiseFloor float64
 	maxLevel   float64
+	lastLevel  float64
 	hotFrames  int
 	startScore int
 	hangover   int
@@ -139,6 +140,7 @@ func (g *micNoiseGate) processWithStartThreshold(frame []int16, startThreshold f
 		return [][]int16{frame}
 	}
 	level := rmsLevel(frame)
+	g.lastLevel = level
 	if level > g.maxLevel {
 		g.maxLevel = level
 	}
@@ -207,6 +209,10 @@ func (g *micNoiseGate) processWithStartThreshold(frame []int16, startThreshold f
 
 	g.stats.MutedFrames++
 	return [][]int16{g.zero}
+}
+
+func (g *micNoiseGate) effectiveThreshold() float64 {
+	return math.Max(g.threshold, g.noiseFloor*g.noiseMultiplier)
 }
 
 func (g *micNoiseGate) resetState() {

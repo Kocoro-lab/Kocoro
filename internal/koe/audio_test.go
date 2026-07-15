@@ -348,6 +348,23 @@ func TestMicNoiseGateRejectsShortNoiseBurstByDefault(t *testing.T) {
 	}
 }
 
+func TestMicNoiseGateReportsEffectiveThresholdAtOpen(t *testing.T) {
+	g := newMicNoiseGate()
+	burst := make([]int16, audioFrameSize)
+	for i := range burst {
+		burst[i] = 1800
+	}
+	for g.stats.SpeechStarts == 0 {
+		_ = g.process(burst)
+	}
+	if !g.open {
+		t.Fatal("gate did not open")
+	}
+	if g.lastLevel <= g.effectiveThreshold() {
+		t.Fatalf("open evidence level %.4f did not exceed threshold %.4f", g.lastLevel, g.effectiveThreshold())
+	}
+}
+
 func TestDefaultMicNoiseGateRejectsPostAECQuietSpeechLevel(t *testing.T) {
 	g := newMicNoiseGate()
 	quietSpeech := make([]int16, audioFrameSize)
