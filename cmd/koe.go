@@ -770,6 +770,17 @@ func desktopParentDone(ctx context.Context) <-chan struct{} {
 	return done
 }
 
+// residentOwnerDone keeps the Desktop subprocess contract for Mac/Lite, but a
+// Wireless Koe is owned by the robot app/runtime and commonly starts through a
+// short-lived launcher shell. Reparenting it to init is healthy, not a shutdown
+// signal; only its own context/signal ends that process.
+func residentOwnerDone(ctx context.Context, wireless bool) <-chan struct{} {
+	if wireless {
+		return ctx.Done()
+	}
+	return desktopParentDone(ctx)
+}
+
 // koeLanguageInstruction returns the one complete language section for this
 // session. It replaces, rather than supplements, the default section.
 func koeLanguageInstruction(lang string) string {
@@ -1729,7 +1740,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 
 	select {
 	case <-ctx.Done():
-	case <-desktopParentDone(ctx):
+	case <-residentOwnerDone(ctx, wirelessLazy):
 	}
 	controlClosing.Store(true)
 	_ = ln.Close()

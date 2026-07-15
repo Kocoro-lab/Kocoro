@@ -864,6 +864,22 @@ func TestRunDesktopCallWirelessDoesNotMintWhileIdle(t *testing.T) {
 	}
 }
 
+func TestResidentOwnerDoneWirelessIgnoresLauncherParent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := residentOwnerDone(ctx, true)
+	select {
+	case <-done:
+		t.Fatal("wireless owner channel closed before its context")
+	default:
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("wireless owner channel did not follow context cancellation")
+	}
+}
+
 // freeTCPPort grabs an ephemeral localhost port and releases it for the caller to
 // bind. A tiny TOCTOU window is acceptable in a test.
 func freeTCPPort(t *testing.T) string {
