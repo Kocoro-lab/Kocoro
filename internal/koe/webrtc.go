@@ -683,6 +683,7 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 				log.Printf("koe[audio]: flushing local mic pre-roll frames=%d", len(captured)-1)
 			}
 			for _, captureFrame := range captured {
+				captureFrame = rc.audio.captureFrameForSend(captureFrame)
 				wasOpen := gate.open
 				for _, out := range gate.processWithStartThreshold(captureFrame, startThreshold) {
 					select {

@@ -185,6 +185,17 @@ func (a *AudioIO) resolveCaptureFrame(frame []int16, forward bool) []int16 {
 
 var captureSilenceFrameLinux = make([]int16, audioFrameSize)
 
+// captureFrameForSend re-checks the Wireless capture gate at the moment a queued
+// frame reaches the Realtime sender. The carrier and send pumps run independently;
+// without this late check, a raw frame queued just before response.created can sit
+// behind the prior utterance and reach server VAD after speaker playback starts.
+func (a *AudioIO) captureFrameForSend(frame []int16) []int16 {
+	if a.captureSuppressed() {
+		return captureSilenceFrameLinux
+	}
+	return frame
+}
+
 // Play enqueues a decoded PCM frame for uplink playback (drop on overflow rather
 // than block the decode path, same as darwin).
 func (a *AudioIO) Play(pcm []int16) {

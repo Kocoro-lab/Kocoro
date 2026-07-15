@@ -286,6 +286,10 @@ func (a *AudioIO) resolveCaptureFrame(frame []int16, forward bool) []int16 {
 	return captureSilenceFrame
 }
 
+// Darwin capture is gated in the device callback (malgo/VPIO), so queued frames do
+// not need Wireless's second-stage send-time filter.
+func (a *AudioIO) captureFrameForSend(frame []int16) []int16 { return frame }
+
 // Frames yields captured 48 kHz mono 20 ms frames.
 func (a *AudioIO) Frames() <-chan []int16 { return a.frames }
 

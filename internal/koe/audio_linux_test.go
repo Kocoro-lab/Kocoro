@@ -41,6 +41,20 @@ func TestWirelessBargeInPerceptionGateHasExplicitTestBypass(t *testing.T) {
 	}
 }
 
+func TestWirelessQueuedCaptureIsRegatedAtSendTime(t *testing.T) {
+	a := &AudioIO{}
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	a.SetSpeaking(true)
+	raw := []int16{123, -456}
+	if got := a.captureFrameForSend(raw); len(got) != audioFrameSize || got[0] != 0 {
+		t.Fatalf("unauthorized queued frame = %v, want a full silence frame", got)
+	}
+	a.SetBargeInAuthorized(true)
+	if got := a.captureFrameForSend(raw); len(got) != len(raw) || got[0] != raw[0] {
+		t.Fatalf("authorized queued frame = %v, want %v", got, raw)
+	}
+}
+
 func TestWirelessInterruptPlaybackSendsCarrierFlush(t *testing.T) {
 	koeConn, carrierConn := net.Pipe()
 	defer koeConn.Close()
