@@ -915,6 +915,9 @@ func TestToolDefsForCarrierAddsExpressWithBody(t *testing.T) {
 	if !strings.Contains(found.Description, "Never choose dance unless") || !strings.Contains(found.Description, "not permission") {
 		t.Errorf("express tool must state the explicit-dance rule, got %q", found.Description)
 	}
+	if !strings.Contains(found.Description, "no arms, hands, or legs") || !strings.Contains(found.Description, "ask the user to imagine it") {
+		t.Errorf("express tool must state the real body and silent-delivery contract, got %q", found.Description)
+	}
 }
 
 func TestDispatchExpressExpressed(t *testing.T) {
@@ -932,8 +935,10 @@ func TestDispatchExpressExpressed(t *testing.T) {
 	if gotIntent != "happy" {
 		t.Errorf("intent not forwarded: %q", gotIntent)
 	}
-	if !strings.Contains(string(out), "expressed") {
-		t.Errorf("expected expressed status, got %s", out)
+	if !strings.Contains(string(out), `"status":"expressed"`) ||
+		!strings.Contains(string(out), `"delivery":"physical_silent"`) ||
+		!strings.Contains(string(out), "without describing the gesture") {
+		t.Errorf("expected silent physical delivery guidance, got %s", out)
 	}
 }
 

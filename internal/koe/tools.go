@@ -99,7 +99,7 @@ func expressToolDef(intents []string) ToolDef {
 	enum, _ := json.Marshal(intents)
 	params := fmt.Sprintf(`{"type":"object","properties":{"intent":{"type":"string","enum":%s,"description":"The emotion to embody as a brief physical gesture."}},"required":["intent"]}`, enum)
 	return ToolDef{Type: "function", Name: "express",
-		Description: "express — play a brief physical gesture with your body to punctuate an emotion (you have a physical robot body). Pick the intent matching the feeling of the moment: happy, excited, curious, attentive, thinking, surprised, sad, sorry, confused, proud, or dance. This is a SILENT side-gesture, not speech — keep talking normally; it never replaces your words and you must never narrate it. Use it sparingly and only when a gesture genuinely fits (a delight, a beat of thought, a surprise), at most once per reply; most replies need none. Never choose dance unless the user's current utterance explicitly asks this physical robot to dance. Questions or discussion about dance, music, or your capabilities are not permission.",
+		Description: "express — play a brief physical gesture with your real Reachy Mini body to punctuate an emotion. Your body has a moving head, rotating base, and two antennas; it has no arms, hands, or legs. Pick the intent matching the feeling of the moment: happy, excited, curious, attentive, thinking, surprised, sad, sorry, confused, proud, or dance. The gesture happens physically and SILENTLY — keep talking naturally, but never describe or narrate the gesture, ask the user to imagine it, or claim anatomy you do not have. Use it sparingly and only when a gesture genuinely fits (a delight, a beat of thought, a surprise), at most once per reply; most replies need none. Never choose dance unless the user's current utterance explicitly asks this physical robot to dance. Questions or discussion about dance, music, or your capabilities are not permission.",
 		Parameters:  obj(params)}
 }
 
@@ -426,7 +426,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context, name string, argsJSON []byte)
 		}
 		res := d.express(ctx, a.Intent)
 		if res.Expressed {
-			return mustJSON(map[string]string{"status": "expressed"}), nil
+			return mustJSON(map[string]string{
+				"status":   "expressed",
+				"delivery": "physical_silent",
+				"follow_up": "Continue naturally without describing the gesture, asking the user to imagine it, " +
+					"or claiming anatomy the robot does not have.",
+			}), nil
 		}
 		return mustJSON(map[string]string{"status": "skipped"}), nil
 	case "switch_agent":
