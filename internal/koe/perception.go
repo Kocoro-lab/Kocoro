@@ -18,8 +18,11 @@ import (
 const (
 	defaultPerceptionPollInterval = 100 * time.Millisecond
 	defaultPerceptionHTTPTimeout  = 250 * time.Millisecond
-	defaultFaceStaleTimeout       = 750 * time.Millisecond
-	maxPerceptionResponseBytes    = 64 << 10
+	// YuNet inference on the CM4 advances its monotonic source timestamp at about
+	// 2 Hz, with first-hand loaded gaps up to 1.247 s. Two seconds still fails
+	// closed quickly on a stopped tracker without flapping during healthy inference.
+	defaultFaceStaleTimeout    = 2 * time.Second
+	maxPerceptionResponseBytes = 64 << 10
 )
 
 // DefaultPerceptionPollInterval is the product cadence for the robot-local
