@@ -27,6 +27,39 @@ func TestCarrierWireRateIs16k(t *testing.T) {
 	}
 }
 
+func TestSpeakerRingFramesDefaultIs100ms(t *testing.T) {
+	t.Setenv("KOE_SPK_RING_FRAMES", "")
+	got, err := speakerRingFramesFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 5 {
+		t.Fatalf("speakerRingFramesFromEnv = %d, want 5 (100 ms)", got)
+	}
+}
+
+func TestSpeakerRingFramesOverride(t *testing.T) {
+	t.Setenv("KOE_SPK_RING_FRAMES", "10")
+	got, err := speakerRingFramesFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 10 {
+		t.Fatalf("speakerRingFramesFromEnv = %d, want 10", got)
+	}
+}
+
+func TestSpeakerRingFramesInvalidFailsLoud(t *testing.T) {
+	for _, value := range []string{"bad", "0", "51"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("KOE_SPK_RING_FRAMES", value)
+			if _, err := speakerRingFramesFromEnv(); err == nil {
+				t.Fatalf("speakerRingFramesFromEnv(%q) succeeded, want error", value)
+			}
+		})
+	}
+}
+
 func TestToCarrierPCMDownratesToWireRate(t *testing.T) {
 	// 48k → 16k is a 3:1 decimation: N input samples → N/3 output samples.
 	in := make([]int16, audioFrameSize) // 960 samples @ 48k = 20 ms

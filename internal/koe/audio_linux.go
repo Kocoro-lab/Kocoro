@@ -8,6 +8,8 @@ import (
 	"log"
 	"math"
 	"net"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,12 +65,20 @@ type AudioIO struct {
 	// micRS up-rates the 16k carrier mic to 48k.
 	spkRS *Resampler
 	micRS *Resampler
+
+	// 20 ms frames. Product default is 5 frames (100 ms); a bounded env
+	// override remains as a deployment rollback escape hatch.
+	spkRingFrames int
 }
 
 // NewAudioIO builds the codec (no UDS opened yet — Start() dials the carrier, so
 // unit tests exercise Encode/Decode/gate without a carrier present). Mirror of the
 // darwin NewAudioIO so cmd/koe.go is platform-agnostic.
 func NewAudioIO() (*AudioIO, error) {
+	spkRingFrames, err := speakerRingFramesFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	enc, err := opus.NewEncoder(audioSampleRate, audioChannels, opus.AppVoIP)
 	if err != nil {
 		return nil, err
@@ -78,14 +88,15 @@ func NewAudioIO() (*AudioIO, error) {
 		return nil, err
 	}
 	a := &AudioIO{
-		enc:       enc,
-		dec:       dec,
-		frames:    make(chan []int16, inputBufferFrames),
-		playBuf:   make(chan []int16, 256),
-		sendReady: make(chan struct{}),
-		done:      make(chan struct{}),
-		spkRS:     NewResampler(audioSampleRate, carrierWireRate),
-		micRS:     NewResampler(carrierWireRate, audioSampleRate),
+		enc:           enc,
+		dec:           dec,
+		frames:        make(chan []int16, inputBufferFrames),
+		playBuf:       make(chan []int16, 256),
+		sendReady:     make(chan struct{}),
+		done:          make(chan struct{}),
+		spkRS:         NewResampler(audioSampleRate, carrierWireRate),
+		micRS:         NewResampler(carrierWireRate, audioSampleRate),
+		spkRingFrames: spkRingFrames,
 	}
 	a.playback.Store(true)
 	return a, nil
@@ -105,18 +116,18 @@ func (a *AudioIO) InputLevel() float64 {
 	}
 	return math.Float64frombits(a.inLevel.Load())
 }
-func (a *AudioIO) OutputLevel() float64  { return math.Float64frombits(a.outLevel.Load()) }
-func (a *AudioIO) PlaybackIdle() bool    { return a.OutputLevel() < playbackIdleLevelEps }
-func (a *AudioIO) markSendReady()        { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
-func (a *AudioIO) SetSpeaking(s bool)    { a.speaking.Store(s) }
-func (a *AudioIO) dropCapture() bool     { return a.speaking.Load() }
-func (a *AudioIO) SetUserMicOff(off bool) { a.userMicOff.Store(off) }
-func (a *AudioIO) UserMicOff() bool       { return a.userMicOff.Load() }
+func (a *AudioIO) OutputLevel() float64    { return math.Float64frombits(a.outLevel.Load()) }
+func (a *AudioIO) PlaybackIdle() bool      { return a.OutputLevel() < playbackIdleLevelEps }
+func (a *AudioIO) markSendReady()          { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
+func (a *AudioIO) SetSpeaking(s bool)      { a.speaking.Store(s) }
+func (a *AudioIO) dropCapture() bool       { return a.speaking.Load() }
+func (a *AudioIO) SetUserMicOff(off bool)  { a.userMicOff.Store(off) }
+func (a *AudioIO) UserMicOff() bool        { return a.userMicOff.Load() }
 func (a *AudioIO) SetUserMicSticky(s bool) { a.userMicSticky.Store(s) }
 func (a *AudioIO) UserMicSticky() bool     { return a.userMicSticky.Load() }
 func (a *AudioIO) captureSuppressed() bool { return a.dropCapture() || a.userMicOff.Load() }
-func (a *AudioIO) CaptureExpected() bool    { return !a.captureSuppressed() }
-func (a *AudioIO) Frames() <-chan []int16   { return a.frames }
+func (a *AudioIO) CaptureExpected() bool   { return !a.captureSuppressed() }
+func (a *AudioIO) Frames() <-chan []int16  { return a.frames }
 
 // SetPreferredDevices is a no-op on linux: CoreAudio device UIDs are darwin/VPIO
 // only; the wireless mic/speaker reach Koe through the carrier UDS, not a device UID.
@@ -128,9 +139,9 @@ func (a *AudioIO) SetPreferredDevices(micUID, speakerUID string) {
 
 // VPIO knobs are inert on linux (VoiceProcessingIO is macOS-only). Kept so the
 // cross-platform callers (realtime/cmd) compile and behave sensibly (never active).
-func (a *AudioIO) VPIOActive() bool                       { return false }
-func (a *AudioIO) SetVPIOVoiceProcessingBypassed(_ bool)  {}
-func (a *AudioIO) VPIOVoiceProcessingBypassed() bool      { return false }
+func (a *AudioIO) VPIOActive() bool                      { return false }
+func (a *AudioIO) SetVPIOVoiceProcessingBypassed(_ bool) {}
+func (a *AudioIO) VPIOVoiceProcessingBypassed() bool     { return false }
 
 func (a *AudioIO) resolveCaptureFrame(frame []int16, forward bool) []int16 {
 	if forward {
@@ -210,11 +221,23 @@ func (a *AudioIO) DecodeFrame(payload []byte) ([]int16, error) {
 
 // ---- device half: the carrier UDS link (koe-audio-carrier-spec §2–§5) ----
 
-// spkRingFrames bounds the speaker uplink jitter buffer (§3): ~300 ms of 20 ms
-// frames. WORKLOAD: model reply audio arrives in network-paced bursts while the
-// carrier drains at a steady clock. SYMPTOM if too small: audible drop on jitter;
-// if too large: added latency. OVERRIDE: KOE_SPK_RING_FRAMES.
-const spkRingFrames = 15
+// defaultSpkRingFrames bounds Koe's speaker uplink jitter buffer (§3): 100 ms of
+// 20 ms frames. The carrier owns a second 100 ms ring, so the product default is
+// 200 ms end-to-end rather than the previously deployed 300+300 ms. The bounded
+// env override remains a dev/rollback escape hatch, not a product setting.
+const defaultSpkRingFrames = 5
+
+func speakerRingFramesFromEnv() (int, error) {
+	raw := os.Getenv("KOE_SPK_RING_FRAMES")
+	if raw == "" {
+		return defaultSpkRingFrames, nil
+	}
+	frames, err := strconv.Atoi(raw)
+	if err != nil || frames < 1 || frames > 50 {
+		return 0, fmt.Errorf("koe[audio]: KOE_SPK_RING_FRAMES must be an integer in 1..50")
+	}
+	return frames, nil
+}
 
 // carrierWireRate is the UDS sample rate for BOTH legs of the carrier link. The
 // daemon SDK's audio I/O is 16 kHz and its playback appsrc caps pin 16k with no
@@ -325,7 +348,11 @@ func (a *AudioIO) micPump() {
 // scheduling jitter never produces an audible glitch) and writes each frame uplink.
 func (a *AudioIO) spkPump() {
 	defer a.wg.Done()
-	ring := make(chan []int16, spkRingFrames)
+	capacity := a.spkRingFrames
+	if capacity < 1 {
+		capacity = defaultSpkRingFrames
+	}
+	ring := make(chan []int16, capacity)
 	go func() {
 		for {
 			select {
