@@ -3850,6 +3850,93 @@ func TestAgentLoop_SkillExemptBypassesFilter(t *testing.T) {
 	}
 }
 
+// TestAgentLoop_SkillToolFilter_EmptyDeniesAll guards the security hardening for
+// a present-but-empty allowed-tools: a NON-NIL EMPTY SkillToolFilter must deny
+// every non-exempt tool (restrict to none), NOT be treated as "no filter" and
+// silently grant everything. A regular tool (bash) is denied; a SkillExempt tool
+// (think) still runs.
+func TestAgentLoop_SkillToolFilter_EmptyDeniesAll(t *testing.T) {
+	var mu sync.Mutex
+	var capturedMessages [][]client.Message
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req client.CompletionRequest
+		json.Unmarshal(body, &req)
+		mu.Lock()
+		callNum := len(capturedMessages)
+		snap := make([]client.Message, len(req.Messages))
+		copy(snap, req.Messages)
+		capturedMessages = append(capturedMessages, snap)
+		mu.Unlock()
+
+		switch callNum {
+		case 0:
+			// Activate a skill whose allowed-tools is present but EMPTY.
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("use_skill", `{"skill_name": "tool-free"}`), 10, 5))
+		case 1:
+			// bash must be denied (nothing is allowed).
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("bash", `{"command":"echo hi"}`), 10, 5))
+		case 2:
+			// think is SkillExempt — must still run.
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("think", `{"thought":"plan"}`), 10, 5))
+		default:
+			json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 10, 5))
+		}
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockSimpleTool{
+		name: "use_skill",
+		result: ToolResult{
+			Content:         "tool-free skill activated",
+			SkillToolFilter: []string{}, // non-nil empty: restrict to zero tools
+		},
+	})
+	reg.Register(&mockSimpleTool{name: "bash", result: ToolResult{Content: "DID NOT EXPECT TO RUN"}})
+	reg.Register(&mockSkillExemptTool{mockSimpleTool: mockSimpleTool{
+		name:   "think",
+		result: ToolResult{Content: "thought recorded"},
+	}})
+
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	if _, _, err := loop.Run(context.Background(), "test", nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(capturedMessages) < 4 {
+		t.Fatalf("expected ≥4 LLM calls, got %d", len(capturedMessages))
+	}
+	last := capturedMessages[len(capturedMessages)-1]
+	hasBashDenied := false
+	hasThinkSuccess := false
+	for _, m := range last {
+		text := m.Content.Text()
+		if strings.Contains(text, "[skill restriction]") && strings.Contains(text, `"bash"`) {
+			hasBashDenied = true
+		}
+		if strings.Contains(text, "thought recorded") {
+			hasThinkSuccess = true
+		}
+		if strings.Contains(text, "DID NOT EXPECT TO RUN") {
+			t.Errorf("bash executed despite an empty allowlist — empty filter was treated as 'no restriction'")
+		}
+	}
+	if !hasBashDenied {
+		t.Errorf("expected bash to be denied by the empty skill allowlist")
+	}
+	if !hasThinkSuccess {
+		t.Errorf("expected SkillExempt think to still execute under an empty allowlist")
+	}
+}
+
 func TestAgentLoop_SkillToolHintAppended(t *testing.T) {
 	var mu sync.Mutex
 	var messagesPerCall [][]client.Message

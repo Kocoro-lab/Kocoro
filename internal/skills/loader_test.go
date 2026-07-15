@@ -50,6 +50,111 @@ func TestLoadSkills_BasicParsing(t *testing.T) {
 	}
 }
 
+// Regression: ClawHub skills commonly declare `allowed-tools` as a YAML list.
+// A `string`-typed field made yaml.Unmarshal fail ("cannot unmarshal !!seq into
+// string"), which errored loadSkillMD → 422 on marketplace install AND fail-open
+// skip from GET /skills. stringOrList must accept both the list and scalar forms.
+func TestLoadSkills_AllowedTools_ListAndScalar(t *testing.T) {
+	want := []string{"read_file", "write_to_file", "run_command"}
+
+	t.Run("list form", func(t *testing.T) {
+		tmp := t.TempDir()
+		createSkillDir(t, tmp, "listy", "---\nname: listy\ndescription: uses list-form tools\nallowed-tools:\n  - read_file\n  - write_to_file\n  - run_command\n---\n\nBody.\n")
+		skills, err := LoadSkills(SkillSource{Dir: tmp, Source: "global"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(skills) != 1 {
+			t.Fatalf("list-form skill was skipped: expected 1 skill, got %d", len(skills))
+		}
+		if strings.Join(skills[0].AllowedTools, " ") != strings.Join(want, " ") {
+			t.Errorf("allowed tools = %v, want %v", skills[0].AllowedTools, want)
+		}
+	})
+
+	t.Run("scalar form", func(t *testing.T) {
+		tmp := t.TempDir()
+		createSkillDir(t, tmp, "scalary", "---\nname: scalary\ndescription: uses scalar-form tools\nallowed-tools: read_file write_to_file run_command\n---\n\nBody.\n")
+		skills, err := LoadSkills(SkillSource{Dir: tmp, Source: "global"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(skills) != 1 {
+			t.Fatalf("expected 1 skill, got %d", len(skills))
+		}
+		if strings.Join(skills[0].AllowedTools, " ") != strings.Join(want, " ") {
+			t.Errorf("allowed tools = %v, want %v", skills[0].AllowedTools, want)
+		}
+	})
+}
+
+// Security guard: an ABSENT allowed-tools must load as nil (no tool restriction),
+// while a PRESENT-BUT-EMPTY allowed-tools (list `[]` or empty scalar) must load
+// as a non-nil empty slice (restrict to zero tools). The execution filter in
+// loop.go gates on nil vs non-nil, so this distinction is what prevents an
+// explicit empty allowlist from silently granting every tool.
+func TestLoadSkills_AllowedTools_EmptyVsAbsent(t *testing.T) {
+	cases := []struct {
+		name        string
+		frontmatter string
+		wantNil     bool
+	}{
+		{"absent", "", true},
+		{"empty list", "allowed-tools: []\n", false},
+		{"empty scalar", "allowed-tools: \"\"\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			createSkillDir(t, tmp, "s", "---\nname: s\ndescription: d\n"+tc.frontmatter+"---\n\nBody.\n")
+			skills, err := LoadSkills(SkillSource{Dir: tmp, Source: "global"})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(skills) != 1 {
+				t.Fatalf("expected 1 skill, got %d", len(skills))
+			}
+			at := skills[0].AllowedTools
+			if tc.wantNil && at != nil {
+				t.Errorf("absent allowed-tools should load as nil (no restriction), got %#v", at)
+			}
+			if !tc.wantNil && (at == nil || len(at) != 0) {
+				t.Errorf("present-but-empty allowed-tools should load as non-nil empty (restrict to none), got %#v", at)
+			}
+		})
+	}
+}
+
+// The list form must survive a WriteGlobalSkill → LoadSkills round-trip, and the
+// on-disk form stays the spec-compliant scalar string (stringOrList.MarshalYAML).
+func TestWriteGlobalSkill_AllowedTools_RoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	want := []string{"read_file", "write_to_file"}
+	if err := WriteGlobalSkill(tmp, &Skill{
+		Name:         "rt",
+		Slug:         "rt",
+		Description:  "round-trip",
+		Prompt:       "Body.",
+		AllowedTools: want,
+	}); err != nil {
+		t.Fatalf("WriteGlobalSkill: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(tmp, "skills", "rt", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "allowed-tools: read_file write_to_file") {
+		t.Errorf("on-disk allowed-tools not scalar form:\n%s", raw)
+	}
+	skills, err := LoadSkills(SkillSource{Dir: filepath.Join(tmp, "skills"), Source: "global"})
+	if err != nil {
+		t.Fatalf("LoadSkills: %v", err)
+	}
+	if len(skills) != 1 || strings.Join(skills[0].AllowedTools, " ") != strings.Join(want, " ") {
+		t.Fatalf("round-trip lost allowed tools: %+v", skills)
+	}
+}
+
 func TestLoadSkills_PriorityDedup(t *testing.T) {
 	agentDir := t.TempDir()
 	globalDir := t.TempDir()

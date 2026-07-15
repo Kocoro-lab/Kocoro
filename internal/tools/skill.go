@@ -106,7 +106,12 @@ func (t *useSkillTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	}
 	var filter []string
 	var hint string
-	if len(skill.AllowedTools) > 0 {
+	// A non-nil AllowedTools activates the filter — including a present-but-empty
+	// list, which restricts the skill to zero tools (only the SkillExempt ones
+	// like use_skill/think). A nil AllowedTools (field absent) leaves the model
+	// unrestricted. Gate on != nil, NOT len > 0, so an explicit empty allowlist
+	// is honored as "grant nothing" instead of silently granting everything.
+	if skill.AllowedTools != nil {
 		filter = skill.AllowedTools
 		allowed := append([]string{}, skill.AllowedTools...)
 		allowed = append(allowed, "use_skill")
