@@ -1750,6 +1750,15 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if r.URL.Query().Get("view") == remoteTimelineView {
+		page, err := buildRemoteTimelinePage(sess, r)
+		if err != nil {
+			writeErrorCode(w, http.StatusBadRequest, "invalid_remote_timeline_page", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, page)
+		return
+	}
 	writeJSON(w, http.StatusOK, sess)
 }
 
