@@ -108,6 +108,27 @@ func TestParseCarrierProfile_ReachyWirelessNoDeviceUIDsRequired(t *testing.T) {
 	}
 }
 
+func TestParseCarrierProfile_ReachyWirelessDaemonURL(t *testing.T) {
+	p, err := ParseCarrierProfile(CarrierInputs{Carrier: CarrierReachyWireless})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ReachyDaemonURL != reachyWirelessDefaultDaemonURL {
+		t.Errorf("wireless daemon URL = %q, want %q", p.ReachyDaemonURL, reachyWirelessDefaultDaemonURL)
+	}
+
+	p, err = ParseCarrierProfile(CarrierInputs{
+		Carrier:         CarrierReachyWireless,
+		ReachyDaemonURL: "http://reachy-mini.local:8000",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ReachyDaemonURL != "http://reachy-mini.local:8000" {
+		t.Errorf("explicit wireless daemon URL lost: %q", p.ReachyDaemonURL)
+	}
+}
+
 func TestParseCarrierProfile_UnknownCapTokenFailsLoud(t *testing.T) {
 	_, err := ParseCarrierProfile(reachyUIDs(CarrierInputs{
 		Carrier: CarrierReachyLite,

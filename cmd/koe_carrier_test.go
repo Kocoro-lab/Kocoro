@@ -59,7 +59,7 @@ func TestResolveCarrierProfile_ExplicitAECWinsOverPreset(t *testing.T) {
 
 func TestResolveCarrierProfile_UnknownCarrierFailsLoud(t *testing.T) {
 	cfg := defaultKoeConfig()
-	if _, err := resolveCarrierProfile(&cfg, "reachy_wireless", "", "", ""); err == nil {
+	if _, err := resolveCarrierProfile(&cfg, "reachy_pro", "", "", ""); err == nil {
 		t.Fatal("unknown --carrier must fail loud")
 	}
 }

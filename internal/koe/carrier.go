@@ -31,9 +31,13 @@ const (
 	audioBackendGate = "gate"
 )
 
-// reachyDefaultDaemonURL is the Pollen daemon read-plane (DOA/volume) address
-// under reachy_lite when --reachy-daemon-url is not given (plan §16: port 7534).
-const reachyDefaultDaemonURL = "http://127.0.0.1:7534"
+// Pollen daemon read-plane defaults differ by topology: Lite runs the daemon on
+// the Mac-local pinned port, while Wireless runs beside Koe on the CM4 factory
+// port. An explicit --reachy-daemon-url always wins.
+const (
+	reachyLiteDefaultDaemonURL     = "http://127.0.0.1:7534"
+	reachyWirelessDefaultDaemonURL = "http://127.0.0.1:8000"
+)
 
 var validCaps = map[string]struct{}{
 	CapFullDuplex: {}, CapHasCamera: {}, CapHasBody: {}, CapHasFace: {}, CapHasScreen: {},
@@ -56,7 +60,7 @@ type CarrierInputs struct {
 	Carrier         string // --carrier ("" → mac)
 	CapsCSV         string // --caps ("" → carrier default superset)
 	BridgeSocket    string // --bridge-socket ("" → motion disabled)
-	ReachyDaemonURL string // --reachy-daemon-url ("" → reachy_lite default)
+	ReachyDaemonURL string // --reachy-daemon-url ("" → carrier-specific Reachy default)
 	AEC             string // resolved --aec/KOE_AEC ("" → carrier preset default)
 	MicUID          string // --mic-device (CoreAudio input UID)
 	SpeakerUID      string // --speaker-device (CoreAudio output UID)
@@ -119,11 +123,17 @@ func ParseCarrierProfile(in CarrierInputs) (CarrierProfile, error) {
 		p.AudioBackend = audioBackendGate
 	}
 
-	if carrier == CarrierReachyLite {
+	if carrier == CarrierReachyLite || carrier == CarrierReachyWireless {
 		p.ReachyDaemonURL = in.ReachyDaemonURL
 		if p.ReachyDaemonURL == "" {
-			p.ReachyDaemonURL = reachyDefaultDaemonURL
+			if carrier == CarrierReachyWireless {
+				p.ReachyDaemonURL = reachyWirelessDefaultDaemonURL
+			} else {
+				p.ReachyDaemonURL = reachyLiteDefaultDaemonURL
+			}
 		}
+	}
+	if carrier == CarrierReachyLite {
 		// M1 preset fail-loud (§02 lesson): reachy_lite must bind the explicit
 		// Reachy device UIDs; silently falling back to the system default mic or
 		// speaker is exactly the trap that made "voice ran" a false positive.
