@@ -180,14 +180,16 @@ func NewAudioIO() (*AudioIO, error) {
 func (a *AudioIO) markSendReady() { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
 
 // SetSpeaking marks playback as active. Production treats it as a hard mute while
-// Kocoro speaks unless VPIO barge-in is explicitly enabled.
+// Kocoro speaks unless an AEC-capable barge-in path is explicitly enabled.
 func (a *AudioIO) SetSpeaking(s bool) {
 	a.speaking.Store(s)
 	if !s {
 		a.playbackTailProtected.Store(false)
 	}
 }
-func (a *AudioIO) dropCapture() bool { return a.speaking.Load() }
+func (a *AudioIO) Speaking() bool              { return a.speaking.Load() }
+func (a *AudioIO) SetBargeInAuthorized(_ bool) {}
+func (a *AudioIO) dropCapture() bool           { return a.speaking.Load() }
 
 func (a *AudioIO) SetPlaybackTailProtected(protected bool) {
 	a.playbackTailProtected.Store(protected)

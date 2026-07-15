@@ -18,12 +18,26 @@ func TestWirelessBargeInForwardsCaptureWhileSpeaking(t *testing.T) {
 		t.Fatal("Wireless must retain half-duplex rollback when barge-in is off")
 	}
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	if !a.captureSuppressed() {
+		t.Fatal("Wireless barge-in must fail closed before sustained perception evidence")
+	}
+	a.SetBargeInAuthorized(true)
 	if a.captureSuppressed() {
-		t.Fatal("Wireless XVF capture must stay live while speaking when barge-in is on")
+		t.Fatal("sustained front speech must authorize Wireless talk-over capture")
 	}
 	a.SetUserMicOff(true)
 	if !a.captureSuppressed() {
 		t.Fatal("explicit user mic-off must outrank Wireless barge-in")
+	}
+}
+
+func TestWirelessBargeInPerceptionGateHasExplicitTestBypass(t *testing.T) {
+	a := &AudioIO{}
+	a.SetSpeaking(true)
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_BARGE_PERCEPTION_GATE", "0")
+	if a.captureSuppressed() {
+		t.Fatal("deterministic injection seam must be able to bypass perception")
 	}
 }
 

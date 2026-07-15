@@ -1689,25 +1689,49 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		log.Printf("koe[gaze]: wireless lazy sessions enabled gaze=%t face_hits=%d vad_hits=%d arm_timeout=%s",
 			gazeCfg.Enabled, gazeCfg.FaceHits, gazeCfg.VADHits, gazeCfg.ArmTimeout)
 	}
-	if wirelessLazy && gazeCfg.Enabled {
+	// Wireless barge-in and the IDLE gaze gate consume one serialized robot-local
+	// perception stream. Barge-in keeps the stream alive even when the product's
+	// IDLE gaze gate is disabled: without sustained DOA evidence Linux capture
+	// fails closed while Kocoro speaks, preventing residual XVF echo from cancelling
+	// its own response.
+	if wirelessLazy && (gazeCfg.Enabled || cfg.bargeIn) {
 		perception, perr := koe.NewPerceptionClient(cfg.carrier.ReachyDaemonURL)
-		gate, gerr := koe.NewGazeGate(gazeCfg)
+		gazeGate, gerr := koe.NewGazeGate(gazeCfg)
+		bargeGate := koe.NewBargePerceptionGate()
 		if perr != nil {
-			log.Printf("koe[gaze]: degraded: perception setup failed: %v", perr)
+			log.Printf("koe[perception]: degraded: setup failed: %v", perr)
 		} else if gerr != nil {
 			log.Printf("koe[gaze]: degraded: gate setup failed: %v", gerr)
 		} else {
 			stream, serr := perception.Stream(ctx, koe.DefaultPerceptionPollInterval())
 			if serr != nil {
-				log.Printf("koe[gaze]: degraded: perception stream failed: %v", serr)
+				log.Printf("koe[perception]: degraded: stream failed: %v", serr)
 			} else {
 				go func() {
+					defer func() {
+						if audio := snapAudio.Load(); audio != nil {
+							audio.SetBargeInAuthorized(false)
+						}
+					}()
 					for snapshot := range stream {
 						sessMu.Lock()
 						prepared := sessionWanted && sessionReady && curAudioStarted && curConn != nil
 						active := callActive
 						sessMu.Unlock()
-						decision := gate.Update(koe.GazeInput{
+						audio := snapAudio.Load()
+						speaking := audio != nil && audio.Speaking()
+						bargeDecision := bargeGate.Update(snapshot.ObservedAt, active, speaking, snapshot)
+						if audio != nil {
+							audio.SetBargeInAuthorized(cfg.bargeIn && bargeDecision.Authorized)
+						}
+						if cfg.bargeIn && bargeDecision.Changed {
+							state := "closed"
+							if bargeDecision.Authorized {
+								state = "open"
+							}
+							log.Printf("koe[barge]: perception gate=%s reason=%s hits=%d", state, bargeDecision.Reason, bargeDecision.Hits)
+						}
+						decision := gazeGate.Update(koe.GazeInput{
 							Now:        snapshot.ObservedAt,
 							Snapshot:   snapshot,
 							Prepared:   prepared,

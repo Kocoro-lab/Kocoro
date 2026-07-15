@@ -40,6 +40,7 @@ type AudioIO struct {
 	playBuf chan []int16
 
 	speaking      atomic.Bool
+	bargeAllowed  atomic.Bool // sustained robot-local DOA/VAD authorized talk-over
 	userMicOff    atomic.Bool
 	userMicSticky atomic.Bool
 	playback      atomic.Bool
@@ -118,10 +119,19 @@ func (a *AudioIO) InputLevel() float64 {
 	}
 	return math.Float64frombits(a.inLevel.Load())
 }
-func (a *AudioIO) OutputLevel() float64    { return math.Float64frombits(a.outLevel.Load()) }
-func (a *AudioIO) PlaybackIdle() bool      { return a.OutputLevel() < playbackIdleLevelEps }
-func (a *AudioIO) markSendReady()          { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
-func (a *AudioIO) SetSpeaking(s bool)      { a.speaking.Store(s) }
+func (a *AudioIO) OutputLevel() float64 { return math.Float64frombits(a.outLevel.Load()) }
+func (a *AudioIO) PlaybackIdle() bool   { return a.OutputLevel() < playbackIdleLevelEps }
+func (a *AudioIO) markSendReady()       { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
+func (a *AudioIO) SetSpeaking(s bool) {
+	a.speaking.Store(s)
+	if !s {
+		a.bargeAllowed.Store(false)
+	}
+}
+func (a *AudioIO) Speaking() bool { return a.speaking.Load() }
+func (a *AudioIO) SetBargeInAuthorized(allowed bool) {
+	a.bargeAllowed.Store(allowed)
+}
 func (a *AudioIO) dropCapture() bool       { return a.speaking.Load() }
 func (a *AudioIO) SetUserMicOff(off bool)  { a.userMicOff.Store(off) }
 func (a *AudioIO) UserMicOff() bool        { return a.userMicOff.Load() }
@@ -131,10 +141,20 @@ func (a *AudioIO) captureSuppressed() bool {
 	if a.userMicOff.Load() {
 		return true
 	}
-	// XVF3800 has already removed the robot's own speaker signal before this
-	// stream reaches Koe. With explicit barge-in enabled, keep forwarding the mic
-	// while speaking; otherwise retain the half-duplex rollback gate.
-	return a.dropCapture() && !koeEnvBool("KOE_VPIO_BARGE_IN", false)
+	if !a.dropCapture() {
+		return false
+	}
+	if !koeEnvBool("KOE_VPIO_BARGE_IN", false) {
+		return true
+	}
+	// First-hand Wireless E2E showed that XVF AEC can report converged yet still
+	// leak enough robot speech to trigger Realtime server VAD. Product barge-in is
+	// therefore fail-closed until the robot-local DOA stream sees sustained front
+	// speech. The bypass is a deterministic injection/test seam, never the default.
+	if !koeEnvBool("KOE_BARGE_PERCEPTION_GATE", true) {
+		return false
+	}
+	return !a.bargeAllowed.Load()
 }
 func (a *AudioIO) CaptureExpected() bool  { return !a.captureSuppressed() }
 func (a *AudioIO) Frames() <-chan []int16 { return a.frames }
