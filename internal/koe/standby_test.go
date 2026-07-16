@@ -6,13 +6,29 @@ import (
 	"time"
 )
 
+// standbySnapshot is a healthy sample with a person in view — the ordinary
+// "someone is standing in front of the robot" case.
 func standbySnapshot(now time.Time, speech bool, angle float64) PerceptionSnapshot {
+	return standbySnapshotFace(now, true, speech, angle)
+}
+
+func standbySnapshotFace(now time.Time, face, speech bool, angle float64) PerceptionSnapshot {
 	return PerceptionSnapshot{
 		ObservedAt: now,
 		Health:     PerceptionOK,
-		Face:       FaceSample{Available: true, Fresh: true},
+		Face:       FaceSample{Available: true, Fresh: true, Detected: face},
 		DOA:        DOASample{Available: true, Fresh: true, Angle: angle, SpeechDetected: speech},
 	}
+}
+
+// feed runs n samples at the 100ms poll cadence, returning the last decision.
+func feed(g *StandbyGate, now *time.Time, n int, snap func(time.Time) PerceptionSnapshot) StandbyDecision {
+	var d StandbyDecision
+	for i := 0; i < n; i++ {
+		*now = now.Add(100 * time.Millisecond)
+		d = g.Update(StandbyInput{Now: *now, Snapshot: snap(*now)})
+	}
+	return d
 }
 
 func standbyActionKinds(d StandbyDecision) []StandbyActionKind {
@@ -54,29 +70,104 @@ func TestParseOpenMode(t *testing.T) {
 	}
 }
 
-// Front speech is the only condition: no face is required, and exactly one
-// activation is issued per utterance.
-func TestStandbyGateActivatesOnFrontSpeechWithoutFace(t *testing.T) {
+// The product promise: stand in front of the robot and speak. Face + sustained
+// front VAD activates exactly once per utterance.
+func TestStandbyGateActivatesOnFaceAndFrontSpeech(t *testing.T) {
 	now := time.Unix(100, 0)
+	cfg := enabledStandbyConfig()
+	g := newTestStandbyGate(t, cfg)
+
+	// Every sample below the VAD bar is silent.
+	for i := 0; i < cfg.VADHits-1; i++ {
+		if d := feed(g, &now, 1, func(n time.Time) PerceptionSnapshot {
+			return standbySnapshot(n, true, math.Pi/2)
+		}); len(d.Actions) != 0 {
+			t.Fatalf("activated at hit %d, below the %d-hit bar: %v", i+1, cfg.VADHits, standbyActionKinds(d))
+		}
+	}
+
+	d := feed(g, &now, 1, func(n time.Time) PerceptionSnapshot { return standbySnapshot(n, true, math.Pi/2) })
+	if len(d.Actions) != 1 || d.Actions[0].Kind != StandbyActivate || d.Reason != "face_speech_front" {
+		t.Fatalf("activation decision = %+v", d)
+	}
+
+	// Still speaking, call not up yet: the gate must not re-issue.
+	if d := feed(g, &now, 3, func(n time.Time) PerceptionSnapshot {
+		return standbySnapshot(n, true, math.Pi/2)
+	}); len(d.Actions) != 0 {
+		t.Fatalf("repeat activation = %v", standbyActionKinds(d))
+	}
+}
+
+// The 2026-07-16 field regression: this XVF3800 reports front-directed
+// speech_detected with nobody talking, and it opened two calls. Noise with no
+// face in view must never activate, however long it sustains.
+func TestStandbyGateNoiseWithoutFaceNeverActivates(t *testing.T) {
+	now := time.Unix(150, 0)
 	g := newTestStandbyGate(t, enabledStandbyConfig())
 
-	snap := standbySnapshot(now, true, math.Pi/2)
-	snap.Face = FaceSample{Available: true, Fresh: true, Detected: false}
-	if d := g.Update(StandbyInput{Now: now, Snapshot: snap}); len(d.Actions) != 0 {
-		t.Fatalf("first speech sample actions = %v", standbyActionKinds(d))
+	// 10s of sustained front "speech" — the hardware's false-positive signature.
+	for i := 0; i < 100; i++ {
+		d := feed(g, &now, 1, func(n time.Time) PerceptionSnapshot {
+			return standbySnapshotFace(n, false, true, math.Pi/2)
+		})
+		if len(d.Actions) != 0 {
+			t.Fatalf("room noise opened a call at sample %d: %+v", i, d)
+		}
+	}
+	// The rejection is reported once per burst, not at poll rate.
+	if g.State() != StandbyIdle {
+		t.Fatalf("state = %s, want idle", g.State())
+	}
+}
+
+// A face that has gone stale (person left, tracker still healthy) must not keep
+// the door open for noise that arrives afterwards.
+func TestStandbyGateFaceMustBeFresherThanFaceHold(t *testing.T) {
+	now := time.Unix(180, 0)
+	cfg := enabledStandbyConfig()
+	g := newTestStandbyGate(t, cfg)
+
+	// Person seen, then leaves; no speech yet.
+	feed(g, &now, 2, func(n time.Time) PerceptionSnapshot { return standbySnapshot(n, false, math.Pi/2) })
+	now = now.Add(cfg.FaceHold + 100*time.Millisecond)
+
+	d := feed(g, &now, cfg.VADHits+2, func(n time.Time) PerceptionSnapshot {
+		return standbySnapshotFace(n, false, true, math.Pi/2)
+	})
+	if len(d.Actions) != 0 {
+		t.Fatalf("stale face let noise open a call: %+v", d)
 	}
 
-	now = now.Add(100 * time.Millisecond)
-	snap = standbySnapshot(now, true, math.Pi/2)
-	d := g.Update(StandbyInput{Now: now, Snapshot: snap})
-	if len(d.Actions) != 1 || d.Actions[0].Kind != StandbyActivate || d.Reason != "speech_front" {
-		t.Fatalf("second speech sample decision = %+v", d)
+	// YuNet dropping the face for a beat inside FaceHold must still activate —
+	// otherwise a stationary person can never open a conversation.
+	g2 := newTestStandbyGate(t, cfg)
+	now = time.Unix(200, 0)
+	feed(g2, &now, 1, func(n time.Time) PerceptionSnapshot { return standbySnapshot(n, false, math.Pi/2) })
+	d = feed(g2, &now, cfg.VADHits, func(n time.Time) PerceptionSnapshot {
+		return standbySnapshotFace(n, false, true, math.Pi/2) // detector dropout, still within FaceHold
+	})
+	if len(d.Actions) != 1 || d.Reason != "face_speech_front" {
+		t.Fatalf("detector dropout within FaceHold blocked activation: %+v", d)
 	}
+}
 
-	// Still speaking, still no call yet: the gate must not re-issue.
-	now = now.Add(100 * time.Millisecond)
-	if d := g.Update(StandbyInput{Now: now, Snapshot: standbySnapshot(now, true, math.Pi/2)}); len(d.Actions) != 0 {
-		t.Fatalf("repeat activation = %v", standbyActionKinds(d))
+// Evidence survives the missing-face window: a person who walks up while already
+// talking opens the conversation on the next sample, with no re-arm penalty.
+func TestStandbyGateActivatesWhenFaceArrivesDuringSpeech(t *testing.T) {
+	now := time.Unix(250, 0)
+	cfg := enabledStandbyConfig()
+	g := newTestStandbyGate(t, cfg)
+
+	d := feed(g, &now, cfg.VADHits+3, func(n time.Time) PerceptionSnapshot {
+		return standbySnapshotFace(n, false, true, math.Pi/2)
+	})
+	if len(d.Actions) != 0 {
+		t.Fatalf("activated with no face: %+v", d)
+	}
+	d = feed(g, &now, 1, func(n time.Time) PerceptionSnapshot { return standbySnapshot(n, true, math.Pi/2) })
+	if len(d.Actions) != 1 || d.Reason != "face_speech_front" {
+		t.Fatalf("face arriving mid-speech did not activate: %+v", d)
 	}
 }
 
@@ -122,62 +213,86 @@ func TestStandbyGateCooldownBlocksEchoRetrigger(t *testing.T) {
 		t.Fatalf("cooldown completion = %+v", d)
 	}
 	// Evidence collected during cooldown must not carry over.
-	now = now.Add(100 * time.Millisecond)
-	if d := g.Update(StandbyInput{Now: now, Snapshot: standbySnapshot(now, true, math.Pi/2)}); len(d.Actions) != 0 {
+	if d := feed(g, &now, cfg.VADHits-1, func(n time.Time) PerceptionSnapshot {
+		return standbySnapshot(n, true, math.Pi/2)
+	}); len(d.Actions) != 0 {
 		t.Fatalf("cooldown evidence leaked into idle: %v", standbyActionKinds(d))
 	}
-	now = now.Add(100 * time.Millisecond)
-	if d := g.Update(StandbyInput{Now: now, Snapshot: standbySnapshot(now, true, math.Pi/2)}); len(d.Actions) != 1 {
+	if d := feed(g, &now, 1, func(n time.Time) PerceptionSnapshot {
+		return standbySnapshot(n, true, math.Pi/2)
+	}); len(d.Actions) != 1 {
 		t.Fatalf("re-arm after cooldown = %+v", d)
 	}
 }
 
 func TestStandbyGateDegradesAndRecovers(t *testing.T) {
 	now := time.Unix(400, 0)
-	g := newTestStandbyGate(t, enabledStandbyConfig())
+	cfg := enabledStandbyConfig()
+	g := newTestStandbyGate(t, cfg)
 
-	now = now.Add(100 * time.Millisecond)
-	g.Update(StandbyInput{Now: now, Snapshot: standbySnapshot(now, true, math.Pi/2)}) // one hit banked
+	feed(g, &now, 1, func(n time.Time) PerceptionSnapshot { return standbySnapshot(n, true, math.Pi/2) }) // one hit banked
 
-	now = now.Add(100 * time.Millisecond)
-	bad := standbySnapshot(now, true, math.Pi/2)
-	bad.Health = PerceptionDaemonUnreachable
-	d := g.Update(StandbyInput{Now: now, Snapshot: bad})
+	d := feed(g, &now, 1, func(n time.Time) PerceptionSnapshot {
+		bad := standbySnapshot(n, true, math.Pi/2)
+		bad.Health = PerceptionDaemonUnreachable
+		return bad
+	})
 	if d.State != StandbyDegraded || len(d.Actions) != 0 {
 		t.Fatalf("unreachable decision = %+v", d)
 	}
 
 	// Recovery re-arms from zero: stale evidence from before the gap must not
 	// combine with one fresh sample into an activation.
-	now = now.Add(100 * time.Millisecond)
-	if d := g.Update(StandbyInput{Now: now, Snapshot: standbySnapshot(now, true, math.Pi/2)}); d.State != StandbyIdle || d.Reason != "perception_recovered" || len(d.Actions) != 0 {
+	d = feed(g, &now, 1, func(n time.Time) PerceptionSnapshot { return standbySnapshot(n, true, math.Pi/2) })
+	if d.State != StandbyIdle || d.Reason != "perception_recovered" || len(d.Actions) != 0 {
 		t.Fatalf("recovery decision = %+v", d)
 	}
-	now = now.Add(100 * time.Millisecond)
-	if d := g.Update(StandbyInput{Now: now, Snapshot: standbySnapshot(now, true, math.Pi/2)}); len(d.Actions) != 0 {
-		t.Fatalf("first post-recovery hit activated: %v", standbyActionKinds(d))
+	if d := feed(g, &now, cfg.VADHits-1, func(n time.Time) PerceptionSnapshot {
+		return standbySnapshot(n, true, math.Pi/2)
+	}); len(d.Actions) != 0 {
+		t.Fatalf("post-recovery hits activated early: %v", standbyActionKinds(d))
 	}
-	now = now.Add(100 * time.Millisecond)
-	if d := g.Update(StandbyInput{Now: now, Snapshot: standbySnapshot(now, true, math.Pi/2)}); len(d.Actions) != 1 {
+	if d := feed(g, &now, 1, func(n time.Time) PerceptionSnapshot {
+		return standbySnapshot(n, true, math.Pi/2)
+	}); len(d.Actions) != 1 {
 		t.Fatalf("post-recovery activation = %+v", d)
 	}
 }
 
-// A missing camera must not disable resident listening — face is a gaze input.
-func TestStandbyGateToleratesStaleFace(t *testing.T) {
+// A dead face channel leaves only the DOA/VAD that false-positives on room
+// noise, so standby must silently disable rather than degrade into a
+// noise-triggered mode — and re-arm from zero once the tracker recovers.
+func TestStandbyGateDisablesWhenFaceChannelIsUnavailable(t *testing.T) {
 	now := time.Unix(500, 0)
-	g := newTestStandbyGate(t, enabledStandbyConfig())
-	for i := 0; i < 2; i++ {
-		now = now.Add(100 * time.Millisecond)
-		snap := standbySnapshot(now, true, math.Pi/2)
+	cfg := enabledStandbyConfig()
+	g := newTestStandbyGate(t, cfg)
+
+	faceStale := func(n time.Time) PerceptionSnapshot {
+		snap := standbySnapshot(n, true, math.Pi/2)
 		snap.Health = PerceptionFaceStale
-		snap.Face = FaceSample{}
-		if d := g.Update(StandbyInput{Now: now, Snapshot: snap}); d.State == StandbyDegraded {
-			t.Fatalf("face-stale snapshot degraded standby: %+v", d)
-		}
+		snap.Face = FaceSample{} // tracker stopped: unavailable, not merely "no face"
+		return snap
 	}
-	if g.State() != StandbyIdle {
-		t.Fatalf("state = %s", g.State())
+	d := feed(g, &now, cfg.VADHits+5, faceStale)
+	if d.State != StandbyDegraded || d.Reason != string(PerceptionFaceStale) || len(d.Actions) != 0 {
+		t.Fatalf("face-stale decision = %+v, want a silent degrade", d)
+	}
+
+	// Recovery re-arms from zero: pre-outage evidence must not combine with one
+	// fresh sample into an activation.
+	d = feed(g, &now, 1, func(n time.Time) PerceptionSnapshot { return standbySnapshot(n, true, math.Pi/2) })
+	if d.State != StandbyIdle || d.Reason != "perception_recovered" || len(d.Actions) != 0 {
+		t.Fatalf("recovery decision = %+v", d)
+	}
+	d = feed(g, &now, cfg.VADHits-1, func(n time.Time) PerceptionSnapshot {
+		return standbySnapshot(n, true, math.Pi/2)
+	})
+	if len(d.Actions) != 0 {
+		t.Fatalf("re-armed gate activated early: %+v", d)
+	}
+	d = feed(g, &now, 1, func(n time.Time) PerceptionSnapshot { return standbySnapshot(n, true, math.Pi/2) })
+	if len(d.Actions) != 1 || d.Reason != "face_speech_front" {
+		t.Fatalf("post-recovery activation = %+v", d)
 	}
 }
 
@@ -193,6 +308,21 @@ func TestStandbyGateDisabledNeverActivates(t *testing.T) {
 	}
 }
 
+// The shipped bar is the fix for the 2026-07-16 noise activations. Pin it: a
+// silent default regression would re-open exactly that bug on the same hardware.
+func TestStandbyDefaultsPinTheAntiNoiseBar(t *testing.T) {
+	cfg := DefaultStandbyConfig()
+	if cfg.VADHits != 3 {
+		t.Errorf("default VAD hits = %d, want 3", cfg.VADHits)
+	}
+	if cfg.FaceHold != 1500*time.Millisecond {
+		t.Errorf("default face hold = %s, want 1.5s", cfg.FaceHold)
+	}
+	if cfg.Enabled {
+		t.Error("standby must default off (trigger is the shipped mode)")
+	}
+}
+
 func TestStandbyConfigFromEnv(t *testing.T) {
 	cfg, err := standbyConfigFromLookup(func(k string) (string, bool) {
 		switch k {
@@ -201,7 +331,9 @@ func TestStandbyConfigFromEnv(t *testing.T) {
 		case "KOE_STANDBY_COOLDOWN_MS":
 			return "9000", true
 		case "KOE_STANDBY_VAD_HITS":
-			return "3", true
+			return "4", true
+		case "KOE_STANDBY_FACE_HOLD_MS":
+			return "2000", true
 		case "KOE_STANDBY_FRONT_DEG":
 			return "45", true
 		}
@@ -210,7 +342,7 @@ func TestStandbyConfigFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.IdleHangup != 40*time.Second || cfg.Cooldown != 9*time.Second || cfg.VADHits != 3 {
+	if cfg.IdleHangup != 40*time.Second || cfg.Cooldown != 9*time.Second || cfg.VADHits != 4 || cfg.FaceHold != 2*time.Second {
 		t.Fatalf("cfg = %+v", cfg)
 	}
 	if math.Abs(cfg.FrontHalfAngle-math.Pi/4) > 1e-9 {
@@ -222,7 +354,7 @@ func TestStandbyConfigFromEnv(t *testing.T) {
 		t.Fatal("standby config from env must not enable the mode")
 	}
 
-	for _, k := range []string{"KOE_STANDBY_IDLE_HANGUP_S", "KOE_STANDBY_COOLDOWN_MS", "KOE_STANDBY_VAD_HITS", "KOE_STANDBY_FRONT_DEG"} {
+	for _, k := range []string{"KOE_STANDBY_IDLE_HANGUP_S", "KOE_STANDBY_COOLDOWN_MS", "KOE_STANDBY_VAD_HITS", "KOE_STANDBY_FRONT_DEG", "KOE_STANDBY_FACE_HOLD_MS"} {
 		key := k
 		if _, err := standbyConfigFromLookup(func(name string) (string, bool) {
 			if name == key {

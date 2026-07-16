@@ -19,7 +19,16 @@ const (
 )
 
 const (
-	defaultStandbyVADHits    = 2
+	// This XVF3800 reports front-directed speech_detected with nobody talking
+	// (field evidence: 45-53 degree false positives, and two noise-opened calls on
+	// 2026-07-16). DOA alone cannot open a conversation, so activation additionally
+	// requires a freshly tracked face — and the VAD evidence bar is three hits, not
+	// two, so a hardware pulse train has to survive longer to count.
+	defaultStandbyVADHits = 3
+	// Same semantics as the gaze gate's FaceHold: YuNet drops a stationary face for
+	// a beat or two, so require a face seen within this window rather than in the
+	// exact sample that carries the VAD hit.
+	defaultStandbyFaceHold   = 1500 * time.Millisecond
 	defaultStandbyCooldown   = 5 * time.Second
 	defaultStandbyIdleHangup = 25 * time.Second
 )
@@ -50,6 +59,7 @@ func OpenModeFromEnv() (string, error) { return ParseOpenMode(os.Getenv("KOE_OPE
 type StandbyConfig struct {
 	Enabled        bool
 	VADHits        int
+	FaceHold       time.Duration
 	FrontHalfAngle float64
 	Cooldown       time.Duration
 	IdleHangup     time.Duration
@@ -59,6 +69,7 @@ func DefaultStandbyConfig() StandbyConfig {
 	return StandbyConfig{
 		Enabled:        false,
 		VADHits:        defaultStandbyVADHits,
+		FaceHold:       defaultStandbyFaceHold,
 		FrontHalfAngle: math.Pi / 3,
 		Cooldown:       defaultStandbyCooldown,
 		IdleHangup:     defaultStandbyIdleHangup,
@@ -88,6 +99,13 @@ func standbyConfigFromLookup(lookup func(string) (string, bool)) (StandbyConfig,
 		}
 		cfg.FrontHalfAngle = v * math.Pi / 180
 	}
+	if raw, ok := lookup("KOE_STANDBY_FACE_HOLD_MS"); ok {
+		v, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || v < 100 || v > 10_000 {
+			return StandbyConfig{}, fmt.Errorf("koe[standby]: KOE_STANDBY_FACE_HOLD_MS must be an integer in 100..10000")
+		}
+		cfg.FaceHold = time.Duration(v) * time.Millisecond
+	}
 	if raw, ok := lookup("KOE_STANDBY_COOLDOWN_MS"); ok {
 		v, err := strconv.Atoi(strings.TrimSpace(raw))
 		if err != nil || v < 100 || v > 60_000 {
@@ -112,7 +130,7 @@ func (c StandbyConfig) validate() error {
 	if c.VADHits < 1 || c.VADHits > 20 {
 		return fmt.Errorf("koe[standby]: vad hit count must be in 1..20")
 	}
-	if c.Cooldown <= 0 || c.IdleHangup <= 0 {
+	if c.FaceHold <= 0 || c.Cooldown <= 0 || c.IdleHangup <= 0 {
 		return fmt.Errorf("koe[standby]: durations must be positive")
 	}
 	if !finite(c.FrontHalfAngle) || c.FrontHalfAngle <= 0 || c.FrontHalfAngle >= math.Pi/2 {
@@ -135,7 +153,8 @@ type StandbyActionKind string
 
 // StandbyActivate asks the runtime to open a call. Standby, like the gaze gate,
 // only ever OPENS a call from idle; hang-up is owned by the idle gate, the
-// end_call tool, or Desktop.
+// end_call tool, or Desktop. It is issued only for reason "face_speech_front" —
+// a face freshly tracked within FaceHold plus sustained front-directed speech.
 const StandbyActivate StandbyActionKind = "activate"
 
 type StandbyAction struct{ Kind StandbyActionKind }
@@ -153,21 +172,27 @@ type StandbyInput struct {
 	CallActive bool
 }
 
-// StandbyGate is the pure resident-listen trigger policy: speaking toward the
-// robot's front opens the conversation. Unlike the gaze gate it has no face
-// condition and no preparation phase — standby keeps the Realtime session hot,
-// so activation is a single step. It owns no I/O; the resident runtime feeds it
-// the same robot-local perception stream and executes the returned actions.
+// StandbyGate is the pure resident-listen trigger policy: standing in front of
+// the robot AND speaking opens the conversation. Both halves are load-bearing —
+// this XVF3800 emits front-directed speech_detected for room noise with nobody
+// talking, so a face freshly tracked within FaceHold is what separates "someone
+// is talking to me" from "the hardware VAD twitched". Unlike the gaze gate there
+// is no preparation phase: standby keeps the Realtime session hot, so activation
+// is a single step.
 //
-// The room is never uploaded while idle: this gate reads only the robot-local
-// XVF DOA/VAD snapshot, and call audio capture starts inside startCall.
+// It owns no I/O; the resident runtime feeds it the same robot-local perception
+// stream and executes the returned actions. The room is never uploaded while
+// idle: this gate reads only the robot-local camera/XVF snapshot, and call audio
+// capture starts inside startCall.
 type StandbyGate struct {
 	cfg   StandbyConfig
 	state StandbyState
 
 	vadHits        int
+	lastFaceSeen   time.Time
 	cooldownUntil  time.Time
 	activateIssued bool
+	noFaceReported bool
 	wasCallActive  bool
 }
 
@@ -233,6 +258,10 @@ func (g *StandbyGate) Update(in StandbyInput) StandbyDecision {
 		return g.transition(StandbyIdle, "cooldown_complete")
 	}
 
+	if in.Snapshot.Face.Detected {
+		g.lastFaceSeen = now
+	}
+
 	front := math.Abs(in.Snapshot.DOA.Angle-math.Pi/2) <= g.cfg.FrontHalfAngle
 	if in.Snapshot.DOA.SpeechDetected && front {
 		g.vadHits++
@@ -241,31 +270,46 @@ func (g *StandbyGate) Update(in StandbyInput) StandbyDecision {
 		// A clean no-speech sample re-arms the gate, so a failed activation (e.g.
 		// audio start error) does not wedge standby until the next call.
 		g.activateIssued = false
+		g.noFaceReported = false
 	}
-	if g.vadHits >= g.cfg.VADHits && !g.activateIssued {
-		g.activateIssued = true
-		return StandbyDecision{State: g.state, Reason: "speech_front", Actions: []StandbyAction{{Kind: StandbyActivate}}}
+	if g.vadHits < g.cfg.VADHits || g.activateIssued {
+		return StandbyDecision{State: g.state}
 	}
-	return StandbyDecision{State: g.state}
+	// The VAD bar is met — but without a face this is the hardware's own noise
+	// floor talking. Hold the door closed and keep the evidence, so the moment a
+	// real person steps in front while still speaking, the next sample opens.
+	// Report it once per burst: sustained noise would otherwise log at poll rate.
+	if g.lastFaceSeen.IsZero() || now.Sub(g.lastFaceSeen) > g.cfg.FaceHold {
+		if g.noFaceReported {
+			return StandbyDecision{State: g.state}
+		}
+		g.noFaceReported = true
+		return StandbyDecision{State: g.state, Reason: "speech_front_no_face"}
+	}
+	g.activateIssued = true
+	return StandbyDecision{State: g.state, Reason: "face_speech_front", Actions: []StandbyAction{{Kind: StandbyActivate}}}
 }
 
-// standbyPerceptionUnusable reports whether the snapshot lacks trustworthy DOA.
-// Standby deliberately tolerates a stale/absent FACE sample — face is a gaze-gate
-// input, and resident listening must keep working with the camera unavailable.
+// standbyPerceptionUnusable reports whether the snapshot can be trusted to open a
+// conversation. Standby needs BOTH channels: without a working face tracker its
+// only remaining evidence is the DOA/VAD that false-positives on room noise, so a
+// camera outage must silently disable the mode rather than degrade it into a
+// noise-triggered one. Recovery re-arms on the next healthy sample.
 func standbyPerceptionUnusable(s PerceptionSnapshot) (string, bool) {
-	switch s.Health {
-	case PerceptionDaemonUnreachable, PerceptionInvalidPayload:
+	if s.Healthy() {
+		return "", false
+	}
+	if s.Health != PerceptionOK {
 		return string(s.Health), true
 	}
-	if !s.DOA.Available || !s.DOA.Fresh {
-		return string(PerceptionDOAUnavailable), true
-	}
-	return "", false
+	return string(PerceptionDOAUnavailable), true
 }
 
 func (g *StandbyGate) resetEvidence() {
 	g.vadHits = 0
+	g.lastFaceSeen = time.Time{}
 	g.activateIssued = false
+	g.noFaceReported = false
 }
 
 func (g *StandbyGate) transition(state StandbyState, reason string, actions ...StandbyAction) StandbyDecision {

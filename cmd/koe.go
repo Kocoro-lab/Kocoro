@@ -1895,8 +1895,14 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	if wirelessLazy {
 		log.Printf("koe[gaze]: wireless lazy sessions enabled gaze=%t face_hits=%d vad_hits=%d arm_timeout=%s",
 			gazeCfg.Enabled, gazeCfg.FaceHits, gazeCfg.VADHits, gazeCfg.ArmTimeout)
-		log.Printf("koe[standby]: open_mode=%s resident_session=%t vad_hits=%d cooldown=%s idle_hangup=%s",
-			cfg.carrier.OpenMode, standbyResident, standbyCfg.VADHits, standbyCfg.Cooldown, standbyCfg.IdleHangup)
+		log.Printf("koe[standby]: open_mode=%s resident_session=%t vad_hits=%d face_hold=%s cooldown=%s idle_hangup=%s",
+			cfg.carrier.OpenMode, standbyResident, standbyCfg.VADHits, standbyCfg.FaceHold, standbyCfg.Cooldown, standbyCfg.IdleHangup)
+		if standbyResident && !cfg.carrier.HasCap(koe.CapHasFace) {
+			// Not fatal: the manual trigger key and /call/start still work, and the
+			// gate itself fails closed. Say so loudly — silent non-activation on a
+			// robot the user explicitly put in standby is otherwise unexplainable.
+			log.Printf("koe[standby]: WARNING open_mode=standby needs the has_face capability; auto-activation will stay closed on this carrier")
+		}
 	}
 	// Wireless barge-in and the IDLE gaze gate consume one serialized robot-local
 	// perception stream. Barge-in keeps the stream alive even when the product's
@@ -1975,7 +1981,14 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 							Snapshot:   snapshot,
 							CallActive: active,
 						})
-						if standbyDecision.Changed || standbyDecision.Reason == "speech_front" {
+						// Only these two reasons are latched to once per speech burst; the
+						// steady-state ones (call_active, disabled) repeat every sample, so
+						// an "any reason" condition would log at poll rate.
+						// speech_front_no_face is the counter-evidence trail for XVF false
+						// positives — keep it.
+						if standbyDecision.Changed ||
+							standbyDecision.Reason == "face_speech_front" ||
+							standbyDecision.Reason == "speech_front_no_face" {
 							log.Printf("koe[standby]: state=%s reason=%s", standbyDecision.State, standbyDecision.Reason)
 						}
 						for _, action := range standbyDecision.Actions {
