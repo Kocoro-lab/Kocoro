@@ -1178,13 +1178,21 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	var sessionReady bool
 	var callActive bool
 	// Mac/Lite retain an always-wanted warm session. Wireless sets this only for
-	// a manual call or one bounded gaze encounter, so no 24/7 Realtime session is
-	// created merely because the robot process is alive.
+	// a manual call or one bounded gaze encounter. A separate Desktop-renewed
+	// prewarm lease can keep the session hot while Reachy is the selected Koe
+	// carrier; expiry prevents one request from becoming a 24/7 connection.
 	sessionWanted := !wirelessLazy
+	var prewarmLeaseUntil time.Time
+	var prewarmLeaseSeq uint64
 	var callStarted time.Time
 	var readyEmitted bool
 	idleSessionTTL := koeWarmSessionTTL()
-	shouldHaveSessionLocked := func() bool { return !wirelessLazy || sessionWanted }
+	prewarmLeaseActiveLocked := func() bool {
+		return wirelessLazy && !prewarmLeaseUntil.IsZero() && time.Now().Before(prewarmLeaseUntil)
+	}
+	shouldHaveSessionLocked := func() bool {
+		return !wirelessLazy || sessionWanted || prewarmLeaseActiveLocked()
+	}
 
 	stopSessionResources := func(conn *koe.RealtimeConn, cancel context.CancelFunc, audio *koe.AudioIO) {
 		if cancel != nil {
@@ -1264,9 +1272,6 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	var scheduleWarmRotationLocked func(uint64, string)
 	var handleSessionClosed func(uint64, error)
 	scheduleWarmRetry := func(reason string) {
-		if wirelessLazy {
-			return // one gaze encounter / manual attempt is bounded; never retry forever while idle
-		}
 		go func() {
 			select {
 			case <-time.After(5 * time.Second):
@@ -1275,13 +1280,13 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			}
 			sessMu.Lock()
 			defer sessMu.Unlock()
-			if curConn == nil && !warming {
+			if shouldHaveSessionLocked() && curConn == nil && !warming {
 				ensureWarmSessionLocked(reason)
 			}
 		}()
 	}
 	scheduleWarmRotationLocked = func(seq uint64, reason string) {
-		if wirelessLazy || idleSessionTTL <= 0 {
+		if idleSessionTTL <= 0 || (wirelessLazy && !prewarmLeaseActiveLocked()) {
 			return
 		}
 		go func() {
@@ -1649,7 +1654,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		sessMu.Lock()
 		if !callActive {
 			sessionWanted = false
-			conn, cancel, audio = closeSessionLocked(true)
+			if !shouldHaveSessionLocked() {
+				conn, cancel, audio = closeSessionLocked(true)
+			}
 			cancelled = true
 		}
 		sessMu.Unlock()
@@ -1660,7 +1667,81 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		log.Printf("koe[gaze]: preparation cancelled reason=%s", reason)
 	}
 
+	sessionLeaseStatusLocked := func() koe.SessionLeaseStatus {
+		status := koe.SessionLeaseStatus{Status: "ok", PrewarmState: "disconnected"}
+		if !prewarmLeaseActiveLocked() {
+			return status
+		}
+		status.ExpiresAt = prewarmLeaseUntil.UTC().Format(time.RFC3339Nano)
+		switch {
+		case callActive:
+			status.PrewarmState = "in_call"
+		case sessionReady && curConn != nil:
+			status.PrewarmState = "ready"
+		default:
+			status.PrewarmState = "connecting"
+		}
+		return status
+	}
+	prepareSession := func(lease time.Duration) koe.SessionLeaseStatus {
+		sessMu.Lock()
+		prewarmLeaseUntil = time.Now().Add(lease)
+		prewarmLeaseSeq++
+		seq := prewarmLeaseSeq
+		expires := prewarmLeaseUntil
+		ensureWarmSessionLocked("desktop_prepare")
+		status := sessionLeaseStatusLocked()
+		sessMu.Unlock()
+
+		go func() {
+			timer := time.NewTimer(time.Until(expires))
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return
+			}
+			var conn *koe.RealtimeConn
+			var cancel context.CancelFunc
+			var audio *koe.AudioIO
+			sessMu.Lock()
+			if seq == prewarmLeaseSeq && !time.Now().Before(prewarmLeaseUntil) {
+				prewarmLeaseUntil = time.Time{}
+				if !callActive && !sessionWanted {
+					conn, cancel, audio = closeSessionLocked(true)
+				}
+			}
+			sessMu.Unlock()
+			stopSessionResources(conn, cancel, audio)
+		}()
+		return status
+	}
+	releaseSession := func() koe.SessionLeaseStatus {
+		var conn *koe.RealtimeConn
+		var cancel context.CancelFunc
+		var audio *koe.AudioIO
+		sessMu.Lock()
+		prewarmLeaseUntil = time.Time{}
+		prewarmLeaseSeq++
+		if !callActive && !sessionWanted {
+			conn, cancel, audio = closeSessionLocked(true)
+		}
+		status := sessionLeaseStatusLocked()
+		sessMu.Unlock()
+		stopSessionResources(conn, cancel, audio)
+		return status
+	}
+
 	ctrl = koe.NewControlServer(startCall, endCall, interruptCall)
+	if wirelessLazy {
+		ctrl.SetSessionHandlers(prepareSession, releaseSession)
+		ctrl.SetPrewarmSnapshotProvider(func() (state, expiresAt string) {
+			sessMu.Lock()
+			defer sessMu.Unlock()
+			status := sessionLeaseStatusLocked()
+			return status.PrewarmState, status.ExpiresAt
+		})
+	}
 	ctrl.SetToken(cfg.controlToken)
 	// GET /carrier/status: bound = Koe is wired to explicit device UIDs (not the
 	// system default). reachy_lite's fail-loud guarantees both are set; mac with no

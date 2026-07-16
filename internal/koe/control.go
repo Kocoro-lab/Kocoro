@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Sentinel rejections for POST /call/mic — the body of the 409 response, so
@@ -51,6 +52,15 @@ type StartCallRequest struct {
 	ForegroundHint *ForegroundHint `json:"foreground_hint,omitempty"`
 }
 
+// SessionLeaseStatus is the additive Wireless prewarm response. The Desktop
+// renews a bounded lease while Reachy is the selected Koe carrier; expiry is a
+// crash/network-loss backstop, so one prepare request can never pin a session.
+type SessionLeaseStatus struct {
+	Status       string `json:"status"`
+	PrewarmState string `json:"prewarm_state"`
+	ExpiresAt    string `json:"expires_at,omitempty"`
+}
+
 // ControlServer is the Koe-side HTTP+SSE control channel for Kocoro Desktop: it
 // accepts POST /call/start|end and broadcasts GET /events (voice_state,
 // control_app, call_state). This is the SERVER half of the Desktop↔Koe contract
@@ -64,7 +74,9 @@ type ControlServer struct {
 	onEnd        func()                 // Desktop ended: tear the call down
 	onInterrupt  func()                 // Desktop explicitly interrupted playback
 	onMic        func(off bool) error   // POST /call/mic (nil until SetMicHandler)
-	taskPending  func() bool            // nil-safe snapshot providers, stamped on every voice_state
+	onPrepare    func(time.Duration) SessionLeaseStatus
+	onRelease    func() SessionLeaseStatus
+	taskPending  func() bool // nil-safe snapshot providers, stamped on every voice_state
 	micOff       func() bool
 	token        string       // optional Bearer token for Desktop-owned requests
 	lastVoice    atomic.Value // string: last voice_state, replayed by ReemitVoiceState
@@ -79,6 +91,7 @@ type ControlServer struct {
 	wirelessCameraSocketConfigured atomic.Bool
 	wirelessCameraVerified         atomic.Bool
 	bridgeDetails                  func() (proto, bridgeVersion string)
+	prewarmSnapshot                func() (state, expiresAt string)
 }
 
 // NewControlServer wires the Desktop-driven start/end callbacks (either may be nil).
@@ -98,6 +111,16 @@ func NewControlServer(onStart func(StartCallRequest), onEnd func(), onInterrupt 
 // SetMicHandler wires POST /call/mic. Called once at startup, before Handler()
 // serves — no locking needed.
 func (s *ControlServer) SetMicHandler(h func(off bool) error) { s.onMic = h }
+
+// SetSessionHandlers wires the Wireless-only bounded Realtime prewarm lease.
+// Leaving both nil preserves the Mac/Lite control surface byte-for-byte.
+func (s *ControlServer) SetSessionHandlers(
+	prepare func(time.Duration) SessionLeaseStatus,
+	release func() SessionLeaseStatus,
+) {
+	s.onPrepare = prepare
+	s.onRelease = release
+}
 
 // SetToken enables Bearer-token auth for every control request. Empty preserves
 // older Desktop builds and test harnesses.
@@ -140,6 +163,13 @@ func (s *ControlServer) SetWirelessCameraStatus(socketConfigured, verified bool)
 // provider is consulted only for a connected bridge snapshot.
 func (s *ControlServer) SetBridgeDetailsProvider(provider func() (proto, bridgeVersion string)) {
 	s.bridgeDetails = provider
+}
+
+// SetPrewarmSnapshotProvider exposes the bounded Wireless lease without making
+// ControlServer own session lifecycle. The provider is called from an HTTP
+// handler, never from the Koe session mutex.
+func (s *ControlServer) SetPrewarmSnapshotProvider(provider func() (state, expiresAt string)) {
+	s.prewarmSnapshot = provider
 }
 
 // SetRealtimeState updates the runtime snapshot reported by /carrier/status.
@@ -211,6 +241,29 @@ func (s *ControlServer) Handler() http.Handler {
 		}
 		writeControlOK(w)
 	})
+	mux.HandleFunc("POST /session/prepare", func(w http.ResponseWriter, r *http.Request) {
+		if s.onPrepare == nil {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			LeaseMS int64 `json:"lease_ms"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.LeaseMS < 30_000 || req.LeaseMS > 300_000 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_lease"}`))
+			return
+		}
+		writeControlJSON(w, s.onPrepare(time.Duration(req.LeaseMS)*time.Millisecond))
+	})
+	mux.HandleFunc("POST /session/release", func(w http.ResponseWriter, r *http.Request) {
+		if s.onRelease == nil {
+			http.NotFound(w, r)
+			return
+		}
+		writeControlJSON(w, s.onRelease())
+	})
 	mux.HandleFunc("GET /events", s.handleEvents)
 	mux.HandleFunc("GET /carrier/status", func(w http.ResponseWriter, r *http.Request) {
 		s.writeCarrierStatus(w)
@@ -244,6 +297,11 @@ func writeControlUnauthorized(w http.ResponseWriter) {
 func writeControlOK(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func writeControlJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 func (s *ControlServer) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -346,15 +404,17 @@ const bridgeStateDisabled = "disabled"
 // control-spec §3). Additive + field-presence-gated on the Desktop side: an old
 // Koe with no route 404s, which Desktop reads as "feature absent".
 type carrierStatusResponse struct {
-	Carrier       string               `json:"carrier"`
-	Caps          []string             `json:"caps"`
-	Audio         carrierAudioStatus   `json:"audio"`
-	Camera        *carrierCameraStatus `json:"camera,omitempty"`
-	Bridge        carrierBridgeStatus  `json:"bridge"`
-	Model         string               `json:"model"`
-	Agent         string               `json:"agent"`
-	CallState     string               `json:"call_state,omitempty"`
-	RealtimeState string               `json:"realtime_state,omitempty"`
+	Carrier          string               `json:"carrier"`
+	Caps             []string             `json:"caps"`
+	Audio            carrierAudioStatus   `json:"audio"`
+	Camera           *carrierCameraStatus `json:"camera,omitempty"`
+	Bridge           carrierBridgeStatus  `json:"bridge"`
+	Model            string               `json:"model"`
+	Agent            string               `json:"agent"`
+	CallState        string               `json:"call_state,omitempty"`
+	RealtimeState    string               `json:"realtime_state,omitempty"`
+	PrewarmState     string               `json:"prewarm_state,omitempty"`
+	PrewarmExpiresAt string               `json:"prewarm_expires_at,omitempty"`
 }
 
 type carrierAudioStatus struct {
@@ -407,6 +467,8 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 	bridgeStatus := carrierBridgeStatus{State: bridgeState}
 	callState := ""
 	realtimeState := ""
+	prewarmState := ""
+	prewarmExpiresAt := ""
 	var cameraStatus *carrierCameraStatus
 	if p.Carrier == CarrierReachyWireless {
 		socketConfigured := s.wirelessAudioSocketConfigured.Load()
@@ -438,20 +500,25 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 		if value, ok := s.lastRealtime.Load().(string); ok {
 			realtimeState = value
 		}
+		if s.prewarmSnapshot != nil {
+			prewarmState, prewarmExpiresAt = s.prewarmSnapshot()
+		}
 	}
 	if bridgeState == bridgeStateConnected && s.bridgeDetails != nil {
 		bridgeStatus.Proto, bridgeStatus.BridgeVersion = s.bridgeDetails()
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(carrierStatusResponse{
-		Carrier:       p.Carrier,
-		Caps:          caps,
-		Audio:         audioStatus,
-		Camera:        cameraStatus,
-		Bridge:        bridgeStatus,
-		Model:         p.Model,
-		Agent:         p.Agent,
-		CallState:     callState,
-		RealtimeState: realtimeState,
+		Carrier:          p.Carrier,
+		Caps:             caps,
+		Audio:            audioStatus,
+		Camera:           cameraStatus,
+		Bridge:           bridgeStatus,
+		Model:            p.Model,
+		Agent:            p.Agent,
+		CallState:        callState,
+		RealtimeState:    realtimeState,
+		PrewarmState:     prewarmState,
+		PrewarmExpiresAt: prewarmExpiresAt,
 	})
 }

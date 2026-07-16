@@ -4,6 +4,7 @@ package koe
 
 import (
 	"bufio"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,57 @@ import (
 	"testing"
 	"time"
 )
+
+func TestControlServerSessionLeaseEndpoints(t *testing.T) {
+	var prepared time.Duration
+	released := false
+	s := NewControlServer(nil, nil, nil)
+	s.SetSessionHandlers(
+		func(lease time.Duration) SessionLeaseStatus {
+			prepared = lease
+			return SessionLeaseStatus{Status: "ok", PrewarmState: "connecting", ExpiresAt: "2026-07-16T12:00:00Z"}
+		},
+		func() SessionLeaseStatus {
+			released = true
+			return SessionLeaseStatus{Status: "ok", PrewarmState: "disconnected"}
+		},
+	)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/session/prepare", "application/json", strings.NewReader(`{"lease_ms":120000}`))
+	if err != nil {
+		t.Fatalf("POST /session/prepare: %v", err)
+	}
+	var status SessionLeaseStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode prepare response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || prepared != 2*time.Minute || status.PrewarmState != "connecting" {
+		t.Fatalf("prepare: status=%d lease=%s response=%+v", resp.StatusCode, prepared, status)
+	}
+
+	for _, body := range []string{`{"lease_ms":29999}`, `{"lease_ms":300001}`, `{}`} {
+		bad, err := http.Post(srv.URL+"/session/prepare", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("invalid prepare %s: %v", body, err)
+		}
+		bad.Body.Close()
+		if bad.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid prepare %s status=%d, want 400", body, bad.StatusCode)
+		}
+	}
+
+	release, err := http.Post(srv.URL+"/session/release", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("POST /session/release: %v", err)
+	}
+	release.Body.Close()
+	if release.StatusCode != http.StatusOK || !released {
+		t.Fatalf("release: status=%d released=%t", release.StatusCode, released)
+	}
+}
 
 // subscriberCount is a test-only accessor (compiled only in tests).
 func (s *ControlServer) subscriberCount() int {
