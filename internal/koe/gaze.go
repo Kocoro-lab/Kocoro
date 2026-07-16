@@ -284,6 +284,13 @@ func (g *GazeGate) Update(in GazeInput) GazeDecision {
 		return g.transition(GazeIdle, "arm_timeout", GazeAction{Kind: GazeCancelPreparation})
 	}
 	if g.lastFaceSeen.IsZero() || now.Sub(g.lastFaceSeen) > g.cfg.FaceHold {
+		// Treat a failed preparation as one consumed encounter. YuNet can flicker
+		// around the detection threshold; without this latch the same stationary
+		// face immediately collects FaceHits again and repeatedly mints warm
+		// Realtime sessions. A continuous EncounterReset absence clears the latch
+		// in updateEncounter, so a person who genuinely leaves and returns can try
+		// again.
+		g.encounterBlocked = true
 		g.resetEvidence()
 		return g.transition(GazeIdle, "face_lost", GazeAction{Kind: GazeCancelPreparation})
 	}

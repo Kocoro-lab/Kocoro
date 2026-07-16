@@ -145,6 +145,56 @@ func TestSpeakerRingFramesInvalidFailsLoud(t *testing.T) {
 	}
 }
 
+func TestWirelessEarconPacingPreservesEveryFrame(t *testing.T) {
+	koeConn, carrierConn := net.Pipe()
+	a := &AudioIO{
+		playBuf:       make(chan []int16, 256),
+		conn:          koeConn,
+		done:          make(chan struct{}),
+		spkRS:         NewResampler(audioSampleRate, carrierWireRate),
+		spkRingFrames: 5,
+	}
+	a.playback.Store(true)
+	a.wg.Add(1)
+	go a.spkPump()
+
+	const frameCount = 24
+	received := make(chan int, 1)
+	go func() {
+		count := 0
+		for count < frameCount {
+			hdr, _, err := audiobridge.ReadFrame(carrierConn)
+			if err != nil {
+				break
+			}
+			if hdr.Magic == audiobridge.MagicSpk {
+				count++
+			}
+		}
+		received <- count
+	}()
+
+	frames := make([][]int16, frameCount)
+	for i := range frames {
+		frames[i] = make([]int16, audioFrameSize)
+		frames[i][0] = int16(i + 1)
+	}
+	a.queueEarconFrames(frames)
+
+	select {
+	case got := <-received:
+		if got != frameCount {
+			t.Fatalf("carrier received %d earcon frames, want %d", got, frameCount)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for paced earcon frames")
+	}
+	close(a.done)
+	_ = koeConn.Close()
+	_ = carrierConn.Close()
+	a.wg.Wait()
+}
+
 func TestMicCaptureQueueDropsOldest(t *testing.T) {
 	ch := make(chan []int16, 2)
 	enqueueLatestPCM(ch, []int16{1})

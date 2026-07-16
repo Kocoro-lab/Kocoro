@@ -101,13 +101,11 @@ func (a *AudioIO) playEarcon(name string, frames [][]int16) {
 	a.SetPlaybackEnabled(true)
 	a.SetSpeaking(true)
 
-	// Queue every frame up front. renderInto only starts draining once
-	// prerollFrames have accumulated, so drip-feeding one frame per tick would
-	// never cross the pre-roll threshold and nothing would play. playBuf (cap 256)
-	// holds the whole cue without overflow.
-	for _, f := range frames {
-		a.Play(f)
-	}
+	// Platform playback owns the enqueue policy. Darwin queues the whole cue so
+	// renderInto crosses its preroll threshold. Wireless paces at 20 ms because
+	// bulk-enqueuing a cue into its 5-frame drop-oldest jitter ring preserves only
+	// the tail before the UDS pump can send it.
+	a.queueEarconFrames(frames)
 
 	// Hold the speaking gate until playback has actually DRAINED, not on a fixed
 	// clock: releasing exactly at the computed wall time cut the tail (or left it

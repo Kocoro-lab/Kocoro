@@ -208,6 +208,19 @@ func (a *AudioIO) Play(pcm []int16) {
 	}
 }
 
+// queueEarconFrames feeds a Wireless cue at device cadence. The normal speaker
+// path intentionally keeps only 100 ms of queued audio; bulk-enqueuing an entire
+// 500 ms cue would make that drop-oldest ring discard most of the prompt before
+// the UDS writer can observe it.
+func (a *AudioIO) queueEarconFrames(frames [][]int16) {
+	for i, frame := range frames {
+		a.Play(frame)
+		if i+1 < len(frames) {
+			time.Sleep(audioFrameMs * time.Millisecond)
+		}
+	}
+}
+
 // PrepareForCall clears stale capture/playback queued before a session starts.
 func (a *AudioIO) PrepareForCall() {
 	a.SetSpeaking(false)

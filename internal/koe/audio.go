@@ -418,6 +418,14 @@ func (a *AudioIO) Play(pcm []int16) {
 	}
 }
 
+// queueEarconFrames queues the complete cue up front on Darwin. renderInto needs
+// enough frames to cross its preroll threshold before the device starts draining.
+func (a *AudioIO) queueEarconFrames(frames [][]int16) {
+	for _, frame := range frames {
+		a.Play(frame)
+	}
+}
+
 // PrepareForCall clears stale capture/playback queued before a session starts
 // sending user audio.
 func (a *AudioIO) PrepareForCall() {

@@ -143,6 +143,42 @@ func TestGazeGateArmTimeoutCancelsAndBlocksSameEncounter(t *testing.T) {
 	}
 }
 
+func TestGazeGateFaceLossBlocksFlickeringSameEncounter(t *testing.T) {
+	now := time.Unix(100, 0)
+	g, _ := NewGazeGate(DefaultGazeConfig())
+	for i := 0; i < 2; i++ {
+		g.Update(GazeInput{Now: now, Snapshot: healthyGazeSnapshot(now, true, false, math.Pi/2)})
+		now = now.Add(100 * time.Millisecond)
+	}
+
+	// A face miss held beyond FaceHold cancels this preparation and consumes the
+	// encounter. Immediate detector flicker must not mint another session.
+	now = now.Add(defaultGazeFaceHold + time.Millisecond)
+	d := g.Update(GazeInput{Now: now, Prepared: true, Snapshot: healthyGazeSnapshot(now, false, false, math.Pi/2)})
+	if len(d.Actions) != 1 || d.Actions[0].Kind != GazeCancelPreparation || d.Reason != "face_lost" {
+		t.Fatalf("face-loss decision = %+v", d)
+	}
+	for i := 0; i < 4; i++ {
+		now = now.Add(100 * time.Millisecond)
+		d = g.Update(GazeInput{Now: now, Snapshot: healthyGazeSnapshot(now, true, false, math.Pi/2)})
+	}
+	if len(d.Actions) != 0 || d.State != GazeIdle {
+		t.Fatalf("flickering face rearmed same encounter: %+v", d)
+	}
+
+	// A real absence clears the encounter latch; a returning face may prepare.
+	d = g.Update(GazeInput{Now: now, Snapshot: healthyGazeSnapshot(now, false, false, math.Pi/2)})
+	now = now.Add(defaultGazeEncounterReset + time.Millisecond)
+	d = g.Update(GazeInput{Now: now, Snapshot: healthyGazeSnapshot(now, false, false, math.Pi/2)})
+	for i := 0; i < 2; i++ {
+		now = now.Add(100 * time.Millisecond)
+		d = g.Update(GazeInput{Now: now, Snapshot: healthyGazeSnapshot(now, true, false, math.Pi/2)})
+	}
+	if len(d.Actions) != 1 || d.Actions[0].Kind != GazePrepare {
+		t.Fatalf("new encounter did not rearm: %+v", d)
+	}
+}
+
 func TestGazeGateKeepsPreparationAcrossOneTransportGap(t *testing.T) {
 	now := time.Unix(100, 0)
 	g, _ := NewGazeGate(DefaultGazeConfig())
