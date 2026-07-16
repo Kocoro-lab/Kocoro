@@ -84,6 +84,16 @@ func (s stringOrList) MarshalYAML() (interface{}, error) {
 	return strings.Join([]string(s), " "), nil
 }
 
+// IsZero controls the `omitempty` decision for the AllowedTools field. yaml.v3
+// evaluates omitempty via the zeroer interface BEFORE it calls MarshalYAML, and
+// its default slice-emptiness check would treat a non-nil empty slice as zero
+// and omit it — dropping a present-but-empty allowlist from disk, which reloads
+// as nil (no restriction) and re-opens the fail-open. Only a nil slice is zero:
+// a non-nil empty slice ("grant zero tools") must be written so it round-trips.
+func (s stringOrList) IsZero() bool {
+	return s == nil
+}
+
 type skillFrontmatter struct {
 	Name string `yaml:"name"`
 	// Slug is not part of the Agent Skills spec nor the openclaw/clawhub
