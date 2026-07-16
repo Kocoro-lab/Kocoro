@@ -426,6 +426,10 @@ func (a *AudioIO) queueEarconFrames(frames [][]int16) {
 	}
 }
 
+// Darwin already renders the embedded PCM directly through the Mac Koe output
+// path; only the Wireless carrier has a Pollen-native fixed-cue transport.
+func (a *AudioIO) playNativeEarcon(_ string) bool { return false }
+
 // PrepareForCall clears stale capture/playback queued before a session starts
 // sending user audio.
 func (a *AudioIO) PrepareForCall() {

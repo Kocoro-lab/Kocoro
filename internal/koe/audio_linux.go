@@ -221,6 +221,28 @@ func (a *AudioIO) queueEarconFrames(frames [][]int16) {
 	}
 }
 
+// playNativeEarcon delegates fixed brand cues to Pollen's local GStreamer
+// playbin. It bypasses both bounded speaker rings and the 48k→16k streaming
+// resampler, while Realtime reply audio continues to use the normal PCM path.
+func (a *AudioIO) playNativeEarcon(name string) bool {
+	if a.conn == nil {
+		return false
+	}
+	// A native cue must be the only speaker source at the call boundary. Close
+	// the stream gate before sending play_cue; this drains playBuf and advances
+	// its epoch so an in-flight frame cannot accompany the fixed-file player.
+	a.SetPlaybackEnabled(false)
+	body, err := json.Marshal(map[string]string{"type": "play_cue", "name": name})
+	if err != nil {
+		return false
+	}
+	if err := a.sendControl(body); err != nil {
+		log.Printf("koe[earcon]: native %s cue unavailable: %v", name, err)
+		return false
+	}
+	return true
+}
+
 // PrepareForCall clears stale capture/playback queued before a session starts.
 func (a *AudioIO) PrepareForCall() {
 	a.SetSpeaking(false)
@@ -253,7 +275,7 @@ func (a *AudioIO) SetPlaybackEnabled(s bool) {
 
 // InterruptPlayback flushes every Wireless playback layer: Koe's play queue and
 // epoch-tagged jitter ring, then the carrier ring and the daemon SDK 1.9 player via
-// the v0.2 barge_in control frame. The write lock prevents interleaving this JSON
+// the v0.3 barge_in control frame. The write lock prevents interleaving this JSON
 // frame with a concurrently emitted speaker PCM frame.
 func (a *AudioIO) InterruptPlayback() {
 	a.SetPlaybackEnabled(false)
@@ -326,7 +348,7 @@ type helloMsg struct {
 }
 
 // audioProto is the carrier-link protocol version (koe-audio-carrier-spec §4.1).
-const audioProto = "0.2"
+const audioProto = "0.3"
 
 // Start dials the carrier UDS, performs the hello handshake, and runs the mic
 // (carrier→koe) and speaker (koe→carrier) pumps. Media stays daemon-resident under
@@ -365,7 +387,7 @@ func dialAudioCarrier(path string) (net.Conn, error) {
 	return conn, nil
 }
 
-// ProbeAudioCarrier performs the same v0.2 hello as a real call, then closes the
+// ProbeAudioCarrier performs the same v0.3 hello as a real call, then closes the
 // socket. Wireless startup uses this as first-hand protocol evidence while
 // preserving the idle invariant: no audio-UDS connection remains open and no
 // Realtime session is minted merely because Koe is resident.

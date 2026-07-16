@@ -98,14 +98,22 @@ func (a *AudioIO) playEarcon(name string, frames [][]int16) {
 	started := time.Now()
 
 	a.knownOutputCaptureHold.Store(true)
-	a.SetPlaybackEnabled(true)
 	a.SetSpeaking(true)
 
-	// Platform playback owns the enqueue policy. Darwin queues the whole cue so
-	// renderInto crosses its preroll threshold. Wireless paces at 20 ms because
-	// bulk-enqueuing a cue into its 5-frame drop-oldest jitter ring preserves only
-	// the tail before the UDS pump can send it.
-	a.queueEarconFrames(frames)
+	// Darwin queues the embedded PCM through its normal output path. Wireless
+	// delegates the same cue to Pollen's fixed-file local player, avoiding two
+	// bounded stream rings and a needless 48k→16k conversion. A failed native
+	// control send falls back to the existing stream path rather than going silent.
+	transport := "stream"
+	if a.playNativeEarcon(name) {
+		// The fixed cue no longer needs Koe's speaker pump. Keep that pump gated
+		// and drain/epoch any frame that raced the call boundary, so native cue
+		// playback cannot accidentally be accompanied by streamed PCM.
+		transport = "pollen_local"
+	} else {
+		a.SetPlaybackEnabled(true)
+		a.queueEarconFrames(frames)
+	}
 
 	// Hold the speaking gate until playback has actually DRAINED, not on a fixed
 	// clock: releasing exactly at the computed wall time cut the tail (or left it
@@ -151,5 +159,5 @@ func (a *AudioIO) playEarcon(name string, frames [][]int16) {
 	a.SetSpeaking(prevSpeaking)
 	a.SetPlaybackEnabled(prevPlayback)
 	a.knownOutputCaptureHold.Store(prevCaptureHold)
-	log.Printf("koe[earcon]: %s earcon played frames=%d dur=%dms", name, len(frames), time.Since(started).Milliseconds())
+	log.Printf("koe[earcon]: %s earcon played transport=%s frames=%d dur=%dms", name, transport, len(frames), time.Since(started).Milliseconds())
 }

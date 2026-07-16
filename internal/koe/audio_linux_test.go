@@ -92,6 +92,37 @@ func TestWirelessInterruptPlaybackSendsCarrierFlush(t *testing.T) {
 	}
 }
 
+func TestWirelessNativeEarconSendsClosedCueControl(t *testing.T) {
+	koeConn, carrierConn := net.Pipe()
+	defer koeConn.Close()
+	defer carrierConn.Close()
+	a := &AudioIO{conn: koeConn}
+
+	got := make(chan []byte, 1)
+	go func() {
+		body, err := readControl(carrierConn)
+		if err == nil {
+			got <- body
+		}
+	}()
+	if !a.playNativeEarcon("ready") {
+		t.Fatal("native cue control send failed")
+	}
+
+	select {
+	case body := <-got:
+		var msg map[string]string
+		if err := json.Unmarshal(body, &msg); err != nil {
+			t.Fatalf("decode control: %v", err)
+		}
+		if msg["type"] != "play_cue" || msg["name"] != "ready" {
+			t.Fatalf("native cue control = %#v", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for play_cue control")
+	}
+}
+
 // spkTestIO builds a minimal AudioIO carrying only the spk-leg resampler, so the
 // toCarrierPCM tests exercise the down-rate path without constructing the cgo Opus
 // codec that NewAudioIO would.
