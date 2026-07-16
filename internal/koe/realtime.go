@@ -1794,6 +1794,13 @@ func signalNonBlocking(c chan struct{}) {
 
 func eventLogEnabled() bool { return os.Getenv("KOE_EVENT_LOG") == "1" }
 
+// timingLogEnabled keeps the small, content-free latency spine available in
+// product logs. Full Realtime event logging remains opt-in because it is noisy
+// and can include tool arguments; these milestones contain only durations and
+// are needed to distinguish VAD, model, network, and playback delay on devices.
+// Operators can explicitly disable the timing spine with KOE_TIMING_LOG=0.
+func timingLogEnabled() bool { return os.Getenv("KOE_TIMING_LOG") != "0" }
+
 func transcriptLogEnabled() bool { return os.Getenv("KOE_TRANSCRIPT_LOG") == "1" }
 
 func logMaybeText(s string, max int) string {
@@ -2165,7 +2172,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	case "input_audio_buffer.speech_started":
 		h.userSpeaking.Store(true)
 		h.speechStartedAt = time.Now()
-		if eventLogEnabled() {
+		if timingLogEnabled() {
 			log.Printf("koe[timing]: speech_started")
 		}
 		// Server-VAD detected the user talking — the reactive "I hear you" moment.
@@ -2187,7 +2194,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		h.userSpeaking.Store(false)
 		h.speechStoppedAt = time.Now()
 		h.resultMailbox.Wake()
-		if eventLogEnabled() {
+		if timingLogEnabled() {
 			log.Printf("koe[timing]: speech_stopped speech_ms=%d", elapsedMS(h.speechStartedAt, h.speechStoppedAt))
 		}
 		// The user finished talking. create_response=true lets the server start the
@@ -2252,7 +2259,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.onResponseStarted() // reset the express ≤1/response budget for the new response
 		}
 		h.responseCreatedAt = time.Now()
-		if eventLogEnabled() {
+		if timingLogEnabled() {
 			log.Printf("koe[timing]: response_created after_speech_stop_ms=%d", elapsedMS(h.speechStoppedAt, h.responseCreatedAt))
 		}
 		h.asyncTaskPending.Store(false)
@@ -2357,7 +2364,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 	case "output_audio_buffer.started":
 		h.outputStartedAt = time.Now()
-		if eventLogEnabled() {
+		if timingLogEnabled() {
 			log.Printf("koe[timing]: output_started after_response_created_ms=%d", elapsedMS(h.responseCreatedAt, h.outputStartedAt))
 		}
 		// WebRTC-only: the server began streaming reply audio — the PRECISE
@@ -2397,7 +2404,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 	case "output_audio_buffer.stopped":
 		now := time.Now()
-		if eventLogEnabled() {
+		if timingLogEnabled() {
 			log.Printf("koe[timing]: output_stopped after_response_done_ms=%d output_ms=%d", elapsedMS(h.responseDoneAt, now), elapsedMS(h.outputStartedAt, now))
 		}
 		if h.floor.holdsPlayback() {
@@ -2442,7 +2449,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 				h.audio.SetPlaybackTailProtected(true)
 			}
 		}
-		if eventLogEnabled() {
+		if timingLogEnabled() {
 			log.Printf("koe[timing]: response_done response_ms=%d output_elapsed_ms=%d", elapsedMS(h.responseCreatedAt, h.responseDoneAt), elapsedMS(h.outputStartedAt, h.responseDoneAt))
 		}
 		// Turn finished → mark the response slot free. Do not immediately ungate the

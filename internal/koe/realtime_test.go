@@ -1086,6 +1086,17 @@ func TestSessionConfigCanEnableInterruptForBargeInExperiment(t *testing.T) {
 	}
 }
 
+func TestTimingLogEnabledDefaultsOnAndCanBeDisabled(t *testing.T) {
+	t.Setenv("KOE_TIMING_LOG", "")
+	if !timingLogEnabled() {
+		t.Fatal("timing log should default on for product latency evidence")
+	}
+	t.Setenv("KOE_TIMING_LOG", "0")
+	if timingLogEnabled() {
+		t.Fatal("KOE_TIMING_LOG=0 should disable product timing logs")
+	}
+}
+
 func TestSessionConfigCanDisableNoiseReduction(t *testing.T) {
 	t.Setenv("KOE_NOISE_REDUCTION", "off")
 	cfg := sessionConfig("persona", "marin", true)
