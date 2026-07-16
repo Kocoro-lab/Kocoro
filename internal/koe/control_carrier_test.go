@@ -41,6 +41,7 @@ type carrierStatusWant struct {
 	Agent         string `json:"agent"`
 	CallState     string `json:"call_state"`
 	RealtimeState string `json:"realtime_state"`
+	OpenMode      string `json:"open_mode"`
 }
 
 func TestCarrierStatusEndpoint_ReachyWirelessRuntimeContract(t *testing.T) {
@@ -90,6 +91,11 @@ func TestCarrierStatusEndpoint_ReachyWirelessRuntimeContract(t *testing.T) {
 	if got.CallState != "connecting" || got.RealtimeState != "connecting" {
 		t.Errorf("runtime state = call %q realtime %q", got.CallState, got.RealtimeState)
 	}
+	// Wireless always reports a concrete open mode, so Desktop can tell "trigger"
+	// apart from an old Koe that has no such field.
+	if got.OpenMode != OpenModeTrigger {
+		t.Errorf("open mode = %q, want %q", got.OpenMode, OpenModeTrigger)
+	}
 
 	s.EmitCallState("ended")
 	s.SetRealtimeState("disconnected")
@@ -103,6 +109,30 @@ func TestCarrierStatusEndpoint_ReachyWirelessRuntimeContract(t *testing.T) {
 	}
 	if got.CallState != "idle" || got.RealtimeState != "disconnected" {
 		t.Errorf("idle runtime state = call %q realtime %q", got.CallState, got.RealtimeState)
+	}
+}
+
+func TestCarrierStatusEndpoint_ReachyWirelessStandbyOpenMode(t *testing.T) {
+	s := NewControlServer(nil, nil, nil)
+	prof, err := ParseCarrierProfile(CarrierInputs{Carrier: CarrierReachyWireless, OpenMode: OpenModeStandby})
+	if err != nil {
+		t.Fatalf("build profile: %v", err)
+	}
+	s.SetCarrierProfile(prof, func() bool { return false })
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/carrier/status")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	var got carrierStatusWant
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.OpenMode != OpenModeStandby {
+		t.Errorf("open mode = %q, want %q", got.OpenMode, OpenModeStandby)
 	}
 }
 
@@ -189,6 +219,10 @@ func TestCarrierStatusEndpoint_MacDefaultAndCapsArray(t *testing.T) {
 	// explicit device → bound=false.
 	if !strings.Contains(s2, `"bound":false`) {
 		t.Errorf("mac bound should be false: %s", s2)
+	}
+	// open_mode is Wireless-only: the mac response must stay byte-identical.
+	if strings.Contains(s2, "open_mode") {
+		t.Errorf("mac status must not carry open_mode: %s", s2)
 	}
 }
 

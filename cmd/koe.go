@@ -273,6 +273,10 @@ func applyAudioProcessing(audio *koe.AudioIO, cfg koeConfig, useVPIO bool) (audi
 // on the VPIO backend); mac stays byte-identical. Unknown carrier/caps fail loud —
 // Desktop generates the argv, so a bad value is a bug, not user input.
 func resolveCarrierProfile(cfg *koeConfig, carrier, caps, bridgeSocket, reachyDaemonURL string) (koe.CarrierProfile, error) {
+	openMode, err := koe.OpenModeFromEnv()
+	if err != nil {
+		return koe.CarrierProfile{}, err
+	}
 	prof, err := koe.ParseCarrierProfile(koe.CarrierInputs{
 		Carrier:         carrier,
 		CapsCSV:         caps,
@@ -283,6 +287,7 @@ func resolveCarrierProfile(cfg *koeConfig, carrier, caps, bridgeSocket, reachyDa
 		SpeakerUID:      cfg.speakerDevice,
 		Model:           cfg.model,
 		Agent:           cfg.agent,
+		OpenMode:        openMode,
 	})
 	if err != nil {
 		return koe.CarrierProfile{}, err
@@ -1069,6 +1074,11 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	wirelessAudioVerified := false
 	wirelessCameraVerified := false
 	gazeCfg := koe.DefaultGazeConfig()
+	standbyCfg := koe.DefaultStandbyConfig()
+	// Standby (resident listen) is an explicit Wireless-only product mode: the robot
+	// holds a hot session and opens the conversation when someone speaks toward its
+	// front. Trigger mode leaves every policy below exactly as it was.
+	standbyResident := wirelessLazy && cfg.carrier.OpenMode == koe.OpenModeStandby
 	if wirelessLazy {
 		if err := probeAudioCarrier(cfg.audioSocket); err != nil {
 			return fmt.Errorf("wireless audio carrier readiness: %w", err)
@@ -1090,6 +1100,11 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		if !cfg.carrier.HasCap(koe.CapHasFace) {
 			gazeCfg.Enabled = false
 		}
+		standbyCfg, err = koe.StandbyConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		standbyCfg.Enabled = standbyResident
 	}
 	// One mailbox spans every warm Realtime session in this resident process. A
 	// do_task can outlive the session that dispatched it; its spoken result must not.
@@ -1112,7 +1127,14 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	// body (nil for mac / no bridge socket). Assigned after ctrl is built; captured by
 	// newSessionState (express handler) + connectWith (express tool + response reset).
 	var motionCtrl *koe.MotionController
+	// voiceEventSeq counts emitted voice_state transitions; the standby silence
+	// timer reads it as its liveness beat.
+	var voiceEventSeq atomic.Uint64
 	emitVoiceState := func(state string) {
+		// Every voice_state transition (speech_started, thinking, speaking, …) is a
+		// liveness beat for the standby silence timer. The reactive level pump does
+		// NOT come through here, so a steady RMS stream can't fake activity.
+		voiceEventSeq.Add(1)
 		if ctrl != nil {
 			ctrl.EmitVoiceState(state)
 		}
@@ -1182,6 +1204,10 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	// prewarm lease can keep the session hot while Reachy is the selected Koe
 	// carrier; expiry prevents one request from becoming a 24/7 connection.
 	sessionWanted := !wirelessLazy
+	// callStandbyOwned marks a call the standby gate opened. Only those are subject
+	// to the silence auto-dismiss below: a manual trigger-key call is the user's to
+	// end. It tracks callActive and is cleared wherever callActive is cleared.
+	callStandbyOwned := false
 	var prewarmLeaseUntil time.Time
 	var prewarmLeaseSeq uint64
 	var callStarted time.Time
@@ -1191,7 +1217,10 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		return wirelessLazy && !prewarmLeaseUntil.IsZero() && time.Now().Before(prewarmLeaseUntil)
 	}
 	shouldHaveSessionLocked := func() bool {
-		return !wirelessLazy || sessionWanted || prewarmLeaseActiveLocked()
+		// Standby keeps the session hot for the process lifetime — the whole point of
+		// the mode is that speaking to the robot connects instantly, so it must not
+		// depend on a Desktop-renewed prewarm lease.
+		return !wirelessLazy || standbyResident || sessionWanted || prewarmLeaseActiveLocked()
 	}
 
 	stopSessionResources := func(conn *koe.RealtimeConn, cancel context.CancelFunc, audio *koe.AudioIO) {
@@ -1286,7 +1315,10 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}()
 	}
 	scheduleWarmRotationLocked = func(seq uint64, reason string) {
-		if idleSessionTTL <= 0 || (wirelessLazy && !prewarmLeaseActiveLocked()) {
+		// A standby session is held indefinitely, so it needs the same idle TTL
+		// rotation Mac/Lite get; a lease-less trigger-mode session is short-lived
+		// and keeps skipping rotation.
+		if idleSessionTTL <= 0 || (wirelessLazy && !standbyResident && !prewarmLeaseActiveLocked()) {
 			return
 		}
 		go func() {
@@ -1343,6 +1375,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		if err := startSessionAudioLocked("active_session_reconnect"); err != nil {
 			log.Printf("koe: audio restart failed: %v", err)
 			callActive = false
+			callStandbyOwned = false
 			if wirelessLazy {
 				sessionWanted = false
 			}
@@ -1364,6 +1397,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		log.Printf("koe: %s: %v", msg, err)
 		if callActive {
 			callActive = false
+			callStandbyOwned = false
 			if wirelessLazy {
 				sessionWanted = false
 			}
@@ -1526,7 +1560,10 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}()
 	}
 
-	startCall := func(req koe.StartCallRequest) {
+	// startCallFrom opens a call and records whether standby owns it. standbyOwned
+	// only ever arms the silence auto-dismiss; the open path itself is identical for
+	// every caller.
+	startCallFrom := func(req koe.StartCallRequest, standbyOwned bool) {
 		sessMu.Lock()
 		if callActive {
 			sessMu.Unlock()
@@ -1552,6 +1589,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			log.Printf("koe: audio start failed: %v", err)
 			emitVoiceState("idle")
 			ctrl.EmitCallState("ended")
+			callStandbyOwned = false
 			if wirelessLazy {
 				sessionWanted = false
 			}
@@ -1564,6 +1602,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			return
 		}
 		callActive = true
+		callStandbyOwned = standbyOwned
 		resultMailbox.Wake()
 		if curConn != nil && sessionReady {
 			emitReadyLocked()
@@ -1573,6 +1612,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		ensureWarmSessionLocked("call_start")
 		sessMu.Unlock()
 	}
+	startCall := func(req koe.StartCallRequest) { startCallFrom(req, false) }
 
 	endCall = func() {
 		sessMu.Lock()
@@ -1581,6 +1621,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			return
 		}
 		callActive = false
+		callStandbyOwned = false
 		if wirelessLazy {
 			sessionWanted = false
 		}
@@ -1854,20 +1895,28 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	if wirelessLazy {
 		log.Printf("koe[gaze]: wireless lazy sessions enabled gaze=%t face_hits=%d vad_hits=%d arm_timeout=%s",
 			gazeCfg.Enabled, gazeCfg.FaceHits, gazeCfg.VADHits, gazeCfg.ArmTimeout)
+		log.Printf("koe[standby]: open_mode=%s resident_session=%t vad_hits=%d cooldown=%s idle_hangup=%s",
+			cfg.carrier.OpenMode, standbyResident, standbyCfg.VADHits, standbyCfg.Cooldown, standbyCfg.IdleHangup)
 	}
 	// Wireless barge-in and the IDLE gaze gate consume one serialized robot-local
 	// perception stream. Barge-in keeps the stream alive even when the product's
 	// IDLE gaze gate is disabled: without sustained DOA evidence Linux capture
 	// fails closed while Kocoro speaks, preventing residual XVF echo from cancelling
 	// its own response.
-	if wirelessLazy && (gazeCfg.Enabled || cfg.bargeIn || motionCtrl != nil) {
+	// Standby also rides this stream: front-directed DOA speech is its only trigger,
+	// which is exactly why the room is never uploaded while idle.
+	if wirelessLazy && (gazeCfg.Enabled || standbyResident || cfg.bargeIn || motionCtrl != nil) {
 		perception, perr := koe.NewPerceptionClient(cfg.carrier.ReachyDaemonURL)
 		gazeGate, gerr := koe.NewGazeGate(gazeCfg)
+		standbyGate, sberr := koe.NewStandbyGate(standbyCfg)
+		standbyIdle := koe.NewStandbyIdleGate(standbyCfg.IdleHangup)
 		bargeGate := koe.NewBargePerceptionGate()
 		if perr != nil {
 			log.Printf("koe[perception]: degraded: setup failed: %v", perr)
 		} else if gerr != nil {
 			log.Printf("koe[gaze]: degraded: gate setup failed: %v", gerr)
+		} else if sberr != nil {
+			log.Printf("koe[standby]: degraded: gate setup failed: %v", sberr)
 		} else {
 			stream, serr := perception.Stream(ctx, koe.DefaultPerceptionPollInterval())
 			if serr != nil {
@@ -1886,6 +1935,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 						sessMu.Lock()
 						prepared := sessionWanted && sessionReady && curAudioStarted && curConn != nil
 						active := callActive
+						standbyOwned := callStandbyOwned
 						sessMu.Unlock()
 						audio := snapAudio.Load()
 						speaking := audio != nil && audio.Speaking()
@@ -1918,6 +1968,40 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 							case koe.GazeCancelPreparation:
 								cancelGazePreparation(decision.Reason)
 							}
+						}
+
+						standbyDecision := standbyGate.Update(koe.StandbyInput{
+							Now:        snapshot.ObservedAt,
+							Snapshot:   snapshot,
+							CallActive: active,
+						})
+						if standbyDecision.Changed || standbyDecision.Reason == "speech_front" {
+							log.Printf("koe[standby]: state=%s reason=%s", standbyDecision.State, standbyDecision.Reason)
+						}
+						for _, action := range standbyDecision.Actions {
+							if action.Kind == koe.StandbyActivate {
+								// The ready cue plays through the normal startCall path, so the
+								// user hears the same "I'm listening" they get from the key.
+								startCallFrom(koe.StartCallRequest{}, true)
+							}
+						}
+
+						// Silence auto-dismiss: a standby-opened call the user walked away
+						// from returns the robot to standby instead of holding the session.
+						taskPending := false
+						if state := snapState.Load(); state != nil {
+							taskPending = state.InFlight() != ""
+						}
+						if standbyIdle.Update(koe.StandbyIdleInput{
+							Now:               snapshot.ObservedAt,
+							CallActive:        active,
+							StandbyOwned:      standbyOwned,
+							TaskPending:       taskPending,
+							AssistantSpeaking: speaking,
+							VoiceEventSeq:     voiceEventSeq.Load(),
+						}) {
+							log.Printf("koe[standby]: auto-dismiss after %s of silence", standbyCfg.IdleHangup)
+							endCall()
 						}
 					}
 				}()

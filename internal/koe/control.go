@@ -415,6 +415,9 @@ type carrierStatusResponse struct {
 	RealtimeState    string               `json:"realtime_state,omitempty"`
 	PrewarmState     string               `json:"prewarm_state,omitempty"`
 	PrewarmExpiresAt string               `json:"prewarm_expires_at,omitempty"`
+	// OpenMode is read-only ("trigger" | "standby") and Wireless-only, so the
+	// mac/lite response stays byte-identical. Additive: an older Desktop ignores it.
+	OpenMode string `json:"open_mode,omitempty"`
 }
 
 type carrierAudioStatus struct {
@@ -469,6 +472,7 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 	realtimeState := ""
 	prewarmState := ""
 	prewarmExpiresAt := ""
+	openMode := ""
 	var cameraStatus *carrierCameraStatus
 	if p.Carrier == CarrierReachyWireless {
 		socketConfigured := s.wirelessAudioSocketConfigured.Load()
@@ -503,6 +507,10 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 		if s.prewarmSnapshot != nil {
 			prewarmState, prewarmExpiresAt = s.prewarmSnapshot()
 		}
+		openMode = p.OpenMode
+		if openMode == "" {
+			openMode = OpenModeTrigger
+		}
 	}
 	if bridgeState == bridgeStateConnected && s.bridgeDetails != nil {
 		bridgeStatus.Proto, bridgeStatus.BridgeVersion = s.bridgeDetails()
@@ -520,5 +528,6 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 		RealtimeState:    realtimeState,
 		PrewarmState:     prewarmState,
 		PrewarmExpiresAt: prewarmExpiresAt,
+		OpenMode:         openMode,
 	})
 }

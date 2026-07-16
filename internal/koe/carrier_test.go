@@ -251,3 +251,47 @@ func TestParseCarrierProfile_PassesModelAndAgentThrough(t *testing.T) {
 		t.Errorf("model/agent not carried through: model=%q agent=%q", p.Model, p.Agent)
 	}
 }
+
+func TestParseCarrierProfile_OpenModeDefaultsToTrigger(t *testing.T) {
+	for _, carrier := range []string{CarrierMac, CarrierReachyWireless} {
+		p, err := ParseCarrierProfile(CarrierInputs{Carrier: carrier})
+		if err != nil {
+			t.Fatalf("%s: unexpected err: %v", carrier, err)
+		}
+		if p.OpenMode != OpenModeTrigger {
+			t.Errorf("%s: open mode = %q, want %q", carrier, p.OpenMode, OpenModeTrigger)
+		}
+	}
+}
+
+func TestParseCarrierProfile_OpenModeStandbyIsWirelessOnly(t *testing.T) {
+	p, err := ParseCarrierProfile(CarrierInputs{Carrier: CarrierReachyWireless, OpenMode: OpenModeStandby})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if p.OpenMode != OpenModeStandby {
+		t.Errorf("wireless open mode = %q, want %q", p.OpenMode, OpenModeStandby)
+	}
+
+	// mac/lite must never enter resident listening, however the env is set.
+	for _, carrier := range []string{CarrierMac, CarrierReachyLite} {
+		in := CarrierInputs{Carrier: carrier, OpenMode: OpenModeStandby}
+		if carrier == CarrierReachyLite {
+			in.MicUID, in.SpeakerUID = "mic", "spk"
+		}
+		p, err := ParseCarrierProfile(in)
+		if err != nil {
+			t.Fatalf("%s: unexpected err: %v", carrier, err)
+		}
+		if p.OpenMode != OpenModeTrigger {
+			t.Errorf("%s: open mode = %q, want %q", carrier, p.OpenMode, OpenModeTrigger)
+		}
+	}
+}
+
+func TestParseCarrierProfile_UnknownOpenModeFailsLoud(t *testing.T) {
+	_, err := ParseCarrierProfile(CarrierInputs{Carrier: CarrierReachyWireless, OpenMode: "always_on"})
+	if err == nil || !strings.Contains(err.Error(), "KOE_OPEN_MODE") {
+		t.Fatalf("err = %v, want a KOE_OPEN_MODE validation error", err)
+	}
+}

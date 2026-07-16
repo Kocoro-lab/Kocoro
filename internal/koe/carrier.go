@@ -69,6 +69,7 @@ type CarrierInputs struct {
 	SpeakerUID      string // --speaker-device (CoreAudio output UID)
 	Model           string // realtime model
 	Agent           string // bound back-brain agent slug
+	OpenMode        string // resolved KOE_OPEN_MODE ("" → trigger); honoured only by reachy_wireless
 }
 
 // CarrierProfile is Koe's resolved, immutable carrier identity for the process
@@ -84,6 +85,11 @@ type CarrierProfile struct {
 	SpeakerUID      string
 	Model           string
 	Agent           string
+	// OpenMode is how a conversation is opened: OpenModeTrigger (default — the
+	// Desktop trigger key / gaze encounter) or OpenModeStandby (resident listen).
+	// Only reachy_wireless honours the injected value; every other carrier is
+	// pinned to trigger, so mac/lite behaviour is untouched.
+	OpenMode string
 }
 
 // ParseCarrierProfile validates the carrier/caps inputs fail-loud (unknown values
@@ -103,6 +109,17 @@ func ParseCarrierProfile(in CarrierInputs) (CarrierProfile, error) {
 		return CarrierProfile{}, err
 	}
 
+	// The open mode is validated for every carrier (a bad token is a config bug
+	// worth failing on) but only applied to reachy_wireless: standby listening is
+	// a robot behaviour, and silently enabling it on mac would be a surprise.
+	openMode, err := ParseOpenMode(in.OpenMode)
+	if err != nil {
+		return CarrierProfile{}, err
+	}
+	if carrier != CarrierReachyWireless {
+		openMode = OpenModeTrigger
+	}
+
 	p := CarrierProfile{
 		Carrier:      carrier,
 		Caps:         caps,
@@ -111,6 +128,7 @@ func ParseCarrierProfile(in CarrierInputs) (CarrierProfile, error) {
 		SpeakerUID:   in.SpeakerUID,
 		Model:        in.Model,
 		Agent:        in.Agent,
+		OpenMode:     openMode,
 	}
 
 	// Audio backend: an explicit --aec always wins. Otherwise reachy_lite presets
