@@ -246,6 +246,9 @@ func TestGazeGateInvalidSensorStateCancelsImmediately(t *testing.T) {
 }
 
 func TestGazeConfigValidation(t *testing.T) {
+	if got := DefaultGazeConfig().EncounterReset; got != 10*time.Second {
+		t.Fatalf("default encounter reset = %s, want 10s dropout tolerance", got)
+	}
 	cfg := DefaultGazeConfig()
 	cfg.FrontHalfAngle = math.Pi
 	if _, err := NewGazeGate(cfg); err == nil {

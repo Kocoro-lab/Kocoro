@@ -10,12 +10,16 @@ import (
 )
 
 const (
-	defaultGazeFaceHits       = 2
-	defaultGazeVADHits        = 2
-	defaultGazeFaceHold       = 1500 * time.Millisecond
-	defaultGazeArmTimeout     = 8 * time.Second
-	defaultGazeRearmCooldown  = 2 * time.Second
-	defaultGazeEncounterReset = 2 * time.Second
+	defaultGazeFaceHits      = 2
+	defaultGazeVADHits       = 2
+	defaultGazeFaceHold      = 1500 * time.Millisecond
+	defaultGazeArmTimeout    = 8 * time.Second
+	defaultGazeRearmCooldown = 2 * time.Second
+	// YuNet produced 3-4 second false-negative gaps for a stationary person on
+	// the Wireless CM4. A shorter reset turns one seated encounter into repeated
+	// warm-session mints. Ten seconds still treats a real leave-and-return as a
+	// new encounter while absorbing detector dropouts.
+	defaultGazeEncounterReset = 10 * time.Second
 	defaultGazeHealthGrace    = 1500 * time.Millisecond
 )
 
