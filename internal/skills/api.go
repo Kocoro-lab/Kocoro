@@ -67,9 +67,13 @@ func WriteGlobalSkill(shannonDir string, skill *Skill) error {
 		StickyInstructions: skill.StickyInstructions,
 		Hidden:             skill.Hidden,
 	}
-	if len(skill.AllowedTools) > 0 {
-		// stringOrList.MarshalYAML re-joins these into the scalar string form,
-		// so the on-disk SKILL.md is byte-identical to the previous behavior.
+	if skill.AllowedTools != nil {
+		// Gate on != nil, NOT len > 0: a non-nil empty allowlist ("grant zero
+		// tools") must be persisted, else it reloads as absent (nil → NO
+		// restriction) and silently grants every tool. stringOrList.MarshalYAML
+		// re-joins these into the scalar string form and IsZero keeps the empty
+		// slice from being omitempty-dropped, so the on-disk SKILL.md stays
+		// byte-identical for the non-empty case and round-trips the empty case.
 		fm.AllowedTools = stringOrList(skill.AllowedTools)
 	}
 	// Only marshal the sticky-snippet when the author explicitly pinned one

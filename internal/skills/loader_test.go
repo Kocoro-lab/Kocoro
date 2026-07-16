@@ -155,6 +155,43 @@ func TestWriteGlobalSkill_AllowedTools_RoundTrip(t *testing.T) {
 	}
 }
 
+// A present-but-empty allowlist ("grant zero tools") must survive a
+// WriteGlobalSkill → LoadSkills round-trip. If the write drops the field, the
+// reload reads it as absent (nil → NO restriction), silently granting every
+// tool — re-opening the fail-open the non-nil-empty invariant exists to close.
+// Guards the omitempty ordering trap: yaml.v3 evaluates omitempty (via the
+// zeroer interface) before MarshalYAML, so stringOrList.IsZero must report a
+// non-nil empty slice as non-zero, and WriteGlobalSkill must set the field.
+func TestWriteGlobalSkill_AllowedTools_EmptyRoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	if err := WriteGlobalSkill(tmp, &Skill{
+		Name:         "zero",
+		Slug:         "zero",
+		Description:  "grant nothing",
+		Prompt:       "Body.",
+		AllowedTools: []string{}, // non-nil empty: restrict to zero tools
+	}); err != nil {
+		t.Fatalf("WriteGlobalSkill: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(tmp, "skills", "zero", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "allowed-tools:") {
+		t.Errorf("empty allowlist dropped from disk (would reload as unrestricted):\n%s", raw)
+	}
+	skills, err := LoadSkills(SkillSource{Dir: filepath.Join(tmp, "skills"), Source: "global"})
+	if err != nil {
+		t.Fatalf("LoadSkills: %v", err)
+	}
+	if len(skills) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(skills))
+	}
+	if at := skills[0].AllowedTools; at == nil || len(at) != 0 {
+		t.Fatalf("empty allowlist did not round-trip as non-nil empty (restrict to none), got %#v", at)
+	}
+}
+
 func TestLoadSkills_PriorityDedup(t *testing.T) {
 	agentDir := t.TempDir()
 	globalDir := t.TempDir()
