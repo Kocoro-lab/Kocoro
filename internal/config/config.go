@@ -121,7 +121,17 @@ type KoeConfig struct {
 	// every daemon request once LANBind is on. Loopback callers stay exempt;
 	// non-loopback callers without a matching token are rejected (fail-closed).
 	// Never logged.
+	//
+	// Deprecated for writes: this is one slot, so pairing a second robot
+	// overwrote the first and a Mac could only ever honour its newest. Use
+	// LANTokens. Still read, so a robot paired before that field existed keeps
+	// working without re-pairing.
 	LANToken string `mapstructure:"lan_token" yaml:"lan_token,omitempty" json:"lan_token,omitempty"`
+	// LANTokens is the bearer token each paired robot presents, keyed by its
+	// Pollen hardware id. One slot per robot, so pairing a second robot does not
+	// revoke the first and unpairing one does not revoke the others — neither of
+	// which the single LANToken above can express. Never logged.
+	LANTokens map[string]string `mapstructure:"lan_tokens" yaml:"lan_tokens,omitempty" json:"lan_tokens,omitempty"`
 }
 
 // MCPConfig holds client-side settings shared across all MCP servers.
