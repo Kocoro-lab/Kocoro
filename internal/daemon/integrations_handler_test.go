@@ -68,6 +68,16 @@ func TestHandleListIntegrations_CloudGate(t *testing.T) {
 	}
 }
 
+func TestHandleRefreshIntegrations_CloudGate(t *testing.T) {
+	s := newIntegrationsTestServer(false, false)
+	req := httptest.NewRequest(http.MethodPost, "/integrations/refresh", nil)
+	rr := httptest.NewRecorder()
+	s.handleRefreshIntegrations(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (body: %s)", rr.Code, rr.Body.String())
+	}
+}
+
 func TestHandleGetIntegration_GateAndValidation(t *testing.T) {
 	t.Run("cloud disabled -> 503", func(t *testing.T) {
 		s := newIntegrationsTestServer(false, false)

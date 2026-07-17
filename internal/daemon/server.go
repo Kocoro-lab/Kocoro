@@ -558,6 +558,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Generic integrations — thin proxy to Cloud (which owns the per-provider
 	// OAuth exchange). The daemon attaches the API key and forwards.
 	mux.HandleFunc("POST /integrations/{provider}/connect", s.handleConnectIntegration)
+	// Lightweight refresh: re-pull the caller's active integration tools into the
+	// local agent registry. Desktop calls this right after a connection is
+	// confirmed active (or disconnected) so the tools appear/disappear without a
+	// full /config/reload (which would also restart MCP subprocesses).
+	mux.HandleFunc("POST /integrations/refresh", s.handleRefreshIntegrations)
 	mux.HandleFunc("GET /integrations", s.handleListIntegrations)
 	mux.HandleFunc("GET /integrations/{id}", s.handleGetIntegration)
 	mux.HandleFunc("DELETE /integrations/{id}", s.handleDeleteIntegration)

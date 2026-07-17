@@ -2,23 +2,45 @@ package daemon
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
-// refreshIntegrationToolsAsync re-syncs the local agent's integration tools
-// after a connection change. Fired best-effort in the background so it never
-// delays the HTTP response (RebuildAuthSensitiveTools is internally bounded).
+// RefreshIntegrationTools re-pulls the caller's active integration tools from
+// Cloud and (re)registers them on the live agent registry. Lightweight: it only
+// touches integration tools (unlike RebuildAuthSensitiveTools, which also
+// re-registers publish/image/cloud_delegate; and unlike /config/reload, which
+// restarts MCP subprocesses). Bounded so a slow/unavailable gateway can't stall
+// the caller. No-op (nil) when deps aren't ready.
+func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
+	if s == nil || s.deps == nil || s.deps.Registry == nil || s.deps.GW == nil {
+		return nil
+	}
+	itCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return tools.RegisterIntegrationTools(itCtx, s.deps.GW, s.deps.Registry)
+}
+
+// refreshIntegrationToolsAsync fires RefreshIntegrationTools in the background
+// so it never delays the HTTP response.
 //
 // A `connect` returns an oauth_url and the connection only goes active AFTER
 // the user completes OAuth in the browser — out of band from this daemon — so
 // this call populates tools immediately only for a re-connect of an
 // already-authorized provider. First-time activation reliably lands via the
-// sign-in refresh (OnAPIKeyChanged), a POST /config/reload after the OAuth
-// flow, or daemon restart. `delete` is immediate: the provider's tools are
-// dropped on the next refresh.
+// explicit POST /integrations/refresh (Desktop calls it once the connection is
+// confirmed active), the sign-in refresh (OnAPIKeyChanged), or daemon restart.
+// `delete` is immediate: the provider's tools are dropped on the next refresh.
 func (s *Server) refreshIntegrationToolsAsync() {
-	go s.RebuildAuthSensitiveTools(context.Background())
+	go func() {
+		if err := s.RefreshIntegrationTools(context.Background()); err != nil {
+			log.Printf("daemon: integration tools refresh failed (continuing): %v", err)
+		}
+	}()
 }
 
 // This file implements the generic integrations surface as a thin proxy to
@@ -64,6 +86,22 @@ func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request
 	if status >= 200 && status < 300 {
 		s.refreshIntegrationToolsAsync()
 	}
+}
+
+// handleRefreshIntegrations handles POST /integrations/refresh: re-pull the
+// caller's active integration tools into the local agent registry. Desktop
+// calls this once a connection is confirmed active (or after a disconnect) so
+// the tools appear/disappear immediately, without a full /config/reload. Runs
+// synchronously so the caller knows the refresh completed.
+func (s *Server) handleRefreshIntegrations(w http.ResponseWriter, r *http.Request) {
+	if !s.integrationsCloudReady(w) {
+		return
+	}
+	if err := s.RefreshIntegrationTools(r.Context()); err != nil {
+		writeError(w, http.StatusBadGateway, "integration tools refresh failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "refreshed"})
 }
 
 // handleListIntegrations proxies GET /integrations to Cloud.
