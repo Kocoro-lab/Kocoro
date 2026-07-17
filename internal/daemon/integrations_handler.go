@@ -17,16 +17,25 @@ import (
 // restarts MCP subprocesses). Bounded so a slow/unavailable gateway can't stall
 // the caller. No-op (nil) when deps aren't ready.
 func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
-	if s == nil || s.deps == nil || s.deps.Registry == nil || s.deps.GW == nil {
+	if s == nil || s.deps == nil || s.deps.GW == nil {
 		return nil
 	}
 	// Serialize with other live-registry refreshes so overlapping calls can't
 	// apply stale snapshots out of order.
 	s.toolRefreshMu.Lock()
 	defer s.toolRefreshMu.Unlock()
+	_, reg, _ := s.deps.Snapshot() // read the registry pointer under deps.mu
+	if reg == nil {
+		return nil
+	}
 	itCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	return tools.RegisterIntegrationTools(itCtx, s.deps.GW, s.deps.Registry)
+	err := tools.RegisterIntegrationTools(itCtx, s.deps.GW, reg)
+	// Keep the cached overlay in sync so a later MCP health rebuild preserves
+	// the integration tools registered above (RebuildRegistryForHealth rebuilds
+	// the live registry from the cached GatewayOverlay).
+	s.syncGatewayOverlay(reg)
+	return err
 }
 
 // refreshIntegrationToolsAsync fires RefreshIntegrationTools in the background

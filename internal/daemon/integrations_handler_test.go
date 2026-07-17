@@ -1,10 +1,13 @@
 package daemon
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 )
@@ -65,6 +68,41 @@ func TestHandleListIntegrations_CloudGate(t *testing.T) {
 	s.handleListIntegrations(rr, req)
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503 (body: %s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRefreshIntegrationTools_SyncsGatewayOverlay guards the fix for the
+// health-rebuild staleness bug: after an in-place refresh, the cached
+// GatewayOverlay must include the integration tools, so a later MCP health
+// rebuild (which rebuilds from the cached overlay) does not drop them.
+func TestRefreshIntegrationTools_SyncsGatewayOverlay(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]client.ServerToolSchema{{Name: "notion_search"}})
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{}
+	cfg.Cloud.Enabled = true
+	cfg.APIKey = "test-key"
+	reg := agent.NewToolRegistry()
+	deps := &ServerDeps{Config: cfg, Registry: reg, GW: client.NewGatewayClient(server.URL, "test-key")}
+	s := &Server{deps: deps}
+
+	if err := s.RefreshIntegrationTools(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if _, ok := reg.Get("notion_search"); !ok {
+		t.Error("notion_search should be registered in the live registry")
+	}
+	found := false
+	for _, tl := range deps.GatewayOverlay {
+		if tl.Info().Name == "notion_search" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("integration tool must be in GatewayOverlay after refresh (survives MCP health rebuild)")
 	}
 }
 
