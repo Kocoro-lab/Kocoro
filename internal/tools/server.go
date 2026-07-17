@@ -22,15 +22,43 @@ const ladderHeader = "Provider attempts:"
 // balancing diagnostic value vs LLM context burn.
 const ladderDetailMaxLen = 200
 
-// ServerTool wraps a server-side tool schema and proxies execution
-// through the gateway's /api/v1/tools/{name}/execute endpoint.
+// ServerTool wraps a server-side tool schema and proxies execution to the
+// gateway. Gateway tools hit /api/v1/tools/{name}/execute; integration tools
+// (see NewIntegrationTool) hit /api/v1/integrations/tools/{name}/execute. Only
+// the execute function and the declared source differ — the argument
+// stripping, error classification, usage accounting and result shaping are
+// identical, so both share Run.
 type ServerTool struct {
 	schema  client.ServerToolSchema
 	gateway *client.GatewayClient
+	execute func(ctx context.Context, name string, args map[string]any) (*client.ToolExecuteResponse, error)
+	source  agent.ToolSource
 }
 
+// NewServerTool builds a gateway tool (allowlisted server-side tools such as
+// web_search / web_fetch), executed via /api/v1/tools/{name}/execute.
 func NewServerTool(schema client.ServerToolSchema, gateway *client.GatewayClient) *ServerTool {
-	return &ServerTool{schema: schema, gateway: gateway}
+	return &ServerTool{
+		schema:  schema,
+		gateway: gateway,
+		execute: func(ctx context.Context, name string, args map[string]any) (*client.ToolExecuteResponse, error) {
+			return gateway.ExecuteTool(ctx, name, args, "")
+		},
+		source: agent.SourceGateway,
+	}
+}
+
+// NewIntegrationTool builds a third-party integration tool (Notion/Slack/…),
+// executed via /api/v1/integrations/tools/{name}/execute. Cloud resolves the
+// caller's connection from the API key and enforces its own access control, so
+// like a gateway tool it does not require local approval.
+func NewIntegrationTool(schema client.ServerToolSchema, gateway *client.GatewayClient) *ServerTool {
+	return &ServerTool{
+		schema:  schema,
+		gateway: gateway,
+		execute: gateway.ExecuteIntegrationTool,
+		source:  agent.SourceIntegration,
+	}
 }
 
 func (t *ServerTool) Info() agent.ToolInfo {
@@ -65,7 +93,7 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 	// older cloud versions without the reserved-daemon-fields whitelist.
 	stripFieldsNotInSchema(args, t.schema.Parameters)
 
-	resp, err := t.gateway.ExecuteTool(ctx, t.schema.Name, args, "")
+	resp, err := t.execute(ctx, t.schema.Name, args)
 	if err != nil {
 		msg := err.Error()
 		prefix := classifyServerError(msg)
@@ -182,7 +210,7 @@ func classifyServerError(msg string) string {
 }
 
 // ToolSource implements agent.ToolSourcer for deterministic tool ordering.
-func (t *ServerTool) ToolSource() agent.ToolSource { return agent.SourceGateway }
+func (t *ServerTool) ToolSource() agent.ToolSource { return t.source }
 
 // appendLadder returns base with a fallback-ladder block appended when one can
 // be built from metadata. Idempotent: if base already contains the ladder

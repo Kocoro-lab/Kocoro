@@ -48,6 +48,12 @@ const (
 	SourceLocal   ToolSource = "local"
 	SourceMCP     ToolSource = "mcp"
 	SourceGateway ToolSource = "gateway"
+	// SourceIntegration marks cloud-proxied third-party integration tools
+	// (Notion/Slack/Figma/…) surfaced from the user's connected accounts.
+	// They behave like gateway tools for listing/cache purposes (grouped with
+	// SourceGateway in both partitioners) but carry their own source so the
+	// registry can refresh them as a set when connections change.
+	SourceIntegration ToolSource = "integration"
 )
 
 // ToolSourcer is an optional interface tools implement to declare their origin.
@@ -641,7 +647,7 @@ func (r *ToolRegistry) partitionBySourceLocked() (local, mcp, gw []string) {
 			switch sourcer.ToolSource() {
 			case SourceMCP:
 				mcp = append(mcp, name)
-			case SourceGateway:
+			case SourceGateway, SourceIntegration:
 				gw = append(gw, name)
 			default:
 				local = append(local, name)

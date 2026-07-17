@@ -239,6 +239,50 @@ func RegisterServerTools(ctx context.Context, gw *client.GatewayClient, reg *age
 	return nil
 }
 
+// RegisterIntegrationTools fetches the caller's active third-party integration
+// tools from the gateway and (re)registers them on reg. Unlike gateway tools
+// there is NO local allowlist — Cloud already filters by the user's active
+// connections and its own whitelist, so we trust whatever it returns. Local
+// tools keep priority (a name collision is skipped). Idempotent: this doubles
+// as a refresh when the user connects/disconnects an account.
+//
+// Fetch-then-replace: the list is fetched BEFORE any existing integration tools
+// are removed, so a failed Cloud round-trip leaves the registry untouched
+// (previously registered tools survive the outage) rather than wiping the tools
+// and returning empty. Callers must still serialize concurrent refreshes so two
+// overlapping runs can't apply stale snapshots out of order (see
+// Server.toolRefreshMu).
+func RegisterIntegrationTools(ctx context.Context, gw *client.GatewayClient, reg *agent.ToolRegistry) error {
+	if reg == nil {
+		return fmt.Errorf("tool registry is nil")
+	}
+	if gw == nil {
+		return nil
+	}
+
+	schemas, err := gw.ListIntegrationTools(ctx)
+	if err != nil {
+		// Registry left as-is: keep the previously registered integration tools
+		// through a transient integration-endpoint outage.
+		return fmt.Errorf("integration tools unavailable: %w", err)
+	}
+
+	// Fetch succeeded — now replace the integration subset. Drop stale tools
+	// (a disconnected provider's tools disappear) then register the current set.
+	for _, t := range reg.All() {
+		if sourcer, ok := t.(agent.ToolSourcer); ok && sourcer.ToolSource() == agent.SourceIntegration {
+			reg.Remove(t.Info().Name)
+		}
+	}
+	for _, schema := range schemas {
+		if _, exists := reg.Get(schema.Name); exists {
+			continue // local/gateway tool takes priority
+		}
+		reg.Register(NewIntegrationTool(schema, gw))
+	}
+	return nil
+}
+
 // SetRegistrySkills updates the use_skill tool in a registry to point to the
 // given skills slice. Returns the skills pointer for the caller to keep in sync.
 // This is safe for concurrent use because it creates a new use_skill tool instance.
@@ -389,6 +433,9 @@ func CompleteRegistration(ctx context.Context, gw *client.GatewayClient, cfg *co
 	var err error
 	if gw != nil {
 		err = RegisterServerTools(ctx, gw, reg)
+		if ierr := RegisterIntegrationTools(ctx, gw, reg); ierr != nil {
+			log.Printf("integration tools registration failed (continuing): %v", ierr)
+		}
 	}
 
 	// Apply tool filter AFTER all sources are registered
@@ -477,6 +524,9 @@ func CompleteRegistrationAsync(ctx context.Context, gw *client.GatewayClient, cf
 	var err error
 	if gw != nil {
 		err = RegisterServerTools(ctx, gw, reg)
+		if ierr := RegisterIntegrationTools(ctx, gw, reg); ierr != nil {
+			log.Printf("integration tools registration failed (continuing): %v", ierr)
+		}
 	}
 
 	reg = ApplyToolFilter(reg, agentDef...)

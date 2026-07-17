@@ -46,11 +46,17 @@ import (
 )
 
 type Server struct {
-	port           int
-	client         *Client
-	deps           *ServerDeps
-	server         *http.Server
-	listenerMu     sync.Mutex // protects listener
+	port       int
+	client     *Client
+	deps       *ServerDeps
+	server     *http.Server
+	listenerMu sync.Mutex // protects listener
+	// toolRefreshMu serializes in-place re-registration of the live registry's
+	// gateway/integration tools (RebuildAuthSensitiveTools + RefreshIntegrationTools).
+	// Without it, overlapping refreshes (e.g. sign-in + a connect/delete async
+	// refresh + POST /integrations/refresh) can apply stale snapshots out of order
+	// and resurrect a disconnected provider's tools.
+	toolRefreshMu  sync.Mutex
 	listener       net.Listener
 	version        string
 	ctx            context.Context // daemon lifecycle context, set on Start
@@ -476,15 +482,41 @@ func (s *Server) RegisterAuthRoutes(mux *http.ServeMux) {
 // touch MCP / local tools, which keeps the path safe to call repeatedly
 // without disturbing in-flight agent runs that hold concurrent reads on
 // the local-tool subset.
-func (s *Server) RebuildAuthSensitiveTools(_ context.Context) {
-	if s == nil || s.deps == nil || s.deps.Registry == nil || s.deps.GW == nil {
+// syncGatewayOverlay re-extracts the cached GatewayOverlay from the live
+// registry. The in-place refresh paths (RebuildAuthSensitiveTools,
+// RefreshIntegrationTools) register gateway/integration tools directly on
+// s.deps.Registry; the cached overlay is otherwise only rewritten by
+// /config/reload. An MCP health transition rebuilds the live registry from the
+// cached overlay (SetOnChange → RebuildRegistryForHealth), so without syncing it
+// here any integration tool connected after startup would be dropped on the next
+// health flap. Integration tools are *ServerTool, so ExtractGatewayTools
+// captures them alongside the gateway tools. Extract before taking the write
+// lock to keep the deps critical section short.
+func (s *Server) syncGatewayOverlay(reg *agent.ToolRegistry) {
+	if reg == nil {
+		return
+	}
+	overlay := tools.ExtractGatewayTools(reg)
+	s.deps.WriteLock()
+	s.deps.GatewayOverlay = overlay
+	s.deps.WriteUnlock()
+}
+
+func (s *Server) RebuildAuthSensitiveTools(ctx context.Context) {
+	if s == nil || s.deps == nil || s.deps.GW == nil {
 		return
 	}
 	cfg := s.configWithLiveAPIKey(s.deps.Config)
 	if cfg == nil {
 		return
 	}
-	reg := s.deps.Registry
+	// Serialize with RefreshIntegrationTools (shares the integration-tool refresh).
+	s.toolRefreshMu.Lock()
+	defer s.toolRefreshMu.Unlock()
+	_, reg, _ := s.deps.Snapshot() // read the registry pointer under deps.mu
+	if reg == nil {
+		return
+	}
 	for _, name := range []string{
 		"cloud_delegate",
 		"publish_to_web",
@@ -501,6 +533,17 @@ func (s *Server) RebuildAuthSensitiveTools(_ context.Context) {
 	tools.RegisterRetractPublishedFileTool(reg, s.deps.GW, cfg)
 	tools.RegisterGenerateImageTool(reg, s.deps.GW, cfg)
 	tools.RegisterEditImageTool(reg, s.deps.GW, cfg)
+
+	// Refresh third-party integration tools: a bounded call so a slow/unavailable
+	// gateway can't stall the caller (e.g. an integration connect/disconnect).
+	itCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := tools.RegisterIntegrationTools(itCtx, s.deps.GW, reg); err != nil {
+		log.Printf("daemon: integration tools refresh failed (continuing): %v", err)
+	}
+	// Keep the cached overlay in sync so a later MCP health rebuild preserves
+	// the tools registered in place above.
+	s.syncGatewayOverlay(reg)
 }
 
 // registerRoutes wires every HTTP handler onto mux. Extracted from Start so
@@ -550,6 +593,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Generic integrations — thin proxy to Cloud (which owns the per-provider
 	// OAuth exchange). The daemon attaches the API key and forwards.
 	mux.HandleFunc("POST /integrations/{provider}/connect", s.handleConnectIntegration)
+	// Lightweight refresh: re-pull the caller's active integration tools into the
+	// local agent registry. Desktop calls this right after a connection is
+	// confirmed active (or disconnected) so the tools appear/disappear without a
+	// full /config/reload (which would also restart MCP subprocesses).
+	mux.HandleFunc("POST /integrations/refresh", s.handleRefreshIntegrations)
 	mux.HandleFunc("GET /integrations", s.handleListIntegrations)
 	mux.HandleFunc("GET /integrations/{id}", s.handleGetIntegration)
 	mux.HandleFunc("DELETE /integrations/{id}", s.handleDeleteIntegration)
@@ -6250,6 +6298,18 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		freshReg := newBaseline.Clone()
 		gwCtx, gwCancel := context.WithTimeout(r.Context(), 5*time.Second)
 		gwErr := tools.RegisterServerTools(gwCtx, s.deps.GW, freshReg)
+		if ierr := tools.RegisterIntegrationTools(gwCtx, s.deps.GW, freshReg); ierr != nil {
+			// Integration and gateway tools share one overlay (both *ServerTool,
+			// extracted together by ExtractGatewayTools). If only the integration
+			// list failed, replacing the overlay with freshReg would drop the
+			// previously registered integration tools. Fold the error into gwErr
+			// so the keep-existing-overlay path below runs — preserving BOTH old
+			// gateway and old integration tools through a transient outage.
+			log.Printf("daemon: reload: integration tools refresh failed, keeping existing overlay: %v", ierr)
+			if gwErr == nil {
+				gwErr = ierr
+			}
+		}
 		gwCancel()
 		toolCfg := s.configWithLiveAPIKey(newCfg)
 		tools.RegisterCloudDelegate(freshReg, s.deps.GW, toolCfg, nil, "", "")

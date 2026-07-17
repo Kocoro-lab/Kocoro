@@ -195,6 +195,13 @@ const (
 	// search on this token; an old daemon omits it, so Desktop falls back to
 	// title-only (in-memory) search rather than calling a 404 route.
 	CapSearchV1 = "search_v1"
+	// CapIntegrationToolsV1 — the local agent registers the user's connected
+	// third-party integration tools (Notion/Slack/Figma/…) fetched from Cloud's
+	// GET /api/v1/integrations/tools and proxies their execution to Cloud. Desktop
+	// gates its "integrations usable in chat" affordance on this token; an old
+	// daemon omits it (integration connections exist but the local agent never
+	// sees the tools), so Desktop can prompt the user to update the engine.
+	CapIntegrationToolsV1 = "integration_tools_v1"
 )
 
 var Capabilities = []string{
@@ -222,6 +229,7 @@ var Capabilities = []string{
 	CapRemoteSessionTimelineV1,
 	CapClawHubExcludeInstalled,
 	CapSearchV1,
+	CapIntegrationToolsV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a

@@ -27,7 +27,8 @@
     "remote_control_v1",
     "remote_session_timeline_v1",
     "clawhub_exclude_installed",
-    "search_v1"
+    "search_v1",
+    "integration_tools_v1"
   ],
   "memory": {
     "provider": "disabled",
