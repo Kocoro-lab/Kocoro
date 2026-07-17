@@ -111,6 +111,43 @@ func TestRegisterIntegrationTools_RegistersAndRespectsLocalPriority(t *testing.T
 	}
 }
 
+// TestRegisterIntegrationTools_ListFailurePreservesExisting verifies that a
+// failed Cloud round-trip leaves the previously registered integration tools in
+// place (fetch-then-replace), rather than wiping them.
+func TestRegisterIntegrationTools_ListFailurePreservesExisting(t *testing.T) {
+	var fail bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail {
+			w.WriteHeader(http.StatusBadGateway)
+			w.Write([]byte(`{"error":"upstream down"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]client.ServerToolSchema{{Name: "notion_search"}})
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := agent.NewToolRegistry()
+
+	// First sync succeeds → notion_search registered.
+	if err := RegisterIntegrationTools(context.Background(), gw, reg); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if _, ok := reg.Get("notion_search"); !ok {
+		t.Fatal("notion_search should be registered after successful sync")
+	}
+
+	// Second sync fails → must return error AND keep the existing tool.
+	fail = true
+	if err := RegisterIntegrationTools(context.Background(), gw, reg); err == nil {
+		t.Error("expected error when list fails")
+	}
+	if _, ok := reg.Get("notion_search"); !ok {
+		t.Error("notion_search must survive a failed refresh (fetch-then-replace)")
+	}
+}
+
 // TestRegisterIntegrationTools_RefreshDropsStale verifies a second call reflects
 // the current active set: tools no longer returned are removed, so a
 // disconnected provider's tools disappear.

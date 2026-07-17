@@ -20,6 +20,10 @@ func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
 	if s == nil || s.deps == nil || s.deps.Registry == nil || s.deps.GW == nil {
 		return nil
 	}
+	// Serialize with other live-registry refreshes so overlapping calls can't
+	// apply stale snapshots out of order.
+	s.toolRefreshMu.Lock()
+	defer s.toolRefreshMu.Unlock()
 	itCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	return tools.RegisterIntegrationTools(itCtx, s.deps.GW, s.deps.Registry)

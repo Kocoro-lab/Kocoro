@@ -46,11 +46,17 @@ import (
 )
 
 type Server struct {
-	port           int
-	client         *Client
-	deps           *ServerDeps
-	server         *http.Server
-	listenerMu     sync.Mutex // protects listener
+	port       int
+	client     *Client
+	deps       *ServerDeps
+	server     *http.Server
+	listenerMu sync.Mutex // protects listener
+	// toolRefreshMu serializes in-place re-registration of the live registry's
+	// gateway/integration tools (RebuildAuthSensitiveTools + RefreshIntegrationTools).
+	// Without it, overlapping refreshes (e.g. sign-in + a connect/delete async
+	// refresh + POST /integrations/refresh) can apply stale snapshots out of order
+	// and resurrect a disconnected provider's tools.
+	toolRefreshMu  sync.Mutex
 	listener       net.Listener
 	version        string
 	ctx            context.Context // daemon lifecycle context, set on Start
@@ -484,6 +490,9 @@ func (s *Server) RebuildAuthSensitiveTools(ctx context.Context) {
 	if cfg == nil {
 		return
 	}
+	// Serialize with RefreshIntegrationTools (shares the integration-tool refresh).
+	s.toolRefreshMu.Lock()
+	defer s.toolRefreshMu.Unlock()
 	reg := s.deps.Registry
 	for _, name := range []string{
 		"cloud_delegate",
@@ -6264,7 +6273,16 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		gwCtx, gwCancel := context.WithTimeout(r.Context(), 5*time.Second)
 		gwErr := tools.RegisterServerTools(gwCtx, s.deps.GW, freshReg)
 		if ierr := tools.RegisterIntegrationTools(gwCtx, s.deps.GW, freshReg); ierr != nil {
-			log.Printf("daemon: reload: integration tools refresh failed (continuing): %v", ierr)
+			// Integration and gateway tools share one overlay (both *ServerTool,
+			// extracted together by ExtractGatewayTools). If only the integration
+			// list failed, replacing the overlay with freshReg would drop the
+			// previously registered integration tools. Fold the error into gwErr
+			// so the keep-existing-overlay path below runs — preserving BOTH old
+			// gateway and old integration tools through a transient outage.
+			log.Printf("daemon: reload: integration tools refresh failed, keeping existing overlay: %v", ierr)
+			if gwErr == nil {
+				gwErr = ierr
+			}
 		}
 		gwCancel()
 		toolCfg := s.configWithLiveAPIKey(newCfg)

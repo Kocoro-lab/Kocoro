@@ -243,9 +243,15 @@ func RegisterServerTools(ctx context.Context, gw *client.GatewayClient, reg *age
 // tools from the gateway and (re)registers them on reg. Unlike gateway tools
 // there is NO local allowlist — Cloud already filters by the user's active
 // connections and its own whitelist, so we trust whatever it returns. Local
-// tools keep priority (a name collision is skipped). Idempotent: any previously
-// registered integration tools are removed first, so this doubles as a refresh
-// when the user connects/disconnects an account.
+// tools keep priority (a name collision is skipped). Idempotent: this doubles
+// as a refresh when the user connects/disconnects an account.
+//
+// Fetch-then-replace: the list is fetched BEFORE any existing integration tools
+// are removed, so a failed Cloud round-trip leaves the registry untouched
+// (previously registered tools survive the outage) rather than wiping the tools
+// and returning empty. Callers must still serialize concurrent refreshes so two
+// overlapping runs can't apply stale snapshots out of order (see
+// Server.toolRefreshMu).
 func RegisterIntegrationTools(ctx context.Context, gw *client.GatewayClient, reg *agent.ToolRegistry) error {
 	if reg == nil {
 		return fmt.Errorf("tool registry is nil")
@@ -254,16 +260,19 @@ func RegisterIntegrationTools(ctx context.Context, gw *client.GatewayClient, reg
 		return nil
 	}
 
-	// Drop stale integration tools so a disconnected provider's tools disappear.
+	schemas, err := gw.ListIntegrationTools(ctx)
+	if err != nil {
+		// Registry left as-is: keep the previously registered integration tools
+		// through a transient integration-endpoint outage.
+		return fmt.Errorf("integration tools unavailable: %w", err)
+	}
+
+	// Fetch succeeded — now replace the integration subset. Drop stale tools
+	// (a disconnected provider's tools disappear) then register the current set.
 	for _, t := range reg.All() {
 		if sourcer, ok := t.(agent.ToolSourcer); ok && sourcer.ToolSource() == agent.SourceIntegration {
 			reg.Remove(t.Info().Name)
 		}
-	}
-
-	schemas, err := gw.ListIntegrationTools(ctx)
-	if err != nil {
-		return fmt.Errorf("integration tools unavailable: %w", err)
 	}
 	for _, schema := range schemas {
 		if _, exists := reg.Get(schema.Name); exists {
