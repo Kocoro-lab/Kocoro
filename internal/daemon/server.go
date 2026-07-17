@@ -1000,6 +1000,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /koe/realtime/usage", s.handleKoeRealtimeUsage)
 	mux.HandleFunc("GET /koe/persona", s.handleKoePersona)
 	mux.HandleFunc("POST /koe/lan/configure", s.handleKoeLANConfigure)
+	mux.HandleFunc("POST /koe/lan/revoke", s.handleKoeLANRevoke)
 	mux.HandleFunc("POST /local/screenshot/window", s.handleScreenshotWindow)
 	mux.HandleFunc("POST /inject/retract", s.handleRetractInject)
 	mux.HandleFunc("POST /cancel", s.handleCancel)
