@@ -9,16 +9,32 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 )
 
-// koeLANBind resolves the daemon's HTTP listen host and the bearer token from the
-// opt-in LAN-exposure config. LAN binding ("" = all interfaces) requires BOTH
-// Koe.LANBind AND a non-empty Koe.LANToken, so a mis-set flag alone cannot open
-// an unauthenticated hole — without a token the daemon stays loopback-only
+// koeLANBind resolves the daemon's HTTP listen host and every bearer token that
+// may reach it from the LAN. Binding ("" = all interfaces) requires BOTH
+// Koe.LANBind AND at least one token, so a mis-set flag alone cannot open an
+// unauthenticated hole — with no tokens the daemon stays loopback-only
 // ("localhost"), unchanged.
-func koeLANBind(cfg *config.Config) (bindHost, token string) {
-	if cfg != nil && cfg.Koe.LANBind && cfg.Koe.LANToken != "" {
-		return "", cfg.Koe.LANToken
+//
+// Tokens come from Koe.LANTokens, one per paired robot: a Mac pairs several
+// robots, and each must authenticate on its own so that pairing one cannot
+// revoke another. Koe.LANToken is the pre-map form and is still honoured, so a
+// robot paired before that field existed keeps working without re-pairing.
+func koeLANBind(cfg *config.Config) (bindHost string, tokens []string) {
+	if cfg == nil || !cfg.Koe.LANBind {
+		return "localhost", nil
 	}
-	return "localhost", ""
+	for _, token := range cfg.Koe.LANTokens {
+		if token != "" {
+			tokens = append(tokens, token)
+		}
+	}
+	if cfg.Koe.LANToken != "" {
+		tokens = append(tokens, cfg.Koe.LANToken)
+	}
+	if len(tokens) == 0 {
+		return "localhost", nil
+	}
+	return "", tokens
 }
 
 // withKoeLANAuth gates the daemon's HTTP surface when it is exposed on the LAN
@@ -36,13 +52,13 @@ func koeLANBind(cfg *config.Config) (bindHost, token string) {
 //   - Fail-closed: an empty token rejects EVERY non-loopback request, so enabling
 //     the LAN listener without provisioning a token cannot silently open a hole.
 //   - CORS preflight (OPTIONS) is exempt so browser origins can still probe.
-func withKoeLANAuth(token string, h http.Handler) http.Handler {
+func withKoeLANAuth(tokens []string, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions || isLoopbackRemoteAddr(r.RemoteAddr) {
 			h.ServeHTTP(w, r)
 			return
 		}
-		if !bearerTokenMatches(r.Header.Get("Authorization"), token) {
+		if !bearerTokenMatchesAny(r.Header.Get("Authorization"), tokens) {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -63,17 +79,24 @@ func isLoopbackRemoteAddr(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// bearerTokenMatches constant-time compares the `Authorization: Bearer <token>`
-// header value against the configured token. An empty configured token never
+// bearerTokenMatchesAny constant-time compares the `Authorization: Bearer <token>`
+// header value against every token a paired robot may hold. An empty set never
 // matches (fail-closed).
-func bearerTokenMatches(header, token string) bool {
-	if token == "" {
-		return false
-	}
+//
+// Every candidate is compared even after a hit: returning early would make the
+// time taken depend on which robot matched, leaking the map's ordering.
+func bearerTokenMatchesAny(header string, tokens []string) bool {
 	const prefix = "Bearer "
 	if !strings.HasPrefix(header, prefix) {
 		return false
 	}
-	got := header[len(prefix):]
-	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+	got := []byte(header[len(prefix):])
+	matched := 0
+	for _, token := range tokens {
+		if token == "" {
+			continue
+		}
+		matched |= subtle.ConstantTimeCompare(got, []byte(token))
+	}
+	return matched == 1
 }

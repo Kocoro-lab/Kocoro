@@ -19,18 +19,18 @@ func TestKoeLANBind_LoopbackByDefault(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			host, token := koeLANBind(tc.cfg)
-			if host != "localhost" || token != "" {
-				t.Fatalf("koeLANBind = (%q,%q), want (localhost, \"\")", host, token)
+			host, tokens := koeLANBind(tc.cfg)
+			if host != "localhost" || len(tokens) != 0 {
+				t.Fatalf("koeLANBind = (%q,%v), want (localhost, no tokens)", host, tokens)
 			}
 		})
 	}
 }
 
 func TestKoeLANBind_AllInterfacesWhenBindAndToken(t *testing.T) {
-	host, token := koeLANBind(&config.Config{Koe: config.KoeConfig{LANBind: true, LANToken: "s3cr3t"}})
-	if host != "" || token != "s3cr3t" {
-		t.Fatalf("koeLANBind = (%q,%q), want (\"\", s3cr3t)", host, token)
+	host, tokens := koeLANBind(&config.Config{Koe: config.KoeConfig{LANBind: true, LANToken: "s3cr3t"}})
+	if host != "" || len(tokens) != 1 || tokens[0] != "s3cr3t" {
+		t.Fatalf("koeLANBind = (%q,%v), want (\"\", [s3cr3t])", host, tokens)
 	}
 }
 
@@ -45,7 +45,7 @@ func lanAuthProbe(t *testing.T, token, remoteAddr, method, authHeader string) in
 		req.Header.Set("Authorization", authHeader)
 	}
 	rec := httptest.NewRecorder()
-	withKoeLANAuth(token, inner).ServeHTTP(rec, req)
+	withKoeLANAuth([]string{token}, inner).ServeHTTP(rec, req)
 	return rec.Code
 }
 
@@ -90,5 +90,105 @@ func TestKoeLANAuth_PreflightOptionsPasses(t *testing.T) {
 	// CORS preflight from a non-loopback origin must not be blocked by auth.
 	if got := lanAuthProbe(t, "secret", "192.168.1.50:51000", "OPTIONS", ""); got != http.StatusTeapot {
 		t.Fatalf("OPTIONS preflight should pass, got %d", got)
+	}
+}
+
+// --- per-robot LAN tokens ---
+
+func TestKoeLANBind_CollectsEveryPairedToken(t *testing.T) {
+	cfg := &config.Config{Koe: config.KoeConfig{
+		LANBind: true,
+		LANTokens: map[string]string{
+			"50531443cbaa7e08": "token-robot-a-0123456789",
+			"be92ee93cacbff5f": "token-robot-b-0123456789",
+		},
+	}}
+	host, tokens := koeLANBind(cfg)
+	if host != "" {
+		t.Fatalf("want LAN bind, got host %q", host)
+	}
+	if len(tokens) != 2 {
+		t.Fatalf("want both robots' tokens, got %d", len(tokens))
+	}
+}
+
+func TestKoeLANBind_StillHonoursTheLegacySingleToken(t *testing.T) {
+	// A robot paired before lan_tokens existed must keep working untouched.
+	cfg := &config.Config{Koe: config.KoeConfig{
+		LANBind:  true,
+		LANToken: "legacy-single-token-0123456789",
+	}}
+	host, tokens := koeLANBind(cfg)
+	if host != "" || len(tokens) != 1 {
+		t.Fatalf("legacy token must still bind LAN: host=%q tokens=%d", host, len(tokens))
+	}
+}
+
+func TestKoeLANBind_EmptyTokensInTheMapDoNotOpenTheListener(t *testing.T) {
+	// Fail-closed: a map of blanks is no tokens at all.
+	cfg := &config.Config{Koe: config.KoeConfig{
+		LANBind:   true,
+		LANTokens: map[string]string{"50531443cbaa7e08": ""},
+	}}
+	host, tokens := koeLANBind(cfg)
+	if host != "localhost" || len(tokens) != 0 {
+		t.Fatalf("want loopback-only, got host=%q tokens=%d", host, len(tokens))
+	}
+}
+
+func TestKoeLANAuth_EachPairedRobotAuthenticatesIndependently(t *testing.T) {
+	tokens := []string{"token-robot-a-0123456789", "token-robot-b-0123456789"}
+	handler := withKoeLANAuth(tokens, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	for _, token := range tokens {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/status", nil)
+		req.RemoteAddr = "192.168.1.9:5000"
+		req.Header.Set("Authorization", "Bearer "+token)
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("token %q rejected: %d", token, rec.Code)
+		}
+	}
+}
+
+func TestKoeLANAuth_AnUnknownTokenIsStillRejected(t *testing.T) {
+	handler := withKoeLANAuth([]string{"token-robot-a-0123456789"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.RemoteAddr = "192.168.1.9:5000"
+	req.Header.Set("Authorization", "Bearer token-of-an-unpaired-robot")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401 for an unknown token, got %d", rec.Code)
+	}
+}
+
+func TestKoeLANAuth_AnEmptyTokenSetRejectsEveryRemoteCaller(t *testing.T) {
+	handler := withKoeLANAuth(nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.RemoteAddr = "192.168.1.9:5000"
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want fail-closed 401, got %d", rec.Code)
+	}
+}
+
+func TestKoeLANAuth_LoopbackStaysExempt(t *testing.T) {
+	handler := withKoeLANAuth([]string{"token-robot-a-0123456789"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.RemoteAddr = "127.0.0.1:5000"
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("loopback must stay local-trusted, got %d", rec.Code)
 	}
 }

@@ -49,7 +49,7 @@ func TestKoeLANAuth_RealNetworkPath(t *testing.T) {
 	}
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
-	srv := &http.Server{Handler: withKoeLANAuth("s3cr3t", inner)}
+	srv := &http.Server{Handler: withKoeLANAuth([]string{"s3cr3t"}, inner)}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 
