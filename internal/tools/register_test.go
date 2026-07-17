@@ -141,6 +141,12 @@ func TestRegisterServerTools_AllowlistFiltering(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// The gateway tool catalog (allowlist applies) and the integrations tool
+		// list are distinct endpoints; only the former carries these tools.
+		if r.URL.Path == "/api/v1/integrations/tools" {
+			json.NewEncoder(w).Encode([]client.ServerToolSchema{})
+			return
+		}
 		json.NewEncoder(w).Encode(serverTools)
 	}))
 	defer server.Close()

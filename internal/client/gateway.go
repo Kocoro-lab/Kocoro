@@ -2084,6 +2084,72 @@ func (c *GatewayClient) ExecuteTool(ctx context.Context, name string, arguments 
 	return &result, nil
 }
 
+// ListIntegrationTools fetches the executable tool schemas for the caller's
+// active third-party integrations from Cloud. Mirrors ListTools; Cloud filters
+// by the user's active connections + its integration whitelist, so the daemon
+// registers whatever comes back without a local allowlist. Returns an empty
+// list (not an error) when the feature is disabled or nothing is connected.
+func (c *GatewayClient) ListIntegrationTools(ctx context.Context) ([]ServerToolSchema, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/integrations/tools", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
+	}
+	var tools []ServerToolSchema
+	if err := json.NewDecoder(resp.Body).Decode(&tools); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return tools, nil
+}
+
+// ExecuteIntegrationTool executes a third-party integration tool by name.
+// Mirrors ExecuteTool but targets the integrations execute endpoint; Cloud
+// resolves the caller's connection from the API key and proxies to the
+// integration provider. Returns Cloud's status + parsed ToolExecuteResponse.
+func (c *GatewayClient) ExecuteIntegrationTool(ctx context.Context, name string, arguments map[string]any) (*ToolExecuteResponse, error) {
+	reqBody := ToolExecuteRequest{Arguments: arguments}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	endpoint := c.baseURL + "/api/v1/integrations/tools/" + url.PathEscape(name) + "/execute"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		errBody := readResponseBody(resp)
+		if errBody != "" {
+			return nil, fmt.Errorf("integration tool %s returned %d: %s", name, resp.StatusCode, errBody)
+		}
+		return nil, fmt.Errorf("integration tool %s returned %d", name, resp.StatusCode)
+	}
+	var result ToolExecuteResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &result, nil
+}
+
 func readResponseBody(resp *http.Response) string {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {

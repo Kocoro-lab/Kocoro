@@ -277,7 +277,7 @@ func partitionLiveToolNamesBySource(reg *ToolRegistry, names []string) (local, m
 		switch sourcer.ToolSource() {
 		case SourceMCP:
 			mcp = append(mcp, name)
-		case SourceGateway:
+		case SourceGateway, SourceIntegration:
 			gateway = append(gateway, name)
 		default:
 			local = append(local, name)

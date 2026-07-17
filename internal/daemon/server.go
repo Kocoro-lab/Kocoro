@@ -476,7 +476,7 @@ func (s *Server) RegisterAuthRoutes(mux *http.ServeMux) {
 // touch MCP / local tools, which keeps the path safe to call repeatedly
 // without disturbing in-flight agent runs that hold concurrent reads on
 // the local-tool subset.
-func (s *Server) RebuildAuthSensitiveTools(_ context.Context) {
+func (s *Server) RebuildAuthSensitiveTools(ctx context.Context) {
 	if s == nil || s.deps == nil || s.deps.Registry == nil || s.deps.GW == nil {
 		return
 	}
@@ -501,6 +501,14 @@ func (s *Server) RebuildAuthSensitiveTools(_ context.Context) {
 	tools.RegisterRetractPublishedFileTool(reg, s.deps.GW, cfg)
 	tools.RegisterGenerateImageTool(reg, s.deps.GW, cfg)
 	tools.RegisterEditImageTool(reg, s.deps.GW, cfg)
+
+	// Refresh third-party integration tools: a bounded call so a slow/unavailable
+	// gateway can't stall the caller (e.g. an integration connect/disconnect).
+	itCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := tools.RegisterIntegrationTools(itCtx, s.deps.GW, reg); err != nil {
+		log.Printf("daemon: integration tools refresh failed (continuing): %v", err)
+	}
 }
 
 // registerRoutes wires every HTTP handler onto mux. Extracted from Start so
@@ -6250,6 +6258,9 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		freshReg := newBaseline.Clone()
 		gwCtx, gwCancel := context.WithTimeout(r.Context(), 5*time.Second)
 		gwErr := tools.RegisterServerTools(gwCtx, s.deps.GW, freshReg)
+		if ierr := tools.RegisterIntegrationTools(gwCtx, s.deps.GW, freshReg); ierr != nil {
+			log.Printf("daemon: reload: integration tools refresh failed (continuing): %v", ierr)
+		}
 		gwCancel()
 		toolCfg := s.configWithLiveAPIKey(newCfg)
 		tools.RegisterCloudDelegate(freshReg, s.deps.GW, toolCfg, nil, "", "")

@@ -1,9 +1,25 @@
 package daemon
 
 import (
+	"context"
 	"net/http"
 	"strings"
 )
+
+// refreshIntegrationToolsAsync re-syncs the local agent's integration tools
+// after a connection change. Fired best-effort in the background so it never
+// delays the HTTP response (RebuildAuthSensitiveTools is internally bounded).
+//
+// A `connect` returns an oauth_url and the connection only goes active AFTER
+// the user completes OAuth in the browser — out of band from this daemon — so
+// this call populates tools immediately only for a re-connect of an
+// already-authorized provider. First-time activation reliably lands via the
+// sign-in refresh (OnAPIKeyChanged), a POST /config/reload after the OAuth
+// flow, or daemon restart. `delete` is immediate: the provider's tools are
+// dropped on the next refresh.
+func (s *Server) refreshIntegrationToolsAsync() {
+	go s.RebuildAuthSensitiveTools(context.Background())
+}
 
 // This file implements the generic integrations surface as a thin proxy to
 // Shannon Cloud (mirrors slack_handler.go). The renderer only ever talks to
@@ -45,6 +61,9 @@ func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeCloudPassthrough(w, status, body)
+	if status >= 200 && status < 300 {
+		s.refreshIntegrationToolsAsync()
+	}
 }
 
 // handleListIntegrations proxies GET /integrations to Cloud.
@@ -94,4 +113,7 @@ func (s *Server) handleDeleteIntegration(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeCloudPassthrough(w, status, body)
+	if status >= 200 && status < 300 {
+		s.refreshIntegrationToolsAsync()
+	}
 }
