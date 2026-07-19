@@ -324,12 +324,11 @@ func TestKoePersonaPinsCurrentUtteranceLanguage(t *testing.T) {
 func TestKoePersonaTeachesEndCallOnDismiss(t *testing.T) {
 	for _, want := range []string{"end_call", "退出吧", "stop_speaking", "keeps the voice call active", "double-tapping the", "NOT cancel"} {
 		if !strings.Contains(koePersona, want) {
-			t.Errorf("koePersona missing dismiss/end_call guidance %q", want)
+			t.Errorf("koePersona missing stop/end guidance %q", want)
 		}
 	}
-	// The old line that made the model verbally "stop" instead of hanging up is gone.
-	if strings.Contains(koePersona, "if they tell you to stop, stop") {
-		t.Error("koePersona still has the verbal-stop line that suppressed end_call")
+	if strings.Contains(koePersona, `"stop", "shut up",`) && strings.Contains(koePersona, "that is a hang-up") {
+		t.Error("koePersona still teaches stop-talking as a hang-up")
 	}
 }
 
@@ -991,6 +990,9 @@ func TestApplyBargeInEnv(t *testing.T) {
 	applyBargeInEnv(false, false)
 	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
 		t.Fatalf("implicit barge-in setting changed KOE_VPIO_BARGE_IN=%q", v)
+	}
+	if v := os.Getenv("KOE_CLIENT_RESPONSE"); v != "" {
+		t.Fatalf("barge-in off set KOE_CLIENT_RESPONSE=%q, want unchanged", v)
 	}
 
 	applyBargeInEnv(false, true)

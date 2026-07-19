@@ -653,6 +653,102 @@ func TestQwenResponseDoneProtectsPlaybackTailFromEchoBargeIn(t *testing.T) {
 	}
 }
 
+func TestAdaptiveBargeBackchannelResumesBufferedPlayback(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_NATIVE_FLOOR", "0")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "0")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-adaptive-backchannel", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, audio, cap.send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	audio.Play(make([]int16, audioFrameSize))
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	if !h.bargeCandidate.Load() {
+		t.Fatal("speech_started during playback did not create a barge candidate")
+	}
+	if got := audio.PlaybackGain(); got != defaultBargeDuckGain {
+		t.Fatalf("candidate playback gain = %v, want %v", got, defaultBargeDuckGain)
+	}
+	if got := len(audio.playBuf); got != 1 {
+		t.Fatalf("candidate must preserve buffered playback, got %d frame(s)", got)
+	}
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.cleared"}`))
+
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-ok","transcript":"อือออ"}`))
+	if h.bargeCandidate.Load() {
+		t.Fatal("backchannel did not resolve the barge candidate")
+	}
+	if got := audio.PlaybackGain(); got != 1 {
+		t.Fatalf("resumed playback gain = %v, want 1", got)
+	}
+	if got := len(audio.playBuf); got != 1 {
+		t.Fatalf("false interruption discarded buffered playback, got %d frame(s)", got)
+	}
+	if cap.sentContains("response.cancel") || cap.sentContains("output_audio_buffer.clear") {
+		t.Fatalf("false interruption permanently cancelled playback: %v", cap.types())
+	}
+	if got := cap.countType("conversation.item.delete"); got != 1 {
+		t.Fatalf("backchannel sent %d conversation.item.delete messages, want 1", got)
+	}
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("cleared false interruption queued %d continuation responses, want 1", got)
+	}
+	req := <-h.respReq
+	if req.instructions != falseInterruptionResumeInstructions {
+		t.Fatalf("continuation instructions = %q", req.instructions)
+	}
+}
+
+func TestAdaptiveBargeMeaningfulSpeechConfirmsAndQueuesResponse(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_NATIVE_FLOOR", "0")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "0")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-adaptive-question", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, audio, cap.send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	audio.Play(make([]int16, audioFrameSize))
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-question","transcript":"木星有多大"}`))
+
+	if h.bargeCandidate.Load() {
+		t.Fatal("meaningful speech did not confirm the barge candidate")
+	}
+	if got := len(audio.playBuf); got != 0 {
+		t.Fatalf("confirmed interruption left %d buffered frame(s)", got)
+	}
+	for _, want := range []string{"response.cancel", "output_audio_buffer.clear"} {
+		if got := cap.countType(want); got != 1 {
+			t.Fatalf("confirmed interruption sent %d %s messages, want 1", got, want)
+		}
+	}
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("meaningful interruption queued %d responses, want 1", got)
+	}
+}
+
 func sentContains(types []string, want string) bool {
 	for _, t := range types {
 		if t == want {
@@ -1022,6 +1118,25 @@ func TestSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 	}
 }
 
+func TestSessionConfigCanKeepVADWithClientOwnedResponses(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "1")
+	cfg := sessionConfig("persona", "marin", true)
+	raw, _ := json.Marshal(cfg)
+	s := string(raw)
+
+	for _, want := range []string{
+		`"type":"server_vad"`,
+		`"create_response":false`,
+		`"interrupt_response":true`,
+		`"transcription":{"model":"gpt-4o-mini-transcribe"}`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("client-owned response config missing %s in %s", want, s)
+		}
+	}
+}
+
 func TestSessionConfigCanUseServerVAD(t *testing.T) {
 	t.Setenv("KOE_TURN_DETECTION", "server_vad")
 	cfg := sessionConfig("persona", "marin", true)
@@ -1081,8 +1196,25 @@ func TestSessionConfigCanEnableInterruptForBargeInExperiment(t *testing.T) {
 	t.Setenv("KOE_INTERRUPT_RESPONSE", "1")
 	cfg := sessionConfig("persona", "marin", true)
 	raw, _ := json.Marshal(cfg)
-	if !strings.Contains(string(raw), `"interrupt_response":true`) {
-		t.Fatalf("KOE_INTERRUPT_RESPONSE=1 should enable interruption for VPIO experiments: %s", raw)
+	s := string(raw)
+	for _, want := range []string{
+		`"interrupt_response":true`,
+		`"threshold":0.5`,
+		`"prefix_padding_ms":1000`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("barge-in config missing %s in %s", want, s)
+		}
+	}
+}
+
+func TestSessionConfigCanTuneServerVADPrefix(t *testing.T) {
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "1")
+	t.Setenv("KOE_VAD_PREFIX_MS", "750")
+	cfg := sessionConfig("persona", "marin", true)
+	raw, _ := json.Marshal(cfg)
+	if !strings.Contains(string(raw), `"prefix_padding_ms":750`) {
+		t.Fatalf("KOE_VAD_PREFIX_MS was not applied: %s", raw)
 	}
 }
 
@@ -1290,6 +1422,93 @@ func TestTranscriptCompletedDoesNotCreateResponse(t *testing.T) {
 	time.Sleep(150 * time.Millisecond) // the sender would have flushed by now if anything were queued
 	if cap.sentContains("response.create") {
 		t.Fatal("transcript.completed must not create a response under create_response:true")
+	}
+}
+
+func TestClientOwnedTranscriptCreatesOneResponse(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	state := NewCallState("burst-client-response", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.handleEvent(ctx, []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"解释一下量子纠缠"}`))
+	waitUntil(t, func() bool { return cap.sentContains("response.create") }, "client-owned turn did not create a response")
+	if got := cap.countType("response.create"); got != 1 {
+		t.Fatalf("client-owned transcript created %d responses, want 1", got)
+	}
+}
+
+func TestClientOwnedStopSpeechSuppressesResponse(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	state := NewCallState("burst-stop-speech", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.handleEvent(ctx, []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"闭嘴"}`))
+	time.Sleep(150 * time.Millisecond)
+	if cap.sentContains("response.create") {
+		t.Fatal("stop-speech control must not become a model response")
+	}
+}
+
+func TestServerOwnedStopSpeechCancelsTheAutoResponse(t *testing.T) {
+	state := NewCallState("burst-server-stop-speech", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-stop","transcript":"闭嘴"}`))
+
+	for _, want := range []string{"input_audio_buffer.clear", "response.cancel", "output_audio_buffer.clear", "conversation.item.delete"} {
+		if got := cap.countType(want); got != 1 {
+			t.Errorf("server-owned stop-speech sent %d %s messages, want 1", got, want)
+		}
+	}
+}
+
+func TestShortEmptyTranscriptCancelsNoiseTurn(t *testing.T) {
+	state := NewCallState("burst-empty-noise", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	h.speechStartedAt = time.Now().Add(-700 * time.Millisecond)
+	h.speechStoppedAt = time.Now()
+	h.respBusy.Store(true)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-noise","transcript":""}`))
+
+	if got := cap.countType("response.cancel"); got != 1 {
+		t.Fatalf("short empty noise turn sent %d response.cancel messages, want 1", got)
+	}
+	if got := cap.countType("conversation.item.delete"); got != 1 {
+		t.Fatalf("short empty noise turn sent %d conversation.item.delete messages, want 1", got)
+	}
+}
+
+func TestSilentBackchannelDoesNotStartAReplyLoop(t *testing.T) {
+	state := NewCallState("burst-backchannel", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	h.respBusy.Store(true)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-ok","transcript":"OK."}`))
+
+	if got := cap.countType("response.cancel"); got != 1 {
+		t.Fatalf("silent backchannel sent %d response.cancel messages, want 1", got)
+	}
+	if got := cap.countType("conversation.item.delete"); got != 1 {
+		t.Fatalf("silent backchannel sent %d conversation.item.delete messages, want 1", got)
 	}
 }
 

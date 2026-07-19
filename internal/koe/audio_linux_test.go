@@ -19,11 +19,11 @@ func TestWirelessBargeInForwardsCaptureWhileSpeaking(t *testing.T) {
 	}
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	if !a.captureSuppressed() {
-		t.Fatal("Wireless barge-in must fail closed before sustained perception evidence")
+		t.Fatal("Wireless barge-in must fail closed before fast perception evidence")
 	}
 	a.SetBargeInAuthorized(true)
 	if a.captureSuppressed() {
-		t.Fatal("sustained front speech must authorize Wireless talk-over capture")
+		t.Fatal("sustained front speech must authorize talk-over capture")
 	}
 	a.SetUserMicOff(true)
 	if !a.captureSuppressed() {
@@ -31,19 +31,20 @@ func TestWirelessBargeInForwardsCaptureWhileSpeaking(t *testing.T) {
 	}
 }
 
-func TestWirelessBargeInPerceptionGateHasExplicitTestBypass(t *testing.T) {
+func TestWirelessBargeInPerceptionGateHasExplicitFieldBypass(t *testing.T) {
 	a := &AudioIO{}
 	a.SetSpeaking(true)
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_BARGE_PERCEPTION_GATE", "0")
 	if a.captureSuppressed() {
-		t.Fatal("deterministic injection seam must be able to bypass perception")
+		t.Fatal("field bypass must keep capture live without perception evidence")
 	}
 }
 
 func TestWirelessQueuedCaptureIsRegatedAtSendTime(t *testing.T) {
 	a := &AudioIO{}
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_BARGE_PERCEPTION_GATE", "1")
 	a.SetSpeaking(true)
 	raw := []int16{123, -456}
 	if got := a.captureFrameForSend(raw); len(got) != audioFrameSize || got[0] != 0 {

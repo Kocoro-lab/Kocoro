@@ -99,6 +99,7 @@ func (s *otoSource) Read(p []byte) (int, error) {
 	for i < len(p) {
 		select {
 		case pcm := <-s.a.playBuf:
+			pcm = s.a.scaledPlaybackPCM(pcm)
 			s.a.setOutputLevel(rmsLevel(pcm)) // D3w: reactive speaking amplitude
 			b := s16Bytes(pcm)
 			n := copy(p[i:], b)

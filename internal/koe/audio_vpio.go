@@ -599,6 +599,7 @@ func (a *AudioIO) vpioPlaybackLoop() {
 			if len(pcm) == 0 {
 				continue
 			}
+			pcm = a.scaledPlaybackPCM(pcm)
 			if !a.waitForVPIOPlaySpace(len(pcm)) {
 				return
 			}

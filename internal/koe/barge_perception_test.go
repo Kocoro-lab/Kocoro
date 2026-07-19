@@ -33,7 +33,7 @@ func TestBargePerceptionGateRejectsResidualEchoPulses(t *testing.T) {
 		if d.Authorized {
 			t.Fatalf("cycle %d authorized after evidence broke", cycle)
 		}
-		// Isolated two-hit echo clusters must age out before the next cluster.
+		// Isolated echo evidence must age out before the next cluster.
 		now = now.Add(defaultBargePerceptionWindow + time.Millisecond)
 	}
 }
@@ -43,7 +43,7 @@ func TestBargePerceptionGateClearsCandidateOnOutsideSpeech(t *testing.T) {
 	now := time.Unix(150, 0)
 	for range defaultBargePerceptionHits - 1 {
 		if d := g.Update(now, true, true, bargeSnapshot(now, true, math.Pi/2)); d.Authorized {
-			t.Fatal("two front hits must not authorize")
+			t.Fatal("insufficient front evidence must not authorize")
 		}
 		now = now.Add(100 * time.Millisecond)
 	}
@@ -86,22 +86,20 @@ func TestBargePerceptionGateAuthorizesSparseFrontPulsesWithinWindow(t *testing.T
 	g := NewBargePerceptionGate()
 	now := time.Unix(250, 0)
 
-	// Live Wireless A/B on a loaded CM4 produced exactly this shape for a
-	// front speaker: speech, speech, one no-speech sample, then speech. The
-	// three positive samples spanned 1.823s; requiring consecutive REST
-	// samples falsely rejected the talk-over.
+	// A real utterance may contain one no-speech REST sample. Positive evidence
+	// remains usable within the short wall-time window without requiring strictly
+	// consecutive samples.
 	for i, step := range []struct {
 		after  time.Duration
 		speech bool
 	}{
 		{speech: true},
-		{after: 654 * time.Millisecond, speech: true},
-		{after: 570 * time.Millisecond, speech: false},
-		{after: 599 * time.Millisecond, speech: true},
+		{after: 250 * time.Millisecond, speech: false},
+		{after: 250 * time.Millisecond, speech: true},
 	} {
 		now = now.Add(step.after)
 		d := g.Update(now, true, true, bargeSnapshot(now, step.speech, math.Pi/2))
-		if got, want := d.Authorized, i == 3; got != want {
+		if got, want := d.Authorized, i == 2; got != want {
 			t.Fatalf("sample %d authorized=%v, want %v (decision=%+v)", i, got, want, d)
 		}
 	}
@@ -115,10 +113,10 @@ func TestBargePerceptionGateHoldsThroughServerVADLatency(t *testing.T) {
 		now = now.Add(100 * time.Millisecond)
 	}
 
-	// Wireless live evidence showed roughly 3s from hardware authorization to
-	// Realtime speech_started. Four seconds must remain inside the authorized
-	// hold so ordinary polling/VAD jitter cannot close capture at that boundary.
-	now = now.Add(4 * time.Second)
+	// The tuned VAD path should react well within the three-second authorization
+	// hold; tolerate normal polling/network jitter without leaving capture open
+	// longer than the user utterance.
+	now = now.Add(2 * time.Second)
 	if d := g.Update(now, true, true, bargeSnapshot(now, false, math.Pi/2)); !d.Authorized {
 		t.Fatalf("decision=%+v, want authorization held through server VAD latency", d)
 	}
@@ -159,5 +157,23 @@ func TestBargePerceptionGateFailsClosed(t *testing.T) {
 			t.Fatal("rear/side speech must not authorize front talk-over")
 		}
 		now = now.Add(100 * time.Millisecond)
+	}
+}
+
+func TestBargePerceptionGateTuningOverrides(t *testing.T) {
+	t.Setenv("KOE_BARGE_PERCEPTION_HITS", "1")
+	t.Setenv("KOE_BARGE_PERCEPTION_WINDOW_MS", "250")
+	t.Setenv("KOE_BARGE_PERCEPTION_HOLD_MS", "400")
+	g := NewBargePerceptionGate()
+	now := time.Now()
+
+	d := g.Update(now, true, true, bargeSnapshot(now, true, math.Pi/2))
+	if !d.Authorized {
+		t.Fatal("one-hit tuning must authorize the first front speech sample")
+	}
+	now = now.Add(401 * time.Millisecond)
+	d = g.Update(now, true, true, bargeSnapshot(now, false, math.Pi/2))
+	if d.Authorized {
+		t.Fatal("tuned hold must expire")
 	}
 }

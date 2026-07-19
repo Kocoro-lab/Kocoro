@@ -1,0 +1,25 @@
+package koe
+
+const defaultBargeDuckGain = 0.20
+
+func clampPlaybackGain(gain float64) float64 {
+	if gain < 0 {
+		return 0
+	}
+	if gain > 1 {
+		return 1
+	}
+	return gain
+}
+
+func scalePCM(pcm []int16, gain float64) []int16 {
+	gain = clampPlaybackGain(gain)
+	if gain >= 1 {
+		return pcm
+	}
+	scaled := make([]int16, len(pcm))
+	for i, sample := range pcm {
+		scaled[i] = int16(float64(sample) * gain)
+	}
+	return scaled
+}

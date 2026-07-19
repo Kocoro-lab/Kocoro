@@ -53,6 +53,9 @@ func TestEndCallDescriptionSignalsDismissIntent(t *testing.T) {
 			t.Fatalf("end_call description missing %q", want)
 		}
 	}
+	if !strings.Contains(desc, "Never call end_call") {
+		t.Fatal("end_call description must keep stop-speech controls local")
+	}
 }
 
 func TestVoiceControlToolsSeparateStopSpeakingFromEndingTheCall(t *testing.T) {

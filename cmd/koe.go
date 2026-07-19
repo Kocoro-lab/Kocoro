@@ -1905,10 +1905,8 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}
 	}
 	// Wireless barge-in and the IDLE gaze gate consume one serialized robot-local
-	// perception stream. Barge-in keeps the stream alive even when the product's
-	// IDLE gaze gate is disabled: without sustained DOA evidence Linux capture
-	// fails closed while Kocoro speaks, preventing residual XVF echo from cancelling
-	// its own response.
+	// perception stream. The sub-second DOA gate keeps residual XVF echo from
+	// cancelling Kocoro's own response without clipping normal talk-over.
 	// Standby also rides this stream: front-directed DOA speech is its only trigger,
 	// which is exactly why the room is never uploaded while idle.
 	if wirelessLazy && (gazeCfg.Enabled || standbyResident || cfg.bargeIn || motionCtrl != nil) {

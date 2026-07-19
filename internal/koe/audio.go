@@ -73,6 +73,7 @@ type AudioIO struct {
 	preferredMicUID     string
 	preferredSpeakerUID string
 	playback            atomic.Bool
+	playbackGain        atomic.Uint64
 	playbackQueueDrops  atomic.Uint64
 	playbackQueueMax    atomic.Int64
 	// playbackPaused is a reversible local floor hold. Unlike playback=false it
@@ -152,6 +153,21 @@ const playbackIdleLevelEps = 0.005
 // drain signal.
 func (a *AudioIO) PlaybackIdle() bool { return a.OutputLevel() < playbackIdleLevelEps }
 
+// SetPlaybackGain changes assistant playout amplitude without discarding queued
+// speech. Adaptive barge-in ducks here, then restores the same response when the
+// detected sound turns out not to be an interruption.
+func (a *AudioIO) SetPlaybackGain(gain float64) {
+	a.playbackGain.Store(math.Float64bits(clampPlaybackGain(gain)))
+}
+
+func (a *AudioIO) PlaybackGain() float64 {
+	return math.Float64frombits(a.playbackGain.Load())
+}
+
+func (a *AudioIO) scaledPlaybackPCM(pcm []int16) []int16 {
+	return scalePCM(pcm, a.PlaybackGain())
+}
+
 // NewAudioIO builds the codec (no device opened yet — Start() opens it, so unit
 // tests can exercise Encode/Decode/gate without audio hardware).
 func NewAudioIO() (*AudioIO, error) {
@@ -171,6 +187,7 @@ func NewAudioIO() (*AudioIO, error) {
 		sendReady: make(chan struct{}),
 	}
 	a.playback.Store(true)
+	a.SetPlaybackGain(1)
 	return a, nil
 }
 
@@ -434,6 +451,7 @@ func (a *AudioIO) playNativeEarcon(_ string) bool { return false }
 // sending user audio.
 func (a *AudioIO) PrepareForCall() {
 	a.SetSpeaking(false)
+	a.SetPlaybackGain(1)
 	a.SetPlaybackEnabled(false)
 	a.primed.Store(false)
 	for {
@@ -501,6 +519,7 @@ func (a *AudioIO) renderInto(out []byte) {
 	}
 	select {
 	case pcm := <-a.playBuf:
+		pcm = a.scaledPlaybackPCM(pcm)
 		a.setOutputLevel(rmsLevel(pcm)) // keep the drain signal honest on this path too
 		n := s16ToBytes(pcm, out)
 		for i := n; i < len(out); i++ { // zero any tail a >1-frame device buffer leaves

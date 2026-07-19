@@ -7,17 +7,14 @@ import (
 
 const (
 	// The XVF3800 still emits isolated speech_detected pulses for residual speaker
-	// echo even after its AEC reports converged. Three front-directed hits are still
-	// required, but loaded CM4 REST polling is sparse enough that real near-end speech
-	// can contain a no-speech sample between hits. Bound evidence by wall time instead
-	// of assuming consecutive 100 ms samples.
-	defaultBargePerceptionHits   = 3
-	defaultBargePerceptionWindow = 2500 * time.Millisecond
+	// echo after AEC. Two front-directed samples within a sub-second window reject
+	// those isolated pulses while opening quickly enough for normal talk-over.
+	// Wall-time evidence tolerates an occasional no-speech poll between real hits.
+	defaultBargePerceptionHits   = 2
+	defaultBargePerceptionWindow = 800 * time.Millisecond
 	// Once sustained near-end speech opens the gate, keep it open long enough for
-	// both the local energy gate and Realtime server VAD to observe the utterance.
-	// Wireless live evidence reached speech_started about 3s after authorization,
-	// so 5s leaves bounded polling/VAD jitter without weakening the opening gate.
-	defaultBargePerceptionHold = 5 * time.Second
+	// the local energy gate and Realtime server VAD to observe the utterance.
+	defaultBargePerceptionHold = 3 * time.Second
 	defaultBargeFrontHalfAngle = math.Pi / 3
 )
 
@@ -38,9 +35,30 @@ type BargePerceptionGate struct {
 	hitTimes        []time.Time
 	authorized      bool
 	authorizedUntil time.Time
+	requiredHits    int
+	window          time.Duration
+	hold            time.Duration
 }
 
-func NewBargePerceptionGate() *BargePerceptionGate { return &BargePerceptionGate{} }
+func NewBargePerceptionGate() *BargePerceptionGate {
+	hits := koeEnvInt("KOE_BARGE_PERCEPTION_HITS", defaultBargePerceptionHits)
+	if hits < 1 {
+		hits = 1
+	}
+	window := time.Duration(koeEnvInt("KOE_BARGE_PERCEPTION_WINDOW_MS", int(defaultBargePerceptionWindow/time.Millisecond))) * time.Millisecond
+	if window < time.Millisecond {
+		window = time.Millisecond
+	}
+	hold := time.Duration(koeEnvInt("KOE_BARGE_PERCEPTION_HOLD_MS", int(defaultBargePerceptionHold/time.Millisecond))) * time.Millisecond
+	if hold < time.Millisecond {
+		hold = time.Millisecond
+	}
+	return &BargePerceptionGate{
+		requiredHits: hits,
+		window:       window,
+		hold:         hold,
+	}
+}
 
 func (g *BargePerceptionGate) Update(now time.Time, callActive, speaking bool, snapshot PerceptionSnapshot) BargePerceptionDecision {
 	if now.IsZero() {
@@ -76,8 +94,8 @@ func (g *BargePerceptionGate) Update(now time.Time, callActive, speaking bool, s
 		// not a transport/VAD gap. Start a fresh candidate utterance.
 		g.hitTimes = nil
 	}
-	if len(g.hitTimes) >= defaultBargePerceptionHits {
-		g.authorizedUntil = now.Add(defaultBargePerceptionHold)
+	if len(g.hitTimes) >= g.requiredHits {
+		g.authorizedUntil = now.Add(g.hold)
 	}
 	authorized := !g.authorizedUntil.IsZero() && now.Before(g.authorizedUntil)
 	reason := "collecting"
@@ -94,7 +112,7 @@ func (g *BargePerceptionGate) Update(now time.Time, callActive, speaking bool, s
 }
 
 func (g *BargePerceptionGate) pruneHits(now time.Time) {
-	cutoff := now.Add(-defaultBargePerceptionWindow)
+	cutoff := now.Add(-g.window)
 	keep := 0
 	for keep < len(g.hitTimes) && g.hitTimes[keep].Before(cutoff) {
 		keep++

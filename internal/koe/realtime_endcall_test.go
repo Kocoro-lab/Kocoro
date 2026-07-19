@@ -79,12 +79,9 @@ func TestEndCallToolClearsActiveOutputBeforeHangup(t *testing.T) {
 	}
 }
 
-// TestDismissTranscriptHangsUp pins the deterministic backstop: a whole-utterance
-// dismiss phrase in the input transcription hangs up (onEndCall) even when the model
-// never calls the end_call tool — the reliable path for the fixed vocabulary. A
-// non-dismiss transcript must NOT hang up.
-func TestDismissTranscriptHangsUp(t *testing.T) {
-	t.Setenv("KOE_ASR_DISMISS_BACKSTOP", "1")
+// TestTranscriptControlsSeparateSpeechStopFromHangup pins the product contract:
+// stop-talking stays on the call, while an explicit goodbye ends it.
+func TestTranscriptControlsSeparateSpeechStopFromHangup(t *testing.T) {
 	newH := func() (*eventHandler, chan struct{}) {
 		audio, err := NewAudioIO()
 		if err != nil {
@@ -105,22 +102,22 @@ func TestDismissTranscriptHangsUp(t *testing.T) {
 		h.handleEvent(context.Background(), raw)
 	}
 
-	t.Run("stop-speaking phrase stays on call", func(t *testing.T) {
+	t.Run("stop speech stays on call", func(t *testing.T) {
 		h, hung := newH()
 		feed(h, "闭嘴。")
 		select {
 		case <-hung:
-			t.Fatal("stop-speaking transcript hung up the call")
-		case <-time.After(100 * time.Millisecond):
+			t.Fatal("stop-speech transcript must not hang up")
+		case <-time.After(300 * time.Millisecond):
 		}
 	})
-	t.Run("terminal dismiss phrase hangs up", func(t *testing.T) {
+	t.Run("explicit end phrase hangs up", func(t *testing.T) {
 		h, hung := newH()
-		feed(h, "退出吧。")
+		feed(h, "再见。")
 		select {
 		case <-hung:
 		case <-time.After(2 * time.Second):
-			t.Fatal("terminal dismiss transcript did not hang up")
+			t.Fatal("explicit end transcript did not hang up")
 		}
 	})
 	t.Run("non-dismiss transcript stays on the call", func(t *testing.T) {
@@ -132,7 +129,7 @@ func TestDismissTranscriptHangsUp(t *testing.T) {
 		case <-time.After(300 * time.Millisecond):
 		}
 	})
-	t.Run("ambiguous stop while task running is left to the model", func(t *testing.T) {
+	t.Run("stop speech while task running does not end the task call", func(t *testing.T) {
 		h, hung := newH()
 		h.state.SetInFlight("running task")
 		feed(h, "停止")
@@ -142,14 +139,14 @@ func TestDismissTranscriptHangsUp(t *testing.T) {
 		case <-time.After(300 * time.Millisecond):
 		}
 	})
-	t.Run("stop speaking still stays on call while task running", func(t *testing.T) {
+	t.Run("explicit end still hangs up while task running", func(t *testing.T) {
 		h, hung := newH()
 		h.state.SetInFlight("running task")
-		feed(h, "闭嘴")
+		feed(h, "结束对话")
 		select {
 		case <-hung:
-			t.Fatal("stop speaking during a task hung up the call")
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(2 * time.Second):
+			t.Fatal("explicit end during a task did not hang up")
 		}
 	})
 }

@@ -44,6 +44,7 @@ type AudioIO struct {
 	userMicOff    atomic.Bool
 	userMicSticky atomic.Bool
 	playback      atomic.Bool
+	playbackGain  atomic.Uint64
 	encMu         sync.Mutex
 	decMu         sync.Mutex
 	writeMu       sync.Mutex // serialize speaker and control frames on the UDS
@@ -102,6 +103,7 @@ func NewAudioIO() (*AudioIO, error) {
 		spkRingFrames: spkRingFrames,
 	}
 	a.playback.Store(true)
+	a.SetPlaybackGain(1)
 	return a, nil
 }
 
@@ -121,7 +123,16 @@ func (a *AudioIO) InputLevel() float64 {
 }
 func (a *AudioIO) OutputLevel() float64 { return math.Float64frombits(a.outLevel.Load()) }
 func (a *AudioIO) PlaybackIdle() bool   { return a.OutputLevel() < playbackIdleLevelEps }
-func (a *AudioIO) markSendReady()       { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
+func (a *AudioIO) SetPlaybackGain(gain float64) {
+	a.playbackGain.Store(math.Float64bits(clampPlaybackGain(gain)))
+}
+func (a *AudioIO) PlaybackGain() float64 {
+	return math.Float64frombits(a.playbackGain.Load())
+}
+func (a *AudioIO) scaledPlaybackPCM(pcm []int16) []int16 {
+	return scalePCM(pcm, a.PlaybackGain())
+}
+func (a *AudioIO) markSendReady() { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
 func (a *AudioIO) SetSpeaking(s bool) {
 	a.speaking.Store(s)
 	if !s {
@@ -147,10 +158,9 @@ func (a *AudioIO) captureSuppressed() bool {
 	if !koeEnvBool("KOE_VPIO_BARGE_IN", false) {
 		return true
 	}
-	// First-hand Wireless E2E showed that XVF AEC can report converged yet still
-	// leak enough robot speech to trigger Realtime server VAD. Product barge-in is
-	// therefore fail-closed until the robot-local DOA stream sees sustained front
-	// speech. The bypass is a deterministic injection/test seam, never the default.
+	// Hardware AEC removes most playback echo; the fast robot-local DOA gate rejects
+	// the sparse residue that remains. Its window is intentionally sub-second so it
+	// cannot recreate the old multi-second talk-over delay.
 	if !koeEnvBool("KOE_BARGE_PERCEPTION_GATE", true) {
 		return false
 	}
@@ -246,6 +256,7 @@ func (a *AudioIO) playNativeEarcon(name string) bool {
 // PrepareForCall clears stale capture/playback queued before a session starts.
 func (a *AudioIO) PrepareForCall() {
 	a.SetSpeaking(false)
+	a.SetPlaybackGain(1)
 	a.SetPlaybackEnabled(false)
 	drain(a.frames)
 	drain(a.playBuf)
@@ -526,6 +537,8 @@ func (a *AudioIO) spkPump() {
 				continue
 			}
 			wire := a.toCarrierPCM(queued.pcm) // 48k codec → 16k wire; carrier stays thin (§9-b.1)
+			wire = a.scaledPlaybackPCM(wire)
+			a.setOutputLevel(rmsLevel(wire))
 			payload := s16PCMToBytes(wire)
 			hdr := audiobridge.Header{
 				Magic:      audiobridge.MagicSpk,

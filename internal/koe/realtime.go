@@ -80,10 +80,9 @@ type eventHandler struct {
 	// failure / busy / misheard / agent clarify) that bypass the Realtime model; when
 	// empty, fallbackLang infers from the utterance. Set from ConnectOptions.Language.
 	language string
-	// fullDuplexAEC means the local audio backend already has echo cancellation
-	// (VPIO). Even in that mode, server interruption is off by default because a
-	// laptop speaker/mic pair still needs an intent-level barge-in gate, not just
-	// energy. Set KOE_INTERRUPT_RESPONSE=1 only for explicit barge-in experiments.
+	// fullDuplexAEC means the local audio backend already has echo cancellation.
+	// KOE_INTERRUPT_RESPONSE selects whether Realtime may treat that full-duplex
+	// capture as talk-over and interrupt an active response.
 	fullDuplexAEC bool
 	// Timing markers for event-log diagnostics. They are intentionally best-effort:
 	// Realtime can emit multiple responses for one user turn (e.g. spoken ack then
@@ -117,7 +116,14 @@ type eventHandler struct {
 	// a call_id the replacement provider conversation has never seen; submitting
 	// it as function_call_output is rejected there and the result is lost.
 	sessionCallIDs sync.Map
-
+	// bargeCandidate means VAD heard possible user speech during assistant
+	// playback. The audio is ducked, not destroyed, until transcript evidence
+	// confirms a real interruption or classifies a false positive/backchannel.
+	bargeCandidate atomic.Bool
+	// bargeServerCleared records WebRTC's automatic playout truncation after
+	// speech_started. When a candidate is false, Koe asks the same native S2S
+	// session to continue from the unsaid point instead of losing the reply.
+	bargeServerCleared atomic.Bool
 	// asyncTaskPending keeps Desktop/--once in "thinking" after the model's short
 	// spoken ack while do_task is still running or its result speech is queued.
 	asyncTaskPending atomic.Bool
@@ -308,6 +314,8 @@ const (
 	localCommitAckPollInterval = 10 * time.Millisecond
 )
 
+const falseInterruptionResumeInstructions = "Continue the assistant response that was just interrupted from the next unsaid point. Do not restart, repeat, acknowledge the interruption, or mention the deleted filler/noise. Keep the language and style of the interrupted response."
+
 // missedSpeechInstructions steers the fallback response when the manual commit was
 // NOT acked: the user's words never became a conversation item (observed live
 // 2026-07-02 — semantic_vad rejects the commit with an error and the audio is
@@ -448,11 +456,54 @@ func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 // clears the input buffer, discarding any in-progress user audio.
 func (h *eventHandler) interruptOutput() { h.stopOutput(false) }
 
-// bargeInStopPlayback stops Kocoro's playback the instant the server VAD reports the
-// user talking over (input_audio_buffer.speech_started) while barge-in is on. It
-// keeps the input buffer: the server is mid-capture of the user's barge-in utterance,
-// so clearing it would throw the interruption away.
+// bargeInStopPlayback permanently stops Kocoro's playback after adaptive
+// barge-in confirms meaningful user speech. It keeps the committed user input.
 func (h *eventHandler) bargeInStopPlayback() { h.stopOutput(true) }
+
+func (h *eventHandler) beginBargeCandidate() bool {
+	if !h.fullDuplexAEC || !clientOwnsTurnResponse() {
+		return false
+	}
+	if !h.bargeCandidate.CompareAndSwap(false, true) {
+		return true
+	}
+	h.bargeServerCleared.Store(false)
+	gain := clampPlaybackGain(koeEnvFloat("KOE_BARGE_DUCK_GAIN", defaultBargeDuckGain))
+	if h.audio != nil {
+		h.audio.SetPlaybackGain(gain)
+	}
+	if eventLogEnabled() {
+		log.Printf("koe[barge]: candidate — ducking playback to %.0f%%", gain*100)
+	}
+	return true
+}
+
+func (h *eventHandler) resumeBargeCandidate(reason string) bool {
+	if !h.bargeCandidate.Swap(false) {
+		return false
+	}
+	if h.audio != nil {
+		h.audio.SetPlaybackGain(1)
+	}
+	if eventLogEnabled() {
+		log.Printf("koe[barge]: false interruption (%s) — resuming playback", reason)
+	}
+	if h.isSpeakingOrResponding() {
+		h.emitVoiceState("speaking")
+	} else {
+		h.emitVoiceState(h.voiceStateAfterSpeaking())
+	}
+	return h.bargeServerCleared.Swap(false)
+}
+
+func (h *eventHandler) confirmBargeCandidate() {
+	h.bargeCandidate.Store(false)
+	h.bargeServerCleared.Store(false)
+	if h.audio != nil {
+		h.audio.SetPlaybackGain(1)
+	}
+	h.bargeInStopPlayback()
+}
 
 // stopOutput tears down the active response's local playback and its server-side turn
 // state. It frees the response slot (respBusy) itself rather than waiting for a
@@ -461,6 +512,8 @@ func (h *eventHandler) bargeInStopPlayback() { h.stopOutput(true) }
 // audio doesn't linger in history. keepInput preserves the input buffer for barge-in
 // (the user is mid-utterance); the explicit interrupt clears it.
 func (h *eventHandler) stopOutput(keepInput bool) {
+	h.bargeCandidate.Store(false)
+	h.bargeServerCleared.Store(false)
 	hadResponse := h.respBusy.Load()
 	hadOutput := h.outputBufferActive.Load()
 	if h.audio != nil && h.audio.dropCapture() {
@@ -474,6 +527,7 @@ func (h *eventHandler) stopOutput(keepInput bool) {
 	h.clearActiveResponseID("")
 	var playbackFlush time.Duration
 	if h.audio != nil {
+		h.audio.SetPlaybackGain(1)
 		h.audio.SetSpeaking(false)
 		flushStarted := time.Now()
 		h.audio.InterruptPlayback()
@@ -482,12 +536,9 @@ func (h *eventHandler) stopOutput(keepInput bool) {
 	if !keepInput {
 		_ = h.sendFn(map[string]any{"type": "input_audio_buffer.clear"})
 	}
-	// With server interrupt_response=true, the speech_started event means Realtime
-	// has already accepted responsibility for cancelling this response. Sending a
-	// second response.cancel races that automatic cancellation and produces the
-	// noisy response_cancel_not_active error observed on the first Wireless E2E.
-	// Keep the explicit cancel for /call/interrupt and for power-user configurations
-	// that open the local barge gate without server-side interruption.
+	// A legacy power-user configuration may still give Realtime interruption
+	// ownership. Adaptive product barge-in uses interrupt_response=false, so Koe
+	// sends one response.cancel only after transcript confirmation.
 	serverOwnsBargeCancel := keepInput && koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
 	if hadResponse && !serverOwnsBargeCancel {
 		_ = h.sendFn(map[string]any{"type": "response.cancel"})
@@ -1794,6 +1845,12 @@ func signalNonBlocking(c chan struct{}) {
 
 func eventLogEnabled() bool { return os.Getenv("KOE_EVENT_LOG") == "1" }
 
+// clientOwnsTurnResponse keeps Realtime's VAD and native speech understanding but
+// defers response.create until the input transcription has completed. The
+// transcript is control evidence only: it lets Koe swallow deterministic local
+// commands such as "stop talking" without converting the happy path to text.
+func clientOwnsTurnResponse() bool { return koeEnvBool("KOE_CLIENT_RESPONSE", false) }
+
 // timingLogEnabled keeps the small, content-free latency spine available in
 // product logs. Full Realtime event logging remains opt-in because it is noisy
 // and can include tool arguments; these milestones contain only durations and
@@ -1854,10 +1911,18 @@ func outcomeKindLog(kind OutcomeKind) string {
 // tool_choice stays "auto" — forcing a specific function under output_modalities
 // ["audio"] makes GA emit the call as text instead of a real function call.
 //
-// Turn detection remains native Realtime VAD. Half-duplex sessions let the server
-// create responses automatically. Native-floor barge-in keeps server interruption
-// off and uses create_response=false so Koe can first ask the same S2S model a
-// narrow raw-audio floor question; no transcript gates the normal turn.
+// Turn detection always uses Realtime VAD. By default OpenAI starts the spoken
+// response automatically. A carrier may opt into KOE_CLIENT_RESPONSE=1 to retain
+// native speech-to-speech while deferring response.create until the auxiliary
+// transcript can reject a local control phrase. The default (barge-in off) is
+// semantic_vad — less eager on ambient/noisy audio and more tolerant of
+// backchannels while still deciding end-of-turn server-side.
+// Barge-in ON inverts both: it defaults to server_vad (reacts to talk-over more
+// directly) with interrupt_response ON. Wireless hardware AEC proved stable at
+// Realtime's 0.50 threshold in speaker-loop tests; the old 0.60 default clipped
+// short talk-over commands. KOE_TURN_DETECTION / KOE_VAD_THRESHOLD /
+// KOE_INTERRUPT_RESPONSE override either mode. Far-field noise reduction is on by
+// default for the laptop speaker/mic case; set KOE_NOISE_REDUCTION=off for raw input.
 func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 	return sessionConfigForCarrier(persona, voice, fullDuplexAEC, nil)
 }
@@ -1872,7 +1937,14 @@ func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressI
 		interruptResponse = koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
 	}
 	nativeFloor := nativeFloorControlEnabled(fullDuplexAEC)
-	createResponse := !nativeFloor
+	createResponse := !nativeFloor && !clientOwnsTurnResponse()
+	responseOwner := "server"
+	switch {
+	case nativeFloor:
+		responseOwner = "floor"
+	case !createResponse:
+		responseOwner = "client"
+	}
 	// Barge-in (interruptResponse) forwards the mic continuously during playback and
 	// leans on the server VAD to detect talk-over. Default to server_vad there — it
 	// reacts to the user speaking over Kocoro more directly than semantic_vad's
@@ -1884,20 +1956,21 @@ func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressI
 	// Both stay env-overridable (KOE_TURN_DETECTION / KOE_VAD_THRESHOLD).
 	defaultTurn := "semantic_vad"
 	defaultThreshold := 0.50
-	if interruptResponse || nativeFloor {
+	if interruptResponse || nativeFloor || (fullDuplexAEC && koeEnvBool("KOE_VPIO_BARGE_IN", false)) {
 		defaultTurn = "server_vad"
 		defaultThreshold = 0.50
 	}
 	vadThreshold := koeEnvFloat("KOE_VAD_THRESHOLD", defaultThreshold)
+	vadPrefixMS := koeEnvInt("KOE_VAD_PREFIX_MS", 1000)
 	turnMode := koeEnvString("KOE_TURN_DETECTION", defaultTurn)
 	semanticEagerness := koeEnvString("KOE_SEMANTIC_VAD_EAGERNESS", "low")
 	noiseReduction := koeEnvString("KOE_NOISE_REDUCTION", "far_field")
 	var turnDetection map[string]any
 	if strings.EqualFold(turnMode, "semantic_vad") {
 		log.Printf(
-			"koe[barge]: sessionConfig fullDuplexAEC=%v native_floor=%v create_response=%v interrupt_response=%v turn=semantic_vad eagerness=%s noise_reduction=%s",
+			"koe[barge]: sessionConfig fullDuplexAEC=%v response_owner=%s create_response=%v interrupt_response=%v turn=semantic_vad eagerness=%s noise_reduction=%s",
 			fullDuplexAEC,
-			nativeFloor,
+			responseOwner,
 			createResponse,
 			interruptResponse,
 			semanticEagerness,
@@ -1911,19 +1984,20 @@ func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressI
 		}
 	} else {
 		log.Printf(
-			"koe[barge]: sessionConfig fullDuplexAEC=%v native_floor=%v create_response=%v interrupt_response=%v turn=server_vad threshold=%.2f silence_ms=%d noise_reduction=%s",
+			"koe[barge]: sessionConfig fullDuplexAEC=%v response_owner=%s create_response=%v interrupt_response=%v turn=server_vad threshold=%.2f prefix_ms=%d silence_ms=%d noise_reduction=%s",
 			fullDuplexAEC,
-			nativeFloor,
+			responseOwner,
 			createResponse,
 			interruptResponse,
 			vadThreshold,
+			vadPrefixMS,
 			vadSilenceMS,
 			noiseReduction,
 		)
 		turnDetection = map[string]any{
 			"type":                "server_vad",
 			"threshold":           vadThreshold,
-			"prefix_padding_ms":   300,
+			"prefix_padding_ms":   vadPrefixMS,
 			"silence_duration_ms": vadSilenceMS,
 			"create_response":     createResponse,
 			"interrupt_response":  interruptResponse,
@@ -2147,6 +2221,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		Name       string          `json:"name"`    // function_call_arguments.done
 		CallID     string          `json:"call_id"` // function call id
 		ResponseID string          `json:"response_id"`
+		ItemID     string          `json:"item_id"`   // input transcription item
 		Arguments  json.RawMessage `json:"arguments"` // function args (string-encoded JSON)
 		Transcript string          `json:"transcript"`
 		Item       struct {
@@ -2184,8 +2259,10 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if providerBargeInEnabled(h.provider) && h.isSpeakingOrResponding() {
 			if h.pauseForNativeFloor() {
 				log.Printf("koe[barge]: talk-over detected — playback paused for native floor decision")
+			} else if h.beginBargeCandidate() {
+				log.Printf("koe[barge]: possible talk-over detected — playback ducked")
 			} else {
-				log.Printf("koe[barge]: talk-over detected — stopping playback")
+				log.Printf("koe[barge]: legacy talk-over detected — stopping playback")
 				h.bargeInStopPlayback()
 			}
 		}
@@ -2235,10 +2312,18 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.toolLoop.noteUserCommit(turnID)
 		}
 	case "conversation.item.input_audio_transcription.completed":
-		h.handleInputTranscript(ev.Transcript)
+		h.handleInputTranscriptForItem(ev.ItemID, ev.Transcript)
 	case "conversation.item.input_audio_transcription.failed":
-		// Treat failed ASR like unclear audio. Do not guess.
-		h.emitVoiceState("listening")
+		// Native S2S still has the original audio. Transcription is only the local
+		// control lane, so its failure must not swallow a normal user turn.
+		if clientOwnsTurnResponse() {
+			if h.bargeCandidate.Load() {
+				h.confirmBargeCandidate()
+			}
+			h.requestResponse()
+		} else {
+			h.emitVoiceState("listening")
+		}
 	case "response.created":
 		if h.ending.Load() {
 			// A response.create admitted just before end_call can be acknowledged
@@ -2251,6 +2336,11 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 				log.Printf("koe[call]: cancelled late response.created after end_call response_id=%q", ev.Response.ID)
 			}
 			break
+		}
+		h.bargeCandidate.Store(false)
+		h.bargeServerCleared.Store(false)
+		if h.audio != nil {
+			h.audio.SetPlaybackGain(1)
 		}
 		matchedPending := h.bindCreatedResponse(ev.Response.ID, ev.Response.Metadata)
 		h.setActiveResponseID(ev.Response.ID)
@@ -2373,6 +2463,13 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// into the next turn.
 		h.outputBufferActive.Store(true)
 		h.markSpeaking()
+	case "conversation.item.truncated":
+		// Realtime WebRTC may clear device playout as soon as the user starts
+		// speaking even with interrupt_response=false. Preserve that fact until
+		// transcript classification decides whether a continuation is needed.
+		if h.bargeCandidate.Load() {
+			h.bargeServerCleared.Store(true)
+		}
 	case "response.output_audio.delta":
 		// Redundant safety: also gate on the first audio delta in case the
 		// output_audio_buffer.* markers are absent on some transport. Idempotent
@@ -2380,6 +2477,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// convention.
 		h.markSpeaking()
 	case "output_audio_buffer.cleared":
+		if h.bargeCandidate.Load() {
+			h.bargeServerCleared.Store(true)
+		}
 		// WebRTC clears the server output buffer and truncates the speaking item
 		// on speech_started EVEN with interrupt_response=false (observed live
 		// 2026-07-22). During a floor hold this means the un-sent audio tail is
@@ -2499,12 +2599,15 @@ func isTerminalProviderError(provider, errorType, code, message string) bool {
 	return strings.Contains(strings.ToLower(message), "response stream timeout")
 }
 
-// handleInputTranscript logs the user's transcript for diagnostics and provides
-// the fixed-vocabulary dismiss backstop when the raw-audio floor controller is
-// unavailable. Under create_response:true the server already auto-creates the
-// response, so this must NOT send response.create. Transcript logging remains off
-// by default (privacy: user voice content); opt in with KOE_TRANSCRIPT_LOG=1.
+// handleInputTranscript keeps transcription out of the model input. It is used only
+// for deterministic local controls and diagnostics; native audio remains the S2S
+// source of truth. With KOE_CLIENT_RESPONSE=1 a normal transcript releases exactly
+// one response.create after the control lane has had its say.
 func (h *eventHandler) handleInputTranscript(transcript string) {
+	h.handleInputTranscriptForItem("", transcript)
+}
+
+func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 	if os.Getenv("KOE_TRANSCRIPT_LOG") == "1" {
 		log.Printf("koe[transcript]: %q", transcript)
 	}
@@ -2517,25 +2620,90 @@ func (h *eventHandler) handleInputTranscript(transcript string) {
 	if !koeEnvBool("KOE_ASR_DISMISS_BACKSTOP", !h.nativeFloorEnabled()) {
 		return
 	}
-	// Deterministic dismiss backstop: a whole-utterance terminal phrase (退出/再见/
-	// bye/…) hangs up regardless of whether the model also calls end_call —
-	// gpt-realtime-mini is unreliable at that tool (1/7 live), so the fixed vocabulary
-	// cannot depend on it. requestEndCall owns the same handler-local terminal as the
-	// tool path, so a racing tool call is harmless. Runs regardless of KOE_TRANSCRIPT_LOG.
-	if h.onEndCall != nil && isDismissPhrase(transcript) {
-		if h.taskInFlight() && isTaskAmbiguousDismissPhrase(transcript) {
-			if eventLogEnabled() {
-				log.Printf("koe[call]: dismiss phrase %q left to model while task is running", transcript)
-			}
-			return
-		}
+	// Ending the session is intentionally narrower than stopping current speech:
+	// Esc/red button and explicit goodbyes hang up; "停/闭嘴/stop talking" only silence
+	// the current utterance and leave the conversation ready for the next turn.
+	if isEndConversationPhrase(transcript) {
 		if eventLogEnabled() {
-			log.Printf("koe[call]: dismiss phrase %q — hanging up", transcript)
+			log.Printf("koe[call]: end phrase %q — hanging up", transcript)
 		}
 		// Cut any in-progress auto-response audio immediately and enter the same
 		// idempotent terminal used by the model-owned end_call tool.
-		h.requestEndCall("asr-dismiss-backstop")
+		if h.bargeCandidate.Load() {
+			h.confirmBargeCandidate()
+		}
+		h.requestEndCall("transcript-end-phrase")
+		return
 	}
+	if isStopSpeechPhrase(transcript) {
+		if eventLogEnabled() {
+			log.Printf("koe[barge]: stop-speech phrase %q — suppressing response", transcript)
+		}
+		if h.bargeCandidate.Load() {
+			h.confirmBargeCandidate()
+		} else if h.isSpeakingOrResponding() {
+			h.interruptOutput()
+		}
+		h.deleteInputItem(itemID)
+		h.emitVoiceState("listening")
+		return
+	}
+	if isSilentBackchannelPhrase(transcript) {
+		if eventLogEnabled() {
+			log.Printf("koe[turn]: backchannel %q — staying quiet", transcript)
+		}
+		resumeNeeded := false
+		if h.bargeCandidate.Load() {
+			resumeNeeded = h.resumeBargeCandidate("backchannel")
+		} else if h.isSpeakingOrResponding() {
+			h.interruptOutput()
+		}
+		h.deleteInputItem(itemID)
+		if resumeNeeded {
+			h.requestResponseWith(responseCreateRequest{instructions: falseInterruptionResumeInstructions})
+		}
+		h.emitVoiceState("listening")
+		return
+	}
+	// Short empty transcriptions are the field signature of a residual echo pulse
+	// or room transient, not a usable conversational turn. Server-owned response
+	// creation can already be racing, so cancel it and remove the empty input item
+	// before it turns into a spoken "I didn't hear you" loop.
+	if strings.TrimSpace(transcript) == "" &&
+		elapsedMS(h.speechStartedAt, h.speechStoppedAt) >= 0 &&
+		elapsedMS(h.speechStartedAt, h.speechStoppedAt) <= 1200 {
+		if eventLogEnabled() {
+			log.Printf("koe[turn]: short empty transcript — suppressing response")
+		}
+		resumeNeeded := false
+		if h.bargeCandidate.Load() {
+			resumeNeeded = h.resumeBargeCandidate("short empty audio")
+		} else if h.isSpeakingOrResponding() {
+			h.interruptOutput()
+		}
+		h.deleteInputItem(itemID)
+		if resumeNeeded {
+			h.requestResponseWith(responseCreateRequest{instructions: falseInterruptionResumeInstructions})
+		}
+		h.emitVoiceState("listening")
+		return
+	}
+	if h.bargeCandidate.Load() {
+		h.confirmBargeCandidate()
+	}
+	if clientOwnsTurnResponse() {
+		h.requestResponse()
+	}
+}
+
+func (h *eventHandler) deleteInputItem(itemID string) {
+	if strings.TrimSpace(itemID) == "" {
+		return
+	}
+	_ = h.sendFn(map[string]any{
+		"type":    "conversation.item.delete",
+		"item_id": itemID,
+	})
 }
 
 // unwrapArgs normalizes the arguments field: OpenAI sends function arguments as a
