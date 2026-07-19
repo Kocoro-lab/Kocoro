@@ -971,7 +971,7 @@ func realtimeSessionPayload(provider RealtimeProvider, persona, openAIVoice, qwe
 	if provider == ProviderQwen {
 		return qwenSessionConfig(persona, qwenVoice, hasLiveVideo)
 	}
-	return sessionConfigForCarrier(persona, openAIVoice, opts.FullDuplexAEC, opts.ExpressIntents, opts.CameraEnabled)
+	return sessionConfigForCarrierLanguage(persona, openAIVoice, opts.Language, opts.FullDuplexAEC, opts.ExpressIntents, opts.CameraEnabled)
 }
 
 func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvider, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions, dial func(*RealtimeConn) error) (*RealtimeConn, error) {

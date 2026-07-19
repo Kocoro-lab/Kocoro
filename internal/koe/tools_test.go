@@ -24,13 +24,27 @@ func TestToolDefsShape(t *testing.T) {
 			t.Errorf("tool %q type = %q, want function", d.Name, d.Type)
 		}
 	}
-	for _, want := range []string{"do_task", "cancel", "get_status", "control_app", "switch_agent", "stop_speaking", "end_call"} {
+	for _, want := range []string{"do_task", "cancel", "get_status", "control_app", "switch_agent", "stop_speaking", "end_call", "wait_for_user"} {
 		if !names[want] {
 			t.Errorf("missing tool %q", want)
 		}
 	}
-	if len(defs) != 7 {
-		t.Errorf("got %d tools, want exactly 7", len(defs))
+	if len(defs) != 8 {
+		t.Errorf("got %d tools, want exactly 8", len(defs))
+	}
+}
+
+func TestWaitForUserDescriptionKeepsNoiseSilent(t *testing.T) {
+	var desc string
+	for _, d := range ToolDefs() {
+		if d.Name == "wait_for_user" {
+			desc = d.Description
+		}
+	}
+	for _, want := range []string{"background noise", "residual speaker echo", "not clearly addressed", "Say NOTHING"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("wait_for_user description missing %q", want)
+		}
 	}
 }
 

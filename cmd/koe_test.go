@@ -305,18 +305,18 @@ func TestResolveAudioProcessingMode(t *testing.T) {
 	}
 }
 
-func TestKoePersonaPinsCurrentUtteranceLanguage(t *testing.T) {
-	// The current-utterance language rule is load-bearing (voice turns must follow
-	// the just-spoken language, not the Desktop global preference — see
-	// daemon.applyKoeResponseLanguage). Explicit Chinese/Japanese constraints keep
-	// a noisy multilingual turn from inheriting the previous response language.
+func TestKoePersonaUsesStableCurrentUtteranceLanguage(t *testing.T) {
+	// Clear language switches remain per-turn, while short names/fillers and noisy
+	// audio inherit the most recent clear language instead of randomly flipping a
+	// Chinese conversation into English or Japanese.
 	for _, want := range []string{
 		"current utterance",
-		"not the user's usual",
-		"Chinese input gets only",
-		"Japanese input gets only Japanese",
-		"never carry the previous",
-		"turn's language",
+		"Simplified Chinese for Chinese",
+		"Japanese for Japanese",
+		"clearly switches",
+		"not a language switch",
+		"most recent clearly established conversation language",
+		"default to one concise",
 	} {
 		if !strings.Contains(koePersona, want) {
 			t.Fatalf("koePersona missing language discipline %q", want)

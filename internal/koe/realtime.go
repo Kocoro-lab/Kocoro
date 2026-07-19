@@ -129,8 +129,9 @@ type eventHandler struct {
 	// speech_started. When a candidate is false, Koe asks the same native S2S
 	// session to continue from the unsaid point instead of losing the reply.
 	bargeServerCleared atomic.Bool
-	// bargeServerVAD distinguishes an immediate local-energy duck from a candidate
-	// confirmed by Realtime VAD.
+	// bargeServerVAD distinguishes a reversible local soft-duck from a candidate
+	// independently corroborated by Realtime VAD. Only the latter survives the
+	// local gate closing while transcription decides whether to hard-interrupt.
 	bargeServerVAD atomic.Bool
 	// asyncTaskPending keeps Desktop/--once in "thinking" after the model's short
 	// spoken ack while do_task is still running or its result speech is queued.
@@ -486,21 +487,36 @@ func (h *eventHandler) interruptOutput() { h.stopOutput(false) }
 // barge-in confirms meaningful user speech. It keeps the committed user input.
 func (h *eventHandler) bargeInStopPlayback() { h.stopOutput(true) }
 
-func (h *eventHandler) beginBargeCandidate() bool {
+func (h *eventHandler) beginBargeCandidate(gain float64, serverVAD bool, evidence string) bool {
 	if !h.fullDuplexAEC || !clientOwnsTurnResponse() {
 		return false
 	}
-	if !h.bargeCandidate.CompareAndSwap(false, true) {
-		return true
+	first := h.bargeCandidate.CompareAndSwap(false, true)
+	if first {
+		h.bargeServerCleared.Store(false)
 	}
-	h.bargeServerCleared.Store(false)
-	h.bargeServerVAD.Store(false)
-	gain := clampPlaybackGain(koeEnvFloat("KOE_BARGE_DUCK_GAIN", defaultBargeDuckGain))
+	if serverVAD {
+		h.bargeServerVAD.Store(true)
+	}
+	gain = clampPlaybackGain(gain)
+	changed := first
 	if h.audio != nil {
-		h.audio.SetPlaybackGain(gain)
+		if current := h.audio.PlaybackGain(); gain < current {
+			h.audio.SetPlaybackGain(gain)
+			changed = true
+		}
 	}
-	if eventLogEnabled() {
-		log.Printf("koe[barge]: candidate — ducking playback to %.0f%%", gain*100)
+	if changed && eventLogEnabled() {
+		stage := "soft"
+		if serverVAD {
+			stage = "deep"
+		}
+		log.Printf(
+			"koe[barge]: candidate stage=%s evidence=%s target_gain=%.0f%%",
+			stage,
+			evidence,
+			gain*100,
+		)
 	}
 	return true
 }
@@ -604,6 +620,21 @@ func (h *eventHandler) observeLocalSpeechStarted() {
 	if eventLogEnabled() {
 		log.Printf("koe[timing]: mic_gate_open seq=%d", seq)
 	}
+	// The ordinary mic gate must stay sensitive enough for quiet Chinese and
+	// Japanese speech. Give barge-in its own higher fast-path threshold instead
+	// of making all capture less sensitive. A strong AEC-cleaned onset produces
+	// an immediate, reversible soft duck; weaker speech waits for the independent
+	// front-speech or server-VAD evidence below.
+	if !koeEnvBool("KOE_VPIO_BARGE_IN", false) || !h.isSpeakingOrResponding() || h.audio == nil {
+		return
+	}
+	inputLevel := h.audio.InputLevel()
+	localDuckLevel := koeEnvFloat("KOE_BARGE_LOCAL_DUCK_LEVEL", 0.040)
+	if inputLevel < localDuckLevel {
+		return
+	}
+	gain := koeEnvFloat("KOE_BARGE_SOFT_DUCK_GAIN", defaultBargeSoftDuckGain)
+	h.beginBargeCandidate(gain, false, "strong_local_onset")
 }
 
 // taskInFlight reports whether a back-brain do_task is actually running.
@@ -645,8 +676,9 @@ func (h *eventHandler) maybeRestoreUserMic() {
 func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 	h.userSpeaking.Store(false)
 	h.resultMailbox.Wake()
-	h.resumeUnconfirmedLocalBarge(ctx, h.localSpeechSeq.Load())
+	seq := h.localSpeechSeq.Load()
 	h.localSpeechStartedNS.Store(0)
+	h.resumeUnconfirmedLocalBarge(ctx, seq)
 	if !koeEnvBool("KOE_LOCAL_COMMIT_FALLBACK", false) {
 		return
 	}
@@ -656,7 +688,6 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 		}
 		return
 	}
-	seq := h.localSpeechSeq.Load()
 	if seq == 0 {
 		return
 	}
@@ -753,7 +784,7 @@ func (h *eventHandler) resumeUnconfirmedLocalBarge(ctx context.Context, seq int6
 	if !h.bargeCandidate.Load() || h.bargeServerVAD.Load() {
 		return
 	}
-	delay := time.Duration(koeEnvInt("KOE_BARGE_LOCAL_CONFIRM_MS", 400)) * time.Millisecond
+	delay := time.Duration(koeEnvInt("KOE_BARGE_LOCAL_RELEASE_MS", 550)) * time.Millisecond
 	go func() {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
@@ -765,7 +796,7 @@ func (h *eventHandler) resumeUnconfirmedLocalBarge(ctx context.Context, seq int6
 		if h.localSpeechSeq.Load() != seq || !h.bargeCandidate.Load() || h.bargeServerVAD.Load() {
 			return
 		}
-		h.resumeBargeCandidate("local speech not confirmed by server VAD")
+		h.resumeBargeCandidate("local evidence ended without server VAD")
 	}()
 }
 
@@ -2018,7 +2049,8 @@ func (h *eventHandler) observeFusedBargeReattack() bool {
 	h.turnSuppressedEcho[itemID] = false
 	h.activeSuppressedEcho = ""
 	h.turnMu.Unlock()
-	if !h.beginBargeCandidate() {
+	gain := koeEnvFloat("KOE_BARGE_DUCK_GAIN", defaultBargeDuckGain)
+	if !h.beginBargeCandidate(gain, true, "server_vad_plus_front_speech") {
 		return false
 	}
 	if eventLogEnabled() {
@@ -2037,7 +2069,21 @@ func (h *eventHandler) setBargeInAuthorized(allowed bool) bool {
 	if !allowed {
 		return false
 	}
-	return h.observeFusedBargeReattack()
+	changed := h.observeFusedBargeReattack()
+	// A sustained front-speech decision already combines multiple XVF samples.
+	// Let it soft-duck before the cloud VAD round trip when the post-AEC mic level
+	// is non-trivial. The candidate remains reversible until server VAD arrives.
+	if h.audio != nil && h.isSpeakingOrResponding() {
+		inputLevel := h.audio.InputLevel()
+		frontMinLevel := koeEnvFloat("KOE_BARGE_FRONT_MIN_LEVEL", 0.015)
+		if inputLevel >= frontMinLevel {
+			gain := koeEnvFloat("KOE_BARGE_SOFT_DUCK_GAIN", defaultBargeSoftDuckGain)
+			if h.beginBargeCandidate(gain, false, "sustained_front_speech") {
+				changed = true
+			}
+		}
+	}
+	return changed
 }
 
 func (h *eventHandler) requestTurnResponse(itemID string) bool {
@@ -2234,7 +2280,18 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 // express{intent} tool for a carrier with a body; empty (mac) yields a tool set
 // byte-identical to the pre-carrier build.
 func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressIntents []string, hasCamera ...bool) map[string]any {
+	return sessionConfigForCarrierLanguage(persona, voice, "", fullDuplexAEC, expressIntents, hasCamera...)
+}
+
+func sessionConfigForCarrierLanguage(persona, voice, language string, fullDuplexAEC bool, expressIntents []string, hasCamera ...bool) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
+	reasoningEffort := strings.ToLower(strings.TrimSpace(koeEnvString("KOE_REASONING_EFFORT", "low")))
+	switch reasoningEffort {
+	case "minimal", "low", "medium", "high", "xhigh":
+	default:
+		log.Printf("koe: invalid KOE_REASONING_EFFORT=%q; using low", reasoningEffort)
+		reasoningEffort = "low"
+	}
 	interruptResponse := false
 	if fullDuplexAEC {
 		interruptResponse = koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
@@ -2306,10 +2363,18 @@ func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressI
 			"interrupt_response":  interruptResponse,
 		}
 	}
+	transcription := map[string]any{
+		"model": koeEnvString("KOE_TRANSCRIPTION_MODEL", "gpt-4o-transcribe"),
+	}
+	// A user-pinned reply language is also useful acoustic context for auxiliary
+	// ASR, especially for short Chinese/Japanese controls. Auto mode deliberately
+	// omits the hint so a clear mid-conversation language switch remains possible.
+	switch language {
+	case "en", "ja", "zh":
+		transcription["language"] = language
+	}
 	input := map[string]any{
-		"transcription": map[string]any{
-			"model": koeEnvString("KOE_TRANSCRIPTION_MODEL", "gpt-4o-transcribe"),
-		},
+		"transcription":  transcription,
 		"turn_detection": turnDetection,
 	}
 	if !strings.EqualFold(noiseReduction, "off") {
@@ -2321,6 +2386,7 @@ func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressI
 		"session": map[string]any{
 			"type":              "realtime",
 			"instructions":      sessionInstructions,
+			"reasoning":         map[string]any{"effort": reasoningEffort},
 			"output_modalities": []string{"audio"},
 			"audio": map[string]any{
 				"input":  input,
@@ -2329,9 +2395,6 @@ func sessionConfigForCarrier(persona, voice string, fullDuplexAEC bool, expressI
 			"tools":               ToolDefsForCarrier(expressIntents, hasCamera...),
 			"tool_choice":         "auto",
 			"parallel_tool_calls": true,
-			"reasoning": map[string]any{
-				"effort": koeEnvString("KOE_REASONING_EFFORT", "low"),
-			},
 		},
 	}
 }
@@ -2578,7 +2641,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// A long hangover can keep the local gate open across response playback,
 		// however, so a second real utterance has no new open edge. In that case a
 		// high current mic level is accepted as a within-gate reattack, still fused
-		// with server VAD. Low-level stale echo remains transcript-gated.
+		// with server VAD. A fresh edge also has a barge-specific level floor:
+		// field evidence showed noise at 0.0067 and real talk-over at 0.026+.
+		// Low-level stale echo remains transcript-gated.
 		speaking := h.isSpeakingOrResponding()
 		postPlaybackEchoMS := int64(koeEnvInt("KOE_POST_PLAYBACK_ECHO_MS", 1500))
 		recentPlaybackTail := !speaking && afterPlaybackMS >= 0 && afterPlaybackMS <= postPlaybackEchoMS
@@ -2593,34 +2658,44 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			if h.audio != nil {
 				inputLevel = h.audio.InputLevel()
 			}
-			reattackLevel := koeEnvFloat("KOE_BARGE_REATTACK_LEVEL", 0.025)
+			reattackLevel := koeEnvFloat("KOE_BARGE_REATTACK_LEVEL", 0.040)
 			freshOnset := afterLocalMS >= 0 && afterLocalMS <= maxOnsetMS
+			freshMinLevel := koeEnvFloat("KOE_BARGE_FRESH_MIN_LEVEL", 0.018)
+			// After playback has fully released, a fresh local gate is an ordinary
+			// next turn and must not inherit the active-playback energy floor.
+			freshOnsetEvidence := freshOnset && (!speaking || inputLevel >= freshMinLevel)
 			frontMinLevel := koeEnvFloat("KOE_BARGE_FRONT_MIN_LEVEL", 0.015)
 			frontSpeechAuthorized := speaking && h.frontSpeechAuthorized.Load()
 			frontSpeechEvidence := frontSpeechAuthorized && inputLevel >= frontMinLevel
-			withinGateReattack := !freshOnset && (inputLevel >= reattackLevel || frontSpeechEvidence)
-			if ev.ItemID != "" && !freshOnset && !withinGateReattack {
-				h.markTurnSuppressedEcho(ev.ItemID)
+			withinGateReattack := !freshOnsetEvidence && inputLevel >= reattackLevel
+			hasBargeEvidence := freshOnsetEvidence || withinGateReattack || frontSpeechEvidence
+			if !hasBargeEvidence {
+				if ev.ItemID != "" {
+					h.markTurnSuppressedEcho(ev.ItemID)
+				}
 				if eventLogEnabled() {
 					log.Printf(
-						"koe[barge]: server VAD ignored — stale local onset after_local_gate_ms=%d after_playback_release_ms=%d input_level=%.4f reattack_level=%.4f front_speech=%t front_min_level=%.4f",
+						"koe[barge]: server VAD ignored — insufficient near-end evidence after_local_gate_ms=%d after_playback_release_ms=%d input_level=%.4f fresh_min_level=%.4f reattack_level=%.4f front_speech=%t front_min_level=%.4f",
 						afterLocalMS,
 						afterPlaybackMS,
 						inputLevel,
+						freshMinLevel,
 						reattackLevel,
 						frontSpeechAuthorized,
 						frontMinLevel,
 					)
 				}
-			} else if speaking && h.beginBargeCandidate() {
+			} else if speaking {
 				evidence := "fresh_onset"
 				if frontSpeechEvidence {
 					evidence = "server_vad_plus_front_speech"
 				} else if withinGateReattack {
 					evidence = "within_gate_reattack"
 				}
+				gain := koeEnvFloat("KOE_BARGE_DUCK_GAIN", defaultBargeDuckGain)
+				h.beginBargeCandidate(gain, true, evidence)
 				log.Printf(
-					"koe[barge]: possible talk-over detected — playback ducked evidence=%s input_level=%.4f",
+					"koe[barge]: possible talk-over detected — playback deep-ducked evidence=%s input_level=%.4f",
 					evidence,
 					inputLevel,
 				)
@@ -3499,6 +3574,18 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 		// Teardown is the complete response. requestEndCall owns idempotency and
 		// suppresses all later response requests before the connection closes.
 		h.requestEndCall(callID)
+		return
+	}
+	if name == "wait_for_user" {
+		// Realtime's production guidance recommends a silent no-op tool for room
+		// noise, TV, echo, and speech not addressed to the assistant. Satisfy the
+		// function call but deliberately do not request a follow-up response.
+		h.sendFunctionOutput(callID, mustJSON(map[string]string{"status": "waiting"}))
+		h.asyncTaskPending.Store(false)
+		h.emitVoiceState("listening")
+		if eventLogEnabled() {
+			log.Printf("koe[turn]: wait_for_user — silent turn complete")
+		}
 		return
 	}
 	if name == "camera" {

@@ -125,7 +125,15 @@ func (a *AudioIO) InputLevel() float64 {
 func (a *AudioIO) OutputLevel() float64 { return math.Float64frombits(a.outLevel.Load()) }
 func (a *AudioIO) PlaybackIdle() bool   { return a.OutputLevel() < playbackIdleLevelEps }
 func (a *AudioIO) SetPlaybackGain(gain float64) {
-	a.playbackGain.Store(math.Float64bits(clampPlaybackGain(gain)))
+	gain = clampPlaybackGain(gain)
+	bits := math.Float64bits(gain)
+	if a.playbackGain.Swap(bits) == bits || a.conn == nil {
+		return
+	}
+	body, _ := json.Marshal(playbackGainControl{Type: "playback_gain", Gain: gain})
+	if err := a.sendControl(body); err != nil {
+		log.Printf("koe[barge]: carrier playback gain update failed: %v", err)
+	}
 }
 func (a *AudioIO) PlaybackGain() float64 {
 	return math.Float64frombits(a.playbackGain.Load())
@@ -288,7 +296,7 @@ func (a *AudioIO) SetPlaybackEnabled(s bool) {
 
 // InterruptPlayback flushes every Wireless playback layer: Koe's play queue and
 // epoch-tagged jitter ring, then the carrier ring and the daemon SDK 1.9 player via
-// the v0.3 barge_in control frame. The write lock prevents interleaving this JSON
+// the v0.4 barge_in control frame. The write lock prevents interleaving this JSON
 // frame with a concurrently emitted speaker PCM frame.
 func (a *AudioIO) InterruptPlayback() {
 	a.SetPlaybackEnabled(false)
@@ -360,8 +368,13 @@ type helloMsg struct {
 	Role  string `json:"role"`
 }
 
+type playbackGainControl struct {
+	Type string  `json:"type"`
+	Gain float64 `json:"gain"`
+}
+
 // audioProto is the carrier-link protocol version (koe-audio-carrier-spec §4.1).
-const audioProto = "0.3"
+const audioProto = "0.4"
 
 // Start dials the carrier UDS, performs the hello handshake, and runs the mic
 // (carrier→koe) and speaker (koe→carrier) pumps. Media stays daemon-resident under
@@ -400,7 +413,7 @@ func dialAudioCarrier(path string) (net.Conn, error) {
 	return conn, nil
 }
 
-// ProbeAudioCarrier performs the same v0.3 hello as a real call, then closes the
+// ProbeAudioCarrier performs the same v0.4 hello as a real call, then closes the
 // socket. Wireless startup uses this as first-hand protocol evidence while
 // preserving the idle invariant: no audio-UDS connection remains open and no
 // Realtime session is minted merely because Koe is resident.
@@ -538,8 +551,11 @@ func (a *AudioIO) spkPump() {
 			if queued.epoch != a.spkEpoch.Load() || !a.playback.Load() {
 				continue
 			}
-			wire := a.toCarrierPCM(queued.pcm) // 48k codec → 16k wire; carrier stays thin (§9-b.1)
-			wire = a.scaledPlaybackPCM(wire)
+			// Carrier v0.4 owns the final device-side gain envelope so a duck also
+			// affects audio already queued in its jitter/batch layers. Keep wire PCM
+			// unscaled here; applying the gain twice would turn a 15% deep duck into
+			// an unintended near-mute.
+			wire := a.toCarrierPCM(queued.pcm) // 48k codec → 16k wire (§9-b.1)
 			a.setOutputLevel(rmsLevel(wire))
 			payload := s16PCMToBytes(wire)
 			hdr := audiobridge.Header{

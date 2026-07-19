@@ -69,6 +69,9 @@ func ToolDefs() []ToolDef {
 		{Type: "function", Name: "end_call",
 			Description: "End the entire voice conversation and go dormant — a hang up. Call this immediately when the user explicitly dismisses Kocoro or ends the conversation: \"退出\" \"退出吧\" \"结束通话\" \"结束对话\" \"再见\" \"拜拜\" \"没事了\" \"就这样\" \"exit\" \"quit\" \"bye\" \"goodbye\" \"that's all\" — and similar. Judge it from what you actually heard, not just the on-screen transcription. After this, the call is over and the user must double-tap the Option key to talk again. Say NOTHING — do not acknowledge or ask to confirm; a short tone plays and the call ends. Never call end_call when the user only wants the current speech to stop; use stop_speaking and keep the call active. Do not use it to stop a running task either; that is cancel. When you are unsure whether they meant to end the entire conversation, keep listening instead.",
 			Parameters:  obj(`{"type":"object","properties":{},"required":[]}`)},
+		{Type: "function", Name: "wait_for_user",
+			Description: "End this turn silently and keep listening. Call this when the latest audio is silence, background noise, music or TV, side conversation, residual speaker echo, or speech not clearly addressed to you. Do not call it when the user clearly addressed you but one or more words were unclear; ask one brief clarification in the most recent clear conversation language instead. Say NOTHING before or after this tool.",
+			Parameters:  obj(`{"type":"object","properties":{},"required":[]}`)},
 	}
 	if TaskLedgerEnabled() {
 		defs[1].Description += " When the user asks to stop everything (\"都停了\" / \"全部取消\" / \"stop everything\"), make one call with all_running=true instead of one call per task."

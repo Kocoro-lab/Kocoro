@@ -150,6 +150,73 @@ func TestWirelessInterruptPlaybackSendsCarrierFlush(t *testing.T) {
 	}
 }
 
+func TestWirelessPlaybackGainUsesCarrierControl(t *testing.T) {
+	koeConn, carrierConn := net.Pipe()
+	defer koeConn.Close()
+	defer carrierConn.Close()
+	a := &AudioIO{conn: koeConn}
+	a.playbackGain.Store(math.Float64bits(1))
+
+	got := make(chan []byte, 1)
+	go func() {
+		body, err := readControl(carrierConn)
+		if err == nil {
+			got <- body
+		}
+	}()
+	a.SetPlaybackGain(0.35)
+
+	select {
+	case body := <-got:
+		var msg playbackGainControl
+		if err := json.Unmarshal(body, &msg); err != nil {
+			t.Fatalf("decode control: %v", err)
+		}
+		if msg.Type != "playback_gain" || msg.Gain != 0.35 {
+			t.Fatalf("playback gain control = %#v", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for carrier playback_gain control")
+	}
+}
+
+func TestWirelessSpeakerWireIsNotDoubleDucked(t *testing.T) {
+	koeConn, carrierConn := net.Pipe()
+	defer carrierConn.Close()
+	a, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	a.SetPlaybackGain(defaultBargeDuckGain) // no conn yet: stores target only
+	a.conn = koeConn
+	a.wg.Add(1)
+	go a.spkPump()
+
+	frame := make([]int16, audioFrameSize)
+	for i := range frame {
+		frame[i] = 12000
+	}
+	a.Play(frame)
+	hdr, payload, err := audiobridge.ReadFrame(carrierConn)
+	if err != nil {
+		t.Fatalf("read speaker frame: %v", err)
+	}
+	if hdr.Magic != audiobridge.MagicSpk {
+		t.Fatalf("frame magic = %x, want speaker", hdr.Magic)
+	}
+	peak := int16(0)
+	for i := 0; i+1 < len(payload); i += 2 {
+		sample := int16(uint16(payload[i]) | uint16(payload[i+1])<<8)
+		if sample > peak {
+			peak = sample
+		}
+	}
+	if peak < 5000 {
+		t.Fatalf("wire peak = %d; Koe appears to have pre-ducked PCM before carrier", peak)
+	}
+	a.Stop()
+}
+
 func TestWirelessNativeEarconSendsClosedCueControl(t *testing.T) {
 	koeConn, carrierConn := net.Pipe()
 	defer koeConn.Close()

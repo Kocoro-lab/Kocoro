@@ -4,7 +4,7 @@ import "testing"
 
 func TestScalePCMForBargeDuck(t *testing.T) {
 	got := scalePCM([]int16{-1000, 0, 1000}, defaultBargeDuckGain)
-	want := []int16{-50, 0, 50}
+	want := []int16{-150, 0, 150}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("scalePCM[%d] = %d, want %d", i, got[i], want[i])

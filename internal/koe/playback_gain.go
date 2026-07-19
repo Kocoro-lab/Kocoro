@@ -1,10 +1,16 @@
 package koe
 
-// Five percent (-26 dB) is deliberately unmistakable at the Wireless product's
-// maximum speaker setting. The joint local-onset + server-VAD gate prevents a
-// single noise impulse from reaching this point, so a confirmed candidate should
-// yield the sound field to the user instead of remaining perceptually loud.
-const defaultBargeDuckGain = 0.05
+const (
+	// Soft duck is the immediate, reversible "I hear you" response to strong
+	// robot-local speech evidence. Thirty-five percent is clearly audible as a
+	// level change without making a false positive feel like playback vanished.
+	defaultBargeSoftDuckGain = 0.35
+	// Deep duck follows independent server-VAD confirmation. It yields the sound
+	// field while the auxiliary transcript decides between a real interruption,
+	// a backchannel, and residual echo. Five percent behaved like an abrupt mute
+	// at volume 100; fifteen percent keeps continuity until the hard flush.
+	defaultBargeDuckGain = 0.15
+)
 
 func clampPlaybackGain(gain float64) float64 {
 	if gain < 0 {

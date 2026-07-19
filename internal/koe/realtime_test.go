@@ -672,8 +672,10 @@ func TestAdaptiveBargeBackchannelResumesBufferedPlayback(t *testing.T) {
 	audio.Play(make([]int16, audioFrameSize))
 	h.respBusy.Store(true)
 	h.outputBufferActive.Store(true)
+	audio.setInputLevel(0.030)
+	h.observeLocalSpeechStarted()
 
-	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-ok"}`))
 	if !h.bargeCandidate.Load() {
 		t.Fatal("speech_started during playback did not create a barge candidate")
 	}
@@ -736,6 +738,63 @@ func TestAdaptiveBargeDoesNotDuckOnLocalEnergyAlone(t *testing.T) {
 	}
 }
 
+func TestAdaptiveBargeSoftDucksStrongLocalSpeechBeforeServerVAD(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-local-fast-duck", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	audio.setInputLevel(0.060)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.observeLocalSpeechStarted()
+
+	if !h.bargeCandidate.Load() {
+		t.Fatal("strong local speech did not create a reversible barge candidate")
+	}
+	if h.bargeServerVAD.Load() {
+		t.Fatal("local evidence must not masquerade as server-VAD confirmation")
+	}
+	if got := audio.PlaybackGain(); got != defaultBargeSoftDuckGain {
+		t.Fatalf("local soft-duck gain = %v, want %v", got, defaultBargeSoftDuckGain)
+	}
+}
+
+func TestAdaptiveBargeRestoresUnconfirmedLocalSoftDuck(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_BARGE_LOCAL_RELEASE_MS", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-local-soft-resume", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	audio.setInputLevel(0.060)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(context.Background())
+
+	waitUntil(t, func() bool { return !h.bargeCandidate.Load() }, "unconfirmed local soft duck did not resume")
+	if got := audio.PlaybackGain(); got != 1 {
+		t.Fatalf("resumed playback gain = %v, want 1", got)
+	}
+}
+
 func TestAdaptiveBargeDucksWhenServerVADConfirmsSpeech(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_CLIENT_RESPONSE", "1")
@@ -752,6 +811,7 @@ func TestAdaptiveBargeDucksWhenServerVADConfirmsSpeech(t *testing.T) {
 	h.respBusy.Store(true)
 	h.outputBufferActive.Store(true)
 
+	audio.setInputLevel(0.030)
 	h.observeLocalSpeechStarted()
 	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-human","audio_start_ms":1000}`))
 
@@ -760,6 +820,37 @@ func TestAdaptiveBargeDucksWhenServerVADConfirmsSpeech(t *testing.T) {
 	}
 	if got := audio.PlaybackGain(); got != defaultBargeDuckGain {
 		t.Fatalf("server VAD playback gain = %v, want %v", got, defaultBargeDuckGain)
+	}
+}
+
+func TestAdaptiveBargeRejectsQuietFreshOnsetAtVolume100(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-quiet-fresh-noise", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	audio.setInputLevel(0.0067) // first-hand false-duck level from volume-100 E2E
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.observeLocalSpeechStarted()
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-quiet-noise","audio_start_ms":1000}`))
+
+	if h.bargeCandidate.Load() {
+		t.Fatal("quiet fresh onset created a barge candidate")
+	}
+	if got := audio.PlaybackGain(); got != 1 {
+		t.Fatalf("quiet fresh onset changed playback gain to %v", got)
+	}
+	if !h.turnIsSuppressedEcho("item-quiet-noise") {
+		t.Fatal("quiet fresh onset was not retained for transcript-based echo rejection")
 	}
 }
 
@@ -1053,6 +1144,8 @@ func TestAdaptiveBargeMeaningfulSpeechConfirmsAndQueuesResponse(t *testing.T) {
 	audio.Play(make([]int16, audioFrameSize))
 	h.respBusy.Store(true)
 	h.outputBufferActive.Store(true)
+	audio.setInputLevel(0.030)
+	h.observeLocalSpeechStarted()
 
 	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
 	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-question","transcript":"木星有多大"}`))
@@ -1568,6 +1661,50 @@ func TestSessionConfigCanOverrideTranscriptionModel(t *testing.T) {
 	raw, _ := json.Marshal(cfg)
 	if !strings.Contains(string(raw), `"transcription":{"model":"gpt-4o-mini-transcribe"}`) {
 		t.Fatalf("KOE_TRANSCRIPTION_MODEL was not applied: %s", raw)
+	}
+}
+
+func TestSessionConfigHintsPinnedTranscriptionLanguageOnly(t *testing.T) {
+	for _, tc := range []struct {
+		language string
+		want     string
+	}{
+		{language: "zh", want: `"language":"zh"`},
+		{language: "ja", want: `"language":"ja"`},
+		{language: "en", want: `"language":"en"`},
+	} {
+		cfg := sessionConfigForCarrierLanguage("persona", "marin", tc.language, true, nil)
+		raw, _ := json.Marshal(cfg)
+		if !strings.Contains(string(raw), tc.want) {
+			t.Fatalf("language %q missing transcription hint in %s", tc.language, raw)
+		}
+	}
+	auto := sessionConfigForCarrierLanguage("persona", "marin", "", true, nil)
+	raw, _ := json.Marshal(auto)
+	if strings.Contains(string(raw), `"language"`) {
+		t.Fatalf("auto language must not pin transcription: %s", raw)
+	}
+}
+
+func TestSessionConfigUsesLowReasoningByDefaultAndValidatesOverride(t *testing.T) {
+	cfg := sessionConfigForCarrierLanguage("persona", "marin", "", true, nil)
+	raw, _ := json.Marshal(cfg)
+	if !strings.Contains(string(raw), `"reasoning":{"effort":"low"}`) {
+		t.Fatalf("default reasoning effort missing from %s", raw)
+	}
+
+	t.Setenv("KOE_REASONING_EFFORT", "minimal")
+	cfg = sessionConfigForCarrierLanguage("persona", "marin", "", true, nil)
+	raw, _ = json.Marshal(cfg)
+	if !strings.Contains(string(raw), `"reasoning":{"effort":"minimal"}`) {
+		t.Fatalf("reasoning override missing from %s", raw)
+	}
+
+	t.Setenv("KOE_REASONING_EFFORT", "invalid")
+	cfg = sessionConfigForCarrierLanguage("persona", "marin", "", true, nil)
+	raw, _ = json.Marshal(cfg)
+	if !strings.Contains(string(raw), `"reasoning":{"effort":"low"}`) {
+		t.Fatalf("invalid reasoning effort must fall back to low: %s", raw)
 	}
 }
 
@@ -2161,6 +2298,25 @@ func TestCameraToolFailureDoesNotInjectImage(t *testing.T) {
 	}
 	if got := len(h.respReq); got != 1 {
 		t.Fatalf("camera failure queued response count = %d, want 1", got)
+	}
+}
+
+func TestWaitForUserCompletesToolWithoutSpokenFollowup(t *testing.T) {
+	state := NewCallState("burst-wait", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+
+	h.handleFunctionCall(context.Background(), "wait-call", "wait_for_user", []byte(`{}`))
+
+	if got := cap.countType("conversation.item.create"); got != 1 {
+		t.Fatalf("wait_for_user function outputs = %d, want 1", got)
+	}
+	if got := len(h.respReq); got != 0 {
+		t.Fatalf("wait_for_user queued %d spoken responses, want 0", got)
+	}
+	if cap.countType("response.create") != 0 {
+		t.Fatal("wait_for_user must not create a spoken response")
 	}
 }
 
