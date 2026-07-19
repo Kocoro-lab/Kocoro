@@ -1795,6 +1795,50 @@ func TestClientOwnedLongSpeechRequestsResponseBeforeTranscript(t *testing.T) {
 	}
 }
 
+func TestClientOwnedSegmentGraceWaitsForContinuedSpeech(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_SEGMENT_RESPONSE_GRACE_MS", "80")
+	state := NewCallState("burst-segment-grace", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, nil, (&captureSender{}).send)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-fragment","audio_start_ms":1000}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-fragment","audio_end_ms":2400}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-continuation","audio_start_ms":2500}`))
+	time.Sleep(100 * time.Millisecond)
+	if got := len(h.respReq); got != 0 {
+		t.Fatalf("continued first segment queued %d responses, want 0", got)
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-fragment","transcript":"一から五十まで"}`))
+	if got := len(h.respReq); got != 0 {
+		t.Fatalf("older segment transcript queued %d responses, want 0", got)
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-continuation","audio_end_ms":3900}`))
+	waitUntil(t, func() bool { return len(h.respReq) == 1 }, "continued utterance did not queue one response")
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("continued utterance queued %d responses, want 1", got)
+	}
+}
+
+func TestClientOwnedTranscriptWinsSegmentGraceWithoutDuplicate(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_SEGMENT_RESPONSE_GRACE_MS", "80")
+	state := NewCallState("burst-transcript-before-grace", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, nil, (&captureSender{}).send)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-complete","audio_start_ms":1000}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-complete","audio_end_ms":2400}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-complete","transcript":"量子纠缠是什么"}`))
+	time.Sleep(100 * time.Millisecond)
+
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("transcript plus expired segment grace queued %d responses, want 1", got)
+	}
+}
+
 func TestClientOwnedShortSpeechWaitsForTranscript(t *testing.T) {
 	t.Setenv("KOE_CLIENT_RESPONSE", "1")
 	state := NewCallState("burst-short-control", "")

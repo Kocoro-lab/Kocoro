@@ -152,6 +152,7 @@ type eventHandler struct {
 	// sequence: the provider proved it sends no input_audio_buffer.committed,
 	// so every user-turn response.create mints the turn boundary itself.
 	commitlessTurns atomic.Bool
+	serverSpeechSeq atomic.Int64
 	// VAD item bookkeeping is keyed by the server's item_id. Realtime may start a
 	// second utterance before the first item's auxiliary transcript completes, so
 	// one global speechStartedAt/speechStoppedAt pair cannot safely classify short
@@ -159,6 +160,7 @@ type eventHandler struct {
 	turnMu                sync.Mutex
 	vadStartMS            map[string]int
 	vadDurationMS         map[string]int
+	turnSpeechSeq         map[string]int64
 	turnSuppressedEcho    map[string]bool
 	activeSuppressedEcho  string
 	turnResponseRequested map[string]bool
@@ -825,6 +827,7 @@ func newEventHandlerWithMailbox(disp *Dispatcher, state *CallState, audio *Audio
 		floor:                 newNativeFloorController(),
 		vadStartMS:            make(map[string]int),
 		vadDurationMS:         make(map[string]int),
+		turnSpeechSeq:         make(map[string]int64),
 		turnSuppressedEcho:    make(map[string]bool),
 		turnResponseRequested: make(map[string]bool),
 		turnResponseCanceled:  make(map[string]bool),
@@ -1920,6 +1923,7 @@ func (h *eventHandler) noteVADStart(itemID string, audioStartMS int) {
 	}
 	h.turnMu.Lock()
 	h.vadStartMS[itemID] = audioStartMS
+	h.turnSpeechSeq[itemID] = h.serverSpeechSeq.Load()
 	h.turnMu.Unlock()
 }
 
@@ -1967,6 +1971,26 @@ func (h *eventHandler) turnIsSuppressedEcho(itemID string) bool {
 	return h.turnSuppressedEcho[itemID]
 }
 
+func (h *eventHandler) turnHasNewerSpeech(itemID string) bool {
+	if itemID == "" {
+		return false
+	}
+	h.turnMu.Lock()
+	seq, ok := h.turnSpeechSeq[itemID]
+	h.turnMu.Unlock()
+	return ok && h.serverSpeechSeq.Load() > seq
+}
+
+func (h *eventHandler) turnIsTracked(itemID string) bool {
+	if itemID == "" {
+		return true
+	}
+	h.turnMu.Lock()
+	_, ok := h.turnSpeechSeq[itemID]
+	h.turnMu.Unlock()
+	return ok
+}
+
 // observeFusedBargeReattack promotes a low-level playback-tail VAD item when the
 // robot-local front-speech gate subsequently sees a real user. The tail and the
 // user can occupy one continuous server-VAD item, so waiting for a second
@@ -2005,6 +2029,33 @@ func (h *eventHandler) setBargeInAuthorized(allowed bool) bool {
 
 func (h *eventHandler) requestTurnResponse(itemID string) bool {
 	return h.requestTurnResponseWithInstructions(itemID, "")
+}
+
+func (h *eventHandler) requestTurnResponseAfterSegmentGrace(itemID string) {
+	grace := time.Duration(koeEnvInt("KOE_SEGMENT_RESPONSE_GRACE_MS", 0)) * time.Millisecond
+	if grace <= 0 {
+		h.requestTurnResponse(itemID)
+		return
+	}
+	seq := h.serverSpeechSeq.Load()
+	go func() {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		<-timer.C
+		if h.serverSpeechSeq.Load() != seq {
+			if eventLogEnabled() {
+				log.Printf("koe[turn]: deferring segmented utterance item=%s to newer speech", itemID)
+			}
+			return
+		}
+		// The auxiliary transcript may have arrived during the grace and already
+		// queued the response. finishInputTurn removes its tracking entry, which
+		// prevents this delayed eager lane from creating a duplicate.
+		if !h.turnIsTracked(itemID) {
+			return
+		}
+		h.requestTurnResponse(itemID)
+	}()
 }
 
 func (h *eventHandler) requestTurnResponseWithInstructions(itemID, instructions string) bool {
@@ -2057,6 +2108,7 @@ func (h *eventHandler) finishInputTurn(itemID string) {
 	h.turnMu.Lock()
 	delete(h.vadStartMS, itemID)
 	delete(h.vadDurationMS, itemID)
+	delete(h.turnSpeechSeq, itemID)
 	delete(h.turnSuppressedEcho, itemID)
 	delete(h.turnResponseRequested, itemID)
 	h.turnMu.Unlock()
@@ -2458,6 +2510,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	}
 	switch ev.Type {
 	case "input_audio_buffer.speech_started":
+		h.serverSpeechSeq.Add(1)
 		h.userSpeaking.Store(true)
 		h.speechStartedAt = time.Now()
 		h.noteVADStart(ev.ItemID, ev.AudioStart)
@@ -2553,7 +2606,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// suppressible without adding transcription latency to normal questions.
 		eagerMinMS := int64(koeEnvInt("KOE_EAGER_RESPONSE_MIN_SPEECH_MS", 800))
 		if clientOwnsTurnResponse() && !h.bargeCandidate.Load() && !h.turnIsSuppressedEcho(ev.ItemID) && speechMS >= eagerMinMS {
-			h.requestTurnResponse(ev.ItemID)
+			h.requestTurnResponseAfterSegmentGrace(ev.ItemID)
 		}
 	case "input_audio_buffer.committed":
 		if h.ending.Load() {
@@ -3002,6 +3055,13 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 		h.confirmBargeCandidate()
 	}
 	if clientOwnsTurnResponse() {
+		if h.turnHasNewerSpeech(itemID) {
+			if eventLogEnabled() {
+				log.Printf("koe[turn]: transcript belongs to a continued utterance item=%s — waiting for the newer segment", itemID)
+			}
+			h.cancelRequestedTurnResponse(itemID)
+			return
+		}
 		if wasBarge {
 			h.requestTurnResponseWithInstructions(itemID, bargeTranscriptEvidenceInstructions(transcript))
 		} else {
