@@ -55,6 +55,9 @@ type AudioIO struct {
 
 	inLevel  atomic.Uint64
 	outLevel atomic.Uint64
+	// Idle room floor sampled by the carrier before this call and attached to
+	// its v0.4 hello. Set once during Start, then read by the shared mic gate.
+	preCallAmbientRMS float64
 
 	// UDS device: the carrier link. socketPath is injected (never derived, §2).
 	socketPath string
@@ -122,8 +125,9 @@ func (a *AudioIO) InputLevel() float64 {
 	}
 	return math.Float64frombits(a.inLevel.Load())
 }
-func (a *AudioIO) OutputLevel() float64 { return math.Float64frombits(a.outLevel.Load()) }
-func (a *AudioIO) PlaybackIdle() bool   { return a.OutputLevel() < playbackIdleLevelEps }
+func (a *AudioIO) PreCallAmbientRMS() float64 { return a.preCallAmbientRMS }
+func (a *AudioIO) OutputLevel() float64       { return math.Float64frombits(a.outLevel.Load()) }
+func (a *AudioIO) PlaybackIdle() bool         { return a.OutputLevel() < playbackIdleLevelEps }
 func (a *AudioIO) SetPlaybackGain(gain float64) {
 	gain = clampPlaybackGain(gain)
 	bits := math.Float64bits(gain)
@@ -363,9 +367,10 @@ func speakerRingFramesFromEnv() (int, error) {
 const carrierWireRate = wirelessCarrierWireRate
 
 type helloMsg struct {
-	Type  string `json:"type"`
-	Proto string `json:"proto"`
-	Role  string `json:"role"`
+	Type       string  `json:"type"`
+	Proto      string  `json:"proto"`
+	Role       string  `json:"role"`
+	AmbientRMS float64 `json:"ambient_rms,omitempty"`
 }
 
 type playbackGainControl struct {
@@ -436,27 +441,39 @@ func ProbeAudioCarrier(path string) error {
 // handshake sends our hello and validates the carrier's, per §4.1 (fail-loud on a
 // proto mismatch — a future header v2 must not be silently misparsed).
 func (a *AudioIO) handshake() error {
-	return handshakeAudioCarrier(a.conn)
+	hello, err := exchangeAudioCarrierHello(a.conn)
+	if err == nil && hello.AmbientRMS > 0 && hello.AmbientRMS <= micGateAmbientCeiling {
+		a.preCallAmbientRMS = hello.AmbientRMS
+		if os.Getenv("KOE_AUDIO_LOG") == "1" || eventLogEnabled() {
+			log.Printf("koe[audio]: carrier pre-call ambient_rms=%.4f", hello.AmbientRMS)
+		}
+	}
+	return err
 }
 
 func handshakeAudioCarrier(conn net.Conn) error {
+	_, err := exchangeAudioCarrierHello(conn)
+	return err
+}
+
+func exchangeAudioCarrierHello(conn net.Conn) (helloMsg, error) {
 	mine := helloMsg{Type: "hello", Proto: audioProto, Role: "koe"}
 	body, _ := json.Marshal(mine)
 	if err := writeControl(conn, body); err != nil {
-		return fmt.Errorf("koe[audio]: send hello: %w", err)
+		return helloMsg{}, fmt.Errorf("koe[audio]: send hello: %w", err)
 	}
 	peer, err := readControl(conn)
 	if err != nil {
-		return fmt.Errorf("koe[audio]: read carrier hello: %w", err)
+		return helloMsg{}, fmt.Errorf("koe[audio]: read carrier hello: %w", err)
 	}
 	var got helloMsg
 	if err := json.Unmarshal(peer, &got); err != nil || got.Type != "hello" {
-		return fmt.Errorf("koe[audio]: first frame not hello: %q", string(peer))
+		return helloMsg{}, fmt.Errorf("koe[audio]: first frame not hello: %q", string(peer))
 	}
 	if got.Proto != audioProto {
-		return fmt.Errorf("koe[audio]: carrier proto %q != %q — closing", got.Proto, audioProto)
+		return helloMsg{}, fmt.Errorf("koe[audio]: carrier proto %q != %q — closing", got.Proto, audioProto)
 	}
-	return nil
+	return got, nil
 }
 
 // micPump reads carrier mic frames, transcodes to the codec's 48k mono S16, applies

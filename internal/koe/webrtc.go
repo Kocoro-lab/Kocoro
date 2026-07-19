@@ -640,6 +640,7 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 	if rc.fullDuplexAEC {
 		gate = newVPIOMicNoiseGate()
 	}
+	gate.observeAmbientLevel(rc.audio.PreCallAmbientRMS())
 	defer gate.logStats()
 	stats := &sendTrackStats{}
 	preRoll := newMicPreRoll(micPreRollFrames)

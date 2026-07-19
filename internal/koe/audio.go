@@ -140,6 +140,10 @@ func (a *AudioIO) InputLevel() float64 {
 	return math.Float64frombits(a.inLevel.Load())
 }
 
+// PreCallAmbientRMS is supplied by the Wireless carrier handshake. macOS owns
+// its device directly and has no carrier-side idle sampler.
+func (a *AudioIO) PreCallAmbientRMS() float64 { return 0 }
+
 // OutputLevel reports the latest played frame RMS (0..1).
 func (a *AudioIO) OutputLevel() float64 { return math.Float64frombits(a.outLevel.Load()) }
 

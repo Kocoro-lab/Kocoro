@@ -86,3 +86,31 @@ func TestProbeAudioCarrier_RejectsProtoMismatch(t *testing.T) {
 		t.Fatal("proto mismatch must fail loud")
 	}
 }
+
+func TestAudioHandshakeRetainsCarrierAmbientFloor(t *testing.T) {
+	koeConn, carrierConn := net.Pipe()
+	defer koeConn.Close()
+	defer carrierConn.Close()
+	done := make(chan error, 1)
+	go func() {
+		if _, err := readControl(carrierConn); err != nil {
+			done <- err
+			return
+		}
+		peer, _ := json.Marshal(helloMsg{
+			Type: "hello", Proto: audioProto, Role: "carrier", AmbientRMS: 0.041,
+		})
+		done <- writeControl(carrierConn, peer)
+	}()
+
+	audio := &AudioIO{conn: koeConn}
+	if err := audio.handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := audio.PreCallAmbientRMS(); got != 0.041 {
+		t.Fatalf("pre-call ambient RMS = %.4f, want 0.0410", got)
+	}
+}

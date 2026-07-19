@@ -656,6 +656,19 @@ func TestMicNoiseGatePreCallAmbientRejectsSpeechScaleOutlier(t *testing.T) {
 	}
 }
 
+func TestMicNoiseGateAcceptsCarrierAmbientLevel(t *testing.T) {
+	t.Setenv("KOE_MIC_GATE_THRESHOLD", "0.006")
+	g := newMicNoiseGate()
+	g.observeAmbientLevel(0.04)
+	if got := g.effectiveThreshold(); got < 0.079 || got > 0.081 {
+		t.Fatalf("carrier ambient effective threshold = %.4f, want about 0.080", got)
+	}
+	g.observeAmbientLevel(0.2)
+	if got := g.effectiveThreshold(); got < 0.079 || got > 0.081 {
+		t.Fatalf("speech-scale carrier outlier changed threshold to %.4f", got)
+	}
+}
+
 func TestMicNoiseGateRequiresSustainedSpeechAndHangover(t *testing.T) {
 	t.Setenv("KOE_MIC_GATE_START_MS", "100")
 	t.Setenv("KOE_MIC_GATE_HANGOVER_MS", "60")

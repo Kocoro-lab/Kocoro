@@ -222,10 +222,13 @@ func (g *micNoiseGate) effectiveThreshold() float64 {
 }
 
 func (g *micNoiseGate) observeAmbient(frame []int16) {
+	g.observeAmbientLevel(rmsLevel(frame))
+}
+
+func (g *micNoiseGate) observeAmbientLevel(level float64) {
 	if !g.enabled {
 		return
 	}
-	level := rmsLevel(frame)
 	if level <= 0 || level > micGateAmbientCeiling {
 		return
 	}
