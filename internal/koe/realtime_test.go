@@ -1105,6 +1105,35 @@ func TestAdaptiveBargeQueuesTranscriptAsUntrustedDisambiguationEvidence(t *testi
 	}
 }
 
+func TestAdaptiveBargeDoesNotInjectUnmarkedASRNumbers(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-barge-unmarked-asr", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetSpeaking(true)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	h.observeLocalSpeechStarted()
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-misheard-math","audio_start_ms":1000}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-misheard-math","audio_end_ms":4500}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-misheard-math","transcript":"5×3×10はいくつですか?"}`))
+
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("unmarked barge transcript queued %d responses, want 1", got)
+	}
+	req := <-h.respReq
+	if req.instructions != "" {
+		t.Fatalf("unmarked ASR numbers leaked into response instructions: %q", req.instructions)
+	}
+}
+
 func sentContains(types []string, want string) bool {
 	for _, t := range types {
 		if t == want {

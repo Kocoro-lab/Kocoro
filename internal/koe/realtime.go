@@ -2092,6 +2092,20 @@ func bargeTranscriptEvidenceInstructions(transcript string) string {
 	)
 }
 
+func shouldAttachBargeTranscriptEvidence(transcript string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(transcript), ""))
+	for _, marker := range []string{
+		"只回答", "请回答", "先停", "等等", "不对", "不是", "改成", "我是说",
+		"もういい", "やめて", "止めて", "違う", "訂正", "だけ答", "答えて",
+		"justanswer", "stop", "wait", "correction", "actually", "imeant", "isaid",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *eventHandler) cancelRequestedTurnResponse(itemID string) {
 	if itemID == "" || h.respBusy.Load() {
 		return
@@ -3078,7 +3092,7 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 			h.cancelRequestedTurnResponse(itemID)
 			return
 		}
-		if wasBarge {
+		if wasBarge && shouldAttachBargeTranscriptEvidence(transcript) {
 			h.requestTurnResponseWithInstructions(itemID, bargeTranscriptEvidenceInstructions(transcript))
 		} else {
 			h.requestTurnResponse(itemID)
