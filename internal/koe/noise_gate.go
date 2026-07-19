@@ -19,8 +19,14 @@ const (
 	defaultMicGateNoiseMultiplier  = 2.0
 	defaultMicGateStartMS          = 160
 	defaultMicGateHangoverMS       = 2000
-	micGateHotEvidenceWeight       = 2
-	micGateNoiseAlpha              = 0.04
+	// Frames observed while the call is not yet active are known ambient
+	// evidence. Reachy Wireless can sit around RMS 0.04 from its own fan even
+	// after XVF processing, well above the fixed 0.006 product floor. Accept
+	// that bounded pre-call evidence so the existing noise multiplier can adapt
+	// before the ready cue ends, while refusing speech-scale outliers.
+	micGateAmbientCeiling    = 0.080
+	micGateHotEvidenceWeight = 2
+	micGateNoiseAlpha        = 0.04
 )
 
 type micGateStats struct {
@@ -213,6 +219,17 @@ func (g *micNoiseGate) processWithStartThreshold(frame []int16, startThreshold f
 
 func (g *micNoiseGate) effectiveThreshold() float64 {
 	return math.Max(g.threshold, g.noiseFloor*g.noiseMultiplier)
+}
+
+func (g *micNoiseGate) observeAmbient(frame []int16) {
+	if !g.enabled {
+		return
+	}
+	level := rmsLevel(frame)
+	if level <= 0 || level > micGateAmbientCeiling {
+		return
+	}
+	g.updateNoiseFloor(level)
 }
 
 func (g *micNoiseGate) resetState() {

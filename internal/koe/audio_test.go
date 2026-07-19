@@ -613,6 +613,49 @@ func TestMicNoiseGateDoesNotLearnSpeechAsNoiseFloor(t *testing.T) {
 	}
 }
 
+func TestMicNoiseGateLearnsExplicitPreCallAmbientAboveFixedFloor(t *testing.T) {
+	t.Setenv("KOE_MIC_GATE_THRESHOLD", "0.006")
+	g := newMicNoiseGate()
+	ambient := make([]int16, audioFrameSize)
+	for i := range ambient {
+		ambient[i] = 1300 // RMS ~= 0.040, measured Reachy Wireless fan floor.
+	}
+	for range 100 {
+		g.observeAmbient(ambient)
+	}
+	if g.noiseFloor < 0.035 || g.noiseFloor > 0.045 {
+		t.Fatalf("pre-call ambient floor = %.4f, want about 0.040", g.noiseFloor)
+	}
+	for i := 0; i < requiredMicGateHotEvidenceFrames(g.startFrames)+2; i++ {
+		if out := g.process(ambient); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("adapted fan floor frame %d should remain muted", i)
+		}
+	}
+	if g.open {
+		t.Fatal("adapted fan floor opened the mic gate")
+	}
+
+	speech := make([]int16, audioFrameSize)
+	for i := range speech {
+		speech[i] = 4000
+	}
+	for !g.open {
+		_ = g.process(speech)
+	}
+}
+
+func TestMicNoiseGatePreCallAmbientRejectsSpeechScaleOutlier(t *testing.T) {
+	g := newMicNoiseGate()
+	outlier := make([]int16, audioFrameSize)
+	for i := range outlier {
+		outlier[i] = 4000
+	}
+	g.observeAmbient(outlier)
+	if g.noiseFloor != 0 {
+		t.Fatalf("speech-scale pre-call outlier became noise floor %.4f", g.noiseFloor)
+	}
+}
+
 func TestMicNoiseGateRequiresSustainedSpeechAndHangover(t *testing.T) {
 	t.Setenv("KOE_MIC_GATE_START_MS", "100")
 	t.Setenv("KOE_MIC_GATE_HANGOVER_MS", "60")

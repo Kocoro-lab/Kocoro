@@ -664,6 +664,11 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 			// to keep the capture pipeline from backing up.
 			captureActive := rc.callActive == nil || rc.callActive()
 			if !captureActive {
+				// This is the only interval where room audio is authoritative
+				// ambient evidence: there is no user turn and no assistant
+				// playback. Calibrate before the ready cue so a robot's own
+				// steady fan noise cannot open the gate and false-duck speech.
+				gate.observeAmbient(frame)
 				gate.resetState()
 				preRoll.Push(frame)
 				captureWasActive = false
