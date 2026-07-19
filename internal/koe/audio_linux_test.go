@@ -18,8 +18,12 @@ func TestWirelessBargeInForwardsCaptureWhileSpeaking(t *testing.T) {
 		t.Fatal("Wireless must retain half-duplex rollback when barge-in is off")
 	}
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	if a.captureSuppressed() {
+		t.Fatal("Wireless product barge-in must not require DOA evidence")
+	}
+	t.Setenv("KOE_BARGE_PERCEPTION_GATE", "1")
 	if !a.captureSuppressed() {
-		t.Fatal("Wireless barge-in must fail closed before fast perception evidence")
+		t.Fatal("an explicitly enabled perception gate must fail closed before evidence")
 	}
 	a.SetBargeInAuthorized(true)
 	if a.captureSuppressed() {

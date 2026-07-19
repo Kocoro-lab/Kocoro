@@ -158,10 +158,11 @@ func (a *AudioIO) captureSuppressed() bool {
 	if !koeEnvBool("KOE_VPIO_BARGE_IN", false) {
 		return true
 	}
-	// Hardware AEC removes most playback echo; the fast robot-local DOA gate rejects
-	// the sparse residue that remains. Its window is intentionally sub-second so it
-	// cannot recreate the old multi-second talk-over delay.
-	if !koeEnvBool("KOE_BARGE_PERCEPTION_GATE", true) {
+	// Hardware AEC plus the local energy gate are the primary full-duplex path.
+	// DOA is optional corroborating evidence, not a product hard gate: live tests at
+	// speaker volume 100 showed the XVF can miss real near-end speech while playback
+	// is active. Requiring DOA there makes the robot observably uninterruptible.
+	if !koeEnvBool("KOE_BARGE_PERCEPTION_GATE", false) {
 		return false
 	}
 	return !a.bargeAllowed.Load()
