@@ -1950,15 +1950,15 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 						if audio != nil {
 							audio.SetBargeInAuthorized(cfg.bargeIn && bargeDecision.Authorized)
 						}
+						if conn != nil {
+							conn.SetBargeInAuthorized(cfg.bargeIn && bargeDecision.Authorized)
+						}
 						if cfg.bargeIn && bargeDecision.Changed {
 							state := "closed"
 							if bargeDecision.Authorized {
 								state = "open"
 							}
 							log.Printf("koe[barge]: perception gate=%s reason=%s hits=%d", state, bargeDecision.Reason, bargeDecision.Hits)
-						}
-						if cfg.bargeIn && speaking && bargeDecision.Changed && bargeDecision.Authorized && conn != nil {
-							conn.ObserveBargeReattack()
 						}
 						decision := gazeGate.Update(koe.GazeInput{
 							Now:        snapshot.ObservedAt,

@@ -121,6 +121,10 @@ type eventHandler struct {
 	// playback. The audio is ducked, not destroyed, until transcript evidence
 	// confirms a real interruption or classifies a false positive/backchannel.
 	bargeCandidate atomic.Bool
+	// frontSpeechAuthorized mirrors Reachy's sustained robot-local DOA/VAD gate
+	// into the event handler. A server speech_started event can arrive after the
+	// gate's open transition, so checking only edge callbacks misses real users.
+	frontSpeechAuthorized atomic.Bool
 	// bargeServerCleared records WebRTC's automatic playout truncation after
 	// speech_started. When a candidate is false, Koe asks the same native S2S
 	// session to continue from the unsaid point instead of losing the reply.
@@ -1991,6 +1995,14 @@ func (h *eventHandler) observeFusedBargeReattack() bool {
 	return true
 }
 
+func (h *eventHandler) setBargeInAuthorized(allowed bool) bool {
+	h.frontSpeechAuthorized.Store(allowed)
+	if !allowed {
+		return false
+	}
+	return h.observeFusedBargeReattack()
+}
+
 func (h *eventHandler) requestTurnResponse(itemID string) bool {
 	return h.requestTurnResponseWithInstructions(itemID, "")
 }
@@ -2490,21 +2502,25 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			}
 			reattackLevel := koeEnvFloat("KOE_BARGE_REATTACK_LEVEL", 0.025)
 			freshOnset := afterLocalMS >= 0 && afterLocalMS <= maxOnsetMS
-			withinGateReattack := !freshOnset && inputLevel >= reattackLevel
+			frontSpeechAuthorized := speaking && h.frontSpeechAuthorized.Load()
+			withinGateReattack := !freshOnset && (inputLevel >= reattackLevel || frontSpeechAuthorized)
 			if ev.ItemID != "" && !freshOnset && !withinGateReattack {
 				h.markTurnSuppressedEcho(ev.ItemID)
 				if eventLogEnabled() {
 					log.Printf(
-						"koe[barge]: server VAD ignored — stale local onset after_local_gate_ms=%d after_playback_release_ms=%d input_level=%.4f reattack_level=%.4f",
+						"koe[barge]: server VAD ignored — stale local onset after_local_gate_ms=%d after_playback_release_ms=%d input_level=%.4f reattack_level=%.4f front_speech=%t",
 						afterLocalMS,
 						afterPlaybackMS,
 						inputLevel,
 						reattackLevel,
+						frontSpeechAuthorized,
 					)
 				}
 			} else if speaking && h.beginBargeCandidate() {
 				evidence := "fresh_onset"
-				if withinGateReattack {
+				if frontSpeechAuthorized {
+					evidence = "server_vad_plus_front_speech"
+				} else if withinGateReattack {
 					evidence = "within_gate_reattack"
 				}
 				log.Printf(

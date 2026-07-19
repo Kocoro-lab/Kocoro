@@ -92,7 +92,7 @@ type RealtimeConn struct {
 	cancel               context.CancelFunc
 	audio                *AudioIO
 	interruptOutput      func()
-	observeBargeReattack func() bool
+	setBargeInAuthorized func(bool) bool
 	onLocalSpeechStarted func()
 	onLocalSpeechEnded   func()
 	onRemoteAudio        func([]int16) bool
@@ -786,14 +786,14 @@ func (rc *RealtimeConn) InterruptOutput() bool {
 	return true
 }
 
-// ObserveBargeReattack supplies robot-local front-speech evidence to an already
-// active server-VAD tail item. It is deliberately a no-op unless the event
-// handler has an echo-suppressed VAD item during assistant playback.
-func (rc *RealtimeConn) ObserveBargeReattack() bool {
-	if rc == nil || rc.observeBargeReattack == nil {
+// SetBargeInAuthorized supplies Reachy's sustained front-speech state to the
+// Realtime event handler. It can promote an already-active echo-held server-VAD
+// item, and it also lets a later speech_started event see an earlier gate edge.
+func (rc *RealtimeConn) SetBargeInAuthorized(allowed bool) bool {
+	if rc == nil || rc.setBargeInAuthorized == nil {
 		return false
 	}
-	return rc.observeBargeReattack()
+	return rc.setBargeInAuthorized(allowed)
 }
 
 // MintEphemeral is the exported dev-key mint (C-minimal). The deferred daemon mint relay swaps the body
@@ -1014,7 +1014,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	h.language = opts.Language
 	h.fullDuplexAEC = opts.FullDuplexAEC
 	rc.interruptOutput = h.interruptOutput
-	rc.observeBargeReattack = h.observeFusedBargeReattack
+	rc.setBargeInAuthorized = h.setBargeInAuthorized
 	rc.onLocalSpeechStarted = h.observeLocalSpeechStarted
 	rc.onLocalSpeechEnded = func() { h.observeLocalSpeechEnded(ctx) }
 	rc.callActive = opts.CallActive
