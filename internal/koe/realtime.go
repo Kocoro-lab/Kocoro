@@ -2001,6 +2001,14 @@ func (h *eventHandler) observeFusedBargeReattack() bool {
 	if !h.fullDuplexAEC || !clientOwnsTurnResponse() || !h.isSpeakingOrResponding() {
 		return false
 	}
+	inputLevel := 0.0
+	if h.audio != nil {
+		inputLevel = h.audio.InputLevel()
+	}
+	frontMinLevel := koeEnvFloat("KOE_BARGE_FRONT_MIN_LEVEL", 0.015)
+	if inputLevel < frontMinLevel {
+		return false
+	}
 	h.turnMu.Lock()
 	itemID := h.activeSuppressedEcho
 	if itemID == "" || !h.turnSuppressedEcho[itemID] {
@@ -2014,7 +2022,12 @@ func (h *eventHandler) observeFusedBargeReattack() bool {
 		return false
 	}
 	if eventLogEnabled() {
-		log.Printf("koe[barge]: possible talk-over detected — playback ducked evidence=server_vad_plus_front_speech item=%s", itemID)
+		log.Printf(
+			"koe[barge]: possible talk-over detected — playback ducked evidence=server_vad_plus_front_speech item=%s input_level=%.4f front_min_level=%.4f",
+			itemID,
+			inputLevel,
+			frontMinLevel,
+		)
 	}
 	return true
 }
@@ -2555,23 +2568,26 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			}
 			reattackLevel := koeEnvFloat("KOE_BARGE_REATTACK_LEVEL", 0.025)
 			freshOnset := afterLocalMS >= 0 && afterLocalMS <= maxOnsetMS
+			frontMinLevel := koeEnvFloat("KOE_BARGE_FRONT_MIN_LEVEL", 0.015)
 			frontSpeechAuthorized := speaking && h.frontSpeechAuthorized.Load()
-			withinGateReattack := !freshOnset && (inputLevel >= reattackLevel || frontSpeechAuthorized)
+			frontSpeechEvidence := frontSpeechAuthorized && inputLevel >= frontMinLevel
+			withinGateReattack := !freshOnset && (inputLevel >= reattackLevel || frontSpeechEvidence)
 			if ev.ItemID != "" && !freshOnset && !withinGateReattack {
 				h.markTurnSuppressedEcho(ev.ItemID)
 				if eventLogEnabled() {
 					log.Printf(
-						"koe[barge]: server VAD ignored — stale local onset after_local_gate_ms=%d after_playback_release_ms=%d input_level=%.4f reattack_level=%.4f front_speech=%t",
+						"koe[barge]: server VAD ignored — stale local onset after_local_gate_ms=%d after_playback_release_ms=%d input_level=%.4f reattack_level=%.4f front_speech=%t front_min_level=%.4f",
 						afterLocalMS,
 						afterPlaybackMS,
 						inputLevel,
 						reattackLevel,
 						frontSpeechAuthorized,
+						frontMinLevel,
 					)
 				}
 			} else if speaking && h.beginBargeCandidate() {
 				evidence := "fresh_onset"
-				if frontSpeechAuthorized {
+				if frontSpeechEvidence {
 					evidence = "server_vad_plus_front_speech"
 				} else if withinGateReattack {
 					evidence = "within_gate_reattack"

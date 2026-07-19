@@ -894,7 +894,7 @@ func TestAdaptiveBargePromotesTailVADOnFrontSpeechReattack(t *testing.T) {
 	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
 	h.fullDuplexAEC = true
 	audio.SetSpeaking(true)
-	audio.setInputLevel(0.005)
+	audio.setInputLevel(0.020)
 	h.localSpeechStartedNS.Store(time.Now().Add(-6 * time.Second).UnixNano())
 
 	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-tail-plus-human","audio_start_ms":1000}`))
@@ -946,6 +946,36 @@ func TestAdaptiveBargeUsesExistingFrontSpeechAuthorization(t *testing.T) {
 	}
 	if got := audio.PlaybackGain(); got != 0.05 {
 		t.Fatalf("front-authorized playback gain = %v, want 0.05", got)
+	}
+}
+
+func TestAdaptiveBargeRejectsLowLevelFrontSpeechAuthorization(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_BARGE_FRONT_MIN_LEVEL", "0.015")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-low-front", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetSpeaking(true)
+	h.setBargeInAuthorized(true)
+	audio.setInputLevel(0.010)
+	h.localSpeechStartedNS.Store(time.Now().Add(-9 * time.Second).UnixNano())
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-low-front","audio_start_ms":1000}`))
+
+	if h.bargeCandidate.Load() {
+		t.Fatal("low-level front authorization unexpectedly created a barge candidate")
+	}
+	if !h.turnIsSuppressedEcho("item-low-front") {
+		t.Fatal("low-level front-authorized item was not kept echo-suppressed")
+	}
+	if got := audio.PlaybackGain(); got != 1 {
+		t.Fatalf("low-level front-authorized playback gain = %v, want 1", got)
 	}
 }
 
