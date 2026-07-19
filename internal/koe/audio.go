@@ -45,6 +45,10 @@ type AudioIO struct {
 	// backends, which keep their own render paths. Set by Start(), closed by Stop().
 	otoPlayer *oto.Player
 	speaking  atomic.Bool
+	// earconCaptureMute is stronger than the ordinary speaking gate. Full-duplex
+	// barge-in intentionally keeps capture live while assistant speech plays, but
+	// a product cue is never user-interruptible and must not feed itself to VAD.
+	earconCaptureMute atomic.Bool
 	// userMicOff is the user-initiated "mic off while a do_task runs" gate
 	// (Desktop double-tap / mic button via POST /call/mic). Independent of the
 	// speaking gate on purpose: the response lifecycle flips SetSpeaking
@@ -246,7 +250,7 @@ func ProbeAudioCarrier(string) error {
 // captureSuppressed is the capture-path gate: speaking gate OR user mic off.
 // Both resolve to silent keepalive frames downstream.
 func (a *AudioIO) captureSuppressed() bool {
-	return a.dropCapture() || a.userMicOff.Load() || a.knownOutputCaptureHold.Load()
+	return a.earconCaptureMute.Load() || a.dropCapture() || a.userMicOff.Load() || a.knownOutputCaptureHold.Load()
 }
 
 // CaptureExpected reports whether the mic is currently expected to be capturing
@@ -328,7 +332,7 @@ func (a *AudioIO) shouldForwardVPIOCapture(level float64) bool {
 		a.vpioGateDropped.Add(1)
 		return false
 	}
-	if a.userMicOff.Load() {
+	if a.earconCaptureMute.Load() || a.userMicOff.Load() {
 		// User mic-off outranks everything, including barge-in: never forward while
 		// the user has explicitly asked for silence.
 		a.vpioGateDropped.Add(1)

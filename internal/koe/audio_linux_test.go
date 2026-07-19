@@ -45,6 +45,20 @@ func TestWirelessBargeInPerceptionGateHasExplicitFieldBypass(t *testing.T) {
 	}
 }
 
+func TestWirelessBargeInNeverOverridesEarconCaptureMute(t *testing.T) {
+	a := &AudioIO{}
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	a.SetSpeaking(true)
+	a.earconCaptureMute.Store(true)
+	if !a.captureSuppressed() {
+		t.Fatal("earcon capture mute must outrank full-duplex barge-in")
+	}
+	a.earconCaptureMute.Store(false)
+	if a.captureSuppressed() {
+		t.Fatal("ordinary assistant speech must remain interruptible after the cue")
+	}
+}
+
 func TestWirelessQueuedCaptureIsRegatedAtSendTime(t *testing.T) {
 	a := &AudioIO{}
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
@@ -58,6 +72,45 @@ func TestWirelessQueuedCaptureIsRegatedAtSendTime(t *testing.T) {
 	if got := a.captureFrameForSend(raw); len(got) != len(raw) || got[0] != raw[0] {
 		t.Fatalf("authorized queued frame = %v, want %v", got, raw)
 	}
+}
+
+func TestWirelessPlaybackLevelReturnsIdleAfterFramesDrain(t *testing.T) {
+	koeConn, carrierConn := net.Pipe()
+	defer carrierConn.Close()
+	a, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	a.conn = koeConn
+	a.wg.Add(1)
+	go a.spkPump()
+
+	readDone := make(chan struct{})
+	go func() {
+		_, _, _ = audiobridge.ReadFrame(carrierConn)
+		close(readDone)
+	}()
+	frame := make([]int16, audioFrameSize)
+	for i := range frame {
+		frame[i] = 8000
+	}
+	a.Play(frame)
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for wireless speaker frame")
+	}
+	if a.PlaybackIdle() {
+		t.Fatal("non-silent speaker frame must mark playback active")
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for !a.PlaybackIdle() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !a.PlaybackIdle() {
+		t.Fatal("drained wireless playback retained its final RMS level")
+	}
+	a.Stop()
 }
 
 func TestWirelessInterruptPlaybackSendsCarrierFlush(t *testing.T) {

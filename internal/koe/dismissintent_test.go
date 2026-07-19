@@ -71,7 +71,7 @@ func TestIsDismissPhraseMisses(t *testing.T) {
 }
 
 func TestDismissIntentSeparatesSpeechStopFromConversationEnd(t *testing.T) {
-	for _, phrase := range []string{"停", "闭嘴", "stop", "shut up", "やめて"} {
+	for _, phrase := range []string{"停", "闭嘴", "stop", "shut up", "やめて", "続けなくていいです"} {
 		if !isStopSpeechPhrase(phrase) {
 			t.Errorf("isStopSpeechPhrase(%q) = false, want true", phrase)
 		}

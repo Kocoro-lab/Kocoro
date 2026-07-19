@@ -311,6 +311,21 @@ func TestVPIOBargeInNeverOverridesUserMicOff(t *testing.T) {
 	}
 }
 
+func TestVPIOBargeInNeverOverridesEarconCaptureMute(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	a, _ := NewAudioIO()
+	a.SetSpeaking(true)
+	a.earconCaptureMute.Store(true)
+
+	if a.shouldForwardVPIOCapture(0.9) {
+		t.Fatal("earcon capture mute must outrank full-duplex barge-in")
+	}
+	a.earconCaptureMute.Store(false)
+	if !a.shouldForwardVPIOCapture(0.9) {
+		t.Fatal("ordinary assistant speech must remain interruptible after the cue")
+	}
+}
+
 func TestMicNoiseGateDropsQuietFrames(t *testing.T) {
 	g := newMicNoiseGate()
 	quiet := make([]int16, audioFrameSize)

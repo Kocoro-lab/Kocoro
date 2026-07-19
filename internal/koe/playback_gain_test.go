@@ -3,8 +3,8 @@ package koe
 import "testing"
 
 func TestScalePCMForBargeDuck(t *testing.T) {
-	got := scalePCM([]int16{-1000, 0, 1000}, 0.20)
-	want := []int16{-200, 0, 200}
+	got := scalePCM([]int16{-1000, 0, 1000}, defaultBargeDuckGain)
+	want := []int16{-50, 0, 50}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("scalePCM[%d] = %d, want %d", i, got[i], want[i])

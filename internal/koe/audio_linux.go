@@ -39,18 +39,19 @@ type AudioIO struct {
 	frames  chan []int16
 	playBuf chan []int16
 
-	speaking      atomic.Bool
-	bargeAllowed  atomic.Bool // sustained robot-local DOA/VAD authorized talk-over
-	userMicOff    atomic.Bool
-	userMicSticky atomic.Bool
-	playback      atomic.Bool
-	playbackGain  atomic.Uint64
-	encMu         sync.Mutex
-	decMu         sync.Mutex
-	writeMu       sync.Mutex // serialize speaker and control frames on the UDS
-	stopOnce      sync.Once
-	sendReady     chan struct{}
-	sendReadyOnce sync.Once
+	speaking          atomic.Bool
+	bargeAllowed      atomic.Bool // sustained robot-local DOA/VAD authorized talk-over
+	earconCaptureMute atomic.Bool // unconditional; full-duplex barge-in cannot bypass cues
+	userMicOff        atomic.Bool
+	userMicSticky     atomic.Bool
+	playback          atomic.Bool
+	playbackGain      atomic.Uint64
+	encMu             sync.Mutex
+	decMu             sync.Mutex
+	writeMu           sync.Mutex // serialize speaker and control frames on the UDS
+	stopOnce          sync.Once
+	sendReady         chan struct{}
+	sendReadyOnce     sync.Once
 
 	inLevel  atomic.Uint64
 	outLevel atomic.Uint64
@@ -149,7 +150,7 @@ func (a *AudioIO) UserMicOff() bool        { return a.userMicOff.Load() }
 func (a *AudioIO) SetUserMicSticky(s bool) { a.userMicSticky.Store(s) }
 func (a *AudioIO) UserMicSticky() bool     { return a.userMicSticky.Load() }
 func (a *AudioIO) captureSuppressed() bool {
-	if a.userMicOff.Load() {
+	if a.earconCaptureMute.Load() || a.userMicOff.Load() {
 		return true
 	}
 	if !a.dropCapture() {
@@ -552,6 +553,15 @@ func (a *AudioIO) spkPump() {
 			if err := a.sendFrame(hdr, payload); err != nil {
 				return
 			}
+		case <-time.After(3 * audioFrameMs * time.Millisecond):
+			// Match the Darwin playback backends: once no new speaker frame has
+			// reached the carrier for a short interval, expose an idle level. The
+			// response lifecycle adds its own carrier-tail hold before reopening
+			// capture. Without this reset, Wireless retained the RMS of its final
+			// frame forever whenever Realtime omitted output_buffer.stopped, so a
+			// completed answer remained "speaking" for the 60 s hard cap and the
+			// user's next normal turn was misclassified as barge-in.
+			a.setOutputLevel(0)
 		}
 	}
 }

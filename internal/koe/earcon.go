@@ -98,6 +98,7 @@ func (a *AudioIO) playEarcon(name string, frames [][]int16) {
 	started := time.Now()
 
 	a.knownOutputCaptureHold.Store(true)
+	a.earconCaptureMute.Store(true)
 	a.SetSpeaking(true)
 
 	// Darwin queues the embedded PCM through its normal output path. Wireless
@@ -159,5 +160,6 @@ func (a *AudioIO) playEarcon(name string, frames [][]int16) {
 	a.SetSpeaking(prevSpeaking)
 	a.SetPlaybackEnabled(prevPlayback)
 	a.knownOutputCaptureHold.Store(prevCaptureHold)
+	a.earconCaptureMute.Store(false)
 	log.Printf("koe[earcon]: %s earcon played transport=%s frames=%d dur=%dms", name, transport, len(frames), time.Since(started).Milliseconds())
 }

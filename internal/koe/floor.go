@@ -13,6 +13,7 @@ func nativeFloorControlEnabled(fullDuplexAEC bool) bool {
 	return fullDuplexAEC &&
 		koeEnvBool("KOE_VPIO_BARGE_IN", false) &&
 		NativeFloorEnabled() &&
+		!koeEnvBool("KOE_CLIENT_RESPONSE", false) &&
 		!koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
 }
 

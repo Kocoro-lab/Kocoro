@@ -1,6 +1,10 @@
 package koe
 
-const defaultBargeDuckGain = 0.20
+// Five percent (-26 dB) is deliberately unmistakable at the Wireless product's
+// maximum speaker setting. The joint local-onset + server-VAD gate prevents a
+// single noise impulse from reaching this point, so a confirmed candidate should
+// yield the sound field to the user instead of remaining perceptually loud.
+const defaultBargeDuckGain = 0.05
 
 func clampPlaybackGain(gain float64) float64 {
 	if gain < 0 {
