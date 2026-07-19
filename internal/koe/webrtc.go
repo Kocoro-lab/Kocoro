@@ -641,6 +641,7 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 		gate = newVPIOMicNoiseGate()
 	}
 	gate.observeAmbientLevel(rc.audio.PreCallAmbientRMS())
+	ambientSeeded := rc.audio.PreCallAmbientRMS() > 0
 	defer gate.logStats()
 	stats := &sendTrackStats{}
 	preRoll := newMicPreRoll(micPreRollFrames)
@@ -660,6 +661,15 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case frame := <-rc.audio.Frames():
+			// The send pump can start before Linux AudioIO finishes its carrier
+			// hello. Seed again on the first real frame so a warm call cannot
+			// race past the carrier's already-measured room floor.
+			if !ambientSeeded {
+				if ambient := rc.audio.PreCallAmbientRMS(); ambient > 0 {
+					gate.observeAmbientLevel(ambient)
+					ambientSeeded = true
+				}
+			}
 			// Press-to-talk gate: while no call is active, drop captured mic audio so
 			// OpenAI never hears the room (Koe stays idle). Drain the frame either way
 			// to keep the capture pipeline from backing up.
