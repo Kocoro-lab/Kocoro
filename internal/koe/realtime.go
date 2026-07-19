@@ -140,6 +140,7 @@ type eventHandler struct {
 	// into spoken "could not hear you" loops.
 	localSpeechSeq        atomic.Int64
 	localSpeechStartedNS  atomic.Int64
+	playbackReleasedNS    atomic.Int64
 	localStartCommitSeq   atomic.Int64
 	localStartResponseSeq atomic.Int64
 	inputCommitSeq        atomic.Int64
@@ -397,6 +398,7 @@ func (h *eventHandler) releaseSpeakingAfter(delay time.Duration) {
 			h.audio.SetSpeaking(false)
 			h.audio.SetPlaybackEnabled(false)
 		}
+		h.playbackReleasedNS.Store(time.Now().UnixNano())
 		h.maybeRestoreUserMic()
 		h.emitVoiceState(h.voiceStateAfterSpeaking())
 	}()
@@ -463,6 +465,7 @@ func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 			h.audio.SetSpeaking(false)
 			h.audio.SetPlaybackEnabled(false)
 		}
+		h.playbackReleasedNS.Store(time.Now().UnixNano())
 		h.maybeRestoreUserMic()
 		h.emitVoiceState(h.voiceStateAfterSpeaking())
 	}()
@@ -553,6 +556,7 @@ func (h *eventHandler) stopOutput(keepInput bool) {
 		h.audio.InterruptPlayback()
 		playbackFlush = time.Since(flushStarted)
 	}
+	h.playbackReleasedNS.Store(time.Now().UnixNano())
 	if !keepInput {
 		_ = h.sendFn(map[string]any{"type": "input_audio_buffer.clear"})
 	}
@@ -2419,8 +2423,17 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if startedNS := h.localSpeechStartedNS.Load(); startedNS > 0 {
 			afterLocalMS = time.Since(time.Unix(0, startedNS)).Milliseconds()
 		}
+		afterPlaybackMS := int64(-1)
+		if releasedNS := h.playbackReleasedNS.Load(); releasedNS > 0 {
+			afterPlaybackMS = time.Since(time.Unix(0, releasedNS)).Milliseconds()
+		}
 		if timingLogEnabled() {
-			log.Printf("koe[timing]: speech_started item=%s after_local_gate_ms=%d", ev.ItemID, afterLocalMS)
+			log.Printf(
+				"koe[timing]: speech_started item=%s after_local_gate_ms=%d after_playback_release_ms=%d",
+				ev.ItemID,
+				afterLocalMS,
+				afterPlaybackMS,
+			)
 		}
 		// During playback, fuse two independent detectors. Server VAD alone can
 		// recognize delayed speaker echo as a short foreign-language utterance at
@@ -2431,43 +2444,44 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// however, so a second real utterance has no new open edge. In that case a
 		// high current mic level is accepted as a within-gate reattack, still fused
 		// with server VAD. Low-level stale echo remains transcript-gated.
-		if providerBargeInEnabled(h.provider) && h.isSpeakingOrResponding() {
-			if h.pauseForNativeFloor() {
-				log.Printf("koe[barge]: talk-over detected — playback paused for native floor decision")
-			} else if !clientOwnsTurnResponse() {
-				log.Printf("koe[barge]: legacy talk-over detected — stopping playback")
-				h.bargeInStopPlayback()
-			} else {
-				maxOnsetMS := int64(koeEnvInt("KOE_BARGE_LOCAL_ONSET_MAX_MS", 1000))
-				inputLevel := 0.0
-				if h.audio != nil {
-					inputLevel = h.audio.InputLevel()
-				}
-				reattackLevel := koeEnvFloat("KOE_BARGE_REATTACK_LEVEL", 0.025)
-				freshOnset := afterLocalMS >= 0 && afterLocalMS <= maxOnsetMS
-				withinGateReattack := !freshOnset && inputLevel >= reattackLevel
-				if ev.ItemID != "" && !freshOnset && !withinGateReattack {
-					h.markTurnSuppressedEcho(ev.ItemID)
-					if eventLogEnabled() {
-						log.Printf(
-							"koe[barge]: server VAD ignored — stale local onset after_local_gate_ms=%d input_level=%.4f reattack_level=%.4f",
-							afterLocalMS,
-							inputLevel,
-							reattackLevel,
-						)
-					}
-				} else if h.beginBargeCandidate() {
-					h.bargeServerVAD.Store(true)
-					evidence := "fresh_onset"
-					if withinGateReattack {
-						evidence = "within_gate_reattack"
-					}
+		speaking := h.isSpeakingOrResponding()
+		postPlaybackEchoMS := int64(koeEnvInt("KOE_POST_PLAYBACK_ECHO_MS", 1500))
+		recentPlaybackTail := !speaking && afterPlaybackMS >= 0 && afterPlaybackMS <= postPlaybackEchoMS
+		if providerBargeInEnabled(h.provider) && speaking && h.pauseForNativeFloor() {
+			log.Printf("koe[barge]: talk-over detected — playback paused for native floor decision")
+		} else if providerBargeInEnabled(h.provider) && speaking && !clientOwnsTurnResponse() {
+			log.Printf("koe[barge]: legacy talk-over detected — stopping playback")
+			h.bargeInStopPlayback()
+		} else if providerBargeInEnabled(h.provider) && (speaking || recentPlaybackTail) {
+			maxOnsetMS := int64(koeEnvInt("KOE_BARGE_LOCAL_ONSET_MAX_MS", 1000))
+			inputLevel := 0.0
+			if h.audio != nil {
+				inputLevel = h.audio.InputLevel()
+			}
+			reattackLevel := koeEnvFloat("KOE_BARGE_REATTACK_LEVEL", 0.025)
+			freshOnset := afterLocalMS >= 0 && afterLocalMS <= maxOnsetMS
+			withinGateReattack := !freshOnset && inputLevel >= reattackLevel
+			if ev.ItemID != "" && !freshOnset && !withinGateReattack {
+				h.markTurnSuppressedEcho(ev.ItemID)
+				if eventLogEnabled() {
 					log.Printf(
-						"koe[barge]: possible talk-over detected — playback ducked evidence=%s input_level=%.4f",
-						evidence,
+						"koe[barge]: server VAD ignored — stale local onset after_local_gate_ms=%d after_playback_release_ms=%d input_level=%.4f reattack_level=%.4f",
+						afterLocalMS,
+						afterPlaybackMS,
 						inputLevel,
+						reattackLevel,
 					)
 				}
+			} else if speaking && h.beginBargeCandidate() {
+				evidence := "fresh_onset"
+				if withinGateReattack {
+					evidence = "within_gate_reattack"
+				}
+				log.Printf(
+					"koe[barge]: possible talk-over detected — playback ducked evidence=%s input_level=%.4f",
+					evidence,
+					inputLevel,
+				)
 			}
 		}
 		h.emitVoiceState("listening")

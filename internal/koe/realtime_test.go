@@ -844,6 +844,68 @@ func TestAdaptiveBargeDucksLoudWithinGateReattack(t *testing.T) {
 	}
 }
 
+func TestAdaptiveBargeSuppressesShortPostPlaybackEcho(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_POST_PLAYBACK_ECHO_MS", "1500")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-post-playback-echo", "")
+	sender := &captureSender{}
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, sender.send)
+	h.fullDuplexAEC = true
+	audio.setInputLevel(0.005)
+	h.localSpeechStartedNS.Store(time.Now().Add(-6 * time.Second).UnixNano())
+	h.playbackReleasedNS.Store(time.Now().Add(-500 * time.Millisecond).UnixNano())
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-tail-echo","audio_start_ms":1000}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-tail-echo","audio_end_ms":2500}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-tail-echo","transcript":"유신정권"}`))
+
+	if got := len(h.respReq); got != 0 {
+		t.Fatalf("post-playback echo queued %d responses", got)
+	}
+	deletes := 0
+	sender.mu.Lock()
+	for _, m := range sender.sent {
+		if m["type"] == "conversation.item.delete" && m["item_id"] == "item-tail-echo" {
+			deletes++
+		}
+	}
+	sender.mu.Unlock()
+	if deletes != 1 {
+		t.Fatalf("post-playback echo sent %d conversation.item.delete messages, want 1", deletes)
+	}
+}
+
+func TestAdaptiveBargeAcceptsFreshSpeechAfterPlayback(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-post-playback-human", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	h.playbackReleasedNS.Store(time.Now().Add(-500 * time.Millisecond).UnixNano())
+	h.observeLocalSpeechStarted()
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-next-human","audio_start_ms":1000}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-next-human","audio_end_ms":2200}`))
+
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("fresh post-playback speech queued %d responses, want 1", got)
+	}
+	if h.turnIsSuppressedEcho("item-next-human") {
+		t.Fatal("fresh post-playback speech was classified as echo")
+	}
+}
+
 func TestAdaptiveBargeAcceptsMeaningfulJapaneseQuestionWithStaleLocalOnset(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_CLIENT_RESPONSE", "1")
