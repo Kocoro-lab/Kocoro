@@ -881,6 +881,44 @@ func TestAdaptiveBargeSuppressesShortPostPlaybackEcho(t *testing.T) {
 	}
 }
 
+func TestAdaptiveBargePromotesTailVADOnFrontSpeechReattack(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_BARGE_DUCK_GAIN", "0.05")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-tail-reattack", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetSpeaking(true)
+	audio.setInputLevel(0.005)
+	h.localSpeechStartedNS.Store(time.Now().Add(-6 * time.Second).UnixNano())
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-tail-plus-human","audio_start_ms":1000}`))
+	if h.bargeCandidate.Load() {
+		t.Fatal("low-level tail unexpectedly created a barge candidate")
+	}
+	if !h.turnIsSuppressedEcho("item-tail-plus-human") {
+		t.Fatal("low-level tail was not initially suppressed")
+	}
+
+	if !h.observeFusedBargeReattack() {
+		t.Fatal("front-speech reattack did not promote the active server-VAD item")
+	}
+	if !h.bargeCandidate.Load() {
+		t.Fatal("front-speech reattack did not create a barge candidate")
+	}
+	if h.turnIsSuppressedEcho("item-tail-plus-human") {
+		t.Fatal("promoted server-VAD item remained echo-suppressed")
+	}
+	if got := audio.PlaybackGain(); got != 0.05 {
+		t.Fatalf("promoted playback gain = %v, want 0.05", got)
+	}
+}
+
 func TestAdaptiveBargeAcceptsFreshSpeechAfterPlayback(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_CLIENT_RESPONSE", "1")

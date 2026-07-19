@@ -92,6 +92,7 @@ type RealtimeConn struct {
 	cancel               context.CancelFunc
 	audio                *AudioIO
 	interruptOutput      func()
+	observeBargeReattack func() bool
 	onLocalSpeechStarted func()
 	onLocalSpeechEnded   func()
 	onRemoteAudio        func([]int16) bool
@@ -785,6 +786,16 @@ func (rc *RealtimeConn) InterruptOutput() bool {
 	return true
 }
 
+// ObserveBargeReattack supplies robot-local front-speech evidence to an already
+// active server-VAD tail item. It is deliberately a no-op unless the event
+// handler has an echo-suppressed VAD item during assistant playback.
+func (rc *RealtimeConn) ObserveBargeReattack() bool {
+	if rc == nil || rc.observeBargeReattack == nil {
+		return false
+	}
+	return rc.observeBargeReattack()
+}
+
 // MintEphemeral is the exported dev-key mint (C-minimal). The deferred daemon mint relay swaps the body
 // for a via-daemon call; the signature stays so cmd/koe.go is unchanged.
 // DEV-KEY: replaced by the deferred daemon mint relay (→ Plan D Cloud mint).
@@ -1003,6 +1014,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	h.language = opts.Language
 	h.fullDuplexAEC = opts.FullDuplexAEC
 	rc.interruptOutput = h.interruptOutput
+	rc.observeBargeReattack = h.observeFusedBargeReattack
 	rc.onLocalSpeechStarted = h.observeLocalSpeechStarted
 	rc.onLocalSpeechEnded = func() { h.observeLocalSpeechEnded(ctx) }
 	rc.callActive = opts.CallActive

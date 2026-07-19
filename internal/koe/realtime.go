@@ -156,6 +156,7 @@ type eventHandler struct {
 	vadStartMS            map[string]int
 	vadDurationMS         map[string]int
 	turnSuppressedEcho    map[string]bool
+	activeSuppressedEcho  string
 	turnResponseRequested map[string]bool
 	turnResponseCanceled  map[string]bool
 	// commitEmptySeq counts input_audio_buffer_commit_empty rejections. The
@@ -1949,6 +1950,7 @@ func (h *eventHandler) markTurnSuppressedEcho(itemID string) {
 	}
 	h.turnMu.Lock()
 	h.turnSuppressedEcho[itemID] = true
+	h.activeSuppressedEcho = itemID
 	h.turnMu.Unlock()
 }
 
@@ -1959,6 +1961,34 @@ func (h *eventHandler) turnIsSuppressedEcho(itemID string) bool {
 	h.turnMu.Lock()
 	defer h.turnMu.Unlock()
 	return h.turnSuppressedEcho[itemID]
+}
+
+// observeFusedBargeReattack promotes a low-level playback-tail VAD item when the
+// robot-local front-speech gate subsequently sees a real user. The tail and the
+// user can occupy one continuous server-VAD item, so waiting for a second
+// speech_started event would never duck. This still requires two independent
+// signals (an active server-VAD item plus sustained front-directed robot speech);
+// robot-local noise alone cannot change playback.
+func (h *eventHandler) observeFusedBargeReattack() bool {
+	if !h.fullDuplexAEC || !clientOwnsTurnResponse() || !h.isSpeakingOrResponding() {
+		return false
+	}
+	h.turnMu.Lock()
+	itemID := h.activeSuppressedEcho
+	if itemID == "" || !h.turnSuppressedEcho[itemID] {
+		h.turnMu.Unlock()
+		return false
+	}
+	h.turnSuppressedEcho[itemID] = false
+	h.activeSuppressedEcho = ""
+	h.turnMu.Unlock()
+	if !h.beginBargeCandidate() {
+		return false
+	}
+	if eventLogEnabled() {
+		log.Printf("koe[barge]: possible talk-over detected — playback ducked evidence=server_vad_plus_front_speech item=%s", itemID)
+	}
+	return true
 }
 
 func (h *eventHandler) requestTurnResponse(itemID string) bool {
@@ -2490,6 +2520,11 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		h.speechStoppedAt = time.Now()
 		h.resultMailbox.Wake()
 		speechMS := int64(h.noteVADStop(ev.ItemID, ev.AudioEnd))
+		h.turnMu.Lock()
+		if h.activeSuppressedEcho == ev.ItemID {
+			h.activeSuppressedEcho = ""
+		}
+		h.turnMu.Unlock()
 		if speechMS < 0 {
 			speechMS = elapsedMS(h.speechStartedAt, h.speechStoppedAt)
 		}
