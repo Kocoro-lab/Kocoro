@@ -2106,6 +2106,19 @@ func shouldAttachBargeTranscriptEvidence(transcript string) bool {
 	return false
 }
 
+func hasUnsupportedShortTurnScript(transcript string) bool {
+	for _, r := range transcript {
+		if !unicode.IsLetter(r) {
+			continue
+		}
+		if unicode.In(r, unicode.Latin, unicode.Han, unicode.Hiragana, unicode.Katakana) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (h *eventHandler) cancelRequestedTurnResponse(itemID string) {
 	if itemID == "" || h.respBusy.Load() {
 		return
@@ -2985,6 +2998,27 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 	if h.onUserTranscript != nil {
 		h.onUserTranscript(transcript)
 	}
+	speechMS := elapsedMS(h.speechStartedAt, h.speechStoppedAt)
+	if duration, ok := h.vadDuration(itemID); ok {
+		speechMS = int64(duration)
+	}
+	// At volume 100, rare quiet-room fragments have transcribed as short Tamil
+	// or Hangul words even though nobody spoke. Kocoro's supported conversational
+	// scripts are Chinese/Japanese/Latin; suppress only bounded foreign-script
+	// fragments so real longer multilingual audio can still reach native S2S.
+	unsupportedMaxMS := int64(koeEnvInt("KOE_UNSUPPORTED_SCRIPT_MAX_MS", 2500))
+	if speechMS >= 0 && speechMS <= unsupportedMaxMS && hasUnsupportedShortTurnScript(transcript) {
+		if eventLogEnabled() {
+			log.Printf("koe[turn]: unsupported-script short fragment — suppressing response")
+		}
+		h.cancelRequestedTurnResponse(itemID)
+		if h.isSpeakingOrResponding() {
+			h.interruptOutput()
+		}
+		h.deleteInputItem(itemID)
+		h.emitVoiceState("listening")
+		return
+	}
 	// The raw-audio floor controller is authoritative when available. Provider
 	// paths without that controller use completed ASR for exact dismiss phrases.
 	// The explicit environment value remains a kill switch in either direction.
@@ -3042,10 +3076,6 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 	// or room transient, not a usable conversational turn. Server-owned response
 	// creation can already be racing, so cancel it and remove the empty input item
 	// before it turns into a spoken "I didn't hear you" loop.
-	speechMS := elapsedMS(h.speechStartedAt, h.speechStoppedAt)
-	if duration, ok := h.vadDuration(itemID); ok {
-		speechMS = int64(duration)
-	}
 	if strings.TrimSpace(transcript) == "" && speechMS >= 0 && speechMS <= 1200 {
 		if eventLogEnabled() {
 			log.Printf("koe[turn]: short empty transcript — suppressing response")

@@ -1134,6 +1134,46 @@ func TestAdaptiveBargeDoesNotInjectUnmarkedASRNumbers(t *testing.T) {
 	}
 }
 
+func TestClientOwnedSuppressesUnsupportedScriptQuietFragment(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_EAGER_RESPONSE_MIN_SPEECH_MS", "1800")
+	state := NewCallState("burst-quiet-foreign-fragment", "")
+	sender := &captureSender{}
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, nil, sender.send)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-quiet","audio_start_ms":1000}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-quiet","audio_end_ms":2704}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-quiet","transcript":"பயம்."}`))
+
+	if got := len(h.respReq); got != 0 {
+		t.Fatalf("unsupported-script quiet fragment queued %d responses, want 0", got)
+	}
+	if got := sender.countType("conversation.item.delete"); got != 1 {
+		t.Fatalf("unsupported-script quiet fragment sent %d deletes, want 1", got)
+	}
+}
+
+func TestUnsupportedScriptQuietFragmentCancelsCreatedResponse(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	state := NewCallState("burst-quiet-created-response", "")
+	sender := &captureSender{}
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, nil, sender.send)
+	h.respBusy.Store(true)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-korean-noise","audio_start_ms":1000}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-korean-noise","audio_end_ms":2576}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-korean-noise","transcript":"쟤들 뭐야?"}`))
+
+	if got := sender.countType("response.cancel"); got != 1 {
+		t.Fatalf("created unsupported-script response sent %d cancels, want 1", got)
+	}
+	if got := sender.countType("conversation.item.delete"); got != 1 {
+		t.Fatalf("created unsupported-script response sent %d deletes, want 1", got)
+	}
+}
+
 func sentContains(types []string, want string) bool {
 	for _, t := range types {
 		if t == want {
