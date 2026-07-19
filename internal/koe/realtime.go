@@ -124,6 +124,11 @@ type eventHandler struct {
 	// speech_started. When a candidate is false, Koe asks the same native S2S
 	// session to continue from the unsaid point instead of losing the reply.
 	bargeServerCleared atomic.Bool
+	// bargeServerVAD distinguishes an immediate local-energy duck from a candidate
+	// that Realtime has confirmed as overlapping speech. Local evidence controls
+	// perceived latency; server VAD and transcription still own the destructive
+	// interruption decision.
+	bargeServerVAD atomic.Bool
 	// asyncTaskPending keeps Desktop/--once in "thinking" after the model's short
 	// spoken ack while do_task is still running or its result speech is queued.
 	asyncTaskPending atomic.Bool
@@ -468,6 +473,7 @@ func (h *eventHandler) beginBargeCandidate() bool {
 		return true
 	}
 	h.bargeServerCleared.Store(false)
+	h.bargeServerVAD.Store(false)
 	gain := clampPlaybackGain(koeEnvFloat("KOE_BARGE_DUCK_GAIN", defaultBargeDuckGain))
 	if h.audio != nil {
 		h.audio.SetPlaybackGain(gain)
@@ -482,6 +488,7 @@ func (h *eventHandler) resumeBargeCandidate(reason string) bool {
 	if !h.bargeCandidate.Swap(false) {
 		return false
 	}
+	h.bargeServerVAD.Store(false)
 	if h.audio != nil {
 		h.audio.SetPlaybackGain(1)
 	}
@@ -499,6 +506,7 @@ func (h *eventHandler) resumeBargeCandidate(reason string) bool {
 func (h *eventHandler) confirmBargeCandidate() {
 	h.bargeCandidate.Store(false)
 	h.bargeServerCleared.Store(false)
+	h.bargeServerVAD.Store(false)
 	if h.audio != nil {
 		h.audio.SetPlaybackGain(1)
 	}
@@ -514,6 +522,7 @@ func (h *eventHandler) confirmBargeCandidate() {
 func (h *eventHandler) stopOutput(keepInput bool) {
 	h.bargeCandidate.Store(false)
 	h.bargeServerCleared.Store(false)
+	h.bargeServerVAD.Store(false)
 	hadResponse := h.respBusy.Load()
 	hadOutput := h.outputBufferActive.Load()
 	if h.audio != nil && h.audio.dropCapture() {
@@ -572,6 +581,14 @@ func (h *eventHandler) observeLocalSpeechStarted() {
 	if eventLogEnabled() {
 		log.Printf("koe[timing]: mic_gate_open seq=%d", seq)
 	}
+	// Perceived barge-in latency must not wait for a cloud VAD round trip. Duck
+	// on the AEC-cleaned local energy gate, then let server VAD + transcript
+	// confirm whether playback should be destroyed or restored.
+	if koeEnvBool("KOE_VPIO_BARGE_IN", false) && h.isSpeakingOrResponding() && h.beginBargeCandidate() {
+		if eventLogEnabled() {
+			log.Printf("koe[barge]: local speech candidate — playback ducked")
+		}
+	}
 }
 
 // taskInFlight reports whether a back-brain do_task is actually running.
@@ -613,6 +630,7 @@ func (h *eventHandler) maybeRestoreUserMic() {
 func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 	h.userSpeaking.Store(false)
 	h.resultMailbox.Wake()
+	h.resumeUnconfirmedLocalBarge(ctx, h.localSpeechSeq.Load())
 	if !koeEnvBool("KOE_LOCAL_COMMIT_FALLBACK", false) {
 		return
 	}
@@ -712,6 +730,26 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 			purpose:      responsePurposeSynthetic,
 			toolMode:     responseToolsDisabled,
 		})
+	}()
+}
+
+func (h *eventHandler) resumeUnconfirmedLocalBarge(ctx context.Context, seq int64) {
+	if !h.bargeCandidate.Load() || h.bargeServerVAD.Load() {
+		return
+	}
+	delay := time.Duration(koeEnvInt("KOE_BARGE_LOCAL_CONFIRM_MS", 400)) * time.Millisecond
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if h.localSpeechSeq.Load() != seq || !h.bargeCandidate.Load() || h.bargeServerVAD.Load() {
+			return
+		}
+		h.resumeBargeCandidate("local speech not confirmed by server VAD")
 	}()
 }
 
@@ -2260,6 +2298,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			if h.pauseForNativeFloor() {
 				log.Printf("koe[barge]: talk-over detected — playback paused for native floor decision")
 			} else if h.beginBargeCandidate() {
+				h.bargeServerVAD.Store(true)
 				log.Printf("koe[barge]: possible talk-over detected — playback ducked")
 			} else {
 				log.Printf("koe[barge]: legacy talk-over detected — stopping playback")
@@ -2339,6 +2378,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 		h.bargeCandidate.Store(false)
 		h.bargeServerCleared.Store(false)
+		h.bargeServerVAD.Store(false)
 		if h.audio != nil {
 			h.audio.SetPlaybackGain(1)
 		}

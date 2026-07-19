@@ -710,6 +710,63 @@ func TestAdaptiveBargeBackchannelResumesBufferedPlayback(t *testing.T) {
 	}
 }
 
+func TestAdaptiveBargeDucksOnLocalSpeechBeforeServerVAD(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-local-duck", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.observeLocalSpeechStarted()
+
+	if !h.bargeCandidate.Load() {
+		t.Fatal("local speech did not create a barge candidate")
+	}
+	if h.bargeServerVAD.Load() {
+		t.Fatal("local speech must not masquerade as server VAD confirmation")
+	}
+	if got := audio.PlaybackGain(); got != defaultBargeDuckGain {
+		t.Fatalf("local candidate playback gain = %v, want %v", got, defaultBargeDuckGain)
+	}
+}
+
+func TestAdaptiveBargeRestoresUnconfirmedLocalSpeech(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_BARGE_LOCAL_CONFIRM_MS", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-local-false-positive", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h.observeLocalSpeechStarted()
+	h.observeLocalSpeechEnded(ctx)
+
+	waitUntil(t, func() bool { return !h.bargeCandidate.Load() }, "unconfirmed local duck did not resume")
+	if got := audio.PlaybackGain(); got != 1 {
+		t.Fatalf("restored playback gain = %v, want 1", got)
+	}
+}
+
 func TestAdaptiveBargeMeaningfulSpeechConfirmsAndQueuesResponse(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_NATIVE_FLOOR", "0")
