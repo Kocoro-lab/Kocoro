@@ -416,6 +416,7 @@ func (h *eventHandler) releaseSpeakingAfter(delay time.Duration) {
 			return
 		}
 		if h.audio != nil {
+			h.audio.SetPlaybackGain(1)
 			h.audio.SetSpeaking(false)
 			h.audio.SetPlaybackEnabled(false)
 		}
@@ -483,6 +484,7 @@ func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 		h.remoteAudioTailUntil.Store(0)
 		h.outputBufferActive.Store(false)
 		if h.audio != nil {
+			h.audio.SetPlaybackGain(1)
 			h.audio.SetSpeaking(false)
 			h.audio.SetPlaybackEnabled(false)
 		}
@@ -2182,12 +2184,15 @@ func (h *eventHandler) setBargeInAuthorized(allowed bool) bool {
 	}
 	changed := h.observeFusedBargeReattack()
 	// A sustained front-speech decision already combines multiple XVF samples.
-	// Let it soft-duck before the cloud VAD round trip when the post-AEC mic level
-	// is non-trivial. The candidate remains reversible until server VAD arrives.
+	// Let it soft-duck before the cloud VAD round trip only when the post-AEC mic
+	// level is strong. At speaker volume 100, Reachy's own reply can satisfy the
+	// directional VAD and reach ~0.019 even after AEC; the weaker
+	// KOE_BARGE_FRONT_MIN_LEVEL remains valid once server VAD independently
+	// corroborates the same input item.
 	if h.audio != nil && h.isSpeakingOrResponding() {
 		inputLevel := h.audio.InputLevel()
-		frontMinLevel := koeEnvFloat("KOE_BARGE_FRONT_MIN_LEVEL", 0.015)
-		if inputLevel >= frontMinLevel {
+		frontDuckLevel := koeEnvFloat("KOE_BARGE_FRONT_DUCK_LEVEL", 0.030)
+		if inputLevel >= frontDuckLevel {
 			gain := koeEnvFloat("KOE_BARGE_SOFT_DUCK_GAIN", defaultBargeSoftDuckGain)
 			if h.beginBargeCandidate(gain, false, "sustained_front_speech") {
 				changed = true
@@ -3191,6 +3196,13 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 				log.Printf("koe[floor]: output_stopped deferred while playback is paused")
 			}
 			return
+		}
+		// Duck is meaningful only while assistant audio is playing. A candidate
+		// can outlive the output marker while its transcript is still being
+		// classified; restore amplitude here without discarding that control
+		// evidence so a later turn can never inherit a stale 35% gain.
+		if h.audio != nil {
+			h.audio.SetPlaybackGain(1)
 		}
 		if !h.outputBufferActive.Swap(false) {
 			if eventLogEnabled() {

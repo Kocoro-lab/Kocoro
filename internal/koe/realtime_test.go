@@ -813,6 +813,34 @@ func TestAdaptiveBargeRestoresUnconfirmedLocalSoftDuck(t *testing.T) {
 	}
 }
 
+func TestAdaptiveBargeOutputStopAlwaysRestoresDuckGain(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-output-stop-restores-duck", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	h.beginBargeCandidate(defaultBargeSoftDuckGain, false, "test")
+
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.stopped"}`))
+
+	if got := audio.PlaybackGain(); got != 1 {
+		t.Fatalf("output stop left playback gain at %v, want 1", got)
+	}
+	if !h.bargeCandidate.Load() {
+		t.Fatal("output stop discarded the pending transcript classification")
+	}
+}
+
 func TestAdaptiveBargeDucksWhenServerVADConfirmsSpeech(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_CLIENT_RESPONSE", "1")
@@ -838,6 +866,44 @@ func TestAdaptiveBargeDucksWhenServerVADConfirmsSpeech(t *testing.T) {
 	}
 	if got := audio.PlaybackGain(); got != defaultBargeSoftDuckGain {
 		t.Fatalf("server VAD playback gain = %v, want %v", got, defaultBargeSoftDuckGain)
+	}
+}
+
+func TestAdaptiveBargeRequiresStrongLevelForFrontSpeechOnlyDuck(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_BARGE_FRONT_MIN_LEVEL", "0.015")
+	t.Setenv("KOE_BARGE_FRONT_DUCK_LEVEL", "0.030")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-front-only-floor", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	audio.setInputLevel(0.019) // observed self-playback level at volume 100
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	if h.setBargeInAuthorized(true) {
+		t.Fatal("front speech below the uncorroborated floor changed barge state")
+	}
+	if h.bargeCandidate.Load() {
+		t.Fatal("front speech alone created a barge candidate below its duck floor")
+	}
+	if got := audio.PlaybackGain(); got != 1 {
+		t.Fatalf("front speech alone changed playback gain to %v", got)
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-front-corroborated","audio_start_ms":1000}`))
+	if !h.bargeCandidate.Load() {
+		t.Fatal("front speech plus server VAD did not create a barge candidate")
+	}
+	if got := audio.PlaybackGain(); got != defaultBargeSoftDuckGain {
+		t.Fatalf("corroborated front speech gain = %v, want %v", got, defaultBargeSoftDuckGain)
 	}
 }
 
