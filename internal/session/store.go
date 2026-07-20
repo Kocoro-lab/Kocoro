@@ -251,8 +251,12 @@ func FilterInjected(msgs []client.Message, meta []MessageMeta) []client.Message 
 }
 
 type SessionSummary struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	// CWD is the immutable working directory captured for the session. It is
+	// always emitted (empty for legacy/unlinked sessions) so Desktop can derive
+	// project groups without issuing one GET /sessions/{id} request per row.
+	CWD       string    `json:"cwd"`
 	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt is the timestamp of the most recent activity in the session
 	// (mirrors Session.UpdatedAt). Drives list ordering in GET /sessions so
@@ -660,6 +664,7 @@ func (s *Store) List() ([]SessionSummary, error) {
 		summaries = append(summaries, SessionSummary{
 			ID:        sess.ID,
 			Title:     sess.Title,
+			CWD:       sess.CWD,
 			CreatedAt: sess.CreatedAt,
 			UpdatedAt: sess.UpdatedAt,
 			MsgCount:  len(sess.Messages),

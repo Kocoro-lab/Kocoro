@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,10 +16,15 @@ import (
 // seedSession writes a session with one user message into sessionsDir and
 // returns its ID.
 func seedSession(t *testing.T, sessionsDir, title, text string) string {
+	return seedSessionWithCWD(t, sessionsDir, title, text, "")
+}
+
+func seedSessionWithCWD(t *testing.T, sessionsDir, title, text, cwd string) string {
 	t.Helper()
 	mgr := session.NewManager(sessionsDir)
 	sess := mgr.NewSession()
 	sess.Title = title
+	sess.CWD = cwd
 	sess.Messages = append(sess.Messages,
 		client.Message{Role: "user", Content: client.NewTextContent(text)})
 	if err := mgr.Save(); err != nil {
@@ -107,9 +113,11 @@ func TestHandleSessionSearch_ScopeAll(t *testing.T) {
 	shannonDir := filepath.Join(dir, "shannon")
 	agentsDir := filepath.Join(shannonDir, "agents")
 
-	seedSession(t, filepath.Join(shannonDir, "sessions"), "default chat", "pineapple in default")
+	defaultCWD := filepath.Join(dir, "projects", "default")
+	agentCWD := filepath.Join(dir, "projects", "agent")
+	seedSessionWithCWD(t, filepath.Join(shannonDir, "sessions"), "default chat", "pineapple in default", defaultCWD)
 	agentSlug := "agent-xyz789"
-	seedSession(t, filepath.Join(agentsDir, agentSlug, "sessions"), "agent chat", "pineapple in agent")
+	seedSessionWithCWD(t, filepath.Join(agentsDir, agentSlug, "sessions"), "agent chat", "pineapple in agent", agentCWD)
 	writeAgentDefinition(t, agentsDir, agentSlug)
 
 	s := &Server{deps: &ServerDeps{
@@ -136,6 +144,69 @@ func TestHandleSessionSearch_ScopeAll(t *testing.T) {
 	}
 	if !agentsSeen[""] || !agentsSeen[agentSlug] {
 		t.Fatalf("expected hits from both default and %q, got: %s", agentSlug, rr.Body.String())
+	}
+	for _, result := range resp.Results {
+		if result.CWD == "" || result.UpdatedAt.IsZero() {
+			t.Fatalf("search result lost project/activity context: %+v", result)
+		}
+	}
+
+	filteredReq := httptest.NewRequest(http.MethodGet, "/sessions/search?scope=all&q=pineapple&project_cwd="+url.QueryEscape(agentCWD), nil)
+	filteredRR := httptest.NewRecorder()
+	s.handleSessionSearch(filteredRR, filteredReq)
+	if err := json.Unmarshal(filteredRR.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode filtered search: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Agent != agentSlug || resp.Results[0].CWD != agentCWD {
+		t.Fatalf("project-filtered search = %+v", resp.Results)
+	}
+}
+
+func TestHandleSessions_ProjectCatalogAndFilter(t *testing.T) {
+	dir := t.TempDir()
+	shannonDir := filepath.Join(dir, "shannon")
+	agentsDir := filepath.Join(shannonDir, "agents")
+	orgCWD := filepath.Join(dir, "work", "org")
+	skillsCWD := filepath.Join(dir, "work", "skills")
+
+	orgID := seedSessionWithCWD(t, filepath.Join(shannonDir, "sessions"), "org", "organization", orgCWD)
+	seedSessionWithCWD(t, filepath.Join(shannonDir, "sessions"), "skills", "competency", skillsCWD)
+	seedSession(t, filepath.Join(shannonDir, "sessions"), "legacy", "no cwd")
+
+	s := &Server{deps: &ServerDeps{
+		ShannonDir:   shannonDir,
+		AgentsDir:    agentsDir,
+		SessionCache: NewSessionCache(shannonDir),
+	}}
+	req := httptest.NewRequest(http.MethodGet, "/sessions?scope=all&project_cwd="+url.QueryEscape(orgCWD), nil)
+	rr := httptest.NewRecorder()
+	s.handleSessions(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Sessions []session.SessionSummary `json:"sessions"`
+		Projects []sessionProjectSummary  `json:"projects"`
+		Total    int                      `json:"total"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Sessions) != 1 || resp.Sessions[0].ID != orgID || resp.Sessions[0].CWD != orgCWD {
+		t.Fatalf("project filter = %+v, want only %s", resp.Sessions, orgID)
+	}
+	if resp.Total != 1 || len(resp.Projects) != 3 {
+		t.Fatalf("total/projects = %d/%d, want 1/3", resp.Total, len(resp.Projects))
+	}
+
+	// A present-but-empty filter addresses the legacy/unlinked project.
+	rr = httptest.NewRecorder()
+	s.handleSessions(rr, httptest.NewRequest(http.MethodGet, "/sessions?scope=all&project_cwd=", nil))
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode unlinked: %v", err)
+	}
+	if len(resp.Sessions) != 1 || resp.Sessions[0].CWD != "" {
+		t.Fatalf("unlinked filter = %+v", resp.Sessions)
 	}
 }
 
@@ -181,6 +252,14 @@ func TestWireFixture_HTTPSessionsScopeAll(t *testing.T) {
 		normalizePrefixedID(t, pm, fm, "id", "2026-")
 		normalizeRFC3339(t, pm, fm, "created_at")
 		normalizeRFC3339(t, pm, fm, "updated_at")
+	}
+	prodProjects := produced["projects"].([]any)
+	fixProjects := fixture["projects"].([]any)
+	if len(prodProjects) != len(fixProjects) {
+		t.Fatalf("projects count: want %d, got %d", len(fixProjects), len(prodProjects))
+	}
+	for i := range prodProjects {
+		normalizeRFC3339(t, prodProjects[i].(map[string]any), fixProjects[i].(map[string]any), "updated_at")
 	}
 	assertSemanticEqual(t, fixture, produced)
 

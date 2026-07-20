@@ -25,3 +25,12 @@ func TestAgentDefaultCWDV1CapabilityAdvertised(t *testing.T) {
 	}
 	t.Fatalf("CapAgentDefaultCWDV1 (%q) not in advertised Capabilities", CapAgentDefaultCWDV1)
 }
+
+func TestSessionProjectsV1CapabilityAdvertised(t *testing.T) {
+	for _, c := range Capabilities {
+		if c == CapSessionProjectsV1 {
+			return
+		}
+	}
+	t.Fatalf("CapSessionProjectsV1 (%q) not in advertised Capabilities", CapSessionProjectsV1)
+}

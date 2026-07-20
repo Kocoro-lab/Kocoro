@@ -81,12 +81,16 @@ CREATE INDEX IF NOT EXISTS idx_sessions_route_key_updated ON sessions(route_key,
 `
 
 type SearchResult struct {
-	SessionID    string    `json:"session_id"`
-	SessionTitle string    `json:"session_title"`
-	Role         string    `json:"role"`
-	Snippet      string    `json:"snippet"`
-	MsgIndex     int       `json:"msg_index"`
-	CreatedAt    time.Time `json:"created_at"`
+	SessionID    string `json:"session_id"`
+	SessionTitle string `json:"session_title"`
+	// CWD + UpdatedAt let Desktop attribute a buried full-text hit to its
+	// project and order/search it by last activity without loading the session.
+	CWD       string    `json:"cwd"`
+	Role      string    `json:"role"`
+	Snippet   string    `json:"snippet"`
+	MsgIndex  int       `json:"msg_index"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 	// Agent identifies the agent scope this result belongs to: empty string
 	// for the default agent, otherwise the agent slug. Populated at HTTP-search
 	// time by the daemon so cross-agent search (GET /sessions/search?scope=all)
@@ -314,7 +318,7 @@ func (idx *Index) UpdateSessionFlags(id string, pinned, favorite *bool) error {
 
 func (idx *Index) ListSessions() ([]SessionSummary, error) {
 	rows, err := idx.db.Query(
-		`SELECT id, title, created_at, updated_at, msg_count, source, pinned, favorite
+		`SELECT id, title, cwd, created_at, updated_at, msg_count, source, pinned, favorite
 		 FROM sessions ORDER BY pinned DESC, updated_at DESC`,
 	)
 	if err != nil {
@@ -327,7 +331,7 @@ func (idx *Index) ListSessions() ([]SessionSummary, error) {
 		var s SessionSummary
 		var createdStr, updatedStr string
 		var pinned, favorite int
-		if err := rows.Scan(&s.ID, &s.Title, &createdStr, &updatedStr, &s.MsgCount, &s.Source, &pinned, &favorite); err != nil {
+		if err := rows.Scan(&s.ID, &s.Title, &s.CWD, &createdStr, &updatedStr, &s.MsgCount, &s.Source, &pinned, &favorite); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		s.CreatedAt = parseTime(createdStr)
@@ -384,7 +388,7 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 	}
 
 	rows, err := idx.db.Query(
-		`SELECT m.session_id, s.title, m.role, m.msg_index, s.created_at,
+		`SELECT m.session_id, s.title, s.cwd, m.role, m.msg_index, s.created_at, s.updated_at,
 		        snippet(messages_fts, 0, '>>>', '<<<', '...', 40)
 		 FROM messages_fts
 		 JOIN messages m ON m.rowid = messages_fts.rowid
@@ -414,11 +418,12 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		var createdStr string
-		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.Role, &r.MsgIndex, &createdStr, &r.Snippet); err != nil {
+		var createdStr, updatedStr string
+		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.CWD, &r.Role, &r.MsgIndex, &createdStr, &updatedStr, &r.Snippet); err != nil {
 			return nil, fmt.Errorf("scan result: %w", err)
 		}
 		r.CreatedAt = parseTime(createdStr)
+		r.UpdatedAt = parseTime(updatedStr)
 		results = append(results, r)
 	}
 	return results, rows.Err()
@@ -488,7 +493,7 @@ func (idx *Index) searchLike(terms []string, limit int) ([]SearchResult, error) 
 		args = append(args, "%"+escapeLike(t)+"%")
 	}
 	args = append(args, limit)
-	sqlText := `SELECT m.session_id, s.title, m.role, m.msg_index, s.created_at, m.content
+	sqlText := `SELECT m.session_id, s.title, s.cwd, m.role, m.msg_index, s.created_at, s.updated_at, m.content
 		 FROM messages m
 		 JOIN sessions s ON s.id = m.session_id
 		 WHERE ` + strings.Join(clauses, " AND ") + `
@@ -503,11 +508,12 @@ func (idx *Index) searchLike(terms []string, limit int) ([]SearchResult, error) 
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		var createdStr, content string
-		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.Role, &r.MsgIndex, &createdStr, &content); err != nil {
+		var createdStr, updatedStr, content string
+		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.CWD, &r.Role, &r.MsgIndex, &createdStr, &updatedStr, &content); err != nil {
 			return nil, fmt.Errorf("scan result: %w", err)
 		}
 		r.CreatedAt = parseTime(createdStr)
+		r.UpdatedAt = parseTime(updatedStr)
 		// Snippet around the first term match; fall back to the first term.
 		// Centre the snippet on the earliest matching term so the user can
 		// see why the result matched when their query had multiple terms.

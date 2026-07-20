@@ -14,7 +14,7 @@ description: >
   Covers anything under ~/.shannon/. Do NOT use bash/file_read/file_edit to probe or modify
   these — kocoro routes every op through the daemon HTTP API at localhost:7533 which handles
   validation, atomic writes and audit logging.
-allowed-tools: http file_read think schedule_create schedule_list schedule_update schedule_remove schedule_show
+# allowed-tools: http file_read think schedule_create schedule_list schedule_update schedule_remove schedule_show
 hidden: true
 ---
 
