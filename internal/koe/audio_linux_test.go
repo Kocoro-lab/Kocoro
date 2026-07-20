@@ -150,6 +150,40 @@ func TestWirelessInterruptPlaybackSendsCarrierFlush(t *testing.T) {
 	}
 }
 
+func TestWirelessRepeatedTeardownSendsOneCarrierFlush(t *testing.T) {
+	koeConn, carrierConn := net.Pipe()
+	defer koeConn.Close()
+	defer carrierConn.Close()
+	a, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	a.conn = koeConn
+	a.SetSpeaking(true)
+	h := newEventHandler(nil, nil, a, func(any) error { return nil })
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		h.interruptOutput()
+		h.interruptOutput()
+		close(done)
+	}()
+	if _, err := readControl(carrierConn); err != nil {
+		t.Fatalf("read first carrier flush: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("repeated teardown did not complete")
+	}
+	_ = carrierConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if body, err := readControl(carrierConn); err == nil {
+		t.Fatalf("repeated teardown sent a duplicate carrier flush: %s", body)
+	}
+}
+
 func TestWirelessPlaybackGainUsesCarrierControl(t *testing.T) {
 	koeConn, carrierConn := net.Pipe()
 	defer koeConn.Close()
@@ -361,6 +395,32 @@ func TestMicCaptureQueueDropsOldest(t *testing.T) {
 	}
 	if got := (<-ch)[0]; got != 3 {
 		t.Fatalf("latest retained = %d, want 3", got)
+	}
+}
+
+func TestWirelessMicUsesOfficialProcessedChannel(t *testing.T) {
+	stereo := []float32{
+		0.80, -0.80,
+		0.25, 0.75,
+	}
+	payload := make([]byte, 0, len(stereo)*4)
+	for _, sample := range stereo {
+		bits := math.Float32bits(sample)
+		payload = append(payload, byte(bits), byte(bits>>8), byte(bits>>16), byte(bits>>24))
+	}
+	got := decodeToMono(audiobridge.Header{
+		Format:   audiobridge.FormatF32LE,
+		Channels: 2,
+		NSamples: 2,
+	}, payload)
+	want := []float64{0.80, 0.25}
+	if len(got) != len(want) {
+		t.Fatalf("decodeToMono len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if math.Abs(got[i]-want[i]) > 1e-6 {
+			t.Fatalf("decodeToMono[%d] = %.3f, want channel-0 %.3f", i, got[i], want[i])
+		}
 	}
 }
 

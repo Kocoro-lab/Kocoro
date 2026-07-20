@@ -645,9 +645,10 @@ func (a *AudioIO) toCarrierPCM(pcm []int16) []int16 {
 }
 
 // toCodecPCM converts a carrier mic frame (per its header format/rate/channels) to
-// the codec's 48k mono S16. TODO(u2-fidelity): the carrier is thin and sends the
-// SDK-native F32LE/16k/2ch (§9-b); this does the format+downmix and a linear
-// resample. Replace with a windowed resampler if the naive one aliases audibly.
+// the codec's 48k mono S16. The carrier stays thin and sends the SDK-native
+// F32LE/16k/2ch (§9-b); Reachy's official conversation app treats channel 0 as
+// the processed speech channel, so decodeToMono preserves that channel instead
+// of averaging in channel 1. The stateful windowed FIR then up-rates 16k→48k.
 func (a *AudioIO) toCodecPCM(h audiobridge.Header, payload []byte) []int16 {
 	// Decode payload → mono float samples at the source rate.
 	mono := decodeToMono(h, payload)
@@ -686,13 +687,13 @@ func decodeToMono(h audiobridge.Header, payload []byte) []float64 {
 	if ch == 1 {
 		return samples
 	}
+	// Match pollen-robotics/reachy_mini_conversation_app. Its realtime input path
+	// selects audio_frame[:, 0]; averaging the second hardware channel into that
+	// processed speech signal measurably changes the waveform and can reduce
+	// recognition quality when the channels carry different post-XVF content.
 	mono := make([]float64, len(samples)/ch)
 	for i := range mono {
-		var sum float64
-		for c := 0; c < ch; c++ {
-			sum += samples[i*ch+c]
-		}
-		mono[i] = sum / float64(ch)
+		mono[i] = samples[i*ch]
 	}
 	return mono
 }

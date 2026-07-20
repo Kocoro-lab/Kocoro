@@ -46,6 +46,8 @@ const (
 	lastSpeakerTTL        = 15 * time.Minute
 	motionRPCTimeout      = 3 * time.Second
 	taskCompleteClip      = "success1"
+	speechNodClip         = "yeah_nod"
+	speechNodCooldown     = 6 * time.Second
 )
 
 // MotionController owns the reachy motion-bridge client + the express gate for a
@@ -81,7 +83,10 @@ type MotionController struct {
 	reflectionNotify     chan struct{}
 	doaLookAt            chan float64
 	taskComplete         chan struct{}
+	speechStarted        chan struct{}
 	successClipAvailable atomic.Bool
+	speechNodAvailable   atomic.Bool
+	lastSpeechNod        time.Time
 
 	perceptionMu      sync.Mutex
 	lastSpeakerAngle  float64
@@ -109,6 +114,7 @@ func NewMotionController(socketPath string, tier ActivityTier, onBridgeStatus fu
 		reflectionNotify:  make(chan struct{}, 1),
 		doaLookAt:         make(chan float64, 1),
 		taskComplete:      make(chan struct{}, 1),
+		speechStarted:     make(chan struct{}, 1),
 		doaHitsRequired:   doaReflectionHits,
 		doaCooldown:       doaReflectionCooldown,
 	}
@@ -217,6 +223,17 @@ func (mc *MotionController) NewResponse() {
 	mc.mu.Unlock()
 }
 
+// SpeechStarted schedules one restrained official nod when audible response
+// playback begins. The latest-only channel and cooldown avoid mechanical
+// repetition across tool preambles/follow-ups while the SDK HeadWobbler continues
+// to provide fine-grained audio-reactive motion during the rest of the utterance.
+func (mc *MotionController) SpeechStarted() {
+	select {
+	case mc.speechStarted <- struct{}{}:
+	default:
+	}
+}
+
 // ObserveVoiceState drives the model-free listening reflex. Only the listening
 // state raises/animates the antennas; thinking, speaking, idle, and teardown all
 // clear it. The callback is non-blocking and latest-only.
@@ -322,6 +339,14 @@ func (mc *MotionController) applyMoves() {
 		}
 	}
 	mc.successClipAvailable.Store(available)
+	nodAvailable := false
+	for _, move := range moves {
+		if move == speechNodClip {
+			nodAvailable = true
+			break
+		}
+	}
+	mc.speechNodAvailable.Store(nodAvailable)
 	mc.movesApplied.Store(true)
 }
 
@@ -336,8 +361,29 @@ func (mc *MotionController) runAutomaticLanes(ctx context.Context) {
 			mc.lookAtDOA(ctx, angle, "speech")
 		case <-mc.taskComplete:
 			mc.playTaskComplete(ctx)
+		case <-mc.speechStarted:
+			mc.playSpeechNod(ctx)
 		}
 	}
+}
+
+func (mc *MotionController) playSpeechNod(ctx context.Context) {
+	if !mc.client.IsConnected() || !mc.speechNodAvailable.Load() {
+		return
+	}
+	now := mc.now()
+	if !mc.lastSpeechNod.IsZero() && now.Sub(mc.lastSpeechNod) < speechNodCooldown {
+		return
+	}
+	callCtx, cancel := context.WithTimeout(ctx, motionRPCTimeout)
+	err := mc.client.PlayMove(callCtx, speechNodClip, false)
+	cancel()
+	if err != nil {
+		log.Printf("koe[event]: speech_nod clip=%s status=skipped reason=bridge_error err=%v", speechNodClip, err)
+		return
+	}
+	mc.lastSpeechNod = now
+	log.Printf("koe[event]: speech_nod clip=%s status=played", speechNodClip)
 }
 
 func (mc *MotionController) applyListening(ctx context.Context) {
@@ -440,6 +486,7 @@ func (mc *MotionController) Run(ctx context.Context) {
 			if !mc.client.IsConnected() {
 				mc.movesApplied.Store(false)
 				mc.successClipAvailable.Store(false)
+				mc.speechNodAvailable.Store(false)
 				setState(bridgeStateConnecting)
 				continue
 			}

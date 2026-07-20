@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -500,6 +501,23 @@ func TestHandleEventDoesNotUngateBeforeOutputBufferStops(t *testing.T) {
 	waitUntil(t, func() bool { return !audio.dropCapture() }, "output_audio_buffer.stopped did not release the speaking gate")
 }
 
+func TestHandleEventOutputStartPublishesSpeechBoundary(t *testing.T) {
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, func(any) error { return nil })
+	var starts atomic.Int32
+	h.onSpeechStarted = func() { starts.Add(1) }
+
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("speech-start callback count = %d, want 1", got)
+	}
+}
+
 func TestInterruptOutputStopsPlaybackAndClearsRealtimeBuffers(t *testing.T) {
 	audio, err := NewAudioIO()
 	if err != nil {
@@ -903,6 +921,139 @@ func TestAdaptiveBargeSuppressesServerVADWithStaleLocalOnset(t *testing.T) {
 	}
 }
 
+func TestAdaptiveBargeSuppressedEchoResumesAfterServerClear(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-cleared-echo", "")
+	sender := &captureSender{}
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, sender.send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	audio.setInputLevel(0.005)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	h.localSpeechStartedNS.Store(time.Now().Add(-6 * time.Second).UnixNano())
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-echo","audio_start_ms":1000}`))
+	if !h.turnIsSuppressedEcho("item-echo") {
+		t.Fatal("quiet server VAD was not classified as suppressed echo")
+	}
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-echo","audio_end_ms":2200}`))
+	// Realtime can deliver the playout clear just after speech_stopped. The item
+	// must stay attributable until its transcript is classified.
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.cleared"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-echo","transcript":"Zavvi"}`))
+
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("cleared suppressed echo queued %d continuation responses, want 1", got)
+	}
+	req := <-h.respReq
+	if req.instructions != falseInterruptionResumeInstructions {
+		t.Fatalf("continuation instructions = %q", req.instructions)
+	}
+	if sender.sentContains("response.cancel") || sender.sentContains("output_audio_buffer.clear") {
+		t.Fatalf("false echo permanently cancelled playback: %v", sender.types())
+	}
+}
+
+func TestLateEchoTranscriptCannotResolveNewerBargeCandidate(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-overlapping-barge", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.noteVADStart("item-old", 1000)
+	h.noteVADStop("item-old", 2200)
+	h.markTurnSuppressedEcho("item-old")
+	h.beginBargeCandidate(defaultBargeSoftDuckGain, true, "newer_user")
+
+	// Before the new server item is assigned, any completed transcript necessarily
+	// belongs to an older turn and must not resolve the new local-onset candidate.
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-old","transcript":"Zavvi"}`))
+
+	if !h.bargeCandidate.Load() {
+		t.Fatal("late old transcript resolved the newer barge candidate")
+	}
+	h.associateBargeCandidate("item-new")
+	if got := audio.PlaybackGain(); got != defaultBargeSoftDuckGain {
+		t.Fatalf("late old transcript restored newer candidate gain to %v", got)
+	}
+}
+
+func TestAcceptedTurnLanguageHintsChineseAndJapanese(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	state := NewCallState("burst-language-hints", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, nil, (&captureSender{}).send)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-zh","transcript":"你好，请用一句话回答。"}`))
+	zh := <-h.respReq
+	if !strings.Contains(zh.instructions, "Reply in Simplified Chinese") {
+		t.Fatalf("Chinese turn instructions = %q", zh.instructions)
+	}
+	if strings.Contains(zh.instructions, "你好") {
+		t.Fatalf("ordinary language hint leaked transcript content: %q", zh.instructions)
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-ja","transcript":"今何時ですか。"}`))
+	ja := <-h.respReq
+	if !strings.Contains(ja.instructions, "Reply in Japanese") {
+		t.Fatalf("Japanese turn instructions = %q", ja.instructions)
+	}
+}
+
+func TestForeignLookingLatinASRDoesNotOverrideEstablishedChinese(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	state := NewCallState("burst-language-noise", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, nil, (&captureSender{}).send)
+	h.conversationLanguage = "zh"
+
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-noisy","transcript":"Të shkuvak Waikiki"}`))
+	req := <-h.respReq
+	if !strings.Contains(req.instructions, "Reply in Simplified Chinese") {
+		t.Fatalf("foreign-looking ASR overrode established Chinese: %q", req.instructions)
+	}
+}
+
+func TestInitialLanguageTranscriptWinsBoundedEagerGrace(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_SEGMENT_RESPONSE_GRACE_MS", "0")
+	t.Setenv("KOE_INITIAL_LANGUAGE_GRACE_MS", "80")
+	state := NewCallState("burst-first-language", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, nil, (&captureSender{}).send)
+	h.noteVADStart("item-first", 1000)
+
+	h.requestTurnResponseAfterSegmentGrace("item-first")
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-first","transcript":"你好，我叫 Kiki。"}`))
+	time.Sleep(120 * time.Millisecond)
+
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("initial transcript plus eager grace queued %d responses, want 1", got)
+	}
+	req := <-h.respReq
+	if !strings.Contains(req.instructions, "Reply in Simplified Chinese") {
+		t.Fatalf("initial language grace lost Chinese hint: %q", req.instructions)
+	}
+}
+
 func TestAdaptiveBargeDucksLoudWithinGateReattack(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_CLIENT_RESPONSE", "1")
@@ -1081,6 +1232,7 @@ func TestAdaptiveBargeAcceptsFreshSpeechAfterPlayback(t *testing.T) {
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
 	h.fullDuplexAEC = true
+	h.conversationLanguage = "zh"
 	h.playbackReleasedNS.Store(time.Now().Add(-500 * time.Millisecond).UnixNano())
 	h.observeLocalSpeechStarted()
 
@@ -1147,7 +1299,7 @@ func TestAdaptiveBargeMeaningfulSpeechConfirmsAndQueuesResponse(t *testing.T) {
 	audio.setInputLevel(0.030)
 	h.observeLocalSpeechStarted()
 
-	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-question"}`))
 	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-question","transcript":"木星有多大"}`))
 
 	if h.bargeCandidate.Load() {
@@ -1281,7 +1433,8 @@ func TestAdaptiveBargeDoesNotInjectUnmarkedASRNumbers(t *testing.T) {
 		t.Fatalf("unmarked barge transcript queued %d responses, want 1", got)
 	}
 	req := <-h.respReq
-	if req.instructions != "" {
+	if strings.Contains(req.instructions, "5×3×10") ||
+		strings.Contains(req.instructions, "Auxiliary ASR evidence") {
 		t.Fatalf("unmarked ASR numbers leaked into response instructions: %q", req.instructions)
 	}
 }
@@ -2074,9 +2227,12 @@ func TestClientOwnedTranscriptCreatesOneResponse(t *testing.T) {
 
 func TestClientOwnedLongSpeechRequestsResponseBeforeTranscript(t *testing.T) {
 	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	// This test isolates the eager-response lane. The separately-covered first
+	// auto-language turn intentionally has a small bounded script-hint grace.
 	state := NewCallState("burst-eager-response", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	h := newEventHandler(disp, state, nil, (&captureSender{}).send)
+	h.conversationLanguage = "zh"
 
 	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-long","audio_start_ms":1000}`))
 	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-long","audio_end_ms":2400}`))

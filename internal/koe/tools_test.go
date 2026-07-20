@@ -955,6 +955,9 @@ func TestToolDefsForCarrierAddsCameraOnlyWithCapability(t *testing.T) {
 	if !strings.Contains(camera.Description, "current frame") || !strings.Contains(camera.Description, "do not claim to recognize") {
 		t.Fatalf("camera privacy/current-scene contract missing: %q", camera.Description)
 	}
+	if !strings.Contains(camera.Description, "Call it silently") {
+		t.Fatalf("camera tool must prohibit a latency-adding spoken preamble: %q", camera.Description)
+	}
 }
 
 func TestDispatchExpressExpressed(t *testing.T) {

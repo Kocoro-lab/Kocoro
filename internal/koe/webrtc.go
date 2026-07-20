@@ -874,6 +874,9 @@ type ConnectOptions struct {
 	// OnResponseStarted (nil-safe) fires on each response.created — the express gate
 	// resets its ≤1/response budget here. Wired only for a carrier with a body.
 	OnResponseStarted func()
+	// OnSpeechStarted (nil-safe) fires when audible output begins. Reachy maps this
+	// to a rate-limited official nod; Mac leaves it nil.
+	OnSpeechStarted func()
 	// OnUserTranscript (nil-safe) receives a completed input transcript for local
 	// deterministic expression policy. The body controller uses it only to grant or
 	// clear a bounded explicit-dance authorization; it does not retain the text.
@@ -1023,6 +1026,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	// original no-authority-without-a-bind contract.
 	h.toolLoop.setLazyBind(provider == ProviderQwen)
 	h.onResponseStarted = opts.OnResponseStarted
+	h.onSpeechStarted = opts.OnSpeechStarted
 	h.onUserTranscript = opts.OnUserTranscript
 	h.onTaskCompleted = opts.OnTaskCompleted
 	h.model = opts.Model

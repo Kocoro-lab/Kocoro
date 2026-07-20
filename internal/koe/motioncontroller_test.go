@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -318,6 +319,38 @@ func TestMotionControllerVoiceStateDrivesListeningReflex(t *testing.T) {
 		}
 		_ = json.Unmarshal(params[len(params)-1], &got)
 		return !got.On
+	})
+}
+
+func TestMotionControllerSpeechStartPlaysRateLimitedOfficialNod(t *testing.T) {
+	fb := newFakeBridge(t, []string{speechNodClip})
+	defer fb.close()
+	mc := NewMotionController(fb.path, ActivityStandard, nil)
+	mc.pollInterval = 15 * time.Millisecond
+	var nowNS atomic.Int64
+	nowNS.Store(time.Unix(100, 0).UnixNano())
+	mc.now = func() time.Time { return time.Unix(0, nowNS.Load()) }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mc.Run(ctx)
+	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+
+	mc.SpeechStarted()
+	waitForKMC(t, 2*time.Second, func() bool { return fb.lastPlay() == speechNodClip })
+	firstCount := len(fb.rpcParams(reachy.MethodPlayMove))
+
+	// A second output boundary in the same spoken answer (for example after a
+	// tool call) must not make the robot nod repeatedly.
+	mc.SpeechStarted()
+	time.Sleep(50 * time.Millisecond)
+	if got := len(fb.rpcParams(reachy.MethodPlayMove)); got != firstCount {
+		t.Fatalf("speech nod repeated inside cooldown: got %d play calls, want %d", got, firstCount)
+	}
+
+	nowNS.Add(int64(speechNodCooldown + time.Millisecond))
+	mc.SpeechStarted()
+	waitForKMC(t, 2*time.Second, func() bool {
+		return len(fb.rpcParams(reachy.MethodPlayMove)) == firstCount+1
 	})
 }
 

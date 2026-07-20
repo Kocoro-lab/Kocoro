@@ -56,6 +56,9 @@ type eventHandler struct {
 	// ≤1/response budget so the next response may express again. nil for carriers
 	// with no body (mac) and in unit tests.
 	onResponseStarted func()
+	// onSpeechStarted (nil-safe) fires at the precise audible playback boundary.
+	// Reachy uses it for a restrained official nod; Mac has no body hook.
+	onSpeechStarted func()
 	// onUserTranscript (nil-safe) feeds only the deterministic body-expression
 	// authorization policy. The callback stores no transcript; nil on Mac/no body.
 	onUserTranscript func(string)
@@ -121,6 +124,12 @@ type eventHandler struct {
 	// playback. The audio is ducked, not destroyed, until transcript evidence
 	// confirms a real interruption or classifies a false positive/backchannel.
 	bargeCandidate atomic.Bool
+	// bargeCandidateItem associates the reversible candidate with the Realtime
+	// input item whose transcript is allowed to resolve it. Local onset can begin
+	// ducking before Realtime assigns an item_id, so the empty value temporarily
+	// means "the next speech_started item". Guarded by turnMu.
+	bargeCandidateItem      string
+	bargeCandidateItemBound bool
 	// frontSpeechAuthorized mirrors Reachy's sustained robot-local DOA/VAD gate
 	// into the event handler. A server speech_started event can arrive after the
 	// gate's open transition, so checking only edge callbacks misses real users.
@@ -163,6 +172,10 @@ type eventHandler struct {
 	vadDurationMS         map[string]int
 	turnSpeechSeq         map[string]int64
 	turnSuppressedEcho    map[string]bool
+	turnServerCleared     map[string]bool
+	turnLanguage          map[string]string
+	conversationLanguage  string
+	latestInputItem       string
 	activeSuppressedEcho  string
 	turnResponseRequested map[string]bool
 	turnResponseCanceled  map[string]bool
@@ -494,6 +507,10 @@ func (h *eventHandler) beginBargeCandidate(gain float64, serverVAD bool, evidenc
 	first := h.bargeCandidate.CompareAndSwap(false, true)
 	if first {
 		h.bargeServerCleared.Store(false)
+		h.turnMu.Lock()
+		h.bargeCandidateItem = ""
+		h.bargeCandidateItemBound = false
+		h.turnMu.Unlock()
 	}
 	if serverVAD {
 		h.bargeServerVAD.Store(true)
@@ -521,10 +538,41 @@ func (h *eventHandler) beginBargeCandidate(gain float64, serverVAD bool, evidenc
 	return true
 }
 
+func (h *eventHandler) associateBargeCandidate(itemID string) {
+	if !h.bargeCandidate.Load() {
+		return
+	}
+	h.turnMu.Lock()
+	if !h.bargeCandidateItemBound {
+		h.bargeCandidateItem = itemID
+		h.bargeCandidateItemBound = true
+	}
+	h.turnMu.Unlock()
+}
+
+func (h *eventHandler) bargeCandidateForItem(itemID string) bool {
+	if !h.bargeCandidate.Load() {
+		return false
+	}
+	h.turnMu.Lock()
+	candidateItem := h.bargeCandidateItem
+	bound := h.bargeCandidateItemBound
+	h.turnMu.Unlock()
+	return bound && candidateItem == itemID
+}
+
+func (h *eventHandler) clearBargeCandidateItem() {
+	h.turnMu.Lock()
+	h.bargeCandidateItem = ""
+	h.bargeCandidateItemBound = false
+	h.turnMu.Unlock()
+}
+
 func (h *eventHandler) resumeBargeCandidate(reason string) bool {
 	if !h.bargeCandidate.Swap(false) {
 		return false
 	}
+	h.clearBargeCandidateItem()
 	h.bargeServerVAD.Store(false)
 	if h.audio != nil {
 		h.audio.SetPlaybackGain(1)
@@ -563,6 +611,7 @@ func (h *eventHandler) cancelRejectedAutoResponse(hadBargeCandidate bool) {
 
 func (h *eventHandler) confirmBargeCandidate() {
 	h.bargeCandidate.Store(false)
+	h.clearBargeCandidateItem()
 	h.bargeServerCleared.Store(false)
 	h.bargeServerVAD.Store(false)
 	if h.audio != nil {
@@ -579,6 +628,7 @@ func (h *eventHandler) confirmBargeCandidate() {
 // (the user is mid-utterance); the explicit interrupt clears it.
 func (h *eventHandler) stopOutput(keepInput bool) {
 	h.bargeCandidate.Store(false)
+	h.clearBargeCandidateItem()
 	h.bargeServerCleared.Store(false)
 	h.bargeServerVAD.Store(false)
 	hadResponse := h.respBusy.Load()
@@ -596,9 +646,15 @@ func (h *eventHandler) stopOutput(keepInput bool) {
 	if h.audio != nil {
 		h.audio.SetPlaybackGain(1)
 		h.audio.SetSpeaking(false)
-		flushStarted := time.Now()
-		h.audio.InterruptPlayback()
-		playbackFlush = time.Since(flushStarted)
+		// end_call reaches this path once in the function handler and once more
+		// through the shared Desktop teardown closure. The first call clears all
+		// active response/output flags; do not send a second expensive carrier
+		// clear_player command when the teardown re-enters with nothing active.
+		if hadResponse || hadOutput {
+			flushStarted := time.Now()
+			h.audio.InterruptPlayback()
+			playbackFlush = time.Since(flushStarted)
+		}
 	}
 	h.playbackReleasedNS.Store(time.Now().UnixNano())
 	if !keepInput {
@@ -881,6 +937,8 @@ func newEventHandlerWithMailbox(disp *Dispatcher, state *CallState, audio *Audio
 		vadDurationMS:         make(map[string]int),
 		turnSpeechSeq:         make(map[string]int64),
 		turnSuppressedEcho:    make(map[string]bool),
+		turnServerCleared:     make(map[string]bool),
+		turnLanguage:          make(map[string]string),
 		turnResponseRequested: make(map[string]bool),
 		turnResponseCanceled:  make(map[string]bool),
 	}
@@ -1976,6 +2034,7 @@ func (h *eventHandler) noteVADStart(itemID string, audioStartMS int) {
 	h.turnMu.Lock()
 	h.vadStartMS[itemID] = audioStartMS
 	h.turnSpeechSeq[itemID] = h.serverSpeechSeq.Load()
+	h.latestInputItem = itemID
 	h.turnMu.Unlock()
 }
 
@@ -2012,6 +2071,36 @@ func (h *eventHandler) markTurnSuppressedEcho(itemID string) {
 	h.turnSuppressedEcho[itemID] = true
 	h.activeSuppressedEcho = itemID
 	h.turnMu.Unlock()
+}
+
+func (h *eventHandler) markServerClearedForActiveInput() {
+	h.turnMu.Lock()
+	itemID := ""
+	if h.bargeCandidateItemBound {
+		itemID = h.bargeCandidateItem
+	}
+	if itemID == "" {
+		itemID = h.activeSuppressedEcho
+	}
+	if itemID == "" {
+		// A clear/truncate event can trail speech_stopped by a few scheduler
+		// ticks. Keep the newest input item until its transcript finishes so that
+		// a rejected false VAD still repairs the server-cleared reply.
+		itemID = h.latestInputItem
+	}
+	if itemID != "" {
+		h.turnServerCleared[itemID] = true
+	}
+	h.turnMu.Unlock()
+}
+
+func (h *eventHandler) turnWasServerCleared(itemID string) bool {
+	if itemID == "" {
+		return false
+	}
+	h.turnMu.Lock()
+	defer h.turnMu.Unlock()
+	return h.turnServerCleared[itemID]
 }
 
 func (h *eventHandler) turnIsSuppressedEcho(itemID string) bool {
@@ -2074,6 +2163,7 @@ func (h *eventHandler) observeFusedBargeReattack() bool {
 	if !h.beginBargeCandidate(gain, true, "server_vad_plus_front_speech") {
 		return false
 	}
+	h.associateBargeCandidate(itemID)
 	if eventLogEnabled() {
 		log.Printf(
 			"koe[barge]: possible talk-over detected — playback ducked evidence=server_vad_plus_front_speech item=%s input_level=%.4f front_min_level=%.4f",
@@ -2108,11 +2198,22 @@ func (h *eventHandler) setBargeInAuthorized(allowed bool) bool {
 }
 
 func (h *eventHandler) requestTurnResponse(itemID string) bool {
-	return h.requestTurnResponseWithInstructions(itemID, "")
+	return h.requestTurnResponseWithInstructions(itemID, h.replyLanguageInstructions(itemID))
 }
 
 func (h *eventHandler) requestTurnResponseAfterSegmentGrace(itemID string) {
 	grace := time.Duration(koeEnvInt("KOE_SEGMENT_RESPONSE_GRACE_MS", 0)) * time.Millisecond
+	// Give only the first auto-language turn a bounded opportunity for auxiliary
+	// transcription to contribute a script hint. Once Chinese or Japanese is
+	// established, later turns keep the normal lower-latency grace. Keep this
+	// below the ordinary endpointer/first-token budget: it buys deterministic
+	// Chinese/Japanese startup without making every turn pay an ASR round trip.
+	if h.language == "" && h.currentConversationLanguage() == "" {
+		initialLanguageGrace := time.Duration(koeEnvInt("KOE_INITIAL_LANGUAGE_GRACE_MS", 350)) * time.Millisecond
+		if initialLanguageGrace > grace {
+			grace = initialLanguageGrace
+		}
+	}
 	if grace <= 0 {
 		h.requestTurnResponse(itemID)
 		return
@@ -2150,6 +2251,91 @@ func (h *eventHandler) requestTurnResponseWithInstructions(itemID, instructions 
 	}
 	h.requestResponseWith(responseCreateRequest{turnItemID: itemID, instructions: instructions})
 	return true
+}
+
+func inferAcceptedTurnLanguage(transcript, established string) string {
+	hasHan := false
+	hasKana := false
+	for _, r := range transcript {
+		switch {
+		case unicode.In(r, unicode.Hiragana, unicode.Katakana):
+			hasKana = true
+		case unicode.In(r, unicode.Han):
+			hasHan = true
+		}
+	}
+	if hasKana {
+		return "ja"
+	}
+	if hasHan {
+		// Japanese can be all-kanji ("終了", "大丈夫"). Once Japanese is
+		// established, script alone must not flip the conversation to Chinese.
+		if established == "ja" {
+			return "ja"
+		}
+		return "zh"
+	}
+	// Do not promote Latin ASR into a language lock. Live Chinese speech has been
+	// rendered as Albanian-looking Latin text; native S2S remains authoritative
+	// for English and explicit language switches.
+	return ""
+}
+
+func (h *eventHandler) observeAcceptedTurnLanguage(itemID, transcript string) string {
+	if h.language != "" {
+		return h.language
+	}
+	h.turnMu.Lock()
+	defer h.turnMu.Unlock()
+	lang := inferAcceptedTurnLanguage(transcript, h.conversationLanguage)
+	if lang != "" {
+		h.conversationLanguage = lang
+		if itemID != "" {
+			h.turnLanguage[itemID] = lang
+		}
+	}
+	return lang
+}
+
+func (h *eventHandler) currentConversationLanguage() string {
+	if h.language != "" {
+		return h.language
+	}
+	h.turnMu.Lock()
+	defer h.turnMu.Unlock()
+	return h.conversationLanguage
+}
+
+func (h *eventHandler) replyLanguageInstructions(itemID string) string {
+	lang := h.language
+	if lang == "" {
+		h.turnMu.Lock()
+		lang = h.turnLanguage[itemID]
+		if lang == "" {
+			lang = h.conversationLanguage
+		}
+		h.turnMu.Unlock()
+	}
+	switch lang {
+	case "zh":
+		return "The accepted user turn strongly indicates Chinese. Reply in Simplified Chinese. If the original audio clearly and explicitly switched languages, follow the original audio instead. Do not mention this language hint."
+	case "ja":
+		return "The accepted user turn strongly indicates Japanese. Reply in Japanese. If the original audio clearly and explicitly switched languages, follow the original audio instead. Do not mention this language hint."
+	case "en":
+		return "Reply in English."
+	default:
+		return ""
+	}
+}
+
+func joinResponseInstructions(parts ...string) string {
+	var nonempty []string
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			nonempty = append(nonempty, part)
+		}
+	}
+	return strings.Join(nonempty, "\n\n")
 }
 
 func bargeTranscriptEvidenceInstructions(transcript string) string {
@@ -2217,7 +2403,16 @@ func (h *eventHandler) finishInputTurn(itemID string) {
 	delete(h.vadDurationMS, itemID)
 	delete(h.turnSpeechSeq, itemID)
 	delete(h.turnSuppressedEcho, itemID)
+	delete(h.turnServerCleared, itemID)
+	delete(h.turnLanguage, itemID)
 	delete(h.turnResponseRequested, itemID)
+	if h.bargeCandidateItemBound && h.bargeCandidateItem == itemID {
+		h.bargeCandidateItem = ""
+		h.bargeCandidateItemBound = false
+	}
+	if h.latestInputItem == itemID {
+		h.latestInputItem = ""
+	}
 	h.turnMu.Unlock()
 }
 
@@ -2666,6 +2861,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// field evidence showed noise at 0.0067 and real talk-over at 0.026+.
 		// Low-level stale echo remains transcript-gated.
 		speaking := h.isSpeakingOrResponding()
+		if speaking && h.bargeCandidate.Load() {
+			h.associateBargeCandidate(ev.ItemID)
+		}
 		postPlaybackEchoMS := int64(koeEnvInt("KOE_POST_PLAYBACK_ECHO_MS", 1500))
 		recentPlaybackTail := !speaking && afterPlaybackMS >= 0 && afterPlaybackMS <= postPlaybackEchoMS
 		if providerBargeInEnabled(h.provider) && speaking && h.pauseForNativeFloor() {
@@ -2715,6 +2913,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 				}
 				gain := koeEnvFloat("KOE_BARGE_SOFT_DUCK_GAIN", defaultBargeSoftDuckGain)
 				h.beginBargeCandidate(gain, true, evidence)
+				h.associateBargeCandidate(ev.ItemID)
 				log.Printf(
 					"koe[barge]: possible talk-over detected — playback soft-ducked evidence=%s input_level=%.4f",
 					evidence,
@@ -2788,7 +2987,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// Native S2S still has the original audio. Transcription is only the local
 		// control lane, so its failure must not swallow a normal user turn.
 		if clientOwnsTurnResponse() {
-			if h.bargeCandidate.Load() {
+			if h.bargeCandidateForItem(ev.ItemID) {
 				h.confirmBargeCandidate()
 			}
 			h.requestTurnResponse(ev.ItemID)
@@ -2810,6 +3009,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			break
 		}
 		h.bargeCandidate.Store(false)
+		h.clearBargeCandidateItem()
 		h.bargeServerCleared.Store(false)
 		h.bargeServerVAD.Store(false)
 		if h.audio != nil {
@@ -2942,20 +3142,14 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// into the next turn.
 		h.outputBufferActive.Store(true)
 		h.markSpeaking()
-	case "conversation.item.truncated":
+		if h.onSpeechStarted != nil {
+			h.onSpeechStarted()
+		}
+	case "output_audio_buffer.cleared", "conversation.item.truncated":
 		// Realtime WebRTC may clear device playout as soon as the user starts
 		// speaking even with interrupt_response=false. Preserve that fact until
 		// transcript classification decides whether a continuation is needed.
-		if h.bargeCandidate.Load() {
-			h.bargeServerCleared.Store(true)
-		}
-	case "response.output_audio.delta":
-		// Redundant safety: also gate on the first audio delta in case the
-		// output_audio_buffer.* markers are absent on some transport. Idempotent
-		// with output_audio_buffer.started. Event name is the GA flattened
-		// convention.
-		h.markSpeaking()
-	case "output_audio_buffer.cleared":
+		h.markServerClearedForActiveInput()
 		if h.bargeCandidate.Load() {
 			h.bargeServerCleared.Store(true)
 		}
@@ -2981,6 +3175,12 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 				}
 			}
 		}
+	case "response.output_audio.delta":
+		// Redundant safety: also gate on the first audio delta in case the
+		// output_audio_buffer.* markers are absent on some transport. Idempotent
+		// with output_audio_buffer.started. Event name is the GA flattened
+		// convention.
+		h.markSpeaking()
 	case "output_audio_buffer.stopped":
 		now := time.Now()
 		if timingLogEnabled() {
@@ -3108,10 +3308,10 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 			log.Printf("koe[turn]: unsupported-script short fragment — suppressing response")
 		}
 		h.cancelRequestedTurnResponse(itemID)
-		hadCandidate := h.bargeCandidate.Load()
-		resumeNeeded := false
+		hadCandidate := h.bargeCandidateForItem(itemID)
+		resumeNeeded := h.turnWasServerCleared(itemID)
 		if hadCandidate {
-			resumeNeeded = h.resumeBargeCandidate("unsupported-script short audio")
+			resumeNeeded = h.resumeBargeCandidate("unsupported-script short audio") || resumeNeeded
 		}
 		h.deleteInputItem(itemID)
 		if resumeNeeded {
@@ -3134,9 +3334,7 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 		if eventLogEnabled() {
 			log.Printf("koe[call]: end phrase %q — hanging up", transcript)
 		}
-		// Cut any in-progress auto-response audio immediately and enter the same
-		// idempotent terminal used by the model-owned end_call tool.
-		if h.bargeCandidate.Load() {
+		if h.bargeCandidateForItem(itemID) {
 			h.confirmBargeCandidate()
 		}
 		h.requestEndCall("transcript-end-phrase")
@@ -3147,7 +3345,7 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 			log.Printf("koe[barge]: stop-speech phrase %q — suppressing response", transcript)
 		}
 		h.cancelRequestedTurnResponse(itemID)
-		if h.bargeCandidate.Load() {
+		if h.bargeCandidateForItem(itemID) {
 			h.confirmBargeCandidate()
 		} else if h.isSpeakingOrResponding() {
 			h.interruptOutput()
@@ -3160,11 +3358,11 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 		if eventLogEnabled() {
 			log.Printf("koe[turn]: backchannel %q — staying quiet", transcript)
 		}
-		resumeNeeded := false
+		resumeNeeded := h.turnWasServerCleared(itemID)
 		h.cancelRequestedTurnResponse(itemID)
-		hadCandidate := h.bargeCandidate.Load()
+		hadCandidate := h.bargeCandidateForItem(itemID)
 		if hadCandidate {
-			resumeNeeded = h.resumeBargeCandidate("backchannel")
+			resumeNeeded = h.resumeBargeCandidate("backchannel") || resumeNeeded
 		}
 		h.deleteInputItem(itemID)
 		if resumeNeeded {
@@ -3182,11 +3380,11 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 		if eventLogEnabled() {
 			log.Printf("koe[turn]: short empty transcript — suppressing response")
 		}
-		resumeNeeded := false
+		resumeNeeded := h.turnWasServerCleared(itemID)
 		h.cancelRequestedTurnResponse(itemID)
-		hadCandidate := h.bargeCandidate.Load()
+		hadCandidate := h.bargeCandidateForItem(itemID)
 		if hadCandidate {
-			resumeNeeded = h.resumeBargeCandidate("short empty audio")
+			resumeNeeded = h.resumeBargeCandidate("short empty audio") || resumeNeeded
 		}
 		h.deleteInputItem(itemID)
 		if resumeNeeded {
@@ -3197,15 +3395,15 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 		return
 	}
 	wasSuppressedEcho := h.turnIsSuppressedEcho(itemID)
-	wasCandidate := h.bargeCandidate.Load()
+	wasCandidate := h.bargeCandidateForItem(itemID)
 	if (wasSuppressedEcho || wasCandidate) && shouldSuppressUncorroboratedBarge(transcript, speechMS) {
 		if eventLogEnabled() {
 			log.Printf("koe[barge]: suppressing short uncorroborated interruption")
 		}
 		h.cancelRequestedTurnResponse(itemID)
-		resumeNeeded := false
+		resumeNeeded := h.turnWasServerCleared(itemID)
 		if wasCandidate {
-			resumeNeeded = h.resumeBargeCandidate("short uncorroborated audio")
+			resumeNeeded = h.resumeBargeCandidate("short uncorroborated audio") || resumeNeeded
 		}
 		h.deleteInputItem(itemID)
 		if resumeNeeded {
@@ -3234,10 +3432,15 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 			h.cancelRequestedTurnResponse(itemID)
 			return
 		}
+		h.observeAcceptedTurnLanguage(itemID, transcript)
+		languageInstructions := h.replyLanguageInstructions(itemID)
 		if wasBarge && shouldAttachBargeTranscriptEvidence(transcript) {
-			h.requestTurnResponseWithInstructions(itemID, bargeTranscriptEvidenceInstructions(transcript))
+			h.requestTurnResponseWithInstructions(
+				itemID,
+				joinResponseInstructions(languageInstructions, bargeTranscriptEvidenceInstructions(transcript)),
+			)
 		} else {
-			h.requestTurnResponse(itemID)
+			h.requestTurnResponseWithInstructions(itemID, languageInstructions)
 		}
 	}
 }

@@ -1498,11 +1498,13 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 
 			var expressIntents []string
 			var onResponseStarted func()
+			var onSpeechStarted func()
 			var onUserTranscript func(string)
 			var onTaskCompleted func()
 			if motionCtrl != nil {
 				expressIntents = koe.ExpressIntents()
 				onResponseStarted = motionCtrl.NewResponse
+				onSpeechStarted = motionCtrl.SpeechStarted
 				onUserTranscript = motionCtrl.ObserveUserTranscript
 				onTaskCompleted = func() {
 					if isActive() {
@@ -1528,6 +1530,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				ExpressIntents:    expressIntents,
 				CameraEnabled:     wirelessLazy && cfg.carrier.HasCap(koe.CapHasCamera),
 				OnResponseStarted: onResponseStarted,
+				OnSpeechStarted:   onSpeechStarted,
 				OnUserTranscript:  onUserTranscript,
 				OnTaskCompleted:   onTaskCompleted,
 			}

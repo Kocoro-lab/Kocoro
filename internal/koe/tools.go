@@ -112,7 +112,7 @@ func expressToolDef(intents []string) ToolDef {
 
 func cameraToolDef() ToolDef {
 	return ToolDef{Type: "function", Name: "camera",
-		Description: "camera — look through your Reachy Mini camera at the scene in front of your physical body. Call this only when the user asks you to look, see, inspect, identify, read, or describe something currently visible to the robot. The tool captures one current frame and gives it back to you directly; answer from that image in this same conversation. Do not call it merely because vision could be interesting, do not claim to recognize a person's identity, and do not route ordinary visual description through do_task.",
+		Description: "camera — look through your Reachy Mini camera at the scene in front of your physical body. Call this only when the user asks you to look, see, inspect, identify, read, or describe something currently visible to the robot. Call it silently: do not speak an acknowledgement, preamble, or 'let me look' before the function call. The tool captures one current frame and gives it back to you directly; after it returns, answer from that image in this same conversation. Do not call it merely because vision could be interesting, do not claim to recognize a person's identity, and do not route ordinary visual description through do_task.",
 		Parameters:  obj(`{"type":"object","properties":{},"required":[]}`)}
 }
 
