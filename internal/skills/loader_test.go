@@ -920,17 +920,33 @@ func TestWriteGlobalSkill_RoundTripsSticky(t *testing.T) {
 	})
 }
 
-// TestBundledGenerativeUISkill_RetainsToolAllowlist is a manifest guard for the
-// kocoro-generative-ui builtin. That skill is visualization-only — it emits
-// html-artifact fences that render in Desktop's WKWebView sandbox and must NOT
-// be able to fetch live data or run arbitrary tools. The restriction is enforced
-// at execution time (loop.go) from the skill's `allowed-tools` frontmatter, and
-// an EMPTY AllowedTools clears that filter entirely, silently granting the skill
-// every registered tool (bash, http, browser, web search…). Commit 39fee8f
-// dropped this line once as an accidental side effect of an unrelated feature;
-// this test walks the real embed → extract → parse path so any future drop (or
-// unreviewed widening) fails loudly here instead of in production.
-func TestBundledGenerativeUISkill_RetainsToolAllowlist(t *testing.T) {
+// TestBundledPlatformSkills_ToolAllowlistIntentionallyAbsent pins the reviewed
+// tool policy of the two first-party platform builtins: kocoro and
+// kocoro-generative-ui deliberately ship with NO allowed-tools frontmatter.
+//
+// History: 074cb1d restricted generative-ui to visualization-only tools;
+// 39fee8f dropped the line by accident; 2af82e6 restored it and added this
+// guard's predecessor (asserting the exact allowlist). On 2026-07-20 the
+// restriction was removed on purpose: the use_skill filter is run-scoped
+// (internal/tools/skill.go sets SkillToolFilter, loop.go hard-denies every
+// non-allowlisted call for the rest of the run), and both skills have broad
+// trigger surfaces — kocoro is prompted as "MUST use for ANY read/write" of
+// platform state, generative-ui triggers on any visualization ask — so an
+// allowlist bricked mixed turns (platform op or chart + bash / integration
+// tools / http fetch) with [skill restriction] denials. Routing discipline is
+// prompt-level in the skill bodies instead; generative-ui rendering safety is
+// bounded by Desktop's sandboxed iframe, not by this manifest. Both skills are
+// first-party reviewed content, sha256-synced from embed.FS on every daemon
+// startup.
+//
+// The assertion is nil-specific on purpose: the loader distinguishes absent
+// (nil → no restriction) from present-but-empty (non-nil empty → zero tools).
+// Re-adding an allowlist — or a loader regression that stops parsing absence
+// as nil — must fail loudly here and get reviewed, exactly like the accidental
+// drop this guard's predecessor caught. If you are restoring a restriction,
+// update this policy and the rationale comments in both SKILL.md files in the
+// same change.
+func TestBundledPlatformSkills_ToolAllowlistIntentionallyAbsent(t *testing.T) {
 	src, err := BundledSkillSource(t.TempDir())
 	if err != nil {
 		t.Fatalf("BundledSkillSource: %v", err)
@@ -939,20 +955,22 @@ func TestBundledGenerativeUISkill_RetainsToolAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSkills: %v", err)
 	}
-	var gui *Skill
-	for _, s := range loaded {
-		if s.Slug == "kocoro-generative-ui" {
-			gui = s
-			break
+	for _, slug := range []string{"kocoro", "kocoro-generative-ui"} {
+		var found *Skill
+		for _, s := range loaded {
+			if s.Slug == slug {
+				found = s
+				break
+			}
 		}
-	}
-	if gui == nil {
-		t.Fatal("kocoro-generative-ui skill not found in bundled set")
-	}
-	const want = "file_read file_write publish_to_web think"
-	if got := strings.Join(gui.AllowedTools, " "); got != want {
-		t.Errorf("kocoro-generative-ui allowed-tools = %q, want %q\n"+
-			"(a visualization-only skill must stay tool-restricted; an empty allowlist "+
-			"clears the loop.go execution filter and grants every registered tool)", got, want)
+		if found == nil {
+			t.Fatalf("%s skill not found in bundled set", slug)
+		}
+		if found.AllowedTools != nil {
+			t.Errorf("%s allowed-tools = %q, want field absent (nil)\n"+
+				"(unrestricted by design since 2026-07-20 — the run-scoped use_skill filter "+
+				"bricked mixed turns; see this test's doc comment before changing the policy)",
+				slug, strings.Join(found.AllowedTools, " "))
+		}
 	}
 }

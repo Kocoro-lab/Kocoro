@@ -148,7 +148,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 ### Search sessions
 - Method: GET
 - Path: /sessions/search?q={query}[?agent={name}][?scope=all][?project_cwd={path}]
-- Response: `{"results": [{"session_id", "session_title", "role", "snippet", "msg_index", "created_at", "agent"}]}`
+- Response: `{"results": [{"session_id", "session_title", "cwd", "role", "snippet", "msg_index", "created_at", "updated_at", "agent"}]}`
 - Notes: Full-text (trigram) search over session message history. Single-scope by default (default agent, or `agent={name}`); `scope=all` searches every scope (default + all named agents) and merges hits, ordered by `updated_at DESC`. Each result carries `agent`, normalized `cwd`, and `updated_at`, matching the List-sessions project convention. `project_cwd` optionally restricts hits to one exact project (present empty selects unlinked sessions). `snippet` wraps the matched span in `>>>…<<<`. Search is intentionally **unpaginated** — no `limit`/`offset`/`total`/`has_more` — so buried older sessions stay reachable regardless of the list-view page window (a per-scope cap of 20 matches applies without a project filter; project-filtered search scans a wider local window before filtering). `q` is required (400 if empty).
 
 ### Rename / pin / favorite a session
