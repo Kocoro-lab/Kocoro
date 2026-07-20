@@ -39,6 +39,7 @@ type Session struct {
 	MessageMeta     []MessageMeta    `json:"message_meta,omitempty"`
 	Source          string           `json:"source,omitempty"`            // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still appears in older sessions)
 	Channel         string           `json:"channel,omitempty"`           // source channel/group identifier
+	ScheduleID      string           `json:"schedule_id,omitempty"`       // owning schedule for scheduler-created sessions; retained after schedule deletion
 	RouteKey        string           `json:"route_key,omitempty"`         // persisted daemon route binding for routed conversations
 	SummaryCache    string           `json:"summary_cache,omitempty"`     // cached summary Markdown
 	SummaryCacheKey string           `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
@@ -251,8 +252,12 @@ func FilterInjected(msgs []client.Message, meta []MessageMeta) []client.Message 
 }
 
 type SessionSummary struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	// CWD is the immutable working directory captured for the session. It is
+	// always emitted (empty for legacy/unlinked sessions) so Desktop can derive
+	// project groups without issuing one GET /sessions/{id} request per row.
+	CWD       string    `json:"cwd"`
 	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt is the timestamp of the most recent activity in the session
 	// (mirrors Session.UpdatedAt). Drives list ordering in GET /sessions so
@@ -271,6 +276,10 @@ type SessionSummary struct {
 	// column existed. Frontends use this to pick a channel icon / filter
 	// the sidebar.
 	Source string `json:"source,omitempty"`
+	// ScheduleID identifies the exact scheduled task that created this
+	// session. It remains on the session after the schedule configuration is
+	// deleted, so deleting a schedule never destroys or rewrites history.
+	ScheduleID string `json:"schedule_id,omitempty"`
 	// InProgress reports whether the daemon currently owns an in-flight
 	// agent run for this session (mirrors SessionCache.ActiveSessionIDs).
 	// Populated at HTTP-list time by the daemon — Store.List itself leaves
@@ -436,6 +445,7 @@ func (s *Store) Save(sess *Session) error {
 	if sess.SchemaVersion == 0 {
 		sess.SchemaVersion = 1
 	}
+	backfillLegacyScheduleID(sess)
 
 	data, err := json.MarshalIndent(sess, "", "  ")
 	if err != nil {
@@ -626,12 +636,26 @@ func (s *Store) Load(id string) (*Session, error) {
 	if sess.SchemaVersion == 0 {
 		sess.SchemaVersion = 1
 	}
+	// Sessions created before schedule_id was introduced already persisted a
+	// stable channel in the form "schedule-<id>". Recover that association at
+	// load time so the new filter includes legacy history without rewriting
+	// every JSON file eagerly. A later normal Save self-heals the file.
+	backfillLegacyScheduleID(&sess)
 	// Load-time self-heal for malformed thinking blocks persisted by earlier
 	// daemon versions. See internal/context/thinking_sanitize.go for the
 	// wire-shape that motivates this. The next Save() persists the cleaned
 	// shape, so disk copies repair themselves on first read after upgrade.
 	sess.Messages = ctxwin.DropMalformedThinking(sess.Messages)
 	return &sess, nil
+}
+
+func backfillLegacyScheduleID(sess *Session) {
+	if sess == nil || sess.ScheduleID != "" || !strings.EqualFold(strings.TrimSpace(sess.Source), "schedule") {
+		return
+	}
+	if id, ok := strings.CutPrefix(strings.TrimSpace(sess.Channel), "schedule-"); ok && id != "" {
+		sess.ScheduleID = id
+	}
 }
 
 func (s *Store) List() ([]SessionSummary, error) {
@@ -658,14 +682,16 @@ func (s *Store) List() ([]SessionSummary, error) {
 			continue
 		}
 		summaries = append(summaries, SessionSummary{
-			ID:        sess.ID,
-			Title:     sess.Title,
-			CreatedAt: sess.CreatedAt,
-			UpdatedAt: sess.UpdatedAt,
-			MsgCount:  len(sess.Messages),
-			Source:    sess.Source,
-			Pinned:    sess.Pinned,
-			Favorite:  sess.Favorite,
+			ID:         sess.ID,
+			Title:      sess.Title,
+			CWD:        sess.CWD,
+			CreatedAt:  sess.CreatedAt,
+			UpdatedAt:  sess.UpdatedAt,
+			MsgCount:   len(sess.Messages),
+			Source:     sess.Source,
+			ScheduleID: sess.ScheduleID,
+			Pinned:     sess.Pinned,
+			Favorite:   sess.Favorite,
 		})
 	}
 

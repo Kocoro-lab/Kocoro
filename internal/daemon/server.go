@@ -1520,6 +1520,8 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 
 	scopeAll := r.URL.Query().Get("scope") == "all"
 	limit, offset := parseSessionPageParams(r, scopeAll)
+	projectCWD := sessionProjectCWDFilter(r)
+	scheduleID := strings.TrimSpace(r.URL.Query().Get("schedule_id"))
 
 	// scope=all merges the default scope with every named agent's sessions.
 	// Any other value (including absent) preserves single-scope behavior.
@@ -1545,7 +1547,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 				summaries = append(summaries, sum)
 			}
 		}
-		s.writeSessionsPage(w, summaries, limit, offset)
+		s.writeSessionsPage(w, summaries, limit, offset, projectCWD, scheduleID)
 		return
 	}
 
@@ -1561,7 +1563,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// If the directory doesn't exist, return empty list.
 		if os.IsNotExist(err) {
-			s.writeSessionsPage(w, nil, limit, offset)
+			s.writeSessionsPage(w, nil, limit, offset, projectCWD, scheduleID)
 			return
 		}
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
@@ -1570,7 +1572,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	for i := range summaries {
 		summaries[i].Agent = agentName
 	}
-	s.writeSessionsPage(w, summaries, limit, offset)
+	s.writeSessionsPage(w, summaries, limit, offset, projectCWD, scheduleID)
 }
 
 // defaultSessionsPageLimit is the page size applied to scope=all when the
@@ -1611,14 +1613,45 @@ func parseSessionPageParams(r *http.Request, scopeAll bool) (limit, offset int) 
 	return limit, offset
 }
 
-// writeSessionsPage enriches (filter empties + stamp runtime state), sorts by
+// sessionProjectSummary is the complete project catalog returned alongside a
+// session page. It is computed before project filtering/pagination so Desktop's
+// project picker can reach old projects that are outside the current 100-row
+// recency window. Empty CWD represents legacy/unlinked sessions.
+type sessionProjectSummary struct {
+	CWD          string    `json:"cwd"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	SessionCount int       `json:"session_count"`
+}
+
+// writeSessionsPage enriches (filter empties + stamp runtime state), builds the
+// full project catalog, applies an optional exact project filter, sorts by
 // pinned DESC then updated_at DESC, applies offset/limit, and writes the paged
-// response with a has_more flag and the full (pre-page) total. A limit of
+// response with a has_more flag and the full (post-filter, pre-page) total. A limit of
 // unlimitedSessionsPage (0) returns every row from `offset` on (has_more
 // false). Pinned sessions are capped well under a page, so they naturally lead
 // the first page without special-casing.
-func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.SessionSummary, limit, offset int) {
+func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.SessionSummary, limit, offset int, projectCWD *string, scheduleID string) {
 	enriched := s.enrichSummaries(summaries)
+	if scheduleID != "" {
+		filtered := enriched[:0]
+		for _, summary := range enriched {
+			if summary.ScheduleID == scheduleID {
+				filtered = append(filtered, summary)
+			}
+		}
+		enriched = filtered
+	}
+	projects := summarizeSessionProjects(enriched)
+	if projectCWD != nil {
+		wanted := normalizeSessionProjectCWD(*projectCWD)
+		filtered := enriched[:0]
+		for _, summary := range enriched {
+			if summary.CWD == wanted {
+				filtered = append(filtered, summary)
+			}
+		}
+		enriched = filtered
+	}
 	sort.SliceStable(enriched, func(i, j int) bool {
 		if enriched[i].Pinned != enriched[j].Pinned {
 			return enriched[i].Pinned // pinned first
@@ -1645,9 +1678,63 @@ func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.Se
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"sessions": page,
+		"projects": projects,
 		"total":    total,
 		"has_more": end < total,
 	})
+}
+
+// sessionProjectCWDFilter preserves the three states required by the API:
+// absent = all projects, present+empty = legacy/unlinked, present+path = that
+// exact normalized working directory.
+func sessionProjectCWDFilter(r *http.Request) *string {
+	values, present := r.URL.Query()["project_cwd"]
+	if !present {
+		return nil
+	}
+	value := ""
+	if len(values) > 0 {
+		value = values[0]
+	}
+	return &value
+}
+
+func normalizeSessionProjectCWD(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return ""
+	}
+	if cwd == "~" || strings.HasPrefix(cwd, "~/") || strings.HasPrefix(cwd, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil {
+			if cwd == "~" {
+				cwd = home
+			} else {
+				cwd = filepath.Join(home, cwd[2:])
+			}
+		}
+	}
+	return filepath.Clean(cwd)
+}
+
+func summarizeSessionProjects(summaries []session.SessionSummary) []sessionProjectSummary {
+	byCWD := make(map[string]sessionProjectSummary)
+	for _, summary := range summaries {
+		project := byCWD[summary.CWD]
+		project.CWD = summary.CWD
+		project.SessionCount++
+		if summary.UpdatedAt.After(project.UpdatedAt) {
+			project.UpdatedAt = summary.UpdatedAt
+		}
+		byCWD[summary.CWD] = project
+	}
+	projects := make([]sessionProjectSummary, 0, len(byCWD))
+	for _, project := range byCWD {
+		projects = append(projects, project)
+	}
+	sort.SliceStable(projects, func(i, j int) bool {
+		return projects[i].UpdatedAt.After(projects[j].UpdatedAt)
+	})
+	return projects
 }
 
 // allSessionScopes returns every session scope to iterate for scope=all: the
@@ -1691,6 +1778,7 @@ func (s *Server) enrichSummaries(summaries []session.SessionSummary) []session.S
 			sum.AwaitingApproval = true
 		}
 		sum.Kind = kindOf(sum.Source)
+		sum.CWD = normalizeSessionProjectCWD(sum.CWD)
 		filtered = append(filtered, sum)
 	}
 	return filtered
@@ -2031,6 +2119,18 @@ func (s *Server) handleSessionSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"q parameter required"}`, http.StatusBadRequest)
 		return
 	}
+	projectCWD := sessionProjectCWDFilter(r)
+	var normalizedProjectCWD string
+	if projectCWD != nil {
+		normalizedProjectCWD = normalizeSessionProjectCWD(*projectCWD)
+	}
+	searchLimit := 20
+	if projectCWD != nil {
+		// Filtering happens after the existing per-scope content search. Pull a
+		// wider local window so a project with older matches is not hidden behind
+		// 20 newer matches from other projects; the endpoint remains unpaginated.
+		searchLimit = 400
+	}
 
 	// scope=all searches every scope (default + named agents) and merges hits.
 	// Any other value (including absent) preserves single-scope behavior.
@@ -2043,20 +2143,27 @@ func (s *Server) handleSessionSearch(w http.ResponseWriter, r *http.Request) {
 		results := []session.SearchResult{}
 		for _, scope := range scopes {
 			mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(scope))
-			scoped, err := mgr.Search(query, 20)
+			scoped, err := mgr.Search(query, searchLimit)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
 			for _, res := range scoped {
+				res.CWD = normalizeSessionProjectCWD(res.CWD)
+				if projectCWD != nil && res.CWD != normalizedProjectCWD {
+					continue
+				}
 				res.Agent = scope
 				results = append(results, res)
 			}
 		}
 		// Most recent first, across all scopes.
 		sort.Slice(results, func(i, j int) bool {
-			return results[i].CreatedAt.After(results[j].CreatedAt)
+			return results[i].UpdatedAt.After(results[j].UpdatedAt)
 		})
+		if projectCWD != nil && len(results) > 20 {
+			results = results[:20]
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
 		return
 	}
@@ -2070,7 +2177,7 @@ func (s *Server) handleSessionSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(agentName))
-	results, err := mgr.Search(query, 20)
+	results, err := mgr.Search(query, searchLimit)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -2078,10 +2185,19 @@ func (s *Server) handleSessionSearch(w http.ResponseWriter, r *http.Request) {
 	if results == nil {
 		results = []session.SearchResult{}
 	}
+	filtered := results[:0]
 	for i := range results {
+		results[i].CWD = normalizeSessionProjectCWD(results[i].CWD)
+		if projectCWD != nil && results[i].CWD != normalizedProjectCWD {
+			continue
+		}
 		results[i].Agent = agentName
+		filtered = append(filtered, results[i])
 	}
-	json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
+	if projectCWD != nil && len(filtered) > 20 {
+		filtered = filtered[:20]
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"results": filtered})
 }
 
 // searchErrStatus maps a SearchSessions error to an HTTP status: query-shape

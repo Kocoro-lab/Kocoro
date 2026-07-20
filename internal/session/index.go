@@ -30,7 +30,9 @@ import (
 //	6 — index clean body text only (user questions + final assistant replies),
 //	    excluding tool_result/tool_use dumps; forces a rebuild that drops the old
 //	    tool-output content and shrinks the index. See searchableMessageText.
-const indexSchemaVersion = 6
+//	7 — adds schedule_id to session metadata so list APIs can filter sessions
+//	    by their owning scheduled task without scanning transcript JSON.
+const indexSchemaVersion = 7
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at DATETIME NOT NULL,
     msg_count  INTEGER NOT NULL DEFAULT 0,
     source     TEXT NOT NULL DEFAULT '',
+	schedule_id TEXT NOT NULL DEFAULT '',
     route_key  TEXT NOT NULL DEFAULT '',
     pinned     INTEGER NOT NULL DEFAULT 0,
     favorite   INTEGER NOT NULL DEFAULT 0
@@ -78,15 +81,20 @@ END;
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_route_key_updated ON sessions(route_key, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_schedule_id_updated ON sessions(schedule_id, updated_at DESC);
 `
 
 type SearchResult struct {
-	SessionID    string    `json:"session_id"`
-	SessionTitle string    `json:"session_title"`
-	Role         string    `json:"role"`
-	Snippet      string    `json:"snippet"`
-	MsgIndex     int       `json:"msg_index"`
-	CreatedAt    time.Time `json:"created_at"`
+	SessionID    string `json:"session_id"`
+	SessionTitle string `json:"session_title"`
+	// CWD + UpdatedAt let Desktop attribute a buried full-text hit to its
+	// project and order/search it by last activity without loading the session.
+	CWD       string    `json:"cwd"`
+	Role      string    `json:"role"`
+	Snippet   string    `json:"snippet"`
+	MsgIndex  int       `json:"msg_index"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 	// Agent identifies the agent scope this result belongs to: empty string
 	// for the default agent, otherwise the agent slug. Populated at HTTP-search
 	// time by the daemon so cross-agent search (GET /sessions/search?scope=all)
@@ -155,6 +163,12 @@ func OpenIndex(dir string) (*Index, error) {
 					return nil, fmt.Errorf("add route_key column: %w", err)
 				}
 			}
+			if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN schedule_id TEXT NOT NULL DEFAULT ''`); err != nil {
+				if !strings.Contains(err.Error(), "duplicate column") {
+					db.Close()
+					return nil, fmt.Errorf("add schedule_id column: %w", err)
+				}
+			}
 			if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`); err != nil {
 				if !strings.Contains(err.Error(), "duplicate column") {
 					db.Close()
@@ -216,12 +230,13 @@ func (idx *Index) UpsertSession(sess *Session) error {
 		favorite = 1
 	}
 	_, err = tx.Exec(
-		`INSERT OR REPLACE INTO sessions (id, title, cwd, created_at, updated_at, msg_count, source, route_key, pinned, favorite)
-		 VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO sessions (id, title, cwd, created_at, updated_at, msg_count, source, schedule_id, route_key, pinned, favorite)
+		 VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
 		sess.ID, sess.Title, sess.CWD,
 		sess.CreatedAt.Format(time.RFC3339Nano),
 		sess.UpdatedAt.Format(time.RFC3339Nano),
 		sess.Source,
+		sess.ScheduleID,
 		sess.RouteKey,
 		pinned,
 		favorite,
@@ -314,7 +329,7 @@ func (idx *Index) UpdateSessionFlags(id string, pinned, favorite *bool) error {
 
 func (idx *Index) ListSessions() ([]SessionSummary, error) {
 	rows, err := idx.db.Query(
-		`SELECT id, title, created_at, updated_at, msg_count, source, pinned, favorite
+		`SELECT id, title, cwd, created_at, updated_at, msg_count, source, schedule_id, pinned, favorite
 		 FROM sessions ORDER BY pinned DESC, updated_at DESC`,
 	)
 	if err != nil {
@@ -327,7 +342,7 @@ func (idx *Index) ListSessions() ([]SessionSummary, error) {
 		var s SessionSummary
 		var createdStr, updatedStr string
 		var pinned, favorite int
-		if err := rows.Scan(&s.ID, &s.Title, &createdStr, &updatedStr, &s.MsgCount, &s.Source, &pinned, &favorite); err != nil {
+		if err := rows.Scan(&s.ID, &s.Title, &s.CWD, &createdStr, &updatedStr, &s.MsgCount, &s.Source, &s.ScheduleID, &pinned, &favorite); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		s.CreatedAt = parseTime(createdStr)
@@ -384,7 +399,7 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 	}
 
 	rows, err := idx.db.Query(
-		`SELECT m.session_id, s.title, m.role, m.msg_index, s.created_at,
+		`SELECT m.session_id, s.title, s.cwd, m.role, m.msg_index, s.created_at, s.updated_at,
 		        snippet(messages_fts, 0, '>>>', '<<<', '...', 40)
 		 FROM messages_fts
 		 JOIN messages m ON m.rowid = messages_fts.rowid
@@ -414,11 +429,12 @@ func (idx *Index) Search(query string, limit int) ([]SearchResult, error) {
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		var createdStr string
-		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.Role, &r.MsgIndex, &createdStr, &r.Snippet); err != nil {
+		var createdStr, updatedStr string
+		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.CWD, &r.Role, &r.MsgIndex, &createdStr, &updatedStr, &r.Snippet); err != nil {
 			return nil, fmt.Errorf("scan result: %w", err)
 		}
 		r.CreatedAt = parseTime(createdStr)
+		r.UpdatedAt = parseTime(updatedStr)
 		results = append(results, r)
 	}
 	return results, rows.Err()
@@ -488,7 +504,7 @@ func (idx *Index) searchLike(terms []string, limit int) ([]SearchResult, error) 
 		args = append(args, "%"+escapeLike(t)+"%")
 	}
 	args = append(args, limit)
-	sqlText := `SELECT m.session_id, s.title, m.role, m.msg_index, s.created_at, m.content
+	sqlText := `SELECT m.session_id, s.title, s.cwd, m.role, m.msg_index, s.created_at, s.updated_at, m.content
 		 FROM messages m
 		 JOIN sessions s ON s.id = m.session_id
 		 WHERE ` + strings.Join(clauses, " AND ") + `
@@ -503,11 +519,12 @@ func (idx *Index) searchLike(terms []string, limit int) ([]SearchResult, error) 
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		var createdStr, content string
-		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.Role, &r.MsgIndex, &createdStr, &content); err != nil {
+		var createdStr, updatedStr, content string
+		if err := rows.Scan(&r.SessionID, &r.SessionTitle, &r.CWD, &r.Role, &r.MsgIndex, &createdStr, &updatedStr, &content); err != nil {
 			return nil, fmt.Errorf("scan result: %w", err)
 		}
 		r.CreatedAt = parseTime(createdStr)
+		r.UpdatedAt = parseTime(updatedStr)
 		// Snippet around the first term match; fall back to the first term.
 		// Centre the snippet on the earliest matching term so the user can
 		// see why the result matched when their query had multiple terms.

@@ -75,6 +75,7 @@ type RunAgentRequest struct {
 	ClientMessageID string                `json:"client_message_id,omitempty"` // client-supplied id (e.g. Desktop queued-draft id) echoed back in the injected_committed SSE event when the loop drains this inject, so the client flips its queued card into a real bubble at the consume boundary
 	RouteKey        string                `json:"-"`                           // internal routing key
 	PinnedRouteKey  string                `json:"-"`                           // internal: returned verbatim by ComputeRouteKey so it survives the post-@mention recompute. Sticky schedules pin their dedicated agent:<name>:schedule:<id> key here; json:"-" so HTTP clients cannot pin an arbitrary route.
+	ScheduleID      string                `json:"-"`                           // internal: owning schedule for scheduler-created sessions. Persisted onto session metadata; HTTP clients cannot forge the association.
 	Ephemeral       bool                  `json:"-"`                           // caller owns persistence + events
 	ModelOverride   string                `json:"-"`                           // overrides agent model tier
 	BypassRouting   bool                  `json:"-"`                           // skip route lock (heartbeat runs)
@@ -993,7 +994,13 @@ func wantsPromptSuggestion(source string) bool {
 // onto it. Interactive sources (desktop/tui/kocoro/"") stay UNSTAMPED on purpose
 // so they remain Source="" => interactive — only koe gains channel-less stamping.
 func stampSessionOrigin(sess *session.Session, req RunAgentRequest) {
-	if sess == nil || req.Source == "" {
+	if sess == nil {
+		return
+	}
+	if req.ScheduleID != "" {
+		sess.ScheduleID = req.ScheduleID
+	}
+	if req.Source == "" {
 		return
 	}
 	if req.Channel != "" {

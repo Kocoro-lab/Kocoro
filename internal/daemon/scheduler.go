@@ -189,6 +189,7 @@ func buildScheduleRequest(sched schedule.Schedule, stickyContext string) RunAgen
 	req := RunAgentRequest{
 		Text:          sched.Prompt,
 		Agent:         sched.Agent,
+		ScheduleID:    sched.ID,
 		Source:        ChannelSchedule,
 		Channel:       ChannelSchedule + "-" + sched.ID,
 		Sender:        "scheduler",

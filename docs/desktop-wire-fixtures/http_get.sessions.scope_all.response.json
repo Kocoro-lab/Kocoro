@@ -3,6 +3,7 @@
     {
       "id": "2026-07-05-aaaaaaaaaaaa",
       "title": "agent chat",
+      "cwd": "",
       "created_at": "2026-07-05T10:00:01Z",
       "updated_at": "2026-07-05T10:00:01Z",
       "msg_count": 1,
@@ -12,11 +13,19 @@
     {
       "id": "2026-07-05-bbbbbbbbbbbb",
       "title": "default chat",
+      "cwd": "",
       "created_at": "2026-07-05T10:00:00Z",
       "updated_at": "2026-07-05T10:00:00Z",
       "msg_count": 1,
       "kind": "interactive",
       "agent": ""
+    }
+  ],
+  "projects": [
+    {
+      "cwd": "",
+      "updated_at": "2026-07-05T10:00:01Z",
+      "session_count": 2
     }
   ],
   "total": 2,

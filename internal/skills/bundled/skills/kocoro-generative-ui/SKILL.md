@@ -6,7 +6,12 @@ description: |
   Desktop chat. Use when the user asks to "visualize", "chart", "diagram",
   "explain visually", "show me", or when data is denser than a paragraph of
   prose.
-allowed-tools: file_read file_write publish_to_web think
+# allowed-tools is intentionally absent (2026-07-20). The run-scoped use_skill
+# filter hard-denied data tools after activation, breaking fetch-then-visualize
+# turns (chart a Slack/Notion/HTTP result). Rendering safety is bounded by
+# Desktop's sandboxed iframe (unique origin + CSP), not by this manifest.
+# Policy guard:
+# loader_test.go TestBundledPlatformSkills_ToolAllowlistIntentionallyAbsent.
 hidden: true
 metadata:
   version: "1.0.3"

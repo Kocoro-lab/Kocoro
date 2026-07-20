@@ -14,7 +14,13 @@ description: >
   Covers anything under ~/.shannon/. Do NOT use bash/file_read/file_edit to probe or modify
   these — kocoro routes every op through the daemon HTTP API at localhost:7533 which handles
   validation, atomic writes and audit logging.
-allowed-tools: http file_read think schedule_create schedule_list schedule_update schedule_remove schedule_show
+# allowed-tools is intentionally absent (2026-07-20). The use_skill filter is
+# run-scoped: once this skill activates, every later tool call in the run is
+# hard-denied unless allowlisted — and this skill's trigger surface is
+# deliberately broad ("MUST use for ANY read/write"), so an allowlist bricked
+# mixed turns (platform op + bash / integration tools). Routing discipline is
+# enforced by the body text below instead. Policy guard:
+# loader_test.go TestBundledPlatformSkills_ToolAllowlistIntentionallyAbsent.
 hidden: true
 ---
 

@@ -217,6 +217,9 @@ func TestBuildScheduleRequest_StatelessNamedAgent(t *testing.T) {
 	if req.Source != ChannelSchedule {
 		t.Errorf("Source = %q, want %q", req.Source, ChannelSchedule)
 	}
+	if req.ScheduleID != sched.ID {
+		t.Errorf("ScheduleID = %q, want %q", req.ScheduleID, sched.ID)
+	}
 }
 
 func TestBuildScheduleRequest_LegacyNamedAgent(t *testing.T) {
