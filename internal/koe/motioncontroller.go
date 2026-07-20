@@ -245,6 +245,13 @@ func (mc *MotionController) ObservePerception(snapshot PerceptionSnapshot) {
 
 	mc.perceptionMu.Lock()
 	defer mc.perceptionMu.Unlock()
+	// DOA reflection is a conversation reflex, not an idle room-noise motor loop.
+	// The XVF can report fan/mechanical noise as speech; moving the head on those
+	// samples creates more acoustic energy and feeds the detector again.
+	if !mc.desiredListening.Load() {
+		mc.doaCandidateHits = 0
+		return
+	}
 	if !snapshot.DOA.Available || !snapshot.DOA.Fresh || !snapshot.DOA.SpeechDetected {
 		mc.doaCandidateHits = 0
 		return

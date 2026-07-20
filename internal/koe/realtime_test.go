@@ -679,8 +679,8 @@ func TestAdaptiveBargeBackchannelResumesBufferedPlayback(t *testing.T) {
 	if !h.bargeCandidate.Load() {
 		t.Fatal("speech_started during playback did not create a barge candidate")
 	}
-	if got := audio.PlaybackGain(); got != defaultBargeDuckGain {
-		t.Fatalf("candidate playback gain = %v, want %v", got, defaultBargeDuckGain)
+	if got := audio.PlaybackGain(); got != defaultBargeSoftDuckGain {
+		t.Fatalf("candidate playback gain = %v, want %v", got, defaultBargeSoftDuckGain)
 	}
 	if got := len(audio.playBuf); got != 1 {
 		t.Fatalf("candidate must preserve buffered playback, got %d frame(s)", got)
@@ -818,8 +818,8 @@ func TestAdaptiveBargeDucksWhenServerVADConfirmsSpeech(t *testing.T) {
 	if !h.bargeCandidate.Load() {
 		t.Fatal("server VAD did not create a barge candidate")
 	}
-	if got := audio.PlaybackGain(); got != defaultBargeDuckGain {
-		t.Fatalf("server VAD playback gain = %v, want %v", got, defaultBargeDuckGain)
+	if got := audio.PlaybackGain(); got != defaultBargeSoftDuckGain {
+		t.Fatalf("server VAD playback gain = %v, want %v", got, defaultBargeSoftDuckGain)
 	}
 }
 
@@ -930,8 +930,8 @@ func TestAdaptiveBargeDucksLoudWithinGateReattack(t *testing.T) {
 	if h.turnIsSuppressedEcho("item-reattack") {
 		t.Fatal("loud within-gate reattack was classified as playback echo")
 	}
-	if got := audio.PlaybackGain(); got != defaultBargeDuckGain {
-		t.Fatalf("within-gate playback gain = %v, want %v", got, defaultBargeDuckGain)
+	if got := audio.PlaybackGain(); got != defaultBargeSoftDuckGain {
+		t.Fatalf("within-gate playback gain = %v, want %v", got, defaultBargeSoftDuckGain)
 	}
 }
 
@@ -975,7 +975,7 @@ func TestAdaptiveBargeSuppressesShortPostPlaybackEcho(t *testing.T) {
 func TestAdaptiveBargePromotesTailVADOnFrontSpeechReattack(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_CLIENT_RESPONSE", "1")
-	t.Setenv("KOE_BARGE_DUCK_GAIN", "0.05")
+	t.Setenv("KOE_BARGE_SOFT_DUCK_GAIN", "0.25")
 	audio, err := NewAudioIO()
 	if err != nil {
 		t.Fatalf("NewAudioIO: %v", err)
@@ -1005,15 +1005,15 @@ func TestAdaptiveBargePromotesTailVADOnFrontSpeechReattack(t *testing.T) {
 	if h.turnIsSuppressedEcho("item-tail-plus-human") {
 		t.Fatal("promoted server-VAD item remained echo-suppressed")
 	}
-	if got := audio.PlaybackGain(); got != 0.05 {
-		t.Fatalf("promoted playback gain = %v, want 0.05", got)
+	if got := audio.PlaybackGain(); got != 0.25 {
+		t.Fatalf("promoted playback gain = %v, want 0.25", got)
 	}
 }
 
 func TestAdaptiveBargeUsesExistingFrontSpeechAuthorization(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_CLIENT_RESPONSE", "1")
-	t.Setenv("KOE_BARGE_DUCK_GAIN", "0.05")
+	t.Setenv("KOE_BARGE_SOFT_DUCK_GAIN", "0.25")
 	audio, err := NewAudioIO()
 	if err != nil {
 		t.Fatalf("NewAudioIO: %v", err)
@@ -1035,8 +1035,8 @@ func TestAdaptiveBargeUsesExistingFrontSpeechAuthorization(t *testing.T) {
 	if h.turnIsSuppressedEcho("item-front-before-vad") {
 		t.Fatal("front-authorized server-VAD item was classified as echo")
 	}
-	if got := audio.PlaybackGain(); got != 0.05 {
-		t.Fatalf("front-authorized playback gain = %v, want 0.05", got)
+	if got := audio.PlaybackGain(); got != 0.25 {
+		t.Fatalf("front-authorized playback gain = %v, want 0.25", got)
 	}
 }
 
@@ -1163,6 +1163,65 @@ func TestAdaptiveBargeMeaningfulSpeechConfirmsAndQueuesResponse(t *testing.T) {
 	}
 	if got := len(h.respReq); got != 1 {
 		t.Fatalf("meaningful interruption queued %d responses, want 1", got)
+	}
+}
+
+func TestAdaptiveBargeShortNoiseTranscriptRestoresPlayback(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-noise-restore", "")
+	sender := &captureSender{}
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, audio, sender.send)
+	h.fullDuplexAEC = true
+	audio.SetPlaybackEnabled(true)
+	audio.SetSpeaking(true)
+	audio.Play(make([]int16, audioFrameSize))
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	audio.setInputLevel(0.10)
+	h.observeLocalSpeechStarted()
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","item_id":"item-noise","audio_start_ms":1000}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","item_id":"item-noise","audio_end_ms":2100}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-noise","transcript":"Bum!"}`))
+
+	if h.bargeCandidate.Load() {
+		t.Fatal("short noise transcript left a barge candidate active")
+	}
+	if got := audio.PlaybackGain(); got != 1 {
+		t.Fatalf("short noise transcript left playback gain at %v", got)
+	}
+	if sender.sentContains("response.cancel") || sender.sentContains("output_audio_buffer.clear") {
+		t.Fatalf("short noise transcript permanently interrupted playback: %v", sender.types())
+	}
+	if got := sender.countType("conversation.item.delete"); got != 1 {
+		t.Fatalf("short noise transcript deleted %d input items, want 1", got)
+	}
+}
+
+func TestShortBargeTranscriptEvidenceSupportsChineseJapaneseAndEnglish(t *testing.T) {
+	for _, tc := range []struct {
+		transcript string
+		suppress   bool
+	}{
+		{transcript: "Bum!", suppress: true},
+		{transcript: "登登登。", suppress: true},
+		{transcript: "Gadar.", suppress: true},
+		{transcript: "木星有多大", suppress: false},
+		{transcript: "不对，改成二十七", suppress: false},
+		{transcript: "待って、違うよ", suppress: false},
+		{transcript: "何時ですか？", suppress: false},
+		{transcript: "Actually, I meant twenty seven", suppress: false},
+		{transcript: "What?", suppress: false},
+	} {
+		if got := shouldSuppressUncorroboratedBarge(tc.transcript, 1100); got != tc.suppress {
+			t.Errorf("shouldSuppressUncorroboratedBarge(%q) = %t, want %t", tc.transcript, got, tc.suppress)
+		}
 	}
 }
 

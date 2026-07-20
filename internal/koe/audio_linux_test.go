@@ -187,7 +187,7 @@ func TestWirelessSpeakerWireIsNotDoubleDucked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAudioIO: %v", err)
 	}
-	a.SetPlaybackGain(defaultBargeDuckGain) // no conn yet: stores target only
+	a.SetPlaybackGain(defaultBargeSoftDuckGain) // no conn yet: stores target only
 	a.conn = koeConn
 	a.wg.Add(1)
 	go a.spkPump()

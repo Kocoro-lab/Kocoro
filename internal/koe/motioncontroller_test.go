@@ -332,6 +332,7 @@ func TestMotionControllerDOAReflectionRequiresSustainedSpeechWithoutFace(t *test
 	defer cancel()
 	go mc.Run(ctx)
 	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+	mc.ObserveVoiceState("listening")
 
 	now := time.Unix(100, 0)
 	snapshot := PerceptionSnapshot{
@@ -362,6 +363,30 @@ func TestMotionControllerDOAReflectionRequiresSustainedSpeechWithoutFace(t *test
 	}
 }
 
+func TestMotionControllerIgnoresDOAWhileConversationIsIdle(t *testing.T) {
+	fb := newFakeBridge(t, []string{"success1"})
+	defer fb.close()
+	mc := NewMotionController(fb.path, ActivityStandard, nil)
+	mc.pollInterval = 15 * time.Millisecond
+	mc.doaHitsRequired = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mc.Run(ctx)
+	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+
+	for i := 0; i < 5; i++ {
+		mc.ObservePerception(PerceptionSnapshot{
+			ObservedAt: time.Now().Add(time.Duration(i) * 100 * time.Millisecond),
+			Face:       FaceSample{Available: true, Fresh: true, Detected: false},
+			DOA:        DOASample{Available: true, Fresh: true, Angle: math.Pi / 4, SpeechDetected: true},
+		})
+	}
+	time.Sleep(75 * time.Millisecond)
+	if got := len(fb.rpcParams(reachy.MethodLookAt)); got != 0 {
+		t.Fatalf("idle room noise drove %d DOA look-at RPC(s)", got)
+	}
+}
+
 func TestMotionControllerFaceTrackingSuppressesDOAHeadWriter(t *testing.T) {
 	fb := newFakeBridge(t, []string{"success1"})
 	defer fb.close()
@@ -372,6 +397,7 @@ func TestMotionControllerFaceTrackingSuppressesDOAHeadWriter(t *testing.T) {
 	defer cancel()
 	go mc.Run(ctx)
 	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+	mc.ObserveVoiceState("listening")
 
 	mc.ObservePerception(PerceptionSnapshot{
 		ObservedAt: time.Now(),
@@ -395,6 +421,7 @@ func TestMotionControllerTaskCompleteTurnsThenPlaysFixedSuccess(t *testing.T) {
 	defer cancel()
 	go mc.Run(ctx)
 	waitForKMC(t, 2*time.Second, mc.MovesApplied)
+	mc.ObserveVoiceState("listening")
 
 	// A tracked face prevents the immediate DOA reflex but still records who spoke;
 	// the event lane uses that angle after the task completes.

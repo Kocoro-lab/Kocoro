@@ -570,8 +570,8 @@ func (a *AudioIO) spkPump() {
 			}
 			// Carrier v0.4 owns the final device-side gain envelope so a duck also
 			// affects audio already queued in its jitter/batch layers. Keep wire PCM
-			// unscaled here; applying the gain twice would turn a 15% deep duck into
-			// an unintended near-mute.
+			// unscaled here; applying the gain twice would turn one intentional
+			// device-side duck into an unintended near-mute.
 			wire := a.toCarrierPCM(queued.pcm) // 48k codec → 16k wire (§9-b.1)
 			a.setOutputLevel(rmsLevel(wire))
 			payload := s16PCMToBytes(wire)

@@ -130,8 +130,8 @@ type eventHandler struct {
 	// session to continue from the unsaid point instead of losing the reply.
 	bargeServerCleared atomic.Bool
 	// bargeServerVAD distinguishes a reversible local soft-duck from a candidate
-	// independently corroborated by Realtime VAD. Only the latter survives the
-	// local gate closing while transcription decides whether to hard-interrupt.
+	// independently corroborated by Realtime VAD. Both remain at the same audible
+	// duck level; only transcript evidence may hard-interrupt the old response.
 	bargeServerVAD atomic.Bool
 	// asyncTaskPending keeps Desktop/--once in "thinking" after the model's short
 	// spoken ack while do_task is still running or its result speech is queued.
@@ -509,7 +509,7 @@ func (h *eventHandler) beginBargeCandidate(gain float64, serverVAD bool, evidenc
 	if changed && eventLogEnabled() {
 		stage := "soft"
 		if serverVAD {
-			stage = "deep"
+			stage = "corroborated"
 		}
 		log.Printf(
 			"koe[barge]: candidate stage=%s evidence=%s target_gain=%.0f%%",
@@ -538,6 +538,27 @@ func (h *eventHandler) resumeBargeCandidate(reason string) bool {
 		h.emitVoiceState(h.voiceStateAfterSpeaking())
 	}
 	return h.bargeServerCleared.Swap(false)
+}
+
+func (h *eventHandler) emitRejectedInputState() {
+	if h.isSpeakingOrResponding() {
+		h.emitVoiceState("speaking")
+		return
+	}
+	h.emitVoiceState(h.voiceStateAfterSpeaking())
+}
+
+func (h *eventHandler) cancelRejectedAutoResponse(hadBargeCandidate bool) {
+	// A server-owned response may already have been created for this rejected
+	// input. Cancel that response before it can speak, but never confuse it with
+	// the assistant reply that the user just (falsely) talked over.
+	if hadBargeCandidate || !h.respBusy.Load() || h.outputBufferActive.Load() {
+		return
+	}
+	if h.audio != nil && h.audio.Speaking() {
+		return
+	}
+	h.stopOutput(false)
 }
 
 func (h *eventHandler) confirmBargeCandidate() {
@@ -2049,7 +2070,7 @@ func (h *eventHandler) observeFusedBargeReattack() bool {
 	h.turnSuppressedEcho[itemID] = false
 	h.activeSuppressedEcho = ""
 	h.turnMu.Unlock()
-	gain := koeEnvFloat("KOE_BARGE_DUCK_GAIN", defaultBargeDuckGain)
+	gain := koeEnvFloat("KOE_BARGE_SOFT_DUCK_GAIN", defaultBargeSoftDuckGain)
 	if !h.beginBargeCandidate(gain, true, "server_vad_plus_front_speech") {
 		return false
 	}
@@ -2692,16 +2713,16 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 				} else if withinGateReattack {
 					evidence = "within_gate_reattack"
 				}
-				gain := koeEnvFloat("KOE_BARGE_DUCK_GAIN", defaultBargeDuckGain)
+				gain := koeEnvFloat("KOE_BARGE_SOFT_DUCK_GAIN", defaultBargeSoftDuckGain)
 				h.beginBargeCandidate(gain, true, evidence)
 				log.Printf(
-					"koe[barge]: possible talk-over detected — playback deep-ducked evidence=%s input_level=%.4f",
+					"koe[barge]: possible talk-over detected — playback soft-ducked evidence=%s input_level=%.4f",
 					evidence,
 					inputLevel,
 				)
 			}
 		}
-		h.emitVoiceState("listening")
+		h.emitRejectedInputState()
 	case "input_audio_buffer.speech_stopped":
 		h.userSpeaking.Store(false)
 		h.speechStoppedAt = time.Now()
@@ -3087,11 +3108,17 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 			log.Printf("koe[turn]: unsupported-script short fragment — suppressing response")
 		}
 		h.cancelRequestedTurnResponse(itemID)
-		if h.isSpeakingOrResponding() {
-			h.interruptOutput()
+		hadCandidate := h.bargeCandidate.Load()
+		resumeNeeded := false
+		if hadCandidate {
+			resumeNeeded = h.resumeBargeCandidate("unsupported-script short audio")
 		}
 		h.deleteInputItem(itemID)
-		h.emitVoiceState("listening")
+		if resumeNeeded {
+			h.requestResponseWith(responseCreateRequest{instructions: falseInterruptionResumeInstructions})
+		}
+		h.cancelRejectedAutoResponse(hadCandidate)
+		h.emitRejectedInputState()
 		return
 	}
 	// The raw-audio floor controller is authoritative when available. Provider
@@ -3126,7 +3153,7 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 			h.interruptOutput()
 		}
 		h.deleteInputItem(itemID)
-		h.emitVoiceState("listening")
+		h.emitRejectedInputState()
 		return
 	}
 	if isSilentBackchannelPhrase(transcript) {
@@ -3135,16 +3162,16 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 		}
 		resumeNeeded := false
 		h.cancelRequestedTurnResponse(itemID)
-		if h.bargeCandidate.Load() {
+		hadCandidate := h.bargeCandidate.Load()
+		if hadCandidate {
 			resumeNeeded = h.resumeBargeCandidate("backchannel")
-		} else if h.isSpeakingOrResponding() {
-			h.interruptOutput()
 		}
 		h.deleteInputItem(itemID)
 		if resumeNeeded {
 			h.requestResponseWith(responseCreateRequest{instructions: falseInterruptionResumeInstructions})
 		}
-		h.emitVoiceState("listening")
+		h.cancelRejectedAutoResponse(hadCandidate)
+		h.emitRejectedInputState()
 		return
 	}
 	// Short empty transcriptions are the field signature of a residual echo pulse
@@ -3157,35 +3184,45 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 		}
 		resumeNeeded := false
 		h.cancelRequestedTurnResponse(itemID)
-		if h.bargeCandidate.Load() {
+		hadCandidate := h.bargeCandidate.Load()
+		if hadCandidate {
 			resumeNeeded = h.resumeBargeCandidate("short empty audio")
-		} else if h.isSpeakingOrResponding() {
-			h.interruptOutput()
 		}
 		h.deleteInputItem(itemID)
 		if resumeNeeded {
 			h.requestResponseWith(responseCreateRequest{instructions: falseInterruptionResumeInstructions})
 		}
-		h.emitVoiceState("listening")
+		h.cancelRejectedAutoResponse(hadCandidate)
+		h.emitRejectedInputState()
 		return
 	}
-	wasBarge := h.turnIsSuppressedEcho(itemID)
-	if wasBarge {
-		if shouldSuppressUncorroboratedBarge(transcript, speechMS) {
-			if eventLogEnabled() {
-				log.Printf("koe[barge]: suppressing short uncorroborated playback echo")
-			}
-			h.cancelRequestedTurnResponse(itemID)
-			h.deleteInputItem(itemID)
-			h.emitVoiceState(h.voiceStateAfterSpeaking())
-			return
+	wasSuppressedEcho := h.turnIsSuppressedEcho(itemID)
+	wasCandidate := h.bargeCandidate.Load()
+	if (wasSuppressedEcho || wasCandidate) && shouldSuppressUncorroboratedBarge(transcript, speechMS) {
+		if eventLogEnabled() {
+			log.Printf("koe[barge]: suppressing short uncorroborated interruption")
 		}
+		h.cancelRequestedTurnResponse(itemID)
+		resumeNeeded := false
+		if wasCandidate {
+			resumeNeeded = h.resumeBargeCandidate("short uncorroborated audio")
+		}
+		h.deleteInputItem(itemID)
+		if resumeNeeded {
+			h.requestResponseWith(responseCreateRequest{instructions: falseInterruptionResumeInstructions})
+		}
+		h.cancelRejectedAutoResponse(wasCandidate)
+		h.emitRejectedInputState()
+		return
+	}
+	wasBarge := wasSuppressedEcho
+	if wasSuppressedEcho {
 		if eventLogEnabled() {
 			log.Printf("koe[barge]: accepting meaningful uncorroborated talk-over")
 		}
 		h.bargeInStopPlayback()
 	}
-	if h.bargeCandidate.Load() {
+	if wasCandidate {
 		wasBarge = true
 		h.confirmBargeCandidate()
 	}
@@ -3213,29 +3250,42 @@ func shouldSuppressUncorroboratedBarge(transcript string, speechMS int64) bool {
 	if text == "" {
 		return true
 	}
-	hasCJK := false
-	for _, r := range text {
-		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana) {
-			hasCJK = true
-			break
-		}
-	}
-	if !hasCJK {
-		return true
-	}
-	// A short CJK question, request, or correction is meaningful even when the
-	// local gate remained open across playback and could not emit a fresh onset.
-	// The false positives observed on hardware were brief acknowledgements or
-	// foreign gibberish ("はい", "Chillón", "がんばれ"), none with these intents.
+	normalized := strings.ToLower(strings.Join(strings.Fields(text), ""))
 	for _, marker := range []string{
-		"?", "？", "吗", "嗎", "么", "什麼", "什么", "多少", "几", "幾", "哪", "谁", "誰",
-		"不对", "不對", "错", "錯", "回答", "告诉", "告訴", "请", "請",
-		"か", "ですか", "ますか", "いくつ", "何", "どこ", "どれ", "誰", "教えて", "答えて", "ください",
-		"違う", "ちがう", "間違",
+		"?", "？", "等等", "等一下", "不对", "不對", "不是", "错了", "錯了", "改成", "我是说", "我是說",
+		"什么", "什麼", "多少", "为什么", "為什麼", "请", "請", "回答", "告诉", "告訴",
+		"待って", "まって", "違う", "ちがう", "間違", "何", "どこ", "どれ", "誰", "教えて", "答えて",
+		"wait", "stop", "holdon", "actually", "imeant", "isaid", "wrong", "instead", "what", "why", "how",
 	} {
-		if strings.Contains(text, marker) {
+		if strings.Contains(normalized, marker) {
 			return false
 		}
+	}
+
+	cjkLetters := 0
+	latinLetters := 0
+	digits := 0
+	for _, r := range text {
+		switch {
+		case unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana):
+			cjkLetters++
+		case unicode.In(r, unicode.Latin):
+			latinLetters++
+		case unicode.IsDigit(r):
+			digits++
+		}
+	}
+	if digits > 0 && cjkLetters+latinLetters == 0 {
+		return false
+	}
+	if cjkLetters >= 4 {
+		return false
+	}
+	words := strings.FieldsFunc(text, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	if latinLetters >= 8 || (latinLetters >= 5 && len(words) >= 2) {
+		return false
 	}
 	return true
 }
