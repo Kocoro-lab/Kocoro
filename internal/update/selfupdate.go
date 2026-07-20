@@ -92,9 +92,16 @@ func PlatformInfo() string {
 
 // AutoUpdate performs a background-safe update check + download.
 // Returns a user-facing message (empty if nothing to report).
-// Skips if: dev build or cache is fresh.
+// Skips if: dev/prerelease build or cache is fresh.
+//
+// Git-describe versions such as "0.3.5-79-g1a466fb2" are valid semver
+// prereleases, but they are newer source snapshots than the 0.3.5 release.
+// Semver compares them as older than 0.3.5, so allowing background replacement
+// would silently downgrade a locally built Preview/canary to the public binary.
+// Explicit `shan update` remains available when a developer really wants that.
 func AutoUpdate(currentVersion, shannonDir string) string {
-	if _, err := semver.NewVersion(currentVersion); err != nil {
+	version, err := semver.NewVersion(currentVersion)
+	if err != nil || version.Prerelease() != "" || version.Metadata() != "" {
 		return ""
 	}
 
