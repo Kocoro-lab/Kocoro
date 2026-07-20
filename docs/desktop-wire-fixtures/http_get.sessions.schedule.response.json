@@ -1,0 +1,25 @@
+{
+  "sessions": [
+    {
+      "id": "2026-07-20-aaaaaaaaaaaa",
+      "title": "scheduled report",
+      "cwd": "",
+      "created_at": "2026-07-20T00:00:00Z",
+      "updated_at": "2026-07-20T00:00:00Z",
+      "msg_count": 1,
+      "source": "schedule",
+      "schedule_id": "sch-daily",
+      "kind": "schedule",
+      "agent": ""
+    }
+  ],
+  "projects": [
+    {
+      "cwd": "",
+      "updated_at": "2026-07-20T00:00:00Z",
+      "session_count": 1
+    }
+  ],
+  "total": 1,
+  "has_more": false
+}

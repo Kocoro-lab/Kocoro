@@ -171,6 +171,12 @@ const (
 	// `projects` catalog. Desktop gates folder-derived project grouping on the
 	// whole contract so an older helper falls back to the flat list.
 	CapSessionProjectsV1 = "session_projects_v1"
+	// CapScheduleSessionFilterV1 — scheduler-created sessions persist their
+	// owning schedule_id, GET /sessions accepts schedule_id=<id>, and deleting
+	// a schedule leaves those sessions untouched. Desktop gates the Schedules
+	// master-detail session list on the full contract so an older daemon cannot
+	// silently ignore the query and return every session for the agent.
+	CapScheduleSessionFilterV1 = "schedule_session_filter_v1"
 	// CapAgentDefaultCWDV1 — named-agent cwd writes are validated before any
 	// mutation, invalid persisted cwd is surfaced as a non-fatal warning, and
 	// cross-device agent sync treats cwd as device-local (never pushed or
@@ -231,6 +237,7 @@ var Capabilities = []string{
 	CapPerAgentMCPScope,
 	CapSessionsScopeAll,
 	CapSessionProjectsV1,
+	CapScheduleSessionFilterV1,
 	CapAgentDefaultCWDV1,
 	CapRemoteControlV1,
 	CapRemoteSessionTimelineV1,

@@ -43,11 +43,12 @@ func TestIndex_UpsertAndList(t *testing.T) {
 
 	now := time.Now().Truncate(time.Second)
 	sess := &Session{
-		ID:        "sess-1",
-		Title:     "First session",
-		CWD:       "/tmp/test",
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:         "sess-1",
+		Title:      "First session",
+		CWD:        "/tmp/test",
+		ScheduleID: "sched-daily",
+		CreatedAt:  now,
+		UpdatedAt:  now,
 		Messages: []client.Message{
 			{Role: "user", Content: client.NewTextContent("hello world")},
 			{Role: "assistant", Content: client.NewTextContent("hi there")},
@@ -73,6 +74,9 @@ func TestIndex_UpsertAndList(t *testing.T) {
 	}
 	if summaries[0].MsgCount != 2 {
 		t.Errorf("expected 2 messages, got %d", summaries[0].MsgCount)
+	}
+	if summaries[0].ScheduleID != "sched-daily" {
+		t.Errorf("expected ScheduleID 'sched-daily', got %q", summaries[0].ScheduleID)
 	}
 }
 

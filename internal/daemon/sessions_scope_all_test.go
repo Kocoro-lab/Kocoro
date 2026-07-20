@@ -210,6 +210,94 @@ func TestHandleSessions_ProjectCatalogAndFilter(t *testing.T) {
 	}
 }
 
+func TestHandleSessions_ScheduleIDFilter(t *testing.T) {
+	dir := t.TempDir()
+	shannonDir := filepath.Join(dir, "shannon")
+	sessionsDir := filepath.Join(shannonDir, "sessions")
+	mgr := session.NewManager(sessionsDir)
+	seed := func(title, scheduleID string) string {
+		sess := mgr.NewSession()
+		sess.Title = title
+		sess.Source = ChannelSchedule
+		sess.Channel = ChannelSchedule + "-" + scheduleID
+		sess.ScheduleID = scheduleID
+		sess.Messages = append(sess.Messages, client.Message{Role: "user", Content: client.NewTextContent(title)})
+		if err := mgr.Save(); err != nil {
+			t.Fatalf("save %q: %v", title, err)
+		}
+		return sess.ID
+	}
+	wantedID := seed("daily report", "sched-daily")
+	seed("weekly report", "sched-weekly")
+	mgr.Close()
+
+	s := &Server{deps: &ServerDeps{
+		ShannonDir:   shannonDir,
+		AgentsDir:    filepath.Join(shannonDir, "agents"),
+		SessionCache: NewSessionCache(shannonDir),
+	}}
+	rr := httptest.NewRecorder()
+	s.handleSessions(rr, httptest.NewRequest(http.MethodGet, "/sessions?schedule_id=sched-daily", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Sessions []session.SessionSummary `json:"sessions"`
+		Total    int                      `json:"total"`
+		HasMore  bool                     `json:"has_more"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Sessions) != 1 || resp.Sessions[0].ID != wantedID {
+		t.Fatalf("schedule filter returned %+v, want only %s", resp.Sessions, wantedID)
+	}
+	if resp.Sessions[0].ScheduleID != "sched-daily" || resp.Total != 1 || resp.HasMore {
+		t.Fatalf("schedule response metadata = %+v total=%d hasMore=%v", resp.Sessions[0], resp.Total, resp.HasMore)
+	}
+}
+
+func TestWireFixture_HTTPSessionsScheduleFilter(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.sessions.schedule.response.json")
+	dir := t.TempDir()
+	shannonDir := filepath.Join(dir, "shannon")
+	mgr := session.NewManager(filepath.Join(shannonDir, "sessions"))
+	sess := mgr.NewSession()
+	sess.Title = "scheduled report"
+	sess.Source = ChannelSchedule
+	sess.Channel = "schedule-sch-daily"
+	sess.ScheduleID = "sch-daily"
+	sess.Messages = append(sess.Messages, client.Message{Role: "user", Content: client.NewTextContent("prepare report")})
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+	mgr.Close()
+
+	deps := &ServerDeps{
+		ShannonDir:   shannonDir,
+		AgentsDir:    filepath.Join(shannonDir, "agents"),
+		SessionCache: NewSessionCache(shannonDir),
+	}
+	rec := httptest.NewRecorder()
+	NewServer(0, nil, deps, "test").Handler().ServeHTTP(
+		rec,
+		httptest.NewRequest(http.MethodGet, "/sessions?schedule_id=sch-daily", nil),
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET schedule sessions = %d body=%s", rec.Code, rec.Body.String())
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	pm := produced["sessions"].([]any)[0].(map[string]any)
+	fm := fixture["sessions"].([]any)[0].(map[string]any)
+	normalizePrefixedID(t, pm, fm, "id", "2026-")
+	normalizeRFC3339(t, pm, fm, "created_at")
+	normalizeRFC3339(t, pm, fm, "updated_at")
+	producedProjects := produced["projects"].([]any)
+	fixtureProjects := fixture["projects"].([]any)
+	normalizeRFC3339(t, producedProjects[0].(map[string]any), fixtureProjects[0].(map[string]any), "updated_at")
+	assertSemanticEqual(t, fixture, produced)
+}
+
 // TestWireFixture_HTTPSessionsScopeAll pins the GET /sessions?scope=all response
 // shape (merged across default + named agents, each tagged with its `agent`
 // scope) against the committed fixture, driving the FULL production router.

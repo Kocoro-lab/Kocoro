@@ -892,6 +892,33 @@ func mustList(t *testing.T, store *Store) []SessionSummary {
 	return sums
 }
 
+func TestStoreLoadBackfillsLegacyScheduleID(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	legacy := `{
+  "schema_version": 1,
+  "id": "legacy-schedule-session",
+  "created_at": "2026-07-20T00:00:00Z",
+  "updated_at": "2026-07-20T00:00:00Z",
+  "title": "Daily report",
+  "cwd": "",
+  "messages": [],
+  "source": "schedule",
+  "channel": "schedule-sched-legacy"
+}`
+	if err := os.WriteFile(filepath.Join(dir, "legacy-schedule-session.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.Load("legacy-schedule-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ScheduleID != "sched-legacy" {
+		t.Fatalf("ScheduleID = %q, want sched-legacy", loaded.ScheduleID)
+	}
+}
+
 // TestStore_RoundTripInterleavedThinkingBlocks confirms that assistant
 // messages with interleaved thinking blocks survive a Save → Load cycle
 // with text + signatures intact. The Session struct already serializes

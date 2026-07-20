@@ -1521,6 +1521,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	scopeAll := r.URL.Query().Get("scope") == "all"
 	limit, offset := parseSessionPageParams(r, scopeAll)
 	projectCWD := sessionProjectCWDFilter(r)
+	scheduleID := strings.TrimSpace(r.URL.Query().Get("schedule_id"))
 
 	// scope=all merges the default scope with every named agent's sessions.
 	// Any other value (including absent) preserves single-scope behavior.
@@ -1546,7 +1547,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 				summaries = append(summaries, sum)
 			}
 		}
-		s.writeSessionsPage(w, summaries, limit, offset, projectCWD)
+		s.writeSessionsPage(w, summaries, limit, offset, projectCWD, scheduleID)
 		return
 	}
 
@@ -1562,7 +1563,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// If the directory doesn't exist, return empty list.
 		if os.IsNotExist(err) {
-			s.writeSessionsPage(w, nil, limit, offset, projectCWD)
+			s.writeSessionsPage(w, nil, limit, offset, projectCWD, scheduleID)
 			return
 		}
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
@@ -1571,7 +1572,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	for i := range summaries {
 		summaries[i].Agent = agentName
 	}
-	s.writeSessionsPage(w, summaries, limit, offset, projectCWD)
+	s.writeSessionsPage(w, summaries, limit, offset, projectCWD, scheduleID)
 }
 
 // defaultSessionsPageLimit is the page size applied to scope=all when the
@@ -1629,8 +1630,17 @@ type sessionProjectSummary struct {
 // unlimitedSessionsPage (0) returns every row from `offset` on (has_more
 // false). Pinned sessions are capped well under a page, so they naturally lead
 // the first page without special-casing.
-func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.SessionSummary, limit, offset int, projectCWD *string) {
+func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.SessionSummary, limit, offset int, projectCWD *string, scheduleID string) {
 	enriched := s.enrichSummaries(summaries)
+	if scheduleID != "" {
+		filtered := enriched[:0]
+		for _, summary := range enriched {
+			if summary.ScheduleID == scheduleID {
+				filtered = append(filtered, summary)
+			}
+		}
+		enriched = filtered
+	}
 	projects := summarizeSessionProjects(enriched)
 	if projectCWD != nil {
 		wanted := normalizeSessionProjectCWD(*projectCWD)
