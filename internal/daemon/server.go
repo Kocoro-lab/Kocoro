@@ -6065,6 +6065,13 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use model_tier for tiers", model))
 			return
 		}
+		// effort_tier is a closed enum ("" / low / high / xhigh / max) sent
+		// verbatim to the LLM provider; an out-of-enum value fails the run far
+		// downstream with an obscure remote 400. Reject at the boundary.
+		if tier, ok := agentPatch["effort_tier"].(string); ok && !agents.IsValidEffortTier(tier) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.effort_tier %q is not valid; use one of \"\", \"low\", \"high\", \"xhigh\", \"max\"", tier))
+			return
+		}
 	}
 
 	if err := s.patchGlobalConfig(patch); err != nil {

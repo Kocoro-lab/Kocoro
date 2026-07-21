@@ -62,4 +62,37 @@ func TestValidateAgentModelConfig(t *testing.T) {
 			t.Errorf("expected error for tier %q in agent.model", tier)
 		}
 	}
+
+	// nil EffortTier is fine (inherit); "" is fine (explicit inherit); each
+	// valid tier is fine.
+	if err := ValidateAgentModelConfig(&AgentModelConfig{EffortTier: nil}); err != nil {
+		t.Errorf("nil effort_tier should be valid: %v", err)
+	}
+	for _, tier := range []string{"", "low", "high", "xhigh", "max"} {
+		if err := ValidateAgentModelConfig(&AgentModelConfig{EffortTier: ptr(tier)}); err != nil {
+			t.Errorf("effort_tier %q should be valid: %v", tier, err)
+		}
+	}
+
+	// An out-of-enum effort_tier is the bug we guard against — a bad value
+	// would otherwise reach the LLM provider and fail with an obscure remote
+	// 400.
+	for _, tier := range []string{"medium", "Low", " low", "LOW", "extreme"} {
+		if err := ValidateAgentModelConfig(&AgentModelConfig{EffortTier: ptr(tier)}); err == nil {
+			t.Errorf("expected error for invalid effort_tier %q", tier)
+		}
+	}
+}
+
+func TestIsValidEffortTier(t *testing.T) {
+	for _, tier := range []string{"", "low", "high", "xhigh", "max"} {
+		if !IsValidEffortTier(tier) {
+			t.Errorf("expected %q to be valid", tier)
+		}
+	}
+	for _, tier := range []string{"medium", "Low", " low", "LOW", "extreme"} {
+		if IsValidEffortTier(tier) {
+			t.Errorf("expected %q to be invalid", tier)
+		}
+	}
 }
