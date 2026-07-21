@@ -66,7 +66,7 @@ func ValidateAgentModelConfig(c *AgentModelConfig) error {
 		return fmt.Errorf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use agent.model_tier for tiers", *c.Model)
 	}
 	if c.EffortTier != nil && !IsValidEffortTier(*c.EffortTier) {
-		return fmt.Errorf("agent.effort_tier %q is not valid; use one of %s", *c.EffortTier, strings.Join(effortTierAllowedValues(), ", "))
+		return fmt.Errorf("agent.effort_tier %q is not valid; use one of %s", *c.EffortTier, strings.Join(EffortTierAllowedValues(), ", "))
 	}
 	return nil
 }
@@ -85,8 +85,8 @@ func IsValidEffortTier(s string) bool {
 	return validEffortTiers[s]
 }
 
-// effortTierAllowedValues renders the allowed values (including "" for
+// EffortTierAllowedValues renders the allowed values (including "" for
 // unset/inherit) for error messages, e.g. `"", "low", "high", "xhigh", "max"`.
-func effortTierAllowedValues() []string {
+func EffortTierAllowedValues() []string {
 	return []string{`""`, `"low"`, `"high"`, `"xhigh"`, `"max"`}
 }

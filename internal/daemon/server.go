@@ -6069,7 +6069,7 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		// verbatim to the LLM provider; an out-of-enum value fails the run far
 		// downstream with an obscure remote 400. Reject at the boundary.
 		if tier, ok := agentPatch["effort_tier"].(string); ok && !agents.IsValidEffortTier(tier) {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.effort_tier %q is not valid; use one of \"\", \"low\", \"high\", \"xhigh\", \"max\"", tier))
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.effort_tier %q is not valid; use one of %s", tier, strings.Join(agents.EffortTierAllowedValues(), ", ")))
 			return
 		}
 	}
