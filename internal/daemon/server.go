@@ -5221,10 +5221,18 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := skills.InstallSkillFromRepo(s.deps.ShannonDir, name); err != nil {
+	if err := skills.InstallSkillFromRepo(r.Context(), s.deps.ShannonDir, name); err != nil {
 		if strings.Contains(err.Error(), "already installed") {
 			s.auditHTTPOpError("POST", endpoint, "already installed", err)
 			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		// Deterministic "not in the upstream Anthropic repo" is a 404, not an
+		// internal error — the download/extraction succeeded, the skill just
+		// isn't there. Everything else (network, extraction) stays a 500.
+		if errors.Is(err, skills.ErrSkillNotInRepo) {
+			s.auditHTTPOpError("POST", endpoint, "not in upstream repo", err)
+			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
 		s.auditHTTPOpError("POST", endpoint, "install failed", err)
