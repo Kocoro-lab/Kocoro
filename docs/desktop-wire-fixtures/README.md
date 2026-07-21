@@ -61,6 +61,7 @@ Three transport surfaces, named by file prefix:
 | `sse_event.tool.running.json` | `server.go sseEventHandler.OnToolCall` | bus shape minus `session_id`/`ts` (stream is request-scoped) |
 | `sse_event.tool.completed.json` | `server.go sseEventHandler.OnToolResult` | same |
 | `sse_event.done.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | optional fields omitted here: `partial`, `failure_code`, `message_start_index`, `message_end_index` (all omitempty, soft-failure metadata) |
+| `sse_event.done.with_deliverable.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | `message_idempotency_receipt_v2`: an empty chat reply plus daemon-validated `present_deliverable` metadata. A client that persists a local artifact requires this receipt before deleting its retained source |
 | `bus_event.cloud_progress.json` | `bus_handler.go OnCloudProgress` | counts-only today; a future `items` array extension will be additive + capability-gated |
 | `bus_event.suggestion_ready.json` | `runner.go fireSuggestionAfterRun` | post-turn suggested next user prompt |
 | `bus_event.deliverable.json` | `bus_handler.go makeDeliverableEventHandler` | daemon-validated local regular-file metadata emitted by `present_deliverable`; Desktop dedupes live/replay/history records by `id` |
@@ -78,12 +79,21 @@ Three transport surfaces, named by file prefix:
 
 ### Quick-panel surfaces (POST request bodies + error responses)
 
+`POST /message` optionally accepts `idempotency_key` together with a
+client-minted `session_id` (`message_idempotency_v1`).
+`message_idempotency_receipt_v2` additionally persists validated deliverable
+receipts and returns stable failed/in-progress error codes. The first request
+durably records acceptance before running tools. A completed retry returns the
+stored terminal result; an accepted-but-interrupted or failed request never
+auto-runs again under the same key.
+
 | File | Producer | Notes |
 |---|---|---|
 | `local_screenshot_window_request.json` | Desktop → `POST /local/screenshot/window` | `screenshotWindowRequest` struct; `window_title` included as empty string; `pid` + `app_name` both present (either is sufficient for the handler) |
 | `local_screenshot_window_denied.json` | `screenshot_window.go handleScreenshotWindow` (403 branch) | `writeErrorCode` shape: `{"error":…,"code":…}`; `code` is the stable i18n key Desktop localises on; emitted when ax_server returns `screen_recording_denied` |
 | `local_screenshot_window_success.json` | `screenshot_window.go handleScreenshotWindow` (200 branch) | `{"image_base64":…,"width":…,"height":…}`; anchors key names consumed by Desktop's `CaptureWindowResult` |
 | `message_foreground_hint_request.json` | Desktop → `POST /message` | `RunAgentRequest` with `foreground_hint` populated; `source: "kocoro"` is the quick-panel source string; `foreground_hint` is folded into `StickyContext` by the runner, never forwarded to Cloud |
+| `message_idempotency_request.json` | Desktop → `POST /message` | Crash-safe primary request with a client-minted `session_id` + stable `idempotency_key`; decoded and validated by the daemon and emitted by Desktop's production request builder |
 
 ## Comparison Rule: Semantic Equality, Not Byte Equality
 

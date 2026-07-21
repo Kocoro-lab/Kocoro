@@ -1,0 +1,21 @@
+{
+  "reply": "",
+  "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "agent": "",
+  "usage": {
+    "input_tokens": 9240,
+    "output_tokens": 312,
+    "total_tokens": 9552,
+    "cost_usd": 0.0318
+  },
+  "deliverables": [
+    {
+      "id": "dlv_0123456789abcdef",
+      "path": "/Users/example/Desktop/Report.md",
+      "filename": "Report.md",
+      "title": "Report",
+      "mime": "text/markdown",
+      "byte_size": 2048
+    }
+  ]
+}
