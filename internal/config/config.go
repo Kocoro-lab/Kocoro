@@ -87,13 +87,16 @@ type KoeConfig struct {
 	// PersonaSource == "custom". Injected as-is (already voice-friendly), wrapped
 	// by Koe's base persona; empty falls back to the base persona only.
 	CustomPersona string `mapstructure:"custom_persona" yaml:"custom_persona,omitempty" json:"custom_persona,omitempty"`
-	// EffortTier is the reasoning-effort tier applied to the Kocoro agent TASK
-	// triggered by voice (Path A /v1/completions), NOT the realtime voice model
-	// itself (which has no effort knob). Unified tier names shared with
-	// AgentConfig.EffortTier ("low"/"high"/"xhigh"/"max"). Empty defaults to
-	// "low" at injection (runner) to keep voice-triggered tasks low-latency,
-	// independent of the agent's text-mode effort.
-	EffortTier string `mapstructure:"effort_tier" yaml:"effort_tier,omitempty" json:"effort_tier,omitempty"`
+	// FastEffort forces the Kocoro agent TASK triggered by voice (Path A
+	// /v1/completions) to run at the fastest effort tier ("low") for low
+	// latency, NOT the realtime voice model itself (which has no effort knob).
+	// A *bool so the three states round-trip Desktop's RFC-7386 PATCH:
+	//   nil (unset) / &true  → force low (default ON — voice is snappy)
+	//   &false               → do NOT override; the voice-triggered task
+	//                          inherits the agent's normal global/per-agent
+	//                          effort (for users who don't mind waiting).
+	// Independent of the agent's text-mode effort.
+	FastEffort *bool `mapstructure:"fast_effort" yaml:"fast_effort,omitempty" json:"fast_effort,omitempty"`
 }
 
 // MCPConfig holds client-side settings shared across all MCP servers.

@@ -741,27 +741,30 @@ func applyKoeResponseLanguage(loop *agent.AgentLoop, source, text string) {
 	loop.SetResponseLanguage(inferKoeResponseLanguage(text))
 }
 
-// koeDefaultEffortTier is the reasoning-effort tier applied to voice-triggered
-// Kocoro agent tasks (Path A /v1/completions) when koe.effort_tier is unset.
-// Voice prioritizes low latency, so it defaults to the fastest tier rather than
-// inheriting the (possibly higher) text-mode global/per-agent effort.
-const koeDefaultEffortTier = "low"
+// koeFastEffortTier is the effort tier voice-triggered tasks are forced to when
+// koe.fast_effort is on — the fastest tier, for low-latency voice.
+const koeFastEffortTier = "low"
 
-// applyKoeEffortTier overrides the loop's effort tier for voice-triggered tasks.
-// It runs AFTER the global + per-agent effort has been applied so voice always
-// wins: an unset koe.effort_tier falls back to koeDefaultEffortTier (low), NOT
-// the text-mode effort, keeping voice snappy independent of the agent's text
-// settings. The realtime voice model itself has no effort knob — this tunes the
-// Kocoro agent task the voice front-brain triggers via do_task.
+// applyKoeEffortTier optionally forces the loop's effort tier to fast for
+// voice-triggered tasks. It runs AFTER the global + per-agent effort has been
+// applied, so when fast mode is ON it overrides them. The realtime voice model
+// itself has no effort knob — this tunes the Kocoro agent task the voice
+// front-brain triggers via do_task.
+//
+// koe.fast_effort is a *bool with three states:
+//   - nil (unset) / true → force koeFastEffortTier (default ON: voice is snappy)
+//   - false              → do NOT override; the task keeps the agent's normal
+//                          global/per-agent effort (for users who prefer quality
+//                          over latency on voice).
 func applyKoeEffortTier(loop *agent.AgentLoop, source string, koe config.KoeConfig) {
 	if loop == nil || !isKoeSource(source) {
 		return
 	}
-	tier := strings.TrimSpace(koe.EffortTier)
-	if tier == "" {
-		tier = koeDefaultEffortTier
+	// Default ON: only an explicit false opts out of fast voice.
+	if koe.FastEffort != nil && !*koe.FastEffort {
+		return
 	}
-	loop.SetEffortTier(tier)
+	loop.SetEffortTier(koeFastEffortTier)
 }
 
 func inferKoeResponseLanguage(text string) string {

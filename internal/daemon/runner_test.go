@@ -1619,30 +1619,39 @@ func TestApplyAgentModelOverlayToLoop_EmptyEffortInherits(t *testing.T) {
 	}
 }
 
-// TestApplyKoeEffortTier verifies the voice effort override: koe sources get
-// the configured tier, an unset koe.effort_tier falls back to the low default
-// (NOT the text-mode effort already on the loop), and non-koe sources are left
-// untouched.
+// TestApplyKoeEffortTier verifies the voice fast-effort toggle: on koe sources,
+// fast mode (unset/true) forces low over the text-mode effort, an explicit
+// false leaves it untouched, and non-koe sources are always left untouched.
 func TestApplyKoeEffortTier(t *testing.T) {
-	// Unset koe.effort_tier → low default, overriding whatever text-mode effort
-	// the global/per-agent chain left on the loop.
+	tru := true
+	fls := false
+
+	// Unset fast_effort → default ON → force low, overriding whatever text-mode
+	// effort the global/per-agent chain left on the loop.
 	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
 	loop.SetEffortTier("max")
 	applyKoeEffortTier(loop, "koe", config.KoeConfig{})
 	if got := loop.EffortTier(); got != "low" {
-		t.Errorf("koe with unset effort_tier = %q, want low default", got)
+		t.Errorf("koe with unset fast_effort = %q, want low (default ON)", got)
 	}
 
-	// Explicit koe.effort_tier wins.
-	loop.SetEffortTier("low")
-	applyKoeEffortTier(loop, "koe", config.KoeConfig{EffortTier: "xhigh"})
+	// Explicit true → same as unset: force low.
+	loop.SetEffortTier("max")
+	applyKoeEffortTier(loop, "koe", config.KoeConfig{FastEffort: &tru})
+	if got := loop.EffortTier(); got != "low" {
+		t.Errorf("koe with fast_effort=true = %q, want low", got)
+	}
+
+	// Explicit false → do NOT override; the text-mode effort is preserved.
+	loop.SetEffortTier("xhigh")
+	applyKoeEffortTier(loop, "koe", config.KoeConfig{FastEffort: &fls})
 	if got := loop.EffortTier(); got != "xhigh" {
-		t.Errorf("koe with explicit effort_tier = %q, want xhigh", got)
+		t.Errorf("koe with fast_effort=false = %q, want xhigh (inherited)", got)
 	}
 
-	// Non-koe source: no-op, text-mode effort preserved.
+	// Non-koe source: no-op even with fast_effort=true, text-mode effort preserved.
 	loop.SetEffortTier("high")
-	applyKoeEffortTier(loop, "desktop", config.KoeConfig{EffortTier: "xhigh"})
+	applyKoeEffortTier(loop, "desktop", config.KoeConfig{FastEffort: &tru})
 	if got := loop.EffortTier(); got != "high" {
 		t.Errorf("non-koe source should not touch effort: got %q, want high", got)
 	}

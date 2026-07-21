@@ -6158,10 +6158,11 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 			"agent":            cfg.Koe.Agent,
 			"language":         cfg.Koe.Language,
 			"audio_processing": cfg.Koe.AudioProcessing,
-			// Voice Task Effort tier. Empty here means "unset"; the runner
-			// applies the low default at injection, so Desktop should render an
-			// unset value as 快速(low) to match runtime behavior.
-			"effort_tier": cfg.Koe.EffortTier,
+			// Fast-effort toggle for voice-triggered tasks. nil (unset) means the
+			// runtime default (ON → force fast/low), so Desktop renders an unset
+			// value as ON. Only an explicit false opts out (voice keeps the
+			// agent's normal effort).
+			"fast_effort": cfg.Koe.FastEffort,
 		}
 	}
 
