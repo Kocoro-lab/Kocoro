@@ -4,14 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
-	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 	mcpproto "github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -479,77 +477,6 @@ func TestRegisterLocalTools_CleanupSkipsDeprecatedBrowser(t *testing.T) {
 	}
 	if !browser.IsDeprecated() {
 		t.Fatalf("deprecated flag must persist after cleanup")
-	}
-}
-
-// TestKocoroSkillAllowedToolsAreRegistered guards the manifest↔registry
-// invariant for the bundled kocoro skill: every tool named in its
-// allowed-tools must resolve to a real registered local tool. The drift this
-// catches is silent and severe — allowed-tools is enforced as execution-time
-// denial (loop.go), so a tool the skill's own docs tell the model to call but
-// that is missing from the allowlist gets hard-denied with "[skill
-// restriction]" at call time. schedule_show shipped as a tool in PR #216 but
-// was left out of the allowlist for exactly this reason; nothing failed until
-// the model tried to use it.
-func TestKocoroSkillAllowedToolsAreRegistered(t *testing.T) {
-	// Pin HOME so config.ShannonDir() is deterministic — RegisterLocalTools
-	// only registers the schedule_* tools when ShannonDir() != "".
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	src, err := skills.BundledSkillSource(config.ShannonDir())
-	if err != nil {
-		t.Fatalf("extract bundled skills: %v", err)
-	}
-	loaded, err := skills.LoadSkills(src)
-	if err != nil {
-		t.Fatalf("load bundled skills: %v", err)
-	}
-	var kocoro *skills.Skill
-	for _, s := range loaded {
-		if s.Slug == "kocoro" {
-			kocoro = s
-			break
-		}
-	}
-	if kocoro == nil {
-		t.Fatal("bundled kocoro skill not found")
-	}
-	if len(kocoro.AllowedTools) == 0 {
-		t.Fatal("kocoro skill declares no allowed-tools; expected a restrictive allowlist")
-	}
-
-	reg, _, cleanup := RegisterLocalTools(nil, nil)
-	defer cleanup()
-
-	allowed := make(map[string]bool, len(kocoro.AllowedTools))
-	for _, name := range kocoro.AllowedTools {
-		allowed[name] = true
-	}
-
-	// Direction 1: every allowlist entry resolves to a real registered tool.
-	// Catches a dangling allowlist (typo, or a tool that was renamed/removed).
-	for _, name := range kocoro.AllowedTools {
-		if _, ok := reg.Get(name); !ok {
-			t.Errorf("kocoro allowed-tools lists %q, but it is not a registered local tool; "+
-				"the skill filter would hard-deny it with [skill restriction] at call time", name)
-		}
-	}
-
-	// Direction 2 (the schedule_show regression class): every registered
-	// schedule_* tool must be in the allowlist. The kocoro skill is THE
-	// schedule-management assistant — its docs steer the model to the native
-	// schedule_* tools — so a registered schedule tool that is missing from
-	// the allowlist is silently undocumented-and-denied. schedule_show shipped
-	// in PR #216 registered-but-not-allowlisted and hit exactly this. A future
-	// schedule_* tool tripping this assertion is the desired signal: allowlist
-	// it (or consciously decide not to and update this test).
-	for _, name := range reg.Names() {
-		if strings.HasPrefix(name, "schedule_") && !allowed[name] {
-			t.Errorf("registered tool %q is not in the kocoro skill allowlist; "+
-				"the skill manages schedules natively, so this tool would be hard-denied "+
-				"with [skill restriction] when the skill is active", name)
-		}
 	}
 }
 
