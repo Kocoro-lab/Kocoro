@@ -603,6 +603,13 @@ func Clone(cfg *Config) *Config {
 	cloned.Permissions.DeniedCommands = append([]string(nil), cfg.Permissions.DeniedCommands...)
 	cloned.Permissions.SensitivePatterns = append([]string(nil), cfg.Permissions.SensitivePatterns...)
 	cloned.Permissions.NetworkAllowlist = append([]string(nil), cfg.Permissions.NetworkAllowlist...)
+	cloned.Permissions.AlwaysAllowTools = append([]string(nil), cfg.Permissions.AlwaysAllowTools...)
+
+	// Cloud.PublishAllowedExtensions and MCP.WorkspaceRoots are appended in place
+	// by mergeRuntimeOverlayFile (dedup(append(cfg.X, overlay.X...))) right after
+	// Clone in RuntimeConfigForCWD. Without a deep copy the append aliases the
+	// shared base's backing array, racing concurrent per-cwd runs in the daemon.
+	cloned.Cloud.PublishAllowedExtensions = append([]string(nil), cfg.Cloud.PublishAllowedExtensions...)
 
 	cloned.Hooks.PreToolUse = append([]hooks.HookEntry(nil), cfg.Hooks.PreToolUse...)
 	cloned.Hooks.PostToolUse = append([]hooks.HookEntry(nil), cfg.Hooks.PostToolUse...)
@@ -637,6 +644,7 @@ func Clone(cfg *Config) *Config {
 	// the denylist races with a concurrent delete.
 	cloned.Skills.Disabled = append([]string(nil), cfg.Skills.Disabled...)
 	cloned.MCP.DefaultAgentDisabled = append([]string(nil), cfg.MCP.DefaultAgentDisabled...)
+	cloned.MCP.WorkspaceRoots = append([]string(nil), cfg.MCP.WorkspaceRoots...)
 
 	return &cloned
 }
