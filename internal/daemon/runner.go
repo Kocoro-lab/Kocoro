@@ -1245,6 +1245,10 @@ func completedIdempotentResult(sess *session.Session, key, agentName string) (*R
 	}
 	switch record.State {
 	case idempotentRequestCompleted:
+		// A replayed dedup hit reports no NEW spend: Usage is intentionally
+		// left zero here because the original run already reported and billed
+		// its tokens/cost. A cost-tracking client must not double-count a
+		// deduplicated retry (it will therefore see $0 for the replay).
 		return &RunAgentResult{
 			Reply:        record.Reply,
 			SessionID:    sess.ID,
@@ -1274,6 +1278,11 @@ func setIdempotentRequestState(
 	if sess.IdempotentRequests == nil {
 		sess.IdempotentRequests = make(map[string]session.IdempotentRequest)
 	}
+	// Contract: callers own a one-key-per-fresh-session pairing (Desktop mints a
+	// new session_id per keyed handoff), so this map holds a single entry in the
+	// intended flow and is not pruned. A client that reuses one session across
+	// many keys would grow the map (and the persisted session JSON) without
+	// bound — that is a caller-contract violation, not a supported pattern.
 	sess.IdempotentRequests[key] = session.IdempotentRequest{
 		State:        state,
 		Reply:        reply,
@@ -1304,6 +1313,17 @@ func (c *deliverableReceiptCollector) snapshot() []session.DeliverableReceipt {
 	return append([]session.DeliverableReceipt(nil), c.receipts...)
 }
 
+// terminalIdempotencyState decides the durable state persisted for a keyed
+// request. It fails closed: a run is recorded "completed" (and thus replayable)
+// only when the outcome is known AND it either succeeded cleanly or produced at
+// least one durable deliverable. A soft-failure partial with no deliverable
+// (e.g. an iteration-limit / idle-timeout run that emitted only partial text)
+// is recorded "failed" ON PURPOSE — the first caller still receives that
+// partial as a successful response, but a retry of the same key gets
+// ErrIdempotentRequestFailed and re-runs to actually produce the missing
+// artifact, rather than the client trusting an incomplete result and (for the
+// meeting handoff) deleting its source audio. Only the deliverable-produced
+// path replays a partial; a text-only partial is deliberately not replayable.
 func terminalIdempotencyState(outcomeKnown bool, runErr error, deliverableCount int) string {
 	if outcomeKnown && (runErr == nil || deliverableCount > 0) {
 		return idempotentRequestCompleted

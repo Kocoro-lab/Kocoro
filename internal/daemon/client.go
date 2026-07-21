@@ -220,6 +220,12 @@ const (
 	// fail closed and require explicit recovery. Kocoro Desktop uses this for
 	// a crash-safe file-producing handoff, whose file-writing side effect must
 	// not duplicate across an app crash after daemon completion.
+	//
+	// The guarantee is sequential-retry-safe, not concurrent-submission-safe:
+	// two SIMULTANEOUS requests with the same session_id/key can both pass the
+	// in-progress guard before either registers its route or saves "accepted",
+	// so a naive concurrent client could still double-execute the side effect.
+	// Callers must serialize retries of a key (Desktop does).
 	CapMessageIdempotencyV1 = "message_idempotency_v1"
 	// CapMessageIdempotencyReceiptV2 persists daemon-validated
 	// present_deliverable receipts in the idempotent result and returns stable
