@@ -326,7 +326,7 @@ See `docs/cache-strategy.md` (4-breakpoint allocation, source→TTL routing, byt
 - **Failure telemetry**: `recordCompactionFailure` emits `OnRunStatus("compaction_failed")` + audit row. 9 phase tags.
 - **Tiered result compression**: Tier 1 (>10 msg old) metadata only; Tier 2 (3-10) head+tail; Tier 3 (0-2) full.
 - **Memory staleness**: `annotateStaleness()` appends `[N days ago]` to memory headings.
-- **Deferred tool loading**: when count > 30, MCP/gateway tools sent as name+description; model calls `tool_search`.
+- **Deferred tool loading**: when count > 30, MCP/gateway tools sent as name+description; model calls `tool_search`. `web_search`/`web_fetch` are exempt (`neverDeferTools` in `toolbudget.go`) and always ship full schemas, on both the primary tool-ref path and the legacy path (`buildLocalActiveSchemas`).
 - **System reminders**: short `<system-reminder>` hints appended to `file_read`/`file_write`/`file_edit`/`bash` results; skipped for `cloud_delegate`.
 
 ### Anti-Hallucination

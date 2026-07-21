@@ -59,6 +59,21 @@ func shouldDeferByCategory(name string) bool {
 	return strings.HasPrefix(name, "browser_")
 }
 
+// neverDeferTools enumerates gateway tools that must never enter the
+// deferred set, even though gateway tools are deferred-eligible by default
+// (deferredToolNames in deferred.go). web_search/web_fetch are the most
+// common opener of a NEW session (e.g. "what's the news on X") — deferring
+// them forces the model into an extra tool_search round-trip before it can
+// call the tool at all, adding ~6s of observed latency to the very first
+// reply of a session, every session, since the WorkingSet warm cache is
+// session-scoped and starts cold each time. Same trade as memory_recall
+// above: the two extra full schemas ride along in the cacheable system
+// prefix, so the byte cost is paid once per session, not per turn.
+var neverDeferTools = map[string]bool{
+	"web_search": true,
+	"web_fetch":  true,
+}
+
 // estimateSchemaTokens returns a heuristic token count for the named tool
 // schemas using compact JSON serialization.
 func estimateSchemaTokens(reg *ToolRegistry, names []string) int {
