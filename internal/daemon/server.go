@@ -2571,6 +2571,21 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// not RouteKey alone — to avoid misrouting fresh requests through inject.
 	if req.RouteKey != "" {
 		if s.deps.SessionCache.HasActiveRun(req.RouteKey) {
+			// A primary idempotent request is never a steering inject. The first
+			// run already owns this stable session/key; injecting the same prompt
+			// into it would bypass the durable request ledger and can duplicate
+			// external side effects. Let the caller retry after the owning run
+			// reaches a terminal durable state.
+			if req.IdempotencyKey != "" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "rejected",
+					"reason": "idempotent_request_in_progress",
+					"route":  req.RouteKey,
+				})
+				return
+			}
 			switch s.injectIntoActiveRun(r.Context(), req) {
 			case InjectOK:
 				if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
@@ -2778,7 +2793,14 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	handler := &sseEventHandler{w: w, flusher: flusher, broker: reqBroker, ctx: r.Context(), autoApprove: autoApprove, deps: s.deps, agent: req.Agent, source: req.Source}
 	result, err := RunAgent(r.Context(), s.deps, req, handler)
 	if err != nil {
-		fmt.Fprintf(w, "event: error\ndata: %s\n\n", mustJSON(map[string]string{"error": err.Error()}))
+		payload := map[string]string{"error": err.Error()}
+		switch {
+		case errors.Is(err, ErrIdempotentRequestFailed):
+			payload["code"] = "idempotent_request_failed"
+		case errors.Is(err, ErrIdempotentRequestInProgress):
+			payload["code"] = "idempotent_request_in_progress"
+		}
+		fmt.Fprintf(w, "event: error\ndata: %s\n\n", mustJSON(payload))
 		flusher.Flush()
 		return
 	}

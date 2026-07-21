@@ -692,6 +692,28 @@ func TestCapabilities_AdvertisesAgentProfileV1(t *testing.T) {
 	}
 }
 
+func TestCapabilities_AdvertisesMessageIdempotencyV1(t *testing.T) {
+	found := false
+	for _, capability := range Capabilities {
+		if capability == CapMessageIdempotencyV1 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("default Capabilities = %v, want to contain %q", Capabilities, CapMessageIdempotencyV1)
+	}
+}
+
+func TestCapabilities_AdvertisesMessageIdempotencyReceiptV2(t *testing.T) {
+	for _, capability := range Capabilities {
+		if capability == CapMessageIdempotencyReceiptV2 {
+			return
+		}
+	}
+	t.Errorf("default Capabilities = %v, want to contain %q", Capabilities, CapMessageIdempotencyReceiptV2)
+}
+
 // TestSendDeliveryAck_EmptyMessageIDIsNoOp confirms a missing inbound
 // MessageID short-circuits before sendEnvelope. The wire protocol
 // requires non-empty MessageID for delivery_ack (Cloud warns and drops

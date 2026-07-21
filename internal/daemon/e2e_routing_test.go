@@ -359,6 +359,53 @@ func TestE2E_InjectEndpoint_HTTP(t *testing.T) {
 	}
 }
 
+// A retryable primary request with an idempotency key must never fall through
+// to the mid-turn injection path. Doing so would bypass the durable request
+// ledger and could execute a file-writing handoff twice.
+func TestE2E_ActiveIdempotentRequestReturnsConflictWithoutInjecting(t *testing.T) {
+	dir := t.TempDir()
+	sc := NewSessionCache(dir)
+	defer sc.CloseAll()
+
+	injectCh := make(chan agent.InjectedMessage, 1)
+	sc.mu.Lock()
+	sc.routes["session:12345678"] = &routeEntry{
+		injectCh: injectCh,
+		done:     make(chan struct{}),
+	}
+	sc.mu.Unlock()
+
+	deps := &ServerDeps{SessionCache: sc, ShannonDir: dir, AgentsDir: dir}
+	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
+	srv := NewServer(0, c, deps, "test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Start(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	body := strings.NewReader(`{"text":"write notes","session_id":"12345678","new_session":true,"source":"desktop","idempotency_key":"job-12345678"}`)
+	resp, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d/message", srv.Port()), "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", resp.StatusCode)
+	}
+	var result map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result["reason"] != "idempotent_request_in_progress" {
+		t.Fatalf("response = %v", result)
+	}
+	select {
+	case msg := <-injectCh:
+		t.Fatalf("idempotent primary request was injected: %+v", msg)
+	default:
+	}
+}
+
 // TestE2E_InjectEndpoint_QueueFull_Returns429 verifies queue-full returns 429.
 func TestE2E_InjectEndpoint_QueueFull_Returns429(t *testing.T) {
 	dir := t.TempDir()
