@@ -227,7 +227,7 @@ func TestInstallFromRepo_RetriesOnTransientFailure(t *testing.T) {
 	}
 
 	destDir := filepath.Join(shannonDir, "skills", "retry-fixture")
-	if err := installFromRepo(shannonDir, "retry-fixture", destDir); err != nil {
+	if err := installFromRepo(context.Background(), shannonDir, "retry-fixture", destDir); err != nil {
 		t.Fatalf("install should succeed after retry, got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(destDir, "SKILL.md")); err != nil {
@@ -258,7 +258,7 @@ func TestInstallFromRepo_NoRetryOnNotFoundSentinel(t *testing.T) {
 	}
 
 	destDir := filepath.Join(shannonDir, "skills", "does-not-exist")
-	err := installFromRepo(shannonDir, "does-not-exist", destDir)
+	err := installFromRepo(context.Background(), shannonDir, "does-not-exist", destDir)
 	if err == nil {
 		t.Fatalf("expected sentinel error, got nil")
 	}
@@ -288,7 +288,7 @@ func TestInstallFromRepo_ExhaustsRetriesAndReturnsLastError(t *testing.T) {
 	}
 
 	destDir := filepath.Join(shannonDir, "skills", "always-fails")
-	err := installFromRepo(shannonDir, "always-fails", destDir)
+	err := installFromRepo(context.Background(), shannonDir, "always-fails", destDir)
 	if err == nil {
 		t.Fatalf("expected error after exhausting retries, got nil")
 	}
@@ -405,6 +405,67 @@ func TestExtractSkillFromTarball_PerFileSizeCap(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "pdf")
 	if err := extractSkillFromTarball(bytes.NewReader(buf.Bytes()), "pdf", dest); err == nil {
 		t.Fatalf("expected per-file size cap error, got nil")
+	}
+}
+
+// tarGzBytes builds a .tar.gz from ordered (name, body) regular-file entries.
+func tarGzBytes(t *testing.T, entries [][2]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, e := range entries {
+		body := []byte(e[1])
+		if err := tw.WriteHeader(&tar.Header{Name: e[0], Mode: 0644, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestExtractSkillFromTarball_FileCountCap trips the per-skill file-count guard
+// — one of the decompression-bomb backstops that otherwise has no direct test.
+func TestExtractSkillFromTarball_FileCountCap(t *testing.T) {
+	orig := maxSkillFiles
+	maxSkillFiles = 2
+	t.Cleanup(func() { maxSkillFiles = orig })
+
+	data := tarGzBytes(t, [][2]string{
+		{"root/skills/pdf/SKILL.md", "---\nname: pdf\ndescription: x\n---\n"},
+		{"root/skills/pdf/a.md", "a"},
+		{"root/skills/pdf/b.md", "b"},
+	})
+	dest := filepath.Join(t.TempDir(), "pdf")
+	if err := extractSkillFromTarball(bytes.NewReader(data), "pdf", dest); err == nil ||
+		!strings.Contains(err.Error(), "files") {
+		t.Fatalf("expected file-count cap error, got %v", err)
+	}
+}
+
+// TestExtractSkillFromTarball_TotalDecompressionCap trips the whole-archive
+// decompression guard (countingReader / maxSkillTarballBytes) — the other
+// backstop that was previously untested.
+func TestExtractSkillFromTarball_TotalDecompressionCap(t *testing.T) {
+	orig := maxSkillTarballBytes
+	maxSkillTarballBytes = 4 // below even a single 512-byte tar header block
+	t.Cleanup(func() { maxSkillTarballBytes = orig })
+
+	data := tarGzBytes(t, [][2]string{
+		{"root/skills/pdf/SKILL.md", "---\nname: pdf\ndescription: x\n---\nbody"},
+	})
+	dest := filepath.Join(t.TempDir(), "pdf")
+	if err := extractSkillFromTarball(bytes.NewReader(data), "pdf", dest); err == nil ||
+		!strings.Contains(err.Error(), "decompression") {
+		t.Fatalf("expected decompression-guard error, got %v", err)
 	}
 }
 

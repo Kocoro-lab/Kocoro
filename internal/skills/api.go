@@ -397,8 +397,9 @@ func overlayBuiltinFromEmbed(name, destDir string) error {
 // InstallSkill installs a downloadable skill to the global skills directory
 // (~/.shannon/skills/<name>/). First checks if the skill is available in the
 // embedded bundled directory (fast, no network). Falls back to fetching from
-// Anthropic's skills repo via git sparse checkout.
-func InstallSkill(shannonDir, name string) error {
+// Anthropic's skills repo over HTTP. ctx propagates request cancellation into
+// the network download.
+func InstallSkill(ctx context.Context, shannonDir, name string) error {
 	if err := ValidateSkillName(name); err != nil {
 		return err
 	}
@@ -417,7 +418,7 @@ func InstallSkill(shannonDir, name string) error {
 	}
 
 	// Fall back to Anthropic's repo
-	return installFromRepo(shannonDir, name, destDir)
+	return installFromRepo(ctx, shannonDir, name, destDir)
 }
 
 // ErrPreviewUnavailable is returned by PreviewSkill when a downloadable skill
@@ -499,13 +500,17 @@ var ErrSkillNotInRepo = errors.New("skill not found in Anthropic repo")
 // download on transient failures (network flake, github.com reachability).
 // Does NOT retry ErrSkillNotInRepo — that's a real 404 against the upstream
 // tree, not a flake.
-func installFromRepo(shannonDir, name, destDir string) error {
+func installFromRepo(ctx context.Context, shannonDir, name, destDir string) error {
 	var lastErr error
 	for attempt := 0; attempt < installFromRepoMaxAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * time.Second)
+			select {
+			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
-		err := tryInstallFromRepo(shannonDir, name, destDir)
+		err := tryInstallFromRepo(ctx, shannonDir, name, destDir)
 		if err == nil {
 			return nil
 		}
@@ -523,14 +528,14 @@ func installFromRepo(shannonDir, name, destDir string) error {
 // a fresh per-attempt staging dir, then copies that into destDir. A fresh
 // tmpDir per attempt guarantees a partially-written download from a previous
 // failure cannot contaminate the next try.
-func tryInstallFromRepo(shannonDir, name, destDir string) error {
+func tryInstallFromRepo(ctx context.Context, shannonDir, name, destDir string) error {
 	tmpDir, err := os.MkdirTemp(shannonDir, "skill-install-*")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	rc, err := openRepoTarball(context.Background())
+	rc, err := openRepoTarball(ctx)
 	if err != nil {
 		return fmt.Errorf("download skills tarball: %w", err)
 	}
@@ -563,14 +568,26 @@ func tryInstallFromRepo(shannonDir, name, destDir string) error {
 // git binary, no partial-clone/sparse-checkout git-version requirements.
 const anthropicSkillsTarballURL = "https://codeload.github.com/anthropics/skills/tar.gz/refs/heads/main"
 
-// Extraction backstops for the downloaded tarball. Generous but bounded: the
-// payload is attacker-influenced (a compromised upstream / MITM), so cap total
-// decompressed bytes (zip-bomb guard), per-file size, and file count. Vars (not
-// consts) so tests can shrink them to exercise the guards cheaply.
+// Extraction backstops for the downloaded tarball. The payload is
+// attacker-influenced (compromised upstream / MITM), so we cap total
+// decompressed bytes (decompression-bomb guard), per-file size, and file
+// count. Because install extracts from a whole-repo tarball, these bound the
+// ENTIRE anthropics/skills tree, not a single skill.
+//
+//   - Workload: the full anthropics/skills repo — today ~4 MiB compressed,
+//     tens of MiB decompressed, a few hundred files — so these sit well above
+//     (roughly 10x) the real payload.
+//   - Symptom when a cap binds: EVERY official (docx/pdf/pptx/xlsx) install
+//     fails with a "decompression guard" / "exceeds N files" error (not just
+//     one skill), because the shared tarball can't be read to completion.
+//   - Override: intentionally not exposed as config — a decompression-bomb
+//     backstop is a security floor, not a tuning knob. If upstream legitimately
+//     outgrows the headroom, bump here and recompile. Vars (not consts) only so
+//     tests can shrink them to exercise the guards cheaply.
 var (
-	maxSkillTarballBytes int64 = 200 << 20 // 200 MiB total decompressed
+	maxSkillTarballBytes int64 = 512 << 20 // 512 MiB total decompressed (whole repo)
 	maxSkillFileBytes    int64 = 25 << 20  // 25 MiB per file
-	maxSkillFiles              = 10000
+	maxSkillFiles              = 20000     // whole-repo file count
 )
 
 // skillsHTTPClient downloads the skills tarball. The 2-minute ceiling bounds a
@@ -634,24 +651,32 @@ func extractSkillFromTarball(r io.Reader, name, destDir string) error {
 		}
 		rel, ok := stripSkillPrefix(path.Clean(hdr.Name), name)
 		if !ok {
+			// codeload tar entries are path-sorted (git tree order), so once
+			// we've extracted at least one entry of the target skill and then
+			// hit a non-matching path, we're past its subtree — stop here
+			// instead of decompressing the rest of the whole-repo archive.
+			if matched > 0 {
+				break
+			}
 			continue
+		}
+		target := filepath.Join(destDir, filepath.FromSlash(rel))
+		// tar-slip guard on every materialized path (dir and file alike).
+		if rel != "" && !withinDir(destDir, target) {
+			return fmt.Errorf("unsafe tar path %q", hdr.Name)
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if rel == "" {
 				continue
 			}
-			if err := os.MkdirAll(filepath.Join(destDir, filepath.FromSlash(rel)), 0700); err != nil {
+			if err := os.MkdirAll(target, 0700); err != nil {
 				return err
 			}
 		case tar.TypeReg, tar.TypeRegA:
 			files++
 			if files > maxSkillFiles {
 				return fmt.Errorf("skill %q exceeds %d files", name, maxSkillFiles)
-			}
-			target := filepath.Join(destDir, filepath.FromSlash(rel))
-			if !withinDir(destDir, target) {
-				return fmt.Errorf("unsafe tar path %q", hdr.Name)
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
 				return err
@@ -761,8 +786,8 @@ func copyDir(src, dst string) error {
 
 // InstallSkillFromRepo is a backwards-compatible alias for InstallSkill.
 // Deprecated: use InstallSkill instead.
-func InstallSkillFromRepo(shannonDir, name string) error {
-	return InstallSkill(shannonDir, name)
+func InstallSkillFromRepo(ctx context.Context, shannonDir, name string) error {
+	return InstallSkill(ctx, shannonDir, name)
 }
 
 // atomicWrite writes data to a temp file then renames to dest.

@@ -5029,7 +5029,7 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := skills.InstallSkillFromRepo(s.deps.ShannonDir, name); err != nil {
+	if err := skills.InstallSkillFromRepo(r.Context(), s.deps.ShannonDir, name); err != nil {
 		if strings.Contains(err.Error(), "already installed") {
 			s.auditHTTPOpError("POST", endpoint, "already installed", err)
 			writeError(w, http.StatusConflict, err.Error())
