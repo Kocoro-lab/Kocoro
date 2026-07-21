@@ -30,7 +30,9 @@
     "remote_session_timeline_v1",
     "clawhub_exclude_installed",
     "search_v1",
-    "integration_tools_v1"
+    "integration_tools_v1",
+    "message_idempotency_v1",
+    "message_idempotency_receipt_v2"
   ],
   "memory": {
     "provider": "disabled",

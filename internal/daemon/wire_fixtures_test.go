@@ -496,6 +496,48 @@ func TestWireFixture_Done_PerRequestSSE(t *testing.T) {
 	}
 }
 
+// TestWireFixture_DoneWithDeliverable pins the stronger idempotency receipt a
+// client requires before deleting its retained source after persisting a deliverable.
+func TestWireFixture_DoneWithDeliverable(t *testing.T) {
+	fixture := loadWireFixture(t, "sse_event.done.with_deliverable.json")
+	deliverable := fixture["deliverables"].([]any)[0].(map[string]any)
+	result := &RunAgentResult{
+		Reply:     fixture["reply"].(string),
+		SessionID: fixture["session_id"].(string),
+		Agent:     fixture["agent"].(string),
+		Usage: RunAgentUsage{
+			InputTokens: 9240, OutputTokens: 312, TotalTokens: 9552, CostUSD: 0.0318,
+		},
+		Deliverables: []session.DeliverableReceipt{{
+			ID:       deliverable["id"].(string),
+			Path:     deliverable["path"].(string),
+			Filename: deliverable["filename"].(string),
+			Title:    deliverable["title"].(string),
+			MIME:     deliverable["mime"].(string),
+			ByteSize: int64(deliverable["byte_size"].(float64)),
+		}},
+	}
+	produced := parseJSONMap(t, []byte(mustJSON(result)))
+	assertSemanticEqual(t, fixture, produced)
+
+	var consumer struct {
+		Reply        string `json:"reply"`
+		SessionID    string `json:"session_id"`
+		Deliverables []struct {
+			Path     string `json:"path"`
+			Filename string `json:"filename"`
+			MIME     string `json:"mime"`
+			ByteSize int64  `json:"byte_size"`
+		} `json:"deliverables"`
+	}
+	if err := json.Unmarshal([]byte(mustJSON(result)), &consumer); err != nil {
+		t.Fatalf("decode done-with-deliverable as Desktop consumer: %v", err)
+	}
+	if consumer.Reply != "" || len(consumer.Deliverables) != 1 || consumer.Deliverables[0].ByteSize <= 0 {
+		t.Fatalf("consumer decoded unexpected result: %+v", consumer)
+	}
+}
+
 func TestWireFixture_CloudProgress_Bus(t *testing.T) {
 	fixture := loadWireFixture(t, "bus_event.cloud_progress.json")
 
@@ -1145,4 +1187,39 @@ func TestWireFixture_MessageForegroundHintRequest(t *testing.T) {
 		pj, _ := json.MarshalIndent(ph, "", "  ")
 		t.Fatalf("foreground_hint drifted\n--- fixture ---\n%s\n--- produced ---\n%s", fj, pj)
 	}
+}
+
+// TestWireFixture_MessageIdempotencyRequest pins the request body used for a
+// crash-safe idempotent handoff. It crosses the real RunAgentRequest JSON
+// tags and validation seam; Desktop separately emits the same vendored bytes
+// through its production request builder.
+func TestWireFixture_MessageIdempotencyRequest(t *testing.T) {
+	fixture := loadWireFixture(t, "message_idempotency_request.json")
+
+	raw, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatalf("re-marshal fixture: %v", err)
+	}
+	var req RunAgentRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("request decode failed: %v", err)
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("request validation failed: %v", err)
+	}
+	if req.SessionID != "12345678" {
+		t.Fatalf("session_id=%q", req.SessionID)
+	}
+	if req.IdempotencyKey != "job-12345678" {
+		t.Fatalf("idempotency_key=%q", req.IdempotencyKey)
+	}
+	if !req.NewSession || req.Source != "desktop" || req.Channel != "shanclaw" {
+		t.Fatalf("routing fields drifted: %+v", req)
+	}
+
+	reEncoded, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("re-encode failed: %v", err)
+	}
+	assertSemanticEqual(t, fixture, parseJSONMap(t, reEncoded))
 }
