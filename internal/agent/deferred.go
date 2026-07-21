@@ -330,6 +330,8 @@ func buildLocalActiveSchemas(reg *ToolRegistry, cold map[string]bool) []client.T
 // deferred loading: MCP + gateway tools plus local tools whose category
 // matches shouldDeferByCategory (rare-use, big-schema families like
 // browser_*, schedule_*, computer, etc. — see toolbudget.go for the list).
+// neverDeferTools (web_search, web_fetch) are excluded even though they are
+// gateway tools — see toolbudget.go for rationale.
 //
 // The actual decision to defer depends on the deferredMode trigger in
 // loop.go, which gates on either total budget overflow OR the presence of
@@ -343,9 +345,15 @@ func deferredToolNames(reg *ToolRegistry) map[string]bool {
 		}
 	}
 	for _, n := range mcp {
+		if neverDeferTools[n] {
+			continue
+		}
 		names[n] = true
 	}
 	for _, n := range gw {
+		if neverDeferTools[n] {
+			continue
+		}
 		names[n] = true
 	}
 	return names

@@ -520,6 +520,32 @@ func TestDeferredToolNames_BrowserPrefixCovered(t *testing.T) {
 	}
 }
 
+// web_search / web_fetch are gateway tools but must be excluded from the
+// deferred set (neverDeferTools in toolbudget.go) — they are the common
+// first-message-of-a-session tools, and deferring them costs an extra
+// tool_search round-trip before every new session's first search. Other
+// gateway tools stay deferred-eligible as before.
+func TestDeferredToolNames_ExcludesNeverDeferGatewayTools(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockSourcedTool{name: "web_search", source: SourceGateway})
+	reg.Register(&mockSourcedTool{name: "web_fetch", source: SourceGateway})
+	reg.Register(&mockSourcedTool{name: "alpaca_news", source: SourceGateway})
+	reg.Register(&mockMCPTool{name: "mcp_a"})
+
+	deferred := deferredToolNames(reg)
+
+	for _, n := range []string{"web_search", "web_fetch"} {
+		if deferred[n] {
+			t.Errorf("expected %q NOT to be in deferred set, got %v", n, mapKeys(deferred))
+		}
+	}
+	for _, n := range []string{"alpaca_news", "mcp_a"} {
+		if !deferred[n] {
+			t.Errorf("expected %q to remain in deferred set, got %v", n, mapKeys(deferred))
+		}
+	}
+}
+
 func TestHasCategoricalDeferred(t *testing.T) {
 	cases := []struct {
 		name string
@@ -549,6 +575,45 @@ func mapKeys(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// End-to-end schema build (tool-ref-supported path, loop.go's
+// buildFullSchemasWithDefer call): with deferredMode active because of an
+// unrelated categorical tool (computer), web_search/web_fetch schemas must
+// still ship with DeferLoading=false — full schema, not deferred — while the
+// categorical tool and an ordinary gateway tool stay DeferLoading=true.
+func TestBuildFullSchemasWithDefer_WebToolsNeverDeferred(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "bash"})
+	reg.Register(&mockTool{name: "computer"})
+	reg.Register(&mockSourcedTool{name: "web_search", source: SourceGateway})
+	reg.Register(&mockSourcedTool{name: "web_fetch", source: SourceGateway})
+	reg.Register(&mockSourcedTool{name: "alpaca_news", source: SourceGateway})
+
+	cold := deferredToolNames(reg) // no preseeded/warmed schemas
+	if !hasCategoricalDeferred(cold) {
+		t.Fatal("expected computer to trigger the categorical-defer condition")
+	}
+
+	schemas := buildFullSchemasWithDefer(reg, cold)
+	deferByName := make(map[string]bool, len(schemas))
+	for _, s := range schemas {
+		deferByName[schemaToolName(s)] = s.DeferLoading
+	}
+
+	for _, n := range []string{"web_search", "web_fetch"} {
+		if deferByName[n] {
+			t.Errorf("expected %q to ship with DeferLoading=false, got true", n)
+		}
+	}
+	for _, n := range []string{"computer", "alpaca_news"} {
+		if !deferByName[n] {
+			t.Errorf("expected %q to ship with DeferLoading=true, got false", n)
+		}
+	}
+	if !hasAnyNonDeferred(schemas) {
+		t.Error("expected at least one non-deferred schema (web_search/web_fetch)")
+	}
 }
 
 // Legacy path (modelTier-based; toolRefSupported=false) must filter cold
