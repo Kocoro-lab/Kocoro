@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -129,5 +130,55 @@ func TestClone_IsolatesDenylists(t *testing.T) {
 	}
 	if len(cloned.MCP.DefaultAgentDisabled) != 2 || cloned.MCP.DefaultAgentDisabled[0] != "x" {
 		t.Errorf("Clone aliases MCP.DefaultAgentDisabled backing array: got %v, want [x y]", cloned.MCP.DefaultAgentDisabled)
+	}
+}
+
+func TestClone_PreservesAndIsolatesAlwaysAllowTools(t *testing.T) {
+	base := &Config{}
+	base.Permissions.AlwaysAllowTools = []string{"file_write", "file_read"}
+
+	cloned := Clone(base)
+	if got := cloned.Permissions.AlwaysAllowTools; !reflect.DeepEqual(got, []string{"file_write", "file_read"}) {
+		t.Fatalf("AlwaysAllowTools = %v, want preserved runtime approval bypass", got)
+	}
+
+	cloned.Permissions.AlwaysAllowTools[0] = "bash"
+	if base.Permissions.AlwaysAllowTools[0] != "file_write" {
+		t.Fatalf("clone aliases base AlwaysAllowTools: base = %v", base.Permissions.AlwaysAllowTools)
+	}
+}
+
+// TestClone_IsolatesOverlayMergedSlices guards the two slices that
+// mergeRuntimeOverlayFile appends to in place (dedup(append(cfg.X, ...))) right
+// after Clone in RuntimeConfigForCWD: Cloud.PublishAllowedExtensions and
+// MCP.WorkspaceRoots. Two clones stand in for two concurrent per-cwd runs. The
+// base slices carry spare capacity (cap > len), so with a shallow copy BOTH
+// clones' appends land on the shared backing array at the same index — the
+// second clobbers the first. The fix (deep copy) gives each its own array.
+func TestClone_IsolatesOverlayMergedSlices(t *testing.T) {
+	base := &Config{}
+	base.Cloud.PublishAllowedExtensions = make([]string, 1, 4)
+	base.Cloud.PublishAllowedExtensions[0] = ".md"
+	base.MCP.WorkspaceRoots = make([]string, 1, 4)
+	base.MCP.WorkspaceRoots[0] = "/proj"
+
+	runA := Clone(base)
+	runB := Clone(base)
+
+	// Two independent overlay merges append their own project-scoped entry.
+	runA.Cloud.PublishAllowedExtensions = append(runA.Cloud.PublishAllowedExtensions, ".txtA")
+	runB.Cloud.PublishAllowedExtensions = append(runB.Cloud.PublishAllowedExtensions, ".txtB")
+	runA.MCP.WorkspaceRoots = append(runA.MCP.WorkspaceRoots, "/A")
+	runB.MCP.WorkspaceRoots = append(runB.MCP.WorkspaceRoots, "/B")
+
+	if !reflect.DeepEqual(runA.Cloud.PublishAllowedExtensions, []string{".md", ".txtA"}) {
+		t.Fatalf("runB clobbered runA Cloud.PublishAllowedExtensions via shared backing: %v", runA.Cloud.PublishAllowedExtensions)
+	}
+	if !reflect.DeepEqual(runA.MCP.WorkspaceRoots, []string{"/proj", "/A"}) {
+		t.Fatalf("runB clobbered runA MCP.WorkspaceRoots via shared backing: %v", runA.MCP.WorkspaceRoots)
+	}
+	// Base must never see either run's appended entry.
+	if len(base.Cloud.PublishAllowedExtensions) != 1 || len(base.MCP.WorkspaceRoots) != 1 {
+		t.Fatalf("base grew: publish=%v roots=%v", base.Cloud.PublishAllowedExtensions, base.MCP.WorkspaceRoots)
 	}
 }
