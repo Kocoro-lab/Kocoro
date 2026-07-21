@@ -18,6 +18,7 @@ const (
 	defaultVPIOBargeOutputDecay    = 0.92
 	defaultMicGateNoiseMultiplier  = 2.0
 	defaultMicGateStartMS          = 160
+	defaultMicGatePrefixMS         = 500
 	defaultMicGateHangoverMS       = 2000
 	// Frames observed while the call is not yet active are known ambient
 	// evidence. Reachy Wireless can sit around RMS 0.04 from its own fan even
@@ -47,6 +48,7 @@ type micNoiseGate struct {
 	threshold       float64
 	noiseMultiplier float64
 	startFrames     int
+	prefixFrames    int
 	hangoverFrames  int
 
 	noiseFloor float64
@@ -106,11 +108,17 @@ func (g *vpioBargeStartGate) threshold(assistantSpeaking bool, outputLevel float
 }
 
 func newMicNoiseGate() *micNoiseGate {
+	startFrames := msToAudioFrames(koeEnvInt("KOE_MIC_GATE_START_MS", defaultMicGateStartMS))
+	prefixFrames := msToAudioFrames(koeEnvInt("KOE_MIC_GATE_PREFIX_MS", defaultMicGatePrefixMS))
+	if prefixFrames < startFrames {
+		prefixFrames = startFrames
+	}
 	return &micNoiseGate{
 		enabled:         !koeEnvBool("KOE_MIC_GATE_OFF", false),
 		threshold:       koeEnvFloat("KOE_MIC_GATE_THRESHOLD", defaultMicGateThreshold),
 		noiseMultiplier: koeEnvFloat("KOE_MIC_GATE_NOISE_MULTIPLIER", defaultMicGateNoiseMultiplier),
-		startFrames:     msToAudioFrames(koeEnvInt("KOE_MIC_GATE_START_MS", defaultMicGateStartMS)),
+		startFrames:     startFrames,
+		prefixFrames:    prefixFrames,
 		hangoverFrames:  msToAudioFrames(koeEnvInt("KOE_MIC_GATE_HANGOVER_MS", defaultMicGateHangoverMS)),
 		zero:            make([]int16, audioFrameSize),
 	}
@@ -180,8 +188,8 @@ func (g *micNoiseGate) processWithStartThreshold(frame []int16, startThreshold f
 	// correctly. The ring is released only after the same evidence threshold passes,
 	// so this preserves speech onset without making ambient noise open the gate.
 	g.pending = append(g.pending, append([]int16(nil), frame...))
-	if len(g.pending) > g.startFrames {
-		g.pending = g.pending[len(g.pending)-g.startFrames:]
+	if len(g.pending) > g.prefixFrames {
+		g.pending = g.pending[len(g.pending)-g.prefixFrames:]
 	}
 
 	// Real speech often has low-energy consonant gaps; score evidence lets those

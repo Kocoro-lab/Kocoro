@@ -712,6 +712,7 @@ func TestMicNoiseGateRequiresSustainedSpeechAndHangover(t *testing.T) {
 
 func TestMicNoiseGatePreservesSoftSpeechPrefixBeforeHotEvidence(t *testing.T) {
 	t.Setenv("KOE_MIC_GATE_START_MS", "100")
+	t.Setenv("KOE_MIC_GATE_PREFIX_MS", "200")
 	g := newMicNoiseGate()
 	frame := func(sample int16) []int16 {
 		out := make([]int16, audioFrameSize)
@@ -720,19 +721,19 @@ func TestMicNoiseGatePreservesSoftSpeechPrefixBeforeHotEvidence(t *testing.T) {
 		}
 		return out
 	}
-	softA := frame(100)
-	softB := frame(200)
+	soft := frame(100)
 	loudA := frame(2000)
 	loudB := frame(3000)
 	loudC := frame(4000)
 
-	for i, in := range [][]int16{softA, softB, loudA, loudB} {
+	prefix := [][]int16{soft, soft, soft, soft, soft, soft}
+	for i, in := range append(prefix, loudA, loudB) {
 		if out := g.process(in); len(out) != 1 || !allZeroSamples(out[0]) {
 			t.Fatalf("pre-open frame %d should produce only digital silence", i)
 		}
 	}
 	out := g.process(loudC)
-	want := [][]int16{softA, softB, loudA, loudB, loudC}
+	want := append(prefix, loudA, loudB, loudC)
 	if len(out) != len(want) {
 		t.Fatalf("gate opened with %d frames, want %d-frame speech prefix", len(out), len(want))
 	}

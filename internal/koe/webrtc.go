@@ -717,11 +717,19 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 			for _, captureFrame := range captured {
 				captureFrame = rc.audio.captureFrameForSend(captureFrame)
 				wasOpen := gate.open
-				for _, out := range gate.processWithStartThreshold(captureFrame, startThreshold) {
-					select {
-					case <-ctx.Done():
-						return
-					case <-pacer.C:
+				outputs := gate.processWithStartThreshold(captureFrame, startThreshold)
+				for i, out := range outputs {
+					// A gate-open batch is historical audio that already elapsed while
+					// sustained-speech evidence accumulated. Catch that prefix up now;
+					// pacing every buffered frame duplicated the confirmation delay and
+					// made each intra-utterance reopen add another 0.5-1 s. Pace only the
+					// newest frame so steady-state capture remains real-time.
+					if i == len(outputs)-1 {
+						select {
+						case <-ctx.Done():
+							return
+						case <-pacer.C:
+						}
 					}
 					rc.outboundAudioMu.Lock()
 					enc, err := rc.audio.EncodeFrame(out)
