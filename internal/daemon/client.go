@@ -214,6 +214,18 @@ const (
 	// daemon omits it (integration connections exist but the local agent never
 	// sees the tools), so Desktop can prompt the user to update the engine.
 	CapIntegrationToolsV1 = "integration_tools_v1"
+	// CapMessageIdempotencyV1 — POST /message accepts idempotency_key together
+	// with a client-minted session_id. A completed retry returns the persisted
+	// result without invoking the LLM or tools again; interrupted/failed requests
+	// fail closed and require explicit recovery. Kocoro Desktop uses this for
+	// a crash-safe file-producing handoff, whose file-writing side effect must
+	// not duplicate across an app crash after daemon completion.
+	CapMessageIdempotencyV1 = "message_idempotency_v1"
+	// CapMessageIdempotencyReceiptV2 persists daemon-validated
+	// present_deliverable receipts in the idempotent result and returns stable
+	// error codes for failed/in-progress retries. Crash-safe deliverable recovery
+	// depends on this stronger cross-process contract.
+	CapMessageIdempotencyReceiptV2 = "message_idempotency_receipt_v2"
 )
 
 var Capabilities = []string{
@@ -244,6 +256,8 @@ var Capabilities = []string{
 	CapClawHubExcludeInstalled,
 	CapSearchV1,
 	CapIntegrationToolsV1,
+	CapMessageIdempotencyV1,
+	CapMessageIdempotencyReceiptV2,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
