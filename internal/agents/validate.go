@@ -54,15 +54,39 @@ func IsModelTierKeyword(s string) bool {
 	return modelTierKeywords[strings.ToLower(strings.TrimSpace(s))]
 }
 
-// ValidateAgentModelConfig rejects a tier keyword wedged into agent.model. Both
-// model and model_tier are free-form strings on the wire, so without this guard
-// `{"model": "large"}` persists silently and only fails far downstream.
+// ValidateAgentModelConfig rejects a tier keyword wedged into agent.model, and
+// an out-of-enum agent.effort_tier. Both model and effort_tier are free-form
+// strings on the wire, so without these guards a bad value persists silently
+// and only fails far downstream (an opaque remote 400 from the LLM provider).
 func ValidateAgentModelConfig(c *AgentModelConfig) error {
-	if c == nil || c.Model == nil {
+	if c == nil {
 		return nil
 	}
-	if IsModelTierKeyword(*c.Model) {
+	if c.Model != nil && IsModelTierKeyword(*c.Model) {
 		return fmt.Errorf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use agent.model_tier for tiers", *c.Model)
 	}
+	if c.EffortTier != nil && !IsValidEffortTier(*c.EffortTier) {
+		return fmt.Errorf("agent.effort_tier %q is not valid; use one of %s", *c.EffortTier, strings.Join(EffortTierAllowedValues(), ", "))
+	}
 	return nil
+}
+
+// validEffortTiers are the unified cross-provider reasoning-effort tiers
+// accepted by agent.effort_tier (config.go) and AgentModelConfig.EffortTier
+// (loader.go). "" means unset/inherit. Cloud translates the tier to each
+// provider's native effort at request time; any other value is sent verbatim
+// and fails the LLM call downstream with an opaque error, so it is rejected
+// here at the config write boundary instead.
+var validEffortTiers = map[string]bool{"": true, "low": true, "high": true, "xhigh": true, "max": true}
+
+// IsValidEffortTier reports whether s is a recognized agent.effort_tier value
+// (including "" for unset/inherit).
+func IsValidEffortTier(s string) bool {
+	return validEffortTiers[s]
+}
+
+// EffortTierAllowedValues renders the allowed values (including "" for
+// unset/inherit) for error messages, e.g. `"", "low", "high", "xhigh", "max"`.
+func EffortTierAllowedValues() []string {
+	return []string{`""`, `"low"`, `"high"`, `"xhigh"`, `"max"`}
 }

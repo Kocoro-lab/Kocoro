@@ -765,6 +765,7 @@ type AgentLoop struct {
 	enableStreaming        bool
 	thinking               *client.ThinkingConfig
 	reasoningEffort        string
+	effortTier             string
 	responseLanguage       string
 	temperature            float64
 	specificModel          string
@@ -1083,6 +1084,13 @@ func (a *AgentLoop) ModelTier() string {
 	return a.modelTier
 }
 
+// EffortTier returns the currently-configured unified effort tier. Test-only
+// read-back for the global / per-agent / voice wiring; production callers read
+// effortTier directly through the request-construction sites in Run.
+func (a *AgentLoop) EffortTier() string {
+	return a.effortTier
+}
+
 // SpecificModel returns the currently-configured specific model id. Test-only
 // accessor used to prove that SetSpecificModel won the precedence race against
 // SetModelTier; production callers read specificModel directly via
@@ -1231,6 +1239,16 @@ func buildAssistantMessage(resp *client.CompletionResponse, normalizedToolText s
 
 func (a *AgentLoop) SetReasoningEffort(effort string) {
 	a.reasoningEffort = effort
+}
+
+// SetEffortTier sets the unified cross-provider reasoning-effort tier
+// ("low"/"high"/"xhigh"/"max"). Sent on every completion request as
+// effort_tier; Cloud translates it per resolved provider. "" leaves it unset
+// (Cloud falls back to reasoning_effort, then the provider default). Applied
+// per-turn from global agent.effort_tier, with per-agent / voice overlays at
+// the runner call sites (mirrors SetReasoningEffort).
+func (a *AgentLoop) SetEffortTier(tier string) {
+	a.effortTier = tier
 }
 
 // SetResponseLanguage locks the reply language; "" mirrors the user's
@@ -2850,6 +2868,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			MaxTokens:       a.effectiveMaxTokens(),
 			Thinking:        a.thinking,
 			ReasoningEffort: a.reasoningEffort,
+			EffortTier:      a.effortTier,
 			SessionID:       a.sessionID,
 			CacheSource:     a.cacheSource,
 		}
@@ -3543,6 +3562,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			Tools:           toolSchemas,
 			Thinking:        a.thinking,
 			ReasoningEffort: a.reasoningEffort,
+			EffortTier:      a.effortTier,
 			SessionID:       a.sessionID,
 			CacheSource:     a.cacheSource,
 		}
@@ -3829,6 +3849,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 						Tools:           toolSchemas,
 						Thinking:        a.thinking,
 						ReasoningEffort: a.reasoningEffort,
+						EffortTier:      a.effortTier,
 						SessionID:       a.sessionID,
 						CacheSource:     a.cacheSource,
 					}

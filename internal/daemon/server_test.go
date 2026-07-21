@@ -1022,6 +1022,81 @@ func TestServer_PatchConfigRejectsTierKeywordAsModel(t *testing.T) {
 	}
 }
 
+func TestServer_PatchConfigRejectsInvalidEffortTier(t *testing.T) {
+	shannonDir := t.TempDir()
+	initial := "model_tier: medium\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(initial), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	srv := NewServer(0, nil, &ServerDeps{ShannonDir: shannonDir}, "test")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(`{"agent":{"effort_tier":"medium"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handlePatchConfig(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "effort_tier") {
+		t.Fatalf("expected actionable message, got %s", rec.Body.String())
+	}
+	// The bad value must never reach config.yaml.
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(data), "effort_tier:") {
+		t.Fatalf("invalid effort_tier should not have been written to config, got %s", string(data))
+	}
+}
+
+func TestServer_PatchConfigAcceptsValidEffortTier(t *testing.T) {
+	shannonDir := t.TempDir()
+	initial := "model_tier: medium\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(initial), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	srv := NewServer(0, nil, &ServerDeps{ShannonDir: shannonDir}, "test")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(`{"agent":{"effort_tier":"xhigh"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handlePatchConfig(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !strings.Contains(string(data), "effort_tier: xhigh") {
+		t.Fatalf("expected effort_tier: xhigh to be written, got %s", string(data))
+	}
+}
+
+func TestServer_PatchConfigAcceptsEmptyEffortTier(t *testing.T) {
+	shannonDir := t.TempDir()
+	initial := "agent:\n  effort_tier: high\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(initial), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	srv := NewServer(0, nil, &ServerDeps{ShannonDir: shannonDir}, "test")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(`{"agent":{"effort_tier":""}}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handlePatchConfig(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestE2E_ModelTierKeywordRejectedAcrossWritePaths drives a running daemon over
 // real HTTP and verifies the tier-keyword guard holds end-to-end on every
 // config write path: named-agent create, named-agent config replace (PUT), and

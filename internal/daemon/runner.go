@@ -741,6 +741,32 @@ func applyKoeResponseLanguage(loop *agent.AgentLoop, source, text string) {
 	loop.SetResponseLanguage(inferKoeResponseLanguage(text))
 }
 
+// koeFastEffortTier is the effort tier voice-triggered tasks are forced to when
+// koe.fast_effort is on — the fastest tier, for low-latency voice.
+const koeFastEffortTier = "low"
+
+// applyKoeEffortTier optionally forces the loop's effort tier to fast for
+// voice-triggered tasks. It runs AFTER the global + per-agent effort has been
+// applied, so when fast mode is ON it overrides them. The realtime voice model
+// itself has no effort knob — this tunes the Kocoro agent task the voice
+// front-brain triggers via do_task.
+//
+// koe.fast_effort is a *bool with three states:
+//   - nil (unset) / true → force koeFastEffortTier (default ON: voice is snappy)
+//   - false              → do NOT override; the task keeps the agent's normal
+//                          global/per-agent effort (for users who prefer quality
+//                          over latency on voice).
+func applyKoeEffortTier(loop *agent.AgentLoop, source string, koe config.KoeConfig) {
+	if loop == nil || !isKoeSource(source) {
+		return
+	}
+	// Default ON: only an explicit false opts out of fast voice.
+	if koe.FastEffort != nil && !*koe.FastEffort {
+		return
+	}
+	loop.SetEffortTier(koeFastEffortTier)
+}
+
 func inferKoeResponseLanguage(text string) string {
 	var latin, han, kana, hangul int
 	for _, r := range text {
@@ -1693,6 +1719,12 @@ func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelCo
 	if ac.ModelTier != nil && *ac.ModelTier != "" {
 		loop.SetModelTier(*ac.ModelTier)
 	}
+	// Per-agent effort override. nil OR "" = inherit the global tier already
+	// applied on the loop (Desktop's "Inherit" segment sends the field absent;
+	// tolerate an explicit "" the same way). A concrete value wins.
+	if ac.EffortTier != nil && *ac.EffortTier != "" {
+		loop.SetEffortTier(*ac.EffortTier)
+	}
 	// != nil rather than != "": an explicit "" is a meaningful override that
 	// forces mirror mode even when the global agent.language is locked.
 	if ac.Language != nil {
@@ -2637,6 +2669,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if runCfg.Agent.ReasoningEffort != "" {
 		loop.SetReasoningEffort(runCfg.Agent.ReasoningEffort)
 	}
+	// Global unified effort tier baseline; per-agent overlay (below) may
+	// override, and the Koe branch overrides again for voice-triggered tasks.
+	if runCfg.Agent.EffortTier != "" {
+		loop.SetEffortTier(runCfg.Agent.EffortTier)
+	}
 	// Response language: unconditional global baseline ("" = mirror); the
 	// per-agent overlay below may override (including "" to force mirror).
 	loop.SetResponseLanguage(runCfg.Agent.Language)
@@ -2652,6 +2689,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 	applyKoeResponseLanguage(loop, req.Source, req.Text)
+	// Voice-triggered tasks get their own effort tier (default low), overriding
+	// the global + per-agent effort just applied. Must run after the per-agent
+	// overlay so voice wins.
+	applyKoeEffortTier(loop, req.Source, runCfg.Koe)
 	// Apply idle-timeout config AFTER per-agent overrides have been folded
 	// into runCfg, otherwise agent-level opt-in/override silently does nothing.
 	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)

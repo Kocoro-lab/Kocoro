@@ -1588,6 +1588,75 @@ func TestApplyAgentModelOverlayToLoop_EmptyTierIgnored(t *testing.T) {
 	}
 }
 
+// TestApplyAgentModelOverlayToLoop_EffortTier verifies the per-agent
+// `effort_tier` overlay retargets the loop's unified effort tier. Regression
+// guard for the C4 per-agent断链: without the SetEffortTier call the agent's
+// configured effort would be silently dropped and the loop would keep the
+// global tier.
+func TestApplyAgentModelOverlayToLoop_EffortTier(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetEffortTier("low")
+	if got := loop.EffortTier(); got != "low" {
+		t.Fatalf("precondition: baseline EffortTier = %q, want %q", got, "low")
+	}
+	tier := "xhigh"
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{EffortTier: &tier})
+	if got := loop.EffortTier(); got != "xhigh" {
+		t.Errorf("after overlay: EffortTier = %q, want %q", got, "xhigh")
+	}
+}
+
+// TestApplyAgentModelOverlayToLoop_EmptyEffortInherits guards against an
+// overlay that serializes `effort_tier: ""` clobbering the global tier — an
+// empty per-agent value means "inherit", not "reset to unset".
+func TestApplyAgentModelOverlayToLoop_EmptyEffortInherits(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetEffortTier("high")
+	empty := ""
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{EffortTier: &empty})
+	if got := loop.EffortTier(); got != "high" {
+		t.Errorf("EffortTier after empty-string overlay = %q, want %q (unchanged)", got, "high")
+	}
+}
+
+// TestApplyKoeEffortTier verifies the voice fast-effort toggle: on koe sources,
+// fast mode (unset/true) forces low over the text-mode effort, an explicit
+// false leaves it untouched, and non-koe sources are always left untouched.
+func TestApplyKoeEffortTier(t *testing.T) {
+	tru := true
+	fls := false
+
+	// Unset fast_effort → default ON → force low, overriding whatever text-mode
+	// effort the global/per-agent chain left on the loop.
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetEffortTier("max")
+	applyKoeEffortTier(loop, "koe", config.KoeConfig{})
+	if got := loop.EffortTier(); got != "low" {
+		t.Errorf("koe with unset fast_effort = %q, want low (default ON)", got)
+	}
+
+	// Explicit true → same as unset: force low.
+	loop.SetEffortTier("max")
+	applyKoeEffortTier(loop, "koe", config.KoeConfig{FastEffort: &tru})
+	if got := loop.EffortTier(); got != "low" {
+		t.Errorf("koe with fast_effort=true = %q, want low", got)
+	}
+
+	// Explicit false → do NOT override; the text-mode effort is preserved.
+	loop.SetEffortTier("xhigh")
+	applyKoeEffortTier(loop, "koe", config.KoeConfig{FastEffort: &fls})
+	if got := loop.EffortTier(); got != "xhigh" {
+		t.Errorf("koe with fast_effort=false = %q, want xhigh (inherited)", got)
+	}
+
+	// Non-koe source: no-op even with fast_effort=true, text-mode effort preserved.
+	loop.SetEffortTier("high")
+	applyKoeEffortTier(loop, "desktop", config.KoeConfig{FastEffort: &tru})
+	if got := loop.EffortTier(); got != "high" {
+		t.Errorf("non-koe source should not touch effort: got %q, want high", got)
+	}
+}
+
 func TestApplyKoeResponseLanguage(t *testing.T) {
 	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
 	loop.SetResponseLanguage("中文")

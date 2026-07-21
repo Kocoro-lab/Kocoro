@@ -131,6 +131,12 @@ func (p *AgentPermissionsConfig) Clone() *AgentPermissionsConfig {
 type AgentModelConfig struct {
 	Model         *string  `yaml:"model" json:"model,omitempty"`
 	ModelTier     *string  `yaml:"model_tier" json:"model_tier,omitempty"`
+	// EffortTier is the per-agent reasoning-effort override (unified tier names
+	// "low"/"high"/"xhigh"/"max"). nil = inherit the global agent.effort_tier;
+	// a value overrides it for this agent. Applied to the loop via
+	// applyAgentModelOverlayToLoop. Empty string "" is treated as inherit too
+	// (Desktop's "Inherit" segment sends the field absent, but tolerate "").
+	EffortTier    *string  `yaml:"effort_tier" json:"effort_tier,omitempty"`
 	Language      *string  `yaml:"language" json:"language,omitempty"` // nil = inherit global agent.language; "" = force mirror even if global is locked; value = lock to that language
 	MaxIterations *int     `yaml:"max_iterations" json:"max_iterations,omitempty"`
 	Temperature   *float64 `yaml:"temperature" json:"temperature,omitempty"`

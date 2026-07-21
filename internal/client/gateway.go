@@ -762,7 +762,13 @@ type CompletionRequest struct {
 	// Provider-specific parameters (passed through to gateway)
 	Thinking        *ThinkingConfig `json:"thinking,omitempty"`
 	ReasoningEffort string          `json:"reasoning_effort,omitempty"` // OpenAI o-models: minimal/low/medium/high
-	ToolChoice      any             `json:"tool_choice,omitempty"`      // nil=auto, "any", or {"type":"tool","name":"..."}
+	// EffortTier is the unified cross-provider reasoning-effort intent
+	// ("low"/"high"/"xhigh"/"max"). Cloud translates it to each provider's
+	// native value (Anthropic output_config.effort direct; OpenAI reasoning_effort
+	// low→low/high→medium/xhigh→high/max→high). Cloud prefers effort_tier when
+	// present, else falls back to ReasoningEffort (old behavior). Empty = unset.
+	EffortTier string `json:"effort_tier,omitempty"`
+	ToolChoice any    `json:"tool_choice,omitempty"` // nil=auto, "any", or {"type":"tool","name":"..."}
 
 	// SessionID is sent to the gateway so the Anthropic provider can preserve
 	// the previous turn's rolling cache_control marker across turns (long-session
