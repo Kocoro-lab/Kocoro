@@ -489,6 +489,9 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	if runtimeCfg.Agent.ReasoningEffort != "" {
 		loop.SetReasoningEffort(runtimeCfg.Agent.ReasoningEffort)
 	}
+	if runtimeCfg.Agent.EffortTier != "" {
+		loop.SetEffortTier(runtimeCfg.Agent.EffortTier)
+	}
 	loop.SetResponseLanguage(runtimeCfg.Agent.Language)
 	// Per-agent model config overrides
 	if agentOverride != nil && agentOverride.Config != nil && agentOverride.Config.Agent != nil {
@@ -498,6 +501,10 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		// (see applyAgentModelOverlayToLoop in internal/daemon/runner.go).
 		if ac.ModelTier != nil && *ac.ModelTier != "" {
 			loop.SetModelTier(*ac.ModelTier)
+		}
+		// Per-agent effort override; nil OR "" = inherit the global tier.
+		if ac.EffortTier != nil && *ac.EffortTier != "" {
+			loop.SetEffortTier(*ac.EffortTier)
 		}
 		// != nil (not != ""): explicit "" forces mirror over a locked global.
 		if ac.Language != nil {
@@ -688,6 +695,9 @@ func (m *Model) rebuildAgentLoop() {
 	if m.cfg.Agent.ReasoningEffort != "" {
 		loop.SetReasoningEffort(m.cfg.Agent.ReasoningEffort)
 	}
+	if m.cfg.Agent.EffortTier != "" {
+		loop.SetEffortTier(m.cfg.Agent.EffortTier)
+	}
 	loop.SetResponseLanguage(m.cfg.Agent.Language)
 	if m.agentOverride != nil && m.agentOverride.Config != nil && m.agentOverride.Config.Agent != nil {
 		ac := m.agentOverride.Config.Agent
@@ -696,6 +706,10 @@ func (m *Model) rebuildAgentLoop() {
 		// (see applyAgentModelOverlayToLoop in internal/daemon/runner.go).
 		if ac.ModelTier != nil && *ac.ModelTier != "" {
 			loop.SetModelTier(*ac.ModelTier)
+		}
+		// Per-agent effort override; nil OR "" = inherit the global tier.
+		if ac.EffortTier != nil && *ac.EffortTier != "" {
+			loop.SetEffortTier(*ac.EffortTier)
 		}
 		// != nil (not != ""): explicit "" forces mirror over a locked global.
 		if ac.Language != nil {

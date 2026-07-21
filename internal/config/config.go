@@ -87,6 +87,13 @@ type KoeConfig struct {
 	// PersonaSource == "custom". Injected as-is (already voice-friendly), wrapped
 	// by Koe's base persona; empty falls back to the base persona only.
 	CustomPersona string `mapstructure:"custom_persona" yaml:"custom_persona,omitempty" json:"custom_persona,omitempty"`
+	// EffortTier is the reasoning-effort tier applied to the Kocoro agent TASK
+	// triggered by voice (Path A /v1/completions), NOT the realtime voice model
+	// itself (which has no effort knob). Unified tier names shared with
+	// AgentConfig.EffortTier ("low"/"high"/"xhigh"/"max"). Empty defaults to
+	// "low" at injection (runner) to keep voice-triggered tasks low-latency,
+	// independent of the agent's text-mode effort.
+	EffortTier string `mapstructure:"effort_tier" yaml:"effort_tier,omitempty" json:"effort_tier,omitempty"`
 }
 
 // MCPConfig holds client-side settings shared across all MCP servers.
@@ -124,7 +131,15 @@ type AgentConfig struct {
 	// that specifically depends on the explicit planning tool surface.
 	ForceThinkTool  bool   `mapstructure:"force_think_tool" yaml:"force_think_tool" json:"force_think_tool"`
 	ReasoningEffort string `mapstructure:"reasoning_effort" yaml:"reasoning_effort" json:"reasoning_effort"`
-	Model           string `mapstructure:"model"            yaml:"model"            json:"model"`          // specific model override
+	// EffortTier is the unified cross-provider reasoning-effort intent
+	// (Anthropic-native tier names: "low"/"high"/"xhigh"/"max"). Distinct
+	// from ReasoningEffort (which stays OpenAI-native minimal/low/medium/high
+	// for back-compat). Cloud translates the tier to each provider's native
+	// value at request time (Anthropic passes it straight through as
+	// output_config.effort; OpenAI maps low→low/high→medium/xhigh→high/max→high).
+	// Empty = unset (Cloud falls back to ReasoningEffort, then provider default).
+	EffortTier string `mapstructure:"effort_tier" yaml:"effort_tier" json:"effort_tier"`
+	Model      string `mapstructure:"model"       yaml:"model"       json:"model"` // specific model override
 	Language        string `mapstructure:"language"         yaml:"language"         json:"language"`       // locked reply language as a native name (e.g. "中文"); empty = mirror the user's current-message language
 	ContextWindow   int    `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"` // model context window in tokens
 	// ObservationWindow keeps only the N most recent browser/GUI tool
@@ -398,6 +413,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.thinking_budget", 10000)
 	viper.SetDefault("agent.force_think_tool", false)
 	viper.SetDefault("agent.reasoning_effort", "")
+	viper.SetDefault("agent.effort_tier", "")
 	viper.SetDefault("agent.model", "")
 	viper.SetDefault("agent.context_window", 1_000_000)
 	// NOTE: if you change these idle/stream defaults, also update
@@ -777,6 +793,7 @@ type overlayAgentConfig struct {
 	ThinkingBudget         *int     `yaml:"thinking_budget"`
 	ForceThinkTool         *bool    `yaml:"force_think_tool"`
 	ReasoningEffort        *string  `yaml:"reasoning_effort"`
+	EffortTier             *string  `yaml:"effort_tier"`
 	Model                  *string  `yaml:"model"`
 	ContextWindow          *int     `yaml:"context_window"`
 	ObservationWindow      *int     `yaml:"observation_window"`
@@ -834,6 +851,7 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.thinking_budget":           {Level: "default"},
 		"agent.force_think_tool":          {Level: "default"},
 		"agent.reasoning_effort":          {Level: "default"},
+		"agent.effort_tier":               {Level: "default"},
 		"agent.model":                     {Level: "default"},
 		"agent.context_window":            {Level: "default"},
 		"agent.observation_window":        {Level: "default"},
@@ -892,6 +910,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.reasoning_effort") {
 		cfg.Sources["agent.reasoning_effort"] = src
+	}
+	if viper.IsSet("agent.effort_tier") {
+		cfg.Sources["agent.effort_tier"] = src
 	}
 	if viper.IsSet("agent.model") {
 		cfg.Sources["agent.model"] = src
@@ -1033,6 +1054,10 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Agent.ReasoningEffort != nil {
 			cfg.Agent.ReasoningEffort = *overlay.Agent.ReasoningEffort
 			cfg.Sources["agent.reasoning_effort"] = src
+		}
+		if overlay.Agent.EffortTier != nil {
+			cfg.Agent.EffortTier = *overlay.Agent.EffortTier
+			cfg.Sources["agent.effort_tier"] = src
 		}
 		if overlay.Agent.Model != nil {
 			cfg.Agent.Model = *overlay.Agent.Model

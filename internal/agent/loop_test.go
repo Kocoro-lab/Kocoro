@@ -3339,6 +3339,7 @@ func TestForceStop_PreservesRequestConfig(t *testing.T) {
 	loop.SetSpecificModel("claude-sonnet-4-6")
 	loop.SetThinking(&client.ThinkingConfig{Type: "adaptive"})
 	loop.SetReasoningEffort("medium")
+	loop.SetEffortTier("xhigh")
 
 	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
 	if err != nil {
@@ -3377,6 +3378,9 @@ func TestForceStop_PreservesRequestConfig(t *testing.T) {
 	}
 	if final.ReasoningEffort != "medium" {
 		t.Errorf("force-stop dropped ReasoningEffort: got %q", final.ReasoningEffort)
+	}
+	if final.EffortTier != "xhigh" {
+		t.Errorf("force-stop dropped EffortTier: got %q", final.EffortTier)
 	}
 	if final.ModelTier != "medium" {
 		t.Errorf("force-stop dropped ModelTier: got %q", final.ModelTier)

@@ -6158,6 +6158,10 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 			"agent":            cfg.Koe.Agent,
 			"language":         cfg.Koe.Language,
 			"audio_processing": cfg.Koe.AudioProcessing,
+			// Voice Task Effort tier. Empty here means "unset"; the runner
+			// applies the low default at injection, so Desktop should render an
+			// unset value as 快速(low) to match runtime behavior.
+			"effort_tier": cfg.Koe.EffortTier,
 		}
 	}
 
