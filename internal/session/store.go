@@ -27,23 +27,50 @@ type MessageMeta struct {
 	SystemInjected bool       `json:"system_injected,omitempty"` // true for guardrail/nudge messages injected by the agent loop
 }
 
+// DeliverableReceipt is the durable, daemon-validated metadata emitted only
+// after present_deliverable confirmed a real regular file.
+type DeliverableReceipt struct {
+	ID       string `json:"id"`
+	Path     string `json:"path"`
+	Filename string `json:"filename"`
+	Title    string `json:"title,omitempty"`
+	MIME     string `json:"mime,omitempty"`
+	ByteSize int64  `json:"byte_size"`
+}
+
+// IdempotentRequest records the durable outcome of one client-owned agent
+// request. It is intentionally session-scoped: callers must mint a stable
+// session ID and key together, so a retry can prove whether the original turn
+// completed without re-running its tools. "accepted" is fail-safe after a
+// daemon crash — it never auto-replays because an external side effect may
+// already have happened even when the final session save did not.
+type IdempotentRequest struct {
+	State        string               `json:"state"`
+	Reply        string               `json:"reply,omitempty"`
+	Partial      bool                 `json:"partial,omitempty"`
+	FailureCode  string               `json:"failure_code,omitempty"`
+	Deliverables []DeliverableReceipt `json:"deliverables,omitempty"`
+	UpdatedAt    time.Time            `json:"updated_at"`
+}
+
 type Session struct {
-	SchemaVersion   int              `json:"schema_version,omitempty"`
-	ID              string           `json:"id"`
-	CreatedAt       time.Time        `json:"created_at"`
-	UpdatedAt       time.Time        `json:"updated_at"`
-	Title           string           `json:"title"`
-	CWD             string           `json:"cwd"`
-	Messages        []client.Message `json:"messages"`
-	RemoteTasks     []string         `json:"remote_tasks,omitempty"`
-	MessageMeta     []MessageMeta    `json:"message_meta,omitempty"`
-	Source          string           `json:"source,omitempty"`            // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still appears in older sessions)
-	Channel         string           `json:"channel,omitempty"`           // source channel/group identifier
-	ScheduleID      string           `json:"schedule_id,omitempty"`       // owning schedule for scheduler-created sessions; retained after schedule deletion
-	RouteKey        string           `json:"route_key,omitempty"`         // persisted daemon route binding for routed conversations
-	SummaryCache    string           `json:"summary_cache,omitempty"`     // cached summary Markdown
-	SummaryCacheKey string           `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
-	Usage           *UsageSummary    `json:"usage,omitempty"`             // cumulative LLM + tool cost/token totals
+	SchemaVersion      int                          `json:"schema_version,omitempty"`
+	ID                 string                       `json:"id"`
+	CreatedAt          time.Time                    `json:"created_at"`
+	UpdatedAt          time.Time                    `json:"updated_at"`
+	Title              string                       `json:"title"`
+	CWD                string                       `json:"cwd"`
+	Messages           []client.Message             `json:"messages"`
+	RemoteTasks        []string                     `json:"remote_tasks,omitempty"`
+	MessageMeta        []MessageMeta                `json:"message_meta,omitempty"`
+	IdempotentRequests map[string]IdempotentRequest `json:"idempotent_requests,omitempty"`
+	Source             string                       `json:"source,omitempty"`            // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still appears in older sessions)
+	Channel            string                       `json:"channel,omitempty"`           // source channel/group identifier
+	ScheduleID         string                       `json:"schedule_id,omitempty"`       // owning schedule for scheduler-created sessions; retained after schedule deletion
+	RouteKey           string                       `json:"route_key,omitempty"`         // persisted daemon route binding for routed conversations
+	SummaryCache       string                       `json:"summary_cache,omitempty"`     // cached summary Markdown
+	SummaryCacheKey    string                       `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
+	Usage              *UsageSummary                `json:"usage,omitempty"`             // cumulative LLM + tool cost/token totals
 	// ToolResultReplacements stores query-time tool_result replacement text
 	// keyed by tool_use_id. It is not model-visible by itself; agent loops
 	// apply it to a request-local message copy before LLM calls.

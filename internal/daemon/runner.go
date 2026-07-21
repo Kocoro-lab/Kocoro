@@ -48,6 +48,19 @@ var (
 	stopPlaywrightChromeAndWaitFn = mcp.StopCDPChromeAndWait
 )
 
+var validIdempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{8,128}$`)
+
+var (
+	ErrIdempotentRequestInProgress = errors.New("idempotent request was accepted but did not complete")
+	ErrIdempotentRequestFailed     = errors.New("idempotent request previously failed")
+)
+
+const (
+	idempotentRequestAccepted  = "accepted"
+	idempotentRequestCompleted = "completed"
+	idempotentRequestFailed    = "failed"
+)
+
 // RequestContentBlock represents a content block in the POST /message request.
 // Supported types: "text" and "image" (passed through to LLM), "file_ref" (resolved by daemon).
 type RequestContentBlock struct {
@@ -73,6 +86,7 @@ type RunAgentRequest struct {
 	CWD             string                `json:"cwd,omitempty"`               // absolute project path override
 	InjectOnly      bool                  `json:"inject_only,omitempty"`       // busy-state inject: on InjectNoActiveRun race, return 409 instead of starting a new run so the client re-queues locally (avoids duplicate run)
 	ClientMessageID string                `json:"client_message_id,omitempty"` // client-supplied id (e.g. Desktop queued-draft id) echoed back in the injected_committed SSE event when the loop drains this inject, so the client flips its queued card into a real bubble at the consume boundary
+	IdempotencyKey  string                `json:"idempotency_key,omitempty"`   // stable key for a primary request with a client-minted session_id; completed retries return the persisted result, while interrupted/failed attempts never replay tools automatically
 	RouteKey        string                `json:"-"`                           // internal routing key
 	PinnedRouteKey  string                `json:"-"`                           // internal: returned verbatim by ComputeRouteKey so it survives the post-@mention recompute. Sticky schedules pin their dedicated agent:<name>:schedule:<id> key here; json:"-" so HTTP clients cannot pin an arbitrary route.
 	ScheduleID      string                `json:"-"`                           // internal: owning schedule for scheduler-created sessions. Persisted onto session metadata; HTTP clients cannot forge the association.
@@ -124,6 +138,17 @@ func (r *RunAgentRequest) Validate() error {
 	if r.CWD != "" {
 		if err := cwdctx.ValidateCWD(r.CWD); err != nil {
 			return fmt.Errorf("invalid cwd: %w", err)
+		}
+	}
+	if r.IdempotencyKey != "" {
+		if r.SessionID == "" {
+			return fmt.Errorf("idempotency_key requires session_id")
+		}
+		if r.Ephemeral {
+			return fmt.Errorf("idempotency_key is not supported for ephemeral requests")
+		}
+		if !validIdempotencyKeyPattern.MatchString(r.IdempotencyKey) {
+			return fmt.Errorf("invalid idempotency_key format")
 		}
 	}
 	return nil
@@ -1185,6 +1210,11 @@ type RunAgentResult struct {
 	// an error.
 	Partial     bool           `json:"partial,omitempty"`
 	FailureCode runstatus.Code `json:"failure_code,omitempty"`
+	// Deliverables are daemon-validated local files surfaced by
+	// present_deliverable during this run. Persisting them in the idempotent
+	// result gives crash-recovery clients evidence of the side effect itself,
+	// rather than asking them to infer success from an often-empty chat reply.
+	Deliverables []session.DeliverableReceipt `json:"deliverables,omitempty"`
 
 	// MessageStartIndex / MessageEndIndex pin the slice of sess.Messages this
 	// invocation wrote. MessageStartIndex is len(sess.Messages) AFTER the
@@ -1203,6 +1233,102 @@ type RunAgentResult struct {
 	// both success and hard-error paths.
 	MessageStartIndex int `json:"message_start_index,omitempty"`
 	MessageEndIndex   int `json:"message_end_index,omitempty"`
+}
+
+func completedIdempotentResult(sess *session.Session, key, agentName string) (*RunAgentResult, error, bool) {
+	if sess == nil || key == "" || sess.IdempotentRequests == nil {
+		return nil, nil, false
+	}
+	record, ok := sess.IdempotentRequests[key]
+	if !ok {
+		return nil, nil, false
+	}
+	switch record.State {
+	case idempotentRequestCompleted:
+		// A replayed dedup hit reports no NEW spend: Usage is intentionally
+		// left zero here because the original run already reported and billed
+		// its tokens/cost. A cost-tracking client must not double-count a
+		// deduplicated retry (it will therefore see $0 for the replay).
+		return &RunAgentResult{
+			Reply:        record.Reply,
+			SessionID:    sess.ID,
+			Agent:        agentName,
+			Partial:      record.Partial,
+			FailureCode:  runstatus.Code(record.FailureCode),
+			Deliverables: append([]session.DeliverableReceipt(nil), record.Deliverables...),
+		}, nil, true
+	case idempotentRequestFailed:
+		return nil, ErrIdempotentRequestFailed, true
+	default:
+		// "accepted" intentionally does not auto-replay after a daemon crash:
+		// a file-writing tool may have completed before the terminal session
+		// save. Returning an error preserves the source artifact for explicit
+		// recovery without risking a duplicate deliverable.
+		return nil, ErrIdempotentRequestInProgress, true
+	}
+}
+
+func setIdempotentRequestState(
+	sess *session.Session,
+	key, state, reply string,
+	partial bool,
+	failureCode runstatus.Code,
+	deliverables []session.DeliverableReceipt,
+) {
+	if sess.IdempotentRequests == nil {
+		sess.IdempotentRequests = make(map[string]session.IdempotentRequest)
+	}
+	// Contract: callers own a one-key-per-fresh-session pairing (Desktop mints a
+	// new session_id per keyed handoff), so this map holds a single entry in the
+	// intended flow and is not pruned. A client that reuses one session across
+	// many keys would grow the map (and the persisted session JSON) without
+	// bound — that is a caller-contract violation, not a supported pattern.
+	sess.IdempotentRequests[key] = session.IdempotentRequest{
+		State:        state,
+		Reply:        reply,
+		Partial:      partial,
+		FailureCode:  string(failureCode),
+		Deliverables: append([]session.DeliverableReceipt(nil), deliverables...),
+		UpdatedAt:    time.Now(),
+	}
+}
+
+type deliverableReceiptCollector struct {
+	mu       sync.Mutex
+	receipts []session.DeliverableReceipt
+}
+
+func (c *deliverableReceiptCollector) record(d tools.Deliverable) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.receipts = append(c.receipts, session.DeliverableReceipt{
+		ID: d.ID, Path: d.Path, Filename: d.Filename, Title: d.Title,
+		MIME: d.MIME, ByteSize: d.ByteSize,
+	})
+}
+
+func (c *deliverableReceiptCollector) snapshot() []session.DeliverableReceipt {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]session.DeliverableReceipt(nil), c.receipts...)
+}
+
+// terminalIdempotencyState decides the durable state persisted for a keyed
+// request. It fails closed: a run is recorded "completed" (and thus replayable)
+// only when the outcome is known AND it either succeeded cleanly or produced at
+// least one durable deliverable. A soft-failure partial with no deliverable
+// (e.g. an iteration-limit / idle-timeout run that emitted only partial text)
+// is recorded "failed" ON PURPOSE — the first caller still receives that
+// partial as a successful response, but a retry of the same key gets
+// ErrIdempotentRequestFailed and re-runs to actually produce the missing
+// artifact, rather than the client trusting an incomplete result and (for the
+// meeting handoff) deleting its source audio. Only the deliverable-produced
+// path replays a partial; a text-only partial is deliberately not replayable.
+func terminalIdempotencyState(outcomeKnown bool, runErr error, deliverableCount int) string {
+	if outcomeKnown && (runErr == nil || deliverableCount > 0) {
+		return idempotentRequestCompleted
+	}
+	return idempotentRequestFailed
 }
 
 // RunAgentUsage tracks token and cost information for a single agent run.
@@ -1609,6 +1735,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	cfg, _, sup := deps.Snapshot()
 	if cfg == nil || deps.GW == nil || deps.SessionCache == nil {
 		return nil, fmt.Errorf("daemon not fully configured")
+	}
+	// HTTP callers validate before reaching the runner, but RunAgent is also a
+	// package seam used directly by tests and internal callers. Keep the
+	// idempotency contract fail-closed here as well so a caller cannot execute
+	// an untracked side effect with a missing/unsafe session binding.
+	if req.IdempotencyKey != "" {
+		if err := req.Validate(); err != nil {
+			return nil, err
+		}
 	}
 	// Install ChromeUseLease + BrowserUseLease on ctx before any tool dispatch
 	// happens. Defer the same end-of-turn manager lookup the success-path
@@ -2033,6 +2168,53 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if route != nil && sess != nil {
 		route.storeSessionID(sess.ID)
 	}
+	if result, err, found := completedIdempotentResult(sess, req.IdempotencyKey, agentName); found {
+		// A duplicate SSE request still needs the stable binding event before
+		// handleMessageSSE emits its terminal done/error frame.
+		if setter, ok := handler.(interface{ SetSessionID(string) }); ok && sess != nil {
+			setter.SetSessionID(sess.ID)
+		}
+		return result, err
+	}
+
+	idempotencySettled := req.IdempotencyKey == ""
+	idempotencyOutcomeKnown := false
+	var idempotencyRunErr error
+	var idempotencyReply string
+	var idempotencyPartial bool
+	var idempotencyFailureCode runstatus.Code
+	deliverableReceipts := &deliverableReceiptCollector{}
+	if req.IdempotencyKey != "" {
+		setIdempotentRequestState(
+			sess, req.IdempotencyKey, idempotentRequestAccepted, "", false,
+			runstatus.CodeNone, nil,
+		)
+		// Acceptance must be durable before any LLM or tool can run. If this
+		// save fails, fail closed and leave the Desktop artifact available for
+		// retry rather than executing an untracked side effect.
+		if err := sessMgr.Save(); err != nil {
+			delete(sess.IdempotentRequests, req.IdempotencyKey)
+			return nil, fmt.Errorf("persist idempotent request acceptance: %w", err)
+		}
+		defer func() {
+			if idempotencySettled {
+				return
+			}
+			receipts := deliverableReceipts.snapshot()
+			setIdempotentRequestState(
+				sess,
+				req.IdempotencyKey,
+				terminalIdempotencyState(idempotencyOutcomeKnown, idempotencyRunErr, len(receipts)),
+				idempotencyReply,
+				idempotencyPartial,
+				idempotencyFailureCode,
+				receipts,
+			)
+			if err := sessMgr.Save(); err != nil {
+				log.Printf("daemon: failed to persist idempotent request failure: %v", err)
+			}
+		}()
+	}
 
 	// Ad-hoc route registration for default-agent / route-less runs.
 	//
@@ -2181,6 +2363,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// buffer was full. Using EmitTo's delivery count (rather than a liveness
 	// check) means a single stalled subscriber cannot swallow notifications
 	// into a silent void.
+	var deliverableEventHandler tools.DeliverableHandler
 	if deps.EventBus != nil {
 		sessID := sess.ID
 		notifyAgent := agentName
@@ -2205,8 +2388,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// inside the tool (a real regular local file; not necessarily under
 		// the session CWD) before this fires, so the emitted metadata is
 		// daemon-vouched.
-		ctx = tools.WithDeliverableHandler(ctx, makeDeliverableEventHandler(deps.EventBus, sessID, notifyAgent, notifySource))
+		deliverableEventHandler = makeDeliverableEventHandler(deps.EventBus, sessID, notifyAgent, notifySource)
 	}
+	// Always collect the validated receipt, even when no Desktop EventBus
+	// subscriber is attached. Idempotent replay relies on this durable evidence.
+	ctx = tools.WithDeliverableHandler(ctx, func(d tools.Deliverable) bool {
+		deliverableReceipts.record(d)
+		if deliverableEventHandler != nil {
+			return deliverableEventHandler(d)
+		}
+		return false
+	})
 
 	// Persist session to disk before loop.Run() so there's a record even if
 	// the daemon crashes mid-execution. The final save after completion is
@@ -2785,6 +2977,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	result, usage, runErr := loop.Run(ctx, prompt, resolvedContent, history)
 	status := loop.LastRunStatus()
+	idempotencyOutcomeKnown = true
+	idempotencyRunErr = runErr
+	idempotencyReply = result
+	idempotencyPartial = status.Partial
+	idempotencyFailureCode = status.FailureCode
 	if runErr != nil && !isSoftRunError(runErr) {
 		// Hard error — save a user-friendly error message so the session isn't
 		// left with a dangling user message and no assistant reply.
@@ -2793,6 +2990,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if status.FailureCode == runstatus.CodeNone {
 			status.FailureCode = runstatus.CodeFromError(runErr)
 		}
+		idempotencyFailureCode = status.FailureCode
 		userErr := FriendlyAgentError(runErr)
 		savedSessionID := ""
 		if !req.Ephemeral && result == "" {
@@ -2955,6 +3153,18 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		sess.ToolResultReplacements = loop.ToolResultReplacements()
 		sess.ToolResultSeen = loop.ToolResultSeen()
 		sess.InProgress = false // turn completed — clear mid-turn crash marker
+		if req.IdempotencyKey != "" {
+			receipts := deliverableReceipts.snapshot()
+			setIdempotentRequestState(
+				sess,
+				req.IdempotencyKey,
+				terminalIdempotencyState(true, runErr, len(receipts)),
+				result,
+				status.Partial,
+				status.FailureCode,
+				receipts,
+			)
+		}
 		saveErr = sessMgr.Save()
 		if saveErr != nil {
 			log.Printf("daemon: failed to save session: %v", saveErr)
@@ -3107,6 +3317,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	returnedSessionID := sess.ID
 	if saveErr != nil {
 		returnedSessionID = ""
+	} else {
+		idempotencySettled = true
 	}
 	return &RunAgentResult{
 		Reply:                result,
@@ -3118,6 +3330,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		Usage:                reportedUsage,
 		Partial:              status.Partial,
 		FailureCode:          status.FailureCode,
+		Deliverables:         deliverableReceipts.snapshot(),
 		MessageStartIndex:    turnBase.msgCount,
 		MessageEndIndex:      len(sess.Messages),
 	}, nil

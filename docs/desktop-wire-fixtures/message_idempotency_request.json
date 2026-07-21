@@ -1,0 +1,8 @@
+{
+  "text": "Summarize the attached document.",
+  "channel": "shanclaw",
+  "source": "desktop",
+  "session_id": "12345678",
+  "new_session": true,
+  "idempotency_key": "job-12345678"
+}
