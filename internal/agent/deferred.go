@@ -308,22 +308,46 @@ func buildLocalOnlySchemas(reg *ToolRegistry) []client.Tool {
 }
 
 // buildLocalActiveSchemas returns local tool schemas with categorical-deferred
-// names filtered out. Used by the legacy deferred path (modelSupportsToolRef
-// false) where defer_loading flags are not honored on the wire — instead we
-// simply omit cold local tools so they're discoverable only via tool_search.
+// names filtered out, plus schemas for any neverDeferTools (web_search,
+// web_fetch) present in the registry. Used by the legacy deferred path
+// (modelSupportsToolRef false) where defer_loading flags are not honored on
+// the wire — instead we simply omit cold local tools so they're discoverable
+// only via tool_search.
+//
+// web_search/web_fetch are gateway tools, so the local-only source filter
+// below would otherwise miss them entirely. deferredToolNames() also excludes
+// them from the cold/tool_search set (see toolbudget.go neverDeferTools), so
+// without this graft they would be completely unreachable on the legacy
+// path — worse than before neverDeferTools existed, when they were at least
+// discoverable via tool_search. The result is built by walking the
+// registry's canonical SortedNames() order (local alpha -> MCP alpha ->
+// gateway alpha) so ordering stays deterministic and consistent with
+// rebuildSchemas/buildFullSchemasWithDefer.
 func buildLocalActiveSchemas(reg *ToolRegistry, cold map[string]bool) []client.Tool {
-	schemas := buildLocalOnlySchemas(reg)
-	if len(cold) == 0 {
-		return schemas
-	}
-	out := make([]client.Tool, 0, len(schemas))
-	for _, s := range schemas {
-		if cold[schemaToolName(s)] {
+	local, _, _ := reg.partitionBySource()
+	wanted := make(map[string]bool, len(local)+len(neverDeferTools))
+	for _, name := range local {
+		if cold[name] {
 			continue
 		}
-		out = append(out, s)
+		wanted[name] = true
 	}
-	return out
+	for name := range neverDeferTools {
+		if _, ok := reg.Get(name); ok {
+			wanted[name] = true
+		}
+	}
+
+	schemas := make([]client.Tool, 0, len(wanted))
+	for _, name := range reg.SortedNames() {
+		if !wanted[name] {
+			continue
+		}
+		if t, ok := reg.Get(name); ok {
+			schemas = append(schemas, buildToolSchema(t))
+		}
+	}
+	return schemas
 }
 
 // deferredToolNames returns the set of tool names that are eligible for

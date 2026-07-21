@@ -663,6 +663,104 @@ func TestBuildLocalActiveSchemas_NoColdReturnsAllLocals(t *testing.T) {
 	}
 }
 
+// Legacy path (modelSupportsToolRef returns false — reached for local/
+// non-primary providers, small-tier model failover, or the invariant-
+// violation downgrade in loop.go) assembles tools[] via
+// buildLocalActiveSchemas → rebuildSchemas, and scopes tool_search to
+// coldDeferred (deferredToolNames()). Before the neverDeferTools graft in
+// buildLocalActiveSchemas, web_search/web_fetch were completely unreachable
+// there: buildLocalActiveSchemas is local-only (gateway tools filtered out)
+// and deferredToolNames() also excludes them from the cold/tool_search set
+// (see toolbudget.go neverDeferTools) — regression introduced by commit
+// ca91d14e. This pins the fix: web_search/web_fetch ship full schemas on the
+// legacy path, while other gateway tools (alpaca_news) and MCP tools stay
+// cold/tool_search-only, in deterministic canonical order (local alpha ->
+// MCP alpha -> gateway alpha).
+func TestBuildLocalActiveSchemas_LegacyPathWebToolsReachable(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "bash"})
+	reg.Register(&mockTool{name: "file_read"})
+	reg.Register(&mockTool{name: "computer"}) // categorical always-defer local tool
+	reg.Register(&mockSourcedTool{name: "web_search", source: SourceGateway})
+	reg.Register(&mockSourcedTool{name: "web_fetch", source: SourceGateway})
+	reg.Register(&mockSourcedTool{name: "alpaca_news", source: SourceGateway}) // must stay tool_search-only
+	reg.Register(&mockMCPTool{name: "mcp_a"})
+
+	cold := deferredToolNames(reg)
+	if !cold["computer"] {
+		t.Fatal("expected computer to be in the cold/deferred set")
+	}
+	if !cold["alpaca_news"] || !cold["mcp_a"] {
+		t.Fatal("expected alpaca_news and mcp_a to remain deferred-eligible (tool_search-only)")
+	}
+	for _, n := range []string{"web_search", "web_fetch"} {
+		if cold[n] {
+			t.Fatalf("expected %q to be excluded from the cold set (neverDeferTools)", n)
+		}
+	}
+
+	baseSchemas := buildLocalActiveSchemas(reg, cold)
+	assertLegacyWebToolsAssembly(t, baseSchemas)
+
+	// rebuildSchemas with an empty loaded set (no warmed deferred schemas yet,
+	// mirroring loop.go's len(loadedDeferred) > 0 branch) must reproduce the
+	// same reachable set via the registry's canonical order.
+	rebuilt := rebuildSchemas(reg, baseSchemas, map[string]client.Tool{})
+	assertLegacyWebToolsAssembly(t, rebuilt)
+
+	// Determinism: repeated assembly produces byte-identical name ordering.
+	again := buildLocalActiveSchemas(reg, cold)
+	names1 := liveToolNames(baseSchemas)
+	names2 := liveToolNames(again)
+	if len(names1) != len(names2) {
+		t.Fatalf("non-deterministic length: %v vs %v", names1, names2)
+	}
+	for i := range names1 {
+		if names1[i] != names2[i] {
+			t.Errorf("non-deterministic order at index %d: %q vs %q", i, names1[i], names2[i])
+		}
+	}
+
+	// Canonical order: local alpha (bash, file_read) then gateway alpha
+	// (web_fetch, web_search); computer/alpaca_news/mcp_a stay cold.
+	wantOrder := []string{"bash", "file_read", "web_fetch", "web_search"}
+	if len(names1) != len(wantOrder) {
+		t.Fatalf("expected order %v, got %v", wantOrder, names1)
+	}
+	for i, w := range wantOrder {
+		if names1[i] != w {
+			t.Errorf("index %d: expected %q, got %q (full: %v)", i, w, names1[i], names1)
+		}
+	}
+}
+
+// assertLegacyWebToolsAssembly checks that web_search/web_fetch carry full
+// schemas while other gateway/MCP tools are absent (i.e. still only
+// discoverable via tool_search).
+func assertLegacyWebToolsAssembly(t *testing.T, schemas []client.Tool) {
+	t.Helper()
+	names := liveToolNames(schemas)
+	for _, n := range []string{"web_search", "web_fetch"} {
+		if !containsString(names, n) {
+			t.Errorf("expected %q reachable in legacy tool assembly, got %v", n, names)
+		}
+	}
+	for _, n := range []string{"computer", "alpaca_news", "mcp_a"} {
+		if containsString(names, n) {
+			t.Errorf("expected %q to stay cold/tool_search-only, got %v", n, names)
+		}
+	}
+	for _, s := range schemas {
+		name := schemaToolName(s)
+		if name != "web_search" && name != "web_fetch" {
+			continue
+		}
+		if s.Function.Name == "" {
+			t.Errorf("%q missing full schema (Function.Name empty) — looks like a stub, not a real schema", name)
+		}
+	}
+}
+
 // TestToolSearchSkillExempt asserts that the tool_search meta-tool opts into
 // SkillExempt. Without this, a skill that omits tool_search from its
 // allowed-tools would lock the model out of loading deferred tool schemas.
