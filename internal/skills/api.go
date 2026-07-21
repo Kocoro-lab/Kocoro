@@ -1,13 +1,18 @@
 package skills
 
 import (
+	"archive/tar"
+	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
-	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -425,8 +430,9 @@ var ErrPreviewUnavailable = errors.New("no local preview available for skill")
 // PreviewSkill returns the raw SKILL.md content for a downloadable skill WITHOUT
 // installing it, so the UI can show a full preview before the user commits. The
 // content is served entirely from the daemon (never the network):
-//   1. Already installed on disk → read the on-disk SKILL.md.
-//   2. Bundled (embedded in the binary) → read from the extracted bundled dir.
+//  1. Already installed on disk → read the on-disk SKILL.md.
+//  2. Bundled (embedded in the binary) → read from the extracted bundled dir.
+//
 // If neither exists (a proprietary skill not yet installed), returns
 // ErrPreviewUnavailable so the caller can fall back to the short description.
 func PreviewSkill(shannonDir, name string) (string, error) {
@@ -473,24 +479,26 @@ func installFromBundled(shannonDir, name, destDir string) error {
 }
 
 // installFromRepoMaxAttempts is the number of times installFromRepo retries
-// the git operations on transient failures. Tokyo/CN corporate networks see
+// the tarball download on transient failures. Tokyo/CN corporate networks see
 // intermittent github.com reachability flakes; observed user workaround was
 // to click Install again from the Desktop UI. Backoff: 0s, 1s, 2s → ≤3s of
-// added wait worst-case, on top of actual clone time.
+// added wait worst-case, on top of actual download time.
 // Override: not currently exposed; recompile if 3 attempts proves wrong.
 const installFromRepoMaxAttempts = 3
 
-// ErrSkillNotInRepo is returned by tryInstallFromRepo when `git clone` and
-// `sparse-checkout` succeed but the requested skill's directory is absent
+// ErrSkillNotInRepo is returned by tryInstallFromRepo when the tarball
+// downloads and extracts fine but the requested skill's directory is absent
 // from the upstream tree — a deterministic 404 against
 // github.com/anthropics/skills, not a transient flake. installFromRepo
 // uses errors.Is to short-circuit retry on this sentinel.
 var ErrSkillNotInRepo = errors.New("skill not found in Anthropic repo")
 
-// installFromRepo downloads a skill from Anthropic's skills repo via git sparse checkout.
-// Retries the git operations on transient failures (network flake, github.com
-// reachability). Does NOT retry ErrSkillNotInRepo — that's a real 404 against
-// the upstream tree, not a flake.
+// installFromRepo downloads a skill from Anthropic's skills repo over HTTP
+// (the GitHub codeload tarball — no `git` binary required, so it works on a
+// stock Windows/macOS/Linux machine that has never installed git). Retries the
+// download on transient failures (network flake, github.com reachability).
+// Does NOT retry ErrSkillNotInRepo — that's a real 404 against the upstream
+// tree, not a flake.
 func installFromRepo(shannonDir, name, destDir string) error {
 	var lastErr error
 	for attempt := 0; attempt < installFromRepoMaxAttempts; attempt++ {
@@ -510,9 +518,11 @@ func installFromRepo(shannonDir, name, destDir string) error {
 	return lastErr
 }
 
-// tryInstallFromRepo is a single attempt of installFromRepo. Each attempt
-// uses a fresh tmpDir so a partially-written clone from a previous failure
-// does not contaminate the next try.
+// tryInstallFromRepo is a single attempt of installFromRepo. It downloads the
+// anthropics/skills repo as a gzip tarball, extracts only skills/<name>/** into
+// a fresh per-attempt staging dir, then copies that into destDir. A fresh
+// tmpDir per attempt guarantees a partially-written download from a previous
+// failure cannot contaminate the next try.
 func tryInstallFromRepo(shannonDir, name, destDir string) error {
 	tmpDir, err := os.MkdirTemp(shannonDir, "skill-install-*")
 	if err != nil {
@@ -520,23 +530,211 @@ func tryInstallFromRepo(shannonDir, name, destDir string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := runGit(tmpDir, "clone", "--depth=1", "--filter=blob:none", "--sparse",
-		"https://github.com/anthropics/skills.git", "."); err != nil {
-		return fmt.Errorf("git clone: %w", err)
+	rc, err := openRepoTarball(context.Background())
+	if err != nil {
+		return fmt.Errorf("download skills tarball: %w", err)
 	}
-	if err := runGit(tmpDir, "sparse-checkout", "set", "skills/"+name); err != nil {
-		return fmt.Errorf("git sparse-checkout: %w", err)
-	}
+	defer rc.Close()
 
-	srcDir := filepath.Join(tmpDir, "skills", name)
-	if _, err := os.Stat(filepath.Join(srcDir, "SKILL.md")); err != nil {
-		return fmt.Errorf("%w: %q", ErrSkillNotInRepo, name)
+	// Extract into a staging dir first; only touch destDir once the whole
+	// extraction succeeds so a mid-download failure never leaves a half-written
+	// skill in ~/.shannon/skills.
+	stageDir := filepath.Join(tmpDir, "stage")
+	if err := extractSkillFromTarball(rc, name, stageDir); err != nil {
+		return err // ErrSkillNotInRepo when the skill is absent upstream
 	}
 
 	if err := os.MkdirAll(filepath.Dir(destDir), 0700); err != nil {
 		return err
 	}
-	return os.Rename(srcDir, destDir)
+	// Clear any leftover/partial destDir before copying in. Use copyDir rather
+	// than os.Rename: on Windows MoveFile refuses an existing target directory,
+	// and rename would also fail with EXDEV if TMPDIR/shannonDir ever land on
+	// different volumes. copyDir (MkdirAll + per-file WriteFile) is safe on all.
+	if err := os.RemoveAll(destDir); err != nil {
+		return err
+	}
+	return copyDir(stageDir, destDir)
+}
+
+// anthropicSkillsTarballURL is the GitHub codeload endpoint that serves the
+// whole anthropics/skills repo as a gzip tarball for the main branch. codeload
+// is the same backend `git` archive/clone hits, but over plain HTTP — no local
+// git binary, no partial-clone/sparse-checkout git-version requirements.
+const anthropicSkillsTarballURL = "https://codeload.github.com/anthropics/skills/tar.gz/refs/heads/main"
+
+// Extraction backstops for the downloaded tarball. Generous but bounded: the
+// payload is attacker-influenced (a compromised upstream / MITM), so cap total
+// decompressed bytes (zip-bomb guard), per-file size, and file count. Vars (not
+// consts) so tests can shrink them to exercise the guards cheaply.
+var (
+	maxSkillTarballBytes int64 = 200 << 20 // 200 MiB total decompressed
+	maxSkillFileBytes    int64 = 25 << 20  // 25 MiB per file
+	maxSkillFiles              = 10000
+)
+
+// skillsHTTPClient downloads the skills tarball. The 2-minute ceiling bounds a
+// stalled download so an install can never hang the HTTP handler forever (the
+// old git path had no such deadline).
+var skillsHTTPClient = &http.Client{Timeout: 2 * time.Minute}
+
+// openRepoTarball is the single injectable seam (it replaces the former
+// `runGit` seam) so retry/not-found tests in api_test.go can feed a synthetic
+// tarball or a transient error without any network access.
+var openRepoTarball = openRepoTarballReal
+
+func openRepoTarballReal(ctx context.Context) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, anthropicSkillsTarballURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := skillsHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("codeload returned %s", resp.Status)
+	}
+	return resp.Body, nil
+}
+
+// extractSkillFromTarball reads a gzip tar stream of the anthropics/skills repo
+// and extracts only entries under <root>/skills/<name>/, stripping that prefix
+// into destDir. codeload wraps the repo in a single top-level directory whose
+// name embeds the ref (e.g. "skills-main/"); that name is not hardcoded — the
+// first path segment is treated as the wrapper. Returns ErrSkillNotInRepo when
+// no matching entry exists (deterministic upstream 404).
+//
+// Security: tar paths are always '/'-separated, so cleaning uses path.Clean
+// (never filepath) to avoid the Windows backslash-as-separator asymmetry.
+// Symlinks/hardlinks/devices are skipped (they can be a path-escape vector and
+// never belong in a skill), and every target is re-checked to stay within
+// destDir as defense-in-depth against tar-slip.
+func extractSkillFromTarball(r io.Reader, name, destDir string) error {
+	gz, err := gzip.NewReader(r)
+	if err != nil {
+		return fmt.Errorf("gzip: %w", err)
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(&countingReader{r: gz, limit: maxSkillTarballBytes})
+	if err := os.MkdirAll(destDir, 0700); err != nil {
+		return err
+	}
+
+	matched, files := 0, 0
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("tar: %w", err)
+		}
+		rel, ok := stripSkillPrefix(path.Clean(hdr.Name), name)
+		if !ok {
+			continue
+		}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if rel == "" {
+				continue
+			}
+			if err := os.MkdirAll(filepath.Join(destDir, filepath.FromSlash(rel)), 0700); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			files++
+			if files > maxSkillFiles {
+				return fmt.Errorf("skill %q exceeds %d files", name, maxSkillFiles)
+			}
+			target := filepath.Join(destDir, filepath.FromSlash(rel))
+			if !withinDir(destDir, target) {
+				return fmt.Errorf("unsafe tar path %q", hdr.Name)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+				return err
+			}
+			if err := writeTarFile(target, tr); err != nil {
+				return err
+			}
+			matched++
+		default:
+			// Skip symlinks/hardlinks/char/block/fifo — not expected in a skill
+			// payload and a potential path-escape vector.
+			continue
+		}
+	}
+	if matched == 0 {
+		return fmt.Errorf("%w: %q", ErrSkillNotInRepo, name)
+	}
+	return nil
+}
+
+// stripSkillPrefix matches "<root>/skills/<name>/<rest>" (or the bare
+// "<root>/skills/<name>" directory entry) and returns <rest> ("" for the dir
+// entry itself). ok is false for any path that isn't under the target skill.
+func stripSkillPrefix(clean, name string) (rest string, ok bool) {
+	// [root, "skills", name, rest] — SplitN keeps the remainder intact in [3].
+	parts := strings.SplitN(clean, "/", 4)
+	if len(parts) < 3 || parts[1] != "skills" || parts[2] != name {
+		return "", false
+	}
+	if len(parts) == 3 {
+		return "", true
+	}
+	return parts[3], true
+}
+
+// withinDir reports whether target resolves inside root (tar-slip guard).
+func withinDir(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// writeTarFile writes one tar entry to target with a fixed 0644 mode. It caps
+// actual bytes copied (guarding against a lying hdr.Size) and deliberately does
+// NOT preserve the tar mode bits — matching copyDir/installFromBundled and
+// sidestepping Windows, where os.Chmod cannot set an executable bit anyway.
+func writeTarFile(target string, r io.Reader) error {
+	f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(f, io.LimitReader(r, maxSkillFileBytes+1))
+	if err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if n > maxSkillFileBytes {
+		return fmt.Errorf("tar file %q exceeds %d bytes", target, maxSkillFileBytes)
+	}
+	return nil
+}
+
+// countingReader caps the total number of bytes read from the underlying
+// (decompressed) stream, so a zip-bomb tarball can't exhaust memory/disk during
+// extraction regardless of how small the compressed payload is.
+type countingReader struct {
+	r     io.Reader
+	n     int64
+	limit int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	if c.n > c.limit {
+		return 0, fmt.Errorf("skills tarball exceeds %d bytes (decompression guard)", c.limit)
+	}
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // copyDir recursively copies a directory tree.
@@ -567,27 +765,11 @@ func InstallSkillFromRepo(shannonDir, name string) error {
 	return InstallSkill(shannonDir, name)
 }
 
-// runGit is a package-level indirection so retry tests in api_test.go can
-// inject failures without spawning a real `git` binary. Production callers
-// see no behavioral difference from a regular function — restore by writing
-// runGit = runGitReal in a t.Cleanup.
-var runGit = runGitReal
-
-func runGitReal(dir string, args ...string) error {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-// atomicWrite writes data to a temp file then renames to path.
-func atomicWrite(path string, data []byte) error {
-	tmp := path + ".tmp"
+// atomicWrite writes data to a temp file then renames to dest.
+func atomicWrite(dest string, data []byte) error {
+	tmp := dest + ".tmp"
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return os.Rename(tmp, dest)
 }

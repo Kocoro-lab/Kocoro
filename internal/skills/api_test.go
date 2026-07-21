@@ -1,8 +1,13 @@
 package skills
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -165,45 +170,60 @@ func TestEnsureBuiltinSkills_RemovesLegacyVersionSidecar(t *testing.T) {
 	}
 }
 
-// fakeGitSucceed populates dir with a minimal Anthropic-repo-style layout
-// for the requested skill name. Returns a function suitable for assigning
-// to the package-level runGit variable. The caller chooses which subcommand
-// (clone / sparse-checkout) triggers the layout write.
-func fakeGitSucceed(name string) func(dir string, args ...string) error {
-	return func(dir string, args ...string) error {
-		if len(args) > 0 && args[0] == "clone" {
-			skillDir := filepath.Join(dir, "skills", name)
-			if err := os.MkdirAll(skillDir, 0700); err != nil {
-				return err
-			}
-			if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"),
-				[]byte("---\nname: "+name+"\ndescription: fixture\n---\nbody"), 0644); err != nil {
-				return err
-			}
+// fakeTarball builds an in-memory .tar.gz mimicking the GitHub codeload archive
+// of anthropics/skills: every named skill lands at
+// "<root>/skills/<name>/SKILL.md" under a single top-level wrapper directory
+// (codeload always wraps the repo like this). Returns the complete gzip-tar
+// bytes, ready to hand back from a fake openRepoTarball.
+func fakeTarball(t *testing.T, root string, names ...string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, name := range names {
+		body := []byte("---\nname: " + name + "\ndescription: fixture\n---\nbody")
+		hdr := &tar.Header{
+			Name:     root + "/skills/" + name + "/SKILL.md",
+			Mode:     0644,
+			Size:     int64(len(body)),
+			Typeflag: tar.TypeReg,
 		}
-		return nil
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write tar header: %v", err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			t.Fatalf("write tar body: %v", err)
+		}
 	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close gzip: %v", err)
+	}
+	return buf.Bytes()
 }
 
+func tarballReader(b []byte) io.ReadCloser { return io.NopCloser(bytes.NewReader(b)) }
+
 // TestInstallFromRepo_RetriesOnTransientFailure pins the retry contract:
-// a single transient `git clone` failure must NOT surface to the caller;
+// a single transient download failure must NOT surface to the caller;
 // the next attempt's success should produce a clean install. This is the
 // core robustness change — if it ever regresses, ouikyou's class of
 // "intermittent github.com reachability" failures comes back as user-
 // visible install errors. Backoff makes this test ~1s in the happy path.
 func TestInstallFromRepo_RetriesOnTransientFailure(t *testing.T) {
-	origRunGit := runGit
-	t.Cleanup(func() { runGit = origRunGit })
+	orig := openRepoTarball
+	t.Cleanup(func() { openRepoTarball = orig })
 
 	shannonDir := t.TempDir()
 	var attempts atomic.Int32
-	succeed := fakeGitSucceed("retry-fixture")
-	runGit = func(dir string, args ...string) error {
-		n := attempts.Add(1)
-		if len(args) > 0 && args[0] == "clone" && n == 1 {
-			return fmt.Errorf("simulated network flake")
+	tarball := fakeTarball(t, "skills-main", "retry-fixture")
+	openRepoTarball = func(ctx context.Context) (io.ReadCloser, error) {
+		if attempts.Add(1) == 1 {
+			return nil, fmt.Errorf("simulated network flake")
 		}
-		return succeed(dir, args...)
+		return tarballReader(tarball), nil
 	}
 
 	destDir := filepath.Join(shannonDir, "skills", "retry-fixture")
@@ -213,31 +233,28 @@ func TestInstallFromRepo_RetriesOnTransientFailure(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(destDir, "SKILL.md")); err != nil {
 		t.Fatalf("installed SKILL.md missing: %v", err)
 	}
-	// Attempt 1: clone fail. Attempt 2: clone ok + sparse-checkout. Total 3 git calls.
-	if got := attempts.Load(); got < 2 {
-		t.Errorf("expected ≥2 git calls (proves retry happened), got %d", got)
+	// Attempt 1 flake, attempt 2 success → exactly 2 fetch attempts.
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("expected exactly 2 fetch attempts (1 flake + 1 success), got %d", got)
 	}
 }
 
 // TestInstallFromRepo_NoRetryOnNotFoundSentinel pins the boundary case:
-// when `git clone` succeeds but the requested skill isn't actually in the
+// when the download succeeds but the requested skill isn't actually in the
 // Anthropic repo's tree, the wrapper must return immediately rather than
-// re-running the (slow, network-bound) clone twice more on what is a
-// deterministic 404. Mock clone always succeeds; we never lay down the
-// requested skill subdir; expect exactly one clone call.
+// re-fetching the (large, network-bound) tarball twice more on what is a
+// deterministic 404. The fake serves a valid tarball containing a *different*
+// skill; expect exactly one fetch.
 func TestInstallFromRepo_NoRetryOnNotFoundSentinel(t *testing.T) {
-	origRunGit := runGit
-	t.Cleanup(func() { runGit = origRunGit })
+	orig := openRepoTarball
+	t.Cleanup(func() { openRepoTarball = orig })
 
 	shannonDir := t.TempDir()
-	var cloneCalls atomic.Int32
-	runGit = func(dir string, args ...string) error {
-		if len(args) > 0 && args[0] == "clone" {
-			cloneCalls.Add(1)
-		}
-		// Intentionally do not create skills/<name>/SKILL.md — that's what
-		// triggers the "not found in Anthropic repo" sentinel.
-		return nil
+	var fetches atomic.Int32
+	tarball := fakeTarball(t, "skills-main", "some-other-skill")
+	openRepoTarball = func(ctx context.Context) (io.ReadCloser, error) {
+		fetches.Add(1)
+		return tarballReader(tarball), nil
 	}
 
 	destDir := filepath.Join(shannonDir, "skills", "does-not-exist")
@@ -250,24 +267,24 @@ func TestInstallFromRepo_NoRetryOnNotFoundSentinel(t *testing.T) {
 	if !errors.Is(err, ErrSkillNotInRepo) {
 		t.Errorf("expected errors.Is(err, ErrSkillNotInRepo) == true, got %v", err)
 	}
-	if got := cloneCalls.Load(); got != 1 {
-		t.Errorf("clone called %d times, want exactly 1 (no retry on deterministic 404)", got)
+	if got := fetches.Load(); got != 1 {
+		t.Errorf("fetched %d times, want exactly 1 (no retry on deterministic 404)", got)
 	}
 }
 
 // TestInstallFromRepo_ExhaustsRetriesAndReturnsLastError pins the failure
-// shape after all retries are exhausted: the last git error is returned
-// unchanged so the audit log captures the actual stderr the user needs to
-// diagnose (proxy, DNS, missing git binary, etc.).
+// shape after all retries are exhausted: the last download error is returned
+// unchanged so the audit log captures the actual failure the user needs to
+// diagnose (proxy, DNS, upstream 5xx, etc.).
 func TestInstallFromRepo_ExhaustsRetriesAndReturnsLastError(t *testing.T) {
-	origRunGit := runGit
-	t.Cleanup(func() { runGit = origRunGit })
+	orig := openRepoTarball
+	t.Cleanup(func() { openRepoTarball = orig })
 
 	shannonDir := t.TempDir()
 	var attempts atomic.Int32
-	runGit = func(dir string, args ...string) error {
+	openRepoTarball = func(ctx context.Context) (io.ReadCloser, error) {
 		attempts.Add(1)
-		return fmt.Errorf("persistent failure: exit status 128")
+		return nil, fmt.Errorf("persistent failure: connection refused")
 	}
 
 	destDir := filepath.Join(shannonDir, "skills", "always-fails")
@@ -278,12 +295,116 @@ func TestInstallFromRepo_ExhaustsRetriesAndReturnsLastError(t *testing.T) {
 	if !strings.Contains(err.Error(), "persistent failure") {
 		t.Errorf("final error did not preserve underlying message: %v", err)
 	}
-	// Each attempt makes one clone call before the failure short-circuits
-	// the rest of the attempt's git operations. installFromRepoMaxAttempts
-	// is the contract here; if it changes, this assertion documents the
-	// expected attempt count.
+	// One fetch per attempt. installFromRepoMaxAttempts is the contract here;
+	// if it changes, this assertion documents the expected attempt count.
 	if got := attempts.Load(); int(got) != installFromRepoMaxAttempts {
-		t.Errorf("clone called %d times, want %d (one per attempt)", got, installFromRepoMaxAttempts)
+		t.Errorf("fetched %d times, want %d (one per attempt)", got, installFromRepoMaxAttempts)
+	}
+}
+
+// TestExtractSkillFromTarball_ArbitraryRootAndNested proves the wrapper-dir
+// name is not hardcoded (codeload derives it from the ref) and that nested
+// files under the skill dir are extracted with the prefix stripped.
+func TestExtractSkillFromTarball_ArbitraryRootAndNested(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	writeReg := func(name, body string) {
+		hdr := &tar.Header{Name: name, Mode: 0644, Size: int64(len(body)), Typeflag: tar.TypeReg}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Arbitrary wrapper name + a nested reference file + an unrelated skill.
+	writeReg("skills-abc123/skills/pdf/SKILL.md", "---\nname: pdf\ndescription: x\n---\nbody")
+	writeReg("skills-abc123/skills/pdf/reference/guide.md", "nested")
+	writeReg("skills-abc123/skills/other/SKILL.md", "---\nname: other\ndescription: y\n---\n")
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "pdf")
+	if err := extractSkillFromTarball(bytes.NewReader(buf.Bytes()), "pdf", dest); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "SKILL.md")); err != nil {
+		t.Errorf("SKILL.md not extracted: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "reference", "guide.md")); err != nil {
+		t.Errorf("nested reference file not extracted: %v", err)
+	}
+	// The unrelated skill must not have leaked into pdf's dir.
+	if _, err := os.Stat(filepath.Join(dest, "other")); err == nil {
+		t.Errorf("unrelated skill leaked into dest")
+	}
+}
+
+// TestExtractSkillFromTarball_SkipsSymlinkAndTraversal proves a hostile tarball
+// cannot plant a symlink or escape destDir: non-regular entries are skipped and
+// there is a within-dir guard on every write.
+func TestExtractSkillFromTarball_SkipsSymlinkAndTraversal(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	body := "---\nname: pdf\ndescription: x\n---\nbody"
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(tw.WriteHeader(&tar.Header{Name: "root/skills/pdf/SKILL.md", Mode: 0644, Size: int64(len(body)), Typeflag: tar.TypeReg}))
+	_, err := tw.Write([]byte(body))
+	must(err)
+	// A symlink pointing outside — must be skipped, not created.
+	must(tw.WriteHeader(&tar.Header{Name: "root/skills/pdf/evil-link", Linkname: "/etc/passwd", Typeflag: tar.TypeSymlink}))
+	must(tw.Close())
+	must(gz.Close())
+
+	dest := filepath.Join(t.TempDir(), "pdf")
+	if err := extractSkillFromTarball(bytes.NewReader(buf.Bytes()), "pdf", dest); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dest, "evil-link")); err == nil {
+		t.Errorf("symlink entry was materialized; it must be skipped")
+	}
+	if _, err := os.Stat(filepath.Join(dest, "SKILL.md")); err != nil {
+		t.Errorf("regular file should still extract alongside skipped symlink: %v", err)
+	}
+}
+
+// TestExtractSkillFromTarball_PerFileSizeCap proves the per-file byte cap trips
+// on a lying/oversized entry rather than writing unbounded data to disk.
+func TestExtractSkillFromTarball_PerFileSizeCap(t *testing.T) {
+	orig := maxSkillFileBytes
+	maxSkillFileBytes = 8
+	t.Cleanup(func() { maxSkillFileBytes = orig })
+
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	big := strings.Repeat("A", 64)
+	if err := tw.WriteHeader(&tar.Header{Name: "root/skills/pdf/SKILL.md", Mode: 0644, Size: int64(len(big)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte(big)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "pdf")
+	if err := extractSkillFromTarball(bytes.NewReader(buf.Bytes()), "pdf", dest); err == nil {
+		t.Fatalf("expected per-file size cap error, got nil")
 	}
 }
 
