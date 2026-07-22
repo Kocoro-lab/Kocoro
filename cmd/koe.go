@@ -1839,6 +1839,20 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		ctrl.ReemitVoiceState()
 		return nil
 	})
+	// POST /call/text: inject a typed user turn into the live call (dev manual
+	// testing). Mirrors the /call/interrupt pipeline — read curConn/callActive under
+	// sessMu (the same call-state source the SSE call_state events use), then hand the
+	// text to the realtime session's serialized injector. No active call → 409.
+	ctrl.SetTextHandler(func(text string) error {
+		sessMu.Lock()
+		conn := curConn
+		active := callActive
+		sessMu.Unlock()
+		if !active || conn == nil {
+			return koe.ErrNoActiveCall
+		}
+		return conn.InjectUserText(text)
+	})
 	addr := "127.0.0.1:" + cfg.controlPort
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

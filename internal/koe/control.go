@@ -19,6 +19,13 @@ var (
 	ErrNoTaskPending = errors.New("no_task_pending")
 )
 
+// maxInjectTextBytes caps the POST /call/text body (dev typed-turn injection).
+// WORKLOAD: a developer typing a test utterance into the diagnostics panel — a
+// sentence or two, never a document. SYMPTOM if it binds: a long paste is
+// rejected 400 and must be shortened. OVERRIDE: none today (dev-only route; raise
+// the const if a longer scripted turn is ever needed).
+const maxInjectTextBytes = 4096
+
 // controlEvent is one Koe→Desktop SSE payload, discriminated by Type. Wire shapes
 // are pinned in Plan E (the Desktop client) — keep them byte-identical:
 //
@@ -70,10 +77,11 @@ type SessionLeaseStatus struct {
 type ControlServer struct {
 	mu           sync.Mutex
 	subscribers  map[chan controlEvent]struct{}
-	onStart      func(StartCallRequest) // Desktop pressed talk: start a call
-	onEnd        func()                 // Desktop ended: tear the call down
-	onInterrupt  func()                 // Desktop explicitly interrupted playback
-	onMic        func(off bool) error   // POST /call/mic (nil until SetMicHandler)
+	onStart      func(StartCallRequest)  // Desktop pressed talk: start a call
+	onEnd        func()                  // Desktop ended: tear the call down
+	onInterrupt  func()                  // Desktop explicitly interrupted playback
+	onMic        func(off bool) error    // POST /call/mic (nil until SetMicHandler)
+	onText       func(text string) error // POST /call/text (nil until SetTextHandler)
 	onPrepare    func(time.Duration) SessionLeaseStatus
 	onRelease    func() SessionLeaseStatus
 	taskPending  func() bool // nil-safe snapshot providers, stamped on every voice_state
@@ -111,6 +119,12 @@ func NewControlServer(onStart func(StartCallRequest), onEnd func(), onInterrupt 
 // SetMicHandler wires POST /call/mic. Called once at startup, before Handler()
 // serves — no locking needed.
 func (s *ControlServer) SetMicHandler(h func(off bool) error) { s.onMic = h }
+
+// SetTextHandler wires POST /call/text (dev typed-turn injection). Called once at
+// startup, before Handler() serves — no locking needed. A nil handler makes
+// /call/text report 409 no_active_call: the facility is not plumbed to a session,
+// which is indistinguishable from there being no active call to inject into.
+func (s *ControlServer) SetTextHandler(h func(text string) error) { s.onText = h }
 
 // SetSessionHandlers wires the Wireless-only bounded Realtime prewarm lease.
 // Leaving both nil preserves the Mac/Lite control surface byte-for-byte.
@@ -241,6 +255,28 @@ func (s *ControlServer) Handler() http.Handler {
 		}
 		writeControlOK(w)
 	})
+	mux.HandleFunc("POST /call/text", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid_text"}`, http.StatusBadRequest)
+			return
+		}
+		if req.Text == "" || len(req.Text) > maxInjectTextBytes {
+			http.Error(w, `{"error":"invalid_text"}`, http.StatusBadRequest)
+			return
+		}
+		if s.onText == nil {
+			writeControlConflict(w, ErrNoActiveCall)
+			return
+		}
+		if err := s.onText(req.Text); err != nil {
+			writeControlConflict(w, err)
+			return
+		}
+		writeControlAccepted(w)
+	})
 	mux.HandleFunc("POST /session/prepare", func(w http.ResponseWriter, r *http.Request) {
 		if s.onPrepare == nil {
 			http.NotFound(w, r)
@@ -297,6 +333,23 @@ func writeControlUnauthorized(w http.ResponseWriter) {
 func writeControlOK(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// writeControlConflict renders a 409 with the error's stable code as the JSON
+// body (mirrors the /call/mic rejection shape so Desktop can distinguish the
+// sentinel reasons — e.g. no_active_call).
+func writeControlConflict(w http.ResponseWriter, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_, _ = w.Write([]byte(`{"error":"` + err.Error() + `"}`))
+}
+
+// writeControlAccepted answers 202 for a fire-and-forget action that was queued
+// (typed-turn injection, manual move playback).
+func writeControlAccepted(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte(`{"status":"accepted"}`))
 }
 
 func writeControlJSON(w http.ResponseWriter, value any) {

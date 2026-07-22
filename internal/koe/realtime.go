@@ -994,6 +994,36 @@ func (h *eventHandler) requestResponseWith(req responseCreateRequest) {
 	}
 }
 
+// injectUserText injects a typed user turn (dev manual testing via POST
+// /call/text): it creates a user-message conversation item, then queues a
+// response.create through the serialized sender — NEVER a direct send, since GA
+// rejects a response.create sent while a response is active
+// (conversation_already_has_active_response). The wire shape mirrors the one
+// proven against the live API in e2e_correction_test.go (item.create with an
+// input_text content part, then response.create). A sendFn failure (e.g. a closed
+// data channel — no active session) surfaces as an error and the response.create
+// is not queued.
+func (h *eventHandler) injectUserText(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("inject user text: empty text")
+	}
+	if err := h.sendFn(map[string]any{
+		"type": "conversation.item.create",
+		"item": map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "input_text", "text": text},
+			},
+		},
+	}); err != nil {
+		return err
+	}
+	h.requestResponse()
+	return nil
+}
+
 // runResponseSender is Koe's serialized response.create worker (started by Connect),
 // adapted from kocoro-reachy's _response_sender_loop. For each queued request it
 // waits for any active response to finish, sends response.create, waits for

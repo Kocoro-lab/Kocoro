@@ -92,6 +92,7 @@ type RealtimeConn struct {
 	cancel               context.CancelFunc
 	audio                *AudioIO
 	interruptOutput      func()
+	injectUserText       func(text string) error
 	setBargeInAuthorized func(bool) bool
 	onLocalSpeechStarted func()
 	onLocalSpeechEnded   func()
@@ -810,6 +811,18 @@ func (rc *RealtimeConn) InterruptOutput() bool {
 	return true
 }
 
+// InjectUserText injects a typed user turn into the live session (dev manual
+// testing, POST /call/text): it delegates to the event handler, which creates a
+// user-message conversation item then queues a response.create through the
+// serialized sender. Returns an error when there is no active session (nil conn /
+// not wired) or the underlying send fails.
+func (rc *RealtimeConn) InjectUserText(text string) error {
+	if rc == nil || rc.injectUserText == nil {
+		return fmt.Errorf("no active realtime session")
+	}
+	return rc.injectUserText(text)
+}
+
 // SetBargeInAuthorized supplies Reachy's sustained front-speech state to the
 // Realtime event handler. It can promote an already-active echo-held server-VAD
 // item, and it also lets a later speech_started event see an earlier gate edge.
@@ -1042,6 +1055,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	h.language = opts.Language
 	h.fullDuplexAEC = opts.FullDuplexAEC
 	rc.interruptOutput = h.interruptOutput
+	rc.injectUserText = h.injectUserText
 	rc.setBargeInAuthorized = h.setBargeInAuthorized
 	rc.onLocalSpeechStarted = h.observeLocalSpeechStarted
 	rc.onLocalSpeechEnded = func() { h.observeLocalSpeechEnded(ctx) }
