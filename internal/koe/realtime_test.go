@@ -33,6 +33,19 @@ func (c *captureSender) send(v any) error {
 	return nil
 }
 
+func (c *captureSender) countContains(sub string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := 0
+	for _, message := range c.sent {
+		payload, _ := json.Marshal(message)
+		if strings.Contains(string(payload), sub) {
+			count++
+		}
+	}
+	return count
+}
+
 // countType counts captured frames whose "type" equals typ.
 func (c *captureSender) countType(typ string) int {
 	c.mu.Lock()
@@ -198,7 +211,7 @@ func TestHandleFunctionCallInjectedFollowupDoesNotDoubleSpeak(t *testing.T) {
 	}
 
 	h.handleFunctionCall(ctx, "call-2", "do_task", []byte(`{"task":"change it to 6pm"}`))
-	waitUntil(t, func() bool { return cap.sentContains("injected") }, "injected follow-up did not get function_call_output")
+	waitUntil(t, func() bool { return cap.countContains(`\"status\":\"running\"`) >= 2 }, "follow-up did not get its immediate running ack")
 	time.Sleep(150 * time.Millisecond)
 	if got := cap.countType("response.create"); got != 0 {
 		t.Fatalf("injected follow-up must not request a voiced response, got %d response.create", got)

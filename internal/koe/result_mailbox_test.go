@@ -210,7 +210,7 @@ func TestDoTaskResultUsesMailboxAfterUserMovesOn(t *testing.T) {
 		t.Fatalf("mailbox entries=%d, want 1", len(mailbox.entries))
 	}
 	entry := mailbox.entries[0]
-	if entry.taskID != "call-mailbox" || entry.text != "Done, reminder set." || !entry.resumptive {
+	if entry.taskID != "t01" || entry.text != "Done, reminder set." || !entry.resumptive {
 		t.Fatalf("unexpected mailbox entry: %+v", entry)
 	}
 }

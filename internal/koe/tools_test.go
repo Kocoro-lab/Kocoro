@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestToolDefsShape(t *testing.T) {
@@ -103,7 +104,7 @@ func TestBurstRouteKey(t *testing.T) {
 func TestPrepareDoTaskUsesBoundAgent(t *testing.T) {
 	state := NewCallState("burst-1", "finance")
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	req, clarify, err := d.PrepareDoTask([]byte(`{"task":"check NVDA"}`), "zh")
+	req, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"check NVDA"}`), "zh")
 	if err != nil || clarify != nil {
 		t.Fatalf("PrepareDoTask err=%v clarify=%v", err, clarify)
 	}
@@ -123,7 +124,7 @@ func TestPrepareDoTaskCarriesCallContext(t *testing.T) {
 		},
 	})
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	req, clarify, err := d.PrepareDoTask([]byte(`{"task":"summarize this window"}`), "zh")
+	req, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"summarize this window"}`), "zh")
 	if err != nil || clarify != nil {
 		t.Fatalf("PrepareDoTask err=%v clarify=%v", err, clarify)
 	}
@@ -138,7 +139,7 @@ func TestPrepareDoTaskCarriesCallContext(t *testing.T) {
 func TestPrepareDoTaskClarifyOnUnknownAgent(t *testing.T) {
 	state := NewCallState("burst-1", "default")
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	_, clarify, err := d.PrepareDoTask([]byte(`{"task":"x","agent":"nonexistent zzz"}`), "zh")
+	_, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"ask nonexistent zzz to check x","agent":"nonexistent zzz"}`), "zh")
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -276,6 +277,7 @@ func TestDispatchRejectsDoTask(t *testing.T) {
 }
 
 func TestDispatchCancelUsesBurstKey(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "0")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var got map[string]any
 		json.NewDecoder(r.Body).Decode(&got)
@@ -294,6 +296,7 @@ func TestDispatchCancelUsesBurstKey(t *testing.T) {
 }
 
 func TestDispatchCancelUsesInFlightPerCallAgentRoute(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "0")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var got map[string]any
 		json.NewDecoder(r.Body).Decode(&got)
@@ -316,6 +319,7 @@ func TestDispatchCancelUsesInFlightPerCallAgentRoute(t *testing.T) {
 }
 
 func TestDispatchCancelCancelsAllInFlightRoutes(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "0")
 	var routes []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var got map[string]any
@@ -401,5 +405,145 @@ func TestDoTaskDescriptionUsesOneSelfFraming(t *testing.T) {
 	}
 	if strings.Contains(switchAgent, "back-brain") {
 		t.Error("switch_agent description must not contain 'back-brain'")
+	}
+}
+
+func TestToolDefsLedgerSchema(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	on := ToolDefs()
+	t.Setenv("KOE_TASK_LEDGER", "0")
+	off := ToolDefs()
+	find := func(defs []ToolDef, name string) ToolDef {
+		for _, def := range defs {
+			if def.Name == name {
+				return def
+			}
+		}
+		t.Fatalf("tool %q missing", name)
+		return ToolDef{}
+	}
+	if !strings.Contains(string(find(on, "do_task").Parameters), `"relationship"`) ||
+		!strings.Contains(string(find(on, "cancel").Parameters), `"task_id"`) {
+		t.Fatal("ledger tool schemas must expose relationship and task identity")
+	}
+	if strings.Contains(string(find(off, "do_task").Parameters), `"relationship"`) ||
+		strings.Contains(string(find(off, "cancel").Parameters), `"task_id"`) {
+		t.Fatal("ledger rollback must restore legacy schemas")
+	}
+}
+
+func TestPrepareDoTaskRelationship(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	newDispatcher := func() (*Dispatcher, *CallState) {
+		state := NewCallState("burst-p", "")
+		return NewDispatcher(NewDaemonClient(""), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil), state
+	}
+
+	t.Run("parallel independent calls use separate lanes", func(t *testing.T) {
+		dispatcher, _ := newDispatcher()
+		first, firstTask, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","relationship":"new"}`), "en")
+		if err != nil || clarify != nil || firstTask == nil || first.ThreadID != "burst-p" {
+			t.Fatalf("first task: req=%+v task=%+v clarify=%+v err=%v", first, firstTask, clarify, err)
+		}
+		second, secondTask, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Osaka weather","relationship":"new"}`), "en")
+		if err != nil || clarify != nil || secondTask == nil || second.ThreadID != "burst-p.t02" {
+			t.Fatalf("second task: req=%+v task=%+v clarify=%+v err=%v", second, secondTask, clarify, err)
+		}
+	})
+
+	t.Run("follow-up targets task identity", func(t *testing.T) {
+		dispatcher, state := newDispatcher()
+		state.BeginTask("check Tokyo weather", "")
+		target := state.BeginTask("sort unread email", "")
+		req, task, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"only include urgent messages","relationship":"follow_up","task_id":"`+target.ID+`"}`), "en")
+		if err != nil || clarify != nil || task == nil || task.ID != target.ID || req.ThreadID != target.ThreadID {
+			t.Fatalf("targeted follow-up drifted: req=%+v task=%+v clarify=%+v err=%v", req, task, clarify, err)
+		}
+	})
+
+	t.Run("ambiguous follow-up clarifies", func(t *testing.T) {
+		dispatcher, state := newDispatcher()
+		state.BeginTask("check Tokyo weather", "")
+		state.BeginTask("sort unread email", "")
+		_, task, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"change that","relationship":"follow_up","task_id":"t99"}`), "en")
+		if err != nil || task != nil || clarify == nil || clarify.Status != "clarify" {
+			t.Fatalf("want task clarification: task=%+v clarify=%+v err=%v", task, clarify, err)
+		}
+	})
+}
+
+func TestDispatchLedgerStatusAndTargetedCancel(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	cancelled := make(chan string, 2)
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req CancelRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		cancelled <- req.RouteKey
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mock.Close()
+
+	state := NewCallState("burst-c", "")
+	dispatcher := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+	first := state.BeginTask("check Tokyo weather", "")
+	second := state.BeginTask("sort unread email", "")
+
+	status, err := dispatcher.Dispatch(context.Background(), "get_status", []byte(`{}`))
+	if err != nil || !strings.Contains(string(status), `"task_id":"t01"`) || !strings.Contains(string(status), `"task_id":"t02"`) {
+		t.Fatalf("ledger status missing tasks: %s err=%v", status, err)
+	}
+	ambiguous, _ := dispatcher.Dispatch(context.Background(), "cancel", []byte(`{}`))
+	if !strings.Contains(string(ambiguous), `"clarify"`) {
+		t.Fatalf("ambiguous cancel must not kill all tasks: %s", ambiguous)
+	}
+	select {
+	case route := <-cancelled:
+		t.Fatalf("ambiguous cancel unexpectedly hit %q", route)
+	default:
+	}
+
+	out, _ := dispatcher.Dispatch(context.Background(), "cancel", []byte(`{"task_id":"`+second.ID+`"}`))
+	if !strings.Contains(string(out), `"status":"ok"`) {
+		t.Fatalf("targeted cancel failed: %s", out)
+	}
+	select {
+	case route := <-cancelled:
+		if route != routeKeyFor("", second.ThreadID) {
+			t.Fatalf("cancel route=%q, want %q", route, routeKeyFor("", second.ThreadID))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("targeted cancel did not reach daemon")
+	}
+	if got, _ := state.TaskByID(second.ID); got.State != TaskCancelled {
+		t.Fatalf("cancelled task state=%s", got.State)
+	}
+	if got, _ := state.TaskByID(first.ID); got.State != TaskRunning {
+		t.Fatalf("unrelated task state=%s, want running", got.State)
+	}
+}
+
+func TestPerCallAgentOverrideRequiresUserNamedAgent(t *testing.T) {
+	newDispatcher := func() *Dispatcher {
+		state := NewCallState("burst-agent", "")
+		return NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	}
+
+	dispatcher := newDispatcher()
+	req, _, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","agent":"finance"}`), "en")
+	if err != nil || clarify != nil || req.Agent != "" {
+		t.Fatalf("model-invented override was not ignored: req=%+v clarify=%+v err=%v", req, clarify, err)
+	}
+
+	dispatcher = newDispatcher()
+	req, _, clarify, err = dispatcher.PrepareDoTask([]byte(`{"task":"ask finance to check NVDA","agent":"finance"}`), "en")
+	if err != nil || clarify != nil || req.Agent != "finance" {
+		t.Fatalf("explicitly named override was not honored: req=%+v clarify=%+v err=%v", req, clarify, err)
+	}
+
+	t.Setenv("KOE_AGENT_OVERRIDE_GUARD", "0")
+	dispatcher = newDispatcher()
+	req, _, _, _ = dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","agent":"finance"}`), "en")
+	if req.Agent != "finance" {
+		t.Fatalf("rollback flag did not restore model override: %+v", req)
 	}
 }

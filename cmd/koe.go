@@ -390,6 +390,17 @@ report; mention it only when there is genuinely more worth opening there — a l
 report, a table, code, or images — never as a routine sign-off. Before anything
 irreversible or outbound, restate it and wait for a clear yes.`
 
+const koeMultiTaskPersona = `
+
+You can keep conversing and run several tasks at once. do_task returns immediately with a running status and task_id; the completed result arrives later, so never say you must wait for an earlier task. For another independent request use relationship "new". For a refinement or correction use relationship "follow_up" with that task_id. If several tasks are running and the target is unclear, ask one short question. get_status lists every task and state. You may cancel one task and start another in the same turn when that is what the user asked.`
+
+func appendTaskLedgerPersona(persona string) string {
+	if koe.TaskLedgerEnabled() {
+		return persona + koeMultiTaskPersona
+	}
+	return persona
+}
+
 // koeAgentListLine renders the specialist agents Koe can hand a task to (names
 // only, no capability text) so the Realtime model can answer "which agents do I
 // have?". Empty when there are no agents.
@@ -613,6 +624,7 @@ func buildKoePersona(ctx context.Context, client *koe.DaemonClient, cfg koeConfi
 	if instr := koeLanguageInstruction(cfg.language); instr != "" {
 		persona = persona + " " + instr
 	}
+	persona = appendTaskLedgerPersona(persona)
 	return persona
 }
 
@@ -624,6 +636,7 @@ func baseKoePersona(cfg koeConfig) string {
 	if instr := koeLanguageInstruction(cfg.language); instr != "" {
 		persona = persona + " " + instr
 	}
+	persona = appendTaskLedgerPersona(persona)
 	return persona
 }
 

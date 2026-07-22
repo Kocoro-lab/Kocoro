@@ -525,12 +525,17 @@ func TestWarmMintTakeMintsWhenExpired(t *testing.T) {
 // TestBaseKoePersona: the pre-fetch warm-session persona is the base persona plus
 // (only) the pinned language — no user context / agent list yet.
 func TestBaseKoePersona(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "0")
 	if got := baseKoePersona(koeConfig{language: ""}); got != koePersona {
 		t.Errorf("empty language should give the bare base persona")
 	}
 	zh := baseKoePersona(koeConfig{language: "zh"})
 	if !strings.HasPrefix(zh, koePersona) || !strings.Contains(zh, koeLanguageInstruction("zh")) {
 		t.Errorf("zh base persona missing base or language pin: %q", zh)
+	}
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	if got := baseKoePersona(koeConfig{}); !strings.Contains(got, koeMultiTaskPersona) {
+		t.Error("ledger persona must teach immediate ack and multi-task addressing")
 	}
 }
 
@@ -548,7 +553,7 @@ func TestBuildKoePersonaAssembly(t *testing.T) {
 
 	agents := []koe.AgentSummary{{Slug: "finance", DisplayName: "Finance"}}
 	got := buildKoePersona(context.Background(), koe.NewDaemonClient(daemon.URL), koeConfig{language: "en"}, agents)
-	for _, want := range []string{koePersona, "USER_CONTEXT_MARKER", koeAgentListLine(agents), koeLanguageInstruction("en")} {
+	for _, want := range []string{koePersona, "USER_CONTEXT_MARKER", koeAgentListLine(agents), koeLanguageInstruction("en"), koeMultiTaskPersona} {
 		if !strings.Contains(got, want) {
 			t.Errorf("buildKoePersona missing %q", want)
 		}

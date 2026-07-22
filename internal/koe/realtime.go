@@ -352,7 +352,13 @@ func (h *eventHandler) observeLocalSpeechStarted() {
 // real task delivered 18s later. CallState in-flight tracking is cleared only
 // when DoTask returns.
 func (h *eventHandler) taskInFlight() bool {
-	return h.state != nil && h.state.InFlight() != ""
+	if h.state == nil {
+		return false
+	}
+	if TaskLedgerEnabled() && h.state.HasTasks() {
+		return h.state.AnyRunning()
+	}
+	return h.state.InFlight() != ""
 }
 
 // maybeRestoreUserMic lifts the user's mic-off once no do_task remains in
@@ -1121,7 +1127,7 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 		// inside args, so a Han rune anywhere in args signals a Chinese utterance —
 		// the JSON keys and agent slugs are ASCII).
 		lang := fallbackLang(h.language, string(args))
-		req, clarify, err := h.disp.PrepareDoTask(args, lang)
+		req, task, clarify, err := h.disp.PrepareDoTask(args, lang)
 		if err != nil {
 			if eventLogEnabled() {
 				log.Printf("koe[task]: prepare failed call_id=%q err=%v args=%s", callID, err, logMaybeBytes(args, 500))
@@ -1149,9 +1155,17 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 		// refined the task" (shouldVoiceDoTaskResult). handleEvent is single-goroutine,
 		// so this Store races with no other writer.
 		h.lastDoTaskCommitSeq.Store(h.inputCommitSeq.Load())
-		h.state.SetInFlightForAgent(req.Text, req.Agent)
+		h.state.SetInFlightForRoute(req.Text, req.Agent, req.ThreadID)
 		h.asyncTaskPending.Store(true)
 		h.emitVoiceState("thinking") // delegating; the model's call-turn ack already played
+		if task != nil {
+			// Resolve the Realtime function call immediately. Keeping do_task open
+			// until a minutes-long daemon run returns prevents the native model from
+			// issuing a follow-up, a second independent task, or a cancel in the same
+			// interaction window.
+			ack, _ := json.Marshal(SayResult{Status: "running", TaskID: task.ID})
+			h.sendFunctionOutput(callID, ack)
+		}
 		go func() {
 			// do_task must survive session teardown: a hangup cancels the session ctx
 			// that Connect rides, which would abort this in-flight POST /message and
@@ -1168,22 +1182,39 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 				log.Printf("koe[task]: start call_id=%q agent=%q burst=%q task=%s", callID, req.Agent, req.ThreadID, logMaybeText(req.Text, 500))
 			}
 			out, derr := h.disp.client.DoTask(taskCtx, req)
-			h.state.ClearInFlightForAgent(req.Agent)
+			h.state.ClearInFlightForRoute(req.Agent, req.ThreadID)
 			r := MapDoTaskOutcome(out, derr, lang)
+			if task != nil {
+				r.TaskID = task.ID
+				h.state.LandResult(task.ID, r)
+			}
 			if eventLogEnabled() {
 				log.Printf("koe[task]: done call_id=%q kind=%s status=%s session=%q partial=%t failure=%q reason=%q spoken_len=%d reply_len=%d duration_ms=%d err=%v",
 					callID, outcomeKindLog(out.Kind), r.Status, out.SessionID, out.Partial, out.FailureCode, out.Reason,
 					len([]rune(r.SpokenSummary)), len([]rune(out.Reply)), time.Since(started).Milliseconds(), derr)
 			}
 			b, _ := json.Marshal(r)
-			h.sendFunctionOutput(callID, b) // satisfy the protocol for this call_id
+			if task != nil {
+				// The call_id was consumed by the running ack. Keep the final digest in
+				// the native conversation as a background item; the result mailbox owns
+				// when and whether speech takes the floor.
+				if r.Status == "ok" || r.Status == "failed" {
+					h.injectTaskResultItem(task.ID, b)
+				}
+			} else {
+				h.sendFunctionOutput(callID, b)
+			}
 			// The result is always in the old Realtime conversation for protocol/context.
 			// The durable delivery path additionally records its spoken projection in a
 			// connection-independent mailbox. If this warm session tears down before the
 			// result lands or finishes playing, the next handler can announce it.
 			userSpokeSinceLastDoTask := h.inputCommitSeq.Load() > h.lastDoTaskCommitSeq.Load()
 			if koeEnvBool("KOE_RESULT_DELIVERY", true) {
-				enqueued := h.resultMailbox.Enqueue(callID, r.Say, userSpokeSinceLastDoTask, false)
+				resultTaskID := callID
+				if r.TaskID != "" {
+					resultTaskID = r.TaskID
+				}
+				enqueued := h.resultMailbox.Enqueue(resultTaskID, r.Say, userSpokeSinceLastDoTask, false)
 				if eventLogEnabled() {
 					log.Printf("koe[tool]: output call_id=%q status=%s mailbox_id=%d resumptive=%t output=%s",
 						callID, r.Status, enqueued, userSpokeSinceLastDoTask, logMaybeBytes(b, 500))
@@ -1272,6 +1303,26 @@ func (h *eventHandler) sendFunctionOutput(callID string, output json.RawMessage)
 			"output":  string(output),
 		},
 	})
+}
+
+func (h *eventHandler) injectTaskResultItem(taskID string, payload []byte) {
+	label := ""
+	if task, ok := h.state.TaskByID(taskID); ok {
+		label = task.Label
+	}
+	if err := h.sendFn(map[string]any{
+		"type": "conversation.item.create",
+		"item": map[string]any{
+			"type": "message",
+			"role": "system",
+			"content": []map[string]any{{
+				"type": "input_text",
+				"text": "Background task update — task " + taskID + " (" + label + ") finished: " + string(payload),
+			}},
+		},
+	}); err != nil && eventLogEnabled() {
+		log.Printf("koe[result]: context injection failed task_id=%q err=%v", taskID, err)
+	}
 }
 
 func (h *eventHandler) sendRaw(callID string, output json.RawMessage) {

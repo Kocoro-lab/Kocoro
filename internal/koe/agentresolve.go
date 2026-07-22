@@ -105,6 +105,25 @@ func (r *AgentResolver) Resolve(ref string) ResolveResult {
 // collapsed, and a leading "the" / trailing "agent(s)" filler word stripped. A
 // spoken "investment analyst" or "the investment agent" thus matches the
 // hyphenated slug "investment-analyst".
+func (r *AgentResolver) spokenNamesFor(rawRef, slug string) []string {
+	names := make([]string, 0, 3)
+	if name := normalizeAgentRef(rawRef); name != "" {
+		names = append(names, name)
+	}
+	if name := normalizeAgentRef(slug); name != "" {
+		names = append(names, name)
+	}
+	for _, agent := range r.agents {
+		if agent.Slug == slug {
+			if name := normalizeAgentRef(agent.DisplayName); name != "" {
+				names = append(names, name)
+			}
+			break
+		}
+	}
+	return names
+}
+
 func normalizeAgentRef(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.NewReplacer("-", " ", "_", " ").Replace(s)
