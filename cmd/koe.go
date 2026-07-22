@@ -681,6 +681,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	persona := buildKoePersona(ctx, client, cfg, agents)
 	state := koe.NewCallState(newBurstID(), cfg.agent)
 	disp := koe.NewDispatcher(client, resolver, state, nil)
+	resultMailbox := koe.NewResultMailbox()
 	audio, err := koe.NewAudioIO()
 	if err != nil {
 		return fmt.Errorf("audio init: %v", err)
@@ -737,10 +738,11 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 
 	var dismissOnce sync.Once
 	conn, err := koe.Connect(ctx, audio, ek, persona, state, disp, koe.ConnectOptions{
-		OnVoiceState: onVoiceState,
-		Model:        cfg.model,
-		Voice:        cfg.voice,
-		OnUsage:      onUsage,
+		OnVoiceState:  onVoiceState,
+		Model:         cfg.model,
+		Voice:         cfg.voice,
+		OnUsage:       onUsage,
+		ResultMailbox: resultMailbox,
 		// Standalone/CLI dismiss (end_call tool or a dismiss phrase) = play the goodbye
 		// cue, then exit the process (there is no warm-session teardown to return to).
 		// sync.Once makes it idempotent: the tool and the deterministic phrase can both
@@ -782,6 +784,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	mintEK func(context.Context) (string, error), onUsage func(json.RawMessage)) error {
 
 	fullDuplexAEC := cfg.aec == "vpio"
+	// One mailbox spans every warm Realtime session in this resident process. A
+	// do_task can outlive the session that dispatched it; its spoken result must not.
+	resultMailbox := koe.NewResultMailbox()
 
 	// The agent registry + persona are fetched AFTER the control listener binds (see
 	// below), so they start as an empty registry + base persona and are hot-swapped
@@ -1075,13 +1080,14 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 
 			connectWith := func(secret string) (*koe.RealtimeConn, error) {
 				return koe.Connect(sessionCtx, audio, secret, *personaHolder.Load(), state, disp, koe.ConnectOptions{
-					OnVoiceState: onVoiceState,
-					OnCallState:  onCallState,
-					OnVoiceLevel: onVoiceLevel,
-					CallActive:   callActiveFn,
-					Model:        cfg.model,
-					Voice:        cfg.voice,
-					OnUsage:      onUsage,
+					OnVoiceState:  onVoiceState,
+					OnCallState:   onCallState,
+					OnVoiceLevel:  onVoiceLevel,
+					CallActive:    callActiveFn,
+					ResultMailbox: resultMailbox,
+					Model:         cfg.model,
+					Voice:         cfg.voice,
+					OnUsage:       onUsage,
 					OnEndCall: func() {
 						if endCall != nil {
 							endCall()
@@ -1158,6 +1164,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			return
 		}
 		callActive = true
+		resultMailbox.Wake()
 		if curConn != nil && sessionReady {
 			emitReadyLocked()
 			sessMu.Unlock()

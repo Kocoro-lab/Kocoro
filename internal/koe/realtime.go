@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -112,6 +113,20 @@ type eventHandler struct {
 	respReq      chan responseCreateRequest // queued response.create requests
 	respCreated  chan struct{}              // signalled (buffered 1) on response.created
 	respRejected chan struct{}              // signalled (buffered 1) on the active-response error
+	// resultMailbox is the connection-independent delivery plane for completed
+	// do_task speech. resultOwner leases one batch to this handler until a completed
+	// response.done acknowledges it; teardown releases the lease for the next warm
+	// Realtime session.
+	resultMailbox *ResultMailbox
+	resultOwner   string
+	canAnnounce   func() bool
+	resultBatchMu sync.Mutex
+	resultBatch   bool
+	resultRetries int
+	// userSpeaking prevents an async task result from taking the floor in the
+	// middle of the user's utterance. Both native server VAD and the local audio
+	// floor update it; no ASR text participates in this decision.
+	userSpeaking atomic.Bool
 }
 
 type responseCreateRequest struct {
@@ -321,6 +336,7 @@ func (h *eventHandler) isSpeakingOrResponding() bool {
 }
 
 func (h *eventHandler) observeLocalSpeechStarted() {
+	h.userSpeaking.Store(true)
 	seq := h.localSpeechSeq.Add(1)
 	h.localStartCommitSeq.Store(h.inputCommitSeq.Load())
 	h.localStartResponseSeq.Store(h.responseSeq.Load())
@@ -360,6 +376,8 @@ func (h *eventHandler) maybeRestoreUserMic() {
 }
 
 func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
+	h.userSpeaking.Store(false)
+	h.resultMailbox.Wake()
 	if !koeEnvBool("KOE_LOCAL_COMMIT_FALLBACK", false) {
 		return
 	}
@@ -482,13 +500,27 @@ func (h *eventHandler) reportUsage(raw []byte) {
 	h.onUsage(body)
 }
 
+var resultHandlerSeq atomic.Uint64
+
 func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error) *eventHandler {
-	return &eventHandler{
-		disp: disp, state: state, audio: audio, sendFn: sendFn,
-		respReq:      make(chan responseCreateRequest, 8),
-		respCreated:  make(chan struct{}, 1),
-		respRejected: make(chan struct{}, 1),
+	return newEventHandlerWithMailbox(disp, state, audio, sendFn, nil, nil)
+}
+
+func newEventHandlerWithMailbox(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error, mailbox *ResultMailbox, canAnnounce func() bool) *eventHandler {
+	if mailbox == nil {
+		mailbox = NewResultMailbox()
 	}
+	h := &eventHandler{
+		disp: disp, state: state, audio: audio, sendFn: sendFn,
+		respReq:       make(chan responseCreateRequest, 8),
+		respCreated:   make(chan struct{}, 1),
+		respRejected:  make(chan struct{}, 1),
+		resultMailbox: mailbox,
+		resultOwner:   fmt.Sprintf("realtime-%d", resultHandlerSeq.Add(1)),
+		canAnnounce:   canAnnounce,
+	}
+	mailbox.Wake()
+	return h
 }
 
 const (
@@ -535,40 +567,153 @@ func (h *eventHandler) requestResponseWith(req responseCreateRequest) {
 // waits for any active response to finish, sends response.create, waits for
 // response.created or the active-response rejection, and retries a rejection.
 func (h *eventHandler) runResponseSender(ctx context.Context) {
+	defer h.releaseResultBatch(false)
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-h.resultMailbox.notifications():
+			h.sendResultBatch(ctx)
 		case req := <-h.respReq:
 			h.sendResponseCreate(ctx, req)
 		}
 	}
 }
 
-func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreateRequest) {
+func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreateRequest) bool {
 	for attempt := 0; attempt <= maxResponseCreateRetries; attempt++ {
 		if !h.waitRespIdle(ctx) {
-			return // ctx done
+			return false // ctx done
 		}
 		drainSignal(h.respCreated) // clear stale acks from the previous turn
 		drainSignal(h.respRejected)
-		_ = h.sendFn(responseCreatePayload(req))
+		if err := h.sendFn(responseCreatePayload(req)); err != nil {
+			log.Printf("koe[response]: response.create send failed: %v", err)
+			return false
+		}
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-h.respCreated:
-			return // accepted
+			return true // accepted
 		case <-h.respRejected:
 			// Overlapped an active response — wait a beat for it to drain, then retry.
 			select {
 			case <-ctx.Done():
-				return
+				return false
 			case <-time.After(responseRejectRetryDelay):
 			}
 		case <-time.After(responseCreateAckTimeout):
-			return // neither created nor rejected (nothing to say) — don't spin
+			return false // neither created nor rejected (nothing to say) — don't spin
 		}
 	}
+	return false
+}
+
+const resultVoicePollInterval = 20 * time.Millisecond
+
+func (h *eventHandler) sendResultBatch(ctx context.Context) {
+	if !h.waitResultVoiceGap(ctx) {
+		return
+	}
+	results := h.resultMailbox.claim(h.resultOwner)
+	if len(results) == 0 {
+		return
+	}
+	h.resultBatchMu.Lock()
+	h.resultBatch = true
+	h.resultBatchMu.Unlock()
+
+	if eventLogEnabled() {
+		log.Printf("koe[result]: announcing count=%d task_ids=%q", len(results), resultTaskIDs(results))
+	}
+	accepted := h.sendResponseCreate(ctx, responseCreateRequest{instructions: taskResultSpeechInstructions(results)})
+	if accepted {
+		h.resultRetries = 0
+		return // response.done owns the delivery acknowledgement
+	}
+	h.releaseResultBatch(false)
+	if ctx.Err() == nil && h.resultRetries == 0 {
+		// One bounded same-connection retry. The result stays pending after that;
+		// another enqueue, call activation, or Realtime reconnect wakes it again.
+		h.resultRetries++
+		time.AfterFunc(responseRejectRetryDelay, h.resultMailbox.Wake)
+	}
+}
+
+func (h *eventHandler) waitResultVoiceGap(ctx context.Context) bool {
+	for {
+		if h.canAnnounce != nil && !h.canAnnounce() {
+			return false
+		}
+		if !h.respBusy.Load() && !h.outputBufferActive.Load() && !h.userSpeaking.Load() {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(resultVoicePollInterval):
+		}
+	}
+}
+
+func (h *eventHandler) finishResultBatch(delivered bool) {
+	h.resultBatchMu.Lock()
+	active := h.resultBatch
+	if active {
+		h.resultBatch = false
+	}
+	h.resultBatchMu.Unlock()
+	if !active {
+		return
+	}
+	if delivered {
+		removed := h.resultMailbox.complete(h.resultOwner)
+		if eventLogEnabled() {
+			log.Printf("koe[result]: delivered count=%d", removed)
+		}
+		return
+	}
+	h.resultMailbox.release(h.resultOwner)
+	h.resultMailbox.Wake()
+}
+
+func (h *eventHandler) releaseResultBatch(wake bool) {
+	h.resultBatchMu.Lock()
+	h.resultBatch = false
+	h.resultBatchMu.Unlock()
+	if h.resultMailbox.release(h.resultOwner) > 0 && wake {
+		h.resultMailbox.Wake()
+	}
+}
+
+func resultTaskIDs(results []resultAnnouncement) []string {
+	ids := make([]string, 0, len(results))
+	for _, result := range results {
+		if result.taskID != "" {
+			ids = append(ids, result.taskID)
+		}
+	}
+	return ids
+}
+
+func taskResultSpeechInstructions(results []resultAnnouncement) string {
+	texts := make([]string, 0, len(results))
+	resumptive := false
+	revision := false
+	for _, result := range results {
+		texts = append(texts, result.text)
+		resumptive = resumptive || result.resumptive
+		revision = revision || result.revision
+	}
+	base := exactSpeechInstructions(strings.Join(texts, "\n"))
+	if revision {
+		return "A newer task result supersedes an earlier one. Briefly mark it as the corrected result, then follow the exact-speech instruction below. Do not repeat the older result.\n" + base
+	}
+	if resumptive {
+		return "The user spoke after this task started. At the next quiet boundary, use one very brief natural bridge in the conversation language, then follow the exact-speech instruction below. Do not answer or repeat the intervening turn.\n" + base
+	}
+	return base
 }
 
 func responseCreatePayload(req responseCreateRequest) map[string]any {
@@ -737,7 +882,11 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		CallID     string          `json:"call_id"`   // function call id
 		Arguments  json.RawMessage `json:"arguments"` // function args (string-encoded JSON)
 		Transcript string          `json:"transcript"`
-		Error      struct {
+		Response   struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"response"`
+		Error struct {
 			Code    string `json:"code"`
 			Type    string `json:"type"`
 			Message string `json:"message"`
@@ -749,6 +898,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	}
 	switch ev.Type {
 	case "input_audio_buffer.speech_started":
+		h.userSpeaking.Store(true)
 		h.speechStartedAt = time.Now()
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: speech_started")
@@ -765,7 +915,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 		h.emitVoiceState("listening")
 	case "input_audio_buffer.speech_stopped":
+		h.userSpeaking.Store(false)
 		h.speechStoppedAt = time.Now()
+		h.resultMailbox.Wake()
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: speech_stopped speech_ms=%d", elapsedMS(h.speechStartedAt, h.speechStoppedAt))
 		}
@@ -869,6 +1021,11 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// can still have speaker energy after the server says its output buffer ended.
 		h.releaseSpeakingTail()
 	case "response.done":
+		// A task-result entry remains leased through response.created and is removed
+		// only after a completed response.done. Cancelled/failed responses put it
+		// back in the mailbox so the next quiet boundary or connection can retry.
+		delivered := ev.Response.Status == "" || ev.Response.Status == "completed"
+		h.finishResultBatch(delivered)
 		h.responseDoneAt = time.Now()
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: response_done response_ms=%d output_elapsed_ms=%d", elapsedMS(h.responseCreatedAt, h.responseDoneAt), elapsedMS(h.outputStartedAt, h.responseDoneAt))
@@ -1020,32 +1177,43 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 			}
 			b, _ := json.Marshal(r)
 			h.sendFunctionOutput(callID, b) // satisfy the protocol for this call_id
-			// The result is always in the conversation now; only decide whether to VOICE
-			// it. Suppress when the user has moved on to conversation since the most
-			// recent do_task (correction / topic change / a verbal question during a long
-			// task); a follow-up that refined the task advances lastDoTaskCommitSeq so it
-			// still voices. Overridable via KOE_SUPPRESS_STALE_RESULT=0 (rollback).
+			// The result is always in the old Realtime conversation for protocol/context.
+			// The durable delivery path additionally records its spoken projection in a
+			// connection-independent mailbox. If this warm session tears down before the
+			// result lands or finishes playing, the next handler can announce it.
 			userSpokeSinceLastDoTask := h.inputCommitSeq.Load() > h.lastDoTaskCommitSeq.Load()
+			if koeEnvBool("KOE_RESULT_DELIVERY", true) {
+				enqueued := h.resultMailbox.Enqueue(callID, r.Say, userSpokeSinceLastDoTask, false)
+				if eventLogEnabled() {
+					log.Printf("koe[tool]: output call_id=%q status=%s mailbox_id=%d resumptive=%t output=%s",
+						callID, r.Status, enqueued, userSpokeSinceLastDoTask, logMaybeBytes(b, 500))
+				}
+				if enqueued == 0 { // injected/empty outcomes belong to the owning run
+					h.asyncTaskPending.Store(false)
+					h.maybeRestoreUserMic()
+					h.emitVoiceState("listening")
+				}
+				return
+			}
+
+			// Rollback path: KOE_RESULT_DELIVERY=0 restores main's session-bound stale
+			// suppression and response queue while the mailbox implementation is fielded.
 			voice := shouldVoiceDoTaskResult(r, userSpokeSinceLastDoTask)
 			suppressedAsStale := !voice && userSpokeSinceLastDoTask && r.Status != "injected" && r.Say != ""
 			if suppressedAsStale && !koeEnvBool("KOE_SUPPRESS_STALE_RESULT", true) {
-				voice = true // rollback switch: restore the old always-voice behavior
+				voice = true
 				suppressedAsStale = false
 			}
-			if eventLogEnabled() {
-				log.Printf("koe[tool]: output call_id=%q status=%s voice=%t userSpokeSince=%t output=%s",
-					callID, r.Status, voice, userSpokeSinceLastDoTask, logMaybeBytes(b, 500))
-			}
 			if voice {
-				h.requestResponseForSpeech(r.Say) // voice the result (skip when the daemon already replied)
-			} else {
-				if suppressedAsStale {
-					log.Printf("koe[task]: stale result NOT voiced — user took the floor mid-task, call_id=%q", callID)
-				}
-				h.asyncTaskPending.Store(false)
-				h.maybeRestoreUserMic()
-				h.emitVoiceState("listening")
+				h.requestResponseForSpeech(r.Say)
+				return
 			}
+			if suppressedAsStale {
+				log.Printf("koe[task]: stale result NOT voiced in rollback mode, call_id=%q", callID)
+			}
+			h.asyncTaskPending.Store(false)
+			h.maybeRestoreUserMic()
+			h.emitVoiceState("listening")
 		}()
 		return
 	}
