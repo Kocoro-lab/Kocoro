@@ -61,6 +61,7 @@ func TestDoTaskVoicingGateWiring(t *testing.T) {
 	// This test pins the rollback path's historical stale-result gate. The default
 	// delivery path now defers stale results in ResultMailbox instead of dropping them.
 	t.Setenv("KOE_RESULT_DELIVERY", "0")
+	t.Setenv("KOE_TOOL_CONTINUATION", "0")
 	run := func(t *testing.T, midTaskUserTurn bool) (fnOutputs, voiceRequested int) {
 		t.Helper()
 		release := make(chan struct{})
@@ -163,6 +164,7 @@ func TestDoTaskVoicingGateFollowUpThenMoveOn(t *testing.T) {
 	// Keep the old gate covered behind its rollback flag; durable delivery has its
 	// own cross-session and user-floor tests in result_mailbox_test.go.
 	t.Setenv("KOE_RESULT_DELIVERY", "0")
+	t.Setenv("KOE_TOOL_CONTINUATION", "0")
 	run := func(t *testing.T, moveOn bool) (fnOutputs, voiceRequested int) {
 		t.Helper()
 		release := make(chan struct{})

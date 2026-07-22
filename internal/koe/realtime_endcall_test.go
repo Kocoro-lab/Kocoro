@@ -24,10 +24,12 @@ func TestEndCallToolTriggersHangupWithoutOutput(t *testing.T) {
 	h := newEventHandler(disp, state, audio, cap.send)
 	called := make(chan struct{}, 1)
 	h.onEndCall = func() { called <- struct{}{} }
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"end-response"}}`))
 
 	ev, _ := json.Marshal(map[string]any{
-		"type": "response.function_call_arguments.done",
-		"name": "end_call", "call_id": "c1", "arguments": "{}",
+		"type":        "response.function_call_arguments.done",
+		"response_id": "end-response", "name": "end_call", "call_id": "c1", "arguments": "{}",
 	})
 	h.handleEvent(context.Background(), ev)
 
@@ -53,14 +55,15 @@ func TestEndCallToolClearsActiveOutputBeforeHangup(t *testing.T) {
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	cap := &captureSender{}
 	h := newEventHandler(disp, state, audio, cap.send)
-	h.respBusy.Store(true)
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"end-active-response"}}`))
 	h.outputBufferActive.Store(true)
 	called := make(chan struct{}, 1)
 	h.onEndCall = func() { called <- struct{}{} }
 
 	ev, _ := json.Marshal(map[string]any{
-		"type": "response.function_call_arguments.done",
-		"name": "end_call", "call_id": "c1", "arguments": "{}",
+		"type":        "response.function_call_arguments.done",
+		"response_id": "end-active-response", "name": "end_call", "call_id": "c1", "arguments": "{}",
 	})
 	h.handleEvent(context.Background(), ev)
 
@@ -151,10 +154,12 @@ func TestEndCallToolNilHookIsSafe(t *testing.T) {
 	state := NewCallState("burst-end2", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	h := newEventHandler(disp, state, audio, (&captureSender{}).send)
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"end-nil-response"}}`))
 	// onEndCall stays nil.
 	ev, _ := json.Marshal(map[string]any{
-		"type": "response.function_call_arguments.done",
-		"name": "end_call", "call_id": "c1", "arguments": "{}",
+		"type":        "response.function_call_arguments.done",
+		"response_id": "end-nil-response", "name": "end_call", "call_id": "c1", "arguments": "{}",
 	})
 	h.handleEvent(context.Background(), ev) // must not panic
 }

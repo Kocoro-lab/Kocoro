@@ -234,6 +234,7 @@ func TestHandleFunctionCallInjectedFollowupDoesNotDoubleSpeak(t *testing.T) {
 }
 
 func TestHandleEventFunctionCallArgumentsDoneDelegatesDoTask(t *testing.T) {
+	t.Setenv("KOE_TOOL_CONTINUATION", "0")
 	gotReq := make(chan DoTaskRequest, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req DoTaskRequest
@@ -739,6 +740,7 @@ func TestSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 		`"create_response":true`,
 		`"interrupt_response":false`,
 		`"noise_reduction":{"type":"far_field"}`,
+		`"parallel_tool_calls":true`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("sessionConfig missing %s in %s", want, s)

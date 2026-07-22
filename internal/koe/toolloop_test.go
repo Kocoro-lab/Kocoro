@@ -17,8 +17,8 @@ func TestToolLoopBudgetContinuationAndClosure(t *testing.T) {
 	loop := newToolLoopLedger()
 	loop.noteUserCommit(1)
 	loop.bindResponse("initial", responsePurposeUser, 1)
-	first := loop.claimAction("initial", "do_task")
-	second := loop.claimAction("initial", "do_task")
+	first := loop.claimAction("initial", "call-1", "do_task", nil)
+	second := loop.claimAction("initial", "call-2", "do_task", nil)
 	if !first.allowed || !second.allowed || first.sameResponseDoTaskCall || !second.sameResponseDoTaskCall {
 		t.Fatalf("same-response do_task accounting wrong: first=%+v second=%+v", first, second)
 	}
@@ -27,13 +27,13 @@ func TestToolLoopBudgetContinuationAndClosure(t *testing.T) {
 	}
 
 	loop.bindResponse("continued", responsePurposeContinuation, 1)
-	if claim := loop.claimAction("continued", "cancel"); !claim.allowed {
+	if claim := loop.claimAction("continued", "call-3", "cancel", nil); !claim.allowed {
 		t.Fatalf("third action denied: %+v", claim)
 	}
-	if claim := loop.claimAction("continued", "do_task"); !claim.allowed {
+	if claim := loop.claimAction("continued", "call-4", "do_task", nil); !claim.allowed {
 		t.Fatalf("fourth action denied: %+v", claim)
 	}
-	if claim := loop.claimAction("continued", "get_status"); claim.allowed || claim.reason != "turn_action_budget_exhausted" {
+	if claim := loop.claimAction("continued", "call-5", "get_status", nil); claim.allowed || claim.reason != "turn_action_budget_exhausted" {
 		t.Fatalf("fifth action must be rejected: %+v", claim)
 	}
 	if decision, _ := loop.finishResponse("continued"); decision != toolLoopClose {
@@ -45,14 +45,14 @@ func TestToolLoopNewUserTurnPreemptsContinuation(t *testing.T) {
 	loop := newToolLoopLedger()
 	loop.noteUserCommit(1)
 	loop.bindResponse("old", responsePurposeUser, 1)
-	if claim := loop.claimAction("old", "do_task"); !claim.allowed {
+	if claim := loop.claimAction("old", "call-1", "do_task", nil); !claim.allowed {
 		t.Fatalf("initial action denied: %+v", claim)
 	}
 	loop.noteUserCommit(2)
 	if decision, _ := loop.finishResponse("old"); decision != toolLoopNone {
 		t.Fatalf("preempted response scheduled decision=%v", decision)
 	}
-	if claim := loop.claimAction("old", "cancel"); claim.allowed || claim.reason != "turn_preempted" {
+	if claim := loop.claimAction("old", "call-2", "cancel", nil); claim.allowed || claim.reason != "turn_preempted" {
 		t.Fatalf("old response kept authority after preemption: %+v", claim)
 	}
 }
@@ -61,9 +61,67 @@ func TestToolLoopSyntheticResponsesCannotCallTools(t *testing.T) {
 	loop := newToolLoopLedger()
 	loop.noteUserCommit(1)
 	loop.bindResponse("result", responsePurposeTaskResult, 1)
-	claim := loop.claimAction("result", "do_task")
+	claim := loop.claimAction("result", "call-1", "do_task", nil)
 	if claim.allowed || claim.reason != "response_has_no_tool_capability" {
 		t.Fatalf("task result response acquired tool authority: %+v", claim)
+	}
+}
+
+func TestToolLoopDeduplicatesCallIDWithoutSpendingBudget(t *testing.T) {
+	loop := newToolLoopLedger()
+	loop.noteUserCommit(1)
+	loop.bindResponse("response", responsePurposeUser, 1)
+	first := loop.claimAction("response", "same-call", "control_app", []byte(`{"action":"show"}`))
+	duplicate := loop.claimAction("response", "same-call", "control_app", []byte(`{"action":"hide"}`))
+	if !first.allowed || !duplicate.duplicate || duplicate.allowed || duplicate.reason != "duplicate_tool_event" {
+		t.Fatalf("dedup claims first=%+v duplicate=%+v", first, duplicate)
+	}
+	for i := 0; i < maxTurnTaskActions-1; i++ {
+		claim := loop.claimAction("response", "extra-"+string(rune('a'+i)), "get_status", nil)
+		if !claim.allowed {
+			t.Fatalf("duplicate consumed action budget at extra %d: %+v", i, claim)
+		}
+	}
+}
+
+func TestToolLoopUnknownResponseHasNoAuthority(t *testing.T) {
+	loop := newToolLoopLedger()
+	loop.noteUserCommit(1)
+	claim := loop.claimAction("unbound", "call-1", "do_task", nil)
+	if claim.allowed || claim.known || claim.reason != "unknown_response" {
+		t.Fatalf("unbound response acquired authority: %+v", claim)
+	}
+}
+
+func TestToolLoopDuplicateWireEventExecutesSideEffectOnce(t *testing.T) {
+	state := NewCallState("burst-dedup", "")
+	controlCalls := 0
+	dispatcher := NewDispatcher(NewDaemonClient(""), NewAgentResolver(nil, NoopSemanticMatcher{}), state, func(context.Context, string) error {
+		controlCalls++
+		return nil
+	})
+	functionOutputs := 0
+	h := newEventHandler(dispatcher, state, nil, func(v any) error {
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+			Item struct {
+				Type string `json:"type"`
+			} `json:"item"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "conversation.item.create" && frame.Item.Type == "function_call_output" {
+			functionOutputs++
+		}
+		return nil
+	})
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"dedup"}}`))
+	event := []byte(`{"type":"response.function_call_arguments.done","response_id":"dedup","call_id":"same-call","name":"control_app","arguments":"{\"action\":\"show\"}"}`)
+	h.handleEvent(context.Background(), event)
+	h.handleEvent(context.Background(), event)
+	if controlCalls != 1 || functionOutputs != 1 {
+		t.Fatalf("duplicate event replayed: side_effects=%d function_outputs=%d", controlCalls, functionOutputs)
 	}
 }
 
@@ -241,7 +299,7 @@ func TestToolLoopAggregatesCallsIntoOneContinuation(t *testing.T) {
 		t.Fatalf("aggregated continuation creates=%d, want 1", creates)
 	}
 	response, _ := continuationPayload["response"].(map[string]any)
-	if response["tool_choice"] != "auto" {
+	if response["tool_choice"] != "auto" || response["parallel_tool_calls"] != true {
 		t.Fatalf("continuation is not tools-enabled: %#v", response)
 	}
 }

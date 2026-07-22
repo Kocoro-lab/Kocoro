@@ -853,6 +853,7 @@ func responseCreatePayload(req responseCreateRequest) map[string]any {
 	case responseToolsEnabled:
 		response["tools"] = ToolDefs()
 		response["tool_choice"] = "auto"
+		response["parallel_tool_calls"] = true
 	case responseToolsDisabled:
 		response["tools"] = []ToolDef{}
 	}
@@ -1006,8 +1007,9 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 				"input":  input,
 				"output": map[string]any{"voice": voice},
 			},
-			"tools":       ToolDefs(),
-			"tool_choice": "auto",
+			"tools":               ToolDefs(),
+			"tool_choice":         "auto",
+			"parallel_tool_calls": true,
 		},
 	}
 }
@@ -1135,8 +1137,14 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			log.Printf("koe[tool]: call name=%q call_id=%q args=%s", ev.Name, ev.CallID, logMaybeBytes(args, 500))
 		}
 		sameResponseDoTask := false
-		if ToolContinuationEnabled() && ev.ResponseID != "" {
-			claim := h.toolLoop.claimAction(ev.ResponseID, ev.Name)
+		if ToolContinuationEnabled() {
+			claim := h.toolLoop.claimAction(ev.ResponseID, ev.CallID, ev.Name, args)
+			if claim.duplicate {
+				if eventLogEnabled() {
+					log.Printf("koe[loop]: duplicate tool event ignored response_id=%q call_id=%q name=%q", ev.ResponseID, ev.CallID, ev.Name)
+				}
+				break
+			}
 			if !claim.allowed {
 				if eventLogEnabled() {
 					log.Printf("koe[loop]: tool denied response_id=%q name=%q reason=%s", ev.ResponseID, ev.Name, claim.reason)

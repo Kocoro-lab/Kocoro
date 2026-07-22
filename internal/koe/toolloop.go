@@ -35,6 +35,7 @@ type loopResponse struct {
 	purpose      responsePurpose
 	toolCalls    int
 	doTaskCalls  int
+	claimedCalls map[string]struct{}
 	budgetHit    bool
 	finished     bool
 	messageItems int
@@ -52,6 +53,7 @@ const (
 type toolActionClaim struct {
 	known                  bool
 	allowed                bool
+	duplicate              bool
 	turnID                 int64
 	sameResponseDoTaskCall bool
 	reason                 string
@@ -126,12 +128,14 @@ func (l *toolLoopLedger) bindResponse(responseID string, purpose responsePurpose
 		l.turns[turnID] = &loopTurn{}
 		l.order = append(l.order, turnID)
 	}
-	l.responses[responseID] = &loopResponse{turnID: turnID, purpose: purpose}
+	l.responses[responseID] = &loopResponse{
+		turnID: turnID, purpose: purpose, claimedCalls: make(map[string]struct{}),
+	}
 }
 
-func (l *toolLoopLedger) claimAction(responseID, tool string) toolActionClaim {
+func (l *toolLoopLedger) claimAction(responseID, callID, tool string, args []byte) toolActionClaim {
 	if l == nil || responseID == "" {
-		return toolActionClaim{}
+		return toolActionClaim{reason: "unknown_response"}
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -140,6 +144,18 @@ func (l *toolLoopLedger) claimAction(responseID, tool string) toolActionClaim {
 		return toolActionClaim{reason: "unknown_response"}
 	}
 	claim := toolActionClaim{known: true, turnID: response.turnID}
+	fingerprint := callID
+	if fingerprint == "" {
+		fingerprint = tool + "\x00" + string(args)
+	}
+	if _, duplicate := response.claimedCalls[fingerprint]; duplicate {
+		claim.duplicate = true
+		claim.reason = "duplicate_tool_event"
+		return claim
+	}
+	// Record accepted and rejected calls alike so a repeated server event can
+	// neither replay a side effect nor emit a second function output.
+	response.claimedCalls[fingerprint] = struct{}{}
 	if !response.purpose.allowsTools() {
 		claim.reason = "response_has_no_tool_capability"
 		return claim
