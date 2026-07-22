@@ -473,7 +473,7 @@ func taskNamesAgent(task string, names []string) bool {
 // otherwise the persistent binding (CallState.bound) is used. PrepareDoTask does
 // NOT set inFlight — C's goroutine owns that (SetInFlight before, ClearInFlight
 // after) so get_status reflects the async delegation, not a blocking call.
-func (d *Dispatcher) PrepareDoTask(argsJSON []byte, lang string) (DoTaskRequest, *VoiceTask, *SayResult, error) {
+func (d *Dispatcher) PrepareDoTask(argsJSON []byte, lang string, sameTurnMultiDispatch bool) (DoTaskRequest, *VoiceTask, *SayResult, error) {
 	var a struct {
 		Task         string `json:"task"`
 		Agent        string `json:"agent"`
@@ -539,7 +539,9 @@ func (d *Dispatcher) PrepareDoTask(argsJSON []byte, lang string) (DoTaskRequest,
 	default:
 		// Keep main's existing merge bias when the model is unsure: a later P3
 		// transaction groups same-turn parallel calls so they still split correctly.
-		if running := d.state.RunningMainLaneTask(agent); running != nil {
+		if sameTurnMultiDispatch {
+			task = d.state.BeginTask(a.Task, agent)
+		} else if running := d.state.RunningMainLaneTask(agent); running != nil {
 			task, _ = d.state.BeginFollowUp(running.ID, a.Task)
 		} else if running := d.state.RunningTasksForAgent(agent); len(running) == 1 {
 			task, _ = d.state.BeginFollowUp(running[0].ID, a.Task)

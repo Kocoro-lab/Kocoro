@@ -101,7 +101,7 @@ func TestMapDoTaskOutcomeFallbackLanguage(t *testing.T) {
 func TestPrepareDoTaskClarifyLanguage(t *testing.T) {
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), NewCallState("b", "default"), nil)
 	for _, lang := range []string{"en", "zh"} {
-		_, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"ask nonexistent zzz to check x","agent":"nonexistent zzz"}`), lang)
+		_, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"ask nonexistent zzz to check x","agent":"nonexistent zzz"}`), lang, false)
 		if err != nil || clarify == nil {
 			t.Fatalf("[%s] expected clarify, err=%v clarify=%v", lang, err, clarify)
 		}

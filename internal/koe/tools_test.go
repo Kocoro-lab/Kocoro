@@ -104,7 +104,7 @@ func TestBurstRouteKey(t *testing.T) {
 func TestPrepareDoTaskUsesBoundAgent(t *testing.T) {
 	state := NewCallState("burst-1", "finance")
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	req, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"check NVDA"}`), "zh")
+	req, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"check NVDA"}`), "zh", false)
 	if err != nil || clarify != nil {
 		t.Fatalf("PrepareDoTask err=%v clarify=%v", err, clarify)
 	}
@@ -124,7 +124,7 @@ func TestPrepareDoTaskCarriesCallContext(t *testing.T) {
 		},
 	})
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	req, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"summarize this window"}`), "zh")
+	req, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"summarize this window"}`), "zh", false)
 	if err != nil || clarify != nil {
 		t.Fatalf("PrepareDoTask err=%v clarify=%v", err, clarify)
 	}
@@ -139,7 +139,7 @@ func TestPrepareDoTaskCarriesCallContext(t *testing.T) {
 func TestPrepareDoTaskClarifyOnUnknownAgent(t *testing.T) {
 	state := NewCallState("burst-1", "default")
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
-	_, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"ask nonexistent zzz to check x","agent":"nonexistent zzz"}`), "zh")
+	_, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"ask nonexistent zzz to check x","agent":"nonexistent zzz"}`), "zh", false)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -441,13 +441,22 @@ func TestPrepareDoTaskRelationship(t *testing.T) {
 
 	t.Run("parallel independent calls use separate lanes", func(t *testing.T) {
 		dispatcher, _ := newDispatcher()
-		first, firstTask, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","relationship":"new"}`), "en")
+		first, firstTask, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","relationship":"new"}`), "en", false)
 		if err != nil || clarify != nil || firstTask == nil || first.ThreadID != "burst-p" {
 			t.Fatalf("first task: req=%+v task=%+v clarify=%+v err=%v", first, firstTask, clarify, err)
 		}
-		second, secondTask, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Osaka weather","relationship":"new"}`), "en")
+		second, secondTask, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Osaka weather","relationship":"new"}`), "en", false)
 		if err != nil || clarify != nil || secondTask == nil || second.ThreadID != "burst-p.t02" {
 			t.Fatalf("second task: req=%+v task=%+v clarify=%+v err=%v", second, secondTask, clarify, err)
+		}
+	})
+
+	t.Run("second same-response omitted relationship still forks", func(t *testing.T) {
+		dispatcher, _ := newDispatcher()
+		_, first, _, _ := dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather"}`), "en", false)
+		req, second, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Osaka news"}`), "en", true)
+		if err != nil || clarify != nil || first == nil || second == nil || first.ID == second.ID || req.ThreadID != "burst-p.t02" {
+			t.Fatalf("same-response split failed: first=%+v second=%+v req=%+v clarify=%+v err=%v", first, second, req, clarify, err)
 		}
 	})
 
@@ -455,7 +464,7 @@ func TestPrepareDoTaskRelationship(t *testing.T) {
 		dispatcher, state := newDispatcher()
 		state.BeginTask("check Tokyo weather", "")
 		target := state.BeginTask("sort unread email", "")
-		req, task, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"only include urgent messages","relationship":"follow_up","task_id":"`+target.ID+`"}`), "en")
+		req, task, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"only include urgent messages","relationship":"follow_up","task_id":"`+target.ID+`"}`), "en", false)
 		if err != nil || clarify != nil || task == nil || task.ID != target.ID || req.ThreadID != target.ThreadID {
 			t.Fatalf("targeted follow-up drifted: req=%+v task=%+v clarify=%+v err=%v", req, task, clarify, err)
 		}
@@ -465,7 +474,7 @@ func TestPrepareDoTaskRelationship(t *testing.T) {
 		dispatcher, state := newDispatcher()
 		state.BeginTask("check Tokyo weather", "")
 		state.BeginTask("sort unread email", "")
-		_, task, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"change that","relationship":"follow_up","task_id":"t99"}`), "en")
+		_, task, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"change that","relationship":"follow_up","task_id":"t99"}`), "en", false)
 		if err != nil || task != nil || clarify == nil || clarify.Status != "clarify" {
 			t.Fatalf("want task clarification: task=%+v clarify=%+v err=%v", task, clarify, err)
 		}
@@ -529,20 +538,20 @@ func TestPerCallAgentOverrideRequiresUserNamedAgent(t *testing.T) {
 	}
 
 	dispatcher := newDispatcher()
-	req, _, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","agent":"finance"}`), "en")
+	req, _, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","agent":"finance"}`), "en", false)
 	if err != nil || clarify != nil || req.Agent != "" {
 		t.Fatalf("model-invented override was not ignored: req=%+v clarify=%+v err=%v", req, clarify, err)
 	}
 
 	dispatcher = newDispatcher()
-	req, _, clarify, err = dispatcher.PrepareDoTask([]byte(`{"task":"ask finance to check NVDA","agent":"finance"}`), "en")
+	req, _, clarify, err = dispatcher.PrepareDoTask([]byte(`{"task":"ask finance to check NVDA","agent":"finance"}`), "en", false)
 	if err != nil || clarify != nil || req.Agent != "finance" {
 		t.Fatalf("explicitly named override was not honored: req=%+v clarify=%+v err=%v", req, clarify, err)
 	}
 
 	t.Setenv("KOE_AGENT_OVERRIDE_GUARD", "0")
 	dispatcher = newDispatcher()
-	req, _, _, _ = dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","agent":"finance"}`), "en")
+	req, _, _, _ = dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","agent":"finance"}`), "en", false)
 	if req.Agent != "finance" {
 		t.Fatalf("rollback flag did not restore model override: %+v", req)
 	}

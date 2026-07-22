@@ -111,6 +111,7 @@ type eventHandler struct {
 	// silently dropped that turn. requestResponse() queues; the sender goroutine
 	// sends serially, waits for respCreated/respRejected, and retries a rejection.
 	respReq      chan responseCreateRequest // queued response.create requests
+	loopRespReq  chan responseCreateRequest // durable latest turn-loop continuation/closure
 	respCreated  chan struct{}              // signalled (buffered 1) on response.created
 	respRejected chan struct{}              // signalled (buffered 1) on the active-response error
 	// resultMailbox is the connection-independent delivery plane for completed
@@ -127,10 +128,28 @@ type eventHandler struct {
 	// middle of the user's utterance. Both native server VAD and the local audio
 	// floor update it; no ASR text participates in this decision.
 	userSpeaking atomic.Bool
+	toolLoop     *toolLoopLedger
+	// pendingResponse binds the next response.created id to the serialized
+	// response.create that caused it. Native user responses arrive with no pending
+	// request and are registered against the newest committed turn.
+	pendingResponseMu sync.Mutex
+	pendingResponse   *responseCreateRequest
 }
 
+type responseToolMode string
+
+const (
+	responseToolsInherited responseToolMode = ""
+	responseToolsEnabled   responseToolMode = "enabled"
+	responseToolsDisabled  responseToolMode = "disabled"
+)
+
 type responseCreateRequest struct {
-	instructions string
+	instructions    string
+	purpose         responsePurpose
+	turnID          int64
+	toolMode        responseToolMode
+	dropIfPreempted bool
 }
 
 func (h *eventHandler) emitVoiceState(state string) {
@@ -519,11 +538,13 @@ func newEventHandlerWithMailbox(disp *Dispatcher, state *CallState, audio *Audio
 	h := &eventHandler{
 		disp: disp, state: state, audio: audio, sendFn: sendFn,
 		respReq:       make(chan responseCreateRequest, 8),
+		loopRespReq:   make(chan responseCreateRequest, 1),
 		respCreated:   make(chan struct{}, 1),
 		respRejected:  make(chan struct{}, 1),
 		resultMailbox: mailbox,
 		resultOwner:   fmt.Sprintf("realtime-%d", resultHandlerSeq.Add(1)),
 		canAnnounce:   canAnnounce,
+		toolLoop:      newToolLoopLedger(),
 	}
 	mailbox.Wake()
 	return h
@@ -558,7 +579,11 @@ func (h *eventHandler) requestResponseForSpeech(text string) {
 		h.requestResponse()
 		return
 	}
-	h.requestResponseWith(responseCreateRequest{instructions: exactSpeechInstructions(text)})
+	h.requestResponseWith(responseCreateRequest{
+		instructions: exactSpeechInstructions(text),
+		purpose:      responsePurposeSynthetic,
+		toolMode:     responseToolsDisabled,
+	})
 }
 
 func (h *eventHandler) requestResponseWith(req responseCreateRequest) {
@@ -580,29 +605,57 @@ func (h *eventHandler) runResponseSender(ctx context.Context) {
 			return
 		case <-h.resultMailbox.notifications():
 			h.sendResultBatch(ctx)
+		case req := <-h.loopRespReq:
+			h.sendResponseCreate(ctx, req)
 		case req := <-h.respReq:
 			h.sendResponseCreate(ctx, req)
 		}
 	}
 }
 
+func (h *eventHandler) queueLoopResponse(req responseCreateRequest) {
+	select {
+	case h.loopRespReq <- req:
+		return
+	default:
+	}
+	// A newer committed turn makes the previous queued continuation obsolete.
+	// Replace instead of dropping the current turn's required continuation/closure.
+	select {
+	case <-h.loopRespReq:
+	default:
+	}
+	select {
+	case h.loopRespReq <- req:
+	default:
+		log.Printf("koe[loop]: failed to queue critical response turn=%d", req.turnID)
+	}
+}
+
 func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreateRequest) bool {
 	for attempt := 0; attempt <= maxResponseCreateRetries; attempt++ {
+		if req.dropIfPreempted && !h.toolLoop.isCurrent(req.turnID) {
+			return false
+		}
 		if !h.waitRespIdle(ctx) {
 			return false // ctx done
 		}
 		drainSignal(h.respCreated) // clear stale acks from the previous turn
 		drainSignal(h.respRejected)
+		h.setPendingResponse(req)
 		if err := h.sendFn(responseCreatePayload(req)); err != nil {
+			h.clearPendingResponse()
 			log.Printf("koe[response]: response.create send failed: %v", err)
 			return false
 		}
 		select {
 		case <-ctx.Done():
+			h.clearPendingResponse()
 			return false
 		case <-h.respCreated:
 			return true // accepted
 		case <-h.respRejected:
+			h.clearPendingResponse()
 			// Overlapped an active response — wait a beat for it to drain, then retry.
 			select {
 			case <-ctx.Done():
@@ -610,10 +663,41 @@ func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreat
 			case <-time.After(responseRejectRetryDelay):
 			}
 		case <-time.After(responseCreateAckTimeout):
+			h.clearPendingResponse()
 			return false // neither created nor rejected (nothing to say) — don't spin
 		}
 	}
 	return false
+}
+
+func (h *eventHandler) setPendingResponse(req responseCreateRequest) {
+	h.pendingResponseMu.Lock()
+	copy := req
+	h.pendingResponse = &copy
+	h.pendingResponseMu.Unlock()
+}
+
+func (h *eventHandler) clearPendingResponse() {
+	h.pendingResponseMu.Lock()
+	h.pendingResponse = nil
+	h.pendingResponseMu.Unlock()
+}
+
+func (h *eventHandler) bindCreatedResponse(responseID string) {
+	if !ToolContinuationEnabled() || responseID == "" {
+		return
+	}
+	h.pendingResponseMu.Lock()
+	pending := h.pendingResponse
+	h.pendingResponse = nil
+	h.pendingResponseMu.Unlock()
+	if pending != nil {
+		h.toolLoop.bindResponse(responseID, pending.purpose, pending.turnID)
+		return
+	}
+	// No local response.create caused this response: it belongs to the newest
+	// native user turn produced by the server VAD path.
+	h.toolLoop.bindResponse(responseID, responsePurposeUser, h.inputCommitSeq.Load())
 }
 
 const resultVoicePollInterval = 20 * time.Millisecond
@@ -633,7 +717,11 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 	if eventLogEnabled() {
 		log.Printf("koe[result]: announcing count=%d task_ids=%q", len(results), resultTaskIDs(results))
 	}
-	accepted := h.sendResponseCreate(ctx, responseCreateRequest{instructions: taskResultSpeechInstructions(results)})
+	accepted := h.sendResponseCreate(ctx, responseCreateRequest{
+		instructions: taskResultSpeechInstructions(results),
+		purpose:      responsePurposeTaskResult,
+		toolMode:     responseToolsDisabled,
+	})
 	if accepted {
 		h.resultRetries = 0
 		return // response.done owns the delivery acknowledgement
@@ -722,10 +810,54 @@ func taskResultSpeechInstructions(results []resultAnnouncement) string {
 	return base
 }
 
+const toolContinuationInstructions = "Continue the same user turn using the function outputs now in the conversation. You may call more tools only when another action is genuinely required. Do not repeat the initial acknowledgement or narrate mechanics. If every output only says a background do_task is running, emit no audio and end this response; its real result will be announced later. Otherwise, when no more tool is needed, give one brief grounded summary of what succeeded and what did not."
+
+const toolBudgetClosureInstructions = "The action budget for this user turn is exhausted. Tools are disabled for this closing response. Give one concise grounded summary using only the function outputs in the conversation: say what was actually completed or started and what was not executed. Do not claim success for a rejected or missing action, do not repeat the initial acknowledgement, and do not ask the user to wait."
+
+func (h *eventHandler) finishToolLoopResponse(responseID string) {
+	decision, turnID := h.toolLoop.finishResponse(responseID)
+	switch decision {
+	case toolLoopContinue:
+		h.queueLoopResponse(responseCreateRequest{
+			instructions:    toolContinuationInstructions,
+			purpose:         responsePurposeContinuation,
+			turnID:          turnID,
+			toolMode:        responseToolsEnabled,
+			dropIfPreempted: true,
+		})
+	case toolLoopClose:
+		h.queueLoopResponse(responseCreateRequest{
+			instructions:    toolBudgetClosureInstructions,
+			purpose:         responsePurposeClosure,
+			turnID:          turnID,
+			toolMode:        responseToolsDisabled,
+			dropIfPreempted: true,
+		})
+	}
+}
+
 func responseCreatePayload(req responseCreateRequest) map[string]any {
 	payload := map[string]any{"type": "response.create"}
+	response := map[string]any{}
 	if strings.TrimSpace(req.instructions) != "" {
-		payload["response"] = map[string]any{"instructions": req.instructions}
+		response["instructions"] = req.instructions
+	}
+	if req.purpose != "" {
+		metadata := map[string]string{"koe_purpose": string(req.purpose)}
+		if req.turnID > 0 {
+			metadata["koe_turn_id"] = fmt.Sprintf("%d", req.turnID)
+		}
+		response["metadata"] = metadata
+	}
+	switch req.toolMode {
+	case responseToolsEnabled:
+		response["tools"] = ToolDefs()
+		response["tool_choice"] = "auto"
+	case responseToolsDisabled:
+		response["tools"] = []ToolDef{}
+	}
+	if len(response) > 0 {
+		payload["response"] = response
 	}
 	return payload
 }
@@ -884,13 +1016,18 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	var ev struct {
 		Type       string          `json:"type"`
-		Name       string          `json:"name"`      // function_call_arguments.done
-		CallID     string          `json:"call_id"`   // function call id
+		Name       string          `json:"name"`    // function_call_arguments.done
+		CallID     string          `json:"call_id"` // function call id
+		ResponseID string          `json:"response_id"`
 		Arguments  json.RawMessage `json:"arguments"` // function args (string-encoded JSON)
 		Transcript string          `json:"transcript"`
-		Response   struct {
-			ID     string `json:"id"`
-			Status string `json:"status"`
+		Item       struct {
+			Type string `json:"type"`
+		} `json:"item"`
+		Response struct {
+			ID       string            `json:"id"`
+			Status   string            `json:"status"`
+			Metadata map[string]string `json:"metadata"`
 		} `json:"response"`
 		Error struct {
 			Code    string `json:"code"`
@@ -930,13 +1067,17 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// The user finished talking. create_response=true lets the server start the
 		// spoken response automatically.
 	case "input_audio_buffer.committed":
-		h.inputCommitSeq.Add(1)
+		turnID := h.inputCommitSeq.Add(1)
+		if ToolContinuationEnabled() {
+			h.toolLoop.noteUserCommit(turnID)
+		}
 	case "conversation.item.input_audio_transcription.completed":
 		h.handleInputTranscript(ev.Transcript)
 	case "conversation.item.input_audio_transcription.failed":
 		// Treat failed ASR like unclear audio. Do not guess.
 		h.emitVoiceState("listening")
 	case "response.created":
+		h.bindCreatedResponse(ev.Response.ID)
 		h.responseSeq.Add(1)
 		h.responseCreatedAt = time.Now()
 		if eventLogEnabled() {
@@ -993,7 +1134,27 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if eventLogEnabled() {
 			log.Printf("koe[tool]: call name=%q call_id=%q args=%s", ev.Name, ev.CallID, logMaybeBytes(args, 500))
 		}
-		h.handleFunctionCall(ctx, ev.CallID, ev.Name, args)
+		sameResponseDoTask := false
+		if ToolContinuationEnabled() && ev.ResponseID != "" {
+			claim := h.toolLoop.claimAction(ev.ResponseID, ev.Name)
+			if !claim.allowed {
+				if eventLogEnabled() {
+					log.Printf("koe[loop]: tool denied response_id=%q name=%q reason=%s", ev.ResponseID, ev.Name, claim.reason)
+				}
+				h.sendFunctionOutput(ev.CallID, mustJSON(map[string]any{
+					"status": "failed", "error_code": claim.reason,
+					"message": "This tool action was not executed.",
+				}))
+				break
+			}
+			sameResponseDoTask = claim.sameResponseDoTaskCall
+		}
+		h.handleFunctionCallForResponse(ctx, ev.ResponseID, ev.CallID, ev.Name, args, sameResponseDoTask)
+	case "response.output_item.added":
+		if ToolContinuationEnabled() && h.toolLoop.noteMessageItem(ev.ResponseID, ev.Item.Type) {
+			log.Printf("koe[loop]: repeated assistant message fused response_id=%q", ev.ResponseID)
+			h.interruptOutput()
+		}
 	case "output_audio_buffer.started":
 		h.outputStartedAt = time.Now()
 		if eventLogEnabled() {
@@ -1032,6 +1193,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// back in the mailbox so the next quiet boundary or connection can retry.
 		delivered := ev.Response.Status == "" || ev.Response.Status == "completed"
 		h.finishResultBatch(delivered)
+		if ToolContinuationEnabled() {
+			h.finishToolLoopResponse(ev.Response.ID)
+		}
 		h.responseDoneAt = time.Now()
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: response_done response_ms=%d output_elapsed_ms=%d", elapsedMS(h.responseCreatedAt, h.responseDoneAt), elapsedMS(h.outputStartedAt, h.responseDoneAt))
@@ -1121,26 +1285,30 @@ func shouldVoiceDoTaskResult(r SayResult, userSpokeSinceLastDoTask bool) bool {
 // handleFunctionCall composes do_task synchronously (C-minimal) or routes the
 // fast tools through Dispatch, then sends the function_call_output back.
 func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name string, args []byte) {
+	h.handleFunctionCallForResponse(ctx, "", callID, name, args, false)
+}
+
+func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, responseID, callID, name string, args []byte, sameResponseDoTask bool) {
 	if name == "do_task" {
 		// Resolve the mechanical-fallback language once for this call: the pinned koe
 		// language wins, else the utterance decides (the task text is a JSON string
 		// inside args, so a Han rune anywhere in args signals a Chinese utterance —
 		// the JSON keys and agent slugs are ASCII).
 		lang := fallbackLang(h.language, string(args))
-		req, task, clarify, err := h.disp.PrepareDoTask(args, lang)
+		req, task, clarify, err := h.disp.PrepareDoTask(args, lang, sameResponseDoTask)
 		if err != nil {
 			if eventLogEnabled() {
 				log.Printf("koe[task]: prepare failed call_id=%q err=%v args=%s", callID, err, logMaybeBytes(args, 500))
 			}
 			say := fallbackSay(lang, "misheard")
-			h.sendOutput(callID, SayResult{Status: "failed", SpokenSummary: say, Say: say})
+			h.sendOutputForResponse(responseID, callID, SayResult{Status: "failed", SpokenSummary: say, Say: say})
 			return
 		}
 		if clarify != nil {
 			if eventLogEnabled() {
 				log.Printf("koe[task]: clarify call_id=%q status=%s say_len=%d", callID, clarify.Status, len([]rune(clarify.Say)))
 			}
-			h.sendOutput(callID, *clarify)
+			h.sendOutputForResponse(responseID, callID, *clarify)
 			return
 		}
 		// reachy say-and-ask: the model speaks its own short ack out loud in the
@@ -1268,21 +1436,28 @@ func (h *eventHandler) handleFunctionCall(ctx context.Context, callID, name stri
 		if eventLogEnabled() {
 			log.Printf("koe[tool]: dispatch failed name=%q call_id=%q err=%v args=%s", name, callID, err, logMaybeBytes(args, 500))
 		}
-		h.sendOutput(callID, SayResult{Status: "failed", FailReason: err.Error()})
+		h.sendOutputForResponse(responseID, callID, SayResult{Status: "failed", FailReason: err.Error()})
 		return
 	}
 	if eventLogEnabled() {
 		log.Printf("koe[tool]: dispatch done name=%q call_id=%q output=%s", name, callID, logMaybeBytes(outBytes, 500))
 	}
 	var raw json.RawMessage = outBytes
-	h.sendRaw(callID, raw)
+	h.sendRawForResponse(responseID, callID, raw)
 }
 
 // sendOutput frames a SayResult as a function_call_output + asks for a spoken
 // response (the synchronous error/clarify + fast-tool path).
 func (h *eventHandler) sendOutput(callID string, r SayResult) {
+	h.sendOutputForResponse("", callID, r)
+}
+
+func (h *eventHandler) sendOutputForResponse(responseID, callID string, r SayResult) {
 	b, _ := json.Marshal(r)
 	h.sendFunctionOutput(callID, b)
+	if ToolContinuationEnabled() && responseID != "" {
+		return
+	}
 	if r.Say != "" {
 		h.requestResponseForSpeech(r.Say)
 		return
@@ -1326,7 +1501,14 @@ func (h *eventHandler) injectTaskResultItem(taskID string, payload []byte) {
 }
 
 func (h *eventHandler) sendRaw(callID string, output json.RawMessage) {
+	h.sendRawForResponse("", callID, output)
+}
+
+func (h *eventHandler) sendRawForResponse(responseID, callID string, output json.RawMessage) {
 	h.sendFunctionOutput(callID, output)
+	if ToolContinuationEnabled() && responseID != "" {
+		return
+	}
 	h.requestResponse()
 }
 
