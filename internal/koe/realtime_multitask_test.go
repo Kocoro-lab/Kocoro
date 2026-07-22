@@ -35,6 +35,7 @@ func TestDoTaskImmediateAckAndParallelLanes(t *testing.T) {
 	state := NewCallState("burst-m", "")
 	dispatcher := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
 	mailbox := NewResultMailbox()
+	mailbox.BeginBurst(state.BurstID())
 	var mu sync.Mutex
 	var outputs []SayResult
 	h := newEventHandlerWithMailbox(dispatcher, state, nil, func(v any) error {

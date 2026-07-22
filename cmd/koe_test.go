@@ -370,14 +370,11 @@ func TestKoePersonaForbidsDetailQuizzing(t *testing.T) {
 	}
 }
 
-// TestKoePersonaAckVariedAndNoPreAnswer: the do_task acknowledgement allows
-// natural, task-fitting wording variety and MAY name the action ("我查一下新闻"),
-// which the pre-2026-07-10 content-free rule wrongly forbade. The load-bearing
-// half survives, narrowed: no answer/number/result before it lands — that is what
-// blocks hallucinated pre-answers. It is also spoken only when do_task is actually
-// being called, so a direct answer never gets a stray "let me check" first.
-func TestKoePersonaAckVariedAndNoPreAnswer(t *testing.T) {
-	for _, want := range []string{"vary it between turns", "You may name what you are about to do", "before it lands", "only when you are actually about to call do_task"} {
+// TestKoePersonaAckIsBareAndNoPreAnswer pins the voice-latency contract: one
+// minimal acknowledgement, no narrated process or wait promise, and no guessed
+// answer before the real task result lands. Direct answers get no stray ack.
+func TestKoePersonaAckIsBareAndNoPreAnswer(t *testing.T) {
+	for _, want := range []string{"use at most", "one bare clause", "narrate steps", "ask the user to wait", "before it lands", "only when you are actually about to call do_task"} {
 		if !strings.Contains(koePersona, want) {
 			t.Fatalf("koePersona missing ack contract %q", want)
 		}

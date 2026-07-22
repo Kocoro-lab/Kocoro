@@ -97,6 +97,7 @@ func TestKoeCompoundParallelE2E(t *testing.T) {
 	var connOnce, cfgOnce sync.Once
 	var eventMu sync.Mutex
 	responseCalls := map[string][]string{}
+	responseCreated := 0
 	var errorsSeen []string
 	persona := "You are Kocoro, a concise voice assistant. Execute requested tool actions immediately. A do_task returns running and never blocks another action. If one user turn asks to cancel a task and start multiple independent tasks, emit the cancel and every do_task together in the SAME response using parallel function calls; do not split them across responses."
 	rc.pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
@@ -116,6 +117,10 @@ func TestKoeCompoundParallelE2E(t *testing.T) {
 		switch ev.Type {
 		case "session.updated":
 			cfgOnce.Do(func() { close(configured) })
+		case "response.created":
+			eventMu.Lock()
+			responseCreated++
+			eventMu.Unlock()
 		case "response.function_call_arguments.done":
 			eventMu.Lock()
 			responseCalls[ev.ResponseID] = append(responseCalls[ev.ResponseID], ev.Name)
@@ -161,6 +166,12 @@ func TestKoeCompoundParallelE2E(t *testing.T) {
 		return len(state.RunningTasks()) == 1
 	}, "initial task did not enter the running ledger")
 	waitCompoundIdle(t, ctx, h, "initial task response/continuation did not settle")
+	eventMu.Lock()
+	initialResponseCount := responseCreated
+	eventMu.Unlock()
+	if initialResponseCount != 1 {
+		t.Fatalf("deferred do_task created %d Responses before its result, want exactly 1", initialResponseCount)
+	}
 	initial := state.RunningTasks()[0]
 
 	runTextTurn("Cancel task " + initial.ID + ", and at the same time start two separate independent tasks: check the current weather in Tokyo, and check the current weather in Osaka. Execute all three actions now in this same response.")

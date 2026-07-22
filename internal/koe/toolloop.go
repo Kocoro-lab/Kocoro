@@ -2,7 +2,10 @@
 
 package koe
 
-import "sync"
+import (
+	"encoding/json"
+	"sync"
+)
 
 const (
 	maxTurnTaskActions = 4
@@ -32,15 +35,32 @@ type loopTurn struct {
 }
 
 type loopResponse struct {
-	turnID       int64
-	purpose      responsePurpose
-	toolCalls    int
-	doTaskCalls  int
-	claimedCalls map[string]struct{}
-	budgetHit    bool
-	finished     bool
-	messageItems int
-	fuseTripped  bool
+	turnID         int64
+	purpose        responsePurpose
+	toolCalls      int
+	doTaskCalls    int
+	deferredTasks  int
+	claimedCalls   map[string]struct{}
+	claimedActions map[string]struct{}
+	budgetHit      bool
+	finished       bool
+	messageItems   int
+	fuseTripped    bool
+}
+
+// noteDeferredDoTask records that a valid do_task was resolved immediately with
+// status=running. When every action in a response has this shape, there is no
+// synchronous result for a continuation Response to discuss; the mailbox will
+// create exactly one result Response when the real work finishes.
+func (l *toolLoopLedger) noteDeferredDoTask(responseID string) {
+	if l == nil || responseID == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if response := l.responses[responseID]; response != nil {
+		response.deferredTasks++
+	}
 }
 
 type toolLoopDecision int
@@ -55,6 +75,7 @@ type toolActionClaim struct {
 	known                  bool
 	allowed                bool
 	duplicate              bool
+	duplicateAction        bool
 	turnID                 int64
 	sameResponseDoTaskCall bool
 	reason                 string
@@ -130,8 +151,20 @@ func (l *toolLoopLedger) bindResponse(responseID string, purpose responsePurpose
 		l.order = append(l.order, turnID)
 	}
 	l.responses[responseID] = &loopResponse{
-		turnID: turnID, purpose: purpose, claimedCalls: make(map[string]struct{}),
+		turnID: turnID, purpose: purpose,
+		claimedCalls: make(map[string]struct{}), claimedActions: make(map[string]struct{}),
 	}
+}
+
+func canonicalToolAction(tool string, args []byte) string {
+	normalized := args
+	var value any
+	if json.Unmarshal(args, &value) == nil {
+		if encoded, err := json.Marshal(value); err == nil {
+			normalized = encoded
+		}
+	}
+	return tool + "\x00" + string(normalized)
 }
 
 func (l *toolLoopLedger) claimAction(responseID, callID, tool string, args []byte) toolActionClaim {
@@ -166,12 +199,24 @@ func (l *toolLoopLedger) claimAction(responseID, callID, tool string, args []byt
 		claim.reason = "turn_preempted"
 		return claim
 	}
+	action := canonicalToolAction(tool, args)
+	if tool == "do_task" {
+		if _, duplicate := response.claimedActions[action]; duplicate {
+			claim.duplicate = true
+			claim.duplicateAction = true
+			claim.reason = "duplicate_tool_action"
+			return claim
+		}
+	}
 	if turn.actions >= maxTurnTaskActions {
 		response.budgetHit = true
 		claim.reason = "turn_action_budget_exhausted"
 		return claim
 	}
 	turn.actions++
+	if tool == "do_task" {
+		response.claimedActions[action] = struct{}{}
+	}
 	response.toolCalls++
 	if tool == "do_task" {
 		response.doTaskCalls++
@@ -203,6 +248,10 @@ func (l *toolLoopLedger) finishResponse(responseID string) (toolLoopDecision, in
 	if response.budgetHit || turn.actions >= maxTurnTaskActions {
 		turn.closed = true
 		return toolLoopClose, response.turnID
+	}
+	if response.toolCalls == response.doTaskCalls && response.doTaskCalls == response.deferredTasks {
+		turn.closed = true
+		return toolLoopNone, response.turnID
 	}
 	return toolLoopContinue, response.turnID
 }

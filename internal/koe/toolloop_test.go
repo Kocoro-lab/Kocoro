@@ -17,8 +17,8 @@ func TestToolLoopBudgetContinuationAndClosure(t *testing.T) {
 	loop := newToolLoopLedger()
 	loop.noteUserCommit(1)
 	loop.bindResponse("initial", responsePurposeUser, 1)
-	first := loop.claimAction("initial", "call-1", "do_task", nil)
-	second := loop.claimAction("initial", "call-2", "do_task", nil)
+	first := loop.claimAction("initial", "call-1", "do_task", []byte(`{"task":"weather"}`))
+	second := loop.claimAction("initial", "call-2", "do_task", []byte(`{"task":"news"}`))
 	if !first.allowed || !second.allowed || first.sameResponseDoTaskCall || !second.sameResponseDoTaskCall {
 		t.Fatalf("same-response do_task accounting wrong: first=%+v second=%+v", first, second)
 	}
@@ -38,6 +38,25 @@ func TestToolLoopBudgetContinuationAndClosure(t *testing.T) {
 	}
 	if decision, _ := loop.finishResponse("continued"); decision != toolLoopClose {
 		t.Fatalf("budget exhaustion decision=%v, want tools-disabled closure", decision)
+	}
+}
+
+func TestToolLoopSkipsContinuationForDeferredDoTasks(t *testing.T) {
+	loop := newToolLoopLedger()
+	loop.noteUserCommit(1)
+	loop.bindResponse("initial", responsePurposeUser, 1)
+	for i, callID := range []string{"call-1", "call-2"} {
+		args := []byte(`{"task":"task-` + string(rune('a'+i)) + `"}`)
+		if claim := loop.claimAction("initial", callID, "do_task", args); !claim.allowed {
+			t.Fatalf("do_task %s denied: %+v", callID, claim)
+		}
+		loop.noteDeferredDoTask("initial")
+	}
+	if decision, turnID := loop.finishResponse("initial"); decision != toolLoopNone || turnID != 1 {
+		t.Fatalf("deferred-only finish=(%v,%d), want no continuation for turn 1", decision, turnID)
+	}
+	if claim := loop.claimAction("initial", "call-3", "do_task", nil); claim.allowed || claim.reason != "turn_preempted" {
+		t.Fatalf("deferred-only response did not close turn: %+v", claim)
 	}
 }
 
@@ -84,6 +103,21 @@ func TestToolLoopDeduplicatesCallIDWithoutSpendingBudget(t *testing.T) {
 	}
 }
 
+func TestToolLoopDeduplicatesCanonicalActionAcrossCallIDs(t *testing.T) {
+	loop := newToolLoopLedger()
+	loop.noteUserCommit(1)
+	loop.bindResponse("response", responsePurposeUser, 1)
+	first := loop.claimAction("response", "call-1", "do_task", []byte(`{"task":"weather and news","relationship":"new"}`))
+	duplicate := loop.claimAction("response", "call-2", "do_task", []byte(`{"relationship":"new","task":"weather and news"}`))
+	distinct := loop.claimAction("response", "call-3", "do_task", []byte(`{"task":"weather only","relationship":"new"}`))
+	if !first.allowed || !distinct.allowed {
+		t.Fatalf("distinct actions were denied: first=%+v distinct=%+v", first, distinct)
+	}
+	if duplicate.allowed || !duplicate.duplicate || !duplicate.duplicateAction || duplicate.reason != "duplicate_tool_action" {
+		t.Fatalf("canonical duplicate was not rejected: %+v", duplicate)
+	}
+}
+
 func TestToolLoopUnknownResponseHasNoAuthority(t *testing.T) {
 	loop := newToolLoopLedger()
 	loop.noteUserCommit(1)
@@ -122,6 +156,62 @@ func TestToolLoopDuplicateWireEventExecutesSideEffectOnce(t *testing.T) {
 	h.handleEvent(context.Background(), event)
 	if controlCalls != 1 || functionOutputs != 1 {
 		t.Fatalf("duplicate event replayed: side_effects=%d function_outputs=%d", controlCalls, functionOutputs)
+	}
+}
+
+func TestToolLoopDuplicateDoTaskActionCreatesOneTask(t *testing.T) {
+	posts := make(chan struct{}, 2)
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		posts <- struct{}{}
+		_ = json.NewEncoder(w).Encode(map[string]any{"reply": "done", "spoken_summary": "done"})
+	}))
+	defer mock.Close()
+
+	state := NewCallState("burst-action-dedup", "")
+	dispatcher := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+	var mu sync.Mutex
+	var outputs []map[string]any
+	h := newEventHandler(dispatcher, state, nil, func(v any) error {
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+			Item struct {
+				Type   string `json:"type"`
+				Output string `json:"output"`
+			} `json:"item"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "conversation.item.create" && frame.Item.Type == "function_call_output" {
+			var output map[string]any
+			_ = json.Unmarshal([]byte(frame.Item.Output), &output)
+			mu.Lock()
+			outputs = append(outputs, output)
+			mu.Unlock()
+		}
+		return nil
+	})
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"action-dedup"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"action-dedup","call_id":"call-1","name":"do_task","arguments":"{\"task\":\"weather and news\",\"relationship\":\"new\"}"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"action-dedup","call_id":"call-2","name":"do_task","arguments":"{\"relationship\":\"new\",\"task\":\"weather and news\"}"}`))
+
+	select {
+	case <-posts:
+	case <-time.After(time.Second):
+		t.Fatal("accepted do_task never reached backend")
+	}
+	select {
+	case <-posts:
+		t.Fatal("canonical duplicate reached backend")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if tasks := state.AllTasks(); len(tasks) != 1 {
+		t.Fatalf("duplicate action created %d tasks, want 1: %+v", len(tasks), tasks)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(outputs) != 2 || outputs[0]["status"] != "running" || outputs[1]["error_code"] != "duplicate_tool_action" {
+		t.Fatalf("function outputs=%+v, want running then duplicate_tool_action", outputs)
 	}
 }
 

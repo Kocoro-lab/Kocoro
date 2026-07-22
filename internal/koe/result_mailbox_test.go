@@ -52,6 +52,37 @@ func TestResultMailboxReleasesAcrossConnectionTeardown(t *testing.T) {
 	}
 }
 
+func TestResultMailboxScopesSpeechToOriginatingBurst(t *testing.T) {
+	m := NewResultMailbox()
+	m.BeginBurst("old-call")
+	m.BeginBurst("new-call")
+	if id := m.EnqueueForBurst("old-call", SayResult{TaskID: "task-a", Status: "ok", Reply: "Old result."}, false); id == 0 {
+		t.Fatal("active originating burst rejected its result")
+	}
+	if got := len(m.claimForBurst("new-connection", "new-call")); got != 0 {
+		t.Fatalf("new call claimed %d old-call results, want 0", got)
+	}
+	claimed := m.claimForBurst("old-connection", "old-call")
+	if len(claimed) != 1 || claimed[0].result.Reply != "Old result." {
+		t.Fatalf("originating call did not recover its result: %+v", claimed)
+	}
+}
+
+func TestResultMailboxRetiredBurstDropsQueuedAndLateSpeech(t *testing.T) {
+	m := NewResultMailbox()
+	m.BeginBurst("old-call")
+	m.EnqueueForBurst("old-call", SayResult{TaskID: "task-a", Status: "ok", Reply: "Queued."}, false)
+	if got := m.RetireBurst("old-call"); got != 1 {
+		t.Fatalf("retired queued entries=%d, want 1", got)
+	}
+	if id := m.EnqueueForBurst("old-call", SayResult{TaskID: "task-b", Status: "ok", Reply: "Late."}, false); id != 0 {
+		t.Fatalf("late old-call speech was enqueued with id=%d", id)
+	}
+	if got := m.pending(); got != 0 {
+		t.Fatalf("retired burst left pending speech=%d", got)
+	}
+}
+
 func TestResultMailboxWakeCoalescesWithoutDroppingEntries(t *testing.T) {
 	m := NewResultMailbox()
 	for i := 0; i < 32; i++ {
@@ -244,6 +275,7 @@ func TestDoTaskResultUsesMailboxAfterUserMovesOn(t *testing.T) {
 
 	mailbox := NewResultMailbox()
 	state := NewCallState("burst-mailbox", "")
+	mailbox.BeginBurst(state.BurstID())
 	disp := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
 	var functionOutputs atomic.Int32
 	h := newEventHandlerWithMailbox(disp, state, nil, func(v any) error {

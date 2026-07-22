@@ -545,7 +545,11 @@ func (h *eventHandler) reportUsage(raw []byte) {
 var resultHandlerSeq atomic.Uint64
 
 func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error) *eventHandler {
-	return newEventHandlerWithMailbox(disp, state, audio, sendFn, nil, nil)
+	mailbox := NewResultMailbox()
+	if state != nil {
+		mailbox.BeginBurst(state.BurstID())
+	}
+	return newEventHandlerWithMailbox(disp, state, audio, sendFn, mailbox, nil)
 }
 
 func newEventHandlerWithMailbox(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error, mailbox *ResultMailbox, canAnnounce func() bool) *eventHandler {
@@ -789,7 +793,11 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 	if !h.waitResultVoiceGap(ctx) {
 		return
 	}
-	results := h.resultMailbox.claim(h.resultOwner)
+	burstID := ""
+	if h.state != nil {
+		burstID = h.state.BurstID()
+	}
+	results := h.resultMailbox.claimForBurst(h.resultOwner, burstID)
 	if len(results) == 0 {
 		return
 	}
@@ -1363,7 +1371,13 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			claim := h.toolLoop.claimAction(ev.ResponseID, ev.CallID, ev.Name, args)
 			if claim.duplicate {
 				if eventLogEnabled() {
-					log.Printf("koe[loop]: duplicate tool event ignored response_id=%q call_id=%q name=%q", ev.ResponseID, ev.CallID, ev.Name)
+					log.Printf("koe[loop]: duplicate tool ignored response_id=%q call_id=%q name=%q reason=%s", ev.ResponseID, ev.CallID, ev.Name, claim.reason)
+				}
+				if claim.duplicateAction {
+					h.sendFunctionOutput(ev.CallID, mustJSON(map[string]any{
+						"status": "ignored", "error_code": claim.reason,
+						"message": "An identical tool action was already accepted in this response.",
+					}))
 				}
 				break
 			}
@@ -1586,7 +1600,9 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 			// interaction window.
 			ack, _ := json.Marshal(SayResult{Status: "running", TaskID: task.ID})
 			h.sendFunctionOutput(callID, ack)
+			h.toolLoop.noteDeferredDoTask(responseID)
 		}
+		originBurstID := h.state.BurstID()
 		go func() {
 			// do_task must survive session teardown: a hangup cancels the session ctx
 			// that Connect rides, which would abort this in-flight POST /message and
@@ -1628,7 +1644,7 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 			// part to the Realtime connection that happened to start the task.
 			userSpokeSinceLastDoTask := h.inputCommitSeq.Load() > h.lastDoTaskCommitSeq.Load()
 			if koeEnvBool("KOE_RESULT_DELIVERY", true) {
-				enqueued := h.resultMailbox.Enqueue(r, userSpokeSinceLastDoTask)
+				enqueued := h.resultMailbox.EnqueueForBurst(originBurstID, r, userSpokeSinceLastDoTask)
 				if eventLogEnabled() {
 					log.Printf("koe[tool]: output call_id=%q status=%s mailbox_id=%d resumptive=%t output=%s",
 						callID, r.Status, enqueued, userSpokeSinceLastDoTask, logMaybeBytes(b, 500))

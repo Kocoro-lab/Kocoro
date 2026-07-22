@@ -31,7 +31,7 @@ const cancelParamsLegacy = `{"type":"object","properties":{"reason":{"type":"str
 
 const cancelParamsLedger = `{"type":"object","properties":{"reason":{"type":"string","enum":["user_cancel","interrupt"],"description":"Why the task is being cancelled."},"task_id":{"type":"string","description":"The task id to cancel. Omit when exactly one task is running."}},"required":[]}`
 
-// ToolDefs returns the voice tools. Enum'd where applicable; no parallel calls.
+// ToolDefs returns the voice tools. Inputs are enum'd where applicable.
 // end_call ends the whole conversation (dismiss / hang up) — the model judges the
 // intent from the audio, which is more robust than matching the garbled input
 // transcription; a tone plays and the call goes dormant (re-activate with a
@@ -64,7 +64,7 @@ func ToolDefs() []ToolDef {
 			Parameters:  obj(`{"type":"object","properties":{},"required":[]}`)},
 	}
 	if TaskLedgerEnabled() {
-		defs[0].Description += " The call returns immediately with status running and a task_id; the real result arrives later as a background task update. A running task never blocks you: keep conversing and call do_task again freely for another independent request or a follow-up, and never invent a result before the update lands."
+		defs[0].Description += " Before calling, acknowledge with at most one bare clause; never narrate steps, ask the user to wait, or promise to report back. Multiple calls in one response must describe distinct work: use one complete compound task or disjoint concrete tasks, never duplicate the same compound request. The call returns immediately with status running and a task_id; the real result arrives later as a background task update. A running task never blocks you: keep conversing and call do_task again freely for another independent request or a follow-up, and never invent a result before the update lands."
 	}
 	return defs
 }

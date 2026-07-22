@@ -369,12 +369,12 @@ it. This is NOT cancel — cancel stops one running task and keeps the conversat
 end_call ends the whole conversation.
 
 Say a do_task acknowledgement only when you are actually about to call do_task — if you can
-answer directly, just answer, with no "let me check" first. When you do call it, first say
-one short line in the language of the user's utterance, never both languages, fitting the
-task naturally — 我查一下新闻 / 我来看看这个方向 / 我打开看看 for Chinese, "Let me pull that
-up" / "On it" for English are examples, not a fixed script — and vary it between turns rather
-than repeating one stock phrase. You may name what you are about to do; just don't state the
-answer, a number, or a result before it lands. Then call do_task and say nothing more until
+answer directly, just answer, with no "let me check" first. When you do call it, use at most
+one bare clause in the language of the user's utterance, never both languages: Chinese is
+usually 3–8 characters (我查一下 / 我看看), and English is usually 1–4 words (On it). Never
+narrate steps, explain why, promise to come back, ask the user to wait, mention how long it
+may take, or add a second clause. Do not state an answer, number, or result before it lands.
+Then call do_task and say nothing more until
 the result lands; then speak it briefly in your own voice. Before the result lands, never say the
 task is done, finished, ready, shown, displayed, saved, sent, or available in Kocoro
 Desktop. The completed update contains Kocoro's full final user-facing reply, status,
@@ -392,7 +392,7 @@ irreversible or outbound, restate it and wait for a clear yes.`
 
 const koeMultiTaskPersona = `
 
-You can keep conversing and run several tasks at once. do_task returns immediately with a running status and task_id; the completed result arrives later, so never say you must wait for an earlier task. For another independent request use relationship "new". For a refinement or correction use relationship "follow_up" with that task_id. If several tasks are running and the target is unclear, ask one short question. get_status lists every task and state. You may cancel one task and start another in the same turn when that is what the user asked.`
+You can keep conversing and run several tasks at once. do_task returns immediately with a running status and task_id; the completed result arrives later, so never say you must wait for an earlier task. Multiple calls in one response must describe distinct work: either send one complete compound task, or split it into disjoint concrete tasks; never repeat the same compound request in two calls. For another independent request use relationship "new". For a refinement or correction use relationship "follow_up" with that task_id. If several tasks are running and the target is unclear, ask one short question. get_status lists every task and state. You may cancel one task and start another in the same turn when that is what the user asked.`
 
 func appendTaskLedgerPersona(persona string) string {
 	if koe.TaskLedgerEnabled() {
@@ -695,6 +695,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	state := koe.NewCallState(newBurstID(), cfg.agent)
 	disp := koe.NewDispatcher(client, resolver, state, nil)
 	resultMailbox := koe.NewResultMailbox()
+	resultMailbox.BeginBurst(state.BurstID())
 	audio, err := koe.NewAudioIO()
 	if err != nil {
 		return fmt.Errorf("audio init: %v", err)
@@ -821,6 +822,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	var callContext koe.StartCallRequest
 	newSessionState := func() (*koe.CallState, *koe.Dispatcher) {
 		state := koe.NewCallState(newBurstID(), cfg.agent)
+		resultMailbox.BeginBurst(state.BurstID())
 		state.SetCallContext(callContext)
 		disp := koe.NewDispatcher(client, resolverHolder.Load(), state, func(_ context.Context, action string) error {
 			if ctrl == nil {
@@ -913,6 +915,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		sessionSeq++
 		conn, cancel := curConn, sessionCancel
 		audio := curAudio
+		if curState != nil {
+			resultMailbox.RetireBurst(curState.BurstID())
+		}
 		curConn, curState, curAudio, sessionCancel = nil, nil, nil, nil
 		snapState.Store(nil)
 		snapAudio.Store(nil)
