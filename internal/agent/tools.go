@@ -321,8 +321,12 @@ var autoApprovalDenyList = []string{}
 // keystrokes and clicks into whatever app is frontmost. A schedule firing at
 // 3am with nobody at the Mac must not type into arbitrary windows on the
 // strength of a one-time attended "Always Allow" click or a blanket
-// daemon.auto_approve. Attended use is unaffected: Desktop/Slack/TUI runs
-// still honor always-allow and normal approval.
+// daemon.auto_approve. The gate covers the WHOLE tool, observation actions
+// included: checkPermissionAndApproval also suppresses the SafeChecker
+// exemption for listed tools on unattended runs, so a schedule cannot
+// silently screenshot the user's screen either. Attended use is unaffected:
+// Desktop/Slack/TUI runs still honor always-allow, normal approval, and
+// approval-free observations.
 //
 // The legacy GUI tools (accessibility / computer / applescript) are
 // DELIBERATELY not listed yet: existing user schedules may depend on

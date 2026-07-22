@@ -99,6 +99,54 @@ func TestCheckPermissionAndApproval_UnattendedSkipsAlwaysAllowForDenyListed(t *t
 	}
 }
 
+// TestCheckPermissionAndApproval_UnattendedDeniesSafeArgsForDenyListed pins
+// the companion fix to the always-allow gate above: the SafeChecker
+// observation exemption must not clear approval for a deny-listed tool on an
+// unattended run either. ComputerUseTool.IsSafeArgs returns true for
+// get_app_state/get_value/screenshot/wait, so without this gate a schedule
+// could silently screenshot the user's screen with no approval and no
+// handler deny — the exact shape of bypass the always-allow fix closed, one
+// branch lower. No always-allow entry is needed to reproduce it.
+func TestCheckPermissionAndApproval_UnattendedDeniesSafeArgsForDenyListed(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	loop.SetUnattendedRun(true)
+
+	tool := &mockApprovalTool{
+		name:     "computer_use",
+		safeArgs: func(string) bool { return true }, // mirrors ComputerUseTool.IsSafeArgs for observation actions
+	}
+	_, approved := loop.checkPermissionAndApproval(context.Background(), "computer_use", `{"action":"screenshot","description":"Capture the screen"}`, tool, NewApprovalCache())
+
+	if approved {
+		t.Error("unattended run executed a computer_use observation approval-free; SafeChecker bypassed the unattended deny-list")
+	}
+	if !handler.approvalRequested {
+		t.Error("observation call never reached the handler's unattended deny-list gate")
+	}
+}
+
+// TestCheckPermissionAndApproval_UnattendedKeepsSafeArgsForNonDenyListed
+// scopes the gate above to the deny-list: tools NOT on it (legacy
+// accessibility reads in existing unattended schedules) keep their
+// SafeChecker exemption on unattended runs — the fix must not over-block.
+func TestCheckPermissionAndApproval_UnattendedKeepsSafeArgsForNonDenyListed(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	loop.SetUnattendedRun(true)
+
+	tool := &mockApprovalTool{
+		name:     "accessibility",
+		safeArgs: func(string) bool { return true }, // read_tree/find/annotate/get_value
+	}
+	decision, approved := loop.checkPermissionAndApproval(context.Background(), "accessibility", `{"action":"read_tree","description":"Read window tree"}`, tool, NewApprovalCache())
+
+	if decision != "allow" || !approved {
+		t.Errorf("unattended safe-args call for non-deny-listed tool should stay approval-free; got (%s, %v)", decision, approved)
+	}
+	if handler.approvalRequested {
+		t.Error("OnApprovalNeeded called for non-deny-listed safe-args tool on unattended run")
+	}
+}
+
 // TestCheckPermissionAndApproval_AttendedStillHonorsAlwaysAllowForComputerUse
 // guards the other side: attended runs keep the normal always-allow UX for
 // computer_use — the unattended gate must not silently merge the two

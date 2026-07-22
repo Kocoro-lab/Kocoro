@@ -788,11 +788,13 @@ type AgentLoop struct {
 	alwaysAllowTools map[string]bool
 	// unattendedRun marks runs with no human approval round-trip (schedule/
 	// cron, heartbeat, watcher, mcp, synchronous HTTP).
-	// checkPermissionAndApproval refuses the persisted always-allow bypass for
-	// tools in DisallowsUnattendedAutoApproval when set, so the request falls
-	// through to OnApprovalNeeded where every unattended handler consults the same
-	// deny-list. Without this, a persisted always-allow entry would skip the
-	// handler entirely and the deny-list would never be reached.
+	// checkPermissionAndApproval refuses both the persisted always-allow
+	// bypass AND the SafeChecker safe-args exemption for tools in
+	// DisallowsUnattendedAutoApproval when set, so the request always falls
+	// through to OnApprovalNeeded where every unattended handler consults the
+	// same deny-list. Without this, a persisted always-allow entry — or an
+	// approval-free observation action like computer_use screenshot — would
+	// skip the handler entirely and the deny-list would never be reached.
 	unattendedRun    bool
 	workingSet       *WorkingSet // session-scoped deferred schema cache injected by the caller
 	sessionID        string      // session ID for audit log correlation
@@ -5271,6 +5273,17 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 		} else if checker, ok := tool.(SafeChecker); ok && checker.IsSafeArgs(argsStr) {
 			needsApproval = false
 		}
+	}
+	// Unattended deny-listed tools must ALWAYS route to the handler — the
+	// SafeChecker exemption above must not clear approval for them either.
+	// ComputerUseTool.IsSafeArgs returns true for its observation actions
+	// (get_app_state/get_value/screenshot/wait); without this, a schedule
+	// could silently screenshot the user's screen with no approval and no
+	// deny, because the handler-side DisallowsUnattendedAutoApproval gate is
+	// only reached via OnApprovalNeeded. Same rationale as the always-allow
+	// skip above; attended runs keep observation actions approval-free.
+	if unattendedDenied {
+		needsApproval = true
 	}
 	if needsApproval {
 		// Check approval cache: if this exact tool+args was already approved

@@ -3106,8 +3106,8 @@ func (h *sseEventHandler) OnCloudPlan(planType, content string, needsReview bool
 func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
 		// daemon.auto_approve=true is a "skip prompts" global, but keep this
-		// routed through the unattended deny-list so a future non-unattended-safe
-		// tool can still force a broker round-trip. Empty as of 2026-05-18.
+		// routed through the unattended deny-list so a non-unattended-safe
+		// tool still forces a broker round-trip. computer_use is currently denied.
 		if !agent.DisallowsUnattendedAutoApproval(tool) {
 			log.Printf("sse: auto-approving %s (auto_approve=true)", tool)
 			return true

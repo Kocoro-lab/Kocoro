@@ -6,7 +6,7 @@ All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format 
 
 ### Changed
 
-- **Stateful macOS computer use** — adds the approval-gated `computer_use` workflow with stale-state protection, explicit screenshots, generic window reopen, tolerant integer argument decoding, bounded delay waits, and visible pointer movement. Unattended sources and auto-approve transports cannot invoke it through persisted or broker-level Always Allow.
+- **Stateful macOS computer use** — adds the approval-gated `computer_use` workflow with stale-state protection, explicit screenshots, generic window reopen, tolerant integer argument decoding, bounded delay waits, and visible pointer movement. Unattended sources and auto-approve transports cannot invoke it at all — approval-free observation actions (including screenshots) are denied alongside mutations, whether reached via persisted/broker-level Always Allow or the observation exemption.
 - **Legacy Accessibility mutations now prompt** — `accessibility` read-only actions remain approval-free, while `click`, `press`, `set_value`, and `scroll` now require a `description` and attended approval. Existing unattended legacy automation remains compatible for this patch.
 
 ## v0.3.4 — 2026-07-16 — Session content search, mobile timeline, resilient file edits & ClawHub browse
