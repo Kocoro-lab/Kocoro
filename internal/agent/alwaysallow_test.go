@@ -73,6 +73,120 @@ func TestCheckPermissionAndApproval_FormerlyHighRiskHonorsAlwaysAllow(t *testing
 	}
 }
 
+// TestCheckPermissionAndApproval_UnattendedSkipsAlwaysAllowForDenyListed
+// pins the 2026-07-22 fix: a persisted always-allow entry for a tool on the
+// unattended deny-list (computer_use) must NOT short-circuit approval on an
+// unattended run. The request has to reach OnApprovalNeeded, where every
+// unattended handler (scheduler/heartbeat/watcher/auto_approve) enforces
+// DisallowsUnattendedAutoApproval. Before the fix, the loop.go bypass
+// returned "allow" before the handler was ever consulted.
+func TestCheckPermissionAndApproval_UnattendedSkipsAlwaysAllowForDenyListed(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	loop.SetAlwaysAllowTools([]string{"computer_use"})
+	loop.SetUnattendedRun(true)
+
+	tool := &mockApprovalTool{name: "computer_use"}
+	// mockHandler.approveResult=false stands in for the unattended handlers'
+	// gate, which returns !DisallowsUnattendedAutoApproval("computer_use") ==
+	// false for exactly this tool.
+	_, approved := loop.checkPermissionAndApproval(context.Background(), "computer_use", `{"action":"click","x":1,"y":1,"description":"Click"}`, tool, NewApprovalCache())
+
+	if approved {
+		t.Error("unattended run auto-approved computer_use via persisted always-allow; deny-list bypassed")
+	}
+	if !handler.approvalRequested {
+		t.Error("approval request never reached the handler's unattended deny-list gate")
+	}
+}
+
+// TestCheckPermissionAndApproval_UnattendedDeniesSafeArgsForDenyListed pins
+// the companion fix to the always-allow gate above: the SafeChecker
+// observation exemption must not clear approval for a deny-listed tool on an
+// unattended run either. ComputerUseTool.IsSafeArgs returns true for
+// get_app_state/get_value/screenshot/wait, so without this gate a schedule
+// could silently screenshot the user's screen with no approval and no
+// handler deny — the exact shape of bypass the always-allow fix closed, one
+// branch lower. No always-allow entry is needed to reproduce it.
+func TestCheckPermissionAndApproval_UnattendedDeniesSafeArgsForDenyListed(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	loop.SetUnattendedRun(true)
+
+	tool := &mockApprovalTool{
+		name:     "computer_use",
+		safeArgs: func(string) bool { return true }, // mirrors ComputerUseTool.IsSafeArgs for observation actions
+	}
+	_, approved := loop.checkPermissionAndApproval(context.Background(), "computer_use", `{"action":"screenshot","description":"Capture the screen"}`, tool, NewApprovalCache())
+
+	if approved {
+		t.Error("unattended run executed a computer_use observation approval-free; SafeChecker bypassed the unattended deny-list")
+	}
+	if !handler.approvalRequested {
+		t.Error("observation call never reached the handler's unattended deny-list gate")
+	}
+}
+
+// TestCheckPermissionAndApproval_UnattendedKeepsSafeArgsForNonDenyListed
+// scopes the gate above to the deny-list: tools NOT on it (legacy
+// accessibility reads in existing unattended schedules) keep their
+// SafeChecker exemption on unattended runs — the fix must not over-block.
+func TestCheckPermissionAndApproval_UnattendedKeepsSafeArgsForNonDenyListed(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	loop.SetUnattendedRun(true)
+
+	tool := &mockApprovalTool{
+		name:     "accessibility",
+		safeArgs: func(string) bool { return true }, // read_tree/find/annotate/get_value
+	}
+	decision, approved := loop.checkPermissionAndApproval(context.Background(), "accessibility", `{"action":"read_tree","description":"Read window tree"}`, tool, NewApprovalCache())
+
+	if decision != "allow" || !approved {
+		t.Errorf("unattended safe-args call for non-deny-listed tool should stay approval-free; got (%s, %v)", decision, approved)
+	}
+	if handler.approvalRequested {
+		t.Error("OnApprovalNeeded called for non-deny-listed safe-args tool on unattended run")
+	}
+}
+
+// TestCheckPermissionAndApproval_AttendedStillHonorsAlwaysAllowForComputerUse
+// guards the other side: attended runs keep the normal always-allow UX for
+// computer_use — the unattended gate must not silently merge the two
+// deny-lists.
+func TestCheckPermissionAndApproval_AttendedStillHonorsAlwaysAllowForComputerUse(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	loop.SetAlwaysAllowTools([]string{"computer_use"})
+	// unattendedRun defaults to false (attended).
+
+	tool := &mockApprovalTool{name: "computer_use"}
+	decision, approved := loop.checkPermissionAndApproval(context.Background(), "computer_use", `{"action":"click","x":1,"y":1,"description":"Click"}`, tool, NewApprovalCache())
+
+	if decision != "allow" || !approved {
+		t.Errorf("attended always-allow for computer_use should bypass approval; got (%s, %v)", decision, approved)
+	}
+	if handler.approvalRequested {
+		t.Error("OnApprovalNeeded called despite attended always-allow bypass")
+	}
+}
+
+// TestCheckPermissionAndApproval_UnattendedKeepsAlwaysAllowForOrdinaryTools
+// verifies the unattended gate is scoped to the deny-list: ordinary tools in
+// always-allow still bypass approval on scheduled runs (the whole point of
+// persisting consent for e.g. file_write in a nightly schedule).
+func TestCheckPermissionAndApproval_UnattendedKeepsAlwaysAllowForOrdinaryTools(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	loop.SetAlwaysAllowTools([]string{"file_write"})
+	loop.SetUnattendedRun(true)
+
+	tool := &mockApprovalTool{name: "file_write"}
+	decision, approved := loop.checkPermissionAndApproval(context.Background(), "file_write", `{}`, tool, NewApprovalCache())
+
+	if decision != "allow" || !approved {
+		t.Errorf("unattended always-allow for ordinary tool should still bypass; got (%s, %v)", decision, approved)
+	}
+	if handler.approvalRequested {
+		t.Error("OnApprovalNeeded called for ordinary always-allowed tool on unattended run")
+	}
+}
+
 func TestCheckPermissionAndApproval_DenyBeatsAlwaysAllow(t *testing.T) {
 	// Construct a permissions config that hard-denies bash `rm -rf /`.
 	// always-allow on "bash" must NOT override this.

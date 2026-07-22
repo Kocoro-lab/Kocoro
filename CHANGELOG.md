@@ -2,6 +2,14 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Changed
+
+- **Stateful macOS computer use** — adds the approval-gated `computer_use` workflow with stale-state protection, explicit screenshots, generic window reopen, tolerant integer argument decoding, bounded delay waits, and visible pointer movement. Unattended sources and auto-approve transports cannot invoke it at all — approval-free observation actions (including screenshots) are denied alongside mutations, whether reached via persisted/broker-level Always Allow or the observation exemption.
+- **`applescript` required-field validation** — `Run()` now rejects a missing/empty `script` or `description` with a `[validation error]` result (loop-detector early-stop preserved) instead of silently executing an empty script, matching the policy already enforced by `computer_use` and `accessibility`.
+- **Legacy Accessibility mutations now prompt** — `accessibility` read-only actions remain approval-free, while `click`, `press`, `set_value`, and `scroll` now require a `description` and attended approval. Existing unattended legacy automation remains compatible for this patch.
+
 ## v0.3.4 — 2026-07-16 — Session content search, mobile timeline, resilient file edits & ClawHub browse
 
 Two new read surfaces plus reliability work. The daemon gains **session-grouped content search** (`GET /search`, behind the desktop ⌘K palette) and a **byte-bounded mobile timeline projection** (`GET /sessions/{id}?view=remote_timeline`). **`file_edit`** stops failing on cosmetic drift (smart quotes, trailing whitespace, CRLF, indentation) via a punctuation/line fuzzy fallback that never widens an exact edit. The **ClawHub** marketplace default view stops surfacing intermittent "registry unreachable" 503s and can hide already-installed skills. Named-agent **default cwd** becomes device-local (never synced), and the **skills `allowed-tools`** contract is completed to be fully fail-closed.

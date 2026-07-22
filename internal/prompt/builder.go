@@ -645,20 +645,26 @@ func macOSAutomationGuidance(toolNames []string) string {
 		return false
 	}
 	var bullets strings.Builder
-	if has("accessibility") {
+	if has("computer_use") {
+		bullets.WriteString("- Prefer `computer_use` for native macOS UI. Start with action=get_app_state, then act with the returned state_id and ref.\n")
+		bullets.WriteString("- Re-observe after a mutation or stale-state error. Request include_screenshot only when pixels are needed; semantic state is the default.\n")
+		bullets.WriteString("- Use coordinate click/move only when the Accessibility tree has no usable ref.\n")
+	} else if has("accessibility") {
 		bullets.WriteString("- Prefer `accessibility` (AX API) over `computer` for UI interactions — faster, no screenshot needed.\n")
 		bullets.WriteString("- After annotate or read_tree, click elements by ref (e.g. ref=\"e14\"). Only use coordinate clicks as a last resort.\n")
 		bullets.WriteString("- Always include the app parameter. Use the exact name as shown in the Dock.\n")
 		bullets.WriteString("- Ensure the target app is frontmost before typing. Use accessibility click on the target field first.\n")
 	}
-	if has("computer") && has("accessibility") {
+	if has("computer") && (has("computer_use") || has("accessibility")) {
 		bullets.WriteString("- Fall back to `computer` only when AX fails or the target is a canvas/web element.\n")
 	}
 	if has("browser") {
-		bullets.WriteString("- For interacting with web page elements, use `browser` (DOM-level access). Use accessibility only for native macOS UI.\n")
+		bullets.WriteString("- For interacting with web page elements, use `browser` (DOM-level access). Use macOS GUI tools only for native app chrome.\n")
 	}
 	if has("wait_for") {
 		bullets.WriteString("- Use `wait_for` to poll for UI state instead of bash sleep.\n")
+	} else if has("computer_use") {
+		bullets.WriteString("- Use computer_use action=wait to poll UI state instead of fixed delays.\n")
 	}
 	if bullets.Len() == 0 {
 		return ""

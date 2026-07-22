@@ -95,7 +95,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 - Method: POST
 - Path: /skills/install/{name}
 - Response: `{"name": "...", "slug": "...", "description": "...", "install_source": "..."}`
-- Notes: Installs from bundled (downloadable) skills. The `{name}` path segment is the skill's slug (always lowercase + hyphens).
+- Notes: Installs from bundled (downloadable) skills. The `{name}` path segment is the skill's slug (always lowercase + hyphens). Bundled skills come from the embedded binary (offline); the proprietary set (docx/pdf/pptx/xlsx) is fetched over HTTP from the upstream Anthropic skills repo (no `git` required). Error matrix: **400** invalid/unknown skill name, **404** not in the upstream Anthropic repo, **409** already installed, **500** otherwise (download/extraction failure).
 
 ### Install a marketplace skill
 - Method: POST

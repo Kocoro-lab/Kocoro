@@ -959,6 +959,21 @@ func TestMacOSAutomationGuidance_AccessibilityOnly(t *testing.T) {
 	}
 }
 
+func TestMacOSAutomationGuidance_ComputerUsePreferred(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin-only guidance")
+	}
+	out := macOSAutomationGuidance([]string{"computer_use", "accessibility", "computer", "browser"})
+	for _, want := range []string{"Prefer `computer_use`", "get_app_state", "state_id", "include_screenshot", "coordinate", "`browser`"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("computer_use guidance missing %q: %s", want, out)
+		}
+	}
+	if strings.Contains(out, "After annotate or read_tree") {
+		t.Fatalf("legacy accessibility workflow should not compete with computer_use: %s", out)
+	}
+}
+
 // TestBuildSystemPrompt_MacOSGuidanceEmitted is an integration-level test
 // for the BuildSystemPrompt → macOSAutomationGuidance path. Catches the
 // regression class where macOSAutomationGuidance reads a stale field that

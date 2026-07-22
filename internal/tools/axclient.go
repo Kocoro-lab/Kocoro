@@ -38,7 +38,7 @@ type AXError struct {
 }
 
 // SharedAXClient returns the process-wide singleton AXClient.
-// Both the tools (accessibility, computer, wait) and daemon permission
+// Both the tools (computer_use, accessibility, computer, wait) and daemon permission
 // endpoints must use the same instance, because the socket server
 // accepts only one client at a time.
 func SharedAXClient() *AXClient {

@@ -487,6 +487,11 @@ type remoteRunEventHandler struct {
 	autoApprove bool
 }
 
+// IsUnattendedRun reports whether this remote run has explicitly disabled its
+// approval round-trip. Source classification independently covers schedules
+// and non-interactive IM channels.
+func (h *remoteRunEventHandler) IsUnattendedRun() bool { return h.autoApprove }
+
 func (h *remoteRunEventHandler) SetSessionID(id string) {
 	h.sessionID = id
 	_ = h.server.sendRemoteRunEvent(RemoteRunEvent{

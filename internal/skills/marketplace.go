@@ -32,9 +32,10 @@ import (
 // deadline.
 var marketplaceDownloadClient = &http.Client{Timeout: 2 * time.Minute}
 
-// runGitCtx is a context-aware variant of runGit from api.go. Lets
-// InstallFromMarketplace cancel in-flight clones when the request
-// context is canceled.
+// runGitCtx runs a git command for the marketplace/ClawHub git transport,
+// canceling the in-flight clone when the request context is canceled. This is
+// the only production git dependency left (third-party git-URL sources); the
+// official-skill install path is git-free (see api.go installFromRepo).
 func runGitCtx(ctx context.Context, dir string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir

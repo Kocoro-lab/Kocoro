@@ -41,6 +41,7 @@ var alwaysDeferTools = map[string]bool{
 	"screenshot":      true,
 	"applescript":     true,
 	"accessibility":   true,
+	"computer_use":    true,
 	"wait_for":        true,
 	"ghostty":         true,
 	"process":         true,

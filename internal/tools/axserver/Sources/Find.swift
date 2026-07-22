@@ -2,9 +2,7 @@ import ApplicationServices
 
 func findElements(pid: Int, query: String?, role: String?, identifier: String?) -> [FindResult] {
     let appRef = AXUIElementCreateApplication(Int32(pid))
-    guard let windows = axValue(appRef, "AXWindows") as? [AXUIElement] else {
-        return []
-    }
+    let windows = axWindows(appRef)
 
     var results: [FindResult] = []
     for (winIdx, window) in windows.enumerated() {

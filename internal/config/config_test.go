@@ -184,6 +184,69 @@ func TestAppendGlobalAlwaysAllowTool_NoConfigFile(t *testing.T) {
 	}
 }
 
+// TestLoad_GlobalPermissionLists guards the whole PermissionsConfig against the
+// missing-mapstructure-tag bug: viper.Unmarshal (the only decode path for the
+// global ~/.shannon/config.yaml) drops any snake_case key whose field lacks a
+// mapstructure tag, so it silently comes back empty on every daemon restart.
+// This is security-relevant for denied_commands, so every list field is checked.
+func TestLoad_GlobalPermissionLists(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	shannonDir := filepath.Join(home, ".shannon")
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		t.Fatalf("mkdir shannon dir: %v", err)
+	}
+	configYAML := `permissions:
+  allowed_dirs:
+    - /tmp/work
+  allowed_commands:
+    - ls
+  denied_commands:
+    - rm
+  sensitive_patterns:
+    - secret
+  network_allowlist:
+    - example.com
+  always_allow_tools:
+    - file_write
+    - bash
+`
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(configYAML), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+
+	checks := []struct {
+		name string
+		got  []string
+		want []string
+	}{
+		{"allowed_dirs", cfg.Permissions.AllowedDirs, []string{"/tmp/work"}},
+		{"allowed_commands", cfg.Permissions.AllowedCommands, []string{"ls"}},
+		{"denied_commands", cfg.Permissions.DeniedCommands, []string{"rm"}},
+		{"sensitive_patterns", cfg.Permissions.SensitivePatterns, []string{"secret"}},
+		{"network_allowlist", cfg.Permissions.NetworkAllowlist, []string{"example.com"}},
+		{"always_allow_tools", cfg.Permissions.AlwaysAllowTools, []string{"file_write", "bash"}},
+	}
+	for _, c := range checks {
+		if len(c.got) != len(c.want) {
+			t.Fatalf("%s = %v, want %v", c.name, c.got, c.want)
+		}
+		for i := range c.want {
+			if c.got[i] != c.want[i] {
+				t.Fatalf("%s = %v, want %v", c.name, c.got, c.want)
+			}
+		}
+	}
+}
+
 func TestRemoveGlobalAlwaysAllowTool(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")

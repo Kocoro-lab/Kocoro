@@ -9,6 +9,7 @@ struct InputDriver {
         switch type {
         case "click":
             let (btn, down, up) = mouseConstants(button)
+            movePointer(to: point)
             for i in 0..<clicks {
                 if let event = CGEvent(mouseEventSource: nil, mouseType: down,
                                        mouseCursorPosition: point, mouseButton: btn) {
@@ -28,14 +29,20 @@ struct InputDriver {
             return (ActionResult(result: "clicked \(button) at (\(Int(x)), \(Int(y))) \(clicks)x"), nil)
 
         case "move":
-            if let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
-                                   mouseCursorPosition: point, mouseButton: .left) {
-                event.post(tap: .cghidEventTap)
-            }
+            movePointer(to: point)
             return (ActionResult(result: "moved to (\(Int(x)), \(Int(y)))"), nil)
 
         default:
             return (nil, ErrorInfo(code: -1, message: "unknown mouse event type: \(type)"))
+        }
+    }
+
+    /// Moves the user's real pointer before a coordinate or semantic click so
+    /// GUI automation stays visible instead of teleporting a hidden event.
+    static func movePointer(to point: CGPoint) {
+        if let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                              mouseCursorPosition: point, mouseButton: .left) {
+            move.post(tap: .cghidEventTap)
         }
     }
 

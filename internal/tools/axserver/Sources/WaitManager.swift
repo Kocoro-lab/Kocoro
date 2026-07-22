@@ -118,15 +118,13 @@ func waitFor(pid: Int, condition: String, value: String?, query: String?, role: 
 
 /// Returns the title of the first window.
 private func windowTitle(appRef: AXUIElement) -> String? {
-    guard let windows = axValue(appRef, "AXWindows") as? [AXUIElement],
-          let win = windows.first else { return nil }
+    guard let win = axWindows(appRef).first else { return nil }
     return axString(win, "AXTitle")
 }
 
 /// Finds the browser URL bar value by looking for AXTextField inside AXToolbar.
 private func browserURL(appRef: AXUIElement) -> String? {
-    guard let windows = axValue(appRef, "AXWindows") as? [AXUIElement],
-          let win = windows.first else { return nil }
+    guard let win = axWindows(appRef).first else { return nil }
 
     // Search for a text field in the toolbar (browser URL bar pattern)
     if let toolbar = findChild(of: win, role: "AXToolbar") {

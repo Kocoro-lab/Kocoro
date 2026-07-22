@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -586,8 +587,22 @@ func TestExtractZipToSkillRejectsSizeCap(t *testing.T) {
 	}
 }
 
+// runGit runs a real git command, used only by tests that build local fixture
+// repositories for the marketplace git-transport (installFromGit). Production
+// skill install no longer shells out to git — the official-skill path fetches
+// the codeload tarball over HTTP (see installFromRepo in api.go).
+func runGit(dir string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // makeFixtureRepo creates a minimal git repository on disk that can be
-// cloned via file:// URLs. Uses the runGit helper from api.go.
+// cloned via file:// URLs. Uses the runGit test helper above.
 func makeFixtureRepo(t *testing.T, skillContent string) string {
 	t.Helper()
 	dir := t.TempDir()

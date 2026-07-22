@@ -463,13 +463,13 @@ When a tool returns no results but IsError is false, distinguish "empty = the an
 Prefer dedicated tools over bash when one fits: file_read (not cat/head/tail), file_edit (not sed/awk), glob (not find — find scans the whole filesystem and can take minutes), grep (not grep/rg), directory_list (not ls), screenshot (not screencapture). Reserve bash for shell-only operations. Tool capabilities and parameters live in the tools[] array — discover them there.
 
 ### GUI & Desktop (macOS)
-- Native macOS UI: accessibility (AX API) is preferred over computer when both work. Pattern: applescript activate → accessibility read_tree → click/press by ref. If read_tree returns "not found", activate the app first with applescript.
-- screenshot only when accessibility is insufficient (canvas/games/custom-drawn UIs) or verification is genuinely needed — never just to confirm a non-GUI operation that already succeeded.
+- Native macOS UI: prefer computer_use when registered. Pattern: get_app_state → act by state_id+ref → re-observe after mutation. Use legacy accessibility only when computer_use is unavailable.
+- Screenshots are explicit evidence/fallback for canvas, custom-drawn UI, or visual verification; do not capture after every successful semantic action.
 - Reminders.app owns the "Scheduled Reminders" calendar — modify those events with "tell application Reminders", not Calendar.
 
 ### Web & Network
 - For any web page interaction (navigate, click, read, screenshot), use browser_* tools. They maintain Chrome session state and work for both public and authenticated sites (x.com, gmail, github, banking). Workflow: browser_navigate → browser_snapshot → browser_click/browser_type by ref → browser_take_screenshot.
-- Do not use bash to open URLs, kill Chrome, or start a local HTTP server. Do not use computer/accessibility/applescript for web pages.
+- Do not use bash to open URLs, kill Chrome, or start a local HTTP server. Do not use computer_use/computer/accessibility/applescript for web pages.
 - Local HTML files: pass ` + "`" + `file:///abs/path.html` + "`" + ` directly to browser_navigate — the daemon proxies it to a loopback URL Chromium can load.
 - http: direct API/webhook calls, not page rendering. web_search and web_fetch (server-side) are preferred for search and page reading — faster than browser_*.
 - Never fabricate page content. If browser_* tools returned empty, an anti-bot block, or errors, report the failure honestly. Do not invent product listings, prices, reviews, or any data not in the actual tool result.
@@ -489,7 +489,7 @@ cloud_delegate runs a task in a remote sandbox. Read cloud_delegate's own descri
 
 ALWAYS LOCAL — never delegate (the cloud sandbox's files are NOT accessible on the user's machine):
 - File read/write/edit, shell, builds, tests, git, running code (use the local bash tool)
-- GUI automation (accessibility, applescript, screenshot, computer), clipboard, notifications, process management
+- GUI automation (computer_use, accessibility, applescript, screenshot, computer), clipboard, notifications, process management
 - Anything needing the user's local filesystem / macOS environment, or any result the user expects to persist locally (downloads, saves, exports)
 If the user says "save", "write", "download", or "create a file", it MUST run locally.
 
@@ -786,6 +786,16 @@ type AgentLoop struct {
 	// checkPermissionAndApproval honors it as an approval bypass — except for
 	// tools listed in DisallowsAutoApproval, which must always prompt.
 	alwaysAllowTools map[string]bool
+	// unattendedRun marks runs with no human approval round-trip (schedule/
+	// cron, heartbeat, watcher, mcp, synchronous HTTP).
+	// checkPermissionAndApproval refuses both the persisted always-allow
+	// bypass AND the SafeChecker safe-args exemption for tools in
+	// DisallowsUnattendedAutoApproval when set, so the request always falls
+	// through to OnApprovalNeeded where every unattended handler consults the
+	// same deny-list. Without this, a persisted always-allow entry — or an
+	// approval-free observation action like computer_use screenshot — would
+	// skip the handler entirely and the deny-list would never be reached.
+	unattendedRun    bool
 	workingSet       *WorkingSet // session-scoped deferred schema cache injected by the caller
 	sessionID        string      // session ID for audit log correlation
 	sessionCWD       string      // session-scoped working directory; set by runner/TUI before Run()
@@ -1898,6 +1908,16 @@ func (a *AgentLoop) SetAlwaysAllowTools(tools []string) {
 		return
 	}
 	a.alwaysAllowTools = m
+}
+
+// SetUnattendedRun marks this run as having no human available to approve
+// (schedule/cron, heartbeat, watcher, mcp, synchronous HTTP). When set, tools in
+// DisallowsUnattendedAutoApproval do not honor the persisted always-allow
+// bypass — the approval request reaches the run's handler, whose unattended
+// auto-approver enforces the same deny-list. Attended runs (Desktop, TUI,
+// IM channels with an approval round-trip) leave this false.
+func (a *AgentLoop) SetUnattendedRun(unattended bool) {
+	a.unattendedRun = unattended
 }
 
 // SpillCleanupFunc returns a closure that removes disk-spilled tool result
@@ -4779,11 +4799,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 		// Skill tool filter: when use_skill is called, update the filter.
 		// - Skill with a non-nil allowed-tools: restrict to those tools
-			//   (+ SkillExempt ones). A present-but-empty list restricts to ZERO
-			//   tools — the empty map below denies every non-exempt call.
+		//   (+ SkillExempt ones). A present-but-empty list restricts to ZERO
+		//   tools — the empty map below denies every non-exempt call.
 		// - Skill with no allowed-tools (nil filter): clear any restriction.
-			// Gate on != nil, NOT len > 0, so an explicit empty allowlist means
-			// "grant nothing" rather than silently "grant everything".
+		// Gate on != nil, NOT len > 0, so an explicit empty allowlist means
+		// "grant nothing" rather than silently "grant everything".
 		for _, ac := range approved {
 			er := execResults[ac.index]
 			if ac.fc.Name == "use_skill" && !er.result.IsError {
@@ -5216,7 +5236,13 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 	// even if a hand-edited config.yaml manages to slip them in — the
 	// persistence helper (agents.AppendAlwaysAllowTool) rejects them too, but
 	// the runtime gate is the last line of defense.
-	if a.alwaysAllowTools[toolName] && !DisallowsAutoApproval(toolName) {
+	// Unattended runs must not ride a persisted always-allow entry past the
+	// unattended deny-list: the bypass below returns before OnApprovalNeeded,
+	// which is where scheduler/heartbeat/watcher/auto-approve handlers enforce
+	// DisallowsUnattendedAutoApproval. Skipping the bypass (not denying) keeps
+	// behavior consistent: the handler applies the same deny-list and refuses.
+	unattendedDenied := a.unattendedRun && DisallowsUnattendedAutoApproval(toolName)
+	if a.alwaysAllowTools[toolName] && !DisallowsAutoApproval(toolName) && !unattendedDenied {
 		// Bash-specific defense: tool-level always-allow MUST NOT bypass the
 		// always-ask gate. Agent-author granted "trust this agent for bash
 		// generally", but `pip install`, `rm -rf`, `git push --force`,
@@ -5247,6 +5273,17 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 		} else if checker, ok := tool.(SafeChecker); ok && checker.IsSafeArgs(argsStr) {
 			needsApproval = false
 		}
+	}
+	// Unattended deny-listed tools must ALWAYS route to the handler — the
+	// SafeChecker exemption above must not clear approval for them either.
+	// ComputerUseTool.IsSafeArgs returns true for its observation actions
+	// (get_app_state/get_value/screenshot/wait); without this, a schedule
+	// could silently screenshot the user's screen with no approval and no
+	// deny, because the handler-side DisallowsUnattendedAutoApproval gate is
+	// only reached via OnApprovalNeeded. Same rationale as the always-allow
+	// skip above; attended runs keep observation actions approval-free.
+	if unattendedDenied {
+		needsApproval = true
 	}
 	if needsApproval {
 		// Check approval cache: if this exact tool+args was already approved

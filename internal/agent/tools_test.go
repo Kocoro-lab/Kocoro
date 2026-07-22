@@ -87,17 +87,22 @@ func TestDisallowsAutoApproval(t *testing.T) {
 }
 
 // TestDisallowsUnattendedAutoApproval pins the unattended gate. As of
-// 2026-05-18 this list is empty — see unattendedAutoApprovalDenyList for
-// the product-decision context. The plumbing (function + call sites in
-// scheduler / heartbeat / watcher / auto_approve handlers) is preserved
-// so a future tool can be added without rewiring callers.
+// 2026-07-22 the list contains exactly computer_use — an unattended
+// schedule/heartbeat/watcher run must never invoke computer_use on the
+// strength of an attended always-allow click or a blanket auto_approve. See
+// unattendedAutoApprovalDenyList for the full rationale,
+// including why the legacy GUI tools are deliberately NOT listed.
 //
 // If you add an entry, also enumerate the tools you expect to remain off
 // the list so accidental over-broad deny-listing (which would break
 // scheduled runs of ordinary agents) gets caught.
 func TestDisallowsUnattendedAutoApproval(t *testing.T) {
-	if got := UnattendedAutoApprovalDenyList(); len(got) != 0 {
-		t.Fatalf("unattendedAutoApprovalDenyList expected empty, got %v", got)
+	got := UnattendedAutoApprovalDenyList()
+	if len(got) != 1 || got[0] != "computer_use" {
+		t.Fatalf("unattendedAutoApprovalDenyList expected [computer_use], got %v", got)
+	}
+	if !DisallowsUnattendedAutoApproval("computer_use") {
+		t.Fatal("computer_use must be refused unattended auto-approval")
 	}
 	// Ordinary tools and the three formerly-deny-listed tools should ALL
 	// return false. The formerly-deny-listed trio is enumerated explicitly

@@ -2891,6 +2891,12 @@ type httpEventHandler struct {
 	usage agent.UsageAccumulator
 }
 
+// IsUnattendedRun reports that synchronous HTTP has no approval broker. Its
+// OnApprovalNeeded implementation can only auto-approve or deny, so the agent
+// loop must not honor persisted Always Allow for unattended-deny-listed tools
+// before that handler gets a chance to apply its gate.
+func (h *httpEventHandler) IsUnattendedRun() bool { return true }
+
 // Usage returns the cumulative usage collected during this handler's lifetime.
 func (h *httpEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
 
@@ -2913,7 +2919,7 @@ func (h *httpEventHandler) OnCloudPlan(planType, content string, needsReview boo
 
 // OnApprovalNeeded auto-approves for local HTTP API calls except for tools on
 // the unattended deny-list. HTTP callers are often scripts / automation, so the
-// path stays aligned with scheduled runs. The list is empty as of 2026-05-18.
+// path stays aligned with scheduled runs. computer_use is currently denied.
 func (h *httpEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	return !agent.DisallowsUnattendedAutoApproval(tool)
 }
@@ -2948,6 +2954,10 @@ type sseEventHandler struct {
 	sessionID string
 	usage     agent.UsageAccumulator
 }
+
+// IsUnattendedRun reports whether this SSE request blanket-auto-approves tool
+// prompts instead of waiting for an interactive broker decision.
+func (h *sseEventHandler) IsUnattendedRun() bool { return h.autoApprove }
 
 // SetSessionID captures the resolved session ID. Called by RunAgent's
 // multiHandler interface-assertion path (see runner.go SetSessionID injection).
@@ -3096,8 +3106,8 @@ func (h *sseEventHandler) OnCloudPlan(planType, content string, needsReview bool
 func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
 		// daemon.auto_approve=true is a "skip prompts" global, but keep this
-		// routed through the unattended deny-list so a future non-unattended-safe
-		// tool can still force a broker round-trip. Empty as of 2026-05-18.
+		// routed through the unattended deny-list so a non-unattended-safe
+		// tool still forces a broker round-trip. computer_use is currently denied.
 		if !agent.DisallowsUnattendedAutoApproval(tool) {
 			log.Printf("sse: auto-approving %s (auto_approve=true)", tool)
 			return true
@@ -5221,10 +5231,18 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := skills.InstallSkillFromRepo(s.deps.ShannonDir, name); err != nil {
+	if err := skills.InstallSkillFromRepo(r.Context(), s.deps.ShannonDir, name); err != nil {
 		if strings.Contains(err.Error(), "already installed") {
 			s.auditHTTPOpError("POST", endpoint, "already installed", err)
 			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		// Deterministic "not in the upstream Anthropic repo" is a 404, not an
+		// internal error — the download/extraction succeeded, the skill just
+		// isn't there. Everything else (network, extraction) stays a 500.
+		if errors.Is(err, skills.ErrSkillNotInRepo) {
+			s.auditHTTPOpError("POST", endpoint, "not in upstream repo", err)
+			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
 		s.auditHTTPOpError("POST", endpoint, "install failed", err)

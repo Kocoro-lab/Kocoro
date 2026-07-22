@@ -11,11 +11,11 @@ import (
 
 // PermissionsConfig defines user-configurable permission rules.
 type PermissionsConfig struct {
-	AllowedDirs       []string `yaml:"allowed_dirs"        json:"allowed_dirs"`
-	AllowedCommands   []string `yaml:"allowed_commands"    json:"allowed_commands"`
-	DeniedCommands    []string `yaml:"denied_commands"     json:"denied_commands"`
-	SensitivePatterns []string `yaml:"sensitive_patterns"  json:"sensitive_patterns"`
-	NetworkAllowlist  []string `yaml:"network_allowlist"   json:"network_allowlist"`
+	AllowedDirs       []string `mapstructure:"allowed_dirs"       yaml:"allowed_dirs"        json:"allowed_dirs"`
+	AllowedCommands   []string `mapstructure:"allowed_commands"   yaml:"allowed_commands"    json:"allowed_commands"`
+	DeniedCommands    []string `mapstructure:"denied_commands"    yaml:"denied_commands"     json:"denied_commands"`
+	SensitivePatterns []string `mapstructure:"sensitive_patterns" yaml:"sensitive_patterns"  json:"sensitive_patterns"`
+	NetworkAllowlist  []string `mapstructure:"network_allowlist"  yaml:"network_allowlist"   json:"network_allowlist"`
 	// AlwaysAllowTools is the GLOBAL tool-level approval bypass — applies to
 	// every agent (including the default agent that has no per-agent
 	// config.yaml). Mirrors agents.AgentPermissionsConfig.AlwaysAllowTools
@@ -23,7 +23,7 @@ type PermissionsConfig struct {
 	// runner/TUI/CLI before being injected into AgentLoop. High-risk tools
 	// (agent.DisallowsAutoApproval) and always-ask bash commands are still
 	// blocked by independent gates regardless of what's in this list.
-	AlwaysAllowTools []string `yaml:"always_allow_tools,omitempty" json:"always_allow_tools,omitempty"`
+	AlwaysAllowTools []string `mapstructure:"always_allow_tools" yaml:"always_allow_tools,omitempty" json:"always_allow_tools,omitempty"`
 }
 
 // prefixDepthTable maps known executables to the number of leading non-flag
