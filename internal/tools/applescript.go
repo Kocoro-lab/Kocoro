@@ -41,7 +41,13 @@ func (t *AppleScriptTool) Run(ctx context.Context, argsJSON string) (agent.ToolR
 	}
 	var args appleScriptArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Script) == "" {
+		return agent.ValidationError("missing required parameter: script"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("missing required parameter: description"), nil
 	}
 
 	// Share the process-wide GUI-operation lock with computer_use: osascript
