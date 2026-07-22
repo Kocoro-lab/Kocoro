@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
@@ -92,12 +93,12 @@ func TestRunAgent_NamedAgentMCPScope_ExcludesUnselectedServer(t *testing.T) {
 // not bypass that gate. Interactive and IM sources stay attended — approvals
 // round-trip to a human.
 func TestIsUnattendedSource(t *testing.T) {
-	for _, source := range []string{"schedule", "cron", "heartbeat", "watcher", "mcp", " Schedule "} {
+	for _, source := range []string{"schedule", "cron", "heartbeat", "watcher", "mcp", " Schedule ", "wechat", "wecom", "discord", "telegram", "koe"} {
 		if !isUnattendedSource(source) {
 			t.Errorf("isUnattendedSource(%q) = false, want true", source)
 		}
 	}
-	for _, source := range []string{"", "local", "tui", "desktop", "ios_remote", "web", "webview", "slack", "line", "feishu", "telegram", "webhook", "koe"} {
+	for _, source := range []string{"", "local", "tui", "desktop", "ios_remote", "web", "webview", "slack", "line", "feishu", "lark", "teams", "webhook"} {
 		if isUnattendedSource(source) {
 			t.Errorf("isUnattendedSource(%q) = true, want false", source)
 		}
@@ -113,6 +114,22 @@ func TestIsUnattendedRun_IncludesTransportWithoutApprovalRoundTrip(t *testing.T)
 	}
 	if !isUnattendedRun("schedule", nullEventHandler{}) {
 		t.Fatal("unattended source must remain sufficient regardless of handler")
+	}
+	for _, tc := range []struct {
+		name    string
+		handler agent.EventHandler
+		want    bool
+	}{
+		{"remote auto-approve", &remoteRunEventHandler{autoApprove: true}, true},
+		{"remote broker round-trip", &remoteRunEventHandler{autoApprove: false}, false},
+		{"sse auto-approve", &sseEventHandler{autoApprove: true}, true},
+		{"sse broker round-trip", &sseEventHandler{autoApprove: false}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isUnattendedRun("desktop", tc.handler); got != tc.want {
+				t.Fatalf("isUnattendedRun(desktop, %s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
 	}
 }
 

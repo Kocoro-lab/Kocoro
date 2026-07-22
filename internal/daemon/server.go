@@ -2919,7 +2919,7 @@ func (h *httpEventHandler) OnCloudPlan(planType, content string, needsReview boo
 
 // OnApprovalNeeded auto-approves for local HTTP API calls except for tools on
 // the unattended deny-list. HTTP callers are often scripts / automation, so the
-// path stays aligned with scheduled runs. The list is empty as of 2026-05-18.
+// path stays aligned with scheduled runs. computer_use is currently denied.
 func (h *httpEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	return !agent.DisallowsUnattendedAutoApproval(tool)
 }
@@ -2954,6 +2954,10 @@ type sseEventHandler struct {
 	sessionID string
 	usage     agent.UsageAccumulator
 }
+
+// IsUnattendedRun reports whether this SSE request blanket-auto-approves tool
+// prompts instead of waiting for an interactive broker decision.
+func (h *sseEventHandler) IsUnattendedRun() bool { return h.autoApprove }
 
 // SetSessionID captures the resolved session ID. Called by RunAgent's
 // multiHandler interface-assertion path (see runner.go SetSessionID injection).

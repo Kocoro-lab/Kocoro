@@ -4,12 +4,17 @@ struct FocusManager {
     /// Launches an installed app by display name and activates it once the
     /// process becomes visible to NSWorkspace.
     static func launchApp(appName: String) -> (ActionResult?, ErrorInfo?) {
-        if let running = findApp(named: appName) {
-            running.activate()
+        if let running = resolveRunningApplication(appName: appName) {
+            guard activateAndExposeWindow(running, timeout: 2) else {
+                return (nil, ErrorInfo(code: -1, message: "App '\(appName)' is running but did not expose a window after a reopen request"))
+            }
             let pid = Int(running.processIdentifier)
             return (ActionResult(result: "focused already-running \(appName) (pid \(pid))"), nil)
         }
 
+        // This name-based API is deprecated, but it remains the only general
+        // launch-by-display-name API. Once the process exists, all activation
+        // and reopen work below uses the modern URL/configuration path.
         guard NSWorkspace.shared.launchApplication(appName) else {
             return (nil, ErrorInfo(code: -1, message: "App '\(appName)' is not installed or could not be launched"))
         }
@@ -21,8 +26,10 @@ struct FocusManager {
         // retrying launch_app after the app finishes its own startup work.
         let deadline = Date().addingTimeInterval(10)
         while Date() < deadline {
-            if let launched = findApp(named: appName) {
-                launched.activate()
+            if let launched = resolveRunningApplication(appName: appName) {
+                guard activateAndExposeWindow(launched, timeout: max(0.1, deadline.timeIntervalSinceNow)) else {
+                    return (nil, ErrorInfo(code: -1, message: "App '\(appName)' launched but did not expose a window"))
+                }
                 let pid = Int(launched.processIdentifier)
                 return (ActionResult(result: "launched \(appName) (pid \(pid))"), nil)
             }
@@ -33,11 +40,25 @@ struct FocusManager {
 
     /// Activates an app by name, optionally verifying focus.
     static func focusApp(appName: String, windowTitle: String?, verify: Bool) -> (ActionResult?, ErrorInfo?) {
-        guard let app = findApp(named: appName) else {
+        guard let app = resolveRunningApplication(appName: appName) else {
             return (nil, ErrorInfo(code: -1, message: "App '\(appName)' not found or not running"))
         }
 
-        app.activate()
+        guard activateAndExposeWindow(app, timeout: 2) else {
+            return (nil, ErrorInfo(code: -1, message: "App '\(appName)' is running but did not expose a window after a reopen request"))
+        }
+
+        if let requestedTitle = windowTitle, !requestedTitle.isEmpty {
+            let appRef = AXUIElementCreateApplication(app.processIdentifier)
+            let windows = axWindows(appRef)
+            guard let requestedWindow = windows.first(where: {
+                (axString($0, "AXTitle") ?? "").localizedCaseInsensitiveContains(requestedTitle)
+            }) else {
+                return (nil, ErrorInfo(code: -1, message: "No window containing '\(requestedTitle)' found in '\(appName)'"))
+            }
+            AXUIElementSetAttributeValue(requestedWindow, "AXMinimized" as CFString, false as CFTypeRef)
+            AXUIElementPerformAction(requestedWindow, "AXRaise" as CFString)
+        }
 
         if verify {
             // Brief wait for activation
@@ -63,8 +84,7 @@ struct FocusManager {
         // Get window title via AX
         let appRef = AXUIElementCreateApplication(Int32(pid))
         var windowTitle = ""
-        if let windows = axValue(appRef, "AXWindows") as? [AXUIElement],
-           let win = windows.first {
+        if let win = axWindows(appRef).first {
             windowTitle = axString(win, "AXTitle") ?? ""
         }
 
@@ -80,9 +100,7 @@ struct FocusManager {
     /// Lists all windows for an app.
     static func listWindows(pid: Int) -> [[String: String]] {
         let appRef = AXUIElementCreateApplication(Int32(pid))
-        guard let windows = axValue(appRef, "AXWindows") as? [AXUIElement] else {
-            return []
-        }
+        let windows = axWindows(appRef)
         var result: [[String: String]] = []
         for (i, win) in windows.enumerated() {
             let title = axString(win, "AXTitle") ?? ""
@@ -92,16 +110,37 @@ struct FocusManager {
         return result
     }
 
-    private static func findApp(named name: String) -> NSRunningApplication? {
-        let lower = name.lowercased()
-        for app in NSWorkspace.shared.runningApplications {
-            if let n = app.localizedName, n.lowercased() == lower {
-                return app
-            }
-            if let bundleID = app.bundleIdentifier, bundleID.lowercased().contains(lower) {
-                return app
-            }
+    /// Activates every existing window, or asks LaunchServices to reopen a
+    /// window when the app is alive but windowless. This is app-agnostic and
+    /// mirrors clicking an app's Dock icon without sending Apple Events (and
+    /// therefore without introducing an Automation-TCC dependency).
+    private static func activateAndExposeWindow(_ app: NSRunningApplication, timeout: TimeInterval) -> Bool {
+        app.unhide()
+        _ = app.activate(options: [.activateAllWindows])
+
+        if hasWindow(app) {
+            return true
         }
-        return nil
+
+        if let bundleURL = app.bundleURL {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration) { _, _ in }
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if hasWindow(app) {
+                _ = app.activate(options: [.activateAllWindows])
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return false
+    }
+
+    private static func hasWindow(_ app: NSRunningApplication) -> Bool {
+        let appRef = AXUIElementCreateApplication(app.processIdentifier)
+        return !axWindows(appRef).isEmpty
     }
 }

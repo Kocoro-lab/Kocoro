@@ -41,6 +41,24 @@ func TestApprovalBroker_NonInteractiveChannelAutoApproves(t *testing.T) {
 	}
 }
 
+func TestApprovalBroker_NonInteractiveDenyListBeatsBrokerAlwaysAllow(t *testing.T) {
+	sent := false
+	broker := NewApprovalBroker(func(req ApprovalRequest) error { sent = true; return nil })
+	broker.SetToolAutoApprove("computer_use")
+	if !broker.IsToolAutoApproved("computer_use") {
+		t.Fatal("test setup: attended broker Always Allow was not recorded")
+	}
+
+	decision := broker.Request(context.Background(),
+		ApprovalRequestMeta{Source: ChannelWeChat}, "computer_use", `{"action":"click","x":1,"y":1}`)
+	if decision != DecisionDeny {
+		t.Fatalf("non-interactive computer_use bypassed unattended gate via broker Always Allow: %v", decision)
+	}
+	if sent {
+		t.Error("deny-listed non-interactive request must fail closed without an impossible approval round-trip")
+	}
+}
+
 // A destructive always-ask bash from a non-interactive channel IS auto-approved
 // (there is no one to prompt). This is the accepted "全部放行" trade-off — pin it
 // explicitly so the security posture is intentional, not emergent — and assert

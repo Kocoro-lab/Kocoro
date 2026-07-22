@@ -162,6 +162,7 @@ func TestComputerUse_ValidationErrors(t *testing.T) {
 		want string
 	}{
 		{"invalid JSON", `not-json`, "invalid arguments"},
+		{"invalid numeric string", `{"action":"click","x":"left","y":"20","description":"Click control"}`, "expected an integer or decimal integer string"},
 		{"missing action", `{"description":"Inspect app"}`, "missing required parameter: action"},
 		{"missing description", `{"action":"get_app_state"}`, "missing required parameter: description"},
 		{"unknown action", `{"action":"fly","description":"Fly app"}`, "unknown action"},
@@ -337,6 +338,7 @@ func TestComputerUse_CoordinateAndKeyboardDispatch(t *testing.T) {
 		method string
 	}{
 		{"coordinate click", `{"action":"click","x":120,"y":240,"button":"right","clicks":2,"description":"Open context menu"}`, "mouse_event"},
+		{"string coordinate click", `{"action":"click","x":"120","y":"240","clicks":"1","description":"Open control"}`, "mouse_event"},
 		{"move", `{"action":"move","x":12,"y":24,"description":"Move pointer"}`, "mouse_event"},
 		{"type", `{"action":"type","text":"hello","description":"Type greeting"}`, "type_text"},
 		{"hotkey", `{"action":"hotkey","keys":"command+shift+p","description":"Open command palette"}`, "key_event"},
@@ -359,6 +361,24 @@ func TestComputerUse_CoordinateAndKeyboardDispatch(t *testing.T) {
 				t.Fatalf("AX calls = %+v, want one %s", fake.calls, tc.method)
 			}
 		})
+	}
+}
+
+func TestComputerUse_WaitAcceptsBoundedDelayWithoutCondition(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("computer_use runtime is macOS-only")
+	}
+	tool := newTestComputerUse(newFakeAXCaller())
+	started := time.Now()
+	result, err := tool.Run(context.Background(), `{"action":"wait","timeout":0.01,"description":"Let the UI settle"}`)
+	if err != nil || result.IsError {
+		t.Fatalf("Run result=%+v err=%v", result, err)
+	}
+	if elapsed := time.Since(started); elapsed < 8*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("wait elapsed %v, want a short bounded delay", elapsed)
+	}
+	if !strings.Contains(result.Content, "waited") {
+		t.Fatalf("wait result missing completion message: %q", result.Content)
 	}
 }
 

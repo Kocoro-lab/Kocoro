@@ -56,9 +56,9 @@ type ApprovalBroker struct {
 	toolAutoApprove map[string]bool // in-memory only, non-bash "always allow"
 	sendFn          func(req ApprovalRequest) error
 	onRequest       func(req ApprovalRequest)
-	onCleanup       func(requestID string) // daemon-originated terminal paths (timeout/ctx/CancelAll)
-	onRegister      func(requestID string) // called when a pending entry is created
-	onDeregister    func(requestID string) // called when a pending entry is cleaned up
+	onCleanup       func(requestID string)                      // daemon-originated terminal paths (timeout/ctx/CancelAll)
+	onRegister      func(requestID string)                      // called when a pending entry is created
+	onDeregister    func(requestID string)                      // called when a pending entry is cleaned up
 	onAutoApprove   func(meta ApprovalRequestMeta, tool string) // called when a tool is auto-approved without prompting
 }
 
@@ -105,6 +105,16 @@ func (b *ApprovalBroker) SetOnAutoApprove(fn func(meta ApprovalRequestMeta, tool
 // only from non-channel-routed paths (e.g. the local SSE dev server, where
 // there is no Cloud claim and the approval flow stays in-process).
 func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, tool, args string) ApprovalDecision {
+	// A non-interactive channel has no human approval round-trip. Apply the
+	// unattended deny-list before the broker's in-memory Always Allow cache:
+	// otherwise an approval remembered from an earlier attended request could
+	// silently authorize computer_use on WeChat/voice/etc.
+	nonInteractive := IsNonInteractiveApprovalChannel(meta.Source)
+	if nonInteractive && agentpkg.DisallowsUnattendedAutoApproval(tool) {
+		log.Printf("approval: denying tool %q for non-interactive channel %q (disallows unattended auto-approval, no approval UI)", tool, meta.Source)
+		return DecisionDeny
+	}
+
 	if b.IsToolAutoApproved(tool) {
 		return DecisionAllow
 	}
@@ -116,18 +126,13 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 	// agent can act. Hard-blocked/denied tools are already rejected upstream by
 	// the permission engine before reaching the broker; only "ask" prompts land
 	// here. See IsNonInteractiveApprovalChannel for the channel classification.
-	if IsNonInteractiveApprovalChannel(meta.Source) {
+	if nonInteractive {
 		// Route through the SAME unattended-approval gate as the remote-run
 		// auto_approve path (remote_run.go OnApprovalNeeded), so the two paths stay
 		// consistent: a tool on the DisallowsUnattendedAutoApproval denylist (e.g.
 		// account deletion, payment auth) must never be blanket-approved just
-		// because it arrived from a UI-less channel. The denylist is empty today,
-		// so every current tool is still auto-approved; a denied one fails safe
-		// (deny immediately rather than stall until ApprovalTimeout).
-		if agentpkg.DisallowsUnattendedAutoApproval(tool) {
-			log.Printf("approval: denying tool %q for non-interactive channel %q (disallows unattended auto-approval, no approval UI)", tool, meta.Source)
-			return DecisionDeny
-		}
+		// because it arrived from a UI-less channel. A denied tool fails safe
+		// immediately rather than stalling until ApprovalTimeout.
 		log.Printf("approval: auto-approving tool %q for non-interactive channel %q (no approval UI)", tool, meta.Source)
 		// Emit an observability notice: auto-approval bypasses the normal
 		// approval_request flow, so this is the only controller-visible record

@@ -21,12 +21,25 @@ func axChildren(_ el: AXUIElement) -> [AXUIElement]? {
     axValue(el, "AXChildren") as? [AXUIElement]
 }
 
+/// Returns an app's AX windows with conservative fallbacks for frameworks
+/// that omit AXWindows while still exposing AXFocusedWindow or window-role
+/// children. Every caller uses the same ordering so generated ref paths remain
+/// stable between observation and stale-state preflight.
+func axWindows(_ appRef: AXUIElement) -> [AXUIElement] {
+    if let windows = axValue(appRef, "AXWindows") as? [AXUIElement], !windows.isEmpty {
+        return windows
+    }
+    if let focused = axValue(appRef, "AXFocusedWindow"),
+       CFGetTypeID(focused) == AXUIElementGetTypeID() {
+        return [focused as! AXUIElement]
+    }
+    return (axChildren(appRef) ?? []).filter { axString($0, "AXRole") == "AXWindow" }
+}
+
 /// Resolves an element by path (e.g. "window[0]/AXButton[2]/AXStaticText[0]").
 func resolveElement(pid: Int, path: String) -> AXUIElement? {
     let appRef = AXUIElementCreateApplication(Int32(pid))
-    guard let windows = axValue(appRef, "AXWindows") as? [AXUIElement] else {
-        return nil
-    }
+    let windows = axWindows(appRef)
 
     let allParts = path.split(separator: "/")
     guard !allParts.isEmpty else { return nil }
@@ -38,7 +51,7 @@ func resolveElement(pid: Int, path: String) -> AXUIElement? {
        let bracketEnd = winPart.firstIndex(of: "]") {
         winIndex = Int(winPart[winPart.index(after: bracketStart)..<bracketEnd]) ?? 0
     }
-    guard winIndex < windows.count else { return nil }
+    guard winIndex >= 0 && winIndex < windows.count else { return nil }
 
     let parts = allParts.dropFirst()
     var current: AXUIElement = windows[winIndex]
@@ -108,15 +121,13 @@ func currentContext(pid: Int) -> AppContext {
     }
 
     var windowTitle = ""
-    if let windows = axValue(appRef, "AXWindows") as? [AXUIElement],
-       let win = windows.first {
+    if let win = axWindows(appRef).first {
         windowTitle = axString(win, "AXTitle") ?? ""
     }
 
     // Check for browser URL
     var url: String? = nil
-    if let windows = axValue(appRef, "AXWindows") as? [AXUIElement],
-       let win = windows.first {
+    if let win = axWindows(appRef).first {
         if let toolbar = findToolbarChild(of: win) {
             if let urlField = findToolbarURLField(in: toolbar) {
                 if let val = axValue(urlField, "AXValue") {
@@ -176,18 +187,31 @@ private func findToolbarURLField(in el: AXUIElement) -> AXUIElement? {
     return nil
 }
 
+/// Resolves a user-facing app name or bundle identifier to the main running
+/// application. Matching stays exact so a main app cannot resolve to a
+/// similarly named renderer/helper process that has no AX windows.
+func resolveRunningApplication(appName: String) -> NSRunningApplication? {
+    let requested = appName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !requested.isEmpty else { return nil }
+
+    let applications = NSWorkspace.shared.runningApplications.filter { !$0.isTerminated }
+    if let exactName = applications.first(where: { $0.localizedName?.lowercased() == requested }) {
+        return exactName
+    }
+    if let exactBundleID = applications.first(where: { $0.bundleIdentifier?.lowercased() == requested }) {
+        return exactBundleID
+    }
+    return applications.first { app in
+        app.bundleIdentifier?.split(separator: ".").last?.lowercased() == requested
+    }
+}
+
 /// Resolves an app name to its PID via NSWorkspace.
 /// Retries up to 3 times with short delays for apps that just launched.
 func resolvePID(appName: String) -> Int? {
     for attempt in 0..<3 {
-        for app in NSWorkspace.shared.runningApplications {
-            if let name = app.localizedName, name.lowercased() == appName.lowercased() {
-                return Int(app.processIdentifier)
-            }
-            if let bundleName = app.bundleIdentifier?.split(separator: ".").last,
-               bundleName.lowercased() == appName.lowercased() {
-                return Int(app.processIdentifier)
-            }
+        if let app = resolveRunningApplication(appName: appName) {
+            return Int(app.processIdentifier)
         }
         if attempt < 2 {
             Thread.sleep(forTimeInterval: 0.5)

@@ -395,9 +395,8 @@ func (h *scheduleHandler) OnCloudProgress(completed, total int)                 
 func (h *scheduleHandler) OnCloudPlan(planType, content string, needsReview bool) {}
 
 // OnApprovalNeeded gates auto-approval for scheduled (unattended) runs through
-// the unattended deny-list. The list is empty as of 2026-05-18, but the call
-// site stays explicit so a future non-unattended-safe tool can be blocked here
-// without rewriting scheduler approval flow.
+// the unattended deny-list. computer_use is currently blocked here; keeping
+// this call site explicit prevents handler policy from drifting.
 func (h *scheduleHandler) OnApprovalNeeded(tool string, args string) bool {
 	return !agent.DisallowsUnattendedAutoApproval(tool)
 }

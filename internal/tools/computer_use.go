@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
@@ -42,30 +44,54 @@ type computerUseSnapshot struct {
 	signatures map[string]string
 }
 
+// computerUseInt accepts both a JSON integer and its decimal string form.
+// Tool schemas still advertise integers, but model providers occasionally
+// serialize coordinates as "154". Treating that harmless representation
+// difference as a hard validation failure causes expensive identical retries.
+type computerUseInt int
+
+func (v *computerUseInt) UnmarshalJSON(data []byte) error {
+	var integer int
+	if err := json.Unmarshal(data, &integer); err == nil {
+		*v = computerUseInt(integer)
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return fmt.Errorf("expected an integer or decimal integer string")
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(text))
+	if err != nil {
+		return fmt.Errorf("expected an integer or decimal integer string")
+	}
+	*v = computerUseInt(parsed)
+	return nil
+}
+
 type computerUseArgs struct {
-	Action            string  `json:"action"`
-	Description       string  `json:"description"`
-	StateID           string  `json:"state_id,omitempty"`
-	App               string  `json:"app,omitempty"`
-	Window            string  `json:"window,omitempty"`
-	Ref               string  `json:"ref,omitempty"`
-	Value             *string `json:"value,omitempty"`
-	X                 *int    `json:"x,omitempty"`
-	Y                 *int    `json:"y,omitempty"`
-	Text              *string `json:"text,omitempty"`
-	Keys              string  `json:"keys,omitempty"`
-	Button            string  `json:"button,omitempty"`
-	Clicks            int     `json:"clicks,omitempty"`
-	DX                int     `json:"dx,omitempty"`
-	DY                int     `json:"dy,omitempty"`
-	Condition         string  `json:"condition,omitempty"`
-	Query             string  `json:"query,omitempty"`
-	Role              string  `json:"role,omitempty"`
-	Timeout           float64 `json:"timeout,omitempty"`
-	Interval          float64 `json:"interval,omitempty"`
-	Filter            string  `json:"filter,omitempty"`
-	SemanticBudget    int     `json:"semantic_budget,omitempty"`
-	IncludeScreenshot bool    `json:"include_screenshot,omitempty"`
+	Action            string          `json:"action"`
+	Description       string          `json:"description"`
+	StateID           string          `json:"state_id,omitempty"`
+	App               string          `json:"app,omitempty"`
+	Window            string          `json:"window,omitempty"`
+	Ref               string          `json:"ref,omitempty"`
+	Value             *string         `json:"value,omitempty"`
+	X                 *computerUseInt `json:"x,omitempty"`
+	Y                 *computerUseInt `json:"y,omitempty"`
+	Text              *string         `json:"text,omitempty"`
+	Keys              string          `json:"keys,omitempty"`
+	Button            string          `json:"button,omitempty"`
+	Clicks            computerUseInt  `json:"clicks,omitempty"`
+	DX                computerUseInt  `json:"dx,omitempty"`
+	DY                computerUseInt  `json:"dy,omitempty"`
+	Condition         string          `json:"condition,omitempty"`
+	Query             string          `json:"query,omitempty"`
+	Role              string          `json:"role,omitempty"`
+	Timeout           float64         `json:"timeout,omitempty"`
+	Interval          float64         `json:"interval,omitempty"`
+	Filter            string          `json:"filter,omitempty"`
+	SemanticBudget    computerUseInt  `json:"semantic_budget,omitempty"`
+	IncludeScreenshot bool            `json:"include_screenshot,omitempty"`
 }
 
 // ComputerUseTool is the provider-neutral macOS GUI tool. It deliberately
@@ -100,7 +126,7 @@ func (t *ComputerUseTool) Info() agent.ToolInfo {
 		Name: "computer_use",
 		Description: "Observe and operate native macOS apps through one stateful Accessibility-first workflow. " +
 			"Start with get_app_state, then use its state_id and element refs. Screenshots are opt-in; use coordinates only when semantic refs are unavailable. " +
-			"Use browser tools for web-page DOM interactions." + agent.DescriptionGuidance,
+			"Pointer actions visibly move the real cursor. Use browser tools for web-page DOM interactions." + agent.DescriptionGuidance,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -119,7 +145,7 @@ func (t *ComputerUseTool) Info() agent.ToolInfo {
 				"clicks":             map[string]any{"type": "integer", "description": "Click count (default 1)"},
 				"dx":                 map[string]any{"type": "integer", "description": "Horizontal scroll amount in pixels"},
 				"dy":                 map[string]any{"type": "integer", "description": "Vertical scroll amount in pixels; positive is down"},
-				"condition":          map[string]any{"type": "string", "description": "Wait condition: elementExists, elementGone, titleContains, urlContains, titleChanged, urlChanged"},
+				"condition":          map[string]any{"type": "string", "description": "Optional wait condition: elementExists, elementGone, titleContains, urlContains, titleChanged, urlChanged; omit with timeout for a simple bounded delay"},
 				"query":              map[string]any{"type": "string", "description": "Element text query for wait"},
 				"role":               map[string]any{"type": "string", "description": "AX role filter for wait"},
 				"timeout":            map[string]any{"type": "number", "description": "Wait timeout seconds (default 10)"},
@@ -348,7 +374,7 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 	if filter == "" {
 		filter = "interactive"
 	}
-	budget := args.SemanticBudget
+	budget := int(args.SemanticBudget)
 	if budget <= 0 {
 		budget = 25
 	}
@@ -510,7 +536,7 @@ func (t *ComputerUseTool) click(ctx context.Context, args computerUseArgs) (agen
 	if args.X == nil || args.Y == nil {
 		return agent.ValidationError("click requires either ref+state_id or x+y coordinates"), nil
 	}
-	x, y := t.scaleXY(*args.X, *args.Y)
+	x, y := t.scaleXY(int(*args.X), int(*args.Y))
 	button := args.Button
 	if button == "" {
 		button = "left"
@@ -518,7 +544,7 @@ func (t *ComputerUseTool) click(ctx context.Context, args computerUseArgs) (agen
 	if button != "left" && button != "right" {
 		return agent.ValidationError("button must be 'left' or 'right'"), nil
 	}
-	clicks := args.Clicks
+	clicks := int(args.Clicks)
 	if clicks <= 0 {
 		clicks = 1
 	}
@@ -540,7 +566,7 @@ func (t *ComputerUseTool) scroll(ctx context.Context, args computerUseArgs) (age
 	if !ok {
 		return failure, nil
 	}
-	params := map[string]any{"dx": args.DX, "dy": args.DY}
+	params := map[string]any{"dx": int(args.DX), "dy": int(args.DY)}
 	if pid > 0 {
 		params["pid"] = pid
 	}
@@ -613,7 +639,7 @@ func (t *ComputerUseTool) move(ctx context.Context, args computerUseArgs) (agent
 	if args.X == nil || args.Y == nil {
 		return agent.ValidationError("move requires x+y coordinates"), nil
 	}
-	x, y := t.scaleXY(*args.X, *args.Y)
+	x, y := t.scaleXY(int(*args.X), int(*args.Y))
 	raw, err := t.client.Call(ctx, "mouse_event", map[string]any{"type": "move", "x": float64(x), "y": float64(y)})
 	if err != nil {
 		return computerUseCallError("move", err), nil
@@ -624,7 +650,17 @@ func (t *ComputerUseTool) move(ctx context.Context, args computerUseArgs) (agent
 
 func (t *ComputerUseTool) wait(ctx context.Context, args computerUseArgs) (agent.ToolResult, error) {
 	if args.Condition == "" {
-		return agent.ValidationError("wait requires 'condition'"), nil
+		if args.Timeout <= 0 {
+			return agent.ValidationError("wait requires either 'condition' or a positive 'timeout' delay"), nil
+		}
+		timer := time.NewTimer(time.Duration(args.Timeout * float64(time.Second)))
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return agent.TransientError("wait interrupted: " + ctx.Err().Error()), nil
+		case <-timer.C:
+			return agent.ToolResult{Content: fmt.Sprintf("waited %.1f seconds", args.Timeout)}, nil
+		}
 	}
 	pid, failure, ok := t.resolvePID(ctx, args.App)
 	if !ok {

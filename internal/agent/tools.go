@@ -311,7 +311,7 @@ func isBuiltinCancelable(name string) bool {
 // The plumbing (DisallowsAutoApproval + all call sites) is preserved as a
 // hook for a future tool that genuinely cannot be persisted (account
 // deletion, payment authorization, etc.). See unattendedAutoApprovalDenyList
-// below for the parallel unattended-only gate — also currently empty.
+// below for the parallel unattended-only gate.
 var autoApprovalDenyList = []string{}
 
 // unattendedAutoApprovalDenyList is the set of tools that scheduled

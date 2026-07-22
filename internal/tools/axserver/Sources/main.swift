@@ -97,7 +97,7 @@ func dispatch(id: Int64, method: String, params: Params) -> Response {
         }
         let filter = params.filter ?? "all"
         guard let result = readTree(pid: pid, budget: budget, filter: filter) else {
-            return Response(id: id, error: ErrorInfo(code: -1, message: "No windows found. Is the app running and visible?"))
+            return Response(id: id, error: ErrorInfo(code: -1, message: "No accessible windows found for pid \(pid). Call launch_app to request a window; if the app exposes no AX tree, use a screenshot and coordinates."))
         }
         return Response(id: id, result: AnyCodable(result))
 
@@ -242,7 +242,7 @@ func dispatch(id: Int64, method: String, params: Params) -> Response {
         }
         let maxLabels = params.maxLabels ?? 50
         guard let result = annotateElements(pid: pid, roles: params.roles, maxLabels: maxLabels) else {
-            return Response(id: id, error: ErrorInfo(code: -1, message: "No windows found. Is the app running and visible?"))
+            return Response(id: id, error: ErrorInfo(code: -1, message: "No accessible windows found for pid \(pid). Call launch_app to request a window; if the app exposes no AX tree, use a screenshot and coordinates."))
         }
         return Response(id: id, result: AnyCodable(result))
 

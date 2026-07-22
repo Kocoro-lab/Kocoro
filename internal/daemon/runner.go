@@ -980,10 +980,13 @@ func isAutonomousLocalSource(source string) bool {
 // (heartbeat/watcher/mcp). These runs' event handlers auto-approve through
 // agent.DisallowsUnattendedAutoApproval; the loop needs the same
 // classification so a persisted always-allow entry cannot bypass that gate
-// (agent.SetUnattendedRun). Webhook/web/IM stay attended — their approvals
-// round-trip to a human via the broker or Cloud.
+// (agent.SetUnattendedRun). IM channels without an approval UI are unattended
+// too; interactive IM, webhook, and web sources still round-trip to a human.
 func isUnattendedSource(source string) bool {
 	if isAutonomousLocalSource(source) {
+		return true
+	}
+	if IsNonInteractiveApprovalChannel(source) {
 		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(source)) {
