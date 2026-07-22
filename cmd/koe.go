@@ -1813,9 +1813,11 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		log.Printf("koe[reachy]: motion bridge client starting (socket %s)", carrierProfile.BridgeSocket)
 		// Manual move routes (POST /motion/play|stop, GET /motion/status). /motion/play
 		// is refused while a call is active — a manual gesture must not fight the
-		// realtime session's dispatch authority — using the same call-state source
-		// POST /call/text reads (callActive under sessMu). Left unwired on mac (no
-		// body), where the routes 404.
+		// realtime session's dispatch authority. The authoritative gate lives in the
+		// control server (callInProgress: the same lastCall store the SSE call_state
+		// events read), so the refusal can never disagree with what Desktop was told;
+		// the callActive check here is the sessMu-precise second layer, shared with
+		// POST /call/text. Left unwired on mac (no body), where the routes 404.
 		ctrl.SetMotionHandlers(
 			func(name string) error {
 				sessMu.Lock()

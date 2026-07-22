@@ -283,6 +283,13 @@ func (s *ControlServer) Handler() http.Handler {
 			http.Error(w, `{"error":"invalid_text"}`, http.StatusBadRequest)
 			return
 		}
+		// Gate on the emitted call_state authority (callInProgress) BEFORE the
+		// seam: injection needs a call span Desktop has been told about. The
+		// handler still enforces its own mechanics (live conn under sessMu).
+		if !s.callInProgress() {
+			writeControlConflict(w, ErrNoActiveCall)
+			return
+		}
 		if s.onText == nil {
 			writeControlConflict(w, ErrNoActiveCall)
 			return
@@ -303,6 +310,15 @@ func (s *ControlServer) Handler() http.Handler {
 		}
 		if s.onMotionPlay == nil {
 			http.Error(w, `{"error":"motion_unavailable"}`, http.StatusNotFound)
+			return
+		}
+		// Refuse across the whole emitted call span (connecting → ended), from
+		// the same store the SSE call_state events read — a manual gesture must
+		// not fight the realtime session's dispatch authority, and the seam's
+		// private call flag must not be able to flip this answer (W2-1: 409
+		// while a call is active).
+		if s.callInProgress() {
+			writeMotionError(w, ErrCallActive)
 			return
 		}
 		if err := s.onMotionPlay(req.Name); err != nil {
@@ -505,6 +521,20 @@ func (s *ControlServer) EmitCallState(state string) {
 	}
 	s.lastCall.Store(snapshot)
 	s.broadcast(controlEvent{Type: "call_state", State: state})
+}
+
+// callInProgress reports whether the last call_state emitted to Desktop marks a
+// live call span (connecting/on_call; "ended" is stored back as "idle"). This is
+// THE call-state authority for the manual-injection routes (POST /motion/play,
+// POST /call/text): it reads the same store the SSE stream and /carrier/status
+// serve, so the gate can never disagree with what the UI was told. The wired
+// seams keep their own session-mutex checks as mechanics (e.g. /call/text still
+// needs a live conn), but the accept/refuse decision starts here — a seam whose
+// private call flag lags the emitted span (live robot incident: /motion/play
+// answered 202 during an audible call) can no longer flip the answer.
+func (s *ControlServer) callInProgress() bool {
+	v, ok := s.lastCall.Load().(string)
+	return ok && v != "" && v != "idle"
 }
 
 // EmitMicStatus reports microphone health to Desktop. "silent" = the bound input

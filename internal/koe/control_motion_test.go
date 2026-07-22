@@ -66,6 +66,58 @@ func TestMotionPlayEndpointStatusMapping(t *testing.T) {
 	}
 }
 
+// TestMotionPlayRefusedByCallStateAuthority pins the W2-1 in-call gate to the
+// same store the SSE call_state events (and thus Desktop) read: once the server
+// has emitted connecting/on_call, POST /motion/play must 409 call_active even if
+// the wired play seam's own view of the call lags behind (live incident: a real
+// robot call answered 202 because the seam's private call flag read false while
+// the session was audibly on-call). "ended" reopens manual playback.
+func TestMotionPlayRefusedByCallStateAuthority(t *testing.T) {
+	played := 0
+	s := NewControlServer(nil, nil, nil)
+	// A seam that would accept — simulating the divergent state where the play
+	// closure's own call check believes no call is active.
+	s.SetMotionHandlers(
+		func(name string) error { played++; return nil },
+		nil,
+		nil,
+	)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	post := func() (int, string) {
+		resp, err := http.Post(srv.URL+"/motion/play", "application/json", strings.NewReader(`{"name":"happy1"}`))
+		if err != nil {
+			t.Fatalf("POST /motion/play: %v", err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, string(b)
+	}
+
+	// The whole emitted call span refuses manual playback: from the "connecting"
+	// broadcast (before the session flags flip) through "on_call".
+	for _, state := range []string{"connecting", "on_call"} {
+		s.EmitCallState(state)
+		code, body := post()
+		if code != http.StatusConflict || !strings.Contains(body, "call_active") {
+			t.Fatalf("play during %s: status=%d body=%s, want 409 call_active", state, code, body)
+		}
+		if played != 0 {
+			t.Fatalf("play seam ran during %s", state)
+		}
+	}
+
+	// "ended" normalizes the snapshot back to idle → manual playback allowed.
+	s.EmitCallState("ended")
+	if code, body := post(); code != http.StatusAccepted {
+		t.Fatalf("play after ended: status=%d body=%s, want 202", code, body)
+	}
+	if played != 1 {
+		t.Fatalf("play seam ran %d times after ended, want 1", played)
+	}
+}
+
 func TestMotionStopEndpoint(t *testing.T) {
 	var stopErr error
 	stopped := 0
