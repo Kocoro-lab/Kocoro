@@ -417,12 +417,116 @@ func TestToolDefsLedgerSchema(t *testing.T) {
 		return ToolDef{}
 	}
 	if !strings.Contains(string(find(on, "do_task").Parameters), `"relationship"`) ||
-		!strings.Contains(string(find(on, "cancel").Parameters), `"task_id"`) {
-		t.Fatal("ledger tool schemas must expose relationship and task identity")
+		!strings.Contains(string(find(on, "cancel").Parameters), `"task_id"`) ||
+		!strings.Contains(string(find(on, "cancel").Parameters), `"all_running"`) {
+		t.Fatal("ledger tool schemas must expose relationship, task identity, and all_running cancel")
 	}
 	if strings.Contains(string(find(off, "do_task").Parameters), `"relationship"`) ||
-		strings.Contains(string(find(off, "cancel").Parameters), `"task_id"`) {
+		strings.Contains(string(find(off, "cancel").Parameters), `"task_id"`) ||
+		strings.Contains(string(find(off, "cancel").Parameters), `"all_running"`) {
 		t.Fatal("ledger rollback must restore legacy schemas")
+	}
+}
+
+func TestCancelAllRunningCancelsEveryTaskInOneCall(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	var routes []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got map[string]any
+		json.NewDecoder(r.Body).Decode(&got)
+		routes = append(routes, got["route_key"].(string))
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	state := NewCallState("burst-all", "")
+	first := state.BeginTask("check Tokyo weather", "finance")
+	second := state.BeginTask("review contract", "legal")
+	d := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+
+	out, err := d.Dispatch(context.Background(), "cancel", []byte(`{"all_running":true}`))
+	if err != nil {
+		t.Fatalf("cancel all_running: %v", err)
+	}
+	var decoded struct {
+		Status    string   `json:"status"`
+		Cancelled []string `json:"cancelled"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Status != "ok" || len(decoded.Cancelled) != 2 {
+		t.Fatalf("output = %s, want ok with both task ids", out)
+	}
+	if len(routes) != 2 {
+		t.Fatalf("daemon cancel routes = %v, want one per running task", routes)
+	}
+	for _, id := range []string{first.ID, second.ID} {
+		if task, ok := state.TaskByID(id); !ok || task.State != TaskCancelled {
+			t.Fatalf("task %s state = %+v, want cancelled", id, task)
+		}
+	}
+}
+
+func TestCancelAllRunningReportsPartialFailure(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got map[string]any
+		json.NewDecoder(r.Body).Decode(&got)
+		if strings.Contains(got["route_key"].(string), "legal") {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	state := NewCallState("burst-part", "")
+	okTask := state.BeginTask("check Tokyo weather", "finance")
+	failTask := state.BeginTask("review contract", "legal")
+	d := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+
+	out, err := d.Dispatch(context.Background(), "cancel", []byte(`{"all_running":true}`))
+	if err != nil {
+		t.Fatalf("cancel all_running: %v", err)
+	}
+	var decoded struct {
+		Status    string              `json:"status"`
+		Cancelled []string            `json:"cancelled"`
+		Failed    []map[string]string `json:"failed"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Status != "partial" || len(decoded.Cancelled) != 1 || len(decoded.Failed) != 1 ||
+		decoded.Cancelled[0] != okTask.ID || decoded.Failed[0]["task_id"] != failTask.ID {
+		t.Fatalf("output = %s, want partial with %s cancelled and %s failed", out, okTask.ID, failTask.ID)
+	}
+	if task, _ := state.TaskByID(okTask.ID); task.State != TaskCancelled {
+		t.Fatalf("succeeded task state = %v, want cancelled", task.State)
+	}
+	if task, _ := state.TaskByID(failTask.ID); task.State != TaskRunning {
+		t.Fatalf("failed task state = %v, must stay running for a retry", task.State)
+	}
+}
+
+func TestCancelAllRunningWithNoTasksFallsBackToBlindCancel(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got map[string]any
+		json.NewDecoder(r.Body).Decode(&got)
+		if got["route_key"] != "agent:finance:koe:burst-idle" {
+			t.Errorf("blind cancel route_key = %v, want agent:finance:koe:burst-idle", got["route_key"])
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	state := NewCallState("burst-idle", "finance")
+	d := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	out, err := d.Dispatch(context.Background(), "cancel", []byte(`{"all_running":true}`))
+	if err != nil || !strings.Contains(string(out), `"idle"`) {
+		t.Fatalf("no-task all_running = %s err=%v, want idle blind-cancel", out, err)
 	}
 }
 

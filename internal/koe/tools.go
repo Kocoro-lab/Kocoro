@@ -29,7 +29,7 @@ const doTaskParamsLedger = `{"type":"object","properties":{"task":{"type":"strin
 
 const cancelParamsLegacy = `{"type":"object","properties":{"reason":{"type":"string","enum":["user_cancel","interrupt"],"description":"Why the task is being cancelled."}},"required":[]}`
 
-const cancelParamsLedger = `{"type":"object","properties":{"reason":{"type":"string","enum":["user_cancel","interrupt"],"description":"Why the task is being cancelled."},"task_id":{"type":"string","description":"The task id to cancel. Omit when exactly one task is running."}},"required":[]}`
+const cancelParamsLedger = `{"type":"object","properties":{"reason":{"type":"string","enum":["user_cancel","interrupt"],"description":"Why the task is being cancelled."},"task_id":{"type":"string","description":"The task id to cancel. Omit when exactly one task is running."},"all_running":{"type":"boolean","description":"Set true only when the user asked to stop everything; cancels every running task in this call in one atomic call. Never combine with task_id."}},"required":[]}`
 
 // ToolDefs returns the voice tools. Inputs are enum'd where applicable.
 // end_call ends the whole conversation (dismiss / hang up) — the model judges the
@@ -64,6 +64,7 @@ func ToolDefs() []ToolDef {
 			Parameters:  obj(`{"type":"object","properties":{},"required":[]}`)},
 	}
 	if TaskLedgerEnabled() {
+		defs[1].Description += " When the user asks to stop everything (\"都停了\" / \"全部取消\" / \"stop everything\"), make one call with all_running=true instead of one call per task."
 		defs[0].Description += " Before calling, acknowledge with at most one bare clause; never narrate steps, ask the user to wait, or promise to report back. Multiple calls in one response must describe distinct work: use one complete compound task or disjoint concrete tasks, never duplicate the same compound request. The call returns immediately with status running and a task_id; the real result arrives later as a background task update. A running task never blocks you: keep conversing and call do_task again freely for another independent request or a follow-up, and never invent a result before the update lands."
 	}
 	return defs
@@ -287,8 +288,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, name string, argsJSON []byte)
 		return nil, fmt.Errorf("do_task is async: use PrepareDoTask + goroutine + MapDoTaskOutcome, not Dispatch")
 	case "cancel":
 		var a struct {
-			Reason string `json:"reason"`
-			TaskID string `json:"task_id"`
+			Reason     string `json:"reason"`
+			TaskID     string `json:"task_id"`
+			AllRunning bool   `json:"all_running"`
 		}
 		_ = json.Unmarshal(argsJSON, &a)
 		reason := a.Reason
@@ -296,6 +298,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, name string, argsJSON []byte)
 			reason = "user_cancel"
 		}
 		if TaskLedgerEnabled() {
+			if a.AllRunning {
+				return d.cancelAllRunning(ctx, reason)
+			}
 			return d.cancelLedger(ctx, a.TaskID, reason)
 		}
 		// cancel keys off BoundAgent() (the persistent binding), so a do_task
@@ -415,6 +420,39 @@ func (d *Dispatcher) cancelLedger(ctx context.Context, taskID, reason string) ([
 	}
 	d.state.MarkCancelled(target.ID)
 	return mustJSON(map[string]string{"status": "ok", "task_id": target.ID}), nil
+}
+
+// cancelAllRunning is the "stop everything" path: one tool call snapshots the
+// running set, cancels each task on its own daemon route, and reports one
+// aggregate outcome. Remote cancellation cannot be truly atomic, so per-task
+// failures are explicit — a failed task stays running in the ledger rather
+// than being silently marked cancelled.
+func (d *Dispatcher) cancelAllRunning(ctx context.Context, reason string) ([]byte, error) {
+	running := d.state.RunningTasks()
+	if len(running) == 0 {
+		// Preserve main's blind-cancel recovery for rare daemon/ledger drift.
+		key := routeKeyFor(d.state.BoundAgent(), d.state.BurstID())
+		if err := d.client.Cancel(ctx, CancelRequest{RouteKey: key, Reason: reason}); err != nil {
+			return mustJSON(map[string]string{"status": "failed", "error": err.Error()}), nil
+		}
+		return mustJSON(map[string]string{"status": "idle"}), nil
+	}
+	cancelled := make([]string, 0, len(running))
+	var failed []map[string]string
+	for _, task := range running {
+		if err := d.client.Cancel(ctx, CancelRequest{
+			RouteKey: routeKeyFor(task.Agent, task.ThreadID), Reason: reason,
+		}); err != nil {
+			failed = append(failed, map[string]string{"task_id": task.ID, "error": err.Error()})
+			continue
+		}
+		d.state.MarkCancelled(task.ID)
+		cancelled = append(cancelled, task.ID)
+	}
+	if len(failed) > 0 {
+		return mustJSON(map[string]any{"status": "partial", "cancelled": cancelled, "failed": failed}), nil
+	}
+	return mustJSON(map[string]any{"status": "ok", "cancelled": cancelled}), nil
 }
 
 // agentOverrideAllowed is an opt-in rollback guard for the earlier literal-
