@@ -12,20 +12,22 @@ import "unicode"
 // exist under every language so fallbackSay never returns "".
 var fallbackSpeech = map[string]map[string]string{
 	"zh": {
-		"transport_failed": "抱歉，刚才没能完成，连接出了点问题。",
-		"busy":             "现在有点忙，稍等一下再说一次好吗？",
-		"misheard":         "我没听清，能再说一次吗？",
-		"clarify_which":    "你是指哪个 agent？",
-		"clarify_unknown":  "我没找到这个 agent，你是指哪一个？",
-		"incomplete":       "这个刚才没能做完，你要我再试一次吗？",
+		"transport_failed":   "抱歉，刚才没能完成，连接出了点问题。",
+		"busy":               "现在有点忙，稍等一下再说一次好吗？",
+		"misheard":           "我没听清，能再说一次吗？",
+		"clarify_which":      "你是指哪个 agent？",
+		"clarify_unknown":    "我没找到这个 agent，你是指哪一个？",
+		"incomplete":         "这个刚才没能做完，你要我再试一次吗？",
+		"clarify_which_task": "现在有几件事在跑，你是指哪一个？",
 	},
 	"en": {
-		"transport_failed": "Sorry, I couldn't finish that — there was a connection problem.",
-		"busy":             "I'm a bit busy right now — could you say that again in a moment?",
-		"misheard":         "I didn't catch that — could you say it again?",
-		"clarify_which":    "Which agent do you mean?",
-		"clarify_unknown":  "I couldn't find that agent — which one do you mean?",
-		"incomplete":       "I didn't manage to finish that — want me to try again?",
+		"transport_failed":   "Sorry, I couldn't finish that — there was a connection problem.",
+		"busy":               "I'm a bit busy right now — could you say that again in a moment?",
+		"misheard":           "I didn't catch that — could you say it again?",
+		"clarify_which":      "Which agent do you mean?",
+		"clarify_unknown":    "I couldn't find that agent — which one do you mean?",
+		"incomplete":         "I didn't manage to finish that — want me to try again?",
+		"clarify_which_task": "A few tasks are running — which one do you mean?",
 	},
 }
 
@@ -112,4 +114,20 @@ func clarifyWhich(lang string, candidates []string) string {
 		return q + list
 	}
 	return q + " " + list
+}
+
+func clarifyWhichTask(lang string, tasks []VoiceTask) string {
+	labels := make([]string, len(tasks))
+	for i, task := range tasks {
+		labels[i] = task.Label
+	}
+	question := fallbackSay(lang, "clarify_which_task")
+	list := joinHuman(lang, labels)
+	if list == "" {
+		return question
+	}
+	if lang == "zh" {
+		return question + list
+	}
+	return question + " " + list
 }

@@ -33,6 +33,19 @@ func (c *captureSender) send(v any) error {
 	return nil
 }
 
+func (c *captureSender) countContains(sub string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := 0
+	for _, message := range c.sent {
+		payload, _ := json.Marshal(message)
+		if strings.Contains(string(payload), sub) {
+			count++
+		}
+	}
+	return count
+}
+
 // countType counts captured frames whose "type" equals typ.
 func (c *captureSender) countType(typ string) int {
 	c.mu.Lock()
@@ -89,9 +102,37 @@ func (c *captureSender) responseCreateInstructions() []string {
 	return out
 }
 
-// TestHandleFunctionCallDoTaskAsync verifies the C-full deferred-ack flow: the
-// fast-ack function_call_output is sent SYNCHRONOUSLY (Koe speaks "on it"), then
-// the back-brain result is injected from the goroutine and voiced.
+func responseCreatedForRequest(responseID string, request any) []byte {
+	requestJSON, _ := json.Marshal(request)
+	var frame struct {
+		Response struct {
+			Metadata map[string]string `json:"metadata"`
+		} `json:"response"`
+	}
+	_ = json.Unmarshal(requestJSON, &frame)
+	event, _ := json.Marshal(map[string]any{
+		"type": "response.created",
+		"response": map[string]any{
+			"id": responseID, "status": "in_progress", "metadata": frame.Response.Metadata,
+		},
+	})
+	return event
+}
+
+func (c *captureSender) latestResponseCreatedEvent(responseID string) []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := len(c.sent) - 1; i >= 0; i-- {
+		if c.sent[i]["type"] == "response.create" {
+			return responseCreatedForRequest(responseID, c.sent[i])
+		}
+	}
+	return responseCreatedForRequest(responseID, nil)
+}
+
+// TestHandleFunctionCallDoTaskAsync verifies the deferred-ack flow: the running
+// output consumes the call id, then the complete final reply lands in the durable
+// mailbox for native Realtime delivery.
 func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"reply": "Reminder added.", "agent": "default"})
@@ -108,17 +149,20 @@ func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 
 	h.handleFunctionCall(context.Background(), "call-1", "do_task", []byte(`{"task":"remind me"}`))
 
-	// reachy say-and-ask: NO synchronous placeholder ack — the model spoke its own
-	// ack in the call turn. The single function_call_output carrying the REAL result
-	// is sent after the back-brain turn completes.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if cap.sentContains("Reminder added.") {
+		if h.resultMailbox.pending() == 1 {
+			h.resultMailbox.mu.Lock()
+			got := h.resultMailbox.entries[0].result.Reply
+			h.resultMailbox.mu.Unlock()
+			if got != "Reminder added." {
+				t.Fatalf("mailbox reply = %q", got)
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Error("do_task result function_call_output never sent")
+	t.Error("do_task complete result never reached mailbox")
 }
 
 // TestHandleFunctionCallDoTaskSurvivesSessionCtxCancel verifies S2: a hangup that
@@ -150,7 +194,13 @@ func TestHandleFunctionCallDoTaskSurvivesSessionCtxCancel(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if cap.sentContains("Reminder added.") {
+		if h.resultMailbox.pending() == 1 {
+			h.resultMailbox.mu.Lock()
+			got := h.resultMailbox.entries[0].result.Reply
+			h.resultMailbox.mu.Unlock()
+			if got != "Reminder added." {
+				t.Fatalf("mailbox reply = %q", got)
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -198,7 +248,7 @@ func TestHandleFunctionCallInjectedFollowupDoesNotDoubleSpeak(t *testing.T) {
 	}
 
 	h.handleFunctionCall(ctx, "call-2", "do_task", []byte(`{"task":"change it to 6pm"}`))
-	waitUntil(t, func() bool { return cap.sentContains("injected") }, "injected follow-up did not get function_call_output")
+	waitUntil(t, func() bool { return cap.countContains(`\"status\":\"running\"`) >= 2 }, "follow-up did not get its immediate running ack")
 	time.Sleep(150 * time.Millisecond)
 	if got := cap.countType("response.create"); got != 0 {
 		t.Fatalf("injected follow-up must not request a voiced response, got %d response.create", got)
@@ -214,13 +264,14 @@ func TestHandleFunctionCallInjectedFollowupDoesNotDoubleSpeak(t *testing.T) {
 		t.Fatalf("final result should request exactly one voiced response, got %d", got)
 	}
 	instr := cap.responseCreateInstructions()
-	if len(instr) != 1 || !strings.Contains(instr[0], "Say exactly the text between <spoken_summary>") ||
-		!strings.Contains(instr[0], "Final combined result.") {
-		t.Fatalf("final result response.create must pin exact spoken_summary instructions, got %#v", instr)
+	if len(instr) != 1 || !strings.Contains(instr[0], "sole factual source") ||
+		strings.Contains(instr[0], "Final combined result.") || strings.Contains(instr[0], "spoken_summary") {
+		t.Fatalf("final result response.create must request native grounded delivery, got %#v", instr)
 	}
 }
 
 func TestHandleEventFunctionCallArgumentsDoneDelegatesDoTask(t *testing.T) {
+	t.Setenv("KOE_TOOL_CONTINUATION", "0")
 	gotReq := make(chan DoTaskRequest, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req DoTaskRequest
@@ -261,17 +312,17 @@ func TestHandleEventFunctionCallArgumentsDoneDelegatesDoTask(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if cap.sentContains("You have three new emails.") {
+		if cap.sentContains("Checked Gmail.") {
 			instr := cap.responseCreateInstructions()
-			if len(instr) != 1 || !strings.Contains(instr[0], "You have three new emails.") ||
-				!strings.Contains(instr[0], "Do not add a greeting, preface, follow-up question") {
-				t.Fatalf("do_task response.create must constrain speech to spoken_summary, got %#v", instr)
+			if len(instr) != 1 || !strings.Contains(instr[0], "sole factual source") ||
+				strings.Contains(instr[0], "Checked Gmail.") || strings.Contains(instr[0], "spoken_summary") {
+				t.Fatalf("do_task response.create must request native grounded delivery, got %#v", instr)
 			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("do_task spoken_summary was not sent as function_call_output")
+	t.Fatal("complete do_task reply was not injected for native delivery")
 }
 
 // TestHandleEventGatesMicWhileSpeaking locks the half-duplex gate into the event
@@ -726,6 +777,8 @@ func TestSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 		`"create_response":true`,
 		`"interrupt_response":false`,
 		`"noise_reduction":{"type":"far_field"}`,
+		`"parallel_tool_calls":true`,
+		`"reasoning":{"effort":"low"}`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("sessionConfig missing %s in %s", want, s)
@@ -745,13 +798,22 @@ func TestSessionConfigCanUseServerVAD(t *testing.T) {
 	for _, want := range []string{
 		`"type":"server_vad"`,
 		`"threshold":0.5`,
-		`"silence_duration_ms":900`,
+		`"silence_duration_ms":1500`,
 		`"create_response":true`,
 		`"interrupt_response":false`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("sessionConfig missing %s in %s", want, s)
 		}
+	}
+}
+
+func TestSessionConfigCanOverrideServerVADSilence(t *testing.T) {
+	t.Setenv("KOE_TURN_DETECTION", "server_vad")
+	t.Setenv("KOE_VAD_SILENCE_MS", "2100")
+	raw, _ := json.Marshal(sessionConfig("persona", "marin", true))
+	if !strings.Contains(string(raw), `"silence_duration_ms":2100`) {
+		t.Fatalf("KOE_VAD_SILENCE_MS should override the default: %s", raw)
 	}
 }
 
@@ -1138,6 +1200,7 @@ func TestLocalCommitFallbackSkipsWhenTaskStartsDuringDelay(t *testing.T) {
 // a strong dismiss like "闭嘴" — including its decorated containment form — is about
 // talking, not the task, and must still hang up.
 func TestDismissContainmentHangsUpWhileTaskInFlight(t *testing.T) {
+	t.Setenv("KOE_ASR_DISMISS_BACKSTOP", "1")
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	cap := &captureSender{}
@@ -1197,7 +1260,7 @@ func TestResponseSenderRetriesOnActiveResponseRejection(t *testing.T) {
 	waitUntil(func() bool { return cap.countType("response.create") >= 2 }, "rejection did not trigger a retry")
 
 	// Accept the retry; no further creates after that.
-	h.handleEvent(ctx, []byte(`{"type":"response.created"}`))
+	h.handleEvent(ctx, cap.latestResponseCreatedEvent("retry-accepted"))
 	time.Sleep(200 * time.Millisecond)
 	if n := cap.countType("response.create"); n != 2 {
 		t.Errorf("expected exactly 2 response.create (1 + 1 retry), got %d", n)

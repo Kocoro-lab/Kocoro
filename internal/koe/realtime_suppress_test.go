@@ -27,10 +27,10 @@ func TestShouldVoiceDoTaskResult(t *testing.T) {
 	cancelled := SayResult{Status: "cancelled"} // MapDoTaskOutcome leaves Say empty
 
 	cases := []struct {
-		name       string
-		r          SayResult
+		name        string
+		r           SayResult
 		userMovedOn bool // committed a conversational turn since the last do_task
-		want       bool
+		want        bool
 	}{
 		{"normal completed, user waited", ok, false, true},
 		{"user moved on to conversation → suppress", ok, true, false},
@@ -58,6 +58,10 @@ func TestShouldVoiceDoTaskResult(t *testing.T) {
 // (the response.create), while the function_call_output is still submitted. No live
 // API: the gate is production code exercised end-to-end.
 func TestDoTaskVoicingGateWiring(t *testing.T) {
+	// This test pins the rollback path's historical stale-result gate. The default
+	// delivery path now defers stale results in ResultMailbox instead of dropping them.
+	t.Setenv("KOE_RESULT_DELIVERY", "0")
+	t.Setenv("KOE_TOOL_CONTINUATION", "0")
 	run := func(t *testing.T, midTaskUserTurn bool) (fnOutputs, voiceRequested int) {
 		t.Helper()
 		release := make(chan struct{})
@@ -157,6 +161,10 @@ func TestDoTaskVoicingGateWiring(t *testing.T) {
 // per-dispatch "followUp" flag latched true and wrongly voiced it; the last-do_task
 // commit marker fixes it. The no-move-on control still voices the combined result.
 func TestDoTaskVoicingGateFollowUpThenMoveOn(t *testing.T) {
+	// Keep the old gate covered behind its rollback flag; durable delivery has its
+	// own cross-session and user-floor tests in result_mailbox_test.go.
+	t.Setenv("KOE_RESULT_DELIVERY", "0")
+	t.Setenv("KOE_TOOL_CONTINUATION", "0")
 	run := func(t *testing.T, moveOn bool) (fnOutputs, voiceRequested int) {
 		t.Helper()
 		release := make(chan struct{})
@@ -205,7 +213,10 @@ func TestDoTaskVoicingGateFollowUpThenMoveOn(t *testing.T) {
 		}
 		h := newEventHandler(disp, state, audio, sendFn)
 		ctx := context.Background()
-		commit := func() { c, _ := json.Marshal(map[string]any{"type": "input_audio_buffer.committed"}); h.handleEvent(ctx, c) }
+		commit := func() {
+			c, _ := json.Marshal(map[string]any{"type": "input_audio_buffer.committed"})
+			h.handleEvent(ctx, c)
+		}
 		doTask := func(id, task string) {
 			fc, _ := json.Marshal(map[string]any{
 				"type": "response.function_call_arguments.done", "name": "do_task",
@@ -213,9 +224,9 @@ func TestDoTaskVoicingGateFollowUpThenMoveOn(t *testing.T) {
 			h.handleEvent(ctx, fc)
 		}
 
-		commit()                        // news turn committed
-		doTask("call_news", "the news") // primary → blocks on release
-		commit()                        // email turn committed
+		commit()                         // news turn committed
+		doTask("call_news", "the news")  // primary → blocks on release
+		commit()                         // email turn committed
 		doTask("call_email", "my email") // follow-up → injected, advances lastDoTaskCommitSeq
 		if moveOn {
 			commit() // user moves on to plain conversation ("explain quantum computing") — no do_task

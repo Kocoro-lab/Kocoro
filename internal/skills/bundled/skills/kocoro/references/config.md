@@ -74,6 +74,7 @@ Global settings control how Shannon behaves across all agents — which AI model
 | `cloud.stream_idle_timeout_secs` | Abort a cloud-delegate SSE connection when no line (event or 10s heartbeat) arrives for this many seconds, then reconnect via Last-Event-ID. Per-connection liveness probe, NOT a workflow time limit (`cloud.timeout` bounds total duration). 0 = disabled. Default: 45. | No |
 | `mcp_servers` | External service integrations (see mcp reference) | No |
 | `koe.audio_processing` | Voice microphone processing mode: `auto` (default), `mac_voice` (use Apple VoiceProcessingIO voice processing/AEC), or `clean_device` (for microphones/apps that already clean voice; keep VPIO device binding/playback but bypass Apple's voice processing). In `auto`, Koe uses `clean_device` only for a conservative list of known self-processed conference device/app pairs and otherwise keeps Mac voice processing. Kocoro Desktop exposes this under Voice → Advanced and forwards it to `shan koe --audio-processing`. | No |
+| `koe.barge_in` | Enables VPIO full-duplex turn-taking. Koe pauses the exact assistant PCM locally, asks the native speech-to-speech model to choose only `resume_playback` (backchannel/no reply) or `accept_turn` (real interruption), then resumes or discards playback. ASR is not an admission dependency. Requires the VPIO backend; default: false. | No |
 
 ## Common Scenarios
 

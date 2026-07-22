@@ -72,6 +72,11 @@ type otoSource struct {
 }
 
 func (s *otoSource) Read(p []byte) (int, error) {
+	if s.a.PlaybackPaused() {
+		s.a.setOutputLevel(0)
+		zeroBytes(p)
+		return len(p), nil
+	}
 	i := 0
 	// 1. Place any tail left from the previous Read first (a frame straddling the
 	//    p boundary), so no decoded audio is dropped.

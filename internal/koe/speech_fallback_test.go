@@ -101,7 +101,7 @@ func TestMapDoTaskOutcomeFallbackLanguage(t *testing.T) {
 func TestPrepareDoTaskClarifyLanguage(t *testing.T) {
 	d := NewDispatcher(nil, NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), NewCallState("b", "default"), nil)
 	for _, lang := range []string{"en", "zh"} {
-		_, clarify, err := d.PrepareDoTask([]byte(`{"task":"x","agent":"nonexistent zzz"}`), lang)
+		_, _, clarify, err := d.PrepareDoTask([]byte(`{"task":"ask nonexistent zzz to check x","agent":"nonexistent zzz"}`), lang, false)
 		if err != nil || clarify == nil {
 			t.Fatalf("[%s] expected clarify, err=%v clarify=%v", lang, err, clarify)
 		}
@@ -127,17 +127,19 @@ func TestHandleFunctionCallRejectionSpeaksUtteranceLanguage(t *testing.T) {
 		cap := &captureSender{}
 		h := newEventHandler(disp, state, nil, cap.send)
 		h.language = pinned
-		h.handleFunctionCall(context.Background(), "c1", "do_task", []byte(taskJSON))
-		// The busy fallback rides the function_call_output (conversation.item.create),
-		// sent synchronously once the goroutine's DoTask returns — no runResponseSender
-		// is wired here, so don't wait on a response.create that never fires.
+		ctx, cancel := context.WithCancel(context.Background())
+		go h.runResponseSender(ctx)
+		h.handleFunctionCall(ctx, "c1", "do_task", []byte(taskJSON))
+		// Ledger mode emits the immediate running ack first, then the failed task
+		// update carrying the localized fallback.
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
-			if cap.countType("conversation.item.create") > 0 {
+			if cap.countType("conversation.item.create") >= 2 {
 				break
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
+		cancel()
 		return cap
 	}
 

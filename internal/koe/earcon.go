@@ -83,21 +83,21 @@ func (a *AudioIO) PlayDismissEarcon() { a.playEarcon("dismiss", decodeEarconFram
 // the cue's full duration, then restores the prior gate state. It blocks until
 // playback drains, so call it in a goroutine.
 //
-// Self-trigger safety: it raises the speaking gate (SetSpeaking), which BOTH
-// backends honor — the oto half-duplex path drops capture while speaking, and the
-// VPIO path's shouldForwardVPIOCapture drops capture while speaking too (default,
-// barge-in off). So the cue is never fed to the server VAD and cannot make Koe
-// "answer" its own sound. At a call boundary no reply is in flight (PrepareForCall
-// zeroed the gates), so nothing is clobbered; the captured prior state is restored
-// on return regardless.
+// Self-trigger safety: the dedicated knownOutputCaptureHold is not bypassed by
+// VPIO barge-in, unlike the ordinary speaking gate. This keeps the cue and its AEC
+// tail out of server VAD without making assistant speech uninterruptible. At a call
+// boundary no reply is in flight (PrepareForCall zeroed the gates), so nothing is
+// clobbered; the captured prior state is restored on return regardless.
 func (a *AudioIO) playEarcon(name string, frames [][]int16) {
 	if len(frames) == 0 {
 		return
 	}
 	prevSpeaking := a.speaking.Load()
 	prevPlayback := a.playback.Load()
+	prevCaptureHold := a.knownOutputCaptureHold.Load()
 	started := time.Now()
 
+	a.knownOutputCaptureHold.Store(true)
 	a.SetPlaybackEnabled(true)
 	a.SetSpeaking(true)
 
@@ -152,5 +152,6 @@ func (a *AudioIO) playEarcon(name string, frames [][]int16) {
 
 	a.SetSpeaking(prevSpeaking)
 	a.SetPlaybackEnabled(prevPlayback)
+	a.knownOutputCaptureHold.Store(prevCaptureHold)
 	log.Printf("koe[earcon]: %s earcon played frames=%d dur=%dms", name, len(frames), time.Since(started).Milliseconds())
 }

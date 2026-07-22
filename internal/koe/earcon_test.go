@@ -96,6 +96,7 @@ func TestReadyEarconEnabledEnv(t *testing.T) {
 // transition happens promptly; the ~540ms cue keeps the 300ms mid-check inside it.
 func TestPlayReadyEarconMutesMicAndPlays(t *testing.T) {
 	t.Setenv("KOE_EARCON_IDLE_HOLD_MS", "40")
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	a, err := NewAudioIO()
 	if err != nil {
 		t.Fatalf("NewAudioIO: %v", err)
@@ -127,10 +128,16 @@ func TestPlayReadyEarconMutesMicAndPlays(t *testing.T) {
 	if !a.captureSuppressed() {
 		t.Error("capture must be suppressed WHILE the earcon plays (self-trigger guard)")
 	}
+	if a.shouldForwardVPIOCapture(0.2) {
+		t.Error("VPIO barge-in must not bypass the known earcon capture hold")
+	}
 
 	<-done // PlayReadyEarcon returns once the drain poll sees the cue silent for the hold
 	if a.captureSuppressed() {
 		t.Error("capture suppression must be released after the earcon drains")
+	}
+	if !a.shouldForwardVPIOCapture(0.2) {
+		t.Error("capture must resume after the known earcon drains")
 	}
 
 	m := a.CapturedMetrics() // read before Stop tears the backend down

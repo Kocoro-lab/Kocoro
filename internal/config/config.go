@@ -73,8 +73,9 @@ type KoeConfig struct {
 	// this only under advanced voice settings and forwards it as
 	// --audio-processing.
 	AudioProcessing string `mapstructure:"audio_processing" yaml:"audio_processing,omitempty" json:"audio_processing,omitempty"`
-	// BargeIn opts into interrupting Kocoro while it speaks (barge-in) instead of
-	// the default half-duplex "finish then listen". A *bool for the same reason as
+	// BargeIn opts into reversible native-S2S floor control while Kocoro speaks
+	// instead of the default half-duplex "finish then listen". A *bool for the same
+	// reason as
 	// Enabled: the off state (&false) must survive Desktop's RFC-7386 PATCH merge,
 	// which a plain bool+omitempty would swallow. Desktop forwards this as the
 	// `--barge-in` flag; it is a no-op unless the VPIO backend is active.

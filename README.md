@@ -29,7 +29,7 @@ Built on **[Shannon](https://github.com/Kocoro-lab/Shannon)** — the open-sourc
 
 - [Installation](#installation) · [Updating](#updating) · [Setup](#setup) · [Requirements](#requirements)
 - [Quick Start](#quick-start) · [One-Shot Examples](#one-shot-examples) · [Multi-step Cowork Recipes](#multi-step-cowork-recipes)
-- [CLI Usage](#cli-usage) · [Commands](#commands)
+- [CLI Usage](#cli-usage) · [Voice Front Brain](#voice-front-brain-macos) · [Commands](#commands)
 - [Local Tools](#local-tools) · [Permission Engine](#permission-engine) · [Audit Logging](#audit-logging) · [Hooks](#hooks)
 - [MCP Server](#mcp-server) · [MCP Client](#mcp-client)
 - [Configuration](#configuration) · [Instructions & Memory](#instructions--memory) · [Sessions](#sessions)
@@ -196,6 +196,12 @@ shan schedule list                # local scheduled tasks
 ```
 
 Flags: `-y/--yes` auto-approve; `--agent` named agent; `--dangerously-skip-permissions` skip checks in interactive mode; `--setup` interactive wizard.
+
+### Voice Front Brain (macOS)
+
+`shan koe` runs Kocoro's OpenAI Realtime speech-to-speech front brain and delegates computer work to the local daemon. A spoken turn can start distinct tasks in parallel, cancel or refine an existing task by its call-scoped identity, and keep conversing while results run; completed results are queued and spoken as they arrive. Asking to stop everything cancels all running tasks in one call and reports any task that could not be cancelled.
+
+With the VPIO audio backend, `shan koe --barge-in` uses reversible native-S2S turn taking: playback pauses locally while the speech model decides whether the sound was a backchannel to ignore or a real interruption to accept. ASR is not on this admission path. An accepted interruption trims the cut-off reply from the conversation history, so Kocoro never refers back to words it did not actually get to say.
 
 ## Commands
 

@@ -306,6 +306,9 @@ type ConnectOptions struct {
 	// listening) until the double-tap (or the menu / settings-configured trigger)
 	// starts a call. nil = always send (standalone CLI / E2E always-listen).
 	CallActive func() bool
+	// ResultMailbox carries completed do_task speech across warm Realtime session
+	// replacement. nil creates a connection-local mailbox for standalone callers.
+	ResultMailbox *ResultMailbox
 	// OnCallState (nil-safe) reports the call lifecycle to Desktop (Q2b feedback so
 	// the user knows it's working): "connecting" while the WebRTC/session setup runs
 	// (~2s), "on_call" once OpenAI acks the session. "ended" is emitted by the
@@ -411,10 +414,10 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	if err != nil {
 		return nil, err
 	}
-	h := newEventHandler(disp, state, audio, func(v any) error {
+	h := newEventHandlerWithMailbox(disp, state, audio, func(v any) error {
 		b, _ := json.Marshal(v)
 		return rc.dc.SendText(string(b))
-	})
+	}, opts.ResultMailbox, opts.CallActive)
 	h.onVoiceState = opts.OnVoiceState
 	h.onEndCall = opts.OnEndCall
 	h.model = opts.Model

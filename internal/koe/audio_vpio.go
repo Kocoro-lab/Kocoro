@@ -114,6 +114,25 @@ static unsigned long long gInputFrames = 0;
 static unsigned long long gOutputFrames = 0;
 static unsigned long long gPlayUnderruns = 0;
 static unsigned long long gPlayOverwrites = 0;
+static int gPlayPaused = 0;
+
+static void vpioSetPlaybackPaused(int paused) {
+    if (!gPlayRing.initialized) {
+        gPlayPaused = paused ? 1 : 0;
+        return;
+    }
+    pthread_mutex_lock(&gPlayRing.mu);
+    gPlayPaused = paused ? 1 : 0;
+    pthread_mutex_unlock(&gPlayRing.mu);
+}
+
+static int vpioPlaybackPaused(void) {
+    if (!gPlayRing.initialized) return gPlayPaused;
+    pthread_mutex_lock(&gPlayRing.mu);
+    int paused = gPlayPaused;
+    pthread_mutex_unlock(&gPlayRing.mu);
+    return paused;
+}
 
 static int vpioProbeEnabled(void) {
     const char *v = getenv("KOE_VPIO_PROBE");
@@ -180,6 +199,11 @@ static OSStatus vpioOutputCB(void *inRefCon, AudioUnitRenderActionFlags *flags,
     gOutputCallbacks++;
     gOutputFrames += nFrames;
     if (!ioData) return noErr;
+    if (vpioPlaybackPaused()) {
+        zeroABL(ioData);
+        if (flags) *flags |= kAudioUnitRenderAction_OutputIsSilence;
+        return noErr;
+    }
     if (!gPlayPrimed) {
         if (ringCount(&gPlayRing) < gPlayPrerollSamples) {
             zeroABL(ioData);
@@ -275,6 +299,7 @@ static OSStatus vpioStartC(double sampleRate, int ringCap, int prerollSamples,
     gOutputFrames = 0;
     gPlayUnderruns = 0;
     gPlayOverwrites = 0;
+    gPlayPaused = 0;
     if (!gInputFloatScratch || !gInputIntScratch || !gOutputScratch) {
         vpioCleanupC();
         return -2;
@@ -477,6 +502,17 @@ func (a *AudioIO) clearVPIOBuffers() {
 	if a.vpioActive.Load() {
 		C.vpioClearBuffers()
 	}
+}
+
+func (a *AudioIO) setBackendPlaybackPaused(paused bool) {
+	if !a.vpioActive.Load() {
+		return
+	}
+	value := C.int(0)
+	if paused {
+		value = 1
+	}
+	C.vpioSetPlaybackPaused(value)
 }
 
 // claimVPIOTeardown reports, under vpioLifecycleMu, whether this AudioIO still owns

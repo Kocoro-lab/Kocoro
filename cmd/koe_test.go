@@ -315,11 +315,10 @@ func TestKoePersonaTeachesEndCallOnDismiss(t *testing.T) {
 }
 
 func TestKoePersonaSummaryAndDesktopDiscipline(t *testing.T) {
-	// The do_task result carries a context digest: recaps/follow-ups the digest
-	// covers are answered directly (live 2026-07-02: half the delegations in one
-	// call were re-fetch recaps); only detail beyond it goes back through do_task.
-	// Kocoro Desktop is mentioned only for genuinely long/structured results.
-	for _, want := range []string{"context digest", "never call do_task to re-fetch", "mention it only when"} {
+	// The do_task result carries the complete final reply: recaps/follow-ups it
+	// covers are answered directly, while new action/freshness goes through
+	// do_task. Kocoro Desktop is mentioned only for genuinely rich deliverables.
+	for _, want := range []string{"full final user-facing reply", "never call do_task to re-fetch", "Mention Kocoro Desktop only when"} {
 		if !strings.Contains(koePersona, want) {
 			t.Errorf("koePersona missing result-handling guidance %q", want)
 		}
@@ -371,14 +370,11 @@ func TestKoePersonaForbidsDetailQuizzing(t *testing.T) {
 	}
 }
 
-// TestKoePersonaAckVariedAndNoPreAnswer: the do_task acknowledgement allows
-// natural, task-fitting wording variety and MAY name the action ("我查一下新闻"),
-// which the pre-2026-07-10 content-free rule wrongly forbade. The load-bearing
-// half survives, narrowed: no answer/number/result before it lands — that is what
-// blocks hallucinated pre-answers. It is also spoken only when do_task is actually
-// being called, so a direct answer never gets a stray "let me check" first.
-func TestKoePersonaAckVariedAndNoPreAnswer(t *testing.T) {
-	for _, want := range []string{"vary it between turns", "You may name what you are about to do", "before it lands", "only when you are actually about to call do_task"} {
+// TestKoePersonaAckIsBareAndNoPreAnswer pins the voice-latency contract: one
+// minimal acknowledgement, no narrated process or wait promise, and no guessed
+// answer before the real task result lands. Direct answers get no stray ack.
+func TestKoePersonaAckIsBareAndNoPreAnswer(t *testing.T) {
+	for _, want := range []string{"use at most", "one bare clause", "narrate steps", "ask the user to wait", "before it lands", "only when you are actually about to call do_task"} {
 		if !strings.Contains(koePersona, want) {
 			t.Fatalf("koePersona missing ack contract %q", want)
 		}
@@ -525,12 +521,17 @@ func TestWarmMintTakeMintsWhenExpired(t *testing.T) {
 // TestBaseKoePersona: the pre-fetch warm-session persona is the base persona plus
 // (only) the pinned language — no user context / agent list yet.
 func TestBaseKoePersona(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "0")
 	if got := baseKoePersona(koeConfig{language: ""}); got != koePersona {
 		t.Errorf("empty language should give the bare base persona")
 	}
 	zh := baseKoePersona(koeConfig{language: "zh"})
 	if !strings.HasPrefix(zh, koePersona) || !strings.Contains(zh, koeLanguageInstruction("zh")) {
 		t.Errorf("zh base persona missing base or language pin: %q", zh)
+	}
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	if got := baseKoePersona(koeConfig{}); !strings.Contains(got, koeMultiTaskPersona) {
+		t.Error("ledger persona must teach immediate ack and multi-task addressing")
 	}
 }
 
@@ -548,7 +549,7 @@ func TestBuildKoePersonaAssembly(t *testing.T) {
 
 	agents := []koe.AgentSummary{{Slug: "finance", DisplayName: "Finance"}}
 	got := buildKoePersona(context.Background(), koe.NewDaemonClient(daemon.URL), koeConfig{language: "en"}, agents)
-	for _, want := range []string{koePersona, "USER_CONTEXT_MARKER", koeAgentListLine(agents), koeLanguageInstruction("en")} {
+	for _, want := range []string{koePersona, "USER_CONTEXT_MARKER", koeAgentListLine(agents), koeLanguageInstruction("en"), koeMultiTaskPersona} {
 		if !strings.Contains(got, want) {
 			t.Errorf("buildKoePersona missing %q", want)
 		}
@@ -673,10 +674,11 @@ func TestKoeCmdHasBargeInFlag(t *testing.T) {
 	}
 }
 
-// TestApplyBargeInEnv locks the flag→env bridge: --barge-in on flips both env-gated
-// knobs to "1"; off leaves them untouched (power-user env escape hatch preserved).
+// TestApplyBargeInEnv locks the flag→env bridge: native floor is on while remote
+// irreversible interruption is off.
 func TestApplyBargeInEnv(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "")
+	t.Setenv("KOE_NATIVE_FLOOR", "")
 	t.Setenv("KOE_INTERRUPT_RESPONSE", "")
 
 	applyBargeInEnv(false)
@@ -686,13 +688,19 @@ func TestApplyBargeInEnv(t *testing.T) {
 	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "" {
 		t.Fatalf("barge-in off set KOE_INTERRUPT_RESPONSE=%q, want unchanged", v)
 	}
+	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "" {
+		t.Fatalf("barge-in off set KOE_NATIVE_FLOOR=%q, want unchanged", v)
+	}
 
 	applyBargeInEnv(true)
 	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
 		t.Fatalf("KOE_VPIO_BARGE_IN=%q, want 1", v)
 	}
-	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "1" {
-		t.Fatalf("KOE_INTERRUPT_RESPONSE=%q, want 1", v)
+	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "1" {
+		t.Fatalf("KOE_NATIVE_FLOOR=%q, want 1", v)
+	}
+	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "0" {
+		t.Fatalf("KOE_INTERRUPT_RESPONSE=%q, want 0", v)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 // completion) it reports idle. C-minimal wired this but never exercised it
 // mid-flight (sync do_task had no window).
 func TestDispatchGetStatusDuringInFlight(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "0")
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
 
@@ -39,7 +40,7 @@ func TestDispatchGetStatusDuringInFlight(t *testing.T) {
 // get_status would report idle while a delegation is still running.
 func TestCallStateConcurrentInFlight(t *testing.T) {
 	s := NewCallState("burst-x", "")
-	s.SetInFlight("add a reminder")  // do_task #1 goroutine
+	s.SetInFlight("add a reminder")   // do_task #1 goroutine
 	s.SetInFlight("change it to 6pm") // do_task #2 (follow-up) goroutine
 
 	s.ClearInFlight() // #2 returns fast (injected into #1's running turn)

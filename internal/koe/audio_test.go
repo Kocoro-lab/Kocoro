@@ -164,6 +164,39 @@ func TestPlaybackGateDropsFramesUntilEnabled(t *testing.T) {
 	}
 }
 
+func TestPlaybackPauseRetainsFramesForResume(t *testing.T) {
+	a, _ := NewAudioIO()
+	a.SetPlaybackEnabled(true)
+	frame := make([]int16, audioFrameSize)
+	for i := range frame {
+		frame[i] = 8000
+	}
+	for i := 0; i < prerollFrames; i++ {
+		a.Play(append([]int16(nil), frame...))
+	}
+
+	a.SetPlaybackPaused(true)
+	out := make([]byte, audioFrameSize*2)
+	a.renderInto(out)
+	if got := len(a.playBuf); got != prerollFrames {
+		t.Fatalf("paused playback consumed queued frames: got=%d want=%d", got, prerollFrames)
+	}
+	for i, sample := range out {
+		if sample != 0 {
+			t.Fatalf("paused playback emitted non-silence byte %d at %d", sample, i)
+		}
+	}
+
+	a.SetPlaybackPaused(false)
+	a.renderInto(out)
+	if got := len(a.playBuf); got != prerollFrames-1 {
+		t.Fatalf("resumed playback did not continue queue: got=%d want=%d", got, prerollFrames-1)
+	}
+	if a.PlaybackIdle() {
+		t.Fatal("resumed non-silent frame must be audible")
+	}
+}
+
 func TestSubUint64ClampsCounterReset(t *testing.T) {
 	if got := subUint64(10, 3); got != 7 {
 		t.Fatalf("subUint64(10, 3) = %d, want 7", got)
