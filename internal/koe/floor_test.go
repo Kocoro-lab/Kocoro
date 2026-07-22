@@ -208,3 +208,86 @@ func TestNativeFloorJudgeTimeoutResumesInsteadOfStrandingAudio(t *testing.T) {
 		t.Fatalf("timeout frames = %v, want judge response.cancel", cap.types())
 	}
 }
+
+func TestNativeFloorSplitCommitKeepsOriginalJudgeQueued(t *testing.T) {
+	enableNativeFloorForTest(t)
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newEventHandler(nil, NewCallState("burst-floor", ""), audio, func(any) error { return nil })
+	h.fullDuplexAEC = true
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"source-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+
+	if got := len(h.loopRespReq); got != 1 {
+		t.Fatalf("split overlap queued responses=%d, want one floor judge", got)
+	}
+	judge := <-h.loopRespReq
+	if judge.purpose != responsePurposeFloor || judge.turnID != 1 {
+		t.Fatalf("split overlap displaced judge: %+v", judge)
+	}
+	if !h.toolLoop.isCurrent(1) || h.toolLoop.isCurrent(2) {
+		t.Fatal("split overlap must not preempt the floor-owning turn")
+	}
+}
+
+func TestNativeFloorQueuedJudgeTimeoutResumesBeforeResponseCreated(t *testing.T) {
+	enableNativeFloorForTest(t)
+	t.Setenv("KOE_NATIVE_FLOOR_RESOLVE_MS", "20")
+	t.Setenv("KOE_PLAYBACK_IDLE_HOLD_MS", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newEventHandler(nil, NewCallState("burst-floor", ""), audio, func(any) error { return nil })
+	h.fullDuplexAEC = true
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"source-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	audio.Play(make([]int16, audioFrameSize))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+
+	waitUntil(t, func() bool { return !audio.PlaybackPaused() }, "queued floor judge timeout did not resume playback")
+	if got := len(h.loopRespReq); got != 0 {
+		t.Fatalf("timed-out floor judge remained queued: %d", got)
+	}
+}
+
+func TestNativeFloorResumeRearmsDeferredOutputStop(t *testing.T) {
+	enableNativeFloorForTest(t)
+	t.Setenv("KOE_PLAYBACK_IDLE_HOLD_MS", "5")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "100")
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newEventHandler(nil, NewCallState("burst-floor", ""), audio, func(any) error { return nil })
+	h.fullDuplexAEC = true
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"source-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	audio.Play(make([]int16, audioFrameSize))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	judge := <-h.loopRespReq
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"source-1","status":"completed"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.stopped"}`))
+	if !h.outputBufferActive.Load() {
+		t.Fatal("paused output stop must remain deferred until the floor decision")
+	}
+
+	h.setPendingResponse(judge)
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"judge-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"judge-1","call_id":"floor-call","name":"resume_playback","arguments":"{}"}`))
+
+	waitUntil(t, func() bool {
+		return !h.outputBufferActive.Load() && !audio.dropCapture()
+	}, "resume did not rearm deferred output drain")
+}

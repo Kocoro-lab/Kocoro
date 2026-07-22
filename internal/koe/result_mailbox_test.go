@@ -220,8 +220,8 @@ func TestResultDeliverySurvivesRealtimeTeardown(t *testing.T) {
 			resultContext <- string(payload)
 		}
 		if frame.Type == "response.create" {
+			h2.handleEvent(context.Background(), responseCreatedForRequest("result-response", v))
 			secondCreate <- frame.Response.Instructions
-			h2.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"result-response","status":"in_progress"}}`))
 		}
 		return nil
 	}, m, nil)
@@ -267,8 +267,8 @@ func TestResultDeliveryWaitsForActiveCallAndUserFloor(t *testing.T) {
 	h = newEventHandlerWithMailbox(nil, nil, nil, func(v any) error {
 		payload, _ := json.Marshal(v)
 		if strings.Contains(string(payload), `"type":"response.create"`) {
+			h.handleEvent(context.Background(), responseCreatedForRequest("result-response", v))
 			signalNonBlocking(creates)
-			h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"result-response"}}`))
 		}
 		return nil
 	}, m, active.Load)
@@ -298,6 +298,62 @@ func TestResultDeliveryWaitsForActiveCallAndUserFloor(t *testing.T) {
 	case <-creates:
 	case <-time.After(time.Second):
 		t.Fatal("result was not announced after the user yielded")
+	}
+}
+
+func TestResultDeliveryIgnoresUnrelatedResponseLifecycle(t *testing.T) {
+	m := NewResultMailbox()
+	h := newEventHandlerWithMailbox(nil, nil, nil, func(any) error { return nil }, m, nil)
+	m.Enqueue(SayResult{TaskID: "task-a", Status: "ok", Reply: "Done."}, false)
+	if got := len(m.claim(h.resultOwner)); got != 1 {
+		t.Fatalf("claimed result count=%d, want 1", got)
+	}
+	h.beginResultBatch()
+	h.setPendingResponse(responseCreateRequest{
+		purpose: responsePurposeTaskResult, toolMode: responseToolsDisabled, requestID: "result-request-1",
+	})
+
+	// A server-created user response may race the local result response. It has no
+	// Koe request token and must neither acknowledge the sender nor own the lease.
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"user-response"}}`))
+	if len(h.respCreated) != 0 {
+		t.Fatal("unrelated response.created acknowledged the pending result request")
+	}
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"user-response","status":"completed"}}`))
+	if got := m.pending(); got != 1 {
+		t.Fatalf("unrelated response.done removed pending result: pending=%d", got)
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"result-response","metadata":{"koe_request_id":"result-request-1","koe_purpose":"task_result"}}}`))
+	if len(h.respCreated) != 1 {
+		t.Fatal("matching result response.created did not acknowledge the sender")
+	}
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"result-response","status":"completed"}}`))
+	if got := m.pending(); got != 0 {
+		t.Fatalf("matching result response.done did not complete result: pending=%d", got)
+	}
+}
+
+func TestResultDeliveryHeldDoneCompletesOnlyAfterFloorResume(t *testing.T) {
+	m := NewResultMailbox()
+	h := newEventHandlerWithMailbox(nil, nil, nil, func(any) error { return nil }, m, nil)
+	m.Enqueue(SayResult{TaskID: "task-a", Status: "ok", Reply: "Done."}, false)
+	if got := len(m.claim(h.resultOwner)); got != 1 {
+		t.Fatalf("claimed result count=%d, want 1", got)
+	}
+	h.beginResultBatch()
+	h.bindResultBatch("result-response")
+	if !h.floor.begin("result-response") || !h.floor.noteUserCommit(1) {
+		t.Fatal("failed to establish held result response")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"result-response","status":"completed"}}`))
+	if got := m.pending(); got != 1 {
+		t.Fatalf("held result completed before floor decision: pending=%d", got)
+	}
+	h.applyNativeFloorDecision(h.floor.failTurn(1))
+	if got := m.pending(); got != 0 {
+		t.Fatalf("resumed held result was not completed: pending=%d", got)
 	}
 }
 

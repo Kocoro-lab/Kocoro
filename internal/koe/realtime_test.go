@@ -102,6 +102,34 @@ func (c *captureSender) responseCreateInstructions() []string {
 	return out
 }
 
+func responseCreatedForRequest(responseID string, request any) []byte {
+	requestJSON, _ := json.Marshal(request)
+	var frame struct {
+		Response struct {
+			Metadata map[string]string `json:"metadata"`
+		} `json:"response"`
+	}
+	_ = json.Unmarshal(requestJSON, &frame)
+	event, _ := json.Marshal(map[string]any{
+		"type": "response.created",
+		"response": map[string]any{
+			"id": responseID, "status": "in_progress", "metadata": frame.Response.Metadata,
+		},
+	})
+	return event
+}
+
+func (c *captureSender) latestResponseCreatedEvent(responseID string) []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := len(c.sent) - 1; i >= 0; i-- {
+		if c.sent[i]["type"] == "response.create" {
+			return responseCreatedForRequest(responseID, c.sent[i])
+		}
+	}
+	return responseCreatedForRequest(responseID, nil)
+}
+
 // TestHandleFunctionCallDoTaskAsync verifies the deferred-ack flow: the running
 // output consumes the call id, then the complete final reply lands in the durable
 // mailbox for native Realtime delivery.
@@ -1232,7 +1260,7 @@ func TestResponseSenderRetriesOnActiveResponseRejection(t *testing.T) {
 	waitUntil(func() bool { return cap.countType("response.create") >= 2 }, "rejection did not trigger a retry")
 
 	// Accept the retry; no further creates after that.
-	h.handleEvent(ctx, []byte(`{"type":"response.created"}`))
+	h.handleEvent(ctx, cap.latestResponseCreatedEvent("retry-accepted"))
 	time.Sleep(200 * time.Millisecond)
 	if n := cap.countType("response.create"); n != 2 {
 		t.Errorf("expected exactly 2 response.create (1 + 1 retry), got %d", n)

@@ -352,7 +352,7 @@ func TestToolLoopAggregatesCallsIntoOneContinuation(t *testing.T) {
 			creates++
 			continuationPayload = frame
 			mu.Unlock()
-			h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"continued"}}`))
+			h.handleEvent(context.Background(), responseCreatedForRequest("continued", v))
 		}
 		return nil
 	})
@@ -409,7 +409,7 @@ func TestToolLoopBudgetRejectsFifthSideEffectAndClosesWithoutTools(t *testing.T)
 		_ = json.Unmarshal(payload, &frame)
 		if frame["type"] == "response.create" {
 			closure <- frame
-			h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"closure"}}`))
+			h.handleEvent(context.Background(), responseCreatedForRequest("closure", v))
 		}
 		return nil
 	})

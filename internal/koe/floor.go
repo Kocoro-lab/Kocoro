@@ -124,6 +124,15 @@ func (f *nativeFloorController) bindJudge(responseID string, turnID int64) bool 
 	return true
 }
 
+func (f *nativeFloorController) awaitingJudge(turnID int64) bool {
+	if f == nil || turnID <= 0 {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stage == floorWaitingForJudge && f.turnID == turnID
+}
+
 func (f *nativeFloorController) claim(responseID, callID, tool string) floorToolClaim {
 	if f == nil || responseID == "" {
 		return floorToolClaim{}
@@ -213,17 +222,18 @@ func (f *nativeFloorController) failTurn(turnID int64) floorDecision {
 	return floorDecisionResume
 }
 
-func (f *nativeFloorController) failJudge(responseID string) floorDecision {
-	if f == nil || responseID == "" {
-		return floorDecisionNone
+func (f *nativeFloorController) timeoutTurn(turnID int64) (floorDecision, string) {
+	if f == nil || turnID <= 0 {
+		return floorDecisionNone, ""
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.judgeResponseID != responseID || f.stage != floorJudging {
-		return floorDecisionNone
+	if f.turnID != turnID || (f.stage != floorWaitingForJudge && f.stage != floorJudging) {
+		return floorDecisionNone, ""
 	}
+	judgeResponseID := f.judgeResponseID
 	f.resetLocked()
-	return floorDecisionResume
+	return floorDecisionResume, judgeResponseID
 }
 
 func (f *nativeFloorController) abort() bool {

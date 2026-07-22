@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,17 +113,17 @@ type eventHandler struct {
 	// sends serially, waits for respCreated/respRejected, and retries a rejection.
 	respReq      chan responseCreateRequest // queued response.create requests
 	loopRespReq  chan responseCreateRequest // durable latest turn-loop continuation/closure
-	respCreated  chan struct{}              // signalled (buffered 1) on response.created
+	respCreated  chan struct{}              // signalled only when response.created matches the pending request token
 	respRejected chan struct{}              // signalled (buffered 1) on the active-response error
 	// resultMailbox is the connection-independent delivery plane for completed
-	// do_task speech. resultOwner leases one batch to this handler until a completed
-	// response.done acknowledges it; teardown releases the lease for the next warm
-	// Realtime session.
+	// do_task speech. resultOwner leases one batch to this handler until its bound
+	// response ID reaches a completed response.done; teardown releases the lease
+	// for the next warm Realtime session.
 	resultMailbox *ResultMailbox
 	resultOwner   string
 	canAnnounce   func() bool
 	resultBatchMu sync.Mutex
-	resultBatch   bool
+	resultBatch   resultBatchState
 	resultRetries int
 	// userSpeaking prevents an async task result from taking the floor in the
 	// middle of the user's utterance. Both native server VAD and the local audio
@@ -132,9 +133,9 @@ type eventHandler struct {
 	floor        *nativeFloorController
 	activeRespMu sync.Mutex
 	activeRespID string
-	// pendingResponse binds the next response.created id to the serialized
-	// response.create that caused it. Native user responses arrive with no pending
-	// request and are registered against the newest committed turn.
+	// pendingResponse binds a response.created only when its echoed metadata token
+	// matches the serialized response.create that caused it. Native user responses
+	// carry no local token and are registered against the newest committed turn.
 	pendingResponseMu sync.Mutex
 	pendingResponse   *responseCreateRequest
 }
@@ -154,6 +155,14 @@ type responseCreateRequest struct {
 	turnID          int64
 	toolMode        responseToolMode
 	dropIfPreempted bool
+	requestID       string
+}
+
+type resultBatchState struct {
+	active     bool
+	responseID string
+	done       bool
+	delivered  bool
 }
 
 func (h *eventHandler) emitVoiceState(state string) {
@@ -264,11 +273,12 @@ func (h *eventHandler) releaseSpeakingTail() {
 	h.releaseSpeakingAfter(time.Duration(koeEnvInt("KOE_SPEAKING_TAIL_MS", defaultSpeakingTailMS)) * time.Millisecond)
 }
 
-// releaseSpeakingAfterOutputBufferWait is the missing-stop-event watchdog: after
-// response.done with the output buffer still active, it releases the speaking
-// gate once local playout has actually DRAINED (output level silent for the idle
-// hold), with the wait+tail hard cap as backstop. Releasing on a fixed clock cut
-// long result reads mid-word — audio playout routinely outlives response.done by
+// releaseSpeakingAfterOutputBufferWait is the missing-stop-event watchdog. It is
+// armed after response.done with the output buffer still active and when native
+// floor resumes a stop event deferred during pause. It releases the speaking gate
+// once local playout has actually DRAINED (output level silent for the idle hold),
+// with the wait+tail hard cap as backstop. Releasing on a fixed clock cut long
+// result reads mid-word — audio playout routinely outlives response.done by
 // 15-30s. A real output_audio_buffer.stopped (or a new response) bumps the epoch
 // and this poller stands down.
 func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
@@ -542,7 +552,10 @@ func (h *eventHandler) reportUsage(raw []byte) {
 	h.onUsage(body)
 }
 
-var resultHandlerSeq atomic.Uint64
+var (
+	resultHandlerSeq   atomic.Uint64
+	responseRequestSeq atomic.Uint64
+)
 
 func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error) *eventHandler {
 	mailbox := NewResultMailbox()
@@ -621,9 +634,7 @@ func (h *eventHandler) requestResponseWith(req responseCreateRequest) {
 // response.created or the active-response rejection, and retries a rejection.
 func (h *eventHandler) runResponseSender(ctx context.Context) {
 	defer func() {
-		if h.floor.abort() {
-			h.finishResultBatch(false)
-		}
+		h.floor.abort()
 		h.releaseResultBatch(false)
 	}()
 	for {
@@ -662,16 +673,46 @@ func (h *eventHandler) queueLoopResponse(req responseCreateRequest) {
 		return
 	default:
 	}
-	// A newer committed turn makes the previous queued continuation obsolete.
-	// Replace instead of dropping the current turn's required continuation/closure.
+	// A native-floor judge owns paused playback and cannot be displaced by an
+	// ordinary continuation/user response. Losing it before response.created would
+	// leave the controller in floorWaitingForJudge with no response-level timeout.
+	var queued responseCreateRequest
 	select {
-	case <-h.loopRespReq:
+	case queued = <-h.loopRespReq:
 	default:
 	}
+	if queued.purpose == responsePurposeFloor && h.floor.awaitingJudge(queued.turnID) {
+		select {
+		case h.loopRespReq <- queued:
+		default:
+			h.applyNativeFloorDecision(h.floor.failTurn(queued.turnID))
+		}
+		if eventLogEnabled() {
+			log.Printf("koe[floor]: preserved queued judge turn=%d; deferred purpose=%s turn=%d", queued.turnID, req.purpose, req.turnID)
+		}
+		return
+	}
+	// Outside the floor hold, a newer committed turn makes the previous queued
+	// continuation obsolete. Replace instead of dropping the current turn's
+	// required continuation/closure.
 	select {
 	case h.loopRespReq <- req:
 	default:
 		log.Printf("koe[loop]: failed to queue critical response turn=%d", req.turnID)
+	}
+}
+
+func (h *eventHandler) dropQueuedFloor(turnID int64) {
+	select {
+	case queued := <-h.loopRespReq:
+		if queued.purpose == responsePurposeFloor && queued.turnID == turnID {
+			return
+		}
+		select {
+		case h.loopRespReq <- queued:
+		default:
+		}
+	default:
 	}
 }
 
@@ -680,13 +721,21 @@ func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreat
 		if req.dropIfPreempted && !h.toolLoop.isCurrent(req.turnID) {
 			return false
 		}
+		if req.purpose == responsePurposeFloor && !h.floor.awaitingJudge(req.turnID) {
+			return false
+		}
 		if !h.waitRespIdle(ctx) {
 			return false // ctx done
 		}
+		if req.purpose == responsePurposeFloor && !h.floor.awaitingJudge(req.turnID) {
+			return false
+		}
 		drainSignal(h.respCreated) // clear stale acks from the previous turn
 		drainSignal(h.respRejected)
-		h.setPendingResponse(req)
-		if err := h.sendFn(responseCreatePayload(req)); err != nil {
+		attemptReq := req
+		attemptReq.requestID = fmt.Sprintf("koe-%d", responseRequestSeq.Add(1))
+		h.setPendingResponse(attemptReq)
+		if err := h.sendFn(responseCreatePayload(attemptReq)); err != nil {
 			h.clearPendingResponse()
 			log.Printf("koe[response]: response.create send failed: %v", err)
 			return false
@@ -726,43 +775,83 @@ func (h *eventHandler) clearPendingResponse() {
 	h.pendingResponseMu.Unlock()
 }
 
-func (h *eventHandler) bindCreatedResponse(responseID string) {
+func responseCreatedMatches(req responseCreateRequest, metadata map[string]string) bool {
+	// Direct unit tests may install a pending request without going through the
+	// serialized sender. Production requests always carry a correlation token.
+	if req.requestID == "" {
+		return true
+	}
+	return metadata["koe_request_id"] == req.requestID
+}
+
+func responsePurposeFromMetadata(metadata map[string]string) (responsePurpose, int64, bool) {
+	purpose := responsePurpose(metadata["koe_purpose"])
+	switch purpose {
+	case responsePurposeUser, responsePurposeContinuation, responsePurposeClosure,
+		responsePurposeTaskResult, responsePurposeSynthetic, responsePurposeFloor:
+	default:
+		return "", 0, false
+	}
+	turnID, _ := strconv.ParseInt(metadata["koe_turn_id"], 10, 64)
+	return purpose, turnID, true
+}
+
+// bindCreatedResponse returns true only when this created response acknowledges
+// the currently pending local response.create. Server-created user responses and
+// stale local responses still enter the lifecycle, but cannot wake the sender or
+// inherit the pending request's tool/result authority.
+func (h *eventHandler) bindCreatedResponse(responseID string, metadata map[string]string) bool {
 	if responseID == "" {
-		return
+		return false
 	}
 	h.pendingResponseMu.Lock()
 	pending := h.pendingResponse
-	h.pendingResponse = nil
+	matched := pending != nil && responseCreatedMatches(*pending, metadata)
+	if matched {
+		h.pendingResponse = nil
+	}
 	h.pendingResponseMu.Unlock()
-	if pending != nil {
+	if matched {
 		if pending.purpose == responsePurposeFloor {
-			if h.floor.bindJudge(responseID, pending.turnID) {
-				h.watchNativeFloorJudge(responseID)
-			}
+			h.floor.bindJudge(responseID, pending.turnID)
+		}
+		if pending.purpose == responsePurposeTaskResult {
+			h.bindResultBatch(responseID)
 		}
 		if ToolContinuationEnabled() {
 			h.toolLoop.bindResponse(responseID, pending.purpose, pending.turnID)
 		}
-		return
+		return true
 	}
 	if !ToolContinuationEnabled() {
-		return
+		return false
 	}
-	// No local response.create caused this response: it belongs to the newest
-	// native user turn produced by the server VAD path.
-	h.toolLoop.bindResponse(responseID, responsePurposeUser, h.inputCommitSeq.Load())
+	// Metadata preserves tool authority for a late local response without letting
+	// it acknowledge a different pending request. No metadata means this is the
+	// server-created response for the newest native user turn.
+	purpose, turnID, ok := responsePurposeFromMetadata(metadata)
+	if !ok {
+		purpose, turnID = responsePurposeUser, h.inputCommitSeq.Load()
+	}
+	h.toolLoop.bindResponse(responseID, purpose, turnID)
+	return false
 }
 
-func (h *eventHandler) watchNativeFloorJudge(responseID string) {
+func (h *eventHandler) watchNativeFloorTurn(turnID int64) {
 	time.AfterFunc(time.Duration(koeEnvInt("KOE_NATIVE_FLOOR_RESOLVE_MS", defaultNativeFloorResolveMS))*time.Millisecond, func() {
-		decision := h.floor.failJudge(responseID)
+		decision, judgeResponseID := h.floor.timeoutTurn(turnID)
 		if decision == floorDecisionNone {
 			return
 		}
-		log.Printf("koe[floor]: judge timed out response_id=%q — resuming playback", responseID)
-		_ = h.sendFn(map[string]any{"type": "response.cancel"})
-		h.respBusy.Store(false)
-		h.clearActiveResponseID(responseID)
+		h.dropQueuedFloor(turnID)
+		if judgeResponseID != "" {
+			log.Printf("koe[floor]: judge timed out turn=%d response_id=%q — resuming playback", turnID, judgeResponseID)
+			_ = h.sendFn(map[string]any{"type": "response.cancel"})
+			h.respBusy.Store(false)
+			h.clearActiveResponseID(judgeResponseID)
+		} else {
+			log.Printf("koe[floor]: queued judge timed out turn=%d — resuming playback", turnID)
+		}
 		h.applyNativeFloorDecision(decision)
 	})
 }
@@ -801,9 +890,7 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 	if len(results) == 0 {
 		return
 	}
-	h.resultBatchMu.Lock()
-	h.resultBatch = true
-	h.resultBatchMu.Unlock()
+	h.beginResultBatch()
 
 	if eventLogEnabled() {
 		log.Printf("koe[result]: announcing count=%d task_ids=%q", len(results), resultTaskIDs(results))
@@ -852,16 +939,58 @@ func (h *eventHandler) waitResultVoiceGap(ctx context.Context) bool {
 	}
 }
 
-func (h *eventHandler) finishResultBatch(delivered bool) {
+func (h *eventHandler) beginResultBatch() {
 	h.resultBatchMu.Lock()
-	active := h.resultBatch
-	if active {
-		h.resultBatch = false
-	}
+	h.resultBatch = resultBatchState{active: true}
 	h.resultBatchMu.Unlock()
-	if !active {
+}
+
+func (h *eventHandler) bindResultBatch(responseID string) {
+	if responseID == "" {
 		return
 	}
+	h.resultBatchMu.Lock()
+	if h.resultBatch.active && h.resultBatch.responseID == "" {
+		h.resultBatch.responseID = responseID
+	}
+	h.resultBatchMu.Unlock()
+}
+
+func (h *eventHandler) deferResultBatchDone(responseID string, delivered bool) bool {
+	h.resultBatchMu.Lock()
+	defer h.resultBatchMu.Unlock()
+	if !h.resultBatch.active || responseID == "" || h.resultBatch.responseID != responseID {
+		return false
+	}
+	h.resultBatch.done = true
+	h.resultBatch.delivered = delivered
+	return true
+}
+
+func (h *eventHandler) finishDeferredResultBatch() {
+	h.resultBatchMu.Lock()
+	if !h.resultBatch.active || !h.resultBatch.done {
+		h.resultBatchMu.Unlock()
+		return
+	}
+	delivered := h.resultBatch.delivered
+	h.resultBatch = resultBatchState{}
+	h.resultBatchMu.Unlock()
+	h.completeOrReleaseResultBatch(delivered)
+}
+
+func (h *eventHandler) finishResultBatch(responseID string, delivered bool) {
+	h.resultBatchMu.Lock()
+	if !h.resultBatch.active || responseID == "" || h.resultBatch.responseID != responseID {
+		h.resultBatchMu.Unlock()
+		return
+	}
+	h.resultBatch = resultBatchState{}
+	h.resultBatchMu.Unlock()
+	h.completeOrReleaseResultBatch(delivered)
+}
+
+func (h *eventHandler) completeOrReleaseResultBatch(delivered bool) {
 	if delivered {
 		removed := h.resultMailbox.complete(h.resultOwner)
 		if eventLogEnabled() {
@@ -875,7 +1004,7 @@ func (h *eventHandler) finishResultBatch(delivered bool) {
 
 func (h *eventHandler) releaseResultBatch(wake bool) {
 	h.resultBatchMu.Lock()
-	h.resultBatch = false
+	h.resultBatch = resultBatchState{}
 	h.resultBatchMu.Unlock()
 	if h.resultMailbox.release(h.resultOwner) > 0 && wake {
 		h.resultMailbox.Wake()
@@ -969,6 +1098,7 @@ func (h *eventHandler) queueNativeFloorJudge(turnID int64) {
 		turnID:       turnID,
 		toolMode:     responseToolsFloor,
 	})
+	h.watchNativeFloorTurn(turnID)
 }
 
 func (h *eventHandler) queueAcceptedNativeTurn(turnID int64) {
@@ -988,8 +1118,11 @@ func (h *eventHandler) applyNativeFloorDecision(decision floorDecision) {
 			h.audio.SetPlaybackPaused(false)
 			h.audio.SetSpeaking(true)
 		}
-		h.finishResultBatch(true)
+		h.finishDeferredResultBatch()
 		h.resultMailbox.Wake()
+		if h.outputBufferActive.Load() {
+			h.releaseSpeakingAfterOutputBufferWait()
+		}
 		h.emitVoiceState("speaking")
 		if eventLogEnabled() {
 			log.Printf("koe[floor]: playback resumed")
@@ -1003,8 +1136,7 @@ func (h *eventHandler) applyNativeFloorDecision(decision floorDecision) {
 			h.audio.SetPlaybackEnabled(false)
 		}
 		_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
-		h.finishResultBatch(false)
-		h.resultMailbox.Wake()
+		h.releaseResultBatch(true)
 		h.maybeRestoreUserMic()
 		h.emitVoiceState("thinking")
 		if eventLogEnabled() {
@@ -1049,10 +1181,16 @@ func responseCreatePayload(req responseCreateRequest) map[string]any {
 	if strings.TrimSpace(req.instructions) != "" {
 		response["instructions"] = req.instructions
 	}
-	if req.purpose != "" {
-		metadata := map[string]string{"koe_purpose": string(req.purpose)}
+	if req.purpose != "" || req.requestID != "" {
+		metadata := map[string]string{}
+		if req.purpose != "" {
+			metadata["koe_purpose"] = string(req.purpose)
+		}
 		if req.turnID > 0 {
 			metadata["koe_turn_id"] = fmt.Sprintf("%d", req.turnID)
+		}
+		if req.requestID != "" {
+			metadata["koe_request_id"] = req.requestID
 		}
 		response["metadata"] = metadata
 	}
@@ -1289,17 +1427,29 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: endpoint_committed turn=%d after_speech_stop_ms=%d configured_silence_ms=%d", turnID, elapsedMS(h.speechStoppedAt, time.Now()), koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS))
 		}
-		if ToolContinuationEnabled() {
-			h.toolLoop.noteUserCommit(turnID)
-		}
 		if h.nativeFloorEnabled() {
 			if h.floor.noteUserCommit(turnID) {
+				if ToolContinuationEnabled() {
+					h.toolLoop.noteUserCommit(turnID)
+				}
 				h.queueNativeFloorJudge(turnID)
+			} else if h.floor.holdsPlayback() {
+				// Far-field VAD can split one overlap into multiple commits. The first
+				// committed turn already owns the paused response and its judge; do not
+				// preempt that authority or enqueue an ordinary response over it.
+				if eventLogEnabled() {
+					log.Printf("koe[floor]: coalesced split overlap commit turn=%d", turnID)
+				}
 			} else {
+				if ToolContinuationEnabled() {
+					h.toolLoop.noteUserCommit(turnID)
+				}
 				// Native floor owns response creation, but an ordinary non-overlap turn
 				// remains eager: commit and response.create are adjacent, with no ASR wait.
 				h.queueAcceptedNativeTurn(turnID)
 			}
+		} else if ToolContinuationEnabled() {
+			h.toolLoop.noteUserCommit(turnID)
 		}
 	case "conversation.item.input_audio_transcription.completed":
 		h.handleInputTranscript(ev.Transcript)
@@ -1307,7 +1457,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// Treat failed ASR like unclear audio. Do not guess.
 		h.emitVoiceState("listening")
 	case "response.created":
-		h.bindCreatedResponse(ev.Response.ID)
+		matchedPending := h.bindCreatedResponse(ev.Response.ID, ev.Response.Metadata)
 		h.setActiveResponseID(ev.Response.ID)
 		h.responseSeq.Add(1)
 		h.responseCreatedAt = time.Now()
@@ -1337,7 +1487,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.audio.SetPlaybackEnabled(true)
 			h.audio.SetSpeaking(true)
 		}
-		signalNonBlocking(h.respCreated) // ack the sender's pending response.create
+		if matchedPending {
+			signalNonBlocking(h.respCreated) // ack only this sender's response.create
+		}
 	case "error":
 		// Always log the payload, not just the type: the 2026-07-02 mid-call VAD
 		// failures were undiagnosable from "koe[event]: error" alone (commit
@@ -1446,8 +1598,10 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// back in the mailbox so the next quiet boundary or connection can retry.
 		delivered := ev.Response.Status == "" || ev.Response.Status == "completed"
 		sourceHeld := h.floor.holdsSource(ev.Response.ID)
-		if !sourceHeld || !delivered {
-			h.finishResultBatch(delivered)
+		if sourceHeld && delivered {
+			h.deferResultBatchDone(ev.Response.ID, delivered)
+		} else {
+			h.finishResultBatch(ev.Response.ID, delivered)
 		}
 		h.applyNativeFloorDecision(h.floor.finishResponse(ev.Response.ID))
 		if ToolContinuationEnabled() {
