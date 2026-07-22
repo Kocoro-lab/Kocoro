@@ -164,6 +164,7 @@ func TestSessionConfigNativeFloorOwnsResponseCreation(t *testing.T) {
 	s := string(raw)
 	for _, want := range []string{
 		`"type":"server_vad"`,
+		`"threshold":0.5`,
 		`"create_response":false`,
 		`"interrupt_response":false`,
 	} {

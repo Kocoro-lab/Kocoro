@@ -1144,15 +1144,17 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 	// Barge-in (interruptResponse) forwards the mic continuously during playback and
 	// leans on the server VAD to detect talk-over. Default to server_vad there — it
 	// reacts to the user speaking over Kocoro more directly than semantic_vad's
-	// "wait for a complete thought" — and raise the detection threshold so residual
-	// speaker echo on the uplink is less likely to self-interrupt (headphones need it
-	// less, speakers more). Barge-in off keeps the low-eagerness semantic_vad. Both
-	// stay env-overridable (KOE_TURN_DETECTION / KOE_VAD_THRESHOLD).
+	// "wait for a complete thought". Keep the server threshold at its documented
+	// 0.50 example: HIL on the built-in Mac mic found a sharp cliff where 0.55/0.60
+	// missed sustained real speech that the local gate had already forwarded. Known
+	// self-audio (earcons) is suppressed deterministically in AudioIO instead of
+	// making every user speak louder. Barge-in off keeps low-eagerness semantic_vad.
+	// Both stay env-overridable (KOE_TURN_DETECTION / KOE_VAD_THRESHOLD).
 	defaultTurn := "semantic_vad"
 	defaultThreshold := 0.50
 	if interruptResponse || nativeFloor {
 		defaultTurn = "server_vad"
-		defaultThreshold = 0.60
+		defaultThreshold = 0.50
 	}
 	vadThreshold := koeEnvFloat("KOE_VAD_THRESHOLD", defaultThreshold)
 	turnMode := koeEnvString("KOE_TURN_DETECTION", defaultTurn)
