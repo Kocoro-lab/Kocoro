@@ -30,8 +30,13 @@ func TestRunAgent_IdempotencyKeyReturnsCompletedRunWithoutSecondLLMCall(t *testi
 	deps := runAgentContractTestDeps(t, gateway.URL)
 	defer deps.SessionCache.CloseAll()
 	req := RunAgentRequest{
-		Text:           "write the report",
-		Source:         "desktop",
+		Text: "write the report",
+		// heartbeat (not desktop): this test compares gateway call counts, so
+		// the source must fire neither the async smart-title upgrade nor the
+		// prompt-suggestion fork — both are detached goroutines that hit the
+		// same counted gateway and race the assertions (flaked on CI 2026-07-22).
+		// The idempotency path itself is source-agnostic.
+		Source:         "heartbeat",
 		SessionID:      "task-12345678",
 		NewSession:     true,
 		IdempotencyKey: "deliverable:12345678",
@@ -81,8 +86,10 @@ func TestRunAgent_FailedIdempotentRequestNeverReplaysAutomatically(t *testing.T)
 	deps := runAgentContractTestDeps(t, gateway.URL)
 	defer deps.SessionCache.CloseAll()
 	req := RunAgentRequest{
-		Text:           "write the report",
-		Source:         "desktop",
+		Text: "write the report",
+		// heartbeat, not desktop — same call-count-race rationale as the
+		// dedup test above.
+		Source:         "heartbeat",
 		SessionID:      "task-87654321",
 		NewSession:     true,
 		IdempotencyKey: "deliverable:87654321",
