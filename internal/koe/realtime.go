@@ -129,6 +129,9 @@ type eventHandler struct {
 	// floor update it; no ASR text participates in this decision.
 	userSpeaking atomic.Bool
 	toolLoop     *toolLoopLedger
+	floor        *nativeFloorController
+	activeRespMu sync.Mutex
+	activeRespID string
 	// pendingResponse binds the next response.created id to the serialized
 	// response.create that caused it. Native user responses arrive with no pending
 	// request and are registered against the newest committed turn.
@@ -142,6 +145,7 @@ const (
 	responseToolsInherited responseToolMode = ""
 	responseToolsEnabled   responseToolMode = "enabled"
 	responseToolsDisabled  responseToolMode = "disabled"
+	responseToolsFloor     responseToolMode = "floor"
 )
 
 type responseCreateRequest struct {
@@ -169,6 +173,16 @@ func (h *eventHandler) voiceState() string {
 
 const (
 	defaultSpeakingTailMS = 900
+	// defaultVADSilenceMS is the fixed native endpoint used for VPIO barge-in.
+	// WORKLOAD: natural sentence pauses during close-range voice interaction.
+	// SYMPTOM if too low: one thought splits into multiple turns; if too high:
+	// response onset feels delayed. OVERRIDE: KOE_VAD_SILENCE_MS. Keep fixed until
+	// HIL measurements establish the latency/false-cutoff curve.
+	defaultVADSilenceMS = 1500
+	// A lost/malformed native floor response must not leave playback frozen.
+	// This exceeds the response.create acknowledgement timeout and is only a hard
+	// recovery cap. OVERRIDE: KOE_NATIVE_FLOOR_RESOLVE_MS.
+	defaultNativeFloorResolveMS = 8000
 	// defaultOutputBufferStopWaitMS is the HARD CAP backstop for a lost
 	// output_audio_buffer.stopped event — no longer the primary release (that is
 	// the drain-aware PlaybackIdle poll). WORKLOAD: long do_task result reads play
@@ -326,6 +340,7 @@ func (h *eventHandler) stopOutput(keepInput bool) {
 	h.barged.Store(true)
 	h.outputBufferActive.Store(false)
 	h.respBusy.Store(false)
+	h.clearActiveResponseID("")
 	if h.audio != nil {
 		h.audio.SetSpeaking(false)
 		h.audio.SetPlaybackEnabled(false)
@@ -476,7 +491,9 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 				if eventLogEnabled() {
 					log.Printf("koe[timing]: local_commit_fallback seq=%d commit acked", seq)
 				}
-				h.requestResponse()
+				if !h.nativeFloorEnabled() {
+					h.requestResponse()
+				}
 				return
 			}
 			if h.commitEmptySeq.Load() != startCommitEmptySeq {
@@ -545,6 +562,7 @@ func newEventHandlerWithMailbox(disp *Dispatcher, state *CallState, audio *Audio
 		resultOwner:   fmt.Sprintf("realtime-%d", resultHandlerSeq.Add(1)),
 		canAnnounce:   canAnnounce,
 		toolLoop:      newToolLoopLedger(),
+		floor:         newNativeFloorController(),
 	}
 	mailbox.Wake()
 	return h
@@ -598,19 +616,40 @@ func (h *eventHandler) requestResponseWith(req responseCreateRequest) {
 // waits for any active response to finish, sends response.create, waits for
 // response.created or the active-response rejection, and retries a rejection.
 func (h *eventHandler) runResponseSender(ctx context.Context) {
-	defer h.releaseResultBatch(false)
+	defer func() {
+		if h.floor.abort() {
+			h.finishResultBatch(false)
+		}
+		h.releaseResultBatch(false)
+	}()
 	for {
+		// Turn-local control responses outrank asynchronous result delivery. This
+		// keeps a paused playback decision and a tool continuation adjacent to the
+		// user turn that caused it.
+		select {
+		case req := <-h.loopRespReq:
+			h.sendQueuedResponse(ctx, req)
+			continue
+		default:
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-h.resultMailbox.notifications():
 			h.sendResultBatch(ctx)
 		case req := <-h.loopRespReq:
-			h.sendResponseCreate(ctx, req)
+			h.sendQueuedResponse(ctx, req)
 		case req := <-h.respReq:
-			h.sendResponseCreate(ctx, req)
+			h.sendQueuedResponse(ctx, req)
 		}
 	}
+}
+
+func (h *eventHandler) sendQueuedResponse(ctx context.Context, req responseCreateRequest) {
+	if h.sendResponseCreate(ctx, req) || req.purpose != responsePurposeFloor {
+		return
+	}
+	h.applyNativeFloorDecision(h.floor.failTurn(req.turnID))
 }
 
 func (h *eventHandler) queueLoopResponse(req responseCreateRequest) {
@@ -684,7 +723,7 @@ func (h *eventHandler) clearPendingResponse() {
 }
 
 func (h *eventHandler) bindCreatedResponse(responseID string) {
-	if !ToolContinuationEnabled() || responseID == "" {
+	if responseID == "" {
 		return
 	}
 	h.pendingResponseMu.Lock()
@@ -692,12 +731,56 @@ func (h *eventHandler) bindCreatedResponse(responseID string) {
 	h.pendingResponse = nil
 	h.pendingResponseMu.Unlock()
 	if pending != nil {
-		h.toolLoop.bindResponse(responseID, pending.purpose, pending.turnID)
+		if pending.purpose == responsePurposeFloor {
+			if h.floor.bindJudge(responseID, pending.turnID) {
+				h.watchNativeFloorJudge(responseID)
+			}
+		}
+		if ToolContinuationEnabled() {
+			h.toolLoop.bindResponse(responseID, pending.purpose, pending.turnID)
+		}
+		return
+	}
+	if !ToolContinuationEnabled() {
 		return
 	}
 	// No local response.create caused this response: it belongs to the newest
 	// native user turn produced by the server VAD path.
 	h.toolLoop.bindResponse(responseID, responsePurposeUser, h.inputCommitSeq.Load())
+}
+
+func (h *eventHandler) watchNativeFloorJudge(responseID string) {
+	time.AfterFunc(time.Duration(koeEnvInt("KOE_NATIVE_FLOOR_RESOLVE_MS", defaultNativeFloorResolveMS))*time.Millisecond, func() {
+		decision := h.floor.failJudge(responseID)
+		if decision == floorDecisionNone {
+			return
+		}
+		log.Printf("koe[floor]: judge timed out response_id=%q — resuming playback", responseID)
+		_ = h.sendFn(map[string]any{"type": "response.cancel"})
+		h.respBusy.Store(false)
+		h.clearActiveResponseID(responseID)
+		h.applyNativeFloorDecision(decision)
+	})
+}
+
+func (h *eventHandler) setActiveResponseID(responseID string) {
+	h.activeRespMu.Lock()
+	h.activeRespID = responseID
+	h.activeRespMu.Unlock()
+}
+
+func (h *eventHandler) clearActiveResponseID(responseID string) {
+	h.activeRespMu.Lock()
+	if responseID == "" || h.activeRespID == responseID {
+		h.activeRespID = ""
+	}
+	h.activeRespMu.Unlock()
+}
+
+func (h *eventHandler) activeResponseID() string {
+	h.activeRespMu.Lock()
+	defer h.activeRespMu.Unlock()
+	return h.activeRespID
 }
 
 const resultVoicePollInterval = 20 * time.Millisecond
@@ -737,6 +820,9 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 
 func (h *eventHandler) waitResultVoiceGap(ctx context.Context) bool {
 	for {
+		if len(h.loopRespReq) > 0 {
+			return false
+		}
 		if h.canAnnounce != nil && !h.canAnnounce() {
 			return false
 		}
@@ -836,6 +922,108 @@ func (h *eventHandler) finishToolLoopResponse(responseID string) {
 	}
 }
 
+func (h *eventHandler) nativeFloorEnabled() bool {
+	return h != nil && nativeFloorControlEnabled(h.fullDuplexAEC)
+}
+
+// pauseForNativeFloor locally freezes the exact queued PCM without cancelling or
+// truncating the source response. Realtime keeps hearing the raw overlapping user
+// audio; only the later narrow floor response may resume or discard this playback.
+func (h *eventHandler) pauseForNativeFloor() bool {
+	if !h.nativeFloorEnabled() || !h.floor.begin(h.activeResponseID()) {
+		return false
+	}
+	h.speakingEpoch.Add(1)
+	if h.audio != nil {
+		h.audio.SetPlaybackPaused(true)
+	}
+	if eventLogEnabled() {
+		log.Printf("koe[floor]: playback paused source_response_id=%q", h.activeResponseID())
+	}
+	return true
+}
+
+func (h *eventHandler) queueNativeFloorJudge(turnID int64) {
+	h.queueLoopResponse(responseCreateRequest{
+		instructions: nativeFloorInstructions,
+		purpose:      responsePurposeFloor,
+		turnID:       turnID,
+		toolMode:     responseToolsFloor,
+	})
+}
+
+func (h *eventHandler) queueAcceptedNativeTurn(turnID int64) {
+	h.queueLoopResponse(responseCreateRequest{
+		purpose:         responsePurposeUser,
+		turnID:          turnID,
+		toolMode:        responseToolsEnabled,
+		dropIfPreempted: true,
+	})
+}
+
+func (h *eventHandler) applyNativeFloorDecision(decision floorDecision) {
+	switch decision {
+	case floorDecisionResume:
+		if h.audio != nil {
+			h.audio.SetPlaybackEnabled(true)
+			h.audio.SetPlaybackPaused(false)
+			h.audio.SetSpeaking(true)
+		}
+		h.finishResultBatch(true)
+		h.resultMailbox.Wake()
+		h.emitVoiceState("speaking")
+		if eventLogEnabled() {
+			log.Printf("koe[floor]: playback resumed")
+		}
+	case floorDecisionAccept:
+		h.speakingEpoch.Add(1)
+		h.outputBufferActive.Store(false)
+		if h.audio != nil {
+			h.audio.SetPlaybackPaused(false)
+			h.audio.SetSpeaking(false)
+			h.audio.SetPlaybackEnabled(false)
+		}
+		_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
+		h.finishResultBatch(false)
+		h.resultMailbox.Wake()
+		h.maybeRestoreUserMic()
+		h.emitVoiceState("thinking")
+		if eventLogEnabled() {
+			log.Printf("koe[floor]: playback discarded; accepted user turn")
+		}
+	}
+}
+
+func (h *eventHandler) handleNativeFloorTool(responseID, callID, name string) bool {
+	claim := h.floor.claim(responseID, callID, name)
+	if !claim.handled {
+		return false
+	}
+	if claim.duplicate {
+		if eventLogEnabled() {
+			log.Printf("koe[floor]: duplicate decision ignored response_id=%q call_id=%q", responseID, callID)
+		}
+		return true
+	}
+	if claim.decision == floorDecisionNone {
+		h.sendFunctionOutput(callID, mustJSON(map[string]any{
+			"status": "failed", "error_code": claim.reason,
+			"message": "This floor action was not accepted.",
+		}))
+		return true
+	}
+	status := "resumed"
+	if claim.decision == floorDecisionAccept {
+		status = "accepted"
+	}
+	h.sendFunctionOutput(callID, mustJSON(map[string]any{"status": status}))
+	h.applyNativeFloorDecision(claim.decision)
+	if claim.decision == floorDecisionAccept {
+		h.queueAcceptedNativeTurn(claim.turnID)
+	}
+	return true
+}
+
 func responseCreatePayload(req responseCreateRequest) map[string]any {
 	payload := map[string]any{"type": "response.create"}
 	response := map[string]any{}
@@ -856,6 +1044,10 @@ func responseCreatePayload(req responseCreateRequest) map[string]any {
 		response["parallel_tool_calls"] = true
 	case responseToolsDisabled:
 		response["tools"] = []ToolDef{}
+	case responseToolsFloor:
+		response["tools"] = nativeFloorToolDefs()
+		response["tool_choice"] = "required"
+		response["parallel_tool_calls"] = false
 	}
 	if len(response) > 0 {
 		payload["response"] = response
@@ -937,22 +1129,18 @@ func outcomeKindLog(kind OutcomeKind) string {
 // tool_choice stays "auto" — forcing a specific function under output_modalities
 // ["audio"] makes GA emit the call as text instead of a real function call.
 //
-// Turn detection uses Realtime VAD with create_response=true: OpenAI owns turn
-// segmentation and starts the spoken response automatically. The default (barge-in
-// off) is semantic_vad — less eager on ambient/noisy audio and more tolerant of
-// backchannels while still deciding end-of-turn server-side, with server-side
-// interruption OFF (half-duplex, the mic is muted while Kocoro speaks).
-// Barge-in ON inverts both: it defaults to server_vad (reacts to talk-over more
-// directly) with interrupt_response ON and a higher VAD threshold (0.60) to resist
-// residual speaker echo self-interrupting. KOE_TURN_DETECTION / KOE_VAD_THRESHOLD /
-// KOE_INTERRUPT_RESPONSE override either mode. Far-field noise reduction is on by
-// default for the laptop speaker/mic case; set KOE_NOISE_REDUCTION=off for raw input.
+// Turn detection remains native Realtime VAD. Half-duplex sessions let the server
+// create responses automatically. Native-floor barge-in keeps server interruption
+// off and uses create_response=false so Koe can first ask the same S2S model a
+// narrow raw-audio floor question; no transcript gates the normal turn.
 func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
-	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", 900)
+	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
 	interruptResponse := false
 	if fullDuplexAEC {
 		interruptResponse = koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
 	}
+	nativeFloor := nativeFloorControlEnabled(fullDuplexAEC)
+	createResponse := !nativeFloor
 	// Barge-in (interruptResponse) forwards the mic continuously during playback and
 	// leans on the server VAD to detect talk-over. Default to server_vad there — it
 	// reacts to the user speaking over Kocoro more directly than semantic_vad's
@@ -962,19 +1150,19 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 	// stay env-overridable (KOE_TURN_DETECTION / KOE_VAD_THRESHOLD).
 	defaultTurn := "semantic_vad"
 	defaultThreshold := 0.50
-	if interruptResponse {
+	if interruptResponse || nativeFloor {
 		defaultTurn = "server_vad"
 		defaultThreshold = 0.60
 	}
 	vadThreshold := koeEnvFloat("KOE_VAD_THRESHOLD", defaultThreshold)
 	turnMode := koeEnvString("KOE_TURN_DETECTION", defaultTurn)
-	log.Printf("koe[barge]: sessionConfig fullDuplexAEC=%v interrupt_response=%v turn=%s threshold=%.2f", fullDuplexAEC, interruptResponse, turnMode, vadThreshold)
+	log.Printf("koe[barge]: sessionConfig fullDuplexAEC=%v native_floor=%v create_response=%v interrupt_response=%v turn=%s threshold=%.2f silence_ms=%d", fullDuplexAEC, nativeFloor, createResponse, interruptResponse, turnMode, vadThreshold, vadSilenceMS)
 	var turnDetection map[string]any
 	if strings.EqualFold(turnMode, "semantic_vad") {
 		turnDetection = map[string]any{
 			"type":               "semantic_vad",
 			"eagerness":          koeEnvString("KOE_SEMANTIC_VAD_EAGERNESS", "low"),
-			"create_response":    true,
+			"create_response":    createResponse,
 			"interrupt_response": interruptResponse,
 		}
 	} else {
@@ -983,7 +1171,7 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 			"threshold":           vadThreshold,
 			"prefix_padding_ms":   300,
 			"silence_duration_ms": vadSilenceMS,
-			"create_response":     true,
+			"create_response":     createResponse,
 			"interrupt_response":  interruptResponse,
 		}
 	}
@@ -1055,8 +1243,12 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// the interruption is instant (interrupt_response=true cancels the response
 		// server-side in parallel).
 		if koeEnvBool("KOE_VPIO_BARGE_IN", false) && h.isSpeakingOrResponding() {
-			log.Printf("koe[barge]: talk-over detected — stopping playback")
-			h.bargeInStopPlayback()
+			if h.pauseForNativeFloor() {
+				log.Printf("koe[barge]: talk-over detected — playback paused for native floor decision")
+			} else {
+				log.Printf("koe[barge]: talk-over detected — stopping playback")
+				h.bargeInStopPlayback()
+			}
 		}
 		h.emitVoiceState("listening")
 	case "input_audio_buffer.speech_stopped":
@@ -1070,8 +1262,20 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// spoken response automatically.
 	case "input_audio_buffer.committed":
 		turnID := h.inputCommitSeq.Add(1)
+		if eventLogEnabled() {
+			log.Printf("koe[timing]: endpoint_committed turn=%d after_speech_stop_ms=%d configured_silence_ms=%d", turnID, elapsedMS(h.speechStoppedAt, time.Now()), koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS))
+		}
 		if ToolContinuationEnabled() {
 			h.toolLoop.noteUserCommit(turnID)
+		}
+		if h.nativeFloorEnabled() {
+			if h.floor.noteUserCommit(turnID) {
+				h.queueNativeFloorJudge(turnID)
+			} else {
+				// Native floor owns response creation, but an ordinary non-overlap turn
+				// remains eager: commit and response.create are adjacent, with no ASR wait.
+				h.queueAcceptedNativeTurn(turnID)
+			}
 		}
 	case "conversation.item.input_audio_transcription.completed":
 		h.handleInputTranscript(ev.Transcript)
@@ -1080,6 +1284,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		h.emitVoiceState("listening")
 	case "response.created":
 		h.bindCreatedResponse(ev.Response.ID)
+		h.setActiveResponseID(ev.Response.ID)
 		h.responseSeq.Add(1)
 		h.responseCreatedAt = time.Now()
 		if eventLogEnabled() {
@@ -1137,6 +1342,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			log.Printf("koe[tool]: call name=%q call_id=%q args=%s", ev.Name, ev.CallID, logMaybeBytes(args, 500))
 		}
 		sameResponseDoTask := false
+		if h.handleNativeFloorTool(ev.ResponseID, ev.CallID, ev.Name) {
+			break
+		}
 		if ToolContinuationEnabled() {
 			claim := h.toolLoop.claimAction(ev.ResponseID, ev.CallID, ev.Name, args)
 			if claim.duplicate {
@@ -1185,12 +1393,19 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: output_stopped after_response_done_ms=%d output_ms=%d", elapsedMS(h.responseDoneAt, now), elapsedMS(h.outputStartedAt, now))
 		}
+		if h.floor.holdsPlayback() {
+			if eventLogEnabled() {
+				log.Printf("koe[floor]: output_stopped deferred while playback is paused")
+			}
+			return
+		}
 		if !h.outputBufferActive.Swap(false) {
 			if eventLogEnabled() {
 				log.Printf("koe[timing]: output_stopped ignored after local release")
 			}
 			return
 		}
+		h.clearActiveResponseID("")
 		// WebRTC-only: reply audio fully drained (fires after response.done) — the
 		// PRECISE SPEAKING→IDLE boundary. Keep a short local tail because CoreAudio
 		// can still have speaker energy after the server says its output buffer ended.
@@ -1200,7 +1415,11 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// only after a completed response.done. Cancelled/failed responses put it
 		// back in the mailbox so the next quiet boundary or connection can retry.
 		delivered := ev.Response.Status == "" || ev.Response.Status == "completed"
-		h.finishResultBatch(delivered)
+		sourceHeld := h.floor.holdsSource(ev.Response.ID)
+		if !sourceHeld || !delivered {
+			h.finishResultBatch(delivered)
+		}
+		h.applyNativeFloorDecision(h.floor.finishResponse(ev.Response.ID))
 		if ToolContinuationEnabled() {
 			h.finishToolLoopResponse(ev.Response.ID)
 		}
@@ -1212,10 +1431,16 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// mic if output_audio_buffer.started fired; response.done can precede local
 		// playback drain, and releasing here lets Koe hear its own tail.
 		h.respBusy.Store(false)
-		if h.outputBufferActive.Load() {
+		if sourceHeld {
+			// Preserve exact queued PCM and any result lease until the narrow judge
+			// chooses resume or accept.
+		} else if h.outputBufferActive.Load() {
 			h.releaseSpeakingAfterOutputBufferWait()
 		} else {
 			h.releaseSpeakingTail()
+		}
+		if !h.outputBufferActive.Load() {
+			h.clearActiveResponseID(ev.Response.ID)
 		}
 		h.reportUsage(raw)
 	case "response.output_audio_transcript.done":
@@ -1232,6 +1457,12 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 func (h *eventHandler) handleInputTranscript(transcript string) {
 	if os.Getenv("KOE_TRANSCRIPT_LOG") == "1" {
 		log.Printf("koe[transcript]: %q", transcript)
+	}
+	// ASR is evidence only and is excluded from the default control path. This
+	// legacy deterministic dismiss backstop remains an explicit rollback/debug
+	// switch; native floor and normal response admission never wait for it.
+	if !koeEnvBool("KOE_ASR_DISMISS_BACKSTOP", false) {
+		return
 	}
 	// Deterministic dismiss backstop: a whole-utterance control phrase (闭嘴/停/够了/
 	// 退出/再见/bye/…) hangs up regardless of whether the model also calls end_call —

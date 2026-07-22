@@ -19,6 +19,7 @@ const (
 	responsePurposeClosure      responsePurpose = "closure"
 	responsePurposeTaskResult   responsePurpose = "task_result"
 	responsePurposeSynthetic    responsePurpose = "synthetic"
+	responsePurposeFloor        responsePurpose = "floor"
 )
 
 func (purpose responsePurpose) allowsTools() bool {

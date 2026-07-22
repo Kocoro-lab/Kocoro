@@ -39,7 +39,7 @@ type koeConfig struct {
 	audioProcessing string // auto | mac_voice | clean_device; controls whether VPIO applies or bypasses Apple's voice processing
 	micDevice       string // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
 	speakerDevice   string // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
-	bargeIn         bool   // --barge-in: allow interrupting Kocoro while it speaks (enables KOE_VPIO_BARGE_IN + KOE_INTERRUPT_RESPONSE; vpio backend only)
+	bargeIn         bool   // --barge-in: reversible native-S2S floor control while Kocoro speaks (vpio backend only)
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
 	// mic/ears. All empty/zero = normal mic+speaker device.
 	sayText     string // --say: synthesize this text (macOS say) as the mic input
@@ -74,27 +74,24 @@ func resolveDevKey(flagKey, envKey, controlPort string) string {
 	return ""
 }
 
-// applyBargeInEnv turns the two env-gated barge-in behaviors on when the user
-// enabled barge-in in Kocoro Desktop (forwarded as --barge-in). KOE_VPIO_BARGE_IN
-// lets sustained user speech pass the half-duplex capture gate while Kocoro speaks
-// (audio.go); KOE_INTERRUPT_RESPONSE lets Realtime cancel its own response on that
-// speech (realtime.go, honored only on the VPIO backend). Both are no-ops on the
-// gate backend, so setting them when the flag is on is safe. The flag is the
-// Desktop-facing switch; leaving it off preserves the raw KOE_* env vars as a
-// power-user escape hatch.
+// applyBargeInEnv enables the VPIO raw-audio floor loop. Playback pauses locally;
+// Realtime then chooses resume_playback or accept_turn without ASR admission.
+// KOE_NATIVE_FLOOR=0 plus KOE_INTERRUPT_RESPONSE=1 remains the rollback to the old
+// irreversible server-cancel experiment.
 func applyBargeInEnv(bargeIn bool) {
 	if !bargeIn {
 		return
 	}
 	os.Setenv("KOE_VPIO_BARGE_IN", "1")
-	os.Setenv("KOE_INTERRUPT_RESPONSE", "1")
-	log.Printf("koe[barge]: --barge-in on — KOE_VPIO_BARGE_IN=%s KOE_INTERRUPT_RESPONSE=%s",
-		os.Getenv("KOE_VPIO_BARGE_IN"), os.Getenv("KOE_INTERRUPT_RESPONSE"))
+	os.Setenv("KOE_NATIVE_FLOOR", "1")
+	os.Setenv("KOE_INTERRUPT_RESPONSE", "0")
+	log.Printf("koe[barge]: --barge-in on — KOE_VPIO_BARGE_IN=%s KOE_NATIVE_FLOOR=%s KOE_INTERRUPT_RESPONSE=%s",
+		os.Getenv("KOE_VPIO_BARGE_IN"), os.Getenv("KOE_NATIVE_FLOOR"), os.Getenv("KOE_INTERRUPT_RESPONSE"))
 }
 
 // bargeInBackendWarning returns a non-empty warning when barge-in is enabled on a
 // backend that cannot honor it. Barge-in lives entirely on the VPIO capture path
-// (shouldForwardVPIOCapture) and the fullDuplexAEC-gated interrupt_response; the
+// (shouldForwardVPIOCapture) and the fullDuplexAEC-gated native floor; the
 // gate/oto fallback never reads either, so --barge-in there is a silent no-op.
 func bargeInBackendWarning(bargeIn bool, aec string) string {
 	if bargeIn && aec != "vpio" {
@@ -299,7 +296,7 @@ func init() {
 	koeCmd.Flags().String("audio-processing", "", "voice processing: auto (default) | mac_voice | clean_device")
 	koeCmd.Flags().String("mic-device", "", "CoreAudio input device UID (empty = system default; vpio backend only)")
 	koeCmd.Flags().String("speaker-device", "", "CoreAudio output device UID (empty = system default; vpio backend only)")
-	koeCmd.Flags().Bool("barge-in", false, "allow interrupting Kocoro while it speaks (barge-in; enables KOE_VPIO_BARGE_IN + KOE_INTERRUPT_RESPONSE, vpio backend only)")
+	koeCmd.Flags().Bool("barge-in", false, "allow native-S2S interruption while Kocoro speaks (reversible pause; vpio backend only)")
 	koeCmd.Flags().String("say", "", "debug: synthesize this text as the mic input (macOS say) — headless file mode")
 	koeCmd.Flags().String("audio-in", "", "debug: WAV file to feed as the mic input — headless file mode")
 	koeCmd.Flags().String("audio-out", "", "debug: capture the reply audio to this WAV")
@@ -644,8 +641,8 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// --barge-in flips the two env-gated barge-in knobs on before any audio/session
-	// code reads them (covers both the Desktop and standalone branches below).
+	// --barge-in selects native floor control before any audio/session code reads
+	// the env gates (covers both Desktop and standalone branches below).
 	applyBargeInEnv(cfg.bargeIn)
 	if w := bargeInBackendWarning(cfg.bargeIn, cfg.aec); w != "" {
 		log.Printf("koe[barge]: WARNING — %s", w)

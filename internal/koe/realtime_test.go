@@ -760,13 +760,22 @@ func TestSessionConfigCanUseServerVAD(t *testing.T) {
 	for _, want := range []string{
 		`"type":"server_vad"`,
 		`"threshold":0.5`,
-		`"silence_duration_ms":900`,
+		`"silence_duration_ms":1500`,
 		`"create_response":true`,
 		`"interrupt_response":false`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("sessionConfig missing %s in %s", want, s)
 		}
+	}
+}
+
+func TestSessionConfigCanOverrideServerVADSilence(t *testing.T) {
+	t.Setenv("KOE_TURN_DETECTION", "server_vad")
+	t.Setenv("KOE_VAD_SILENCE_MS", "2100")
+	raw, _ := json.Marshal(sessionConfig("persona", "marin", true))
+	if !strings.Contains(string(raw), `"silence_duration_ms":2100`) {
+		t.Fatalf("KOE_VAD_SILENCE_MS should override the default: %s", raw)
 	}
 }
 
@@ -1153,6 +1162,7 @@ func TestLocalCommitFallbackSkipsWhenTaskStartsDuringDelay(t *testing.T) {
 // a strong dismiss like "闭嘴" — including its decorated containment form — is about
 // talking, not the task, and must still hang up.
 func TestDismissContainmentHangsUpWhileTaskInFlight(t *testing.T) {
+	t.Setenv("KOE_ASR_DISMISS_BACKSTOP", "1")
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	cap := &captureSender{}

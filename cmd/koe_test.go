@@ -678,10 +678,11 @@ func TestKoeCmdHasBargeInFlag(t *testing.T) {
 	}
 }
 
-// TestApplyBargeInEnv locks the flag→env bridge: --barge-in on flips both env-gated
-// knobs to "1"; off leaves them untouched (power-user env escape hatch preserved).
+// TestApplyBargeInEnv locks the flag→env bridge: native floor is on while remote
+// irreversible interruption is off.
 func TestApplyBargeInEnv(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "")
+	t.Setenv("KOE_NATIVE_FLOOR", "")
 	t.Setenv("KOE_INTERRUPT_RESPONSE", "")
 
 	applyBargeInEnv(false)
@@ -691,13 +692,19 @@ func TestApplyBargeInEnv(t *testing.T) {
 	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "" {
 		t.Fatalf("barge-in off set KOE_INTERRUPT_RESPONSE=%q, want unchanged", v)
 	}
+	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "" {
+		t.Fatalf("barge-in off set KOE_NATIVE_FLOOR=%q, want unchanged", v)
+	}
 
 	applyBargeInEnv(true)
 	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
 		t.Fatalf("KOE_VPIO_BARGE_IN=%q, want 1", v)
 	}
-	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "1" {
-		t.Fatalf("KOE_INTERRUPT_RESPONSE=%q, want 1", v)
+	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "1" {
+		t.Fatalf("KOE_NATIVE_FLOOR=%q, want 1", v)
+	}
+	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "0" {
+		t.Fatalf("KOE_INTERRUPT_RESPONSE=%q, want 0", v)
 	}
 }
 

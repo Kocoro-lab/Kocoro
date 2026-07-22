@@ -84,6 +84,7 @@ func TestEndCallToolClearsActiveOutputBeforeHangup(t *testing.T) {
 // never calls the end_call tool — the reliable path for the fixed vocabulary. A
 // non-dismiss transcript must NOT hang up.
 func TestDismissTranscriptHangsUp(t *testing.T) {
+	t.Setenv("KOE_ASR_DISMISS_BACKSTOP", "1")
 	newH := func() (*eventHandler, chan struct{}) {
 		audio, err := NewAudioIO()
 		if err != nil {
@@ -142,6 +143,19 @@ func TestDismissTranscriptHangsUp(t *testing.T) {
 			t.Fatal("explicit dismiss during a task did not hang up")
 		}
 	})
+}
+
+func TestTranscriptIsEvidenceOnlyByDefault(t *testing.T) {
+	t.Setenv("KOE_ASR_DISMISS_BACKSTOP", "0")
+	h := newEventHandler(nil, NewCallState("burst-dismiss", ""), nil, func(any) error { return nil })
+	hung := make(chan struct{}, 1)
+	h.onEndCall = func() { hung <- struct{}{} }
+	h.handleInputTranscript("闭嘴")
+	select {
+	case <-hung:
+		t.Fatal("default ASR evidence path must not own call control")
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
 // TestEndCallToolNilHookIsSafe: the standalone/CLI path leaves onEndCall nil, so a
