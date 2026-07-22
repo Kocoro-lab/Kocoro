@@ -5,7 +5,10 @@
     "data": {
       "motors_ok": true,
       "daemon_ok": true,
-      "queue_len": 0
+      "queue_len": 0,
+      "current_move": "happy1",
+      "is_listening": true,
+      "breathing_active": false
     },
     "ts": "2026-07-09T12:00:02Z"
   }
