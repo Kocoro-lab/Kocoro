@@ -88,8 +88,7 @@ func annotateElements(pid: Int, roles: [String]?, maxLabels: Int) -> AnnotateRes
         appName = "Unknown"
     }
 
-    guard let windows = axValue(appRef, "AXWindows") as? [AXUIElement],
-          let win = windows.first else {
+    guard let win = axWindows(appRef).first else {
         return nil
     }
 
@@ -168,8 +167,7 @@ func readTree(pid: Int, budget: Int, filter: String) -> ReadTreeResult? {
         appName = "Unknown"
     }
 
-    guard let windows = axValue(appRef, "AXWindows") as? [AXUIElement],
-          let win = windows.first else {
+    guard let win = axWindows(appRef).first else {
         return nil
     }
 

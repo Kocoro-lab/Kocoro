@@ -10,7 +10,13 @@ func performClick(pid: Int, path: String, expectedRole: String?) -> (ActionResul
     }
     let title = axString(el, "AXTitle") ?? ""
     let ctx = currentContext(pid: pid)
-    let err = AXUIElementPerformAction(el, "AXPress" as CFString)
+    let err: AXError
+    if let (cx, cy) = elementCenter(el) {
+        InputDriver.movePointer(to: CGPoint(x: cx, y: cy))
+        err = AXUIElementPerformAction(el, "AXPress" as CFString)
+    } else {
+        err = AXUIElementPerformAction(el, "AXPress" as CFString)
+    }
     if err == .success {
         return (ActionResult(result: "pressed \(role) '\(title)'", role: role, context: ctx), nil)
     }

@@ -51,6 +51,7 @@ func TestSkillExemptInventory(t *testing.T) {
 		{"process", &ProcessTool{}, false},
 		{"applescript", &AppleScriptTool{}, false},
 		{"accessibility", &AccessibilityTool{}, false},
+		{"computer_use", &ComputerUseTool{}, false},
 		{"ghostty", &GhosttyTool{}, false},
 		{"browser", &BrowserTool{}, false},
 		{"screenshot", &ScreenshotTool{}, false},

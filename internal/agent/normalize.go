@@ -23,6 +23,7 @@ var ToolFamilies = map[string]string{
 	"x_search":      "web",
 	"browser":       "browser",
 	"accessibility": "gui",
+	"computer_use":  "gui",
 	"screenshot":    "gui",
 	"computer":      "gui",
 	"applescript":   "gui",

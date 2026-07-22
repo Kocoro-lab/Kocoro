@@ -102,6 +102,7 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	reg.Register(&AppleScriptTool{})
 	axClient := SharedAXClient()
 	reg.Register(&AccessibilityTool{client: axClient})
+	reg.Register(&ComputerUseTool{client: axClient})
 	reg.Register(&GhosttyTool{tabs: newTabRegistry()})
 
 	browser := &BrowserTool{}
@@ -130,8 +131,8 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 }
 
 // CloneWithRuntimeConfig returns a registry clone with session-scoped local tool
-// settings applied. Tools with per-run mutable state (BashTool, CloudDelegateTool)
-// are deep-copied so concurrent routes don't share mutable fields.
+// settings applied. Tools with per-run mutable state are deep-copied so
+// concurrent routes don't share refs, state IDs, dimensions, or handlers.
 func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.ToolRegistry {
 	if reg == nil {
 		return nil
@@ -163,6 +164,35 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 				bashCopy.ConcurrencyEnabled = cfg.Agent.BashConcurrencyEnabled
 			}
 			cloned.Register(&bashCopy)
+		}
+	}
+
+	// AX-backed GUI tools share the process-wide transport (ax_server accepts
+	// one client) but never their run-local observations or cached dimensions.
+	if raw, ok := cloned.Get("accessibility"); ok {
+		if existing, ok := raw.(*AccessibilityTool); ok {
+			toolCopy := *existing
+			toolCopy.refs = nil
+			toolCopy.lastPID = 0
+			cloned.Register(&toolCopy)
+		}
+	}
+	if raw, ok := cloned.Get("computer_use"); ok {
+		if existing, ok := raw.(*ComputerUseTool); ok {
+			toolCopy := *existing
+			toolCopy.snapshot = nil
+			toolCopy.refs = nil
+			toolCopy.screenW = 0
+			toolCopy.screenH = 0
+			cloned.Register(&toolCopy)
+		}
+	}
+	if raw, ok := cloned.Get("computer"); ok {
+		if existing, ok := raw.(*ComputerTool); ok {
+			toolCopy := *existing
+			toolCopy.screenW = 0
+			toolCopy.screenH = 0
+			cloned.Register(&toolCopy)
 		}
 	}
 

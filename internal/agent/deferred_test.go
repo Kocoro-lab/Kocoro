@@ -482,12 +482,13 @@ func TestDeferredToolNames_IncludesLocalCategoricals(t *testing.T) {
 	reg.Register(&mockTool{name: "file_write"})
 	// Categorical local tools that MUST be deferred:
 	reg.Register(&mockTool{name: "computer"})
+	reg.Register(&mockTool{name: "computer_use"})
 	reg.Register(&mockTool{name: "schedule_create"})
 	reg.Register(&mockTool{name: "browser_navigate"})
 
 	deferred := deferredToolNames(reg)
 
-	mustDefer := []string{"computer", "schedule_create", "browser_navigate"}
+	mustDefer := []string{"computer", "computer_use", "schedule_create", "browser_navigate"}
 	for _, n := range mustDefer {
 		if !deferred[n] {
 			t.Errorf("expected %q to be in deferred set, got %v", n, mapKeys(deferred))

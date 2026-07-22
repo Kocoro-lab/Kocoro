@@ -975,6 +975,21 @@ func TestBrowserInToolFamilies(t *testing.T) {
 	}
 }
 
+func TestComputerUseAgentClassifications(t *testing.T) {
+	if !isGUIToolName("computer_use") {
+		t.Error("computer_use must receive GUI loop/iteration handling")
+	}
+	if !visualTools["computer_use"] || !repeatableGUITools["computer_use"] {
+		t.Error("computer_use must be visual and repeatable")
+	}
+	if got := toolFamily("computer_use"); got != "gui" {
+		t.Errorf("toolFamily(computer_use) = %q, want gui", got)
+	}
+	if toolResultBudgetEligible("computer_use", ToolResultBudgetOptions{}) {
+		t.Error("computer_use semantic/image observations must not spill through generic result budgeting")
+	}
+}
+
 // TestLoopDetector_BrowserToolsRepeatable ensures that browser_* MCP tools
 // are treated as repeatable GUI tools. Before the fix, `repeatableGUITools`
 // was keyed on the literal string "browser", but real tool names are
