@@ -6,7 +6,7 @@ package koe
 // pre-recorded WAV through the real koe send path (Opus → pion track → OpenAI
 // Realtime) and asserts the back-brain (a mock daemon) receives the do_task the
 // model derived from the spoken words. This proves the KOE SIDE end-to-end:
-// mint → WebRTC → Opus encode → OpenAI ASR → function-call routing → do_task
+// mint → WebRTC → Opus encode → native speech understanding → function-call routing → do_task
 // dispatch. It does NOT exercise the real daemon agent loop (mock) nor OpenAI
 // speaking the answer aloud (the one irreducibly-audible bit that stays manual).
 //
