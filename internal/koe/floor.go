@@ -16,7 +16,7 @@ func nativeFloorControlEnabled(fullDuplexAEC bool) bool {
 		!koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
 }
 
-const nativeFloorInstructions = "Decide turn-taking from the user's most recent RAW SPOKEN AUDIO, not from a transcript. Call exactly one function and say nothing. Call resume_playback for a brief backchannel, filler, laugh, acknowledgement, or non-directed sound that does not ask Kocoro to stop, change, answer, or act. Call accept_turn for a real interruption: a question, request, correction, topic change, explicit stop, or any utterance that expects a response. When uncertain, prefer accept_turn."
+const nativeFloorInstructions = "Decide turn-taking from the user's most recent RAW SPOKEN AUDIO, not from a transcript. Call exactly one function and say nothing. Classify the conversational function, not merely whether speech was detected. Call resume_playback for a brief backchannel, filler, laugh, acknowledgement, or non-directed sound that does not ask Kocoro to stop, change, answer, or act. Clear resume examples include mm-hmm, mhm, uh-huh, hmm, 嗯, 嗯嗯, 对, 好的, うん, はい, laughter, and sighs when they contain no request or correction. Call accept_turn only for semantic content that still needs Kocoro to respond or act after the current speech stops: a question, request, correction, topic change, or explicit stop. If a very short or non-lexical vocalization is ambiguous, prefer resume_playback; if intelligible words may contain a request or correction, prefer accept_turn."
 
 func nativeFloorToolDefs() []ToolDef {
 	return []ToolDef{

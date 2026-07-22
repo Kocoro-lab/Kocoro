@@ -73,6 +73,11 @@ func TestNativeFloorResponseHasOnlyNarrowRequiredTools(t *testing.T) {
 	if len(decoded.Response.Tools) != 2 || decoded.Response.Tools[0].Name != "resume_playback" || decoded.Response.Tools[1].Name != "accept_turn" {
 		t.Fatalf("floor tools = %+v, want only resume_playback and accept_turn", decoded.Response.Tools)
 	}
+	for _, example := range []string{"mm-hmm", "嗯嗯", "うん"} {
+		if !strings.Contains(nativeFloorInstructions, example) {
+			t.Fatalf("native floor instructions lost explicit backchannel example %q", example)
+		}
+	}
 }
 
 func TestNativeFloorAcceptDiscardsPlaybackAndQueuesRawTurnResponse(t *testing.T) {
