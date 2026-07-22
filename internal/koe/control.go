@@ -75,13 +75,18 @@ type SessionLeaseStatus struct {
 // ControlAppFunc seam: when the model calls control_app, the dispatcher's hook
 // calls EmitControlApp and Desktop performs the actual window action.
 type ControlServer struct {
-	mu           sync.Mutex
-	subscribers  map[chan controlEvent]struct{}
-	onStart      func(StartCallRequest)  // Desktop pressed talk: start a call
-	onEnd        func()                  // Desktop ended: tear the call down
-	onInterrupt  func()                  // Desktop explicitly interrupted playback
-	onMic        func(off bool) error    // POST /call/mic (nil until SetMicHandler)
-	onText       func(text string) error // POST /call/text (nil until SetTextHandler)
+	mu          sync.Mutex
+	subscribers map[chan controlEvent]struct{}
+	onStart     func(StartCallRequest)  // Desktop pressed talk: start a call
+	onEnd       func()                  // Desktop ended: tear the call down
+	onInterrupt func()                  // Desktop explicitly interrupted playback
+	onMic       func(off bool) error    // POST /call/mic (nil until SetMicHandler)
+	onText      func(text string) error // POST /call/text (nil until SetTextHandler)
+
+	onMotionPlay   func(name string) error // POST /motion/play (nil until SetMotionHandlers)
+	onMotionStop   func() error            // POST /motion/stop
+	onMotionStatus func() MotionStatus     // GET /motion/status
+
 	onPrepare    func(time.Duration) SessionLeaseStatus
 	onRelease    func() SessionLeaseStatus
 	taskPending  func() bool // nil-safe snapshot providers, stamped on every voice_state
@@ -125,6 +130,17 @@ func (s *ControlServer) SetMicHandler(h func(off bool) error) { s.onMic = h }
 // /call/text report 409 no_active_call: the facility is not plumbed to a session,
 // which is indistinguishable from there being no active call to inject into.
 func (s *ControlServer) SetTextHandler(h func(text string) error) { s.onText = h }
+
+// SetMotionHandlers wires the manual motion routes (POST /motion/play|stop, GET
+// /motion/status) to the MotionController. Called once at startup, before Handler()
+// serves — no locking needed. Any handler left nil makes its route report 404
+// (the motion facility is absent — e.g. a carrier with no body), which is what the
+// runtime facade reads as "Koe has no motion" (merges move: null).
+func (s *ControlServer) SetMotionHandlers(play func(name string) error, stop func() error, status func() MotionStatus) {
+	s.onMotionPlay = play
+	s.onMotionStop = stop
+	s.onMotionStatus = status
+}
 
 // SetSessionHandlers wires the Wireless-only bounded Realtime prewarm lease.
 // Leaving both nil preserves the Mac/Lite control surface byte-for-byte.
@@ -277,6 +293,47 @@ func (s *ControlServer) Handler() http.Handler {
 		}
 		writeControlAccepted(w)
 	})
+	mux.HandleFunc("POST /motion/play", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.Name == "" {
+			http.Error(w, `{"error":"invalid_move"}`, http.StatusBadRequest)
+			return
+		}
+		if s.onMotionPlay == nil {
+			http.Error(w, `{"error":"motion_unavailable"}`, http.StatusNotFound)
+			return
+		}
+		if err := s.onMotionPlay(req.Name); err != nil {
+			writeMotionError(w, err)
+			return
+		}
+		writeControlAccepted(w)
+	})
+	mux.HandleFunc("POST /motion/stop", func(w http.ResponseWriter, r *http.Request) {
+		if s.onMotionStop == nil {
+			http.Error(w, `{"error":"motion_unavailable"}`, http.StatusNotFound)
+			return
+		}
+		if err := s.onMotionStop(); err != nil {
+			writeMotionError(w, err)
+			return
+		}
+		writeControlAccepted(w)
+	})
+	mux.HandleFunc("GET /motion/status", func(w http.ResponseWriter, r *http.Request) {
+		if s.onMotionStatus == nil {
+			http.Error(w, `{"error":"motion_unavailable"}`, http.StatusNotFound)
+			return
+		}
+		status := s.onMotionStatus()
+		if status.Moves == nil {
+			status.Moves = []string{} // never serialize null — Desktop gates on membership
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(status)
+	})
 	mux.HandleFunc("POST /session/prepare", func(w http.ResponseWriter, r *http.Request) {
 		if s.onPrepare == nil {
 			http.NotFound(w, r)
@@ -350,6 +407,24 @@ func writeControlAccepted(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = w.Write([]byte(`{"status":"accepted"}`))
+}
+
+// writeMotionError maps a MotionController / manual-play seam error to its HTTP
+// status: call active → 409, unknown move → 404, bridge disconnected/degraded →
+// 503, anything else → 500. The error's code is echoed as the JSON body.
+func writeMotionError(w http.ResponseWriter, err error) {
+	code := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, ErrCallActive):
+		code = http.StatusConflict
+	case errors.Is(err, ErrUnknownMove):
+		code = http.StatusNotFound
+	case errors.Is(err, ErrBridgeUnavailable):
+		code = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_, _ = w.Write([]byte(`{"error":"` + err.Error() + `"}`))
 }
 
 func writeControlJSON(w http.ResponseWriter, value any) {

@@ -1811,6 +1811,24 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		ctrl.SetBridgeDetailsProvider(motionCtrl.BridgeDetails)
 		go motionCtrl.Run(ctx)
 		log.Printf("koe[reachy]: motion bridge client starting (socket %s)", carrierProfile.BridgeSocket)
+		// Manual move routes (POST /motion/play|stop, GET /motion/status). /motion/play
+		// is refused while a call is active — a manual gesture must not fight the
+		// realtime session's dispatch authority — using the same call-state source
+		// POST /call/text reads (callActive under sessMu). Left unwired on mac (no
+		// body), where the routes 404.
+		ctrl.SetMotionHandlers(
+			func(name string) error {
+				sessMu.Lock()
+				active := callActive
+				sessMu.Unlock()
+				if active {
+					return koe.ErrCallActive
+				}
+				return motionCtrl.ManualPlay(name)
+			},
+			motionCtrl.ManualStop,
+			motionCtrl.Status,
+		)
 	}
 	ctrl.SetSnapshotProviders(
 		func() bool { s := snapState.Load(); return s != nil && s.InFlight() != "" },

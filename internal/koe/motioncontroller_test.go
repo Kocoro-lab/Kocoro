@@ -25,6 +25,9 @@ type fakeBridge struct {
 	moves   []string
 	emitHB  bool
 	hbEvery time.Duration
+	// hbData overrides the status-heartbeat data object; nil uses the default
+	// motors/daemon/queue payload.
+	hbData json.RawMessage
 
 	mu      sync.Mutex
 	writeMu sync.Mutex
@@ -93,7 +96,11 @@ func (fb *fakeBridge) handle(conn net.Conn) {
 			tk := time.NewTicker(fb.hbEvery)
 			defer tk.Stop()
 			for range tk.C {
-				ev := reachy.Event{Event: reachy.EventStatus, Data: json.RawMessage(`{"motors_ok":true,"daemon_ok":true,"queue_len":0}`), Ts: "t"}
+				data := fb.hbData
+				if data == nil {
+					data = json.RawMessage(`{"motors_ok":true,"daemon_ok":true,"queue_len":0}`)
+				}
+				ev := reachy.Event{Event: reachy.EventStatus, Data: data, Ts: "t"}
 				if fb.writeFrame(conn, reachy.FrameEvent, ev) != nil {
 					return
 				}

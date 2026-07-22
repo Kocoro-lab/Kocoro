@@ -2,14 +2,53 @@ package koe
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"log"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/koe/reachy"
 )
+
+// Sentinel errors returned by ManualPlay / ManualStop so the control layer can map
+// each to a distinct HTTP status without knowing the bridge internals:
+//   - ErrUnknownMove       → 404 (name not in the bridge's advertised move set)
+//   - ErrBridgeUnavailable → 503 (bridge disconnected or degraded)
+//
+// ErrCallActive is not raised here — the manual-play seam in cmd/koe.go decides it
+// from the call-state source (the same one POST /call/text reads) and returns it so
+// the control layer maps it to 409; it lives beside the others for that mapping.
+var (
+	ErrUnknownMove       = errors.New("unknown_move")
+	ErrBridgeUnavailable = errors.New("bridge_unavailable")
+	ErrCallActive        = errors.New("call_active")
+)
+
+// MotionStatus is the GET /motion/status snapshot (plan W2-1): the bridge's move
+// catalog (from hello) plus the latest §8 heartbeat fields and the bridge_status
+// state. JSON is snake_case so the runtime facade can merge it verbatim into the
+// 20 Hz motion stream's `move` key and Desktop decodes it with convertFromSnakeCase.
+type MotionStatus struct {
+	Moves           []string `json:"moves"`
+	CurrentMove     string   `json:"current_move"`
+	IsListening     bool     `json:"is_listening"`
+	BreathingActive bool     `json:"breathing_active"`
+	BridgeState     string   `json:"bridge_state"`
+}
+
+// statusSnapshot caches the live fields from the most recent §8 status heartbeat.
+// The bridge's status `data` object today carries motors/daemon/queue fields; when
+// it also carries current_move/is_listening/breathing_active (spec §8) they are
+// picked up here — absent fields stay zero-valued (json ignores unknown keys).
+type statusSnapshot struct {
+	CurrentMove     string `json:"current_move"`
+	IsListening     bool   `json:"is_listening"`
+	BreathingActive bool   `json:"breathing_active"`
+}
 
 // Bridge status states (mirror control.go bridge_status / spec §3-§4).
 const (
@@ -70,6 +109,12 @@ type MotionController struct {
 
 	now          func() time.Time
 	movesApplied atomic.Bool
+
+	// statusSnap (statusSnapshot) and bridgeState (string) are updated by the Run
+	// goroutine and read lock-free by Status()/ManualPlay from the control HTTP
+	// goroutine.
+	statusSnap  atomic.Value
+	bridgeState atomic.Value
 
 	danceAuthorizedUntil time.Time
 	danceAuthWait        time.Duration
@@ -214,6 +259,81 @@ func (mc *MotionController) Express(ctx context.Context, intent string) ExpressR
 	}
 	log.Printf("koe[express]: intent=%s clip=%s status=expressed", intent, clip)
 	return ExpressResult{Expressed: true, Clip: clip}
+}
+
+// ManualPlay plays a named move on operator command (POST /motion/play, dev/robot
+// panel). Unlike Express it does NOT touch the express gate — a manual play is a
+// direct user action, not a budgeted emotional gesture, so it never spends the
+// ≤1/response express budget. The name is validated against the bridge's advertised
+// move set (unknown → ErrUnknownMove); a disconnected or degraded bridge →
+// ErrBridgeUnavailable. preempt is true so a manual play supersedes any in-flight
+// move (play_move preempt semantics).
+func (mc *MotionController) ManualPlay(name string) error {
+	if !mc.bridgeReady() {
+		return ErrBridgeUnavailable
+	}
+	if !mc.moveKnown(name) {
+		return ErrUnknownMove
+	}
+	if err := mc.client.PlayMove(context.Background(), name, true); err != nil {
+		// Dropped between the readiness check and the play.
+		return ErrBridgeUnavailable
+	}
+	return nil
+}
+
+// ManualStop stops any in-flight move (POST /motion/stop). Bridge disconnected or
+// degraded → ErrBridgeUnavailable.
+func (mc *MotionController) ManualStop() error {
+	if !mc.bridgeReady() {
+		return ErrBridgeUnavailable
+	}
+	if err := mc.client.StopMoves(context.Background()); err != nil {
+		return ErrBridgeUnavailable
+	}
+	return nil
+}
+
+// Status returns the GET /motion/status snapshot: the bridge's full move catalog
+// (from hello — the complete list, NOT the express-gate-narrowed pool), the latest
+// §8 heartbeat fields, and the current bridge_status state.
+func (mc *MotionController) Status() MotionStatus {
+	moves := []string{}
+	if h := mc.client.Hello(); h != nil && len(h.Moves) > 0 {
+		moves = append(moves, h.Moves...)
+	}
+	var snap statusSnapshot
+	if v := mc.statusSnap.Load(); v != nil {
+		snap = v.(statusSnapshot)
+	}
+	return MotionStatus{
+		Moves:           moves,
+		CurrentMove:     snap.CurrentMove,
+		IsListening:     snap.IsListening,
+		BreathingActive: snap.BreathingActive,
+		BridgeState:     mc.currentBridgeState(),
+	}
+}
+
+// bridgeReady reports whether a manual command can reach the bridge: the socket is
+// handshaked AND the §10 watchdog has not marked it degraded.
+func (mc *MotionController) bridgeReady() bool {
+	return mc.client.IsConnected() && mc.currentBridgeState() != bridgeStateDegraded
+}
+
+// moveKnown reports whether name is in the bridge's advertised move set (hello).
+func (mc *MotionController) moveKnown(name string) bool {
+	h := mc.client.Hello()
+	return h != nil && slices.Contains(h.Moves, name)
+}
+
+// currentBridgeState returns the last bridge_status emitted by Run ("" before Run
+// has set one).
+func (mc *MotionController) currentBridgeState() string {
+	if v, ok := mc.bridgeState.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 
 // NewResponse resets the express ≤1/response budget (wired to response.created).
@@ -464,6 +584,7 @@ func (mc *MotionController) Run(ctx context.Context) {
 			return
 		}
 		state = s
+		mc.bridgeState.Store(s)
 		if mc.onBridgeStatus != nil {
 			mc.onBridgeStatus(s)
 		}
@@ -481,6 +602,10 @@ func (mc *MotionController) Run(ctx context.Context) {
 			}
 			if ev.Event == reachy.EventStatus {
 				lastStatus = mc.now()
+				var snap statusSnapshot
+				if json.Unmarshal(ev.Data, &snap) == nil {
+					mc.statusSnap.Store(snap)
+				}
 			}
 		case <-ticker.C:
 			if !mc.client.IsConnected() {
