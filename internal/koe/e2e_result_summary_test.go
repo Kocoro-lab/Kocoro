@@ -156,11 +156,11 @@ func TestKoeNativeResultSummaryE2E(t *testing.T) {
 
 func mintE2EEphemeral(ctx context.Context) (string, error) {
 	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
-		return mintEphemeral(ctx, apiKey, e2eModel)
+		return mintEphemeral(ctx, apiKey, e2eModelName())
 	}
 	daemonBase := os.Getenv("KOE_DAEMON_URL")
 	if daemonBase == "" {
 		daemonBase = "http://127.0.0.1:7533"
 	}
-	return NewDaemonClient(daemonBase).MintViaDaemon(ctx, e2eModel)
+	return NewDaemonClient(daemonBase).MintViaDaemon(ctx, e2eModelName())
 }

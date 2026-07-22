@@ -54,7 +54,7 @@ func runNativeFloorTrial(t *testing.T, overlap, expectedTool string) ([]string, 
 	if daemonBase == "" {
 		daemonBase = "http://127.0.0.1:7533"
 	}
-	ek, err := NewDaemonClient(daemonBase).MintViaDaemon(ctx, e2eModel)
+	ek, err := NewDaemonClient(daemonBase).MintViaDaemon(ctx, e2eModelName())
 	if err != nil {
 		t.Fatalf("mint via daemon: %v", err)
 	}

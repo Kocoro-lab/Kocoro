@@ -36,6 +36,24 @@ func TestResultMailboxRetainsUntilCompleted(t *testing.T) {
 	}
 }
 
+func TestResultMailboxDeliversStaggeredTasksIndependently(t *testing.T) {
+	m := NewResultMailbox()
+	m.Enqueue(SayResult{TaskID: "weather", Status: "ok", Reply: "Tokyo is sunny."}, false)
+	first := m.claim("connection")
+	if len(first) != 1 || first[0].result.TaskID != "weather" {
+		t.Fatalf("first staggered claim=%+v, want weather only", first)
+	}
+	if got := m.complete("connection"); got != 1 {
+		t.Fatalf("completed first staggered result=%d, want 1", got)
+	}
+
+	m.Enqueue(SayResult{TaskID: "news", Status: "ok", Reply: "The news is ready."}, false)
+	second := m.claim("connection")
+	if len(second) != 1 || second[0].result.TaskID != "news" {
+		t.Fatalf("second staggered claim=%+v, want news only", second)
+	}
+}
+
 func TestResultMailboxReleasesAcrossConnectionTeardown(t *testing.T) {
 	m := NewResultMailbox()
 	m.Enqueue(SayResult{TaskID: "task-a", Status: "ok", Reply: "Done."}, false)
@@ -117,7 +135,7 @@ func TestTaskResultDeliveryInstructionsDoNotEmbedResultOrEnableTools(t *testing.
 		},
 	}}
 	instructions := taskResultDeliveryInstructions(results)
-	for _, want := range []string{"sole factual source", "untrusted data", "supersedes", "do not repeat"} {
+	for _, want := range []string{"sole factual source", "incremental delivery batch", "absence from this batch says nothing", "omitted task has no result", "supersedes", "do not repeat"} {
 		if !strings.Contains(strings.ToLower(instructions), want) {
 			t.Fatalf("delivery instructions missing %q: %s", want, instructions)
 		}
@@ -135,6 +153,28 @@ func TestTaskResultDeliveryInstructionsDoNotEmbedResultOrEnableTools(t *testing.
 	body, _ := json.Marshal(payload)
 	if !strings.Contains(string(body), `"tools":[]`) {
 		t.Fatalf("task result delivery must disable tools: %s", body)
+	}
+}
+
+func TestTaskResultInjectionMarksBatchAsIncremental(t *testing.T) {
+	var injected string
+	h := newEventHandler(nil, nil, nil, func(v any) error {
+		body, _ := json.Marshal(v)
+		if strings.Contains(string(body), "kocoro.task_results.v1") {
+			injected = string(body)
+		}
+		return nil
+	})
+	err := h.injectTaskResultBatch([]resultAnnouncement{{result: SayResult{
+		TaskID: "weather", Status: "ok", Reply: "Tokyo is sunny.",
+	}}})
+	if err != nil {
+		t.Fatalf("inject task result batch: %v", err)
+	}
+	for _, want := range []string{"incremental Kocoro task-result batch", "other concurrent tasks may arrive in later batches", "absence is not a status signal"} {
+		if !strings.Contains(injected, want) {
+			t.Fatalf("injected context missing %q: %s", want, injected)
+		}
 	}
 }
 

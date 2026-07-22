@@ -35,6 +35,13 @@ import (
 
 const e2eModel = "gpt-realtime-2.1-mini"
 
+func e2eModelName() string {
+	if model := strings.TrimSpace(os.Getenv("KOE_E2E_MODEL")); model != "" {
+		return model
+	}
+	return e2eModel
+}
+
 // the spoken sentence is chosen to clearly demand real work (→ do_task) and to
 // carry words the mock can match back, proving ASR understanding end-to-end.
 const e2eSpoken = "Add a reminder to call mom at six."
