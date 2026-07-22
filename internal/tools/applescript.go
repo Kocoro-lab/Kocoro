@@ -44,6 +44,13 @@ func (t *AppleScriptTool) Run(ctx context.Context, argsJSON string) (agent.ToolR
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
 
+	// Share the process-wide GUI-operation lock with computer_use: osascript
+	// can drive the same frontmost app/keyboard, so it must not interleave
+	// with another route's stale-state preflight + action. The 30s timeout
+	// below bounds how long the lock can be held. See computerUseGUIOperationMu.
+	computerUseGUIOperationMu.Lock()
+	defer computerUseGUIOperationMu.Unlock()
+
 	// Apply a default timeout to prevent hangs (e.g., osascript waiting for user interaction).
 	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

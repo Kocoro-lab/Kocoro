@@ -1,6 +1,36 @@
 import AppKit
 
 struct FocusManager {
+    /// Launches an installed app by display name and activates it once the
+    /// process becomes visible to NSWorkspace.
+    static func launchApp(appName: String) -> (ActionResult?, ErrorInfo?) {
+        if let running = findApp(named: appName) {
+            running.activate()
+            let pid = Int(running.processIdentifier)
+            return (ActionResult(result: "focused already-running \(appName) (pid \(pid))"), nil)
+        }
+
+        guard NSWorkspace.shared.launchApplication(appName) else {
+            return (nil, ErrorInfo(code: -1, message: "App '\(appName)' is not installed or could not be launched"))
+        }
+
+        // Normal GUI apps register with NSWorkspace within a fraction of a
+        // second, while large creative apps can take several seconds. Bound
+        // the serial ax_server request at 10s so a stuck launch cannot wedge
+        // every later GUI call. Callers can recover by using wait/focus or by
+        // retrying launch_app after the app finishes its own startup work.
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            if let launched = findApp(named: appName) {
+                launched.activate()
+                let pid = Int(launched.processIdentifier)
+                return (ActionResult(result: "launched \(appName) (pid \(pid))"), nil)
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return (nil, ErrorInfo(code: -1, message: "App '\(appName)' did not register within 10 seconds"))
+    }
+
     /// Activates an app by name, optionally verifying focus.
     static func focusApp(appName: String, windowTitle: String?, verify: Bool) -> (ActionResult?, ErrorInfo?) {
         guard let app = findApp(named: appName) else {

@@ -156,6 +156,12 @@ func (t *ComputerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 
 	normalizeArgs(&args)
 
+	// Share the process-wide GUI-operation lock with computer_use so a native
+	// computer action from one route cannot interleave with another route's
+	// stale-state preflight + action. See computerUseGUIOperationMu.
+	computerUseGUIOperationMu.Lock()
+	defer computerUseGUIOperationMu.Unlock()
+
 	switch args.Action {
 	case "screenshot":
 		return t.screenshot()

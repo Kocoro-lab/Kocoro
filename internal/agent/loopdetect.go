@@ -100,7 +100,7 @@ type LoopDetector struct {
 // Real MCP playwright tool names (browser_navigate, browser_snapshot, …) are
 // handled via isGUIToolName, which also prefix-matches "browser_".
 var GUITools = map[string]bool{
-	"screenshot": true, "computer": true, "applescript": true, "browser": true, "accessibility": true,
+	"screenshot": true, "computer": true, "computer_use": true, "applescript": true, "browser": true, "accessibility": true,
 }
 
 // isGUIToolName reports whether a tool name belongs to the GUI automation
@@ -116,7 +116,7 @@ func isGUIToolName(name string) bool {
 // Separate from GUITools because applescript/browser return structured data results.
 // Used by the mode-switch detector to distinguish data tools from visual verification.
 var visualTools = map[string]bool{
-	"screenshot": true, "computer": true, "accessibility": true,
+	"screenshot": true, "computer": true, "computer_use": true, "accessibility": true,
 }
 
 // repeatableGUITools extends visualTools with browser — multi-step browser workflows
@@ -124,7 +124,7 @@ var visualTools = map[string]bool{
 // different actions, so the no-progress fallback should not over-trigger.
 // Topic-based detection (FamilyNoProgress) still catches same-URL loops.
 var repeatableGUITools = map[string]bool{
-	"screenshot": true, "computer": true, "accessibility": true, "browser": true,
+	"screenshot": true, "computer": true, "computer_use": true, "accessibility": true, "browser": true,
 }
 
 // dupExemptTools lists tools where every call is inherently independent
@@ -585,7 +585,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			progressCount = sameResultCount
 		}
 
-		// For repeatable tools (browser_*, screenshot, accessibility, computer),
+		// For repeatable tools (browser_*, screenshot, computer_use, accessibility, computer),
 		// a stable result_sig is a weak "no progress" signal: SPA workflows and
 		// form fills legitimately share the same URL across many operations.
 		// When the strong topic-based signal is absent (no prior same-topic

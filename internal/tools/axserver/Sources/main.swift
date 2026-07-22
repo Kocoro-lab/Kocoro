@@ -196,6 +196,14 @@ func dispatch(id: Int64, method: String, params: Params) -> Response {
         if let err = err { return Response(id: id, error: err) }
         return Response(id: id, result: AnyCodable(result!))
 
+    case "launch_app":
+        guard let appName = params.appName else {
+            return Response(id: id, error: ErrorInfo(code: -1, message: "launch_app requires 'app_name'"))
+        }
+        let (result, err) = FocusManager.launchApp(appName: appName)
+        if let err = err { return Response(id: id, error: err) }
+        return Response(id: id, result: AnyCodable(result!))
+
     case "frontmost":
         let (result, err) = FocusManager.frontmost()
         if let err = err { return Response(id: id, error: err) }

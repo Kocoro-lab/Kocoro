@@ -265,7 +265,7 @@ func IsCancelableMidTurn(t Tool) bool {
 //   - http (verb-polymorphic; aborting POST/DELETE risks inconsistent
 //     remote state)
 //   - schedule_create, schedule_update, schedule_remove (modifies plist)
-//   - accessibility, applescript, screenshot, computer, clipboard,
+//   - computer_use, accessibility, applescript, screenshot, computer, clipboard,
 //     notify, browser, wait_for, ghostty (GUI side effects)
 var builtinCancelableMidTurn = map[string]struct{}{
 	"file_read":               {},
@@ -315,18 +315,26 @@ func isBuiltinCancelable(name string) bool {
 var autoApprovalDenyList = []string{}
 
 // unattendedAutoApprovalDenyList is the set of tools that scheduled
-// (unattended) agent runs MUST NOT auto-approve. As of 2026-05-18 this list
-// is empty: the product call (same one that emptied autoApprovalDenyList)
-// chose to treat publish_to_web / generate_image / edit_image as ordinary
-// approval-required tools across all paths — if a user adds them to
-// always-allow, that consent extends to scheduled / watcher / heartbeat
-// invocations too, no separate gate.
+// (unattended) agent runs MUST NOT auto-approve.
 //
-// The plumbing (DisallowsUnattendedAutoApproval + every handler that calls
-// it) is preserved so a future tool that genuinely cannot run unattended
-// (e.g. payment authorization, account deletion) can be added here without
-// rewriting callers. Empty for now.
-var unattendedAutoApprovalDenyList = []string{}
+// computer_use (added 2026-07-22): drives the user's live GUI session —
+// keystrokes and clicks into whatever app is frontmost. A schedule firing at
+// 3am with nobody at the Mac must not type into arbitrary windows on the
+// strength of a one-time attended "Always Allow" click or a blanket
+// daemon.auto_approve. Attended use is unaffected: Desktop/Slack/TUI runs
+// still honor always-allow and normal approval.
+//
+// The legacy GUI tools (accessibility / computer / applescript) are
+// DELIBERATELY not listed yet: existing user schedules may depend on
+// unattended applescript/accessibility automation, and silently breaking
+// them in a patch release is worse than the incremental exposure — they
+// already required the user to author the schedule prompt. Revisit as a
+// product decision if computer_use supersedes them.
+//
+// publish_to_web / generate_image / edit_image were considered for this list
+// on 2026-05-18 and deliberately left off — attended always-allow consent
+// extends to scheduled / watcher / heartbeat invocations for them.
+var unattendedAutoApprovalDenyList = []string{"computer_use"}
 
 // AutoApprovalDenyList returns a copy of the tools that disallow being
 // persisted into a user-facing always-allow list. Exposed for consistency
@@ -365,9 +373,9 @@ func DisallowsAutoApproval(toolName string) bool {
 // the user has them in an always-allow list. Compare with
 // DisallowsAutoApproval, which gates attended ("I'm watching") consent.
 //
-// Caller: scheduleHandler.OnApprovalNeeded. Other unattended paths added in
-// the future (RemoteTrigger auto-run, system-level retries, etc.) should
-// route through this check before auto-approving.
+// Callers include schedule, heartbeat, remote/SSE auto-approve, and
+// synchronous HTTP handlers. The agent loop also consults this before honoring
+// persisted Always Allow when runner.go marks the source/transport unattended.
 func DisallowsUnattendedAutoApproval(toolName string) bool {
 	for _, denied := range unattendedAutoApprovalDenyList {
 		if toolName == denied {

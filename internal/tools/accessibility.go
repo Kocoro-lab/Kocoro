@@ -54,30 +54,32 @@ type AccessibilityTool struct {
 }
 
 type accessibilityArgs struct {
-	Action       string   `json:"action"`
-	App          string   `json:"app,omitempty"`
-	MaxDepth     int      `json:"max_depth,omitempty"`
-	Budget       int      `json:"semantic_budget,omitempty"`
-	Filter       string   `json:"filter,omitempty"`
-	Ref          string   `json:"ref,omitempty"`
-	Value        *string  `json:"value,omitempty"`
-	Query        string   `json:"query,omitempty"`
-	Role         string   `json:"role,omitempty"`
-	Identifier   string   `json:"identifier,omitempty"`
-	DX           int      `json:"dx,omitempty"`
-	DY           int      `json:"dy,omitempty"`
-	Roles        []string `json:"roles,omitempty"`
-	MaxLabels    int      `json:"max_labels,omitempty"`
+	Action      string   `json:"action"`
+	Description string   `json:"description"`
+	App         string   `json:"app,omitempty"`
+	MaxDepth    int      `json:"max_depth,omitempty"`
+	Budget      int      `json:"semantic_budget,omitempty"`
+	Filter      string   `json:"filter,omitempty"`
+	Ref         string   `json:"ref,omitempty"`
+	Value       *string  `json:"value,omitempty"`
+	Query       string   `json:"query,omitempty"`
+	Role        string   `json:"role,omitempty"`
+	Identifier  string   `json:"identifier,omitempty"`
+	DX          int      `json:"dx,omitempty"`
+	DY          int      `json:"dy,omitempty"`
+	Roles       []string `json:"roles,omitempty"`
+	MaxLabels   int      `json:"max_labels,omitempty"`
 }
 
 func (t *AccessibilityTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:        "accessibility",
-		Description: "Interact with macOS apps via the accessibility tree. Workflow: (1) Use 'annotate' to get a labeled screenshot with numbered elements, (2) click/type by ref. Actions: read_tree, click, press, set_value, get_value, find, scroll, annotate. Always specify 'app' parameter with the exact app name. For web content in browsers, prefer the browser tool instead.",
+		Description: "Interact with macOS apps via the accessibility tree. Workflow: (1) Use 'annotate' to get a labeled screenshot with numbered elements, (2) click/type by ref. Actions: read_tree, click, press, set_value, get_value, find, scroll, annotate. Always specify 'app' parameter with the exact app name. For web content in browsers, prefer the browser tool instead." + agent.DescriptionGuidance,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"action":          map[string]any{"type": "string", "description": "Action: read_tree, click, press, set_value, get_value, find, scroll, annotate"},
+				"description":     agent.DescriptionFieldSpec,
 				"app":             map[string]any{"type": "string", "description": "Target app name (defaults to frontmost app)"},
 				"max_depth":       map[string]any{"type": "integer", "description": "Tree depth (default: 25 semantic budget, layout containers cost 0)"},
 				"semantic_budget": map[string]any{"type": "integer", "description": "Semantic depth budget (default: 25, layout containers cost 0 depth)"},
@@ -86,18 +88,27 @@ func (t *AccessibilityTool) Info() agent.ToolInfo {
 				"value":           map[string]any{"type": "string", "description": "Value to set (for set_value)"},
 				"query":           map[string]any{"type": "string", "description": "Text to search for (for find, case-insensitive substring)"},
 				"role":            map[string]any{"type": "string", "description": "AX role filter (for find, e.g. AXButton)"},
-				"identifier":     map[string]any{"type": "string", "description": "AX identifier to find (exact match, for find)"},
+				"identifier":      map[string]any{"type": "string", "description": "AX identifier to find (exact match, for find)"},
 				"dx":              map[string]any{"type": "integer", "description": "Horizontal scroll amount in pixels (for scroll)"},
 				"dy":              map[string]any{"type": "integer", "description": "Vertical scroll amount in pixels (for scroll, positive=down)"},
 				"roles":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Filter by AX roles (for annotate, e.g. [\"AXButton\", \"AXTextField\"])"},
 				"max_labels":      map[string]any{"type": "integer", "description": "Max elements to annotate (default: 50, for annotate)"},
 			},
 		},
-		Required: []string{"action"},
+		Required: []string{"action", "description"},
 	}
 }
 
-func (t *AccessibilityTool) RequiresApproval() bool { return false }
+func (t *AccessibilityTool) RequiresApproval() bool { return true }
+
+func (t *AccessibilityTool) IsSafeArgs(argsJSON string) bool {
+	return t.IsReadOnlyCall(argsJSON)
+}
+
+// AccessibilityTool stores the most recent ref table on the tool instance.
+// Serialize even read calls so concurrent observations cannot replace refs
+// while a sibling call is preparing an action.
+func (t *AccessibilityTool) IsConcurrencySafeCall(string) bool { return false }
 
 func (t *AccessibilityTool) IsReadOnlyCall(argsJSON string) bool {
 	var args struct {
@@ -121,12 +132,21 @@ func (t *AccessibilityTool) Run(ctx context.Context, argsJSON string) (agent.Too
 
 	var args accessibilityArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 
 	if args.Action == "" {
-		return agent.ToolResult{Content: "missing required parameter: action", IsError: true}, nil
+		return agent.ValidationError("missing required parameter: action"), nil
 	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("missing required parameter: description"), nil
+	}
+
+	// Share the process-wide GUI-operation lock with computer_use so a legacy
+	// accessibility call from one route cannot interleave with another route's
+	// stale-state preflight + action. See computerUseGUIOperationMu.
+	computerUseGUIOperationMu.Lock()
+	defer computerUseGUIOperationMu.Unlock()
 
 	switch args.Action {
 	case "read_tree":
@@ -144,10 +164,7 @@ func (t *AccessibilityTool) Run(ctx context.Context, argsJSON string) (agent.Too
 	case "annotate":
 		return t.annotate(ctx, args)
 	default:
-		return agent.ToolResult{
-			Content: fmt.Sprintf("unknown action: %q (valid: read_tree, click, press, set_value, get_value, find, scroll, annotate)", args.Action),
-			IsError: true,
-		}, nil
+		return agent.ValidationError(fmt.Sprintf("unknown action: %q (valid: read_tree, click, press, set_value, get_value, find, scroll, annotate)", args.Action)), nil
 	}
 }
 
@@ -208,11 +225,11 @@ func (t *AccessibilityTool) readTree(ctx context.Context, args accessibilityArgs
 	}
 
 	var treeResult struct {
-		App      string                            `json:"app"`
-		PID      int                               `json:"pid"`
-		Window   string                            `json:"window"`
-		Elements []any                             `json:"elements"`
-		RefPaths map[string]map[string]string       `json:"ref_paths"`
+		App      string                       `json:"app"`
+		PID      int                          `json:"pid"`
+		Window   string                       `json:"window"`
+		Elements []any                        `json:"elements"`
+		RefPaths map[string]map[string]string `json:"ref_paths"`
 	}
 	if err := json.Unmarshal(result, &treeResult); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil

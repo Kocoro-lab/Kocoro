@@ -83,6 +83,18 @@ func TestReadOnly_Accessibility(t *testing.T) {
 	assertReadOnly(t, tool, `not-json`, false)
 }
 
+func TestReadOnly_ComputerUse(t *testing.T) {
+	tool := &ComputerUseTool{}
+	for _, action := range []string{"get_app_state", "get_value", "screenshot", "wait"} {
+		assertReadOnly(t, tool, `{"action":"`+action+`"}`, true)
+	}
+	for _, action := range []string{"focus_app", "launch_app", "click", "press", "set_value", "scroll", "type", "hotkey", "move"} {
+		assertReadOnly(t, tool, `{"action":"`+action+`"}`, false)
+	}
+	assertReadOnly(t, tool, `{}`, false)
+	assertReadOnly(t, tool, `not-json`, false)
+}
+
 func TestReadOnly_Clipboard(t *testing.T) {
 	tool := &ClipboardTool{}
 

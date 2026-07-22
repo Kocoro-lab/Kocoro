@@ -2891,6 +2891,12 @@ type httpEventHandler struct {
 	usage agent.UsageAccumulator
 }
 
+// IsUnattendedRun reports that synchronous HTTP has no approval broker. Its
+// OnApprovalNeeded implementation can only auto-approve or deny, so the agent
+// loop must not honor persisted Always Allow for unattended-deny-listed tools
+// before that handler gets a chance to apply its gate.
+func (h *httpEventHandler) IsUnattendedRun() bool { return true }
+
 // Usage returns the cumulative usage collected during this handler's lifetime.
 func (h *httpEventHandler) Usage() agent.AccumulatedUsage { return h.usage.Snapshot() }
 

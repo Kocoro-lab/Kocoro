@@ -754,8 +754,8 @@ const koeFastEffortTier = "low"
 // koe.fast_effort is a *bool with three states:
 //   - nil (unset) / true → force koeFastEffortTier (default ON: voice is snappy)
 //   - false              → do NOT override; the task keeps the agent's normal
-//                          global/per-agent effort (for users who prefer quality
-//                          over latency on voice).
+//     global/per-agent effort (for users who prefer quality
+//     over latency on voice).
 func applyKoeEffortTier(loop *agent.AgentLoop, source string, koe config.KoeConfig) {
 	if loop == nil || !isKoeSource(source) {
 		return
@@ -973,6 +973,41 @@ var silentBannerSources = map[string]struct{}{
 func isAutonomousLocalSource(source string) bool {
 	_, ok := silentBannerSources[strings.ToLower(strings.TrimSpace(source))]
 	return ok
+}
+
+// isUnattendedSource reports whether a source runs with no human available to
+// approve tool calls: schedule/cron plus the autonomous local triggers
+// (heartbeat/watcher/mcp). These runs' event handlers auto-approve through
+// agent.DisallowsUnattendedAutoApproval; the loop needs the same
+// classification so a persisted always-allow entry cannot bypass that gate
+// (agent.SetUnattendedRun). Webhook/web/IM stay attended — their approvals
+// round-trip to a human via the broker or Cloud.
+func isUnattendedSource(source string) bool {
+	if isAutonomousLocalSource(source) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case ChannelSchedule, "cron":
+		return true
+	}
+	return false
+}
+
+// unattendedRunHandler marks a transport with no approval round-trip. Source
+// classification covers scheduler and autonomous triggers, while this marker
+// covers transports such as synchronous HTTP whose request may still carry an
+// attended-looking source (for example "kocoro") but whose handler can only
+// auto-approve or deny.
+type unattendedRunHandler interface {
+	IsUnattendedRun() bool
+}
+
+func isUnattendedRun(source string, handler agent.EventHandler) bool {
+	if isUnattendedSource(source) {
+		return true
+	}
+	marker, ok := handler.(unattendedRunHandler)
+	return ok && marker.IsUnattendedRun()
 }
 
 // shouldEmitReplyBanner reports whether a reply-complete banner should fire
@@ -1763,6 +1798,11 @@ func historySnapshotForRequest(sess *session.Session, req RunAgentRequest) []cli
 // The caller provides an EventHandler to control streaming, approval, and
 // event reporting (WS uses daemonEventHandler, HTTP uses httpEventHandler).
 func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handler agent.EventHandler) (*RunAgentResult, error) {
+	// Capture the transport mode before the handler is wrapped with the event
+	// bus below. This prevents a synchronous HTTP request from riding a
+	// persisted Always Allow past its handler-side unattended deny-list.
+	unattendedRun := isUnattendedRun(req.Source, handler)
+
 	// Phase 1: read supervisor atomically, probe if needed
 	cfg, _, sup := deps.Snapshot()
 	if cfg == nil || deps.GW == nil || deps.SessionCache == nil {
@@ -2614,6 +2654,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetEnableStreaming(true)
 	loop.SetDeltaProvider(agent.NewTemporalDelta())
 	loop.SetCacheSource(cacheSourceFromDaemonSource(req.Source))
+	// Background sources and no-broker transports have no human approval
+	// round-trip; tools on the unattended deny-list must not ride a persisted
+	// always-allow entry past the handler-side gate.
+	loop.SetUnattendedRun(unattendedRun)
 	loop.SetSkillDiscovery(runCfg.Agent.SkillDiscoveryEnabled())
 	if deps.MemSvc != nil {
 		var helperLLM client.LLMClient

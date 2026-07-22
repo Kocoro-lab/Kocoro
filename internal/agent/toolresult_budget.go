@@ -211,7 +211,7 @@ func resolveToolResultMax(toolName string, opts ToolResultBudgetOptions) int {
 
 func toolResultBudgetEligible(toolName string, opts ToolResultBudgetOptions) bool {
 	switch toolName {
-	case "cloud_delegate", "think", "computer", "screenshot":
+	case "cloud_delegate", "think", "computer", "computer_use", "screenshot":
 		return false
 	}
 	if strings.HasPrefix(toolName, "browser_") {

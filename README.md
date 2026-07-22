@@ -139,14 +139,12 @@ shan -y "kill the process on port 3000"
 shan -y "open Safari and navigate to github.com"
 shan -y "set my Mac volume to 50%"
 
-# GUI via accessibility tree — annotate → click by ref
+# Unified native GUI control — semantic state → state_id + ref action
 shan -y "open Calendar and show me today's events"
 shan -y "open TextEdit and type '你好世界 🌍'"
 
-# Vision + computer use — screenshot, computer
-shan -y "open Chrome, go to x.com, and post a tweet"
-
 # Browser automation — Playwright MCP (preferred) or pinchtab/chromedp fallback
+shan -y "open Chrome, go to x.com, and summarize my notifications"
 shan -y "open https://news.ycombinator.com and get the top 5 stories"
 
 # Ghostty terminal — requires Ghostty >= 1.3.0
@@ -180,7 +178,7 @@ Add one when you find a task shape you keep coming back to; [`examples/cookbook/
 
 - **macOS** (clipboard, notifications, AppleScript, screencapture, accessibility)
 - **Shannon Gateway** at configurable endpoint
-- **Accessibility permission** granted in System Settings > Privacy & Security > Accessibility (for `accessibility` and `computer` tools)
+- **Accessibility permission** granted in System Settings > Privacy & Security > Accessibility (for `computer_use`, `accessibility`, and `computer`); Screen Recording is needed only when those workflows request pixels
 - **Chrome** (optional, for browser automation — Playwright MCP preferred)
 - **[Ghostty](https://ghostty.org) >= 1.3.0** (optional, for `ghostty` tool)
 
@@ -271,12 +269,13 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 
 | Tool | Approval | Description |
 |------|----------|-------------|
-| `accessibility` | Yes | **Primary GUI tool.** Reads macOS accessibility tree via persistent `ax_server` (compiled Swift sidecar). Actions: `read_tree`, `click`, `press`, `set_value`, `get_value`, `find`, `scroll`, `annotate`. Semantic depth traversal (layout containers cost 0); click auto-fallback (AXPress → synthetic coordinate click). Works with Finder, Safari, Chrome, TextEdit, Calendar, System Settings, etc. |
-| `wait_for` | Yes | Wait for UI conditions: `elementExists`, `elementGone`, `titleContains`, `urlContains`, `titleChanged`, `urlChanged`. Use instead of sleep after navigation or app launch. |
+| `computer_use` | Observe: No; mutate: Yes | **Primary native-GUI tool.** Accessibility-first, provider-neutral workflow: `get_app_state` returns a compact tree plus `state_id`; ref actions re-observe and reject stale state. Supports focus/launch, click/press/value, scroll, type/hotkey, coordinate fallback, waits, and explicit screenshots. State and refs are isolated per run; whole calls serialize across concurrent inbound routes (one GUI-operation lock, shared with `accessibility`/`computer`/`applescript`); screenshots are never attached automatically. Unattended runs (schedules, heartbeat, watcher) can never auto-approve it — see the deny-list note under Security. |
+| `accessibility` | Read: No; mutate: Yes | Legacy low-level AX tool retained for compatibility. Reads the macOS accessibility tree via persistent `ax_server`; refs are isolated per run. Actions: `read_tree`, `click`, `press`, `set_value`, `get_value`, `find`, `scroll`, `annotate`. |
+| `wait_for` | No | Wait for UI conditions: `elementExists`, `elementGone`, `titleContains`, `urlContains`, `titleChanged`, `urlChanged`. Use instead of sleep after navigation or app launch. |
 | `clipboard` | Yes | Read/write system clipboard. |
 | `notify` | Yes | macOS desktop notifications. |
 | `applescript` | Yes | Arbitrary AppleScript. Use for operations with no AX equivalent. |
-| `screenshot` | Yes | Screen capture (fullscreen/window/region). |
+| `screenshot` | No | Screen capture (fullscreen/window/region). |
 | `computer` | Yes | Mouse/keyboard via CGEvent (CJK/emoji safe). Click, type, hotkey, move, screenshot. No Python dependency. |
 | `browser` | Yes | Playwright MCP (preferred), pinchtab, or chromedp fallback. When Playwright MCP is configured, the legacy browser tool is auto-disabled. Pinchtab connects to user's real browser for authenticated sessions; chromedp uses an isolated profile. |
 | `ghostty` | Yes | Ghostty terminal control: open tabs, splits, send input. |
@@ -577,7 +576,7 @@ Clicking it writes the tool name to the appropriate scope (named agent → per-a
 **Safety gates remain regardless of what either list contains** — checked by separate code paths, hand-edited config cannot bypass:
 
 - **High-risk bash commands** (`pip install`, `rm -rf`, `python -c`, `git push --force`, etc.) still prompt every call. Enforced by the runtime gate in `internal/agent/loop.go` against `permissions.alwaysAskPrefixes`.
-- **Attended vs unattended auto-approval** — two parallel deny-lists (`agent.DisallowsAutoApproval` / `agent.DisallowsUnattendedAutoApproval`), **both empty as of 2026-05-18**, provide hooks for blocking persistence or unattended execution of specific tools. `publish_to_web`, `generate_image`, and `edit_image` used to be on the attended list; the product call moved them off — they are now ordinary approval-required tools (fresh prompt the first time, "always allow" persists for the rest). The plumbing stays in place for a future tool that genuinely cannot be auto-approved (account deletion, payment authorization, etc.).
+- **Attended vs unattended auto-approval** — two parallel deny-lists (`agent.DisallowsAutoApproval` / `agent.DisallowsUnattendedAutoApproval`) block persistence or unattended execution of specific tools. The attended list is empty as of 2026-05-18: `publish_to_web`, `generate_image`, and `edit_image` used to be on it; the product call moved them off — they are now ordinary approval-required tools (fresh prompt the first time, "always allow" persists for the rest). The unattended list contains `computer_use` (since 2026-07-22): scheduled, heartbeat, watcher, synchronous HTTP, and other no-broker runs cannot auto-approve this tool — not even via persisted "Always Allow" — and blanket `auto_approve` alone cannot approve it. Attended Desktop/IM/TUI approvals remain unchanged. For patch compatibility, legacy `accessibility`, `computer`, and `applescript` are not yet on the unattended list; existing schedules using them still work and retain the corresponding GUI-automation risk.
 
 #### Approval-card descriptions
 
