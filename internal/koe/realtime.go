@@ -131,6 +131,14 @@ type eventHandler struct {
 	userSpeaking atomic.Bool
 	toolLoop     *toolLoopLedger
 	floor        *nativeFloorController
+	// Held-speech identity for a true interruption: the assistant message item
+	// most recently speaking and the moment the floor pause froze its playback.
+	// An accepted interruption truncates that server-side item to the audio the
+	// user actually heard, so the model cannot later treat unspoken text as said.
+	speechItemMu   sync.Mutex
+	speechItemResp string
+	speechItemID   string
+	floorPausedAt  time.Time
 	activeRespMu sync.Mutex
 	activeRespID string
 	// pendingResponse binds a response.created only when its echoed metadata token
@@ -1082,6 +1090,7 @@ func (h *eventHandler) pauseForNativeFloor() bool {
 		return false
 	}
 	h.speakingEpoch.Add(1)
+	h.floorPausedAt = time.Now()
 	if h.audio != nil {
 		h.audio.SetPlaybackPaused(true)
 	}
@@ -1135,6 +1144,7 @@ func (h *eventHandler) applyNativeFloorDecision(decision floorDecision) {
 			h.audio.SetSpeaking(false)
 			h.audio.SetPlaybackEnabled(false)
 		}
+		h.truncateHeldSpeech()
 		_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
 		h.releaseResultBatch(true)
 		h.maybeRestoreUserMic()
@@ -1142,6 +1152,51 @@ func (h *eventHandler) applyNativeFloorDecision(decision floorDecision) {
 		if eventLogEnabled() {
 			log.Printf("koe[floor]: playback discarded; accepted user turn")
 		}
+	}
+}
+
+func (h *eventHandler) noteSpeechItem(responseID, itemID string) {
+	if responseID == "" || itemID == "" {
+		return
+	}
+	h.speechItemMu.Lock()
+	h.speechItemResp = responseID
+	h.speechItemID = itemID
+	h.speechItemMu.Unlock()
+}
+
+func (h *eventHandler) speechItemFor(responseID string) string {
+	if responseID == "" {
+		return ""
+	}
+	h.speechItemMu.Lock()
+	defer h.speechItemMu.Unlock()
+	if h.speechItemResp != responseID {
+		return ""
+	}
+	return h.speechItemID
+}
+
+// truncateHeldSpeech aligns server conversation history with what the user
+// actually heard: an accepted interruption truncates the paused assistant item
+// to the audio played before the floor pause, so the model cannot later refer
+// to unspoken text as something it already said. Skipped when the held item is
+// unknown; an overshoot estimate only makes the server reject the truncate,
+// which degrades to today's keep-full-text behavior.
+func (h *eventHandler) truncateHeldSpeech() {
+	itemID := h.speechItemFor(h.floor.heldSourceID())
+	if itemID == "" || h.outputStartedAt.IsZero() || h.floorPausedAt.Before(h.outputStartedAt) {
+		return
+	}
+	playedMS := max(h.floorPausedAt.Sub(h.outputStartedAt).Milliseconds(), 1)
+	_ = h.sendFn(map[string]any{
+		"type":          "conversation.item.truncate",
+		"item_id":       itemID,
+		"content_index": 0,
+		"audio_end_ms":  playedMS,
+	})
+	if eventLogEnabled() {
+		log.Printf("koe[floor]: truncated interrupted item=%q audio_end_ms=%d", itemID, playedMS)
 	}
 }
 
@@ -1374,6 +1429,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		Arguments  json.RawMessage `json:"arguments"` // function args (string-encoded JSON)
 		Transcript string          `json:"transcript"`
 		Item       struct {
+			ID   string `json:"id"`
 			Type string `json:"type"`
 		} `json:"item"`
 		Response struct {
@@ -1549,6 +1605,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 		h.handleFunctionCallForResponse(ctx, ev.ResponseID, ev.CallID, ev.Name, args, sameResponseDoTask)
 	case "response.output_item.added":
+		if ev.Item.Type == "message" {
+			h.noteSpeechItem(ev.ResponseID, ev.Item.ID)
+		}
 		if ToolContinuationEnabled() && h.toolLoop.noteMessageItem(ev.ResponseID, ev.Item.Type) {
 			log.Printf("koe[loop]: repeated assistant message fused response_id=%q", ev.ResponseID)
 			h.interruptOutput()

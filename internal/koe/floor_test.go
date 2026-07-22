@@ -93,6 +93,7 @@ func TestNativeFloorAcceptDiscardsPlaybackAndQueuesRawTurnResponse(t *testing.T)
 	h.fullDuplexAEC = true
 
 	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"source-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.output_item.added","response_id":"source-1","item":{"id":"item-src-1","type":"message"}}`))
 	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
 	audio.Play(make([]int16, audioFrameSize))
 	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
@@ -124,6 +125,9 @@ func TestNativeFloorAcceptDiscardsPlaybackAndQueuesRawTurnResponse(t *testing.T)
 	}
 	if cap.countType("output_audio_buffer.clear") != 1 || !cap.sentContains("accepted") {
 		t.Fatalf("floor accept output frames = %v", cap.types())
+	}
+	if cap.countType("conversation.item.truncate") != 1 || !cap.sentContains("item-src-1") || !cap.sentContains("audio_end_ms") {
+		t.Fatalf("accept must truncate the interrupted assistant item; frames = %v", cap.types())
 	}
 }
 
@@ -160,6 +164,9 @@ func TestNativeFloorResumeRetainsExactPlaybackWithoutReply(t *testing.T) {
 	}
 	if len(h.loopRespReq) != 0 || cap.countType("output_audio_buffer.clear") != 0 || !cap.sentContains("resumed") {
 		t.Fatalf("resume must not clear playback or queue a reply; frames=%v queued=%d", cap.types(), len(h.loopRespReq))
+	}
+	if cap.countType("conversation.item.truncate") != 0 {
+		t.Fatalf("resume must keep the assistant item intact; frames = %v", cap.types())
 	}
 }
 

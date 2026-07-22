@@ -189,6 +189,18 @@ func (f *nativeFloorController) holdsSource(responseID string) bool {
 		(f.stage == floorPaused || f.stage == floorWaitingForJudge || f.stage == floorJudging)
 }
 
+// heldSourceID returns the paused assistant response while the controller still
+// owns it in any stage — including the instant an accept decision is applied,
+// when holdsSource is already false but the interrupted item must be truncated.
+func (f *nativeFloorController) heldSourceID() string {
+	if f == nil {
+		return ""
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sourceResponseID
+}
+
 func (f *nativeFloorController) finishResponse(responseID string) floorDecision {
 	if f == nil || responseID == "" {
 		return floorDecisionNone
