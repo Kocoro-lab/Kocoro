@@ -525,28 +525,32 @@ func TestDispatchLedgerStatusAndTargetedCancel(t *testing.T) {
 	}
 }
 
-func TestPerCallAgentOverrideRequiresUserNamedAgent(t *testing.T) {
+func TestPerCallAgentOverrideTrustsNativeExplicitAgent(t *testing.T) {
 	newDispatcher := func() *Dispatcher {
 		state := NewCallState("burst-agent", "")
 		return NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	}
 
+	// Realtime may extract the explicitly spoken agent into its own field while
+	// normalizing the task text. The default must not require duplicate wording.
+	t.Setenv("KOE_AGENT_OVERRIDE_GUARD", "")
 	dispatcher := newDispatcher()
 	req, _, clarify, err := dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","agent":"finance"}`), "en", false)
+	if err != nil || clarify != nil || req.Agent != "finance" {
+		t.Fatalf("native explicit override was not honored: req=%+v clarify=%+v err=%v", req, clarify, err)
+	}
+
+	// The old literal-containment policy remains available as a field rollback.
+	t.Setenv("KOE_AGENT_OVERRIDE_GUARD", "1")
+	dispatcher = newDispatcher()
+	req, _, clarify, err = dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","agent":"finance"}`), "en", false)
 	if err != nil || clarify != nil || req.Agent != "" {
-		t.Fatalf("model-invented override was not ignored: req=%+v clarify=%+v err=%v", req, clarify, err)
+		t.Fatalf("rollback guard did not reject non-contained agent: req=%+v clarify=%+v err=%v", req, clarify, err)
 	}
 
 	dispatcher = newDispatcher()
 	req, _, clarify, err = dispatcher.PrepareDoTask([]byte(`{"task":"ask finance to check NVDA","agent":"finance"}`), "en", false)
 	if err != nil || clarify != nil || req.Agent != "finance" {
-		t.Fatalf("explicitly named override was not honored: req=%+v clarify=%+v err=%v", req, clarify, err)
-	}
-
-	t.Setenv("KOE_AGENT_OVERRIDE_GUARD", "0")
-	dispatcher = newDispatcher()
-	req, _, _, _ = dispatcher.PrepareDoTask([]byte(`{"task":"check Tokyo weather","agent":"finance"}`), "en", false)
-	if req.Agent != "finance" {
-		t.Fatalf("rollback flag did not restore model override: %+v", req)
+		t.Fatalf("rollback guard rejected contained agent: req=%+v clarify=%+v err=%v", req, clarify, err)
 	}
 }

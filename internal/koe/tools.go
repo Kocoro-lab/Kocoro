@@ -417,12 +417,14 @@ func (d *Dispatcher) cancelLedger(ctx context.Context, taskID, reason string) ([
 	return mustJSON(map[string]string{"status": "ok", "task_id": target.ID}), nil
 }
 
-// taskNamesAgent prevents a native model from silently selecting a specialist
-// merely because the task resembles that agent's domain. The task field is
-// contractually the user's own request, so an explicit user choice survives this
-// containment check. KOE_AGENT_OVERRIDE_GUARD=0 restores trust-the-model behavior.
-func taskNamesAgent(task string, names []string) bool {
-	if !koeEnvBool("KOE_AGENT_OVERRIDE_GUARD", true) {
+// agentOverrideAllowed is an opt-in rollback guard for the earlier literal-
+// containment policy. Native Realtime may correctly extract
+// agent="investment analyst" while normalizing task to "check AAPL", so the
+// default trusts the narrowly worded agent field instead of requiring the same
+// meaning twice. Set KOE_AGENT_OVERRIDE_GUARD=1 to restore the legacy
+// containment check while investigating model-invented overrides.
+func agentOverrideAllowed(task string, names []string) bool {
+	if !koeEnvBool("KOE_AGENT_OVERRIDE_GUARD", false) {
 		return true
 	}
 	folded := strings.ToLower(task)
@@ -465,19 +467,19 @@ func (d *Dispatcher) PrepareDoTask(argsJSON []byte, lang string, sameTurnMultiDi
 		res := d.resolver.Resolve(a.Agent)
 		switch res.Status {
 		case ResolveResolved:
-			if taskNamesAgent(a.Task, d.resolver.spokenNamesFor(a.Agent, res.Slug)) {
+			if agentOverrideAllowed(a.Task, d.resolver.spokenNamesFor(a.Agent, res.Slug)) {
 				agent = res.Slug
 			} else {
-				log.Printf("koe[task]: ignored unnamed agent override %q; using bound %q", a.Agent, agent)
+				log.Printf("koe[task]: agent override guard rejected %q; using bound %q", a.Agent, agent)
 			}
 		case ResolveAmbiguous:
-			if !taskNamesAgent(a.Task, d.resolver.spokenNamesFor(a.Agent, "")) {
+			if !agentOverrideAllowed(a.Task, d.resolver.spokenNamesFor(a.Agent, "")) {
 				break
 			}
 			say := clarifyWhich(lang, res.Candidates)
 			return DoTaskRequest{}, nil, &SayResult{Status: "clarify", SpokenSummary: say, Say: say}, nil
 		default:
-			if !taskNamesAgent(a.Task, d.resolver.spokenNamesFor(a.Agent, "")) {
+			if !agentOverrideAllowed(a.Task, d.resolver.spokenNamesFor(a.Agent, "")) {
 				break
 			}
 			// Unknown named agent → ask rather than silently using the default.

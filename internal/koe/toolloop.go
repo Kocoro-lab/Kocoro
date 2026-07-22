@@ -8,8 +8,19 @@ import (
 )
 
 const (
+	// maxTurnTaskActions covers a spoken turn that cancels or corrects existing
+	// work while starting distinct new work. On the fifth action the loop rejects
+	// it and emits a tools-disabled closure naming what did and did not run. This
+	// is an interaction safety budget, not a power-user throughput knob: disable
+	// the continuation loop with KOE_TOOL_CONTINUATION=0, or change this constant
+	// with the focused tool-loop tests when deliberately revising the contract.
 	maxTurnTaskActions = 4
-	maxToolLoopTurns   = 64
+	// maxTrackedToolLoopTurns retains bookkeeping for a long voice call without
+	// letting completed turns grow memory forever. Once 64 turns bind, only the
+	// oldest turn's replay/provenance records are evicted; active work continues.
+	// Raise this code-level retention cap with the tool-loop tests if calls longer
+	// than 64 tracked turns need stale-event protection farther into history.
+	maxTrackedToolLoopTurns = 64
 )
 
 func ToolContinuationEnabled() bool { return koeEnvBool("KOE_TOOL_CONTINUATION", true) }
@@ -108,7 +119,7 @@ func (l *toolLoopLedger) noteUserCommit(turnID int64) {
 	if _, ok := l.turns[turnID]; !ok {
 		l.turns[turnID] = &loopTurn{}
 		l.order = append(l.order, turnID)
-		for len(l.order) > maxToolLoopTurns {
+		for len(l.order) > maxTrackedToolLoopTurns {
 			oldest := l.order[0]
 			l.order = l.order[1:]
 			delete(l.turns, oldest)
