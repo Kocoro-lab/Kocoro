@@ -25,13 +25,17 @@ func TestKoeNativeFloorE2E(t *testing.T) {
 		t.Skip("native floor E2E: set KOE_E2E=1 (mints via the running daemon)")
 	}
 	enableNativeFloorForTest(t)
-	t.Run("backchannel resumes exact response without reply", func(t *testing.T) {
+	t.Run("backchannel resumes by finishing the reply", func(t *testing.T) {
 		tools, postDecision := runNativeFloorTrial(t, "Mm-hmm.", "resume_playback")
 		if len(tools) != 1 || tools[0] != "resume_playback" {
 			t.Fatalf("backchannel floor tools=%v, want only resume_playback", tools)
 		}
-		if len(postDecision) != 0 {
-			t.Fatalf("backchannel produced a new spoken reply: %v", postDecision)
+		// The server clears its output buffer and truncates the item on
+		// speech_started, so the paused tail can never replay; a resume decision
+		// now finishes the reply with at most one spoken continuation. More than
+		// one post-decision reply means the backchannel was treated as a turn.
+		if len(postDecision) > 1 {
+			t.Fatalf("backchannel produced %d replies, want at most one continuation: %v", len(postDecision), postDecision)
 		}
 	})
 	t.Run("real interruption is accepted and answered", func(t *testing.T) {

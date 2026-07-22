@@ -170,6 +170,82 @@ func TestNativeFloorResumeRetainsExactPlaybackWithoutReply(t *testing.T) {
 	}
 }
 
+func TestNativeFloorResumeAfterServerClearFinishesBySpeech(t *testing.T) {
+	enableNativeFloorForTest(t)
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := NewCallState("burst-floor", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, audio, cap.send)
+	h.fullDuplexAEC = true
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"source-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.output_item.added","response_id":"source-1","item":{"id":"item-src-1","type":"message"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	audio.Play(make([]int16, audioFrameSize))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	// WebRTC clears the server output and truncates the item on speech_started
+	// even with interrupt_response=false (observed live 2026-07-22); the un-sent
+	// tail is gone, so a PCM resume would play a broken fragment.
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.cleared"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	judgeReq := <-h.loopRespReq
+	h.setPendingResponse(judgeReq)
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"judge-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"judge-1","call_id":"floor-call","name":"resume_playback","arguments":"{}"}`))
+
+	if audio.PlaybackPaused() || audio.dropCapture() || len(audio.playBuf) != 0 {
+		t.Fatalf("server-clear resume state = paused %v speaking %v queued %d, want dead PCM discarded", audio.PlaybackPaused(), audio.dropCapture(), len(audio.playBuf))
+	}
+	select {
+	case cont := <-h.respReq:
+		if cont.purpose != responsePurposeSynthetic || cont.toolMode != responseToolsDisabled ||
+			!strings.Contains(cont.instructions, "continue and finish") {
+			t.Fatalf("continue request = %+v, want tools-disabled synthetic continuation", cont)
+		}
+	default:
+		t.Fatal("server-clear resume must queue a spoken continuation instead of replaying dead PCM")
+	}
+	if cap.countType("conversation.item.truncate") != 0 {
+		t.Fatalf("server already truncated; no local truncate expected, frames = %v", cap.types())
+	}
+}
+
+func TestNativeFloorAcceptAfterServerClearSkipsLocalTruncate(t *testing.T) {
+	enableNativeFloorForTest(t)
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := NewCallState("burst-floor", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, audio, cap.send)
+	h.fullDuplexAEC = true
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"source-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.output_item.added","response_id":"source-1","item":{"id":"item-src-1","type":"message"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	audio.Play(make([]int16, audioFrameSize))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.cleared"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	judgeReq := <-h.loopRespReq
+	h.setPendingResponse(judgeReq)
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"judge-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"judge-1","call_id":"floor-call","name":"accept_turn","arguments":"{}"}`))
+
+	if cap.countType("conversation.item.truncate") != 0 {
+		t.Fatalf("server already truncated at the pause point; a second local truncate would cut past it, frames = %v", cap.types())
+	}
+	if cap.countType("output_audio_buffer.clear") != 1 {
+		t.Fatalf("accept must still clear local playback, frames = %v", cap.types())
+	}
+}
+
 func TestSessionConfigNativeFloorOwnsResponseCreation(t *testing.T) {
 	enableNativeFloorForTest(t)
 	raw, _ := json.Marshal(sessionConfig("persona", "marin", true))
