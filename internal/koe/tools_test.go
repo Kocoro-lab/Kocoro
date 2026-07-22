@@ -81,7 +81,7 @@ func TestDoTaskDescriptionMatchesPersonaContract(t *testing.T) {
 			desc = d.Description
 		}
 	}
-	for _, want := range []string{"vary", "one obvious step", "never quiz the user", "context digest", "stable public knowledge", "nature of the information"} {
+	for _, want := range []string{"vary", "one obvious step", "never quiz the user", "full final user-facing reply", "stable public knowledge", "nature of the information"} {
 		if !strings.Contains(desc, want) {
 			t.Fatalf("do_task description missing %q", want)
 		}
@@ -148,30 +148,24 @@ func TestPrepareDoTaskClarifyOnUnknownAgent(t *testing.T) {
 	}
 }
 
-// TestMapDoTaskOutcomeAttachesContextDigest: the completed result must carry a
-// capped digest of the full reply so the Realtime model can answer recaps and
-// follow-ups directly. Live 2026-07-02: 2 of 4 delegations in one call were
-// re-fetch recaps because Koe only ever held the two spoken sentences.
-func TestMapDoTaskOutcomeAttachesContextDigest(t *testing.T) {
-	long := strings.Repeat("详情内容", 300) // 1200 runes, over the cap
-	r := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: long, SpokenSummary: "查完了。"}, nil, "zh")
-	if r.Context == "" {
-		t.Fatal("completed result must carry a context digest of the reply")
+func TestMapDoTaskOutcomePreservesCompleteReplyAndDeliverables(t *testing.T) {
+	long := strings.Repeat("详情内容", 300)
+	deliverable := Deliverable{ID: "d1", Filename: "report.html", Title: "AI report", MIME: "text/html", ByteSize: 4096}
+	r := MapDoTaskOutcome(DoTaskOutcome{
+		Kind: OutcomeCompleted, Reply: long, SpokenSummary: "查完了。", SessionID: "s1",
+		Deliverables: []Deliverable{deliverable},
+	}, nil, "zh")
+	if r.Reply != long {
+		t.Fatalf("complete reply was truncated: got %d runes, want %d", len([]rune(r.Reply)), len([]rune(long)))
 	}
-	if got := len([]rune(r.Context)); got > defaultVoiceContextCap+1 {
-		t.Fatalf("context digest not capped: %d runes", got)
+	if r.SpokenSummary != "" || r.Say != "" {
+		t.Fatalf("successful result must not pin model-authored speech: %+v", r)
 	}
-	if !strings.HasPrefix(long, strings.TrimSuffix(r.Context, "…")) {
-		t.Fatal("context digest must be a prefix of the reply")
+	if r.LegacySpeech != "查完了。" || r.SessionID != "s1" {
+		t.Fatalf("compatibility/session metadata missing: %+v", r)
 	}
-
-	// No added information → no digest (don't waste session tokens).
-	same := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "查完了。", SpokenSummary: "查完了。"}, nil, "zh")
-	if same.Context != "" {
-		t.Fatalf("reply identical to spoken line must not attach a digest, got %q", same.Context)
-	}
-	if inj := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeInjected}, nil, "zh"); inj.Context != "" {
-		t.Fatal("injected outcome must not attach a digest")
+	if len(r.Deliverables) != 1 || r.Deliverables[0] != deliverable {
+		t.Fatalf("deliverables not preserved: %+v", r.Deliverables)
 	}
 }
 
@@ -190,8 +184,8 @@ func TestMapDoTaskOutcomeCancelledStaysSilent(t *testing.T) {
 	if r.Status != "cancelled" {
 		t.Fatalf("cancelled run status = %q, want cancelled", r.Status)
 	}
-	if r.Say != "" || r.SpokenSummary != "" || r.Context != "" {
-		t.Fatalf("cancelled run must carry no speech or digest, got say=%q spoken=%q ctx=%q", r.Say, r.SpokenSummary, r.Context)
+	if r.Say != "" || r.SpokenSummary != "" || r.Reply != "" {
+		t.Fatalf("cancelled run must carry no result speech, got %+v", r)
 	}
 }
 
@@ -222,8 +216,8 @@ func TestMapDoTaskOutcomePartialDoesNotVoiceProgress(t *testing.T) {
 		if strings.Contains(r.Say, progress) || strings.Contains(r.SpokenSummary, progress) {
 			t.Fatalf("partial(%q) must NOT voice the progress line, got say=%q spoken=%q", failure, r.Say, r.SpokenSummary)
 		}
-		if r.Context != "" {
-			t.Fatalf("partial(%q) must not seed a recap digest, got %q", failure, r.Context)
+		if r.Reply != "" {
+			t.Fatalf("partial(%q) must not seed a final reply, got %q", failure, r.Reply)
 		}
 		if want := fallbackSay("zh", "incomplete"); r.Say == "" || r.Say != want {
 			t.Fatalf("partial(%q) say = %q, want the safe canned line %q", failure, r.Say, want)
@@ -245,16 +239,16 @@ func TestMapDoTaskOutcomeCancelBeatsPartial(t *testing.T) {
 	if r.Status != "cancelled" {
 		t.Fatalf("cancelled+partial status = %q, want cancelled", r.Status)
 	}
-	if r.Say != "" || r.SpokenSummary != "" || r.Context != "" {
-		t.Fatalf("cancelled+partial must stay silent, got say=%q spoken=%q ctx=%q", r.Say, r.SpokenSummary, r.Context)
+	if r.Say != "" || r.SpokenSummary != "" || r.Reply != "" {
+		t.Fatalf("cancelled+partial must stay silent, got %+v", r)
 	}
 }
 
 func TestMapDoTaskOutcome(t *testing.T) {
-	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "long done", SpokenSummary: "done"}, nil, "zh"); got.Status != "ok" || got.SpokenSummary != "done" || got.Say != "done" {
+	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "long done", SpokenSummary: "done"}, nil, "zh"); got.Status != "ok" || got.Reply != "long done" || got.LegacySpeech != "done" || got.Say != "" {
 		t.Errorf("completed: %+v", got)
 	}
-	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "done"}, nil, "zh"); got.SpokenSummary != "done" {
+	if got := MapDoTaskOutcome(DoTaskOutcome{Kind: OutcomeCompleted, Reply: "done"}, nil, "zh"); got.Reply != "done" || got.LegacySpeech != "done" {
 		t.Errorf("completed without spoken summary: %+v", got)
 	}
 	// injected MUST carry an empty say so the front brain doesn't double-speak.

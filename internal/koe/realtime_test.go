@@ -102,9 +102,9 @@ func (c *captureSender) responseCreateInstructions() []string {
 	return out
 }
 
-// TestHandleFunctionCallDoTaskAsync verifies the C-full deferred-ack flow: the
-// fast-ack function_call_output is sent SYNCHRONOUSLY (Koe speaks "on it"), then
-// the back-brain result is injected from the goroutine and voiced.
+// TestHandleFunctionCallDoTaskAsync verifies the deferred-ack flow: the running
+// output consumes the call id, then the complete final reply lands in the durable
+// mailbox for native Realtime delivery.
 func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"reply": "Reminder added.", "agent": "default"})
@@ -121,17 +121,20 @@ func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 
 	h.handleFunctionCall(context.Background(), "call-1", "do_task", []byte(`{"task":"remind me"}`))
 
-	// reachy say-and-ask: NO synchronous placeholder ack — the model spoke its own
-	// ack in the call turn. The single function_call_output carrying the REAL result
-	// is sent after the back-brain turn completes.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if cap.sentContains("Reminder added.") {
+		if h.resultMailbox.pending() == 1 {
+			h.resultMailbox.mu.Lock()
+			got := h.resultMailbox.entries[0].result.Reply
+			h.resultMailbox.mu.Unlock()
+			if got != "Reminder added." {
+				t.Fatalf("mailbox reply = %q", got)
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Error("do_task result function_call_output never sent")
+	t.Error("do_task complete result never reached mailbox")
 }
 
 // TestHandleFunctionCallDoTaskSurvivesSessionCtxCancel verifies S2: a hangup that
@@ -163,7 +166,13 @@ func TestHandleFunctionCallDoTaskSurvivesSessionCtxCancel(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if cap.sentContains("Reminder added.") {
+		if h.resultMailbox.pending() == 1 {
+			h.resultMailbox.mu.Lock()
+			got := h.resultMailbox.entries[0].result.Reply
+			h.resultMailbox.mu.Unlock()
+			if got != "Reminder added." {
+				t.Fatalf("mailbox reply = %q", got)
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -227,9 +236,9 @@ func TestHandleFunctionCallInjectedFollowupDoesNotDoubleSpeak(t *testing.T) {
 		t.Fatalf("final result should request exactly one voiced response, got %d", got)
 	}
 	instr := cap.responseCreateInstructions()
-	if len(instr) != 1 || !strings.Contains(instr[0], "Say exactly the text between <spoken_summary>") ||
-		!strings.Contains(instr[0], "Final combined result.") {
-		t.Fatalf("final result response.create must pin exact spoken_summary instructions, got %#v", instr)
+	if len(instr) != 1 || !strings.Contains(instr[0], "sole factual source") ||
+		strings.Contains(instr[0], "Final combined result.") || strings.Contains(instr[0], "spoken_summary") {
+		t.Fatalf("final result response.create must request native grounded delivery, got %#v", instr)
 	}
 }
 
@@ -275,17 +284,17 @@ func TestHandleEventFunctionCallArgumentsDoneDelegatesDoTask(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if cap.sentContains("You have three new emails.") {
+		if cap.sentContains("Checked Gmail.") {
 			instr := cap.responseCreateInstructions()
-			if len(instr) != 1 || !strings.Contains(instr[0], "You have three new emails.") ||
-				!strings.Contains(instr[0], "Do not add a greeting, preface, follow-up question") {
-				t.Fatalf("do_task response.create must constrain speech to spoken_summary, got %#v", instr)
+			if len(instr) != 1 || !strings.Contains(instr[0], "sole factual source") ||
+				strings.Contains(instr[0], "Checked Gmail.") || strings.Contains(instr[0], "spoken_summary") {
+				t.Fatalf("do_task response.create must request native grounded delivery, got %#v", instr)
 			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("do_task spoken_summary was not sent as function_call_output")
+	t.Fatal("complete do_task reply was not injected for native delivery")
 }
 
 // TestHandleEventGatesMicWhileSpeaking locks the half-duplex gate into the event
@@ -741,6 +750,7 @@ func TestSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 		`"interrupt_response":false`,
 		`"noise_reduction":{"type":"far_field"}`,
 		`"parallel_tool_calls":true`,
+		`"reasoning":{"effort":"low"}`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("sessionConfig missing %s in %s", want, s)

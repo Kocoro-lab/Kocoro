@@ -18,7 +18,7 @@ func TestBeginTaskLaneSelection(t *testing.T) {
 	if otherAgent.ThreadID != "burst-1" {
 		t.Fatalf("different agent owns a separate main route: %+v", otherAgent)
 	}
-	state.LandResult(first.ID, SayResult{Status: "ok", SpokenSummary: "sunny"})
+	state.LandResult(first.ID, SayResult{Status: "ok", Reply: "sunny"})
 	sequential := state.BeginTask("book a table", "")
 	if sequential.ThreadID != "burst-1" {
 		t.Fatalf("completed main lane must be reused: %+v", sequential)
@@ -35,7 +35,7 @@ func TestBeginFollowUpRevision(t *testing.T) {
 	if !ok || followUp.Revision != 2 || followUp.Label != "add Shanghai" {
 		t.Fatalf("follow-up bookkeeping wrong: ok=%v task=%+v", ok, followUp)
 	}
-	state.LandResult(first.ID, SayResult{Status: "ok", SpokenSummary: "done"})
+	state.LandResult(first.ID, SayResult{Status: "ok", Reply: "done"})
 	reopened, ok := state.BeginFollowUp(first.ID, "now add Osaka")
 	if !ok || reopened.State != TaskRunning || reopened.Revision != 3 {
 		t.Fatalf("completed task must reopen on follow-up: ok=%v task=%+v", ok, reopened)
@@ -49,9 +49,16 @@ func TestLandResultUpdatesTaskLifecycle(t *testing.T) {
 	if got, _ := state.TaskByID(first.ID); got.State != TaskRunning {
 		t.Fatalf("injected landing mutated state: %+v", got)
 	}
-	state.LandResult(first.ID, SayResult{Status: "ok", SpokenSummary: "sunny", Context: "detail"})
-	if got, _ := state.TaskByID(first.ID); got.State != TaskCompleted || got.SpokenSummary != "sunny" || got.DeliveredRevision != 1 {
+	state.LandResult(first.ID, SayResult{Status: "ok", Reply: "sunny", Deliverables: []Deliverable{{ID: "d1", Filename: "weather.html"}}})
+	if got, _ := state.TaskByID(first.ID); got.State != TaskCompleted || got.Reply != "sunny" || got.DeliveredRevision != 1 || len(got.Deliverables) != 1 {
 		t.Fatalf("completed landing wrong: %+v", got)
+	}
+	if _, ok := state.BeginFollowUp(first.ID, "correct it"); !ok {
+		t.Fatal("follow-up did not reopen task")
+	}
+	landed, supersedes := state.LandResult(first.ID, SayResult{Status: "ok", Reply: "corrected"})
+	if !supersedes || landed.Revision != 2 || landed.Reply != "corrected" {
+		t.Fatalf("delivered correction metadata wrong: landed=%+v supersedes=%t", landed, supersedes)
 	}
 	failed := state.BeginTask("task b", "")
 	state.LandResult(failed.ID, SayResult{Status: "failed", FailReason: "boom"})

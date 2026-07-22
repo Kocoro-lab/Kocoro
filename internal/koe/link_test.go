@@ -33,6 +33,7 @@ func TestDoTaskCompleted(t *testing.T) {
 			"reply":          "NVDA is up two percent today.\n\nFull table omitted here.",
 			"spoken_summary": "NVDA is up two percent today.",
 			"session_id":     "s1", "agent": "finance",
+			"deliverables": []map[string]any{{"id": "d1", "path": "/private/report.html", "filename": "report.html", "title": "NVDA report", "mime": "text/html", "byte_size": 2048}},
 		})
 	}))
 	defer srv.Close()
@@ -55,6 +56,9 @@ func TestDoTaskCompleted(t *testing.T) {
 	}
 	if out.SpokenSummary != "NVDA is up two percent today." {
 		t.Fatalf("SpokenSummary = %q", out.SpokenSummary)
+	}
+	if len(out.Deliverables) != 1 || out.Deliverables[0].Filename != "report.html" || out.Deliverables[0].ByteSize != 2048 {
+		t.Fatalf("Deliverables = %+v", out.Deliverables)
 	}
 }
 

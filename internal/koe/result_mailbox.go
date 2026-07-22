@@ -3,7 +3,6 @@
 package koe
 
 import (
-	"strings"
 	"sync"
 )
 
@@ -24,19 +23,15 @@ type ResultMailbox struct {
 
 type resultMailboxEntry struct {
 	id         uint64
-	taskID     string
-	text       string
+	result     SayResult
 	resumptive bool
-	revision   bool
 	owner      string
 }
 
 type resultAnnouncement struct {
 	id         uint64
-	taskID     string
-	text       string
+	result     SayResult
 	resumptive bool
-	revision   bool
 }
 
 func NewResultMailbox() *ResultMailbox {
@@ -46,19 +41,19 @@ func NewResultMailbox() *ResultMailbox {
 // Enqueue records a result before waking a sender. The wake is deliberately
 // edge-triggered and lossy; the result is not. Queue saturation therefore cannot
 // discard completed work.
-func (m *ResultMailbox) Enqueue(taskID, text string, resumptive, revision bool) uint64 {
+func (m *ResultMailbox) Enqueue(result SayResult, resumptive bool) uint64 {
 	if m == nil {
 		return 0
 	}
-	text = strings.TrimSpace(text)
-	if text == "" {
+	if result.Reply == "" && result.Say == "" && len(result.Deliverables) == 0 {
 		return 0
 	}
+	result.Deliverables = append([]Deliverable(nil), result.Deliverables...)
 	m.mu.Lock()
 	m.nextID++
 	id := m.nextID
 	m.entries = append(m.entries, resultMailboxEntry{
-		id: id, taskID: taskID, text: text, resumptive: resumptive, revision: revision,
+		id: id, result: result, resumptive: resumptive,
 	})
 	m.mu.Unlock()
 	m.Wake()
@@ -100,9 +95,10 @@ func (m *ResultMailbox) claim(owner string) []resultAnnouncement {
 			continue
 		}
 		entry.owner = owner
+		result := entry.result
+		result.Deliverables = append([]Deliverable(nil), entry.result.Deliverables...)
 		out = append(out, resultAnnouncement{
-			id: entry.id, taskID: entry.taskID, text: entry.text,
-			resumptive: entry.resumptive, revision: entry.revision,
+			id: entry.id, result: result, resumptive: entry.resumptive,
 		})
 	}
 	return out

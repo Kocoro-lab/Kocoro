@@ -854,17 +854,15 @@ func TestBuildSystemPrompt_OutputFormatPlain(t *testing.T) {
 
 func TestFormatGuidanceKoe(t *testing.T) {
 	g := formatGuidance("koe")
-	// New contract: Kocoro writes the full reply, then ENDS with a <spoken_summary>
-	// block reporting the completed outcome (the voice line the daemon extracts).
-	// See internal/daemon/koe_spoken_summary.go.
-	for _, want := range []string{"voice", "<spoken_summary>", "kocoro desktop", "outcome", "in full", "do not mention"} {
+	for _, want := range []string{"native voice", "complete", "kocoro desktop", "outcome", "markdown", "deliverable"} {
 		if !strings.Contains(strings.ToLower(g), want) {
 			t.Errorf("formatGuidance(\"koe\") missing %q; got: %s", want, g)
 		}
 	}
-	// Voice guidance must steer AWAY from rich text, not toward it.
-	if strings.Contains(strings.ToLower(g), "github-flavored markdown") {
-		t.Errorf("formatGuidance(\"koe\") should not request markdown; got: %s", g)
+	for _, forbidden := range []string{"<spoken_summary>", "only thing said aloud", "context digest"} {
+		if strings.Contains(strings.ToLower(g), forbidden) {
+			t.Errorf("formatGuidance(\"koe\") retained legacy contract %q; got: %s", forbidden, g)
+		}
 	}
 }
 

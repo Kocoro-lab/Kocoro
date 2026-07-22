@@ -200,14 +200,26 @@ const (
 // DoTaskOutcome carries exactly one meaningful payload, keyed by Kind.
 type DoTaskOutcome struct {
 	Kind          OutcomeKind
-	Reply         string // Completed
-	SpokenSummary string // Completed; voice-safe projection of Reply when present
-	SessionID     string // Completed
-	Agent         string // Completed
-	Partial       bool   // Completed (soft force-stop)
-	FailureCode   string // Completed (soft)
-	Route         string // Injected / Rejected
-	Reason        string // Rejected (queue_full|active_run_not_ready|cwd_conflict)
+	Reply         string        // Completed
+	SpokenSummary string        // Completed; compatibility projection for older daemons
+	Deliverables  []Deliverable // Completed; validated output metadata, never file bytes
+	SessionID     string        // Completed
+	Agent         string        // Completed
+	Partial       bool          // Completed (soft force-stop)
+	FailureCode   string        // Completed (soft)
+	Route         string        // Injected / Rejected
+	Reason        string        // Rejected (queue_full|active_run_not_ready|cwd_conflict)
+}
+
+// Deliverable is the voice-safe subset of a daemon-validated deliverable. Local
+// paths are deliberately excluded: Realtime only needs enough metadata to tell
+// the user what was produced and where the full result is available.
+type Deliverable struct {
+	ID       string `json:"id"`
+	Filename string `json:"filename"`
+	Title    string `json:"title,omitempty"`
+	MIME     string `json:"mime,omitempty"`
+	ByteSize int64  `json:"byte_size"`
 }
 
 // DoTask POSTs a delegated task and blocks until the back-brain turn completes
@@ -237,16 +249,17 @@ func (c *DaemonClient) DoTask(ctx context.Context, req DoTaskRequest) (DoTaskOut
 	}
 
 	var parsed struct {
-		Reply         string `json:"reply"`
-		SpokenSummary string `json:"spoken_summary"`
-		SessionID     string `json:"session_id"`
-		Agent         string `json:"agent"`
-		Partial       bool   `json:"partial"`
-		FailureCode   string `json:"failure_code"`
-		Status        string `json:"status"`
-		Route         string `json:"route"`
-		Reason        string `json:"reason"`
-		Error         string `json:"error"`
+		Reply         string        `json:"reply"`
+		SpokenSummary string        `json:"spoken_summary"`
+		SessionID     string        `json:"session_id"`
+		Agent         string        `json:"agent"`
+		Partial       bool          `json:"partial"`
+		FailureCode   string        `json:"failure_code"`
+		Deliverables  []Deliverable `json:"deliverables"`
+		Status        string        `json:"status"`
+		Route         string        `json:"route"`
+		Reason        string        `json:"reason"`
+		Error         string        `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return DoTaskOutcome{}, fmt.Errorf("decode POST /message response (status %d): %w; body=%s", resp.StatusCode, err, string(raw))
@@ -260,6 +273,7 @@ func (c *DaemonClient) DoTask(ctx context.Context, req DoTaskRequest) (DoTaskOut
 		return DoTaskOutcome{
 			Kind: OutcomeCompleted, Reply: parsed.Reply, SpokenSummary: parsed.SpokenSummary, SessionID: parsed.SessionID,
 			Agent: parsed.Agent, Partial: parsed.Partial, FailureCode: parsed.FailureCode,
+			Deliverables: append([]Deliverable(nil), parsed.Deliverables...),
 		}, nil
 	case "injected", "retracted_before_delivery":
 		return DoTaskOutcome{Kind: OutcomeInjected, Route: parsed.Route}, nil

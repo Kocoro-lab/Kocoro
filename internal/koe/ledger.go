@@ -28,8 +28,8 @@ type VoiceTask struct {
 
 	Revision          int
 	DeliveredRevision int
-	SpokenSummary     string
-	Context           string
+	Reply             string
+	Deliverables      []Deliverable
 	FailReason        string
 }
 
@@ -78,16 +78,16 @@ func (s *CallState) BeginFollowUp(taskID, label string) (*VoiceTask, bool) {
 	return task, true
 }
 
-func (s *CallState) LandResult(taskID string, result SayResult) {
+func (s *CallState) LandResult(taskID string, result SayResult) (VoiceTask, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	task, ok := s.tasks[taskID]
 	if !ok {
-		return
+		return VoiceTask{}, false
 	}
 	switch result.Status {
 	case "injected":
-		return
+		return *task, false
 	case "ok":
 		task.State = TaskCompleted
 	case "cancelled":
@@ -95,12 +95,16 @@ func (s *CallState) LandResult(taskID string, result SayResult) {
 	default:
 		task.State = TaskFailed
 	}
+	supersedes := task.DeliveredRevision > 0 && task.Revision > task.DeliveredRevision
 	task.DeliveredRevision = task.Revision
-	if result.SpokenSummary != "" {
-		task.SpokenSummary = result.SpokenSummary
+	if result.Reply != "" {
+		task.Reply = result.Reply
 	}
-	task.Context = result.Context
+	task.Deliverables = append([]Deliverable(nil), result.Deliverables...)
 	task.FailReason = result.FailReason
+	copy := *task
+	copy.Deliverables = append([]Deliverable(nil), task.Deliverables...)
+	return copy, supersedes
 }
 
 func (s *CallState) MarkCancelled(taskID string) {

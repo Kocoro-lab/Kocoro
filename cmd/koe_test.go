@@ -315,11 +315,10 @@ func TestKoePersonaTeachesEndCallOnDismiss(t *testing.T) {
 }
 
 func TestKoePersonaSummaryAndDesktopDiscipline(t *testing.T) {
-	// The do_task result carries a context digest: recaps/follow-ups the digest
-	// covers are answered directly (live 2026-07-02: half the delegations in one
-	// call were re-fetch recaps); only detail beyond it goes back through do_task.
-	// Kocoro Desktop is mentioned only for genuinely long/structured results.
-	for _, want := range []string{"context digest", "never call do_task to re-fetch", "mention it only when"} {
+	// The do_task result carries the complete final reply: recaps/follow-ups it
+	// covers are answered directly, while new action/freshness goes through
+	// do_task. Kocoro Desktop is mentioned only for genuinely rich deliverables.
+	for _, want := range []string{"full final user-facing reply", "never call do_task to re-fetch", "Mention Kocoro Desktop only when"} {
 		if !strings.Contains(koePersona, want) {
 			t.Errorf("koePersona missing result-handling guidance %q", want)
 		}

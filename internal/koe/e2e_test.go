@@ -26,6 +26,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,10 +46,6 @@ const e2ePersona = "You are a voice assistant. For any request that is real work
 func TestKoeVoiceE2E(t *testing.T) {
 	if os.Getenv("KOE_E2E") != "1" {
 		t.Skip("headless voice E2E: set KOE_E2E=1 + OPENAI_API_KEY (live OpenAI, ~$0.01)")
-	}
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		t.Skip("OPENAI_API_KEY required for the live voice E2E")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -88,7 +85,7 @@ func TestKoeVoiceE2E(t *testing.T) {
 	state := NewCallState("burst-e2e", "")
 	disp := NewDispatcher(client, NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
 
-	ek, err := mintEphemeral(ctx, apiKey, e2eModel) // DEV-KEY: direct mint (relay is wave-2)
+	ek, err := mintE2EEphemeral(ctx)
 	if err != nil {
 		t.Fatalf("mintEphemeral: %v", err)
 	}
@@ -223,15 +220,11 @@ func TestKoeSayAndAskE2E(t *testing.T) {
 	if os.Getenv("KOE_E2E") != "1" {
 		t.Skip("say-and-ask do_task de-risk: set KOE_E2E=1 + OPENAI_API_KEY")
 	}
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		t.Skip("OPENAI_API_KEY required")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	pcm := synthSpokenWAV(t, e2eSpoken)
-	ek, err := mintEphemeral(ctx, apiKey, e2eModel)
+	ek, err := mintE2EEphemeral(ctx)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -241,9 +234,19 @@ func TestKoeSayAndAskE2E(t *testing.T) {
 		t.Fatalf("pc: %v", err)
 	}
 	defer rc.Close()
-	send := func(v any) { b, _ := json.Marshal(v); _ = rc.dc.SendText(string(b)) }
+	var resultInjected atomic.Bool
+	send := func(v any) error {
+		b, _ := json.Marshal(v)
+		if strings.Contains(string(b), "kocoro.task_results.v1") {
+			resultInjected.Store(true)
+		}
+		return rc.dc.SendText(string(b))
+	}
+	mailbox := NewResultMailbox()
+	h := newEventHandlerWithMailbox(nil, NewCallState("burst-say-and-ask", ""), audio, send, mailbox, nil)
+	go h.runResponseSender(ctx)
 
-	const injectedText = "Done — I added a reminder to call mom at six."
+	const injectedText = "The reminder to call mom was added for six. It will notify you on this Mac, and no message was sent to anyone."
 	var (
 		mu           sync.Mutex
 		transcripts  []string
@@ -258,7 +261,7 @@ func TestKoeSayAndAskE2E(t *testing.T) {
 			once.Do(func() { close(connected) })
 		}
 	})
-	rc.dc.OnOpen(func() { send(sessionConfig(e2ePersona, "marin", false)) })
+	rc.dc.OnOpen(func() { _ = send(sessionConfig(e2ePersona, "marin", false)) })
 	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
 		var ev struct {
 			Type       string `json:"type"`
@@ -266,24 +269,26 @@ func TestKoeSayAndAskE2E(t *testing.T) {
 			Transcript string `json:"transcript"`
 		}
 		_ = json.Unmarshal(m.Data, &ev)
+		if ev.Type != "response.function_call_arguments.done" {
+			h.handleEvent(ctx, m.Data)
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		switch ev.Type {
 		case "session.updated":
 			cfgOnce.Do(func() { close(configured) })
 		case "response.function_call_arguments.done":
-			// reachy say-and-ask (production flow, realtime.go handleFunctionCall): the
-			// do_task RESULT is the SINGLE function_call_output for this call_id; a
-			// response.create then voices it. No placeholder fast-ack + separate
-			// assistant-message inject (that extra voiced turn made the model improvise).
-			out, _ := json.Marshal(map[string]any{"say": injectedText, "status": "ok"})
-			send(map[string]any{"type": "conversation.item.create", "item": map[string]any{
+			// Production deferred-ack flow: consume the function call immediately,
+			// then let ResultMailbox inject the complete reply and request one native
+			// tools-disabled spoken projection after the current response drains.
+			out, _ := json.Marshal(map[string]any{"status": "running", "task_id": "t01"})
+			_ = send(map[string]any{"type": "conversation.item.create", "item": map[string]any{
 				"type": "function_call_output", "call_id": ev.CallID, "output": string(out)}})
-			send(map[string]any{"type": "response.create"})
+			mailbox.Enqueue(SayResult{TaskID: "t01", Task: "add a reminder", Revision: 1, Status: "ok", Reply: injectedText}, false)
 		case "response.output_audio_transcript.done":
 			t.Logf("[spoke] %q", ev.Transcript)
 			transcripts = append(transcripts, ev.Transcript)
-			if strings.Contains(strings.ToLower(ev.Transcript), "mom") || strings.Contains(strings.ToLower(ev.Transcript), "reminder") {
+			if resultInjected.Load() && (strings.Contains(strings.ToLower(ev.Transcript), "mom") || strings.Contains(strings.ToLower(ev.Transcript), "reminder")) {
 				spokeResult = true
 			}
 		case "response.done":
@@ -322,8 +327,8 @@ func TestKoeSayAndAskE2E(t *testing.T) {
 			ok := spokeResult
 			done := responseDone
 			mu.Unlock()
-			if ok {
-				t.Logf("say-and-ask VERIFIED: result-as-function_call_output + response.create made the model speak the result")
+			if ok && mailbox.pending() == 0 {
+				t.Logf("say-and-ask VERIFIED: complete result via mailbox + native response made the model speak the result")
 				return
 			}
 			if done >= 2 && !ok {

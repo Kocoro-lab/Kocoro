@@ -127,7 +127,9 @@ func TestHandleFunctionCallRejectionSpeaksUtteranceLanguage(t *testing.T) {
 		cap := &captureSender{}
 		h := newEventHandler(disp, state, nil, cap.send)
 		h.language = pinned
-		h.handleFunctionCall(context.Background(), "c1", "do_task", []byte(taskJSON))
+		ctx, cancel := context.WithCancel(context.Background())
+		go h.runResponseSender(ctx)
+		h.handleFunctionCall(ctx, "c1", "do_task", []byte(taskJSON))
 		// Ledger mode emits the immediate running ack first, then the failed task
 		// update carrying the localized fallback.
 		deadline := time.Now().Add(5 * time.Second)
@@ -137,6 +139,7 @@ func TestHandleFunctionCallRejectionSpeaksUtteranceLanguage(t *testing.T) {
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
+		cancel()
 		return cap
 	}
 

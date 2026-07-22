@@ -37,7 +37,6 @@ func TestDoTaskImmediateAckAndParallelLanes(t *testing.T) {
 	mailbox := NewResultMailbox()
 	var mu sync.Mutex
 	var outputs []SayResult
-	backgroundItems := 0
 	h := newEventHandlerWithMailbox(dispatcher, state, nil, func(v any) error {
 		payload, _ := json.Marshal(v)
 		var frame struct {
@@ -55,8 +54,6 @@ func TestDoTaskImmediateAckAndParallelLanes(t *testing.T) {
 			var result SayResult
 			_ = json.Unmarshal([]byte(frame.Item.Output), &result)
 			outputs = append(outputs, result)
-		case frame.Type == "conversation.item.create" && frame.Item.Type == "message":
-			backgroundItems++
 		}
 		return nil
 	}, mailbox, nil)
@@ -81,18 +78,24 @@ func TestDoTaskImmediateAckAndParallelLanes(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
-		items := backgroundItems
 		outputCount := len(outputs)
 		mu.Unlock()
-		if items == 2 && mailbox.pending() == 2 {
+		if mailbox.pending() == 2 {
 			if outputCount != 2 {
 				t.Fatalf("final results must not reuse consumed call ids: outputs=%d", outputCount)
+			}
+			mailbox.mu.Lock()
+			firstReply := mailbox.entries[0].result.Reply
+			secondReply := mailbox.entries[1].result.Reply
+			mailbox.mu.Unlock()
+			if firstReply == "" || secondReply == "" || firstReply == secondReply {
+				t.Fatalf("complete parallel results missing: %q / %q", firstReply, secondReply)
 			}
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("results did not land: background_items=%d mailbox=%d", backgroundItems, mailbox.pending())
+	t.Fatalf("results did not land: mailbox=%d", mailbox.pending())
 }
 
 func waitDoTaskPost(t *testing.T, posts <-chan DoTaskRequest) DoTaskRequest {
