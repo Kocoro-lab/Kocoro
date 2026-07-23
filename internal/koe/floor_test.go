@@ -123,6 +123,9 @@ func TestNativeFloorAcceptDiscardsPlaybackAndQueuesRawTurnResponse(t *testing.T)
 	if accepted.purpose != responsePurposeUser || accepted.turnID != 1 || accepted.toolMode != responseToolsEnabled {
 		t.Fatalf("accepted response = %+v, want normal tools-enabled turn 1", accepted)
 	}
+	if accepted.instructions != "" {
+		t.Fatalf("accepted native turn must inherit the complete session persona, got per-response instructions %q", accepted.instructions)
+	}
 	if cap.countType("output_audio_buffer.clear") != 1 || !cap.sentContains("accepted") {
 		t.Fatalf("floor accept output frames = %v", cap.types())
 	}

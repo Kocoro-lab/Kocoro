@@ -156,6 +156,45 @@ func TestTaskResultDeliveryInstructionsDoNotEmbedResultOrEnableTools(t *testing.
 	}
 }
 
+func TestTaskResultResponseInstructionsPinConfiguredLanguage(t *testing.T) {
+	results := []resultAnnouncement{{
+		result: SayResult{
+			TaskID: "t01", Status: "ok",
+			Reply: "Atlas-7 ships on July 30.",
+		},
+	}}
+	tests := []struct {
+		language string
+		want     []string
+	}{
+		{
+			language: "zh",
+			want:     []string{"Simplified Chinese", "regardless of the language used in the task-result data", "Translate"},
+		},
+		{
+			language: "ja",
+			want:     []string{"Japanese", "regardless of the language used in the task-result data", "Translate"},
+		},
+		{
+			language: "en",
+			want:     []string{"English", "regardless of the language used in the task-result data", "Translate"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.language, func(t *testing.T) {
+			instructions := taskResultResponseInstructions(tt.language, results)
+			for _, want := range tt.want {
+				if !strings.Contains(instructions, want) {
+					t.Fatalf("result response instructions for %s missing %q: %s", tt.language, want, instructions)
+				}
+			}
+			if !strings.Contains(instructions, "incremental delivery batch") {
+				t.Fatalf("result response instructions lost delivery policy: %s", instructions)
+			}
+		})
+	}
+}
+
 func TestTaskResultInjectionMarksBatchAsIncremental(t *testing.T) {
 	var injected string
 	h := newEventHandler(nil, nil, nil, func(v any) error {
@@ -225,6 +264,7 @@ func TestResultDeliverySurvivesRealtimeTeardown(t *testing.T) {
 		}
 		return nil
 	}, m, nil)
+	h2.language = "zh"
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
 	go h2.runResponseSender(ctx2)
@@ -233,6 +273,9 @@ func TestResultDeliverySurvivesRealtimeTeardown(t *testing.T) {
 	case instructions := <-secondCreate:
 		if !strings.Contains(instructions, "sole factual source") {
 			t.Fatalf("recovered delivery lost native summary contract: %q", instructions)
+		}
+		if !strings.Contains(instructions, "Reply only in Simplified Chinese") {
+			t.Fatalf("recovered delivery lost configured language pin: %q", instructions)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("new connection did not recover pending result")

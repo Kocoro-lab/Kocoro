@@ -144,8 +144,8 @@ type eventHandler struct {
 	// speech_started even with interrupt_response=false, so a later "resume"
 	// cannot replay audio the server will never send.
 	floorServerCleared atomic.Bool
-	activeRespMu sync.Mutex
-	activeRespID string
+	activeRespMu       sync.Mutex
+	activeRespID       string
 	// pendingResponse binds a response.created only when its echoed metadata token
 	// matches the serialized response.create that caused it. Native user responses
 	// carry no local token and are registered against the newest committed turn.
@@ -916,7 +916,7 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 		return
 	}
 	accepted := h.sendResponseCreate(ctx, responseCreateRequest{
-		instructions: taskResultDeliveryInstructions(results),
+		instructions: taskResultResponseInstructions(h.language, results),
 		purpose:      responsePurposeTaskResult,
 		toolMode:     responseToolsDisabled,
 	})
@@ -1056,6 +1056,24 @@ func taskResultDeliveryInstructions(results []resultAnnouncement) string {
 		return "The user spoke after this task started. Use at most one very brief natural bridge, then deliver the task outcome without answering or repeating the intervening turn.\n" + base
 	}
 	return base
+}
+
+func taskResultResponseInstructions(language string, results []resultAnnouncement) string {
+	return taskResultLanguageInstructions(language) + "\n\n" + taskResultDeliveryInstructions(results)
+}
+
+func taskResultLanguageInstructions(language string) string {
+	const dataRule = " Translate the task-result data before speaking when needed, regardless of the language used in the task-result data. Do not choose or switch the output language because of names, quoted text, or isolated foreign words in that data."
+	switch language {
+	case "zh":
+		return "OUTPUT LANGUAGE IS FIXED: Reply only in Simplified Chinese." + dataRule
+	case "ja":
+		return "OUTPUT LANGUAGE IS FIXED: Reply only in Japanese." + dataRule
+	case "en":
+		return "OUTPUT LANGUAGE IS FIXED: Reply only in English." + dataRule
+	default:
+		return "OUTPUT LANGUAGE: Reply only in the language clearly established by the conversation before the task-result data was added." + dataRule
+	}
 }
 
 const toolContinuationInstructions = "Continue the same user turn using the function outputs now in the conversation. You may call more tools only when another action is genuinely required. Do not repeat the initial acknowledgement or narrate mechanics. If every output only says a background do_task is running, emit no audio and end this response; its real result will be announced later. Otherwise, when no more tool is needed, give one brief grounded summary of what succeeded and what did not."
