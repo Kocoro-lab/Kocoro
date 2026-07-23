@@ -4501,7 +4501,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			// defense in depth, but malformed or incomplete calls should never
 			// create empty side effects (for example bash({}) or notify({})) or
 			// waste a remote MCP/gateway round-trip.
-			if validationResult, valid := ValidateToolArguments(tool.Info(), argsStr); !valid {
+			if validationResult, valid := ValidateToolArgumentPresence(tool.Info(), argsStr); !valid {
 				a.logAudit(fc.Name, argsStr, validationResult.Content, "validation", false, 0, nil)
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{result: validationResult, name: fc.Name}

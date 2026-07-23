@@ -72,7 +72,7 @@ func (t *ServerTool) Info() agent.ToolInfo {
 
 func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	info := t.Info()
-	if result, valid := agent.ValidateToolArguments(info, argsJSON); !valid {
+	if result, valid := agent.ValidateToolArgumentPresence(info, argsJSON); !valid {
 		return result, nil
 	}
 	var args map[string]any

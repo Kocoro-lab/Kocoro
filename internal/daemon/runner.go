@@ -118,6 +118,10 @@ type RunAgentRequest struct {
 	// by daemon startup recovery: Text is an internal continuation marker, not
 	// a new user request, and is persisted as SystemInjected.
 	ResumeInterrupted bool `json:"-"`
+	// InterruptedResumeAttempt is persisted before startup recovery enters the
+	// agent loop, so a crash during continuation still consumes one bounded
+	// retry attempt.
+	InterruptedResumeAttempt int `json:"-"`
 }
 
 // ForegroundHint identifies the app that was frontmost when the user summoned
@@ -1799,6 +1803,7 @@ func interruptedTurnSnapshot(req RunAgentRequest, agentName, effectiveCWD string
 		CloudMessageID:  req.CloudMessageID,
 		IMStatusContext: append(json.RawMessage(nil), req.IMStatusContext...),
 		Participants:    append([]string(nil), req.Participants...),
+		ResumeAttempts:  req.InterruptedResumeAttempt,
 		UpdatedAt:       time.Now(),
 	}
 }
@@ -3129,9 +3134,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			sess.ToolResultSeen = loop.ToolResultSeen()
 			if req.ResumeInterrupted {
 				// A recovery attempt that fails before making forward progress
-				// remains eligible for the next daemon restart. Clearing this
-				// marker here would turn a temporary gateway outage into
-				// permanent abandonment.
+				// remains eligible for a later daemon restart until the
+				// configured recovery-attempt cap is reached. Clearing this
+				// marker on the first failure would turn a temporary gateway
+				// outage into permanent abandonment.
 				sess.InProgress = true
 				sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
 			} else {

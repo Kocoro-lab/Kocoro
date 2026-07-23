@@ -135,6 +135,15 @@ func (m *Manager) Load(id string) (*Session, error) {
 	return m.store.Load(id)
 }
 
+// InterruptedSessions returns the durable startup-recovery candidates without
+// scanning or allocating every historical session after the one-time marker
+// migration has completed.
+func (m *Manager) InterruptedSessions() ([]*Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.InterruptedSessions()
+}
+
 func (m *Manager) Save() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

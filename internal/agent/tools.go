@@ -140,18 +140,28 @@ func ValidationError(msg string) ToolResult {
 	}
 }
 
-// ValidateToolArguments performs the framework-level argument gate before
-// permission prompts, hooks, or execution. Individual Tool.Run methods still
-// validate their own typed structs (defense in depth), but this common gate
-// guarantees that dynamically registered gateway/MCP tools and future builtins
-// cannot turn a missing required field into a syscall, empty side effect, or
-// remote round-trip.
-//
-// Required means present and non-zero, matching the Tool.Run contract:
+// ValidateToolArguments enforces the strict builtin Tool.Run contract:
 // whitespace-only strings, zero numbers, false, null, and empty collections are
-// rejected. Tools that intentionally accept an empty value must not advertise
-// that field in ToolInfo.Required.
+// rejected for required fields. Builtins use typed argument structs, so after
+// unmarshalling they cannot distinguish a missing field from its zero value.
 func ValidateToolArguments(info ToolInfo, argsJSON string) (ToolResult, bool) {
+	return validateToolArguments(info, argsJSON, true)
+}
+
+// ValidateToolArgumentPresence performs the framework-level gate before
+// permission prompts, hooks, or execution. It rejects malformed input and
+// required fields that are absent or null, but accepts present zero values.
+//
+// Presence is authoritative at this layer because arguments are decoded into a
+// generic map. This matters for remote schemas we do not control: a required
+// boolean may legitimately be false, an offset may be 0, and an empty string or
+// collection may be meaningful. Builtin Tool.Run methods still call the strict
+// ValidateToolArguments after decoding their typed structs.
+func ValidateToolArgumentPresence(info ToolInfo, argsJSON string) (ToolResult, bool) {
+	return validateToolArguments(info, argsJSON, false)
+}
+
+func validateToolArguments(info ToolInfo, argsJSON string, rejectZero bool) (ToolResult, bool) {
 	raw := strings.TrimSpace(argsJSON)
 	if raw == "" {
 		raw = "{}"
@@ -178,7 +188,7 @@ func ValidateToolArguments(info ToolInfo, argsJSON string) (ToolResult, bool) {
 	var missing []string
 	for _, name := range info.Required {
 		value, present := obj[name]
-		if !present || isZeroToolArgument(value) {
+		if !present || value == nil || (rejectZero && isZeroToolArgument(value)) {
 			missing = append(missing, name)
 		}
 	}

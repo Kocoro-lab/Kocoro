@@ -49,3 +49,28 @@ func TestValidateToolArguments(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateToolArgumentPresenceAllowsPresentZeroValues(t *testing.T) {
+	info := ToolInfo{
+		Name:     "remote",
+		Required: []string{"query", "offset", "enabled", "items", "options"},
+	}
+
+	result, valid := ValidateToolArgumentPresence(
+		info,
+		`{"query":"","offset":0,"enabled":false,"items":[],"options":{}}`,
+	)
+	if !valid || result.IsError {
+		t.Fatalf("present zero values were rejected: valid=%v result=%#v", valid, result)
+	}
+
+	for _, args := range []string{
+		`{"query":"","offset":0,"enabled":false,"items":[]}`,
+		`{"query":"","offset":0,"enabled":false,"items":[],"options":null}`,
+	} {
+		result, valid = ValidateToolArgumentPresence(info, args)
+		if valid || !result.IsError || result.ErrorCategory != ErrCategoryValidation {
+			t.Fatalf("missing/null required field was accepted: args=%s result=%#v", args, result)
+		}
+	}
+}

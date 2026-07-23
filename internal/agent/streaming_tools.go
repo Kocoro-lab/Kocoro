@@ -56,7 +56,7 @@ func (s *streamToolStarter) eligible(fc client.FunctionCall, activeSkillFilter m
 		return nil, "", false
 	}
 	argsStr := fc.ArgumentsString()
-	if _, valid := ValidateToolArguments(tool.Info(), argsStr); !valid {
+	if _, valid := ValidateToolArgumentPresence(tool.Info(), argsStr); !valid {
 		return nil, "", false
 	}
 	readOnly, ok := tool.(ReadOnlyChecker)
@@ -98,6 +98,10 @@ func (s *streamToolStarter) Start(fc client.FunctionCall, activeSkillFilter map[
 		s.loop.tracker.Enter(PhaseExecutingTools)
 	}
 	if s.handler != nil {
+		// Usage belongs to the real provider/tool work and is emitted even if
+		// the final response later omits this speculative call. Such a result
+		// stays out of transcript/UI, but hiding its incurred usage would
+		// under-report billing.
 		toolCtx = WithUsageEmit(toolCtx, s.handler.OnUsage)
 	}
 	go func() {

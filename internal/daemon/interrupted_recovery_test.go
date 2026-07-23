@@ -78,6 +78,84 @@ func TestDiscoverInterruptedTurns_DefaultAndNamedAgent(t *testing.T) {
 	}
 }
 
+func TestInterruptedResumeAttemptPersistenceAndAbandon(t *testing.T) {
+	shannonDir := t.TempDir()
+	dir := filepath.Join(shannonDir, "sessions")
+	id := "recovery-attempt-001"
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{
+		Source:         "desktop",
+		ResumeAttempts: 1,
+	})
+
+	candidates, err := discoverInterruptedTurns(shannonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(candidates))
+	}
+	candidate := candidates[0]
+	if candidate.StoreDir != dir {
+		t.Fatalf("store dir = %q, want %q", candidate.StoreDir, dir)
+	}
+	if err := persistInterruptedResumeAttempt(candidate, 2); err != nil {
+		t.Fatalf("persist attempt: %v", err)
+	}
+
+	mgr := session.NewManager(dir)
+	sess, err := mgr.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.InterruptedTurn == nil || sess.InterruptedTurn.ResumeAttempts != 2 {
+		t.Fatalf("resume attempts not persisted: %#v", sess.InterruptedTurn)
+	}
+	_ = mgr.Close()
+
+	if err := abandonInterruptedTurn(candidate); err != nil {
+		t.Fatalf("abandon: %v", err)
+	}
+	mgr = session.NewManager(dir)
+	defer mgr.Close()
+	sess, err = mgr.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.InProgress || sess.InterruptedTurn != nil {
+		t.Fatalf("abandoned session retained recovery state: %#v", sess)
+	}
+}
+
+func TestResumeInterruptedTurnsAbandonsExhaustedWithoutGatewayCall(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "must not be called"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+	deps.Config.Agent.InterruptedResumeMaxAttempts = 2
+	id := "recovery-exhausted-001"
+	writeInterruptedSession(t, filepath.Join(deps.ShannonDir, "sessions"), id, &session.InterruptedTurn{
+		Source:         "heartbeat",
+		ResumeAttempts: 2,
+	})
+
+	(&Server{deps: deps}).resumeInterruptedTurns(context.Background())
+	if requests := gw.requests(); len(requests) != 0 {
+		t.Fatalf("exhausted recovery called gateway %d times", len(requests))
+	}
+
+	mgr := session.NewManager(filepath.Join(deps.ShannonDir, "sessions"))
+	defer mgr.Close()
+	sess, err := mgr.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.InProgress || sess.InterruptedTurn != nil {
+		t.Fatalf("exhausted recovery marker not cleared: %#v", sess)
+	}
+}
+
 func TestResumeInterruptedTurns_ContinuesCheckpointWithoutToolReplay(t *testing.T) {
 	gw := &fakeGatewayBackend{reply: "continued from the saved result"}
 	ts := httptest.NewServer(gw.handler())

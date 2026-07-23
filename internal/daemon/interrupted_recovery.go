@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -19,13 +19,15 @@ import (
 type interruptedTurnCandidate struct {
 	SessionID string
 	Agent     string
+	StoreDir  string
 	State     session.InterruptedTurn
 	UpdatedAt time.Time
 }
 
 // discoverInterruptedTurns scans the default and named-agent session stores.
-// It intentionally reads session JSON rather than the SQLite summary index:
-// InProgress and InterruptedTurn are recovery state, not list-index columns.
+// Each store maintains a durable marker index, so steady-state discovery loads
+// only interrupted candidates. Stores created before the index existed perform
+// one lightweight header migration inside session.InterruptedSessions.
 func discoverInterruptedTurns(shannonDir string) ([]interruptedTurnCandidate, error) {
 	var stores []struct {
 		agent string
@@ -53,26 +55,13 @@ func discoverInterruptedTurns(shannonDir string) ([]interruptedTurnCandidate, er
 
 	var candidates []interruptedTurnCandidate
 	for _, store := range stores {
-		entries, readErr := os.ReadDir(store.dir)
-		if errors.Is(readErr, os.ErrNotExist) {
-			continue
-		}
-		if readErr != nil {
-			return nil, readErr
-		}
 		mgr := session.NewManager(store.dir)
-		for _, entry := range entries {
-			if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-				continue
-			}
-			id := strings.TrimSuffix(entry.Name(), ".json")
-			if !session.IsValidSessionID(id) {
-				continue
-			}
-			sess, loadErr := mgr.Load(id)
-			if loadErr != nil || !sess.InProgress {
-				continue
-			}
+		interrupted, loadErr := mgr.InterruptedSessions()
+		_ = mgr.Close()
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		for _, sess := range interrupted {
 			state := session.InterruptedTurn{
 				Agent:     store.agent,
 				Source:    sess.Source,
@@ -92,11 +81,11 @@ func discoverInterruptedTurns(shannonDir string) ([]interruptedTurnCandidate, er
 			candidates = append(candidates, interruptedTurnCandidate{
 				SessionID: sess.ID,
 				Agent:     store.agent,
+				StoreDir:  store.dir,
 				State:     state,
 				UpdatedAt: sess.UpdatedAt,
 			})
 		}
-		_ = mgr.Close()
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
@@ -142,6 +131,54 @@ func emitInterruptedRecoveryStatus(deps *ServerDeps, candidate interruptedTurnCa
 	deps.EventBus.Emit(Event{Type: EventRunStatus, Payload: payload})
 }
 
+func interruptedResumeAttemptLimit(deps *ServerDeps) int {
+	const defaultLimit = 3
+	if deps == nil {
+		return defaultLimit
+	}
+	cfg, _, _ := deps.Snapshot()
+	if cfg == nil || cfg.Agent.InterruptedResumeMaxAttempts <= 0 {
+		return defaultLimit
+	}
+	return cfg.Agent.InterruptedResumeMaxAttempts
+}
+
+func cloneInterruptedTurn(state session.InterruptedTurn) session.InterruptedTurn {
+	state.IMStatusContext = append(json.RawMessage(nil), state.IMStatusContext...)
+	state.Participants = append([]string(nil), state.Participants...)
+	return state
+}
+
+func persistInterruptedResumeAttempt(candidate interruptedTurnCandidate, attempt int) error {
+	mgr := session.NewManager(candidate.StoreDir)
+	defer mgr.Close()
+	sess, err := mgr.Resume(candidate.SessionID)
+	if err != nil {
+		return err
+	}
+	if !sess.InProgress {
+		return fmt.Errorf("session is no longer in progress")
+	}
+	state := cloneInterruptedTurn(candidate.State)
+	state.Agent = candidate.Agent
+	state.ResumeAttempts = attempt
+	state.UpdatedAt = time.Now()
+	sess.InterruptedTurn = &state
+	return mgr.Save()
+}
+
+func abandonInterruptedTurn(candidate interruptedTurnCandidate) error {
+	mgr := session.NewManager(candidate.StoreDir)
+	defer mgr.Close()
+	sess, err := mgr.Resume(candidate.SessionID)
+	if err != nil {
+		return err
+	}
+	sess.InProgress = false
+	sess.InterruptedTurn = nil
+	return mgr.Save()
+}
+
 func (s *Server) resumeInterruptedTurns(ctx context.Context) {
 	if s == nil || s.deps == nil || s.deps.SessionCache == nil || s.deps.GW == nil {
 		return
@@ -151,32 +188,68 @@ func (s *Server) resumeInterruptedTurns(ctx context.Context) {
 		log.Printf("daemon: interrupted-turn discovery failed: %v", err)
 		return
 	}
+	maxAttempts := interruptedResumeAttemptLimit(s.deps)
 	for _, candidate := range candidates {
 		if ctx.Err() != nil {
 			return
 		}
-		emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resuming", "continuing durable checkpoint")
 		state := candidate.State
+		if state.ResumeAttempts >= maxAttempts {
+			if abandonErr := abandonInterruptedTurn(candidate); abandonErr != nil {
+				log.Printf("daemon: interrupted turn abandon failed session=%s agent=%s: %v",
+					candidate.SessionID, candidate.Agent, abandonErr)
+				emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resume_failed",
+					fmt.Sprintf("failed to clear exhausted recovery marker: %v", abandonErr))
+				continue
+			}
+			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
+				fmt.Sprintf("automatic recovery exhausted after %d attempts", state.ResumeAttempts))
+			continue
+		}
+
+		attempt := state.ResumeAttempts + 1
+		if persistErr := persistInterruptedResumeAttempt(candidate, attempt); persistErr != nil {
+			log.Printf("daemon: interrupted turn attempt checkpoint failed session=%s agent=%s: %v",
+				candidate.SessionID, candidate.Agent, persistErr)
+			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resume_failed",
+				fmt.Sprintf("failed to persist recovery attempt %d/%d: %v", attempt, maxAttempts, persistErr))
+			continue
+		}
+		state.ResumeAttempts = attempt
+		emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resuming",
+			fmt.Sprintf("continuing durable checkpoint (attempt %d/%d)", attempt, maxAttempts))
 		req := RunAgentRequest{
-			Text:              interruptedTurnContinuation,
-			Agent:             candidate.Agent,
-			SessionID:         candidate.SessionID,
-			Source:            state.Source,
-			Sender:            state.Sender,
-			Channel:           state.Channel,
-			ThreadID:          state.ThreadID,
-			CWD:               state.CWD,
-			RouteKey:          state.RouteKey,
-			CloudMessageID:    state.CloudMessageID,
-			IMStatusContext:   append(json.RawMessage(nil), state.IMStatusContext...),
-			Participants:      append([]string(nil), state.Participants...),
-			ResumeInterrupted: true,
+			Text:                     interruptedTurnContinuation,
+			Agent:                    candidate.Agent,
+			SessionID:                candidate.SessionID,
+			Source:                   state.Source,
+			Sender:                   state.Sender,
+			Channel:                  state.Channel,
+			ThreadID:                 state.ThreadID,
+			CWD:                      state.CWD,
+			RouteKey:                 state.RouteKey,
+			CloudMessageID:           state.CloudMessageID,
+			IMStatusContext:          append(json.RawMessage(nil), state.IMStatusContext...),
+			Participants:             append([]string(nil), state.Participants...),
+			ResumeInterrupted:        true,
+			InterruptedResumeAttempt: attempt,
 		}
 		result, runErr := RunAgent(ctx, s.deps, req, &interruptedRecoveryHandler{})
 		if runErr != nil {
 			log.Printf("daemon: interrupted turn resume failed session=%s agent=%s: %v",
 				candidate.SessionID, candidate.Agent, runErr)
-			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resume_failed", runErr.Error())
+			if attempt >= maxAttempts {
+				if abandonErr := abandonInterruptedTurn(candidate); abandonErr != nil {
+					emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resume_failed",
+						fmt.Sprintf("attempt %d/%d failed and marker cleanup failed: %v", attempt, maxAttempts, abandonErr))
+					continue
+				}
+				emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
+					fmt.Sprintf("automatic recovery exhausted after %d attempts: %v", attempt, runErr))
+			} else {
+				emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resume_failed",
+					fmt.Sprintf("attempt %d/%d failed: %v", attempt, maxAttempts, runErr))
+			}
 			continue
 		}
 		emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resumed", "durable checkpoint completed")

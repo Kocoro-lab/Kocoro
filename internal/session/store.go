@@ -13,6 +13,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 )
 
 // TimePtr returns a pointer to t, for use in MessageMeta literals.
@@ -68,6 +69,7 @@ type InterruptedTurn struct {
 	CloudMessageID  string          `json:"cloud_message_id,omitempty"`
 	IMStatusContext json.RawMessage `json:"im_status_context,omitempty"`
 	Participants    []string        `json:"participants,omitempty"`
+	ResumeAttempts  int             `json:"resume_attempts,omitempty"`
 	UpdatedAt       time.Time       `json:"updated_at"`
 }
 
@@ -371,6 +373,13 @@ type Store struct {
 	lastUpdated time.Time
 }
 
+const (
+	interruptedMarkerDirName   = ".in-progress"
+	interruptedMarkerSuffix    = ".marker"
+	interruptedMarkerScanStamp = "scan-complete"
+	interruptedMarkerLockName  = ".in-progress.lock"
+)
+
 // safeSessionPath joins id onto s.dir while refusing inputs that could escape
 // the sessions directory. Defense in depth — handler-edge validation is the
 // primary block, but Store.Load/Delete are also reachable from internal code
@@ -407,6 +416,211 @@ func NewStore(dir string) *Store {
 		}
 	}
 	return s
+}
+
+func (s *Store) interruptedMarkerDir() string {
+	return filepath.Join(s.dir, interruptedMarkerDirName)
+}
+
+func (s *Store) interruptedMarkerScanComplete() (bool, error) {
+	_, err := os.Stat(filepath.Join(s.interruptedMarkerDir(), interruptedMarkerScanStamp))
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (s *Store) lockInterruptedMarkerMigration() (func(), error) {
+	path := filepath.Join(s.dir, interruptedMarkerLockName)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open interrupted-session migration lock: %w", err)
+	}
+	if err := fslock.Lock(file.Fd()); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock interrupted-session migration: %w", err)
+	}
+	return func() {
+		_ = fslock.Unlock(file.Fd())
+		_ = file.Close()
+	}, nil
+}
+
+func (s *Store) interruptedMarkerPath(id string) (string, error) {
+	if _, err := s.safeSessionPath(id); err != nil {
+		return "", err
+	}
+	return filepath.Join(s.interruptedMarkerDir(), id+interruptedMarkerSuffix), nil
+}
+
+func (s *Store) writeInterruptedMarker(id string) error {
+	path, err := s.interruptedMarkerPath(id)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return fmt.Errorf("create interrupted-session marker directory: %w", err)
+	}
+	if err := writeFileAtomic(path, []byte("in-progress\n"), 0600); err != nil {
+		return fmt.Errorf("write interrupted-session marker: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) removeInterruptedMarker(id string) {
+	path, err := s.interruptedMarkerPath(id)
+	if err != nil {
+		return
+	}
+	// A stale marker is harmless: InterruptedSessions verifies the session's
+	// durable InProgress field and self-heals false/missing entries. Removal is
+	// therefore best-effort so a completed session save is never reported as
+	// failed only because marker cleanup was temporarily unavailable.
+	_ = os.Remove(path)
+}
+
+func (s *Store) interruptedMarkerIDs() ([]string, error) {
+	markerDir := s.interruptedMarkerDir()
+	stampPath := filepath.Join(markerDir, interruptedMarkerScanStamp)
+	scanComplete, err := s.interruptedMarkerScanComplete()
+	if err != nil {
+		return nil, err
+	}
+	if scanComplete {
+		entries, readErr := os.ReadDir(markerDir)
+		if readErr != nil {
+			return nil, readErr
+		}
+		var ids []string
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), interruptedMarkerSuffix) {
+				continue
+			}
+			id := strings.TrimSuffix(entry.Name(), interruptedMarkerSuffix)
+			if IsValidSessionID(id) {
+				ids = append(ids, id)
+			}
+		}
+		sort.Strings(ids)
+		return ids, nil
+	}
+
+	// Serialize the one-time scan with session saves until the durable stamp
+	// exists. Without this lock, a foreground save could create a marker, have
+	// migration classify it against the previous completed JSON as stale, and
+	// then persist InProgress=true after the marker was removed.
+	unlock, err := s.lockInterruptedMarkerMigration()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	scanComplete, err = s.interruptedMarkerScanComplete()
+	if err != nil {
+		return nil, err
+	}
+	if scanComplete {
+		return s.interruptedMarkerIDs()
+	}
+
+	// One-time migration for stores created before recovery markers existed.
+	// Decode only the two header fields instead of allocating Messages, tool
+	// results, and summaries for every historical session. Once the scan stamp
+	// is durable, normal startup is O(number of interrupted turns), not
+	// O(number of all sessions). New Store.Save calls create markers before
+	// persisting InProgress=true, so concurrent first-start saves cannot be
+	// missed by this migration.
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	idSet := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		if !IsValidSessionID(id) {
+			continue
+		}
+		file, openErr := os.Open(filepath.Join(s.dir, entry.Name()))
+		if openErr != nil {
+			continue
+		}
+		var header struct {
+			ID         string `json:"id"`
+			InProgress bool   `json:"in_progress"`
+		}
+		decodeErr := json.NewDecoder(file).Decode(&header)
+		_ = file.Close()
+		if decodeErr != nil || !header.InProgress {
+			continue
+		}
+		if err := s.writeInterruptedMarker(id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+		idSet[id] = struct{}{}
+	}
+	if err := os.MkdirAll(markerDir, 0700); err != nil {
+		return nil, err
+	}
+	// A Save may create a marker concurrently after the legacy directory scan,
+	// or a crash may have left a marker pointing at a completed JSON. Reconcile
+	// those entries before stamping migration complete so neither case is lost
+	// or carried forward as permanent startup noise.
+	markerEntries, err := os.ReadDir(markerDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range markerEntries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), interruptedMarkerSuffix) {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), interruptedMarkerSuffix)
+		if !IsValidSessionID(id) {
+			continue
+		}
+		if _, exists := idSet[id]; exists {
+			continue
+		}
+		sess, loadErr := s.Load(id)
+		if loadErr != nil || !sess.InProgress {
+			s.removeInterruptedMarker(id)
+			continue
+		}
+		ids = append(ids, id)
+		idSet[id] = struct{}{}
+	}
+	if err := writeFileAtomic(stampPath, []byte("1\n"), 0600); err != nil {
+		return nil, fmt.Errorf("write interrupted-session scan stamp: %w", err)
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// InterruptedSessions loads only sessions named by the durable recovery marker
+// index. Stale markers are removed after verifying the authoritative session
+// JSON, so a crash between the completed-session save and marker cleanup cannot
+// schedule a false recovery.
+func (s *Store) InterruptedSessions() ([]*Session, error) {
+	ids, err := s.interruptedMarkerIDs()
+	if err != nil {
+		return nil, err
+	}
+	sessions := make([]*Session, 0, len(ids))
+	for _, id := range ids {
+		sess, loadErr := s.Load(id)
+		if loadErr != nil || !sess.InProgress {
+			s.removeInterruptedMarker(id)
+			continue
+		}
+		sessions = append(sessions, sess)
+	}
+	return sessions, nil
 }
 
 // nextUpdatedAt returns time.Now(), bumped by 1ns if the underlying clock has
@@ -501,9 +715,38 @@ func (s *Store) Save(sess *Session) error {
 		return fmt.Errorf("marshal session: %w", err)
 	}
 
+	// Before the one-time marker scan is stamped complete, serialize the
+	// marker + session write with migration. This lock file is stable and is
+	// never removed, matching the atomic-persistence locking convention.
+	scanComplete, err := s.interruptedMarkerScanComplete()
+	if err != nil {
+		return err
+	}
+	var unlockMigration func()
+	if !scanComplete {
+		unlockMigration, err = s.lockInterruptedMarkerMigration()
+		if err != nil {
+			return err
+		}
+		defer unlockMigration()
+	}
+
+	// Create the recovery marker before the authoritative session write. If the
+	// process dies between the two writes, startup sees a stale marker, loads
+	// the previous completed JSON, and removes it. The reverse ordering could
+	// leave a newly InProgress session unindexed after a crash.
+	if sess.InProgress {
+		if err := s.writeInterruptedMarker(sess.ID); err != nil {
+			return err
+		}
+	}
+
 	path := filepath.Join(s.dir, sess.ID+".json")
 	if err := writeFileAtomic(path, data, 0600); err != nil {
 		return err
+	}
+	if !sess.InProgress {
+		s.removeInterruptedMarker(sess.ID)
 	}
 
 	if s.index != nil {
@@ -761,6 +1004,7 @@ func (s *Store) Delete(id string) error {
 	if err := os.Remove(path); err != nil {
 		return err
 	}
+	s.removeInterruptedMarker(id)
 
 	if s.index != nil {
 		s.index.DeleteSession(id) // best-effort

@@ -101,7 +101,7 @@ func (t *MCPTool) Info() agent.ToolInfo {
 }
 
 func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
-	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+	if result, valid := agent.ValidateToolArgumentPresence(t.Info(), argsJSON); !valid {
 		return result, nil
 	}
 	var args map[string]any

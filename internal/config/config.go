@@ -177,8 +177,13 @@ type AgentConfig struct {
 	// cannot catch: silent TCP-level connection drop mid-response, where the
 	// kernel never returns from read() so the turn-elapsed watchdog can't
 	// observe progress. 0 = disabled (legacy scanner path). Default: 90.
-	StreamIdleTimeoutSecs int   `mapstructure:"stream_idle_timeout_secs" yaml:"stream_idle_timeout_secs" json:"stream_idle_timeout_secs"`
-	SkillDiscovery        *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
+	StreamIdleTimeoutSecs int `mapstructure:"stream_idle_timeout_secs" yaml:"stream_idle_timeout_secs" json:"stream_idle_timeout_secs"`
+	// InterruptedResumeMaxAttempts caps automatic daemon-start continuations
+	// for one durable checkpoint. Default 3 bounds repeated LLM spend when a
+	// malformed or provider-specific turn fails deterministically across
+	// restarts. Operators diagnosing a recoverable long outage can raise it.
+	InterruptedResumeMaxAttempts int   `mapstructure:"interrupted_resume_max_attempts" yaml:"interrupted_resume_max_attempts" json:"interrupted_resume_max_attempts"`
+	SkillDiscovery               *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
 
 	// BashConcurrencyEnabled gates BashTool.IsConcurrencySafeCall. When true
 	// (the Phase C default since 2026-05-15), bash invocations that pass the
@@ -424,8 +429,9 @@ func Load() (*Config, error) {
 	// docs/config-reference.md AND internal/skills/bundled/skills/kocoro/references/config.md
 	// to match — the bundled skill reference is the AI-facing source of truth.
 	viper.SetDefault("agent.idle_soft_timeout_secs", 90)
-	viper.SetDefault("agent.idle_hard_timeout_secs", 540)    // 60s headroom under the 600s HTTP transport ceiling so cancel can propagate + cleanup runs before transport bails. Set to 0 in yaml to opt out (startup WARN logs).
-	viper.SetDefault("agent.stream_idle_timeout_secs", 90)   // per-chunk gap watchdog inside CompleteStream. 0 disables (legacy scanner path).
+	viper.SetDefault("agent.idle_hard_timeout_secs", 540)  // 60s headroom under the 600s HTTP transport ceiling so cancel can propagate + cleanup runs before transport bails. Set to 0 in yaml to opt out (startup WARN logs).
+	viper.SetDefault("agent.stream_idle_timeout_secs", 90) // per-chunk gap watchdog inside CompleteStream. 0 disables (legacy scanner path).
+	viper.SetDefault("agent.interrupted_resume_max_attempts", 3)
 	viper.SetDefault("agent.bash_concurrency_enabled", true) // Phase C: Desktop now consumes tool_use_id on tool_status events, safe to enable concurrent bash batches by default.
 	// Time-based microcompact. Disabled by default — short sessions never
 	// compact, and only sessions that idle past the gap threshold will
@@ -812,10 +818,11 @@ type overlayAgentConfig struct {
 	MaxRecentImages        *int     `yaml:"max_recent_images"`
 	MaxRecentBrowserImages *int     `yaml:"max_recent_browser_images"`
 
-	IdleSoftTimeoutSecs   *int  `yaml:"idle_soft_timeout_secs"`
-	IdleHardTimeoutSecs   *int  `yaml:"idle_hard_timeout_secs"`
-	StreamIdleTimeoutSecs *int  `yaml:"stream_idle_timeout_secs"`
-	SkillDiscovery        *bool `yaml:"skill_discovery"`
+	IdleSoftTimeoutSecs          *int  `yaml:"idle_soft_timeout_secs"`
+	IdleHardTimeoutSecs          *int  `yaml:"idle_hard_timeout_secs"`
+	StreamIdleTimeoutSecs        *int  `yaml:"stream_idle_timeout_secs"`
+	InterruptedResumeMaxAttempts *int  `yaml:"interrupted_resume_max_attempts"`
+	SkillDiscovery               *bool `yaml:"skill_discovery"`
 
 	// BashConcurrencyEnabled is a pointer so unset overlays leave the value
 	// alone — distinguishing "not specified" from "explicitly false".
@@ -851,35 +858,36 @@ type overlayToolsConfig struct {
 // buildDefaultSources returns source entries for all config keys set to "default".
 func buildDefaultSources() map[string]ConfigSource {
 	return map[string]ConfigSource{
-		"endpoint":                        {Level: "default"},
-		"api_key":                         {Level: "default"},
-		"model_tier":                      {Level: "default"},
-		"auto_update_check":               {Level: "default"},
-		"agent.max_iterations":            {Level: "default"},
-		"agent.temperature":               {Level: "default"},
-		"agent.max_tokens":                {Level: "default"},
-		"agent.thinking":                  {Level: "default"},
-		"agent.thinking_mode":             {Level: "default"},
-		"agent.thinking_budget":           {Level: "default"},
-		"agent.force_think_tool":          {Level: "default"},
-		"agent.reasoning_effort":          {Level: "default"},
-		"agent.effort_tier":               {Level: "default"},
-		"agent.model":                     {Level: "default"},
-		"agent.context_window":            {Level: "default"},
-		"agent.observation_window":        {Level: "default"},
-		"agent.max_recent_images":         {Level: "default"},
-		"agent.max_recent_browser_images": {Level: "default"},
-		"agent.idle_soft_timeout_secs":    {Level: "default"},
-		"agent.idle_hard_timeout_secs":    {Level: "default"},
-		"agent.stream_idle_timeout_secs":  {Level: "default"},
-		"agent.bash_concurrency_enabled":  {Level: "default"},
-		"tools.bash_timeout":              {Level: "default"},
-		"tools.bash_max_timeout":          {Level: "default"},
-		"tools.bash_max_output":           {Level: "default"},
-		"tools.result_truncation":         {Level: "default"},
-		"tools.browser_result_truncation": {Level: "default"},
-		"tools.args_truncation":           {Level: "default"},
-		"tools.server_tool_timeout":       {Level: "default"},
+		"endpoint":                              {Level: "default"},
+		"api_key":                               {Level: "default"},
+		"model_tier":                            {Level: "default"},
+		"auto_update_check":                     {Level: "default"},
+		"agent.max_iterations":                  {Level: "default"},
+		"agent.temperature":                     {Level: "default"},
+		"agent.max_tokens":                      {Level: "default"},
+		"agent.thinking":                        {Level: "default"},
+		"agent.thinking_mode":                   {Level: "default"},
+		"agent.thinking_budget":                 {Level: "default"},
+		"agent.force_think_tool":                {Level: "default"},
+		"agent.reasoning_effort":                {Level: "default"},
+		"agent.effort_tier":                     {Level: "default"},
+		"agent.model":                           {Level: "default"},
+		"agent.context_window":                  {Level: "default"},
+		"agent.observation_window":              {Level: "default"},
+		"agent.max_recent_images":               {Level: "default"},
+		"agent.max_recent_browser_images":       {Level: "default"},
+		"agent.idle_soft_timeout_secs":          {Level: "default"},
+		"agent.idle_hard_timeout_secs":          {Level: "default"},
+		"agent.stream_idle_timeout_secs":        {Level: "default"},
+		"agent.interrupted_resume_max_attempts": {Level: "default"},
+		"agent.bash_concurrency_enabled":        {Level: "default"},
+		"tools.bash_timeout":                    {Level: "default"},
+		"tools.bash_max_timeout":                {Level: "default"},
+		"tools.bash_max_output":                 {Level: "default"},
+		"tools.result_truncation":               {Level: "default"},
+		"tools.browser_result_truncation":       {Level: "default"},
+		"tools.args_truncation":                 {Level: "default"},
+		"tools.server_tool_timeout":             {Level: "default"},
 	}
 }
 
@@ -949,6 +957,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.stream_idle_timeout_secs") {
 		cfg.Sources["agent.stream_idle_timeout_secs"] = src
+	}
+	if viper.IsSet("agent.interrupted_resume_max_attempts") {
+		cfg.Sources["agent.interrupted_resume_max_attempts"] = src
 	}
 	if viper.IsSet("agent.bash_concurrency_enabled") {
 		cfg.Sources["agent.bash_concurrency_enabled"] = src
@@ -1102,6 +1113,10 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Agent.StreamIdleTimeoutSecs != nil {
 			cfg.Agent.StreamIdleTimeoutSecs = *overlay.Agent.StreamIdleTimeoutSecs
 			cfg.Sources["agent.stream_idle_timeout_secs"] = src
+		}
+		if overlay.Agent.InterruptedResumeMaxAttempts != nil {
+			cfg.Agent.InterruptedResumeMaxAttempts = *overlay.Agent.InterruptedResumeMaxAttempts
+			cfg.Sources["agent.interrupted_resume_max_attempts"] = src
 		}
 		if overlay.Agent.SkillDiscovery != nil {
 			cfg.Agent.SkillDiscovery = overlay.Agent.SkillDiscovery
@@ -1301,6 +1316,9 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.Agent.StreamIdleTimeoutSecs < 0 {
 		return fmt.Errorf("agent.stream_idle_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Agent.StreamIdleTimeoutSecs)
+	}
+	if cfg.Agent.InterruptedResumeMaxAttempts < 0 {
+		return fmt.Errorf("agent.interrupted_resume_max_attempts (%d) must be >= 0 (0 = default)", cfg.Agent.InterruptedResumeMaxAttempts)
 	}
 	if cfg.Cloud.StreamIdleTimeoutSecs < 0 {
 		return fmt.Errorf("cloud.stream_idle_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Cloud.StreamIdleTimeoutSecs)

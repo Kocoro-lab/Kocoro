@@ -468,7 +468,7 @@ func (s *Server) handleToolCall(ctx context.Context, id *json.RawMessage, params
 
 	// Validate before permission evaluation or hooks so malformed calls cannot
 	// prompt for approval, trigger automation, or reach Tool.Run.
-	if validationResult, valid := agent.ValidateToolArguments(tool.Info(), argsStr); !valid {
+	if validationResult, valid := agent.ValidateToolArgumentPresence(tool.Info(), argsStr); !valid {
 		s.logAudit(p.Name, argsStr, validationResult.Content, "validation", 0)
 		return Response{
 			JSONRPC: "2.0",

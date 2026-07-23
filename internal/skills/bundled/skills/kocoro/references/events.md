@@ -114,6 +114,7 @@ Emits once per `OnUsage` boundary (typically once per LLM call, not per token). 
 | `interrupted_turn_resuming` | Startup recovery claimed a session with a durable mid-turn checkpoint and is continuing it from saved tool results. |
 | `interrupted_turn_resumed` | The checkpointed turn completed successfully after restart. |
 | `interrupted_turn_resume_failed` | A recovery attempt failed. The durable marker remains eligible for a later daemon restart. |
+| `interrupted_turn_abandoned` | Startup recovery reached `agent.interrupted_resume_max_attempts`; the daemon cleared the durable marker instead of spending another LLM call. The partial checkpoint remains in session history. |
 | `interrupted_turn_delivery_failed` | Recovery completed, but proactive delivery to the saved Cloud route failed. The completed reply remains in session history. |
 
 ### `cloud_agent` / `cloud_progress` / `cloud_plan`
