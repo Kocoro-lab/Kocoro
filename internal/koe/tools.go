@@ -23,11 +23,13 @@ type ToolDef struct {
 
 const VoiceIdentityInstructions = "Speak as Kocoro in the first person when describing your actions, work, or results. Never describe Kocoro as a separate worker, delegate, or result source. Even when a specialist handles work, you remain the single Kocoro voice and own the result. Kocoro Desktop is the app name, not another assistant; refer to the app only by its full name."
 
+const ParallelTaskInstructions = "Default to exactly one do_task call. Use multiple do_task calls in one response only when the user explicitly asks for independent work to run in parallel or concurrently. When emitting multiple calls, each call must contain exactly one disjoint work unit and exclude work assigned to every other call. Never send the full compound request in one call while also sending any of its parts in other calls. If the user asks to run A and B in parallel, send one A-only call and one B-only call. This multiple-call rule overrides guidance to pass the whole utterance as spoken or preserve every detail in each call."
+
 func obj(raw string) json.RawMessage { return json.RawMessage(raw) }
 
 const doTaskParamsLegacy = `{"type":"object","properties":{"task":{"type":"string","description":"The task to perform, in the user's own words."},"agent":{"type":"string","description":"Optional: the agent the user named for this task, verbatim. Omit to use the bound agent."}},"required":["task"]}`
 
-const doTaskParamsLedger = `{"type":"object","properties":{"task":{"type":"string","description":"The complete task to perform, in the user's own words."},"agent":{"type":"string","description":"Only when the user explicitly named an agent in this utterance; otherwise omit it."},"relationship":{"type":"string","enum":["new","follow_up"],"description":"new starts another independent task; follow_up refines or corrects an existing task. Omit only when genuinely unsure."},"task_id":{"type":"string","description":"For follow_up, the target task id from a prior result or get_status. Omit only when one running task is unambiguous."}},"required":["task"]}`
+const doTaskParamsLedger = `{"type":"object","properties":{"task":{"type":"string","description":"Exactly one task scope for this call, in the user's own words. With the default single call, include the complete request. For explicit parallel calls, include only this call's disjoint work unit and exclude work assigned to other calls."},"agent":{"type":"string","description":"Only when the user explicitly named an agent in this utterance; otherwise omit it."},"relationship":{"type":"string","enum":["new","follow_up"],"description":"new starts another independent task; follow_up refines or corrects an existing task. Omit only when genuinely unsure."},"task_id":{"type":"string","description":"For follow_up, the target task id from a prior result or get_status. Omit only when one running task is unambiguous."}},"required":["task"]}`
 
 const cancelParamsLegacy = `{"type":"object","properties":{"reason":{"type":"string","enum":["user_cancel","interrupt"],"description":"Why the task is being cancelled."}},"required":[]}`
 
@@ -67,7 +69,7 @@ func ToolDefs() []ToolDef {
 	}
 	if TaskLedgerEnabled() {
 		defs[1].Description += " When the user asks to stop everything (\"都停了\" / \"全部取消\" / \"stop everything\"), make one call with all_running=true instead of one call per task."
-		defs[0].Description += " Before calling, acknowledge with at most one bare clause; never narrate steps, ask the user to wait, or promise to report back. Multiple calls in one response must describe distinct work: use one complete compound task or disjoint concrete tasks, never duplicate the same compound request. The call returns immediately with status running and a task_id; the real result arrives later as a background task update. A running task never blocks later user turns: you may call do_task again for another independent request or a follow-up, and never invent a result before the update lands."
+		defs[0].Description += " Before calling, acknowledge with at most one bare clause; never narrate steps, ask the user to wait, or promise to report back. " + ParallelTaskInstructions + " The call returns immediately with status running and a task_id; the real result arrives later as a background task update. A running task never blocks later user turns: you may call do_task again for another independent request or a follow-up, and never invent a result before the update lands."
 	}
 	return defs
 }

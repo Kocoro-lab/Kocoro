@@ -111,6 +111,33 @@ func TestDoTaskDescriptionSeparatesCurrentHandoffFromLaterTurns(t *testing.T) {
 	}
 }
 
+func TestDoTaskContractGatesParallelAndMakesEachCallDisjoint(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	var def ToolDef
+	for _, candidate := range ToolDefs() {
+		if candidate.Name == "do_task" {
+			def = candidate
+			break
+		}
+	}
+	combined := def.Description + " " + string(def.Parameters)
+	for _, want := range []string{
+		"Default to exactly one do_task call.",
+		"only when the user explicitly asks",
+		"each call must contain exactly one disjoint work unit",
+		"Never send the full compound request in one call while also sending any of its parts",
+		"Exactly one task scope for this call",
+		"exclude work assigned to other calls",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Errorf("do_task contract missing %q", want)
+		}
+	}
+	if strings.Contains(combined, "use one complete compound task or disjoint concrete tasks") {
+		t.Fatal("do_task description still offers the ambiguous compound-plus-split choice")
+	}
+}
+
 func TestBurstRouteKey(t *testing.T) {
 	// MUST equal the keys Plan A Task 3 pins daemon-side.
 	if got := burstRouteKey("finance", "burst-123"); got != "agent:finance:koe:burst-123" {

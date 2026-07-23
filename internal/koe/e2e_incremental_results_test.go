@@ -25,6 +25,119 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+func TestKoeDefaultCompoundRequestUsesOneDoTaskE2E(t *testing.T) {
+	if os.Getenv("KOE_E2E") != "1" {
+		t.Skip("default compound routing E2E: set KOE_E2E=1 (uses OPENAI_API_KEY or the running daemon mint relay)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	ek, err := mintE2EEphemeral(ctx)
+	if err != nil {
+		t.Fatalf("mint Realtime token: %v", err)
+	}
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	requests := make(chan DoTaskRequest, 3)
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req DoTaskRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		requests <- req
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"reply": "东京今天晴，适合轻薄衣物，午后注意防晒。"})
+	}))
+	defer mock.Close()
+
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	state := NewCallState("burst-default-compound-e2e", "")
+	disp := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+	rc, err := newPeerConnection(audio)
+	if err != nil {
+		t.Fatalf("newPeerConnection: %v", err)
+	}
+	defer rc.Close()
+
+	send := func(v any) error {
+		body, _ := json.Marshal(v)
+		return rc.dc.SendText(string(body))
+	}
+	h := newEventHandler(disp, state, audio, send)
+	h.language = "zh"
+	go h.runResponseSender(ctx)
+
+	connected := make(chan struct{})
+	configured := make(chan struct{})
+	var connOnce, cfgOnce sync.Once
+	rc.pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		if s == webrtc.PeerConnectionStateConnected {
+			connOnce.Do(func() { close(connected) })
+		}
+	})
+	persona := "You are Kocoro, a concise Chinese voice assistant. For current weather use do_task. " +
+		ParallelTaskInstructions + " Before a do_task call say only 我查一下."
+	rc.dc.OnOpen(func() { _ = send(sessionConfig(persona, "marin", false)) })
+	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(m.Data, &ev)
+		h.handleEvent(ctx, m.Data)
+		if ev.Type == "session.updated" {
+			cfgOnce.Do(func() { close(configured) })
+		}
+	})
+	if err := rc.dialOpenAI(ctx, ek); err != nil {
+		t.Fatalf("dial OpenAI: %v", err)
+	}
+	go rc.pumpSendTrack(ctx)
+	waitIncrementalSignal(t, ctx, connected, "peer connection did not connect")
+	waitIncrementalSignal(t, ctx, configured, "session did not configure")
+
+	turnID := h.inputCommitSeq.Add(1)
+	h.toolLoop.noteUserCommit(turnID)
+	if err := send(map[string]any{"type": "conversation.item.create", "item": map[string]any{
+		"type": "message", "role": "user",
+		"content": []map[string]any{{"type": "input_text", "text": "查询今天东京的天气，并根据天气整理穿衣和出行建议。"}},
+	}}); err != nil {
+		t.Fatalf("send user turn: %v", err)
+	}
+	h.queueLoopResponse(responseCreateRequest{
+		purpose: responsePurposeUser, turnID: turnID,
+		toolMode: responseToolsEnabled, dropIfPreempted: true,
+	})
+
+	var first DoTaskRequest
+	select {
+	case first = <-requests:
+	case <-ctx.Done():
+		t.Fatal("model did not dispatch the compound task")
+	}
+	lower := strings.ToLower(first.Text)
+	hasWeather := strings.Contains(first.Text, "天气") || strings.Contains(lower, "weather")
+	hasAdvice := strings.Contains(first.Text, "穿衣") || strings.Contains(first.Text, "出行") ||
+		strings.Contains(lower, "clothing") || strings.Contains(lower, "travel") || strings.Contains(lower, "advice")
+	if !hasWeather || !hasAdvice {
+		t.Fatalf("single compound task lost requested scope: %+v", first)
+	}
+	waitCompoundIdle(t, ctx, h, "default compound response did not settle")
+	select {
+	case second := <-requests:
+		t.Fatalf("non-parallel compound request dispatched a second task: first=%+v second=%+v", first, second)
+	case <-time.After(1500 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	t.Logf("VERDICT: non-parallel multi-part request dispatched exactly one complete do_task: %q", first.Text)
+}
+
 func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 	if os.Getenv("KOE_E2E") != "1" {
 		t.Skip("staggered full-path E2E: set KOE_E2E=1 (uses OPENAI_API_KEY or the running daemon mint relay)")
@@ -119,7 +232,8 @@ func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 			connOnce.Do(func() { close(connected) })
 		}
 	})
-	const persona = "You are Kocoro, a concise Chinese voice assistant. For current weather and news, call do_task. If the user asks for both weather and news, emit exactly two distinct parallel do_task calls in the same response. Before the calls say only 我查一下 and nothing else."
+	persona := "You are Kocoro, a concise Chinese voice assistant. For current weather and news, call do_task. " +
+		ParallelTaskInstructions + " Before the calls say only 我查一下 and nothing else."
 	rc.dc.OnOpen(func() { _ = send(sessionConfig(persona, "marin", false)) })
 	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
 		var ev struct {
@@ -168,10 +282,14 @@ func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 		select {
 		case req := <-requests:
 			lower := strings.ToLower(req.Text)
+			hasWeather := strings.Contains(req.Text, "天气") || strings.Contains(lower, "weather")
+			hasNews := strings.Contains(req.Text, "新闻") || strings.Contains(lower, "news")
 			switch {
-			case strings.Contains(req.Text, "天气") || strings.Contains(lower, "weather"):
+			case hasWeather && hasNews:
+				t.Fatalf("parallel call repeated the full compound request instead of one disjoint scope: %+v", req)
+			case hasWeather:
 				seen["weather"] = req
-			case strings.Contains(req.Text, "新闻") || strings.Contains(lower, "news"):
+			case hasNews:
 				seen["news"] = req
 			default:
 				t.Fatalf("model dispatched an unexpected task: %+v", req)

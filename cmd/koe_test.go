@@ -442,6 +442,23 @@ func TestKoePersonaUsesRealtimeStructureAndVoiceStyle(t *testing.T) {
 	}
 }
 
+func TestKoePersonaDefaultsToOneTaskAndMakesExplicitParallelScopesDisjoint(t *testing.T) {
+	combined := koePersona + koeMultiTaskPersona
+	for _, want := range []string{
+		"Default to exactly one do_task call.",
+		"only when the user explicitly asks",
+		"each call must contain exactly one disjoint work unit",
+		"Never send the full compound request in one call while also sending any of its parts",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Errorf("Koe parallel contract missing %q", want)
+		}
+	}
+	if strings.Contains(combined, "either send one complete compound task, or split it") {
+		t.Fatal("Koe parallel contract still offers the ambiguous compound-plus-split choice")
+	}
+}
+
 // TestKoePersonaDividesByInformationSource pins the split: the line is the NATURE
 // OF THE INFORMATION the answer needs — stable public knowledge the model holds vs
 // current/private/action — not task difficulty, and not the model's own sense of
