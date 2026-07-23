@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
@@ -215,6 +216,11 @@ func TestHandleSessionShare_HappyPath(t *testing.T) {
 	if !strings.Contains(gotUploadMetadata, `"session_id":"`+sessID+`"`) {
 		t.Errorf("session share upload metadata missing session_id %q: %s", sessID, gotUploadMetadata)
 	}
+	// newTestShareServer seeds Title = "Test session for share"; the sync path
+	// must carry it into metadata so the Desktop list can show the real title.
+	if !strings.Contains(gotUploadMetadata, `"title":"Test session for share"`) {
+		t.Errorf("session share upload metadata missing session title: %s", gotUploadMetadata)
+	}
 	if !strings.Contains(gotListQuery, "kind=session_share") {
 		t.Errorf("upload_id lookup must filter by kind=session_share; query = %q", gotListQuery)
 	}
@@ -222,16 +228,61 @@ func TestHandleSessionShare_HappyPath(t *testing.T) {
 
 func TestBuildShareUploadMetadata(t *testing.T) {
 	t.Run("default agent omits agent key", func(t *testing.T) {
-		got := string(buildShareUploadMetadata("sess_abc", ""))
+		got := string(buildShareUploadMetadata("sess_abc", "", ""))
 		if got != `{"session_id":"sess_abc"}` {
 			t.Errorf("metadata = %q, want exactly {\"session_id\":\"sess_abc\"}", got)
 		}
 	})
 	t.Run("named agent included", func(t *testing.T) {
-		got := string(buildShareUploadMetadata("sess_abc", "researcher"))
+		got := string(buildShareUploadMetadata("sess_abc", "researcher", ""))
 		// json.Marshal sorts map keys alphabetically — agent comes before session_id.
 		if got != `{"agent":"researcher","session_id":"sess_abc"}` {
 			t.Errorf("metadata = %q", got)
+		}
+	})
+	t.Run("title included when present", func(t *testing.T) {
+		got := string(buildShareUploadMetadata("sess_abc", "", "Refactor the loader"))
+		// Alphabetical key order: session_id before title.
+		if got != `{"session_id":"sess_abc","title":"Refactor the loader"}` {
+			t.Errorf("metadata = %q", got)
+		}
+	})
+	t.Run("CJK title preserved verbatim", func(t *testing.T) {
+		got := buildShareUploadMetadata("sess_abc", "", "现在支持哪些模型")
+		var decoded map[string]string
+		if err := json.Unmarshal(got, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if decoded["title"] != "现在支持哪些模型" {
+			t.Errorf("title = %q, want CJK preserved (filename ASCII rule must not apply here)", decoded["title"])
+		}
+	})
+	t.Run("blank title omitted", func(t *testing.T) {
+		got := string(buildShareUploadMetadata("sess_abc", "", "   "))
+		if got != `{"session_id":"sess_abc"}` {
+			t.Errorf("metadata = %q, want title key omitted for blank title", got)
+		}
+	})
+	t.Run("surrounding whitespace trimmed", func(t *testing.T) {
+		got := string(buildShareUploadMetadata("sess_abc", "", "  padded title \n"))
+		if got != `{"session_id":"sess_abc","title":"padded title"}` {
+			t.Errorf("metadata = %q", got)
+		}
+	})
+	t.Run("overlong title clamped at rune boundary", func(t *testing.T) {
+		long := strings.Repeat("あ", shareTitleMetadataMaxRunes+50)
+		got := buildShareUploadMetadata("sess_abc", "", long)
+		var decoded map[string]string
+		if err := json.Unmarshal(got, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		title := decoded["title"]
+		if utf8.RuneCountInString(title) != shareTitleMetadataMaxRunes {
+			t.Errorf("clamped title rune count = %d, want %d",
+				utf8.RuneCountInString(title), shareTitleMetadataMaxRunes)
+		}
+		if !utf8.ValidString(title) {
+			t.Errorf("clamped title is not valid UTF-8 — clamp must cut at a rune boundary, not mid-codepoint")
 		}
 	})
 }
@@ -733,6 +784,9 @@ func TestHandleSessionShare_AsyncTagsSessionShareKind(t *testing.T) {
 	}
 	if !strings.Contains(gotMetadata, `"session_id":"`+sessID+`"`) {
 		t.Errorf("async upload metadata missing session_id %q: %s", sessID, gotMetadata)
+	}
+	if !strings.Contains(gotMetadata, `"title":"Test session for share"`) {
+		t.Errorf("async upload metadata missing session title: %s", gotMetadata)
 	}
 	if !strings.Contains(gotListQuery, "kind=session_share") {
 		t.Errorf("async upload_id lookup must filter by kind=session_share; query = %q", gotListQuery)
