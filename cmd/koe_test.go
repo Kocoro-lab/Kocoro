@@ -990,19 +990,18 @@ func TestDesktopSessionPersonaDisclosesActiveReconnectContextBoundary(t *testing
 // TestApplyBargeInEnv locks the flag→env bridge: native floor is on while remote
 // irreversible interruption is off.
 func TestApplyBargeInEnv(t *testing.T) {
+	mac := koe.CarrierProfile{Carrier: "mac"}
+
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_NATIVE_FLOOR", "1")
 	t.Setenv("KOE_INTERRUPT_RESPONSE", "1")
 
-	applyBargeInEnv(false, false)
+	applyBargeInEnv(false, false, mac)
 	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
 		t.Fatalf("implicit barge-in setting changed KOE_VPIO_BARGE_IN=%q", v)
 	}
-	if v := os.Getenv("KOE_CLIENT_RESPONSE"); v != "" {
-		t.Fatalf("barge-in off set KOE_CLIENT_RESPONSE=%q, want unchanged", v)
-	}
 
-	applyBargeInEnv(false, true)
+	applyBargeInEnv(false, true, mac)
 	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "0" {
 		t.Fatalf("explicit barge-in off left KOE_VPIO_BARGE_IN=%q, want 0", v)
 	}
@@ -1013,15 +1012,58 @@ func TestApplyBargeInEnv(t *testing.T) {
 		t.Fatalf("explicit barge-in off left KOE_NATIVE_FLOOR=%q, want 0", v)
 	}
 
-	applyBargeInEnv(true, true)
+	t.Setenv("KOE_VPIO_BARGE_IN", "")
+	t.Setenv("KOE_NATIVE_FLOOR", "")
+	t.Setenv("KOE_CLIENT_RESPONSE", "")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "")
+	applyBargeInEnv(true, true, mac)
 	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
 		t.Fatalf("KOE_VPIO_BARGE_IN=%q, want 1", v)
 	}
 	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "1" {
-		t.Fatalf("KOE_NATIVE_FLOOR=%q, want 1", v)
+		t.Fatalf("mac KOE_NATIVE_FLOOR=%q, want 1", v)
 	}
 	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "0" {
 		t.Fatalf("KOE_INTERRUPT_RESPONSE=%q, want 0", v)
+	}
+}
+
+func TestApplyBargeInEnvWirelessDefaultsToClientResponse(t *testing.T) {
+	// The robot's speaker-to-mic echo trips native floor's talk-over claim
+	// (HIL 2026-07-23: choppy playback + phantom accept_turn), so the wireless
+	// default is the legacy client-response loop until the claim is
+	// perception-gated. Floor stays reachable via explicit KOE_NATIVE_FLOOR=1.
+	t.Setenv("KOE_VPIO_BARGE_IN", "")
+	t.Setenv("KOE_NATIVE_FLOOR", "")
+	t.Setenv("KOE_CLIENT_RESPONSE", "")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "")
+
+	applyBargeInEnv(true, true, koe.CarrierProfile{Carrier: "reachy_wireless"})
+	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "0" {
+		t.Fatalf("wireless KOE_NATIVE_FLOOR=%q, want 0", v)
+	}
+	if v := os.Getenv("KOE_CLIENT_RESPONSE"); v != "1" {
+		t.Fatalf("wireless KOE_CLIENT_RESPONSE=%q, want 1", v)
+	}
+}
+
+func TestApplyBargeInEnvRespectsOperatorOverride(t *testing.T) {
+	// The documented rollback flags must survive applyBargeInEnv — before
+	// setenvDefault they were dead letters under --barge-in.
+	t.Setenv("KOE_VPIO_BARGE_IN", "")
+	t.Setenv("KOE_NATIVE_FLOOR", "0")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "")
+
+	applyBargeInEnv(true, true, koe.CarrierProfile{Carrier: "mac"})
+	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "0" {
+		t.Fatalf("override KOE_NATIVE_FLOOR=%q, want 0 preserved", v)
+	}
+
+	t.Setenv("KOE_NATIVE_FLOOR", "1")
+	applyBargeInEnv(true, true, koe.CarrierProfile{Carrier: "reachy_wireless"})
+	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "1" {
+		t.Fatalf("wireless opt-in KOE_NATIVE_FLOOR=%q, want 1 preserved", v)
 	}
 }
 

@@ -97,12 +97,21 @@ func resolveDevKey(flagKey, envKey, controlPort string) string {
 	return ""
 }
 
-// applyBargeInEnv enables the raw-audio floor loop. VPIO and XVF3800 both
-// provide the echo-cancelled capture it needs. Playback pauses locally;
-// Realtime then chooses resume_playback or accept_turn without ASR admission.
-// KOE_NATIVE_FLOOR=0 plus KOE_INTERRUPT_RESPONSE=1 remains the rollback to the old
-// irreversible server-cancel experiment.
-func applyBargeInEnv(bargeIn, explicit bool) {
+// applyBargeInEnv enables the raw-audio native-floor loop. VPIO and XVF3800 both
+// provide the echo-cancelled capture it needs. Playback pauses locally; Realtime
+// then chooses resume_playback or accept_turn without ASR admission.
+// KOE_NATIVE_FLOOR=0 plus KOE_CLIENT_RESPONSE=1 restores the earlier
+// transcript-confirmed duck loop; KOE_NATIVE_FLOOR=0 plus KOE_INTERRUPT_RESPONSE=1
+// remains the rollback to the old irreversible server-cancel experiment.
+//
+// Pre-set env always wins (setenvDefault) so those rollbacks are reachable in
+// the field. On reachy_wireless the DEFAULT is the legacy client-response loop,
+// not native floor: the robot's loudspeaker sits centimetres from its mics and
+// residual echo past XVF3800 trips the floor's talk-over claim — HIL 2026-07-23
+// showed bursts of false playback pauses (choppy speech) and phantom
+// accept_turn answers. Floor stays opt-in there (KOE_NATIVE_FLOOR=1) until the
+// claim is gated on the wireless barge-perception evidence.
+func applyBargeInEnv(bargeIn, explicit bool, carrier koe.CarrierProfile) {
 	if !bargeIn && !explicit {
 		return
 	}
@@ -112,11 +121,25 @@ func applyBargeInEnv(bargeIn, explicit bool) {
 		os.Setenv("KOE_INTERRUPT_RESPONSE", "0")
 		return
 	}
-	os.Setenv("KOE_VPIO_BARGE_IN", "1")
-	os.Setenv("KOE_NATIVE_FLOOR", "1")
-	os.Setenv("KOE_INTERRUPT_RESPONSE", "0")
-	log.Printf("koe[barge]: --barge-in on — KOE_VPIO_BARGE_IN=%s KOE_NATIVE_FLOOR=%s KOE_INTERRUPT_RESPONSE=%s",
-		os.Getenv("KOE_VPIO_BARGE_IN"), os.Getenv("KOE_NATIVE_FLOOR"), os.Getenv("KOE_INTERRUPT_RESPONSE"))
+	setenvDefault("KOE_VPIO_BARGE_IN", "1")
+	if carrier.Carrier == "reachy_wireless" {
+		setenvDefault("KOE_NATIVE_FLOOR", "0")
+		setenvDefault("KOE_CLIENT_RESPONSE", "1")
+	} else {
+		setenvDefault("KOE_NATIVE_FLOOR", "1")
+	}
+	setenvDefault("KOE_INTERRUPT_RESPONSE", "0")
+	log.Printf("koe[barge]: --barge-in on — KOE_VPIO_BARGE_IN=%s KOE_NATIVE_FLOOR=%s KOE_CLIENT_RESPONSE=%s KOE_INTERRUPT_RESPONSE=%s",
+		os.Getenv("KOE_VPIO_BARGE_IN"), os.Getenv("KOE_NATIVE_FLOOR"), os.Getenv("KOE_CLIENT_RESPONSE"), os.Getenv("KOE_INTERRUPT_RESPONSE"))
+}
+
+// setenvDefault sets key only when the environment does not already carry a
+// non-empty value, so an operator-provided rollback flag survives
+// applyBargeInEnv (empty counts as unset, matching koeEnvBool).
+func setenvDefault(key, value string) {
+	if strings.TrimSpace(os.Getenv(key)) == "" {
+		os.Setenv(key, value)
+	}
 }
 
 // fullDuplexAECForConfig separates signal provenance from the local device backend.
@@ -888,7 +911,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 
 	// --barge-in selects native floor control before any audio/session code reads
 	// the env gates (covers both Desktop and standalone branches below).
-	applyBargeInEnv(cfg.bargeIn, cfg.bargeInSet)
+	applyBargeInEnv(cfg.bargeIn, cfg.bargeInSet, cfg.carrier)
 	if w := bargeInBackendWarning(cfg.bargeIn, fullDuplexAECForConfig(cfg)); w != "" {
 		log.Printf("koe[barge]: WARNING — %s", w)
 	}
