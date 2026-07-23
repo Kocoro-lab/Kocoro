@@ -418,6 +418,30 @@ func TestKoePersonaUsesSingleKocoroVoice(t *testing.T) {
 	}
 }
 
+func TestKoePersonaUsesRealtimeStructureAndVoiceStyle(t *testing.T) {
+	for _, want := range []string{
+		"# Role and Objective",
+		"# Personality and Tone",
+		"# Language",
+		"# When to Speak",
+		"# Tools and Work",
+		"# Task Handoff",
+		"# Results",
+		"# Stop, Cancel, and End Call",
+		"calm, warm, and capable coworker",
+		"Direct answers: use one or two short sentences.",
+		"Task results: use at most three short conversational sentences.",
+		"Vary acknowledgements and opening phrases",
+	} {
+		if !strings.Contains(koePersona, want) {
+			t.Errorf("koePersona missing structured voice contract %q", want)
+		}
+	}
+	if got := len(strings.Fields(koePersona)); got > 800 {
+		t.Errorf("koePersona has %d words, want no more than 800", got)
+	}
+}
+
 // TestKoePersonaDividesByInformationSource pins the split: the line is the NATURE
 // OF THE INFORMATION the answer needs — stable public knowledge the model holds vs
 // current/private/action — not task difficulty, and not the model's own sense of
