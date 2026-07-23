@@ -5,7 +5,31 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"time"
 )
+
+// defaultElicitationTimeout bounds how long a tool call waits for the client to
+// answer an elicitation/create prompt (e.g. an approval confirmation).
+//
+//   - Workload: an interactive user deciding whether to allow a single tool
+//     call — 5 minutes matches calendar_request_permission's TCC-dialog budget.
+//   - Symptom when it binds: a client that received the prompt but never answers
+//     and never disconnects would otherwise pin the tool goroutine forever; on
+//     timeout the elicitation fails closed (approval denied) and the tool call
+//     returns a normal JSON-RPC denial, so no goroutine leaks.
+//   - Override: SHANNON_MCP_ELICITATION_TIMEOUT accepts a Go duration string
+//     (e.g. "30s", "10m"); a non-positive or unparseable value keeps the default.
+const defaultElicitationTimeout = 5 * time.Minute
+
+func elicitationTimeout() time.Duration {
+	if v := os.Getenv("SHANNON_MCP_ELICITATION_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultElicitationTimeout
+}
 
 type lifecycleContextKey struct{}
 
@@ -104,11 +128,16 @@ func (ss *serverSession) requestElicitation(
 		return ElicitationResult{}, err
 	}
 
+	timer := time.NewTimer(elicitationTimeout())
+	defer timer.Stop()
+
 	select {
 	case <-ctx.Done():
 		return ElicitationResult{}, ctx.Err()
 	case <-ss.ctx.Done():
 		return ElicitationResult{}, ss.ctx.Err()
+	case <-timer.C:
+		return ElicitationResult{}, errors.New("elicitation timed out waiting for client response")
 	case msg := <-responseCh:
 		if msg.Error != nil {
 			return ElicitationResult{}, fmt.Errorf(

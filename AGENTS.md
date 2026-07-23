@@ -115,6 +115,8 @@ Image size safety has source-time compression, wire-time sanitization, and persi
 
 The agent loop exposes explicit phases. Only LLM-wait and force-stop phases count as idle for the watchdog. Mid-turn checkpoints run after tool batches, reactive compaction, and before force-stop; final save rebuilds from the same baseline so turns are not double-persisted.
 
+Interrupted turns auto-resume at daemon start (newest first, serial) but only within the `agent.interrupted_resume_max_age_hours` staleness window (default 4h) — older checkpoints are abandoned, never executed. Recovered runs always classify as unattended so the unattended tool deny-list applies, and they pin the session's original route key so concurrent inbound traffic for the same session is serialized. `agent.interrupted_resume_enabled: false` disables auto-resume entirely.
+
 ### Thinking Blocks
 
 When native thinking is enabled, preserve assistant `thinking` and `redacted_thinking` content blocks in order across the conversation trajectory. Sanitizers, compaction, fork builders, and session persistence must not rewrite them. Strip thinking only before session sync upload.

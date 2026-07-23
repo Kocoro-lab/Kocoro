@@ -415,7 +415,10 @@ func FuzzFileWrite_RawJSON(f *testing.F) {
 	})
 }
 
-func TestFileWrite_RejectsWhitespaceOnlyContent(t *testing.T) {
+// Whitespace-only content is a legitimate write (a lone newline, an
+// indentation-only line). Only the empty string "" is rejected — see
+// TestFileWrite_MissingContent / TestFileWrite_EmptyContent.
+func TestFileWrite_AcceptsWhitespaceOnlyContent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "near_empty.txt")
 
@@ -429,8 +432,12 @@ func TestFileWrite_RejectsWhitespaceOnlyContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !result.IsError || !contains(result.Content, "[validation error]") {
-		t.Fatalf("expected validation error for whitespace-only content, got: %s", result.Content)
+	if result.IsError {
+		t.Fatalf("whitespace-only content should write, got error: %s", result.Content)
+	}
+	data, _ := os.ReadFile(path)
+	if string(data) != " " {
+		t.Fatalf("expected single space written, got %q", string(data))
 	}
 }
 

@@ -28,6 +28,13 @@ type streamToolStarter struct {
 	tools   *ToolRegistry
 	handler EventHandler
 	runs    map[string]*speculativeToolRun
+	// barrier is set once any streamed call is not speculation-eligible
+	// (write-capable, approval-gated, unknown, …). Later calls in the same
+	// response must not start early: the normal executor runs calls in
+	// response order, so a read streamed after a write must observe the
+	// write's effect. Stream order matches response order, so refusing to
+	// speculate past the first non-eligible call preserves that ordering.
+	barrier bool
 }
 
 func newStreamToolStarter(ctx context.Context, loop *AgentLoop, tools *ToolRegistry, handler EventHandler) *streamToolStarter {
@@ -79,12 +86,21 @@ func (s *streamToolStarter) eligible(fc client.FunctionCall, activeSkillFilter m
 }
 
 func (s *streamToolStarter) Start(fc client.FunctionCall, activeSkillFilter map[string]bool) {
+	if s == nil {
+		return
+	}
 	tool, argsStr, ok := s.eligible(fc, activeSkillFilter)
+	s.mu.Lock()
 	if !ok {
+		s.barrier = true
+		s.mu.Unlock()
+		return
+	}
+	if s.barrier {
+		s.mu.Unlock()
 		return
 	}
 	key := streamedToolCallKey(fc)
-	s.mu.Lock()
 	if _, exists := s.runs[key]; exists {
 		s.mu.Unlock()
 		return

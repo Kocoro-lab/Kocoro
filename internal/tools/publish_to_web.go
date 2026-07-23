@@ -217,12 +217,17 @@ func (t *PublishToWebTool) Info() agent.ToolInfo {
 }
 
 func (t *PublishToWebTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
-	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
-		return result, nil
-	}
 	var args publishArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	// Explicit required-field checks so path/purpose keep their actionable
+	// hints (validatePurpose carries the recipient/channel guidance).
+	if strings.TrimSpace(args.Path) == "" {
+		return agent.ValidationError("path is required"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("publish_to_web: missing required `description` parameter"), nil
 	}
 	if res, ok := validatePurpose(args.Purpose); !ok {
 		return res, nil

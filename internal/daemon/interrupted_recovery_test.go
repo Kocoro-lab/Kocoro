@@ -98,9 +98,11 @@ func TestInterruptedResumeAttemptPersistenceAndAbandon(t *testing.T) {
 	if candidate.StoreDir != dir {
 		t.Fatalf("store dir = %q, want %q", candidate.StoreDir, dir)
 	}
-	if err := persistInterruptedResumeAttempt(candidate, 2); err != nil {
+	attemptMgr := session.NewManager(dir)
+	if err := persistInterruptedResumeAttempt(attemptMgr, candidate, 2); err != nil {
 		t.Fatalf("persist attempt: %v", err)
 	}
+	_ = attemptMgr.Close()
 
 	mgr := session.NewManager(dir)
 	sess, err := mgr.Load(id)
@@ -112,9 +114,11 @@ func TestInterruptedResumeAttemptPersistenceAndAbandon(t *testing.T) {
 	}
 	_ = mgr.Close()
 
-	if err := abandonInterruptedTurn(candidate); err != nil {
+	abandonMgr := session.NewManager(dir)
+	if err := abandonInterruptedTurn(abandonMgr, candidate); err != nil {
 		t.Fatalf("abandon: %v", err)
 	}
+	_ = abandonMgr.Close()
 	mgr = session.NewManager(dir)
 	defer mgr.Close()
 	sess, err = mgr.Load(id)

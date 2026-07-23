@@ -31,7 +31,9 @@ func (t *DirectoryListTool) Info() agent.ToolInfo {
 				"description": agent.DescriptionFieldSpec,
 			},
 		},
-		Required: []string{"description"},
+		// description is deliberately NOT required: it feeds approval cards, but
+		// this read-only, high-frequency tool never shows one. See file_read.
+		Required: nil,
 	}
 }
 
@@ -39,9 +41,6 @@ func (t *DirectoryListTool) Run(ctx context.Context, argsJSON string) (agent.Too
 	var args dirListArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
-	}
-	if strings.TrimSpace(args.Description) == "" {
-		return agent.ValidationError("directory_list: missing required `description` parameter"), nil
 	}
 
 	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)

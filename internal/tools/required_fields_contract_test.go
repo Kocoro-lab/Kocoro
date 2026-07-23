@@ -45,6 +45,9 @@ func TestBuiltinTools_RejectMissingRequiredFields(t *testing.T) {
 		&EditImageTool{},
 		&ListPublishedFilesTool{},
 		&RetractPublishedFileTool{},
+		// wait_for validates its own required field before touching the client,
+		// so a nil-client instance exercises the argument gate correctly.
+		&WaitTool{},
 	)
 
 	for _, tool := range tools {
@@ -73,6 +76,81 @@ func TestBuiltinTools_RejectMissingRequiredFields(t *testing.T) {
 				}
 				if !strings.Contains(result.Content, missing) {
 					t.Fatalf("error for missing %q did not identify the field: %q", missing, result.Content)
+				}
+			})
+		}
+	}
+}
+
+// emptyStringExemptRequired lists (tool, field) pairs where a required STRING
+// field legitimately accepts "". There should be none — a builtin using
+// presence-only validation for a string field is a bug. The map exists so any
+// future justified exemption is explicit and commented, not silent.
+var emptyStringExemptRequired = map[string]map[string]bool{}
+
+// TestBuiltinTools_RejectEmptyStringRequiredFields complements the missing-field
+// sweep above. Deleting a field only catches presence checks; a builtin that
+// validates presence but not emptiness would pass that sweep while still
+// letting "" through to a syscall. This sets each required STRING field to ""
+// (keeping the others valid) and asserts a [validation error].
+func TestBuiltinTools_RejectEmptyStringRequiredFields(t *testing.T) {
+	cfg := &config.Config{Provider: "ollama"}
+	reg, _, cleanup := RegisterLocalTools(cfg, nil)
+	defer cleanup()
+	ctx := cwdctx.WithSessionCWD(context.Background(), t.TempDir())
+
+	tools := reg.All()
+	tools = append(tools,
+		&SessionSearchTool{},
+		&MemoryTool{},
+		&CalendarCheckPermissionTool{},
+		&CalendarRequestPermissionTool{},
+		&CalendarListSourcesTool{},
+		&CalendarListEventsTool{},
+		&CalendarGetEventTool{},
+		&CalendarCreateEventTool{},
+		&CalendarUpdateEventTool{},
+		&CalendarDeleteEventTool{},
+		&CloudDelegateTool{},
+		&PublishToWebTool{},
+		&GenerateImageTool{},
+		&EditImageTool{},
+		&ListPublishedFilesTool{},
+		&RetractPublishedFileTool{},
+		&WaitTool{},
+	)
+
+	for _, tool := range tools {
+		info := tool.Info()
+		properties, _ := info.Parameters["properties"].(map[string]any)
+		for _, field := range info.Required {
+			field := field
+			// Only string fields can be set to "". Non-string required fields
+			// (arrays, numbers, booleans) are covered by the missing-field sweep.
+			if property, ok := properties[field].(map[string]any); ok {
+				if property["type"] != "string" {
+					continue
+				}
+			}
+			if emptyStringExemptRequired[info.Name][field] {
+				continue
+			}
+			t.Run(info.Name+"/empty_"+field, func(t *testing.T) {
+				args := validRequiredArgs(info)
+				args[field] = ""
+				argsJSON, err := json.Marshal(args)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, err := tool.Run(ctx, string(argsJSON))
+				if err != nil {
+					t.Fatalf("Run returned framework error: %v", err)
+				}
+				if !result.IsError {
+					t.Fatalf("empty %q unexpectedly succeeded: %q", field, result.Content)
+				}
+				if !strings.HasPrefix(result.Content, "[validation error]") {
+					t.Fatalf("empty %q returned a non-standard error: %q", field, result.Content)
 				}
 			})
 		}

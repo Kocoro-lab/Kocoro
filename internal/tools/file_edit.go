@@ -32,12 +32,14 @@ func (t *FileEditTool) Info() agent.ToolInfo {
 			"properties": map[string]any{
 				"path":        map[string]any{"type": "string", "description": "File path to edit"},
 				"old_string":  map[string]any{"type": "string", "description": "Exact string to find. Must be unique unless replace_all=true."},
-				"new_string":  map[string]any{"type": "string", "description": "Replacement string"},
+				"new_string":  map[string]any{"type": "string", "description": "Replacement string. An empty string deletes the matched text."},
 				"description": agent.DescriptionFieldSpec,
 				"replace_all": map[string]any{"type": "boolean", "description": "When true, replace every occurrence of old_string. When false (default), old_string must appear exactly once. Use replace_all only when the target is unambiguous globally (variable rename, refactor)."},
 			},
 		},
-		Required: []string{"path", "old_string", "new_string", "description"},
+		// new_string is intentionally NOT required: JSON cannot distinguish a
+		// missing field from "", and "" is a legal deletion request.
+		Required: []string{"path", "old_string", "description"},
 	}
 }
 
@@ -49,14 +51,11 @@ func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	if strings.TrimSpace(args.Path) == "" {
 		return agent.ValidationError("file_edit: missing required `path` parameter"), nil
 	}
-	if strings.TrimSpace(args.OldString) == "" {
+	// Reject only the empty string, not whitespace-only: a whitespace-only
+	// old_string (e.g. "\n\n") is legitimate content, such as collapsing blank
+	// lines. new_string is not checked at all — "" is a valid deletion request.
+	if args.OldString == "" {
 		return agent.ValidationError("file_edit: missing required `old_string` parameter"), nil
-	}
-	if strings.TrimSpace(args.NewString) == "" {
-		return agent.ValidationError(
-			"file_edit: missing required `new_string` parameter. " +
-				"To delete text, read the file and use file_write with the complete replacement content.",
-		), nil
 	}
 	if strings.TrimSpace(args.Description) == "" {
 		return agent.ValidationError("file_edit: missing required `description` parameter"), nil

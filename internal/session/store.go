@@ -470,6 +470,25 @@ func (s *Store) writeInterruptedMarker(id string) error {
 	return nil
 }
 
+// syncInterruptedMarker re-asserts the durable-marker invariant (on-disk
+// InProgress=true ⟺ marker exists) for a session state that was just
+// persisted. Save and every Patch* read-modify-write path must call this
+// after writeFileAtomic: a patch that persists a Load-time InProgress value
+// concurrently with a completion save would otherwise strand a session as
+// interrupted-with-no-marker (never recovered, never cleaned) or leave a
+// stale marker behind. Best-effort like removeInterruptedMarker —
+// InterruptedSessions self-heals residual mismatches at startup.
+func (s *Store) syncInterruptedMarker(sess *Session) {
+	if sess == nil {
+		return
+	}
+	if sess.InProgress {
+		_ = s.writeInterruptedMarker(sess.ID)
+		return
+	}
+	s.removeInterruptedMarker(sess.ID)
+}
+
 func (s *Store) removeInterruptedMarker(id string) {
 	path, err := s.interruptedMarkerPath(id)
 	if err != nil {
@@ -774,6 +793,7 @@ func (s *Store) PatchTitle(id, title string) error {
 	if err := writeFileAtomic(path, data, 0600); err != nil {
 		return err
 	}
+	s.syncInterruptedMarker(sess)
 
 	if s.index != nil {
 		s.index.UpsertSession(sess)
@@ -804,6 +824,7 @@ func (s *Store) PatchAutoTitle(id, title string, atTurns int) (bool, error) {
 	if err := writeFileAtomic(filepath.Join(s.dir, sess.ID+".json"), data, 0600); err != nil {
 		return false, err
 	}
+	s.syncInterruptedMarker(sess)
 	if s.index != nil {
 		s.index.UpsertSession(sess)
 	}
@@ -838,6 +859,7 @@ func (s *Store) PatchFlags(id string, pinned, favorite *bool) error {
 	if err := writeFileAtomic(path, data, 0600); err != nil {
 		return err
 	}
+	s.syncInterruptedMarker(sess)
 
 	if s.index != nil {
 		// Narrow UPDATE on pinned/favorite columns only — does not rebuild
@@ -879,7 +901,11 @@ func (s *Store) PatchPublishedShares(id string, mutate func([]PublishedShareEntr
 	}
 
 	path := filepath.Join(s.dir, sess.ID+".json")
-	return writeFileAtomic(path, data, 0600)
+	if err := writeFileAtomic(path, data, 0600); err != nil {
+		return err
+	}
+	s.syncInterruptedMarker(sess)
+	return nil
 }
 
 // PatchSummaryCache 从磁盘重新读取 session 的最新版本，仅更新摘要缓存字段后写回。
@@ -899,7 +925,11 @@ func (s *Store) PatchSummaryCache(id, summary, cacheKey string) error {
 	}
 
 	path := filepath.Join(s.dir, sess.ID+".json")
-	return writeFileAtomic(path, data, 0600)
+	if err := writeFileAtomic(path, data, 0600); err != nil {
+		return err
+	}
+	s.syncInterruptedMarker(sess)
+	return nil
 }
 
 func (s *Store) Load(id string) (*Session, error) {

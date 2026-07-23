@@ -182,8 +182,20 @@ type AgentConfig struct {
 	// for one durable checkpoint. Default 3 bounds repeated LLM spend when a
 	// malformed or provider-specific turn fails deterministically across
 	// restarts. Operators diagnosing a recoverable long outage can raise it.
-	InterruptedResumeMaxAttempts int   `mapstructure:"interrupted_resume_max_attempts" yaml:"interrupted_resume_max_attempts" json:"interrupted_resume_max_attempts"`
-	SkillDiscovery               *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
+	InterruptedResumeMaxAttempts int `mapstructure:"interrupted_resume_max_attempts" yaml:"interrupted_resume_max_attempts" json:"interrupted_resume_max_attempts"`
+	// InterruptedResumeMaxAgeHours bounds how old a durable checkpoint may be
+	// and still auto-resume at daemon start. Default 4 covers crash/upgrade
+	// restarts within a work session; anything older executes a stale user
+	// intent with nobody present (a months-old interrupted destructive turn
+	// must never fire on upgrade). When it binds, the checkpoint is abandoned
+	// with an interrupted_turn_abandoned event instead of resumed. Raise it
+	// for long planned outages; <=0 falls back to the default.
+	InterruptedResumeMaxAgeHours int `mapstructure:"interrupted_resume_max_age_hours" yaml:"interrupted_resume_max_age_hours" json:"interrupted_resume_max_age_hours"`
+	// InterruptedResumeEnabled gates daemon-start auto-continuation of durable
+	// checkpoints entirely. Default true. Set false to leave interrupted turns
+	// in place (markers preserved) without any automatic execution.
+	InterruptedResumeEnabled *bool `mapstructure:"interrupted_resume_enabled" yaml:"interrupted_resume_enabled,omitempty" json:"interrupted_resume_enabled,omitempty"`
+	SkillDiscovery           *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
 
 	// BashConcurrencyEnabled gates BashTool.IsConcurrencySafeCall. When true
 	// (the Phase C default since 2026-05-15), bash invocations that pass the
@@ -432,6 +444,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.idle_hard_timeout_secs", 540)  // 60s headroom under the 600s HTTP transport ceiling so cancel can propagate + cleanup runs before transport bails. Set to 0 in yaml to opt out (startup WARN logs).
 	viper.SetDefault("agent.stream_idle_timeout_secs", 90) // per-chunk gap watchdog inside CompleteStream. 0 disables (legacy scanner path).
 	viper.SetDefault("agent.interrupted_resume_max_attempts", 3)
+	viper.SetDefault("agent.interrupted_resume_max_age_hours", 4) // staleness window for auto-resume; see Config.Agent.InterruptedResumeMaxAgeHours
 	viper.SetDefault("agent.bash_concurrency_enabled", true) // Phase C: Desktop now consumes tool_use_id on tool_status events, safe to enable concurrent bash batches by default.
 	// Time-based microcompact. Disabled by default — short sessions never
 	// compact, and only sessions that idle past the gap threshold will
@@ -822,6 +835,8 @@ type overlayAgentConfig struct {
 	IdleHardTimeoutSecs          *int  `yaml:"idle_hard_timeout_secs"`
 	StreamIdleTimeoutSecs        *int  `yaml:"stream_idle_timeout_secs"`
 	InterruptedResumeMaxAttempts *int  `yaml:"interrupted_resume_max_attempts"`
+	InterruptedResumeMaxAgeHours *int  `yaml:"interrupted_resume_max_age_hours"`
+	InterruptedResumeEnabled     *bool `yaml:"interrupted_resume_enabled"`
 	SkillDiscovery               *bool `yaml:"skill_discovery"`
 
 	// BashConcurrencyEnabled is a pointer so unset overlays leave the value
@@ -880,6 +895,7 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.idle_hard_timeout_secs":          {Level: "default"},
 		"agent.stream_idle_timeout_secs":        {Level: "default"},
 		"agent.interrupted_resume_max_attempts": {Level: "default"},
+		"agent.interrupted_resume_max_age_hours": {Level: "default"},
 		"agent.bash_concurrency_enabled":        {Level: "default"},
 		"tools.bash_timeout":                    {Level: "default"},
 		"tools.bash_max_timeout":                {Level: "default"},
@@ -960,6 +976,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.interrupted_resume_max_attempts") {
 		cfg.Sources["agent.interrupted_resume_max_attempts"] = src
+	}
+	if viper.IsSet("agent.interrupted_resume_max_age_hours") {
+		cfg.Sources["agent.interrupted_resume_max_age_hours"] = src
 	}
 	if viper.IsSet("agent.bash_concurrency_enabled") {
 		cfg.Sources["agent.bash_concurrency_enabled"] = src
@@ -1117,6 +1136,14 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Agent.InterruptedResumeMaxAttempts != nil {
 			cfg.Agent.InterruptedResumeMaxAttempts = *overlay.Agent.InterruptedResumeMaxAttempts
 			cfg.Sources["agent.interrupted_resume_max_attempts"] = src
+		}
+		if overlay.Agent.InterruptedResumeMaxAgeHours != nil {
+			cfg.Agent.InterruptedResumeMaxAgeHours = *overlay.Agent.InterruptedResumeMaxAgeHours
+			cfg.Sources["agent.interrupted_resume_max_age_hours"] = src
+		}
+		if overlay.Agent.InterruptedResumeEnabled != nil {
+			cfg.Agent.InterruptedResumeEnabled = overlay.Agent.InterruptedResumeEnabled
+			cfg.Sources["agent.interrupted_resume_enabled"] = src
 		}
 		if overlay.Agent.SkillDiscovery != nil {
 			cfg.Agent.SkillDiscovery = overlay.Agent.SkillDiscovery
@@ -1319,6 +1346,9 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.Agent.InterruptedResumeMaxAttempts < 0 {
 		return fmt.Errorf("agent.interrupted_resume_max_attempts (%d) must be >= 0 (0 = default)", cfg.Agent.InterruptedResumeMaxAttempts)
+	}
+	if cfg.Agent.InterruptedResumeMaxAgeHours < 0 {
+		return fmt.Errorf("agent.interrupted_resume_max_age_hours (%d) must be >= 0 (0 = default)", cfg.Agent.InterruptedResumeMaxAgeHours)
 	}
 	if cfg.Cloud.StreamIdleTimeoutSecs < 0 {
 		return fmt.Errorf("cloud.stream_idle_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Cloud.StreamIdleTimeoutSecs)

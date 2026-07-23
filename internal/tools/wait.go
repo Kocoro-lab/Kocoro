@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
@@ -55,7 +56,7 @@ func (t *WaitTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 
-	if args.Condition == "" {
+	if strings.TrimSpace(args.Condition) == "" {
 		return agent.ValidationError("wait_for: missing required `condition` parameter"), nil
 	}
 

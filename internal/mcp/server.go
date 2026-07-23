@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +17,51 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
 )
+
+// defaultMaxConcurrentRequests caps how many tool calls execute concurrently
+// within a single MCP session.
+//
+//   - Workload: a client pipelining tool calls (e.g. an agent fanning out a
+//     batch of reads) — 64 covers normal fan-out with headroom.
+//   - Symptom when it binds: excess calls queue on a semaphore acquired inside
+//     the request goroutine (the scanner keeps reading frames, so cancellations
+//     and elicitation responses still land) instead of spawning unbounded
+//     goroutines that a misbehaving or malicious client could use to exhaust
+//     memory.
+//   - Override: SHANNON_MCP_MAX_CONCURRENT_REQUESTS accepts a positive integer;
+//     a non-positive or unparseable value keeps the default.
+const defaultMaxConcurrentRequests = 64
+
+func maxConcurrentRequests() int {
+	if v := os.Getenv("SHANNON_MCP_MAX_CONCURRENT_REQUESTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxConcurrentRequests
+}
+
+// defaultEOFDrainGrace bounds how long Serve waits for in-flight requests to
+// finish after the input stream ends (clean EOF) before force-cancelling them.
+//
+//   - Workload: a client that closed stdin while a tool call is still running —
+//     2 seconds lets nearly-done in-process work flush its response (single-shot
+//     callers rely on this to receive their reply after closing the pipe).
+//   - Symptom when it binds: a tool blocked on ctx.Done() would otherwise pin
+//     wg.Wait() forever; once the grace elapses the request is cancelled and
+//     Serve returns.
+//   - Override: SHANNON_MCP_EOF_DRAIN_GRACE accepts a Go duration string (e.g.
+//     "100ms"); a non-positive or unparseable value keeps the default.
+const defaultEOFDrainGrace = 2 * time.Second
+
+func eofDrainGrace() time.Duration {
+	if v := os.Getenv("SHANNON_MCP_EOF_DRAIN_GRACE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultEOFDrainGrace
+}
 
 // JSON-RPC 2.0 types.
 
@@ -240,10 +287,18 @@ func (ss *serverSession) canElicit() bool {
 	return ss.supportsElicitation
 }
 
-func (ss *serverSession) registerActive(id *json.RawMessage, cancel context.CancelFunc) {
+// tryRegisterActive records a cancel func for an in-flight request id. It
+// returns false when that id is already in flight, leaving the existing entry
+// intact so a duplicate request cannot clobber the original's cancel func.
+func (ss *serverSession) tryRegisterActive(id *json.RawMessage, cancel context.CancelFunc) bool {
+	key := rawIDKey(id)
 	ss.activeMu.Lock()
-	ss.active[rawIDKey(id)] = cancel
-	ss.activeMu.Unlock()
+	defer ss.activeMu.Unlock()
+	if _, exists := ss.active[key]; exists {
+		return false
+	}
+	ss.active[key] = cancel
+	return true
 }
 
 func (ss *serverSession) finishActive(id *json.RawMessage) {
@@ -313,6 +368,10 @@ func (s *Server) Serve(ctx context.Context, reader io.Reader, writer io.Writer) 
 		}
 	}()
 
+	// Bounds concurrent tool EXECUTION, not frame reading. Acquired inside the
+	// request goroutine so the scanner stays responsive while requests queue.
+	sem := make(chan struct{}, maxConcurrentRequests())
+
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -353,12 +412,26 @@ func (s *Server) Serve(ctx context.Context, reader io.Reader, writer io.Writer) 
 		}
 
 		requestCtx, requestCancel := context.WithCancel(ss.ctx)
-		ss.registerActive(msg.ID, requestCancel)
+		if !ss.tryRegisterActive(msg.ID, requestCancel) {
+			requestCancel()
+			_ = ss.write(errorResponse(msg.ID, -32600, "request id already in flight"))
+			continue
+		}
 		ss.wg.Add(1)
 		go func(msg inboundMessage, requestCtx context.Context, requestCancel context.CancelFunc) {
 			defer ss.wg.Done()
 			defer requestCancel()
 			defer ss.finishActive(msg.ID)
+
+			// Bound concurrent execution. Acquiring here (not before spawn) keeps
+			// the scanner reading further frames (cancellations, elicitation
+			// responses) while this request queues. The acquire is blocking, not
+			// cancel-aborted: on session teardown running requests are cancelled
+			// and release the semaphore, so a queued request drains rather than
+			// hanging, and an EOF-cancelled request still flushes its response.
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
 			requestCtx = withLifecycleSession(requestCtx, ss)
 
 			var resp Response
@@ -380,9 +453,28 @@ func (s *Server) Serve(ctx context.Context, reader io.Reader, writer io.Writer) 
 
 	scanErr := scanner.Err()
 	if scanErr != nil || ctx.Err() != nil {
+		// The read failed or the parent context is done: no client remains, so
+		// cancel in-flight work immediately.
 		ss.cancelAllActive()
 	}
-	ss.wg.Wait()
+	// Drain in-flight requests, then guarantee termination. On a clean EOF the
+	// parent ctx is still live and nothing has been cancelled yet — running
+	// requests get a bounded grace to finish and flush their responses (this is
+	// how single-shot callers that close stdin still receive their reply), then
+	// any straggler is cancelled so a tool blocked on ctx.Done() cannot pin
+	// wg.Wait() forever. When cancelAllActive already ran above, the drain
+	// completes immediately.
+	drained := make(chan struct{})
+	go func() {
+		ss.wg.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(eofDrainGrace()):
+		ss.cancelAllActive()
+		<-drained
+	}
 	ss.cancel()
 	<-listChangedDone
 	if scanErr != nil {

@@ -49,8 +49,10 @@ func (t *FileWriteTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 	// Reject calls that omit content (or pass an empty string). Without this
 	// guard, os.WriteFile happily writes 0 bytes and returns "wrote 0 bytes"
 	// with IsError=false — the model reads that as a successful write and
-	// keeps looping. See the 2026-05-13 stuck-loop incident.
-	if strings.TrimSpace(args.Content) == "" {
+	// keeps looping. See the 2026-05-13 stuck-loop incident. Only "" is
+	// rejected (not whitespace-only): writing a file whose content is "\n" is
+	// legitimate.
+	if args.Content == "" {
 		return agent.ValidationError(
 			"file_write: missing required `content` parameter. " +
 				"To intentionally truncate a file, use `bash` with `: > path`.",

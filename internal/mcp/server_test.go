@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -882,6 +883,277 @@ func TestToolPermissionDenylistOverridesExecution(t *testing.T) {
 	if tool.runCalls.Load() != 0 {
 		t.Fatalf("run calls = %d", tool.runCalls.Load())
 	}
+}
+
+// readJSONLineTimeout reads one JSON-RPC line but fails the test instead of
+// blocking forever, so a hung server surfaces as a bounded failure.
+func readJSONLineTimeout(t *testing.T, scanner *bufio.Scanner, d time.Duration) map[string]json.RawMessage {
+	t.Helper()
+	type result struct {
+		msg map[string]json.RawMessage
+		ok  bool
+	}
+	ch := make(chan result, 1)
+	go func() {
+		if scanner.Scan() {
+			var m map[string]json.RawMessage
+			_ = json.Unmarshal(scanner.Bytes(), &m)
+			ch <- result{m, true}
+			return
+		}
+		ch <- result{nil, false}
+	}()
+	select {
+	case r := <-ch:
+		if !r.ok {
+			t.Fatalf("scanner closed without a message: %v", scanner.Err())
+		}
+		return r.msg
+	case <-time.After(d):
+		t.Fatalf("timed out after %s waiting for JSON-RPC message", d)
+		return nil
+	}
+}
+
+// Fix 1: clean EOF (client closes stdin) must cancel in-flight requests so
+// Serve does not hang on wg.Wait().
+func TestServeCancelsInFlightRequestsOnCleanEOF(t *testing.T) {
+	t.Setenv("SHANNON_MCP_EOF_DRAIN_GRACE", "100ms")
+	started := make(chan struct{})
+	tool := &lifecycleTool{
+		name:    "block_probe",
+		started: started,
+		run: func(ctx context.Context) (agent.ToolResult, error) {
+			<-ctx.Done()
+			return agent.ToolResult{}, ctx.Err()
+		},
+	}
+	srv := NewServer(newTestRegistry(tool), "test", "1.0", nil, nil, nil)
+	inputReader, inputWriter := io.Pipe()
+	var output bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Serve(context.Background(), inputReader, &output)
+	}()
+
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		ID:      rawID(9),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"block_probe","arguments":{}}`),
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("tool did not start")
+	}
+
+	// Client closes stdin with no prior cancellation notification: clean EOF.
+	_ = inputWriter.Close()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve hung on clean EOF with an in-flight blocking request")
+	}
+}
+
+// Fix 2: a client that receives elicitation/create but never answers must not
+// pin the tool goroutine forever; the wait times out and fails closed.
+func TestElicitationTimeoutFailsClosed(t *testing.T) {
+	t.Setenv("SHANNON_MCP_ELICITATION_TIMEOUT", "100ms")
+	tool := &lifecycleTool{name: "approval_probe", requiresApproval: true}
+	srv := NewServer(newTestRegistry(tool), "test", "1.0", nil, nil, nil)
+	inputReader, inputWriter := io.Pipe()
+	outputReader, outputWriter := io.Pipe()
+	scanner := bufio.NewScanner(outputReader)
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(context.Background(), inputReader, outputWriter) }()
+
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		ID:      rawID(1),
+		Method:  "initialize",
+		Params: json.RawMessage(
+			`{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{"form":{}}}}`,
+		),
+	})
+	readJSONLineTimeout(t, scanner, 2*time.Second)
+	writeJSONLine(t, inputWriter, Request{JSONRPC: "2.0", Method: "notifications/initialized"})
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		ID:      rawID(2),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"approval_probe","arguments":{}}`),
+	})
+
+	elicit := readJSONLineTimeout(t, scanner, 2*time.Second)
+	if string(elicit["method"]) != `"elicitation/create"` {
+		t.Fatalf("method = %s", elicit["method"])
+	}
+
+	// Never answer the elicitation. The bounded timeout must produce a denial.
+	resp := readJSONLineTimeout(t, scanner, 2*time.Second)
+	if string(resp["id"]) != "2" {
+		t.Fatalf("response id = %s, want 2", resp["id"])
+	}
+	if _, hasErr := resp["error"]; !hasErr {
+		t.Fatalf("expected JSON-RPC error (fail closed) on elicitation timeout, got %v", resp)
+	}
+	if tool.runCalls.Load() != 0 {
+		t.Fatalf("run calls = %d, tool must not run when approval times out", tool.runCalls.Load())
+	}
+
+	_ = inputWriter.Close()
+	<-done
+	_ = outputWriter.Close()
+}
+
+// Fix 3: a second request re-using an in-flight id must be rejected without
+// corrupting the original request's active-map entry.
+func TestDuplicateInFlightRequestIDRejected(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	tool := &lifecycleTool{
+		name: "dup_probe",
+		run: func(ctx context.Context) (agent.ToolResult, error) {
+			once.Do(func() { close(started) })
+			select {
+			case <-release:
+				return agent.ToolResult{Content: "done"}, nil
+			case <-ctx.Done():
+				return agent.ToolResult{}, ctx.Err()
+			}
+		},
+	}
+	srv := NewServer(newTestRegistry(tool), "test", "1.0", nil, nil, nil)
+	inputReader, inputWriter := io.Pipe()
+	outputReader, outputWriter := io.Pipe()
+	scanner := bufio.NewScanner(outputReader)
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(context.Background(), inputReader, outputWriter) }()
+
+	call := Request{
+		JSONRPC: "2.0",
+		ID:      rawID(9),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"dup_probe","arguments":{}}`),
+	}
+	writeJSONLine(t, inputWriter, call)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first call did not start")
+	}
+
+	// Second call re-uses the in-flight id 9.
+	writeJSONLine(t, inputWriter, call)
+	dup := readJSONLineTimeout(t, scanner, 2*time.Second)
+	if string(dup["id"]) != "9" {
+		t.Fatalf("duplicate response id = %s, want 9", dup["id"])
+	}
+	raw, ok := dup["error"]
+	if !ok {
+		t.Fatalf("expected JSON-RPC error for duplicate id, got %v", dup)
+	}
+	var rpcErr RPCError
+	if err := json.Unmarshal(raw, &rpcErr); err != nil {
+		t.Fatal(err)
+	}
+	if rpcErr.Code != -32600 {
+		t.Fatalf("error code = %d, want -32600", rpcErr.Code)
+	}
+
+	// The original request's entry survives: it still completes normally.
+	close(release)
+	orig := readJSONLineTimeout(t, scanner, 2*time.Second)
+	if string(orig["id"]) != "9" {
+		t.Fatalf("original response id = %s, want 9", orig["id"])
+	}
+	if _, hasErr := orig["error"]; hasErr {
+		t.Fatalf("original call should succeed, got error: %v", orig["error"])
+	}
+
+	_ = inputWriter.Close()
+	<-done
+	_ = outputWriter.Close()
+}
+
+// Fix 4: concurrent tool EXECUTION is bounded by a semaphore while the scanner
+// stays responsive (queued requests do not block frame reading).
+func TestRequestConcurrencyCapBoundsExecution(t *testing.T) {
+	t.Setenv("SHANNON_MCP_MAX_CONCURRENT_REQUESTS", "1")
+	release := make(chan struct{})
+	var running, maxRunning atomic.Int32
+	firstStarted := make(chan struct{})
+	var once sync.Once
+	tool := &lifecycleTool{
+		name: "cap_probe",
+		run: func(ctx context.Context) (agent.ToolResult, error) {
+			n := running.Add(1)
+			for {
+				m := maxRunning.Load()
+				if n <= m || maxRunning.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			once.Do(func() { close(firstStarted) })
+			select {
+			case <-release:
+			case <-ctx.Done():
+				running.Add(-1)
+				return agent.ToolResult{}, ctx.Err()
+			}
+			running.Add(-1)
+			return agent.ToolResult{Content: "done"}, nil
+		},
+	}
+	srv := NewServer(newTestRegistry(tool), "test", "1.0", nil, nil, nil)
+	inputReader, inputWriter := io.Pipe()
+	outputReader, outputWriter := io.Pipe()
+	scanner := bufio.NewScanner(outputReader)
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(context.Background(), inputReader, outputWriter) }()
+
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		ID:      rawID(1),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"cap_probe","arguments":{}}`),
+	})
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first call did not start")
+	}
+
+	// Second call must queue on the semaphore, not run concurrently.
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		ID:      rawID(2),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"cap_probe","arguments":{}}`),
+	})
+	time.Sleep(200 * time.Millisecond)
+	if got := running.Load(); got != 1 {
+		t.Fatalf("concurrent executions = %d, want 1 (cap not enforced)", got)
+	}
+
+	close(release)
+	got1 := readJSONLineTimeout(t, scanner, 2*time.Second)
+	got2 := readJSONLineTimeout(t, scanner, 2*time.Second)
+	ids := map[string]bool{string(got1["id"]): true, string(got2["id"]): true}
+	if !ids["1"] || !ids["2"] {
+		t.Fatalf("expected responses for ids 1 and 2, got %v", ids)
+	}
+	if m := maxRunning.Load(); m != 1 {
+		t.Fatalf("max concurrent executions = %d, want 1", m)
+	}
+
+	_ = inputWriter.Close()
+	<-done
+	_ = outputWriter.Close()
 }
 
 func TestToolPermissionAllowlistBypassesGenericApproval(t *testing.T) {

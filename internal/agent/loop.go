@@ -4592,7 +4592,11 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 				if earlyResult, claimed := committedStreamTools.Claim(ctx, fc); claimed {
 					callMeta[idx].decision = "allow"
 					callMeta[idx].wasApproved = true
-					callMeta[idx].resolved = true
+					// NOT marked resolved: Claim only emitted OnToolCall. The
+					// post-execution serial pass below must still treat this
+					// call as executed so the claimed result gets err-mapping,
+					// sanitizeResult, the audit row, and the terminal
+					// OnToolResult event.
 					execResults[idx] = earlyResult
 					claimedStreamTool = true
 					// Preserve read-before-edit state before later calls in this
