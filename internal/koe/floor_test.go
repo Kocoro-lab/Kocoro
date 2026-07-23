@@ -331,6 +331,35 @@ func TestNativeFloorServerClearCancelsDeadSourceToUnblockJudge(t *testing.T) {
 	}
 }
 
+func TestNativeFloorServerClearDoesNotCancelActiveJudge(t *testing.T) {
+	enableNativeFloorForTest(t)
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-floor-stale-clear", ""), audio, cap.send)
+	h.fullDuplexAEC = true
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"source-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	judge := <-h.loopRespReq
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"source-1","status":"completed"}}`))
+	h.setPendingResponse(judge)
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"judge-1"}}`))
+
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.cleared"}`))
+
+	if got := cap.countType("response.cancel"); got != 0 {
+		t.Fatalf("stale source clear cancelled the active judge %d times; frames=%v", got, cap.types())
+	}
+	if got := h.activeResponseID(); got != "judge-1" {
+		t.Fatalf("active response after stale clear=%q, want judge-1", got)
+	}
+}
+
 func TestNativeFloorAcceptAfterServerClearSkipsLocalTruncate(t *testing.T) {
 	enableNativeFloorForTest(t)
 	audio, err := NewAudioIO()
