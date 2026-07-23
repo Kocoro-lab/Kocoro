@@ -22,7 +22,7 @@ func TestBash_Run(t *testing.T) {
 		t.Skip("bash tests not supported on Windows")
 	}
 	tool := &BashTool{}
-	result, err := tool.Run(context.Background(), `{"command": "echo hello"}`)
+	result, err := tool.Run(context.Background(), `{"command": "echo hello", "description":"test command"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -114,11 +114,7 @@ func TestBash_Args_DescriptionParsed(t *testing.T) {
 	}
 }
 
-// TestBash_Args_DescriptionMissingStillExecutes confirms the soft-degradation
-// path: even though Required declares `description`, the daemon does not
-// block execution when it's missing — that decision belongs to the model's
-// own tool-call validation. Older sessions and edge cases must still run.
-func TestBash_Args_DescriptionMissingStillExecutes(t *testing.T) {
+func TestBash_Args_DescriptionMissingIsValidationError(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("bash tests not supported on Windows")
 	}
@@ -127,21 +123,12 @@ func TestBash_Args_DescriptionMissingStillExecutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run without description should not return Go error: %v", err)
 	}
-	if result.IsError {
-		t.Fatalf("Run without description should not be marked error: %s", result.Content)
-	}
-	if !strings.Contains(result.Content, "no_desc") {
-		t.Errorf("expected 'no_desc' in output, got: %s", result.Content)
+	if !result.IsError || !strings.HasPrefix(result.Content, "[validation error]") {
+		t.Fatalf("Run without description should be a validation error: %s", result.Content)
 	}
 }
 
-// TestBash_Args_DescriptionEmptyStringSafe covers the case where the model
-// satisfies the Required schema by producing an empty string. The daemon
-// transmits it as-is so audit log reflects truth; UI clients are responsible
-// for falling back to the raw command for display when description is
-// empty — daemon must not rewrite args to invent a placeholder, since the
-// args JSON is also what audit log records.
-func TestBash_Args_DescriptionEmptyStringSafe(t *testing.T) {
+func TestBash_Args_DescriptionEmptyStringIsValidationError(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("bash tests not supported on Windows")
 	}
@@ -150,11 +137,8 @@ func TestBash_Args_DescriptionEmptyStringSafe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run with empty description should not return Go error: %v", err)
 	}
-	if result.IsError {
-		t.Fatalf("Run with empty description should not be marked error: %s", result.Content)
-	}
-	if !strings.Contains(result.Content, "empty_desc") {
-		t.Errorf("expected 'empty_desc' in output, got: %s", result.Content)
+	if !result.IsError || !strings.HasPrefix(result.Content, "[validation error]") {
+		t.Fatalf("Run with empty description should be a validation error: %s", result.Content)
 	}
 }
 
@@ -193,7 +177,7 @@ func TestBashTool_MaxOutputChars(t *testing.T) {
 		t.Skip("bash tests not supported on Windows")
 	}
 	tool := &BashTool{}
-	result, err := tool.Run(context.Background(), `{"command":"printf '%1000s' x","max_output_chars":100}`)
+	result, err := tool.Run(context.Background(), `{"command":"printf '%1000s' x","max_output_chars":100,"description":"test truncation"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +249,7 @@ func TestBash_MaxOutput(t *testing.T) {
 	t.Run("default limit", func(t *testing.T) {
 		tool := &BashTool{}
 		// Generate output larger than 30000 bytes
-		result, err := tool.Run(context.Background(), `{"command": "python3 -c \"print('x' * 35000)\""}`)
+		result, err := tool.Run(context.Background(), `{"command": "python3 -c \"print('x' * 35000)\"","description":"test default limit"}`)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -279,7 +263,7 @@ func TestBash_MaxOutput(t *testing.T) {
 
 	t.Run("custom limit", func(t *testing.T) {
 		tool := &BashTool{MaxOutput: 500}
-		result, err := tool.Run(context.Background(), `{"command": "python3 -c \"print('x' * 1000)\""}`)
+		result, err := tool.Run(context.Background(), `{"command": "python3 -c \"print('x' * 1000)\"","description":"test custom limit"}`)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -293,7 +277,7 @@ func TestBash_MaxOutput(t *testing.T) {
 
 	t.Run("small output not truncated", func(t *testing.T) {
 		tool := &BashTool{MaxOutput: 500}
-		result, err := tool.Run(context.Background(), `{"command": "echo hello"}`)
+		result, err := tool.Run(context.Background(), `{"command": "echo hello","description":"test no truncation"}`)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -387,7 +371,7 @@ func TestBash_EmptyCWDDoesNotLeakProcessCWD(t *testing.T) {
 	}
 
 	tool := &BashTool{}
-	result, err := tool.Run(context.Background(), `{"command":"pwd"}`)
+	result, err := tool.Run(context.Background(), `{"command":"pwd","description":"test cwd"}`)
 	if err != nil {
 		t.Fatalf("Run transport error: %v", err)
 	}
@@ -405,7 +389,7 @@ func TestBash_EmptyCWDDoesNotLeakProcessCWD(t *testing.T) {
 
 	// Double-check: a bash `ls sentinel` should NOT find the sentinel file
 	// because bash is running in os.TempDir(), not the fake daemon dir.
-	lsResult, err := tool.Run(context.Background(), `{"command":"ls `+sentinel+` 2>&1 || true"}`)
+	lsResult, err := tool.Run(context.Background(), `{"command":"ls `+sentinel+` 2>&1 || true","description":"test cwd isolation"}`)
 	if err != nil {
 		t.Fatalf("ls Run error: %v", err)
 	}
@@ -534,7 +518,7 @@ func TestBash_DefaultTimeoutPrecedence(t *testing.T) {
 	t.Run("config default used when no per-call timeout", func(t *testing.T) {
 		// DefaultTimeoutSecs=1 means bash should time out after 1s.
 		tool := &BashTool{DefaultTimeoutSecs: 1}
-		result, err := tool.Run(context.Background(), `{"command": "sleep 5"}`)
+		result, err := tool.Run(context.Background(), `{"command": "sleep 5","description":"test timeout"}`)
 		if err != nil {
 			t.Fatalf("Run transport error: %v", err)
 		}
@@ -549,7 +533,7 @@ func TestBash_DefaultTimeoutPrecedence(t *testing.T) {
 	t.Run("per-call timeout overrides config default", func(t *testing.T) {
 		// Config says 60s, per-call says 1s. Per-call must win.
 		tool := &BashTool{DefaultTimeoutSecs: 60}
-		result, err := tool.Run(context.Background(), `{"command": "sleep 5", "timeout": 1}`)
+		result, err := tool.Run(context.Background(), `{"command": "sleep 5", "timeout": 1,"description":"test timeout override"}`)
 		if err != nil {
 			t.Fatalf("Run transport error: %v", err)
 		}
@@ -569,7 +553,7 @@ func TestBash_DefaultTimeoutPrecedence(t *testing.T) {
 		// field-zero path uses the 120s constant via a short probe: we ensure
 		// a quick command succeeds unambiguously (ruling out a <1s default).
 		tool := &BashTool{} // DefaultTimeoutSecs == 0
-		result, err := tool.Run(context.Background(), `{"command": "echo ok"}`)
+		result, err := tool.Run(context.Background(), `{"command": "echo ok","description":"test fallback timeout"}`)
 		if err != nil {
 			t.Fatalf("Run transport error: %v", err)
 		}
@@ -582,7 +566,7 @@ func TestBash_DefaultTimeoutPrecedence(t *testing.T) {
 		// Force a timeout with a per-call value to confirm the timeout path
 		// still fires (i.e. the code is threading a duration, not skipping
 		// timeouts altogether when DefaultTimeoutSecs is zero).
-		result2, err := tool.Run(context.Background(), `{"command": "sleep 5", "timeout": 1}`)
+		result2, err := tool.Run(context.Background(), `{"command": "sleep 5", "timeout": 1,"description":"test fallback override"}`)
 		if err != nil {
 			t.Fatalf("Run transport error: %v", err)
 		}
@@ -602,7 +586,7 @@ func TestBash_SessionCWDStillHonored(t *testing.T) {
 	ctx := cwdctx.WithSessionCWD(context.Background(), sessionCWD)
 
 	tool := &BashTool{}
-	result, err := tool.Run(ctx, `{"command":"pwd"}`)
+	result, err := tool.Run(ctx, `{"command":"pwd","description":"test session cwd"}`)
 	if err != nil {
 		t.Fatalf("Run transport error: %v", err)
 	}
@@ -626,7 +610,7 @@ func TestBash_ElapsedPrefix_AppearsAtOrAbove1s(t *testing.T) {
 		t.Skip("bash tests not supported on Windows")
 	}
 	tool := &BashTool{}
-	result, err := tool.Run(context.Background(), `{"command":"sleep 1 && echo done"}`)
+	result, err := tool.Run(context.Background(), `{"command":"sleep 1 && echo done","description":"test elapsed prefix"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -645,7 +629,7 @@ func TestBash_ElapsedPrefix_AbsentBelowThreshold(t *testing.T) {
 		t.Skip("bash tests not supported on Windows")
 	}
 	tool := &BashTool{}
-	result, err := tool.Run(context.Background(), `{"command":"echo fast"}`)
+	result, err := tool.Run(context.Background(), `{"command":"echo fast","description":"test fast command"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -667,7 +651,7 @@ func TestBash_ClampsExcessiveTimeout(t *testing.T) {
 	}
 	// Cap at 1s so the test asserts the clamp by observing the SIGKILL.
 	tool := &BashTool{MaxTimeoutSecs: 1}
-	result, _ := tool.Run(context.Background(), `{"command":"sleep 10 && echo nope","timeout":30}`)
+	result, _ := tool.Run(context.Background(), `{"command":"sleep 10 && echo nope","timeout":30,"description":"test timeout cap"}`)
 	// We expect the command to get SIGKILL'd at the 1s cap, not run for the
 	// requested 30s or the model-implied 10s.
 	if !result.IsError && strings.Contains(result.Content, "nope") {
@@ -682,7 +666,7 @@ func TestBash_MaxTimeoutOverride_AcceptsConfiguredCap(t *testing.T) {
 		t.Skip("bash tests not supported on Windows")
 	}
 	tool := &BashTool{MaxTimeoutSecs: 5}
-	result, err := tool.Run(context.Background(), `{"command":"sleep 3 && echo within_cap"}`)
+	result, err := tool.Run(context.Background(), `{"command":"sleep 3 && echo within_cap","description":"test configured cap"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -765,7 +749,7 @@ func TestBash_ParallelProcessGroupKill_TimeoutHonored(t *testing.T) {
 	// `sleep 31337` is a value unlikely to collide with any real or other
 	// test sleep, so a post-call pgrep matches only THIS test's child.
 	tool := &BashTool{MaxTimeoutSecs: 1}
-	result, _ := tool.Run(context.Background(), `{"command":"sleep 31337 & sleep 5"}`)
+	result, _ := tool.Run(context.Background(), `{"command":"sleep 31337 & sleep 5","description":"test process group cleanup"}`)
 	if !result.IsError {
 		t.Errorf("expected timeout error, got: %s", result.Content)
 	}

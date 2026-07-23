@@ -461,7 +461,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	loop.SetContextWindow(agent.SeedContextWindowFromModels(
 		runtimeCfg.Agent.Model, sess.LastSeenModel(),
 		agent.ContextWindowFloorForProvider(runtimeCfg.Provider, runtimeCfg.Agent.ContextWindow)))
-	// Interactive TUI — long-lived session with iteration, 1h cache pays off.
+	// Preserve TUI attribution; Cloud currently uses the short TTL for all sources.
 	loop.SetCacheSource("tui")
 	loop.SetSkillDiscovery(runtimeCfg.Agent.SkillDiscoveryEnabled())
 	if memPreflightQuerier != nil {

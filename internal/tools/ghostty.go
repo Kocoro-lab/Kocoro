@@ -118,10 +118,10 @@ func (t *GhosttyTool) Info() agent.ToolInfo {
 				"action":      map[string]any{"type": "string", "description": "Action: new_tab, new_split, send_input, list_tabs"},
 				"description": agent.DescriptionFieldSpec,
 				"command":     map[string]any{"type": "string", "description": "Shell command to run in the new tab/split"},
-				"title":     map[string]any{"type": "string", "description": "Tab title (defaults to command basename)"},
-				"direction": map[string]any{"type": "string", "description": "Split direction: right or down (for new_split)"},
-				"target":    map[string]any{"type": "string", "description": "Tab title to send input to (for send_input)"},
-				"text":      map[string]any{"type": "string", "description": "Text/keystrokes to send (for send_input)"},
+				"title":       map[string]any{"type": "string", "description": "Tab title (defaults to command basename)"},
+				"direction":   map[string]any{"type": "string", "description": "Split direction: right or down (for new_split)"},
+				"target":      map[string]any{"type": "string", "description": "Tab title to send input to (for send_input)"},
+				"text":        map[string]any{"type": "string", "description": "Text/keystrokes to send (for send_input)"},
 			},
 		},
 		Required: []string{"action", "description"},
@@ -131,7 +131,13 @@ func (t *GhosttyTool) Info() agent.ToolInfo {
 func (t *GhosttyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args ghosttyArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Action) == "" {
+		return agent.ValidationError("ghostty: missing required `action` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("ghostty: missing required `description` parameter"), nil
 	}
 	if !ghosttyAvailable() {
 		return agent.ToolResult{
@@ -151,10 +157,10 @@ func (t *GhosttyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	case "list_tabs":
 		return t.runListTabs()
 	default:
-		return agent.ToolResult{
-			Content: fmt.Sprintf("unknown action %q — use new_tab, new_split, send_input, or list_tabs", args.Action),
-			IsError: true,
-		}, nil
+		return agent.ValidationError(fmt.Sprintf(
+			"ghostty: unknown action %q — use new_tab, new_split, send_input, or list_tabs",
+			args.Action,
+		)), nil
 	}
 }
 

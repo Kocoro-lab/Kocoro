@@ -159,7 +159,7 @@ shan "show all tables in the database"     # sqlite MCP
 
 | Format | Built-in fallback | Better with |
 |---|---|---|
-| PDF | n/a — suggests upload so cloud renders it as a native Anthropic document block | `pdftotext` (`brew install poppler`) |
+| PDF | macOS PDFKit through the installed Swift runtime; other hosts return an install/upload hint | `pdftotext` (`brew install poppler`) |
 | DOCX | unzip + XML strip (raw text) | `pandoc` (`brew install pandoc`) |
 | XLSX | unzip + raw XML | `xlsx2csv` (`pip install xlsx2csv`) |
 | PPTX | unzip + XML strip | `pandoc` (`brew install pandoc`) |
@@ -395,9 +395,15 @@ Expose local tools to MCP clients via JSON-RPC 2.0 over stdio:
 shan mcp serve
 ```
 
-Same permission engine, hooks, and audit logging as the CLI. Tools requiring approval are denied in MCP mode (no interactive TTY).
+Same permission engine, hooks, and audit logging as the CLI. Tools requiring
+approval fail closed unless the connected client negotiated form elicitation;
+capable clients receive a structured one-call confirmation request.
 
-Supported methods: `initialize`, `tools/list`, `tools/call`.
+Supported request methods: `initialize`, `tools/list`, `tools/call`, and
+server-initiated `elicitation/create`. Long-running calls accept
+`notifications/cancelled`, calls carrying `_meta.progressToken` receive
+`notifications/progress`, and initialized clients receive
+`notifications/tools/list_changed` when the registry changes.
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | shan mcp serve

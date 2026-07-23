@@ -161,7 +161,10 @@ Payloads decoded by UI clients (bus events, per-request SSE events, HTTP respons
 
 ### Prompt Cache
 
-Source-routed TTLs matter: channels/TUI use long cache, one-shot/subagent/helper paths use cheaper short cache. Preserve `cache_source` propagation and canonical tool input normalization.
+Cloud currently applies the short prompt-cache TTL to every request. Preserve
+`cache_source` as attribution (not a Kocoro-side TTL selector) and preserve
+canonical tool input normalization. Any future TTL-policy change belongs in
+shannon-cloud and must update `docs/cache-strategy.md` in the same rollout.
 
 Any in-place message content rewrite that can affect prompt bytes must emit cache-compaction/debug instrumentation so drift remains attributable.
 
@@ -200,6 +203,6 @@ Schedule tests use temp directories and do not write to the real LaunchAgents di
 
 ## Tools
 
-Core local tools include file ops, archive inspect/extract, document extraction, shell/system, macOS GUI, schedules, memory, and skills. `computer_use` is the primary native-GUI tool: Accessibility-first observations return a per-run `state_id`; ref mutations reject stale state; screenshots are explicit; windowless apps are reopened generically; integer-shaped strings are tolerated; bounded delay waits need no shell fallback; pointer actions move the real cursor visibly; observations skip approval while mutations retain normal approval policy; whole calls serialize across concurrent routes on one GUI-operation lock shared with the legacy `accessibility` / `computer` / `applescript` tools; unattended runs (including auto-approve transports and IM/voice channels without an approval UI) can never invoke it — observation actions included — even via persisted or broker Always Allow. Runtime-conditional tools include session search, cloud delegation, publish/list/retract uploads, image generation/editing, and deferred tool search.
+Core local tools include file ops, archive inspect/extract, document extraction, shell/system, macOS GUI, schedules, memory, and skills. `computer_use` is the primary native-GUI tool: Accessibility-first observations return a per-run `state_id`; ref mutations reject stale state; screenshots are explicit; windowless apps are reopened generically; integer-shaped strings are tolerated; bounded delay waits need no shell fallback; pointer actions move the real cursor visibly; observations skip approval while mutations retain normal approval policy; whole calls serialize across concurrent routes on one GUI-operation lock shared with the legacy `accessibility` / `computer` / `applescript` tools; unattended runs (including auto-approve transports and IM/voice channels without an approval UI) can never invoke it — observation actions included — even via persisted or broker Always Allow. The standalone `screenshot` tool also requires approval and is denied on unattended runs. Runtime-conditional tools include session search, cloud delegation, publish/list/retract uploads, image generation/editing, and deferred tool search.
 
 Every approval-required tool must expose a short human-readable description or equivalent purpose field for approval UI. Destructive or paid/public cloud tools require approval.

@@ -209,18 +209,10 @@ func BuildForkedSuggestionRequest(main client.CompletionRequest) client.Completi
 	// the load-bearing half of this contract — until it lands, this mark is
 	// inert and user accounts are still charged.
 	//
-	// TTL policy: prompt_suggestion ALWAYS resolves to the 5m TTL bucket on
-	// the cloud side (the default for any source not in
-	// `_LONG_CACHE_SOURCES`). This is a deliberate design choice, not a
-	// requirement to mirror the parent caller. Consequence: if a future
-	// cloud release routes the parent main source (e.g. "shanclaw") to the
-	// 1h bucket, the main turn's cache_control bytes and the fork's
-	// cache_control bytes will diverge — Anthropic cache keys change,
-	// fork-input drops from cache_read (~$0.001) to full price (~$0.015),
-	// suggestion cost rises ~10×. The suggestion call is small and
-	// per-turn, so we accept that regression rather than thread parent TTL
-	// through the wire schema. Re-evaluate this trade-off the day
-	// `_LONG_CACHE_SOURCES` stops being a frozenset of size 0.
+	// Cloud currently applies the short TTL to both main and suggestion calls,
+	// so this attribution/billing tag does not change cache_control bytes. If
+	// Cloud reintroduces source-routed TTLs, it must keep prompt_suggestion
+	// aligned with the parent or this fork will lose its prefix-cache hit.
 	out.CacheSource = "prompt_suggestion"
 	return out
 }

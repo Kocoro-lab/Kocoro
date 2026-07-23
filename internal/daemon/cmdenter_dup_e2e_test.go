@@ -290,10 +290,9 @@ func TestE2E_LateRetract_ReportsAlreadyCommitted(t *testing.T) {
 		t.Fatalf("late retract status = %q, want already_committed", status)
 	}
 
-	// The desktop-source runs fire the async smart-title goroutine
-	// (fireTitleAfterRun) on context.Background(); it re-writes the session
-	// file after this body returns, racing t.TempDir's RemoveAll
-	// ("sessions: directory not empty", ~10% on CI). Join it before cleanup,
-	// mirroring e7e41d3's fix for TestRunAgent_PersistsSessionUsage.
-	waitForTitlePersisted(t, filepath.Join(deps.ShannonDir, "sessions", sid+".json"))
+	// This scenario hits both smart-title trigger turns: run 0 stamps turn 1,
+	// then the tool continuation in run 1 reaches turn 3 and launches a second
+	// detached writer. Waiting for merely TitleTurns >= 1 joins only the first
+	// goroutine and still races t.TempDir cleanup under full-suite load.
+	waitForTitleTurnsPersisted(t, filepath.Join(deps.ShannonDir, "sessions", sid+".json"), 3)
 }

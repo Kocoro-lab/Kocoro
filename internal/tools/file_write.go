@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
@@ -40,17 +41,23 @@ func (t *FileWriteTool) Info() agent.ToolInfo {
 func (t *FileWriteTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args fileWriteArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Path) == "" {
+		return agent.ValidationError("file_write: missing required `path` parameter"), nil
 	}
 	// Reject calls that omit content (or pass an empty string). Without this
 	// guard, os.WriteFile happily writes 0 bytes and returns "wrote 0 bytes"
 	// with IsError=false — the model reads that as a successful write and
 	// keeps looping. See the 2026-05-13 stuck-loop incident.
-	if args.Content == "" {
+	if strings.TrimSpace(args.Content) == "" {
 		return agent.ValidationError(
 			"file_write: missing required `content` parameter. " +
-				"To truncate the file pass a single space, or use `bash` with `: > path`.",
+				"To intentionally truncate a file, use `bash` with `: > path`.",
 		), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("file_write: missing required `description` parameter"), nil
 	}
 	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
 	if resolveErr != nil {

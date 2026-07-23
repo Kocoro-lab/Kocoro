@@ -109,15 +109,15 @@ func (t *GenerateImageTool) Info() agent.ToolInfo {
 }
 
 func (t *GenerateImageTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	var args generateImageArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 
 	prompt := strings.TrimSpace(args.Prompt)
-	if prompt == "" {
-		return agent.ValidationError("prompt is required"), nil
-	}
 	// API spec says "1..32000 chars" — rune-counted to match JSON Schema
 	// maxLength semantics. Using len() (bytes) would reject CJK / emoji
 	// prompts at ~10000 visible characters, well before the server would.

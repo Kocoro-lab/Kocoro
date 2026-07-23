@@ -33,7 +33,7 @@ Both paths funnel through `multiHandler` on the daemon side: the per-request HTT
 | `delta` | Streaming text tokens for the agent reply. | Per-request only |
 | `done` | Final reply payload with accumulated `usage`. | Per-request only |
 | `injected` | Acknowledges a busy-state inject: a `POST /message` (text and/or attachments) targeting a route with an in-flight run delivered the follow-up into the active run's inject channel, so the model sees it at the next iteration boundary (mid-turn steering). The follow-up's model response continues on the **original** run's stream — this short per-request stream carries only the ack (`data:` is the route key) and then closes. Attachments are lowered to inline image/document/text and injected alongside the text. Clients that set `inject_only: true` get `409 {reason: "no_active_run"}` instead of a new run when no active run owns the route (or it ended mid-request), so they can re-queue locally rather than spawn a duplicate run. | Per-request only |
-| `injected_committed` | Fires when the loop **drains** a previously-injected follow-up into the live turn — the *consume* boundary (vs `injected`, the *accept* boundary). Sent on the **original run's** per-request SSE stream, NOT the short inject-ack stream. Payload `{message_id, text}` where `message_id` echoes the inject request's `client_message_id`. Lets a client flip its queued-draft card into a real user bubble at the exact moment the model consumes the message (Codex-style on_committed). Only injects that carried a `client_message_id` fire this. | Per-request only |
+| `injected_committed` | Fires when the loop **drains** a previously-injected follow-up into the live turn — the *consume* boundary (vs `injected`, the *accept* boundary). Sent on the **original run's** per-request SSE stream, NOT the short inject-ack stream. Payload `{message_id, text}` where `message_id` echoes the inject request's `client_message_id`. Lets a client flip its queued-draft card into a real user bubble at the exact moment the model consumes the message. Only injects that carried a `client_message_id` fire this. | Per-request only |
 
 ## Payload shapes
 
@@ -111,6 +111,10 @@ Emits once per `OnUsage` boundary (typically once per LLM call, not per token). 
 | `context_bloat` | Tool-result content has dominated context; an inline nudge was added asking the model to summarize or stop. |
 | `context_window_autodetect` | The configured context window was overridden after the provider's `response.model` revealed a different family (e.g. 200K → 1M). |
 | `compaction_failed` | A compaction attempt failed; detail encodes the phase tag. |
+| `interrupted_turn_resuming` | Startup recovery claimed a session with a durable mid-turn checkpoint and is continuing it from saved tool results. |
+| `interrupted_turn_resumed` | The checkpointed turn completed successfully after restart. |
+| `interrupted_turn_resume_failed` | A recovery attempt failed. The durable marker remains eligible for a later daemon restart. |
+| `interrupted_turn_delivery_failed` | Recovery completed, but proactive delivery to the saved Cloud route failed. The completed reply remains in session history. |
 
 ### `cloud_agent` / `cloud_progress` / `cloud_plan`
 

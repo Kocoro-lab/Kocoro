@@ -77,10 +77,10 @@ func TestNotify_RequiresApproval(t *testing.T) {
 func TestNotify_DesktopHandler_Delivered(t *testing.T) {
 	tool := &NotifyTool{}
 	var (
-		called    bool
-		gotTitle  string
-		gotBody   string
-		gotSound  bool
+		called   bool
+		gotTitle string
+		gotBody  string
+		gotSound bool
 	)
 	handler := NotifyHandler(func(title, body string, sound bool) bool {
 		called = true
@@ -89,7 +89,7 @@ func TestNotify_DesktopHandler_Delivered(t *testing.T) {
 	})
 	ctx := WithNotifyHandler(context.Background(), handler)
 
-	result, err := tool.Run(ctx, `{"title":"T","body":"B","sound":true}`)
+	result, err := tool.Run(ctx, `{"title":"T","body":"B","sound":true,"description":"test delivery"}`)
 	if err != nil {
 		t.Fatalf("Run error: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestNotify_DesktopHandler_BodyFromMessageAlias(t *testing.T) {
 	})
 	ctx := WithNotifyHandler(context.Background(), handler)
 
-	if _, err := tool.Run(ctx, `{"title":"T","message":"from-alias"}`); err != nil {
+	if _, err := tool.Run(ctx, `{"title":"T","message":"from-alias","description":"test alias"}`); err != nil {
 		t.Fatalf("Run error: %v", err)
 	}
 	if gotBody != "from-alias" {
@@ -139,7 +139,7 @@ func TestNotify_DesktopHandler_FallsBackWhenHeadless(t *testing.T) {
 	})
 	ctx = WithNotifyHandler(ctx, handler)
 
-	_, err := tool.Run(ctx, `{"title":"T","body":"B"}`)
+	_, err := tool.Run(ctx, `{"title":"T","body":"B","description":"test fallback"}`)
 	if err != nil {
 		t.Fatalf("Run error: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestNotify_NoHandler_UnchangedBehavior(t *testing.T) {
 	tool := &NotifyTool{}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := tool.Run(ctx, `{"title":"T","body":"B"}`)
+	_, err := tool.Run(ctx, `{"title":"T","body":"B","description":"test error"}`)
 	if err != nil {
 		t.Fatalf("Run error: %v", err)
 	}

@@ -44,12 +44,12 @@ func (t *SessionSearchTool) RequiresApproval() bool { return false }
 func (t *SessionSearchTool) IsReadOnlyCall(string) bool { return true }
 
 func (t *SessionSearchTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	var args sessionSearchArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid input: %v", err), IsError: true}, nil
-	}
-	if args.Query == "" {
-		return agent.ToolResult{Content: "query is required", IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid input: %v", err)), nil
 	}
 	if args.Limit <= 0 {
 		args.Limit = 20

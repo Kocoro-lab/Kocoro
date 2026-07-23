@@ -113,6 +113,11 @@ type RunAgentRequest struct {
 	// Both empty for non-IM sources (TUI/CLI/webhook/cron).
 	CloudMessageID  string          `json:"-"`
 	IMStatusContext json.RawMessage `json:"-"`
+
+	// ResumeInterrupted continues a durable mid-turn checkpoint. It is set only
+	// by daemon startup recovery: Text is an internal continuation marker, not
+	// a new user request, and is persisted as SystemInjected.
+	ResumeInterrupted bool `json:"-"`
 }
 
 // ForegroundHint identifies the app that was frontmost when the user summoned
@@ -1177,42 +1182,25 @@ func IsNonInteractiveApprovalChannel(source string) bool {
 	return IsMessagingPlatform(source) && !channelHasInteractiveApproval(source)
 }
 
-// cacheSourceFromDaemonSource maps the daemon-level source (slack/webhook/
-// cron/mcp/tui/...) to the cache_source string Shannon uses for prompt-cache
-// TTL routing. Channel messages + interactive use → long bucket (1h). Fire-and-
-// forget paths → short bucket (5m). See docs/cache-strategy.md.
-//
-// Unknown / unclassified sources deliberately fall through to "unknown" →
-// Shannon routes unknown to 5m (fail cheap, not fail expensive).
+// cacheSourceFromDaemonSource normalizes daemon-level origins for Cloud-side
+// attribution. It does not select a TTL: Cloud currently applies the short
+// prompt-cache TTL to every source. See docs/cache-strategy.md.
 func cacheSourceFromDaemonSource(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
 	if isKoeSource(s) {
-		// Voice burst: idle gaps of 3–5 min between do_task calls are common, so
-		// the 1h prompt-cache bucket pays off. Cloud's TTL resolver must map
-		// "koe"/"koe-*" to the long bucket (Plan D, cross-repo) — until it does,
-		// an unrecognized source routes to 5m (fail cheap). Return the normalized
-		// source verbatim so per-carrier attribution survives.
+		// Preserve the carrier suffix for per-carrier attribution.
 		return s
 	}
 	switch s {
 	case "slack", "line", "feishu", "lark", "wecom", "wechat", "teams", "telegram":
-		// Human-conversation channels: idle gaps > 5m are common, 1h pays off.
-		// wechat (iLink) is a personal-DM channel with the same idle profile;
-		// as with koe, the 1h bucket only lands once Cloud's TTL resolver maps
-		// "wechat" to the long bucket — until then an unrecognized source falls
-		// back to 5m (fail cheap), so returning it here is forward-compatible.
 		return s
-	case "tui", "kocoro", "shanclaw":
-		// Interactive sessions: TUI and Kocoro Desktop both have idle gaps >> 5m.
+	case "tui", "desktop", "kocoro", "shanclaw", "web":
 		// "shanclaw" kept one release as belt-and-suspenders during Round-2 protocol rename;
 		// removed in 7.4 after cloud confirms all daemons emit "kocoro".
 		return s
 	case "cache_bench":
-		// Synthetic benchmark traffic — treat as long-bucket so bench measures
-		// reflect the production channel-message configuration.
 		return "cache_bench"
 	case "webhook", "cron", "schedule", "mcp":
-		// One-shot paths — each invocation starts fresh, no resume.
 		return s
 	default:
 		return "unknown"
@@ -1795,6 +1783,24 @@ func historySnapshotForRequest(sess *session.Session, req RunAgentRequest) []cli
 		return nil
 	}
 	return sess.HistoryForLoop()
+}
+
+const interruptedTurnContinuation = "[system] The previous turn was interrupted after a durable checkpoint. Continue the existing request from the saved tool results and partial work. Do not repeat completed tool calls."
+
+func interruptedTurnSnapshot(req RunAgentRequest, agentName, effectiveCWD string) *session.InterruptedTurn {
+	return &session.InterruptedTurn{
+		Agent:           agentName,
+		Source:          req.Source,
+		Sender:          req.Sender,
+		Channel:         req.Channel,
+		ThreadID:        req.ThreadID,
+		RouteKey:        req.RouteKey,
+		CWD:             effectiveCWD,
+		CloudMessageID:  req.CloudMessageID,
+		IMStatusContext: append(json.RawMessage(nil), req.IMStatusContext...),
+		Participants:    append([]string(nil), req.Participants...),
+		UpdatedAt:       time.Now(),
+	}
 }
 
 // RunAgent executes a single agent turn using the shared dependencies.
@@ -2522,7 +2528,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			client.Message{Role: "user", Content: userMsgContent},
 		)
 		sess.MessageMeta = append(sess.MessageMeta,
-			session.MessageMeta{Source: source, MessageID: msgID, Timestamp: session.TimePtr(userMsgTime)},
+			session.MessageMeta{
+				Source:         source,
+				MessageID:      msgID,
+				Timestamp:      session.TimePtr(userMsgTime),
+				SystemInjected: req.ResumeInterrupted,
+			},
 		)
 		preLoopUserAppended = true
 		if err := sessMgr.Save(); err != nil {
@@ -3050,6 +3061,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetCheckpointFunc(func(ctx context.Context) error {
 		applyTurnState(sess, loop, turnUsage, turnBase)
 		sess.InProgress = true
+		sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: mid-turn checkpoint save failed: %v", err)
 			// Return the error so AgentLoop.maybeCheckpoint keeps the
@@ -3063,7 +3075,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		return nil
 	})
 
-	result, usage, runErr := loop.Run(ctx, prompt, resolvedContent, history)
+	var result string
+	var usage *agent.TurnUsage
+	var runErr error
+	if req.ResumeInterrupted {
+		result, usage, runErr = loop.ResumeInterrupted(ctx, prompt, history)
+	} else {
+		result, usage, runErr = loop.Run(ctx, prompt, resolvedContent, history)
+	}
 	status := loop.LastRunStatus()
 	idempotencyOutcomeKnown = true
 	idempotencyRunErr = runErr
@@ -3108,7 +3127,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			// the first checkpoint fires.
 			sess.ToolResultReplacements = loop.ToolResultReplacements()
 			sess.ToolResultSeen = loop.ToolResultSeen()
-			sess.InProgress = false // hard-error path: turn is over, clear marker
+			if req.ResumeInterrupted {
+				// A recovery attempt that fails before making forward progress
+				// remains eligible for the next daemon restart. Clearing this
+				// marker here would turn a temporary gateway outage into
+				// permanent abandonment.
+				sess.InProgress = true
+				sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+			} else {
+				sess.InProgress = false // ordinary hard-error path: turn is over
+				sess.InterruptedTurn = nil
+			}
 			if err := sessMgr.Save(); err != nil {
 				log.Printf("daemon: failed to save error session: %v", err)
 			} else {
@@ -3241,6 +3270,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		sess.ToolResultReplacements = loop.ToolResultReplacements()
 		sess.ToolResultSeen = loop.ToolResultSeen()
 		sess.InProgress = false // turn completed — clear mid-turn crash marker
+		sess.InterruptedTurn = nil
 		if req.IdempotencyKey != "" {
 			receipts := deliverableReceipts.snapshot()
 			setIdempotentRequestState(

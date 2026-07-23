@@ -48,11 +48,11 @@ func (t *MemoryAppendTool) Info() agent.ToolInfo {
 func (t *MemoryAppendTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args memoryAppendArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 
 	if strings.TrimSpace(args.Content) == "" {
-		return agent.ToolResult{Content: "content must not be empty", IsError: true}, nil
+		return agent.ValidationError("content must not be empty"), nil
 	}
 
 	memDir := agent.MemoryDirFromContext(ctx)

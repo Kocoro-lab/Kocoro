@@ -122,7 +122,9 @@ type tarEntry struct {
 func runExtract(t *testing.T, src, dest string) (agent.ToolResult, error) {
 	t.Helper()
 	tool := &ArchiveExtractTool{}
-	args, _ := json.Marshal(map[string]any{"path": src, "dest": dest})
+	args, _ := json.Marshal(map[string]any{
+		"path": src, "dest": dest, "description": "test archive extraction",
+	})
 	return tool.Run(context.Background(), string(args))
 }
 
@@ -227,7 +229,9 @@ func TestArchiveExtract_OverwriteAtomicSwap(t *testing.T) {
 		t.Fatal(err)
 	}
 	tool := &ArchiveExtractTool{}
-	args, _ := json.Marshal(map[string]any{"path": src, "dest": dest, "overwrite": true})
+	args, _ := json.Marshal(map[string]any{
+		"path": src, "dest": dest, "overwrite": true, "description": "test overwrite extraction",
+	})
 	res, err := tool.Run(context.Background(), string(args))
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -494,4 +498,3 @@ func TestArchiveTools_ToolInfo(t *testing.T) {
 		t.Error("archive_extract must require approval (mutates fs)")
 	}
 }
-

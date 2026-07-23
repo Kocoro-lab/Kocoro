@@ -47,7 +47,7 @@ func TestHTTP_GET(t *testing.T) {
 	defer srv.Close()
 
 	tool := &HTTPTool{}
-	result, err := tool.Run(context.Background(), `{"url": "`+srv.URL+`"}`)
+	result, err := tool.Run(context.Background(), `{"url": "`+srv.URL+`","description":"test get"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestHTTP_POST(t *testing.T) {
 	defer srv.Close()
 
 	tool := &HTTPTool{}
-	result, err := tool.Run(context.Background(), `{"url": "`+srv.URL+`", "method": "POST", "body": "test"}`)
+	result, err := tool.Run(context.Background(), `{"url": "`+srv.URL+`", "method": "POST", "body": "test","description":"test post"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -137,9 +137,9 @@ func TestHTTP_StatusCodeErrorFlag(t *testing.T) {
 			tool := &HTTPTool{}
 			var argsJSON string
 			if tt.method == "" {
-				argsJSON = `{"url": "` + srv.URL + `"}`
+				argsJSON = `{"url": "` + srv.URL + `","description":"test status"}`
 			} else {
-				argsJSON = `{"url": "` + srv.URL + `", "method": "` + tt.method + `", "body": "x"}`
+				argsJSON = `{"url": "` + srv.URL + `", "method": "` + tt.method + `", "body": "x","description":"test status"}`
 			}
 			result, err := tool.Run(context.Background(), argsJSON)
 			if err != nil {
@@ -172,7 +172,7 @@ func TestHTTP_RedirectNotError(t *testing.T) {
 	defer redirector.Close()
 
 	tool := &HTTPTool{}
-	result, err := tool.Run(context.Background(), `{"url": "`+redirector.URL+`"}`)
+	result, err := tool.Run(context.Background(), `{"url": "`+redirector.URL+`","description":"test redirect"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestHTTP_RedirectNotError(t *testing.T) {
 
 func TestHTTP_InvalidURL(t *testing.T) {
 	tool := &HTTPTool{}
-	result, err := tool.Run(context.Background(), `{"url": "http://invalid.localhost.test:99999/nope"}`)
+	result, err := tool.Run(context.Background(), `{"url": "http://invalid.localhost.test:99999/nope","description":"test network error"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestHTTP_BodyFromFile(t *testing.T) {
 	defer srv.Close()
 
 	tool := &HTTPTool{}
-	argsJSON := `{"url": "` + srv.URL + `", "method": "PUT", "body_from_file": "` + bodyPath + `"}`
+	argsJSON := `{"url": "` + srv.URL + `", "method": "PUT", "body_from_file": "` + bodyPath + `","description":"test file body"}`
 	result, err := tool.Run(context.Background(), argsJSON)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -287,7 +287,7 @@ func TestHTTP_BodyFromFile_SetsContentLength(t *testing.T) {
 	defer srv.Close()
 
 	tool := &HTTPTool{}
-	argsJSON := `{"url": "` + srv.URL + `", "method": "POST", "body_from_file": "` + bodyPath + `"}`
+	argsJSON := `{"url": "` + srv.URL + `", "method": "POST", "body_from_file": "` + bodyPath + `","description":"test content length"}`
 	result, err := tool.Run(context.Background(), argsJSON)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -308,7 +308,7 @@ func TestHTTP_BodyFromFile_MutuallyExclusive(t *testing.T) {
 	}
 
 	tool := &HTTPTool{}
-	argsJSON := `{"url": "http://localhost/x", "method": "POST", "body": "inline", "body_from_file": "` + bodyPath + `"}`
+	argsJSON := `{"url": "http://localhost/x", "method": "POST", "body": "inline", "body_from_file": "` + bodyPath + `","description":"test exclusive bodies"}`
 	result, err := tool.Run(context.Background(), argsJSON)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -326,7 +326,7 @@ func TestHTTP_BodyFromFile_Missing(t *testing.T) {
 	missing := filepath.Join(dir, "does-not-exist.txt")
 
 	tool := &HTTPTool{}
-	argsJSON := `{"url": "http://localhost/x", "method": "POST", "body_from_file": "` + missing + `"}`
+	argsJSON := `{"url": "http://localhost/x", "method": "POST", "body_from_file": "` + missing + `","description":"test missing body file"}`
 	result, err := tool.Run(context.Background(), argsJSON)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -343,7 +343,7 @@ func TestHTTP_BodyFromFile_Directory(t *testing.T) {
 	dir := t.TempDir()
 
 	tool := &HTTPTool{}
-	argsJSON := `{"url": "http://localhost/x", "method": "POST", "body_from_file": "` + dir + `"}`
+	argsJSON := `{"url": "http://localhost/x", "method": "POST", "body_from_file": "` + dir + `","description":"test directory body"}`
 	result, err := tool.Run(context.Background(), argsJSON)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -358,7 +358,7 @@ func TestHTTP_BodyFromFile_Directory(t *testing.T) {
 
 func TestHTTP_BodyFromFile_RelativePathWithoutCWD(t *testing.T) {
 	tool := &HTTPTool{}
-	argsJSON := `{"url": "http://localhost/x", "method": "POST", "body_from_file": "relative/path.txt"}`
+	argsJSON := `{"url": "http://localhost/x", "method": "POST", "body_from_file": "relative/path.txt","description":"test relative body file"}`
 	result, err := tool.Run(context.Background(), argsJSON)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

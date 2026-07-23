@@ -19,7 +19,7 @@ func TestFileRead_Run(t *testing.T) {
 	os.WriteFile(path, []byte("line1\nline2\nline3\n"), 0644)
 
 	tool := &FileReadTool{}
-	result, err := tool.Run(context.Background(), `{"path": "`+path+`"}`)
+	result, err := tool.Run(context.Background(), `{"path": "`+path+`","description":"test read"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestFileReadTool_LargeFileRequiresRange(t *testing.T) {
 		t.Fatal(err)
 	}
 	tool := &FileReadTool{}
-	result, err := tool.Run(context.Background(), `{"path":"`+path+`"}`)
+	result, err := tool.Run(context.Background(), `{"path":"`+path+`","description":"test large file guard"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestFileReadTool_LargeFileRangeSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	tool := &FileReadTool{}
-	result, err := tool.Run(context.Background(), `{"path":"`+path+`","offset":100,"limit":2}`)
+	result, err := tool.Run(context.Background(), `{"path":"`+path+`","offset":100,"limit":2,"description":"test ranged read"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestFileRead_ImageReturnsVisionBlock(t *testing.T) {
 	os.WriteFile(path, pngData, 0644)
 
 	tool := &FileReadTool{}
-	result, err := tool.Run(context.Background(), `{"path": "`+path+`"}`)
+	result, err := tool.Run(context.Background(), `{"path": "`+path+`","description":"test image read"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestFileRead_ImageTooLarge(t *testing.T) {
 	f.Close()
 
 	tool := &FileReadTool{}
-	result, err := tool.Run(context.Background(), `{"path": "`+path+`"}`)
+	result, err := tool.Run(context.Background(), `{"path": "`+path+`","description":"test large image guard"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestFileRead_ImageTooLarge(t *testing.T) {
 
 func TestFileRead_NotFound(t *testing.T) {
 	tool := &FileReadTool{}
-	result, err := tool.Run(context.Background(), `{"path": "/nonexistent/file.txt"}`)
+	result, err := tool.Run(context.Background(), `{"path": "/nonexistent/file.txt","description":"test missing file"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestFileRead_OffsetWithoutLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	tool := &FileReadTool{}
-	result, err := tool.Run(context.Background(), `{"path":"`+path+`","offset":15}`)
+	result, err := tool.Run(context.Background(), `{"path":"`+path+`","offset":15,"description":"test offset read"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -194,7 +194,7 @@ func indexOf(s, substr string) int {
 // longer silently falls back to os.Getwd() when no session CWD is set.
 func TestFileRead_RelativePathRefusedWithoutSessionCWD(t *testing.T) {
 	tool := &FileReadTool{}
-	result, err := tool.Run(context.Background(), `{"path":"relative.txt"}`)
+	result, err := tool.Run(context.Background(), `{"path":"relative.txt","description":"test relative guard"}`)
 	if err != nil {
 		t.Fatalf("Run should not return a transport error, got %v", err)
 	}
@@ -222,7 +222,7 @@ func TestFileRead_OversizeThrows(t *testing.T) {
 	}
 
 	tool := &FileReadTool{}
-	args, _ := json.Marshal(fileReadArgs{Path: path})
+	args, _ := json.Marshal(fileReadArgs{Path: path, Description: "test oversized read"})
 	result, err := tool.Run(context.Background(), string(args))
 	if err != nil {
 		t.Fatalf("unexpected transport error: %v", err)
@@ -256,7 +256,7 @@ func TestFileRead_OversizeRespectsLimit(t *testing.T) {
 	}
 
 	tool := &FileReadTool{}
-	args, _ := json.Marshal(fileReadArgs{Path: path, Limit: 100})
+	args, _ := json.Marshal(fileReadArgs{Path: path, Limit: 100, Description: "test limited read"})
 	result, err := tool.Run(context.Background(), string(args))
 	if err != nil {
 		t.Fatalf("unexpected transport error: %v", err)
@@ -285,7 +285,7 @@ func TestFileRead_DedupSameFile_SameRange(t *testing.T) {
 	tool := &FileReadTool{}
 
 	// First read: full content
-	args, _ := json.Marshal(fileReadArgs{Path: path})
+	args, _ := json.Marshal(fileReadArgs{Path: path, Description: "test read dedup"})
 	r1, err := tool.Run(ctx, string(args))
 	if err != nil {
 		t.Fatalf("first read transport error: %v", err)
@@ -329,14 +329,14 @@ func TestFileRead_DedupSameFile_DifferentRange(t *testing.T) {
 	tool := &FileReadTool{}
 
 	// First read: limit=2 (lines 1-2)
-	args1, _ := json.Marshal(fileReadArgs{Path: path, Limit: 2})
+	args1, _ := json.Marshal(fileReadArgs{Path: path, Limit: 2, Description: "test first range"})
 	r1, _ := tool.Run(ctx, string(args1))
 	if r1.IsError {
 		t.Fatalf("first read error: %s", r1.Content)
 	}
 
 	// Second read with different limit=4 — must return real content, NOT stub
-	args2, _ := json.Marshal(fileReadArgs{Path: path, Limit: 4})
+	args2, _ := json.Marshal(fileReadArgs{Path: path, Limit: 4, Description: "test second range"})
 	r2, err := tool.Run(ctx, string(args2))
 	if err != nil {
 		t.Fatalf("second read transport error: %v", err)
@@ -363,7 +363,7 @@ func TestFileRead_DedupSameFile_FileModified(t *testing.T) {
 	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
 
 	tool := &FileReadTool{}
-	args, _ := json.Marshal(fileReadArgs{Path: path})
+	args, _ := json.Marshal(fileReadArgs{Path: path, Description: "test modified read"})
 	tool.Run(ctx, string(args)) // first read
 
 	// Modify file (sleep 10ms first to ensure mtime ticks on filesystems
@@ -419,7 +419,7 @@ func TestFileRead_DedupImage_SameFile(t *testing.T) {
 	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
 
 	tool := &FileReadTool{}
-	args, _ := json.Marshal(fileReadArgs{Path: path})
+	args, _ := json.Marshal(fileReadArgs{Path: path, Description: "test image dedup"})
 
 	// First read: real image.
 	r1, err := tool.Run(ctx, string(args))
@@ -465,7 +465,7 @@ func TestFileRead_DedupImage_FileModified(t *testing.T) {
 	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
 
 	tool := &FileReadTool{}
-	args, _ := json.Marshal(fileReadArgs{Path: path})
+	args, _ := json.Marshal(fileReadArgs{Path: path, Description: "test modified image"})
 
 	if _, err := tool.Run(ctx, string(args)); err != nil {
 		t.Fatalf("first read transport error: %v", err)
@@ -579,7 +579,7 @@ func TestFileRead_DedupSameFile_NoTracker(t *testing.T) {
 	os.WriteFile(path, []byte("line1\n"), 0o644)
 
 	tool := &FileReadTool{}
-	args, _ := json.Marshal(fileReadArgs{Path: path})
+	args, _ := json.Marshal(fileReadArgs{Path: path, Description: "test untracked read"})
 
 	// Two reads in plain context — both return full content.
 	r1, _ := tool.Run(context.Background(), string(args))

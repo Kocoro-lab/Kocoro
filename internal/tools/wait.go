@@ -50,17 +50,17 @@ func (t *WaitTool) RequiresApproval() bool { return false }
 func (t *WaitTool) IsReadOnlyCall(string) bool { return true }
 
 func (t *WaitTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
-	if runtime.GOOS != "darwin" || t.client == nil {
-		return agent.ToolResult{Content: "wait_for tool is only available on macOS", IsError: true}, nil
-	}
-
 	var args waitArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 
 	if args.Condition == "" {
-		return agent.ToolResult{Content: "missing required parameter: condition", IsError: true}, nil
+		return agent.ValidationError("wait_for: missing required `condition` parameter"), nil
+	}
+
+	if runtime.GOOS != "darwin" || t.client == nil {
+		return agent.ToolResult{Content: "wait_for tool is only available on macOS", IsError: true}, nil
 	}
 
 	// Resolve PID from app name

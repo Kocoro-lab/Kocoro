@@ -109,13 +109,12 @@ func (t *CloudDelegateTool) Info() agent.ToolInfo {
 }
 
 func (t *CloudDelegateTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	var args cloudDelegateArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
-	}
-
-	if args.Task == "" {
-		return agent.ToolResult{Content: "task is required", IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 
 	// Cap context length

@@ -142,10 +142,10 @@ type AgentConfig struct {
 	// value at request time (Anthropic passes it straight through as
 	// output_config.effort; OpenAI maps low→low/high→medium/xhigh→high/max→high).
 	// Empty = unset (Cloud falls back to ReasoningEffort, then provider default).
-	EffortTier string `mapstructure:"effort_tier" yaml:"effort_tier" json:"effort_tier"`
-	Model      string `mapstructure:"model"       yaml:"model"       json:"model"` // specific model override
-	Language        string `mapstructure:"language"         yaml:"language"         json:"language"`       // locked reply language as a native name (e.g. "中文"); empty = mirror the user's current-message language
-	ContextWindow   int    `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"` // model context window in tokens
+	EffortTier    string `mapstructure:"effort_tier" yaml:"effort_tier" json:"effort_tier"`
+	Model         string `mapstructure:"model"       yaml:"model"       json:"model"`                    // specific model override
+	Language      string `mapstructure:"language"         yaml:"language"         json:"language"`       // locked reply language as a native name (e.g. "中文"); empty = mirror the user's current-message language
+	ContextWindow int    `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"` // model context window in tokens
 	// ObservationWindow keeps only the N most recent browser/GUI tool
 	// observations at full fidelity; older ones are stubbed to bound the
 	// page/DOM history a long browser loop re-sends each iteration. 0 disables.
@@ -429,8 +429,8 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.bash_concurrency_enabled", true) // Phase C: Desktop now consumes tool_use_id on tool_status events, safe to enable concurrent bash batches by default.
 	// Time-based microcompact. Disabled by default — short sessions never
 	// compact, and only sessions that idle past the gap threshold will
-	// clear old tool_results. 60min matches Anthropic's 1h prompt-cache
-	// TTL ceiling. KeepRecent=5 keeps a working tail visible to the model.
+	// clear old tool_results. The 60min seed is a history-retention choice,
+	// independent of Cloud cache TTL. KeepRecent=5 keeps a working tail.
 	viper.SetDefault("agent.time_based_compact.enabled", false)
 	viper.SetDefault("agent.time_based_compact.gap_threshold_minutes", 60)
 	viper.SetDefault("agent.time_based_compact.keep_recent", 5)

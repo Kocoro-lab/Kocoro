@@ -114,4 +114,3 @@ func TestCloudDelegateContextTruncation(t *testing.T) {
 		t.Log("Expected error (nil gateway)")
 	}
 }
-

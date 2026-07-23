@@ -144,7 +144,6 @@ func (m *Manager) Save() error {
 	return m.store.Save(m.current)
 }
 
-
 // PatchTitle updates the title of the given session and persists it.
 // If the target is the active session, the in-memory title is also updated.
 // Disk is written first so a failed write won't leave memory inconsistent.
@@ -440,7 +439,7 @@ func (m *Manager) RebuildIndex() error {
 // Reset clears a session's conversation history in place, preserving
 // ID/Title/CreatedAt/CWD/Source/Channel/Usage.
 // Cleared fields: Messages, MessageMeta, RemoteTasks, SummaryCache,
-// SummaryCacheKey, RouteKey, InProgress. If the target is the in-memory
+// SummaryCacheKey, RouteKey, InProgress, InterruptedTurn. If the target is the in-memory
 // current session, the current pointer is updated and its runtime WorkingSet
 // is reset too.
 func (m *Manager) Reset(id string) error {
@@ -461,6 +460,7 @@ func (m *Manager) Reset(id string) error {
 	sess.SummaryCacheKey = ""
 	sess.RouteKey = ""
 	sess.InProgress = false
+	sess.InterruptedTurn = nil
 	if err := m.store.Save(sess); err != nil {
 		return err
 	}

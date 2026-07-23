@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -294,6 +295,13 @@ func RegisterIntegrationTools(ctx context.Context, gw *client.GatewayClient, reg
 	if err != nil {
 		// Registry left as-is: keep the previously registered integration tools
 		// through a transient integration-endpoint outage.
+		var apiErr *client.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == 404 {
+			// Older or feature-disabled Cloud deployments do not expose this
+			// optional endpoint. Treat that as "integration discovery is not
+			// available" instead of logging an error on every agent run.
+			return nil
+		}
 		return fmt.Errorf("integration tools unavailable: %w", err)
 	}
 
@@ -433,12 +441,10 @@ func CompleteRegistration(ctx context.Context, gw *client.GatewayClient, cfg *co
 				hasPlaywright = true
 			}
 		}
-		// Disable legacy browser/automation tools when Playwright MCP is available.
-		// AppleScript and screenshot are macOS-native browser fallbacks the LLM picks
-		// when playwright tools hit errors — remove them so the agent stays on
-		// playwright for all browser automation. `accessibility` is deliberately
-		// KEPT: it reads the AX tree of arbitrary native apps (e.g. WeChat), which
-		// playwright cannot do, so removing it broke reading non-web apps.
+		// Disable only the legacy browser when Playwright MCP is available.
+		// AppleScript, screenshot, and wait_for are native-app tools rather than
+		// browser fallbacks. Removing them made advertised built-ins undiscoverable
+		// and forced models into rough shell fallbacks such as osascript via bash.
 		if hasPlaywright {
 			// Shut down any chromedp Chrome instance before removing the tool
 			if bt, ok := reg.Get("browser"); ok {
@@ -446,10 +452,8 @@ func CompleteRegistration(ctx context.Context, gw *client.GatewayClient, cfg *co
 					browserTool.Cleanup()
 				}
 			}
-			for _, legacy := range []string{"browser", "applescript", "screenshot", "wait_for"} {
-				reg.Remove(legacy)
-			}
-			log.Printf("Playwright MCP connected — disabled legacy browser/automation tools")
+			reg.Remove("browser")
+			log.Printf("Playwright MCP connected — disabled legacy browser tool")
 			// When keepAlive is false, disconnect playwright after tool discovery.
 			// It will reconnect on-demand at first tool invocation.
 			// When keepAlive is true, keep the connection alive to avoid latency.
@@ -1028,9 +1032,7 @@ func RebuildRegistryForHealth(
 	// Do NOT call browserTool.Cleanup() — in-flight sessions share the instance.
 	// Only remove from the NEW registry.
 	if playwrightPresent {
-		for _, legacy := range []string{"browser", "applescript", "screenshot", "wait_for"} {
-			reg.Remove(legacy)
-		}
+		reg.Remove("browser")
 	}
 
 	for _, t := range gatewayOverlay {

@@ -28,14 +28,17 @@ func (t *ThinkTool) Info() agent.ToolInfo {
 				"thought": map[string]any{"type": "string", "description": "Your reasoning or plan"},
 			},
 		},
-		Required: []string{"thought"},
+		// Intentionally optional: the tool accepts think({}) as a soft
+		// no-op because native-thinking models occasionally emit that ritual
+		// call after placing the real reasoning in a thinking block.
+		Required: nil,
 	}
 }
 
 func (t *ThinkTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args thinkArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 	if strings.TrimSpace(args.Thought) == "" {
 		// Soft hint instead of hard error. Sonnet 4.6 / Opus 4.7 with native

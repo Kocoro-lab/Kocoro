@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
@@ -39,7 +40,13 @@ func (t *ProcessTool) Info() agent.ToolInfo {
 func (t *ProcessTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args processArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Action) == "" {
+		return agent.ValidationError("process: missing required `action` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("process: missing required `description` parameter"), nil
 	}
 
 	switch args.Action {
@@ -77,7 +84,7 @@ func (t *ProcessTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 
 	case "kill":
 		if args.PID == 0 {
-			return agent.ToolResult{Content: "pid is required for kill action", IsError: true}, nil
+			return agent.ValidationError("process: pid is required for kill action"), nil
 		}
 		cmd := exec.CommandContext(ctx, "kill", fmt.Sprintf("%d", args.PID))
 		output, err := cmd.CombinedOutput()
@@ -87,7 +94,7 @@ func (t *ProcessTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 		return agent.ToolResult{Content: fmt.Sprintf("sent SIGTERM to PID %d", args.PID)}, nil
 
 	default:
-		return agent.ToolResult{Content: fmt.Sprintf("unknown action: %q (use 'list', 'ports', or 'kill')", args.Action), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("process: unknown action: %q (use 'list', 'ports', or 'kill')", args.Action)), nil
 	}
 }
 

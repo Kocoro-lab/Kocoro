@@ -44,10 +44,22 @@ func (t *FileEditTool) Info() agent.ToolInfo {
 func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args fileEditArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
-	if args.OldString == "" {
-		return agent.ValidationError("old_string must not be empty"), nil
+	if strings.TrimSpace(args.Path) == "" {
+		return agent.ValidationError("file_edit: missing required `path` parameter"), nil
+	}
+	if strings.TrimSpace(args.OldString) == "" {
+		return agent.ValidationError("file_edit: missing required `old_string` parameter"), nil
+	}
+	if strings.TrimSpace(args.NewString) == "" {
+		return agent.ValidationError(
+			"file_edit: missing required `new_string` parameter. " +
+				"To delete text, read the file and use file_write with the complete replacement content.",
+		), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("file_edit: missing required `description` parameter"), nil
 	}
 	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
 	if resolveErr != nil {

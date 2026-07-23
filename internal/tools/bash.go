@@ -169,7 +169,13 @@ Instructions:
 func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Command) == "" {
+		return agent.ValidationError("bash: missing required `command` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("bash: missing required `description` parameter"), nil
 	}
 
 	// Timeout precedence: per-call args > tool default (from config) > 120s fallback,

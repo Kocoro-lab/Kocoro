@@ -17,7 +17,7 @@ func TestFileRead_ResolvesRelativePathFromSessionCWD(t *testing.T) {
 
 	ctx := cwdctx.WithSessionCWD(context.Background(), dir)
 	tool := &FileReadTool{}
-	result, err := tool.Run(ctx, `{"path":"test.txt"}`)
+	result, err := tool.Run(ctx, `{"path":"test.txt","description":"test relative read"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestGlob_ResolvesRelativeRootFromSessionCWD(t *testing.T) {
 
 	ctx := cwdctx.WithSessionCWD(context.Background(), dir)
 	tool := &GlobTool{}
-	result, err := tool.Run(ctx, `{"pattern":"*.go"}`)
+	result, err := tool.Run(ctx, `{"pattern":"*.go","description":"test relative glob"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestDirectoryList_ResolvesRelativePathFromSessionCWD(t *testing.T) {
 
 	ctx := cwdctx.WithSessionCWD(context.Background(), dir)
 	tool := &DirectoryListTool{}
-	result, err := tool.Run(ctx, `{}`)
+	result, err := tool.Run(ctx, `{"description":"test relative list"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestGrep_ResolvesRelativePathFromSessionCWD(t *testing.T) {
 
 	ctx := cwdctx.WithSessionCWD(context.Background(), dir)
 	tool := &GrepTool{}
-	result, err := tool.Run(ctx, `{"pattern":"findme"}`)
+	result, err := tool.Run(ctx, `{"pattern":"findme","description":"test relative grep"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestBash_UsesSessionCWDWhenNoCWDField(t *testing.T) {
 
 	ctx := cwdctx.WithSessionCWD(context.Background(), dir)
 	tool := &BashTool{}
-	result, err := tool.Run(ctx, `{"command":"pwd"}`)
+	result, err := tool.Run(ctx, `{"command":"pwd","description":"test relative bash"}`)
 	if err != nil {
 		t.Fatal(err)
 	}

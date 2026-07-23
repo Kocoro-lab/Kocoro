@@ -124,15 +124,15 @@ func (t *EditImageTool) Info() agent.ToolInfo {
 }
 
 func (t *EditImageTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	var args editImageArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 
 	prompt := strings.TrimSpace(args.Prompt)
-	if prompt == "" {
-		return agent.ValidationError("prompt is required"), nil
-	}
 	// API spec says "1..32000 chars" — rune-counted to match JSON Schema
 	// maxLength semantics. See generate_image.go for the rationale.
 	if runeCount := utf8.RuneCountInString(prompt); runeCount > imagePromptMaxLen {
@@ -142,14 +142,6 @@ func (t *EditImageTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 		)), nil
 	}
 
-	if len(args.ImageURLs) < editImageURLsMin {
-		return agent.ValidationError(
-			"image_urls is required and must contain at least 1 URL. " +
-				"If the user provided an external URL, first call publish_to_web to " +
-				"upload it, or generate_image to produce one, then retry edit_image " +
-				"with the resulting https://static.kocoro.ai/ URL.",
-		), nil
-	}
 	if len(args.ImageURLs) > editImageURLsMax {
 		return agent.ValidationError(fmt.Sprintf(
 			"image_urls has %d entries (max %d). Drop the lowest-priority sources before retrying.",

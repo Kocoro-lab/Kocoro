@@ -4,6 +4,11 @@
 
 MCP servers are bridges that connect agents to external services and tools. There are two types: **stdio** servers run a local process on your machine (like an npm package that talks to Slack), and **http** servers connect to a remote endpoint over the network. Once configured, agents can use the tools the MCP server provides just like built-in tools.
 
+Kocoro can also expose its local tool registry to an MCP client with
+`shan mcp serve`. That stdio server supports cancellation, progress tokens,
+dynamic tool-list notifications, and form elicitation for single-call approval.
+Approval still fails closed when the client did not negotiate form elicitation.
+
 ## API Endpoints
 
 MCP servers are configured through the config API — there is no separate MCP endpoint.

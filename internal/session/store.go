@@ -53,6 +53,24 @@ type IdempotentRequest struct {
 	UpdatedAt    time.Time            `json:"updated_at"`
 }
 
+// InterruptedTurn is the minimum durable routing snapshot needed to continue
+// a checkpointed turn after the daemon restarts. The conversation itself stays
+// in Messages; this metadata only reconstructs the execution lane and delivery
+// context. It intentionally does not duplicate the user prompt or credentials.
+type InterruptedTurn struct {
+	Agent           string          `json:"agent,omitempty"`
+	Source          string          `json:"source,omitempty"`
+	Sender          string          `json:"sender,omitempty"`
+	Channel         string          `json:"channel,omitempty"`
+	ThreadID        string          `json:"thread_id,omitempty"`
+	RouteKey        string          `json:"route_key,omitempty"`
+	CWD             string          `json:"cwd,omitempty"`
+	CloudMessageID  string          `json:"cloud_message_id,omitempty"`
+	IMStatusContext json.RawMessage `json:"im_status_context,omitempty"`
+	Participants    []string        `json:"participants,omitempty"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+}
+
 type Session struct {
 	SchemaVersion      int                          `json:"schema_version,omitempty"`
 	ID                 string                       `json:"id"`
@@ -84,6 +102,10 @@ type Session struct {
 	// run crashed or was killed mid-turn — the transcript is partial but
 	// recoverable; tool results already executed are preserved.
 	InProgress bool `json:"in_progress,omitempty"`
+	// InterruptedTurn is present only while InProgress is true. It lets startup
+	// recovery continue the saved transcript without replaying completed tools
+	// or waiting for the user to resend the original request.
+	InterruptedTurn *InterruptedTurn `json:"interrupted_turn,omitempty"`
 	// Pinned sticks the session to the top of the list regardless of
 	// recency. Set/cleared via PATCH /sessions/{id} {"pinned": bool}.
 	Pinned bool `json:"pinned,omitempty"`

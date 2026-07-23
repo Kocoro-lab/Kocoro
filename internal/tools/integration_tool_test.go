@@ -148,6 +148,24 @@ func TestRegisterIntegrationTools_ListFailurePreservesExisting(t *testing.T) {
 	}
 }
 
+func TestRegisterIntegrationTools_NotFoundIsOptionalAndPreservesExisting(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := agent.NewToolRegistry()
+	reg.Register(NewIntegrationTool(client.ServerToolSchema{Name: "notion_search"}, gw))
+
+	if err := RegisterIntegrationTools(context.Background(), gw, reg); err != nil {
+		t.Fatalf("404 feature absence should be a no-op, got %v", err)
+	}
+	if _, ok := reg.Get("notion_search"); !ok {
+		t.Error("existing integration tool must survive a feature-absent refresh")
+	}
+}
+
 // TestRegisterIntegrationTools_RefreshDropsStale verifies a second call reflects
 // the current active set: tools no longer returned are removed, so a
 // disconnected provider's tools disappear.

@@ -113,12 +113,13 @@ func (t *MemoryTool) RequiresApproval() bool     { return false }
 func (t *MemoryTool) IsReadOnlyCall(string) bool { return true }
 
 func (t *MemoryTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
-	var a memoryArgs
-	if err := json.Unmarshal([]byte(coerceMemoryArgs(argsJSON)), &a); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid input: %v", err), IsError: true}, nil
+	coercedArgs := coerceMemoryArgs(argsJSON)
+	if result, valid := agent.ValidateToolArguments(t.Info(), coercedArgs); !valid {
+		return result, nil
 	}
-	if len(a.AnchorMentions) == 0 {
-		return agent.ToolResult{Content: "anchor_mentions is required and must be non-empty", IsError: true}, nil
+	var a memoryArgs
+	if err := json.Unmarshal([]byte(coercedArgs), &a); err != nil {
+		return agent.ValidationError(fmt.Sprintf("invalid input: %v", err)), nil
 	}
 	if a.Mode == "" {
 		a.Mode = "direct_relation"

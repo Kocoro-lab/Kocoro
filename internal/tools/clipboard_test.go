@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"os/exec"
 	"runtime"
@@ -31,7 +32,7 @@ func TestClipboard_InvalidArgs(t *testing.T) {
 
 func TestClipboard_UnknownAction(t *testing.T) {
 	tool := &ClipboardTool{}
-	result, err := tool.Run(context.Background(), `{"action": "delete"}`)
+	result, err := tool.Run(context.Background(), `{"action": "delete","description":"test invalid action"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -45,7 +46,7 @@ func TestClipboard_UnknownAction(t *testing.T) {
 
 func TestClipboard_WriteEmptyContent(t *testing.T) {
 	tool := &ClipboardTool{}
-	result, err := tool.Run(context.Background(), `{"action": "write"}`)
+	result, err := tool.Run(context.Background(), `{"action": "write","description":"test empty write"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -63,9 +64,20 @@ func TestClipboard_ReadWrite(t *testing.T) {
 	}
 
 	tool := &ClipboardTool{}
+	original, err := exec.Command("pbpaste").Output()
+	if err != nil {
+		t.Skipf("cannot snapshot clipboard: %v", err)
+	}
+	defer func() {
+		cmd := exec.Command("pbcopy")
+		cmd.Stdin = bytes.NewReader(original)
+		if err := cmd.Run(); err != nil {
+			t.Errorf("restore clipboard: %v", err)
+		}
+	}()
 
 	// Write
-	result, err := tool.Run(context.Background(), `{"action": "write", "content": "shannon-test-clipboard"}`)
+	result, err := tool.Run(context.Background(), `{"action": "write", "content": "shannon-test-clipboard","description":"test clipboard write"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -74,7 +86,7 @@ func TestClipboard_ReadWrite(t *testing.T) {
 	}
 
 	// Read back
-	result, err = tool.Run(context.Background(), `{"action": "read"}`)
+	result, err = tool.Run(context.Background(), `{"action": "read","description":"test clipboard read"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
