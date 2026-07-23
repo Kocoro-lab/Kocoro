@@ -136,6 +136,7 @@ func TestKoeNativeResultSummaryE2E(t *testing.T) {
 			if facts < 2 {
 				t.Fatalf("native summary lost the result's key facts (facts=%d): %q", facts, joined)
 			}
+			assertSingleKocoroVoice(t, joined)
 			han, latin := resultSpeechScriptCounts(joined)
 			if han < 8 || han*2 < latin {
 				t.Fatalf("native summary is not predominantly Chinese (han=%d latin=%d): %q", han, latin, joined)
@@ -181,4 +182,22 @@ func resultSpeechScriptCounts(s string) (han, latin int) {
 		}
 	}
 	return han, latin
+}
+
+func assertSingleKocoroVoice(t *testing.T, speech string) {
+	t.Helper()
+	normalized := strings.ToLower(speech)
+	normalized = strings.ReplaceAll(normalized, "kocoro desktop", "")
+	for _, banned := range []string{
+		"kocoro's result",
+		"kocoro found",
+		"ask kocoro",
+		"kocoro 的结果",
+		"kocoro查",
+		"让 kocoro",
+	} {
+		if strings.Contains(normalized, banned) {
+			t.Fatalf("native summary framed Kocoro as a separate worker or result source (%q): %q", banned, speech)
+		}
+	}
 }

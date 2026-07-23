@@ -57,7 +57,7 @@ func TestFinishToolLoopResponsePinsSpecialResponseLanguage(t *testing.T) {
 		}
 		h.finishToolLoopResponse("initial")
 		req := <-h.loopRespReq
-		for _, want := range []string{"Reply only in Simplified Chinese", toolContinuationInstructions} {
+		for _, want := range []string{VoiceIdentityInstructions, "Reply only in Simplified Chinese", toolContinuationInstructions} {
 			if !strings.Contains(req.instructions, want) {
 				t.Fatalf("continuation instructions missing %q: %s", want, req.instructions)
 			}
@@ -77,7 +77,7 @@ func TestFinishToolLoopResponsePinsSpecialResponseLanguage(t *testing.T) {
 		}
 		h.finishToolLoopResponse("initial")
 		req := <-h.loopRespReq
-		for _, want := range []string{"Reply only in Simplified Chinese", toolBudgetClosureInstructions} {
+		for _, want := range []string{VoiceIdentityInstructions, "Reply only in Simplified Chinese", toolBudgetClosureInstructions} {
 			if !strings.Contains(req.instructions, want) {
 				t.Fatalf("closure instructions missing %q: %s", want, req.instructions)
 			}

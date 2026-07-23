@@ -400,10 +400,13 @@ func TestDoTaskDescriptionUsesOneSelfFraming(t *testing.T) {
 	if doTask == "" {
 		t.Fatal("do_task tool not found")
 	}
-	for _, banned := range []string{"back-brain", "back brain", "delegate to"} {
+	for _, banned := range []string{"back-brain", "back brain", "delegate to", "kocoro already", "kocoro's full"} {
 		if strings.Contains(doTask, banned) {
 			t.Errorf("do_task description must not contain %q (contradicts one-self persona)", banned)
 		}
+	}
+	if !strings.Contains(doTask, strings.ToLower(VoiceIdentityInstructions)) {
+		t.Error("do_task description must include the shared single-Kocoro identity contract")
 	}
 	// "own hands" (not the removed "own tools" lecture sentence): first-person
 	// framing survives in the description head after the one-self trim (2026-07-02).

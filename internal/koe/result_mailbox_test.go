@@ -183,6 +183,9 @@ func TestTaskResultResponseInstructionsPinConfiguredLanguage(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.language, func(t *testing.T) {
 			instructions := taskResultResponseInstructions(tt.language, results)
+			if !strings.Contains(instructions, VoiceIdentityInstructions) {
+				t.Fatalf("result response instructions lost the single-Kocoro identity contract: %s", instructions)
+			}
 			for _, want := range tt.want {
 				if !strings.Contains(instructions, want) {
 					t.Fatalf("result response instructions for %s missing %q: %s", tt.language, want, instructions)
@@ -210,10 +213,13 @@ func TestTaskResultInjectionMarksBatchAsIncremental(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inject task result batch: %v", err)
 	}
-	for _, want := range []string{"incremental Kocoro task-result batch", "other concurrent tasks may arrive in later batches", "absence is not a status signal"} {
+	for _, want := range []string{"incremental result batch from work you performed", "other concurrent tasks may arrive in later batches", "absence is not a status signal"} {
 		if !strings.Contains(injected, want) {
 			t.Fatalf("injected context missing %q: %s", want, injected)
 		}
+	}
+	if strings.Contains(injected, "Kocoro task-result batch") {
+		t.Fatalf("injected context still frames Kocoro as a separate result source: %s", injected)
 	}
 }
 

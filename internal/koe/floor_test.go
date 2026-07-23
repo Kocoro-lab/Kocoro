@@ -30,6 +30,18 @@ func TestNativeFloorControllerDefaultsMalformedJudgeToResume(t *testing.T) {
 	}
 }
 
+func TestFloorContinueResponseKeepsIdentityAndLanguage(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-floor", ""), nil, func(any) error { return nil })
+	h.language = "zh"
+	h.resumeBySpeechAfterServerClear()
+	req := <-h.respReq
+	for _, want := range []string{VoiceIdentityInstructions, "Reply only in Simplified Chinese", floorContinueInstructions} {
+		if !strings.Contains(req.instructions, want) {
+			t.Fatalf("floor continuation instructions missing %q: %s", want, req.instructions)
+		}
+	}
+}
+
 func TestNativeFloorControllerDeduplicatesDecision(t *testing.T) {
 	floor := newNativeFloorController()
 	floor.begin("source-1")

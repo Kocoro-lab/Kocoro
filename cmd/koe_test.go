@@ -400,6 +400,24 @@ func TestKoePersonaSeparatesCurrentHandoffFromLaterTurns(t *testing.T) {
 	}
 }
 
+func TestKoePersonaUsesSingleKocoroVoice(t *testing.T) {
+	if !strings.Contains(koePersona, koe.VoiceIdentityInstructions) {
+		t.Fatal("Koe persona must include the shared single-Kocoro identity contract")
+	}
+	for _, banned := range []string{
+		"Kocoro already knows",
+		"Kocoro's full final user-facing reply",
+		"Kocoro's earlier work",
+	} {
+		if strings.Contains(koePersona, banned) {
+			t.Fatalf("Koe persona still frames Kocoro as a separate worker or result source: %q", banned)
+		}
+	}
+	if !strings.Contains(koePersona, "Kocoro Desktop") {
+		t.Fatal("single-Kocoro wording must preserve the Kocoro Desktop app name")
+	}
+}
+
 // TestKoePersonaDividesByInformationSource pins the split: the line is the NATURE
 // OF THE INFORMATION the answer needs — stable public knowledge the model holds vs
 // current/private/action — not task difficulty, and not the model's own sense of
