@@ -22,6 +22,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/projects"
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
@@ -84,6 +85,7 @@ type RunAgentRequest struct {
 	Channel         string                `json:"channel,omitempty"`           // channel/thread source context
 	ThreadID        string                `json:"thread_id,omitempty"`         // thread context for messaging platforms
 	CWD             string                `json:"cwd,omitempty"`               // absolute project path override
+	ProjectID       string                `json:"project_id,omitempty"`        // owning project entity for a session created inside a project; tags the session once (tag-only-if-empty) so project instructions/memory apply. Orthogonal to CWD and Agent.
 	InjectOnly      bool                  `json:"inject_only,omitempty"`       // busy-state inject: on InjectNoActiveRun race, return 409 instead of starting a new run so the client re-queues locally (avoids duplicate run)
 	ClientMessageID string                `json:"client_message_id,omitempty"` // client-supplied id (e.g. Desktop queued-draft id) echoed back in the injected_committed SSE event when the loop drains this inject, so the client flips its queued card into a real bubble at the consume boundary
 	IdempotencyKey  string                `json:"idempotency_key,omitempty"`   // stable key for a primary request with a client-minted session_id; completed retries return the persisted result, while interrupted/failed attempts never replay tools automatically
@@ -138,6 +140,11 @@ func (r *RunAgentRequest) Validate() error {
 	if r.CWD != "" {
 		if err := cwdctx.ValidateCWD(r.CWD); err != nil {
 			return fmt.Errorf("invalid cwd: %w", err)
+		}
+	}
+	if r.ProjectID != "" {
+		if err := projects.ValidateProjectID(r.ProjectID); err != nil {
+			return fmt.Errorf("invalid project_id: %w", err)
 		}
 	}
 	if r.IdempotencyKey != "" {
@@ -1457,6 +1464,7 @@ type ServerDeps struct {
 	PostOverlays    []agent.Tool        // cloud_delegate etc.; refreshed on reload
 	ShannonDir      string
 	AgentsDir       string
+	ProjectsDir     string // ~/.shannon/projects — project entity container
 	Auditor         *audit.AuditLogger
 	HookRunner      *hooks.HookRunner
 	SessionCache    *SessionCache
@@ -2417,6 +2425,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if effectiveCWD != "" && cloudSessionCWD == "" {
 		sess.CWD = effectiveCWD
 	}
+	// Tag the session with its owning project the first time it runs inside one.
+	// Tag-only-if-empty: a resumed session keeps its original project even if a
+	// later request omits or changes project_id, so continuing a conversation
+	// never silently re-files it. Re-filing is an explicit user action via
+	// PATCH /sessions/{id}.
+	if req.ProjectID != "" && sess.ProjectID == "" {
+		sess.ProjectID = req.ProjectID
+	}
 	ctx = cwdctx.WithSessionCWD(ctx, effectiveCWD)
 
 	// Wrap the transport handler with a bus-emitting handler so every run
@@ -2702,6 +2718,27 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// merge from). Solves the "Default agent re-prompts every bash command"
 		// pain since global always_allow_tools persists across daemon restarts.
 		loop.SetAlwaysAllowTools(runCfg.Permissions.AlwaysAllowTools)
+	}
+	// Project scope (orthogonal to agent): when the session belongs to a
+	// project, layer the project's instructions and repoint memory at the
+	// project's MEMORY.md so the agent reads and auto-accumulates into the
+	// project — isolated per project, shared across that project's sessions.
+	// Placed after the agent branches above so project membership overrides
+	// both the named-agent (SwitchAgent) and default-agent memory dirs: in a
+	// project session the agent's memory IS the project's memory.
+	//
+	// Guard on the project still existing: DeleteProject removes the dir but a
+	// session may retain a now-dangling project_id (delete is best-effort about
+	// un-filing). Without this check the override would repoint memory at a
+	// missing dir — the agent would read nothing AND write-back would resurrect a
+	// ghost projects/<id>/ (MEMORY.md only, no project.yaml) invisible to the UI,
+	// silently losing every new learning. A dangling id thus correctly falls
+	// through to the agent's own memory (unfiled behavior).
+	if deps.ProjectsDir != "" && sess.ProjectID != "" {
+		if _, err := projects.LoadProject(deps.ProjectsDir, sess.ProjectID); err == nil {
+			loop.SetProjectEntityDir(projects.InstructionsDir(deps.ProjectsDir, sess.ProjectID))
+			loop.SetMemoryDir(projects.MemoryDir(deps.ProjectsDir, sess.ProjectID))
+		}
 	}
 	if runCfg.Agent.Model != "" {
 		loop.SetSpecificModel(runCfg.Agent.Model)

@@ -68,6 +68,7 @@ type Session struct {
 	Channel            string                       `json:"channel,omitempty"`           // source channel/group identifier
 	ScheduleID         string                       `json:"schedule_id,omitempty"`       // owning schedule for scheduler-created sessions; retained after schedule deletion
 	RouteKey           string                       `json:"route_key,omitempty"`         // persisted daemon route binding for routed conversations
+	ProjectID          string                       `json:"project_id,omitempty"`        // owning project entity (~/.shannon/projects/<id>); optional, empty = unfiled. Set once from RunAgentRequest.ProjectID or via PATCH /sessions/{id}.
 	SummaryCache       string                       `json:"summary_cache,omitempty"`     // cached summary Markdown
 	SummaryCacheKey    string                       `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
 	Usage              *UsageSummary                `json:"usage,omitempty"`             // cumulative LLM + tool cost/token totals
@@ -333,6 +334,12 @@ type SessionSummary struct {
 	// cross-agent views (GET /sessions?scope=all) can attribute each session.
 	// Always emitted (even when empty) so clients can rely on its presence.
 	Agent string `json:"agent"`
+	// ProjectID mirrors Session.ProjectID: the owning project entity
+	// (~/.shannon/projects/<id>), empty for unfiled sessions. Always emitted
+	// so Desktop can render the project badge / filter by project without a
+	// per-row GET /sessions/{id}. Carried straight from Store.List (index +
+	// JSON fallback), no HTTP-time enrichment needed.
+	ProjectID string `json:"project_id"`
 }
 
 type Store struct {
@@ -589,6 +596,41 @@ func (s *Store) PatchFlags(id string, pinned, favorite *bool) error {
 	return nil
 }
 
+// PatchProjectID re-files a session into a project (or clears it when projectID
+// is ""). Like PatchFlags it is a metadata edit: it deliberately does NOT bump
+// UpdatedAt, so moving a session between projects does not re-sort it to the top
+// of the recency list. Passing projectID == nil is a no-op.
+func (s *Store) PatchProjectID(id string, projectID *string) error {
+	if projectID == nil {
+		return nil
+	}
+	sess, err := s.Load(id)
+	if err != nil {
+		return err
+	}
+	sess.ProjectID = *projectID
+
+	data, err := json.MarshalIndent(sess, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal session: %w", err)
+	}
+
+	path := filepath.Join(s.dir, sess.ID+".json")
+	if err := writeFileAtomic(path, data, 0600); err != nil {
+		return err
+	}
+
+	if s.index != nil {
+		// Narrow UPDATE on the project_id column only — keeps re-filing O(1)
+		// regardless of session length. Fall back to a full UpsertSession when
+		// the index row is missing, mirroring PatchFlags.
+		if err := s.index.UpdateSessionProjectID(sess.ID, sess.ProjectID); errors.Is(err, os.ErrNotExist) {
+			s.index.UpsertSession(sess)
+		}
+	}
+	return nil
+}
+
 // PatchPublishedShares re-reads the session from disk, applies mutate to the
 // current PublishedShares slice, and writes it back. UpdatedAt is NOT touched
 // — share/retract is metadata, not user activity, so a bump would re-sort the
@@ -719,6 +761,7 @@ func (s *Store) List() ([]SessionSummary, error) {
 			ScheduleID: sess.ScheduleID,
 			Pinned:     sess.Pinned,
 			Favorite:   sess.Favorite,
+			ProjectID:  sess.ProjectID,
 		})
 	}
 

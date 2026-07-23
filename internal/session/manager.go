@@ -231,6 +231,25 @@ func (m *Manager) PatchFlags(id string, pinned, favorite *bool) error {
 	return nil
 }
 
+// PatchProjectID re-files a session into a project (projectID == "" clears it).
+// projectID == nil is a no-op. If the target is the active session, the
+// in-memory copy is also updated. Disk is written first so a failed write won't
+// leave memory inconsistent.
+func (m *Manager) PatchProjectID(id string, projectID *string) error {
+	if projectID == nil {
+		return nil
+	}
+	if err := m.store.PatchProjectID(id, projectID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if m.current != nil && m.current.ID == id {
+		m.current.ProjectID = *projectID
+	}
+	m.mu.Unlock()
+	return nil
+}
+
 // PatchSummaryCache 从磁盘重新读取最新 session，仅更新摘要缓存字段后写回。
 func (m *Manager) PatchSummaryCache(id, summary, cacheKey string) error {
 	return m.store.PatchSummaryCache(id, summary, cacheKey)
