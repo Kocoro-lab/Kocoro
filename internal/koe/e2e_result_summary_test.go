@@ -48,6 +48,7 @@ func TestKoeNativeResultSummaryE2E(t *testing.T) {
 
 	mailbox := NewResultMailbox()
 	h := newEventHandlerWithMailbox(nil, NewCallState("burst-summary-e2e", ""), audio, send, mailbox, nil)
+	h.language = "zh"
 	go h.runResponseSender(ctx)
 
 	connected := make(chan struct{})

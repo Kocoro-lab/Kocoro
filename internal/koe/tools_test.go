@@ -91,6 +91,26 @@ func TestDoTaskDescriptionMatchesPersonaContract(t *testing.T) {
 	}
 }
 
+func TestDoTaskDescriptionSeparatesCurrentHandoffFromLaterTurns(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	var desc string
+	for _, d := range ToolDefs() {
+		if d.Name == "do_task" {
+			desc = d.Description
+		}
+	}
+	desc = strings.ToLower(desc)
+	for _, want := range []string{
+		"after the do_task call, emit no more audio in this response",
+		"later user turns may continue normally while the task is running",
+		"never narrate the delivery mechanics",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("do_task handoff contract missing %q", want)
+		}
+	}
+}
+
 func TestBurstRouteKey(t *testing.T) {
 	// MUST equal the keys Plan A Task 3 pins daemon-side.
 	if got := burstRouteKey("finance", "burst-123"); got != "agent:finance:koe:burst-123" {

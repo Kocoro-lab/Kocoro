@@ -105,6 +105,7 @@ func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 		return rc.dc.SendText(string(body))
 	}
 	h = newEventHandler(disp, state, audio, send)
+	h.language = "zh"
 	go h.runResponseSender(ctx)
 
 	connected := make(chan struct{})
@@ -183,6 +184,12 @@ func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 		t.Fatalf("parallel tasks shared a daemon lane: %+v", seen)
 	}
 	waitCompoundIdle(t, ctx, h, "initial parallel-tool response did not settle")
+	eventMu.Lock()
+	initialSpeech := append([]string(nil), transcripts...)
+	eventMu.Unlock()
+	if len(initialSpeech) != 1 || strings.Trim(initialSpeech[0], " \t\r\n，。！？,.!?") != "我查一下" {
+		t.Fatalf("task handoff speech=%q, want one bare acknowledgement and no delivery narration", initialSpeech)
+	}
 
 	weatherOnce.Do(func() { close(weatherRelease) })
 	waitIncrementalSignal(t, ctx, firstBatchInjected, "weather result was not claimed")

@@ -384,6 +384,22 @@ func TestKoePersonaAckIsBareAndNoPreAnswer(t *testing.T) {
 	}
 }
 
+func TestKoePersonaSeparatesCurrentHandoffFromLaterTurns(t *testing.T) {
+	combined := strings.ToLower(koePersona + koeMultiTaskPersona)
+	for _, want := range []string{
+		"after the do_task call, emit no more audio in this response",
+		"later user turns may continue normally while the task is running",
+		"never narrate the delivery mechanics",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("Koe handoff contract missing %q", want)
+		}
+	}
+	if strings.Contains(strings.ToLower(koePersona), "say nothing more until\nthe result lands") {
+		t.Fatal("Koe persona still conflates the current handoff response with later conversation turns")
+	}
+}
+
 // TestKoePersonaDividesByInformationSource pins the split: the line is the NATURE
 // OF THE INFORMATION the answer needs — stable public knowledge the model holds vs
 // current/private/action — not task difficulty, and not the model's own sense of
