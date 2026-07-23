@@ -118,10 +118,16 @@ type RunAgentRequest struct {
 	// by daemon startup recovery: Text is an internal continuation marker, not
 	// a new user request, and is persisted as SystemInjected.
 	ResumeInterrupted bool `json:"-"`
-	// InterruptedResumeAttempt is persisted before startup recovery enters the
-	// agent loop, so a crash during continuation still consumes one bounded
-	// retry attempt.
-	InterruptedResumeAttempt int `json:"-"`
+	// Interrupted recovery fields are internal claim metadata. RunAgent checks
+	// and persists them only after acquiring the session route lock, so a
+	// foreground turn that completed after discovery supersedes the stale
+	// candidate instead of being resumed twice.
+	InterruptedResumeAttempt             int           `json:"-"`
+	InterruptedResumePriorAttempts       int           `json:"-"`
+	InterruptedResumeMaxAttempts         int           `json:"-"`
+	InterruptedResumeMaxAge              time.Duration `json:"-"`
+	InterruptedResumeCheckpointUpdatedAt time.Time     `json:"-"`
+	InterruptedResumeSessionUpdatedAt    time.Time     `json:"-"`
 }
 
 // ForegroundHint identifies the app that was frontmost when the user summoned
@@ -1792,6 +1798,12 @@ func historySnapshotForRequest(sess *session.Session, req RunAgentRequest) []cli
 const interruptedTurnContinuation = "[system] The previous turn was interrupted after a durable checkpoint. Continue the existing request from the saved tool results and partial work. Do not repeat completed tool calls."
 
 func interruptedTurnSnapshot(req RunAgentRequest, agentName, effectiveCWD string) *session.InterruptedTurn {
+	updatedAt := time.Now()
+	if req.ResumeInterrupted && !req.InterruptedResumeCheckpointUpdatedAt.IsZero() {
+		// Preserve the original interruption time across failed continuations.
+		// Otherwise repeated restarts could keep refreshing the staleness window.
+		updatedAt = req.InterruptedResumeCheckpointUpdatedAt
+	}
 	return &session.InterruptedTurn{
 		Agent:           agentName,
 		Source:          req.Source,
@@ -1804,8 +1816,80 @@ func interruptedTurnSnapshot(req RunAgentRequest, agentName, effectiveCWD string
 		IMStatusContext: append(json.RawMessage(nil), req.IMStatusContext...),
 		Participants:    append([]string(nil), req.Participants...),
 		ResumeAttempts:  req.InterruptedResumeAttempt,
-		UpdatedAt:       time.Now(),
+		UpdatedAt:       updatedAt,
 	}
+}
+
+// claimInterruptedResume validates and persists a startup recovery claim while
+// RunAgent holds the same route lock as foreground traffic. The discovery
+// snapshot is advisory; the session loaded under this lock is authoritative.
+func claimInterruptedResume(
+	sessMgr *session.Manager,
+	sess *session.Session,
+	req *RunAgentRequest,
+	agentName string,
+) error {
+	if req == nil || !req.ResumeInterrupted {
+		return nil
+	}
+	if sess == nil || !sess.InProgress {
+		return errInterruptedRecoverySuperseded
+	}
+
+	var state session.InterruptedTurn
+	var checkpointAt time.Time
+	if sess.InterruptedTurn != nil {
+		state = cloneInterruptedTurn(*sess.InterruptedTurn)
+		checkpointAt = state.UpdatedAt
+		if state.ResumeAttempts != req.InterruptedResumePriorAttempts ||
+			(!req.InterruptedResumeCheckpointUpdatedAt.IsZero() &&
+				!checkpointAt.Equal(req.InterruptedResumeCheckpointUpdatedAt)) {
+			return errInterruptedRecoverySuperseded
+		}
+	} else {
+		// Legacy InProgress sessions have no InterruptedTurn payload. Session
+		// UpdatedAt is their only claim identity; any foreground save changes it
+		// and therefore supersedes this candidate.
+		if req.InterruptedResumePriorAttempts != 0 ||
+			req.InterruptedResumeSessionUpdatedAt.IsZero() ||
+			!sess.UpdatedAt.Equal(req.InterruptedResumeSessionUpdatedAt) {
+			return errInterruptedRecoverySuperseded
+		}
+		state = *interruptedTurnSnapshot(*req, agentName, req.CWD)
+		checkpointAt = sess.UpdatedAt
+		state.UpdatedAt = checkpointAt
+	}
+
+	now := time.Now()
+	if checkpointAt.IsZero() ||
+		(req.InterruptedResumeMaxAge > 0 && now.Sub(checkpointAt) > req.InterruptedResumeMaxAge) {
+		sess.InProgress = false
+		sess.InterruptedTurn = nil
+		if err := sessMgr.SavePreservingUpdatedAt(); err != nil {
+			return fmt.Errorf("persist stale interrupted-turn abandonment: %w", err)
+		}
+		return errInterruptedRecoveryStale
+	}
+	if req.InterruptedResumeMaxAttempts > 0 &&
+		state.ResumeAttempts >= req.InterruptedResumeMaxAttempts {
+		sess.InProgress = false
+		sess.InterruptedTurn = nil
+		if err := sessMgr.SavePreservingUpdatedAt(); err != nil {
+			return fmt.Errorf("persist exhausted interrupted-turn abandonment: %w", err)
+		}
+		return errInterruptedRecoveryExhausted
+	}
+
+	req.InterruptedResumeAttempt = state.ResumeAttempts + 1
+	req.InterruptedResumeCheckpointUpdatedAt = checkpointAt
+	state.Agent = agentName
+	state.ResumeAttempts = req.InterruptedResumeAttempt
+	state.UpdatedAt = checkpointAt
+	sess.InterruptedTurn = &state
+	if err := sessMgr.Save(); err != nil {
+		return fmt.Errorf("persist interrupted resume attempt: %w", err)
+	}
+	return nil
 }
 
 // RunAgent executes a single agent turn using the shared dependencies.
@@ -2253,6 +2337,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	sess := sessMgr.Current()
 	if route != nil && sess != nil {
 		route.storeSessionID(sess.ID)
+	}
+	if err := claimInterruptedResume(sessMgr, sess, &req, agentName); err != nil {
+		return nil, err
 	}
 	if result, err, found := completedIdempotentResult(sess, req.IdempotencyKey, agentName); found {
 		// A duplicate SSE request still needs the stable binding event before
@@ -3138,8 +3225,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				// configured recovery-attempt cap is reached. Clearing this
 				// marker on the first failure would turn a temporary gateway
 				// outage into permanent abandonment.
-				sess.InProgress = true
-				sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+				if req.InterruptedResumeMaxAttempts > 0 &&
+					req.InterruptedResumeAttempt >= req.InterruptedResumeMaxAttempts {
+					sess.InProgress = false
+					sess.InterruptedTurn = nil
+				} else {
+					sess.InProgress = true
+					sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+				}
 			} else {
 				sess.InProgress = false // ordinary hard-error path: turn is over
 				sess.InterruptedTurn = nil

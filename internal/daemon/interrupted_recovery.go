@@ -24,6 +24,12 @@ type interruptedTurnCandidate struct {
 	UpdatedAt time.Time
 }
 
+var (
+	errInterruptedRecoverySuperseded = errors.New("interrupted recovery superseded")
+	errInterruptedRecoveryStale      = errors.New("interrupted recovery stale")
+	errInterruptedRecoveryExhausted  = errors.New("interrupted recovery exhausted")
+)
+
 // discoverInterruptedTurns scans the default and named-agent session stores.
 // Each store maintains a durable marker index, so steady-state discovery loads
 // only interrupted candidates. Stores created before the index existed perform
@@ -182,9 +188,9 @@ func interruptedResumeEnabled(deps *ServerDeps) bool {
 // A zero UpdatedAt (malformed or pre-feature data) is always stale: with no
 // trustworthy timestamp the safe reading is "not recently interrupted".
 func isStaleInterruptedTurn(candidate interruptedTurnCandidate, maxAge time.Duration, now time.Time) bool {
-	ts := candidate.UpdatedAt
+	ts := candidate.State.UpdatedAt
 	if ts.IsZero() {
-		ts = candidate.State.UpdatedAt
+		ts = candidate.UpdatedAt
 	}
 	if ts.IsZero() {
 		return true
@@ -198,32 +204,6 @@ func cloneInterruptedTurn(state session.InterruptedTurn) session.InterruptedTurn
 	return state
 }
 
-func persistInterruptedResumeAttempt(mgr *session.Manager, candidate interruptedTurnCandidate, attempt int) error {
-	sess, err := mgr.Resume(candidate.SessionID)
-	if err != nil {
-		return err
-	}
-	if !sess.InProgress {
-		return fmt.Errorf("session is no longer in progress")
-	}
-	state := cloneInterruptedTurn(candidate.State)
-	state.Agent = candidate.Agent
-	state.ResumeAttempts = attempt
-	state.UpdatedAt = time.Now()
-	sess.InterruptedTurn = &state
-	return mgr.Save()
-}
-
-func abandonInterruptedTurn(mgr *session.Manager, candidate interruptedTurnCandidate) error {
-	sess, err := mgr.Resume(candidate.SessionID)
-	if err != nil {
-		return err
-	}
-	sess.InProgress = false
-	sess.InterruptedTurn = nil
-	return mgr.Save()
-}
-
 // buildInterruptedResumeRequest constructs the continuation request for a
 // durable checkpoint. The original route key is PINNED so the resume takes the
 // same route lock concurrent inbound traffic for this session would take —
@@ -232,24 +212,28 @@ func abandonInterruptedTurn(mgr *session.Manager, candidate interruptedTurnCandi
 // session file. When the session had no route key (fresh web/webhook runs),
 // the SessionID branch still yields a stable session:<id> lock shared with
 // session-addressed follow-ups.
-func buildInterruptedResumeRequest(candidate interruptedTurnCandidate, attempt int) RunAgentRequest {
+func buildInterruptedResumeRequest(candidate interruptedTurnCandidate, maxAttempts int, maxAge time.Duration) RunAgentRequest {
 	state := candidate.State
 	return RunAgentRequest{
-		Text:                     interruptedTurnContinuation,
-		Agent:                    candidate.Agent,
-		SessionID:                candidate.SessionID,
-		Source:                   state.Source,
-		Sender:                   state.Sender,
-		Channel:                  state.Channel,
-		ThreadID:                 state.ThreadID,
-		CWD:                      state.CWD,
-		RouteKey:                 state.RouteKey,
-		PinnedRouteKey:           state.RouteKey,
-		CloudMessageID:           state.CloudMessageID,
-		IMStatusContext:          append(json.RawMessage(nil), state.IMStatusContext...),
-		Participants:             append([]string(nil), state.Participants...),
-		ResumeInterrupted:        true,
-		InterruptedResumeAttempt: attempt,
+		Text:                                 interruptedTurnContinuation,
+		Agent:                                candidate.Agent,
+		SessionID:                            candidate.SessionID,
+		Source:                               state.Source,
+		Sender:                               state.Sender,
+		Channel:                              state.Channel,
+		ThreadID:                             state.ThreadID,
+		CWD:                                  state.CWD,
+		RouteKey:                             state.RouteKey,
+		PinnedRouteKey:                       state.RouteKey,
+		CloudMessageID:                       state.CloudMessageID,
+		IMStatusContext:                      append(json.RawMessage(nil), state.IMStatusContext...),
+		Participants:                         append([]string(nil), state.Participants...),
+		ResumeInterrupted:                    true,
+		InterruptedResumePriorAttempts:       state.ResumeAttempts,
+		InterruptedResumeMaxAttempts:         maxAttempts,
+		InterruptedResumeMaxAge:              maxAge,
+		InterruptedResumeCheckpointUpdatedAt: state.UpdatedAt,
+		InterruptedResumeSessionUpdatedAt:    candidate.UpdatedAt,
 	}
 }
 
@@ -275,67 +259,40 @@ func (s *Server) resumeInterruptedTurns(ctx context.Context) {
 	}
 }
 
-// resumeInterruptedCandidate applies the policy gates and continues one
-// durable checkpoint. One session.Manager serves every store access for the
-// candidate (attempt persistence + abandon paths) instead of re-opening the
-// store per operation.
+// resumeInterruptedCandidate continues one durable checkpoint. RunAgent
+// applies every policy gate and persists the attempt only after acquiring the
+// session's route lock, so a foreground completion can supersede this stale
+// discovery snapshot without a second model call.
 func (s *Server) resumeInterruptedCandidate(ctx context.Context, candidate interruptedTurnCandidate, maxAttempts int, maxAge time.Duration) {
-	mgr := session.NewManager(candidate.StoreDir)
-	defer mgr.Close()
-
 	state := candidate.State
-	// Staleness gate: a checkpoint older than the window carries a user
-	// intent whose context is gone (live incident 2026-07-23: a 3-month-old
-	// interrupted destructive turn re-executed on upgrade). Abandon it —
-	// clearing the marker — instead of resuming or leaving it to rescan.
-	if isStaleInterruptedTurn(candidate, maxAge, time.Now()) {
-		if abandonErr := abandonInterruptedTurn(mgr, candidate); abandonErr != nil {
-			log.Printf("daemon: stale interrupted turn abandon failed session=%s agent=%s: %v",
-				candidate.SessionID, candidate.Agent, abandonErr)
-			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resume_failed",
-				fmt.Sprintf("failed to clear stale checkpoint: %v", abandonErr))
-			return
-		}
-		emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
-			fmt.Sprintf("checkpoint interrupted at %s exceeds the %s auto-resume window",
-				candidate.UpdatedAt.Format(time.RFC3339), maxAge))
-		return
-	}
-	if state.ResumeAttempts >= maxAttempts {
-		if abandonErr := abandonInterruptedTurn(mgr, candidate); abandonErr != nil {
-			log.Printf("daemon: interrupted turn abandon failed session=%s agent=%s: %v",
-				candidate.SessionID, candidate.Agent, abandonErr)
-			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resume_failed",
-				fmt.Sprintf("failed to clear exhausted recovery marker: %v", abandonErr))
-			return
-		}
-		emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
-			fmt.Sprintf("automatic recovery exhausted after %d attempts", state.ResumeAttempts))
-		return
-	}
-
 	attempt := state.ResumeAttempts + 1
-	if persistErr := persistInterruptedResumeAttempt(mgr, candidate, attempt); persistErr != nil {
-		log.Printf("daemon: interrupted turn attempt checkpoint failed session=%s agent=%s: %v",
-			candidate.SessionID, candidate.Agent, persistErr)
-		emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resume_failed",
-			fmt.Sprintf("failed to persist recovery attempt %d/%d: %v", attempt, maxAttempts, persistErr))
-		return
-	}
-	state.ResumeAttempts = attempt
 	emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resuming",
-		fmt.Sprintf("continuing durable checkpoint (attempt %d/%d)", attempt, maxAttempts))
-	req := buildInterruptedResumeRequest(candidate, attempt)
+		fmt.Sprintf("checking durable checkpoint (attempt %d/%d)", attempt, maxAttempts))
+	req := buildInterruptedResumeRequest(candidate, maxAttempts, maxAge)
 	result, runErr := RunAgent(ctx, s.deps, req, &interruptedRecoveryHandler{})
 	if runErr != nil {
+		switch {
+		case errors.Is(runErr, errInterruptedRecoverySuperseded):
+			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
+				"checkpoint was completed or replaced before recovery acquired its route")
+			return
+		case errors.Is(runErr, errInterruptedRecoveryStale):
+			checkpointAt := candidate.State.UpdatedAt
+			if checkpointAt.IsZero() {
+				checkpointAt = candidate.UpdatedAt
+			}
+			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
+				fmt.Sprintf("checkpoint interrupted at %s exceeds the %s auto-resume window",
+					checkpointAt.Format(time.RFC3339), maxAge))
+			return
+		case errors.Is(runErr, errInterruptedRecoveryExhausted):
+			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
+				fmt.Sprintf("automatic recovery exhausted after %d attempts", state.ResumeAttempts))
+			return
+		}
 		log.Printf("daemon: interrupted turn resume failed session=%s agent=%s: %v",
 			candidate.SessionID, candidate.Agent, runErr)
 		if attempt >= maxAttempts {
-			if abandonErr := abandonInterruptedTurn(mgr, candidate); abandonErr != nil {
-				emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_resume_failed",
-					fmt.Sprintf("attempt %d/%d failed and marker cleanup failed: %v", attempt, maxAttempts, abandonErr))
-				return
-			}
 			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
 				fmt.Sprintf("automatic recovery exhausted after %d attempts: %v", attempt, runErr))
 		} else {

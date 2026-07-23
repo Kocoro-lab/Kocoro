@@ -44,9 +44,7 @@ func (t *GlobTool) Info() agent.ToolInfo {
 				"max_results": map[string]any{"type": "integer", "description": fmt.Sprintf("Max number of results (default: %d)", defaultGlobMaxResults)},
 			},
 		},
-		// description is deliberately NOT required: it feeds approval cards, but
-		// this read-only, high-frequency tool never shows one. See file_read.
-		Required: []string{"pattern"},
+		Required: []string{"pattern", "description"},
 	}
 }
 
@@ -77,6 +75,9 @@ func (t *GlobTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	}
 	if strings.TrimSpace(args.Pattern) == "" {
 		return agent.ValidationError("glob: missing required `pattern` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("glob: missing required `description` parameter"), nil
 	}
 
 	root, pattern := normalizeGlobTarget(args.Pattern, args.Path)

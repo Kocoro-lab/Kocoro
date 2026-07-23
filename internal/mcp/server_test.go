@@ -958,6 +958,57 @@ func TestServeCancelsInFlightRequestsOnCleanEOF(t *testing.T) {
 	}
 }
 
+func TestServeReturnsWhenToolIgnoresEOFCancellation(t *testing.T) {
+	t.Setenv("SHANNON_MCP_EOF_DRAIN_GRACE", "50ms")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	tool := &lifecycleTool{
+		name: "ignore_cancel_probe",
+		run: func(context.Context) (agent.ToolResult, error) {
+			close(started)
+			<-release
+			close(finished)
+			return agent.ToolResult{Content: "late result"}, nil
+		},
+	}
+	srv := NewServer(newTestRegistry(tool), "test", "1.0", nil, nil, nil)
+	inputReader, inputWriter := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Serve(context.Background(), inputReader, io.Discard)
+	}()
+
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		ID:      rawID(10),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"ignore_cancel_probe","arguments":{}}`),
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("tool did not start")
+	}
+	_ = inputWriter.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Serve remained pinned by a tool that ignored cancellation")
+	}
+
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("ignored-cancellation probe did not clean up")
+	}
+}
+
 // Fix 2: a client that receives elicitation/create but never answers must not
 // pin the tool goroutine forever; the wait times out and fails closed.
 func TestElicitationTimeoutFailsClosed(t *testing.T) {
@@ -1154,6 +1205,161 @@ func TestRequestConcurrencyCapBoundsExecution(t *testing.T) {
 	_ = inputWriter.Close()
 	<-done
 	_ = outputWriter.Close()
+}
+
+func TestCancelledQueuedRequestDoesNotExecute(t *testing.T) {
+	t.Setenv("SHANNON_MCP_MAX_CONCURRENT_REQUESTS", "1")
+	t.Setenv("SHANNON_MCP_MAX_QUEUED_REQUESTS", "1")
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstOnce sync.Once
+	var tool *lifecycleTool
+	tool = &lifecycleTool{
+		name: "queued_cancel_probe",
+		run: func(ctx context.Context) (agent.ToolResult, error) {
+			if tool.runCalls.Load() == 1 {
+				firstOnce.Do(func() { close(firstStarted) })
+				select {
+				case <-releaseFirst:
+				case <-ctx.Done():
+					return agent.ToolResult{}, ctx.Err()
+				}
+			}
+			return agent.ToolResult{Content: "done"}, nil
+		},
+	}
+	srv := NewServer(newTestRegistry(tool), "test", "1.0", nil, nil, nil)
+	inputReader, inputWriter := io.Pipe()
+	outputReader, outputWriter := io.Pipe()
+	scanner := bufio.NewScanner(outputReader)
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(context.Background(), inputReader, outputWriter) }()
+
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		ID:      rawID(1),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"queued_cancel_probe","arguments":{}}`),
+	})
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not start")
+	}
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		ID:      rawID(2),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"queued_cancel_probe","arguments":{}}`),
+	})
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		Method:  "notifications/cancelled",
+		Params:  json.RawMessage(`{"requestId":2,"reason":"no longer needed"}`),
+	})
+	// initialize is handled synchronously by the scanner loop. Receiving its
+	// response proves the preceding cancellation notification was processed
+	// before the running request releases the only execution slot.
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		ID:      rawID(99),
+		Method:  "initialize",
+	})
+	initialized := readJSONLineTimeout(t, scanner, 2*time.Second)
+	if string(initialized["id"]) != "99" {
+		t.Fatalf("initialize response id = %s, want 99", initialized["id"])
+	}
+
+	close(releaseFirst)
+	completed := readJSONLineTimeout(t, scanner, 2*time.Second)
+	if string(completed["id"]) != "1" {
+		t.Fatalf("completed response id = %s, want 1", completed["id"])
+	}
+	_ = inputWriter.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not exit")
+	}
+	if got := tool.runCalls.Load(); got != 1 {
+		t.Fatalf("tool executed %d times; cancelled queued request executed", got)
+	}
+	_ = outputWriter.Close()
+}
+
+func TestRequestQueueCapRejectsExcessWithoutSpawningExecution(t *testing.T) {
+	t.Setenv("SHANNON_MCP_MAX_CONCURRENT_REQUESTS", "1")
+	t.Setenv("SHANNON_MCP_MAX_QUEUED_REQUESTS", "1")
+
+	firstStarted := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	tool := &lifecycleTool{
+		name: "queue_cap_probe",
+		run: func(ctx context.Context) (agent.ToolResult, error) {
+			once.Do(func() { close(firstStarted) })
+			select {
+			case <-release:
+				return agent.ToolResult{Content: "done"}, nil
+			case <-ctx.Done():
+				return agent.ToolResult{}, ctx.Err()
+			}
+		},
+	}
+	srv := NewServer(newTestRegistry(tool), "test", "1.0", nil, nil, nil)
+	inputReader, inputWriter := io.Pipe()
+	outputReader, outputWriter := io.Pipe()
+	scanner := bufio.NewScanner(outputReader)
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(context.Background(), inputReader, outputWriter) }()
+
+	for id := 1; id <= 2; id++ {
+		writeJSONLine(t, inputWriter, Request{
+			JSONRPC: "2.0",
+			ID:      rawID(id),
+			Method:  "tools/call",
+			Params:  json.RawMessage(`{"name":"queue_cap_probe","arguments":{}}`),
+		})
+		if id == 1 {
+			select {
+			case <-firstStarted:
+			case <-time.After(time.Second):
+				t.Fatal("first request did not start")
+			}
+		}
+	}
+	writeJSONLine(t, inputWriter, Request{
+		JSONRPC: "2.0",
+		ID:      rawID(3),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"queue_cap_probe","arguments":{}}`),
+	})
+
+	rejected := readJSONLineTimeout(t, scanner, 2*time.Second)
+	if string(rejected["id"]) != "3" {
+		t.Fatalf("rejected response id = %s, want 3", rejected["id"])
+	}
+	var rpcErr RPCError
+	if err := json.Unmarshal(rejected["error"], &rpcErr); err != nil {
+		t.Fatal(err)
+	}
+	if rpcErr.Code != -32000 {
+		t.Fatalf("queue overflow error = %d, want -32000", rpcErr.Code)
+	}
+
+	close(release)
+	readJSONLineTimeout(t, scanner, 2*time.Second)
+	readJSONLineTimeout(t, scanner, 2*time.Second)
+	_ = inputWriter.Close()
+	<-done
+	_ = outputWriter.Close()
+	if got := tool.runCalls.Load(); got != 2 {
+		t.Fatalf("tool executions = %d, want only accepted requests 1 and 2", got)
+	}
 }
 
 func TestToolPermissionAllowlistBypassesGenericApproval(t *testing.T) {

@@ -153,6 +153,17 @@ func (m *Manager) Save() error {
 	return m.store.Save(m.current)
 }
 
+// SavePreservingUpdatedAt persists recovery-policy cleanup without making an
+// abandoned historical session look like fresh user activity.
+func (m *Manager) SavePreservingUpdatedAt() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.current == nil {
+		return nil
+	}
+	return m.store.SavePreservingUpdatedAt(m.current)
+}
+
 // PatchTitle updates the title of the given session and persists it.
 // If the target is the active session, the in-memory title is also updated.
 // Disk is written first so a failed write won't leave memory inconsistent.

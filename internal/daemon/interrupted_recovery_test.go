@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
@@ -33,7 +35,13 @@ func writeInterruptedSession(t *testing.T, dir, id string, state *session.Interr
 	}
 	sess.Source = "desktop"
 	sess.InProgress = true
-	sess.InterruptedTurn = state
+	if state != nil {
+		stateCopy := cloneInterruptedTurn(*state)
+		if stateCopy.UpdatedAt.IsZero() {
+			stateCopy.UpdatedAt = now
+		}
+		sess.InterruptedTurn = &stateCopy
+	}
 	if err := mgr.Save(); err != nil {
 		t.Fatalf("save interrupted session: %v", err)
 	}
@@ -99,8 +107,16 @@ func TestInterruptedResumeAttemptPersistenceAndAbandon(t *testing.T) {
 		t.Fatalf("store dir = %q, want %q", candidate.StoreDir, dir)
 	}
 	attemptMgr := session.NewManager(dir)
-	if err := persistInterruptedResumeAttempt(attemptMgr, candidate, 2); err != nil {
-		t.Fatalf("persist attempt: %v", err)
+	attemptSession, err := attemptMgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := buildInterruptedResumeRequest(candidate, 3, 4*time.Hour)
+	if err := claimInterruptedResume(attemptMgr, attemptSession, &req, ""); err != nil {
+		t.Fatalf("claim attempt: %v", err)
+	}
+	if req.InterruptedResumeAttempt != 2 {
+		t.Fatalf("claimed attempt = %d, want 2", req.InterruptedResumeAttempt)
 	}
 	_ = attemptMgr.Close()
 
@@ -112,11 +128,23 @@ func TestInterruptedResumeAttemptPersistenceAndAbandon(t *testing.T) {
 	if sess.InterruptedTurn == nil || sess.InterruptedTurn.ResumeAttempts != 2 {
 		t.Fatalf("resume attempts not persisted: %#v", sess.InterruptedTurn)
 	}
+	updatedAt := sess.UpdatedAt
 	_ = mgr.Close()
 
+	exhaustedCandidate := interruptedTurnCandidate{
+		SessionID: id,
+		StoreDir:  dir,
+		State:     cloneInterruptedTurn(*sess.InterruptedTurn),
+		UpdatedAt: sess.UpdatedAt,
+	}
 	abandonMgr := session.NewManager(dir)
-	if err := abandonInterruptedTurn(abandonMgr, candidate); err != nil {
-		t.Fatalf("abandon: %v", err)
+	abandonSession, err := abandonMgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = buildInterruptedResumeRequest(exhaustedCandidate, 2, 4*time.Hour)
+	if err := claimInterruptedResume(abandonMgr, abandonSession, &req, ""); !errors.Is(err, errInterruptedRecoveryExhausted) {
+		t.Fatalf("exhausted claim error = %v, want %v", err, errInterruptedRecoveryExhausted)
 	}
 	_ = abandonMgr.Close()
 	mgr = session.NewManager(dir)
@@ -127,6 +155,9 @@ func TestInterruptedResumeAttemptPersistenceAndAbandon(t *testing.T) {
 	}
 	if sess.InProgress || sess.InterruptedTurn != nil {
 		t.Fatalf("abandoned session retained recovery state: %#v", sess)
+	}
+	if !sess.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("abandonment changed session recency: got %s want %s", sess.UpdatedAt, updatedAt)
 	}
 }
 
@@ -157,6 +188,65 @@ func TestResumeInterruptedTurnsAbandonsExhaustedWithoutGatewayCall(t *testing.T)
 	}
 	if sess.InProgress || sess.InterruptedTurn != nil {
 		t.Fatalf("exhausted recovery marker not cleared: %#v", sess)
+	}
+}
+
+func TestResumeInterruptedTurnFailuresPreserveCheckpointAndStopAtLimit(t *testing.T) {
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporary gateway failure", http.StatusServiceUnavailable)
+	}))
+	defer gateway.Close()
+
+	deps := runAgentContractTestDeps(t, gateway.URL)
+	defer deps.SessionCache.CloseAll()
+	id := "recovery-failure-limit-001"
+	dir := filepath.Join(deps.ShannonDir, "sessions")
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{Source: "heartbeat"})
+
+	candidates, err := discoverInterruptedTurns(deps.ShannonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(candidates))
+	}
+	checkpointAt := candidates[0].State.UpdatedAt
+	(&Server{deps: deps}).resumeInterruptedCandidate(context.Background(), candidates[0], 2, 4*time.Hour)
+
+	mgr := session.NewManager(dir)
+	firstFailure, err := mgr.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !firstFailure.InProgress || firstFailure.InterruptedTurn == nil {
+		t.Fatalf("first failure cleared recoverable checkpoint: %#v", firstFailure)
+	}
+	if got := firstFailure.InterruptedTurn.ResumeAttempts; got != 1 {
+		t.Fatalf("resume attempts after first failure = %d, want 1", got)
+	}
+	if !firstFailure.InterruptedTurn.UpdatedAt.Equal(checkpointAt) {
+		t.Fatalf("first failure refreshed checkpoint age: got %s want %s",
+			firstFailure.InterruptedTurn.UpdatedAt, checkpointAt)
+	}
+	_ = mgr.Close()
+
+	candidates, err = discoverInterruptedTurns(deps.ShannonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates after first failure = %d, want 1", len(candidates))
+	}
+	(&Server{deps: deps}).resumeInterruptedCandidate(context.Background(), candidates[0], 2, 4*time.Hour)
+
+	mgr = session.NewManager(dir)
+	defer mgr.Close()
+	exhausted, err := mgr.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exhausted.InProgress || exhausted.InterruptedTurn != nil {
+		t.Fatalf("second failed attempt retained exhausted recovery state: %#v", exhausted)
 	}
 }
 
@@ -229,5 +319,71 @@ func TestResumeInterruptedTurns_ContinuesCheckpointWithoutToolReplay(t *testing.
 	}
 	if !sawSavedToolResult {
 		t.Fatal("gateway did not receive the checkpointed tool result")
+	}
+}
+
+func TestCompletedForegroundTurnCancelsPendingRecovery(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "must not be called"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+	id := "recovery-superseded-001"
+	dir := filepath.Join(deps.ShannonDir, "sessions")
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{Source: "desktop"})
+
+	candidates, err := discoverInterruptedTurns(deps.ShannonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(candidates))
+	}
+	candidate := candidates[0]
+	req := buildInterruptedResumeRequest(candidate, 3, 4*time.Hour)
+	routeKey := ComputeRouteKey(req)
+	route := deps.SessionCache.LockRouteWithManager(routeKey, dir)
+	if route == nil || route.manager == nil {
+		t.Fatal("failed to acquire foreground route manager")
+	}
+
+	started := make(chan struct{})
+	resumeDone := make(chan struct{})
+	go func() {
+		defer close(resumeDone)
+		close(started)
+		(&Server{deps: deps}).resumeInterruptedCandidate(context.Background(), candidate, 3, 4*time.Hour)
+	}()
+	<-started
+
+	foregroundSession, err := route.manager.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foregroundSession.InProgress = false
+	foregroundSession.InterruptedTurn = nil
+	if err := route.manager.Save(); err != nil {
+		t.Fatal(err)
+	}
+	deps.SessionCache.UnlockRoute(routeKey)
+
+	select {
+	case <-resumeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending recovery did not finish after foreground route unlocked")
+	}
+	if requests := gw.requests(); len(requests) != 0 {
+		t.Fatalf("superseded recovery called gateway %d times", len(requests))
+	}
+
+	mgr := session.NewManager(dir)
+	defer mgr.Close()
+	persisted, err := mgr.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.InProgress || persisted.InterruptedTurn != nil {
+		t.Fatalf("superseded recovery rewrote completed session: %#v", persisted)
 	}
 }

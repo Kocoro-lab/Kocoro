@@ -83,10 +83,12 @@ func TestBuiltinTools_RejectMissingRequiredFields(t *testing.T) {
 }
 
 // emptyStringExemptRequired lists (tool, field) pairs where a required STRING
-// field legitimately accepts "". There should be none — a builtin using
-// presence-only validation for a string field is a bug. The map exists so any
-// future justified exemption is explicit and commented, not silent.
-var emptyStringExemptRequired = map[string]map[string]bool{}
+// field legitimately accepts "". file_edit.new_string uses an explicit empty
+// replacement to delete matched text; FileEditTool.Run separately validates
+// that the field is present, so omission still fails closed.
+var emptyStringExemptRequired = map[string]map[string]bool{
+	"file_edit": {"new_string": true},
+}
 
 // TestBuiltinTools_RejectEmptyStringRequiredFields complements the missing-field
 // sweep above. Deleting a field only catches presence checks; a builtin that

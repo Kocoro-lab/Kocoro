@@ -81,11 +81,37 @@ func TestFileEdit_MissingOldStringValidationError(t *testing.T) {
 	}
 }
 
-// Fix 1: new_string must no longer be a required field.
-func TestFileEdit_NewStringNotRequired(t *testing.T) {
+// new_string remains required even though an explicitly empty value is legal.
+// This prevents an omitted model argument from becoming a destructive delete.
+func TestFileEdit_NewStringRequired(t *testing.T) {
 	info := (&FileEditTool{}).Info()
-	if containsString(info.Required, "new_string") {
-		t.Fatalf("new_string must not be in Required, got %v", info.Required)
+	if !containsString(info.Required, "new_string") {
+		t.Fatalf("new_string must be in Required, got %v", info.Required)
+	}
+}
+
+func TestFileEdit_MissingNewStringRejectedWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("keep me"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&FileEditTool{}).Run(
+		editCtx(path),
+		`{"path":"`+path+`","old_string":"keep me","description":"replace text"}`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.HasPrefix(result.Content, "[validation error]") {
+		t.Fatalf("missing new_string must be a validation error, got %q", result.Content)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "keep me" {
+		t.Fatalf("missing new_string mutated file to %q", string(data))
 	}
 }
 
@@ -145,9 +171,9 @@ func TestRetract_MissingIDGuidance(t *testing.T) {
 	}
 }
 
-// Fix 5: file_read without a description succeeds on a real file — description
-// is no longer a hard requirement for read-only high-frequency tools.
-func TestFileRead_NoDescriptionSucceeds(t *testing.T) {
+// A read can still require approval for sensitive or out-of-scope paths, so a
+// missing description must fail before the approval card is rendered.
+func TestFileRead_NoDescriptionRejected(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.txt")
 	if err := os.WriteFile(path, []byte("hello\nworld\n"), 0644); err != nil {
@@ -159,22 +185,18 @@ func TestFileRead_NoDescriptionSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.IsError {
-		t.Fatalf("file_read without description should succeed, got error: %s", result.Content)
-	}
-	if !strings.Contains(result.Content, "hello") {
-		t.Fatalf("expected file contents, got: %s", result.Content)
+	if !result.IsError || !strings.HasPrefix(result.Content, "[validation error]") {
+		t.Fatalf("file_read without description should fail validation, got: %s", result.Content)
 	}
 }
 
-// Fix 5: the four read-only high-frequency tools must not require description.
-func TestReadOnlyTools_DescriptionNotRequired(t *testing.T) {
+func TestReadOnlyTools_DescriptionRequiredForPossibleApproval(t *testing.T) {
 	for _, tool := range []agent.Tool{
 		&FileReadTool{}, &GrepTool{}, &GlobTool{}, &DirectoryListTool{},
 	} {
 		info := tool.Info()
-		if containsString(info.Required, "description") {
-			t.Errorf("%s: description must not be Required, got %v", info.Name, info.Required)
+		if !containsString(info.Required, "description") {
+			t.Errorf("%s: description must be Required, got %v", info.Name, info.Required)
 		}
 	}
 }

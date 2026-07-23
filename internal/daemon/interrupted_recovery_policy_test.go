@@ -21,21 +21,23 @@ func TestInterruptedRecoveryHandler_IsUnattended(t *testing.T) {
 func TestInterruptedRecovery_StaleCandidateFiltering(t *testing.T) {
 	now := time.Now()
 	cases := []struct {
-		name      string
-		updatedAt time.Time
-		maxAge    time.Duration
-		want      bool
+		name             string
+		stateUpdatedAt   time.Time
+		sessionUpdatedAt time.Time
+		maxAge           time.Duration
+		want             bool
 	}{
-		{"fresh candidate resumes", now.Add(-30 * time.Minute), 4 * time.Hour, false},
-		{"months-old candidate is stale", now.Add(-97 * 24 * time.Hour), 4 * time.Hour, true},
-		{"just past cutoff is stale", now.Add(-5 * time.Hour), 4 * time.Hour, true},
-		{"zero UpdatedAt is stale", time.Time{}, 4 * time.Hour, true},
+		{"fresh checkpoint resumes", now.Add(-30 * time.Minute), now, 4 * time.Hour, false},
+		{"old checkpoint stays stale after a recent attempt save", now.Add(-97 * 24 * time.Hour), now, 4 * time.Hour, true},
+		{"just past cutoff is stale", now.Add(-5 * time.Hour), now.Add(-5 * time.Hour), 4 * time.Hour, true},
+		{"legacy session timestamp is the fallback", time.Time{}, now.Add(-30 * time.Minute), 4 * time.Hour, false},
+		{"zero timestamps are stale", time.Time{}, time.Time{}, 4 * time.Hour, true},
 	}
 	for _, tc := range cases {
 		got := isStaleInterruptedTurn(interruptedTurnCandidate{
 			SessionID: "s",
-			State:     session.InterruptedTurn{UpdatedAt: tc.updatedAt},
-			UpdatedAt: tc.updatedAt,
+			State:     session.InterruptedTurn{UpdatedAt: tc.stateUpdatedAt},
+			UpdatedAt: tc.sessionUpdatedAt,
 		}, tc.maxAge, now)
 		if got != tc.want {
 			t.Errorf("%s: isStaleInterruptedTurn = %v, want %v", tc.name, got, tc.want)
@@ -65,7 +67,7 @@ func TestInterruptedResumeRequest_LocksOriginalRouteKey(t *testing.T) {
 			RouteKey: "default:slack:171234.5678",
 		},
 	}
-	req := buildInterruptedResumeRequest(imCandidate, 1)
+	req := buildInterruptedResumeRequest(imCandidate, 3, 4*time.Hour)
 	if got := ComputeRouteKey(req); got != "default:slack:171234.5678" {
 		t.Fatalf("IM-origin resume locks %q, want the original route key %q", got, "default:slack:171234.5678")
 	}
@@ -74,7 +76,7 @@ func TestInterruptedResumeRequest_LocksOriginalRouteKey(t *testing.T) {
 		SessionID: "2026-07-23-def",
 		State:     session.InterruptedTurn{Source: "desktop"},
 	}
-	req = buildInterruptedResumeRequest(desktopCandidate, 1)
+	req = buildInterruptedResumeRequest(desktopCandidate, 3, 4*time.Hour)
 	if got := ComputeRouteKey(req); got != "session:2026-07-23-def" {
 		t.Fatalf("desktop-origin resume locks %q, want session:2026-07-23-def", got)
 	}

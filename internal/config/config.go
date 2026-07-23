@@ -445,6 +445,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.stream_idle_timeout_secs", 90) // per-chunk gap watchdog inside CompleteStream. 0 disables (legacy scanner path).
 	viper.SetDefault("agent.interrupted_resume_max_attempts", 3)
 	viper.SetDefault("agent.interrupted_resume_max_age_hours", 4) // staleness window for auto-resume; see Config.Agent.InterruptedResumeMaxAgeHours
+	viper.SetDefault("agent.interrupted_resume_enabled", true)
 	viper.SetDefault("agent.bash_concurrency_enabled", true) // Phase C: Desktop now consumes tool_use_id on tool_status events, safe to enable concurrent bash batches by default.
 	// Time-based microcompact. Disabled by default — short sessions never
 	// compact, and only sessions that idle past the gap threshold will
@@ -873,37 +874,38 @@ type overlayToolsConfig struct {
 // buildDefaultSources returns source entries for all config keys set to "default".
 func buildDefaultSources() map[string]ConfigSource {
 	return map[string]ConfigSource{
-		"endpoint":                              {Level: "default"},
-		"api_key":                               {Level: "default"},
-		"model_tier":                            {Level: "default"},
-		"auto_update_check":                     {Level: "default"},
-		"agent.max_iterations":                  {Level: "default"},
-		"agent.temperature":                     {Level: "default"},
-		"agent.max_tokens":                      {Level: "default"},
-		"agent.thinking":                        {Level: "default"},
-		"agent.thinking_mode":                   {Level: "default"},
-		"agent.thinking_budget":                 {Level: "default"},
-		"agent.force_think_tool":                {Level: "default"},
-		"agent.reasoning_effort":                {Level: "default"},
-		"agent.effort_tier":                     {Level: "default"},
-		"agent.model":                           {Level: "default"},
-		"agent.context_window":                  {Level: "default"},
-		"agent.observation_window":              {Level: "default"},
-		"agent.max_recent_images":               {Level: "default"},
-		"agent.max_recent_browser_images":       {Level: "default"},
-		"agent.idle_soft_timeout_secs":          {Level: "default"},
-		"agent.idle_hard_timeout_secs":          {Level: "default"},
-		"agent.stream_idle_timeout_secs":        {Level: "default"},
-		"agent.interrupted_resume_max_attempts": {Level: "default"},
+		"endpoint":                               {Level: "default"},
+		"api_key":                                {Level: "default"},
+		"model_tier":                             {Level: "default"},
+		"auto_update_check":                      {Level: "default"},
+		"agent.max_iterations":                   {Level: "default"},
+		"agent.temperature":                      {Level: "default"},
+		"agent.max_tokens":                       {Level: "default"},
+		"agent.thinking":                         {Level: "default"},
+		"agent.thinking_mode":                    {Level: "default"},
+		"agent.thinking_budget":                  {Level: "default"},
+		"agent.force_think_tool":                 {Level: "default"},
+		"agent.reasoning_effort":                 {Level: "default"},
+		"agent.effort_tier":                      {Level: "default"},
+		"agent.model":                            {Level: "default"},
+		"agent.context_window":                   {Level: "default"},
+		"agent.observation_window":               {Level: "default"},
+		"agent.max_recent_images":                {Level: "default"},
+		"agent.max_recent_browser_images":        {Level: "default"},
+		"agent.idle_soft_timeout_secs":           {Level: "default"},
+		"agent.idle_hard_timeout_secs":           {Level: "default"},
+		"agent.stream_idle_timeout_secs":         {Level: "default"},
+		"agent.interrupted_resume_max_attempts":  {Level: "default"},
 		"agent.interrupted_resume_max_age_hours": {Level: "default"},
-		"agent.bash_concurrency_enabled":        {Level: "default"},
-		"tools.bash_timeout":                    {Level: "default"},
-		"tools.bash_max_timeout":                {Level: "default"},
-		"tools.bash_max_output":                 {Level: "default"},
-		"tools.result_truncation":               {Level: "default"},
-		"tools.browser_result_truncation":       {Level: "default"},
-		"tools.args_truncation":                 {Level: "default"},
-		"tools.server_tool_timeout":             {Level: "default"},
+		"agent.interrupted_resume_enabled":       {Level: "default"},
+		"agent.bash_concurrency_enabled":         {Level: "default"},
+		"tools.bash_timeout":                     {Level: "default"},
+		"tools.bash_max_timeout":                 {Level: "default"},
+		"tools.bash_max_output":                  {Level: "default"},
+		"tools.result_truncation":                {Level: "default"},
+		"tools.browser_result_truncation":        {Level: "default"},
+		"tools.args_truncation":                  {Level: "default"},
+		"tools.server_tool_timeout":              {Level: "default"},
 	}
 }
 
@@ -979,6 +981,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.interrupted_resume_max_age_hours") {
 		cfg.Sources["agent.interrupted_resume_max_age_hours"] = src
+	}
+	if viper.IsSet("agent.interrupted_resume_enabled") {
+		cfg.Sources["agent.interrupted_resume_enabled"] = src
 	}
 	if viper.IsSet("agent.bash_concurrency_enabled") {
 		cfg.Sources["agent.bash_concurrency_enabled"] = src

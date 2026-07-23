@@ -720,8 +720,24 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 }
 
 func (s *Store) Save(sess *Session) error {
-	sess.UpdatedAt = s.nextUpdatedAt()
+	return s.save(sess, true)
+}
+
+// SavePreservingUpdatedAt writes the complete session and marker state without
+// changing list recency. It is reserved for daemon recovery-policy cleanup
+// (stale/exhausted checkpoint abandonment), not active turn persistence.
+func (s *Store) SavePreservingUpdatedAt(sess *Session) error {
+	return s.save(sess, false)
+}
+
+func (s *Store) save(sess *Session, touchUpdatedAt bool) error {
+	if touchUpdatedAt {
+		sess.UpdatedAt = s.nextUpdatedAt()
+	}
 	if sess.CreatedAt.IsZero() {
+		if sess.UpdatedAt.IsZero() {
+			sess.UpdatedAt = s.nextUpdatedAt()
+		}
 		sess.CreatedAt = sess.UpdatedAt
 	}
 	if sess.SchemaVersion == 0 {

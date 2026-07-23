@@ -111,10 +111,10 @@ Emits once per `OnUsage` boundary (typically once per LLM call, not per token). 
 | `context_bloat` | Tool-result content has dominated context; an inline nudge was added asking the model to summarize or stop. |
 | `context_window_autodetect` | The configured context window was overridden after the provider's `response.model` revealed a different family (e.g. 200K → 1M). |
 | `compaction_failed` | A compaction attempt failed; detail encodes the phase tag. |
-| `interrupted_turn_resuming` | Startup recovery claimed a session with a durable mid-turn checkpoint and is continuing it from saved tool results. |
+| `interrupted_turn_resuming` | Startup recovery discovered a durable mid-turn checkpoint and is waiting to validate it under the session route lock. The model is called only after that atomic claim succeeds. |
 | `interrupted_turn_resumed` | The checkpointed turn completed successfully after restart. |
-| `interrupted_turn_resume_failed` | A recovery attempt failed. The durable marker remains eligible for a later daemon restart. |
-| `interrupted_turn_abandoned` | Startup recovery reached `agent.interrupted_resume_max_attempts`; the daemon cleared the durable marker instead of spending another LLM call. The partial checkpoint remains in session history. |
+| `interrupted_turn_resume_failed` | A recovery attempt failed. Below the configured attempt limit, the durable marker remains eligible for a later daemon restart. |
+| `interrupted_turn_abandoned` | Recovery did not call the model because the checkpoint was stale, exhausted its attempt limit, or was completed/replaced by foreground work before the route lock was acquired. Stale/exhausted markers are cleared; superseded state is left as written by the foreground turn. |
 | `interrupted_turn_delivery_failed` | Recovery completed, but proactive delivery to the saved Cloud route failed. The completed reply remains in session history. |
 
 ### `cloud_agent` / `cloud_progress` / `cloud_plan`

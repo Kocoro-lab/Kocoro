@@ -37,13 +37,17 @@ func (t *FileEditTool) Info() agent.ToolInfo {
 				"replace_all": map[string]any{"type": "boolean", "description": "When true, replace every occurrence of old_string. When false (default), old_string must appear exactly once. Use replace_all only when the target is unambiguous globally (variable rename, refactor)."},
 			},
 		},
-		// new_string is intentionally NOT required: JSON cannot distinguish a
-		// missing field from "", and "" is a legal deletion request.
-		Required: []string{"path", "old_string", "description"},
+		Required: []string{"path", "old_string", "new_string", "description"},
 	}
 }
 
 func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	// Presence validation distinguishes an omitted new_string from an explicit
+	// empty string. The latter is a valid deletion request; the former must
+	// fail before any file mutation.
+	if result, valid := agent.ValidateToolArgumentPresence(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	var args fileEditArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
@@ -53,7 +57,8 @@ func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	}
 	// Reject only the empty string, not whitespace-only: a whitespace-only
 	// old_string (e.g. "\n\n") is legitimate content, such as collapsing blank
-	// lines. new_string is not checked at all — "" is a valid deletion request.
+	// lines. new_string was presence-checked above but is not zero-checked —
+	// "" is a valid deletion request.
 	if args.OldString == "" {
 		return agent.ValidationError("file_edit: missing required `old_string` parameter"), nil
 	}

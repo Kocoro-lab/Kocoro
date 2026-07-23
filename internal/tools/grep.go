@@ -81,9 +81,7 @@ func (t *GrepTool) Info() agent.ToolInfo {
 				"multiline":      map[string]any{"type": "boolean", "description": "Allow multiline regex matching. Requires rg."},
 			},
 		},
-		// description is deliberately NOT required: it feeds approval cards, but
-		// this read-only, high-frequency tool never shows one. See file_read.
-		Required: []string{"pattern"},
+		Required: []string{"pattern", "description"},
 	}
 }
 
@@ -94,6 +92,9 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	}
 	if strings.TrimSpace(args.Pattern) == "" {
 		return agent.ValidationError("grep: missing required `pattern` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("grep: missing required `description` parameter"), nil
 	}
 
 	path := args.Path

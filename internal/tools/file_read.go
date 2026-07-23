@@ -112,11 +112,7 @@ func (t *FileReadTool) Info() agent.ToolInfo {
 				},
 			},
 		},
-		// description is deliberately NOT required: it feeds approval cards, but
-		// this read-only, high-frequency tool never shows one. Hard-requiring it
-		// let a chronic omission trip the loop detector's 3×[validation error]
-		// force-stop.
-		Required: []string{"path"},
+		Required: []string{"path", "description"},
 	}
 }
 
@@ -127,6 +123,9 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	}
 	if strings.TrimSpace(args.Path) == "" {
 		return agent.ValidationError("file_read: missing required `path` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("file_read: missing required `description` parameter"), nil
 	}
 	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
 	if resolveErr != nil {

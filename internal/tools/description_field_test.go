@@ -40,15 +40,6 @@ func TestApprovalToolsRequireDescription(t *testing.T) {
 		"bash": "PR 4 wrote a bespoke schema before the helper existed; changing it would invalidate prompt cache.",
 		"computer": "Registered as an Anthropic native tool (NativeToolDef); agent.buildToolSchema drops Parameters/Description from the wire. " +
 			"A `description` field in Info().Parameters would never reach the model. UI clients must synthesize a label from action/x/y.",
-		// Read-only, high-frequency tools: RequiresApproval() is nominally true
-		// but the permission engine auto-approves reads, so they never render an
-		// approval card. Hard-requiring description let a chronic omission trip
-		// the loop detector's 3×[validation error] force-stop. The property stays
-		// in the schema (optional); it is simply not in Required.
-		"file_read":      "read-only; never shows an approval card. description stays optional.",
-		"grep":           "read-only; never shows an approval card. description stays optional.",
-		"glob":           "read-only; never shows an approval card. description stays optional.",
-		"directory_list": "read-only; never shows an approval card. description stays optional.",
 	}
 
 	reg, _, cleanup := RegisterLocalTools(&config.Config{}, nil)
