@@ -41,6 +41,27 @@ func TestToolLoopBudgetContinuationAndClosure(t *testing.T) {
 	}
 }
 
+func TestToolLoopFinalVoiceControlBypassesActionBudgetAndClosesTurn(t *testing.T) {
+	loop := newToolLoopLedger()
+	loop.noteUserCommit(1)
+	loop.bindResponse("response", responsePurposeUser, 1)
+	for i := 0; i < maxTurnTaskActions; i++ {
+		callID := "call-" + string(rune('a'+i))
+		if claim := loop.claimAction("response", callID, "get_status", nil); !claim.allowed {
+			t.Fatalf("setup action %d denied: %+v", i, claim)
+		}
+	}
+	if claim := loop.claimAction("response", "end", "end_call", nil); !claim.allowed {
+		t.Fatalf("end_call must bypass the ordinary action budget: %+v", claim)
+	}
+	if decision, _ := loop.finishResponse("response"); decision != toolLoopNone {
+		t.Fatalf("final voice control scheduled continuation decision=%v", decision)
+	}
+	if claim := loop.claimAction("response", "late", "do_task", nil); claim.allowed || claim.reason != "turn_preempted" {
+		t.Fatalf("turn stayed open after final voice control: %+v", claim)
+	}
+}
+
 func TestFinishToolLoopResponsePinsSpecialResponseLanguage(t *testing.T) {
 	newHandler := func() *eventHandler {
 		h := newEventHandler(nil, nil, nil, func(any) error { return nil })

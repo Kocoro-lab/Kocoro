@@ -82,13 +82,90 @@ func TestNativeFloorResponseHasOnlyNarrowRequiredTools(t *testing.T) {
 	if decoded.Response.ToolChoice != "required" || decoded.Response.ParallelToolCalls {
 		t.Fatalf("floor response policy = choice %q parallel %v", decoded.Response.ToolChoice, decoded.Response.ParallelToolCalls)
 	}
-	if len(decoded.Response.Tools) != 2 || decoded.Response.Tools[0].Name != "resume_playback" || decoded.Response.Tools[1].Name != "accept_turn" {
-		t.Fatalf("floor tools = %+v, want only resume_playback and accept_turn", decoded.Response.Tools)
+	wantTools := []string{"resume_playback", "stop_speaking", "accept_turn", "end_call"}
+	if len(decoded.Response.Tools) != len(wantTools) {
+		t.Fatalf("floor tools = %+v, want exactly %v", decoded.Response.Tools, wantTools)
 	}
-	for _, example := range []string{"mm-hmm", "嗯嗯", "うん"} {
+	for i, want := range wantTools {
+		if decoded.Response.Tools[i].Name != want {
+			t.Fatalf("floor tool[%d] = %q, want %q; tools=%+v", i, decoded.Response.Tools[i].Name, want, decoded.Response.Tools)
+		}
+	}
+	for _, example := range []string{"mm-hmm", "嗯嗯", "うん", "退出吧", "停一下"} {
 		if !strings.Contains(nativeFloorInstructions, example) {
 			t.Fatalf("native floor instructions lost explicit backchannel example %q", example)
 		}
+	}
+}
+
+func TestNativeFloorEndCallTerminatesWithoutAcceptedTurnResponse(t *testing.T) {
+	enableNativeFloorForTest(t)
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-floor-end", ""), audio, cap.send)
+	h.fullDuplexAEC = true
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"source-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	audio.Play(make([]int16, audioFrameSize))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	judge := <-h.loopRespReq
+	h.setPendingResponse(judge)
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"judge-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"judge-1","call_id":"floor-end","name":"end_call","arguments":"{}"}`))
+
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("floor end_call did not terminate the voice call")
+	}
+	if got := len(h.loopRespReq); got != 0 {
+		t.Fatalf("floor end_call queued %d accepted-turn responses, want none", got)
+	}
+	if audio.PlaybackPaused() || len(audio.playBuf) != 0 {
+		t.Fatalf("floor end_call left playback paused=%v queued=%d", audio.PlaybackPaused(), len(audio.playBuf))
+	}
+}
+
+func TestNativeFloorStopSpeakingDiscardsPlaybackButKeepsCallActive(t *testing.T) {
+	enableNativeFloorForTest(t)
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-floor-stop", ""), audio, cap.send)
+	h.fullDuplexAEC = true
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"source-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	audio.Play(make([]int16, audioFrameSize))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	judge := <-h.loopRespReq
+	h.setPendingResponse(judge)
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"judge-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"judge-1","call_id":"floor-stop","name":"stop_speaking","arguments":"{}"}`))
+
+	select {
+	case <-ended:
+		t.Fatal("stop_speaking must not end the voice call")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := len(h.loopRespReq); got != 0 {
+		t.Fatalf("stop_speaking queued %d follow-up responses, want none", got)
+	}
+	if audio.PlaybackPaused() || audio.dropCapture() || len(audio.playBuf) != 0 {
+		t.Fatalf("stop_speaking state paused=%v speaking=%v queued=%d, want listening with empty playback",
+			audio.PlaybackPaused(), audio.dropCapture(), len(audio.playBuf))
 	}
 }
 
@@ -226,6 +303,31 @@ func TestNativeFloorResumeAfterServerClearFinishesBySpeech(t *testing.T) {
 	}
 	if cap.countType("conversation.item.truncate") != 0 {
 		t.Fatalf("server already truncated; no local truncate expected, frames = %v", cap.types())
+	}
+}
+
+func TestNativeFloorServerClearCancelsDeadSourceToUnblockJudge(t *testing.T) {
+	enableNativeFloorForTest(t)
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-floor-unblock", ""), audio, cap.send)
+	h.fullDuplexAEC = true
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"source-1"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	<-h.loopRespReq
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.cleared"}`))
+
+	if got := cap.countType("response.cancel"); got != 1 {
+		t.Fatalf("server-cleared source response.cancel count=%d, want 1 to free the floor judge slot; frames=%v", got, cap.types())
+	}
+	if !h.floor.holdsPlayback() {
+		t.Fatal("cancelling the dead source must keep the floor decision pending")
 	}
 }
 

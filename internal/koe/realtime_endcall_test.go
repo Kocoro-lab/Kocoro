@@ -177,3 +177,54 @@ func TestEndCallToolNilHookIsSafe(t *testing.T) {
 	})
 	h.handleEvent(context.Background(), ev) // must not panic
 }
+
+func TestEndCallIsTerminalAndIdempotentInsideRealtimeHandler(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-end-terminal", ""), nil, func(any) error { return nil })
+	ended := make(chan struct{}, 2)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleFunctionCall(context.Background(), "end-1", "end_call", nil)
+	h.handleFunctionCall(context.Background(), "end-2", "end_call", nil)
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first end_call did not invoke onEndCall")
+	}
+	select {
+	case <-ended:
+		t.Fatal("duplicate end_call invoked onEndCall twice")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	h.queueAcceptedNativeTurn(1)
+	h.requestResponse()
+	if got := len(h.loopRespReq) + len(h.respReq); got != 0 {
+		t.Fatalf("terminal handler accepted %d new response requests", got)
+	}
+}
+
+func TestStopSpeakingEndsOnlyTheCurrentTurnWithoutContinuation(t *testing.T) {
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-stop-speaking", ""), nil, cap.send)
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"stop-response"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"stop-response","call_id":"stop-1","name":"stop_speaking","arguments":"{}"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"stop-response","status":"cancelled"}}`))
+
+	select {
+	case <-ended:
+		t.Fatal("stop_speaking ended the voice call")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := cap.countType("response.cancel"); got != 1 {
+		t.Fatalf("stop_speaking response.cancel count=%d, want 1", got)
+	}
+	if got := len(h.loopRespReq) + len(h.respReq); got != 0 {
+		t.Fatalf("stop_speaking queued %d acknowledgement/continuation responses", got)
+	}
+	if h.ending.Load() {
+		t.Fatal("stop_speaking entered the call terminal state")
+	}
+}

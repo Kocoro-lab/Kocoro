@@ -303,7 +303,7 @@ func TestKoePersonaPinsCurrentUtteranceLanguage(t *testing.T) {
 // it verbally acknowledged "闭嘴" instead). It must name end_call, give concrete
 // dismiss words, the double-tap re-activation, and separate it from cancel.
 func TestKoePersonaTeachesEndCallOnDismiss(t *testing.T) {
-	for _, want := range []string{"end_call", "闭嘴", "double-tapping the", "NOT cancel"} {
+	for _, want := range []string{"end_call", "退出吧", "stop_speaking", "keeps the voice call active", "double-tapping the", "NOT cancel"} {
 		if !strings.Contains(koePersona, want) {
 			t.Errorf("koePersona missing dismiss/end_call guidance %q", want)
 		}

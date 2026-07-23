@@ -406,6 +406,29 @@ func TestResultDeliveryHeldDoneCompletesOnlyAfterFloorResume(t *testing.T) {
 	}
 }
 
+func TestResultDeliveryHeldDoneIsDismissedByStopSpeaking(t *testing.T) {
+	m := NewResultMailbox()
+	h := newEventHandlerWithMailbox(nil, nil, nil, func(any) error { return nil }, m, nil)
+	m.Enqueue(SayResult{TaskID: "task-a", Status: "ok", Reply: "Done."}, false)
+	if got := len(m.claim(h.resultOwner)); got != 1 {
+		t.Fatalf("claimed result count=%d, want 1", got)
+	}
+	h.beginResultBatch()
+	h.bindResultBatch("result-response")
+	if !h.floor.begin("result-response") || !h.floor.noteUserCommit(1) {
+		t.Fatal("failed to establish held result response")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"result-response","status":"cancelled"}}`))
+	if got := m.pending(); got != 1 {
+		t.Fatalf("held result left mailbox before floor decision: pending=%d", got)
+	}
+	h.applyNativeFloorDecision(floorDecisionStop)
+	if got := m.pending(); got != 0 {
+		t.Fatalf("stop_speaking left the dismissed result queued for reannouncement: pending=%d", got)
+	}
+}
+
 func TestDoTaskResultUsesMailboxAfterUserMovesOn(t *testing.T) {
 	release := make(chan struct{})
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

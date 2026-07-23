@@ -38,6 +38,10 @@ type eventHandler struct {
 	// path wires it to a goodbye earcon + process exit; nil only in unit tests, where
 	// end_call is a no-op.
 	onEndCall func()
+	// ending is the local call-lifecycle terminal. The first accepted end_call owns
+	// teardown; every duplicate control event and every later response request is
+	// ignored before the outer Desktop callActive guard closes the connection.
+	ending atomic.Bool
 	// curState holds the last emitted voice state (string) so the D3w level pump
 	// knows whether to report input (listening) or output (speaking) RMS.
 	curState atomic.Value
@@ -639,6 +643,9 @@ func (h *eventHandler) requestResponseForSpeech(text string) {
 }
 
 func (h *eventHandler) requestResponseWith(req responseCreateRequest) {
+	if h == nil || h.ending.Load() {
+		return
+	}
 	select {
 	case h.respReq <- req:
 	default: // queue saturated (a request flood) — drop rather than block the loop
@@ -678,6 +685,9 @@ func (h *eventHandler) runResponseSender(ctx context.Context) {
 }
 
 func (h *eventHandler) sendQueuedResponse(ctx context.Context, req responseCreateRequest) {
+	if h.ending.Load() {
+		return
+	}
 	if h.sendResponseCreate(ctx, req) || req.purpose != responsePurposeFloor {
 		return
 	}
@@ -685,6 +695,9 @@ func (h *eventHandler) sendQueuedResponse(ctx context.Context, req responseCreat
 }
 
 func (h *eventHandler) queueLoopResponse(req responseCreateRequest) {
+	if h == nil || h.ending.Load() {
+		return
+	}
 	select {
 	case h.loopRespReq <- req:
 		return
@@ -735,6 +748,9 @@ func (h *eventHandler) dropQueuedFloor(turnID int64) {
 
 func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreateRequest) bool {
 	for attempt := 0; attempt <= maxResponseCreateRetries; attempt++ {
+		if h.ending.Load() {
+			return false
+		}
 		if req.dropIfPreempted && !h.toolLoop.isCurrent(req.turnID) {
 			return false
 		}
@@ -896,6 +912,9 @@ func (h *eventHandler) activeResponseID() string {
 const resultVoicePollInterval = 20 * time.Millisecond
 
 func (h *eventHandler) sendResultBatch(ctx context.Context) {
+	if h.ending.Load() {
+		return
+	}
 	if !h.waitResultVoiceGap(ctx) {
 		return
 	}
@@ -1025,6 +1044,23 @@ func (h *eventHandler) releaseResultBatch(wake bool) {
 	h.resultBatchMu.Unlock()
 	if h.resultMailbox.release(h.resultOwner) > 0 && wake {
 		h.resultMailbox.Wake()
+	}
+}
+
+// dismissResultBatch acknowledges an in-progress result announcement without
+// retrying it. An explicit stop_speaking means the user heard enough and asked
+// for silence; putting the result back in the mailbox would make Koe start the
+// same announcement again on a later wake.
+func (h *eventHandler) dismissResultBatch() {
+	h.resultBatchMu.Lock()
+	if !h.resultBatch.active {
+		h.resultBatchMu.Unlock()
+		return
+	}
+	h.resultBatch = resultBatchState{}
+	h.resultBatchMu.Unlock()
+	if removed := h.resultMailbox.complete(h.resultOwner); removed > 0 && eventLogEnabled() {
+		log.Printf("koe[result]: dismissed count=%d by stop_speaking", removed)
 	}
 }
 
@@ -1177,27 +1213,42 @@ func (h *eventHandler) applyNativeFloorDecision(decision floorDecision) {
 		if eventLogEnabled() {
 			log.Printf("koe[floor]: playback resumed")
 		}
+	case floorDecisionStop:
+		h.dismissResultBatch()
+		h.discardNativeFloorPlayback(false, "listening")
+		if eventLogEnabled() {
+			log.Printf("koe[floor]: playback discarded; call remains active")
+		}
 	case floorDecisionAccept:
-		h.speakingEpoch.Add(1)
-		h.outputBufferActive.Store(false)
-		if h.audio != nil {
-			h.audio.SetPlaybackPaused(false)
-			h.audio.SetSpeaking(false)
-			h.audio.SetPlaybackEnabled(false)
-		}
-		if !h.floorServerCleared.Swap(false) {
-			// When the server already cleared and truncated on speech_started,
-			// a second truncate would cut past the shorter server-side item.
-			h.truncateHeldSpeech()
-		}
-		_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
-		h.releaseResultBatch(true)
-		h.maybeRestoreUserMic()
-		h.emitVoiceState("thinking")
+		h.discardNativeFloorPlayback(true, "thinking")
 		if eventLogEnabled() {
 			log.Printf("koe[floor]: playback discarded; accepted user turn")
 		}
+	case floorDecisionEnd:
+		h.discardNativeFloorPlayback(false, "idle")
+		if eventLogEnabled() {
+			log.Printf("koe[floor]: playback discarded; ending voice call")
+		}
 	}
+}
+
+func (h *eventHandler) discardNativeFloorPlayback(wakeResults bool, voiceState string) {
+	h.speakingEpoch.Add(1)
+	h.outputBufferActive.Store(false)
+	if h.audio != nil {
+		h.audio.SetPlaybackPaused(false)
+		h.audio.SetSpeaking(false)
+		h.audio.SetPlaybackEnabled(false)
+	}
+	if !h.floorServerCleared.Swap(false) {
+		// When the server already cleared and truncated on speech_started,
+		// a second truncate would cut past the shorter server-side item.
+		h.truncateHeldSpeech()
+	}
+	_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
+	h.releaseResultBatch(wakeResults)
+	h.maybeRestoreUserMic()
+	h.emitVoiceState(voiceState)
 }
 
 const floorContinueInstructions = "Your previous spoken reply was cut off mid-sentence; the conversation history contains exactly what was already said aloud. In the same language, briefly continue and finish that reply from where it stopped. Do not repeat what was already said, do not mention any interruption, and do not call tools."
@@ -1304,8 +1355,18 @@ func (h *eventHandler) handleNativeFloorTool(responseID, callID, name string) bo
 		}))
 		return true
 	}
+	if claim.decision == floorDecisionEnd {
+		// Teardown is the function result. Do not inject an output or queue the
+		// ordinary accepted-turn response: either would race a terminal call.
+		h.applyNativeFloorDecision(claim.decision)
+		h.requestEndCall(callID)
+		return true
+	}
 	status := "resumed"
-	if claim.decision == floorDecisionAccept {
+	switch claim.decision {
+	case floorDecisionStop:
+		status = "stopped"
+	case floorDecisionAccept:
 		status = "accepted"
 	}
 	h.sendFunctionOutput(callID, mustJSON(map[string]any{"status": status}))
@@ -1565,6 +1626,12 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// The user finished talking. create_response=true lets the server start the
 		// spoken response automatically.
 	case "input_audio_buffer.committed":
+		if h.ending.Load() {
+			if eventLogEnabled() {
+				log.Printf("koe[call]: ignored committed turn after end_call")
+			}
+			break
+		}
 		turnID := h.inputCommitSeq.Add(1)
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: endpoint_committed turn=%d after_speech_stop_ms=%d configured_silence_ms=%d", turnID, elapsedMS(h.speechStoppedAt, time.Now()), koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS))
@@ -1720,11 +1787,20 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// on speech_started EVEN with interrupt_response=false (observed live
 		// 2026-07-22). During a floor hold this means the un-sent audio tail is
 		// gone for good: a later "resume" cannot replay it, so record the clear
-		// and let the resume path finish the reply by generation instead.
+		// and let the resume path finish the reply by generation instead. Cancel
+		// that now-dead source response as soon as the first clear arrives: Realtime
+		// permits only one active response, so leaving it generating can strand the
+		// floor judge behind it until the resolve timeout.
 		if h.floor.holdsPlayback() {
-			h.floorServerCleared.Store(true)
+			firstClear := !h.floorServerCleared.Swap(true)
 			if eventLogEnabled() {
 				log.Printf("koe[floor]: server cleared output during hold; resume will finish by speech")
+			}
+			if firstClear && h.respBusy.Load() {
+				_ = h.sendFn(map[string]any{"type": "response.cancel"})
+				if eventLogEnabled() {
+					log.Printf("koe[floor]: cancelled dead source response to unblock judge")
+				}
 			}
 		}
 	case "output_audio_buffer.stopped":
@@ -1755,7 +1831,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// back in the mailbox so the next quiet boundary or connection can retry.
 		delivered := ev.Response.Status == "" || ev.Response.Status == "completed"
 		sourceHeld := h.floor.holdsSource(ev.Response.ID)
-		if sourceHeld && delivered {
+		if sourceHeld {
 			h.deferResultBatchDone(ev.Response.ID, delivered)
 		} else {
 			h.finishResultBatch(ev.Response.ID, delivered)
@@ -1860,6 +1936,40 @@ func shouldVoiceDoTaskResult(r SayResult, userSpokeSinceLastDoTask bool) bool {
 		return false
 	}
 	return !userSpokeSinceLastDoTask
+}
+
+func (h *eventHandler) requestEndCall(callID string) bool {
+	if h == nil || h.onEndCall == nil {
+		return false
+	}
+	if !h.ending.CompareAndSwap(false, true) {
+		if eventLogEnabled() {
+			log.Printf("koe[call]: duplicate end_call ignored call_id=%q", callID)
+		}
+		return false
+	}
+	if eventLogEnabled() {
+		log.Printf("koe[call]: end_call requested call_id=%q", callID)
+	}
+	// End is a local terminal before the outer Desktop closure runs. Abort any
+	// held floor state and stop all active output synchronously so no queued
+	// continuation can speak during the teardown race.
+	h.floor.abort()
+	h.interruptOutput()
+	go h.onEndCall()
+	return true
+}
+
+func (h *eventHandler) requestStopSpeaking(callID string) {
+	if h == nil || h.ending.Load() {
+		return
+	}
+	if eventLogEnabled() {
+		log.Printf("koe[call]: stop_speaking requested call_id=%q", callID)
+	}
+	h.floor.abort()
+	h.dismissResultBatch()
+	h.interruptOutput()
 }
 
 // handleFunctionCall composes do_task synchronously (C-minimal) or routes the
@@ -1997,18 +2107,16 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 		}()
 		return
 	}
+	if name == "stop_speaking" {
+		// Silence is the complete response. Do not send a function output or let the
+		// generic tool continuation speak an acknowledgement.
+		h.requestStopSpeaking(callID)
+		return
+	}
 	if name == "end_call" {
-		// Dismiss / hang up. Do NOT send a function_call_output or a spoken reply: the
-		// teardown closes the session, and the goodbye earcon (played inside onEndCall)
-		// is the only feedback. Run in a goroutine — onEndCall closes THIS connection,
-		// and the event loop calling it must not block on its own teardown.
-		if eventLogEnabled() {
-			log.Printf("koe[call]: end_call requested call_id=%q", callID)
-		}
-		if h.onEndCall != nil {
-			h.interruptOutput()
-			go h.onEndCall()
-		}
+		// Teardown is the complete response. requestEndCall owns idempotency and
+		// suppresses all later response requests before the connection closes.
+		h.requestEndCall(callID)
 		return
 	}
 	// Fast tools (cancel/get_status/control_app/switch_agent).

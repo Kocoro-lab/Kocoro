@@ -22,13 +22,13 @@ func TestToolDefsShape(t *testing.T) {
 			t.Errorf("tool %q type = %q, want function", d.Name, d.Type)
 		}
 	}
-	for _, want := range []string{"do_task", "cancel", "get_status", "control_app", "switch_agent", "end_call"} {
+	for _, want := range []string{"do_task", "cancel", "get_status", "control_app", "switch_agent", "stop_speaking", "end_call"} {
 		if !names[want] {
 			t.Errorf("missing tool %q", want)
 		}
 	}
-	if len(defs) != 6 {
-		t.Errorf("got %d tools, want exactly 6", len(defs))
+	if len(defs) != 7 {
+		t.Errorf("got %d tools, want exactly 7", len(defs))
 	}
 }
 
@@ -46,9 +46,31 @@ func TestEndCallDescriptionSignalsDismissIntent(t *testing.T) {
 	if desc == "" {
 		t.Fatal("end_call tool missing")
 	}
-	for _, want := range []string{"闭嘴", "goodbye", "double-tap the Option", "Say NOTHING", "cancel", "unsure"} {
+	for _, want := range []string{"退出吧", "goodbye", "double-tap the Option", "Say NOTHING", "cancel", "stop_speaking", "unsure"} {
 		if !strings.Contains(desc, want) {
 			t.Fatalf("end_call description missing %q", want)
+		}
+	}
+}
+
+func TestVoiceControlToolsSeparateStopSpeakingFromEndingTheCall(t *testing.T) {
+	var stopDesc, endDesc string
+	for _, d := range ToolDefs() {
+		switch d.Name {
+		case "stop_speaking":
+			stopDesc = d.Description
+		case "end_call":
+			endDesc = d.Description
+		}
+	}
+	for _, want := range []string{"停一下", "stop talking", "keep the voice call active", "not end_call"} {
+		if !strings.Contains(stopDesc, want) {
+			t.Fatalf("stop_speaking description missing %q: %s", want, stopDesc)
+		}
+	}
+	for _, want := range []string{"退出", "结束通话", "End the entire voice conversation"} {
+		if !strings.Contains(endDesc, want) {
+			t.Fatalf("end_call description missing %q: %s", want, endDesc)
 		}
 	}
 }
