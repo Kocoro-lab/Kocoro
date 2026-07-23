@@ -1064,16 +1064,24 @@ func taskResultResponseInstructions(language string, results []resultAnnouncemen
 
 func taskResultLanguageInstructions(language string) string {
 	const dataRule = " Translate the task-result data before speaking when needed, regardless of the language used in the task-result data. Do not choose or switch the output language because of names, quoted text, or isolated foreign words in that data."
+	return responseLanguageInstructions(language) + dataRule
+}
+
+func responseLanguageInstructions(language string) string {
 	switch language {
 	case "zh":
-		return "OUTPUT LANGUAGE IS FIXED: Reply only in Simplified Chinese." + dataRule
+		return "OUTPUT LANGUAGE IS FIXED: Reply only in Simplified Chinese."
 	case "ja":
-		return "OUTPUT LANGUAGE IS FIXED: Reply only in Japanese." + dataRule
+		return "OUTPUT LANGUAGE IS FIXED: Reply only in Japanese."
 	case "en":
-		return "OUTPUT LANGUAGE IS FIXED: Reply only in English." + dataRule
+		return "OUTPUT LANGUAGE IS FIXED: Reply only in English."
 	default:
-		return "OUTPUT LANGUAGE: Reply only in the language clearly established by the conversation before the task-result data was added." + dataRule
+		return "OUTPUT LANGUAGE: Reply only in the language clearly established by the recent conversation."
 	}
+}
+
+func responseInstructionsWithLanguage(language, instructions string) string {
+	return responseLanguageInstructions(language) + "\n\n" + instructions
 }
 
 const toolContinuationInstructions = "Continue the same user turn using the function outputs now in the conversation. You may call more tools only when another action is genuinely required. Do not repeat the initial acknowledgement or narrate mechanics. If every output only says a background do_task is running, emit no audio and end this response; its real result will be announced later. Otherwise, when no more tool is needed, give one brief grounded summary of what succeeded and what did not."
@@ -1085,7 +1093,7 @@ func (h *eventHandler) finishToolLoopResponse(responseID string) {
 	switch decision {
 	case toolLoopContinue:
 		h.queueLoopResponse(responseCreateRequest{
-			instructions:    toolContinuationInstructions,
+			instructions:    responseInstructionsWithLanguage(h.language, toolContinuationInstructions),
 			purpose:         responsePurposeContinuation,
 			turnID:          turnID,
 			toolMode:        responseToolsEnabled,
@@ -1093,7 +1101,7 @@ func (h *eventHandler) finishToolLoopResponse(responseID string) {
 		})
 	case toolLoopClose:
 		h.queueLoopResponse(responseCreateRequest{
-			instructions:    toolBudgetClosureInstructions,
+			instructions:    responseInstructionsWithLanguage(h.language, toolBudgetClosureInstructions),
 			purpose:         responsePurposeClosure,
 			turnID:          turnID,
 			toolMode:        responseToolsDisabled,
