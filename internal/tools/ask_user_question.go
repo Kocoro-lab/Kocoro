@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -33,16 +34,16 @@ const (
 type AskUserQuestionTool struct{}
 
 type askUserQuestionArgs struct {
-	Questions        []askUserQuestionQuestion `json:"questions"`
-	AutoResolutionMs int                       `json:"auto_resolution_ms,omitempty"`
+	Questions        questionList `json:"questions"`
+	AutoResolutionMs int          `json:"auto_resolution_ms,omitempty"`
 }
 
 type askUserQuestionQuestion struct {
-	Header      string                  `json:"header,omitempty"`
-	Question    string                  `json:"question"`
-	MultiSelect bool                    `json:"multi_select,omitempty"`
-	AllowOther  *bool                   `json:"allow_other,omitempty"`
-	Options     []askUserQuestionOption `json:"options"`
+	Header      string     `json:"header,omitempty"`
+	Question    string     `json:"question"`
+	MultiSelect bool       `json:"multi_select,omitempty"`
+	AllowOther  *bool      `json:"allow_other,omitempty"`
+	Options     optionList `json:"options"`
 }
 
 type askUserQuestionOption struct {
@@ -50,6 +51,49 @@ type askUserQuestionOption struct {
 	Description string `json:"description,omitempty"`
 	Preview     string `json:"preview,omitempty"`
 	Recommended bool   `json:"recommended,omitempty"`
+}
+
+// questionList / optionList tolerate a model that double-encodes a nested
+// array argument as a JSON string — e.g. "questions":"[{...}]" instead of
+// "questions":[{...}]. This is a real, intermittent tool-calling quirk (seen
+// live: the same prompt produced a proper array on one call and a stringified
+// array on the next, which hard-failed into a 5x [validation error] retry
+// loop). Unwrapping one layer of string encoding before decoding lets the
+// recoverable call land the card instead of stalling the turn.
+type questionList []askUserQuestionQuestion
+
+func (ql *questionList) UnmarshalJSON(data []byte) error {
+	var arr []askUserQuestionQuestion
+	if err := unmarshalMaybeStringified(data, &arr); err != nil {
+		return err
+	}
+	*ql = arr
+	return nil
+}
+
+type optionList []askUserQuestionOption
+
+func (ol *optionList) UnmarshalJSON(data []byte) error {
+	var arr []askUserQuestionOption
+	if err := unmarshalMaybeStringified(data, &arr); err != nil {
+		return err
+	}
+	*ol = arr
+	return nil
+}
+
+// unmarshalMaybeStringified unmarshals data into v, first peeling one layer of
+// JSON-string wrapping if the model quoted the whole value.
+func unmarshalMaybeStringified(data []byte, v any) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return err
+		}
+		data = []byte(s)
+	}
+	return json.Unmarshal(data, v)
 }
 
 func (t *AskUserQuestionTool) Info() agent.ToolInfo {
