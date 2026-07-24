@@ -294,6 +294,7 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 | `schedule_list` / `_show` | No | List with sync status; show a schedule's last run. |
 | `session_search` | No | FTS5 keyword search across past session messages. |
 | `memory_append` | No | Append entries to agent MEMORY.md (flock-protected). |
+| `ask_user_question` | No | Ask the user to pick among a few explicit options (1-4 questions, 2-4 options each) when genuinely blocked or when they must choose between equivalent alternatives. You get the full chosen labels back. Rendered as a selection card in Kocoro Desktop; on channels/surfaces that can't prompt, it returns cleanly so the agent proceeds on its own judgment. |
 | `use_skill` | No | Activate a skill by name — returns full SKILL.md body. Skill discovery auto-suggests relevant skills each turn via `model_tier: small` prefetch. |
 
 ### Calendar (registered only when daemon is a Kocoro Desktop subprocess)

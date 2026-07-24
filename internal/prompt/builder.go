@@ -211,6 +211,17 @@ func buildStaticSystem(opts PromptOptions) string {
 			"so a `description` argument would never reach the model — do not invent one for it. " +
 			"Code identifiers, file paths, and CLI commands inside the description may stay in their " +
 			"original form, but the surrounding prose follows the reply language.")
+
+		// Anti-over-asking gate for ask_user_question. This is the PRIMARY
+		// suppressor of reflexive questioning — the tool's own description only
+		// states capability. Byte-stable, gated on LocalToolNames like the rules
+		// above so an agent with no local tools pays no extra cached bytes.
+		sb.WriteString("\n\n## Asking the user\n")
+		sb.WriteString("Only escalate to `ask_user_question` when you are genuinely blocked after investigating, " +
+			"or when the user must make a preference/decision among equivalent options that you cannot settle " +
+			"yourself. Do NOT reach for it at the first sign of friction: exhaust your tools, read the code, and " +
+			"make a reasonable assumption first. A good question is a real fork with a small set of concrete " +
+			"choices — not a request for permission to start, and not a substitute for doing the work.")
 	}
 
 	sb.WriteString("\n\n## Memory & Retrieval\n")
