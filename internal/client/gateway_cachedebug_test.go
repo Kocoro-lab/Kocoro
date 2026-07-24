@@ -82,7 +82,7 @@ func TestCacheDebug_ResponseCarriesSessionID(t *testing.T) {
 // TestCacheDebug_ForceTTLEnvCaptured guards visibility of SHANNON_FORCE_TTL.
 // Without this field, after-the-fact analysis cannot tell whether a TTL
 // override was active during the run or whether the gateway used its default
-// cache_source → TTL routing.
+// operator TTL override logging; cache_source itself is attribution.
 func TestCacheDebug_ForceTTLEnvCaptured(t *testing.T) {
 	cases := []struct {
 		val      string

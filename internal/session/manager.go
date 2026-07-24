@@ -135,6 +135,15 @@ func (m *Manager) Load(id string) (*Session, error) {
 	return m.store.Load(id)
 }
 
+// InterruptedSessions returns the durable startup-recovery candidates without
+// scanning or allocating every historical session after the one-time marker
+// migration has completed.
+func (m *Manager) InterruptedSessions() ([]*Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.InterruptedSessions()
+}
+
 func (m *Manager) Save() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -144,6 +153,16 @@ func (m *Manager) Save() error {
 	return m.store.Save(m.current)
 }
 
+// SavePreservingUpdatedAt persists recovery-policy cleanup without making an
+// abandoned historical session look like fresh user activity.
+func (m *Manager) SavePreservingUpdatedAt() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.current == nil {
+		return nil
+	}
+	return m.store.SavePreservingUpdatedAt(m.current)
+}
 
 // PatchTitle updates the title of the given session and persists it.
 // If the target is the active session, the in-memory title is also updated.
@@ -440,7 +459,7 @@ func (m *Manager) RebuildIndex() error {
 // Reset clears a session's conversation history in place, preserving
 // ID/Title/CreatedAt/CWD/Source/Channel/Usage.
 // Cleared fields: Messages, MessageMeta, RemoteTasks, SummaryCache,
-// SummaryCacheKey, RouteKey, InProgress. If the target is the in-memory
+// SummaryCacheKey, RouteKey, InProgress, InterruptedTurn. If the target is the in-memory
 // current session, the current pointer is updated and its runtime WorkingSet
 // is reset too.
 func (m *Manager) Reset(id string) error {
@@ -461,6 +480,7 @@ func (m *Manager) Reset(id string) error {
 	sess.SummaryCacheKey = ""
 	sess.RouteKey = ""
 	sess.InProgress = false
+	sess.InterruptedTurn = nil
 	if err := m.store.Save(sess); err != nil {
 		return err
 	}

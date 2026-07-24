@@ -420,6 +420,10 @@ func (c *OllamaClient) CompleteStream(ctx context.Context, req CompletionRequest
 					Name:      tc.Function.Name,
 					Arguments: args,
 				})
+				if onDelta != nil {
+					call := toolCalls[len(toolCalls)-1]
+					onDelta(StreamDelta{ToolCall: &call})
+				}
 			}
 			if chunk.Choices[0].FinishReason != nil {
 				finishReason = *chunk.Choices[0].FinishReason

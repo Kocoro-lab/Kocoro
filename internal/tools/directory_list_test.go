@@ -18,7 +18,7 @@ func TestDirectoryList_Absolute(t *testing.T) {
 	}
 
 	tool := &DirectoryListTool{}
-	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"path":%q}`, tmp))
+	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"path":%q,"description":"test absolute list"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestDirectoryList_Absolute(t *testing.T) {
 
 func TestDirectoryList_RelativeRefusedWithoutSessionCWD(t *testing.T) {
 	tool := &DirectoryListTool{}
-	result, err := tool.Run(context.Background(), `{"path":"somedir"}`)
+	result, err := tool.Run(context.Background(), `{"path":"somedir","description":"test relative guard"}`)
 	if err != nil {
 		t.Fatalf("Run should not return a transport error, got %v", err)
 	}
@@ -63,7 +63,7 @@ func TestDirectoryList_RelativeWorksWithSessionCWD(t *testing.T) {
 	}
 	ctx := cwdctx.WithSessionCWD(context.Background(), tmp)
 	tool := &DirectoryListTool{}
-	result, err := tool.Run(ctx, `{}`)
+	result, err := tool.Run(ctx, `{"description":"test cwd list"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

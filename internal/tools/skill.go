@@ -50,10 +50,10 @@ func (t *useSkillTool) Info() agent.ToolInfo {
 func (t *useSkillTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args useSkillArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
-	if args.SkillName == "" {
-		return agent.ToolResult{Content: "skill_name is required", IsError: true}, nil
+	if strings.TrimSpace(args.SkillName) == "" {
+		return agent.ValidationError("skill_name is required"), nil
 	}
 	if t.skills == nil || len(*t.skills) == 0 {
 		return agent.ToolResult{Content: "no skills available", IsError: true}, nil

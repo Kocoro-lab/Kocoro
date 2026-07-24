@@ -29,7 +29,7 @@ const editTestSrc = "https://static.kocoro.ai/public/abc/src.png"
 
 func TestEditImageInvalidJSON(t *testing.T) {
 	tool := NewEditImageTool(&fakeImageEdit{})
-	res, err := tool.Run(context.Background(), `{"prompt":}`) // malformed JSON
+	res, err := tool.Run(context.Background(), `{"description":"test image operation","prompt":}`) // malformed JSON
 	if err != nil {
 		t.Fatalf("Run returned error (should embed in ToolResult): %v", err)
 	}
@@ -41,9 +41,9 @@ func TestEditImageInvalidJSON(t *testing.T) {
 func TestEditImageEmptyPrompt(t *testing.T) {
 	tool := NewEditImageTool(&fakeImageEdit{})
 	args := []string{
-		`{"image_urls":["` + editTestSrc + `"]}`,
-		`{"prompt":"","image_urls":["` + editTestSrc + `"]}`,
-		`{"prompt":"   ","image_urls":["` + editTestSrc + `"]}`,
+		`{"description":"test image operation","image_urls":["` + editTestSrc + `"]}`,
+		`{"description":"test image operation","prompt":"","image_urls":["` + editTestSrc + `"]}`,
+		`{"description":"test image operation","prompt":"   ","image_urls":["` + editTestSrc + `"]}`,
 	}
 	for _, a := range args {
 		res, _ := tool.Run(context.Background(), a)
@@ -57,7 +57,7 @@ func TestEditImagePromptTooLong(t *testing.T) {
 	tool := NewEditImageTool(&fakeImageEdit{})
 	long := strings.Repeat("a", imagePromptMaxLen+1)
 	res, _ := tool.Run(context.Background(),
-		`{"prompt":"`+long+`","image_urls":["`+editTestSrc+`"]}`)
+		`{"description":"test image operation","prompt":"`+long+`","image_urls":["`+editTestSrc+`"]}`)
 	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
 		t.Fatalf("expected validation error for over-length prompt, got %+v", res)
 	}
@@ -78,14 +78,14 @@ func TestEditImagePromptRuneVsByte(t *testing.T) {
 
 	cjk := strings.Repeat("漢", 16000)
 	res, _ := tool.Run(context.Background(),
-		`{"prompt":"`+cjk+`","image_urls":["`+editTestSrc+`"]}`)
+		`{"description":"test image operation","prompt":"`+cjk+`","image_urls":["`+editTestSrc+`"]}`)
 	if res.IsError {
 		t.Fatalf("16000-rune CJK prompt must be accepted, got %+v", res)
 	}
 
 	over := strings.Repeat("漢", imagePromptMaxLen+1)
 	res, _ = tool.Run(context.Background(),
-		`{"prompt":"`+over+`","image_urls":["`+editTestSrc+`"]}`)
+		`{"description":"test image operation","prompt":"`+over+`","image_urls":["`+editTestSrc+`"]}`)
 	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
 		t.Fatalf("32001-rune prompt must be rejected, got %+v", res)
 	}
@@ -97,8 +97,8 @@ func TestEditImagePromptRuneVsByte(t *testing.T) {
 func TestEditImageMissingImageURLs(t *testing.T) {
 	tool := NewEditImageTool(&fakeImageEdit{})
 	for _, a := range []string{
-		`{"prompt":"x"}`,                 // missing entirely
-		`{"prompt":"x","image_urls":[]}`, // empty array
+		`{"description":"test image operation","prompt":"x"}`,                 // missing entirely
+		`{"description":"test image operation","prompt":"x","image_urls":[]}`, // empty array
 	} {
 		res, _ := tool.Run(context.Background(), a)
 		if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
@@ -116,7 +116,7 @@ func TestEditImageTooManyImageURLs(t *testing.T) {
 	for i := range urls {
 		urls[i] = `"` + editTestSrc + `"`
 	}
-	args := `{"prompt":"x","image_urls":[` + strings.Join(urls, ",") + `]}`
+	args := `{"description":"test image operation","prompt":"x","image_urls":[` + strings.Join(urls, ",") + `]}`
 	res, _ := tool.Run(context.Background(), args)
 	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
 		t.Fatalf("expected validation error for >%d URLs, got %+v", editImageURLsMax, res)
@@ -127,13 +127,13 @@ func TestEditImageNonCDNURL(t *testing.T) {
 	tool := NewEditImageTool(&fakeImageEdit{})
 	cases := []string{
 		// pure external URL
-		`{"prompt":"x","image_urls":["https://example.com/x.png"]}`,
+		`{"description":"test image operation","prompt":"x","image_urls":["https://example.com/x.png"]}`,
 		// http (not https)
-		`{"prompt":"x","image_urls":["http://static.kocoro.ai/x.png"]}`,
+		`{"description":"test image operation","prompt":"x","image_urls":["http://static.kocoro.ai/x.png"]}`,
 		// CDN host but wrong domain
-		`{"prompt":"x","image_urls":["https://cdn.kocoro.com/x.png"]}`,
+		`{"description":"test image operation","prompt":"x","image_urls":["https://cdn.kocoro.com/x.png"]}`,
 		// mixed: first valid, second external — must still reject
-		`{"prompt":"x","image_urls":["` + editTestSrc + `","https://example.com/y.png"]}`,
+		`{"description":"test image operation","prompt":"x","image_urls":["` + editTestSrc + `","https://example.com/y.png"]}`,
 	}
 	for _, a := range cases {
 		res, _ := tool.Run(context.Background(), a)
@@ -152,7 +152,7 @@ func TestEditImageNonCDNURLDoesNotCallClient(t *testing.T) {
 	fake := &fakeImageEdit{}
 	tool := NewEditImageTool(fake)
 	_, _ = tool.Run(context.Background(),
-		`{"prompt":"x","image_urls":["https://example.com/x.png"]}`)
+		`{"description":"test image operation","prompt":"x","image_urls":["https://example.com/x.png"]}`)
 	if fake.calls != 0 {
 		t.Errorf("client must not be called when URL fails prefix check; calls=%d", fake.calls)
 	}
@@ -161,12 +161,12 @@ func TestEditImageNonCDNURLDoesNotCallClient(t *testing.T) {
 func TestEditImageNOutOfRange(t *testing.T) {
 	tool := NewEditImageTool(&fakeImageEdit{})
 	res, _ := tool.Run(context.Background(),
-		`{"prompt":"x","image_urls":["`+editTestSrc+`"],"n":11}`)
+		`{"description":"test image operation","prompt":"x","image_urls":["`+editTestSrc+`"],"n":11}`)
 	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
 		t.Fatalf("expected validation error for n=11, got %+v", res)
 	}
 	res, _ = tool.Run(context.Background(),
-		`{"prompt":"x","image_urls":["`+editTestSrc+`"],"n":-1}`)
+		`{"description":"test image operation","prompt":"x","image_urls":["`+editTestSrc+`"],"n":-1}`)
 	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
 		t.Fatalf("expected validation error for n=-1, got %+v", res)
 	}
@@ -175,9 +175,9 @@ func TestEditImageNOutOfRange(t *testing.T) {
 func TestEditImageInvalidEnum(t *testing.T) {
 	tool := NewEditImageTool(&fakeImageEdit{})
 	cases := []string{
-		`{"prompt":"x","image_urls":["` + editTestSrc + `"],"size":"4096x4096"}`,
-		`{"prompt":"x","image_urls":["` + editTestSrc + `"],"quality":"ultra"}`,
-		`{"prompt":"x","image_urls":["` + editTestSrc + `"],"background":"chrome"}`,
+		`{"description":"test image operation","prompt":"x","image_urls":["` + editTestSrc + `"],"size":"4096x4096"}`,
+		`{"description":"test image operation","prompt":"x","image_urls":["` + editTestSrc + `"],"quality":"ultra"}`,
+		`{"description":"test image operation","prompt":"x","image_urls":["` + editTestSrc + `"],"background":"chrome"}`,
 	}
 	for _, args := range cases {
 		res, _ := tool.Run(context.Background(), args)
@@ -199,7 +199,7 @@ func TestEditImageHappyPath(t *testing.T) {
 	}
 	tool := NewEditImageTool(fake)
 	res, _ := tool.Run(context.Background(),
-		`{"prompt":"add a hat to the cat","image_urls":["`+editTestSrc+`"],"quality":"low"}`)
+		`{"description":"test image operation","prompt":"add a hat to the cat","image_urls":["`+editTestSrc+`"],"quality":"low"}`)
 	if res.IsError {
 		t.Fatalf("happy path returned error: %+v", res)
 	}
@@ -234,7 +234,7 @@ func TestEditImageMultiSourceHappyPath(t *testing.T) {
 		`"https://static.kocoro.ai/public/ghi/three.png"`,
 		`"https://static.kocoro.ai/public/jkl/four.png"`,
 	}
-	args := `{"prompt":"combine into one","image_urls":[` + strings.Join(srcs, ",") + `]}`
+	args := `{"description":"test image operation","prompt":"combine into one","image_urls":[` + strings.Join(srcs, ",") + `]}`
 	res, _ := tool.Run(context.Background(), args)
 	if res.IsError {
 		t.Fatalf("4-source happy path returned error: %+v", res)
@@ -265,7 +265,7 @@ func TestEditImageErrorClassification(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tool := NewEditImageTool(&fakeImageEdit{err: tc.err})
 			res, _ := tool.Run(context.Background(),
-				`{"prompt":"x","image_urls":["`+editTestSrc+`"]}`)
+				`{"description":"test image operation","prompt":"x","image_urls":["`+editTestSrc+`"]}`)
 			if !res.IsError {
 				t.Fatalf("expected IsError, got %+v", res)
 			}
@@ -279,7 +279,7 @@ func TestEditImageErrorClassification(t *testing.T) {
 func TestEditImageUnknownErrorFallsThrough(t *testing.T) {
 	tool := NewEditImageTool(&fakeImageEdit{err: errors.New("boom")})
 	res, _ := tool.Run(context.Background(),
-		`{"prompt":"x","image_urls":["`+editTestSrc+`"]}`)
+		`{"description":"test image operation","prompt":"x","image_urls":["`+editTestSrc+`"]}`)
 	if !res.IsError {
 		t.Fatalf("expected IsError, got %+v", res)
 	}
@@ -294,7 +294,7 @@ func TestEditImageRequiresApproval(t *testing.T) {
 	if !tool.RequiresApproval() {
 		t.Error("RequiresApproval must be true (paid + permanent public URL)")
 	}
-	if tool.IsSafeArgs(`{"prompt":"x","image_urls":["`+editTestSrc+`"]}`) {
+	if tool.IsSafeArgs(`{"description":"test image operation","prompt":"x","image_urls":["` + editTestSrc + `"]}`) {
 		t.Error("IsSafeArgs must be false")
 	}
 	// SafeChecker contract assertion mirrors generate_image.

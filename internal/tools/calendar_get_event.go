@@ -43,6 +43,9 @@ func (t *CalendarGetEventTool) RequiresApproval() bool { return false }
 func (t *CalendarGetEventTool) IsReadOnlyCall(string) bool { return true }
 
 func (t *CalendarGetEventTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	if t.Broker == nil {
 		return agent.ToolResult{
 			Content: "calendar_get_event: Desktop RPC broker not available",
@@ -52,9 +55,6 @@ func (t *CalendarGetEventTool) Run(ctx context.Context, argsJSON string) (agent.
 	var args calendarGetEventArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return invalidArgResult("calendar_get_event", "_", err.Error()), nil
-	}
-	if args.ID == "" {
-		return agent.ValidationError("calendar_get_event: missing required `id` parameter"), nil
 	}
 	return callDesktopRPC(ctx, t.Broker, desktop_rpc.MethodCalendarGetEvent, args, 0)
 }

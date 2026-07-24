@@ -46,6 +46,9 @@ func (t *CalendarRequestPermissionTool) Info() agent.ToolInfo {
 func (t *CalendarRequestPermissionTool) RequiresApproval() bool { return true }
 
 func (t *CalendarRequestPermissionTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	if t.Broker == nil {
 		return agent.ToolResult{
 			Content: "calendar_request_permission: Desktop RPC broker not available",
@@ -55,9 +58,6 @@ func (t *CalendarRequestPermissionTool) Run(ctx context.Context, argsJSON string
 	var args calendarRequestPermissionArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return invalidArgResult("calendar_request_permission", "_", err.Error()), nil
-	}
-	if args.Description == "" {
-		return agent.ValidationError("calendar_request_permission: missing required `description` parameter"), nil
 	}
 	// RPC params payload is empty (spec §5.2 request_permission has no params).
 	return callDesktopRPC(ctx, t.Broker, desktop_rpc.MethodCalendarRequestPermission, struct{}{}, requestPermissionTimeoutMs)

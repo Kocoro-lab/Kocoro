@@ -215,6 +215,9 @@ func (t *ArchiveExtractTool) Run(ctx context.Context, argsJSON string) (agent.To
 	if strings.TrimSpace(args.Dest) == "" {
 		return agent.ValidationError("dest is required"), nil
 	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("archive_extract: missing required `description` parameter"), nil
+	}
 
 	resolvedSrc, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
 	if resolveErr != nil {

@@ -71,7 +71,13 @@ func normalizeGlobTarget(pattern, path string) (root, relPattern string) {
 func (t *GlobTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args globArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Pattern) == "" {
+		return agent.ValidationError("glob: missing required `pattern` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("glob: missing required `description` parameter"), nil
 	}
 
 	root, pattern := normalizeGlobTarget(args.Pattern, args.Path)

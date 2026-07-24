@@ -210,6 +210,9 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 	baseline.Register(&ThinkTool{})
 	baseline.Register(&BrowserTool{})
 	baseline.Register(&AccessibilityTool{})
+	baseline.Register(&AppleScriptTool{})
+	baseline.Register(&ScreenshotTool{})
+	baseline.Register(&WaitTool{})
 
 	healthStates := map[string]mcp.ServerHealth{
 		"playwright": {State: mcp.StateHealthy},
@@ -231,6 +234,11 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 	// cannot, so it must survive Playwright (regression: it was wrongly removed).
 	if _, ok := reg.Get("accessibility"); !ok {
 		t.Error("accessibility must NOT be removed when Playwright is present")
+	}
+	for _, name := range []string{"applescript", "screenshot", "wait_for"} {
+		if _, ok := reg.Get(name); !ok {
+			t.Errorf("%s must NOT be removed when Playwright is present", name)
+		}
 	}
 }
 

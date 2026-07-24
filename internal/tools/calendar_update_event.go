@@ -47,6 +47,9 @@ func (t *CalendarUpdateEventTool) Info() agent.ToolInfo {
 func (t *CalendarUpdateEventTool) RequiresApproval() bool { return true }
 
 func (t *CalendarUpdateEventTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	if t.Broker == nil {
 		return agent.ToolResult{
 			Content: "calendar_update_event: Desktop RPC broker not available",
@@ -61,17 +64,9 @@ func (t *CalendarUpdateEventTool) Run(ctx context.Context, argsJSON string) (age
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return invalidArgResult("calendar_update_event", "_", err.Error()), nil
 	}
-	if args.ID == "" {
-		return agent.ValidationError("calendar_update_event: missing required `id` parameter"), nil
-	}
-	if args.Description == "" {
-		return agent.ValidationError("calendar_update_event: missing required `description` parameter"), nil
-	}
 	switch args.Scope {
 	case desktop_rpc.ScopeThis, desktop_rpc.ScopeThisAndFuture:
 		// OK
-	case "":
-		return agent.ValidationError("calendar_update_event: missing required `scope` parameter (must be 'this' or 'this_and_future')"), nil
 	case desktop_rpc.ScopeAll:
 		// Spec §5.5.8: update_event does NOT support scope='all'. Catch
 		// client-side so we don't even RPC.

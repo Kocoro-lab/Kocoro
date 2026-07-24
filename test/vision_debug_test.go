@@ -36,7 +36,7 @@ func TestVisionLoop_FullPipeline(t *testing.T) {
 				FinishReason: "tool_use",
 				FunctionCall: &client.FunctionCall{
 					Name:      "screenshot",
-					Arguments: json.RawMessage(`{"target":"fullscreen"}`),
+					Arguments: json.RawMessage(`{"description":"Verify screenshot image delivery in the vision pipeline test","target":"fullscreen"}`),
 				},
 				Usage: client.Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
 			})

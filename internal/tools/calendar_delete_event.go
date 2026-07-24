@@ -13,7 +13,7 @@ import (
 //   - this:            delete one instance (creates an exception in recurrence)
 //   - this_and_future: delete this instance + all future
 //   - all:             delete the entire recurring series (Desktop resolves
-//                      instance → series master internally per spec §3.3)
+//     instance → series master internally per spec §3.3)
 type CalendarDeleteEventTool struct {
 	Broker *desktop_rpc.DesktopRPCBroker
 }
@@ -40,6 +40,9 @@ func (t *CalendarDeleteEventTool) Info() agent.ToolInfo {
 func (t *CalendarDeleteEventTool) RequiresApproval() bool { return true }
 
 func (t *CalendarDeleteEventTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	if t.Broker == nil {
 		return agent.ToolResult{
 			Content: "calendar_delete_event: Desktop RPC broker not available",
@@ -54,17 +57,9 @@ func (t *CalendarDeleteEventTool) Run(ctx context.Context, argsJSON string) (age
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return invalidArgResult("calendar_delete_event", "_", err.Error()), nil
 	}
-	if args.ID == "" {
-		return agent.ValidationError("calendar_delete_event: missing required `id` parameter"), nil
-	}
-	if args.Description == "" {
-		return agent.ValidationError("calendar_delete_event: missing required `description` parameter"), nil
-	}
 	switch args.Scope {
 	case desktop_rpc.ScopeThis, desktop_rpc.ScopeThisAndFuture, desktop_rpc.ScopeAll:
 		// OK
-	case "":
-		return agent.ValidationError("calendar_delete_event: missing required `scope` parameter (must be 'this', 'this_and_future', or 'all')"), nil
 	default:
 		return invalidArgResult("calendar_delete_event", "scope", "must be 'this', 'this_and_future', or 'all'"), nil
 	}

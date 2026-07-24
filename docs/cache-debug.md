@@ -39,7 +39,7 @@ The log is a JSON-lines stream of three entry kinds, joined chronologically:
 |---|---|
 | `req_id` | 6-byte hex correlation key for the matching `resp` line |
 | `session_id` | Session this call belongs to (rolling cache_control marker key) |
-| `cache_source` | `oneshot_cli` / `tui` / `slack` / etc. — gateway uses this to route 5m/1h TTL |
+| `cache_source` | `oneshot_cli` / `tui` / `slack` / etc. — attribution label; Cloud currently uses the short TTL for all values |
 | `force_ttl` | Present only when `SHANNON_FORCE_TTL` is set; values: `off` / `5m` / `1h` |
 | `tag` | `complete` or `stream` — which client method invoked the call |
 | `model` | `<specific>/<tier>` |
@@ -151,4 +151,4 @@ hashes, lengths, role, type, and TTL/source metadata.
 - `internal/agent/timebasedcompact.go` — `timeBasedCompact` (call site)
 - `scripts/cache_bench.sh` — fixture-based regression bench
 - `docs/cache-strategy.md` — authoritative cache design (4-breakpoint
-  allocation, source→TTL routing, byte-stability invariants)
+  allocation, current Cloud TTL policy, source attribution, byte stability)

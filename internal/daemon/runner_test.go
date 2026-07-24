@@ -35,16 +35,16 @@ func TestCacheSourceFromDaemonSource(t *testing.T) {
 		{"  line  ", "line"},
 		{"feishu", "feishu"},
 		{"wecom", "wecom"},
-		{"wechat", "wechat"}, // personal WeChat (iLink): human-conversation long bucket
+		{"wechat", "wechat"},
 		{"teams", "teams"},
 		{"telegram", "telegram"},
 		{"tui", "tui"},
+		{"desktop", "desktop"},
+		{"web", "web"},
 		{"shanclaw", "shanclaw"},
 		// Empty source is defaulted to "kocoro" in server.go before reaching
 		// this function; the dedicated empty-string case was removed. Falls
-		// through to "unknown" (5m) defensively in case the default is ever
-		// bypassed — matches the fail-cheap policy documented in
-		// docs/cache-strategy.md.
+		// through to "unknown" defensively in case the default is ever bypassed.
 		{"", "unknown"},
 		{"webhook", "webhook"},
 		{"cron", "cron"},
@@ -2075,17 +2075,22 @@ func TestRunAgent_PersistsSessionUsage(t *testing.T) {
 // simply re-poll.
 func waitForTitlePersisted(t *testing.T, sessPath string) {
 	t.Helper()
+	waitForTitleTurnsPersisted(t, sessPath, 1)
+}
+
+func waitForTitleTurnsPersisted(t *testing.T, sessPath string, minTurns int) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		data, err := os.ReadFile(sessPath)
 		if err == nil {
 			var s session.Session
-			if json.Unmarshal(data, &s) == nil && s.TitleTurns >= 1 {
+			if json.Unmarshal(data, &s) == nil && s.TitleTurns >= minTurns {
 				return
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("smart-title never persisted to %s within 5s — the async title goroutine did not land (production path broken, not a timing race)", sessPath)
+			t.Fatalf("smart-title never persisted TitleTurns >= %d to %s within 5s — the async title goroutine did not land (production path broken, not a timing race)", minTurns, sessPath)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

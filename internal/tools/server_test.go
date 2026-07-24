@@ -92,6 +92,39 @@ func TestServerTool_Run_EmptyArgs(t *testing.T) {
 	}
 }
 
+func TestServerTool_Run_AllowsRequiredZeroValues(t *testing.T) {
+	var received map[string]any
+	tool := NewServerTool(client.ServerToolSchema{
+		Name: "remote_config",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"enabled": map[string]any{"type": "boolean"},
+				"offset":  map[string]any{"type": "number"},
+				"query":   map[string]any{"type": "string"},
+				"items":   map[string]any{"type": "array"},
+			},
+			"required": []any{"enabled", "offset", "query", "items"},
+		},
+	}, nil)
+	tool.execute = func(_ context.Context, _ string, args map[string]any) (*client.ToolExecuteResponse, error) {
+		received = args
+		resp := toolExecResp(true, map[string]any{"status": "ok"}, nil)
+		return &resp, nil
+	}
+
+	result, err := tool.Run(context.Background(), `{"enabled":false,"offset":0,"query":"","items":[]}`)
+	if err != nil || result.IsError {
+		t.Fatalf("required zero values were rejected: err=%v result=%#v", err, result)
+	}
+	if enabled, ok := received["enabled"].(bool); !ok || enabled {
+		t.Fatalf("enabled was not forwarded as false: %#v", received)
+	}
+	if offset, ok := received["offset"].(float64); !ok || offset != 0 {
+		t.Fatalf("offset was not forwarded as zero: %#v", received)
+	}
+}
+
 func TestServerTool_Run_ServerError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -32,7 +32,7 @@ func (t *FileEditTool) Info() agent.ToolInfo {
 			"properties": map[string]any{
 				"path":        map[string]any{"type": "string", "description": "File path to edit"},
 				"old_string":  map[string]any{"type": "string", "description": "Exact string to find. Must be unique unless replace_all=true."},
-				"new_string":  map[string]any{"type": "string", "description": "Replacement string"},
+				"new_string":  map[string]any{"type": "string", "description": "Replacement string. An empty string deletes the matched text."},
 				"description": agent.DescriptionFieldSpec,
 				"replace_all": map[string]any{"type": "boolean", "description": "When true, replace every occurrence of old_string. When false (default), old_string must appear exactly once. Use replace_all only when the target is unambiguous globally (variable rename, refactor)."},
 			},
@@ -42,12 +42,28 @@ func (t *FileEditTool) Info() agent.ToolInfo {
 }
 
 func (t *FileEditTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	// Presence validation distinguishes an omitted new_string from an explicit
+	// empty string. The latter is a valid deletion request; the former must
+	// fail before any file mutation.
+	if result, valid := agent.ValidateToolArgumentPresence(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	var args fileEditArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
+	if strings.TrimSpace(args.Path) == "" {
+		return agent.ValidationError("file_edit: missing required `path` parameter"), nil
+	}
+	// Reject only the empty string, not whitespace-only: a whitespace-only
+	// old_string (e.g. "\n\n") is legitimate content, such as collapsing blank
+	// lines. new_string was presence-checked above but is not zero-checked —
+	// "" is a valid deletion request.
 	if args.OldString == "" {
-		return agent.ValidationError("old_string must not be empty"), nil
+		return agent.ValidationError("file_edit: missing required `old_string` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("file_edit: missing required `description` parameter"), nil
 	}
 	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
 	if resolveErr != nil {

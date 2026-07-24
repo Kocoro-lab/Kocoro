@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
@@ -42,7 +43,13 @@ func (t *ClipboardTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 	}
 	var args clipboardArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Action) == "" {
+		return agent.ValidationError("clipboard: missing required `action` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("clipboard: missing required `description` parameter"), nil
 	}
 
 	switch args.Action {
@@ -56,7 +63,7 @@ func (t *ClipboardTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 
 	case "write":
 		if args.Content == "" {
-			return agent.ToolResult{Content: "content is required for write action", IsError: true}, nil
+			return agent.ValidationError("clipboard: content is required for write action"), nil
 		}
 		cmd := exec.CommandContext(ctx, "pbcopy")
 		cmd.Stdin = bytes.NewReader([]byte(args.Content))
@@ -66,7 +73,7 @@ func (t *ClipboardTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 		return agent.ToolResult{Content: fmt.Sprintf("wrote %d bytes to clipboard", len(args.Content))}, nil
 
 	default:
-		return agent.ToolResult{Content: fmt.Sprintf("unknown action: %q (use 'read' or 'write')", args.Action), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("clipboard: unknown action: %q (use 'read' or 'write')", args.Action)), nil
 	}
 }
 

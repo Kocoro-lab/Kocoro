@@ -203,8 +203,9 @@ func logCacheDebug(req CompletionRequest, tag string) string {
 		"tool_hashes":    toolHashes,
 		"msg_hashes":     msgHashes,
 	}
-	// SHANNON_FORCE_TTL surfaces operator overrides ({off,5m,1h}). Absent →
-	// gateway uses cache_source → TTL routing (see docs/cache-strategy.md).
+	// SHANNON_FORCE_TTL surfaces operator overrides ({off,5m,1h}). Without
+	// an override, Cloud currently uses the short TTL for every cache_source;
+	// cache_source remains useful for attribution (see docs/cache-strategy.md).
 	// Logged only when set so normal-operation logs stay tidy.
 	if v := os.Getenv("SHANNON_FORCE_TTL"); v != "" {
 		entry["force_ttl"] = v
@@ -776,10 +777,9 @@ type CompletionRequest struct {
 	// to single rolling marker per request).
 	SessionID string `json:"session_id,omitempty"`
 
-	// CacheSource tags the call-site origin so the gateway can route prompt-cache
-	// TTL by logical source (channels/TUI → 1h; cron/webhook/mcp/oneshot/
-	// subagent → 5m). See docs/cache-strategy.md for the authoritative table.
-	// Unset → gateway treats as "unknown" and falls back to 5m (fail cheap).
+	// CacheSource tags the logical call-site origin for cost, cache, and latency
+	// attribution. It is not a Kocoro-side TTL selector: Cloud currently applies
+	// the short TTL to every source. See docs/cache-strategy.md.
 	CacheSource string `json:"cache_source,omitempty"`
 
 	// SkipCacheWrite signals the gateway to read existing prompt cache markers
@@ -1133,9 +1133,12 @@ func (c *GatewayClient) SendRealtimeUsage(ctx context.Context, body json.RawMess
 	return json.RawMessage(raw), nil
 }
 
-// StreamDelta represents an incremental text chunk from streaming completion.
+// StreamDelta represents an incremental text chunk or a fully assembled tool
+// call from a streaming completion. ToolCall is emitted only after name and
+// arguments are complete; partial JSON deltas never cross this boundary.
 type StreamDelta struct {
-	Text string
+	Text     string
+	ToolCall *FunctionCall
 }
 
 // CompleteStream sends a streaming completion request. It calls onDelta for each
@@ -1353,6 +1356,10 @@ func processSSEData(line string, onDelta func(StreamDelta)) (stop bool, result *
 		if text != "" && onDelta != nil {
 			onDelta(StreamDelta{Text: text})
 		}
+	case "tool_call", "tool_call_completed", "tool_use", "content_block_stop":
+		if call := completeStreamToolCall(event); call != nil && onDelta != nil {
+			onDelta(StreamDelta{ToolCall: call})
+		}
 	case "done":
 		var final CompletionResponse
 		if err := json.Unmarshal([]byte(payload), &final); err == nil {
@@ -1360,6 +1367,40 @@ func processSSEData(line string, onDelta func(StreamDelta)) (stop bool, result *
 		}
 	}
 	return false, nil
+}
+
+func completeStreamToolCall(event map[string]json.RawMessage) *FunctionCall {
+	var nested json.RawMessage
+	for _, key := range []string{"tool_call", "toolCall", "content_block"} {
+		if raw := event[key]; len(raw) > 0 {
+			nested = raw
+			break
+		}
+	}
+	source := event
+	if len(nested) > 0 {
+		var decoded map[string]json.RawMessage
+		if json.Unmarshal(nested, &decoded) == nil {
+			source = decoded
+		}
+	}
+
+	var call FunctionCall
+	_ = json.Unmarshal(source["id"], &call.ID)
+	_ = json.Unmarshal(source["name"], &call.Name)
+	args := source["arguments"]
+	if len(args) == 0 {
+		args = source["input"]
+	}
+	if call.Name == "" || len(args) == 0 {
+		return nil
+	}
+	call.Arguments = normalizeToolInput(args)
+	var obj map[string]any
+	if err := json.Unmarshal(call.Arguments, &obj); err != nil || obj == nil {
+		return nil
+	}
+	return &call
 }
 
 // resetTimer stops, drains, and resets a timer. The drain is unnecessary on

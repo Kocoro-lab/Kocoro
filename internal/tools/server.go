@@ -66,17 +66,19 @@ func (t *ServerTool) Info() agent.ToolInfo {
 		Name:        t.schema.Name,
 		Description: t.schema.Description,
 		Parameters:  t.schema.Parameters,
+		Required:    requiredFieldsFromSchema(t.schema.Parameters),
 	}
 }
 
 func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	info := t.Info()
+	if result, valid := agent.ValidateToolArgumentPresence(info, argsJSON); !valid {
+		return result, nil
+	}
 	var args map[string]any
 	if argsJSON != "" && argsJSON != "{}" {
 		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-			return agent.ToolResult{
-				Content: fmt.Sprintf("invalid arguments: %v", err),
-				IsError: true,
-			}, nil
+			return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 		}
 	}
 	if args == nil {
@@ -153,6 +155,11 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 		if !resp.Success {
 			content = appendLadder(content, resp.Metadata)
 		}
+		if looksLikeRemoteValidationError(content) {
+			result := agent.ValidationError(strings.TrimPrefix(content, "[validation error] "))
+			result.Usage = toolUsage
+			return result, nil
+		}
 		return agent.ToolResult{Content: content, IsError: true, Usage: toolUsage}, nil
 	}
 
@@ -211,6 +218,47 @@ func classifyServerError(msg string) string {
 
 // ToolSource implements agent.ToolSourcer for deterministic tool ordering.
 func (t *ServerTool) ToolSource() agent.ToolSource { return t.source }
+
+func requiredFieldsFromSchema(parameters map[string]any) []string {
+	if parameters == nil {
+		return nil
+	}
+	raw, ok := parameters["required"]
+	if !ok {
+		return nil
+	}
+	switch values := raw.(type) {
+	case []string:
+		return append([]string(nil), values...)
+	case []any:
+		required := make([]string, 0, len(values))
+		for _, value := range values {
+			if name, ok := value.(string); ok && name != "" {
+				required = append(required, name)
+			}
+		}
+		return required
+	default:
+		return nil
+	}
+}
+
+func looksLikeRemoteValidationError(content string) bool {
+	lower := strings.ToLower(content)
+	for _, marker := range []string{
+		"validation error",
+		"missing required argument",
+		"missing required parameter",
+		"unexpected keyword argument",
+		"input should be",
+		"pydantic.dev",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // appendLadder returns base with a fallback-ladder block appended when one can
 // be built from metadata. Idempotent: if base already contains the ladder

@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -13,6 +17,68 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
 )
+
+// defaultMaxConcurrentRequests caps how many tool calls execute concurrently
+// within a single MCP session.
+//
+//   - Workload: a client pipelining tool calls (e.g. an agent fanning out a
+//     batch of reads) — 64 covers normal fan-out with headroom.
+//   - Symptom when it binds: excess calls wait in the separately bounded
+//     request queue while the scanner keeps reading cancellations and
+//     elicitation responses.
+//   - Override: SHANNON_MCP_MAX_CONCURRENT_REQUESTS accepts a positive integer;
+//     a non-positive or unparseable value keeps the default.
+const defaultMaxConcurrentRequests = 64
+
+func maxConcurrentRequests() int {
+	if v := os.Getenv("SHANNON_MCP_MAX_CONCURRENT_REQUESTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxConcurrentRequests
+}
+
+// defaultMaxQueuedRequests bounds requests that have been accepted but are
+// waiting for an execution slot. Together with defaultMaxConcurrentRequests it
+// caps per-session request goroutines at 128 instead of letting an untrusted
+// client grow memory without bound. When the queue is full, the server rejects
+// the new request with a retryable server error while keeping the scanner live.
+//
+// Override: SHANNON_MCP_MAX_QUEUED_REQUESTS accepts a positive integer.
+const defaultMaxQueuedRequests = 64
+
+func maxQueuedRequests() int {
+	if v := os.Getenv("SHANNON_MCP_MAX_QUEUED_REQUESTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxQueuedRequests
+}
+
+// defaultEOFDrainGrace bounds how long Serve waits for in-flight requests to
+// finish after the input stream ends (clean EOF) before force-cancelling them.
+//
+//   - Workload: a client that closed stdin while a tool call is still running —
+//     2 seconds lets nearly-done in-process work flush its response (single-shot
+//     callers rely on this to receive their reply after closing the pipe).
+//   - Symptom when it binds: a tool blocked on ctx.Done() would otherwise pin
+//     wg.Wait() forever. Serve gives requests one grace period to finish, then
+//     cancels them and gives cleanup one final bounded grace before returning
+//     even if a broken tool ignores cancellation.
+//   - Override: SHANNON_MCP_EOF_DRAIN_GRACE accepts a Go duration string (e.g.
+//     "100ms"); a non-positive or unparseable value keeps the default.
+const defaultEOFDrainGrace = 2 * time.Second
+
+func eofDrainGrace() time.Duration {
+	if v := os.Getenv("SHANNON_MCP_EOF_DRAIN_GRACE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultEOFDrainGrace
+}
 
 // JSON-RPC 2.0 types.
 
@@ -23,11 +89,20 @@ type Request struct {
 	Params  json.RawMessage  `json:"params,omitempty"`
 }
 
-type Response struct {
-	JSONRPC string      `json:"jsonrpc"`
+type inboundMessage struct {
+	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id,omitempty"`
-	Result  any         `json:"result,omitempty"`
-	Error   *RPCError   `json:"error,omitempty"`
+	Method  string           `json:"method,omitempty"`
+	Params  json.RawMessage  `json:"params,omitempty"`
+	Result  json.RawMessage  `json:"result,omitempty"`
+	Error   *RPCError        `json:"error,omitempty"`
+}
+
+type Response struct {
+	JSONRPC string           `json:"jsonrpc"`
+	ID      *json.RawMessage `json:"id,omitempty"`
+	Result  any              `json:"result,omitempty"`
+	Error   *RPCError        `json:"error,omitempty"`
 }
 
 type RPCError struct {
@@ -56,6 +131,20 @@ type ToolsCapability struct {
 	ListChanged bool `json:"listChanged"`
 }
 
+type InitializeParams struct {
+	ProtocolVersion string             `json:"protocolVersion"`
+	Capabilities    ClientCapabilities `json:"capabilities"`
+}
+
+type ClientCapabilities struct {
+	Elicitation *ElicitationCapability `json:"elicitation,omitempty"`
+}
+
+type ElicitationCapability struct {
+	Form map[string]any `json:"form,omitempty"`
+	URL  map[string]any `json:"url,omitempty"`
+}
+
 type ToolDef struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
@@ -69,6 +158,11 @@ type ToolsListResult struct {
 type ToolCallParams struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
+	Meta      RequestMeta     `json:"_meta,omitempty"`
+}
+
+type RequestMeta struct {
+	ProgressToken json.RawMessage `json:"progressToken,omitempty"`
 }
 
 type ToolCallResult struct {
@@ -79,6 +173,29 @@ type ToolCallResult struct {
 type ContentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+}
+
+type ProgressParams struct {
+	ProgressToken json.RawMessage `json:"progressToken"`
+	Progress      float64         `json:"progress"`
+	Total         float64         `json:"total,omitempty"`
+	Message       string          `json:"message,omitempty"`
+}
+
+type CancelledParams struct {
+	RequestID json.RawMessage `json:"requestId"`
+	Reason    string          `json:"reason,omitempty"`
+}
+
+type ElicitationParams struct {
+	Mode            string         `json:"mode,omitempty"`
+	Message         string         `json:"message"`
+	RequestedSchema map[string]any `json:"requestedSchema"`
+}
+
+type ElicitationResult struct {
+	Action  string         `json:"action"`
+	Content map[string]any `json:"content,omitempty"`
 }
 
 // Server is a lightweight MCP server that exposes a ToolRegistry over
@@ -104,64 +221,336 @@ func NewServer(tools *agent.ToolRegistry, name, version string, perms *permissio
 	}
 }
 
-// Serve reads JSON-RPC requests from reader (one per line) and writes
-// responses to writer. It blocks until the reader is closed or the
-// context is cancelled.
-func (s *Server) Serve(ctx context.Context, reader io.Reader, writer io.Writer) error {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	enc := json.NewEncoder(writer)
+type serverSession struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	enc    *json.Encoder
 
-	for scanner.Scan() {
+	writeMu sync.Mutex
+	wg      sync.WaitGroup
+
+	activeMu sync.Mutex
+	active   map[string]context.CancelFunc
+
+	pendingMu sync.Mutex
+	pending   map[string]chan inboundMessage
+	nextID    atomic.Uint64
+
+	stateMu             sync.RWMutex
+	initialized         bool
+	supportsElicitation bool
+	writeErr            error
+}
+
+func newServerSession(ctx context.Context, writer io.Writer) *serverSession {
+	sessionCtx, cancel := context.WithCancel(ctx)
+	return &serverSession{
+		ctx:     sessionCtx,
+		cancel:  cancel,
+		enc:     json.NewEncoder(writer),
+		active:  make(map[string]context.CancelFunc),
+		pending: make(map[string]chan inboundMessage),
+	}
+}
+
+func rawIDKey(id *json.RawMessage) string {
+	if id == nil {
+		return ""
+	}
+	return string(*id)
+}
+
+func (ss *serverSession) write(value any) error {
+	ss.writeMu.Lock()
+	defer ss.writeMu.Unlock()
+	if ss.writeErr != nil {
+		return ss.writeErr
+	}
+	if err := ss.enc.Encode(value); err != nil {
+		ss.writeErr = err
+		ss.cancel()
+		return err
+	}
+	return nil
+}
+
+func (ss *serverSession) setInitialized(params json.RawMessage) {
+	var init InitializeParams
+	_ = json.Unmarshal(params, &init)
+	protocolVersion := negotiatedProtocolVersion(params)
+	ss.stateMu.Lock()
+	ss.supportsElicitation =
+		(protocolVersion == "2025-06-18" || protocolVersion == "2025-11-25") &&
+			init.Capabilities.Elicitation != nil &&
+			init.Capabilities.Elicitation.Form != nil
+	ss.stateMu.Unlock()
+}
+
+func (ss *serverSession) markReady() {
+	ss.stateMu.Lock()
+	ss.initialized = true
+	ss.stateMu.Unlock()
+}
+
+func (ss *serverSession) ready() bool {
+	ss.stateMu.RLock()
+	defer ss.stateMu.RUnlock()
+	return ss.initialized
+}
+
+func (ss *serverSession) canElicit() bool {
+	ss.stateMu.RLock()
+	defer ss.stateMu.RUnlock()
+	return ss.supportsElicitation
+}
+
+// tryRegisterActive records a cancel func for an in-flight request id. It
+// returns false when that id is already in flight, leaving the existing entry
+// intact so a duplicate request cannot clobber the original's cancel func.
+func (ss *serverSession) tryRegisterActive(id *json.RawMessage, cancel context.CancelFunc) bool {
+	key := rawIDKey(id)
+	ss.activeMu.Lock()
+	defer ss.activeMu.Unlock()
+	if _, exists := ss.active[key]; exists {
+		return false
+	}
+	ss.active[key] = cancel
+	return true
+}
+
+func (ss *serverSession) finishActive(id *json.RawMessage) {
+	ss.activeMu.Lock()
+	delete(ss.active, rawIDKey(id))
+	ss.activeMu.Unlock()
+}
+
+func (ss *serverSession) cancelActive(id json.RawMessage) {
+	ss.activeMu.Lock()
+	cancel := ss.active[string(id)]
+	ss.activeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (ss *serverSession) cancelAllActive() {
+	ss.activeMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(ss.active))
+	for _, cancel := range ss.active {
+		cancels = append(cancels, cancel)
+	}
+	ss.activeMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (ss *serverSession) deliverResponse(msg inboundMessage) {
+	key := rawIDKey(msg.ID)
+	ss.pendingMu.Lock()
+	ch := ss.pending[key]
+	ss.pendingMu.Unlock()
+	if ch != nil {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case ch <- msg:
 		default:
 		}
+	}
+}
 
+// Serve reads newline-delimited JSON-RPC messages. Requests execute
+// concurrently so cancellation notifications and responses to server-initiated
+// elicitation remain processable while a tool is running.
+func (s *Server) Serve(ctx context.Context, reader io.Reader, writer io.Writer) error {
+	ss := newServerSession(ctx, writer)
+	defer ss.cancel()
+
+	changes, unsubscribe := s.tools.SubscribeChanges()
+	defer unsubscribe()
+	listChangedDone := make(chan struct{})
+	go func() {
+		defer close(listChangedDone)
+		for {
+			select {
+			case <-ss.ctx.Done():
+				return
+			case <-changes:
+				if ss.ready() {
+					_ = ss.write(map[string]any{
+						"jsonrpc": "2.0",
+						"method":  "notifications/tools/list_changed",
+					})
+				}
+			}
+		}
+	}()
+
+	// Bound both executing and queued request goroutines without blocking frame
+	// reading. This keeps cancellation and elicitation responses responsive
+	// while preventing an untrusted client from creating an unbounded goroutine
+	// backlog.
+	maxRunning := maxConcurrentRequests()
+	executionSlots := make(chan struct{}, maxRunning)
+	requestSlots := make(chan struct{}, maxRunning+maxQueuedRequests())
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
+	for scanner.Scan() {
+		if ss.ctx.Err() != nil {
+			break
+		}
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
 
-		var req Request
-		if err := json.Unmarshal(line, &req); err != nil {
-			enc.Encode(errorResponse(nil, -32700, "parse error"))
+		var msg inboundMessage
+		if err := json.Unmarshal(line, &msg); err != nil {
+			_ = ss.write(errorResponse(nil, -32700, "parse error"))
+			continue
+		}
+		if msg.Method == "" && msg.ID != nil {
+			ss.deliverResponse(msg)
+			continue
+		}
+		if msg.ID == nil {
+			switch msg.Method {
+			case "notifications/initialized":
+				ss.markReady()
+			case "notifications/cancelled":
+				var params CancelledParams
+				if json.Unmarshal(msg.Params, &params) == nil && len(params.RequestID) > 0 {
+					ss.cancelActive(params.RequestID)
+				}
+			}
 			continue
 		}
 
-		// Notifications have no ID and must not receive a response.
-		if req.ID == nil {
+		if msg.Method == "initialize" {
+			ss.setInitialized(msg.Params)
+			_ = ss.write(s.handleInitialize(msg.ID, msg.Params))
 			continue
 		}
 
-		var resp Response
-		switch req.Method {
-		case "initialize":
-			resp = s.handleInitialize(req.ID)
-		case "tools/list":
-			resp = s.handleToolsList(req.ID)
-		case "tools/call":
-			resp = s.handleToolCall(ctx, req.ID, req.Params)
+		requestCtx, requestCancel := context.WithCancel(ss.ctx)
+		if !ss.tryRegisterActive(msg.ID, requestCancel) {
+			requestCancel()
+			_ = ss.write(errorResponse(msg.ID, -32600, "request id already in flight"))
+			continue
+		}
+		select {
+		case requestSlots <- struct{}{}:
 		default:
-			resp = errorResponse(req.ID, -32601, "method not found: "+req.Method)
+			requestCancel()
+			ss.finishActive(msg.ID)
+			_ = ss.write(errorResponse(msg.ID, -32000, "too many concurrent MCP requests; retry later"))
+			continue
 		}
+		ss.wg.Add(1)
+		go func(msg inboundMessage, requestCtx context.Context, requestCancel context.CancelFunc) {
+			defer ss.wg.Done()
+			defer func() { <-requestSlots }()
+			defer requestCancel()
+			defer ss.finishActive(msg.ID)
 
-		if err := enc.Encode(resp); err != nil {
-			return err
+			// A cancellation received while this request is queued must prevent
+			// execution entirely. The second Err check closes the race where the
+			// context and a newly freed slot become ready simultaneously.
+			select {
+			case executionSlots <- struct{}{}:
+			case <-requestCtx.Done():
+				return
+			}
+			defer func() { <-executionSlots }()
+			if requestCtx.Err() != nil {
+				return
+			}
+
+			requestCtx = withLifecycleSession(requestCtx, ss)
+
+			var resp Response
+			switch msg.Method {
+			case "tools/list":
+				resp = s.handleToolsList(msg.ID)
+			case "tools/call":
+				resp = s.handleToolCall(requestCtx, msg.ID, msg.Params)
+			default:
+				resp = errorResponse(msg.ID, -32601, "method not found: "+msg.Method)
+			}
+			// Cancellation is fire-and-forget: once cancelled, the receiver
+			// stops work and does not send a late response for that request.
+			if requestCtx.Err() == nil {
+				_ = ss.write(resp)
+			}
+		}(msg, requestCtx, requestCancel)
+	}
+
+	scanErr := scanner.Err()
+	if scanErr != nil || ctx.Err() != nil {
+		// The read failed or the parent context is done: no client remains, so
+		// cancel in-flight work immediately.
+		ss.cancelAllActive()
+	}
+	// Drain in-flight requests, then guarantee termination. On a clean EOF the
+	// parent ctx is still live and nothing has been cancelled yet — running
+	// requests get a bounded grace to finish and flush their responses (this is
+	// how single-shot callers that close stdin still receive their reply), then
+	// any straggler is cancelled so a tool blocked on ctx.Done() cannot pin
+	// wg.Wait() forever. When cancelAllActive already ran above, the drain
+	// completes immediately.
+	drained := make(chan struct{})
+	go func() {
+		ss.wg.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(eofDrainGrace()):
+		ss.cancelAllActive()
+		ss.cancel()
+		select {
+		case <-drained:
+		case <-time.After(eofDrainGrace()):
+			// A Tool.Run implementation that ignores ctx cannot be forcibly
+			// stopped in Go. Do not let it pin the MCP transport forever; the
+			// cancelled request suppresses any late response if it returns.
 		}
 	}
-	return scanner.Err()
+	ss.cancel()
+	<-listChangedDone
+	if scanErr != nil {
+		return scanErr
+	}
+	if ss.writeErr != nil {
+		return ss.writeErr
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return nil
 }
 
-func (s *Server) handleInitialize(id *json.RawMessage) Response {
+func negotiatedProtocolVersion(params json.RawMessage) string {
+	var init InitializeParams
+	if json.Unmarshal(params, &init) != nil || init.ProtocolVersion == "" {
+		return "2024-11-05"
+	}
+	switch init.ProtocolVersion {
+	case "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25":
+		return init.ProtocolVersion
+	default:
+		return "2025-11-25"
+	}
+}
+
+func (s *Server) handleInitialize(id *json.RawMessage, params json.RawMessage) Response {
 	return Response{
 		JSONRPC: "2.0",
 		ID:      id,
 		Result: InitializeResult{
-			ProtocolVersion: "2024-11-05",
+			ProtocolVersion: negotiatedProtocolVersion(params),
 			Capabilities: Capabilities{
-				Tools: &ToolsCapability{ListChanged: false},
+				Tools: &ToolsCapability{ListChanged: true},
 			},
 			ServerInfo: ServerInfo{Name: s.name, Version: s.version},
 		},
@@ -172,9 +561,14 @@ func (s *Server) handleToolsList(id *json.RawMessage) Response {
 	var tools []ToolDef
 	for _, t := range s.tools.All() {
 		info := t.Info()
-		schema := map[string]any{
-			"type":       "object",
-			"properties": info.Parameters,
+		schema := cloneSchema(info.Parameters)
+		// Current builtin tools expose a complete JSON Schema in Parameters.
+		// Keep compatibility with older/custom tools that expose only the flat
+		// properties map, but never nest a complete schema under properties.
+		if _, hasType := schema["type"]; !hasType {
+			schema = map[string]any{"type": "object", "properties": schema}
+		} else if _, hasProperties := schema["properties"]; !hasProperties {
+			schema["properties"] = map[string]any{}
 		}
 		if len(info.Required) > 0 {
 			schema["required"] = info.Required
@@ -205,7 +599,27 @@ func (s *Server) handleToolCall(ctx context.Context, id *json.RawMessage, params
 
 	argsStr := string(p.Arguments)
 
-	// Permission check: MCP has no interactive TTY, so "ask" → deny (conservative)
+	// Validate before permission evaluation or hooks so malformed calls cannot
+	// prompt for approval, trigger automation, or reach Tool.Run.
+	if validationResult, valid := agent.ValidateToolArgumentPresence(tool.Info(), argsStr); !valid {
+		s.logAudit(p.Name, argsStr, validationResult.Content, "validation", 0)
+		return Response{
+			JSONRPC: "2.0",
+			ID:      id,
+			Result: ToolCallResult{
+				Content: []ContentBlock{{Type: "text", Text: validationResult.Content}},
+				IsError: true,
+			},
+		}
+	}
+
+	requiresInteractiveApproval := tool.RequiresApproval()
+	if checker, ok := tool.(agent.SafeCheckerWithContext); ok && checker.IsSafeArgsWithContext(ctx, argsStr) {
+		requiresInteractiveApproval = false
+	} else if checker, ok := tool.(agent.SafeChecker); ok && checker.IsSafeArgs(argsStr) {
+		requiresInteractiveApproval = false
+	}
+	approvalReason := ""
 	if s.permissions != nil {
 		decision, reason := permissions.CheckToolCall(p.Name, argsStr, s.permissions)
 		if decision == "deny" {
@@ -213,20 +627,27 @@ func (s *Server) handleToolCall(ctx context.Context, id *json.RawMessage, params
 			return errorResponse(id, -32603, "tool call denied by permission policy")
 		}
 		if decision == "ask" {
-			s.logAudit(p.Name, argsStr, "denied (requires approval, no TTY): "+reason, "deny", 0)
-			return errorResponse(id, -32603, "tool call requires approval (not available in MCP mode)")
+			requiresInteractiveApproval = true
+			approvalReason = reason
+		} else if decision == "allow" {
+			requiresInteractiveApproval = false
 		}
-	} else {
-		// No permissions config: only allow tools that don't require approval
-		if tool.RequiresApproval() {
-			s.logAudit(p.Name, argsStr, "denied (requires approval, no permissions config)", "deny", 0)
-			return errorResponse(id, -32603, "tool call requires approval (not available in MCP mode)")
+	}
+	if requiresInteractiveApproval {
+		approved, approvalErr := requestToolApproval(ctx, p.Name)
+		if approvalErr != nil || !approved {
+			detail := approvalReason
+			if approvalErr != nil {
+				detail = approvalErr.Error()
+			}
+			s.logAudit(p.Name, argsStr, "approval unavailable or declined: "+detail, "deny", 0)
+			return errorResponse(id, -32603, "tool call requires user approval")
 		}
 	}
 
 	// Pre-tool-use hook
 	if s.hookRunner != nil {
-		hookDecision, hookReason, hookErr := s.hookRunner.RunPreToolUse(ctx, p.Name, argsStr, "")
+		hookDecision, hookReason, hookErr := s.hookRunner.RunPreToolUse(ctx, p.Name, argsStr, "mcp")
 		if hookErr != nil {
 			fmt.Fprintf(io.Discard, "[hooks] pre-tool-use error: %v\n", hookErr)
 		}
@@ -236,16 +657,19 @@ func (s *Server) handleToolCall(ctx context.Context, id *json.RawMessage, params
 		}
 	}
 
+	ctx = withProgressToken(ctx, p.Meta.ProgressToken)
+	ReportProgress(ctx, 0, 1, "Tool execution started")
 	startTime := time.Now()
 	result, err := tool.Run(ctx, argsStr)
 	elapsed := time.Since(startTime)
 	if err != nil {
 		return errorResponse(id, -32603, err.Error())
 	}
+	ReportProgress(ctx, 1, 1, "Tool execution completed")
 
 	// Post-tool-use hook
 	if s.hookRunner != nil {
-		_ = s.hookRunner.RunPostToolUse(ctx, p.Name, argsStr, result.Content, "")
+		_ = s.hookRunner.RunPostToolUse(ctx, p.Name, argsStr, result.Content, "mcp")
 	}
 
 	s.logAudit(p.Name, argsStr, result.Content, "allow", elapsed.Milliseconds())
@@ -258,6 +682,37 @@ func (s *Server) handleToolCall(ctx context.Context, id *json.RawMessage, params
 			IsError: result.IsError,
 		},
 	}
+}
+
+func requestToolApproval(ctx context.Context, toolName string) (bool, error) {
+	result, err := RequestElicitation(
+		ctx,
+		"Allow the requested "+toolName+" tool call?",
+		map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"confirmed": map[string]any{
+					"type":        "boolean",
+					"title":       "Allow tool call",
+					"description": "Confirm this single tool execution.",
+				},
+			},
+			"required": []string{"confirmed"},
+		},
+	)
+	if err != nil {
+		return false, err
+	}
+	confirmed, _ := result.Content["confirmed"].(bool)
+	return result.Action == "accept" && confirmed, nil
+}
+
+func cloneSchema(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func (s *Server) logAudit(toolName, argsStr, outputSummary, decision string, durationMs int64) {

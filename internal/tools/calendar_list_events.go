@@ -69,6 +69,9 @@ func (t *CalendarListEventsTool) RequiresApproval() bool { return false }
 func (t *CalendarListEventsTool) IsReadOnlyCall(string) bool { return true }
 
 func (t *CalendarListEventsTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	if t.Broker == nil {
 		return agent.ToolResult{
 			Content: "calendar_list_events: Desktop RPC broker not available",
@@ -78,12 +81,6 @@ func (t *CalendarListEventsTool) Run(ctx context.Context, argsJSON string) (agen
 	var args calendarListEventsArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return invalidArgResult("calendar_list_events", "_", err.Error()), nil
-	}
-	if args.Start == "" {
-		return agent.ValidationError("calendar_list_events: missing required `start` parameter"), nil
-	}
-	if args.End == "" {
-		return agent.ValidationError("calendar_list_events: missing required `end` parameter"), nil
 	}
 	if err := validateRFC3339(args.Start); err != nil {
 		return invalidArgResult("calendar_list_events", "start", err.Error()), nil
