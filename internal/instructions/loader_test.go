@@ -30,7 +30,7 @@ func TestLoadInstructions_BasicHierarchy(t *testing.T) {
 	// Create project local
 	os.WriteFile(filepath.Join(projectDir, "instructions.local.md"), []byte("local overrides"), 0644)
 
-	result, err := LoadInstructions(shannonDir, projectDir, 10000)
+	result, err := LoadInstructions(shannonDir, "", projectDir, 10000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestLoadInstructions_NoProvenanceComments(t *testing.T) {
 	shannonDir := t.TempDir()
 	os.WriteFile(filepath.Join(shannonDir, "instructions.md"), []byte("hello"), 0644)
 
-	result, err := LoadInstructions(shannonDir, "", 10000)
+	result, err := LoadInstructions(shannonDir, "", "", 10000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestLoadInstructions_MissingFiles(t *testing.T) {
 	projectDir := t.TempDir()
 
 	// No files created — all should be missing
-	result, err := LoadInstructions(shannonDir, projectDir, 10000)
+	result, err := LoadInstructions(shannonDir, "", projectDir, 10000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestLoadInstructions_MissingFiles(t *testing.T) {
 }
 
 func TestLoadInstructions_EmptyDirs(t *testing.T) {
-	result, err := LoadInstructions("", "", 10000)
+	result, err := LoadInstructions("", "", "", 10000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestLoadInstructions_Deduplication(t *testing.T) {
 	os.WriteFile(filepath.Join(shannonDir, "instructions.md"), []byte("shared line\nglobal only"), 0644)
 	os.WriteFile(filepath.Join(projectDir, "instructions.md"), []byte("shared line\nproject only"), 0644)
 
-	result, err := LoadInstructions(shannonDir, projectDir, 10000)
+	result, err := LoadInstructions(shannonDir, "", projectDir, 10000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestLoadInstructions_Truncation(t *testing.T) {
 	os.WriteFile(filepath.Join(shannonDir, "instructions.md"), []byte(bigContent), 0644)
 
 	// Budget of 500 tokens = 2000 chars
-	result, err := LoadInstructions(shannonDir, "", 500)
+	result, err := LoadInstructions(shannonDir, "", "", 500)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestLoadInstructions_NonMDFilesIgnored(t *testing.T) {
 	os.WriteFile(filepath.Join(shannonDir, "rules", "ignored.txt"), []byte("should be ignored"), 0644)
 	os.WriteFile(filepath.Join(shannonDir, "rules", "ignored.yaml"), []byte("also ignored"), 0644)
 
-	result, err := LoadInstructions(shannonDir, "", 10000)
+	result, err := LoadInstructions(shannonDir, "", "", 10000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestLoadInstructions_InvalidUTF8(t *testing.T) {
 	// Write invalid UTF-8
 	os.WriteFile(filepath.Join(shannonDir, "instructions.md"), []byte{0xff, 0xfe, 0xfd}, 0644)
 
-	result, err := LoadInstructions(shannonDir, "", 10000)
+	result, err := LoadInstructions(shannonDir, "", "", 10000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestLoadInstructions_RulesSortedAlphabetically(t *testing.T) {
 	os.WriteFile(filepath.Join(shannonDir, "rules", "alice.md"), []byte("alice"), 0644)
 	os.WriteFile(filepath.Join(shannonDir, "rules", "bob.md"), []byte("bob"), 0644)
 
-	result, err := LoadInstructions(shannonDir, "", 10000)
+	result, err := LoadInstructions(shannonDir, "", "", 10000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -439,7 +439,7 @@ func TestLoadInstructions_DeduplicationPreservesEmptyLines(t *testing.T) {
 	os.WriteFile(filepath.Join(shannonDir, "instructions.md"), []byte("line1\n\nline2"), 0644)
 	os.WriteFile(filepath.Join(projectDir, "instructions.md"), []byte("line3\n\nline4"), 0644)
 
-	result, err := LoadInstructions(shannonDir, projectDir, 10000)
+	result, err := LoadInstructions(shannonDir, "", projectDir, 10000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

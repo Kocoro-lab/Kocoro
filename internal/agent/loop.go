@@ -776,6 +776,7 @@ type AgentLoop struct {
 	contextWindow         int
 	contextWindowExplicit bool
 	memoryDir             string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
+	projectEntityDir      string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
 	stickyContext         string             // session-scoped facts injected verbatim into system prompt; never truncated
 	outputFormat          string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
 	userFilePaths         []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
@@ -1870,6 +1871,15 @@ func (a *AgentLoop) SetSessionCWD(cwd string) {
 	a.sessionCWD = cwd
 }
 
+// SetProjectEntityDir sets the owning project's directory (~/.shannon/projects/
+// <id>) so LoadInstructions layers the project-scoped instructions tier. Pass ""
+// for an unfiled session. Project memory is handled separately by pointing the
+// loop's memoryDir at the same directory (see runner), so project memory reads
+// and auto-accumulation reuse the existing MEMORY.md plumbing.
+func (a *AgentLoop) SetProjectEntityDir(dir string) {
+	a.projectEntityDir = dir
+}
+
 // UserAttachedPath represents a single path the user attached via a file_ref
 // block. IsDir distinguishes folder attachments from file attachments so the
 // auto-approve matcher can do prefix-match for directories (entries inside an
@@ -2167,7 +2177,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	if cwd != "" {
 		projectDir = filepath.Join(cwd, ".shannon")
 	}
-	instrText, _ := instructions.LoadInstructions(a.shannonDir, projectDir, 4000)
+	instrText, _ := instructions.LoadInstructions(a.shannonDir, a.projectEntityDir, projectDir, 4000)
 	if cwd != "" {
 		ctx = cwdctx.WithSessionCWD(ctx, cwd)
 	}

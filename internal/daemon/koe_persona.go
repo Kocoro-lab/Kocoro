@@ -39,7 +39,7 @@ func (s *Server) buildKoePersona(ctx context.Context) (string, error) {
 	}
 	// Global (default) source: distill the user's instructions + memory. projectDir
 	// is empty: the persona is about the user, not the cwd.
-	instr, _ := instructions.LoadInstructions(s.deps.ShannonDir, "", 8000)
+	instr, _ := instructions.LoadInstructions(s.deps.ShannonDir, "", "", 8000)
 	mem, _ := instructions.LoadMemory(s.deps.ShannonDir, 200)
 	src := strings.TrimSpace(strings.TrimSpace(instr) + "\n\n" + strings.TrimSpace(mem))
 	if src == "" {

@@ -36,6 +36,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
 	"github.com/Kocoro-lab/ShanClaw/internal/migrate/claudecode"
+	"github.com/Kocoro-lab/ShanClaw/internal/projects"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
@@ -565,6 +566,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /agents/{name}/permissions/always-allow", s.handleRemoveAgentAlwaysAllow)
 	mux.HandleFunc("POST /permissions/always-allow", s.handleAddGlobalAlwaysAllow)
 	mux.HandleFunc("DELETE /permissions/always-allow", s.handleRemoveGlobalAlwaysAllow)
+	mux.HandleFunc("GET /projects", s.handleProjects)
+	mux.HandleFunc("POST /projects", s.handleCreateProject)
+	mux.HandleFunc("GET /projects/{id}", s.handleGetProject)
+	mux.HandleFunc("PUT /projects/{id}", s.handleUpdateProject)
+	mux.HandleFunc("DELETE /projects/{id}", s.handleDeleteProject)
 	mux.HandleFunc("PUT /agents/{name}/commands/{cmd}", s.handlePutCommand)
 	mux.HandleFunc("DELETE /agents/{name}/commands/{cmd}", s.handleDeleteCommand)
 	mux.HandleFunc("PUT /agents/{name}/skills/{skill}", s.handlePutSkill)
@@ -1526,6 +1532,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	scopeAll := r.URL.Query().Get("scope") == "all"
 	limit, offset := parseSessionPageParams(r, scopeAll)
 	projectCWD := sessionProjectCWDFilter(r)
+	projectID := sessionProjectIDFilter(r)
 	scheduleID := strings.TrimSpace(r.URL.Query().Get("schedule_id"))
 
 	// scope=all merges the default scope with every named agent's sessions.
@@ -1552,7 +1559,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 				summaries = append(summaries, sum)
 			}
 		}
-		s.writeSessionsPage(w, summaries, limit, offset, projectCWD, scheduleID)
+		s.writeSessionsPage(w, summaries, limit, offset, projectCWD, projectID, scheduleID)
 		return
 	}
 
@@ -1568,7 +1575,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// If the directory doesn't exist, return empty list.
 		if os.IsNotExist(err) {
-			s.writeSessionsPage(w, nil, limit, offset, projectCWD, scheduleID)
+			s.writeSessionsPage(w, nil, limit, offset, projectCWD, projectID, scheduleID)
 			return
 		}
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
@@ -1577,7 +1584,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	for i := range summaries {
 		summaries[i].Agent = agentName
 	}
-	s.writeSessionsPage(w, summaries, limit, offset, projectCWD, scheduleID)
+	s.writeSessionsPage(w, summaries, limit, offset, projectCWD, projectID, scheduleID)
 }
 
 // defaultSessionsPageLimit is the page size applied to scope=all when the
@@ -1635,7 +1642,7 @@ type sessionProjectSummary struct {
 // unlimitedSessionsPage (0) returns every row from `offset` on (has_more
 // false). Pinned sessions are capped well under a page, so they naturally lead
 // the first page without special-casing.
-func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.SessionSummary, limit, offset int, projectCWD *string, scheduleID string) {
+func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.SessionSummary, limit, offset int, projectCWD *string, projectID *string, scheduleID string) {
 	enriched := s.enrichSummaries(summaries)
 	if scheduleID != "" {
 		filtered := enriched[:0]
@@ -1652,6 +1659,19 @@ func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.Se
 		filtered := enriched[:0]
 		for _, summary := range enriched {
 			if summary.CWD == wanted {
+				filtered = append(filtered, summary)
+			}
+		}
+		enriched = filtered
+	}
+	// project_id filter: absent = all, present+empty = unfiled sessions,
+	// present+value = that exact project entity. Plain string compare (project
+	// ids are opaque slugs, no path normalization).
+	if projectID != nil {
+		wanted := strings.TrimSpace(*projectID)
+		filtered := enriched[:0]
+		for _, summary := range enriched {
+			if summary.ProjectID == wanted {
 				filtered = append(filtered, summary)
 			}
 		}
@@ -1694,6 +1714,21 @@ func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.Se
 // exact normalized working directory.
 func sessionProjectCWDFilter(r *http.Request) *string {
 	values, present := r.URL.Query()["project_cwd"]
+	if !present {
+		return nil
+	}
+	value := ""
+	if len(values) > 0 {
+		value = values[0]
+	}
+	return &value
+}
+
+// sessionProjectIDFilter preserves three states mirroring the CWD filter:
+// absent = all, present+empty = unfiled sessions, present+id = that exact
+// project entity.
+func sessionProjectIDFilter(r *http.Request) *string {
+	values, present := r.URL.Query()["project_id"]
 	if !present {
 		return nil
 	}
@@ -2053,16 +2088,35 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Title    *string `json:"title,omitempty"`
-		Pinned   *bool   `json:"pinned,omitempty"`
-		Favorite *bool   `json:"favorite,omitempty"`
+		Title     *string `json:"title,omitempty"`
+		Pinned    *bool   `json:"pinned,omitempty"`
+		Favorite  *bool   `json:"favorite,omitempty"`
+		ProjectID *string `json:"project_id,omitempty"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
 	}
-	if body.Title == nil && body.Pinned == nil && body.Favorite == nil {
-		writeError(w, http.StatusBadRequest, "request body must include at least one of: title, pinned, favorite")
+	if body.Title == nil && body.Pinned == nil && body.Favorite == nil && body.ProjectID == nil {
+		writeError(w, http.StatusBadRequest, "request body must include at least one of: title, pinned, favorite, project_id")
 		return
+	}
+	// project_id: "" clears the tag (unfile); a non-empty value must reference an
+	// existing project so we never file a session into a ghost project.
+	if body.ProjectID != nil && *body.ProjectID != "" {
+		if err := projects.ValidateProjectID(*body.ProjectID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Reject (don't silently file into a project that cannot exist) when the
+		// projects store isn't configured; otherwise require the project to exist.
+		if s.deps.ProjectsDir == "" {
+			writeError(w, http.StatusBadRequest, "projects not configured")
+			return
+		}
+		if _, err := projects.LoadProject(s.deps.ProjectsDir, *body.ProjectID); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("project %q not found", *body.ProjectID))
+			return
+		}
 	}
 	var title string
 	if body.Title != nil {
@@ -2108,6 +2162,17 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		if body.Favorite != nil {
 			resp["favorite"] = *body.Favorite
 		}
+	}
+	if body.ProjectID != nil {
+		if err := mgr.PatchProjectID(id, body.ProjectID); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		resp["project_id"] = *body.ProjectID
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
