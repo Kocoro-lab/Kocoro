@@ -232,6 +232,13 @@ const (
 	// error codes for failed/in-progress retries. Crash-safe deliverable recovery
 	// depends on this stronger cross-process contract.
 	CapMessageIdempotencyReceiptV2 = "message_idempotency_receipt_v2"
+	// CapQuestionV1 — daemon supports the structured ask-user interaction: it
+	// emits question.request / question.resolved bus events (and a "question"
+	// per-request SSE frame) and accepts answers at POST /question. Desktop gates
+	// its question-card rendering + answer round-trip on this token; an old
+	// daemon omits it and never emits the events, so the ask-user tool stays a
+	// no-op there rather than surfacing an undecodable event family.
+	CapQuestionV1 = "question_v1"
 )
 
 var Capabilities = []string{
@@ -264,6 +271,7 @@ var Capabilities = []string{
 	CapIntegrationToolsV1,
 	CapMessageIdempotencyV1,
 	CapMessageIdempotencyReceiptV2,
+	CapQuestionV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
