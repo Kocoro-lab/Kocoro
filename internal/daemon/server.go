@@ -72,6 +72,13 @@ type Server struct {
 	// pendingBrokers maps requestID → per-request ApprovalBroker.
 	// SSE handlers register here so POST /approval can find the right broker.
 	pendingBrokers sync.Map // map[string]*ApprovalBroker
+	// questionBroker is the server-level QuestionBroker (ask_user_question).
+	// Like approvalBroker its sendFn is a no-op; SSE per-request brokers inherit
+	// its bus hooks so question.request / question.resolved stay consistent.
+	questionBroker *QuestionBroker
+	// pendingQuestionBrokers maps requestID → per-request QuestionBroker so
+	// POST /question can find the right broker (parallels pendingBrokers).
+	pendingQuestionBrokers sync.Map // map[string]*QuestionBroker
 	remoteRuns     sync.Map // map[string]*remoteRunState
 	remoteRunSlots chan struct{}
 	// Remote run events are sequenced and kept briefly so a Cloud WS reconnect can
@@ -299,6 +306,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		deps:                   deps,
 		version:                version,
 		approvalBroker:         NewApprovalBroker(func(req ApprovalRequest) error { return nil }),
+		questionBroker:         NewQuestionBroker(func(req QuestionRequest) error { return nil }),
 		eventBus:               NewEventBus(),
 		notifyApprovalResolved: func(p ApprovalResolvedPayload) error { return nil },
 		remoteRunSlots:         make(chan struct{}, MaxConcurrentAgents),
@@ -324,6 +332,11 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	WireApprovalBusHooks(s.approvalBroker, s.eventBus, func(p ApprovalResolvedPayload) error {
 		return s.notifyApprovalResolved(p)
 	})
+	// Question interaction: same bus-hook wiring so SSE per-request question
+	// brokers publish question.request / question.resolved through one path.
+	// notify is nil — no Cloud question transport exists yet (the interaction
+	// is Desktop-local today).
+	WireQuestionBusHooks(s.questionBroker, s.eventBus, nil)
 	if deps != nil {
 		deps.Suggestions = s.suggestions
 		if deps.ApprovalTracker == nil {
@@ -676,6 +689,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /permissions/request", s.handlePermissionsRequest)
 	mux.HandleFunc("POST /approval", s.handleApproval)
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
+	mux.HandleFunc("POST /question", s.handleQuestion)
 	mux.HandleFunc("POST /remote/pairing-code", s.handleRemotePairingCode)
 	mux.HandleFunc("GET /remote/pairings", s.handleRemotePairings)
 	mux.HandleFunc("POST /remote/revoke", s.handleRemoteRevoke)
@@ -1363,6 +1377,48 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true}`))
+}
+
+// handleQuestion resolves a pending ask_user_question interaction. Mirrors
+// handleApproval: it claims the request under the broker mutex and emits the
+// terminal question.resolved (resolved_by=kocoro) as Resolve's beforeDeliver so
+// the event is sequenced before any post-answer agent event. Desktop-only
+// transport (the agent never calls it), so it stays out of the kocoro skill
+// references but is pinned by the wire fixtures.
+func (s *Server) handleQuestion(w http.ResponseWriter, r *http.Request) {
+	var req QuestionResponse
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.RequestID == "" {
+		http.Error(w, `{"error":"request_id required"}`, http.StatusBadRequest)
+		return
+	}
+	switch req.Action {
+	case QuestionActionAnswer, QuestionActionDecline:
+	default:
+		http.Error(w, `{"error":"action must be answer or decline"}`, http.StatusBadRequest)
+		return
+	}
+	resolution := questionResolution{Action: req.Action, Answers: req.Answers}
+	emitResolved := func() {
+		emitBusJSON(s.eventBus, EventQuestionResolved, map[string]any{
+			"request_id":  req.RequestID,
+			"action":      req.Action,
+			"resolved_by": "kocoro",
+			"ts":          nowISO(),
+		})
+	}
+	// The per-request SSE broker owns the pending question; the server broker is
+	// the no-op-sendFn fallback that shares its bus hooks. No Cloud/WS question
+	// transport exists yet, so there is no third fallback (unlike approvals).
+	if b, ok := s.pendingQuestionBrokers.Load(req.RequestID); ok {
+		b.(*QuestionBroker).Resolve(req.RequestID, resolution, emitResolved)
+	} else {
+		s.questionBroker.Resolve(req.RequestID, resolution, emitResolved)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"ok":true}`))
 }
@@ -2786,6 +2842,16 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	// Cancel only this request's pending approvals when the SSE stream ends.
 	defer reqBroker.CancelAll()
 
+	// Per-request question broker (ask_user_question), parallel to reqBroker:
+	// its own pending map + SSE `question` sendFn, inheriting the server broker's
+	// bus hooks so question.request / question.resolved stay consistent.
+	qBroker := NewQuestionBroker(newSSEQuestionSendFn(w, flusher))
+	qBroker.onRequest = s.questionBroker.onRequest
+	qBroker.onCleanup = s.questionBroker.onCleanup
+	qBroker.onRegister = func(requestID string) { s.pendingQuestionBrokers.Store(requestID, qBroker) }
+	qBroker.onDeregister = func(requestID string) { s.pendingQuestionBrokers.Delete(requestID) }
+	defer qBroker.CancelAll()
+
 	// Resolve auto_approve: per-agent overrides global
 	cfg, _, _ := s.deps.Snapshot()
 	autoApprove := cfg.Daemon.AutoApprove
@@ -2796,7 +2862,21 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	}
 
 	handler := &sseEventHandler{w: w, flusher: flusher, broker: reqBroker, ctx: r.Context(), autoApprove: autoApprove, deps: s.deps, agent: req.Agent, source: req.Source}
-	result, err := RunAgent(r.Context(), s.deps, req, handler)
+	// Inject the QuestionAsker so ask_user_question can reach qBroker. metaFn is
+	// read lazily at ask time so the session id RunAgent resolves mid-run is
+	// captured, mirroring how OnApprovalNeeded reads handler.sessionID. An
+	// autoApprove/unattended SSE run gets no asker: a background run must not
+	// block on an interactive question, so the tool falls back cleanly.
+	askCtx := r.Context()
+	if !autoApprove {
+		askCtx = agent.WithQuestionAsker(askCtx, &brokerQuestionAsker{
+			broker: qBroker,
+			metaFn: func() ApprovalRequestMeta {
+				return ApprovalRequestMeta{SessionID: handler.sessionID, Source: req.Source, Agent: req.Agent}
+			},
+		})
+	}
+	result, err := RunAgent(askCtx, s.deps, req, handler)
 	if err != nil {
 		payload := map[string]string{"error": err.Error()}
 		switch {

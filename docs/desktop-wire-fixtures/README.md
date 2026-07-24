@@ -52,6 +52,17 @@ Three transport surfaces, named by file prefix:
 | `bus_event.approval_notice.json` | `alwaysallow.go emitAlwaysAllowNotice` | post-decision feedback; `code` is the stable i18n key, `message` is English fallback |
 | `sse_event.approval.json` | `server.go handleMessageSSE` per-request broker sendFn | full `ApprovalRequest` struct; `channel`/`thread_id`/`agent` are present-but-empty for foreground runs (no omitempty) |
 
+### Ask-user question lifecycle
+
+Second request/resolve interaction (`ask_user_question` tool). Same `pendingCore` lifecycle + at-most-one-terminal-event contract as approvals; distinct wire face. Capability token `question_v1`.
+
+| File | Producer | Notes |
+|---|---|---|
+| `bus_event.question_request.json` | `internal/daemon/question_broker.go makeQuestionRequestEmitter` | `questions` is the model-authored 1-4 array (`id` = `q0`..); `auto_resolution_ms` optional (omitted when 0) |
+| `bus_event.question_resolved.json` | `server.go handleQuestion` (`POST /question` ingress) | `action: "answer"`, `resolved_by: "kocoro"` = a UI answered it |
+| `bus_event.question_resolved.daemon_cleanup.json` | `question_broker.go makeQuestionCleanupEmitter` | timeout / ctx-cancel / disconnect; always `action: "cancel"`, `resolved_by: "daemon"`. Exactly one terminal event per request_id across both files |
+| `sse_event.question.json` | `server.go handleMessageSSE` per-request broker sendFn | full `QuestionRequest` struct on the per-request stream under the shorter frame name `question`; `channel`/`thread_id`/`agent` present-but-empty for foreground runs |
+
 ### Agent run events
 
 | File | Producer | Notes |

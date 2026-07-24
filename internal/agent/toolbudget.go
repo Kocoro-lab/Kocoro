@@ -49,6 +49,10 @@ var alwaysDeferTools = map[string]bool{
 	"schedule_list":   true,
 	"schedule_remove": true,
 	"schedule_update": true,
+	// ask_user_question is a rare-use escalation tool: most turns never ask the
+	// user, so defer its schema and let tool_search surface it on demand. Unlike
+	// web_search/web_fetch (neverDeferTools) it is not a common session-opener.
+	"ask_user_question": true,
 }
 
 // shouldDeferByCategory reports whether a tool name belongs to a category
