@@ -55,7 +55,7 @@ func TestComputer_MissingAction(t *testing.T) {
 	if !result.IsError {
 		t.Error("expected error result for missing action")
 	}
-	if !contains(result.Content, "missing required parameter: action") {
+	if !contains(result.Content, "missing required `action` parameter") {
 		t.Errorf("expected 'missing required parameter: action' in error, got: %s", result.Content)
 	}
 }

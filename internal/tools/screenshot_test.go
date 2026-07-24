@@ -21,20 +21,20 @@ func TestScreenshot_Info(t *testing.T) {
 	if !ok {
 		t.Fatal("expected properties map in parameters")
 	}
-	for _, key := range []string{"target", "path", "delay"} {
+	for _, key := range []string{"description", "target", "path", "delay"} {
 		if _, exists := props[key]; !exists {
 			t.Errorf("expected property %q in schema", key)
 		}
 	}
-	if len(info.Required) != 0 {
-		t.Errorf("expected no required fields, got %v", info.Required)
+	if len(info.Required) != 1 || info.Required[0] != "description" {
+		t.Errorf("expected description to be required, got %v", info.Required)
 	}
 }
 
 func TestScreenshot_RequiresApproval(t *testing.T) {
 	tool := &ScreenshotTool{}
-	if tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return false")
+	if !tool.RequiresApproval() {
+		t.Error("expected RequiresApproval to return true")
 	}
 }
 
@@ -51,7 +51,7 @@ func TestScreenshot_InvalidArgs(t *testing.T) {
 
 func TestScreenshot_UnknownTarget(t *testing.T) {
 	tool := &ScreenshotTool{}
-	result, err := tool.Run(context.Background(), `{"target": "webcam"}`)
+	result, err := tool.Run(context.Background(), `{"target": "webcam","description":"test invalid target"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

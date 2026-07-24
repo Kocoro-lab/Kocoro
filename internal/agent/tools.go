@@ -2,7 +2,11 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -133,6 +137,89 @@ func ValidationError(msg string) ToolResult {
 		Content:       "[validation error] " + msg,
 		IsError:       true,
 		ErrorCategory: ErrCategoryValidation,
+	}
+}
+
+// ValidateToolArguments enforces the strict builtin Tool.Run contract:
+// whitespace-only strings, zero numbers, false, null, and empty collections are
+// rejected for required fields. Builtins use typed argument structs, so after
+// unmarshalling they cannot distinguish a missing field from its zero value.
+func ValidateToolArguments(info ToolInfo, argsJSON string) (ToolResult, bool) {
+	return validateToolArguments(info, argsJSON, true)
+}
+
+// ValidateToolArgumentPresence performs the framework-level gate before
+// permission prompts, hooks, or execution. It rejects malformed input and
+// required fields that are absent or null, but accepts present zero values.
+//
+// Presence is authoritative at this layer because arguments are decoded into a
+// generic map. This matters for remote schemas we do not control: a required
+// boolean may legitimately be false, an offset may be 0, and an empty string or
+// collection may be meaningful. Builtin Tool.Run methods still call the strict
+// ValidateToolArguments after decoding their typed structs.
+func ValidateToolArgumentPresence(info ToolInfo, argsJSON string) (ToolResult, bool) {
+	return validateToolArguments(info, argsJSON, false)
+}
+
+func validateToolArguments(info ToolInfo, argsJSON string, rejectZero bool) (ToolResult, bool) {
+	raw := strings.TrimSpace(argsJSON)
+	if raw == "" {
+		raw = "{}"
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var args any
+	if err := decoder.Decode(&args); err != nil {
+		return ValidationError(fmt.Sprintf("%s: invalid arguments: %v", info.Name, err)), false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return ValidationError(fmt.Sprintf("%s: arguments must contain exactly one JSON value", info.Name)), false
+		}
+		return ValidationError(fmt.Sprintf("%s: invalid arguments: %v", info.Name, err)), false
+	}
+	obj, ok := args.(map[string]any)
+	if !ok {
+		return ValidationError(fmt.Sprintf("%s: arguments must be a JSON object", info.Name)), false
+	}
+
+	var missing []string
+	for _, name := range info.Required {
+		value, present := obj[name]
+		if !present || value == nil || (rejectZero && isZeroToolArgument(value)) {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return ValidationError(fmt.Sprintf(
+			"%s: missing required parameter(s): %s",
+			info.Name, strings.Join(missing, ", "),
+		)), false
+	}
+	return ToolResult{}, true
+}
+
+func isZeroToolArgument(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(v) == ""
+	case bool:
+		return !v
+	case json.Number:
+		f, err := v.Float64()
+		return err != nil || f == 0
+	case float64:
+		return v == 0
+	case []any:
+		return len(v) == 0
+	case map[string]any:
+		return len(v) == 0
+	default:
+		return false
 	}
 }
 
@@ -317,16 +404,16 @@ var autoApprovalDenyList = []string{}
 // unattendedAutoApprovalDenyList is the set of tools that scheduled
 // (unattended) agent runs MUST NOT auto-approve.
 //
-// computer_use (added 2026-07-22): drives the user's live GUI session —
-// keystrokes and clicks into whatever app is frontmost. A schedule firing at
-// 3am with nobody at the Mac must not type into arbitrary windows on the
-// strength of a one-time attended "Always Allow" click or a blanket
-// daemon.auto_approve. The gate covers the WHOLE tool, observation actions
-// included: checkPermissionAndApproval also suppresses the SafeChecker
-// exemption for listed tools on unattended runs, so a schedule cannot
-// silently screenshot the user's screen either. Attended use is unaffected:
+// computer_use (added 2026-07-22) drives the user's live GUI session.
+// screenshot (added 2026-07-23) captures the user's desktop. Neither may run
+// unattended: a schedule firing at 3am must not observe or control arbitrary
+// windows on the strength of a prior Always Allow click or daemon.auto_approve.
+//
+// The gate covers the WHOLE tool, observation actions included:
+// checkPermissionAndApproval also suppresses the SafeChecker exemption for
+// listed tools on unattended runs. Attended use is unaffected:
 // Desktop/Slack/TUI runs still honor always-allow, normal approval, and
-// approval-free observations.
+// approval-free computer_use observations.
 //
 // The legacy GUI tools (accessibility / computer / applescript) are
 // DELIBERATELY not listed yet: existing user schedules may depend on
@@ -338,7 +425,7 @@ var autoApprovalDenyList = []string{}
 // publish_to_web / generate_image / edit_image were considered for this list
 // on 2026-05-18 and deliberately left off — attended always-allow consent
 // extends to scheduled / watcher / heartbeat invocations for them.
-var unattendedAutoApprovalDenyList = []string{"computer_use"}
+var unattendedAutoApprovalDenyList = []string{"computer_use", "screenshot"}
 
 // AutoApprovalDenyList returns a copy of the tools that disallow being
 // persisted into a user-facing always-allow list. Exposed for consistency
@@ -405,9 +492,11 @@ type ToolSummary struct {
 }
 
 type ToolRegistry struct {
-	mu    sync.RWMutex
-	tools map[string]Tool
-	order []string
+	mu         sync.RWMutex
+	tools      map[string]Tool
+	order      []string
+	changeSubs map[uint64]chan struct{}
+	nextSubID  uint64
 }
 
 func NewToolRegistry() *ToolRegistry {
@@ -420,10 +509,14 @@ func (r *ToolRegistry) Register(t Tool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	name := t.Info().Name
-	if _, exists := r.tools[name]; !exists {
+	_, exists := r.tools[name]
+	if !exists {
 		r.order = append(r.order, name)
 	}
 	r.tools[name] = t
+	if !exists {
+		r.notifyChangedLocked()
+	}
 }
 
 func (r *ToolRegistry) Clone() *ToolRegistry {
@@ -480,7 +573,42 @@ func (r *ToolRegistry) Remove(name string) {
 	for i, n := range r.order {
 		if n == name {
 			r.order = append(r.order[:i], r.order[i+1:]...)
-			return
+			break
+		}
+	}
+	r.notifyChangedLocked()
+}
+
+// SubscribeChanges reports tool-name additions and removals. Replacing an
+// existing implementation under the same name does not change tools/list and
+// therefore emits no notification. The channel is edge-triggered and buffered:
+// a slow subscriber coalesces repeated registry mutations into one refresh.
+func (r *ToolRegistry) SubscribeChanges() (<-chan struct{}, func()) {
+	if r == nil {
+		ch := make(chan struct{})
+		return ch, func() {}
+	}
+	r.mu.Lock()
+	if r.changeSubs == nil {
+		r.changeSubs = make(map[uint64]chan struct{})
+	}
+	r.nextSubID++
+	id := r.nextSubID
+	ch := make(chan struct{}, 1)
+	r.changeSubs[id] = ch
+	r.mu.Unlock()
+	return ch, func() {
+		r.mu.Lock()
+		delete(r.changeSubs, id)
+		r.mu.Unlock()
+	}
+}
+
+func (r *ToolRegistry) notifyChangedLocked() {
+	for _, ch := range r.changeSubs {
+		select {
+		case ch <- struct{}{}:
+		default:
 		}
 	}
 }

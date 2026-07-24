@@ -64,7 +64,7 @@ func (t *GrepTool) Info() agent.ToolInfo {
 				"pattern":     map[string]any{"type": "string", "description": "Regex pattern to search"},
 				"description": agent.DescriptionFieldSpec,
 				"path":        map[string]any{"type": "string", "description": "Directory or file to search. Required when no session working directory is set."},
-				"glob":    map[string]any{"type": "string", "description": "File glob filter (e.g. '*.csv', '*.txt', '*.go'). Only honored with rg; ignored on grep fallback."},
+				"glob":        map[string]any{"type": "string", "description": "File glob filter (e.g. '*.csv', '*.txt', '*.go'). Only honored with rg; ignored on grep fallback."},
 				"output_mode": map[string]any{
 					"type":        "string",
 					"enum":        []string{"files_with_matches", "content", "count"},
@@ -88,7 +88,13 @@ func (t *GrepTool) Info() agent.ToolInfo {
 func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args grepArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Pattern) == "" {
+		return agent.ValidationError("grep: missing required `pattern` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("grep: missing required `description` parameter"), nil
 	}
 
 	path := args.Path

@@ -614,6 +614,15 @@ func TestConfig_StreamIdleTimeoutDefault90(t *testing.T) {
 	if cfg.Agent.StreamIdleTimeoutSecs != 90 {
 		t.Errorf("StreamIdleTimeoutSecs default = %d, want 90", cfg.Agent.StreamIdleTimeoutSecs)
 	}
+	if cfg.Agent.InterruptedResumeMaxAttempts != 3 {
+		t.Errorf("InterruptedResumeMaxAttempts default = %d, want 3", cfg.Agent.InterruptedResumeMaxAttempts)
+	}
+	if cfg.Agent.InterruptedResumeMaxAgeHours != 4 {
+		t.Errorf("InterruptedResumeMaxAgeHours default = %d, want 4", cfg.Agent.InterruptedResumeMaxAgeHours)
+	}
+	if cfg.Agent.InterruptedResumeEnabled == nil || !*cfg.Agent.InterruptedResumeEnabled {
+		t.Errorf("InterruptedResumeEnabled default = %v, want true", cfg.Agent.InterruptedResumeEnabled)
+	}
 }
 
 // TestConfig_IdleHardTimeoutYamlOverridesDefault verifies a yaml-supplied
@@ -626,7 +635,7 @@ func TestConfig_IdleHardTimeoutYamlOverridesDefault(t *testing.T) {
 	if err := os.MkdirAll(shannonDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	yaml := "agent:\n  idle_hard_timeout_secs: 180\n  stream_idle_timeout_secs: 30\n"
+	yaml := "agent:\n  idle_hard_timeout_secs: 180\n  stream_idle_timeout_secs: 30\n  interrupted_resume_max_attempts: 7\n  interrupted_resume_max_age_hours: 8\n  interrupted_resume_enabled: false\n"
 	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(yaml), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -639,6 +648,24 @@ func TestConfig_IdleHardTimeoutYamlOverridesDefault(t *testing.T) {
 	}
 	if cfg.Agent.StreamIdleTimeoutSecs != 30 {
 		t.Errorf("StreamIdleTimeoutSecs = %d, want 30 (yaml override)", cfg.Agent.StreamIdleTimeoutSecs)
+	}
+	if cfg.Agent.InterruptedResumeMaxAttempts != 7 {
+		t.Errorf("InterruptedResumeMaxAttempts = %d, want 7 (yaml override)", cfg.Agent.InterruptedResumeMaxAttempts)
+	}
+	if cfg.Agent.InterruptedResumeMaxAgeHours != 8 {
+		t.Errorf("InterruptedResumeMaxAgeHours = %d, want 8 (yaml override)", cfg.Agent.InterruptedResumeMaxAgeHours)
+	}
+	if cfg.Agent.InterruptedResumeEnabled == nil || *cfg.Agent.InterruptedResumeEnabled {
+		t.Errorf("InterruptedResumeEnabled = %v, want false (yaml override)", cfg.Agent.InterruptedResumeEnabled)
+	}
+	for _, key := range []string{
+		"agent.interrupted_resume_max_attempts",
+		"agent.interrupted_resume_max_age_hours",
+		"agent.interrupted_resume_enabled",
+	} {
+		if src := cfg.Sources[key]; src.Level != "global" {
+			t.Errorf("Sources[%q].Level = %q, want \"global\"", key, src.Level)
+		}
 	}
 }
 
@@ -774,6 +801,30 @@ func TestConfig_StreamIdleTimeoutNegativeRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "stream_idle_timeout_secs") {
 		t.Errorf("expected error to mention stream_idle_timeout_secs, got %v", err)
+	}
+}
+
+func TestConfig_InterruptedResumeMaxAttemptsNegativeRejected(t *testing.T) {
+	cfg := &Config{}
+	cfg.Agent.InterruptedResumeMaxAttempts = -1
+	err := validateConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error for negative interrupted_resume_max_attempts, got nil")
+	}
+	if !strings.Contains(err.Error(), "interrupted_resume_max_attempts") {
+		t.Errorf("expected error to mention interrupted_resume_max_attempts, got %v", err)
+	}
+}
+
+func TestConfig_InterruptedResumeMaxAgeNegativeRejected(t *testing.T) {
+	cfg := &Config{}
+	cfg.Agent.InterruptedResumeMaxAgeHours = -1
+	err := validateConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error for negative interrupted_resume_max_age_hours, got nil")
+	}
+	if !strings.Contains(err.Error(), "interrupted_resume_max_age_hours") {
+		t.Errorf("expected error to mention interrupted_resume_max_age_hours, got %v", err)
 	}
 }
 

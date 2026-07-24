@@ -57,6 +57,7 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return ValidationError("invalid arguments: " + err.Error()), nil
 	}
+	args.Query = strings.TrimSpace(args.Query)
 	if args.Query == "" {
 		return ValidationError("query is required"), nil
 	}
@@ -71,6 +72,12 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 				matched = append(matched, name)
 			}
 		}
+	} else if t.deferred[args.Query] {
+		// Treat an exact deferred tool name as an exact lookup even when the
+		// model omits the documented "select:" prefix. Models commonly search
+		// for a tool by its literal name; a keyword ranking miss should not turn
+		// that into a multi-call recovery loop.
+		matched = append(matched, args.Query)
 	} else {
 		matched = t.matchKeyword(args.Query)
 	}

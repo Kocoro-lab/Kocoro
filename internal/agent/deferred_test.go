@@ -135,6 +135,18 @@ func TestToolSearchTool_SelectExact(t *testing.T) {
 	}
 }
 
+func TestToolSearchTool_BareExactName(t *testing.T) {
+	ts := newTestToolSearchAgent()
+	result, err := ts.Run(context.Background(), `{"query":" mock_mcp_a "}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if header != "LOADED:mock_mcp_a" {
+		t.Fatalf("bare exact name should load only that tool, got header: %s", header)
+	}
+}
+
 func TestToolSearchTool_KeywordSearch(t *testing.T) {
 	ts := newTestToolSearchAgent()
 	// mockMCPTool has description "mock mcp tool"

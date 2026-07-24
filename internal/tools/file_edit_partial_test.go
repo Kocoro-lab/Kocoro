@@ -23,7 +23,7 @@ func TestFileEdit_RejectsEmptyOldStringBeforeFileIO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transport error: %v", err)
 	}
-	if !result.IsError || !contains(result.Content, "old_string must not be empty") {
+	if !result.IsError || !contains(result.Content, "missing required `old_string` parameter") {
 		t.Fatalf("expected early old_string validation, got: %s", result.Content)
 	}
 }

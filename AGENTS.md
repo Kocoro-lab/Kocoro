@@ -19,7 +19,7 @@ Kocoro is the Go CLI/runtime for Shannon AI agents. The main production path is 
 - cmd: CLI entry points for one-shot, daemon, scheduling, update, and MCP serve.
 - internal/daemon: primary production path; HTTP API server, WebSocket client, routing, approvals, events, launchd, attachments, session CWD, memory fallback, suggestions, email/password auth (`auth.go` / `auth_handlers.go` / `ws_controller.go`), Desktop RPC reverse-channel (`desktop_rpc/` subpackage — Unix sock listener + length-prefixed JSON codec + DesktopRPCBroker for Calendar RPC v1).
 - internal/agent: core loop; tool batching, compaction, spill/budget state, deferred loading, state cache, read tracking, approvals, phase/watchdog, thinking handling, prompt suggestions, forked requests.
-- internal/koe: macOS native speech-to-speech voice front brain; Realtime tool authority, bounded continuation, call-scoped task ledger (targeted and atomic all-running cancel), asynchronous result mailbox, and reversible native-floor barge-in with server-side truncation of interrupted speech. ASR transcripts remain asynchronous evidence/logging, not ordinary-turn or barge-in admission.
+- internal/koe: macOS native speech-to-speech voice front brain; one first-person Kocoro identity; Realtime tool authority; bounded continuation; call-scoped task ledger with one `do_task` per response by default and explicit, disjoint scopes for parallel calls; asynchronous result mailbox; and reversible raw-audio native-floor barge-in. Keep `stop_speaking` (current output), `cancel` (delegated work), and terminal `end_call` (voice session) as separate authorities. ASR transcripts remain asynchronous evidence/logging, not ordinary-turn, barge-in-admission, or default dismissal control.
 - internal/tools: local, gateway, cloud, schedule, publish/upload, image, memory, MCP, and document tools.
 - internal/keychain: credential store wrapper for daemon api_key — macOS Keychain / Windows Credential Manager via go-keyring (backend_keyring.go), Linux file store at ~/.shannon/credentials.json 0600 (backend_linux.go + backend_file.go); `keychain.Supported()` = darwin||windows||linux, other platforms return ErrUnsupportedPlatform. Constructor `NewOSStoreAt(dir, logger)`; callers pass config.ShannonDir().
 - internal/client: gateway/SSE/Ollama clients plus AuthClient (`/api/v1/auth/*` REST wrapper).
@@ -115,6 +115,8 @@ Image size safety has source-time compression, wire-time sanitization, and persi
 
 The agent loop exposes explicit phases. Only LLM-wait and force-stop phases count as idle for the watchdog. Mid-turn checkpoints run after tool batches, reactive compaction, and before force-stop; final save rebuilds from the same baseline so turns are not double-persisted.
 
+Interrupted turns auto-resume at daemon start (newest first, serial) but only within the `agent.interrupted_resume_max_age_hours` staleness window (default 4h) — older checkpoints are abandoned, never executed. Recovered runs always classify as unattended so the unattended tool deny-list applies, and they pin the session's original route key so concurrent inbound traffic for the same session is serialized. `agent.interrupted_resume_enabled: false` disables auto-resume entirely.
+
 ### Thinking Blocks
 
 When native thinking is enabled, preserve assistant `thinking` and `redacted_thinking` content blocks in order across the conversation trajectory. Sanitizers, compaction, fork builders, and session persistence must not rewrite them. Strip thinking only before session sync upload.
@@ -161,7 +163,10 @@ Payloads decoded by UI clients (bus events, per-request SSE events, HTTP respons
 
 ### Prompt Cache
 
-Source-routed TTLs matter: channels/TUI use long cache, one-shot/subagent/helper paths use cheaper short cache. Preserve `cache_source` propagation and canonical tool input normalization.
+Cloud currently applies the short prompt-cache TTL to every request. Preserve
+`cache_source` as attribution (not a Kocoro-side TTL selector) and preserve
+canonical tool input normalization. Any future TTL-policy change belongs in
+shannon-cloud and must update `docs/cache-strategy.md` in the same rollout.
 
 Any in-place message content rewrite that can affect prompt bytes must emit cache-compaction/debug instrumentation so drift remains attributable.
 
@@ -200,6 +205,6 @@ Schedule tests use temp directories and do not write to the real LaunchAgents di
 
 ## Tools
 
-Core local tools include file ops, archive inspect/extract, document extraction, shell/system, macOS GUI, schedules, memory, and skills. `computer_use` is the primary native-GUI tool: Accessibility-first observations return a per-run `state_id`; ref mutations reject stale state; screenshots are explicit; windowless apps are reopened generically; integer-shaped strings are tolerated; bounded delay waits need no shell fallback; pointer actions move the real cursor visibly; observations skip approval while mutations retain normal approval policy; whole calls serialize across concurrent routes on one GUI-operation lock shared with the legacy `accessibility` / `computer` / `applescript` tools; unattended runs (including auto-approve transports and IM/voice channels without an approval UI) can never invoke it — observation actions included — even via persisted or broker Always Allow. Runtime-conditional tools include session search, cloud delegation, publish/list/retract uploads, image generation/editing, and deferred tool search.
+Core local tools include file ops, archive inspect/extract, document extraction, shell/system, macOS GUI, schedules, memory, and skills. `computer_use` is the primary native-GUI tool: Accessibility-first observations return a per-run `state_id`; ref mutations reject stale state; screenshots are explicit; windowless apps are reopened generically; integer-shaped strings are tolerated; bounded delay waits need no shell fallback; pointer actions move the real cursor visibly; observations skip approval while mutations retain normal approval policy; whole calls serialize across concurrent routes on one GUI-operation lock shared with the legacy `accessibility` / `computer` / `applescript` tools; unattended runs (including auto-approve transports and IM/voice channels without an approval UI) can never invoke it — observation actions included — even via persisted or broker Always Allow. The standalone `screenshot` tool also requires approval and is denied on unattended runs. Runtime-conditional tools include session search, cloud delegation, publish/list/retract uploads, image generation/editing, and deferred tool search.
 
 Every approval-required tool must expose a short human-readable description or equivalent purpose field for approval UI. Destructive or paid/public cloud tools require approval.

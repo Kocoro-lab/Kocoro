@@ -24,7 +24,7 @@ func TestGrep_FindsMatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	tool := &GrepTool{}
-	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"hello","path":%q}`, tmp))
+	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"hello","path":%q,"description":"test grep"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestGrep_FindsMatches_ContentMode(t *testing.T) {
 	}
 	tool := &GrepTool{}
 	result, err := tool.Run(context.Background(),
-		fmt.Sprintf(`{"pattern":"hello","path":%q,"output_mode":"content"}`, tmp))
+		fmt.Sprintf(`{"pattern":"hello","path":%q,"output_mode":"content","description":"test content grep"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestGrep_CountMode(t *testing.T) {
 	}
 	tool := &GrepTool{}
 	result, err := tool.Run(context.Background(),
-		fmt.Sprintf(`{"pattern":"hello","path":%q,"output_mode":"count"}`, tmp))
+		fmt.Sprintf(`{"pattern":"hello","path":%q,"output_mode":"count","description":"test count grep"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -98,7 +98,8 @@ func TestGrepTool_TypeHeadLimitAndOffset(t *testing.T) {
 		"type":"go",
 		"output_mode":"content",
 		"head_limit":1,
-		"offset":1
+		"offset":1,
+		"description":"test type and offset"
 	}`)
 	if err != nil {
 		t.Fatal(err)
@@ -124,7 +125,8 @@ func TestGrepTool_ContextAndIgnoreCase(t *testing.T) {
 		"pattern":"target",
 		"output_mode":"content",
 		"ignore_case":true,
-		"context":1
+		"context":1,
+		"description":"test context grep"
 	}`)
 	if err != nil {
 		t.Fatal(err)
@@ -145,7 +147,7 @@ func TestGrep_InvalidMode(t *testing.T) {
 	}
 	tool := &GrepTool{}
 	result, err := tool.Run(context.Background(),
-		fmt.Sprintf(`{"pattern":"hello","path":%q,"output_mode":"json"}`, tmp))
+		fmt.Sprintf(`{"pattern":"hello","path":%q,"output_mode":"json","description":"test invalid mode"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -163,7 +165,7 @@ func TestGrep_NoMatchesReturnsSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	tool := &GrepTool{}
-	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"goodbye","path":%q}`, tmp))
+	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"goodbye","path":%q,"description":"test no matches"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -197,7 +199,7 @@ func TestGrep_GlobalLineCap(t *testing.T) {
 	// targets only applies in content mode. Default files_with_matches
 	// would return ≤50 paths and never exercise per-line cap.
 	result, err := tool.Run(context.Background(),
-		fmt.Sprintf(`{"pattern":"needle","path":%q,"max_results":20,"output_mode":"content"}`, tmp))
+		fmt.Sprintf(`{"pattern":"needle","path":%q,"max_results":20,"output_mode":"content","description":"test global cap"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -227,7 +229,7 @@ func TestGrep_GlobalLineCap(t *testing.T) {
 
 func TestGrep_RelativePathRefusedWithoutSessionCWD(t *testing.T) {
 	tool := &GrepTool{}
-	result, err := tool.Run(context.Background(), `{"pattern":"anything"}`)
+	result, err := tool.Run(context.Background(), `{"pattern":"anything","description":"test relative guard"}`)
 	if err != nil {
 		t.Fatalf("Run should not return a transport error, got %v", err)
 	}
@@ -247,7 +249,7 @@ func TestGrep_RelativePathWorksWithSessionCWD(t *testing.T) {
 	}
 	ctx := cwdctx.WithSessionCWD(context.Background(), tmp)
 	tool := &GrepTool{}
-	result, err := tool.Run(ctx, `{"pattern":"findme"}`)
+	result, err := tool.Run(ctx, `{"pattern":"findme","description":"test relative grep"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -269,7 +271,7 @@ func TestGrep_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	tool := &GrepTool{}
-	_, _ = tool.Run(ctx, fmt.Sprintf(`{"pattern":"x","path":%q}`, tmp))
+	_, _ = tool.Run(ctx, fmt.Sprintf(`{"pattern":"x","path":%q,"description":"test cancellation"}`, tmp))
 	// Must not hang.
 }
 
@@ -291,9 +293,9 @@ func TestGrepTool_RelativizesOutputPaths(t *testing.T) {
 		args string
 		want string
 	}{
-		{name: "files", args: `{"pattern":"needle"}`, want: expectedPath},
-		{name: "content", args: `{"pattern":"needle","output_mode":"content"}`, want: expectedPath + ":1:needle"},
-		{name: "count", args: `{"pattern":"needle","output_mode":"count"}`, want: expectedPath + ":2"},
+		{name: "files", args: `{"pattern":"needle","description":"test files output"}`, want: expectedPath},
+		{name: "content", args: `{"pattern":"needle","output_mode":"content","description":"test content output"}`, want: expectedPath + ":1:needle"},
+		{name: "count", args: `{"pattern":"needle","output_mode":"count","description":"test count output"}`, want: expectedPath + ":2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			result, err := tool.Run(ctx, tc.args)
@@ -330,7 +332,7 @@ func TestGrepTool_RipgrepFindsHiddenFilesButExcludesVCS(t *testing.T) {
 	}
 
 	tool := &GrepTool{}
-	result, err := tool.Run(cwdctx.WithSessionCWD(context.Background(), tmp), `{"pattern":"needle"}`)
+	result, err := tool.Run(cwdctx.WithSessionCWD(context.Background(), tmp), `{"pattern":"needle","description":"test hidden files"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +358,8 @@ func TestGrepTool_RipgrepTreatsDashLeadingPatternAsPattern(t *testing.T) {
 	tool := &GrepTool{}
 	result, err := tool.Run(cwdctx.WithSessionCWD(context.Background(), tmp), `{
 		"pattern":"-needle",
-		"output_mode":"content"
+		"output_mode":"content",
+		"description":"test dash pattern"
 	}`)
 	if err != nil {
 		t.Fatal(err)
@@ -395,7 +398,8 @@ func TestGrepTool_RipgrepSplitsGlobListAndSortsFilesByMTime(t *testing.T) {
 	tool := &GrepTool{}
 	result, err := tool.Run(cwdctx.WithSessionCWD(context.Background(), tmp), `{
 		"pattern":"needle",
-		"glob":"*.go,*.txt"
+		"glob":"*.go,*.txt",
+		"description":"test glob list"
 	}`)
 	if err != nil {
 		t.Fatal(err)
@@ -427,7 +431,8 @@ func TestGrepTool_RipgrepOmitsVeryLongContentLines(t *testing.T) {
 	tool := &GrepTool{}
 	result, err := tool.Run(cwdctx.WithSessionCWD(context.Background(), tmp), `{
 		"pattern":"needle",
-		"output_mode":"content"
+		"output_mode":"content",
+		"description":"test long line"
 	}`)
 	if err != nil {
 		t.Fatal(err)

@@ -1000,6 +1000,7 @@ func TestLocalCommitFallbackAsksToRepeatWhenCommitNotAcked(t *testing.T) {
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
 	cap := &captureSender{}
 	h := newEventHandler(disp, state, nil, cap.send)
+	h.language = "zh"
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go h.runResponseSender(ctx)
@@ -1010,8 +1011,25 @@ func TestLocalCommitFallbackAsksToRepeatWhenCommitNotAcked(t *testing.T) {
 	waitUntil(t, func() bool { return cap.countType("input_audio_buffer.commit") == 1 }, "local fallback did not commit input audio")
 	waitUntil(t, func() bool { return cap.countType("response.create") == 1 }, "local fallback did not request a response")
 	instr := cap.responseCreateInstructions()
-	if len(instr) != 1 || instr[0] != missedSpeechInstructions {
+	if len(instr) != 1 {
 		t.Fatalf("unacked commit must ask the user to repeat, got instructions %#v", instr)
+	}
+	for _, want := range []string{VoiceIdentityInstructions, "Reply only in Simplified Chinese", missedSpeechInstructions} {
+		if !strings.Contains(instr[0], want) {
+			t.Fatalf("unacked commit instructions missing %q: %q", want, instr[0])
+		}
+	}
+}
+
+func TestExactSpeechResponseKeepsIdentityAndLanguage(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.language = "zh"
+	h.requestResponseForSpeech("已经处理好了")
+	req := <-h.respReq
+	for _, want := range []string{VoiceIdentityInstructions, "Reply only in Simplified Chinese", "Say exactly", "已经处理好了"} {
+		if !strings.Contains(req.instructions, want) {
+			t.Fatalf("exact-speech instructions missing %q: %s", want, req.instructions)
+		}
 	}
 }
 

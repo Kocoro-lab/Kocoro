@@ -48,7 +48,7 @@ func TestConcurrentRoutes_DifferentCWDs(t *testing.T) {
 	go func() {
 		ctx := cwdctx.WithSessionCWD(context.Background(), dir1)
 		tool := &FileReadTool{}
-		result, err := tool.Run(ctx, `{"path":"route1.txt"}`)
+		result, err := tool.Run(ctx, `{"path":"route1.txt","description":"test route one"}`)
 		if err != nil {
 			errs <- fmt.Errorf("route1 err: %w", err)
 			return
@@ -64,7 +64,7 @@ func TestConcurrentRoutes_DifferentCWDs(t *testing.T) {
 	go func() {
 		ctx := cwdctx.WithSessionCWD(context.Background(), dir2)
 		tool := &FileReadTool{}
-		result, err := tool.Run(ctx, `{"path":"route2.txt"}`)
+		result, err := tool.Run(ctx, `{"path":"route2.txt","description":"test route two"}`)
 		if err != nil {
 			errs <- fmt.Errorf("route2 err: %w", err)
 			return

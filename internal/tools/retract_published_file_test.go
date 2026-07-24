@@ -284,34 +284,27 @@ func TestRetractPublishedFileTool_Run_HappyPath(t *testing.T) {
 	}
 }
 
-func TestRetractPublishedFileTool_Run_EmptyDescriptionStillExecutes(t *testing.T) {
-	// Approval-description spec invariant (CLAUDE.md): the daemon does NOT
-	// block execution when `description` is missing or empty. The schema
-	// declares it required so the model is nudged to populate it, but tools
-	// must NOT enforce — `args` JSON is the source of truth for audit logs
-	// and rewriting it would record fiction. UI clients fall back to raw
-	// args when description is empty.
-	//
-	// Symmetric to TestRetractPublishedFileTool_Run_MissingIDIsValidationError
-	// (which DOES enforce, because no id means there's nothing to delete).
+func TestRetractPublishedFileTool_Run_EmptyDescriptionIsValidationError(t *testing.T) {
+	// Approval descriptions are a required safety field. Direct callers must
+	// receive the same standardized validation failure as the main agent loop,
+	// before the paid/public delete client can run.
 	fake := &fakeRetractUploader{
 		resp: &uploads.DeleteResponse{Deleted: true, ID: "abc", CDNEvictionSeconds: 300},
 	}
 	tool := NewRetractPublishedFileTool(fake)
-	// Missing description entirely.
-	out, _ := tool.Run(context.Background(), `{"id":"abc"}`)
-	if out.IsError {
-		t.Errorf("missing description must not block execution; got error: %s", out.Content)
+	for _, args := range []string{
+		`{"id":"abc"}`,
+		`{"id":"abc","description":""}`,
+		`{"id":"abc","description":"   "}`,
+	} {
+		out, _ := tool.Run(context.Background(), args)
+		if !out.IsError || out.ErrorCategory != agent.ErrCategoryValidation ||
+			!strings.Contains(out.Content, "description") {
+			t.Errorf("args=%s: expected description validation error, got %+v", args, out)
+		}
 	}
-	// Empty-string description.
-	out, _ = tool.Run(context.Background(), `{"id":"abc","description":""}`)
-	if out.IsError {
-		t.Errorf("empty description must not block execution; got error: %s", out.Content)
-	}
-	// Whitespace-only description.
-	out, _ = tool.Run(context.Background(), `{"id":"abc","description":"   "}`)
-	if out.IsError {
-		t.Errorf("whitespace-only description must not block execution; got error: %s", out.Content)
+	if fake.gotID != "" {
+		t.Errorf("delete client ran despite invalid description: id=%q", fake.gotID)
 	}
 }
 

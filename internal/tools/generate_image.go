@@ -114,9 +114,13 @@ func (t *GenerateImageTool) Run(ctx context.Context, argsJSON string) (agent.Too
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 
+	// Explicit required-field checks so the missing-field messages stay useful.
 	prompt := strings.TrimSpace(args.Prompt)
 	if prompt == "" {
 		return agent.ValidationError("prompt is required"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("generate_image: missing required `description` parameter"), nil
 	}
 	// API spec says "1..32000 chars" — rune-counted to match JSON Schema
 	// maxLength semantics. Using len() (bytes) would reject CJK / emoji

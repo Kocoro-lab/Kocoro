@@ -177,3 +177,200 @@ func TestEndCallToolNilHookIsSafe(t *testing.T) {
 	})
 	h.handleEvent(context.Background(), ev) // must not panic
 }
+
+func TestEndCallIsTerminalAndIdempotentInsideRealtimeHandler(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-end-terminal", ""), nil, func(any) error { return nil })
+	ended := make(chan struct{}, 2)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleFunctionCall(context.Background(), "end-1", "end_call", nil)
+	h.handleFunctionCall(context.Background(), "end-2", "end_call", nil)
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first end_call did not invoke onEndCall")
+	}
+	select {
+	case <-ended:
+		t.Fatal("duplicate end_call invoked onEndCall twice")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	h.queueAcceptedNativeTurn(1)
+	h.requestResponse()
+	if got := len(h.loopRespReq) + len(h.respReq); got != 0 {
+		t.Fatalf("terminal handler accepted %d new response requests", got)
+	}
+}
+
+func TestEndCallDropsLateToolsWhenContinuationIsDisabled(t *testing.T) {
+	t.Setenv("KOE_TOOL_CONTINUATION", "0")
+	state := NewCallState("burst-end-late-tool", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	h := newEventHandler(disp, state, nil, cap.send)
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"end-response"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"end-response","call_id":"end-1","name":"end_call","arguments":"{}"}`))
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("end_call did not invoke onEndCall")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"end-response","call_id":"late-status","name":"get_status","arguments":"{}"}`))
+	if got := cap.countType("conversation.item.create"); got != 0 {
+		t.Fatalf("terminal handler executed a late tool and sent %d function outputs", got)
+	}
+}
+
+func TestDismissTranscriptAndEndCallShareOneTerminal(t *testing.T) {
+	t.Setenv("KOE_ASR_DISMISS_BACKSTOP", "1")
+	h := newEventHandler(nil, NewCallState("burst-end-shared-terminal", ""), nil, func(any) error { return nil })
+	ended := make(chan struct{}, 2)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleInputTranscript("退出吧")
+	h.handleFunctionCall(context.Background(), "end-after-transcript", "end_call", nil)
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dismiss transcript did not invoke onEndCall")
+	}
+	select {
+	case <-ended:
+		t.Fatal("dismiss transcript and end_call invoked onEndCall twice")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !h.ending.Load() {
+		t.Fatal("dismiss transcript did not enter the shared terminal state")
+	}
+}
+
+func TestEndCallCancelsLateResponseCreatedWithoutReopeningPlayback(t *testing.T) {
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-end-late-response", ""), nil, cap.send)
+	h.onEndCall = func() {}
+	if !h.requestEndCall("end-before-created") {
+		t.Fatal("end_call was not accepted")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"late-response"}}`))
+
+	if got := cap.countType("response.cancel"); got != 1 {
+		t.Fatalf("late response.created cancellation count=%d, want 1", got)
+	}
+	if h.respBusy.Load() {
+		t.Fatal("late response.created reopened the response slot after end_call")
+	}
+	if got := h.activeResponseID(); got != "" {
+		t.Fatalf("late response.created became active after end_call: %q", got)
+	}
+	if got := h.voiceState(); got != "idle" {
+		t.Fatalf("voice state after late response.created=%q, want idle", got)
+	}
+}
+
+func TestEndCallStopsResponseCreateAlreadyWaitingForIdle(t *testing.T) {
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-end-waiting-response", ""), nil, cap.send)
+	h.respBusy.Store(true)
+	h.onEndCall = func() {}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		h.sendQueuedResponse(ctx, responseCreateRequest{})
+		close(done)
+	}()
+
+	time.Sleep(40 * time.Millisecond)
+	if !h.requestEndCall("end-waiting-response") {
+		t.Fatal("end_call was not accepted")
+	}
+	time.Sleep(80 * time.Millisecond)
+	if got := cap.countType("response.create"); got != 0 {
+		t.Fatalf("terminal handler sent %d response.create frames after ending", got)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("response sender did not stop after end_call")
+	}
+}
+
+func TestEndCallLeavesVoiceStateIdle(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-end-idle", ""), nil, func(any) error { return nil })
+	h.respBusy.Store(true)
+	h.asyncTaskPending.Store(true)
+	var states []string
+	h.onVoiceState = func(state string) { states = append(states, state) }
+	h.onEndCall = func() {}
+
+	if !h.requestEndCall("end-idle") {
+		t.Fatal("end_call was not accepted")
+	}
+	if len(states) == 0 {
+		t.Fatal("end_call emitted no terminal voice state")
+	}
+	for _, state := range states {
+		if state != "idle" {
+			t.Fatalf("end_call emitted non-terminal voice state %q; states=%v", state, states)
+		}
+	}
+	if got := h.voiceState(); got != "idle" {
+		t.Fatalf("voice state after end_call=%q, want idle", got)
+	}
+}
+
+func TestEndCallStopsResultVoiceGapWait(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-end-result-wait", ""), nil, func(any) error { return nil })
+	h.respBusy.Store(true)
+	h.onEndCall = func() {}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	waited := make(chan bool, 1)
+	go func() { waited <- h.waitResultVoiceGap(ctx) }()
+
+	time.Sleep(40 * time.Millisecond)
+	if !h.requestEndCall("end-result-wait") {
+		t.Fatal("end_call was not accepted")
+	}
+	select {
+	case accepted := <-waited:
+		if accepted {
+			t.Fatal("result voice gap became admissible after end_call")
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("result voice gap wait did not stop after end_call")
+	}
+}
+
+func TestStopSpeakingEndsOnlyTheCurrentTurnWithoutContinuation(t *testing.T) {
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-stop-speaking", ""), nil, cap.send)
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.committed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"stop-response"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"stop-response","call_id":"stop-1","name":"stop_speaking","arguments":"{}"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"stop-response","status":"cancelled"}}`))
+
+	select {
+	case <-ended:
+		t.Fatal("stop_speaking ended the voice call")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := cap.countType("response.cancel"); got != 1 {
+		t.Fatalf("stop_speaking response.cancel count=%d, want 1", got)
+	}
+	if got := len(h.loopRespReq) + len(h.respReq); got != 0 {
+		t.Fatalf("stop_speaking queued %d acknowledgement/continuation responses", got)
+	}
+	if h.ending.Load() {
+		t.Fatal("stop_speaking entered the call terminal state")
+	}
+}

@@ -69,7 +69,13 @@ func (t *NotifyTool) Info() agent.ToolInfo {
 func (t *NotifyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args notifyArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Title) == "" {
+		return agent.ValidationError("notify: missing required `title` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("notify: missing required `description` parameter"), nil
 	}
 
 	body := args.Body

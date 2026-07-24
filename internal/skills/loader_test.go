@@ -926,18 +926,16 @@ func TestWriteGlobalSkill_RoundTripsSticky(t *testing.T) {
 //
 // History: 074cb1d restricted generative-ui to visualization-only tools;
 // 39fee8f dropped the line by accident; 2af82e6 restored it and added this
-// guard's predecessor (asserting the exact allowlist). On 2026-07-20 the
+// guard's predecessor (asserting the exact allowlist). The
 // restriction was removed on purpose: the use_skill filter is run-scoped
 // (internal/tools/skill.go sets SkillToolFilter, loop.go hard-denies every
-// non-allowlisted call for the rest of the run), and both skills have broad
-// trigger surfaces — kocoro is prompted as "MUST use for ANY read/write" of
-// platform state, generative-ui triggers on any visualization ask — so an
-// allowlist bricked mixed turns (platform op or chart + bash / integration
-// tools / http fetch) with [skill restriction] denials. Routing discipline is
-// prompt-level in the skill bodies instead; generative-ui rendering safety is
-// bounded by Desktop's sandboxed iframe, not by this manifest. Both skills are
-// first-party reviewed content, sha256-synced from embed.FS on every daemon
-// startup.
+// non-allowlisted call for the rest of the run), and both skills can be one
+// part of a mixed request. An allowlist therefore blocked unrelated shell,
+// file, web, or integration work with [skill restriction] denials. Routing
+// discipline is prompt-level in the skill bodies instead; generative-ui
+// rendering safety is bounded by Desktop's sandboxed iframe, not by this
+// manifest. Both skills are first-party reviewed content, sha256-synced from
+// embed.FS on every daemon startup.
 //
 // The assertion is nil-specific on purpose: the loader distinguishes absent
 // (nil → no restriction) from present-but-empty (non-nil empty → zero tools).
@@ -968,9 +966,22 @@ func TestBundledPlatformSkills_ToolAllowlistIntentionallyAbsent(t *testing.T) {
 		}
 		if found.AllowedTools != nil {
 			t.Errorf("%s allowed-tools = %q, want field absent (nil)\n"+
-				"(unrestricted by design since 2026-07-20 — the run-scoped use_skill filter "+
+				"(unrestricted by design — the run-scoped use_skill filter "+
 				"bricked mixed turns; see this test's doc comment before changing the policy)",
 				slug, strings.Join(found.AllowedTools, " "))
+		}
+		if slug == "kocoro" {
+			for _, want := range []string{
+				"Activating this skill never means “HTTP only” for the whole run.",
+				"Complete every requested subtask",
+			} {
+				if !strings.Contains(found.Prompt, want) {
+					t.Errorf("kocoro prompt missing mixed-turn routing guard %q", want)
+				}
+			}
+			if strings.Contains(found.Prompt, "One task at a time.") {
+				t.Error("kocoro prompt must not tell the model to drop mixed-request subtasks")
+			}
 		}
 	}
 }

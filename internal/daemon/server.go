@@ -847,6 +847,11 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 
+	// Continue durable mid-turn checkpoints after the process is fully
+	// configured. The worker is sequential to avoid a restart burst competing
+	// with foreground traffic for model and tool capacity.
+	go s.resumeInterruptedTurns(ctx)
+
 	go func() {
 		<-ctx.Done()
 		// Stop the memory sidecar before HTTP shutdown so SIGTERM reaches the

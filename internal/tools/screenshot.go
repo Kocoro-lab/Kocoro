@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
@@ -15,27 +16,31 @@ import (
 type ScreenshotTool struct{}
 
 type screenshotArgs struct {
-	Target string `json:"target,omitempty"`
-	Path   string `json:"path,omitempty"`
-	Delay  int    `json:"delay,omitempty"`
+	Description string `json:"description"`
+	Target      string `json:"target,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Delay       int    `json:"delay,omitempty"`
 }
 
 func (t *ScreenshotTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
-		Name:        "screenshot",
-		Description: "Capture the macOS desktop screen (fullscreen, window, or region). Use ONLY for native macOS UI. For web page screenshots use browser(action=screenshot) — this tool captures the macOS screen, not browser content.",
+		Name: "screenshot",
+		Description: "Capture the macOS desktop screen (fullscreen, window, or region). Use ONLY for native macOS UI. For web page screenshots use browser(action=screenshot) — this tool captures the macOS screen, not browser content." +
+			agent.DescriptionGuidance,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"target": map[string]any{"type": "string", "description": "Capture target: fullscreen (default), window, or region"},
-				"path":   map[string]any{"type": "string", "description": "Output file path. If not provided, saves to a temp file"},
-				"delay":  map[string]any{"type": "integer", "description": "Seconds to wait before capture (default: 0)"},
+				"description": agent.DescriptionFieldSpec,
+				"target":      map[string]any{"type": "string", "description": "Capture target: fullscreen (default), window, or region"},
+				"path":        map[string]any{"type": "string", "description": "Output file path. If not provided, saves to a temp file"},
+				"delay":       map[string]any{"type": "integer", "description": "Seconds to wait before capture (default: 0)"},
 			},
 		},
+		Required: []string{"description"},
 	}
 }
 
-func (t *ScreenshotTool) RequiresApproval() bool { return false }
+func (t *ScreenshotTool) RequiresApproval() bool { return true }
 
 func (t *ScreenshotTool) IsReadOnlyCall(string) bool { return true }
 
@@ -45,7 +50,10 @@ func (t *ScreenshotTool) Run(ctx context.Context, argsJSON string) (agent.ToolRe
 	}
 	var args screenshotArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("screenshot: missing required `description` parameter"), nil
 	}
 
 	target := args.Target

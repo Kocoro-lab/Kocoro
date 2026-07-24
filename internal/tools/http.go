@@ -52,7 +52,13 @@ func (t *HTTPTool) Info() agent.ToolInfo {
 func (t *HTTPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args httpArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.URL) == "" {
+		return agent.ValidationError("http: missing required `url` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("http: missing required `description` parameter"), nil
 	}
 
 	method := args.Method

@@ -74,6 +74,7 @@ func (s *Session) TruncateAt(idx int) (*RestoredMessage, error) {
 	// The truncate operation is intentional; if InProgress was set from a
 	// crashed run, clear it so the session list no longer flags the row.
 	s.InProgress = false
+	s.InterruptedTurn = nil
 
 	return restored, nil
 }
