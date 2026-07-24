@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
-	"sync"
 	"time"
 
 	agentpkg "github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -39,26 +38,24 @@ type ApprovalRequestMeta struct {
 	Agent     string
 }
 
-// pendingApproval tracks an in-flight approval request inside the broker. The
-// `emitted` flag lets CancelAll skip cleanup events for requests whose
-// approval_request was never published (sendFn failed before emission).
-type pendingApproval struct {
-	ch      chan ApprovalDecision
-	emitted bool
-}
+// pendingApproval tracks an in-flight approval request inside the broker. It is
+// an alias of the shared pending-interaction entry specialized to
+// ApprovalDecision; the `emitted` flag lets CancelAll skip cleanup events for
+// requests whose approval_request was never published (sendFn failed before
+// emission). See pending.go for the shared lifecycle.
+type pendingApproval = pendingEntry[ApprovalDecision]
 
 // ApprovalBroker mediates between the agent loop's OnApprovalNeeded and the WS
 // client. It sends approval_request messages over WS and blocks until a
-// matching approval_response arrives (or context is cancelled).
+// matching approval_response arrives (or context is cancelled). The pending
+// lifecycle (register / emit-guard / Resolve / CancelAll / timeout ordering) is
+// the shared pendingCore; ApprovalBroker adds the approval-specific wire face
+// (ApprovalRequest payload, non-interactive channel gating, Always-Allow cache).
 type ApprovalBroker struct {
-	mu              sync.Mutex
-	pending         map[string]*pendingApproval
+	*pendingCore[ApprovalDecision]
 	toolAutoApprove map[string]bool // in-memory only, non-bash "always allow"
 	sendFn          func(req ApprovalRequest) error
 	onRequest       func(req ApprovalRequest)
-	onCleanup       func(requestID string)                      // daemon-originated terminal paths (timeout/ctx/CancelAll)
-	onRegister      func(requestID string)                      // called when a pending entry is created
-	onDeregister    func(requestID string)                      // called when a pending entry is cleaned up
 	onAutoApprove   func(meta ApprovalRequestMeta, tool string) // called when a tool is auto-approved without prompting
 }
 
@@ -66,7 +63,7 @@ type ApprovalBroker struct {
 // It must be reconnect-safe (e.g., a method on *Client, not a closure over a conn).
 func NewApprovalBroker(sendFn func(req ApprovalRequest) error) *ApprovalBroker {
 	return &ApprovalBroker{
-		pending:         make(map[string]*pendingApproval),
+		pendingCore:     newPendingCore[ApprovalDecision](),
 		toolAutoApprove: make(map[string]bool),
 		sendFn:          sendFn,
 	}
@@ -144,25 +141,6 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 	}
 
 	reqID := generateRequestID()
-	pa := &pendingApproval{ch: make(chan ApprovalDecision, 1)}
-
-	b.mu.Lock()
-	b.pending[reqID] = pa
-	b.mu.Unlock()
-
-	if b.onRegister != nil {
-		b.onRegister(reqID)
-	}
-
-	defer func() {
-		if b.onDeregister != nil {
-			b.onDeregister(reqID)
-		}
-		b.mu.Lock()
-		delete(b.pending, reqID)
-		b.mu.Unlock()
-	}()
-
 	req := ApprovalRequest{
 		MessageID: meta.MessageID,
 		SessionID: meta.SessionID,
@@ -181,165 +159,24 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 	if agentpkg.DisallowsAutoApproval(tool) {
 		req.Flags = append(req.Flags, ApprovalFlagAlwaysAllowDisabled)
 	}
-	if err := b.sendFn(req); err != nil {
-		return DecisionDeny
-	}
 
-	// Publish approval_request only AFTER sendFn succeeds so the bus never
-	// shows a card for a request that never reached the foreground client.
-	// onRequest + emitted=true run inside the broker mutex as a single
-	// critical section: a concurrent CancelAll (WS disconnect mid-emit) is
-	// either fully sequenced before us (we observe pa missing from pending
-	// and skip emission so neither event reaches the bus) or fully sequenced
-	// after us (it sees emitted=true and fires the matching cleanup).
-	// Without this serialization, the race window between onRequest and
-	// emitted=true could leak an orphan approval_request into the ring,
-	// leaving a stale Desktop inbox card.
-	b.mu.Lock()
-	if _, stillPending := b.pending[reqID]; !stillPending {
-		b.mu.Unlock()
-		// Resolve or CancelAll terminated us between sendFn and now. Both
-		// send to pa.ch under the same mutex before deleting from pending,
-		// so a value is buffered; drain it for the correct decision.
-		select {
-		case decision := <-pa.ch:
-			return decision
-		default:
-			return DecisionDeny
-		}
-	}
-	if b.onRequest != nil {
-		b.onRequest(req)
-	}
-	pa.emitted = true
-	b.mu.Unlock()
-
-	select {
-	case decision := <-pa.ch:
-		return decision
-	case <-time.After(ApprovalTimeout):
-		if b.claimForCleanup(reqID) {
-			log.Printf("daemon: approval timeout for %s (tool=%s), denying", reqID, tool)
-			if b.onCleanup != nil {
-				b.onCleanup(reqID)
+	// The pending lifecycle (register → send → emit-guard → wait, with the
+	// timeout / ctx / cancelAll ordering invariants) lives in pendingCore.run.
+	return b.run(ctx, reqID, ApprovalTimeout, DecisionDeny,
+		func() error { return b.sendFn(req) },
+		func() {
+			if b.onRequest != nil {
+				b.onRequest(req)
 			}
-			return DecisionDeny
-		}
-		// Lost the delete race to Resolve / CancelAll. Honor the real
-		// decision they buffered onto pa.ch instead of producing a
-		// conflicting deny/daemon terminal state.
-		select {
-		case decision := <-pa.ch:
-			return decision
-		default:
-			return DecisionDeny
-		}
-	case <-ctx.Done():
-		if b.claimForCleanup(reqID) {
-			if b.onCleanup != nil {
-				b.onCleanup(reqID)
-			}
-			return DecisionDeny
-		}
-		select {
-		case decision := <-pa.ch:
-			return decision
-		default:
-			return DecisionDeny
-		}
-	}
+		},
+	)
 }
 
-// claimForCleanup is the inverse of Resolve: it removes reqID from pending
-// under the broker mutex and reports whether this caller is the one that
-// won the delete race. Used by the timeout / ctx-cancel branches to ensure
-// that the daemon-originated cleanup event is emitted only when no ingress
-// (HTTP /approval, WS approval_response) has already claimed the request.
-// Pairs with the at-most-one terminal-event contract documented on
-// EventApprovalResolved.
-func (b *ApprovalBroker) claimForCleanup(reqID string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if _, ok := b.pending[reqID]; !ok {
-		return false
-	}
-	delete(b.pending, reqID)
-	return true
-}
-
-// Resolve delivers a decision to a pending request. Returns true if this
-// call is the one that terminated the request (i.e., the entry was still
-// in pending); false if a prior Resolve / CancelAll / timeout / ctx-cancel
-// already claimed it. Ingress callers (HTTP /approval, WS approval_response)
-// use the return value to gate their bus emission so a daemon-cleanup path
-// firing concurrently cannot produce a conflicting terminal event for the
-// same request_id.
-//
-// beforeDeliver, when non-nil, runs UNDER the broker mutex AFTER the claim
-// succeeds but BEFORE the decision is buffered onto pa.ch. Ingress callers
-// pass an EventApprovalResolved emitter here so the bus event is guaranteed
-// to be assigned an ID earlier than any event the Request goroutine — and
-// the agent loop reading its decision — can emit after waking up. Without
-// this serialization the Request goroutine can resume on another P in
-// parallel with the bus emit (pa.ch is buffered cap-1 so the send is
-// non-blocking and wakes the receiver immediately), letting an agent
-// tool_status land on the bus with a lower ID than approval_resolved —
-// Desktop would then dismiss the inbox card AFTER observing the next
-// tool already running. Pass nil from non-ingress paths (tests, internal
-// stubs) that do not produce a bus event.
-//
-// The decision is buffered onto pa.ch WHILE the broker mutex is held so a
-// concurrent Request that races to acquire the lock after sendFn-success
-// is guaranteed to see either (pa still in pending, emit normally) or
-// (pa removed + decision ready to drain). Without that pairing the
-// post-sendFn pa-missing check could race the ch send and return a stale
-// DecisionDeny while the real decision goes to nobody.
-func (b *ApprovalBroker) Resolve(requestID string, decision ApprovalDecision, beforeDeliver func()) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	pa, ok := b.pending[requestID]
-	if !ok {
-		return false
-	}
-	if beforeDeliver != nil {
-		beforeDeliver()
-	}
-	select {
-	case pa.ch <- decision:
-	default:
-	}
-	delete(b.pending, requestID)
-	return true
-}
-
-// CancelAll sends DecisionDeny to all pending requests and clears the map.
-// Called on WS disconnect to unblock all waiting goroutines. Fires onCleanup
-// for any pending entry whose approval_request had already been emitted so
-// the corresponding inbox card on Desktop is dismissed.
-//
-// onCleanup is invoked under the broker mutex, BEFORE the deny is buffered
-// onto pa.ch, for the same bus-ID ordering reason documented on Resolve:
-// the Request goroutine becomes runnable on another P the instant the
-// channel send completes, and any event its agent loop emits after seeing
-// DecisionDeny must land on the bus with a higher ID than the cleanup
-// approval_resolved. emitBusJSON only contends the bus mutex with
-// non-blocking subscriber sends, so holding the broker mutex across emits
-// here is bounded — even at 200K-context-era pending depths CancelAll
-// keeps a single-digit number of in-flight approvals.
-func (b *ApprovalBroker) CancelAll() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for id, pa := range b.pending {
-		if pa.emitted && b.onCleanup != nil {
-			b.onCleanup(id)
-		}
-		select {
-		case pa.ch <- DecisionDeny:
-		default:
-		}
-		delete(b.pending, id)
-	}
-}
+// CancelAll sends DecisionDeny to all pending approvals and clears the map,
+// firing onCleanup (approval_resolved) for every already-emitted request.
+// Called on WS disconnect to unblock all waiting goroutines. See
+// pendingCore.cancelAll for the bus-ID ordering contract.
+func (b *ApprovalBroker) CancelAll() { b.cancelAll(DecisionDeny) }
 
 // SetToolAutoApprove marks a non-bash tool as auto-approved (in-memory only).
 // Tools in agentpkg.DisallowsAutoApproval are silently refused. The list is
