@@ -27,7 +27,6 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
-	"github.com/Kocoro-lab/ShanClaw/internal/projects"
 	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -37,6 +36,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
 	"github.com/Kocoro-lab/ShanClaw/internal/migrate/claudecode"
+	"github.com/Kocoro-lab/ShanClaw/internal/projects"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
@@ -2102,11 +2102,15 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if s.deps.ProjectsDir != "" {
-			if _, err := projects.LoadProject(s.deps.ProjectsDir, *body.ProjectID); err != nil {
-				writeError(w, http.StatusBadRequest, fmt.Sprintf("project %q not found", *body.ProjectID))
-				return
-			}
+		// Reject (don't silently file into a project that cannot exist) when the
+		// projects store isn't configured; otherwise require the project to exist.
+		if s.deps.ProjectsDir == "" {
+			writeError(w, http.StatusBadRequest, "projects not configured")
+			return
+		}
+		if _, err := projects.LoadProject(s.deps.ProjectsDir, *body.ProjectID); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("project %q not found", *body.ProjectID))
+			return
 		}
 	}
 	var title string

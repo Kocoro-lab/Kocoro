@@ -32,7 +32,8 @@
     "search_v1",
     "integration_tools_v1",
     "message_idempotency_v1",
-    "message_idempotency_receipt_v2"
+    "message_idempotency_receipt_v2",
+    "project_entity_v1"
   ],
   "memory": {
     "provider": "disabled",

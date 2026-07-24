@@ -65,13 +65,22 @@ func isValidColor(c string) bool {
 }
 
 // randomColor picks a palette color using crypto/rand (math/rand-free, matching
-// the slug generator). Falls back to the first color on a rand failure.
+// the slug generator). Rejection-samples to avoid the modulo bias that would
+// otherwise favor the first (256 % len) colors. Falls back to the first color
+// on a rand failure.
 func randomColor() string {
+	n := len(ProjectColors)
+	limit := 256 - (256 % n) // largest multiple of n ≤ 256; reject values ≥ it
 	b := make([]byte, 1)
-	if _, err := rand.Read(b); err != nil {
-		return ProjectColors[0]
+	for i := 0; i < 16; i++ {
+		if _, err := rand.Read(b); err != nil {
+			return ProjectColors[0]
+		}
+		if int(b[0]) < limit {
+			return ProjectColors[int(b[0])%n]
+		}
 	}
-	return ProjectColors[int(b[0])%len(ProjectColors)]
+	return ProjectColors[0]
 }
 
 // Project is a fully-loaded project entity.

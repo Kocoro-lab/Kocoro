@@ -197,6 +197,9 @@ func writeMeta(projectsDir, id string, meta projectMeta) error {
 // WriteProjectInstructions writes instructions.md atomically; an empty string
 // removes the file.
 func WriteProjectInstructions(projectsDir, id, instructions string) error {
+	if err := ValidateProjectID(id); err != nil {
+		return err
+	}
 	path := filepath.Join(projectsDir, id, instructionsFile)
 	if strings.TrimSpace(instructions) == "" {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -216,6 +219,9 @@ func WriteProjectInstructions(projectsDir, id, instructions string) error {
 // This path takes that identical flock so a user save and a concurrent
 // agent append cannot clobber each other (last-writer-wins data loss).
 func WriteProjectMemory(projectsDir, id, memory string) error {
+	if err := ValidateProjectID(id); err != nil {
+		return err
+	}
 	dir := filepath.Join(projectsDir, id)
 	path := filepath.Join(dir, memoryFile)
 	if err := os.MkdirAll(dir, 0700); err != nil {

@@ -45,6 +45,30 @@ func (s *Server) countSessionsByProject() map[string]int {
 	return counts
 }
 
+// countSessionsForProject tallies sessions for a single project across scopes,
+// without building the whole project→count map — used by GET /projects/{id},
+// which needs exactly one count. Same MsgCount>0 rule as countSessionsByProject.
+func (s *Server) countSessionsForProject(projectID string) int {
+	scopes, err := s.allSessionScopes()
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, scope := range scopes {
+		mgr := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(scope))
+		summaries, err := mgr.List()
+		if err != nil {
+			continue
+		}
+		for _, sum := range summaries {
+			if sum.ProjectID == projectID && sum.MsgCount > 0 {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 // deleteSessionsOfProject permanently deletes every session filed under the
 // given project, across the default scope and every named agent. Mirrors the
 // single-session delete path (cancel active run → Manager.Delete removes JSON +
@@ -116,7 +140,7 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	api := p.ToAPI()
-	api.SessionCount = s.countSessionsByProject()[id]
+	api.SessionCount = s.countSessionsForProject(id)
 	writeJSON(w, http.StatusOK, api)
 }
 
@@ -194,11 +218,11 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	// BEFORE removing the dir so a mid-delete crash never leaves sessions
 	// pointing at a half-removed project. The renderer gates this behind a
 	// strong confirmation warning.
-	s.deleteSessionsOfProject(id)
+	deleted := s.deleteSessionsOfProject(id)
 	if err := projects.DeleteProjectDir(s.deps.ProjectsDir, id); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.auditHTTPOp("DELETE", "/projects/"+id, "deleted")
+	s.auditHTTPOp("DELETE", "/projects/"+id, fmt.Sprintf("deleted (+%d sessions)", deleted))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }

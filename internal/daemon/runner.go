@@ -22,7 +22,6 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
-	"github.com/Kocoro-lab/ShanClaw/internal/projects"
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
@@ -32,6 +31,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
+	"github.com/Kocoro-lab/ShanClaw/internal/projects"
 	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"

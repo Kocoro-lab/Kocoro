@@ -232,6 +232,16 @@ const (
 	// error codes for failed/in-progress retries. Crash-safe deliverable recovery
 	// depends on this stronger cross-process contract.
 	CapMessageIdempotencyReceiptV2 = "message_idempotency_receipt_v2"
+	// CapProjectEntityV1 — daemon supports the persisted Project ENTITY (distinct
+	// from CapSessionProjectsV1, which is the CWD/folder-derived grouping): the
+	// /projects CRUD surface (incl. per-project instructions/memory + theme
+	// color), an always-emitted `project_id` on every session row, the
+	// `project_id` filter on GET /sessions, PATCH /sessions/{id} project_id
+	// re-filing, and project-scoped instructions/memory injection. Desktop gates
+	// the Projects module on this token so an older daemon (which 404s /projects
+	// and never emits project_id) falls back to hiding the feature instead of
+	// probing routes / sniffing the response shape.
+	CapProjectEntityV1 = "project_entity_v1"
 )
 
 var Capabilities = []string{
@@ -264,6 +274,7 @@ var Capabilities = []string{
 	CapIntegrationToolsV1,
 	CapMessageIdempotencyV1,
 	CapMessageIdempotencyReceiptV2,
+	CapProjectEntityV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
