@@ -2864,11 +2864,18 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	handler := &sseEventHandler{w: w, flusher: flusher, broker: reqBroker, ctx: r.Context(), autoApprove: autoApprove, deps: s.deps, agent: req.Agent, source: req.Source}
 	// Inject the QuestionAsker so ask_user_question can reach qBroker. metaFn is
 	// read lazily at ask time so the session id RunAgent resolves mid-run is
-	// captured, mirroring how OnApprovalNeeded reads handler.sessionID. An
-	// autoApprove/unattended SSE run gets no asker: a background run must not
-	// block on an interactive question, so the tool falls back cleanly.
+	// captured, mirroring how OnApprovalNeeded reads handler.sessionID.
+	//
+	// Gate on the run's SOURCE, not auto_approve. auto_approve only governs
+	// whether tool EXECUTIONS are auto-approved; it says nothing about whether a
+	// human can answer a multiple-choice question. An attended Desktop/web run
+	// with auto_approve on must still be able to ask. Only unattended sources
+	// (schedule/cron, heartbeat/watcher/mcp, non-interactive channels) get no
+	// asker, so a background run can never block on an interactive question; the
+	// QuestionBroker's auto-resolution timeout backstops an attended run whose
+	// user walks away.
 	askCtx := r.Context()
-	if !autoApprove {
+	if !isUnattendedSource(req.Source) {
 		askCtx = agent.WithQuestionAsker(askCtx, &brokerQuestionAsker{
 			broker: qBroker,
 			metaFn: func() ApprovalRequestMeta {
