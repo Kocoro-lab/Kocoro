@@ -26,9 +26,12 @@ func TestKoeNativeFloorE2E(t *testing.T) {
 	}
 	enableNativeFloorForTest(t)
 	t.Run("backchannel resumes by finishing the reply", func(t *testing.T) {
-		tools, postDecision := runNativeFloorTrial(t, "Mm-hmm.", "resume_playback")
+		tools, postDecision, ended := runNativeFloorTrial(t, "Mm-hmm.", "resume_playback")
 		if len(tools) != 1 || tools[0] != "resume_playback" {
 			t.Fatalf("backchannel floor tools=%v, want only resume_playback", tools)
+		}
+		if ended {
+			t.Fatal("backchannel ended the voice call")
 		}
 		// The server clears its output buffer and truncates the item on
 		// speech_started, so the paused tail can never replay; a resume decision
@@ -38,19 +41,48 @@ func TestKoeNativeFloorE2E(t *testing.T) {
 			t.Fatalf("backchannel produced %d replies, want at most one continuation: %v", len(postDecision), postDecision)
 		}
 	})
+	t.Run("speech stop keeps the call active", func(t *testing.T) {
+		t.Setenv("KOE_SAY_VOICE", "Tingting")
+		tools, postDecision, ended := runNativeFloorTrial(t, "停一下", "stop_speaking")
+		if len(tools) != 1 || tools[0] != "stop_speaking" {
+			t.Fatalf("speech-stop floor tools=%v, want only stop_speaking", tools)
+		}
+		if ended {
+			t.Fatal("stop_speaking ended the voice call")
+		}
+		if len(postDecision) != 0 {
+			t.Fatalf("stop_speaking produced a spoken follow-up: %v", postDecision)
+		}
+	})
 	t.Run("real interruption is accepted and answered", func(t *testing.T) {
-		tools, postDecision := runNativeFloorTrial(t, "Stop that. What is the capital of France?", "accept_turn")
+		tools, postDecision, ended := runNativeFloorTrial(t, "Stop that. What is the capital of France?", "accept_turn")
 		if len(tools) != 1 || tools[0] != "accept_turn" {
 			t.Fatalf("real interruption floor tools=%v, want only accept_turn", tools)
+		}
+		if ended {
+			t.Fatal("real interruption ended the voice call")
 		}
 		joined := strings.ToLower(strings.Join(postDecision, " "))
 		if !strings.Contains(joined, "paris") {
 			t.Fatalf("accepted raw-audio turn was not answered from its content: %v", postDecision)
 		}
 	})
+	t.Run("explicit dismissal ends during playback", func(t *testing.T) {
+		t.Setenv("KOE_SAY_VOICE", "Tingting")
+		tools, postDecision, ended := runNativeFloorTrial(t, "退出吧", "end_call")
+		if len(tools) != 1 || tools[0] != "end_call" {
+			t.Fatalf("dismiss floor tools=%v, want only end_call", tools)
+		}
+		if !ended {
+			t.Fatal("floor end_call did not end the voice call")
+		}
+		if len(postDecision) != 0 {
+			t.Fatalf("floor end_call produced speech after dismissal: %v", postDecision)
+		}
+	})
 }
 
-func runNativeFloorTrial(t *testing.T, overlap, expectedTool string) ([]string, []string) {
+func runNativeFloorTrial(t *testing.T, overlap, expectedTool string) ([]string, []string, bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -82,15 +114,18 @@ func runNativeFloorTrial(t *testing.T, overlap, expectedTool string) ([]string, 
 	disp := NewDispatcher(NewDaemonClient("http://127.0.0.1:1"), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
 	h := newEventHandler(disp, state, audio, send)
 	h.fullDuplexAEC = true
-	go h.runResponseSender(ctx)
-	go drainHeadlessPlayback(ctx, audio)
 
 	connected := make(chan struct{})
 	configured := make(chan struct{})
 	outputStarted := make(chan struct{})
 	decisionSeen := make(chan struct{})
 	acceptedReply := make(chan struct{})
-	var connOnce, cfgOnce, outputOnce, decisionOnce, replyOnce sync.Once
+	callEnded := make(chan struct{})
+	var connOnce, cfgOnce, outputOnce, decisionOnce, replyOnce, endOnce sync.Once
+	h.onEndCall = func() { endOnce.Do(func() { close(callEnded) }) }
+	go h.runResponseSender(ctx)
+	go drainHeadlessPlayback(ctx, audio)
+
 	var mu sync.Mutex
 	var floorTools []string
 	var postDecision []string
@@ -117,7 +152,8 @@ func runNativeFloorTrial(t *testing.T, overlap, expectedTool string) ([]string, 
 		case "output_audio_buffer.started":
 			outputOnce.Do(func() { close(outputStarted) })
 		case "response.function_call_arguments.done":
-			if ev.Name == "resume_playback" || ev.Name == "accept_turn" {
+			if ev.Name == "resume_playback" || ev.Name == "stop_speaking" ||
+				ev.Name == "accept_turn" || ev.Name == "end_call" {
 				mu.Lock()
 				floorTools = append(floorTools, ev.Name)
 				decisionApplied = true
@@ -180,7 +216,8 @@ func runNativeFloorTrial(t *testing.T, overlap, expectedTool string) ([]string, 
 		mu.Unlock()
 		t.Fatalf("native floor made no decision; errors=%v", errs)
 	}
-	if expectedTool == "accept_turn" {
+	switch expectedTool {
+	case "accept_turn":
 		select {
 		case <-acceptedReply:
 		case <-time.After(30 * time.Second):
@@ -190,14 +227,28 @@ func runNativeFloorTrial(t *testing.T, overlap, expectedTool string) ([]string, 
 			mu.Unlock()
 			t.Fatalf("accepted turn did not answer Paris; transcripts=%v errors=%v", transcripts, errs)
 		}
-	} else {
+	case "end_call":
+		select {
+		case <-callEnded:
+		case <-time.After(10 * time.Second):
+			t.Fatal("native floor selected end_call but did not invoke call teardown")
+		}
+	default:
 		// The floor function output itself completes silently. Give a mistaken normal
 		// reply a full response window to surface.
 		time.Sleep(3 * time.Second)
 	}
 	mu.Lock()
-	defer mu.Unlock()
-	return append([]string(nil), floorTools...), append([]string(nil), postDecision...)
+	tools := append([]string(nil), floorTools...)
+	transcripts := append([]string(nil), postDecision...)
+	mu.Unlock()
+	ended := false
+	select {
+	case <-callEnded:
+		ended = true
+	default:
+	}
+	return tools, transcripts, ended
 }
 
 func feedWAVWithSilence(ctx context.Context, audio *AudioIO, pcm []int16, silenceFrames int) {

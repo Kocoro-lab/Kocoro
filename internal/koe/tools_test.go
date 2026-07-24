@@ -22,13 +22,13 @@ func TestToolDefsShape(t *testing.T) {
 			t.Errorf("tool %q type = %q, want function", d.Name, d.Type)
 		}
 	}
-	for _, want := range []string{"do_task", "cancel", "get_status", "control_app", "switch_agent", "end_call"} {
+	for _, want := range []string{"do_task", "cancel", "get_status", "control_app", "switch_agent", "stop_speaking", "end_call"} {
 		if !names[want] {
 			t.Errorf("missing tool %q", want)
 		}
 	}
-	if len(defs) != 6 {
-		t.Errorf("got %d tools, want exactly 6", len(defs))
+	if len(defs) != 7 {
+		t.Errorf("got %d tools, want exactly 7", len(defs))
 	}
 }
 
@@ -46,9 +46,31 @@ func TestEndCallDescriptionSignalsDismissIntent(t *testing.T) {
 	if desc == "" {
 		t.Fatal("end_call tool missing")
 	}
-	for _, want := range []string{"闭嘴", "goodbye", "double-tap the Option", "Say NOTHING", "cancel", "unsure"} {
+	for _, want := range []string{"退出吧", "goodbye", "double-tap the Option", "Say NOTHING", "cancel", "stop_speaking", "unsure"} {
 		if !strings.Contains(desc, want) {
 			t.Fatalf("end_call description missing %q", want)
+		}
+	}
+}
+
+func TestVoiceControlToolsSeparateStopSpeakingFromEndingTheCall(t *testing.T) {
+	var stopDesc, endDesc string
+	for _, d := range ToolDefs() {
+		switch d.Name {
+		case "stop_speaking":
+			stopDesc = d.Description
+		case "end_call":
+			endDesc = d.Description
+		}
+	}
+	for _, want := range []string{"停一下", "stop talking", "keep the voice call active", "not end_call"} {
+		if !strings.Contains(stopDesc, want) {
+			t.Fatalf("stop_speaking description missing %q: %s", want, stopDesc)
+		}
+	}
+	for _, want := range []string{"退出", "结束通话", "End the entire voice conversation"} {
+		if !strings.Contains(endDesc, want) {
+			t.Fatalf("end_call description missing %q: %s", want, endDesc)
 		}
 	}
 }
@@ -88,6 +110,53 @@ func TestDoTaskDescriptionMatchesPersonaContract(t *testing.T) {
 	}
 	if strings.Contains(desc, `Chinese utterance -> "我来处理"`) {
 		t.Fatal("do_task description must not mandate a single fixed acknowledgement phrase anymore")
+	}
+}
+
+func TestDoTaskDescriptionSeparatesCurrentHandoffFromLaterTurns(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	var desc string
+	for _, d := range ToolDefs() {
+		if d.Name == "do_task" {
+			desc = d.Description
+		}
+	}
+	desc = strings.ToLower(desc)
+	for _, want := range []string{
+		"after the do_task call, emit no more audio in this response",
+		"later user turns may continue normally while the task is running",
+		"never narrate the delivery mechanics",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("do_task handoff contract missing %q", want)
+		}
+	}
+}
+
+func TestDoTaskContractGatesParallelAndMakesEachCallDisjoint(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	var def ToolDef
+	for _, candidate := range ToolDefs() {
+		if candidate.Name == "do_task" {
+			def = candidate
+			break
+		}
+	}
+	combined := def.Description + " " + string(def.Parameters)
+	for _, want := range []string{
+		"Default to exactly one do_task call.",
+		"only when the user explicitly asks",
+		"each call must contain exactly one disjoint work unit",
+		"Never send the full compound request in one call while also sending any of its parts",
+		"Exactly one task scope for this call",
+		"exclude work assigned to other calls",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Errorf("do_task contract missing %q", want)
+		}
+	}
+	if strings.Contains(combined, "use one complete compound task or disjoint concrete tasks") {
+		t.Fatal("do_task description still offers the ambiguous compound-plus-split choice")
 	}
 }
 
@@ -380,10 +449,13 @@ func TestDoTaskDescriptionUsesOneSelfFraming(t *testing.T) {
 	if doTask == "" {
 		t.Fatal("do_task tool not found")
 	}
-	for _, banned := range []string{"back-brain", "back brain", "delegate to"} {
+	for _, banned := range []string{"back-brain", "back brain", "delegate to", "kocoro already", "kocoro's full"} {
 		if strings.Contains(doTask, banned) {
 			t.Errorf("do_task description must not contain %q (contradicts one-self persona)", banned)
 		}
+	}
+	if !strings.Contains(doTask, strings.ToLower(VoiceIdentityInstructions)) {
+		t.Error("do_task description must include the shared single-Kocoro identity contract")
 	}
 	// "own hands" (not the removed "own tools" lecture sentence): first-person
 	// framing survives in the description head after the one-self trim (2026-07-02).

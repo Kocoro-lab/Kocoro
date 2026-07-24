@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/pion/webrtc/v4"
@@ -47,6 +48,7 @@ func TestKoeNativeResultSummaryE2E(t *testing.T) {
 
 	mailbox := NewResultMailbox()
 	h := newEventHandlerWithMailbox(nil, NewCallState("burst-summary-e2e", ""), audio, send, mailbox, nil)
+	h.language = "zh"
 	go h.runResponseSender(ctx)
 
 	connected := make(chan struct{})
@@ -134,6 +136,11 @@ func TestKoeNativeResultSummaryE2E(t *testing.T) {
 			if facts < 2 {
 				t.Fatalf("native summary lost the result's key facts (facts=%d): %q", facts, joined)
 			}
+			assertSingleKocoroVoice(t, joined)
+			han, latin := resultSpeechScriptCounts(joined)
+			if han < 8 || han*2 < latin {
+				t.Fatalf("native summary is not predominantly Chinese (han=%d latin=%d): %q", han, latin, joined)
+			}
 			if strings.Contains(lower, "https://") || strings.Contains(joined, "##") || strings.Contains(joined, "**") {
 				t.Fatalf("native summary read markup or URL aloud: %q", joined)
 			}
@@ -163,4 +170,34 @@ func mintE2EEphemeral(ctx context.Context) (string, error) {
 		daemonBase = "http://127.0.0.1:7533"
 	}
 	return NewDaemonClient(daemonBase).MintViaDaemon(ctx, e2eModelName())
+}
+
+func resultSpeechScriptCounts(s string) (han, latin int) {
+	for _, r := range s {
+		switch {
+		case unicode.Is(unicode.Han, r):
+			han++
+		case unicode.Is(unicode.Latin, r):
+			latin++
+		}
+	}
+	return han, latin
+}
+
+func assertSingleKocoroVoice(t *testing.T, speech string) {
+	t.Helper()
+	normalized := strings.ToLower(speech)
+	normalized = strings.ReplaceAll(normalized, "kocoro desktop", "")
+	for _, banned := range []string{
+		"kocoro's result",
+		"kocoro found",
+		"ask kocoro",
+		"kocoro 的结果",
+		"kocoro查",
+		"让 kocoro",
+	} {
+		if strings.Contains(normalized, banned) {
+			t.Fatalf("native summary framed Kocoro as a separate worker or result source (%q): %q", banned, speech)
+		}
+	}
 }

@@ -41,6 +41,71 @@ func TestToolLoopBudgetContinuationAndClosure(t *testing.T) {
 	}
 }
 
+func TestToolLoopFinalVoiceControlBypassesActionBudgetAndClosesTurn(t *testing.T) {
+	loop := newToolLoopLedger()
+	loop.noteUserCommit(1)
+	loop.bindResponse("response", responsePurposeUser, 1)
+	for i := 0; i < maxTurnTaskActions; i++ {
+		callID := "call-" + string(rune('a'+i))
+		if claim := loop.claimAction("response", callID, "get_status", nil); !claim.allowed {
+			t.Fatalf("setup action %d denied: %+v", i, claim)
+		}
+	}
+	if claim := loop.claimAction("response", "end", "end_call", nil); !claim.allowed {
+		t.Fatalf("end_call must bypass the ordinary action budget: %+v", claim)
+	}
+	if decision, _ := loop.finishResponse("response"); decision != toolLoopNone {
+		t.Fatalf("final voice control scheduled continuation decision=%v", decision)
+	}
+	if claim := loop.claimAction("response", "late", "do_task", nil); claim.allowed || claim.reason != "turn_preempted" {
+		t.Fatalf("turn stayed open after final voice control: %+v", claim)
+	}
+}
+
+func TestFinishToolLoopResponsePinsSpecialResponseLanguage(t *testing.T) {
+	newHandler := func() *eventHandler {
+		h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+		h.language = "zh"
+		h.toolLoop.noteUserCommit(1)
+		h.toolLoop.bindResponse("initial", responsePurposeUser, 1)
+		return h
+	}
+
+	t.Run("continuation", func(t *testing.T) {
+		h := newHandler()
+		if claim := h.toolLoop.claimAction("initial", "call-1", "get_status", nil); !claim.allowed {
+			t.Fatalf("get_status claim denied: %+v", claim)
+		}
+		h.finishToolLoopResponse("initial")
+		req := <-h.loopRespReq
+		for _, want := range []string{VoiceIdentityInstructions, "Reply only in Simplified Chinese", toolContinuationInstructions} {
+			if !strings.Contains(req.instructions, want) {
+				t.Fatalf("continuation instructions missing %q: %s", want, req.instructions)
+			}
+		}
+	})
+
+	t.Run("closure", func(t *testing.T) {
+		h := newHandler()
+		for i := 0; i < maxTurnTaskActions; i++ {
+			callID := "call-" + string(rune('a'+i))
+			if claim := h.toolLoop.claimAction("initial", callID, "get_status", nil); !claim.allowed {
+				t.Fatalf("action %d denied: %+v", i, claim)
+			}
+		}
+		if claim := h.toolLoop.claimAction("initial", "over-budget", "get_status", nil); claim.allowed {
+			t.Fatal("over-budget action was accepted")
+		}
+		h.finishToolLoopResponse("initial")
+		req := <-h.loopRespReq
+		for _, want := range []string{VoiceIdentityInstructions, "Reply only in Simplified Chinese", toolBudgetClosureInstructions} {
+			if !strings.Contains(req.instructions, want) {
+				t.Fatalf("closure instructions missing %q: %s", want, req.instructions)
+			}
+		}
+	})
+}
+
 func TestToolLoopSkipsContinuationForDeferredDoTasks(t *testing.T) {
 	loop := newToolLoopLedger()
 	loop.noteUserCommit(1)

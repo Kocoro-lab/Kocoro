@@ -156,6 +156,48 @@ func TestTaskResultDeliveryInstructionsDoNotEmbedResultOrEnableTools(t *testing.
 	}
 }
 
+func TestTaskResultResponseInstructionsPinConfiguredLanguage(t *testing.T) {
+	results := []resultAnnouncement{{
+		result: SayResult{
+			TaskID: "t01", Status: "ok",
+			Reply: "Atlas-7 ships on July 30.",
+		},
+	}}
+	tests := []struct {
+		language string
+		want     []string
+	}{
+		{
+			language: "zh",
+			want:     []string{"Simplified Chinese", "regardless of the language used in the task-result data", "Translate"},
+		},
+		{
+			language: "ja",
+			want:     []string{"Japanese", "regardless of the language used in the task-result data", "Translate"},
+		},
+		{
+			language: "en",
+			want:     []string{"English", "regardless of the language used in the task-result data", "Translate"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.language, func(t *testing.T) {
+			instructions := taskResultResponseInstructions(tt.language, results)
+			if !strings.Contains(instructions, VoiceIdentityInstructions) {
+				t.Fatalf("result response instructions lost the single-Kocoro identity contract: %s", instructions)
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(instructions, want) {
+					t.Fatalf("result response instructions for %s missing %q: %s", tt.language, want, instructions)
+				}
+			}
+			if !strings.Contains(instructions, "incremental delivery batch") {
+				t.Fatalf("result response instructions lost delivery policy: %s", instructions)
+			}
+		})
+	}
+}
+
 func TestTaskResultInjectionMarksBatchAsIncremental(t *testing.T) {
 	var injected string
 	h := newEventHandler(nil, nil, nil, func(v any) error {
@@ -171,10 +213,13 @@ func TestTaskResultInjectionMarksBatchAsIncremental(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inject task result batch: %v", err)
 	}
-	for _, want := range []string{"incremental Kocoro task-result batch", "other concurrent tasks may arrive in later batches", "absence is not a status signal"} {
+	for _, want := range []string{"incremental result batch from work you performed", "other concurrent tasks may arrive in later batches", "absence is not a status signal"} {
 		if !strings.Contains(injected, want) {
 			t.Fatalf("injected context missing %q: %s", want, injected)
 		}
+	}
+	if strings.Contains(injected, "Kocoro task-result batch") {
+		t.Fatalf("injected context still frames Kocoro as a separate result source: %s", injected)
 	}
 }
 
@@ -225,6 +270,7 @@ func TestResultDeliverySurvivesRealtimeTeardown(t *testing.T) {
 		}
 		return nil
 	}, m, nil)
+	h2.language = "zh"
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
 	go h2.runResponseSender(ctx2)
@@ -233,6 +279,9 @@ func TestResultDeliverySurvivesRealtimeTeardown(t *testing.T) {
 	case instructions := <-secondCreate:
 		if !strings.Contains(instructions, "sole factual source") {
 			t.Fatalf("recovered delivery lost native summary contract: %q", instructions)
+		}
+		if !strings.Contains(instructions, "Reply only in Simplified Chinese") {
+			t.Fatalf("recovered delivery lost configured language pin: %q", instructions)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("new connection did not recover pending result")
@@ -354,6 +403,29 @@ func TestResultDeliveryHeldDoneCompletesOnlyAfterFloorResume(t *testing.T) {
 	h.applyNativeFloorDecision(h.floor.failTurn(1))
 	if got := m.pending(); got != 0 {
 		t.Fatalf("resumed held result was not completed: pending=%d", got)
+	}
+}
+
+func TestResultDeliveryHeldDoneIsDismissedByStopSpeaking(t *testing.T) {
+	m := NewResultMailbox()
+	h := newEventHandlerWithMailbox(nil, nil, nil, func(any) error { return nil }, m, nil)
+	m.Enqueue(SayResult{TaskID: "task-a", Status: "ok", Reply: "Done."}, false)
+	if got := len(m.claim(h.resultOwner)); got != 1 {
+		t.Fatalf("claimed result count=%d, want 1", got)
+	}
+	h.beginResultBatch()
+	h.bindResultBatch("result-response")
+	if !h.floor.begin("result-response") || !h.floor.noteUserCommit(1) {
+		t.Fatal("failed to establish held result response")
+	}
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"result-response","status":"cancelled"}}`))
+	if got := m.pending(); got != 1 {
+		t.Fatalf("held result left mailbox before floor decision: pending=%d", got)
+	}
+	h.applyNativeFloorDecision(floorDecisionStop)
+	if got := m.pending(); got != 0 {
+		t.Fatalf("stop_speaking left the dismissed result queued for reannouncement: pending=%d", got)
 	}
 }
 

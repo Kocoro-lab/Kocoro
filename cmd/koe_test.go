@@ -303,7 +303,7 @@ func TestKoePersonaPinsCurrentUtteranceLanguage(t *testing.T) {
 // it verbally acknowledged "闭嘴" instead). It must name end_call, give concrete
 // dismiss words, the double-tap re-activation, and separate it from cancel.
 func TestKoePersonaTeachesEndCallOnDismiss(t *testing.T) {
-	for _, want := range []string{"end_call", "闭嘴", "double-tapping the", "NOT cancel"} {
+	for _, want := range []string{"end_call", "退出吧", "stop_speaking", "keeps the voice call active", "double-tapping the", "NOT cancel"} {
 		if !strings.Contains(koePersona, want) {
 			t.Errorf("koePersona missing dismiss/end_call guidance %q", want)
 		}
@@ -381,6 +381,81 @@ func TestKoePersonaAckIsBareAndNoPreAnswer(t *testing.T) {
 	}
 	if strings.Contains(koePersona, `say exactly "我来处理"`) {
 		t.Fatal("koePersona must not mandate a single fixed acknowledgement phrase anymore")
+	}
+}
+
+func TestKoePersonaSeparatesCurrentHandoffFromLaterTurns(t *testing.T) {
+	combined := strings.ToLower(koePersona + koeMultiTaskPersona)
+	for _, want := range []string{
+		"after the do_task call, emit no more audio in this response",
+		"later user turns may continue normally while the task is running",
+		"never narrate the delivery mechanics",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("Koe handoff contract missing %q", want)
+		}
+	}
+	if strings.Contains(strings.ToLower(koePersona), "say nothing more until\nthe result lands") {
+		t.Fatal("Koe persona still conflates the current handoff response with later conversation turns")
+	}
+}
+
+func TestKoePersonaUsesSingleKocoroVoice(t *testing.T) {
+	if !strings.Contains(koePersona, koe.VoiceIdentityInstructions) {
+		t.Fatal("Koe persona must include the shared single-Kocoro identity contract")
+	}
+	for _, banned := range []string{
+		"Kocoro already knows",
+		"Kocoro's full final user-facing reply",
+		"Kocoro's earlier work",
+	} {
+		if strings.Contains(koePersona, banned) {
+			t.Fatalf("Koe persona still frames Kocoro as a separate worker or result source: %q", banned)
+		}
+	}
+	if !strings.Contains(koePersona, "Kocoro Desktop") {
+		t.Fatal("single-Kocoro wording must preserve the Kocoro Desktop app name")
+	}
+}
+
+func TestKoePersonaUsesRealtimeStructureAndVoiceStyle(t *testing.T) {
+	for _, want := range []string{
+		"# Role and Objective",
+		"# Personality and Tone",
+		"# Language",
+		"# When to Speak",
+		"# Tools and Work",
+		"# Task Handoff",
+		"# Results",
+		"# Stop, Cancel, and End Call",
+		"calm, warm, and capable coworker",
+		"Direct answers: use one or two short sentences.",
+		"Task results: use at most three short conversational sentences.",
+		"Vary acknowledgements and opening phrases",
+	} {
+		if !strings.Contains(koePersona, want) {
+			t.Errorf("koePersona missing structured voice contract %q", want)
+		}
+	}
+	if got := len(strings.Fields(koePersona)); got > 800 {
+		t.Errorf("koePersona has %d words, want no more than 800", got)
+	}
+}
+
+func TestKoePersonaDefaultsToOneTaskAndMakesExplicitParallelScopesDisjoint(t *testing.T) {
+	combined := koePersona + koeMultiTaskPersona
+	for _, want := range []string{
+		"Default to exactly one do_task call.",
+		"only when the user explicitly asks",
+		"each call must contain exactly one disjoint work unit",
+		"Never send the full compound request in one call while also sending any of its parts",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Errorf("Koe parallel contract missing %q", want)
+		}
+	}
+	if strings.Contains(combined, "either send one complete compound task, or split it") {
+		t.Fatal("Koe parallel contract still offers the ambiguous compound-plus-split choice")
 	}
 }
 

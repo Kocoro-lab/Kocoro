@@ -199,9 +199,9 @@ Flags: `-y/--yes` auto-approve; `--agent` named agent; `--dangerously-skip-permi
 
 ### Voice Front Brain (macOS)
 
-`shan koe` runs Kocoro's OpenAI Realtime speech-to-speech front brain and delegates computer work to the local daemon. A spoken turn can start distinct tasks in parallel, cancel or refine an existing task by its call-scoped identity, and keep conversing while results run; completed results are queued and spoken as they arrive. Asking to stop everything cancels all running tasks in one call and reports any task that could not be cancelled.
+`shan koe` is Kocoro's realtime voice interface. It speaks as one consistent assistant, handles computer tasks while you keep talking, and shares results as they arrive. Each request stays as one task by default and splits into parallel work only when you explicitly ask.
 
-With the VPIO audio backend, `shan koe --barge-in` uses reversible native-S2S turn taking: playback pauses locally while the speech model decides whether the sound was a backchannel to ignore or a real interruption to accept. ASR is not on this admission path. An accepted interruption trims the cut-off reply from the conversation history, so Kocoro never refers back to words it did not actually get to say.
+With `shan koe --barge-in` on the VPIO audio backend, Kocoro can pause and resume around a backchannel, stop speaking without hanging up, accept a new request, or end the call. Stopping speech, cancelling work, and ending the call are separate actions; work already in progress survives a hang-up. Double-tap Option to talk again.
 
 ## Commands
 
