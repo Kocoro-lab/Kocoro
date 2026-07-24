@@ -16,6 +16,7 @@ type ProjectAPI struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
 	Description  string    `json:"description"`
+	Color        string    `json:"color"` // theme color key from ProjectColors
 	Instructions *string   `json:"instructions"` // null when no instructions.md
 	Memory       *string   `json:"memory"`       // null when no MEMORY.md
 	CreatedAt    time.Time `json:"created_at"`
@@ -31,6 +32,7 @@ func (p *Project) ToAPI() *ProjectAPI {
 		ID:          p.ID,
 		Name:        p.Name,
 		Description: p.Description,
+		Color:       p.Color,
 		CreatedAt:   p.CreatedAt,
 		UpdatedAt:   p.UpdatedAt,
 	}
@@ -49,6 +51,7 @@ func (p *Project) ToAPI() *ProjectAPI {
 type ProjectCreateRequest struct {
 	Name         string `json:"name"`
 	Description  string `json:"description,omitempty"`
+	Color        string `json:"color,omitempty"` // empty → random palette color
 	Instructions string `json:"instructions,omitempty"`
 	Memory       string `json:"memory,omitempty"`
 }
@@ -61,6 +64,9 @@ func (r *ProjectCreateRequest) Validate() error {
 	if len(r.Description) > maxProjectDescriptionLen {
 		return fmt.Errorf("project description exceeds %d characters", maxProjectDescriptionLen)
 	}
+	if r.Color != "" && !isValidColor(r.Color) {
+		return fmt.Errorf("invalid project color %q", r.Color)
+	}
 	return nil
 }
 
@@ -69,6 +75,7 @@ func (r *ProjectCreateRequest) Validate() error {
 type ProjectUpdateRequest struct {
 	Name         *string `json:"name,omitempty"`
 	Description  *string `json:"description,omitempty"`
+	Color        *string `json:"color,omitempty"`
 	Instructions *string `json:"instructions,omitempty"`
 	Memory       *string `json:"memory,omitempty"`
 }
@@ -87,10 +94,15 @@ func CreateProject(projectsDir string, req *ProjectCreateRequest) (*Project, err
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
+	color := req.Color
+	if color == "" {
+		color = randomColor() // macOS-style: a new project gets a random theme color
+	}
 	now := time.Now().UTC()
 	meta := projectMeta{
 		Name:        strings.TrimSpace(req.Name),
 		Description: strings.TrimSpace(req.Description),
+		Color:       color,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -136,6 +148,13 @@ func UpdateProject(projectsDir, id string, req *ProjectUpdateRequest) (*Project,
 		p.Description = strings.TrimSpace(*req.Description)
 		metaChanged = true
 	}
+	if req.Color != nil {
+		if !isValidColor(*req.Color) {
+			return nil, fmt.Errorf("invalid project color %q", *req.Color)
+		}
+		p.Color = *req.Color
+		metaChanged = true
+	}
 	if req.Instructions != nil {
 		if err := WriteProjectInstructions(projectsDir, id, *req.Instructions); err != nil {
 			return nil, err
@@ -152,6 +171,7 @@ func UpdateProject(projectsDir, id string, req *ProjectUpdateRequest) (*Project,
 		meta := projectMeta{
 			Name:        p.Name,
 			Description: p.Description,
+			Color:       p.Color,
 			CreatedAt:   p.CreatedAt,
 			UpdatedAt:   time.Now().UTC(),
 		}

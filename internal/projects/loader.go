@@ -50,11 +50,36 @@ const (
 	maxProjectDescriptionLen = 2000
 )
 
+// ProjectColors is the fixed macOS-Finder-style palette a project's theme color
+// is drawn from (semantic keys; the renderer maps each to a hue for light/dark).
+// A new project gets a random one by default; the user can change it.
+var ProjectColors = []string{"red", "orange", "yellow", "green", "blue", "purple", "gray"}
+
+func isValidColor(c string) bool {
+	for _, v := range ProjectColors {
+		if v == c {
+			return true
+		}
+	}
+	return false
+}
+
+// randomColor picks a palette color using crypto/rand (math/rand-free, matching
+// the slug generator). Falls back to the first color on a rand failure.
+func randomColor() string {
+	b := make([]byte, 1)
+	if _, err := rand.Read(b); err != nil {
+		return ProjectColors[0]
+	}
+	return ProjectColors[int(b[0])%len(ProjectColors)]
+}
+
 // Project is a fully-loaded project entity.
 type Project struct {
 	ID           string
 	Name         string
 	Description  string
+	Color        string
 	Instructions string
 	Memory       string
 	CreatedAt    time.Time
@@ -65,6 +90,7 @@ type Project struct {
 type projectMeta struct {
 	Name        string    `yaml:"name"`
 	Description string    `yaml:"description,omitempty"`
+	Color       string    `yaml:"color,omitempty"`
 	CreatedAt   time.Time `yaml:"created_at"`
 	UpdatedAt   time.Time `yaml:"updated_at"`
 }
@@ -130,10 +156,15 @@ func LoadProject(projectsDir, id string) (*Project, error) {
 		return nil, fmt.Errorf("project %q: bad %s: %w", id, metaFile, err)
 	}
 
+	color := meta.Color
+	if !isValidColor(color) {
+		color = ProjectColors[len(ProjectColors)-1] // legacy/invalid → gray
+	}
 	p := &Project{
 		ID:          id,
 		Name:        meta.Name,
 		Description: meta.Description,
+		Color:       color,
 		CreatedAt:   meta.CreatedAt,
 		UpdatedAt:   meta.UpdatedAt,
 	}
