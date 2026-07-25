@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -111,11 +112,15 @@ func (t *CloudDelegateTool) Info() agent.ToolInfo {
 func (t *CloudDelegateTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args cloudDelegateArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
-
-	if args.Task == "" {
-		return agent.ToolResult{Content: "task is required", IsError: true}, nil
+	// Explicit required-field checks so the [validation error] prefix is kept
+	// and each field names itself for the loop detector's early stop.
+	if strings.TrimSpace(args.Task) == "" {
+		return agent.ValidationError("task is required: describe the work to delegate to the cloud."), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("cloud_delegate: missing required `description` parameter"), nil
 	}
 
 	// Cap context length

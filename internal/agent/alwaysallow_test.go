@@ -73,29 +73,60 @@ func TestCheckPermissionAndApproval_FormerlyHighRiskHonorsAlwaysAllow(t *testing
 	}
 }
 
-// TestCheckPermissionAndApproval_UnattendedSkipsAlwaysAllowForLegacyDenyListed
-// pins the legacy-tool boundary: a hand-edited always-allow entry for a tool
-// that is not persistable must NOT short-circuit approval on an
+// TestCheckPermissionAndApproval_UnattendedSkipsAlwaysAllowForDenyListed
+// pins the unattended gate: a persisted always-allow entry for a tool on the
+// unattended deny-list must NOT short-circuit approval on an
 // unattended run. The request has to reach OnApprovalNeeded, where every
 // unattended handler (scheduler/heartbeat/watcher/auto_approve) enforces
 // DisallowsUnattendedAutoApproval. Before the fix, the loop.go bypass
 // returned "allow" before the handler was ever consulted.
-func TestCheckPermissionAndApproval_UnattendedSkipsAlwaysAllowForLegacyDenyListed(t *testing.T) {
+//
+// computer_use is the ONE documented exception and is pinned separately in
+// TestCheckPermissionAndApproval_UnattendedHonorsGlobalComputerUseGrant.
+// Everything else on the deny-list — standalone screenshot and the legacy GUI
+// names — still fails closed.
+func TestCheckPermissionAndApproval_UnattendedSkipsAlwaysAllowForDenyListed(t *testing.T) {
+	for _, name := range []string{"screenshot", "computer", "accessibility", "applescript", "ghostty"} {
+		t.Run(name, func(t *testing.T) {
+			loop, handler := newApprovalProbeLoop(t, nil)
+			loop.SetAlwaysAllowTools([]string{name})
+			loop.SetUnattendedRun(true)
+
+			tool := &mockApprovalTool{name: name}
+			// mockHandler.approveResult=false stands in for the unattended
+			// handlers' deny-list gate.
+			_, approved := loop.checkPermissionAndApproval(
+				context.Background(), name, `{"description":"Inspect the screen"}`, tool, NewApprovalCache())
+
+			if approved {
+				t.Errorf("unattended run auto-approved %s via persisted always-allow; deny-list bypassed", name)
+			}
+			if !handler.approvalRequested {
+				t.Error("approval request never reached the handler's unattended deny-list gate")
+			}
+		})
+	}
+}
+
+// The global Computer Use grant is the product's single automation permission:
+// an explicit persisted computer_use always-allow DOES authorize an unattended
+// run. This is the deliberate exception to the test above — pinned separately
+// so that widening it back to "any persisted always-allow wins" (which would
+// re-open unattended desktop capture for screenshot) fails loudly.
+func TestCheckPermissionAndApproval_UnattendedHonorsGlobalComputerUseGrant(t *testing.T) {
 	loop, handler := newApprovalProbeLoop(t, nil)
-	loop.SetAlwaysAllowTools([]string{"computer"})
+	loop.SetAlwaysAllowTools([]string{"computer_use"})
 	loop.SetUnattendedRun(true)
 
-	tool := &mockApprovalTool{name: "computer"}
-	// mockHandler.approveResult=false stands in for the unattended handlers'
-	// gate, which returns !DisallowsUnattendedAutoApproval("computer_use") ==
-	// false for exactly this tool.
-	_, approved := loop.checkPermissionAndApproval(context.Background(), "computer", `{"action":"click","x":1,"y":1,"description":"Click"}`, tool, NewApprovalCache())
+	tool := &mockApprovalTool{name: "computer_use"}
+	_, approved := loop.checkPermissionAndApproval(
+		context.Background(), "computer_use", `{"description":"Inspect the screen"}`, tool, NewApprovalCache())
 
-	if approved {
-		t.Error("unattended run auto-approved legacy computer via persisted always-allow; deny-list bypassed")
+	if !approved {
+		t.Error("explicit global computer_use grant was not honored on an unattended run")
 	}
-	if !handler.approvalRequested {
-		t.Error("approval request never reached the handler's unattended deny-list gate")
+	if handler.approvalRequested {
+		t.Error("granted computer_use should not have prompted the unattended handler")
 	}
 }
 

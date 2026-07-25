@@ -112,17 +112,19 @@ func TestGUIActionOutcomeValidationRequiresCoherentFailureCodes(t *testing.T) {
 	}
 }
 
-// TestDisallowsUnattendedAutoApproval pins the unattended gate. As of
-// 2026-07-22 the list contains every model-visible GUI-control surface — an
-// unattended schedule/heartbeat/watcher run must never use a legacy name to
-// bypass the computer_use gate.
+// TestDisallowsUnattendedAutoApproval pins the unattended gate. The list
+// contains computer_use, standalone screenshot, and every legacy GUI-control
+// name — an unattended schedule/heartbeat/watcher run must never observe or
+// control the screen on the strength of an attended always-allow click or a
+// blanket auto_approve, nor use a legacy name to bypass the computer_use gate.
+// See unattendedAutoApprovalDenyList for the full rationale.
 //
 // If you add an entry, also enumerate the tools you expect to remain off
 // the list so accidental over-broad deny-listing (which would break
 // scheduled runs of ordinary agents) gets caught.
 func TestDisallowsUnattendedAutoApproval(t *testing.T) {
 	got := UnattendedAutoApprovalDenyList()
-	want := []string{"computer_use", "computer", "accessibility", "applescript", "ghostty"}
+	want := []string{"computer_use", "screenshot", "computer", "accessibility", "applescript", "ghostty"}
 	if len(got) != len(want) {
 		t.Fatalf("unattendedAutoApprovalDenyList expected %v, got %v", want, got)
 	}
@@ -130,6 +132,9 @@ func TestDisallowsUnattendedAutoApproval(t *testing.T) {
 		if got[index] != name || !DisallowsUnattendedAutoApproval(name) {
 			t.Fatalf("GUI tool %q missing from unattended deny-list %v", name, got)
 		}
+	}
+	if !DisallowsUnattendedAutoApproval("screenshot") {
+		t.Fatal("screenshot must be refused unattended auto-approval")
 	}
 	// Ordinary tools and the three formerly-deny-listed tools should ALL
 	// return false. The formerly-deny-listed trio is enumerated explicitly

@@ -38,7 +38,10 @@ func (t *DirectoryListTool) Info() agent.ToolInfo {
 func (t *DirectoryListTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args dirListArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("directory_list: missing required `description` parameter"), nil
 	}
 
 	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)

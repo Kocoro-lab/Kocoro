@@ -36,16 +36,14 @@ var compactableTools = map[string]bool{
 
 // TimeBasedCompactConfig controls when time-based microcompaction fires.
 //
-// The default policy is disabled. When enabled, the gap threshold of 60
-// minutes matches Anthropic's documented 1h prompt-cache TTL ceiling — at
-// that point the server-side cache has reliably expired so the full prefix
-// will be rewritten regardless, and clearing old tool results becomes free.
+// The default policy is disabled. When enabled, the 60-minute seed is an
+// operator-tunable idle-history threshold; it is intentionally independent of
+// Cloud's prompt-cache TTL policy.
 type TimeBasedCompactConfig struct {
 	// Enabled is the master switch. When false, time-based compaction is a no-op.
 	Enabled bool
 	// GapThresholdMinutes triggers compaction when (now - lastAssistantAt)
-	// exceeds this value. Default 60 — matches the Anthropic 1h cache TTL
-	// ceiling so we never force a cache miss that wouldn't have happened.
+	// exceeds this value. Default 60.
 	GapThresholdMinutes int
 	// KeepRecent retains this many most-recent compactable tool results.
 	// Older results are cleared. Default 5 — enough for the model to keep a

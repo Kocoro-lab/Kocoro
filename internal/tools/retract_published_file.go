@@ -222,11 +222,15 @@ func (t *RetractPublishedFileTool) Run(ctx context.Context, argsJSON string) (ag
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
+	// Explicit required-field checks so the missing-id message keeps its hint.
 	id := strings.TrimSpace(args.ID)
 	if id == "" {
 		return agent.ValidationError(
 			"id is required. Get it from `list_my_published_files` — do not pass the URL.",
 		), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("retract_published_file: missing required `description` parameter"), nil
 	}
 	if strings.HasPrefix(id, "http://") || strings.HasPrefix(id, "https://") {
 		return agent.ValidationError(

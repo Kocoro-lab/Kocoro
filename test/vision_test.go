@@ -10,7 +10,7 @@ import (
 
 func TestVisionLoop_ScreenshotReturnsImage(t *testing.T) {
 	st := &tools.ScreenshotTool{}
-	result, err := st.Run(context.Background(), `{"target":"fullscreen"}`)
+	result, err := st.Run(context.Background(), `{"description":"Verify the screenshot tool returns an image block","target":"fullscreen"}`)
 	if err != nil {
 		t.Fatalf("screenshot error: %v", err)
 	}

@@ -14,10 +14,10 @@ func TestMemoryAppendTool_DescriptionCarriesLanguageDiscipline(t *testing.T) {
 	info := (&MemoryAppendTool{}).Info()
 
 	required := []string{
-		"LANGUAGE:",                         // section marker
+		"LANGUAGE:",                           // section marker
 		"write entries in English by default", // the rule
-		"quote the user's words verbatim",   // escape hatch for proper nouns / decisions
-		"self-reinforcing loop",             // why it matters
+		"quote the user's words verbatim",     // escape hatch for proper nouns / decisions
+		"self-reinforcing loop",               // why it matters
 	}
 	for _, phrase := range required {
 		if !strings.Contains(info.Description, phrase) {

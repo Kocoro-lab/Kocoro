@@ -49,6 +49,17 @@ func (g *guiExecutionGate) RestoreGUIActionTargetV1(
 }
 
 func (g *guiExecutionGate) Run(ctx context.Context, args string) (agent.ToolResult, error) {
+	// Validate required fields BEFORE classification. A malformed call cannot be
+	// classified, so without this the gate would mask every missing/empty field
+	// behind the generic "could not be safely classified" message — losing the
+	// field name the model needs to self-correct, and for some shapes downgrading
+	// a validation error to a business error, which costs the loop detector its
+	// 3-strike validation fast path. Nothing executes on this path either way:
+	// every gated GUI tool declares only string required fields, so the strict
+	// zero-value check is exact here.
+	if invalid, ok := agent.ValidateToolArguments(g.inner.Info(), args); !ok {
+		return invalid, nil
+	}
 	descriptor, err := g.describer.DescribeGUIAction(ctx, args)
 	if err != nil {
 		// The gate is the last seam before the real implementation. A classifier

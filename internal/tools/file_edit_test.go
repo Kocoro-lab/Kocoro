@@ -21,9 +21,10 @@ func TestFileEdit_RejectsUnreadFile(t *testing.T) {
 
 	tool := &FileEditTool{}
 	args, _ := json.Marshal(fileEditArgs{
-		Path:      path,
-		OldString: "hello",
-		NewString: "goodbye",
+		Path:        path,
+		OldString:   "hello",
+		NewString:   "goodbye",
+		Description: "test unread edit",
 	})
 
 	result, err := tool.Run(ctx, string(args))
@@ -56,9 +57,10 @@ func TestFileEdit_AllowsReadFile(t *testing.T) {
 
 	tool := &FileEditTool{}
 	args, _ := json.Marshal(fileEditArgs{
-		Path:      path,
-		OldString: "hello",
-		NewString: "goodbye",
+		Path:        path,
+		OldString:   "hello",
+		NewString:   "goodbye",
+		Description: "test read edit",
 	})
 
 	result, err := tool.Run(ctx, string(args))
@@ -83,9 +85,10 @@ func TestFileEdit_NoTrackerInContext(t *testing.T) {
 	// No tracker in context (e.g., tool called outside agent loop) - should allow
 	tool := &FileEditTool{}
 	args, _ := json.Marshal(fileEditArgs{
-		Path:      path,
-		OldString: "hello",
-		NewString: "goodbye",
+		Path:        path,
+		OldString:   "hello",
+		NewString:   "goodbye",
+		Description: "test direct edit",
 	})
 
 	result, err := tool.Run(context.Background(), string(args))
@@ -173,10 +176,11 @@ func TestFileEdit_ReplaceAll(t *testing.T) {
 			ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
 
 			args, _ := json.Marshal(fileEditArgs{
-				Path:       path,
-				OldString:  tc.oldStr,
-				NewString:  "X",
-				ReplaceAll: tc.replaceAll,
+				Path:        path,
+				OldString:   tc.oldStr,
+				NewString:   "X",
+				Description: "test replace all",
+				ReplaceAll:  tc.replaceAll,
 			})
 
 			tool := &FileEditTool{}

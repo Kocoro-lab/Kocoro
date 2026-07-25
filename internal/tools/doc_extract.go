@@ -1,9 +1,8 @@
 // Package tools — doc_extract.go implements four document-extraction convenience
 // tools: pdf_to_text, docx_to_text, xlsx_to_text, pptx_to_text. Each tool
-// shells out to an external "primary" extractor (poppler / pandoc / xlsx2csv)
-// and falls back to a zero-dependency unzip + raw-XML strip path when the
-// primary is missing, so the LLM can read common Office formats in a single
-// turn regardless of host setup.
+// shells out to an external "primary" extractor (poppler / pandoc / xlsx2csv).
+// Office formats fall back to raw XML; PDF falls back to macOS PDFKit when
+// available.
 //
 // Design notes:
 //
@@ -16,8 +15,8 @@
 //     marker so the LLM knows the result is partial.
 //   - Primary tools that aren't installed produce a structured install hint
 //     rather than a hard error — the agent falls through to the unzip fallback
-//     for Office formats, or surfaces the hint to the user for PDF (no
-//     zero-dep PDF text extractor in the Go stdlib).
+//     for Office formats. PDF uses the host-native PDFKit fallback on macOS and
+//     otherwise surfaces an install hint (the Go stdlib has no PDF extractor).
 //   - exec.Command is invoked with a fixed argv slice for every path. We
 //     never construct a shell command string from user input, so the
 //     well-known "$(...)" / "; rm -rf /" attack surface does not apply here.
@@ -34,6 +33,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -195,11 +195,11 @@ type pdfToTextArgs struct {
 func (t *PDFToTextTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "pdf_to_text",
-		Description: "Extract plain text from a PDF using poppler's pdftotext. " +
+		Description: "Extract plain text from a PDF using poppler's pdftotext, with a macOS PDFKit fallback. " +
 			"Optional pages selector: \"all\" (default), \"5\" (single page), or \"1-10\" (range). " +
-			"Read-only; no approval. Requires `pdftotext` on PATH — if missing, returns an install hint " +
-			"(`brew install poppler` on macOS) and suggests uploading the PDF directly so cloud can " +
-			"render it as a native Anthropic document block instead. Output capped at 100K characters.",
+			"Read-only; no approval. On non-macOS hosts without `pdftotext`, returns an install hint " +
+			"and suggests uploading the PDF directly so cloud can render it as a native Anthropic document block. " +
+			"Output capped at 100K characters.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -233,8 +233,14 @@ func (t *PDFToTextTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 	}
 
 	if _, err := exec.LookPath("pdftotext"); err != nil {
+		if out, ok := pdfTextWithPDFKit(ctx, resolved, pageArgs); ok {
+			return agent.ToolResult{
+				Content: "[Extracted via macOS PDFKit fallback]\n\n" + capRunes(out),
+			}, nil
+		}
 		return agent.ToolResult{
-			Content: "[pdf_to_text] pdftotext (poppler) is not installed. Install with `brew install poppler` on macOS, " +
+			Content: "[pdf_to_text] no supported PDF text extractor is available. Install pdftotext " +
+				"(`brew install poppler` on macOS), " +
 				"or upload the PDF directly so cloud renders it as a native Anthropic document block " +
 				"(no host-side extractor needed in that path).",
 			IsError:       true,
@@ -253,6 +259,49 @@ func (t *PDFToTextTool) Run(ctx context.Context, argsJSON string) (agent.ToolRes
 	}
 	note := "[Extracted via pdftotext -layout]"
 	return agent.ToolResult{Content: note + "\n\n" + capRunes(out)}, nil
+}
+
+func pdfTextWithPDFKit(ctx context.Context, path string, pageArgs []string) (string, bool) {
+	if runtime.GOOS != "darwin" {
+		return "", false
+	}
+	if _, err := exec.LookPath("swift"); err != nil {
+		return "", false
+	}
+
+	first, last := 1, -1
+	if len(pageArgs) == 4 {
+		parsedFirst, errFirst := strconv.Atoi(pageArgs[1])
+		parsedLast, errLast := strconv.Atoi(pageArgs[3])
+		if errFirst != nil || errLast != nil {
+			return "", false
+		}
+		first, last = parsedFirst, parsedLast
+	}
+
+	swiftCode := fmt.Sprintf(`
+import Foundation
+import PDFKit
+
+let url = URL(fileURLWithPath: %q)
+guard let doc = PDFDocument(url: url) else { exit(2) }
+if doc.isEncrypted && !doc.unlock(withPassword: "") { exit(3) }
+let first = max(1, %d)
+let requestedLast = %d
+let last = requestedLast < 0 ? doc.pageCount : min(requestedLast, doc.pageCount)
+if first > doc.pageCount || first > last { exit(4) }
+var found = false
+for pageNumber in first...last {
+    guard let page = doc.page(at: pageNumber - 1),
+          let text = page.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !text.isEmpty else { continue }
+    found = true
+    print("=== Page \(pageNumber) ===")
+    print(text)
+}
+if !found { exit(5) }
+`, path, first, last)
+	return runPrimary(ctx, "swift", []string{"-e", swiftCode})
 }
 
 func (t *PDFToTextTool) RequiresApproval() bool { return false }

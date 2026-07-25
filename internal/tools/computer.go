@@ -201,14 +201,14 @@ func (t *ComputerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	}
 	var args computerArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 	}
 
-	if args.Action == "" {
-		return agent.ValidationError("missing required parameter: action"), nil
+	if strings.TrimSpace(args.Action) == "" {
+		return agent.ValidationError("computer: missing required `action` parameter"), nil
 	}
 	if strings.TrimSpace(args.Description) == "" {
-		return agent.ValidationError("missing required parameter: description"), nil
+		return agent.ValidationError("computer: missing required `description` parameter"), nil
 	}
 
 	normalizeArgs(&args)

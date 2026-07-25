@@ -101,10 +101,13 @@ func (t *MCPTool) Info() agent.ToolInfo {
 }
 
 func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArgumentPresence(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
 	var args map[string]any
 	if argsJSON != "" && argsJSON != "{}" {
 		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-			return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+			return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
 		}
 	}
 	if args == nil {
@@ -168,6 +171,9 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	}
 
 	content = normalizeMCPResult(t.serverName, t.tool.Name, content, isError)
+	if isError && looksLikeRemoteValidationError(content) {
+		return agent.ValidationError(strings.TrimPrefix(content, "[validation error] ")), nil
+	}
 	if !isError && rewrittenOutPath != "" {
 		content = annotateAbsPath(content, rewrittenOutPath)
 	}

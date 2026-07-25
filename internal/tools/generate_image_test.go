@@ -13,10 +13,10 @@ import (
 // fakeImageGen is an in-memory imageGen so the tool tests can assert
 // arg-validation and error-classification behavior without an HTTP server.
 type fakeImageGen struct {
-	resp     *images.GenerateResponse
-	err      error
-	gotReq   images.GenerateRequest
-	calls    int
+	resp   *images.GenerateResponse
+	err    error
+	gotReq images.GenerateRequest
+	calls  int
 }
 
 func (f *fakeImageGen) Generate(ctx context.Context, req images.GenerateRequest) (*images.GenerateResponse, error) {
@@ -27,7 +27,7 @@ func (f *fakeImageGen) Generate(ctx context.Context, req images.GenerateRequest)
 
 func TestGenerateImageInvalidJSON(t *testing.T) {
 	tool := NewGenerateImageTool(&fakeImageGen{})
-	res, err := tool.Run(context.Background(), `{"prompt":}`) // malformed JSON
+	res, err := tool.Run(context.Background(), `{"description":"test image operation","prompt":}`) // malformed JSON
 	if err != nil {
 		t.Fatalf("Run returned error (should embed in ToolResult): %v", err)
 	}
@@ -38,7 +38,7 @@ func TestGenerateImageInvalidJSON(t *testing.T) {
 
 func TestGenerateImageEmptyPrompt(t *testing.T) {
 	tool := NewGenerateImageTool(&fakeImageGen{})
-	for _, args := range []string{`{}`, `{"prompt":""}`, `{"prompt":"   "}`} {
+	for _, args := range []string{`{"description":"test image operation"}`, `{"description":"test image operation","prompt":""}`, `{"description":"test image operation","prompt":"   "}`} {
 		res, _ := tool.Run(context.Background(), args)
 		if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
 			t.Errorf("args=%q: expected validation error, got %+v", args, res)
@@ -49,7 +49,7 @@ func TestGenerateImageEmptyPrompt(t *testing.T) {
 func TestGenerateImagePromptTooLong(t *testing.T) {
 	tool := NewGenerateImageTool(&fakeImageGen{})
 	long := strings.Repeat("a", imagePromptMaxLen+1)
-	res, _ := tool.Run(context.Background(), `{"prompt":"`+long+`"}`)
+	res, _ := tool.Run(context.Background(), `{"description":"test image operation","prompt":"`+long+`"}`)
 	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
 		t.Fatalf("expected validation error for over-length prompt, got %+v", res)
 	}
@@ -71,14 +71,14 @@ func TestGenerateImagePromptRuneVsByte(t *testing.T) {
 
 	// 16000 CJK runes (each 3 bytes in UTF-8) → 48000 bytes, 16000 runes.
 	cjk := strings.Repeat("漢", 16000)
-	res, _ := tool.Run(context.Background(), `{"prompt":"`+cjk+`"}`)
+	res, _ := tool.Run(context.Background(), `{"description":"test image operation","prompt":"`+cjk+`"}`)
 	if res.IsError {
 		t.Fatalf("16000-rune CJK prompt must be accepted (well under 32000 max), got %+v", res)
 	}
 
 	// At exactly 32000 runes — boundary, still accepted.
 	at := strings.Repeat("漢", imagePromptMaxLen)
-	res, _ = tool.Run(context.Background(), `{"prompt":"`+at+`"}`)
+	res, _ = tool.Run(context.Background(), `{"description":"test image operation","prompt":"`+at+`"}`)
 	if res.IsError {
 		t.Fatalf("32000-rune CJK prompt at boundary must be accepted, got %+v", res)
 	}
@@ -86,7 +86,7 @@ func TestGenerateImagePromptRuneVsByte(t *testing.T) {
 	// 32001 runes — one over, must reject. Rune count, not byte count, in
 	// the error message.
 	over := strings.Repeat("漢", imagePromptMaxLen+1)
-	res, _ = tool.Run(context.Background(), `{"prompt":"`+over+`"}`)
+	res, _ = tool.Run(context.Background(), `{"description":"test image operation","prompt":"`+over+`"}`)
 	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
 		t.Fatalf("32001-rune prompt must be rejected, got %+v", res)
 	}
@@ -97,11 +97,11 @@ func TestGenerateImagePromptRuneVsByte(t *testing.T) {
 
 func TestGenerateImageNOutOfRange(t *testing.T) {
 	tool := NewGenerateImageTool(&fakeImageGen{})
-	res, _ := tool.Run(context.Background(), `{"prompt":"x","n":11}`)
+	res, _ := tool.Run(context.Background(), `{"description":"test image operation","prompt":"x","n":11}`)
 	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
 		t.Fatalf("expected validation error for n=11, got %+v", res)
 	}
-	res, _ = tool.Run(context.Background(), `{"prompt":"x","n":-1}`)
+	res, _ = tool.Run(context.Background(), `{"description":"test image operation","prompt":"x","n":-1}`)
 	if !res.IsError || res.ErrorCategory != agent.ErrCategoryValidation {
 		t.Fatalf("expected validation error for n=-1, got %+v", res)
 	}
@@ -110,9 +110,9 @@ func TestGenerateImageNOutOfRange(t *testing.T) {
 func TestGenerateImageInvalidEnum(t *testing.T) {
 	tool := NewGenerateImageTool(&fakeImageGen{})
 	cases := []string{
-		`{"prompt":"x","size":"4096x4096"}`,
-		`{"prompt":"x","quality":"ultra"}`,
-		`{"prompt":"x","background":"chrome"}`,
+		`{"description":"test image operation","prompt":"x","size":"4096x4096"}`,
+		`{"description":"test image operation","prompt":"x","quality":"ultra"}`,
+		`{"description":"test image operation","prompt":"x","background":"chrome"}`,
 	}
 	for _, args := range cases {
 		res, _ := tool.Run(context.Background(), args)
@@ -134,7 +134,7 @@ func TestGenerateImageHappyPath(t *testing.T) {
 	}
 	tool := NewGenerateImageTool(fake)
 	res, _ := tool.Run(context.Background(),
-		`{"prompt":"a cyberpunk cat","size":"1024x1024","quality":"low","n":1}`)
+		`{"description":"test image operation","prompt":"a cyberpunk cat","size":"1024x1024","quality":"low","n":1}`)
 	if res.IsError {
 		t.Fatalf("happy path returned error: %+v", res)
 	}
@@ -165,7 +165,7 @@ func TestGenerateImageMultiImageOutput(t *testing.T) {
 		},
 	}
 	tool := NewGenerateImageTool(fake)
-	res, _ := tool.Run(context.Background(), `{"prompt":"three cats","n":3}`)
+	res, _ := tool.Run(context.Background(), `{"description":"test image operation","prompt":"three cats","n":3}`)
 	if res.IsError {
 		t.Fatalf("error: %+v", res)
 	}
@@ -194,7 +194,7 @@ func TestGenerateImageErrorClassification(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tool := NewGenerateImageTool(&fakeImageGen{err: tc.err})
-			res, _ := tool.Run(context.Background(), `{"prompt":"x"}`)
+			res, _ := tool.Run(context.Background(), `{"description":"test image operation","prompt":"x"}`)
 			if !res.IsError {
 				t.Fatalf("expected IsError, got %+v", res)
 			}
@@ -207,7 +207,7 @@ func TestGenerateImageErrorClassification(t *testing.T) {
 
 func TestGenerateImageUnknownErrorFallsThrough(t *testing.T) {
 	tool := NewGenerateImageTool(&fakeImageGen{err: errors.New("boom")})
-	res, _ := tool.Run(context.Background(), `{"prompt":"x"}`)
+	res, _ := tool.Run(context.Background(), `{"description":"test image operation","prompt":"x"}`)
 	if !res.IsError {
 		t.Fatalf("expected IsError, got %+v", res)
 	}
@@ -222,7 +222,7 @@ func TestGenerateImageRequiresApproval(t *testing.T) {
 	if !tool.RequiresApproval() {
 		t.Error("RequiresApproval must be true (paid + permanent public URL)")
 	}
-	if tool.IsSafeArgs(`{"prompt":"x"}`) {
+	if tool.IsSafeArgs(`{"description":"test image operation","prompt":"x"}`) {
 		t.Error("IsSafeArgs must be false")
 	}
 	// SafeChecker contract assertion mirrors the publish_to_web pattern.

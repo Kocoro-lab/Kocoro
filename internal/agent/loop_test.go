@@ -2668,6 +2668,76 @@ func (h *trackingHandler) OnToolCall(name string, args string, toolUseID string)
 	h.toolCallNames = append(h.toolCallNames, name)
 }
 
+type validationProbeTool struct {
+	runCalls int
+}
+
+func (t *validationProbeTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        "validation_probe",
+		Description: "test validation ordering",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{"type": "string"},
+			},
+		},
+		Required: []string{"query"},
+	}
+}
+
+func (t *validationProbeTool) Run(context.Context, string) (ToolResult, error) {
+	t.runCalls++
+	return ToolResult{Content: "executed"}, nil
+}
+
+func (t *validationProbeTool) RequiresApproval() bool { return true }
+
+func TestAgentLoop_ValidationPrecedesApprovalAndExecution(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			json.NewEncoder(w).Encode(nativeResponseWithID(
+				"",
+				"tool_use",
+				toolCallWithID("validation_probe", `{}`, "invalid-call"),
+				10,
+				5,
+			))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("recovered", "end_turn", nil, 10, 5))
+	}))
+	defer server.Close()
+
+	tool := &validationProbeTool{}
+	reg := NewToolRegistry()
+	reg.Register(tool)
+	handler := &collectingHandler{}
+	handler.approveResult = true
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetHandler(handler)
+
+	result, _, err := loop.Run(context.Background(), "test invalid call", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "recovered" {
+		t.Fatalf("result = %q, want recovered", result)
+	}
+	if handler.approvalRequested {
+		t.Fatal("invalid call requested approval")
+	}
+	if tool.runCalls != 0 {
+		t.Fatalf("invalid call executed %d time(s)", tool.runCalls)
+	}
+	if len(handler.results) != 1 ||
+		!strings.HasPrefix(handler.results[0].Content, "[validation error]") {
+		t.Fatalf("validation result = %#v", handler.results)
+	}
+}
+
 // TestOnToolCall_NotFiredForDeniedOrUnknown verifies that OnToolCall only fires
 // for tools that actually execute, not for denied, unknown, or short-circuited calls.
 func TestOnToolCall_NotFiredForDeniedOrUnknown(t *testing.T) {

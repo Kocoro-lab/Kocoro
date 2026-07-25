@@ -105,6 +105,32 @@ func TestMCPTool_Run_NoSupervisor_NoReconnect(t *testing.T) {
 	}
 }
 
+func TestMCPTool_Run_AllowsRequiredZeroValues(t *testing.T) {
+	mgr := mcp.NewClientManager()
+	mgr.SeedClient("remote", &successCallToolClient{})
+	tool := mcpgo.Tool{
+		Name: "set_options",
+		InputSchema: mcpgo.ToolInputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"enabled": map[string]any{"type": "boolean"},
+				"offset":  map[string]any{"type": "number"},
+				"query":   map[string]any{"type": "string"},
+				"items":   map[string]any{"type": "array"},
+			},
+			Required: []string{"enabled", "offset", "query", "items"},
+		},
+	}
+
+	result, err := NewMCPTool("remote", tool, mgr).Run(
+		context.Background(),
+		`{"enabled":false,"offset":0,"query":"","items":[]}`,
+	)
+	if err != nil || result.IsError {
+		t.Fatalf("required zero values were rejected: err=%v result=%#v", err, result)
+	}
+}
+
 func TestMCPTool_Run_PreflightsDedicatedChromeWhenAlreadyConnected(t *testing.T) {
 	mgr := mcp.NewClientManager()
 	mgr.SeedConfig("playwright", mcp.MCPServerConfig{

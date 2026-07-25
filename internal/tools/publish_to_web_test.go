@@ -49,6 +49,9 @@ func (f *fakeUploader) Upload(ctx context.Context, openBody func() (io.ReadClose
 // paths, then invokes the tool. Returns the ToolResult for assertions.
 func runTool(t *testing.T, tool *PublishToWebTool, args map[string]any, sessionCWD string) agent.ToolResult {
 	t.Helper()
+	if _, ok := args["description"]; !ok {
+		args["description"] = "Test public file upload"
+	}
 	argsJSON, err := jsonMarshal(args)
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)

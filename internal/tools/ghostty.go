@@ -131,7 +131,13 @@ func (t *GhosttyTool) Info() agent.ToolInfo {
 func (t *GhosttyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args ghosttyArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil
+	}
+	if strings.TrimSpace(args.Action) == "" {
+		return agent.ValidationError("ghostty: missing required `action` parameter"), nil
+	}
+	if strings.TrimSpace(args.Description) == "" {
+		return agent.ValidationError("ghostty: missing required `description` parameter"), nil
 	}
 	if !ghosttyAvailable(ctx) {
 		return agent.ToolResult{
@@ -154,10 +160,10 @@ func (t *GhosttyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	case "list_tabs":
 		return t.runListTabs()
 	default:
-		return agent.ToolResult{
-			Content: fmt.Sprintf("unknown action %q — use new_tab, new_split, send_input, or list_tabs", args.Action),
-			IsError: true,
-		}, nil
+		return agent.ValidationError(fmt.Sprintf(
+			"ghostty: unknown action %q — use new_tab, new_split, send_input, or list_tabs",
+			args.Action,
+		)), nil
 	}
 }
 

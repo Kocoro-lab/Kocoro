@@ -103,6 +103,10 @@ type toolLoopLedger struct {
 	order     []int64
 }
 
+func isFinalVoiceControlTool(tool string) bool {
+	return tool == "stop_speaking" || tool == "end_call"
+}
+
 func newToolLoopLedger() *toolLoopLedger {
 	return &toolLoopLedger{
 		turns: make(map[int64]*loopTurn), responses: make(map[string]*loopResponse),
@@ -208,6 +212,16 @@ func (l *toolLoopLedger) claimAction(responseID, callID, tool string, args []byt
 	turn := l.turns[response.turnID]
 	if turn == nil || turn.closed || l.current != response.turnID {
 		claim.reason = "turn_preempted"
+		return claim
+	}
+	// Voice-control actions finish the spoken turn and must remain available even
+	// after the ordinary action budget is exhausted. end_call is a call-lifecycle
+	// terminal; stop_speaking is a silent turn terminal that keeps the call alive.
+	// Closing here also denies any parallel tool emitted after either control.
+	if isFinalVoiceControlTool(tool) {
+		response.toolCalls++
+		turn.closed = true
+		claim.allowed = true
 		return claim
 	}
 	action := canonicalToolAction(tool, args)
