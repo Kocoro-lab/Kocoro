@@ -625,6 +625,35 @@ func TestWireFixture_HTTPComputerUseAppPolicyUpdate(t *testing.T) {
 		entry.Decision != ComputerUseAppPolicyBlocked || entry.Source != ComputerUseAppPolicySourceUser {
 		t.Fatalf("consumer lost app policy fields: %+v", snapshot)
 	}
+
+	// The revoke fixture is published to Desktop as part of this contract, so it
+	// must be emitted through the real DELETE path too — otherwise its shape can
+	// drift away from the Go type with nothing to catch it.
+	revokeFixture := loadWireFixture(t, "computer_use.app_policy.revoke.request.json")
+	revokePayload, err := json.Marshal(revokeFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokeReq := httptest.NewRequest(
+		http.MethodDelete, "/local/computer-use/app-policy", bytes.NewReader(revokePayload))
+	revokeReq.Header.Set(localPresenceHeader, "wire-fixture-presence")
+	revokeRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(revokeRec, revokeReq)
+	if revokeRec.Code != http.StatusOK {
+		t.Fatalf("DELETE /local/computer-use/app-policy = %d: %s",
+			revokeRec.Code, revokeRec.Body.Bytes())
+	}
+	var revoked ComputerUseAppPolicySnapshot
+	if err := decodeStrictComputerUseAppPolicyJSON(revokeRec.Body.Bytes(), &revoked); err != nil {
+		t.Fatalf("consumer strict decode failed after revoke: %v", err)
+	}
+	if revoked.Revision <= snapshot.Revision {
+		t.Fatalf("revoke did not advance revision: %d -> %d", snapshot.Revision, revoked.Revision)
+	}
+	if entry := findAppPolicyEntry(revoked.Entries, "com.example.editor"); entry != nil &&
+		entry.Source == ComputerUseAppPolicySourceUser {
+		t.Fatalf("revoked user rule survived: %+v", entry)
+	}
 }
 
 func TestWireFixture_HTTPConsequentialRiskConfirmation(t *testing.T) {

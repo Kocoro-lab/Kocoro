@@ -32,7 +32,7 @@ func TestSignedClickAndTypeThroughImmutableFrame(t *testing.T) {
 	client := &AXClient{}
 	t.Cleanup(client.Close)
 	tool := &ComputerUseTool{
-		client:                        client,
+		client: client,
 		coordinateExecutor: func(
 			ctx context.Context,
 			request CoordinateMouseEventRequestV1,

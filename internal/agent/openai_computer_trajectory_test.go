@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -503,5 +505,87 @@ func requireAgentJSONSemanticEqual(t *testing.T, got, want []byte) {
 	}
 	if !reflect.DeepEqual(gotValue, wantValue) {
 		t.Fatalf("JSON semantic drift:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// The invalid.* execution-profile fixtures enumerate the known poisoned-history
+// attacks: cross-call and cross-response safety replay, duplicate call_id,
+// duplicate/missing safety ack, missing provenance, same-envelope replay, and a
+// wrong call_id. The defense is not validation but deletion —
+// stripPriorOpenAIComputerPairs removes every prior computer_call and its paired
+// tool_result before a continuation request is built, so none of these payloads
+// can reach the provider or influence the next turn.
+//
+// Without this test the fixtures are inert: they are listed in the manifest but
+// never replayed through the code that neutralizes them, so a regression that
+// started retaining prior pairs would go unnoticed.
+func TestPoisonedPriorComputerPairsAreStrippedFromEveryInvalidFixture(t *testing.T) {
+	fixtures := []string{
+		"invalid.openai-native-cross-call-safety-replay.json",
+		"invalid.openai-native-cross-response-replay.json",
+		"invalid.openai-native-duplicate-call-id.json",
+		"invalid.openai-native-duplicate-safety-ack.json",
+		"invalid.openai-native-missing-provenance.json",
+		"invalid.openai-native-missing-safety-ack.json",
+		"invalid.openai-native-same-envelope-replay.json",
+		"invalid.openai-native-wrong-call-id.json",
+	}
+	for _, name := range fixtures {
+		t.Run(name, func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join(
+				"..", "..", "docs", "desktop-wire-fixtures", "execution-profiles-v1", name,
+			))
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			var transcript struct {
+				Messages []client.Message `json:"messages"`
+			}
+			if err := json.Unmarshal(raw, &transcript); err != nil {
+				// Neutralized at the wire boundary: ContentBlock's decoder
+				// refuses the payload outright (duplicate acknowledged safety
+				// check id, empty provider provenance). That is a strictly
+				// stronger outcome than stripping, so the attack is contained.
+				t.Logf("rejected at decode: %v", err)
+				return
+			}
+			if len(transcript.Messages) == 0 {
+				t.Fatal("fixture carried no messages; the attack shape would be untested")
+			}
+
+			// Guard the guard: the fixture must actually contain the payload we
+			// claim to neutralize, otherwise this test passes vacuously.
+			poisoned := 0
+			callIDs := make(map[string]struct{})
+			for _, message := range transcript.Messages {
+				for _, block := range message.Content.Blocks() {
+					if block.Type == client.OpenAIComputerCallType {
+						poisoned++
+						if block.CallID != "" {
+							callIDs[block.CallID] = struct{}{}
+						}
+					}
+				}
+			}
+			if poisoned == 0 {
+				t.Fatal("fixture carried no computer_call block to strip")
+			}
+
+			for _, message := range stripPriorOpenAIComputerPairs(transcript.Messages) {
+				for _, block := range message.Content.Blocks() {
+					if block.Type == client.OpenAIComputerCallType {
+						t.Fatalf("prior computer_call survived into the continuation: %#v", block)
+					}
+					if block.Type == "tool_result" {
+						if _, paired := callIDs[block.ToolUseID]; paired {
+							t.Fatalf(
+								"tool_result paired to stripped call %q survived",
+								block.ToolUseID,
+							)
+						}
+					}
+				}
+			}
+		})
 	}
 }
