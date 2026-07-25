@@ -30,10 +30,9 @@ version they target. Sync is one-way — consumer repos never author fixture
 changes locally; propose them here first. Fixture contents must describe only
 what crosses the wire: no consumer-side type names, file paths, or internals.
 
-`execution-profiles-v1/` is the one inverse-direction exception: Cloud mints
-that contract, so `shannon-cloud/contracts/execution-profiles/v1/` is its
-canonical home. This repository vendors the same named bytes and the same
-SHA-256 manifest. Both repositories validate their local copy in CI; neither
+`execution-profiles-v1/` is the one inverse-direction exception: Shannon Cloud
+mints that contract and is its canonical home. This repository vendors the same
+named bytes and the same SHA-256 manifest. Both repositories validate their local copy in CI; neither
 test suite depends on a sibling checkout or an absolute path.
 
 ## Surfaces
