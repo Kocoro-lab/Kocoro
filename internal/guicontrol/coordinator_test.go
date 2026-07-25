@@ -915,6 +915,28 @@ func TestPauseAndTakeOverRetainQuiescenceBarrierUntilActionAcknowledgesCancellat
 	}
 }
 
+// An idempotent take-over retry — the exact case the idempotency key exists
+// for, after the first response was lost — must not be answered 409. By then the
+// executor has finished and the lease is gone, and a lease owning no action is
+// trivially quiesced. A correct client reacts to 409 by NOT handing control back
+// to the user, so reporting a conflict for a take-over that already succeeded
+// leaves the user believing they do not have the pointer when they do.
+func TestAwaitActionQuiescenceTreatsEndedLeaseAsQuiesced(t *testing.T) {
+	coordinator, _ := newCoordinatorFixture(t, nil)
+	lease, err := coordinator.BeginWorkflow(workflowRequest("turn-quiesced-replay"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.EndTurn(lease.TurnID, ComputerUseResultVerified); err != nil {
+		t.Fatalf("EndTurn: %v", err)
+	}
+	if err := coordinator.AwaitActionQuiescence(
+		context.Background(), lease.LeaseID,
+	); err != nil {
+		t.Fatalf("AwaitActionQuiescence on an ended lease = %v, want nil", err)
+	}
+}
+
 func TestAwaitActionQuiescenceReturnsOnlyAfterFinishAction(t *testing.T) {
 	coordinator, _ := newCoordinatorFixture(t, nil)
 	lease, err := coordinator.BeginWorkflow(workflowRequest("turn-await-quiescence"))

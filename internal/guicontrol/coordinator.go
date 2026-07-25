@@ -390,8 +390,15 @@ func (c *Coordinator) AwaitActionQuiescence(ctx context.Context, leaseID string)
 	for {
 		c.mu.Lock()
 		if c.active == nil || c.active.lease.LeaseID != leaseID {
+			// A lease that is no longer active is trivially quiesced: it owns no
+			// action that could still commit input, which is the only property
+			// this barrier asserts. Reporting a stale-lease error here instead
+			// would make an idempotent take-over retry — the exact case the
+			// idempotency key exists for, after the first response was lost —
+			// answer 409 for a take-over that already succeeded, and a correct
+			// client reacts to 409 by NOT handing control back to the user.
 			c.mu.Unlock()
-			return &StaleLeaseError{LeaseID: leaseID}
+			return nil
 		}
 		if c.active.currentAction == nil {
 			c.mu.Unlock()
