@@ -1,0 +1,32 @@
+{
+  "id": 801,
+  "method": "coordinate_mouse_event",
+  "params": {
+    "schema_version": 1,
+    "topology_ref": {
+      "topology_id": "topo_mixed_001",
+      "generation": 7
+    },
+    "helper_boot_id": "helper_boot_demo",
+    "pid": 4242,
+    "bundle_id": "com.example.fixture",
+    "window_id": 7001,
+    "expected_window_quartz_bounds": {
+      "x": 100,
+      "y": 100,
+      "width": 800,
+      "height": 600
+    },
+    "display_id": 1,
+    "quartz_point": {
+      "x": 200.5,
+      "y": 300.5
+    },
+    "action": "click",
+    "button": "left",
+    "click_count": 2,
+    "modifiers": [],
+    "commit_deadline_at": "2026-07-22T12:03:30.500Z",
+    "risk_assertion": null
+  }
+}

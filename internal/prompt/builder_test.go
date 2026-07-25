@@ -569,15 +569,10 @@ func TestLanguageDirective_CoversToolDescAndMicroCompact(t *testing.T) {
 // the per-turn directive is the live re-anchor. Both must remain present.
 // Regression guard for the 2026-05-22 session-share post-mortem.
 //
-// Two of the required phrases (`When the field is present` and the
-// `computer` exemption) are specifically there because the first iteration
-// of this section claimed "Every tool call carries a description" and
-// listed `computer` alongside bash / http — but agent.buildToolSchema
-// drops Parameters for Anthropic native tools (computer included), so
-// the model would never see a `description` slot on computer's call
-// schema. Lock both the conditional wording and the `computer` carve-out
-// so a future cleanup can't quietly reintroduce the schema/prompt
-// contradiction.
+// Keep the conditional wording because provider-native tools do not expose
+// Kocoro's function parameters. The rollback-compatible legacy `computer`
+// tool is now an ordinary function and follows the same description contract
+// as other approval-required function tools.
 func TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present(t *testing.T) {
 	parts := BuildSystemPrompt(PromptOptions{
 		BasePrompt:     "Base.",
@@ -591,15 +586,14 @@ func TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present(t *testing.T) {
 		"follow the Language directive",
 		// Conditional wording — must NOT regress to "Every tool call carries".
 		"When the field is present",
-		// Computer exemption — must NOT regress to listing `computer`
-		// alongside bash / http as if it accepted a description field.
-		"`computer`",
-		"do not invent one for it",
 	}
 	for _, phrase := range required {
 		if !strings.Contains(parts.System, phrase) {
 			t.Errorf("system prompt missing tool-description language-lock phrase %q", phrase)
 		}
+	}
+	if strings.Contains(parts.System, "do not invent one for it") {
+		t.Error("system prompt still exempts legacy computer from its function description contract")
 	}
 }
 

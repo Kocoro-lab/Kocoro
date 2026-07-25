@@ -2,6 +2,7 @@ package agents
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -188,6 +189,17 @@ func TestAppendAlwaysAllowTool_PersistsFormerlyHighRisk(t *testing.T) {
 		if !want[tool] {
 			t.Errorf("unexpected tool persisted: %q", tool)
 		}
+	}
+}
+
+func TestAppendAlwaysAllowToolRejectsGlobalComputerUsePermission(t *testing.T) {
+	dir, name := setupAgent(t, "computeruse")
+	err := AppendAlwaysAllowTool(dir, name, "computer_use")
+	if !errors.Is(err, ErrToolNotPersistable) {
+		t.Fatalf("err=%v, want ErrToolNotPersistable", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, name, "config.yaml")); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected per-agent grant wrote config.yaml: %v", statErr)
 	}
 }
 

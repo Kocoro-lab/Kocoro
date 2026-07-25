@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "status": "user_interference",
+  "drag_committed": true,
+  "mouse_down_committed": true,
+  "pointer_motion_committed": true,
+  "mouse_up_committed": true,
+  "possible_drop_side_effect": true,
+  "phase": "cleanup",
+  "failure_code": "physical_input_interference",
+  "retry_safe": false,
+  "postcondition": null,
+  "pointer_endpoint": {
+    "requested": {"x": 500.5, "y": 300.5},
+    "observed": {"x": 350, "y": 305},
+    "tolerance": 2,
+    "verified": false
+  }
+}

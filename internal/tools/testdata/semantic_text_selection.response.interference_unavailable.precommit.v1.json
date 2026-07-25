@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "selection_committed": false,
+  "phase": "preflight",
+  "failure_code": "interference_detection_unavailable",
+  "retry_safe": false,
+  "postcondition": null,
+  "selected_range": null
+}

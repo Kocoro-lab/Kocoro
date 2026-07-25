@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "failure_code": "window_bounds_mismatch",
+  "retry_safe": true,
+  "topology_ref": null,
+  "helper_boot_id": null,
+  "pid": null,
+  "bundle_id": null,
+  "window_id": null,
+  "window_quartz_bounds": null,
+  "display_id": null,
+  "backing_scale_factor": null,
+  "media_type": null,
+  "width_px": null,
+  "height_px": null,
+  "byte_length": null,
+  "sha256": null,
+  "image_base64": null,
+  "captured_at": null
+}

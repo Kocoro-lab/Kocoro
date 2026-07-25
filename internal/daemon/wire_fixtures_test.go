@@ -16,6 +16,7 @@ package daemon
 // compare.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -567,6 +568,188 @@ func TestWireFixture_SuggestionReady_Bus(t *testing.T) {
 
 // --- HTTP responses (full-router seam) ------------------------------------
 
+func TestWireFixture_HTTPComputerUseTopology(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.computer_use_topology.response.json")
+	original := readDisplayTopologyVia
+	defer func() { readDisplayTopologyVia = original }()
+	readDisplayTopologyVia = func(context.Context) (tools.DisplayTopologyV1, error) {
+		return canonicalHelperDisplayTopology(t), nil
+	}
+
+	rec := httptest.NewRecorder()
+	NewServer(0, nil, nil, "test").Handler().ServeHTTP(
+		rec,
+		httptest.NewRequest(http.MethodGet, "/local/computer-use/topology", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /local/computer-use/topology = %d: %s", rec.Code, rec.Body.Bytes())
+	}
+	assertSemanticEqual(t, fixture, parseJSONMap(t, rec.Body.Bytes()))
+
+	// Decode the bytes emitted by the real HTTP route through the same strict
+	// versioned contract Desktop vendors. This rejects missing/null scalar
+	// fields instead of allowing Go zero values to masquerade as valid wire data.
+	topology, err := tools.DecodeDisplayTopologyV1(rec.Body.Bytes())
+	if err != nil {
+		t.Fatalf("consumer strict decode failed: %v", err)
+	}
+	if topology.TopologyID != "topo_mixed_001" || topology.Displays[1].QuartzBounds.X != -1600 {
+		t.Fatalf("consumer topology lost authority or mixed coordinates: %+v", topology)
+	}
+}
+
+func TestWireFixture_HTTPComputerUseAppPolicyUpdate(t *testing.T) {
+	requestFixture := loadWireFixture(t, "computer_use.app_policy.update.request.json")
+	responseFixture := loadWireFixture(t, "computer_use.app_policy.update.response.json")
+	requestPayload, err := json.Marshal(requestFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := &ServerDeps{ShannonDir: t.TempDir()}
+	server := NewServer(0, nil, deps, "test")
+	t.Setenv(localPresenceEnv, "wire-fixture-presence")
+	req := httptest.NewRequest(http.MethodPut, "/local/computer-use/app-policy", bytes.NewReader(requestPayload))
+	req.Header.Set(localPresenceHeader, "wire-fixture-presence")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT /local/computer-use/app-policy = %d: %s", rec.Code, rec.Body.Bytes())
+	}
+	assertSemanticEqual(t, responseFixture, parseJSONMap(t, rec.Body.Bytes()))
+
+	var snapshot ComputerUseAppPolicySnapshot
+	if err := decodeStrictComputerUseAppPolicyJSON(rec.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("consumer strict decode failed: %v", err)
+	}
+	entry := findAppPolicyEntry(snapshot.Entries, "com.example.editor")
+	if snapshot.SchemaVersion != 1 || snapshot.Revision != 1 || entry == nil ||
+		entry.Decision != ComputerUseAppPolicyBlocked || entry.Source != ComputerUseAppPolicySourceUser {
+		t.Fatalf("consumer lost app policy fields: %+v", snapshot)
+	}
+}
+
+func TestWireFixture_HTTPConsequentialRiskConfirmation(t *testing.T) {
+	detailFixture := loadWireFixture(t, "computer_use.risk_intent.detail.response.json")
+	for _, decision := range []struct {
+		name            string
+		requestFixture  string
+		responseFixture string
+		wantDecision    ConsequentialRiskDecision
+	}{
+		{
+			name:            "allow",
+			requestFixture:  "computer_use.risk_intent.allow.request.json",
+			responseFixture: "computer_use.risk_intent.allow.response.json",
+			wantDecision:    ConsequentialRiskDecisionAllowed,
+		},
+		{
+			name:            "deny",
+			requestFixture:  "computer_use.risk_intent.deny.request.json",
+			responseFixture: "computer_use.risk_intent.deny.response.json",
+			wantDecision:    ConsequentialRiskDecisionDenied,
+		},
+	} {
+		t.Run(decision.name, func(t *testing.T) {
+			broker, _ := newConsequentialRiskBrokerFixture(t, sequentialConsequentialRiskRandom(1))
+			intent, _, err := broker.Register(consequentialRiskBrokerDraft(t, "req_http_send"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := NewServer(0, nil, nil, "test")
+			server.SetConsequentialRiskBroker(broker)
+			t.Setenv(localPresenceEnv, "wire-fixture-presence")
+
+			detailReq := httptest.NewRequest(http.MethodGet,
+				"/local/computer-use/risk-intents/"+intent.IntentID, nil)
+			detailReq.RemoteAddr = "127.0.0.1:54321"
+			detailReq.Header.Set(localPresenceHeader, "wire-fixture-presence")
+			detailRec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(detailRec, detailReq)
+			if detailRec.Code != http.StatusOK || detailRec.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("risk detail status=%d cache=%q body=%s",
+					detailRec.Code, detailRec.Header().Get("Cache-Control"), detailRec.Body.Bytes())
+			}
+			assertSemanticEqual(t, detailFixture, parseJSONMap(t, detailRec.Body.Bytes()))
+			decodedIntent, err := tools.DecodeConsequentialRiskIntentV1(
+				detailRec.Body.Bytes(), consequentialRiskBrokerFixtureNow)
+			if err != nil || decodedIntent.IntentID != intent.IntentID ||
+				decodedIntent.Target.TargetDigest != intent.Target.TargetDigest {
+				t.Fatalf("consumer risk detail decode = %+v, %v", decodedIntent, err)
+			}
+
+			requestFixture := loadWireFixture(t, decision.requestFixture)
+			requestPayload, err := json.Marshal(requestFixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decisionReq := httptest.NewRequest(http.MethodPost,
+				"/local/computer-use/risk-intents/"+intent.IntentID+"/decision",
+				bytes.NewReader(requestPayload))
+			decisionReq.RemoteAddr = "127.0.0.1:54321"
+			decisionReq.Header.Set(localPresenceHeader, "wire-fixture-presence")
+			decisionRec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(decisionRec, decisionReq)
+			if decisionRec.Code != http.StatusOK || decisionRec.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("risk decision status=%d cache=%q body=%s",
+					decisionRec.Code, decisionRec.Header().Get("Cache-Control"), decisionRec.Body.Bytes())
+			}
+			responseFixture := loadWireFixture(t, decision.responseFixture)
+			assertSemanticEqual(t, responseFixture, parseJSONMap(t, decisionRec.Body.Bytes()))
+			var response ConsequentialRiskDecisionResponseV1
+			if err := decodeStrictComputerUseAppPolicyJSON(decisionRec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("consumer risk decision decode failed: %v", err)
+			}
+			if response.SchemaVersion != 1 || response.IntentID != intent.IntentID ||
+				response.Decision != decision.wantDecision {
+				t.Fatalf("consumer lost risk decision fields: %+v", response)
+			}
+		})
+	}
+}
+
+func TestWireFixture_HTTPCoordinateConsequentialRiskDetail(t *testing.T) {
+	fixture := loadWireFixture(t, "computer_use.risk_intent.detail.coordinate.response.json")
+	broker, _ := newConsequentialRiskBrokerFixture(t, sequentialConsequentialRiskRandom(1))
+	intent, _, err := broker.Register(consequentialRiskCoordinateBrokerDraft(
+		t,
+		"req_http_coordinate",
+		consequentialRiskBrokerFixtureNow.Add(30*time.Second),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(0, nil, nil, "test")
+	server.SetConsequentialRiskBroker(broker)
+	t.Setenv(localPresenceEnv, "wire-fixture-presence")
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/local/computer-use/risk-intents/"+intent.IntentID,
+		nil,
+	)
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set(localPresenceHeader, "wire-fixture-presence")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("coordinate risk detail status=%d cache=%q body=%s",
+			rec.Code, rec.Header().Get("Cache-Control"), rec.Body.Bytes())
+	}
+	assertSemanticEqual(t, fixture, parseJSONMap(t, rec.Body.Bytes()))
+	decoded, err := tools.DecodeConsequentialRiskIntentV1(
+		rec.Body.Bytes(), consequentialRiskBrokerFixtureNow)
+	if err != nil {
+		t.Fatalf("consumer strict decode failed: %v", err)
+	}
+	authority := decoded.Target.CoordinateAuthority
+	if decoded.Target.ActionKind != "click" ||
+		decoded.Target.ExecutionPath != "synthetic_coordinate" ||
+		authority == nil || authority.ElementPath != "window[0]/AXButton[0]" ||
+		authority.FrameExpiresAt != decoded.ExpiresAt ||
+		authority.QuartzPoint != (tools.ConsequentialRiskQuartzPointV1{X: 100.5, Y: 200.5}) {
+		t.Fatalf("consumer lost coordinate authority: %+v", decoded.Target)
+	}
+}
+
 func TestWireFixture_HTTPStatus(t *testing.T) {
 	fixture := loadWireFixture(t, "http_get.status.response.json")
 
@@ -632,6 +815,21 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	}
 	if !has(CapScheduleSessionFilterV1) {
 		t.Fatalf("capabilities lost %q: %v", CapScheduleSessionFilterV1, *status.Capabilities)
+	}
+	if !has(CapComputerUseTopologyV1) {
+		t.Fatalf("capabilities lost %q: %v", CapComputerUseTopologyV1, *status.Capabilities)
+	}
+	if !has(CapComputerUseControlV1) {
+		t.Fatalf("capabilities lost %q: %v", CapComputerUseControlV1, *status.Capabilities)
+	}
+	if !has(CapComputerUseAppPolicyV1) {
+		t.Fatalf("capabilities lost %q: %v", CapComputerUseAppPolicyV1, *status.Capabilities)
+	}
+	if !has(CapComputerUsePhysicalInterferenceV1) {
+		t.Fatalf("capabilities lost %q: %v", CapComputerUsePhysicalInterferenceV1, *status.Capabilities)
+	}
+	if !has(CapComputerUseRiskConfirmationV1) {
+		t.Fatalf("capabilities lost %q: %v", CapComputerUseRiskConfirmationV1, *status.Capabilities)
 	}
 	if status.Memory == nil || status.Memory.Provider != "disabled" || status.Memory.Reason != nil {
 		t.Fatalf("memory block decode mismatch: %+v", status.Memory)

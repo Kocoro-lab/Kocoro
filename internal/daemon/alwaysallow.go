@@ -35,17 +35,23 @@ import (
 //     default. Replaced the legacy command-string allowed_commands path so
 //     non-technical users get "click once, never asked again" semantics.
 //
-//  4. Non-bash + named agent: tool-level per-agent persistence.
+//  4. computer_use from any agent: GLOBAL persistence. The grant is a product
+//     permission across apps and agents, not a per-agent tool preference.
 //
-//  5. Non-bash + default agent: tool-level GLOBAL persistence (same global
+//  5. Other non-bash + named agent: tool-level per-agent persistence.
+//
+//  6. Other non-bash + default agent: tool-level GLOBAL persistence (same global
 //     list bash uses). Required because the SSE handler recreates the
 //     broker per request, so broker.SetToolAutoApprove alone evaporates.
 //     Tools in DisallowsAutoApproval are refused at this entry plus at
-//     PersistAgentAlwaysAllow, broker, and the runtime gate in loop.go. The
-//     list is empty as of 2026-05-18.
+//     PersistAgentAlwaysAllow, broker, and the runtime gate in loop.go.
 func HandleAlwaysAllowDecision(deps *ServerDeps, broker *ApprovalBroker, agentName, tool, args string) {
 	if tool == "bash" {
 		handleBashAlwaysAllow(deps, broker, agentName, args)
+		return
+	}
+	if tool == "computer_use" {
+		persistGlobalToolAlwaysAllow(deps, broker, tool)
 		return
 	}
 	// Non-bash. PersistAgentAlwaysAllow does its own DisallowsAutoApproval gate
@@ -104,7 +110,8 @@ func handleBashAlwaysAllow(deps *ServerDeps, broker *ApprovalBroker, agentName, 
 // and sets the broker's in-memory flag for immediate session effect.
 // Used by both bash (default agent) and non-bash + default agent paths so a
 // fresh-per-request SSE broker doesn't make "Always Allow" evaporate.
-// Callers must reject DisallowsAutoApproval tools before invoking this.
+// Callers must reject DisallowsAutoApproval tools before invoking this, except
+// for computer_use's explicit product-level grant path above.
 func persistGlobalToolAlwaysAllow(deps *ServerDeps, broker *ApprovalBroker, tool string) {
 	if err := config.AppendGlobalAlwaysAllowTool(deps.ShannonDir, tool); err != nil {
 		log.Printf("daemon: failed to persist global always-allow for %s: %v", tool, err)

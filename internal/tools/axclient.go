@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -26,15 +27,37 @@ type AXRequest struct {
 
 // AXResponse is a JSON-RPC response from ax_server.
 type AXResponse struct {
-	ID     int64            `json:"id"`
-	Result json.RawMessage  `json:"result,omitempty"`
-	Error  *AXError         `json:"error,omitempty"`
+	ID     int64           `json:"id"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *AXError        `json:"error,omitempty"`
 }
 
 // AXError is an error returned by ax_server.
 type AXError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+type displayTopologyRPCCaller interface {
+	Call(context.Context, string, any) (json.RawMessage, error)
+}
+
+// ReadDisplayTopologyV1 performs the typed, read-only helper RPC and applies
+// the strict topology decoder before returning authority to a caller.
+func ReadDisplayTopologyV1(ctx context.Context, caller displayTopologyRPCCaller) (DisplayTopologyV1, error) {
+	result, err := caller.Call(ctx, "display_topology", map[string]any{})
+	if err != nil {
+		return DisplayTopologyV1{}, fmt.Errorf("read display topology v1: %w", err)
+	}
+	topology, err := DecodeDisplayTopologyV1(result)
+	if err != nil {
+		return DisplayTopologyV1{}, fmt.Errorf("read display topology v1 response: %w", err)
+	}
+	return topology, nil
+}
+
+func (c *AXClient) DisplayTopologyV1(ctx context.Context) (DisplayTopologyV1, error) {
+	return ReadDisplayTopologyV1(ctx, c)
 }
 
 // SharedAXClient returns the process-wide singleton AXClient.
@@ -53,15 +76,38 @@ var (
 	sharedInstance *AXClient
 )
 
+const (
+	launchServicesRegisterPath = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+	// AXServerBundlePathEnv lets a signed desktop host provide a stable,
+	// standalone copy of Kocoro AX.app. macOS TCC cannot resolve the Debug
+	// helper when it is nested inside an app running from DerivedData or /tmp,
+	// even after an explicit LaunchServices registration.
+	AXServerBundlePathEnv = "KOCORO_AX_SERVER_BUNDLE_PATH"
+)
+
+type combinedOutputRunner func(string, ...string) ([]byte, error)
+
+func registerBundledApplication(bundlePath string, run combinedOutputRunner) error {
+	out, err := run(launchServicesRegisterPath, "-f", "-R", "-trusted", bundlePath)
+	if err != nil {
+		return fmt.Errorf("register ax_server bundle with LaunchServices: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func runCombinedOutput(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
+}
+
 // AXClient manages a persistent ax_server process and multiplexes
 // requests by ID. Multiple goroutines can call Call() concurrently.
 //
 // Two transport modes:
-// - Bundled: ax_server is inside a .app bundle, launched via LaunchServices
-//   (`open -a`), communicates over a Unix domain socket. Required for TCC
-//   permission attribution on macOS.
-// - Fallback: ax_server is a bare binary, launched via exec.Command,
-//   communicates over stdin/stdout pipes. Used for dev, npm, and CLI.
+//   - Bundled: ax_server is inside a .app bundle, launched via LaunchServices
+//     (`open -a`), communicates over a Unix domain socket. Required for TCC
+//     permission attribution on macOS.
+//   - Fallback: ax_server is a bare binary, launched via exec.Command,
+//     communicates over stdin/stdout pipes. Used for dev, npm, and CLI.
 type AXClient struct {
 	mu      sync.Mutex // guards process lifecycle (start/restart)
 	writeMu sync.Mutex // guards writes to ax_server
@@ -71,10 +117,10 @@ type AXClient struct {
 	nextID atomic.Int64
 
 	// Process management
-	cmd        *exec.Cmd // non-nil in fallback mode
-	conn       net.Conn  // non-nil in bundled mode
-	bundlePID  int       // ax_server PID in bundled mode (for cleanup)
-	started    bool
+	cmd       *exec.Cmd // non-nil in fallback mode
+	conn      net.Conn  // non-nil in bundled mode
+	bundlePID int       // ax_server PID in bundled mode (for cleanup)
+	started   bool
 
 	pendingMu sync.Mutex
 	pending   map[int64]chan AXResponse
@@ -104,6 +150,13 @@ func (c *AXClient) Ensure(ctx context.Context) error {
 
 // startBundled launches ax_server via LaunchServices and connects over Unix socket.
 func (c *AXClient) startBundled(ctx context.Context, bundlePath string) error {
+	// Nested helper apps are not registered when LaunchServices registers only
+	// the outer Desktop app. TCC cannot resolve a new Debug/release bundle ID to
+	// its code requirement until the exact nested bundle has its own record.
+	if err := registerBundledApplication(bundlePath, runCombinedOutput); err != nil {
+		return err
+	}
+
 	socketPath := AXSocketPath()
 
 	// Try connecting to an existing socket first — ax_server may already be running
@@ -197,13 +250,73 @@ func (c *AXClient) startFallback(binPath string) error {
 }
 
 // axMaxResponseLine bounds a single NDJSON response line from ax_server.
-// capture_window returns a base64-encoded PNG of a whole window inline on one
-// line; a retina-resolution screenshot's base64 runs several MB and overran the
+// Coordinate window/display capture returns a base64-encoded PNG inline on one
+// line; a Retina-resolution screenshot's base64 runs several MB and overran the
 // old 1 MiB cap, which surfaced as a bogus "unexpected EOF" — the scanner
 // stopped with bufio.ErrTooLong and readLoop misreported it as a disconnect.
 // 64 MiB fits any single-window capture with headroom; bufio.Scanner only grows
 // the buffer toward this on demand.
 const axMaxResponseLine = 64 * 1024 * 1024
+
+// AXMutationCommitUnknownError means a side-effecting request crossed the
+// transport write boundary but the helper did not return a valid synchronous
+// acknowledgement. Automatic retry could duplicate a GUI action.
+type AXMutationCommitUnknownError struct {
+	Method string
+	cause  error
+}
+
+func (err *AXMutationCommitUnknownError) Error() string {
+	return fmt.Sprintf("ax_server %s commit unknown (not retry-safe): %v", err.Method, err.cause)
+}
+
+func (err *AXMutationCommitUnknownError) Unwrap() error       { return err.cause }
+func (err *AXMutationCommitUnknownError) RetrySafe() bool     { return false }
+func (err *AXMutationCommitUnknownError) CommitUnknown() bool { return true }
+
+func newAXMutationCommitUnknown(method string, cause error) error {
+	if cause == nil {
+		cause = fmt.Errorf("missing valid helper acknowledgement")
+	}
+	return &AXMutationCommitUnknownError{Method: method, cause: cause}
+}
+
+// isAXMutationMethod is deliberately based on an explicit read allow-list.
+// Unknown helper RPCs fail closed into post-write acknowledgement semantics so
+// a newly added side effect cannot silently regain early context cancellation.
+// Dedicated versioned mutation clients (coordinate mouse/drag, semantic
+// selection, and press) own stricter typed contracts and do not pass through
+// Call.
+func isAXMutationMethod(method string) bool {
+	switch method {
+	case "ping", "display_topology", "capture_coordinate_window", "capture_coordinate_display", "read_tree",
+		"get_value", "find", "resolve_pid", "frontmost", "list_windows",
+		"wait_for", "annotate", "capture_window", "check_permissions":
+		return false
+	default:
+		return true
+	}
+}
+
+// axMutationAckTimeout bounds how long a cancelled caller keeps the global GUI
+// action barrier while the synchronous helper finishes. The bounds cover the
+// helper's actual workloads: launch_app polls for at most 10s, focus for 2s,
+// semantic_press post-observes for 500ms, and the remaining AX/CGEvent actions
+// are single operations. There is intentionally no override path: lowering a
+// bound could release the single-operator lease while the helper is still
+// mutating the Mac.
+func axMutationAckTimeout(method string) time.Duration {
+	switch method {
+	case "launch_app":
+		return 12 * time.Second
+	case "focus":
+		return 4 * time.Second
+	case "semantic_press":
+		return 2 * time.Second
+	default:
+		return 3 * time.Second
+	}
+}
 
 // readLoop reads NDJSON responses and dispatches them to pending callers.
 func (c *AXClient) readLoop(reader io.Reader) {
@@ -251,6 +364,9 @@ func (c *AXClient) Call(ctx context.Context, method string, params any) (json.Ra
 	if runtime.GOOS != "darwin" {
 		return nil, fmt.Errorf("ax_server is macOS-only")
 	}
+	if isAXMutationMethod(method) {
+		return c.callMutationWithAckTimeout(ctx, method, params, axMutationAckTimeout(method))
+	}
 
 	if err := c.Ensure(ctx); err != nil {
 		return nil, err
@@ -296,6 +412,79 @@ func (c *AXClient) Call(ctx context.Context, method string, params any) (json.Ra
 	}
 }
 
+// callMutationWithAckTimeout sends a synchronous side-effecting helper RPC.
+// Cancellation is honored until the final pre-write check. Once any request
+// bytes may have reached the helper, the caller remains blocked until a helper
+// acknowledgement or the method's conservative hard bound. This keeps
+// guicontrol FinishAction from releasing its quiescence barrier while Swift may
+// still be applying the GUI side effect.
+func (c *AXClient) callMutationWithAckTimeout(
+	ctx context.Context,
+	method string,
+	params any,
+	ackTimeout time.Duration,
+) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ackTimeout <= 0 {
+		return nil, fmt.Errorf("ax_server %s mutation acknowledgement timeout must be positive", method)
+	}
+	if err := c.Ensure(ctx); err != nil {
+		return nil, err
+	}
+
+	id := c.nextID.Add(1)
+	data, err := json.Marshal(AXRequest{ID: id, Method: method, Params: params})
+	if err != nil {
+		return nil, fmt.Errorf("encode ax_server %s mutation: %w", method, err)
+	}
+	data = append(data, '\n')
+
+	responses := make(chan AXResponse, 1)
+	c.pendingMu.Lock()
+	c.pending[id] = responses
+	c.pendingMu.Unlock()
+	removePending := func() {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+	}
+
+	c.writeMu.Lock()
+	if err := ctx.Err(); err != nil {
+		c.writeMu.Unlock()
+		removePending()
+		return nil, err
+	}
+	written, writeErr := c.writer.Write(data)
+	if writeErr == nil && written < len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	c.writeMu.Unlock()
+	if writeErr != nil {
+		removePending()
+		return nil, newAXMutationCommitUnknown(
+			method, fmt.Errorf("ax_server mutation write: %w", writeErr))
+	}
+
+	timer := time.NewTimer(ackTimeout)
+	defer timer.Stop()
+	select {
+	case response := <-responses:
+		removePending()
+		if response.Error != nil {
+			return nil, newAXMutationCommitUnknown(method, fmt.Errorf(
+				"ax_server RPC error %d: %s", response.Error.Code, response.Error.Message))
+		}
+		return response.Result, nil
+	case <-timer.C:
+		removePending()
+		return nil, newAXMutationCommitUnknown(
+			method, fmt.Errorf("helper acknowledgement timed out after %s", ackTimeout))
+	}
+}
+
 // Close terminates the ax_server process and cleans up resources.
 func (c *AXClient) Close() {
 	c.mu.Lock()
@@ -321,8 +510,11 @@ func (c *AXClient) Close() {
 	}
 	// Fallback mode: kill the subprocess
 	if c.cmd != nil && c.cmd.Process != nil {
-		c.cmd.Process.Kill()
-		c.cmd.Wait()
+		// Give the helper's DispatchSourceSignal cleanup a normal Swift context
+		// in which to release any journaled key/mouse state. The existing reader
+		// goroutine owns Wait/reaping; an uncatchable loss is recovered by the next
+		// stable helper start before that helper publishes readiness.
+		_ = c.cmd.Process.Signal(syscall.SIGTERM)
 	}
 	c.started = false
 }
@@ -337,6 +529,22 @@ func AXSocketPath() string {
 // If bundlePath is non-empty, use LaunchServices + socket mode.
 // If bundlePath is empty, use exec.Command + stdin/stdout with binPath.
 func AXServerPaths() (binPath, bundlePath string, err error) {
+	if configured := strings.TrimSpace(os.Getenv(AXServerBundlePathEnv)); configured != "" {
+		if !filepath.IsAbs(configured) {
+			return "", "", fmt.Errorf("%s must be an absolute path", AXServerBundlePathEnv)
+		}
+		bundlePath = filepath.Clean(configured)
+		binPath = filepath.Join(bundlePath, "Contents", "MacOS", "ax_server")
+		info, statErr := os.Stat(binPath)
+		if statErr != nil {
+			return "", "", fmt.Errorf("%s executable: %w", AXServerBundlePathEnv, statErr)
+		}
+		if info.IsDir() || info.Mode()&0o111 == 0 {
+			return "", "", fmt.Errorf("%s executable is not executable: %s", AXServerBundlePathEnv, binPath)
+		}
+		return binPath, bundlePath, nil
+	}
+
 	exe, exeErr := os.Executable()
 	if exeErr == nil {
 		dir := filepath.Dir(exe)

@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "status": "completed_unverified",
+  "commit_state": "unknown",
+  "phase": "action",
+  "failure_code": "ax_selection_commit_unknown",
+  "retry_safe": false,
+  "postcondition": null,
+  "selected_range": null
+}

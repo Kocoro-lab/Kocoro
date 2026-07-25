@@ -24,10 +24,10 @@ type Request struct {
 }
 
 type Response struct {
-	JSONRPC string      `json:"jsonrpc"`
+	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id,omitempty"`
-	Result  any         `json:"result,omitempty"`
-	Error   *RPCError   `json:"error,omitempty"`
+	Result  any              `json:"result,omitempty"`
+	Error   *RPCError        `json:"error,omitempty"`
 }
 
 type RPCError struct {
@@ -268,8 +268,8 @@ func (s *Server) logAudit(toolName, argsStr, outputSummary, decision string, dur
 		Timestamp:     time.Now(),
 		SessionID:     "mcp",
 		ToolName:      toolName,
-		InputSummary:  argsStr,
-		OutputSummary: outputSummary,
+		InputSummary:  agent.RedactGUIActivityArguments(toolName, argsStr),
+		OutputSummary: agent.RedactGUIActivityResult(toolName, outputSummary),
 		Decision:      decision,
 		Approved:      decision == "allow",
 		DurationMs:    durationMs,

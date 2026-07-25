@@ -2,9 +2,7 @@ package tools
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"runtime"
 	"strings"
 	"testing"
@@ -64,11 +62,13 @@ func (f *fakeAXCaller) Call(_ context.Context, method string, params any) (json.
 }
 
 func treeFixture(title string) string {
-	return `{"app":"Notes","pid":42,"window":"Note","elements":[` +
-		`{"ref":"e1","role":"AXButton","title":` + mustJSON(title) + `},` +
-		`{"ref":"e2","role":"AXTextField","title":"Body","value":"hello"}` +
-		`],"ref_paths":{"e1":{"path":"window[0]/AXButton[0]","role":"AXButton"},` +
-		`"e2":{"path":"window[0]/AXTextField[0]","role":"AXTextField"}}}`
+	return `{"schema_version":1,"app":"Notes","app_name":"Notes","bundle_id":"com.apple.Notes",` +
+		`"pid":42,"window":"Note","window_title":"Note","window_id":7001,` +
+		`"window_frame":{"x":0,"y":0,"width":800,"height":600},"focused_ref":null,"elements":[` +
+		`{"ref":"e1","fingerprint":"axf_e1","path":"window[0]/AXButton[0]","role":"AXButton","title":` + mustJSON(title) + `,"value_redacted":false,"enabled":true,"focused":false,"selected":false,"actions":["AXPress"],"children":[]},` +
+		`{"ref":"e2","fingerprint":"axf_e2","path":"window[0]/AXTextField[0]","role":"AXTextField","title":"Body","value":"hello","value_redacted":false,"enabled":true,"focused":false,"selected":false,"actions":[],"children":[]}` +
+		`],"ref_paths":{"e1":{"path":"window[0]/AXButton[0]","role":"AXButton","fingerprint":"axf_e1"},` +
+		`"e2":{"path":"window[0]/AXTextField[0]","role":"AXTextField","fingerprint":"axf_e2"}}}`
 }
 
 func mustJSON(value string) string {
@@ -77,11 +77,7 @@ func mustJSON(value string) string {
 }
 
 func newTestComputerUse(fake *fakeAXCaller) *ComputerUseTool {
-	return &ComputerUseTool{
-		client:  fake,
-		screenW: DefaultAPIWidth,
-		screenH: DefaultAPIHeight,
-	}
+	return &ComputerUseTool{client: fake}
 }
 
 func observeNotes(t *testing.T, tool *ComputerUseTool, fake *fakeAXCaller, tree string) string {
@@ -119,9 +115,31 @@ func TestComputerUse_InfoSafetyAndSerialization(t *testing.T) {
 	if !ok {
 		t.Fatal("Parameters.properties missing")
 	}
-	for _, name := range []string{"action", "description", "state_id", "app", "ref", "value", "x", "y", "text", "keys", "include_screenshot"} {
+	for _, name := range []string{"action", "description", "state_id", "app", "ref", "value", "x", "y", "dx", "dy", "text", "keys", "include_screenshot"} {
 		if _, ok := props[name]; !ok {
 			t.Errorf("schema missing %q", name)
+		}
+	}
+	if _, leaked := props["frame_id"]; leaked {
+		t.Error("internal coordinate frame_id leaked into model tool schema")
+	}
+	actionSpec, ok := props["action"].(map[string]any)
+	if !ok {
+		t.Fatal("action schema missing")
+	}
+	actionDescription, _ := actionSpec["description"].(string)
+	if !strings.Contains(actionDescription, ", scroll") {
+		t.Fatalf("model schema must advertise strict semantic scroll, got %q", actionDescription)
+	}
+	for field, required := range map[string][]string{
+		"dx": {"dx > 0", "AXIncrement", "right", "dx < 0", "AXDecrement", "left"},
+		"dy": {"dy > 0", "AXIncrement", "down", "dy < 0", "AXDecrement", "up"},
+	} {
+		description := props[field].(map[string]any)["description"].(string)
+		for _, phrase := range required {
+			if !strings.Contains(description, phrase) {
+				t.Fatalf("%s schema omitted sign semantics %q: %q", field, phrase, description)
+			}
 		}
 	}
 	if !tool.RequiresApproval() {
@@ -148,6 +166,50 @@ func TestComputerUse_InfoSafetyAndSerialization(t *testing.T) {
 	}
 	if tool.IsSafeArgs(`not-json`) || tool.IsReadOnlyCall(`not-json`) {
 		t.Error("argument classification must fail closed")
+	}
+}
+
+func TestComputerUse_InfoDoesNotAdvertiseTemporarilyUnavailableMutations(t *testing.T) {
+	info := (&ComputerUseTool{}).Info()
+	props := info.Parameters["properties"].(map[string]any)
+	actionSpec := props["action"].(map[string]any)
+	actionDescription, _ := actionSpec["description"].(string)
+	for _, action := range []string{"focus_app", "launch_app", "set_value"} {
+		if strings.Contains(actionDescription, action) {
+			t.Fatalf("model schema advertises temporarily unavailable action %q: %q", action, actionDescription)
+		}
+	}
+	valueSpec := props["value"].(map[string]any)
+	valueDescription, _ := valueSpec["description"].(string)
+	if strings.Contains(valueDescription, "set_value") {
+		t.Fatalf("model schema still describes value as set_value input: %q", valueDescription)
+	}
+}
+
+func TestComputerUse_TemporarilyUnavailableMutationsFailBeforeAX(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("computer_use runtime is macOS-only")
+	}
+	for _, test := range []struct {
+		action string
+		args   string
+	}{
+		{action: "focus_app", args: `{"action":"focus_app","app":"Notes","description":"Focus Notes"}`},
+		{action: "launch_app", args: `{"action":"launch_app","app":"Notes","description":"Launch Notes"}`},
+		{action: "set_value", args: `{"action":"set_value","state_id":"s1","ref":"e1","value":"redacted","description":"Set field"}`},
+	} {
+		t.Run(test.action, func(t *testing.T) {
+			fake := newFakeAXCaller()
+			result, err := newTestComputerUse(fake).Run(context.Background(), test.args)
+			if err != nil || !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness ||
+				!strings.Contains(result.Content, test.action) ||
+				!strings.Contains(result.Content, "temporarily unavailable") {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if len(fake.calls) != 0 {
+				t.Fatalf("temporarily unavailable %s reached AX/RPC: %+v", test.action, fake.calls)
+			}
+		})
 	}
 }
 
@@ -262,8 +324,8 @@ func TestComputerUse_StaleRefRejectedBeforeMutation(t *testing.T) {
 		t.Fatalf("result = %+v, want stale-state business error", result)
 	}
 	for _, call := range fake.calls {
-		if call.method == "click" {
-			t.Fatal("click reached ax_server despite stale preflight")
+		if call.method == "click" || call.method == "semantic_press" || call.method == "mouse_event" {
+			t.Fatalf("mutation reached ax_server despite stale preflight: %+v", call)
 		}
 	}
 }
@@ -276,12 +338,9 @@ func TestComputerUse_RefActionsUsePreflightAndNoAutomaticScreenshot(t *testing.T
 		action string
 		ref    string
 		extra  string
-		method string
 	}{
-		{"click", "e1", "", "click"},
-		{"press", "e1", "", "press"},
-		{"set_value", "e2", `,"value":"updated"`, "set_value"},
-		{"scroll", "e2", `,"dy":240`, "scroll"},
+		{"click", "e1", ""},
+		{"press", "e1", ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.action, func(t *testing.T) {
@@ -289,7 +348,17 @@ func TestComputerUse_RefActionsUsePreflightAndNoAutomaticScreenshot(t *testing.T
 			tool := newTestComputerUse(fake)
 			stateID := observeNotes(t, tool, fake, treeFixture("Save"))
 			fake.queue("read_tree", treeFixture("Save"))
-			fake.queue(tc.method, `{"result":"done"}`)
+			var executed bool
+			tool.semanticPressExecutor = func(
+				context.Context, SemanticPressRequestV2,
+			) (SemanticPressResultV2, error) {
+				executed = true
+				code := "postcondition_not_declared"
+				return SemanticPressResultV2{
+					SchemaVersion: 2, Status: "completed_unverified", CommitState: "committed",
+					Phase: "post_verification", FailureCode: &code,
+				}, nil
+			}
 			args := `{"action":"` + tc.action + `","state_id":"` + stateID + `","ref":"` + tc.ref + `","description":"Update Notes"` + tc.extra + `}`
 			result, err := tool.Run(context.Background(), args)
 			if err != nil || result.IsError {
@@ -302,8 +371,8 @@ func TestComputerUse_RefActionsUsePreflightAndNoAutomaticScreenshot(t *testing.T
 				t.Fatalf("%s did not invalidate state after mutation", tc.action)
 			}
 			last := fake.calls[len(fake.calls)-1]
-			if last.method != tc.method || last.params["pid"] != 42 || last.params["path"] == "" {
-				t.Fatalf("last AX call = %+v", last)
+			if !executed || last.method != "read_tree" {
+				t.Fatalf("typed semantic press executed=%t, last generic AX call = %+v", executed, last)
 			}
 		})
 	}
@@ -328,42 +397,6 @@ func TestComputerUse_GetValueKeepsState(t *testing.T) {
 	}
 }
 
-func TestComputerUse_CoordinateAndKeyboardDispatch(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("computer_use runtime is macOS-only")
-	}
-	tests := []struct {
-		name   string
-		args   string
-		method string
-	}{
-		{"coordinate click", `{"action":"click","x":120,"y":240,"button":"right","clicks":2,"description":"Open context menu"}`, "mouse_event"},
-		{"string coordinate click", `{"action":"click","x":"120","y":"240","clicks":"1","description":"Open control"}`, "mouse_event"},
-		{"move", `{"action":"move","x":12,"y":24,"description":"Move pointer"}`, "mouse_event"},
-		{"type", `{"action":"type","text":"hello","description":"Type greeting"}`, "type_text"},
-		{"hotkey", `{"action":"hotkey","keys":"command+shift+p","description":"Open command palette"}`, "key_event"},
-		{"focus", `{"action":"focus_app","app":"Notes","description":"Focus Notes"}`, "focus"},
-		{"launch", `{"action":"launch_app","app":"Notes","description":"Launch Notes"}`, "launch_app"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			fake := newFakeAXCaller()
-			fake.queue(tc.method, `{"result":"done"}`)
-			tool := newTestComputerUse(fake)
-			result, err := tool.Run(context.Background(), tc.args)
-			if err != nil || result.IsError {
-				t.Fatalf("Run result=%+v err=%v", result, err)
-			}
-			if len(result.Images) != 0 {
-				t.Fatal("mutation unexpectedly attached screenshot")
-			}
-			if len(fake.calls) != 1 || fake.calls[0].method != tc.method {
-				t.Fatalf("AX calls = %+v, want one %s", fake.calls, tc.method)
-			}
-		})
-	}
-}
-
 func TestComputerUse_WaitAcceptsBoundedDelayWithoutCondition(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("computer_use runtime is macOS-only")
@@ -382,33 +415,6 @@ func TestComputerUse_WaitAcceptsBoundedDelayWithoutCondition(t *testing.T) {
 	}
 }
 
-func TestComputerUse_ScreenshotIsExplicit(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("computer_use runtime is macOS-only")
-	}
-	fake := newFakeAXCaller()
-	// Valid 1x1 transparent PNG.
-	pngBytes, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake.queue("resolve_pid", `{"pid":42}`)
-	fake.queue("read_tree", treeFixture("Save"))
-	fake.queue("capture_window", `{"ok":true,"image_base64":"`+base64.StdEncoding.EncodeToString(pngBytes)+`","width":1,"height":1}`)
-	tool := newTestComputerUse(fake)
-
-	result, err := tool.Run(context.Background(), `{"action":"get_app_state","app":"Notes","include_screenshot":true,"description":"Inspect Notes visually"}`)
-	if err != nil || result.IsError {
-		t.Fatalf("Run result=%+v err=%v", result, err)
-	}
-	if len(result.Images) != 1 || result.Images[0].Data == "" {
-		t.Fatalf("expected one encoded image, got %+v", result.Images)
-	}
-	if fake.calls[len(fake.calls)-1].method != "capture_window" {
-		t.Fatalf("last AX call = %+v, want capture_window", fake.calls[len(fake.calls)-1])
-	}
-}
-
 func TestComputerUse_FullscreenScreenshotUsesCapturePipeline(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("computer_use runtime is macOS-only")
@@ -423,22 +429,6 @@ func TestComputerUse_FullscreenScreenshotUsesCapturePipeline(t *testing.T) {
 	}
 }
 
-func TestComputerUse_AXErrorsAreCategorized(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("computer_use runtime is macOS-only")
-	}
-	fake := newFakeAXCaller()
-	fake.errors["launch_app"] = []error{errors.New("permission denied")}
-	tool := newTestComputerUse(fake)
-	result, err := tool.Run(context.Background(), `{"action":"launch_app","app":"Notes","description":"Launch Notes"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.IsError || result.ErrorCategory == "" {
-		t.Fatalf("AX failure lacks category: %+v", result)
-	}
-}
-
 func TestComputerUse_RegisteredAndClonedPerRun(t *testing.T) {
 	reg, _, cleanup := RegisterLocalTools(&config.Config{}, nil)
 	defer cleanup()
@@ -447,24 +437,40 @@ func TestComputerUse_RegisteredAndClonedPerRun(t *testing.T) {
 	if !ok {
 		t.Fatal("computer_use is not registered as a local tool")
 	}
-	base := baseRaw.(*ComputerUseTool)
+	base, ok := unwrapGUIExecutionGate(baseRaw).(*ComputerUseTool)
+	if !ok {
+		t.Fatalf("registered computer_use inner type = %T", unwrapGUIExecutionGate(baseRaw))
+	}
 	base.snapshot = &computerUseSnapshot{id: "base-state"}
 	base.refs = map[string]refEntry{"e1": {path: "window[0]", pid: 1}}
+	base.coordinateArtifact = &CoordinateWindowArtifactV1{}
 
 	cloned := CloneWithRuntimeConfig(reg, &config.Config{})
 	cloneRaw, ok := cloned.Get("computer_use")
 	if !ok {
 		t.Fatal("computer_use missing from per-run clone")
 	}
-	clone := cloneRaw.(*ComputerUseTool)
+	clone, ok := unwrapGUIExecutionGate(cloneRaw).(*ComputerUseTool)
+	if !ok {
+		t.Fatalf("cloned computer_use inner type = %T", unwrapGUIExecutionGate(cloneRaw))
+	}
 	if clone == base {
 		t.Fatal("per-run clone shares ComputerUseTool pointer")
 	}
 	if clone.client != base.client {
 		t.Fatal("per-run clone should retain the process-wide AX transport")
 	}
-	if clone.snapshot != nil || clone.refs != nil {
-		t.Fatalf("per-run clone inherited state: snapshot=%+v refs=%+v", clone.snapshot, clone.refs)
+	if clone.coordinateExecutor == nil {
+		t.Fatal("per-run clone lost the typed coordinate executor")
+	}
+	if clone.targetBoundInputExecutor == nil {
+		t.Fatal("per-run clone lost the typed target-bound input executor")
+	}
+	if clone.semanticPressExecutor == nil {
+		t.Fatal("per-run clone lost the typed semantic press executor")
+	}
+	if clone.snapshot != nil || clone.refs != nil || clone.coordinateArtifact != nil {
+		t.Fatalf("per-run clone inherited state: snapshot=%+v refs=%+v artifact=%+v", clone.snapshot, clone.refs, clone.coordinateArtifact)
 	}
 
 	baseAXRaw, _ := reg.Get("accessibility")
@@ -491,10 +497,10 @@ func TestComputerUse_SerializesAcrossInboundRuns(t *testing.T) {
 	secondAX := &blockingAXCaller{
 		started: make(chan struct{}),
 		release: make(chan struct{}),
-		result:  json.RawMessage(`{"result":"clicked"}`),
+		result:  json.RawMessage(treeFixture("Send")),
 	}
-	first := &ComputerUseTool{client: firstAX, screenW: DefaultAPIWidth, screenH: DefaultAPIHeight}
-	second := &ComputerUseTool{client: secondAX, screenW: DefaultAPIWidth, screenH: DefaultAPIHeight}
+	first := &ComputerUseTool{client: firstAX}
+	second := &ComputerUseTool{client: secondAX}
 
 	firstDone := make(chan struct{})
 	go func() {
@@ -506,7 +512,7 @@ func TestComputerUse_SerializesAcrossInboundRuns(t *testing.T) {
 	secondDone := make(chan struct{})
 	go func() {
 		defer close(secondDone)
-		_, _ = second.Run(context.Background(), `{"action":"click","x":10,"y":10,"description":"Click control"}`)
+		_, _ = second.Run(context.Background(), `{"action":"get_app_state","description":"Inspect second app"}`)
 	}()
 
 	select {
@@ -549,7 +555,7 @@ func TestComputerUse_LegacyGUIToolsShareOperationLock(t *testing.T) {
 		}},
 		{"computer", func() (agent.ToolResult, error) {
 			// nil client errors AFTER the lock for the click action.
-			return (&ComputerTool{}).Run(context.Background(), `{"action":"click","x":1,"y":1}`)
+			return (&ComputerTool{}).Run(context.Background(), `{"action":"click","x":1,"y":1,"description":"Click coordinate"}`)
 		}},
 		{"applescript", func() (agent.ToolResult, error) {
 			return (&AppleScriptTool{}).Run(cancelled, `{"script":"return 1","description":"Run script"}`)

@@ -41,7 +41,6 @@ var alwaysDeferTools = map[string]bool{
 	"screenshot":      true,
 	"applescript":     true,
 	"accessibility":   true,
-	"computer_use":    true,
 	"wait_for":        true,
 	"ghostty":         true,
 	"process":         true,
@@ -60,19 +59,15 @@ func shouldDeferByCategory(name string) bool {
 	return strings.HasPrefix(name, "browser_")
 }
 
-// neverDeferTools enumerates gateway tools that must never enter the
-// deferred set, even though gateway tools are deferred-eligible by default
-// (deferredToolNames in deferred.go). web_search/web_fetch are the most
-// common opener of a NEW session (e.g. "what's the news on X") — deferring
-// them forces the model into an extra tool_search round-trip before it can
-// call the tool at all, adding ~6s of observed latency to the very first
-// reply of a session, every session, since the WorkingSet warm cache is
-// session-scoped and starts cold each time. Same trade as memory_recall
-// above: the two extra full schemas ride along in the cacheable system
-// prefix, so the byte cost is paid once per session, not per turn.
+// neverDeferTools enumerates primary contracts that must never enter the
+// deferred set. web_search/web_fetch are common session openers. computer_use
+// is the sole public native-GUI contract on daemon runs; keeping it visible
+// prevents a warmed schema from producing a misleading tool_search no-match
+// and sending the model toward removed legacy GUI fallbacks.
 var neverDeferTools = map[string]bool{
-	"web_search": true,
-	"web_fetch":  true,
+	"computer_use": true,
+	"web_search":   true,
+	"web_fetch":    true,
 }
 
 // estimateSchemaTokens returns a heuristic token count for the named tool

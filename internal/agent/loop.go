@@ -769,6 +769,8 @@ type AgentLoop struct {
 	responseLanguage       string
 	temperature            float64
 	specificModel          string
+	executionProfile       *client.ExecutionProfile
+	openAIComputerExecutor OpenAIComputerBatchExecutor
 	agentBasePrompt        string
 	agentSkills            []*skills.Skill
 	// contextWindowExplicit is true when set via user config (e.g. per-agent
@@ -1274,6 +1276,31 @@ func (a *AgentLoop) SetTemperature(temp float64) {
 
 func (a *AgentLoop) SetSpecificModel(model string) {
 	a.specificModel = model
+}
+
+// SetExecutionProfile pins this loop's computer-use requests to the exact
+// Cloud-owned provider/model/tool contract resolved before the run-local tool
+// registry was selected. GatewayClient verifies the trusted seal and requires
+// Cloud to echo the full profile before returning tool calls.
+func (a *AgentLoop) SetExecutionProfile(profile *client.ExecutionProfile) {
+	a.executionProfile = profile
+}
+
+// SetOpenAIComputerBatchExecutor installs the daemon-owned execution seam.
+// Merely setting this callback does not select OpenAI native computer use:
+// every response still needs the exact trusted OpenAI Responses profile and
+// profile echo before the callback can run.
+func (a *AgentLoop) SetOpenAIComputerBatchExecutor(
+	executor OpenAIComputerBatchExecutor,
+) {
+	a.openAIComputerExecutor = executor
+}
+
+func executionProfileID(profile *client.ExecutionProfile) string {
+	if profile == nil {
+		return ""
+	}
+	return profile.ProfileID()
 }
 
 // SetContextWindow seeds the context window from a hint (typically the
@@ -2135,6 +2162,18 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// the remaining cold deferred tools behind tool_search when the full toolset
 	// exceeds the schema token budget.
 	deferred := deferredToolNames(a.tools)
+	// A resolved execution profile is a request-level contract, not an
+	// optional cold tool. Keep its selected computer schema in every profiled
+	// completion so Cloud can verify profile/model/tool consistency before
+	// dispatch. Other large GUI families remain deferred as usual.
+	if a.executionProfile != nil {
+		switch a.executionProfile.ExecutionMode() {
+		case client.ExecutionModeNativeComputer:
+			delete(deferred, client.NativeComputerToolName)
+		case client.ExecutionModeFunctionComputerUse:
+			delete(deferred, "computer_use")
+		}
+	}
 	loadedDeferred := preseedDeferredSchemas(a.workingSet, deferred)
 	coldDeferred := remainingDeferredNames(deferred, loadedDeferred)
 	// Trigger deferred mode when EITHER the total schema budget is exceeded
@@ -2310,6 +2349,24 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		toolSchemas = effTools.SortedSchemas()
 		baseSchemas = toolSchemas // needed by rebuildSchemas after deferred loading
 		toolNames = liveToolNames(toolSchemas)
+	}
+	if validateTrustedOpenAIComputerProfile(a.executionProfile) == nil {
+		// OpenAI Responses' native computer contract forbids function tools.
+		// Keep computer_use in the run-local registry as a daemon-private
+		// execution core, but expose only the exact {"type":"computer"}
+		// provider schema in every initial and continuation request.
+		filtered := make([]client.Tool, 0, 1)
+		for _, schema := range toolSchemas {
+			if schema.Type == client.OpenAINativeComputerToolType {
+				filtered = append(filtered, client.Tool{
+					Type: client.OpenAINativeComputerToolType,
+				})
+			}
+		}
+		toolSchemas = filtered
+		baseSchemas = append([]client.Tool(nil), filtered...)
+		toolNames = liveToolNames(toolSchemas)
+		deferredSummaries = nil
 	}
 
 	// Partition the live tool name set (toolNames = names actually in tools[])
@@ -2635,6 +2692,8 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		continuationCount         int
 		truncationRecoveryCount   int // per-Run() (one user message); see maxTruncationRecoveries
 		inconsistentFinishRetries int // per-Run(); see maxInconsistentFinishRetries (Task 7)
+		openAIComputerBaseRequest *client.CompletionRequest
+		openAIContinuationRequest *client.CompletionRequest
 		afterCheckpoint           bool
 		checkpointDone            bool
 		nudges                    = newNudgeWindow(maxNudges, nudgeWindowIters)
@@ -3573,18 +3632,50 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// Call LLM — streaming or blocking
 		var resp *client.CompletionResponse
 		var err error
+		// Provider-native schemas can be observation-dependent. Prepare only
+		// the native tools already selected for this iteration, then refresh
+		// their dynamic fields immediately before constructing the request.
+		// Function schemas and defer_loading remain part of the stable selection.
+		if err := prepareProviderNativeTools(ctx, effTools, toolSchemas); err != nil {
+			captureRunMessages()
+			setRunStatus(runstatus.CodeFromError(err), false)
+			return "", usage, err
+		}
+		toolSchemas = refreshProviderNativeToolSchemas(effTools, toolSchemas)
+		requestMessages := a.messagesForLLM(messages)
+		if validateTrustedOpenAIComputerProfile(a.executionProfile) == nil {
+			// A fresh Responses run has no previous_response_id, so persisted
+			// computer_call/output pairs from an older run are invalid provider
+			// input. Strip them only from the outbound copy; messages remains
+			// the complete crash-recovery transcript.
+			requestMessages = stripPriorOpenAIComputerPairs(requestMessages)
+		}
 		req := client.CompletionRequest{
-			Messages:        a.messagesForLLM(messages),
-			ModelTier:       a.modelTier,
-			SpecificModel:   a.specificModel,
-			Temperature:     a.temperature,
-			MaxTokens:       a.effectiveMaxTokens(),
-			Tools:           toolSchemas,
-			Thinking:        a.thinking,
-			ReasoningEffort: a.reasoningEffort,
-			EffortTier:      a.effortTier,
-			SessionID:       a.sessionID,
-			CacheSource:     a.cacheSource,
+			Messages:                 requestMessages,
+			ModelTier:                a.modelTier,
+			SpecificModel:            a.specificModel,
+			Temperature:              a.temperature,
+			MaxTokens:                a.effectiveMaxTokens(),
+			Tools:                    toolSchemas,
+			Thinking:                 a.thinking,
+			ReasoningEffort:          a.reasoningEffort,
+			EffortTier:               a.effortTier,
+			SessionID:                a.sessionID,
+			CacheSource:              a.cacheSource,
+			ExecutionProfileID:       executionProfileID(a.executionProfile),
+			ResolvedExecutionProfile: a.executionProfile,
+		}
+		reuseExactRequestOnRetry := false
+		// A Responses continuation carries previous_response_id plus exactly
+		// the latest assistant computer_call / user computer_call_output pair.
+		// Rebuilding from the full persisted transcript would resend every
+		// older pair and make Cloud's strict mapper see multiple calls. Keep
+		// the full transcript in messages for crash recovery, but dispatch the
+		// provider continuation request constructed at the prior boundary.
+		if openAIContinuationRequest != nil {
+			req = *openAIContinuationRequest
+			openAIContinuationRequest = nil
+			reuseExactRequestOnRetry = true
 		}
 
 		recordMainLLMUsage := func(resp *client.CompletionResponse, updateLastIter bool) client.Usage {
@@ -3860,18 +3951,26 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					reanchorActiveTask(MetaBoundaryPostCompaction)
 
 					// Rebuild request with compacted messages.
+					if prepareErr := prepareProviderNativeTools(ctx, effTools, toolSchemas); prepareErr != nil {
+						captureRunMessages()
+						setRunStatus(runstatus.CodeFromError(prepareErr), false)
+						return "", usage, prepareErr
+					}
+					toolSchemas = refreshProviderNativeToolSchemas(effTools, toolSchemas)
 					req = client.CompletionRequest{
-						Messages:        a.messagesForLLM(messages),
-						ModelTier:       a.modelTier,
-						SpecificModel:   a.specificModel,
-						Temperature:     a.temperature,
-						MaxTokens:       a.effectiveMaxTokens(),
-						Tools:           toolSchemas,
-						Thinking:        a.thinking,
-						ReasoningEffort: a.reasoningEffort,
-						EffortTier:      a.effortTier,
-						SessionID:       a.sessionID,
-						CacheSource:     a.cacheSource,
+						Messages:                 a.messagesForLLM(messages),
+						ModelTier:                a.modelTier,
+						SpecificModel:            a.specificModel,
+						Temperature:              a.temperature,
+						MaxTokens:                a.effectiveMaxTokens(),
+						Tools:                    toolSchemas,
+						Thinking:                 a.thinking,
+						ReasoningEffort:          a.reasoningEffort,
+						EffortTier:               a.effortTier,
+						SessionID:                a.sessionID,
+						CacheSource:              a.cacheSource,
+						ExecutionProfileID:       executionProfileID(a.executionProfile),
+						ResolvedExecutionProfile: a.executionProfile,
 					}
 					// Checkpoint the compacted state before retrying. Gated on
 					// the dirty flag we just set — a no-op compaction path
@@ -3896,7 +3995,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				reason := classifyLLMError(err)
 				retryCount++
 				reanchorActiveTask(MetaBoundaryRetryAfterError)
-				req.Messages = messages
+				if !reuseExactRequestOnRetry {
+					req.Messages = messages
+				}
 				fmt.Fprintf(os.Stderr, "[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxLLMRetries, backoff, err)
 				if a.handler != nil {
 					a.handler.OnCloudAgent("", "retry", fmt.Sprintf("Retrying request (attempt %d/%d): %s", attempt+1, maxLLMRetries, reason))
@@ -3933,6 +4034,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 			// reason claims tool_use, no visible text in OutputText or any
 			// content block, and the per-Run retry budget has room.
 			if !resp.HasToolCalls() &&
+				!responseHasOpenAIComputerCall(resp) &&
 				resp.FinishReason == "tool_use" &&
 				strings.TrimSpace(resp.OutputText) == "" &&
 				strings.TrimSpace(recoverVisibleTextFromBlocks(resp)) == "" &&
@@ -3998,6 +4100,182 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		if compactionApplied && !ctxwin.ShouldCompact(lastPromptTokens, lastOutputTokens, a.contextWindow) {
 			compactionApplied = false
 			compactionSummary = ""
+		}
+
+		// OpenAI Responses computer_call is not an ordinary function tool call:
+		// the full actions[] batch must reach the daemon executor as one
+		// provenance-bound unit, then continue with previous_response_id and
+		// one final screenshot. Handle it before the text-only branch because
+		// CompletionResponse.HasToolCalls intentionally recognizes only the
+		// ordinary tool_use family.
+		if responseHasOpenAIComputerCall(resp) {
+			trajectory, trajectoryErr := newOpenAIComputerTrajectory(
+				a.executionProfile,
+				resp,
+			)
+			if trajectoryErr != nil {
+				captureRunMessages()
+				setRunStatus(runstatus.CodeFromError(trajectoryErr), false)
+				return "", usage, trajectoryErr
+			}
+			// Cloud currently exposes the same provider computer_call through
+			// both ordered content_blocks and legacy function-call aliases.
+			// Only byte-semantically matching aliases are tolerated; an
+			// ordinary or mismatched alias cannot be dispatched separately or
+			// smuggled past the provider-native admission path.
+			if aliasErr := validateOpenAIComputerResponseAliases(
+				resp,
+				trajectory.call,
+			); aliasErr != nil {
+				captureRunMessages()
+				setRunStatus(runstatus.CodeFromError(aliasErr), false)
+				return "", usage, aliasErr
+			}
+			if a.openAIComputerExecutor == nil {
+				err := fmt.Errorf(
+					"OpenAI native computer executor is unavailable in this build",
+				)
+				captureRunMessages()
+				setRunStatus(runstatus.CodeFromError(err), false)
+				return "", usage, err
+			}
+			envelope := trajectory.BatchEnvelope()
+			payload, payloadErr := envelope.AdapterPayload()
+			if payloadErr != nil {
+				captureRunMessages()
+				setRunStatus(runstatus.CodeFromError(payloadErr), false)
+				return "", usage, payloadErr
+			}
+			confirmationArgs, requiresConfirmation, confirmationErr :=
+				trajectory.safetyConfirmationArguments()
+			if confirmationErr != nil {
+				captureRunMessages()
+				setRunStatus(runstatus.CodeFromError(confirmationErr), false)
+				return "", usage, confirmationErr
+			}
+			userConfirmed := false
+			if requiresConfirmation {
+				if a.handler == nil {
+					err := fmt.Errorf(
+						"OpenAI computer pending safety checks require an attended confirmation handler",
+					)
+					captureRunMessages()
+					setRunStatus(runstatus.CodeFromError(err), false)
+					return "", usage, err
+				}
+				restoreApproval := func() {}
+				if a.tracker != nil {
+					restoreApproval = a.tracker.EnterTransient(PhaseAwaitingApproval)
+				}
+				userConfirmed = a.handler.OnApprovalNeeded(
+					"computer_use",
+					confirmationArgs,
+				)
+				restoreApproval()
+				if !userConfirmed {
+					err := fmt.Errorf(
+						"OpenAI computer pending safety checks were not confirmed",
+					)
+					captureRunMessages()
+					setRunStatus(runstatus.CodeFromError(err), false)
+					return "", usage, err
+				}
+			}
+			safetyAcknowledgement, acknowledgementErr :=
+				trajectory.newSafetyAcknowledgement(userConfirmed)
+			if acknowledgementErr != nil {
+				captureRunMessages()
+				setRunStatus(runstatus.CodeFromError(acknowledgementErr), false)
+				return "", usage, acknowledgementErr
+			}
+
+			// The daemon passes its exact guarded computer_use tool back into
+			// this callback for each action. ApprovalAdmissionRequireFresh on
+			// mutations prevents both persisted Always Allow and the per-turn
+			// cache from becoming blanket batch authority.
+			freshApproval := func(
+				approvalCtx context.Context,
+				tool Tool,
+				args string,
+			) bool {
+				if tool == nil || tool.Info().Name != "computer_use" ||
+					strings.TrimSpace(args) == "" {
+					return false
+				}
+				_, approved := a.checkPermissionAndApproval(
+					approvalCtx,
+					tool.Info().Name,
+					args,
+					tool,
+					approvalCache,
+				)
+				return approved
+			}
+			execution, executeErr := a.openAIComputerExecutor.ExecuteOpenAIComputerBatch(
+				ctx,
+				a.executionProfile,
+				envelope.ResponseID,
+				payload,
+				safetyAcknowledgement,
+				freshApproval,
+			)
+			screenshot, validationErr := validateOpenAIComputerExecution(
+				trajectory,
+				execution,
+				executeErr,
+			)
+			if validationErr != nil {
+				captureRunMessages()
+				setRunStatus(runstatus.CodeFromError(validationErr), false)
+				return "", usage, validationErr
+			}
+
+			if openAIComputerBaseRequest == nil {
+				base := cloneOpenAIComputerBaseRequest(req)
+				openAIComputerBaseRequest = &base
+			}
+			next, nextErr := trajectory.buildNextRequest(
+				*openAIComputerBaseRequest,
+				screenshot,
+				execution.Result.IsError,
+				safetyAcknowledgement,
+			)
+			if nextErr != nil {
+				captureRunMessages()
+				setRunStatus(runstatus.CodeFromError(nextErr), false)
+				return "", usage, nextErr
+			}
+			baseMessageCount := len(openAIComputerBaseRequest.Messages)
+			if len(next.Messages) != baseMessageCount+2 {
+				err := fmt.Errorf(
+					"OpenAI computer continuation produced an invalid message pair",
+				)
+				captureRunMessages()
+				setRunStatus(runstatus.CodeFromError(err), false)
+				return "", usage, err
+			}
+			pairStart := len(messages)
+			messages = append(
+				messages,
+				cloneMessages(next.Messages[baseMessageCount:])...,
+			)
+			now := time.Now()
+			msgTimestamps[pairStart] = now
+			msgTimestamps[pairStart+1] = now
+			a.tracker.MarkDirty()
+			captureRunMessages()
+			a.maybeCheckpoint(ctx)
+
+			if !execution.ContinuationAllowed {
+				err := fmt.Errorf(
+					"OpenAI computer batch may have committed without verification; " +
+						"provider continuation is blocked",
+				)
+				setRunStatus(runstatus.CodeFromError(err), false)
+				return "", usage, err
+			}
+			openAIContinuationRequest = &next
+			continue
 		}
 
 		// Handle text-only responses (no tool calls).
@@ -5191,8 +5469,17 @@ func classifyLLMError(err error) string {
 // The approvalCache tracks previously approved tool+args combinations within
 // the current turn so the user is not asked twice for the same call.
 func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, argsStr string, tool Tool, cache *ApprovalCache) (string, bool) {
+	admission := ApprovalAdmissionInherit
+	if checker, ok := tool.(ApprovalAdmissionChecker); ok {
+		admission = checker.ApprovalAdmission(ctx, argsStr)
+		if admission == ApprovalAdmissionDeny {
+			return "deny", false
+		}
+	}
+	requireFreshApproval := admission == ApprovalAdmissionRequireFresh
+
 	// Bypass mode: skip all permission checks including hard-blocks
-	if a.bypassPermissions {
+	if a.bypassPermissions && !requireFreshApproval {
 		return "allow", true
 	}
 
@@ -5203,7 +5490,7 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 			if decision == "deny" {
 				return "deny", false
 			}
-			if decision == "allow" {
+			if decision == "allow" && !requireFreshApproval {
 				return "allow", true
 			}
 			// decision == "ask" — fall through; may be auto-approved by user file paths below
@@ -5215,7 +5502,7 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 	// File attachments: exact path match only — no substring escalation.
 	// Folder attachments: subtree match — files inside the attached folder
 	// are auto-approved (dragging a folder is intuitively "all of this").
-	if len(a.userFilePaths) > 0 {
+	if !requireFreshApproval && len(a.userFilePaths) > 0 {
 		if toolPath := extractToolPath(toolName, argsStr); toolPath != "" {
 			cleaned := resolvePathForAttachmentMatch(toolPath)
 			for _, fp := range a.userFilePaths {
@@ -5236,13 +5523,12 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 	// even if a hand-edited config.yaml manages to slip them in — the
 	// persistence helper (agents.AppendAlwaysAllowTool) rejects them too, but
 	// the runtime gate is the last line of defense.
-	// Unattended runs must not ride a persisted always-allow entry past the
-	// unattended deny-list: the bypass below returns before OnApprovalNeeded,
-	// which is where scheduler/heartbeat/watcher/auto-approve handlers enforce
-	// DisallowsUnattendedAutoApproval. Skipping the bypass (not denying) keeps
-	// behavior consistent: the handler applies the same deny-list and refuses.
-	unattendedDenied := a.unattendedRun && DisallowsUnattendedAutoApproval(toolName)
-	if a.alwaysAllowTools[toolName] && !DisallowsAutoApproval(toolName) && !unattendedDenied {
+	// An explicit persisted computer_use grant is intentionally honored for
+	// unattended runs: this global product switch is what enables schedules and
+	// background tasks to operate the Mac without a person at the approval UI.
+	// With no grant, the unattended deny-list below still fails closed.
+	persistedAlwaysAllow := a.alwaysAllowTools[toolName] && !DisallowsAutoApproval(toolName)
+	if !requireFreshApproval && persistedAlwaysAllow {
 		// Bash-specific defense: tool-level always-allow MUST NOT bypass the
 		// always-ask gate. Agent-author granted "trust this agent for bash
 		// generally", but `pip install`, `rm -rf`, `git push --force`,
@@ -5264,10 +5550,16 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 			return "allow", true
 		}
 	}
+	// Unattended Computer Use is denied by default, but an explicit persisted
+	// grant is the product switch that enables full automation. This differs
+	// from the generic non-interactive fallback, which must never silently
+	// infer Computer Use consent merely because no approval UI is available.
+	unattendedDenied := a.unattendedRun &&
+		DisallowsUnattendedAutoApproval(toolName) && !persistedAlwaysAllow
 
 	// Existing RequiresApproval + SafeChecker logic
-	needsApproval := tool.RequiresApproval()
-	if needsApproval {
+	needsApproval := requireFreshApproval || tool.RequiresApproval()
+	if needsApproval && !requireFreshApproval {
 		if checker, ok := tool.(SafeCheckerWithContext); ok && checker.IsSafeArgsWithContext(ctx, argsStr) {
 			needsApproval = false
 		} else if checker, ok := tool.(SafeChecker); ok && checker.IsSafeArgs(argsStr) {
@@ -5287,8 +5579,12 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 	}
 	if needsApproval {
 		// Check approval cache: if this exact tool+args was already approved
-		// in this turn, skip asking the user again.
-		if cache != nil && cache.WasApproved(toolName, argsStr) {
+		// in this turn, skip asking the user again. GUI control tools that
+		// refuse persistent auto-approval also refuse this shorter-lived cache:
+		// repeating an identical click or submit can still duplicate a purchase,
+		// send, delete, or other consequential side effect.
+		freshApproval := requireFreshApproval || DisallowsAutoApproval(toolName)
+		if !freshApproval && cache != nil && cache.WasApproved(toolName, argsStr) {
 			return "ask", true
 		}
 		approved := false
@@ -5303,7 +5599,7 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 			approved = a.handler.OnApprovalNeeded(toolName, argsStr)
 			restoreApproval()
 		}
-		if approved && cache != nil {
+		if approved && !freshApproval && cache != nil {
 			cache.RecordApproval(toolName, argsStr)
 		}
 		return "ask", approved
@@ -5571,8 +5867,8 @@ func (a *AgentLoop) logAudit(toolName, argsStr, outputSummary, decision string, 
 		Timestamp:     time.Now(),
 		SessionID:     a.sessionID,
 		ToolName:      toolName,
-		InputSummary:  argsStr,
-		OutputSummary: outputSummary,
+		InputSummary:  RedactGUIActivityArguments(toolName, argsStr),
+		OutputSummary: RedactGUIActivityResult(toolName, outputSummary),
 		Decision:      decision,
 		Approved:      approved,
 		DurationMs:    durationMs,

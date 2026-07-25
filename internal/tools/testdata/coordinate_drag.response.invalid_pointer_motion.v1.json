@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "status": "completed_unverified",
+  "drag_committed": true,
+  "mouse_down_committed": true,
+  "pointer_motion_committed": false,
+  "mouse_up_committed": true,
+  "possible_drop_side_effect": true,
+  "phase": "post_verification",
+  "failure_code": "drop_postcondition_not_declared",
+  "retry_safe": false,
+  "postcondition": null,
+  "pointer_endpoint": {
+    "requested": {"x": 500.5, "y": 300.5},
+    "observed": {"x": 500.5, "y": 300.5},
+    "tolerance": 2,
+    "verified": true
+  }
+}

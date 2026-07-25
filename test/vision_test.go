@@ -37,7 +37,7 @@ func TestVisionLoop_ComputerScreenshotAction(t *testing.T) {
 	reg, _, cleanup := tools.RegisterLocalTools(nil, nil)
 	defer cleanup()
 	ct, _ := reg.Get("computer")
-	result, err := ct.Run(context.Background(), `{"action":"screenshot"}`)
+	result, err := ct.Run(context.Background(), `{"action":"screenshot","description":"Capture main display"}`)
 	if err != nil {
 		t.Fatalf("computer screenshot error: %v", err)
 	}
@@ -51,14 +51,18 @@ func TestVisionLoop_ComputerScreenshotAction(t *testing.T) {
 	t.Logf("Image: %d KB", len(result.Images[0].Data)*3/4/1024)
 }
 
-func TestVisionLoop_ComputerNativeLeftClick(t *testing.T) {
-	// Test that Anthropic native left_click with coordinate array parses correctly
-	// Will fail with ax_server error since we're not in a real GUI context,
-	// but that's fine — it means the action was correctly mapped to "click"
+func TestVisionLoop_ComputerHistoricalProviderLeftClick(t *testing.T) {
+	// Historical saved provider-shaped left_click calls remain parse-compatible
+	// even though the rollback ComputerTool now advertises an ordinary function
+	// schema. It will fail with an ax_server error outside a real GUI context,
+	// which still proves the action normalized to the legacy click path.
 	reg, _, cleanup := tools.RegisterLocalTools(nil, nil)
 	defer cleanup()
 	ct, _ := reg.Get("computer")
-	result, err := ct.Run(context.Background(), `{"action":"left_click","coordinate":[640,400]}`)
+	result, err := ct.Run(context.Background(), `{
+		"action":"left_click","coordinate":[640,400],
+		"description":"Replay historical click"
+	}`)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}

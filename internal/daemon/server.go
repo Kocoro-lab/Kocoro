@@ -33,6 +33,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
+	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
 	"github.com/Kocoro-lab/ShanClaw/internal/migrate/claudecode"
@@ -63,6 +64,16 @@ type Server struct {
 	cancel         context.CancelFunc
 	approvalBroker *ApprovalBroker
 	eventBus       *EventBus
+	// computerUseCoordinator is the process-wide authority shared by every
+	// model-facing GUI mutation and the local Desktop control plane. Tests may
+	// replace it before serving requests.
+	computerUseCoordinator    *guicontrol.Coordinator
+	computerUseExpiryInterval time.Duration
+	// consequentialRiskBroker is deliberately process-memory-only. The HTTP
+	// authorizer is set before serving and defaults to the same local-presence
+	// identity used by the Desktop computer-use control plane.
+	consequentialRiskBroker         *ConsequentialRiskBroker
+	consequentialRiskHTTPAuthorizer func(*http.Request) bool
 	// notifyApprovalResolved is set once at startup (SetApprovalResolvedNotifier,
 	// before the WS connects or any approval can fire) and read without a lock
 	// from both the /approval handler and every cleanup-notify goroutine. Safe
@@ -294,22 +305,26 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	// deps.Suggestions; flipping these would either panic on nil deps or
 	// race the eventBus subscriber test fixtures.
 	s := &Server{
-		port:                   port,
-		client:                 client,
-		deps:                   deps,
-		version:                version,
-		approvalBroker:         NewApprovalBroker(func(req ApprovalRequest) error { return nil }),
-		eventBus:               NewEventBus(),
-		notifyApprovalResolved: func(p ApprovalResolvedPayload) error { return nil },
-		remoteRunSlots:         make(chan struct{}, MaxConcurrentAgents),
-		marketplace:            newMarketplaceClient(deps),
-		clawhub:                newClawHubClient(deps),
-		slugLocks:              skills.NewSlugLocks(),
-		secretsStore:           store,
-		suggestions:            agent.NewSuggestionState(),
-		migratePlans:           claudecode.NewPlanStore(),
-		agentSyncTrigger:       make(chan struct{}, 1),
-		pullDone:               make(chan struct{}),
+		port:                            port,
+		client:                          client,
+		deps:                            deps,
+		version:                         version,
+		approvalBroker:                  NewApprovalBroker(func(req ApprovalRequest) error { return nil }),
+		eventBus:                        NewEventBus(),
+		computerUseCoordinator:          guicontrol.ProcessCoordinator(),
+		computerUseExpiryInterval:       defaultComputerUseExpiryInterval,
+		consequentialRiskBroker:         newDefaultConsequentialRiskBroker(),
+		consequentialRiskHTTPAuthorizer: localPresenceAuthorized,
+		notifyApprovalResolved:          func(p ApprovalResolvedPayload) error { return nil },
+		remoteRunSlots:                  make(chan struct{}, MaxConcurrentAgents),
+		marketplace:                     newMarketplaceClient(deps),
+		clawhub:                         newClawHubClient(deps),
+		slugLocks:                       skills.NewSlugLocks(),
+		secretsStore:                    store,
+		suggestions:                     agent.NewSuggestionState(),
+		migratePlans:                    claudecode.NewPlanStore(),
+		agentSyncTrigger:                make(chan struct{}, 1),
+		pullDone:                        make(chan struct{}),
 	}
 	// Wire approval bus hooks so SSE per-request brokers (which inherit from
 	// s.approvalBroker in handleMessageSSE) publish EventApprovalRequest /
@@ -326,6 +341,8 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	})
 	if deps != nil {
 		deps.Suggestions = s.suggestions
+		deps.ComputerUseCoordinator = s.computerUseCoordinator
+		deps.ConsequentialRiskBroker = s.consequentialRiskBroker
 		if deps.ApprovalTracker == nil {
 			deps.ApprovalTracker = NewApprovalTracker()
 		}
@@ -433,6 +450,41 @@ func (s *Server) SetOnReload(fn func()) {
 // Nil is permitted (platforms without a credential store) — handlers respond 503.
 func (s *Server) SetAuth(a *AuthManager) {
 	s.auth = a
+}
+
+// SetComputerUseCoordinator injects the GUI control authority before the
+// server begins serving. Production NewServer binds ProcessCoordinator so the
+// HTTP plane and tool execution observe and mutate the same lease.
+func (s *Server) SetComputerUseCoordinator(coordinator *guicontrol.Coordinator) {
+	s.computerUseCoordinator = coordinator
+	if s.deps != nil {
+		s.deps.ComputerUseCoordinator = coordinator
+	}
+	if coordinator == nil || s.eventBus == nil {
+		return
+	}
+	coordinator.SetSink(func(event guicontrol.ComputerUseActivityEvent) {
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return
+		}
+		s.eventBus.Emit(Event{Type: EventComputerUseActivity, Payload: payload})
+	})
+}
+
+// SetConsequentialRiskBroker injects the process-local point-of-risk broker
+// before serving. Nil keeps the HTTP seam visible but fail-closed with 503.
+func (s *Server) SetConsequentialRiskBroker(broker *ConsequentialRiskBroker) {
+	s.consequentialRiskBroker = broker
+	if s.deps != nil {
+		s.deps.ConsequentialRiskBroker = broker
+	}
+}
+
+// SetConsequentialRiskHTTPAuthorizer injects the recognized local Desktop
+// identity check. Loopback origin remains a separate, non-overridable gate.
+func (s *Server) SetConsequentialRiskHTTPAuthorizer(authorizer func(*http.Request) bool) {
+	s.consequentialRiskHTTPAuthorizer = authorizer
 }
 
 func (s *Server) liveAPIKey(cfg *config.Config) string {
@@ -554,6 +606,18 @@ func (s *Server) RebuildAuthSensitiveTools(ctx context.Context) {
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /status", s.handleStatus)
+	mux.HandleFunc("GET /local/computer-use/topology", s.handleComputerUseTopology)
+	mux.HandleFunc("GET /local/computer-use/activity", s.handleComputerUseActivity)
+	mux.HandleFunc("POST /local/computer-use/control", s.handleComputerUseControl)
+	mux.HandleFunc("POST /local/computer-use/heartbeat", s.handleComputerUseHeartbeat)
+	mux.HandleFunc("GET /local/computer-use/risk-intents/{intent_id}", s.handleConsequentialRiskDetail)
+	mux.HandleFunc("POST /local/computer-use/risk-intents/{intent_id}/decision", s.handleConsequentialRiskDecision)
+	mux.HandleFunc("/local/computer-use/app-policy", s.handleComputerUseAppPolicy)
+	mux.HandleFunc("/local/computer-use/activity", s.handleComputerUseMethodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/local/computer-use/control", s.handleComputerUseMethodNotAllowed(http.MethodPost))
+	mux.HandleFunc("/local/computer-use/heartbeat", s.handleComputerUseMethodNotAllowed(http.MethodPost))
+	mux.HandleFunc("/local/computer-use/risk-intents/{intent_id}", s.handleConsequentialRiskMethodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/local/computer-use/risk-intents/{intent_id}/decision", s.handleConsequentialRiskMethodNotAllowed(http.MethodPost))
 	mux.HandleFunc("GET /agents", s.handleAgents)
 	mux.HandleFunc("GET /agents/{name}", s.handleGetAgent)
 	mux.HandleFunc("POST /agents", s.handleCreateAgent)
@@ -772,6 +836,17 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) Start(ctx context.Context) error {
 	s.ctx = ctx
+	// Bind the process coordinator's activity sink only for the live server.
+	// Offline Handler() fixtures can inject an isolated coordinator without
+	// stealing the singleton sink from a concurrently running daemon.
+	s.SetComputerUseCoordinator(s.computerUseCoordinator)
+	cleanupComputerUseIntegrationFixture, err := startComputerUseIntegrationFixture(
+		s.computerUseCoordinator,
+	)
+	if err != nil {
+		return fmt.Errorf("daemon server computer-use integration fixture: %w", err)
+	}
+	defer cleanupComputerUseIntegrationFixture()
 	s.recoverMigrationOrphans()
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
@@ -785,6 +860,9 @@ func (s *Server) Start(ctx context.Context) error {
 	s.listener = ln
 	s.listenerMu.Unlock()
 	s.server = &http.Server{Handler: withLocalCORS(mux)}
+	expiryCtx, stopComputerUseExpiry := context.WithCancel(ctx)
+	defer stopComputerUseExpiry()
+	go s.runComputerUseExpiryLoop(expiryCtx)
 
 	// Spawn the gated session-sync ticker. It self-disables when sync is
 	// not enabled, so it's always safe to start unconditionally here.
@@ -2993,7 +3071,7 @@ func (h *sseEventHandler) OnToolCall(name string, args string, toolUseID string)
 		"tool":        name,
 		"tool_use_id": toolUseID,
 		"status":      "running",
-		"args":        redactAndTruncate(args, 200),
+		"args":        redactAndTruncate(agent.RedactGUIActivityArguments(name, args), 200),
 	})
 	fmt.Fprintf(h.w, "event: tool\ndata: %s\n\n", data)
 	h.flusher.Flush()
@@ -3011,7 +3089,7 @@ func (h *sseEventHandler) OnToolResult(name string, args string, toolUseID strin
 		"status":      "completed",
 		"elapsed":     elapsed.Seconds(),
 		"is_error":    result.IsError,
-		"preview":     redactAndTruncate(toolResultPreview(result), 200),
+		"preview":     redactAndTruncate(agent.RedactGUIActivityResult(name, toolResultPreview(result)), 200),
 	})
 	fmt.Fprintf(h.w, "event: tool\ndata: %s\n\n", data)
 	h.flusher.Flush()
@@ -3735,6 +3813,10 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if err := agents.ValidateAgentPermissionsConfig(cfg.Permissions); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		parsedConfig = &cfg
 	}
 	if req.DisplayName != nil {
@@ -4051,6 +4133,10 @@ func (s *Server) handlePutAgentConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := agents.ValidateAgentPermissionsConfig(cfg.Permissions); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	// Materialize builtin AFTER validation passes — avoids orphaned override dirs on bad input.
 	if !s.materializeIfBuiltin(w, name) {
 		return
@@ -4091,10 +4177,8 @@ type alwaysAllowToolRequest struct {
 }
 
 // handleAddAgentAlwaysAllow appends a tool to permissions.always_allow_tools
-// for an agent. Tools in agent.DisallowsAutoApproval return 400 — the list
-// is currently empty as of 2026-05-18 (publish_to_web / generate_image /
-// edit_image used to be on it and were moved off), so no production tool
-// is refused today, but the gate stays in place for future use.
+// for an agent. computer_use is a single global product permission and cannot
+// be persisted through this per-agent endpoint.
 func (s *Server) handleAddAgentAlwaysAllow(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := agents.ValidateAgentName(name); err != nil {
@@ -4169,6 +4253,9 @@ func (s *Server) handleAddGlobalAlwaysAllow(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "tool is required")
 		return
 	}
+	if req.Tool == "computer_use" && !requireComputerUseLocalPresence(w, r) {
+		return
+	}
 	if agent.DisallowsAutoApproval(req.Tool) {
 		writeError(w, http.StatusBadRequest,
 			"tool requires fresh approval each call and cannot be persisted as always-allow")
@@ -4206,6 +4293,9 @@ func (s *Server) handleRemoveGlobalAlwaysAllow(w http.ResponseWriter, r *http.Re
 	}
 	if req.Tool == "" {
 		writeError(w, http.StatusBadRequest, "tool is required")
+		return
+	}
+	if req.Tool == "computer_use" && !requireComputerUseLocalPresence(w, r) {
 		return
 	}
 	if err := config.RemoveGlobalAlwaysAllowTool(s.deps.ShannonDir, req.Tool); err != nil {

@@ -1,12 +1,103 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"image"
+	"image/color"
+	"image/png"
 	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
+
+func TestDrawAnnotationsUsesExactWindowLogicalBounds(t *testing.T) {
+	input := image.NewRGBA(image.Rect(0, 0, 800, 600))
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, input); err != nil {
+		t.Fatal(err)
+	}
+	block, err := drawAnnotationsBytes(encoded.Bytes(), []annotationEntry{{
+		Label: 1, X: -900, Y: 250, Width: 20, Height: 20,
+	}}, annotationViewport{X: -1000, Y: 200, Width: 400, Height: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(block.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	annotated, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Center: ((-890)-(-1000))/400*800 = 220, (260-200)/300*600 = 120.
+	// Sample inside the red fill but outside the centered digit glyph.
+	if got := color.NRGBAModel.Convert(annotated.At(228, 120)).(color.NRGBA); got.A != 230 {
+		t.Fatalf("marker alpha = %#v, want an annotation pixel", got)
+	}
+	if got := color.NRGBAModel.Convert(annotated.At(20, 20)).(color.NRGBA); got.A != 0 {
+		t.Fatal("annotation was mapped as a main-screen coordinate instead of exact-window coordinate")
+	}
+}
+
+func TestDecodeExactAccessibilityWindowRejectsDimensionMismatch(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 80, 60))); err != nil {
+		t.Fatal(err)
+	}
+	payload := exactAccessibilityWindowResult{
+		OK: true, ImageBase64: base64.StdEncoding.EncodeToString(encoded.Bytes()),
+		Width: 40, Height: 30,
+	}
+	signature := strings.Repeat("a", 64)
+	payload.ContentSig = signature
+	if _, err := decodeExactAccessibilityWindow(payload, signature); err == nil {
+		t.Fatal("expected fail-closed result/image dimension mismatch")
+	}
+}
+
+func TestDecodeExactAccessibilityWindowRejectsChangedAXContentSignature(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 80, 60))); err != nil {
+		t.Fatal(err)
+	}
+	payload := exactAccessibilityWindowResult{
+		OK: true, ImageBase64: base64.StdEncoding.EncodeToString(encoded.Bytes()),
+		Width: 80, Height: 60, ContentSig: strings.Repeat("b", 64),
+	}
+	if _, err := decodeExactAccessibilityWindow(payload, strings.Repeat("a", 64)); err == nil ||
+		!strings.Contains(err.Error(), "content signature changed") {
+		t.Fatalf("signature mismatch error = %v", err)
+	}
+}
+
+func TestDrawAnnotationsDownscalesRetinaWindowToProviderBandPreservingAspect(t *testing.T) {
+	input := image.NewRGBA(image.Rect(0, 0, 3200, 1800))
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, input); err != nil {
+		t.Fatal(err)
+	}
+	block, err := drawAnnotationsBytes(
+		encoded.Bytes(), nil,
+		annotationViewport{X: 100, Y: 200, Width: 1600, Height: 900})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(block.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Width != 1280 || config.Height != 720 {
+		t.Fatalf("annotated Retina image = %dx%d, want 1280x720", config.Width, config.Height)
+	}
+}
 
 func TestAccessibility_Info(t *testing.T) {
 	tool := &AccessibilityTool{client: &AXClient{}}

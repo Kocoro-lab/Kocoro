@@ -51,7 +51,16 @@ func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 
 	resp, err := gw.Complete(ctx, CompletionRequest{
 		Messages: []Message{{Role: "user", Content: NewTextContent("ping")}},
-		Tools:    []Tool{{Type: "function"}},
+		Tools: []Tool{{
+			Type: "function",
+			Function: FunctionDef{
+				Name: "test_tool",
+				Parameters: map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+				},
+			},
+		}},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -64,6 +73,180 @@ func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	}
 	if len(got.Tools) != 1 || got.Tools[0].Type != "function" {
 		t.Errorf("expected tool payload to include tools")
+	}
+}
+
+func TestToolMarshalJSONStrictTaggedUnion(t *testing.T) {
+	t.Run("function preserves existing wire shape", func(t *testing.T) {
+		tool := Tool{
+			Type: "function",
+			Function: FunctionDef{
+				Name:        "bash",
+				Description: "Run a command",
+				Parameters: map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+				},
+			},
+		}
+		raw, err := json.Marshal(tool)
+		if err != nil {
+			t.Fatalf("marshal function tool: %v", err)
+		}
+		want := `{"type":"function","function":{"name":"bash","description":"Run a command","parameters":{"properties":{},"type":"object"}}}`
+		if string(raw) != want {
+			t.Fatalf("function tool JSON = %s, want %s", raw, want)
+		}
+	})
+
+	t.Run("function preserves defer loading", func(t *testing.T) {
+		tool := Tool{
+			Type:         "function",
+			Function:     FunctionDef{Name: "browser_navigate"},
+			DeferLoading: true,
+		}
+		raw, err := json.Marshal(tool)
+		if err != nil {
+			t.Fatalf("marshal deferred function tool: %v", err)
+		}
+		want := `{"type":"function","function":{"name":"browser_navigate"},"defer_loading":true}`
+		if string(raw) != want {
+			t.Fatalf("deferred function tool JSON = %s, want %s", raw, want)
+		}
+	})
+
+	t.Run("native omits function", func(t *testing.T) {
+		tool := Tool{
+			Type:            "computer_20251124",
+			Name:            "computer",
+			DisplayWidthPx:  1280,
+			DisplayHeightPx: 800,
+		}
+		raw, err := json.Marshal(tool)
+		if err != nil {
+			t.Fatalf("marshal native tool: %v", err)
+		}
+		want := `{"type":"computer_20251124","name":"computer","display_width_px":1280,"display_height_px":800}`
+		if string(raw) != want {
+			t.Fatalf("native tool JSON = %s, want %s", raw, want)
+		}
+		if bytes.Contains(raw, []byte(`"function"`)) {
+			t.Fatalf("native tool leaked function member: %s", raw)
+		}
+	})
+
+	t.Run("OpenAI computer is type only", func(t *testing.T) {
+		raw, err := json.Marshal(Tool{Type: OpenAINativeComputerToolType})
+		if err != nil {
+			t.Fatalf("marshal OpenAI computer tool: %v", err)
+		}
+		const want = `{"type":"computer"}`
+		if string(raw) != want {
+			t.Fatalf("OpenAI computer tool JSON = %s, want %s", raw, want)
+		}
+	})
+
+	invalid := []struct {
+		name string
+		tool Tool
+	}{
+		{name: "unknown type", tool: Tool{Type: "computer_20241022", Name: "computer", DisplayWidthPx: 1280, DisplayHeightPx: 800}},
+		{name: "native wrong name", tool: Tool{Type: "computer_20251124", Name: "desktop", DisplayWidthPx: 1280, DisplayHeightPx: 800}},
+		{name: "native zero width", tool: Tool{Type: "computer_20251124", Name: "computer", DisplayHeightPx: 800}},
+		{name: "native zero height", tool: Tool{Type: "computer_20251124", Name: "computer", DisplayWidthPx: 1280}},
+		{name: "native carries function", tool: Tool{Type: "computer_20251124", Name: "computer", DisplayWidthPx: 1280, DisplayHeightPx: 800, Function: FunctionDef{Name: "computer"}}},
+		{name: "native is deferred", tool: Tool{Type: "computer_20251124", Name: "computer", DisplayWidthPx: 1280, DisplayHeightPx: 800, DeferLoading: true}},
+		{name: "OpenAI computer carries name", tool: Tool{Type: OpenAINativeComputerToolType, Name: "computer"}},
+		{name: "OpenAI computer carries dimensions", tool: Tool{Type: OpenAINativeComputerToolType, DisplayWidthPx: 1280, DisplayHeightPx: 800}},
+		{name: "OpenAI computer carries function", tool: Tool{Type: OpenAINativeComputerToolType, Function: FunctionDef{Name: "computer"}}},
+		{name: "OpenAI computer is deferred", tool: Tool{Type: OpenAINativeComputerToolType, DeferLoading: true}},
+		{name: "function missing name", tool: Tool{Type: "function"}},
+		{name: "function carries native fields", tool: Tool{Type: "function", Function: FunctionDef{Name: "bash"}, Name: "computer"}},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := json.Marshal(tc.tool); err == nil {
+				t.Fatalf("json.Marshal(%+v) unexpectedly succeeded", tc.tool)
+			}
+		})
+	}
+}
+
+func TestCompletionRequestMarshalFunctionToolExact(t *testing.T) {
+	req := CompletionRequest{
+		Messages: []Message{{Role: "user", Content: NewTextContent("ping")}},
+		Tools: []Tool{{
+			Type: "function",
+			Function: FunctionDef{
+				Name:        "bash",
+				Description: "Run a command",
+				Parameters: map[string]any{
+					"type":       "object",
+					"properties": map[string]any{},
+				},
+			},
+		}},
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal completion request: %v", err)
+	}
+	want := `{"messages":[{"role":"user","content":"ping"}],"tools":[{"type":"function","function":{"name":"bash","description":"Run a command","parameters":{"properties":{},"type":"object"}}}]}`
+	if string(raw) != want {
+		t.Fatalf("CompletionRequest JSON = %s, want %s", raw, want)
+	}
+}
+
+func TestCompletionRequestMarshalNativeToolExact(t *testing.T) {
+	req := CompletionRequest{
+		Messages: []Message{{Role: "user", Content: NewTextContent("ping")}},
+		Tools: []Tool{{
+			Type:            "computer_20251124",
+			Name:            "computer",
+			DisplayWidthPx:  1280,
+			DisplayHeightPx: 800,
+		}},
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal completion request: %v", err)
+	}
+	want := `{"messages":[{"role":"user","content":"ping"}],"tools":[{"type":"computer_20251124","name":"computer","display_width_px":1280,"display_height_px":800}]}`
+	if string(raw) != want {
+		t.Fatalf("CompletionRequest JSON = %s, want %s", raw, want)
+	}
+}
+
+func TestCompletionRequestMarshalOpenAIComputerToolExact(t *testing.T) {
+	req := CompletionRequest{
+		Messages: []Message{{Role: "user", Content: NewTextContent("ping")}},
+		Tools:    []Tool{{Type: OpenAINativeComputerToolType}},
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal OpenAI computer completion request: %v", err)
+	}
+	want := `{"messages":[{"role":"user","content":"ping"}],"tools":[{"type":"computer"}]}`
+	if string(raw) != want {
+		t.Fatalf("CompletionRequest JSON = %s, want %s", raw, want)
+	}
+}
+
+func TestNativeToolDefValidate(t *testing.T) {
+	valid := NativeToolDef{Type: "computer_20251124", Name: "computer", DisplayWidthPx: 1280, DisplayHeightPx: 800}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid native tool rejected: %v", err)
+	}
+	invalid := []NativeToolDef{
+		{Type: "computer_20241022", Name: "computer", DisplayWidthPx: 1280, DisplayHeightPx: 800},
+		{Type: "computer_20251124", Name: "desktop", DisplayWidthPx: 1280, DisplayHeightPx: 800},
+		{Type: "computer_20251124", Name: "computer", DisplayWidthPx: 0, DisplayHeightPx: 800},
+		{Type: "computer_20251124", Name: "computer", DisplayWidthPx: 1280, DisplayHeightPx: -1},
+	}
+	for _, def := range invalid {
+		if err := def.Validate(); err == nil {
+			t.Fatalf("Validate(%+v) unexpectedly succeeded", def)
+		}
 	}
 }
 

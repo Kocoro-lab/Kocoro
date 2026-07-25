@@ -28,17 +28,17 @@ const (
 	// telemetry (replay buffer + Desktop) that an unattended tool ran; without it
 	// a channel-driven bash/http call executes with just a local log line. Payload:
 	// {session_id, agent, tool, source, channel, reason, ts}.
-	EventApprovalAuto = "approval_auto"
-	EventAgentError        = "agent_error"
-	EventHeartbeatAlert    = "heartbeat_alert"
-	EventToolStatus        = "tool_status"
-	EventAssistantText     = "assistant_text" // mid-turn agent narration (preamble + state-transition updates); distinct from EventAgentReply (final answer)
-	EventUsage             = "usage"          // per-LLM-call usage snapshot for the run
-	EventCloudAgent        = "cloud_agent"
-	EventCloudProgress     = "cloud_progress"
-	EventCloudPlan         = "cloud_plan"
-	EventNotification      = "notification"
-	EventRunStatus         = "run_status" // watchdog soft/hard events, LLM retries, etc.
+	EventApprovalAuto   = "approval_auto"
+	EventAgentError     = "agent_error"
+	EventHeartbeatAlert = "heartbeat_alert"
+	EventToolStatus     = "tool_status"
+	EventAssistantText  = "assistant_text" // mid-turn agent narration (preamble + state-transition updates); distinct from EventAgentReply (final answer)
+	EventUsage          = "usage"          // per-LLM-call usage snapshot for the run
+	EventCloudAgent     = "cloud_agent"
+	EventCloudProgress  = "cloud_progress"
+	EventCloudPlan      = "cloud_plan"
+	EventNotification   = "notification"
+	EventRunStatus      = "run_status" // watchdog soft/hard events, LLM retries, etc.
 	// EventSuggestionReady is emitted by the daemon's post-Run hook after a
 	// prompt suggestion has been generated and stored in SuggestionState.
 	// Payload: {session_id, agent, text}.
@@ -117,6 +117,12 @@ const (
 	// present_deliverable tool_use/tool_result pair, so the deliverable
 	// re-surfaces when the session is reopened.
 	EventDeliverable = "deliverable"
+
+	// EventComputerUseActivity is the redacted, versioned lifecycle stream for
+	// native GUI control. Its coordinator-owned revision is carried inside the
+	// payload and is deliberately independent from Event.ID, which is the
+	// transport-wide SSE replay cursor.
+	EventComputerUseActivity = "computer_use.activity"
 )
 
 // Event is a daemon lifecycle event pushed to SSE subscribers.

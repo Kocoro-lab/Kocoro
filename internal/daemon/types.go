@@ -75,8 +75,8 @@ type ApprovalRequest struct {
 	Agent string `json:"agent"`
 	// Flags is an optional, additive list of policy hints for the UI. Older
 	// clients can safely ignore it. Currently emitted:
-	//   - "always_allow_disabled": tool is in agent.DisallowsAutoApproval (paid
-	//     or permanent public output). UI should disable / hide the
+	//   - "always_allow_disabled": tool is in agent.DisallowsAutoApproval and
+	//     requires fresh consent. UI should disable / hide the
 	//     "Always Allow" button so non-technical users don't click it
 	//     expecting persistence; daemon still rejects persistence at every
 	//     other gate as defense-in-depth.
@@ -85,8 +85,7 @@ type ApprovalRequest struct {
 
 // ApprovalFlagAlwaysAllowDisabled is the canonical token used by the daemon
 // to tell UI clients to disable the "Always Allow" affordance for a tool
-// whose nature (paid quota, permanent public output) requires fresh consent
-// every call. See ApprovalRequest.Flags.
+// whose nature requires fresh consent every call. See ApprovalRequest.Flags.
 const ApprovalFlagAlwaysAllowDisabled = "always_allow_disabled"
 
 // ApprovalResponse is received from the client (via Cloud relay).

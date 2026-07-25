@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "status": "verified",
+  "commit_state": "committed",
+  "phase": "post_verification",
+  "failure_code": null,
+  "retry_safe": false,
+  "postcondition": "scroll_value_changed_in_direction",
+  "initial_value": 0.25,
+  "final_value": 0.5,
+  "steps_completed": 3,
+  "expected_steps": 3
+}

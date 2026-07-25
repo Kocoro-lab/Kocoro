@@ -26,13 +26,13 @@ func newToolSearchTool(reg *ToolRegistry, deferred map[string]bool) *toolSearchT
 func (t *toolSearchTool) Info() ToolInfo {
 	return ToolInfo{
 		Name:        "tool_search",
-		Description: "Load deferred tool schemas so you can call them in this same request. After calling tool_search, immediately continue the task using the loaded tools — do not stop or ask the user to proceed. Use \"select:name1,name2\" for exact lookup or a keyword to search by name/description.",
+		Description: "Load deferred tool schemas so you can call them in this same request. Exact lookup also confirms an already-active primary tool such as computer_use. After calling tool_search, immediately continue the task using the loaded tools — do not stop or ask the user to proceed. Use \"select:name1,name2\" for exact lookup or a keyword to search by name/description.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"query": map[string]any{
 					"type":        "string",
-					"description": "Either \"select:name1,name2\" for exact match or a keyword to search deferred tools.",
+					"description": "Either \"select:name1,name2\" for exact match or a keyword to search deferred tools. Exact lookup may also confirm an already-active primary tool.",
 				},
 			},
 		},
@@ -62,6 +62,7 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 	}
 
 	var matched []string
+	activePrimary := make(map[string]bool)
 
 	if strings.HasPrefix(args.Query, "select:") {
 		names := strings.Split(strings.TrimPrefix(args.Query, "select:"), ",")
@@ -69,17 +70,27 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 			name = strings.TrimSpace(name)
 			if name != "" && t.deferred[name] {
 				matched = append(matched, name)
+			} else if name != "" && neverDeferTools[name] && t.registry.Has(name) {
+				activePrimary[name] = true
 			}
 		}
 	} else {
 		matched = t.matchKeyword(args.Query)
 	}
 	matched = expandDeferredFamilyCore(t.registry, t.deferred, matched)
+	for _, name := range t.registry.SortedNames() {
+		if activePrimary[name] {
+			matched = append(matched, name)
+		}
+	}
 
 	// Build structured tool_reference blocks for the new protocol path.
 	// Zero matches → zero blocks (loop.go falls back to the Content string).
 	var blocks []client.ContentBlock
 	for _, name := range matched {
+		if !t.deferred[name] {
+			continue
+		}
 		blocks = append(blocks, client.ContentBlock{
 			Type:     "tool_reference",
 			ToolName: name,
@@ -469,7 +480,10 @@ func buildFullSchemasWithDefer(reg *ToolRegistry, cold map[string]bool) []client
 			continue
 		}
 		s := buildToolSchema(tool)
-		if cold[name] {
+		// defer_loading is part of the custom-function tool contract. Provider-
+		// native tools have their own exact schemas and must not acquire function-
+		// only fields merely because their name is in the cold set.
+		if cold[name] && s.Type == "function" {
 			s.DeferLoading = true
 		}
 		out = append(out, s)

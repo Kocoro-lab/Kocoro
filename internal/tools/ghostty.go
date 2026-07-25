@@ -118,10 +118,10 @@ func (t *GhosttyTool) Info() agent.ToolInfo {
 				"action":      map[string]any{"type": "string", "description": "Action: new_tab, new_split, send_input, list_tabs"},
 				"description": agent.DescriptionFieldSpec,
 				"command":     map[string]any{"type": "string", "description": "Shell command to run in the new tab/split"},
-				"title":     map[string]any{"type": "string", "description": "Tab title (defaults to command basename)"},
-				"direction": map[string]any{"type": "string", "description": "Split direction: right or down (for new_split)"},
-				"target":    map[string]any{"type": "string", "description": "Tab title to send input to (for send_input)"},
-				"text":      map[string]any{"type": "string", "description": "Text/keystrokes to send (for send_input)"},
+				"title":       map[string]any{"type": "string", "description": "Tab title (defaults to command basename)"},
+				"direction":   map[string]any{"type": "string", "description": "Split direction: right or down (for new_split)"},
+				"target":      map[string]any{"type": "string", "description": "Tab title to send input to (for send_input)"},
+				"text":        map[string]any{"type": "string", "description": "Text/keystrokes to send (for send_input)"},
 			},
 		},
 		Required: []string{"action", "description"},
@@ -133,7 +133,7 @@ func (t *GhosttyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("invalid arguments: %v", err), IsError: true}, nil
 	}
-	if !ghosttyAvailable() {
+	if !ghosttyAvailable(ctx) {
 		return agent.ToolResult{
 			Content: "Ghostty >= " + minGhosttyVersion + " is required but not found. " +
 				"Use the applescript tool with macOS Terminal.app instead. " +
@@ -143,11 +143,11 @@ func (t *GhosttyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	}
 	switch args.Action {
 	case "new_tab":
-		return t.runNewTab(args)
+		return t.runNewTab(ctx, args)
 	case "new_split":
-		return t.runNewSplit(args)
+		return t.runNewSplit(ctx, args)
 	case "send_input":
-		return t.runSendInput(args)
+		return t.runSendInput(ctx, args)
 	case "list_tabs":
 		return t.runListTabs()
 	default:
@@ -158,20 +158,20 @@ func (t *GhosttyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	}
 }
 
-func (t *GhosttyTool) runNewTab(args ghosttyArgs) (agent.ToolResult, error) {
+func (t *GhosttyTool) runNewTab(ctx context.Context, args ghosttyArgs) (agent.ToolResult, error) {
 	title := resolveTitle(args.Title, args.Command)
 	color := agentColor(title)
-	winIdx, tabIdx, err := ghosttyNewTab(args.Command, title, color)
+	winIdx, tabIdx, err := ghosttyNewTab(ctx, args.Command, title, color)
 	if err != nil {
 		return agent.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
 	t.tabs.add(title, tabRef{windowIndex: winIdx, tabIndex: tabIdx})
 	result := agent.ToolResult{Content: fmt.Sprintf("opened tab %q (window:%d, tab:%d)", title, winIdx, tabIdx)}
-	appendScreenshot(&result)
+	appendScreenshot(ctx, &result)
 	return result, nil
 }
 
-func (t *GhosttyTool) runNewSplit(args ghosttyArgs) (agent.ToolResult, error) {
+func (t *GhosttyTool) runNewSplit(ctx context.Context, args ghosttyArgs) (agent.ToolResult, error) {
 	dir := args.Direction
 	if dir == "" {
 		dir = "right"
@@ -181,17 +181,17 @@ func (t *GhosttyTool) runNewSplit(args ghosttyArgs) (agent.ToolResult, error) {
 	}
 	title := resolveTitle(args.Title, args.Command)
 	color := agentColor(title)
-	winIdx, tabIdx, err := ghosttyNewSplit(dir, args.Command, title, color)
+	winIdx, tabIdx, err := ghosttyNewSplit(ctx, dir, args.Command, title, color)
 	if err != nil {
 		return agent.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
 	t.tabs.add(title, tabRef{windowIndex: winIdx, tabIndex: tabIdx})
 	result := agent.ToolResult{Content: fmt.Sprintf("opened %s split %q", dir, title)}
-	appendScreenshot(&result)
+	appendScreenshot(ctx, &result)
 	return result, nil
 }
 
-func (t *GhosttyTool) runSendInput(args ghosttyArgs) (agent.ToolResult, error) {
+func (t *GhosttyTool) runSendInput(ctx context.Context, args ghosttyArgs) (agent.ToolResult, error) {
 	if args.Target == "" {
 		return agent.ToolResult{Content: "target is required for send_input", IsError: true}, nil
 	}
@@ -209,7 +209,7 @@ func (t *GhosttyTool) runSendInput(args ghosttyArgs) (agent.ToolResult, error) {
 			IsError: true,
 		}, nil
 	}
-	if err := ghosttySendInput(ref.windowIndex, ref.tabIndex, args.Text); err != nil {
+	if err := ghosttySendInput(ctx, ref.windowIndex, ref.tabIndex, args.Text); err != nil {
 		return agent.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
 	return agent.ToolResult{Content: fmt.Sprintf("sent input to %q", args.Target)}, nil
@@ -245,8 +245,14 @@ func resolveTitle(title, command string) string {
 	return "terminal"
 }
 
-func appendScreenshot(result *agent.ToolResult) {
-	time.Sleep(500 * time.Millisecond)
+func appendScreenshot(ctx context.Context, result *agent.ToolResult) {
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
 	_, block, err := CaptureAndEncode(DefaultAPIWidth)
 	if err == nil {
 		result.Images = []agent.ImageBlock{block}

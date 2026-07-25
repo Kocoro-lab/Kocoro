@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"strings"
 	"testing"
@@ -249,6 +250,34 @@ func TestToolSearchTool_OnlySearchesDeferred(t *testing.T) {
 	}
 }
 
+func TestToolSearchTool_ExactSelectConfirmsActivePrimaryTool(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "computer_use"})
+	reg.Register(&mockTool{name: "bash"})
+	ts := newToolSearchTool(reg, map[string]bool{})
+
+	result, err := ts.Run(context.Background(), `{"query":"select:computer_use"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if header != "LOADED:computer_use" {
+		t.Fatalf("active primary tool should be confirmed, got: %s", header)
+	}
+	if len(result.ContentBlocks) != 0 {
+		t.Fatalf("already-active tool must not emit a deferred tool_reference, got %+v", result.ContentBlocks)
+	}
+
+	result, err = ts.Run(context.Background(), `{"query":"select:bash"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header = strings.SplitN(result.Content, "\n", 2)[0]
+	if header != "LOADED:" {
+		t.Fatalf("ordinary active tool must remain outside tool_search, got: %s", header)
+	}
+}
+
 func TestToolSearchTool_IsReadOnly(t *testing.T) {
 	ts := newTestToolSearchAgent()
 	if !ts.IsReadOnlyCall("{}") {
@@ -482,19 +511,21 @@ func TestDeferredToolNames_IncludesLocalCategoricals(t *testing.T) {
 	reg.Register(&mockTool{name: "file_write"})
 	// Categorical local tools that MUST be deferred:
 	reg.Register(&mockTool{name: "computer"})
-	reg.Register(&mockTool{name: "computer_use"})
 	reg.Register(&mockTool{name: "schedule_create"})
 	reg.Register(&mockTool{name: "browser_navigate"})
+	// The primary GUI contract must stay visible even after it was warmed in
+	// an earlier turn; otherwise tool_search reports a misleading no-match.
+	reg.Register(&mockTool{name: "computer_use"})
 
 	deferred := deferredToolNames(reg)
 
-	mustDefer := []string{"computer", "computer_use", "schedule_create", "browser_navigate"}
+	mustDefer := []string{"computer", "schedule_create", "browser_navigate"}
 	for _, n := range mustDefer {
 		if !deferred[n] {
 			t.Errorf("expected %q to be in deferred set, got %v", n, mapKeys(deferred))
 		}
 	}
-	mustNotDefer := []string{"bash", "file_read", "file_write"}
+	mustNotDefer := []string{"bash", "file_read", "file_write", "computer_use"}
 	for _, n := range mustNotDefer {
 		if deferred[n] {
 			t.Errorf("expected %q NOT to be in deferred set", n)
@@ -614,6 +645,47 @@ func TestBuildFullSchemasWithDefer_WebToolsNeverDeferred(t *testing.T) {
 	}
 	if !hasAnyNonDeferred(schemas) {
 		t.Error("expected at least one non-deferred schema (web_search/web_fetch)")
+	}
+}
+
+func TestBuildFullSchemasWithDefer_NativeComputerIsNeverDeferred(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockNativeTool{name: "computer"})
+	reg.Register(&mockTool{name: "bash"})
+
+	schemas := buildFullSchemasWithDefer(reg, map[string]bool{
+		"computer": true,
+		"bash":     true,
+	})
+	if len(schemas) != 2 {
+		t.Fatalf("schemas len = %d, want 2", len(schemas))
+	}
+
+	var native, function *client.Tool
+	for index := range schemas {
+		schema := &schemas[index]
+		switch schema.Type {
+		case client.NativeComputerToolType:
+			native = schema
+		case "function":
+			function = schema
+		}
+	}
+	if native == nil || function == nil {
+		t.Fatalf("expected native and function schemas, got %+v", schemas)
+	}
+	if native.DeferLoading {
+		t.Fatal("native computer must never be marked defer_loading")
+	}
+	if !function.DeferLoading {
+		t.Fatal("cold function tool lost existing defer_loading behavior")
+	}
+	raw, err := json.Marshal(native)
+	if err != nil {
+		t.Fatalf("marshal cold native computer: %v", err)
+	}
+	if strings.Contains(string(raw), "defer_loading") || strings.Contains(string(raw), "function") {
+		t.Fatalf("native computer leaked non-native fields: %s", raw)
 	}
 }
 

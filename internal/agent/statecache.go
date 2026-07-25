@@ -132,6 +132,15 @@ func resolveFallbackReadStateTraits(tool Tool, argsJSON string) CallStateTraits 
 	if tool == nil {
 		return CallStateTraits{}
 	}
+	// Read-only classification controls approval and parallel scheduling, but it
+	// does not imply referential transparency. These GUI tools keep observation
+	// state (refs, state IDs, and coordinate image authority) on the tool
+	// instance, so serving a cross-iteration cached result would bypass the Run
+	// call that installs that state. Every such observation must execute.
+	switch tool.Info().Name {
+	case "computer_use", "accessibility":
+		return CallStateTraits{}
+	}
 	readOnly, ok := tool.(ReadOnlyChecker)
 	if !ok || !readOnly.IsReadOnlyCall(argsJSON) {
 		return CallStateTraits{}

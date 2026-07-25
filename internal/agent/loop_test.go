@@ -5269,6 +5269,166 @@ type capturingLLMClient struct {
 	idx       int
 }
 
+type mutableNativeImageTool struct {
+	mu            sync.Mutex
+	width         int
+	height        int
+	prepareWidth  int
+	prepareHeight int
+	prepareCalls  int
+	prepareErr    error
+}
+
+func (t *mutableNativeImageTool) Info() ToolInfo {
+	return ToolInfo{Name: client.NativeComputerToolName, Description: "dynamic native computer test tool"}
+}
+
+func (t *mutableNativeImageTool) RequiresApproval() bool { return false }
+
+func (t *mutableNativeImageTool) NativeToolDef() *client.NativeToolDef {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return &client.NativeToolDef{
+		Type:            client.NativeComputerToolType,
+		Name:            client.NativeComputerToolName,
+		DisplayWidthPx:  t.width,
+		DisplayHeightPx: t.height,
+	}
+}
+
+func (t *mutableNativeImageTool) PrepareNativeToolRequest(context.Context) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.prepareCalls++
+	if t.prepareWidth > 0 && t.prepareHeight > 0 {
+		t.width = t.prepareWidth
+		t.height = t.prepareHeight
+	}
+	return t.prepareErr
+}
+
+func (t *mutableNativeImageTool) Run(context.Context, string) (ToolResult, error) {
+	t.mu.Lock()
+	t.width = 1024
+	t.height = 768
+	t.mu.Unlock()
+	return ToolResult{
+		Content: "updated screenshot",
+		Images: []ImageBlock{{
+			MediaType: "image/png",
+			Data:      "iVBORfakebase64data",
+		}},
+	}, nil
+}
+
+func TestAgentLoopPreparesNativeToolBeforeFirstRequestSchema(t *testing.T) {
+	reg := NewToolRegistry()
+	native := &mutableNativeImageTool{
+		width: 1280, height: 800,
+		prepareWidth: 1024, prepareHeight: 768,
+	}
+	reg.Register(native)
+
+	cap := &capturingLLMClient{responses: []*client.CompletionResponse{{
+		OutputText: "done", FinishReason: "end_turn",
+	}}}
+	loop := NewAgentLoop(cap, reg, "medium", "", 5, 2000, 200, nil, nil, nil)
+	loop.SetSpecificModel("claude-sonnet-4-6")
+
+	result, _, err := loop.Run(context.Background(), "inspect the screen", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "done" || len(cap.requests) != 1 {
+		t.Fatalf("result=%q requests=%d", result, len(cap.requests))
+	}
+	var prepared *client.Tool
+	for index := range cap.requests[0].Tools {
+		schema := &cap.requests[0].Tools[index]
+		if schema.Type == client.NativeComputerToolType &&
+			schema.Name == client.NativeComputerToolName {
+			prepared = schema
+		}
+	}
+	if prepared == nil || prepared.DisplayWidthPx != 1024 ||
+		prepared.DisplayHeightPx != 768 {
+		t.Fatalf("first prepared native schema = %+v", cap.requests[0].Tools)
+	}
+	native.mu.Lock()
+	prepareCalls := native.prepareCalls
+	native.mu.Unlock()
+	if prepareCalls != 1 {
+		t.Fatalf("native prepare calls = %d, want 1", prepareCalls)
+	}
+}
+
+func TestAgentLoopNativePreparationFailureMakesZeroLLMRequests(t *testing.T) {
+	reg := NewToolRegistry()
+	native := &mutableNativeImageTool{
+		width: 1280, height: 800,
+		prepareErr: errors.New("strict screenshot unavailable"),
+	}
+	reg.Register(native)
+	cap := &capturingLLMClient{}
+	loop := NewAgentLoop(cap, reg, "medium", "", 5, 2000, 200, nil, nil, nil)
+	loop.SetSpecificModel("claude-sonnet-4-6")
+
+	if _, _, err := loop.Run(context.Background(), "inspect the screen", nil, nil); err == nil ||
+		!strings.Contains(err.Error(), "strict screenshot unavailable") {
+		t.Fatalf("preparation error = %v", err)
+	}
+	if len(cap.requests) != 0 {
+		t.Fatalf("preparation failure sent %d LLM requests", len(cap.requests))
+	}
+}
+
+func TestAgentLoopRefreshesNativeDimensionsAfterImageToolResult(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mutableNativeImageTool{width: 1280, height: 800})
+
+	cap := &capturingLLMClient{responses: []*client.CompletionResponse{
+		{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				ID:        "toolu_dynamic_computer",
+				Name:      client.NativeComputerToolName,
+				Arguments: json.RawMessage(`{"action":"screenshot"}`),
+			}},
+		},
+		{OutputText: "done", FinishReason: "end_turn"},
+	}}
+	loop := NewAgentLoop(cap, reg, "medium", "", 5, 2000, 200, nil, nil, nil)
+	loop.SetSpecificModel("claude-sonnet-4-6")
+
+	result, _, err := loop.Run(context.Background(), "inspect the screen", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "done" {
+		t.Fatalf("result = %q, want done", result)
+	}
+	if len(cap.requests) != 2 {
+		t.Fatalf("LLM requests = %d, want 2", len(cap.requests))
+	}
+
+	dimensions := func(req client.CompletionRequest) (int, int, bool) {
+		for _, schema := range req.Tools {
+			if schema.Type == client.NativeComputerToolType && schema.Name == client.NativeComputerToolName {
+				return schema.DisplayWidthPx, schema.DisplayHeightPx, true
+			}
+		}
+		return 0, 0, false
+	}
+	firstWidth, firstHeight, firstFound := dimensions(cap.requests[0])
+	secondWidth, secondHeight, secondFound := dimensions(cap.requests[1])
+	if !firstFound || firstWidth != 1280 || firstHeight != 800 {
+		t.Fatalf("first native declaration = found:%t %dx%d, want 1280x800", firstFound, firstWidth, firstHeight)
+	}
+	if !secondFound || secondWidth != 1024 || secondHeight != 768 {
+		t.Fatalf("second native declaration = found:%t %dx%d, want 1024x768", secondFound, secondWidth, secondHeight)
+	}
+}
+
 func (c *capturingLLMClient) Complete(_ context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
 	c.requests = append(c.requests, req)
 	if c.idx >= len(c.responses) {

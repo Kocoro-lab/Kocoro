@@ -328,6 +328,64 @@ func TestHandleAlwaysAllowDecision_NonBashDefaultAgent_GlobalToolLevel(t *testin
 	}
 }
 
+// Computer Use is one product-level permission, so clicking Always Allow from
+// any named agent must persist globally instead of creating a per-agent grant.
+func TestHandleAlwaysAllowDecision_ComputerUseNamedAgentPersistsGlobally(t *testing.T) {
+	deps := newDepsWithConfig(t, "operator")
+	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
+
+	HandleAlwaysAllowDecision(deps, broker, "operator", "computer_use",
+		`{"action":"click","x":12,"y":34,"description":"Click target"}`)
+
+	if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 0 {
+		t.Fatalf("computer_use must not create a per-agent grant, got %v", got)
+	}
+	found := false
+	for _, tool := range deps.Config.Permissions.AlwaysAllowTools {
+		if tool == "computer_use" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("global always_allow_tools missing computer_use: %v", deps.Config.Permissions.AlwaysAllowTools)
+	}
+	cfgData, err := os.ReadFile(filepath.Join(deps.ShannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read global config: %v", err)
+	}
+	if !strings.Contains(string(cfgData), "computer_use") {
+		t.Fatalf("global config should contain computer_use, got:\n%s", cfgData)
+	}
+	if !broker.IsToolAutoApproved("computer_use") {
+		t.Fatal("broker should honor the global computer_use grant immediately")
+	}
+}
+
+func TestMergeAgentAlwaysAllowToolsIgnoresPerAgentComputerUseResidue(t *testing.T) {
+	merged := mergeAgentAlwaysAllowTools(
+		[]string{"computer_use", "global_tool"},
+		[]string{"computer_use", "agent_tool"},
+	)
+	var computerUseCount int
+	var foundAgentTool bool
+	for _, tool := range merged {
+		if tool == "computer_use" {
+			computerUseCount++
+		}
+		if tool == "agent_tool" {
+			foundAgentTool = true
+		}
+	}
+	if computerUseCount != 1 {
+		t.Fatalf("computer_use count=%d, want global grant only: %v",
+			computerUseCount, merged)
+	}
+	if !foundAgentTool {
+		t.Fatalf("ordinary per-agent grant was dropped: %v", merged)
+	}
+}
+
 // TestHandleAlwaysAllowDecision_NonBashDefaultAgent_FormerlyHighRiskPersists
 // pins the 2026-05-18 policy change for the global-default path. publish_to_web
 // used to be globally non-persistable with a warn notice; it now persists

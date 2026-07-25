@@ -1,12 +1,14 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
-	"image/draw"
+	imagedraw "image/draw"
 	"image/png"
 	"math"
 	"os"
@@ -17,12 +19,14 @@ import (
 	_ "image/jpeg"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	xdraw "golang.org/x/image/draw"
 )
 
 type refEntry struct {
-	path string
-	role string
-	pid  int
+	path        string
+	role        string
+	fingerprint string
+	pid         int
 }
 
 type appContext struct {
@@ -48,9 +52,48 @@ func formatContext(ctx *appContext) string {
 }
 
 type AccessibilityTool struct {
-	client  *AXClient
-	refs    map[string]refEntry
-	lastPID int
+	client       *AXClient
+	refs         map[string]refEntry
+	lastPID      int
+	lastBundleID string
+	lastAppName  string
+}
+
+type annotationViewport struct {
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+}
+
+func (bounds annotationViewport) valid() bool {
+	return bounds.Width > 0 && bounds.Height > 0 &&
+		!math.IsNaN(bounds.X) && !math.IsNaN(bounds.Y) &&
+		!math.IsNaN(bounds.Width) && !math.IsNaN(bounds.Height) &&
+		!math.IsInf(bounds.X, 0) && !math.IsInf(bounds.Y, 0) &&
+		!math.IsInf(bounds.Width, 0) && !math.IsInf(bounds.Height, 0)
+}
+
+type accessibilityAnnotateResult struct {
+	App         string                       `json:"app"`
+	AppName     string                       `json:"app_name"`
+	BundleID    string                       `json:"bundle_id"`
+	PID         int                          `json:"pid"`
+	Window      string                       `json:"window"`
+	WindowID    int                          `json:"window_id"`
+	WindowFrame *annotationViewport          `json:"window_frame"`
+	ContentSig  string                       `json:"content_signature"`
+	Annotations []annotationEntry            `json:"annotations"`
+	RefPaths    map[string]map[string]string `json:"ref_paths"`
+}
+
+type exactAccessibilityWindowResult struct {
+	OK          bool   `json:"ok"`
+	Code        string `json:"code"`
+	ImageBase64 string `json:"image_base64"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+	ContentSig  string `json:"content_signature"`
 }
 
 type accessibilityArgs struct {
@@ -226,6 +269,8 @@ func (t *AccessibilityTool) readTree(ctx context.Context, args accessibilityArgs
 
 	var treeResult struct {
 		App      string                       `json:"app"`
+		AppName  string                       `json:"app_name"`
+		BundleID string                       `json:"bundle_id"`
 		PID      int                          `json:"pid"`
 		Window   string                       `json:"window"`
 		Elements []any                        `json:"elements"`
@@ -237,6 +282,11 @@ func (t *AccessibilityTool) readTree(ctx context.Context, args accessibilityArgs
 
 	t.refs = make(map[string]refEntry)
 	t.lastPID = treeResult.PID
+	t.lastBundleID = treeResult.BundleID
+	t.lastAppName = treeResult.AppName
+	if t.lastAppName == "" {
+		t.lastAppName = treeResult.App
+	}
 
 	for ref, entry := range treeResult.RefPaths {
 		t.refs[ref] = refEntry{
@@ -436,13 +486,7 @@ func (t *AccessibilityTool) annotate(ctx context.Context, args accessibilityArgs
 	}
 
 	// Parse the annotation result
-	var annotateResult struct {
-		App         string                       `json:"app"`
-		PID         int                          `json:"pid"`
-		Window      string                       `json:"window"`
-		Annotations []annotationEntry            `json:"annotations"`
-		RefPaths    map[string]map[string]string `json:"ref_paths"`
-	}
+	var annotateResult accessibilityAnnotateResult
 	if err := json.Unmarshal(result, &annotateResult); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("parse error: %v", err), IsError: true}, nil
 	}
@@ -450,6 +494,11 @@ func (t *AccessibilityTool) annotate(ctx context.Context, args accessibilityArgs
 	// Store refs so the agent can click by ref after annotating
 	t.refs = make(map[string]refEntry)
 	t.lastPID = annotateResult.PID
+	t.lastBundleID = annotateResult.BundleID
+	t.lastAppName = annotateResult.AppName
+	if t.lastAppName == "" {
+		t.lastAppName = annotateResult.App
+	}
 	for ref, entry := range annotateResult.RefPaths {
 		t.refs[ref] = refEntry{
 			path: entry["path"],
@@ -470,27 +519,124 @@ func (t *AccessibilityTool) annotate(ctx context.Context, args accessibilityArgs
 	}
 	content := strings.Join(lines, "\n")
 
-	// Take a screenshot and draw annotation markers on it
-	screenshotPath, imgBlock, captureErr := CaptureAndEncode(DefaultAPIWidth)
 	var images []agent.ImageBlock
-	if captureErr == nil {
-		// Get screen dimensions for coordinate mapping
-		screenW, screenH, dimErr := GetScreenDimensions()
-		if dimErr == nil && len(annotateResult.Annotations) > 0 {
-			annotatedBlock, annotErr := drawAnnotations(screenshotPath, annotateResult.Annotations, screenW, screenH)
-			if annotErr == nil {
-				imgBlock = annotatedBlock
+	screenshotWarning := ""
+	if annotateResult.WindowID > 0 && annotateResult.WindowFrame != nil &&
+		annotateResult.WindowFrame.valid() && validContentSignature(annotateResult.ContentSig) {
+		maxLabels := args.MaxLabels
+		if maxLabels <= 0 {
+			maxLabels = 50
+		}
+		windowImage, captureErr := t.captureExactAccessibilityWindow(
+			ctx,
+			annotateResult.PID,
+			annotateResult.WindowID,
+			*annotateResult.WindowFrame,
+			annotateResult.ContentSig,
+			args.Roles,
+			maxLabels)
+		if captureErr == nil {
+			var imgBlock agent.ImageBlock
+			if len(annotateResult.Annotations) > 0 {
+				imgBlock, captureErr = drawAnnotationsBytes(
+					windowImage, annotateResult.Annotations, *annotateResult.WindowFrame)
+			} else {
+				imgBlock, captureErr = drawAnnotationsBytes(
+					windowImage, nil, *annotateResult.WindowFrame)
+			}
+			if captureErr == nil {
+				images = append(images, imgBlock)
 			}
 		}
-		images = append(images, imgBlock)
-		// Clean up original screenshot temp file
-		os.Remove(screenshotPath)
+		if captureErr != nil {
+			screenshotWarning = "exact window screenshot unavailable; annotations remain text-only"
+		}
+	} else {
+		screenshotWarning = "exact window identity unavailable; annotations remain text-only"
+	}
+	if screenshotWarning != "" {
+		content += "\nscreenshot_warning: " + screenshotWarning
 	}
 
 	return agent.ToolResult{
 		Content: content,
 		Images:  images,
 	}, nil
+}
+
+func (t *AccessibilityTool) captureExactAccessibilityWindow(
+	ctx context.Context,
+	pid, windowID int,
+	bounds annotationViewport,
+	expectedContentSignature string,
+	roles []string,
+	maxLabels int,
+) ([]byte, error) {
+	if t.client == nil || pid <= 0 || windowID <= 0 || !bounds.valid() ||
+		!validContentSignature(expectedContentSignature) || maxLabels <= 0 {
+		return nil, fmt.Errorf("exact accessibility window identity is required")
+	}
+	raw, err := t.client.Call(ctx, "capture_window", map[string]any{
+		"pid":                    pid,
+		"window_id":              windowID,
+		"expected_quartz_bounds": bounds,
+		"roles":                  roles,
+		"max_labels":             maxLabels,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result exactAccessibilityWindowResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("decode exact accessibility window: %w", err)
+	}
+	return decodeExactAccessibilityWindow(result, expectedContentSignature)
+}
+
+func validContentSignature(signature string) bool {
+	if len(signature) != 64 {
+		return false
+	}
+	for _, char := range signature {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func decodeExactAccessibilityWindow(
+	result exactAccessibilityWindowResult,
+	expectedContentSignature string,
+) ([]byte, error) {
+	if !result.OK {
+		if result.Code == "" {
+			result.Code = "capture_failed"
+		}
+		return nil, fmt.Errorf("exact accessibility window capture failed: %s", result.Code)
+	}
+	if result.Width <= 0 || result.Height <= 0 || result.ImageBase64 == "" {
+		return nil, fmt.Errorf("exact accessibility window capture returned incomplete image metadata")
+	}
+	if !validContentSignature(expectedContentSignature) ||
+		!validContentSignature(result.ContentSig) ||
+		result.ContentSig != expectedContentSignature {
+		return nil, fmt.Errorf("exact accessibility window content signature changed during capture")
+	}
+	raw, err := base64.StdEncoding.DecodeString(result.ImageBase64)
+	if err != nil {
+		return nil, fmt.Errorf("decode exact accessibility window image: %w", err)
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("inspect exact accessibility window image: %w", err)
+	}
+	if config.Width != result.Width || config.Height != result.Height {
+		return nil, fmt.Errorf(
+			"exact accessibility window image dimensions %dx%d do not match metadata %dx%d",
+			config.Width, config.Height, result.Width, result.Height)
+	}
+	return raw, nil
 }
 
 func (t *AccessibilityTool) scroll(ctx context.Context, args accessibilityArgs) (agent.ToolResult, error) {
@@ -543,50 +689,60 @@ type annotationEntry struct {
 // drawAnnotations loads a screenshot image and draws numbered markers at each
 // annotation's center position. Returns the annotated image as an ImageBlock.
 func drawAnnotations(imgPath string, annotations []annotationEntry, screenW, screenH int) (agent.ImageBlock, error) {
-	f, err := os.Open(imgPath)
+	raw, err := os.ReadFile(imgPath)
 	if err != nil {
 		return agent.ImageBlock{}, err
 	}
-	defer f.Close()
+	return drawAnnotationsBytes(raw, annotations, annotationViewport{
+		Width: float64(screenW), Height: float64(screenH),
+	})
+}
 
-	img, _, err := image.Decode(f)
+func drawAnnotationsBytes(
+	raw []byte,
+	annotations []annotationEntry,
+	viewport annotationViewport,
+) (agent.ImageBlock, error) {
+	if !viewport.valid() {
+		return agent.ImageBlock{}, fmt.Errorf("annotation viewport must have finite positive dimensions")
+	}
+	img, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
 		return agent.ImageBlock{}, err
 	}
+	img = downscaleAnnotationImage(img, DefaultAPIWidth)
 
 	bounds := img.Bounds()
 	annotated := image.NewRGBA(bounds)
-	draw.Draw(annotated, bounds, img, image.Point{}, draw.Src)
+	imagedraw.Draw(annotated, bounds, img, bounds.Min, imagedraw.Src)
 
 	// Scale: screen coordinates -> image coordinates
-	scaleX := float64(bounds.Dx()) / float64(screenW)
-	scaleY := float64(bounds.Dy()) / float64(screenH)
+	scaleX := float64(bounds.Dx()) / viewport.Width
+	scaleY := float64(bounds.Dy()) / viewport.Height
 
 	for _, a := range annotations {
 		// Center of element in screen coords -> image coords
-		cx := int((a.X + a.Width/2) * scaleX)
-		cy := int((a.Y + a.Height/2) * scaleY)
+		cx := int(((a.X - viewport.X) + a.Width/2) * scaleX)
+		cy := int(((a.Y - viewport.Y) + a.Height/2) * scaleY)
 		drawMarker(annotated, cx, cy, a.Label)
 	}
 
-	// Write annotated image to a temp file
-	outFile, err := os.CreateTemp("", "shannon-annotated-*.png")
-	if err != nil {
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, annotated); err != nil {
 		return agent.ImageBlock{}, err
 	}
-	defer outFile.Close()
+	return EncodeImageBytes(encoded.Bytes(), "image/png")
+}
 
-	if err := png.Encode(outFile, annotated); err != nil {
-		os.Remove(outFile.Name())
-		return agent.ImageBlock{}, err
+func downscaleAnnotationImage(img image.Image, maxDimension int) image.Image {
+	bounds := img.Bounds()
+	width, height := resizeDimensions(bounds.Dx(), bounds.Dy(), maxDimension)
+	if width == bounds.Dx() && height == bounds.Dy() {
+		return img
 	}
-
-	block, err := EncodeImage(outFile.Name())
-	os.Remove(outFile.Name()) // clean up temp file after encoding
-	if err != nil {
-		return agent.ImageBlock{}, err
-	}
-	return block, nil
+	resized := image.NewRGBA(image.Rect(0, 0, width, height))
+	xdraw.CatmullRom.Scale(resized, resized.Bounds(), img, bounds, imagedraw.Src, nil)
+	return resized
 }
 
 // drawMarker draws a filled circle with a contrasting border at (x, y) on the image.

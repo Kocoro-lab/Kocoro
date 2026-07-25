@@ -206,9 +206,7 @@ func buildStaticSystem(opts PromptOptions) string {
 			"necessarily the user's current-message language. Describe the user-facing goal in " +
 			"5–15 words, not the internal mechanism. Example for a Chinese conversation: " +
 			"'查找最大的 10 个文件', NOT 'Run find piped to du and sort'. When the field is present, " +
-			"this rule applies — that covers almost every tool you can call. The notable exception is " +
-			"`computer`, which is registered via NativeToolDef and drops Parameters before transmission, " +
-			"so a `description` argument would never reach the model — do not invent one for it. " +
+			"this rule applies — that covers almost every tool you can call. " +
 			"Code identifiers, file paths, and CLI commands inside the description may stay in their " +
 			"original form, but the surrounding prose follows the reply language.")
 	}

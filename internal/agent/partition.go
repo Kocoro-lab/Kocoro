@@ -111,6 +111,10 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 				if toolCancel != nil {
 					defer toolCancel()
 				}
+				toolCtx = withToolInvocation(toolCtx, ToolInvocation{
+					ToolName:  ac.fc.Name,
+					ToolUseID: ac.fc.ID,
+				})
 				startTime := time.Now()
 				result, runErr := ac.tool.Run(toolCtx, ac.argsStr)
 				execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr, name: ac.fc.Name}
@@ -143,6 +147,10 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 					if toolCancel != nil {
 						defer toolCancel()
 					}
+					toolCtx = withToolInvocation(toolCtx, ToolInvocation{
+						ToolName:  ac.fc.Name,
+						ToolUseID: ac.fc.ID,
+					})
 					startTime := time.Now()
 					result, runErr := ac.tool.Run(toolCtx, ac.argsStr)
 					execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr, name: ac.fc.Name}

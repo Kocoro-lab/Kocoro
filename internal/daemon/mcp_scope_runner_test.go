@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -147,7 +148,14 @@ func TestRunAgent_AllInboundSourcesOfferComputerUse(t *testing.T) {
 	} {
 		t.Run(source, func(t *testing.T) {
 			gw := &fakeGatewayBackend{reply: "done"}
-			ts := httptest.NewServer(gw.handler())
+			completionHandler := gw.handler()
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/completions/resolve" {
+					http.NotFound(w, r)
+					return
+				}
+				completionHandler(w, r)
+			}))
 			defer ts.Close()
 
 			deps := runAgentContractTestDeps(t, ts.URL)

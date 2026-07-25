@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "required": true,
+  "kind": "delete",
+  "intent_id": "cri_EBESExQVFhcYGRobHB0eHw",
+  "expires_at": "2026-07-23T00:02:00Z"
+}

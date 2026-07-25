@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "action": "move",
+  "primary_action_committed": false,
+  "pointer_motion_committed": false,
+  "phase": "preflight",
+  "failure_code": "point_occluded",
+  "retry_safe": false,
+  "pointer_endpoint": null
+}

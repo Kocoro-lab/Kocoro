@@ -1,0 +1,30 @@
+{
+  "id": 1201,
+  "method": "coordinate_pixel_scroll",
+  "params": {
+    "schema_version": 1,
+    "topology_ref": {"topology_id": "topology-demo", "generation": 7},
+    "helper_boot_id": "helper_boot_demo",
+    "pid": 4242,
+    "bundle_id": "com.example.Target",
+    "window_id": 7001,
+    "expected_window_quartz_bounds": {
+      "x": 100,
+      "y": 100,
+      "width": 800,
+      "height": 600
+    },
+    "display_id": 1,
+    "quartz_point": {"x": 350.5, "y": 450.5},
+    "unit": "pixel",
+    "provider_delta_x": 37,
+    "provider_delta_y": -618,
+    "provider_to_quartz_scale_x": 1,
+    "provider_to_quartz_scale_y": 1,
+    "cg_point_delta_axis1": 618,
+    "cg_point_delta_axis2": -37,
+    "modifiers": [],
+    "target_policy": "same_window",
+    "commit_deadline_at": "2026-07-22T12:03:32Z"
+  }
+}

@@ -513,7 +513,7 @@ func (h *remoteRunEventHandler) OnToolCall(name string, args string, toolUseID s
 			"tool":        name,
 			"tool_use_id": toolUseID,
 			"status":      "running",
-			"args":        redactAndTruncate(args, 200),
+			"args":        redactAndTruncate(agent.RedactGUIActivityArguments(name, args), 200),
 		}),
 	})
 }
@@ -529,7 +529,7 @@ func (h *remoteRunEventHandler) OnToolResult(name string, args string, toolUseID
 			"status":      "completed",
 			"elapsed":     elapsed.Seconds(),
 			"is_error":    result.IsError,
-			"preview":     redactAndTruncate(toolResultPreview(result), 200),
+			"preview":     redactAndTruncate(agent.RedactGUIActivityResult(name, toolResultPreview(result)), 200),
 		}),
 	})
 }

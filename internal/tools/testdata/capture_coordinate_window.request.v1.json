@@ -1,0 +1,12 @@
+{
+  "id": 801,
+  "method": "capture_coordinate_window",
+  "params": {
+    "schema_version": 1,
+    "topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+    "pid": 4242,
+    "bundle_id": "com.example.fixture",
+    "window_id": 7001,
+    "expected_quartz_bounds": {"x": -100, "y": 200, "width": 1, "height": 1}
+  }
+}

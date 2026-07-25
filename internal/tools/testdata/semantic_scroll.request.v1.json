@@ -1,0 +1,19 @@
+{
+  "id": 907,
+  "method": "semantic_scroll_v1",
+  "params": {
+    "schema_version": 1,
+    "pid": 42,
+    "bundle_id": "com.apple.Notes",
+    "window_id": 7001,
+    "ref": "e3",
+    "path": "window[0]/AXScrollArea[0]",
+    "expected_role": "AXScrollArea",
+    "expected_fingerprint": "axf_scroll_target",
+    "axis": "vertical",
+    "direction": "increment",
+    "steps": 3,
+    "fallback_policy": "report_unsupported",
+    "commit_deadline_at": "2027-01-15T08:00:01.000000000Z"
+  }
+}

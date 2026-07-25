@@ -28,6 +28,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
+	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
@@ -1483,6 +1484,17 @@ type ServerDeps struct {
 	// Wired by NewServer after construction. nil-safe: when unset (e.g. CLI
 	// fixtures that construct ServerDeps directly), the post-Run hook is a no-op.
 	Suggestions *agent.SuggestionState
+	// ComputerUseCoordinator is the process-wide GUI control authority used by
+	// daemon tool wrappers. Production leaves this nil and resolves
+	// guicontrol.ProcessCoordinator; tests may inject an isolated coordinator.
+	ComputerUseCoordinator *guicontrol.Coordinator
+	// ComputerUseAppPolicy is the process-wide Ask/Blocked policy store shared
+	// by daemon admission and the Desktop local-presence API. Tests may inject
+	// an isolated in-memory-directory-backed store before the first run.
+	ComputerUseAppPolicy *ComputerUseAppPolicyStore
+	// ConsequentialRiskBroker is process-memory-only and shared by the daemon
+	// tool workflow and authenticated local Desktop decision endpoints.
+	ConsequentialRiskBroker *ConsequentialRiskBroker
 
 	// ApprovalTracker records which sessions are currently blocked on a
 	// user approval prompt. Approval handlers (SSE + WS) Mark/Clear here so
@@ -1507,6 +1519,15 @@ func (d *ServerDeps) Snapshot() (*config.Config, *agent.ToolRegistry, *mcp.Super
 	cfg, reg, sup := d.Config, d.Registry, d.Supervisor
 	d.mu.RUnlock()
 	return cfg, reg, sup
+}
+
+func (d *ServerDeps) computerUseAppPolicyStore() *ComputerUseAppPolicyStore {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.ComputerUseAppPolicy == nil {
+		d.ComputerUseAppPolicy = NewComputerUseAppPolicyStore(d.ShannonDir)
+	}
+	return d.ComputerUseAppPolicy
 }
 
 // ShutdownCleanup captures and calls the current Cleanup function under lock,
@@ -1785,6 +1806,103 @@ func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelCo
 	}
 }
 
+type runModelIntent struct {
+	ModelTier     string
+	SpecificModel string
+}
+
+// effectiveRunModelIntent mirrors the existing loop precedence so route
+// resolution and the eventual CompletionRequest cannot disagree:
+// global config -> named-agent overlay -> request tier override.
+func effectiveRunModelIntent(
+	runCfg *config.Config,
+	agentOverride *agents.Agent,
+	req RunAgentRequest,
+) runModelIntent {
+	var intent runModelIntent
+	if runCfg != nil {
+		intent.ModelTier = runCfg.ModelTier
+		intent.SpecificModel = runCfg.Agent.Model
+	}
+	if agentOverride != nil &&
+		agentOverride.Config != nil &&
+		agentOverride.Config.Agent != nil {
+		model := agentOverride.Config.Agent
+		if model.ModelTier != nil && *model.ModelTier != "" {
+			intent.ModelTier = *model.ModelTier
+		}
+		if model.Model != nil {
+			intent.SpecificModel = *model.Model
+		}
+	}
+	if req.ModelOverride != "" {
+		intent.ModelTier = req.ModelOverride
+	}
+	return intent
+}
+
+// prepareComputerUseRegistryForRun resolves the Cloud-owned execution profile
+// before cloning any run-local computer tool state. A missing/old/unreachable
+// resolve endpoint safely downgrades to the provider-neutral AX-only function
+// tool and removes legacy `computer`; malformed or unauthenticated data can
+// therefore never activate a provider-native adapter.
+func prepareComputerUseRegistryForRun(
+	ctx context.Context,
+	gateway *client.GatewayClient,
+	baseReg *agent.ToolRegistry,
+	runCfg *config.Config,
+	intent runModelIntent,
+) (*agent.ToolRegistry, *client.ExecutionProfile, bool, error) {
+	if baseReg == nil || !baseReg.Has("computer_use") {
+		return tools.CloneWithRuntimeConfig(baseReg, runCfg), nil, false, nil
+	}
+	if gateway == nil {
+		registry, err := tools.CloneWithGenericComputerUseForRun(baseReg, runCfg, false)
+		return registry, nil, true, err
+	}
+	resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	profile, err := gateway.ResolveExecutionProfile(
+		resolveCtx,
+		client.ResolveExecutionProfileRequest{
+			SchemaVersion:      client.ExecutionProfileSchemaVersion,
+			ModelTier:          intent.ModelTier,
+			SpecificModel:      intent.SpecificModel,
+			Capability:         client.ExecutionProfileCapabilityComputer,
+			AllowModelFallback: true,
+		},
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, nil, false, ctx.Err()
+		}
+		if !executionProfileResolveAllowsCompatibilityFallback(err) {
+			return nil, nil, false, fmt.Errorf("execution profile resolve: %w", err)
+		}
+		log.Printf(
+			"daemon: execution profile resolve unavailable; using AX-only generic computer_use: %v",
+			err,
+		)
+		registry, cloneErr := tools.CloneWithGenericComputerUseForRun(baseReg, runCfg, false)
+		return registry, nil, true, cloneErr
+	}
+	registry, err := tools.CloneWithResolvedComputerUseProfileForRun(baseReg, runCfg, profile)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("resolved computer-use profile: %w", err)
+	}
+	return registry, profile, false, nil
+}
+
+func executionProfileResolveAllowsCompatibilityFallback(err error) bool {
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == http.StatusNotFound ||
+			apiErr.StatusCode == http.StatusMethodNotAllowed
+	}
+	var transportErr *url.Error
+	return errors.As(err, &transportErr)
+}
+
 // historySnapshotForRequest returns the conversation history that the agent
 // loop should see. When req.OmitHistory is true (set by the scheduler for
 // stateless schedules), the LLM gets an empty history even though the session
@@ -1795,6 +1913,16 @@ func historySnapshotForRequest(sess *session.Session, req RunAgentRequest) []cli
 		return nil
 	}
 	return sess.HistoryForLoop()
+}
+
+func mergeAgentAlwaysAllowTools(global, perAgent []string) []string {
+	merged := append([]string(nil), global...)
+	for _, tool := range perAgent {
+		if agents.IsToolAlwaysAllowable(tool) {
+			merged = append(merged, tool)
+		}
+	}
+	return merged
 }
 
 // RunAgent executes a single agent turn using the shared dependencies.
@@ -2545,8 +2673,33 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 
-	// Clone and apply per-agent tool filter
-	reg := tools.CloneWithRuntimeConfig(baseReg, runCfg)
+	// Resolve one exact Cloud execution profile before the run-local registry
+	// clone. Old Cloud / unavailable resolve safely falls back to AX-only
+	// computer_use; provider-native adapters require a trusted resolved seal.
+	modelIntent := effectiveRunModelIntent(runCfg, agentOverride, req)
+	reg, executionProfile, _, err := prepareComputerUseRegistryForRun(
+		ctx,
+		deps.GW,
+		baseReg,
+		runCfg,
+		modelIntent,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if hint := req.ForegroundHint; hint != nil && hint.PID > 0 &&
+		strings.TrimSpace(hint.AppName) != "" && strings.TrimSpace(hint.BundleID) != "" {
+		if err := tools.BindComputerUseInitialTargetForRun(reg, tools.ComputerUseInitialTargetV1{
+			PID: hint.PID, AppName: hint.AppName, BundleID: hint.BundleID,
+		}); err != nil {
+			return nil, fmt.Errorf("bind foreground computer-use target: %w", err)
+		}
+	}
+	openAIComputerPrivate, err :=
+		detachDaemonOpenAIComputerPrivateRuntimeV1(reg, executionProfile)
+	if err != nil {
+		return nil, fmt.Errorf("detach OpenAI computer runtime: %w", err)
+	}
 	if agentOverride != nil {
 		reg = tools.ApplyToolFilter(reg, agentOverride)
 		// Enforce per-agent MCP server selection: drop MCP tools whose server is
@@ -2559,6 +2712,28 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// (config.mcp.default_agent_disabled). No-op when empty.
 		reg = tools.ApplyMCPServerScope(reg, runCfg)
 	}
+	// A named-agent allow/deny filter may intentionally remove the selected
+	// computer tool. In that case no profile is attached to ordinary requests;
+	// Gateway preflight would otherwise (correctly) reject a profile whose tool
+	// contract is absent from the final schema surface.
+	if executionProfile != nil {
+		switch executionProfile.ExecutionMode() {
+		case client.ExecutionModeNativeComputer:
+			if !reg.Has(client.NativeComputerToolName) {
+				executionProfile = nil
+			}
+		case client.ExecutionModeFunctionComputerUse:
+			if !reg.Has("computer_use") {
+				executionProfile = nil
+			}
+		}
+	}
+	executionProfile, openAIComputerPrivate =
+		retainDaemonOpenAIComputerPrivateRuntimeV1(
+			reg,
+			executionProfile,
+			openAIComputerPrivate,
+		)
 
 	// Attach SecretsStore to the session-scoped bash tool so use_skill
 	// activations can expose skill secrets as child-process env vars.
@@ -2626,9 +2801,47 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	tools.RegisterMemoryTool(reg, memSvc, &daemonFallback{sessionMgr: sessMgr})
 
+	guiCoordinator := deps.ComputerUseCoordinator
+	if guiCoordinator == nil {
+		guiCoordinator = guicontrol.ProcessCoordinator()
+	}
+	guiWorkflow := newDaemonGUIWorkflow(guiCoordinator, daemonGUIWorkflowRequest{
+		SessionID:   sess.ID,
+		TurnID:      "turn/" + guicontrol.NewCoordinatorInstanceID(),
+		SourceKind:  req.Source,
+		SourceLabel: daemonGUISourceLabel(req.Source),
+	})
+	guiWorkflow.appPolicy = deps.computerUseAppPolicyStore()
+	guiWorkflow.riskBroker = deps.ConsequentialRiskBroker
+	var openAIComputerRuntime *tools.OpenAIComputerActionRuntimeV1
+	var openAIComputerApprovalTool agent.Tool
+	if openAIComputerPrivate != nil {
+		openAIComputerRuntime = openAIComputerPrivate.runtime
+		openAIComputerApprovalTool, err = wrapDetachedDaemonGUIToolV1(
+			openAIComputerPrivate.approvalCore,
+			guiWorkflow,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"wrap detached OpenAI computer approval tool: %w",
+				err,
+			)
+		}
+	}
+	wrapDaemonGUITools(reg, guiWorkflow)
+	defer guiWorkflow.EndTurn()
+
 	loop := agent.NewAgentLoop(deps.GW, reg, runCfg.ModelTier, deps.ShannonDir,
 		runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation,
 		&runCfg.Permissions, deps.Auditor, deps.HookRunner)
+	if err := installDaemonOpenAIComputerBatchRunnerV1(
+		loop,
+		guiWorkflow,
+		openAIComputerRuntime,
+		openAIComputerApprovalTool,
+	); err != nil {
+		return nil, fmt.Errorf("install OpenAI computer batch runner: %w", err)
+	}
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
 	// Browser/GUI context trimming (config-gated; defaults ON via viper).
@@ -2684,11 +2897,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// — global lets the user authorize a tool once and have it apply to
 		// every agent; per-agent narrows trust to a single agent.
 		// SetAlwaysAllowTools dedups internally so simple append is fine.
-		merged := append([]string(nil), runCfg.Permissions.AlwaysAllowTools...)
+		var perAgentAlwaysAllow []string
 		if agentOverride.Config != nil && agentOverride.Config.Permissions != nil {
-			merged = append(merged, agentOverride.Config.Permissions.AlwaysAllowTools...)
+			perAgentAlwaysAllow = agentOverride.Config.Permissions.AlwaysAllowTools
 		}
-		loop.SetAlwaysAllowTools(merged)
+		loop.SetAlwaysAllowTools(mergeAgentAlwaysAllowTools(
+			runCfg.Permissions.AlwaysAllowTools,
+			perAgentAlwaysAllow,
+		))
 	} else {
 		loop.SetMemoryDir(filepath.Join(deps.ShannonDir, "memory"))
 		if loadedSkills != nil {
@@ -2745,6 +2961,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)
 	if req.ModelOverride != "" {
 		loop.SetModelTier(req.ModelOverride)
+	}
+	if executionProfile != nil {
+		// Resolve turns a routing tier into one exact identity. Apply this last
+		// so the request model and run-local tool contract cannot diverge.
+		loop.SetSpecificModel(executionProfile.Model())
+		loop.SetExecutionProfile(executionProfile)
 	}
 	// Inject session metadata as sticky context so it survives compaction.
 	// imBindings is a best-effort Cloud probe: failures degrade silently so
@@ -3064,6 +3286,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	})
 
 	result, usage, runErr := loop.Run(ctx, prompt, resolvedContent, history)
+	// Release GUI authority at the actual agent-turn boundary, before session
+	// persistence, title generation, suggestions, or delivery work. The defer
+	// above remains as a panic/early-return safety net and is idempotent.
+	guiWorkflow.EndTurn()
 	status := loop.LastRunStatus()
 	idempotencyOutcomeKnown = true
 	idempotencyRunErr = runErr

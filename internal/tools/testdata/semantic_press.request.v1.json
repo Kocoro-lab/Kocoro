@@ -1,0 +1,12 @@
+{
+  "id": 701,
+  "method": "semantic_press",
+  "params": {
+    "expected_fingerprint": "axf_target",
+    "expected_role": "AXButton",
+    "fallback_policy": "none",
+    "path": "window[0]/AXButton[0]",
+    "pid": 42,
+    "window_id": 7001
+  }
+}

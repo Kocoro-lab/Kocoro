@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "drag_committed": false,
+  "mouse_down_committed": false,
+  "pointer_motion_committed": false,
+  "mouse_up_committed": false,
+  "possible_drop_side_effect": false,
+  "phase": "preflight",
+  "failure_code": "start_point_occluded",
+  "retry_safe": false,
+  "postcondition": null,
+  "pointer_endpoint": null
+}
