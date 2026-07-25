@@ -280,7 +280,7 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 | `wait_for` | No | Wait for UI conditions: `elementExists`, `elementGone`, `titleContains`, `urlContains`, `titleChanged`, `urlChanged`. Use instead of sleep after navigation or app launch. |
 | `clipboard` | Yes | Read/write system clipboard. |
 | `notify` | Yes | macOS desktop notifications. |
-| `applescript` | Yes | Arbitrary AppleScript. Use for operations with no AX equivalent. |
+| `applescript` | Yes | Arbitrary AppleScript. Use for operations with no AX equivalent. **Not available on daemon runs** where `computer_use` is registered — it is removed from the model's toolset there (along with `accessibility`), and `bash` rejects `osascript`/`cliclick`, so a failed semantic path cannot bypass `computer_use` target binding. Still available in TUI / one-shot CLI / MCP. |
 | `screenshot` | No | Screen capture (fullscreen/window/region). |
 | `computer` | Yes | Mouse/keyboard via CGEvent (CJK/emoji safe). Click, type, hotkey, move, screenshot. No Python dependency. |
 | `browser` | Yes | Playwright MCP (preferred), pinchtab, or chromedp fallback. When Playwright MCP is configured, the legacy browser tool is auto-disabled. Pinchtab connects to user's real browser for authenticated sessions; chromedp uses an isolated profile. |
@@ -298,7 +298,7 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 
 ### Calendar (registered only when daemon is a Kocoro Desktop subprocess)
 
-Operates the user's iCloud / Google / Microsoft 365 / Exchange / Outlook calendars configured under **System Settings → Internet Accounts**. EventKit access lives in Kocoro Desktop (.app); daemon talks to Desktop over a local Unix domain socket. Not available in TUI / one-shot CLI / MCP / scheduled-task modes (fall back to `applescript` driving Calendar.app).
+Operates the user's iCloud / Google / Microsoft 365 / Exchange / Outlook calendars configured under **System Settings → Internet Accounts**. EventKit access lives in Kocoro Desktop (.app); daemon talks to Desktop over a local Unix domain socket. Not available in TUI / one-shot CLI / MCP / scheduled-task modes. In TUI / one-shot CLI / MCP, fall back to `applescript` driving Calendar.app; scheduled tasks run through the daemon, where `applescript` is removed whenever `computer_use` is registered, so use `computer_use` against Calendar.app there instead.
 
 | Tool | Approval | Description |
 |------|----------|-------------|

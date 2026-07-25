@@ -135,9 +135,12 @@ func (t *GhosttyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	}
 	if !ghosttyAvailable(ctx) {
 		return agent.ToolResult{
+			// applescript is removed from the model's toolset on daemon runs that
+			// register computer_use, so it cannot be offered unconditionally here.
 			Content: "Ghostty >= " + minGhosttyVersion + " is required but not found. " +
-				"Use the applescript tool with macOS Terminal.app instead. " +
-				"Example: tell application \"Terminal\" to do script \"<command>\"",
+				"Use the bash tool to run the command directly, or drive Terminal.app " +
+				"with computer_use. On TUI / one-shot CLI / MCP runs the applescript " +
+				"tool is also available: tell application \"Terminal\" to do script \"<command>\"",
 			IsError: true,
 		}, nil
 	}
