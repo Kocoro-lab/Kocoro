@@ -32,7 +32,12 @@
     "search_v1",
     "integration_tools_v1",
     "message_idempotency_v1",
-    "message_idempotency_receipt_v2"
+    "message_idempotency_receipt_v2",
+    "computer_use_topology_v1",
+    "computer_use_control_v1",
+    "computer_use_app_policy_v1",
+    "computer_use_physical_interference_v1",
+    "computer_use_risk_confirmation_v1"
   ],
   "memory": {
     "provider": "disabled",

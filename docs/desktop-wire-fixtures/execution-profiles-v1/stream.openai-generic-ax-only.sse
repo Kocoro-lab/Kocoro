@@ -1,0 +1,6 @@
+data: {"type": "content_delta", "text": "ok"}
+
+data: {"type": "done", "output_text": "ok", "provider": "openai", "model": "gpt-5-mini-2025-08-07", "usage": {"cache_aware_total_tokens": 0, "billable_tokens": 0}, "execution_profile": {"schema_version": 1, "contract_revision": 1, "profile_id": "ep1_217889e2bd16ac438ea11979501af6e2a9c3077d324ef0697e8d606d4847d610", "provider": "openai", "model": "gpt-5-mini-2025-08-07", "api_surface": "openai_chat_completions", "execution_mode": "function_computer_use", "tool_contract": "kocoro.computer_use.v1", "beta_contract": null, "supports_image_input": true, "supports_tool_result_images": false, "supports_function_tools": true, "supports_batched_actions": false}}
+
+data: [DONE]
+

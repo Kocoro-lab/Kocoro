@@ -275,7 +275,7 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 
 | Tool | Approval | Description |
 |------|----------|-------------|
-| `computer_use` | Observe: No; mutate: Yes | **Primary native-GUI tool.** Accessibility-first, provider-neutral workflow: `get_app_state` returns a compact tree plus `state_id`; ref actions re-observe and reject stale state. Supports focus/launch (including app-agnostic window reopen), click/press/value, scroll, type/hotkey, coordinate fallback, condition or bounded-delay waits, and explicit screenshots. Numeric strings from model providers are tolerated for integer fields, and pointer actions visibly move the real cursor. State and refs are isolated per run; whole calls serialize across concurrent inbound routes (one GUI-operation lock, shared with `accessibility`/`computer`/`applescript`); screenshots are never attached automatically. Unattended runs can never auto-approve it — see the deny-list note under Security. |
+| `computer_use` | Observe: No; mutate: Yes | **Primary native-GUI tool.** Accessibility-first, provider-neutral workflow: `get_app_state` returns a compact tree plus `state_id`; ref actions re-observe and reject stale state. Supports focus/launch (including app-agnostic window reopen), click/press/value, scroll, type/hotkey, coordinate fallback, condition or bounded-delay waits, and explicit screenshots. Numeric strings from model providers are tolerated for integer fields, and pointer actions visibly move the real cursor. State and refs are isolated per run; whole calls serialize across concurrent inbound routes (one GUI-operation lock, shared with `accessibility`/`computer`/`applescript`); screenshots are never attached automatically. Unattended runs require the explicit persisted global Computer Use grant; blanket auto-approve is denied. |
 | `accessibility` | Read: No; mutate: Yes | Legacy low-level AX tool retained for compatibility. Reads the macOS accessibility tree via persistent `ax_server`; refs are isolated per run. Mutations require a user-visible `description` and attended approval; read-only actions do not prompt. Actions: `read_tree`, `click`, `press`, `set_value`, `get_value`, `find`, `scroll`, `annotate`. |
 | `wait_for` | No | Wait for UI conditions: `elementExists`, `elementGone`, `titleContains`, `urlContains`, `titleChanged`, `urlChanged`. Use instead of sleep after navigation or app launch. |
 | `clipboard` | Yes | Read/write system clipboard. |
@@ -572,17 +572,17 @@ Slack/LINE ──webhook──▶ Shannon Cloud ──WebSocket──▶ shan da
 
 #### Interactive approval + always-allow
 
-Tools requiring approval send requests to the client app (via WS relay through Shannon Cloud). "Always Allow" persists tool-level at two scopes:
+Tools requiring approval send requests to the client app (via WS relay through Shannon Cloud). General tools support two persisted tool-level scopes:
 
 - **Global** (`~/.shannon/config.yaml permissions.always_allow_tools`) — every agent, including default
 - **Per-agent** (`~/.shannon/agents/<name>/config.yaml permissions.always_allow_tools`) — single agent
 
-Clicking it writes the tool name to the appropriate scope (named agent → per-agent; default agent → global); future calls of that tool skip approval.
+For ordinary tools, clicking it writes the tool name to the appropriate scope (named agent → per-agent; default agent → global). `computer_use` is deliberately simpler: **Always Allow Computer Use is one global product permission**, regardless of which agent or app initiated the prompt. It applies to interactive and unattended tasks. Without that explicit grant, an attended user may Allow Once, while an unattended run fails closed.
 
 **Safety gates remain regardless of what either list contains** — checked by separate code paths, hand-edited config cannot bypass:
 
 - **High-risk bash commands** (`pip install`, `rm -rf`, `python -c`, `git push --force`, etc.) still prompt every call. Enforced by the runtime gate in `internal/agent/loop.go` against `permissions.alwaysAskPrefixes`.
-- **Attended vs unattended auto-approval** — two parallel deny-lists (`agent.DisallowsAutoApproval` / `agent.DisallowsUnattendedAutoApproval`) block persistence or unattended execution of specific tools. The attended list is empty as of 2026-05-18: `publish_to_web`, `generate_image`, and `edit_image` used to be on it; the product call moved them off — they are now ordinary approval-required tools (fresh prompt the first time, "always allow" persists for the rest). The unattended list contains `computer_use` (since 2026-07-22): schedules, heartbeat, watcher, MCP, synchronous HTTP, remote/SSE `auto_approve`, and IM/voice channels without an approval UI cannot run this tool at all — observation actions (including screenshots) are denied alongside mutations, and neither persisted "Always Allow" nor an in-memory broker allow changes that. Attended Desktop/interactive-IM/TUI approvals remain unchanged. For patch compatibility, legacy `accessibility`, `computer`, and `applescript` are not yet on the unattended list; existing schedules using them still work and retain the corresponding GUI-automation risk.
+- **Computer Use consent is explicit** — `computer_use` remains on the unattended auto-approval deny-list so blanket `daemon.auto_approve`, a missing approval UI, or a transient broker flag cannot silently grant desktop control. The agent loop overrides that default denial only for the persisted global `computer_use` grant. Legacy `computer`, `accessibility`, `applescript`, and `ghostty` wrappers cannot be persisted as Always Allow and remain denied for unattended execution. Built-in sensitive-app blocks, lease/Stop/Take Over, physical-interference handling, and separate point-of-risk confirmation remain authoritative even when the global grant is enabled.
 
 #### Approval-card descriptions
 
@@ -849,7 +849,7 @@ Koe voice tests link cgo audio deps on macOS; install them with `brew install op
 
 ## Known Limitations
 
-- **Vision**: screenshots are captured, resized (1200px max), sent as base64 image content blocks. The `computer` tool uses Anthropic's native `computer_20251124` schema with coordinate scaling for retina displays. Vision models may blend what they see with training knowledge — verify critical details.
+- **Vision**: screenshots are captured, resized, and sent as base64 image content blocks. The rollback-compatible `computer` tool is an ordinary function tool with coordinate scaling from its exact screenshot dimensions to AppKit logical points. Anthropic-native execution is admitted only by an exact server-minted provider/model/profile contract; unsupported models keep the generic function-tool fallback. Vision models may blend what they see with training knowledge — verify critical details.
 - **Streaming**: one-shot mode does not stream; waits for the full LLM response before display.
 - **Windows/Linux**: local tools (clipboard, notifications, AppleScript, screenshot, computer) and scheduled tasks (launchd) are macOS-only.
 - **Account login**: email/password sign-in stores the api_key in a per-platform credential store — **macOS Keychain**, **Windows Credential Manager**, and on **Linux** a file store at `~/.shannon/credentials.json` (mode 0600). On Linux the sign-in key is moved out of `config.yaml` into that file; if you manage `config.yaml` with IaC (Ansible/Puppet) note the key now lives in `credentials.json`. On unsupported platforms, set `api_key` in `~/.shannon/config.yaml` instead.

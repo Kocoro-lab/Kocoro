@@ -207,7 +207,7 @@ When an agent produces something the user wants to **share externally** (a landi
 Once a user has published a file via `publish_to_web`, two companion tools let the agent (and the user, via Kocoro Desktop's "Published Files" panel) review and retract those uploads:
 
 - **`list_my_published_files`** — read-only, no approval. Paginated (default 20, max 100), newest first. Optional `kind` filter narrows by business purpose (`session_share` = HTML pages from the session-share button, `other` = files uploaded via `publish_to_web`, plus `report`/`landing_page`/`image` reserved for future producers). Omit `kind` to list every category. Use when the user asks "what have I shared?" / "find that landing page I sent yesterday" / "show me my shared conversations" (→ `kind="session_share"`) / before calling `retract_published_file` (the LLM needs an `id` from this list — the public URL alone is not enough).
-- **`retract_published_file`** — destructive. Soft-deletes the DB row and hard-deletes the S3 object. Approval required by default; the user can opt in to `always_allow_tools` to skip after the first prompt. The current auto-approval deny-list is empty, so this behaves like other approval-required tools.
+- **`retract_published_file`** — destructive. Soft-deletes the DB row and hard-deletes the S3 object. Approval required by default; the user can opt in to `always_allow_tools` to skip after the first prompt. It is not in the GUI-control fresh-approval deny-list, so this existing behavior is unchanged.
 
 **Important caveats:**
 - Retraction is **not** undoable.

@@ -1,0 +1,5 @@
+{
+  "lease_id": "cul_demo",
+  "action": "stop",
+  "idempotency_key": "stop_demo"
+}
