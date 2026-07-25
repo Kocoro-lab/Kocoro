@@ -45,12 +45,29 @@ import (
 //     broker per request, so broker.SetToolAutoApprove alone evaporates.
 //     Tools in DisallowsAutoApproval are refused at this entry plus at
 //     PersistAgentAlwaysAllow, broker, and the runtime gate in loop.go.
-func HandleAlwaysAllowDecision(deps *ServerDeps, broker *ApprovalBroker, agentName, tool, args string) {
+//
+// localSurface reports whether the approval decision arrived on a
+// loopback-only surface the user is physically at (Desktop over local SSE), as
+// opposed to a Cloud-relayed channel or a paired remote device. Only a local
+// surface may mint the persistent global Computer Use grant: that grant also
+// authorizes UNATTENDED runs, so a tap in Slack or on a phone would otherwise
+// permanently license 3am schedules to drive this Mac. POST
+// /permissions/always-allow already enforces the same rule via
+// X-Kocoro-Local-Presence; this keeps the approval-click path consistent with it.
+func HandleAlwaysAllowDecision(
+	deps *ServerDeps, broker *ApprovalBroker, agentName, tool, args string, localSurface bool,
+) {
 	if tool == "bash" {
 		handleBashAlwaysAllow(deps, broker, agentName, args)
 		return
 	}
 	if tool == "computer_use" {
+		if !localSurface {
+			emitAlwaysAllowNotice(deps, "warn", NoticeCodeComputerUseGrantRequiresLocalPresence, tool,
+				"Computer Use was allowed for this call only. Turn on Always Allow Computer Use from the app on this Mac to grant it permanently.")
+			log.Printf("daemon: computer_use global grant refused on a non-local approval surface")
+			return
+		}
 		persistGlobalToolAlwaysAllow(deps, broker, tool)
 		return
 	}
@@ -197,6 +214,12 @@ const (
 	// an otherwise-allowed tool but the filesystem write failed. The click
 	// is still honored for the current session via the broker.
 	NoticeCodePersistFailed = "persist_failed"
+	// NoticeCodeComputerUseGrantRequiresLocalPresence is sent when "Always
+	// Allow" for computer_use is clicked on a Cloud-relayed channel or a
+	// paired remote device. The call itself is honored, but the persistent
+	// global grant — which also authorizes unattended runs — may only be
+	// minted from the Mac itself.
+	NoticeCodeComputerUseGrantRequiresLocalPresence = "computer_use_grant_requires_local_presence"
 )
 
 // AlwaysAllowNoticePayload is the structured shape of EventApprovalNotice

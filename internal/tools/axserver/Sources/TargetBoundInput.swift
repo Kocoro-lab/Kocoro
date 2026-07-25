@@ -315,7 +315,7 @@ struct TargetBoundInputDependencies {
     let prepareKeypress:
         ([String], [String]) -> TargetBoundPreparedKeySequenceV1?
     let prepareDirectText: (String) -> TargetBoundPreparedInput?
-    let prepareClipboardText: (String) -> TargetBoundClipboardTransaction?
+    let prepareClipboardText: (String) -> TargetBoundClipboardPreparationV1
     let prepareTypeVerification:
         (TargetBoundInputRequestV1, String) -> TargetBoundTypeVerificationPreparationV1
     let observePhysicalInput: () -> PhysicalInputInterferenceSnapshotV1?
@@ -325,6 +325,10 @@ struct TargetBoundInputDependencies {
 
 private let targetBoundInputMaximumDeadlineHorizonV1 = 2.0
 private let targetBoundInputCounterSettleDelayV1 = 0.005
+/// Upper bound for one authority revalidation pass. It must stay well inside
+/// targetBoundInputMaximumDeadlineHorizonV1 so a hung target cannot hold the
+/// single-threaded socket loop past the commit horizon.
+private let targetBoundInputAuthorityTimeoutV1 = 0.75
 private let targetBoundInputMaximumCounterSettleAttemptsV1 = 10
 
 func targetBoundInputAssessPhysicalInputV1(
@@ -405,10 +409,33 @@ private func targetBoundTypePostVerification(
     request: TargetBoundInputRequestV1,
     preparation: TargetBoundTypeVerificationPreparationV1,
     clipboardTouched: Bool,
-    clipboardRestored: Bool,
+    restoreClipboard: @escaping () -> Bool,
     physicalInputAfterPost: PhysicalInputInterferenceSnapshotV1?,
     dependencies: TargetBoundInputDependencies
 ) -> TargetBoundInputResultV1 {
+    // Restoring the pasteboard is deliberately LAZY and memoized. Restoring
+    // eagerly before the verifier observes the target lets a busy or
+    // beachballing app service our synthetic Cmd+V after the restore, so it
+    // pastes the user's PREVIOUS clipboard content into the target field. Each
+    // return path triggers the restore at the latest safe moment instead, and
+    // the verifier below is the only evidence the paste actually landed.
+    var restoreResult: Bool? = nil
+    let clipboardRestoredNow: () -> Bool = {
+        if let restored = restoreResult { return restored }
+        let restored = restoreClipboard()
+        restoreResult = restored
+        return restored
+    }
+    // Applied only to results produced after the preparation switch, matching
+    // the previous placement of the restore-failure check.
+    let withRestoreFailure: (TargetBoundInputResultV1) -> TargetBoundInputResultV1 = { result in
+        guard clipboardTouched, !clipboardRestoredNow() else { return result }
+        return TargetBoundInputResultV1(
+            status: "completed_unverified", action: request.action,
+            inputCommitted: true, clipboardTouched: true, clipboardRestored: false,
+            phase: "post_verification",
+            failureCode: "clipboard_restore_failed_after_commit")
+    }
     var physicalInputBaseline = physicalInputAfterPost
     var physicalAssessment: PhysicalInputInterferenceAssessmentV1 = .unchanged
     let assessCurrentPhysicalInput: () -> PhysicalInputInterferenceAssessmentV1 = {
@@ -425,33 +452,26 @@ private func targetBoundTypePostVerification(
         return targetBoundInputUserInterference(
             request, inputCommitted: true,
             clipboardTouched: clipboardTouched,
-            clipboardRestored: clipboardRestored)
+            clipboardRestored: clipboardRestoredNow())
     }
     if physicalAssessment == .unavailable {
         return targetBoundInputMonitoringLostAfterCommit(
             request, clipboardTouched: clipboardTouched,
-            clipboardRestored: clipboardRestored)
-    }
-    if clipboardTouched && !clipboardRestored {
-        return TargetBoundInputResultV1(
-            status: "completed_unverified", action: request.action,
-            inputCommitted: true, clipboardTouched: true, clipboardRestored: false,
-            phase: "post_verification",
-            failureCode: "clipboard_restore_failed_after_commit")
+            clipboardRestored: clipboardRestoredNow())
     }
     switch preparation {
     case let .unavailable(failureCode):
-        return TargetBoundInputResultV1(
+        return withRestoreFailure(TargetBoundInputResultV1(
             status: "completed_unverified", action: request.action,
             inputCommitted: true, clipboardTouched: clipboardTouched,
-            clipboardRestored: clipboardRestored, phase: "post_verification",
-            failureCode: failureCode)
+            clipboardRestored: clipboardRestoredNow(), phase: "post_verification",
+            failureCode: failureCode))
     case let .failed(failureCode):
         // A failed preparation is consumed before input commit. This branch is
         // defensive: runTargetBoundInput handles it before posting the event.
         return targetBoundInputFailure(
             request, code: failureCode, phase: "action",
-            clipboardTouched: clipboardTouched, clipboardRestored: clipboardRestored)
+            clipboardTouched: clipboardTouched, clipboardRestored: clipboardRestoredNow())
     case let .ready(verifier):
         let outcome: TargetedAXPostconditionOutcomeV1<Bool> =
             runTargetedAXPostconditionVerificationV1(
@@ -486,27 +506,27 @@ private func targetBoundTypePostVerification(
             return targetBoundInputUserInterference(
                 request, inputCommitted: true,
                 clipboardTouched: clipboardTouched,
-                clipboardRestored: clipboardRestored)
+                clipboardRestored: clipboardRestoredNow())
         }
         if physicalAssessment == .unavailable {
             return targetBoundInputMonitoringLostAfterCommit(
                 request, clipboardTouched: clipboardTouched,
-                clipboardRestored: clipboardRestored)
+                clipboardRestored: clipboardRestoredNow())
         }
         switch outcome {
         case .verified:
-            return TargetBoundInputResultV1(
+            return withRestoreFailure(TargetBoundInputResultV1(
                 status: "verified", action: request.action,
                 inputCommitted: true, clipboardTouched: clipboardTouched,
-                clipboardRestored: clipboardRestored, phase: "post_verification",
+                clipboardRestored: clipboardRestoredNow(), phase: "post_verification",
                 failureCode: nil,
-                postcondition: "target_value_matches_expected_edit")
+                postcondition: "target_value_matches_expected_edit"))
         case let .inconclusive(failureCode, _, _):
-            return TargetBoundInputResultV1(
+            return withRestoreFailure(TargetBoundInputResultV1(
                 status: "completed_unverified", action: request.action,
                 inputCommitted: true, clipboardTouched: clipboardTouched,
-                clipboardRestored: clipboardRestored, phase: "post_verification",
-                failureCode: failureCode)
+                clipboardRestored: clipboardRestoredNow(), phase: "post_verification",
+                failureCode: failureCode))
         }
     }
 }
@@ -685,9 +705,20 @@ func runTargetBoundInput(
     let text = request.text!
     if dependencies.requiresClipboard(text) {
         // The first authority check above occurs before touching the clipboard.
-        guard let transaction = dependencies.prepareClipboardText(text) else {
+        let transaction: TargetBoundClipboardTransaction
+        switch dependencies.prepareClipboardText(text) {
+        case let .prepared(ready):
+            transaction = ready
+        case let .failedAfterTouch(restored):
+            // The pasteboard was already cleared, so report it truthfully rather
+            // than claiming it was never touched.
             return targetBoundInputFailure(
-                request, code: "clipboard_preparation_failed", phase: "preparation")
+                request,
+                code: restored
+                    ? "clipboard_preparation_failed"
+                    : "clipboard_restore_failed_before_input",
+                phase: "preparation",
+                clipboardTouched: true, clipboardRestored: restored)
         }
         let restoreWithoutInput: (String) -> TargetBoundInputResultV1 = { code in
             let restored = transaction.restore()
@@ -759,14 +790,15 @@ func runTargetBoundInput(
         case .failed:
             return restoreWithoutInput("event_post_failed")
         }
-        let restored = transaction.restore()
         if physicalAssessment == .unavailable {
             return targetBoundInputMonitoringLostAfterCommit(
-                request, clipboardTouched: true, clipboardRestored: restored)
+                request, clipboardTouched: true, clipboardRestored: transaction.restore())
         }
+        // Restore is handed over as a deferred closure so it runs only after the
+        // verifier has read the target back — see targetBoundTypePostVerification.
         return targetBoundTypePostVerification(
             request: request, preparation: verification,
-            clipboardTouched: true, clipboardRestored: restored,
+            clipboardTouched: true, restoreClipboard: transaction.restore,
             physicalInputAfterPost: physicalInputAfterPost,
             dependencies: dependencies)
     }
@@ -824,9 +856,11 @@ func runTargetBoundInput(
     guard posted else {
         return targetBoundInputFailure(request, code: "event_post_failed", phase: "action")
     }
+    // Direct (non-clipboard) typing never touched the pasteboard, so there is
+    // nothing to restore and the deferred closure is never consulted.
     return targetBoundTypePostVerification(
         request: request, preparation: verification,
-        clipboardTouched: false, clipboardRestored: false,
+        clipboardTouched: false, restoreClipboard: { false },
         physicalInputAfterPost: physicalInputAfterPost,
         dependencies: dependencies)
 }
@@ -922,6 +956,30 @@ private func targetBoundInputFingerprint(_ element: AXUIElement) -> String? {
         focused: axBool(element, "AXFocused") ?? false,
         selected: axBool(element, "AXSelected") ?? false,
         actions: axActions(element), frame: nil))
+}
+
+/// Bounds the authority revalidation pass. productionTargetBoundInputAuthorityFailure
+/// issues an unbounded number of AX calls (focused window, bounded path walk,
+/// fingerprint reads, focused element) and was the only commit-adjacent path
+/// without a scoped messaging timeout. An unresponsive target would block the
+/// single-threaded socket loop while Go's ack timeout fires and releases the GUI
+/// barrier — and on the clipboard branch that is a window in which the user's
+/// pasteboard already holds the agent's text.
+private func productionTargetBoundInputAuthorityFailureBoundedV1(
+    _ request: TargetBoundInputRequestV1
+) -> String? {
+    guard let processID = pid_t(exactly: request.pid) else { return "process_not_live" }
+    switch withTargetedAXMessagingTimeoutV1(
+        element: AXUIElementCreateApplication(processID),
+        timeout: targetBoundInputAuthorityTimeoutV1,
+        operation: { productionTargetBoundInputAuthorityFailure(request) }
+    ) {
+    case let .completed(failure):
+        return failure
+    case .unavailable:
+        // Fail closed: an unbounded pass is never silently substituted.
+        return "authority_revalidation_timeout"
+    }
 }
 
 private func productionTargetBoundInputAuthorityFailure(
@@ -1071,11 +1129,20 @@ private func productionTargetBoundDirectText(_ text: String) -> TargetBoundPrepa
     nil
 }
 
+/// Preparation outcome. Both failure paths occur after `clearContents()` has
+/// already run, so the pasteboard was modified even though no input was posted.
+/// Returning a bare nil made the caller report `clipboard_touched: false` while
+/// the clipboard was left empty, or still holding the text meant for the target.
+enum TargetBoundClipboardPreparationV1 {
+    case prepared(TargetBoundClipboardTransaction)
+    case failedAfterTouch(restored: Bool)
+}
+
 func makeTargetBoundClipboardTransaction(
     _ text: String,
     pasteboard: NSPasteboard,
     waitBeforeRestore: @escaping () -> Void
-) -> TargetBoundClipboardTransaction? {
+) -> TargetBoundClipboardPreparationV1 {
     var savedItems: [[NSPasteboard.PasteboardType: Data]] = []
     for item in pasteboard.pasteboardItems ?? [] {
         var values: [NSPasteboard.PasteboardType: Data] = [:]
@@ -1098,13 +1165,11 @@ func makeTargetBoundClipboardTransaction(
     pasteboard.clearContents()
     let emptyOwnedChangeCount = pasteboard.changeCount
     guard pasteboard.setString(text, forType: .string) else {
-        _ = restoreSavedItemsIfOwned(emptyOwnedChangeCount)
-        return nil
+        return .failedAfterTouch(restored: restoreSavedItemsIfOwned(emptyOwnedChangeCount))
     }
     let ownedChangeCount = pasteboard.changeCount
     guard let prepared = productionTargetBoundPreparedKey(key: "v", modifiers: ["command"]) else {
-        _ = restoreSavedItemsIfOwned(ownedChangeCount)
-        return nil
+        return .failedAfterTouch(restored: restoreSavedItemsIfOwned(ownedChangeCount))
     }
     let restore: () -> Bool = {
         waitBeforeRestore()
@@ -1122,12 +1187,12 @@ func makeTargetBoundClipboardTransaction(
         }
         return prepared.post() ? .committed : .failed
     }
-    return TargetBoundClipboardTransaction(post: post, restore: restore)
+    return .prepared(TargetBoundClipboardTransaction(post: post, restore: restore))
 }
 
 private func productionTargetBoundClipboardText(
     _ text: String
-) -> TargetBoundClipboardTransaction? {
+) -> TargetBoundClipboardPreparationV1 {
     makeTargetBoundClipboardTransaction(
         text,
         pasteboard: NSPasteboard.general,
@@ -1257,7 +1322,7 @@ func productionTargetBoundInputDependenciesV1(
 ) -> TargetBoundInputDependencies {
     TargetBoundInputDependencies(
         canAdmitInput: processInputCommitGateV1.canAdmitInput,
-        authorityFailure: productionTargetBoundInputAuthorityFailure,
+        authorityFailure: productionTargetBoundInputAuthorityFailureBoundedV1,
         restoreAuthority: productionRestoreTargetBoundInputAuthority,
         requiresClipboard: { _ in true },
         prepareHotkey: productionTargetBoundPreparedKey,

@@ -191,7 +191,13 @@ func currentContext(pid: Int) -> AppContext {
     if let win = axWindows(appRef).first {
         if let toolbar = findToolbarChild(of: win) {
             if let urlField = findToolbarURLField(in: toolbar) {
-                if let val = axValue(urlField, "AXValue") {
+                // findToolbarURLField returns the first AXTextField/AXComboBox in
+                // the toolbar — it is not URL-specific, so an app whose toolbar
+                // hosts a 2FA code, API key, or licence field would surface that
+                // value here. Every other AXValue read in this helper is gated;
+                // this one must be too.
+                if !isSensitiveAXValue(axValueSensitivityMetadata(urlField)),
+                   let val = axValue(urlField, "AXValue") {
                     url = "\(val)"
                 }
             }

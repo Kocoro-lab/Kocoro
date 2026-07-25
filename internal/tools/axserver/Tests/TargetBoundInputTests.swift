@@ -408,10 +408,12 @@ final class TargetBoundInputTests: XCTestCase {
         defer { pasteboard.clearContents() }
         pasteboard.clearContents()
         XCTAssertTrue(pasteboard.setString("original", forType: .string))
-        let transaction = try XCTUnwrap(makeTargetBoundClipboardTransaction(
+        guard case let .prepared(transaction) = makeTargetBoundClipboardTransaction(
             "temporary secret",
             pasteboard: pasteboard,
-            waitBeforeRestore: {}))
+            waitBeforeRestore: {}) else {
+            return XCTFail("clipboard preparation unexpectedly failed")
+        }
         XCTAssertEqual(pasteboard.string(forType: .string), "temporary secret")
 
         pasteboard.clearContents()
@@ -490,8 +492,40 @@ final class TargetBoundInputTests: XCTestCase {
         XCTAssertFalse(result.clipboardRestored)
         XCTAssertEqual(result.failureCode, "clipboard_restore_failed_after_commit")
         XCTAssertNil(result.postcondition)
-        XCTAssertEqual(harness.verifyObserveCount, 0)
+        // Verification now runs BEFORE the restore is attempted: restoring first
+        // lets a busy target service our Cmd+V after the pasteboard has already
+        // been reverted, pasting the user's previous clipboard content. A failed
+        // restore is still reported, it is just discovered after the read-back.
+        XCTAssertEqual(harness.verifyObserveCount, 1)
         XCTAssertFalse(String(decoding: try JSONEncoder().encode(result), as: UTF8.self).contains(secret))
+    }
+
+    /// The pasteboard must not be reverted until the verifier has read the
+    /// target back. Restoring first lets a busy or beachballing app service our
+    /// synthetic Cmd+V afterwards, pasting the user's PREVIOUS clipboard content
+    /// into the target field — detected only as a value mismatch, and not at all
+    /// when the target is sensitive and read-back is skipped.
+    func testClipboardIsRestoredOnlyAfterVerificationReadsTheTarget() throws {
+        let harness = TargetBoundInputHarness()
+        harness.forceClipboard = true
+        var restoreCountWhenVerified = -1
+        harness.typeVerificationPreparation = .ready(.init(observe: { _ in
+            harness.verifyObserveCount += 1
+            restoreCountWhenVerified = harness.restoreCount
+            return .matched
+        }))
+        let result = runTargetBoundInput(
+            request: try request(action: "type", text: "penguin"),
+            dependencies: harness.dependencies())
+
+        XCTAssertEqual(result.status, "verified")
+        XCTAssertTrue(result.clipboardTouched)
+        XCTAssertTrue(result.clipboardRestored)
+        XCTAssertEqual(harness.verifyObserveCount, 1)
+        XCTAssertEqual(
+            restoreCountWhenVerified, 0,
+            "clipboard was restored before the verifier read the target back")
+        XCTAssertEqual(harness.restoreCount, 1, "restore must still run exactly once")
     }
 
     func testStrictDecoderRejectsUnknownDuplicateAndEscapedDuplicateMembers() throws {
@@ -659,7 +693,7 @@ private final class TargetBoundInputHarness {
             },
             prepareClipboardText: { _ in
                 self.prepareClipboardCount += 1
-                return TargetBoundClipboardTransaction(
+                return .prepared(TargetBoundClipboardTransaction(
                     post: {
                         self.postCount += 1
                         return self.clipboardPostOutcome
@@ -667,7 +701,7 @@ private final class TargetBoundInputHarness {
                     restore: {
                         self.restoreCount += 1
                         return self.restoreSucceeds
-                    })
+                    }))
             },
             prepareTypeVerification: { _, _ in self.typeVerificationPreparation },
             observePhysicalInput: {

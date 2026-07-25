@@ -146,10 +146,20 @@ struct InputDriver {
             // While alive, reuse the target-bound transaction's change-count
             // ownership guard so cleanup never overwrites newer user content.
             let pasteboard = NSPasteboard.general
-            guard let transaction = makeTargetBoundClipboardTransaction(
+            let transaction: TargetBoundClipboardTransaction
+            switch makeTargetBoundClipboardTransaction(
                 text, pasteboard: pasteboard,
-                waitBeforeRestore: { Thread.sleep(forTimeInterval: 0.1) }) else {
-                return (nil, ErrorInfo(code: -1, message: "Failed to prepare pasteboard"))
+                waitBeforeRestore: { Thread.sleep(forTimeInterval: 0.1) }) {
+            case let .prepared(ready):
+                transaction = ready
+            case let .failedAfterTouch(restored):
+                // The pasteboard was already cleared by preparation; say so
+                // instead of implying it was left untouched.
+                return (nil, ErrorInfo(
+                    code: -1,
+                    message: restored
+                        ? "Failed to prepare pasteboard; prior clipboard restored"
+                        : "Failed to prepare pasteboard and clipboard restore is unresolved"))
             }
             switch transaction.post() {
             case .ownershipLost:

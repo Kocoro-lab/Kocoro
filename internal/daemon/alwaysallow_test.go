@@ -223,7 +223,7 @@ func TestHandleAlwaysAllowDecision_BashNamedAgent(t *testing.T) {
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
 
 	HandleAlwaysAllowDecision(deps, broker, "writer", "bash",
-		`{"command":"find /tmp -name '*.log' | head -5"}`)
+		`{"command":"find /tmp -name '*.log' | head -5"}`, true)
 
 	// (a) persisted to per-agent always_allow_tools
 	got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "writer")
@@ -258,7 +258,7 @@ func TestHandleAlwaysAllowDecision_BashDefaultAgent_GlobalToolLevel(t *testing.T
 	// Genuinely-prompted command (not default-safe), agent name empty
 	// (== Default agent path).
 	HandleAlwaysAllowDecision(deps, broker, "", "bash",
-		`{"command":"find /Users/me -name '*.pdf' -delete"}`)
+		`{"command":"find /Users/me -name '*.pdf' -delete"}`, true)
 
 	// (a) "bash" persisted to GLOBAL always_allow_tools — both in-memory and
 	// on disk via config.AppendGlobalAlwaysAllowTool.
@@ -303,7 +303,7 @@ func TestHandleAlwaysAllowDecision_NonBashDefaultAgent_GlobalToolLevel(t *testin
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
 
 	HandleAlwaysAllowDecision(deps, broker, "", "file_write",
-		`{"path":"/tmp/x.html","content":"<html></html>","description":"creates test landing page"}`)
+		`{"path":"/tmp/x.html","content":"<html></html>","description":"creates test landing page"}`, true)
 
 	// Disk: global always_allow_tools contains file_write.
 	cfgData, _ := os.ReadFile(filepath.Join(deps.ShannonDir, "config.yaml"))
@@ -328,6 +328,36 @@ func TestHandleAlwaysAllowDecision_NonBashDefaultAgent_GlobalToolLevel(t *testin
 	}
 }
 
+// The persistent global Computer Use grant also authorizes UNATTENDED runs, so
+// it may only be minted from a loopback surface the user is physically at. A tap
+// in Slack or on a paired phone is honored for that call only — otherwise a
+// remote tap would permanently license 3am schedules to drive this Mac. This
+// mirrors the X-Kocoro-Local-Presence requirement on POST
+// /permissions/always-allow.
+func TestHandleAlwaysAllowDecision_ComputerUseRemoteSurfaceDoesNotPersistGrant(t *testing.T) {
+	deps := newDepsWithConfig(t, "operator")
+	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
+
+	HandleAlwaysAllowDecision(deps, broker, "operator", "computer_use",
+		`{"action":"click","x":12,"y":34,"description":"Click target"}`, false)
+
+	for _, tool := range deps.Config.Permissions.AlwaysAllowTools {
+		if tool == "computer_use" {
+			t.Fatal("remote approval surface minted the persistent global Computer Use grant")
+		}
+	}
+	if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 0 {
+		t.Fatalf("remote approval surface wrote a per-agent grant: %v", got)
+	}
+	cfgData, err := os.ReadFile(filepath.Join(deps.ShannonDir, "config.yaml"))
+	if err == nil && strings.Contains(string(cfgData), "computer_use") {
+		t.Fatalf("global config must not contain computer_use, got:\n%s", cfgData)
+	}
+	if broker.IsToolAutoApproved("computer_use") {
+		t.Fatal("remote approval surface must not set session-wide auto-approve")
+	}
+}
+
 // Computer Use is one product-level permission, so clicking Always Allow from
 // any named agent must persist globally instead of creating a per-agent grant.
 func TestHandleAlwaysAllowDecision_ComputerUseNamedAgentPersistsGlobally(t *testing.T) {
@@ -335,7 +365,7 @@ func TestHandleAlwaysAllowDecision_ComputerUseNamedAgentPersistsGlobally(t *test
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
 
 	HandleAlwaysAllowDecision(deps, broker, "operator", "computer_use",
-		`{"action":"click","x":12,"y":34,"description":"Click target"}`)
+		`{"action":"click","x":12,"y":34,"description":"Click target"}`, true)
 
 	if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 0 {
 		t.Fatalf("computer_use must not create a per-agent grant, got %v", got)
@@ -397,7 +427,7 @@ func TestHandleAlwaysAllowDecision_NonBashDefaultAgent_FormerlyHighRiskPersists(
 	defer deps.EventBus.Unsubscribe(ch)
 
 	HandleAlwaysAllowDecision(deps, broker, "", "publish_to_web",
-		`{"path":"/tmp/x.html","purpose":"share with user"}`)
+		`{"path":"/tmp/x.html","purpose":"share with user"}`, true)
 
 	found := false
 	for _, t := range deps.Config.Permissions.AlwaysAllowTools {
@@ -440,7 +470,7 @@ func TestHandleAlwaysAllowDecision_BashHighRiskNotPersisted(t *testing.T) {
 	defer deps.EventBus.Unsubscribe(ch)
 
 	HandleAlwaysAllowDecision(deps, broker, "writer", "bash",
-		`{"command":"pip install requests"}`)
+		`{"command":"pip install requests"}`, true)
 
 	// Nothing persisted to per-agent file
 	if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "writer"); len(got) != 0 {
@@ -493,7 +523,7 @@ func TestAlwaysAllowNotice_I18nStructuredPayload(t *testing.T) {
 			name: "bash always-ask command",
 			invoke: func() {
 				HandleAlwaysAllowDecision(deps, broker, "writer", "bash",
-					`{"command":"pip install requests","description":"install requests"}`)
+					`{"command":"pip install requests","description":"install requests"}`, true)
 			},
 			wantCode: NoticeCodeBashAlwaysAskNotPersisted,
 			wantTool: "bash",

@@ -3222,7 +3222,7 @@ func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 		Agent:     h.agent,
 	}, tool, args)
 	if decision == DecisionAlwaysAllow {
-		HandleAlwaysAllowDecision(h.deps, h.broker, h.agent, tool, args)
+		HandleAlwaysAllowDecision(h.deps, h.broker, h.agent, tool, args, true)
 	}
 	return decision == DecisionAllow || decision == DecisionAlwaysAllow
 }

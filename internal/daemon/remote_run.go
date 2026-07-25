@@ -626,7 +626,7 @@ func (h *remoteRunEventHandler) OnApprovalNeeded(tool string, args string) bool 
 		Agent:     h.agent,
 	}, tool, args)
 	if decision == DecisionAlwaysAllow && h.server != nil && h.server.deps != nil {
-		HandleAlwaysAllowDecision(h.server.deps, h.broker, h.agent, tool, args)
+		HandleAlwaysAllowDecision(h.server.deps, h.broker, h.agent, tool, args, false)
 	}
 	return decision == DecisionAllow || decision == DecisionAlwaysAllow
 }
