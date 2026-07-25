@@ -9,27 +9,33 @@ struct InputDriver {
         switch type {
         case "click":
             let (btn, down, up) = mouseConstants(button)
-            movePointer(to: point)
+            if let error = movePointer(to: point) {
+                return (nil, error)
+            }
             for i in 0..<clicks {
-                if let event = CGEvent(mouseEventSource: nil, mouseType: down,
-                                       mouseCursorPosition: point, mouseButton: btn) {
-                    if clicks > 1 {
-                        event.setIntegerValueField(.mouseEventClickState, value: Int64(i + 1))
-                    }
-                    event.post(tap: .cghidEventTap)
+                guard let downEvent = CGEvent(mouseEventSource: nil, mouseType: down,
+                                              mouseCursorPosition: point, mouseButton: btn),
+                      let upEvent = CGEvent(mouseEventSource: nil, mouseType: up,
+                                            mouseCursorPosition: point, mouseButton: btn) else {
+                    return (nil, ErrorInfo(code: -1, message: "failed to create mouse click event"))
                 }
-                if let event = CGEvent(mouseEventSource: nil, mouseType: up,
-                                       mouseCursorPosition: point, mouseButton: btn) {
-                    if clicks > 1 {
-                        event.setIntegerValueField(.mouseEventClickState, value: Int64(i + 1))
-                    }
-                    event.post(tap: .cghidEventTap)
+                if clicks > 1 {
+                    downEvent.setIntegerValueField(.mouseEventClickState, value: Int64(i + 1))
+                    upEvent.setIntegerValueField(.mouseEventClickState, value: Int64(i + 1))
+                }
+                guard postMousePair(
+                    down: downEvent, up: upEvent, buttonName: button, button: btn) else {
+                    return (nil, ErrorInfo(
+                        code: -1,
+                        message: "input commit blocked or mouse release unconfirmed"))
                 }
             }
             return (ActionResult(result: "clicked \(button) at (\(Int(x)), \(Int(y))) \(clicks)x"), nil)
 
         case "move":
-            movePointer(to: point)
+            if let error = movePointer(to: point) {
+                return (nil, error)
+            }
             return (ActionResult(result: "moved to (\(Int(x)), \(Int(y)))"), nil)
 
         default:
@@ -39,11 +45,59 @@ struct InputDriver {
 
     /// Moves the user's real pointer before a coordinate or semantic click so
     /// GUI automation stays visible instead of teleporting a hidden event.
-    static func movePointer(to point: CGPoint) {
-        if let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
-                              mouseCursorPosition: point, mouseButton: .left) {
-            move.post(tap: .cghidEventTap)
+    static func movePointer(to point: CGPoint) -> ErrorInfo? {
+        let bounds = activeDisplayBounds()
+        guard !bounds.isEmpty, isPointOnScreen(point, displayBounds: bounds) else {
+            return ErrorInfo(code: -1, message: "mouse target is outside all active displays: (\(Int(point.x)), \(Int(point.y)))")
         }
+
+        guard let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                                 mouseCursorPosition: point, mouseButton: .left) else {
+            return ErrorInfo(code: -1, message: "failed to create mouse move event")
+        }
+        var observed: CGPoint?
+        var warpError: CGError?
+        guard processInputCommitGateV1.commitSample({
+            let result = CGWarpMouseCursorPosition(point)
+            guard result == .success else { warpError = result; return false }
+            _ = CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+            move.post(tap: .cghidEventTap)
+            observed = CGEvent(source: nil)?.location
+            return true
+        }) else {
+            if let warpError {
+                return ErrorInfo(
+                    code: -1,
+                    message: "failed to move mouse cursor (CGError \(warpError.rawValue))")
+            }
+            return ErrorInfo(code: -1, message: "input commit blocked during pointer move")
+        }
+
+        guard let observed, pointerReached(point, observed: observed) else {
+            let suffix = observed.map { " observed (\(Int($0.x)), \(Int($0.y)))" } ?? ""
+            return ErrorInfo(code: -1, message: "mouse cursor did not reach (\(Int(point.x)), \(Int(point.y)))\(suffix)")
+        }
+        return nil
+    }
+
+    static func isPointOnScreen(_ point: CGPoint, displayBounds: [CGRect]) -> Bool {
+        displayBounds.contains { $0.contains(point) }
+    }
+
+    static func pointerReached(_ requested: CGPoint, observed: CGPoint, tolerance: CGFloat = 2) -> Bool {
+        abs(requested.x - observed.x) <= tolerance && abs(requested.y - observed.y) <= tolerance
+    }
+
+    private static func activeDisplayBounds() -> [CGRect] {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else {
+            return []
+        }
+        var displays = Array(repeating: CGDirectDisplayID(), count: Int(count))
+        guard CGGetActiveDisplayList(count, &displays, &count) == .success else {
+            return []
+        }
+        return displays.prefix(Int(count)).map(CGDisplayBounds)
     }
 
     static func keyEvent(key: String, modifiers: [String]) -> (ActionResult?, ErrorInfo?) {
@@ -67,13 +121,9 @@ struct InputDriver {
             return (nil, ErrorInfo(code: -1, message: "unknown key: \(key)"))
         }
 
-        if let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) {
-            down.flags = flags
-            down.post(tap: .cghidEventTap)
-        }
-        if let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) {
-            up.flags = flags
-            up.post(tap: .cghidEventTap)
+        guard postKeyPair(keyCode: keyCode, flags: flags) else {
+            return (nil, ErrorInfo(
+                code: -1, message: "input commit blocked or key release unconfirmed"))
         }
 
         let modStr = modifiers.isEmpty ? "" : modifiers.joined(separator: "+") + "+"
@@ -84,57 +134,43 @@ struct InputDriver {
     /// because CGEvent synthetic keystrokes produce wrong output when an IME is active
     /// (macOS reads virtualKey=0 → 'a' instead of the Unicode string).
     static func typeText(_ text: String) -> (ActionResult?, ErrorInfo?) {
+        guard processInputCommitGateV1.canAdmitInput() else {
+            return (nil, ErrorInfo(code: -1, message: "input recovery is blocked"))
+        }
         let hasNonASCII = text.unicodeScalars.contains { $0.value > 0x7F }
 
         if hasNonASCII || text.count > 20 {
-            // Clipboard paste path — safe for CJK/emoji/long text
+            // Compatibility-only clipboard path. Clipboard bytes are never
+            // journaled, so a fatal crash cannot promise restoration; the Go
+            // caller receives commit-unknown when no acknowledgement arrives.
+            // While alive, reuse the target-bound transaction's change-count
+            // ownership guard so cleanup never overwrites newer user content.
             let pasteboard = NSPasteboard.general
-
-            // Save all pasteboard items (not just string) to preserve files/images/HTML
-            var savedItems: [[NSPasteboard.PasteboardType: Data]] = []
-            for item in pasteboard.pasteboardItems ?? [] {
-                var itemData: [NSPasteboard.PasteboardType: Data] = [:]
-                for type in item.types {
-                    if let data = item.data(forType: type) {
-                        itemData[type] = data
-                    }
+            guard let transaction = makeTargetBoundClipboardTransaction(
+                text, pasteboard: pasteboard,
+                waitBeforeRestore: { Thread.sleep(forTimeInterval: 0.1) }) else {
+                return (nil, ErrorInfo(code: -1, message: "Failed to prepare pasteboard"))
+            }
+            switch transaction.post() {
+            case .ownershipLost:
+                return (nil, ErrorInfo(
+                    code: -1,
+                    message: "clipboard ownership lost before paste; newer content preserved"))
+            case .failed:
+                let restored = transaction.restore()
+                return (nil, ErrorInfo(
+                    code: -1,
+                    message: restored
+                        ? "paste input commit blocked or key release unconfirmed"
+                        : "paste failed and clipboard restore is unresolved"))
+            case .committed:
+                guard transaction.restore() else {
+                    return (nil, ErrorInfo(
+                        code: -1,
+                        message: "paste committed but clipboard restore is unresolved"))
                 }
-                if !itemData.isEmpty { savedItems.append(itemData) }
             }
-
-            pasteboard.clearContents()
-            guard pasteboard.setString(text, forType: .string) else {
-                return (nil, ErrorInfo(code: -1, message: "Failed to set pasteboard"))
-            }
-            // Cmd+V
-            let vKey: CGKeyCode = 0x09
-            if let down = CGEvent(keyboardEventSource: nil, virtualKey: vKey, keyDown: true) {
-                down.flags = .maskCommand
-                down.post(tap: .cghidEventTap)
-            }
-            if let up = CGEvent(keyboardEventSource: nil, virtualKey: vKey, keyDown: false) {
-                up.flags = .maskCommand
-                up.post(tap: .cghidEventTap)
-            }
-            // Wait for paste to complete before restoring clipboard
-            Thread.sleep(forTimeInterval: 0.1)
-
-            // Restore original pasteboard contents
-            pasteboard.clearContents()
-            if !savedItems.isEmpty {
-                var pbItems: [NSPasteboardItem] = []
-                for itemData in savedItems {
-                    let pbItem = NSPasteboardItem()
-                    for (type, data) in itemData {
-                        pbItem.setData(data, forType: type)
-                    }
-                    pbItems.append(pbItem)
-                }
-                pasteboard.writeObjects(pbItems)
-            }
-
-            let method = hasNonASCII ? "paste (non-ASCII)" : "paste (long text)"
-            return (ActionResult(result: "typed via \(method): \(text)"), nil)
+            return (ActionResult(result: "typed text (content redacted)"), nil)
         }
 
         // Short ASCII text — direct keystroke synthesis
@@ -152,23 +188,23 @@ struct InputDriver {
             var flags: CGEventFlags = []
             if needsShift { flags.insert(.maskShift) }
 
-            if let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) {
-                down.flags = flags
-                down.post(tap: .cghidEventTap)
-            }
-            if let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) {
-                up.flags = flags
-                up.post(tap: .cghidEventTap)
+            guard postKeyPair(keyCode: keyCode, flags: flags) else {
+                return (nil, ErrorInfo(
+                    code: -1, message: "text input commit blocked or key release unconfirmed"))
             }
             Thread.sleep(forTimeInterval: 0.01)
         }
-        return (ActionResult(result: "typed: \(text)"), nil)
+        return (ActionResult(result: "typed text (content redacted)"), nil)
     }
 
     static func scroll(dx: Int, dy: Int) {
-        if let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
-                               wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0) {
+        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
+                                  wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0) else {
+            return
+        }
+        _ = processInputCommitGateV1.commitSample {
             event.post(tap: .cghidEventTap)
+            return true
         }
     }
 
@@ -179,6 +215,43 @@ struct InputDriver {
         default:
             return (.left, .leftMouseDown, .leftMouseUp)
         }
+    }
+
+    private static func postMousePair(
+        down: CGEvent,
+        up: CGEvent,
+        buttonName: String,
+        button: CGMouseButton
+    ) -> Bool {
+        let normalized = buttonName.lowercased() == "right" ? "right" : "left"
+        let release = PreparedInputReleaseV1(metadata: .mouse(button: normalized)) {
+            up.post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: 0.005)
+            return !CGEventSource.buttonState(.combinedSessionState, button: button)
+        }
+        guard let token = processInputCommitGateV1.registerPress(
+            release: release,
+            commitDown: { down.post(tap: .cghidEventTap); return true }) else { return false }
+        return processInputCommitGateV1.confirmRelease(token: token)
+    }
+
+    private static func postKeyPair(keyCode: CGKeyCode, flags: CGEventFlags) -> Bool {
+        guard let down = CGEvent(
+            keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(
+                keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else { return false }
+        down.flags = flags
+        up.flags = flags
+        let release = PreparedInputReleaseV1(metadata: .key(
+            virtualKey: UInt16(keyCode), eventFlags: flags.rawValue)) {
+            up.post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: 0.005)
+            return !CGEventSource.keyState(.combinedSessionState, key: keyCode)
+        }
+        guard let token = processInputCommitGateV1.registerPress(
+            release: release,
+            commitDown: { down.post(tap: .cghidEventTap); return true }) else { return false }
+        return processInputCommitGateV1.confirmRelease(token: token)
     }
 }
 

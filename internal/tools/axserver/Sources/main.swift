@@ -39,6 +39,14 @@ if let idx = args.firstIndex(of: "--socket"), idx + 1 < args.count {
 
 // MARK: - Normal Stdin Loop Mode
 
+// Every helper start is the daemon's one-shot recovery watchdog: a valid,
+// redacted release journal is consumed before any new mutation can commit.
+// Malformed or unconfirmed recovery fails the process-global input gate closed;
+// observation RPCs remain available for diagnosis.
+_ = processInputCommitGateV1.recoverAtStartup()
+let stdinShutdownController = SocketServerShutdownController(socketPath: nil)
+stdinShutdownController.installSignalSources()
+
 // Check accessibility permission once at startup.
 guard AXIsProcessTrusted() else {
     let err = Response(id: 0, error: ErrorInfo(code: -1,
@@ -47,40 +55,280 @@ guard AXIsProcessTrusted() else {
     exit(1)
 }
 
-let encoder = JSONEncoder()
-encoder.outputFormatting = [.sortedKeys]
+let encoder = makeWireEncoder()
 let decoder = JSONDecoder()
 
 // Persistent stdin read loop — one JSON request per line.
 while let line = readLine(strippingNewline: true) {
     guard let data = line.data(using: .utf8) else { continue }
+    writeResponse(dispatchWireRequest(data, decoder: decoder))
+}
+stdinShutdownController.stop(signal: 0, terminate: false)
 
-    guard let req = try? decoder.decode(Request.self, from: data) else {
-        let resp = Response(id: 0, error: ErrorInfo(code: -1, message: "Invalid JSON request"))
-        writeResponse(resp)
-        continue
-    }
+// MARK: - Dispatch
 
-    let params = req.params ?? Params(
+private struct WireRequestHeader: Decodable {
+    let id: Int64
+    let method: String
+}
+
+func emptyParams() -> Params {
+    Params(
+        schemaVersion: nil, topologyRef: nil,
         pid: nil, maxDepth: nil, semanticBudget: nil, filter: nil,
-        path: nil, expectedRole: nil, value: nil, appName: nil,
+        path: nil, expectedRole: nil, expectedFingerprint: nil,
+        windowID: nil, bundleID: nil, expectedQuartzBounds: nil,
+        fallbackPolicy: nil, value: nil, appName: nil,
         query: nil, role: nil, identifier: nil, type: nil,
         x: nil, y: nil, button: nil, clicks: nil,
         key: nil, modifiers: nil, dx: nil, dy: nil,
         windowTitle: nil, verify: nil, condition: nil,
-        timeout: nil, interval: nil, roles: nil, maxLabels: nil
-    )
-
-    let response = dispatch(id: req.id, method: req.method, params: params)
-    writeResponse(response)
+        timeout: nil, interval: nil, roles: nil, maxLabels: nil)
 }
 
-// MARK: - Dispatch
+/// Routes the coordinate mutation through its method-specific exact-key
+/// decoder while preserving the existing permissive Request/Params decoder for
+/// every legacy RPC.
+func dispatchWireRequest(
+    _ data: Data,
+    decoder: JSONDecoder = JSONDecoder(),
+    coordinateDependencies: CoordinateMouseEventDependencies =
+        productionCoordinateMouseEventDependencies,
+    coordinateDragDependencies: CoordinateDragDependencies? = nil,
+    coordinatePixelScrollDependenciesV1: CoordinatePixelScrollDependenciesV1? = nil,
+    semanticTextSelectionDependencies: SemanticTextSelectionDependencies =
+        productionSemanticTextSelectionDependencies,
+    semanticTextSelectionDependenciesV2: SemanticTextSelectionDependenciesV2 =
+        productionSemanticTextSelectionDependenciesV2,
+    semanticPressDependenciesV2: SemanticPressDependenciesV2 =
+        productionSemanticPressDependenciesV2,
+    semanticScrollDependenciesV1: SemanticScrollDependenciesV1? = nil,
+    targetBoundInputDependencies: TargetBoundInputDependencies? = nil,
+    coordinateDisplayDependencies: CaptureCoordinateDisplayDependencies =
+        productionCaptureCoordinateDisplayDependencies
+) -> Response {
+    guard let header = try? decoder.decode(WireRequestHeader.self, from: data) else {
+        return Response(
+            id: 0,
+            error: ErrorInfo(code: -1, message: "Invalid JSON request"))
+    }
+    if header.method == "coordinate_mouse_event" {
+        do {
+            let request = try decodeCoordinateMouseEventRPCRequestV1(data)
+            let result = runCoordinateMouseEventWithModifiersV1(
+                request: request.params,
+                dependencies: coordinateDependencies)
+            return Response(id: request.id, result: AnyCodable(result))
+        } catch {
+            return Response(
+                id: header.id,
+                result: AnyCodable(CoordinateMouseEventResultV1(
+                    status: "failed",
+                    action: "unknown",
+                    primaryActionCommitted: false,
+                    pointerMotionCommitted: false,
+                    phase: "preflight",
+                    failureCode: "invalid_request",
+                    pointerEndpoint: nil)))
+        }
+    }
+    if header.method == "coordinate_drag" {
+        do {
+            let request = try decodeCoordinateDragRPCRequestV1(data)
+            let cancellationURL = coordinateDragCancellationMarkerURL(
+                requestID: request.id, helperBootID: request.params.helperBootID)
+            defer { try? FileManager.default.removeItem(at: cancellationURL) }
+            let result = runCoordinateDragWithModifiersV1(
+                request: request.params,
+                dependencies: coordinateDragDependencies ?? productionCoordinateDragDependencies(
+                    requestID: request.id,
+                    helperBootID: request.params.helperBootID))
+            return Response(id: request.id, result: AnyCodable(result))
+        } catch {
+            return Response(
+                id: header.id,
+                result: AnyCodable(CoordinateDragResultV1(
+                    status: "failed", dragCommitted: false,
+                    mouseDownCommitted: false, pointerMotionCommitted: false,
+                    mouseUpCommitted: false, possibleDropSideEffect: false,
+                    phase: "preflight", failureCode: "invalid_request",
+                    postcondition: nil, pointerEndpoint: nil)))
+        }
+    }
+    if header.method == "coordinate_pixel_scroll" {
+        do {
+            let request = try decodeCoordinatePixelScrollRPCRequestV1(data)
+            let cancellationURL = coordinatePixelScrollCancellationMarkerURL(
+                requestID: request.id, helperBootID: request.params.helperBootID)
+            defer { try? FileManager.default.removeItem(at: cancellationURL) }
+            let result = runCoordinatePixelScrollWithModifiersV1(
+                request: request.params,
+                dependencies: coordinatePixelScrollDependenciesV1 ??
+                    productionCoordinatePixelScrollDependenciesV1(
+                        requestID: request.id,
+                        helperBootID: request.params.helperBootID,
+                        modifiers: request.params.modifiers))
+            return Response(id: request.id, result: AnyCodable(result))
+        } catch {
+            return Response(
+                id: header.id,
+                result: AnyCodable(CoordinatePixelScrollResultV1(
+                    status: "failed",
+                    pointerMoveCommitState: .notCommitted,
+                    scrollCommitState: .notCommitted,
+                    phase: "preflight", failureCode: "invalid_request",
+                    requested: nil, pointerEndpoint: nil)))
+        }
+    }
+    if header.method == "semantic_text_selection" {
+        do {
+            let request = try decodeSemanticTextSelectionRPCRequestV1(data)
+            let result = runSemanticTextSelection(
+                request: request.params,
+                dependencies: semanticTextSelectionDependencies)
+            return Response(id: request.id, result: AnyCodable(result))
+        } catch {
+            return Response(
+                id: header.id,
+                result: AnyCodable(SemanticTextSelectionResultV1(
+                    status: "failed", selectionCommitted: false,
+                    phase: "preflight", failureCode: "invalid_request",
+                    postcondition: nil, selectedRange: nil)))
+        }
+    }
+    if header.method == "semantic_text_selection_v2" {
+        do {
+            let request = try decodeSemanticTextSelectionRPCRequestV2(data)
+            let result = runSemanticTextSelectionV2(
+                request: request.params,
+                dependencies: semanticTextSelectionDependenciesV2)
+            return Response(id: request.id, result: AnyCodable(result))
+        } catch {
+            return Response(
+                id: header.id,
+                result: AnyCodable(SemanticTextSelectionResultV2(
+                    status: "failed", commitState: "not_committed",
+                    phase: "preflight", failureCode: "invalid_request")))
+        }
+    }
+    if header.method == "semantic_press_v2" {
+        do {
+            let request = try decodeSemanticPressRPCRequestV2(data)
+            let result = runSemanticPressV2(
+                request: request.params,
+                dependencies: semanticPressDependenciesV2)
+            return Response(id: request.id, result: AnyCodable(result))
+        } catch {
+            return Response(
+                id: header.id,
+                result: AnyCodable(SemanticPressResultV2(
+                    status: "failed", commitState: "not_committed",
+                    phase: "preflight", failureCode: "invalid_request")))
+        }
+    }
+    if header.method == "semantic_scroll_v1" {
+        do {
+            let request = try decodeSemanticScrollRPCRequestV1(data)
+            let result = runSemanticScrollV1(
+                request: request.params,
+                dependencies: semanticScrollDependenciesV1 ??
+                    productionSemanticScrollDependenciesV1(
+                        requestID: request.id, request: request.params))
+            return Response(id: request.id, result: AnyCodable(result))
+        } catch {
+            return Response(
+                id: header.id,
+                result: AnyCodable(SemanticScrollResultV1(
+                    status: "failed", commitState: "not_committed",
+                    phase: "preflight", failureCode: "invalid_request")))
+        }
+    }
+    if header.method == "target_bound_input" {
+        do {
+            let request = try decodeTargetBoundInputRPCRequestV1(data)
+            let cancellationURL = targetBoundInputCancellationMarkerURLV1(
+                requestID: request.id, request: request.params)
+            defer { try? FileManager.default.removeItem(at: cancellationURL) }
+            let result = runTargetBoundInput(
+                request: request.params,
+                dependencies: targetBoundInputDependencies ??
+                    productionTargetBoundInputDependenciesV1(isCancelled: {
+                        FileManager.default.fileExists(atPath: cancellationURL.path)
+                    }))
+            return Response(id: request.id, result: AnyCodable(result))
+        } catch {
+            return Response(
+                id: header.id,
+                result: AnyCodable(TargetBoundInputResultV1(
+                    status: "failed", action: "unknown",
+                    inputCommitted: false, clipboardTouched: false,
+                    clipboardRestored: false, phase: "preflight",
+                    failureCode: "invalid_request")))
+        }
+    }
+    if header.method == "capture_coordinate_display" {
+        do {
+            let request = try decodeCaptureCoordinateDisplayRPCRequestV1(data)
+            let result = captureCoordinateDisplay(
+                request: request.params,
+                dependencies: coordinateDisplayDependencies)
+            return Response(id: request.id, result: AnyCodable(result))
+        } catch {
+            return Response(
+                id: header.id,
+                result: AnyCodable(CaptureCoordinateDisplayResultV1.failed(
+                    code: "invalid_request",
+                    retrySafe: false)))
+        }
+    }
 
-func dispatch(id: Int64, method: String, params: Params) -> Response {
+    guard let request = try? decoder.decode(Request.self, from: data) else {
+        return Response(
+            id: 0,
+            error: ErrorInfo(code: -1, message: "Invalid JSON request"))
+    }
+    return dispatch(
+        id: request.id,
+        method: request.method,
+        params: request.params ?? emptyParams())
+}
+
+func dispatch(
+    id: Int64,
+    method: String,
+    params: Params,
+    displayTopologyProvider: () throws -> DisplayTopologyV1 = {
+        try liveDisplayTopologyService.observe()
+    }
+) -> Response {
     switch method {
     case "ping":
         return Response(id: id, result: AnyCodable(["ok": true]))
+
+    case "display_topology":
+        do {
+            let topology = try displayTopologyProvider()
+            try topology.validate()
+            return Response(id: id, result: AnyCodable(topology))
+        } catch {
+            return Response(id: id, error: ErrorInfo(
+                code: -1,
+                message: "Cannot collect display topology: \(error)"))
+        }
+
+    case "capture_coordinate_window":
+        do {
+            let request = try CaptureCoordinateWindowRequestV1(params: params)
+            let result = captureCoordinateWindow(
+                request: request,
+                dependencies: productionCaptureCoordinateWindowDependencies)
+            return Response(id: id, result: AnyCodable(result))
+        } catch {
+            return Response(id: id, result: AnyCodable(
+                CaptureCoordinateWindowResultV1.failed(
+                    code: "invalid_request",
+                    retrySafe: false)))
+        }
 
     case "read_tree":
         let pid = params.pid ?? frontmostPID()
@@ -100,6 +348,23 @@ func dispatch(id: Int64, method: String, params: Params) -> Response {
             return Response(id: id, error: ErrorInfo(code: -1, message: "No accessible windows found for pid \(pid). Call launch_app to request a window; if the app exposes no AX tree, use a screenshot and coordinates."))
         }
         return Response(id: id, result: AnyCodable(result))
+
+    case "semantic_press":
+        do {
+            let request = try SemanticPressRequest(
+                pid: params.pid,
+                windowID: params.windowID,
+                path: params.path,
+                expectedRole: params.expectedRole,
+                expectedFingerprint: params.expectedFingerprint,
+                fallbackPolicy: params.fallbackPolicy)
+            let result = runSemanticPress(
+                request,
+                dependencies: productionSemanticPressDependencies())
+            return Response(id: id, result: AnyCodable(result))
+        } catch {
+            return Response(id: id, error: ErrorInfo(code: -1, message: "Invalid semantic_press request: \(error)"))
+        }
 
     case "click", "press":
         guard let pid = params.pid, let path = params.path else {
@@ -247,7 +512,17 @@ func dispatch(id: Int64, method: String, params: Params) -> Response {
         return Response(id: id, result: AnyCodable(result))
 
     case "capture_window":
-        let result = captureWindow(pid: params.pid, appName: params.appName, windowTitle: params.windowTitle)
+        let expectedBounds = params.expectedQuartzBounds.map {
+            AXFrame(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+        }
+        let result = captureWindow(
+            pid: params.pid,
+            appName: params.appName,
+            windowTitle: params.windowTitle,
+            windowID: params.windowID,
+            expectedBounds: expectedBounds,
+            signatureRoles: params.roles,
+            signatureMaxLabels: params.maxLabels ?? 50)
         return Response(id: id, result: AnyCodable(result))
 
     case "check_permissions":
@@ -269,6 +544,7 @@ func dispatch(id: Int64, method: String, params: Params) -> Response {
 // MARK: - Helpers
 
 func frontmostPID() -> Int {
+    refreshAppKitState()
     guard let app = NSWorkspace.shared.frontmostApplication else { return 0 }
     return Int(app.processIdentifier)
 }
@@ -334,6 +610,7 @@ func checkAutomation() -> String {
 }
 
 func ensureSystemEventsRunning() {
+    refreshAppKitState()
     let running = NSWorkspace.shared.runningApplications.contains {
         $0.bundleIdentifier == "com.apple.systemevents"
     }

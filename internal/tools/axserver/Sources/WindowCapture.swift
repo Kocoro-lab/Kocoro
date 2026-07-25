@@ -2,6 +2,64 @@ import Foundation
 import AppKit
 import CoreGraphics
 
+struct WindowCaptureCandidate: Equatable {
+    let id: CGWindowID
+    let ownerPID: Int
+    let layer: Int
+    let area: CGFloat
+    let title: String
+    let onScreen: Bool
+    let frame: AXFrame
+}
+
+private func captureWindowFramesMatch(_ lhs: AXFrame, _ rhs: AXFrame, tolerance: Double = 2) -> Bool {
+    abs(lhs.x - rhs.x) <= tolerance &&
+        abs(lhs.y - rhs.y) <= tolerance &&
+        abs(lhs.width - rhs.width) <= tolerance &&
+        abs(lhs.height - rhs.height) <= tolerance
+}
+
+func selectExactWindowCaptureCandidate(
+    pid: Int,
+    windowID: Int,
+    expectedBounds: AXFrame,
+    candidates: [WindowCaptureCandidate]
+) -> WindowCaptureCandidate? {
+    let matches = candidates.filter {
+        Int($0.id) == windowID && $0.ownerPID == pid && $0.layer == 0 &&
+            $0.onScreen && captureWindowFramesMatch($0.frame, expectedBounds)
+    }
+    return matches.count == 1 ? matches[0] : nil
+}
+
+private func currentWindowCaptureCandidates() -> [WindowCaptureCandidate]? {
+    let options: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+    guard let infoList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+        return nil
+    }
+    return infoList.compactMap { info in
+        guard let owner = (info[kCGWindowOwnerPID as String] as? NSNumber)?.intValue,
+              let number = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+              let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+              let rect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else {
+            return nil
+        }
+        let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1
+        let title = info[kCGWindowName as String] as? String ?? ""
+        let onScreen = (info[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false
+        return WindowCaptureCandidate(
+            id: number,
+            ownerPID: owner,
+            layer: layer,
+            area: rect.width * rect.height,
+            title: title,
+            onScreen: onScreen,
+            frame: AXFrame(
+                x: Double(rect.origin.x), y: Double(rect.origin.y),
+                width: Double(rect.width), height: Double(rect.height)))
+    }
+}
+
 /// Result of capture_window. Encoded into the NDJSON `result` field via AnyCodable.
 struct CaptureWindowResult: Codable {
     let ok: Bool
@@ -9,18 +67,29 @@ struct CaptureWindowResult: Codable {
     let imageBase64: String?
     let width: Int?
     let height: Int?
+    let contentSignature: String?
 
     enum CodingKeys: String, CodingKey {
         case ok, code
         case imageBase64 = "image_base64"
+        case contentSignature = "content_signature"
         case width, height
     }
 
     static func failure(_ code: String) -> CaptureWindowResult {
-        CaptureWindowResult(ok: false, code: code, imageBase64: nil, width: nil, height: nil)
+        CaptureWindowResult(
+            ok: false, code: code, imageBase64: nil,
+            width: nil, height: nil, contentSignature: nil)
     }
-    static func success(_ base64: String, _ w: Int, _ h: Int) -> CaptureWindowResult {
-        CaptureWindowResult(ok: true, code: nil, imageBase64: base64, width: w, height: h)
+    static func success(
+        _ base64: String,
+        _ w: Int,
+        _ h: Int,
+        contentSignature: String? = nil
+    ) -> CaptureWindowResult {
+        CaptureWindowResult(
+            ok: true, code: nil, imageBase64: base64,
+            width: w, height: h, contentSignature: contentSignature)
     }
 }
 
@@ -35,10 +104,19 @@ struct CaptureWindowResult: Codable {
 /// process (its own session) and works with ax_server's existing Screen
 /// Recording grant.
 ///
-/// Window selection: if `windowTitle` is given, the first on-screen normal
-/// window of the pid whose title contains it (case-insensitive); else the
-/// largest on-screen normal window of the pid.
-func captureWindow(pid: Int?, appName: String?, windowTitle: String?) -> CaptureWindowResult {
+/// Window selection: callers that supply `windowID` and `expectedBounds` get
+/// exact PID/ID/bounds admission with an on-screen requirement and a post-
+/// capture recheck. Legacy callers without exact identity retain title/largest
+/// selection for compatibility.
+func captureWindow(
+    pid: Int?,
+    appName: String?,
+    windowTitle: String?,
+    windowID: Int? = nil,
+    expectedBounds: AXFrame? = nil,
+    signatureRoles: [String]? = nil,
+    signatureMaxLabels: Int = 50
+) -> CaptureWindowResult {
     // Passive grant check — never prompts (the Desktop drives request_permission).
     guard CGPreflightScreenCaptureAccess() else {
         return .failure("screen_recording_denied")
@@ -57,41 +135,32 @@ func captureWindow(pid: Int?, appName: String?, windowTitle: String?) -> Capture
     // .optionAll (NOT .optionOnScreenOnly) so an app the user keeps on another
     // Space (or minimized) is still found — screencapture -l can grab another
     // Space's window. We prefer an on-screen window in selection below.
-    let options: CGWindowListOption = [.optionAll, .excludeDesktopElements]
-    guard let infoList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+    guard let allCandidates = currentWindowCaptureCandidates() else {
         return .failure("window_not_found")
     }
-
-    struct Candidate { let id: CGWindowID; let area: CGFloat; let title: String; let onScreen: Bool }
-    var candidates: [Candidate] = []
-    for info in infoList {
-        guard let owner = (info[kCGWindowOwnerPID as String] as? NSNumber)?.intValue,
-              owner == targetPID else { continue }
-        // Layer 0 = normal app windows (excludes menubar/dock/overlays).
-        let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1
-        guard layer == 0 else { continue }
-        guard let number = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value else { continue }
-        let title = info[kCGWindowName as String] as? String ?? ""
-        let onScreen = (info[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false
-        var area: CGFloat = 0
-        if let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
-           let rect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) {
-            area = rect.width * rect.height
-        }
-        candidates.append(Candidate(id: number, area: area, title: title, onScreen: onScreen))
-    }
+    let candidates = allCandidates.filter { $0.ownerPID == targetPID && $0.layer == 0 }
     guard !candidates.isEmpty else {
         return .failure("window_not_found")
     }
 
     // Prefer an on-screen window, then the largest by area (the main window is
     // almost always the biggest; thin toolbar/strip windows rank below it).
-    let better: (Candidate, Candidate) -> Bool = { a, b in
+    let better: (WindowCaptureCandidate, WindowCaptureCandidate) -> Bool = { a, b in
         if a.onScreen != b.onScreen { return !a.onScreen }   // off-screen ranks lower
         return a.area < b.area
     }
-    let chosen: Candidate
-    if let want = windowTitle, !want.isEmpty {
+    let chosen: WindowCaptureCandidate
+    if let exactID = windowID {
+        guard let expectedBounds,
+              let exact = selectExactWindowCaptureCandidate(
+                pid: targetPID,
+                windowID: exactID,
+                expectedBounds: expectedBounds,
+                candidates: allCandidates) else {
+            return .failure("window_not_found")
+        }
+        chosen = exact
+    } else if let want = windowTitle, !want.isEmpty {
         guard let match = candidates
             .filter({ $0.title.range(of: want, options: .caseInsensitive) != nil })
             .max(by: better) else {
@@ -105,28 +174,43 @@ func captureWindow(pid: Int?, appName: String?, windowTitle: String?) -> Capture
     // Capture the chosen window by id via the system screencapture binary.
     let tmpPath = (NSTemporaryDirectory() as NSString)
         .appendingPathComponent("kocoro-capwin-\(UUID().uuidString).png")
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    defer { try? FileManager.default.removeItem(atPath: tmpPath) }
     // -x: silent · -o: omit window shadow · -l<id>: capture that window's content
-    proc.arguments = ["-x", "-o", "-l\(chosen.id)", tmpPath]
     do {
-        try proc.run()
+        try runCoordinateWindowCaptureProcess(
+            executableURL: URL(fileURLWithPath: "/usr/sbin/screencapture"),
+            arguments: ["-x", "-o", "-l\(chosen.id)", tmpPath],
+            timeout: 8)
     } catch {
         return .failure("window_not_found")
     }
-    defer { try? FileManager.default.removeItem(atPath: tmpPath) }
-    // Watchdog: screencapture can hang (window-server stall, target window vanished
-    // mid-capture, heavy load). ax_server serves requests serially, so an unbounded
-    // waitUntilExit() here would wedge EVERY subsequent AX call until the helper is
-    // killed by hand. Bound it, then SIGTERM and fail closed (the 3-code contract has
-    // no generic capture-failure code, so collapse to window_not_found).
-    let captureDeadline = Date().addingTimeInterval(8)
-    while proc.isRunning && Date() < captureDeadline {
-        Thread.sleep(forTimeInterval: 0.05)
-    }
-    if proc.isRunning {
-        proc.terminate()
-        return .failure("window_not_found")
+
+    // Exact legacy Accessibility annotations are bound to the AX window frame
+    // observed immediately before capture. If that window moved, disappeared,
+    // or became off-screen during screencapture, discard the pixels rather than
+    // drawing labels against stale geometry.
+    var postCaptureContentSignature: String?
+    if let exactID = windowID, let expectedBounds {
+        guard let postCandidates = currentWindowCaptureCandidates(),
+              selectExactWindowCaptureCandidate(
+                pid: targetPID,
+                windowID: exactID,
+                expectedBounds: expectedBounds,
+                candidates: postCandidates) != nil else {
+            return .failure("window_not_found")
+        }
+        guard signatureMaxLabels > 0,
+              let postAnnotation = annotateElements(
+                pid: targetPID,
+                roles: signatureRoles,
+                maxLabels: signatureMaxLabels),
+              postAnnotation.windowID == exactID,
+              let postFrame = postAnnotation.windowFrame,
+              captureWindowFramesMatch(postFrame, expectedBounds),
+              !postAnnotation.contentSignature.isEmpty else {
+            return .failure("window_content_unavailable")
+        }
+        postCaptureContentSignature = postAnnotation.contentSignature
     }
 
     guard let data = FileManager.default.contents(atPath: tmpPath), !data.isEmpty else {
@@ -142,5 +226,7 @@ func captureWindow(pid: Int?, appName: String?, windowTitle: String?) -> Capture
     guard let rep = NSBitmapImageRep(data: data) else {
         return .failure("window_not_found")
     }
-    return .success(data.base64EncodedString(), rep.pixelsWide, rep.pixelsHigh)
+    return .success(
+        data.base64EncodedString(), rep.pixelsWide, rep.pixelsHigh,
+        contentSignature: postCaptureContentSignature)
 }

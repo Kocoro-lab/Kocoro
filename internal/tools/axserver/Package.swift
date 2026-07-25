@@ -9,5 +9,10 @@ let package = Package(
             name: "ax_server",
             path: "Sources"
         ),
+        .testTarget(
+            name: "ax_serverTests",
+            dependencies: ["ax_server"],
+            path: "Tests"
+        ),
     ]
 )

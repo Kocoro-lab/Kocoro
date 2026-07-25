@@ -21,17 +21,57 @@ func axChildren(_ el: AXUIElement) -> [AXUIElement]? {
     axValue(el, "AXChildren") as? [AXUIElement]
 }
 
+func axActions(_ el: AXUIElement) -> [String] {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(el, &names) == .success,
+          let actions = names as? [String] else {
+        return []
+    }
+    return actions.sorted()
+}
+
+func axFocusedElement(_ appRef: AXUIElement) -> AXUIElement? {
+    guard let value = axValue(appRef, "AXFocusedUIElement"),
+          CFGetTypeID(value) == AXUIElementGetTypeID() else {
+        return nil
+    }
+    return (value as! AXUIElement)
+}
+
+func axElementsEqual(_ lhs: AXUIElement, _ rhs: AXUIElement?) -> Bool {
+    guard let rhs else { return false }
+    return CFEqual(lhs, rhs)
+}
+
 /// Returns an app's AX windows with conservative fallbacks for frameworks
 /// that omit AXWindows while still exposing AXFocusedWindow or window-role
 /// children. Every caller uses the same ordering so generated ref paths remain
 /// stable between observation and stale-state preflight.
+func orderAXWindows(
+    _ windows: [AXUIElement],
+    focusedWindow: AXUIElement?
+) -> [AXUIElement] {
+    guard let focusedWindow else { return windows }
+    return [focusedWindow] + windows.filter { !CFEqual($0, focusedWindow) }
+}
+
 func axWindows(_ appRef: AXUIElement) -> [AXUIElement] {
-    if let windows = axValue(appRef, "AXWindows") as? [AXUIElement], !windows.isEmpty {
-        return windows
-    }
+    let focusedWindow: AXUIElement?
     if let focused = axValue(appRef, "AXFocusedWindow"),
        CFGetTypeID(focused) == AXUIElementGetTypeID() {
-        return [focused as! AXUIElement]
+        focusedWindow = (focused as! AXUIElement)
+    } else {
+        focusedWindow = nil
+    }
+    if let windows = axValue(appRef, "AXWindows") as? [AXUIElement], !windows.isEmpty {
+        // macOS may prepend a transient screen-sharing control window ahead
+        // of the app's real focused window. All observation and action paths
+        // go through this function, so focused-first remains deterministic
+        // while avoiding a tiny overlay becoming window[0].
+        return orderAXWindows(windows, focusedWindow: focusedWindow)
+    }
+    if let focusedWindow {
+        return [focusedWindow]
     }
     return (axChildren(appRef) ?? []).filter { axString($0, "AXRole") == "AXWindow" }
 }
@@ -76,6 +116,27 @@ func resolveElement(pid: Int, path: String) -> AXUIElement? {
             }
         }
         if !found { return nil }
+    }
+    return current
+}
+
+/// Resolves a read_tree path inside an already identity-verified window.
+/// Typed observations currently expose only window[0], so any other root is
+/// rejected instead of silently selecting a different live window.
+func resolveElement(in window: AXUIElement, path: String) -> AXUIElement? {
+    let allParts = path.split(separator: "/")
+    guard allParts.first == "window[0]" else { return nil }
+    var current = window
+    for part in allParts.dropFirst() {
+        guard let bracketStart = part.firstIndex(of: "["),
+              let bracketEnd = part.firstIndex(of: "]"),
+              let index = Int(part[part.index(after: bracketStart)..<bracketEnd]) else {
+            return nil
+        }
+        let role = String(part[part.startIndex..<bracketStart])
+        let matching = (axChildren(current) ?? []).filter { axString($0, "AXRole") == role }
+        guard index >= 0 && index < matching.count else { return nil }
+        current = matching[index]
     }
     return current
 }
@@ -191,6 +252,12 @@ private func findToolbarURLField(in el: AXUIElement) -> AXUIElement? {
 /// application. Matching stays exact so a main app cannot resolve to a
 /// similarly named renderer/helper process that has no AX windows.
 func resolveRunningApplication(appName: String) -> NSRunningApplication? {
+    // ax_server is a synchronous socket process whose main thread normally
+    // blocks in read(2), so AppKit never gets a natural run-loop turn. Without
+    // this pump, NSWorkspace.shared.runningApplications remains the snapshot
+    // from ax_server startup and cannot see apps launched later in the session.
+    refreshAppKitState()
+
     let requested = appName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     guard !requested.isEmpty else { return nil }
 
@@ -218,4 +285,15 @@ func resolvePID(appName: String) -> Int? {
         }
     }
     return nil
+}
+
+/// Gives AppKit a bounded chance to deliver workspace/frontmost-app updates.
+/// Keep this short: every ax_server request is serialized on the calling
+/// thread, but a blocked socket loop otherwise gives AppKit no run-loop turns.
+func refreshAppKitState(for interval: TimeInterval = 0.01) {
+    let deadline = Date(timeIntervalSinceNow: max(0, interval))
+    repeat {
+        let handledEvent = RunLoop.current.run(mode: .default, before: deadline)
+        if !handledEvent { break }
+    } while Date() < deadline
 }

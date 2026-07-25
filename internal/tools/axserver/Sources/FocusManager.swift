@@ -63,6 +63,7 @@ struct FocusManager {
         if verify {
             // Brief wait for activation
             Thread.sleep(forTimeInterval: 0.3)
+            refreshAppKitState()
             guard let frontmost = NSWorkspace.shared.frontmostApplication,
                   frontmost.processIdentifier == app.processIdentifier else {
                 return (nil, ErrorInfo(code: -1, message: "Failed to bring '\(appName)' to front"))
@@ -75,6 +76,7 @@ struct FocusManager {
 
     /// Returns the frontmost app's PID and window title.
     static func frontmost() -> (ActionResult?, ErrorInfo?) {
+        refreshAppKitState()
         guard let app = NSWorkspace.shared.frontmostApplication else {
             return (nil, ErrorInfo(code: -1, message: "Cannot determine frontmost application"))
         }
