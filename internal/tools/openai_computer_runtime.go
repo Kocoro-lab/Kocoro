@@ -175,6 +175,13 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerObservationV1(
 		return OpenAIComputerActionPlanV1{},
 			fmt.Errorf("OpenAI computer observation description is required")
 	}
+	if includeScreenshot {
+		// The next provider image must show the window that is actually
+		// frontmost after the ordered batch. Keeping the previous snapshot here
+		// would recapture the old app after Command-Tab and make multi-app tasks
+		// impossible.
+		r.raw.invalidateState()
+	}
 	return r.plan(computerUseArgs{
 		Action:            "get_app_state",
 		Description:       description,

@@ -23,15 +23,8 @@ type openAIComputerActionRuntimeV1 interface {
 	) (tools.OpenAIComputerActionPlanV1, error)
 }
 
-type openAIComputerFreshApprovalV1 func(
-	context.Context,
-	string,
-	string,
-) bool
-
 type daemonOpenAIComputerPrivateRuntimeV1 struct {
-	runtime      *tools.OpenAIComputerActionRuntimeV1
-	approvalCore agent.Tool
+	runtime *tools.OpenAIComputerActionRuntimeV1
 }
 
 // daemonOpenAIComputerBatchRunnerV1 is the daemon-owned AgentLoop callback.
@@ -39,15 +32,13 @@ type daemonOpenAIComputerPrivateRuntimeV1 struct {
 // while daemonGUIWorkflow retains the single turn lease across Responses
 // continuations.
 type daemonOpenAIComputerBatchRunnerV1 struct {
-	workflow     *daemonGUIWorkflow
-	runtime      openAIComputerActionRuntimeV1
-	approvalTool agent.Tool
+	workflow *daemonGUIWorkflow
+	runtime  openAIComputerActionRuntimeV1
 }
 
 func newDaemonOpenAIComputerBatchRunnerV1(
 	workflow *daemonGUIWorkflow,
 	runtime openAIComputerActionRuntimeV1,
-	approvalTool agent.Tool,
 ) (*daemonOpenAIComputerBatchRunnerV1, error) {
 	if workflow == nil || workflow.coordinator == nil {
 		return nil, fmt.Errorf("OpenAI computer daemon workflow is unavailable")
@@ -55,13 +46,9 @@ func newDaemonOpenAIComputerBatchRunnerV1(
 	if runtime == nil {
 		return nil, fmt.Errorf("OpenAI computer action runtime is unavailable")
 	}
-	if approvalTool == nil || approvalTool.Info().Name != "computer_use" {
-		return nil, fmt.Errorf("OpenAI computer approval tool is unavailable")
-	}
 	return &daemonOpenAIComputerBatchRunnerV1{
-		workflow:     workflow,
-		runtime:      runtime,
-		approvalTool: approvalTool,
+		workflow: workflow,
+		runtime:  runtime,
 	}, nil
 }
 
@@ -116,8 +103,7 @@ func detachDaemonOpenAIComputerPrivateRuntimeCoreV1(
 	}
 	registry.Remove("computer_use")
 	return &daemonOpenAIComputerPrivateRuntimeV1{
-		runtime:      runtime,
-		approvalCore: core,
+		runtime: runtime,
 	}, nil
 }
 
@@ -144,40 +130,15 @@ func retainDaemonOpenAIComputerPrivateRuntimeV1(
 	return profile, private
 }
 
-func installDaemonOpenAIComputerBatchRunnerV1(
-	loop *agent.AgentLoop,
-	workflow *daemonGUIWorkflow,
-	runtime *tools.OpenAIComputerActionRuntimeV1,
-	approvalTool agent.Tool,
-) error {
-	if runtime == nil {
-		return nil
-	}
-	if loop == nil || workflow == nil {
-		return fmt.Errorf("OpenAI computer AgentLoop installation is unavailable")
-	}
-	runner, err := newDaemonOpenAIComputerBatchRunnerV1(
-		workflow,
-		runtime,
-		approvalTool,
-	)
-	if err != nil {
-		return err
-	}
-	loop.SetOpenAIComputerBatchExecutor(runner)
-	return nil
-}
-
 func (r *daemonOpenAIComputerBatchRunnerV1) ExecuteOpenAIComputerBatch(
 	ctx context.Context,
 	profile *client.ExecutionProfile,
 	responseID string,
 	payload json.RawMessage,
 	safetyAcknowledgement *agent.OpenAIComputerSafetyAcknowledgement,
-	approve agent.OpenAIComputerFreshApproval,
 ) (agent.OpenAIComputerBatchExecution, error) {
 	if r == nil || r.workflow == nil || r.runtime == nil ||
-		r.approvalTool == nil || safetyAcknowledgement == nil || approve == nil {
+		safetyAcknowledgement == nil {
 		return agent.OpenAIComputerBatchExecution{},
 			fmt.Errorf("OpenAI computer daemon batch runner is unavailable")
 	}
@@ -207,9 +168,6 @@ func (r *daemonOpenAIComputerBatchRunnerV1) ExecuteOpenAIComputerBatch(
 		r.workflow,
 		r.runtime,
 		provenance,
-		func(approvalCtx context.Context, _ string, args string) bool {
-			return approve(approvalCtx, r.approvalTool, args)
-		},
 	)
 	if err != nil {
 		return agent.OpenAIComputerBatchExecution{}, err
@@ -220,7 +178,7 @@ func (r *daemonOpenAIComputerBatchRunnerV1) ExecuteOpenAIComputerBatch(
 		ExecuteBatchV1(ctx, payload)
 	return agent.OpenAIComputerBatchExecution{
 		CallID:              result.CallID,
-		ContinuationAllowed: executeErr == nil && !result.ToolResult.IsError,
+		ContinuationAllowed: executeErr == nil && len(result.ToolResult.Images) == 1,
 		Result:              result.ToolResult,
 	}, executeErr
 }
@@ -239,7 +197,6 @@ type daemonOpenAIComputerExecutorV1 struct {
 	workflow   *daemonGUIWorkflow
 	runtime    openAIComputerActionRuntimeV1
 	provenance tools.OpenAIComputerExecutionProvenanceV1
-	approve    openAIComputerFreshApprovalV1
 
 	authority       tools.OpenAIComputerBatchAuthorityV1
 	call            *tools.OpenAIComputerCallV1
@@ -252,7 +209,6 @@ func newDaemonOpenAIComputerExecutorV1(
 	workflow *daemonGUIWorkflow,
 	runtime openAIComputerActionRuntimeV1,
 	provenance tools.OpenAIComputerExecutionProvenanceV1,
-	approve openAIComputerFreshApprovalV1,
 ) (*daemonOpenAIComputerExecutorV1, error) {
 	if workflow == nil || workflow.coordinator == nil {
 		return nil, fmt.Errorf("OpenAI computer daemon workflow is unavailable")
@@ -263,12 +219,9 @@ func newDaemonOpenAIComputerExecutorV1(
 	if !provenance.IsTrusted() {
 		return nil, fmt.Errorf("OpenAI computer execution provenance is untrusted")
 	}
-	if approve == nil {
-		return nil, fmt.Errorf("OpenAI computer fresh approval seam is unavailable")
-	}
 	return &daemonOpenAIComputerExecutorV1{
 		workflow: workflow, runtime: runtime,
-		provenance: provenance, approve: approve,
+		provenance: provenance,
 	}, nil
 }
 
@@ -298,32 +251,10 @@ func (e *daemonOpenAIComputerExecutorV1) AcquireOpenAIComputerBatchAuthorityV1(
 			fmt.Errorf("OpenAI computer response provenance does not match")
 	}
 
-	// Classify the exact current target without committing GUI input. The
-	// resulting descriptor freezes the batch allowlist into one workflow lease.
-	plan, err := e.runtime.PlanOpenAIComputerObservationV1(
-		"Bind OpenAI native computer batch target",
-		false,
-	)
-	if err != nil {
-		return tools.OpenAIComputerBatchAuthorityV1{},
-			fmt.Errorf("OpenAI computer batch target could not be safely classified")
-	}
-	descriptor, err := describeOpenAIComputerPlanV1(ctx, plan, false)
-	if err != nil || descriptor.TargetBundleID == "" {
-		return tools.OpenAIComputerBatchAuthorityV1{},
-			fmt.Errorf("OpenAI computer batch target could not be safely classified")
-	}
-	if e.workflow.appPolicy != nil &&
-		e.workflow.appPolicy.DecisionFor(descriptor.TargetBundleID).Decision ==
-			ComputerUseAppPolicyBlocked {
-		return tools.OpenAIComputerBatchAuthorityV1{},
-			fmt.Errorf("OpenAI computer batch target is blocked by app policy")
-	}
-	// The runtime plan describes the exact current observation that was sent to
-	// the provider. Admit that already-observed target without pretending the
-	// classification step itself is another GUI observation.
-	lease, err := e.workflow.ensureLeaseWithObservedTarget(ctx, descriptor, true)
-	if err != nil {
+	// The task entry point already resolved every declared app, checked policy,
+	// and opened one turn lease before the initial screenshot.
+	lease, ok := e.workflow.currentLease()
+	if !ok {
 		return tools.OpenAIComputerBatchAuthorityV1{},
 			fmt.Errorf("OpenAI computer batch lease is unavailable")
 	}
@@ -415,18 +346,6 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 		}, fmt.Errorf("OpenAI computer action projection changed its effect")
 	}
 	nativeActionCtx := tools.ContextWithOpenAINativeComputerActionV1(ctx)
-	if _, err := describeOpenAIComputerPlanV1(
-		nativeActionCtx, plan, plan.Mutation); err != nil {
-		return tools.OpenAIComputerActionExecutionV1{
-			CommitState: tools.OpenAIComputerNotCommittedV1,
-		}, fmt.Errorf("OpenAI computer action projection is not executable")
-	}
-	if plan.Mutation && !e.approve(ctx, plan.Tool.Info().Name, plan.Args) {
-		return tools.OpenAIComputerActionExecutionV1{
-			CommitState: tools.OpenAIComputerNotCommittedV1,
-			Result:      agent.BusinessError("fresh per-action approval denied"),
-		}, fmt.Errorf("OpenAI computer fresh per-action approval denied")
-	}
 
 	result, runErr := e.runPlanV1(nativeActionCtx, plan, scope.ActionID)
 	execution := tools.OpenAIComputerActionExecutionV1{
@@ -477,12 +396,9 @@ func (e *daemonOpenAIComputerExecutorV1) CaptureFinalOpenAIComputerObservationV1
 		return agent.ToolResult{},
 			fmt.Errorf("OpenAI computer final observation could not be safely projected")
 	}
-	if _, err := describeOpenAIComputerPlanV1(ctx, plan, false); err != nil {
-		return agent.ToolResult{},
-			fmt.Errorf("OpenAI computer final observation is not executable")
-	}
+	nativeActionCtx := tools.ContextWithOpenAINativeComputerActionV1(ctx)
 	result, runErr := e.runPlanV1(
-		ctx,
+		nativeActionCtx,
 		plan,
 		call.CallID+"/final-observation",
 	)
@@ -509,38 +425,6 @@ func (e *daemonOpenAIComputerExecutorV1) runPlanV1(
 		ToolUseID: toolUseID,
 	})
 	return e.workflow.runTool(invocationCtx, plan.Tool, plan.Args)
-}
-
-func describeOpenAIComputerPlanV1(
-	ctx context.Context,
-	plan tools.OpenAIComputerActionPlanV1,
-	mutation bool,
-) (agent.GUIActionDescriptor, error) {
-	if plan.Tool == nil || plan.Tool.Info().Name != "computer_use" ||
-		plan.Args == "" || plan.Mutation != mutation {
-		return agent.GUIActionDescriptor{}, fmt.Errorf("invalid OpenAI computer action plan")
-	}
-	describer, ok := plan.Tool.(agent.GUIActionDescriber)
-	if !ok {
-		return agent.GUIActionDescriptor{},
-			fmt.Errorf("OpenAI computer action plan lacks a GUI descriptor")
-	}
-	descriptor, err := describer.DescribeGUIAction(ctx, plan.Args)
-	if err != nil || !descriptor.Participates ||
-		descriptor.ActionKind == "" ||
-		descriptor.TargetBundleID == "" {
-		return agent.GUIActionDescriptor{},
-			fmt.Errorf("OpenAI computer action target is unavailable")
-	}
-	wantEffect := agent.GUIActionObservation
-	if mutation {
-		wantEffect = agent.GUIActionMutation
-	}
-	if descriptor.Effect != wantEffect {
-		return agent.GUIActionDescriptor{},
-			fmt.Errorf("OpenAI computer action effect is inconsistent")
-	}
-	return descriptor, nil
 }
 
 func (e *daemonOpenAIComputerExecutorV1) validateActionBoundary(

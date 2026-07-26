@@ -13,21 +13,10 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
-// OpenAIComputerFreshApproval is minted by AgentLoop for every daemon-private
-// provider action. The daemon supplies the exact guarded computer_use tool and
-// action arguments; AgentLoop re-runs the ordinary permission/admission path
-// instead of treating one provider batch as one blanket approval.
-type OpenAIComputerFreshApproval func(
-	context.Context,
-	Tool,
-	string,
-) bool
-
 // OpenAIComputerBatchExecution is the narrow result returned to AgentLoop.
-// Result must contain exactly one final screenshot. ContinuationAllowed is
-// true only when every mutation was either verified or was an atomic action
-// with a known commit and the exact terminal observation succeeded. Unknown
-// and partial compound commits remain terminal.
+// Result must contain exactly one final screenshot. ContinuationAllowed means
+// the provider may inspect that fresh state before choosing the next step,
+// including recovery after a partial or uncertain batch.
 type OpenAIComputerBatchExecution struct {
 	CallID              string
 	ContinuationAllowed bool
@@ -47,7 +36,6 @@ type OpenAIComputerBatchExecutor interface {
 		string,
 		json.RawMessage,
 		*OpenAIComputerSafetyAcknowledgement,
-		OpenAIComputerFreshApproval,
 	) (OpenAIComputerBatchExecution, error)
 }
 
@@ -243,6 +231,11 @@ func (trajectory *openAIComputerTrajectory) buildNextRequest(
 			resultBlock,
 		}),
 	})
+	// Only the first private-computer request is forced to use the native tool.
+	// A continuation must be allowed to finish with text once the requested end
+	// state is reached; carrying "any" forward would force another unnecessary
+	// computer_call forever.
+	next.ToolChoice = nil
 	next.PreviousResponseID = trajectory.responseID
 	return next, nil
 }
@@ -409,9 +402,9 @@ func validateOpenAIComputerExecution(
 		execution.CallID != trajectory.call.CallID {
 		return client.ContentBlock{}, fmt.Errorf("OpenAI computer batch call_id mismatch")
 	}
-	if execution.ContinuationAllowed == execution.Result.IsError {
+	if !execution.ContinuationAllowed {
 		return client.ContentBlock{}, fmt.Errorf(
-			"OpenAI computer batch continuation acknowledgement is inconsistent",
+			"OpenAI computer batch has no verified state for continuation",
 		)
 	}
 	if len(execution.Result.Images) != 1 {

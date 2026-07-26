@@ -47,7 +47,6 @@ type openAIComputerTaskToolV1 struct {
 	childTools      *agent.ToolRegistry
 	workflow        *daemonGUIWorkflow
 	runtime         openAIComputerTaskRuntimeV1
-	approvalTool    agent.Tool
 	appPolicy       *ComputerUseAppPolicyStore
 	handler         agent.EventHandler
 
@@ -69,7 +68,7 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 			"Give the complete task once; the computer executor launches/focuses apps, " +
 			"observes the current UI, performs the needed actions, and verifies the result internally. " +
 			"Do not split clicks, typing, screenshots, or app switches into separate calls. " +
-			"List every app named by the user in apps, in first-use order.",
+			"List app names in apps when known; the executor may switch apps itself.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -80,12 +79,12 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 				"apps": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Installed macOS app names involved in the task, in first-use order.",
+					"description": "Optional installed macOS app names to launch before starting.",
 				},
 				"description": agent.DescriptionFieldSpec,
 			},
 		},
-		Required: []string{"task", "apps", "description"},
+		Required: []string{"task", "description"},
 	}
 }
 
@@ -108,8 +107,7 @@ func (t *openAIComputerTaskToolV1) Run(
 		return agent.ValidationError("description is required"), nil
 	}
 	if t == nil || t.gateway == nil ||
-		t.childTools == nil || t.workflow == nil || t.runtime == nil ||
-		t.approvalTool == nil {
+		t.childTools == nil || t.workflow == nil || t.runtime == nil {
 		return agent.BusinessError(
 			"OpenAI native Computer Use is temporarily unavailable; no desktop action was attempted",
 		), nil
@@ -188,27 +186,40 @@ func (t *openAIComputerTaskToolV1) Run(
 		return agent.BusinessError(err.Error()), nil
 	}
 
-	plan, err := t.runtime.PlanOpenAIComputerObservationV1(
-		"Capture the initial desktop task state",
-		true,
+	invocationCtx := tools.ContextWithOpenAINativeComputerActionV1(
+		agent.ContextWithToolInvocation(ctx, agent.ToolInvocation{
+			ToolName:  "computer_use",
+			ToolUseID: "computer-task/initial-observation",
+		}),
 	)
-	if err != nil {
-		return agent.BusinessError(err.Error()), nil
+	var initial agent.ToolResult
+	var runErr error
+	var observationErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		plan, err := t.runtime.PlanOpenAIComputerObservationV1(
+			"Capture the initial desktop task state",
+			true,
+		)
+		if err != nil {
+			observationErr = err
+			continue
+		}
+		initial, runErr = t.workflow.runTool(invocationCtx, plan.Tool, plan.Args)
+		if runErr == nil && !initial.IsError && len(initial.Images) == 1 {
+			observationErr = nil
+			break
+		}
+		observationErr = runErr
 	}
-	invocationCtx := agent.ContextWithToolInvocation(ctx, agent.ToolInvocation{
-		ToolName:  "computer_use",
-		ToolUseID: "computer-task/initial-observation",
-	})
-	initial, runErr := t.workflow.runTool(invocationCtx, plan.Tool, plan.Args)
 	if runErr != nil || initial.IsError || len(initial.Images) != 1 {
 		detail := "the desktop observation backend returned an error"
-		if runErr != nil {
-			detail = runErr.Error()
+		if observationErr != nil {
+			detail = observationErr.Error()
 		}
 		return agent.BusinessError(
 			"computer_use_error: initial_observation_unavailable\n" +
 				"message: Computer Use could not capture the verified initial app window\n" +
-				"recovery: do not retry computer_use in this turn; the private OpenAI trajectory did not start\n" +
+				"recovery: retry computer_use once; no desktop action was attempted\n" +
 				"detail: " + detail,
 		), nil
 	}
@@ -216,7 +227,6 @@ func (t *openAIComputerTaskToolV1) Run(
 	runner, err := newDaemonOpenAIComputerBatchRunnerV1(
 		t.workflow,
 		t.runtime,
-		t.approvalTool,
 	)
 	if err != nil {
 		return agent.BusinessError(err.Error()), nil
@@ -238,6 +248,7 @@ func (t *openAIComputerTaskToolV1) Run(
 	child.SetSpecificModel(profile.Model())
 	child.SetExecutionProfile(profile)
 	child.SetOpenAIComputerBatchExecutor(runner)
+	child.SetForceInitialToolUse(true)
 	child.SetHandler(openAIComputerChildHandlerV1{parent: t.handler})
 	child.SetStickyContext(
 		"execution_role=private_openai_native_computer\n" +
@@ -263,7 +274,7 @@ func (t *openAIComputerTaskToolV1) Run(
 		return agent.BusinessError(
 			"computer_use_error: executor_failed\n" +
 				"message: the private OpenAI Computer Use executor could not complete the task\n" +
-				"recovery: do not call computer_use again in this turn; actions may have completed, and the failure does not mean the target app is missing or blocked\n" +
+				"recovery: retry computer_use once; it will inspect the current app state before continuing, and the failure does not mean the target app is missing or blocked\n" +
 				"detail: " + err.Error(),
 		), nil
 	}

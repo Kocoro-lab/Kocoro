@@ -93,7 +93,6 @@ type openAIComputerLoopBatchExecutor struct {
 	mu                    sync.Mutex
 	executions            []OpenAIComputerBatchExecution
 	calls                 []openAIComputerLoopBatchCall
-	approvalSet           bool
 	skipSafetyConsumption bool
 }
 
@@ -111,11 +110,9 @@ func (e *openAIComputerLoopBatchExecutor) ExecuteOpenAIComputerBatch(
 	responseID string,
 	payload json.RawMessage,
 	safetyAcknowledgement *OpenAIComputerSafetyAcknowledgement,
-	approve OpenAIComputerFreshApproval,
 ) (OpenAIComputerBatchExecution, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.approvalSet = approve != nil
 	callRecord := openAIComputerLoopBatchCall{
 		ProfileID:                 profile.ProfileID(),
 		ResponseID:                responseID,
@@ -301,6 +298,7 @@ func TestAgentLoopOpenAIComputerExecutesBatchAndContinuesResponsesTrajectory(t *
 	loop.SetSpecificModel(profile.Model())
 	loop.SetExecutionProfile(profile)
 	loop.SetOpenAIComputerBatchExecutor(executor)
+	loop.SetForceInitialToolUse(true)
 
 	reply, _, err := loop.Run(context.Background(), "open the thread", nil, nil)
 	if err != nil {
@@ -323,9 +321,6 @@ func TestAgentLoopOpenAIComputerExecutesBatchAndContinuesResponsesTrajectory(t *
 		batches[0].Payload,
 		[]byte(normalizedOpenAIComputerCallForTrajectory),
 	)
-	if !executor.approvalSet {
-		t.Fatal("batch executor did not receive the per-action approval seam")
-	}
 	if !batches[0].SafetyAcknowledgementSeen ||
 		!batches[0].SafetyAcknowledgementOK {
 		t.Fatalf("batch safety acknowledgement = %+v", batches[0])
@@ -343,6 +338,9 @@ func TestAgentLoopOpenAIComputerExecutesBatchAndContinuesResponsesTrajectory(t *
 		first.ResolvedExecutionProfile != profile {
 		t.Fatal("initial request lost trusted execution profile")
 	}
+	if first.ToolChoice != "any" {
+		t.Fatalf("initial tool_choice = %#v, want any", first.ToolChoice)
+	}
 	if continuation.PreviousResponseID != openAIContinuationTokenPrimary {
 		t.Fatalf(
 			"continuation previous_response_id = %q, want %q",
@@ -353,6 +351,9 @@ func TestAgentLoopOpenAIComputerExecutesBatchAndContinuesResponsesTrajectory(t *
 	if continuation.ExecutionProfileID != profile.ProfileID() ||
 		continuation.ResolvedExecutionProfile != profile {
 		t.Fatal("continuation request lost trusted execution profile")
+	}
+	if continuation.ToolChoice != nil {
+		t.Fatalf("continuation tool_choice = %#v, want auto", continuation.ToolChoice)
 	}
 	if len(continuation.Messages) != len(first.Messages)+2 {
 		t.Fatalf(
@@ -1069,7 +1070,7 @@ func TestAgentLoopOpenAIComputerRejectsMismatchedFunctionCallAliasBeforeExecutio
 	}
 }
 
-func TestAgentLoopOpenAIComputerUnsafeCommitTerminatesWithoutModelRetry(t *testing.T) {
+func TestAgentLoopOpenAIComputerUnknownCommitContinuesFromFinalScreenshot(t *testing.T) {
 	profile := resolveTrustedOpenAIComputerProfile(t, "gpt-5.6-sol")
 	llm := &openAIComputerLoopLLM{responses: []*client.CompletionResponse{
 		openAIComputerLoopResponse(
@@ -1078,11 +1079,17 @@ func TestAgentLoopOpenAIComputerUnsafeCommitTerminatesWithoutModelRetry(t *testi
 			openAIContinuationTokenPrimary,
 			normalizedOpenAIComputerCallForTrajectory,
 		),
+		{
+			Model:        profile.Model(),
+			Provider:     profile.Provider(),
+			FinishReason: "stop",
+			OutputText:   "done",
+		},
 	}}
 	executor := &openAIComputerLoopBatchExecutor{
 		executions: []OpenAIComputerBatchExecution{{
 			CallID:              "call_001",
-			ContinuationAllowed: false,
+			ContinuationAllowed: true,
 			Result: ToolResult{
 				Content: "commit status is unknown; do not retry automatically",
 				IsError: true,
@@ -1110,37 +1117,35 @@ func TestAgentLoopOpenAIComputerUnsafeCommitTerminatesWithoutModelRetry(t *testi
 	loop.SetExecutionProfile(profile)
 	loop.SetOpenAIComputerBatchExecutor(executor)
 
-	_, _, err := loop.Run(context.Background(), "click once", nil, nil)
-	if err == nil {
-		t.Fatal("unsafe committed batch did not terminate the run")
+	reply, _, err := loop.Run(context.Background(), "click once", nil, nil)
+	if err != nil || reply != "done" {
+		t.Fatalf("unknown commit recovery = %q / %v", reply, err)
 	}
-	if got := len(llm.capturedRequests()); got != 1 {
-		t.Fatalf("unsafe commit issued %d completion requests, want 1", got)
+	requests := llm.capturedRequests()
+	if got := len(requests); got != 2 {
+		t.Fatalf("unknown commit issued %d completion requests, want 2", got)
 	}
 	if got := len(executor.capturedCalls()); got != 1 {
-		t.Fatalf("unsafe commit executed %d batches, want 1", got)
+		t.Fatalf("unknown commit executed %d batches, want 1", got)
 	}
 
-	runMessages := loop.RunMessages()
-	if len(runMessages) < 3 {
-		t.Fatalf("run messages = %#v, want user + computer_call + output", runMessages)
+	continuation := requests[1]
+	if continuation.PreviousResponseID != openAIContinuationTokenPrimary {
+		t.Fatalf("continuation response id = %q", continuation.PreviousResponseID)
 	}
-	assistant := runMessages[len(runMessages)-2]
-	output := runMessages[len(runMessages)-1]
-	if assistant.Role != "assistant" ||
-		len(assistant.Content.Blocks()) != 1 ||
-		assistant.Content.Blocks()[0].CallID != "call_001" {
-		t.Fatalf("terminal assistant call = %#v", assistant)
+	if len(continuation.Messages) < 2 {
+		t.Fatalf("continuation messages = %#v", continuation.Messages)
 	}
+	output := continuation.Messages[len(continuation.Messages)-1]
 	blocks := output.Content.Blocks()
 	if output.Role != "user" || len(blocks) != 1 ||
 		blocks[0].ToolUseID != "call_001" || !blocks[0].IsError {
-		t.Fatalf("terminal computer_call_output = %#v", output)
+		t.Fatalf("recovery computer_call_output = %#v", output)
 	}
 	nested, ok := blocks[0].ToolContent.([]client.ContentBlock)
 	if !ok || len(nested) != 1 || nested[0].Source == nil ||
 		nested[0].Source.Data != "ZmluYWw=" {
-		t.Fatalf("terminal final screenshot = %#v", blocks[0].ToolContent)
+		t.Fatalf("recovery final screenshot = %#v", blocks[0].ToolContent)
 	}
 }
 

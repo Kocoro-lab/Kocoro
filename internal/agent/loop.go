@@ -771,6 +771,7 @@ type AgentLoop struct {
 	specificModel          string
 	executionProfile       *client.ExecutionProfile
 	openAIComputerExecutor OpenAIComputerBatchExecutor
+	forceInitialToolUse    bool
 	agentBasePrompt        string
 	agentSkills            []*skills.Skill
 	// contextWindowExplicit is true when set via user config (e.g. per-agent
@@ -1293,6 +1294,14 @@ func (a *AgentLoop) SetOpenAIComputerBatchExecutor(
 	executor OpenAIComputerBatchExecutor,
 ) {
 	a.openAIComputerExecutor = executor
+}
+
+// SetForceInitialToolUse requires a tool call only on the first provider
+// request. It is used by the private OpenAI Computer Use loop, where a
+// text-only first response cannot perform the delegated desktop task. Native
+// continuations reset tool_choice to auto so the model can finish normally.
+func (a *AgentLoop) SetForceInitialToolUse(force bool) {
+	a.forceInitialToolUse = force
 }
 
 func executionProfileID(profile *client.ExecutionProfile) string {
@@ -3680,6 +3689,9 @@ iterationLoop:
 			ExecutionProfileID:       executionProfileID(a.executionProfile),
 			ResolvedExecutionProfile: a.executionProfile,
 		}
+		if a.forceInitialToolUse && openAIComputerBaseRequest == nil {
+			req.ToolChoice = "any"
+		}
 		reuseExactRequestOnRetry := false
 		isOpenAIComputerContinuation := openAIContinuationRequest != nil
 		// A Responses continuation carries previous_response_id plus exactly
@@ -4039,6 +4051,9 @@ iterationLoop:
 						ExecutionProfileID:       executionProfileID(a.executionProfile),
 						ResolvedExecutionProfile: a.executionProfile,
 					}
+					if a.forceInitialToolUse && openAIComputerBaseRequest == nil {
+						req.ToolChoice = "any"
+					}
 					// Checkpoint the compacted state before retrying. Gated on
 					// the dirty flag we just set — a no-op compaction path
 					// (same message count, no MarkDirty) would not write.
@@ -4256,35 +4271,12 @@ iterationLoop:
 				return "", usage, acknowledgementErr
 			}
 
-			// The daemon passes its exact guarded computer_use tool back into
-			// this callback for each action. ApprovalAdmissionRequireFresh on
-			// mutations prevents both persisted Always Allow and the per-turn
-			// cache from becoming blanket batch authority.
-			freshApproval := func(
-				approvalCtx context.Context,
-				tool Tool,
-				args string,
-			) bool {
-				if tool == nil || tool.Info().Name != "computer_use" ||
-					strings.TrimSpace(args) == "" {
-					return false
-				}
-				_, approved := a.checkPermissionAndApproval(
-					approvalCtx,
-					tool.Info().Name,
-					args,
-					tool,
-					approvalCache,
-				)
-				return approved
-			}
 			execution, executeErr := a.openAIComputerExecutor.ExecuteOpenAIComputerBatch(
 				ctx,
 				a.executionProfile,
 				envelope.ResponseID,
 				payload,
 				safetyAcknowledgement,
-				freshApproval,
 			)
 			screenshot, validationErr := validateOpenAIComputerExecution(
 				trajectory,
@@ -4333,16 +4325,6 @@ iterationLoop:
 			captureRunMessages()
 			a.maybeCheckpoint(ctx)
 
-			if !execution.ContinuationAllowed {
-				message := "OpenAI computer batch may have committed without verification; " +
-					"provider continuation is blocked"
-				if detail := strings.TrimSpace(execution.Result.Content); detail != "" {
-					message += ": " + detail
-				}
-				err := fmt.Errorf("%s", message)
-				setRunStatus(runstatus.CodeFromError(err), false)
-				return "", usage, err
-			}
 			screenshotCopy := screenshot
 			sourceCopy := *screenshot.Source
 			screenshotCopy.Source = &sourceCopy

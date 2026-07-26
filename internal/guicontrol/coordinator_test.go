@@ -1122,6 +1122,36 @@ func TestMutationAdmissionRequiresFrozenAllowedTarget(t *testing.T) {
 	}
 }
 
+func TestOrderedNativeBatchMaySwitchToAnotherApp(t *testing.T) {
+	coordinator, _ := newCoordinatorFixture(t, nil)
+	lease, err := coordinator.BeginWorkflow(workflowRequest("turn-native-switch"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := coordinator.BeginAction(context.Background(), ActionRequest{
+		LeaseID:            lease.LeaseID,
+		TurnID:             lease.TurnID,
+		ToolName:           "computer_use",
+		ToolUseID:          "toolu-native-calculator",
+		ActionKind:         "click",
+		Effect:             ComputerUseActionMutation,
+		TargetBundleID:     "com.apple.calculator",
+		TargetAppName:      "Calculator",
+		OrderedBatchAction: true,
+	})
+	if err != nil {
+		t.Fatalf("native cross-app mutation: %v", err)
+	}
+	verified := ComputerUseResultVerified
+	if err := coordinator.FinishAction(ActionFinish{
+		LeaseID:  lease.LeaseID,
+		ActionID: action.ActionID,
+		Result:   &verified,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWorkflowLeaseAdmitsEachResolvedObservationForLaterMutation(t *testing.T) {
 	coordinator, _ := newCoordinatorFixture(t, nil)
 	request := workflowRequest("turn-late-bind")

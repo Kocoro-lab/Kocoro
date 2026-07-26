@@ -429,7 +429,7 @@ func TestOpenAIComputerActionRuntimePreservesEveryOfficialClickButton(t *testing
 }
 
 func TestOpenAIComputerActionRuntimeSeparatesInternalRefreshFromFinalScreenshot(t *testing.T) {
-	_, runtime := guardedOpenAIComputerRuntimeHarness(t)
+	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
 	refresh, err := runtime.PlanOpenAIComputerObservationV1(
 		"Refresh state",
 		false,
@@ -463,5 +463,8 @@ func TestOpenAIComputerActionRuntimeSeparatesInternalRefreshFromFinalScreenshot(
 			final,
 			finalArgs,
 		)
+	}
+	if harness.tool.snapshot != nil || harness.tool.coordinateArtifact != nil {
+		t.Fatal("final provider screenshot retained the previous app observation")
 	}
 }

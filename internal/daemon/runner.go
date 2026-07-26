@@ -2896,20 +2896,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	guiWorkflow.appPolicy = deps.computerUseAppPolicyStore()
 	guiWorkflow.riskBroker = deps.ConsequentialRiskBroker
 	var openAIComputerRuntime *tools.OpenAIComputerActionRuntimeV1
-	var openAIComputerApprovalTool agent.Tool
 	childComputerTools := agent.NewToolRegistry()
 	if openAIComputerPrivate != nil {
 		openAIComputerRuntime = openAIComputerPrivate.runtime
-		openAIComputerApprovalTool, err = wrapDetachedDaemonGUIToolV1(
-			openAIComputerPrivate.approvalCore,
-			guiWorkflow,
-		)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"wrap detached OpenAI computer approval tool: %w",
-				err,
-			)
-		}
 		if marker, ok := computerReg.Get(client.NativeComputerToolName); ok {
 			childComputerTools.Register(marker)
 		} else {
@@ -2933,7 +2922,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			childTools:     childComputerTools,
 			workflow:       guiWorkflow,
 			runtime:        openAIComputerRuntime,
-			approvalTool:   openAIComputerApprovalTool,
 			appPolicy:      guiWorkflow.appPolicy,
 			handler:        handler,
 			modelTier:      "large",

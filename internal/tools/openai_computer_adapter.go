@@ -847,17 +847,11 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 			)
 			return result, nil
 		}
-		// A committed_unverified acknowledgement means the input commit is
-		// known, but the action-specific causal postcondition was not proven.
-		// Known atomic commits and fully committed scroll/drag actions can
-		// continue within the provider's ordered batch. Partial compound or
-		// unknown commits and explicit action errors stop before any later
-		// action can run.
-		if executeErr != nil || execution.Result.IsError ||
-			openAIComputerActionMutatesV1(action) &&
-				execution.CommitState != OpenAIComputerCommitVerifiedV1 &&
-				!(execution.CommitState == OpenAIComputerCommitUnverifiedV1 &&
-					openAIComputerKnownCommitCanContinueV1(action, execution)) {
+		// Commit state is the action boundary. A helper may report an error only
+		// because its optional postcondition could not be proven after the input
+		// was already committed. Continue known atomic/full commits and stop
+		// only on no-commit, partial, or unknown outcomes.
+		if !openAIComputerActionCanContinueV1(action, execution, executeErr) {
 			result.ToolResult = openAIComputerActionFailureV1(
 				index,
 				len(call.Actions),
@@ -901,6 +895,24 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 	return result, nil
 }
 
+func openAIComputerActionCanContinueV1(
+	action OpenAIComputerActionV1,
+	execution OpenAIComputerActionExecutionV1,
+	executeErr error,
+) bool {
+	if !openAIComputerActionMutatesV1(action) {
+		return executeErr == nil && !execution.Result.IsError
+	}
+	switch execution.CommitState {
+	case OpenAIComputerCommitVerifiedV1:
+		return true
+	case OpenAIComputerCommitUnverifiedV1:
+		return openAIComputerKnownCommitCanContinueV1(action, execution)
+	default:
+		return false
+	}
+}
+
 func validateOpenAIComputerActionExecutionV1(
 	action OpenAIComputerActionV1,
 	execution OpenAIComputerActionExecutionV1,
@@ -936,21 +948,26 @@ func openAIComputerKnownCommitCanContinueV1(
 	action OpenAIComputerActionV1,
 	execution OpenAIComputerActionExecutionV1,
 ) bool {
+	failureCode := ""
+	if execution.Result.GUIOutcome != nil {
+		failureCode = execution.Result.GUIOutcome.FailureCode
+	}
 	switch action.Type {
 	case OpenAIComputerActionClickV1,
-		OpenAIComputerActionDoubleClickV1,
-		OpenAIComputerActionMoveV1,
-		OpenAIComputerActionTypeTextV1,
+		OpenAIComputerActionDoubleClickV1:
+		return failureCode == "click_postcondition_not_declared" ||
+			failureCode == "postcondition_not_declared" ||
+			failureCode == "postcondition_not_observed"
+	case OpenAIComputerActionMoveV1:
+		return false
+	case OpenAIComputerActionTypeTextV1,
 		OpenAIComputerActionKeypressV1:
-		return true
+		return failureCode == "postcondition_not_declared" ||
+			failureCode == "postcondition_not_observed"
 	case OpenAIComputerActionScrollV1:
-		return execution.Result.GUIOutcome != nil &&
-			execution.Result.GUIOutcome.FailureCode ==
-				"scroll_postcondition_not_declared"
+		return failureCode == "scroll_postcondition_not_declared"
 	case OpenAIComputerActionDragV1:
-		return execution.Result.GUIOutcome != nil &&
-			execution.Result.GUIOutcome.FailureCode ==
-				"drop_postcondition_not_declared"
+		return failureCode == "drop_postcondition_not_declared"
 	default:
 		return false
 	}

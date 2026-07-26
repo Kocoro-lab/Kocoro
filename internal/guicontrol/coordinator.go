@@ -666,6 +666,12 @@ func (c *Coordinator) enforceAllowedTargetLocked(request ActionRequest) error {
 	if request.TargetBundleID == "" {
 		return deny("a mutating action requires an explicit target bundle")
 	}
+	if request.OrderedBatchAction {
+		// One user-approved native computer task may naturally move between
+		// apps. The daemon still checks the live target, Saved App Blocks, and
+		// consequential-risk policy before minting each action capability.
+		return nil
+	}
 	if len(c.active.lease.AllowedAppBundleIDs) == 0 {
 		return deny("no app target is bound to this workflow; start the app and observe the running app before attempting a mutation")
 	}

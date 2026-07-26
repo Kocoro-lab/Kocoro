@@ -50,6 +50,9 @@ func (t *openAIComputerDaemonProbeTool) DescribeGUIAction(
 	if err := json.Unmarshal([]byte(args), &input); err != nil {
 		return agent.GUIActionDescriptor{}, err
 	}
+	if input.Action == tools.OpenAIComputerActionWaitV1 {
+		return agent.GUIActionDescriptor{}, nil
+	}
 	effect := agent.GUIActionObservation
 	path := ""
 	if input.Mutation || t.defaultMutation {
@@ -358,13 +361,13 @@ func newOpenAIComputerDaemonExecutorFixture(
 	*tools.OpenAIComputerAdapterV1,
 	*openAIComputerDaemonProbeTool,
 	*guicontrol.Coordinator,
-	*int,
 ) {
 	t.Helper()
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
 	workflow := testGUIWorkflow(coordinator, "session-openai", "turn-openai")
 	workflow.invocationFromContext = agent.ToolInvocationFromContext
 	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	mustOpenAIComputerDaemonLease(t, workflow, "com.apple.Notes", "Notes")
 	probe := &openAIComputerDaemonProbeTool{
 		targetBundleID: "com.apple.Notes",
 		targetAppName:  "Notes",
@@ -393,23 +396,37 @@ func newOpenAIComputerDaemonExecutorFixture(
 			},
 		},
 	}
-	approvals := 0
 	executor, err := newDaemonOpenAIComputerExecutorV1(
 		workflow,
 		&openAIComputerDaemonRuntimeProbe{tool: probe},
 		trustedOpenAIComputerProvenanceForDaemon(t),
-		func(_ context.Context, toolName, args string) bool {
-			if toolName != "computer_use" || args == "" {
-				t.Fatalf("approval identity = %q / %q", toolName, args)
-			}
-			approvals++
-			return true
-		},
 	)
 	if err != nil {
 		t.Fatalf("newDaemonOpenAIComputerExecutorV1: %v", err)
 	}
-	return executor, tools.NewOpenAIComputerAdapterV1(executor), probe, coordinator, &approvals
+	return executor, tools.NewOpenAIComputerAdapterV1(executor), probe, coordinator
+}
+
+func mustOpenAIComputerDaemonLease(
+	t *testing.T,
+	workflow *daemonGUIWorkflow,
+	bundleID string,
+	appName string,
+) {
+	t.Helper()
+	if _, err := workflow.ensureLease(
+		context.Background(),
+		agent.GUIActionDescriptor{
+			Participates:   true,
+			ActionKind:     "desktop_task",
+			Effect:         agent.GUIActionMutation,
+			TargetBundleID: bundleID,
+			TargetAppName:  appName,
+			ExecutionPath:  "openai_native",
+		},
+	); err != nil {
+		t.Fatalf("establish OpenAI computer task lease: %v", err)
+	}
 }
 
 func autoAcknowledgeOpenAIComputerController(
@@ -439,7 +456,7 @@ func autoAcknowledgeOpenAIComputerController(
 }
 
 func TestDaemonOpenAIComputerExecutorRunsOrderedActionsThroughFreshAuthority(t *testing.T) {
-	executor, adapter, probe, coordinator, approvals := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, adapter, probe, coordinator := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	result, err := adapter.ExecuteBatchV1(
 		context.Background(),
@@ -462,9 +479,6 @@ func TestDaemonOpenAIComputerExecutorRunsOrderedActionsThroughFreshAuthority(t *
 		"click,type,final_screenshot" {
 		t.Fatalf("risk preflight order = %v", got)
 	}
-	if *approvals != 2 {
-		t.Fatalf("fresh approvals = %d, want 2", *approvals)
-	}
 	if executor.finalCaptures != 1 {
 		t.Fatalf("final captures = %d, want 1", executor.finalCaptures)
 	}
@@ -475,7 +489,7 @@ func TestDaemonOpenAIComputerExecutorRunsOrderedActionsThroughFreshAuthority(t *
 }
 
 func TestDaemonOpenAIComputerExecutorContinuesKnownAtomicCommitWithoutInternalReobserve(t *testing.T) {
-	executor, adapter, probe, _, approvals := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	probe.results["click"] = agent.ToolResult{
 		Content: "click committed without a declared postcondition",
@@ -503,8 +517,26 @@ func TestDaemonOpenAIComputerExecutorContinuesKnownAtomicCommitWithoutInternalRe
 		"click,type,final_screenshot" {
 		t.Fatalf("execution order = %q", got)
 	}
-	if *approvals != 2 {
-		t.Fatalf("fresh approvals = %d, want 2", *approvals)
+}
+
+func TestDaemonOpenAIComputerExecutorRunsProviderWaitWithoutGUIPolicyProjection(
+	t *testing.T,
+) {
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(`{"type":"wait"}`),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if result.ToolResult.IsError || len(result.ToolResult.Images) != 1 {
+		t.Fatalf("result = %+v", result.ToolResult)
+	}
+	if got := strings.Join(probe.runNames(), ","); got != "wait,final_screenshot" {
+		t.Fatalf("execution order = %q", got)
 	}
 }
 
@@ -514,6 +546,7 @@ func TestDaemonOpenAIComputerBatchRunnerBridgesAgentLoopToGuardedWorkflow(t *tes
 	workflow.invocationFromContext = agent.ToolInvocationFromContext
 	autoAcknowledgeOpenAIComputerController(t, coordinator)
 	defer workflow.EndTurn()
+	mustOpenAIComputerDaemonLease(t, workflow, "com.apple.Notes", "Notes")
 
 	probe := &openAIComputerDaemonProbeTool{
 		targetBundleID: "com.apple.Notes",
@@ -547,7 +580,6 @@ func TestDaemonOpenAIComputerBatchRunnerBridgesAgentLoopToGuardedWorkflow(t *tes
 	runner, err := newDaemonOpenAIComputerBatchRunnerV1(
 		workflow,
 		&openAIComputerDaemonRuntimeProbe{tool: probe},
-		probe,
 	)
 	if err != nil {
 		t.Fatalf("newDaemonOpenAIComputerBatchRunnerV1: %v", err)
@@ -604,8 +636,8 @@ func TestDaemonOpenAIComputerBatchRunnerBridgesAgentLoopToGuardedWorkflow(t *tes
 		"click,type,final_screenshot" {
 		t.Fatalf("execution order = %v", got)
 	}
-	if handler.approvals != 2 {
-		t.Fatalf("fresh approvals = %d, want 2", handler.approvals)
+	if handler.approvals != 0 {
+		t.Fatalf("ordinary per-action approvals = %d, want 0", handler.approvals)
 	}
 	if active := coordinator.Snapshot().Active; active == nil {
 		t.Fatal("one batch lease was not retained through the runner")
@@ -684,15 +716,14 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 			resolveCalls++
 			return profile, nil
 		},
-		childTools:   childTools,
-		workflow:     workflow,
-		runtime:      runtime,
-		approvalTool: probe,
-		handler:      handler,
-		modelTier:    "large",
-		maxIter:      4,
-		resultTrunc:  2000,
-		argsTrunc:    200,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     runtime,
+		handler:     handler,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
 	}
 
 	result, err := taskTool.Run(
@@ -717,12 +748,23 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 		runtime.launchedApps[1].App != "Calculator" {
 		t.Fatalf("launched apps = %+v", runtime.launchedApps)
 	}
+	if workflow.lease == nil ||
+		strings.Join(workflow.lease.AllowedAppBundleIDs, ",") !=
+			"com.example.slack" {
+		t.Fatalf("task lease targets = %+v", workflow.lease)
+	}
 	if got := strings.Join(probe.runNames(), ","); got !=
 		"final_screenshot,click,type,final_screenshot" {
 		t.Fatalf("private execution order = %q", got)
 	}
 	if len(llm.requests) != 2 {
 		t.Fatalf("child completion requests = %d, want one batch + one continuation", len(llm.requests))
+	}
+	if llm.requests[0].ToolChoice != "any" {
+		t.Fatalf("initial child tool_choice = %#v, want any", llm.requests[0].ToolChoice)
+	}
+	if llm.requests[1].ToolChoice != nil {
+		t.Fatalf("continuation child tool_choice = %#v, want auto", llm.requests[1].ToolChoice)
 	}
 	for index, request := range llm.requests {
 		if request.SpecificModel != profile.Model() ||
@@ -768,8 +810,7 @@ func TestOpenAIComputerTaskToolResolverFailureDoesNotTouchDesktop(t *testing.T) 
 			"session-openai-resolve-failure",
 			"turn-openai-resolve-failure",
 		),
-		runtime:      runtime,
-		approvalTool: probe,
+		runtime: runtime,
 	}
 
 	for attempt := 0; attempt < 2; attempt++ {
@@ -822,12 +863,11 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 		},
 	}
 	taskTool := &openAIComputerTaskToolV1{
-		gateway:      &openAIComputerDaemonLoopLLM{},
-		profile:      trustedOpenAIComputerProfileForDaemon(t),
-		childTools:   agent.NewToolRegistry(),
-		workflow:     workflow,
-		runtime:      &openAIComputerDaemonRuntimeProbe{tool: probe},
-		approvalTool: probe,
+		gateway:    &openAIComputerDaemonLoopLLM{},
+		profile:    trustedOpenAIComputerProfileForDaemon(t),
+		childTools: agent.NewToolRegistry(),
+		workflow:   workflow,
+		runtime:    &openAIComputerDaemonRuntimeProbe{tool: probe},
 	}
 
 	result, err := taskTool.Run(
@@ -839,12 +879,16 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "initial_observation_unavailable") ||
-		!strings.Contains(result.Content, "do not retry computer_use in this turn") {
+		!strings.Contains(result.Content, "retry computer_use once") {
 		t.Fatalf("task result = %+v", result)
 	}
 	if strings.Contains(result.Content, "state_id") ||
 		strings.Contains(result.Content, "ref=e17") {
 		t.Fatalf("initial failure leaked stale observation state: %q", result.Content)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,final_screenshot" {
+		t.Fatalf("initial observation attempts = %q", got)
 	}
 }
 
@@ -877,11 +921,10 @@ func TestOpenAIComputerTaskToolExecutorFailureForbidsAutomaticRetryAndGuessing(
 		gateway: &openAIComputerDaemonLoopLLM{
 			err: errors.New("API returned 400: malformed provider response"),
 		},
-		profile:      trustedOpenAIComputerProfileForDaemon(t),
-		childTools:   agent.NewToolRegistry(),
-		workflow:     workflow,
-		runtime:      &openAIComputerDaemonRuntimeProbe{tool: probe},
-		approvalTool: probe,
+		profile:    trustedOpenAIComputerProfileForDaemon(t),
+		childTools: agent.NewToolRegistry(),
+		workflow:   workflow,
+		runtime:    &openAIComputerDaemonRuntimeProbe{tool: probe},
 	}
 
 	result, err := taskTool.Run(
@@ -893,17 +936,102 @@ func TestOpenAIComputerTaskToolExecutorFailureForbidsAutomaticRetryAndGuessing(
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "executor_failed") ||
-		!strings.Contains(result.Content, "do not call computer_use again in this turn") ||
+		!strings.Contains(result.Content, "retry computer_use once") ||
 		!strings.Contains(result.Content, "does not mean the target app is missing or blocked") ||
 		!strings.Contains(result.Content, "malformed provider response") {
 		t.Fatalf("task result = %+v", result)
 	}
 }
 
-func TestOpenAIComputerTaskToolSchemaRequiresExplicitAppList(t *testing.T) {
+func TestOpenAIComputerTaskToolSchemaKeepsAppHintsOptional(t *testing.T) {
 	info := (&openAIComputerTaskToolV1{}).Info()
-	if got := strings.Join(info.Required, ","); got != "task,apps,description" {
+	if got := strings.Join(info.Required, ","); got != "task,description" {
 		t.Fatalf("required fields = %q", got)
+	}
+	properties := info.Parameters["properties"].(map[string]any)
+	if _, ok := properties["apps"]; !ok {
+		t.Fatal("optional app launch hints are missing")
+	}
+}
+
+func TestOpenAIComputerTaskToolRunsAgainstCurrentAppWithoutAppHints(t *testing.T) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-current-app",
+		"turn-openai-current-app",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.slack",
+		targetAppName:  "Slack",
+		results: map[string]agent.ToolResult{
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "Y3VycmVudC1hcHA=",
+				}},
+			},
+		},
+	}
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	call := openAIComputerDaemonCall(`{"type":"wait"}`)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(call),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_current_app_final",
+			`{"type":"text","text":"done"}`,
+			"done",
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     runtime,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Wait for the current app to settle","description":"Complete the desktop task"}`,
+	)
+	if err != nil || result.IsError || result.Content != "done" {
+		t.Fatalf("current-app task result = %+v / %v", result, err)
+	}
+	if len(runtime.resolvedApps) != 0 || len(runtime.launchedApps) != 0 {
+		t.Fatalf(
+			"current-app task resolved/launched hints: %v / %v",
+			runtime.resolvedApps,
+			runtime.launchedApps,
+		)
+	}
+	if workflow.lease == nil ||
+		workflow.lease.RequestedAppBundleID != "com.example.slack" {
+		t.Fatalf("current-app task lease = %+v", workflow.lease)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,wait,final_screenshot" {
+		t.Fatalf("current-app execution order = %q", got)
 	}
 }
 
@@ -926,7 +1054,7 @@ func TestDaemonOpenAIComputerRuntimeIsDetachedBeforeWorkflowWrapping(t *testing.
 	if err != nil {
 		t.Fatalf("detach pre-wrap runtime: %v", err)
 	}
-	if private == nil || private.runtime == nil || private.approvalCore == nil {
+	if private == nil || private.runtime == nil {
 		t.Fatalf("detached private runtime = %+v", private)
 	}
 	if registry.Has("computer_use") {
@@ -942,26 +1070,18 @@ func TestDaemonOpenAIComputerRuntimeIsDetachedBeforeWorkflowWrapping(t *testing.
 		"turn-openai-order",
 	)
 	wrapDaemonGUITools(registry, workflow)
-	approvalTool, err := wrapDetachedDaemonGUIToolV1(
-		private.approvalCore,
-		workflow,
-	)
-	if err != nil {
-		t.Fatalf("wrap detached approval tool: %v", err)
-	}
 	if registry.Has("computer_use") {
-		t.Fatal("wrapping detached approval tool re-registered computer_use")
+		t.Fatal("workflow wrapping re-registered private computer_use")
 	}
 	runner, err := newDaemonOpenAIComputerBatchRunnerV1(
 		workflow,
 		private.runtime,
-		approvalTool,
 	)
 	if err != nil {
 		t.Fatalf("construct post-wrap runner: %v", err)
 	}
-	if runner.approvalTool != approvalTool {
-		t.Fatal("runner did not retain the post-wrap approval tool")
+	if runner.runtime != private.runtime {
+		t.Fatal("runner did not retain the detached runtime")
 	}
 }
 
@@ -1050,7 +1170,7 @@ func TestDetachedOpenAIComputerRuntimeDropsWhenPublicMarkerIsFiltered(t *testing
 }
 
 func TestDaemonOpenAIComputerExecutorPauseStopsBeforeNextProviderAction(t *testing.T) {
-	executor, adapter, probe, coordinator, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, adapter, probe, coordinator := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	probe.afterRun = func(action string) {
 		if action != "click" {
@@ -1084,7 +1204,7 @@ func TestDaemonOpenAIComputerExecutorPauseStopsBeforeNextProviderAction(t *testi
 }
 
 func TestDaemonOpenAIComputerExecutorStopRevokesCurrentAndRemainingActions(t *testing.T) {
-	executor, adapter, probe, coordinator, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, adapter, probe, coordinator := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	probe.afterRun = func(action string) {
 		if action != "click" {
@@ -1122,7 +1242,7 @@ func TestDaemonOpenAIComputerExecutorStopRevokesCurrentAndRemainingActions(t *te
 }
 
 func TestDaemonOpenAIComputerExecutorUncertainCommitNeverContinuesOrRetries(t *testing.T) {
-	executor, adapter, probe, _, approvals := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	probe.results["click"] = agent.ToolResult{
 		Content: "commit uncertain",
@@ -1150,13 +1270,10 @@ func TestDaemonOpenAIComputerExecutorUncertainCommitNeverContinuesOrRetries(t *t
 	if got := probe.runNames(); strings.Join(got, ",") != "click,final_screenshot" {
 		t.Fatalf("uncertain action continued or retried: %v", got)
 	}
-	if *approvals != 1 {
-		t.Fatalf("approval count = %d, want 1", *approvals)
-	}
 }
 
 func TestDaemonOpenAIComputerExecutorPartialPixelScrollCommitNeverContinuesOrRetries(t *testing.T) {
-	executor, adapter, probe, _, approvals := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	probe.results["scroll"] = agent.ToolResult{
 		Content: "pointer move committed; scroll not committed",
@@ -1183,9 +1300,6 @@ func TestDaemonOpenAIComputerExecutorPartialPixelScrollCommitNeverContinuesOrRet
 	if got := probe.runNames(); strings.Join(got, ",") != "scroll,final_screenshot" {
 		t.Fatalf("partial scroll continued or retried: %v", got)
 	}
-	if *approvals != 1 {
-		t.Fatalf("approval count = %d, want 1", *approvals)
-	}
 }
 
 func TestDaemonOpenAIComputerExecutorRejectsMissingOrWrongProvenanceBeforeLease(t *testing.T) {
@@ -1203,7 +1317,6 @@ func TestDaemonOpenAIComputerExecutorRejectsMissingOrWrongProvenanceBeforeLease(
 		workflow,
 		runtime,
 		tools.OpenAIComputerExecutionProvenanceV1{},
-		func(context.Context, string, string) bool { return true },
 	); err == nil || executor != nil {
 		t.Fatalf("zero provenance accepted: executor=%v err=%v", executor, err)
 	}
@@ -1215,11 +1328,11 @@ func TestDaemonOpenAIComputerExecutorRejectsMissingOrWrongProvenanceBeforeLease(
 		workflow,
 		runtime,
 		trustedOpenAIComputerProvenanceForDaemon(t),
-		func(context.Context, string, string) bool { return true },
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	mustOpenAIComputerDaemonLease(t, workflow, "com.apple.Notes", "Notes")
 	call, err := tools.DecodeOpenAIComputerCallV1(
 		openAIComputerDaemonCall(`{"type":"wait"}`),
 	)
@@ -1263,7 +1376,6 @@ func TestDaemonOpenAIComputerExecutorRejectsMalformedDirectCallBeforePlannerOrLe
 		workflow,
 		runtime,
 		trustedOpenAIComputerProvenanceForDaemon(t),
-		func(context.Context, string, string) bool { return true },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1301,7 +1413,7 @@ func TestDaemonOpenAIComputerExecutorRejectsMalformedDirectCallBeforePlannerOrLe
 }
 
 func TestDaemonOpenAIComputerExecutorFinalCaptureIsSingleUse(t *testing.T) {
-	executor, _, _, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, _, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	call, err := tools.DecodeOpenAIComputerCallV1(
 		openAIComputerDaemonCall(`{"type":"wait"}`),
@@ -1334,7 +1446,7 @@ func TestDaemonOpenAIComputerExecutorFinalCaptureIsSingleUse(t *testing.T) {
 }
 
 func TestDaemonOpenAIComputerExecutorRejectsSameTypeTamperedActionBeforePlanningOrTool(t *testing.T) {
-	executor, _, probe, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, _, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	runtime := executor.runtime.(*openAIComputerDaemonRuntimeProbe)
 	call, err := tools.DecodeOpenAIComputerCallV1(
@@ -1417,7 +1529,7 @@ func TestDaemonOpenAIComputerExecutorDeepFreezesProviderActionBackingStorage(t *
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			executor, _, probe, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
+			executor, _, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
 			defer executor.EndBatchV1()
 			runtime := executor.runtime.(*openAIComputerDaemonRuntimeProbe)
 			call, err := tools.DecodeOpenAIComputerCallV1(
@@ -1497,7 +1609,7 @@ func TestDaemonOpenAIComputerExecutorRejectsTamperedActionSlicesAndText(t *testi
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			executor, _, probe, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
+			executor, _, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
 			defer executor.EndBatchV1()
 			runtime := executor.runtime.(*openAIComputerDaemonRuntimeProbe)
 			call, err := tools.DecodeOpenAIComputerCallV1(
@@ -1544,7 +1656,7 @@ func TestDaemonOpenAIComputerExecutorRejectsTamperedActionSlicesAndText(t *testi
 }
 
 func TestDaemonOpenAIComputerExecutorConcurrentSameScopeExecutesAtMostOnce(t *testing.T) {
-	executor, _, probe, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, _, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	call, err := tools.DecodeOpenAIComputerCallV1(
 		openAIComputerDaemonCall(
@@ -1626,7 +1738,7 @@ func TestDaemonOpenAIComputerExecutorConcurrentSameScopeExecutesAtMostOnce(t *te
 }
 
 func TestDaemonOpenAIComputerExecutorFinalCaptureWaitsForInflightAction(t *testing.T) {
-	executor, _, probe, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, _, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	call, err := tools.DecodeOpenAIComputerCallV1(
 		openAIComputerDaemonCall(
@@ -1698,43 +1810,8 @@ func TestDaemonOpenAIComputerExecutorFinalCaptureWaitsForInflightAction(t *testi
 	}
 }
 
-func TestDaemonOpenAIComputerExecutorRejectsMissingApprovalSeam(t *testing.T) {
-	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
-	workflow := testGUIWorkflow(coordinator, "session-openai-approval", "turn-openai-approval")
-	workflow.invocationFromContext = agent.ToolInvocationFromContext
-	executor, err := newDaemonOpenAIComputerExecutorV1(
-		workflow,
-		&openAIComputerDaemonRuntimeProbe{tool: &openAIComputerDaemonProbeTool{}},
-		trustedOpenAIComputerProvenanceForDaemon(t),
-		nil,
-	)
-	if err == nil || executor != nil {
-		t.Fatalf("missing approval seam accepted: executor=%v err=%v", executor, err)
-	}
-}
-
-func TestDaemonOpenAIComputerExecutorOrdinaryApprovalDenialDoesNotCommit(t *testing.T) {
-	executor, adapter, probe, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
-	defer executor.EndBatchV1()
-	executor.approve = func(context.Context, string, string) bool { return false }
-	result, err := adapter.ExecuteBatchV1(
-		context.Background(),
-		openAIComputerDaemonCall(`{"type":"click","button":"left","x":10,"y":20}`),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.ToolResult.IsError ||
-		!strings.Contains(result.ToolResult.Content, "action 1 of 1") {
-		t.Fatalf("denied result = %+v", result.ToolResult)
-	}
-	if got := probe.runNames(); len(got) != 1 || got[0] != "final_screenshot" {
-		t.Fatalf("denied mutation reached tool: %v", got)
-	}
-}
-
 func TestDaemonOpenAIComputerExecutorRuntimeErrorsAreRedacted(t *testing.T) {
-	executor, _, _, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	executor, _, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	executor.runtime = openAIComputerRuntimeErrorProbe{
 		err: errors.New("secret typed text must not leak"),
@@ -1749,9 +1826,28 @@ func TestDaemonOpenAIComputerExecutorRuntimeErrorsAreRedacted(t *testing.T) {
 		context.Background(),
 		call,
 	)
+	if err != nil || authority.LeaseID == "" {
+		t.Fatalf("acquire authority: authority=%+v err=%v", authority, err)
+	}
+	scope := tools.OpenAIComputerActionScopeV1{
+		ResponseID:   call.ResponseID,
+		CallID:       call.CallID,
+		Provider:     call.Provider,
+		APISurface:   call.APISurface,
+		ToolContract: call.ToolContract,
+		ActionID:     call.CallID + "/action/1",
+		ActionIndex:  0,
+		ActionCount:  1,
+	}
+	execution, err := executor.ExecuteAuthorizedOpenAIComputerActionV1(
+		context.Background(),
+		authority,
+		scope,
+		call.Actions[0],
+	)
 	if err == nil || strings.Contains(err.Error(), "secret typed text") ||
-		authority.LeaseID != "" {
-		t.Fatalf("runtime error leaked or acquired authority: authority=%+v err=%v", authority, err)
+		execution.CommitState != tools.OpenAIComputerNotCommittedV1 {
+		t.Fatalf("runtime error leaked or committed: execution=%+v err=%v", execution, err)
 	}
 }
 

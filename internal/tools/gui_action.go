@@ -125,7 +125,7 @@ func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string
 	if args.Action == "wait" && strings.TrimSpace(args.Condition) == "" {
 		return agent.GUIActionDescriptor{}, nil
 	}
-	if t.requiresExplicitFirstTargetV1(args) {
+	if t.requiresExplicitFirstTargetV1(ctx, args) {
 		return agent.GUIActionDescriptor{}, nil
 	}
 	effect := agent.GUIActionMutation

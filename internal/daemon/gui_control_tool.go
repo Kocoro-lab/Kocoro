@@ -52,14 +52,6 @@ func newDaemonGUIWorkflow(coordinator *guicontrol.Coordinator, request daemonGUI
 }
 
 func (w *daemonGUIWorkflow) ensureLease(ctx context.Context, descriptor agent.GUIActionDescriptor) (guicontrol.WorkflowLease, error) {
-	return w.ensureLeaseWithObservedTarget(ctx, descriptor, false)
-}
-
-func (w *daemonGUIWorkflow) ensureLeaseWithObservedTarget(
-	ctx context.Context,
-	descriptor agent.GUIActionDescriptor,
-	observedTarget bool,
-) (guicontrol.WorkflowLease, error) {
 	w.mu.Lock()
 	if w.lease != nil {
 		lease := *w.lease
@@ -71,12 +63,10 @@ func (w *daemonGUIWorkflow) ensureLeaseWithObservedTarget(
 		return guicontrol.WorkflowLease{}, fmt.Errorf("computer-use coordinator is unavailable")
 	}
 	allowed := []string(nil)
-	if (observedTarget || descriptor.Effect == agent.GUIActionMutation) &&
+	if descriptor.Effect == agent.GUIActionMutation &&
 		descriptor.TargetBundleID != "" {
 		// A first mutation carries its own exact execution authority. The
-		// separate observedTarget path is reserved for provider-native bootstrap
-		// state already shown to the model. Ordinary observations earn admission
-		// only after their successful acknowledgement.
+		// first verified observation is admitted by FinishAction instead.
 		allowed = []string{descriptor.TargetBundleID}
 	}
 	lease, err := w.coordinator.BeginWorkflow(guicontrol.WorkflowRequest{
@@ -108,6 +98,18 @@ func (w *daemonGUIWorkflow) ensureLeaseWithObservedTarget(
 	w.lease = &lease
 	w.mu.Unlock()
 	return lease, nil
+}
+
+func (w *daemonGUIWorkflow) currentLease() (guicontrol.WorkflowLease, bool) {
+	if w == nil {
+		return guicontrol.WorkflowLease{}, false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.lease == nil {
+		return guicontrol.WorkflowLease{}, false
+	}
+	return *w.lease, true
 }
 
 func (w *daemonGUIWorkflow) runTool(ctx context.Context, tool agent.Tool, argsJSON string) (result agent.ToolResult, runErr error) {
@@ -965,16 +967,6 @@ func wrapOneDaemonGUIToolV1(
 	default:
 		return ro, nil
 	}
-}
-
-func wrapDetachedDaemonGUIToolV1(
-	inner agent.Tool,
-	workflow *daemonGUIWorkflow,
-) (agent.Tool, error) {
-	if inner == nil || inner.Info().Name != "computer_use" {
-		return nil, fmt.Errorf("detached OpenAI computer approval tool is invalid")
-	}
-	return wrapOneDaemonGUIToolV1(inner, workflow)
 }
 
 func wrapDaemonGUITools(registry *agent.ToolRegistry, workflow *daemonGUIWorkflow) {

@@ -457,13 +457,13 @@ func TestOpenAIComputerAdapterRejectsMismatchedBatchAuthorityBeforeAction(t *tes
 	}
 }
 
-func TestOpenAIComputerAdapterShortCircuitsAfterDeniedAction(t *testing.T) {
+func TestOpenAIComputerAdapterShortCircuitsAfterActionFailure(t *testing.T) {
 	executor := &openAIComputerExecutorProbe{
 		executions: []OpenAIComputerActionExecutionV1{
 			{CommitState: OpenAIComputerCommitVerifiedV1},
 			{CommitState: OpenAIComputerNotCommittedV1},
 		},
-		executionErrs: []error{nil, errors.New("fresh approval denied")},
+		executionErrs: []error{nil, errors.New("action backend rejected input")},
 		finalResult:   finalOpenAIComputerObservation(),
 	}
 	adapter := newOpenAIComputerAdapterV1(executor)

@@ -356,8 +356,12 @@ func (t *ComputerUseTool) IsConcurrencySafeCall(string) bool { return false }
 // requiresExplicitFirstTargetV1 prevents unattended workflows from resolving
 // whichever app happens to be frontmost when their first observation runs.
 // A bound Quick Panel target and a prior exact observation are already scoped.
-func (t *ComputerUseTool) requiresExplicitFirstTargetV1(args computerUseArgs) bool {
+func (t *ComputerUseTool) requiresExplicitFirstTargetV1(
+	ctx context.Context,
+	args computerUseArgs,
+) bool {
 	if t == nil || t.targetScope != computerUseTargetScopeExplicitV1 ||
+		hasOpenAINativeComputerActionV1(ctx) ||
 		strings.TrimSpace(args.App) != "" || t.initialTarget != nil || t.snapshot != nil ||
 		t.coordinateFocus != nil {
 		return false
@@ -407,7 +411,7 @@ func (t *ComputerUseTool) runWithGUIOperationLockHeld(
 	if strings.TrimSpace(args.Description) == "" {
 		return agent.ValidationError("missing required parameter: description"), nil
 	}
-	if t.requiresExplicitFirstTargetV1(args) {
+	if t.requiresExplicitFirstTargetV1(ctx, args) {
 		return agent.BusinessError(
 			"computer_use requires an explicit app for the first unattended observation; retry with the app field",
 		), nil
