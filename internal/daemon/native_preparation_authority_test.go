@@ -208,7 +208,9 @@ func TestDaemonNativePreparationBlockedAppFailsBeforeLeaseAndCapture(t *testing.
 
 	err := wrappedDaemonNativePreparer(t, workflow, probe).
 		PrepareNativeToolRequest(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "app policy blocked") {
+	if err == nil ||
+		!strings.Contains(err.Error(), "computer_use_error: app_policy_blocked") ||
+		!strings.Contains(err.Error(), "policy_source: user") {
 		t.Fatalf("blocked native preparation error = %v", err)
 	}
 	if calls, _, _ := probe.snapshot(); calls != 0 {

@@ -3002,7 +3002,8 @@ func (h *httpEventHandler) OnCloudPlan(planType, content string, needsReview boo
 
 // OnApprovalNeeded auto-approves for local HTTP API calls except for tools on
 // the unattended deny-list. HTTP callers are often scripts / automation, so the
-// path stays aligned with scheduled runs. computer_use is currently denied.
+// path stays aligned with scheduled runs. The agent loop honors computer_use
+// only when the separate global Computer Use grant is present.
 func (h *httpEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	return !agent.DisallowsUnattendedAutoApproval(tool)
 }
@@ -3190,7 +3191,8 @@ func (h *sseEventHandler) OnApprovalNeeded(tool string, args string) bool {
 	if h.autoApprove {
 		// daemon.auto_approve=true is a "skip prompts" global, but keep this
 		// routed through the unattended deny-list so a non-unattended-safe
-		// tool still forces a broker round-trip. computer_use is currently denied.
+		// tool still forces a broker round-trip. computer_use is admitted only
+		// through its separate global grant in the agent loop.
 		if !agent.DisallowsUnattendedAutoApproval(tool) {
 			log.Printf("sse: auto-approving %s (auto_approve=true)", tool)
 			return true

@@ -415,17 +415,25 @@ func TestComputerUse_WaitAcceptsBoundedDelayWithoutCondition(t *testing.T) {
 	}
 }
 
-func TestComputerUse_FullscreenScreenshotUsesCapturePipeline(t *testing.T) {
+func TestComputerUse_ScreenshotUsesExactTargetWindowObservation(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("computer_use runtime is macOS-only")
 	}
-	tool := newTestComputerUse(newFakeAXCaller())
-	tool.captureScreen = func(int) (string, agent.ImageBlock, error) {
-		return "/tmp/fake-computer-use.png", agent.ImageBlock{MediaType: "image/png", Data: "encoded"}, nil
-	}
-	result, err := tool.Run(context.Background(), `{"action":"screenshot","description":"Capture desktop"}`)
-	if err != nil || result.IsError || len(result.Images) != 1 || result.Images[0].Data != "encoded" {
+	harness := newComputerUseCoordinateHarness(t)
+	harness.fake.queue("resolve_pid", `{"pid":42}`)
+	harness.queueObservation(harness.tree, harness.tree)
+
+	result, err := harness.tool.Run(
+		context.Background(),
+		`{"action":"screenshot","app":"Fixture App","description":"Capture Fixture App"}`,
+	)
+	if err != nil || result.IsError || len(result.Images) != 1 {
 		t.Fatalf("Run result=%+v err=%v", result, err)
+	}
+	if harness.tool.coordinateArtifact == nil ||
+		!strings.Contains(result.Content, "state_id: ") ||
+		!strings.Contains(result.Content, "app: Fixture App") {
+		t.Fatalf("screenshot did not publish exact-window state and coordinates: %+v", result)
 	}
 }
 

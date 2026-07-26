@@ -124,28 +124,100 @@ func TestComputerUseObservationFailureAndNonScreenshotClearPriorArtifact(t *test
 	}
 }
 
-func TestComputerUseStandaloneScreenshotIsExplicitlyNonActionableAndClearsArtifact(t *testing.T) {
+func TestComputerUseStandaloneScreenshotUsesSameStableWindowTransaction(t *testing.T) {
 	requireComputerUseDarwin(t)
 	harness := newComputerUseCoordinateHarness(t)
 	harness.tool.coordinateArtifact = &harness.artifact
-	harness.tool.captureScreen = func(width int) (string, agent.ImageBlock, error) {
-		if width != DefaultAPIWidth {
-			t.Fatalf("capture width = %d", width)
-		}
-		return "", agent.ImageBlock{MediaType: "image/png", Data: "encoded"}, nil
-	}
+	harness.fake.queue("resolve_pid", `{"pid":42}`)
+	harness.queueObservation(harness.tree, harness.tree)
 	result, err := harness.tool.Run(context.Background(), `{
-		"action":"screenshot","description":"Capture overview"
+		"action":"screenshot","app":"Fixture App","description":"Capture Fixture App"
 	}`)
 	if err != nil || result.IsError || len(result.Images) != 1 {
 		t.Fatalf("standalone screenshot result=%+v err=%v", result, err)
 	}
-	if !strings.Contains(result.Content, "coordinate_space: none") ||
-		!strings.Contains(result.Content, "actionable: false") {
-		t.Fatalf("standalone screenshot did not disclose coordinate contract: %s", result.Content)
+	if harness.tool.coordinateArtifact == nil ||
+		!strings.Contains(result.Content, "state_id: ") ||
+		!strings.Contains(result.Content, "app: Fixture App") {
+		t.Fatalf("standalone screenshot did not publish exact-window state: %s", result.Content)
 	}
-	if harness.tool.coordinateArtifact != nil {
-		t.Fatal("standalone screenshot retained actionable artifact")
+	wantMethods := []string{
+		"resolve_pid", "read_tree", "display_topology",
+		"capture_coordinate_window", "read_tree",
+	}
+	if got := fakeAXMethods(harness.fake.calls); !reflect.DeepEqual(got, wantMethods) {
+		t.Fatalf("AX sequence = %v, want exact-window transaction %v", got, wantMethods)
+	}
+}
+
+func TestComputerUseScreenshotReturnsRecoverableExactWindowFailures(t *testing.T) {
+	requireComputerUseDarwin(t)
+	tests := []struct {
+		code     string
+		retry    bool
+		contains string
+	}{
+		{code: "window_not_found", retry: true, contains: "open one normal app window"},
+		{code: "window_not_actionable", retry: true, contains: "fully visible"},
+		{code: "window_changed", retry: true, contains: "stop moving or resizing"},
+		{code: "window_identity_mismatch", retry: false, contains: "re-observe the app"},
+	}
+	for _, test := range tests {
+		t.Run(test.code, func(t *testing.T) {
+			harness := newComputerUseCoordinateHarness(t)
+			harness.fake.queue("resolve_pid", `{"pid":42}`)
+			harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+			harness.fake.queue("display_topology", marshalDisplayTopology(t, harness.topology))
+			failure := captureWindowJSONMap(
+				t,
+				loadCoordinateFixture(t, "capture_coordinate_window.response.failure.v1.json"),
+			)
+			failure["failure_code"] = test.code
+			failure["retry_safe"] = test.retry
+			harness.fake.queue("capture_coordinate_window", string(marshalCaptureWindowJSON(t, failure)))
+
+			result, err := harness.tool.Run(context.Background(), `{
+				"action":"screenshot","app":"Fixture App","description":"Capture Fixture App"
+			}`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.IsError || result.IsRetryable != test.retry ||
+				!strings.Contains(result.Content, "computer_use_error: "+test.code) ||
+				!strings.Contains(result.Content, test.contains) {
+				t.Fatalf("result = %+v", result)
+			}
+			if len(result.Images) != 0 || harness.tool.coordinateArtifact != nil {
+				t.Fatalf("failed capture published image or coordinate authority: %+v", result)
+			}
+		})
+	}
+}
+
+func TestComputerUseScreenshotExplainsAppWithoutUniqueWindow(t *testing.T) {
+	requireComputerUseDarwin(t)
+	fake := newFakeAXCaller()
+	fake.queue("resolve_pid", `{"pid":77}`)
+	fake.queue("read_tree", `{
+		"schema_version":1,"app":"Finder","app_name":"Finder",
+		"bundle_id":"com.apple.finder","pid":77,"window":"","window_title":"",
+		"window_id":null,"window_frame":null,"elements":[],"ref_paths":{}
+	}`)
+	tool := newTestComputerUse(fake)
+
+	result, err := tool.Run(context.Background(), `{
+		"action":"screenshot","app":"Finder","description":"Capture Finder"
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "computer_use_error: window_not_found") ||
+		!strings.Contains(result.Content, "open one normal app window") {
+		t.Fatalf("result = %+v", result)
+	}
+	if got := fakeAXMethods(fake.calls); !reflect.DeepEqual(got, []string{"resolve_pid", "read_tree"}) {
+		t.Fatalf("missing-window path made extra GUI calls: %v", got)
 	}
 }
 

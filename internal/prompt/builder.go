@@ -644,8 +644,8 @@ func macOSAutomationGuidance(toolNames []string) string {
 	}
 	var bullets strings.Builder
 	if has("computer_use") {
-		bullets.WriteString("- Prefer `computer_use` for native macOS UI. Start with action=get_app_state, then act with the returned state_id and ref.\n")
-		bullets.WriteString("- Re-observe after a mutation or stale-state error. Request include_screenshot only when pixels are needed; semantic state is the default.\n")
+		bullets.WriteString("- Use `computer_use` for native macOS UI. Start with an exact app name unless this run already identifies the user's original foreground app, then act with the returned state_id and ref.\n")
+		bullets.WriteString("- One state belongs to one existing app window. Re-observe after a mutation or stale-state error. screenshot and include_screenshot capture only that target window and should be requested only when pixels are needed.\n")
 		bullets.WriteString("- Use coordinate click/move only when the Accessibility tree has no usable ref.\n")
 	} else if has("accessibility") {
 		bullets.WriteString("- Prefer `accessibility` (AX API) over `computer` for UI interactions — faster, no screenshot needed.\n")

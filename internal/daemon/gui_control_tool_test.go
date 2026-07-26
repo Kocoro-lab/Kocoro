@@ -89,6 +89,19 @@ type daemonNativeAllTraitsProbe struct {
 	prepareCalls int
 }
 
+type daemonNativeNoPreparationProbe struct {
+	guiProbeTool
+}
+
+func (t *daemonNativeNoPreparationProbe) NativeToolDef() *client.NativeToolDef {
+	return &client.NativeToolDef{
+		Type:            client.NativeComputerToolType,
+		Name:            client.NativeComputerToolName,
+		DisplayWidthPx:  1280,
+		DisplayHeightPx: 800,
+	}
+}
+
 func (t *daemonNativeAllTraitsProbe) NativeToolDef() *client.NativeToolDef {
 	return &client.NativeToolDef{
 		Type:            client.NativeComputerToolType,
@@ -255,6 +268,60 @@ func TestDaemonGUIToolAppPolicyAdmission(t *testing.T) {
 	}
 }
 
+func TestDaemonGUIToolAppPolicyDenialReportsSourceAndRecovery(t *testing.T) {
+	store := NewComputerUseAppPolicyStore(t.TempDir())
+	if _, err := store.Update("com.example.blocked", ComputerUseAppPolicyBlocked); err != nil {
+		t.Fatal(err)
+	}
+	workflow := testGUIWorkflow(
+		guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{}),
+		"sess-policy-report",
+		"turn-policy-report",
+	)
+	workflow.appPolicy = store
+
+	for _, test := range []struct {
+		name       string
+		descriptor agent.GUIActionDescriptor
+		source     string
+		recovery   string
+	}{
+		{
+			name: "user block",
+			descriptor: agent.GUIActionDescriptor{
+				Participates: true, ActionKind: "get_app_state", Effect: agent.GUIActionObservation,
+				TargetBundleID: "com.example.blocked", TargetAppName: "Editor",
+			},
+			source:   "policy_source: user",
+			recovery: "remove this saved app block",
+		},
+		{
+			name: "built in block",
+			descriptor: agent.GUIActionDescriptor{
+				Participates: true, ActionKind: "get_app_state", Effect: agent.GUIActionObservation,
+				TargetBundleID: "com.apple.Terminal", TargetAppName: "Terminal",
+			},
+			source:   "policy_source: built_in",
+			recovery: "choose another app",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wrapped := &daemonGUIToolBase{
+				inner:    &guiProbeTool{name: "computer_use", descriptor: test.descriptor},
+				workflow: workflow,
+			}
+			result, ok := wrapped.ApprovalAdmissionDenialResult(context.Background(), `{}`)
+			if !ok || !result.IsError ||
+				!strings.Contains(result.Content, "computer_use_error: app_policy_blocked") ||
+				!strings.Contains(result.Content, "target_app: "+test.descriptor.TargetAppName) ||
+				!strings.Contains(result.Content, test.source) ||
+				!strings.Contains(result.Content, test.recovery) {
+				t.Fatalf("denial result = %+v, available=%v", result, ok)
+			}
+		})
+	}
+}
+
 type driftingGUIProbeTool struct {
 	descriptors []agent.GUIActionDescriptor
 	calls       int
@@ -289,7 +356,9 @@ func TestDaemonGUIToolRechecksPolicyAfterApprovalDescriptorDrift(t *testing.T) {
 		t.Fatalf("initial admission = %q, want global-permission inheritance", got)
 	}
 	result, err := workflow.runTool(context.Background(), tool, `{}`)
-	if err != nil || !result.IsError || !strings.Contains(result.Content, "app policy blocked") {
+	if err != nil || !result.IsError ||
+		!strings.Contains(result.Content, "computer_use_error: app_policy_blocked") ||
+		!strings.Contains(result.Content, "policy_source: built_in") {
 		t.Fatalf("drift result = %+v, err=%v", result, err)
 	}
 	if tool.runs != 0 {
@@ -954,6 +1023,37 @@ func TestWrapDaemonGUIToolsPreservesEveryNativeToolTraitAndRunDelegation(t *test
 	result, err := wrapped.Run(context.Background(), args)
 	if err != nil || result.Content != "native probe reached" || probe.calls != 1 || probe.lastArgs != args {
 		t.Fatalf("wrapped native Run result=%+v err=%v calls=%d args=%q", result, err, probe.calls, probe.lastArgs)
+	}
+}
+
+func TestWrapDaemonGUIToolsDoesNotInventNativeRequestPreparation(t *testing.T) {
+	workflow := testGUIWorkflow(
+		guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{}),
+		"sess-native-no-prepare",
+		"turn-native-no-prepare",
+	)
+	probe := &daemonNativeNoPreparationProbe{guiProbeTool: guiProbeTool{
+		name: "computer",
+		descriptor: agent.GUIActionDescriptor{
+			Participates: true, ActionKind: "get_app_state",
+			Effect:         agent.GUIActionObservation,
+			TargetBundleID: "com.example.Editor", TargetAppName: "Editor",
+			ExecutionPath: "accessibility",
+		},
+	}}
+	reg := agent.NewToolRegistry()
+	reg.Register(probe)
+
+	wrapDaemonGUITools(reg, workflow)
+	wrapped, ok := reg.Get("computer")
+	if !ok {
+		t.Fatal("wrapped native probe was not registered")
+	}
+	if _, ok := wrapped.(agent.NativeToolProvider); !ok {
+		t.Fatalf("wrapped native tool lost NativeToolProvider: %T", wrapped)
+	}
+	if _, ok := wrapped.(agent.NativeToolRequestPreparer); ok {
+		t.Fatalf("wrapper invented request-time GUI preparation: %T", wrapped)
 	}
 }
 

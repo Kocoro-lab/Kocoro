@@ -133,8 +133,8 @@ type RunAgentRequest struct {
 
 // ForegroundHint identifies the app that was frontmost when the user summoned
 // the Desktop quick panel (captured before Kocoro stole focus). Folded into the
-// run's StickyContext so the agent's accessibility/screenshot tools target this
-// app instead of Kocoro when the user refers to "the current app".
+// run's StickyContext and run-local computer_use target so the tool observes
+// this app instead of Kocoro when the user refers to "the current app".
 type ForegroundHint struct {
 	PID      int    `json:"pid,omitempty"`
 	AppName  string `json:"app_name,omitempty"`
@@ -1884,6 +1884,22 @@ func prepareComputerUseRegistryForRun(
 		registry, cloneErr := tools.CloneWithGenericComputerUseForRun(baseReg, runCfg, false)
 		return registry, nil, true, cloneErr
 	}
+	// Anthropic's native computer contract is intentionally not admitted yet.
+	// Its provider schema exposes actions the local adapter cannot execute, and
+	// its request-time screenshot preparation can observe or fail before the
+	// model chooses Computer Use. Keep one reliable function-tool path until the
+	// native adapter has a stable canvas and full contract coverage.
+	if profile.ToolContract() == client.ToolContractAnthropicComputer20251124 {
+		log.Printf(
+			"daemon: Anthropic native computer is not admitted; using generic computer_use",
+		)
+		registry, cloneErr := tools.CloneWithGenericComputerUseForRun(
+			baseReg,
+			runCfg,
+			profile.SupportsToolResultImages(),
+		)
+		return registry, nil, true, cloneErr
+	}
 	registry, err := tools.CloneWithResolvedComputerUseProfileForRun(baseReg, runCfg, profile)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("resolved computer-use profile: %w", err)
@@ -2796,6 +2812,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			PID: hint.PID, AppName: hint.AppName, BundleID: hint.BundleID,
 		}); err != nil {
 			return nil, fmt.Errorf("bind foreground computer-use target: %w", err)
+		}
+	}
+	if unattendedRun && (executionProfile == nil ||
+		executionProfile.ExecutionMode() == client.ExecutionModeFunctionComputerUse) {
+		if err := tools.RequireExplicitComputerUseTargetForRun(reg); err != nil {
+			return nil, fmt.Errorf("scope unattended computer-use target: %w", err)
 		}
 	}
 	openAIComputerPrivate, err :=

@@ -127,45 +127,23 @@ func TestDecodeAnthropicComputerArgsRejectsDuplicateMembers(t *testing.T) {
 	}
 }
 
-func TestAnthropicComputerAdapterPreparesFirstDeclarationBeforeScreenshot(t *testing.T) {
+func TestAnthropicComputerAdapterUsesFixedDeclarationAndCapturesOnlyOnScreenshot(t *testing.T) {
 	requireComputerUseDarwin(t)
 	harness := newComputerUseCoordinateHarness(t)
 	adapter := NewAnthropicComputerAdapter(harness.tool, 1280, 800)
-	initial := adapter.NativeToolDef()
-	if initial.DisplayWidthPx != 1280 || initial.DisplayHeightPx != 800 {
-		t.Fatalf("initial native definition = %+v", initial)
+	before := adapter.NativeToolDef()
+	if before.DisplayWidthPx != 1280 || before.DisplayHeightPx != 800 {
+		t.Fatalf("initial native definition = %+v", before)
+	}
+	if len(harness.fake.calls) != 0 || harness.tool.snapshot != nil ||
+		harness.tool.coordinateArtifact != nil {
+		t.Fatal("native declaration observed the GUI before the model requested screenshot")
 	}
 
 	harness.queueObservation(harness.tree, harness.tree)
-	if err := adapter.PrepareNativeToolRequest(context.Background()); err != nil {
-		t.Fatalf("PrepareNativeToolRequest: %v", err)
-	}
-	if adapter.pendingBootstrap == nil || harness.tool.snapshot != nil ||
-		harness.tool.refs != nil || harness.tool.coordinateArtifact != nil {
-		t.Fatalf("native preparation did not quarantine hidden authority: pending=%+v raw=%+v/%+v/%+v",
-			adapter.pendingBootstrap, harness.tool.snapshot, harness.tool.refs, harness.tool.coordinateArtifact)
-	}
-
-	frame := adapter.pendingBootstrap.artifact.Frame()
-	definition := adapter.NativeToolDef()
-	if definition.DisplayWidthPx != frame.FinalImage.WidthPX ||
-		definition.DisplayHeightPx != frame.FinalImage.HeightPX {
-		t.Fatalf("prepared native dimensions=%dx%d image=%dx%d",
-			definition.DisplayWidthPx, definition.DisplayHeightPx,
-			frame.FinalImage.WidthPX, frame.FinalImage.HeightPX)
-	}
-
-	// The provider's first screenshot must consume the exact one-shot prepared
-	// artifact. Re-capturing here could change dimensions after the request's
-	// native definition was already serialized.
-	beforeFirstScreenshot := len(harness.fake.calls)
 	first, err := adapter.Run(context.Background(), `{"action":"screenshot"}`)
 	if err != nil || first.IsError || len(first.Images) != 1 {
-		t.Fatalf("prepared first screenshot result=%+v err=%v", first, err)
-	}
-	if len(harness.fake.calls) != beforeFirstScreenshot {
-		t.Fatalf("first screenshot recaptured after schema declaration: %+v",
-			harness.fake.calls[beforeFirstScreenshot:])
+		t.Fatalf("lazy first screenshot result=%+v err=%v", first, err)
 	}
 	for _, secret := range []string{"state_id", "frame_id", "topology", "digest", harness.tool.snapshot.id} {
 		if strings.Contains(first.Content, secret) {
@@ -175,8 +153,15 @@ func TestAnthropicComputerAdapterPreparesFirstDeclarationBeforeScreenshot(t *tes
 	if !reflect.DeepEqual(first.Images[0], harness.tool.coordinateArtifact.ImageBlock()) {
 		t.Fatal("provider screenshot is not the exact raw ComputerUse artifact")
 	}
-	// Once delivered, the pending bootstrap is consumed and later screenshots
-	// return to the normal fresh strict observation/capture path.
+	frame := harness.tool.coordinateArtifact.Frame()
+	if frame.FinalImage.WidthPX != 1280 || frame.FinalImage.HeightPX != 800 {
+		t.Fatalf("provider image = %dx%d, want fixed 1280x800", frame.FinalImage.WidthPX, frame.FinalImage.HeightPX)
+	}
+	after := adapter.NativeToolDef()
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("native declaration changed after screenshot: before=%+v after=%+v", before, after)
+	}
+
 	harness.queueObservation(harness.tree, harness.tree)
 	second, err := adapter.Run(context.Background(), `{"action":"screenshot"}`)
 	if err != nil || second.IsError || len(second.Images) != 1 {
@@ -191,20 +176,15 @@ func TestAnthropicComputerAdapterPreparesFirstDeclarationBeforeScreenshot(t *tes
 	}
 }
 
-func TestAnthropicComputerAdapterPreparedPrivateImageCannotAuthorizeMutation(t *testing.T) {
+func TestAnthropicComputerAdapterMutationRequiresProviderVisibleScreenshot(t *testing.T) {
 	requireComputerUseDarwin(t)
 	harness := newComputerUseCoordinateHarness(t)
 	adapter := NewAnthropicComputerAdapter(harness.tool, 1280, 800)
-	harness.queueObservation(harness.tree, harness.tree)
-	if err := adapter.PrepareNativeToolRequest(context.Background()); err != nil {
-		t.Fatalf("PrepareNativeToolRequest: %v", err)
-	}
 	before := len(harness.fake.calls)
 
 	for _, payload := range []string{
 		`{"action":"left_click","coordinate":[1,1]}`,
 		`{"action":"type","text":"hidden"}`,
-		`{"action":"wait","duration":0.01}`,
 	} {
 		result, err := adapter.Run(context.Background(), payload)
 		if err != nil || !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness {
@@ -220,44 +200,25 @@ func TestAnthropicComputerAdapterPreparedPrivateImageCannotAuthorizeMutation(t *
 	}
 }
 
-func TestAnthropicComputerAdapterTamperedPreparedImageFailsWithoutRecapture(t *testing.T) {
-	requireComputerUseDarwin(t)
-	harness := newComputerUseCoordinateHarness(t)
-	adapter := NewAnthropicComputerAdapter(harness.tool, 1280, 800)
-	harness.queueObservation(harness.tree, harness.tree)
-	if err := adapter.PrepareNativeToolRequest(context.Background()); err != nil {
-		t.Fatalf("PrepareNativeToolRequest: %v", err)
-	}
-	adapter.pendingBootstrap.artifact.frame.FrameID = "frame_tampered_after_prepare"
-	before := len(harness.fake.calls)
-
-	result, err := adapter.Run(context.Background(), `{"action":"screenshot"}`)
-	if err != nil || !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness ||
-		len(result.Images) != 0 {
-		t.Fatalf("tampered bootstrap result=%+v err=%v", result, err)
-	}
-	if len(harness.fake.calls) != before {
-		t.Fatalf("tampered bootstrap silently recaptured: %+v", harness.fake.calls[before:])
-	}
-	if adapter.pendingBootstrap != nil || harness.tool.snapshot != nil ||
-		harness.tool.refs != nil || harness.tool.coordinateArtifact != nil {
-		t.Fatal("tampered bootstrap retained hidden action authority")
-	}
-}
-
-func TestAnthropicComputerAdapterPreparationFailureClearsRawAuthority(t *testing.T) {
+func TestAnthropicComputerAdapterFailedFirstScreenshotCanRetryFresh(t *testing.T) {
 	requireComputerUseDarwin(t)
 	harness := newComputerUseCoordinateHarness(t)
 	adapter := NewAnthropicComputerAdapter(harness.tool, 1280, 800)
 	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
 	harness.fake.queue("display_topology", `{}`)
 
-	if err := adapter.PrepareNativeToolRequest(context.Background()); err == nil {
-		t.Fatal("invalid strict capture unexpectedly prepared a native request")
+	failed, err := adapter.Run(context.Background(), `{"action":"screenshot"}`)
+	if err != nil || !failed.IsError || len(failed.Images) != 0 {
+		t.Fatalf("failed first screenshot = %+v, err=%v", failed, err)
 	}
-	if adapter.pendingBootstrap != nil || harness.tool.snapshot != nil ||
-		harness.tool.refs != nil || harness.tool.coordinateArtifact != nil {
-		t.Fatal("failed preparation retained partial hidden authority")
+	if harness.tool.coordinateArtifact != nil || adapter.visibleImage != nil {
+		t.Fatal("failed first screenshot retained coordinate or provider-visible authority")
+	}
+
+	harness.queueObservation(harness.tree, harness.tree)
+	retried, err := adapter.Run(context.Background(), `{"action":"screenshot"}`)
+	if err != nil || retried.IsError || len(retried.Images) != 1 {
+		t.Fatalf("fresh screenshot retry = %+v, err=%v", retried, err)
 	}
 }
 
@@ -429,9 +390,6 @@ func TestAnthropicComputerAdapterMutationReobservesAndPreservesGUIOutcome(t *tes
 	adapter := NewAnthropicComputerAdapter(
 		harness.tool, frame.FinalImage.WidthPX, frame.FinalImage.HeightPX)
 	harness.queueObservation(harness.tree, harness.tree)
-	if err := adapter.PrepareNativeToolRequest(context.Background()); err != nil {
-		t.Fatalf("PrepareNativeToolRequest: %v", err)
-	}
 	if first, err := adapter.Run(context.Background(), `{"action":"screenshot"}`); err != nil || first.IsError {
 		t.Fatalf("initial screenshot=%+v err=%v", first, err)
 	}
@@ -493,9 +451,6 @@ func TestAnthropicComputerAdapterWaitReturnsFreshExactScreenshot(t *testing.T) {
 	adapter := NewAnthropicComputerAdapter(
 		harness.tool, frame.FinalImage.WidthPX, frame.FinalImage.HeightPX)
 	harness.queueObservation(harness.tree, harness.tree)
-	if err := adapter.PrepareNativeToolRequest(context.Background()); err != nil {
-		t.Fatalf("PrepareNativeToolRequest: %v", err)
-	}
 	if first, err := adapter.Run(context.Background(), `{"action":"screenshot"}`); err != nil || first.IsError {
 		t.Fatalf("initial screenshot=%+v err=%v", first, err)
 	}

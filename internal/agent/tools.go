@@ -261,6 +261,14 @@ type ApprovalAdmissionChecker interface {
 	ApprovalAdmission(ctx context.Context, argsJSON string) ApprovalAdmissionDecision
 }
 
+// ApprovalAdmissionDenialReporter optionally replaces the generic permission
+// denial shown to the model with a structured, redacted reason. It is queried
+// only after ApprovalAdmission returned deny; it cannot turn a denial into an
+// allow or execute the tool.
+type ApprovalAdmissionDenialReporter interface {
+	ApprovalAdmissionDenialResult(ctx context.Context, argsJSON string) (ToolResult, bool)
+}
+
 type ApprovalAdmissionDecision string
 
 const (
@@ -821,8 +829,10 @@ func refreshProviderNativeToolSchemas(reg *ToolRegistry, schemas []client.Tool) 
 		}
 		// Capture NativeToolDef exactly once so an asynchronously changing
 		// observation cannot mix dimensions from two different snapshots.
-		// Function schemas stay byte-for-byte unchanged, including defer_loading.
-		refreshed[index] = buildProviderNativeToolSchema(def)
+		// Keep request-selection metadata stable while refreshing native fields.
+		rebuilt := buildProviderNativeToolSchema(def)
+		rebuilt.DeferLoading = schema.DeferLoading
+		refreshed[index] = rebuilt
 	}
 	return refreshed
 }

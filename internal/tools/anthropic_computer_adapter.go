@@ -11,7 +11,6 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
-	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 )
 
 // AnthropicComputerAdapter is an experimental provider-native shell around
@@ -26,9 +25,7 @@ type AnthropicComputerAdapter struct {
 	raw                    *ComputerUseTool
 	initialDisplayWidthPX  int
 	initialDisplayHeightPX int
-	pendingBootstrap       *anthropicComputerBootstrap
 	visibleImage           *anthropicComputerImageIdentity
-	hasExposedImage        bool
 }
 
 type anthropicComputerImageIdentity struct {
@@ -38,13 +35,6 @@ type anthropicComputerImageIdentity struct {
 	widthPX   int
 	heightPX  int
 	expiresAt time.Time
-}
-
-type anthropicComputerBootstrap struct {
-	snapshot *computerUseSnapshot
-	refs     map[string]refEntry
-	artifact *CoordinateWindowArtifactV1
-	identity anthropicComputerImageIdentity
 }
 
 func NewAnthropicComputerAdapter(
@@ -87,18 +77,9 @@ func (a *AnthropicComputerAdapter) NativeToolDef() *client.NativeToolDef {
 	if a == nil {
 		return nil
 	}
-	width, height := a.initialDisplayWidthPX, a.initialDisplayHeightPX
-	if a.pendingBootstrap != nil {
-		width, height = a.pendingBootstrap.identity.widthPX, a.pendingBootstrap.identity.heightPX
-	} else if a.raw != nil && a.raw.coordinateArtifact != nil {
-		frame := a.raw.coordinateArtifact.Frame()
-		if frame.FinalImage.WidthPX > 0 && frame.FinalImage.HeightPX > 0 {
-			width, height = frame.FinalImage.WidthPX, frame.FinalImage.HeightPX
-		}
-	}
 	return &client.NativeToolDef{
 		Type: client.NativeComputerToolType, Name: client.NativeComputerToolName,
-		DisplayWidthPx: width, DisplayHeightPx: height,
+		DisplayWidthPx: a.initialDisplayWidthPX, DisplayHeightPx: a.initialDisplayHeightPX,
 	}
 }
 
@@ -145,7 +126,7 @@ func (identity anthropicComputerImageIdentity) matches(
 }
 
 func (a *AnthropicComputerAdapter) providerImageIsCurrent() bool {
-	return a != nil && a.hasExposedImage && a.visibleImage != nil && a.raw != nil &&
+	return a != nil && a.visibleImage != nil && a.raw != nil &&
 		a.visibleImage.matches(a.raw, a.raw.snapshot, a.raw.coordinateArtifact)
 }
 
@@ -166,165 +147,7 @@ func (a *AnthropicComputerAdapter) markCurrentImageVisible() error {
 		return err
 	}
 	a.visibleImage = &identity
-	a.hasExposedImage = true
 	return nil
-}
-
-func (a *AnthropicComputerAdapter) discardUnexposedAuthority() {
-	if a == nil || a.raw == nil {
-		return
-	}
-	a.raw.snapshot = nil
-	a.raw.refs = nil
-	a.raw.coordinateArtifact = nil
-}
-
-func (a *AnthropicComputerAdapter) DescribeNativeToolRequestPreparation(
-	ctx context.Context,
-) (agent.GUIActionDescriptor, error) {
-	if a == nil || a.raw == nil {
-		return agent.GUIActionDescriptor{}, fmt.Errorf("provider-native computer adapter is unavailable")
-	}
-	payload, err := marshalAnthropicRawArgs(computerUseArgs{
-		Action: "get_app_state", Description: "Prepare first native computer screenshot",
-		IncludeScreenshot: true,
-	})
-	if err != nil {
-		return agent.GUIActionDescriptor{}, err
-	}
-	return a.raw.DescribeGUIAction(ctx, payload)
-}
-
-func (a *AnthropicComputerAdapter) validateNativePreparationAuthority(
-	ctx context.Context,
-) error {
-	if !guicontrol.ExecutionAuthorityPresent(ctx) {
-		// Direct unit/CLI observation remains available. Daemon execution is
-		// distinguishable because its wrapper always installs a genuine claim.
-		return nil
-	}
-	descriptor, err := a.DescribeNativeToolRequestPreparation(ctx)
-	if err != nil {
-		return fmt.Errorf("provider-native computer preparation authority target is unavailable: %w", err)
-	}
-	invocation, ok := agent.ToolInvocationFromContext(ctx)
-	scope := guicontrol.ExecutionScope{
-		ToolName:       client.NativeComputerToolName,
-		ToolUseID:      invocation.ToolUseID,
-		ActionKind:     descriptor.ActionKind,
-		Effect:         string(guicontrol.ComputerUseActionObservation),
-		TargetBundleID: descriptor.TargetBundleID,
-		ExecutionPath:  descriptor.ExecutionPath,
-	}
-	if !ok || invocation.ToolName != client.NativeComputerToolName ||
-		descriptor.Effect != agent.GUIActionObservation ||
-		!guicontrol.ExecutionAuthorized(ctx, scope) {
-		return fmt.Errorf("provider-native computer preparation lacks exact daemon execution authority")
-	}
-	return nil
-}
-
-// PrepareNativeToolRequest creates the exact first provider image immediately
-// before request construction. The observation is Accessibility-first and uses
-// the normal strict tree → topology → exact-window capture → tree transaction.
-//
-// Its action authority is moved out of the raw ComputerUseTool until the
-// provider actually receives the image. This prevents a model from mutating
-// against an internal screenshot it has never seen. The first screenshot call
-// consumes the same finalized artifact byte-for-byte, so its dimensions cannot
-// drift after the native schema has been serialized.
-func (a *AnthropicComputerAdapter) PrepareNativeToolRequest(ctx context.Context) error {
-	if a == nil || a.raw == nil {
-		return fmt.Errorf("provider-native computer adapter is unavailable")
-	}
-	if err := a.validateNativePreparationAuthority(ctx); err != nil {
-		return err
-	}
-	if a.hasExposedImage {
-		return nil
-	}
-
-	computerUseGUIOperationMu.Lock()
-	defer computerUseGUIOperationMu.Unlock()
-	if a.hasExposedImage {
-		return nil
-	}
-	if a.pendingBootstrap != nil {
-		if a.pendingBootstrap.identity.matches(
-			a.raw,
-			a.pendingBootstrap.snapshot,
-			a.pendingBootstrap.artifact,
-		) {
-			return nil
-		}
-		a.pendingBootstrap = nil
-	}
-	a.discardUnexposedAuthority()
-
-	payload, err := marshalAnthropicRawArgs(computerUseArgs{
-		Action: "get_app_state", Description: "Prepare first native computer screenshot",
-		IncludeScreenshot: true,
-	})
-	if err != nil {
-		return fmt.Errorf("prepare first native computer screenshot: %w", err)
-	}
-	result, runErr := a.raw.runWithGUIOperationLockHeld(ctx, payload)
-	if runErr != nil || result.IsError || len(result.Images) != 1 ||
-		a.raw.snapshot == nil || a.raw.coordinateArtifact == nil {
-		a.discardUnexposedAuthority()
-		if runErr != nil {
-			return fmt.Errorf("prepare first native computer screenshot: %w", runErr)
-		}
-		return fmt.Errorf("prepare first native computer screenshot: strict exact image unavailable")
-	}
-	identity, err := anthropicComputerImageIdentityFrom(
-		a.raw, a.raw.snapshot, a.raw.coordinateArtifact)
-	if err != nil || !reflectImageBlockV1(
-		result.Images[0], a.raw.coordinateArtifact.ImageBlock()) {
-		a.discardUnexposedAuthority()
-		if err != nil {
-			return fmt.Errorf("prepare first native computer screenshot: %w", err)
-		}
-		return fmt.Errorf("prepare first native computer screenshot: image does not match coordinate authority")
-	}
-	// Re-resolve after capture. If the foreground target changed between daemon
-	// admission and the strict screenshot transaction, the original action
-	// capability no longer matches and the image must never reach the provider.
-	if err := a.validateNativePreparationAuthority(ctx); err != nil {
-		a.discardUnexposedAuthority()
-		return err
-	}
-	a.pendingBootstrap = &anthropicComputerBootstrap{
-		snapshot: a.raw.snapshot,
-		refs:     a.raw.refs,
-		artifact: a.raw.coordinateArtifact,
-		identity: identity,
-	}
-	a.discardUnexposedAuthority()
-	return nil
-}
-
-func (a *AnthropicComputerAdapter) consumePreparedBootstrap() agent.ToolResult {
-	if a == nil || a.raw == nil || a.pendingBootstrap == nil {
-		return agent.BusinessError("native computer request was not prepared; retry the request before calling screenshot")
-	}
-	pending := a.pendingBootstrap
-	if a.raw.snapshot != nil || a.raw.refs != nil || a.raw.coordinateArtifact != nil ||
-		!pending.identity.matches(a.raw, pending.snapshot, pending.artifact) {
-		a.pendingBootstrap = nil
-		a.discardUnexposedAuthority()
-		return agent.BusinessError("prepared native computer screenshot authority changed; retry the request")
-	}
-	a.raw.snapshot = pending.snapshot
-	a.raw.refs = pending.refs
-	a.raw.coordinateArtifact = pending.artifact
-	a.pendingBootstrap = nil
-	a.visibleImage = &pending.identity
-	a.hasExposedImage = true
-	return agent.ToolResult{
-		Content: "Screenshot captured from the current exact Accessibility target.",
-		Images:  []agent.ImageBlock{pending.artifact.ImageBlock()},
-	}
 }
 
 type anthropicComputerArgs struct {
@@ -836,6 +659,34 @@ func (declaration anthropicNativeDisplayDeclaration) matchesArtifact(raw *Comput
 		frame.FinalImage.HeightPX == declaration.heightPX
 }
 
+func fitAnthropicArtifactToDeclaration(
+	raw *ComputerUseTool,
+	declaration anthropicNativeDisplayDeclaration,
+) error {
+	if raw == nil || raw.coordinateArtifact == nil {
+		return fmt.Errorf("strict provider screenshot has no coordinate artifact")
+	}
+	profile, err := anthropicFixedCanvasProfileV1(
+		declaration.widthPX,
+		declaration.heightPX,
+	)
+	if err != nil {
+		return err
+	}
+	fitted, err := FitCoordinateWindowArtifactToCanvasV1(
+		*raw.coordinateArtifact,
+		declaration.widthPX,
+		declaration.heightPX,
+		profile,
+	)
+	if err != nil {
+		raw.coordinateArtifact = nil
+		return err
+	}
+	raw.coordinateArtifact = &fitted
+	return nil
+}
+
 func sanitizeAnthropicObservationResult(
 	result agent.ToolResult,
 	raw *ComputerUseTool,
@@ -843,6 +694,16 @@ func sanitizeAnthropicObservationResult(
 ) agent.ToolResult {
 	if result.IsError || raw == nil || raw.coordinateArtifact == nil || len(result.Images) != 1 {
 		failure := agent.BusinessError("strict provider screenshot could not be established")
+		failure.GUIOutcome = result.GUIOutcome
+		return failure
+	}
+	if !reflectImageBlockV1(result.Images[0], raw.coordinateArtifact.ImageBlock()) {
+		failure := agent.BusinessError("strict provider screenshot did not match its internal coordinate authority")
+		failure.GUIOutcome = result.GUIOutcome
+		return failure
+	}
+	if err := fitAnthropicArtifactToDeclaration(raw, declaration); err != nil {
+		failure := agent.BusinessError("strict provider screenshot could not fit the fixed display canvas: " + err.Error())
 		failure.GUIOutcome = result.GUIOutcome
 		return failure
 	}
@@ -854,11 +715,6 @@ func sanitizeAnthropicObservationResult(
 		return failure
 	}
 	exact := raw.coordinateArtifact.ImageBlock()
-	if !reflectImageBlockV1(result.Images[0], exact) {
-		failure := agent.BusinessError("strict provider screenshot did not match its internal coordinate authority")
-		failure.GUIOutcome = result.GUIOutcome
-		return failure
-	}
 	result.Content = "Screenshot captured from the current exact Accessibility target."
 	result.Images = []agent.ImageBlock{exact}
 	result.GUIOutcome = nil
@@ -889,13 +745,6 @@ func (a *AnthropicComputerAdapter) Run(
 
 	computerUseGUIOperationMu.Lock()
 	defer computerUseGUIOperationMu.Unlock()
-	if !a.hasExposedImage {
-		if args.Action != "screenshot" {
-			return agent.BusinessError(
-				"no provider-visible actionable screenshot; call screenshot first"), nil
-		}
-		return a.consumePreparedBootstrap(), nil
-	}
 	declaration, err := currentAnthropicNativeDisplayDeclaration(a)
 	if err != nil {
 		return agent.BusinessError(err.Error()), nil
@@ -937,15 +786,20 @@ func (a *AnthropicComputerAdapter) Run(
 		if postErr != nil || post.IsError || len(post.Images) != 1 || a.raw.coordinateArtifact == nil {
 			return agent.BusinessError("wait completed, but the required fresh exact screenshot is unavailable"), postErr
 		}
+		if !reflectImageBlockV1(post.Images[0], a.raw.coordinateArtifact.ImageBlock()) {
+			return agent.BusinessError("wait completed, but fresh screenshot authority did not match its image"), nil
+		}
+		if err := fitAnthropicArtifactToDeclaration(a.raw, declaration); err != nil {
+			return agent.BusinessError(
+				"wait completed, but the fresh screenshot could not fit the fixed display canvas",
+			), nil
+		}
 		if !declaration.matchesArtifact(a.raw) {
 			return agent.BusinessError(
 				"wait completed, but fresh screenshot dimensions do not match this request's native display declaration; retry only after the next declaration refresh",
 			), nil
 		}
 		exact := a.raw.coordinateArtifact.ImageBlock()
-		if !reflectImageBlockV1(post.Images[0], exact) {
-			return agent.BusinessError("wait completed, but fresh screenshot authority did not match its image"), nil
-		}
 		result.Content = "Wait completed; a fresh exact screenshot is attached."
 		result.Images = []agent.ImageBlock{exact}
 		if err := a.markCurrentImageVisible(); err != nil {
@@ -976,6 +830,18 @@ func (a *AnthropicComputerAdapter) Run(
 		}
 		return failure, postErr
 	}
+	if !reflectImageBlockV1(post.Images[0], a.raw.coordinateArtifact.ImageBlock()) {
+		failure := agent.BusinessError("computer action may have completed, but fresh screenshot authority did not match its image")
+		failure.GUIOutcome = result.GUIOutcome
+		return failure, runErr
+	}
+	if err := fitAnthropicArtifactToDeclaration(a.raw, declaration); err != nil {
+		failure := agent.BusinessError(
+			"computer action may have completed, but the fresh screenshot could not fit the fixed display canvas",
+		)
+		failure.GUIOutcome = result.GUIOutcome
+		return failure, runErr
+	}
 	if !declaration.matchesArtifact(a.raw) {
 		failure := agent.BusinessError(
 			"computer action may have completed, but fresh screenshot dimensions do not match this request's native display declaration; do not retry the action",
@@ -984,11 +850,6 @@ func (a *AnthropicComputerAdapter) Run(
 		return failure, runErr
 	}
 	exact := a.raw.coordinateArtifact.ImageBlock()
-	if !reflectImageBlockV1(post.Images[0], exact) {
-		failure := agent.BusinessError("computer action may have completed, but fresh screenshot authority did not match its image")
-		failure.GUIOutcome = result.GUIOutcome
-		return failure, runErr
-	}
 	switch {
 	case result.IsError:
 		result.Content = "Computer action did not verify; a fresh exact screenshot is attached."
@@ -1012,7 +873,6 @@ func (a *AnthropicComputerAdapter) Run(
 
 var _ agent.Tool = (*AnthropicComputerAdapter)(nil)
 var _ agent.NativeToolProvider = (*AnthropicComputerAdapter)(nil)
-var _ agent.NativeToolRequestPreparer = (*AnthropicComputerAdapter)(nil)
 var _ agent.SafeChecker = (*AnthropicComputerAdapter)(nil)
 var _ agent.ReadOnlyChecker = (*AnthropicComputerAdapter)(nil)
 var _ agent.ConcurrencySafeChecker = (*AnthropicComputerAdapter)(nil)

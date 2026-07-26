@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -184,11 +183,19 @@ type ComputerUseInitialTargetV1 struct {
 	BundleID string
 }
 
+type computerUseTargetScopeV1 uint8
+
+const (
+	computerUseTargetScopeForegroundV1 computerUseTargetScopeV1 = iota
+	computerUseTargetScopeExplicitV1
+)
+
 // ComputerUseTool is the provider-neutral macOS GUI tool. It deliberately
 // keeps only one current observation per agent run: refs are meaningful only
 // for that state_id and every ref action re-observes before touching the GUI.
 type ComputerUseTool struct {
 	client                        axCallClient
+	targetScope                   computerUseTargetScopeV1
 	initialTarget                 *ComputerUseInitialTargetV1
 	snapshot                      *computerUseSnapshot
 	refs                          map[string]refEntry
@@ -204,7 +211,6 @@ type ComputerUseTool struct {
 	coordinateCaptureLimits       CaptureCoordinateWindowLimitsV1
 	coordinateNow                 func() time.Time
 	coordinateFrameID             func() (string, error)
-	captureScreen                 func(int) (string, agent.ImageBlock, error)
 }
 
 // A Mac has one frontmost app, pointer, keyboard focus, and AX server. Keep a
@@ -225,18 +231,17 @@ var computerUseGUIOperationMu sync.Mutex
 func (t *ComputerUseTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "computer_use",
-		Description: "Observe and operate native macOS apps through one stateful Accessibility-first workflow. " +
-			"Start with get_app_state, then use its state_id and element refs. Request include_screenshot before coordinate fallback; coordinates are valid only for that latest state_id. " +
+		Description: "Observe and operate one existing macOS app window through a stateful Accessibility-first workflow. " +
+			"Start with get_app_state, or screenshot when a window image is needed, then use its state_id and element refs. Coordinates are valid only for the latest attached target-window image. " +
 			"Prefer select_text for AX text ranges; if AX reports fallback_required, re-observe before deciding whether an explicit drag is appropriate. " +
 			"Pointer actions visibly move the real cursor. Use browser tools for web-page DOM interactions." + agent.DescriptionGuidance,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"action":      map[string]any{"type": "string", "description": "Action: get_app_state, click, press, get_value, scroll, type, hotkey, move, drag, select_text, wait, screenshot. Focus, launch, and direct value mutation are temporarily unavailable until they have target-bound execution and action-specific postcondition verification."},
+				"action":      map[string]any{"type": "string", "description": "Action: get_app_state, screenshot, click, press, get_value, scroll, type, hotkey, move, drag, select_text, wait. screenshot observes and captures the exact target app window. Focus, launch, and direct value mutation are temporarily unavailable until they have target-bound execution and action-specific postcondition verification."},
 				"description": agent.DescriptionFieldSpec,
 				"state_id":    map[string]any{"type": "string", "description": "Latest state_id from get_app_state; required with ref, keyboard, and coordinate actions"},
-				"app":         map[string]any{"type": "string", "description": "Target macOS app name; omitted means frontmost app where supported"},
-				"window":      map[string]any{"type": "string", "description": "Optional window-title substring"},
+				"app":         map[string]any{"type": "string", "description": "Target running macOS app name. Required on the first observation in unattended runs; an attended Quick Panel run may already bind its original foreground app"},
 				"ref":         map[string]any{"type": "string", "description": "Element ref from the matching state_id; type requires the currently focused ref, while hotkey rejects ref"},
 				"value":       map[string]any{"type": "string", "description": "Value for wait matching"},
 				"x":           map[string]any{"type": "integer", "description": "X pixel index in the latest attached get_app_state image"},
@@ -319,6 +324,24 @@ func (t *ComputerUseTool) IsReadOnlyCall(argsJSON string) bool {
 // make a sibling ref action stale nondeterministically.
 func (t *ComputerUseTool) IsConcurrencySafeCall(string) bool { return false }
 
+// requiresExplicitFirstTargetV1 prevents unattended workflows from resolving
+// whichever app happens to be frontmost when their first observation runs.
+// A bound Quick Panel target and a prior exact observation are already scoped.
+func (t *ComputerUseTool) requiresExplicitFirstTargetV1(args computerUseArgs) bool {
+	if t == nil || t.targetScope != computerUseTargetScopeExplicitV1 ||
+		strings.TrimSpace(args.App) != "" || t.initialTarget != nil || t.snapshot != nil {
+		return false
+	}
+	switch args.Action {
+	case "get_app_state", "screenshot":
+		return true
+	case "wait":
+		return strings.TrimSpace(args.Condition) != ""
+	default:
+		return false
+	}
+}
+
 func (t *ComputerUseTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	computerUseGUIOperationMu.Lock()
 	defer computerUseGUIOperationMu.Unlock()
@@ -353,6 +376,11 @@ func (t *ComputerUseTool) runWithGUIOperationLockHeld(
 	}
 	if strings.TrimSpace(args.Description) == "" {
 		return agent.ValidationError("missing required parameter: description"), nil
+	}
+	if t.requiresExplicitFirstTargetV1(args) {
+		return agent.BusinessError(
+			"computer_use requires an explicit app for the first unattended observation; retry with the app field",
+		), nil
 	}
 	if _, present := consequentialRiskExecutionFromContextV1(ctx); present &&
 		!computerUseObservationAction(args.Action) &&
@@ -567,6 +595,9 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 		budget,
 	)
 	if !ok {
+		if args.Action == "screenshot" {
+			return failure, nil
+		}
 		result.Content += "\nscreenshot_warning: " + failure.Content
 		return result, nil
 	}
@@ -655,6 +686,9 @@ func (t *ComputerUseTool) captureCoordinateObservationV1(
 	if err != nil {
 		return CoordinateWindowArtifactV1{}, computerUseCallError("capture exact window", err), false
 	}
+	if failure, failed := computerUseCaptureFailureV1(rawCapture, treeA); failed {
+		return CoordinateWindowArtifactV1{}, failure, false
+	}
 	frameID, err := t.computerUseCoordinateFrameIDV1()
 	if err != nil {
 		return CoordinateWindowArtifactV1{}, agent.BusinessError("create coordinate frame identity: " + err.Error()), false
@@ -695,11 +729,24 @@ func (t *ComputerUseTool) captureCoordinateObservationV1(
 func computerUseCoordinateCaptureRequestV1(
 	tree computerUseTree,
 ) (CaptureCoordinateWindowRequestV1, agent.ToolResult, bool) {
+	app := strings.TrimSpace(tree.AppName)
+	if app == "" {
+		app = strings.TrimSpace(tree.App)
+	}
+	if app == "" {
+		app = "the target app"
+	}
 	if tree.SchemaVersion != 1 || tree.PID <= 0 || tree.BundleID == "" ||
-		tree.BundleID != strings.TrimSpace(tree.BundleID) || tree.WindowID == nil ||
-		*tree.WindowID <= 0 || uint64(*tree.WindowID) > uint64(^uint32(0)) || tree.WindowFrame == nil {
+		tree.BundleID != strings.TrimSpace(tree.BundleID) {
 		return CaptureCoordinateWindowRequestV1{}, agent.BusinessError(
-			"coordinate screenshot requires typed AX pid, bundle, unique window id, and bounds"), false
+			"computer_use_error: target_identity_unavailable\nmessage: the target app did not provide stable Accessibility identity\nrecovery: re-open the app and retry the observation"), false
+	}
+	if tree.WindowID == nil || *tree.WindowID <= 0 ||
+		uint64(*tree.WindowID) > uint64(^uint32(0)) || tree.WindowFrame == nil {
+		return CaptureCoordinateWindowRequestV1{}, agent.BusinessError(fmt.Sprintf(
+			"computer_use_error: window_not_found\nmessage: %s has no unique capturable window\nrecovery: open one normal app window, bring it forward, and retry",
+			app,
+		)), false
 	}
 	bounds := CoordinateQuartzRectV1{
 		X: tree.WindowFrame.X, Y: tree.WindowFrame.Y,
@@ -713,6 +760,55 @@ func computerUseCoordinateCaptureRequestV1(
 		PID:           tree.PID, BundleID: tree.BundleID, WindowID: uint32(*tree.WindowID),
 		ExpectedQuartzBounds: bounds,
 	}, agent.ToolResult{}, true
+}
+
+func computerUseCaptureFailureV1(
+	payload []byte,
+	tree computerUseTree,
+) (agent.ToolResult, bool) {
+	result, err := DecodeCaptureCoordinateWindowResultV1(payload)
+	if err != nil || result.Status != "failed" || result.FailureCode == nil {
+		return agent.ToolResult{}, false
+	}
+	code := *result.FailureCode
+	app := strings.TrimSpace(tree.AppName)
+	if app == "" {
+		app = strings.TrimSpace(tree.App)
+	}
+	if app == "" {
+		app = "the target app"
+	}
+	var message, recovery string
+	switch code {
+	case "window_not_found":
+		message = app + " has no capturable window"
+		recovery = "open one normal app window, bring it forward, and retry"
+	case "window_not_actionable", "display_not_actionable":
+		message = app + "'s target window is hidden, minimized, transient, or outside one active display"
+		recovery = "make one normal window fully visible on an active display and retry"
+	case "window_bounds_mismatch", "window_changed", "topology_changed", "stale_topology":
+		message = app + "'s window or display changed during capture"
+		recovery = "stop moving or resizing the window, then retry once"
+	case "capture_timeout", "capture_failed", "topology_unavailable":
+		message = "the exact target window could not be captured"
+		recovery = "keep the window visible and retry once"
+	case "process_identity_mismatch", "window_identity_mismatch":
+		message = app + "'s process or window identity changed before capture"
+		recovery = "re-observe the app before retrying"
+	default:
+		message = "the exact target window capture was rejected"
+		recovery = "re-observe the app and use Accessibility refs if the window still cannot be captured"
+	}
+	content := fmt.Sprintf(
+		"computer_use_error: %s\nmessage: %s\nrecovery: %s",
+		code,
+		message,
+		recovery,
+	)
+	if result.RetrySafe {
+		return agent.TransientError(content), true
+	}
+	return agent.BusinessError(content), true
 }
 
 func computerUseCoordinateTreesStableV1(before, after computerUseTree) bool {
@@ -2471,24 +2567,11 @@ func (t *ComputerUseTool) wait(ctx context.Context, args computerUseArgs) (agent
 }
 
 func (t *ComputerUseTool) screenshot(ctx context.Context, args computerUseArgs) (agent.ToolResult, error) {
-	// A standalone screenshot is an overview only. It deliberately never
-	// creates coordinate authority and invalidates any prior framed artifact.
-	t.coordinateArtifact = nil
-	capture := t.captureScreen
-	if capture == nil {
-		capture = CaptureAndEncode
-	}
-	path, block, err := capture(DefaultAPIWidth)
-	if path != "" {
-		defer os.Remove(path)
-	}
-	if err != nil {
-		return computerUseCallError("screenshot", err), nil
-	}
-	return agent.ToolResult{
-		Content: "Captured desktop screenshot\ncoordinate_space: none\nactionable: false",
-		Images:  []agent.ImageBlock{block},
-	}, nil
+	// Keep screenshot on the same exact-window transaction as an explicit
+	// visual get_app_state. This avoids leaking unrelated windows or
+	// notifications and publishes one coherent state/image coordinate frame.
+	args.IncludeScreenshot = true
+	return t.getAppState(ctx, args)
 }
 
 func (t *ComputerUseTool) invalidateState() {

@@ -487,10 +487,11 @@ func buildFullSchemasWithDefer(reg *ToolRegistry, cold map[string]bool) []client
 			continue
 		}
 		s := buildToolSchema(tool)
-		// defer_loading is part of the custom-function tool contract. Provider-
-		// native tools have their own exact schemas and must not acquire function-
-		// only fields merely because their name is in the cold set.
-		if cold[name] && s.Type == "function" {
+		// Anthropic supports defer_loading on both user-defined functions and
+		// Anthropic-schema client tools. OpenAI's type-only computer marker is a
+		// different provider contract and must not acquire this field.
+		if cold[name] &&
+			(s.Type == "function" || s.Type == client.NativeComputerToolType) {
 			s.DeferLoading = true
 		}
 		out = append(out, s)

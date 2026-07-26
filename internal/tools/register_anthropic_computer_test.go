@@ -92,8 +92,8 @@ func TestCloneWithAnthropicComputerForRunIsExplicitAndRunLocal(t *testing.T) {
 	if _, ok := firstPublic.(agent.NativeToolProvider); !ok {
 		t.Fatalf("guarded adapter lost native provider trait: %T", firstPublic)
 	}
-	if _, ok := firstPublic.(agent.NativeToolRequestPreparer); !ok {
-		t.Fatalf("guarded adapter lost native request preparer trait: %T", firstPublic)
+	if _, ok := firstPublic.(agent.NativeToolRequestPreparer); ok {
+		t.Fatalf("Anthropic adapter still performs request-time GUI preparation: %T", firstPublic)
 	}
 	if _, ok := firstPublic.(agent.SafeChecker); !ok {
 		t.Fatalf("guarded adapter lost safe trait: %T", firstPublic)

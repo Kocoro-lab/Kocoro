@@ -338,7 +338,7 @@ func TestCoordinateFrameV1ValidatesAgainstImageProfile(t *testing.T) {
 		{name: "encoded bytes", mutate: func(f *CoordinateFrameV1, p *CoordinateImageProfileV1) {
 			p.MaxEncodedBytes = f.FinalImage.ByteLength - 1
 		}},
-		{name: "undeclared padding", mutate: func(_ *CoordinateFrameV1, p *CoordinateImageProfileV1) { p.PaddingMode = "letterbox" }},
+		{name: "unknown padding", mutate: func(_ *CoordinateFrameV1, p *CoordinateImageProfileV1) { p.PaddingMode = "stretch" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

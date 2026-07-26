@@ -889,7 +889,8 @@ func (d NativeToolDef) Validate() error {
 
 // Tool is a strict tagged union at the outbound JSON boundary:
 //   - type=function serializes only Function (+ optional defer_loading)
-//   - type=computer_20251124 serializes only the flattened native definition
+//   - type=computer_20251124 serializes the flattened Anthropic definition
+//     (+ optional defer_loading)
 //   - type=computer serializes only OpenAI Responses' native marker
 //
 // Function remains value-typed for source compatibility with the existing
@@ -924,9 +925,6 @@ func (t Tool) Validate() error {
 	case NativeComputerToolType:
 		if t.Function.Name != "" || t.Function.Description != "" || len(t.Function.Parameters) != 0 {
 			return errors.New("native tool must not contain a function definition")
-		}
-		if t.DeferLoading {
-			return errors.New("native computer tool does not support defer_loading")
 		}
 		return (NativeToolDef{
 			Type:            t.Type,
@@ -974,11 +972,13 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 		Name            string `json:"name"`
 		DisplayWidthPx  int    `json:"display_width_px"`
 		DisplayHeightPx int    `json:"display_height_px"`
+		DeferLoading    bool   `json:"defer_loading,omitempty"`
 	}{
 		Type:            t.Type,
 		Name:            t.Name,
 		DisplayWidthPx:  t.DisplayWidthPx,
 		DisplayHeightPx: t.DisplayHeightPx,
+		DeferLoading:    t.DeferLoading,
 	})
 }
 

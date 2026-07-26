@@ -958,7 +958,7 @@ func TestMacOSAutomationGuidance_ComputerUsePreferred(t *testing.T) {
 		t.Skip("darwin-only guidance")
 	}
 	out := macOSAutomationGuidance([]string{"computer_use", "accessibility", "computer", "browser"})
-	for _, want := range []string{"Prefer `computer_use`", "get_app_state", "state_id", "include_screenshot", "coordinate", "`browser`"} {
+	for _, want := range []string{"Use `computer_use`", "exact app name", "state_id", "target window", "include_screenshot", "coordinate", "`browser`"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("computer_use guidance missing %q: %s", want, out)
 		}

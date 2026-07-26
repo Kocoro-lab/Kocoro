@@ -289,6 +289,7 @@ func TestRefreshProviderNativeToolSchemasOnlyRebuildsNativeEntries(t *testing.T)
 		buildToolSchema(&mockNativeTool{name: "computer", def: nativeDef}),
 		functionSchema,
 	}
+	before[0].DeferLoading = true
 
 	nativeDef.DisplayWidthPx = 1024
 	nativeDef.DisplayHeightPx = 768
@@ -302,6 +303,9 @@ func TestRefreshProviderNativeToolSchemasOnlyRebuildsNativeEntries(t *testing.T)
 	}
 	if got[1].DeferLoading != true {
 		t.Fatal("ordinary function lost defer_loading while refreshing native schema")
+	}
+	if !got[0].DeferLoading {
+		t.Fatal("Anthropic native tool lost defer_loading while refreshing its schema")
 	}
 	if &got[0] == &before[0] {
 		t.Fatal("refresh must return an isolated slice so prior dispatched requests stay immutable")

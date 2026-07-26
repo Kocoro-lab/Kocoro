@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -780,6 +781,111 @@ func TestAgentLoopOpenAIComputerContinuationRetryReusesExactRequest(t *testing.T
 	}
 	if retried.PreviousResponseID != openAIContinuationTokenPrimary {
 		t.Fatalf("retry previous_response_id=%q", retried.PreviousResponseID)
+	}
+}
+
+func TestAgentLoopOpenAIComputerExpiredContinuationRestartsFromVerifiedScreen(t *testing.T) {
+	profile := resolveTrustedOpenAIComputerProfile(t, "gpt-5.6-sol")
+	call := `{"type":"computer_call","provider":"openai","api_surface":"openai_responses","tool_contract":"openai.computer.v1","call_id":"call_expired_1","actions":[{"type":"click","button":"left","x":1,"y":1}],"status":"completed"}`
+	llm := &openAIComputerLoopLLM{
+		responses: []*client.CompletionResponse{
+			openAIComputerLoopResponse(
+				t,
+				profile,
+				openAIContinuationTokenPrimary,
+				call,
+			),
+			openAIComputerLoopFinalResponse(
+				t,
+				profile,
+				"resp_restarted",
+				"continued safely",
+			),
+		},
+		errors: []error{
+			nil,
+			&client.APIError{
+				StatusCode: http.StatusConflict,
+				Body: `{"error":{"type":"computer_continuation_expired",` +
+					`"code":"invalid_request","message":"spent","status":409}}`,
+			},
+			nil,
+		},
+	}
+	executor := &openAIComputerLoopBatchExecutor{
+		executions: []OpenAIComputerBatchExecution{{
+			CallID:              "call_expired_1",
+			ContinuationAllowed: true,
+			Result: ToolResult{Images: []ImageBlock{{
+				MediaType: "image/png",
+				Data:      "dmVyaWZpZWQ=",
+			}}},
+		}},
+	}
+	loop := newOpenAIComputerTestLoop(t, llm, profile, executor, nil)
+
+	reply, _, err := loop.Run(
+		context.Background(),
+		"click once, then continue from the result",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if reply != "continued safely" {
+		t.Fatalf("reply=%q", reply)
+	}
+	if got := len(executor.capturedCalls()); got != 1 {
+		t.Fatalf("expired continuation replayed %d computer batches, want 1", got)
+	}
+
+	requests := llm.capturedRequests()
+	if len(requests) != 3 {
+		t.Fatalf(
+			"completion requests=%d, want initial + expired continuation + fresh restart",
+			len(requests),
+		)
+	}
+	if requests[1].PreviousResponseID != openAIContinuationTokenPrimary {
+		t.Fatalf(
+			"expired continuation previous_response_id=%q",
+			requests[1].PreviousResponseID,
+		)
+	}
+	restarted := requests[2]
+	if restarted.PreviousResponseID != "" {
+		t.Fatalf(
+			"restarted previous_response_id=%q, want fresh trajectory",
+			restarted.PreviousResponseID,
+		)
+	}
+	var restartText string
+	var restartImages []string
+	for _, message := range restarted.Messages {
+		for _, block := range message.Content.Blocks() {
+			switch block.Type {
+			case client.OpenAIComputerCallType:
+				t.Fatalf("fresh restart resent expired computer_call: %#v", block)
+			case "tool_result":
+				if block.ToolUseID == "call_expired_1" {
+					t.Fatalf("fresh restart resent expired tool_result: %#v", block)
+				}
+			case "text":
+				restartText += block.Text
+			case "image":
+				if block.Source != nil {
+					restartImages = append(restartImages, block.Source.Data)
+				}
+			}
+		}
+	}
+	if !strings.Contains(restartText, "Do not repeat") ||
+		!strings.Contains(restartText, "click once, then continue from the result") {
+		t.Fatalf("restart guidance=%q", restartText)
+	}
+	if len(restartImages) != 1 || restartImages[0] != "dmVyaWZpZWQ=" {
+		t.Fatalf("restart images=%v, want verified terminal screenshot", restartImages)
 	}
 }
 

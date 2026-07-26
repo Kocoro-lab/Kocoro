@@ -115,6 +115,16 @@ func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string
 		return agent.GUIActionDescriptor{}, fmt.Errorf(
 			"pixel_scroll is restricted to an admitted OpenAI native computer action")
 	}
+	// A pure delay has no GUI target. Likewise, an unattended first
+	// observation without an explicit app is intentionally classified as
+	// non-participating so admission does not resolve the frontmost app merely
+	// to return an actionable validation result from Tool.Run.
+	if args.Action == "wait" && strings.TrimSpace(args.Condition) == "" {
+		return agent.GUIActionDescriptor{}, nil
+	}
+	if t.requiresExplicitFirstTargetV1(args) {
+		return agent.GUIActionDescriptor{}, nil
+	}
 	effect := agent.GUIActionMutation
 	if computerUseObservationAction(args.Action) {
 		effect = agent.GUIActionObservation
@@ -123,9 +133,6 @@ func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string
 	if (args.Action == "click" && args.Ref == "") || args.Action == "move" ||
 		args.Action == "drag" || args.Action == "pixel_scroll" {
 		path = "synthetic_coordinate"
-	}
-	if args.Action == "screenshot" || args.Action == "wait" {
-		path = ""
 	}
 	descriptor := guiDescriptor(args.Action, effect, path)
 

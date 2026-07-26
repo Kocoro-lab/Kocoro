@@ -10,9 +10,11 @@ import (
 type approvalAdmissionTool struct {
 	*mockApprovalTool
 	decision ApprovalAdmissionDecision
+	calls    int
 }
 
 func (t *approvalAdmissionTool) ApprovalAdmission(context.Context, string) ApprovalAdmissionDecision {
+	t.calls++
 	return t.decision
 }
 
@@ -65,5 +67,61 @@ func TestApprovalAdmissionInheritPreservesSafeObservation(t *testing.T) {
 	}
 	if handler.approvalRequested {
 		t.Fatal("safe inherited observation unexpectedly prompted")
+	}
+}
+
+func TestApprovalAdmissionDoesNotReadGUIBeforeUnattendedComputerUseGrant(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	loop.SetUnattendedRun(true)
+	tool := &approvalAdmissionTool{
+		mockApprovalTool: &mockApprovalTool{
+			name:     "computer_use",
+			safeArgs: func(string) bool { return true },
+		},
+		decision: ApprovalAdmissionDeny,
+	}
+
+	decision, approved := loop.checkPermissionAndApproval(
+		context.Background(),
+		tool.Info().Name,
+		`{"action":"get_app_state"}`,
+		tool,
+		NewApprovalCache(),
+	)
+	if decision != "ask" || approved {
+		t.Fatalf("decision = (%q, %v), want unattended handler denial", decision, approved)
+	}
+	if tool.calls != 0 {
+		t.Fatalf("ApprovalAdmission calls = %d, want 0 before global Computer Use grant", tool.calls)
+	}
+	if !handler.approvalRequested {
+		t.Fatal("unattended denial did not reach the approval handler")
+	}
+}
+
+func TestApprovalAdmissionRunsAfterUnattendedComputerUseGrant(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	loop.SetAlwaysAllowTools([]string{"computer_use"})
+	loop.SetUnattendedRun(true)
+	tool := &approvalAdmissionTool{
+		mockApprovalTool: &mockApprovalTool{name: "computer_use"},
+		decision:         ApprovalAdmissionDeny,
+	}
+
+	decision, approved := loop.checkPermissionAndApproval(
+		context.Background(),
+		tool.Info().Name,
+		`{"action":"get_app_state","app":"Finder"}`,
+		tool,
+		NewApprovalCache(),
+	)
+	if decision != "deny" || approved {
+		t.Fatalf("decision = (%q, %v), want app-policy denial", decision, approved)
+	}
+	if tool.calls != 1 {
+		t.Fatalf("ApprovalAdmission calls = %d, want 1 after global Computer Use grant", tool.calls)
+	}
+	if handler.approvalRequested {
+		t.Fatal("app-policy denial unexpectedly reached approval UI")
 	}
 }

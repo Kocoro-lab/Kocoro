@@ -215,8 +215,8 @@ func (profile CoordinateImageProfileV1) Validate() error {
 		}
 		previous = quality
 	}
-	if profile.PaddingMode != "none" {
-		return fmt.Errorf("coordinate image profile padding_mode must be none")
+	if profile.PaddingMode != "none" && profile.PaddingMode != "letterbox" {
+		return fmt.Errorf("coordinate image profile padding_mode must be none or letterbox")
 	}
 	if !profile.RequiresExactCoordinateDimensions {
 		return fmt.Errorf("coordinate image profile must require exact coordinate dimensions")
@@ -322,11 +322,6 @@ func (frame CoordinateFrameV1) Validate() error {
 		if frame.DisplayID == nil || region.DisplayID != *frame.DisplayID {
 			return fmt.Errorf("actionable coordinate frame transform must match display_id")
 		}
-		if region.PixelRect.X != 0 || region.PixelRect.Y != 0 ||
-			region.PixelRect.Width != frame.FinalImage.WidthPX ||
-			region.PixelRect.Height != frame.FinalImage.HeightPX {
-			return fmt.Errorf("actionable coordinate frame must cover final_image without padding or gaps")
-		}
 		if err := validateActionableCoordinateAffine(region); err != nil {
 			return err
 		}
@@ -367,8 +362,29 @@ func (frame CoordinateFrameV1) ValidateAgainst(profile CoordinateImageProfileV1)
 	if frame.FinalImage.ByteLength > profile.MaxEncodedBytes {
 		return fmt.Errorf("coordinate frame exceeds provider profile max_encoded_bytes")
 	}
-	if profile.PaddingMode != "none" {
-		return fmt.Errorf("coordinate frame has no contract for provider padding mode %q", profile.PaddingMode)
+	if frame.Actionable {
+		region := frame.TransformRegions[0]
+		horizontalPadding := region.PixelRect.X > 0 ||
+			region.PixelRect.Width < frame.FinalImage.WidthPX
+		verticalPadding := region.PixelRect.Y > 0 ||
+			region.PixelRect.Height < frame.FinalImage.HeightPX
+		switch profile.PaddingMode {
+		case "none":
+			if horizontalPadding || verticalPadding {
+				return fmt.Errorf("coordinate frame declares padding under a no-padding profile")
+			}
+		case "letterbox":
+			left := region.PixelRect.X
+			right := frame.FinalImage.WidthPX - region.PixelRect.X - region.PixelRect.Width
+			top := region.PixelRect.Y
+			bottom := frame.FinalImage.HeightPX - region.PixelRect.Y - region.PixelRect.Height
+			if horizontalPadding && verticalPadding {
+				return fmt.Errorf("letterbox content must fill one canvas axis")
+			}
+			if left-right < -1 || left-right > 1 || top-bottom < -1 || top-bottom > 1 {
+				return fmt.Errorf("letterbox coordinate frame padding must be centered")
+			}
+		}
 	}
 	return nil
 }

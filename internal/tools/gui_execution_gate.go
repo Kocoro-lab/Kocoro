@@ -152,14 +152,6 @@ type guiExecutionNativeReadOnlyGate struct {
 func (g *guiExecutionNativeReadOnlyGate) NativeToolDef() *client.NativeToolDef {
 	return g.native.NativeToolDef()
 }
-func (g *guiExecutionNativeReadOnlyGate) PrepareNativeToolRequest(ctx context.Context) error {
-	return prepareGUIExecutionNativeToolRequest(ctx, g.native)
-}
-func (g *guiExecutionNativeReadOnlyGate) DescribeNativeToolRequestPreparation(
-	ctx context.Context,
-) (agent.GUIActionDescriptor, error) {
-	return describeGUIExecutionNativeToolRequestPreparation(ctx, g.native)
-}
 
 type guiExecutionNativeSafeReadOnlyGate struct {
 	*guiExecutionSafeReadOnlyGate
@@ -168,14 +160,6 @@ type guiExecutionNativeSafeReadOnlyGate struct {
 
 func (g *guiExecutionNativeSafeReadOnlyGate) NativeToolDef() *client.NativeToolDef {
 	return g.native.NativeToolDef()
-}
-func (g *guiExecutionNativeSafeReadOnlyGate) PrepareNativeToolRequest(ctx context.Context) error {
-	return prepareGUIExecutionNativeToolRequest(ctx, g.native)
-}
-func (g *guiExecutionNativeSafeReadOnlyGate) DescribeNativeToolRequestPreparation(
-	ctx context.Context,
-) (agent.GUIActionDescriptor, error) {
-	return describeGUIExecutionNativeToolRequestPreparation(ctx, g.native)
 }
 
 type guiExecutionNativeConcurrencyReadOnlyGate struct {
@@ -186,14 +170,6 @@ type guiExecutionNativeConcurrencyReadOnlyGate struct {
 func (g *guiExecutionNativeConcurrencyReadOnlyGate) NativeToolDef() *client.NativeToolDef {
 	return g.native.NativeToolDef()
 }
-func (g *guiExecutionNativeConcurrencyReadOnlyGate) PrepareNativeToolRequest(ctx context.Context) error {
-	return prepareGUIExecutionNativeToolRequest(ctx, g.native)
-}
-func (g *guiExecutionNativeConcurrencyReadOnlyGate) DescribeNativeToolRequestPreparation(
-	ctx context.Context,
-) (agent.GUIActionDescriptor, error) {
-	return describeGUIExecutionNativeToolRequestPreparation(ctx, g.native)
-}
 
 type guiExecutionNativeSafeConcurrencyReadOnlyGate struct {
 	*guiExecutionSafeConcurrencyReadOnlyGate
@@ -203,10 +179,58 @@ type guiExecutionNativeSafeConcurrencyReadOnlyGate struct {
 func (g *guiExecutionNativeSafeConcurrencyReadOnlyGate) NativeToolDef() *client.NativeToolDef {
 	return g.native.NativeToolDef()
 }
-func (g *guiExecutionNativeSafeConcurrencyReadOnlyGate) PrepareNativeToolRequest(ctx context.Context) error {
-	return prepareGUIExecutionNativeToolRequest(ctx, g.native)
+
+type guiExecutionNativePreparingReadOnlyGate struct {
+	*guiExecutionNativeReadOnlyGate
+	preparer agent.NativeToolRequestPreparer
 }
-func (g *guiExecutionNativeSafeConcurrencyReadOnlyGate) DescribeNativeToolRequestPreparation(
+
+func (g *guiExecutionNativePreparingReadOnlyGate) PrepareNativeToolRequest(ctx context.Context) error {
+	return g.preparer.PrepareNativeToolRequest(ctx)
+}
+func (g *guiExecutionNativePreparingReadOnlyGate) DescribeNativeToolRequestPreparation(
+	ctx context.Context,
+) (agent.GUIActionDescriptor, error) {
+	return describeGUIExecutionNativeToolRequestPreparation(ctx, g.native)
+}
+
+type guiExecutionNativePreparingSafeReadOnlyGate struct {
+	*guiExecutionNativeSafeReadOnlyGate
+	preparer agent.NativeToolRequestPreparer
+}
+
+func (g *guiExecutionNativePreparingSafeReadOnlyGate) PrepareNativeToolRequest(ctx context.Context) error {
+	return g.preparer.PrepareNativeToolRequest(ctx)
+}
+func (g *guiExecutionNativePreparingSafeReadOnlyGate) DescribeNativeToolRequestPreparation(
+	ctx context.Context,
+) (agent.GUIActionDescriptor, error) {
+	return describeGUIExecutionNativeToolRequestPreparation(ctx, g.native)
+}
+
+type guiExecutionNativePreparingConcurrencyReadOnlyGate struct {
+	*guiExecutionNativeConcurrencyReadOnlyGate
+	preparer agent.NativeToolRequestPreparer
+}
+
+func (g *guiExecutionNativePreparingConcurrencyReadOnlyGate) PrepareNativeToolRequest(ctx context.Context) error {
+	return g.preparer.PrepareNativeToolRequest(ctx)
+}
+func (g *guiExecutionNativePreparingConcurrencyReadOnlyGate) DescribeNativeToolRequestPreparation(
+	ctx context.Context,
+) (agent.GUIActionDescriptor, error) {
+	return describeGUIExecutionNativeToolRequestPreparation(ctx, g.native)
+}
+
+type guiExecutionNativePreparingSafeConcurrencyReadOnlyGate struct {
+	*guiExecutionNativeSafeConcurrencyReadOnlyGate
+	preparer agent.NativeToolRequestPreparer
+}
+
+func (g *guiExecutionNativePreparingSafeConcurrencyReadOnlyGate) PrepareNativeToolRequest(ctx context.Context) error {
+	return g.preparer.PrepareNativeToolRequest(ctx)
+}
+func (g *guiExecutionNativePreparingSafeConcurrencyReadOnlyGate) DescribeNativeToolRequestPreparation(
 	ctx context.Context,
 ) (agent.GUIActionDescriptor, error) {
 	return describeGUIExecutionNativeToolRequestPreparation(ctx, g.native)
@@ -229,17 +253,6 @@ func describeGUIExecutionNativeToolRequestPreparation(
 	return describer.DescribeNativeToolRequestPreparation(ctx)
 }
 
-func prepareGUIExecutionNativeToolRequest(
-	ctx context.Context,
-	native agent.NativeToolProvider,
-) error {
-	preparer, ok := native.(agent.NativeToolRequestPreparer)
-	if !ok {
-		return nil
-	}
-	return preparer.PrepareNativeToolRequest(ctx)
-}
-
 func wrapGUIExecutionGate(tool agent.Tool) agent.Tool {
 	if tool == nil {
 		return nil
@@ -260,9 +273,10 @@ func wrapGUIExecutionGate(tool agent.Tool) agent.Tool {
 	safe, hasSafe := tool.(agent.SafeChecker)
 	concurrency, hasConcurrency := tool.(agent.ConcurrencySafeChecker)
 	if native, ok := tool.(agent.NativeToolProvider); ok {
+		preparer, hasPreparation := tool.(agent.NativeToolRequestPreparer)
 		switch {
 		case hasSafe && hasConcurrency:
-			return &guiExecutionNativeSafeConcurrencyReadOnlyGate{
+			wrapped := &guiExecutionNativeSafeConcurrencyReadOnlyGate{
 				guiExecutionSafeConcurrencyReadOnlyGate: &guiExecutionSafeConcurrencyReadOnlyGate{
 					guiExecutionSafeReadOnlyGate: &guiExecutionSafeReadOnlyGate{
 						guiExecutionReadOnlyGate: ro, safe: safe,
@@ -271,22 +285,50 @@ func wrapGUIExecutionGate(tool agent.Tool) agent.Tool {
 				},
 				native: native,
 			}
+			if hasPreparation {
+				return &guiExecutionNativePreparingSafeConcurrencyReadOnlyGate{
+					guiExecutionNativeSafeConcurrencyReadOnlyGate: wrapped,
+					preparer: preparer,
+				}
+			}
+			return wrapped
 		case hasSafe:
-			return &guiExecutionNativeSafeReadOnlyGate{
+			wrapped := &guiExecutionNativeSafeReadOnlyGate{
 				guiExecutionSafeReadOnlyGate: &guiExecutionSafeReadOnlyGate{
 					guiExecutionReadOnlyGate: ro, safe: safe,
 				},
 				native: native,
 			}
+			if hasPreparation {
+				return &guiExecutionNativePreparingSafeReadOnlyGate{
+					guiExecutionNativeSafeReadOnlyGate: wrapped,
+					preparer:                           preparer,
+				}
+			}
+			return wrapped
 		case hasConcurrency:
-			return &guiExecutionNativeConcurrencyReadOnlyGate{
+			wrapped := &guiExecutionNativeConcurrencyReadOnlyGate{
 				guiExecutionConcurrencyReadOnlyGate: &guiExecutionConcurrencyReadOnlyGate{
 					guiExecutionReadOnlyGate: ro, concurrency: concurrency,
 				},
 				native: native,
 			}
+			if hasPreparation {
+				return &guiExecutionNativePreparingConcurrencyReadOnlyGate{
+					guiExecutionNativeConcurrencyReadOnlyGate: wrapped,
+					preparer: preparer,
+				}
+			}
+			return wrapped
 		default:
-			return &guiExecutionNativeReadOnlyGate{guiExecutionReadOnlyGate: ro, native: native}
+			wrapped := &guiExecutionNativeReadOnlyGate{guiExecutionReadOnlyGate: ro, native: native}
+			if hasPreparation {
+				return &guiExecutionNativePreparingReadOnlyGate{
+					guiExecutionNativeReadOnlyGate: wrapped,
+					preparer:                       preparer,
+				}
+			}
+			return wrapped
 		}
 	}
 	switch {

@@ -273,6 +273,26 @@ func BindComputerUseInitialTargetForRun(
 	return fmt.Errorf("run registry has no computer-use core")
 }
 
+// RequireExplicitComputerUseTargetForRun makes the first observation on a
+// run-local generic tool require an app name (or a Desktop-bound initial
+// target). It is used for schedules and other unattended sources so they never
+// inherit an unrelated app that happens to be frontmost at execution time.
+func RequireExplicitComputerUseTargetForRun(reg *agent.ToolRegistry) error {
+	if reg == nil {
+		return fmt.Errorf("cannot scope computer-use target on a nil registry")
+	}
+	registered, ok := reg.Get("computer_use")
+	if !ok {
+		return nil
+	}
+	raw := rawComputerUseToolForRun(registered)
+	if raw == nil {
+		return fmt.Errorf("run registry computer_use has no configurable core")
+	}
+	raw.targetScope = computerUseTargetScopeExplicitV1
+	return nil
+}
+
 // CloneWithGenericComputerUseForRun creates the provider-neutral function-tool
 // surface for a resolved generic route or a safe old-Cloud fallback. The legacy
 // `computer` function is deliberately absent so fallback can never silently
@@ -346,9 +366,8 @@ func CloneWithResolvedComputerUseProfileForRun(
 			profile.APISurface() == client.APISurfaceAnthropicMessages &&
 			profile.ToolContract() == client.ToolContractAnthropicComputer20251124 &&
 			profile.BetaContract() == client.AnthropicComputerBetaContract {
-			// These dimensions are only a constructor placeholder. The adapter's
-			// mandatory request preparation replaces them with the exact captured
-			// provider image dimensions before the native schema is serialized.
+			// The provider declaration remains stable. Exact target-window
+			// screenshots are captured lazily and letterboxed into this canvas.
 			capability := newAnthropicComputerRunCapabilityAfterVerification(1280, 800)
 			cloned, err := CloneWithAnthropicComputerForRun(reg, cfg, capability)
 			if err != nil {

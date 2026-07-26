@@ -135,6 +135,24 @@ func TestToolMarshalJSONStrictTaggedUnion(t *testing.T) {
 		}
 	})
 
+	t.Run("Anthropic native preserves defer loading", func(t *testing.T) {
+		tool := Tool{
+			Type:            NativeComputerToolType,
+			Name:            NativeComputerToolName,
+			DisplayWidthPx:  1280,
+			DisplayHeightPx: 800,
+			DeferLoading:    true,
+		}
+		raw, err := json.Marshal(tool)
+		if err != nil {
+			t.Fatalf("marshal deferred native tool: %v", err)
+		}
+		const want = `{"type":"computer_20251124","name":"computer","display_width_px":1280,"display_height_px":800,"defer_loading":true}`
+		if string(raw) != want {
+			t.Fatalf("deferred native tool JSON = %s, want %s", raw, want)
+		}
+	})
+
 	t.Run("OpenAI computer is type only", func(t *testing.T) {
 		raw, err := json.Marshal(Tool{Type: OpenAINativeComputerToolType})
 		if err != nil {
@@ -155,7 +173,6 @@ func TestToolMarshalJSONStrictTaggedUnion(t *testing.T) {
 		{name: "native zero width", tool: Tool{Type: "computer_20251124", Name: "computer", DisplayHeightPx: 800}},
 		{name: "native zero height", tool: Tool{Type: "computer_20251124", Name: "computer", DisplayWidthPx: 1280}},
 		{name: "native carries function", tool: Tool{Type: "computer_20251124", Name: "computer", DisplayWidthPx: 1280, DisplayHeightPx: 800, Function: FunctionDef{Name: "computer"}}},
-		{name: "native is deferred", tool: Tool{Type: "computer_20251124", Name: "computer", DisplayWidthPx: 1280, DisplayHeightPx: 800, DeferLoading: true}},
 		{name: "OpenAI computer carries name", tool: Tool{Type: OpenAINativeComputerToolType, Name: "computer"}},
 		{name: "OpenAI computer carries dimensions", tool: Tool{Type: OpenAINativeComputerToolType, DisplayWidthPx: 1280, DisplayHeightPx: 800}},
 		{name: "OpenAI computer carries function", tool: Tool{Type: OpenAINativeComputerToolType, Function: FunctionDef{Name: "computer"}}},
@@ -1027,6 +1044,36 @@ func TestUsage_JSON_BackwardCompat_MissingSplit(t *testing.T) {
 	if u.CacheCreation5mTokens != 0 || u.CacheCreation1hTokens != 0 {
 		t.Errorf("expected zero for absent split fields, got 5m=%d 1h=%d",
 			u.CacheCreation5mTokens, u.CacheCreation1hTokens)
+	}
+}
+
+// tool_choice is now a cross-repo behavioral contract: Cloud forwards it to the
+// provider, so a serialization regression here silently stops forcing the tool
+// rather than failing loudly. This mirrors the byte-level coverage
+// skip_cache_write already has.
+func TestCompletionRequest_ToolChoice_Marshaling(t *testing.T) {
+	req := CompletionRequest{
+		Messages:   []Message{{Role: "user", Content: NewTextContent("hi")}},
+		ModelTier:  "small",
+		ToolChoice: map[string]any{"type": "tool", "name": "compile_memory_intents"},
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b),
+		`"tool_choice":{"name":"compile_memory_intents","type":"tool"}`) {
+		t.Errorf("expected forced tool_choice in JSON, got: %s", string(b))
+	}
+
+	// nil must omit the field (omitempty) so "auto" stays the wire default.
+	req2 := CompletionRequest{Messages: []Message{{Role: "user", Content: NewTextContent("hi")}}}
+	b2, err := json.Marshal(req2)
+	if err != nil {
+		t.Fatalf("marshal zero value: %v", err)
+	}
+	if strings.Contains(string(b2), "tool_choice") {
+		t.Errorf("expected tool_choice to be omitted when nil, got: %s", string(b2))
 	}
 }
 

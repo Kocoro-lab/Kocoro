@@ -121,8 +121,11 @@ func (w *daemonGUIWorkflow) runTool(ctx context.Context, tool agent.Tool, argsJS
 	// descriptor; the foreground app or resolved target may have changed while
 	// the user was deciding. The lease allow-list is not a substitute for this
 	// per-action check, especially when a workflow already owns a lease.
-	if descriptor.TargetBundleID != "" && w.appPolicy != nil && w.appPolicy.DecisionFor(descriptor.TargetBundleID).Decision == ComputerUseAppPolicyBlocked {
-		return agent.BusinessError("computer-use app policy blocked this target"), nil
+	if descriptor.TargetBundleID != "" && w.appPolicy != nil {
+		entry := w.appPolicy.DecisionFor(descriptor.TargetBundleID)
+		if entry.Decision == ComputerUseAppPolicyBlocked {
+			return computerUseAppPolicyBlockedResult(descriptor, entry), nil
+		}
 	}
 	if descriptor.Effect == agent.GUIActionMutation && descriptor.TargetBundleID == "" {
 		if tool.Info().Name == "computer_use" && descriptor.ActionKind == "launch_app" {
@@ -408,9 +411,11 @@ func (w *daemonGUIWorkflow) prepareNativeToolRequest(
 	if descriptor.TargetBundleID == "" {
 		return fmt.Errorf("computer-use native preparation could not resolve an exact app target")
 	}
-	if w.appPolicy != nil &&
-		w.appPolicy.DecisionFor(descriptor.TargetBundleID).Decision == ComputerUseAppPolicyBlocked {
-		return fmt.Errorf("computer-use app policy blocked this target")
+	if w.appPolicy != nil {
+		entry := w.appPolicy.DecisionFor(descriptor.TargetBundleID)
+		if entry.Decision == ComputerUseAppPolicyBlocked {
+			return errors.New(computerUseAppPolicyBlockedResult(descriptor, entry).Content)
+		}
 	}
 
 	lease, err := w.ensureLease(ctx, descriptor)
@@ -616,6 +621,41 @@ func guiCoordinatorToolError(err error) agent.ToolResult {
 	return agent.BusinessError(err.Error())
 }
 
+func computerUseAppPolicyBlockedResult(
+	descriptor agent.GUIActionDescriptor,
+	entry ComputerUseAppPolicyEntry,
+) agent.ToolResult {
+	target := strings.TrimSpace(descriptor.TargetAppName)
+	if target == "" {
+		target = strings.TrimSpace(descriptor.TargetBundleID)
+	}
+	if target == "" {
+		target = "the requested app"
+	}
+	source := string(entry.Source)
+	message := target + " is blocked by Computer Use app policy"
+	recovery := "choose another app"
+	switch entry.Source {
+	case ComputerUseAppPolicySourceBuiltIn:
+		message = target + " is a protected app and cannot be controlled by Computer Use"
+	case ComputerUseAppPolicySourceUser:
+		recovery = "remove this saved app block in Computer Use settings, or choose another app"
+	case ComputerUseAppPolicySourceInvalidStore:
+		message = "the Computer Use app policy could not be loaded, so " + target + " is blocked for safety"
+		recovery = "repair or reset the saved app policy, then retry"
+	case ComputerUseAppPolicySourceInvalidTarget:
+		message = "the requested app identity is invalid and was blocked for safety"
+		recovery = "retry with an exact running app name"
+	}
+	return agent.BusinessError(fmt.Sprintf(
+		"computer_use_error: app_policy_blocked\ntarget_app: %s\npolicy_source: %s\nmessage: %s\nrecovery: %s",
+		target,
+		source,
+		message,
+		recovery,
+	))
+}
+
 type daemonGUIToolBase struct {
 	inner    agent.Tool
 	workflow *daemonGUIWorkflow
@@ -656,6 +696,24 @@ func (t *daemonGUIToolBase) ApprovalAdmission(ctx context.Context, args string) 
 		return agent.ApprovalAdmissionRequireFresh
 	}
 	return agent.ApprovalAdmissionInherit
+}
+func (t *daemonGUIToolBase) ApprovalAdmissionDenialResult(
+	ctx context.Context,
+	args string,
+) (agent.ToolResult, bool) {
+	describer, ok := t.inner.(agent.GUIActionDescriber)
+	if !ok || t.workflow == nil || t.workflow.appPolicy == nil {
+		return agent.ToolResult{}, false
+	}
+	descriptor, err := describer.DescribeGUIAction(ctx, args)
+	if err != nil || descriptor.TargetBundleID == "" {
+		return agent.ToolResult{}, false
+	}
+	entry := t.workflow.appPolicy.DecisionFor(descriptor.TargetBundleID)
+	if entry.Decision != ComputerUseAppPolicyBlocked {
+		return agent.ToolResult{}, false
+	}
+	return computerUseAppPolicyBlockedResult(descriptor, entry), true
 }
 func (t *daemonGUIToolBase) Run(ctx context.Context, args string) (agent.ToolResult, error) {
 	return t.workflow.runTool(ctx, t.inner, args)
@@ -703,9 +761,6 @@ type daemonGUINativeReadOnlyTool struct {
 func (t *daemonGUINativeReadOnlyTool) NativeToolDef() *client.NativeToolDef {
 	return t.native.NativeToolDef()
 }
-func (t *daemonGUINativeReadOnlyTool) PrepareNativeToolRequest(ctx context.Context) error {
-	return prepareDaemonNativeToolRequest(ctx, t.daemonGUIToolBase, t.native)
-}
 
 type daemonGUINativeSafeReadOnlyTool struct {
 	*daemonGUISafeReadOnlyTool
@@ -714,9 +769,6 @@ type daemonGUINativeSafeReadOnlyTool struct {
 
 func (t *daemonGUINativeSafeReadOnlyTool) NativeToolDef() *client.NativeToolDef {
 	return t.native.NativeToolDef()
-}
-func (t *daemonGUINativeSafeReadOnlyTool) PrepareNativeToolRequest(ctx context.Context) error {
-	return prepareDaemonNativeToolRequest(ctx, t.daemonGUIToolBase, t.native)
 }
 
 type daemonGUINativeConcurrencyReadOnlyTool struct {
@@ -727,9 +779,6 @@ type daemonGUINativeConcurrencyReadOnlyTool struct {
 func (t *daemonGUINativeConcurrencyReadOnlyTool) NativeToolDef() *client.NativeToolDef {
 	return t.native.NativeToolDef()
 }
-func (t *daemonGUINativeConcurrencyReadOnlyTool) PrepareNativeToolRequest(ctx context.Context) error {
-	return prepareDaemonNativeToolRequest(ctx, t.daemonGUIToolBase, t.native)
-}
 
 type daemonGUINativeSafeConcurrencyReadOnlyTool struct {
 	*daemonGUISafeConcurrencyReadOnlyTool
@@ -739,7 +788,36 @@ type daemonGUINativeSafeConcurrencyReadOnlyTool struct {
 func (t *daemonGUINativeSafeConcurrencyReadOnlyTool) NativeToolDef() *client.NativeToolDef {
 	return t.native.NativeToolDef()
 }
-func (t *daemonGUINativeSafeConcurrencyReadOnlyTool) PrepareNativeToolRequest(ctx context.Context) error {
+
+type daemonGUINativePreparingReadOnlyTool struct {
+	*daemonGUINativeReadOnlyTool
+}
+
+func (t *daemonGUINativePreparingReadOnlyTool) PrepareNativeToolRequest(ctx context.Context) error {
+	return prepareDaemonNativeToolRequest(ctx, t.daemonGUIToolBase, t.native)
+}
+
+type daemonGUINativePreparingSafeReadOnlyTool struct {
+	*daemonGUINativeSafeReadOnlyTool
+}
+
+func (t *daemonGUINativePreparingSafeReadOnlyTool) PrepareNativeToolRequest(ctx context.Context) error {
+	return prepareDaemonNativeToolRequest(ctx, t.daemonGUIToolBase, t.native)
+}
+
+type daemonGUINativePreparingConcurrencyReadOnlyTool struct {
+	*daemonGUINativeConcurrencyReadOnlyTool
+}
+
+func (t *daemonGUINativePreparingConcurrencyReadOnlyTool) PrepareNativeToolRequest(ctx context.Context) error {
+	return prepareDaemonNativeToolRequest(ctx, t.daemonGUIToolBase, t.native)
+}
+
+type daemonGUINativePreparingSafeConcurrencyReadOnlyTool struct {
+	*daemonGUINativeSafeConcurrencyReadOnlyTool
+}
+
+func (t *daemonGUINativePreparingSafeConcurrencyReadOnlyTool) PrepareNativeToolRequest(ctx context.Context) error {
 	return prepareDaemonNativeToolRequest(ctx, t.daemonGUIToolBase, t.native)
 }
 
@@ -787,9 +865,10 @@ func wrapOneDaemonGUIToolV1(
 	safe, hasSafe := inner.(agent.SafeChecker)
 	concurrency, hasConcurrency := inner.(agent.ConcurrencySafeChecker)
 	if native, ok := inner.(agent.NativeToolProvider); ok {
+		_, hasPreparation := inner.(agent.NativeToolRequestPreparer)
 		switch {
 		case hasSafe && hasConcurrency:
-			return &daemonGUINativeSafeConcurrencyReadOnlyTool{
+			wrapped := &daemonGUINativeSafeConcurrencyReadOnlyTool{
 				daemonGUISafeConcurrencyReadOnlyTool: &daemonGUISafeConcurrencyReadOnlyTool{
 					daemonGUISafeReadOnlyTool: &daemonGUISafeReadOnlyTool{
 						daemonGUIReadOnlyTool: ro, safe: safe,
@@ -797,26 +876,50 @@ func wrapOneDaemonGUIToolV1(
 					concurrency: concurrency,
 				},
 				native: native,
-			}, nil
+			}
+			if hasPreparation {
+				return &daemonGUINativePreparingSafeConcurrencyReadOnlyTool{
+					daemonGUINativeSafeConcurrencyReadOnlyTool: wrapped,
+				}, nil
+			}
+			return wrapped, nil
 		case hasSafe:
-			return &daemonGUINativeSafeReadOnlyTool{
+			wrapped := &daemonGUINativeSafeReadOnlyTool{
 				daemonGUISafeReadOnlyTool: &daemonGUISafeReadOnlyTool{
 					daemonGUIReadOnlyTool: ro, safe: safe,
 				},
 				native: native,
-			}, nil
+			}
+			if hasPreparation {
+				return &daemonGUINativePreparingSafeReadOnlyTool{
+					daemonGUINativeSafeReadOnlyTool: wrapped,
+				}, nil
+			}
+			return wrapped, nil
 		case hasConcurrency:
-			return &daemonGUINativeConcurrencyReadOnlyTool{
+			wrapped := &daemonGUINativeConcurrencyReadOnlyTool{
 				daemonGUIConcurrencyReadOnlyTool: &daemonGUIConcurrencyReadOnlyTool{
 					daemonGUIReadOnlyTool: ro, concurrency: concurrency,
 				},
 				native: native,
-			}, nil
+			}
+			if hasPreparation {
+				return &daemonGUINativePreparingConcurrencyReadOnlyTool{
+					daemonGUINativeConcurrencyReadOnlyTool: wrapped,
+				}, nil
+			}
+			return wrapped, nil
 		default:
-			return &daemonGUINativeReadOnlyTool{
+			wrapped := &daemonGUINativeReadOnlyTool{
 				daemonGUIReadOnlyTool: ro,
 				native:                native,
-			}, nil
+			}
+			if hasPreparation {
+				return &daemonGUINativePreparingReadOnlyTool{
+					daemonGUINativeReadOnlyTool: wrapped,
+				}, nil
+			}
+			return wrapped, nil
 		}
 	}
 	switch {

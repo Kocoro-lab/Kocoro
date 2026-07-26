@@ -660,7 +660,7 @@ func TestBuildFullSchemasWithDefer_WebToolsNeverDeferred(t *testing.T) {
 	}
 }
 
-func TestBuildFullSchemasWithDefer_NativeComputerIsNeverDeferred(t *testing.T) {
+func TestBuildFullSchemasWithDefer_AnthropicNativeComputerCanBeDeferred(t *testing.T) {
 	reg := NewToolRegistry()
 	reg.Register(&mockNativeTool{name: "computer"})
 	reg.Register(&mockTool{name: "bash"})
@@ -686,8 +686,8 @@ func TestBuildFullSchemasWithDefer_NativeComputerIsNeverDeferred(t *testing.T) {
 	if native == nil || function == nil {
 		t.Fatalf("expected native and function schemas, got %+v", schemas)
 	}
-	if native.DeferLoading {
-		t.Fatal("native computer must never be marked defer_loading")
+	if !native.DeferLoading {
+		t.Fatal("cold Anthropic native computer lost defer_loading")
 	}
 	if !function.DeferLoading {
 		t.Fatal("cold function tool lost existing defer_loading behavior")
@@ -696,8 +696,9 @@ func TestBuildFullSchemasWithDefer_NativeComputerIsNeverDeferred(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal cold native computer: %v", err)
 	}
-	if strings.Contains(string(raw), "defer_loading") || strings.Contains(string(raw), "function") {
-		t.Fatalf("native computer leaked non-native fields: %s", raw)
+	if !strings.Contains(string(raw), `"defer_loading":true`) ||
+		strings.Contains(string(raw), "function") {
+		t.Fatalf("deferred native computer wire shape is invalid: %s", raw)
 	}
 }
 

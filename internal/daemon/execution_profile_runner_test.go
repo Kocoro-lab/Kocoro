@@ -224,7 +224,7 @@ func TestPrepareComputerUseRegistryForRunResolvedGenericIsAXOnlyAndSingleSurface
 	}
 }
 
-func TestPrepareComputerUseRegistryForRunResolvedAnthropicUsesOnlyNativeAlias(t *testing.T) {
+func TestPrepareComputerUseRegistryForRunResolvedAnthropicFallsBackToGeneric(t *testing.T) {
 	anthropicNative := loadRunnerExecutionProfileFixture(t, "profile.anthropic-native.json")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(anthropicNative)
@@ -245,24 +245,132 @@ func TestPrepareComputerUseRegistryForRunResolvedAnthropicUsesOnlyNativeAlias(t 
 	if err != nil {
 		t.Fatalf("prepareComputerUseRegistryForRun: %v", err)
 	}
-	if fallback {
-		t.Fatal("valid resolved native profile used fallback")
+	if !fallback {
+		t.Fatal("Anthropic native profile did not select the safe generic fallback")
 	}
-	if profile == nil || profile.ToolContract() != client.ToolContractAnthropicComputer20251124 {
-		t.Fatalf("profile = %+v", profile)
+	if profile != nil {
+		t.Fatalf("fallback profile = %+v, want nil so completion cannot claim the native contract", profile)
 	}
-	native, ok := registry.Get("computer")
+	public, ok := registry.Get("computer_use")
 	if !ok {
-		t.Fatal("native profile lost computer alias")
+		t.Fatal("Anthropic fallback lost computer_use")
 	}
-	if _, ok := native.(agent.NativeToolProvider); !ok {
-		t.Fatalf("computer type = %T, want NativeToolProvider", native)
+	if _, ok := public.(agent.NativeToolRequestPreparer); ok {
+		t.Fatalf("Anthropic fallback computer_use unexpectedly prepares provider-native state: %T", public)
 	}
-	if _, ok := registry.Get("computer_use"); ok {
-		t.Fatal("native profile exposed competing computer_use")
+	if _, ok := registry.Get(client.NativeComputerToolName); ok {
+		t.Fatal("Anthropic fallback exposed native or legacy computer")
 	}
 	if _, ok := registry.Get("accessibility"); ok {
-		t.Fatal("native profile exposed competing accessibility tool")
+		t.Fatal("Anthropic fallback exposed competing accessibility tool")
+	}
+}
+
+func TestRunAgentAnthropicFallbackDoesNotPrepareGUIForScheduleTextReply(t *testing.T) {
+	anthropicNative := loadRunnerExecutionProfileFixture(t, "profile.anthropic-native.json")
+	streamResponse := []byte(
+		"data: {\"type\":\"content_delta\",\"text\":\"ok\"}\n\n" +
+			"data: {\"type\":\"done\",\"output_text\":\"ok\",\"provider\":\"anthropic\"," +
+			"\"model\":\"claude-sonnet-5\",\"usage\":{\"cache_aware_total_tokens\":0,\"billable_tokens\":0}}\n\n" +
+			"data: [DONE]\n\n",
+	)
+	var mu sync.Mutex
+	var completionRequests []client.CompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/completions/resolve":
+			_, _ = w.Write(anthropicNative)
+		case "/v1/completions":
+			var req client.CompletionRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode completion request: %v", err)
+			}
+			mu.Lock()
+			completionRequests = append(completionRequests, req)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write(streamResponse)
+		case "/channels":
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	shannonDir := t.TempDir()
+	cfg := &config.Config{
+		Provider:  "gateway",
+		ModelTier: "medium",
+		Agent: config.AgentConfig{
+			MaxIterations: 2,
+		},
+	}
+	baseline, _, cleanup := tools.RegisterLocalTools(cfg, nil)
+	defer cleanup()
+	deps := &ServerDeps{
+		Config:       cfg,
+		GW:           client.NewGatewayClient(server.URL, "test-key"),
+		Registry:     baseline,
+		BaselineReg:  baseline,
+		SessionCache: NewSessionCache(shannonDir),
+		ShannonDir:   shannonDir,
+		AgentsDir:    filepath.Join(shannonDir, "agents"),
+	}
+	defer deps.SessionCache.CloseAll()
+
+	result, err := RunAgent(
+		context.Background(),
+		deps,
+		RunAgentRequest{
+			Text:          "What is 1+1?",
+			Source:        "schedule",
+			BypassRouting: true,
+		},
+		nullEventHandler{},
+	)
+	if err != nil {
+		t.Fatalf("RunAgent: %v", err)
+	}
+	if result == nil || result.Reply != "ok" {
+		t.Fatalf("result = %+v", result)
+	}
+
+	mu.Lock()
+	requests := append([]client.CompletionRequest(nil), completionRequests...)
+	mu.Unlock()
+	if len(requests) == 0 {
+		t.Fatal("schedule text reply sent no completion request")
+	}
+	hasGenericMainRequest := false
+	for index, request := range requests {
+		if request.ExecutionProfileID != "" || request.ResolvedExecutionProfile != nil {
+			t.Fatalf(
+				"completion request %d leaked native execution profile: id=%q profile=%+v",
+				index,
+				request.ExecutionProfileID,
+				request.ResolvedExecutionProfile,
+			)
+		}
+		var hasComputerUse, hasNativeComputer bool
+		for _, schema := range request.Tools {
+			if schema.Type == "function" && schema.Function.Name == "computer_use" {
+				hasComputerUse = true
+			}
+			if schema.Type == client.NativeComputerToolType {
+				hasNativeComputer = true
+			}
+		}
+		if hasNativeComputer {
+			t.Fatalf(
+				"completion request %d exposed native computer",
+				index,
+			)
+		}
+		hasGenericMainRequest = hasGenericMainRequest || hasComputerUse
+	}
+	if !hasGenericMainRequest {
+		t.Fatal("no completion request exposed generic computer_use")
 	}
 }
 

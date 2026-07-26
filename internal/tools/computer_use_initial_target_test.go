@@ -69,7 +69,10 @@ func TestAnthropicComputerInitialTargetUsesForegroundHintAndRestoresBeforeMutati
 	if !ok {
 		t.Fatalf("native computer = %T", unwrapGUIExecutionGate(public))
 	}
-	descriptor, err := adapter.DescribeNativeToolRequestPreparation(context.Background())
+	descriptor, err := adapter.DescribeGUIAction(
+		context.Background(),
+		`{"action":"screenshot"}`,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -463,8 +463,8 @@ When a tool returns no results but IsError is false, distinguish "empty = the an
 Prefer dedicated tools over bash when one fits: file_read (not cat/head/tail), file_edit (not sed/awk), glob (not find — find scans the whole filesystem and can take minutes), grep (not grep/rg), directory_list (not ls), screenshot (not screencapture). Reserve bash for shell-only operations. Tool capabilities and parameters live in the tools[] array — discover them there.
 
 ### GUI & Desktop (macOS)
-- Native macOS UI: prefer computer_use when registered. Pattern: get_app_state → act by state_id+ref → re-observe after mutation. Use legacy accessibility only when computer_use is unavailable.
-- Screenshots are explicit evidence/fallback for canvas, custom-drawn UI, or visual verification; do not capture after every successful semantic action.
+- Native macOS UI: use computer_use when registered. Start with an exact app name unless the current run already identifies the user's original foreground app. Pattern: get_app_state → act by state_id+ref → re-observe after mutation.
+- One computer_use state belongs to one existing app window. screenshot and include_screenshot capture only that target window; use them as explicit evidence/fallback for canvas, custom-drawn UI, or visual verification.
 - Reminders.app owns the "Scheduled Reminders" calendar — modify those events with "tell application Reminders", not Calendar.
 
 ### Web & Network
@@ -2697,27 +2697,28 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		}
 	}
 	var (
-		detector                  = NewLoopDetector()
-		toolsUsed                 = make(map[string]int)
-		totalToolCalls            int
-		lastText                  string
-		streamingText             strings.Builder // accumulates streaming deltas for cancel recovery
-		truncatedText             strings.Builder // accumulates text from max_tokens continuations
-		continuationCount         int
-		truncationRecoveryCount   int // per-Run() (one user message); see maxTruncationRecoveries
-		inconsistentFinishRetries int // per-Run(); see maxInconsistentFinishRetries (Task 7)
-		openAIComputerBaseRequest *client.CompletionRequest
-		openAIContinuationRequest *client.CompletionRequest
-		afterCheckpoint           bool
-		checkpointDone            bool
-		nudges                    = newNudgeWindow(maxNudges, nudgeWindowIters)
-		hallucinationNudges       int
-		lastPromptTokens          int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
-		lastOutputTokens          int    // actual output tokens from last LLM response
-		compactionSummary         string // cached summary from compaction
-		compactionApplied         bool   // true once messages have been shaped
-		reactiveCompacted         bool   // true once reactive compaction fired (never resets)
-		summaryFailures           int    // consecutive summary failures; backs off after 3
+		detector                     = NewLoopDetector()
+		toolsUsed                    = make(map[string]int)
+		totalToolCalls               int
+		lastText                     string
+		streamingText                strings.Builder // accumulates streaming deltas for cancel recovery
+		truncatedText                strings.Builder // accumulates text from max_tokens continuations
+		continuationCount            int
+		truncationRecoveryCount      int // per-Run() (one user message); see maxTruncationRecoveries
+		inconsistentFinishRetries    int // per-Run(); see maxInconsistentFinishRetries (Task 7)
+		openAIComputerBaseRequest    *client.CompletionRequest
+		openAIContinuationRequest    *client.CompletionRequest
+		openAIContinuationScreenshot *client.ContentBlock
+		afterCheckpoint              bool
+		checkpointDone               bool
+		nudges                       = newNudgeWindow(maxNudges, nudgeWindowIters)
+		hallucinationNudges          int
+		lastPromptTokens             int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
+		lastOutputTokens             int    // actual output tokens from last LLM response
+		compactionSummary            string // cached summary from compaction
+		compactionApplied            bool   // true once messages have been shaped
+		reactiveCompacted            bool   // true once reactive compaction fired (never resets)
+		summaryFailures              int    // consecutive summary failures; backs off after 3
 		// lastSummaryFailureIter records the iteration of the most recent summary
 		// failure; summaryBackedOff measures the cool-off distance from this iter.
 		// Zero value is fine: the `summaryFailures >= maxSummaryFailures` guard
@@ -3219,6 +3220,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		return true
 	}
 
+iterationLoop:
 	for i := 0; ; i++ {
 		effectiveMax := a.effectiveMaxIter(toolsUsed)
 		if i >= effectiveMax {
@@ -3679,6 +3681,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			ResolvedExecutionProfile: a.executionProfile,
 		}
 		reuseExactRequestOnRetry := false
+		isOpenAIComputerContinuation := openAIContinuationRequest != nil
 		// A Responses continuation carries previous_response_id plus exactly
 		// the latest assistant computer_call / user computer_call_output pair.
 		// Rebuilding from the full persisted transcript would resend every
@@ -3823,6 +3826,9 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 					resp, err = a.client.Complete(ctx, req)
 				}
 				if err == nil {
+					if isOpenAIComputerContinuation {
+						openAIContinuationScreenshot = nil
+					}
 					// Mark "last assistant response received" for the time-based
 					// microcompact gap calculation (timebasedcompact.go).
 					a.lastAssistantAt = time.Now()
@@ -3863,6 +3869,41 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 					}
 					setRunStatus(runstatus.CodeFromError(ctx.Err()), false)
 					return partial, usage, fmt.Errorf("LLM call cancelled: %w", ctx.Err())
+				}
+				if isOpenAIComputerContinuation &&
+					openAIContinuationScreenshot != nil &&
+					isOpenAIComputerContinuationExpired(err) {
+					// The prior computer batch already executed and its final
+					// screenshot was verified before this one-shot continuation
+					// failed. A fresh provider run cannot accept the expired
+					// computer_call/output pair, so carry the verified screen
+					// forward as an ordinary image turn and explicitly forbid
+					// replaying the committed action.
+					screenshot := *openAIContinuationScreenshot
+					source := *screenshot.Source
+					screenshot.Source = &source
+					restartText :=
+						"[system] The previous OpenAI computer continuation expired " +
+							"after its computer action completed and was verified. " +
+							"Do not repeat that action. Continue from the current screen below."
+					if strings.TrimSpace(latestUserText) != "" {
+						restartText += "\n\nCurrent task:\n" + latestUserText
+					}
+					messages = append(messages, client.Message{
+						Role: "user",
+						Content: client.NewBlockContent([]client.ContentBlock{
+							{Type: "text", Text: restartText},
+							screenshot,
+						}),
+					})
+					markInjected()
+					openAIComputerBaseRequest = nil
+					openAIContinuationRequest = nil
+					openAIContinuationScreenshot = nil
+					a.tracker.MarkDirty()
+					captureRunMessages()
+					a.maybeCheckpoint(ctx)
+					continue iterationLoop
 				}
 				// Reactive compaction: if the error is a context-length overflow,
 				// try the normal compaction profile first so summary quality stays
@@ -4300,6 +4341,10 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 				setRunStatus(runstatus.CodeFromError(err), false)
 				return "", usage, err
 			}
+			screenshotCopy := screenshot
+			sourceCopy := *screenshot.Source
+			screenshotCopy.Source = &sourceCopy
+			openAIContinuationScreenshot = &screenshotCopy
 			openAIContinuationRequest = &next
 			continue
 		}
@@ -4821,14 +4866,21 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			callMeta[idx].decision = decision
 			callMeta[idx].wasApproved = wasApproved
 			if decision == "deny" {
-				a.logAudit(fc.Name, argsStr, "tool call denied by permission policy", decision, false, 0, nil)
+				denial := ToolResult{Content: "tool call denied by permission policy", IsError: true}
+				if reporter, ok := tool.(ApprovalAdmissionDenialReporter); ok {
+					if reported, available := reporter.ApprovalAdmissionDenialResult(ctx, argsStr); available {
+						denial = reported
+						denial.IsError = true
+					}
+				}
+				a.logAudit(fc.Name, argsStr, denial.Content, decision, false, 0, nil)
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
-					result: ToolResult{Content: "tool call denied by permission policy", IsError: true},
+					result: denial,
 					name:   fc.Name,
 				}
 				if a.handler != nil {
-					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, ToolResult{Content: "denied by policy", IsError: true}, 0)
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, denial, 0)
 				}
 				continue
 			}
@@ -5441,6 +5493,24 @@ func isContextLengthError(err error) bool {
 		strings.Contains(body, "context_length_exceeded")
 }
 
+// isOpenAIComputerContinuationExpired recognizes only Cloud's structured 409
+// contract. Other conflicts remain terminal; text matching alone must not turn
+// an unrelated failure into a provider-trajectory restart.
+func isOpenAIComputerContinuationExpired(err error) bool {
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 409 {
+		return false
+	}
+	var envelope struct {
+		Error *struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	return json.Unmarshal([]byte(apiErr.Body), &envelope) == nil &&
+		envelope.Error != nil &&
+		envelope.Error.Type == "computer_continuation_expired"
+}
+
 // isRetryableLLMError returns true for transient errors that may succeed on retry
 // (rate limits, server errors, timeouts). Non-retryable: 400 bad request,
 // 401 auth, 403 forbidden, context cancelled, marshalling errors,
@@ -5517,8 +5587,17 @@ func classifyLLMError(err error) string {
 // The approvalCache tracks previously approved tool+args combinations within
 // the current turn so the user is not asked twice for the same call.
 func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, argsStr string, tool Tool, cache *ApprovalCache) (string, bool) {
+	// The persisted Computer Use grant is the only fact that authorizes GUI
+	// observation or mutation in an unattended run. Establish this gate before
+	// ApprovalAdmission: the GUI admission checker resolves the target app, so
+	// calling it first would itself read Accessibility state before consent.
+	persistedAlwaysAllow := a.alwaysAllowTools[toolName] && !DisallowsAutoApproval(toolName)
+	unattendedGrantHonored := persistedAlwaysAllow && toolName == "computer_use"
+	unattendedDenied := a.unattendedRun &&
+		DisallowsUnattendedAutoApproval(toolName) && !unattendedGrantHonored
+
 	admission := ApprovalAdmissionInherit
-	if checker, ok := tool.(ApprovalAdmissionChecker); ok {
+	if checker, ok := tool.(ApprovalAdmissionChecker); ok && !unattendedDenied {
 		admission = checker.ApprovalAdmission(ctx, argsStr)
 		if admission == ApprovalAdmissionDeny {
 			return "deny", false
@@ -5527,7 +5606,7 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 	requireFreshApproval := admission == ApprovalAdmissionRequireFresh
 
 	// Bypass mode: skip all permission checks including hard-blocks
-	if a.bypassPermissions && !requireFreshApproval {
+	if a.bypassPermissions && !requireFreshApproval && !unattendedDenied {
 		return "allow", true
 	}
 
@@ -5538,7 +5617,7 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 			if decision == "deny" {
 				return "deny", false
 			}
-			if decision == "allow" && !requireFreshApproval {
+			if decision == "allow" && !requireFreshApproval && !unattendedDenied {
 				return "allow", true
 			}
 			// decision == "ask" — fall through; may be auto-approved by user file paths below
@@ -5550,7 +5629,7 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 	// File attachments: exact path match only — no substring escalation.
 	// Folder attachments: subtree match — files inside the attached folder
 	// are auto-approved (dragging a folder is intuitively "all of this").
-	if !requireFreshApproval && len(a.userFilePaths) > 0 {
+	if !requireFreshApproval && !unattendedDenied && len(a.userFilePaths) > 0 {
 		if toolPath := extractToolPath(toolName, argsStr); toolPath != "" {
 			cleaned := resolvePathForAttachmentMatch(toolPath)
 			for _, fp := range a.userFilePaths {
@@ -5575,17 +5654,13 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 	// unattended runs: this global product switch is what enables schedules and
 	// background tasks to operate the Mac without a person at the approval UI.
 	// With no grant, the unattended deny-list below still fails closed.
-	persistedAlwaysAllow := a.alwaysAllowTools[toolName] && !DisallowsAutoApproval(toolName)
 	// The global Computer Use grant is the ONLY persisted always-allow that may
 	// authorize an unattended run. Every other tool on the unattended deny-list
 	// — standalone screenshot, and the legacy GUI names — still fails closed
 	// there, exactly as it does on main. Scoping this to computer_use is
 	// load-bearing: a blanket "persisted always-allow wins" would silently
 	// re-open unattended desktop capture for screenshot.
-	unattendedGrantHonored := persistedAlwaysAllow && toolName == "computer_use"
-	unattendedDeniedForAlwaysAllow := a.unattendedRun &&
-		DisallowsUnattendedAutoApproval(toolName) && !unattendedGrantHonored
-	if !requireFreshApproval && persistedAlwaysAllow && !unattendedDeniedForAlwaysAllow {
+	if !requireFreshApproval && persistedAlwaysAllow && !unattendedDenied {
 		// Bash-specific defense: tool-level always-allow MUST NOT bypass the
 		// always-ask gate. Agent-author granted "trust this agent for bash
 		// generally", but `pip install`, `rm -rf`, `git push --force`,
@@ -5611,8 +5686,6 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 	// grant is the product switch that enables full automation. This differs
 	// from the generic non-interactive fallback, which must never silently
 	// infer Computer Use consent merely because no approval UI is available.
-	unattendedDenied := unattendedDeniedForAlwaysAllow
-
 	// Existing RequiresApproval + SafeChecker logic
 	needsApproval := requireFreshApproval || tool.RequiresApproval()
 	if needsApproval && !requireFreshApproval {
