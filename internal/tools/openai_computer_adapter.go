@@ -847,9 +847,17 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 			)
 			return result, nil
 		}
+		// A committed_unverified acknowledgement means the input commit is
+		// known, but the action-specific causal postcondition was not proven.
+		// Atomic pointer/key actions can safely continue after the daemon's
+		// mandatory re-observation. Compound scroll/drag actions can partially
+		// commit, so they still stop unless fully verified. Unknown commits and
+		// explicit action errors always stop before any later action can run.
 		if executeErr != nil || execution.Result.IsError ||
-			execution.CommitState != OpenAIComputerCommitVerifiedV1 &&
-				openAIComputerActionMutatesV1(action) {
+			openAIComputerActionMutatesV1(action) &&
+				execution.CommitState != OpenAIComputerCommitVerifiedV1 &&
+				!(execution.CommitState == OpenAIComputerCommitUnverifiedV1 &&
+					openAIComputerKnownCommitCanContinueV1(action)) {
 			result.ToolResult = openAIComputerActionFailureV1(
 				index,
 				len(call.Actions),
@@ -922,6 +930,19 @@ func validateOpenAIComputerActionExecutionV1(
 func openAIComputerActionMutatesV1(action OpenAIComputerActionV1) bool {
 	return action.Type != OpenAIComputerActionScreenshotV1 &&
 		action.Type != OpenAIComputerActionWaitV1
+}
+
+func openAIComputerKnownCommitCanContinueV1(action OpenAIComputerActionV1) bool {
+	switch action.Type {
+	case OpenAIComputerActionClickV1,
+		OpenAIComputerActionDoubleClickV1,
+		OpenAIComputerActionMoveV1,
+		OpenAIComputerActionTypeTextV1,
+		OpenAIComputerActionKeypressV1:
+		return true
+	default:
+		return false
+	}
 }
 
 func openAIComputerActionFailureV1(

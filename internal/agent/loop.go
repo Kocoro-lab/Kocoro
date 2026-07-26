@@ -4334,10 +4334,12 @@ iterationLoop:
 			a.maybeCheckpoint(ctx)
 
 			if !execution.ContinuationAllowed {
-				err := fmt.Errorf(
-					"OpenAI computer batch may have committed without verification; " +
-						"provider continuation is blocked",
-				)
+				message := "OpenAI computer batch may have committed without verification; " +
+					"provider continuation is blocked"
+				if detail := strings.TrimSpace(execution.Result.Content); detail != "" {
+					message += ": " + detail
+				}
+				err := fmt.Errorf("%s", message)
 				setRunStatus(runstatus.CodeFromError(err), false)
 				return "", usage, err
 			}

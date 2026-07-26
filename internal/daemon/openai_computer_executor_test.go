@@ -474,6 +474,40 @@ func TestDaemonOpenAIComputerExecutorRunsOrderedActionsThroughFreshAuthority(t *
 	}
 }
 
+func TestDaemonOpenAIComputerExecutorReobservesAfterCommittedUnverifiedAction(t *testing.T) {
+	executor, adapter, probe, _, approvals := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	probe.results["click"] = agent.ToolResult{
+		Content: "click committed without a declared postcondition",
+		GUIOutcome: &agent.GUIActionOutcome{
+			Result:      agent.GUIActionResultCompletedUnverified,
+			Phase:       agent.GUIActionPhaseVerifying,
+			FailureCode: "click_postcondition_not_declared",
+		},
+	}
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"click","button":"left","x":10,"y":20},`+
+				`{"type":"type","text":"redacted"}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if result.ToolResult.IsError || len(result.ToolResult.Images) != 1 {
+		t.Fatalf("result = %+v", result.ToolResult)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"click,reobserve,type,final_screenshot" {
+		t.Fatalf("execution order = %q", got)
+	}
+	if *approvals != 2 {
+		t.Fatalf("fresh approvals = %d, want 2", *approvals)
+	}
+}
+
 func TestDaemonOpenAIComputerBatchRunnerBridgesAgentLoopToGuardedWorkflow(t *testing.T) {
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
 	workflow := testGUIWorkflow(coordinator, "session-openai-runner", "turn-openai-runner")
@@ -486,10 +520,11 @@ func TestDaemonOpenAIComputerBatchRunnerBridgesAgentLoopToGuardedWorkflow(t *tes
 		targetAppName:  "Notes",
 		results: map[string]agent.ToolResult{
 			"click": {
-				Content: "clicked",
+				Content: "click committed without a declared postcondition",
 				GUIOutcome: &agent.GUIActionOutcome{
-					Result: agent.GUIActionResultVerified,
-					Phase:  agent.GUIActionPhaseVerifying,
+					Result:      agent.GUIActionResultCompletedUnverified,
+					Phase:       agent.GUIActionPhaseVerifying,
+					FailureCode: "click_postcondition_not_declared",
 				},
 			},
 			"type": {
@@ -593,10 +628,11 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 		targetAppName:  "Slack",
 		results: map[string]agent.ToolResult{
 			"click": {
-				Content: "clicked",
+				Content: "click committed without a declared postcondition",
 				GUIOutcome: &agent.GUIActionOutcome{
-					Result: agent.GUIActionResultVerified,
-					Phase:  agent.GUIActionPhaseVerifying,
+					Result:      agent.GUIActionResultCompletedUnverified,
+					Phase:       agent.GUIActionPhaseVerifying,
+					FailureCode: "click_postcondition_not_declared",
 				},
 			},
 			"type": {
