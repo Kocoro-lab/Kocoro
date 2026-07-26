@@ -1122,6 +1122,91 @@ func TestMutationAdmissionRequiresFrozenAllowedTarget(t *testing.T) {
 	}
 }
 
+func TestEmptyWorkflowLeaseBindsOnlyOnFirstResolvedObservation(t *testing.T) {
+	coordinator, _ := newCoordinatorFixture(t, nil)
+	request := workflowRequest("turn-late-bind")
+	request.RequestedAppBundleID = ""
+	request.RequestedAppName = ""
+	request.AllowedAppBundleIDs = nil
+	lease, err := coordinator.BeginWorkflow(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = coordinator.BeginAction(context.Background(), ActionRequest{
+		LeaseID: lease.LeaseID, TurnID: lease.TurnID, ToolUseID: "toolu-early-mutation",
+		ActionKind: "click", Effect: ComputerUseActionMutation,
+		TargetBundleID: "com.apple.Notes", TargetAppName: "Notes",
+	})
+	var denied *PolicyDeniedError
+	if !errors.As(err, &denied) || !strings.Contains(err.Error(), "observe the running app") {
+		t.Fatalf("early mutation error = %T %v; want actionable policy denial", err, err)
+	}
+
+	observation, err := coordinator.BeginAction(context.Background(), ActionRequest{
+		LeaseID: lease.LeaseID, TurnID: lease.TurnID, ToolUseID: "toolu-observe-notes",
+		ActionKind: "get_app_state", Effect: ComputerUseActionObservation,
+		TargetBundleID: "com.apple.Notes", TargetAppName: "Notes",
+	})
+	if err != nil {
+		t.Fatalf("resolved observation: %v", err)
+	}
+	verified := ComputerUseResultVerified
+	if err := coordinator.FinishAction(ActionFinish{
+		LeaseID: lease.LeaseID, ActionID: observation.ActionID, Result: &verified,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	bound, err := coordinator.BeginWorkflow(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.RequestedAppBundleID != "com.apple.Notes" ||
+		bound.RequestedAppName != "Notes" ||
+		!reflect.DeepEqual(bound.AllowedAppBundleIDs, []string{"com.apple.Notes"}) {
+		t.Fatalf("late-bound lease = %+v", bound)
+	}
+
+	allowed, err := coordinator.BeginAction(context.Background(), ActionRequest{
+		LeaseID: lease.LeaseID, TurnID: lease.TurnID, ToolUseID: "toolu-click-notes",
+		ActionKind: "click", Effect: ComputerUseActionMutation,
+		TargetBundleID: "com.apple.Notes", TargetAppName: "Notes",
+	})
+	if err != nil {
+		t.Fatalf("bound mutation: %v", err)
+	}
+	failed := ComputerUseResultFailed
+	if err := coordinator.FinishAction(ActionFinish{
+		LeaseID: lease.LeaseID, ActionID: allowed.ActionID, Result: &failed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	otherObservation, err := coordinator.BeginAction(context.Background(), ActionRequest{
+		LeaseID: lease.LeaseID, TurnID: lease.TurnID, ToolUseID: "toolu-observe-slack",
+		ActionKind: "get_app_state", Effect: ComputerUseActionObservation,
+		TargetBundleID: "com.tinyspeck.slackmacgap", TargetAppName: "Slack",
+	})
+	if err != nil {
+		t.Fatalf("cross-app observation: %v", err)
+	}
+	if err := coordinator.FinishAction(ActionFinish{
+		LeaseID: lease.LeaseID, ActionID: otherObservation.ActionID, Result: &verified,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = coordinator.BeginAction(context.Background(), ActionRequest{
+		LeaseID: lease.LeaseID, TurnID: lease.TurnID, ToolUseID: "toolu-click-slack",
+		ActionKind: "click", Effect: ComputerUseActionMutation,
+		TargetBundleID: "com.tinyspeck.slackmacgap", TargetAppName: "Slack",
+	})
+	if !errors.As(err, &denied) || !strings.Contains(err.Error(), "another app") {
+		t.Fatalf("cross-app mutation error = %T %v; want bound-app policy denial", err, err)
+	}
+}
+
 func TestTombstonesAreBounded(t *testing.T) {
 	fixture := &coordinatorFixture{now: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)}
 	coordinator := NewCoordinator(CoordinatorOptions{

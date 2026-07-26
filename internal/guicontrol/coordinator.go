@@ -497,6 +497,19 @@ func (c *Coordinator) BeginAction(parent context.Context, request ActionRequest)
 		c.mu.Unlock()
 		return ActionHandle{}, &PolicyDeniedError{LeaseID: request.LeaseID, Reason: "consequential-risk confirmation was not staged"}
 	}
+	// A workflow may begin with an observation whose requested app is not
+	// running yet, so its lease has no exact bundle to admit. Keep that lease
+	// and the process-wide GUI serialization, but bind its one mutation target
+	// when the first later observation resolves an exact bundle. Mutations can
+	// never create or widen this authority, and an already-bound workflow stays
+	// pinned to its original app.
+	if request.Effect == ComputerUseActionObservation &&
+		request.TargetBundleID != "" &&
+		len(c.active.lease.AllowedAppBundleIDs) == 0 {
+		c.active.lease.RequestedAppBundleID = request.TargetBundleID
+		c.active.lease.RequestedAppName = request.TargetAppName
+		c.active.lease.AllowedAppBundleIDs = []string{request.TargetBundleID}
+	}
 	if request.Effect == ComputerUseActionMutation && c.active.requiresObservation {
 		c.mu.Unlock()
 		return ActionHandle{}, &ReobservationRequiredError{LeaseID: request.LeaseID}
@@ -655,12 +668,15 @@ func (c *Coordinator) enforceAllowedTargetLocked(request ActionRequest) error {
 	if request.TargetBundleID == "" {
 		return deny("a mutating action requires an explicit target bundle")
 	}
+	if len(c.active.lease.AllowedAppBundleIDs) == 0 {
+		return deny("no app target is bound to this workflow; start the app and observe the running app before attempting a mutation")
+	}
 	for _, allowed := range c.active.lease.AllowedAppBundleIDs {
 		if request.TargetBundleID == allowed {
 			return nil
 		}
 	}
-	return deny("target bundle is outside the frozen allowlist")
+	return deny("this workflow is bound to another app; start a new turn to control a different app")
 }
 
 func (c *Coordinator) FinishAction(finish ActionFinish) error {

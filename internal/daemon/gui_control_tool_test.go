@@ -820,7 +820,8 @@ func TestDaemonGUIWorkflowDeniesCrossAppMutationAfterFrozenFirstTarget(t *testin
 		},
 	}
 	result, err := workflow.runTool(context.Background(), mutate, `{}`)
-	if err != nil || !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness || !strings.Contains(result.Content, "outside the frozen allowlist") {
+	if err != nil || !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness ||
+		!strings.Contains(result.Content, "bound to another app") {
 		t.Fatalf("cross-app mutation result=%+v err=%v", result, err)
 	}
 	if mutate.calls != 0 {
@@ -829,7 +830,7 @@ func TestDaemonGUIWorkflowDeniesCrossAppMutationAfterFrozenFirstTarget(t *testin
 	workflow.EndTurn()
 }
 
-func TestDaemonGUIWorkflowUnresolvedFirstObservationFreezesEmptyAllowlist(t *testing.T) {
+func TestDaemonGUIWorkflowFirstResolvedObservationBindsEmptyLease(t *testing.T) {
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{
 		RequireControllerHeartbeat: true,
 		LeaseTTL:                   5 * time.Second,
@@ -850,16 +851,26 @@ func TestDaemonGUIWorkflowUnresolvedFirstObservationFreezesEmptyAllowlist(t *tes
 	if result := <-done; result.IsError {
 		t.Fatalf("targetless observation=%+v", result)
 	}
+	resolved := &guiProbeTool{
+		name: "computer_use",
+		descriptor: agent.GUIActionDescriptor{
+			Participates: true, ActionKind: "get_app_state", Effect: agent.GUIActionObservation,
+			TargetBundleID: "com.example.Notes", TargetAppName: "Notes",
+		},
+	}
+	if result, err := workflow.runTool(context.Background(), resolved, `{}`); err != nil || result.IsError {
+		t.Fatalf("resolved observation=%+v err=%v", result, err)
+	}
 	mutate := &guiProbeTool{
-		name: "computer",
+		name: "computer_use",
 		descriptor: agent.GUIActionDescriptor{
 			Participates: true, ActionKind: "click", Effect: agent.GUIActionMutation,
 			TargetBundleID: "com.example.Notes", TargetAppName: "Notes",
 		},
 	}
-	result, _ := workflow.runTool(context.Background(), mutate, `{}`)
-	if !result.IsError || !strings.Contains(result.Content, "outside the frozen allowlist") || mutate.calls != 0 {
-		t.Fatalf("mutation after unresolved observation=%+v calls=%d", result, mutate.calls)
+	result, err := workflow.runTool(context.Background(), mutate, `{}`)
+	if err != nil || result.IsError || mutate.calls != 1 {
+		t.Fatalf("mutation after resolved observation=%+v err=%v calls=%d", result, err, mutate.calls)
 	}
 	workflow.EndTurn()
 }
