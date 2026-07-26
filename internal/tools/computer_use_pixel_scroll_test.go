@@ -83,8 +83,8 @@ func TestComputerUsePixelScrollMapsExactFramePointAndPreservesProviderDeltas(t *
 		result.GUIOutcome.Pointer == nil {
 		t.Fatalf("typed outcome=%+v", result.GUIOutcome)
 	}
-	if harness.tool.snapshot != nil || harness.tool.coordinateArtifact != nil {
-		t.Fatal("pixel scroll did not consume observation authority")
+	if harness.tool.snapshot == nil || harness.tool.coordinateArtifact == nil {
+		t.Fatal("native pixel scroll consumed ordered-batch observation authority")
 	}
 	if got := fakeAXMethods(harness.fake.calls[len(harness.fake.calls)-2:]); !reflect.DeepEqual(
 		got, []string{"read_tree", "display_topology"}) {

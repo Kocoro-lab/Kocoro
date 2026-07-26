@@ -26,9 +26,8 @@ type OpenAIComputerFreshApproval func(
 // OpenAIComputerBatchExecution is the narrow result returned to AgentLoop.
 // Result must contain exactly one final screenshot. ContinuationAllowed is
 // true only when every mutation was either verified or was an atomic action
-// with a known commit, all required re-observations succeeded, and the exact
-// terminal observation succeeded. Unknown and partial compound commits remain
-// terminal.
+// with a known commit and the exact terminal observation succeeded. Unknown
+// and partial compound commits remain terminal.
 type OpenAIComputerBatchExecution struct {
 	CallID              string
 	ContinuationAllowed bool

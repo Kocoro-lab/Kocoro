@@ -455,11 +455,11 @@ func TestDaemonOpenAIComputerExecutorRunsOrderedActionsThroughFreshAuthority(t *
 		t.Fatalf("result = %+v", result.ToolResult)
 	}
 	if got := probe.runNames(); strings.Join(got, ",") !=
-		"click,reobserve,type,final_screenshot" {
+		"click,type,final_screenshot" {
 		t.Fatalf("execution order = %v", got)
 	}
 	if got := probe.preflightNames(); strings.Join(got, ",") !=
-		"click,reobserve,type,final_screenshot" {
+		"click,type,final_screenshot" {
 		t.Fatalf("risk preflight order = %v", got)
 	}
 	if *approvals != 2 {
@@ -474,7 +474,7 @@ func TestDaemonOpenAIComputerExecutorRunsOrderedActionsThroughFreshAuthority(t *
 	}
 }
 
-func TestDaemonOpenAIComputerExecutorReobservesAfterCommittedUnverifiedAction(t *testing.T) {
+func TestDaemonOpenAIComputerExecutorContinuesKnownAtomicCommitWithoutInternalReobserve(t *testing.T) {
 	executor, adapter, probe, _, approvals := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
 	probe.results["click"] = agent.ToolResult{
@@ -500,7 +500,7 @@ func TestDaemonOpenAIComputerExecutorReobservesAfterCommittedUnverifiedAction(t 
 		t.Fatalf("result = %+v", result.ToolResult)
 	}
 	if got := strings.Join(probe.runNames(), ","); got !=
-		"click,reobserve,type,final_screenshot" {
+		"click,type,final_screenshot" {
 		t.Fatalf("execution order = %q", got)
 	}
 	if *approvals != 2 {
@@ -601,7 +601,7 @@ func TestDaemonOpenAIComputerBatchRunnerBridgesAgentLoopToGuardedWorkflow(t *tes
 		t.Fatalf("reply=%q completion_requests=%d", reply, len(llm.requests))
 	}
 	if got := probe.runNames(); strings.Join(got, ",") !=
-		"click,reobserve,type,final_screenshot" {
+		"click,type,final_screenshot" {
 		t.Fatalf("execution order = %v", got)
 	}
 	if handler.approvals != 2 {
@@ -718,7 +718,7 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 		t.Fatalf("launched apps = %+v", runtime.launchedApps)
 	}
 	if got := strings.Join(probe.runNames(), ","); got !=
-		"final_screenshot,click,reobserve,type,final_screenshot" {
+		"final_screenshot,click,type,final_screenshot" {
 		t.Fatalf("private execution order = %q", got)
 	}
 	if len(llm.requests) != 2 {

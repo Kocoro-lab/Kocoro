@@ -65,6 +65,10 @@ type ActionRequest struct {
 	ExecutionPath  *ComputerUseExecutionPath
 	Pointer        *ComputerUsePointer
 	Effect         ComputerUseActionEffect
+	// OrderedBatchAction keeps one already-observed provider screenshot valid
+	// across sequential actions. Pause, Take Over, and user interference still
+	// establish the ordinary re-observation barrier.
+	OrderedBatchAction bool
 	// RiskIntentID and RiskTargetDigest are process-local execution authority.
 	// They are never projected into ComputerUseActivityState or routine logs.
 	RiskIntentID     string
@@ -109,6 +113,7 @@ type actionRecord struct {
 	actionKind              string
 	targetBundleID          string
 	targetAppName           string
+	orderedBatchAction      bool
 	cancel                  context.CancelFunc
 	executionAuthority      *executionAuthority
 	cancellationResult      *ComputerUseActionResult
@@ -517,7 +522,8 @@ func (c *Coordinator) BeginAction(parent context.Context, request ActionRequest)
 		id: actionID, effect: request.Effect, toolName: request.ToolName,
 		actionKind:     request.ActionKind,
 		targetBundleID: request.TargetBundleID, targetAppName: request.TargetAppName,
-		cancel: cancel, executionAuthority: executionAuthority,
+		orderedBatchAction: request.OrderedBatchAction,
+		cancel:             cancel, executionAuthority: executionAuthority,
 	}
 	state := &c.active.activity
 	state.ActionID = actionID
@@ -644,7 +650,8 @@ func exactConsequentialRiskActionRequest(a, b ActionRequest) bool {
 		a.ToolUseID == b.ToolUseID && a.ActionKind == b.ActionKind && a.ActionPhase == b.ActionPhase &&
 		a.TargetBundleID == b.TargetBundleID &&
 		a.TargetAppName == b.TargetAppName && executionPathString(a.ExecutionPath) == executionPathString(b.ExecutionPath) &&
-		a.Effect == b.Effect && a.RiskIntentID == b.RiskIntentID && a.RiskTargetDigest == b.RiskTargetDigest
+		a.Effect == b.Effect && a.OrderedBatchAction == b.OrderedBatchAction &&
+		a.RiskIntentID == b.RiskIntentID && a.RiskTargetDigest == b.RiskTargetDigest
 }
 
 func (c *Coordinator) enforceAllowedTargetLocked(request ActionRequest) error {
@@ -714,7 +721,8 @@ func (c *Coordinator) FinishAction(finish ActionFinish) error {
 		state.ActionPhase = ComputerUsePhaseIdle
 	}
 	terminal := c.active.lease.State == ComputerUseLeaseStopping
-	mutationRequiresObservation := action.effect == ComputerUseActionMutation && finish.Result != nil &&
+	mutationRequiresObservation := action.effect == ComputerUseActionMutation &&
+		!action.orderedBatchAction && finish.Result != nil &&
 		(*finish.Result == ComputerUseResultVerified ||
 			*finish.Result == ComputerUseResultCompletedUnverified ||
 			(*finish.Result == ComputerUseResultCancelled && finish.FailureCode != nil &&

@@ -296,6 +296,56 @@ func TestComputerUseCoordinateClickMapsCurrentArtifactAndConsumesIt(t *testing.T
 	}
 }
 
+func TestOpenAINativeComputerBatchReusesStableWindowFrameAcrossCoordinateActions(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.observe(t)
+	stateID := harness.tool.snapshot.id
+	executions := 0
+	harness.tool.coordinateExecutor = func(
+		_ context.Context,
+		request CoordinateMouseEventRequestV1,
+	) (CoordinateMouseEventResultV1, error) {
+		executions++
+		failure := "click_postcondition_not_declared"
+		return CoordinateMouseEventResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: "click",
+			PrimaryActionCommitted: true, PointerMotionCommitted: true,
+			Phase: "post_verification", FailureCode: &failure,
+			PointerEndpoint: &CoordinateMouseEventPointerEndpointV1{
+				Requested: request.QuartzPoint, Observed: &request.QuartzPoint,
+				Tolerance: coordinateMouseEndpointToleranceV1, Verified: true,
+			},
+		}, nil
+	}
+	nativeContext := ContextWithOpenAINativeComputerActionV1(context.Background())
+
+	for index := 0; index < 2; index++ {
+		current := cloneComputerUseTree(t, harness.tree)
+		if index == 1 {
+			title := "Changed after first click"
+			current.Elements[0].Title = &title
+		}
+		harness.fake.queue("read_tree", marshalComputerUseTree(t, current))
+		harness.fake.queue("display_topology", marshalDisplayTopology(t, harness.topology))
+		result, err := harness.tool.Run(nativeContext, fmt.Sprintf(`{
+			"action":"click","state_id":%q,"x":%d,"y":0,
+			"description":"OpenAI native batch click"
+		}`, stateID, index))
+		if err != nil || result.IsError {
+			t.Fatalf("native click %d result=%+v err=%v", index+1, result, err)
+		}
+		if harness.tool.snapshot == nil || harness.tool.coordinateArtifact == nil {
+			t.Fatalf("native click %d consumed batch frame authority", index+1)
+		}
+	}
+	if executions != 2 {
+		t.Fatalf("native batch executed %d coordinate actions, want 2", executions)
+	}
+}
+
 func TestComputerUseVerifiedCoordinateClickAllowsOneWindowBoundTypeWithoutAXRef(t *testing.T) {
 	requireComputerUseDarwin(t)
 	harness := newComputerUseCoordinateHarness(t)

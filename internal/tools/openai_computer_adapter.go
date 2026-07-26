@@ -849,15 +849,15 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 		}
 		// A committed_unverified acknowledgement means the input commit is
 		// known, but the action-specific causal postcondition was not proven.
-		// Atomic pointer/key actions can safely continue after the daemon's
-		// mandatory re-observation. Compound scroll/drag actions can partially
-		// commit, so they still stop unless fully verified. Unknown commits and
-		// explicit action errors always stop before any later action can run.
+		// Known atomic commits and fully committed scroll/drag actions can
+		// continue within the provider's ordered batch. Partial compound or
+		// unknown commits and explicit action errors stop before any later
+		// action can run.
 		if executeErr != nil || execution.Result.IsError ||
 			openAIComputerActionMutatesV1(action) &&
 				execution.CommitState != OpenAIComputerCommitVerifiedV1 &&
 				!(execution.CommitState == OpenAIComputerCommitUnverifiedV1 &&
-					openAIComputerKnownCommitCanContinueV1(action)) {
+					openAIComputerKnownCommitCanContinueV1(action, execution)) {
 			result.ToolResult = openAIComputerActionFailureV1(
 				index,
 				len(call.Actions),
@@ -932,7 +932,10 @@ func openAIComputerActionMutatesV1(action OpenAIComputerActionV1) bool {
 		action.Type != OpenAIComputerActionWaitV1
 }
 
-func openAIComputerKnownCommitCanContinueV1(action OpenAIComputerActionV1) bool {
+func openAIComputerKnownCommitCanContinueV1(
+	action OpenAIComputerActionV1,
+	execution OpenAIComputerActionExecutionV1,
+) bool {
 	switch action.Type {
 	case OpenAIComputerActionClickV1,
 		OpenAIComputerActionDoubleClickV1,
@@ -940,6 +943,14 @@ func openAIComputerKnownCommitCanContinueV1(action OpenAIComputerActionV1) bool 
 		OpenAIComputerActionTypeTextV1,
 		OpenAIComputerActionKeypressV1:
 		return true
+	case OpenAIComputerActionScrollV1:
+		return execution.Result.GUIOutcome != nil &&
+			execution.Result.GUIOutcome.FailureCode ==
+				"scroll_postcondition_not_declared"
+	case OpenAIComputerActionDragV1:
+		return execution.Result.GUIOutcome != nil &&
+			execution.Result.GUIOutcome.FailureCode ==
+				"drop_postcondition_not_declared"
 	default:
 		return false
 	}
@@ -962,7 +973,9 @@ func openAIComputerActionFailureV1(
 	case OpenAIComputerCommitUnverifiedV1, OpenAIComputerCommitVerifiedV1:
 		message += "; input may have committed; do not retry automatically"
 	}
-	if executeErr == nil && execution.Result.Content != "" {
+	if executeErr != nil {
+		message += ": " + executeErr.Error()
+	} else if execution.Result.Content != "" {
 		message += ": " + execution.Result.Content
 	}
 	return agent.BusinessError(message)

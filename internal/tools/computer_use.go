@@ -1489,7 +1489,7 @@ func (t *ComputerUseTool) coordinateFocusedType(
 	args computerUseArgs,
 	text string,
 ) (agent.ToolResult, error) {
-	defer t.invalidateState()
+	defer t.invalidateStateAfterMutationV1(ctx)
 	focus := t.coordinateFocus
 	if focus == nil || args.StateID == "" || args.StateID != focus.stateID {
 		return computerUseKeyboardTargetUnavailableV1(), nil
@@ -1502,7 +1502,9 @@ func (t *ComputerUseTool) coordinateFocusedType(
 		focus.observedAfterClick && computerUseStateID(current) != args.StateID {
 		return computerUseKeyboardTargetUnavailableV1(), nil
 	}
-	deadline := t.computerUseCoordinateNowV1().Add(time.Second)
+	deadline := t.computerUseCoordinateNowV1().Add(
+		computerUseMutationDeadlineV1,
+	)
 	request := TargetBoundInputRequestV1{
 		SchemaVersion: 1,
 		PID:           current.PID,
@@ -1581,10 +1583,10 @@ func (t *ComputerUseTool) targetBoundInput(
 	key string,
 	modifiers []string,
 ) (agent.ToolResult, error) {
-	// Keyboard input consumes its observation on every attempt. Even an exact
-	// helper preflight failure means the model must re-observe before deciding
-	// where input should go next.
-	defer t.invalidateState()
+	// Generic single-action calls consume their observation. One trusted
+	// OpenAI Responses action batch instead keeps its original screenshot and
+	// exact window frame until the batch's required final screenshot.
+	defer t.invalidateStateAfterMutationV1(ctx)
 	if args.StateID == "" {
 		return agent.ValidationError(args.Action + " requires the latest state_id"), nil
 	}
@@ -1611,7 +1613,8 @@ func (t *ComputerUseTool) targetBoundInput(
 	if !ok {
 		return failure, nil
 	}
-	if computerUseStateID(current) != args.StateID {
+	if !hasOpenAINativeComputerActionV1(ctx) &&
+		computerUseStateID(current) != args.StateID {
 		return agent.BusinessError("stale state detected before target-bound input; call get_app_state again"), nil
 	}
 	if current.BundleID != t.snapshot.bundleID || current.WindowID == nil ||
@@ -1627,7 +1630,9 @@ func (t *ComputerUseTool) targetBoundInput(
 		}
 	}
 
-	deadline := t.computerUseCoordinateNowV1().Add(time.Second).UTC().Format(time.RFC3339Nano)
+	deadline := t.computerUseCoordinateNowV1().
+		Add(computerUseMutationDeadlineV1).
+		UTC().Format(time.RFC3339Nano)
 	request := TargetBoundInputRequestV1{
 		SchemaVersion: 1,
 		PID:           current.PID,
@@ -1677,8 +1682,10 @@ func (t *ComputerUseTool) executeTargetBoundInput(
 	if err != nil {
 		var commitUnknown *TargetBoundInputCommitUnknownErrorV1
 		if errors.As(err, &commitUnknown) {
+			detail := commitUnknown.Error()
 			failure := agent.BusinessError(
-				"target-bound input commit status is unknown; do not retry automatically; re-observe the app")
+				"target-bound input commit status is unknown: " + detail +
+					"; do not retry automatically; re-observe the app")
 			failure.GUIOutcome = &agent.GUIActionOutcome{
 				Result: agent.GUIActionResultCompletedUnverified, Phase: agent.GUIActionPhaseInputCommitted,
 				FailureCode: "commit_unknown",
@@ -1762,7 +1769,7 @@ func (t *ComputerUseTool) pixelScroll(
 	// real pointer to the provider point, then emit the provider's exact pixel
 	// deltas there. Every path consumes the immutable observation authority and
 	// no result is retry-safe.
-	defer t.invalidateState()
+	defer t.invalidateStateAfterMutationV1(ctx)
 
 	if args.X == nil || args.Y == nil || args.ScrollX == nil || args.ScrollY == nil {
 		return agent.ValidationError(
@@ -1795,7 +1802,8 @@ func (t *ComputerUseTool) pixelScroll(
 	if !ok {
 		return failure, nil
 	}
-	if computerUseStateID(currentTree) != args.StateID {
+	if !hasOpenAINativeComputerActionV1(ctx) &&
+		computerUseStateID(currentTree) != args.StateID {
 		return agent.BusinessError(
 			"stale state detected before pixel scroll; call get_app_state again"), nil
 	}
@@ -1991,7 +1999,7 @@ func (t *ComputerUseTool) drag(ctx context.Context, args computerUseArgs) (agent
 	// including argument, freshness, cancellation, transport, and helper-result
 	// failures. A possible drop side effect must always be followed by a fresh
 	// observation rather than an automatic retry.
-	defer t.invalidateState()
+	defer t.invalidateStateAfterMutationV1(ctx)
 
 	pixelPath := args.Path
 	if len(pixelPath) > 0 {
@@ -2045,7 +2053,8 @@ func (t *ComputerUseTool) drag(ctx context.Context, args computerUseArgs) (agent
 	if !ok {
 		return failure, nil
 	}
-	if computerUseStateID(currentTree) != args.StateID {
+	if !hasOpenAINativeComputerActionV1(ctx) &&
+		computerUseStateID(currentTree) != args.StateID {
 		return agent.BusinessError("stale state detected before drag; call get_app_state again"), nil
 	}
 	currentTarget, failure, ok := computerUseCoordinateCaptureRequestV1(currentTree)
@@ -2379,10 +2388,11 @@ func (t *ComputerUseTool) coordinatePointerActionV1(
 	ctx context.Context,
 	args computerUseArgs,
 ) (agent.ToolResult, error) {
-	// A coordinate attempt consumes both the AX snapshot and its exact image,
-	// including validation, freshness, transport, and helper failures.
+	// Generic coordinate calls consume the screenshot after one action. A
+	// trusted OpenAI Responses batch deliberately maps all ordered coordinates
+	// from the same provider-visible screenshot, then captures one final image.
 	t.coordinateFocus = nil
-	defer t.invalidateObservationState()
+	defer t.invalidateObservationStateAfterMutationV1(ctx)
 
 	if args.X == nil || args.Y == nil {
 		return agent.ValidationError(args.Action + " requires x+y coordinates"), nil
@@ -2429,7 +2439,8 @@ func (t *ComputerUseTool) coordinatePointerActionV1(
 	if !ok {
 		return failure, nil
 	}
-	if computerUseStateID(currentTree) != args.StateID {
+	if !hasOpenAINativeComputerActionV1(ctx) &&
+		computerUseStateID(currentTree) != args.StateID {
 		return agent.BusinessError("stale state detected before coordinate action; call get_app_state again"), nil
 	}
 	currentTarget, failure, ok := computerUseCoordinateCaptureRequestV1(currentTree)
@@ -2742,6 +2753,25 @@ func (t *ComputerUseTool) invalidateObservationState() {
 	t.snapshot = nil
 	t.refs = nil
 	t.coordinateArtifact = nil
+}
+
+func (t *ComputerUseTool) invalidateObservationStateAfterMutationV1(
+	ctx context.Context,
+) {
+	if !hasOpenAINativeComputerActionV1(ctx) {
+		t.invalidateObservationState()
+	}
+}
+
+func (t *ComputerUseTool) invalidateStateAfterMutationV1(ctx context.Context) {
+	if hasOpenAINativeComputerActionV1(ctx) {
+		// Keyboard and compound input can change focus, but the provider's
+		// original screenshot/window frame remains the coordinate authority for
+		// later actions in this same ordered batch.
+		t.coordinateFocus = nil
+		return
+	}
+	t.invalidateState()
 }
 
 func (t *ComputerUseTool) invalidateState() {

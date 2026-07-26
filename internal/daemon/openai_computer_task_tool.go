@@ -36,7 +36,7 @@ type openAIComputerTaskRuntimeV1 interface {
 
 // openAIComputerTaskToolV1 is the only model-visible desktop-control surface.
 // The parent model delegates one complete goal; a private OpenAI Responses loop
-// owns screenshots, actions, re-observation, and continuation state.
+// owns screenshots, ordered action batches, and continuation state.
 type openAIComputerTaskToolV1 struct {
 	gateway         client.LLMClient
 	profile         *client.ExecutionProfile

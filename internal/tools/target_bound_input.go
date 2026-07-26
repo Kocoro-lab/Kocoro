@@ -12,7 +12,11 @@ import (
 	"time"
 )
 
-const targetBoundInputTransportGraceV1 = 150 * time.Millisecond
+// The helper may finish its bounded 350ms AX postcondition check and restore
+// the clipboard after the input commit deadline. Keep the transport waiting
+// long enough to receive that typed acknowledgement instead of misclassifying
+// a successful Electron input as commit_unknown.
+const targetBoundInputTransportGraceV1 = 1250 * time.Millisecond
 
 func targetBoundInputCancellationMarkerPathV1(
 	request TargetBoundInputRequestV1, requestID int64,

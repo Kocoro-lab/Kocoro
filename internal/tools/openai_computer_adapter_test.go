@@ -541,6 +541,7 @@ func TestOpenAIComputerAdapterUnknownCommitNeverContinuesOrInvitesRetry(t *testi
 	}
 	if !result.ToolResult.IsError ||
 		!strings.Contains(result.ToolResult.Content, "commit status is unknown") ||
+		!strings.Contains(result.ToolResult.Content, "helper connection lost") ||
 		!strings.Contains(result.ToolResult.Content, "do not retry automatically") {
 		t.Fatalf("tool result = %#v", result.ToolResult)
 	}
@@ -549,6 +550,92 @@ func TestOpenAIComputerAdapterUnknownCommitNeverContinuesOrInvitesRetry(t *testi
 	}
 	if executor.finalCalls != 1 || len(result.ToolResult.Images) != 1 {
 		t.Fatalf("final observation = calls=%d result=%#v", executor.finalCalls, result.ToolResult)
+	}
+}
+
+func TestOpenAIComputerAdapterContinuesFullyCommittedScrollAndDrag(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		firstAction string
+		failureCode string
+	}{
+		{
+			name: "scroll",
+			firstAction: `{"type":"scroll","x":7,"y":8,` +
+				`"scroll_x":0,"scroll_y":-618}`,
+			failureCode: "scroll_postcondition_not_declared",
+		},
+		{
+			name: "drag",
+			firstAction: `{"type":"drag","path":[` +
+				`{"x":1,"y":2},{"x":3,"y":4}]}`,
+			failureCode: "drop_postcondition_not_declared",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor := &openAIComputerExecutorProbe{
+				executions: []OpenAIComputerActionExecutionV1{
+					{
+						CommitState: OpenAIComputerCommitUnverifiedV1,
+						Result: agent.ToolResult{GUIOutcome: &agent.GUIActionOutcome{
+							Result:      agent.GUIActionResultCompletedUnverified,
+							Phase:       agent.GUIActionPhaseVerifying,
+							FailureCode: test.failureCode,
+						}},
+					},
+					{CommitState: OpenAIComputerCommitVerifiedV1},
+				},
+				finalResult: finalOpenAIComputerObservation(),
+			}
+			result, err := newOpenAIComputerAdapterV1(executor).ExecuteBatchV1(
+				context.Background(),
+				[]byte(openAIComputerCallWithActions(
+					test.firstAction+
+						`,{"type":"click","button":"left","x":9,"y":10}`,
+				)),
+			)
+			if err != nil || result.ToolResult.IsError ||
+				len(executor.actions) != 2 || executor.finalCalls != 1 {
+				t.Fatalf(
+					"result=%+v actions=%d final=%d err=%v",
+					result.ToolResult,
+					len(executor.actions),
+					executor.finalCalls,
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestOpenAIComputerAdapterStopsPartiallyCommittedScroll(t *testing.T) {
+	executor := &openAIComputerExecutorProbe{
+		executions: []OpenAIComputerActionExecutionV1{{
+			CommitState: OpenAIComputerCommitUnverifiedV1,
+			Result: agent.ToolResult{GUIOutcome: &agent.GUIActionOutcome{
+				Result:      agent.GUIActionResultCompletedUnverified,
+				Phase:       agent.GUIActionPhaseInputCommitted,
+				FailureCode: "scroll_not_committed",
+			}},
+		}},
+		finalResult: finalOpenAIComputerObservation(),
+	}
+	result, err := newOpenAIComputerAdapterV1(executor).ExecuteBatchV1(
+		context.Background(),
+		[]byte(openAIComputerCallWithActions(
+			`{"type":"scroll","x":7,"y":8,"scroll_x":0,"scroll_y":-618},`+
+				`{"type":"click","button":"left","x":9,"y":10}`,
+		)),
+	)
+	if err != nil || !result.ToolResult.IsError ||
+		len(executor.actions) != 1 || executor.finalCalls != 1 {
+		t.Fatalf(
+			"result=%+v actions=%d final=%d err=%v",
+			result.ToolResult,
+			len(executor.actions),
+			executor.finalCalls,
+			err,
+		)
 	}
 }
 

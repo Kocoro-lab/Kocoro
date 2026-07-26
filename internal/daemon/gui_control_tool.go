@@ -174,17 +174,19 @@ func (w *daemonGUIWorkflow) runTool(ctx context.Context, tool agent.Tool, argsJS
 		phase = guicontrol.ComputerUsePhaseMoving
 	}
 	executionPath := guiExecutionPath(descriptor.ExecutionPath)
+	orderedBatchAction := tools.IsOpenAINativeComputerActionV1(ctx)
 	actionRequest := guicontrol.ActionRequest{
-		LeaseID:        lease.LeaseID,
-		TurnID:         lease.TurnID,
-		ToolName:       tool.Info().Name,
-		ToolUseID:      invocation.ToolUseID,
-		ActionKind:     descriptor.ActionKind,
-		ActionPhase:    phase,
-		TargetBundleID: descriptor.TargetBundleID,
-		TargetAppName:  descriptor.TargetAppName,
-		ExecutionPath:  executionPath,
-		Effect:         effect,
+		LeaseID:            lease.LeaseID,
+		TurnID:             lease.TurnID,
+		ToolName:           tool.Info().Name,
+		ToolUseID:          invocation.ToolUseID,
+		ActionKind:         descriptor.ActionKind,
+		ActionPhase:        phase,
+		TargetBundleID:     descriptor.TargetBundleID,
+		TargetAppName:      descriptor.TargetAppName,
+		ExecutionPath:      executionPath,
+		Effect:             effect,
+		OrderedBatchAction: orderedBatchAction,
 	}
 	var approvedRisk *tools.ConsequentialRiskDraftV1
 	var riskIntentID string
@@ -364,7 +366,7 @@ func (w *daemonGUIWorkflow) runTool(ctx context.Context, tool agent.Tool, argsJS
 	executionCtx = agent.ContextWithToolInvocation(executionCtx, agent.ToolInvocation{
 		ToolName: tool.Info().Name, ToolUseID: invocation.ToolUseID,
 	})
-	if descriptor.Effect == agent.GUIActionMutation {
+	if descriptor.Effect == agent.GUIActionMutation && !orderedBatchAction {
 		if restorer, ok := tool.(tools.GUIActionTargetRestorerV1); ok {
 			if err := restorer.RestoreGUIActionTargetV1(executionCtx, descriptor); err != nil {
 				return agent.BusinessError(

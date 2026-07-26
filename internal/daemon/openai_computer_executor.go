@@ -241,12 +241,11 @@ type daemonOpenAIComputerExecutorV1 struct {
 	provenance tools.OpenAIComputerExecutionProvenanceV1
 	approve    openAIComputerFreshApprovalV1
 
-	authority        tools.OpenAIComputerBatchAuthorityV1
-	call             *tools.OpenAIComputerCallV1
-	nextActionIndex  int
-	needsObservation bool
-	finalCaptures    int
-	closed           bool
+	authority       tools.OpenAIComputerBatchAuthorityV1
+	call            *tools.OpenAIComputerCallV1
+	nextActionIndex int
+	finalCaptures   int
+	closed          bool
 }
 
 func newDaemonOpenAIComputerExecutorV1(
@@ -347,7 +346,6 @@ func (e *daemonOpenAIComputerExecutorV1) AcquireOpenAIComputerBatchAuthorityV1(
 	e.call = &callCopy
 	e.authority = authority
 	e.nextActionIndex = 0
-	e.needsObservation = false
 	return authority, nil
 }
 
@@ -405,17 +403,6 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 		}, fmt.Errorf("OpenAI computer action cancelled before admission")
 	}
 
-	e.mu.Lock()
-	needsObservation := e.needsObservation
-	e.mu.Unlock()
-	if needsObservation {
-		if err := e.runRequiredObservationV1(ctx, scope); err != nil {
-			return tools.OpenAIComputerActionExecutionV1{
-				CommitState: tools.OpenAIComputerNotCommittedV1,
-			}, err
-		}
-	}
-
 	plan, err := e.runtime.PlanOpenAIComputerActionV1(ctx, action)
 	if err != nil {
 		return tools.OpenAIComputerActionExecutionV1{
@@ -455,12 +442,9 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 
 	e.mu.Lock()
 	e.nextActionIndex++
-	e.needsObservation =
-		plan.Mutation &&
-			execution.CommitState != tools.OpenAIComputerNotCommittedV1
 	e.mu.Unlock()
 	if runErr != nil {
-		return execution, fmt.Errorf("OpenAI computer action executor failed")
+		return execution, fmt.Errorf("OpenAI computer action executor failed: %w", runErr)
 	}
 	if execution.Result.IsError {
 		return execution, nil
@@ -508,34 +492,6 @@ func (e *daemonOpenAIComputerExecutorV1) CaptureFinalOpenAIComputerObservationV1
 	}
 	result.GUIOutcome = nil
 	return result, nil
-}
-
-func (e *daemonOpenAIComputerExecutorV1) runRequiredObservationV1(
-	ctx context.Context,
-	scope tools.OpenAIComputerActionScopeV1,
-) error {
-	plan, err := e.runtime.PlanOpenAIComputerObservationV1(
-		"Refresh exact AX state between OpenAI computer actions",
-		false,
-	)
-	if err != nil {
-		return fmt.Errorf("OpenAI computer required re-observation is unavailable")
-	}
-	if _, err := describeOpenAIComputerPlanV1(ctx, plan, false); err != nil {
-		return fmt.Errorf("OpenAI computer required re-observation is invalid")
-	}
-	result, runErr := e.runPlanV1(
-		ctx,
-		plan,
-		scope.ActionID+"/reobserve",
-	)
-	if runErr != nil || result.IsError || len(result.Images) != 0 {
-		return fmt.Errorf("OpenAI computer required re-observation failed")
-	}
-	e.mu.Lock()
-	e.needsObservation = false
-	e.mu.Unlock()
-	return nil
 }
 
 func (e *daemonOpenAIComputerExecutorV1) runPlanV1(

@@ -26,6 +26,12 @@ func hasOpenAINativeComputerActionV1(ctx context.Context) bool {
 	return authorized
 }
 
+// IsOpenAINativeComputerActionV1 lets the daemon coordinator preserve the
+// provider-visible screenshot across one ordered Responses action batch.
+func IsOpenAINativeComputerActionV1(ctx context.Context) bool {
+	return hasOpenAINativeComputerActionV1(ctx)
+}
+
 // OpenAIComputerActionRuntimeV1 projects one normalized OpenAI action at a
 // time onto the same guarded, clone-local Accessibility-first ComputerUseTool
 // used by the generic and Anthropic adapters. It never executes by itself:
@@ -281,11 +287,15 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 		return r.plan(args, true)
 
 	case OpenAIComputerActionTypeTextV1:
-		ref, err := anthropicHelpers.uniqueFocusedRef()
-		if err != nil && (r.raw.coordinateFocus == nil ||
-			r.raw.coordinateFocus.stateID != stateID) {
-			return OpenAIComputerActionPlanV1{},
-				fmt.Errorf("OpenAI computer type target is unavailable")
+		ref := ""
+		if r.raw.coordinateFocus == nil ||
+			r.raw.coordinateFocus.stateID != stateID {
+			var err error
+			ref, err = anthropicHelpers.uniqueFocusedRef()
+			if err != nil {
+				return OpenAIComputerActionPlanV1{},
+					fmt.Errorf("OpenAI computer type target is unavailable")
+			}
 		}
 		text := action.Text
 		args.Action, args.Ref, args.Text = "type", ref, &text

@@ -280,6 +280,40 @@ func TestAXClientTargetBoundInputV1WaitsForTypedAckAfterCancellation(t *testing.
 	}
 }
 
+func TestAXClientTargetBoundInputV1WaitsForBoundedPostCommitVerification(t *testing.T) {
+	writer := &coordinateMouseTestWriter{}
+	client := coordinateMouseTestClient(writer)
+	writer.afterWrite = func(requestBytes []byte) {
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			envelope, err := DecodeTargetBoundInputRPCRequestV1(bytes.TrimSpace(requestBytes))
+			if err != nil {
+				return
+			}
+			failure := "target_value_readback_unavailable"
+			result, _ := EncodeTargetBoundInputResultV1(TargetBoundInputResultV1{
+				SchemaVersion: 1, Status: "completed_unverified", Action: envelope.Params.Action,
+				InputCommitted: true, Phase: "post_verification", FailureCode: &failure,
+			})
+			client.pendingMu.Lock()
+			response := client.pending[envelope.ID]
+			client.pendingMu.Unlock()
+			if response != nil {
+				response <- AXResponse{ID: envelope.ID, Result: result}
+			}
+		}()
+	}
+	request := canonicalTargetBoundInputRequest(t, "type")
+	request.CommitDeadlineAt = time.Now().Add(20 * time.Millisecond).
+		UTC().Format(time.RFC3339Nano)
+	result, err := client.targetBoundInputV1(context.Background(), request)
+	if err != nil || !result.InputCommitted ||
+		result.FailureCode == nil ||
+		*result.FailureCode != "target_value_readback_unavailable" {
+		t.Fatalf("bounded post-commit acknowledgement was lost: %+v %v", result, err)
+	}
+}
+
 func TestAXClientTargetBoundInputV1PostWriteAmbiguityIsCommitUnknown(t *testing.T) {
 	for _, test := range []struct {
 		name   string

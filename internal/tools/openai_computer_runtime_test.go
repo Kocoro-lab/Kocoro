@@ -220,6 +220,46 @@ func TestOpenAIComputerActionRuntimeUsesVerifiedCoordinateFocusWithoutAXRefForTy
 	}
 }
 
+func TestOpenAIComputerActionRuntimePrefersLatestCoordinateFocusOverOldAXFocus(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.tree.Elements[0].Focused = true
+	focused := harness.tree.Elements[0].Ref
+	harness.tree.FocusedRef = &focused
+	harness.observe(t)
+	harness.tool.coordinateFocus = &computerUseCoordinateFocusV1{
+		stateID:  harness.tool.snapshot.id,
+		pid:      harness.tree.PID,
+		bundleID: harness.tree.BundleID,
+		windowID: uint32(*harness.tree.WindowID),
+	}
+	runtime, err := NewOpenAIComputerActionRuntimeV1(
+		wrapGUIExecutionGate(harness.tool),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "private text",
+		},
+	)
+	if err != nil {
+		t.Fatalf("PlanOpenAIComputerActionV1: %v", err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.Action != "type" || args.Ref != "" {
+		t.Fatalf("old AX focus overrode the latest coordinate click: %+v", args)
+	}
+}
+
 func TestOpenAIComputerActionRuntimeRejectsWindowBoundTypeWithoutVerifiedCoordinateFocus(
 	t *testing.T,
 ) {
