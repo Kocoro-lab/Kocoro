@@ -33,6 +33,45 @@ func TestOpenAIComputerActionRuntimeRequiresFinalGUIExecutionGate(t *testing.T) 
 	}
 }
 
+func TestOpenAIComputerTaskAppsSupersedeForegroundHintAndRefreshFrontmost(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue("launch_app", `{"result":"launched"}`)
+	fake.queue("launch_app", `{"result":"launched"}`)
+	fake.queue("focus_app", `{"result":"focused"}`)
+	raw := &ComputerUseTool{
+		client: fake,
+		initialTarget: &ComputerUseInitialTargetV1{
+			PID: 9, AppName: "Kocoro Desktop",
+			BundleID: "run.shannon.shanclaw.dev",
+		},
+		snapshot: &computerUseSnapshot{id: "old"},
+	}
+	runtime := &OpenAIComputerActionRuntimeV1{raw: raw}
+
+	err := runtime.LaunchAndFocusTaskAppsV1(
+		context.Background(),
+		[]OpenAIComputerTaskAppV1{
+			{App: "Slack", BundleID: "com.tinyspeck.slackmacgap"},
+			{App: "Calculator", BundleID: "com.apple.calculator"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw.initialTarget != nil || raw.snapshot != nil {
+		t.Fatalf("stale foreground/bootstrap state survived: %+v / %+v",
+			raw.initialTarget, raw.snapshot)
+	}
+	if len(fake.calls) != 3 ||
+		fake.calls[0].method != "launch_app" ||
+		fake.calls[1].method != "launch_app" ||
+		fake.calls[2].method != "focus_app" {
+		t.Fatalf("app preparation calls = %+v", fake.calls)
+	}
+}
+
 func TestOpenAIComputerActionRuntimeProjectsFramedClickWithoutLeakingAuthority(t *testing.T) {
 	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
 	harness.fake.queue(
@@ -70,6 +109,42 @@ func TestOpenAIComputerActionRuntimeProjectsFramedClickWithoutLeakingAuthority(t
 	}
 }
 
+func TestOpenAIComputerActionRuntimeKeepsAXHitOnVisibleCoordinatePath(t *testing.T) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.tree.Elements[0].Frame = harness.tree.WindowFrame
+	harness.observe(t)
+	harness.fake.queue(
+		"display_topology",
+		marshalDisplayTopologyNoTest(harness.topology),
+	)
+	runtime, err := NewOpenAIComputerActionRuntimeV1(
+		wrapGUIExecutionGate(harness.tool),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, y := 4, 5
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionClickV1, Button: "left", X: &x, Y: &y,
+		},
+	)
+	if err != nil {
+		t.Fatalf("PlanOpenAIComputerActionV1: %v", err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.Action != "click" || args.Ref != "" ||
+		args.X == nil || int(*args.X) != x ||
+		args.Y == nil || int(*args.Y) != y {
+		t.Fatalf("AX-hit click did not remain on visible coordinate path: %+v", args)
+	}
+}
+
 func TestOpenAIComputerActionRuntimeUsesUniqueTrustedFocusedAXRefForType(t *testing.T) {
 	requireComputerUseDarwin(t)
 	harness := newComputerUseCoordinateHarness(t)
@@ -101,6 +176,68 @@ func TestOpenAIComputerActionRuntimeUsesUniqueTrustedFocusedAXRefForType(t *test
 		args.Text == nil || *args.Text != "private text" ||
 		args.StateID != harness.tool.snapshot.id {
 		t.Fatalf("translated type plan = %+v / %+v", plan, args)
+	}
+}
+
+func TestOpenAIComputerActionRuntimeUsesVerifiedCoordinateFocusWithoutAXRefForType(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.tree.Elements = nil
+	harness.tree.RefPaths = map[string]computerUseRefPath{}
+	harness.observe(t)
+	harness.tool.coordinateFocus = &computerUseCoordinateFocusV1{
+		stateID:  harness.tool.snapshot.id,
+		pid:      harness.tree.PID,
+		bundleID: harness.tree.BundleID,
+		windowID: uint32(*harness.tree.WindowID),
+	}
+	runtime, err := NewOpenAIComputerActionRuntimeV1(
+		wrapGUIExecutionGate(harness.tool),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "private text",
+		},
+	)
+	if err != nil {
+		t.Fatalf("PlanOpenAIComputerActionV1: %v", err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Mutation || args.Action != "type" || args.Ref != "" ||
+		args.Text == nil || *args.Text != "private text" ||
+		args.StateID != harness.tool.snapshot.id {
+		t.Fatalf("translated coordinate-focused type plan = %+v / %+v", plan, args)
+	}
+}
+
+func TestOpenAIComputerActionRuntimeRejectsWindowBoundTypeWithoutVerifiedCoordinateFocus(
+	t *testing.T,
+) {
+	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
+	harness.tree.Elements = nil
+	harness.tree.RefPaths = map[string]computerUseRefPath{}
+	harness.tool.snapshot.elements = nil
+	harness.tool.refs = map[string]refEntry{}
+
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "private text",
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "type target is unavailable") {
+		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
 }
 

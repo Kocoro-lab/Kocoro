@@ -516,16 +516,54 @@ func (t *ComputerUseTool) readTree(ctx context.Context, pid int, filter string, 
 	}
 	raw, err := t.client.Call(ctx, "read_tree", params)
 	if err != nil {
-		return computerUseTree{}, computerUseCallError("observe app", err), false
+		windowRaw, windowErr := t.client.Call(ctx, "read_window_target", params)
+		if windowErr != nil {
+			return computerUseTree{}, computerUseCallError("observe app", err), false
+		}
+		raw = windowRaw
 	}
 	tree, err := decodeComputerUseTree(raw)
 	if err != nil {
 		return computerUseTree{}, agent.BusinessError(fmt.Sprintf("parse accessibility state: %v", err)), false
 	}
+	// A successful AX read can still omit the exact CGWindow identity needed
+	// for screenshots and coordinate actions. In that case use the independent
+	// CGWindow observation as the whole target rather than mixing AX refs from
+	// one window with coordinate authority from another.
+	if !computerUseTreeHasCoordinateTargetV1(tree) {
+		windowParams := params
+		if tree.PID > 0 {
+			windowParams = map[string]any{
+				"filter":          filter,
+				"semantic_budget": budget,
+				"pid":             tree.PID,
+			}
+		}
+		if windowRaw, windowErr := t.client.Call(
+			ctx,
+			"read_window_target",
+			windowParams,
+		); windowErr == nil {
+			if windowTree, decodeErr := decodeComputerUseTree(windowRaw); decodeErr == nil &&
+				computerUseTreeHasCoordinateTargetV1(windowTree) {
+				tree = windowTree
+			}
+		}
+	}
 	if tree.PID <= 0 {
 		return computerUseTree{}, agent.BusinessError("accessibility state did not include a valid pid"), false
 	}
 	return tree, agent.ToolResult{}, true
+}
+
+func computerUseTreeHasCoordinateTargetV1(tree computerUseTree) bool {
+	return tree.SchemaVersion == 1 &&
+		tree.PID > 0 &&
+		strings.TrimSpace(tree.BundleID) != "" &&
+		tree.WindowID != nil && *tree.WindowID > 0 &&
+		tree.WindowFrame != nil &&
+		tree.WindowFrame.Width > 0 &&
+		tree.WindowFrame.Height > 0
 }
 
 func computerUseStateID(tree computerUseTree) string {

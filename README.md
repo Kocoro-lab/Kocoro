@@ -139,7 +139,7 @@ shan -y "kill the process on port 3000"
 shan -y "open Safari and navigate to github.com"
 shan -y "set my Mac volume to 50%"
 
-# Unified native GUI control — semantic state → state_id + ref action
+# Unified native GUI control — delegate one complete desktop goal
 shan -y "open Calendar and show me today's events"
 shan -y "open TextEdit and type '你好世界 🌍'"
 
@@ -275,7 +275,7 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 
 | Tool | Approval | Description |
 |------|----------|-------------|
-| `computer_use` | Observe: No; mutate: Yes | **Primary native-GUI tool.** Accessibility-first, provider-neutral workflow: `get_app_state` returns a compact tree plus `state_id`; ref actions re-observe and reject stale state. Supports focus/launch (including app-agnostic window reopen), click/press/value, scroll, type/hotkey, coordinate fallback, condition or bounded-delay waits, and explicit screenshots. Numeric strings from model providers are tolerated for integer fields, and pointer actions visibly move the real cursor. State and refs are isolated per run; whole calls serialize across concurrent inbound routes (one GUI-operation lock, shared with `accessibility`/`computer`/`applescript`); screenshots are never attached automatically. Unattended runs require the explicit persisted global Computer Use grant; blanket auto-approve is denied. |
+| `computer_use` | One task approval | **Primary native-GUI tool on daemon runs.** The Sonnet parent delegates one complete desktop goal; Kocoro launches/focuses the named apps and lazily runs a private OpenAI native Computer Use trajectory. Screenshots, pointer actions, typing, app switching, re-observation, and continuation stay inside the call instead of exposing `state_id`/ref steps to the parent. Exact CGWindow fallback supports apps with incomplete AX trees, and OpenAI pointer actions visibly move the real cursor. Unattended runs require the explicit persisted global Computer Use grant; blanket auto-approve is denied. |
 | `accessibility` | Read: No; mutate: Yes | Legacy low-level AX tool retained for compatibility. Reads the macOS accessibility tree via persistent `ax_server`; refs are isolated per run. Mutations require a user-visible `description` and attended approval; read-only actions do not prompt. Actions: `read_tree`, `click`, `press`, `set_value`, `get_value`, `find`, `scroll`, `annotate`. |
 | `wait_for` | No | Wait for UI conditions: `elementExists`, `elementGone`, `titleContains`, `urlContains`, `titleChanged`, `urlChanged`. Use instead of sleep after navigation or app launch. |
 | `clipboard` | Yes | Read/write system clipboard. |
@@ -855,7 +855,7 @@ Koe voice tests link cgo audio deps on macOS; install them with `brew install op
 
 ## Known Limitations
 
-- **Vision**: screenshots are captured, resized, and sent as base64 image content blocks. The rollback-compatible `computer` tool is an ordinary function tool with coordinate scaling from its exact screenshot dimensions to AppKit logical points. Anthropic-native execution is admitted only by an exact server-minted provider/model/profile contract; unsupported models keep the generic function-tool fallback. Vision models may blend what they see with training knowledge — verify critical details.
+- **Vision**: screenshots are captured, resized, and sent as base64 image content blocks. On daemon runs, the Sonnet parent delegates one complete desktop goal to `computer_use`; only that call lazily starts a private OpenAI Responses trajectory with native Computer Use. Provider coordinates stay bound to the exact screenshot bytes and map into AppKit logical points. Anthropic-native execution and generic model-visible GUI fallbacks are not admitted on this path. Vision models may blend what they see with training knowledge — verify critical details.
 - **Streaming**: one-shot mode does not stream; waits for the full LLM response before display.
 - **Windows/Linux**: local tools (clipboard, notifications, AppleScript, screenshot, computer) and scheduled tasks (launchd) are macOS-only.
 - **Account login**: email/password sign-in stores the api_key in a per-platform credential store — **macOS Keychain**, **Windows Credential Manager**, and on **Linux** a file store at `~/.shannon/credentials.json` (mode 0600). On Linux the sign-in key is moved out of `config.yaml` into that file; if you manage `config.yaml` with IaC (Ansible/Puppet) note the key now lives in `credentials.json`. On unsupported platforms, set `api_key` in `~/.shannon/config.yaml` instead.

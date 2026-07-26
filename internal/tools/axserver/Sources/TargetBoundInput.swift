@@ -1013,14 +1013,14 @@ private func productionTargetBoundInputAuthorityFailure(
         request.expectedWindowAXBounds, window.bounds) else {
         return "window_bounds_mismatch"
     }
-    guard let focusedWindow = targetBoundInputFocusedAXWindow(
-        pid: request.pid, windowID: request.windowID) else {
-        return "focused_window_mismatch"
-    }
     guard targetBoundInputFrontmostNormalWindowID(pid: request.pid) == request.windowID else {
         return "frontmost_window_mismatch"
     }
     if request.action == "type", request.ref != nil {
+        guard let focusedWindow = targetBoundInputFocusedAXWindow(
+            pid: request.pid, windowID: request.windowID) else {
+            return "focused_window_mismatch"
+        }
         guard let path = request.path,
               let target = resolveElement(in: focusedWindow, path: path) else {
             return "path_not_found"

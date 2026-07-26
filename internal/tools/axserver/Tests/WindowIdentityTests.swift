@@ -2,6 +2,28 @@ import XCTest
 @testable import ax_server
 
 final class WindowIdentityTests: XCTestCase {
+    func testFrontmostNormalCGWindowDoesNotRequireAXIdentity() {
+        let windows = [
+            CGWindowIdentityCandidate(
+                windowID: 41,
+                ownerPID: 900,
+                layer: 0,
+                title: "Slack",
+                frame: AXFrame(x: 10, y: 20, width: 800, height: 600)),
+            CGWindowIdentityCandidate(
+                windowID: 42,
+                ownerPID: 901,
+                layer: 0,
+                title: "Other",
+                frame: AXFrame(x: 0, y: 0, width: 100, height: 100)),
+        ]
+
+        let target = frontmostNormalCGWindow(pid: 900, candidates: windows)
+
+        XCTAssertEqual(target?.windowID, 41)
+        XCTAssertEqual(target?.frame, AXFrame(x: 10, y: 20, width: 800, height: 600))
+    }
+
     func testWindowIdentityMatchesPIDTitleAndBoundsWithinTolerance() {
         let observation = WindowIdentityObservation(
             pid: 42,

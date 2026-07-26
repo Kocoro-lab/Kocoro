@@ -151,7 +151,11 @@ func TestRunAgent_AllInboundSourcesOfferComputerUse(t *testing.T) {
 			completionHandler := gw.handler()
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/v1/completions/resolve" {
-					http.NotFound(w, r)
+					http.Error(
+						w,
+						"ordinary turns must not resolve computer use",
+						http.StatusInternalServerError,
+					)
 					return
 				}
 				completionHandler(w, r)

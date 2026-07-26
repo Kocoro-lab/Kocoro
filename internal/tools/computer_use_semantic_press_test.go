@@ -171,7 +171,10 @@ func TestComputerUseSemanticPressRejectsStaleStateAndMissingWindow(t *testing.T)
 		if err != nil || !result.IsError || !strings.Contains(result.Content, "window identity") {
 			t.Fatalf("result=%+v err=%v", result, err)
 		}
-		if len(fake.calls) != 1 || fake.calls[0].method != "read_tree" || tool.snapshot != nil || tool.refs != nil {
+		if len(fake.calls) != 2 ||
+			fake.calls[0].method != "read_tree" ||
+			fake.calls[1].method != "read_window_target" ||
+			tool.snapshot != nil || tool.refs != nil {
 			t.Fatalf("missing-window request skipped freshness check, reached mutation, or retained state: calls=%+v snapshot=%+v", fake.calls, tool.snapshot)
 		}
 	})

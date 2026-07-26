@@ -345,7 +345,19 @@ func dispatch(
         }
         let filter = params.filter ?? "all"
         guard let result = readTree(pid: pid, budget: budget, filter: filter) else {
-            return Response(id: id, error: ErrorInfo(code: -1, message: "No accessible windows found for pid \(pid). Call launch_app to request a window; if the app exposes no AX tree, use a screenshot and coordinates."))
+            return Response(id: id, error: ErrorInfo(
+                code: -1,
+                message: "No Accessibility window found for pid \(pid)"))
+        }
+        return Response(id: id, result: AnyCodable(result))
+
+    case "read_window_target":
+        let pid = params.pid ?? frontmostPID()
+        guard pid > 0 else {
+            return Response(id: id, error: ErrorInfo(code: -1, message: "Cannot determine frontmost application"))
+        }
+        guard let result = readCoordinateWindowTarget(pid: pid) else {
+            return Response(id: id, error: ErrorInfo(code: -1, message: "No normal coordinate window found for pid \(pid)"))
         }
         return Response(id: id, result: AnyCodable(result))
 
@@ -406,6 +418,14 @@ func dispatch(
             return Response(id: id, error: ErrorInfo(code: -1, message: "App '\(appName)' not found or not running"))
         }
         return Response(id: id, result: AnyCodable(["pid": pid]))
+
+    case "resolve_app_identity":
+        guard let appName = params.appName else {
+            return Response(id: id, error: ErrorInfo(code: -1, message: "resolve_app_identity requires 'app_name'"))
+        }
+        let (result, err) = FocusManager.resolveAppIdentity(appName: appName)
+        if let err = err { return Response(id: id, error: err) }
+        return Response(id: id, result: AnyCodable(result!))
 
     case "mouse_event":
         guard let type = params.type, let x = params.x, let y = params.y else {
@@ -507,7 +527,9 @@ func dispatch(
         }
         let maxLabels = params.maxLabels ?? 50
         guard let result = annotateElements(pid: pid, roles: params.roles, maxLabels: maxLabels) else {
-            return Response(id: id, error: ErrorInfo(code: -1, message: "No accessible windows found for pid \(pid). Call launch_app to request a window; if the app exposes no AX tree, use a screenshot and coordinates."))
+            return Response(id: id, error: ErrorInfo(
+                code: -1,
+                message: "No Accessibility window found for pid \(pid)"))
         }
         return Response(id: id, result: AnyCodable(result))
 

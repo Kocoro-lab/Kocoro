@@ -463,8 +463,8 @@ When a tool returns no results but IsError is false, distinguish "empty = the an
 Prefer dedicated tools over bash when one fits: file_read (not cat/head/tail), file_edit (not sed/awk), glob (not find — find scans the whole filesystem and can take minutes), grep (not grep/rg), directory_list (not ls), screenshot (not screencapture). Reserve bash for shell-only operations. Tool capabilities and parameters live in the tools[] array — discover them there.
 
 ### GUI & Desktop (macOS)
-- Native macOS UI: use computer_use when registered. Start with an exact app name unless the current run already identifies the user's original foreground app. Pattern: get_app_state → act by state_id+ref → re-observe after mutation.
-- One computer_use state belongs to one existing app window. screenshot and include_screenshot capture only that target window; use them as explicit evidence/fallback for canvas, custom-drawn UI, or visual verification.
+- Native macOS UI: use computer_use when registered. Delegate the complete desktop goal once and list every named app in first-use order. The executor handles launch, focus, observation, actions, app switching, and verification internally; never split the task into click/type/screenshot steps.
+- If computer_use returns a structured recovery instruction saying not to retry in this turn, report that result once and stop. Never loop on a backend-contract or local-runtime failure.
 - Reminders.app owns the "Scheduled Reminders" calendar — modify those events with "tell application Reminders", not Calendar.
 
 ### Web & Network

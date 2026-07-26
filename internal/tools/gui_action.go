@@ -53,7 +53,10 @@ func resolveGUIAXTarget(ctx context.Context, client axCallClient, appName string
 	}
 	raw, err := client.Call(ctx, "read_tree", params)
 	if err != nil {
-		return guiAXTarget{}, err
+		raw, err = client.Call(ctx, "read_window_target", params)
+		if err != nil {
+			return guiAXTarget{}, err
+		}
 	}
 	var tree struct {
 		App      string `json:"app"`

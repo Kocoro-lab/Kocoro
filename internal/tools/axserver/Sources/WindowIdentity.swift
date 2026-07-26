@@ -1,4 +1,5 @@
 import ApplicationServices
+import AppKit
 import CoreGraphics
 import Foundation
 
@@ -14,6 +15,26 @@ struct CGWindowIdentityCandidate {
     let layer: Int
     let title: String?
     let frame: AXFrame
+    let isOnScreen: Bool
+    let alpha: Double
+
+    init(
+        windowID: Int,
+        ownerPID: Int,
+        layer: Int,
+        title: String?,
+        frame: AXFrame,
+        isOnScreen: Bool = true,
+        alpha: Double = 1
+    ) {
+        self.windowID = windowID
+        self.ownerPID = ownerPID
+        self.layer = layer
+        self.title = title
+        self.frame = frame
+        self.isOnScreen = isOnScreen
+        self.alpha = alpha
+    }
 }
 
 enum WindowIdentityMatch: Equatable {
@@ -92,7 +113,9 @@ func currentCGWindowIdentityCandidates() -> [CGWindowIdentityCandidate] {
                 x: Double(bounds.origin.x),
                 y: Double(bounds.origin.y),
                 width: Double(bounds.width),
-                height: Double(bounds.height)))
+                height: Double(bounds.height)),
+            isOnScreen: (entry[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false,
+            alpha: (entry[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 0)
     }
 }
 
@@ -106,4 +129,50 @@ func uniqueWindowID(pid: Int, title: String, frame: AXFrame?) -> Int? {
         return windowID
     }
     return nil
+}
+
+func frontmostNormalCGWindow(
+    pid: Int,
+    candidates: [CGWindowIdentityCandidate]
+) -> CGWindowIdentityCandidate? {
+    candidates.first {
+        $0.ownerPID == pid &&
+            $0.layer == 0 &&
+            $0.windowID > 0 &&
+            $0.isOnScreen &&
+            $0.alpha > 0 &&
+            $0.frame.width > 0 &&
+            $0.frame.height > 0
+    }
+}
+
+/// Returns a typed, coordinate-capable observation even when the target app
+/// exposes no usable AX window/tree. CGWindow owns the window identity and
+/// geometry; AX elements are intentionally empty rather than fabricated.
+func readCoordinateWindowTarget(pid: Int) -> ReadTreeResult? {
+    refreshAppKitState()
+    guard pid > 0,
+          let processID = pid_t(exactly: pid),
+          let app = NSRunningApplication(processIdentifier: processID),
+          !app.isTerminated,
+          let bundleID = app.bundleIdentifier,
+          !bundleID.isEmpty,
+          let window = frontmostNormalCGWindow(
+            pid: pid,
+            candidates: currentCGWindowIdentityCandidates()
+          ) else {
+        return nil
+    }
+    let appName = app.localizedName ?? bundleID
+    return ReadTreeResult(
+        schemaVersion: 1,
+        appName: appName,
+        bundleID: bundleID,
+        pid: pid,
+        windowTitle: window.title ?? "",
+        windowID: window.windowID,
+        windowFrame: window.frame,
+        focusedRef: nil,
+        elements: [],
+        refPaths: [:])
 }

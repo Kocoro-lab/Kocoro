@@ -42,11 +42,12 @@ const (
 // run-local registry. A model tier is routing intent, not an identity pin;
 // Cloud always returns an exact model in the resolved profile.
 type ResolveExecutionProfileRequest struct {
-	SchemaVersion      int    `json:"schema_version"`
-	ModelTier          string `json:"model_tier,omitempty"`
-	SpecificModel      string `json:"specific_model,omitempty"`
-	Capability         string `json:"capability"`
-	AllowModelFallback bool   `json:"allow_model_fallback"`
+	SchemaVersion        int    `json:"schema_version"`
+	ModelTier            string `json:"model_tier,omitempty"`
+	SpecificModel        string `json:"specific_model,omitempty"`
+	Capability           string `json:"capability"`
+	RequiredToolContract string `json:"required_tool_contract,omitempty"`
+	AllowModelFallback   bool   `json:"allow_model_fallback"`
 }
 
 // executionProfileWire is the canonical Cloud-owned profile. profile_id is
@@ -325,6 +326,14 @@ func validateResolveExecutionProfileRequest(req ResolveExecutionProfileRequest) 
 			ExecutionProfileInvalid,
 			"resolve capability %q is unsupported",
 			req.Capability,
+		)
+	}
+	if req.RequiredToolContract != "" &&
+		req.RequiredToolContract != ToolContractOpenAIComputerV1 {
+		return executionProfileError(
+			ExecutionProfileInvalid,
+			"resolve required_tool_contract %q is unsupported",
+			req.RequiredToolContract,
 		)
 	}
 	if strings.TrimSpace(req.ModelTier) == "" && strings.TrimSpace(req.SpecificModel) == "" {

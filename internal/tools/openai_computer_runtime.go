@@ -35,6 +35,12 @@ type OpenAIComputerActionRuntimeV1 struct {
 	raw    *ComputerUseTool
 }
 
+type OpenAIComputerTaskAppV1 struct {
+	App      string
+	BundleID string
+	PID      int
+}
+
 // NewOpenAIComputerActionRuntimeV1 accepts only a registry entry carrying
 // Kocoro's final GUI execution gate. A raw ComputerUseTool would let a future
 // caller accidentally bypass the daemon coordinator, so it is rejected even
@@ -51,6 +57,85 @@ func NewOpenAIComputerActionRuntimeV1(
 		return nil, fmt.Errorf("OpenAI computer runtime requires clone-local ComputerUseTool")
 	}
 	return &OpenAIComputerActionRuntimeV1{public: public, raw: raw}, nil
+}
+
+func (r *OpenAIComputerActionRuntimeV1) ResolveTaskAppV1(
+	ctx context.Context,
+	app string,
+) (OpenAIComputerTaskAppV1, error) {
+	app = strings.TrimSpace(app)
+	if r == nil || r.raw == nil || r.raw.client == nil {
+		return OpenAIComputerTaskAppV1{},
+			fmt.Errorf("OpenAI computer task app resolver is unavailable")
+	}
+	if app == "" || !ValidAppNamePattern.MatchString(app) {
+		return OpenAIComputerTaskAppV1{}, fmt.Errorf("invalid app name")
+	}
+	raw, err := r.raw.client.Call(
+		ctx,
+		"resolve_app_identity",
+		map[string]any{"app_name": app},
+	)
+	if err != nil {
+		return OpenAIComputerTaskAppV1{}, fmt.Errorf("resolve app %q: %w", app, err)
+	}
+	var identity struct {
+		App      string `json:"app"`
+		BundleID string `json:"bundle_id"`
+		PID      *int   `json:"pid"`
+	}
+	if err := json.Unmarshal(raw, &identity); err != nil ||
+		strings.TrimSpace(identity.App) == "" ||
+		strings.TrimSpace(identity.BundleID) == "" {
+		return OpenAIComputerTaskAppV1{},
+			fmt.Errorf("resolve app %q returned invalid identity", app)
+	}
+	result := OpenAIComputerTaskAppV1{
+		App:      strings.TrimSpace(identity.App),
+		BundleID: strings.TrimSpace(identity.BundleID),
+	}
+	if identity.PID != nil {
+		result.PID = *identity.PID
+	}
+	return result, nil
+}
+
+func (r *OpenAIComputerActionRuntimeV1) LaunchAndFocusTaskAppsV1(
+	ctx context.Context,
+	apps []OpenAIComputerTaskAppV1,
+) error {
+	if r == nil || r.raw == nil || r.raw.client == nil {
+		return fmt.Errorf("OpenAI computer task launcher is unavailable")
+	}
+	if len(apps) == 0 {
+		return nil
+	}
+	for _, app := range apps {
+		if strings.TrimSpace(app.App) == "" ||
+			strings.TrimSpace(app.BundleID) == "" {
+			return fmt.Errorf("OpenAI computer task app identity is invalid")
+		}
+		if _, err := r.raw.client.Call(
+			ctx,
+			"launch_app",
+			map[string]any{"app_name": app.App},
+		); err != nil {
+			return fmt.Errorf("launch app %q: %w", app.App, err)
+		}
+	}
+	if _, err := r.raw.client.Call(
+		ctx,
+		"focus_app",
+		map[string]any{"app_name": apps[0].App, "verify": true},
+	); err != nil {
+		return fmt.Errorf("focus app %q: %w", apps[0].App, err)
+	}
+	// The explicit task app list supersedes a Quick Panel foreground hint.
+	// Clear that one-shot bootstrap target so every post-action refresh follows
+	// the actual frontmost window, including an OpenAI-native app switch.
+	r.raw.initialTarget = nil
+	r.raw.invalidateState()
+	return nil
 }
 
 func (r *OpenAIComputerActionRuntimeV1) plan(
@@ -137,8 +222,7 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 			return OpenAIComputerActionPlanV1{},
 				fmt.Errorf("OpenAI computer click coordinates are unavailable")
 		}
-		observation, err := anthropicHelpers.actionableObservation(ctx)
-		if err != nil {
+		if _, err := anthropicHelpers.actionableObservation(ctx); err != nil {
 			return OpenAIComputerActionPlanV1{},
 				fmt.Errorf("OpenAI computer coordinate authority is unavailable")
 		}
@@ -149,24 +233,6 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 		if action.Type == OpenAIComputerActionDoubleClickV1 {
 			args.Button = "left"
 			args.Clicks = 2
-		} else if action.Button == "left" && len(action.Keys) == 0 {
-			// Prefer a unique trusted semantic target. This preserves the
-			// Accessibility-first product contract while retaining exact framed
-			// coordinate fallback when Electron exposes no actionable AX node.
-			ref, found, hitErr := anthropicHelpers.uniqueAXPressHit(
-				observation,
-				*action.X,
-				*action.Y,
-			)
-			if hitErr != nil {
-				return OpenAIComputerActionPlanV1{},
-					fmt.Errorf("OpenAI computer click target is ambiguous")
-			}
-			if found {
-				args.Action, args.Ref = "press", ref
-				args.X, args.Y = nil, nil
-				args.Button, args.Clicks = "", 0
-			}
 		}
 		args.Modifiers = append([]string(nil), action.Keys...)
 		return r.plan(args, true)
@@ -215,7 +281,8 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 
 	case OpenAIComputerActionTypeTextV1:
 		ref, err := anthropicHelpers.uniqueFocusedRef()
-		if err != nil {
+		if err != nil && (r.raw.coordinateFocus == nil ||
+			r.raw.coordinateFocus.stateID != stateID) {
 			return OpenAIComputerActionPlanV1{},
 				fmt.Errorf("OpenAI computer type target is unavailable")
 		}

@@ -216,7 +216,10 @@ func TestComputerUseScreenshotExplainsAppWithoutUniqueWindow(t *testing.T) {
 		!strings.Contains(result.Content, "open one normal app window") {
 		t.Fatalf("result = %+v", result)
 	}
-	if got := fakeAXMethods(fake.calls); !reflect.DeepEqual(got, []string{"resolve_pid", "read_tree"}) {
+	if got := fakeAXMethods(fake.calls); !reflect.DeepEqual(
+		got,
+		[]string{"resolve_pid", "read_tree", "read_window_target"},
+	) {
 		t.Fatalf("missing-window path made extra GUI calls: %v", got)
 	}
 }

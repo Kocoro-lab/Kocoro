@@ -1,6 +1,45 @@
 import AppKit
 
+struct AppIdentityResult: Encodable {
+    let app: String
+    let bundleID: String
+    let pid: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case app, pid
+        case bundleID = "bundle_id"
+    }
+}
+
 struct FocusManager {
+    static func resolveAppIdentity(appName: String) -> (AppIdentityResult?, ErrorInfo?) {
+        if let running = resolveRunningApplication(appName: appName),
+           let bundleID = running.bundleIdentifier, !bundleID.isEmpty {
+            return (
+                AppIdentityResult(
+                    app: running.localizedName ?? appName,
+                    bundleID: bundleID,
+                    pid: Int(running.processIdentifier)),
+                nil)
+        }
+        guard let path = NSWorkspace.shared.fullPath(forApplication: appName),
+              let bundle = Bundle(path: path),
+              let bundleID = bundle.bundleIdentifier,
+              !bundleID.isEmpty else {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "App '\(appName)' is not installed"))
+        }
+        return (
+            AppIdentityResult(
+                app: bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ??
+                    bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ??
+                    appName,
+                bundleID: bundleID,
+                pid: nil),
+            nil)
+    }
+
     /// Launches an installed app by display name and activates it once the
     /// process becomes visible to NSWorkspace.
     static func launchApp(appName: String) -> (ActionResult?, ErrorInfo?) {
@@ -143,6 +182,12 @@ struct FocusManager {
 
     private static func hasWindow(_ app: NSRunningApplication) -> Bool {
         let appRef = AXUIElementCreateApplication(app.processIdentifier)
-        return !axWindows(appRef).isEmpty
+        if !axWindows(appRef).isEmpty {
+            return true
+        }
+        return frontmostNormalCGWindow(
+            pid: Int(app.processIdentifier),
+            candidates: currentCGWindowIdentityCandidates()
+        ) != nil
     }
 }

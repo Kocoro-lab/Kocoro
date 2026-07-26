@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"runtime"
 	"strings"
 	"testing"
@@ -166,6 +167,70 @@ func TestComputerUse_InfoSafetyAndSerialization(t *testing.T) {
 	}
 	if tool.IsSafeArgs(`not-json`) || tool.IsReadOnlyCall(`not-json`) {
 		t.Error("argument classification must fail closed")
+	}
+}
+
+func TestComputerUseReadTreeFallsBackToTypedCGWindowTarget(t *testing.T) {
+	fake := newFakeAXCaller()
+	fake.errors["read_tree"] = []error{errors.New("no accessible windows")}
+	fake.queue("read_window_target",
+		`{"schema_version":1,"app":"Slack","app_name":"Slack",`+
+			`"bundle_id":"com.tinyspeck.slackmacgap","pid":77,`+
+			`"window":"General","window_title":"General","window_id":901,`+
+			`"window_frame":{"x":10,"y":20,"width":1200,"height":800},`+
+			`"focused_ref":null,"elements":[],"ref_paths":{}}`)
+	tool := newTestComputerUse(fake)
+
+	tree, result, ok := tool.readTree(context.Background(), 77, "interactive", 25)
+
+	if !ok || result.IsError {
+		t.Fatalf("readTree fallback failed: %+v", result)
+	}
+	if tree.PID != 77 || tree.BundleID != "com.tinyspeck.slackmacgap" ||
+		tree.WindowID == nil || *tree.WindowID != 901 ||
+		tree.WindowFrame == nil || tree.SchemaVersion != 1 {
+		t.Fatalf("fallback tree = %+v", tree)
+	}
+	if len(fake.calls) != 2 ||
+		fake.calls[0].method != "read_tree" ||
+		fake.calls[1].method != "read_window_target" {
+		t.Fatalf("calls = %+v", fake.calls)
+	}
+}
+
+func TestComputerUseReadTreeReplacesIncompleteAXIdentityWithCGWindowTarget(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue("read_tree",
+		`{"schema_version":1,"app":"Slack","app_name":"Slack",`+
+			`"bundle_id":"com.tinyspeck.slackmacgap","pid":77,`+
+			`"window":"General","window_title":"General","window_id":null,`+
+			`"window_frame":{"x":11,"y":21,"width":1198,"height":798},`+
+			`"focused_ref":"e1","elements":[{"ref":"e1","fingerprint":"axf",`+
+			`"path":"window[0]/AXGroup[0]","role":"AXGroup",`+
+			`"value_redacted":false,"enabled":true,"focused":true,`+
+			`"selected":false,"actions":[]}],`+
+			`"ref_paths":{"e1":{"path":"window[0]/AXGroup[0]",`+
+			`"role":"AXGroup","fingerprint":"axf"}}}`)
+	fake.queue("read_window_target",
+		`{"schema_version":1,"app":"Slack","app_name":"Slack",`+
+			`"bundle_id":"com.tinyspeck.slackmacgap","pid":77,`+
+			`"window":"General","window_title":"General","window_id":901,`+
+			`"window_frame":{"x":10,"y":20,"width":1200,"height":800},`+
+			`"focused_ref":null,"elements":[],"ref_paths":{}}`)
+	tool := newTestComputerUse(fake)
+
+	tree, result, ok := tool.readTree(context.Background(), 77, "interactive", 25)
+
+	if !ok || result.IsError {
+		t.Fatalf("readTree fallback failed: %+v", result)
+	}
+	if tree.WindowID == nil || *tree.WindowID != 901 ||
+		tree.WindowFrame == nil || tree.WindowFrame.X != 10 ||
+		len(tree.Elements) != 0 || tree.FocusedRef != nil ||
+		len(tree.RefPaths) != 0 {
+		t.Fatalf("incomplete AX identity was mixed with CG authority: %+v", tree)
 	}
 }
 

@@ -90,6 +90,19 @@ func detachDaemonOpenAIComputerPrivateRuntimeV1(
 	if !tools.OpenAINativeComputerBatchExecutionAvailable() {
 		return nil, nil
 	}
+	return detachDaemonOpenAIComputerPrivateRuntimeCoreV1(registry)
+}
+
+// detachDaemonOpenAIComputerPrivateRuntimeCoreV1 prepares the local executor
+// without resolving or pinning a provider model. The high-level dispatcher
+// resolves its OpenAI profile lazily only when the model actually delegates a
+// desktop task, so ordinary turns never pay Computer Use preparation latency.
+func detachDaemonOpenAIComputerPrivateRuntimeCoreV1(
+	registry *agent.ToolRegistry,
+) (*daemonOpenAIComputerPrivateRuntimeV1, error) {
+	if !tools.OpenAINativeComputerBatchExecutionAvailable() {
+		return nil, nil
+	}
 	if registry == nil {
 		return nil, fmt.Errorf("OpenAI computer run registry is unavailable")
 	}

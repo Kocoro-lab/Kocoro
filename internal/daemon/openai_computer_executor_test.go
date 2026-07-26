@@ -132,6 +132,27 @@ type openAIComputerDaemonRuntimeProbe struct {
 	tool             *openAIComputerDaemonProbeTool
 	actionPlans      []tools.OpenAIComputerActionV1
 	observationPlans int
+	resolvedApps     []string
+	launchedApps     []tools.OpenAIComputerTaskAppV1
+}
+
+func (r *openAIComputerDaemonRuntimeProbe) ResolveTaskAppV1(
+	_ context.Context,
+	app string,
+) (tools.OpenAIComputerTaskAppV1, error) {
+	r.resolvedApps = append(r.resolvedApps, app)
+	return tools.OpenAIComputerTaskAppV1{
+		App:      app,
+		BundleID: "com.example." + strings.ToLower(app),
+	}, nil
+}
+
+func (r *openAIComputerDaemonRuntimeProbe) LaunchAndFocusTaskAppsV1(
+	_ context.Context,
+	apps []tools.OpenAIComputerTaskAppV1,
+) error {
+	r.launchedApps = append(r.launchedApps, apps...)
+	return nil
 }
 
 func (r *openAIComputerDaemonRuntimeProbe) PlanOpenAIComputerActionV1(
@@ -549,6 +570,199 @@ func TestDaemonOpenAIComputerBatchRunnerBridgesAgentLoopToGuardedWorkflow(t *tes
 	}
 	if active := coordinator.Snapshot().Active; active == nil {
 		t.Fatal("one batch lease was not retained through the runner")
+	}
+}
+
+func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *testing.T) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-task",
+		"turn-openai-task",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.slack",
+		targetAppName:  "Slack",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "clicked",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result: agent.GUIActionResultVerified,
+					Phase:  agent.GUIActionPhaseVerifying,
+				},
+			},
+			"type": {
+				Content: "typed",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result: agent.GUIActionResultVerified,
+					Phase:  agent.GUIActionPhaseVerifying,
+				},
+			},
+			"reobserve": {Content: "observed"},
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "ZmluYWwtaW1hZ2U=",
+				}},
+			},
+		},
+	}
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	call := openAIComputerDaemonCall(
+		`{"type":"click","button":"left","x":10,"y":20},` +
+			`{"type":"type","text":"hello"}`,
+	)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(call),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_task_final",
+			`{"type":"text","text":"done"}`,
+			"done",
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	handler := &openAIComputerDaemonApprovalHandler{}
+	resolveCalls := 0
+	taskTool := &openAIComputerTaskToolV1{
+		gateway: llm,
+		resolveProfile: func(context.Context) (*client.ExecutionProfile, error) {
+			resolveCalls++
+			return profile, nil
+		},
+		childTools:   childTools,
+		workflow:     workflow,
+		runtime:      runtime,
+		approvalTool: probe,
+		handler:      handler,
+		modelTier:    "large",
+		maxIter:      4,
+		resultTrunc:  2000,
+		argsTrunc:    200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Open Slack, type hello, then switch to Calculator and click 7",`+
+			`"apps":["Slack","Calculator"],"description":"Complete the desktop task"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if result.IsError || result.Content != "done" {
+		t.Fatalf("task result = %+v", result)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("lazy profile resolve calls = %d", resolveCalls)
+	}
+	if got := strings.Join(runtime.resolvedApps, ","); got != "Slack,Calculator" {
+		t.Fatalf("resolved apps = %q", got)
+	}
+	if len(runtime.launchedApps) != 2 ||
+		runtime.launchedApps[0].App != "Slack" ||
+		runtime.launchedApps[1].App != "Calculator" {
+		t.Fatalf("launched apps = %+v", runtime.launchedApps)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,reobserve,type,final_screenshot" {
+		t.Fatalf("private execution order = %q", got)
+	}
+	if len(llm.requests) != 2 {
+		t.Fatalf("child completion requests = %d, want one batch + one continuation", len(llm.requests))
+	}
+	for index, request := range llm.requests {
+		if request.SpecificModel != profile.Model() ||
+			request.ExecutionProfileID != profile.ProfileID() {
+			t.Fatalf("child request %d model/profile = %q/%q", index, request.SpecificModel, request.ExecutionProfileID)
+		}
+		if len(request.Tools) != 1 ||
+			request.Tools[0].Type != client.OpenAINativeComputerToolType {
+			t.Fatalf("child request %d tools = %+v", index, request.Tools)
+		}
+		hasExecutorInstructions := false
+		for _, message := range request.Messages {
+			if strings.Contains(
+				message.Content.Text(),
+				"execution_role=private_openai_native_computer",
+			) {
+				hasExecutorInstructions = true
+				break
+			}
+		}
+		if !hasExecutorInstructions {
+			t.Fatalf("child request %d lacks private executor instructions", index)
+		}
+	}
+	if blocks := llm.requests[0].Messages[len(llm.requests[0].Messages)-1].Content.Blocks(); len(blocks) != 2 || blocks[1].Type != "image" {
+		t.Fatalf("child initial user content = %+v", blocks)
+	}
+}
+
+func TestOpenAIComputerTaskToolResolverFailureDoesNotTouchDesktop(t *testing.T) {
+	probe := &openAIComputerDaemonProbeTool{}
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	resolveCalls := 0
+	taskTool := &openAIComputerTaskToolV1{
+		gateway: &openAIComputerDaemonLoopLLM{},
+		resolveProfile: func(context.Context) (*client.ExecutionProfile, error) {
+			resolveCalls++
+			return nil, errors.New("profile unavailable")
+		},
+		childTools: agent.NewToolRegistry(),
+		workflow: testGUIWorkflow(
+			guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{}),
+			"session-openai-resolve-failure",
+			"turn-openai-resolve-failure",
+		),
+		runtime:      runtime,
+		approvalTool: probe,
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := taskTool.Run(
+			context.Background(),
+			`{"task":"Open Slack and type hello","apps":["Slack"],`+
+				`"description":"Complete the desktop task"}`,
+		)
+		if err != nil {
+			t.Fatalf("task Run %d: %v", attempt, err)
+		}
+		if !result.IsError ||
+			!strings.Contains(result.Content, "do not retry computer_use in this turn") ||
+			!strings.Contains(result.Content, "no desktop action was attempted") {
+			t.Fatalf("task result %d = %+v", attempt, result)
+		}
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("profile resolver calls = %d, want one per turn", resolveCalls)
+	}
+	if len(runtime.resolvedApps) != 0 || len(runtime.launchedApps) != 0 ||
+		len(probe.runNames()) != 0 {
+		t.Fatalf(
+			"resolver failure touched desktop: resolved=%v launched=%v runs=%v",
+			runtime.resolvedApps, runtime.launchedApps, probe.runNames(),
+		)
+	}
+}
+
+func TestOpenAIComputerTaskToolSchemaRequiresExplicitAppList(t *testing.T) {
+	info := (&openAIComputerTaskToolV1{}).Info()
+	if got := strings.Join(info.Required, ","); got != "task,apps,description" {
+		t.Fatalf("required fields = %q", got)
 	}
 }
 

@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,7 +12,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
@@ -27,247 +28,87 @@ func loadRunnerExecutionProfileFixture(t *testing.T, name string) []byte {
 	return data
 }
 
-func TestPrepareComputerUseRegistryForRunOldCloudFallsBackToGenericNeverLegacyComputer(t *testing.T) {
+func TestResolveOpenAIComputerProfileRequestsOnlyNativeWithoutParentModelPin(t *testing.T) {
+	var resolveBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/completions/resolve" {
-			http.NotFound(w, r)
-			return
+		var err error
+		resolveBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read resolve body: %v", err)
 		}
-		t.Fatalf("unexpected path %q", r.URL.Path)
+		_, _ = w.Write(loadRunnerExecutionProfileFixture(t, "profile.openai-native.json"))
 	}))
 	defer server.Close()
 
-	cfg := &config.Config{ModelTier: "medium"}
-	baseline, _, cleanup := tools.RegisterLocalTools(cfg, nil)
-	defer cleanup()
-
-	registry, profile, fallback, err := prepareComputerUseRegistryForRun(
+	profile, err := resolveOpenAIComputerProfileForTask(
 		context.Background(),
 		client.NewGatewayClient(server.URL, "test-key"),
-		baseline,
-		cfg,
-		runModelIntent{ModelTier: "medium"},
+		"medium",
 	)
 	if err != nil {
-		t.Fatalf("prepareComputerUseRegistryForRun: %v", err)
+		t.Fatalf("resolveOpenAIComputerProfileForTask: %v", err)
 	}
-	if !fallback {
-		t.Fatal("old Cloud did not select safe generic fallback")
+	if profile == nil ||
+		profile.ToolContract() != client.ToolContractOpenAIComputerV1 {
+		t.Fatalf("profile=%+v", profile)
 	}
-	if profile != nil {
-		t.Fatalf("fallback profile = %+v, want nil", profile)
+	if bytes.Contains(resolveBody, []byte(`"specific_model":"claude-sonnet-5"`)) {
+		t.Fatalf("resolve body pinned parent model: %s", resolveBody)
 	}
-	if _, ok := registry.Get("computer_use"); !ok {
-		t.Fatal("old-Cloud fallback lost computer_use")
-	}
-	if _, ok := registry.Get("computer"); ok {
-		t.Fatal("old-Cloud fallback exposed legacy computer")
-	}
-	// The generic fallback keeps AX execution behind computer_use, but must not
-	// expose the old accessibility wrapper as a competing model-visible tool.
-	if _, ok := registry.Get("accessibility"); ok {
-		t.Fatal("old-Cloud fallback exposed competing accessibility tool")
-	}
-	if _, ok := registry.Get("applescript"); ok {
-		t.Fatal("old-Cloud fallback exposed legacy applescript GUI automation")
+	if !bytes.Contains(resolveBody, []byte(
+		`"required_tool_contract":"openai.computer.v1"`,
+	)) {
+		t.Fatalf("resolve body omitted OpenAI contract: %s", resolveBody)
 	}
 }
 
-func TestPrepareComputerUseRegistryForRunFallbackIsNarrowAndFailClosed(t *testing.T) {
-	staleProfileError := string(loadRunnerExecutionProfileFixture(t, "error.execution-profile-stale.json"))
-	tests := []struct {
-		name         string
-		status       int
-		body         string
-		wantFallback bool
-		wantError    bool
-	}{
-		{
-			name:         "old Cloud 404",
-			status:       http.StatusNotFound,
-			body:         `{"detail":"not found"}`,
-			wantFallback: true,
-		},
-		{
-			name:         "old Cloud 405",
-			status:       http.StatusMethodNotAllowed,
-			body:         `{"detail":"method not allowed"}`,
-			wantFallback: true,
-		},
-		{
-			name:      "authentication failure",
-			status:    http.StatusUnauthorized,
-			body:      `{"error":{"code":"unauthorized"}}`,
-			wantError: true,
-		},
-		{
-			name:      "authorization failure",
-			status:    http.StatusForbidden,
-			body:      `{"error":{"code":"forbidden"}}`,
-			wantError: true,
-		},
-		{
-			name:      "stale profile contract",
-			status:    http.StatusConflict,
-			body:      staleProfileError,
-			wantError: true,
-		},
-		{
-			name:      "Cloud server failure",
-			status:    http.StatusInternalServerError,
-			body:      `{"error":{"code":"internal"}}`,
-			wantError: true,
-		},
-		{
-			name:      "malformed successful response",
-			status:    http.StatusOK,
-			body:      `{"provider":"openai","model":"gpt-5-mini-2025-08-07"}`,
-			wantError: true,
-		},
-		{
-			name:   "noncanonical successful response",
-			status: http.StatusOK,
-			body: `{"schema_version":1,"contract_revision":1,"profile_id":"ep1_0000000000000000000000000000000000000000000000000000000000000000",` +
-				`"provider":"openai","model":"gpt-5-mini-2025-08-07","api_surface":"openai_chat_completions","execution_mode":"function_computer_use",` +
-				`"tool_contract":"kocoro.computer_use.v1","beta_contract":null,"supports_image_input":true,"supports_tool_result_images":false,` +
-				`"supports_function_tools":true,"supports_batched_actions":false}`,
-			wantError: true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(tc.status)
-				_, _ = w.Write([]byte(tc.body))
+func TestResolveOpenAIComputerProfileSurfacesEveryCloudFailure(t *testing.T) {
+	for _, status := range []int{
+		http.StatusNotFound,
+		http.StatusUnauthorized,
+		http.StatusConflict,
+		http.StatusInternalServerError,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "unavailable", status)
 			}))
 			defer server.Close()
-			cfg := &config.Config{ModelTier: "medium"}
-			baseline, _, cleanup := tools.RegisterLocalTools(cfg, nil)
-			defer cleanup()
-
-			registry, profile, fallback, err := prepareComputerUseRegistryForRun(
+			profile, err := resolveOpenAIComputerProfileForTask(
 				context.Background(),
 				client.NewGatewayClient(server.URL, "test-key"),
-				baseline,
-				cfg,
-				runModelIntent{ModelTier: "medium"},
+				"medium",
 			)
-			if tc.wantError {
-				if err == nil {
-					t.Fatalf("err = nil, want fail-closed error (registry=%p profile=%+v fallback=%t)", registry, profile, fallback)
-				}
-				if fallback {
-					t.Fatal("fail-closed case incorrectly reported compatibility fallback")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("prepareComputerUseRegistryForRun: %v", err)
-			}
-			if fallback != tc.wantFallback {
-				t.Fatalf("fallback = %t, want %t", fallback, tc.wantFallback)
+			if err == nil || profile != nil {
+				t.Fatalf("profile=%+v err=%v", profile, err)
 			}
 		})
 	}
 }
 
-func TestPrepareComputerUseRegistryForRunResolvedGenericIsAXOnlyAndSingleSurface(t *testing.T) {
-	openAIGeneric := loadRunnerExecutionProfileFixture(t, "profile.openai-generic-ax-only.json")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(openAIGeneric)
-	}))
-	defer server.Close()
-
-	cfg := &config.Config{ModelTier: "medium"}
-	baseline, _, cleanup := tools.RegisterLocalTools(cfg, nil)
-	defer cleanup()
-
-	registry, profile, fallback, err := prepareComputerUseRegistryForRun(
-		context.Background(),
-		client.NewGatewayClient(server.URL, "test-key"),
-		baseline,
-		cfg,
-		runModelIntent{ModelTier: "medium"},
-	)
-	if err != nil {
-		t.Fatalf("prepareComputerUseRegistryForRun: %v", err)
-	}
-	if fallback {
-		t.Fatal("valid resolved generic profile used fallback")
-	}
-	if profile == nil || !profile.IsTrustedResolution() {
-		t.Fatal("resolved generic profile is not trusted")
-	}
-	if profile.Model() != "gpt-5-mini-2025-08-07" {
-		t.Fatalf("resolved model = %q", profile.Model())
-	}
-	public, ok := registry.Get("computer_use")
-	if !ok {
-		t.Fatal("resolved generic profile lost computer_use")
-	}
-	if _, ok := registry.Get("computer"); ok {
-		t.Fatal("resolved generic profile exposed legacy computer")
-	}
-	if _, ok := registry.Get("accessibility"); ok {
-		t.Fatal("resolved generic profile exposed competing accessibility tool")
-	}
-	result, runErr := public.Run(
-		context.Background(),
-		`{"action":"screenshot","description":"inspect"}`,
-	)
-	if runErr != nil {
-		t.Fatalf("AX-only rejection returned Go error: %v", runErr)
-	}
-	if !result.IsError || len(result.Images) != 0 {
-		t.Fatalf("AX-only screenshot result = %+v", result)
+func TestResolveOpenAIComputerProfileRejectsEveryNonOpenAINativeProfile(t *testing.T) {
+	for _, fixture := range []string{
+		"profile.anthropic-native.json",
+		"profile.openai-generic-ax-only.json",
+	} {
+		t.Run(fixture, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(loadRunnerExecutionProfileFixture(t, fixture))
+			}))
+			defer server.Close()
+			profile, err := resolveOpenAIComputerProfileForTask(
+				context.Background(),
+				client.NewGatewayClient(server.URL, "test-key"),
+				"medium",
+			)
+			if err == nil || profile != nil {
+				t.Fatalf("profile=%+v err=%v", profile, err)
+			}
+		})
 	}
 }
 
-func TestPrepareComputerUseRegistryForRunResolvedAnthropicFallsBackToGeneric(t *testing.T) {
-	anthropicNative := loadRunnerExecutionProfileFixture(t, "profile.anthropic-native.json")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(anthropicNative)
-	}))
-	defer server.Close()
-
-	cfg := &config.Config{ModelTier: "medium"}
-	baseline, _, cleanup := tools.RegisterLocalTools(cfg, nil)
-	defer cleanup()
-
-	registry, profile, fallback, err := prepareComputerUseRegistryForRun(
-		context.Background(),
-		client.NewGatewayClient(server.URL, "test-key"),
-		baseline,
-		cfg,
-		runModelIntent{ModelTier: "medium"},
-	)
-	if err != nil {
-		t.Fatalf("prepareComputerUseRegistryForRun: %v", err)
-	}
-	if !fallback {
-		t.Fatal("Anthropic native profile did not select the safe generic fallback")
-	}
-	if profile != nil {
-		t.Fatalf("fallback profile = %+v, want nil so completion cannot claim the native contract", profile)
-	}
-	public, ok := registry.Get("computer_use")
-	if !ok {
-		t.Fatal("Anthropic fallback lost computer_use")
-	}
-	if _, ok := public.(agent.NativeToolRequestPreparer); ok {
-		t.Fatalf("Anthropic fallback computer_use unexpectedly prepares provider-native state: %T", public)
-	}
-	if _, ok := registry.Get(client.NativeComputerToolName); ok {
-		t.Fatal("Anthropic fallback exposed native or legacy computer")
-	}
-	if _, ok := registry.Get("accessibility"); ok {
-		t.Fatal("Anthropic fallback exposed competing accessibility tool")
-	}
-}
-
-func TestRunAgentAnthropicFallbackDoesNotPrepareGUIForScheduleTextReply(t *testing.T) {
-	anthropicNative := loadRunnerExecutionProfileFixture(t, "profile.anthropic-native.json")
+func TestRunAgentKeepsSonnetParentAndExposesOnlyHighLevelComputerTask(t *testing.T) {
 	streamResponse := []byte(
 		"data: {\"type\":\"content_delta\",\"text\":\"ok\"}\n\n" +
 			"data: {\"type\":\"done\",\"output_text\":\"ok\",\"provider\":\"anthropic\"," +
@@ -276,10 +117,14 @@ func TestRunAgentAnthropicFallbackDoesNotPrepareGUIForScheduleTextReply(t *testi
 	)
 	var mu sync.Mutex
 	var completionRequests []client.CompletionRequest
+	resolveRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/completions/resolve":
-			_, _ = w.Write(anthropicNative)
+			mu.Lock()
+			resolveRequests++
+			mu.Unlock()
+			http.Error(w, "ordinary turns must not resolve computer use", http.StatusInternalServerError)
 		case "/v1/completions":
 			var req client.CompletionRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -303,6 +148,7 @@ func TestRunAgentAnthropicFallbackDoesNotPrepareGUIForScheduleTextReply(t *testi
 		Provider:  "gateway",
 		ModelTier: "medium",
 		Agent: config.AgentConfig{
+			Model:         "claude-sonnet-5",
 			MaxIterations: 2,
 		},
 	}
@@ -338,181 +184,45 @@ func TestRunAgentAnthropicFallbackDoesNotPrepareGUIForScheduleTextReply(t *testi
 
 	mu.Lock()
 	requests := append([]client.CompletionRequest(nil), completionRequests...)
+	resolves := resolveRequests
 	mu.Unlock()
+	if resolves != 0 {
+		t.Fatalf("ordinary Sonnet turn made %d Computer Use resolve request(s)", resolves)
+	}
 	if len(requests) == 0 {
-		t.Fatal("schedule text reply sent no completion request")
-	}
-	hasGenericMainRequest := false
-	for index, request := range requests {
-		if request.ExecutionProfileID != "" || request.ResolvedExecutionProfile != nil {
-			t.Fatalf(
-				"completion request %d leaked native execution profile: id=%q profile=%+v",
-				index,
-				request.ExecutionProfileID,
-				request.ResolvedExecutionProfile,
-			)
-		}
-		var hasComputerUse, hasNativeComputer bool
-		for _, schema := range request.Tools {
-			if schema.Type == "function" && schema.Function.Name == "computer_use" {
-				hasComputerUse = true
-			}
-			if schema.Type == client.NativeComputerToolType {
-				hasNativeComputer = true
-			}
-		}
-		if hasNativeComputer {
-			t.Fatalf(
-				"completion request %d exposed native computer",
-				index,
-			)
-		}
-		hasGenericMainRequest = hasGenericMainRequest || hasComputerUse
-	}
-	if !hasGenericMainRequest {
-		t.Fatal("no completion request exposed generic computer_use")
-	}
-}
-
-func TestPrepareComputerUseRegistryForRunResolvedOpenAIKeepsPrivateRuntimeAndNativeAlias(t *testing.T) {
-	openAINative := loadRunnerExecutionProfileFixture(t, "profile.openai-native.json")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(openAINative)
-	}))
-	defer server.Close()
-
-	cfg := &config.Config{ModelTier: "large"}
-	baseline, _, cleanup := tools.RegisterLocalTools(cfg, nil)
-	defer cleanup()
-
-	registry, profile, fallback, err := prepareComputerUseRegistryForRun(
-		context.Background(),
-		client.NewGatewayClient(server.URL, "test-key"),
-		baseline,
-		cfg,
-		runModelIntent{ModelTier: "large", SpecificModel: "gpt-5.6-sol"},
-	)
-	if err != nil {
-		t.Fatalf("prepareComputerUseRegistryForRun: %v", err)
-	}
-	if fallback {
-		t.Fatal("valid OpenAI native profile used fallback")
-	}
-	if profile == nil || profile.ToolContract() != client.ToolContractOpenAIComputerV1 {
-		t.Fatalf("profile = %+v", profile)
-	}
-	native, ok := registry.Get(client.NativeComputerToolName)
-	if !ok {
-		t.Fatal("OpenAI native profile lost computer alias")
-	}
-	definer, ok := native.(agent.NativeToolProvider)
-	if !ok || definer.NativeToolDef() == nil ||
-		definer.NativeToolDef().Type != "computer" {
-		t.Fatalf("OpenAI computer type = %T definition=%+v", native, definer)
-	}
-	if _, ok := registry.Get("computer_use"); !ok {
-		t.Fatal("OpenAI native profile lost private guarded computer_use runtime")
-	}
-	if _, ok := registry.Get("accessibility"); ok {
-		t.Fatal("OpenAI native profile exposed competing accessibility tool")
-	}
-}
-
-func TestRunAgentPinsResolvedProfileOnActualStreamingCompletion(t *testing.T) {
-	openAIGeneric := loadRunnerExecutionProfileFixture(t, "profile.openai-generic-ax-only.json")
-	streamResponse := loadRunnerExecutionProfileFixture(t, "stream.openai-generic-ax-only.sse")
-	var mu sync.Mutex
-	var completionRequests []client.CompletionRequest
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1/completions/resolve":
-			_, _ = w.Write(openAIGeneric)
-		case "/v1/completions":
-			var req client.CompletionRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Fatalf("decode completion request: %v", err)
-			}
-			mu.Lock()
-			completionRequests = append(completionRequests, req)
-			mu.Unlock()
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = w.Write(streamResponse)
-		case "/channels":
-			_, _ = w.Write([]byte(`[]`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	shannonDir := t.TempDir()
-	cfg := &config.Config{
-		Provider:  "gateway",
-		ModelTier: "medium",
-		Agent: config.AgentConfig{
-			MaxIterations: 2,
-		},
-	}
-	baseline, _, cleanup := tools.RegisterLocalTools(cfg, nil)
-	defer cleanup()
-	deps := &ServerDeps{
-		Config:       cfg,
-		GW:           client.NewGatewayClient(server.URL, "test-key"),
-		Registry:     baseline,
-		BaselineReg:  baseline,
-		SessionCache: NewSessionCache(shannonDir),
-		ShannonDir:   shannonDir,
-		AgentsDir:    filepath.Join(shannonDir, "agents"),
-	}
-	defer deps.SessionCache.CloseAll()
-
-	result, err := RunAgent(
-		context.Background(),
-		deps,
-		RunAgentRequest{
-			Text:          "inspect with accessibility if needed",
-			Source:        "heartbeat",
-			BypassRouting: true,
-		},
-		nullEventHandler{},
-	)
-	if err != nil {
-		t.Fatalf("RunAgent: %v", err)
-	}
-	if result == nil || result.Reply != "ok" {
-		t.Fatalf("result = %+v", result)
-	}
-
-	mu.Lock()
-	requests := append([]client.CompletionRequest(nil), completionRequests...)
-	mu.Unlock()
-	if len(requests) != 1 {
-		t.Fatalf("completion requests = %d, want 1", len(requests))
+		t.Fatal("parent sent no completion request")
 	}
 	request := requests[0]
-	if request.ExecutionProfileID != "ep1_217889e2bd16ac438ea11979501af6e2a9c3077d324ef0697e8d606d4847d610" {
-		t.Fatalf("execution_profile_id = %q", request.ExecutionProfileID)
+	if request.SpecificModel != "claude-sonnet-5" {
+		t.Fatalf("parent specific_model = %q", request.SpecificModel)
 	}
-	if request.SpecificModel != "gpt-5-mini-2025-08-07" {
-		t.Fatalf("specific_model = %q", request.SpecificModel)
+	if request.ExecutionProfileID != "" || request.ResolvedExecutionProfile != nil {
+		t.Fatalf("parent leaked child profile: %+v", request)
 	}
-	var hasComputerUse, hasLegacyComputer, hasAccessibility bool
-	for _, schema := range request.Tools {
-		switch {
-		case schema.Type == "function" && schema.Function.Name == "computer_use":
-			hasComputerUse = true
-		case schema.Type == "function" && schema.Function.Name == "computer":
-			hasLegacyComputer = true
-		case schema.Type == "function" && schema.Function.Name == "accessibility":
-			hasAccessibility = true
+	var computer *client.Tool
+	for index := range request.Tools {
+		schema := &request.Tools[index]
+		if schema.Type == client.NativeComputerToolType ||
+			schema.Function.Name == "accessibility" ||
+			schema.Function.Name == "applescript" ||
+			schema.Function.Name == "computer" {
+			t.Fatalf("parent exposed legacy/native GUI tool: %+v", *schema)
+		}
+		if schema.Type == "function" && schema.Function.Name == "computer_use" {
+			computer = schema
 		}
 	}
-	if !hasComputerUse || hasLegacyComputer || hasAccessibility {
-		t.Fatalf(
-			"tool surface computer_use=%t legacy_computer=%t accessibility=%t",
-			hasComputerUse,
-			hasLegacyComputer,
-			hasAccessibility,
-		)
+	if computer == nil {
+		t.Fatal("parent omitted high-level computer_use")
+	}
+	properties, _ := computer.Function.Parameters["properties"].(map[string]any)
+	if _, ok := properties["task"]; !ok {
+		t.Fatalf("computer_use schema = %+v", computer.Function.Parameters)
+	}
+	if _, leaked := properties["action"]; leaked {
+		t.Fatalf("low-level action leaked into parent schema: %+v", properties)
+	}
+	if _, leaked := properties["state_id"]; leaked {
+		t.Fatalf("state_id leaked into parent schema: %+v", properties)
 	}
 }

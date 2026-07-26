@@ -1839,82 +1839,44 @@ func effectiveRunModelIntent(
 	return intent
 }
 
-// prepareComputerUseRegistryForRun resolves the Cloud-owned execution profile
-// before cloning any run-local computer tool state. A missing/old/unreachable
-// resolve endpoint safely downgrades to the provider-neutral AX-only function
-// tool and removes legacy `computer`; malformed or unauthenticated data can
-// therefore never activate a provider-native adapter.
-func prepareComputerUseRegistryForRun(
+// resolveOpenAIComputerProfileForTask is called only after the parent model
+// delegates an actual desktop goal. Ordinary turns never touch the Computer
+// Use resolver or inherit its model.
+func resolveOpenAIComputerProfileForTask(
 	ctx context.Context,
 	gateway *client.GatewayClient,
-	baseReg *agent.ToolRegistry,
-	runCfg *config.Config,
-	intent runModelIntent,
-) (*agent.ToolRegistry, *client.ExecutionProfile, bool, error) {
-	if baseReg == nil || !baseReg.Has("computer_use") {
-		return tools.CloneWithRuntimeConfig(baseReg, runCfg), nil, false, nil
-	}
+	modelTier string,
+) (*client.ExecutionProfile, error) {
 	if gateway == nil {
-		registry, err := tools.CloneWithGenericComputerUseForRun(baseReg, runCfg, false)
-		return registry, nil, true, err
+		return nil, fmt.Errorf("Cloud gateway is unavailable")
 	}
 	resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	profile, err := gateway.ResolveExecutionProfile(
 		resolveCtx,
 		client.ResolveExecutionProfileRequest{
-			SchemaVersion:      client.ExecutionProfileSchemaVersion,
-			ModelTier:          intent.ModelTier,
-			SpecificModel:      intent.SpecificModel,
-			Capability:         client.ExecutionProfileCapabilityComputer,
-			AllowModelFallback: true,
+			SchemaVersion:        client.ExecutionProfileSchemaVersion,
+			ModelTier:            modelTier,
+			Capability:           client.ExecutionProfileCapabilityComputer,
+			RequiredToolContract: client.ToolContractOpenAIComputerV1,
+			AllowModelFallback:   true,
 		},
 	)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, nil, false, ctx.Err()
-		}
-		if !executionProfileResolveAllowsCompatibilityFallback(err) {
-			return nil, nil, false, fmt.Errorf("execution profile resolve: %w", err)
-		}
-		log.Printf(
-			"daemon: execution profile resolve unavailable; using AX-only generic computer_use: %v",
-			err,
-		)
-		registry, cloneErr := tools.CloneWithGenericComputerUseForRun(baseReg, runCfg, false)
-		return registry, nil, true, cloneErr
+		return nil, fmt.Errorf("resolve OpenAI computer profile: %w", err)
 	}
-	// Anthropic's native computer contract is intentionally not admitted yet.
-	// Its provider schema exposes actions the local adapter cannot execute, and
-	// its request-time screenshot preparation can observe or fail before the
-	// model chooses Computer Use. Keep one reliable function-tool path until the
-	// native adapter has a stable canvas and full contract coverage.
-	if profile.ToolContract() == client.ToolContractAnthropicComputer20251124 {
-		log.Printf(
-			"daemon: Anthropic native computer is not admitted; using generic computer_use",
-		)
-		registry, cloneErr := tools.CloneWithGenericComputerUseForRun(
-			baseReg,
-			runCfg,
-			profile.SupportsToolResultImages(),
-		)
-		return registry, nil, true, cloneErr
+	if profile.Provider() != client.OpenAIComputerProvider ||
+		profile.APISurface() != client.APISurfaceOpenAIResponses ||
+		profile.ToolContract() != client.ToolContractOpenAIComputerV1 ||
+		profile.ExecutionMode() != client.ExecutionModeNativeComputer ||
+		!profile.IsTrustedResolution() ||
+		!profile.SupportsImageInput() ||
+		!profile.SupportsToolResultImages() ||
+		profile.SupportsFunctionTools() ||
+		!profile.SupportsBatchedActions() {
+		return nil, fmt.Errorf("Cloud returned an unsupported OpenAI computer profile")
 	}
-	registry, err := tools.CloneWithResolvedComputerUseProfileForRun(baseReg, runCfg, profile)
-	if err != nil {
-		return nil, nil, false, fmt.Errorf("resolved computer-use profile: %w", err)
-	}
-	return registry, profile, false, nil
-}
-
-func executionProfileResolveAllowsCompatibilityFallback(err error) bool {
-	var apiErr *client.APIError
-	if errors.As(err, &apiErr) {
-		return apiErr.StatusCode == http.StatusNotFound ||
-			apiErr.StatusCode == http.StatusMethodNotAllowed
-	}
-	var transportErr *url.Error
-	return errors.As(err, &transportErr)
+	return profile, nil
 }
 
 // historySnapshotForRequest returns the conversation history that the agent
@@ -2792,39 +2754,39 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 
-	// Resolve one exact Cloud execution profile before the run-local registry
-	// clone. Old Cloud / unavailable resolve safely falls back to AX-only
-	// computer_use; provider-native adapters require a trusted resolved seal.
+	// Prepare only the local executor. The OpenAI profile is resolved lazily if
+	// and when the parent delegates a desktop goal, so ordinary Sonnet turns
+	// never pay provider-native preparation latency.
 	modelIntent := effectiveRunModelIntent(runCfg, agentOverride, req)
-	reg, executionProfile, _, err := prepareComputerUseRegistryForRun(
-		ctx,
-		deps.GW,
-		baseReg,
-		runCfg,
-		modelIntent,
-	)
-	if err != nil {
-		return nil, err
-	}
-	if hint := req.ForegroundHint; hint != nil && hint.PID > 0 &&
-		strings.TrimSpace(hint.AppName) != "" && strings.TrimSpace(hint.BundleID) != "" {
-		if err := tools.BindComputerUseInitialTargetForRun(reg, tools.ComputerUseInitialTargetV1{
-			PID: hint.PID, AppName: hint.AppName, BundleID: hint.BundleID,
-		}); err != nil {
-			return nil, fmt.Errorf("bind foreground computer-use target: %w", err)
+	var computerReg *agent.ToolRegistry
+	var openAIComputerPrivate *daemonOpenAIComputerPrivateRuntimeV1
+	if baseReg.Has("computer_use") {
+		computerReg, err = tools.CloneWithOpenAIComputerForRun(baseReg, runCfg)
+		if err != nil {
+			log.Printf(
+				"daemon: local OpenAI computer executor unavailable; computer_use will be omitted: %v",
+				err,
+			)
+			computerReg = nil
 		}
 	}
-	if unattendedRun && (executionProfile == nil ||
-		executionProfile.ExecutionMode() == client.ExecutionModeFunctionComputerUse) {
-		if err := tools.RequireExplicitComputerUseTargetForRun(reg); err != nil {
-			return nil, fmt.Errorf("scope unattended computer-use target: %w", err)
+	if computerReg != nil {
+		if hint := req.ForegroundHint; hint != nil && hint.PID > 0 &&
+			strings.TrimSpace(hint.AppName) != "" && strings.TrimSpace(hint.BundleID) != "" {
+			if err := tools.BindComputerUseInitialTargetForRun(computerReg, tools.ComputerUseInitialTargetV1{
+				PID: hint.PID, AppName: hint.AppName, BundleID: hint.BundleID,
+			}); err != nil {
+				return nil, fmt.Errorf("bind foreground computer-use target: %w", err)
+			}
+		}
+		openAIComputerPrivate, err =
+			detachDaemonOpenAIComputerPrivateRuntimeCoreV1(computerReg)
+		if err != nil {
+			return nil, fmt.Errorf("detach OpenAI computer runtime: %w", err)
 		}
 	}
-	openAIComputerPrivate, err :=
-		detachDaemonOpenAIComputerPrivateRuntimeV1(reg, executionProfile)
-	if err != nil {
-		return nil, fmt.Errorf("detach OpenAI computer runtime: %w", err)
-	}
+
+	reg := tools.CloneWithRuntimeConfig(baseReg, runCfg)
 	if agentOverride != nil {
 		reg = tools.ApplyToolFilter(reg, agentOverride)
 		// Enforce per-agent MCP server selection: drop MCP tools whose server is
@@ -2837,28 +2799,23 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// (config.mcp.default_agent_disabled). No-op when empty.
 		reg = tools.ApplyMCPServerScope(reg, runCfg)
 	}
-	// A named-agent allow/deny filter may intentionally remove the selected
-	// computer tool. In that case no profile is attached to ordinary requests;
-	// Gateway preflight would otherwise (correctly) reject a profile whose tool
-	// contract is absent from the final schema surface.
-	if executionProfile != nil {
-		switch executionProfile.ExecutionMode() {
-		case client.ExecutionModeNativeComputer:
-			if !reg.Has(client.NativeComputerToolName) {
-				executionProfile = nil
-			}
-		case client.ExecutionModeFunctionComputerUse:
-			if !reg.Has("computer_use") {
-				executionProfile = nil
-			}
+	computerUseDispatcherEnabled := reg.Has("computer_use")
+	// There is exactly one model-visible desktop surface. The low-level
+	// computer_use core and native computer marker live only in computerReg;
+	// legacy GUI tools cannot compete with the dispatcher.
+	reg.Remove("computer_use")
+	reg.Remove(client.NativeComputerToolName)
+	reg.Remove("accessibility")
+	reg.Remove("applescript")
+	if raw, ok := reg.Get("bash"); ok {
+		if bash, ok := raw.(*tools.BashTool); ok {
+			bash.LegacyGUIAutomationDisabled = true
 		}
 	}
-	executionProfile, openAIComputerPrivate =
-		retainDaemonOpenAIComputerPrivateRuntimeV1(
-			reg,
-			executionProfile,
-			openAIComputerPrivate,
-		)
+	if openAIComputerPrivate == nil || computerReg == nil ||
+		!computerReg.Has(client.NativeComputerToolName) {
+		computerUseDispatcherEnabled = false
+	}
 
 	// Attach SecretsStore to the session-scoped bash tool so use_skill
 	// activations can expose skill secrets as child-process env vars.
@@ -2940,6 +2897,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	guiWorkflow.riskBroker = deps.ConsequentialRiskBroker
 	var openAIComputerRuntime *tools.OpenAIComputerActionRuntimeV1
 	var openAIComputerApprovalTool agent.Tool
+	childComputerTools := agent.NewToolRegistry()
 	if openAIComputerPrivate != nil {
 		openAIComputerRuntime = openAIComputerPrivate.runtime
 		openAIComputerApprovalTool, err = wrapDetachedDaemonGUIToolV1(
@@ -2952,21 +2910,48 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				err,
 			)
 		}
+		if marker, ok := computerReg.Get(client.NativeComputerToolName); ok {
+			childComputerTools.Register(marker)
+		} else {
+			return nil, fmt.Errorf("OpenAI computer child marker is unavailable")
+		}
 	}
 	wrapDaemonGUITools(reg, guiWorkflow)
+	if computerUseDispatcherEnabled {
+		resolveProfile := func(
+			taskCtx context.Context,
+		) (*client.ExecutionProfile, error) {
+			return resolveOpenAIComputerProfileForTask(
+				taskCtx,
+				deps.GW,
+				modelIntent.ModelTier,
+			)
+		}
+		reg.Register(&openAIComputerTaskToolV1{
+			gateway:        deps.GW,
+			resolveProfile: resolveProfile,
+			childTools:     childComputerTools,
+			workflow:       guiWorkflow,
+			runtime:        openAIComputerRuntime,
+			approvalTool:   openAIComputerApprovalTool,
+			appPolicy:      guiWorkflow.appPolicy,
+			handler:        handler,
+			modelTier:      "large",
+			shannonDir:     deps.ShannonDir,
+			maxIter:        runCfg.Agent.MaxIterations,
+			maxTokens:      runCfg.Agent.MaxTokens,
+			resultTrunc:    runCfg.Tools.ResultTruncation,
+			argsTrunc:      runCfg.Tools.ArgsTruncation,
+			permissions:    &runCfg.Permissions,
+			auditor:        deps.Auditor,
+			hookRunner:     deps.HookRunner,
+		})
+	}
 	defer guiWorkflow.EndTurn()
 
 	loop := agent.NewAgentLoop(deps.GW, reg, runCfg.ModelTier, deps.ShannonDir,
 		runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation,
 		&runCfg.Permissions, deps.Auditor, deps.HookRunner)
-	if err := installDaemonOpenAIComputerBatchRunnerV1(
-		loop,
-		guiWorkflow,
-		openAIComputerRuntime,
-		openAIComputerApprovalTool,
-	); err != nil {
-		return nil, fmt.Errorf("install OpenAI computer batch runner: %w", err)
-	}
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
 	// Browser/GUI context trimming (config-gated; defaults ON via viper).
@@ -3086,12 +3071,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)
 	if req.ModelOverride != "" {
 		loop.SetModelTier(req.ModelOverride)
-	}
-	if executionProfile != nil {
-		// Resolve turns a routing tier into one exact identity. Apply this last
-		// so the request model and run-local tool contract cannot diverge.
-		loop.SetSpecificModel(executionProfile.Model())
-		loop.SetExecutionProfile(executionProfile)
 	}
 	// Inject session metadata as sticky context so it survives compaction.
 	// imBindings is a best-effort Cloud probe: failures degrade silently so

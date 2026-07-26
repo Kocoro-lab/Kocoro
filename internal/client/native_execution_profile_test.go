@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -77,6 +78,40 @@ func TestResolveExecutionProfileRejectsResponseLargerThan64KiBBeforeDecode(t *te
 	requireExecutionProfileErrorCode(t, err, ExecutionProfileInvalid)
 	if !strings.Contains(err.Error(), "exceeds 65536 byte limit") {
 		t.Fatalf("oversized resolve error = %v, want explicit size rejection before JSON decode", err)
+	}
+}
+
+func TestResolveExecutionProfileSendsRequiredOpenAIComputerContract(t *testing.T) {
+	var body []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(loadExecutionProfileFixture(t, "profile.openai-native.json"))
+	}))
+	defer server.Close()
+
+	profile, err := NewGatewayClient(server.URL, "").ResolveExecutionProfile(
+		context.Background(),
+		ResolveExecutionProfileRequest{
+			SchemaVersion:        ExecutionProfileSchemaVersion,
+			ModelTier:            "medium",
+			Capability:           ExecutionProfileCapabilityComputer,
+			RequiredToolContract: ToolContractOpenAIComputerV1,
+			AllowModelFallback:   true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("ResolveExecutionProfile: %v", err)
+	}
+	if profile.ToolContract() != ToolContractOpenAIComputerV1 {
+		t.Fatalf("resolved contract = %q", profile.ToolContract())
+	}
+	if !bytes.Contains(body, []byte(`"required_tool_contract":"openai.computer.v1"`)) {
+		t.Fatalf("resolve body = %s", body)
 	}
 }
 
