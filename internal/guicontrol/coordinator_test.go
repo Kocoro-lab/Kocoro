@@ -1122,7 +1122,7 @@ func TestMutationAdmissionRequiresFrozenAllowedTarget(t *testing.T) {
 	}
 }
 
-func TestEmptyWorkflowLeaseBindsOnlyOnFirstResolvedObservation(t *testing.T) {
+func TestWorkflowLeaseAdmitsEachResolvedObservationForLaterMutation(t *testing.T) {
 	coordinator, _ := newCoordinatorFixture(t, nil)
 	request := workflowRequest("turn-late-bind")
 	request.RequestedAppBundleID = ""
@@ -1197,13 +1197,72 @@ func TestEmptyWorkflowLeaseBindsOnlyOnFirstResolvedObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = coordinator.BeginAction(context.Background(), ActionRequest{
+	bound, err = coordinator.BeginWorkflow(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(bound.AllowedAppBundleIDs, []string{
+		"com.apple.Notes", "com.tinyspeck.slackmacgap",
+	}) {
+		t.Fatalf("observed app targets were not admitted: %+v", bound.AllowedAppBundleIDs)
+	}
+
+	otherMutation, err := coordinator.BeginAction(context.Background(), ActionRequest{
 		LeaseID: lease.LeaseID, TurnID: lease.TurnID, ToolUseID: "toolu-click-slack",
 		ActionKind: "click", Effect: ComputerUseActionMutation,
 		TargetBundleID: "com.tinyspeck.slackmacgap", TargetAppName: "Slack",
 	})
-	if !errors.As(err, &denied) || !strings.Contains(err.Error(), "another app") {
-		t.Fatalf("cross-app mutation error = %T %v; want bound-app policy denial", err, err)
+	if err != nil {
+		t.Fatalf("observed cross-app mutation: %v", err)
+	}
+	if err := coordinator.FinishAction(ActionFinish{
+		LeaseID: lease.LeaseID, ActionID: otherMutation.ActionID, Result: &failed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = coordinator.BeginAction(context.Background(), ActionRequest{
+		LeaseID: lease.LeaseID, TurnID: lease.TurnID, ToolUseID: "toolu-click-mail",
+		ActionKind: "click", Effect: ComputerUseActionMutation,
+		TargetBundleID: "com.apple.mail", TargetAppName: "Mail",
+	})
+	if !errors.As(err, &denied) || !strings.Contains(err.Error(), "not been observed") {
+		t.Fatalf("unobserved cross-app mutation error = %T %v; want observation policy denial", err, err)
+	}
+}
+
+func TestWorkflowLeaseDoesNotAdmitFailedObservation(t *testing.T) {
+	coordinator, _ := newCoordinatorFixture(t, nil)
+	request := workflowRequest("turn-failed-observation")
+	request.RequestedAppBundleID = ""
+	request.RequestedAppName = ""
+	request.AllowedAppBundleIDs = nil
+	lease, err := coordinator.BeginWorkflow(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := coordinator.BeginAction(context.Background(), ActionRequest{
+		LeaseID: lease.LeaseID, TurnID: lease.TurnID, ToolUseID: "toolu-observe-failed",
+		ActionKind: "get_app_state", Effect: ComputerUseActionObservation,
+		TargetBundleID: "com.example.Editor", TargetAppName: "Editor",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := ComputerUseResultFailed
+	if err := coordinator.FinishAction(ActionFinish{
+		LeaseID: lease.LeaseID, ActionID: observation.ActionID, Result: &failed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = coordinator.BeginAction(context.Background(), ActionRequest{
+		LeaseID: lease.LeaseID, TurnID: lease.TurnID, ToolUseID: "toolu-mutate-failed",
+		ActionKind: "click", Effect: ComputerUseActionMutation,
+		TargetBundleID: "com.example.Editor", TargetAppName: "Editor",
+	})
+	var denied *PolicyDeniedError
+	if !errors.As(err, &denied) || !strings.Contains(err.Error(), "observe the running app") {
+		t.Fatalf("failed observation admitted mutation: %T %v", err, err)
 	}
 }
 

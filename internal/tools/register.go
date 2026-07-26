@@ -201,6 +201,7 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 			toolCopy.snapshot = nil
 			toolCopy.refs = nil
 			toolCopy.coordinateArtifact = nil
+			toolCopy.coordinateFocus = nil
 			cloned.Register(wrapGUIExecutionGate(&toolCopy))
 		}
 	}

@@ -79,6 +79,7 @@ const (
 	computerUseCoordinateMaxCaptureNDJSONBytesV1 = 22 * 1024 * 1024
 	computerUseCoordinateMaxCapturePixelsV1      = 16_000_000
 	computerUseCoordinateFrameTTLV1              = CoordinateFrameMaxTTLV1
+	computerUseCoordinateFocusTTLV1              = 30 * time.Second
 	computerUseDefaultDragDurationV1             = 350
 	computerUseMutationDeadlineV1                = 2 * time.Second
 	computerUseDragDeadlineOverheadV1            = 500 * time.Millisecond
@@ -190,6 +191,37 @@ const (
 	computerUseTargetScopeExplicitV1
 )
 
+type computerUseCoordinateFocusV1 struct {
+	stateID                string
+	pid                    int
+	bundleID               string
+	app                    string
+	windowID               uint32
+	expectedWindowAXBounds CoordinateQuartzRectV1
+	expectedPointer        CoordinateMouseEventPointV1
+	filter                 string
+	budget                 int
+	expiresAt              time.Time
+	observedAfterClick     bool
+}
+
+func (focus *computerUseCoordinateFocusV1) matchesTree(
+	tree computerUseTree,
+	now time.Time,
+) bool {
+	if focus == nil || !now.Before(focus.expiresAt) || tree.SchemaVersion != 1 ||
+		tree.PID != focus.pid || tree.BundleID != focus.bundleID ||
+		tree.WindowID == nil || *tree.WindowID <= 0 ||
+		uint64(*tree.WindowID) != uint64(focus.windowID) ||
+		tree.WindowFrame == nil {
+		return false
+	}
+	return focus.expectedWindowAXBounds == (CoordinateQuartzRectV1{
+		X: tree.WindowFrame.X, Y: tree.WindowFrame.Y,
+		Width: tree.WindowFrame.Width, Height: tree.WindowFrame.Height,
+	})
+}
+
 // ComputerUseTool is the provider-neutral macOS GUI tool. It deliberately
 // keeps only one current observation per agent run: refs are meaningful only
 // for that state_id and every ref action re-observes before touching the GUI.
@@ -200,6 +232,7 @@ type ComputerUseTool struct {
 	snapshot                      *computerUseSnapshot
 	refs                          map[string]refEntry
 	coordinateArtifact            *CoordinateWindowArtifactV1
+	coordinateFocus               *computerUseCoordinateFocusV1
 	coordinateExecutor            computerUseCoordinateExecutorV1
 	coordinateDragExecutor        computerUseCoordinateDragExecutorV1
 	coordinatePixelScrollExecutor computerUseCoordinatePixelScrollExecutorV1
@@ -231,7 +264,7 @@ var computerUseGUIOperationMu sync.Mutex
 func (t *ComputerUseTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "computer_use",
-		Description: "Observe and operate one existing macOS app window through a stateful Accessibility-first workflow. " +
+		Description: "Observe and operate existing macOS app windows through a stateful Accessibility-first workflow. " +
 			"Start with get_app_state, or screenshot when a window image is needed, then use its state_id and element refs. Coordinates are valid only for the latest attached target-window image. " +
 			"Prefer select_text for AX text ranges; if AX reports fallback_required, re-observe before deciding whether an explicit drag is appropriate. " +
 			"Pointer actions visibly move the real cursor. Use browser tools for web-page DOM interactions." + agent.DescriptionGuidance,
@@ -242,7 +275,7 @@ func (t *ComputerUseTool) Info() agent.ToolInfo {
 				"description": agent.DescriptionFieldSpec,
 				"state_id":    map[string]any{"type": "string", "description": "Latest state_id from get_app_state; required with ref, keyboard, and coordinate actions"},
 				"app":         map[string]any{"type": "string", "description": "Target running macOS app name. Required on the first observation in unattended runs; an attended Quick Panel run may already bind its original foreground app"},
-				"ref":         map[string]any{"type": "string", "description": "Element ref from the matching state_id; type requires the currently focused ref, while hotkey rejects ref"},
+				"ref":         map[string]any{"type": "string", "description": "Element ref from the matching state_id. Type prefers the focused ref; after one verified left coordinate click, one same-window type may omit ref. Hotkey rejects ref"},
 				"value":       map[string]any{"type": "string", "description": "Value for wait matching"},
 				"x":           map[string]any{"type": "integer", "description": "X pixel index in the latest attached get_app_state image"},
 				"y":           map[string]any{"type": "integer", "description": "Y pixel index in the latest attached get_app_state image"},
@@ -259,7 +292,7 @@ func (t *ComputerUseTool) Info() agent.ToolInfo {
 					},
 					"required": []string{"location", "length"},
 				},
-				"text":               map[string]any{"type": "string", "description": "Text for type; requires latest state_id and its focused ref"},
+				"text":               map[string]any{"type": "string", "description": "Text for type; requires a focused ref or the one-shot focus from a verified coordinate click"},
 				"keys":               map[string]any{"type": "string", "description": "Window-bound hotkey such as command+shift+p; requires latest state_id and no ref"},
 				"button":             map[string]any{"type": "string", "enum": []string{"left", "right", "wheel", "back", "forward"}, "description": "Mouse button: left (default), right, wheel, back, or forward"},
 				"clicks":             map[string]any{"type": "integer", "description": "Click count (default 1)"},
@@ -329,7 +362,8 @@ func (t *ComputerUseTool) IsConcurrencySafeCall(string) bool { return false }
 // A bound Quick Panel target and a prior exact observation are already scoped.
 func (t *ComputerUseTool) requiresExplicitFirstTargetV1(args computerUseArgs) bool {
 	if t == nil || t.targetScope != computerUseTargetScopeExplicitV1 ||
-		strings.TrimSpace(args.App) != "" || t.initialTarget != nil || t.snapshot != nil {
+		strings.TrimSpace(args.App) != "" || t.initialTarget != nil || t.snapshot != nil ||
+		t.coordinateFocus != nil {
 		return false
 	}
 	switch args.Action {
@@ -410,6 +444,10 @@ func (t *ComputerUseTool) runWithGUIOperationLockHeld(
 	}
 	if args.Clicks < 0 || args.Clicks > 3 {
 		return agent.ValidationError("clicks must be between 0 and 3 (0 or omitted means a single click)"), nil
+	}
+	if t.coordinateFocus != nil && args.Action != "type" &&
+		args.Action != "get_app_state" && args.Action != "screenshot" {
+		t.coordinateFocus = nil
 	}
 
 	switch args.Action {
@@ -542,6 +580,8 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 	// artifact is installed only after tree A -> topology -> capture ->
 	// finalizer -> tree B succeeds as one exact-window transaction.
 	t.coordinateArtifact = nil
+	pendingFocus := t.coordinateFocus
+	t.coordinateFocus = nil
 
 	pid := 0
 	var expectedPID int
@@ -551,6 +591,10 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 			pid = t.snapshot.pid
 			expectedPID = t.snapshot.pid
 			expectedBundleID = t.snapshot.bundleID
+		} else if pendingFocus != nil {
+			pid = pendingFocus.pid
+			expectedPID = pendingFocus.pid
+			expectedBundleID = pendingFocus.bundleID
 		} else if t.initialTarget != nil {
 			pid = t.initialTarget.PID
 			expectedPID = t.initialTarget.PID
@@ -583,6 +627,14 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 		), nil
 	}
 	result, stateID := t.publishComputerUseObservation(tree, filter, budget)
+	if pendingFocus != nil && pendingFocus.matchesTree(
+		tree, t.computerUseCoordinateNowV1()) {
+		pendingFocus.stateID = stateID
+		pendingFocus.filter = filter
+		pendingFocus.budget = budget
+		pendingFocus.observedAfterClick = true
+		t.coordinateFocus = pendingFocus
+	}
 	if !args.IncludeScreenshot {
 		return result, nil
 	}
@@ -1394,9 +1446,57 @@ func (t *ComputerUseTool) typeText(ctx context.Context, args computerUseArgs) (a
 		return agent.ValidationError("type requires non-empty 'text'"), nil
 	}
 	if args.Ref == "" {
-		return agent.ValidationError("type requires the focused element 'ref' from the latest state_id"), nil
+		return t.coordinateFocusedType(ctx, args, *args.Text)
 	}
 	return t.targetBoundInput(ctx, args, *args.Text, "", nil)
+}
+
+func (t *ComputerUseTool) coordinateFocusedType(
+	ctx context.Context,
+	args computerUseArgs,
+	text string,
+) (agent.ToolResult, error) {
+	defer t.invalidateState()
+	focus := t.coordinateFocus
+	if focus == nil || args.StateID == "" || args.StateID != focus.stateID ||
+		!t.computerUseCoordinateNowV1().Before(focus.expiresAt) {
+		return computerUseKeyboardTargetUnavailableV1(), nil
+	}
+	current, failure, ok := t.readTree(ctx, focus.pid, focus.filter, focus.budget)
+	if !ok {
+		return failure, nil
+	}
+	if !focus.matchesTree(current, t.computerUseCoordinateNowV1()) ||
+		focus.observedAfterClick && computerUseStateID(current) != args.StateID {
+		return computerUseKeyboardTargetUnavailableV1(), nil
+	}
+	deadline := t.computerUseCoordinateNowV1().Add(time.Second)
+	if focus.expiresAt.Before(deadline) {
+		deadline = focus.expiresAt
+	}
+	request := TargetBoundInputRequestV1{
+		SchemaVersion: 1,
+		PID:           current.PID,
+		BundleID:      current.BundleID,
+		WindowID:      uint32(*current.WindowID),
+		ExpectedWindowAXBounds: CoordinateQuartzRectV1{
+			X: current.WindowFrame.X, Y: current.WindowFrame.Y,
+			Width: current.WindowFrame.Width, Height: current.WindowFrame.Height,
+		},
+		Action:           "type",
+		ExpectedPointer:  &focus.expectedPointer,
+		Text:             &text,
+		CommitDeadlineAt: deadline.UTC().Format(time.RFC3339Nano),
+	}
+	return t.executeTargetBoundInput(ctx, args.Action, request)
+}
+
+func computerUseKeyboardTargetUnavailableV1() agent.ToolResult {
+	return agent.BusinessError(
+		"computer_use_error: keyboard_target_unavailable\n" +
+			"message: no current text target is available from an AX focused ref or one verified coordinate click\n" +
+			"recovery: observe the intended window with a screenshot, click the editor once, then type once; do not retry automatically",
+	)
 }
 
 func (t *ComputerUseTool) hotkey(ctx context.Context, args computerUseArgs) (agent.ToolResult, error) {
@@ -1526,6 +1626,14 @@ func (t *ComputerUseTool) targetBoundInput(
 		request.Keys = &keys
 		request.Modifiers = &modifiers
 	}
+	return t.executeTargetBoundInput(ctx, args.Action, request)
+}
+
+func (t *ComputerUseTool) executeTargetBoundInput(
+	ctx context.Context,
+	action string,
+	request TargetBoundInputRequestV1,
+) (agent.ToolResult, error) {
 	if err := request.Validate(); err != nil {
 		return agent.BusinessError("target-bound input request is invalid; re-observe before retrying"), nil
 	}
@@ -1549,9 +1657,9 @@ func (t *ComputerUseTool) targetBoundInput(
 			}
 			return failure, nil
 		}
-		return computerUseCallError("target-bound "+args.Action, err), nil
+		return computerUseCallError("target-bound "+action, err), nil
 	}
-	if err := result.ValidateTaggedUnion(); err != nil || result.Action != args.Action {
+	if err := result.ValidateTaggedUnion(); err != nil || result.Action != action {
 		failure := agent.BusinessError(
 			"invalid target-bound input acknowledgement; do not retry automatically; re-observe the app")
 		failure.GUIOutcome = &agent.GUIActionOutcome{
@@ -1569,20 +1677,20 @@ func (t *ComputerUseTool) targetBoundInput(
 	}
 	if result.Status == "completed_unverified" {
 		return agent.ToolResult{
-			Content: "target-bound " + args.Action +
+			Content: "target-bound " + action +
 				" completed_unverified; input content is redacted; do not retry automatically; re-observe the app",
 			GUIOutcome: outcome,
 		}, nil
 	}
 	if result.Status == "user_interference" {
 		failure := agent.BusinessError(
-			"target-bound " + args.Action + " stopped after user interference: " +
+			"target-bound " + action + " stopped after user interference: " +
 				*result.FailureCode + "; input content is redacted; do not retry automatically; re-observe the app")
 		failure.GUIOutcome = outcome
 		return failure, nil
 	}
-	failure = agent.BusinessError(
-		"target-bound " + args.Action + " failed before input commit: " +
+	failure := agent.BusinessError(
+		"target-bound " + action + " failed before input commit: " +
 			*result.FailureCode + "; input content is redacted; re-observe the app")
 	failure.GUIOutcome = outcome
 	return failure, nil
@@ -2245,7 +2353,8 @@ func (t *ComputerUseTool) coordinatePointerActionV1(
 ) (agent.ToolResult, error) {
 	// A coordinate attempt consumes both the AX snapshot and its exact image,
 	// including validation, freshness, transport, and helper failures.
-	defer t.invalidateState()
+	t.coordinateFocus = nil
+	defer t.invalidateObservationState()
 
 	if args.X == nil || args.Y == nil {
 		return agent.ValidationError(args.Action + " requires x+y coordinates"), nil
@@ -2439,6 +2548,35 @@ func (t *ComputerUseTool) coordinatePointerActionV1(
 			"coordinate %s completed at verified target; re-observe before the next action",
 			args.Action), GUIOutcome: computerUseCoordinateGUIOutcomeV1(request, result)}, nil
 	case "completed_unverified":
+		if args.Action == "click" && request.Button != nil && *request.Button == "left" &&
+			request.ClickCount != nil && *request.ClickCount == 1 &&
+			len(request.Modifiers) == 0 && request.RiskAssertion == nil &&
+			result.PrimaryActionCommitted && result.PointerEndpoint != nil &&
+			result.PointerEndpoint.Verified && result.PointerEndpoint.Observed != nil &&
+			result.FailureCode != nil &&
+			*result.FailureCode == "click_postcondition_not_declared" &&
+			currentTree.WindowFrame != nil {
+			app := strings.TrimSpace(currentTree.AppName)
+			if app == "" {
+				app = strings.TrimSpace(currentTree.App)
+			}
+			t.coordinateFocus = &computerUseCoordinateFocusV1{
+				stateID: args.StateID, pid: currentTree.PID,
+				bundleID: currentTree.BundleID, app: app,
+				windowID: uint32(*currentTree.WindowID),
+				expectedWindowAXBounds: CoordinateQuartzRectV1{
+					X: currentTree.WindowFrame.X, Y: currentTree.WindowFrame.Y,
+					Width: currentTree.WindowFrame.Width, Height: currentTree.WindowFrame.Height,
+				},
+				expectedPointer: *result.PointerEndpoint.Observed,
+				filter:          t.snapshot.filter, budget: t.snapshot.budget,
+				expiresAt: now.Add(computerUseCoordinateFocusTTLV1),
+			}
+			return agent.ToolResult{Content: "coordinate click completed_unverified at the verified pointer; " +
+				"if this click focused a text editor, type may use this state_id once without a ref; " +
+				"otherwise re-observe before the next action; do not retry the click automatically",
+				GUIOutcome: computerUseCoordinateGUIOutcomeV1(request, result)}, nil
+		}
 		return agent.ToolResult{Content: fmt.Sprintf(
 			"coordinate %s completed_unverified: %s; do not retry automatically; re-observe the app",
 			args.Action, *result.FailureCode), GUIOutcome: computerUseCoordinateGUIOutcomeV1(request, result)}, nil
@@ -2574,10 +2712,15 @@ func (t *ComputerUseTool) screenshot(ctx context.Context, args computerUseArgs) 
 	return t.getAppState(ctx, args)
 }
 
-func (t *ComputerUseTool) invalidateState() {
+func (t *ComputerUseTool) invalidateObservationState() {
 	t.snapshot = nil
 	t.refs = nil
 	t.coordinateArtifact = nil
+}
+
+func (t *ComputerUseTool) invalidateState() {
+	t.invalidateObservationState()
+	t.coordinateFocus = nil
 }
 
 func computerUseActionMessage(raw json.RawMessage, fallback string) string {

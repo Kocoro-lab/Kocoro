@@ -52,6 +52,14 @@ func newDaemonGUIWorkflow(coordinator *guicontrol.Coordinator, request daemonGUI
 }
 
 func (w *daemonGUIWorkflow) ensureLease(ctx context.Context, descriptor agent.GUIActionDescriptor) (guicontrol.WorkflowLease, error) {
+	return w.ensureLeaseWithObservedTarget(ctx, descriptor, false)
+}
+
+func (w *daemonGUIWorkflow) ensureLeaseWithObservedTarget(
+	ctx context.Context,
+	descriptor agent.GUIActionDescriptor,
+	observedTarget bool,
+) (guicontrol.WorkflowLease, error) {
 	w.mu.Lock()
 	if w.lease != nil {
 		lease := *w.lease
@@ -63,7 +71,12 @@ func (w *daemonGUIWorkflow) ensureLease(ctx context.Context, descriptor agent.GU
 		return guicontrol.WorkflowLease{}, fmt.Errorf("computer-use coordinator is unavailable")
 	}
 	allowed := []string(nil)
-	if descriptor.TargetBundleID != "" {
+	if (observedTarget || descriptor.Effect == agent.GUIActionMutation) &&
+		descriptor.TargetBundleID != "" {
+		// A first mutation carries its own exact execution authority. The
+		// separate observedTarget path is reserved for provider-native bootstrap
+		// state already shown to the model. Ordinary observations earn admission
+		// only after their successful acknowledgement.
 		allowed = []string{descriptor.TargetBundleID}
 	}
 	lease, err := w.coordinator.BeginWorkflow(guicontrol.WorkflowRequest{
@@ -132,7 +145,13 @@ func (w *daemonGUIWorkflow) runTool(ctx context.Context, tool agent.Tool, argsJS
 			return agent.BusinessError("computer_use launch_app cannot safely resolve the target bundle before launch; launch the app manually first, then observe it before continuing"), nil
 		}
 		switch descriptor.ActionKind {
-		case "type", "hotkey", "scroll":
+		case "type":
+			return agent.BusinessError(
+				"computer_use_error: keyboard_target_unavailable\n" +
+					"message: no current text target is available from an AX focused ref or one verified coordinate click\n" +
+					"recovery: observe the intended window with a screenshot, click the editor once, then type once; do not retry automatically",
+			), nil
+		case "hotkey", "scroll":
 			return agent.BusinessError("computer-use target-bound execution is unavailable for " + descriptor.ActionKind + "; use an accessibility action tied to an observed element"), nil
 		}
 	}

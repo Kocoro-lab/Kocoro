@@ -452,6 +452,7 @@ func TestComputerUse_RegisteredAndClonedPerRun(t *testing.T) {
 	base.snapshot = &computerUseSnapshot{id: "base-state"}
 	base.refs = map[string]refEntry{"e1": {path: "window[0]", pid: 1}}
 	base.coordinateArtifact = &CoordinateWindowArtifactV1{}
+	base.coordinateFocus = &computerUseCoordinateFocusV1{stateID: "base-state"}
 
 	cloned := CloneWithRuntimeConfig(reg, &config.Config{})
 	cloneRaw, ok := cloned.Get("computer_use")
@@ -477,8 +478,10 @@ func TestComputerUse_RegisteredAndClonedPerRun(t *testing.T) {
 	if clone.semanticPressExecutor == nil {
 		t.Fatal("per-run clone lost the typed semantic press executor")
 	}
-	if clone.snapshot != nil || clone.refs != nil || clone.coordinateArtifact != nil {
-		t.Fatalf("per-run clone inherited state: snapshot=%+v refs=%+v artifact=%+v", clone.snapshot, clone.refs, clone.coordinateArtifact)
+	if clone.snapshot != nil || clone.refs != nil || clone.coordinateArtifact != nil ||
+		clone.coordinateFocus != nil {
+		t.Fatalf("per-run clone inherited state: snapshot=%+v refs=%+v artifact=%+v focus=%+v",
+			clone.snapshot, clone.refs, clone.coordinateArtifact, clone.coordinateFocus)
 	}
 
 	baseAXRaw, _ := reg.Get("accessibility")

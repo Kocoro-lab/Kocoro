@@ -790,12 +790,63 @@ func TestDaemonGUIWorkflowEndTurnReleasesLease(t *testing.T) {
 	next.EndTurn()
 }
 
-func TestDaemonGUIWorkflowDeniesCrossAppMutationAfterFrozenFirstTarget(t *testing.T) {
+func TestDaemonGUIWorkflowAllowsMutationAfterCrossAppObservation(t *testing.T) {
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{
 		RequireControllerHeartbeat: true,
 		LeaseTTL:                   5 * time.Second,
 	})
 	workflow := testGUIWorkflow(coordinator, "sess-cross-app", "turn-cross-app")
+	observe := &guiProbeTool{
+		name: "computer_use",
+		descriptor: agent.GUIActionDescriptor{
+			Participates: true, ActionKind: "get_app_state", Effect: agent.GUIActionObservation,
+			TargetBundleID: "com.example.Notes", TargetAppName: "Notes",
+		},
+	}
+	observed := make(chan agent.ToolResult, 1)
+	go func() {
+		result, _ := workflow.runTool(context.Background(), observe, `{}`)
+		observed <- result
+	}()
+	acknowledgeController(t, coordinator)
+	if result := <-observed; result.IsError {
+		t.Fatalf("initial observation=%+v", result)
+	}
+	observeOther := &guiProbeTool{
+		name: "computer_use",
+		descriptor: agent.GUIActionDescriptor{
+			Participates: true, ActionKind: "get_app_state", Effect: agent.GUIActionObservation,
+			TargetBundleID: "com.example.Slack", TargetAppName: "Slack",
+		},
+	}
+	result, err := workflow.runTool(context.Background(), observeOther, `{}`)
+	if err != nil || result.IsError {
+		t.Fatalf("cross-app observation result=%+v err=%v", result, err)
+	}
+
+	mutate := &guiProbeTool{
+		name: "accessibility",
+		descriptor: agent.GUIActionDescriptor{
+			Participates: true, ActionKind: "press", Effect: agent.GUIActionMutation,
+			TargetBundleID: "com.example.Slack", TargetAppName: "Slack",
+		},
+	}
+	result, err = workflow.runTool(context.Background(), mutate, `{}`)
+	if err != nil || result.IsError {
+		t.Fatalf("cross-app mutation result=%+v err=%v", result, err)
+	}
+	if mutate.calls != 1 {
+		t.Fatalf("observed cross-app mutation calls=%d want 1", mutate.calls)
+	}
+	workflow.EndTurn()
+}
+
+func TestDaemonGUIWorkflowDeniesUnobservedCrossAppMutation(t *testing.T) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{
+		RequireControllerHeartbeat: true,
+		LeaseTTL:                   5 * time.Second,
+	})
+	workflow := testGUIWorkflow(coordinator, "sess-cross-app-denied", "turn-cross-app-denied")
 	observe := &guiProbeTool{
 		name: "computer_use",
 		descriptor: agent.GUIActionDescriptor{
@@ -821,11 +872,11 @@ func TestDaemonGUIWorkflowDeniesCrossAppMutationAfterFrozenFirstTarget(t *testin
 	}
 	result, err := workflow.runTool(context.Background(), mutate, `{}`)
 	if err != nil || !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness ||
-		!strings.Contains(result.Content, "bound to another app") {
-		t.Fatalf("cross-app mutation result=%+v err=%v", result, err)
+		!strings.Contains(result.Content, "not been observed") {
+		t.Fatalf("unobserved cross-app mutation result=%+v err=%v", result, err)
 	}
 	if mutate.calls != 0 {
-		t.Fatalf("cross-app mutation reached legacy tool: calls=%d", mutate.calls)
+		t.Fatalf("unobserved cross-app mutation reached tool: calls=%d", mutate.calls)
 	}
 	workflow.EndTurn()
 }
@@ -1226,9 +1277,16 @@ func TestDaemonGUIWorkflowUntargetedGlobalInputFailsBeforeExecution(t *testing.T
 				},
 			}
 			result, err := workflow.runTool(context.Background(), tool, `{}`)
+			wantMessage := "target-bound execution is unavailable"
+			if action == "type" {
+				wantMessage = "keyboard_target_unavailable"
+			}
 			if err != nil || !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness ||
-				!strings.Contains(result.Content, "target-bound execution is unavailable") || tool.calls != 0 {
+				!strings.Contains(result.Content, wantMessage) || tool.calls != 0 {
 				t.Fatalf("result=%+v err=%v calls=%d", result, err, tool.calls)
+			}
+			if action == "type" && !strings.Contains(result.Content, "do not retry automatically") {
+				t.Fatalf("untargeted type invited a retry: %+v", result)
 			}
 			if active := coordinator.Snapshot().Active; active != nil {
 				t.Fatalf("untargeted %s acquired a lease: %+v", action, active)

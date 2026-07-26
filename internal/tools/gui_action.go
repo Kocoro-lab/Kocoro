@@ -142,6 +142,13 @@ func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string
 	if t.snapshot != nil {
 		target = guiAXTarget{BundleID: t.snapshot.bundleID, AppName: t.snapshot.app}
 		pid = t.snapshot.pid
+	} else if t.coordinateFocus != nil &&
+		t.computerUseCoordinateNowV1().Before(t.coordinateFocus.expiresAt) {
+		target = guiAXTarget{
+			BundleID: t.coordinateFocus.bundleID,
+			AppName:  t.coordinateFocus.app,
+		}
+		pid = t.coordinateFocus.pid
 	} else if args.App == "" && t.initialTarget != nil {
 		pid = t.initialTarget.PID
 		usesInitialTarget = true
@@ -175,15 +182,25 @@ func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string
 	// Tool.Run can enforce that same state + unique window through the dedicated
 	// strict RPC immediately before event commit.
 	targetBoundInputInvalid := false
-	if args.Action == "type" || args.Action == "hotkey" || args.Action == "keypress" {
+	if args.Action == "hotkey" || args.Action == "keypress" {
 		targetBoundInputInvalid = t.snapshot == nil || args.StateID == "" ||
 			args.StateID != t.snapshot.id || t.snapshot.bundleID == "" ||
 			t.snapshot.windowID == nil || *t.snapshot.windowID <= 0
 	}
 	if args.Action == "type" {
-		entry, exists := t.refs[args.Ref]
-		targetBoundInputInvalid = targetBoundInputInvalid || args.Ref == "" || !exists ||
-			entry.path == "" || entry.role == "" || entry.fingerprint == ""
+		if args.Ref == "" {
+			focus := t.coordinateFocus
+			targetBoundInputInvalid = focus == nil || args.StateID == "" ||
+				focus != nil && (args.StateID != focus.stateID ||
+					!t.computerUseCoordinateNowV1().Before(focus.expiresAt))
+		} else {
+			entry, exists := t.refs[args.Ref]
+			targetBoundInputInvalid = t.snapshot == nil || args.StateID == "" ||
+				args.StateID != t.snapshot.id || t.snapshot.bundleID == "" ||
+				t.snapshot.windowID == nil || *t.snapshot.windowID <= 0 ||
+				!exists || entry.path == "" || entry.role == "" ||
+				entry.fingerprint == ""
+		}
 	}
 	if args.Action == "hotkey" && args.Ref != "" {
 		targetBoundInputInvalid = true
@@ -231,6 +248,17 @@ func (t *ComputerUseTool) RestoreGUIActionTargetV1(
 	}
 	if !descriptor.Participates || descriptor.Effect != agent.GUIActionMutation {
 		return fmt.Errorf("computer-use target restore requires an admitted mutation")
+	}
+	if descriptor.ActionKind == "type" && t != nil && t.coordinateFocus != nil &&
+		t.computerUseCoordinateNowV1().Before(t.coordinateFocus.expiresAt) {
+		if descriptor.TargetBundleID == t.coordinateFocus.bundleID &&
+			descriptor.TargetAppName == t.coordinateFocus.app {
+			// A coordinate-focused type must use the focus left by the verified
+			// click. Do not reactivate the app here; the helper will fail closed
+			// unless that exact process/window/pointer authority is still live.
+			return nil
+		}
+		return fmt.Errorf("computer-use coordinate focus does not match the admitted target")
 	}
 	if t == nil || t.client == nil || t.snapshot == nil {
 		return fmt.Errorf("computer-use target restore has no observed target")

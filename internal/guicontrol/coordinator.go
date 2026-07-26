@@ -107,6 +107,8 @@ type actionRecord struct {
 	effect                  ComputerUseActionEffect
 	toolName                string
 	actionKind              string
+	targetBundleID          string
+	targetAppName           string
 	cancel                  context.CancelFunc
 	executionAuthority      *executionAuthority
 	cancellationResult      *ComputerUseActionResult
@@ -497,19 +499,6 @@ func (c *Coordinator) BeginAction(parent context.Context, request ActionRequest)
 		c.mu.Unlock()
 		return ActionHandle{}, &PolicyDeniedError{LeaseID: request.LeaseID, Reason: "consequential-risk confirmation was not staged"}
 	}
-	// A workflow may begin with an observation whose requested app is not
-	// running yet, so its lease has no exact bundle to admit. Keep that lease
-	// and the process-wide GUI serialization, but bind its one mutation target
-	// when the first later observation resolves an exact bundle. Mutations can
-	// never create or widen this authority, and an already-bound workflow stays
-	// pinned to its original app.
-	if request.Effect == ComputerUseActionObservation &&
-		request.TargetBundleID != "" &&
-		len(c.active.lease.AllowedAppBundleIDs) == 0 {
-		c.active.lease.RequestedAppBundleID = request.TargetBundleID
-		c.active.lease.RequestedAppName = request.TargetAppName
-		c.active.lease.AllowedAppBundleIDs = []string{request.TargetBundleID}
-	}
 	if request.Effect == ComputerUseActionMutation && c.active.requiresObservation {
 		c.mu.Unlock()
 		return ActionHandle{}, &ReobservationRequiredError{LeaseID: request.LeaseID}
@@ -526,7 +515,9 @@ func (c *Coordinator) BeginAction(parent context.Context, request ActionRequest)
 	executionAuthority := newExecutionAuthority(request, actionID)
 	c.active.currentAction = &actionRecord{
 		id: actionID, effect: request.Effect, toolName: request.ToolName,
-		actionKind: request.ActionKind, cancel: cancel, executionAuthority: executionAuthority,
+		actionKind:     request.ActionKind,
+		targetBundleID: request.TargetBundleID, targetAppName: request.TargetAppName,
+		cancel: cancel, executionAuthority: executionAuthority,
 	}
 	state := &c.active.activity
 	state.ActionID = actionID
@@ -676,7 +667,7 @@ func (c *Coordinator) enforceAllowedTargetLocked(request ActionRequest) error {
 			return nil
 		}
 	}
-	return deny("this workflow is bound to another app; start a new turn to control a different app")
+	return deny("this app has not been observed in the current workflow; observe the running app before attempting a mutation")
 }
 
 func (c *Coordinator) FinishAction(finish ActionFinish) error {
@@ -734,6 +725,25 @@ func (c *Coordinator) FinishAction(finish ActionFinish) error {
 		// stale-state barrier across later Pause/Resume; only an exact verified
 		// computer_use get_app_state may clear it below.
 		c.active.requiresObservation = true
+	}
+	if action.effect == ComputerUseActionObservation &&
+		finish.Result != nil && *finish.Result == ComputerUseResultVerified &&
+		action.targetBundleID != "" {
+		if c.active.lease.RequestedAppBundleID == "" {
+			c.active.lease.RequestedAppBundleID = action.targetBundleID
+			c.active.lease.RequestedAppName = action.targetAppName
+		}
+		alreadyAllowed := false
+		for _, allowed := range c.active.lease.AllowedAppBundleIDs {
+			if action.targetBundleID == allowed {
+				alreadyAllowed = true
+				break
+			}
+		}
+		if !alreadyAllowed {
+			c.active.lease.AllowedAppBundleIDs = append(
+				c.active.lease.AllowedAppBundleIDs, action.targetBundleID)
+		}
 	}
 	if terminal {
 		state.LeaseState = ComputerUseLeaseTerminal

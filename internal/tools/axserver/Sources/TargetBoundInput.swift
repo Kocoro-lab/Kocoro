@@ -14,6 +14,7 @@ struct TargetBoundInputRequestV1: Equatable, Decodable {
     let path: String?
     let expectedRole: String?
     let expectedFingerprint: String?
+    let expectedPointer: CoordinateMouseEventPointV1?
     let text: String?
     let key: String?
     let keys: [String]?
@@ -27,7 +28,8 @@ struct TargetBoundInputRequestV1: Equatable, Decodable {
             exactly: [
                 "schema_version", "pid", "bundle_id", "window_id",
                 "expected_window_ax_bounds", "action", "ref", "path",
-                "expected_role", "expected_fingerprint", "text", "key",
+                "expected_role", "expected_fingerprint", "expected_pointer",
+                "text", "key",
                 "keys", "modifiers", "commit_deadline_at",
             ],
             field: "target_bound_input.params")
@@ -45,6 +47,9 @@ struct TargetBoundInputRequestV1: Equatable, Decodable {
             String.self, forKey: strictMutationKey("expected_role"))
         expectedFingerprint = try container.decodeIfPresent(
             String.self, forKey: strictMutationKey("expected_fingerprint"))
+        expectedPointer = try container.decodeIfPresent(
+            CoordinateMouseEventPointV1.self,
+            forKey: strictMutationKey("expected_pointer"))
         text = try container.decodeIfPresent(String.self, forKey: strictMutationKey("text"))
         key = try container.decodeIfPresent(String.self, forKey: strictMutationKey("key"))
         keys = try container.decodeIfPresent(
@@ -67,19 +72,29 @@ struct TargetBoundInputRequestV1: Equatable, Decodable {
         }
         switch action {
         case "type":
-            guard let ref, strictMutationIdentity(ref), ref.count > 1,
-                  ref.first == "e", ref.dropFirst().allSatisfy(\.isNumber),
-                  let path, strictMutationIdentity(path),
-                  path == "window[0]" || path.hasPrefix("window[0]/"),
-                  let expectedRole, strictMutationIdentity(expectedRole),
-                  let expectedFingerprint, strictMutationIdentity(expectedFingerprint),
+            let elementBound =
+                ref.map {
+                    strictMutationIdentity($0) && $0.count > 1 &&
+                        $0.first == "e" && $0.dropFirst().allSatisfy(\.isNumber)
+                } == true &&
+                path.map {
+                    strictMutationIdentity($0) &&
+                        ($0 == "window[0]" || $0.hasPrefix("window[0]/"))
+                } == true &&
+                expectedRole.map(strictMutationIdentity) == true &&
+                expectedFingerprint.map(strictMutationIdentity) == true &&
+                expectedPointer == nil
+            let windowBound =
+                ref == nil && path == nil && expectedRole == nil &&
+                expectedFingerprint == nil && expectedPointer != nil
+            guard elementBound || windowBound,
                   let text, !text.isEmpty, key == nil, keys == nil,
                   modifiers == nil else {
                 throw StrictMutationWireError.invalid("invalid target_bound_input type tuple")
             }
         case "hotkey":
             guard ref == nil, path == nil, expectedRole == nil,
-                  expectedFingerprint == nil, text == nil,
+                  expectedFingerprint == nil, expectedPointer == nil, text == nil,
                   let key, strictMutationIdentity(key),
                   keys == nil, let modifiers else {
                 throw StrictMutationWireError.invalid("invalid target_bound_input hotkey tuple")
@@ -89,7 +104,8 @@ struct TargetBoundInputRequestV1: Equatable, Decodable {
             }
         case "keypress":
             guard ref == nil, path == nil, expectedRole == nil,
-                  expectedFingerprint == nil, text == nil, key == nil,
+                  expectedFingerprint == nil, expectedPointer == nil,
+                  text == nil, key == nil,
                   let keys, (1...64).contains(keys.count),
                   keys.allSatisfy(strictInputKeyV1),
                   let modifiers, strictInputModifiersV1(modifiers) else {
@@ -549,7 +565,8 @@ func runTargetBoundInput(
         return targetBoundInputFailure(request, code: "input_recovery_blocked")
     }
     if let initialFailure = dependencies.authorityFailure(request) {
-        guard targetBoundInputRestorableFocusFailuresV1.contains(initialFailure),
+        guard request.expectedPointer == nil,
+              targetBoundInputRestorableFocusFailuresV1.contains(initialFailure),
               dependencies.restoreAuthority(request, initialFailure) else {
             return targetBoundInputFailure(request, code: initialFailure)
         }
@@ -564,7 +581,7 @@ func runTargetBoundInput(
     if assessPhysicalInputInterferenceV1(
         baseline: initialPhysicalInput,
         current: initialPhysicalInput,
-        expectedPointer: nil
+        expectedPointer: request.expectedPointer
     ) == .interference {
         return targetBoundInputUserInterference(request, inputCommitted: false)
     }
@@ -1009,7 +1026,7 @@ private func productionTargetBoundInputAuthorityFailure(
     guard targetBoundInputFrontmostNormalWindowID(pid: request.pid) == request.windowID else {
         return "frontmost_window_mismatch"
     }
-    if request.action == "type" {
+    if request.action == "type", request.expectedPointer == nil {
         guard let path = request.path,
               let target = resolveElement(in: focusedWindow, path: path) else {
             return "path_not_found"
@@ -1203,6 +1220,7 @@ private func targetBoundInputVerificationTarget(
     _ request: TargetBoundInputRequestV1
 ) -> AXUIElement? {
     guard request.action == "type",
+          request.expectedPointer == nil,
           let path = request.path,
           let processID = pid_t(exactly: request.pid),
           let window = targetBoundInputFocusedAXWindow(
@@ -1253,6 +1271,9 @@ private func productionTargetBoundTypeVerification(
     request: TargetBoundInputRequestV1,
     text: String
 ) -> TargetBoundTypeVerificationPreparationV1 {
+    if request.expectedPointer != nil {
+        return .unavailable(failureCode: "postcondition_not_declared")
+    }
     guard let target = targetBoundInputVerificationTarget(request) else {
         return .failed(failureCode: "focused_element_mismatch")
     }

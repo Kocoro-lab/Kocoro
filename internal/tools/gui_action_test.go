@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
@@ -119,6 +120,30 @@ func TestComputerUseTargetBoundInputDescriptorsUseExactObservedBundle(t *testing
 				t.Fatalf("descriptor=%+v", descriptor)
 			}
 		})
+	}
+}
+
+func TestComputerUseCoordinateFocusedTypeDescriptorUsesClickBoundTarget(t *testing.T) {
+	now := time.Date(2026, 7, 26, 14, 30, 0, 0, time.UTC)
+	tool := &ComputerUseTool{
+		client:        &guiTargetFixtureClient{bundleID: "com.example.other", appName: "Other"},
+		coordinateNow: func() time.Time { return now },
+		coordinateFocus: &computerUseCoordinateFocusV1{
+			stateID: "s_clicked", pid: 42,
+			bundleID: "com.tinyspeck.slackmacgap", app: "Slack",
+			windowID: 7001, expiresAt: now.Add(time.Second),
+		},
+	}
+	descriptor, err := tool.DescribeGUIAction(context.Background(),
+		`{"action":"type","state_id":"s_clicked","text":"redacted","description":"type"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if descriptor.Effect != agent.GUIActionMutation ||
+		descriptor.TargetBundleID != "com.tinyspeck.slackmacgap" ||
+		descriptor.TargetAppName != "Slack" ||
+		descriptor.ExecutionPath != "accessibility" {
+		t.Fatalf("descriptor=%+v", descriptor)
 	}
 }
 

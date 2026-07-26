@@ -280,6 +280,9 @@ func TestComputerUseCoordinateClickMapsCurrentArtifactAndConsumesIt(t *testing.T
 	if harness.tool.snapshot != nil || harness.tool.refs != nil || harness.tool.coordinateArtifact != nil {
 		t.Fatal("coordinate attempt did not consume snapshot/artifact")
 	}
+	if harness.tool.coordinateFocus != nil {
+		t.Fatal("right/double click minted keyboard focus authority")
+	}
 	if got := fakeAXMethods(harness.fake.calls[len(harness.fake.calls)-2:]); !reflect.DeepEqual(got, []string{"read_tree", "display_topology"}) {
 		t.Fatalf("coordinate preflight calls = %v", got)
 	}
@@ -287,6 +290,192 @@ func TestComputerUseCoordinateClickMapsCurrentArtifactAndConsumesIt(t *testing.T
 		if call.method == "mouse_event" {
 			t.Fatal("coordinate path delegated to legacy mouse_event")
 		}
+	}
+}
+
+func TestComputerUseVerifiedCoordinateClickAllowsOneWindowBoundTypeWithoutAXRef(t *testing.T) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.observe(t)
+	stateID := harness.tool.snapshot.id
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	harness.fake.queue("display_topology", marshalDisplayTopology(t, harness.topology))
+	harness.tool.coordinateExecutor = func(
+		_ context.Context, request CoordinateMouseEventRequestV1,
+	) (CoordinateMouseEventResultV1, error) {
+		failure := "click_postcondition_not_declared"
+		return CoordinateMouseEventResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: "click",
+			PrimaryActionCommitted: true, PointerMotionCommitted: true,
+			Phase: "post_verification", FailureCode: &failure,
+			PointerEndpoint: &CoordinateMouseEventPointerEndpointV1{
+				Requested: request.QuartzPoint, Observed: &request.QuartzPoint,
+				Tolerance: coordinateMouseEndpointToleranceV1, Verified: true,
+			},
+		}, nil
+	}
+	clicked, err := harness.tool.Run(context.Background(), fmt.Sprintf(`{
+		"action":"click","state_id":%q,"x":0,"y":0,
+		"description":"Focus the editor"
+	}`, stateID))
+	if err != nil || clicked.IsError {
+		t.Fatalf("coordinate click result=%+v err=%v", clicked, err)
+	}
+
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	var executed *TargetBoundInputRequestV1
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context, request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		executed = &request
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: "type",
+			InputCommitted: true, ClipboardTouched: true, ClipboardRestored: true,
+			Phase: "post_verification", FailureCode: &failure,
+		}, nil
+	}
+	typed, err := harness.tool.Run(context.Background(), fmt.Sprintf(`{
+		"action":"type","state_id":%q,"text":"hello",
+		"description":"Type into the focused editor"
+	}`, stateID))
+	if err != nil || typed.IsError {
+		t.Fatalf("coordinate-focused type result=%+v err=%v", typed, err)
+	}
+	if executed == nil || executed.Action != "type" || executed.Text == nil ||
+		*executed.Text != "hello" || executed.Ref != nil || executed.Path != nil ||
+		executed.ExpectedRole != nil || executed.ExpectedFingerprint != nil ||
+		executed.ExpectedPointer == nil ||
+		executed.ExpectedPointer.X != -99.5 || executed.ExpectedPointer.Y != 200.5 {
+		t.Fatalf("coordinate-focused type lost exact authority: %+v", executed)
+	}
+
+	again, err := harness.tool.Run(context.Background(), fmt.Sprintf(`{
+		"action":"type","state_id":%q,"text":"again",
+		"description":"Do not reuse focus authority"
+	}`, stateID))
+	if err != nil || !again.IsError ||
+		!strings.Contains(again.Content, "keyboard_target_unavailable") ||
+		!strings.Contains(again.Content, "do not retry automatically") {
+		t.Fatalf("reused coordinate focus result=%+v err=%v", again, err)
+	}
+}
+
+func TestComputerUseCoordinateFocusDoesNotFollowAnotherWindowObservation(t *testing.T) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.observe(t)
+	stateID := harness.tool.snapshot.id
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	harness.fake.queue("display_topology", marshalDisplayTopology(t, harness.topology))
+	harness.tool.coordinateExecutor = func(
+		_ context.Context, request CoordinateMouseEventRequestV1,
+	) (CoordinateMouseEventResultV1, error) {
+		failure := "click_postcondition_not_declared"
+		return CoordinateMouseEventResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: "click",
+			PrimaryActionCommitted: true, PointerMotionCommitted: true,
+			Phase: "post_verification", FailureCode: &failure,
+			PointerEndpoint: &CoordinateMouseEventPointerEndpointV1{
+				Requested: request.QuartzPoint, Observed: &request.QuartzPoint,
+				Tolerance: coordinateMouseEndpointToleranceV1, Verified: true,
+			},
+		}, nil
+	}
+	if result, err := harness.tool.Run(context.Background(), fmt.Sprintf(`{
+		"action":"click","state_id":%q,"x":0,"y":0,"description":"Focus editor"
+	}`, stateID)); err != nil || result.IsError {
+		t.Fatalf("coordinate click result=%+v err=%v", result, err)
+	}
+
+	other := cloneComputerUseTree(t, harness.tree)
+	other.PID++
+	other.BundleID = "com.example.Other"
+	other.App = "Other"
+	other.AppName = "Other"
+	otherWindowID := *other.WindowID + 1
+	other.WindowID = &otherWindowID
+	harness.fake.queue("resolve_pid", fmt.Sprintf(`{"pid":%d}`, other.PID))
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, other))
+	observed, err := harness.tool.Run(context.Background(), `{
+		"action":"get_app_state","app":"Other","description":"Observe another window"
+	}`)
+	if err != nil || observed.IsError {
+		t.Fatalf("other observation result=%+v err=%v", observed, err)
+	}
+	otherStateID := harness.tool.snapshot.id
+	typed, err := harness.tool.Run(context.Background(), fmt.Sprintf(`{
+		"action":"type","state_id":%q,"text":"hello",
+		"description":"Must not follow focus to another window"
+	}`, otherStateID))
+	if err != nil || !typed.IsError ||
+		!strings.Contains(typed.Content, "keyboard_target_unavailable") {
+		t.Fatalf("cross-window focus result=%+v err=%v", typed, err)
+	}
+}
+
+func TestComputerUseCoordinateFocusSurvivesOneSameWindowReobservation(t *testing.T) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.observe(t)
+	stateID := harness.tool.snapshot.id
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	harness.fake.queue("display_topology", marshalDisplayTopology(t, harness.topology))
+	harness.tool.coordinateExecutor = func(
+		_ context.Context, request CoordinateMouseEventRequestV1,
+	) (CoordinateMouseEventResultV1, error) {
+		failure := "click_postcondition_not_declared"
+		return CoordinateMouseEventResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: "click",
+			PrimaryActionCommitted: true, PointerMotionCommitted: true,
+			Phase: "post_verification", FailureCode: &failure,
+			PointerEndpoint: &CoordinateMouseEventPointerEndpointV1{
+				Requested: request.QuartzPoint, Observed: &request.QuartzPoint,
+				Tolerance: coordinateMouseEndpointToleranceV1, Verified: true,
+			},
+		}, nil
+	}
+	if result, err := harness.tool.Run(context.Background(), fmt.Sprintf(`{
+		"action":"click","state_id":%q,"x":0,"y":0,"description":"Focus editor"
+	}`, stateID)); err != nil || result.IsError {
+		t.Fatalf("coordinate click result=%+v err=%v", result, err)
+	}
+
+	focused := cloneComputerUseTree(t, harness.tree)
+	title := "Editor focused"
+	focused.Elements[0].Title = &title
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, focused))
+	observed, err := harness.tool.Run(context.Background(), `{
+		"action":"get_app_state","description":"Confirm the focused window"
+	}`)
+	if err != nil || observed.IsError {
+		t.Fatalf("same-window observation result=%+v err=%v", observed, err)
+	}
+	focusedStateID := harness.tool.snapshot.id
+	if focusedStateID == stateID {
+		t.Fatal("test did not create a new post-click state")
+	}
+
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, focused))
+	called := false
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context, request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		called = true
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: request.Action,
+			InputCommitted: true, ClipboardTouched: true, ClipboardRestored: true,
+			Phase: "post_verification", FailureCode: &failure,
+		}, nil
+	}
+	typed, err := harness.tool.Run(context.Background(), fmt.Sprintf(`{
+		"action":"type","state_id":%q,"text":"hello",
+		"description":"Type after confirming focus"
+	}`, focusedStateID))
+	if err != nil || typed.IsError || !called {
+		t.Fatalf("same-window coordinate-focused type result=%+v err=%v called=%v",
+			typed, err, called)
 	}
 }
 

@@ -307,7 +307,10 @@ func (e *daemonOpenAIComputerExecutorV1) AcquireOpenAIComputerBatchAuthorityV1(
 		return tools.OpenAIComputerBatchAuthorityV1{},
 			fmt.Errorf("OpenAI computer batch target is blocked by app policy")
 	}
-	lease, err := e.workflow.ensureLease(ctx, descriptor)
+	// The runtime plan describes the exact current observation that was sent to
+	// the provider. Admit that already-observed target without pretending the
+	// classification step itself is another GUI observation.
+	lease, err := e.workflow.ensureLeaseWithObservedTarget(ctx, descriptor, true)
 	if err != nil {
 		return tools.OpenAIComputerBatchAuthorityV1{},
 			fmt.Errorf("OpenAI computer batch lease is unavailable")

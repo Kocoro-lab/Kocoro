@@ -219,13 +219,14 @@ func TestComputerUseTargetBoundInputRequiresStateID(t *testing.T) {
 	}
 }
 
-func TestComputerUseTargetBoundTypeRequiresFocusedRef(t *testing.T) {
+func TestComputerUseTargetBoundTypeRequiresFocusedRefOrCoordinateFocus(t *testing.T) {
 	requireComputerUseDarwin(t)
 	tool := newTestComputerUse(newFakeAXCaller())
 	result, err := tool.Run(context.Background(),
 		`{"action":"type","state_id":"s_state","text":"redacted","description":"Type"}`)
-	if err != nil || !result.IsError || result.ErrorCategory != agent.ErrCategoryValidation ||
-		!strings.Contains(result.Content, "focused element 'ref'") {
+	if err != nil || !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness ||
+		!strings.Contains(result.Content, "keyboard_target_unavailable") ||
+		!strings.Contains(result.Content, "do not retry automatically") {
 		t.Fatalf("missing ref result=%+v err=%v", result, err)
 	}
 }

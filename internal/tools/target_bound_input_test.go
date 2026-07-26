@@ -73,6 +73,7 @@ func TestTargetBoundInputV1StrictRequestAndResultContracts(t *testing.T) {
 func TestTargetBoundInputV1CanonicalCrossLanguageFixtures(t *testing.T) {
 	for _, name := range []string{
 		"target_bound_input.request.type.v1.json",
+		"target_bound_input.request.coordinate_type.v1.json",
 		"target_bound_input.request.hotkey.v1.json",
 		"target_bound_input.request.keypress.v1.json",
 	} {
@@ -173,6 +174,19 @@ func TestTargetBoundInputV1TaggedUnionRejectsMalformedTuples(t *testing.T) {
 		if err := request.Validate(); err == nil {
 			t.Fatal("type request accepted missing focused-element authority")
 		}
+	}
+	request = canonicalTargetBoundInputRequest(t, "type")
+	request.Ref = nil
+	request.Path = nil
+	request.ExpectedRole = nil
+	request.ExpectedFingerprint = nil
+	request.ExpectedPointer = &CoordinateMouseEventPointV1{X: 320.5, Y: 744.5}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("coordinate-focused type request was rejected: %v", err)
+	}
+	request.ExpectedPointer = nil
+	if err := request.Validate(); err == nil {
+		t.Fatal("window-bound type accepted no coordinate focus authority")
 	}
 	request = canonicalTargetBoundInputRequest(t, "hotkey")
 	request.Ref = stringPointer("e2")

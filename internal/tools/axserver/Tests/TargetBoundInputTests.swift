@@ -60,6 +60,12 @@ final class TargetBoundInputTests: XCTestCase {
         XCTAssertEqual(type.params.action, "type")
         XCTAssertEqual(type.params.ref, "e2")
         XCTAssertEqual(type.params.expectedFingerprint, "axf_e2")
+        let coordinateType = try decodeTargetBoundInputRPCRequestV1(
+            fixture("target_bound_input.request.coordinate_type.v1.json"))
+        XCTAssertNil(coordinateType.params.ref)
+        XCTAssertEqual(
+            coordinateType.params.expectedPointer,
+            CoordinateMouseEventPointV1(x: 320.5, y: 744.5))
         let hotkey = try decodeTargetBoundInputRPCRequestV1(
             fixture("target_bound_input.request.hotkey.v1.json"))
         XCTAssertEqual(hotkey.id, 903)
@@ -97,6 +103,50 @@ final class TargetBoundInputTests: XCTestCase {
             try jsonObject(JSONEncoder().encode(hotkeyResult)),
             try jsonObject(fixture(
                 "target_bound_input.response.hotkey.user_interference.v1.json")))
+    }
+
+    func testCoordinateFocusedTypeRequiresTheClickPointerAndNeverRestoresFocus() throws {
+        let request = try decodeTargetBoundInputRPCRequestV1(
+            fixture("target_bound_input.request.coordinate_type.v1.json")).params
+        let expectedPointer = try XCTUnwrap(request.expectedPointer)
+
+        let harness = TargetBoundInputHarness()
+        harness.forceClipboard = true
+        harness.physicalInputSnapshots = [
+            TargetBoundInputHarness.physicalSnapshot(pointer: expectedPointer),
+            TargetBoundInputHarness.physicalSnapshot(pointer: expectedPointer),
+            TargetBoundInputHarness.physicalSnapshot(
+                pointer: expectedPointer,
+                changes: [(.keyDown, 1), (.keyUp, 1)]),
+            TargetBoundInputHarness.physicalSnapshot(
+                pointer: expectedPointer,
+                changes: [(.keyDown, 1), (.keyUp, 1)]),
+        ]
+        let result = runTargetBoundInput(
+            request: request, dependencies: harness.dependencies())
+        XCTAssertEqual(result.status, "completed_unverified")
+        XCTAssertTrue(result.inputCommitted)
+        XCTAssertEqual(result.failureCode, "postcondition_not_declared")
+        XCTAssertEqual(harness.postCount, 1)
+
+        let drifted = TargetBoundInputHarness()
+        drifted.physicalInputSnapshots = [
+            TargetBoundInputHarness.physicalSnapshot(),
+        ]
+        let driftedResult = runTargetBoundInput(
+            request: request, dependencies: drifted.dependencies())
+        XCTAssertEqual(driftedResult.status, "user_interference")
+        XCTAssertFalse(driftedResult.inputCommitted)
+        XCTAssertEqual(drifted.postCount, 0)
+
+        let lostWindow = TargetBoundInputHarness()
+        lostWindow.authorityFailures = ["frontmost_process_mismatch"]
+        lostWindow.restoreAuthoritySucceeds = true
+        let lostResult = runTargetBoundInput(
+            request: request, dependencies: lostWindow.dependencies())
+        XCTAssertEqual(lostResult.status, "failed")
+        XCTAssertEqual(lostResult.failureCode, "frontmost_process_mismatch")
+        XCTAssertEqual(lostWindow.restoreAuthorityCount, 0)
     }
 
     func testCancellationMarkerMatchesCrossLanguageFixture() throws {
@@ -601,6 +651,7 @@ final class TargetBoundInputTests: XCTestCase {
             "path": NSNull(),
             "expected_role": NSNull(),
             "expected_fingerprint": NSNull(),
+            "expected_pointer": NSNull(),
             "text": NSNull(),
             "key": NSNull(),
             "keys": NSNull(),
@@ -715,6 +766,7 @@ private final class TargetBoundInputHarness {
     }
 
     static func physicalSnapshot(
+        pointer: CoordinateMouseEventPointV1 = .init(x: 100, y: 200),
         changes: [(CGEventType, UInt32)] = [],
         externalChanges: [(CGEventType, UInt32)] = []
     ) -> PhysicalInputInterferenceSnapshotV1 {
@@ -731,7 +783,7 @@ private final class TargetBoundInputHarness {
             counters[physicalInputHIDEventTypesV1.firstIndex(of: eventType)!] += delta
         }
         return .init(
-            pointer: .init(x: 100, y: 200),
+            pointer: pointer,
             hidEventCounters: counters,
             syntheticEventCounters: syntheticCounters)
     }

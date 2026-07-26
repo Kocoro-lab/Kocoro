@@ -24,21 +24,22 @@ func targetBoundInputCancellationMarkerPathV1(
 }
 
 type TargetBoundInputRequestV1 struct {
-	SchemaVersion          int                    `json:"schema_version"`
-	PID                    int                    `json:"pid"`
-	BundleID               string                 `json:"bundle_id"`
-	WindowID               uint32                 `json:"window_id"`
-	ExpectedWindowAXBounds CoordinateQuartzRectV1 `json:"expected_window_ax_bounds"`
-	Action                 string                 `json:"action"`
-	Ref                    *string                `json:"ref"`
-	Path                   *string                `json:"path"`
-	ExpectedRole           *string                `json:"expected_role"`
-	ExpectedFingerprint    *string                `json:"expected_fingerprint"`
-	Text                   *string                `json:"text"`
-	Key                    *string                `json:"key"`
-	Keys                   *[]string              `json:"keys"`
-	Modifiers              *[]string              `json:"modifiers"`
-	CommitDeadlineAt       string                 `json:"commit_deadline_at"`
+	SchemaVersion          int                          `json:"schema_version"`
+	PID                    int                          `json:"pid"`
+	BundleID               string                       `json:"bundle_id"`
+	WindowID               uint32                       `json:"window_id"`
+	ExpectedWindowAXBounds CoordinateQuartzRectV1       `json:"expected_window_ax_bounds"`
+	Action                 string                       `json:"action"`
+	Ref                    *string                      `json:"ref"`
+	Path                   *string                      `json:"path"`
+	ExpectedRole           *string                      `json:"expected_role"`
+	ExpectedFingerprint    *string                      `json:"expected_fingerprint"`
+	ExpectedPointer        *CoordinateMouseEventPointV1 `json:"expected_pointer"`
+	Text                   *string                      `json:"text"`
+	Key                    *string                      `json:"key"`
+	Keys                   *[]string                    `json:"keys"`
+	Modifiers              *[]string                    `json:"modifiers"`
+	CommitDeadlineAt       string                       `json:"commit_deadline_at"`
 }
 
 type TargetBoundInputRPCRequestV1 struct {
@@ -74,6 +75,7 @@ var targetBoundInputRequestWireShapeV1 = coordinateObjectWireShape(false, map[st
 		"path":                      coordinateScalarWireShape(true),
 		"expected_role":             coordinateScalarWireShape(true),
 		"expected_fingerprint":      coordinateScalarWireShape(true),
+		"expected_pointer":          coordinateNullableWireShape(coordinateMousePointWireShapeV1),
 		"text":                      coordinateScalarWireShape(true),
 		"key":                       coordinateScalarWireShape(true),
 		"keys": coordinateNullableWireShape(
@@ -113,17 +115,30 @@ func (request TargetBoundInputRequestV1) Validate() error {
 	}
 	switch request.Action {
 	case "type":
-		if request.Ref == nil || !validComputerUseRef(*request.Ref) ||
-			request.Path == nil || (*request.Path != "window[0]" && !strings.HasPrefix(*request.Path, "window[0]/")) ||
-			request.ExpectedRole == nil || !strictTargetBoundIdentity(*request.ExpectedRole) ||
-			request.ExpectedFingerprint == nil || !strictTargetBoundIdentity(*request.ExpectedFingerprint) ||
-			request.Text == nil || *request.Text == "" || request.Key != nil ||
-			request.Keys != nil || request.Modifiers != nil {
-			return fmt.Errorf("target_bound_input type requires ref/path/role/fingerprint/text and null key/keys/modifiers")
+		elementBound := request.Ref != nil && validComputerUseRef(*request.Ref) &&
+			request.Path != nil &&
+			(*request.Path == "window[0]" || strings.HasPrefix(*request.Path, "window[0]/")) &&
+			request.ExpectedRole != nil && strictTargetBoundIdentity(*request.ExpectedRole) &&
+			request.ExpectedFingerprint != nil &&
+			strictTargetBoundIdentity(*request.ExpectedFingerprint) &&
+			request.ExpectedPointer == nil
+		windowBound := request.Ref == nil && request.Path == nil &&
+			request.ExpectedRole == nil && request.ExpectedFingerprint == nil &&
+			request.ExpectedPointer != nil
+		if request.ExpectedPointer != nil {
+			if err := validateCoordinateMousePointV1(
+				"target_bound_input expected_pointer", *request.ExpectedPointer); err != nil {
+				return err
+			}
+		}
+		if (!elementBound && !windowBound) || request.Text == nil || *request.Text == "" ||
+			request.Key != nil || request.Keys != nil || request.Modifiers != nil {
+			return fmt.Errorf("target_bound_input type requires either element authority or recent coordinate-focus authority")
 		}
 	case "hotkey":
 		if request.Ref != nil || request.Path != nil || request.ExpectedRole != nil ||
-			request.ExpectedFingerprint != nil || request.Text != nil || request.Key == nil || *request.Key == "" ||
+			request.ExpectedFingerprint != nil || request.ExpectedPointer != nil ||
+			request.Text != nil || request.Key == nil || *request.Key == "" ||
 			*request.Key != strings.TrimSpace(*request.Key) || request.Keys != nil ||
 			request.Modifiers == nil || len(*request.Modifiers) > 4 {
 			return fmt.Errorf("target_bound_input hotkey requires key/modifiers and null text/keys")
@@ -133,7 +148,8 @@ func (request TargetBoundInputRequestV1) Validate() error {
 		}
 	case "keypress":
 		if request.Ref != nil || request.Path != nil || request.ExpectedRole != nil ||
-			request.ExpectedFingerprint != nil || request.Text != nil || request.Key != nil ||
+			request.ExpectedFingerprint != nil || request.ExpectedPointer != nil ||
+			request.Text != nil || request.Key != nil ||
 			request.Keys == nil || len(*request.Keys) == 0 || len(*request.Keys) > 64 ||
 			request.Modifiers == nil || len(*request.Modifiers) > 4 {
 			return fmt.Errorf("target_bound_input keypress requires keys/modifiers and null text/key")
