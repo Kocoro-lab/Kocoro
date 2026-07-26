@@ -39,7 +39,7 @@ func TestOpenAIComputerTaskAppsSupersedeForegroundHintAndRefreshFrontmost(
 	fake := newFakeAXCaller()
 	fake.queue("launch_app", `{"result":"launched"}`)
 	fake.queue("launch_app", `{"result":"launched"}`)
-	fake.queue("focus_app", `{"result":"focused"}`)
+	fake.queue("focus", `{"result":"focused"}`)
 	raw := &ComputerUseTool{
 		client: fake,
 		initialTarget: &ComputerUseInitialTargetV1{
@@ -67,7 +67,7 @@ func TestOpenAIComputerTaskAppsSupersedeForegroundHintAndRefreshFrontmost(
 	if len(fake.calls) != 3 ||
 		fake.calls[0].method != "launch_app" ||
 		fake.calls[1].method != "launch_app" ||
-		fake.calls[2].method != "focus_app" {
+		fake.calls[2].method != "focus" {
 		t.Fatalf("app preparation calls = %+v", fake.calls)
 	}
 }

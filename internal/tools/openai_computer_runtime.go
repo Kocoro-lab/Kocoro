@@ -123,9 +123,10 @@ func (r *OpenAIComputerActionRuntimeV1) LaunchAndFocusTaskAppsV1(
 			return fmt.Errorf("launch app %q: %w", app.App, err)
 		}
 	}
+	// "focus_app" is the public computer_use action; the AX socket method is "focus".
 	if _, err := r.raw.client.Call(
 		ctx,
-		"focus_app",
+		"focus",
 		map[string]any{"app_name": apps[0].App, "verify": true},
 	); err != nil {
 		return fmt.Errorf("focus app %q: %w", apps[0].App, err)
