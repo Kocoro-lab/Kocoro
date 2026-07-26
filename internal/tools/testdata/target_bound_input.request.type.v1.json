@@ -12,7 +12,6 @@
     "path": "window[0]/AXTextField[0]",
     "expected_role": "AXTextField",
     "expected_fingerprint": "axf_e2",
-    "expected_pointer": null,
     "text": "fixture input",
     "key": null,
     "keys": null,

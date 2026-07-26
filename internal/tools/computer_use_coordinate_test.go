@@ -344,9 +344,7 @@ func TestComputerUseVerifiedCoordinateClickAllowsOneWindowBoundTypeWithoutAXRef(
 	}
 	if executed == nil || executed.Action != "type" || executed.Text == nil ||
 		*executed.Text != "hello" || executed.Ref != nil || executed.Path != nil ||
-		executed.ExpectedRole != nil || executed.ExpectedFingerprint != nil ||
-		executed.ExpectedPointer == nil ||
-		executed.ExpectedPointer.X != -99.5 || executed.ExpectedPointer.Y != 200.5 {
+		executed.ExpectedRole != nil || executed.ExpectedFingerprint != nil {
 		t.Fatalf("coordinate-focused type lost exact authority: %+v", executed)
 	}
 

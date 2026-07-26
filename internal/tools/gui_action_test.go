@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
@@ -124,14 +123,12 @@ func TestComputerUseTargetBoundInputDescriptorsUseExactObservedBundle(t *testing
 }
 
 func TestComputerUseCoordinateFocusedTypeDescriptorUsesClickBoundTarget(t *testing.T) {
-	now := time.Date(2026, 7, 26, 14, 30, 0, 0, time.UTC)
 	tool := &ComputerUseTool{
-		client:        &guiTargetFixtureClient{bundleID: "com.example.other", appName: "Other"},
-		coordinateNow: func() time.Time { return now },
+		client: &guiTargetFixtureClient{bundleID: "com.example.other", appName: "Other"},
 		coordinateFocus: &computerUseCoordinateFocusV1{
 			stateID: "s_clicked", pid: 42,
 			bundleID: "com.tinyspeck.slackmacgap", app: "Slack",
-			windowID: 7001, expiresAt: now.Add(time.Second),
+			windowID: 7001,
 		},
 	}
 	descriptor, err := tool.DescribeGUIAction(context.Background(),

@@ -12,7 +12,6 @@
     "path": null,
     "expected_role": null,
     "expected_fingerprint": null,
-    "expected_pointer": {"x": 320.5, "y": 744.5},
     "text": "fixture input",
     "key": null,
     "keys": null,

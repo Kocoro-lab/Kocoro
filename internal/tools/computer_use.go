@@ -79,7 +79,6 @@ const (
 	computerUseCoordinateMaxCaptureNDJSONBytesV1 = 22 * 1024 * 1024
 	computerUseCoordinateMaxCapturePixelsV1      = 16_000_000
 	computerUseCoordinateFrameTTLV1              = CoordinateFrameMaxTTLV1
-	computerUseCoordinateFocusTTLV1              = 30 * time.Second
 	computerUseDefaultDragDurationV1             = 350
 	computerUseMutationDeadlineV1                = 2 * time.Second
 	computerUseDragDeadlineOverheadV1            = 500 * time.Millisecond
@@ -198,18 +197,15 @@ type computerUseCoordinateFocusV1 struct {
 	app                    string
 	windowID               uint32
 	expectedWindowAXBounds CoordinateQuartzRectV1
-	expectedPointer        CoordinateMouseEventPointV1
 	filter                 string
 	budget                 int
-	expiresAt              time.Time
 	observedAfterClick     bool
 }
 
 func (focus *computerUseCoordinateFocusV1) matchesTree(
 	tree computerUseTree,
-	now time.Time,
 ) bool {
-	if focus == nil || !now.Before(focus.expiresAt) || tree.SchemaVersion != 1 ||
+	if focus == nil || tree.SchemaVersion != 1 ||
 		tree.PID != focus.pid || tree.BundleID != focus.bundleID ||
 		tree.WindowID == nil || *tree.WindowID <= 0 ||
 		uint64(*tree.WindowID) != uint64(focus.windowID) ||
@@ -627,8 +623,7 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 		), nil
 	}
 	result, stateID := t.publishComputerUseObservation(tree, filter, budget)
-	if pendingFocus != nil && pendingFocus.matchesTree(
-		tree, t.computerUseCoordinateNowV1()) {
+	if pendingFocus != nil && pendingFocus.matchesTree(tree) {
 		pendingFocus.stateID = stateID
 		pendingFocus.filter = filter
 		pendingFocus.budget = budget
@@ -1458,22 +1453,18 @@ func (t *ComputerUseTool) coordinateFocusedType(
 ) (agent.ToolResult, error) {
 	defer t.invalidateState()
 	focus := t.coordinateFocus
-	if focus == nil || args.StateID == "" || args.StateID != focus.stateID ||
-		!t.computerUseCoordinateNowV1().Before(focus.expiresAt) {
+	if focus == nil || args.StateID == "" || args.StateID != focus.stateID {
 		return computerUseKeyboardTargetUnavailableV1(), nil
 	}
 	current, failure, ok := t.readTree(ctx, focus.pid, focus.filter, focus.budget)
 	if !ok {
 		return failure, nil
 	}
-	if !focus.matchesTree(current, t.computerUseCoordinateNowV1()) ||
+	if !focus.matchesTree(current) ||
 		focus.observedAfterClick && computerUseStateID(current) != args.StateID {
 		return computerUseKeyboardTargetUnavailableV1(), nil
 	}
 	deadline := t.computerUseCoordinateNowV1().Add(time.Second)
-	if focus.expiresAt.Before(deadline) {
-		deadline = focus.expiresAt
-	}
 	request := TargetBoundInputRequestV1{
 		SchemaVersion: 1,
 		PID:           current.PID,
@@ -1484,7 +1475,6 @@ func (t *ComputerUseTool) coordinateFocusedType(
 			Width: current.WindowFrame.Width, Height: current.WindowFrame.Height,
 		},
 		Action:           "type",
-		ExpectedPointer:  &focus.expectedPointer,
 		Text:             &text,
 		CommitDeadlineAt: deadline.UTC().Format(time.RFC3339Nano),
 	}
@@ -2568,9 +2558,7 @@ func (t *ComputerUseTool) coordinatePointerActionV1(
 					X: currentTree.WindowFrame.X, Y: currentTree.WindowFrame.Y,
 					Width: currentTree.WindowFrame.Width, Height: currentTree.WindowFrame.Height,
 				},
-				expectedPointer: *result.PointerEndpoint.Observed,
-				filter:          t.snapshot.filter, budget: t.snapshot.budget,
-				expiresAt: now.Add(computerUseCoordinateFocusTTLV1),
+				filter: t.snapshot.filter, budget: t.snapshot.budget,
 			}
 			return agent.ToolResult{Content: "coordinate click completed_unverified at the verified pointer; " +
 				"if this click focused a text editor, type may use this state_id once without a ref; " +

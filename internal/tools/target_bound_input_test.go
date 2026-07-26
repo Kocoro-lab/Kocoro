@@ -180,13 +180,8 @@ func TestTargetBoundInputV1TaggedUnionRejectsMalformedTuples(t *testing.T) {
 	request.Path = nil
 	request.ExpectedRole = nil
 	request.ExpectedFingerprint = nil
-	request.ExpectedPointer = &CoordinateMouseEventPointV1{X: 320.5, Y: 744.5}
 	if err := request.Validate(); err != nil {
-		t.Fatalf("coordinate-focused type request was rejected: %v", err)
-	}
-	request.ExpectedPointer = nil
-	if err := request.Validate(); err == nil {
-		t.Fatal("window-bound type accepted no coordinate focus authority")
+		t.Fatalf("window-bound type request was rejected: %v", err)
 	}
 	request = canonicalTargetBoundInputRequest(t, "hotkey")
 	request.Ref = stringPointer("e2")

@@ -12,7 +12,6 @@
     "path": null,
     "expected_role": null,
     "expected_fingerprint": null,
-    "expected_pointer": null,
     "text": null,
     "key": null,
     "keys": ["p", "a", "g", "e", "down"],
