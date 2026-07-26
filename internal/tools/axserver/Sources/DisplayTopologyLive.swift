@@ -34,6 +34,9 @@ enum DisplayTopologyLiveError: Error, Equatable {
     case coreGraphics(String)
 }
 
+private let displayTopologySetMismatchReason =
+    "CoreGraphics and NSScreen display IDs do not match exactly"
+
 private struct DisplayTopologyStructuralSignature: Encodable {
     let mainDisplayID: UInt32
     let displays: [DisplayTopologyDisplayV1]
@@ -76,7 +79,7 @@ final class DisplayTopologyObservationBuilder {
             }
         }
         guard Set(quartzByID.keys) == Set(screensByID.keys) else {
-            throw DisplayTopologyLiveError.invalid("CoreGraphics and NSScreen display IDs do not match exactly")
+            throw DisplayTopologyLiveError.invalid(displayTopologySetMismatchReason)
         }
         let mainDisplays = snapshot.quartzDisplays.filter(\.isMain)
         guard mainDisplays.count == 1,
@@ -215,9 +218,17 @@ private func readAppKitDisplayTopology() throws -> [DisplayTopologyAppKitScreenS
 }
 
 final class LiveDisplayTopologyService {
+    // AppKit can trail CoreGraphics briefly during display reconfiguration.
+    // One immediate read plus two 50 ms settle retries covers that transient
+    // without relaxing exact-set validation for a persistent mismatch.
+    private static let collectionAttempts = 3
+    private static let displaySetMismatch = DisplayTopologyLiveError.invalid(
+        displayTopologySetMismatchReason)
+
     private let builder: DisplayTopologyObservationBuilder
     private let now: () -> Date
     private let collect: () throws -> DisplayTopologyRawSnapshot
+    private let settleBeforeRetry: () -> Void
     private let lock = NSLock()
     private var lastCapturedDate: Date?
     private var lastCapturedAt: String?
@@ -231,6 +242,9 @@ final class LiveDisplayTopologyService {
                 refresh: { refreshAppKitState() },
                 readQuartz: readQuartzDisplayTopology,
                 readAppKit: readAppKitDisplayTopology)
+        },
+        settleBeforeRetry: @escaping () -> Void = {
+            Thread.sleep(forTimeInterval: 0.05)
         }
     ) {
         builder = DisplayTopologyObservationBuilder(
@@ -238,24 +252,38 @@ final class LiveDisplayTopologyService {
             topologyID: topologyID)
         self.now = now
         self.collect = collect
+        self.settleBeforeRetry = settleBeforeRetry
     }
 
     func observe() throws -> DisplayTopologyV1 {
         lock.lock()
         defer { lock.unlock() }
 
-        let snapshot = try collect()
-        var capturedDate = now()
-        var capturedAt = formatDisplayTopologyTimestamp(capturedDate)
-        if let lastCapturedDate, let lastCapturedAt,
-           capturedDate <= lastCapturedDate || capturedAt == lastCapturedAt {
-            capturedDate = lastCapturedDate.addingTimeInterval(0.001)
-            capturedAt = formatDisplayTopologyTimestamp(capturedDate)
+        for attempt in 0..<Self.collectionAttempts {
+            do {
+                let snapshot = try collect()
+                var capturedDate = now()
+                var capturedAt = formatDisplayTopologyTimestamp(capturedDate)
+                if let lastCapturedDate, let lastCapturedAt,
+                   capturedDate <= lastCapturedDate || capturedAt == lastCapturedAt {
+                    capturedDate = lastCapturedDate.addingTimeInterval(0.001)
+                    capturedAt = formatDisplayTopologyTimestamp(capturedDate)
+                }
+                let topology = try builder.observe(
+                    snapshot: snapshot,
+                    capturedAt: capturedAt)
+                lastCapturedDate = capturedDate
+                lastCapturedAt = capturedAt
+                return topology
+            } catch let error as DisplayTopologyLiveError {
+                guard error == Self.displaySetMismatch,
+                      attempt + 1 < Self.collectionAttempts else {
+                    throw error
+                }
+                settleBeforeRetry()
+            }
         }
-        let topology = try builder.observe(snapshot: snapshot, capturedAt: capturedAt)
-        lastCapturedDate = capturedDate
-        lastCapturedAt = capturedAt
-        return topology
+        preconditionFailure("display topology collection attempts exhausted")
     }
 }
 

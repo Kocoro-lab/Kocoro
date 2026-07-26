@@ -201,11 +201,16 @@ func (t *openAIComputerTaskToolV1) Run(
 	})
 	initial, runErr := t.workflow.runTool(invocationCtx, plan.Tool, plan.Args)
 	if runErr != nil || initial.IsError || len(initial.Images) != 1 {
-		if initial.Content == "" {
-			initial.Content = "the initial app window could not be observed"
+		detail := "the desktop observation backend returned an error"
+		if runErr != nil {
+			detail = runErr.Error()
 		}
-		initial.IsError = true
-		return initial, nil
+		return agent.BusinessError(
+			"computer_use_error: initial_observation_unavailable\n" +
+				"message: Computer Use could not capture the verified initial app window\n" +
+				"recovery: do not retry computer_use in this turn; the private OpenAI trajectory did not start\n" +
+				"detail: " + detail,
+		), nil
 	}
 
 	runner, err := newDaemonOpenAIComputerBatchRunnerV1(
@@ -256,7 +261,10 @@ func (t *openAIComputerTaskToolV1) Run(
 	reply, _, err := child.Run(ctx, args.Task, content, nil)
 	if err != nil {
 		return agent.BusinessError(
-			"Computer Use could not complete the task: " + err.Error(),
+			"computer_use_error: executor_failed\n" +
+				"message: the private OpenAI Computer Use executor could not complete the task\n" +
+				"recovery: do not call computer_use again in this turn; actions may have completed, and the failure does not mean the target app is missing or blocked\n" +
+				"detail: " + err.Error(),
 		), nil
 	}
 	reply = strings.TrimSpace(reply)

@@ -269,6 +269,7 @@ func openAIComputerDaemonCall(actions string) []byte {
 type openAIComputerDaemonLoopLLM struct {
 	responses []*client.CompletionResponse
 	requests  []client.CompletionRequest
+	err       error
 }
 
 func (l *openAIComputerDaemonLoopLLM) Complete(
@@ -276,6 +277,9 @@ func (l *openAIComputerDaemonLoopLLM) Complete(
 	request client.CompletionRequest,
 ) (*client.CompletionResponse, error) {
 	l.requests = append(l.requests, request)
+	if l.err != nil {
+		return nil, l.err
+	}
 	if len(l.responses) == 0 {
 		return nil, errors.New("unexpected extra completion request")
 	}
@@ -756,6 +760,107 @@ func TestOpenAIComputerTaskToolResolverFailureDoesNotTouchDesktop(t *testing.T) 
 			"resolver failure touched desktop: resolved=%v launched=%v runs=%v",
 			runtime.resolvedApps, runtime.launchedApps, probe.runNames(),
 		)
+	}
+}
+
+func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-initial-failure",
+		"turn-openai-initial-failure",
+	)
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"final_screenshot": {
+				Content: "state_id: stale-secret\nref=e17\nscreenshot_warning: topology mismatch",
+				IsError: true,
+			},
+		},
+	}
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:      &openAIComputerDaemonLoopLLM{},
+		profile:      trustedOpenAIComputerProfileForDaemon(t),
+		childTools:   agent.NewToolRegistry(),
+		workflow:     workflow,
+		runtime:      &openAIComputerDaemonRuntimeProbe{tool: probe},
+		approvalTool: probe,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Inspect Calculator","apps":["Calculator"],"description":"Inspect the app"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "initial_observation_unavailable") ||
+		!strings.Contains(result.Content, "do not retry computer_use in this turn") {
+		t.Fatalf("task result = %+v", result)
+	}
+	if strings.Contains(result.Content, "state_id") ||
+		strings.Contains(result.Content, "ref=e17") {
+		t.Fatalf("initial failure leaked stale observation state: %q", result.Content)
+	}
+}
+
+func TestOpenAIComputerTaskToolExecutorFailureForbidsAutomaticRetryAndGuessing(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-executor-failure",
+		"turn-openai-executor-failure",
+	)
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "aW5pdGlhbC1pbWFnZQ==",
+				}},
+			},
+		},
+	}
+	taskTool := &openAIComputerTaskToolV1{
+		gateway: &openAIComputerDaemonLoopLLM{
+			err: errors.New("API returned 400: malformed provider response"),
+		},
+		profile:      trustedOpenAIComputerProfileForDaemon(t),
+		childTools:   agent.NewToolRegistry(),
+		workflow:     workflow,
+		runtime:      &openAIComputerDaemonRuntimeProbe{tool: probe},
+		approvalTool: probe,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Inspect Calculator","apps":["Calculator"],"description":"Inspect the app"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "executor_failed") ||
+		!strings.Contains(result.Content, "do not call computer_use again in this turn") ||
+		!strings.Contains(result.Content, "does not mean the target app is missing or blocked") ||
+		!strings.Contains(result.Content, "malformed provider response") {
+		t.Fatalf("task result = %+v", result)
 	}
 }
 

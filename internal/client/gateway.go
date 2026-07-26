@@ -453,8 +453,8 @@ type ContentBlock struct {
 	CallID       string          `json:"-"`
 	Actions      json.RawMessage `json:"-"`
 	// PendingSafetyChecks is populated only for OpenAI computer_call blocks.
-	// A non-nil empty slice is significant: the provider emitted the required
-	// field and no acknowledgement is needed.
+	// A non-nil empty slice is significant: Cloud normalized the provider
+	// response and no acknowledgement is needed.
 	PendingSafetyChecks []OpenAIComputerSafetyCheck `json:"-"`
 	Status              string                      `json:"-"`
 	// CompressedTier records that an agent-loop compaction pass has visited

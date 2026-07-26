@@ -118,6 +118,46 @@ final class DisplayTopologyLiveTests: XCTestCase {
         XCTAssertNotEqual(first.capturedAt, second.capturedAt)
     }
 
+    func testLiveServiceRetriesTransientDisplaySetMismatch() throws {
+        var mismatched = Self.snapshot()
+        mismatched.appKitScreens.removeLast()
+        var collections = 0
+        var settles = 0
+        let service = LiveDisplayTopologyService(
+            helperBootID: "helper_boot_live",
+            topologyID: "topo_live",
+            collect: {
+                collections += 1
+                return collections == 1 ? mismatched : Self.snapshot()
+            },
+            settleBeforeRetry: { settles += 1 })
+
+        let topology = try service.observe()
+
+        XCTAssertEqual(topology.displays.map(\.displayID), [1, 2])
+        XCTAssertEqual(collections, 2)
+        XCTAssertEqual(settles, 1)
+    }
+
+    func testLiveServiceRejectsPersistentDisplaySetMismatchAfterBoundedRetries() {
+        var mismatched = Self.snapshot()
+        mismatched.appKitScreens.removeLast()
+        var collections = 0
+        var settles = 0
+        let service = LiveDisplayTopologyService(
+            helperBootID: "helper_boot_live",
+            topologyID: "topo_live",
+            collect: {
+                collections += 1
+                return mismatched
+            },
+            settleBeforeRetry: { settles += 1 })
+
+        XCTAssertThrowsError(try service.observe())
+        XCTAssertEqual(collections, 3)
+        XCTAssertEqual(settles, 2)
+    }
+
     func testTypedRPCUsesInjectedProviderAndSurfacesCollectorFailure() throws {
         let topology = try DisplayTopologyObservationBuilder(
             helperBootID: "helper_boot_live",
