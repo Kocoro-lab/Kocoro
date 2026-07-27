@@ -1301,7 +1301,7 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 			}
 			if strings.Contains(
 				message.Content.Text(),
-				"use Return only while the latest observation still verifies that location-field focus",
+				"use Command-L, type the exact URL, then Return",
 			) && strings.Contains(
 				message.Content.Text(),
 				"If keyboard focus is unavailable or Return is rejected, do not repeat it",
@@ -1558,6 +1558,10 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 			Data:      "Y29sZC1hcHAtcmVhZHk=",
 		}},
 	}
+	initialVisualOnly := initialSuccess
+	initialVisualOnly.GUIObservation = &agent.GUIObservationOutcome{
+		CoordinateActionable: false,
+	}
 	probe := &openAIComputerDaemonProbeTool{
 		targetBundleID: "com.example.calculator",
 		targetAppName:  "Calculator",
@@ -1579,6 +1583,10 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 		}
 		initialRuns++
 		if initialRuns == 1 {
+			probe.mu.Lock()
+			probe.results["final_screenshot"] = initialVisualOnly
+			probe.mu.Unlock()
+		} else if initialRuns == 2 {
 			probe.mu.Lock()
 			probe.results["final_screenshot"] = initialSuccess
 			probe.mu.Unlock()
@@ -1638,10 +1646,10 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 		t.Fatalf("task result = %+v", result)
 	}
 	if got := strings.Join(probe.runNames(), ","); got !=
-		"final_screenshot,final_screenshot,click,final_screenshot" {
+		"final_screenshot,final_screenshot,final_screenshot,click,final_screenshot" {
 		t.Fatalf("desktop runs = %q", got)
 	}
-	if !reflect.DeepEqual(waits, []int{1}) {
+	if !reflect.DeepEqual(waits, []int{1, 2}) {
 		t.Fatalf("initial observation waits = %v", waits)
 	}
 }
@@ -1678,6 +1686,9 @@ func TestOpenAIComputerTaskToolAcceptsVisualSuccessAfterDynamicWindowCaptureSett
 			MediaType: "image/png",
 			Data:      "ZnJlc2gtZmluYWwtaW1hZ2U=",
 		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			CoordinateActionable: false,
+		},
 	}
 	probe := &openAIComputerDaemonProbeTool{
 		targetBundleID: "com.example.calculator",
@@ -3422,8 +3433,61 @@ func TestDaemonOpenAIComputerExecutorRuntimeErrorsAreRedacted(t *testing.T) {
 		call.Actions[0],
 	)
 	if err == nil || strings.Contains(err.Error(), "secret typed text") ||
-		execution.CommitState != tools.OpenAIComputerNotCommittedV1 {
+		strings.Contains(execution.Result.Content, "secret typed text") ||
+		execution.CommitState != tools.OpenAIComputerNotCommittedV1 ||
+		execution.Result.GUIOutcome == nil ||
+		execution.Result.GUIOutcome.FailureCode !=
+			"action_projection_failed" {
 		t.Fatalf("runtime error leaked or committed: execution=%+v err=%v", execution, err)
+	}
+}
+
+func TestDaemonOpenAIComputerExecutorPreservesTypedPlanFailureCode(t *testing.T) {
+	executor, _, _, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	executor.runtime = openAIComputerRuntimeErrorProbe{
+		err: &tools.OpenAIComputerActionPlanErrorV1{
+			FailureCode: "keyboard_plan_focused_ref_unavailable",
+			Detail:      "no unique focused AX element exists",
+		},
+	}
+	call, err := tools.DecodeOpenAIComputerCallV1(
+		openAIComputerDaemonCall(`{"type":"type","text":"private"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := executor.AcquireOpenAIComputerBatchAuthorityV1(
+		context.Background(),
+		call,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := tools.OpenAIComputerActionScopeV1{
+		ResponseID: call.ResponseID, CallID: call.CallID,
+		Provider: call.Provider, APISurface: call.APISurface,
+		ToolContract: call.ToolContract,
+		ActionID:     call.CallID + "/action/1",
+		ActionIndex:  0, ActionCount: 1,
+	}
+	execution, err := executor.ExecuteAuthorizedOpenAIComputerActionV1(
+		context.Background(),
+		authority,
+		scope,
+		call.Actions[0],
+	)
+	if err == nil ||
+		execution.CommitState != tools.OpenAIComputerNotCommittedV1 ||
+		execution.Result.GUIOutcome == nil ||
+		execution.Result.GUIOutcome.FailureCode !=
+			"keyboard_plan_focused_ref_unavailable" ||
+		!strings.Contains(
+			execution.Result.Content,
+			"no unique focused AX element exists",
+		) ||
+		strings.Contains(execution.Result.Content, "private") {
+		t.Fatalf("typed plan failure = %+v / %v", execution, err)
 	}
 }
 

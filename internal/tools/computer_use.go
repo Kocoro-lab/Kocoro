@@ -33,6 +33,7 @@ type computerUseSnapshot struct {
 	window                 string
 	windowID               *int
 	expectedWindowAXBounds *CoordinateQuartzRectV1
+	focusedRef             string
 	filter                 string
 	budget                 int
 	elements               []computerUseElement
@@ -201,6 +202,7 @@ type computerUseCoordinateFocusV1 struct {
 	filter                 string
 	budget                 int
 	locationNavigation     bool
+	allowsWindowBoundType  bool
 }
 
 type computerUseNavigationCommitV1 struct {
@@ -211,20 +213,41 @@ type computerUseNavigationCommitV1 struct {
 	role     string
 }
 
+func (focus *computerUseCoordinateFocusV1) treeMismatchCode(
+	tree computerUseTree,
+) string {
+	switch {
+	case focus == nil:
+		return "keyboard_focus_witness_missing"
+	case tree.SchemaVersion != 1:
+		return "keyboard_target_schema_changed"
+	case tree.PID != focus.pid:
+		return "keyboard_target_process_changed"
+	case tree.BundleID != focus.bundleID:
+		return "keyboard_target_bundle_changed"
+	case tree.WindowID == nil || *tree.WindowID <= 0:
+		return "keyboard_target_window_missing"
+	case uint64(*tree.WindowID) != uint64(focus.windowID):
+		return "keyboard_target_window_changed"
+	case tree.WindowFrame == nil:
+		return "keyboard_target_frame_missing"
+	case !captureCoordinateWindowRectsCorrelate(
+		focus.expectedWindowAXBounds,
+		CoordinateQuartzRectV1{
+			X: tree.WindowFrame.X, Y: tree.WindowFrame.Y,
+			Width: tree.WindowFrame.Width, Height: tree.WindowFrame.Height,
+		},
+	):
+		return "keyboard_target_frame_drift"
+	default:
+		return ""
+	}
+}
+
 func (focus *computerUseCoordinateFocusV1) matchesTree(
 	tree computerUseTree,
 ) bool {
-	if focus == nil || tree.SchemaVersion != 1 ||
-		tree.PID != focus.pid || tree.BundleID != focus.bundleID ||
-		tree.WindowID == nil || *tree.WindowID <= 0 ||
-		uint64(*tree.WindowID) != uint64(focus.windowID) ||
-		tree.WindowFrame == nil {
-		return false
-	}
-	return focus.expectedWindowAXBounds == (CoordinateQuartzRectV1{
-		X: tree.WindowFrame.X, Y: tree.WindowFrame.Y,
-		Width: tree.WindowFrame.Width, Height: tree.WindowFrame.Height,
-	})
+	return focus.treeMismatchCode(tree) == ""
 }
 
 // ComputerUseTool is the provider-neutral macOS GUI tool. It deliberately
@@ -703,6 +726,9 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 			image, visualErr := t.captureVisualOnlyObservationV1(ctx, tree)
 			if visualErr == nil {
 				result.Images = []agent.ImageBlock{image}
+				result.GUIObservation = &agent.GUIObservationOutcome{
+					CoordinateActionable: false,
+				}
 				result.Content += "\ncoordinate_notice: exact window screenshot is visual-only; coordinate actions require a new fully actionable observation"
 				result.GUICaptureDiagnostics = failure.GUICaptureDiagnostics
 				return result, nil
@@ -717,6 +743,9 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 	}
 	t.coordinateArtifact = &artifact
 	result.Images = []agent.ImageBlock{artifact.ImageBlock()}
+	result.GUIObservation = &agent.GUIObservationOutcome{
+		CoordinateActionable: true,
+	}
 	return result, nil
 }
 
@@ -802,6 +831,10 @@ func (t *ComputerUseTool) publishComputerUseObservation(
 		}
 		expectedWindowAXBounds = &bounds
 	}
+	focusedRef := ""
+	if tree.FocusedRef != nil {
+		focusedRef = *tree.FocusedRef
+	}
 	t.snapshot = &computerUseSnapshot{
 		id:                     id,
 		status:                 status,
@@ -811,6 +844,7 @@ func (t *ComputerUseTool) publishComputerUseObservation(
 		window:                 tree.Window,
 		windowID:               tree.WindowID,
 		expectedWindowAXBounds: expectedWindowAXBounds,
+		focusedRef:             focusedRef,
 		filter:                 filter,
 		budget:                 budget,
 		elements:               tree.Elements,
@@ -1638,11 +1672,17 @@ func (t *ComputerUseTool) coordinateFocusedType(
 	if !ok {
 		return failure, nil
 	}
-	if !focus.matchesTree(current) {
-		return computerUseKeyboardTargetUnavailableV1(), nil
+	if code := focus.treeMismatchCode(current); code != "" {
+		return computerUseKeyboardTargetUnavailableReasonV1(code), nil
 	}
 	ref, entry, element, hasFocusedElement :=
 		computerUseFocusedElementAuthorityV1(current)
+	if !focus.allowsWindowBoundType &&
+		(!hasFocusedElement || !computerUseEditableFocusEvidenceV1(element)) {
+		return computerUseKeyboardTargetUnavailableReasonV1(
+			"keyboard_focused_element_unavailable",
+		), nil
+	}
 	deadline := t.computerUseCoordinateNowV1().Add(
 		computerUseMutationDeadlineV1,
 	)
@@ -1681,6 +1721,15 @@ func (t *ComputerUseTool) coordinateFocusedType(
 		locationTarget,
 	)
 	return result, err
+}
+
+func computerUseEditableFocusEvidenceV1(element computerUseElement) bool {
+	switch element.Role {
+	case "AXTextField", "AXTextArea", "AXComboBox":
+		return element.Enabled == nil || *element.Enabled
+	default:
+		return false
+	}
 }
 
 func computerUseFocusedElementAuthorityV1(
@@ -1739,10 +1788,19 @@ func (t *ComputerUseTool) recordLocationNavigationCommitV1(
 }
 
 func computerUseKeyboardTargetUnavailableV1() agent.ToolResult {
-	return computerUsePrecommitBusinessErrorV1(
+	return computerUseKeyboardTargetUnavailableReasonV1(
 		"keyboard_target_unavailable",
+	)
+}
+
+func computerUseKeyboardTargetUnavailableReasonV1(
+	failureCode string,
+) agent.ToolResult {
+	return computerUsePrecommitBusinessErrorV1(
+		failureCode,
 		"computer_use_error: keyboard_target_unavailable\n"+
 			"message: no current exact AX focus or one-shot verified same-window focus handoff is available for this keyboard action\n"+
+			"gate: "+failureCode+"\n"+
 			"recovery: re-observe the intended window and establish one focused text target before typing; do not retry automatically",
 	)
 }
@@ -1789,10 +1847,12 @@ func (t *ComputerUseTool) hotkey(ctx context.Context, args computerUseArgs) (age
 		return agent.ValidationError("hotkey is window-bound and does not accept 'ref'"), nil
 	}
 	if computerUseKeyboardNeedsExactIntentV1(args) {
-		t.invalidateState()
-		return consequentialRiskToolFailureV1(
-			ConsequentialRiskCodeUnsupportedPathV1,
-		), nil
+		if _, ok := t.ordinaryKeyboardFocusWitnessV1(args); !ok {
+			t.invalidateState()
+			return consequentialRiskToolFailureV1(
+				ConsequentialRiskCodeUnsupportedPathV1,
+			), nil
+		}
 	}
 	return t.targetBoundInput(ctx, args, "", key, modifiers)
 }
@@ -1814,10 +1874,12 @@ func (t *ComputerUseTool) keypress(
 	}
 	if computerUseKeyboardNeedsExactIntentV1(args) &&
 		!t.allowsLocationNavigationCommitV1(args) {
-		t.invalidateState()
-		return consequentialRiskToolFailureV1(
-			ConsequentialRiskCodeUnsupportedPathV1,
-		), nil
+		if _, ok := t.ordinaryKeyboardFocusWitnessV1(args); !ok {
+			t.invalidateState()
+			return consequentialRiskToolFailureV1(
+				ConsequentialRiskCodeUnsupportedPathV1,
+			), nil
+		}
 	}
 	return t.targetBoundInput(ctx, args, "", "", args.Modifiers)
 }
@@ -1850,6 +1912,7 @@ func (t *ComputerUseTool) targetBoundInput(
 	}
 	var typeEntry refEntry
 	var navigationCommit *computerUseNavigationCommitV1
+	var keyboardFocusWitness *computerUseKeyboardFocusWitnessV1
 	if args.Action == "type" {
 		var exists bool
 		typeEntry, exists = t.refs[args.Ref]
@@ -1866,13 +1929,16 @@ func (t *ComputerUseTool) targetBoundInput(
 			), nil
 		}
 	} else if computerUseKeyboardNeedsExactIntentV1(args) {
-		if !t.allowsLocationNavigationCommitV1(args) {
+		if t.allowsLocationNavigationCommitV1(args) {
+			navigationCommit = t.navigationCommit
+			t.navigationCommit = nil
+		} else if witness, ok := t.ordinaryKeyboardFocusWitnessV1(args); ok {
+			keyboardFocusWitness = &witness
+		} else {
 			return consequentialRiskToolFailureV1(
 				ConsequentialRiskCodeUnsupportedPathV1,
 			), nil
 		}
-		navigationCommit = t.navigationCommit
-		t.navigationCommit = nil
 	}
 
 	current, failure, ok := t.readTree(
@@ -1918,6 +1984,22 @@ func (t *ComputerUseTool) targetBoundInput(
 			entry.Path != navigationCommit.path ||
 			entry.Role != navigationCommit.role {
 			return computerUseKeyboardTargetUnavailableV1(), nil
+		}
+	} else if keyboardFocusWitness != nil {
+		_, entry, element, focused :=
+			computerUseFocusedElementAuthorityV1(current)
+		if !focused ||
+			entry.Path != keyboardFocusWitness.path ||
+			entry.Role != keyboardFocusWitness.role {
+			return computerUseKeyboardTargetUnavailableReasonV1(
+				"keyboard_focused_element_changed",
+			), nil
+		}
+		if !computerUseKeyboardFocusRoleAllowedV1(args, element) ||
+			computerUseFocusedKeyboardElementConsequentialV1(element) {
+			return consequentialRiskToolFailureV1(
+				ConsequentialRiskCodeUnsupportedPathV1,
+			), nil
 		}
 	}
 
@@ -2897,36 +2979,30 @@ func (t *ComputerUseTool) coordinatePointerActionV1(
 		}
 		return failure, nil
 	}
+	clickFocusRecorded := t.recordCoordinateClickFocusV1(
+		args,
+		request,
+		currentTree,
+		result,
+	)
 	switch result.Status {
 	case "completed":
-		return agent.ToolResult{Content: fmt.Sprintf(
+		content := fmt.Sprintf(
 			"coordinate %s completed at verified target; re-observe before the next action",
-			args.Action), GUIOutcome: computerUseCoordinateGUIOutcomeV1(request, result)}, nil
+			args.Action,
+		)
+		if clickFocusRecorded {
+			content = "coordinate click completed at the verified pointer; " +
+				"type may use this state_id once only if fresh AX state proves an editable focused element"
+		}
+		return agent.ToolResult{
+			Content:    content,
+			GUIOutcome: computerUseCoordinateGUIOutcomeV1(request, result),
+		}, nil
 	case "completed_unverified":
-		if args.Action == "click" && request.Button != nil && *request.Button == "left" &&
-			request.ClickCount != nil && *request.ClickCount == 1 &&
-			len(request.Modifiers) == 0 && request.RiskAssertion == nil &&
-			result.PrimaryActionCommitted && result.PointerEndpoint != nil &&
-			result.PointerEndpoint.Verified && result.PointerEndpoint.Observed != nil &&
-			result.FailureCode != nil &&
-			*result.FailureCode == "click_postcondition_not_declared" &&
-			currentTree.WindowFrame != nil {
-			app := strings.TrimSpace(currentTree.AppName)
-			if app == "" {
-				app = strings.TrimSpace(currentTree.App)
-			}
-			t.coordinateFocus = &computerUseCoordinateFocusV1{
-				stateID: args.StateID, pid: currentTree.PID,
-				bundleID: currentTree.BundleID, app: app,
-				windowID: uint32(*currentTree.WindowID),
-				expectedWindowAXBounds: CoordinateQuartzRectV1{
-					X: currentTree.WindowFrame.X, Y: currentTree.WindowFrame.Y,
-					Width: currentTree.WindowFrame.Width, Height: currentTree.WindowFrame.Height,
-				},
-				filter: t.snapshot.filter, budget: t.snapshot.budget,
-			}
+		if clickFocusRecorded {
 			return agent.ToolResult{Content: "coordinate click completed_unverified at the verified pointer; " +
-				"if this click focused a text editor, type may use this state_id once without a ref; " +
+				"type may use this state_id once only if fresh AX state proves an editable focused element; " +
 				"otherwise re-observe before the next action; do not retry the click automatically",
 				GUIOutcome: computerUseCoordinateGUIOutcomeV1(request, result)}, nil
 		}
@@ -2946,6 +3022,44 @@ func (t *ComputerUseTool) coordinatePointerActionV1(
 		failure.GUIOutcome = computerUseCoordinateGUIOutcomeV1(request, result)
 		return failure, nil
 	}
+}
+
+func (t *ComputerUseTool) recordCoordinateClickFocusV1(
+	args computerUseArgs,
+	request CoordinateMouseEventRequestV1,
+	currentTree computerUseTree,
+	result CoordinateMouseEventResultV1,
+) bool {
+	if args.Action != "click" ||
+		request.Button == nil || *request.Button != "left" ||
+		request.ClickCount == nil || *request.ClickCount != 1 ||
+		len(request.Modifiers) != 0 || request.RiskAssertion != nil ||
+		!result.PrimaryActionCommitted || result.PointerEndpoint == nil ||
+		!result.PointerEndpoint.Verified ||
+		result.PointerEndpoint.Observed == nil ||
+		currentTree.WindowID == nil || *currentTree.WindowID <= 0 ||
+		uint64(*currentTree.WindowID) > uint64(^uint32(0)) ||
+		currentTree.WindowFrame == nil ||
+		result.Status != "completed_unverified" ||
+		result.FailureCode == nil ||
+		*result.FailureCode != "click_postcondition_not_declared" {
+		return false
+	}
+	app := strings.TrimSpace(currentTree.AppName)
+	if app == "" {
+		app = strings.TrimSpace(currentTree.App)
+	}
+	t.coordinateFocus = &computerUseCoordinateFocusV1{
+		stateID: args.StateID, pid: currentTree.PID,
+		bundleID: currentTree.BundleID, app: app,
+		windowID: uint32(*currentTree.WindowID),
+		expectedWindowAXBounds: CoordinateQuartzRectV1{
+			X: currentTree.WindowFrame.X, Y: currentTree.WindowFrame.Y,
+			Width: currentTree.WindowFrame.Width, Height: currentTree.WindowFrame.Height,
+		},
+		filter: t.snapshot.filter, budget: t.snapshot.budget,
+	}
+	return true
 }
 
 func computerUseCoordinateGUIOutcomeV1(

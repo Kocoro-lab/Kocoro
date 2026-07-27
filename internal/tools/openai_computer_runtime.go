@@ -47,6 +47,18 @@ type OpenAIComputerTaskAppV1 struct {
 	PID      int
 }
 
+type OpenAIComputerActionPlanErrorV1 struct {
+	FailureCode string
+	Detail      string
+}
+
+func (e *OpenAIComputerActionPlanErrorV1) Error() string {
+	if e == nil {
+		return "OpenAI computer action plan failed"
+	}
+	return e.Detail
+}
+
 // NewOpenAIComputerActionRuntimeV1 accepts only a registry entry carrying
 // Kocoro's final GUI execution gate. A raw ComputerUseTool would let a future
 // caller accidentally bypass the daemon coordinator, so it is rejected even
@@ -213,6 +225,7 @@ func (r *OpenAIComputerActionRuntimeV1) AuthorizeOpenAIComputerTypeAfterKeypress
 		filter:                 snapshot.filter,
 		budget:                 snapshot.budget,
 		locationNavigation:     openAIComputerLocationFocusShortcutV1(action),
+		allowsWindowBoundType:  openAIComputerLocationFocusShortcutV1(action),
 		// The target comes from the post-keypress refresh itself. Any later
 		// input is still bound to the same verified app, window, and frame.
 	}
@@ -378,7 +391,11 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 			ref, err = anthropicHelpers.uniqueFocusedRef()
 			if err != nil {
 				return OpenAIComputerActionPlanV1{},
-					fmt.Errorf("OpenAI computer type target is unavailable")
+					&OpenAIComputerActionPlanErrorV1{
+						FailureCode: "keyboard_plan_focused_ref_unavailable",
+						Detail: "OpenAI computer type target is unavailable: " +
+							err.Error(),
+					}
 			}
 		}
 		text := action.Text

@@ -2,6 +2,21 @@ import XCTest
 @testable import ax_server
 
 final class WindowCaptureTests: XCTestCase {
+    func testWindowIdentityToleranceMatchesSharedContractFixture() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("testdata/window_identity_contract.v1.json")
+        let data = try Data(contentsOf: fixtureURL)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["schema_version"] as? Int, 1)
+        XCTAssertEqual(
+            object["ax_cg_frame_tolerance_points"] as? Double,
+            captureWindowFrameToleranceV1)
+    }
+
     func testAnnotateResultCarriesExactWindowIdentityAndLogicalBounds() throws {
         let result = AnnotateResult(
             app: "Editor",

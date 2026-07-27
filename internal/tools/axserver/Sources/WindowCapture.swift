@@ -12,7 +12,13 @@ struct WindowCaptureCandidate: Equatable {
     let frame: AXFrame
 }
 
-private func captureWindowFramesMatch(_ lhs: AXFrame, _ rhs: AXFrame, tolerance: Double = 2) -> Bool {
+let captureWindowFrameToleranceV1 = 2.0
+
+private func captureWindowFramesMatch(
+    _ lhs: AXFrame,
+    _ rhs: AXFrame,
+    tolerance: Double = captureWindowFrameToleranceV1
+) -> Bool {
     abs(lhs.x - rhs.x) <= tolerance &&
         abs(lhs.y - rhs.y) <= tolerance &&
         abs(lhs.width - rhs.width) <= tolerance &&

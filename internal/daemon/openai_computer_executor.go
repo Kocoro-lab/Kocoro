@@ -471,9 +471,32 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 
 	plan, err := e.runtime.PlanOpenAIComputerActionV1(ctx, action)
 	if err != nil {
+		failureCode := "action_projection_failed"
+		detail := "the action planner rejected the provider action"
+		var planErr *tools.OpenAIComputerActionPlanErrorV1
+		if errors.As(err, &planErr) &&
+			strings.TrimSpace(planErr.FailureCode) != "" {
+			failureCode = strings.TrimSpace(planErr.FailureCode)
+			detail = strings.TrimSpace(planErr.Detail)
+		}
+		result := agent.BusinessError(
+			"computer_use_error: " + failureCode + "\n" +
+				"message: the OpenAI computer action could not be safely projected\n" +
+				"detail: " + detail,
+		)
+		result.GUIOutcome = &agent.GUIActionOutcome{
+			Result:      agent.GUIActionResultFailed,
+			Phase:       agent.GUIActionPhaseActing,
+			FailureCode: failureCode,
+		}
 		return tools.OpenAIComputerActionExecutionV1{
-			CommitState: tools.OpenAIComputerNotCommittedV1,
-		}, fmt.Errorf("OpenAI computer action could not be safely projected")
+				CommitState: tools.OpenAIComputerNotCommittedV1,
+				Result:      result,
+			},
+			fmt.Errorf(
+				"OpenAI computer action could not be safely projected (%s)",
+				failureCode,
+			)
 	}
 	if plan.Mutation != openAIComputerActionMutatesInDaemonV1(action) {
 		return tools.OpenAIComputerActionExecutionV1{
@@ -621,6 +644,7 @@ func (e *daemonOpenAIComputerExecutorV1) CaptureFinalOpenAIComputerObservationV1
 	result, err = runOpenAIComputerObservationV1(
 		ctx,
 		maxOpenAIComputerFinalObservationsV1,
+		false,
 		e.observationRetry,
 		func(
 			attemptCtx context.Context,

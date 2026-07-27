@@ -88,6 +88,134 @@ func TestComputerUseConsequentialKeyboardNeedsExactIntent(t *testing.T) {
 	}
 }
 
+func TestComputerUsePlainReturnAllowsFreshOrdinaryEditableFocus(t *testing.T) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.tree = computerUseCoordinateFocusedTextTreeV1(harness.tree)
+	title := "Document body"
+	harness.tree.Elements[0].Title = &title
+	harness.observe(t)
+	raw := fmt.Sprintf(
+		`{"action":"keypress","state_id":%q,"key_sequence":["return"],"description":"Insert a new line"}`,
+		harness.tool.snapshot.id,
+	)
+	preflight, err := harness.tool.PreflightConsequentialRiskV1(
+		context.Background(),
+		raw,
+		"toolu_plain_return",
+	)
+	if err != nil || preflight.Status != ConsequentialRiskPreflightNoneV1 {
+		t.Fatalf("preflight=%+v err=%v", preflight, err)
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	executed := false
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context,
+		request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		executed = true
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified",
+			Action: request.Action, InputCommitted: true,
+			Phase: "post_verification", FailureCode: &failure,
+		}, nil
+	}
+	result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		raw,
+	)
+	if err != nil || result.IsError || !executed {
+		t.Fatalf("result=%+v err=%v executed=%v", result, err, executed)
+	}
+}
+
+func TestComputerUsePlainReturnBlocksMessageComposerShortcut(t *testing.T) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.tree = computerUseCoordinateFocusedTextTreeV1(harness.tree)
+	title := "Message Zoro"
+	harness.tree.Elements[0].Title = &title
+	harness.observe(t)
+	raw := fmt.Sprintf(
+		`{"action":"keypress","state_id":%q,"key_sequence":["return"],"description":"Send the message"}`,
+		harness.tool.snapshot.id,
+	)
+	preflight, err := harness.tool.PreflightConsequentialRiskV1(
+		context.Background(),
+		raw,
+		"toolu_send_return",
+	)
+	if err != nil ||
+		preflight.Status != ConsequentialRiskPreflightBlockedV1 ||
+		preflight.FailureCode != ConsequentialRiskCodeUnsupportedPathV1 {
+		t.Fatalf("preflight=%+v err=%v", preflight, err)
+	}
+	executed := false
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context,
+		request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		executed = true
+		return TargetBoundInputResultV1{}, nil
+	}
+	result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		raw,
+	)
+	if err != nil || !result.IsError || executed ||
+		result.GUIOutcome == nil ||
+		result.GUIOutcome.FailureCode !=
+			ConsequentialRiskCodeUnsupportedPathV1 {
+		t.Fatalf(
+			"result=%+v err=%v executed=%v",
+			result,
+			err,
+			executed,
+		)
+	}
+}
+
+func TestComputerUsePlainReturnRevalidatesFocusedElement(t *testing.T) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.tree = computerUseCoordinateFocusedTextTreeV1(harness.tree)
+	title := "Document body"
+	harness.tree.Elements[0].Title = &title
+	harness.observe(t)
+	raw := fmt.Sprintf(
+		`{"action":"keypress","state_id":%q,"key_sequence":["return"],"description":"Insert a new line"}`,
+		harness.tool.snapshot.id,
+	)
+	changed := cloneComputerUseTree(t, harness.tree)
+	changed.FocusedRef = nil
+	changed.Elements[0].Focused = false
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, changed))
+	executed := false
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context,
+		request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		executed = true
+		return TargetBoundInputResultV1{}, nil
+	}
+	result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		raw,
+	)
+	if err != nil || !result.IsError || executed ||
+		result.GUIOutcome == nil ||
+		result.GUIOutcome.FailureCode !=
+			"keyboard_focused_element_changed" {
+		t.Fatalf(
+			"result=%+v err=%v executed=%v",
+			result,
+			err,
+			executed,
+		)
+	}
+}
+
 func TestComputerUseModifiedSpaceRemainsOrdinaryNavigation(t *testing.T) {
 	requireComputerUseDarwin(t)
 	raw := `{"action":"keypress","state_id":"s_state","modifiers":["command"],"key_sequence":["space"],"description":"Switch app"}`

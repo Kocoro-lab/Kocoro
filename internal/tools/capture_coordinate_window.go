@@ -16,6 +16,8 @@ import (
 	"time"
 )
 
+const coordinateWindowIdentityToleranceV1 = 2.0
+
 type CaptureCoordinateWindowRequestV1 struct {
 	SchemaVersion        int                     `json:"schema_version"`
 	TopologyRef          CoordinateTopologyRefV1 `json:"topology_ref"`
@@ -432,8 +434,10 @@ func captureCoordinateWindowBase64HasWhitespace(value string) bool {
 }
 
 func captureCoordinateWindowRectsCorrelate(left, right CoordinateQuartzRectV1) bool {
-	return math.Abs(left.X-right.X) <= 2 && math.Abs(left.Y-right.Y) <= 2 &&
-		math.Abs(left.Width-right.Width) <= 2 && math.Abs(left.Height-right.Height) <= 2
+	return math.Abs(left.X-right.X) <= coordinateWindowIdentityToleranceV1 &&
+		math.Abs(left.Y-right.Y) <= coordinateWindowIdentityToleranceV1 &&
+		math.Abs(left.Width-right.Width) <= coordinateWindowIdentityToleranceV1 &&
+		math.Abs(left.Height-right.Height) <= coordinateWindowIdentityToleranceV1
 }
 
 func captureCoordinateWindowRectContains(outer DisplayTopologyRectV1, inner CoordinateQuartzRectV1) bool {

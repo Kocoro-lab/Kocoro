@@ -370,6 +370,11 @@ func boundOpenAIComputerObservationDetailV1(value string) string {
 // contain refs, values, and state IDs before its screenshot_warning; those are
 // private executor authority and must not escape into the parent transcript.
 func openAIComputerObservationResultDetailV1(result agent.ToolResult) string {
+	if result.GUIObservation != nil &&
+		!result.GUIObservation.CoordinateActionable &&
+		len(result.Images) == 1 {
+		return "the exact target window image was visual-only and could not safely seed desktop actions"
+	}
 	content := result.Content
 	if marker := strings.LastIndex(content, "screenshot_warning:"); marker >= 0 {
 		content = strings.TrimSpace(content[marker+len("screenshot_warning:"):])
@@ -428,6 +433,10 @@ func retryOpenAIComputerObservationV1(
 	if result.IsRetryable {
 		return true
 	}
+	if result.GUIObservation != nil &&
+		!result.GUIObservation.CoordinateActionable {
+		return true
+	}
 	switch openAIComputerTraceFailureCodeV1(result, nil) {
 	case "window_not_found",
 		"window_not_actionable",
@@ -468,6 +477,7 @@ type openAIComputerObservationRecorderV1 func(
 func runOpenAIComputerObservationV1(
 	ctx context.Context,
 	maxAttempts int,
+	requireCoordinateActionable bool,
 	retryWait func(context.Context, int) error,
 	attempt openAIComputerObservationAttemptV1,
 	record openAIComputerObservationRecorderV1,
@@ -490,7 +500,10 @@ func runOpenAIComputerObservationV1(
 		if record != nil {
 			record(attemptIndex, result, err, time.Since(started))
 		}
-		if err == nil && !result.IsError && len(result.Images) == 1 {
+		actionable := result.GUIObservation == nil ||
+			result.GUIObservation.CoordinateActionable
+		if err == nil && !result.IsError && len(result.Images) == 1 &&
+			(!requireCoordinateActionable || actionable) {
 			return result, nil
 		}
 		if attemptIndex == maxAttempts ||
@@ -709,6 +722,7 @@ func (t *openAIComputerTaskToolV1) Run(
 	initial, observationErr = runOpenAIComputerObservationV1(
 		ctx,
 		maxOpenAIComputerInitialObservationsV1,
+		true,
 		retryObservation,
 		func(
 			attemptCtx context.Context,
@@ -873,7 +887,7 @@ func (t *openAIComputerTaskToolV1) Run(
 			"Continue across app switches, " +
 			"and stop as soon as the requested end state is verified. " +
 			"Keyboard actions are bound to the latest verified target app, window, and focus; re-observe whenever that target is uncertain. " +
-			"For browser navigation, focus the location field, type the exact URL, and use Return only while the latest observation still verifies that location-field focus. " +
+			"For browser navigation, use Command-L, type the exact URL, then Return while the latest observation still verifies the same browser window. " +
 			"If keyboard focus is unavailable or Return is rejected, do not repeat it; use the latest screenshot to click the exact visible Go, URL suggestion, or navigation target instead. " +
 			"Click the intended visible button for harmless dialogs. " +
 			"For send, delete, or purchase actions, click the exact visible action button and wait for Kocoro's one local confirmation; " +

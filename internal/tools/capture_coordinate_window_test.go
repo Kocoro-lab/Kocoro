@@ -28,6 +28,27 @@ func canonicalCaptureWindowTopology(t *testing.T) DisplayTopologyV1 {
 	return topology
 }
 
+func TestWindowIdentityToleranceMatchesSharedContractFixture(t *testing.T) {
+	var contract struct {
+		SchemaVersion int     `json:"schema_version"`
+		Tolerance     float64 `json:"ax_cg_frame_tolerance_points"`
+	}
+	if err := json.Unmarshal(
+		loadCoordinateFixture(t, "window_identity_contract.v1.json"),
+		&contract,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if contract.SchemaVersion != 1 ||
+		contract.Tolerance != coordinateWindowIdentityToleranceV1 {
+		t.Fatalf(
+			"window identity contract=%+v Go tolerance=%v",
+			contract,
+			coordinateWindowIdentityToleranceV1,
+		)
+	}
+}
+
 func canonicalCaptureWindowLimits() CaptureCoordinateWindowLimitsV1 {
 	return CaptureCoordinateWindowLimitsV1{
 		MaxRawBytes:    1024,

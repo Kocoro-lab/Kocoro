@@ -128,6 +128,32 @@ func computerUsePlainReturnKeypressV1(args computerUseArgs) bool {
 	return key == "return" || key == "enter"
 }
 
+func computerUseKeyboardMayUseFocusedWitnessV1(args computerUseArgs) bool {
+	var key string
+	var modifiers []string
+	switch args.Action {
+	case "keypress":
+		if len(args.KeySequence) != 1 {
+			return false
+		}
+		key = canonicalComputerUseHotkeyTokenV1(args.KeySequence[0])
+		modifiers = args.Modifiers
+	case "hotkey":
+		var ok bool
+		key, modifiers, ok = parseComputerUseHotkeyV1(args.Keys)
+		if !ok {
+			return false
+		}
+		key = canonicalComputerUseHotkeyTokenV1(key)
+	default:
+		return false
+	}
+	if len(modifiers) != 0 {
+		return false
+	}
+	return key == "return" || key == "enter" || key == "space"
+}
+
 func openAIComputerLocationFocusShortcutV1(
 	action OpenAIComputerActionV1,
 ) bool {

@@ -1040,10 +1040,10 @@ func openAIComputerActionFailureV1(
 	case OpenAIComputerCommitUnverifiedV1, OpenAIComputerCommitVerifiedV1:
 		message += "; input may have committed; do not retry automatically"
 	}
-	if executeErr != nil {
-		message += ": " + executeErr.Error()
-	} else if execution.Result.Content != "" {
+	if execution.Result.Content != "" {
 		message += ": " + execution.Result.Content
+	} else if executeErr != nil {
+		message += ": " + executeErr.Error()
 	}
 	failure := agent.BusinessError(message)
 	if execution.Result.GUIOutcome != nil {

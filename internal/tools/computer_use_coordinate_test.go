@@ -122,6 +122,10 @@ func TestComputerUseObservationUsesExactVisualOnlyFallbackWithoutCoordinateAutho
 	if harness.tool.coordinateArtifact != nil {
 		t.Fatal("visual-only screenshot minted coordinate authority")
 	}
+	if result.GUIObservation == nil ||
+		result.GUIObservation.CoordinateActionable {
+		t.Fatalf("visual-only observation metadata = %+v", result.GUIObservation)
+	}
 	if !strings.Contains(result.Content, "visual-only") {
 		t.Fatalf("visual-only limitation was not disclosed: %s", result.Content)
 	}
@@ -476,6 +480,8 @@ func TestComputerUseVerifiedCoordinateClickBindsLiveFocusedRefForType(t *testing
 	}
 
 	focusedTree := computerUseCoordinateFocusedTextTreeV1(harness.tree)
+	focusedTree.WindowFrame.X += 1.5
+	focusedTree.WindowFrame.Y -= 2
 	harness.fake.queue("read_tree", marshalComputerUseTree(t, focusedTree))
 	var executed *TargetBoundInputRequestV1
 	harness.tool.targetBoundInputExecutor = func(
@@ -518,7 +524,7 @@ func TestComputerUseVerifiedCoordinateClickBindsLiveFocusedRefForType(t *testing
 	}
 }
 
-func TestComputerUseCoordinateTypeFallsBackToOneShotSameWindowWitness(
+func TestComputerUseLocationShortcutTypeFallsBackToOneShotSameWindowWitness(
 	t *testing.T,
 ) {
 	requireComputerUseDarwin(t)
@@ -533,6 +539,7 @@ func TestComputerUseCoordinateTypeFallsBackToOneShotSameWindowWitness(
 		expectedWindowAXBounds: *frame,
 		filter:                 harness.tool.snapshot.filter,
 		budget:                 harness.tool.snapshot.budget,
+		allowsWindowBoundType:  true,
 	}
 	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
 	var executed *TargetBoundInputRequestV1
@@ -562,6 +569,53 @@ func TestComputerUseCoordinateTypeFallsBackToOneShotSameWindowWitness(
 		executed.WindowID != uint32(*harness.tree.WindowID) {
 		t.Fatalf("same-window focus fallback result=%+v err=%v executed=%+v",
 			result, err, executed)
+	}
+}
+
+func TestComputerUseCoordinateClickTypeRequiresEditableFocusWitness(t *testing.T) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.observe(t)
+	frame := harness.tool.snapshot.expectedWindowAXBounds
+	harness.tool.coordinateFocus = &computerUseCoordinateFocusV1{
+		stateID:                harness.tool.snapshot.id,
+		pid:                    harness.tree.PID,
+		bundleID:               harness.tree.BundleID,
+		windowID:               uint32(*harness.tree.WindowID),
+		expectedWindowAXBounds: *frame,
+		filter:                 harness.tool.snapshot.filter,
+		budget:                 harness.tool.snapshot.budget,
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	executed := false
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context,
+		request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		executed = true
+		return TargetBoundInputResultV1{}, nil
+	}
+	result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		fmt.Sprintf(`{
+			"action":"type","state_id":%q,"text":"must not type",
+			"description":"Require fresh editable focus"
+		}`, harness.tool.snapshot.id),
+	)
+	if err != nil || !result.IsError || executed ||
+		result.GUIOutcome == nil ||
+		result.GUIOutcome.FailureCode !=
+			"keyboard_focused_element_unavailable" ||
+		!strings.Contains(
+			result.Content,
+			"gate: keyboard_focused_element_unavailable",
+		) {
+		t.Fatalf(
+			"missing focus witness result=%+v err=%v executed=%v",
+			result,
+			err,
+			executed,
+		)
 	}
 }
 
@@ -646,6 +700,8 @@ func TestComputerUseCoordinateFocusSurvivesOneSameWindowReobservation(t *testing
 	}
 
 	focused := computerUseCoordinateFocusedTextTreeV1(harness.tree)
+	focused.WindowFrame.Width += 2
+	focused.WindowFrame.Height -= 1.5
 	title := "Editor focused"
 	focused.Elements[0].Title = &title
 	harness.fake.queue("read_tree", marshalComputerUseTree(t, focused))

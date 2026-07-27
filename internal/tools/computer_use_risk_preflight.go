@@ -168,6 +168,11 @@ func (t *ComputerUseTool) PreflightConsequentialRiskV1(
 				Status: ConsequentialRiskPreflightNoneV1,
 			}, nil
 		}
+		if _, ok := t.ordinaryKeyboardFocusWitnessV1(args); ok {
+			return ConsequentialRiskPreflightResultV1{
+				Status: ConsequentialRiskPreflightNoneV1,
+			}, nil
+		}
 		return ConsequentialRiskPreflightResultV1{
 			Status:      ConsequentialRiskPreflightBlockedV1,
 			FailureCode: ConsequentialRiskCodeUnsupportedPathV1,
@@ -253,6 +258,95 @@ func (t *ComputerUseTool) PreflightConsequentialRiskV1(
 		},
 	}
 	return ConsequentialRiskPreflightResultV1{Status: ConsequentialRiskPreflightRequiredV1, Draft: draft}, nil
+}
+
+type computerUseKeyboardFocusWitnessV1 struct {
+	path string
+	role string
+}
+
+func (t *ComputerUseTool) ordinaryKeyboardFocusWitnessV1(
+	args computerUseArgs,
+) (computerUseKeyboardFocusWitnessV1, bool) {
+	if !computerUseKeyboardMayUseFocusedWitnessV1(args) ||
+		t == nil || t.snapshot == nil || !t.snapshot.typed ||
+		!validComputerUseRef(t.snapshot.focusedRef) {
+		return computerUseKeyboardFocusWitnessV1{}, false
+	}
+	entry, exists := t.refs[t.snapshot.focusedRef]
+	if !exists || entry.path == "" || entry.role == "" ||
+		entry.fingerprint == "" {
+		return computerUseKeyboardFocusWitnessV1{}, false
+	}
+	element, err := resolveComputerUseFingerprint(
+		t.snapshot.elements,
+		entry.fingerprint,
+	)
+	if err != nil ||
+		element.Ref != t.snapshot.focusedRef ||
+		entry.role != element.Role ||
+		entry.fingerprint != element.Fingerprint ||
+		!computerUseKeyboardFocusRoleAllowedV1(args, element) ||
+		computerUseFocusedKeyboardElementConsequentialV1(element) {
+		return computerUseKeyboardFocusWitnessV1{}, false
+	}
+	return computerUseKeyboardFocusWitnessV1{
+		path: entry.path,
+		role: entry.role,
+	}, true
+}
+
+func computerUseKeyboardFocusRoleAllowedV1(
+	args computerUseArgs,
+	element computerUseElement,
+) bool {
+	if element.Enabled != nil && !*element.Enabled {
+		return false
+	}
+	switch element.Role {
+	case "AXTextField", "AXTextArea", "AXComboBox", "AXButton":
+		return true
+	case "AXCheckBox", "AXRadioButton":
+		return !computerUsePlainReturnKeypressV1(args)
+	default:
+		return false
+	}
+}
+
+func computerUseFocusedKeyboardElementConsequentialV1(
+	element computerUseElement,
+) bool {
+	if classifyConsequentialRiskLabelsV1(
+		element.Title,
+		element.Description,
+		element.Desc,
+		element.Identifier,
+	) != consequentialRiskSemanticNoneV1 {
+		return true
+	}
+	for _, label := range []*string{
+		element.Title,
+		element.Description,
+		element.Desc,
+		element.Identifier,
+	} {
+		if label == nil {
+			continue
+		}
+		if validateConsequentialRiskLabelV1("semantic_label", *label) != nil ||
+			strings.IndexFunc(*label, unicode.IsControl) >= 0 {
+			return true
+		}
+		normalized := normalizeConsequentialRiskLabelV1(*label)
+		for _, marker := range []string{
+			"message", "composer", "chat", "reply", "comment",
+		} {
+			if strings.Contains(normalized, marker) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type consequentialRiskCoordinateHitV1 struct {
