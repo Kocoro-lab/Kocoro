@@ -940,7 +940,11 @@ func (s *Server) forwardRemoteEvents(ctx context.Context) {
 
 func remoteEventAllowed(evt Event) bool {
 	switch evt.Type {
-	case EventApprovalRequest, EventApprovalResolved, EventApprovalNotice:
+	// Interactive requests stay local until the remote-control protocol can
+	// resolve them. Forwarding only one side would expose their payloads while
+	// leaving remote clients with no allowed POST endpoint to answer them.
+	case EventApprovalRequest, EventApprovalResolved, EventApprovalNotice,
+		EventQuestionRequest, EventQuestionResolved:
 		return false
 	default:
 		return true
