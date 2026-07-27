@@ -134,7 +134,8 @@ func (request TargetBoundInputRequestV1) Validate() error {
 			request.ExpectedFingerprint != nil ||
 			request.Text != nil || request.Key == nil || *request.Key == "" ||
 			*request.Key != strings.TrimSpace(*request.Key) || request.Keys != nil ||
-			request.Modifiers == nil || len(*request.Modifiers) > 4 {
+			request.Modifiers == nil || *request.Modifiers == nil ||
+			len(*request.Modifiers) > 4 {
 			return fmt.Errorf("target_bound_input hotkey requires key/modifiers and null text/keys")
 		}
 		if err := validateTargetBoundInputModifiersV1(*request.Modifiers); err != nil {
@@ -145,7 +146,8 @@ func (request TargetBoundInputRequestV1) Validate() error {
 			request.ExpectedFingerprint != nil ||
 			request.Text != nil || request.Key != nil ||
 			request.Keys == nil || len(*request.Keys) == 0 || len(*request.Keys) > 64 ||
-			request.Modifiers == nil || len(*request.Modifiers) > 4 {
+			request.Modifiers == nil || *request.Modifiers == nil ||
+			len(*request.Modifiers) > 4 {
 			return fmt.Errorf("target_bound_input keypress requires keys/modifiers and null text/key")
 		}
 		if err := validateTargetBoundInputModifiersV1(*request.Modifiers); err != nil {
@@ -452,9 +454,20 @@ func (client *AXClient) targetBoundInputV1(
 				return TargetBoundInputResultV1{}, newTargetBoundInputCommitUnknownV1(fmt.Errorf(
 					"decode target-bound input result: %w", decodeErr))
 			}
+			// "unknown" is the helper's strict, typed preflight rejection. It
+			// explicitly proves that no input committed, so preserve the result
+			// for the caller instead of turning a malformed request into a
+			// misleading commit-unknown error.
+			if result.Action == "unknown" {
+				return result, nil
+			}
 			if result.Action != request.Action {
 				return TargetBoundInputResultV1{}, newTargetBoundInputCommitUnknownV1(
-					fmt.Errorf("target-bound input response action mismatch"))
+					fmt.Errorf(
+						"target-bound input response action mismatch: requested %q, received %q",
+						request.Action,
+						result.Action,
+					))
 			}
 			return result, nil
 		case <-ctxDone:

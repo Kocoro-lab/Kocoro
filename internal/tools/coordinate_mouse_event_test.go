@@ -361,6 +361,22 @@ func TestCoordinateMouseEventV1AcceptsPointOccludedAsFailClosedPreflight(t *test
 	}
 }
 
+func TestCoordinateMouseEventV1AcceptsInputRecoveryBlockedAsFailClosedPreflight(t *testing.T) {
+	result := coordinateMouseJSONMap(
+		t,
+		loadCoordinateFixture(
+			t,
+			"coordinate_mouse_event.response.failed.stale_topology.v1.json",
+		),
+	)
+	result["failure_code"] = "input_recovery_blocked"
+	if _, err := DecodeCoordinateMouseEventResultV1(
+		marshalCoordinateMouseJSON(t, result),
+	); err != nil {
+		t.Fatalf("input-recovery-blocked preflight result rejected: %v", err)
+	}
+}
+
 func TestCoordinateMouseEventV1AcceptsStrictRawRequestFailureWithUnknownAction(t *testing.T) {
 	result := coordinateMouseJSONMap(t, loadCoordinateFixture(t, "coordinate_mouse_event.response.failed.stale_topology.v1.json"))
 	result["action"] = "unknown"

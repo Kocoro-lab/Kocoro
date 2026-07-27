@@ -171,19 +171,104 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerObservationV1(
 	description string,
 	includeScreenshot bool,
 ) (OpenAIComputerActionPlanV1, error) {
+	return r.planOpenAIComputerObservationV1(
+		nil,
+		description,
+		includeScreenshot,
+	)
+}
+
+// AuthorizeOpenAIComputerTypeAfterKeypressV1 installs one window-bound,
+// one-shot keyboard target after the daemon has executed a provider keypress
+// and refreshed the real frontmost window. This covers ordinary ordered
+// batches such as focus-shortcut -> type without trusting a stale pre-keypress
+// AX focus or inventing app-specific address-bar rules.
+func (r *OpenAIComputerActionRuntimeV1) AuthorizeOpenAIComputerTypeAfterKeypressV1(
+	action OpenAIComputerActionV1,
+) error {
+	if r == nil || r.raw == nil || r.raw.snapshot == nil {
+		return fmt.Errorf("OpenAI computer post-keypress target is unavailable")
+	}
+	if action.Type != OpenAIComputerActionKeypressV1 {
+		return fmt.Errorf("OpenAI computer post-keypress action identity is invalid")
+	}
+	snapshot := r.raw.snapshot
+	if !snapshot.typed || snapshot.id == "" || snapshot.pid <= 0 ||
+		strings.TrimSpace(snapshot.bundleID) == "" ||
+		strings.TrimSpace(snapshot.app) == "" ||
+		snapshot.windowID == nil || *snapshot.windowID <= 0 ||
+		uint64(*snapshot.windowID) > uint64(^uint32(0)) ||
+		snapshot.expectedWindowAXBounds == nil ||
+		snapshot.expectedWindowAXBounds.Width <= 0 ||
+		snapshot.expectedWindowAXBounds.Height <= 0 {
+		return fmt.Errorf("OpenAI computer post-keypress target identity is invalid")
+	}
+	r.raw.coordinateFocus = &computerUseCoordinateFocusV1{
+		stateID:                snapshot.id,
+		pid:                    snapshot.pid,
+		bundleID:               snapshot.bundleID,
+		app:                    snapshot.app,
+		windowID:               uint32(*snapshot.windowID),
+		expectedWindowAXBounds: *snapshot.expectedWindowAXBounds,
+		filter:                 snapshot.filter,
+		budget:                 snapshot.budget,
+		// The target comes from the post-keypress refresh itself. Any later
+		// tree change invalidates it before type commits.
+		observationBound:   true,
+		locationNavigation: openAIComputerLocationFocusKeypressV1(action),
+	}
+	return nil
+}
+
+func openAIComputerLocationFocusKeypressV1(action OpenAIComputerActionV1) bool {
+	modifiers, keys, err := openAIComputerKeySequenceV1(action.Keys)
+	return err == nil &&
+		len(modifiers) == 1 && modifiers[0] == "command" &&
+		len(keys) == 1 && keys[0] == "l"
+}
+
+// PlanOpenAIComputerTaskInitialObservationV1 binds the first screenshot to the
+// first optional task app hint. Later observations deliberately pass nil and
+// follow the real frontmost app so one native task can still switch apps.
+func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerTaskInitialObservationV1(
+	app *OpenAIComputerTaskAppV1,
+	description string,
+	includeScreenshot bool,
+) (OpenAIComputerActionPlanV1, error) {
+	return r.planOpenAIComputerObservationV1(
+		app,
+		description,
+		includeScreenshot,
+	)
+}
+
+func (r *OpenAIComputerActionRuntimeV1) planOpenAIComputerObservationV1(
+	app *OpenAIComputerTaskAppV1,
+	description string,
+	includeScreenshot bool,
+) (OpenAIComputerActionPlanV1, error) {
 	if strings.TrimSpace(description) == "" {
 		return OpenAIComputerActionPlanV1{},
 			fmt.Errorf("OpenAI computer observation description is required")
 	}
-	if includeScreenshot {
-		// The next provider image must show the window that is actually
-		// frontmost after the ordered batch. Keeping the previous snapshot here
-		// would recapture the old app after Command-Tab and make multi-app tasks
-		// impossible.
-		r.raw.invalidateState()
+	// Every provider-requested observation follows the app/window that is
+	// actually frontmost now. This is also used for one lightweight,
+	// image-free refresh after a keypress when the same ordered batch has a
+	// later action: Command-Tab (and shortcuts that open another window) must
+	// not leave that later action bound to the previous app's snapshot.
+	r.raw.invalidateState()
+	appName := ""
+	if app != nil {
+		if strings.TrimSpace(app.App) == "" ||
+			strings.TrimSpace(app.BundleID) == "" {
+			return OpenAIComputerActionPlanV1{},
+				fmt.Errorf("OpenAI computer initial observation app identity is invalid")
+		}
+		appName = app.App
 	}
 	return r.plan(computerUseArgs{
 		Action:            "get_app_state",
+		App:               appName,
 		Description:       description,
 		IncludeScreenshot: includeScreenshot,
 	}, false)

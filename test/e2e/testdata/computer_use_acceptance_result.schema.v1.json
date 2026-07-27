@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kocoro.local/schemas/computer-use-acceptance-result.v1.json",
+  "title": "Computer Use acceptance result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "scenario_id",
+    "started_at",
+    "finished_at",
+    "outcome",
+    "build",
+    "metrics",
+    "visual_verification",
+    "failures"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "scenario_id": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "outcome": {
+      "enum": ["passed", "failed", "partial", "blocked", "not_run"]
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["daemon_commit", "daemon_dirty", "desktop_app_path", "team_id"],
+      "properties": {
+        "daemon_commit": {"type": "string", "minLength": 7},
+        "daemon_dirty": {"type": "boolean"},
+        "desktop_app_path": {"type": "string", "minLength": 1},
+        "team_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "duration_ms",
+        "initial_observation_attempts",
+        "provider_batches",
+        "actions",
+        "confirmations"
+      ],
+      "properties": {
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "initial_observation_attempts": {"type": "integer", "minimum": 0},
+        "provider_batches": {"type": "integer", "minimum": 0},
+        "actions": {"type": "integer", "minimum": 0},
+        "confirmations": {"type": "integer", "minimum": 0}
+      }
+    },
+    "visual_verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checked", "expected_states_met", "notes"],
+      "properties": {
+        "checked": {"type": "boolean"},
+        "expected_states_met": {"type": "integer", "minimum": 0},
+        "notes": {"type": "string"}
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["phase", "code"],
+        "properties": {
+          "phase": {"type": "string", "minLength": 1},
+          "code": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

@@ -235,9 +235,11 @@ struct InputDriver {
     ) -> Bool {
         let normalized = buttonName.lowercased() == "right" ? "right" : "left"
         let release = PreparedInputReleaseV1(metadata: .mouse(button: normalized)) {
-            up.post(tap: .cghidEventTap)
-            Thread.sleep(forTimeInterval: 0.005)
-            return !CGEventSource.buttonState(.combinedSessionState, button: button)
+            postAndConfirmInputReleaseV1(
+                post: { up.post(tap: .cghidEventTap) },
+                isReleased: {
+                    !CGEventSource.buttonState(.combinedSessionState, button: button)
+                })
         }
         guard let token = processInputCommitGateV1.registerPress(
             release: release,
@@ -254,9 +256,11 @@ struct InputDriver {
         up.flags = flags
         let release = PreparedInputReleaseV1(metadata: .key(
             virtualKey: UInt16(keyCode), eventFlags: flags.rawValue)) {
-            up.post(tap: .cghidEventTap)
-            Thread.sleep(forTimeInterval: 0.005)
-            return !CGEventSource.keyState(.combinedSessionState, key: keyCode)
+            postAndConfirmInputReleaseV1(
+                post: { up.post(tap: .cghidEventTap) },
+                isReleased: {
+                    !CGEventSource.keyState(.combinedSessionState, key: keyCode)
+                })
         }
         guard let token = processInputCommitGateV1.registerPress(
             release: release,

@@ -2658,6 +2658,18 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// output budget at the same boundary.
 	const maxTruncationRecoveries = 3
 
+	// maxOpenAIComputerErrorBatches bounds provider-native computer recovery.
+	// A failed-but-continuable batch returns only a fresh screenshot to the
+	// provider (computer_call_output carries no error text), so a stuck UI
+	// yields blind retry loops that burn one paid provider call per batch.
+	// After this many failed batches in one Run the loop terminates with the
+	// last executor failure reason instead of continuing.
+	// This is an invariant rather than a power-user workload limit: there is no
+	// runtime override while the continuation wire hides the failure reason.
+	// Changing it requires updating this constant and the exact request-count
+	// regression test; agent.max_iterations remains the outer loop ceiling.
+	const maxOpenAIComputerErrorBatches = 3
+
 	// maxInconsistentFinishRetries bounds the daemon-side retry budget for the
 	// "stop_reason=tool_use but no tool_use block AND no visible text" upstream
 	// anomaly. Matches shannon-cloud's `_retry_attempt` ceiling of 1 — if
@@ -2718,6 +2730,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		openAIComputerBaseRequest    *client.CompletionRequest
 		openAIContinuationRequest    *client.CompletionRequest
 		openAIContinuationScreenshot *client.ContentBlock
+		openAIComputerErrorBatches   int // total failed-but-continuable batches this Run; see maxOpenAIComputerErrorBatches
+		computerUseTerminalFailure   bool
 		afterCheckpoint              bool
 		checkpointDone               bool
 		nudges                       = newNudgeWindow(maxNudges, nudgeWindowIters)
@@ -4288,6 +4302,19 @@ iterationLoop:
 				setRunStatus(runstatus.CodeFromError(validationErr), false)
 				return "", usage, validationErr
 			}
+			if execution.Result.IsError {
+				openAIComputerErrorBatches++
+				if openAIComputerErrorBatches >= maxOpenAIComputerErrorBatches {
+					err := fmt.Errorf(
+						"OpenAI computer recovery stopped after %d failed action batches; the desktop task did not reach a verified end state%s",
+						openAIComputerErrorBatches,
+						openAIComputerExecutionDetail(execution),
+					)
+					captureRunMessages()
+					setRunStatus(runstatus.CodeFromError(err), false)
+					return "", usage, err
+				}
+			}
 
 			if openAIComputerBaseRequest == nil {
 				base := cloneOpenAIComputerBaseRequest(req)
@@ -4419,7 +4446,15 @@ iterationLoop:
 				markInjected()
 				continue
 			}
-			if totalToolCalls > 0 && hallucinationNudges < 2 && looksLikeUnverifiedClaim(resp.OutputText) {
+			// A native OpenAI computer final response is based on the exact
+			// screenshot returned by the immediately preceding computer_call.
+			// Its task wrapper parses a strict terminal outcome, so the generic
+			// "claim without verification in this response" nudge would discard
+			// valid long summaries and force an unnecessary provider round trip.
+			if openAIComputerBaseRequest == nil &&
+				totalToolCalls > 0 &&
+				hallucinationNudges < 2 &&
+				looksLikeUnverifiedClaim(resp.OutputText) {
 				hallucinationNudges++
 				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
@@ -4626,6 +4661,13 @@ iterationLoop:
 		// The first occurrence executes; duplicates get a synthetic error result.
 		// Arguments are normalized (compact JSON) to handle whitespace/key-order variance.
 		seenCalls := make(map[string]bool, len(toolCalls))
+		computerUseOwnsGUIResponse := false
+		for _, call := range toolCalls {
+			if call.Name == "computer_use" {
+				computerUseOwnsGUIResponse = true
+				break
+			}
+		}
 
 		for idx, fc := range toolCalls {
 			totalToolCalls++
@@ -4646,6 +4688,22 @@ iterationLoop:
 				continue
 			}
 			seenCalls[dedupKey] = true
+
+			blockedByPriorComputerUseFailure := computerUseTerminalFailure &&
+				isAlternateDesktopControlCall(fc.Name, argsStr)
+			blockedBesideComputerUse := computerUseOwnsGUIResponse &&
+				fc.Name != "computer_use" &&
+				isAlternateDesktopControlCall(fc.Name, argsStr)
+			if blockedByPriorComputerUseFailure || blockedBesideComputerUse {
+				blocked := alternateDesktopControlBlockedResult()
+				a.logAudit(fc.Name, argsStr, blocked.Content, "deny", false, 0, nil)
+				callMeta[idx].resolved = true
+				execResults[idx] = toolExecResult{result: blocked, name: fc.Name}
+				if a.handler != nil {
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, blocked, 0)
+				}
+				continue
+			}
 
 			// Denied-call blocking: auto-reject if this exact call was denied earlier
 			if deniedCalls[dedupKey] {
@@ -4991,6 +5049,9 @@ iterationLoop:
 			er := execResults[idx]
 			result := er.result
 			elapsed := er.elapsed
+			if isTerminalGoalComputerUseFailure(fc.Name, result) {
+				computerUseTerminalFailure = true
+			}
 
 			if callMeta[idx].resolved {
 				// Already resolved in Phase 1 (denied/unknown/hook-denied).

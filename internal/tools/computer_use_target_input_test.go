@@ -219,6 +219,84 @@ func TestComputerUseTargetBoundInputRequiresStateID(t *testing.T) {
 	}
 }
 
+func TestComputerUseTargetBoundKeypressEncodesNoModifiersAsExplicitArray(t *testing.T) {
+	requireComputerUseDarwin(t)
+	fake := newFakeAXCaller()
+	tool := newTestComputerUse(fake)
+	stateID := observeNotes(t, tool, fake, treeFixture("Save"))
+	fake.queue("read_tree", treeFixture("Save"))
+	var executed *TargetBoundInputRequestV1
+	tool.targetBoundInputExecutor = func(
+		_ context.Context,
+		request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		executed = &request
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: request.Action,
+			InputCommitted: true, Phase: "post_verification", FailureCode: &failure,
+		}, nil
+	}
+
+	result, err := tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		fmt.Sprintf(
+			`{"action":"keypress","state_id":%q,"key_sequence":["tab"],"description":"Advance focus"}`,
+			stateID,
+		),
+	)
+	if err != nil || result.IsError || executed == nil {
+		t.Fatalf("keypress result=%+v request=%+v err=%v", result, executed, err)
+	}
+	if executed.Modifiers == nil || *executed.Modifiers == nil ||
+		len(*executed.Modifiers) != 0 {
+		t.Fatalf("keypress modifiers were not an explicit empty array: %+v", executed.Modifiers)
+	}
+	wire, err := EncodeTargetBoundInputRPCRequestV1(TargetBoundInputRPCRequestV1{
+		ID: 901, Method: "target_bound_input", Params: *executed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wire), `"modifiers":[]`) ||
+		strings.Contains(string(wire), `"modifiers":null`) {
+		t.Fatalf("keypress wire did not preserve explicit empty modifiers: %s", wire)
+	}
+}
+
+func TestComputerUseTargetBoundHelperInvalidRequestIsPrecommitFailure(t *testing.T) {
+	requireComputerUseDarwin(t)
+	fake := newFakeAXCaller()
+	tool := newTestComputerUse(fake)
+	stateID := observeNotes(t, tool, fake, treeFixture("Save"))
+	fake.queue("read_tree", treeFixture("Save"))
+	tool.targetBoundInputExecutor = func(
+		context.Context,
+		TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		failure := "invalid_request"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "failed", Action: "unknown",
+			Phase: "preflight", FailureCode: &failure,
+		}, nil
+	}
+
+	result, err := tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		fmt.Sprintf(
+			`{"action":"keypress","state_id":%q,"key_sequence":["tab"],"description":"Advance focus"}`,
+			stateID,
+		),
+	)
+	if err != nil || !result.IsError || result.GUIOutcome == nil ||
+		result.GUIOutcome.Result != agent.GUIActionResultFailed ||
+		result.GUIOutcome.Phase != agent.GUIActionPhaseActing ||
+		result.GUIOutcome.FailureCode != "invalid_request" ||
+		strings.Contains(result.Content, "commit status is unknown") {
+		t.Fatalf("helper rejection was not a precommit failure: result=%+v err=%v", result, err)
+	}
+}
+
 func TestComputerUseTargetBoundTypeRequiresFocusedRefOrCoordinateFocus(t *testing.T) {
 	requireComputerUseDarwin(t)
 	tool := newTestComputerUse(newFakeAXCaller())

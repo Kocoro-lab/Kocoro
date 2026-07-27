@@ -163,6 +163,12 @@ func TestTargetBoundInputV1TaggedUnionRejectsMalformedTuples(t *testing.T) {
 	if err := request.Validate(); err == nil {
 		t.Fatal("hotkey request accepted null modifiers")
 	}
+	request = canonicalTargetBoundInputRequest(t, "keypress")
+	nilModifiers := []string(nil)
+	request.Modifiers = &nilModifiers
+	if err := request.Validate(); err == nil {
+		t.Fatal("keypress request accepted a pointer that encodes modifiers as null")
+	}
 	for _, mutate := range []func(*TargetBoundInputRequestV1){
 		func(request *TargetBoundInputRequestV1) { request.Ref = nil },
 		func(request *TargetBoundInputRequestV1) { request.Path = nil },
@@ -311,6 +317,40 @@ func TestAXClientTargetBoundInputV1WaitsForBoundedPostCommitVerification(t *test
 		result.FailureCode == nil ||
 		*result.FailureCode != "target_value_readback_unavailable" {
 		t.Fatalf("bounded post-commit acknowledgement was lost: %+v %v", result, err)
+	}
+}
+
+func TestAXClientTargetBoundInputV1PreservesTypedPrecommitRejection(t *testing.T) {
+	writer := &coordinateMouseTestWriter{}
+	client := coordinateMouseTestClient(writer)
+	writer.afterWrite = func(requestBytes []byte) {
+		envelope, err := DecodeTargetBoundInputRPCRequestV1(bytes.TrimSpace(requestBytes))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		failure := "invalid_request"
+		result, err := EncodeTargetBoundInputResultV1(TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "failed", Action: "unknown",
+			Phase: "preflight", FailureCode: &failure,
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		client.pendingMu.Lock()
+		response := client.pending[envelope.ID]
+		client.pendingMu.Unlock()
+		response <- AXResponse{ID: envelope.ID, Result: result}
+	}
+
+	result, err := client.targetBoundInputV1(
+		context.Background(),
+		canonicalTargetBoundInputRequest(t, "keypress"),
+	)
+	if err != nil || result.Action != "unknown" || result.InputCommitted ||
+		result.FailureCode == nil || *result.FailureCode != "invalid_request" {
+		t.Fatalf("typed precommit rejection was lost: result=%+v err=%v", result, err)
 	}
 }
 

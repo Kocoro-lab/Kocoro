@@ -92,6 +92,7 @@ func (l *openAIComputerLoopLLM) capturedRequests() []client.CompletionRequest {
 type openAIComputerLoopBatchExecutor struct {
 	mu                    sync.Mutex
 	executions            []OpenAIComputerBatchExecution
+	executionErrs         []error
 	calls                 []openAIComputerLoopBatchCall
 	skipSafetyConsumption bool
 }
@@ -131,6 +132,13 @@ func (e *openAIComputerLoopBatchExecutor) ExecuteOpenAIComputerBatch(
 		}
 	}
 	e.calls = append(e.calls, callRecord)
+	if len(e.executionErrs) > 0 {
+		err := e.executionErrs[0]
+		e.executionErrs = e.executionErrs[1:]
+		if err != nil {
+			return OpenAIComputerBatchExecution{}, err
+		}
+	}
 	if len(e.executions) == 0 {
 		return OpenAIComputerBatchExecution{}, errors.New("unexpected extra batch execution")
 	}
@@ -1146,6 +1154,177 @@ func TestAgentLoopOpenAIComputerUnknownCommitContinuesFromFinalScreenshot(t *tes
 	if !ok || len(nested) != 1 || nested[0].Source == nil ||
 		nested[0].Source.Data != "ZmluYWw=" {
 		t.Fatalf("recovery final screenshot = %#v", blocks[0].ToolContent)
+	}
+}
+
+func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {
+	profile := resolveTrustedOpenAIComputerProfile(t, "gpt-5.6-sol")
+	llm := &openAIComputerLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerLoopResponse(
+			t,
+			profile,
+			openAIContinuationTokenPrimary,
+			normalizedOpenAIComputerCallForTrajectory,
+		),
+		openAIComputerLoopResponse(
+			t,
+			profile,
+			openAIContinuationTokenSecondary,
+			normalizedOpenAIComputerCallForTrajectory,
+		),
+		openAIComputerLoopResponse(
+			t,
+			profile,
+			openAIContinuationTokenOther,
+			normalizedOpenAIComputerCallForTrajectory,
+		),
+	}}
+	failedBatch := func(detail string) OpenAIComputerBatchExecution {
+		return OpenAIComputerBatchExecution{
+			CallID:              "call_001",
+			ContinuationAllowed: true,
+			Result: ToolResult{
+				Content: detail,
+				IsError: true,
+				Images: []ImageBlock{{
+					MediaType: "image/png",
+					Data:      "ZmluYWw=",
+				}},
+			},
+		}
+	}
+	executor := &openAIComputerLoopBatchExecutor{
+		executions: []OpenAIComputerBatchExecution{
+			failedBatch("OpenAI computer action 1 of 2 did not complete: click target vanished"),
+			failedBatch("OpenAI computer action 1 of 2 did not complete: click target vanished"),
+			failedBatch("OpenAI computer action 2 of 2 did not complete: typed text was not accepted"),
+		},
+	}
+	loop := NewAgentLoop(
+		llm,
+		NewToolRegistry(),
+		"medium",
+		t.TempDir(),
+		10,
+		2000,
+		200,
+		nil,
+		nil,
+		nil,
+	)
+	loop.SetSkillDiscovery(false)
+	loop.SetSpecificModel(profile.Model())
+	loop.SetExecutionProfile(profile)
+	loop.SetOpenAIComputerBatchExecutor(executor)
+
+	_, _, err := loop.Run(context.Background(), "click once", nil, nil)
+	if err == nil {
+		t.Fatal("repeated failed batches did not terminate the run")
+	}
+	for _, want := range []string{
+		"stopped after 3 failed action batches",
+		"typed text was not accepted",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("terminal error %q missing %q", err.Error(), want)
+		}
+	}
+	if got := len(executor.capturedCalls()); got != 3 {
+		t.Fatalf("failed batches executed = %d, want exactly 3", got)
+	}
+	if got := len(llm.capturedRequests()); got != 3 {
+		t.Fatalf(
+			"completion requests = %d, want 3 (no provider call after the recovery cap)",
+			got,
+		)
+	}
+}
+
+func TestAgentLoopOpenAIComputerTerminalErrorsPreserveExecutorDetail(t *testing.T) {
+	profile := resolveTrustedOpenAIComputerProfile(t, "gpt-5.6-sol")
+	cases := []struct {
+		name       string
+		execution  OpenAIComputerBatchExecution
+		executeErr error
+		want       []string
+	}{
+		{
+			name: "payload rejected before execution surfaces the decode reason",
+			execution: OpenAIComputerBatchExecution{
+				Result: ToolResult{
+					Content: `validation error: OpenAI computer action 1 has an unsupported type "triple_click"`,
+					IsError: true,
+				},
+			},
+			want: []string{
+				"rejected before execution",
+				`unsupported type "triple_click"`,
+			},
+		},
+		{
+			name:       "executor error is wrapped not replaced",
+			executeErr: errors.New("focus target vanished mid-action"),
+			want: []string{
+				"execution failed",
+				"focus target vanished mid-action",
+			},
+		},
+		{
+			name: "missing continuation state carries the executor reason",
+			execution: OpenAIComputerBatchExecution{
+				CallID: "call_001",
+				Result: ToolResult{
+					Content: "OpenAI computer batch finished, but its required final exact screenshot is unavailable",
+					IsError: true,
+				},
+			},
+			want: []string{
+				"no verified state for continuation",
+				"final exact screenshot is unavailable",
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			llm := &openAIComputerLoopLLM{responses: []*client.CompletionResponse{
+				openAIComputerLoopResponse(
+					t,
+					profile,
+					openAIContinuationTokenPrimary,
+					normalizedOpenAIComputerCallForTrajectory,
+				),
+			}}
+			executor := &openAIComputerLoopBatchExecutor{
+				executions:    []OpenAIComputerBatchExecution{testCase.execution},
+				executionErrs: []error{testCase.executeErr},
+			}
+			loop := NewAgentLoop(
+				llm,
+				NewToolRegistry(),
+				"medium",
+				t.TempDir(),
+				4,
+				2000,
+				200,
+				nil,
+				nil,
+				nil,
+			)
+			loop.SetSkillDiscovery(false)
+			loop.SetSpecificModel(profile.Model())
+			loop.SetExecutionProfile(profile)
+			loop.SetOpenAIComputerBatchExecutor(executor)
+
+			_, _, err := loop.Run(context.Background(), "click once", nil, nil)
+			if err == nil {
+				t.Fatal("invalid batch execution did not terminate the run")
+			}
+			for _, want := range testCase.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("terminal error %q missing %q", err.Error(), want)
+				}
+			}
+		})
 	}
 }
 

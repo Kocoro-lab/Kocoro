@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -23,14 +25,16 @@ import (
 const openAIComputerDaemonContinuationToken = "shct_pOIBMOn2gmZdU7TJZm93xdhEM1SNRTRle-n9A0mz76g"
 
 type openAIComputerDaemonProbeTool struct {
-	mu              sync.Mutex
-	runs            []string
-	preflights      []string
-	results         map[string]agent.ToolResult
-	afterRun        func(string)
-	targetBundleID  string
-	targetAppName   string
-	defaultMutation bool
+	mu                  sync.Mutex
+	runs                []string
+	preflights          []string
+	results             map[string]agent.ToolResult
+	riskResults         map[string]tools.ConsequentialRiskPreflightResultV1
+	afterRun            func(string)
+	targetBundleID      string
+	targetAppName       string
+	targetExecutionPath string
+	defaultMutation     bool
 }
 
 func (t *openAIComputerDaemonProbeTool) Info() agent.ToolInfo {
@@ -57,7 +61,10 @@ func (t *openAIComputerDaemonProbeTool) DescribeGUIAction(
 	path := ""
 	if input.Mutation || t.defaultMutation {
 		effect = agent.GUIActionMutation
-		path = "accessibility"
+		path = t.targetExecutionPath
+		if path == "" {
+			path = "accessibility"
+		}
 	}
 	return agent.GUIActionDescriptor{
 		Participates:   true,
@@ -87,7 +94,11 @@ func (t *openAIComputerDaemonProbeTool) PreflightConsequentialRiskV1(
 		name = input.Kind
 	}
 	t.preflights = append(t.preflights, name)
+	riskResult, found := t.riskResults[name]
 	t.mu.Unlock()
+	if found {
+		return riskResult, nil
+	}
 	return tools.ConsequentialRiskPreflightResultV1{
 		Status: tools.ConsequentialRiskPreflightNoneV1,
 	}, nil
@@ -132,11 +143,13 @@ func (t *openAIComputerDaemonProbeTool) preflightNames() []string {
 }
 
 type openAIComputerDaemonRuntimeProbe struct {
-	tool             *openAIComputerDaemonProbeTool
-	actionPlans      []tools.OpenAIComputerActionV1
-	observationPlans int
-	resolvedApps     []string
-	launchedApps     []tools.OpenAIComputerTaskAppV1
+	tool                   *openAIComputerDaemonProbeTool
+	actionPlans            []tools.OpenAIComputerActionV1
+	observationPlans       int
+	keyboardTargets        int
+	initialObservationApps []string
+	resolvedApps           []string
+	launchedApps           []tools.OpenAIComputerTaskAppV1
 }
 
 func (r *openAIComputerDaemonRuntimeProbe) ResolveTaskAppV1(
@@ -192,6 +205,26 @@ func (r *openAIComputerDaemonRuntimeProbe) PlanOpenAIComputerObservationV1(
 	return tools.OpenAIComputerActionPlanV1{
 		Tool: r.tool, Args: string(payload), Mutation: false,
 	}, nil
+}
+
+func (r *openAIComputerDaemonRuntimeProbe) AuthorizeOpenAIComputerTypeAfterKeypressV1(
+	tools.OpenAIComputerActionV1,
+) error {
+	r.keyboardTargets++
+	return nil
+}
+
+func (r *openAIComputerDaemonRuntimeProbe) PlanOpenAIComputerTaskInitialObservationV1(
+	app *tools.OpenAIComputerTaskAppV1,
+	description string,
+	includeScreenshot bool,
+) (tools.OpenAIComputerActionPlanV1, error) {
+	appName := ""
+	if app != nil {
+		appName = app.App
+	}
+	r.initialObservationApps = append(r.initialObservationApps, appName)
+	return r.PlanOpenAIComputerObservationV1(description, includeScreenshot)
 }
 
 func trustedOpenAIComputerProfileForDaemon(
@@ -273,6 +306,24 @@ type openAIComputerDaemonLoopLLM struct {
 	responses []*client.CompletionResponse
 	requests  []client.CompletionRequest
 	err       error
+}
+
+type openAIComputerDaemonBlockingLLM struct{}
+
+func (openAIComputerDaemonBlockingLLM) Complete(
+	ctx context.Context,
+	_ client.CompletionRequest,
+) (*client.CompletionResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (l openAIComputerDaemonBlockingLLM) CompleteStream(
+	ctx context.Context,
+	request client.CompletionRequest,
+	_ func(client.StreamDelta),
+) (*client.CompletionResponse, error) {
+	return l.Complete(ctx, request)
 }
 
 func (l *openAIComputerDaemonLoopLLM) Complete(
@@ -386,6 +437,14 @@ func newOpenAIComputerDaemonExecutorFixture(
 					Phase:  agent.GUIActionPhaseVerifying,
 				},
 			},
+			"keypress": {
+				Content: "keypress committed without a declared postcondition",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result:      agent.GUIActionResultCompletedUnverified,
+					Phase:       agent.GUIActionPhaseVerifying,
+					FailureCode: "postcondition_not_declared",
+				},
+			},
 			"reobserve": {Content: "observed"},
 			"final_screenshot": {
 				Content: "observed",
@@ -488,6 +547,162 @@ func TestDaemonOpenAIComputerExecutorRunsOrderedActionsThroughFreshAuthority(t *
 	}
 }
 
+func TestDaemonOpenAIComputerExecutorRefreshesAndAuthorizesTypeAfterKeypress(
+	t *testing.T,
+) {
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	runtime := executor.runtime.(*openAIComputerDaemonRuntimeProbe)
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"keypress","keys":["META","L"]},`+
+				`{"type":"type","text":"waylandz.com"}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if result.ToolResult.IsError || len(result.ToolResult.Images) != 1 {
+		t.Fatalf("result = %+v", result.ToolResult)
+	}
+	if got := probe.runNames(); strings.Join(got, ",") !=
+		"keypress,reobserve,type,final_screenshot" {
+		t.Fatalf("execution order = %v", got)
+	}
+	if runtime.keyboardTargets != 1 {
+		t.Fatalf("keyboard target authorizations = %d, want 1",
+			runtime.keyboardTargets)
+	}
+}
+
+func TestDaemonOpenAIComputerExecutorAwaitsOneConsequentialClickDecision(t *testing.T) {
+	executor, adapter, probe, coordinator := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+
+	now := time.Now().UTC()
+	broker, err := NewConsequentialRiskBroker(ConsequentialRiskBrokerOptions{
+		Now:        func() time.Time { return now },
+		Random:     bytes.NewReader(sequentialConsequentialRiskRandom(1)),
+		PendingTTL: 5 * time.Second,
+		GrantTTL:   5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.workflow.riskBroker = broker
+	probe.targetBundleID = "com.tinyspeck.slackmacgap"
+	probe.targetAppName = "Slack"
+	probe.targetExecutionPath = "synthetic_coordinate"
+	draft := consequentialRiskCoordinateBrokerDraft(
+		t,
+		openAIComputerActionToolUseIDV1("call_daemon_001/action/1"),
+		now.Add(5*time.Second),
+	)
+	probe.riskResults = map[string]tools.ConsequentialRiskPreflightResultV1{
+		"click": {
+			Status: tools.ConsequentialRiskPreflightRequiredV1,
+			Draft:  &draft,
+		},
+	}
+
+	type batchResult struct {
+		result tools.OpenAIComputerBatchResultV1
+		err    error
+	}
+	done := make(chan batchResult, 1)
+	go func() {
+		result, executeErr := adapter.ExecuteBatchV1(
+			context.Background(),
+			openAIComputerDaemonCall(
+				`{"type":"click","button":"left","x":320,"y":240}`,
+			),
+		)
+		done <- batchResult{result: result, err: executeErr}
+	}()
+
+	var intentID string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case execution := <-done:
+			t.Fatalf("native consequential click returned before confirmation: %+v", execution)
+		default:
+		}
+		active := coordinator.Snapshot().Active
+		if active != nil && active.ConsequentialRisk != nil {
+			intentID = active.ConsequentialRisk.IntentID
+			if active.ActionPhase != guicontrol.ComputerUsePhaseWaitingForUser ||
+				active.ConsequentialRisk.Kind != "send" ||
+				active.TargetBundleID != draft.Target.BundleID ||
+				active.TargetAppName != draft.Target.AppName {
+				t.Fatalf("pending activity=%+v draftTarget=%+v", active, draft.Target)
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if intentID == "" {
+		t.Fatal("native consequential click did not stage one local confirmation")
+	}
+	if got := probe.runNames(); len(got) != 0 {
+		t.Fatalf("native click ran before confirmation: %v", got)
+	}
+	if _, err := broker.Decide(ConsequentialRiskDecisionRequestV1{
+		SchemaVersion: 1,
+		IntentID:      intentID,
+		Decision:      ConsequentialRiskDecisionAllow,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case execution := <-done:
+		if execution.err != nil || execution.result.ToolResult.IsError ||
+			len(execution.result.ToolResult.Images) != 1 {
+			t.Fatalf("execution = %+v", execution)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("allow did not unblock native consequential click")
+	}
+	if got := strings.Join(probe.runNames(), ","); got != "click,final_screenshot" {
+		t.Fatalf("native execution order = %q", got)
+	}
+}
+
+func TestDaemonOpenAIComputerExecutorKeepsPreflightRejectionNotCommitted(t *testing.T) {
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	probe.results["keypress"] = consequentialRiskDaemonFailure(
+		tools.ConsequentialRiskCodeUnsupportedPathV1,
+	)
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"keypress","keys":["ENTER"]}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if !result.ToolResult.IsError ||
+		!strings.Contains(result.ToolResult.Content, "(keypress)") ||
+		!strings.Contains(
+			result.ToolResult.Content,
+			tools.ConsequentialRiskCodeUnsupportedPathV1,
+		) {
+		t.Fatalf("result = %+v", result.ToolResult)
+	}
+	if strings.Contains(result.ToolResult.Content, "commit status is unknown") {
+		t.Fatalf("known preflight rejection degraded to unknown commit: %q", result.ToolResult.Content)
+	}
+	if len(result.ToolResult.Images) != 1 {
+		t.Fatalf("preflight rejection lacked recovery screenshot: %+v", result.ToolResult)
+	}
+}
+
 func TestDaemonOpenAIComputerExecutorContinuesKnownAtomicCommitWithoutInternalReobserve(t *testing.T) {
 	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
@@ -516,6 +731,47 @@ func TestDaemonOpenAIComputerExecutorContinuesKnownAtomicCommitWithoutInternalRe
 	if got := strings.Join(probe.runNames(), ","); got !=
 		"click,type,final_screenshot" {
 		t.Fatalf("execution order = %q", got)
+	}
+}
+
+func TestDaemonOpenAIComputerExecutorRefreshesTargetBetweenOrderedKeypresses(
+	t *testing.T,
+) {
+	executor, adapter, probe, coordinator := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	keypresses := 0
+	probe.afterRun = func(action string) {
+		if action != "keypress" {
+			return
+		}
+		keypresses++
+		if keypresses == 1 {
+			probe.targetBundleID = "com.apple.calculator"
+			probe.targetAppName = "Calculator"
+		}
+	}
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"keypress","keys":["META","TAB"]},`+
+				`{"type":"keypress","keys":["9"]}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if result.ToolResult.IsError || len(result.ToolResult.Images) != 1 {
+		t.Fatalf("result = %+v", result.ToolResult)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"keypress,reobserve,keypress,final_screenshot" {
+		t.Fatalf("execution order = %q", got)
+	}
+	active := coordinator.Snapshot().Active
+	if active == nil ||
+		active.TargetBundleID != "com.apple.calculator" {
+		t.Fatalf("batch retained the first app target: %+v", active)
 	}
 }
 
@@ -686,6 +942,8 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 	}
 	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
 	profile := trustedOpenAIComputerProfileForDaemon(t)
+	completedSummary := "The screen shows Slack with hello in the requested composer, " +
+		"then Calculator in front with 7 visibly entered, so the full cross-app task is complete."
 	call := openAIComputerDaemonCall(
 		`{"type":"click","button":"left","x":10,"y":20},` +
 			`{"type":"type","text":"hello"}`,
@@ -702,8 +960,8 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 			t,
 			profile,
 			"resp_daemon_task_final",
-			`{"type":"text","text":"done"}`,
-			"done",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"The screen shows Slack with hello in the requested composer, then Calculator in front with 7 visibly entered, so the full cross-app task is complete.\"}"}`,
+			`{"status":"completed","summary":"The screen shows Slack with hello in the requested composer, then Calculator in front with 7 visibly entered, so the full cross-app task is complete."}`,
 		),
 	}}
 	childTools := agent.NewToolRegistry()
@@ -734,7 +992,7 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 	if err != nil {
 		t.Fatalf("task Run: %v", err)
 	}
-	if result.IsError || result.Content != "done" {
+	if result.IsError || result.Content != completedSummary {
 		t.Fatalf("task result = %+v", result)
 	}
 	if resolveCalls != 1 {
@@ -747,6 +1005,9 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 		runtime.launchedApps[0].App != "Slack" ||
 		runtime.launchedApps[1].App != "Calculator" {
 		t.Fatalf("launched apps = %+v", runtime.launchedApps)
+	}
+	if got := strings.Join(runtime.initialObservationApps, ","); got != "Slack" {
+		t.Fatalf("initial observation apps = %q", got)
 	}
 	if workflow.lease == nil ||
 		strings.Join(workflow.lease.AllowedAppBundleIDs, ",") !=
@@ -776,17 +1037,36 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 			t.Fatalf("child request %d tools = %+v", index, request.Tools)
 		}
 		hasExecutorInstructions := false
+		hasOutcomeContract := false
+		hasConsequentialPathInstructions := false
 		for _, message := range request.Messages {
 			if strings.Contains(
 				message.Content.Text(),
 				"execution_role=private_openai_native_computer",
 			) {
 				hasExecutorInstructions = true
-				break
+			}
+			if strings.Contains(
+				message.Content.Text(),
+				`{"status":"completed","summary":"brief visible result"}`,
+			) {
+				hasOutcomeContract = true
+			}
+			if strings.Contains(
+				message.Content.Text(),
+				"click the exact visible action button and wait for Kocoro's one local confirmation",
+			) {
+				hasConsequentialPathInstructions = true
 			}
 		}
 		if !hasExecutorInstructions {
 			t.Fatalf("child request %d lacks private executor instructions", index)
+		}
+		if !hasOutcomeContract {
+			t.Fatalf("child request %d lacks terminal outcome contract", index)
+		}
+		if !hasConsequentialPathInstructions {
+			t.Fatalf("child request %d lacks consequential action path instructions", index)
 		}
 	}
 	if blocks := llm.requests[0].Messages[len(llm.requests[0].Messages)-1].Content.Blocks(); len(blocks) != 2 || blocks[1].Type != "image" {
@@ -857,7 +1137,10 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 		targetAppName:  "Calculator",
 		results: map[string]agent.ToolResult{
 			"final_screenshot": {
-				Content: "state_id: stale-secret\nref=e17\nscreenshot_warning: topology mismatch",
+				Content: "state_id: stale-secret\nref=e17\nscreenshot_warning: " +
+					"[transient error] computer_use_error: window_changed\n" +
+					"message: Calculator's window changed during capture\n" +
+					"recovery: stop moving or resizing the window, then retry once",
 				IsError: true,
 			},
 		},
@@ -868,6 +1151,9 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 		childTools: agent.NewToolRegistry(),
 		workflow:   workflow,
 		runtime:    &openAIComputerDaemonRuntimeProbe{tool: probe},
+		initialObservationRetry: func(context.Context, int) error {
+			return nil
+		},
 	}
 
 	result, err := taskTool.Run(
@@ -879,7 +1165,8 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "initial_observation_unavailable") ||
-		!strings.Contains(result.Content, "retry computer_use once") {
+		!strings.Contains(result.Content, "do not retry computer_use again in this turn") ||
+		!strings.Contains(result.Content, "window_changed") {
 		t.Fatalf("task result = %+v", result)
 	}
 	if strings.Contains(result.Content, "state_id") ||
@@ -887,8 +1174,122 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 		t.Fatalf("initial failure leaked stale observation state: %q", result.Content)
 	}
 	if got := strings.Join(probe.runNames(), ","); got !=
-		"final_screenshot,final_screenshot" {
+		"final_screenshot,final_screenshot,final_screenshot,final_screenshot,final_screenshot" {
 		t.Fatalf("initial observation attempts = %q", got)
+	}
+}
+
+func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-cold-app",
+		"turn-openai-cold-app",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	initialFailure := agent.ToolResult{
+		Content: "state_id: must-not-escape\nscreenshot_warning: " +
+			"[business error] computer_use_error: window_not_found\n" +
+			"message: Calculator has no unique capturable window\n" +
+			"recovery: open one normal app window, bring it forward, and retry",
+	}
+	initialSuccess := agent.ToolResult{
+		Content: "observed",
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "Y29sZC1hcHAtcmVhZHk=",
+		}},
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "clicked",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result: agent.GUIActionResultVerified,
+					Phase:  agent.GUIActionPhaseVerifying,
+				},
+			},
+			"final_screenshot": initialFailure,
+		},
+	}
+	initialRuns := 0
+	probe.afterRun = func(name string) {
+		if name != "final_screenshot" {
+			return
+		}
+		initialRuns++
+		if initialRuns == 1 {
+			probe.mu.Lock()
+			probe.results["final_screenshot"] = initialSuccess
+			probe.mu.Unlock()
+		}
+	}
+
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	call := openAIComputerDaemonCall(
+		`{"type":"click","button":"left","x":10,"y":20}`,
+	)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(call),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_cold_app_final",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"Calculator visibly shows the requested result.\"}"}`,
+			`{"status":"completed","summary":"Calculator visibly shows the requested result."}`,
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	var waits []int
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     runtime,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+		initialObservationRetry: func(_ context.Context, attempt int) error {
+			waits = append(waits, attempt)
+			return nil
+		},
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Compute 3-10 in Calculator","apps":["Calculator"],`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if result.IsError ||
+		result.Content != "Calculator visibly shows the requested result." {
+		t.Fatalf("task result = %+v", result)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,final_screenshot,click,final_screenshot" {
+		t.Fatalf("desktop runs = %q", got)
+	}
+	if !reflect.DeepEqual(waits, []int{1}) {
+		t.Fatalf("initial observation waits = %v", waits)
 	}
 }
 
@@ -936,9 +1337,398 @@ func TestOpenAIComputerTaskToolExecutorFailureForbidsAutomaticRetryAndGuessing(
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "executor_failed") ||
-		!strings.Contains(result.Content, "retry computer_use once") ||
-		!strings.Contains(result.Content, "does not mean the target app is missing or blocked") ||
+		!strings.Contains(result.Content, "do not retry computer_use or attempt alternate desktop-control tools in this turn") ||
+		!strings.Contains(result.Content, "without guessing that the target app is missing or blocked") ||
 		!strings.Contains(result.Content, "malformed provider response") {
+		t.Fatalf("task result = %+v", result)
+	}
+}
+
+func TestOpenAIComputerTaskToolBoundsPrivateExecutorDuration(t *testing.T) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-timeout",
+		"turn-openai-timeout",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.google.Chrome",
+		targetAppName:  "Google Chrome",
+		results: map[string]agent.ToolResult{
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "aW5pdGlhbC1icm93c2Vy",
+				}},
+			},
+		},
+	}
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     openAIComputerDaemonBlockingLLM{},
+		profile:     trustedOpenAIComputerProfileForDaemon(t),
+		childTools:  agent.NewToolRegistry(),
+		workflow:    workflow,
+		runtime:     runtime,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+		taskTimeout: 20 * time.Millisecond,
+	}
+
+	started := time.Now()
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Open waylandz.com in Chrome","apps":["Google Chrome"],`+
+			`"description":"Open the browser page"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("private executor deadline took %s", elapsed)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "executor_timeout") ||
+		!strings.Contains(result.Content, "exceeded 20ms") ||
+		!strings.Contains(
+			result.Content,
+			"do not retry computer_use or attempt alternate desktop-control tools",
+		) {
+		t.Fatalf("task result = %+v", result)
+	}
+	if got := strings.Join(runtime.initialObservationApps, ","); got !=
+		"Google Chrome" {
+		t.Fatalf("initial observation apps = %q", got)
+	}
+	if got := strings.Join(probe.runNames(), ","); got != "final_screenshot" {
+		t.Fatalf("timeout desktop runs = %q", got)
+	}
+}
+
+func TestOpenAIComputerTaskToolRejectsCompletionClaimWithoutAnyDesktopAction(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-no-action",
+		"turn-openai-no-action",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "aW5pdGlhbA==",
+				}},
+			},
+		},
+	}
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_no_action",
+			`{"type":"text","text":"I finished 250*0.01 in Calculator."}`,
+			"I finished 250*0.01 in Calculator.",
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     runtime,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Compute 250*0.01 in Calculator","apps":["Calculator"],`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "no_desktop_action") ||
+		!strings.Contains(result.Content, "do not retry computer_use again in this turn") ||
+		!strings.Contains(result.Content, "I finished 250*0.01 in Calculator.") {
+		t.Fatalf("task result = %+v", result)
+	}
+	if got := strings.Join(probe.runNames(), ","); got != "final_screenshot" {
+		t.Fatalf("desktop runs = %q, want only the initial observation", got)
+	}
+}
+
+func TestOpenAIComputerTaskToolAcceptsScreenshotVerifiedCompletionAfterFailedBatch(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-failed-batch",
+		"turn-openai-failed-batch",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "click target vanished before the press",
+				IsError: true,
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result:      agent.GUIActionResultFailed,
+					Phase:       agent.GUIActionPhaseActing,
+					FailureCode: "target_not_found",
+				},
+			},
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "ZmFpbGVkLWJhdGNo",
+				}},
+			},
+		},
+	}
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	call := openAIComputerDaemonCall(
+		`{"type":"click","button":"left","x":10,"y":20}`,
+	)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(call),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_failed_batch_final",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"Calculator visibly shows 6.\"}"}`,
+			`{"status":"completed","summary":"Calculator visibly shows 6."}`,
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     runtime,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Compute 3+3 in Calculator","apps":["Calculator"],`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if result.IsError || result.Content != "Calculator visibly shows 6." {
+		t.Fatalf("task result = %+v", result)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,final_screenshot" {
+		t.Fatalf("desktop runs = %q", got)
+	}
+}
+
+func TestOpenAIComputerTaskToolReportsFailedOutcomeAfterSuccessfulBatch(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-failed-outcome",
+		"turn-openai-failed-outcome",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "clicked",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result: agent.GUIActionResultVerified,
+					Phase:  agent.GUIActionPhaseVerifying,
+				},
+			},
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "dW5jaGFuZ2VkLWNhbGN1bGF0b3I=",
+				}},
+			},
+		},
+	}
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	call := openAIComputerDaemonCall(
+		`{"type":"click","button":"left","x":10,"y":20}`,
+	)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(call),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_failed_outcome_final",
+			`{"type":"text","text":"{\"status\":\"failed\",\"summary\":\"Calculator still shows 7.56; the requested result is not visible.\"}"}`,
+			`{"status":"failed","summary":"Calculator still shows 7.56; the requested result is not visible."}`,
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     runtime,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Compute 3+3 in Calculator","apps":["Calculator"],`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "task_failed") ||
+		!strings.Contains(
+			result.Content,
+			"Calculator still shows 7.56; the requested result is not visible.",
+		) ||
+		!strings.Contains(result.Content, "do not retry computer_use again in this turn") {
+		t.Fatalf("task result = %+v", result)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,final_screenshot" {
+		t.Fatalf("current-app execution order = %q", got)
+	}
+}
+
+func TestOpenAIComputerTaskToolRejectsMalformedTerminalOutcome(t *testing.T) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-malformed-outcome",
+		"turn-openai-malformed-outcome",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"wait": {Content: "waited"},
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "bWFsZm9ybWVkLW91dGNvbWU=",
+				}},
+			},
+		},
+	}
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	call := openAIComputerDaemonCall(`{"type":"wait"}`)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(call),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_malformed_outcome_final",
+			`{"type":"text","text":"done"}`,
+			"done",
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     runtime,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Wait for Calculator","apps":["Calculator"],`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "outcome_unverified") ||
+		!strings.Contains(result.Content, "decode private Computer Use outcome") {
 		t.Fatalf("task result = %+v", result)
 	}
 }
@@ -993,8 +1783,8 @@ func TestOpenAIComputerTaskToolRunsAgainstCurrentAppWithoutAppHints(t *testing.T
 			t,
 			profile,
 			"resp_daemon_current_app_final",
-			`{"type":"text","text":"done"}`,
-			"done",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"done\"}"}`,
+			`{"status":"completed","summary":"done"}`,
 		),
 	}}
 	childTools := agent.NewToolRegistry()
@@ -1865,4 +2655,10 @@ func (p openAIComputerRuntimeErrorProbe) PlanOpenAIComputerObservationV1(
 	bool,
 ) (tools.OpenAIComputerActionPlanV1, error) {
 	return tools.OpenAIComputerActionPlanV1{}, p.err
+}
+
+func (p openAIComputerRuntimeErrorProbe) AuthorizeOpenAIComputerTypeAfterKeypressV1(
+	tools.OpenAIComputerActionV1,
+) error {
+	return p.err
 }

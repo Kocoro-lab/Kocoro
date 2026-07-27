@@ -4,6 +4,24 @@ import XCTest
 @testable import ax_server
 
 final class CoordinateMouseEventTests: XCTestCase {
+    func testInputRecoveryBlockFailsBeforeAuthorityOrPointerMutation() throws {
+        let harness = Harness()
+        harness.inputAdmitted = false
+
+        let result = runCoordinateMouseEvent(
+            request: try request("coordinate_mouse_event.request.click.v1.json"),
+            dependencies: harness.dependencies()
+        )
+
+        XCTAssertEqual(result.status, "failed")
+        XCTAssertEqual(result.phase, "preflight")
+        XCTAssertEqual(result.failureCode, "input_recovery_blocked")
+        XCTAssertFalse(result.primaryActionCommitted)
+        XCTAssertEqual(harness.topologyCalls, 0)
+        XCTAssertEqual(harness.prepareCount, 0)
+        XCTAssertEqual(harness.moveCount, 0)
+    }
+
     func testPhysicalAssessmentWaitsForDeliveredSyntheticCounter() {
         let baseline = Harness.physicalSnapshot(pointerX: 100)
         let delivered = Harness.physicalSnapshot(
@@ -603,6 +621,7 @@ private final class Harness {
     var frontmostWindowIDs: [UInt32?] = [7001]
     var nowValues = [now, now, now, now]
     var pidLive = true
+    var inputAdmitted = true
     var bundleID: String? = "com.example.fixture"
     var prepareSucceeds = true
     var postOutcome: CoordinateMousePreparedClick.PostOutcome = .committed
@@ -639,6 +658,7 @@ private final class Harness {
 
     func dependencies() -> CoordinateMouseEventDependencies {
         CoordinateMouseEventDependencies(
+            canAdmitInput: { self.inputAdmitted },
             observeTopology: {
                 let value = self.topologies[min(self.topologyCalls, self.topologies.count - 1)]
                 self.topologyCalls += 1

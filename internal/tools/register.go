@@ -202,6 +202,7 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 			toolCopy.refs = nil
 			toolCopy.coordinateArtifact = nil
 			toolCopy.coordinateFocus = nil
+			toolCopy.navigationCommit = nil
 			cloned.Register(wrapGUIExecutionGate(&toolCopy))
 		}
 	}

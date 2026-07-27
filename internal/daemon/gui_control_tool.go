@@ -148,11 +148,7 @@ func (w *daemonGUIWorkflow) runTool(ctx context.Context, tool agent.Tool, argsJS
 		}
 		switch descriptor.ActionKind {
 		case "type":
-			return agent.BusinessError(
-				"computer_use_error: keyboard_target_unavailable\n" +
-					"message: no current text target is available from an AX focused ref or one verified coordinate click\n" +
-					"recovery: observe the intended window with a screenshot, click the editor once, then type once; do not retry automatically",
-			), nil
+			return keyboardTargetUnavailableDaemonFailure(), nil
 		case "hotkey", "scroll":
 			return agent.BusinessError("computer-use target-bound execution is unavailable for " + descriptor.ActionKind + "; use an accessibility action tied to an observed element"), nil
 		}
@@ -536,7 +532,33 @@ func consequentialRiskDaemonFailure(code string) agent.ToolResult {
 	if code == "" {
 		code = tools.ConsequentialRiskCodeUntrustedMetadataV1
 	}
-	return agent.BusinessError("computer-use consequential action blocked: " + code)
+	result := agent.BusinessError("computer-use consequential action blocked: " + code)
+	// Preflight rejects the action before BeginAction mints execution
+	// authority, so no GUI input can have committed. Preserve that fact for the
+	// native adapter instead of degrading a deterministic policy rejection to
+	// commit_unknown.
+	result.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseActing,
+		FailureCode: code,
+	}
+	return result
+}
+
+func keyboardTargetUnavailableDaemonFailure() agent.ToolResult {
+	result := agent.BusinessError(
+		"computer_use_error: keyboard_target_unavailable\n" +
+			"message: no current text target is available from an AX focused ref or one verified coordinate click\n" +
+			"recovery: observe the intended window with a screenshot, click the editor once, then type once; do not retry automatically",
+	)
+	// Classification rejected the mutation before BeginAction and Tool.Run, so
+	// the adapter can report a deterministic not_committed result.
+	result.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseActing,
+		FailureCode: "keyboard_target_unavailable",
+	}
+	return result
 }
 
 func (w *daemonGUIWorkflow) trackRiskIntent(intentID string) {

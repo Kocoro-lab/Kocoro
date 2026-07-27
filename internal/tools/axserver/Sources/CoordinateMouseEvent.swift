@@ -694,6 +694,7 @@ enum CoordinateMouseRiskVerificationOutcomeV1: Equatable {
 }
 
 struct CoordinateMouseEventDependencies {
+    let canAdmitInput: () -> Bool
     let observeTopology: () throws -> DisplayTopologyV1
     let isPIDLive: (Int) -> Bool
     let bundleIDForPID: (Int) -> String?
@@ -902,6 +903,9 @@ func runCoordinateMouseEvent(
     }
     guard horizon <= coordinateMouseMaximumDeadlineHorizonV1 else {
         return coordinateMouseFailure(request: request, code: "invalid_request")
+    }
+    guard dependencies.canAdmitInput() else {
+        return coordinateMouseFailure(request: request, code: "input_recovery_blocked")
     }
     if let failure = coordinateMouseAuthorityFailure(request: request, dependencies: dependencies) {
         return coordinateMouseFailure(request: request, code: failure)
@@ -1365,9 +1369,11 @@ private func productionCoordinateMousePreparedClick(
             up.setIntegerValueField(.mouseEventClickState, value: state)
         }
         let release = PreparedInputReleaseV1(metadata: .mouse(button: button)) {
-            up.post(tap: .cghidEventTap)
-            Thread.sleep(forTimeInterval: 0.005)
-            return !CGEventSource.buttonState(.combinedSessionState, button: cgButton)
+            postAndConfirmInputReleaseV1(
+                post: { up.post(tap: .cghidEventTap) },
+                isReleased: {
+                    !CGEventSource.buttonState(.combinedSessionState, button: cgButton)
+                })
         }
         events.append((down, release))
     }
@@ -1671,6 +1677,7 @@ private func productionCoordinateMouseRiskTarget(
 }
 
 let productionCoordinateMouseEventDependencies = CoordinateMouseEventDependencies(
+    canAdmitInput: processInputCommitGateV1.canAdmitInput,
     observeTopology: { try liveDisplayTopologyService.observe() },
     isPIDLive: { pid in
         refreshAppKitState()

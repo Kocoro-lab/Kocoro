@@ -392,7 +392,8 @@ func validateCoordinateMouseFailureV1(result CoordinateMouseEventResultV1) error
 		"window_bounds_mismatch": true, "display_not_found": true,
 		"display_not_actionable": true, "point_outside_window": true,
 		"point_outside_display": true, "point_occluded": true,
-		"modifier_press_failed": true, "cancelled_before_input": true,
+		"input_recovery_blocked": true,
+		"modifier_press_failed":  true, "cancelled_before_input": true,
 		"modifier_release_unconfirmed": true,
 	}
 	if preflightNoSideEffect[code] {

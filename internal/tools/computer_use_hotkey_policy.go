@@ -1,6 +1,12 @@
 package tools
 
-import "strings"
+import (
+	"net"
+	"net/url"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 // parseComputerUseHotkeyV1 is the single raw chord parser used by both the
 // local execution path and the consequential-risk preflight. It deliberately
@@ -94,4 +100,58 @@ func computerUseKeypressRequiresDestinationAuthorityV1(
 		}
 	}
 	return false
+}
+
+func computerUseLocationNavigationTextV1(text string) bool {
+	if text == "" || text != strings.TrimSpace(text) || !utf8.ValidString(text) ||
+		len(text) > 2048 || strings.IndexFunc(text, unicode.IsSpace) >= 0 ||
+		strings.IndexFunc(text, unicode.IsControl) >= 0 {
+		return false
+	}
+	candidate := text
+	if !strings.Contains(candidate, "://") {
+		candidate = "https://" + candidate
+	}
+	parsed, err := url.ParseRequestURI(candidate)
+	if err != nil || parsed.User != nil ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	return host == "localhost" ||
+		net.ParseIP(host) != nil ||
+		strings.Contains(host, ".")
+}
+
+func computerUsePlainReturnKeypressV1(args computerUseArgs) bool {
+	if len(args.Modifiers) != 0 || len(args.KeySequence) != 1 {
+		return false
+	}
+	key := canonicalComputerUseHotkeyTokenV1(args.KeySequence[0])
+	return key == "return" || key == "enter"
+}
+
+func (t *ComputerUseTool) allowsLocationNavigationCommitV1(
+	args computerUseArgs,
+) bool {
+	commit := t.navigationCommit
+	return commit != nil &&
+		computerUsePlainReturnKeypressV1(args) &&
+		t.snapshot != nil &&
+		t.snapshot.pid == commit.pid &&
+		t.snapshot.bundleID == commit.bundleID &&
+		t.snapshot.windowID != nil &&
+		*t.snapshot.windowID > 0 &&
+		uint64(*t.snapshot.windowID) == uint64(commit.windowID)
+}
+
+func (t *ComputerUseTool) consumeLocationNavigationCommitV1(
+	args computerUseArgs,
+) bool {
+	allowed := t.allowsLocationNavigationCommitV1(args)
+	t.navigationCommit = nil
+	return allowed
 }

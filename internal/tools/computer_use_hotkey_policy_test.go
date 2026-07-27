@@ -77,6 +77,157 @@ func TestComputerUseKeypressDestinationAuthorityClassifierV1(t *testing.T) {
 	}
 }
 
+func TestComputerUseLocationNavigationTextV1(t *testing.T) {
+	for _, text := range []string{
+		"waylandz.com",
+		"https://waylandz.com/blog/",
+		"http://localhost:3000",
+		"https://127.0.0.1:8443/path",
+	} {
+		if !computerUseLocationNavigationTextV1(text) {
+			t.Fatalf("navigation text rejected: %q", text)
+		}
+	}
+	for _, text := range []string{
+		"",
+		"search terms",
+		"user:password@example.com",
+		"javascript:alert(1)",
+		"https://example.com/\nnext",
+	} {
+		if computerUseLocationNavigationTextV1(text) {
+			t.Fatalf("unsafe or non-location text accepted: %q", text)
+		}
+	}
+}
+
+func TestComputerUseNativeLocationShortcutTypeAllowsOneWindowBoundReturn(
+	t *testing.T,
+) {
+	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
+	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionKeypressV1,
+			Keys: []string{"command", "l"},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	typePlan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "waylandz.com",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context,
+		request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: request.Action,
+			InputCommitted:    true,
+			ClipboardTouched:  request.Action == "type",
+			ClipboardRestored: request.Action == "type",
+			Phase:             "post_verification", FailureCode: &failure,
+		}, nil
+	}
+	typed, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		typePlan.Args,
+	)
+	if err != nil || typed.IsError || harness.tool.navigationCommit == nil {
+		t.Fatalf("location type result=%+v err=%v commit=%+v",
+			typed, err, harness.tool.navigationCommit)
+	}
+
+	stateID := harness.tool.snapshot.id
+	returnArgs := fmt.Sprintf(
+		`{"action":"keypress","state_id":%q,"key_sequence":["return"],"description":"Navigate to the typed URL"}`,
+		stateID,
+	)
+	preflight, err := harness.tool.PreflightConsequentialRiskV1(
+		context.Background(), returnArgs, "toolu_location_return_1")
+	if err != nil || preflight.Status != ConsequentialRiskPreflightNoneV1 {
+		t.Fatalf("location return preflight=%+v err=%v", preflight, err)
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	pressed, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		returnArgs,
+	)
+	if err != nil || pressed.IsError || harness.tool.navigationCommit != nil {
+		t.Fatalf("location return result=%+v err=%v commit=%+v",
+			pressed, err, harness.tool.navigationCommit)
+	}
+
+	reused, err := harness.tool.PreflightConsequentialRiskV1(
+		context.Background(), returnArgs, "toolu_location_return_2")
+	if err != nil || reused.Status != ConsequentialRiskPreflightBlockedV1 ||
+		reused.FailureCode != ConsequentialRiskCodeUnsupportedPathV1 {
+		t.Fatalf("reused location return preflight=%+v err=%v", reused, err)
+	}
+}
+
+func TestComputerUseNonLocationKeypressTypeCannotAuthorizeReturn(
+	t *testing.T,
+) {
+	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
+	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionKeypressV1,
+			Keys: []string{"tab"},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	typePlan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "waylandz.com",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context,
+		request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: request.Action,
+			InputCommitted: true, ClipboardTouched: true, ClipboardRestored: true,
+			Phase: "post_verification", FailureCode: &failure,
+		}, nil
+	}
+	if result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		typePlan.Args,
+	); err != nil || result.IsError {
+		t.Fatalf("ordinary type result=%+v err=%v", result, err)
+	}
+	if harness.tool.navigationCommit != nil {
+		t.Fatal("non-location keypress minted navigation commit authority")
+	}
+	returnArgs := fmt.Sprintf(
+		`{"action":"keypress","state_id":%q,"key_sequence":["return"],"description":"Must remain blocked"}`,
+		harness.tool.snapshot.id,
+	)
+	preflight, err := harness.tool.PreflightConsequentialRiskV1(
+		context.Background(), returnArgs, "toolu_non_location_return")
+	if err != nil || preflight.Status != ConsequentialRiskPreflightBlockedV1 {
+		t.Fatalf("non-location return preflight=%+v err=%v", preflight, err)
+	}
+}
+
 func TestComputerUseDangerousRawHotkeyFailsBeforeExecutorAndConsumesState(t *testing.T) {
 	requireComputerUseDarwin(t)
 	for _, keys := range []string{

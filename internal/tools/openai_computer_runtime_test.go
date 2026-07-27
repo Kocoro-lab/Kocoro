@@ -72,6 +72,54 @@ func TestOpenAIComputerTaskAppsSupersedeForegroundHintAndRefreshFrontmost(
 	}
 }
 
+func TestOpenAIComputerTaskInitialObservationPinsFirstAppHint(t *testing.T) {
+	raw := &ComputerUseTool{
+		snapshot: &computerUseSnapshot{id: "stale"},
+	}
+	runtime := &OpenAIComputerActionRuntimeV1{
+		public: raw,
+		raw:    raw,
+	}
+	plan, err := runtime.PlanOpenAIComputerTaskInitialObservationV1(
+		&OpenAIComputerTaskAppV1{
+			App:      "Google Chrome",
+			BundleID: "com.google.Chrome",
+		},
+		"Capture the initial browser state",
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw.snapshot != nil {
+		t.Fatal("initial app observation retained stale state")
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.Action != "get_app_state" ||
+		args.App != "Google Chrome" ||
+		!args.IncludeScreenshot {
+		t.Fatalf("initial observation args = %+v", args)
+	}
+
+	next, err := runtime.PlanOpenAIComputerObservationV1(
+		"Follow the actual frontmost app",
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args = computerUseArgs{}
+	if err := json.Unmarshal([]byte(next.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.App != "" {
+		t.Fatalf("continuation froze optional app hint: %+v", args)
+	}
+}
+
 func TestOpenAIComputerActionRuntimeProjectsFramedClickWithoutLeakingAuthority(t *testing.T) {
 	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
 	harness.fake.queue(
@@ -217,6 +265,72 @@ func TestOpenAIComputerActionRuntimeUsesVerifiedCoordinateFocusWithoutAXRefForTy
 		args.Text == nil || *args.Text != "private text" ||
 		args.StateID != harness.tool.snapshot.id {
 		t.Fatalf("translated coordinate-focused type plan = %+v / %+v", plan, args)
+	}
+}
+
+func TestOpenAIComputerActionRuntimeBindsPostKeypressObservationForOneType(
+	t *testing.T,
+) {
+	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
+	harness.tree.Elements = nil
+	harness.tree.RefPaths = map[string]computerUseRefPath{}
+	harness.observe(t)
+
+	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionKeypressV1,
+			Keys: []string{"command", "l"},
+		},
+	); err != nil {
+		t.Fatalf("AuthorizeOpenAIComputerTypeAfterKeypressV1: %v", err)
+	}
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "waylandz.com",
+		},
+	)
+	if err != nil {
+		t.Fatalf("PlanOpenAIComputerActionV1: %v", err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.Action != "type" || args.Ref != "" ||
+		args.StateID != harness.tool.snapshot.id {
+		t.Fatalf("post-keypress type plan = %+v", args)
+	}
+
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context,
+		request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: request.Action,
+			InputCommitted: true, ClipboardTouched: true, ClipboardRestored: true,
+			Phase: "post_verification", FailureCode: &failure,
+		}, nil
+	}
+	typed, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		plan.Args,
+	)
+	if err != nil || typed.IsError {
+		t.Fatalf("post-keypress type result=%+v err=%v", typed, err)
+	}
+
+	if _, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "must not reuse",
+		},
+	); err == nil {
+		t.Fatal("post-keypress keyboard target was reusable")
 	}
 }
 
@@ -437,6 +551,10 @@ func TestOpenAIComputerActionRuntimeSeparatesInternalRefreshFromFinalScreenshot(
 	if err != nil {
 		t.Fatal(err)
 	}
+	if harness.tool.snapshot != nil || harness.tool.coordinateArtifact != nil {
+		t.Fatal("internal refresh retained the previous app observation")
+	}
+	harness.observe(t)
 	final, err := runtime.PlanOpenAIComputerObservationV1(
 		"Capture final",
 		true,
@@ -466,5 +584,41 @@ func TestOpenAIComputerActionRuntimeSeparatesInternalRefreshFromFinalScreenshot(
 	}
 	if harness.tool.snapshot != nil || harness.tool.coordinateArtifact != nil {
 		t.Fatal("final provider screenshot retained the previous app observation")
+	}
+}
+
+func TestOpenAIComputerActionRuntimeInternalRefreshFollowsNewFrontmostApp(
+	t *testing.T,
+) {
+	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
+	next := harness.tree
+	next.App = "Calculator"
+	next.BundleID = "com.apple.calculator"
+	next.PID = 222
+	nextWindowID := 333
+	next.WindowID = &nextWindowID
+	encoded, err := json.Marshal(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.fake.queue("read_tree", string(encoded))
+
+	refresh, err := runtime.PlanOpenAIComputerObservationV1(
+		"Follow the frontmost app after Command-Tab",
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := harness.tool.Run(context.Background(), refresh.Args)
+	if err != nil || result.IsError {
+		t.Fatalf("refresh result=%+v err=%v", result, err)
+	}
+	if harness.tool.snapshot == nil ||
+		harness.tool.snapshot.bundleID != "com.apple.calculator" ||
+		harness.tool.snapshot.pid != 222 ||
+		harness.tool.snapshot.windowID == nil ||
+		*harness.tool.snapshot.windowID != nextWindowID {
+		t.Fatalf("refresh retained old target: %+v", harness.tool.snapshot)
 	}
 }

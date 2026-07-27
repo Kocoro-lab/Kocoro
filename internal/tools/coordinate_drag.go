@@ -241,9 +241,6 @@ func (result CoordinateDragResultV1) ValidateTaggedUnion() error {
 		}
 		if result.MouseUpCommitted {
 			if *result.FailureCode == "interference_detection_unavailable" {
-				if !result.PointerMotionCommitted {
-					return fmt.Errorf("post-up coordinate_drag result requires committed pointer motion")
-				}
 				return nil
 			}
 			if result.PointerEndpoint.Verified {

@@ -480,7 +480,7 @@ func TestOpenAIComputerAdapterShortCircuitsAfterActionFailure(t *testing.T) {
 		t.Fatalf("ExecuteBatchV1: %v", err)
 	}
 	if !result.ToolResult.IsError ||
-		!strings.Contains(result.ToolResult.Content, "action 2 of 3") {
+		!strings.Contains(result.ToolResult.Content, "action 2 of 3 (type)") {
 		t.Fatalf("tool result = %#v", result.ToolResult)
 	}
 	if len(executor.actions) != 2 {
@@ -605,6 +605,119 @@ func TestOpenAIComputerAdapterContinuesFullyCommittedScrollAndDrag(t *testing.T)
 				)
 			}
 		})
+	}
+}
+
+func TestOpenAIComputerAdapterContinuesKeypressWhenOnlyPhysicalMonitoringWasLost(
+	t *testing.T,
+) {
+	executor := &openAIComputerExecutorProbe{
+		executions: []OpenAIComputerActionExecutionV1{
+			{
+				CommitState: OpenAIComputerCommitUnverifiedV1,
+				Result: agent.ToolResult{GUIOutcome: &agent.GUIActionOutcome{
+					Result:      agent.GUIActionResultCompletedUnverified,
+					Phase:       agent.GUIActionPhaseVerifying,
+					FailureCode: "interference_detection_unavailable",
+				}},
+			},
+			{CommitState: OpenAIComputerCommitVerifiedV1},
+		},
+		finalResult: finalOpenAIComputerObservation(),
+	}
+	result, err := newOpenAIComputerAdapterV1(executor).ExecuteBatchV1(
+		context.Background(),
+		[]byte(openAIComputerCallWithActions(
+			`{"type":"keypress","keys":["META","TAB"]},`+
+				`{"type":"keypress","keys":["9"]}`,
+		)),
+	)
+	if err != nil || result.ToolResult.IsError ||
+		len(executor.actions) != 2 || executor.finalCalls != 1 {
+		t.Fatalf(
+			"result=%+v actions=%d final=%d err=%v",
+			result.ToolResult,
+			len(executor.actions),
+			executor.finalCalls,
+			err,
+		)
+	}
+}
+
+func TestOpenAIComputerAdapterObservesButDoesNotReplayDragAfterMonitoringLoss(
+	t *testing.T,
+) {
+	executor := &openAIComputerExecutorProbe{
+		executions: []OpenAIComputerActionExecutionV1{
+			{
+				CommitState: OpenAIComputerCommitUnverifiedV1,
+				Result: agent.ToolResult{GUIOutcome: &agent.GUIActionOutcome{
+					Result:      agent.GUIActionResultCompletedUnverified,
+					Phase:       agent.GUIActionPhaseVerifying,
+					FailureCode: "interference_detection_unavailable",
+				}},
+			},
+			{CommitState: OpenAIComputerCommitVerifiedV1},
+		},
+		finalResult: finalOpenAIComputerObservation(),
+	}
+	result, err := newOpenAIComputerAdapterV1(executor).ExecuteBatchV1(
+		context.Background(),
+		[]byte(openAIComputerCallWithActions(
+			`{"type":"drag","path":[{"x":1,"y":2},{"x":3,"y":4}]},`+
+				`{"type":"wait"}`,
+		)),
+	)
+	if err != nil || !result.ToolResult.IsError ||
+		len(executor.actions) != 1 || executor.finalCalls != 1 ||
+		len(result.ToolResult.Images) != 1 {
+		t.Fatalf(
+			"result=%+v actions=%d final=%d err=%v",
+			result.ToolResult,
+			len(executor.actions),
+			executor.finalCalls,
+			err,
+		)
+	}
+}
+
+func TestOpenAIComputerAdapterStopsAfterCommittedActionWhenTargetRefreshFails(
+	t *testing.T,
+) {
+	executor := &openAIComputerExecutorProbe{
+		executions: []OpenAIComputerActionExecutionV1{
+			{
+				CommitState: OpenAIComputerCommitUnverifiedV1,
+				Result: agent.ToolResult{GUIOutcome: &agent.GUIActionOutcome{
+					Result:      agent.GUIActionResultCompletedUnverified,
+					Phase:       agent.GUIActionPhaseVerifying,
+					FailureCode: "postcondition_not_declared",
+				}},
+			},
+			{CommitState: OpenAIComputerCommitVerifiedV1},
+		},
+		executionErrs: []error{
+			errors.New("target refresh failed after the committed keypress"),
+		},
+		finalResult: finalOpenAIComputerObservation(),
+	}
+	result, err := newOpenAIComputerAdapterV1(executor).ExecuteBatchV1(
+		context.Background(),
+		[]byte(openAIComputerCallWithActions(
+			`{"type":"keypress","keys":["META","TAB"]},`+
+				`{"type":"keypress","keys":["9"]}`,
+		)),
+	)
+	if err != nil || !result.ToolResult.IsError ||
+		!strings.Contains(result.ToolResult.Content, "target refresh failed") ||
+		len(executor.actions) != 1 || executor.finalCalls != 1 {
+		t.Fatalf(
+			"result=%+v actions=%d final=%d err=%v",
+			result.ToolResult,
+			len(executor.actions),
+			executor.finalCalls,
+			err,
+		)
 	}
 }
 

@@ -855,6 +855,7 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 			result.ToolResult = openAIComputerActionFailureV1(
 				index,
 				len(call.Actions),
+				action,
 				execution,
 				executeErr,
 			)
@@ -905,9 +906,10 @@ func openAIComputerActionCanContinueV1(
 	}
 	switch execution.CommitState {
 	case OpenAIComputerCommitVerifiedV1:
-		return true
+		return executeErr == nil
 	case OpenAIComputerCommitUnverifiedV1:
-		return openAIComputerKnownCommitCanContinueV1(action, execution)
+		return executeErr == nil &&
+			openAIComputerKnownCommitCanContinueV1(action, execution)
 	default:
 		return false
 	}
@@ -963,7 +965,8 @@ func openAIComputerKnownCommitCanContinueV1(
 	case OpenAIComputerActionTypeTextV1,
 		OpenAIComputerActionKeypressV1:
 		return failureCode == "postcondition_not_declared" ||
-			failureCode == "postcondition_not_observed"
+			failureCode == "postcondition_not_observed" ||
+			failureCode == "interference_detection_unavailable"
 	case OpenAIComputerActionScrollV1:
 		return failureCode == "scroll_postcondition_not_declared"
 	case OpenAIComputerActionDragV1:
@@ -976,13 +979,15 @@ func openAIComputerKnownCommitCanContinueV1(
 func openAIComputerActionFailureV1(
 	index int,
 	count int,
+	action OpenAIComputerActionV1,
 	execution OpenAIComputerActionExecutionV1,
 	executeErr error,
 ) agent.ToolResult {
 	message := fmt.Sprintf(
-		"OpenAI computer action %d of %d did not complete",
+		"OpenAI computer action %d of %d (%s) did not complete",
 		index+1,
 		count,
+		action.Type,
 	)
 	switch execution.CommitState {
 	case OpenAIComputerCommitUnknownV1:

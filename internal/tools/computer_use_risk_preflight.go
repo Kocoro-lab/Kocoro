@@ -170,7 +170,8 @@ func (t *ComputerUseTool) PreflightConsequentialRiskV1(
 		}, nil
 	}
 	if args.Action == "keypress" &&
-		computerUseKeypressRequiresDestinationAuthorityV1(args.Modifiers, args.KeySequence) {
+		computerUseKeypressRequiresDestinationAuthorityV1(args.Modifiers, args.KeySequence) &&
+		!t.allowsLocationNavigationCommitV1(args) {
 		return ConsequentialRiskPreflightResultV1{
 			Status: ConsequentialRiskPreflightBlockedV1, FailureCode: ConsequentialRiskCodeUnsupportedPathV1,
 		}, nil

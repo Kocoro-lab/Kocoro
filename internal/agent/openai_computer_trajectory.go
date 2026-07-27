@@ -396,15 +396,30 @@ func validateOpenAIComputerExecution(
 	executeErr error,
 ) (client.ContentBlock, error) {
 	if executeErr != nil {
-		return client.ContentBlock{}, fmt.Errorf("OpenAI computer batch execution failed")
+		return client.ContentBlock{}, fmt.Errorf(
+			"OpenAI computer batch execution failed: %w",
+			executeErr,
+		)
 	}
-	if trajectory == nil || execution.CallID == "" ||
-		execution.CallID != trajectory.call.CallID {
+	if trajectory == nil {
+		return client.ContentBlock{}, fmt.Errorf("OpenAI computer batch trajectory is unavailable")
+	}
+	// An empty CallID means the daemon adapter rejected the payload before any
+	// action ran (e.g. an action shape this build cannot decode). Surface that
+	// original reason instead of misreporting it as a provider ID mismatch.
+	if execution.CallID == "" {
+		return client.ContentBlock{}, fmt.Errorf(
+			"OpenAI computer batch was rejected before execution%s",
+			openAIComputerExecutionDetail(execution),
+		)
+	}
+	if execution.CallID != trajectory.call.CallID {
 		return client.ContentBlock{}, fmt.Errorf("OpenAI computer batch call_id mismatch")
 	}
 	if !execution.ContinuationAllowed {
 		return client.ContentBlock{}, fmt.Errorf(
-			"OpenAI computer batch has no verified state for continuation",
+			"OpenAI computer batch has no verified state for continuation%s",
+			openAIComputerExecutionDetail(execution),
 		)
 	}
 	if len(execution.Result.Images) != 1 {
@@ -425,6 +440,22 @@ func validateOpenAIComputerExecution(
 		return client.ContentBlock{}, err
 	}
 	return screenshot, nil
+}
+
+// openAIComputerExecutionDetail preserves the executor's own failure text in
+// terminal errors. The continuation wire cannot carry it (computer_call_output
+// is screenshot-only), so this suffix is the only place the original reason
+// survives to the parent tool card and logs.
+func openAIComputerExecutionDetail(execution OpenAIComputerBatchExecution) string {
+	detail := strings.TrimSpace(execution.Result.Content)
+	if detail == "" {
+		return ""
+	}
+	const maxDetailRunes = 500
+	if runes := []rune(detail); len(runes) > maxDetailRunes {
+		detail = string(runes[:maxDetailRunes]) + "…"
+	}
+	return ": " + detail
 }
 
 func validateTrustedOpenAIComputerProfile(profile *client.ExecutionProfile) error {

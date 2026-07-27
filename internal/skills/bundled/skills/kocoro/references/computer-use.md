@@ -41,6 +41,12 @@ The consequential slice is intentionally narrower than generic mutation approval
 
 `computer_use.activity` events carry only structured, redacted state. Desktop orders them by `(coordinator_instance_id, revision)`, repairs gaps from the snapshot endpoint, and invalidates pointer projection on topology changes.
 
+## Acceptance diagnostics
+
+Every native task writes content-free `computer_use_trace_v1` rows to the local audit log. The trace covers task, app resolution/launch, initial observation attempts, provider batches, individual action types, final observations, terminal status, stable failure codes, commit state, and phase duration. It deliberately excludes model text, typed text, coordinates, AX values, window titles, screenshots, response/call/tool-use IDs, and user-authored descriptions. `scripts/computer-use-trace.sh <session-id>` extracts only these rows.
+
+The frozen manual acceptance suite lives at `test/e2e/testdata/computer_use_acceptance_manifest.v1.json`; its result contract is `computer_use_acceptance_result.schema.v1.json`. Live execution is always explicit because it uses billed models and the real pointer. The default suite covers cold/warm launch, URL keyboard focus, cross-app partial completion, draft-without-send, exact consequential confirmation (disabled by default), and deliberate pointer interference. Secondary-display acceptance remains paused in the suite policy.
+
 ## Legacy migration
 
 The daemon exposes one stable high-level function contract to the parent and one OpenAI-native contract inside the private child. Cloud profile resolution is lazy and contract-filtered; an unavailable or incompatible resolver fails only that invoked desktop task and never an unrelated ordinary turn. No generic or Anthropic-native fallback is selected, and `computer`, `accessibility`, or `applescript` are not re-exposed. Browser tools remain available for real web pages, but their page coordinates are not native-app coordinates.

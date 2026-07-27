@@ -192,6 +192,56 @@ final class CoordinateDragTests: XCTestCase {
         XCTAssertEqual(harness.posts, [])
     }
 
+    func testDragWaitsForDelayedSyntheticMouseDownCounter() {
+        let start = CoordinateMouseEventPointV1(x: 200.5, y: 300.5)
+        let baseline = DragHarness.physicalSnapshot(pointer: start)
+        let observations: [PhysicalInputInterferenceSnapshotV1?] = [
+            baseline,
+            DragHarness.physicalSnapshot(
+                pointer: start, changes: [(.leftMouseDown, 1)], heldButtons: 1),
+        ]
+        var observationIndex = 0
+        var settleCalls = 0
+
+        let assessment = coordinateDragAssessPhysicalInputV1(
+            baseline: baseline,
+            expectedPointer: start,
+            expectedSyntheticEvents: [(.leftMouseDown, 1)],
+            expectedSyntheticHeldMouseButtons: 1,
+            expectedSyntheticHeldModifierFlags: 0,
+            observe: {
+                defer { observationIndex += 1 }
+                return observations[min(observationIndex, observations.count - 1)]
+            },
+            settle: { settleCalls += 1 })
+
+        XCTAssertEqual(assessment.assessment, .unchanged)
+        XCTAssertEqual(observationIndex, 2)
+        XCTAssertEqual(settleCalls, 1)
+    }
+
+    func testMonitoringLossAfterMouseDownIsNotReportedAsUserInterference() throws {
+        let harness = DragHarness()
+        let start = DragHarness.defaultPreparedPath()[0]
+        harness.physicalInputSnapshots = [
+            DragHarness.physicalSnapshot(pointer: start),
+            nil,
+        ]
+
+        let result = runCoordinateDrag(
+            request: try dragRequest(), dependencies: harness.dependencies())
+
+        XCTAssertEqual(result.status, "completed_unverified")
+        XCTAssertEqual(result.phase, "post_verification")
+        XCTAssertEqual(result.failureCode, "interference_detection_unavailable")
+        XCTAssertTrue(result.mouseDownCommitted)
+        XCTAssertFalse(result.pointerMotionCommitted)
+        XCTAssertTrue(result.mouseUpCommitted)
+        XCTAssertFalse(harness.buttonDown)
+        let encoded = try JSONEncoder().encode(result)
+        XCTAssertNoThrow(try decodeCoordinateDragResultV1(encoded))
+    }
+
     func testCleanupRetriesPrecreatedMouseUpWithoutPostingModifiers() throws {
         let harness = DragHarness()
         harness.cancelValues = [false, true]

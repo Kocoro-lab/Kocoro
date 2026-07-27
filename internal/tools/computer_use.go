@@ -25,18 +25,19 @@ type axCallClient interface {
 }
 
 type computerUseSnapshot struct {
-	id         string
-	status     string
-	app        string
-	bundleID   string
-	pid        int
-	window     string
-	windowID   *int
-	filter     string
-	budget     int
-	elements   []computerUseElement
-	signatures map[string]string
-	typed      bool
+	id                     string
+	status                 string
+	app                    string
+	bundleID               string
+	pid                    int
+	window                 string
+	windowID               *int
+	expectedWindowAXBounds *CoordinateQuartzRectV1
+	filter                 string
+	budget                 int
+	elements               []computerUseElement
+	signatures             map[string]string
+	typed                  bool
 }
 
 type computerUseCoordinateExecutorV1 func(
@@ -199,7 +200,14 @@ type computerUseCoordinateFocusV1 struct {
 	expectedWindowAXBounds CoordinateQuartzRectV1
 	filter                 string
 	budget                 int
-	observedAfterClick     bool
+	observationBound       bool
+	locationNavigation     bool
+}
+
+type computerUseNavigationCommitV1 struct {
+	pid      int
+	bundleID string
+	windowID uint32
 }
 
 func (focus *computerUseCoordinateFocusV1) matchesTree(
@@ -229,6 +237,7 @@ type ComputerUseTool struct {
 	refs                          map[string]refEntry
 	coordinateArtifact            *CoordinateWindowArtifactV1
 	coordinateFocus               *computerUseCoordinateFocusV1
+	navigationCommit              *computerUseNavigationCommitV1
 	coordinateExecutor            computerUseCoordinateExecutorV1
 	coordinateDragExecutor        computerUseCoordinateDragExecutorV1
 	coordinatePixelScrollExecutor computerUseCoordinatePixelScrollExecutorV1
@@ -448,6 +457,9 @@ func (t *ComputerUseTool) runWithGUIOperationLockHeld(
 	if t.coordinateFocus != nil && args.Action != "type" &&
 		args.Action != "get_app_state" && args.Action != "screenshot" {
 		t.coordinateFocus = nil
+	}
+	if t.navigationCommit != nil && args.Action != "keypress" {
+		t.navigationCommit = nil
 	}
 
 	switch args.Action {
@@ -669,7 +681,7 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 		pendingFocus.stateID = stateID
 		pendingFocus.filter = filter
 		pendingFocus.budget = budget
-		pendingFocus.observedAfterClick = true
+		pendingFocus.observationBound = true
 		t.coordinateFocus = pendingFocus
 	}
 	if !args.IncludeScreenshot {
@@ -717,19 +729,28 @@ func (t *ComputerUseTool) publishComputerUseObservation(
 		// counts. Treat the observation as a fresh "initial" baseline.
 	}
 
+	var expectedWindowAXBounds *CoordinateQuartzRectV1
+	if tree.WindowFrame != nil {
+		bounds := CoordinateQuartzRectV1{
+			X: tree.WindowFrame.X, Y: tree.WindowFrame.Y,
+			Width: tree.WindowFrame.Width, Height: tree.WindowFrame.Height,
+		}
+		expectedWindowAXBounds = &bounds
+	}
 	t.snapshot = &computerUseSnapshot{
-		id:         id,
-		status:     status,
-		app:        tree.App,
-		bundleID:   tree.BundleID,
-		pid:        tree.PID,
-		window:     tree.Window,
-		windowID:   tree.WindowID,
-		filter:     filter,
-		budget:     budget,
-		elements:   tree.Elements,
-		signatures: signatures,
-		typed:      tree.SchemaVersion == 1,
+		id:                     id,
+		status:                 status,
+		app:                    tree.App,
+		bundleID:               tree.BundleID,
+		pid:                    tree.PID,
+		window:                 tree.Window,
+		windowID:               tree.WindowID,
+		expectedWindowAXBounds: expectedWindowAXBounds,
+		filter:                 filter,
+		budget:                 budget,
+		elements:               tree.Elements,
+		signatures:             signatures,
+		typed:                  tree.SchemaVersion == 1,
 	}
 	t.refs = make(map[string]refEntry, len(tree.RefPaths))
 	for ref, entry := range tree.RefPaths {
@@ -1503,7 +1524,7 @@ func (t *ComputerUseTool) coordinateFocusedType(
 		return failure, nil
 	}
 	if !focus.matchesTree(current) ||
-		focus.observedAfterClick && computerUseStateID(current) != args.StateID {
+		focus.observationBound && computerUseStateID(current) != args.StateID {
 		return computerUseKeyboardTargetUnavailableV1(), nil
 	}
 	deadline := t.computerUseCoordinateNowV1().Add(
@@ -1522,15 +1543,31 @@ func (t *ComputerUseTool) coordinateFocusedType(
 		Text:             &text,
 		CommitDeadlineAt: deadline.UTC().Format(time.RFC3339Nano),
 	}
-	return t.executeTargetBoundInput(ctx, args.Action, request)
+	result, err := t.executeTargetBoundInput(ctx, args.Action, request)
+	if err == nil && !result.IsError && focus.locationNavigation &&
+		computerUseLocationNavigationTextV1(text) {
+		t.navigationCommit = &computerUseNavigationCommitV1{
+			pid: current.PID, bundleID: current.BundleID,
+			windowID: uint32(*current.WindowID),
+		}
+	}
+	return result, err
 }
 
 func computerUseKeyboardTargetUnavailableV1() agent.ToolResult {
-	return agent.BusinessError(
+	result := agent.BusinessError(
 		"computer_use_error: keyboard_target_unavailable\n" +
-			"message: no current text target is available from an AX focused ref or one verified coordinate click\n" +
-			"recovery: observe the intended window with a screenshot, click the editor once, then type once; do not retry automatically",
+			"message: no current text target is available from an AX focused ref, a verified coordinate click, or a refreshed post-keypress window target\n" +
+			"recovery: re-observe the intended window and establish one exact text target before typing; do not retry automatically",
 	)
+	// No target-bound input request was constructed, so this is a known
+	// pre-commit rejection rather than an ambiguous keyboard mutation.
+	result.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseActing,
+		FailureCode: "keyboard_target_unavailable",
+	}
+	return result
 }
 
 func (t *ComputerUseTool) hotkey(ctx context.Context, args computerUseArgs) (agent.ToolResult, error) {
@@ -1573,7 +1610,8 @@ func (t *ComputerUseTool) keypress(
 		return agent.ValidationError(
 			"keypress exceeds the admitted key/modifier sequence"), nil
 	}
-	if computerUseKeypressRequiresDestinationAuthorityV1(args.Modifiers, args.KeySequence) {
+	if computerUseKeypressRequiresDestinationAuthorityV1(args.Modifiers, args.KeySequence) &&
+		!t.consumeLocationNavigationCommitV1(args) {
 		t.invalidateState()
 		return consequentialRiskToolFailureV1(ConsequentialRiskCodeUnsupportedPathV1), nil
 	}
@@ -1656,12 +1694,18 @@ func (t *ComputerUseTool) targetBoundInput(
 		request.ExpectedFingerprint = &fingerprint
 		request.Text = &text
 	} else if args.Action == "hotkey" {
+		// computerUseArgs uses omitempty, so a provider keypress without
+		// modifiers arrives here as a nil slice. The strict cross-language wire
+		// contract requires an explicit JSON array: Swift intentionally rejects
+		// null because null and "no modifiers" are different protocol states.
+		explicitModifiers := append([]string{}, modifiers...)
 		request.Key = &key
-		request.Modifiers = &modifiers
+		request.Modifiers = &explicitModifiers
 	} else {
+		explicitModifiers := append([]string{}, modifiers...)
 		keys := append([]string(nil), args.KeySequence...)
 		request.Keys = &keys
-		request.Modifiers = &modifiers
+		request.Modifiers = &explicitModifiers
 	}
 	return t.executeTargetBoundInput(ctx, args.Action, request)
 }
@@ -1697,6 +1741,18 @@ func (t *ComputerUseTool) executeTargetBoundInput(
 			return failure, nil
 		}
 		return computerUseCallError("target-bound "+action, err), nil
+	}
+	if result.Action == "unknown" && result.Status == "failed" &&
+		!result.InputCommitted && result.FailureCode != nil &&
+		*result.FailureCode == "invalid_request" {
+		failure := agent.BusinessError(
+			"target-bound input helper rejected the request before execution; re-observe before retrying")
+		failure.GUIOutcome = &agent.GUIActionOutcome{
+			Result:      agent.GUIActionResultFailed,
+			Phase:       agent.GUIActionPhaseActing,
+			FailureCode: "invalid_request",
+		}
+		return failure, nil
 	}
 	if err := result.ValidateTaggedUnion(); err != nil || result.Action != action {
 		failure := agent.BusinessError(
@@ -2781,6 +2837,7 @@ func (t *ComputerUseTool) invalidateStateAfterMutationV1(ctx context.Context) {
 func (t *ComputerUseTool) invalidateState() {
 	t.invalidateObservationState()
 	t.coordinateFocus = nil
+	t.navigationCommit = nil
 }
 
 func computerUseActionMessage(raw json.RawMessage, fallback string) string {

@@ -1626,6 +1626,94 @@ func TestAgentLoop_ToolSearchLoadsBrowserFamilyCoreAndReanchorsTask(t *testing.T
 	}
 }
 
+func TestAgentLoop_TerminalComputerUseFailureBlocksBrowserFallbackInTurn(
+	t *testing.T,
+) {
+	computerUse := &mockSimpleTool{
+		name: "computer_use",
+		result: ToolResult{
+			Content: "[business error] computer_use_error: executor_failed\n" +
+				"message: private executor failed\n" +
+				"recovery: do not retry computer_use or attempt alternate desktop-control tools in this turn",
+			IsError:       true,
+			ErrorCategory: ErrCategoryBusiness,
+		},
+	}
+	browserNavigate := &mockCountingTool{
+		name:    "browser_navigate",
+		content: "must not run",
+	}
+
+	var thirdRequest client.CompletionRequest
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use", `{"task":"open the browser"}`), 10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("tool_search",
+					`{"query":"select:browser_navigate,browser_snapshot,browser_click"}`),
+				10, 5))
+		case 3:
+			thirdRequest = req
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The Computer Use task failed, so I stopped without switching control paths.",
+				"end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	reg.Register(browserNavigate)
+	for _, name := range FamilyRegistry["browser"].Core {
+		if name != "browser_navigate" {
+			reg.Register(&bulkyMockMCPTool{name: name})
+		}
+	}
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+
+	result, _, err := loop.Run(
+		context.Background(),
+		"Use computer use to open a browser",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(result, "stopped") {
+		t.Fatalf("result = %q", result)
+	}
+	if browserNavigate.runs != 0 {
+		t.Fatalf("browser fallback executed %d times", browserNavigate.runs)
+	}
+	encoded, err := json.Marshal(thirdRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(encoded)
+	if !strings.Contains(transcript, "alternate_desktop_control_blocked") ||
+		strings.Contains(transcript, "LOADED:browser_navigate") {
+		t.Fatalf("fallback boundary was not machine-enforced: %s", transcript)
+	}
+}
+
 // mockErrorTool always returns an error.
 type mockErrorTool struct {
 	name string

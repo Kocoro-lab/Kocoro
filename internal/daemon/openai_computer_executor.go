@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -21,6 +24,9 @@ type openAIComputerActionRuntimeV1 interface {
 		string,
 		bool,
 	) (tools.OpenAIComputerActionPlanV1, error)
+	AuthorizeOpenAIComputerTypeAfterKeypressV1(
+		tools.OpenAIComputerActionV1,
+	) error
 }
 
 type daemonOpenAIComputerPrivateRuntimeV1 struct {
@@ -34,6 +40,50 @@ type daemonOpenAIComputerPrivateRuntimeV1 struct {
 type daemonOpenAIComputerBatchRunnerV1 struct {
 	workflow *daemonGUIWorkflow
 	runtime  openAIComputerActionRuntimeV1
+	trace    *openAIComputerTraceV1
+
+	statsMu       sync.Mutex
+	stats         openAIComputerBatchStatsV1
+	batchSequence int
+}
+
+// openAIComputerBatchStatsV1 records execution evidence for diagnostics. It
+// deliberately does not decide whether the user's goal completed: only the
+// private model can make that judgment from the latest screenshot, and it
+// reports the judgment through openAIComputerTaskOutcomeV1.
+type openAIComputerBatchStatsV1 struct {
+	Batches           int
+	LastFailureDetail string
+}
+
+func (r *daemonOpenAIComputerBatchRunnerV1) recordBatchV1(
+	execution agent.OpenAIComputerBatchExecution,
+	err error,
+) {
+	r.statsMu.Lock()
+	defer r.statsMu.Unlock()
+	r.stats.Batches++
+	if err == nil && !execution.Result.IsError {
+		return
+	}
+	if err != nil {
+		r.stats.LastFailureDetail = err.Error()
+		return
+	}
+	r.stats.LastFailureDetail = strings.TrimSpace(execution.Result.Content)
+}
+
+func (r *daemonOpenAIComputerBatchRunnerV1) BatchStatsV1() openAIComputerBatchStatsV1 {
+	r.statsMu.Lock()
+	defer r.statsMu.Unlock()
+	return r.stats
+}
+
+func (r *daemonOpenAIComputerBatchRunnerV1) nextBatchIndexV1() int {
+	r.statsMu.Lock()
+	defer r.statsMu.Unlock()
+	r.batchSequence++
+	return r.batchSequence
 }
 
 func newDaemonOpenAIComputerBatchRunnerV1(
@@ -136,12 +186,33 @@ func (r *daemonOpenAIComputerBatchRunnerV1) ExecuteOpenAIComputerBatch(
 	responseID string,
 	payload json.RawMessage,
 	safetyAcknowledgement *agent.OpenAIComputerSafetyAcknowledgement,
-) (agent.OpenAIComputerBatchExecution, error) {
+) (execution agent.OpenAIComputerBatchExecution, err error) {
 	if r == nil || r.workflow == nil || r.runtime == nil ||
 		safetyAcknowledgement == nil {
 		return agent.OpenAIComputerBatchExecution{},
 			fmt.Errorf("OpenAI computer daemon batch runner is unavailable")
 	}
+	batchIndex := r.nextBatchIndexV1()
+	started := time.Now()
+	defer func() {
+		r.recordBatchV1(execution, err)
+		status := openAIComputerTraceStatusV1(execution.Result, err)
+		failureCode := openAIComputerTraceFailureCodeV1(execution.Result, err)
+		if err == nil && !execution.Result.IsError &&
+			len(execution.Result.Images) != 1 {
+			status = "failed"
+			if failureCode == "" {
+				failureCode = "final_image_unavailable"
+			}
+		}
+		r.trace.record(openAIComputerTraceEventV1{
+			Phase:       "batch",
+			Status:      status,
+			BatchIndex:  batchIndex,
+			FailureCode: failureCode,
+			DurationMS:  time.Since(started).Milliseconds(),
+		})
+	}()
 	var normalizedCall client.OpenAIComputerCall
 	if err := json.Unmarshal(payload, &normalizedCall); err != nil ||
 		normalizedCall.ResponseID != responseID {
@@ -172,6 +243,8 @@ func (r *daemonOpenAIComputerBatchRunnerV1) ExecuteOpenAIComputerBatch(
 	if err != nil {
 		return agent.OpenAIComputerBatchExecution{}, err
 	}
+	executor.trace = r.trace
+	executor.batchIndex = batchIndex
 	defer executor.EndBatchV1()
 
 	result, executeErr := tools.NewOpenAIComputerAdapterV1(executor).
@@ -197,6 +270,8 @@ type daemonOpenAIComputerExecutorV1 struct {
 	workflow   *daemonGUIWorkflow
 	runtime    openAIComputerActionRuntimeV1
 	provenance tools.OpenAIComputerExecutionProvenanceV1
+	trace      *openAIComputerTraceV1
+	batchIndex int
 
 	authority       tools.OpenAIComputerBatchAuthorityV1
 	call            *tools.OpenAIComputerCallV1
@@ -315,7 +390,30 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 	authority tools.OpenAIComputerBatchAuthorityV1,
 	scope tools.OpenAIComputerActionScopeV1,
 	action tools.OpenAIComputerActionV1,
-) (tools.OpenAIComputerActionExecutionV1, error) {
+) (execution tools.OpenAIComputerActionExecutionV1, err error) {
+	started := time.Now()
+	var trace *openAIComputerTraceV1
+	batchIndex := 0
+	if e != nil {
+		trace = e.trace
+		batchIndex = e.batchIndex
+	}
+	defer func() {
+		trace.record(openAIComputerTraceEventV1{
+			Phase:       "action",
+			Status:      openAIComputerTraceStatusV1(execution.Result, err),
+			BatchIndex:  batchIndex,
+			ActionIndex: scope.ActionIndex + 1,
+			ActionCount: scope.ActionCount,
+			ActionType:  action.Type,
+			CommitState: string(execution.CommitState),
+			FailureCode: openAIComputerTraceFailureCodeV1(
+				execution.Result,
+				err,
+			),
+			DurationMS: time.Since(started).Milliseconds(),
+		})
+	}()
 	if e == nil {
 		return tools.OpenAIComputerActionExecutionV1{
 			CommitState: tools.OpenAIComputerNotCommittedV1,
@@ -346,9 +444,10 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 		}, fmt.Errorf("OpenAI computer action projection changed its effect")
 	}
 	nativeActionCtx := tools.ContextWithOpenAINativeComputerActionV1(ctx)
+	actionToolUseID := openAIComputerActionToolUseIDV1(scope.ActionID)
 
-	result, runErr := e.runPlanV1(nativeActionCtx, plan, scope.ActionID)
-	execution := tools.OpenAIComputerActionExecutionV1{
+	result, runErr := e.runPlanV1(nativeActionCtx, plan, actionToolUseID)
+	execution = tools.OpenAIComputerActionExecutionV1{
 		CommitState: tools.OpenAIComputerNotCommittedV1,
 		Result:      result,
 	}
@@ -359,11 +458,50 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 		execution.CommitState = openAIComputerCommitStateV1(result, runErr)
 	}
 
+	var targetRefreshErr error
+	if runErr == nil &&
+		!execution.Result.IsError &&
+		(execution.CommitState == tools.OpenAIComputerCommitVerifiedV1 ||
+			execution.CommitState == tools.OpenAIComputerCommitUnverifiedV1) &&
+		openAIComputerActionNeedsFollowingTargetRefreshV1(action, scope) {
+		refreshPlan, refreshPlanErr := e.runtime.PlanOpenAIComputerObservationV1(
+			"Refresh the frontmost target after an ordered OpenAI computer keypress",
+			false,
+		)
+		if refreshPlanErr != nil {
+			targetRefreshErr = fmt.Errorf(
+				"OpenAI computer target refresh could not be safely projected",
+			)
+		} else {
+			refreshResult, refreshRunErr := e.runPlanV1(
+				nativeActionCtx,
+				refreshPlan,
+				actionToolUseID+"_target_refresh",
+			)
+			if refreshRunErr != nil || refreshResult.IsError ||
+				len(refreshResult.Images) != 0 {
+				targetRefreshErr = fmt.Errorf(
+					"OpenAI computer target refresh failed after the committed keypress",
+				)
+			} else if e.nextOpenAIComputerActionIsTypeV1(scope) {
+				if authorizeErr := e.runtime.
+					AuthorizeOpenAIComputerTypeAfterKeypressV1(action); authorizeErr != nil {
+					targetRefreshErr = fmt.Errorf(
+						"OpenAI computer keyboard target could not be bound after the committed keypress",
+					)
+				}
+			}
+		}
+	}
+
 	e.mu.Lock()
 	e.nextActionIndex++
 	e.mu.Unlock()
 	if runErr != nil {
 		return execution, fmt.Errorf("OpenAI computer action executor failed: %w", runErr)
+	}
+	if targetRefreshErr != nil {
+		return execution, targetRefreshErr
 	}
 	if execution.Result.IsError {
 		return execution, nil
@@ -371,11 +509,68 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 	return execution, nil
 }
 
+// openAIComputerActionToolUseIDV1 keeps provider call identity opaque while
+// deriving a bounded daemon invocation ID that also satisfies the local
+// consequential-risk request contract. Provider action IDs contain "/" and
+// can exceed that contract's 128-byte limit, so they must not cross the
+// confirmation seam verbatim.
+func openAIComputerActionToolUseIDV1(actionID string) string {
+	digest := sha256.Sum256([]byte(actionID))
+	return fmt.Sprintf("openai_action_%x", digest[:])
+}
+
+func openAIComputerActionNeedsFollowingTargetRefreshV1(
+	action tools.OpenAIComputerActionV1,
+	scope tools.OpenAIComputerActionScopeV1,
+) bool {
+	return action.Type == tools.OpenAIComputerActionKeypressV1 &&
+		scope.ActionIndex+1 < scope.ActionCount
+}
+
+func (e *daemonOpenAIComputerExecutorV1) nextOpenAIComputerActionIsTypeV1(
+	scope tools.OpenAIComputerActionScopeV1,
+) bool {
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	next := scope.ActionIndex + 1
+	return e.call != nil &&
+		next >= 0 &&
+		next < len(e.call.Actions) &&
+		e.call.Actions[next].Type == tools.OpenAIComputerActionTypeTextV1
+}
+
 func (e *daemonOpenAIComputerExecutorV1) CaptureFinalOpenAIComputerObservationV1(
 	ctx context.Context,
 	authority tools.OpenAIComputerBatchAuthorityV1,
 	call tools.OpenAIComputerCallV1,
-) (agent.ToolResult, error) {
+) (result agent.ToolResult, err error) {
+	started := time.Now()
+	var trace *openAIComputerTraceV1
+	batchIndex := 0
+	if e != nil {
+		trace = e.trace
+		batchIndex = e.batchIndex
+	}
+	defer func() {
+		status := openAIComputerTraceStatusV1(result, err)
+		failureCode := openAIComputerTraceFailureCodeV1(result, err)
+		if err == nil && !result.IsError && len(result.Images) != 1 {
+			status = "failed"
+			if failureCode == "" {
+				failureCode = "final_image_unavailable"
+			}
+		}
+		trace.record(openAIComputerTraceEventV1{
+			Phase:       "final_observation",
+			Status:      status,
+			BatchIndex:  batchIndex,
+			FailureCode: failureCode,
+			DurationMS:  time.Since(started).Milliseconds(),
+		})
+	}()
 	if e == nil {
 		return agent.ToolResult{},
 			fmt.Errorf("OpenAI computer executor is unavailable")
@@ -397,7 +592,8 @@ func (e *daemonOpenAIComputerExecutorV1) CaptureFinalOpenAIComputerObservationV1
 			fmt.Errorf("OpenAI computer final observation could not be safely projected")
 	}
 	nativeActionCtx := tools.ContextWithOpenAINativeComputerActionV1(ctx)
-	result, runErr := e.runPlanV1(
+	var runErr error
+	result, runErr = e.runPlanV1(
 		nativeActionCtx,
 		plan,
 		call.CallID+"/final-observation",

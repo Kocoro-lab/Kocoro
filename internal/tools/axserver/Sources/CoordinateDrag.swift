@@ -301,7 +301,7 @@ private func validateCoordinateDragResult(_ result: CoordinateDragResultV1) -> B
                 result.postcondition == nil && result.pointerEndpoint != nil else { return false }
         if result.mouseUpCommitted {
             if result.failureCode == "interference_detection_unavailable" {
-                return result.pointerMotionCommitted
+                return true
             }
             if result.pointerEndpoint?.verified == true {
                 return result.pointerMotionCommitted &&
@@ -384,6 +384,48 @@ struct CoordinateDragDependencies {
 
 private let coordinateDragPointerToleranceV1 = 2.0
 private let coordinateDragMaximumDeadlineHorizonV1 = 3.0
+private let coordinateDragCounterSettleDelayV1 = 0.005
+private let coordinateDragMaximumCounterSettleAttemptsV1 = 10
+
+func coordinateDragAssessPhysicalInputV1(
+    baseline: PhysicalInputInterferenceSnapshotV1?,
+    expectedPointer: CoordinateMouseEventPointV1?,
+    expectedSyntheticEvents: [(CGEventType, UInt32)] = [],
+    expectedSyntheticHeldMouseButtons: UInt32,
+    expectedSyntheticHeldModifierFlags: UInt64,
+    observe: () -> PhysicalInputInterferenceSnapshotV1?,
+    settle: () -> Void,
+    maximumSettleAttempts: Int =
+        coordinateDragMaximumCounterSettleAttemptsV1
+) -> (
+    assessment: PhysicalInputInterferenceAssessmentV1,
+    snapshot: PhysicalInputInterferenceSnapshotV1?
+) {
+    // CGEvent delivery and the HID/synthetic counters are asynchronous. A
+    // single immediate sample can therefore see the cursor/button state from
+    // the committed event while its matching counter has not arrived yet.
+    // Retry only the observation for a bounded 50 ms; never repost an event.
+    var settleAttempt = 0
+    while true {
+        let current = observe()
+        let assessment = assessPhysicalInputInterferenceV1(
+            baseline: baseline,
+            current: current,
+            expectedPointer: expectedPointer,
+            expectedSyntheticEvents: expectedSyntheticEvents,
+            expectedSyntheticHeldMouseButtons:
+                expectedSyntheticHeldMouseButtons,
+            expectedSyntheticHeldModifierFlags:
+                expectedSyntheticHeldModifierFlags
+        )
+        if assessment != .unavailable ||
+            settleAttempt >= max(0, maximumSettleAttempts) {
+            return (assessment, current)
+        }
+        settleAttempt += 1
+        settle()
+    }
+}
 
 /// Kocoro-owned bounded minimum-jerk interpolation. The scalar polynomial
 /// p(t)=10t^3-15t^4+6t^5 has zero velocity and acceleration at both ends.
@@ -583,6 +625,21 @@ private func cleanupCoordinateDrag(
             pointerEndpoint: dragEndpoint(
                 requested: request.endQuartzPoint, observed: current))
     }
+    if code == "interference_detection_unavailable" {
+        // Monitoring loss is not evidence of physical user interference.
+        // mouseUp was acknowledged, so report the real committed-but-
+        // unverified boundary and let the caller take a fresh screenshot
+        // without replaying the drag.
+        return .init(
+            status: "completed_unverified", dragCommitted: true,
+            mouseDownCommitted: true, pointerMotionCommitted: pointerMotionCommitted,
+            mouseUpCommitted: true, possibleDropSideEffect: true,
+            phase: "post_verification",
+            failureCode: code,
+            postcondition: nil,
+            pointerEndpoint: dragEndpoint(
+                requested: request.endQuartzPoint, observed: current))
+    }
     return .init(
         status: "user_interference", dragCommitted: true, mouseDownCommitted: true,
         pointerMotionCommitted: pointerMotionCommitted, mouseUpCommitted: true,
@@ -642,16 +699,20 @@ func runCoordinateDrag(
             code: "pointer_interference", pointerMotionCommitted: false,
             lastKnownPoint: lastKnown)
     }
-    var physicalInputBaseline = dependencies.observePhysicalInput()
-    switch assessPhysicalInputInterferenceV1(
+    let afterDownAssessment = coordinateDragAssessPhysicalInputV1(
         baseline: physicalInputBeforeDown,
-        current: physicalInputBaseline,
         expectedPointer: request.startQuartzPoint,
         expectedSyntheticEvents: [(.leftMouseDown, 1)],
         expectedSyntheticHeldMouseButtons: 1,
         expectedSyntheticHeldModifierFlags:
-            strictInputModifierFlagsV1(request.modifiers)!.rawValue
-    ) {
+            strictInputModifierFlagsV1(request.modifiers)!.rawValue,
+        observe: dependencies.observePhysicalInput,
+        settle: {
+            dependencies.sleep(coordinateDragCounterSettleDelayV1)
+        }
+    )
+    var physicalInputBaseline = afterDownAssessment.snapshot
+    switch afterDownAssessment.assessment {
     case .interference:
         return cleanupCoordinateDrag(
             request: request, prepared: prepared, dependencies: dependencies,
@@ -681,15 +742,19 @@ func runCoordinateDrag(
                 code: "request_expired_during_drag", pointerMotionCommitted: motionCommitted,
                 lastKnownPoint: lastKnown)
         }
-        let physicalInputBeforeDrag = dependencies.observePhysicalInput()
-        switch assessPhysicalInputInterferenceV1(
+        let beforeDragAssessment = coordinateDragAssessPhysicalInputV1(
             baseline: physicalInputBaseline,
-            current: physicalInputBeforeDrag,
             expectedPointer: lastKnown,
             expectedSyntheticHeldMouseButtons: 1,
             expectedSyntheticHeldModifierFlags:
-                strictInputModifierFlagsV1(request.modifiers)!.rawValue
-        ) {
+                strictInputModifierFlagsV1(request.modifiers)!.rawValue,
+            observe: dependencies.observePhysicalInput,
+            settle: {
+                dependencies.sleep(coordinateDragCounterSettleDelayV1)
+            }
+        )
+        let physicalInputBeforeDrag = beforeDragAssessment.snapshot
+        switch beforeDragAssessment.assessment {
         case .interference:
             return cleanupCoordinateDrag(
                 request: request, prepared: prepared, dependencies: dependencies,
@@ -712,16 +777,25 @@ func runCoordinateDrag(
         motionCommitted = true
         let observed = dependencies.observePointer()
         lastKnown = observed ?? lastKnown
-        let physicalInputAfterDrag = dependencies.observePhysicalInput()
-        switch assessPhysicalInputInterferenceV1(
+        let afterDragAssessment = coordinateDragAssessPhysicalInputV1(
             baseline: physicalInputBeforeDrag,
-            current: physicalInputAfterDrag,
             expectedPointer: path[index],
             expectedSyntheticEvents: [(.leftMouseDragged, 1)],
             expectedSyntheticHeldMouseButtons: 1,
             expectedSyntheticHeldModifierFlags:
-                strictInputModifierFlagsV1(request.modifiers)!.rawValue
-        ) {
+                strictInputModifierFlagsV1(request.modifiers)!.rawValue,
+            observe: dependencies.observePhysicalInput,
+            settle: {
+                dependencies.sleep(coordinateDragCounterSettleDelayV1)
+            }
+        )
+        let physicalInputAfterDrag = afterDragAssessment.snapshot
+        // Cursor delivery can lag the event post just like its counter. Bind
+        // endpoint verification to a fresh cursor sample after the bounded
+        // counter settle, while retaining the monitor snapshot as fallback.
+        lastKnown = dependencies.observePointer() ??
+            physicalInputAfterDrag?.pointer ?? observed ?? lastKnown
+        switch afterDragAssessment.assessment {
         case .interference:
             return cleanupCoordinateDrag(
                 request: request, prepared: prepared, dependencies: dependencies,
@@ -736,7 +810,7 @@ func runCoordinateDrag(
             break
         }
         physicalInputBaseline = physicalInputAfterDrag
-        guard dragPointMatches(path[index], observed) else {
+        guard dragPointMatches(path[index], lastKnown) else {
             return cleanupCoordinateDrag(
                 request: request, prepared: prepared, dependencies: dependencies,
                 code: "pointer_interference", pointerMotionCommitted: true,
@@ -788,15 +862,19 @@ func runCoordinateDrag(
             code: "request_expired_before_drop", pointerMotionCommitted: motionCommitted,
             lastKnownPoint: lastKnown)
     }
-    let physicalInputBeforeUp = dependencies.observePhysicalInput()
-    switch assessPhysicalInputInterferenceV1(
+    let beforeUpAssessment = coordinateDragAssessPhysicalInputV1(
         baseline: physicalInputBaseline,
-        current: physicalInputBeforeUp,
         expectedPointer: lastKnown,
         expectedSyntheticHeldMouseButtons: 1,
         expectedSyntheticHeldModifierFlags:
-            strictInputModifierFlagsV1(request.modifiers)!.rawValue
-    ) {
+            strictInputModifierFlagsV1(request.modifiers)!.rawValue,
+        observe: dependencies.observePhysicalInput,
+        settle: {
+            dependencies.sleep(coordinateDragCounterSettleDelayV1)
+        }
+    )
+    let physicalInputBeforeUp = beforeUpAssessment.snapshot
+    switch beforeUpAssessment.assessment {
     case .interference:
         return cleanupCoordinateDrag(
             request: request, prepared: prepared, dependencies: dependencies,
@@ -810,6 +888,18 @@ func runCoordinateDrag(
     case .unchanged:
         break
     }
+    if dependencies.isCancelled() {
+        return cleanupCoordinateDrag(
+            request: request, prepared: prepared, dependencies: dependencies,
+            code: "cancelled_before_drop", pointerMotionCommitted: motionCommitted,
+            lastKnownPoint: lastKnown)
+    }
+    if dependencies.now() >= deadline {
+        return cleanupCoordinateDrag(
+            request: request, prepared: prepared, dependencies: dependencies,
+            code: "request_expired_before_drop", pointerMotionCommitted: motionCommitted,
+            lastKnownPoint: lastKnown)
+    }
     let upPosted = prepared.postUp(lastKnown)
     let observed = dependencies.observePointer() ?? lastKnown
     let endpoint = dragEndpoint(requested: request.endQuartzPoint, observed: observed)
@@ -821,15 +911,19 @@ func runCoordinateDrag(
             phase: "post_verification", failureCode: "mouse_up_post_unverified",
             postcondition: nil, pointerEndpoint: endpoint)
     }
-    let physicalInputAfterUp = dependencies.observePhysicalInput()
-    switch assessPhysicalInputInterferenceV1(
+    let afterUpAssessment = coordinateDragAssessPhysicalInputV1(
         baseline: physicalInputBeforeUp,
-        current: physicalInputAfterUp,
         expectedPointer: observed,
         expectedSyntheticEvents: [(.leftMouseUp, 1)],
+        expectedSyntheticHeldMouseButtons: 0,
         expectedSyntheticHeldModifierFlags:
-            strictInputModifierFlagsV1(request.modifiers)!.rawValue
-    ) {
+            strictInputModifierFlagsV1(request.modifiers)!.rawValue,
+        observe: dependencies.observePhysicalInput,
+        settle: {
+            dependencies.sleep(coordinateDragCounterSettleDelayV1)
+        }
+    )
+    switch afterUpAssessment.assessment {
     case .interference:
         return .init(
             status: "user_interference", dragCommitted: true,

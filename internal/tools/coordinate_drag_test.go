@@ -109,6 +109,33 @@ func TestCoordinateDragV1RejectsImpossiblePointerMotionFlags(t *testing.T) {
 	}
 }
 
+func TestCoordinateDragV1AdmitsMonitoringLossAfterAcknowledgedMouseUp(t *testing.T) {
+	failure := "interference_detection_unavailable"
+	observed := CoordinateMouseEventPointV1{X: 200.5, Y: 300.5}
+	result := CoordinateDragResultV1{
+		SchemaVersion: 1, Status: "completed_unverified",
+		DragCommitted: true, MouseDownCommitted: true,
+		PointerMotionCommitted: false, MouseUpCommitted: true,
+		PossibleDropSideEffect: true, Phase: "post_verification",
+		FailureCode: &failure,
+		PointerEndpoint: &CoordinateMouseEventPointerEndpointV1{
+			Requested: CoordinateMouseEventPointV1{X: 500.5, Y: 300.5},
+			Observed:  &observed,
+			Tolerance: coordinateMouseEndpointToleranceV1,
+			Verified:  false,
+		},
+	}
+	payload, err := EncodeCoordinateDragResultV1(result)
+	if err != nil {
+		t.Fatalf("encode monitor-loss cleanup: %v", err)
+	}
+	decoded, err := DecodeCoordinateDragResultV1(payload)
+	if err != nil || decoded.Status != "completed_unverified" ||
+		decoded.PointerMotionCommitted || !decoded.MouseUpCommitted {
+		t.Fatalf("decoded=%+v err=%v", decoded, err)
+	}
+}
+
 func TestAXClientCoordinateDragV1AfterWriteCancellationWaitsForCleanupAck(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	requestEnvelope, err := DecodeCoordinateDragRPCRequestV1(

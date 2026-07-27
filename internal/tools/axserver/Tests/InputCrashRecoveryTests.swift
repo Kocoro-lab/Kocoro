@@ -3,6 +3,51 @@ import XCTest
 @testable import ax_server
 
 final class InputCrashRecoveryTests: XCTestCase {
+    func testReleaseConfirmationWaitsForAsynchronousCombinedState() {
+        var posts = 0
+        var settles = 0
+        var observations = [false, false, true]
+
+        XCTAssertTrue(postAndConfirmInputReleaseV1(
+            post: { posts += 1 },
+            isReleased: { observations.removeFirst() },
+            settle: { settles += 1 },
+            maximumAttempts: 3
+        ))
+        XCTAssertEqual(posts, 1)
+        XCTAssertEqual(settles, 3)
+        XCTAssertTrue(observations.isEmpty)
+    }
+
+    func testBlockedGateSelfRecoversWhenCurrentProcessReleaseBecomesConfirmable() throws {
+        let harness = try RecoveryHarness()
+        let gate = harness.makeGate()
+        XCTAssertEqual(gate.recoverAtStartup(), .clean)
+        var releaseAttempts = 0
+        let token = try XCTUnwrap(gate.registerPress(
+            release: .init(metadata: .mouse(button: "left")) {
+                releaseAttempts += 1
+                harness.posts.append("up-\(releaseAttempts)")
+                return releaseAttempts >= 2
+            },
+            commitDown: {
+                harness.posts.append("down")
+                return true
+            }))
+
+        XCTAssertFalse(gate.confirmRelease(token: token))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.journal.path))
+
+        harness.now = harness.now.addingTimeInterval(1)
+        XCTAssertTrue(gate.canAdmitInput())
+        XCTAssertEqual(harness.posts, ["down", "up-1", "up-2"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.journal.path))
+        XCTAssertTrue(gate.commitSample {
+            harness.posts.append("next-input")
+            return true
+        })
+    }
+
     func testEveryOfficialOpenAIClickButtonHasDurableReleaseMetadata() throws {
         for button in ["left", "right", "wheel", "back", "forward"] {
             let metadata = InputReleaseMetadataV1.mouse(button: button)
@@ -358,7 +403,7 @@ final class InputCrashRecoveryTests: XCTestCase {
 private final class RecoveryHarness {
     let directory: URL
     let journal: URL
-    let now = Date(timeIntervalSince1970: 2_000_000_000)
+    var now = Date(timeIntervalSince1970: 2_000_000_000)
     var posts: [String] = []
     var recovered: [InputReleaseMetadataV1] = []
 

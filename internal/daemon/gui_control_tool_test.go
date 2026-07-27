@@ -186,6 +186,19 @@ func (t *consequentialRiskProbeTool) Run(context.Context, string) (agent.ToolRes
 	return agent.ToolResult{Content: "ok"}, nil
 }
 
+func TestConsequentialRiskDaemonFailureIsKnownPrecommit(t *testing.T) {
+	result := consequentialRiskDaemonFailure(
+		tools.ConsequentialRiskCodeUnsupportedPathV1,
+	)
+	if !result.IsError || result.GUIOutcome == nil ||
+		result.GUIOutcome.Result != agent.GUIActionResultFailed ||
+		result.GUIOutcome.Phase != agent.GUIActionPhaseActing ||
+		result.GUIOutcome.FailureCode !=
+			tools.ConsequentialRiskCodeUnsupportedPathV1 {
+		t.Fatalf("preflight failure lost not-committed outcome: %+v", result)
+	}
+}
+
 func testGUIWorkflow(coordinator *guicontrol.Coordinator, sessionID, turnID string) *daemonGUIWorkflow {
 	workflow := newDaemonGUIWorkflow(coordinator, daemonGUIWorkflowRequest{
 		SessionID:   sessionID,
@@ -1287,6 +1300,13 @@ func TestDaemonGUIWorkflowUntargetedGlobalInputFailsBeforeExecution(t *testing.T
 			}
 			if action == "type" && !strings.Contains(result.Content, "do not retry automatically") {
 				t.Fatalf("untargeted type invited a retry: %+v", result)
+			}
+			if action == "type" &&
+				(result.GUIOutcome == nil ||
+					result.GUIOutcome.Result != agent.GUIActionResultFailed ||
+					result.GUIOutcome.Phase != agent.GUIActionPhaseActing ||
+					result.GUIOutcome.FailureCode != "keyboard_target_unavailable") {
+				t.Fatalf("untargeted type lost known pre-commit outcome: %+v", result.GUIOutcome)
 			}
 			if active := coordinator.Snapshot().Active; active != nil {
 				t.Fatalf("untargeted %s acquired a lease: %+v", action, active)

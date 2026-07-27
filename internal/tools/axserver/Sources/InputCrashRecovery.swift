@@ -92,6 +92,30 @@ struct PreparedInputReleaseV1 {
     }
 }
 
+private let inputReleaseConfirmationDelayV1: TimeInterval = 0.005
+private let inputReleaseMaximumConfirmationAttemptsV1 = 10
+private let inputBlockedRecoveryRetryDelayV1: TimeInterval = 0.05
+
+/// Posts one idempotent release and allows the combined-session input state a
+/// bounded interval to reflect it. CGEvent delivery is asynchronous; treating
+/// the first 5 ms sample as final can quarantine the process even though the
+/// matching mouse-up/key-up arrives moments later.
+func postAndConfirmInputReleaseV1(
+    post: () -> Void,
+    isReleased: () -> Bool,
+    settle: () -> Void = {
+        Thread.sleep(forTimeInterval: inputReleaseConfirmationDelayV1)
+    },
+    maximumAttempts: Int = inputReleaseMaximumConfirmationAttemptsV1
+) -> Bool {
+    post()
+    for _ in 0..<max(1, maximumAttempts) {
+        settle()
+        if isReleased() { return true }
+    }
+    return false
+}
+
 enum InputRecoveryStartupResultV1: Equatable {
     case clean
     case recovered(releaseCount: Int)
@@ -166,6 +190,7 @@ final class InputCommitGateV1 {
     private var state: State = .uninitialized
     private var active: [UUID: PreparedInputReleaseV1] = [:]
     private var releasesConfirmedDuringShutdown: Set<UUID> = []
+    private var nextBlockedRecoveryAttemptAt: Date?
 
     init(
         journalURL: URL,
@@ -249,6 +274,7 @@ final class InputCommitGateV1 {
     ) -> UUID? {
         lock.lock()
         defer { lock.unlock() }
+        recoverBlockedCurrentProcessInputsLocked()
         guard state == .ready, release.metadata.isValid else { return nil }
         let token = UUID()
         active[token] = release
@@ -270,6 +296,7 @@ final class InputCommitGateV1 {
     func commitSample(_ commit: () -> Bool) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        recoverBlockedCurrentProcessInputsLocked()
         guard state == .ready else { return false }
         return commit()
     }
@@ -277,6 +304,7 @@ final class InputCommitGateV1 {
     func canAdmitInput() -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        recoverBlockedCurrentProcessInputsLocked()
         return state == .ready
     }
 
@@ -304,12 +332,42 @@ final class InputCommitGateV1 {
             // retain their normal retry/recovery paths through `active` plus
             // the journal.
             state = .blocked
+            nextBlockedRecoveryAttemptAt = now().addingTimeInterval(
+                inputBlockedRecoveryRetryDelayV1)
             return false
         }
         active.removeValue(forKey: token)
         let persisted = persistActiveLocked()
         if !persisted { state = .blocked }
+        if persisted && active.isEmpty && state == .blocked {
+            state = .ready
+            nextBlockedRecoveryAttemptAt = nil
+        }
         return persisted
+    }
+
+    /// A failed release confirmation may be only a delivery race. The durable
+    /// journal and in-memory release closure let a later input admission safely
+    /// retry the idempotent key-up/mouse-up. Only current-process releases are
+    /// eligible: malformed journals and persistence failures have no known
+    /// active closure and remain fail-closed until helper restart.
+    private func recoverBlockedCurrentProcessInputsLocked() {
+        // Multiple active releases belong to an in-flight modifier/drag
+        // cleanup sequence. Let its owner finish in deterministic reverse
+        // order; self-recovery is only for the single token stranded after
+        // that owner has already returned.
+        guard state == .blocked, active.count == 1,
+              nextBlockedRecoveryAttemptAt.map({ now() >= $0 }) ?? true,
+              let (token, release) = active.first else { return }
+        nextBlockedRecoveryAttemptAt = now().addingTimeInterval(
+            inputBlockedRecoveryRetryDelayV1)
+        guard release.postAndConfirm() else { return }
+        active.removeValue(forKey: token)
+        guard persistActiveLocked() else { return }
+        if active.isEmpty {
+            state = .ready
+            nextBlockedRecoveryAttemptAt = nil
+        }
     }
 
     func shutdownForSignal(_ signal: Int32) -> InputShutdownResultV1 {
@@ -417,9 +475,11 @@ func productionInputRelease(
             guard let event = CGEvent(
                 mouseEventSource: eventSource, mouseType: type,
                 mouseCursorPosition: location, mouseButton: button) else { return false }
-            event.post(tap: .cghidEventTap)
-            Thread.sleep(forTimeInterval: 0.005)
-            return !CGEventSource.buttonState(.combinedSessionState, button: button)
+            return postAndConfirmInputReleaseV1(
+                post: { event.post(tap: .cghidEventTap) },
+                isReleased: {
+                    !CGEventSource.buttonState(.combinedSessionState, button: button)
+                })
         }
     case "key":
         guard let virtualKey = metadata.virtualKey,
@@ -431,10 +491,12 @@ func productionInputRelease(
         }
         event.flags = CGEventFlags(rawValue: flags)
         return PreparedInputReleaseV1(metadata: metadata) {
-            event.post(tap: .cghidEventTap)
-            Thread.sleep(forTimeInterval: 0.005)
-            return !CGEventSource.keyState(
-                .combinedSessionState, key: CGKeyCode(virtualKey))
+            postAndConfirmInputReleaseV1(
+                post: { event.post(tap: .cghidEventTap) },
+                isReleased: {
+                    !CGEventSource.keyState(
+                        .combinedSessionState, key: CGKeyCode(virtualKey))
+                })
         }
     default:
         return nil
