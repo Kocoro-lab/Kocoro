@@ -234,6 +234,15 @@ func TestTargetBoundInputV1TaggedUnionRejectsMalformedTuples(t *testing.T) {
 	}
 }
 
+func TestTargetBoundInputRequestAdmitsDriverFunctionKey(t *testing.T) {
+	request := canonicalTargetBoundInputRequest(t, "keypress")
+	keys := []string{"f4"}
+	request.Keys = &keys
+	if err := request.Validate(); err != nil {
+		t.Fatalf("F4 keypress request: %v", err)
+	}
+}
+
 func TestAXClientTargetBoundInputV1WaitsForTypedAckAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	release := make(chan struct{})

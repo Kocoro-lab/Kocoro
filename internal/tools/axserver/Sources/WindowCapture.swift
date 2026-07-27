@@ -200,10 +200,10 @@ func captureWindow(
         return .failure("window_not_found")
     }
 
-    // Exact legacy Accessibility annotations are bound to the AX window frame
-    // observed immediately before capture. If that window moved, disappeared,
-    // or became off-screen during screencapture, discard the pixels rather than
-    // drawing labels against stale geometry.
+    // Every exact capture is bound to the same PID/window/bounds before and
+    // after screencapture. Annotation callers additionally request a content
+    // signature. A max-label budget of zero is the explicit visual-only path:
+    // it returns exact current pixels without claiming coordinate authority.
     var postCaptureContentSignature: String?
     if let exactID = windowID, let expectedBounds {
         guard let postCandidates = currentWindowCaptureCandidates(),
@@ -214,18 +214,19 @@ func captureWindow(
                 candidates: postCandidates) != nil else {
             return .failure("window_not_found")
         }
-        guard signatureMaxLabels > 0,
-              let postAnnotation = annotateElements(
-                pid: targetPID,
-                roles: signatureRoles,
-                maxLabels: signatureMaxLabels),
-              postAnnotation.windowID == exactID,
-              let postFrame = postAnnotation.windowFrame,
-              captureWindowFramesMatch(postFrame, expectedBounds),
-              !postAnnotation.contentSignature.isEmpty else {
-            return .failure("window_content_unavailable")
+        if signatureMaxLabels > 0 {
+            guard let postAnnotation = annotateElements(
+                    pid: targetPID,
+                    roles: signatureRoles,
+                    maxLabels: signatureMaxLabels),
+                  postAnnotation.windowID == exactID,
+                  let postFrame = postAnnotation.windowFrame,
+                  captureWindowFramesMatch(postFrame, expectedBounds),
+                  !postAnnotation.contentSignature.isEmpty else {
+                return .failure("window_content_unavailable")
+            }
+            postCaptureContentSignature = postAnnotation.contentSignature
         }
-        postCaptureContentSignature = postAnnotation.contentSignature
     }
 
     guard let data = FileManager.default.contents(atPath: tmpPath), !data.isEmpty else {

@@ -203,6 +203,13 @@ func TestComputerUseTargetBoundInputRequiresFreshStateBeforeExecutor(t *testing.
 	if err != nil || !result.IsError || !strings.Contains(result.Content, "stale state") {
 		t.Fatalf("stale target result=%+v err=%v", result, err)
 	}
+	if result.GUIOutcome == nil ||
+		result.GUIOutcome.Result != agent.GUIActionResultFailed ||
+		result.GUIOutcome.Phase != agent.GUIActionPhaseActing ||
+		result.GUIOutcome.FailureCode != "stale_state" {
+		t.Fatalf("stale precommit result lost known not-committed evidence: %+v",
+			result.GUIOutcome)
+	}
 	if executed {
 		t.Fatal("stale state reached target-bound executor")
 	}

@@ -4997,7 +4997,14 @@ iterationLoop:
 		if len(approved) > 0 {
 			batches := partitionToolCalls(approved)
 			a.tracker.Enter(PhaseExecutingTools)
-			executeBatches(ctx, batches, execResults, readTracker, a.handler)
+			executeBatches(
+				ctx,
+				batches,
+				execResults,
+				readTracker,
+				a.handler,
+				latestUserText,
+			)
 		}
 		if len(approved) > 0 || claimedStreamTool {
 			// Per-turn aggregate cap: even when each result is below the 50K

@@ -141,6 +141,12 @@ func (request TargetBoundInputRequestV1) Validate() error {
 		if err := validateTargetBoundInputModifiersV1(*request.Modifiers); err != nil {
 			return err
 		}
+		if !validTargetBoundInputKeyV1(*request.Key) {
+			return fmt.Errorf(
+				"target_bound_input hotkey key %q is invalid",
+				*request.Key,
+			)
+		}
 	case "keypress":
 		if request.Ref != nil || request.Path != nil || request.ExpectedRole != nil ||
 			request.ExpectedFingerprint != nil ||
@@ -188,7 +194,10 @@ func validTargetBoundInputKeyV1(key string) bool {
 	}
 	switch key {
 	case "return", "escape", "tab", "delete", "backspace", "home", "end",
-		"pageup", "pagedown", "up", "down", "left", "right", "space":
+		"pageup", "pagedown", "up", "down", "left", "right", "space",
+		"forwarddelete",
+		"f1", "f2", "f3", "f4", "f5", "f6",
+		"f7", "f8", "f9", "f10", "f11", "f12":
 		return true
 	}
 	return len(key) == 1 && key[0] >= 0x20 && key[0] <= 0x7e &&

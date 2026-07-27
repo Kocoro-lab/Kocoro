@@ -74,6 +74,84 @@ func TestComputerUseCoordinateObservationAllowsDynamicAXContentInStableWindow(
 	}
 }
 
+func TestComputerUseObservationUsesExactVisualOnlyFallbackWithoutCoordinateAuthority(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	harness.fake.queue(
+		"display_topology",
+		marshalDisplayTopology(t, harness.topology),
+	)
+	failure := captureWindowJSONMap(
+		t,
+		loadCoordinateFixture(
+			t,
+			"capture_coordinate_window.response.failure.v1.json",
+		),
+	)
+	failure["failure_code"] = "display_not_actionable"
+	failure["retry_safe"] = true
+	harness.fake.queue(
+		"capture_coordinate_window",
+		string(marshalCaptureWindowJSON(t, failure)),
+	)
+	image := harness.artifact.ImageBlock()
+	width, height, err := imageBlockDimensions(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.fake.queue("capture_window", string(marshalCaptureWindowJSON(
+		t,
+		exactAccessibilityWindowResult{
+			OK:          true,
+			ImageBase64: image.Data,
+			Width:       width,
+			Height:      height,
+		},
+	)))
+
+	result, err := harness.tool.Run(context.Background(), `{
+		"action":"get_app_state","include_screenshot":true,
+		"description":"Verify an exact window that cannot mint one-display coordinates"
+	}`)
+	if err != nil || result.IsError || len(result.Images) != 1 {
+		t.Fatalf("visual-only observation result=%+v err=%v", result, err)
+	}
+	if harness.tool.coordinateArtifact != nil {
+		t.Fatal("visual-only screenshot minted coordinate authority")
+	}
+	if !strings.Contains(result.Content, "visual-only") {
+		t.Fatalf("visual-only limitation was not disclosed: %s", result.Content)
+	}
+	wantMethods := []string{
+		"read_tree", "display_topology", "capture_coordinate_window",
+		"capture_window",
+	}
+	if got := fakeAXMethods(harness.fake.calls); !reflect.DeepEqual(got, wantMethods) {
+		t.Fatalf("visual-only AX sequence=%v, want %v", got, wantMethods)
+	}
+
+	runtime, err := NewOpenAIComputerActionRuntimeV1(
+		wrapGUIExecutionGate(harness.tool),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, y := 10, 20
+	if _, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionClickV1,
+			X:    &x,
+			Y:    &y,
+		},
+	); err == nil || !strings.Contains(err.Error(), "coordinate authority") {
+		t.Fatalf("visual-only screenshot authorized a coordinate click: %v", err)
+	}
+}
+
 func TestComputerUseCoordinateObservationRejectsWindowIdentityChanges(t *testing.T) {
 	requireComputerUseDarwin(t)
 	baseHarness := newComputerUseCoordinateHarness(t)

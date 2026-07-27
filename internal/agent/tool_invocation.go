@@ -6,8 +6,9 @@ import "context"
 // It is injected by the dispatcher immediately before Tool.Run so downstream
 // execution coordinators can bind cancellation and activity to one tool_use.
 type ToolInvocation struct {
-	ToolName  string
-	ToolUseID string
+	ToolName    string
+	ToolUseID   string
+	UserRequest string
 }
 
 type toolInvocationKey struct{}

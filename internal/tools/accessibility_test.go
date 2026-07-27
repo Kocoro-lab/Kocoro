@@ -74,6 +74,31 @@ func TestDecodeExactAccessibilityWindowRejectsChangedAXContentSignature(t *testi
 	}
 }
 
+func TestDecodeExactVisualOnlyWindowRequiresExactPixelsWithoutContentAuthority(
+	t *testing.T,
+) {
+	source := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, source); err != nil {
+		t.Fatal(err)
+	}
+	raw := encoded.Bytes()
+	result := exactAccessibilityWindowResult{
+		OK:          true,
+		ImageBase64: base64.StdEncoding.EncodeToString(raw),
+		Width:       2,
+		Height:      1,
+	}
+	block, err := decodeExactVisualOnlyWindow(result)
+	if err != nil || block.Data == "" {
+		t.Fatalf("visual-only exact window block=%+v err=%v", block, err)
+	}
+	result.ContentSig = strings.Repeat("a", 64)
+	if _, err := decodeExactVisualOnlyWindow(result); err == nil {
+		t.Fatal("visual-only exact window accepted annotation content authority")
+	}
+}
+
 func TestDrawAnnotationsDownscalesRetinaWindowToProviderBandPreservingAspect(t *testing.T) {
 	input := image.NewRGBA(image.Rect(0, 0, 3200, 1800))
 	var encoded bytes.Buffer

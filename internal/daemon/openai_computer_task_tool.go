@@ -24,11 +24,143 @@ type openAIComputerTaskArgsV1 struct {
 	Description string   `json:"description,omitempty"`
 }
 
+type openAIComputerChildGoalV1 struct {
+	OriginalUserRequest string `json:"original_user_request"`
+	ParentDesktopPlan   string `json:"parent_desktop_plan"`
+}
+
+type openAIComputerInitialResponseUnavailableV1 struct {
+	Attempts int
+	Window   time.Duration
+}
+
+func (e *openAIComputerInitialResponseUnavailableV1) Error() string {
+	return fmt.Sprintf(
+		"private OpenAI Computer Use initial response unavailable after %d bounded attempts of %s",
+		e.Attempts,
+		e.Window,
+	)
+}
+
+// openAIComputerInitialResponseClientV1 bounds only the first private-provider
+// response. A dropped initial request previously consumed the whole two-minute
+// desktop task without issuing one action. Continuations retain the ordinary
+// task deadline because slow page/app transitions can legitimately need more
+// time after visible progress has begun.
+type openAIComputerInitialResponseClientV1 struct {
+	delegate client.LLMClient
+	window   time.Duration
+	attempts int
+
+	mu          sync.Mutex
+	completed   bool
+	unavailable *openAIComputerInitialResponseUnavailableV1
+}
+
+func newOpenAIComputerInitialResponseClientV1(
+	delegate client.LLMClient,
+	window time.Duration,
+	attempts int,
+) *openAIComputerInitialResponseClientV1 {
+	if window <= 0 {
+		window = defaultOpenAIComputerInitialResponseTimeoutV1
+	}
+	if attempts <= 0 {
+		attempts = defaultOpenAIComputerInitialResponseAttemptsV1
+	}
+	return &openAIComputerInitialResponseClientV1{
+		delegate: delegate,
+		window:   window,
+		attempts: attempts,
+	}
+}
+
+func (c *openAIComputerInitialResponseClientV1) complete(
+	ctx context.Context,
+	invoke func(context.Context) (*client.CompletionResponse, error),
+) (*client.CompletionResponse, error) {
+	c.mu.Lock()
+	if c.completed {
+		c.mu.Unlock()
+		return invoke(ctx)
+	}
+	if c.unavailable != nil {
+		unavailable := c.unavailable
+		c.mu.Unlock()
+		return nil, unavailable
+	}
+	defer c.mu.Unlock()
+
+	for attempt := 1; attempt <= c.attempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, c.window)
+		response, err := invoke(attemptCtx)
+		attemptExpired := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
+		cancel()
+		if err == nil {
+			c.completed = true
+			return response, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !attemptExpired {
+			return nil, err
+		}
+	}
+	c.unavailable = &openAIComputerInitialResponseUnavailableV1{
+		Attempts: c.attempts,
+		Window:   c.window,
+	}
+	return nil, c.unavailable
+}
+
+func (c *openAIComputerInitialResponseClientV1) Complete(
+	ctx context.Context,
+	request client.CompletionRequest,
+) (*client.CompletionResponse, error) {
+	return c.complete(ctx, func(attemptCtx context.Context) (*client.CompletionResponse, error) {
+		return c.delegate.Complete(attemptCtx, request)
+	})
+}
+
+func (c *openAIComputerInitialResponseClientV1) CompleteStream(
+	ctx context.Context,
+	request client.CompletionRequest,
+	onDelta func(client.StreamDelta),
+) (*client.CompletionResponse, error) {
+	return c.complete(ctx, func(attemptCtx context.Context) (*client.CompletionResponse, error) {
+		return c.delegate.CompleteStream(attemptCtx, request, onDelta)
+	})
+}
+
 const (
 	openAIComputerTaskCompletedV1    = "completed"
 	openAIComputerTaskNotCompletedV1 = "not_completed"
 	openAIComputerTaskUnverifiedV1   = "unverified"
 )
+
+func openAIComputerChildGoalInputV1(
+	ctx context.Context,
+	parentDesktopPlan string,
+) string {
+	parentDesktopPlan = strings.TrimSpace(parentDesktopPlan)
+	invocation, ok := agent.ToolInvocationFromContext(ctx)
+	if !ok {
+		return parentDesktopPlan
+	}
+	originalUserRequest := strings.TrimSpace(invocation.UserRequest)
+	if originalUserRequest == "" || originalUserRequest == parentDesktopPlan {
+		return parentDesktopPlan
+	}
+	encoded, err := json.Marshal(openAIComputerChildGoalV1{
+		OriginalUserRequest: originalUserRequest,
+		ParentDesktopPlan:   parentDesktopPlan,
+	})
+	if err != nil {
+		return parentDesktopPlan
+	}
+	return string(encoded)
+}
 
 // openAIComputerTaskOutcomeV1 is the private executor's terminal contract.
 // Batch transport status cannot represent goal completion: an action can report
@@ -175,6 +307,10 @@ type openAIComputerTaskToolV1 struct {
 	resultTrunc int
 	argsTrunc   int
 	taskTimeout time.Duration
+	// Tests may shorten this private first-response window. Production keeps
+	// exactly one retry so a provider-side stall cannot consume the whole task.
+	initialResponseTimeout  time.Duration
+	initialResponseAttempts int
 	// Tests replace this seam so initial and final observation retries never sleep.
 	// The argument is the one-based failed attempt that precedes the wait.
 	observationRetry func(context.Context, int) error
@@ -184,8 +320,10 @@ type openAIComputerTaskToolV1 struct {
 }
 
 const (
-	defaultOpenAIComputerTaskTimeoutV1     = 2 * time.Minute
-	maxOpenAIComputerInitialObservationsV1 = 5
+	defaultOpenAIComputerTaskTimeoutV1             = 2 * time.Minute
+	defaultOpenAIComputerInitialResponseTimeoutV1  = 20 * time.Second
+	defaultOpenAIComputerInitialResponseAttemptsV1 = 2
+	maxOpenAIComputerInitialObservationsV1         = 5
 	// Final observations receive the same bounded settle window as initial
 	// cold-app capture. These retries repeat only screenshot observation,
 	// never a committed provider action.
@@ -373,6 +511,7 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 			"Give the complete task once; the computer executor launches/focuses apps, " +
 			"observes the current UI, performs the needed actions, and verifies the result internally. " +
 			"Do not split clicks, typing, screenshots, or app switches into separate calls. " +
+			"Do not omit a later step or app from the user's request. " +
 			"List app names in apps when known; the executor may switch apps itself.",
 		Parameters: map[string]any{
 			"type": "object",
@@ -672,8 +811,13 @@ func (t *openAIComputerTaskToolV1) Run(
 	}
 	runner.trace = trace
 	runner.observationRetry = retryObservation
-	child := agent.NewAgentLoop(
+	privateGateway := newOpenAIComputerInitialResponseClientV1(
 		t.gateway,
+		t.initialResponseTimeout,
+		t.initialResponseAttempts,
+	)
+	child := agent.NewAgentLoop(
+		privateGateway,
 		t.childTools,
 		t.modelTier,
 		t.shannonDir,
@@ -694,11 +838,21 @@ func (t *openAIComputerTaskToolV1) Run(
 	child.SetStickyContext(
 		"execution_role=private_openai_native_computer\n" +
 			"Complete the user's entire desktop goal with the native computer tool. " +
+			"When the child input is JSON, original_user_request is authoritative: complete every desktop step it requests, including later steps in other apps. " +
+			"parent_desktop_plan is only a planning hint and may accidentally omit a requested step; never treat that omission as permission to stop early. " +
 			"The initial image is the current verified app window. " +
-			"Use coordinates from the latest returned screenshot, continue across app switches, " +
+			"After every action batch, derive the next action only from the latest returned screenshot; never reuse coordinates from an older app state. " +
+			"Use semantic visible targets when they are clear, and use coordinates only against that latest screenshot. " +
+			"Before every new mutating action, compare the latest screenshot with every observable requirement in original_user_request. " +
+			"If all requested end states are already visible, your next response must be the completed JSON object, not another computer call. " +
+			"Never move or drag merely to park the cursor, rearrange windows, clean up the screen, or prepare the final response. " +
+			"For inspection or summarization, read from screenshots and use scroll only when more content must be revealed; do not drag-select text unless the user explicitly requested selection or dragging. " +
+			"Do not add routine fixed waits: Kocoro already settles and re-observes after actions; use wait only while the latest UI visibly shows loading or an in-progress transition. " +
+			"Continue across app switches, " +
 			"and stop as soon as the requested end state is verified. " +
 			"Keyboard actions are bound to the latest verified target app, window, and focus; re-observe whenever that target is uncertain. " +
-			"For browser navigation, use Command-L, type the exact URL, then Return; the URL and focused location field authorize that one navigation only. " +
+			"For browser navigation, focus the location field, type the exact URL, and use Return only while the latest observation still verifies that location-field focus. " +
+			"If keyboard focus is unavailable or Return is rejected, do not repeat it; use the latest screenshot to click the exact visible Go, URL suggestion, or navigation target instead. " +
 			"Click the intended visible button for harmless dialogs. " +
 			"For send, delete, or purchase actions, click the exact visible action button and wait for Kocoro's one local confirmation; " +
 			"never use Return, Enter, Space, or another keyboard shortcut to submit or bypass that exact consequential-action confirmation because those activation paths are rejected locally. " +
@@ -728,7 +882,12 @@ func (t *openAIComputerTaskToolV1) Run(
 	taskCtx, cancelTask := context.WithTimeout(ctx, taskTimeout)
 	defer cancelTask()
 	providerStarted := time.Now()
-	reply, _, err := child.Run(taskCtx, args.Task, content, nil)
+	reply, _, err := child.Run(
+		taskCtx,
+		openAIComputerChildGoalInputV1(ctx, args.Task),
+		content,
+		nil,
+	)
 	stats := runner.BatchStatsV1()
 	providerEvent := openAIComputerTraceEventV1{
 		Phase:      "private_executor",
@@ -736,9 +895,13 @@ func (t *openAIComputerTaskToolV1) Run(
 		DurationMS: time.Since(providerStarted).Milliseconds(),
 	}
 	if err != nil {
+		var initialUnavailable *openAIComputerInitialResponseUnavailableV1
 		if stats.LastFinalObservationUnavailable {
 			providerEvent.Status = "completed_unverified"
 			providerEvent.FailureCode = "final_observation_unavailable"
+		} else if errors.As(err, &initialUnavailable) {
+			providerEvent.Status = "failed"
+			providerEvent.FailureCode = "initial_response_unavailable"
 		} else {
 			providerEvent.Status = "failed"
 			providerEvent.FailureCode = openAIComputerTraceFailureCodeV1(
@@ -770,6 +933,56 @@ func (t *openAIComputerTaskToolV1) Run(
 		), nil
 	}
 	if err != nil {
+		var initialUnavailable *openAIComputerInitialResponseUnavailableV1
+		if errors.As(err, &initialUnavailable) {
+			trace.record(openAIComputerTraceEventV1{
+				Phase:       "task",
+				Status:      "failed",
+				FailureCode: "executor_timeout_before_action",
+				DurationMS:  time.Since(taskStarted).Milliseconds(),
+			})
+			return agent.BusinessError(
+				"computer_use_error: executor_timeout_before_action\n" +
+					"message: the private OpenAI Computer Use executor did not return an initial action plan within its bounded response window\n" +
+					"recovery: no desktop action was attempted; another observation or control path may still be used if appropriate\n" +
+					"detail: " + initialUnavailable.Error(),
+			), nil
+		}
+		// A later provider/protocol/observation failure cannot erase already
+		// acknowledged desktop effects from earlier batches. Preserve the task
+		// as structured unverified so the parent neither claims that nothing ran
+		// nor blindly repeats work that is known to have committed.
+		if stats.TaskEffect == agent.ComputerUseCommitKnown {
+			failureCode := "executor_failed_after_commit"
+			detail := err.Error()
+			switch {
+			case stats.LastFinalObservationUnavailable:
+				failureCode = "final_observation_unavailable"
+				if strings.TrimSpace(stats.LastFailureDetail) != "" {
+					detail = stats.LastFailureDetail
+				}
+			case errors.Is(err, context.DeadlineExceeded) ||
+				errors.Is(taskCtx.Err(), context.DeadlineExceeded):
+				failureCode = "executor_timeout_after_commit"
+			case stats.LastGUIResult == agent.GUIActionResultCancelled:
+				failureCode = "cancelled"
+			case stats.LastGUIResult == agent.GUIActionResultUserInterference:
+				failureCode = "user_interference"
+			case stats.LastBatchHadFreshObservation:
+				failureCode = "outcome_unverified"
+			}
+			trace.record(openAIComputerTraceEventV1{
+				Phase:       "task",
+				Status:      "completed_unverified",
+				FailureCode: failureCode,
+				DurationMS:  time.Since(taskStarted).Milliseconds(),
+			})
+			return openAIComputerTaskUnverifiedResultV1(
+				failureCode,
+				detail,
+				agent.ComputerUseCommitKnown,
+			), nil
+		}
 		if errors.Is(err, context.DeadlineExceeded) ||
 			errors.Is(taskCtx.Err(), context.DeadlineExceeded) {
 			failureCode := "executor_timeout"

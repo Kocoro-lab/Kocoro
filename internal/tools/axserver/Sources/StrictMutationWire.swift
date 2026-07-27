@@ -59,6 +59,9 @@ func strictInputKeyV1(_ key: String) -> Bool {
     let named: Set<String> = [
         "return", "escape", "tab", "delete", "backspace", "home", "end",
         "pageup", "pagedown", "up", "down", "left", "right", "space",
+        "forwarddelete",
+        "f1", "f2", "f3", "f4", "f5", "f6",
+        "f7", "f8", "f9", "f10", "f11", "f12",
     ]
     if named.contains(key) { return true }
     guard strictMutationIdentity(key), key.utf8.count == 1,

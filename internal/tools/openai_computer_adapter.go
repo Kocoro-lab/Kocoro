@@ -601,6 +601,11 @@ func normalizeOpenAIComputerKeyV1(raw string) (token string, modifier bool, ok b
 		return "right", false, true
 	case "SPACE":
 		return "space", false, true
+	case "FORWARDDELETE":
+		return "forwarddelete", false, true
+	case "F1", "F2", "F3", "F4", "F5", "F6",
+		"F7", "F8", "F9", "F10", "F11", "F12":
+		return strings.ToLower(raw), false, true
 	}
 	runes := []rune(raw)
 	if len(runes) != 1 || unicode.IsControl(runes[0]) || runes[0] > unicode.MaxASCII {

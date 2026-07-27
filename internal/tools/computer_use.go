@@ -204,13 +204,11 @@ type computerUseCoordinateFocusV1 struct {
 }
 
 type computerUseNavigationCommitV1 struct {
-	pid         int
-	bundleID    string
-	windowID    uint32
-	ref         string
-	path        string
-	role        string
-	fingerprint string
+	pid      int
+	bundleID string
+	windowID uint32
+	path     string
+	role     string
 }
 
 func (focus *computerUseCoordinateFocusV1) matchesTree(
@@ -273,7 +271,7 @@ func (t *ComputerUseTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "computer_use",
 		Description: "Observe and operate existing macOS app windows through a stateful Accessibility-first workflow. " +
-			"Start with get_app_state, or screenshot when a window image is needed, then use its state_id and element refs. Coordinates are valid only for the latest attached target-window image. " +
+			"Start with get_app_state, or screenshot when a window image is needed, then use its state_id and element refs. Coordinates are valid only for the latest actionable target-window image; an observation marked visual-only supports verification but never coordinates. " +
 			"Prefer select_text for AX text ranges; if AX reports fallback_required, re-observe before deciding whether an explicit drag is appropriate. " +
 			"Pointer actions visibly move the real cursor. Use browser tools for web-page DOM interactions." + agent.DescriptionGuidance,
 		Parameters: map[string]any{
@@ -285,12 +283,12 @@ func (t *ComputerUseTool) Info() agent.ToolInfo {
 				"app":         map[string]any{"type": "string", "description": "Target running macOS app name. Required on the first observation in unattended runs; an attended Quick Panel run may already bind its original foreground app"},
 				"ref":         map[string]any{"type": "string", "description": "Element ref from the matching state_id. Type prefers the focused ref; after one verified left coordinate click, one same-window type may omit ref. Hotkey rejects ref"},
 				"value":       map[string]any{"type": "string", "description": "Value for wait matching"},
-				"x":           map[string]any{"type": "integer", "description": "X pixel index in the latest attached get_app_state image"},
-				"y":           map[string]any{"type": "integer", "description": "Y pixel index in the latest attached get_app_state image"},
-				"start_x":     map[string]any{"type": "integer", "description": "Drag start X pixel index in the latest attached get_app_state image"},
-				"start_y":     map[string]any{"type": "integer", "description": "Drag start Y pixel index in the latest attached get_app_state image"},
-				"end_x":       map[string]any{"type": "integer", "description": "Drag end X pixel index in the latest attached get_app_state image"},
-				"end_y":       map[string]any{"type": "integer", "description": "Drag end Y pixel index in the latest attached get_app_state image"},
+				"x":           map[string]any{"type": "integer", "description": "X pixel index in the latest actionable get_app_state image; unavailable for visual-only images"},
+				"y":           map[string]any{"type": "integer", "description": "Y pixel index in the latest actionable get_app_state image; unavailable for visual-only images"},
+				"start_x":     map[string]any{"type": "integer", "description": "Drag start X pixel index in the latest actionable get_app_state image"},
+				"start_y":     map[string]any{"type": "integer", "description": "Drag start Y pixel index in the latest actionable get_app_state image"},
+				"end_x":       map[string]any{"type": "integer", "description": "Drag end X pixel index in the latest actionable get_app_state image"},
+				"end_y":       map[string]any{"type": "integer", "description": "Drag end Y pixel index in the latest actionable get_app_state image"},
 				"duration_ms": map[string]any{"type": "integer", "description": "Drag duration in milliseconds, 120-800 (default 350)"},
 				"range": map[string]any{
 					"type": "object", "description": "AX UTF-16 text range for select_text",
@@ -701,6 +699,15 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 		budget,
 	)
 	if !ok {
+		if computerUseAllowsVisualOnlyFallbackV1(failure) {
+			image, visualErr := t.captureVisualOnlyObservationV1(ctx, tree)
+			if visualErr == nil {
+				result.Images = []agent.ImageBlock{image}
+				result.Content += "\ncoordinate_notice: exact window screenshot is visual-only; coordinate actions require a new fully actionable observation"
+				result.GUICaptureDiagnostics = failure.GUICaptureDiagnostics
+				return result, nil
+			}
+		}
 		if args.Action == "screenshot" {
 			return failure, nil
 		}
@@ -711,6 +718,58 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 	t.coordinateArtifact = &artifact
 	result.Images = []agent.ImageBlock{artifact.ImageBlock()}
 	return result, nil
+}
+
+func computerUseAllowsVisualOnlyFallbackV1(
+	failure agent.ToolResult,
+) bool {
+	if failure.GUIOutcome == nil {
+		return false
+	}
+	switch failure.GUIOutcome.FailureCode {
+	case "display_not_actionable", "image_dimensions_mismatch":
+		return true
+	default:
+		return false
+	}
+}
+
+// captureVisualOnlyObservationV1 captures the same exact PID/window/bounds
+// without minting a CoordinateWindowArtifact. It is used only when the pixels
+// remain useful for visual verification but the coordinate transform cannot be
+// admitted safely (for example, a window spanning displays). Future coordinate
+// actions therefore still fail closed until a new actionable observation.
+func (t *ComputerUseTool) captureVisualOnlyObservationV1(
+	ctx context.Context,
+	tree computerUseTree,
+) (agent.ImageBlock, error) {
+	if t == nil || t.client == nil || tree.PID <= 0 ||
+		tree.WindowID == nil || *tree.WindowID <= 0 ||
+		tree.WindowFrame == nil {
+		return agent.ImageBlock{},
+			fmt.Errorf("visual-only capture requires exact window identity")
+	}
+	raw, err := t.client.Call(ctx, "capture_window", map[string]any{
+		"pid":       tree.PID,
+		"window_id": *tree.WindowID,
+		"expected_quartz_bounds": CoordinateQuartzRectV1{
+			X: tree.WindowFrame.X, Y: tree.WindowFrame.Y,
+			Width: tree.WindowFrame.Width, Height: tree.WindowFrame.Height,
+		},
+		// Zero explicitly disables annotation/content-signature work in the
+		// helper. Exact identity and bounds are still checked both before and
+		// after screencapture.
+		"max_labels": 0,
+	})
+	if err != nil {
+		return agent.ImageBlock{}, err
+	}
+	var result exactAccessibilityWindowResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return agent.ImageBlock{},
+			fmt.Errorf("decode visual-only exact window: %w", err)
+	}
+	return decodeExactVisualOnlyWindow(result)
 }
 
 func (t *ComputerUseTool) publishComputerUseObservation(
@@ -899,8 +958,11 @@ func computerUseCaptureFailureV1(
 	case "window_not_found":
 		message = app + " has no capturable window"
 		recovery = "open one normal app window, bring it forward, and retry"
-	case "window_not_actionable", "display_not_actionable":
-		message = app + "'s target window is hidden, minimized, transient, or outside one active display"
+	case "window_not_actionable":
+		message = app + "'s target window is hidden, minimized, or transient"
+		recovery = "make one normal window fully visible on an active display and retry"
+	case "display_not_actionable":
+		message = app + "'s target window is not fully contained in one supported active display"
 		recovery = "make one normal window fully visible on an active display and retry"
 	case "window_bounds_mismatch", "window_changed", "topology_changed", "stale_topology":
 		message = app + "'s window or display changed during capture"
@@ -951,10 +1013,20 @@ func computerUseCaptureFailureV1(
 	}
 	if result.RetrySafe {
 		failure := agent.TransientError(content)
+		failure.GUIOutcome = &agent.GUIActionOutcome{
+			Result:      agent.GUIActionResultFailed,
+			Phase:       agent.GUIActionPhaseObserving,
+			FailureCode: code,
+		}
 		failure.GUICaptureDiagnostics = diagnostics
 		return failure, true
 	}
 	failure := agent.BusinessError(content)
+	failure.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseObserving,
+		FailureCode: code,
+	}
 	failure.GUICaptureDiagnostics = diagnostics
 	return failure, true
 }
@@ -1605,7 +1677,6 @@ func (t *ComputerUseTool) coordinateFocusedType(
 		err,
 		text,
 		current,
-		ref,
 		entry,
 		locationTarget,
 	)
@@ -1642,7 +1713,6 @@ func (t *ComputerUseTool) recordLocationNavigationCommitV1(
 	err error,
 	text string,
 	tree computerUseTree,
-	ref string,
 	entry computerUseRefPath,
 	locationTarget bool,
 ) {
@@ -1660,30 +1730,47 @@ func (t *ComputerUseTool) recordLocationNavigationCommitV1(
 		return
 	}
 	t.navigationCommit = &computerUseNavigationCommitV1{
-		pid:         tree.PID,
-		bundleID:    tree.BundleID,
-		windowID:    uint32(*tree.WindowID),
-		ref:         ref,
-		path:        entry.Path,
-		role:        entry.Role,
-		fingerprint: entry.Fingerprint,
+		pid:      tree.PID,
+		bundleID: tree.BundleID,
+		windowID: uint32(*tree.WindowID),
+		path:     entry.Path,
+		role:     entry.Role,
 	}
 }
 
 func computerUseKeyboardTargetUnavailableV1() agent.ToolResult {
-	result := agent.BusinessError(
-		"computer_use_error: keyboard_target_unavailable\n" +
-			"message: no current exact AX focus or one-shot verified same-window focus handoff is available for this keyboard action\n" +
+	return computerUsePrecommitBusinessErrorV1(
+		"keyboard_target_unavailable",
+		"computer_use_error: keyboard_target_unavailable\n"+
+			"message: no current exact AX focus or one-shot verified same-window focus handoff is available for this keyboard action\n"+
 			"recovery: re-observe the intended window and establish one focused text target before typing; do not retry automatically",
 	)
-	// No target-bound input request was constructed, so this is a known
-	// pre-commit rejection rather than an ambiguous keyboard mutation.
+}
+
+// computerUsePrecommitFailureV1 is the single classification seam for an input
+// action rejected before executeTargetBoundInput invokes the helper. These
+// failures may require a fresh observation, but they can never make the input
+// commit status unknown because no input request crossed the mutation boundary.
+func computerUsePrecommitFailureV1(
+	result agent.ToolResult,
+	failureCode string,
+) agent.ToolResult {
 	result.GUIOutcome = &agent.GUIActionOutcome{
 		Result:      agent.GUIActionResultFailed,
 		Phase:       agent.GUIActionPhaseActing,
-		FailureCode: "keyboard_target_unavailable",
+		FailureCode: failureCode,
 	}
 	return result
+}
+
+func computerUsePrecommitBusinessErrorV1(
+	failureCode string,
+	message string,
+) agent.ToolResult {
+	return computerUsePrecommitFailureV1(
+		agent.BusinessError(message),
+		failureCode,
+	)
 }
 
 func (t *ComputerUseTool) hotkey(ctx context.Context, args computerUseArgs) (agent.ToolResult, error) {
@@ -1750,10 +1837,16 @@ func (t *ComputerUseTool) targetBoundInput(
 		return agent.ValidationError(args.Action + " requires the latest state_id"), nil
 	}
 	if t.snapshot == nil || args.StateID != t.snapshot.id {
-		return agent.BusinessError("stale state_id or no active state; call get_app_state again"), nil
+		return computerUsePrecommitBusinessErrorV1(
+			"stale_state",
+			"stale state_id or no active state; call get_app_state again",
+		), nil
 	}
 	if t.snapshot.bundleID == "" || t.snapshot.windowID == nil || *t.snapshot.windowID <= 0 {
-		return agent.BusinessError("target-bound input requires typed bundle and unique window authority; call get_app_state again"), nil
+		return computerUsePrecommitBusinessErrorV1(
+			"target_identity_unavailable",
+			"target-bound input requires typed bundle and unique window authority; call get_app_state again",
+		), nil
 	}
 	var typeEntry refEntry
 	var navigationCommit *computerUseNavigationCommitV1
@@ -1761,10 +1854,16 @@ func (t *ComputerUseTool) targetBoundInput(
 		var exists bool
 		typeEntry, exists = t.refs[args.Ref]
 		if !exists {
-			return agent.BusinessError("unknown ref for latest state_id; call get_app_state again"), nil
+			return computerUsePrecommitBusinessErrorV1(
+				"target_ref_unavailable",
+				"unknown ref for latest state_id; call get_app_state again",
+			), nil
 		}
 		if typeEntry.path == "" || typeEntry.role == "" || typeEntry.fingerprint == "" {
-			return agent.BusinessError("target-bound type requires typed element authority; call get_app_state again"), nil
+			return computerUsePrecommitBusinessErrorV1(
+				"target_element_unavailable",
+				"target-bound type requires typed element authority; call get_app_state again",
+			), nil
 		}
 	} else if computerUseKeyboardNeedsExactIntentV1(args) {
 		if !t.allowsLocationNavigationCommitV1(args) {
@@ -1779,30 +1878,45 @@ func (t *ComputerUseTool) targetBoundInput(
 	current, failure, ok := t.readTree(
 		ctx, t.snapshot.pid, t.snapshot.filter, t.snapshot.budget)
 	if !ok {
-		return failure, nil
+		return computerUsePrecommitFailureV1(
+			failure,
+			"target_observation_unavailable",
+		), nil
 	}
 	if args.Action == "type" && !hasOpenAINativeComputerActionV1(ctx) &&
 		computerUseStateID(current) != args.StateID {
-		return agent.BusinessError("stale state detected before target-bound input; call get_app_state again"), nil
+		return computerUsePrecommitBusinessErrorV1(
+			"stale_state",
+			"stale state detected before target-bound input; call get_app_state again",
+		), nil
 	}
 	if current.BundleID != t.snapshot.bundleID || current.WindowID == nil ||
 		*current.WindowID != *t.snapshot.windowID || current.WindowFrame == nil {
-		return agent.BusinessError("target-bound input authority changed; call get_app_state again"), nil
+		return computerUsePrecommitBusinessErrorV1(
+			"target_authority_changed",
+			"target-bound input authority changed; call get_app_state again",
+		), nil
 	}
 	if uint64(*current.WindowID) > uint64(^uint32(0)) {
-		return agent.BusinessError("target-bound input window authority is invalid; call get_app_state again"), nil
+		return computerUsePrecommitBusinessErrorV1(
+			"window_identity_invalid",
+			"target-bound input window authority is invalid; call get_app_state again",
+		), nil
 	}
 	if args.Action == "type" {
 		if current.FocusedRef == nil || *current.FocusedRef != args.Ref {
-			return agent.BusinessError("target-bound type ref is no longer focused; call get_app_state again"), nil
+			return computerUseKeyboardTargetUnavailableV1(), nil
 		}
-	} else if navigationCommit != nil && navigationCommit.ref != "" {
-		ref, entry, _, focused := computerUseFocusedElementAuthorityV1(current)
+	} else if navigationCommit != nil && navigationCommit.path != "" {
+		_, entry, _, focused := computerUseFocusedElementAuthorityV1(current)
+		// Typing intentionally changes the value-derived AX fingerprint of
+		// some editable location fields (Safari is one example). Keep the
+		// one-shot Return bound to the same window, focused AX path, and role,
+		// but do not require the pre-type value fingerprint to survive its own
+		// mutation.
 		if !focused ||
-			ref != navigationCommit.ref ||
 			entry.Path != navigationCommit.path ||
-			entry.Role != navigationCommit.role ||
-			entry.Fingerprint != navigationCommit.fingerprint {
+			entry.Role != navigationCommit.role {
 			return computerUseKeyboardTargetUnavailableV1(), nil
 		}
 	}
@@ -1851,7 +1965,6 @@ func (t *ComputerUseTool) targetBoundInput(
 				err,
 				text,
 				current,
-				ref,
 				entry,
 				computerUseLocationFieldEvidenceV1(element),
 			)
@@ -1866,14 +1979,20 @@ func (t *ComputerUseTool) executeTargetBoundInput(
 	request TargetBoundInputRequestV1,
 ) (agent.ToolResult, error) {
 	if err := request.Validate(); err != nil {
-		return agent.BusinessError("target-bound input request is invalid; re-observe before retrying"), nil
+		return computerUsePrecommitBusinessErrorV1(
+			"invalid_request",
+			"target-bound input request is invalid; re-observe before retrying",
+		), nil
 	}
 	executor := t.targetBoundInputExecutor
 	if executor == nil {
 		if client, ok := t.client.(*AXClient); ok {
 			executor = client.TargetBoundInputV1
 		} else {
-			return agent.BusinessError("target-bound input executor is unavailable; re-observe before retrying"), nil
+			return computerUsePrecommitBusinessErrorV1(
+				"input_executor_unavailable",
+				"target-bound input executor is unavailable; re-observe before retrying",
+			), nil
 		}
 	}
 	result, err := executor(ctx, request)

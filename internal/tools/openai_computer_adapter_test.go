@@ -235,7 +235,7 @@ func TestDecodeOpenAIComputerCallV1StrictActionUnion(t *testing.T) {
 		`{"type":"click","button":"forward","x":0,"y":1}`,
 		`{"type":"double_click","x":2,"y":3,"keys":["CTRL"]}`,
 		`{"type":"drag","path":[{"x":1,"y":2},{"x":3,"y":4}],"keys":["ALT"]}`,
-		`{"type":"keypress","keys":["META","A","B","B","RETURN"]}`,
+		`{"type":"keypress","keys":["META","A","B","B","RETURN","F4"]}`,
 		`{"type":"move","x":5,"y":6,"keys":["COMMAND"]}`,
 		`{"type":"screenshot"}`,
 		`{"type":"scroll","x":7,"y":8,"scroll_x":0,"scroll_y":-618,"keys":["SHIFT"]}`,
@@ -280,6 +280,35 @@ func TestDecodeOpenAIComputerCallV1StrictActionUnion(t *testing.T) {
 			t.Errorf("invalid action accepted: %s", action)
 		}
 	}
+}
+
+func TestOpenAIComputerKeypressAdmitsDriverFunctionKeys(t *testing.T) {
+	keys := []string{
+		"F1", "F2", "F3", "F4", "F5", "F6",
+		"F7", "F8", "F9", "F10", "F11", "F12",
+	}
+	action, err := decodeOpenAIComputerActionV1(json.RawMessage(
+		`{"type":"keypress","keys":` + mustJSONValueForOpenAIComputerTest(t, keys) + `}`,
+	))
+	if err != nil {
+		t.Fatalf("function-key action: %v", err)
+	}
+	want := []string{
+		"f1", "f2", "f3", "f4", "f5", "f6",
+		"f7", "f8", "f9", "f10", "f11", "f12",
+	}
+	if !reflect.DeepEqual(action.Keys, want) {
+		t.Fatalf("normalized function keys = %v, want %v", action.Keys, want)
+	}
+}
+
+func mustJSONValueForOpenAIComputerTest(t *testing.T, value any) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
 }
 
 func TestDecodeOpenAIComputerCallV1CanonicalizesOfficialKeyAliases(t *testing.T) {

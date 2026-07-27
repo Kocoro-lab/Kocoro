@@ -189,15 +189,32 @@ func TestExecuteBatchesInjectsExactToolInvocationIntoSerialAndConcurrentRuns(t *
 		{index: 2, fc: client.FunctionCall{ID: "toolu_b", Name: concurrentB.name}, tool: concurrentB, argsStr: "{}"},
 	}
 	execResults := make([]toolExecResult, len(approved))
-	executeBatches(context.Background(), partitionToolCalls(approved), execResults, nil, nil)
+	const userRequest = "Open TextEdit, type hello, then open Calculator"
+	executeBatches(
+		context.Background(),
+		partitionToolCalls(approved),
+		execResults,
+		nil,
+		nil,
+		userRequest,
+	)
 
 	for _, test := range []struct {
 		tool *invocationCapturingTool
 		want ToolInvocation
 	}{
-		{serial, ToolInvocation{ToolName: "serial_probe", ToolUseID: "toolu_serial"}},
-		{concurrentA, ToolInvocation{ToolName: "read_probe_a", ToolUseID: "toolu_a"}},
-		{concurrentB, ToolInvocation{ToolName: "read_probe_b", ToolUseID: "toolu_b"}},
+		{serial, ToolInvocation{
+			ToolName: "serial_probe", ToolUseID: "toolu_serial",
+			UserRequest: userRequest,
+		}},
+		{concurrentA, ToolInvocation{
+			ToolName: "read_probe_a", ToolUseID: "toolu_a",
+			UserRequest: userRequest,
+		}},
+		{concurrentB, ToolInvocation{
+			ToolName: "read_probe_b", ToolUseID: "toolu_b",
+			UserRequest: userRequest,
+		}},
 	} {
 		got := <-test.tool.invocations
 		if got != test.want {

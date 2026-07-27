@@ -639,6 +639,41 @@ func decodeExactAccessibilityWindow(
 	return raw, nil
 }
 
+func decodeExactVisualOnlyWindow(
+	result exactAccessibilityWindowResult,
+) (agent.ImageBlock, error) {
+	if !result.OK {
+		if result.Code == "" {
+			result.Code = "capture_failed"
+		}
+		return agent.ImageBlock{},
+			fmt.Errorf("visual-only exact window capture failed: %s", result.Code)
+	}
+	if result.Width <= 0 || result.Height <= 0 ||
+		result.ImageBase64 == "" || result.ContentSig != "" {
+		return agent.ImageBlock{},
+			fmt.Errorf("visual-only exact window returned invalid metadata")
+	}
+	raw, err := base64.StdEncoding.Strict().DecodeString(result.ImageBase64)
+	if err != nil ||
+		base64.StdEncoding.EncodeToString(raw) != result.ImageBase64 {
+		return agent.ImageBlock{},
+			fmt.Errorf("decode visual-only exact window image")
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return agent.ImageBlock{},
+			fmt.Errorf("inspect visual-only exact window image: %w", err)
+	}
+	if config.Width != result.Width || config.Height != result.Height {
+		return agent.ImageBlock{}, fmt.Errorf(
+			"visual-only exact window image dimensions %dx%d do not match metadata %dx%d",
+			config.Width, config.Height, result.Width, result.Height,
+		)
+	}
+	return EncodeImageBytes(raw, "image/png")
+}
+
 func (t *AccessibilityTool) scroll(ctx context.Context, args accessibilityArgs) (agent.ToolResult, error) {
 	pid := t.lastPID
 	var path *string

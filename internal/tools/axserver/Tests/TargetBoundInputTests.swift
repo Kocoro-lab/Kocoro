@@ -5,6 +5,15 @@ import XCTest
 @testable import ax_server
 
 final class TargetBoundInputTests: XCTestCase {
+    func testStrictWireAdmitsEveryFunctionKeySupportedByInputDriver() {
+        for number in 1...12 {
+            let key = "f\(number)"
+            XCTAssertTrue(strictInputKeyV1(key))
+            XCTAssertNotNil(keyCodeMap[key])
+        }
+        XCTAssertFalse(strictInputKeyV1("f13"))
+    }
+
     func testProductionTypeAlwaysUsesClipboardToBypassActiveIME() {
         let dependencies = productionTargetBoundInputDependenciesV1(isCancelled: { false })
 

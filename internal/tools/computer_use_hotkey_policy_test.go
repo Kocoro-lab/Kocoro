@@ -183,3 +183,125 @@ func TestComputerUseVerifiedLocationTypeAuthorizesOneReturn(
 		t.Fatalf("reused return preflight=%+v err=%v", blocked, err)
 	}
 }
+
+func TestComputerUseLocationReturnSurvivesTypedFieldFingerprintChange(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	locationTitle := "Address and Search"
+	harness.tree.Elements = []computerUseElement{{
+		Ref: "e1", Fingerprint: "axf_location_before",
+		Path: "window[0]/AXTextField[0]", Role: "AXTextField",
+		Title: &locationTitle, Focused: true, ValueRedacted: false,
+		Enabled: boolPointer(true),
+	}}
+	harness.tree.RefPaths = map[string]computerUseRefPath{
+		"e1": {
+			Path: "window[0]/AXTextField[0]", Role: "AXTextField",
+			Fingerprint: "axf_location_before",
+		},
+	}
+	focused := "e1"
+	harness.tree.FocusedRef = &focused
+	harness.observe(t)
+	runtime, err := NewOpenAIComputerActionRuntimeV1(
+		wrapGUIExecutionGate(harness.tool),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionKeypressV1,
+			Keys: []string{"command", "l"},
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	typePlan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "waylandz.com",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var actions []string
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context,
+		request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		actions = append(actions, request.Action)
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified",
+			Action: request.Action, InputCommitted: true,
+			ClipboardTouched:  request.Action == "type",
+			ClipboardRestored: request.Action == "type",
+			Phase:             "post_verification",
+			FailureCode:       &failure,
+		}, nil
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	typed, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		typePlan.Args,
+	)
+	if err != nil || typed.IsError {
+		t.Fatalf("type result=%+v err=%v", typed, err)
+	}
+
+	afterType := cloneComputerUseTree(t, harness.tree)
+	afterType.Elements[0].Fingerprint = "axf_location_after"
+	afterType.RefPaths["e1"] = computerUseRefPath{
+		Path: "window[0]/AXTextField[0]", Role: "AXTextField",
+		Fingerprint: "axf_location_after",
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, afterType))
+	returnArgs := fmt.Sprintf(
+		`{"action":"keypress","state_id":%q,"key_sequence":["return"],"description":"Navigate to the typed URL"}`,
+		harness.tool.snapshot.id,
+	)
+	pressed, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		returnArgs,
+	)
+	if err != nil || pressed.IsError {
+		t.Fatalf("return result=%+v err=%v", pressed, err)
+	}
+	if !reflect.DeepEqual(actions, []string{"type", "keypress"}) {
+		t.Fatalf("location navigation actions=%v", actions)
+	}
+
+	// The relaxed value fingerprint must not turn into a generic same-window
+	// Return grant: a different focused AX path still fails before execution.
+	harness.tool.navigationCommit = &computerUseNavigationCommitV1{
+		pid:      afterType.PID,
+		bundleID: afterType.BundleID,
+		windowID: uint32(*afterType.WindowID),
+		path:     "window[0]/AXTextField[0]",
+		role:     "AXTextField",
+	}
+	pathChanged := cloneComputerUseTree(t, afterType)
+	pathChanged.Elements[0].Path = "window[0]/AXTextField[1]"
+	pathChanged.RefPaths["e1"] = computerUseRefPath{
+		Path: "window[0]/AXTextField[1]", Role: "AXTextField",
+		Fingerprint: "axf_location_after",
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, pathChanged))
+	blocked, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		returnArgs,
+	)
+	if err != nil || !blocked.IsError || blocked.GUIOutcome == nil ||
+		blocked.GUIOutcome.FailureCode != "keyboard_target_unavailable" {
+		t.Fatalf("focused path drift result=%+v err=%v", blocked, err)
+	}
+	if !reflect.DeepEqual(actions, []string{"type", "keypress"}) {
+		t.Fatalf("focused path drift executed another action: %v", actions)
+	}
+}
