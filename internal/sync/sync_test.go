@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	stdsync "sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 
 // stubAudit captures audit events for assertions.
 type stubAudit struct {
+	mu     stdsync.Mutex
 	events []map[string]any
 }
 
@@ -25,6 +27,9 @@ func (s *stubAudit) Log(event string, fields map[string]any) {
 	for k, v := range fields {
 		merged[k] = v
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.events = append(s.events, merged)
 }
 
