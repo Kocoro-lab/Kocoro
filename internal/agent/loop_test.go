@@ -1265,6 +1265,57 @@ func (m *mockCountingTool) IsReadOnlyCall(string) bool {
 	return true
 }
 
+type mockComputerUseRecoveryTool struct {
+	runs int
+	args []string
+}
+
+func (m *mockComputerUseRecoveryTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        "computer_use",
+		Description: "mock computer use recovery tool",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"apps": map[string]any{
+					"type":  "array",
+					"items": map[string]any{"type": "string"},
+				},
+			},
+		},
+	}
+}
+
+func (m *mockComputerUseRecoveryTool) Run(
+	_ context.Context,
+	args string,
+) (ToolResult, error) {
+	m.runs++
+	m.args = append(m.args, args)
+	if m.runs == 1 {
+		return ToolResult{
+			Content: "computer_use_error: initial_target_required\n" +
+				"recovery: retry computer_use once with apps",
+			IsError: true,
+			ComputerUseOutcome: &ComputerUseTaskOutcome{
+				Status:      ComputerUseTaskNotCompleted,
+				Effect:      ComputerUseCommitNone,
+				FailureCode: "initial_target_required",
+				Recovery:    ComputerUseRecoveryRetryWithApps,
+			},
+		}, nil
+	}
+	return ToolResult{
+		Content: "computer_use_result: completed",
+		ComputerUseOutcome: &ComputerUseTaskOutcome{
+			Status: ComputerUseTaskCompleted,
+			Effect: ComputerUseCommitKnown,
+		},
+	}, nil
+}
+
+func (m *mockComputerUseRecoveryTool) RequiresApproval() bool { return false }
+
 type bulkyMockMCPTool struct {
 	name string
 }
@@ -1780,6 +1831,113 @@ func TestAgentLoop_OneGoalComputerUseCallOwnsDesktopForTurn(t *testing.T) {
 		"alternate_desktop_control_blocked",
 	) {
 		t.Fatalf("second goal-level call was not blocked: %s", transcript)
+	}
+}
+
+func TestAgentLoop_InitialTargetRequiredAllowsOneComputerUseRetryWithApps(
+	t *testing.T,
+) {
+	computerUse := &mockComputerUseRecoveryTool{}
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","description":"open browser"}`),
+				10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","apps":["Google Chrome"],"description":"open browser"}`),
+				10, 5))
+		case 3:
+			json.NewEncoder(w).Encode(nativeResponse(
+				"Browser task completed.", "end_turn", nil, 10, 5,
+			))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+	result, _, err := loop.Run(
+		context.Background(),
+		"Use computer use to open a browser",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Browser task completed." || computerUse.runs != 2 {
+		t.Fatalf("result=%q runs=%d args=%v", result, computerUse.runs, computerUse.args)
+	}
+}
+
+func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T) {
+	computerUse := &mockComputerUseRecoveryTool{}
+	browserNavigate := &mockCountingTool{
+		name:    "browser_navigate",
+		content: "must not run",
+	}
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","description":"open browser"}`),
+				10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("browser_navigate", `{"url":"https://example.com"}`),
+				10, 5))
+		case 3:
+			json.NewEncoder(w).Encode(nativeResponse(
+				"Stopped until the app target is supplied.",
+				"end_turn", nil, 10, 5,
+			))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	reg.Register(browserNavigate)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+	result, _, err := loop.Run(
+		context.Background(),
+		"Use computer use to open a browser",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(result, "Stopped") ||
+		computerUse.runs != 1 || browserNavigate.runs != 0 {
+		t.Fatalf(
+			"result=%q computer runs=%d browser runs=%d",
+			result,
+			computerUse.runs,
+			browserNavigate.runs,
+		)
 	}
 }
 

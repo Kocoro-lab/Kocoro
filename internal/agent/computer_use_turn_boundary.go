@@ -58,3 +58,28 @@ func alternateDesktopControlBlockedResult() ToolResult {
 		ErrorCategory: ErrCategoryBusiness,
 	}
 }
+
+func computerUseCallHasApps(argsJSON string) bool {
+	var args struct {
+		Apps []string `json:"apps"`
+	}
+	if json.Unmarshal([]byte(argsJSON), &args) != nil {
+		return false
+	}
+	for _, app := range args.Apps {
+		if strings.TrimSpace(app) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func computerUseAppsRequiredResult() ToolResult {
+	return ToolResult{
+		Content: "computer_use_error: initial_target_required\n" +
+			"message: the previous computer_use call attempted no desktop action because it lacked a safe initial app target\n" +
+			"recovery: retry computer_use with the relevant app names in apps; alternate desktop-control tools remain blocked",
+		IsError:       true,
+		ErrorCategory: ErrCategoryBusiness,
+	}
+}

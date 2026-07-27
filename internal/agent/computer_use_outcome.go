@@ -45,12 +45,21 @@ const (
 	ComputerUseTaskUnverified   ComputerUseTaskStatus = "unverified"
 )
 
+type ComputerUseTaskRecovery string
+
+const (
+	ComputerUseRecoveryNone          ComputerUseTaskRecovery = ""
+	ComputerUseRecoveryRetryWithApps ComputerUseTaskRecovery = "retry_with_apps"
+)
+
 // ComputerUseTaskOutcome is the structured daemon-to-AgentLoop completion
 // contract. It stays out of provider-visible serialization but lets the outer
 // loop enforce unknown-commit boundaries without parsing prose or IsError.
 type ComputerUseTaskOutcome struct {
-	Status ComputerUseTaskStatus
-	Effect ComputerUseCommitEffect
+	Status      ComputerUseTaskStatus
+	Effect      ComputerUseCommitEffect
+	FailureCode string
+	Recovery    ComputerUseTaskRecovery
 }
 
 func (outcome ComputerUseTaskOutcome) Validate() error {
@@ -67,6 +76,19 @@ func (outcome ComputerUseTaskOutcome) Validate() error {
 		ComputerUseCommitUnknown:
 	default:
 		return fmt.Errorf("computer-use commit effect %q is invalid", outcome.Effect)
+	}
+	switch outcome.Recovery {
+	case ComputerUseRecoveryNone:
+	case ComputerUseRecoveryRetryWithApps:
+		if outcome.Status != ComputerUseTaskNotCompleted ||
+			outcome.Effect != ComputerUseCommitNone {
+			return fmt.Errorf(
+				"computer-use recovery %q requires not_completed with no committed effect",
+				outcome.Recovery,
+			)
+		}
+	default:
+		return fmt.Errorf("computer-use recovery %q is invalid", outcome.Recovery)
 	}
 	return nil
 }

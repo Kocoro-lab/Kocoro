@@ -788,6 +788,28 @@ func (t *openAIComputerTaskToolV1) Run(
 		if detail == "" {
 			detail = "the desktop observation backend returned an error"
 		}
+		failureCode := openAIComputerTraceFailureCodeV1(
+			initial,
+			observationErr,
+		)
+		if len(apps) == 0 && failureCode == "app_policy_blocked" {
+			trace.record(openAIComputerTraceEventV1{
+				Phase:       "task",
+				Status:      "failed",
+				FailureCode: "initial_target_required",
+				DurationMS:  time.Since(taskStarted).Milliseconds(),
+			})
+			result := withOpenAIComputerTaskOutcomeV1(agent.BusinessError(
+				"computer_use_error: initial_target_required\n"+
+					"message: Computer Use cannot infer a safe initial target while the protected Kocoro Desktop window is frontmost\n"+
+					"recovery: retry computer_use once in this turn with the relevant app names in apps; do not switch to another desktop-control tool\n"+
+					"detail: no desktop action was attempted",
+			), agent.ComputerUseTaskNotCompleted, agent.ComputerUseCommitNone)
+			result.ComputerUseOutcome.FailureCode = "initial_target_required"
+			result.ComputerUseOutcome.Recovery =
+				agent.ComputerUseRecoveryRetryWithApps
+			return result, nil
+		}
 		trace.record(openAIComputerTraceEventV1{
 			Phase:       "task",
 			Status:      "failed",

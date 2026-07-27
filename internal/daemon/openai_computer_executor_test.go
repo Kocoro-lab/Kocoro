@@ -1474,6 +1474,64 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 	}
 }
 
+func TestOpenAIComputerTaskToolProtectedFrontmostRequestsAppHints(t *testing.T) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-protected-frontmost",
+		"turn-openai-protected-frontmost",
+	)
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "run.shannon.shanclaw.dev",
+		targetAppName:  "Kocoro Desktop",
+		results: map[string]agent.ToolResult{
+			"final_screenshot": agent.BusinessError(
+				"computer_use_error: app_policy_blocked\n" +
+					"target_app: Kocoro Desktop\n" +
+					"policy_source: built_in\n" +
+					"message: Kocoro Desktop is a protected app and cannot be controlled by Computer Use",
+			),
+		},
+	}
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:    &openAIComputerDaemonLoopLLM{},
+		profile:    trustedOpenAIComputerProfileForDaemon(t),
+		childTools: agent.NewToolRegistry(),
+		workflow:   workflow,
+		runtime:    &openAIComputerDaemonRuntimeProbe{tool: probe},
+		observationRetry: func(context.Context, int) error {
+			return nil
+		},
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Open the browser","description":"Open the browser"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "initial_target_required") ||
+		!strings.Contains(result.Content, "with the relevant app names in apps") {
+		t.Fatalf("task result = %+v", result)
+	}
+	if result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskNotCompleted ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitNone ||
+		result.ComputerUseOutcome.FailureCode != "initial_target_required" ||
+		result.ComputerUseOutcome.Recovery !=
+			agent.ComputerUseRecoveryRetryWithApps {
+		t.Fatalf("task outcome = %+v", result.ComputerUseOutcome)
+	}
+	if got := strings.Join(probe.runNames(), ","); got != "final_screenshot" {
+		t.Fatalf("protected initial observation retried: %q", got)
+	}
+}
+
 func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 	t *testing.T,
 ) {

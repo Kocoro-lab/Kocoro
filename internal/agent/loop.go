@@ -2732,6 +2732,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		openAIContinuationScreenshot *client.ContentBlock
 		openAIComputerErrorBatches   int // total failed-but-continuable batches this Run; see maxOpenAIComputerErrorBatches
 		computerUseOwnsTurn          bool
+		computerUseNeedsApps         bool
+		computerUseAppsRecoveryUsed  bool
 		afterCheckpoint              bool
 		checkpointDone               bool
 		nudges                       = newNudgeWindow(maxNudges, nudgeWindowIters)
@@ -4691,11 +4693,19 @@ iterationLoop:
 
 			blockedByPriorComputerUse := computerUseOwnsTurn &&
 				isAlternateDesktopControlCall(fc.Name, argsStr)
+			blockedByMissingComputerUseApps := computerUseNeedsApps &&
+				isAlternateDesktopControlCall(fc.Name, argsStr) &&
+				(fc.Name != "computer_use" ||
+					!computerUseCallHasApps(argsStr))
 			blockedBesideComputerUse := computerUseOwnsGUIResponse &&
 				fc.Name != "computer_use" &&
 				isAlternateDesktopControlCall(fc.Name, argsStr)
-			if blockedByPriorComputerUse || blockedBesideComputerUse {
+			if blockedByPriorComputerUse || blockedByMissingComputerUseApps ||
+				blockedBesideComputerUse {
 				blocked := alternateDesktopControlBlockedResult()
+				if blockedByMissingComputerUseApps {
+					blocked = computerUseAppsRequiredResult()
+				}
 				a.logAudit(fc.Name, argsStr, blocked.Content, "deny", false, 0, nil)
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{result: blocked, name: fc.Name}
@@ -4709,6 +4719,7 @@ iterationLoop:
 				// parent turn. Recovery, re-observation, and verification belong
 				// inside its private executor, not in a second outer task.
 				computerUseOwnsTurn = true
+				computerUseNeedsApps = false
 			}
 
 			// Denied-call blocking: auto-reject if this exact call was denied earlier
@@ -5085,6 +5096,23 @@ iterationLoop:
 				if a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, result, elapsed)
 				}
+			}
+			if fc.Name == "computer_use" &&
+				result.ComputerUseOutcome != nil &&
+				result.ComputerUseOutcome.Recovery ==
+					ComputerUseRecoveryRetryWithApps &&
+				result.ComputerUseOutcome.Status ==
+					ComputerUseTaskNotCompleted &&
+				result.ComputerUseOutcome.Effect ==
+					ComputerUseCommitNone &&
+				!computerUseAppsRecoveryUsed {
+				// This call never acquired a usable desktop target and therefore
+				// does not own the turn. Permit only one corrected computer_use
+				// call with explicit app hints; alternate control paths remain
+				// blocked while the outer model repairs the invocation.
+				computerUseOwnsTurn = false
+				computerUseNeedsApps = true
+				computerUseAppsRecoveryUsed = true
 			}
 
 			// Track successful file reads for read-before-edit enforcement
