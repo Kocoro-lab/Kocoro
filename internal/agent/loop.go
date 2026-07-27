@@ -37,6 +37,11 @@ import (
 // inaccuracy. Below this, ShouldCompact's 0.90 trigger handles it.
 const preflightCompactThreshold = 0.95
 
+// warnedDirectSchemaBudgets prevents a stable over-budget registry from
+// logging on every turn. Dynamic toolset fingerprints still get one
+// deterministic contributor report when they first exceed the guard.
+var warnedDirectSchemaBudgets sync.Map
+
 // shouldPreflightCompact returns true when the messages-about-to-be-sent
 // estimate exceeds preflightCompactThreshold * contextWindow.
 //
@@ -2145,19 +2150,20 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	}
 	a.workingSet.SyncToolset(a.tools)
 
-	// Deferred mode: pre-seed session-warmed deferred schemas, then only keep
-	// the remaining cold deferred tools behind tool_search when the full toolset
-	// exceeds the schema token budget.
+	// Resolve exposure independently for every tool, then pre-seed schemas that
+	// this session already loaded. Any remaining Deferred tool activates
+	// tool_search; schema size is diagnostic only and never reclassifies tools.
 	deferred := deferredToolNames(a.tools)
 	loadedDeferred := preseedDeferredSchemas(a.workingSet, deferred)
 	coldDeferred := remainingDeferredNames(deferred, loadedDeferred)
-	// Trigger deferred mode when EITHER the total schema budget is exceeded
-	// OR any cold deferred tool belongs to an always-defer category. The
-	// categorical clause lets us shrink cold-start tools[] for one-shot CLI
-	// even when total tokens stay under schemaTokenBudget.
-	deferredMode := len(coldDeferred) > 0 &&
-		(shouldDefer(a.tools, a.tools.SortedNames(), schemaTokenBudget) ||
-			hasCategoricalDeferred(coldDeferred))
+	deferredMode := len(coldDeferred) > 0
+	if report := directSchemaBudgetReport(a.tools, schemaTokenBudget); report.Exceeded() {
+		fingerprint := a.workingSet.Fingerprint()
+		if _, alreadyWarned := warnedDirectSchemaBudgets.LoadOrStore(fingerprint, struct{}{}); !alreadyWarned {
+			log.Printf("[tool-search] Direct schema budget exceeded: total=%d budget=%d contributors=%s",
+				report.Total, report.Budget, formatSchemaBudgetContributors(report, 12))
+		}
+	}
 
 	// sessionCWD may legitimately be empty for daemon runs that arrive without
 	// a CWD (pure web / reasoning tasks). Do NOT fall back to os.Getwd() here:
@@ -2256,7 +2262,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// New path: send full tools[] with defer_loading flags; Anthropic strips
 		// deferred entries from the prefix hash so tools_h stays stable, while
 		// tool_search returns tool_reference blocks that the server expands inline.
-		tsSearch := newToolSearchTool(a.tools, coldDeferred)
+		tsSearch := newToolSearchTool(a.tools, coldDeferred, a.workingSet)
 		effTools = a.tools.Clone()
 		effTools.Register(tsSearch)
 
@@ -2300,11 +2306,11 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// the system prompt's Deferred Tools section would list each tool twice.
 		deferredSummaries = nil
 
-		tsSearch := newToolSearchTool(a.tools, coldDeferred)
+		tsSearch := newToolSearchTool(a.tools, coldDeferred, a.workingSet)
 		effTools = a.tools.Clone()
 		effTools.Register(tsSearch)
 
-		baseSchemas = buildLocalActiveSchemas(effTools, coldDeferred)
+		baseSchemas = buildActiveSchemas(effTools, coldDeferred)
 		toolSchemas = baseSchemas
 		if len(loadedDeferred) > 0 {
 			toolSchemas = rebuildSchemas(effTools, baseSchemas, loadedDeferred)

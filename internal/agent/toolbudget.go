@@ -4,76 +4,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math"
+	"sort"
 	"strings"
 )
 
 const (
-	// schemaTokenBudget is the maximum token budget we allow for tool schemas
-	// before switching to deferred mode. 8000 tokens is roughly 28K chars of
-	// compact schema JSON at the conservative 3.5 chars/token ratio.
+	// schemaTokenBudget is a diagnostic guard for the directly exposed schema
+	// set. It must not reclassify tools: effective exposure is resolved from
+	// explicit tool policy and source defaults.
 	schemaTokenBudget = 8000
 
 	// charsPerTokenSchema mirrors the context estimator's conservative ratio.
 	charsPerTokenSchema = 3.5
 )
-
-// alwaysDeferTools enumerates local tools whose schemas should start out
-// deferred regardless of the total schema budget. These are categories that
-// most one-shot CLI tasks never use (macOS GUI automation, scheduling,
-// headless process control). Keeping them in the deferred set means cold-start
-// `tools[]` ships ~5K fewer tokens; sessions that DO need them pay one extra
-// `tool_search` round-trip per session.
-//
-// memory_recall is intentionally NOT in this set: it is the explicit fallback
-// path when the implicit memory preflight injects nothing (or the model needs
-// a relation the injected block did not cover). Keeping it always-loaded
-// avoids the "model hallucinates an older schema on first attempt → wasted
-// turn" failure mode observed in production, and the ~1.5K extra schema bytes
-// ride along in the cacheable system prefix so the cost is paid once per
-// session, not per turn.
-//
-// The browser_* prefix is matched separately by shouldDeferByCategory.
-//
-// See docs/issues/cache-action-plan.md §1.2 for the data behind this list.
-var alwaysDeferTools = map[string]bool{
-	"computer":        true,
-	"screenshot":      true,
-	"applescript":     true,
-	"accessibility":   true,
-	"computer_use":    true,
-	"wait_for":        true,
-	"ghostty":         true,
-	"process":         true,
-	"schedule_create": true,
-	"schedule_list":   true,
-	"schedule_remove": true,
-	"schedule_update": true,
-}
-
-// shouldDeferByCategory reports whether a tool name belongs to a category
-// that should be deferred by default (independent of total schema budget).
-func shouldDeferByCategory(name string) bool {
-	if alwaysDeferTools[name] {
-		return true
-	}
-	return strings.HasPrefix(name, "browser_")
-}
-
-// neverDeferTools enumerates gateway tools that must never enter the
-// deferred set, even though gateway tools are deferred-eligible by default
-// (deferredToolNames in deferred.go). web_search/web_fetch are the most
-// common opener of a NEW session (e.g. "what's the news on X") — deferring
-// them forces the model into an extra tool_search round-trip before it can
-// call the tool at all, adding ~6s of observed latency to the very first
-// reply of a session, every session, since the WorkingSet warm cache is
-// session-scoped and starts cold each time. Same trade as memory_recall
-// above: the two extra full schemas ride along in the cacheable system
-// prefix, so the byte cost is paid once per session, not per turn.
-var neverDeferTools = map[string]bool{
-	"web_search": true,
-	"web_fetch":  true,
-}
 
 // estimateSchemaTokens returns a heuristic token count for the named tool
 // schemas using compact JSON serialization.
@@ -97,17 +42,66 @@ func estimateSchemaTokens(reg *ToolRegistry, names []string) int {
 	return total
 }
 
-// shouldDefer returns true when sending all named schemas would exceed budget.
-func shouldDefer(reg *ToolRegistry, names []string, budget int) bool {
-	if budget <= 0 {
-		return false
-	}
-	return estimateSchemaTokens(reg, names) > budget
+type schemaBudgetContributor struct {
+	Name   string
+	Tokens int
 }
 
-// toolSchemaFingerprint hashes the effective serialized tool schemas in
-// deterministic name order. This is used to invalidate warmed deferred
-// schemas whenever the real toolset changes.
+type schemaBudgetReport struct {
+	Total        int
+	Budget       int
+	Contributors []schemaBudgetContributor
+}
+
+func (report schemaBudgetReport) Exceeded() bool {
+	return report.Budget > 0 && report.Total > report.Budget
+}
+
+// directSchemaBudgetReport measures only effective Direct schemas. It is a
+// deterministic diagnostic and never changes exposure.
+func directSchemaBudgetReport(reg *ToolRegistry, budget int) schemaBudgetReport {
+	report := schemaBudgetReport{Budget: budget}
+	if reg == nil {
+		return report
+	}
+	for _, name := range reg.SortedNames() {
+		tool, ok := reg.Get(name)
+		if !ok || EffectiveToolExposure(tool) != ToolExposureDirect {
+			continue
+		}
+		tokens := estimateSchemaTokens(reg, []string{name})
+		report.Total += tokens
+		report.Contributors = append(report.Contributors, schemaBudgetContributor{
+			Name:   name,
+			Tokens: tokens,
+		})
+	}
+	sort.Slice(report.Contributors, func(i, j int) bool {
+		if report.Contributors[i].Tokens != report.Contributors[j].Tokens {
+			return report.Contributors[i].Tokens > report.Contributors[j].Tokens
+		}
+		return report.Contributors[i].Name < report.Contributors[j].Name
+	})
+	return report
+}
+
+func formatSchemaBudgetContributors(report schemaBudgetReport, limit int) string {
+	if limit <= 0 || limit > len(report.Contributors) {
+		limit = len(report.Contributors)
+	}
+	parts := make([]string, 0, limit+1)
+	for _, contributor := range report.Contributors[:limit] {
+		parts = append(parts, fmt.Sprintf("%s=%d", contributor.Name, contributor.Tokens))
+	}
+	if remaining := len(report.Contributors) - limit; remaining > 0 {
+		parts = append(parts, fmt.Sprintf("...(+%d)", remaining))
+	}
+	return strings.Join(parts, ",")
+}
+
+// toolSchemaFingerprint hashes schemas, source, and effective exposure in
+// deterministic name order. This invalidates warmed schemas when a registry
+// refresh changes either callable metadata or the Direct/Deferred boundary.
 func toolSchemaFingerprint(reg *ToolRegistry) string {
 	if reg == nil {
 		return ""
@@ -123,7 +117,21 @@ func toolSchemaFingerprint(reg *ToolRegistry) string {
 		if err != nil {
 			continue
 		}
+		source := SourceLocal
+		if sourcer, ok := t.(ToolSourcer); ok {
+			source = sourcer.ToolSource()
+		}
+		namespace := ""
+		if provider, ok := t.(ToolSearchNamespaceProvider); ok {
+			namespace = provider.ToolSearchNamespace()
+		}
 		_, _ = h.Write([]byte(name))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(source))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(namespace))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(EffectiveToolExposure(t)))
 		_, _ = h.Write([]byte{0})
 		_, _ = h.Write(data)
 		_, _ = h.Write([]byte{'\n'})

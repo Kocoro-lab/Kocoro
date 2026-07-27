@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -16,11 +15,18 @@ import (
 type toolSearchTool struct {
 	registry *ToolRegistry
 	deferred map[string]bool
+	index    *toolSearchIndex
 }
 
 // newToolSearchTool creates a tool_search scoped to the given deferred tool names.
-func newToolSearchTool(reg *ToolRegistry, deferred map[string]bool) *toolSearchTool {
-	return &toolSearchTool{registry: reg, deferred: deferred}
+func newToolSearchTool(reg *ToolRegistry, deferred map[string]bool, workingSet ...*WorkingSet) *toolSearchTool {
+	var index *toolSearchIndex
+	if len(workingSet) > 0 && workingSet[0] != nil {
+		index = workingSet[0].toolSearchIndex(reg, deferred)
+	} else {
+		index = newToolSearchIndex(reg, deferred)
+	}
+	return &toolSearchTool{registry: reg, deferred: deferred, index: index}
 }
 
 func (t *toolSearchTool) Info() ToolInfo {
@@ -42,6 +48,7 @@ func (t *toolSearchTool) Info() ToolInfo {
 
 func (t *toolSearchTool) RequiresApproval() bool     { return false }
 func (t *toolSearchTool) IsReadOnlyCall(string) bool { return true }
+func (t *toolSearchTool) ToolExposure() ToolExposure { return ToolExposureDirect }
 
 // SkillExempt opts tool_search out of skill allowed-tools restriction. Without
 // this, a skill that omitted tool_search from its allowed list would lock the
@@ -118,65 +125,8 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 	}, nil
 }
 
-var toolSearchTokenRE = regexp.MustCompile(`[a-z0-9_]+`)
-
 func (t *toolSearchTool) matchKeyword(query string) []string {
-	terms := toolSearchTerms(query)
-	if len(terms) == 0 {
-		// Tokenization dropped everything the ASCII token regex can see — a CJK
-		// query (邮件), an all-stopword query, or any script it can't split. Fall
-		// back to a single lowercase substring match on the raw trimmed query so
-		// non-Latin scripts still resolve, matching the pre-tokenizer substring
-		// behavior instead of reporting the tool as nonexistent.
-		raw := strings.ToLower(strings.TrimSpace(query))
-		if raw == "" {
-			return nil
-		}
-		terms = []string{raw}
-	}
-
-	var matched []string
-	for name := range t.deferred {
-		tool, ok := t.registry.Get(name)
-		if !ok {
-			continue
-		}
-		info := tool.Info()
-		haystack := strings.ToLower(info.Name + " " + info.Description)
-		for _, term := range terms {
-			if strings.Contains(haystack, term) {
-				matched = append(matched, name)
-				break
-			}
-		}
-	}
-	sort.Strings(matched)
-	return matched
-}
-
-func toolSearchTerms(query string) []string {
-	raw := toolSearchTokenRE.FindAllString(strings.ToLower(query), -1)
-	seen := make(map[string]bool, len(raw))
-	terms := make([]string, 0, len(raw))
-	for _, term := range raw {
-		// Keep 2-char tokens ("db", "ax", "id") — dropping them made short but
-		// meaningful queries tokenize to nothing and match no tool.
-		if len(term) < 2 || seen[term] || toolSearchStopWord(term) {
-			continue
-		}
-		seen[term] = true
-		terms = append(terms, term)
-	}
-	return terms
-}
-
-func toolSearchStopWord(term string) bool {
-	switch term {
-	case "the", "and", "for", "with", "tool", "tools", "use", "get", "set", "run", "new":
-		return true
-	default:
-		return false
-	}
+	return t.index.Search(query, toolSearchDefaultLimit)
 }
 
 func expandDeferredFamilyCore(reg *ToolRegistry, deferred map[string]bool, matched []string) []string {
@@ -185,9 +135,12 @@ func expandDeferredFamilyCore(reg *ToolRegistry, deferred map[string]bool, match
 	}
 
 	selected := make(map[string]bool, len(matched))
+	expanded := make([]string, 0, len(matched))
+	extra := make(map[string]bool)
 	for _, name := range matched {
-		if name != "" && deferred[name] {
+		if name != "" && deferred[name] && !selected[name] {
 			selected[name] = true
+			expanded = append(expanded, name)
 		}
 		family := toolFamily(name)
 		spec, ok := FamilyRegistry[family]
@@ -195,15 +148,15 @@ func expandDeferredFamilyCore(reg *ToolRegistry, deferred map[string]bool, match
 			continue
 		}
 		for _, coreName := range spec.Core {
-			if deferred[coreName] {
-				selected[coreName] = true
+			if deferred[coreName] && !selected[coreName] {
+				extra[coreName] = true
 			}
 		}
 	}
 
-	expanded := make([]string, 0, len(selected))
 	for _, name := range reg.SortedNames() {
-		if selected[name] {
+		if extra[name] && !selected[name] {
+			selected[name] = true
 			expanded = append(expanded, name)
 		}
 	}
@@ -314,40 +267,14 @@ func buildLocalOnlySchemas(reg *ToolRegistry) []client.Tool {
 	return schemas
 }
 
-// buildLocalActiveSchemas returns local tool schemas with categorical-deferred
-// names filtered out, plus schemas for any neverDeferTools (web_search,
-// web_fetch) present in the registry. Used by the legacy deferred path
-// (modelSupportsToolRef false) where defer_loading flags are not honored on
-// the wire — instead we simply omit cold local tools so they're discoverable
-// only via tool_search.
-//
-// web_search/web_fetch are gateway tools, so the local-only source filter
-// below would otherwise miss them entirely. deferredToolNames() also excludes
-// them from the cold/tool_search set (see toolbudget.go neverDeferTools), so
-// without this graft they would be completely unreachable on the legacy
-// path — worse than before neverDeferTools existed, when they were at least
-// discoverable via tool_search. The result is built by walking the
-// registry's canonical SortedNames() order (local alpha -> MCP alpha ->
-// gateway alpha) so ordering stays deterministic and consistent with
-// rebuildSchemas/buildFullSchemasWithDefer.
-func buildLocalActiveSchemas(reg *ToolRegistry, cold map[string]bool) []client.Tool {
-	local, _, _ := reg.partitionBySource()
-	wanted := make(map[string]bool, len(local)+len(neverDeferTools))
-	for _, name := range local {
-		if cold[name] {
-			continue
-		}
-		wanted[name] = true
-	}
-	for name := range neverDeferTools {
-		if _, ok := reg.Get(name); ok {
-			wanted[name] = true
-		}
-	}
-
-	schemas := make([]client.Tool, 0, len(wanted))
+// buildActiveSchemas returns every schema not in the cold Deferred set. The
+// legacy path uses this instead of defer_loading flags, so an explicit Direct
+// override on an MCP, gateway, or integration tool must remain visible just
+// like a Direct local tool.
+func buildActiveSchemas(reg *ToolRegistry, cold map[string]bool) []client.Tool {
+	schemas := make([]client.Tool, 0, reg.Len())
 	for _, name := range reg.SortedNames() {
-		if !wanted[name] {
+		if cold[name] {
 			continue
 		}
 		if t, ok := reg.Get(name); ok {
@@ -357,49 +284,18 @@ func buildLocalActiveSchemas(reg *ToolRegistry, cold map[string]bool) []client.T
 	return schemas
 }
 
-// deferredToolNames returns the set of tool names that are eligible for
-// deferred loading: MCP + gateway tools plus local tools whose category
-// matches shouldDeferByCategory (rare-use, big-schema families like
-// browser_*, schedule_*, computer, etc. — see toolbudget.go for the list).
-// neverDeferTools (web_search, web_fetch) are excluded even though they are
-// gateway tools — see toolbudget.go for rationale.
-//
-// The actual decision to defer depends on the deferredMode trigger in
-// loop.go, which gates on either total budget overflow OR the presence of
-// any categorical-deferred cold tool.
+// deferredToolNames returns tools whose own effective exposure is Deferred.
+// Exposure is independent per tool: registering one Deferred tool cannot
+// change whether any other tool is Direct.
 func deferredToolNames(reg *ToolRegistry) map[string]bool {
-	local, mcp, gw := reg.partitionBySource()
-	names := make(map[string]bool, len(mcp)+len(gw))
-	for _, n := range local {
-		if shouldDeferByCategory(n) {
-			names[n] = true
+	names := make(map[string]bool)
+	for _, name := range reg.SortedNames() {
+		tool, ok := reg.Get(name)
+		if ok && EffectiveToolExposure(tool) == ToolExposureDeferred {
+			names[name] = true
 		}
-	}
-	for _, n := range mcp {
-		if neverDeferTools[n] {
-			continue
-		}
-		names[n] = true
-	}
-	for _, n := range gw {
-		if neverDeferTools[n] {
-			continue
-		}
-		names[n] = true
 	}
 	return names
-}
-
-// hasCategoricalDeferred reports whether any name in the cold deferred set
-// belongs to an always-defer category. Used by deferredMode to fire even
-// when total schema tokens stay under schemaTokenBudget.
-func hasCategoricalDeferred(cold map[string]bool) bool {
-	for name := range cold {
-		if shouldDeferByCategory(name) {
-			return true
-		}
-	}
-	return false
 }
 
 // preseedDeferredSchemas filters the session working set down to schemas that
@@ -462,9 +358,9 @@ func hasAnyNonDeferred(tools []client.Tool) bool {
 }
 
 // buildFullSchemasWithDefer emits the complete tools array (local + MCP + gateway)
-// with defer_loading: true on the cold set. Anthropic strips deferred entries from
-// the cache-key hash before caching, so tools[] stays byte-stable across sessions
-// while retaining full input_schema for tool_search's BM25/regex matching.
+// with defer_loading: true on the cold set. Anthropic strips deferred entries
+// from the cache-key hash before caching while retaining full input_schema for
+// server-side tool search.
 //
 // Caller is responsible for ensuring at least one tool (typically tool_search
 // itself) is non-deferred — verify with hasAnyNonDeferred.

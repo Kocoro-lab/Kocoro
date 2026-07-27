@@ -13,6 +13,8 @@ type WorkingSet struct {
 	mu          sync.RWMutex
 	fingerprint string
 	schemas     map[string]client.Tool
+	searchKey   string
+	searchIndex *toolSearchIndex
 }
 
 // NewWorkingSet creates an empty working set.
@@ -105,6 +107,8 @@ func (ws *WorkingSet) EnsureFingerprint(fingerprint string) bool {
 	}
 	ws.fingerprint = fingerprint
 	ws.schemas = make(map[string]client.Tool)
+	ws.searchKey = ""
+	ws.searchIndex = nil
 	return true
 }
 
@@ -123,4 +127,35 @@ func (ws *WorkingSet) Invalidate() {
 	defer ws.mu.Unlock()
 	ws.fingerprint = ""
 	ws.schemas = make(map[string]client.Tool)
+	ws.searchKey = ""
+	ws.searchIndex = nil
+}
+
+// toolSearchIndex reuses the tokenized BM25 index while the effective
+// Deferred set and its searchable metadata are byte-identical.
+func (ws *WorkingSet) toolSearchIndex(reg *ToolRegistry, deferred map[string]bool) *toolSearchIndex {
+	corpus := collectToolSearchCorpus(reg, deferred)
+	if ws == nil {
+		return buildToolSearchIndex(corpus)
+	}
+
+	ws.mu.RLock()
+	if ws.searchIndex != nil && ws.searchKey == corpus.fingerprint {
+		index := ws.searchIndex
+		ws.mu.RUnlock()
+		return index
+	}
+	ws.mu.RUnlock()
+
+	index := buildToolSearchIndex(corpus)
+	ws.mu.Lock()
+	if ws.searchIndex != nil && ws.searchKey == corpus.fingerprint {
+		cached := ws.searchIndex
+		ws.mu.Unlock()
+		return cached
+	}
+	ws.searchKey = corpus.fingerprint
+	ws.searchIndex = index
+	ws.mu.Unlock()
+	return index
 }

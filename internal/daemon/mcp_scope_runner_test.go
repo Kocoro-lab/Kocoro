@@ -26,10 +26,10 @@ func offeredToolName(tl client.Tool) string {
 // integration test for ApplyMCPServerScope. It exercises the real runner.go
 // seam (Snapshot baseReg → CloneWithRuntimeConfig → ApplyMCPServerScope →
 // NewAgentLoop → tools offered to the gateway) that the pure-function unit test
-// can't reach. A named agent scoping MCP to serverA must have serverB's tools
-// dropped from what's offered to the LLM. BypassRouting sidesteps the
-// pre-existing routed-session TempDir cleanup flaky (a teardown race, not a
-// body failure).
+// can't reach. A named agent scoping MCP to serverA must retain serverA's
+// Deferred schema while dropping serverB's tools entirely. BypassRouting
+// sidesteps the pre-existing routed-session TempDir cleanup flaky (a teardown
+// race, not a body failure).
 func TestRunAgent_NamedAgentMCPScope_ExcludesUnselectedServer(t *testing.T) {
 	gw := &fakeGatewayBackend{reply: "done"}
 	ts := httptest.NewServer(gw.handler())
@@ -44,6 +44,10 @@ func TestRunAgent_NamedAgentMCPScope_ExcludesUnselectedServer(t *testing.T) {
 	deps.Registry.Register(tools.NewMCPTool("serverA", mcpproto.Tool{Name: "a_tool"}, nil))
 	deps.Registry.Register(tools.NewMCPTool("serverB", mcpproto.Tool{Name: "b_tool"}, nil))
 	deps.Config.MCPServers = map[string]mcp.MCPServerConfig{"serverA": {}, "serverB": {}}
+	// Use the native tool-reference path so selected MCP schemas remain on the
+	// wire with defer_loading=true and the test can distinguish Deferred from
+	// excluded.
+	deps.Config.Agent.Model = "claude-sonnet-4-5-20250929"
 
 	// A named agent scoping MCP to serverA only (inherit:false + serverA).
 	agentDir := filepath.Join(deps.AgentsDir, "mcptest")
@@ -72,16 +76,18 @@ func TestRunAgent_NamedAgentMCPScope_ExcludesUnselectedServer(t *testing.T) {
 	if len(reqs) == 0 {
 		t.Fatal("no gateway requests captured")
 	}
-	offered := map[string]bool{}
+	offered := map[string]client.Tool{}
 	for _, r := range reqs {
 		for _, tl := range r.Tools {
-			offered[offeredToolName(tl)] = true
+			offered[offeredToolName(tl)] = tl
 		}
 	}
-	if !offered["a_tool"] {
+	if _, ok := offered["a_tool"]; !ok {
 		t.Errorf("serverA tool a_tool not offered; offered=%v", offered)
+	} else if !offered["a_tool"].DeferLoading {
+		t.Error("serverA MCP tool a_tool must be offered as Deferred")
 	}
-	if offered["b_tool"] {
+	if _, ok := offered["b_tool"]; ok {
 		t.Errorf("serverB tool b_tool offered — scope not enforced")
 	}
 }

@@ -36,14 +36,16 @@ func TestSystemPromptAudit(t *testing.T) {
 	dumpConst(t, "  cloudDelegationGuidance (conditional)", cloudDelegationGuidance)
 	dumpConst(t, "  contrastExamplesCloud (conditional)", contrastExamplesCloud)
 
-	// Mimic a typical post-categorical-defer one-shot CLI tool registry.
-	// 17 tools after browser/computer/schedule/etc. are filtered out by
-	// buildLocalActiveSchemas (see cache-action-plan §1.2).
+	// Default gateway + native-thinking Direct set. The exhaustive production
+	// registration matrix is pinned by tools.TestRegisteredLocalToolExposureMatrix;
+	// `think` is intentionally absent because default native thinking skips it.
 	tools := []string{
-		"bash", "clipboard", "cloud_delegate", "directory_list",
-		"file_edit", "file_read", "file_write", "glob", "grep", "http",
-		"memory_append", "notify", "session_search", "system_info", "think",
-		"tool_search", "use_skill",
+		"archive_extract", "archive_inspect", "ask_user_question", "bash",
+		"clipboard", "directory_list", "docx_to_text", "file_edit",
+		"file_read", "file_write", "glob", "grep", "http", "memory_append",
+		"notify", "pdf_to_text", "pptx_to_text", "present_deliverable",
+		"schedule_list", "schedule_show", "system_info", "tool_search",
+		"use_skill", "xlsx_to_text",
 	}
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
 		BasePrompt:     basePrompt,
