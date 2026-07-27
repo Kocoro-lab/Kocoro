@@ -83,3 +83,13 @@ func computerUseAppsRequiredResult() ToolResult {
 		ErrorCategory: ErrCategoryBusiness,
 	}
 }
+
+func computerUseRetryBlockedResult() ToolResult {
+	return ToolResult{
+		Content: "computer_use_error: repeated_goal_task_blocked\n" +
+			"message: the previous computer_use task ended before a desktop action committed, but a second goal-level computer_use task is not allowed in the same turn\n" +
+			"recovery: use another appropriate non-computer_use tool if the user did not require Computer Use specifically; otherwise report the original failure",
+		IsError:       true,
+		ErrorCategory: ErrCategoryBusiness,
+	}
+}

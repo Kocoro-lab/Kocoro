@@ -529,26 +529,79 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 			false,
 		)
 		if refreshPlanErr != nil {
-			targetRefreshErr = fmt.Errorf(
-				"OpenAI computer target refresh could not be safely projected",
+			failureCode, detail := openAIComputerTypedPlanFailureV1(
+				refreshPlanErr,
+				"target_refresh_projection_failed",
+				"the post-keypress observation planner rejected the target refresh",
 			)
+			execution.Result, targetRefreshErr =
+				openAIComputerCommittedTargetRefreshFailureV1(
+					failureCode,
+					"the keyboard action committed, but its next target could not be refreshed",
+					detail,
+				)
 		} else {
 			refreshResult, refreshRunErr := e.runPlanV1(
 				nativeActionCtx,
 				refreshPlan,
 				actionToolUseID+"_target_refresh",
 			)
-			if refreshRunErr != nil || refreshResult.IsError ||
-				len(refreshResult.Images) != 0 {
-				targetRefreshErr = fmt.Errorf(
-					"OpenAI computer target refresh failed after the committed keypress",
+			switch {
+			case refreshRunErr != nil:
+				failureCode := openAIComputerTraceFailureCodeV1(
+					refreshResult,
+					refreshRunErr,
 				)
-			} else if e.nextOpenAIComputerActionIsTypeV1(scope) {
+				if failureCode == "" || failureCode == "executor_error" {
+					failureCode = "target_refresh_executor_failed"
+				}
+				detail := "the post-keypress target refresh executor failed"
+				if errors.Is(refreshRunErr, context.Canceled) ||
+					errors.Is(refreshRunErr, context.DeadlineExceeded) {
+					failureCode = "target_refresh_cancelled"
+					detail = "the post-keypress target refresh was cancelled"
+				}
+				execution.Result, targetRefreshErr =
+					openAIComputerCommittedTargetRefreshFailureV1(
+						failureCode,
+						"the keyboard action committed, but its next target refresh failed",
+						detail,
+					)
+			case refreshResult.IsError:
+				failureCode := openAIComputerTraceFailureCodeV1(
+					refreshResult,
+					nil,
+				)
+				if failureCode == "" || failureCode == "tool_error" {
+					failureCode = "target_refresh_failed"
+				}
+				execution.Result, targetRefreshErr =
+					openAIComputerCommittedTargetRefreshFailureV1(
+						failureCode,
+						"the keyboard action committed, but its next target refresh was rejected",
+						openAIComputerObservationResultDetailV1(refreshResult),
+					)
+			case len(refreshResult.Images) != 0:
+				execution.Result, targetRefreshErr =
+					openAIComputerCommittedTargetRefreshFailureV1(
+						"target_refresh_contract_invalid",
+						"the keyboard action committed, but its next target refresh violated the internal observation contract",
+						"an image-free target refresh unexpectedly returned an image",
+					)
+			case e.nextOpenAIComputerActionIsTypeV1(scope):
 				if authorizeErr := e.runtime.
 					AuthorizeOpenAIComputerTypeAfterKeypressV1(action); authorizeErr != nil {
-					targetRefreshErr = fmt.Errorf(
-						"OpenAI computer keyboard target could not be bound after the committed keypress",
+					failureCode, detail := openAIComputerTypedPlanFailureV1(
+						authorizeErr,
+						"keyboard_target_bind_failed",
+						"the refreshed post-keypress target could not authorize text input",
 					)
+					execution.Result, targetRefreshErr =
+						openAIComputerCommittedTargetRefreshFailureV1(
+							failureCode,
+							"the keyboard action committed, but text input could not be bound to its refreshed target",
+							detail,
+						)
 				}
 			}
 		}
@@ -567,6 +620,55 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 		return execution, nil
 	}
 	return execution, nil
+}
+
+func openAIComputerTypedPlanFailureV1(
+	err error,
+	fallbackCode string,
+	fallbackDetail string,
+) (string, string) {
+	failureCode := strings.TrimSpace(fallbackCode)
+	detail := strings.TrimSpace(fallbackDetail)
+	var planErr *tools.OpenAIComputerActionPlanErrorV1
+	if errors.As(err, &planErr) {
+		if typedCode := strings.TrimSpace(planErr.FailureCode); typedCode != "" {
+			failureCode = typedCode
+		}
+		if typedDetail := strings.TrimSpace(planErr.Detail); typedDetail != "" {
+			detail = typedDetail
+		}
+	}
+	return failureCode, boundOpenAIComputerObservationDetailV1(detail)
+}
+
+func openAIComputerCommittedTargetRefreshFailureV1(
+	failureCode string,
+	message string,
+	detail string,
+) (agent.ToolResult, error) {
+	failureCode = strings.TrimSpace(failureCode)
+	if failureCode == "" {
+		failureCode = "target_refresh_failed"
+	}
+	message = strings.Join(strings.Fields(message), " ")
+	detail = strings.Join(strings.Fields(
+		boundOpenAIComputerObservationDetailV1(detail),
+	), " ")
+	content := "computer_use_error: " + failureCode + "\n" +
+		"message: " + message
+	if detail != "" {
+		content += "\ndetail: " + detail
+	}
+	result := agent.BusinessError(content)
+	result.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultCompletedUnverified,
+		Phase:       agent.GUIActionPhaseVerifying,
+		FailureCode: failureCode,
+	}
+	return result, fmt.Errorf(
+		"OpenAI computer post-keypress target refresh failed (%s)",
+		failureCode,
+	)
 }
 
 // openAIComputerActionToolUseIDV1 keeps provider call identity opaque while

@@ -28,6 +28,9 @@ type openAIComputerTraceEventV1 struct {
 	AppBundleID   string `json:"app_bundle_id,omitempty"`
 	CommitState   string `json:"commit_state,omitempty"`
 	FailureCode   string `json:"failure_code,omitempty"`
+	ModelCalls    int    `json:"model_calls,omitempty"`
+	ModelTimeouts int    `json:"model_timeouts,omitempty"`
+	BatchCount    int    `json:"batch_count,omitempty"`
 	DurationMS    int64  `json:"duration_ms"`
 
 	// Capture diagnostics are written as a separate structured audit event.

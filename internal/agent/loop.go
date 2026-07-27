@@ -2733,6 +2733,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		openAIComputerErrorBatches   int // total failed-but-continuable batches this Run; see maxOpenAIComputerErrorBatches
 		computerUseOwnsTurn          bool
 		computerUseNeedsApps         bool
+		computerUseAlternateOnly     bool
 		computerUseAppsRecoveryUsed  bool
 		afterCheckpoint              bool
 		checkpointDone               bool
@@ -4697,14 +4698,18 @@ iterationLoop:
 				isAlternateDesktopControlCall(fc.Name, argsStr) &&
 				(fc.Name != "computer_use" ||
 					!computerUseCallHasApps(argsStr))
+			blockedRepeatedComputerUse := computerUseAlternateOnly &&
+				fc.Name == "computer_use"
 			blockedBesideComputerUse := computerUseOwnsGUIResponse &&
 				fc.Name != "computer_use" &&
 				isAlternateDesktopControlCall(fc.Name, argsStr)
 			if blockedByPriorComputerUse || blockedByMissingComputerUseApps ||
-				blockedBesideComputerUse {
+				blockedRepeatedComputerUse || blockedBesideComputerUse {
 				blocked := alternateDesktopControlBlockedResult()
 				if blockedByMissingComputerUseApps {
 					blocked = computerUseAppsRequiredResult()
+				} else if blockedRepeatedComputerUse {
+					blocked = computerUseRetryBlockedResult()
 				}
 				a.logAudit(fc.Name, argsStr, blocked.Content, "deny", false, 0, nil)
 				callMeta[idx].resolved = true
@@ -4720,6 +4725,7 @@ iterationLoop:
 				// inside its private executor, not in a second outer task.
 				computerUseOwnsTurn = true
 				computerUseNeedsApps = false
+				computerUseAlternateOnly = false
 			}
 
 			// Denied-call blocking: auto-reject if this exact call was denied earlier
@@ -5099,6 +5105,7 @@ iterationLoop:
 			}
 			if fc.Name == "computer_use" &&
 				result.ComputerUseOutcome != nil &&
+				result.ComputerUseOutcome.Validate() == nil &&
 				result.ComputerUseOutcome.Recovery ==
 					ComputerUseRecoveryRetryWithApps &&
 				result.ComputerUseOutcome.Status ==
@@ -5112,7 +5119,21 @@ iterationLoop:
 				// blocked while the outer model repairs the invocation.
 				computerUseOwnsTurn = false
 				computerUseNeedsApps = true
+				computerUseAlternateOnly = false
 				computerUseAppsRecoveryUsed = true
+			} else if fc.Name == "computer_use" &&
+				result.ComputerUseOutcome != nil &&
+				result.ComputerUseOutcome.Validate() == nil &&
+				result.ComputerUseOutcome.Recovery ==
+					ComputerUseRecoveryAlternateControl &&
+				result.ComputerUseOutcome.Effect ==
+					ComputerUseCommitNone {
+				// The specialist proved that no desktop action committed. Release
+				// other control paths, but keep the one-goal-call invariant: a
+				// second computer_use task would restart the private model loop.
+				computerUseOwnsTurn = false
+				computerUseNeedsApps = false
+				computerUseAlternateOnly = true
 			}
 
 			// Track successful file reads for read-before-edit enforcement

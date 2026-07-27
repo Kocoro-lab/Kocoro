@@ -105,6 +105,21 @@ func TestOpenAIComputerTaskUnknownCommitIsStructuredUnverified(t *testing.T) {
 	}
 }
 
+func TestOpenAIComputerTaskNoEffectAloneDoesNotReleaseAlternateControl(
+	t *testing.T,
+) {
+	result := openAIComputerTaskUnverifiedResultV1(
+		tools.ConsequentialRiskCodeUnsupportedPathV1,
+		"the requested submit path was rejected before input",
+		agent.ComputerUseCommitNone,
+	)
+	if result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitNone ||
+		result.ComputerUseOutcome.Recovery != agent.ComputerUseRecoveryNone {
+		t.Fatalf("no-effect safety rejection released alternate control: %+v", result)
+	}
+}
+
 type openAIComputerDaemonProbeTool struct {
 	mu                  sync.Mutex
 	runs                []string
@@ -232,7 +247,9 @@ type openAIComputerDaemonRuntimeProbe struct {
 	tool                   *openAIComputerDaemonProbeTool
 	actionPlans            []tools.OpenAIComputerActionV1
 	observationPlans       int
+	targetRefreshPlanErr   error
 	keyboardTargets        int
+	keyboardTargetErr      error
 	initialObservationApps []string
 	resolvedApps           []string
 	launchedApps           []tools.OpenAIComputerTaskAppV1
@@ -278,6 +295,9 @@ func (r *openAIComputerDaemonRuntimeProbe) PlanOpenAIComputerObservationV1(
 	includeScreenshot bool,
 ) (tools.OpenAIComputerActionPlanV1, error) {
 	r.observationPlans++
+	if !includeScreenshot && r.targetRefreshPlanErr != nil {
+		return tools.OpenAIComputerActionPlanV1{}, r.targetRefreshPlanErr
+	}
 	kind := "reobserve"
 	if includeScreenshot {
 		kind = "final_screenshot"
@@ -297,7 +317,7 @@ func (r *openAIComputerDaemonRuntimeProbe) AuthorizeOpenAIComputerTypeAfterKeypr
 	tools.OpenAIComputerActionV1,
 ) error {
 	r.keyboardTargets++
-	return nil
+	return r.keyboardTargetErr
 }
 
 func (r *openAIComputerDaemonRuntimeProbe) PlanOpenAIComputerTaskInitialObservationV1(
@@ -791,6 +811,133 @@ func TestDaemonOpenAIComputerExecutorRefreshesAndAuthorizesTypeAfterKeypress(
 	}
 }
 
+func TestDaemonOpenAIComputerExecutorPreservesTargetRefreshProjectionFailure(
+	t *testing.T,
+) {
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	runtime := executor.runtime.(*openAIComputerDaemonRuntimeProbe)
+	runtime.targetRefreshPlanErr = &tools.OpenAIComputerActionPlanErrorV1{
+		FailureCode: "coordinate_focus_window_frame_drift",
+		Detail:      "the refreshed window frame no longer matches",
+	}
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"keypress","keys":["META","L"]},`+
+				`{"type":"type","text":"must-not-appear"}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if !result.ToolResult.IsError ||
+		result.ActionEffect != agent.ComputerUseCommitKnown ||
+		result.ToolResult.GUIOutcome == nil ||
+		result.ToolResult.GUIOutcome.Result !=
+			agent.GUIActionResultCompletedUnverified ||
+		result.ToolResult.GUIOutcome.FailureCode !=
+			"coordinate_focus_window_frame_drift" ||
+		!strings.Contains(
+			result.ToolResult.Content,
+			"the refreshed window frame no longer matches",
+		) ||
+		strings.Contains(result.ToolResult.Content, "must-not-appear") {
+		t.Fatalf("target refresh projection failure = %+v", result)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"keypress,final_screenshot" {
+		t.Fatalf("target refresh projection execution = %q", got)
+	}
+}
+
+func TestDaemonOpenAIComputerExecutorPreservesTargetRefreshToolFailure(
+	t *testing.T,
+) {
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	refreshFailure := agent.BusinessError(
+		"state_id: must-not-escape\nref=e17\nscreenshot_warning: " +
+			"computer_use_error: coordinate_focus_window_frame_drift\n" +
+			"message: the target window frame changed",
+	)
+	refreshFailure.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseObserving,
+		FailureCode: "coordinate_focus_window_frame_drift",
+	}
+	probe.results["reobserve"] = refreshFailure
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"keypress","keys":["META","L"]},`+
+				`{"type":"type","text":"must-not-appear"}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if !result.ToolResult.IsError ||
+		result.ActionEffect != agent.ComputerUseCommitKnown ||
+		result.ToolResult.GUIOutcome == nil ||
+		result.ToolResult.GUIOutcome.FailureCode !=
+			"coordinate_focus_window_frame_drift" ||
+		!strings.Contains(
+			result.ToolResult.Content,
+			"coordinate_focus_window_frame_drift: the target window frame changed",
+		) ||
+		strings.Contains(result.ToolResult.Content, "state_id") ||
+		strings.Contains(result.ToolResult.Content, "ref=e17") ||
+		strings.Contains(result.ToolResult.Content, "must-not-appear") {
+		t.Fatalf("target refresh tool failure = %+v", result)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"keypress,reobserve,final_screenshot" {
+		t.Fatalf("target refresh tool execution = %q", got)
+	}
+}
+
+func TestDaemonOpenAIComputerExecutorPreservesKeyboardTargetBindFailure(
+	t *testing.T,
+) {
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	runtime := executor.runtime.(*openAIComputerDaemonRuntimeProbe)
+	runtime.keyboardTargetErr = &tools.OpenAIComputerActionPlanErrorV1{
+		FailureCode: "keyboard_post_keypress_target_identity_invalid",
+		Detail:      "the refreshed target lacks a stable window identity",
+	}
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"keypress","keys":["META","L"]},`+
+				`{"type":"type","text":"must-not-appear"}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if !result.ToolResult.IsError ||
+		result.ActionEffect != agent.ComputerUseCommitKnown ||
+		result.ToolResult.GUIOutcome == nil ||
+		result.ToolResult.GUIOutcome.FailureCode !=
+			"keyboard_post_keypress_target_identity_invalid" ||
+		!strings.Contains(
+			result.ToolResult.Content,
+			"the refreshed target lacks a stable window identity",
+		) ||
+		strings.Contains(result.ToolResult.Content, "must-not-appear") {
+		t.Fatalf("keyboard target bind failure = %+v", result)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"keypress,reobserve,final_screenshot" {
+		t.Fatalf("keyboard target bind execution = %q", got)
+	}
+}
+
 func TestDaemonOpenAIComputerExecutorAwaitsOneConsequentialClickDecision(t *testing.T) {
 	executor, adapter, probe, coordinator := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
@@ -1281,6 +1428,12 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 			) && strings.Contains(
 				message.Content.Text(),
 				"Do not add routine fixed waits",
+			) && strings.Contains(
+				message.Content.Text(),
+				"make that first batch perform the first useful goal action",
+			) && strings.Contains(
+				message.Content.Text(),
+				"Batch adjacent deterministic actions",
 			) {
 				hasFreshObservationInstructions = true
 			}
@@ -1398,8 +1551,11 @@ func TestOpenAIComputerTaskToolResolverFailureDoesNotTouchDesktop(t *testing.T) 
 			t.Fatalf("task Run %d: %v", attempt, err)
 		}
 		if !result.IsError ||
-			!strings.Contains(result.Content, "do not retry computer_use in this turn") ||
-			!strings.Contains(result.Content, "no desktop action was attempted") {
+			!strings.Contains(result.Content, "another appropriate control path") ||
+			!strings.Contains(result.Content, "no desktop action was attempted") ||
+			result.ComputerUseOutcome == nil ||
+			result.ComputerUseOutcome.Recovery !=
+				agent.ComputerUseRecoveryAlternateControl {
 			t.Fatalf("task result %d = %+v", attempt, result)
 		}
 	}
@@ -1460,8 +1616,11 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "initial_observation_unavailable") ||
-		!strings.Contains(result.Content, "do not retry computer_use again in this turn") ||
-		!strings.Contains(result.Content, "window_changed") {
+		!strings.Contains(result.Content, "another appropriate control path") ||
+		!strings.Contains(result.Content, "window_changed") ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Recovery !=
+			agent.ComputerUseRecoveryAlternateControl {
 		t.Fatalf("task result = %+v", result)
 	}
 	if strings.Contains(result.Content, "state_id") ||
@@ -2113,6 +2272,10 @@ func TestOpenAIComputerInitialResponseClientRetriesOneBoundedStall(
 	if calls := delegate.callCount(); calls != 2 {
 		t.Fatalf("initial provider calls=%d, want exactly one retry", calls)
 	}
+	if stats := bounded.StatsV1(); stats.ModelCalls != 2 ||
+		stats.ModelTimeouts != 1 {
+		t.Fatalf("initial provider stats = %+v", stats)
+	}
 
 	response, err = bounded.Complete(
 		context.Background(),
@@ -2123,6 +2286,10 @@ func TestOpenAIComputerInitialResponseClientRetriesOneBoundedStall(
 	}
 	if calls := delegate.callCount(); calls != 3 {
 		t.Fatalf("continuation provider calls=%d, want direct delegation", calls)
+	}
+	if stats := bounded.StatsV1(); stats.ModelCalls != 3 ||
+		stats.ModelTimeouts != 1 {
+		t.Fatalf("continuation provider stats = %+v", stats)
 	}
 }
 
@@ -2256,8 +2423,11 @@ func TestOpenAIComputerTaskToolRejectsCompletionClaimWithoutAnyDesktopAction(
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "no_desktop_action") ||
-		!strings.Contains(result.Content, "do not retry computer_use again in this turn") ||
-		!strings.Contains(result.Content, "I finished 250*0.01 in Calculator.") {
+		!strings.Contains(result.Content, "another appropriate control path") ||
+		!strings.Contains(result.Content, "I finished 250*0.01 in Calculator.") ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Recovery !=
+			agent.ComputerUseRecoveryAlternateControl {
 		t.Fatalf("task result = %+v", result)
 	}
 	if got := strings.Join(probe.runNames(), ","); got != "final_screenshot" {
@@ -2434,7 +2604,7 @@ func TestOpenAIComputerTaskToolReportsFailedOutcomeAfterSuccessfulBatch(
 			result.Content,
 			"Calculator still shows 7.56; the requested result is not visible.",
 		) ||
-		!strings.Contains(result.Content, "do not retry computer_use again in this turn") {
+		!strings.Contains(result.Content, "do not repeat committed desktop actions") {
 		t.Fatalf("task result = %+v", result)
 	}
 	if result.ComputerUseOutcome == nil ||

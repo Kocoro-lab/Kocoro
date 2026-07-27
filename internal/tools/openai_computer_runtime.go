@@ -199,10 +199,16 @@ func (r *OpenAIComputerActionRuntimeV1) AuthorizeOpenAIComputerTypeAfterKeypress
 	action OpenAIComputerActionV1,
 ) error {
 	if r == nil || r.raw == nil || r.raw.snapshot == nil {
-		return fmt.Errorf("OpenAI computer post-keypress target is unavailable")
+		return &OpenAIComputerActionPlanErrorV1{
+			FailureCode: "keyboard_post_keypress_target_unavailable",
+			Detail:      "the post-keypress observation did not produce a keyboard target",
+		}
 	}
 	if action.Type != OpenAIComputerActionKeypressV1 {
-		return fmt.Errorf("OpenAI computer post-keypress action identity is invalid")
+		return &OpenAIComputerActionPlanErrorV1{
+			FailureCode: "keyboard_post_keypress_action_invalid",
+			Detail:      "the keyboard target request was not bound to the committed keypress",
+		}
 	}
 	snapshot := r.raw.snapshot
 	if !snapshot.typed || snapshot.id == "" || snapshot.pid <= 0 ||
@@ -213,7 +219,10 @@ func (r *OpenAIComputerActionRuntimeV1) AuthorizeOpenAIComputerTypeAfterKeypress
 		snapshot.expectedWindowAXBounds == nil ||
 		snapshot.expectedWindowAXBounds.Width <= 0 ||
 		snapshot.expectedWindowAXBounds.Height <= 0 {
-		return fmt.Errorf("OpenAI computer post-keypress target identity is invalid")
+		return &OpenAIComputerActionPlanErrorV1{
+			FailureCode: "keyboard_post_keypress_target_identity_invalid",
+			Detail:      "the post-keypress app, window, or frame identity is incomplete",
+		}
 	}
 	r.raw.coordinateFocus = &computerUseCoordinateFocusV1{
 		stateID:                snapshot.id,

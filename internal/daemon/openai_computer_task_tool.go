@@ -52,9 +52,16 @@ type openAIComputerInitialResponseClientV1 struct {
 	window   time.Duration
 	attempts int
 
-	mu          sync.Mutex
-	completed   bool
-	unavailable *openAIComputerInitialResponseUnavailableV1
+	mu            sync.Mutex
+	completed     bool
+	unavailable   *openAIComputerInitialResponseUnavailableV1
+	modelCalls    int
+	modelTimeouts int
+}
+
+type openAIComputerProviderStatsV1 struct {
+	ModelCalls    int
+	ModelTimeouts int
 }
 
 func newOpenAIComputerInitialResponseClientV1(
@@ -81,6 +88,7 @@ func (c *openAIComputerInitialResponseClientV1) complete(
 ) (*client.CompletionResponse, error) {
 	c.mu.Lock()
 	if c.completed {
+		c.modelCalls++
 		c.mu.Unlock()
 		return invoke(ctx)
 	}
@@ -92,6 +100,7 @@ func (c *openAIComputerInitialResponseClientV1) complete(
 	defer c.mu.Unlock()
 
 	for attempt := 1; attempt <= c.attempts; attempt++ {
+		c.modelCalls++
 		attemptCtx, cancel := context.WithTimeout(ctx, c.window)
 		response, err := invoke(attemptCtx)
 		attemptExpired := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
@@ -106,12 +115,25 @@ func (c *openAIComputerInitialResponseClientV1) complete(
 		if !attemptExpired {
 			return nil, err
 		}
+		c.modelTimeouts++
 	}
 	c.unavailable = &openAIComputerInitialResponseUnavailableV1{
 		Attempts: c.attempts,
 		Window:   c.window,
 	}
 	return nil, c.unavailable
+}
+
+func (c *openAIComputerInitialResponseClientV1) StatsV1() openAIComputerProviderStatsV1 {
+	if c == nil {
+		return openAIComputerProviderStatsV1{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return openAIComputerProviderStatsV1{
+		ModelCalls:    c.modelCalls,
+		ModelTimeouts: c.modelTimeouts,
+	}
 }
 
 func (c *openAIComputerInitialResponseClientV1) Complete(
@@ -245,8 +267,9 @@ func openAIComputerTaskUnverifiedResultV1(
 			FailureCode: failureCode,
 		},
 		ComputerUseOutcome: &agent.ComputerUseTaskOutcome{
-			Status: agent.ComputerUseTaskUnverified,
-			Effect: effect,
+			Status:      agent.ComputerUseTaskUnverified,
+			Effect:      effect,
+			FailureCode: failureCode,
 		},
 	}
 	return result
@@ -264,6 +287,19 @@ func withOpenAIComputerTaskOutcomeV1(
 		Status: status,
 		Effect: effect,
 	}
+	return result
+}
+
+func withOpenAIComputerTaskFailureOutcomeV1(
+	result agent.ToolResult,
+	status agent.ComputerUseTaskStatus,
+	effect agent.ComputerUseCommitEffect,
+	failureCode string,
+	recovery agent.ComputerUseTaskRecovery,
+) agent.ToolResult {
+	result = withOpenAIComputerTaskOutcomeV1(result, status, effect)
+	result.ComputerUseOutcome.FailureCode = strings.TrimSpace(failureCode)
+	result.ComputerUseOutcome.Recovery = recovery
 	return result
 }
 
@@ -437,7 +473,19 @@ func retryOpenAIComputerObservationV1(
 		!result.GUIObservation.CoordinateActionable {
 		return true
 	}
-	switch openAIComputerTraceFailureCodeV1(result, nil) {
+	if retryableOpenAIComputerObservationFailureCodeV1(
+		openAIComputerTraceFailureCodeV1(result, nil),
+	) {
+		return true
+	}
+	// get_app_state deliberately preserves a useful AX observation when its
+	// optional image capture fails, so this shape has IsError=false. Retrying
+	// the observation is safe and is the cold-launch readiness path.
+	return !result.IsError && len(result.Images) != 1
+}
+
+func retryableOpenAIComputerObservationFailureCodeV1(code string) bool {
+	switch strings.TrimSpace(code) {
 	case "window_not_found",
 		"window_not_actionable",
 		"display_not_actionable",
@@ -452,11 +500,9 @@ func retryOpenAIComputerObservationV1(
 		"process_identity_mismatch",
 		"window_identity_mismatch":
 		return true
+	default:
+		return false
 	}
-	// get_app_state deliberately preserves a useful AX observation when its
-	// optional image capture fails, so this shape has IsError=false. Retrying
-	// the observation is safe and is the cold-launch readiness path.
-	return !result.IsError && len(result.Images) != 1
 }
 
 type openAIComputerObservationAttemptV1 func(
@@ -565,8 +611,17 @@ func (t *openAIComputerTaskToolV1) Run(
 	}
 	if t == nil || t.gateway == nil ||
 		t.childTools == nil || t.workflow == nil || t.runtime == nil {
-		return agent.BusinessError(
-			"OpenAI native Computer Use is temporarily unavailable; no desktop action was attempted",
+		return withOpenAIComputerTaskFailureOutcomeV1(
+			agent.BusinessError(
+				"computer_use_error: native_executor_unavailable\n"+
+					"message: OpenAI native Computer Use is temporarily unavailable\n"+
+					"recovery: no desktop action was attempted; another appropriate control path may be used in this turn\n"+
+					"detail: the local native executor is unavailable",
+			),
+			agent.ComputerUseTaskNotCompleted,
+			agent.ComputerUseCommitNone,
+			"native_executor_unavailable",
+			agent.ComputerUseRecoveryAlternateControl,
 		), nil
 	}
 	taskStarted := time.Now()
@@ -588,11 +643,17 @@ func (t *openAIComputerTaskToolV1) Run(
 				FailureCode: "backend_contract_unavailable",
 				DurationMS:  time.Since(taskStarted).Milliseconds(),
 			})
-			return agent.BusinessError(
-				"computer_use_error: backend_contract_unavailable\n" +
-					"message: OpenAI native Computer Use is unavailable because its execution profile could not be resolved\n" +
-					"recovery: do not retry computer_use in this turn; no desktop action was attempted\n" +
-					"detail: " + t.profileErr.Error(),
+			return withOpenAIComputerTaskFailureOutcomeV1(
+				agent.BusinessError(
+					"computer_use_error: backend_contract_unavailable\n"+
+						"message: OpenAI native Computer Use is unavailable because its execution profile could not be resolved\n"+
+						"recovery: no desktop action was attempted; another appropriate control path may be used in this turn\n"+
+						"detail: "+t.profileErr.Error(),
+				),
+				agent.ComputerUseTaskNotCompleted,
+				agent.ComputerUseCommitNone,
+				"backend_contract_unavailable",
+				agent.ComputerUseRecoveryAlternateControl,
 			), nil
 		}
 	}
@@ -612,8 +673,17 @@ func (t *openAIComputerTaskToolV1) Run(
 			FailureCode: "backend_contract_unsupported",
 			DurationMS:  time.Since(taskStarted).Milliseconds(),
 		})
-		return agent.BusinessError(
-			"OpenAI native Computer Use is temporarily unavailable; no desktop action was attempted",
+		return withOpenAIComputerTaskFailureOutcomeV1(
+			agent.BusinessError(
+				"computer_use_error: backend_contract_unsupported\n"+
+					"message: OpenAI native Computer Use is temporarily unavailable\n"+
+					"recovery: no desktop action was attempted; another appropriate control path may be used in this turn\n"+
+					"detail: the resolved execution profile does not support the native computer contract",
+			),
+			agent.ComputerUseTaskNotCompleted,
+			agent.ComputerUseCommitNone,
+			"backend_contract_unsupported",
+			agent.ComputerUseRecoveryAlternateControl,
 		), nil
 	}
 
@@ -638,7 +708,13 @@ func (t *openAIComputerTaskToolV1) Run(
 				FailureCode: "app_resolution_failed",
 				DurationMS:  time.Since(resolutionStarted).Milliseconds(),
 			})
-			return agent.BusinessError(err.Error()), nil
+			return withOpenAIComputerTaskFailureOutcomeV1(
+				agent.BusinessError(err.Error()),
+				agent.ComputerUseTaskNotCompleted,
+				agent.ComputerUseCommitNone,
+				"app_resolution_failed",
+				agent.ComputerUseRecoveryAlternateControl,
+			), nil
 		}
 		trace.record(openAIComputerTraceEventV1{
 			Phase:       "app_resolution",
@@ -656,8 +732,14 @@ func (t *openAIComputerTaskToolV1) Run(
 				FailureCode: "saved_app_blocked",
 				DurationMS:  time.Since(taskStarted).Milliseconds(),
 			})
-			return agent.PermissionError(
-				fmt.Sprintf("%s is blocked in Saved App Blocks", identity.App),
+			return withOpenAIComputerTaskFailureOutcomeV1(
+				agent.PermissionError(
+					fmt.Sprintf("%s is blocked in Saved App Blocks", identity.App),
+				),
+				agent.ComputerUseTaskNotCompleted,
+				agent.ComputerUseCommitNone,
+				"saved_app_blocked",
+				agent.ComputerUseRecoveryNone,
 			), nil
 		}
 		apps = append(apps, identity)
@@ -682,7 +764,13 @@ func (t *openAIComputerTaskToolV1) Run(
 				FailureCode: "controller_unavailable",
 				DurationMS:  time.Since(preparationStarted).Milliseconds(),
 			})
-			return guiCoordinatorToolError(err), nil
+			return withOpenAIComputerTaskFailureOutcomeV1(
+				guiCoordinatorToolError(err),
+				agent.ComputerUseTaskNotCompleted,
+				agent.ComputerUseCommitNone,
+				"controller_unavailable",
+				agent.ComputerUseRecoveryNone,
+			), nil
 		}
 	}
 	if err := t.runtime.LaunchAndFocusTaskAppsV1(ctx, apps); err != nil {
@@ -696,7 +784,13 @@ func (t *openAIComputerTaskToolV1) Run(
 			event.AppBundleID = apps[0].BundleID
 		}
 		trace.record(event)
-		return agent.BusinessError(err.Error()), nil
+		return withOpenAIComputerTaskFailureOutcomeV1(
+			agent.BusinessError(err.Error()),
+			agent.ComputerUseTaskNotCompleted,
+			agent.ComputerUseCommitNone,
+			"app_launch_focus_failed",
+			agent.ComputerUseRecoveryAlternateControl,
+		), nil
 	}
 	preparationEvent := openAIComputerTraceEventV1{
 		Phase:      "app_launch_focus",
@@ -806,6 +900,9 @@ func (t *openAIComputerTaskToolV1) Run(
 			initial,
 			observationErr,
 		)
+		if failureCode == "" {
+			failureCode = "initial_image_unavailable"
+		}
 		if len(apps) == 0 && failureCode == "app_policy_blocked" {
 			trace.record(openAIComputerTraceEventV1{
 				Phase:       "task",
@@ -830,11 +927,29 @@ func (t *openAIComputerTaskToolV1) Run(
 			FailureCode: "initial_observation_unavailable",
 			DurationMS:  time.Since(taskStarted).Milliseconds(),
 		})
-		return agent.BusinessError(
-			"computer_use_error: initial_observation_unavailable\n" +
-				"message: Computer Use could not capture the verified initial app window\n" +
-				"recovery: do not retry computer_use again in this turn; report that the initial desktop state could not be observed\n" +
-				"detail: " + detail,
+		recovery := agent.ComputerUseRecoveryNone
+		recoveryText :=
+			"report that the initial desktop state could not be safely observed"
+		if failureCode == "initial_image_unavailable" ||
+			retryableOpenAIComputerObservationFailureCodeV1(failureCode) {
+			recovery = agent.ComputerUseRecoveryAlternateControl
+			recoveryText =
+				"no desktop action was attempted; another appropriate control path may be used in this turn"
+		} else if failureCode == "app_policy_blocked" {
+			recoveryText =
+				"do not retry or bypass the protected-app boundary with another desktop-control path"
+		}
+		return withOpenAIComputerTaskFailureOutcomeV1(
+			agent.BusinessError(
+				"computer_use_error: initial_observation_unavailable\n"+
+					"message: Computer Use could not capture the verified initial app window\n"+
+					"recovery: "+recoveryText+"\n"+
+					"detail: "+detail,
+			),
+			agent.ComputerUseTaskNotCompleted,
+			agent.ComputerUseCommitNone,
+			"initial_observation_unavailable",
+			recovery,
 		), nil
 	}
 
@@ -843,7 +958,13 @@ func (t *openAIComputerTaskToolV1) Run(
 		t.runtime,
 	)
 	if err != nil {
-		return agent.BusinessError(err.Error()), nil
+		return withOpenAIComputerTaskFailureOutcomeV1(
+			agent.BusinessError(err.Error()),
+			agent.ComputerUseTaskNotCompleted,
+			agent.ComputerUseCommitNone,
+			"native_executor_unavailable",
+			agent.ComputerUseRecoveryAlternateControl,
+		), nil
 	}
 	runner.trace = trace
 	runner.observationRetry = retryObservation
@@ -876,7 +997,9 @@ func (t *openAIComputerTaskToolV1) Run(
 			"Complete the user's entire desktop goal with the native computer tool. " +
 			"When the child input is JSON, original_user_request is authoritative: complete every desktop step it requests, including later steps in other apps. " +
 			"parent_desktop_plan is only a planning hint and may accidentally omit a requested step; never treat that omission as permission to stop early. " +
-			"The initial image is the current verified app window. " +
+			"The initial image is the current verified app window and is sufficient to plan the first useful action. " +
+			"Because the first response must call the computer tool, make that first batch perform the first useful goal action; do not spend it on screenshot or wait unless the initial image is unreadable or visibly loading. " +
+			"Batch adjacent deterministic actions that are justified by the same latest screenshot, and stop the batch before an action needs a newly changed visual target. " +
 			"After every action batch, derive the next action only from the latest returned screenshot; never reuse coordinates from an older app state. " +
 			"Use semantic visible targets when they are clear, and use coordinates only against that latest screenshot. " +
 			"Before every new mutating action, compare the latest screenshot with every observable requirement in original_user_request. " +
@@ -925,10 +1048,14 @@ func (t *openAIComputerTaskToolV1) Run(
 		nil,
 	)
 	stats := runner.BatchStatsV1()
+	providerStats := privateGateway.StatsV1()
 	providerEvent := openAIComputerTraceEventV1{
-		Phase:      "private_executor",
-		Status:     "completed",
-		DurationMS: time.Since(providerStarted).Milliseconds(),
+		Phase:         "private_executor",
+		Status:        "completed",
+		ModelCalls:    providerStats.ModelCalls,
+		ModelTimeouts: providerStats.ModelTimeouts,
+		BatchCount:    stats.Batches,
+		DurationMS:    time.Since(providerStarted).Milliseconds(),
 	}
 	if err != nil {
 		var initialUnavailable *openAIComputerInitialResponseUnavailableV1
@@ -977,11 +1104,17 @@ func (t *openAIComputerTaskToolV1) Run(
 				FailureCode: "executor_timeout_before_action",
 				DurationMS:  time.Since(taskStarted).Milliseconds(),
 			})
-			return agent.BusinessError(
-				"computer_use_error: executor_timeout_before_action\n" +
-					"message: the private OpenAI Computer Use executor did not return an initial action plan within its bounded response window\n" +
-					"recovery: no desktop action was attempted; another observation or control path may still be used if appropriate\n" +
-					"detail: " + initialUnavailable.Error(),
+			return withOpenAIComputerTaskFailureOutcomeV1(
+				agent.BusinessError(
+					"computer_use_error: executor_timeout_before_action\n"+
+						"message: the private OpenAI Computer Use executor did not return an initial action plan within its bounded response window\n"+
+						"recovery: no desktop action was attempted; another appropriate control path may be used in this turn\n"+
+						"detail: "+initialUnavailable.Error(),
+				),
+				agent.ComputerUseTaskNotCompleted,
+				agent.ComputerUseCommitNone,
+				"executor_timeout_before_action",
+				agent.ComputerUseRecoveryAlternateControl,
 			), nil
 		}
 		// A later provider/protocol/observation failure cannot erase already
@@ -1023,9 +1156,11 @@ func (t *openAIComputerTaskToolV1) Run(
 			errors.Is(taskCtx.Err(), context.DeadlineExceeded) {
 			failureCode := "executor_timeout"
 			recovery := "do not retry computer_use or attempt alternate desktop-control tools in this turn; report that the desktop task timed out"
+			outcomeRecovery := agent.ComputerUseRecoveryNone
 			if stats.Batches == 0 {
 				failureCode = "executor_timeout_before_action"
-				recovery = "no desktop action was attempted; another observation or control path may still be used if appropriate"
+				recovery = "no desktop action was attempted; another appropriate control path may be used in this turn"
+				outcomeRecovery = agent.ComputerUseRecoveryAlternateControl
 			}
 			trace.record(openAIComputerTraceEventV1{
 				Phase:       "task",
@@ -1033,11 +1168,18 @@ func (t *openAIComputerTaskToolV1) Run(
 				FailureCode: failureCode,
 				DurationMS:  time.Since(taskStarted).Milliseconds(),
 			})
-			return agent.BusinessError(
+			result := agent.BusinessError(
 				"computer_use_error: " + failureCode + "\n" +
 					"message: the private OpenAI Computer Use executor exceeded its interactive task deadline\n" +
 					"recovery: " + recovery + "\n" +
 					"detail: the private executor exceeded " + taskTimeout.String(),
+			)
+			return withOpenAIComputerTaskFailureOutcomeV1(
+				result,
+				agent.ComputerUseTaskNotCompleted,
+				agent.ComputerUseCommitNone,
+				failureCode,
+				outcomeRecovery,
 			), nil
 		}
 		if stats.LastFinalObservationUnavailable {
@@ -1091,10 +1233,10 @@ func (t *openAIComputerTaskToolV1) Run(
 		recovery := "do not retry computer_use or attempt alternate desktop-control tools in this turn; report the executor failure without guessing that the target app is missing or blocked"
 		if stats.Batches == 0 {
 			failureCode = "executor_failed_before_action"
-			recovery = "no desktop action was attempted; another observation or control path may still be used if appropriate"
+			recovery = "no desktop action was attempted; another appropriate control path may be used in this turn"
 		} else if stats.TaskEffect == agent.ComputerUseCommitNone {
 			failureCode = "executor_failed_without_mutation"
-			recovery = "no desktop mutation committed; another observation or control path may still be used if appropriate"
+			recovery = "do not start another desktop-control path in this turn; report the executor failure and its last failure code"
 		}
 		trace.record(openAIComputerTraceEventV1{
 			Phase:       "task",
@@ -1102,11 +1244,21 @@ func (t *openAIComputerTaskToolV1) Run(
 			FailureCode: failureCode,
 			DurationMS:  time.Since(taskStarted).Milliseconds(),
 		})
-		return agent.BusinessError(
-			"computer_use_error: " + failureCode + "\n" +
-				"message: the private OpenAI Computer Use executor could not complete the task\n" +
-				"recovery: " + recovery + "\n" +
-				"detail: " + err.Error(),
+		outcomeRecovery := agent.ComputerUseRecoveryNone
+		if stats.Batches == 0 {
+			outcomeRecovery = agent.ComputerUseRecoveryAlternateControl
+		}
+		return withOpenAIComputerTaskFailureOutcomeV1(
+			agent.BusinessError(
+				"computer_use_error: "+failureCode+"\n"+
+					"message: the private OpenAI Computer Use executor could not complete the task\n"+
+					"recovery: "+recovery+"\n"+
+					"detail: "+err.Error(),
+			),
+			agent.ComputerUseTaskNotCompleted,
+			stats.TaskEffect,
+			failureCode,
+			outcomeRecovery,
 		), nil
 	}
 	reply = strings.TrimSpace(reply)
@@ -1121,12 +1273,18 @@ func (t *openAIComputerTaskToolV1) Run(
 			FailureCode: "no_desktop_action",
 			DurationMS:  time.Since(taskStarted).Milliseconds(),
 		})
-		return withOpenAIComputerTaskOutcomeV1(agent.BusinessError(
-			"computer_use_error: no_desktop_action\n"+
-				"message: the private OpenAI Computer Use executor finished without issuing any native computer batch, so the task was not done\n"+
-				"recovery: do not retry computer_use again in this turn; report that the native executor performed no action\n"+
-				"detail: "+detail,
-		), agent.ComputerUseTaskNotCompleted, agent.ComputerUseCommitNone), nil
+		return withOpenAIComputerTaskFailureOutcomeV1(
+			agent.BusinessError(
+				"computer_use_error: no_desktop_action\n"+
+					"message: the private OpenAI Computer Use executor finished without issuing any native computer batch, so the task was not done\n"+
+					"recovery: no desktop action was attempted; another appropriate control path may be used in this turn\n"+
+					"detail: "+detail,
+			),
+			agent.ComputerUseTaskNotCompleted,
+			agent.ComputerUseCommitNone,
+			"no_desktop_action",
+			agent.ComputerUseRecoveryAlternateControl,
+		), nil
 	}
 	outcome, outcomeErr := parseOpenAIComputerTaskOutcomeV1(reply)
 	if outcomeErr != nil {
@@ -1136,12 +1294,27 @@ func (t *openAIComputerTaskToolV1) Run(
 			FailureCode: "outcome_unverified",
 			DurationMS:  time.Since(taskStarted).Milliseconds(),
 		})
-		return withOpenAIComputerTaskOutcomeV1(agent.BusinessError(
-			"computer_use_error: outcome_unverified\n"+
-				"message: the private OpenAI Computer Use executor did not return a verifiable task outcome\n"+
-				"recovery: do not retry computer_use again in this turn; report that the executor outcome could not be verified\n"+
-				"detail: "+outcomeErr.Error(),
-		), agent.ComputerUseTaskUnverified, stats.TaskEffect), nil
+		recoveryText :=
+			"do not start another desktop-control path; report that the executor outcome could not be verified"
+		if stats.TaskEffect == agent.ComputerUseCommitKnown {
+			recoveryText =
+				"do not repeat committed desktop actions or start another desktop-control path; report that the executor outcome could not be verified"
+		} else if stats.TaskEffect == agent.ComputerUseCommitUnknown {
+			recoveryText =
+				"do not repeat the unresolved desktop action or use another desktop-control path; report that the executor outcome could not be verified"
+		}
+		return withOpenAIComputerTaskFailureOutcomeV1(
+			agent.BusinessError(
+				"computer_use_error: outcome_unverified\n"+
+					"message: the private OpenAI Computer Use executor did not return a verifiable task outcome\n"+
+					"recovery: "+recoveryText+"\n"+
+					"detail: "+outcomeErr.Error(),
+			),
+			agent.ComputerUseTaskUnverified,
+			stats.TaskEffect,
+			"outcome_unverified",
+			agent.ComputerUseRecoveryNone,
+		), nil
 	}
 	if outcome.Status == openAIComputerTaskNotCompletedV1 {
 		detail := outcome.Summary
@@ -1154,12 +1327,27 @@ func (t *openAIComputerTaskToolV1) Run(
 			FailureCode: "task_not_completed",
 			DurationMS:  time.Since(taskStarted).Milliseconds(),
 		})
-		return withOpenAIComputerTaskOutcomeV1(agent.BusinessError(
-			"computer_use_error: task_not_completed\n"+
-				"message: the private OpenAI Computer Use executor reported that the requested visible end state was not reached\n"+
-				"recovery: do not retry computer_use again in this turn; report the executor's visible-state result\n"+
-				"detail: "+detail,
-		), agent.ComputerUseTaskNotCompleted, stats.TaskEffect), nil
+		recoveryText :=
+			"do not start another desktop-control path; report the executor's visible-state result"
+		if stats.TaskEffect == agent.ComputerUseCommitKnown {
+			recoveryText =
+				"do not repeat committed desktop actions or start another desktop-control path; report the executor's visible-state result"
+		} else if stats.TaskEffect == agent.ComputerUseCommitUnknown {
+			recoveryText =
+				"do not repeat the unresolved desktop action or use another desktop-control path; report the executor's visible-state result"
+		}
+		return withOpenAIComputerTaskFailureOutcomeV1(
+			agent.BusinessError(
+				"computer_use_error: task_not_completed\n"+
+					"message: the private OpenAI Computer Use executor reported that the requested visible end state was not reached\n"+
+					"recovery: "+recoveryText+"\n"+
+					"detail: "+detail,
+			),
+			agent.ComputerUseTaskNotCompleted,
+			stats.TaskEffect,
+			"task_not_completed",
+			agent.ComputerUseRecoveryNone,
+		), nil
 	}
 	if outcome.Status == openAIComputerTaskUnverifiedV1 {
 		trace.record(openAIComputerTraceEventV1{

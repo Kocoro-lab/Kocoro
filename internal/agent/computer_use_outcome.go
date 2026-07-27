@@ -48,8 +48,9 @@ const (
 type ComputerUseTaskRecovery string
 
 const (
-	ComputerUseRecoveryNone          ComputerUseTaskRecovery = ""
-	ComputerUseRecoveryRetryWithApps ComputerUseTaskRecovery = "retry_with_apps"
+	ComputerUseRecoveryNone             ComputerUseTaskRecovery = ""
+	ComputerUseRecoveryRetryWithApps    ComputerUseTaskRecovery = "retry_with_apps"
+	ComputerUseRecoveryAlternateControl ComputerUseTaskRecovery = "alternate_control"
 )
 
 // ComputerUseTaskOutcome is the structured daemon-to-AgentLoop completion
@@ -84,6 +85,14 @@ func (outcome ComputerUseTaskOutcome) Validate() error {
 			outcome.Effect != ComputerUseCommitNone {
 			return fmt.Errorf(
 				"computer-use recovery %q requires not_completed with no committed effect",
+				outcome.Recovery,
+			)
+		}
+	case ComputerUseRecoveryAlternateControl:
+		if outcome.Status == ComputerUseTaskCompleted ||
+			outcome.Effect != ComputerUseCommitNone {
+			return fmt.Errorf(
+				"computer-use recovery %q requires an incomplete task with no committed effect",
 				outcome.Recovery,
 			)
 		}

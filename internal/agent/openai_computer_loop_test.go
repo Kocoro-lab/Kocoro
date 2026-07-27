@@ -1209,11 +1209,36 @@ func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {
 	if got := len(executor.capturedCalls()); got != 3 {
 		t.Fatalf("failed batches executed = %d, want exactly 3", got)
 	}
-	if got := len(llm.capturedRequests()); got != 3 {
+	requests := llm.capturedRequests()
+	if got := len(requests); got != 3 {
 		t.Fatalf(
 			"completion requests = %d, want 3 (no provider call after the recovery cap)",
 			got,
 		)
+	}
+	for index, request := range requests[1:] {
+		messages := request.Messages
+		if len(messages) == 0 {
+			t.Fatalf("continuation request %d has no messages", index+2)
+		}
+		blocks := messages[len(messages)-1].Content.Blocks()
+		if len(blocks) != 1 || blocks[0].Type != "tool_result" ||
+			!blocks[0].IsError {
+			t.Fatalf(
+				"continuation request %d result block = %#v",
+				index+2,
+				blocks,
+			)
+		}
+		nested, ok := blocks[0].ToolContent.([]client.ContentBlock)
+		if !ok || len(nested) != 1 ||
+			nested[0].Type != "image" {
+			t.Fatalf(
+				"continuation request %d tool content = %#v",
+				index+2,
+				blocks[0].ToolContent,
+			)
+		}
 	}
 }
 

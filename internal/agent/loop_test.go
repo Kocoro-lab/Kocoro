@@ -1316,6 +1316,39 @@ func (m *mockComputerUseRecoveryTool) Run(
 
 func (m *mockComputerUseRecoveryTool) RequiresApproval() bool { return false }
 
+type mockNoEffectComputerUseTool struct {
+	runs int
+}
+
+func (m *mockNoEffectComputerUseTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        "computer_use",
+		Description: "mock no-effect computer use tool",
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+	}
+}
+
+func (m *mockNoEffectComputerUseTool) Run(
+	context.Context,
+	string,
+) (ToolResult, error) {
+	m.runs++
+	return ToolResult{
+		Content: "computer_use_error: executor_timeout_before_action\n" +
+			"recovery: another appropriate control path may be used",
+		IsError:       true,
+		ErrorCategory: ErrCategoryBusiness,
+		ComputerUseOutcome: &ComputerUseTaskOutcome{
+			Status:      ComputerUseTaskNotCompleted,
+			Effect:      ComputerUseCommitNone,
+			FailureCode: "executor_timeout_before_action",
+			Recovery:    ComputerUseRecoveryAlternateControl,
+		},
+	}, nil
+}
+
+func (m *mockNoEffectComputerUseTool) RequiresApproval() bool { return false }
+
 type bulkyMockMCPTool struct {
 	name string
 }
@@ -1938,6 +1971,83 @@ func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T
 			computerUse.runs,
 			browserNavigate.runs,
 		)
+	}
+}
+
+func TestAgentLoop_NoEffectComputerUseReleasesAlternateControlButNotSecondTask(
+	t *testing.T,
+) {
+	computerUse := &mockNoEffectComputerUseTool{}
+	browserNavigate := &mockCountingTool{
+		name:    "browser_navigate",
+		content: "browser completed",
+	}
+	var finalRequest client.CompletionRequest
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use", `{"task":"open the site"}`), 10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use", `{"task":"retry the site"}`), 10, 5))
+		case 3:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("browser_navigate", `{"url":"https://example.com"}`), 10, 5))
+		case 4:
+			finalRequest = req
+			json.NewEncoder(w).Encode(nativeResponse(
+				"Browser fallback completed.", "end_turn", nil, 10, 5,
+			))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	reg.Register(browserNavigate)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+	result, _, err := loop.Run(
+		context.Background(),
+		"Open a site using the best available control path",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Browser fallback completed." ||
+		computerUse.runs != 1 || browserNavigate.runs != 1 {
+		t.Fatalf(
+			"result=%q computer runs=%d browser runs=%d",
+			result,
+			computerUse.runs,
+			browserNavigate.runs,
+		)
+	}
+	encoded, err := json.Marshal(finalRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transcript := string(encoded); !strings.Contains(
+		transcript,
+		"repeated_goal_task_blocked",
+	) {
+		t.Fatalf("second computer_use was not blocked: %s", transcript)
 	}
 }
 

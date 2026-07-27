@@ -24,16 +24,19 @@ func TestOpenAIComputerTraceV1WritesOnlyStructuredContentFreeFields(
 		TurnID:    "turn-trace",
 	})
 	trace.record(openAIComputerTraceWithCaptureDiagnosticsV1(openAIComputerTraceEventV1{
-		Phase:       "action",
-		Status:      "failed",
-		BatchIndex:  2,
-		ActionIndex: 3,
-		ActionCount: 4,
-		ActionType:  "type",
-		AppBundleID: "com.example.Editor",
-		CommitState: "not_committed",
-		FailureCode: "keyboard_target_unavailable",
-		DurationMS:  17,
+		Phase:         "action",
+		Status:        "failed",
+		BatchIndex:    2,
+		ActionIndex:   3,
+		ActionCount:   4,
+		ActionType:    "type",
+		AppBundleID:   "com.example.Editor",
+		CommitState:   "not_committed",
+		FailureCode:   "keyboard_target_unavailable",
+		ModelCalls:    3,
+		ModelTimeouts: 1,
+		BatchCount:    2,
+		DurationMS:    17,
 	}, agent.ToolResult{
 		GUICaptureDiagnostics: &agent.GUICaptureDiagnostics{
 			Stage:              "decoded_dimensions",
@@ -96,12 +99,20 @@ func TestOpenAIComputerTraceV1WritesOnlyStructuredContentFreeFields(
 		"app_bundle_id":  true,
 		"commit_state":   true,
 		"failure_code":   true,
+		"model_calls":    true,
+		"model_timeouts": true,
+		"batch_count":    true,
 		"duration_ms":    true,
 	}
 	for key := range payload {
 		if !allowed[key] {
 			t.Fatalf("trace emitted non-contract field %q: %s", key, entries[0].InputSummary)
 		}
+	}
+	if payload["model_calls"] != float64(3) ||
+		payload["model_timeouts"] != float64(1) ||
+		payload["batch_count"] != float64(2) {
+		t.Fatalf("trace lost provider counters: %s", entries[0].InputSummary)
 	}
 	for _, forbidden := range []string{
 		"text", "coordinates", "window_title", "screenshot",
